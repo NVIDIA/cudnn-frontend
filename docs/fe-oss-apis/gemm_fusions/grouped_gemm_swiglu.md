@@ -98,6 +98,13 @@ $$
 
 ### High-level Wrapper
 
+``````{tab-set}
+:sync-group: frontend-framework
+
+`````{tab-item} PyTorch
+:sync: torch
+:selected:
+
 ```python
 from cudnn import grouped_gemm_swiglu_wrapper_sm100
 from cuda.bindings import driver as cuda
@@ -137,6 +144,50 @@ sfd_col = outputs["sfd_col_tensor"] # column scale factors (when d_dtype is FP8)
 # or tuple unpacking:
 c, d, d_col, amax, sfd_row, sfd_col = outputs
 ```
+
+`````
+
+`````{tab-item} JAX
+:sync: jax
+
+Install the JAX integration with `pip install nvidia-cudnn-frontend[jax]`.
+
+```python
+import jax
+import jax.numpy as jnp
+from cudnn.jax import grouped_gemm_swiglu_wrapper_sm100
+
+@jax.jit
+def run(a, b, sfa, sfb, padded_offsets, alpha, norm_const, prob):
+    return grouped_gemm_swiglu_wrapper_sm100(
+        a,
+        b,
+        sfa,
+        sfb,
+        padded_offsets,
+        alpha,
+        norm_const,
+        prob,
+        acc_dtype=jnp.float32,
+        c_dtype=jnp.bfloat16,
+        d_dtype=jnp.float8_e4m3fn,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=32,
+    )
+
+result = run(a, b, sfa, sfb, padded_offsets, alpha, norm_const, prob)
+c, d, d_col, amax, sfd_row, sfd_col = result
+```
+
+The JAX API returns `GroupedGemmSwigluResult`. It supports dense FP8 A/B with
+E8M0 scale factors and `sf_vec_size=32`; discrete weight pointers and packed
+FP4 are not exposed. With the FP8 D type above, `amax` is `None`. Shapes,
+dtypes, layouts, and configuration arguments are static under `jax.jit`.
+
+`````
+
+``````
 
 ### Class API
 

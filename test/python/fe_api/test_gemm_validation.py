@@ -89,6 +89,8 @@ class GemmValidationTest(unittest.TestCase):
                     _MODULE.require_cluster_shape(
                         cluster_shape,
                         mma_m=128,
+                        two_cta_mma_m=256,
+                        max_ctas=16,
                         max_dimension=4,
                     ),
                     cluster_shape,
@@ -106,6 +108,8 @@ class GemmValidationTest(unittest.TestCase):
                     _MODULE.require_cluster_shape(
                         cluster_shape,
                         mma_m=mma_m,
+                        two_cta_mma_m=256,
+                        max_ctas=16,
                         max_dimension=4,
                     )
 
@@ -126,11 +130,6 @@ class GemmValidationTest(unittest.TestCase):
                 cta_group_size=2,
                 reason="the probability load is not predicated",
             )
-
-    def test_validates_swiglu_block_pairs(self):
-        self.assertEqual(_MODULE.require_swiglu_n(128), 64)
-        with self.assertRaisesRegex(ValueError, "32-column SwiGLU block pairs"):
-            _MODULE.require_swiglu_n(96)
 
     def test_resolves_cluster_overlap_margin(self):
         self.assertEqual(_MODULE.resolve_max_active_clusters(12, 2), 10)

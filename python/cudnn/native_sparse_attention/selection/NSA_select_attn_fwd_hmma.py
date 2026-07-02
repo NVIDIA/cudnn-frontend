@@ -568,9 +568,10 @@ class HopperSelectAttentionFwd:
 
         seq_len = seq_offsets[offset_idx + 1] - seq_offsets[offset_idx]
         offset = seq_offsets[offset_idx]
-        for i in cutlass.range((block_indices.shape[2] + self.threads_per_block - 1) // self.threads_per_block):
-            if i * self.threads_per_block + tidx < block_indices.shape[2]:
-                sIDX[i * self.threads_per_block + tidx] = block_indices[offset + t, KV_head_idx, i * self.threads_per_block + tidx]
+        if t < seq_len:
+            for i in cutlass.range((block_indices.shape[2] + self.threads_per_block - 1) // self.threads_per_block):
+                if i * self.threads_per_block + tidx < block_indices.shape[2]:
+                    sIDX[i * self.threads_per_block + tidx] = block_indices[offset + t, KV_head_idx, i * self.threads_per_block + tidx]
         cute.arch.sync_threads()
 
         seq_len_aligned = (seq_len + self.tile_shape_mnk_QK[1] - 1) // self.tile_shape_mnk_QK[1] * self.tile_shape_mnk_QK[1]

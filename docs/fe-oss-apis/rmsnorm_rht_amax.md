@@ -10,7 +10,7 @@ This frontend integration exposes the kernel as a standard FE-OSS Python API wit
 - a class API (`RmsNormRhtAmaxSm100`)
 - a PyTorch functional API (`cudnn.rmsnorm_rht_amax_sm100`)
 - the existing wrapper API (`rmsnorm_rht_amax_wrapper_sm100`)
-- an experimental JAX functional API (`cudnn.jax.rmsnorm_rht_amax_sm100`)
+- a JAX functional API (`cudnn.jax.rmsnorm_rht_amax_sm100`)
 - grouped-gemm-style regression coverage for compile/execute, wrapper use, and cache reuse
 
 ## Shapes
@@ -134,7 +134,7 @@ pytree.
 
 ``````
 
-The JAX proof of concept requires concrete `M` and `N` during tracing and does
+The JAX API requires concrete `M` and `N` during tracing and does
 not yet define autodiff, `vmap`, or automatic partitioning rules. `eps`,
 `num_threads`, and `rows_per_cta` are static compilation state; close them over
 as above or list them in `jax.jit(static_argnames=...)`. JAX always uses XLA's
@@ -244,7 +244,7 @@ Tuple unpacking follows each key order.
 - `EPT = N / num_threads` must be at least `8` and divisible by `8`.
 - `M` must be divisible by `rows_per_cta`.
 - Inputs and output are currently bf16 only.
-- The JAX proof of concept requires concrete shapes and compact row-major inputs.
+- The JAX API requires concrete shapes and compact row-major inputs.
 - The frontend integration matches the upstream RMSNorm kernel semantics; it does not expose full LayerNorm mean/bias behavior.
 
 ## Verification

@@ -1,19 +1,16 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""
-Grouped GEMM SwiGLU Kernel Module
+"""Grouped GEMM SwiGLU APIs for SM100."""
 
-This module provides the forward grouped GEMM with SwiGLU activation
-for MoE (Mixture of Experts) workloads on SM100+ GPUs.
-"""
+from ..._operation_api import make_operation_api
 
-from .api import (
-    GroupedGemmSwigluSm100,
-    grouped_gemm_swiglu_wrapper_sm100,
-)
-
-__all__ = [
+_API_EXPORTS = (
     "GroupedGemmSwigluSm100",
     "grouped_gemm_swiglu_wrapper_sm100",
-]
+)
+
+__all__, __getattr__ = make_operation_api(
+    globals(),
+    exports=_API_EXPORTS,
+)

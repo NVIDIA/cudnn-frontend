@@ -45,11 +45,8 @@ from cudnn.api_base import APIBase, TupleDict, ceil_div
 from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.gemm_validation import (
     block_scale_shape,
-    require_cluster_shape,
     require_contiguous_alignment,
     require_gemm_shapes,
-    require_mma_tiler,
-    require_swiglu_n,
     resolve_max_active_clusters,
 )
 import os
@@ -89,10 +86,6 @@ class GemmSwigluSm100(APIBase):
         self.alpha = alpha
         self.acc_dtype = acc_dtype
         self.mma_tiler_mn = mma_tiler_mn
-        if cluster_shape_mn is None:
-            self.cluster_shape_mn = (1, 1) if not self.mma_tiler_mn[0] == 256 else (2, 2)
-        else:
-            self.cluster_shape_mn = cluster_shape_mn
 
         ### Quantize only arguments
         self.sfa_desc = self._make_tensor_desc(sample_sfa, name="sample_sfa")
@@ -114,6 +107,11 @@ class GemmSwigluSm100(APIBase):
             self._logger.debug("Quantization arguments provided, using quantized GEMM swiglu kernel")
             self._kernel = Sm100BlockScaledPersistentDenseGemmKernel
 
+        if cluster_shape_mn is None:
+            self.cluster_shape_mn = (2, 2) if self.mma_tiler_mn[0] == self._kernel.TWO_CTA_MMA_TILER_M else (1, 1)
+        else:
+            self.cluster_shape_mn = cluster_shape_mn
+
         self._logger.debug(
             f"__init__ completed with args: sample_a {self.a_desc.shape}, sample_b {self.b_desc.shape}, sample_ab12 {self.ab12_desc.shape}, sample_c {self.c_desc.shape}, alpha {alpha}, acc_dtype {acc_dtype}, mma_tiler_mn {mma_tiler_mn}, cluster_shape_mn {cluster_shape_mn}, sample_sfa {self.sfa_desc.shape if self.sfa_desc is not None else None}, sample_sfb {self.sfb_desc.shape if self.sfb_desc is not None else None}, sample_amax {self.amax_desc.shape if self.amax_desc is not None else None}, sample_sfc {self.sfc_desc.shape if self.sfc_desc is not None else None}, sample_norm_const {self.norm_const_desc.shape if self.norm_const_desc is not None else None}, sf_vec_size {sf_vec_size}, vector_f32 {vector_f32}, ab12_stages {ab12_stages}"
         )
@@ -126,7 +124,7 @@ class GemmSwigluSm100(APIBase):
             self._tensor_shape(self.a_desc, name="sample_a"),
             self._tensor_shape(self.b_desc, name="sample_b"),
         )
-        n_2 = require_swiglu_n(n)
+        n_2 = self._kernel.get_output_n(n)
         self._check_tensor_shape(self.ab12_desc, (m, n, l), "AB12")
         self._check_tensor_shape(self.c_desc, (m, n_2, l), "C")
 
@@ -254,7 +252,7 @@ class GemmSwigluSm100(APIBase):
             )
 
             self._value_error_if(
-                self.sf_vec_size not in {16, 32},
+                self.sf_vec_size not in self._kernel.SF_VEC_SIZES,
                 f"sf_vec_size must be 16 or 32 when ab_dtype is {{torch.float8_e5m2, torch.float8_e4m3fn}}, got {self.sf_vec_size}",
             )
             self.sf_dtype = self._check_dtype(
@@ -303,34 +301,17 @@ class GemmSwigluSm100(APIBase):
 
         self._logger.debug("Checking MMA tile shape and cluster shape")
 
-        self.mma_tiler_mn = require_mma_tiler(
-            self.mma_tiler_mn,
-            allowed_m=(128, 256),
-            allowed_n=(64, 128, 192, 256),
-        )
+        self.mma_tiler_mn = self._kernel.require_mma_tiler(self.mma_tiler_mn)
         if self._kernel is Sm100BlockScaledPersistentDenseGemmKernel and self._is_fp8(self.ab_dtype):
             self._value_error_if(
                 self._is_fp8(self.c_dtype) or self._is_fp8(self.ab12_dtype) or self.ab12_dtype == torch.float32,
                 "For MXFP8 inputs for blockscaled quantized GEMM swiglu kernel, ab12_dtype and c_dtype cannot be FP8. ab12_dtype also cannot be float32",
             )
 
-        self.cluster_shape_mn = require_cluster_shape(
+        self.cluster_shape_mn = self._kernel.require_cluster_shape(
             self.cluster_shape_mn,
-            mma_m=self.mma_tiler_mn[0],
-            max_dimension=4 if self._kernel is Sm100BlockScaledPersistentDenseGemmKernel else None,
+            mma_tiler_mn=self.mma_tiler_mn,
         )
-
-        if self._kernel is PersistentDenseGemmKernel:
-            use_2cta_instrs = self.mma_tiler_mn[0] == 256
-            self._value_error_if(
-                not use_2cta_instrs and self.cluster_shape_mn != (1, 1),
-                "Invalid cluster shape: cluster_shape must be (1, 1) when use_2cta_instrs=False",
-            )
-            if self.cluster_shape_mn != (1, 1) and self.mma_tiler_mn[0] == 128:
-                self._value_error_if(
-                    self.mma_tiler_mn != (128, 128),
-                    "Invalid MMA tile shape: for non-1x1 cluster shape and 128xmma tile shape, mma_tiler_mn must be (128, 128)",
-                )
 
         self._logger.debug("Checking tensor alignment")
 
@@ -380,7 +361,7 @@ class GemmSwigluSm100(APIBase):
         if self._kernel is PersistentDenseGemmKernel:
             gemm_swiglu = self._kernel(
                 acc_dtype=_convert_to_cutlass_data_type(self.acc_dtype),
-                use_2cta_instrs=(self.mma_tiler_mn[0] == 256),
+                use_2cta_instrs=(self.mma_tiler_mn[0] == self._kernel.TWO_CTA_MMA_TILER_M),
                 mma_tiler_mn=self.mma_tiler_mn,
                 cluster_shape_mn=self.cluster_shape_mn,
             )

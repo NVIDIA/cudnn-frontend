@@ -21,10 +21,7 @@ from .._jax.gemm import (
 )
 from .._jax.validation import require_dtype
 from ..gemm_validation import (
-    require_cluster_shape,
     require_full_mma_rows,
-    require_mma_tiler,
-    require_swiglu_n,
     resolve_max_active_clusters,
 )
 
@@ -56,7 +53,7 @@ def _make_launcher(
 
         kernel = PersistentDenseGemmKernel(
             acc_dtype=jax_to_cutlass_dtype(acc_dtype),
-            use_2cta_instrs=mma_tiler_mn[0] == 256,
+            use_2cta_instrs=mma_tiler_mn[0] == PersistentDenseGemmKernel.TWO_CTA_MMA_TILER_M,
             mma_tiler_mn=mma_tiler_mn,
             cluster_shape_mn=cluster_shape_mn,
         )
@@ -116,8 +113,11 @@ def gemm_swiglu_wrapper_sm100(
             "The JAX GEMM + SwiGLU API currently supports only the " "unquantized path; sfa_tensor, sfb_tensor, and norm_const_tensor " "must be None"
         )
 
+    from .dense_gemm_persistent_swiglu import PersistentDenseGemmKernel
+
+    kernel = PersistentDenseGemmKernel
     m, n, k, batch, a_dtype = require_gemm_inputs(a_tensor, b_tensor)
-    output_n = require_swiglu_n(n)
+    output_n = kernel.get_output_n(n)
 
     a_dtype = require_dtype(
         "a_tensor.dtype",
@@ -138,18 +138,15 @@ def gemm_swiglu_wrapper_sm100(
     ab12_dtype = require_dtype("ab12_dtype", ab12_dtype, supported_ab12, default=jnp.float32)
     c_dtype = require_dtype("c_dtype", c_dtype, (jnp.float16, jnp.bfloat16), default=jnp.float16)
 
-    mma_tiler_mn = require_mma_tiler(
-        mma_tiler_mn,
-        allowed_m=(128, 256),
-        allowed_n=(64, 128, 192, 256),
-    )
-    if mma_tiler_mn[0] == 256:
+    mma_tiler_mn = kernel.require_mma_tiler(mma_tiler_mn)
+    if mma_tiler_mn[0] == kernel.TWO_CTA_MMA_TILER_M:
         require_full_mma_rows(m, mma_tiler_mn[0], reason="2-CTA MMA requires a complete CTA pair")
     if cluster_shape_mn is None:
-        cluster_shape_mn = (1, 1) if mma_tiler_mn[0] == 128 else (2, 2)
-    cluster_shape_mn = require_cluster_shape(cluster_shape_mn, mma_m=mma_tiler_mn[0])
-    if mma_tiler_mn[0] == 128 and cluster_shape_mn != (1, 1):
-        raise ValueError("cluster_shape_mn must be (1, 1) with a 128-wide M tile")
+        cluster_shape_mn = (2, 2) if mma_tiler_mn[0] == kernel.TWO_CTA_MMA_TILER_M else (1, 1)
+    cluster_shape_mn = kernel.require_cluster_shape(
+        cluster_shape_mn,
+        mma_tiler_mn=mma_tiler_mn,
+    )
 
     a_spec = gemm_a_tensor_spec(a_major)
     b_spec = gemm_b_tensor_spec(b_major)

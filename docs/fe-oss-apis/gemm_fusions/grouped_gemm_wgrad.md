@@ -43,6 +43,13 @@ The API supports two output modes through one public surface:
 
 ## Wrapper Example
 
+``````{tab-set}
+:sync-group: frontend-framework
+
+`````{tab-item} PyTorch
+:sync: torch
+:selected:
+
 ```python
 import cudnn
 import torch
@@ -60,6 +67,47 @@ result = cudnn.grouped_gemm_wgrad_wrapper_sm100(
 
 wgrad_tensor = result["wgrad_tensor"]
 ```
+
+`````
+
+`````{tab-item} JAX
+:sync: jax
+
+Install the JAX integration with `pip install nvidia-cudnn-frontend[jax]`.
+
+```python
+import jax
+import jax.numpy as jnp
+from cudnn.jax import grouped_gemm_wgrad_wrapper_sm100
+
+@jax.jit
+def run(a, b, sfa, sfb, offsets):
+    return grouped_gemm_wgrad_wrapper_sm100(
+        a,
+        b,
+        sfa,
+        sfb,
+        offsets,
+        wgrad_dtype=jnp.bfloat16,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=32,
+        input_order="tensor2d",
+    )
+
+result = run(a_tensor, b_tensor, sfa_tensor, sfb_tensor, offsets_tensor)
+wgrad_tensor = result.wgrad_tensor
+```
+
+The JAX API returns `GroupedGemmWgradResult` and exposes only the dense-output
+mode. A/B are FP8 with E8M0 scale factors and `sf_vec_size=32`; raw discrete
+output pointers and packed FP4 are not exposed. Tensor shapes and dtypes,
+expert count, `input_order`, and other configuration arguments are static
+under `jax.jit`; the offset values remain runtime data.
+
+`````
+
+``````
 
 ## Class API Example
 

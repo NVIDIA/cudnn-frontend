@@ -12,7 +12,10 @@ import jax.numpy as jnp
 
 from ..._jax.cutedsl import BufferSpec, call_cutedsl
 from ..._jax.validation import require_dtype
-from .config import resolve_sparse_score_kernel_config
+from .config import (
+    resolve_dense_score_kernel_config,
+    resolve_sparse_score_kernel_config,
+)
 
 
 class SparseIndexerScoreRecomputeResult(NamedTuple):
@@ -25,6 +28,13 @@ class SparseAttnScoreRecomputeResult(NamedTuple):
     """Normalized sparse attention scores."""
 
     target: Any
+
+
+class DenseScoreRecomputeResult(NamedTuple):
+    """Raw dense scores and their per-query normalization denominator."""
+
+    out: Any
+    denom: Any
 
 
 @lru_cache(maxsize=None)
@@ -91,6 +101,175 @@ def _make_launcher(
             )
 
     return launch
+
+
+@lru_cache(maxsize=None)
+def _make_dense_launcher(
+    *,
+    score_type: str,
+    head_dim: int,
+    qhead_per_kv_head: int,
+    ratio: int,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    scale: float,
+    have_q_causal_offsets: bool,
+):
+    from cutlass import Float32, Int32
+
+    from .dense_score_recompute_sm100 import DenseScoreRecomputeSm100
+
+    config = resolve_dense_score_kernel_config(
+        score_type=score_type,
+        head_dim=head_dim,
+        qhead_per_kv_head=qhead_per_kv_head,
+    )
+    kernel = DenseScoreRecomputeSm100(
+        head_dim=head_dim,
+        qhead_per_kvhead=qhead_per_kv_head,
+        m_block_size=config.m_block_size,
+        n_block_size=config.n_block_size,
+        k_block_size=config.k_block_size,
+        kv_stage=config.kv_stage,
+        score_type=score_type,
+        ratio=ratio,
+        is_varlen=False,
+    )
+    if have_q_causal_offsets:
+
+        def launch(stream, q, k, per_head, q_causal_offsets, out, denom):
+            kernel(
+                q,
+                k,
+                per_head,
+                out,
+                denom,
+                Float32(scale),
+                Int32(max_seqlen_q),
+                Int32(max_seqlen_k),
+                None,
+                None,
+                q_causal_offsets,
+                stream,
+            )
+
+    else:
+
+        def launch(stream, q, k, per_head, out, denom):
+            kernel(
+                q,
+                k,
+                per_head,
+                out,
+                denom,
+                Float32(scale),
+                Int32(max_seqlen_q),
+                Int32(max_seqlen_k),
+                None,
+                None,
+                None,
+                stream,
+            )
+
+    return launch
+
+
+def _dense_score_recompute(
+    q: Any,
+    k: Any,
+    per_head: Any,
+    *,
+    score_type: str,
+    per_head_name: str,
+    per_head_dtype: Any,
+    scale: float,
+    qhead_per_kv_head: Optional[int],
+    ratio: int,
+    q_causal_offsets: Any | None,
+) -> DenseScoreRecomputeResult:
+    arrays = (
+        ("q", q, 4),
+        ("k", k, 4),
+        (per_head_name, per_head, 3),
+    )
+    for name, value, rank in arrays:
+        if not hasattr(value, "shape") or not hasattr(value, "dtype"):
+            raise TypeError(f"{name} must have shape and dtype metadata")
+        if len(value.shape) != rank:
+            raise ValueError(f"{name} must have rank {rank}, got shape {value.shape}")
+
+    require_dtype("q.dtype", q, (jnp.bfloat16,))
+    require_dtype("k.dtype", k, (jnp.bfloat16,))
+    require_dtype(f"{per_head_name}.dtype", per_head, (per_head_dtype,))
+
+    batch, seqlen_q, num_query_heads, head_dim = q.shape
+    k_batch, seqlen_k, num_kv_heads, k_head_dim = k.shape
+    dimensions = {
+        "batch": batch,
+        "S_q": seqlen_q,
+        "S_k": seqlen_k,
+        "H_q": num_query_heads,
+        "H_kv": num_kv_heads,
+        "head dimension": head_dim,
+    }
+    nonpositive = [f"{name}={value}" for name, value in dimensions.items() if value <= 0]
+    if nonpositive:
+        raise ValueError("Dense score-recompute dimensions must be positive, got " + ", ".join(nonpositive))
+    if k_batch != batch:
+        raise ValueError(f"q and k batch dimensions must match, got {batch} and {k_batch}")
+    if k_head_dim != head_dim:
+        raise ValueError("q and k head dimensions must match, got " f"{head_dim} and {k_head_dim}")
+    if tuple(per_head.shape) != (batch, seqlen_q, num_query_heads):
+        raise ValueError(f"{per_head_name} shape must be " f"{(batch, seqlen_q, num_query_heads)}, got {per_head.shape}")
+    if num_query_heads % num_kv_heads:
+        raise ValueError(f"H_q ({num_query_heads}) must be divisible by H_kv ({num_kv_heads})")
+
+    inferred_qhead_per_kv_head = num_query_heads // num_kv_heads
+    if qhead_per_kv_head is None:
+        qhead_per_kv_head = inferred_qhead_per_kv_head
+    if qhead_per_kv_head != inferred_qhead_per_kv_head:
+        raise ValueError("qhead_per_kv_head must equal H_q / H_kv, got " f"{qhead_per_kv_head} and {num_query_heads} / {num_kv_heads}")
+    if ratio < 1:
+        raise ValueError(f"ratio must be at least 1, got {ratio}")
+
+    inputs = (q, k, per_head)
+    if q_causal_offsets is not None:
+        if not hasattr(q_causal_offsets, "shape") or not hasattr(q_causal_offsets, "dtype"):
+            raise TypeError("q_causal_offsets must have shape and dtype metadata")
+        if tuple(q_causal_offsets.shape) != (batch,):
+            raise ValueError(f"q_causal_offsets must have shape {(batch,)}, got " f"{q_causal_offsets.shape}")
+        require_dtype(
+            "q_causal_offsets.dtype",
+            q_causal_offsets,
+            (jnp.int32,),
+        )
+        inputs += (q_causal_offsets,)
+
+    resolved_scale = float(scale)
+    out, denom = call_cutedsl(
+        _make_dense_launcher(
+            score_type=score_type,
+            head_dim=head_dim,
+            qhead_per_kv_head=qhead_per_kv_head,
+            ratio=int(ratio),
+            max_seqlen_q=seqlen_q,
+            max_seqlen_k=seqlen_k,
+            scale=resolved_scale,
+            have_q_causal_offsets=q_causal_offsets is not None,
+        ),
+        inputs,
+        outputs=(
+            BufferSpec(
+                "out",
+                (batch, seqlen_q, seqlen_k),
+                jnp.float32,
+                fill_value=float("-inf"),
+            ),
+            BufferSpec("denom", (batch, seqlen_q), jnp.float32),
+        ),
+        use_static_tensors=True,
+    )
+    return DenseScoreRecomputeResult(out=out, denom=denom)
 
 
 def _sparse_score_recompute(
@@ -289,9 +468,75 @@ def sparse_attn_score_recompute_wrapper(
     return SparseAttnScoreRecomputeResult(target=target)
 
 
+def dense_indexer_score_recompute_wrapper(
+    q: Any,
+    k: Any,
+    weights: Any,
+    qhead_per_kv_head: Optional[int] = None,
+    sm_scale: float = 1.0,
+    ratio: int = 1,
+    q_causal_offsets: Any | None = None,
+) -> DenseScoreRecomputeResult:
+    """Compute dense indexer scores and their log-sum-exp denominator.
+
+    This binding currently supports fixed-shape SM100 BSHD tensors. ``q`` and
+    ``k`` have shapes ``(B, S_q, H_q, D)`` and ``(B, S_k, H_kv, D)``;
+    ``weights`` has shape ``(B, S_q, H_q)``. All inputs use ``bfloat16``.
+    The returned ``out`` and ``denom`` arrays use ``float32`` and have shapes
+    ``(B, S_q, S_k)`` and ``(B, S_q)``.
+    """
+
+    return _dense_score_recompute(
+        q,
+        k,
+        weights,
+        score_type="indexer",
+        per_head_name="weights",
+        per_head_dtype=jnp.bfloat16,
+        scale=sm_scale,
+        qhead_per_kv_head=qhead_per_kv_head,
+        ratio=ratio,
+        q_causal_offsets=q_causal_offsets,
+    )
+
+
+def dense_attn_score_recompute_wrapper(
+    q: Any,
+    k: Any,
+    lse: Any,
+    softmax_scale: float,
+    qhead_per_kv_head: Optional[int] = None,
+    ratio: int = 1,
+    q_causal_offsets: Any | None = None,
+) -> DenseScoreRecomputeResult:
+    """Compute dense attention scores and their L1 denominator.
+
+    This binding currently supports fixed-shape SM100 BSHD tensors. ``q`` and
+    ``k`` use ``bfloat16`` and ``lse`` uses ``float32``. The returned ``out``
+    and ``denom`` arrays use ``float32`` and have shapes ``(B, S_q, S_k)`` and
+    ``(B, S_q)``.
+    """
+
+    return _dense_score_recompute(
+        q,
+        k,
+        lse,
+        score_type="attention",
+        per_head_name="lse",
+        per_head_dtype=jnp.float32,
+        scale=softmax_scale,
+        qhead_per_kv_head=qhead_per_kv_head,
+        ratio=ratio,
+        q_causal_offsets=q_causal_offsets,
+    )
+
+
 __all__ = [
+    "DenseScoreRecomputeResult",
     "SparseAttnScoreRecomputeResult",
     "SparseIndexerScoreRecomputeResult",
+    "dense_attn_score_recompute_wrapper",
+    "dense_indexer_score_recompute_wrapper",
     "sparse_attn_score_recompute_wrapper",
     "sparse_indexer_score_recompute_wrapper",
 ]

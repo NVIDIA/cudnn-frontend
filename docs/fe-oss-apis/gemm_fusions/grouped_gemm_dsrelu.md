@@ -83,6 +83,13 @@ A (valid_m×K×1), SFA     B (N×K×L), SFB       padded_offsets
 
 ### High-level wrapper
 
+``````{tab-set}
+:sync-group: frontend-framework
+
+`````{tab-item} PyTorch
+:sync: torch
+:selected:
+
 ```python
 from cudnn import grouped_gemm_dsrelu_wrapper_sm100
 
@@ -110,6 +117,50 @@ result = grouped_gemm_dsrelu_wrapper_sm100(
 
 d_row, d_col, dprob, dbias, amax, sfd_row, sfd_col = result
 ```
+
+`````
+
+`````{tab-item} JAX
+:sync: jax
+
+Install the JAX integration with `pip install nvidia-cudnn-frontend[jax]`.
+
+```python
+import jax
+import jax.numpy as jnp
+from cudnn.jax import grouped_gemm_dsrelu_wrapper_sm100
+
+@jax.jit
+def run(a, b, c, sfa, sfb, padded_offsets, alpha, prob, norm_const):
+    return grouped_gemm_dsrelu_wrapper_sm100(
+        a,
+        b,
+        c,
+        sfa,
+        sfb,
+        padded_offsets,
+        alpha,
+        prob,
+        generate_dbias=True,
+        norm_const_tensor=norm_const,
+        d_dtype=jnp.float8_e4m3fn,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=32,
+    )
+
+result = run(a, b, c, sfa, sfb, padded_offsets, alpha, prob, norm_const)
+d_row, d_col, d_srelu, dprob, dbias, amax, sfd_row, sfd_col, sfd_col_d_srelu = result
+```
+
+The JAX API returns `GroupedGemmDsreluResult`. `dprob` and optional `dbias`
+are fresh zero-initialized functional results. It supports dense FP8 A/B and
+FP8 outputs with E8M0 scales and `sf_vec_size=32`; `amax` is `None`. Shapes,
+dtypes, layouts, and configuration arguments are static under `jax.jit`.
+
+`````
+
+``````
 
 ### Discrete-weight wrapper
 

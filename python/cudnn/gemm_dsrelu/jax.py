@@ -25,9 +25,7 @@ from .._jax.gemm import (
 )
 from .._jax.validation import require_dtype
 from ..gemm_validation import (
-    require_cluster_shape,
     require_full_mma_rows,
-    require_mma_tiler,
     require_shape,
     resolve_max_active_clusters,
 )
@@ -132,6 +130,11 @@ def gemm_dsrelu_wrapper_sm100(
     if norm_const_tensor is not None:
         raise NotImplementedError("norm_const_tensor is used by the FP8 output path, which is not " "available in the JAX squared-ReLU backward API")
 
+    from .dense_blockscaled_gemm_persistent_dsrelu_quant import (
+        Sm100BlockScaledPersistentDenseGemmKernel,
+    )
+
+    kernel = Sm100BlockScaledPersistentDenseGemmKernel
     m, n, k, batch, ab_dtype = require_gemm_inputs(a_tensor, b_tensor)
     supported_inputs = {
         jnp.dtype(jnp.float8_e4m3fn),
@@ -160,23 +163,18 @@ def gemm_dsrelu_wrapper_sm100(
     d_dtype = require_dtype("d_dtype", d_dtype, supported_outputs, default=jnp.bfloat16)
     acc_dtype = require_dtype("acc_dtype", acc_dtype, (jnp.float32,), default=jnp.float32)
 
-    mma_tiler_mn = require_mma_tiler(
-        mma_tiler_mn,
-        allowed_m=(128, 256),
-        allowed_n=(64, 128, 192, 256),
-    )
+    mma_tiler_mn = kernel.require_mma_tiler(mma_tiler_mn)
     require_full_mma_rows(
         m,
         mma_tiler_mn[0],
-        cta_group_size=2 if mma_tiler_mn[0] == 256 else 1,
+        cta_group_size=2 if mma_tiler_mn[0] == kernel.TWO_CTA_MMA_TILER_M else 1,
         reason="the probability load is not predicated",
     )
     if cluster_shape_mn is None:
-        cluster_shape_mn = (2, 1) if mma_tiler_mn[0] == 256 else (1, 1)
-    cluster_shape_mn = require_cluster_shape(
+        cluster_shape_mn = (2, 1) if mma_tiler_mn[0] == kernel.TWO_CTA_MMA_TILER_M else (1, 1)
+    cluster_shape_mn = kernel.require_cluster_shape(
         cluster_shape_mn,
-        mma_m=mma_tiler_mn[0],
-        max_dimension=4,
+        mma_tiler_mn=mma_tiler_mn,
     )
 
     a_spec = gemm_a_tensor_spec(a_major)

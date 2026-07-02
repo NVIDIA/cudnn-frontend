@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Framework-neutral SM100 configuration for sparse score recompute."""
+"""Framework-neutral SM100 configuration for score-recompute kernels."""
 
 from __future__ import annotations
 
@@ -21,6 +21,16 @@ class SparseScoreKernelConfig:
     kv_stage: int
     have_topk_length: bool
     topk_in_smem: bool
+
+
+@dataclass(frozen=True)
+class DenseScoreKernelConfig:
+    """Static launch configuration for :class:`DenseScoreRecomputeSm100`."""
+
+    m_block_size: int
+    n_block_size: int
+    k_block_size: int | None
+    kv_stage: int
 
 
 def dispatch_sparse_attn_tile_params(
@@ -177,9 +187,111 @@ def resolve_sparse_score_kernel_config(
     )
 
 
+def _select_dense_k_block_size(
+    head_dim_padded: int,
+    m_block_size: int,
+    n_block_size: int,
+    per_head_element_bytes: int,
+) -> int:
+    """Select a K tile that divides the padded head dimension and fits SMEM."""
+
+    q_bytes = m_block_size * head_dim_padded * 2
+    per_head_bytes = m_block_size * 2 * per_head_element_bytes
+    available_k_bytes = _SM100_SMEM_BYTES - q_bytes - per_head_bytes - 2048
+    max_k_block_size = max(64, available_k_bytes // (n_block_size * 2))
+    max_k_block_size = (max_k_block_size // 64) * 64
+
+    for candidate in range(
+        min(head_dim_padded, max_k_block_size),
+        63,
+        -64,
+    ):
+        if head_dim_padded % candidate == 0:
+            return candidate
+    raise ValueError(
+        "No SM100 dense-score K tile divides the padded head dimension: "
+        f"head_dim_padded={head_dim_padded}, m_block_size={m_block_size}, "
+        f"n_block_size={n_block_size}"
+    )
+
+
+def _dense_m_block_size(
+    qhead_per_kv_head: int,
+    head_dim: int,
+    per_head_element_bytes: int,
+) -> int:
+    """Use two query tokens per tile when the minimum K tile fits in SMEM."""
+
+    head_dim_padded = int(math.ceil(head_dim / 16) * 16)
+    n_block_size = 128
+    m_block_size = qhead_per_kv_head * 2
+    q_bytes = m_block_size * head_dim_padded * 2
+    minimum_k_bytes = n_block_size * 64 * 2
+    per_head_bytes = m_block_size * 2 * per_head_element_bytes
+    if q_bytes + minimum_k_bytes + per_head_bytes + 4096 <= _SM100_SMEM_BYTES:
+        return m_block_size
+    return qhead_per_kv_head
+
+
+def resolve_dense_score_kernel_config(
+    *,
+    score_type: str,
+    head_dim: int,
+    qhead_per_kv_head: int,
+) -> DenseScoreKernelConfig:
+    """Resolve the tuned SM100 dense-score tile from concrete metadata."""
+
+    if score_type not in ("indexer", "attention"):
+        raise ValueError(f"score_type must be 'indexer' or 'attention', got {score_type!r}")
+    if head_dim <= 0 or head_dim % 64:
+        raise ValueError(f"head dimension must be a positive multiple of 64, got {head_dim}")
+    if qhead_per_kv_head not in (32, 64, 128):
+        raise ValueError("qhead_per_kv_head must be 32, 64, or 128 for the SM100 " f"dense score kernel, got {qhead_per_kv_head}")
+
+    per_head_element_bytes = 2 if score_type == "indexer" else 4
+    m_block_size = _dense_m_block_size(
+        qhead_per_kv_head,
+        head_dim,
+        per_head_element_bytes,
+    )
+    n_block_size = 128
+    head_dim_padded = int(math.ceil(head_dim / 16) * 16)
+
+    if score_type == "indexer" and head_dim == 128:
+        k_block_size = head_dim_padded
+    elif score_type == "attention" and head_dim in (512, 576):
+        k_block_size = 64
+    else:
+        k_block_size = _select_dense_k_block_size(
+            head_dim_padded,
+            m_block_size,
+            n_block_size,
+            per_head_element_bytes,
+        )
+
+    k_bytes_per_stage = n_block_size * k_block_size * 2
+    q_bytes = m_block_size * head_dim_padded * 2
+    per_head_bytes = m_block_size * 2 * per_head_element_bytes
+    kv_stage = min(
+        4,
+        max(
+            1,
+            (_SM100_SMEM_BYTES - q_bytes - per_head_bytes - 2048) // k_bytes_per_stage,
+        ),
+    )
+    return DenseScoreKernelConfig(
+        m_block_size=m_block_size,
+        n_block_size=n_block_size,
+        k_block_size=(None if k_block_size == head_dim_padded else k_block_size),
+        kv_stage=kv_stage,
+    )
+
+
 __all__ = [
+    "DenseScoreKernelConfig",
     "SparseScoreKernelConfig",
     "dispatch_sparse_attn_tile_params",
+    "resolve_dense_score_kernel_config",
     "resolve_sparse_score_kernel_config",
     "resolve_sparse_score_smem_config",
 ]

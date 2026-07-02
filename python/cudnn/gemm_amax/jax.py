@@ -22,7 +22,7 @@ from .._jax.gemm import (
     require_gemm_inputs,
 )
 from .._jax.validation import require_dtype
-from ..gemm_validation import require_cluster_shape, require_mma_tiler, resolve_max_active_clusters
+from ..gemm_validation import resolve_max_active_clusters
 
 
 class GemmAmaxResult(NamedTuple):
@@ -125,17 +125,15 @@ def gemm_amax_wrapper_sm100(
     )
     acc_dtype = require_dtype("acc_dtype", acc_dtype, (jnp.float32,), default=jnp.float32)
 
-    mma_tiler_mn = require_mma_tiler(
-        mma_tiler_mn,
-        allowed_m=(128, 256),
-        allowed_n=(128, 256),
+    from .dense_blockscaled_gemm_persistent_amax import (
+        Sm100BlockScaledPersistentDenseGemmKernel,
     )
-    if mma_tiler_mn[0] == 256:
-        raise NotImplementedError("mma_tiler_mn[0] == 256 currently hangs")
-    cluster_shape_mn = require_cluster_shape(
+
+    kernel = Sm100BlockScaledPersistentDenseGemmKernel
+    mma_tiler_mn = kernel.require_mma_tiler(mma_tiler_mn)
+    cluster_shape_mn = kernel.require_cluster_shape(
         cluster_shape_mn,
-        mma_m=mma_tiler_mn[0],
-        max_dimension=4,
+        mma_tiler_mn=mma_tiler_mn,
     )
 
     a_spec = gemm_a_tensor_spec(a_major)

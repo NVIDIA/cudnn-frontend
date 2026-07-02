@@ -92,8 +92,8 @@ The JAX optional dependency set requires Python 3.11 or newer.
 ### DSA Namespace
 
 PyTorch remains the default and exposes every DSA class and wrapper below.
-The optional JAX namespace implements the two score-selection wrappers in
-sections 2 and 3 and the sparse score-recompute pair in sections 4 and 5.
+The optional JAX namespace exposes functional wrappers for the supported
+fixed-shape subsets; the PyTorch class APIs remain unchanged.
 
 ```python
 from cudnn import DSA
@@ -133,8 +133,14 @@ from cudnn.jax import DSA
 
 DSA.indexer_forward_wrapper
 DSA.indexer_top_k_wrapper
+DSA.local_to_global_wrapper
+DSA.compactify_wrapper
 DSA.sparse_indexer_score_recompute_wrapper
 DSA.sparse_attn_score_recompute_wrapper
+DSA.dense_indexer_score_recompute_wrapper
+DSA.dense_attn_score_recompute_wrapper
+DSA.indexer_backward_wrapper
+DSA.sparse_attention_backward_wrapper
 ```
 
 ---
@@ -157,7 +163,18 @@ Backward pass for DeepSeek Sparse Attention. Expects the forward outputs
 - **Outputs** — tuple `(dq, dkv, d_sink)`
 - **Constraints** — SM90 or SM100; SM90 supports the FlashMLA DSA shape with `head_dim ∈ {512, 576}`
 
+``````{tab-set}
+:sync-group: frontend-framework
+
+`````{tab-item} PyTorch
+:sync: torch
+:selected:
+
 ```python
+import math
+
+from cudnn import DSA
+
 result = DSA.sparse_attention_backward_wrapper(
     q, kv, out, dout, lse, attn_sink, topk_idxs,
     softmax_scale=1.0 / math.sqrt(D),
@@ -165,6 +182,55 @@ result = DSA.sparse_attention_backward_wrapper(
 )
 dq, dkv, d_sink = result["dq"], result["dkv"], result["d_sink"]
 ```
+
+`````
+
+`````{tab-item} JAX
+:sync: jax
+
+```python
+import math
+
+import jax
+from cudnn.jax import DSA
+
+@jax.jit
+def sparse_attention_bwd(q, kv, out, dout, lse, attn_sink, topk_idxs, topk_length):
+    return DSA.sparse_attention_backward_wrapper(
+        q,
+        kv,
+        out,
+        dout,
+        lse,
+        attn_sink,
+        topk_idxs,
+        softmax_scale=1.0 / math.sqrt(512),
+        topk_length=topk_length,
+    )
+
+result = sparse_attention_bwd(
+    q, kv, out, dout, lse, attn_sink, topk_idxs, topk_length
+)
+dq, dkv, d_sink = result.dq, result.dkv, result.d_sink
+```
+
+The JAX wrapper returns
+`SparseAttentionBackwardResult(dq=..., dkv=..., d_sink=...)`. It supports the
+fixed SM100 flat-MQA domain only: BF16 `q`, `out`, and `dout` have shape
+`(S_q, H, 512)`, BF16 `kv` has shape `(S_kv, 512)`, `lse` and `attn_sink` are
+FP32, and `H` is divisible by 64. Indices are global INT32 values and the
+optional runtime `topk_length` has shape `(S_q,)`.
+
+`softmax_scale`, `block_tile=64`, and whether `topk_length` is present are
+static compilation choices. Tensor data, indices, and lengths remain runtime
+operands. XLA owns the zero-initialized reduction workspaces and output
+accumulators. This is an explicit backward operation, not a registered JAX
+autodiff rule; SM90 and broader packed/variable-length layouts remain
+PyTorch-only.
+
+`````
+
+``````
 
 ### 2. Indexer Forward (score-only)
 
@@ -509,7 +575,16 @@ indexer tower:
 (CuTe-DSL only).** If the CuTe-DSL path fails the wrapper raises
 `RuntimeError` rather than silently falling back.
 
+``````{tab-set}
+:sync-group: frontend-framework
+
+`````{tab-item} PyTorch
+:sync: torch
+:selected:
+
 ```python
+from cudnn import DSA
+
 result = DSA.indexer_backward_wrapper(
     index_q, weights, index_k,
     attn_score, index_score, topk_indices,
@@ -519,6 +594,75 @@ d_index_q, d_weights, d_index_k = (
     result["d_index_q"], result["d_weights"], result["d_index_k"],
 )
 ```
+
+The PyTorch score-gradient stage overwrites `attn_score` and `index_score`
+in place, preserving the existing eager pipeline and class API.
+
+`````
+
+`````{tab-item} JAX
+:sync: jax
+
+```python
+import jax
+from cudnn.jax import DSA
+
+@jax.jit
+def indexer_bwd(
+    index_q,
+    weights,
+    index_k,
+    attn_score,
+    index_score,
+    topk_indices,
+    grad_loss,
+):
+    return DSA.indexer_backward_wrapper(
+        index_q,
+        weights,
+        index_k,
+        attn_score,
+        index_score,
+        topk_indices,
+        sm_scale=1.0,
+        loss_coeff=1.0,
+        grad_loss=grad_loss,
+        block_I=128,
+        topk_indices_global=False,
+    )
+
+result = indexer_bwd(
+    index_q,
+    weights,
+    index_k,
+    attn_score,
+    index_score,
+    topk_indices,
+    grad_loss,
+)
+d_index_q = result.d_index_q
+d_weights = result.d_weights
+d_index_k = result.d_index_k
+```
+
+The JAX wrapper returns
+`IndexerBackwardResult(d_index_q=..., d_weights=..., d_index_k=...)` for the
+fixed SM100 BSHD subset. It requires BF16 `index_q=(B,S_q,64,128)`, BF16
+`weights=(B,S_q,64)`, BF16 `index_k=(B,S_k,128)`, FP32 score tensors, and
+INT32 indices with common shape `(B,S_q,topk)`. `topk` must be divisible by
+`block_I`, and the JAX path currently requires `block_I=128`.
+
+`grad_loss` is a runtime FP32 scalar or one-element array. `sm_scale`,
+`loss_coeff`, `block_I`, and `topk_indices_global` are static compilation
+state. Unlike the PyTorch API, JAX leaves both score inputs unchanged: an
+XLA-owned hidden buffer carries `grad_signal` between the score-gradient and
+GEMM stages, and an XLA-owned zeroed FP32 accumulator is cast to the returned
+BF16 `d_index_k`. This is a standalone backward wrapper and does not register
+a custom VJP.
+
+`````
+
+``````
 
 ### 8. Dense Indexer Backward
 
@@ -535,6 +679,13 @@ and denominators produced by Dense Indexer / Dense Attn Score Recompute.
     Dense Indexer / Dense Attn Score Recompute outputs.
 - **Outputs** — `d_index_q`, `d_weights`, `d_index_k`
 - **Constraints** — SM90 or SM100+, `H >= 64`, `ratio >= 1`
+
+``````{tab-set}
+:sync-group: frontend-framework
+
+`````{tab-item} PyTorch
+:sync: torch
+:selected:
 
 ```python
 dense_index = DSA.dense_indexer_score_recompute_wrapper(
@@ -555,6 +706,22 @@ result = DSA.dense_indexer_backward_wrapper(
 )
 ```
 
+`````
+
+`````{tab-item} JAX
+:sync: jax
+
+Dense indexer backward is not exposed in the JAX namespace. Its current
+score-gradient boundary consumes `grad_loss` as a host scalar and overwrites
+the predict-score input before launching the GEMM stage. A functional JAX
+binding requires a runtime loss operand and a distinct gradient output buffer;
+the sparse wrapper above implements that ABI, but the dense kernel does not
+yet provide it.
+
+`````
+
+``````
+
 ---
 
 ## Limitations
@@ -568,8 +735,9 @@ result = DSA.dense_indexer_backward_wrapper(
   `qhead_per_kv_head ∈ {32, 64}`.
 - **Top-K only up to 2048**; `top_k > 2048` is not supported by the
   underlying radix top-K kernel.
-- **JAX coverage includes Indexer Forward, Indexer Top-K, and the
-  sparse indexer/attention score-recompute pair.** All require concrete compact
-  shapes and do not define autodiff, `vmap`, or automatic sharding rules.
-  Indexer Forward and both score-recompute wrappers support only their fixed
-  batched SM100 domains; their broader SM90/THD PyTorch paths remain unchanged.
+- **JAX coverage includes Indexer Forward, Indexer Top-K, sparse and dense
+  score recompute, sparse Indexer Backward, and Sparse Attention Backward.**
+  The wrappers require concrete compact shapes and do not define autodiff,
+  `vmap`, or automatic sharding rules. Their broader SM90/THD PyTorch paths
+  remain unchanged. Dense Indexer Backward is PyTorch-only for the ABI reason
+  described above.

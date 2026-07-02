@@ -15,10 +15,8 @@ from cudnn.api_base import APIBase, TupleDict
 from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.gemm_validation import (
     block_scale_shape,
-    require_cluster_shape,
     require_contiguous_alignment,
     require_gemm_shapes,
-    require_mma_tiler,
     resolve_max_active_clusters,
 )
 
@@ -42,6 +40,7 @@ class GemmAmaxSm100(APIBase):
 
         self._warn_experimental_api()
         self._logger.debug("Entering __init__")
+        self._kernel = Sm100BlockScaledPersistentDenseGemmKernel
 
         self.a_desc = self._make_tensor_desc(sample_a, name="sample_a")
         self.b_desc = self._make_tensor_desc(sample_b, name="sample_b")
@@ -81,8 +80,8 @@ class GemmAmaxSm100(APIBase):
             self._logger.warning("Uint8 ab_dtype will be interpreted as packed fp4, not as native uint8")
 
         self._value_error_if(
-            self.sf_vec_size not in {16, 32},
-            f"Unsupported sf_vec_size: received {self.sf_vec_size}, expected {{16, 32}}",
+            self.sf_vec_size not in self._kernel.SF_VEC_SIZES,
+            f"Unsupported sf_vec_size: received {self.sf_vec_size}, expected {self._kernel.SF_VEC_SIZES}",
         )
 
         sf_dtype = self._check_dtype(
@@ -174,15 +173,7 @@ class GemmAmaxSm100(APIBase):
         )
 
         self._logger.debug("Checking mma tiler and cluster shape")
-        self.mma_tiler_mn = require_mma_tiler(
-            self.mma_tiler_mn,
-            allowed_m=(128, 256),
-            allowed_n=(128, 256),
-        )
-        self._not_implemented_error_if(
-            self.mma_tiler_mn[0] == 256,
-            "mma_tiler_mn[0] == 256 currently hangs",
-        )
+        self.mma_tiler_mn = self._kernel.require_mma_tiler(self.mma_tiler_mn)
         self._value_error_if(
             self._is_fp4x2(self.ab_dtype) and self.mma_tiler_mn[1] == 256 and k <= 128,
             f"mma_tiler_mn (X, 256) requires k > 128 (packed x2), got {k}",
@@ -194,10 +185,9 @@ class GemmAmaxSm100(APIBase):
 
         # Special cluster shape check for scale factor multicasts.
         # Due to limited size of scale factors, we can't multicast among more than 4 CTAs.
-        self.cluster_shape_mn = require_cluster_shape(
+        self.cluster_shape_mn = self._kernel.require_cluster_shape(
             self.cluster_shape_mn,
-            mma_m=self.mma_tiler_mn[0],
-            max_dimension=4,
+            mma_tiler_mn=self.mma_tiler_mn,
         )
 
         self._logger.debug("Checking tensor alignment")
@@ -222,8 +212,6 @@ class GemmAmaxSm100(APIBase):
             compute_capability < 100,
             f"GemmAmax requires SM100+ compute capability, but found SM{compute_capability} on device {device}",
         )
-
-        self._kernel = Sm100BlockScaledPersistentDenseGemmKernel
 
         self._is_supported = True
         self._logger.debug("check_support completed successfully")

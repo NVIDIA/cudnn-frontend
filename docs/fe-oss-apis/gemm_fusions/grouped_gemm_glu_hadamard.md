@@ -101,6 +101,13 @@ A (valid_m×K×1), SFA     B (N×K×L), SFB       padded_offsets
 
 ### High-level wrapper
 
+``````{tab-set}
+:sync-group: frontend-framework
+
+`````{tab-item} PyTorch
+:sync: torch
+:selected:
+
 ```python
 from cudnn import grouped_gemm_glu_hadamard_wrapper_sm100
 
@@ -130,6 +137,51 @@ c_tensor, d_tensor, amax_tensor = result
 ```
 
 The wrapper constructs the fixed Hadamard matrix internally.
+
+`````
+
+`````{tab-item} JAX
+:sync: jax
+
+Install the JAX integration with `pip install nvidia-cudnn-frontend[jax]`.
+
+```python
+import jax
+import jax.numpy as jnp
+from cudnn.jax import grouped_gemm_glu_hadamard_wrapper_sm100
+
+@jax.jit
+def run(a, b, sfa, sfb, padded_offsets, alpha, prob, bias):
+    return grouped_gemm_glu_hadamard_wrapper_sm100(
+        a,
+        b,
+        sfa,
+        sfb,
+        padded_offsets,
+        alpha,
+        prob,
+        bias_tensor=bias,
+        c_dtype=jnp.bfloat16,
+        d_dtype=jnp.bfloat16,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=16,
+        act_func="swiglu",
+    )
+
+result = run(a, b, sfa, sfb, padded_offsets, alpha, prob, bias)
+c, d, amax, post_rht_amax = result
+```
+
+The JAX API returns `GroupedGemmGluHadamardResult`. Unlike the other grouped
+JAX wrappers, this kernel's supported input path is dense native FP4
+(`jnp.float4_e2m1fn`), with E8M0 or E4M3 scale factors. Raw packed `uint8`
+FP4 and discrete weight pointers are not exposed. Shapes, dtypes, layouts,
+and configuration arguments are static under `jax.jit`.
+
+`````
+
+``````
 
 ### Class API
 

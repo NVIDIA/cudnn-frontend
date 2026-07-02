@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import ast
 import importlib
 from importlib.machinery import ModuleSpec
 from pathlib import Path
@@ -21,9 +22,86 @@ else:
     pytestmark = pytest.mark.L0
 
 
+def _identity_jit(fn=None, **_kwargs):
+    return (lambda decorated_fn: decorated_fn) if fn is None else fn
+
+
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _CUDNN_ROOT = _REPO_ROOT / "python" / "cudnn"
 _TEST_PACKAGE = "cudnn_frontend_jax_gemm_contract_test"
+_COMMON_KERNEL_CAPABILITIES = {
+    "MMA_TILER_M",
+    "MMA_TILER_N",
+    "TWO_CTA_MMA_TILER_M",
+    "MAX_CLUSTER_CTAS",
+    "MAX_CLUSTER_DIMENSION",
+}
+_COMMON_KERNEL_METHODS = {"require_mma_tiler", "require_cluster_shape"}
+
+
+def _kernel_capabilities(
+    path: Path,
+    class_name: str,
+    field_names: set[str],
+    method_names: set[str],
+) -> type:
+    tree = ast.parse(path.read_text(), filename=str(path))
+    kernel_class = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == class_name)
+    field_nodes = []
+    found_fields = set()
+    method_nodes = []
+    found_methods = set()
+    for node in kernel_class.body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target = node.targets[0]
+        elif isinstance(node, ast.AnnAssign):
+            target = node.target
+        else:
+            target = None
+        if isinstance(target, ast.Name) and target.id in field_names:
+            field_nodes.append(node)
+            found_fields.add(target.id)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in method_names:
+            method_nodes.append(node)
+            found_methods.add(node.name)
+
+    missing = field_names - found_fields
+    if missing:
+        raise AssertionError(f"{class_name} is missing public kernel capabilities: {sorted(missing)}")
+    missing = method_names - found_methods
+    if missing:
+        raise AssertionError(f"{class_name} is missing public kernel methods: {sorted(missing)}")
+
+    def validation_helper(name):
+        def call(*args, **kwargs):
+            validation = importlib.import_module(f"{_TEST_PACKAGE}.gemm_validation")
+            return getattr(validation, name)(*args, **kwargs)
+
+        return call
+
+    surface_class = ast.ClassDef(
+        name=class_name,
+        bases=[],
+        keywords=[],
+        body=[*field_nodes, *method_nodes],
+        decorator_list=[],
+    )
+    surface_module = ast.fix_missing_locations(
+        ast.Module(
+            body=[
+                ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0),
+                surface_class,
+            ],
+            type_ignores=[],
+        )
+    )
+    namespace = {
+        "__name__": __name__,
+        "_require_mma_tiler": validation_helper("require_mma_tiler"),
+        "_require_cluster_shape": validation_helper("require_cluster_shape"),
+    }
+    exec(compile(surface_module, str(path), "exec"), namespace)
+    return namespace[class_name]
 
 
 class _DType:
@@ -87,15 +165,75 @@ class JaxGemmContractTest(unittest.TestCase):
 
         cls.fake_cutlass = types.ModuleType("cutlass")
         cls.fake_cutlass.__path__ = []
+        cls.fake_cutlass.Constexpr = object
         cls.fake_cutlass_jax = types.ModuleType("cutlass.jax")
         cls.fake_cutlass_jax.is_available = lambda: True
         cls.fake_cutlass_jax.TensorSpec = _TensorSpec
         cls.fake_cutlass_jax.jax_to_cutlass_dtype = lambda dtype: f"cutlass.{dtype.name}"
         cls.fake_cutlass.jax = cls.fake_cutlass_jax
         cls.fake_cutlass_cute = types.ModuleType("cutlass.cute")
+        cls.fake_cutlass_cute.jit = _identity_jit
         cls.fake_cutlass_cute.where = lambda condition, yes, no: (yes if condition else no)
         cls.fake_cutlass_cute.full_like = lambda value, fill: fill
         cls.fake_cutlass.cute = cls.fake_cutlass_cute
+
+        cls.swiglu_capabilities = _kernel_capabilities(
+            _CUDNN_ROOT / "gemm_swiglu" / "dense_gemm_persistent_swiglu.py",
+            "PersistentDenseGemmKernel",
+            _COMMON_KERNEL_CAPABILITIES | {"SINGLE_CTA_CLUSTER_SHAPE", "SWIGLU_BLOCK_COLUMNS", "SWIGLU_BLOCKS_PER_PAIR"},
+            _COMMON_KERNEL_METHODS | {"get_output_n"},
+        )
+        cls.quantized_swiglu_capabilities = _kernel_capabilities(
+            _CUDNN_ROOT / "gemm_swiglu" / "dense_blockscaled_gemm_persistent_swiglu_interleaved_quant.py",
+            "Sm100BlockScaledPersistentDenseGemmKernel",
+            _COMMON_KERNEL_CAPABILITIES | {"SWIGLU_BLOCK_COLUMNS", "SWIGLU_BLOCKS_PER_PAIR"},
+            _COMMON_KERNEL_METHODS | {"get_output_n"},
+        )
+        cls.srelu_capabilities = _kernel_capabilities(
+            _CUDNN_ROOT / "gemm_srelu" / "dense_blockscaled_gemm_persistent_srelu_quant.py",
+            "Sm100BlockScaledPersistentDenseGemmKernel",
+            _COMMON_KERNEL_CAPABILITIES,
+            _COMMON_KERNEL_METHODS,
+        )
+        cls.dsrelu_capabilities = _kernel_capabilities(
+            _CUDNN_ROOT / "gemm_dsrelu" / "dense_blockscaled_gemm_persistent_dsrelu_quant.py",
+            "Sm100BlockScaledPersistentDenseGemmKernel",
+            _COMMON_KERNEL_CAPABILITIES,
+            _COMMON_KERNEL_METHODS,
+        )
+        cls.amax_capabilities = _kernel_capabilities(
+            _CUDNN_ROOT / "gemm_amax" / "dense_blockscaled_gemm_persistent_amax.py",
+            "Sm100BlockScaledPersistentDenseGemmKernel",
+            _COMMON_KERNEL_CAPABILITIES | {"KNOWN_HANG_MMA_TILER_M"},
+            _COMMON_KERNEL_METHODS,
+        )
+        cls.fake_kernel_modules = {}
+        for module_suffix, class_name, capabilities in (
+            (
+                "gemm_swiglu.dense_gemm_persistent_swiglu",
+                "PersistentDenseGemmKernel",
+                cls.swiglu_capabilities,
+            ),
+            (
+                "gemm_amax.dense_blockscaled_gemm_persistent_amax",
+                "Sm100BlockScaledPersistentDenseGemmKernel",
+                cls.amax_capabilities,
+            ),
+            (
+                "gemm_srelu.dense_blockscaled_gemm_persistent_srelu_quant",
+                "Sm100BlockScaledPersistentDenseGemmKernel",
+                cls.srelu_capabilities,
+            ),
+            (
+                "gemm_dsrelu.dense_blockscaled_gemm_persistent_dsrelu_quant",
+                "Sm100BlockScaledPersistentDenseGemmKernel",
+                cls.dsrelu_capabilities,
+            ),
+        ):
+            module_name = f"{_TEST_PACKAGE}.{module_suffix}"
+            module = types.ModuleType(module_name)
+            setattr(module, class_name, capabilities)
+            cls.fake_kernel_modules[module_name] = module
 
         parent = types.ModuleType(_TEST_PACKAGE)
         parent.__path__ = [str(_CUDNN_ROOT)]
@@ -116,15 +254,17 @@ class JaxGemmContractTest(unittest.TestCase):
 
     @classmethod
     def _optional_modules(cls):
+        modules = {
+            "jax": cls.fake_jax,
+            "jax.numpy": cls.fake_jnp,
+            "cutlass": cls.fake_cutlass,
+            "cutlass.cute": cls.fake_cutlass_cute,
+            "cutlass.jax": cls.fake_cutlass_jax,
+        }
+        modules.update(cls.fake_kernel_modules)
         return mock.patch.dict(
             sys.modules,
-            {
-                "jax": cls.fake_jax,
-                "jax.numpy": cls.fake_jnp,
-                "cutlass": cls.fake_cutlass,
-                "cutlass.cute": cls.fake_cutlass_cute,
-                "cutlass.jax": cls.fake_cutlass_jax,
-            },
+            modules,
         )
 
     @staticmethod
@@ -180,6 +320,32 @@ class JaxGemmContractTest(unittest.TestCase):
         self.assertEqual(result._fields, ("ab12_tensor", "c_tensor", "sfc_tensor", "amax_tensor"))
         self.assertIsNone(result.sfc_tensor)
         self.assertIsNone(result.amax_tensor)
+
+    def test_kernel_capability_fields_are_public(self):
+        for capabilities in (
+            self.swiglu_capabilities,
+            self.quantized_swiglu_capabilities,
+            self.amax_capabilities,
+            self.srelu_capabilities,
+            self.dsrelu_capabilities,
+        ):
+            with self.subTest(capabilities=capabilities):
+                self.assertLessEqual(_COMMON_KERNEL_CAPABILITIES, vars(capabilities).keys())
+                for method_name in _COMMON_KERNEL_METHODS:
+                    self.assertTrue(callable(getattr(capabilities, method_name)))
+
+    def test_swiglu_kernel_validates_output_n(self):
+        for kernel in (self.swiglu_capabilities, self.quantized_swiglu_capabilities):
+            with self.subTest(kernel=kernel):
+                self.assertEqual(kernel.get_output_n(128), 64)
+                with self.assertRaisesRegex(ValueError, "32-column SwiGLU block pairs"):
+                    kernel.get_output_n(96)
+
+    def test_kernel_surface_applies_kernel_specific_configuration_rules(self):
+        with self.assertRaisesRegex(NotImplementedError, "currently hangs"):
+            self.amax_capabilities.require_mma_tiler((256, 128))
+        with self.assertRaisesRegex(ValueError, "single-CTA MMA tile"):
+            self.swiglu_capabilities.require_cluster_shape((2, 2), mma_tiler_mn=(128, 128))
 
     def test_amax_declares_scale_layout_and_initialized_reduction(self):
         captured = {}
@@ -381,6 +547,8 @@ class JaxGemmContractTest(unittest.TestCase):
                 return 11
 
         class FakeSwigluKernel:
+            TWO_CTA_MMA_TILER_M = 256
+
             def __init__(self, **options):
                 self.options = options
 

@@ -17,11 +17,9 @@ from cudnn.api_base import APIBase, TupleDict, ceil_div
 from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.gemm_validation import (
     block_scale_shape,
-    require_cluster_shape,
     require_contiguous_alignment,
     require_full_mma_rows,
     require_gemm_shapes,
-    require_mma_tiler,
     resolve_max_active_clusters,
 )
 
@@ -63,6 +61,7 @@ class GemmDsreluSm100(APIBase):
         self._interpret_uint8_as_fp4x2 = True
 
         self._warn_experimental_api()
+        self._kernel = Sm100BlockScaledPersistentDenseGemmKernel
 
         self.a_desc = self._make_tensor_desc(sample_a, name="sample_a")
         self.b_desc = self._make_tensor_desc(sample_b, name="sample_b")
@@ -83,12 +82,12 @@ class GemmDsreluSm100(APIBase):
         self.alpha = alpha
         self.acc_dtype = acc_dtype
         self.mma_tiler_mn = mma_tiler_mn
-        self.cluster_shape_mn = cluster_shape_mn if cluster_shape_mn is not None else ((2, 1) if mma_tiler_mn[0] == 256 else (1, 1))
+        self.cluster_shape_mn = (
+            cluster_shape_mn if cluster_shape_mn is not None else ((2, 1) if mma_tiler_mn[0] == self._kernel.TWO_CTA_MMA_TILER_M else (1, 1))
+        )
         self.sf_vec_size = sf_vec_size
         self.vector_f32 = vector_f32
         self.num_cluster_overlap_margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
-
-        self._kernel = Sm100BlockScaledPersistentDenseGemmKernel
 
     def check_support(self) -> bool:
         m, n, k, l = require_gemm_shapes(
@@ -134,7 +133,10 @@ class GemmDsreluSm100(APIBase):
 
         self._check_dtype(self.acc_dtype, dtype=torch.float32, name="Accumulator")
 
-        self._value_error_if(self.sf_vec_size not in {16, 32}, f"sf_vec_size must be 16 or 32, got {self.sf_vec_size}")
+        self._value_error_if(
+            self.sf_vec_size not in self._kernel.SF_VEC_SIZES,
+            f"sf_vec_size must be one of {self._kernel.SF_VEC_SIZES}, got {self.sf_vec_size}",
+        )
         self._value_error_if(
             self._is_fp8(self.d_desc) and (self.sfd_desc is None or self.norm_const_desc is None), "sfd and norm_const are required when D is FP8"
         )
@@ -148,21 +150,16 @@ class GemmDsreluSm100(APIBase):
         d_major = _major_from_stride_order(self.d_desc.stride_order, "m", "n")
         self._value_error_if(c_major != d_major, f"C and D must share the same layout, got {c_major} and {d_major}")
 
-        self.mma_tiler_mn = require_mma_tiler(
-            self.mma_tiler_mn,
-            allowed_m=(128, 256),
-            allowed_n=(64, 128, 192, 256),
-        )
+        self.mma_tiler_mn = self._kernel.require_mma_tiler(self.mma_tiler_mn)
         require_full_mma_rows(
             m,
             self.mma_tiler_mn[0],
-            cta_group_size=2 if self.mma_tiler_mn[0] == 256 else 1,
+            cta_group_size=2 if self.mma_tiler_mn[0] == self._kernel.TWO_CTA_MMA_TILER_M else 1,
             reason="the probability load is not predicated",
         )
-        self.cluster_shape_mn = require_cluster_shape(
+        self.cluster_shape_mn = self._kernel.require_cluster_shape(
             self.cluster_shape_mn,
-            mma_m=self.mma_tiler_mn[0],
-            max_dimension=4,
+            mma_tiler_mn=self.mma_tiler_mn,
         )
 
         ab_bits = _convert_to_cutlass_data_type(

@@ -46,6 +46,11 @@ import cutlass.pipeline as pipeline
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 
+from ...gemm_validation import (
+    require_cluster_shape as _require_cluster_shape,
+    require_mma_tiler as _require_mma_tiler,
+)
+
 from ..utils import (
     PersistentTileSchedulerParams,
     StaticPersistentTileScheduler,
@@ -205,8 +210,52 @@ class BlockScaledContiguousGroupedGemmKernel:
 
     """
 
+    MMA_TILER_M = (64, 128, 256)
+    MMA_TILER_N = (128, 256)
+    TWO_CTA_MMA_TILER_M = 256
+    MAX_CLUSTER_CTAS = 16
+    MAX_CLUSTER_DIMENSION = 4
+    CLUSTER_TILER_M = (128, 256)
+    SF_VEC_SIZES = (16, 32)
+    FP8_SF_VEC_SIZE = 32
+    MAX_EXPERTS = 1024
+
     # Fixed pad size for user-side padding (decoupled from kernel tile size)
     FIX_PAD_SIZE = 256
+
+    @classmethod
+    def require_mma_tiler(cls, mma_tiler_mn: Tuple[int, int]) -> Tuple[int, int]:
+        """Validate an FE-supported grouped GEMM MMA tile."""
+
+        return _require_mma_tiler(
+            mma_tiler_mn,
+            allowed_m=cls.MMA_TILER_M,
+            allowed_n=cls.MMA_TILER_N,
+        )
+
+    @classmethod
+    def require_cluster_shape(
+        cls,
+        cluster_shape_mn: Tuple[int, int],
+        *,
+        mma_tiler_mn: Tuple[int, int],
+    ) -> Tuple[int, int]:
+        """Validate the cluster and grouped scheduler tile shape."""
+
+        cluster_shape_mn = _require_cluster_shape(
+            cluster_shape_mn,
+            mma_m=mma_tiler_mn[0],
+            two_cta_mma_m=cls.TWO_CTA_MMA_TILER_M,
+            max_ctas=cls.MAX_CLUSTER_CTAS,
+            max_dimension=cls.MAX_CLUSTER_DIMENSION,
+        )
+        cta_group_size = 2 if mma_tiler_mn[0] == cls.TWO_CTA_MMA_TILER_M else 1
+        cluster_tiler_m = cluster_shape_mn[0] // cta_group_size * mma_tiler_mn[0]
+        if cluster_tiler_m not in cls.CLUSTER_TILER_M:
+            raise ValueError(
+                f"cluster M tile must be one of {cls.CLUSTER_TILER_M}, " f"got {cluster_tiler_m} from MMA tile {mma_tiler_mn} and cluster {cluster_shape_mn}"
+            )
+        return cluster_shape_mn
 
     def __init__(
         self,

@@ -13,6 +13,13 @@ This is available through a standalone API (documented below) and is also used b
 
 ### High-level wrapper
 
+``````{tab-set}
+:sync-group: frontend-framework
+
+`````{tab-item} PyTorch
+:sync: torch
+:selected:
+
 ```python
 import torch
 from cudnn import sdpa_fwd_wrapper_sm100_d256
@@ -38,6 +45,45 @@ result = sdpa_fwd_wrapper_sm100_d256(
 o_tensor, lse_tensor = result
 # Key access: result["o_tensor"], result["lse_tensor"]
 ```
+
+`````
+
+`````{tab-item} JAX
+:sync: jax
+
+```python
+import jax
+from cudnn.jax import sdpa_fwd_wrapper_sm100_d256
+
+@jax.jit
+def sdpa_fwd(q, k, v):
+    return sdpa_fwd_wrapper_sm100_d256(
+        q,
+        k,
+        v,
+        mma_tiler_mn=(128, 128),
+        is_causal=False,
+        window_size=(-1, -1),
+        scale_softmax=None,
+        scale_output=1.0,
+    )
+
+result = sdpa_fwd(q, k, v)
+o_tensor, lse_tensor = result.o_tensor, result.lse_tensor
+```
+
+The JAX wrapper returns `SdpaFwdResult(o_tensor=..., lse_tensor=...)`. It
+supports fixed BHSD arrays only: Q, K, and V use logical shape
+`(B,H,S,256)`, share FP16 or BF16 dtype, and satisfy `H_q % H_kv == 0`.
+Packed THD inputs, cumulative lengths, `max_s_*`, explicit outputs, and stream
+arguments remain PyTorch-only. Tensor data is runtime; shapes, dtypes,
+accumulator types, tiling, mask/window configuration, and both scale values
+are static compilation state. XLA supplies the runtime stream and owns both
+results.
+
+`````
+
+``````
 
 ### Class API
 
@@ -124,12 +170,15 @@ sdpa_fwd.execute(
 
 ## Wrapper return values
 
-Returns a `TupleDict` with keys:
+The PyTorch wrapper returns a `TupleDict` with keys:
 
 - `o_tensor`
 - `lse_tensor`
 
 Tuple unpacking order is `(o_tensor, lse_tensor)`.
+
+The JAX wrapper returns `SdpaFwdResult` with the same `o_tensor` and
+`lse_tensor` field names and tuple order.
 
 ## Support surface and constraints
 

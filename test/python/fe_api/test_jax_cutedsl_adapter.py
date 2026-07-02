@@ -22,6 +22,14 @@ else:
     pytestmark = pytest.mark.L0
 
 
+def _identity_jit(fn=None, **kwargs):
+    def decorate(decorated_fn):
+        decorated_fn._cute_jit_options = kwargs
+        return decorated_fn
+
+    return decorate if fn is None else decorate(fn)
+
+
 _MODULE_PATH = Path(__file__).resolve().parents[3] / "python" / "cudnn" / "_jax" / "cutedsl.py"
 _SPEC = importlib.util.spec_from_file_location("cudnn_jax_cutedsl_poc", _MODULE_PATH)
 assert _SPEC is not None and _SPEC.loader is not None
@@ -34,8 +42,12 @@ _bootstrap_jax.__path__ = []
 _bootstrap_jax.numpy = _bootstrap_jnp
 _bootstrap_cutlass_jax = types.ModuleType("cutlass.jax")
 _bootstrap_cutlass_jax.TensorSpec = type("TensorSpec", (), {})
+_bootstrap_cute = types.ModuleType("cutlass.cute")
+_bootstrap_cute.jit = _identity_jit
 _bootstrap_cutlass = types.ModuleType("cutlass")
 _bootstrap_cutlass.__path__ = []
+_bootstrap_cutlass.Constexpr = object
+_bootstrap_cutlass.cute = _bootstrap_cute
 _bootstrap_cutlass.jax = _bootstrap_cutlass_jax
 with mock.patch.dict(
     sys.modules,
@@ -43,13 +55,14 @@ with mock.patch.dict(
         "jax": _bootstrap_jax,
         "jax.numpy": _bootstrap_jnp,
         "cutlass": _bootstrap_cutlass,
+        "cutlass.cute": _bootstrap_cute,
         "cutlass.jax": _bootstrap_cutlass_jax,
     },
 ):
     _SPEC.loader.exec_module(_MODULE)
 
 BufferSpec = _MODULE.BufferSpec
-_call_cutedsl_with_modules = _MODULE._call_cutedsl_with_modules
+call_cutedsl = _MODULE.call_cutedsl
 
 
 class _Array:
@@ -139,15 +152,16 @@ class CallCutedslAdapterTest(unittest.TestCase):
     def _call(self, kernel, inputs, **kwargs):
         fake_jnp = _FakeJaxNumpy()
         fake_cutlass_jax = _FakeCutlassJax()
-        result = _call_cutedsl_with_modules(
-            kernel,
-            inputs,
-            jax_module=_FakeJax,
-            jax_numpy_module=fake_jnp,
-            cutlass_jax_module=fake_cutlass_jax,
-            **kwargs,
-        )
+        with (
+            mock.patch.object(_MODULE, "jax", _FakeJax),
+            mock.patch.object(_MODULE, "jnp", fake_jnp),
+            mock.patch.object(_MODULE, "cutlass_jax", fake_cutlass_jax),
+        ):
+            result = call_cutedsl(kernel, inputs, **kwargs)
         return result, fake_jnp, fake_cutlass_jax
+
+    def test_launch_adapter_uses_compile_time_tracing(self):
+        self.assertEqual(_MODULE._launch_adapter._cute_jit_options, {"preprocess": False})
 
     def test_workspace_is_passed_to_launcher_but_hidden_from_results(self):
         seen = []
@@ -300,13 +314,25 @@ class CallCutedslAdapterTest(unittest.TestCase):
                 outputs=(BufferSpec("output", (1,), "f32"),),
             )
 
-        with self.assertRaisesRegex(ValueError, "reserved by cutlass_call"):
-            self._call(
-                lambda stream, x, y: None,
-                (_Array((1,), "f32", "x"),),
-                outputs=(BufferSpec("output", (1,), "f32"),),
-                static_args={"compile_options": "not a kernel argument"},
-            )
+    def test_kernel_static_args_do_not_collide_with_cutlass_call_options(self):
+        seen = []
+
+        def kernel(stream, x, output, *, compile_options):
+            seen.append((stream, x, output, compile_options))
+
+        x = _Array((1,), "f32", "x")
+        result, _, bridge = self._call(
+            kernel,
+            (x,),
+            outputs=(BufferSpec("output", (1,), "f32"),),
+            static_args={"compile_options": "kernel option"},
+        )
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(seen[0][3], "kernel option")
+        self.assertIsNone(bridge.calls[0][1]["compile_options"])
+        self.assertIs(bridge.calls[0][0], _MODULE._launch_adapter)
+        self.assertIsInstance(hash(bridge.calls[0][1]["config"]), int)
 
 
 if __name__ == "__main__":

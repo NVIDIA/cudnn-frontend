@@ -23,6 +23,10 @@ else:
     pytestmark = pytest.mark.L0
 
 
+def _identity_jit(fn=None, **_kwargs):
+    return (lambda decorated_fn: decorated_fn) if fn is None else fn
+
+
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _CUDNN_ROOT = _REPO_ROOT / "python" / "cudnn"
 _TEST_PACKAGE = "cudnn_frontend_jax_surface_test"
@@ -67,6 +71,10 @@ class JaxApiSurfaceTest(unittest.TestCase):
         fake_cutlass_jax.jax_to_cutlass_dtype = lambda dtype: dtype
         fake_cutlass = types.ModuleType("cutlass")
         fake_cutlass.__path__ = []
+        fake_cutlass.Constexpr = object
+        fake_cutlass_cute = types.ModuleType("cutlass.cute")
+        fake_cutlass_cute.jit = _identity_jit
+        fake_cutlass.cute = fake_cutlass_cute
         fake_cutlass.jax = fake_cutlass_jax
 
         return mock.patch.dict(
@@ -75,6 +83,7 @@ class JaxApiSurfaceTest(unittest.TestCase):
                 "jax": fake_jax,
                 "jax.numpy": fake_jnp,
                 "cutlass": fake_cutlass,
+                "cutlass.cute": fake_cutlass_cute,
                 "cutlass.jax": fake_cutlass_jax,
                 "torch": None,
             },
@@ -97,11 +106,18 @@ class JaxApiSurfaceTest(unittest.TestCase):
                 operation_modules[operation_path] = sys.modules[module_name]
             self.assertIn(f"{_TEST_PACKAGE}._jax.cutedsl", sys.modules)
 
-            expected_exports = {"DSA"}
+            expected_exports = {"DSA", "NSA"}
             expected_dsa_exports = set()
+            expected_nsa_exports = set()
             torch_dsa_exports = set(
                 _literal_assignment(
                     _CUDNN_ROOT / "deepseek_sparse_attention" / "__init__.py",
+                    "_SYMBOLS",
+                )
+            )
+            torch_nsa_exports = set(
+                _literal_assignment(
+                    _CUDNN_ROOT / "native_sparse_attention" / "__init__.py",
                     "_SYMBOLS",
                 )
             )
@@ -116,6 +132,8 @@ class JaxApiSurfaceTest(unittest.TestCase):
                     self.assertTrue(callable(getattr(jax_namespace, name)))
                     if name in torch_dsa_exports:
                         expected_dsa_exports.add(name)
+                    if name in torch_nsa_exports:
+                        expected_nsa_exports.add(name)
 
                 loaded_descendants = {name for name in sys.modules if name.startswith(f"{_TEST_PACKAGE}.{operation_path}.")}
                 self.assertLessEqual(
@@ -128,8 +146,11 @@ class JaxApiSurfaceTest(unittest.TestCase):
 
             self.assertEqual(set(jax_namespace.__all__), expected_exports)
             self.assertEqual(set(vars(jax_namespace.DSA)), expected_dsa_exports)
+            self.assertEqual(set(vars(jax_namespace.NSA)), expected_nsa_exports)
             for name in expected_dsa_exports:
                 self.assertIs(getattr(jax_namespace.DSA, name), getattr(jax_namespace, name))
+            for name in expected_nsa_exports:
+                self.assertIs(getattr(jax_namespace.NSA, name), getattr(jax_namespace, name))
 
             torch_after = {name for name, module in sys.modules.items() if name.split(".", 1)[0] == "torch" and module is not None}
             self.assertEqual(torch_after - torch_before, set())

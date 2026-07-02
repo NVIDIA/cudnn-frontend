@@ -114,7 +114,8 @@ def require_cluster_shape(
     cluster_shape_mn: Sequence[int],
     *,
     mma_m: int,
-    max_ctas: int = 16,
+    two_cta_mma_m: int,
+    max_ctas: int,
     max_dimension: Optional[int] = None,
 ) -> tuple[int, int]:
     """Validate a cluster shape and its 2-CTA MMA requirement."""
@@ -132,8 +133,8 @@ def require_cluster_shape(
         raise ValueError(
             "cluster_shape_mn dimensions must be positive powers of two" f"{dimension_limit} with product at most {max_ctas}, got {cluster_shape_mn}"
         )
-    if mma_m == 256 and cluster_m % 2:
-        raise ValueError("cluster_shape_mn[0] must be divisible by 2 with a 256-wide M tile")
+    if mma_m == two_cta_mma_m and cluster_m % 2:
+        raise ValueError("cluster_shape_mn[0] must be divisible by 2 with a " f"{two_cta_mma_m}-wide M tile")
     return cluster_shape_mn
 
 
@@ -169,14 +170,6 @@ def require_full_mma_rows(
     if m % rows_per_cta:
         suffix = "" if not reason else f" because {reason}"
         raise ValueError(f"M must be divisible by {rows_per_cta} (CTA_M for TILE_M={mma_m})" f"{suffix}, got {m}")
-
-
-def require_swiglu_n(n: int) -> int:
-    """Validate SwiGLU's paired 32-column blocks and return output N."""
-
-    if n % 64:
-        raise ValueError(f"N must be divisible by 64 for 32-column SwiGLU block pairs, got {n}")
-    return n // 2
 
 
 def resolve_max_active_clusters(max_active_clusters: int, overlap_margin: int) -> int:

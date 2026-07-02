@@ -24,6 +24,19 @@ class IndexerTopKResult(NamedTuple):
     values: Any
 
 
+class LocalToGlobalResult(NamedTuple):
+    """Top-K indices converted to the global flattened KV index space."""
+
+    indices: Any
+
+
+class CompactifyResult(NamedTuple):
+    """Valid row-wise indices and their per-row lengths."""
+
+    indices: Any
+    topk_length: Any
+
+
 @lru_cache(maxsize=None)
 def _make_launcher(
     cutlass_dtype: Any,
@@ -69,6 +82,61 @@ def _make_launcher(
             enable_persistent_dynamic_scheduling=False,
             min_blocks_per_mp=1,
         )
+
+    return launch
+
+
+@lru_cache(maxsize=None)
+def _make_local_to_global_launcher(*, is_varlen: bool, seqlen_k: int):
+    from cutlass import Int32
+
+    from .local_to_global_dsl import LocalToGlobalTopK
+
+    kernel = LocalToGlobalTopK(is_varlen=is_varlen)
+
+    if is_varlen:
+
+        def launch(
+            stream,
+            local_indices,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            global_indices,
+        ):
+            kernel(
+                local_indices,
+                global_indices,
+                Int32(seqlen_k),
+                cu_seqlens_q,
+                cu_seqlens_k,
+                stream,
+            )
+
+    else:
+
+        def launch(stream, local_indices, global_indices):
+            kernel(
+                local_indices,
+                global_indices,
+                Int32(seqlen_k),
+                None,
+                None,
+                stream,
+            )
+
+    return launch
+
+
+@lru_cache(maxsize=None)
+def _make_compactify_launcher(*, rows: int, cols: int):
+    from cutlass import Int32
+
+    from .compactify import CompactifyKernel
+
+    kernel = CompactifyKernel(cols=cols)
+
+    def launch(stream, indices, compact_indices, topk_length):
+        kernel(indices, compact_indices, topk_length, Int32(rows), stream)
 
     return launch
 
@@ -197,4 +265,115 @@ def indexer_top_k_wrapper(
     return IndexerTopKResult(indices=output_indices, values=output_values)
 
 
-__all__ = ["IndexerTopKResult", "indexer_top_k_wrapper"]
+def local_to_global_wrapper(
+    local_indices: Any,
+    seqlen_k: int,
+    cu_seqlens_q: Any | None = None,
+    cu_seqlens_k: Any | None = None,
+) -> LocalToGlobalResult:
+    """Convert local top-K indices to the global flattened KV index space.
+
+    Fixed-shape input has shape ``(B, S_q, topk)`` and uses
+    ``batch_index * seqlen_k`` as its offset. Packed input has shape
+    ``(total_q, topk)`` and requires matching ``cu_seqlens_q`` and
+    ``cu_seqlens_k`` int32 arrays. Runtime cumulative lengths are consumed by
+    the kernel and are not copied to the host while tracing.
+    """
+
+    if not hasattr(local_indices, "shape") or not hasattr(local_indices, "dtype"):
+        raise TypeError("local_indices must have shape and dtype metadata")
+    if seqlen_k <= 0:
+        raise ValueError(f"seqlen_k must be positive, got {seqlen_k}")
+
+    is_varlen = cu_seqlens_q is not None or cu_seqlens_k is not None
+    if is_varlen:
+        if cu_seqlens_q is None or cu_seqlens_k is None:
+            raise ValueError("Packed local-to-global conversion requires both cu_seqlens_q " "and cu_seqlens_k")
+        if len(local_indices.shape) != 2:
+            raise ValueError("Packed local_indices must have rank 2, got shape " f"{local_indices.shape}")
+        for name, value in (
+            ("cu_seqlens_q", cu_seqlens_q),
+            ("cu_seqlens_k", cu_seqlens_k),
+        ):
+            if not hasattr(value, "shape") or not hasattr(value, "dtype"):
+                raise TypeError(f"{name} must have shape and dtype metadata")
+            if len(value.shape) != 1:
+                raise ValueError(f"{name} must have rank 1, got shape {value.shape}")
+            require_dtype(f"{name}.dtype", value, (jnp.int32,))
+        if tuple(cu_seqlens_q.shape) != tuple(cu_seqlens_k.shape):
+            raise ValueError("cu_seqlens_q and cu_seqlens_k must have the same shape, got " f"{cu_seqlens_q.shape} and {cu_seqlens_k.shape}")
+        inputs = (local_indices, cu_seqlens_q, cu_seqlens_k)
+    else:
+        if len(local_indices.shape) != 3:
+            raise ValueError("Fixed-shape local_indices must have rank 3, got shape " f"{local_indices.shape}")
+        inputs = (local_indices,)
+
+    require_dtype(
+        "local_indices.dtype",
+        local_indices,
+        (jnp.int32, jnp.int64),
+    )
+    (global_indices,) = call_cutedsl(
+        _make_local_to_global_launcher(
+            is_varlen=is_varlen,
+            seqlen_k=int(seqlen_k),
+        ),
+        inputs,
+        outputs=(
+            BufferSpec(
+                "indices",
+                tuple(local_indices.shape),
+                jnp.int32,
+            ),
+        ),
+        use_static_tensors=True,
+    )
+    return LocalToGlobalResult(indices=global_indices)
+
+
+def compactify_wrapper(indices: Any) -> CompactifyResult:
+    """Pack nonnegative indices to the front of each row.
+
+    ``indices`` may have shape ``(rows, topk)`` or ``(B, S_q, topk)``. As in
+    the Torch API, a rank-3 input is flattened batch-major and the returned
+    index array has shape ``(B * S_q, topk)``. ``topk_length`` contains the
+    number of nonnegative entries in every returned row.
+    """
+
+    if not hasattr(indices, "shape") or not hasattr(indices, "dtype"):
+        raise TypeError("indices must have shape and dtype metadata")
+    if len(indices.shape) not in (2, 3):
+        raise ValueError(f"indices must have rank 2 or 3, got shape {indices.shape}")
+    require_dtype("indices.dtype", indices, (jnp.int32,))
+
+    cols = indices.shape[-1]
+    rows = 1
+    for extent in indices.shape[:-1]:
+        rows *= extent
+    if rows <= 0 or cols <= 0:
+        raise ValueError(f"indices dimensions must be positive, got {indices.shape}")
+
+    flat_indices = jnp.reshape(indices, (rows, cols))
+    compact_indices, topk_length = call_cutedsl(
+        _make_compactify_launcher(rows=rows, cols=cols),
+        (flat_indices,),
+        outputs=(
+            BufferSpec("indices", (rows, cols), jnp.int32),
+            BufferSpec("topk_length", (rows,), jnp.int32),
+        ),
+        use_static_tensors=True,
+    )
+    return CompactifyResult(
+        indices=compact_indices,
+        topk_length=topk_length,
+    )
+
+
+__all__ = [
+    "CompactifyResult",
+    "IndexerTopKResult",
+    "LocalToGlobalResult",
+    "compactify_wrapper",
+    "indexer_top_k_wrapper",
+    "local_to_global_wrapper",
+]

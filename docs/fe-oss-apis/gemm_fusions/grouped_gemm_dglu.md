@@ -116,6 +116,13 @@ $$
 
 **Dense mode:**
 
+``````{tab-set}
+:sync-group: frontend-framework
+
+`````{tab-item} PyTorch
+:sync: torch
+:selected:
+
 ```python
 from cudnn import grouped_gemm_dglu_wrapper_sm100
 from cuda.bindings import driver as cuda
@@ -160,6 +167,53 @@ sfd_col = outputs["sfd_col_tensor"]
 # or tuple unpacking:
 d_row, d_col, dprob, dbias, amax, sfd_row, sfd_col = outputs
 ```
+
+`````
+
+`````{tab-item} JAX
+:sync: jax
+
+Install the JAX integration with `pip install nvidia-cudnn-frontend[jax]`.
+
+```python
+import jax
+import jax.numpy as jnp
+from cudnn.jax import grouped_gemm_dglu_wrapper_sm100
+
+@jax.jit
+def run(a, b, c, sfa, sfb, padded_offsets, alpha, beta, prob, norm_const):
+    return grouped_gemm_dglu_wrapper_sm100(
+        a_tensor=a,
+        c_tensor=c,
+        sfa_tensor=sfa,
+        padded_offsets=padded_offsets,
+        alpha_tensor=alpha,
+        beta_tensor=beta,
+        prob_tensor=prob,
+        b_tensor=b,
+        sfb_tensor=sfb,
+        generate_dbias=True,
+        norm_const_tensor=norm_const,
+        d_dtype=jnp.float8_e4m3fn,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=32,
+        act_func="dswiglu",
+    )
+
+result = run(a, b, c, sfa, sfb, padded_offsets, alpha, beta, prob, norm_const)
+d_row, d_col, dprob, dbias, amax, sfd_row, sfd_col = result
+```
+
+The JAX API returns `GroupedGemmDgluResult`. `dprob` and optional `dbias` are
+fresh zero-initialized functional results. The current surface supports dense
+FP8 A/B and FP8 D with E8M0 scales and `sf_vec_size=32`; `amax` is `None`.
+Shapes, dtypes, layouts, and configuration arguments are static under
+`jax.jit`.
+
+`````
+
+``````
 
 **Discrete mode:**
 
