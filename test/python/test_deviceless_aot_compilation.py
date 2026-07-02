@@ -9,6 +9,12 @@ Tests deviceless AoT compilation.
 """
 
 
+@pytest.mark.L0
+def test_deserialize_enforce_precompiled_rejects_json_graph():
+    with pytest.raises(Exception, match="enforce_precompiled requires plan serialization"):
+        cudnn.pygraph().deserialize("{}", enforce_precompiled=True)
+
+
 @pytest.mark.skipif(
     LooseVersion(cudnn.backend_version_string()) < "9.11",
     reason="requires cudnn 9.11 or higher",
@@ -74,7 +80,7 @@ def test_device_properties():
         cudnn.set_stream(handle=cudnn_handle, stream=stream)
 
         graph_deserialized = cudnn.pygraph()
-        graph_deserialized.deserialize(cudnn_handle, json_str)
+        graph_deserialized.deserialize(cudnn_handle, json_str, enforce_precompiled=True)
 
         Y_actual = torch.zeros_like(Y_ref)
 

@@ -231,11 +231,14 @@ def indexer_forward_wrapper(
     cu_seqlens_k: Optional[torch.Tensor] = None,
     max_seqlen_q: Optional[int] = None,
     max_seqlen_k: Optional[int] = None,
+    q_causal_offsets: Optional[torch.Tensor] = None,
 ) -> TupleDict:
     """High-level wrapper. Allocates the output buffer with TMA padding on S_k.
 
     Returns ``{'scores': (B, S_q, S_k) FP32}``. The ratio causal mask marks
-    positions outside the valid KV range with -inf.
+    positions outside the valid KV range with -inf. ``q_causal_offsets`` may
+    specify the global uncompressed token index for each batch/THD segment's
+    local q[0].
     """
     if device_major() == 9:
         unsupported = []
@@ -265,6 +268,7 @@ def indexer_forward_wrapper(
             cu_seqlens_k=cu_seqlens_k,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
+            q_causal_offsets=q_causal_offsets,
             current_stream=stream,
         )
         return TupleDict(scores=scores)
@@ -289,6 +293,7 @@ def indexer_forward_wrapper(
         cu_seqlens_k=cu_seqlens_k,
         max_seqlen_q=max_seqlen_q,
         max_seqlen_k=max_seqlen_k,
+        q_causal_offsets=q_causal_offsets,
         current_stream=stream,
     )
     return TupleDict(scores=scores)

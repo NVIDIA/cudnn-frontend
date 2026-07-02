@@ -132,19 +132,31 @@ dq, dkv, d_sink = result["dq"], result["dkv"], result["d_sink"]
 ### 2. Indexer Forward (score-only)
 
 Computes dense indexer scores:
-``S[b, q, k] = sum_h ReLU(Q_h · K_h^T) · W_h`` with a ratio causal mask
-(positions with `k >= (S_k * ratio - S_q + q + 1)//ratio` masked; this
-reduces to `(q+1)//ratio` when `S_q == S_k * ratio`).
+``S[b, q, k] = sum_h ReLU(Q_h · K_h^T) · W_h`` with a ratio-causal mask.
+For local query row `q_local`, valid KV columns satisfy
+`k_local < clamp((q_causal_offsets[b] + q_local + 1) // ratio, 0, seqlen_k_b)`.
+When `q_causal_offsets` is omitted, all offsets are zero.
+
+`q_causal_offsets[b]` is the global uncompressed token index corresponding to
+local `q[0]` for batch or THD segment `b`. It is not the packed storage offset
+from `cu_seqlens_q`: `cu_seqlens_q` locates where a local Q segment is stored,
+while `q_causal_offsets` locates that segment in the global causal timeline.
+The K columns are assumed to be a compressed-KV prefix starting at global
+compressed column 0.
 
 - **Inputs**
   - `q`: `(B, S_q, H_q, D)` BF16
   - `k`: `(B, S_k, H_kv, D)` BF16
   - `w`: `(B, S_q, H_q)` BF16
+  - `q_causal_offsets` (optional): CUDA INT32 tensor with one entry per
+    batch/THD segment, on the same device as `q`.
 - **Output** — `scores`: `(B, S_q, S_k)` FP32
 - **Constraints** — SM100+, `head_dim == 128`, `qhead_per_kv_head ∈ {32, 64}`
 
 ```python
-result = DSA.indexer_forward_wrapper(q, k, w, ratio=4)
+result = DSA.indexer_forward_wrapper(
+    q, k, w, ratio=4, q_causal_offsets=q_causal_offsets,
+)
 scores = result["scores"]
 ```
 
@@ -194,8 +206,9 @@ L1-normalised head-summed softmax over top-K entries:
 ### 6. Dense Indexer / Dense Attn Score Recompute
 
 Full-KV (no top-K) analogues of §4 and §5. Each returns `{'out', 'denom'}`.
-They apply the same bottom-right ratio causal mask as Indexer Forward; masked
-positions are written as zero and excluded from `denom`.
+They apply the same ratio-causal mask as Indexer Forward; masked positions are
+written as zero and excluded from `denom`. Pass the same `q_causal_offsets` to
+all dense score tensors that feed the same loss path.
 
 ### 7. Indexer Backward
 
@@ -236,18 +249,27 @@ and denominators produced by Dense Indexer / Dense Attn Score Recompute.
   - `index_k`: `(B, S_k, D)` BF16
   - `attn_score`, `index_score`: `(B, S_q, S_k)` FP32 raw dense scores
   - `attn_l1norm`, `index_lse`: `(B, S_q)` FP32 denominators
+  - `q_causal_offsets` (optional): same offsets used for the corresponding
+    Dense Indexer / Dense Attn Score Recompute outputs.
 - **Outputs** — `d_index_q`, `d_weights`, `d_index_k`
 - **Constraints** — SM90 or SM100+, `H >= 64`, `ratio >= 1`
 
 ```python
-dense_index = DSA.dense_indexer_score_recompute_wrapper(index_q, index_k.unsqueeze(2), weights)
-dense_attn = DSA.dense_attn_score_recompute_wrapper(attn_q, attn_k, lse, softmax_scale)
+dense_index = DSA.dense_indexer_score_recompute_wrapper(
+    index_q, index_k.unsqueeze(2), weights,
+    q_causal_offsets=q_causal_offsets,
+)
+dense_attn = DSA.dense_attn_score_recompute_wrapper(
+    attn_q, attn_k, lse, softmax_scale,
+    q_causal_offsets=q_causal_offsets,
+)
 
 result = DSA.dense_indexer_backward_wrapper(
     index_q, weights, index_k,
     dense_attn["out"], dense_attn["denom"],
     dense_index["out"], dense_index["denom"],
     sm_scale=1.0, loss_coeff=1.0, grad_loss=1.0, block_I=128, ratio=1,
+    q_causal_offsets=q_causal_offsets,
 )
 ```
 

@@ -140,6 +140,7 @@ def ref_indexer_forward(
     k: torch.Tensor,  # (B, S_k, H_kv, D)
     w: torch.Tensor,  # (B, S_q, H_q)
     ratio: int,
+    q_causal_offsets: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Dense indexer score computation. Returns (B, S_q, S_k) FP32."""
     b, s_q, h_q, d = q.shape
@@ -158,8 +159,8 @@ def ref_indexer_forward(
     scores = scores * w_f.unsqueeze(-1)  # (B, S_q, H_q, S_k)
     out = scores.sum(dim=2)  # (B, S_q, S_k)
 
-    valid = _bottom_right_causal_mask(s_q, s_k, ratio, q.device)
-    out = out.masked_fill(~valid.unsqueeze(0), float("-inf"))
+    valid = _batched_ratio_causal_mask(s_q, s_k, ratio, q.device, b, q_causal_offsets)
+    out = out.masked_fill(~valid, float("-inf"))
     return out
 
 
@@ -169,10 +170,11 @@ def check_ref_indexer_forward(
     w,
     out_actual,
     ratio: int,
+    q_causal_offsets: Optional[torch.Tensor] = None,
     atol: float = 1e-4,
     rtol: float = 1e-4,
 ):
-    out_ref = ref_indexer_forward(q, k, w, ratio)
+    out_ref = ref_indexer_forward(q, k, w, ratio, q_causal_offsets=q_causal_offsets)
     finite = torch.isfinite(out_ref)
     assert torch.equal(torch.isneginf(out_actual), torch.isneginf(out_ref))
     torch.testing.assert_close(
@@ -348,18 +350,46 @@ def check_ref_sparse_score_recompute(
 # ---------------------------------------------------------------------------
 
 
+def _ratio_causal_mask(
+    s_q: int,
+    s_k: int,
+    ratio: int,
+    device: torch.device,
+    q_causal_offset: int = 0,
+) -> torch.Tensor:
+    """Return ratio-causal validity mask for one local Q segment."""
+    q = q_causal_offset + torch.arange(s_q, device=device, dtype=torch.int64)
+    k_pos = torch.arange(s_k, device=device, dtype=torch.int64)
+    col_limit = torch.div(q + 1, ratio, rounding_mode="floor").clamp(0, s_k)
+    return k_pos.view(1, s_k) < col_limit.view(s_q, 1)
+
+
+def _batched_ratio_causal_mask(
+    s_q: int,
+    s_k: int,
+    ratio: int,
+    device: torch.device,
+    batch: int,
+    q_causal_offsets: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Return ``(B, S_q, S_k)`` ratio-causal masks with per-batch offsets."""
+    if q_causal_offsets is None:
+        return _ratio_causal_mask(s_q, s_k, ratio, device).unsqueeze(0).expand(batch, -1, -1)
+    offsets = q_causal_offsets.to(device=device, dtype=torch.int64)
+    q = torch.arange(s_q, device=device, dtype=torch.int64).view(1, s_q)
+    k_pos = torch.arange(s_k, device=device, dtype=torch.int64).view(1, 1, s_k)
+    col_limit = torch.div(offsets.view(batch, 1) + q + 1, ratio, rounding_mode="floor").clamp(0, s_k)
+    return k_pos < col_limit.unsqueeze(-1)
+
+
 def _bottom_right_causal_mask(
     s_q: int,
     s_k: int,
     ratio: int,
     device: torch.device,
 ) -> torch.Tensor:
-    """Return dense score validity mask with bottom-right causal alignment."""
-    q_global_start = s_k * ratio - s_q
-    q = torch.arange(s_q, device=device, dtype=torch.int64)
-    k_pos = torch.arange(s_k, device=device, dtype=torch.int64)
-    col_limit = torch.div(q_global_start + q + 1, ratio, rounding_mode="floor")
-    return k_pos.view(1, s_k) < col_limit.view(s_q, 1)
+    """Compatibility alias for the offset-0 ratio-causal mask."""
+    return _ratio_causal_mask(s_q, s_k, ratio, device)
 
 
 def ref_dense_indexer_score_recompute(
@@ -367,13 +397,14 @@ def ref_dense_indexer_score_recompute(
     k_indexer: torch.Tensor,  # (B, S_k, H_kv, D) — H_kv=1 for MQA
     weights: torch.Tensor,  # (B, S_q, H_q)
     ratio: int = 1,
+    q_causal_offsets: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Reference for ``DSA.dense_indexer_score_recompute_wrapper``.
 
     Computes per-query dense indexer scores
     ``S[b, q, k] = sum_h ReLU(Q_h · K_h^T) · W_h`` and the
     ``LogSumExp``-style denom ``log(sum_k exp(S[b, q, k]))`` over valid
-    bottom-right causal positions.
+    ratio-causal compressed-KV positions.
     """
     b, s_q, h_q, d = q_indexer.shape
     _, s_k, h_kv, _ = k_indexer.shape
@@ -388,10 +419,10 @@ def ref_dense_indexer_score_recompute(
     scores = torch.relu(scores)
     scores = (scores * w_f.unsqueeze(-1)).sum(dim=2)  # (B, S_q, S_k)
 
-    valid = _bottom_right_causal_mask(s_q, s_k, ratio, q_indexer.device)
-    scores_for_denom = scores.masked_fill(~valid.unsqueeze(0), float("-inf"))
+    valid = _batched_ratio_causal_mask(s_q, s_k, ratio, q_indexer.device, b, q_causal_offsets)
+    scores_for_denom = scores.masked_fill(~valid, float("-inf"))
     denom = torch.logsumexp(scores_for_denom, dim=-1)  # (B, S_q)
-    return scores.masked_fill(~valid.unsqueeze(0), 0.0), denom
+    return scores.masked_fill(~valid, 0.0), denom
 
 
 def ref_dense_attn_score_recompute(
@@ -400,12 +431,13 @@ def ref_dense_attn_score_recompute(
     lse: torch.Tensor,  # (B, S_q, H_q) FP32
     softmax_scale: float,
     ratio: int = 1,
+    q_causal_offsets: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Reference for ``DSA.dense_attn_score_recompute_wrapper``.
 
     ``P[b, q, h, k] = exp(Q_h · K_h^T · scale - LSE_h)``, sum over heads,
     returns unnormalized ``S`` and the per-query L1-norm denom over valid
-    bottom-right causal positions.
+    ratio-causal compressed-KV positions.
     """
     b, s_q, h_q, d = q_attn.shape
     _, s_k, h_kv, _ = k_attn.shape
@@ -419,8 +451,8 @@ def ref_dense_attn_score_recompute(
     p = torch.exp(qk - lse_f.unsqueeze(-1))  # (B, S_q, H_q, S_k)
     s = p.sum(dim=2)  # (B, S_q, S_k)
 
-    valid = _bottom_right_causal_mask(s_q, s_k, ratio, q_attn.device)
-    s = s.masked_fill(~valid.unsqueeze(0), 0.0)
+    valid = _batched_ratio_causal_mask(s_q, s_k, ratio, q_attn.device, b, q_causal_offsets)
+    s = s.masked_fill(~valid, 0.0)
     denom = s.sum(dim=-1)  # (B, S_q)
     return s, denom
 
@@ -434,6 +466,7 @@ def check_ref_dense_score_recompute(
     denom_actual,
     softmax_scale: Optional[float] = None,
     ratio: int = 1,
+    q_causal_offsets: Optional[torch.Tensor] = None,
     atol_scores: float = 5e-3,
     rtol_scores: float = 5e-3,
     atol_denom: float = 5e-3,
@@ -447,7 +480,7 @@ def check_ref_dense_score_recompute(
     """
     if score_type == "indexer":
         # aux = weights
-        s_ref, denom_ref = ref_dense_indexer_score_recompute(q, k, aux, ratio)
+        s_ref, denom_ref = ref_dense_indexer_score_recompute(q, k, aux, ratio, q_causal_offsets=q_causal_offsets)
     else:
         # aux = lse
         s_ref, denom_ref = ref_dense_attn_score_recompute(
@@ -456,6 +489,7 @@ def check_ref_dense_score_recompute(
             aux,
             softmax_scale,
             ratio,
+            q_causal_offsets=q_causal_offsets,
         )
 
     finite = torch.isfinite(out_actual)
@@ -576,6 +610,7 @@ def _dense_indexer_predict_distribution(
     weights: torch.Tensor,  # (B, S_q, H)
     sm_scale: float,
     ratio: int,
+    q_causal_offsets: Optional[torch.Tensor] = None,
     return_scores: bool = False,
 ) -> torch.Tensor:
     """Dense full-KV predict distribution for dense indexer backward."""
@@ -590,8 +625,8 @@ def _dense_indexer_predict_distribution(
     scores_per_head = torch.relu(scores_per_head)
     scores = (scores_per_head * (weights * sm_scale).unsqueeze(-1)).sum(dim=2)
 
-    valid = _bottom_right_causal_mask(s_q, s_k, ratio, q_indexer.device)
-    scores = scores.masked_fill(~valid.unsqueeze(0), float("-inf"))
+    valid = _batched_ratio_causal_mask(s_q, s_k, ratio, q_indexer.device, b, q_causal_offsets)
+    scores = scores.masked_fill(~valid, float("-inf"))
     predict = torch.softmax(scores, dim=-1)
     return (predict, scores) if return_scores else predict
 
@@ -605,18 +640,27 @@ def ref_dense_indexer_backward(
     sm_scale: float = 1.0,
     ratio: int = 1,
     grad_scale: float = 1.0,
+    q_causal_offsets: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """PyTorch autograd reference for ``DSA.dense_indexer_backward_wrapper``."""
     q = index_q.detach().clone().requires_grad_(True)
     w = weights.detach().clone().requires_grad_(True)
     k = index_k.detach().clone().requires_grad_(True)
 
-    predict, scores = _dense_indexer_predict_distribution(q, k, w, sm_scale, ratio, return_scores=True)
+    predict, scores = _dense_indexer_predict_distribution(
+        q,
+        k,
+        w,
+        sm_scale,
+        ratio,
+        q_causal_offsets=q_causal_offsets,
+        return_scores=True,
+    )
 
-    _, s_q, _, _ = index_q.shape
+    b, s_q, _, _ = index_q.shape
     _, s_k, _ = index_k.shape
-    valid = _bottom_right_causal_mask(s_q, s_k, ratio, index_q.device)
-    target = attn_score_raw.to(torch.float32).masked_fill(~valid.unsqueeze(0), 0.0)
+    valid = _batched_ratio_causal_mask(s_q, s_k, ratio, index_q.device, b, q_causal_offsets)
+    target = attn_score_raw.to(torch.float32).masked_fill(~valid, 0.0)
     target = target / attn_l1norm.to(torch.float32).unsqueeze(-1).clamp(min=1e-10)
 
     eps = math.exp(-100.0)
@@ -624,7 +668,7 @@ def ref_dense_indexer_backward(
     predict = predict.to(torch.float32)
     log_clip_mask = (predict >= eps).to(torch.float32)
     g = -target_eff * log_clip_mask * grad_scale
-    grad_signal = (g - predict * g.sum(dim=-1, keepdim=True)).masked_fill(~valid.unsqueeze(0), 0.0)
+    grad_signal = (g - predict * g.sum(dim=-1, keepdim=True)).masked_fill(~valid, 0.0)
     grads = torch.autograd.grad(scores, (q, w, k), grad_outputs=grad_signal.to(scores.dtype))
 
     dq, dw, dk = grads
@@ -714,6 +758,7 @@ def check_ref_dense_indexer_backward(
     sm_scale: float = 1.0,
     ratio: int = 1,
     grad_scale: float = 1.0,
+    q_causal_offsets: Optional[torch.Tensor] = None,
     cos_min: float = 0.97,
     rms_rel_max: float = 0.55,
 ):
@@ -726,6 +771,7 @@ def check_ref_dense_indexer_backward(
         sm_scale=sm_scale,
         ratio=ratio,
         grad_scale=grad_scale,
+        q_causal_offsets=q_causal_offsets,
     )
 
     for name, actual, ref in (

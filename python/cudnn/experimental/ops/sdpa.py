@@ -89,6 +89,16 @@ def _device_supports_d256_oss(device: torch.device) -> bool:
     return major * 10 + minor >= 100
 
 
+# cuDNN 9.23.0 added d=256 SDPA fprop and bprop support in the cuDNN backend.
+# From this version on the OSS (cuteDSL) kernels are no longer needed.
+_CUDNN_BACKEND_D256_VERSION = 92300
+
+
+def _cudnn_backend_supports_d256() -> bool:
+    """Return True when the linked cuDNN backend handles d=256 SDPA itself (no OSS kernel needed)."""
+    return cudnn.backend_version() >= _CUDNN_BACKEND_D256_VERSION
+
+
 def _torch_dtype_to_cudnn(dtype: torch.dtype):
     """Map a PyTorch dtype to a cuDNN data_type enum."""
     return _TORCH_DTYPE_TO_CUDNN[dtype]
@@ -638,9 +648,17 @@ def _sdpa_impl(
         cumulative_seq_len_q,
         cumulative_seq_len_kv,
     )
-    use_d256_oss_fwd = can_use_d256_oss_fwd and _device_supports_d256_oss(q.device)
+    device_supports_d256_oss = _device_supports_d256_oss(q.device)
+    cudnn_backend_supports_d256 = _cudnn_backend_supports_d256()
+    use_d256_oss_fwd = can_use_d256_oss_fwd and device_supports_d256_oss and not cudnn_backend_supports_d256
     if can_use_d256_oss_fwd and not use_d256_oss_fwd:
-        _logger.debug("Falling back to cuDNN graph d=256 forward path because OSS kernel requires SM100+, got device %s", q.device)
+        _logger.debug(
+            "Routing d=256 forward through the cuDNN backend (cuDNN backend version %d, backend support=%s, OSS device support=%s, device=%s)",
+            cudnn.backend_version(),
+            cudnn_backend_supports_d256,
+            device_supports_d256_oss,
+            q.device,
+        )
     if use_d256_oss_fwd:
         try:
             return sdpa_fwd_d256(
@@ -658,7 +676,7 @@ def _sdpa_impl(
                 cumulative_seq_len_kv,
             )
         except ImportError as e:
-            _logger.warning("Falling back to cuDNN graph d=256 forward path because OSS dependencies are unavailable: %s", e)
+            _logger.warning("Falling back to cuDNN backend d=256 forward path because OSS dependencies are unavailable: %s", e)
 
     handle = _get_handle(q.device)
 
@@ -1132,7 +1150,7 @@ def _sdpa_backward(ctx, dO, dStats):
         cum_q,
         cum_kv,
     )
-    use_d256_oss_bwd = can_use_d256_oss_bwd and _device_supports_d256_oss(q.device)
+    use_d256_oss_bwd = can_use_d256_oss_bwd and _device_supports_d256_oss(q.device) and not _cudnn_backend_supports_d256()
 
     if is_d256:
         if use_d256_oss_bwd:
@@ -1155,7 +1173,7 @@ def _sdpa_backward(ctx, dO, dStats):
                     cum_kv,
                 )
             except ImportError as e:
-                _logger.warning("Falling back to cuDNN graph d=256 backward path because OSS dependencies are unavailable: %s", e)
+                _logger.warning("Falling back to cuDNN backend d=256 backward path because OSS dependencies are unavailable: %s", e)
                 dQ, dK, dV = torch.ops.cudnn.sdpa_bwd(
                     dO,
                     q,

@@ -52,9 +52,10 @@ class ScoreGradDenseSm90:
     WARP_SIZE = 32
     THREADS_PER_CTA = 128
 
-    def __init__(self, ratio: int = 1):
+    def __init__(self, ratio: int = 1, block_I: int = 128):
         assert ratio >= 1, f"ratio must be >= 1, got {ratio}"
         self.ratio = ratio
+        self.block_I = block_I
 
     @cute.jit
     def __call__(
@@ -65,6 +66,7 @@ class ScoreGradDenseSm90:
         mAttnL1Norm,
         mCuSeqlensQ,
         mCuSeqlensK,
+        mQCausalOffsets,
         grad_scale: Float32,
         max_seqlen_q: Int32,
         max_seqlen_k: Int32,
@@ -106,6 +108,7 @@ class ScoreGradDenseSm90:
             mAttnL1Norm,
             mCuSeqlensQ,
             mCuSeqlensK,
+            mQCausalOffsets,
             grad_scale,
             seqlen_k_pad,
             max_seqlen_q,
@@ -125,6 +128,7 @@ class ScoreGradDenseSm90:
         mAttnL1Norm,
         mCuSeqlensQ,
         mCuSeqlensK,
+        mQCausalOffsets,
         grad_scale: Float32,
         seqlen_k_pad: Int32,
         seqlen_q_static: Int32,
@@ -143,6 +147,7 @@ class ScoreGradDenseSm90:
             seqlen_q_static,
             seqlen_k_static,
         )
+        q_causal_offset_b = Int32(0) if const_expr(mQCausalOffsets is None) else mQCausalOffsets[batch_idx]
 
         if seq_local < seqlen_q_b:
             smem = cutlass.utils.SmemAllocator()
@@ -173,25 +178,24 @@ class ScoreGradDenseSm90:
             LOG2E = Float32(1.4426950408889634)
 
             ratio = Int32(self.ratio)
-            q_start_b = seqlen_k_b * ratio - seqlen_q_b
-            col_limit_raw = (q_start_b + Int32(seq_local) + Int32(1)) // ratio
+            col_limit_raw = (q_causal_offset_b + Int32(seq_local) + Int32(1)) // ratio
             col_limit = col_limit_raw if col_limit_raw < seqlen_k_b else seqlen_k_b
+            col_limit = col_limit if col_limit > Int32(0) else Int32(0)
 
             local_sum = Float32(0.0)
             pos = tidx
-            while pos < seqlen_k_pad:
-                if pos < col_limit:
-                    idx_raw = mIdxScore_b[seq_local, pos]
-                    attn_raw = mAttnScore_b[seq_local, pos]
-                    score_minus_lse = idx_raw - idx_lse_val
-                    predict = cute.math.exp2(
-                        score_minus_lse * LOG2E,
-                        fastmath=True,
-                    )
-                    target = attn_raw / (attn_l1_val + Float32(EPS))
-                    target_eff = target if target >= Float32(CLIP_PROB_MIN) else Float32(CLIP_PROB_MIN)
-                    log_clip_mask = Float32(1.0) if score_minus_lse >= Float32(CLIP_LOG_MIN) else Float32(0.0)
-                    local_sum = local_sum + (-target_eff * log_clip_mask * grad_scale)
+            while pos < col_limit:
+                idx_raw = mIdxScore_b[seq_local, pos]
+                attn_raw = mAttnScore_b[seq_local, pos]
+                score_minus_lse = idx_raw - idx_lse_val
+                predict = cute.math.exp2(
+                    score_minus_lse * LOG2E,
+                    fastmath=True,
+                )
+                target = attn_raw / (attn_l1_val + Float32(EPS))
+                target_eff = target if target >= Float32(CLIP_PROB_MIN) else Float32(CLIP_PROB_MIN)
+                log_clip_mask = Float32(1.0) if score_minus_lse >= Float32(CLIP_LOG_MIN) else Float32(0.0)
+                local_sum = local_sum + (-target_eff * log_clip_mask * grad_scale)
                 pos = pos + Int32(128)
 
             warp_sum = cute.arch.warp_reduction_sum(local_sum)
@@ -200,8 +204,12 @@ class ScoreGradDenseSm90:
             cute.arch.sync_threads()
             sum_grad = sReduceScratch[0] + sReduceScratch[1] + sReduceScratch[2] + sReduceScratch[3]
 
+            block_i = Int32(self.block_I)
+            zero_limit = ((col_limit + block_i - Int32(1)) // block_i) * block_i
+            zero_limit = zero_limit if zero_limit < seqlen_k_pad else seqlen_k_pad
+
             pos = tidx
-            while pos < seqlen_k_pad:
+            while pos < zero_limit:
                 if pos < col_limit:
                     idx_raw = mIdxScore_b[seq_local, pos]
                     attn_raw = mAttnScore_b[seq_local, pos]
@@ -230,6 +238,7 @@ def dense_indexer_backward_sm90(
     block_I=128,
     ratio=1,
     is_varlen=False,
+    has_q_causal_offsets=False,
 ):
     """Factory for the dense indexer backward gradient kernel on SM90."""
     assert ratio >= 1, f"ratio must be >= 1, got {ratio}"
@@ -245,6 +254,7 @@ def dense_indexer_backward_sm90(
         block_I,
         ratio,
         is_varlen,
+        has_q_causal_offsets,
     )
 
 
@@ -258,6 +268,7 @@ def _build_cute_dsl_dense_kernel(
     block_I,
     ratio,
     is_varlen,
+    has_q_causal_offsets,
 ):
     cap = torch.cuda.get_device_capability()[0]
     if cap < 9:
@@ -266,7 +277,7 @@ def _build_cute_dsl_dense_kernel(
         raise RuntimeError("Use SM100 kernel for Blackwell")
 
     topk = seqlen_k
-    score_grad_obj = ScoreGradDenseSm90(ratio=ratio)
+    score_grad_obj = ScoreGradDenseSm90(ratio=ratio, block_I=block_I)
     kernel_obj = IndexerBackwardSm90(
         head_dim=dim,
         heads=heads,
@@ -278,8 +289,8 @@ def _build_cute_dsl_dense_kernel(
 
     # Compile caches are keyed only by params that change generated code. In
     # dense mode, K-block traversal is runtime-sized by seqlen_k.
-    score_grad_key = (is_varlen, ratio)
-    gemm_key = (is_varlen, heads, dim, block_I, ratio)
+    score_grad_key = (is_varlen, ratio, block_I, bool(has_q_causal_offsets))
+    gemm_key = (is_varlen, heads, dim, block_I, ratio, bool(has_q_causal_offsets))
     dummy_topk_holder = [None]
 
     def _get_dummy_topk(device, current_stream=None):
@@ -298,6 +309,7 @@ def _build_cute_dsl_dense_kernel(
         GradSignal,
         CuSeqlensQ,
         CuSeqlensK,
+        QCausalOffsets,
         current_stream=None,
     ):
         s = _resolve_stream(current_stream)
@@ -305,6 +317,7 @@ def _build_cute_dsl_dense_kernel(
             dummy_topk = _get_dummy_topk(IndexQ.device, current_stream=current_stream)
             cuq_arg = to_cute_tensor(CuSeqlensQ) if CuSeqlensQ is not None else None
             cuk_arg = to_cute_tensor(CuSeqlensK) if CuSeqlensK is not None else None
+            q_offsets_arg = to_cute_tensor(QCausalOffsets) if QCausalOffsets is not None else None
             cute_args = [
                 to_cute_tensor(t)
                 for t in [
@@ -327,6 +340,7 @@ def _build_cute_dsl_dense_kernel(
                 cuk_arg,
                 cutlass.Int32(seqlen),
                 cutlass.Int32(seqlen_k),
+                q_offsets_arg,
                 options=compile_options(),
             )
 
@@ -337,6 +351,7 @@ def _build_cute_dsl_dense_kernel(
         AttnL1Norm,
         CuSeqlensQ,
         CuSeqlensK,
+        QCausalOffsets,
         grad_scale,
         current_stream=None,
     ):
@@ -344,6 +359,7 @@ def _build_cute_dsl_dense_kernel(
             s = _resolve_stream(current_stream)
             cuq_arg = to_cute_tensor(CuSeqlensQ) if CuSeqlensQ is not None else None
             cuk_arg = to_cute_tensor(CuSeqlensK) if CuSeqlensK is not None else None
+            q_offsets_arg = to_cute_tensor(QCausalOffsets) if QCausalOffsets is not None else None
             _dense_score_grad_compile_cache[score_grad_key] = cute.compile(
                 score_grad_obj,
                 to_cute_tensor(IdxScoreRaw),
@@ -352,6 +368,7 @@ def _build_cute_dsl_dense_kernel(
                 to_cute_tensor(AttnL1Norm),
                 cuq_arg,
                 cuk_arg,
+                q_offsets_arg,
                 cutlass.Float32(float(grad_scale)),
                 cutlass.Int32(seqlen),
                 cutlass.Int32(seqlen_k),
@@ -367,12 +384,17 @@ def _build_cute_dsl_dense_kernel(
         grad_scale,
         CuSeqlensQ=None,
         CuSeqlensK=None,
+        QCausalOffsets=None,
         current_stream=None,
     ):
         if is_varlen:
             assert CuSeqlensQ is not None and CuSeqlensK is not None, "THD-compiled score-grad kernel requires cu_seqlens_q/k at runtime"
         else:
             assert CuSeqlensQ is None and CuSeqlensK is None, "BSHD-compiled score-grad kernel must not receive cu_seqlens_q/k"
+        if has_q_causal_offsets:
+            assert QCausalOffsets is not None, "offset-compiled score-grad kernel requires q_causal_offsets at runtime"
+        else:
+            assert QCausalOffsets is None, "non-offset compiled score-grad kernel must not receive q_causal_offsets"
         s = _resolve_stream(current_stream)
         _ensure_compiled_score_grad(
             IdxScoreRaw,
@@ -381,6 +403,7 @@ def _build_cute_dsl_dense_kernel(
             AttnL1Norm,
             CuSeqlensQ,
             CuSeqlensK,
+            QCausalOffsets,
             grad_scale,
             current_stream=current_stream,
         )
@@ -391,6 +414,7 @@ def _build_cute_dsl_dense_kernel(
             AttnL1Norm,
             CuSeqlensQ,
             CuSeqlensK,
+            QCausalOffsets,
             cutlass.Float32(float(grad_scale)),
             cutlass.Int32(seqlen),
             cutlass.Int32(seqlen_k),
@@ -407,6 +431,7 @@ def _build_cute_dsl_dense_kernel(
         GradSignal,
         CuSeqlensQ=None,
         CuSeqlensK=None,
+        QCausalOffsets=None,
         current_stream=None,
     ):
         """Run fused dense Kernel 2. Caller must run score_grad first."""
@@ -414,6 +439,10 @@ def _build_cute_dsl_dense_kernel(
             assert CuSeqlensQ is not None and CuSeqlensK is not None, "THD-compiled kernel requires cu_seqlens_q/k at runtime"
         else:
             assert CuSeqlensQ is None and CuSeqlensK is None, "BSHD-compiled kernel must not receive cu_seqlens_q/k"
+        if has_q_causal_offsets:
+            assert QCausalOffsets is not None, "offset-compiled kernel requires q_causal_offsets at runtime"
+        else:
+            assert QCausalOffsets is None, "non-offset compiled kernel must not receive q_causal_offsets"
         dummy_topk = _get_dummy_topk(IndexQ.device, current_stream=current_stream)
         s = _resolve_stream(current_stream)
 
@@ -427,6 +456,7 @@ def _build_cute_dsl_dense_kernel(
             GradSignal,
             CuSeqlensQ,
             CuSeqlensK,
+            QCausalOffsets,
             current_stream=current_stream,
         )
         _dense_compile_cache[gemm_key](
@@ -444,6 +474,7 @@ def _build_cute_dsl_dense_kernel(
             CuSeqlensK,
             cutlass.Int32(seqlen),
             cutlass.Int32(seqlen_k),
+            QCausalOffsets,
         )
 
     def _run(
@@ -460,6 +491,7 @@ def _build_cute_dsl_dense_kernel(
         grad_scale,
         CuSeqlensQ=None,
         CuSeqlensK=None,
+        QCausalOffsets=None,
         current_stream=None,
     ):
         if is_varlen:
@@ -474,6 +506,7 @@ def _build_cute_dsl_dense_kernel(
             grad_scale,
             CuSeqlensQ,
             CuSeqlensK,
+            QCausalOffsets,
             current_stream=current_stream,
         )
         grad_signal = idx_scores_raw
@@ -489,6 +522,7 @@ def _build_cute_dsl_dense_kernel(
                 grad_signal,
                 CuSeqlensQ,
                 CuSeqlensK,
+                QCausalOffsets,
                 current_stream=current_stream,
             )
         else:
@@ -504,6 +538,7 @@ def _build_cute_dsl_dense_kernel(
                 grad_signal,
                 CuSeqlensQ,
                 CuSeqlensK,
+                QCausalOffsets,
                 current_stream=current_stream,
             )
             with _torch_stream_context(current_stream):

@@ -51,6 +51,7 @@ def test_DSA_indexer_forward_wrapper(
         min_compute_capability=90,
     )
     q, k, w = _allocate_inputs(cfg)
+    q_causal_offsets = torch.full((cfg["b"],), 4, dtype=torch.int32, device=q.device)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     try:
@@ -60,6 +61,7 @@ def test_DSA_indexer_forward_wrapper(
             w,
             ratio=ratio,
             qhead_per_kv_head=qhead_per_kv_head,
+            q_causal_offsets=q_causal_offsets,
             stream=stream,
         )
     except (ValueError, NotImplementedError, RuntimeError) as e:
@@ -67,4 +69,4 @@ def test_DSA_indexer_forward_wrapper(
 
     scores = result["scores"]
     if not cfg["skip_ref"]:
-        check_ref_indexer_forward(q, k, w, scores, ratio)
+        check_ref_indexer_forward(q, k, w, scores, ratio, q_causal_offsets=q_causal_offsets)

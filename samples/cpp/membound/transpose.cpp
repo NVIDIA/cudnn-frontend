@@ -34,7 +34,7 @@ TEST_CASE("Membound transpose permutes dims", "[membound][transpose][graph]") {
 #endif
 
     if (!is_blackwell_computing_arch()) {
-        SKIP("TensorIR MemBound engine is only supported on SM100-SM109 (data center Blackwell)");
+        SKIP("TensorIR MemBound engine is only supported on Blackwell (data center Blackwell)");
     }
 
 #if (CUDNN_VERSION < 92200)

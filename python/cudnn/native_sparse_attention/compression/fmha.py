@@ -1756,7 +1756,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         cum_seqlen_q: Optional[cute.Tensor],
         cum_seqlen_k: Optional[cute.Tensor],
         scale_softmax_log2: Float32,
-        qk_thr_mma: cute.core.ThrMma,
+        qk_thr_mma: cute.ThrMma,
         tStS: cute.Tensor,
         tStSi: cute.Tensor,
         window_size_left: Optional[Int32],
@@ -1791,7 +1791,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         :param scale_softmax_log2: Log2 scale factor for softmax operation
         :type scale_softmax_log2: Float32
         :param qk_thr_mma: Thread MMA operation for QK matrix multiplication
-        :type qk_thr_mma: cute.core.ThrMma
+        :type qk_thr_mma: cute.ThrMma
         :param tStS: Shared tensor for softmax input/output
         :type tStS: cute.Tensor
         :param tStSi: Input tensor containing attention scores
@@ -2056,7 +2056,7 @@ class BlackwellFusedMultiHeadAttentionForward:
     @cute.jit
     def correction_rescale(
         self,
-        thr_mma: cute.core.ThrMma,
+        thr_mma: cute.ThrMma,
         tOtO: cute.Tensor,
         scale: Float32,
     ):
@@ -2073,7 +2073,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         3. Store the rescaled results back to tensor memory
 
         :param thr_mma: Thread MMA operation for the computation
-        :type thr_mma: cute.core.ThrMma
+        :type thr_mma: cute.ThrMma
         :param tOtO: Tensor representing partial attention output to be rescaled
         :type tOtO: cute.Tensor
         :param scale: Scaling factor to apply to the partial results
@@ -2134,7 +2134,7 @@ class BlackwellFusedMultiHeadAttentionForward:
     @cute.jit
     def correction_epilog(
         self,
-        thr_mma: cute.core.ThrMma,
+        thr_mma: cute.ThrMma,
         tOtO: cute.Tensor,
         mLSE: cute.Tensor | None,
         tTMEM_LOAD_VECrS: cute.Tensor,
@@ -2160,7 +2160,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         5. Preparation for efficient TMA store operations
 
         :param thr_mma: Thread MMA operation for the computation
-        :type thr_mma: cute.core.ThrMma
+        :type thr_mma: cute.ThrMma
         :param tOtO: Tensor containing accumulated attention output
         :type tOtO: cute.Tensor
         :param mLSE: Tensor containing log-sum-exp values for LSE calculation

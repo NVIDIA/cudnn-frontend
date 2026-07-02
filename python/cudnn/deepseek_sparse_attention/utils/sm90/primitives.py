@@ -10,7 +10,7 @@ import cutlass.cute as cute
 
 from cutlass import Float32, const_expr
 from cutlass.cutlass_dsl import T, dsl_user_op
-from cutlass._mlir.dialects import nvvm, llvm
+from cutlass._mlir.dialects import llvm
 
 
 def get_smem_store_atom(arch: cutlass.Constexpr[int], element_type: Type[cute.Numeric], transpose: bool = False) -> cute.CopyAtom:
@@ -156,7 +156,7 @@ def logf(a: float | Float32, *, loc=None, ip=None) -> Float32:
 @dsl_user_op
 def atomic_add_fp32(a: float | Float32, gmem_ptr: cute.Pointer, *, loc=None, ip=None) -> None:
     """Scalar f32 atomicAdd: atomically adds `a` to the f32 value at `gmem_ptr`."""
-    nvvm.atomicrmw(op=nvvm.AtomicOpKind.FADD, ptr=gmem_ptr.llvm_ptr, a=Float32(a).ir_value())
+    cute.arch.atomic_add(gmem_ptr.llvm_ptr, Float32(a), loc=loc, ip=ip)
 
 
 @dsl_user_op

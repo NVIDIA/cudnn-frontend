@@ -42,6 +42,11 @@ DSA_SCORE_RECOMPUTE_PARAM_MARKS = [
     pytest.mark.parametrize("score_type", ["indexer", "attention"]),
 ]
 
+DSA_SPARSE_SCORE_RECOMPUTE_PARAM_MARKS = [
+    *DSA_SCORE_RECOMPUTE_PARAM_MARKS,
+    pytest.mark.parametrize("has_topk_length", [False, True]),
+]
+
 DSA_INDEXER_BACKWARD_PARAM_MARKS = [
     pytest.mark.parametrize("head_dim", [128]),
     # IndexerBackward requires heads >= 64 (warp-specialized GEMM layout).
@@ -77,6 +82,10 @@ def with_dsa_indexer_top_k_params(func):
 
 def with_dsa_score_recompute_params(func):
     return _apply(DSA_PARAM_MARKS + DSA_SCORE_RECOMPUTE_PARAM_MARKS, func)
+
+
+def with_dsa_sparse_score_recompute_params(func):
+    return _apply(DSA_PARAM_MARKS + DSA_SPARSE_SCORE_RECOMPUTE_PARAM_MARKS, func)
 
 
 def with_dsa_indexer_backward_params(func):

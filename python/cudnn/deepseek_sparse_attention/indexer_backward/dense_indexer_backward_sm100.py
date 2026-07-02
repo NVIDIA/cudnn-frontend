@@ -42,11 +42,11 @@ BSHD vs THD (explicit branches, no implicit packing):
     GradSignal / Score : (T_q, max_seqlen_k)   [second dim is batch-local k]
     LSE / L1Norm       : (T_q,)
 
-Bottom-right ratio causal:
-    q_start_b  = seqlen_k_b * ratio - seqlen_q_b
-    col_limit  = min(seqlen_k_b, (q_start_b + q_local + 1) // ratio)
-  When seqlen_q_b == seqlen_k_b * ratio, q_start_b == 0 (legacy behavior).
-  Constraint per batch: seqlen_q_b <= seqlen_k_b * ratio.
+Ratio causal mask:
+    q_abs      = q_causal_offset_b + q_local
+    col_limit  = clamp((q_abs + 1) // ratio, 0, seqlen_k_b)
+    valid if k_local < col_limit
+  q_causal_offset_b defaults to 0 when no offset tensor is provided.
 """
 
 from __future__ import annotations
@@ -124,6 +124,7 @@ class ScoreGradDense:
     def __init__(
         self,
         ratio: int = 1,
+        block_I: int = 128,
     ):
         assert ratio >= 1, f"ratio must be >= 1, got {ratio}"
         # Neither ``grad_scale`` nor ``max_seqlen_q/k`` are stored on the object:
@@ -134,6 +135,7 @@ class ScoreGradDense:
         # are passed as runtime ``Float32``/``Int32`` args on ``__call__`` so one
         # compiled kernel serves all seqlens / loss scales.
         self.ratio = ratio
+        self.block_I = block_I
 
     @cute.jit
     def __call__(
@@ -144,6 +146,7 @@ class ScoreGradDense:
         mDenomTarget,
         mCuSeqlensQ,
         mCuSeqlensK,
+        mQCausalOffsets,
         grad_scale: Float32,
         max_seqlen_q: Int32,
         max_seqlen_k: Int32,
@@ -188,6 +191,7 @@ class ScoreGradDense:
             mDenomTarget,
             mCuSeqlensQ,
             mCuSeqlensK,
+            mQCausalOffsets,
             grad_scale,
             seqlen_k_pad,
             max_seqlen_q,
@@ -207,6 +211,7 @@ class ScoreGradDense:
         mDenomTarget,
         mCuSeqlensQ,
         mCuSeqlensK,
+        mQCausalOffsets,
         grad_scale: Float32,
         seqlen_k_pad: Int32,
         seqlen_q_static: Int32,
@@ -227,6 +232,7 @@ class ScoreGradDense:
             seqlen_q_static,
             seqlen_k_static,
         )
+        q_causal_offset_b = Int32(0) if const_expr(mQCausalOffsets is None) else mQCausalOffsets[batch_idx]
 
         # Out-of-range CTAs (seq_local >= seqlen_q_b in this batch): skip work.
         # CuTe DSL forbids early `return`, so wrap the body in an `if` block.
@@ -261,31 +267,26 @@ class ScoreGradDense:
 
             LOG2E = Float32(1.4426950408889634)
 
-            # Bottom-right ratio causal:
-            #   q_start_b  = seqlen_k_b * ratio - seqlen_q_b
-            #   col_limit  = min(seqlen_k_b, (q_start_b + q_local + 1) // ratio)
-            # Equals legacy ((q_local+1)//ratio) when seqlen_q_b == seqlen_k_b * ratio.
             ratio = Int32(self.ratio)
-            q_start_b = seqlen_k_b * ratio - seqlen_q_b
-            col_limit_raw = (q_start_b + Int32(seq_local) + Int32(1)) // ratio
+            col_limit_raw = (q_causal_offset_b + Int32(seq_local) + Int32(1)) // ratio
             col_limit = col_limit_raw if col_limit_raw < seqlen_k_b else seqlen_k_b
+            col_limit = col_limit if col_limit > Int32(0) else Int32(0)
 
             # --- Phase 1: Accumulate sum_grad ---
             local_sum = Float32(0.0)
             pos = tidx
-            while pos < seqlen_k_pad:
-                if pos < col_limit:
-                    pr = mPredict_b[seq_local, pos]
-                    tr = mTarget_b[seq_local, pos]
+            while pos < col_limit:
+                pr = mPredict_b[seq_local, pos]
+                tr = mTarget_b[seq_local, pos]
 
-                    score_minus_lse = pr - lse_val
-                    predict = cute.math.exp2(score_minus_lse * LOG2E, fastmath=True)
-                    target = tr / (denom_val + Float32(DENOM_EPS))
-                    target_eff = target if target >= Float32(CLIP_PROB_MIN) else Float32(CLIP_PROB_MIN)
-                    log_clip_mask = Float32(1.0) if score_minus_lse >= Float32(CLIP_LOG_MIN) else Float32(0.0)
-                    g = -target_eff * log_clip_mask * grad_scale
+                score_minus_lse = pr - lse_val
+                predict = cute.math.exp2(score_minus_lse * LOG2E, fastmath=True)
+                target = tr / (denom_val + Float32(DENOM_EPS))
+                target_eff = target if target >= Float32(CLIP_PROB_MIN) else Float32(CLIP_PROB_MIN)
+                log_clip_mask = Float32(1.0) if score_minus_lse >= Float32(CLIP_LOG_MIN) else Float32(0.0)
+                g = -target_eff * log_clip_mask * grad_scale
 
-                    local_sum = local_sum + g
+                local_sum = local_sum + g
                 pos = pos + Int32(128)
 
             # Cross-warp reduction (4 warps)
@@ -297,8 +298,23 @@ class ScoreGradDense:
 
             # --- Phase 2: Write grad_signal in-place to PredictRaw ---
             # Padding columns (pos >= seqlen_k_b in THD, or pos >= col_limit) get 0.
+            # Kernel 2 processes q tokens in reversed 2Q pairs and uses the
+            # larger q token's K-block bound. For the smaller q token, clear up
+            # to that pair bound so stale raw scores cannot be consumed as
+            # grad_signal, but skip the rest of the padded K row.
+            rel_from_last = (seqlen_q_b - Int32(1)) - Int32(seq_local)
+            pair_q0_local = Int32(seq_local) + (rel_from_last & Int32(1))
+            pair_col_limit_raw = (q_causal_offset_b + pair_q0_local + Int32(1)) // ratio
+            pair_col_limit = pair_col_limit_raw if pair_col_limit_raw < seqlen_k_b else seqlen_k_b
+            pair_col_limit = pair_col_limit if pair_col_limit > Int32(0) else Int32(0)
+            block_i = Int32(self.block_I)
+            zero_limit = ((pair_col_limit + block_i - Int32(1)) // block_i) * block_i
+            min_zero_limit = block_i if seqlen_k_b > Int32(0) else Int32(0)
+            zero_limit = min_zero_limit if zero_limit < min_zero_limit else zero_limit
+            zero_limit = zero_limit if zero_limit < seqlen_k_pad else seqlen_k_pad
+
             pos = tidx
-            while pos < seqlen_k_pad:
+            while pos < zero_limit:
                 if pos < col_limit:
                     pr = mPredict_b[seq_local, pos]
                     tr = mTarget_b[seq_local, pos]
@@ -326,7 +342,7 @@ class ScoreGradDense:
 # Barrier indices
 MBAR_2Q_S_FULL = 0  # MMA → Compute (phase-flipped 2×/block)
 MBAR_2Q_DS_READY = 1  # Compute → MMA (phase-flipped 2×/block)
-MBAR_2Q_DK_FULL = 2  # MMA → Reduce (1×/block, after Phase B GEMM2)
+MBAR_2Q_DK_FULL = 2  # MMA → Reduce/Compute (1×/block, after dK/dQ GEMMs)
 MBAR_2Q_DK_EMPTY = 3  # Reduce → MMA (1×/block)
 MBAR_2Q_GS_LOADED_0 = 4  # Load → Compute (2-stage K pipeline)
 MBAR_2Q_GS_LOADED_1 = 5
@@ -420,6 +436,7 @@ class DenseIndexerBackward2QGemmSm100:
         mGradSignal: cute.Tensor,
         mCuSeqlensQ,
         mCuSeqlensK,
+        mQCausalOffsets,
         sm_scale: Float32 | float,
         max_seqlen_q: Int32,
         max_seqlen_k: Int32,
@@ -592,6 +609,7 @@ class DenseIndexerBackward2QGemmSm100:
             mGradSignal,
             mCuSeqlensQ,
             mCuSeqlensK,
+            mQCausalOffsets,
             sm_scale,
             Int32(max_seqlen_q),
             Int32(max_seqlen_k),
@@ -635,6 +653,7 @@ class DenseIndexerBackward2QGemmSm100:
         mGradSignal,
         mCuSeqlensQ,
         mCuSeqlensK,
+        mQCausalOffsets,
         sm_scale: Float32 | float,
         seqlen_q_static: Int32,
         seqlen_k_static: Int32,
@@ -674,6 +693,7 @@ class DenseIndexerBackward2QGemmSm100:
             seqlen_q_static,
             seqlen_k_static,
         )
+        q_causal_offset_b = Int32(0) if const_expr(mQCausalOffsets is None) else mQCausalOffsets[batch_idx]
 
         # 2Q pair indices are batch-local and scheduled from largest q to
         # smallest q. For odd seqlen_q_b this puts the singleton CTA at the
@@ -713,11 +733,10 @@ class DenseIndexerBackward2QGemmSm100:
             mGS_b = mGradSignal[None, None, batch_idx]
 
         # Causal-aware K-block bound for this 2Q CTA. GradSignal has already
-        # been zeroed past each q token's bottom-right causal column limit, but
+        # been zeroed past each q token's ratio-causal column limit, but
         # using that limit here avoids TMA/MMA work for wholly future K blocks.
         ratio = Int32(self.ratio)
-        q_start_b = seqlen_k_b * ratio - seqlen_q_b
-        max_kv_needed_raw = (q_start_b + q0_local + Int32(1)) // ratio
+        max_kv_needed_raw = (q_causal_offset_b + q0_local + Int32(1)) // ratio
         max_kv_needed = max_kv_needed_raw if max_kv_needed_raw > Int32(0) else Int32(0)
         max_kv_needed = max_kv_needed if max_kv_needed < seqlen_k_b else seqlen_k_b
         num_kv_blocks = (max_kv_needed + self.block_I - 1) // self.block_I
@@ -1706,6 +1725,14 @@ class DenseIndexerBackward2QGemmSm100:
                 cute.arch.fence_proxy("async.shared", space="cta")
                 cute.arch.mbarrier_arrive(mbar + MBAR_2Q_DS_READY)
 
+        # DK_FULL is committed after both dQ GEMM3 phases for every K block.
+        # Observe its final phase before reading the persistent dQ TMEM
+        # accumulators.  There is no next S_FULL hand-off after the last block
+        # to provide this ordering, so omitting this wait races the epilogue
+        # against the final dQ accumulation.
+        final_dk_full_phase = (num_kv_blocks - Int32(1)) & Int32(1)
+        cute.arch.mbarrier_wait(mbar + MBAR_2Q_DK_FULL, final_dk_full_phase)
+
         # dQ staging via coordinate writes — same pattern as sdS.
         sdQ_gemm_view = cute.composition(
             sdQ_epi_slice,
@@ -1738,8 +1765,12 @@ class DenseIndexerBackward2QGemmSm100:
 
         # ---- Epilogue: dQ for q1 via TMA store (guarded) ----
         if has_q1:
-            # Wait for q0 TMA store to complete before reusing sdQ_epi SMEM
-            dQ_store_pipeline.producer_acquire()
+            # The TMA store async group belongs to the issuing warp.  Wait on
+            # that warp, then release the other compute warps together before
+            # they overwrite their portions of the shared dQ staging tile.
+            if warp_idx == compute_warp0:
+                dQ_store_pipeline.producer_acquire()
+            self.compute_sync_barrier.arrive_and_wait()
 
             tDQrDQ_q1 = cute.make_rmem_tensor(tDQrDQ_shape, Float32)
             cute.copy(tiled_tmem_load_dq1, tDqDq_1_t2r, tDQrDQ_q1)
@@ -1789,6 +1820,9 @@ class DenseIndexerBackward2QGemmSm100:
                 total = cute.arch.warp_reduction_sum(my_partial)
                 if lane_id == 0:
                     mdW_b[q1_local, h] = self.q_dtype(total)
+
+        # Ensure the final q0/q1 TMA store has completed before the CTA exits.
+        dQ_store_pipeline.producer_tail()
 
     # =========================================================================
     # Reduce warpgroup (2Q): Single-buffered dK
@@ -1905,6 +1939,7 @@ def dense_indexer_backward_sm100(
     block_I=128,
     ratio=1,
     is_varlen=False,
+    has_q_causal_offsets=False,
 ):
     """Build / fetch a compiled SM100 dense backward gradient kernel.
 
@@ -1915,10 +1950,10 @@ def dense_indexer_backward_sm100(
         grid + row stride. Inputs are packed (T_q, ...) tensors plus
         cu_seqlens_q / k.
 
-    ``ratio`` is the indexer compression ratio. Bottom-right causal mask is
-    applied: kv_local < (seqlen_k_b * ratio - seqlen_q_b + q_local + 1) // ratio.
-    Per batch we require ``seqlen_q_b <= seqlen_k_b * ratio``. ``ratio`` must
-    be passed explicitly — auto-inferring from S_q / S_k is unsafe under THD.
+    ``ratio`` is the indexer compression ratio. The causal rule is
+    ``kv_local < (q_causal_offset_b + q_local + 1) // ratio``, clamped to the
+    batch-local K length. ``ratio`` must be passed explicitly — auto-inferring
+    from S_q / S_k is unsafe under THD.
 
     ``grad_scale`` is intentionally **not** an argument to this factory: it's
     a host scalar consumed only as a multiplicative factor inside
@@ -1941,18 +1976,19 @@ def dense_indexer_backward_sm100(
         block_I,
         ratio,
         is_varlen,
+        has_q_causal_offsets,
     )
 
 
-def _build_cute_dsl_kernel(batch, max_seqlen_q, max_seqlen_k, heads, dim, sm_scale, block_I, ratio, is_varlen):
+def _build_cute_dsl_kernel(batch, max_seqlen_q, max_seqlen_k, heads, dim, sm_scale, block_I, ratio, is_varlen, has_q_causal_offsets):
     from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
 
     if torch.cuda.get_device_capability()[0] < 10:
         raise RuntimeError("Requires SM100+")
 
-    # Kernel 1: ScoreGradDense — applies bottom-right ratio causal mask so
+    # Kernel 1: ScoreGradDense — applies ratio causal mask so
     # masked / padding columns produce grad_signal=0 (won't contaminate GEMM).
-    score_grad_obj = ScoreGradDense(ratio=ratio)
+    score_grad_obj = ScoreGradDense(ratio=ratio, block_I=block_I)
 
     # Kernel 2: 2Q GEMM kernel (reads pre-computed grad_signal, 2 Q tokens per CTA).
     # is_varlen branches at compile time on whether CuSeqlens* are None.
@@ -1961,7 +1997,7 @@ def _build_cute_dsl_kernel(batch, max_seqlen_q, max_seqlen_k, heads, dim, sm_sca
     # Only params that change generated code. max_seqlen_q/k are now runtime
     # Int32 args to ScoreGradDense (drive the launch grid + causal-mask bound)
     # and to the GEMM, so neither is keyed; batch/sm_scale likewise runtime.
-    compile_key = (is_varlen, heads, dim, block_I, ratio)
+    compile_key = (is_varlen, heads, dim, block_I, ratio, bool(has_q_causal_offsets))
 
     def _ensure_compiled_score_grad(
         IdxScoreRaw,
@@ -1970,6 +2006,7 @@ def _build_cute_dsl_kernel(batch, max_seqlen_q, max_seqlen_k, heads, dim, sm_sca
         AttnL1Norm,
         CuSeqlensQ,
         CuSeqlensK,
+        QCausalOffsets,
         grad_scale,
         current_stream=None,
     ):
@@ -1990,6 +2027,7 @@ def _build_cute_dsl_kernel(batch, max_seqlen_q, max_seqlen_k, heads, dim, sm_sca
             s = _resolve_stream(current_stream)
             cuq_arg = to_cute_tensor(CuSeqlensQ) if CuSeqlensQ is not None else None
             cuk_arg = to_cute_tensor(CuSeqlensK) if CuSeqlensK is not None else None
+            q_offsets_arg = to_cute_tensor(QCausalOffsets) if QCausalOffsets is not None else None
             _score_grad_compile_cache[compile_key] = cute.compile(
                 score_grad_obj,
                 to_cute_tensor(IdxScoreRaw),
@@ -1998,6 +2036,7 @@ def _build_cute_dsl_kernel(batch, max_seqlen_q, max_seqlen_k, heads, dim, sm_sca
                 to_cute_tensor(AttnL1Norm),
                 cuq_arg,
                 cuk_arg,
+                q_offsets_arg,
                 cutlass.Float32(float(grad_scale)),
                 cutlass.Int32(max_seqlen_q),
                 cutlass.Int32(max_seqlen_k),
@@ -2015,6 +2054,7 @@ def _build_cute_dsl_kernel(batch, max_seqlen_q, max_seqlen_k, heads, dim, sm_sca
         GradSignal,
         CuSeqlensQ,
         CuSeqlensK,
+        QCausalOffsets,
         current_stream=None,
     ):
         """Lazy-compile kernel 2 (2Q GEMM).
@@ -2026,6 +2066,7 @@ def _build_cute_dsl_kernel(batch, max_seqlen_q, max_seqlen_k, heads, dim, sm_sca
             s = _resolve_stream(current_stream)
             cuq_arg = to_cute_tensor(CuSeqlensQ) if CuSeqlensQ is not None else None
             cuk_arg = to_cute_tensor(CuSeqlensK) if CuSeqlensK is not None else None
+            q_offsets_arg = to_cute_tensor(QCausalOffsets) if QCausalOffsets is not None else None
             _gemm_compile_cache[compile_key] = cute.compile(
                 gemm_obj,
                 to_cute_tensor(IndexQ),
@@ -2037,6 +2078,7 @@ def _build_cute_dsl_kernel(batch, max_seqlen_q, max_seqlen_k, heads, dim, sm_sca
                 to_cute_tensor(GradSignal),
                 cuq_arg,
                 cuk_arg,
+                q_offsets_arg,
                 cutlass.Float32(sm_scale),
                 cutlass.Int32(max_seqlen_q),
                 cutlass.Int32(max_seqlen_k),
@@ -2054,6 +2096,7 @@ def _build_cute_dsl_kernel(batch, max_seqlen_q, max_seqlen_k, heads, dim, sm_sca
         GradSignal,
         CuSeqlensQ=None,
         CuSeqlensK=None,
+        QCausalOffsets=None,
         current_stream=None,
     ):
         """Run only kernel 2 (2Q GEMM). Caller must have run kernel 1 and zeroed dIndexK_f32."""
@@ -2063,6 +2106,10 @@ def _build_cute_dsl_kernel(batch, max_seqlen_q, max_seqlen_k, heads, dim, sm_sca
             assert CuSeqlensQ is not None and CuSeqlensK is not None, "THD-compiled kernel requires cu_seqlens_q/k at runtime"
         else:
             assert CuSeqlensQ is None and CuSeqlensK is None, "BSHD-compiled kernel must not receive cu_seqlens_q/k"
+        if has_q_causal_offsets:
+            assert QCausalOffsets is not None, "offset-compiled kernel requires q_causal_offsets at runtime"
+        else:
+            assert QCausalOffsets is None, "non-offset compiled kernel must not receive q_causal_offsets"
         s = _resolve_stream(current_stream)
         _ensure_compiled_gemm(
             IndexQ,
@@ -2074,6 +2121,7 @@ def _build_cute_dsl_kernel(batch, max_seqlen_q, max_seqlen_k, heads, dim, sm_sca
             GradSignal,
             CuSeqlensQ,
             CuSeqlensK,
+            QCausalOffsets,
             current_stream=current_stream,
         )
         with torch.cuda.nvtx.range("indexer_backward_dsl_dense_gemm_2q"):
@@ -2087,6 +2135,7 @@ def _build_cute_dsl_kernel(batch, max_seqlen_q, max_seqlen_k, heads, dim, sm_sca
                 GradSignal,
                 CuSeqlensQ,
                 CuSeqlensK,
+                QCausalOffsets,
                 cutlass.Float32(sm_scale),
                 cutlass.Int32(max_seqlen_q),
                 cutlass.Int32(max_seqlen_k),
@@ -2107,6 +2156,7 @@ def _build_cute_dsl_kernel(batch, max_seqlen_q, max_seqlen_k, heads, dim, sm_sca
         grad_scale,
         CuSeqlensQ=None,
         CuSeqlensK=None,
+        QCausalOffsets=None,
         current_stream=None,
     ):
         """Full dense backward: kernel 1 (score grad) + kernel 2 (2Q GEMM).
@@ -2123,6 +2173,10 @@ def _build_cute_dsl_kernel(batch, max_seqlen_q, max_seqlen_k, heads, dim, sm_sca
             assert CuSeqlensQ is not None and CuSeqlensK is not None, "THD-compiled kernel requires cu_seqlens_q/k at runtime"
         else:
             assert CuSeqlensQ is None and CuSeqlensK is None, "BSHD-compiled kernel must not receive cu_seqlens_q/k"
+        if has_q_causal_offsets:
+            assert QCausalOffsets is not None, "offset-compiled kernel requires q_causal_offsets at runtime"
+        else:
+            assert QCausalOffsets is None, "non-offset compiled kernel must not receive q_causal_offsets"
         s = _resolve_stream(current_stream)
 
         # Kernel 1 (CuTe DSL): in-place overwrites IdxScoreRaw with grad_signal.
@@ -2134,6 +2188,7 @@ def _build_cute_dsl_kernel(batch, max_seqlen_q, max_seqlen_k, heads, dim, sm_sca
             AttnL1Norm,
             CuSeqlensQ,
             CuSeqlensK,
+            QCausalOffsets,
             grad_scale,
             current_stream=current_stream,
         )
@@ -2145,6 +2200,7 @@ def _build_cute_dsl_kernel(batch, max_seqlen_q, max_seqlen_k, heads, dim, sm_sca
                 AttnL1Norm,
                 CuSeqlensQ,
                 CuSeqlensK,
+                QCausalOffsets,
                 cutlass.Float32(float(grad_scale)),
                 cutlass.Int32(max_seqlen_q),
                 cutlass.Int32(max_seqlen_k),
@@ -2163,6 +2219,7 @@ def _build_cute_dsl_kernel(batch, max_seqlen_q, max_seqlen_k, heads, dim, sm_sca
             IdxScoreRaw,
             CuSeqlensQ,
             CuSeqlensK,
+            QCausalOffsets,
             current_stream=current_stream,
         )
 
