@@ -482,41 +482,6 @@ class NativeGraph:
         self._nodes.append(node)
         return out
 
-    def rmsnorm(
-        self, input: Any, scale: Any, epsilon: Any, bias: Optional[Any] = None, norm_forward_phase: Any = None, name: str = "", compute_data_type: Any = None
-    ):
-        """RMS normalization. Returns (Y, inv_var).
-
-        First-class node: named input/scale/bias/epsilon ports + a
-        norm_forward_phase param, so it is fully introspectable and consumable by
-        any backend via graph.nodes (not an opaque pass-through). ``epsilon`` is a
-        pass-by-value host scalar tensor. Y has the input's shape; inv_var reduces
-        the non-batch dims (mirrors RMSNorm over dims 1..)."""
-        name = self._get_name("rmsnorm", name)
-        input = self._ensure_tensor(input, name=f"{name}::input")
-        scale = self._ensure_tensor(scale, name=f"{name}::scale")
-        epsilon = self._ensure_tensor(epsilon, name=f"{name}::epsilon")
-        node = Node(name, NodeType.RMSNORM, compute_data_type or self._context.compute_data_type)
-        node.inputs["input"] = input
-        node.inputs["scale"] = scale
-        node.inputs["epsilon"] = epsilon
-        if bias is not None:
-            node.inputs["bias"] = self._ensure_tensor(bias, name=f"{name}::bias")
-        node.params["norm_forward_phase"] = norm_forward_phase
-        Y = self._make_output(f"{name}::Y")
-        Y.dim = list(input.dim)
-        Y.stride = list(input.stride)
-        inv_var = self._make_output(f"{name}::inv_var")
-        if input.dim:
-            inv_var.dim = [input.dim[0]] + [1] * (len(input.dim) - 1)
-            inv_var.stride = _row_major_stride(inv_var.dim)
-        node.outputs["Y"] = Y
-        node.outputs["inv_var"] = inv_var
-        self._register_tensor(Y)
-        self._register_tensor(inv_var)
-        self._nodes.append(node)
-        return Y, inv_var
-
     def sdpa(
         self,
         q: Any,
@@ -1239,22 +1204,32 @@ class NativeGraph:
                     cpp_out.set_dim(_red_out.dim)
                 if _red_out.stride:
                     cpp_out.set_stride(_red_out.stride)
-            elif node.node_type == NodeType.RMSNORM:
-                phase = node.params.get("norm_forward_phase") or cudnn.norm_forward_phase.TRAINING
-                rms_kwargs = {
-                    "norm_forward_phase": phase,
-                    "input": tensor_map[node.inputs["input"].uid],
-                    "scale": tensor_map[node.inputs["scale"].uid],
-                    "epsilon": tensor_map[node.inputs["epsilon"].uid],
-                    "compute_data_type": node.compute_data_type,
-                    "name": node.name,
-                }
-                if "bias" in node.inputs:
-                    rms_kwargs["bias"] = tensor_map[node.inputs["bias"].uid]
-                Yc, ivc = graph.rmsnorm(**rms_kwargs)
-                # Let cuDNN infer Y/inv_var dims (matching the classic API); only
-                # mark output + dtype. The IR carries dims for introspection.
-                for out_t, cpp_t in ((node.outputs["Y"], Yc), (node.outputs["inv_var"], ivc)):
+            elif node.node_type in _STRUCTURED_BY_TYPE:
+                # Generic multi-output structured op (norm family): input ports
+                # are named after the C++ kwargs, so lowering is kwargs assembly
+                # + one call + zipping the returned tuple with the declared
+                # output ports. cuDNN infers output dims on its side; the IR
+                # carries dims for introspection.
+                method, spec = _STRUCTURED_BY_TYPE[node.node_type]
+                kw = {"compute_data_type": node.compute_data_type, "name": node.name}
+                list_ports = spec.get("list_inputs", ())
+                for port, t in node.inputs.items():
+                    if any(port.startswith(f"{lp}_") for lp in list_ports):
+                        continue  # collected below
+                    kw[port] = tensor_map[t.uid]
+                for lp in list_ports:
+                    n = node.params.get(f"_n_{lp}", 0)
+                    if n:
+                        kw[lp] = [tensor_map[node.inputs[f"{lp}_{i}"].uid] for i in range(n)]
+                for ek in spec.get("enums", ()):
+                    if ek in node.params:
+                        kw[ek] = node.params[ek]
+                result = getattr(graph, method)(**kw)
+                cpp_outs = list(result) if isinstance(result, (list, tuple)) else [result]
+                for oport, cpp_t in zip(spec["outputs"], cpp_outs):
+                    out_t = node.outputs.get(oport)
+                    if out_t is None or cpp_t is None:
+                        continue
                     tensor_map[out_t.uid] = cpp_t
                     if not out_t.is_virtual:
                         cpp_t.set_output(True)
@@ -1360,3 +1335,169 @@ def _install_pointwise_builders() -> None:
 
 
 _install_pointwise_builders()
+
+
+# ---------------------------------------------------------------------------
+# Structured multi-output ops (the norm family), declaratively.
+#
+# One table entry per op: its NodeType, the tensor-input ports (== the C++
+# pybind kwarg names), scalar/enum params passed through verbatim, the output
+# ports in C++ return order, and per-output shape inference (IR-side dims for
+# introspection; cuDNN re-infers at build). Builders are generated (keyword
+# call style, matching how these ops are used throughout the repo) and lowering
+# is one generic branch — no per-op code.
+# ---------------------------------------------------------------------------
+
+
+def _like(port):  # output dims mirror an input port
+    return lambda node: (node.inputs[port].dim if port in node.inputs else None)
+
+
+def _stats_like(port, keep_axes):  # input-port dims with all but keep_axes reduced to 1
+    def infer(node):
+        d = node.inputs[port].dim if port in node.inputs else None
+        return [x if i in keep_axes else 1 for i, x in enumerate(d)] if d else None
+
+    return infer
+
+
+_NORM_FWD_INFER = {"Y": _like("input"), "mean": _stats_like("input", (0,)), "inv_var": _stats_like("input", (0,))}
+_NORM_BWD_INFER = {"DX": _like("input"), "DScale": _like("scale"), "DBias": _like("scale")}
+
+_STRUCTURED_OPS = {
+    "rmsnorm": dict(
+        node_type=NodeType.RMSNORM,
+        inputs=("input", "scale", "bias", "epsilon"),
+        enums=("norm_forward_phase",),
+        outputs=("Y", "inv_var"),
+        infer={"Y": _like("input"), "inv_var": _stats_like("input", (0,))},
+    ),
+    "rmsnorm_backward": dict(
+        node_type=NodeType.RMSNORM_BWD,
+        inputs=("grad", "input", "scale", "inv_variance"),
+        enums=("has_dbias",),
+        outputs=("DX", "DScale", "DBias"),
+        infer=_NORM_BWD_INFER,
+    ),
+    "layernorm": dict(
+        node_type=NodeType.LAYERNORM,
+        inputs=("input", "scale", "bias", "epsilon"),
+        enums=("norm_forward_phase",),
+        outputs=("Y", "mean", "inv_var"),
+        infer=_NORM_FWD_INFER,
+    ),
+    "layernorm_backward": dict(
+        node_type=NodeType.LAYERNORM_BWD,
+        inputs=("grad", "input", "scale", "mean", "inv_variance"),
+        outputs=("DX", "DScale", "DBias"),
+        infer=_NORM_BWD_INFER,
+    ),
+    "adalayernorm": dict(
+        node_type=NodeType.ADALAYERNORM,
+        inputs=("input", "scale", "bias", "epsilon"),
+        enums=("norm_forward_phase",),
+        outputs=("Y", "mean", "inv_var"),
+        infer=_NORM_FWD_INFER,
+    ),
+    "adalayernorm_backward": dict(
+        node_type=NodeType.ADALAYERNORM_BWD,
+        inputs=("grad", "input", "scale", "mean", "inv_variance"),
+        outputs=("DX", "DScale", "DBias"),
+        infer=_NORM_BWD_INFER,
+    ),
+    "instancenorm": dict(
+        node_type=NodeType.INSTANCENORM,
+        inputs=("input", "scale", "bias", "epsilon"),
+        enums=("norm_forward_phase",),
+        outputs=("Y", "mean", "inv_var"),
+        infer={"Y": _like("input"), "mean": _stats_like("input", (0, 1)), "inv_var": _stats_like("input", (0, 1))},
+    ),
+    "instancenorm_backward": dict(
+        node_type=NodeType.INSTANCENORM_BWD,
+        inputs=("grad", "input", "scale", "mean", "inv_variance"),
+        outputs=("DX", "DScale", "DBias"),
+        infer=_NORM_BWD_INFER,
+    ),
+    "batchnorm": dict(
+        node_type=NodeType.BATCHNORM,
+        inputs=("input", "scale", "bias", "in_running_mean", "in_running_var", "epsilon", "momentum"),
+        list_inputs=("peer_stats",),
+        outputs=("Y", "mean", "inv_var", "next_running_mean", "next_running_var"),
+        infer={
+            "Y": _like("input"),
+            "mean": _stats_like("input", (1,)),
+            "inv_var": _stats_like("input", (1,)),
+            "next_running_mean": _stats_like("input", (1,)),
+            "next_running_var": _stats_like("input", (1,)),
+        },
+    ),
+    "batchnorm_inference": dict(
+        node_type=NodeType.BATCHNORM_INFERENCE,
+        inputs=("input", "mean", "inv_variance", "scale", "bias"),
+        outputs=("Y",),
+        infer={"Y": _like("input")},
+    ),
+    "batchnorm_backward": dict(
+        node_type=NodeType.BATCHNORM_BWD,
+        inputs=("grad", "input", "scale", "mean", "inv_variance"),
+        list_inputs=("peer_stats",),
+        outputs=("DX", "DScale", "DBias"),
+        infer=_NORM_BWD_INFER,
+    ),
+}
+
+# node_type -> (method name, spec), for the generic lowering branch
+_STRUCTURED_BY_TYPE = {spec["node_type"]: (op, spec) for op, spec in _STRUCTURED_OPS.items()}
+
+
+def _install_structured_builders() -> None:
+    """Generate builders for _STRUCTURED_OPS (keyword call style)."""
+
+    def make(op: str, spec: dict):
+        input_ports = spec["inputs"]
+        list_ports = spec.get("list_inputs", ())
+        enum_kws = spec.get("enums", ())
+        infer = spec.get("infer", {})
+
+        def builder(self, name: str = "", compute_data_type: Any = None, **kwargs):
+            name_ = self._get_name(op, name)
+            node = Node(name_, spec["node_type"], compute_data_type or self._context.compute_data_type)
+            for port in input_ports:
+                v = kwargs.pop(port, None)
+                if v is not None:
+                    node.inputs[port] = self._ensure_tensor(v, name=f"{name_}::{port}")
+            for lp in list_ports:
+                vs = kwargs.pop(lp, None) or []
+                for i, v in enumerate(vs):
+                    node.inputs[f"{lp}_{i}"] = self._ensure_tensor(v, name=f"{name_}::{lp}_{i}")
+                if vs:
+                    node.params[f"_n_{lp}"] = len(vs)
+            for ek in enum_kws:
+                v = kwargs.pop(ek, None)
+                if v is not None:
+                    node.params[ek] = v
+            if kwargs:
+                raise TypeError(f"{op}() got unexpected arguments {sorted(kwargs)}; tensor ports are {input_ports}")
+            outs = []
+            for oport in spec["outputs"]:
+                o = self._make_output(f"{name_}::{oport}")
+                d = infer.get(oport, lambda n: None)(node)
+                if d:
+                    o.dim = list(d)
+                    o.stride = _row_major_stride(o.dim)
+                node.outputs[oport] = o
+                self._register_tensor(o)
+                outs.append(o)
+            self._nodes.append(node)
+            return outs[0] if len(outs) == 1 else tuple(outs)
+
+        builder.__name__ = op
+        builder.__qualname__ = f"NativeGraph.{op}"
+        builder.__doc__ = f"{op}({', '.join(input_ports)}) -> ({', '.join(spec['outputs'])})."
+        return builder
+
+    for op, spec in _STRUCTURED_OPS.items():
+        setattr(NativeGraph, op, make(op, spec))
+
+
+_install_structured_builders()

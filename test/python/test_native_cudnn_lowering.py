@@ -156,6 +156,77 @@ def test_native_moe_grouped_matmul_lowers_to_cudnn():
     torch.testing.assert_close(out_d.view(T, Wt).float(), ref.cuda(), rtol=5e-2, atol=5e-2)
 
 
+def test_native_layernorm_fwd_bwd_lowers_to_cudnn():
+    """layernorm fwd (3 outputs) + layernorm_backward (3 outputs) through the
+    generic structured-op lowering, parity vs torch autograd.
+
+    Uses the cuDNN-supported LN config ([N, C, 1, 1] channels_last, i.e. LN over
+    the embedding dim) — same as the classic test_layernorm.py."""
+    h = _handle()
+    Nb, C = 64, 128
+    eps = 1e-3
+
+    def cl(t):
+        return t.to(memory_format=torch.channels_last)
+
+    x = cl(torch.randn(Nb, C, 1, 1, device="cuda", dtype=torch.float16)).requires_grad_()
+    scale = cl(torch.randn(1, C, 1, 1, device="cuda", dtype=torch.float16)).requires_grad_()
+    bias = cl(torch.randn(1, C, 1, 1, device="cuda", dtype=torch.float16)).requires_grad_()
+    eps_cpu = torch.full((1, 1, 1, 1), eps, dtype=torch.float32)
+
+    # torch reference (normalize over all non-batch dims)
+    xf = x.float()
+    mean_ref = xf.mean(dim=(1, 2, 3), keepdim=True)
+    inv_ref = torch.rsqrt(xf.var(dim=(1, 2, 3), keepdim=True, unbiased=False) + eps)
+    Y_ref = (xf - mean_ref) * inv_ref * scale.float() + bias.float()
+    grad = torch.randn_like(Y_ref)
+    Y_ref.backward(grad)
+
+    cl_stride = [C, 1, C, C]  # channels_last for [*, C, 1, 1]
+
+    # ---- forward ----
+    g = NativeGraph(handle=h, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    X = g.tensor(dim=[Nb, C, 1, 1], stride=cl_stride, data_type=cudnn.data_type.HALF)
+    S = g.tensor(dim=[1, C, 1, 1], stride=cl_stride, data_type=cudnn.data_type.HALF)
+    Bi = g.tensor(dim=[1, C, 1, 1], stride=cl_stride, data_type=cudnn.data_type.HALF)
+    E = g.tensor(dim=[1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.FLOAT, is_pass_by_value=True)
+    Y, mean, iv = g.layernorm(norm_forward_phase=cudnn.norm_forward_phase.TRAINING, input=X, scale=S, bias=Bi, epsilon=E)
+    Y.set_output(True).set_data_type(cudnn.data_type.HALF)
+    mean.set_output(True).set_data_type(cudnn.data_type.FLOAT)
+    iv.set_output(True).set_data_type(cudnn.data_type.FLOAT)
+    g.build([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    Yb = cl(torch.empty(Nb, C, 1, 1, device="cuda", dtype=torch.float16))
+    mb = torch.empty(Nb, 1, 1, 1, device="cuda", dtype=torch.float32)
+    ivb = torch.empty(Nb, 1, 1, 1, device="cuda", dtype=torch.float32)
+    ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
+    g.execute({X: x.detach(), S: scale.detach(), Bi: bias.detach(), E: eps_cpu, Y: Yb, mean: mb, iv: ivb}, ws, handle=h)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(Yb.float(), Y_ref, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(mb, mean_ref, atol=5e-3, rtol=5e-3)
+    torch.testing.assert_close(ivb, inv_ref, atol=5e-3, rtol=5e-3)
+
+    # ---- backward ----
+    g2 = NativeGraph(handle=h, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    DY = g2.tensor(dim=[Nb, C, 1, 1], stride=cl_stride, data_type=cudnn.data_type.HALF)
+    X2 = g2.tensor(dim=[Nb, C, 1, 1], stride=cl_stride, data_type=cudnn.data_type.HALF)
+    S2 = g2.tensor(dim=[1, C, 1, 1], stride=cl_stride, data_type=cudnn.data_type.HALF)
+    M2 = g2.tensor(dim=[Nb, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.FLOAT)
+    IV2 = g2.tensor(dim=[Nb, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.FLOAT)
+    DX, DS, DB = g2.layernorm_backward(grad=DY, input=X2, scale=S2, mean=M2, inv_variance=IV2)
+    for t in (DX, DS, DB):
+        t.set_output(True).set_data_type(cudnn.data_type.HALF)
+    g2.build([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    dxb = cl(torch.empty(Nb, C, 1, 1, device="cuda", dtype=torch.float16))
+    dsb = cl(torch.empty(1, C, 1, 1, device="cuda", dtype=torch.float16))
+    dbb = cl(torch.empty(1, C, 1, 1, device="cuda", dtype=torch.float16))
+    ws2 = torch.empty(max(g2.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
+    g2.execute({DY: cl(grad.half()), X2: x.detach(), S2: scale.detach(), M2: mb, IV2: ivb, DX: dxb, DS: dsb, DB: dbb}, ws2, handle=h)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(dxb.float(), x.grad.float(), atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(dsb.float(), scale.grad.float(), atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(dbb.float(), bias.grad.float(), atol=5e-2, rtol=5e-2)
+
+
 def test_native_pointwise_batch_lowers_to_cudnn():
     """Generated pointwise builders through real cuDNN: sqrt(abs(A@B)) clamped
     via binary max/min (keyword call style, input0/input1)."""

@@ -282,6 +282,37 @@ class TestNativeGraph:
                 g.validate()
                 assert node.outputs["OUT_0"].dim == [4, 8], op
 
+    def test_all_structured_builders(self):
+        """Every op in _STRUCTURED_OPS builds a first-class node: named ports
+        (== C++ kwargs), enum params, declared outputs with inferred dims."""
+        from cudnn.graph_native import _STRUCTURED_OPS
+
+        for op, spec in _STRUCTURED_OPS.items():
+            g = NativeGraph()
+            kwargs = {port: g.tensor(dim=[4, 8], name=f"{op}::{port}_in") for port in spec["inputs"]}
+            for ek in spec.get("enums", ()):
+                kwargs[ek] = "PHASE_SENTINEL"  # any value; stored verbatim
+            outs = getattr(g, op)(**kwargs)
+            outs = outs if isinstance(outs, tuple) else (outs,)
+            (node,) = g.nodes
+            assert node.node_type == spec["node_type"], op
+            assert set(node.inputs) == set(spec["inputs"]), op
+            assert tuple(node.outputs) == spec["outputs"], op
+            for ek in spec.get("enums", ()):
+                assert node.params[ek] == "PHASE_SENTINEL", op
+            assert len(outs) == len(spec["outputs"]), op
+            g.validate()  # inferred dims satisfy tensor validation
+
+    def test_batchnorm_peer_stats_ports(self):
+        """List inputs (peer_stats) become indexed ports + a count param."""
+        g = NativeGraph()
+        kwargs = {p: g.tensor(dim=[4, 8], name=p) for p in ("input", "scale", "bias", "epsilon", "momentum", "in_running_mean", "in_running_var")}
+        ps = [g.tensor(dim=[4, 8], name=f"ps{i}") for i in range(2)]
+        g.batchnorm(peer_stats=ps, **kwargs)
+        (node,) = g.nodes
+        assert node.params["_n_peer_stats"] == 2
+        assert "peer_stats_0" in node.inputs and "peer_stats_1" in node.inputs
+
     def test_pointwise_scalar_attrs(self):
         """Ops with scalar attributes store them in params (introspectable)."""
         g = NativeGraph()
