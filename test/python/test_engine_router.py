@@ -1,6 +1,6 @@
 """CPU tests for the backend Router + BaseEngine contract.
 
-These run without a GPU or cuDNN: they exercise NativeGraph -> Router -> ranked
+These run without a GPU or cuDNN: they exercise pygraph -> Router -> ranked
 plan list -> engine-id dispatch using the pure-PyTorch ReferenceMatmulEngine.
 This is the CI-safe proof that the unification contract works end to end.
 """
@@ -9,7 +9,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from cudnn.pygraph import NativeGraph
+from cudnn.pygraph import pygraph
 from cudnn.engines import BaseEngine, Router, ReferenceMatmulEngine, PYTHON_ENGINE_ID_BASE, is_python_engine
 from cudnn.engines.engine_ids import CUDNN_HEURISTIC_ENGINE_ID
 
@@ -36,7 +36,7 @@ def test_router_plan_list_includes_supporting_engines_then_cudnn():
         def execute(self, graph, tensor_data, ctx=None):
             pass
 
-    g = NativeGraph()
+    g = pygraph()
     a = g.tensor(dim=[4, 8], name="A")
     b = g.tensor(dim=[8, 4], name="B")
     g.matmul(a, b, name="mm")
@@ -51,7 +51,7 @@ def test_router_plan_list_includes_supporting_engines_then_cudnn():
 
 def test_reference_matmul_execute_cpu():
     """ReferenceMatmulEngine runs a matmul on CPU and writes the output buffer."""
-    g = NativeGraph()
+    g = pygraph()
     g.register_backend(ReferenceMatmulEngine())
 
     a = torch.randn(2, 3, 4)
@@ -68,7 +68,7 @@ def test_reference_matmul_execute_cpu():
 
 def test_reference_matmul_bias_relu_fusion_cpu():
     """A small matmul + add + relu chain routes to the reference and matches."""
-    g = NativeGraph()
+    g = pygraph()
     g.register_backend(ReferenceMatmulEngine())
 
     a = torch.randn(3, 4)
@@ -105,7 +105,7 @@ def test_select_plan_survives_build_and_execute():
         def execute(self, graph, tensor_data, ctx=None):
             type(self).ran += 1
 
-    g = NativeGraph()
+    g = pygraph()
     g.register_backend(EngA()).register_backend(EngB())
     a = torch.randn(2, 2)
     C = g.matmul(a, torch.randn(2, 2))
@@ -134,7 +134,7 @@ def test_register_backend_validation():
         def execute(self, graph, tensor_data, ctx=None):
             pass
 
-    g = NativeGraph()
+    g = pygraph()
     with pytest.raises(ValueError, match="engine_id"):
         g.register_backend(NoId())
     g.register_backend(E1())
@@ -165,7 +165,7 @@ def test_unexpected_engine_exception_propagates():
         def execute(self, graph, tensor_data, ctx=None):
             pass
 
-    g = NativeGraph()
+    g = pygraph()
     a = g.tensor(dim=[2, 2], name="A")
     g.matmul(a, g.tensor(dim=[2, 2], name="B"))
     g.register_backend(Buggy())
@@ -175,7 +175,7 @@ def test_unexpected_engine_exception_propagates():
 
 def test_no_backend_plan_list_is_cudnn_only():
     """With no python engine, the plan list is just the cuDNN entry (selected=None)."""
-    g = NativeGraph()
+    g = pygraph()
     a = g.tensor(dim=[4, 8], name="A")
     b = g.tensor(dim=[8, 4], name="B")
     g.matmul(a, b, name="mm")
@@ -219,7 +219,7 @@ def test_compiled_plan_lifecycle_knobs_and_reuse():
             compiled_log.append(plan.knobs)
             return TunablePlan(plan.knobs)
 
-    g = NativeGraph()
+    g = pygraph()
     g.register_backend(Tunable())
     C = g.matmul(torch.randn(2, 2), torch.randn(2, 2))
     g.create_execution_plans()
@@ -239,7 +239,7 @@ def test_compiled_plan_lifecycle_knobs_and_reuse():
     assert plan.executed[0] == ({"tile": 256}, ws)  # knobs + caller workspace observed
 
     # same engine instance on a second graph: no state collision
-    g2 = NativeGraph()
+    g2 = pygraph()
     g2.register_backend(Tunable())
     C2 = g2.matmul(torch.randn(2, 2), torch.randn(2, 2))
     g2.execute({C2: torch.empty(2, 2)})
@@ -270,27 +270,22 @@ def _mk_engine(id_off, knobs=None, log=None):
     return _E()
 
 
-def test_explicit_replan_invalidates_compiled_artifacts():
-    """Follow-up item 1: explicit create_execution_plans() must not leave a
-    stale compiled artifact executable."""
-    from cudnn.engines import PlanConfig
-
+def test_planning_is_one_shot():
+    """Classic conformance: re-planning was never a supported call pattern (the
+    C++ graph appends plans by accident on a second call; nobody re-plans).
+    A second create_execution_plans() raises — a stale compiled artifact can
+    therefore never execute. Plan differently => build a new graph."""
     log = []
     eng = _mk_engine(60, knobs="old", log=log)
-    g = NativeGraph()
+    g = pygraph()
     g.register_backend(eng)
     C = g.matmul(torch.randn(2, 2), torch.randn(2, 2))
     g.create_execution_plans()
     g.build_plans()
-    old_compiled = g._compiled_plans[0]
-
-    type(eng).default_knobs = "new"
-    g.create_execution_plans()  # explicit replan
-    assert g.plans[0].knobs == "new"
-    assert not g._compiled_plans and not g._is_built  # artifacts invalidated
+    with pytest.raises(RuntimeError, match="one-shot"):
+        g.create_execution_plans()
     g.execute({C: torch.empty(2, 2)})
-    assert g._compiled_plans[0] is not old_compiled
-    assert log[-1] == "new"  # executed the NEW plan's compilation
+    assert log[-1] == "old"  # the planned artifact, unchanged
 
 
 def test_mixed_router_ordering_dispatch():
@@ -310,7 +305,7 @@ def test_mixed_router_ordering_dispatch():
                 PlanConfig(eb.engine_id, "B"),
             ]
 
-    g = NativeGraph(router=Interleaved())
+    g = pygraph(router=Interleaved())
     g.register_backend(ea).register_backend(eb)
     C = g.matmul(torch.randn(2, 2), torch.randn(2, 2))
     g.create_execution_plans()
@@ -333,7 +328,7 @@ def test_constructor_backends_validated_and_proposals_checked():
             pass
 
     with pytest.raises(ValueError, match="engine_id"):
-        NativeGraph(backends=[NoId()])
+        pygraph(backends=[NoId()])
 
     class Impostor(BaseEngine):
         name = "impostor"
@@ -345,14 +340,14 @@ def test_constructor_backends_validated_and_proposals_checked():
         def execute(self, graph, tensor_data, ctx=None):
             pass
 
-    g = NativeGraph(backends=[Impostor()])
+    g = pygraph(backends=[Impostor()])
     g.matmul(torch.randn(2, 2), torch.randn(2, 2))
     with pytest.raises(ValueError, match="foreign engine_id"):
         g.create_execution_plans()
 
 
 def test_python_plan_rejects_dynamic_workspace_overrides():
-    g = NativeGraph()
+    g = pygraph()
     g.register_backend(ReferenceMatmulEngine())
     C = g.matmul(torch.randn(2, 3), torch.randn(3, 2))
     g.build()
@@ -366,7 +361,7 @@ def test_failed_stream_query_on_supplied_handle_raises(monkeypatch):
     correctness error — never a silent stream-0 fallback."""
     import cudnn as _cudnn
 
-    g = NativeGraph()
+    g = pygraph()
     g.register_backend(ReferenceMatmulEngine())
     C = g.matmul(torch.randn(2, 3), torch.randn(3, 2))
     g.build()

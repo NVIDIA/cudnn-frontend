@@ -42,13 +42,13 @@ from .base import BaseEngine, PlanConfig
 from .engine_ids import CUDNN_HEURISTIC_ENGINE_ID
 
 if TYPE_CHECKING:
-    from ..pygraph import NativeGraph
+    from ..pygraph import pygraph
 
 
 class Router:
     """Default policy: python engines that support the graph, then cuDNN."""
 
-    def plan(self, graph: "NativeGraph", backends: List[BaseEngine]) -> List[PlanConfig]:
+    def plan(self, graph: "pygraph", backends: List[BaseEngine]) -> List[PlanConfig]:
         """Return the ranked candidate plan list for ``graph``.
 
         Python engines are included (by ascending ``engine_id``, a stable order)
@@ -82,5 +82,5 @@ class Router:
 
 
 # Process-wide default. Assign a Router subclass to change global policy, or pass
-# one to NativeGraph(router=...) / graph.set_router(...) per graph.
+# one to pygraph(router=...) / graph.set_router(...) per graph.
 default_router = Router()

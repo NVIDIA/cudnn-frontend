@@ -1,6 +1,6 @@
 """Pure-PyTorch reference backend — a correctness baseline with no GPU/JIT deps.
 
-This backend exists so the NativeGraph + BaseEngine + Router contract can be
+This backend exists so the pygraph + BaseEngine + Router contract can be
 exercised in CI on CPU, and so every future DSL backend has a numerical oracle
 to diff against. It supports MATMUL plus a small set of POINTWISE ops; anything
 else is declined (the Router then tries another backend or falls back to cuDNN).
@@ -21,7 +21,7 @@ from .engine_ids import PYTHON_ENGINE_ID_BASE
 from ..graph_types import NodeType
 
 if TYPE_CHECKING:
-    from ..pygraph import NativeGraph
+    from ..pygraph import pygraph
 
 # POINTWISE ops this reference understands, keyed by the op kind
 # (params["mode"] == the pygraph method name).
@@ -53,7 +53,7 @@ class ReferenceMatmulEngine(BaseEngine):
     name = "reference_matmul"
     engine_id = PYTHON_ENGINE_ID_BASE + 0  # stable id (a correctness oracle)
 
-    def check_support(self, graph: "NativeGraph") -> None:
+    def check_support(self, graph: "pygraph") -> None:
         if torch is None:
             raise NotImplementedError("ReferenceMatmulEngine requires PyTorch")
         for node in graph.nodes:

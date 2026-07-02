@@ -1,4 +1,4 @@
-"""Execution backends for NativeGraph.
+"""Execution backends for pygraph.
 
 Pluggable execution backends in one flat engine-id space with the cuDNN backend.
 The Router builds a ranked plan list at ``create_execution_plans()`` time; graph

@@ -1,4 +1,4 @@
-"""GPU parity: NativeGraph builds natively, lowers to cuDNN, executes correctly.
+"""GPU parity: pygraph builds natively, lowers to cuDNN, executes correctly.
 
 Covers the native -> _lower_to_cpp -> cuDNN execute path (uid propagation, handle
 threading, pointwise dispatch). Skipped without a GPU / cuDNN.
@@ -11,7 +11,7 @@ if not torch.cuda.is_available():
     pytest.skip("needs a CUDA GPU", allow_module_level=True)
 
 import cudnn
-from cudnn.pygraph import NativeGraph
+from cudnn.pygraph import pygraph
 
 pytestmark = pytest.mark.L0
 
@@ -28,7 +28,7 @@ def test_native_matmul_lowers_to_cudnn():
     b = torch.randn(1, K, N, device="cuda", dtype=torch.float16)
     c = torch.empty(1, M, N, device="cuda", dtype=torch.float16)
 
-    g = NativeGraph(handle=h, io_data_type=cudnn.data_type.HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    g = pygraph(handle=h, io_data_type=cudnn.data_type.HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
     A = g.tensor(dim=[1, M, K], stride=[M * K, K, 1], data_type=cudnn.data_type.HALF)
     B = g.tensor(dim=[1, K, N], stride=[K * N, N, 1], data_type=cudnn.data_type.HALF)
     C = g.matmul(A, B)
@@ -49,7 +49,7 @@ def test_native_matmul_bias_relu_lowers_to_cudnn():
     bias = torch.randn(1, M, N, device="cuda", dtype=torch.float16)
     c = torch.empty(1, M, N, device="cuda", dtype=torch.float16)
 
-    g = NativeGraph(handle=h, io_data_type=cudnn.data_type.HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    g = pygraph(handle=h, io_data_type=cudnn.data_type.HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
     A = g.tensor(dim=[1, M, K], stride=[M * K, K, 1], data_type=cudnn.data_type.HALF)
     B = g.tensor(dim=[1, K, N], stride=[K * N, N, 1], data_type=cudnn.data_type.HALF)
     Bi = g.tensor(dim=[1, M, N], stride=[M * N, N, 1], data_type=cudnn.data_type.HALF)
@@ -71,7 +71,7 @@ def test_native_matmul_reduction_lowers_to_cudnn():
     b = torch.randn(1, K, N, device="cuda", dtype=torch.float16)
     r = torch.empty(1, M, 1, device="cuda", dtype=torch.float32)
 
-    g = NativeGraph(handle=h, io_data_type=cudnn.data_type.HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    g = pygraph(handle=h, io_data_type=cudnn.data_type.HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
     A = g.tensor(dim=[1, M, K], stride=[M * K, K, 1], data_type=cudnn.data_type.HALF)
     B = g.tensor(dim=[1, K, N], stride=[K * N, N, 1], data_type=cudnn.data_type.HALF)
     R = g.reduction(g.matmul(A, B), mode=cudnn.reduction_mode.ADD, out_dims=[1, M, 1])
@@ -101,7 +101,7 @@ def test_native_block_scale_nvfp4_lowers_to_cudnn():
     B_ds = torch.full((b, k_scale, 128), 1.0, dtype=torch.float8_e4m3fn, device="cuda")
     C = torch.empty((b, Mb, Nb), dtype=torch.bfloat16, device="cuda")
 
-    g = NativeGraph(handle=h, compute_data_type=cudnn.data_type.FLOAT)
+    g = pygraph(handle=h, compute_data_type=cudnn.data_type.FLOAT)
     At = g.tensor(dim=[b, Mb, Kb], stride=[Mb * Kb, Kb, 1], data_type=cudnn.data_type.FP4_E2M1)
     Bt = g.tensor(dim=[b, Kb, Nb], stride=[Nb * Kb, 1, Kb], data_type=cudnn.data_type.FP4_E2M1)
     Ad = g.tensor(
@@ -128,7 +128,7 @@ def test_native_moe_grouped_matmul_lowers_to_cudnn():
     E, T, Wt, Hd = 8, 256, 64, 128
     fto = [i * (T // E) for i in range(E)]  # one contiguous token chunk per expert
 
-    g = NativeGraph(handle=h, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    g = pygraph(handle=h, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
     tok = g.tensor(dim=[1, T, Hd], stride=[T * Hd, Hd, 1], data_type=cudnn.data_type.BFLOAT16)
     wt = g.tensor(dim=[E, Hd, Wt], stride=[Hd * Wt, 1, Hd], data_type=cudnn.data_type.BFLOAT16)
     off = g.tensor(dim=[E, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
@@ -166,7 +166,7 @@ def test_native_sdpa_fwd_lowers_to_cudnn():
     o = torch.empty(B, Hh, S, D, device="cuda", dtype=torch.float16)
     ref = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
 
-    g = NativeGraph(handle=h, io_data_type=cudnn.data_type.HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    g = pygraph(handle=h, io_data_type=cudnn.data_type.HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
     Q = g.tensor(dim=[B, Hh, S, D], stride=list(q.stride()), data_type=cudnn.data_type.HALF)
     K = g.tensor(dim=[B, Hh, S, D], stride=list(k.stride()), data_type=cudnn.data_type.HALF)
     V = g.tensor(dim=[B, Hh, S, D], stride=list(v.stride()), data_type=cudnn.data_type.HALF)
@@ -190,7 +190,7 @@ def test_native_conv_fprop_lowers_to_cudnn():
     ref = torch.nn.functional.conv2d(x, w, padding=[1, 1], stride=[1, 1], dilation=[1, 1])
     y = torch.empty_like(ref).to(memory_format=torch.channels_last)
 
-    g = NativeGraph(handle=h, io_data_type=cudnn.data_type.HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    g = pygraph(handle=h, io_data_type=cudnn.data_type.HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
     X = g.tensor(dim=list(x.shape), stride=list(x.stride()), data_type=cudnn.data_type.HALF)
     W = g.tensor(dim=list(w.shape), stride=list(w.stride()), data_type=cudnn.data_type.HALF)
     Y = g.conv_fprop(image=X, weight=W, padding=[1, 1], stride=[1, 1], dilation=[1, 1])
@@ -234,7 +234,7 @@ def test_native_layernorm_fwd_bwd_lowers_to_cudnn():
     cl_stride = [C, 1, C, C]  # channels_last for [*, C, 1, 1]
 
     # ---- forward ----
-    g = NativeGraph(handle=h, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    g = pygraph(handle=h, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
     X = g.tensor(dim=[Nb, C, 1, 1], stride=cl_stride, data_type=cudnn.data_type.HALF)
     S = g.tensor(dim=[1, C, 1, 1], stride=cl_stride, data_type=cudnn.data_type.HALF)
     Bi = g.tensor(dim=[1, C, 1, 1], stride=cl_stride, data_type=cudnn.data_type.HALF)
@@ -255,7 +255,7 @@ def test_native_layernorm_fwd_bwd_lowers_to_cudnn():
     torch.testing.assert_close(ivb, inv_ref, atol=5e-3, rtol=5e-3)
 
     # ---- backward ----
-    g2 = NativeGraph(handle=h, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    g2 = pygraph(handle=h, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
     DY = g2.tensor(dim=[Nb, C, 1, 1], stride=cl_stride, data_type=cudnn.data_type.HALF)
     X2 = g2.tensor(dim=[Nb, C, 1, 1], stride=cl_stride, data_type=cudnn.data_type.HALF)
     S2 = g2.tensor(dim=[1, C, 1, 1], stride=cl_stride, data_type=cudnn.data_type.HALF)
@@ -286,7 +286,7 @@ def test_native_pointwise_batch_lowers_to_cudnn():
     hi = torch.full((1, 1, 1), 2.0, device="cuda", dtype=torch.float32)
     c = torch.empty(1, M, N, device="cuda", dtype=torch.float16)
 
-    g = NativeGraph(handle=h, io_data_type=cudnn.data_type.HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    g = pygraph(handle=h, io_data_type=cudnn.data_type.HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
     A = g.tensor(dim=[1, M, K], stride=[M * K, K, 1], data_type=cudnn.data_type.HALF)
     B = g.tensor(dim=[1, K, N], stride=[K * N, N, 1], data_type=cudnn.data_type.HALF)
     Lo = g.tensor(dim=[1, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.FLOAT)
@@ -322,7 +322,7 @@ def test_native_rmsnorm_lowers_to_cudnn():
     Yb = torch.empty_like(x)
     ivb = torch.empty(Nb, 1, 1, 1, device="cuda", dtype=torch.float32)
 
-    g = NativeGraph(handle=h, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    g = pygraph(handle=h, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
     X = g.tensor(dim=[Nb, C, Hh, W], stride=[C * Hh * W, Hh * W, W, 1], data_type=cudnn.data_type.HALF)
     S = g.tensor(dim=[1, C, Hh, W], stride=[C * Hh * W, Hh * W, W, 1], data_type=cudnn.data_type.HALF)
     Bi = g.tensor(dim=[1, C, Hh, W], stride=[C * Hh * W, Hh * W, W, 1], data_type=cudnn.data_type.HALF)

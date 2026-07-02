@@ -8,13 +8,13 @@ results directly into these buffers (matching cuDNN's execution model).
 
 Example Usage:
     import torch
-    from cudnn import NativeGraph
+    from cudnn import pygraph
 
     a = torch.randn(2, 3, 4, device="cuda")
     b = torch.randn(2, 4, 5, device="cuda")
     c = torch.empty(2, 3, 5, device="cuda")
 
-    graph = NativeGraph(use_native=True)
+    graph = pygraph(use_native=True)
     C = graph.matmul(a, b)  # pass torch tensors directly
     graph.execute({C: c})   # leaf outputs auto-detected, inputs auto-bound
 
@@ -39,7 +39,7 @@ from .engine_ids import PYTHON_ENGINE_ID_BASE
 from ..graph_types import NodeType
 
 if TYPE_CHECKING:
-    from ..pygraph import NativeGraph
+    from ..pygraph import pygraph
 
 
 # Tile sizes for matmul kernel
@@ -148,7 +148,7 @@ class MatmulCuTileEngine(BaseEngine):
             raise ImportError("MatmulCuTileEngine requires cuda-python package. " "Install with: pip install cuda-python")
         self.device = device
 
-    def check_support(self, graph: "NativeGraph") -> None:
+    def check_support(self, graph: "pygraph") -> None:
         """Check hardware requirements and that graph only contains MATMUL nodes.
 
         Raises:

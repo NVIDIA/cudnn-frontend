@@ -664,16 +664,19 @@ class pygraph:
 
         from .engines.router import default_router
 
+        # One-shot planning (classic conformance: the C++ graph never supported
+        # re-planning — a second call there appends plans by accident, and no
+        # user re-plans). Plan once; to plan differently, build a new graph
+        # (IR construction is microseconds). Autotune re-selects WITHIN this
+        # plan set via select_plan().
+        if self._plans:
+            raise RuntimeError(
+                "create_execution_plans() was already called on this graph; planning is one-shot — build a new graph to re-plan, or use select_plan() to switch plans"
+            )
         router = self._router or default_router
         self._plans = router.plan(self, self._backends)
         self._plan_index = 0
         self._cudnn_heuristics = heuristics  # applied when a cuDNN plan is built
-        # Explicit replan invalidates every plan-derived artifact: compiled
-        # python plans, built state, and the backend's plan list (heuristic
-        # modes may have changed). Stale artifacts must never execute.
-        self._compiled_plans.clear()
-        self._is_built = False
-        self._cpp_plans_created = False
         # Classic sequencing: if the graph was already lowered (no python
         # engines -> build_operation_graph lowered eagerly) and the selected
         # plan is the cuDNN one, create the C++ plans now.
@@ -967,21 +970,21 @@ class pygraph:
 
     @classmethod
     def from_serialized(cls, data: bytes, handle: Optional[int] = None, **kwargs) -> "pygraph":
-        """Create a NativeGraph from serialized data.
+        """Create a pygraph from serialized data.
 
         This is a convenience method that creates a minimal graph and deserializes into it.
 
         Args:
             data: Serialized graph data (from serialize()).
             handle: Optional cuDNN handle for AoT compilation.
-            **kwargs: Additional arguments passed to NativeGraph constructor.
+            **kwargs: Additional arguments passed to the constructor.
 
         Returns:
-            NativeGraph: Deserialized graph ready for execution.
+            pygraph: Deserialized graph ready for execution.
         """
         import cudnn
 
-        # Create a new NativeGraph with a fresh C++ graph
+        # Create a new graph with a fresh C++ graph
         graph = cls(**kwargs)
         graph._lowered_graph = cudnn._pybind_module.pygraph(
             io_data_type=graph._context.io_data_type,
@@ -1800,5 +1803,5 @@ def _install_captured_builders() -> None:
 _install_captured_builders()
 
 
-# Transitional alias (pre-flip name)
+# Transitional alias (pre-flip name); will be removed after downstreams migrate.
 NativeGraph = pygraph

@@ -6,7 +6,7 @@ torch = pytest.importorskip("torch")
 
 from cudnn.graph_types import NodeType, Tensor
 from cudnn.nodes import Node, _row_major_stride
-from cudnn.pygraph import NativeGraph, GraphContext
+from cudnn.pygraph import pygraph, GraphContext
 
 pytestmark = pytest.mark.L0
 
@@ -149,21 +149,21 @@ class TestRowMajorStride:
         assert _row_major_stride([]) == []
 
 
-class TestNativeGraph:
-    """Tests for NativeGraph."""
+class Testpygraph:
+    """Tests for pygraph."""
 
     def test_creation(self):
-        g = NativeGraph()
+        g = pygraph()
         assert len(g.nodes) == 0
         assert len(g.tensors) == 0
 
     def test_with_context(self):
-        g = NativeGraph(io_data_type="HALF", compute_data_type="FLOAT")
+        g = pygraph(io_data_type="HALF", compute_data_type="FLOAT")
         assert g.context.io_data_type == "HALF"
         assert g.context.compute_data_type == "FLOAT"
 
     def test_tensor_creation(self):
-        g = NativeGraph()
+        g = pygraph()
         t = g.tensor(dim=[8, 64, 128], name="my_tensor")
         assert t.name == "my_tensor"
         assert t.dim == [8, 64, 128]
@@ -173,7 +173,7 @@ class TestNativeGraph:
     def test_uid_ownership(self):
         """The IR owns the uid namespace: user-specified uids are reserved (auto
         allocation skips them) and duplicates are rejected eagerly."""
-        g = NativeGraph()
+        g = pygraph()
         a = g.tensor(dim=[2, 2], uid=2, name="user_uid")  # reserve 2
         assert a.uid == 2 and a.uid_assigned
         b = g.tensor(dim=[2, 2], name="auto1")  # auto: 1
@@ -184,7 +184,7 @@ class TestNativeGraph:
             g.tensor(dim=[2, 2], uid=3, name="dup")
 
     def test_matmul(self):
-        g = NativeGraph()
+        g = pygraph()
         A = g.tensor(dim=[8, 64, 128], name="A")
         B = g.tensor(dim=[8, 128, 256], name="B")
         C = g.matmul(A, B, name="mm1")
@@ -195,7 +195,7 @@ class TestNativeGraph:
         assert C.is_virtual
 
     def test_matmul_inputs_outputs(self):
-        g = NativeGraph()
+        g = pygraph()
         A = g.tensor(dim=[8, 64, 128], name="A")
         B = g.tensor(dim=[8, 128, 256], name="B")
         C = g.matmul(A, B, name="mm1")
@@ -207,21 +207,21 @@ class TestNativeGraph:
         assert node.params["padding"] == 0.0
 
     def test_find_tensor_by_name(self):
-        g = NativeGraph()
+        g = pygraph()
         t = g.tensor(dim=[8, 64], name="test")
         assert g.find_tensor("test") is t
 
     def test_find_tensor_by_uid(self):
-        g = NativeGraph()
+        g = pygraph()
         t = g.tensor(dim=[8, 64], name="test")
         assert g.find_tensor(t.uid) is t
 
     def test_find_tensor_not_found(self):
-        g = NativeGraph()
+        g = pygraph()
         assert g.find_tensor("nonexistent") is None
 
     def test_inspect(self):
-        g = NativeGraph(io_data_type="HALF")
+        g = pygraph(io_data_type="HALF")
         A = g.tensor(dim=[8, 64], name="A")
         B = g.tensor(dim=[64, 32], name="B")
         C = g.matmul(A, B, name="mm1")
@@ -234,7 +234,7 @@ class TestNativeGraph:
         assert "A" in info["tensors"]
 
     def test_auto_naming(self):
-        g = NativeGraph()
+        g = pygraph()
         A = g.tensor(dim=[8, 64], name="A")
         B = g.tensor(dim=[64, 32], name="B")
 
@@ -245,14 +245,14 @@ class TestNativeGraph:
         assert g.nodes[1].name == "matmul.1"
 
     def test_validation(self):
-        g = NativeGraph()
+        g = pygraph()
         A = g.tensor(dim=[8, 64], stride=[64, 1], name="A")
         B = g.tensor(dim=[64, 32], stride=[32, 1], name="B")
         g.matmul(A, B)
         g.validate()
 
     def test_pointwise_add(self):
-        g = NativeGraph()
+        g = pygraph()
         A = g.tensor(dim=[8, 64], name="A")
         B = g.tensor(dim=[8, 64], name="B")
         C = g.add(A, B)
@@ -262,7 +262,7 @@ class TestNativeGraph:
         assert "mode" in g.nodes[0].params
 
     def test_relu(self):
-        g = NativeGraph()
+        g = pygraph()
         X = g.tensor(dim=[8, 64], name="X")
         Y = g.relu(X)
         assert g.nodes[0].node_type == NodeType.POINTWISE
@@ -270,9 +270,9 @@ class TestNativeGraph:
     def test_all_pointwise_builders(self):
         """Every op in _POINTWISE_TENSOR_ARGS has a builder: positional AND the
         classic pybind keyword call styles both produce a first-class node."""
-        for op, argnames in NativeGraph._POINTWISE_TENSOR_ARGS.items():
+        for op, argnames in pygraph._POINTWISE_TENSOR_ARGS.items():
             for style in ("positional", "keyword"):
-                g = NativeGraph()
+                g = pygraph()
                 tensors = [g.tensor(dim=[4, 8], name=f"t{i}") for i in range(len(argnames))]
                 builder = getattr(g, op)
                 out = builder(*tensors) if style == "positional" else builder(**dict(zip(argnames, tensors)))
@@ -292,7 +292,7 @@ class TestNativeGraph:
 
         for op, spec in _STRUCTURED_OPS.items():
             for style in ("keyword", "positional"):
-                g = NativeGraph()
+                g = pygraph()
                 tensors = {port: g.tensor(dim=[4, 8], name=f"{port}_in") for port in spec["inputs"]}
                 attrs = {ak: "ATTR_SENTINEL" for ak in spec.get("attrs", ())}
                 lists = {lp: [g.tensor(dim=[4, 8], name=f"{lp}{i}_in") for i in range(2)] for lp in spec.get("list_inputs", ())}
@@ -312,14 +312,14 @@ class TestNativeGraph:
 
     def test_structured_out_dims(self):
         """out_dims sets output dims for shapes cuDNN cannot infer (reduction)."""
-        g = NativeGraph()
+        g = pygraph()
         A = g.tensor(dim=[1, 4, 8], name="A")
         R = g.reduction(A, mode="ADD_SENTINEL", out_dims=[1, 4, 1])
         assert R.dim == [1, 4, 1] and R.stride == [4, 1, 1]
 
     def test_batchnorm_peer_stats_ports(self):
         """List inputs (peer_stats) become indexed ports + a count param."""
-        g = NativeGraph()
+        g = pygraph()
         kwargs = {p: g.tensor(dim=[4, 8], name=p) for p in ("input", "scale", "bias", "epsilon", "momentum", "in_running_mean", "in_running_var")}
         ps = [g.tensor(dim=[4, 8], name=f"ps{i}") for i in range(2)]
         g.batchnorm(peer_stats=ps, **kwargs)
@@ -329,7 +329,7 @@ class TestNativeGraph:
 
     def test_pointwise_scalar_attrs(self):
         """Ops with scalar attributes store them in params (introspectable)."""
-        g = NativeGraph()
+        g = pygraph()
         X = g.tensor(dim=[4, 8], name="X")
         g.relu(X, lower_clip=0.1, upper_clip=6.0)
         g.leaky_relu(X, negative_slope=0.01)
@@ -342,7 +342,7 @@ class TestNativeGraph:
         assert gi.params == {"mode": "gen_index", "axis": 1}
 
     def test_chaining(self):
-        g = NativeGraph()
+        g = pygraph()
         A = g.tensor(dim=[8, 64, 128], name="A")
         B = g.tensor(dim=[8, 128, 256], name="B")
         bias = g.tensor(dim=[1, 1, 256], name="bias")
@@ -355,7 +355,7 @@ class TestNativeGraph:
         assert [n.node_type for n in g.nodes] == [NodeType.MATMUL, NodeType.POINTWISE, NodeType.POINTWISE]
 
     def test_get_node(self):
-        g = NativeGraph()
+        g = pygraph()
         A = g.tensor(dim=[8, 64], name="A")
         B = g.tensor(dim=[64, 32], name="B")
         g.matmul(A, B, name="mm1")
@@ -366,7 +366,7 @@ class TestNativeGraph:
 
     def test_sdpa_inference(self):
         """Test SDPA forward inference mode."""
-        g = NativeGraph()
+        g = pygraph()
         # [B, H, S, D] layout
         Q = g.tensor(dim=[2, 8, 128, 64], name="Q")
         K = g.tensor(dim=[2, 8, 128, 64], name="K")
@@ -384,7 +384,7 @@ class TestNativeGraph:
 
     def test_sdpa_training(self):
         """Test SDPA forward training mode (returns stats)."""
-        g = NativeGraph()
+        g = pygraph()
         Q = g.tensor(dim=[2, 8, 128, 64], name="Q")
         K = g.tensor(dim=[2, 8, 128, 64], name="K")
         V = g.tensor(dim=[2, 8, 128, 64], name="V")
@@ -427,7 +427,7 @@ class TestCuTileEngine:
         c_data = torch.empty(2, 3, 5, device="cuda", dtype=torch.float32)
 
         # Pass torch tensors directly — no g.tensor() or set_output() needed
-        g = NativeGraph(use_native=True)
+        g = pygraph(use_native=True)
         C = g.matmul(a_data, b_data)
 
         # execute() lazy-builds; C is auto-marked as output (leaf tensor)
@@ -457,7 +457,7 @@ class TestIntegration:
 
         import cudnn
 
-        g = NativeGraph(
+        g = pygraph(
             io_data_type=cudnn.data_type.HALF,
             compute_data_type=cudnn.data_type.FLOAT,
         )
@@ -477,7 +477,7 @@ class TestIntegration:
 
         import cudnn
 
-        g = NativeGraph(
+        g = pygraph(
             io_data_type=cudnn.data_type.HALF,
             compute_data_type=cudnn.data_type.FLOAT,
         )
@@ -505,7 +505,7 @@ class TestReviewSemantics:
 
     def test_sdpa_output_direction(self):
         """dBias & co. are outputs of the node, not inputs (review item 3)."""
-        g = NativeGraph()
+        g = pygraph()
         t = lambda n: g.tensor(dim=[2, 4, 8, 16], name=n)  # noqa: E731
         dbias = g.tensor(dim=[1, 4, 8, 8], name="dbias_buf")
         g.sdpa_backward(t("q"), t("k"), t("v"), t("o"), t("dO"), t("stats"), dBias=dbias)
@@ -514,7 +514,7 @@ class TestReviewSemantics:
         assert "dBias" not in node.inputs
 
     def test_tensor_rename_reindexes(self):
-        g = NativeGraph()
+        g = pygraph()
         a = g.tensor(dim=[2, 2], name="old")
         a.set_name("new")
         assert g.find_tensor("new") is a and g.find_tensor("old") is None
@@ -525,7 +525,7 @@ class TestReviewSemantics:
     def test_set_uid_steals_auto_uid_and_rejects_user_dup(self):
         """Classic parity: user set_uid wins over an auto-assigned holder (which
         is silently renumbered); two USER uids colliding is an error."""
-        g = NativeGraph()
+        g = pygraph()
         a = torch.randn(2, 2)
         A = g.tensor_like(a, name="A")  # auto uid 1
         g._data_bindings[A.uid] = a  # simulate auto-binding
@@ -541,7 +541,7 @@ class TestReviewSemantics:
     def test_tensor_dict_key_stable_across_mutation(self):
         """Identity-based hashing: a Tensor used as a dict key survives
         uid/name mutation (review item 4)."""
-        g = NativeGraph()
+        g = pygraph()
         A = g.tensor(dim=[2, 2], name="A")
         d = {A: "x"}
         A.set_name("renamed")
@@ -557,7 +557,7 @@ class TestReviewSemantics:
             def execute(self, graph, tensor_data, ctx=None):
                 pass
 
-        g = NativeGraph()
+        g = pygraph()
         g.register_backend(Dummy())  # keeps planning python-side (no C++ needed)
         A = g.tensor(dim=[1, 2, 2], name="A")
         g.matmul(A, g.tensor(dim=[1, 2, 2], name="B"))
@@ -567,7 +567,7 @@ class TestReviewSemantics:
 
     def test_mxfp8_dsink_is_output(self):
         """Follow-up item 4: mxfp8_backward dSink_token is an output port."""
-        g = NativeGraph()
+        g = pygraph()
         t = lambda n: g.tensor(dim=[2, 4, 8, 16], name=n)  # noqa: E731
         kw = {p: t(p) for p in ("q", "q_T", "k", "k_T", "v", "o_f16", "dO_f16", "dO", "dO_T", "stats")}
         ds = g.tensor(dim=[1, 4, 1, 1], name="dsink_buf")
@@ -584,7 +584,7 @@ class TestReviewSemantics:
             def execute(self, graph, tensor_data, ctx=None):
                 pass
 
-        g = NativeGraph(backends=[Dummy()])
+        g = pygraph(backends=[Dummy()])
         A = g.tensor(dim=[1, 2, 2], name="A")
         g.matmul(A, g.tensor(dim=[1, 2, 2], name="B"))
         g.create_execution_plans()
@@ -593,13 +593,13 @@ class TestReviewSemantics:
                 mutate()
 
     def test_tensor_scalar_is_graph_owned(self):
-        g = NativeGraph()
+        g = pygraph()
         s = g.tensor_scalar(1.5, scalar_type="FLOAT_SENTINEL")
         s.set_name("renamed_scalar")
         assert g.find_tensor("renamed_scalar") is s
 
     def test_duplicate_initial_name_rejected(self):
-        g = NativeGraph()
+        g = pygraph()
         g.tensor(dim=[2, 2], name="X")
         with pytest.raises(ValueError, match="already used"):
             g.tensor(dim=[2, 2], name="X")
