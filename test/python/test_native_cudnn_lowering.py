@@ -62,3 +62,24 @@ def test_native_matmul_bias_relu_lowers_to_cudnn():
     torch.cuda.synchronize()
 
     torch.testing.assert_close(c.float(), torch.relu(a.float() @ b.float() + bias.float()), atol=2e-2, rtol=2e-2)
+
+
+def test_native_matmul_reduction_lowers_to_cudnn():
+    """matmul -> reduction(ADD) over N; cuDNN needs explicit reduced output dims."""
+    h = _handle()
+    a = torch.randn(1, M, K, device="cuda", dtype=torch.float16)
+    b = torch.randn(1, K, N, device="cuda", dtype=torch.float16)
+    r = torch.empty(1, M, 1, device="cuda", dtype=torch.float32)
+
+    g = NativeGraph(handle=h, io_data_type=cudnn.data_type.HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    A = g.tensor(dim=[1, M, K], stride=[M * K, K, 1], data_type=cudnn.data_type.HALF)
+    B = g.tensor(dim=[1, K, N], stride=[K * N, N, 1], data_type=cudnn.data_type.HALF)
+    R = g.reduction(g.matmul(A, B), cudnn.reduction_mode.ADD, dim=[1, M, 1])
+    R.set_output(True).set_data_type(cudnn.data_type.FLOAT)
+
+    g.build([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
+    g.execute({A: a, B: b, R: r}, ws, handle=h)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(r, (a.float() @ b.float()).sum(dim=2, keepdim=True), atol=5e-2, rtol=5e-2)

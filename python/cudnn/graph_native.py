@@ -404,8 +404,14 @@ class NativeGraph:
         self._nodes.append(node)
         return out
 
-    def reduction(self, input: Any, mode: Any, group_offset: Optional[Any] = None, name: str = "", compute_data_type: Any = None) -> Tensor:
-        """Reduction (add/amax/max/min), optionally grouped by an offset tensor."""
+    def reduction(
+        self, input: Any, mode: Any, dim: Optional[List[int]] = None, group_offset: Optional[Any] = None, name: str = "", compute_data_type: Any = None
+    ) -> Tensor:
+        """Reduction (add/amax/max/min), optionally grouped by an offset tensor.
+
+        ``dim`` is the reduced output shape (each axis either the input extent or
+        1). cuDNN requires the reduction output dims to be set explicitly, so
+        pass ``dim`` here (row-major stride is inferred)."""
         name = self._get_name("reduction", name)
         input = self._ensure_tensor(input, name=f"{name}::input")
         node = Node(name, NodeType.REDUCTION, compute_data_type or self._context.compute_data_type)
@@ -414,6 +420,9 @@ class NativeGraph:
             node.inputs["group_offset"] = self._ensure_tensor(group_offset, name=f"{name}::group_offset")
         node.params["mode"] = mode
         out = self._make_output(f"{name}::OUT_0")
+        if dim is not None:
+            out.dim = list(dim)
+            out.stride = _row_major_stride(list(dim))
         node.outputs["OUT_0"] = out
         self._register_tensor(out)
         self._nodes.append(node)
@@ -950,7 +959,7 @@ class NativeGraph:
         def lower_tensor(t: Tensor) -> Any:
             if t.uid in tensor_map:
                 return tensor_map[t.uid]
-            cpp = graph._make_tensor(
+            mk_kwargs = dict(
                 dim=t.dim,
                 stride=t.stride,
                 data_type=t.data_type,
@@ -962,6 +971,9 @@ class NativeGraph:
                 # buffers never bind. IR uids are unique and positive.
                 uid=t.uid,
             )
+            if t.reordering_type is not None:  # e.g. F8_128x4 for block-scale SFs
+                mk_kwargs["reordering_type"] = t.reordering_type
+            cpp = graph._make_tensor(**mk_kwargs)
             tensor_map[t.uid] = cpp
             return cpp
 
@@ -1126,6 +1138,12 @@ class NativeGraph:
                 if "group_offset" in node.inputs:
                     red_kwargs["group_offset"] = tensor_map[node.inputs["group_offset"].uid]
                 cpp_out = graph.reduction(**red_kwargs)
+                # cuDNN needs the reduction output dims set explicitly.
+                _red_out = node.outputs["OUT_0"]
+                if _red_out.dim:
+                    cpp_out.set_dim(_red_out.dim)
+                if _red_out.stride:
+                    cpp_out.set_stride(_red_out.stride)
             elif node.node_type == NodeType.BLOCK_SCALE_DEQUANTIZE:
                 cpp_out = graph.block_scale_dequantize(
                     input=tensor_map[node.inputs["input"].uid],
