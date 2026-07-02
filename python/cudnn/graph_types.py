@@ -53,7 +53,7 @@ class NodeType(Enum):
     BLOCK_SCALE_DEQUANTIZE = auto()
 
 
-@dataclass
+@dataclass(eq=False)  # identity-based hash/eq: uid/name are mutable
 class Tensor:
     """Pure Python representation of tensor attributes.
 
@@ -86,6 +86,9 @@ class Tensor:
     ragged_offset: Optional["Tensor"] = None
     ragged_offset_multiplier: int = 1
     scalar_type: Any = None  # cudnn.scalar_type for tensor_scalar-created scalars
+    # weakref to the owning graph (set at registration): identity mutations
+    # (set_name / set_uid) delegate to the graph so its indexes stay coherent.
+    owner: Any = field(default=None, repr=False)
 
     def set_output(self, value: bool) -> "Tensor":
         """Mark this tensor as an output (non-virtual) or intermediate (virtual)."""
@@ -98,8 +101,12 @@ class Tensor:
         return self
 
     def set_name(self, name: str) -> "Tensor":
-        """Set the tensor name."""
-        self.name = name
+        """Set the tensor name (graph-owned tensors re-index atomically)."""
+        g = self.owner() if self.owner is not None else None
+        if g is not None:
+            g._rename_tensor(self, name)
+        else:
+            self.name = name
         return self
 
     def set_dim(self, dim: List[int]) -> "Tensor":
@@ -113,9 +120,14 @@ class Tensor:
         return self
 
     def set_uid(self, uid: int) -> "Tensor":
-        """Set the tensor UID."""
-        self.uid = uid
-        self.uid_assigned = True
+        """Set the tensor UID (graph-owned tensors re-index atomically; a
+        colliding auto-assigned uid is renumbered, user-user conflicts raise)."""
+        g = self.owner() if self.owner is not None else None
+        if g is not None:
+            g._reuid_tensor(self, uid)
+        else:
+            self.uid = uid
+            self.uid_assigned = True
         return self
 
     def set_ragged_offset(self, ragged_offset: "Tensor") -> "Tensor":
@@ -181,12 +193,5 @@ class Tensor:
         if self.is_virtual and self.is_pass_by_value:
             raise ValueError(f"Tensor '{self.name}' can't be both virtual and pass_by_value.")
 
-    def __hash__(self) -> int:
-        """Hash based on UID for use as dict key."""
-        return hash(self.uid)
-
-    def __eq__(self, other: object) -> bool:
-        """Equality based on UID."""
-        if isinstance(other, Tensor):
-            return self.uid == other.uid
-        return False
+    # NOTE: hash/eq are object identity (dataclass eq=False). uid and name are
+    # mutable, so value-based hashing would violate the dict-key invariant.

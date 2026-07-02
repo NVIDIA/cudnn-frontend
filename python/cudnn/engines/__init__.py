@@ -2,7 +2,7 @@
 
 Pluggable execution backends in one flat engine-id space with the cuDNN backend.
 The Router builds a ranked plan list at ``create_execution_plans()`` time; graph
-construction stays backend-agnostic. See ``docs/python_native_graph_router.md``.
+construction stays backend-agnostic.
 
 Backends:
 - ReferenceMatmulEngine: pure-PyTorch correctness oracle (CPU/GPU, no JIT deps)

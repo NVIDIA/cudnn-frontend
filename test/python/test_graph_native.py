@@ -2,6 +2,8 @@
 
 import pytest
 
+torch = pytest.importorskip("torch")
+
 from cudnn.graph_types import NodeType, Tensor
 from cudnn.nodes import Node, _row_major_stride
 from cudnn.pygraph import NativeGraph, GraphContext
@@ -496,3 +498,69 @@ class TestIntegration:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestReviewSemantics:
+    """Review items 3 + 4: SDPA port direction; graph-owned identity mutation."""
+
+    def test_sdpa_output_direction(self):
+        """dBias & co. are outputs of the node, not inputs (review item 3)."""
+        g = NativeGraph()
+        t = lambda n: g.tensor(dim=[2, 4, 8, 16], name=n)  # noqa: E731
+        dbias = g.tensor(dim=[1, 4, 8, 8], name="dbias_buf")
+        g.sdpa_backward(t("q"), t("k"), t("v"), t("o"), t("dO"), t("stats"), dBias=dbias)
+        (node,) = g.nodes
+        assert "dBias" in node.outputs and node.outputs["dBias"] is dbias
+        assert "dBias" not in node.inputs
+
+    def test_tensor_rename_reindexes(self):
+        g = NativeGraph()
+        a = g.tensor(dim=[2, 2], name="old")
+        a.set_name("new")
+        assert g.find_tensor("new") is a and g.find_tensor("old") is None
+        g.tensor(dim=[2, 2], name="other")
+        with pytest.raises(ValueError, match="already used"):
+            a.set_name("other")
+
+    def test_set_uid_steals_auto_uid_and_rejects_user_dup(self):
+        """Classic parity: user set_uid wins over an auto-assigned holder (which
+        is silently renumbered); two USER uids colliding is an error."""
+        g = NativeGraph()
+        a = torch.randn(2, 2)
+        A = g.tensor_like(a, name="A")  # auto uid 1
+        g._data_bindings[A.uid] = a  # simulate auto-binding
+        B = g.tensor(dim=[2, 2], name="B")  # auto uid 2
+        B.set_uid(A.uid)  # user claims A's auto uid
+        assert B.uid_assigned and g.find_tensor(B.uid) is B
+        assert A.uid != B.uid and g.find_tensor(A.uid) is A  # A renumbered
+        assert g._data_bindings.get(A.uid) is a  # binding followed A
+        C = g.tensor(dim=[2, 2], name="C")
+        with pytest.raises(ValueError, match="user-assigned"):
+            C.set_uid(B.uid)
+
+    def test_tensor_dict_key_stable_across_mutation(self):
+        """Identity-based hashing: a Tensor used as a dict key survives
+        uid/name mutation (review item 4)."""
+        g = NativeGraph()
+        A = g.tensor(dim=[2, 2], name="A")
+        d = {A: "x"}
+        A.set_name("renamed")
+        A.set_uid(1000)
+        assert d[A] == "x"
+
+    def test_identity_mutation_frozen_after_planning(self):
+        from cudnn.engines import BaseEngine, PYTHON_ENGINE_ID_BASE
+
+        class Dummy(BaseEngine):
+            engine_id = PYTHON_ENGINE_ID_BASE + 90
+
+            def execute(self, graph, tensor_data, ctx=None):
+                pass
+
+        g = NativeGraph()
+        g.register_backend(Dummy())  # keeps planning python-side (no C++ needed)
+        A = g.tensor(dim=[1, 2, 2], name="A")
+        g.matmul(A, g.tensor(dim=[1, 2, 2], name="B"))
+        g.create_execution_plans()
+        with pytest.raises(RuntimeError, match="frozen"):
+            A.set_uid(500)

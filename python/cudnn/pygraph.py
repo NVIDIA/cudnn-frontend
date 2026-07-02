@@ -3,7 +3,7 @@
 All graph structure and attributes are kept in Python. Graph construction is
 backend-agnostic; a backend is chosen at create_execution_plans() time by the
 Router, and the backend-specific representation (e.g. the C++ cuDNN graph) is
-generated lazily only then. See ``docs/python_native_graph_router.md``.
+generated lazily only then.
 
 Execution flow (unification proposal):
     build ops -> create_execution_plans() -> Router -> selected backend
@@ -17,6 +17,7 @@ Example with a native backend (pass torch tensors directly):
 """
 
 from dataclasses import dataclass
+import weakref
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 from .graph_types import NodeType, Tensor
@@ -198,8 +199,7 @@ class pygraph:
             uid_assigned=uid is not None,
             **kwargs,
         )
-        self._tensors[name] = t
-        self._tensor_by_uid[t.uid] = t
+        self._register_tensor(t)
         return t
 
     def tensor_like(self, template: Any, name: str = "", is_virtual: bool = False) -> Tensor:
@@ -247,6 +247,50 @@ class pygraph:
         self._tensor_by_uid[t.uid] = t
         return t
 
+    def _check_mutable(self, what: str) -> None:
+        if self._lowered_graph is not None or self._plans:
+            raise RuntimeError(f"cannot {what} after lowering/planning — the graph is frozen (re-plan explicitly)")
+
+    def _rename_tensor(self, t: Tensor, name: str) -> None:
+        """Atomic rename keeping the name index coherent (duplicates rejected)."""
+        if name == t.name:
+            return
+        self._check_mutable("rename a tensor")
+        if name in self._tensors:
+            raise ValueError(f"tensor name {name!r} is already used")
+        self._tensors.pop(t.name, None)
+        t.name = name
+        self._tensors[name] = t
+
+    def _reuid_tensor(self, t: Tensor, uid: int) -> None:
+        """Atomic re-uid keeping indexes/bindings coherent.
+
+        Classic parity: classic tensors have NO uid until set_uid, while the IR
+        assigns eagerly — so a user set_uid may land on an auto-assigned uid.
+        The user wins: the auto holder is silently renumbered (auto uids are
+        internal until lowering). Two USER-assigned uids colliding is an error.
+        """
+        if uid == t.uid:
+            t.uid_assigned = True
+            return
+        self._check_mutable("re-uid a tensor")
+        holder = self._tensor_by_uid.get(uid)
+        if holder is not None:
+            if holder.uid_assigned:
+                raise ValueError(f"uid {uid} is already user-assigned to tensor {holder.name!r}")
+            fresh = self._alloc_uid()  # renumber the auto holder
+            self._tensor_by_uid[fresh] = holder
+            if holder.uid in self._data_bindings:
+                self._data_bindings[fresh] = self._data_bindings.pop(holder.uid)
+            holder.uid = fresh
+        self._tensor_by_uid.pop(t.uid, None)
+        if t.uid in self._data_bindings:
+            self._data_bindings[uid] = self._data_bindings.pop(t.uid)
+        t.uid = uid
+        t.uid_assigned = True
+        self._reserved_uids.add(uid)
+        self._tensor_by_uid[uid] = t
+
     def _alloc_uid(self) -> int:
         # Skip uids the user reserved via tensor(uid=...) — the Python IR owns
         # the whole uid namespace (see the uid-ownership note in _lower_to_cpp).
@@ -257,6 +301,7 @@ class pygraph:
         return uid
 
     def _get_name(self, op: str, name: str) -> str:
+        self._check_mutable(f"add a {op} op")
         if name:
             return name
         count = self._node_count.get(op, 0)
@@ -274,6 +319,7 @@ class pygraph:
         )
 
     def _register_tensor(self, t: Tensor) -> None:
+        t.owner = weakref.ref(self)
         self._tensors[t.name] = t
         self._tensor_by_uid[t.uid] = t
 
@@ -720,15 +766,16 @@ class pygraph:
         self.check_support()
         self.build_plans()
 
-    def get_workspace_size(self) -> int:
-        """Get workspace size in bytes for the selected plan."""
+    def get_workspace_size(self, *args, **kwargs) -> int:
+        """Workspace bytes for the selected plan. Classic overloads (handle /
+        dynamic-shape overrides) pass through on the cuDNN path."""
         if not self._is_built:
             raise RuntimeError("Call build() first")
 
         if self.selected_engine is not None:
             return self._compiled_plans[self._plan_index].get_workspace_size()
 
-        return self._lowered_graph.get_workspace_size()
+        return self._lowered_graph.get_workspace_size(*args, **kwargs)
 
     def execute(
         self,
@@ -851,8 +898,14 @@ class pygraph:
         Returns:
             bytes: Serialized graph data.
         """
-        if not self._is_built:
-            raise RuntimeError("Call build() first")
+        if self._lowered_graph is None:
+            # Serialization is the cuDNN graph format by definition — lower on
+            # demand (independent of which plan is selected for execution).
+            self.validate()
+            if self._lowered_graph is None:  # python engines registered
+                self._lowered_graph = self._lower_to_cpp()
+                self._lowered_graph.validate()
+                self._verify_uid_ownership()
         return bytes(self._lowered_graph.serialize())
 
     def deserialize(self, *args, **kwargs) -> None:
@@ -986,6 +1039,9 @@ class pygraph:
                 for port, t in node.inputs.items():
                     if not port.startswith("dropout_"):
                         kw[port] = tensor_map[t.uid]
+                for port in spec.get("out_kwargs", ()):
+                    if port in node.outputs:  # classic passes these descriptors as args
+                        kw[port] = lower_tensor(node.outputs[port])
                 n_drop = node.params.get("_dropout_n")
                 if n_drop:
                     kw["dropout"] = tuple(
@@ -1184,6 +1240,14 @@ def _conv_dgrad_dims(node):
     return out
 
 
+def _slice_dims(node):  # output extent of each python slice over the input dims
+    d = node.inputs["input"].dim
+    sls = node.params.get("slices")
+    if not d or not sls:
+        return None
+    return [len(range(*sl.indices(int(n)))) for sl, n in zip(sls, d)]
+
+
 def _moe_bwd_dweight_dims(node):
     do, tok, fto = (node.inputs[p].dim for p in ("doutput", "token", "first_token_offset"))
     return [fto[0], tok[-1], do[-1]]  # [E, H, N]
@@ -1329,8 +1393,8 @@ _STRUCTURED_OPS = {
     ),
     "moe_grouped_matmul": dict(
         node_type=NodeType.MOE_GROUPED_MATMUL,
-        inputs=("token", "weight", "first_token_offset"),
-        attrs=("mode",),
+        inputs=("token", "weight", "first_token_offset", "token_index", "token_ks"),
+        attrs=("mode", "top_k"),
         outputs=("OUT_0",),
         infer={"OUT_0": lambda n: [1, n.inputs["token"].dim[-2], n.inputs["weight"].dim[-1]]},
     ),
@@ -1378,6 +1442,8 @@ _STRUCTURED_OPS = {
         inputs=("input",),
         attrs=("slices",),
         outputs=("OUT_0",),
+        infer={"OUT_0": _slice_dims},
+        dtype_like={"OUT_0": "input"},  # classic: slice output dtype == input's
     ),
     "transpose": dict(
         node_type=NodeType.TRANSPOSE,
@@ -1431,8 +1497,15 @@ def _install_structured_builders() -> None:
         def builder(self, *args, name: str = "", compute_data_type: Any = None, out_dims: Any = None, **kwargs):
             name_ = self._get_name(op, name)
             node = Node(name_, spec["node_type"], compute_data_type or self._context.compute_data_type)
-            if len(args) > len(input_ports):
-                raise TypeError(f"{op}() takes at most {len(input_ports)} positional tensors {input_ports}")
+            # classic positional order: tensor ports first, then attrs
+            n_p = len(input_ports)
+            if len(args) > n_p + len(attr_kws):
+                raise TypeError(f"{op}() takes at most {n_p + len(attr_kws)} positional arguments ({input_ports} + {attr_kws})")
+            for ak, v in zip(attr_kws, args[n_p:]):
+                if ak in kwargs:
+                    raise TypeError(f"{op}() got multiple values for {ak!r}")
+                kwargs[ak] = v
+            args = args[:n_p]
             for port, v in zip(input_ports, args):
                 node.inputs[port] = self._ensure_tensor(v, name=f"{name_}::{port}")
             for port in input_ports[len(args) :]:
@@ -1453,6 +1526,7 @@ def _install_structured_builders() -> None:
                 raise TypeError(f"{op}() got unexpected arguments {sorted(kwargs)}; tensor ports are {input_ports}, attrs are {attr_kws}")
             if out_dims is not None and not isinstance(out_dims, dict):
                 out_dims = {spec["outputs"][0]: out_dims}
+            dtype_like = spec.get("dtype_like", {})
             outs = []
             for oport in spec["outputs"]:
                 cond = maybe.get(oport)
@@ -1460,6 +1534,9 @@ def _install_structured_builders() -> None:
                     outs.append(None)  # classic returns None for absent outputs
                     continue
                 o = self._make_output(f"{name_}::{oport}")
+                src = dtype_like.get(oport)
+                if src and src in node.inputs:
+                    o.data_type = node.inputs[src].data_type
                 d = (out_dims or {}).get(oport)
                 if d is None:
                     try:  # best-effort IR-side inference; C++ validates at build
@@ -1520,6 +1597,10 @@ _CAPTURED_OPS = {
         node_type=NodeType.SDPA,
         pos=("q", "k", "v"),
         outputs=("O", "Stats"),
+        # kwargs whose tensors are semantically OUTPUTS of the node (the classic
+        # API passes their descriptors as arguments): recorded in node.outputs so
+        # engines see correct producer/consumer direction.
+        out_kwargs=("rng_dump", "score_max", "score_sum_exp"),
         maybe={"Stats": _stats_expected},
         infer={"O": _sdpa_o_dims, "Stats": _sdpa_stats_dims},
     ),
@@ -1527,19 +1608,41 @@ _CAPTURED_OPS = {
         node_type=NodeType.SDPA_BWD,
         pos=("q", "k", "v", "o", "dO", "stats"),
         outputs=("dQ", "dK", "dV"),
+        out_kwargs=("dBias", "dSink_token", "rng_dump"),
         infer={"dQ": _like("q"), "dK": _like("k"), "dV": _like("v")},
     ),
     "sdpa_fp8": dict(
         node_type=NodeType.SDPA_FP8,
-        pos=("q", "k", "v"),
+        pos=("q", "k", "v", "descale_q", "descale_k", "descale_v", "descale_s", "scale_s", "scale_o"),
         outputs=("O", "Stats", "Amax_S", "Amax_O"),
+        out_kwargs=("rng_dump", "score_max", "score_sum_exp"),
         maybe={"Stats": _stats_expected},
         infer={"O": _sdpa_o_dims, "Stats": _sdpa_stats_dims, "Amax_S": _AMAX, "Amax_O": _AMAX},
     ),
     "sdpa_fp8_backward": dict(
         node_type=NodeType.SDPA_FP8_BWD,
-        pos=("q", "k", "v", "o", "dO", "stats"),
+        pos=(
+            "q",
+            "k",
+            "v",
+            "o",
+            "dO",
+            "stats",
+            "descale_q",
+            "descale_k",
+            "descale_v",
+            "descale_o",
+            "descale_dO",
+            "descale_s",
+            "descale_dP",
+            "scale_s",
+            "scale_dQ",
+            "scale_dK",
+            "scale_dV",
+            "scale_dP",
+        ),
         outputs=("dQ", "dK", "dV", "amax_dQ", "amax_dK", "amax_dV", "amax_dP"),
+        out_kwargs=("dSink_token", "rng_dump"),
         infer={"dQ": _like("q"), "dK": _like("k"), "dV": _like("v"), "amax_dQ": _AMAX, "amax_dK": _AMAX, "amax_dV": _AMAX, "amax_dP": _AMAX},
     ),
     # mxfp8 variants: outputs are positional (see sdpa.cpp result_array); dims
@@ -1576,11 +1679,15 @@ def _install_captured_builders() -> None:
                     raise TypeError(f"{op}() got multiple values for {k!r}")
                 kwargs[k] = v
             drop = kwargs.pop("dropout", None)
+            out_kwargs = spec.get("out_kwargs", ())
             for k, v in kwargs.items():
                 if v is None:
                     continue
                 if _tensorish(v):
-                    node.inputs[k] = self._ensure_tensor(v, name=f"{name_}::{k}")
+                    if k in out_kwargs:  # semantically an OUTPUT of this node
+                        node.outputs[k] = self._ensure_tensor(v, name=f"{name_}::{k}")
+                    else:
+                        node.inputs[k] = self._ensure_tensor(v, name=f"{name_}::{k}")
                 else:  # scalar / enum / callback — forwarded verbatim at lowering
                     node.params[k] = v
             if drop is not None:
