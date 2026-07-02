@@ -30,13 +30,21 @@ def _identity_jit(fn=None, **kwargs):
     return decorate if fn is None else decorate(fn)
 
 
-_MODULE_PATH = Path(__file__).resolve().parents[3] / "python" / "cudnn" / "_jax" / "cutedsl.py"
-_SPEC = importlib.util.spec_from_file_location("cudnn_jax_cutedsl_poc", _MODULE_PATH)
+_CUDNN_ROOT = Path(__file__).resolve().parents[3] / "python" / "cudnn"
+_TEST_PACKAGE = "cudnn_frontend_jax_api_base_adapter_test"
+_PARENT = types.ModuleType(_TEST_PACKAGE)
+_PARENT.__path__ = [str(_CUDNN_ROOT)]
+_JAX_PACKAGE = types.ModuleType(f"{_TEST_PACKAGE}._jax")
+_JAX_PACKAGE.__path__ = [str(_CUDNN_ROOT / "_jax")]
+
+_MODULE_PATH = _CUDNN_ROOT / "_jax" / "api_base.py"
+_SPEC = importlib.util.spec_from_file_location(f"{_TEST_PACKAGE}._jax.api_base", _MODULE_PATH)
 assert _SPEC is not None and _SPEC.loader is not None
 _MODULE = importlib.util.module_from_spec(_SPEC)
 sys.modules[_SPEC.name] = _MODULE
 
 _bootstrap_jnp = types.ModuleType("jax.numpy")
+_bootstrap_jnp.dtype = lambda value: value
 _bootstrap_jax = types.ModuleType("jax")
 _bootstrap_jax.__path__ = []
 _bootstrap_jax.numpy = _bootstrap_jnp
@@ -57,6 +65,8 @@ with mock.patch.dict(
         "cutlass": _bootstrap_cutlass,
         "cutlass.cute": _bootstrap_cute,
         "cutlass.jax": _bootstrap_cutlass_jax,
+        _TEST_PACKAGE: _PARENT,
+        f"{_TEST_PACKAGE}._jax": _JAX_PACKAGE,
     },
 ):
     _SPEC.loader.exec_module(_MODULE)

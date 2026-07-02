@@ -112,7 +112,8 @@ class JaxApiSurfaceTest(unittest.TestCase):
                 module_name = f"{_TEST_PACKAGE}.{operation_path}.jax"
                 self.assertIn(module_name, sys.modules)
                 operation_modules[operation_path] = sys.modules[module_name]
-            self.assertIn(f"{_TEST_PACKAGE}._jax.cutedsl", sys.modules)
+            self.assertIn(f"{_TEST_PACKAGE}._jax.api_base", sys.modules)
+            self.assertNotIn(f"{_TEST_PACKAGE}._jax.cutedsl", sys.modules)
 
             expected_exports = {"ApiBaseJax", "DSA", "JaxTensorDesc", "NSA"}
             expected_dsa_exports = set()
@@ -215,7 +216,7 @@ class JaxApiSurfaceTest(unittest.TestCase):
 
                 facade = importlib.import_module(f"{package_name}.jax")
                 compatibility_adapter = importlib.import_module(f"{package_name}.jax.cutedsl")
-                internal_adapter = importlib.import_module(f"{package_name}._jax.cutedsl")
+                internal_adapter = importlib.import_module(f"{package_name}._jax.api_base")
                 self.assertIs(compatibility_adapter.BufferSpec, internal_adapter.BufferSpec)
                 self.assertIs(compatibility_adapter.call_cutedsl, internal_adapter.call_cutedsl)
 

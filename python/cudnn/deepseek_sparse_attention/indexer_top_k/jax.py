@@ -11,8 +11,7 @@ from typing import Any, NamedTuple
 import jax.numpy as jnp
 from cutlass.jax import jax_to_cutlass_dtype
 
-from ..._jax.api_base import ApiBaseJax
-from ..._jax.cutedsl import BufferSpec, call_cutedsl
+from ..._jax.api_base import ApiBaseJax, BufferSpec, call_cutedsl
 from ..._jax.validation import require_dtype
 
 _INT32_MAX = (1 << 31) - 1

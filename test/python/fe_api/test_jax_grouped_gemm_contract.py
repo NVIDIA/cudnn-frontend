@@ -170,10 +170,6 @@ class JaxGroupedGemmContractTest(unittest.TestCase):
             cls.calls.append((tuple(outputs), kwargs))
             return result_buffers
 
-        cls.fake_cutedsl = types.ModuleType(f"{_TEST_PACKAGE}._jax.cutedsl")
-        cls.fake_cutedsl.BufferSpec = _BufferSpec
-        cls.fake_cutedsl.call_cutedsl = call_cutedsl
-
         cls.fake_gemm = types.ModuleType(f"{_TEST_PACKAGE}._jax.gemm")
         cls.fake_gemm.require_array = cls._require_array
         cls.fake_gemm.require_16_byte_extent = lambda *_: None
@@ -252,6 +248,12 @@ class JaxGroupedGemmContractTest(unittest.TestCase):
                 f"{_TEST_PACKAGE}._jax.validation",
                 _CUDNN_ROOT / "_jax" / "validation.py",
             )
+            jax_api_base = cls._load_source(
+                f"{_TEST_PACKAGE}._jax.api_base",
+                _CUDNN_ROOT / "_jax" / "api_base.py",
+            )
+            jax_api_base.BufferSpec = _BufferSpec
+            jax_api_base.call_cutedsl = call_cutedsl
             cls._load_source(
                 f"{_TEST_PACKAGE}._jax.grouped_gemm",
                 _CUDNN_ROOT / "_jax" / "grouped_gemm.py",
@@ -303,7 +305,6 @@ class JaxGroupedGemmContractTest(unittest.TestCase):
             "cutlass.cute.nvgpu": cls.fake_cutlass_nvgpu,
             "cutlass.jax": cls.fake_cutlass_jax,
             "torch": None,
-            f"{_TEST_PACKAGE}._jax.cutedsl": cls.fake_cutedsl,
             f"{_TEST_PACKAGE}._jax.gemm": cls.fake_gemm,
             f"{_TEST_PACKAGE}.grouped_gemm.moe_utils": cls.fake_moe_utils,
             **cls.fake_kernel_modules,

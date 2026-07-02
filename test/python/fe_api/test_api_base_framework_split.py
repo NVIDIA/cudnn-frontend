@@ -111,8 +111,31 @@ class ApiBaseFrameworkSplitTest(unittest.TestCase):
         fake_jax.__spec__ = ModuleSpec("jax", loader=None, is_package=True)
         fake_jax.numpy = fake_jnp
 
+        def identity_jit(fn=None, **_kwargs):
+            return (lambda decorated_fn: decorated_fn) if fn is None else fn
+
+        fake_cutlass_jax = types.ModuleType("cutlass.jax")
+        fake_cutlass_jax.TensorSpec = type("TensorSpec", (), {})
+        fake_cute = types.ModuleType("cutlass.cute")
+        fake_cute.jit = identity_jit
+        fake_cutlass = types.ModuleType("cutlass")
+        fake_cutlass.__path__ = []
+        fake_cutlass.Constexpr = object
+        fake_cutlass.cute = fake_cute
+        fake_cutlass.jax = fake_cutlass_jax
+
         try:
-            with mock.patch.dict(sys.modules, {"jax": fake_jax, "jax.numpy": fake_jnp, "torch": None}):
+            with mock.patch.dict(
+                sys.modules,
+                {
+                    "jax": fake_jax,
+                    "jax.numpy": fake_jnp,
+                    "cutlass": fake_cutlass,
+                    "cutlass.cute": fake_cute,
+                    "cutlass.jax": fake_cutlass_jax,
+                    "torch": None,
+                },
+            ):
                 module = importlib.import_module(f"{package_name}._jax.api_base")
 
                 value = types.SimpleNamespace(

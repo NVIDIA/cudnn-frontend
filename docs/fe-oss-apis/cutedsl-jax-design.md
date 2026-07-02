@@ -93,6 +93,8 @@ are:
   `TensorDesc` and `ApiBase`, including canonical logical dtype and packing.
 - [`api_base_torch.py`](../../python/cudnn/api_base_torch.py): observed Torch
   strides/devices plus the existing compile/execute lifecycle.
+- [`_jax/api_base.py`](../../python/cudnn/_jax/api_base.py): JAX descriptors,
+  callable lifecycle, and the `cutlass_call` adapter.
 - [`datatypes.py`](../../python/cudnn/datatypes.py): framework mappings only
   cover Torch today.
 - [`gemm_amax/api.py`](../../python/cudnn/gemm_amax/api.py) and
@@ -204,7 +206,7 @@ The implementations are co-located with the kernels:
 cudnn/
   _operation_api.py                         shared lazy operation exports
   gemm_validation.py                       framework-neutral dense GEMM rules
-  _jax/cutedsl.py                          import-order-neutral adapter implementation
+  _jax/api_base.py                         JAX base, descriptors, and call adapter
   _jax/validation.py                       shared JAX metadata validation
   _jax/gemm.py                             JAX GEMM layout and metadata adapters
   _jax/grouped_gemm.py                     JAX grouped-GEMM metadata adapters
@@ -501,7 +503,7 @@ This lets XLA account for the memory, reuse it according to liveness, preserve
 asynchronous lifetime, and avoid runtime allocation during CUDA-graph capture.
 
 The internal
-[`call_cutedsl`](../../python/cudnn/_jax/cutedsl.py), also available from the
+[`call_cutedsl`](../../python/cudnn/_jax/api_base.py), also available from the
 compatibility module `cudnn.jax.cutedsl`, supports these categories:
 
 | Buffer requirement | JAX representation |
@@ -751,10 +753,12 @@ removes the legacy FFI branch from the supported integration surface.
 
 ### Implemented pieces
 
-- [`cudnn._jax.cutedsl`](../../python/cudnn/_jax/cutedsl.py)
-  - remains an internal integration seam rather than a top-level public export;
-    `cudnn.jax.cutedsl` is a compatibility re-export, while operation-local
-    modules import the neutral path so they can load before the facade;
+- [`cudnn._jax.api_base`](../../python/cudnn/_jax/api_base.py)
+  - contains `ApiBaseJax`, `JaxTensorDesc`, `BufferSpec`, and `call_cutedsl` as
+    the internal JAX integration layer;
+  - remains outside the top-level public export; `cudnn.jax.cutedsl` is a
+    compatibility re-export, while operation-local modules import the internal
+    path so they can load before the facade;
   - translates output/workspace metadata to `cutlass_call`;
   - appends hidden workspaces and drops them from public results;
   - supports uninitialized, zeroed, and constant-filled buffers;

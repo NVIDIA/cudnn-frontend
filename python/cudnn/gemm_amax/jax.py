@@ -11,8 +11,7 @@ from typing import Any, NamedTuple
 
 import jax.numpy as jnp
 
-from .._jax.api_base import ApiBaseJax, JaxTensorDesc
-from .._jax.cutedsl import BufferSpec, call_cutedsl
+from .._jax.api_base import ApiBaseJax, BufferSpec, JaxTensorDesc, call_cutedsl
 from .._jax.gemm import (
     block_scale_tensor_spec,
     gemm_a_tensor_spec,

@@ -3,6 +3,6 @@
 
 """Compatibility exports for the internal CuTe DSL JAX adapter."""
 
-from .._jax.cutedsl import BufferSpec, call_cutedsl
+from .._jax.api_base import BufferSpec, call_cutedsl
 
 __all__ = ["BufferSpec", "call_cutedsl"]
