@@ -1117,8 +1117,8 @@ convert_to_cudnn_type(cudnn_frontend::DataType_t const mode, cudnnDataType_t& cu
             cudnn_mode = CUDNN_DATA_BOOLEAN;
             return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
         case DataType_t::BYTE_BOOLEAN:
-#if (CUDNN_VERSION >= 93000)
-            NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(93000, cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE);
+#if (CUDNN_VERSION >= 92500)
+            NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(92500, cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE);
             cudnn_mode = CUDNN_DATA_BYTE_BOOLEAN;
             return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
 #else
@@ -2348,7 +2348,7 @@ convert_from_cudnn_type(cudnnDataType_t const cudnn_mode) {
             return DataType_t::INT64;
         case CUDNN_DATA_BOOLEAN:
             return DataType_t::BOOLEAN;
-#if (CUDNN_VERSION >= 93000)
+#if (CUDNN_VERSION >= 92500)
         case CUDNN_DATA_BYTE_BOOLEAN:
             return DataType_t::BYTE_BOOLEAN;
 #endif

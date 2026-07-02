@@ -459,7 +459,7 @@ SDPA_attributes::verify_sdpa_support_surface_for_implementation(const detail::Co
                 allowed_input_msg += ", CU_SEQ_LEN_Q, CU_SEQ_LEN_KV";
             }
 
-            if (effective_cudnn_ver >= 93000) {
+            if (effective_cudnn_ver >= 92500) {
                 allowed_input_names.insert({input_names::Descale_Q,
                                             input_names::Descale_K,
                                             input_names::Descale_V,
@@ -484,7 +484,7 @@ SDPA_attributes::verify_sdpa_support_surface_for_implementation(const detail::Co
                 allowed_output_msg += ", RNG_DUMP, Max, Sum_exp";
             }
 
-            if (effective_cudnn_ver >= 93000) {
+            if (effective_cudnn_ver >= 92500) {
                 allowed_output_names.insert({output_names::Amax_S, output_names::Amax_O});
                 allowed_output_msg += ", Amax_S, Amax_O";
             }
@@ -538,10 +538,10 @@ SDPA_attributes::verify_sdpa_support_surface_for_implementation(const detail::Co
 
             if (mma_core_mode == DataType_t::FP8_E4M3 || mma_core_mode == DataType_t::FP8_E5M2) {
                 // Per-tensor FP8 and MXFP8 (block-scaled, E8M0 descales) are supported by the
-                // unified node starting from cuDNN 9.30.0.
-                if (effective_cudnn_ver < 93000) {
+                // unified node starting from cuDNN 9.25.0.
+                if (effective_cudnn_ver < 92500) {
                     return {error_code_t::GRAPH_NOT_SUPPORTED,
-                            "FP8/MXFP8 for the unified SDPA node requires cuDNN 9.30.0 or above"};
+                            "FP8/MXFP8 for the unified SDPA node requires cuDNN 9.25.0 or above"};
                 }
             }
         } break;
