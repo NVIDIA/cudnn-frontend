@@ -564,3 +564,42 @@ class TestReviewSemantics:
         g.create_execution_plans()
         with pytest.raises(RuntimeError, match="frozen"):
             A.set_uid(500)
+
+    def test_mxfp8_dsink_is_output(self):
+        """Follow-up item 4: mxfp8_backward dSink_token is an output port."""
+        g = NativeGraph()
+        t = lambda n: g.tensor(dim=[2, 4, 8, 16], name=n)  # noqa: E731
+        kw = {p: t(p) for p in ("q", "q_T", "k", "k_T", "v", "o_f16", "dO_f16", "dO", "dO_T", "stats")}
+        ds = g.tensor(dim=[1, 4, 1, 1], name="dsink_buf")
+        g.sdpa_mxfp8_backward(dSink_token=ds, **kw)
+        (node,) = g.nodes
+        assert "dSink_token" in node.outputs and "dSink_token" not in node.inputs
+
+    def test_semantic_setters_frozen_after_planning(self):
+        from cudnn.engines import BaseEngine, PYTHON_ENGINE_ID_BASE
+
+        class Dummy(BaseEngine):
+            engine_id = PYTHON_ENGINE_ID_BASE + 91
+
+            def execute(self, graph, tensor_data, ctx=None):
+                pass
+
+        g = NativeGraph(backends=[Dummy()])
+        A = g.tensor(dim=[1, 2, 2], name="A")
+        g.matmul(A, g.tensor(dim=[1, 2, 2], name="B"))
+        g.create_execution_plans()
+        for mutate in (lambda: A.set_dim([4, 4]), lambda: A.set_data_type("HALF"), lambda: A.set_output(True), lambda: A.set_stride([4, 1])):
+            with pytest.raises(RuntimeError, match="frozen"):
+                mutate()
+
+    def test_tensor_scalar_is_graph_owned(self):
+        g = NativeGraph()
+        s = g.tensor_scalar(1.5, scalar_type="FLOAT_SENTINEL")
+        s.set_name("renamed_scalar")
+        assert g.find_tensor("renamed_scalar") is s
+
+    def test_duplicate_initial_name_rejected(self):
+        g = NativeGraph()
+        g.tensor(dim=[2, 2], name="X")
+        with pytest.raises(ValueError, match="already used"):
+            g.tensor(dim=[2, 2], name="X")

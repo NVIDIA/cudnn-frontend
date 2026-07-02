@@ -90,7 +90,7 @@ class pygraph:
         # ranked plan list (python engines + cuDNN) in one shared engine-id
         # space; each plan is dispatched by its id (is_python_engine -> python
         # registry, else lower to cuDNN). ``_plan_index`` selects the plan to run.
-        self._backends: List["BaseEngine"] = list(backends) if backends else []
+        self._backends: List["BaseEngine"] = []
         self._router = router  # None => engines.router.default_router at route time
         self._plans: List[Any] = []  # list[PlanConfig], populated by create_execution_plans()
         self._plan_index: int = 0
@@ -100,6 +100,8 @@ class pygraph:
         self._cpp_bog_done: bool = False  # C++ build_operation_graph ran
         self._cpp_tensors: Dict[int, Any] = {}  # IR uid -> lowered C++ tensor
         self._reserved_uids: set = set()  # user-specified uids _alloc_uid must skip
+        for _e in backends or ():  # constructor path uses the SAME validation
+            self.register_backend(_e)
 
     # =========================================================================
     # Backend registration & routing
@@ -145,23 +147,34 @@ class pygraph:
         """The ranked plan list (list[PlanConfig]) from create_execution_plans()."""
         return list(self._plans)
 
+    def _selected_slot(self) -> Optional[Any]:
+        slots = self._plan_slots()
+        if not slots or not 0 <= self._plan_index < len(slots):
+            return None
+        return slots[self._plan_index]
+
     @property
     def selected_engine(self) -> Optional["BaseEngine"]:
-        """The python engine for the currently selected plan, or None for the
-        cuDNN path. Populated after create_execution_plans()."""
-        if not self._plans or self._plan_index >= self._n_python_plans():
+        """The python engine for the currently selected plan slot, or None for
+        the cuDNN path. Populated after create_execution_plans()."""
+        slot = self._selected_slot()
+        if slot is None or slot[0] != "python":
             return None
-        return self._engine_by_id(self._plans[self._plan_index].engine_id)
+        return self._engine_by_id(slot[1].engine_id)
+
+    @property
+    def _selected_plan_config(self) -> Optional[Any]:
+        slot = self._selected_slot()
+        return slot[1] if slot is not None and slot[0] == "python" else None
 
     @property
     def _cpp_plan_index(self) -> Optional[int]:
-        """Backend sub-index for a selected backend plan (None = python plan or
-        classic default). Sub-index 0 == the backend's top-ranked plan == the
-        classic default execution path."""
-        if not self._plans or self.selected_engine is not None:
+        """Backend sub-index for a selected backend slot (None = python plan or
+        classic default; sub-index 0 == the classic default execution path)."""
+        slot = self._selected_slot()
+        if slot is None or slot[0] != "cudnn":
             return None
-        idx = self._plan_index - self._n_python_plans()
-        return idx if idx > 0 else None
+        return slot[1] if slot[1] > 0 else None
 
     # =========================================================================
     # Tensor Creation
@@ -243,8 +256,7 @@ class pygraph:
             scalar_type=scalar_type,
             uid=self._alloc_uid(),
         )
-        self._tensors[name] = t
-        self._tensor_by_uid[t.uid] = t
+        self._register_tensor(t)
         return t
 
     def _check_mutable(self, what: str) -> None:
@@ -319,6 +331,8 @@ class pygraph:
         )
 
     def _register_tensor(self, t: Tensor) -> None:
+        if t.name in self._tensors:
+            raise ValueError(f"tensor name {t.name!r} is already used")
         t.owner = weakref.ref(self)
         self._tensors[t.name] = t
         self._tensor_by_uid[t.uid] = t
@@ -654,46 +668,80 @@ class pygraph:
         self._plans = router.plan(self, self._backends)
         self._plan_index = 0
         self._cudnn_heuristics = heuristics  # applied when a cuDNN plan is built
+        # Explicit replan invalidates every plan-derived artifact: compiled
+        # python plans, built state, and the backend's plan list (heuristic
+        # modes may have changed). Stale artifacts must never execute.
+        self._compiled_plans.clear()
+        self._is_built = False
+        self._cpp_plans_created = False
         # Classic sequencing: if the graph was already lowered (no python
         # engines -> build_operation_graph lowered eagerly) and the selected
         # plan is the cuDNN one, create the C++ plans now.
         if self.selected_engine is None and self._lowered_graph is not None:
             self._lower_cudnn_plan()
 
-    def _n_python_plans(self) -> int:
+    def _plan_slots(self) -> List[Any]:
+        """Public plan slots, honoring the Router's ORDERING verbatim.
+
+        Each python PlanConfig contributes one slot ("python", PlanConfig); the
+        cuDNN delegating entry expands in place to the backend's plan count once
+        the backend plans exist (("cudnn", sub_index) slots, sub-index 0 == the
+        classic default), else it holds one slot. Dispatch inspects the selected
+        slot's kind — never a prefix count — so any Router mix works
+        (cuDNN-first, interleaved, several python plans per engine).
+        """
         from .engines.engine_ids import is_python_engine
 
-        return sum(1 for p in self._plans if is_python_engine(p.engine_id))
+        cpp_count = None
+        if self._lowered_graph is not None and self._cpp_plans_created:
+            cpp_count = max(self._lowered_graph.get_execution_plan_count(), 1)
+        slots: List[Any] = []
+        for p in self._plans:
+            if is_python_engine(p.engine_id):
+                slots.append(("python", p))
+            else:
+                for k in range(cpp_count if cpp_count is not None else 1):
+                    slots.append(("cudnn", k))
+        return slots
 
     def get_execution_plan_count(self) -> int:
-        """Number of candidate plans, in ONE index space: indices
-        [0, n_python) are python plans; [n_python, ...) are the backend's own
-        plans (count queried dynamically from the lowered graph — never
-        statically known to the frontend). Every index in this range is valid
-        for select_plan(). With no python engines this is exactly the classic
-        semantic."""
-        n_python = self._n_python_plans()
-        if self._lowered_graph is not None and self._cpp_plans_created:
-            return n_python + self._lowered_graph.get_execution_plan_count()
-        return len(self._plans)
+        """Number of public plan slots (see _plan_slots). The backend's count is
+        queried dynamically from the lowered graph — never statically known to
+        the frontend. Every index in this range is valid for select_plan(); with
+        no python engines this is exactly the classic semantic."""
+        return len(self._plan_slots())
 
     def select_plan(self, index: int) -> "pygraph":
-        """Pick a plan by index in the unified space (see
-        get_execution_plan_count): python plans first, then the backend's plans
-        (backend sub-index = index - n_python). Selecting a backend sub-index
-        lowers on demand so the backend's plan list exists to validate against."""
+        """Pick a plan by public slot index (see _plan_slots). Selecting into
+        the backend's range lowers on demand so its plan list exists."""
         if not self._plans:
             raise RuntimeError("call create_execution_plans() before select_plan()")
-        n_python = self._n_python_plans()
-        if index >= n_python:
-            # backend range: make sure the backend plan list exists
-            self._lower_cudnn_plan()
-        total = self.get_execution_plan_count()
-        if not 0 <= index < total:
-            raise IndexError(f"plan index {index} out of range for {total} plan(s)")
+        slots = self._plan_slots()
+        if index >= len(slots) or (0 <= index < len(slots) and slots[index][0] == "cudnn" and not self._cpp_plans_created):
+            self._lower_cudnn_plan()  # expand the backend entry, then re-check
+            slots = self._plan_slots()
+        if not 0 <= index < len(slots):
+            raise IndexError(f"plan index {index} out of range for {len(slots)} plan(s)")
         self._plan_index = index
         self._is_built = False
         return self
+
+    def _resolve_stream(self, handle: Any) -> Any:
+        """Stream for a supplied handle (classic set_stream semantics). A failed
+        query on a SUPPLIED handle is a correctness error and raises — never a
+        silent fall-back to another stream. No handle -> None (the engine must
+        resolve deterministically from its framework, e.g. torch current stream)."""
+        if handle is None:
+            return None
+        import cudnn
+
+        return cudnn.get_stream(handle)
+
+    def _build_context(self, handle: Any = None) -> Any:
+        from .engines.base import ExecutionContext
+
+        h = handle if handle is not None else self._handle
+        return ExecutionContext(handle=h, stream=self._resolve_stream(h))
 
     def _verify_uid_ownership(self) -> None:
         # Verify the uid-ownership invariant (see _lower_to_cpp): every C++
@@ -744,7 +792,7 @@ class pygraph:
         eng = self.selected_engine
         if eng is not None:
             if self._plan_index not in self._compiled_plans:
-                self._compiled_plans[self._plan_index] = eng.build_plan(self, self._plans[self._plan_index])
+                self._compiled_plans[self._plan_index] = eng.build_plan(self, self._selected_plan_config, self._build_context())
         if eng is None:
             if self._lowered_graph is None or not self._cpp_plans_created:
                 self._lower_cudnn_plan()
@@ -773,6 +821,8 @@ class pygraph:
             raise RuntimeError("Call build() first")
 
         if self.selected_engine is not None:
+            if args or kwargs:
+                raise NotImplementedError("dynamic workspace-query overrides are not supported by python plans")
             return self._compiled_plans[self._plan_index].get_workspace_size()
 
         return self._lowered_graph.get_workspace_size(*args, **kwargs)
@@ -819,26 +869,19 @@ class pygraph:
 
         eng = self.selected_engine
         if eng is not None:  # python engine (plan id in the reserved region)
-            import cudnn
             from .engines.base import ExecutionContext
 
             h = handle if handle is not None else self._handle
-            stream = None
-            if h is not None:
-                try:
-                    stream = cudnn.get_stream(h)
-                except Exception:  # noqa: BLE001 — stream query is best-effort
-                    stream = None
             ctx = ExecutionContext(
                 handle=h,
-                stream=stream,
+                stream=self._resolve_stream(h),
                 workspace=workspace,
                 override_uids=override_uids,
                 override_shapes=override_shapes,
                 override_strides=override_strides,
             )
             if self._plan_index not in self._compiled_plans:  # execute() auto-built
-                self._compiled_plans[self._plan_index] = eng.build_plan(self, self._plans[self._plan_index])
+                self._compiled_plans[self._plan_index] = eng.build_plan(self, self._selected_plan_config, self._build_context())
             self._compiled_plans[self._plan_index].execute(self, uid_to_data, ctx)
             return
 
@@ -1645,13 +1688,37 @@ _CAPTURED_OPS = {
         out_kwargs=("dSink_token", "rng_dump"),
         infer={"dQ": _like("q"), "dK": _like("k"), "dV": _like("v"), "amax_dQ": _AMAX, "amax_dK": _AMAX, "amax_dV": _AMAX, "amax_dP": _AMAX},
     ),
-    # mxfp8 variants: outputs are positional (see sdpa.cpp result_array); dims
-    # via out_dims / set_dim where cuDNN needs them.
-    "sdpa_mxfp8": dict(node_type=NodeType.SDPA_MXFP8, pos=("q", "k", "v"), outputs=("OUT_0", "OUT_1", "OUT_2")),
+    # mxfp8 variants (schemas match the bindings exactly; output dims via
+    # out_dims / set_dim where cuDNN needs them)
+    "sdpa_mxfp8": dict(
+        node_type=NodeType.SDPA_MXFP8,
+        pos=("q", "k", "v", "descale_q", "descale_k", "descale_v"),
+        outputs=("O", "Stats", "Amax_O"),
+        maybe={"Stats": _stats_expected},
+    ),
     "sdpa_mxfp8_backward": dict(
         node_type=NodeType.SDPA_MXFP8_BWD,
-        pos=("q", "k", "v", "o", "dO", "stats"),
-        outputs=("OUT_0", "OUT_1", "OUT_2", "OUT_3", "OUT_4", "OUT_5"),
+        pos=(
+            "q",
+            "q_T",
+            "k",
+            "k_T",
+            "v",
+            "o_f16",
+            "dO_f16",
+            "dO",
+            "dO_T",
+            "stats",
+            "descale_q",
+            "descale_q_T",
+            "descale_k",
+            "descale_k_T",
+            "descale_v",
+            "descale_dO",
+            "descale_dO_T",
+        ),
+        outputs=("dQ", "dK", "dV", "amax_dQ", "amax_dK", "amax_dV"),
+        out_kwargs=("dSink_token",),
     ),
 }
 

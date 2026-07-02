@@ -142,9 +142,12 @@ class BaseEngine(ABC):
         self.check_support(graph)
         return [PlanConfig(self.engine_id, self.default_knobs)]
 
-    def build_plan(self, graph: "pygraph", plan: PlanConfig) -> CompiledPlan:
+    def build_plan(self, graph: "pygraph", plan: PlanConfig, ctx: "ExecutionContext" = None) -> CompiledPlan:
         """Compile ``graph`` for ``plan`` (the expensive step; run once per
-        graph/plan at build_plans() time). Default wraps eager ``execute()``."""
+        graph/plan at build_plans() time). ``ctx`` carries the build context —
+        handle and stream when available — so device-specific AoT compilers get
+        their inputs explicitly instead of reading private graph state. Default
+        wraps eager ``execute()``."""
         return _EagerPlan(self, plan)
 
     def get_workspace_size(self) -> int:

@@ -215,7 +215,7 @@ def test_compiled_plan_lifecycle_knobs_and_reuse():
         def propose_plans(self, graph):
             return [PlanConfig(self.engine_id, {"tile": 128}), PlanConfig(self.engine_id, {"tile": 256})]
 
-        def build_plan(self, graph, plan):
+        def build_plan(self, graph, plan, ctx=None):
             compiled_log.append(plan.knobs)
             return TunablePlan(plan.knobs)
 
@@ -244,3 +244,136 @@ def test_compiled_plan_lifecycle_knobs_and_reuse():
     C2 = g2.matmul(torch.randn(2, 2), torch.randn(2, 2))
     g2.execute({C2: torch.empty(2, 2)})
     assert compiled_log == [{"tile": 256}, {"tile": 128}]  # g2 compiled its own plan
+
+
+def _mk_engine(id_off, knobs=None, log=None):
+    from cudnn.engines import CompiledPlan, PlanConfig
+
+    class _Plan(CompiledPlan):
+        def __init__(self, k):
+            self.knobs = k
+
+        def execute(self, graph, tensor_data, ctx):
+            (log if log is not None else []).append(self.knobs)
+
+    class _E(BaseEngine):
+        name = f"e{id_off}"
+        engine_id = PYTHON_ENGINE_ID_BASE + id_off
+        default_knobs = knobs
+
+        def build_plan(self, graph, plan, ctx=None):
+            return _Plan(plan.knobs)
+
+        def execute(self, graph, tensor_data, ctx=None):
+            pass
+
+    return _E()
+
+
+def test_explicit_replan_invalidates_compiled_artifacts():
+    """Follow-up item 1: explicit create_execution_plans() must not leave a
+    stale compiled artifact executable."""
+    from cudnn.engines import PlanConfig
+
+    log = []
+    eng = _mk_engine(60, knobs="old", log=log)
+    g = NativeGraph()
+    g.register_backend(eng)
+    C = g.matmul(torch.randn(2, 2), torch.randn(2, 2))
+    g.create_execution_plans()
+    g.build_plans()
+    old_compiled = g._compiled_plans[0]
+
+    type(eng).default_knobs = "new"
+    g.create_execution_plans()  # explicit replan
+    assert g.plans[0].knobs == "new"
+    assert not g._compiled_plans and not g._is_built  # artifacts invalidated
+    g.execute({C: torch.empty(2, 2)})
+    assert g._compiled_plans[0] is not old_compiled
+    assert log[-1] == "new"  # executed the NEW plan's compilation
+
+
+def test_mixed_router_ordering_dispatch():
+    """Follow-up item 2: dispatch honors arbitrary Router ordering (cuDNN-first,
+    interleaved), never a python-prefix assumption."""
+    from cudnn.engines import PlanConfig, Router
+    from cudnn.engines.engine_ids import CUDNN_HEURISTIC_ENGINE_ID
+
+    ran = []
+    ea, eb = _mk_engine(61, "A", ran), _mk_engine(62, "B", ran)
+
+    class Interleaved(Router):
+        def plan(self, graph, backends):
+            return [
+                PlanConfig(ea.engine_id, "A"),
+                PlanConfig(CUDNN_HEURISTIC_ENGINE_ID),
+                PlanConfig(eb.engine_id, "B"),
+            ]
+
+    g = NativeGraph(router=Interleaved())
+    g.register_backend(ea).register_backend(eb)
+    C = g.matmul(torch.randn(2, 2), torch.randn(2, 2))
+    g.create_execution_plans()
+    # slot 0 = python A, slot 1 = cuDNN, slot 2 = python B
+    assert g.selected_engine.name == "e61"
+    g.select_plan(2)
+    assert g.selected_engine.name == "e62"
+    g.execute({C: torch.empty(2, 2)})
+    assert ran[-1] == "B"
+    assert g._plan_slots()[1] == ("cudnn", 0)  # middle slot is the cuDNN entry
+
+
+def test_constructor_backends_validated_and_proposals_checked():
+    """Follow-up item 6: constructor path uses registration validation; foreign
+    engine ids in proposals are rejected."""
+    from cudnn.engines import PlanConfig
+
+    class NoId(BaseEngine):
+        def execute(self, graph, tensor_data, ctx=None):
+            pass
+
+    with pytest.raises(ValueError, match="engine_id"):
+        NativeGraph(backends=[NoId()])
+
+    class Impostor(BaseEngine):
+        name = "impostor"
+        engine_id = PYTHON_ENGINE_ID_BASE + 63
+
+        def propose_plans(self, graph):
+            return [PlanConfig(PYTHON_ENGINE_ID_BASE + 99, None)]  # foreign id
+
+        def execute(self, graph, tensor_data, ctx=None):
+            pass
+
+    g = NativeGraph(backends=[Impostor()])
+    g.matmul(torch.randn(2, 2), torch.randn(2, 2))
+    with pytest.raises(ValueError, match="foreign engine_id"):
+        g.create_execution_plans()
+
+
+def test_python_plan_rejects_dynamic_workspace_overrides():
+    g = NativeGraph()
+    g.register_backend(ReferenceMatmulEngine())
+    C = g.matmul(torch.randn(2, 3), torch.randn(3, 2))
+    g.build()
+    with pytest.raises(NotImplementedError, match="overrides"):
+        g.get_workspace_size(1234)
+    g.execute({C: torch.empty(2, 2)})  # normal path unaffected
+
+
+def test_failed_stream_query_on_supplied_handle_raises(monkeypatch):
+    """Follow-up item 3: a supplied handle whose stream cannot be queried is a
+    correctness error — never a silent stream-0 fallback."""
+    import cudnn as _cudnn
+
+    g = NativeGraph()
+    g.register_backend(ReferenceMatmulEngine())
+    C = g.matmul(torch.randn(2, 3), torch.randn(3, 2))
+    g.build()
+
+    def boom(handle):
+        raise RuntimeError("stream query failed")
+
+    monkeypatch.setattr(_cudnn, "get_stream", boom)
+    with pytest.raises(RuntimeError, match="stream query failed"):
+        g.execute({C: torch.empty(2, 2)}, handle=42)

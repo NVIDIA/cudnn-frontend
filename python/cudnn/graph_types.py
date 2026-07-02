@@ -90,13 +90,20 @@ class Tensor:
     # (set_name / set_uid) delegate to the graph so its indexes stay coherent.
     owner: Any = field(default=None, repr=False)
 
+    def _guard(self, what: str = "mutate a tensor attribute") -> None:
+        g = self.owner() if self.owner is not None else None
+        if g is not None:
+            g._check_mutable(what)
+
     def set_output(self, value: bool) -> "Tensor":
         """Mark this tensor as an output (non-virtual) or intermediate (virtual)."""
+        self._guard()
         self.is_virtual = not value
         return self
 
     def set_data_type(self, dtype: Any) -> "Tensor":
         """Set the data type."""
+        self._guard()
         self.data_type = dtype
         return self
 
@@ -111,11 +118,13 @@ class Tensor:
 
     def set_dim(self, dim: List[int]) -> "Tensor":
         """Set the tensor dimensions."""
+        self._guard()
         self.dim = dim
         return self
 
     def set_stride(self, stride: List[int]) -> "Tensor":
         """Set the tensor strides."""
+        self._guard()
         self.stride = stride
         return self
 
@@ -132,26 +141,31 @@ class Tensor:
 
     def set_ragged_offset(self, ragged_offset: "Tensor") -> "Tensor":
         """Set the ragged-offset tensor (variable-length layouts)."""
+        self._guard()
         self.ragged_offset = ragged_offset
         return self
 
     def set_ragged_offset_multiplier(self, multiplier: int) -> "Tensor":
         """Set the ragged-offset unit size in tensor elements."""
+        self._guard()
         self.ragged_offset_multiplier = multiplier
         return self
 
     def set_reordering_type(self, reordering_type: Any) -> "Tensor":
         """Set the memory reordering layout (e.g. F8_128x4)."""
+        self._guard()
         self.reordering_type = reordering_type
         return self
 
     def set_is_pass_by_value(self, value: bool) -> "Tensor":
         """Mark the tensor as a host pass-by-value scalar."""
+        self._guard()
         self.is_pass_by_value = value
         return self
 
     def set_is_virtual(self, value: bool) -> "Tensor":
         """Set virtualness directly (classic parity; inverse of set_output)."""
+        self._guard()
         self.is_virtual = value
         return self
 

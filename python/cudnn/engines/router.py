@@ -66,6 +66,9 @@ class Router:
                 proposals = engine.propose_plans(graph)
             except decline:
                 continue
+            for pc in proposals:
+                if pc.engine_id != engine.engine_id:  # no identity injection
+                    raise ValueError(f"engine {engine.name!r} proposed a plan with foreign engine_id {pc.engine_id}")
             plans.extend(proposals)
 
         # The cuDNN side is ONE delegating entry by design: the frontend owns
