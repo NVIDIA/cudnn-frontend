@@ -230,7 +230,7 @@ class pygraph:
         is_pbv = bool(getattr(getattr(template, "device", None), "type", None) == "cpu")
         return self.tensor(dim=dim, stride=stride, data_type=data_type, is_virtual=is_virtual, is_pass_by_value=is_pbv, name=name)
 
-    def tensor_scalar(self, value: Any, scalar_type: Any = None, name: str = "") -> Tensor:
+    def tensor_scalar(self, value: Any, scalar_type: Any, name: str = "") -> Tensor:
         """Create a pass-by-value scalar tensor (classic tensor_scalar parity)."""
         if not name:
             name = f"scalar_{len(self._tensors)}"

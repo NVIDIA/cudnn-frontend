@@ -99,12 +99,15 @@ class Node:
             if len(b.dim) >= 2:
                 c_dim[-1] = b.dim[-1]
 
-            # Broadcast batch dims
+            # Broadcast batch dims (incompatible extents raise, matching numpy
+            # rules: equal, or one side is 1)
             for i in range(ndim - 2):
                 a_idx = i - (ndim - len(a.dim))
                 b_idx = i - (ndim - len(b.dim))
                 a_val = a.dim[a_idx] if 0 <= a_idx < len(a.dim) - 2 else 1
                 b_val = b.dim[b_idx] if 0 <= b_idx < len(b.dim) - 2 else 1
+                if a_val != b_val and 1 not in (a_val, b_val):
+                    raise ValueError(f"Node '{self.name}': batch dims not broadcastable: A{a.dim} vs B{b.dim}")
                 c_dim[i] = max(a_val, b_val)
 
             c.dim = c_dim
@@ -119,14 +122,20 @@ class Node:
             return
 
         if not out.dim:
-            # Find largest input shape
-            max_dim = []
+            # Right-aligned elementwise broadcast across all inputs (numpy
+            # rules); lower-rank operands contribute to the trailing dims.
+            max_dim: list = []
             for tensor in self.inputs.values():
-                if tensor and tensor.dim:
-                    if len(tensor.dim) > len(max_dim):
-                        max_dim = tensor.dim.copy()
-                    elif len(tensor.dim) == len(max_dim):
-                        max_dim = [max(a, b) for a, b in zip(max_dim, tensor.dim)]
+                if not (tensor and tensor.dim):
+                    continue
+                d = list(tensor.dim)
+                if len(d) > len(max_dim):
+                    d, max_dim = max_dim, d  # keep max_dim the longer one
+                for i in range(1, len(d) + 1):  # merge right-aligned
+                    a, b = max_dim[-i], d[-i]
+                    if a != b and 1 not in (a, b):
+                        raise ValueError(f"Node '{self.name}': pointwise inputs not broadcastable")
+                    max_dim[-i] = max(a, b)
             if max_dim:
                 out.dim = max_dim
 

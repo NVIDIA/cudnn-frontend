@@ -155,15 +155,22 @@ class MatmulCuTileEngine(BaseEngine):
             RuntimeError: If GPU or driver doesn't meet requirements
             NotImplementedError: If graph contains unsupported operations
         """
-        # Check GPU compute capability (need SM100+ for Blackwell)
+        # Check GPU compute capability (need SM100+ for Blackwell). CUDA
+        # runtime failures decline the engine (never proceed on garbage).
         err, device_id = cudart.cudaGetDevice()
+        if err != cudart.cudaError_t.cudaSuccess:
+            raise NotImplementedError(f"MatmulCuTileEngine: cudaGetDevice failed ({err})")
         err, props = cudart.cudaGetDeviceProperties(device_id)
+        if err != cudart.cudaError_t.cudaSuccess:
+            raise NotImplementedError(f"MatmulCuTileEngine: cudaGetDeviceProperties failed ({err})")
         cc_int = props.major * 10 + props.minor
         if cc_int < 100:
             raise NotImplementedError(f"MatmulCuTileEngine requires Blackwell GPU (SM100+), got SM{cc_int}")
 
         # Check driver version (need r580+)
         err, driver_version = cudart.cudaDriverGetVersion()
+        if err != cudart.cudaError_t.cudaSuccess:
+            raise NotImplementedError(f"MatmulCuTileEngine: cudaDriverGetVersion failed ({err})")
         # Driver version format: 1000 * major + 10 * minor
         # r580 corresponds to CUDA 13.1 which is driver version 13010
         if driver_version < 13010:
@@ -197,6 +204,12 @@ class MatmulCuTileEngine(BaseEngine):
             a = tensor_data[node.inputs["A"].uid]
             b = tensor_data[node.inputs["B"].uid]
             c = tensor_data[node.outputs["C"].uid]
+
+            # all operands must live on the same CUDA device (multi-GPU hosts:
+            # launching against a mismatched context silently corrupts results)
+            devices = {getattr(t, "device", None) for t in (a, b, c)}
+            if len(devices) != 1 or getattr(next(iter(devices)), "type", None) != "cuda":
+                raise RuntimeError(f"MatmulCuTileEngine: operands must share one CUDA device, got {devices}")
 
             # Get dimensions and launch kernel
             if a.ndim == 2:
