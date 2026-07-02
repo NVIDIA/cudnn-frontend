@@ -20,6 +20,7 @@ class NodeType(Enum):
     MATMUL_FP8 = auto()
     POINTWISE = auto()
     REDUCTION = auto()
+    RMSNORM = auto()
     SDPA = auto()
     SDPA_BWD = auto()
     SDPA_FP8 = auto()

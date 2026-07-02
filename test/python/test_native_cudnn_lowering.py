@@ -154,3 +154,47 @@ def test_native_moe_grouped_matmul_lowers_to_cudnn():
         if en > s:
             ref[s:en] = token[s:en] @ weight[e]
     torch.testing.assert_close(out_d.view(T, Wt).float(), ref.cuda(), rtol=5e-2, atol=5e-2)
+
+
+def test_native_rmsnorm_lowers_to_cudnn():
+    """rmsnorm (multi-output: Y + inv_var, pass-by-value epsilon) -> cuDNN parity.
+
+    Regression cover for the IR-uid -> C++-uid translation: multi-output ops get
+    their C++ output uids in FE enumeration order (inv_var before Y here), which
+    does not match IR allocation order — keying the variant pack by raw IR uids
+    bound Y's buffer to inv_var (heap corruption / NaN)."""
+    h = _handle()
+    Nb, C, Hh, W = 4, 8, 4, 4
+    eps = 1e-3
+    x = torch.randn(Nb, C, Hh, W, device="cuda", dtype=torch.float16)
+    scale = torch.randn(1, C, Hh, W, device="cuda", dtype=torch.float16)
+    bias = torch.randn(1, C, Hh, W, device="cuda", dtype=torch.float16)
+    eps_cpu = torch.full((1, 1, 1, 1), eps, dtype=torch.float32)
+    Yb = torch.empty_like(x)
+    ivb = torch.empty(Nb, 1, 1, 1, device="cuda", dtype=torch.float32)
+
+    g = NativeGraph(handle=h, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    X = g.tensor(dim=[Nb, C, Hh, W], stride=[C * Hh * W, Hh * W, W, 1], data_type=cudnn.data_type.HALF)
+    S = g.tensor(dim=[1, C, Hh, W], stride=[C * Hh * W, Hh * W, W, 1], data_type=cudnn.data_type.HALF)
+    Bi = g.tensor(dim=[1, C, Hh, W], stride=[C * Hh * W, Hh * W, W, 1], data_type=cudnn.data_type.HALF)
+    E = g.tensor(dim=[1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.FLOAT, is_pass_by_value=True)
+    Y, iv = g.rmsnorm(input=X, scale=S, epsilon=E, bias=Bi, norm_forward_phase=cudnn.norm_forward_phase.TRAINING)
+    Y.set_output(True).set_data_type(cudnn.data_type.HALF)
+    iv.set_output(True).set_data_type(cudnn.data_type.FLOAT)
+
+    # first-class introspection: named ports + params
+    node = g.nodes[0]
+    assert node.node_type.name == "RMSNORM"
+    assert set(node.inputs) == {"input", "scale", "epsilon", "bias"}
+    assert set(node.outputs) == {"Y", "inv_var"}
+
+    g.build([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
+    g.execute({X: x, S: scale, Bi: bias, E: eps_cpu, Y: Yb, iv: ivb}, ws, handle=h)
+    torch.cuda.synchronize()
+
+    xf = x.float()
+    ivref = torch.rsqrt(xf.pow(2).mean(dim=(1, 2, 3), keepdim=True) + eps)
+    Yref = scale.float() * (xf * ivref) + bias.float()
+    torch.testing.assert_close(Yb.float(), Yref, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(ivb, ivref, atol=5e-3, rtol=5e-3)

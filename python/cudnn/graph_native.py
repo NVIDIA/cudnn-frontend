@@ -91,6 +91,8 @@ class NativeGraph:
         self._plans: List[Any] = []  # list[PlanConfig], populated by create_execution_plans()
         self._plan_index: int = 0
         self._cudnn_heuristics: Optional[List] = None  # heur modes for a cuDNN plan
+        self._cpp_tensors: Dict[int, Any] = {}  # IR uid -> lowered C++ tensor
+        self._cpp_uid_of: Dict[int, int] = {}  # IR uid -> C++ uid (post-build)
 
         # Back-compat: use_native=True registers the default native matmul engine
         # as a candidate (the Router still falls back to cuDNN if it can't run
@@ -428,6 +430,41 @@ class NativeGraph:
         self._nodes.append(node)
         return out
 
+    def rmsnorm(
+        self, input: Any, scale: Any, epsilon: Any, bias: Optional[Any] = None, norm_forward_phase: Any = None, name: str = "", compute_data_type: Any = None
+    ):
+        """RMS normalization. Returns (Y, inv_var).
+
+        First-class node: named input/scale/bias/epsilon ports + a
+        norm_forward_phase param, so it is fully introspectable and consumable by
+        any backend via graph.nodes (not an opaque pass-through). ``epsilon`` is a
+        pass-by-value host scalar tensor. Y has the input's shape; inv_var reduces
+        the non-batch dims (mirrors RMSNorm over dims 1..)."""
+        name = self._get_name("rmsnorm", name)
+        input = self._ensure_tensor(input, name=f"{name}::input")
+        scale = self._ensure_tensor(scale, name=f"{name}::scale")
+        epsilon = self._ensure_tensor(epsilon, name=f"{name}::epsilon")
+        node = Node(name, NodeType.RMSNORM, compute_data_type or self._context.compute_data_type)
+        node.inputs["input"] = input
+        node.inputs["scale"] = scale
+        node.inputs["epsilon"] = epsilon
+        if bias is not None:
+            node.inputs["bias"] = self._ensure_tensor(bias, name=f"{name}::bias")
+        node.params["norm_forward_phase"] = norm_forward_phase
+        Y = self._make_output(f"{name}::Y")
+        Y.dim = list(input.dim)
+        Y.stride = list(input.stride)
+        inv_var = self._make_output(f"{name}::inv_var")
+        if input.dim:
+            inv_var.dim = [input.dim[0]] + [1] * (len(input.dim) - 1)
+            inv_var.stride = _row_major_stride(inv_var.dim)
+        node.outputs["Y"] = Y
+        node.outputs["inv_var"] = inv_var
+        self._register_tensor(Y)
+        self._register_tensor(inv_var)
+        self._nodes.append(node)
+        return Y, inv_var
+
     def sdpa(
         self,
         q: Any,
@@ -743,6 +780,22 @@ class NativeGraph:
             self._lowered_graph = self._lower_to_cpp()
             self._lowered_graph.validate()
             self._lowered_graph.build_operation_graph()
+            # Op-created (output/virtual) C++ tensors get their uids assigned by
+            # the C++ FE during build_operation_graph, in ITS enumeration order —
+            # which need not match IR allocation order (multi-output ops iterate
+            # an unordered map; e.g. rmsnorm assigns inv_var before Y). Build the
+            # explicit IR-uid -> C++-uid translation now; execute() translates
+            # variant-pack keys through it. Relying on order coincidence binds
+            # buffers to the wrong tensors (observed: Y written into the 16-byte
+            # inv_var buffer -> heap corruption / NaN).
+            self._cpp_uid_of = {}
+            for ir_uid, cpp_t in self._cpp_tensors.items():
+                try:
+                    cpp_uid = cpp_t.get_uid()
+                except Exception:  # noqa: BLE001 — defensive; tensor variants differ
+                    continue
+                if isinstance(cpp_uid, int) and cpp_uid > 0:
+                    self._cpp_uid_of[ir_uid] = cpp_uid
         heur = self._cudnn_heuristics or [cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK]
         self._lowered_graph.create_execution_plans(heur)
 
@@ -831,8 +884,10 @@ class NativeGraph:
             eng.execute(self, uid_to_data)
             return
 
-        # cuDNN execution path (plan id < PYTHON_ENGINE_ID_BASE)
-        var_pack = {uid: (d.data_ptr() if hasattr(d, "data_ptr") else d) for uid, d in uid_to_data.items()}
+        # cuDNN execution path (plan id < PYTHON_ENGINE_ID_BASE). Translate IR
+        # uids to the C++-assigned uids — op-output uids are assigned by the C++
+        # FE at build time and do NOT reliably match IR allocation order.
+        var_pack = {self._cpp_uid_of.get(uid, uid): (d.data_ptr() if hasattr(d, "data_ptr") else d) for uid, d in uid_to_data.items()}
         ws_ptr = workspace.data_ptr() if hasattr(workspace, "data_ptr") else workspace
         self._lowered_graph._execute(var_pack, ws_ptr, handle)
 
@@ -1149,6 +1204,28 @@ class NativeGraph:
                     cpp_out.set_dim(_red_out.dim)
                 if _red_out.stride:
                     cpp_out.set_stride(_red_out.stride)
+            elif node.node_type == NodeType.RMSNORM:
+                phase = node.params.get("norm_forward_phase") or cudnn.norm_forward_phase.TRAINING
+                rms_kwargs = {
+                    "norm_forward_phase": phase,
+                    "input": tensor_map[node.inputs["input"].uid],
+                    "scale": tensor_map[node.inputs["scale"].uid],
+                    "epsilon": tensor_map[node.inputs["epsilon"].uid],
+                    "compute_data_type": node.compute_data_type,
+                    "name": node.name,
+                }
+                if "bias" in node.inputs:
+                    rms_kwargs["bias"] = tensor_map[node.inputs["bias"].uid]
+                Yc, ivc = graph.rmsnorm(**rms_kwargs)
+                # Let cuDNN infer Y/inv_var dims (matching the classic API); only
+                # mark output + dtype. The IR carries dims for introspection.
+                for out_t, cpp_t in ((node.outputs["Y"], Yc), (node.outputs["inv_var"], ivc)):
+                    tensor_map[out_t.uid] = cpp_t
+                    if not out_t.is_virtual:
+                        cpp_t.set_output(True)
+                    if out_t.data_type:
+                        cpp_t.set_data_type(out_t.data_type)
+                continue
             elif node.node_type == NodeType.BLOCK_SCALE_DEQUANTIZE:
                 cpp_out = graph.block_scale_dequantize(
                     input=tensor_map[node.inputs["input"].uid],
@@ -1198,4 +1275,5 @@ class NativeGraph:
                 if out_t.data_type:
                     cpp_out.set_data_type(out_t.data_type)
 
+        self._cpp_tensors = tensor_map  # for the IR-uid -> C++-uid translation
         return graph
