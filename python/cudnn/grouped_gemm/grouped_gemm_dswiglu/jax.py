@@ -5,13 +5,18 @@
 
 from __future__ import annotations
 
-from functools import lru_cache
 import os
-from typing import Any, NamedTuple, Optional
+from typing import Any, Optional
 
 import jax.numpy as jnp
 
-from ..._jax.api_base import ApiBaseJax, BufferSpec, call_cutedsl
+from ..._jax.api_base import (
+    ApiBaseJax,
+    BufferSpec,
+    TupleDict,
+    call_cutedsl,
+    require_dtype,
+)
 from ..._jax.gemm import (
     block_scale_tensor_spec,
     gemm_a_tensor_spec,
@@ -26,7 +31,6 @@ from ..._jax.grouped_gemm import (
     require_grouped_probability,
     require_grouped_vector,
 )
-from ..._jax.validation import require_dtype
 from ...gemm_validation import (
     block_scale_shape,
     require_shape,
@@ -35,19 +39,23 @@ from ...gemm_validation import (
 from .._jax_api import check_call_signatures, immutable_mapping
 
 
-class GroupedGemmDswigluResult(NamedTuple):
-    """Functional outputs from contiguous grouped GEMM + dSwiGLU."""
-
-    d_row_tensor: Any
-    d_col_tensor: Any
-    dprob_tensor: Any
-    amax_tensor: None
-    sfd_row_tensor: Any
-    sfd_col_tensor: Any
-
-
-@lru_cache(maxsize=None)
-def _make_launcher(
+def _launch(
+    stream,
+    a,
+    b,
+    c,
+    sfa,
+    sfb,
+    padded_offsets,
+    alpha,
+    beta,
+    prob,
+    norm_const,
+    d_row,
+    d_col,
+    dprob,
+    sfd_row,
+    sfd_col,
     *,
     acc_dtype: Any,
     mma_tiler_mn: tuple[int, int],
@@ -59,83 +67,63 @@ def _make_launcher(
     epilogue_op: str,
     cluster_overlap_margin: int,
 ):
-    def launch(
-        stream,
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass.jax import jax_to_cutlass_dtype
+
+    from .grouped_gemm_dswiglu_quant import BlockScaledContiguousGroupedGemmKernel
+
+    if epilogue_op == "relu":
+
+        def epilogue(x):
+            return cute.where(x > 0, x, cute.full_like(x, 0))
+
+    elif epilogue_op == "srelu":
+
+        def epilogue(x):
+            return cute.where(x > 0, x, cute.full_like(x, 0)) ** 2
+
+    else:
+
+        def epilogue(x):
+            return x
+
+    kernel = BlockScaledContiguousGroupedGemmKernel(
+        sf_vec_size=sf_vec_size,
+        acc_dtype=jax_to_cutlass_dtype(acc_dtype),
+        use_2cta_instrs=mma_tiler_mn[0] == BlockScaledContiguousGroupedGemmKernel.TWO_CTA_MMA_TILER_M,
+        mma_tiler_mn=mma_tiler_mn,
+        cluster_shape_mn=cluster_shape_mn,
+        vectorized_f32=vector_f32,
+        discrete_col_sfd=discrete_col_sfd,
+        expert_cnt=expert_cnt,
+        use_mono_increase_expert_idx=True,
+    )
+    max_active_clusters = resolve_max_active_clusters(
+        cutlass.utils.HardwareInfo().get_max_active_clusters(cluster_shape_mn[0] * cluster_shape_mn[1]),
+        cluster_overlap_margin,
+    )
+    kernel(
         a,
         b,
         c,
+        d_row,
+        d_col,
         sfa,
         sfb,
+        sfd_row,
+        sfd_col,
+        None,
+        norm_const,
         padded_offsets,
         alpha,
         beta,
         prob,
-        norm_const,
-        d_row,
-        d_col,
         dprob,
-        sfd_row,
-        sfd_col,
-    ):
-        import cutlass
-        import cutlass.cute as cute
-        from cutlass.jax import jax_to_cutlass_dtype
-
-        from .grouped_gemm_dswiglu_quant import BlockScaledContiguousGroupedGemmKernel
-
-        if epilogue_op == "relu":
-
-            def epilogue(x):
-                return cute.where(x > 0, x, cute.full_like(x, 0))
-
-        elif epilogue_op == "srelu":
-
-            def epilogue(x):
-                return cute.where(x > 0, x, cute.full_like(x, 0)) ** 2
-
-        else:
-
-            def epilogue(x):
-                return x
-
-        kernel = BlockScaledContiguousGroupedGemmKernel(
-            sf_vec_size=sf_vec_size,
-            acc_dtype=jax_to_cutlass_dtype(acc_dtype),
-            use_2cta_instrs=mma_tiler_mn[0] == BlockScaledContiguousGroupedGemmKernel.TWO_CTA_MMA_TILER_M,
-            mma_tiler_mn=mma_tiler_mn,
-            cluster_shape_mn=cluster_shape_mn,
-            vectorized_f32=vector_f32,
-            discrete_col_sfd=discrete_col_sfd,
-            expert_cnt=expert_cnt,
-            use_mono_increase_expert_idx=True,
-        )
-        max_active_clusters = resolve_max_active_clusters(
-            cutlass.utils.HardwareInfo().get_max_active_clusters(cluster_shape_mn[0] * cluster_shape_mn[1]),
-            cluster_overlap_margin,
-        )
-        kernel(
-            a,
-            b,
-            c,
-            d_row,
-            d_col,
-            sfa,
-            sfb,
-            sfd_row,
-            sfd_col,
-            None,
-            norm_const,
-            padded_offsets,
-            alpha,
-            beta,
-            prob,
-            dprob,
-            max_active_clusters,
-            stream,
-            epilogue_op=epilogue,
-        )
-
-    return launch
+        max_active_clusters,
+        stream,
+        epilogue_op=epilogue,
+    )
 
 
 def _grouped_gemm_dswiglu_impl(
@@ -161,7 +149,7 @@ def _grouped_gemm_dswiglu_impl(
     epilogue_op: Optional[str] = None,
     *,
     _validate_only: bool = False,
-) -> GroupedGemmDswigluResult | dict[str, Any]:
+) -> TupleDict | dict[str, Any]:
     """Compute the MXFP8 contiguous grouped dSwiGLU fusion.
 
     ``dprob_tensor`` is modeled as a fresh zero-initialized JAX result instead
@@ -252,17 +240,7 @@ def _grouped_gemm_dswiglu_impl(
         }
 
     d_row_tensor, d_col_tensor, dprob_tensor, sfd_row_tensor, sfd_col_tensor = call_cutedsl(
-        _make_launcher(
-            acc_dtype=acc_dtype,
-            mma_tiler_mn=mma_tiler_mn,
-            cluster_shape_mn=cluster_shape_mn,
-            sf_vec_size=sf_vec_size,
-            vector_f32=bool(vector_f32),
-            discrete_col_sfd=bool(discrete_col_sfd),
-            expert_cnt=experts,
-            epilogue_op=normalized_epilogue,
-            cluster_overlap_margin=int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0")),
-        ),
+        _launch,
         (
             a_tensor,
             b_tensor,
@@ -275,6 +253,17 @@ def _grouped_gemm_dswiglu_impl(
             prob_tensor,
             norm_const_tensor,
         ),
+        static_args={
+            "acc_dtype": acc_dtype,
+            "mma_tiler_mn": mma_tiler_mn,
+            "cluster_shape_mn": cluster_shape_mn,
+            "sf_vec_size": sf_vec_size,
+            "vector_f32": bool(vector_f32),
+            "discrete_col_sfd": bool(discrete_col_sfd),
+            "expert_cnt": experts,
+            "epilogue_op": normalized_epilogue,
+            "cluster_overlap_margin": int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0")),
+        },
         outputs=(
             BufferSpec("d_row_tensor", (m, output_n, 1), d_dtype, tensor_spec=output_spec),
             BufferSpec("d_col_tensor", (m, output_n, 1), d_dtype, tensor_spec=output_spec),
@@ -306,7 +295,7 @@ def _grouped_gemm_dswiglu_impl(
         ),
         use_static_tensors=True,
     )
-    return GroupedGemmDswigluResult(
+    return TupleDict(
         d_row_tensor=d_row_tensor,
         d_col_tensor=d_col_tensor,
         dprob_tensor=dprob_tensor,
@@ -401,7 +390,7 @@ class GroupedGemmDswigluSm100(ApiBaseJax):
         beta_tensor: Optional[Any],
         prob_tensor: Any,
         norm_const_tensor: Any,
-    ) -> GroupedGemmDswigluResult:
+    ) -> TupleDict:
         return super().__call__(
             a_tensor,
             b_tensor,
@@ -427,7 +416,7 @@ class GroupedGemmDswigluSm100(ApiBaseJax):
         beta_tensor: Optional[Any],
         prob_tensor: Any,
         norm_const_tensor: Any,
-    ) -> GroupedGemmDswigluResult:
+    ) -> TupleDict:
         values = {
             "a_tensor": a_tensor,
             "b_tensor": b_tensor,
@@ -465,7 +454,7 @@ def grouped_gemm_dswiglu_wrapper_sm100(
     m_aligned: int = 256,
     discrete_col_sfd: bool = False,
     epilogue_op: Optional[str] = None,
-) -> GroupedGemmDswigluResult:
+) -> TupleDict:
     """Compute the MXFP8 contiguous grouped dSwiGLU fusion."""
 
     op = GroupedGemmDswigluSm100(
@@ -505,7 +494,6 @@ def grouped_gemm_dswiglu_wrapper_sm100(
 
 
 __all__ = [
-    "GroupedGemmDswigluResult",
     "GroupedGemmDswigluSm100",
     "grouped_gemm_dswiglu_wrapper_sm100",
 ]

@@ -5,13 +5,18 @@
 
 from __future__ import annotations
 
-from functools import lru_cache
 import os
-from typing import Any, NamedTuple, Optional
+from typing import Any, Optional
 
 import jax.numpy as jnp
 
-from ..._jax.api_base import ApiBaseJax, BufferSpec, call_cutedsl
+from ..._jax.api_base import (
+    ApiBaseJax,
+    BufferSpec,
+    TupleDict,
+    call_cutedsl,
+    require_dtype,
+)
 from ..._jax.gemm import (
     block_scale_tensor_spec,
     gemm_a_tensor_spec,
@@ -27,22 +32,12 @@ from ..._jax.grouped_gemm import (
     require_grouped_gemm_inputs,
     require_grouped_probability,
 )
-from ..._jax.validation import require_dtype
 from ...gemm_validation import (
     require_contiguous_alignment,
     require_shape,
     resolve_max_active_clusters,
 )
 from .._jax_api import check_call_signatures, immutable_mapping
-
-
-class GroupedGemmGluHadamardResult(NamedTuple):
-    """Functional outputs from grouped GEMM + GLU + Hadamard."""
-
-    c_tensor: Any
-    d_tensor: Any
-    amax_tensor: Any
-    post_rht_amax_tensor: Any
 
 
 def hadamard_values(size: int) -> tuple[tuple[int, ...], ...]:
@@ -56,9 +51,9 @@ def hadamard_values(size: int) -> tuple[tuple[int, ...], ...]:
     return matrix
 
 
-@lru_cache(maxsize=None)
-def _make_launcher(
-    *,
+def _launch(
+    stream,
+    *args,
     acc_dtype: Any,
     mma_tiler_mn: tuple[int, int],
     cluster_shape_mn: tuple[int, int],
@@ -72,84 +67,81 @@ def _make_launcher(
     use_tmem_post_rht_amax: bool,
     cluster_overlap_margin: int,
 ):
-    def launch(stream, *args):
-        import cutlass
-        from cutlass.cute.nvgpu import OperandMajorMode
-        from cutlass.jax import jax_to_cutlass_dtype
+    import cutlass
+    from cutlass.cute.nvgpu import OperandMajorMode
+    from cutlass.jax import jax_to_cutlass_dtype
 
-        from ..moe_utils import MoEWeightMode
-        from .moe_blockscaled_grouped_gemm_glu_hadamard import (
-            BlockScaledMoEGroupedGemmGluHadamardKernel,
-        )
+    from ..moe_utils import MoEWeightMode
+    from .moe_blockscaled_grouped_gemm_glu_hadamard import (
+        BlockScaledMoEGroupedGemmGluHadamardKernel,
+    )
 
-        arg_idx = 0
+    arg_idx = 0
 
-        def take():
-            nonlocal arg_idx
-            value = args[arg_idx]
-            arg_idx += 1
-            return value
+    def take():
+        nonlocal arg_idx
+        value = args[arg_idx]
+        arg_idx += 1
+        return value
 
-        a = take()
-        b = take()
-        sfa = take()
-        sfb = take()
-        padded_offsets = take()
-        alpha = take()
-        prob = take()
-        hadamard = take() if has_hadamard else None
-        bias = take() if has_bias else None
-        c = take()
-        d = take()
-        amax = take()
-        post_rht_amax = take()
-        workspace = take()
-        if arg_idx != len(args):
-            raise RuntimeError(f"Unexpected grouped GEMM argument count: consumed {arg_idx}, received {len(args)}")
+    a = take()
+    b = take()
+    sfa = take()
+    sfb = take()
+    padded_offsets = take()
+    alpha = take()
+    prob = take()
+    hadamard = take() if has_hadamard else None
+    bias = take() if has_bias else None
+    c = take()
+    d = take()
+    amax = take()
+    post_rht_amax = take()
+    workspace = take()
+    if arg_idx != len(args):
+        raise RuntimeError(f"Unexpected grouped GEMM argument count: consumed {arg_idx}, received {len(args)}")
 
-        kernel = BlockScaledMoEGroupedGemmGluHadamardKernel(
-            sf_vec_size=sf_vec_size,
-            acc_dtype=jax_to_cutlass_dtype(acc_dtype),
-            use_2cta_instrs=True,
-            mma_tiler_mn=mma_tiler_mn,
-            cluster_shape_mn=cluster_shape_mn,
-            vectorized_f32=vector_f32,
-            expert_cnt=expert_cnt,
-            weight_mode=MoEWeightMode.DENSE,
-            use_dynamic_sched=use_dynamic_sched,
-            act_func=act_func,
-            enable_bias=has_bias,
-            use_tmem_post_rht_amax=use_tmem_post_rht_amax,
-        )
-        max_active_clusters = resolve_max_active_clusters(
-            cutlass.utils.HardwareInfo().get_max_active_clusters(cluster_shape_mn[0] * cluster_shape_mn[1]),
-            cluster_overlap_margin,
-        )
-        kernel(
-            a,
-            b,
-            sfa,
-            sfb,
-            cutlass.Int32(0),
-            cutlass.Int32(0),
-            cutlass.Int64(0),
-            OperandMajorMode.K,
-            workspace.iterator,
-            c,
-            d,
-            amax,
-            post_rht_amax,
-            padded_offsets,
-            alpha,
-            prob,
-            hadamard,
-            bias,
-            max_active_clusters,
-            stream,
-            linear_offset=cutlass.Float32(1.0 if act_func == "geglu" else 0.0),
-        )
-
-    return launch
+    kernel = BlockScaledMoEGroupedGemmGluHadamardKernel(
+        sf_vec_size=sf_vec_size,
+        acc_dtype=jax_to_cutlass_dtype(acc_dtype),
+        use_2cta_instrs=True,
+        mma_tiler_mn=mma_tiler_mn,
+        cluster_shape_mn=cluster_shape_mn,
+        vectorized_f32=vector_f32,
+        expert_cnt=expert_cnt,
+        weight_mode=MoEWeightMode.DENSE,
+        use_dynamic_sched=use_dynamic_sched,
+        act_func=act_func,
+        enable_bias=has_bias,
+        use_tmem_post_rht_amax=use_tmem_post_rht_amax,
+    )
+    max_active_clusters = resolve_max_active_clusters(
+        cutlass.utils.HardwareInfo().get_max_active_clusters(cluster_shape_mn[0] * cluster_shape_mn[1]),
+        cluster_overlap_margin,
+    )
+    kernel(
+        a,
+        b,
+        sfa,
+        sfb,
+        cutlass.Int32(0),
+        cutlass.Int32(0),
+        cutlass.Int64(0),
+        OperandMajorMode.K,
+        workspace.iterator,
+        c,
+        d,
+        amax,
+        post_rht_amax,
+        padded_offsets,
+        alpha,
+        prob,
+        hadamard,
+        bias,
+        max_active_clusters,
+        stream,
+        linear_offset=cutlass.Float32(1.0 if act_func == "geglu" else 0.0),
+    )
 
 
 def _grouped_gemm_glu_hadamard_impl(
@@ -177,7 +169,7 @@ def _grouped_gemm_glu_hadamard_impl(
     *,
     b_major: str = "k",
     _validate_only: bool = False,
-) -> GroupedGemmGluHadamardResult | dict[str, Any]:
+) -> TupleDict | dict[str, Any]:
     """Compute dense native-FP4 grouped GEMM with GLU and Hadamard amax.
 
     A and B use JAX's native ``float4_e2m1fn`` dtype with logical shapes
@@ -334,21 +326,22 @@ def _grouped_gemm_glu_hadamard_impl(
 
     workspace_bytes = max(kernel.get_dense_workspace_bytes(bool(use_dynamic_sched)), 1)
     c_tensor, d_tensor, amax_tensor, post_rht_amax_tensor = call_cutedsl(
-        _make_launcher(
-            acc_dtype=acc_dtype,
-            mma_tiler_mn=mma_tiler_mn,
-            cluster_shape_mn=cluster_shape_mn,
-            sf_vec_size=sf_vec_size,
-            vector_f32=bool(vector_f32),
-            expert_cnt=experts,
-            act_func=act_func,
-            has_bias=bias_tensor is not None,
-            has_hadamard=has_hadamard,
-            use_dynamic_sched=bool(use_dynamic_sched),
-            use_tmem_post_rht_amax=bool(use_tmem_post_rht_amax),
-            cluster_overlap_margin=int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0")),
-        ),
+        _launch,
         inputs,
+        static_args={
+            "acc_dtype": acc_dtype,
+            "mma_tiler_mn": mma_tiler_mn,
+            "cluster_shape_mn": cluster_shape_mn,
+            "sf_vec_size": sf_vec_size,
+            "vector_f32": bool(vector_f32),
+            "expert_cnt": experts,
+            "act_func": act_func,
+            "has_bias": bias_tensor is not None,
+            "has_hadamard": has_hadamard,
+            "use_dynamic_sched": bool(use_dynamic_sched),
+            "use_tmem_post_rht_amax": bool(use_tmem_post_rht_amax),
+            "cluster_overlap_margin": int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0")),
+        },
         outputs=(
             BufferSpec("c_tensor", (m, n, 1), c_dtype, tensor_spec=output_spec, fill_value=0),
             BufferSpec(
@@ -373,7 +366,7 @@ def _grouped_gemm_glu_hadamard_impl(
         input_specs=input_specs,
         use_static_tensors=True,
     )
-    return GroupedGemmGluHadamardResult(
+    return TupleDict(
         c_tensor=c_tensor,
         d_tensor=d_tensor,
         amax_tensor=amax_tensor,
@@ -469,7 +462,7 @@ class GroupedGemmGluHadamardSm100(ApiBaseJax):
         prob_tensor: Any,
         bias_tensor: Optional[Any] = None,
         hadamard_tensor: Optional[Any] = None,
-    ) -> GroupedGemmGluHadamardResult:
+    ) -> TupleDict:
         return super().__call__(
             a_tensor,
             b_tensor,
@@ -493,7 +486,7 @@ class GroupedGemmGluHadamardSm100(ApiBaseJax):
         prob_tensor: Any,
         bias_tensor: Optional[Any] = None,
         hadamard_tensor: Optional[Any] = None,
-    ) -> GroupedGemmGluHadamardResult:
+    ) -> TupleDict:
         values = {
             "a_tensor": a_tensor,
             "b_tensor": b_tensor,
@@ -533,7 +526,7 @@ def grouped_gemm_glu_hadamard_wrapper_sm100(
     use_tmem_post_rht_amax: bool = False,
     *,
     b_major: str = "k",
-) -> GroupedGemmGluHadamardResult:
+) -> TupleDict:
     """Compute dense native-FP4 grouped GEMM with GLU and Hadamard amax."""
 
     op = GroupedGemmGluHadamardSm100(
@@ -574,7 +567,6 @@ def grouped_gemm_glu_hadamard_wrapper_sm100(
 
 
 __all__ = [
-    "GroupedGemmGluHadamardResult",
     "GroupedGemmGluHadamardSm100",
     "grouped_gemm_glu_hadamard_wrapper_sm100",
 ]

@@ -127,9 +127,8 @@ def run(x, weight):
 output, amax = run(x, weight)
 ```
 
-The JAX function returns
-`RmsNormRhtAmaxResult(output=..., amax=...)`, a standard named tuple and JAX
-pytree.
+The JAX function returns `TupleDict(output=..., amax=...)`, registered as a
+JAX pytree with the same key and unpacking behavior as the PyTorch result.
 
 The JAX class API mirrors the sample-signature style without retaining sample
 arrays:
@@ -250,8 +249,7 @@ The PyTorch functional API returns a `TupleDict` with keys:
 - `output`
 - `amax`
 
-The JAX functional API returns an `RmsNormRhtAmaxResult` named tuple with
-fields `output` and `amax`.
+The JAX functional API returns a `TupleDict` with keys `output` and `amax`.
 
 The legacy wrapper returns a `TupleDict` with keys:
 - `o_tensor`

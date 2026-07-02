@@ -42,6 +42,7 @@ def test_jax_dense_gemm_abstract_shapes():
     jax, jnp = _jax_dependencies()
 
     from cudnn.jax import (
+        TupleDict,
         gemm_amax_wrapper_sm100,
         gemm_dsrelu_wrapper_sm100,
         gemm_srelu_wrapper_sm100,
@@ -51,12 +52,14 @@ def test_jax_dense_gemm_abstract_shapes():
     a_bf16 = jax.ShapeDtypeStruct((128, 128, 1), jnp.bfloat16)
     b_bf16 = jax.ShapeDtypeStruct((128, 128, 1), jnp.bfloat16)
     swiglu = jax.eval_shape(gemm_swiglu_wrapper_sm100, a_bf16, b_bf16)
-    assert swiglu.ab12_tensor.shape == (128, 128, 1)
-    assert swiglu.ab12_tensor.dtype == jnp.float32
-    assert swiglu.c_tensor.shape == (128, 64, 1)
-    assert swiglu.c_tensor.dtype == jnp.float16
-    assert swiglu.sfc_tensor is None
-    assert swiglu.amax_tensor is None
+    assert isinstance(swiglu, TupleDict)
+    assert tuple(swiglu.keys()) == ("ab12_tensor", "c_tensor", "sfc_tensor", "amax_tensor")
+    assert swiglu["ab12_tensor"].shape == (128, 128, 1)
+    assert swiglu["ab12_tensor"].dtype == jnp.float32
+    assert swiglu["c_tensor"].shape == (128, 64, 1)
+    assert swiglu["c_tensor"].dtype == jnp.float16
+    assert swiglu["sfc_tensor"] is None
+    assert swiglu["amax_tensor"] is None
 
     a_fp8 = jax.ShapeDtypeStruct((256, 512, 2), jnp.float8_e4m3fn)
     b_fp8 = jax.ShapeDtypeStruct((256, 512, 2), jnp.float8_e4m3fn)
@@ -71,10 +74,10 @@ def test_jax_dense_gemm_abstract_shapes():
         scales,
         scales,
     )
-    assert amax.c_tensor.shape == (256, 256, 2)
-    assert amax.c_tensor.dtype == jnp.float32
-    assert amax.amax_tensor.shape == (1, 1, 1)
-    assert amax.amax_tensor.dtype == jnp.float32
+    assert amax["c_tensor"].shape == (256, 256, 2)
+    assert amax["c_tensor"].dtype == jnp.float32
+    assert amax["amax_tensor"].shape == (1, 1, 1)
+    assert amax["amax_tensor"].dtype == jnp.float32
 
     srelu = jax.eval_shape(
         gemm_srelu_wrapper_sm100,
@@ -84,12 +87,12 @@ def test_jax_dense_gemm_abstract_shapes():
         scales,
         prob,
     )
-    assert srelu.c_tensor.shape == (256, 256, 2)
-    assert srelu.d_tensor.shape == (256, 256, 2)
-    assert srelu.c_tensor.dtype == jnp.bfloat16
-    assert srelu.d_tensor.dtype == jnp.bfloat16
-    assert srelu.amax_tensor is None
-    assert srelu.sfd_tensor is None
+    assert srelu["c_tensor"].shape == (256, 256, 2)
+    assert srelu["d_tensor"].shape == (256, 256, 2)
+    assert srelu["c_tensor"].dtype == jnp.bfloat16
+    assert srelu["d_tensor"].dtype == jnp.bfloat16
+    assert srelu["amax_tensor"] is None
+    assert srelu["sfd_tensor"] is None
 
     dsrelu = jax.eval_shape(
         gemm_dsrelu_wrapper_sm100,
@@ -100,12 +103,12 @@ def test_jax_dense_gemm_abstract_shapes():
         scales,
         prob,
     )
-    assert dsrelu.d_tensor.shape == (256, 256, 2)
-    assert dsrelu.d_tensor.dtype == jnp.bfloat16
-    assert dsrelu.dprob_tensor.shape == (256, 1, 2)
-    assert dsrelu.dprob_tensor.dtype == jnp.float32
-    assert dsrelu.amax_tensor is None
-    assert dsrelu.sfd_tensor is None
+    assert dsrelu["d_tensor"].shape == (256, 256, 2)
+    assert dsrelu["d_tensor"].dtype == jnp.bfloat16
+    assert dsrelu["dprob_tensor"].shape == (256, 1, 2)
+    assert dsrelu["dprob_tensor"].dtype == jnp.float32
+    assert dsrelu["amax_tensor"] is None
+    assert dsrelu["sfd_tensor"] is None
 
 
 @pytest.mark.L0
@@ -157,11 +160,11 @@ def test_jax_gemm_swiglu_jit():
 
     for a_value in (a, -a):
         result = compiled(a_value, b)
-        result.c_tensor.block_until_ready()
+        result["c_tensor"].block_until_ready()
         expected_ab12, expected_c = reference(a_value, b)
-        assert jnp.allclose(result.ab12_tensor, expected_ab12, atol=5e-2, rtol=2e-2)
+        assert jnp.allclose(result["ab12_tensor"], expected_ab12, atol=5e-2, rtol=2e-2)
         assert jnp.allclose(
-            result.c_tensor.astype(jnp.float32),
+            result["c_tensor"].astype(jnp.float32),
             expected_c,
             atol=8e-2,
             rtol=3e-2,
@@ -221,22 +224,22 @@ def test_jax_gemm_amax_jit_reinitializes_reduction():
     compiled = lowered.compile()
 
     result = compiled(a, b, sfa, sfb)
-    result.c_tensor.block_until_ready()
+    result["c_tensor"].block_until_ready()
     expected = jnp.einsum(
         "mkl,nkl->mnl",
         a.astype(jnp.float32) * jnp.repeat(sfa_canonical, 32, axis=1),
         b.astype(jnp.float32) * jnp.repeat(sfb_canonical, 32, axis=1),
     )
     expected_amax = jnp.max(jnp.abs(expected)).reshape(1, 1, 1)
-    assert jnp.allclose(result.c_tensor, expected, atol=2e-1, rtol=3e-2)
-    assert jnp.allclose(result.amax_tensor, expected_amax, atol=5e-1, rtol=3e-2)
+    assert jnp.allclose(result["c_tensor"], expected, atol=2e-1, rtol=3e-2)
+    assert jnp.allclose(result["amax_tensor"], expected_amax, atol=5e-1, rtol=3e-2)
 
     zero_result = compiled(a, jnp.zeros_like(b), sfa, sfb)
-    zero_result.amax_tensor.block_until_ready()
-    assert jnp.array_equal(zero_result.c_tensor, jnp.zeros_like(zero_result.c_tensor))
+    zero_result["amax_tensor"].block_until_ready()
+    assert jnp.array_equal(zero_result["c_tensor"], jnp.zeros_like(zero_result["c_tensor"]))
     assert jnp.array_equal(
-        zero_result.amax_tensor,
-        jnp.zeros_like(zero_result.amax_tensor),
+        zero_result["amax_tensor"],
+        jnp.zeros_like(zero_result["amax_tensor"]),
     )
 
 
@@ -335,16 +338,16 @@ def test_jax_gemm_squared_relu_forward_and_backward_jit():
     relu_x = jnp.maximum(x, 0.0)
 
     forward_result = forward_lowered.compile()(a, b, scales, scales, prob)
-    forward_result.d_tensor.block_until_ready()
+    forward_result["d_tensor"].block_until_ready()
     expected_forward = jnp.square(relu_x) * prob
     assert jnp.allclose(
-        forward_result.c_tensor.astype(jnp.float32),
+        forward_result["c_tensor"].astype(jnp.float32),
         x,
         atol=2e-1,
         rtol=3e-2,
     )
     assert jnp.allclose(
-        forward_result.d_tensor.astype(jnp.float32),
+        forward_result["d_tensor"].astype(jnp.float32),
         expected_forward,
         atol=4e-1,
         rtol=5e-2,
@@ -359,18 +362,18 @@ def test_jax_gemm_squared_relu_forward_and_backward_jit():
         scales,
         prob,
     )
-    backward_result.dprob_tensor.block_until_ready()
+    backward_result["dprob_tensor"].block_until_ready()
     c_f32 = c_input.astype(jnp.float32)
     expected_d = c_f32 * prob * 2 * relu_x
     expected_dprob = jnp.sum(c_f32 * jnp.square(relu_x), axis=1, keepdims=True)
     assert jnp.allclose(
-        backward_result.d_tensor.astype(jnp.float32),
+        backward_result["d_tensor"].astype(jnp.float32),
         expected_d,
         atol=4e-1,
         rtol=5e-2,
     )
     assert jnp.allclose(
-        backward_result.dprob_tensor,
+        backward_result["dprob_tensor"],
         expected_dprob,
         atol=2.0,
         rtol=5e-2,
@@ -384,8 +387,8 @@ def test_jax_gemm_squared_relu_forward_and_backward_jit():
         scales,
         prob,
     )
-    zero_result.dprob_tensor.block_until_ready()
+    zero_result["dprob_tensor"].block_until_ready()
     assert jnp.array_equal(
-        zero_result.dprob_tensor,
-        jnp.zeros_like(zero_result.dprob_tensor),
+        zero_result["dprob_tensor"],
+        jnp.zeros_like(zero_result["dprob_tensor"]),
     )

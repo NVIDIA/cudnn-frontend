@@ -248,8 +248,7 @@ Returns a `TupleDict` with keys:
 
 Tuple unpacking order is: `(c_tensor, amax_tensor)`.
 
-The JAX API returns `GemmAmaxResult`, a named tuple with the same field names
-and unpacking order.
+The JAX API returns the same `TupleDict` keys and unpacking order.
 
 ### Class-specific parameters: `GemmAmaxSm100`
 

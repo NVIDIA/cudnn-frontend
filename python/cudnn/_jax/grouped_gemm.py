@@ -12,8 +12,8 @@ import jax.numpy as jnp
 from cutlass.jax import TensorSpec
 
 from ..gemm_validation import block_scale_shape, require_shape
+from .api_base import require_dtype
 from .gemm import require_array
-from .validation import require_dtype
 
 
 def require_grouped_gemm_inputs(

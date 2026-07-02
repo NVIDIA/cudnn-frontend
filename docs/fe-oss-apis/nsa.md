@@ -196,11 +196,11 @@ def selection(q, k, v, block_indices, block_counts, cum_q, cum_k):
     )
 
 result = selection(q, k, v, block_indices, block_counts, cum_seqlen_q, cum_seqlen_k)
-o, l, m = result.o_tensor, result.l_tensor, result.m_tensor
+o, l, m = result["o_tensor"], result["l_tensor"], result["m_tensor"]
 ```
 
 The JAX wrapper returns
-`SelectionAttentionResult(o_tensor=..., l_tensor=..., m_tensor=...)`. It
+`TupleDict(o_tensor=..., l_tensor=..., m_tensor=...)`. It
 supports packed, compact THD self-attention on SM90: FP16/BF16 Q, K, and V,
 runtime cumulative lengths and block metadata, equal Q/KV token counts, and
 identical Q/K runtime cumulative-length values. `max_s_q` and `max_s_k` are
@@ -357,11 +357,11 @@ def compression(q, k, v):
     )
 
 result = compression(q, k, v)
-o, lse = result.o_tensor, result.lse_tensor
+o, lse = result["o_tensor"], result["lse_tensor"]
 ```
 
 The JAX wrapper returns
-`CompressionAttentionResult(o_tensor=..., lse_tensor=...)`, where
+`TupleDict(o_tensor=..., lse_tensor=...)`, where
 `lse_tensor` is `None` when `enable_lse=False`. It supports fixed BHSD inputs
 on SM100 with matching FP16/BF16 Q, K, and V, `D` in `{32, 64, 128}`, and
 `S_q` an integer multiple of `S_k`. THD inputs and cumulative-length operands
@@ -652,12 +652,12 @@ def reduce_topk(q, k, lse):
     )
 
 result = reduce_topk(q, k, lse)
-topk_scores = result.topk_scores_tensor
-topk_indices = result.topk_indices_tensor
+topk_scores = result["topk_scores_tensor"]
+topk_indices = result["topk_indices_tensor"]
 ```
 
 The JAX wrapper returns
-`TopKReductionResult(topk_scores_tensor=..., topk_indices_tensor=...)` with
+`TupleDict(topk_scores_tensor=..., topk_indices_tensor=...)` with
 shape `(B,H_kv,S_q,k_value)`, FP32 scores, and INT32 indices. It supports
 fixed FP16/BF16 BHSD inputs on SM100; THD inputs, cumulative lengths, and
 `max_s_*` controls remain PyTorch-only. Q/K/LSE are runtime operands. Shapes,

@@ -5,25 +5,22 @@
 
 from __future__ import annotations
 
-from functools import lru_cache
-from typing import Any, NamedTuple, Optional
+from typing import Any, Optional
 
 import jax.numpy as jnp
 from cutlass.jax import TensorSpec
 
-from ..._jax.api_base import ApiBaseJax, BufferSpec, call_cutedsl
+from ..._jax.api_base import ApiBaseJax, BufferSpec, TupleDict, call_cutedsl
 
 _TMA_ALIGN_ELEMENTS = 4
 
 
-class IndexerForwardResult(NamedTuple):
-    """Dense indexer scores produced by :func:`indexer_forward_wrapper`."""
-
-    scores: Any
-
-
-@lru_cache(maxsize=None)
-def _make_launcher(
+def _launch(
+    stream,
+    q,
+    k,
+    w,
+    scores,
     *,
     head_dim: int,
     qhead_per_kv_head: int,
@@ -53,23 +50,20 @@ def _make_launcher(
         kv_stage=kv_stage,
     )
 
-    def launch(stream, q, k, w, scores):
-        kernel(
-            q,
-            k,
-            w,
-            scores,
-            Int32(num_kv_heads),
-            Int32(max_seqlen_q),
-            Int32(max_seqlen_k),
-            Float32(sm_scale),
-            None,
-            None,
-            None,
-            stream,
-        )
-
-    return launch
+    kernel(
+        q,
+        k,
+        w,
+        scores,
+        Int32(num_kv_heads),
+        Int32(max_seqlen_q),
+        Int32(max_seqlen_k),
+        Float32(sm_scale),
+        None,
+        None,
+        None,
+        stream,
+    )
 
 
 def _require_supported_config(
@@ -103,7 +97,7 @@ def _indexer_forward_impl(
     kv_stage: int = 4,
     sm_scale: float = 1.0,
     _validate_only: bool = False,
-) -> IndexerForwardResult:
+) -> TupleDict:
     """Compute fixed-shape BSHD indexer scores with the SM100 CuTe kernel.
 
     ``q`` and ``k`` must have shapes ``(B, S_q, H_q, 128)`` and
@@ -192,19 +186,7 @@ def _indexer_forward_impl(
     )
 
     (scores_padded,) = call_cutedsl(
-        _make_launcher(
-            head_dim=head_dim,
-            qhead_per_kv_head=qhead_per_kv_head,
-            ratio=ratio,
-            m_block_size=m_block_size,
-            n_block_size=n_block_size,
-            q_stage=q_stage,
-            kv_stage=kv_stage,
-            num_kv_heads=num_kv_heads,
-            max_seqlen_q=seqlen_q,
-            max_seqlen_k=seqlen_k,
-            sm_scale=sm_scale,
-        ),
+        _launch,
         (q, k, w),
         outputs=(
             BufferSpec(
@@ -215,9 +197,22 @@ def _indexer_forward_impl(
                 fill_value=float("-inf"),
             ),
         ),
+        static_args={
+            "head_dim": int(head_dim),
+            "qhead_per_kv_head": int(qhead_per_kv_head),
+            "ratio": int(ratio),
+            "m_block_size": int(m_block_size),
+            "n_block_size": int(n_block_size),
+            "q_stage": int(q_stage),
+            "kv_stage": int(kv_stage),
+            "num_kv_heads": int(num_kv_heads),
+            "max_seqlen_q": int(seqlen_q),
+            "max_seqlen_k": int(seqlen_k),
+            "sm_scale": float(sm_scale),
+        },
         use_static_tensors=True,
     )
-    return IndexerForwardResult(scores=scores_padded[..., :seqlen_k])
+    return TupleDict(scores=scores_padded[..., :seqlen_k])
 
 
 class IndexerForward(ApiBaseJax):
@@ -265,10 +260,10 @@ class IndexerForward(ApiBaseJax):
         )
         return True
 
-    def __call__(self, q: Any, k: Any, w: Any) -> IndexerForwardResult:
+    def __call__(self, q: Any, k: Any, w: Any) -> TupleDict:
         return super().__call__(q, k, w)
 
-    def _call_impl(self, q: Any, k: Any, w: Any) -> IndexerForwardResult:
+    def _call_impl(self, q: Any, k: Any, w: Any) -> TupleDict:
         self.check_tensor_signature(q, self.q_desc, name="Q")
         self.check_tensor_signature(k, self.k_desc, name="K")
         self.check_tensor_signature(w, self.w_desc, name="W")
@@ -298,7 +293,7 @@ def indexer_forward_wrapper(
     q_stage: int = 2,
     kv_stage: int = 4,
     sm_scale: float = 1.0,
-) -> IndexerForwardResult:
+) -> TupleDict:
     """Compute fixed-shape BSHD indexer scores with the SM100 CuTe kernel."""
 
     return IndexerForward(
@@ -315,4 +310,4 @@ def indexer_forward_wrapper(
     )(q, k, w)
 
 
-__all__ = ["IndexerForward", "IndexerForwardResult", "indexer_forward_wrapper"]
+__all__ = ["IndexerForward", "indexer_forward_wrapper"]

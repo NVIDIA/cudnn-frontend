@@ -17,14 +17,74 @@ import jax
 import jax.numpy as jnp
 from cutlass.jax import TensorSpec
 
-from ..api_base import ApiBase, TensorDesc
-from .validation import (
-    as_dtype as _as_dtype,
-    as_optional_dtype as _as_optional_dtype,
-    require_dtype as _require_dtype,
-)
+from ..api_base import ApiBase, TensorDesc, TupleDict
 
 _NO_DEFAULT = object()
+
+
+def as_dtype(value: Any) -> Any:
+    """Return a JAX dtype without retaining a dtype-bearing value."""
+
+    # Scalar dtype classes such as numpy.float32 expose an instance-level
+    # dtype descriptor, so only unwrap dtype-bearing values, not classes.
+    if not isinstance(value, type) and hasattr(value, "dtype"):
+        value = value.dtype
+    return jnp.dtype(value)
+
+
+def as_optional_dtype(value: Any | None) -> Any | None:
+    """Return ``None`` or a JAX dtype without retaining the source value."""
+
+    return None if value is None else as_dtype(value)
+
+
+def require_dtype(
+    name: str,
+    value: Any,
+    valid_dtypes: Iterable[Any],
+    *,
+    default: Any = _NO_DEFAULT,
+) -> Any:
+    """Return a supported dtype from a dtype-like value or object with ``dtype``."""
+
+    if value is None:
+        if default is _NO_DEFAULT:
+            raise ValueError(f"{name} must not be None")
+        value = default
+
+    dtype = as_dtype(value)
+    valid_dtypes = tuple(as_dtype(item) for item in valid_dtypes)
+    if dtype not in valid_dtypes:
+        supported = ", ".join(item.name for item in valid_dtypes)
+        raise ValueError(f"{name} must be one of {{{supported}}}, got {dtype}")
+    return dtype
+
+
+def _flatten_tuple_dict(value: TupleDict) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
+    """Flatten the current mapping values in insertion order."""
+
+    keys = tuple(dict.keys(value))
+    children = tuple(dict.__getitem__(value, key) for key in keys)
+    return children, keys
+
+
+def _flatten_tuple_dict_with_keys(value: TupleDict):
+    children, keys = _flatten_tuple_dict(value)
+    return tuple((jax.tree_util.DictKey(key), child) for key, child in zip(keys, children)), keys
+
+
+def _unflatten_tuple_dict(keys: tuple[Any, ...], children: Iterable[Any]) -> TupleDict:
+    return TupleDict(zip(keys, children))
+
+
+if not getattr(TupleDict, "_jax_pytree_registered", False):
+    jax.tree_util.register_pytree_with_keys(
+        TupleDict,
+        _flatten_tuple_dict_with_keys,
+        _unflatten_tuple_dict,
+        _flatten_tuple_dict,
+    )
+    TupleDict._jax_pytree_registered = True
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -180,12 +240,12 @@ class ApiBaseJax(ApiBase, ABC):
     def as_dtype(self, value: Any) -> Any:
         """Return a JAX dtype without retaining a dtype-bearing value."""
 
-        return _as_dtype(value)
+        return as_dtype(value)
 
     def as_optional_dtype(self, value: Any | None) -> Any | None:
         """Return ``None`` or a JAX dtype without retaining the source value."""
 
-        return _as_optional_dtype(value)
+        return as_optional_dtype(value)
 
     def require_dtype(
         self,
@@ -197,9 +257,7 @@ class ApiBaseJax(ApiBase, ABC):
     ) -> Any:
         """Return a supported dtype from a dtype-like value or descriptor."""
 
-        if default is _NO_DEFAULT:
-            return _require_dtype(name, value, valid_dtypes)
-        return _require_dtype(name, value, valid_dtypes, default=default)
+        return require_dtype(name, value, valid_dtypes, default=default)
 
     def make_optional_tensor_desc(
         self,
@@ -467,4 +525,13 @@ def call_cutedsl(
     return tuple(all_results[: plan.num_public_results])
 
 
-__all__ = ["ApiBaseJax", "BufferSpec", "JaxTensorDesc", "call_cutedsl"]
+__all__ = [
+    "ApiBaseJax",
+    "BufferSpec",
+    "JaxTensorDesc",
+    "TupleDict",
+    "as_dtype",
+    "as_optional_dtype",
+    "call_cutedsl",
+    "require_dtype",
+]

@@ -84,6 +84,10 @@ class JaxNsaContractTest(unittest.TestCase):
         cls.fake_jax.__path__ = []
         cls.fake_jax.__spec__ = ModuleSpec("jax", loader=None, is_package=True)
         cls.fake_jax.numpy = cls.fake_jnp
+        cls.fake_jax.tree_util = types.SimpleNamespace(
+            DictKey=lambda key: key,
+            register_pytree_with_keys=lambda *_args: None,
+        )
 
         cls.fake_cutlass = types.ModuleType("cutlass")
         cls.fake_cutlass.__path__ = []
@@ -180,14 +184,8 @@ class JaxNsaContractTest(unittest.TestCase):
         block_counts = _Array((16, 1), self.int32)
         cum_q = _Array((3,), self.int32)
         cum_k = _Array((3,), self.int32)
-        launcher = object()
         with (
             self._optional_modules(),
-            mock.patch.object(
-                self.selection,
-                "_make_launcher",
-                return_value=launcher,
-            ) as make_launcher,
             mock.patch.object(
                 self.selection,
                 "call_cutedsl",
@@ -206,10 +204,10 @@ class JaxNsaContractTest(unittest.TestCase):
                 max_s_k=8,
             )
 
-        self.assertEqual((result.o_tensor.shape, result.o_tensor.dtype), ((16, 4, 64), self.float16))
-        self.assertEqual((result.l_tensor.shape, result.l_tensor.dtype), ((16, 4, 1), self.float32))
-        self.assertEqual((result.m_tensor.shape, result.m_tensor.dtype), ((16, 4, 1), self.float32))
-        self.assertIs(captured["launcher"], launcher)
+        self.assertEqual((result["o_tensor"].shape, result["o_tensor"].dtype), ((16, 4, 64), self.float16))
+        self.assertEqual((result["l_tensor"].shape, result["l_tensor"].dtype), ((16, 4, 1), self.float32))
+        self.assertEqual((result["m_tensor"].shape, result["m_tensor"].dtype), ((16, 4, 1), self.float32))
+        self.assertIs(captured["launcher"], self.selection._launch)
         self.assertEqual(tuple(value.shape for value in captured["inputs"][:3]), ((1, 16, 4, 128), (1, 16, 1, 128), (1, 16, 1, 64)))
         self.assertEqual(captured["inputs"][3:], (block_indices, block_counts, cum_q, cum_k))
         self.assertTrue(captured["use_static_tensors"])
@@ -222,7 +220,7 @@ class JaxNsaContractTest(unittest.TestCase):
         self.assertEqual(row_max.shape, (1, 16, 4))
         self.assertEqual(row_max.fill_value, float("-inf"))
 
-        config = make_launcher.call_args.kwargs
+        config = captured["static_args"]
         self.assertEqual(config["element_dtype"], "cutlass.float16")
         self.assertEqual(config["gqa_group_size"], 4)
         self.assertEqual(config["max_s_q"], 8)
@@ -251,17 +249,7 @@ class JaxNsaContractTest(unittest.TestCase):
             mock.patch.dict(sys.modules, {kernel_name: kernel_module}),
             mock.patch.object(self.fake_cutlass, "Float32", float32, create=True),
         ):
-            self.selection._make_launcher.cache_clear()
-            launcher = self.selection._make_launcher(
-                element_dtype="float16",
-                head_dim=128,
-                value_dim=64,
-                gqa_group_size=4,
-                block_size=64,
-                max_s_q=8,
-                scale_softmax=0.125,
-            )
-            launcher(
+            self.selection._launch(
                 "stream",
                 "q",
                 "k",
@@ -273,8 +261,14 @@ class JaxNsaContractTest(unittest.TestCase):
                 "out",
                 "l",
                 "m",
+                element_dtype="float16",
+                head_dim=128,
+                value_dim=64,
+                gqa_group_size=4,
+                block_size=64,
+                max_s_q=8,
+                scale_softmax=0.125,
             )
-            self.selection._make_launcher.cache_clear()
 
         self.assertEqual(kernel_options[0]["head_dim"], 128)
         self.assertEqual(kernel_options[0]["GQA_group_size"], 4)
@@ -306,7 +300,7 @@ class JaxNsaContractTest(unittest.TestCase):
         with (
             self._optional_modules(),
             self.assertRaisesRegex(ValueError, "must be identical"),
-            mock.patch.object(self.selection, "_make_launcher") as make_launcher,
+            mock.patch.object(self.selection, "call_cutedsl") as call_cutedsl,
         ):
             self.selection.selection_attention_wrapper(
                 q,
@@ -319,7 +313,7 @@ class JaxNsaContractTest(unittest.TestCase):
                 max_s_q=8,
                 max_s_k=16,
             )
-        make_launcher.assert_not_called()
+        call_cutedsl.assert_not_called()
 
     def test_compression_attention_declares_layouts_and_optional_lse(self):
         captured = {}
@@ -331,14 +325,8 @@ class JaxNsaContractTest(unittest.TestCase):
         q = _Array((2, 4, 16, 64), self.float16)
         k = _Array((2, 2, 8, 64), self.float16)
         v = _Array((2, 2, 8, 64), self.float16)
-        launcher = object()
         with (
             self._optional_modules(),
-            mock.patch.object(
-                self.compression,
-                "_make_launcher",
-                return_value=launcher,
-            ) as make_launcher,
             mock.patch.object(
                 self.compression,
                 "call_cutedsl",
@@ -357,9 +345,9 @@ class JaxNsaContractTest(unittest.TestCase):
                 inv_scale_o=0.25,
             )
 
-        self.assertEqual((result.o_tensor.shape, result.o_tensor.dtype), ((2, 4, 16, 64), self.bfloat16))
-        self.assertEqual((result.lse_tensor.shape, result.lse_tensor.dtype), ((2, 4, 16), self.float32))
-        self.assertIs(captured["launcher"], launcher)
+        self.assertEqual((result["o_tensor"].shape, result["o_tensor"].dtype), ((2, 4, 16, 64), self.bfloat16))
+        self.assertEqual((result["lse_tensor"].shape, result["lse_tensor"].dtype), ((2, 4, 16), self.float32))
+        self.assertIs(captured["launcher"], self.compression._launch)
         self.assertEqual(captured["inputs"], (q, k, v))
         self.assertTrue(captured["use_static_tensors"])
         self.assertEqual(len(captured["input_specs"]), 3)
@@ -376,7 +364,7 @@ class JaxNsaContractTest(unittest.TestCase):
         self.assertEqual(lse.tensor_spec.layout, (2, 1, 0))
         self.assertEqual(lse.tensor_spec.mode, (0, 2, 1))
 
-        config = make_launcher.call_args.kwargs
+        config = captured["static_args"]
         self.assertTrue(config["enable_lse"])
         self.assertEqual(config["scale_softmax"], 0.125)
         self.assertEqual(config["scale_output"], 0.75)
@@ -416,8 +404,13 @@ class JaxNsaContractTest(unittest.TestCase):
             mock.patch.object(self.fake_cutlass, "Float32", float32, create=True),
             mock.patch.object(self.fake_cutlass, "Int32", int32, create=True),
         ):
-            self.compression._make_launcher.cache_clear()
-            launcher = self.compression._make_launcher(
+            self.compression._launch(
+                "stream",
+                "q",
+                "k",
+                "v",
+                "out",
+                "lse",
                 batch=2,
                 seqlen_q=16,
                 seqlen_k=8,
@@ -429,8 +422,23 @@ class JaxNsaContractTest(unittest.TestCase):
                 scale_softmax=0.125,
                 scale_output=0.75,
             )
-            launcher("stream", "q", "k", "v", "out", "lse")
-            self.compression._make_launcher.cache_clear()
+            self.compression._launch(
+                "stream",
+                "q",
+                "k",
+                "v",
+                "out",
+                batch=2,
+                seqlen_q=16,
+                seqlen_k=8,
+                num_query_heads=4,
+                num_kv_heads=2,
+                head_dim=64,
+                enable_lse=False,
+                is_persistent=False,
+                scale_softmax=0.125,
+                scale_output=0.75,
+            )
 
         self.assertEqual(kernel_options[0]["qk_acc_dtype"], float32)
         self.assertEqual(kernel_options[0]["mask_type"], "compressed")
@@ -440,6 +448,7 @@ class JaxNsaContractTest(unittest.TestCase):
         self.assertEqual(args[4][1:4], (("Int32", 16), ("Int32", 16), ("Int32", 8)))
         self.assertEqual(args[7], "lse")
         self.assertEqual(args[-3:], (None, ("Int32", 0), "stream"))
+        self.assertIsNone(calls[1][7])
 
     def test_topk_reduction_declares_initialized_outputs(self):
         captured = {}
@@ -451,21 +460,16 @@ class JaxNsaContractTest(unittest.TestCase):
         q = _Array((2, 4, 16, 64), self.bfloat16)
         k = _Array((2, 2, 8, 64), self.bfloat16)
         lse = _Array((2, 4, 16), self.float32)
-        launcher = object()
         with (
             self._optional_modules(),
-            mock.patch.object(
-                self.topk,
-                "_make_launcher",
-                return_value=launcher,
-            ) as make_launcher,
             mock.patch.object(self.topk, "call_cutedsl", side_effect=fake_call),
         ):
             result = self.topk.topk_reduction_wrapper(q, k, lse)
 
-        self.assertEqual((result.topk_scores_tensor.shape, result.topk_scores_tensor.dtype), ((2, 2, 16, 16), self.float32))
-        self.assertEqual((result.topk_indices_tensor.shape, result.topk_indices_tensor.dtype), ((2, 2, 16, 16), self.int32))
+        self.assertEqual((result["topk_scores_tensor"].shape, result["topk_scores_tensor"].dtype), ((2, 2, 16, 16), self.float32))
+        self.assertEqual((result["topk_indices_tensor"].shape, result["topk_indices_tensor"].dtype), ((2, 2, 16, 16), self.int32))
         self.assertEqual(captured["inputs"], (q, k, lse))
+        self.assertIs(captured["launcher"], self.topk._launch)
         self.assertTrue(captured["use_static_tensors"])
         scores, indices = captured["outputs"]
         self.assertEqual(scores.fill_value, float("-inf"))
@@ -474,7 +478,7 @@ class JaxNsaContractTest(unittest.TestCase):
             self.assertEqual(spec.layout, (3, 1, 2, 0))
             self.assertEqual(spec.mode, (0, 1, 2, 3))
         self.assertEqual(captured["input_specs"][2].layout, (2, 1, 0))
-        self.assertEqual(make_launcher.call_args.kwargs["element_dtype"], "cutlass.bfloat16")
+        self.assertEqual(captured["static_args"]["element_dtype"], "cutlass.bfloat16")
 
     def test_topk_launcher_preserves_native_argument_order(self):
         calls = []
@@ -502,8 +506,13 @@ class JaxNsaContractTest(unittest.TestCase):
             mock.patch.object(self.fake_cutlass, "Float32", float32, create=True),
             mock.patch.object(self.fake_cutlass, "Int32", int32, create=True),
         ):
-            self.topk._make_launcher.cache_clear()
-            launcher = self.topk._make_launcher(
+            self.topk._launch(
+                "stream",
+                "q",
+                "k",
+                "lse",
+                "scores",
+                "indices",
                 element_dtype="float16",
                 batch=2,
                 seqlen_q=16,
@@ -517,8 +526,6 @@ class JaxNsaContractTest(unittest.TestCase):
                 is_causal=True,
                 scale_softmax=0.125,
             )
-            launcher("stream", "q", "k", "lse", "scores", "indices")
-            self.topk._make_launcher.cache_clear()
 
         args = calls[0]
         self.assertEqual(args[1:6], ("q", "k", "lse", "scores", "indices"))
@@ -532,10 +539,10 @@ class JaxNsaContractTest(unittest.TestCase):
         with (
             self._optional_modules(),
             self.assertRaisesRegex(ValueError, "positive multiple of 4"),
-            mock.patch.object(self.topk, "_make_launcher") as make_launcher,
+            mock.patch.object(self.topk, "call_cutedsl") as call_cutedsl,
         ):
             self.topk.topk_reduction_wrapper(q, k, lse, k_value=7)
-        make_launcher.assert_not_called()
+        call_cutedsl.assert_not_called()
 
 
 if __name__ == "__main__":

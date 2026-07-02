@@ -115,6 +115,10 @@ class JaxDsaSparseAttentionBackwardContractTest(unittest.TestCase):
         cls.fake_jax.__path__ = []
         cls.fake_jax.__spec__ = ModuleSpec("jax", loader=None, is_package=True)
         cls.fake_jax.numpy = cls.fake_jnp
+        cls.fake_jax.tree_util = types.SimpleNamespace(
+            DictKey=lambda key: key,
+            register_pytree_with_keys=lambda *_args: None,
+        )
         cls.fake_jax.ShapeDtypeStruct = lambda shape, dtype: (shape, dtype)
 
         cls.fake_cutlass = types.ModuleType("cutlass")
@@ -203,7 +207,7 @@ class JaxDsaSparseAttentionBackwardContractTest(unittest.TestCase):
 
         with (
             self._optional_modules(include_kernel=True),
-            mock.patch.object(self.module, "_make_launcher", return_value=launcher),
+            mock.patch.object(self.module, "_launch_without_topk_length", new=launcher),
             mock.patch.object(
                 self.module,
                 "call_cutedsl",
@@ -220,9 +224,9 @@ class JaxDsaSparseAttentionBackwardContractTest(unittest.TestCase):
                 topk_idxs,
             )
 
-        self.assertEqual(result.dq.shape, q.shape)
-        self.assertEqual(result.dkv.shape, kv.shape)
-        self.assertEqual(result.d_sink.shape, attn_sink.shape)
+        self.assertEqual(result["dq"].shape, q.shape)
+        self.assertEqual(result["dkv"].shape, kv.shape)
+        self.assertEqual(result["d_sink"].shape, attn_sink.shape)
         self.assertEqual(
             captured["inputs"],
             (q, kv, out, dout, lse, attn_sink, topk_idxs),
@@ -246,6 +250,17 @@ class JaxDsaSparseAttentionBackwardContractTest(unittest.TestCase):
         )
         self.assertEqual(captured["outputs"][0].tensor_spec.divisibility, 512)
         self.assertEqual(len(captured["input_specs"]), 7)
+        self.assertEqual(
+            captured["static_args"],
+            {
+                "total_seqlen_q": 65,
+                "total_seqlen_kv": 130,
+                "num_heads": 64,
+                "head_dim": 512,
+                "block_tile": 64,
+                "softmax_scale": 1.0 / (512**0.5),
+            },
+        )
 
     def test_optional_topk_length_is_a_real_kernel_input(self):
         captured = {}
@@ -259,7 +274,7 @@ class JaxDsaSparseAttentionBackwardContractTest(unittest.TestCase):
 
         with (
             self._optional_modules(include_kernel=True),
-            mock.patch.object(self.module, "_make_launcher", return_value=launcher) as make_launcher,
+            mock.patch.object(self.module, "_launch_with_topk_length", new=launcher),
             mock.patch.object(
                 self.module,
                 "call_cutedsl",
@@ -273,32 +288,39 @@ class JaxDsaSparseAttentionBackwardContractTest(unittest.TestCase):
 
         self.assertIs(captured["inputs"][-1], inputs[-1])
         self.assertEqual(len(captured["input_specs"]), 8)
-        self.assertTrue(make_launcher.call_args.kwargs["has_topk_length"])
+        self.assertEqual(captured["static_args"]["softmax_scale"], 1.0 / (512**0.5))
 
-    def test_launcher_preserves_kernel_argument_order(self):
-        _Kernel.instances.clear()
-        placeholders = [object() for _ in range(14)]
-        with self._optional_modules(include_kernel=True):
-            launcher = self.module._make_launcher(
-                total_seqlen_q=64,
-                total_seqlen_kv=128,
-                num_heads=64,
-                head_dim=512,
-                block_tile=64,
-                softmax_scale=0.125,
-                has_topk_length=True,
-            )
-            launcher(*placeholders)
+    def test_launchers_preserve_kernel_argument_order(self):
+        for launcher_name, num_args, topk_length_idx, dq_idx, workspace_idx in (
+            ("_launch_with_topk_length", 14, 8, 9, 13),
+            ("_launch_without_topk_length", 13, None, 8, 12),
+        ):
+            with self.subTest(launcher=launcher_name):
+                _Kernel.instances.clear()
+                placeholders = [object() for _ in range(num_args)]
+                with self._optional_modules(include_kernel=True):
+                    getattr(self.module, launcher_name)(
+                        *placeholders,
+                        total_seqlen_q=64,
+                        total_seqlen_kv=128,
+                        num_heads=64,
+                        head_dim=512,
+                        block_tile=64,
+                        softmax_scale=0.125,
+                    )
 
-        kernel = _Kernel.instances[-1]
-        self.assertEqual(kernel.configuration, (512, 512, 64))
-        args = kernel.calls[-1]
-        self.assertEqual(args[0], (64, 128, 512, (64, 1)))
-        self.assertIs(args[8], placeholders[8])
-        self.assertIs(args[9], placeholders[9])
-        self.assertIs(args[13], placeholders[13])
-        self.assertEqual(args[14].value, 0.125)
-        self.assertIs(args[15], placeholders[0])
+                kernel = _Kernel.instances[-1]
+                self.assertEqual(kernel.configuration, (512, 512, 64))
+                args = kernel.calls[-1]
+                self.assertEqual(args[0], (64, 128, 512, (64, 1)))
+                if topk_length_idx is None:
+                    self.assertIsNone(args[8])
+                else:
+                    self.assertIs(args[8], placeholders[topk_length_idx])
+                self.assertIs(args[9], placeholders[dq_idx])
+                self.assertIs(args[13], placeholders[workspace_idx])
+                self.assertEqual(args[14].value, 0.125)
+                self.assertIs(args[15], placeholders[0])
 
     def test_rejects_non_bf16_or_non_multiple_of_64_heads(self):
         inputs = self._inputs(

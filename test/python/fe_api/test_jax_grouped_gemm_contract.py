@@ -140,6 +140,10 @@ class JaxGroupedGemmContractTest(unittest.TestCase):
         cls.fake_jax.__path__ = []
         cls.fake_jax.__spec__ = ModuleSpec("jax", loader=None, is_package=True)
         cls.fake_jax.numpy = cls.fake_jnp
+        cls.fake_jax.tree_util = types.SimpleNamespace(
+            DictKey=lambda key: key,
+            register_pytree_with_keys=lambda *_args: None,
+        )
 
         cls.fake_cutlass = types.ModuleType("cutlass")
         cls.fake_cutlass.__path__ = []
@@ -166,8 +170,14 @@ class JaxGroupedGemmContractTest(unittest.TestCase):
             del input_specs
             result_buffers = tuple(types.SimpleNamespace(name=spec.name) for spec in outputs)
             workspace_buffers = tuple(types.SimpleNamespace(name=spec.name, iterator=f"{spec.name}_ptr") for spec in kwargs.get("workspaces", ()))
-            fn("stream", *inputs, *result_buffers, *workspace_buffers)
-            cls.calls.append((tuple(outputs), kwargs))
+            fn(
+                "stream",
+                *inputs,
+                *result_buffers,
+                *workspace_buffers,
+                **kwargs.get("static_args", {}),
+            )
+            cls.calls.append((tuple(outputs), {**kwargs, "launcher": fn}))
             return result_buffers
 
         cls.fake_gemm = types.ModuleType(f"{_TEST_PACKAGE}._jax.gemm")
@@ -244,10 +254,6 @@ class JaxGroupedGemmContractTest(unittest.TestCase):
                     _CUDNN_ROOT / "grouped_gemm" / operation,
                 )
             cls._load_source(f"{_TEST_PACKAGE}.gemm_validation", _CUDNN_ROOT / "gemm_validation.py")
-            cls._load_source(
-                f"{_TEST_PACKAGE}._jax.validation",
-                _CUDNN_ROOT / "_jax" / "validation.py",
-            )
             jax_api_base = cls._load_source(
                 f"{_TEST_PACKAGE}._jax.api_base",
                 _CUDNN_ROOT / "_jax" / "api_base.py",
@@ -364,6 +370,9 @@ class JaxGroupedGemmContractTest(unittest.TestCase):
             (32, 4, 2, 4, 1, 1),
         )
         self.assertTrue(options["use_static_tensors"])
+        self.assertIs(options["launcher"], self.swiglu._launch)
+        self.assertEqual(options["static_args"]["expert_cnt"], 4)
+        self.assertTrue(options["static_args"]["has_prob"])
         self.assertEqual(_KernelSurface.calls[-1][0]["expert_cnt"], 4)
 
     def test_class_configuration_and_sample_descriptors_are_immutable(self):

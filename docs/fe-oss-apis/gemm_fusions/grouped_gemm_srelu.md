@@ -145,7 +145,7 @@ result = run(a, b, sfa, sfb, padded_offsets, alpha, prob, norm_const)
 c, d, d_col, amax, sfd_row, sfd_col = result
 ```
 
-The JAX API returns `GroupedGemmSreluResult`. It supports dense FP8 A/B with
+The JAX API returns `TupleDict`. It supports dense FP8 A/B with
 E8M0 scales and `sf_vec_size=32`; the FP8 D configuration above returns both
 quantized layouts and their scale factors, with `amax=None`. Discrete weight
 pointers and packed FP4 are not exposed. Shapes, dtypes, layouts, and

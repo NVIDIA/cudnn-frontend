@@ -5,14 +5,18 @@
 
 from __future__ import annotations
 
-from functools import lru_cache
 import math
-from typing import Any, NamedTuple
+from typing import Any
 
 import jax.numpy as jnp
 
-from ..._jax.api_base import ApiBaseJax, BufferSpec, call_cutedsl
-from ..._jax.validation import require_dtype
+from ..._jax.api_base import (
+    ApiBaseJax,
+    BufferSpec,
+    TupleDict,
+    call_cutedsl,
+    require_dtype,
+)
 from ..jax_utils import (
     bhs_lse_as_bsh_spec,
     bhsd_storage_spec,
@@ -20,15 +24,13 @@ from ..jax_utils import (
 )
 
 
-class CompressionAttentionResult(NamedTuple):
-    """Functional outputs from :func:`compression_attention_wrapper`."""
-
-    o_tensor: Any
-    lse_tensor: Any | None
-
-
-@lru_cache(maxsize=None)
-def _make_launcher(
+def _launch(
+    stream,
+    q,
+    k,
+    v,
+    output,
+    lse=None,
     *,
     batch: int,
     seqlen_q: int,
@@ -66,47 +68,22 @@ def _make_launcher(
         )
     )
 
-    if enable_lse:
-
-        def launch(stream, q, k, v, output, lse):
-            kernel(
-                q,
-                k,
-                v,
-                output,
-                problem_size,
-                None,
-                None,
-                lse,
-                Float32(scale_softmax * math.log2(math.e)),
-                Float32(scale_softmax),
-                Float32(scale_output),
-                None,
-                Int32(0),
-                stream,
-            )
-
-    else:
-
-        def launch(stream, q, k, v, output):
-            kernel(
-                q,
-                k,
-                v,
-                output,
-                problem_size,
-                None,
-                None,
-                None,
-                Float32(scale_softmax * math.log2(math.e)),
-                Float32(scale_softmax),
-                Float32(scale_output),
-                None,
-                Int32(0),
-                stream,
-            )
-
-    return launch
+    kernel(
+        q,
+        k,
+        v,
+        output,
+        problem_size,
+        None,
+        None,
+        lse if enable_lse else None,
+        Float32(scale_softmax * math.log2(math.e)),
+        Float32(scale_softmax),
+        Float32(scale_output),
+        None,
+        Int32(0),
+        stream,
+    )
 
 
 def _compression_attention_impl(
@@ -126,7 +103,7 @@ def _compression_attention_impl(
     scale_softmax: float | None = None,
     *,
     _validate_only: bool = False,
-) -> CompressionAttentionResult:
+) -> TupleDict:
     """Compute fixed-shape BHSD compression attention on SM100.
 
     Q, K, and V use logical shapes ``(B, H, S, D)`` and a shared ``float16``
@@ -199,24 +176,25 @@ def _compression_attention_impl(
         )
 
     results = call_cutedsl(
-        _make_launcher(
-            batch=batch,
-            seqlen_q=seqlen_q,
-            seqlen_k=seqlen_k,
-            num_query_heads=num_query_heads,
-            num_kv_heads=num_kv_heads,
-            head_dim=head_dim,
-            enable_lse=bool(enable_lse),
-            is_persistent=bool(is_persistent),
-            scale_softmax=resolved_softmax_scale,
-            scale_output=resolved_output_scale,
-        ),
+        _launch,
         (q_tensor, k_tensor, v_tensor),
         outputs=tuple(outputs),
         input_specs=(input_spec, input_spec, input_spec),
+        static_args={
+            "batch": batch,
+            "seqlen_q": seqlen_q,
+            "seqlen_k": seqlen_k,
+            "num_query_heads": num_query_heads,
+            "num_kv_heads": num_kv_heads,
+            "head_dim": head_dim,
+            "enable_lse": bool(enable_lse),
+            "is_persistent": bool(is_persistent),
+            "scale_softmax": resolved_softmax_scale,
+            "scale_output": resolved_output_scale,
+        },
         use_static_tensors=True,
     )
-    return CompressionAttentionResult(
+    return TupleDict(
         o_tensor=results[0],
         lse_tensor=results[1] if enable_lse else None,
     )
@@ -278,10 +256,10 @@ class CompressionAttention(ApiBaseJax):
         )
         return True
 
-    def __call__(self, q_tensor: Any, k_tensor: Any, v_tensor: Any) -> CompressionAttentionResult:
+    def __call__(self, q_tensor: Any, k_tensor: Any, v_tensor: Any) -> TupleDict:
         return super().__call__(q_tensor, k_tensor, v_tensor)
 
-    def _call_impl(self, q_tensor: Any, k_tensor: Any, v_tensor: Any) -> CompressionAttentionResult:
+    def _call_impl(self, q_tensor: Any, k_tensor: Any, v_tensor: Any) -> TupleDict:
         self.check_tensor_signature(q_tensor, self.q_desc, name="Q")
         self.check_tensor_signature(k_tensor, self.k_desc, name="K")
         self.check_tensor_signature(v_tensor, self.v_desc, name="V")
@@ -318,7 +296,7 @@ def compression_attention_wrapper(
     scale_v: float = 1.0,
     inv_scale_o: float = 1.0,
     scale_softmax: float | None = None,
-) -> CompressionAttentionResult:
+) -> TupleDict:
     """Compute fixed-shape BHSD compression attention on SM100."""
 
     return CompressionAttention(
@@ -341,6 +319,5 @@ def compression_attention_wrapper(
 
 __all__ = [
     "CompressionAttention",
-    "CompressionAttentionResult",
     "compression_attention_wrapper",
 ]

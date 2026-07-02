@@ -173,7 +173,7 @@ result = run(a, b, sfa, sfb, padded_offsets, alpha, prob, bias)
 c, d, amax, post_rht_amax = result
 ```
 
-The JAX API returns `GroupedGemmGluHadamardResult`. Unlike the other grouped
+The JAX API returns `TupleDict`. Unlike the other grouped
 JAX wrappers, this kernel's supported input path is dense native FP4
 (`jnp.float4_e2m1fn`), with E8M0 or E4M3 scale factors. Raw packed `uint8`
 FP4 and discrete weight pointers are not exposed. Shapes, dtypes, layouts,

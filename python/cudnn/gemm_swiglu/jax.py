@@ -6,12 +6,11 @@
 from __future__ import annotations
 
 import os
-from functools import lru_cache
-from typing import Any, NamedTuple, Optional
+from typing import Any, Optional
 
 import jax.numpy as jnp
 
-from .._jax.api_base import ApiBaseJax, BufferSpec, call_cutedsl
+from .._jax.api_base import ApiBaseJax, BufferSpec, TupleDict, call_cutedsl
 from .._jax.gemm import (
     gemm_a_tensor_spec,
     gemm_b_tensor_spec,
@@ -25,17 +24,12 @@ from ..gemm_validation import (
 )
 
 
-class GemmSwigluResult(NamedTuple):
-    """Functional outputs from dense GEMM + SwiGLU."""
-
-    ab12_tensor: Any
-    c_tensor: Any
-    sfc_tensor: Any | None
-    amax_tensor: Any | None
-
-
-@lru_cache(maxsize=None)
-def _make_launcher(
+def _launch(
+    stream,
+    a,
+    b,
+    ab12,
+    c,
     *,
     alpha: float,
     acc_dtype: Any,
@@ -43,34 +37,31 @@ def _make_launcher(
     cluster_shape_mn: tuple[int, int],
     cluster_overlap_margin: int,
 ):
-    def launch(stream, a, b, ab12, c):
-        # These operations happen during CUDA lowering, not abstract evaluation.
-        import cutlass
-        from cutlass.jax import jax_to_cutlass_dtype
+    # These operations happen during CUDA lowering, not abstract evaluation.
+    import cutlass
+    from cutlass.jax import jax_to_cutlass_dtype
 
-        from .dense_gemm_persistent_swiglu import PersistentDenseGemmKernel
+    from .dense_gemm_persistent_swiglu import PersistentDenseGemmKernel
 
-        kernel = PersistentDenseGemmKernel(
-            acc_dtype=jax_to_cutlass_dtype(acc_dtype),
-            use_2cta_instrs=mma_tiler_mn[0] == PersistentDenseGemmKernel.TWO_CTA_MMA_TILER_M,
-            mma_tiler_mn=mma_tiler_mn,
-            cluster_shape_mn=cluster_shape_mn,
-        )
-        max_active_clusters = resolve_max_active_clusters(
-            cutlass.utils.HardwareInfo().get_max_active_clusters(cluster_shape_mn[0] * cluster_shape_mn[1]),
-            cluster_overlap_margin,
-        )
-        kernel(
-            a,
-            b,
-            ab12,
-            c,
-            cutlass.Float32(alpha),
-            max_active_clusters,
-            stream,
-        )
-
-    return launch
+    kernel = PersistentDenseGemmKernel(
+        acc_dtype=jax_to_cutlass_dtype(acc_dtype),
+        use_2cta_instrs=mma_tiler_mn[0] == PersistentDenseGemmKernel.TWO_CTA_MMA_TILER_M,
+        mma_tiler_mn=mma_tiler_mn,
+        cluster_shape_mn=cluster_shape_mn,
+    )
+    max_active_clusters = resolve_max_active_clusters(
+        cutlass.utils.HardwareInfo().get_max_active_clusters(cluster_shape_mn[0] * cluster_shape_mn[1]),
+        cluster_overlap_margin,
+    )
+    kernel(
+        a,
+        b,
+        ab12,
+        c,
+        cutlass.Float32(alpha),
+        max_active_clusters,
+        stream,
+    )
 
 
 class GemmSwigluSm100(ApiBaseJax):
@@ -189,7 +180,7 @@ class GemmSwigluSm100(ApiBaseJax):
         sfa_tensor: Optional[Any] = None,
         sfb_tensor: Optional[Any] = None,
         norm_const_tensor: Optional[Any] = None,
-    ) -> GemmSwigluResult:
+    ) -> TupleDict:
         return super().__call__(a_tensor, b_tensor, sfa_tensor, sfb_tensor, norm_const_tensor)
 
     def _call_impl(
@@ -199,22 +190,15 @@ class GemmSwigluSm100(ApiBaseJax):
         sfa_tensor: Optional[Any],
         sfb_tensor: Optional[Any],
         norm_const_tensor: Optional[Any],
-    ) -> GemmSwigluResult:
+    ) -> TupleDict:
         self.check_tensor_signature(a_tensor, self.a_desc, name="A")
         self.check_tensor_signature(b_tensor, self.b_desc, name="B")
         self.check_optional_tensor_signature(sfa_tensor, self.sfa_desc, name="SFA")
         self.check_optional_tensor_signature(sfb_tensor, self.sfb_desc, name="SFB")
         self.check_optional_tensor_signature(norm_const_tensor, self.norm_const_desc, name="norm_const")
 
-        launcher = _make_launcher(
-            alpha=float(self.alpha),
-            acc_dtype=self.acc_dtype,
-            mma_tiler_mn=self.mma_tiler_mn,
-            cluster_shape_mn=self.cluster_shape_mn,
-            cluster_overlap_margin=self.num_cluster_overlap_margin,
-        )
         ab12_tensor, c_tensor = call_cutedsl(
-            launcher,
+            _launch,
             (a_tensor, b_tensor),
             outputs=(
                 BufferSpec(
@@ -231,9 +215,16 @@ class GemmSwigluSm100(ApiBaseJax):
                 ),
             ),
             input_specs=(self.a_spec, self.b_spec),
+            static_args={
+                "alpha": float(self.alpha),
+                "acc_dtype": self.acc_dtype,
+                "mma_tiler_mn": self.mma_tiler_mn,
+                "cluster_shape_mn": self.cluster_shape_mn,
+                "cluster_overlap_margin": self.num_cluster_overlap_margin,
+            },
             use_static_tensors=True,
         )
-        return GemmSwigluResult(
+        return TupleDict(
             ab12_tensor=ab12_tensor,
             c_tensor=c_tensor,
             sfc_tensor=None,
@@ -260,7 +251,7 @@ def gemm_swiglu_wrapper_sm100(
     *,
     a_major: str = "k",
     b_major: str = "k",
-) -> GemmSwigluResult:
+) -> TupleDict:
     """Compute a dense batched GEMM and its fused SwiGLU projection."""
 
     return GemmSwigluSm100(
@@ -284,4 +275,4 @@ def gemm_swiglu_wrapper_sm100(
     )(a_tensor, b_tensor, sfa_tensor, sfb_tensor, norm_const_tensor)
 
 
-__all__ = ["GemmSwigluResult", "GemmSwigluSm100", "gemm_swiglu_wrapper_sm100"]
+__all__ = ["GemmSwigluSm100", "gemm_swiglu_wrapper_sm100"]

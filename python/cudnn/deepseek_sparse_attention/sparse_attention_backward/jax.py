@@ -5,23 +5,19 @@
 
 from __future__ import annotations
 
-from functools import lru_cache
 import math
-from typing import Any, NamedTuple, Optional
+from typing import Any, Optional
 
 import jax.numpy as jnp
 from cutlass.jax import TensorSpec
 
-from ..._jax.api_base import ApiBaseJax, BufferSpec, call_cutedsl
-from ..._jax.validation import require_dtype
-
-
-class SparseAttentionBackwardResult(NamedTuple):
-    """Functional gradients from :func:`sparse_attention_backward_wrapper`."""
-
-    dq: Any
-    dkv: Any
-    d_sink: Any
+from ..._jax.api_base import (
+    ApiBaseJax,
+    BufferSpec,
+    TupleDict,
+    call_cutedsl,
+    require_dtype,
+)
 
 
 def require_array(
@@ -43,8 +39,21 @@ def require_array(
     require_dtype(f"{name}.dtype", value, (dtype,))
 
 
-@lru_cache(maxsize=None)
-def _make_launcher(
+def _launch_with_topk_length(
+    stream,
+    q,
+    kv,
+    output,
+    doutput,
+    lse,
+    attn_sink,
+    topk_idxs,
+    topk_length,
+    dq,
+    dkv,
+    d_sink,
+    workspace_lse_odo,
+    workspace_dkv,
     *,
     total_seqlen_q: int,
     total_seqlen_kv: int,
@@ -52,7 +61,6 @@ def _make_launcher(
     head_dim: int,
     block_tile: int,
     softmax_scale: float,
-    has_topk_length: bool,
 ):
     from cutlass import Float32, Int32
 
@@ -64,92 +72,87 @@ def _make_launcher(
         block_tile=block_tile,
     )
 
-    if has_topk_length:
+    problem_shape = (
+        Int32(total_seqlen_q),
+        Int32(total_seqlen_kv),
+        Int32(head_dim),
+        (Int32(num_heads), Int32(1)),
+    )
+    kernel(
+        problem_shape,
+        q,
+        kv,
+        output,
+        doutput,
+        lse,
+        attn_sink,
+        topk_idxs,
+        topk_length,
+        dq,
+        dkv,
+        d_sink,
+        workspace_lse_odo,
+        workspace_dkv,
+        Float32(softmax_scale),
+        stream,
+    )
 
-        def launch(
-            stream,
-            q,
-            kv,
-            output,
-            doutput,
-            lse,
-            attn_sink,
-            topk_idxs,
-            topk_length,
-            dq,
-            dkv,
-            d_sink,
-            workspace_lse_odo,
-            workspace_dkv,
-        ):
-            problem_shape = (
-                Int32(total_seqlen_q),
-                Int32(total_seqlen_kv),
-                Int32(head_dim),
-                (Int32(num_heads), Int32(1)),
-            )
-            kernel(
-                problem_shape,
-                q,
-                kv,
-                output,
-                doutput,
-                lse,
-                attn_sink,
-                topk_idxs,
-                topk_length,
-                dq,
-                dkv,
-                d_sink,
-                workspace_lse_odo,
-                workspace_dkv,
-                Float32(softmax_scale),
-                stream,
-            )
 
-    else:
+def _launch_without_topk_length(
+    stream,
+    q,
+    kv,
+    output,
+    doutput,
+    lse,
+    attn_sink,
+    topk_idxs,
+    dq,
+    dkv,
+    d_sink,
+    workspace_lse_odo,
+    workspace_dkv,
+    *,
+    total_seqlen_q: int,
+    total_seqlen_kv: int,
+    num_heads: int,
+    head_dim: int,
+    block_tile: int,
+    softmax_scale: float,
+):
+    from cutlass import Float32, Int32
 
-        def launch(
-            stream,
-            q,
-            kv,
-            output,
-            doutput,
-            lse,
-            attn_sink,
-            topk_idxs,
-            dq,
-            dkv,
-            d_sink,
-            workspace_lse_odo,
-            workspace_dkv,
-        ):
-            problem_shape = (
-                Int32(total_seqlen_q),
-                Int32(total_seqlen_kv),
-                Int32(head_dim),
-                (Int32(num_heads), Int32(1)),
-            )
-            kernel(
-                problem_shape,
-                q,
-                kv,
-                output,
-                doutput,
-                lse,
-                attn_sink,
-                topk_idxs,
-                None,
-                dq,
-                dkv,
-                d_sink,
-                workspace_lse_odo,
-                workspace_dkv,
-                Float32(softmax_scale),
-                stream,
-            )
+    from .dsa_bwd_sm100 import FlashAttentionDSABackwardSm100
 
-    return launch
+    kernel = FlashAttentionDSABackwardSm100(
+        head_dim=head_dim,
+        head_dim_v=head_dim,
+        block_tile=block_tile,
+    )
+    problem_shape = (
+        Int32(total_seqlen_q),
+        Int32(total_seqlen_kv),
+        Int32(head_dim),
+        (Int32(num_heads), Int32(1)),
+    )
+    kernel(
+        problem_shape,
+        q,
+        kv,
+        output,
+        doutput,
+        lse,
+        attn_sink,
+        topk_idxs,
+        None,
+        dq,
+        dkv,
+        d_sink,
+        workspace_lse_odo,
+        workspace_dkv,
+        Float32(softmax_scale),
+        stream,
+    )
 
 
 def _sparse_attention_backward_impl(
@@ -164,7 +167,7 @@ def _sparse_attention_backward_impl(
     topk_length: Optional[Any] = None,
     block_tile: int = 64,
     _validate_only: bool = False,
-) -> SparseAttentionBackwardResult:
+) -> TupleDict:
     """Compute fixed-shape DSA sparse-attention gradients on SM100.
 
     Inputs follow the Torch wrapper's flat MQA contract: Q, O, and dO have
@@ -273,16 +276,9 @@ def _sparse_attention_backward_impl(
         inputs += (topk_length,)
         input_specs += (None,)
 
+    launcher = _launch_with_topk_length if topk_length is not None else _launch_without_topk_length
     dq, dkv, d_sink = call_cutedsl(
-        _make_launcher(
-            total_seqlen_q=total_seqlen_q,
-            total_seqlen_kv=total_seqlen_kv,
-            num_heads=num_heads,
-            head_dim=head_dim,
-            block_tile=block_tile,
-            softmax_scale=resolved_scale,
-            has_topk_length=topk_length is not None,
-        ),
+        launcher,
         inputs,
         outputs=(
             BufferSpec("dq", q_shape, jnp.bfloat16, tensor_spec=tensor_spec),
@@ -310,9 +306,17 @@ def _sparse_attention_backward_impl(
             ),
         ),
         input_specs=input_specs,
+        static_args={
+            "total_seqlen_q": int(total_seqlen_q),
+            "total_seqlen_kv": int(total_seqlen_kv),
+            "num_heads": int(num_heads),
+            "head_dim": int(head_dim),
+            "block_tile": int(block_tile),
+            "softmax_scale": float(resolved_scale),
+        },
         use_static_tensors=True,
     )
-    return SparseAttentionBackwardResult(dq=dq, dkv=dkv, d_sink=d_sink)
+    return TupleDict(dq=dq, dkv=dkv, d_sink=d_sink)
 
 
 class SparseAttentionBackward(ApiBaseJax):
@@ -369,7 +373,7 @@ class SparseAttentionBackward(ApiBaseJax):
         attn_sink: Any,
         topk_idxs: Any,
         topk_length: Optional[Any] = None,
-    ) -> SparseAttentionBackwardResult:
+    ) -> TupleDict:
         return super().__call__(q, kv, out, dout, lse, attn_sink, topk_idxs, topk_length)
 
     def _call_impl(
@@ -382,7 +386,7 @@ class SparseAttentionBackward(ApiBaseJax):
         attn_sink: Any,
         topk_idxs: Any,
         topk_length: Optional[Any] = None,
-    ) -> SparseAttentionBackwardResult:
+    ) -> TupleDict:
         for value, expected, name in (
             (q, self.q_desc, "Q"),
             (kv, self.kv_desc, "KV"),
@@ -419,7 +423,7 @@ def sparse_attention_backward_wrapper(
     softmax_scale: Optional[float] = None,
     topk_length: Optional[Any] = None,
     block_tile: int = 64,
-) -> SparseAttentionBackwardResult:
+) -> TupleDict:
     """Compute fixed-shape DSA sparse-attention gradients on SM100."""
 
     return SparseAttentionBackward(
@@ -438,6 +442,5 @@ def sparse_attention_backward_wrapper(
 
 __all__ = [
     "SparseAttentionBackward",
-    "SparseAttentionBackwardResult",
     "sparse_attention_backward_wrapper",
 ]

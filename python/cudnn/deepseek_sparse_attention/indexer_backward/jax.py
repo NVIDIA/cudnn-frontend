@@ -11,22 +11,18 @@ that kernel ABI to accept runtime loss data and a distinct gradient output.
 
 from __future__ import annotations
 
-from functools import lru_cache
-from typing import Any, NamedTuple
+from typing import Any
 
 import jax.numpy as jnp
 from cutlass.jax import TensorSpec
 
-from ..._jax.api_base import ApiBaseJax, BufferSpec, call_cutedsl
-from ..._jax.validation import require_dtype
-
-
-class IndexerBackwardResult(NamedTuple):
-    """Functional gradients from :func:`indexer_backward_wrapper`."""
-
-    d_index_q: Any
-    d_weights: Any
-    d_index_k: Any
+from ..._jax.api_base import (
+    ApiBaseJax,
+    BufferSpec,
+    TupleDict,
+    call_cutedsl,
+    require_dtype,
+)
 
 
 def require_array(name: str, value: Any, rank: int, dtype: Any) -> tuple[int, ...]:
@@ -60,8 +56,19 @@ def as_grad_loss_operand(grad_loss: Any) -> Any:
     return jnp.asarray((grad_loss,), dtype=jnp.float32)
 
 
-@lru_cache(maxsize=None)
-def _make_launcher(
+def _launch(
+    stream,
+    index_q,
+    weights,
+    index_k,
+    attn_score,
+    index_score,
+    topk_indices,
+    grad_loss,
+    d_index_q,
+    d_weights,
+    d_index_k_accum,
+    grad_signal,
     *,
     heads: int,
     head_dim: int,
@@ -84,43 +91,27 @@ def _make_launcher(
         topk_indices_global=topk_indices_global,
     )
 
-    def launch(
+    score_grad(
+        attn_score,
+        index_score,
+        grad_loss,
+        Float32(grad_scale),
         stream,
+        grad_signal,
+        None,
+    )
+    backward(
         index_q,
         weights,
         index_k,
-        attn_score,
-        index_score,
-        topk_indices,
-        grad_loss,
         d_index_q,
         d_weights,
         d_index_k_accum,
         grad_signal,
-    ):
-        score_grad(
-            attn_score,
-            index_score,
-            grad_loss,
-            Float32(grad_scale),
-            stream,
-            grad_signal,
-            None,
-        )
-        backward(
-            index_q,
-            weights,
-            index_k,
-            d_index_q,
-            d_weights,
-            d_index_k_accum,
-            grad_signal,
-            topk_indices,
-            Float32(sm_scale),
-            stream,
-        )
-
-    return launch
+        topk_indices,
+        Float32(sm_scale),
+        stream,
+    )
 
 
 def _indexer_backward_impl(
@@ -136,7 +127,7 @@ def _indexer_backward_impl(
     block_I: int = 128,
     topk_indices_global: bool = False,
     _validate_only: bool = False,
-) -> IndexerBackwardResult:
+) -> TupleDict:
     """Compute sparse indexer gradients with fixed-shape SM100 kernels.
 
     Inputs use BSHD shapes ``index_q=(B,S_q,64,128)``,
@@ -199,15 +190,7 @@ def _indexer_backward_impl(
     tensor_spec = TensorSpec(divisibility=head_dim)
 
     d_index_q, d_weights, d_index_k_accum = call_cutedsl(
-        _make_launcher(
-            heads=heads,
-            head_dim=head_dim,
-            topk=topk,
-            block_i=block_I,
-            sm_scale=sm_scale,
-            grad_scale=grad_scale,
-            topk_indices_global=bool(topk_indices_global),
-        ),
+        _launch,
         (
             index_q,
             weights,
@@ -230,9 +213,18 @@ def _indexer_backward_impl(
         ),
         workspaces=(BufferSpec("grad_signal", score_shape, jnp.float32),),
         input_specs=(tensor_spec, None, tensor_spec, None, None, None, None),
+        static_args={
+            "heads": int(heads),
+            "head_dim": int(head_dim),
+            "topk": int(topk),
+            "block_i": int(block_I),
+            "sm_scale": float(sm_scale),
+            "grad_scale": float(grad_scale),
+            "topk_indices_global": bool(topk_indices_global),
+        },
         use_static_tensors=True,
     )
-    return IndexerBackwardResult(
+    return TupleDict(
         d_index_q=d_index_q,
         d_weights=d_weights,
         d_index_k=d_index_k_accum.astype(jnp.bfloat16),
@@ -295,7 +287,7 @@ class IndexerBackward(ApiBaseJax):
         index_score: Any,
         topk_indices: Any,
         grad_loss: Any = 1.0,
-    ) -> IndexerBackwardResult:
+    ) -> TupleDict:
         return super().__call__(index_q, weights, index_k, attn_score, index_score, topk_indices, grad_loss)
 
     def _call_impl(
@@ -307,7 +299,7 @@ class IndexerBackward(ApiBaseJax):
         index_score: Any,
         topk_indices: Any,
         grad_loss: Any = 1.0,
-    ) -> IndexerBackwardResult:
+    ) -> TupleDict:
         for value, expected, name in (
             (index_q, self.index_q_desc, "index_q"),
             (weights, self.weights_desc, "weights"),
@@ -346,7 +338,7 @@ def indexer_backward_wrapper(
     grad_loss: Any = 1.0,
     block_I: int = 128,
     topk_indices_global: bool = False,
-) -> IndexerBackwardResult:
+) -> TupleDict:
     """Compute sparse indexer gradients with fixed-shape SM100 kernels."""
 
     return IndexerBackward(
@@ -364,4 +356,4 @@ def indexer_backward_wrapper(
     )(index_q, weights, index_k, attn_score, index_score, topk_indices, grad_loss)
 
 
-__all__ = ["IndexerBackward", "IndexerBackwardResult", "indexer_backward_wrapper"]
+__all__ = ["IndexerBackward", "indexer_backward_wrapper"]

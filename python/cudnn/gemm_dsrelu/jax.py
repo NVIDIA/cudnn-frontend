@@ -6,12 +6,11 @@
 from __future__ import annotations
 
 import os
-from functools import lru_cache
-from typing import Any, NamedTuple, Optional
+from typing import Any, Optional
 
 import jax.numpy as jnp
 
-from .._jax.api_base import ApiBaseJax, BufferSpec, call_cutedsl
+from .._jax.api_base import ApiBaseJax, BufferSpec, TupleDict, call_cutedsl
 from .._jax.gemm import (
     block_scale_tensor_spec,
     gemm_a_tensor_spec,
@@ -30,17 +29,16 @@ from ..gemm_validation import (
 )
 
 
-class GemmDsreluResult(NamedTuple):
-    """Functional outputs from block-scaled squared-ReLU backward."""
-
-    d_tensor: Any
-    dprob_tensor: Any
-    amax_tensor: Any | None
-    sfd_tensor: Any | None
-
-
-@lru_cache(maxsize=None)
-def _make_launcher(
+def _launch(
+    stream,
+    a,
+    b,
+    c,
+    sfa,
+    sfb,
+    prob,
+    d,
+    dprob,
     *,
     alpha: float,
     sf_vec_size: int,
@@ -49,48 +47,45 @@ def _make_launcher(
     vector_f32: bool,
     cluster_overlap_margin: int,
 ):
-    def launch(stream, a, b, c, sfa, sfb, prob, d, dprob):
-        # These operations happen during CUDA lowering, not abstract evaluation.
-        import cutlass
-        import cutlass.cute as cute
+    # These operations happen during CUDA lowering, not abstract evaluation.
+    import cutlass
+    import cutlass.cute as cute
 
-        from .dense_blockscaled_gemm_persistent_dsrelu_quant import (
-            Sm100BlockScaledPersistentDenseGemmKernel,
-        )
+    from .dense_blockscaled_gemm_persistent_dsrelu_quant import (
+        Sm100BlockScaledPersistentDenseGemmKernel,
+    )
 
-        kernel = Sm100BlockScaledPersistentDenseGemmKernel(
-            sf_vec_size=sf_vec_size,
-            mma_tiler_mn=mma_tiler_mn,
-            cluster_shape_mn=cluster_shape_mn,
-            vector_f32=vector_f32,
-        )
-        max_active_clusters = resolve_max_active_clusters(
-            cutlass.utils.HardwareInfo().get_max_active_clusters(cluster_shape_mn[0] * cluster_shape_mn[1]),
-            cluster_overlap_margin,
-        )
+    kernel = Sm100BlockScaledPersistentDenseGemmKernel(
+        sf_vec_size=sf_vec_size,
+        mma_tiler_mn=mma_tiler_mn,
+        cluster_shape_mn=cluster_shape_mn,
+        vector_f32=vector_f32,
+    )
+    max_active_clusters = resolve_max_active_clusters(
+        cutlass.utils.HardwareInfo().get_max_active_clusters(cluster_shape_mn[0] * cluster_shape_mn[1]),
+        cluster_overlap_margin,
+    )
 
-        def squared_relu_backward(x, upstream):
-            return cute.where(x > 0, x, cute.full_like(x, 0)) * 2 * upstream
+    def squared_relu_backward(x, upstream):
+        return cute.where(x > 0, x, cute.full_like(x, 0)) * 2 * upstream
 
-        kernel(
-            a,
-            b,
-            sfa,
-            sfb,
-            c,
-            d,
-            prob,
-            dprob,
-            None,
-            None,
-            None,
-            cutlass.Float32(alpha),
-            max_active_clusters,
-            stream,
-            epilogue_op=squared_relu_backward,
-        )
-
-    return launch
+    kernel(
+        a,
+        b,
+        sfa,
+        sfb,
+        c,
+        d,
+        prob,
+        dprob,
+        None,
+        None,
+        None,
+        cutlass.Float32(alpha),
+        max_active_clusters,
+        stream,
+        epilogue_op=squared_relu_backward,
+    )
 
 
 class GemmDsreluSm100(ApiBaseJax):
@@ -207,7 +202,7 @@ class GemmDsreluSm100(ApiBaseJax):
         sfb_tensor: Any,
         prob_tensor: Any,
         norm_const_tensor: Optional[Any] = None,
-    ) -> GemmDsreluResult:
+    ) -> TupleDict:
         return super().__call__(
             a_tensor,
             b_tensor,
@@ -227,7 +222,7 @@ class GemmDsreluSm100(ApiBaseJax):
         sfb_tensor: Any,
         prob_tensor: Any,
         norm_const_tensor: Optional[Any],
-    ) -> GemmDsreluResult:
+    ) -> TupleDict:
         self.check_tensor_signature(a_tensor, self.a_desc, name="A")
         self.check_tensor_signature(b_tensor, self.b_desc, name="B")
         self.check_tensor_signature(c_tensor, self.c_desc, name="C")
@@ -236,16 +231,8 @@ class GemmDsreluSm100(ApiBaseJax):
         self.check_tensor_signature(prob_tensor, self.prob_desc, name="prob")
         self.check_optional_tensor_signature(norm_const_tensor, self.norm_const_desc, name="norm_const")
 
-        launcher = _make_launcher(
-            alpha=float(self.alpha),
-            sf_vec_size=self.sf_vec_size,
-            mma_tiler_mn=self.mma_tiler_mn,
-            cluster_shape_mn=self.cluster_shape_mn,
-            vector_f32=bool(self.vector_f32),
-            cluster_overlap_margin=self.num_cluster_overlap_margin,
-        )
         d_tensor, dprob_tensor = call_cutedsl(
-            launcher,
+            _launch,
             (a_tensor, b_tensor, c_tensor, sfa_tensor, sfb_tensor, prob_tensor),
             outputs=(
                 BufferSpec(
@@ -269,9 +256,17 @@ class GemmDsreluSm100(ApiBaseJax):
                 self.scale_spec,
                 self.prob_spec,
             ),
+            static_args={
+                "alpha": float(self.alpha),
+                "sf_vec_size": self.sf_vec_size,
+                "mma_tiler_mn": self.mma_tiler_mn,
+                "cluster_shape_mn": self.cluster_shape_mn,
+                "vector_f32": bool(self.vector_f32),
+                "cluster_overlap_margin": self.num_cluster_overlap_margin,
+            },
             use_static_tensors=True,
         )
-        return GemmDsreluResult(
+        return TupleDict(
             d_tensor=d_tensor,
             dprob_tensor=dprob_tensor,
             amax_tensor=None,
@@ -298,7 +293,7 @@ def gemm_dsrelu_wrapper_sm100(
     *,
     a_major: str = "k",
     b_major: str = "k",
-) -> GemmDsreluResult:
+) -> TupleDict:
     """Compute the MXFP8 squared-ReLU backward fusion."""
 
     return GemmDsreluSm100(
@@ -330,4 +325,4 @@ def gemm_dsrelu_wrapper_sm100(
     )
 
 
-__all__ = ["GemmDsreluResult", "GemmDsreluSm100", "gemm_dsrelu_wrapper_sm100"]
+__all__ = ["GemmDsreluSm100", "gemm_dsrelu_wrapper_sm100"]

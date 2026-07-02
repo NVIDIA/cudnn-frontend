@@ -96,10 +96,10 @@ def run(a, b, sfa, sfb, offsets):
     )
 
 result = run(a_tensor, b_tensor, sfa_tensor, sfb_tensor, offsets_tensor)
-wgrad_tensor = result.wgrad_tensor
+wgrad_tensor = result["wgrad_tensor"]
 ```
 
-The JAX API returns `GroupedGemmWgradResult` and exposes only the dense-output
+The JAX API returns `TupleDict` and exposes only the dense-output
 mode. A/B are FP8 with E8M0 scale factors and `sf_vec_size=32`; raw discrete
 output pointers and packed FP4 are not exposed. Tensor shapes and dtypes,
 expert count, `input_order`, and other configuration arguments are static

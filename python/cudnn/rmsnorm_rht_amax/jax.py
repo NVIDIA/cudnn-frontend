@@ -6,21 +6,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import lru_cache
-from typing import Any, NamedTuple, Optional
+from typing import Any, Optional
 
 import jax.numpy as jnp
 from cutlass.jax import TensorSpec
 
-from .._jax.api_base import ApiBaseJax, BufferSpec, call_cutedsl
+from .._jax.api_base import ApiBaseJax, BufferSpec, TupleDict, call_cutedsl
 from .config import RmsNormRhtAmaxPlan, validate_rmsnorm_rht_amax
-
-
-class RmsNormRhtAmaxResult(NamedTuple):
-    """Functional JAX outputs for RMSNorm + RHT + amax."""
-
-    output: Any
-    amax: Any
 
 
 @dataclass(frozen=True)
@@ -30,8 +22,13 @@ class _RmsNormRhtAmaxJaxConfig:
     rows_per_cta: Optional[int]
 
 
-@lru_cache(maxsize=None)
-def _make_launcher(
+def _launch(
+    stream,
+    x,
+    weight,
+    output,
+    amax,
+    *,
     n: int,
     num_threads: int,
     rows_per_cta: int,
@@ -47,11 +44,7 @@ def _make_launcher(
         eps=eps,
         rows_per_cta=rows_per_cta,
     )
-
-    def launch(stream, x, weight, output, amax):
-        kernel(x, weight, output, amax, Float32(eps), stream)
-
-    return launch
+    kernel(x, weight, output, amax, Float32(eps), stream)
 
 
 class RmsNormRhtAmaxSm100(ApiBaseJax):
@@ -98,12 +91,12 @@ class RmsNormRhtAmaxSm100(ApiBaseJax):
         self.n = self._plan.n
         return True
 
-    def __call__(self, x: Any, weight: Any) -> RmsNormRhtAmaxResult:
+    def __call__(self, x: Any, weight: Any) -> TupleDict:
         """Run with arrays matching the validated sample signature."""
 
         return super().__call__(x, weight)
 
-    def _call_impl(self, x: Any, weight: Any) -> RmsNormRhtAmaxResult:
+    def _call_impl(self, x: Any, weight: Any) -> TupleDict:
         plan = self._plan
         if plan is None:
             raise RuntimeError("check_support() did not produce a launch plan")
@@ -118,7 +111,7 @@ class RmsNormRhtAmaxSm100(ApiBaseJax):
         weight_spec = TensorSpec(divisibility=(16,))
 
         output, amax = call_cutedsl(
-            _make_launcher(plan.n, plan.num_threads, plan.rows_per_cta, self._config.eps),
+            _launch,
             (x, weight),
             outputs=(
                 BufferSpec(
@@ -134,9 +127,15 @@ class RmsNormRhtAmaxSm100(ApiBaseJax):
                 ),
             ),
             input_specs=(x_spec, weight_spec),
+            static_args={
+                "n": plan.n,
+                "num_threads": plan.num_threads,
+                "rows_per_cta": plan.rows_per_cta,
+                "eps": self._config.eps,
+            },
             use_static_tensors=True,
         )
-        return RmsNormRhtAmaxResult(output=output, amax=amax)
+        return TupleDict(output=output, amax=amax)
 
 
 def rmsnorm_rht_amax_sm100(
@@ -146,7 +145,7 @@ def rmsnorm_rht_amax_sm100(
     eps: float = 1e-5,
     num_threads: Optional[int] = None,
     rows_per_cta: Optional[int] = None,
-) -> RmsNormRhtAmaxResult:
+) -> TupleDict:
     """Apply fused RMSNorm, 16-wide RHT, and per-CTA amax from JAX.
 
     ``x`` must be a row-major ``bfloat16`` array of shape ``(M, N)`` and
@@ -168,4 +167,4 @@ def rmsnorm_rht_amax_sm100(
     )(x, weight)
 
 
-__all__ = ["RmsNormRhtAmaxResult", "RmsNormRhtAmaxSm100", "rmsnorm_rht_amax_sm100"]
+__all__ = ["RmsNormRhtAmaxSm100", "rmsnorm_rht_amax_sm100"]

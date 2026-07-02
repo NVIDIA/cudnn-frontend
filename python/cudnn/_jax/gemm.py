@@ -15,7 +15,7 @@ from ..gemm_validation import (
     require_contiguous_alignment,
     require_gemm_shapes,
 )
-from .validation import require_dtype
+from .api_base import require_dtype
 
 
 def require_array(name: str, value: Any, rank: int) -> tuple[Any, ...]:

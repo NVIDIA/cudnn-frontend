@@ -5,26 +5,28 @@
 
 from __future__ import annotations
 
-from functools import lru_cache
 import math
-from typing import Any, NamedTuple
+from typing import Any
 
 import jax.numpy as jnp
 
-from ..._jax.api_base import ApiBaseJax, BufferSpec, call_cutedsl
-from ..._jax.validation import require_dtype
+from ..._jax.api_base import (
+    ApiBaseJax,
+    BufferSpec,
+    TupleDict,
+    call_cutedsl,
+    require_dtype,
+)
 from ..jax_utils import bhsd_tensor_spec, require_bhsd_qkv, resolve_sdpa_config
 
 
-class SdpaFwdResult(NamedTuple):
-    """Functional outputs from :func:`sdpa_fwd_wrapper_sm100_d256`."""
-
-    o_tensor: Any
-    lse_tensor: Any
-
-
-@lru_cache(maxsize=None)
-def _make_launcher(
+def _launch(
+    stream,
+    q,
+    k,
+    v,
+    output,
+    lse,
     *,
     batch: int,
     seqlen_q: int,
@@ -54,38 +56,35 @@ def _make_launcher(
         mask_type=mask_type,
     )
 
-    def launch(stream, q, k, v, output, lse):
-        problem_size = tuple(
-            Int32(value)
-            for value in (
-                batch,
-                seqlen_q,
-                seqlen_k,
-                num_query_heads,
-                num_kv_heads,
-                256,
-            )
+    problem_size = tuple(
+        Int32(value)
+        for value in (
+            batch,
+            seqlen_q,
+            seqlen_k,
+            num_query_heads,
+            num_kv_heads,
+            256,
         )
-        left = None if window_size_left < 0 else Int32(window_size_left)
-        right = None if window_size_right < 0 else Int32(window_size_right)
-        kernel(
-            q,
-            k,
-            v,
-            output,
-            problem_size,
-            None,
-            None,
-            lse,
-            Float32(scale_softmax * math.log2(math.e)),
-            Float32(scale_softmax),
-            Float32(scale_output),
-            left,
-            right,
-            stream,
-        )
-
-    return launch
+    )
+    left = None if window_size_left < 0 else Int32(window_size_left)
+    right = None if window_size_right < 0 else Int32(window_size_right)
+    kernel(
+        q,
+        k,
+        v,
+        output,
+        problem_size,
+        None,
+        None,
+        lse,
+        Float32(scale_softmax * math.log2(math.e)),
+        Float32(scale_softmax),
+        Float32(scale_output),
+        left,
+        right,
+        stream,
+    )
 
 
 def _sdpa_fwd_impl(
@@ -101,7 +100,7 @@ def _sdpa_fwd_impl(
     scale_output: float = 1.0,
     *,
     _validate_only: bool = False,
-) -> SdpaFwdResult:
+) -> TupleDict:
     """Compute fixed-shape BHSD SDPA forward with the SM100 d=256 kernel.
 
     ``q_tensor``, ``k_tensor``, and ``v_tensor`` use logical JAX shapes
@@ -143,18 +142,7 @@ def _sdpa_fwd_impl(
     bhsd_spec = bhsd_tensor_spec()
 
     o_tensor, lse_tensor = call_cutedsl(
-        _make_launcher(
-            batch=batch,
-            seqlen_q=seqlen_q,
-            seqlen_k=seqlen_k,
-            num_query_heads=num_query_heads,
-            num_kv_heads=num_kv_heads,
-            scale_softmax=scale_softmax,
-            scale_output=scale_output,
-            window_size_left=window_size_left,
-            window_size_right=window_size_right,
-            mask_kind=mask_kind,
-        ),
+        _launch,
         (q_tensor, k_tensor, v_tensor),
         outputs=(
             BufferSpec(
@@ -170,9 +158,21 @@ def _sdpa_fwd_impl(
             ),
         ),
         input_specs=(bhsd_spec, bhsd_spec, bhsd_spec),
+        static_args={
+            "batch": batch,
+            "seqlen_q": seqlen_q,
+            "seqlen_k": seqlen_k,
+            "num_query_heads": num_query_heads,
+            "num_kv_heads": num_kv_heads,
+            "scale_softmax": scale_softmax,
+            "scale_output": scale_output,
+            "window_size_left": window_size_left,
+            "window_size_right": window_size_right,
+            "mask_kind": mask_kind,
+        },
         use_static_tensors=True,
     )
-    return SdpaFwdResult(o_tensor=o_tensor, lse_tensor=lse_tensor)
+    return TupleDict(o_tensor=o_tensor, lse_tensor=lse_tensor)
 
 
 class SdpafwdSm100D256(ApiBaseJax):
@@ -219,10 +219,10 @@ class SdpafwdSm100D256(ApiBaseJax):
         )
         return True
 
-    def __call__(self, q_tensor: Any, k_tensor: Any, v_tensor: Any) -> SdpaFwdResult:
+    def __call__(self, q_tensor: Any, k_tensor: Any, v_tensor: Any) -> TupleDict:
         return super().__call__(q_tensor, k_tensor, v_tensor)
 
-    def _call_impl(self, q_tensor: Any, k_tensor: Any, v_tensor: Any) -> SdpaFwdResult:
+    def _call_impl(self, q_tensor: Any, k_tensor: Any, v_tensor: Any) -> TupleDict:
         self.check_tensor_signature(q_tensor, self.q_desc, name="Q")
         self.check_tensor_signature(k_tensor, self.k_desc, name="K")
         self.check_tensor_signature(v_tensor, self.v_desc, name="V")
@@ -251,7 +251,7 @@ def sdpa_fwd_wrapper_sm100_d256(
     window_size: tuple[int, int] = (-1, -1),
     scale_softmax: float | None = None,
     scale_output: float = 1.0,
-) -> SdpaFwdResult:
+) -> TupleDict:
     """Compute fixed-shape BHSD SDPA forward with the SM100 d=256 kernel."""
 
     return SdpafwdSm100D256(
@@ -268,4 +268,4 @@ def sdpa_fwd_wrapper_sm100_d256(
     )(q_tensor, k_tensor, v_tensor)
 
 
-__all__ = ["SdpaFwdResult", "SdpafwdSm100D256", "sdpa_fwd_wrapper_sm100_d256"]
+__all__ = ["SdpafwdSm100D256", "sdpa_fwd_wrapper_sm100_d256"]

@@ -152,6 +152,10 @@ class JaxGroupedGemmWgradContractTest(unittest.TestCase):
         cls.fake_jax.__path__ = []
         cls.fake_jax.__spec__ = ModuleSpec("jax", loader=None, is_package=True)
         cls.fake_jax.numpy = cls.fake_jnp
+        cls.fake_jax.tree_util = types.SimpleNamespace(
+            DictKey=lambda key: key,
+            register_pytree_with_keys=lambda *_args: None,
+        )
         cls.fake_jax.ShapeDtypeStruct = lambda shape, dtype: (shape, dtype)
 
         cls.fake_cutlass = types.ModuleType("cutlass")
@@ -197,7 +201,6 @@ class JaxGroupedGemmWgradContractTest(unittest.TestCase):
                 sys.modules.pop(module_name, None)
 
     def setUp(self):
-        self.module._make_launcher.cache_clear()
         _Kernel.instances.clear()
 
     @classmethod
@@ -237,11 +240,9 @@ class JaxGroupedGemmWgradContractTest(unittest.TestCase):
 
     def test_dense_output_and_workspace_are_xla_owned(self):
         captured = {}
-        launcher = object()
         inputs = self._inputs()
         with (
             self._optional_modules(include_kernel=True),
-            mock.patch.object(self.module, "_make_launcher", return_value=launcher),
             mock.patch.object(
                 self.module,
                 "call_cutedsl",
@@ -250,11 +251,25 @@ class JaxGroupedGemmWgradContractTest(unittest.TestCase):
         ):
             result = self.module.grouped_gemm_wgrad_wrapper_sm100(*inputs)
 
-        self.assertEqual(result.wgrad_tensor.shape, (2, 384, 640))
-        self.assertIs(result.wgrad_tensor.dtype, self.bfloat16)
+        self.assertEqual(result["wgrad_tensor"].shape, (2, 384, 640))
+        self.assertIs(result["wgrad_tensor"].dtype, self.bfloat16)
         self.assertEqual(captured["inputs"], inputs)
         self.assertTrue(captured["use_static_tensors"])
-        self.assertIs(captured["launcher"], launcher)
+        self.assertIs(captured["launcher"], self.module._launch)
+        self.assertEqual(
+            captured["static_args"],
+            {
+                "acc_dtype": self.float32,
+                "mma_tiler_mn": (256, 256),
+                "cluster_shape_mn": (2, 1),
+                "sf_vec_size": 32,
+                "accumulate_on_output": False,
+                "expert_cnt": 2,
+                "input_order": "tensor2d",
+                "has_global_scale": False,
+                "cluster_overlap_margin": 0,
+            },
+        )
 
         (output,) = captured["outputs"]
         self.assertEqual(
@@ -279,7 +294,6 @@ class JaxGroupedGemmWgradContractTest(unittest.TestCase):
         global_b = _Array((2,), self.float32)
         with (
             self._optional_modules(include_kernel=True),
-            mock.patch.object(self.module, "_make_launcher", return_value=object()),
             mock.patch.object(
                 self.module,
                 "call_cutedsl",
@@ -294,12 +308,12 @@ class JaxGroupedGemmWgradContractTest(unittest.TestCase):
 
         self.assertEqual(captured["inputs"][-2:], (global_a, global_b))
         self.assertEqual(len(captured["input_specs"]), 7)
+        self.assertTrue(captured["static_args"]["has_global_scale"])
 
     def test_accumulating_and_ragged_modes_use_initialized_storage(self):
         captured = {}
         with (
             self._optional_modules(include_kernel=True),
-            mock.patch.object(self.module, "_make_launcher", return_value=object()) as make,
             mock.patch.object(
                 self.module,
                 "call_cutedsl",
@@ -314,13 +328,14 @@ class JaxGroupedGemmWgradContractTest(unittest.TestCase):
 
         self.assertEqual(captured["outputs"][0].fill_value, 0.0)
         self.assertEqual(captured["workspaces"][0].shape, (1024,))
-        self.assertTrue(make.call_args.kwargs["accumulate_on_output"])
-        self.assertEqual(make.call_args.kwargs["input_order"], "tensor_ragged")
+        self.assertTrue(captured["static_args"]["accumulate_on_output"])
+        self.assertEqual(captured["static_args"]["input_order"], "tensor_ragged")
 
     def test_launcher_preserves_kernel_abi(self):
         placeholders = [object() for _ in range(10)]
         with self._optional_modules(include_kernel=True):
-            launcher = self.module._make_launcher(
+            self.module._launch(
+                *placeholders,
                 acc_dtype=self.float32,
                 mma_tiler_mn=(256, 256),
                 cluster_shape_mn=(2, 1),
@@ -331,7 +346,6 @@ class JaxGroupedGemmWgradContractTest(unittest.TestCase):
                 has_global_scale=True,
                 cluster_overlap_margin=1,
             )
-            launcher(*placeholders)
 
         kernel = _Kernel.instances[-1]
         self.assertEqual(

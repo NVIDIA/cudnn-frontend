@@ -67,6 +67,10 @@ class JaxApiSurfaceTest(unittest.TestCase):
         fake_jax.__path__ = []
         fake_jax.__spec__ = ModuleSpec("jax", loader=None, is_package=True)
         fake_jax.numpy = fake_jnp
+        fake_jax.tree_util = types.SimpleNamespace(
+            DictKey=lambda key: key,
+            register_pytree_with_keys=lambda *_args: None,
+        )
 
         fake_cutlass_jax = types.ModuleType("cutlass.jax")
         fake_cutlass_jax.is_available = lambda: True
@@ -115,7 +119,7 @@ class JaxApiSurfaceTest(unittest.TestCase):
             self.assertIn(f"{_TEST_PACKAGE}._jax.api_base", sys.modules)
             self.assertNotIn(f"{_TEST_PACKAGE}._jax.cutedsl", sys.modules)
 
-            expected_exports = {"ApiBaseJax", "DSA", "JaxTensorDesc", "NSA"}
+            expected_exports = {"ApiBaseJax", "DSA", "JaxTensorDesc", "NSA", "TupleDict"}
             expected_dsa_exports = set()
             expected_nsa_exports = set()
             torch_dsa_exports = set(
@@ -184,13 +188,17 @@ class JaxApiSurfaceTest(unittest.TestCase):
                 captured.update(launcher=launcher, inputs=inputs, **options)
                 return "output", "amax"
 
-            with (
-                mock.patch.object(rmsnorm_module, "_make_launcher", return_value="launcher"),
-                mock.patch.object(rmsnorm_module, "call_cutedsl", side_effect=fake_call),
-            ):
+            with mock.patch.object(rmsnorm_module, "call_cutedsl", side_effect=fake_call):
                 result = rmsnorm_api(sample_x, sample_w)
-            self.assertEqual(result, ("output", "amax"))
+            self.assertIsInstance(result, jax_namespace.TupleDict)
+            self.assertEqual(tuple(result.keys()), ("output", "amax"))
+            self.assertEqual(tuple(result), ("output", "amax"))
+            self.assertIs(captured["launcher"], rmsnorm_module._launch)
             self.assertEqual(captured["inputs"], (sample_x, sample_w))
+            self.assertEqual(
+                captured["static_args"],
+                {"n": 2048, "num_threads": 128, "rows_per_cta": 2, "eps": 1e-5},
+            )
             self.assertEqual(
                 [(spec.name, spec.shape) for spec in captured["outputs"]],
                 [("output", (256, 2048)), ("amax", (128,))],
@@ -215,10 +223,6 @@ class JaxApiSurfaceTest(unittest.TestCase):
                     self.assertNotIn(f"{package_name}.jax", sys.modules)
 
                 facade = importlib.import_module(f"{package_name}.jax")
-                compatibility_adapter = importlib.import_module(f"{package_name}.jax.cutedsl")
-                internal_adapter = importlib.import_module(f"{package_name}._jax.api_base")
-                self.assertIs(compatibility_adapter.BufferSpec, internal_adapter.BufferSpec)
-                self.assertIs(compatibility_adapter.call_cutedsl, internal_adapter.call_cutedsl)
 
                 for operation_module in operation_modules:
                     for name in operation_module.__all__:
@@ -258,6 +262,10 @@ class JaxApiSurfaceTest(unittest.TestCase):
         fake_jax.__path__ = []
         fake_jax.__spec__ = ModuleSpec("jax", loader=None, is_package=True)
         fake_jax.numpy = fake_jnp
+        fake_jax.tree_util = types.SimpleNamespace(
+            DictKey=lambda key: key,
+            register_pytree_with_keys=lambda *_args: None,
+        )
 
         try:
             with mock.patch.dict(
@@ -338,7 +346,6 @@ class JaxApiSurfaceTest(unittest.TestCase):
         operation_apis = {}
         for operation_path, shared_names, jax_only_names in operations:
             self.assertTrue(shared_names, f"{operation_path} has no aligned Torch/JAX symbol")
-            self.assertTrue(jax_only_names, f"{operation_path} has no JAX-specific result type")
             operation_name = f"{package_name}.{operation_path}"
             torch_api = types.ModuleType(f"{operation_name}.api")
             jax_api = types.ModuleType(f"{operation_name}.jax")
@@ -440,8 +447,85 @@ class JaxApiSurfaceTest(unittest.TestCase):
 
         self.assertEqual(
             {path.name for path in (_CUDNN_ROOT / "jax").glob("*.py")},
-            {"__init__.py", "cutedsl.py"},
+            {"__init__.py"},
         )
+
+    def test_cutedsl_calls_use_stable_module_launchers(self):
+        for jax_file in _colocated_jax_files():
+            tree = ast.parse(jax_file.read_text(), filename=str(jax_file))
+            module_functions = {node.name: node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+            parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+
+            def resolve_launchers(value, assignments, seen=frozenset()):
+                if isinstance(value, ast.Name):
+                    if value.id in module_functions and value.id.startswith("_launch"):
+                        return {value.id}
+                    if value.id in seen:
+                        return set()
+                    resolved_assignments = [
+                        resolve_launchers(assigned_value, assignments, seen | {value.id}) for assigned_value in assignments.get(value.id, ())
+                    ]
+                    if not resolved_assignments or any(not resolved for resolved in resolved_assignments):
+                        return set()
+                    return set().union(*resolved_assignments)
+                if isinstance(value, ast.IfExp):
+                    body_launchers = resolve_launchers(value.body, assignments, seen)
+                    else_launchers = resolve_launchers(value.orelse, assignments, seen)
+                    if not body_launchers or not else_launchers:
+                        return set()
+                    return body_launchers | else_launchers
+                return set()
+
+            def same_scope_nodes(scope):
+                pending = list(scope.body)
+                while pending:
+                    node = pending.pop()
+                    yield node
+                    pending.extend(
+                        child
+                        for child in ast.iter_child_nodes(node)
+                        if not isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda))
+                    )
+
+            launcher_factories = {
+                node.name
+                for node in ast.walk(tree)
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and re.fullmatch(r"_make_?.*launcher", node.name)
+            }
+            cutedsl_calls = [
+                node for node in ast.walk(tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "call_cutedsl"
+            ]
+            if cutedsl_calls:
+                self.assertFalse(launcher_factories, f"{jax_file} must use stable module-level launchers")
+            for call in cutedsl_calls:
+                with self.subTest(operation=jax_file.parent.name, line=call.lineno):
+                    self.assertTrue(call.args, "call_cutedsl requires a launcher")
+                    scope = parents.get(call)
+                    while scope is not None and not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        scope = parents.get(scope)
+                    self.assertIsNotNone(scope)
+
+                    assignments = {}
+                    for node in same_scope_nodes(scope):
+                        if not isinstance(node, ast.Assign):
+                            continue
+                        for target in node.targets:
+                            if isinstance(target, ast.Name):
+                                assignments.setdefault(target.id, []).append(node.value)
+
+                    launchers = resolve_launchers(call.args[0], assignments)
+                    self.assertTrue(launchers, "launcher must resolve to a stable module-level function")
+
+                    static_keyword = next((keyword for keyword in call.keywords if keyword.arg == "static_args"), None)
+                    expected_by_launcher = {launcher: {argument.arg for argument in module_functions[launcher].args.kwonlyargs} for launcher in launchers}
+                    if not any(expected_by_launcher.values()) and static_keyword is None:
+                        continue
+                    self.assertIsNotNone(static_keyword)
+                    self.assertIsInstance(static_keyword.value, ast.Dict)
+                    static_names = {key.value for key in static_keyword.value.keys if isinstance(key, ast.Constant) and isinstance(key.value, str)}
+                    self.assertEqual(len(static_names), len(static_keyword.value.keys))
+                    for launcher, expected_names in expected_by_launcher.items():
+                        self.assertEqual(static_names, expected_names)
 
     def test_torch_function_remains_a_lazy_top_level_export(self):
         top_level_tree = ast.parse(

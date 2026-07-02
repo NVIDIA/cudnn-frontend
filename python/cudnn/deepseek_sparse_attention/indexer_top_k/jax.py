@@ -5,40 +5,30 @@
 
 from __future__ import annotations
 
-from functools import lru_cache
-from typing import Any, NamedTuple
+from typing import Any
 
 import jax.numpy as jnp
 from cutlass.jax import jax_to_cutlass_dtype
 
-from ..._jax.api_base import ApiBaseJax, BufferSpec, call_cutedsl
-from ..._jax.validation import require_dtype
+from ..._jax.api_base import (
+    ApiBaseJax,
+    BufferSpec,
+    TupleDict,
+    call_cutedsl,
+    require_dtype,
+)
 
 _INT32_MAX = (1 << 31) - 1
 
 
-class IndexerTopKResult(NamedTuple):
-    """Functional JAX outputs for indexer top-K."""
-
-    indices: Any
-    values: Any
-
-
-class LocalToGlobalResult(NamedTuple):
-    """Top-K indices converted to the global flattened KV index space."""
-
-    indices: Any
-
-
-class CompactifyResult(NamedTuple):
-    """Valid row-wise indices and their per-row lengths."""
-
-    indices: Any
-    topk_length: Any
-
-
-@lru_cache(maxsize=None)
-def _make_launcher(
+def _launch(
+    stream,
+    input_values,
+    seq_lens,
+    output_indices,
+    output_values,
+    extra_buffer,
+    *,
     cutlass_dtype: Any,
     dtype_bits: int,
     num_cols: int,
@@ -69,76 +59,81 @@ def _make_launcher(
         dtype_bits=dtype_bits,
     )
 
-    def launch(stream, input_values, seq_lens, output_indices, output_values, extra_buffer):
-        kernel(
-            input_values,
-            None,  # Only used by the unsupported multi-CTA merge path.
-            extra_buffer,
-            None,  # Only used by the unsupported persistent scheduler.
-            seq_lens,
-            output_indices,
-            output_values,
-            stream,
-            enable_persistent_dynamic_scheduling=False,
-            min_blocks_per_mp=1,
-        )
-
-    return launch
+    kernel(
+        input_values,
+        None,  # Only used by the unsupported multi-CTA merge path.
+        extra_buffer,
+        None,  # Only used by the unsupported persistent scheduler.
+        seq_lens,
+        output_indices,
+        output_values,
+        stream,
+        enable_persistent_dynamic_scheduling=False,
+        min_blocks_per_mp=1,
+    )
 
 
-@lru_cache(maxsize=None)
-def _make_local_to_global_launcher(*, is_varlen: bool, seqlen_k: int):
+def _launch_local_to_global_fixed(
+    stream,
+    local_indices,
+    global_indices,
+    *,
+    seqlen_k: int,
+):
     from cutlass import Int32
 
     from .local_to_global_dsl import LocalToGlobalTopK
 
-    kernel = LocalToGlobalTopK(is_varlen=is_varlen)
-
-    if is_varlen:
-
-        def launch(
-            stream,
-            local_indices,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            global_indices,
-        ):
-            kernel(
-                local_indices,
-                global_indices,
-                Int32(seqlen_k),
-                cu_seqlens_q,
-                cu_seqlens_k,
-                stream,
-            )
-
-    else:
-
-        def launch(stream, local_indices, global_indices):
-            kernel(
-                local_indices,
-                global_indices,
-                Int32(seqlen_k),
-                None,
-                None,
-                stream,
-            )
-
-    return launch
+    kernel = LocalToGlobalTopK(is_varlen=False)
+    kernel(
+        local_indices,
+        global_indices,
+        Int32(seqlen_k),
+        None,
+        None,
+        stream,
+    )
 
 
-@lru_cache(maxsize=None)
-def _make_compactify_launcher(*, rows: int, cols: int):
+def _launch_local_to_global_varlen(
+    stream,
+    local_indices,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    global_indices,
+    *,
+    seqlen_k: int,
+):
+    from cutlass import Int32
+
+    from .local_to_global_dsl import LocalToGlobalTopK
+
+    kernel = LocalToGlobalTopK(is_varlen=True)
+    kernel(
+        local_indices,
+        global_indices,
+        Int32(seqlen_k),
+        cu_seqlens_q,
+        cu_seqlens_k,
+        stream,
+    )
+
+
+def _launch_compactify(
+    stream,
+    indices,
+    compact_indices,
+    topk_length,
+    *,
+    rows: int,
+    cols: int,
+):
     from cutlass import Int32
 
     from .compactify import CompactifyKernel
 
     kernel = CompactifyKernel(cols=cols)
-
-    def launch(stream, indices, compact_indices, topk_length):
-        kernel(indices, compact_indices, topk_length, Int32(rows), stream)
-
-    return launch
+    kernel(indices, compact_indices, topk_length, Int32(rows), stream)
 
 
 def require_supported_top_k_output(
@@ -168,7 +163,7 @@ def _indexer_top_k_impl(
     return_val: bool = True,
     num_copy_bits: int = 256,
     _validate_only: bool = False,
-) -> IndexerTopKResult:
+) -> TupleDict:
     """Select the largest values from each row with variable valid lengths.
 
     This is the JAX counterpart of the Torch ``indexer_top_k_wrapper`` and is
@@ -242,15 +237,7 @@ def _indexer_top_k_impl(
 
     output_shape = (num_rows, top_k)
     output_indices, output_values = call_cutedsl(
-        _make_launcher(
-            jax_to_cutlass_dtype(input_dtype),
-            dtype_bits,
-            num_cols,
-            top_k,
-            next_n,
-            num_copy_bits,
-            num_rows > 148,
-        ),
+        _launch,
         (input_values, seq_lens),
         outputs=(
             BufferSpec("indices", output_shape, jnp.int32),
@@ -263,9 +250,18 @@ def _indexer_top_k_impl(
                 jnp.int32,
             ),
         ),
+        static_args={
+            "cutlass_dtype": jax_to_cutlass_dtype(input_dtype),
+            "dtype_bits": int(dtype_bits),
+            "num_cols": int(num_cols),
+            "top_k": int(top_k),
+            "next_n": int(next_n),
+            "num_copy_bits": int(num_copy_bits),
+            "large_occupancy": bool(num_rows > 148),
+        },
         use_static_tensors=True,
     )
-    return IndexerTopKResult(indices=output_indices, values=output_values)
+    return TupleDict(indices=output_indices, values=output_values)
 
 
 class IndexerTopK(ApiBaseJax):
@@ -300,10 +296,10 @@ class IndexerTopK(ApiBaseJax):
         )
         return True
 
-    def __call__(self, input_values: Any, seq_lens: Any) -> IndexerTopKResult:
+    def __call__(self, input_values: Any, seq_lens: Any) -> TupleDict:
         return super().__call__(input_values, seq_lens)
 
-    def _call_impl(self, input_values: Any, seq_lens: Any) -> IndexerTopKResult:
+    def _call_impl(self, input_values: Any, seq_lens: Any) -> TupleDict:
         self.check_tensor_signature(input_values, self.input_desc, name="input_values")
         self.check_tensor_signature(seq_lens, self.seq_lens_desc, name="seq_lens")
         return _indexer_top_k_impl(
@@ -323,7 +319,7 @@ def indexer_top_k_wrapper(
     next_n: int = 1,
     return_val: bool = True,
     num_copy_bits: int = 256,
-) -> IndexerTopKResult:
+) -> TupleDict:
     """Select the largest values from each row with variable valid lengths."""
 
     return IndexerTopK(
@@ -341,7 +337,7 @@ def local_to_global_wrapper(
     seqlen_k: int,
     cu_seqlens_q: Any | None = None,
     cu_seqlens_k: Any | None = None,
-) -> LocalToGlobalResult:
+) -> TupleDict:
     """Convert local top-K indices to the global flattened KV index space.
 
     Fixed-shape input has shape ``(B, S_q, topk)`` and uses
@@ -384,11 +380,9 @@ def local_to_global_wrapper(
         local_indices,
         (jnp.int32, jnp.int64),
     )
+    launcher = _launch_local_to_global_varlen if is_varlen else _launch_local_to_global_fixed
     (global_indices,) = call_cutedsl(
-        _make_local_to_global_launcher(
-            is_varlen=is_varlen,
-            seqlen_k=int(seqlen_k),
-        ),
+        launcher,
         inputs,
         outputs=(
             BufferSpec(
@@ -397,12 +391,13 @@ def local_to_global_wrapper(
                 jnp.int32,
             ),
         ),
+        static_args={"seqlen_k": int(seqlen_k)},
         use_static_tensors=True,
     )
-    return LocalToGlobalResult(indices=global_indices)
+    return TupleDict(indices=global_indices)
 
 
-def compactify_wrapper(indices: Any) -> CompactifyResult:
+def compactify_wrapper(indices: Any) -> TupleDict:
     """Pack nonnegative indices to the front of each row.
 
     ``indices`` may have shape ``(rows, topk)`` or ``(B, S_q, topk)``. As in
@@ -426,25 +421,23 @@ def compactify_wrapper(indices: Any) -> CompactifyResult:
 
     flat_indices = jnp.reshape(indices, (rows, cols))
     compact_indices, topk_length = call_cutedsl(
-        _make_compactify_launcher(rows=rows, cols=cols),
+        _launch_compactify,
         (flat_indices,),
         outputs=(
             BufferSpec("indices", (rows, cols), jnp.int32),
             BufferSpec("topk_length", (rows,), jnp.int32),
         ),
+        static_args={"rows": int(rows), "cols": int(cols)},
         use_static_tensors=True,
     )
-    return CompactifyResult(
+    return TupleDict(
         indices=compact_indices,
         topk_length=topk_length,
     )
 
 
 __all__ = [
-    "CompactifyResult",
     "IndexerTopK",
-    "IndexerTopKResult",
-    "LocalToGlobalResult",
     "compactify_wrapper",
     "indexer_top_k_wrapper",
     "local_to_global_wrapper",

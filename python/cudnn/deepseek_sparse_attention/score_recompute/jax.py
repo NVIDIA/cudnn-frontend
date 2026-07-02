@@ -5,40 +5,31 @@
 
 from __future__ import annotations
 
-from functools import lru_cache
-from typing import Any, NamedTuple, Optional
+from typing import Any, Optional
 
 import jax.numpy as jnp
 
-from ..._jax.api_base import ApiBaseJax, BufferSpec, call_cutedsl
-from ..._jax.validation import require_dtype
+from ..._jax.api_base import (
+    ApiBaseJax,
+    BufferSpec,
+    TupleDict,
+    call_cutedsl,
+    require_dtype,
+)
 from .config import (
     resolve_dense_score_kernel_config,
     resolve_sparse_score_kernel_config,
 )
 
 
-class SparseIndexerScoreRecomputeResult(NamedTuple):
-    """Normalized sparse indexer scores."""
-
-    predict: Any
-
-
-class SparseAttnScoreRecomputeResult(NamedTuple):
-    """Normalized sparse attention scores."""
-
-    target: Any
-
-
-class DenseScoreRecomputeResult(NamedTuple):
-    """Raw dense scores and their per-query normalization denominator."""
-
-    out: Any
-    denom: Any
-
-
-@lru_cache(maxsize=None)
-def _make_launcher(
+def _launch_sparse_with_topk_length(
+    stream,
+    q,
+    k,
+    per_head,
+    topk_indices,
+    topk_length,
+    out,
     *,
     score_type: str,
     head_dim: int,
@@ -48,7 +39,6 @@ def _make_launcher(
     n_block_size: int,
     k_block_size: int | None,
     kv_stage: int,
-    have_topk_length: bool,
     topk_in_smem: bool,
     topk_indices_global: bool,
     softmax_scale: float,
@@ -66,45 +56,83 @@ def _make_launcher(
         topk=topk,
         kv_stage=kv_stage,
         score_type=score_type,
-        have_topk_length=have_topk_length,
+        have_topk_length=True,
         topk_in_smem=topk_in_smem,
         k_block_size=k_block_size,
         topk_indices_global=topk_indices_global,
     )
 
-    if have_topk_length:
-
-        def launch(stream, q, k, per_head, topk_indices, topk_length, out):
-            kernel(
-                q,
-                k,
-                per_head,
-                topk_indices,
-                out,
-                topk_length,
-                Float32(softmax_scale),
-                stream,
-            )
-
-    else:
-
-        def launch(stream, q, k, per_head, topk_indices, out, topk_length_workspace):
-            kernel(
-                q,
-                k,
-                per_head,
-                topk_indices,
-                out,
-                topk_length_workspace,
-                Float32(softmax_scale),
-                stream,
-            )
-
-    return launch
+    kernel(
+        q,
+        k,
+        per_head,
+        topk_indices,
+        out,
+        topk_length,
+        Float32(softmax_scale),
+        stream,
+    )
 
 
-@lru_cache(maxsize=None)
-def _make_dense_launcher(
+def _launch_sparse_without_topk_length(
+    stream,
+    q,
+    k,
+    per_head,
+    topk_indices,
+    out,
+    topk_length_workspace,
+    *,
+    score_type: str,
+    head_dim: int,
+    qhead_per_kv_head: int,
+    topk: int,
+    m_block_size: int,
+    n_block_size: int,
+    k_block_size: int | None,
+    kv_stage: int,
+    topk_in_smem: bool,
+    topk_indices_global: bool,
+    softmax_scale: float,
+):
+    # Load the architecture-specific kernel only when tracing the operation.
+    from cutlass import Float32
+
+    from .sparse_score_recompute_sm100 import SparseScoreRecomputeSm100
+
+    kernel = SparseScoreRecomputeSm100(
+        head_dim=head_dim,
+        qhead_per_kvhead=qhead_per_kv_head,
+        m_block_size=m_block_size,
+        n_block_size=n_block_size,
+        topk=topk,
+        kv_stage=kv_stage,
+        score_type=score_type,
+        have_topk_length=False,
+        topk_in_smem=topk_in_smem,
+        k_block_size=k_block_size,
+        topk_indices_global=topk_indices_global,
+    )
+    kernel(
+        q,
+        k,
+        per_head,
+        topk_indices,
+        out,
+        topk_length_workspace,
+        Float32(softmax_scale),
+        stream,
+    )
+
+
+def _launch_dense_with_q_causal_offsets(
+    stream,
+    q,
+    k,
+    per_head,
+    q_causal_offsets,
+    out,
+    denom,
     *,
     score_type: str,
     head_dim: int,
@@ -113,7 +141,6 @@ def _make_dense_launcher(
     max_seqlen_q: int,
     max_seqlen_k: int,
     scale: float,
-    have_q_causal_offsets: bool,
 ):
     from cutlass import Float32, Int32
 
@@ -135,43 +162,72 @@ def _make_dense_launcher(
         ratio=ratio,
         is_varlen=False,
     )
-    if have_q_causal_offsets:
+    kernel(
+        q,
+        k,
+        per_head,
+        out,
+        denom,
+        Float32(scale),
+        Int32(max_seqlen_q),
+        Int32(max_seqlen_k),
+        None,
+        None,
+        q_causal_offsets,
+        stream,
+    )
 
-        def launch(stream, q, k, per_head, q_causal_offsets, out, denom):
-            kernel(
-                q,
-                k,
-                per_head,
-                out,
-                denom,
-                Float32(scale),
-                Int32(max_seqlen_q),
-                Int32(max_seqlen_k),
-                None,
-                None,
-                q_causal_offsets,
-                stream,
-            )
 
-    else:
+def _launch_dense_without_q_causal_offsets(
+    stream,
+    q,
+    k,
+    per_head,
+    out,
+    denom,
+    *,
+    score_type: str,
+    head_dim: int,
+    qhead_per_kv_head: int,
+    ratio: int,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    scale: float,
+):
+    from cutlass import Float32, Int32
 
-        def launch(stream, q, k, per_head, out, denom):
-            kernel(
-                q,
-                k,
-                per_head,
-                out,
-                denom,
-                Float32(scale),
-                Int32(max_seqlen_q),
-                Int32(max_seqlen_k),
-                None,
-                None,
-                None,
-                stream,
-            )
+    from .dense_score_recompute_sm100 import DenseScoreRecomputeSm100
 
-    return launch
+    config = resolve_dense_score_kernel_config(
+        score_type=score_type,
+        head_dim=head_dim,
+        qhead_per_kv_head=qhead_per_kv_head,
+    )
+    kernel = DenseScoreRecomputeSm100(
+        head_dim=head_dim,
+        qhead_per_kvhead=qhead_per_kv_head,
+        m_block_size=config.m_block_size,
+        n_block_size=config.n_block_size,
+        k_block_size=config.k_block_size,
+        kv_stage=config.kv_stage,
+        score_type=score_type,
+        ratio=ratio,
+        is_varlen=False,
+    )
+    kernel(
+        q,
+        k,
+        per_head,
+        out,
+        denom,
+        Float32(scale),
+        Int32(max_seqlen_q),
+        Int32(max_seqlen_k),
+        None,
+        None,
+        None,
+        stream,
+    )
 
 
 def _dense_score_recompute(
@@ -187,7 +243,7 @@ def _dense_score_recompute(
     ratio: int,
     q_causal_offsets: Any | None,
     _validate_only: bool = False,
-) -> DenseScoreRecomputeResult:
+) -> TupleDict:
     arrays = (
         ("q", q, 4),
         ("k", k, 4),
@@ -250,17 +306,9 @@ def _dense_score_recompute(
     if _validate_only:
         return None
 
+    launcher = _launch_dense_with_q_causal_offsets if q_causal_offsets is not None else _launch_dense_without_q_causal_offsets
     out, denom = call_cutedsl(
-        _make_dense_launcher(
-            score_type=score_type,
-            head_dim=head_dim,
-            qhead_per_kv_head=qhead_per_kv_head,
-            ratio=int(ratio),
-            max_seqlen_q=seqlen_q,
-            max_seqlen_k=seqlen_k,
-            scale=resolved_scale,
-            have_q_causal_offsets=q_causal_offsets is not None,
-        ),
+        launcher,
         inputs,
         outputs=(
             BufferSpec(
@@ -271,9 +319,18 @@ def _dense_score_recompute(
             ),
             BufferSpec("denom", (batch, seqlen_q), jnp.float32),
         ),
+        static_args={
+            "score_type": str(score_type),
+            "head_dim": int(head_dim),
+            "qhead_per_kv_head": int(qhead_per_kv_head),
+            "ratio": int(ratio),
+            "max_seqlen_q": int(seqlen_q),
+            "max_seqlen_k": int(seqlen_k),
+            "scale": resolved_scale,
+        },
         use_static_tensors=True,
     )
-    return DenseScoreRecomputeResult(out=out, denom=denom)
+    return TupleDict(out=out, denom=denom)
 
 
 def _sparse_score_recompute(
@@ -367,21 +424,6 @@ def _sparse_score_recompute(
     if _validate_only:
         return None
 
-    launcher = _make_launcher(
-        score_type=score_type,
-        head_dim=head_dim,
-        qhead_per_kv_head=qhead_per_kv_head,
-        topk=topk,
-        m_block_size=config.m_block_size,
-        n_block_size=config.n_block_size,
-        k_block_size=config.k_block_size,
-        kv_stage=config.kv_stage,
-        have_topk_length=config.have_topk_length,
-        topk_in_smem=config.topk_in_smem,
-        topk_indices_global=topk_indices_global,
-        softmax_scale=softmax_scale,
-    )
-
     inputs = (q, k, per_head, topk_indices)
     workspaces = ()
     if topk_length is not None:
@@ -391,11 +433,25 @@ def _sparse_score_recompute(
         # ``have_topk_length`` mode is false. It never reads this dummy buffer.
         workspaces = (BufferSpec("topk_length_workspace", (1, 1), jnp.int32),)
 
+    launcher = _launch_sparse_with_topk_length if config.have_topk_length else _launch_sparse_without_topk_length
     (out,) = call_cutedsl(
         launcher,
         inputs,
         outputs=(BufferSpec(output_name, (batch, seqlen_q, topk), jnp.float32),),
         workspaces=workspaces,
+        static_args={
+            "score_type": str(score_type),
+            "head_dim": int(head_dim),
+            "qhead_per_kv_head": int(qhead_per_kv_head),
+            "topk": int(topk),
+            "m_block_size": int(config.m_block_size),
+            "n_block_size": int(config.n_block_size),
+            "k_block_size": None if config.k_block_size is None else int(config.k_block_size),
+            "kv_stage": int(config.kv_stage),
+            "topk_in_smem": bool(config.topk_in_smem),
+            "topk_indices_global": bool(topk_indices_global),
+            "softmax_scale": float(softmax_scale),
+        },
         use_static_tensors=True,
     )
     return out
@@ -448,7 +504,7 @@ class SparseIndexerScoreRecompute(ApiBaseJax):
         weights: Any,
         topk_indices: Any,
         topk_length: Optional[Any] = None,
-    ) -> SparseIndexerScoreRecomputeResult:
+    ) -> TupleDict:
         return super().__call__(q_indexer, k_indexer, weights, topk_indices, topk_length)
 
     def _call_impl(
@@ -458,7 +514,7 @@ class SparseIndexerScoreRecompute(ApiBaseJax):
         weights: Any,
         topk_indices: Any,
         topk_length: Optional[Any] = None,
-    ) -> SparseIndexerScoreRecomputeResult:
+    ) -> TupleDict:
         for value, expected, name in (
             (q_indexer, self.q_desc, "Q"),
             (k_indexer, self.k_desc, "K"),
@@ -481,7 +537,7 @@ class SparseIndexerScoreRecompute(ApiBaseJax):
             topk_length=topk_length,
             topk_indices_global=self.topk_indices_global,
         )
-        return SparseIndexerScoreRecomputeResult(predict=predict)
+        return TupleDict(predict=predict)
 
 
 class SparseAttnScoreRecompute(ApiBaseJax):
@@ -533,7 +589,7 @@ class SparseAttnScoreRecompute(ApiBaseJax):
         lse: Any,
         topk_indices: Any,
         topk_length: Optional[Any] = None,
-    ) -> SparseAttnScoreRecomputeResult:
+    ) -> TupleDict:
         return super().__call__(q_attn, k_attn, lse, topk_indices, topk_length)
 
     def _call_impl(
@@ -543,7 +599,7 @@ class SparseAttnScoreRecompute(ApiBaseJax):
         lse: Any,
         topk_indices: Any,
         topk_length: Optional[Any] = None,
-    ) -> SparseAttnScoreRecomputeResult:
+    ) -> TupleDict:
         for value, expected, name in (
             (q_attn, self.q_desc, "Q"),
             (k_attn, self.k_desc, "K"),
@@ -566,7 +622,7 @@ class SparseAttnScoreRecompute(ApiBaseJax):
             topk_length=topk_length,
             topk_indices_global=self.topk_indices_global,
         )
-        return SparseAttnScoreRecomputeResult(target=target)
+        return TupleDict(target=target)
 
 
 class DenseIndexerScoreRecompute(ApiBaseJax):
@@ -607,10 +663,10 @@ class DenseIndexerScoreRecompute(ApiBaseJax):
         )
         return True
 
-    def __call__(self, q: Any, k: Any, weights: Any, q_causal_offsets: Any | None = None) -> DenseScoreRecomputeResult:
+    def __call__(self, q: Any, k: Any, weights: Any, q_causal_offsets: Any | None = None) -> TupleDict:
         return super().__call__(q, k, weights, q_causal_offsets)
 
-    def _call_impl(self, q: Any, k: Any, weights: Any, q_causal_offsets: Any | None = None) -> DenseScoreRecomputeResult:
+    def _call_impl(self, q: Any, k: Any, weights: Any, q_causal_offsets: Any | None = None) -> TupleDict:
         self.check_tensor_signature(q, self.q_desc, name="Q")
         self.check_tensor_signature(k, self.k_desc, name="K")
         self.check_tensor_signature(weights, self.weights_desc, name="weights")
@@ -667,10 +723,10 @@ class DenseAttnScoreRecompute(ApiBaseJax):
         )
         return True
 
-    def __call__(self, q: Any, k: Any, lse: Any, q_causal_offsets: Any | None = None) -> DenseScoreRecomputeResult:
+    def __call__(self, q: Any, k: Any, lse: Any, q_causal_offsets: Any | None = None) -> TupleDict:
         return super().__call__(q, k, lse, q_causal_offsets)
 
-    def _call_impl(self, q: Any, k: Any, lse: Any, q_causal_offsets: Any | None = None) -> DenseScoreRecomputeResult:
+    def _call_impl(self, q: Any, k: Any, lse: Any, q_causal_offsets: Any | None = None) -> TupleDict:
         self.check_tensor_signature(q, self.q_desc, name="Q")
         self.check_tensor_signature(k, self.k_desc, name="K")
         self.check_tensor_signature(lse, self.lse_desc, name="LSE")
@@ -697,7 +753,7 @@ def sparse_indexer_score_recompute_wrapper(
     qhead_per_kv_head: Optional[int] = None,
     topk_length: Optional[Any] = None,
     topk_indices_global: bool = False,
-) -> SparseIndexerScoreRecomputeResult:
+) -> TupleDict:
     """Recompute normalized sparse indexer scores with the SM100 kernel.
 
     Inputs have shapes ``(B, S_q, H_q, D)``, ``(B, S_k, D)``,
@@ -730,7 +786,7 @@ def sparse_attn_score_recompute_wrapper(
     qhead_per_kv_head: Optional[int] = None,
     topk_length: Optional[Any] = None,
     topk_indices_global: bool = False,
-) -> SparseAttnScoreRecomputeResult:
+) -> TupleDict:
     """Recompute normalized sparse attention scores with the SM100 kernel.
 
     ``q_attn`` and ``k_attn`` use ``bfloat16``; ``lse`` uses ``float32``;
@@ -760,7 +816,7 @@ def dense_indexer_score_recompute_wrapper(
     sm_scale: float = 1.0,
     ratio: int = 1,
     q_causal_offsets: Any | None = None,
-) -> DenseScoreRecomputeResult:
+) -> TupleDict:
     """Compute dense indexer scores and their log-sum-exp denominator.
 
     This binding currently supports fixed-shape SM100 BSHD tensors. ``q`` and
@@ -789,7 +845,7 @@ def dense_attn_score_recompute_wrapper(
     qhead_per_kv_head: Optional[int] = None,
     ratio: int = 1,
     q_causal_offsets: Any | None = None,
-) -> DenseScoreRecomputeResult:
+) -> TupleDict:
     """Compute dense attention scores and their L1 denominator.
 
     This binding currently supports fixed-shape SM100 BSHD tensors. ``q`` and
@@ -812,11 +868,8 @@ def dense_attn_score_recompute_wrapper(
 __all__ = [
     "DenseAttnScoreRecompute",
     "DenseIndexerScoreRecompute",
-    "DenseScoreRecomputeResult",
     "SparseAttnScoreRecompute",
-    "SparseAttnScoreRecomputeResult",
     "SparseIndexerScoreRecompute",
-    "SparseIndexerScoreRecomputeResult",
     "dense_attn_score_recompute_wrapper",
     "dense_indexer_score_recompute_wrapper",
     "sparse_attn_score_recompute_wrapper",

@@ -69,10 +69,10 @@ def sdpa_fwd(q, k, v):
     )
 
 result = sdpa_fwd(q, k, v)
-o_tensor, lse_tensor = result.o_tensor, result.lse_tensor
+o_tensor, lse_tensor = result["o_tensor"], result["lse_tensor"]
 ```
 
-The JAX wrapper returns `SdpaFwdResult(o_tensor=..., lse_tensor=...)`. It
+The JAX wrapper returns `TupleDict(o_tensor=..., lse_tensor=...)`. It
 supports fixed BHSD arrays only: Q, K, and V use logical shape
 `(B,H,S,256)`, share FP16 or BF16 dtype, and satisfy `H_q % H_kv == 0`.
 Packed THD inputs, cumulative lengths, `max_s_*`, explicit outputs, and stream
@@ -177,7 +177,7 @@ The PyTorch wrapper returns a `TupleDict` with keys:
 
 Tuple unpacking order is `(o_tensor, lse_tensor)`.
 
-The JAX wrapper returns `SdpaFwdResult` with the same `o_tensor` and
+The JAX wrapper returns `TupleDict` with the same `o_tensor` and
 `lse_tensor` field names and tuple order.
 
 ## Support surface and constraints

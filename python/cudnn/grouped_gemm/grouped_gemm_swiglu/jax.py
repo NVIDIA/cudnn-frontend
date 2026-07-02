@@ -5,13 +5,18 @@
 
 from __future__ import annotations
 
-from functools import lru_cache
 import os
-from typing import Any, NamedTuple, Optional
+from typing import Any, Optional
 
 import jax.numpy as jnp
 
-from ..._jax.api_base import ApiBaseJax, BufferSpec, call_cutedsl
+from ..._jax.api_base import (
+    ApiBaseJax,
+    BufferSpec,
+    TupleDict,
+    call_cutedsl,
+    require_dtype,
+)
 from ..._jax.gemm import (
     block_scale_tensor_spec,
     gemm_a_tensor_spec,
@@ -26,7 +31,6 @@ from ..._jax.grouped_gemm import (
     require_grouped_probability,
     require_grouped_vector,
 )
-from ..._jax.validation import require_dtype
 from ...gemm_validation import (
     block_scale_shape,
     resolve_max_active_clusters,
@@ -34,20 +38,9 @@ from ...gemm_validation import (
 from .._jax_api import check_call_signatures, immutable_mapping
 
 
-class GroupedGemmSwigluResult(NamedTuple):
-    """Functional outputs from contiguous grouped GEMM + SwiGLU."""
-
-    c_tensor: Any
-    d_tensor: Any
-    d_col_tensor: Any
-    amax_tensor: Any | None
-    sfd_row_tensor: Any
-    sfd_col_tensor: Any
-
-
-@lru_cache(maxsize=None)
-def _make_launcher(
-    *,
+def _launch(
+    stream,
+    *args,
     acc_dtype: Any,
     mma_tiler_mn: tuple[int, int],
     cluster_shape_mn: tuple[int, int],
@@ -59,73 +52,70 @@ def _make_launcher(
     has_amax: bool,
     cluster_overlap_margin: int,
 ):
-    def launch(stream, *args):
-        import cutlass
-        from cutlass.jax import jax_to_cutlass_dtype
+    import cutlass
+    from cutlass.jax import jax_to_cutlass_dtype
 
-        from .grouped_gemm_swiglu_quant import BlockScaledContiguousGroupedGemmKernel
+    from .grouped_gemm_swiglu_quant import BlockScaledContiguousGroupedGemmKernel
 
-        arg_idx = 0
+    arg_idx = 0
 
-        def take():
-            nonlocal arg_idx
-            value = args[arg_idx]
-            arg_idx += 1
-            return value
+    def take():
+        nonlocal arg_idx
+        value = args[arg_idx]
+        arg_idx += 1
+        return value
 
-        a = take()
-        b = take()
-        sfa = take()
-        sfb = take()
-        padded_offsets = take()
-        alpha = take()
-        norm_const = take()
-        prob = take() if has_prob else None
-        c = take()
-        d = take()
-        d_col = take()
-        amax = take() if has_amax else None
-        sfd_row = take()
-        sfd_col = take()
-        if arg_idx != len(args):
-            raise RuntimeError(f"Unexpected grouped GEMM argument count: consumed {arg_idx}, received {len(args)}")
+    a = take()
+    b = take()
+    sfa = take()
+    sfb = take()
+    padded_offsets = take()
+    alpha = take()
+    norm_const = take()
+    prob = take() if has_prob else None
+    c = take()
+    d = take()
+    d_col = take()
+    amax = take() if has_amax else None
+    sfd_row = take()
+    sfd_col = take()
+    if arg_idx != len(args):
+        raise RuntimeError(f"Unexpected grouped GEMM argument count: consumed {arg_idx}, received {len(args)}")
 
-        kernel = BlockScaledContiguousGroupedGemmKernel(
-            sf_vec_size=sf_vec_size,
-            acc_dtype=jax_to_cutlass_dtype(acc_dtype),
-            use_2cta_instrs=mma_tiler_mn[0] == BlockScaledContiguousGroupedGemmKernel.TWO_CTA_MMA_TILER_M,
-            mma_tiler_mn=mma_tiler_mn,
-            cluster_shape_mn=cluster_shape_mn,
-            vector_f32=vector_f32,
-            generate_sfd=True,
-            discrete_col_sfd=discrete_col_sfd,
-            expert_cnt=expert_cnt,
-            use_mono_increase_expert_idx=True,
-        )
-        max_active_clusters = resolve_max_active_clusters(
-            cutlass.utils.HardwareInfo().get_max_active_clusters(cluster_shape_mn[0] * cluster_shape_mn[1]),
-            cluster_overlap_margin,
-        )
-        kernel(
-            a,
-            b,
-            c,
-            d,
-            d_col,
-            sfa,
-            sfb,
-            sfd_row,
-            sfd_col,
-            amax,
-            norm_const,
-            padded_offsets,
-            alpha,
-            prob,
-            max_active_clusters,
-            stream,
-        )
-
-    return launch
+    kernel = BlockScaledContiguousGroupedGemmKernel(
+        sf_vec_size=sf_vec_size,
+        acc_dtype=jax_to_cutlass_dtype(acc_dtype),
+        use_2cta_instrs=mma_tiler_mn[0] == BlockScaledContiguousGroupedGemmKernel.TWO_CTA_MMA_TILER_M,
+        mma_tiler_mn=mma_tiler_mn,
+        cluster_shape_mn=cluster_shape_mn,
+        vector_f32=vector_f32,
+        generate_sfd=True,
+        discrete_col_sfd=discrete_col_sfd,
+        expert_cnt=expert_cnt,
+        use_mono_increase_expert_idx=True,
+    )
+    max_active_clusters = resolve_max_active_clusters(
+        cutlass.utils.HardwareInfo().get_max_active_clusters(cluster_shape_mn[0] * cluster_shape_mn[1]),
+        cluster_overlap_margin,
+    )
+    kernel(
+        a,
+        b,
+        c,
+        d,
+        d_col,
+        sfa,
+        sfb,
+        sfd_row,
+        sfd_col,
+        amax,
+        norm_const,
+        padded_offsets,
+        alpha,
+        prob,
+        max_active_clusters,
+        stream,
+    )
 
 
 def _grouped_gemm_swiglu_impl(
@@ -149,7 +139,7 @@ def _grouped_gemm_swiglu_impl(
     discrete_col_sfd: bool = False,
     *,
     _validate_only: bool = False,
-) -> GroupedGemmSwigluResult | dict[str, Any]:
+) -> TupleDict | dict[str, Any]:
     """Compute MXFP8 contiguous grouped GEMM and fused SwiGLU.
 
     ``a_tensor`` has shape ``(M, K, 1)`` and contains all padded expert rows.
@@ -279,19 +269,20 @@ def _grouped_gemm_swiglu_impl(
         )
     )
     results = call_cutedsl(
-        _make_launcher(
-            acc_dtype=acc_dtype,
-            mma_tiler_mn=mma_tiler_mn,
-            cluster_shape_mn=cluster_shape_mn,
-            sf_vec_size=sf_vec_size,
-            vector_f32=bool(vector_f32),
-            discrete_col_sfd=bool(discrete_col_sfd),
-            expert_cnt=experts,
-            has_prob=prob_tensor is not None,
-            has_amax=has_amax,
-            cluster_overlap_margin=int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0")),
-        ),
+        _launch,
         inputs,
+        static_args={
+            "acc_dtype": acc_dtype,
+            "mma_tiler_mn": mma_tiler_mn,
+            "cluster_shape_mn": cluster_shape_mn,
+            "sf_vec_size": sf_vec_size,
+            "vector_f32": bool(vector_f32),
+            "discrete_col_sfd": bool(discrete_col_sfd),
+            "expert_cnt": experts,
+            "has_prob": prob_tensor is not None,
+            "has_amax": has_amax,
+            "cluster_overlap_margin": int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0")),
+        },
         outputs=output_specs,
         input_specs=input_specs,
         use_static_tensors=True,
@@ -307,7 +298,7 @@ def _grouped_gemm_swiglu_impl(
     result_idx += int(has_amax)
     sfd_row_tensor = results[result_idx]
     sfd_col_tensor = results[result_idx + 1]
-    return GroupedGemmSwigluResult(
+    return TupleDict(
         c_tensor=c_tensor,
         d_tensor=d_tensor,
         d_col_tensor=d_col_tensor,
@@ -394,7 +385,7 @@ class GroupedGemmSwigluSm100(ApiBaseJax):
         alpha_tensor: Any,
         norm_const_tensor: Any,
         prob_tensor: Optional[Any] = None,
-    ) -> GroupedGemmSwigluResult:
+    ) -> TupleDict:
         return super().__call__(
             a_tensor,
             b_tensor,
@@ -416,7 +407,7 @@ class GroupedGemmSwigluSm100(ApiBaseJax):
         alpha_tensor: Any,
         norm_const_tensor: Any,
         prob_tensor: Optional[Any] = None,
-    ) -> GroupedGemmSwigluResult:
+    ) -> TupleDict:
         values = {
             "a_tensor": a_tensor,
             "b_tensor": b_tensor,
@@ -450,7 +441,7 @@ def grouped_gemm_swiglu_wrapper_sm100(
     vector_f32: bool = False,
     m_aligned: int = 256,
     discrete_col_sfd: bool = False,
-) -> GroupedGemmSwigluResult:
+) -> TupleDict:
     """Compute MXFP8 contiguous grouped GEMM and fused SwiGLU."""
 
     return GroupedGemmSwigluSm100(
@@ -485,7 +476,6 @@ def grouped_gemm_swiglu_wrapper_sm100(
 
 
 __all__ = [
-    "GroupedGemmSwigluResult",
     "GroupedGemmSwigluSm100",
     "grouped_gemm_swiglu_wrapper_sm100",
 ]

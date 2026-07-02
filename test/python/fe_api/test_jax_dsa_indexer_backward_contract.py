@@ -127,6 +127,10 @@ class JaxDsaIndexerBackwardContractTest(unittest.TestCase):
         cls.fake_jax.__path__ = []
         cls.fake_jax.__spec__ = ModuleSpec("jax", loader=None, is_package=True)
         cls.fake_jax.numpy = cls.fake_jnp
+        cls.fake_jax.tree_util = types.SimpleNamespace(
+            DictKey=lambda key: key,
+            register_pytree_with_keys=lambda *_args: None,
+        )
         cls.fake_jax.ShapeDtypeStruct = lambda shape, dtype: (shape, dtype)
 
         cls.fake_cutlass = types.ModuleType("cutlass")
@@ -167,7 +171,6 @@ class JaxDsaIndexerBackwardContractTest(unittest.TestCase):
                 sys.modules.pop(module_name, None)
 
     def setUp(self):
-        self.module._make_launcher.cache_clear()
         _ScoreGradKernel.instances.clear()
         _BackwardKernel.instances.clear()
 
@@ -213,7 +216,7 @@ class JaxDsaIndexerBackwardContractTest(unittest.TestCase):
 
         with (
             self._optional_modules(include_kernel=True),
-            mock.patch.object(self.module, "_make_launcher", return_value=launcher),
+            mock.patch.object(self.module, "_launch", new=launcher),
             mock.patch.object(
                 self.module,
                 "call_cutedsl",
@@ -223,10 +226,10 @@ class JaxDsaIndexerBackwardContractTest(unittest.TestCase):
             result = self.module.indexer_backward_wrapper(*inputs)
 
         q, weights, k, attn_score, index_score, topk_indices = inputs
-        self.assertEqual(result.d_index_q.shape, q.shape)
-        self.assertEqual(result.d_weights.shape, weights.shape)
-        self.assertEqual(result.d_index_k.shape, k.shape)
-        self.assertIs(result.d_index_k.dtype, self.bfloat16)
+        self.assertEqual(result["d_index_q"].shape, q.shape)
+        self.assertEqual(result["d_weights"].shape, weights.shape)
+        self.assertEqual(result["d_index_k"].shape, k.shape)
+        self.assertIs(result["d_index_k"].dtype, self.bfloat16)
         self.assertEqual(captured["inputs"][:-1], inputs)
         grad_loss = captured["inputs"][-1]
         self.assertEqual((grad_loss.shape, grad_loss.dtype), ((1,), self.float32))
@@ -249,13 +252,25 @@ class JaxDsaIndexerBackwardContractTest(unittest.TestCase):
         self.assertIs(captured["inputs"][3], attn_score)
         self.assertIs(captured["inputs"][4], index_score)
         self.assertIs(captured["inputs"][5], topk_indices)
+        self.assertEqual(
+            captured["static_args"],
+            {
+                "heads": 64,
+                "head_dim": 128,
+                "topk": 128,
+                "block_i": 128,
+                "sm_scale": 1.0,
+                "grad_scale": 1.0 / (2 * 64),
+                "topk_indices_global": False,
+            },
+        )
 
     def test_grad_loss_array_remains_a_runtime_operand(self):
         captured = {}
         grad_loss = _Array((), self.float32)
         with (
             self._optional_modules(include_kernel=True),
-            mock.patch.object(self.module, "_make_launcher", return_value=object()),
+            mock.patch.object(self.module, "_launch", new=object()),
             mock.patch.object(
                 self.module,
                 "call_cutedsl",
@@ -270,7 +285,8 @@ class JaxDsaIndexerBackwardContractTest(unittest.TestCase):
     def test_launcher_orders_stages_without_mutating_score_inputs(self):
         placeholders = [object() for _ in range(12)]
         with self._optional_modules(include_kernel=True):
-            launcher = self.module._make_launcher(
+            self.module._launch(
+                *placeholders,
                 heads=64,
                 head_dim=128,
                 topk=128,
@@ -279,7 +295,6 @@ class JaxDsaIndexerBackwardContractTest(unittest.TestCase):
                 grad_scale=0.25,
                 topk_indices_global=False,
             )
-            launcher(*placeholders)
 
         score_grad = _ScoreGradKernel.instances[-1]
         backward = _BackwardKernel.instances[-1]

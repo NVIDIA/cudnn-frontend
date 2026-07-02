@@ -110,6 +110,15 @@ class ApiBaseFrameworkSplitTest(unittest.TestCase):
         fake_jax.__path__ = []
         fake_jax.__spec__ = ModuleSpec("jax", loader=None, is_package=True)
         fake_jax.numpy = fake_jnp
+        pytree_registrations = []
+
+        def register_pytree_with_keys(node_type, flatten_with_keys, unflatten, flatten):
+            pytree_registrations.append((node_type, flatten_with_keys, unflatten, flatten))
+
+        fake_jax.tree_util = types.SimpleNamespace(
+            DictKey=lambda key: key,
+            register_pytree_with_keys=register_pytree_with_keys,
+        )
 
         def identity_jit(fn=None, **_kwargs):
             return (lambda decorated_fn: decorated_fn) if fn is None else fn
@@ -137,6 +146,25 @@ class ApiBaseFrameworkSplitTest(unittest.TestCase):
                 },
             ):
                 module = importlib.import_module(f"{package_name}._jax.api_base")
+
+                self.assertEqual(len(pytree_registrations), 1)
+                node_type, flatten_with_keys, unflatten, flatten = pytree_registrations[0]
+                self.assertIs(node_type, module.TupleDict)
+                result = module.TupleDict(output="output", values="values")
+                children, keys = flatten(result)
+                self.assertEqual(children, ("output", "values"))
+                self.assertEqual(keys, ("output", "values"))
+                keyed_children, keyed_aux = flatten_with_keys(result)
+                self.assertEqual(keyed_children, (("output", "output"), ("values", "values")))
+                self.assertEqual(keyed_aux, keys)
+                restored = unflatten(keys, children)
+                self.assertIsInstance(restored, module.TupleDict)
+                self.assertEqual(tuple(restored.keys()), keys)
+                self.assertEqual(tuple(restored), children)
+                self.assertEqual(restored[0], "output")
+                self.assertEqual(restored["values"], "values")
+                self.assertIs(importlib.reload(module), module)
+                self.assertEqual(len(pytree_registrations), 1)
 
                 value = types.SimpleNamespace(
                     shape=(2, 3, 5, 7, 11, 13),

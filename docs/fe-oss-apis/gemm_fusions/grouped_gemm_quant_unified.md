@@ -176,7 +176,7 @@ d, d_col, amax, sfd_row, sfd_col = result
 ```
 
 The JAX namespace currently exposes the dense-weight subset of this unified
-API. It returns `GroupedGemmQuantResult` and supports FP8 A/B with E8M0 scales
+API. It returns `TupleDict` and supports FP8 A/B with E8M0 scales
 and `sf_vec_size=32`. FP8 D produces `d_col`, `sfd_row`, and `sfd_col`, while
 `amax` is `None`. Shapes, dtypes, layouts, and configuration arguments are
 static under `jax.jit`.

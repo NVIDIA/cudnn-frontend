@@ -6,12 +6,11 @@
 from __future__ import annotations
 
 import os
-from functools import lru_cache
-from typing import Any, NamedTuple
+from typing import Any
 
 import jax.numpy as jnp
 
-from .._jax.api_base import ApiBaseJax, BufferSpec, JaxTensorDesc, call_cutedsl
+from .._jax.api_base import ApiBaseJax, BufferSpec, JaxTensorDesc, TupleDict, call_cutedsl
 from .._jax.gemm import (
     block_scale_tensor_spec,
     gemm_a_tensor_spec,
@@ -22,50 +21,46 @@ from ..gemm_validation import require_gemm_shapes, resolve_max_active_clusters
 from .validation import validate_gemm_amax
 
 
-class GemmAmaxResult(NamedTuple):
-    """Functional outputs from block-scaled GEMM + amax."""
-
-    c_tensor: Any
-    amax_tensor: Any
-
-
-@lru_cache(maxsize=None)
-def _make_launcher(
+def _launch(
+    stream,
+    a,
+    b,
+    sfa,
+    sfb,
+    c,
+    amax,
     *,
     sf_vec_size: int,
     mma_tiler_mn: tuple[int, int],
     cluster_shape_mn: tuple[int, int],
     cluster_overlap_margin: int,
 ):
-    def launch(stream, a, b, sfa, sfb, c, amax):
-        # These operations happen during CUDA lowering, not abstract evaluation.
-        import cutlass
+    # These operations happen during CUDA lowering, not abstract evaluation.
+    import cutlass
 
-        from .dense_blockscaled_gemm_persistent_amax import (
-            Sm100BlockScaledPersistentDenseGemmKernel,
-        )
+    from .dense_blockscaled_gemm_persistent_amax import (
+        Sm100BlockScaledPersistentDenseGemmKernel,
+    )
 
-        kernel = Sm100BlockScaledPersistentDenseGemmKernel(
-            sf_vec_size=sf_vec_size,
-            mma_tiler_mn=mma_tiler_mn,
-            cluster_shape_mn=cluster_shape_mn,
-        )
-        max_active_clusters = resolve_max_active_clusters(
-            cutlass.utils.HardwareInfo().get_max_active_clusters(cluster_shape_mn[0] * cluster_shape_mn[1]),
-            cluster_overlap_margin,
-        )
-        kernel(
-            a,
-            b,
-            sfa,
-            sfb,
-            c,
-            amax,
-            max_active_clusters,
-            stream,
-        )
-
-    return launch
+    kernel = Sm100BlockScaledPersistentDenseGemmKernel(
+        sf_vec_size=sf_vec_size,
+        mma_tiler_mn=mma_tiler_mn,
+        cluster_shape_mn=cluster_shape_mn,
+    )
+    max_active_clusters = resolve_max_active_clusters(
+        cutlass.utils.HardwareInfo().get_max_active_clusters(cluster_shape_mn[0] * cluster_shape_mn[1]),
+        cluster_overlap_margin,
+    )
+    kernel(
+        a,
+        b,
+        sfa,
+        sfb,
+        c,
+        amax,
+        max_active_clusters,
+        stream,
+    )
 
 
 class GemmAmaxSm100(ApiBaseJax):
@@ -168,7 +163,7 @@ class GemmAmaxSm100(ApiBaseJax):
         b_tensor: Any,
         sfa_tensor: Any,
         sfb_tensor: Any,
-    ) -> GemmAmaxResult:
+    ) -> TupleDict:
         return super().__call__(a_tensor, b_tensor, sfa_tensor, sfb_tensor)
 
     def _call_impl(
@@ -177,7 +172,7 @@ class GemmAmaxSm100(ApiBaseJax):
         b_tensor: Any,
         sfa_tensor: Any,
         sfb_tensor: Any,
-    ) -> GemmAmaxResult:
+    ) -> TupleDict:
         if self._plan is None:
             raise RuntimeError("check_support() did not produce a launch plan")
         self.check_tensor_signature(a_tensor, self.a_desc, name="A")
@@ -185,14 +180,8 @@ class GemmAmaxSm100(ApiBaseJax):
         self.check_tensor_signature(sfa_tensor, self.sfa_desc, name="SFA")
         self.check_tensor_signature(sfb_tensor, self.sfb_desc, name="SFB")
 
-        launcher = _make_launcher(
-            sf_vec_size=self.sf_vec_size,
-            mma_tiler_mn=self.mma_tiler_mn,
-            cluster_shape_mn=self.cluster_shape_mn,
-            cluster_overlap_margin=self.num_cluster_overlap_margin,
-        )
         c_tensor, amax_tensor = call_cutedsl(
-            launcher,
+            _launch,
             (a_tensor, b_tensor, sfa_tensor, sfb_tensor),
             outputs=(
                 BufferSpec(
@@ -209,9 +198,15 @@ class GemmAmaxSm100(ApiBaseJax):
                 ),
             ),
             input_specs=(self.a_spec, self.b_spec, self.scale_spec, self.scale_spec),
+            static_args={
+                "sf_vec_size": self.sf_vec_size,
+                "mma_tiler_mn": self.mma_tiler_mn,
+                "cluster_shape_mn": self.cluster_shape_mn,
+                "cluster_overlap_margin": self.num_cluster_overlap_margin,
+            },
             use_static_tensors=True,
         )
-        return GemmAmaxResult(c_tensor=c_tensor, amax_tensor=amax_tensor)
+        return TupleDict(c_tensor=c_tensor, amax_tensor=amax_tensor)
 
 
 def gemm_amax_wrapper_sm100(
@@ -228,7 +223,7 @@ def gemm_amax_wrapper_sm100(
     *,
     a_major: str = "k",
     b_major: str = "k",
-) -> GemmAmaxResult:
+) -> TupleDict:
     """Compute FP8 block-scaled GEMM and a global max-absolute reduction."""
 
     return GemmAmaxSm100(
@@ -247,4 +242,4 @@ def gemm_amax_wrapper_sm100(
     )(a_tensor, b_tensor, sfa_tensor, sfb_tensor)
 
 
-__all__ = ["GemmAmaxResult", "GemmAmaxSm100", "gemm_amax_wrapper_sm100"]
+__all__ = ["GemmAmaxSm100", "gemm_amax_wrapper_sm100"]

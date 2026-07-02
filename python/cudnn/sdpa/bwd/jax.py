@@ -5,14 +5,18 @@
 
 from __future__ import annotations
 
-from functools import lru_cache
-from typing import Any, NamedTuple
+from typing import Any
 
 import jax.numpy as jnp
 from cutlass.jax import jax_to_cutlass_dtype
 
-from ..._jax.api_base import ApiBaseJax, BufferSpec, call_cutedsl
-from ..._jax.validation import require_dtype
+from ..._jax.api_base import (
+    ApiBaseJax,
+    BufferSpec,
+    TupleDict,
+    call_cutedsl,
+    require_dtype,
+)
 from ..jax_utils import (
     bhsd_tensor_spec,
     require_array,
@@ -21,16 +25,18 @@ from ..jax_utils import (
 )
 
 
-class SdpaBwdResult(NamedTuple):
-    """Functional outputs from :func:`sdpa_bwd_wrapper_sm100_d256`."""
-
-    dq_tensor: Any
-    dk_tensor: Any
-    dv_tensor: Any
-
-
-@lru_cache(maxsize=None)
-def _make_launcher(
+def _launch(
+    stream,
+    q,
+    k,
+    v,
+    output,
+    doutput,
+    lse,
+    dq,
+    dk,
+    dv,
+    workspace,
     *,
     batch: int,
     seqlen_q: int,
@@ -65,35 +71,32 @@ def _make_launcher(
         window_size_right=window_size_right,
     )
 
-    def launch(stream, q, k, v, output, doutput, lse, dq, dk, dv, workspace):
-        problem_shape = (
-            Int32(seqlen_q),
-            Int32(seqlen_k),
-            Int32(256),
-            (
-                (Int32(num_query_heads // num_kv_heads), Int32(num_kv_heads)),
-                Int32(batch),
-            ),
-        )
-        kernel(
-            problem_shape,
-            q,
-            k,
-            v,
-            output,
-            dq,
-            dk,
-            dv,
-            doutput,
-            lse,
-            None,
-            None,
-            Float32(scale_softmax),
-            workspace,
-            stream,
-        )
-
-    return launch
+    problem_shape = (
+        Int32(seqlen_q),
+        Int32(seqlen_k),
+        Int32(256),
+        (
+            (Int32(num_query_heads // num_kv_heads), Int32(num_kv_heads)),
+            Int32(batch),
+        ),
+    )
+    kernel(
+        problem_shape,
+        q,
+        k,
+        v,
+        output,
+        dq,
+        dk,
+        dv,
+        doutput,
+        lse,
+        None,
+        None,
+        Float32(scale_softmax),
+        workspace,
+        stream,
+    )
 
 
 def _sdpa_bwd_impl(
@@ -111,7 +114,7 @@ def _sdpa_bwd_impl(
     scale_softmax: float | None = None,
     *,
     _validate_only: bool = False,
-) -> SdpaBwdResult:
+) -> TupleDict:
     """Compute fixed-shape BHSD SDPA gradients with the SM100 d=256 kernel.
 
     Q, K, V, O, and dO use logical JAX shapes ``(B, H, S, 256)``.
@@ -170,19 +173,7 @@ def _sdpa_bwd_impl(
     )
     bhsd_spec = bhsd_tensor_spec()
     dq_tensor, dk_tensor, dv_tensor = call_cutedsl(
-        _make_launcher(
-            batch=batch,
-            seqlen_q=seqlen_q,
-            seqlen_k=seqlen_k,
-            num_query_heads=num_query_heads,
-            num_kv_heads=num_kv_heads,
-            element_dtype=jax_to_cutlass_dtype(dtype),
-            scale_softmax=scale_softmax,
-            is_causal=bool(is_causal),
-            window_size_left=window_size_left,
-            window_size_right=window_size_right,
-            mask_kind=mask_kind,
-        ),
+        _launch,
         (q_tensor, k_tensor, v_tensor, o_tensor, do_tensor, lse_tensor),
         outputs=(
             BufferSpec(
@@ -213,9 +204,22 @@ def _sdpa_bwd_impl(
             ),
         ),
         input_specs=(bhsd_spec, bhsd_spec, bhsd_spec, bhsd_spec, bhsd_spec, None),
+        static_args={
+            "batch": batch,
+            "seqlen_q": seqlen_q,
+            "seqlen_k": seqlen_k,
+            "num_query_heads": num_query_heads,
+            "num_kv_heads": num_kv_heads,
+            "element_dtype": jax_to_cutlass_dtype(dtype),
+            "scale_softmax": scale_softmax,
+            "is_causal": bool(is_causal),
+            "window_size_left": window_size_left,
+            "window_size_right": window_size_right,
+            "mask_kind": mask_kind,
+        },
         use_static_tensors=True,
     )
-    return SdpaBwdResult(
+    return TupleDict(
         dq_tensor=dq_tensor,
         dk_tensor=dk_tensor,
         dv_tensor=dv_tensor,
@@ -280,7 +284,7 @@ class SdpabwdSm100D256(ApiBaseJax):
         o_tensor: Any,
         do_tensor: Any,
         lse_tensor: Any,
-    ) -> SdpaBwdResult:
+    ) -> TupleDict:
         return super().__call__(q_tensor, k_tensor, v_tensor, o_tensor, do_tensor, lse_tensor)
 
     def _call_impl(
@@ -291,7 +295,7 @@ class SdpabwdSm100D256(ApiBaseJax):
         o_tensor: Any,
         do_tensor: Any,
         lse_tensor: Any,
-    ) -> SdpaBwdResult:
+    ) -> TupleDict:
         for value, expected, name in (
             (q_tensor, self.q_desc, "Q"),
             (k_tensor, self.k_desc, "K"),
@@ -330,7 +334,7 @@ def sdpa_bwd_wrapper_sm100_d256(
     is_causal: bool = False,
     window_size: tuple[int, int] = (-1, -1),
     scale_softmax: float | None = None,
-) -> SdpaBwdResult:
+) -> TupleDict:
     """Compute fixed-shape BHSD SDPA gradients with the SM100 d=256 kernel."""
 
     return SdpabwdSm100D256(
@@ -349,4 +353,4 @@ def sdpa_bwd_wrapper_sm100_d256(
     )(q_tensor, k_tensor, v_tensor, o_tensor, do_tensor, lse_tensor)
 
 
-__all__ = ["SdpaBwdResult", "SdpabwdSm100D256", "sdpa_bwd_wrapper_sm100_d256"]
+__all__ = ["SdpabwdSm100D256", "sdpa_bwd_wrapper_sm100_d256"]

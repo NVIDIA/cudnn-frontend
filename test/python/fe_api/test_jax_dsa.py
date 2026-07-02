@@ -39,6 +39,7 @@ def test_jax_dsa_abstract_shapes():
     jax, jnp = _jax_dependencies()
 
     from cudnn.jax import (
+        TupleDict,
         indexer_forward_wrapper,
         indexer_top_k_wrapper,
         sparse_attn_score_recompute_wrapper,
@@ -59,7 +60,7 @@ def test_jax_dsa_abstract_shapes():
 
     input_values = jax.ShapeDtypeStruct((2, 64), jnp.float32)
     seq_lens = jax.ShapeDtypeStruct((2,), jnp.int32)
-    indices, values = jax.eval_shape(
+    topk_result = jax.eval_shape(
         lambda values, lengths: indexer_top_k_wrapper(
             values,
             lengths,
@@ -68,6 +69,9 @@ def test_jax_dsa_abstract_shapes():
         input_values,
         seq_lens,
     )
+    assert isinstance(topk_result, TupleDict)
+    assert tuple(topk_result.keys()) == ("indices", "values")
+    indices, values = topk_result
     assert indices.shape == (2, 8)
     assert indices.dtype == jnp.int32
     assert values.shape == (2, 8)
@@ -83,7 +87,7 @@ def test_jax_dsa_abstract_shapes():
         sparse_k,
         sparse_weights,
         sparse_topk,
-    ).predict
+    )["predict"]
     assert predict.shape == (1, 4, 128)
     assert predict.dtype == jnp.float32
 
@@ -100,7 +104,7 @@ def test_jax_dsa_abstract_shapes():
         sparse_k,
         sparse_lse,
         sparse_topk,
-    ).target
+    )["target"]
     assert target.shape == (1, 4, 128)
     assert target.dtype == jnp.float32
 
@@ -148,7 +152,7 @@ def test_jax_indexer_forward_jit():
             w,
             ratio=1,
             sm_scale=sm_scale,
-        ).scores
+        )["scores"]
 
     lowered = run.lower(q, k, w)
     stablehlo = lowered.as_text("stablehlo")
@@ -282,7 +286,7 @@ def test_jax_sparse_indexer_score_recompute_jit():
             k,
             weights,
             indices,
-        ).predict
+        )["predict"]
 
     lowered = run.lower(q, k, weights, topk_indices)
     stablehlo = lowered.as_text("stablehlo")
@@ -365,7 +369,7 @@ def test_jax_sparse_attn_score_recompute_jit():
             lse,
             indices,
             softmax_scale=softmax_scale,
-        ).target
+        )["target"]
 
     lowered = run.lower(q, k, lse, topk_indices)
     stablehlo = lowered.as_text("stablehlo")
@@ -466,7 +470,7 @@ def test_jax_sparse_score_recompute_global_indices_and_partial_lengths():
             indices,
             topk_length=lengths,
             topk_indices_global=True,
-        ).predict
+        )["predict"]
         target = sparse_attn_score_recompute_wrapper(
             q,
             k,
@@ -475,7 +479,7 @@ def test_jax_sparse_score_recompute_global_indices_and_partial_lengths():
             softmax_scale,
             topk_length=lengths,
             topk_indices_global=True,
-        ).target
+        )["target"]
         return predict, target
 
     lowered = run.lower(q, k, weights, lse, global_indices, topk_length)

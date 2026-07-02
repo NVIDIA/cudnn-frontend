@@ -11,7 +11,7 @@ from typing import Any
 import jax.numpy as jnp
 from cutlass.jax import TensorSpec
 
-from .._jax.validation import require_dtype
+from .._jax.api_base import require_dtype
 
 
 def bhsd_tensor_spec() -> TensorSpec:

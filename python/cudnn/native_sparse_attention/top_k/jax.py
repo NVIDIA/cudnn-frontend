@@ -5,27 +5,29 @@
 
 from __future__ import annotations
 
-from functools import lru_cache
 import math
-from typing import Any, NamedTuple
+from typing import Any
 
 import jax.numpy as jnp
 from cutlass.jax import TensorSpec, jax_to_cutlass_dtype
 
-from ..._jax.api_base import ApiBaseJax, BufferSpec, call_cutedsl
-from ..._jax.validation import require_dtype
+from ..._jax.api_base import (
+    ApiBaseJax,
+    BufferSpec,
+    TupleDict,
+    call_cutedsl,
+    require_dtype,
+)
 from ..jax_utils import bhsd_storage_spec, require_bhsd_qkv
 
 
-class TopKReductionResult(NamedTuple):
-    """Functional outputs from :func:`topk_reduction_wrapper`."""
-
-    topk_scores_tensor: Any
-    topk_indices_tensor: Any
-
-
-@lru_cache(maxsize=None)
-def _make_launcher(
+def _launch(
+    stream,
+    q,
+    k,
+    lse,
+    topk_scores,
+    topk_indices,
     *,
     element_dtype: Any,
     batch: int,
@@ -65,21 +67,18 @@ def _make_launcher(
         )
     )
 
-    def launch(stream, q, k, lse, topk_scores, topk_indices):
-        kernel(
-            problem_size,
-            q,
-            k,
-            lse,
-            topk_scores,
-            topk_indices,
-            Float32(scale_softmax * math.log2(math.e)),
-            None,
-            None,
-            stream,
-        )
-
-    return launch
+    kernel(
+        problem_size,
+        q,
+        k,
+        lse,
+        topk_scores,
+        topk_indices,
+        Float32(scale_softmax * math.log2(math.e)),
+        None,
+        None,
+        stream,
+    )
 
 
 def _require_topk_config(
@@ -116,7 +115,7 @@ def _topk_reduction_impl(
     scale_softmax: float | None = None,
     *,
     _validate_only: bool = False,
-) -> TopKReductionResult:
+) -> TupleDict:
     """Select top compressed-KV blocks for fixed-shape BHSD inputs on SM100.
 
     ``q_tensor`` and ``k_tensor`` have logical shapes ``(B, H, S, D)`` and a
@@ -158,20 +157,7 @@ def _topk_reduction_impl(
     lse_spec = TensorSpec(layout=(2, 1, 0), mode=(0, 1, 2))
     output_shape = (batch, num_kv_heads, seqlen_q, int(k_value))
     topk_scores, topk_indices = call_cutedsl(
-        _make_launcher(
-            element_dtype=jax_to_cutlass_dtype(input_dtype),
-            batch=batch,
-            seqlen_q=seqlen_q,
-            seqlen_k=seqlen_k,
-            num_query_heads=num_query_heads,
-            num_kv_heads=num_kv_heads,
-            head_dim=head_dim,
-            k_value=int(k_value),
-            selection_block_size=int(selection_block_size),
-            compress_stride=int(compress_stride),
-            is_causal=bool(is_causal),
-            scale_softmax=resolved_scale,
-        ),
+        _launch,
         (q_tensor, k_tensor, lse_tensor),
         outputs=(
             BufferSpec(
@@ -190,9 +176,23 @@ def _topk_reduction_impl(
             ),
         ),
         input_specs=(bhsd_spec, bhsd_spec, lse_spec),
+        static_args={
+            "element_dtype": jax_to_cutlass_dtype(input_dtype),
+            "batch": batch,
+            "seqlen_q": seqlen_q,
+            "seqlen_k": seqlen_k,
+            "num_query_heads": num_query_heads,
+            "num_kv_heads": num_kv_heads,
+            "head_dim": head_dim,
+            "k_value": int(k_value),
+            "selection_block_size": int(selection_block_size),
+            "compress_stride": int(compress_stride),
+            "is_causal": bool(is_causal),
+            "scale_softmax": resolved_scale,
+        },
         use_static_tensors=True,
     )
-    return TopKReductionResult(
+    return TupleDict(
         topk_scores_tensor=topk_scores,
         topk_indices_tensor=topk_indices,
     )
@@ -242,10 +242,10 @@ class TopKReduction(ApiBaseJax):
         )
         return True
 
-    def __call__(self, q_tensor: Any, k_tensor: Any, lse_tensor: Any) -> TopKReductionResult:
+    def __call__(self, q_tensor: Any, k_tensor: Any, lse_tensor: Any) -> TupleDict:
         return super().__call__(q_tensor, k_tensor, lse_tensor)
 
-    def _call_impl(self, q_tensor: Any, k_tensor: Any, lse_tensor: Any) -> TopKReductionResult:
+    def _call_impl(self, q_tensor: Any, k_tensor: Any, lse_tensor: Any) -> TupleDict:
         self.check_tensor_signature(q_tensor, self.q_desc, name="Q")
         self.check_tensor_signature(k_tensor, self.k_desc, name="K")
         self.check_tensor_signature(lse_tensor, self.lse_desc, name="LSE")
@@ -274,7 +274,7 @@ def topk_reduction_wrapper(
     is_causal: bool = True,
     mma_tiler_mn: tuple[int, int] = (128, 128),
     scale_softmax: float | None = None,
-) -> TopKReductionResult:
+) -> TupleDict:
     """Select top compressed-KV blocks for fixed-shape BHSD inputs on SM100."""
 
     return TopKReduction(
@@ -291,4 +291,4 @@ def topk_reduction_wrapper(
     )(q_tensor, k_tensor, lse_tensor)
 
 
-__all__ = ["TopKReduction", "TopKReductionResult", "topk_reduction_wrapper"]
+__all__ = ["TopKReduction", "topk_reduction_wrapper"]

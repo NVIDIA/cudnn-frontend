@@ -97,6 +97,10 @@ class JaxSdpaContractTest(unittest.TestCase):
         cls.fake_jax.__path__ = []
         cls.fake_jax.__spec__ = ModuleSpec("jax", loader=None, is_package=True)
         cls.fake_jax.numpy = cls.fake_jnp
+        cls.fake_jax.tree_util = types.SimpleNamespace(
+            DictKey=lambda key: key,
+            register_pytree_with_keys=lambda *_args: None,
+        )
         cls.fake_jax.ShapeDtypeStruct = lambda shape, dtype: (shape, dtype)
 
         cls.fake_cutlass = types.ModuleType("cutlass")
@@ -169,14 +173,12 @@ class JaxSdpaContractTest(unittest.TestCase):
 
     def test_forward_declares_bhsd_layout_and_functional_outputs(self):
         captured = {}
-        launcher = object()
         q = _Array((2, 8, 64, 256), self.float16)
         k = _Array((2, 2, 96, 256), self.float16)
         v = _Array((2, 2, 96, 256), self.float16)
 
         with (
             self._optional_modules(),
-            mock.patch.object(self.forward, "_make_launcher", return_value=launcher),
             mock.patch.object(
                 self.forward,
                 "call_cutedsl",
@@ -185,12 +187,27 @@ class JaxSdpaContractTest(unittest.TestCase):
         ):
             result = self.forward.sdpa_fwd_wrapper_sm100_d256(q, k, v)
 
-        self.assertEqual(result.o_tensor.shape, q.shape)
-        self.assertEqual(result.lse_tensor.shape, (2, 8, 64))
+        self.assertEqual(result["o_tensor"].shape, q.shape)
+        self.assertEqual(result["lse_tensor"].shape, (2, 8, 64))
         self.assertEqual(captured["inputs"], (q, k, v))
         self.assertTrue(captured["use_static_tensors"])
         self.assertNotIn("workspaces", captured)
-        self.assertIs(captured["launcher"], launcher)
+        self.assertIs(captured["launcher"], self.forward._launch)
+        self.assertEqual(
+            captured["static_args"],
+            {
+                "batch": 2,
+                "seqlen_q": 64,
+                "seqlen_k": 96,
+                "num_query_heads": 8,
+                "num_kv_heads": 2,
+                "scale_softmax": 0.0625,
+                "scale_output": 1.0,
+                "window_size_left": -1,
+                "window_size_right": -1,
+                "mask_kind": "residual",
+            },
+        )
 
         output, lse = captured["outputs"]
         self.assertEqual(
@@ -207,7 +224,6 @@ class JaxSdpaContractTest(unittest.TestCase):
 
     def test_backward_declares_zero_initialized_hidden_workspace(self):
         captured = {}
-        launcher = object()
         q = _Array((2, 8, 65, 256), self.bfloat16)
         k = _Array((2, 2, 96, 256), self.bfloat16)
         v = _Array((2, 2, 96, 256), self.bfloat16)
@@ -217,7 +233,6 @@ class JaxSdpaContractTest(unittest.TestCase):
 
         with (
             self._optional_modules(include_backward_kernel=True),
-            mock.patch.object(self.backward, "_make_launcher", return_value=launcher) as make_launcher,
             mock.patch.object(
                 self.backward,
                 "call_cutedsl",
@@ -233,12 +248,12 @@ class JaxSdpaContractTest(unittest.TestCase):
                 lse,
             )
 
-        self.assertEqual(result.dq_tensor.shape, q.shape)
-        self.assertEqual(result.dk_tensor.shape, k.shape)
-        self.assertEqual(result.dv_tensor.shape, v.shape)
+        self.assertEqual(result["dq_tensor"].shape, q.shape)
+        self.assertEqual(result["dk_tensor"].shape, k.shape)
+        self.assertEqual(result["dv_tensor"].shape, v.shape)
         self.assertEqual(captured["inputs"], (q, k, v, output, doutput, lse))
         self.assertTrue(captured["use_static_tensors"])
-        self.assertIs(captured["launcher"], launcher)
+        self.assertIs(captured["launcher"], self.backward._launch)
         self.assertEqual(
             [(spec.name, spec.shape, spec.dtype) for spec in captured["outputs"]],
             [
@@ -252,8 +267,143 @@ class JaxSdpaContractTest(unittest.TestCase):
         self.assertEqual(workspace.shape, (2, 72, 8, 1032))
         self.assertEqual(workspace.dtype, self.uint8)
         self.assertEqual(workspace.fill_value, 0)
-        self.assertEqual(make_launcher.call_args.kwargs["element_dtype"], "cutlass.bfloat16")
-        self.assertEqual(make_launcher.call_args.kwargs["mask_kind"], "residual")
+        self.assertEqual(captured["static_args"]["element_dtype"], "cutlass.bfloat16")
+        self.assertEqual(captured["static_args"]["mask_kind"], "residual")
+
+    def test_forward_launcher_preserves_native_argument_order(self):
+        calls = []
+        kernel_options = []
+
+        class FakeKernel:
+            def __init__(self, **options):
+                kernel_options.append(options)
+
+            def __call__(self, *args):
+                calls.append(args)
+
+        mask_module_name = f"{_TEST_PACKAGE}.sdpa.fmha_utils"
+        mask_module = types.ModuleType(mask_module_name)
+        mask_module.MaskEnum = types.SimpleNamespace(
+            RESIDUAL_MASK="residual",
+            WINDOW_MASK_INFERENCE="window",
+        )
+        kernel_module_name = f"{_TEST_PACKAGE}.sdpa.fwd.fmha_forward_sm100_d256"
+        kernel_module = types.ModuleType(kernel_module_name)
+        kernel_module.BlackwellFusedMultiHeadAttentionForward = FakeKernel
+
+        def float32(value=None):
+            return ("Float32", value)
+
+        def int32(value):
+            return ("Int32", value)
+
+        with (
+            self._optional_modules(),
+            mock.patch.dict(
+                sys.modules,
+                {
+                    mask_module_name: mask_module,
+                    kernel_module_name: kernel_module,
+                },
+            ),
+            mock.patch.object(self.fake_cutlass, "Float32", float32),
+            mock.patch.object(self.fake_cutlass, "Int32", int32),
+        ):
+            self.forward._launch(
+                "stream",
+                "q",
+                "k",
+                "v",
+                "out",
+                "lse",
+                batch=2,
+                seqlen_q=64,
+                seqlen_k=96,
+                num_query_heads=8,
+                num_kv_heads=2,
+                scale_softmax=0.0625,
+                scale_output=0.5,
+                window_size_left=32,
+                window_size_right=0,
+                mask_kind="window",
+            )
+
+        self.assertEqual(kernel_options[0]["mask_type"], "window")
+        args = calls[0]
+        self.assertEqual(args[:4], ("q", "k", "v", "out"))
+        self.assertEqual(args[4][:3], (("Int32", 2), ("Int32", 64), ("Int32", 96)))
+        self.assertEqual(args[7], "lse")
+        self.assertEqual(args[-3:], (("Int32", 32), ("Int32", 0), "stream"))
+
+    def test_backward_launcher_preserves_native_argument_order(self):
+        calls = []
+        kernel_options = []
+
+        class FakeKernel:
+            def __init__(self, **options):
+                kernel_options.append(options)
+
+            def __call__(self, *args):
+                calls.append(args)
+
+        mask_module_name = f"{_TEST_PACKAGE}.sdpa.fmha_utils"
+        mask_module = types.ModuleType(mask_module_name)
+        mask_module.MaskEnum = types.SimpleNamespace(
+            RESIDUAL_MASK="residual",
+            WINDOW_MASK_INFERENCE="window",
+        )
+        kernel_module = types.ModuleType(self.backward_kernel_module_name)
+        kernel_module.BlackwellFusedMultiHeadAttentionBackward = FakeKernel
+
+        def float32(value=None):
+            return ("Float32", value)
+
+        def int32(value):
+            return ("Int32", value)
+
+        with (
+            self._optional_modules(),
+            mock.patch.dict(
+                sys.modules,
+                {
+                    mask_module_name: mask_module,
+                    self.backward_kernel_module_name: kernel_module,
+                },
+            ),
+            mock.patch.object(self.fake_cutlass, "Float32", float32),
+            mock.patch.object(self.fake_cutlass, "Int32", int32),
+        ):
+            self.backward._launch(
+                "stream",
+                "q",
+                "k",
+                "v",
+                "out",
+                "dout",
+                "lse",
+                "dq",
+                "dk",
+                "dv",
+                "workspace",
+                batch=2,
+                seqlen_q=64,
+                seqlen_k=96,
+                num_query_heads=8,
+                num_kv_heads=2,
+                element_dtype="bfloat16",
+                scale_softmax=0.0625,
+                is_causal=True,
+                window_size_left=32,
+                window_size_right=0,
+                mask_kind="window",
+            )
+
+        self.assertEqual(kernel_options[0]["element_dtype"], "bfloat16")
+        self.assertEqual(kernel_options[0]["mask_type"], "window")
+        args = calls[0]
+        self.assertEqual(args[1:9], ("q", "k", "v", "out", "dq", "dk", "dv", "dout"))
+        self.assertEqual(args[9], "lse")
+        self.assertEqual(args[-2:], ("workspace", "stream"))
 
     def test_noncausal_sliding_window_is_rejected(self):
         q = _Array((1, 4, 64, 256), self.float16)

@@ -48,6 +48,10 @@ _bootstrap_jnp.dtype = lambda value: value
 _bootstrap_jax = types.ModuleType("jax")
 _bootstrap_jax.__path__ = []
 _bootstrap_jax.numpy = _bootstrap_jnp
+_bootstrap_jax.tree_util = types.SimpleNamespace(
+    DictKey=lambda key: key,
+    register_pytree_with_keys=lambda *_args: None,
+)
 _bootstrap_cutlass_jax = types.ModuleType("cutlass.jax")
 _bootstrap_cutlass_jax.TensorSpec = type("TensorSpec", (), {})
 _bootstrap_cute = types.ModuleType("cutlass.cute")
@@ -343,6 +347,31 @@ class CallCutedslAdapterTest(unittest.TestCase):
         self.assertIsNone(bridge.calls[0][1]["compile_options"])
         self.assertIs(bridge.calls[0][0], _MODULE._launch_adapter)
         self.assertIsInstance(hash(bridge.calls[0][1]["config"]), int)
+
+    def test_static_launcher_config_has_a_value_stable_cache_key(self):
+        def kernel(stream, x, output, *, scale):
+            del stream, x, output, scale
+
+        x = _Array((1,), "f32", "x")
+        options = {
+            "outputs": (BufferSpec("output", (1,), "f32"),),
+            "static_args": {"scale": 2.0},
+        }
+        _, _, first_bridge = self._call(kernel, (x,), **options)
+        _, _, second_bridge = self._call(kernel, (x,), **options)
+        _, _, different_bridge = self._call(
+            kernel,
+            (x,),
+            outputs=options["outputs"],
+            static_args={"scale": 3.0},
+        )
+
+        first_config = first_bridge.calls[0][1]["config"]
+        second_config = second_bridge.calls[0][1]["config"]
+        different_config = different_bridge.calls[0][1]["config"]
+        self.assertEqual(first_config, second_config)
+        self.assertEqual(hash(first_config), hash(second_config))
+        self.assertNotEqual(first_config, different_config)
 
 
 if __name__ == "__main__":

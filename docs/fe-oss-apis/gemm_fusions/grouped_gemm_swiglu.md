@@ -180,7 +180,7 @@ result = run(a, b, sfa, sfb, padded_offsets, alpha, norm_const, prob)
 c, d, d_col, amax, sfd_row, sfd_col = result
 ```
 
-The JAX API returns `GroupedGemmSwigluResult`. It supports dense FP8 A/B with
+The JAX API returns `TupleDict`. It supports dense FP8 A/B with
 E8M0 scale factors and `sf_vec_size=32`; discrete weight pointers and packed
 FP4 are not exposed. With the FP8 D type above, `amax` is `None`. Shapes,
 dtypes, layouts, and configuration arguments are static under `jax.jit`.

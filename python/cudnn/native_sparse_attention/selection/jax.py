@@ -5,23 +5,19 @@
 
 from __future__ import annotations
 
-from functools import lru_cache
 import math
-from typing import Any, NamedTuple
+from typing import Any
 
 import jax.numpy as jnp
 from cutlass.jax import jax_to_cutlass_dtype
 
-from ..._jax.api_base import ApiBaseJax, BufferSpec, call_cutedsl
-from ..._jax.validation import require_dtype
-
-
-class SelectionAttentionResult(NamedTuple):
-    """Functional outputs from :func:`selection_attention_wrapper`."""
-
-    o_tensor: Any
-    l_tensor: Any
-    m_tensor: Any
+from ..._jax.api_base import (
+    ApiBaseJax,
+    BufferSpec,
+    TupleDict,
+    call_cutedsl,
+    require_dtype,
+)
 
 
 def require_array(
@@ -43,8 +39,18 @@ def require_array(
     return shape, resolved_dtype
 
 
-@lru_cache(maxsize=None)
-def _make_launcher(
+def _launch(
+    stream,
+    q,
+    k,
+    v,
+    block_indices,
+    block_counts,
+    cum_seqlen_q,
+    cum_seqlen_k,
+    output,
+    lse_sum,
+    row_max,
     *,
     element_dtype: Any,
     head_dim: int,
@@ -67,39 +73,24 @@ def _make_launcher(
         acc_dtype=Float32,
     )
 
-    def launch(
-        stream,
+    # Selection attention is currently self-attention. The second runtime
+    # offsets operand preserves API parity and is required to match Q's
+    # offsets, but the native kernel has a single seq_offsets argument.
+    del cum_seqlen_k
+    kernel(
         q,
         k,
         v,
-        block_indices,
-        block_counts,
-        cum_seqlen_q,
-        cum_seqlen_k,
         output,
         lse_sum,
         row_max,
-    ):
-        # Selection attention is currently self-attention. The second runtime
-        # offsets operand preserves API parity and is required to match Q's
-        # offsets, but the native kernel has a single seq_offsets argument.
-        del cum_seqlen_k
-        kernel(
-            q,
-            k,
-            v,
-            output,
-            lse_sum,
-            row_max,
-            block_indices,
-            block_counts,
-            max_s_q,
-            cum_seqlen_q,
-            Float32(scale_softmax),
-            stream,
-        )
-
-    return launch
+        block_indices,
+        block_counts,
+        max_s_q,
+        cum_seqlen_q,
+        Float32(scale_softmax),
+        stream,
+    )
 
 
 def _selection_attention_impl(
@@ -118,7 +109,7 @@ def _selection_attention_impl(
     o_dtype: Any = None,
     acc_dtype: Any = None,
     _validate_only: bool = False,
-) -> SelectionAttentionResult:
+) -> TupleDict:
     """Compute packed THD selection attention with the SM90 CuTe kernel.
 
     Q, K, and V use compact row-major ``(T, H, D)`` storage. Block indices
@@ -230,15 +221,7 @@ def _selection_attention_impl(
     v_storage = jnp.reshape(v_tensor, (1, total_tokens, num_kv_heads, value_dim))
 
     o_storage, l_storage, m_storage = call_cutedsl(
-        _make_launcher(
-            element_dtype=jax_to_cutlass_dtype(input_dtype),
-            head_dim=head_dim,
-            value_dim=value_dim,
-            gqa_group_size=gqa_group_size,
-            block_size=block_size,
-            max_s_q=max_s_q,
-            scale_softmax=resolved_scale,
-        ),
+        _launch,
         (
             q_storage,
             k_storage,
@@ -268,9 +251,18 @@ def _selection_attention_impl(
                 fill_value=float("-inf"),
             ),
         ),
+        static_args={
+            "element_dtype": jax_to_cutlass_dtype(input_dtype),
+            "head_dim": head_dim,
+            "value_dim": value_dim,
+            "gqa_group_size": gqa_group_size,
+            "block_size": block_size,
+            "max_s_q": max_s_q,
+            "scale_softmax": resolved_scale,
+        },
         use_static_tensors=True,
     )
-    return SelectionAttentionResult(
+    return TupleDict(
         o_tensor=jnp.reshape(o_storage, (total_tokens, num_query_heads, value_dim)),
         l_tensor=jnp.reshape(l_storage, (total_tokens, num_query_heads, 1)),
         m_tensor=jnp.reshape(m_storage, (total_tokens, num_query_heads, 1)),
@@ -340,7 +332,7 @@ class SelectionAttention(ApiBaseJax):
         block_counts_tensor: Any,
         cum_seqlen_q_tensor: Any,
         cum_seqlen_k_tensor: Any,
-    ) -> SelectionAttentionResult:
+    ) -> TupleDict:
         return super().__call__(
             q_tensor,
             k_tensor,
@@ -360,7 +352,7 @@ class SelectionAttention(ApiBaseJax):
         block_counts_tensor: Any,
         cum_seqlen_q_tensor: Any,
         cum_seqlen_k_tensor: Any,
-    ) -> SelectionAttentionResult:
+    ) -> TupleDict:
         for value, expected, name in (
             (q_tensor, self.q_desc, "Q"),
             (k_tensor, self.k_desc, "K"),
@@ -403,7 +395,7 @@ def selection_attention_wrapper(
     scale_softmax: float | None = None,
     o_dtype: Any = None,
     acc_dtype: Any = None,
-) -> SelectionAttentionResult:
+) -> TupleDict:
     """Compute packed THD selection attention with the SM90 CuTe kernel."""
 
     return SelectionAttention(
@@ -433,6 +425,5 @@ def selection_attention_wrapper(
 
 __all__ = [
     "SelectionAttention",
-    "SelectionAttentionResult",
     "selection_attention_wrapper",
 ]

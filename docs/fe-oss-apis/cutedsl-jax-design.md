@@ -206,11 +206,10 @@ The implementations are co-located with the kernels:
 cudnn/
   _operation_api.py                         shared lazy operation exports
   gemm_validation.py                       framework-neutral dense GEMM rules
-  _jax/api_base.py                         JAX base, descriptors, and call adapter
-  _jax/validation.py                       shared JAX metadata validation
+  _jax/api_base.py                         JAX base, descriptors, validation, and call adapter
   _jax/gemm.py                             JAX GEMM layout and metadata adapters
   _jax/grouped_gemm.py                     JAX grouped-GEMM metadata adapters
-  jax/                                      shared facade and cutedsl.py compatibility export
+  jax/                                      shared JAX facade
   rmsnorm_rht_amax/{api.py,jax.py,config.py,kernel.py}
   gemm_{swiglu,amax,srelu,dsrelu}/{api.py,jax.py,...}
   grouped_gemm/grouped_gemm_*/{api.py,jax.py,...}
@@ -300,7 +299,7 @@ OperatorDefinition
   config                         static algorithm/tile/mask attributes
   infer_outputs(input_specs)     logical output shapes and dtypes
   validate(input_specs, target)  rank, dtype, layout, divisibility, target limits
-  make_launcher(config)          CuTe launcher or kernel factory
+  launcher                       stable CuTe/kernel ABI adapter
   workspace_specs(...)           size, alignment, initialization, lifetime
   aliasing                       legal in-place relationships
   transform_policy               AD, batching, and sharding behavior
@@ -355,7 +354,7 @@ Each wrapper:
 2. Resolves static configuration.
 3. Infers every public output and hidden workspace.
 4. Binds a canonical launcher through `call_cutedsl`.
-5. Returns a standard tuple, named tuple, or registered pytree.
+5. Returns a `TupleDict`, registered as a JAX pytree.
 
 Each `ApiBaseJax` instance is specialized from sample array-like metadata and
 is itself a stable traceable callable. Construction immediately converts
@@ -470,12 +469,15 @@ Only immutable compilation state belongs in a cache key:
 Do not cache output buffers, workspace buffers, tensor addresses, CUDA streams,
 or mutable scheduler counters. CUTLASS currently keys its in-memory compile cache
 partly by Python function identity. The integration therefore uses one stable
-`@cute.jit` launch adapter and passes the operation launcher plus immutable
-argument-reconstruction state as constexpr configuration.
+`@cute.jit` launch adapter, stable module-level operation launchers, and
+immutable operation configuration passed through `call_cutedsl(static_args=...)`
+as constexpr state. Generated launcher closures and frontend `lru_cache`
+layers are avoided so equivalent traces share CUTLASS's compilation cache
+without retaining a second unbounded cache of kernel configurations.
 
 CUTLASS 4.5's outer JAX compile-cache key does not visibly include the target
 architecture, and that cache retains entries without a bound. Before supporting
-heterogeneous GPU processes or a large unbounded set of generated launchers,
+heterogeneous GPU processes or a large unbounded set of static configurations,
 verify device targeting with CUTLASS and provide coordinated cache observability
 and clearing.
 
@@ -503,8 +505,7 @@ This lets XLA account for the memory, reuse it according to liveness, preserve
 asynchronous lifetime, and avoid runtime allocation during CUDA-graph capture.
 
 The internal
-[`call_cutedsl`](../../python/cudnn/_jax/api_base.py), also available from the
-compatibility module `cudnn.jax.cutedsl`, supports these categories:
+[`call_cutedsl`](../../python/cudnn/_jax/api_base.py) supports these categories:
 
 | Buffer requirement | JAX representation |
 | --- | --- |
@@ -718,8 +719,9 @@ jax_result = jitted_api(x_jax, weight_jax)
 - JAX is explicitly selected by importing `cudnn.jax` or an operation's sibling
   `.jax` namespace. There is no availability-based fallback from an unqualified
   PyTorch name. Installing the base or PyTorch extras does not require JAX.
-- JAX operations use functional inputs/outputs and standard named tuples or
-  registered pytrees. They do not emulate PyTorch output buffers or streams.
+- JAX operations use functional inputs/outputs and return the same registered
+  `TupleDict` container used by PyTorch. They do not emulate PyTorch output
+  buffers or streams.
 - Document how logical operands, options, and results correspond. Parameter
   kinds, defaults, containers, layouts, target-only controls, and supported
   domains may differ.
@@ -756,9 +758,8 @@ removes the legacy FFI branch from the supported integration surface.
 - [`cudnn._jax.api_base`](../../python/cudnn/_jax/api_base.py)
   - contains `ApiBaseJax`, `JaxTensorDesc`, `BufferSpec`, and `call_cutedsl` as
     the internal JAX integration layer;
-  - remains outside the top-level public export; `cudnn.jax.cutedsl` is a
-    compatibility re-export, while operation-local modules import the internal
-    path so they can load before the facade;
+  - remains outside the top-level public export; operation-local modules import
+    the internal path so they can load before the facade;
   - translates output/workspace metadata to `cutlass_call`;
   - appends hidden workspaces and drops them from public results;
   - supports uninitialized, zeroed, and constant-filled buffers;
@@ -833,7 +834,7 @@ removes the legacy FFI branch from the supported integration surface.
 - CPU contract tests still use a fake CUTLASS bridge for deterministic adapter
   edge cases.
 - The JAX optional dependency version range needs release-owner approval.
-- Launcher and CUTLASS compile caches are currently unbounded.
+- The CUTLASS compile cache is currently unbounded.
 
 ## Rollout plan and validation milestones
 

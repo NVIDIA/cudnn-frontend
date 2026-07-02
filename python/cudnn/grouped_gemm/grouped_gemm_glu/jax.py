@@ -5,13 +5,18 @@
 
 from __future__ import annotations
 
-from functools import lru_cache
 import os
-from typing import Any, NamedTuple, Optional
+from typing import Any, Optional
 
 import jax.numpy as jnp
 
-from ..._jax.api_base import ApiBaseJax, BufferSpec, call_cutedsl
+from ..._jax.api_base import (
+    ApiBaseJax,
+    BufferSpec,
+    TupleDict,
+    call_cutedsl,
+    require_dtype,
+)
 from ..._jax.gemm import (
     block_scale_tensor_spec,
     gemm_a_tensor_spec,
@@ -28,7 +33,6 @@ from ..._jax.grouped_gemm import (
     require_grouped_probability,
     require_grouped_vector,
 )
-from ..._jax.validation import require_dtype
 from ...gemm_validation import (
     block_scale_shape,
     require_shape,
@@ -37,20 +41,9 @@ from ...gemm_validation import (
 from .._jax_api import check_call_signatures, immutable_mapping
 
 
-class GroupedGemmGluResult(NamedTuple):
-    """Functional outputs from dense-weight grouped GEMM + GLU."""
-
-    c_tensor: Any
-    d_tensor: Any
-    d_col_tensor: Any | None
-    amax_tensor: Any | None
-    sfd_row_tensor: Any | None
-    sfd_col_tensor: Any | None
-
-
-@lru_cache(maxsize=None)
-def _make_launcher(
-    *,
+def _launch(
+    stream,
+    *args,
     acc_dtype: Any,
     mma_tiler_mn: tuple[int, int],
     cluster_shape_mn: tuple[int, int],
@@ -69,102 +62,99 @@ def _make_launcher(
     glu_clamp_min: float,
     cluster_overlap_margin: int,
 ):
-    def launch(stream, *args):
-        import cutlass
-        from cutlass.cute.nvgpu import OperandMajorMode
-        from cutlass.jax import jax_to_cutlass_dtype
+    import cutlass
+    from cutlass.cute.nvgpu import OperandMajorMode
+    from cutlass.jax import jax_to_cutlass_dtype
 
-        from ..moe_utils import MoEWeightMode
-        from .moe_blockscaled_grouped_gemm_glu_bias import (
-            BlockScaledMoEGroupedGemmGluBiasKernel,
-        )
+    from ..moe_utils import MoEWeightMode
+    from .moe_blockscaled_grouped_gemm_glu_bias import (
+        BlockScaledMoEGroupedGemmGluBiasKernel,
+    )
 
-        arg_idx = 0
+    arg_idx = 0
 
-        def take():
-            nonlocal arg_idx
-            value = args[arg_idx]
-            arg_idx += 1
-            return value
+    def take():
+        nonlocal arg_idx
+        value = args[arg_idx]
+        arg_idx += 1
+        return value
 
-        a = take()
-        b = take()
-        sfa = take()
-        sfb = take()
-        padded_offsets = take()
-        alpha = take()
-        prob = take() if has_prob else None
-        bias = take() if has_bias else None
-        norm_const = take() if quantized_output else None
+    a = take()
+    b = take()
+    sfa = take()
+    sfb = take()
+    padded_offsets = take()
+    alpha = take()
+    prob = take() if has_prob else None
+    bias = take() if has_bias else None
+    norm_const = take() if quantized_output else None
 
-        c = take()
-        d = take()
-        if quantized_output:
-            d_col = take()
-            amax = None
-            sfd_row = take()
-            sfd_col = take()
-        else:
-            d_col = None
-            amax = take()
-            sfd_row = None
-            sfd_col = None
+    c = take()
+    d = take()
+    if quantized_output:
+        d_col = take()
+        amax = None
+        sfd_row = take()
+        sfd_col = take()
+    else:
+        d_col = None
+        amax = take()
+        sfd_row = None
+        sfd_col = None
 
-        if not quantized_output:
-            d_col = take()
-        workspace = take()
-        if arg_idx != len(args):
-            raise RuntimeError(f"Unexpected grouped GEMM argument count: consumed {arg_idx}, received {len(args)}")
+    if not quantized_output:
+        d_col = take()
+    workspace = take()
+    if arg_idx != len(args):
+        raise RuntimeError(f"Unexpected grouped GEMM argument count: consumed {arg_idx}, received {len(args)}")
 
-        kernel = BlockScaledMoEGroupedGemmGluBiasKernel(
-            sf_vec_size=sf_vec_size,
-            acc_dtype=jax_to_cutlass_dtype(acc_dtype),
-            use_2cta_instrs=mma_tiler_mn[0] == BlockScaledMoEGroupedGemmGluBiasKernel.TWO_CTA_MMA_TILER_M,
-            mma_tiler_mn=mma_tiler_mn,
-            cluster_shape_mn=cluster_shape_mn,
-            vectorized_f32=vector_f32,
-            generate_sfd=quantized_output,
-            discrete_col_sfd=discrete_col_sfd,
-            expert_cnt=expert_cnt,
-            weight_mode=MoEWeightMode.DENSE,
-            use_dynamic_sched=use_dynamic_sched,
-            act_func=act_func,
-            enable_bias=has_bias,
-        )
-        max_active_clusters = resolve_max_active_clusters(
-            cutlass.utils.HardwareInfo().get_max_active_clusters(cluster_shape_mn[0] * cluster_shape_mn[1]),
-            cluster_overlap_margin,
-        )
-        kernel(
-            a,
-            b,
-            sfb,
-            cutlass.Int32(0),
-            cutlass.Int32(0),
-            cutlass.Int64(0),
-            OperandMajorMode.K,
-            workspace.iterator,
-            c,
-            d,
-            d_col,
-            sfa,
-            sfd_row,
-            sfd_col,
-            amax,
-            norm_const,
-            padded_offsets,
-            alpha,
-            prob,
-            bias,
-            max_active_clusters,
-            stream,
-            linear_offset=cutlass.Float32(linear_offset),
-            geglu_alpha=cutlass.Float32(geglu_alpha),
-            glu_clamp_max=cutlass.Float32(glu_clamp_max),
-            glu_clamp_min=cutlass.Float32(glu_clamp_min),
-        )
-
-    return launch
+    kernel = BlockScaledMoEGroupedGemmGluBiasKernel(
+        sf_vec_size=sf_vec_size,
+        acc_dtype=jax_to_cutlass_dtype(acc_dtype),
+        use_2cta_instrs=mma_tiler_mn[0] == BlockScaledMoEGroupedGemmGluBiasKernel.TWO_CTA_MMA_TILER_M,
+        mma_tiler_mn=mma_tiler_mn,
+        cluster_shape_mn=cluster_shape_mn,
+        vectorized_f32=vector_f32,
+        generate_sfd=quantized_output,
+        discrete_col_sfd=discrete_col_sfd,
+        expert_cnt=expert_cnt,
+        weight_mode=MoEWeightMode.DENSE,
+        use_dynamic_sched=use_dynamic_sched,
+        act_func=act_func,
+        enable_bias=has_bias,
+    )
+    max_active_clusters = resolve_max_active_clusters(
+        cutlass.utils.HardwareInfo().get_max_active_clusters(cluster_shape_mn[0] * cluster_shape_mn[1]),
+        cluster_overlap_margin,
+    )
+    kernel(
+        a,
+        b,
+        sfb,
+        cutlass.Int32(0),
+        cutlass.Int32(0),
+        cutlass.Int64(0),
+        OperandMajorMode.K,
+        workspace.iterator,
+        c,
+        d,
+        d_col,
+        sfa,
+        sfd_row,
+        sfd_col,
+        amax,
+        norm_const,
+        padded_offsets,
+        alpha,
+        prob,
+        bias,
+        max_active_clusters,
+        stream,
+        linear_offset=cutlass.Float32(linear_offset),
+        geglu_alpha=cutlass.Float32(geglu_alpha),
+        glu_clamp_max=cutlass.Float32(glu_clamp_max),
+        glu_clamp_min=cutlass.Float32(glu_clamp_min),
+    )
 
 
 def _grouped_gemm_glu_impl(
@@ -196,7 +186,7 @@ def _grouped_gemm_glu_impl(
     *,
     b_major: str = "k",
     _validate_only: bool = False,
-) -> GroupedGemmGluResult | dict[str, Any]:
+) -> TupleDict | dict[str, Any]:
     """Compute an MXFP8 dense-weight grouped GEMM with fused GLU.
 
     Dense expert weights use shape ``(N, K, L)``. ``swiglu`` and ``geglu``
@@ -366,26 +356,27 @@ def _grouped_gemm_glu_impl(
         )
     )
     results = call_cutedsl(
-        _make_launcher(
-            acc_dtype=acc_dtype,
-            mma_tiler_mn=mma_tiler_mn,
-            cluster_shape_mn=cluster_shape_mn,
-            sf_vec_size=sf_vec_size,
-            vector_f32=bool(vector_f32),
-            discrete_col_sfd=bool(discrete_col_sfd),
-            expert_cnt=experts,
-            has_prob=prob_tensor is not None,
-            has_bias=bias_tensor is not None,
-            quantized_output=quantized_output,
-            use_dynamic_sched=bool(use_dynamic_sched),
-            act_func=act_func,
-            linear_offset=float(linear_offset),
-            geglu_alpha=float(geglu_alpha),
-            glu_clamp_max=float(glu_clamp_max),
-            glu_clamp_min=float(glu_clamp_min),
-            cluster_overlap_margin=int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0")),
-        ),
+        _launch,
         inputs,
+        static_args={
+            "acc_dtype": acc_dtype,
+            "mma_tiler_mn": mma_tiler_mn,
+            "cluster_shape_mn": cluster_shape_mn,
+            "sf_vec_size": sf_vec_size,
+            "vector_f32": bool(vector_f32),
+            "discrete_col_sfd": bool(discrete_col_sfd),
+            "expert_cnt": experts,
+            "has_prob": prob_tensor is not None,
+            "has_bias": bias_tensor is not None,
+            "quantized_output": quantized_output,
+            "use_dynamic_sched": bool(use_dynamic_sched),
+            "act_func": act_func,
+            "linear_offset": float(linear_offset),
+            "geglu_alpha": float(geglu_alpha),
+            "glu_clamp_max": float(glu_clamp_max),
+            "glu_clamp_min": float(glu_clamp_min),
+            "cluster_overlap_margin": int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0")),
+        },
         outputs=outputs,
         workspaces=workspaces,
         input_specs=input_specs,
@@ -399,7 +390,7 @@ def _grouped_gemm_glu_impl(
         d_col_tensor = None
         sfd_row_tensor = None
         sfd_col_tensor = None
-    return GroupedGemmGluResult(
+    return TupleDict(
         c_tensor=c_tensor,
         d_tensor=d_tensor,
         d_col_tensor=d_col_tensor,
@@ -505,7 +496,7 @@ class GroupedGemmGluSm100(ApiBaseJax):
         bias_tensor: Optional[Any] = None,
         norm_const_tensor: Optional[Any] = None,
         prob_tensor: Optional[Any] = None,
-    ) -> GroupedGemmGluResult:
+    ) -> TupleDict:
         return super().__call__(
             a_tensor,
             sfa_tensor,
@@ -529,7 +520,7 @@ class GroupedGemmGluSm100(ApiBaseJax):
         bias_tensor: Optional[Any] = None,
         norm_const_tensor: Optional[Any] = None,
         prob_tensor: Optional[Any] = None,
-    ) -> GroupedGemmGluResult:
+    ) -> TupleDict:
         values = {
             "a_tensor": a_tensor,
             "sfa_tensor": sfa_tensor,
@@ -573,7 +564,7 @@ def grouped_gemm_glu_wrapper_sm100(
     use_dynamic_sched: bool = False,
     *,
     b_major: str = "k",
-) -> GroupedGemmGluResult:
+) -> TupleDict:
     """Compute an MXFP8 dense-weight grouped GEMM with fused GLU."""
 
     op = GroupedGemmGluSm100(
@@ -618,7 +609,6 @@ def grouped_gemm_glu_wrapper_sm100(
 
 
 __all__ = [
-    "GroupedGemmGluResult",
     "GroupedGemmGluSm100",
     "grouped_gemm_glu_wrapper_sm100",
 ]

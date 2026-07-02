@@ -5,25 +5,23 @@
 
 from __future__ import annotations
 
-from functools import lru_cache
 import os
-from typing import Any, NamedTuple, Optional
+from typing import Any, Optional
 
 import jax.numpy as jnp
 from cutlass.jax import TensorSpec
 
-from ..._jax.api_base import ApiBaseJax, BufferSpec, call_cutedsl
+from ..._jax.api_base import (
+    ApiBaseJax,
+    BufferSpec,
+    TupleDict,
+    call_cutedsl,
+    require_dtype,
+)
 from ..._jax.gemm import require_16_byte_extent, require_array
 from ..._jax.grouped_gemm import grouped_workspace_tensor_spec
-from ..._jax.validation import require_dtype
 from ...gemm_validation import ceil_div, require_shape, resolve_max_active_clusters
 from .._jax_api import check_call_signatures, immutable_mapping
-
-
-class GroupedGemmWgradResult(NamedTuple):
-    """Functional dense weight gradient."""
-
-    wgrad_tensor: Any
 
 
 def wgrad_scale_shape(
@@ -63,9 +61,9 @@ def wgrad_output_tensor_spec() -> TensorSpec:
     return TensorSpec(layout=(2, 1, 0), mode=(0, 1, 2), ptr_assumed_align=16)
 
 
-@lru_cache(maxsize=None)
-def _make_launcher(
-    *,
+def _launch(
+    stream,
+    *args,
     acc_dtype: Any,
     mma_tiler_mn: tuple[int, int],
     cluster_shape_mn: tuple[int, int],
@@ -76,66 +74,63 @@ def _make_launcher(
     has_global_scale: bool,
     cluster_overlap_margin: int,
 ):
-    def launch(stream, *args):
-        import cutlass
-        from cutlass.jax import jax_to_cutlass_dtype
+    import cutlass
+    from cutlass.jax import jax_to_cutlass_dtype
 
-        from ..moe_utils import MoEWeightMode, WGradInputOrder
-        from .moe_blockscaled_grouped_gemm_wgrad import (
-            BlockScaledMoEGroupedGemmWgradKernel,
-        )
+    from ..moe_utils import MoEWeightMode, WGradInputOrder
+    from .moe_blockscaled_grouped_gemm_wgrad import (
+        BlockScaledMoEGroupedGemmWgradKernel,
+    )
 
-        arg_idx = 0
+    arg_idx = 0
 
-        def take():
-            nonlocal arg_idx
-            value = args[arg_idx]
-            arg_idx += 1
-            return value
+    def take():
+        nonlocal arg_idx
+        value = args[arg_idx]
+        arg_idx += 1
+        return value
 
-        a_tensor = take()
-        b_tensor = take()
-        sfa_tensor = take()
-        sfb_tensor = take()
-        offsets_tensor = take()
-        global_scale_a = take() if has_global_scale else None
-        global_scale_b = take() if has_global_scale else None
-        wgrad_tensor = take()
-        workspace = take()
-        if arg_idx != len(args):
-            raise RuntimeError(f"Unexpected grouped wgrad argument count: consumed {arg_idx}, " f"received {len(args)}")
+    a_tensor = take()
+    b_tensor = take()
+    sfa_tensor = take()
+    sfb_tensor = take()
+    offsets_tensor = take()
+    global_scale_a = take() if has_global_scale else None
+    global_scale_b = take() if has_global_scale else None
+    wgrad_tensor = take()
+    workspace = take()
+    if arg_idx != len(args):
+        raise RuntimeError(f"Unexpected grouped wgrad argument count: consumed {arg_idx}, " f"received {len(args)}")
 
-        kernel = BlockScaledMoEGroupedGemmWgradKernel(
-            sf_vec_size=sf_vec_size,
-            acc_dtype=jax_to_cutlass_dtype(acc_dtype),
-            use_2cta_instrs=(mma_tiler_mn[0] == BlockScaledMoEGroupedGemmWgradKernel.TWO_CTA_MMA_TILER_M),
-            mma_tiler_mn=mma_tiler_mn,
-            cluster_shape_mn=cluster_shape_mn,
-            accumulate_on_output=accumulate_on_output,
-            expert_cnt=expert_cnt,
-            weight_mode=MoEWeightMode.DENSE,
-            input_order=WGradInputOrder(input_order),
-        )
-        max_active_clusters = resolve_max_active_clusters(
-            cutlass.utils.HardwareInfo().get_max_active_clusters(cluster_shape_mn[0] * cluster_shape_mn[1]),
-            cluster_overlap_margin,
-        )
-        kernel(
-            a_tensor,
-            b_tensor,
-            sfa_tensor,
-            sfb_tensor,
-            wgrad_tensor,
-            offsets_tensor,
-            workspace,
-            max_active_clusters,
-            stream,
-            global_scale_a,
-            global_scale_b,
-            None,
-        )
-
-    return launch
+    kernel = BlockScaledMoEGroupedGemmWgradKernel(
+        sf_vec_size=sf_vec_size,
+        acc_dtype=jax_to_cutlass_dtype(acc_dtype),
+        use_2cta_instrs=(mma_tiler_mn[0] == BlockScaledMoEGroupedGemmWgradKernel.TWO_CTA_MMA_TILER_M),
+        mma_tiler_mn=mma_tiler_mn,
+        cluster_shape_mn=cluster_shape_mn,
+        accumulate_on_output=accumulate_on_output,
+        expert_cnt=expert_cnt,
+        weight_mode=MoEWeightMode.DENSE,
+        input_order=WGradInputOrder(input_order),
+    )
+    max_active_clusters = resolve_max_active_clusters(
+        cutlass.utils.HardwareInfo().get_max_active_clusters(cluster_shape_mn[0] * cluster_shape_mn[1]),
+        cluster_overlap_margin,
+    )
+    kernel(
+        a_tensor,
+        b_tensor,
+        sfa_tensor,
+        sfb_tensor,
+        wgrad_tensor,
+        offsets_tensor,
+        workspace,
+        max_active_clusters,
+        stream,
+        global_scale_a,
+        global_scale_b,
+        None,
+    )
 
 
 def _grouped_gemm_wgrad_impl(
@@ -155,7 +150,7 @@ def _grouped_gemm_wgrad_impl(
     input_order: str = "tensor2d",
     *,
     _validate_only: bool = False,
-) -> GroupedGemmWgradResult | dict[str, Any]:
+) -> TupleDict | dict[str, Any]:
     """Compute dense expert weight gradients using the SM100 grouped kernel.
 
     ``a_tensor`` has shape ``(hidden,tokens)`` and ``b_tensor`` has shape
@@ -293,18 +288,19 @@ def _grouped_gemm_wgrad_impl(
 
     output_shape = (expert_cnt, hidden, intermediate)
     (wgrad_tensor,) = call_cutedsl(
-        _make_launcher(
-            acc_dtype=acc_dtype,
-            mma_tiler_mn=mma_tiler_mn,
-            cluster_shape_mn=cluster_shape_mn,
-            sf_vec_size=sf_vec_size,
-            accumulate_on_output=bool(accumulate_on_output),
-            expert_cnt=expert_cnt,
-            input_order=input_order_value,
-            has_global_scale=has_global_scale,
-            cluster_overlap_margin=int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0")),
-        ),
+        _launch,
         inputs,
+        static_args={
+            "acc_dtype": acc_dtype,
+            "mma_tiler_mn": mma_tiler_mn,
+            "cluster_shape_mn": cluster_shape_mn,
+            "sf_vec_size": sf_vec_size,
+            "accumulate_on_output": bool(accumulate_on_output),
+            "expert_cnt": expert_cnt,
+            "input_order": input_order_value,
+            "has_global_scale": has_global_scale,
+            "cluster_overlap_margin": int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0")),
+        },
         outputs=(
             BufferSpec(
                 "wgrad_tensor",
@@ -330,7 +326,7 @@ def _grouped_gemm_wgrad_impl(
         input_specs=input_specs,
         use_static_tensors=True,
     )
-    return GroupedGemmWgradResult(wgrad_tensor=wgrad_tensor)
+    return TupleDict(wgrad_tensor=wgrad_tensor)
 
 
 class GroupedGemmWgradSm100(ApiBaseJax):
@@ -400,7 +396,7 @@ class GroupedGemmWgradSm100(ApiBaseJax):
         offsets_tensor: Any,
         global_scale_a: Optional[Any] = None,
         global_scale_b: Optional[Any] = None,
-    ) -> GroupedGemmWgradResult:
+    ) -> TupleDict:
         return super().__call__(
             a_tensor,
             b_tensor,
@@ -420,7 +416,7 @@ class GroupedGemmWgradSm100(ApiBaseJax):
         offsets_tensor: Any,
         global_scale_a: Optional[Any] = None,
         global_scale_b: Optional[Any] = None,
-    ) -> GroupedGemmWgradResult:
+    ) -> TupleDict:
         values = {
             "a_tensor": a_tensor,
             "b_tensor": b_tensor,
@@ -449,7 +445,7 @@ def grouped_gemm_wgrad_wrapper_sm100(
     sf_vec_size: int = 32,
     accumulate_on_output: bool = False,
     input_order: str = "tensor2d",
-) -> GroupedGemmWgradResult:
+) -> TupleDict:
     """Compute dense expert weight gradients using the SM100 grouped kernel."""
 
     op = GroupedGemmWgradSm100(
@@ -480,7 +476,6 @@ def grouped_gemm_wgrad_wrapper_sm100(
 
 
 __all__ = [
-    "GroupedGemmWgradResult",
     "GroupedGemmWgradSm100",
     "grouped_gemm_wgrad_wrapper_sm100",
 ]

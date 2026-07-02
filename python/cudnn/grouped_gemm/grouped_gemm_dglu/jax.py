@@ -5,13 +5,18 @@
 
 from __future__ import annotations
 
-from functools import lru_cache
 import os
-from typing import Any, NamedTuple, Optional
+from typing import Any, Optional
 
 import jax.numpy as jnp
 
-from ..._jax.api_base import ApiBaseJax, BufferSpec, call_cutedsl
+from ..._jax.api_base import (
+    ApiBaseJax,
+    BufferSpec,
+    TupleDict,
+    call_cutedsl,
+    require_dtype,
+)
 from ..._jax.gemm import (
     block_scale_tensor_spec,
     gemm_a_tensor_spec,
@@ -27,7 +32,6 @@ from ..._jax.grouped_gemm import (
     require_grouped_probability,
     require_grouped_vector,
 )
-from ..._jax.validation import require_dtype
 from ...gemm_validation import (
     block_scale_shape,
     require_shape,
@@ -36,21 +40,9 @@ from ...gemm_validation import (
 from .._jax_api import check_call_signatures, immutable_mapping
 
 
-class GroupedGemmDgluResult(NamedTuple):
-    """Functional outputs from dense-weight grouped GEMM + dGLU."""
-
-    d_row_tensor: Any
-    d_col_tensor: Any
-    dprob_tensor: Any
-    dbias_tensor: Any | None
-    amax_tensor: None
-    sfd_row_tensor: Any
-    sfd_col_tensor: Any
-
-
-@lru_cache(maxsize=None)
-def _make_launcher(
-    *,
+def _launch(
+    stream,
+    *args,
     acc_dtype: Any,
     mma_tiler_mn: tuple[int, int],
     cluster_shape_mn: tuple[int, int],
@@ -68,111 +60,108 @@ def _make_launcher(
     glu_clamp_min: float,
     cluster_overlap_margin: int,
 ):
-    def launch(stream, *args):
-        import cutlass
-        import cutlass.cute as cute
-        from cutlass.cute.nvgpu import OperandMajorMode
-        from cutlass.jax import jax_to_cutlass_dtype
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass.cute.nvgpu import OperandMajorMode
+    from cutlass.jax import jax_to_cutlass_dtype
 
-        from ..moe_utils import MoEWeightMode
-        from .moe_blockscaled_grouped_gemm_dglu_dbias import (
-            BlockScaledMoEGroupedGemmDgluDbiasKernel,
-        )
+    from ..moe_utils import MoEWeightMode
+    from .moe_blockscaled_grouped_gemm_dglu_dbias import (
+        BlockScaledMoEGroupedGemmDgluDbiasKernel,
+    )
 
-        arg_idx = 0
+    arg_idx = 0
 
-        def take():
-            nonlocal arg_idx
-            value = args[arg_idx]
-            arg_idx += 1
-            return value
+    def take():
+        nonlocal arg_idx
+        value = args[arg_idx]
+        arg_idx += 1
+        return value
 
-        a = take()
-        b = take()
-        c = take()
-        sfa = take()
-        sfb = take()
-        padded_offsets = take()
-        alpha = take()
-        beta = take()
-        prob = take()
-        norm_const = take()
+    a = take()
+    b = take()
+    c = take()
+    sfa = take()
+    sfb = take()
+    padded_offsets = take()
+    alpha = take()
+    beta = take()
+    prob = take()
+    norm_const = take()
 
-        d_row = take()
-        d_col = take()
-        dprob = take()
-        dbias = take() if generate_dbias else None
-        sfd_row = take()
-        sfd_col = take()
-        workspace = take()
-        if arg_idx != len(args):
-            raise RuntimeError(f"Unexpected grouped GEMM argument count: consumed {arg_idx}, received {len(args)}")
+    d_row = take()
+    d_col = take()
+    dprob = take()
+    dbias = take() if generate_dbias else None
+    sfd_row = take()
+    sfd_col = take()
+    workspace = take()
+    if arg_idx != len(args):
+        raise RuntimeError(f"Unexpected grouped GEMM argument count: consumed {arg_idx}, received {len(args)}")
 
-        if epilogue_op == "relu":
+    if epilogue_op == "relu":
 
-            def epilogue(x):
-                return cute.where(x > 0, x, cute.full_like(x, 0))
+        def epilogue(x):
+            return cute.where(x > 0, x, cute.full_like(x, 0))
 
-        elif epilogue_op == "srelu":
+    elif epilogue_op == "srelu":
 
-            def epilogue(x):
-                return cute.where(x > 0, x, cute.full_like(x, 0)) ** 2
+        def epilogue(x):
+            return cute.where(x > 0, x, cute.full_like(x, 0)) ** 2
 
-        else:
+    else:
 
-            def epilogue(x):
-                return x
+        def epilogue(x):
+            return x
 
-        kernel = BlockScaledMoEGroupedGemmDgluDbiasKernel(
-            sf_vec_size=sf_vec_size,
-            acc_dtype=jax_to_cutlass_dtype(acc_dtype),
-            use_2cta_instrs=mma_tiler_mn[0] == BlockScaledMoEGroupedGemmDgluDbiasKernel.TWO_CTA_MMA_TILER_M,
-            mma_tiler_mn=mma_tiler_mn,
-            cluster_shape_mn=cluster_shape_mn,
-            vectorized_f32=vector_f32,
-            discrete_col_sfd=discrete_col_sfd,
-            expert_cnt=expert_cnt,
-            weight_mode=MoEWeightMode.DENSE,
-            use_dynamic_sched=use_dynamic_sched,
-            act_func=act_func,
-        )
-        max_active_clusters = resolve_max_active_clusters(
-            cutlass.utils.HardwareInfo().get_max_active_clusters(cluster_shape_mn[0] * cluster_shape_mn[1]),
-            cluster_overlap_margin,
-        )
-        kernel(
-            a,
-            b,
-            sfb,
-            cutlass.Int32(0),
-            cutlass.Int32(0),
-            cutlass.Int64(0),
-            OperandMajorMode.K,
-            workspace.iterator,
-            c,
-            d_row,
-            d_col,
-            sfa,
-            sfd_row,
-            sfd_col,
-            None,
-            norm_const,
-            padded_offsets,
-            alpha,
-            beta,
-            prob,
-            dprob,
-            dbias,
-            max_active_clusters,
-            stream,
-            epilogue_op=epilogue,
-            linear_offset=linear_offset,
-            geglu_alpha=geglu_alpha,
-            glu_clamp_max=glu_clamp_max,
-            glu_clamp_min=glu_clamp_min,
-        )
-
-    return launch
+    kernel = BlockScaledMoEGroupedGemmDgluDbiasKernel(
+        sf_vec_size=sf_vec_size,
+        acc_dtype=jax_to_cutlass_dtype(acc_dtype),
+        use_2cta_instrs=mma_tiler_mn[0] == BlockScaledMoEGroupedGemmDgluDbiasKernel.TWO_CTA_MMA_TILER_M,
+        mma_tiler_mn=mma_tiler_mn,
+        cluster_shape_mn=cluster_shape_mn,
+        vectorized_f32=vector_f32,
+        discrete_col_sfd=discrete_col_sfd,
+        expert_cnt=expert_cnt,
+        weight_mode=MoEWeightMode.DENSE,
+        use_dynamic_sched=use_dynamic_sched,
+        act_func=act_func,
+    )
+    max_active_clusters = resolve_max_active_clusters(
+        cutlass.utils.HardwareInfo().get_max_active_clusters(cluster_shape_mn[0] * cluster_shape_mn[1]),
+        cluster_overlap_margin,
+    )
+    kernel(
+        a,
+        b,
+        sfb,
+        cutlass.Int32(0),
+        cutlass.Int32(0),
+        cutlass.Int64(0),
+        OperandMajorMode.K,
+        workspace.iterator,
+        c,
+        d_row,
+        d_col,
+        sfa,
+        sfd_row,
+        sfd_col,
+        None,
+        norm_const,
+        padded_offsets,
+        alpha,
+        beta,
+        prob,
+        dprob,
+        dbias,
+        max_active_clusters,
+        stream,
+        epilogue_op=epilogue,
+        linear_offset=linear_offset,
+        geglu_alpha=geglu_alpha,
+        glu_clamp_max=glu_clamp_max,
+        glu_clamp_min=glu_clamp_min,
+    )
 
 
 def _grouped_gemm_dglu_impl(
@@ -206,7 +195,7 @@ def _grouped_gemm_dglu_impl(
     *,
     b_major: str = "k",
     _validate_only: bool = False,
-) -> GroupedGemmDgluResult | dict[str, Any]:
+) -> TupleDict | dict[str, Any]:
     """Compute an MXFP8 dense-weight grouped GEMM with fused dGLU.
 
     ``dprob_tensor`` and optional ``dbias_tensor`` are fresh, zero-initialized
@@ -335,24 +324,7 @@ def _grouped_gemm_dglu_impl(
 
     workspace_bytes = max(kernel.get_dense_workspace_bytes(bool(use_dynamic_sched)), 1)
     results = call_cutedsl(
-        _make_launcher(
-            acc_dtype=acc_dtype,
-            mma_tiler_mn=mma_tiler_mn,
-            cluster_shape_mn=cluster_shape_mn,
-            sf_vec_size=sf_vec_size,
-            vector_f32=bool(vector_f32),
-            discrete_col_sfd=bool(discrete_col_sfd),
-            expert_cnt=experts,
-            generate_dbias=bool(generate_dbias),
-            use_dynamic_sched=bool(use_dynamic_sched),
-            act_func=act_func,
-            epilogue_op=normalized_epilogue,
-            linear_offset=float(linear_offset),
-            geglu_alpha=float(geglu_alpha),
-            glu_clamp_max=float(glu_clamp_max),
-            glu_clamp_min=float(glu_clamp_min),
-            cluster_overlap_margin=int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0")),
-        ),
+        _launch,
         (
             a_tensor,
             b_tensor,
@@ -365,6 +337,24 @@ def _grouped_gemm_dglu_impl(
             prob_tensor,
             norm_const_tensor,
         ),
+        static_args={
+            "acc_dtype": acc_dtype,
+            "mma_tiler_mn": mma_tiler_mn,
+            "cluster_shape_mn": cluster_shape_mn,
+            "sf_vec_size": sf_vec_size,
+            "vector_f32": bool(vector_f32),
+            "discrete_col_sfd": bool(discrete_col_sfd),
+            "expert_cnt": experts,
+            "generate_dbias": bool(generate_dbias),
+            "use_dynamic_sched": bool(use_dynamic_sched),
+            "act_func": act_func,
+            "epilogue_op": normalized_epilogue,
+            "linear_offset": float(linear_offset),
+            "geglu_alpha": float(geglu_alpha),
+            "glu_clamp_max": float(glu_clamp_max),
+            "glu_clamp_min": float(glu_clamp_min),
+            "cluster_overlap_margin": int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0")),
+        },
         outputs=outputs,
         workspaces=(
             BufferSpec(
@@ -399,7 +389,7 @@ def _grouped_gemm_dglu_impl(
     result_idx += int(bool(generate_dbias))
     sfd_row_tensor = results[result_idx]
     sfd_col_tensor = results[result_idx + 1]
-    return GroupedGemmDgluResult(
+    return TupleDict(
         d_row_tensor=d_row_tensor,
         d_col_tensor=d_col_tensor,
         dprob_tensor=dprob_tensor,
@@ -512,7 +502,7 @@ class GroupedGemmDgluSm100(ApiBaseJax):
         b_tensor: Any,
         sfb_tensor: Any,
         norm_const_tensor: Optional[Any] = None,
-    ) -> GroupedGemmDgluResult:
+    ) -> TupleDict:
         return super().__call__(
             a_tensor,
             c_tensor,
@@ -538,7 +528,7 @@ class GroupedGemmDgluSm100(ApiBaseJax):
         b_tensor: Any,
         sfb_tensor: Any,
         norm_const_tensor: Optional[Any] = None,
-    ) -> GroupedGemmDgluResult:
+    ) -> TupleDict:
         values = {
             "a_tensor": a_tensor,
             "c_tensor": c_tensor,
@@ -585,7 +575,7 @@ def grouped_gemm_dglu_wrapper_sm100(
     use_dynamic_sched: bool = False,
     *,
     b_major: str = "k",
-) -> GroupedGemmDgluResult:
+) -> TupleDict:
     """Compute an MXFP8 dense-weight grouped GEMM with fused dGLU."""
 
     op = GroupedGemmDgluSm100(
@@ -633,7 +623,6 @@ def grouped_gemm_dglu_wrapper_sm100(
 
 
 __all__ = [
-    "GroupedGemmDgluResult",
     "GroupedGemmDgluSm100",
     "grouped_gemm_dglu_wrapper_sm100",
 ]

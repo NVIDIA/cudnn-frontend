@@ -153,7 +153,7 @@ result = run(a, b, c, sfa, sfb, padded_offsets, alpha, prob, norm_const)
 d_row, d_col, d_srelu, dprob, dbias, amax, sfd_row, sfd_col, sfd_col_d_srelu = result
 ```
 
-The JAX API returns `GroupedGemmDsreluResult`. `dprob` and optional `dbias`
+The JAX API returns `TupleDict`. `dprob` and optional `dbias`
 are fresh zero-initialized functional results. It supports dense FP8 A/B and
 FP8 outputs with E8M0 scales and `sf_vec_size=32`; `amax` is `None`. Shapes,
 dtypes, layouts, and configuration arguments are static under `jax.jit`.

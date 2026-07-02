@@ -94,6 +94,10 @@ class JaxDsaContractTest(unittest.TestCase):
         cls.fake_jax.__path__ = []
         cls.fake_jax.__spec__ = ModuleSpec("jax", loader=None, is_package=True)
         cls.fake_jax.numpy = cls.fake_jnp
+        cls.fake_jax.tree_util = types.SimpleNamespace(
+            DictKey=lambda key: key,
+            register_pytree_with_keys=lambda *_args: None,
+        )
 
         cls.fake_cutlass = types.ModuleType("cutlass")
         cls.fake_cutlass.__path__ = []
@@ -171,19 +175,31 @@ class JaxDsaContractTest(unittest.TestCase):
         launcher = object()
         with (
             self._optional_modules(),
-            mock.patch.object(
-                self.forward,
-                "_make_launcher",
-                return_value=launcher,
-            ),
+            mock.patch.object(self.forward, "_launch", new=launcher),
             mock.patch.object(self.forward, "call_cutedsl", side_effect=fake_call),
         ):
             result = self.forward.indexer_forward_wrapper(q, k, w, ratio=1)
 
-        self.assertEqual(result.scores.shape, (1, 4, 5))
+        self.assertEqual(result["scores"].shape, (1, 4, 5))
         self.assertIs(captured["launcher"], launcher)
         self.assertEqual(captured["inputs"], (q, k, w))
         self.assertTrue(captured["use_static_tensors"])
+        self.assertEqual(
+            captured["static_args"],
+            {
+                "head_dim": 128,
+                "qhead_per_kv_head": 32,
+                "ratio": 1,
+                "m_block_size": 128,
+                "n_block_size": 128,
+                "q_stage": 2,
+                "kv_stage": 4,
+                "num_kv_heads": 1,
+                "max_seqlen_q": 4,
+                "max_seqlen_k": 5,
+                "sm_scale": 1.0,
+            },
+        )
 
         output = captured["outputs"][0]
         self.assertEqual(output.name, "scores")
@@ -206,11 +222,7 @@ class JaxDsaContractTest(unittest.TestCase):
         launcher = object()
         with (
             self._optional_modules(),
-            mock.patch.object(
-                self.top_k,
-                "_make_launcher",
-                return_value=launcher,
-            ) as make_launcher,
+            mock.patch.object(self.top_k, "_launch", new=launcher),
             mock.patch.object(
                 self.top_k,
                 "call_cutedsl",
@@ -223,8 +235,8 @@ class JaxDsaContractTest(unittest.TestCase):
                 top_k=8,
             )
 
-        self.assertEqual(result.indices.shape, (2, 8))
-        self.assertEqual(result.values.shape, (2, 8))
+        self.assertEqual(result["indices"].shape, (2, 8))
+        self.assertEqual(result["values"].shape, (2, 8))
         self.assertIs(captured["launcher"], launcher)
         self.assertEqual(captured["inputs"], (input_values, seq_lens))
         self.assertTrue(captured["use_static_tensors"])
@@ -241,7 +253,18 @@ class JaxDsaContractTest(unittest.TestCase):
         self.assertEqual(workspace.shape, (2, 2, 64))
         self.assertEqual(workspace.dtype, self.int32)
         self.assertIsNone(workspace.fill_value)
-        self.assertEqual(make_launcher.call_args.args[:2], ("cutlass.float32", 32))
+        self.assertEqual(
+            captured["static_args"],
+            {
+                "cutlass_dtype": "cutlass.float32",
+                "dtype_bits": 32,
+                "num_cols": 64,
+                "top_k": 8,
+                "next_n": 1,
+                "num_copy_bits": 256,
+                "large_occupancy": False,
+            },
+        )
 
     def test_indexer_top_k_rejects_unsupported_result_mode(self):
         input_values = _Array((2, 64), self.float16)
@@ -290,16 +313,8 @@ class JaxDsaContractTest(unittest.TestCase):
         compact_launcher = object()
         with (
             self._optional_modules(),
-            mock.patch.object(
-                self.top_k,
-                "_make_local_to_global_launcher",
-                return_value=global_launcher,
-            ) as make_global_launcher,
-            mock.patch.object(
-                self.top_k,
-                "_make_compactify_launcher",
-                return_value=compact_launcher,
-            ) as make_compact_launcher,
+            mock.patch.object(self.top_k, "_launch_local_to_global_fixed", new=global_launcher),
+            mock.patch.object(self.top_k, "_launch_compactify", new=compact_launcher),
             mock.patch.object(self.top_k, "call_cutedsl", side_effect=fake_call),
         ):
             global_result = self.top_k.local_to_global_wrapper(
@@ -308,10 +323,10 @@ class JaxDsaContractTest(unittest.TestCase):
             )
             compact_result = self.top_k.compactify_wrapper(compact_input)
 
-        self.assertEqual(global_result.indices.shape, (2, 3, 8))
-        self.assertEqual(global_result.indices.dtype, self.int32)
-        self.assertEqual(compact_result.indices.shape, (6, 8))
-        self.assertEqual(compact_result.topk_length.shape, (6,))
+        self.assertEqual(global_result["indices"].shape, (2, 3, 8))
+        self.assertEqual(global_result["indices"].dtype, self.int32)
+        self.assertEqual(compact_result["indices"].shape, (6, 8))
+        self.assertEqual(compact_result["topk_length"].shape, (6,))
 
         global_call, compact_call = captured
         self.assertIs(global_call["launcher"], global_launcher)
@@ -320,10 +335,7 @@ class JaxDsaContractTest(unittest.TestCase):
             [(spec.name, spec.shape, spec.dtype) for spec in global_call["outputs"]],
             [("indices", (2, 3, 8), self.int32)],
         )
-        make_global_launcher.assert_called_once_with(
-            is_varlen=False,
-            seqlen_k=1024,
-        )
+        self.assertEqual(global_call["static_args"], {"seqlen_k": 1024})
 
         self.assertIs(compact_call["launcher"], compact_launcher)
         self.assertEqual(compact_call["inputs"][0].shape, (6, 8))
@@ -334,7 +346,7 @@ class JaxDsaContractTest(unittest.TestCase):
                 ("topk_length", (6,), self.int32),
             ],
         )
-        make_compact_launcher.assert_called_once_with(rows=6, cols=8)
+        self.assertEqual(compact_call["static_args"], {"rows": 6, "cols": 8})
         self.assertTrue(global_call["use_static_tensors"])
         self.assertTrue(compact_call["use_static_tensors"])
 
@@ -352,11 +364,7 @@ class JaxDsaContractTest(unittest.TestCase):
         launcher = object()
         with (
             self._optional_modules(),
-            mock.patch.object(
-                self.top_k,
-                "_make_local_to_global_launcher",
-                return_value=launcher,
-            ) as make_launcher,
+            mock.patch.object(self.top_k, "_launch_local_to_global_varlen", new=launcher),
             mock.patch.object(self.top_k, "call_cutedsl", side_effect=fake_call),
         ):
             result = self.top_k.local_to_global_wrapper(
@@ -366,12 +374,12 @@ class JaxDsaContractTest(unittest.TestCase):
                 cu_seqlens_k=cu_seqlens_k,
             )
 
-        self.assertEqual(result.indices.shape, local_indices.shape)
+        self.assertEqual(result["indices"].shape, local_indices.shape)
         self.assertEqual(
             captured["inputs"],
             (local_indices, cu_seqlens_q, cu_seqlens_k),
         )
-        make_launcher.assert_called_once_with(is_varlen=True, seqlen_k=16)
+        self.assertEqual(captured["static_args"], {"seqlen_k": 16})
 
     def test_index_helper_launchers_preserve_native_argument_order(self):
         calls = []
@@ -408,22 +416,9 @@ class JaxDsaContractTest(unittest.TestCase):
             ),
             mock.patch.object(self.fake_cutlass, "Int32", int32, create=True),
         ):
-            self.top_k._make_local_to_global_launcher.cache_clear()
-            self.top_k._make_compactify_launcher.cache_clear()
-            fixed = self.top_k._make_local_to_global_launcher(
-                is_varlen=False,
-                seqlen_k=32,
-            )
-            packed = self.top_k._make_local_to_global_launcher(
-                is_varlen=True,
-                seqlen_k=32,
-            )
-            compact = self.top_k._make_compactify_launcher(rows=6, cols=8)
-            fixed("stream", "local", "global")
-            packed("stream", "local", "cuq", "cuk", "global")
-            compact("stream", "indices", "out", "length")
-            self.top_k._make_local_to_global_launcher.cache_clear()
-            self.top_k._make_compactify_launcher.cache_clear()
+            self.top_k._launch_local_to_global_fixed("stream", "local", "global", seqlen_k=32)
+            self.top_k._launch_local_to_global_varlen("stream", "local", "cuq", "cuk", "global", seqlen_k=32)
+            self.top_k._launch_compactify("stream", "indices", "out", "length", rows=6, cols=8)
 
         self.assertEqual(
             calls,
@@ -482,9 +477,14 @@ class JaxDsaContractTest(unittest.TestCase):
             self._optional_modules(),
             mock.patch.object(
                 self.score,
-                "_make_dense_launcher",
-                side_effect=(indexer_launcher, attention_launcher),
-            ) as make_launcher,
+                "_launch_dense_with_q_causal_offsets",
+                new=indexer_launcher,
+            ),
+            mock.patch.object(
+                self.score,
+                "_launch_dense_without_q_causal_offsets",
+                new=attention_launcher,
+            ),
             mock.patch.object(self.score, "call_cutedsl", side_effect=fake_call),
         ):
             indexer = self.score.dense_indexer_score_recompute_wrapper(
@@ -502,8 +502,8 @@ class JaxDsaContractTest(unittest.TestCase):
             )
 
         for result in (indexer, attention):
-            self.assertEqual((result.out.shape, result.out.dtype), ((2, 4, 8), self.float32))
-            self.assertEqual((result.denom.shape, result.denom.dtype), ((2, 4), self.float32))
+            self.assertEqual((result["out"].shape, result["out"].dtype), ((2, 4, 8), self.float32))
+            self.assertEqual((result["denom"].shape, result["denom"].dtype), ((2, 4), self.float32))
 
         indexer_call, attention_call = captured
         self.assertIs(indexer_call["launcher"], indexer_launcher)
@@ -522,14 +522,12 @@ class JaxDsaContractTest(unittest.TestCase):
         self.assertEqual(attention_call["outputs"][0].fill_value, float("-inf"))
         self.assertTrue(attention_call["use_static_tensors"])
 
-        indexer_config = make_launcher.call_args_list[0].kwargs
+        indexer_config = indexer_call["static_args"]
         self.assertEqual(indexer_config["score_type"], "indexer")
         self.assertEqual(indexer_config["ratio"], 2)
-        self.assertTrue(indexer_config["have_q_causal_offsets"])
-        attention_config = make_launcher.call_args_list[1].kwargs
+        attention_config = attention_call["static_args"]
         self.assertEqual(attention_config["score_type"], "attention")
         self.assertEqual(attention_config["scale"], 0.125)
-        self.assertFalse(attention_config["have_q_causal_offsets"])
 
     def test_sparse_score_wrappers_declare_functional_results(self):
         captured = []
@@ -551,9 +549,14 @@ class JaxDsaContractTest(unittest.TestCase):
             self._optional_modules(),
             mock.patch.object(
                 self.score,
-                "_make_launcher",
-                side_effect=(indexer_launcher, attention_launcher),
-            ) as make_launcher,
+                "_launch_sparse_without_topk_length",
+                new=indexer_launcher,
+            ),
+            mock.patch.object(
+                self.score,
+                "_launch_sparse_with_topk_length",
+                new=attention_launcher,
+            ),
             mock.patch.object(self.score, "call_cutedsl", side_effect=fake_call),
         ):
             predict = self.score.sparse_indexer_score_recompute_wrapper(
@@ -561,7 +564,7 @@ class JaxDsaContractTest(unittest.TestCase):
                 k,
                 weights,
                 indices,
-            ).predict
+            )["predict"]
             target = self.score.sparse_attn_score_recompute_wrapper(
                 q,
                 k,
@@ -569,7 +572,7 @@ class JaxDsaContractTest(unittest.TestCase):
                 indices,
                 0.125,
                 topk_length=lengths,
-            ).target
+            )["target"]
 
         self.assertEqual((predict.shape, predict.dtype), ((2, 4, 128), self.float32))
         self.assertEqual((target.shape, target.dtype), ((2, 4, 128), self.float32))
@@ -596,14 +599,12 @@ class JaxDsaContractTest(unittest.TestCase):
         self.assertTrue(indexer_call["use_static_tensors"])
         self.assertTrue(attention_call["use_static_tensors"])
 
-        indexer_config = make_launcher.call_args_list[0].kwargs
+        indexer_config = indexer_call["static_args"]
         self.assertEqual(indexer_config["score_type"], "indexer")
         self.assertEqual(indexer_config["n_block_size"], 128)
-        self.assertFalse(indexer_config["have_topk_length"])
-        attention_config = make_launcher.call_args_list[1].kwargs
+        attention_config = attention_call["static_args"]
         self.assertEqual(attention_config["score_type"], "attention")
         self.assertEqual(attention_config["n_block_size"], 64)
-        self.assertTrue(attention_config["have_topk_length"])
         self.assertEqual(attention_config["softmax_scale"], 0.125)
 
     def test_sparse_score_launcher_preserves_native_argument_order(self):
@@ -639,17 +640,17 @@ class JaxDsaContractTest(unittest.TestCase):
             mock.patch.dict(sys.modules, {kernel_module_name: kernel_module}),
             mock.patch.object(self.fake_cutlass, "Float32", float32, create=True),
         ):
-            self.score._make_launcher.cache_clear()
-            with_length = self.score._make_launcher(
+            self.score._launch_sparse_with_topk_length(
+                "stream",
+                "q",
+                "k",
+                "aux",
+                "indices",
+                "length",
+                "out",
                 **common,
-                have_topk_length=True,
             )
-            without_length = self.score._make_launcher(
-                **common,
-                have_topk_length=False,
-            )
-            with_length("stream", "q", "k", "aux", "indices", "length", "out")
-            without_length(
+            self.score._launch_sparse_without_topk_length(
                 "stream",
                 "q",
                 "k",
@@ -657,8 +658,8 @@ class JaxDsaContractTest(unittest.TestCase):
                 "indices",
                 "out",
                 "dummy_length",
+                **common,
             )
-            self.score._make_launcher.cache_clear()
 
         self.assertEqual(
             calls,
@@ -708,8 +709,13 @@ class JaxDsaContractTest(unittest.TestCase):
             mock.patch.object(self.fake_cutlass, "Float32", float32, create=True),
             mock.patch.object(self.fake_cutlass, "Int32", int32, create=True),
         ):
-            self.score._make_dense_launcher.cache_clear()
-            fixed = self.score._make_dense_launcher(
+            self.score._launch_dense_without_q_causal_offsets(
+                "stream",
+                "q",
+                "k",
+                "weights",
+                "out",
+                "denom",
                 score_type="indexer",
                 head_dim=128,
                 qhead_per_kv_head=32,
@@ -717,20 +723,8 @@ class JaxDsaContractTest(unittest.TestCase):
                 max_seqlen_q=4,
                 max_seqlen_k=8,
                 scale=0.5,
-                have_q_causal_offsets=False,
             )
-            with_offsets = self.score._make_dense_launcher(
-                score_type="attention",
-                head_dim=128,
-                qhead_per_kv_head=32,
-                ratio=2,
-                max_seqlen_q=4,
-                max_seqlen_k=8,
-                scale=0.125,
-                have_q_causal_offsets=True,
-            )
-            fixed("stream", "q", "k", "weights", "out", "denom")
-            with_offsets(
+            self.score._launch_dense_with_q_causal_offsets(
                 "stream",
                 "q",
                 "k",
@@ -738,8 +732,14 @@ class JaxDsaContractTest(unittest.TestCase):
                 "offsets",
                 "out",
                 "denom",
+                score_type="attention",
+                head_dim=128,
+                qhead_per_kv_head=32,
+                ratio=2,
+                max_seqlen_q=4,
+                max_seqlen_k=8,
+                scale=0.125,
             )
-            self.score._make_dense_launcher.cache_clear()
 
         self.assertEqual(
             calls,
@@ -879,10 +879,10 @@ class JaxDsaContractTest(unittest.TestCase):
                 ValueError,
                 "dtype bfloat16",
             ),
-            mock.patch.object(self.forward, "_make_launcher") as make_forward,
+            mock.patch.object(self.forward, "call_cutedsl") as call_forward,
         ):
             self.forward.indexer_forward_wrapper(bad_q, k, w, ratio=1)
-        make_forward.assert_not_called()
+        call_forward.assert_not_called()
 
         input_values = _Array((2, 64), self.float32)
         wrong_batch = _Array((1,), self.int32)
@@ -892,14 +892,14 @@ class JaxDsaContractTest(unittest.TestCase):
                 ValueError,
                 "num_rows.*must equal",
             ),
-            mock.patch.object(self.top_k, "_make_launcher") as make_top_k,
+            mock.patch.object(self.top_k, "call_cutedsl") as call_top_k,
         ):
             self.top_k.indexer_top_k_wrapper(
                 input_values,
                 wrong_batch,
                 top_k=8,
             )
-        make_top_k.assert_not_called()
+        call_top_k.assert_not_called()
 
 
 if __name__ == "__main__":

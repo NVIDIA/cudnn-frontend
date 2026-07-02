@@ -211,11 +211,11 @@ def sparse_attention_bwd(q, kv, out, dout, lse, attn_sink, topk_idxs, topk_lengt
 result = sparse_attention_bwd(
     q, kv, out, dout, lse, attn_sink, topk_idxs, topk_length
 )
-dq, dkv, d_sink = result.dq, result.dkv, result.d_sink
+dq, dkv, d_sink = result["dq"], result["dkv"], result["d_sink"]
 ```
 
 The JAX wrapper returns
-`SparseAttentionBackwardResult(dq=..., dkv=..., d_sink=...)`. It supports the
+`TupleDict(dq=..., dkv=..., d_sink=...)`. It supports the
 fixed SM100 flat-MQA domain only: BF16 `q`, `out`, and `dout` have shape
 `(S_q, H, 512)`, BF16 `kv` has shape `(S_kv, 512)`, `lse` and `attn_sink` are
 FP32, and `H` is divisible by 64. Indices are global INT32 values and the
@@ -288,10 +288,10 @@ from cudnn.jax import DSA
 def indexer_scores(q, k, w):
     return DSA.indexer_forward_wrapper(q, k, w, ratio=4)
 
-scores = indexer_scores(q, k, w).scores
+scores = indexer_scores(q, k, w)["scores"]
 ```
 
-The JAX wrapper returns `IndexerForwardResult(scores=...)`. Its public result
+The JAX wrapper returns `TupleDict(scores=...)`. Its public result
 has shape `(B, S_q, S_k)`. Internally, the custom call uses an FP32 result whose
 last dimension is padded to a multiple of four for TMA. That physical result is
 initialized to `-inf`, aliased into the custom call, and sliced back to `S_k`;
@@ -356,10 +356,10 @@ def select_scores(scores, seq_lens):
     )
 
 result = select_scores(scores, seq_lens)
-indices, values = result.indices, result.values
+indices, values = result["indices"], result["values"]
 ```
 
-The JAX wrapper returns `IndexerTopKResult(indices=..., values=...)`, with both
+The JAX wrapper returns `TupleDict(indices=..., values=...)`, with both
 arrays shaped `(n_rows, top_k)`. The JAX API requires `return_val=True`; the
 PyTorch wrapper retains its `return_val=False` mode. The
 radix kernel needs an INT32 temporary of shape
@@ -444,11 +444,11 @@ def recompute_predict(q_indexer, k_indexer, weights, topk_indices, topk_length):
 
 predict = recompute_predict(
     q_indexer, k_indexer, weights, topk_indices, topk_length
-).predict
+)["predict"]
 ```
 
 The JAX wrapper returns
-`SparseIndexerScoreRecomputeResult(predict=...)`. It supports the SM100 fixed
+`TupleDict(predict=...)`. It supports the SM100 fixed
 batched MQA layout: BF16 `q_indexer` has shape `(B, S_q, H_q, D)`, BF16
 `k_indexer` has shape `(B, S_k, D)`, BF16 `weights` has shape
 `(B, S_q, H_q)`, and INT32 `topk_indices` has shape `(B, S_q, topk)`. The
@@ -524,10 +524,10 @@ def recompute_target(q_attn, k_attn, lse, topk_indices, topk_length):
 
 target = recompute_target(
     q_attn, k_attn, lse, topk_indices, topk_length
-).target
+)["target"]
 ```
 
-The JAX wrapper returns `SparseAttnScoreRecomputeResult(target=...)`. It uses
+The JAX wrapper returns `TupleDict(target=...)`. It uses
 the same SM100 fixed batched MQA shapes as the indexer variant, with BF16
 `q_attn` and `k_attn`, FP32 `lse` shaped `(B, S_q, H_q)`, INT32 indices and
 optional lengths, and an FP32 `(B, S_q, topk)` result. The kernel fully
@@ -640,13 +640,13 @@ result = indexer_bwd(
     topk_indices,
     grad_loss,
 )
-d_index_q = result.d_index_q
-d_weights = result.d_weights
-d_index_k = result.d_index_k
+d_index_q = result["d_index_q"]
+d_weights = result["d_weights"]
+d_index_k = result["d_index_k"]
 ```
 
 The JAX wrapper returns
-`IndexerBackwardResult(d_index_q=..., d_weights=..., d_index_k=...)` for the
+`TupleDict(d_index_q=..., d_weights=..., d_index_k=...)` for the
 fixed SM100 BSHD subset. It requires BF16 `index_q=(B,S_q,64,128)`, BF16
 `weights=(B,S_q,64)`, BF16 `index_k=(B,S_k,128)`, FP32 score tensors, and
 INT32 indices with common shape `(B,S_q,topk)`. `topk` must be divisible by

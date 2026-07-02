@@ -162,6 +162,10 @@ class JaxGemmContractTest(unittest.TestCase):
         cls.fake_jax.__path__ = []
         cls.fake_jax.__spec__ = ModuleSpec("jax", loader=None, is_package=True)
         cls.fake_jax.numpy = cls.fake_jnp
+        cls.fake_jax.tree_util = types.SimpleNamespace(
+            DictKey=lambda key: key,
+            register_pytree_with_keys=lambda *_args: None,
+        )
 
         cls.fake_cutlass = types.ModuleType("cutlass")
         cls.fake_cutlass.__path__ = []
@@ -284,10 +288,8 @@ class JaxGemmContractTest(unittest.TestCase):
         captured = {}
         a = _Array((128, 128, 1), self.bfloat16)
         b = _Array((128, 128, 1), self.bfloat16)
-        launcher = object()
         with (
             self._optional_modules(),
-            mock.patch.object(self.swiglu, "_make_launcher", return_value=launcher),
             mock.patch.object(
                 self.swiglu,
                 "call_cutedsl",
@@ -305,9 +307,19 @@ class JaxGemmContractTest(unittest.TestCase):
                 b_major="n",
             )
 
-        self.assertIs(captured["launcher"], launcher)
+        self.assertIs(captured["launcher"], self.swiglu._launch)
         self.assertEqual(captured["inputs"], (a, b))
         self.assertTrue(captured["use_static_tensors"])
+        self.assertEqual(
+            captured["static_args"],
+            {
+                "alpha": 1.0,
+                "acc_dtype": self.float32,
+                "mma_tiler_mn": (128, 128),
+                "cluster_shape_mn": (1, 1),
+                "cluster_overlap_margin": 0,
+            },
+        )
         self.assertNotIn("workspaces", captured)
         self.assertEqual(
             [(spec.name, spec.shape, spec.dtype, spec.fill_value) for spec in captured["outputs"]],
@@ -322,9 +334,9 @@ class JaxGemmContractTest(unittest.TestCase):
             [spec.tensor_spec.layout for spec in captured["outputs"]],
             [(0, 1, 2), (0, 1, 2)],
         )
-        self.assertEqual(result._fields, ("ab12_tensor", "c_tensor", "sfc_tensor", "amax_tensor"))
-        self.assertIsNone(result.sfc_tensor)
-        self.assertIsNone(result.amax_tensor)
+        self.assertEqual(tuple(result.keys()), ("ab12_tensor", "c_tensor", "sfc_tensor", "amax_tensor"))
+        self.assertIsNone(result["sfc_tensor"])
+        self.assertIsNone(result["amax_tensor"])
 
     def test_kernel_capability_fields_are_public(self):
         for capabilities in (
@@ -358,10 +370,8 @@ class JaxGemmContractTest(unittest.TestCase):
         b = _Array((128, 128, 1), self.float8_e4m3fn)
         sfa = _Array((32, 4, 1, 4, 1, 1), self.float8_e8m0fnu)
         sfb = _Array((32, 4, 1, 4, 1, 1), self.float8_e8m0fnu)
-        launcher = object()
         with (
             self._optional_modules(),
-            mock.patch.object(self.amax, "_make_launcher", return_value=launcher),
             mock.patch.object(
                 self.amax,
                 "call_cutedsl",
@@ -378,7 +388,17 @@ class JaxGemmContractTest(unittest.TestCase):
             )
 
         self.assertEqual(captured["inputs"], (a, b, sfa, sfb))
+        self.assertIs(captured["launcher"], self.amax._launch)
         self.assertTrue(captured["use_static_tensors"])
+        self.assertEqual(
+            captured["static_args"],
+            {
+                "sf_vec_size": 32,
+                "mma_tiler_mn": (128, 128),
+                "cluster_shape_mn": (1, 1),
+                "cluster_overlap_margin": 0,
+            },
+        )
         self.assertEqual(
             [spec.layout for spec in captured["input_specs"]],
             [(1, 0, 2), (1, 0, 2), (2, 1, 4, 0, 3, 5), (2, 1, 4, 0, 3, 5)],
@@ -393,7 +413,7 @@ class JaxGemmContractTest(unittest.TestCase):
             (amax_spec.name, amax_spec.shape, amax_spec.dtype, amax_spec.fill_value),
             ("amax_tensor", (1, 1, 1), self.float32, float("-inf")),
         )
-        self.assertEqual(result._fields, ("c_tensor", "amax_tensor"))
+        self.assertEqual(tuple(result.keys()), ("c_tensor", "amax_tensor"))
 
     def test_swiglu_rejects_quantized_arguments(self):
         a = _Array((128, 128, 1), self.bfloat16)
@@ -402,10 +422,10 @@ class JaxGemmContractTest(unittest.TestCase):
         with (
             self._optional_modules(),
             self.assertRaisesRegex(NotImplementedError, "unquantized path"),
-            mock.patch.object(self.swiglu, "_make_launcher") as make_launcher,
+            mock.patch.object(self.swiglu, "call_cutedsl") as lower,
         ):
             self.swiglu.gemm_swiglu_wrapper_sm100(a, b, sfa_tensor=scale, sfb_tensor=scale)
-        make_launcher.assert_not_called()
+        lower.assert_not_called()
 
     def test_swiglu_rejects_unsupported_epilogue_and_incomplete_2cta_tiles(self):
         a = _Array((128, 128, 1), self.bfloat16)
@@ -419,10 +439,10 @@ class JaxGemmContractTest(unittest.TestCase):
                 with (
                     self.subTest(mma_tiler_mn=mma_tiler_mn),
                     self.assertRaisesRegex(ValueError, message),
-                    mock.patch.object(self.swiglu, "_make_launcher") as make_launcher,
+                    mock.patch.object(self.swiglu, "call_cutedsl") as lower,
                 ):
                     self.swiglu.gemm_swiglu_wrapper_sm100(a, b, mma_tiler_mn=mma_tiler_mn)
-                make_launcher.assert_not_called()
+                lower.assert_not_called()
 
     def test_amax_validates_scale_shapes_before_lowering(self):
         a = _Array((128, 128, 1), self.float8_e5m2)
@@ -432,10 +452,10 @@ class JaxGemmContractTest(unittest.TestCase):
         with (
             self._optional_modules(),
             self.assertRaisesRegex(ValueError, "sfa_tensor must have shape"),
-            mock.patch.object(self.amax, "_make_launcher") as make_launcher,
+            mock.patch.object(self.amax, "call_cutedsl") as lower,
         ):
             self.amax.gemm_amax_wrapper_sm100(a, b, bad_sfa, sfb)
-        make_launcher.assert_not_called()
+        lower.assert_not_called()
 
     def test_srelu_and_dsrelu_declare_functional_outputs(self):
         a = _Array((384, 512, 2), self.float8_e4m3fn)
@@ -449,13 +469,11 @@ class JaxGemmContractTest(unittest.TestCase):
 
         with (
             self._optional_modules(),
-            mock.patch.object(self.srelu, "_make_launcher", return_value="srelu"),
             mock.patch.object(
                 self.srelu,
                 "call_cutedsl",
                 side_effect=self._fake_call(srelu_captured),
             ),
-            mock.patch.object(self.dsrelu, "_make_launcher", return_value="dsrelu"),
             mock.patch.object(
                 self.dsrelu,
                 "call_cutedsl",
@@ -479,6 +497,11 @@ class JaxGemmContractTest(unittest.TestCase):
             )
 
         self.assertEqual(srelu_captured["inputs"], (a, b, sfa, sfb, prob))
+        self.assertIs(srelu_captured["launcher"], self.srelu._launch)
+        self.assertEqual(
+            set(srelu_captured["static_args"]),
+            {"alpha", "sf_vec_size", "mma_tiler_mn", "cluster_shape_mn", "vector_f32", "cluster_overlap_margin"},
+        )
         self.assertEqual(
             [(spec.name, spec.shape, spec.dtype, spec.fill_value) for spec in srelu_captured["outputs"]],
             [
@@ -496,10 +519,15 @@ class JaxGemmContractTest(unittest.TestCase):
                 (0, 1, 2),
             ],
         )
-        self.assertIsNone(srelu_result.amax_tensor)
-        self.assertIsNone(srelu_result.sfd_tensor)
+        self.assertIsNone(srelu_result["amax_tensor"])
+        self.assertIsNone(srelu_result["sfd_tensor"])
 
         self.assertEqual(dsrelu_captured["inputs"], (a, b, c, sfa, sfb, prob))
+        self.assertIs(dsrelu_captured["launcher"], self.dsrelu._launch)
+        self.assertEqual(
+            set(dsrelu_captured["static_args"]),
+            {"alpha", "sf_vec_size", "mma_tiler_mn", "cluster_shape_mn", "vector_f32", "cluster_overlap_margin"},
+        )
         d_spec, dprob_spec = dsrelu_captured["outputs"]
         self.assertEqual(
             (d_spec.name, d_spec.shape, d_spec.dtype),
@@ -514,8 +542,8 @@ class JaxGemmContractTest(unittest.TestCase):
             ),
             ("dprob_tensor", (384, 1, 2), self.float32, 0.0),
         )
-        self.assertIsNone(dsrelu_result.amax_tensor)
-        self.assertIsNone(dsrelu_result.sfd_tensor)
+        self.assertIsNone(dsrelu_result["amax_tensor"])
+        self.assertIsNone(dsrelu_result["sfd_tensor"])
         self.assertTrue(srelu_captured["use_static_tensors"])
         self.assertTrue(dsrelu_captured["use_static_tensors"])
 
@@ -538,10 +566,10 @@ class JaxGemmContractTest(unittest.TestCase):
                     with (
                         self.subTest(module=module.__name__, mma_tiler_mn=mma_tiler_mn),
                         self.assertRaisesRegex(ValueError, f"TILE_M={mma_tiler_mn[0]}"),
-                        mock.patch.object(module, "_make_launcher") as make_launcher,
+                        mock.patch.object(module, "call_cutedsl") as lower,
                     ):
                         getattr(module, wrapper_name)(*call_args, mma_tiler_mn=mma_tiler_mn)
-                    make_launcher.assert_not_called()
+                    lower.assert_not_called()
 
     def test_dense_class_uses_sample_metadata_without_retaining_arrays(self):
         sample_a = _Array((128, 128, 1), self.float8_e4m3fn)
@@ -568,7 +596,6 @@ class JaxGemmContractTest(unittest.TestCase):
         captured = {}
         with (
             self._optional_modules(),
-            mock.patch.object(self.amax, "_make_launcher", return_value="amax"),
             mock.patch.object(
                 self.amax,
                 "call_cutedsl",
@@ -623,8 +650,6 @@ class JaxGemmContractTest(unittest.TestCase):
         amax_module = types.ModuleType(amax_module_name)
         amax_module.Sm100BlockScaledPersistentDenseGemmKernel = FakeAmaxKernel
 
-        self.swiglu._make_launcher.cache_clear()
-        self.amax._make_launcher.cache_clear()
         with (
             self._optional_modules(),
             mock.patch.dict(
@@ -647,21 +672,31 @@ class JaxGemmContractTest(unittest.TestCase):
                 create=True,
             ),
         ):
-            swiglu_launch = self.swiglu._make_launcher(
+            self.swiglu._launch(
+                "stream",
+                "a",
+                "b",
+                "ab12",
+                "c",
                 alpha=0.5,
                 acc_dtype=self.float32,
                 mma_tiler_mn=(128, 128),
                 cluster_shape_mn=(1, 1),
                 cluster_overlap_margin=1,
             )
-            swiglu_launch("stream", "a", "b", "ab12", "c")
-            amax_launch = self.amax._make_launcher(
+            self.amax._launch(
+                "stream",
+                "a",
+                "b",
+                "sfa",
+                "sfb",
+                "c",
+                "amax",
                 sf_vec_size=32,
                 mma_tiler_mn=(128, 128),
                 cluster_shape_mn=(2, 2),
                 cluster_overlap_margin=2,
             )
-            amax_launch("stream", "a", "b", "sfa", "sfb", "c", "amax")
 
         self.assertEqual(
             swiglu_calls,
@@ -701,8 +736,6 @@ class JaxGemmContractTest(unittest.TestCase):
         dsrelu_module = types.ModuleType(dsrelu_module_name)
         dsrelu_module.Sm100BlockScaledPersistentDenseGemmKernel = FakeDsreluKernel
 
-        self.srelu._make_launcher.cache_clear()
-        self.dsrelu._make_launcher.cache_clear()
         with (
             self._optional_modules(),
             mock.patch.dict(
@@ -725,7 +758,15 @@ class JaxGemmContractTest(unittest.TestCase):
                 create=True,
             ),
         ):
-            srelu_launch = self.srelu._make_launcher(
+            self.srelu._launch(
+                "stream",
+                "a",
+                "b",
+                "sfa",
+                "sfb",
+                "prob",
+                "c",
+                "d",
                 alpha=0.25,
                 sf_vec_size=32,
                 mma_tiler_mn=(128, 128),
@@ -733,16 +774,7 @@ class JaxGemmContractTest(unittest.TestCase):
                 vector_f32=False,
                 cluster_overlap_margin=1,
             )
-            srelu_launch("stream", "a", "b", "sfa", "sfb", "prob", "c", "d")
-            dsrelu_launch = self.dsrelu._make_launcher(
-                alpha=0.5,
-                sf_vec_size=32,
-                mma_tiler_mn=(256, 256),
-                cluster_shape_mn=(2, 1),
-                vector_f32=True,
-                cluster_overlap_margin=2,
-            )
-            dsrelu_launch(
+            self.dsrelu._launch(
                 "stream",
                 "a",
                 "b",
@@ -752,6 +784,12 @@ class JaxGemmContractTest(unittest.TestCase):
                 "prob",
                 "d",
                 "dprob",
+                alpha=0.5,
+                sf_vec_size=32,
+                mma_tiler_mn=(256, 256),
+                cluster_shape_mn=(2, 1),
+                vector_f32=True,
+                cluster_overlap_margin=2,
             )
 
         srelu_args, srelu_kwargs = srelu_calls[0]

@@ -396,9 +396,8 @@ Tuple unpacking order is always:
 - **Standard mode**: `sfc_tensor is None` and `amax_tensor is None`
 - **Quantized mode**: `sfc_tensor` and/or `amax_tensor` are populated based on dtype/configuration
 
-The JAX API returns `GemmSwigluResult`, a named tuple with the same four field
-names and unpacking order. Its supported standard mode returns `None` for the
-last two fields.
+The JAX API returns the same four `TupleDict` keys and unpacking order. Its
+supported standard mode returns `None` for the last two fields.
 
 ### Class-specific parameters
 
