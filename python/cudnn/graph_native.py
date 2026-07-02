@@ -945,11 +945,15 @@ class NativeGraph:
         """Lower Python graph to C++."""
         import cudnn
 
-        pg_kwargs = dict(
-            io_data_type=self._context.io_data_type,
-            intermediate_data_type=self._context.intermediate_data_type,
-            compute_data_type=self._context.compute_data_type,
-        )
+        # cudnn.pygraph rejects None (wants the enum). io_data_type may be unset
+        # (block-scale tensors carry their own dtypes), but intermediate/compute
+        # default to FLOAT — matching cudnn.graph() — so cuDNN can infer virtual
+        # (intermediate) tensor dtypes during build.
+        pg_kwargs = {}
+        if self._context.io_data_type is not None:
+            pg_kwargs["io_data_type"] = self._context.io_data_type
+        pg_kwargs["intermediate_data_type"] = self._context.intermediate_data_type or cudnn.data_type.FLOAT
+        pg_kwargs["compute_data_type"] = self._context.compute_data_type or cudnn.data_type.FLOAT
         if self._handle is not None:
             pg_kwargs["handle"] = self._handle
         graph = cudnn.pygraph(**pg_kwargs)
@@ -962,7 +966,6 @@ class NativeGraph:
             mk_kwargs = dict(
                 dim=t.dim,
                 stride=t.stride,
-                data_type=t.data_type,
                 is_virtual=t.is_virtual,
                 is_pass_by_value=t.is_pass_by_value,
                 name=t.name,
@@ -971,6 +974,8 @@ class NativeGraph:
                 # buffers never bind. IR uids are unique and positive.
                 uid=t.uid,
             )
+            if t.data_type is not None:  # else NOT_SET → cuDNN infers from the
+                mk_kwargs["data_type"] = t.data_type  # graph intermediate_data_type
             if t.reordering_type is not None:  # e.g. F8_128x4 for block-scale SFs
                 mk_kwargs["reordering_type"] = t.reordering_type
             cpp = graph._make_tensor(**mk_kwargs)

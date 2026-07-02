@@ -83,3 +83,39 @@ def test_native_matmul_reduction_lowers_to_cudnn():
     torch.cuda.synchronize()
 
     torch.testing.assert_close(r, (a.float() @ b.float()).sum(dim=2, keepdim=True), atol=5e-2, rtol=5e-2)
+
+
+def test_native_block_scale_nvfp4_lowers_to_cudnn():
+    """block_scale_dequantize(A)@block_scale_dequantize(B), nvfp4 -> cuDNN (SM100)."""
+    if not hasattr(torch, "float4_e2m1fn_x2"):
+        pytest.skip("torch lacks float4_e2m1fn_x2")
+    if torch.cuda.get_device_properties(0).major < 10:
+        pytest.skip("block-scale MMA needs SM100+")
+
+    h = _handle()
+    b, Mb, Nb, Kb, BS = 1, 128, 128, 64, 16
+    A = torch.randint(0, 256, (b, Mb, Kb // 2), dtype=torch.uint8, device="cuda").view(torch.float4_e2m1fn_x2)
+    B = torch.randint(0, 256, (b, Kb, Nb // 2), dtype=torch.uint8, device="cuda").view(torch.float4_e2m1fn_x2)
+    k_scale = ((Kb + BS - 1) // BS + 3) // 4 * 4
+    A_ds = torch.full((b, 128, k_scale), 1.0, dtype=torch.float8_e4m3fn, device="cuda")
+    B_ds = torch.full((b, k_scale, 128), 1.0, dtype=torch.float8_e4m3fn, device="cuda")
+    C = torch.empty((b, Mb, Nb), dtype=torch.bfloat16, device="cuda")
+
+    g = NativeGraph(handle=h, compute_data_type=cudnn.data_type.FLOAT)
+    At = g.tensor(dim=[b, Mb, Kb], stride=[Mb * Kb, Kb, 1], data_type=cudnn.data_type.FP4_E2M1)
+    Bt = g.tensor(dim=[b, Kb, Nb], stride=[Nb * Kb, 1, Kb], data_type=cudnn.data_type.FP4_E2M1)
+    Ad = g.tensor(
+        dim=[b, 128, k_scale], stride=[128 * k_scale, k_scale, 1], data_type=cudnn.data_type.FP8_E4M3, reordering_type=cudnn.tensor_reordering.F8_128x4
+    )
+    Bd = g.tensor(
+        dim=[b, k_scale, 128], stride=[k_scale * 128, 1, k_scale], data_type=cudnn.data_type.FP8_E4M3, reordering_type=cudnn.tensor_reordering.F8_128x4
+    )
+    Cc = g.matmul(
+        g.block_scale_dequantize(At, Ad, block_size=[1, BS]), g.block_scale_dequantize(Bt, Bd, block_size=[BS, 1]), compute_data_type=cudnn.data_type.FLOAT
+    )
+    Cc.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
+
+    g.build([cudnn.heur_mode.A, cudnn.heur_mode.B])
+    ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
+    g.execute({At: A, Bt: B, Ad: A_ds, Bd: B_ds, Cc: C}, ws, handle=h)
+    torch.cuda.synchronize()  # builds + executes without error (parity harness = repo's fp4 test)
