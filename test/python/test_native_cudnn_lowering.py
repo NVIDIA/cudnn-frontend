@@ -11,7 +11,7 @@ if not torch.cuda.is_available():
     pytest.skip("needs a CUDA GPU", allow_module_level=True)
 
 import cudnn
-from cudnn.pygraph import pygraph
+from cudnn._pygraph import pygraph
 
 pytestmark = pytest.mark.L0
 
@@ -20,6 +20,17 @@ M, K, N = 64, 32, 48
 
 def _handle():
     return cudnn.create_handle()
+
+
+def _assert_ran_on_cudnn(g):
+    """Dispatch-level proof the execution took the cuDNN backend plan path:
+    the selected routed plan is the cuDNN entry (no python engine), the graph
+    was really lowered, and backend plans were created and built. Kernel
+    identity below the backend API is deliberately not asserted (kernel names
+    are backend-internal and version-dependent)."""
+    assert g.selected_engine is None
+    assert g._lowered_graph is not None
+    assert g._cpp_plans_created and g._is_built
 
 
 def test_native_matmul_lowers_to_cudnn():
@@ -38,6 +49,7 @@ def test_native_matmul_lowers_to_cudnn():
     ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
     g.execute({A: a, B: b, C: c}, ws, handle=h)
     torch.cuda.synchronize()
+    _assert_ran_on_cudnn(g)
 
     torch.testing.assert_close(c.float(), a.float() @ b.float(), atol=2e-2, rtol=2e-2)
 
@@ -60,6 +72,7 @@ def test_native_matmul_bias_relu_lowers_to_cudnn():
     ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
     g.execute({A: a, B: b, Bi: bias, Y: c}, ws, handle=h)
     torch.cuda.synchronize()
+    _assert_ran_on_cudnn(g)
 
     torch.testing.assert_close(c.float(), torch.relu(a.float() @ b.float() + bias.float()), atol=2e-2, rtol=2e-2)
 
@@ -81,6 +94,7 @@ def test_native_matmul_reduction_lowers_to_cudnn():
     ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
     g.execute({A: a, B: b, R: r}, ws, handle=h)
     torch.cuda.synchronize()
+    _assert_ran_on_cudnn(g)
 
     torch.testing.assert_close(r, (a.float() @ b.float()).sum(dim=2, keepdim=True), atol=5e-2, rtol=5e-2)
 
@@ -118,7 +132,8 @@ def test_native_block_scale_nvfp4_lowers_to_cudnn():
     g.build([cudnn.heur_mode.A, cudnn.heur_mode.B])
     ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
     g.execute({At: A, Bt: B, Ad: A_ds, Bd: B_ds, Cc: C}, ws, handle=h)
-    torch.cuda.synchronize()  # builds + executes without error (parity harness = repo's fp4 test)
+    torch.cuda.synchronize()
+    _assert_ran_on_cudnn(g)  # builds + executes without error (parity harness = repo's fp4 test)
 
 
 def test_native_moe_grouped_matmul_lowers_to_cudnn():
@@ -145,6 +160,7 @@ def test_native_moe_grouped_matmul_lowers_to_cudnn():
     ws = torch.empty(max(g.get_workspace_size(), 1), dtype=torch.uint8, device="cuda")
     g.execute({tok: tok_d, wt: wt_d, off: off_d, out: out_d}, ws, handle=h)
     torch.cuda.synchronize()
+    _assert_ran_on_cudnn(g)
 
     # reference: per-expert token-chunk @ weight[e] (weights stored H-contiguous)
     token = tok_d.view(T, Hd).float()
@@ -180,6 +196,7 @@ def test_native_sdpa_fwd_lowers_to_cudnn():
     ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
     g.execute({Q: q, K: k, V: v, O: o}, ws, handle=h)
     torch.cuda.synchronize()
+    _assert_ran_on_cudnn(g)
 
     torch.testing.assert_close(o, ref, atol=5e-2, rtol=5e-2)
 
@@ -203,6 +220,7 @@ def test_native_conv_fprop_lowers_to_cudnn():
     ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
     g.execute({X: x, W: w, Y: y}, ws, handle=h)
     torch.cuda.synchronize()
+    _assert_ran_on_cudnn(g)
 
     torch.testing.assert_close(y, ref, atol=5e-2, rtol=5e-2)
 
@@ -252,6 +270,7 @@ def test_native_layernorm_fwd_bwd_lowers_to_cudnn():
     ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
     g.execute({X: x.detach(), S: scale.detach(), Bi: bias.detach(), E: eps_cpu, Y: Yb, mean: mb, iv: ivb}, ws, handle=h)
     torch.cuda.synchronize()
+    _assert_ran_on_cudnn(g)
     torch.testing.assert_close(Yb.float(), Y_ref, atol=3e-2, rtol=3e-2)
     torch.testing.assert_close(mb, mean_ref, atol=5e-3, rtol=5e-3)
     torch.testing.assert_close(ivb, inv_ref, atol=5e-3, rtol=5e-3)
@@ -273,6 +292,7 @@ def test_native_layernorm_fwd_bwd_lowers_to_cudnn():
     ws2 = torch.empty(max(g2.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
     g2.execute({DY: cl(grad.half()), X2: x.detach(), S2: scale.detach(), M2: mb, IV2: ivb, DX: dxb, DS: dsb, DB: dbb}, ws2, handle=h)
     torch.cuda.synchronize()
+    _assert_ran_on_cudnn(g2)
     torch.testing.assert_close(dxb.float(), x.grad.float(), atol=5e-2, rtol=5e-2)
     torch.testing.assert_close(dsb.float(), scale.grad.float(), atol=5e-2, rtol=5e-2)
     torch.testing.assert_close(dbb.float(), bias.grad.float(), atol=5e-2, rtol=5e-2)
@@ -300,6 +320,7 @@ def test_native_pointwise_batch_lowers_to_cudnn():
     ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
     g.execute({A: a, B: b, Lo: lo, Hi: hi, Y: c}, ws, handle=h)
     torch.cuda.synchronize()
+    _assert_ran_on_cudnn(g)
 
     ref = (a.float() @ b.float()).abs().sqrt().clamp(0.5, 2.0)
     torch.testing.assert_close(c.float(), ref, atol=2e-2, rtol=2e-2)
@@ -343,6 +364,7 @@ def test_native_rmsnorm_lowers_to_cudnn():
     ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
     g.execute({X: x, S: scale, Bi: bias, E: eps_cpu, Y: Yb, iv: ivb}, ws, handle=h)
     torch.cuda.synchronize()
+    _assert_ran_on_cudnn(g)
 
     xf = x.float()
     ivref = torch.rsqrt(xf.pow(2).mean(dim=(1, 2, 3), keepdim=True) + eps)
@@ -402,6 +424,7 @@ def test_mixed_router_cudnn_slot_executes():
     ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
     g.execute({A: a, B: b, C: c}, ws, handle=h)
     torch.cuda.synchronize()
+    _assert_ran_on_cudnn(g)
     torch.testing.assert_close(c.float(), ref.float(), atol=2e-2, rtol=2e-2)
     assert ran == []  # the python engine did NOT run
 
@@ -415,6 +438,7 @@ def test_mixed_router_cudnn_slot_executes():
     assert g.selected_engine.name == "py_matmul"
     g.execute({A: a, B: b, C: c}, ws, handle=h)
     torch.cuda.synchronize()
+    assert g.selected_engine is not None  # this slot is the python engine
     assert ran == ["python"]
     torch.testing.assert_close(c.float(), ref.float(), atol=2e-2, rtol=2e-2)
 
@@ -443,6 +467,7 @@ def test_planning_one_shot_cudnn_only():
     ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
     g.execute({A: a, B: b, C: c}, ws, handle=h)
     torch.cuda.synchronize()
+    _assert_ran_on_cudnn(g)
     torch.testing.assert_close(c.float(), (a.float() @ b.float()), atol=2e-2, rtol=2e-2)
 
 
@@ -472,6 +497,7 @@ def test_output_layout_contract():
     ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
     g.execute({A: a, B: b, C: c}, ws, handle=h)
     torch.cuda.synchronize()
+    _assert_ran_on_cudnn(g)
     torch.testing.assert_close(c.float(), (a.float() @ b.float()), atol=2e-2, rtol=2e-2)
 
     # (b) inferred conv output keeps the backend's channels-last inference

@@ -1024,7 +1024,7 @@ class pygraph:
                 self.validate()
                 self._lowered_graph = self._lower_to_cpp()
             else:  # fresh container (classic usage): empty C++ graph
-                self._lowered_graph = cudnn._pybind_module.pygraph()
+                self._lowered_graph = cudnn._pybind_module.backend_graph()
         self._lowered_graph.deserialize(*args, **kwargs)
         self._is_built = True
 
@@ -1046,7 +1046,7 @@ class pygraph:
 
         # Create a new graph with a fresh C++ graph
         graph = cls(**kwargs)
-        graph._lowered_graph = cudnn._pybind_module.pygraph(
+        graph._lowered_graph = cudnn._pybind_module.backend_graph(
             io_data_type=graph._context.io_data_type,
             intermediate_data_type=graph._context.intermediate_data_type,
             compute_data_type=graph._context.compute_data_type,
@@ -1060,7 +1060,7 @@ class pygraph:
         return graph
 
     def _lower_to_cpp(self) -> Any:
-        """Lower Python graph to C++ (the internal ``_pybind_module.pygraph``)."""
+        """Lower Python graph to C++ (the internal ``_pybind_module.backend_graph``)."""
         import cudnn
         from .datatypes import _library_type  # torch dtype -> cudnn enum (classic parity)
 
@@ -1077,7 +1077,7 @@ class pygraph:
         pg_kwargs["compute_data_type"] = _library_type(self._context.compute_data_type or cudnn.data_type.FLOAT)
         if self._handle is not None:
             pg_kwargs["handle"] = self._handle
-        graph = cudnn._pybind_module.pygraph(**pg_kwargs)
+        graph = cudnn._pybind_module.backend_graph(**pg_kwargs)
 
         tensor_map: Dict[int, Any] = {}
 
@@ -1736,7 +1736,7 @@ def _wrap_callback(fn, lower_tensor):
     def wrapped(*args, **kwargs):
         import cudnn
 
-        cpp_graph_t = cudnn._pybind_module.pygraph
+        cpp_graph_t = cudnn._pybind_module.backend_graph
 
         def conv(v):
             if isinstance(v, cpp_graph_t):
@@ -1930,7 +1930,3 @@ def _install_captured_builders() -> None:
 
 
 _install_captured_builders()
-
-
-# Transitional alias (pre-flip name); will be removed after downstreams migrate.
-NativeGraph = pygraph

@@ -6,7 +6,7 @@ torch = pytest.importorskip("torch")
 
 from cudnn.graph_types import NodeType, Tensor
 from cudnn.nodes import Node, _row_major_stride
-from cudnn.pygraph import pygraph, GraphContext
+from cudnn._pygraph import pygraph, GraphContext
 
 pytestmark = pytest.mark.L0
 
@@ -297,7 +297,7 @@ class Testpygraph:
         """Every op in _STRUCTURED_OPS builds a first-class node: named ports
         (== C++ kwargs), attrs stored verbatim, declared outputs — via both
         keyword and positional-tensor call styles."""
-        from cudnn.pygraph import _STRUCTURED_OPS
+        from cudnn._pygraph import _STRUCTURED_OPS
 
         for op, spec in _STRUCTURED_OPS.items():
             for style in ("keyword", "positional"):
