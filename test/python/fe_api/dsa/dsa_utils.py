@@ -110,6 +110,63 @@ def with_dsa_dense_indexer_backward_params(func):
     return _apply(DSA_PARAM_MARKS + DSA_DENSE_INDEXER_BACKWARD_PARAM_MARKS, func)
 
 
+def make_random_mxfp8_scale(
+    shape: Tuple[int, ...],
+    *,
+    device: torch.device | str,
+    seed: Optional[int] = None,
+    exponent_min: int = -4,
+    exponent_max: int = 4,
+) -> torch.Tensor:
+    """Create random power-of-two E8M0 scales for MXFP8 test inputs."""
+    if exponent_min > exponent_max:
+        raise ValueError("exponent_min must be <= exponent_max")
+    generator = None
+    if seed is not None:
+        generator = torch.Generator(device=device)
+        generator.manual_seed(seed)
+    exponents = torch.randint(
+        exponent_min,
+        exponent_max + 1,
+        shape,
+        device=device,
+        generator=generator,
+        dtype=torch.int32,
+    )
+    if exponents.numel() > 0 and bool((exponents == 0).all().item()):
+        exponents.reshape(-1)[0] = exponent_min if exponent_min != 0 else exponent_max
+    values = torch.ldexp(torch.ones(shape, device=device, dtype=torch.float32), exponents)
+    return values.to(torch.float8_e8m0fnu)
+
+
+def expand_mxfp8_scale(
+    scale: torch.Tensor,
+    head_dim: int,
+    sf_vec_size: int = 32,
+) -> torch.Tensor:
+    """Expand one MXFP8 scale per scale-vector group to elementwise scales."""
+    return scale.float().repeat_interleave(sf_vec_size, dim=-1)[..., :head_dim]
+
+
+def quantize_mxfp8(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """Quantize a tensor to E4M3 using logical MXFP8 E8M0 scales."""
+    return (x.float() / expand_mxfp8_scale(scale, x.shape[-1])).to(torch.float8_e4m3fn)
+
+
+def quantize_fp8_1x128(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize rows to E4M3 with one floating-point descale per row."""
+    x_f32 = x.float()
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    amax = x_f32.abs().amax(dim=-1)
+    descale = torch.where(amax > 0, amax / fp8_max, torch.ones_like(amax))
+    q = torch.clamp(
+        x_f32 / descale.unsqueeze(-1),
+        min=-fp8_max,
+        max=fp8_max,
+    ).to(torch.float8_e4m3fn)
+    return q, descale.float()
+
+
 def dsa_init(
     request: pytest.FixtureRequest,
     dtype: Optional[torch.dtype] = None,

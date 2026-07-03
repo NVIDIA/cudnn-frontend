@@ -8,22 +8,15 @@ two-stage unfused path (score → top-K).
 
 from __future__ import annotations
 
-import logging
 from typing import Optional
 
 import torch
 import cuda.bindings.driver as cuda
 
-import cutlass
-import cutlass.cute as cute
-from cutlass.cute.runtime import make_fake_stream
-
 from cudnn.api_base import APIBase, TupleDict
 
-from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
-from cudnn.deepseek_sparse_attention.utils.runtime import device_major, resolve_stream
+from cudnn.deepseek_sparse_attention.utils.runtime import device_major
 
-from .indexer_fwd_sm100 import IndexerForwardSm100
 from ._interface import indexer_fwd as indexer_fwd_sm100
 from ._interface_sm90 import indexer_fwd as indexer_fwd_sm90
 
@@ -31,9 +24,10 @@ TMA_ALIGN_ELEMS = 4  # FP32 output => seqlen_k padded to multiples of 4 (16 B)
 
 
 class IndexerForward(APIBase):
-    """SM100+ APIBase implementation used by ``indexer_forward_wrapper``.
+    """SM100+ BF16 APIBase shell for the shared forward interface.
 
-    Hopper dispatch uses the direct SM90 wrapper in ``_interface_sm90.py``.
+    The backend interface owns lazy compilation and its kernel cache. Hopper
+    dispatch uses the direct SM90 wrapper in ``_interface_sm90.py``.
     """
 
     def __init__(
@@ -51,7 +45,6 @@ class IndexerForward(APIBase):
         sm_scale: float = 1.0,
     ):
         super().__init__()
-        self._kernel = IndexerForwardSm100
 
         self.q_desc = self._make_tensor_desc(sample_q, name="sample_q")
         self.k_desc = self._make_tensor_desc(sample_k, name="sample_k")
@@ -125,6 +118,10 @@ class IndexerForward(APIBase):
             s_k_padded_from_out % TMA_ALIGN_ELEMS != 0,
             f"Out seqlen_k dim must be a multiple of {TMA_ALIGN_ELEMS}, got {s_k_padded_from_out}",
         )
+        self._value_error_if(
+            s_k_padded_from_out < s_k,
+            f"Out seqlen_k dim ({s_k_padded_from_out}) must cover logical K length ({s_k})",
+        )
 
         major = device_major()
         self._runtime_error_if(
@@ -145,57 +142,10 @@ class IndexerForward(APIBase):
     def compile(self) -> None:
         self._logger.debug("Entering compile")
         self._ensure_support_checked()
-        if self._compiled_kernel is not None:
-            return
-
-        kernel_obj = self._kernel(
-            head_dim=self.head_dim,
-            qhead_per_kvhead=self.qhead_per_kv_head,
-            ratio=self.ratio,
-            m_block_size=self.m_block_size,
-            n_block_size=self.n_block_size,
-            q_stage=self.q_stage,
-            kv_stage=self.kv_stage,
-        )
-
-        fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
-
-        _compiled_kernel = cute.compile(
-            kernel_obj,
-            self._make_fake_cute_tensor_from_desc(self.q_desc, assumed_align=16),
-            self._make_fake_cute_tensor_from_desc(self.k_desc, assumed_align=16),
-            self._make_fake_cute_tensor_from_desc(self.w_desc, assumed_align=16),
-            self._make_fake_cute_tensor_from_desc(self.o_desc, assumed_align=16),
-            self.h_kv,
-            cutlass.Int32(self.s_q),
-            cutlass.Int32(self.s_k),
-            cutlass.Float32(self.sm_scale),
-            None,
-            None,
-            fake_stream,
-            options=compile_options(),
-        )
-
-        def tensor_api(q, k, w, out, stream):
-            # The kernel only writes to tiles it actually computes. Callers
-            # that depend on -inf in skipped positions should ensure the output
-            # was filled to -inf before invoking (the wrapper does this).
-            return _compiled_kernel(
-                q,
-                k,
-                w,
-                out,
-                self.h_kv,
-                cutlass.Int32(self.s_q),
-                cutlass.Int32(self.s_k),
-                cutlass.Float32(self.sm_scale),
-                None,
-                None,
-                stream,
-            )
-
-        self._compiled_kernel = tensor_api
-        self._logger.debug("Kernel compiled successfully")
+        # The direct interface owns its compile cache and needs real tensors
+        # to preserve runtime layouts. Mark this APIBase object ready and let
+        # the interface compile lazily on first execute().
+        self._compiled_kernel = True
 
     def execute(
         self,
@@ -206,13 +156,29 @@ class IndexerForward(APIBase):
         current_stream: Optional[cuda.CUstream] = None,
     ) -> None:
         self._logger.debug("Entering execute")
-        current_stream = resolve_stream(current_stream)
         if self._compiled_kernel is None:
             raise ValueError("IndexerForward kernel not compiled")
-        self._compiled_kernel(q, k, w, out, current_stream)
 
-
-_logger = logging.getLogger(__name__)
+        # APIBase callers provide a TMA-aligned output allocation, while the
+        # shared interface describes only the logical K columns. Passing the
+        # logical view lets the interface manage any internal padded buffer
+        # without exposing padded columns as scores.
+        logical_out = out[..., : self.s_k]
+        indexer_fwd_sm100(
+            q,
+            k,
+            w,
+            ratio=self.ratio,
+            qhead_per_kv_head=self.qhead_per_kv_head,
+            out=logical_out,
+            m_block_size=self.m_block_size,
+            n_block_size=self.n_block_size,
+            q_stage=self.q_stage,
+            kv_stage=self.kv_stage,
+            sm_scale=self.sm_scale,
+            precision="bf16",
+            current_stream=current_stream,
+        )
 
 
 def indexer_forward_wrapper(
@@ -232,6 +198,12 @@ def indexer_forward_wrapper(
     max_seqlen_q: Optional[int] = None,
     max_seqlen_k: Optional[int] = None,
     q_causal_offsets: Optional[torch.Tensor] = None,
+    precision: str = "bf16",
+    q_scale: Optional[torch.Tensor] = None,
+    k_scale: Optional[torch.Tensor] = None,
+    sf_vec_size: int = 32,
+    return_lse: bool = False,
+    lse_out: Optional[torch.Tensor] = None,
 ) -> TupleDict:
     """High-level wrapper. Allocates the output buffer with TMA padding on S_k.
 
@@ -257,7 +229,7 @@ def indexer_forward_wrapper(
             )
         # Both arches route through their own indexer_fwd wrapper (which owns
         # output allocation + TMA padding); Hopper uses the SM90 variant.
-        scores = indexer_fwd_sm90(
+        result = indexer_fwd_sm90(
             q,
             k,
             w,
@@ -269,9 +241,20 @@ def indexer_forward_wrapper(
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
             q_causal_offsets=q_causal_offsets,
+            precision=precision,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            return_lse=return_lse,
+            lse_out=lse_out,
             current_stream=stream,
         )
-        return TupleDict(scores=scores)
+        if return_lse:
+            scores, lse = result
+            return TupleDict(scores=scores, lse=lse)
+        return TupleDict(scores=result)
+
+    if return_lse or lse_out is not None:
+        raise NotImplementedError("SM100 dense indexer forward does not expose LSE; " "LSE is produced by dense_indexer_score_recompute_wrapper")
 
     # BSHD and THD both go through indexer_fwd (it branches on cu_seqlens
     # internally): it owns output allocation + TMA padding and uses a single
@@ -294,6 +277,10 @@ def indexer_forward_wrapper(
         max_seqlen_q=max_seqlen_q,
         max_seqlen_k=max_seqlen_k,
         q_causal_offsets=q_causal_offsets,
+        precision=precision,
+        q_scale=q_scale,
+        k_scale=k_scale,
+        sf_vec_size=sf_vec_size,
         current_stream=stream,
     )
     return TupleDict(scores=scores)

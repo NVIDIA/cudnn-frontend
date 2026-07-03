@@ -21,8 +21,12 @@ import cutlass.cute as cute
 
 from .sparse_score_recompute_sm100 import SparseScoreRecomputeSm100
 from .dense_score_recompute_sm100 import DenseScoreRecomputeSm100
+from .dense_score_recompute_sm100_mxfp8 import BwdDenseAttnScoreSm100Mxfp8
+from .indexer_score_unified_sm100 import IndexerScoreUnifiedSm100
+from .indexer_score_unified_sm100_mxfp8 import IndexerScoreUnifiedSm100Mxfp8
 from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
 from cudnn.deepseek_sparse_attention.utils.runtime import (
+    ceil_div as _ceil_div,
     device_major as _get_device_capability,
     maybe_contiguous,
     resolve_stream as _resolve_stream,
@@ -36,6 +40,74 @@ torch2cute_dtype_map = {
     torch.bfloat16: cutlass.BFloat16,
     torch.float32: cutlass.Float32,
 }
+
+
+def _normalize_dense_precision(
+    precision: str,
+    q_scale: Optional[torch.Tensor],
+    k_scale: Optional[torch.Tensor],
+) -> str:
+    precision = precision.lower()
+    if precision not in ("bf16", "mxfp8"):
+        raise ValueError(f"precision must be 'bf16' or 'mxfp8', got {precision!r}")
+    if precision == "bf16" and (q_scale is not None or k_scale is not None):
+        raise ValueError("q_scale and k_scale are only valid with precision='mxfp8'")
+    return precision
+
+
+def _validate_dense_mxfp8_contract(
+    *,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    per_head: torch.Tensor,
+    per_head_name: str,
+    q_scale: Optional[torch.Tensor],
+    k_scale: Optional[torch.Tensor],
+    qhead_per_kv_head: int,
+    head_dim: int,
+    seqlen_q: int,
+    seqlen_k: int,
+    bs: int,
+    n_heads_q: int,
+    n_heads_kv: int,
+    sf_vec_size: int,
+) -> None:
+    if q.dtype != torch.float8_e4m3fn or k.dtype != torch.float8_e4m3fn:
+        raise TypeError("precision='mxfp8' requires q and k to be torch.float8_e4m3fn")
+    if per_head_name == "weights" and per_head.dtype != torch.bfloat16:
+        raise TypeError("precision='mxfp8' requires weights to be torch.bfloat16")
+    if per_head_name == "lse" and per_head.dtype != torch.float32:
+        raise TypeError("precision='mxfp8' requires lse to be torch.float32")
+    if q_scale is None or k_scale is None:
+        raise ValueError("precision='mxfp8' requires q_scale and k_scale")
+    if q_scale.dtype != torch.float8_e8m0fnu or k_scale.dtype != torch.float8_e8m0fnu:
+        raise TypeError("precision='mxfp8' requires q_scale and k_scale to be " "torch.float8_e8m0fnu")
+    if sf_vec_size != 32:
+        raise ValueError("precision='mxfp8' currently requires sf_vec_size=32")
+    if head_dim != 128 and not (per_head_name == "lse" and head_dim == 512):
+        raise ValueError("precision='mxfp8' currently supports head_dim=128, " "or attention head_dim=512")
+    if n_heads_kv != 1:
+        raise ValueError("precision='mxfp8' dense score currently requires n_heads_kv=1")
+    if n_heads_q != n_heads_kv * qhead_per_kv_head:
+        raise ValueError("n_heads_q must equal n_heads_kv * qhead_per_kv_head for " "precision='mxfp8'")
+
+    sf_groups = _ceil_div(head_dim, sf_vec_size)
+    sf_groups_padded = _ceil_div(sf_groups, 4) * 4
+    q_mn = seqlen_q * qhead_per_kv_head
+    q_shape = (
+        bs * n_heads_kv,
+        _ceil_div(q_mn, 128) * 128,
+        sf_groups_padded,
+    )
+    k_shape = (
+        bs * n_heads_kv,
+        _ceil_div(seqlen_k, 128) * 128,
+        sf_groups_padded,
+    )
+    if tuple(q_scale.shape) != q_shape:
+        raise ValueError(f"q_scale packed shape must be {q_shape}, got {tuple(q_scale.shape)}")
+    if tuple(k_scale.shape) != k_shape:
+        raise ValueError(f"k_scale packed shape must be {k_shape}, got {tuple(k_scale.shape)}")
 
 
 def _sparse_indexer_score_recompute(
@@ -615,7 +687,14 @@ def _dense_m_block_with_smem_check(qhead_per_kv_head, head_dim, per_head_elem_by
     return qhead_per_kv_head
 
 
-def _dispatch_dense_attn_tile_params(head_dim, qhead_per_kv_head):
+def _dispatch_dense_attn_tile_params(
+    head_dim,
+    qhead_per_kv_head,
+    *,
+    precision: str = "bf16",
+    seqlen_k_hint: Optional[int] = None,
+    k_block_size: Optional[int] = None,
+):
     """Select (m_block_size, n_block_size, k_block_size) for dense attention backward.
 
     n_block_size is always 128 (required for Ld32x32bOp TMEM path).
@@ -625,29 +704,47 @@ def _dispatch_dense_attn_tile_params(head_dim, qhead_per_kv_head):
     Returns (m_block_size, n_block_size, k_block_size) where k_block_size=None
     means no head_dim splitting.
 
-    Rules tuned on B200 via tests/sweep_tile_params.py (dense mode, 2q sweep).
-    k=64 kvs=4 is consistently best or within 1-2% of best across all sizes.
-    2q (m=2*qhpkv) gives 35-46% speedup over 1q for nh_q=64.
+    Rules tuned on B200 via dense score sweeps.
     """
+    precision = precision.lower()
+    if precision == "mxfp8":
+        if head_dim == 512:
+            default_k = 256 if seqlen_k_hint is not None and seqlen_k_hint >= 4096 else 128
+        else:
+            default_k = 64
+        return 128, 128, default_k if k_block_size is None else k_block_size
+    if precision != "bf16":
+        raise ValueError(f"precision must be 'bf16' or 'mxfp8', got {precision!r}")
+
     m = _dense_m_block_with_smem_check(qhead_per_kv_head, head_dim, per_head_elem_bytes=4)
     n = 128
 
-    # hd=512, nh_q=64:  m=128(2q) k=64 kvs=4  ~1600 TFLOPS (16K best, +46% vs 1q)
-    # hd=512, nh_q=128: m=128(1q) k=64 kvs=4  ~1512 TFLOPS (m=256 doesn't fit SMEM)
-    # hd=576, nh_q=64:  m=128(2q) k=64 kvs=4  ~1601 TFLOPS (16K best, +41% vs 1q)
-    # hd=576, nh_q=128: m=128(1q) k=64 kvs=4  ~1527 TFLOPS (m=256 doesn't fit SMEM)
-    if head_dim in (512, 576):
-        return m, n, 64
+    if head_dim == 512:
+        if qhead_per_kv_head == 64:
+            return m, n, 128 if k_block_size is None else k_block_size
+        if qhead_per_kv_head == 128:
+            return m, n, 128 if k_block_size is None else k_block_size
+        return m, n, 64 if k_block_size is None else k_block_size
+    if head_dim == 576:
+        return m, n, 64 if k_block_size is None else k_block_size
 
     # Fallback: auto-select from SMEM budget
     head_dim_padded = int(math.ceil(head_dim / 16) * 16)
     k = _select_dense_k_block_size(head_dim_padded, m, n, per_head_elem_bytes=4)
     if k == head_dim_padded:
         k = None
+    if k_block_size is not None:
+        k = k_block_size
     return m, n, k
 
 
-def _dispatch_dense_indexer_tile_params(head_dim, qhead_per_kv_head):
+def _dispatch_dense_indexer_tile_params(
+    head_dim,
+    qhead_per_kv_head,
+    *,
+    precision: str = "bf16",
+    k_block_size: Optional[int] = None,
+):
     """Select (m_block_size, n_block_size, k_block_size) for dense indexer backward.
 
     m_block_size = qhpkv * 2 (2 q_tokens per tile) when SMEM allows,
@@ -656,23 +753,27 @@ def _dispatch_dense_indexer_tile_params(head_dim, qhead_per_kv_head):
     Returns (m_block_size, n_block_size, k_block_size) where k_block_size=None
     means no head_dim splitting.
 
-    Rules tuned on B200 via tests/sweep_tile_params.py (dense mode, 2q sweep).
-    2q with k=full is consistently best for all tested configs.
-    nh_q=32: 2q gives ~68% speedup; nh_q=64: 2q gives ~54% speedup.
+    Rules tuned on B200 via dense score sweeps.
     """
+    precision = precision.lower()
+    if precision == "mxfp8":
+        return 128, 128, 64 if k_block_size is None else k_block_size
+    if precision != "bf16":
+        raise ValueError(f"precision must be 'bf16' or 'mxfp8', got {precision!r}")
+
     m = _dense_m_block_with_smem_check(qhead_per_kv_head, head_dim, per_head_elem_bytes=2)
     n = 128
 
-    # hd=128, nh_q=32: m=64(2q)  k=full kvs=4  ~541 TFLOPS (16K best, +71% vs 1q)
-    # hd=128, nh_q=64: m=128(2q) k=full kvs=4  ~871 TFLOPS (16K best, +56% vs 1q)
     if head_dim == 128:
-        return m, n, None
+        return m, n, 64 if k_block_size is None else k_block_size
 
     # Fallback: auto-select from SMEM budget
     head_dim_padded = int(math.ceil(head_dim / 16) * 16)
     k = _select_dense_k_block_size(head_dim_padded, m, n, per_head_elem_bytes=2)
     if k == head_dim_padded:
         k = None
+    if k_block_size is not None:
+        k = k_block_size
     return m, n, k
 
 
@@ -693,9 +794,14 @@ def _dense_indexer_score_recompute(
     ratio: int = 1,
     cu_seqlens_q: Optional[torch.Tensor] = None,
     cu_seqlens_k: Optional[torch.Tensor] = None,
+    q_causal_offsets: Optional[torch.Tensor] = None,
     max_seqlen_q: Optional[int] = None,
     max_seqlen_k: Optional[int] = None,
-    q_causal_offsets: Optional[torch.Tensor] = None,
+    *,
+    precision: str = "bf16",
+    q_scale: Optional[torch.Tensor] = None,
+    k_scale: Optional[torch.Tensor] = None,
+    sf_vec_size: int = 32,
     current_stream: Optional[cuda.CUstream] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
@@ -715,12 +821,18 @@ def _dense_indexer_score_recompute(
         out: optional (total_q, max_seqlen_k) [FP32]
         denom_out: optional (total_q,) [FP32]
 
+    Both dense-indexer implementations fill causal-invalid score entries
+    with -inf, matching raw-logit mask semantics. Denom/LSE semantics are
+    unchanged.
+
     Returns:
         (out, denom_out)
     """
     current_stream = _resolve_stream(current_stream)
     q, k, weights = [maybe_contiguous(t, current_stream) for t in (q, k, weights)]
-
+    q_scale = maybe_contiguous(q_scale, current_stream)
+    k_scale = maybe_contiguous(k_scale, current_stream)
+    precision = _normalize_dense_precision(precision, q_scale, k_scale)
     is_varlen_q = cu_seqlens_q is not None
     is_varlen_k = cu_seqlens_k is not None
     assert is_varlen_q == is_varlen_k, "THD input requires both cu_seqlens_q and cu_seqlens_k"
@@ -744,13 +856,42 @@ def _dense_indexer_score_recompute(
         assert cu_seqlens_q.shape == (bs + 1,) and cu_seqlens_k.shape == (bs + 1,)
     else:
         bs, seqlen_q, n_heads_q, head_dim = q.shape
-        _, seqlen_k, _, _ = k.shape
+        _, seqlen_k, n_heads_kv, _ = k.shape
     q_causal_offsets = validate_q_causal_offsets(q_causal_offsets, int(bs), q.device, stream=current_stream)
 
     if qhead_per_kv_head is None:
-        qhead_per_kv_head = n_heads_q
-    if m_block_size is None:
+        qhead_per_kv_head = n_heads_q // n_heads_kv
+    if precision == "mxfp8":
+        if qhead_per_kv_head != 64:
+            raise ValueError("precision='mxfp8' dense indexer requires qhead_per_kv_head=64")
+        if m_block_size is not None and m_block_size != 128:
+            raise ValueError("precision='mxfp8' dense indexer requires m_block_size=128")
+        if n_block_size != 128:
+            raise ValueError("precision='mxfp8' dense indexer requires n_block_size=128")
+        if k_block_size is not None and k_block_size != 64:
+            raise ValueError("precision='mxfp8' dense indexer requires k_block_size=64")
+        m_block_size = 128
+        k_block_size = 64
+    elif m_block_size is None:
         m_block_size = qhead_per_kv_head
+
+    if precision == "mxfp8":
+        _validate_dense_mxfp8_contract(
+            q=q,
+            k=k,
+            per_head=weights,
+            per_head_name="weights",
+            q_scale=q_scale,
+            k_scale=k_scale,
+            qhead_per_kv_head=qhead_per_kv_head,
+            head_dim=head_dim,
+            seqlen_q=seqlen_q,
+            seqlen_k=seqlen_k,
+            bs=bs,
+            n_heads_q=n_heads_q,
+            n_heads_kv=n_heads_kv,
+            sf_vec_size=sf_vec_size,
+        )
 
     device = q.device
 
@@ -762,30 +903,53 @@ def _dense_indexer_score_recompute(
         denom_shape = (q.shape[0],) if is_varlen else (bs, seqlen_q)
         with _torch_stream_context(current_stream):
             denom_out = torch.empty(denom_shape, dtype=torch.float32, device=device)
-
     head_dim_padded = int(math.ceil(head_dim / 16) * 16)
     if k_block_size is None:
         k_block_size = _select_dense_k_block_size(head_dim_padded, m_block_size, n_block_size, per_head_elem_bytes=2)
     kv_stage = _compute_dense_kv_stage(head_dim_padded, m_block_size, n_block_size, k_block_size, per_head_elem_bytes=2)
+    if precision == "mxfp8":
+        kv_stage = 24
 
     compute_capability = _get_device_capability()
     if compute_capability < 10:
         raise NotImplementedError(f"Dense indexer backward requires SM100+ (got {compute_capability}).")
 
-    compile_key = (
-        "dense_indexer",
-        q.dtype,
-        head_dim,
-        qhead_per_kv_head,
-        m_block_size,
-        n_block_size,
-        k_block_size,
-        kv_stage,
-        ratio,
-        is_varlen,
-        q_causal_offsets is not None,
-    )
-
+    if precision == "mxfp8":
+        assert q_scale is not None and k_scale is not None
+        compile_key = (
+            "dense_indexer",
+            "mxfp8",
+            q.dtype,
+            k.dtype,
+            weights.dtype,
+            q_scale.dtype,
+            k_scale.dtype,
+            head_dim,
+            qhead_per_kv_head,
+            m_block_size,
+            n_block_size,
+            k_block_size,
+            head_dim_padded // k_block_size,
+            kv_stage,
+            ratio,
+            is_varlen,
+            q_causal_offsets is not None,
+            sf_vec_size,
+        )
+    else:
+        base_compile_key = (
+            q.dtype,
+            head_dim,
+            qhead_per_kv_head,
+            m_block_size,
+            n_block_size,
+            k_block_size,
+            kv_stage,
+            ratio,
+            is_varlen,
+            q_causal_offsets is not None,
+        )
+        compile_key = ("dense_indexer",) + base_compile_key
     if compile_key not in _dense_indexer_score_recompute.compile_cache:
         q_cute = to_cute_tensor(q)
         k_cute = to_cute_tensor(k)
@@ -796,61 +960,117 @@ def _dense_indexer_score_recompute(
         cu_k_cute = to_cute_tensor(cu_seqlens_k, leading_dim=0) if is_varlen else None
         q_offsets_cute = to_cute_tensor(q_causal_offsets, leading_dim=0) if q_causal_offsets is not None else None
 
-        kernel_obj = DenseScoreRecomputeSm100(
-            head_dim=head_dim,
-            qhead_per_kvhead=qhead_per_kv_head,
-            m_block_size=m_block_size,
-            n_block_size=n_block_size,
-            k_block_size=k_block_size,
-            kv_stage=kv_stage,
-            score_type="indexer",
-            ratio=ratio,
-            is_varlen=is_varlen,
-        )
-
+        if precision == "mxfp8":
+            assert q_scale is not None and k_scale is not None
+            q_scale_cute = to_cute_tensor(q_scale)
+            k_scale_cute = to_cute_tensor(k_scale)
+            kernel_obj = IndexerScoreUnifiedSm100Mxfp8(
+                head_dim=head_dim,
+                qhead_per_kvhead=qhead_per_kv_head,
+                m_block_size=m_block_size,
+                n_block_size=n_block_size,
+                k_block_size=k_block_size,
+                kv_stage=kv_stage,
+                ratio=ratio,
+                is_varlen=is_varlen,
+                sf_vec_size=sf_vec_size,
+                compute_lse=True,
+            )
+        else:
+            q_scale_cute = None
+            k_scale_cute = None
+            kernel_obj = IndexerScoreUnifiedSm100(
+                head_dim=head_dim,
+                qhead_per_kvhead=qhead_per_kv_head,
+                m_block_size=m_block_size,
+                n_block_size=n_block_size,
+                k_block_size=k_block_size,
+                kv_stage=kv_stage,
+                ratio=ratio,
+                is_varlen=is_varlen,
+                compute_lse=True,
+            )
         scale_arg = cutlass.Float32(sm_scale)
         max_q_arg = cutlass.Int32(seqlen_q)
         max_k_arg = cutlass.Int32(seqlen_k)
 
-        _dense_indexer_score_recompute.compile_cache[compile_key] = cute.compile(
-            kernel_obj,
-            q_cute,
-            k_cute,
-            w_cute,
-            out_cute,
-            denom_cute,
-            scale_arg,
-            max_q_arg,
-            max_k_arg,
-            cu_q_cute,
-            cu_k_cute,
-            q_offsets_cute,
-            current_stream,
-            options=compile_options(),
-        )
+        if precision == "mxfp8":
+            _dense_indexer_score_recompute.compile_cache[compile_key] = cute.compile(
+                kernel_obj,
+                q_cute,
+                k_cute,
+                w_cute,
+                q_scale_cute,
+                k_scale_cute,
+                out_cute,
+                denom_cute,
+                scale_arg,
+                max_q_arg,
+                max_k_arg,
+                cu_q_cute,
+                cu_k_cute,
+                q_offsets_cute,
+                current_stream,
+                options=compile_options(),
+            )
+        else:
+            _dense_indexer_score_recompute.compile_cache[compile_key] = cute.compile(
+                kernel_obj,
+                q_cute,
+                k_cute,
+                w_cute,
+                out_cute,
+                denom_cute,
+                scale_arg,
+                max_q_arg,
+                max_k_arg,
+                cu_q_cute,
+                cu_k_cute,
+                q_offsets_cute,
+                current_stream,
+                options=compile_options(),
+            )
 
-    scale_arg = cutlass.Float32(sm_scale)
-    max_q_arg = cutlass.Int32(seqlen_q)
-    max_k_arg = cutlass.Int32(seqlen_k)
     # Dense indexer score is a raw-logit buffer, so masked/skipped positions
     # must remain outside the softmax/logsumexp domain.
     with _torch_stream_context(current_stream):
         out.fill_(float("-inf"))
+    scale_arg = cutlass.Float32(sm_scale)
+    max_q_arg = cutlass.Int32(seqlen_q)
+    max_k_arg = cutlass.Int32(seqlen_k)
     with torch.cuda.nvtx.range("dense_indexer_score_recompute"):
-        _dense_indexer_score_recompute.compile_cache[compile_key](
-            q,
-            k,
-            weights,
-            out,
-            denom_out,
-            scale_arg,
-            max_q_arg,
-            max_k_arg,
-            cu_seqlens_q if is_varlen else None,
-            cu_seqlens_k if is_varlen else None,
-            q_causal_offsets,
-            current_stream,
-        )
+        if precision == "mxfp8":
+            _dense_indexer_score_recompute.compile_cache[compile_key](
+                q,
+                k,
+                weights,
+                q_scale,
+                k_scale,
+                out,
+                denom_out,
+                scale_arg,
+                max_q_arg,
+                max_k_arg,
+                cu_seqlens_q if is_varlen else None,
+                cu_seqlens_k if is_varlen else None,
+                q_causal_offsets,
+                current_stream,
+            )
+        else:
+            _dense_indexer_score_recompute.compile_cache[compile_key](
+                q,
+                k,
+                weights,
+                out,
+                denom_out,
+                scale_arg,
+                max_q_arg,
+                max_k_arg,
+                cu_seqlens_q if is_varlen else None,
+                cu_seqlens_k if is_varlen else None,
+                q_causal_offsets,
+                current_stream,
+            )
     return out, denom_out
 
 
@@ -871,9 +1091,14 @@ def _dense_attn_score_recompute(
     ratio: int = 1,
     cu_seqlens_q: Optional[torch.Tensor] = None,
     cu_seqlens_k: Optional[torch.Tensor] = None,
+    q_causal_offsets: Optional[torch.Tensor] = None,
     max_seqlen_q: Optional[int] = None,
     max_seqlen_k: Optional[int] = None,
-    q_causal_offsets: Optional[torch.Tensor] = None,
+    *,
+    precision: str = "bf16",
+    q_scale: Optional[torch.Tensor] = None,
+    k_scale: Optional[torch.Tensor] = None,
+    sf_vec_size: int = 32,
     current_stream: Optional[cuda.CUstream] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
@@ -898,6 +1123,9 @@ def _dense_attn_score_recompute(
     """
     current_stream = _resolve_stream(current_stream)
     q, k = [maybe_contiguous(t, current_stream) for t in (q, k)]
+    q_scale = maybe_contiguous(q_scale, current_stream)
+    k_scale = maybe_contiguous(k_scale, current_stream)
+    precision = _normalize_dense_precision(precision, q_scale, k_scale)
 
     is_varlen_q = cu_seqlens_q is not None
     is_varlen_k = cu_seqlens_k is not None
@@ -922,17 +1150,35 @@ def _dense_attn_score_recompute(
         assert cu_seqlens_q.shape == (bs + 1,) and cu_seqlens_k.shape == (bs + 1,)
     else:
         bs, seqlen_q, n_heads_q, head_dim = q.shape
-        _, seqlen_k, _, _ = k.shape
+        _, seqlen_k, n_heads_kv, _ = k.shape
     q_causal_offsets = validate_q_causal_offsets(q_causal_offsets, int(bs), q.device, stream=current_stream)
 
     if qhead_per_kv_head is None:
-        qhead_per_kv_head = n_heads_q
+        qhead_per_kv_head = n_heads_q // n_heads_kv
     if m_block_size is None:
         m_block_size = qhead_per_kv_head
 
     device = q.device
 
     lse = maybe_contiguous(lse, current_stream)
+
+    if precision == "mxfp8":
+        _validate_dense_mxfp8_contract(
+            q=q,
+            k=k,
+            per_head=lse,
+            per_head_name="lse",
+            q_scale=q_scale,
+            k_scale=k_scale,
+            qhead_per_kv_head=qhead_per_kv_head,
+            head_dim=head_dim,
+            seqlen_q=seqlen_q,
+            seqlen_k=seqlen_k,
+            bs=bs,
+            n_heads_q=n_heads_q,
+            n_heads_kv=n_heads_kv,
+            sf_vec_size=sf_vec_size,
+        )
 
     if out is None:
         out_shape = (q.shape[0], seqlen_k) if is_varlen else (bs, seqlen_q, seqlen_k)
@@ -942,29 +1188,68 @@ def _dense_attn_score_recompute(
         denom_shape = (q.shape[0],) if is_varlen else (bs, seqlen_q)
         with _torch_stream_context(current_stream):
             denom_out = torch.empty(denom_shape, dtype=torch.float32, device=device)
+    if precision == "mxfp8" and ((head_dim == 512 and qhead_per_kv_head >= 128) or (head_dim == 128 and qhead_per_kv_head == 64)):
+        with _torch_stream_context(current_stream):
+            out.zero_()
+            denom_out.zero_()
 
     head_dim_padded = int(math.ceil(head_dim / 16) * 16)
     if k_block_size is None:
         k_block_size = _select_dense_k_block_size(head_dim_padded, m_block_size, n_block_size, per_head_elem_bytes=4)
     kv_stage = _compute_dense_kv_stage(head_dim_padded, m_block_size, n_block_size, k_block_size, per_head_elem_bytes=4)
+    if precision == "mxfp8":
+        if head_dim == 512:
+            if k_block_size == 64:
+                kv_stage = 7
+            elif k_block_size == 256:
+                kv_stage = 3
+            elif qhead_per_kv_head >= 128:
+                kv_stage = 9
+            else:
+                kv_stage = 7
+        else:
+            kv_stage = 4
 
     compute_capability = _get_device_capability()
     if compute_capability < 10:
         raise NotImplementedError(f"Dense attention backward requires SM100+ (got {compute_capability}).")
 
-    compile_key = (
-        "dense_attention",
-        q.dtype,
-        head_dim,
-        qhead_per_kv_head,
-        m_block_size,
-        n_block_size,
-        k_block_size,
-        kv_stage,
-        ratio,
-        is_varlen,
-        q_causal_offsets is not None,
-    )
+    if precision == "mxfp8":
+        assert q_scale is not None and k_scale is not None
+        compile_key = (
+            "dense_attention",
+            "mxfp8",
+            q.dtype,
+            k.dtype,
+            lse.dtype,
+            q_scale.dtype,
+            k_scale.dtype,
+            head_dim,
+            qhead_per_kv_head,
+            m_block_size,
+            n_block_size,
+            k_block_size,
+            head_dim_padded // k_block_size,
+            kv_stage,
+            ratio,
+            is_varlen,
+            q_causal_offsets is not None,
+            sf_vec_size,
+        )
+    else:
+        compile_key = (
+            "dense_attention",
+            q.dtype,
+            head_dim,
+            qhead_per_kv_head,
+            m_block_size,
+            n_block_size,
+            k_block_size,
+            kv_stage,
+            ratio,
+            is_varlen,
+            q_causal_offsets is not None,
+        )
 
     if compile_key not in _dense_attn_score_recompute.compile_cache:
         q_cute = to_cute_tensor(q)
@@ -976,59 +1261,120 @@ def _dense_attn_score_recompute(
         cu_k_cute = to_cute_tensor(cu_seqlens_k, leading_dim=0) if is_varlen else None
         q_offsets_cute = to_cute_tensor(q_causal_offsets, leading_dim=0) if q_causal_offsets is not None else None
 
-        kernel_obj = DenseScoreRecomputeSm100(
-            head_dim=head_dim,
-            qhead_per_kvhead=qhead_per_kv_head,
-            m_block_size=m_block_size,
-            n_block_size=n_block_size,
-            k_block_size=k_block_size,
-            kv_stage=kv_stage,
-            score_type="attention",
-            ratio=ratio,
-            is_varlen=is_varlen,
-        )
+        if precision == "mxfp8":
+            assert q_scale is not None and k_scale is not None
+            q_scale_cute = to_cute_tensor(q_scale)
+            k_scale_cute = to_cute_tensor(k_scale)
+            kernel_obj = BwdDenseAttnScoreSm100Mxfp8(
+                head_dim=head_dim,
+                qhead_per_kvhead=qhead_per_kv_head,
+                m_block_size=m_block_size,
+                n_block_size=n_block_size,
+                k_block_size=k_block_size,
+                kv_stage=kv_stage,
+                ratio=ratio,
+                is_varlen=is_varlen,
+                sf_vec_size=sf_vec_size,
+            )
+        else:
+            q_scale_cute = None
+            k_scale_cute = None
+            kernel_obj = DenseScoreRecomputeSm100(
+                head_dim=head_dim,
+                qhead_per_kvhead=qhead_per_kv_head,
+                m_block_size=m_block_size,
+                n_block_size=n_block_size,
+                k_block_size=k_block_size,
+                kv_stage=kv_stage,
+                score_type="attention",
+                ratio=ratio,
+                is_varlen=is_varlen,
+            )
 
         max_q_arg = cutlass.Int32(seqlen_q)
         max_k_arg = cutlass.Int32(seqlen_k)
 
-        _dense_attn_score_recompute.compile_cache[compile_key] = cute.compile(
-            kernel_obj,
-            q_cute,
-            k_cute,
-            lse_cute,
-            out_cute,
-            denom_cute,
-            cutlass.Float32(softmax_scale),
-            max_q_arg,
-            max_k_arg,
-            cu_q_cute,
-            cu_k_cute,
-            q_offsets_cute,
-            current_stream,
-            options=compile_options(),
-        )
+        if precision == "mxfp8":
+            _dense_attn_score_recompute.compile_cache[compile_key] = cute.compile(
+                kernel_obj,
+                q_cute,
+                k_cute,
+                lse_cute,
+                q_scale_cute,
+                k_scale_cute,
+                out_cute,
+                denom_cute,
+                cutlass.Float32(softmax_scale),
+                max_q_arg,
+                max_k_arg,
+                cu_q_cute,
+                cu_k_cute,
+                q_offsets_cute,
+                current_stream,
+                options=compile_options(),
+            )
+        else:
+            _dense_attn_score_recompute.compile_cache[compile_key] = cute.compile(
+                kernel_obj,
+                q_cute,
+                k_cute,
+                lse_cute,
+                out_cute,
+                denom_cute,
+                cutlass.Float32(softmax_scale),
+                max_q_arg,
+                max_k_arg,
+                cu_q_cute,
+                cu_k_cute,
+                q_offsets_cute,
+                current_stream,
+                options=compile_options(),
+            )
 
     max_q_arg = cutlass.Int32(seqlen_q)
     max_k_arg = cutlass.Int32(seqlen_k)
-    # Dense score kernels skip K blocks that are wholly outside the
-    # ratio-causal region, so skipped masked/padding columns must be prefilled.
+    # Dense score kernels skip K blocks that are wholly outside the ratio-causal
+    # region, so skipped masked/padding columns must be pre-filled. MXFP8
+    # dense-attention uses mOut as an atomic-add accumulation buffer for valid
+    # scores in some paths; those kernels patch invalid/skipped scores to -inf.
     with _torch_stream_context(current_stream):
-        out.fill_(float("-inf"))
+        if precision == "mxfp8":
+            out.zero_()
+        else:
+            out.fill_(float("-inf"))
     with torch.cuda.nvtx.range("dense_attn_score_recompute"):
-        _dense_attn_score_recompute.compile_cache[compile_key](
-            q,
-            k,
-            lse,
-            out,
-            denom_out,
-            cutlass.Float32(softmax_scale),
-            max_q_arg,
-            max_k_arg,
-            cu_seqlens_q if is_varlen else None,
-            cu_seqlens_k if is_varlen else None,
-            q_causal_offsets,
-            current_stream,
-        )
+        if precision == "mxfp8":
+            _dense_attn_score_recompute.compile_cache[compile_key](
+                q,
+                k,
+                lse,
+                q_scale,
+                k_scale,
+                out,
+                denom_out,
+                cutlass.Float32(softmax_scale),
+                max_q_arg,
+                max_k_arg,
+                cu_seqlens_q if is_varlen else None,
+                cu_seqlens_k if is_varlen else None,
+                q_causal_offsets,
+                current_stream,
+            )
+        else:
+            _dense_attn_score_recompute.compile_cache[compile_key](
+                q,
+                k,
+                lse,
+                out,
+                denom_out,
+                cutlass.Float32(softmax_scale),
+                max_q_arg,
+                max_k_arg,
+                cu_seqlens_q if is_varlen else None,
+                cu_seqlens_k if is_varlen else None,
+                q_causal_offsets,
+                current_stream,
+            )
     return out, denom_out
 
 
@@ -1049,9 +1395,15 @@ def dense_indexer_score_recompute(
     ratio: int = 1,
     cu_seqlens_q: Optional[torch.Tensor] = None,
     cu_seqlens_k: Optional[torch.Tensor] = None,
+    q_causal_offsets: Optional[torch.Tensor] = None,
     max_seqlen_q: Optional[int] = None,
     max_seqlen_k: Optional[int] = None,
-    q_causal_offsets: Optional[torch.Tensor] = None,
+    *,
+    precision: str = "bf16",
+    q_scale: Optional[torch.Tensor] = None,
+    k_scale: Optional[torch.Tensor] = None,
+    sf_vec_size: int = 32,
+    k_block_size: Optional[int] = None,
     current_stream: Optional[cuda.CUstream] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
@@ -1060,6 +1412,9 @@ def dense_indexer_score_recompute(
     Tile params auto-selected via _dispatch_dense_indexer_tile_params. sm_scale
     is applied to the fp32 head-reduced score inside the kernel (preserves
     precision vs pre-multiplying onto bf16 weights on the host).
+    The shared unified indexer kernel runs with ``compute_lse=True``;
+    causal-invalid entries in ``out`` remain -inf and ``denom_out`` stores
+    LogSumExp.
 
     Args:
         q: BSHD ``(bs, seqlen_q, n_heads_q, head_dim)`` or THD
@@ -1077,10 +1432,16 @@ def dense_indexer_score_recompute(
         (out, denom_out)
     """
     if qhead_per_kv_head is None:
-        qhead_per_kv_head = q.shape[-2] if q.ndim == 3 else q.shape[2]
+        qhead_per_kv_head = (q.shape[-2] // k.shape[-2]) if q.ndim == 3 else (q.shape[2] // k.shape[2])
     head_dim = q.shape[-1]
 
-    m, n, kbs = _dispatch_dense_indexer_tile_params(head_dim, qhead_per_kv_head)
+    precision = _normalize_dense_precision(precision, q_scale, k_scale)
+    m, n, kbs = _dispatch_dense_indexer_tile_params(
+        head_dim,
+        qhead_per_kv_head,
+        precision=precision,
+        k_block_size=k_block_size,
+    )
     return _dense_indexer_score_recompute(
         q,
         k,
@@ -1095,9 +1456,13 @@ def dense_indexer_score_recompute(
         ratio=ratio,
         cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_k=cu_seqlens_k,
+        q_causal_offsets=q_causal_offsets,
         max_seqlen_q=max_seqlen_q,
         max_seqlen_k=max_seqlen_k,
-        q_causal_offsets=q_causal_offsets,
+        precision=precision,
+        q_scale=q_scale,
+        k_scale=k_scale,
+        sf_vec_size=sf_vec_size,
         current_stream=current_stream,
     )
 
@@ -1113,9 +1478,15 @@ def dense_attn_score_recompute(
     ratio: int = 1,
     cu_seqlens_q: Optional[torch.Tensor] = None,
     cu_seqlens_k: Optional[torch.Tensor] = None,
+    q_causal_offsets: Optional[torch.Tensor] = None,
     max_seqlen_q: Optional[int] = None,
     max_seqlen_k: Optional[int] = None,
-    q_causal_offsets: Optional[torch.Tensor] = None,
+    *,
+    precision: str = "bf16",
+    q_scale: Optional[torch.Tensor] = None,
+    k_scale: Optional[torch.Tensor] = None,
+    sf_vec_size: int = 32,
+    k_block_size: Optional[int] = None,
     current_stream: Optional[cuda.CUstream] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
@@ -1139,10 +1510,19 @@ def dense_attn_score_recompute(
         (out, denom_out)
     """
     if qhead_per_kv_head is None:
-        qhead_per_kv_head = q.shape[-2] if q.ndim == 3 else q.shape[2]
+        qhead_per_kv_head = (q.shape[-2] // k.shape[-2]) if q.ndim == 3 else (q.shape[2] // k.shape[2])
     head_dim = q.shape[-1]
 
-    m, n, kbs = _dispatch_dense_attn_tile_params(head_dim, qhead_per_kv_head)
+    precision = _normalize_dense_precision(precision, q_scale, k_scale)
+    seqlen_k_hint = int(max_seqlen_k) if max_seqlen_k is not None else (k.shape[0] if q.ndim == 3 else k.shape[1])
+    m, n, kbs = _dispatch_dense_attn_tile_params(
+        head_dim,
+        qhead_per_kv_head,
+        precision=precision,
+        seqlen_k_hint=seqlen_k_hint,
+        k_block_size=k_block_size,
+    )
+
     return _dense_attn_score_recompute(
         q,
         k,
@@ -1157,8 +1537,12 @@ def dense_attn_score_recompute(
         ratio=ratio,
         cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_k=cu_seqlens_k,
+        q_causal_offsets=q_causal_offsets,
         max_seqlen_q=max_seqlen_q,
         max_seqlen_k=max_seqlen_k,
-        q_causal_offsets=q_causal_offsets,
+        precision=precision,
+        q_scale=q_scale,
+        k_scale=k_scale,
+        sf_vec_size=sf_vec_size,
         current_stream=current_stream,
     )

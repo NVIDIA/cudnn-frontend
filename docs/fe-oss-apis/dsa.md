@@ -6,8 +6,8 @@
 
 The DeepSeek Sparse Attention (DSA) module integrates a set of CuTe-DSL
 kernels that support the sparse-attention path used by DeepSeek-style models.
-Most kernels target Hopper (SM90) and Blackwell (SM100+) GPUs; Indexer Top-K
-remains SM100+ only. The kernels are
+Most kernels target Hopper (SM90) and Blackwell (SM100+) GPUs; Indexer
+Forward and Indexer Top-K both support SM90 and SM100+. The kernels are
 delivered as Python classes / wrappers that follow the same `APIBase`
 pattern as other cuDNN Frontend operations.
 
@@ -24,7 +24,7 @@ The module packages the following operations:
 2. **Indexer Forward** – CuTe-DSL score kernel (Q @ K^T, ReLU, head reduce,
    ratio causal mask). Non-fused; pair with **Indexer Top-K** for the
    top-K step.
-3. **Indexer Top-K** – SM100 CuTe-DSL radix top-K kernel with per-row
+3. **Indexer Top-K** – SM90+ CuTe-DSL radix top-K kernel with per-row
    ``seq_lens``.
 4. **Sparse Indexer / Attention Score Recompute** – sparse (top-K) recompute
    of indexer and attention scores for training loss.
@@ -145,12 +145,21 @@ The K columns are assumed to be a compressed-KV prefix starting at global
 compressed column 0.
 
 - **Inputs**
-  - `q`: `(B, S_q, H_q, D)` BF16
-  - `k`: `(B, S_k, H_kv, D)` BF16
-  - `w`: `(B, S_q, H_q)` BF16
+  - `q`: `(B, S_q, H_q, D)` BF16, or the architecture-specific FP8 format
+    described below.
+  - `k`: `(B, S_k, H_kv, D)` BF16, or the architecture-specific FP8 format
+    described below.
+  - `w`: `(B, S_q, H_q)` BF16. The SM90 FP8 path also accepts FP32 when
+    weights have already been pre-scaled by `q_scale * sm_scale`.
   - `q_causal_offsets` (optional): CUDA INT32 tensor with one entry per
     batch/THD segment, on the same device as `q`.
 - **Output** — `scores`: `(B, S_q, S_k)` FP32
+- **Precision paths**
+  - SM90 `precision="fp8"`: Q/K use E4M3 and `q_scale`/`k_scale` are FP32
+    descales with one value per token/head. Set `return_lse=True` (or provide
+    `lse_out`) to compute LSE in the same kernel invocation.
+  - SM100 `precision="mxfp8"`: Q/K use E4M3 with block-scaled, packed E8M0
+    scale tensors; `sf_vec_size` is currently fixed at 32.
 - **Constraints** — `head_dim == 128`. The SM90 direct path supports
   `qhead_per_kv_head ∈ {16, 32, 64}` and currently requires `H_kv == 1`;
   SM100 supports `qhead_per_kv_head ∈ {32, 64}`.
@@ -172,7 +181,7 @@ with variable per-row effective length.
   - `seq_lens`: `(batch_size,)` INT32 (per-batch effective column count)
 - **Outputs** — tuple `(indices, values)` (values is `None` when
   `return_val=False`)
-- **Constraints** — SM100+, `top_k ≤ 2048`
+- **Constraints** — SM90+, `top_k ≤ 2048`
 
 ```python
 result = DSA.indexer_top_k_wrapper(
@@ -209,8 +218,15 @@ L1-normalised head-summed softmax over top-K entries:
 
 Full-KV (no top-K) analogues of §4 and §5. Each returns `{'out', 'denom'}`.
 They apply the same ratio-causal mask as Indexer Forward; masked positions are
-written as zero and excluded from `denom`. Pass the same `q_causal_offsets` to
+written as `-inf` and excluded from `denom`. Pass the same `q_causal_offsets` to
 all dense score tensors that feed the same loss path.
+
+On SM100, Indexer Forward and Dense Indexer Score Recompute use the same
+unified kernel implementation: forward runs it with `compute_lse=False`, while
+dense indexer score recompute runs it with `compute_lse=True`. The shared
+implementation lives in `score_recompute`; `indexer_forward` only imports it.
+Dense Attention Score Recompute has a separate MXFP8 kernel because its score
+and normalization semantics differ from the indexer path.
 
 ### 7. Indexer Backward
 
@@ -282,8 +298,7 @@ result = DSA.dense_indexer_backward_wrapper(
 ## Limitations
 
 - **Architecture support** — Sparse Attention Backward, Score Recompute,
-  Indexer Forward, and Indexer Backward support SM90 and SM100; Indexer Top-K
-  remains SM100+ only.
+  Indexer Forward, Indexer Top-K, and Indexer Backward support SM90 and SM100.
 - **No fused forward** — the production forward is FlashMLA (C++); this
   module ships only the CuTe-DSL kernels.
 - **Indexer Forward only supports `head_dim = 128`**. SM90 supports
@@ -291,3 +306,7 @@ result = DSA.dense_indexer_backward_wrapper(
   `qhead_per_kv_head ∈ {32, 64}`.
 - **Top-K only up to 2048**; `top_k > 2048` is not supported by the
   underlying radix top-K kernel.
+- **No compressed-logits / compressed top-K path** — this precision update
+  covers score generation and recompute. It does not add the separate
+  compressed-logits/top-K flow; the existing standalone Indexer Top-K API is
+  unchanged.

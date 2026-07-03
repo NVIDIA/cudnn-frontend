@@ -5,7 +5,13 @@ import torch
 
 from test_utils import torch_fork_set_rng
 
-from fe_api.dsa.dsa_utils import dsa_init, with_dsa_score_recompute_params
+from fe_api.dsa.dsa_utils import (
+    dsa_init,
+    expand_mxfp8_scale,
+    make_random_mxfp8_scale,
+    quantize_mxfp8,
+    with_dsa_score_recompute_params,
+)
 from fe_api.dsa.dsa_reference import (
     _batched_ratio_causal_mask,
     _ratio_causal_mask,
@@ -83,6 +89,51 @@ def _allocate(cfg, score_type: str):
         return q, k, weights
     lse = torch.randn(b, s_q, h_kv * qhpkv, dtype=torch.float32, device=device)
     return q, k, lse
+
+
+def _allocate_mxfp8_qk(cfg, scale_utils):
+    b = cfg["b"]
+    s_q = cfg["s_q"]
+    s_k = cfg["s_kv"]
+    d = cfg["head_dim"]
+    qhpkv = cfg["qhead_per_kv_head"]
+    h_kv = cfg["h_kv"]
+    h_q = h_kv * qhpkv
+    sf_groups = (d + 31) // 32
+    device = "cuda"
+
+    q_ref = torch.randn(b, s_q, h_q, d, dtype=torch.bfloat16, device=device)
+    k_ref = torch.randn(b, s_k, h_kv, d, dtype=torch.bfloat16, device=device)
+    q_scale_logical = make_random_mxfp8_scale(
+        (b, s_q, h_q, sf_groups),
+        device=device,
+        seed=201,
+        exponent_min=-2,
+        exponent_max=3,
+    )
+    k_scale_logical = make_random_mxfp8_scale(
+        (b, s_k, h_kv, sf_groups),
+        device=device,
+        seed=203,
+        exponent_min=-2,
+        exponent_max=3,
+    )
+    q = quantize_mxfp8(q_ref, q_scale_logical)
+    k = quantize_mxfp8(k_ref, k_scale_logical)
+    q_deq = q.float() * expand_mxfp8_scale(q_scale_logical, d)
+    k_deq = k.float() * expand_mxfp8_scale(k_scale_logical, d)
+    q_scale = scale_utils.pack_q_scale_bshd(q_scale_logical, qhead_per_kv_head=qhpkv)
+    k_scale = scale_utils.pack_k_scale_bshd(k_scale_logical)
+    return q, k, q_deq, k_deq, q_scale, k_scale
+
+
+def _dense_attn_lse(q, k, softmax_scale):
+    h_q = q.shape[2]
+    h_kv = k.shape[2]
+    qhpkv = h_q // h_kv
+    k_exp = k.repeat_interleave(qhpkv, dim=2)
+    qk = torch.einsum("bqhd,bkhd->bqhk", q.float(), k_exp.float()) * softmax_scale
+    return torch.logsumexp(qk, dim=-1)
 
 
 @pytest.mark.L0
@@ -219,3 +270,102 @@ def test_DSA_dense_score_recompute_wrapper(
                 softmax_scale=softmax_scale,
                 q_causal_offsets=q_causal_offsets,
             )
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("score_type", ["indexer", "attention"])
+@torch_fork_set_rng(seed=13)
+def test_DSA_dense_score_recompute_wrapper_mxfp8_matches_dequant_reference(
+    score_type,
+    request,
+):
+    try:
+        from cudnn import DSA
+        from cuda.bindings import driver as cuda
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    scale_utils = pytest.importorskip("cudnn.deepseek_sparse_attention.utils.sm100.mxfp8_scale_utils")
+    cfg = dsa_init(
+        request=request,
+        head_dim=128,
+        qhead_per_kv_head=64,
+        score_type=score_type,
+        min_compute_capability=100,
+        b_default=1,
+        s_q_default=128,
+        s_kv_default=128,
+    )
+    ratio = 4
+    q, k, q_deq, k_deq, q_scale, k_scale = _allocate_mxfp8_qk(cfg, scale_utils)
+    q_causal_offsets = torch.full((cfg["b"],), 16, dtype=torch.int32, device=q.device)
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+    if score_type == "indexer":
+        aux = (
+            torch.randn(
+                cfg["b"],
+                cfg["s_q"],
+                cfg["h_kv"] * cfg["qhead_per_kv_head"],
+                dtype=torch.bfloat16,
+                device="cuda",
+            ).abs()
+            * 0.1
+        )
+        result = DSA.dense_indexer_score_recompute_wrapper(
+            q,
+            k,
+            aux,
+            qhead_per_kv_head=cfg["qhead_per_kv_head"],
+            ratio=ratio,
+            q_causal_offsets=q_causal_offsets,
+            precision="mxfp8",
+            q_scale=q_scale,
+            k_scale=k_scale,
+            stream=stream,
+        )
+        check_ref_dense_score_recompute(
+            "indexer",
+            q_deq,
+            k_deq,
+            aux,
+            result["out"],
+            result["denom"],
+            ratio=ratio,
+            q_causal_offsets=q_causal_offsets,
+            atol_scores=5e-3,
+            rtol_scores=5e-3,
+            atol_denom=5e-3,
+            rtol_denom=5e-3,
+        )
+    else:
+        softmax_scale = 1.0 / math.sqrt(cfg["head_dim"])
+        aux = _dense_attn_lse(q_deq, k_deq, softmax_scale)
+        result = DSA.dense_attn_score_recompute_wrapper(
+            q,
+            k,
+            aux,
+            softmax_scale,
+            qhead_per_kv_head=cfg["qhead_per_kv_head"],
+            ratio=ratio,
+            q_causal_offsets=q_causal_offsets,
+            precision="mxfp8",
+            q_scale=q_scale,
+            k_scale=k_scale,
+            stream=stream,
+        )
+        check_ref_dense_score_recompute(
+            "attention",
+            q_deq,
+            k_deq,
+            aux,
+            result["out"],
+            result["denom"],
+            softmax_scale=softmax_scale,
+            ratio=ratio,
+            q_causal_offsets=q_causal_offsets,
+            atol_scores=5e-3,
+            rtol_scores=5e-3,
+            atol_denom=5e-3,
+            rtol_denom=5e-3,
+        )
