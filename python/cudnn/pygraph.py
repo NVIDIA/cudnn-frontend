@@ -93,6 +93,7 @@ class pygraph:
         self._backends: List["BaseEngine"] = []
         self._router = router  # None => engines.router.default_router at route time
         self._plans: List[Any] = []  # list[PlanConfig], populated by create_execution_plans()
+        self._planning_done: bool = False  # create_execution_plans() ran (one-shot)
         self._plan_index: int = 0
         self._cudnn_heuristics: Optional[List] = None  # heur modes for a cuDNN plan
         self._cpp_plans_created: bool = False  # C++ create_execution_plans ran
@@ -113,7 +114,8 @@ class pygraph:
 
         Validated at registration (not at failure time): the engine must declare
         a stable engine_id in the reserved python region, ids must be unique per
-        graph, and registration after planning is rejected (re-plan explicitly)."""
+        graph, and registration after planning is rejected (planning is
+        one-shot — build a new graph)."""
         from .engines.engine_ids import is_python_engine
 
         eid = getattr(engine, "engine_id", None)
@@ -121,13 +123,17 @@ class pygraph:
             raise ValueError(f"engine {engine!r} must declare a stable integer engine_id >= PYTHON_ENGINE_ID_BASE (got {eid!r})")
         if any(e.engine_id == eid for e in self._backends):
             raise ValueError(f"engine_id {eid} is already registered on this graph")
-        if self._plans:
-            raise RuntimeError("cannot register a backend after create_execution_plans(); re-plan explicitly")
+        if self._planning_done:
+            raise RuntimeError("cannot register a backend after create_execution_plans(); planning is one-shot — build a new graph")
         self._backends.append(engine)
         return self
 
     def set_router(self, router: Any) -> "pygraph":
-        """Override the plan-list / ranking policy for this graph."""
+        """Override the plan-list / ranking policy for this graph. Must be set
+        before create_execution_plans() (a later router cannot affect the
+        already-planned list)."""
+        if self._planning_done:
+            raise RuntimeError("cannot set a router after create_execution_plans(); planning is one-shot — build a new graph")
         self._router = router
         return self
 
@@ -182,10 +188,19 @@ class pygraph:
             name = f"tensor_{len(self._tensors)}"
 
         if uid is not None:
-            # User-owned uid: reserve it so _alloc_uid never hands it out, and
-            # reject duplicates eagerly (C++ would only fail at build time).
-            if uid in self._tensor_by_uid:
-                raise ValueError(f"uid {uid} is already used by tensor {self._tensor_by_uid[uid].name!r}")
+            # User-owned uid, same rule as set_uid (_reuid_tensor): classic
+            # tensors have no uid until assigned, so a user uid may land on an
+            # eagerly auto-assigned one — the user wins, the auto holder is
+            # renumbered; colliding with another USER uid is an error.
+            holder = self._tensor_by_uid.get(uid)
+            if holder is not None:
+                if holder.uid_assigned:
+                    raise ValueError(f"uid {uid} is already user-assigned to tensor {holder.name!r}")
+                fresh = self._alloc_uid()
+                self._tensor_by_uid[fresh] = holder
+                if holder.uid in self._data_bindings:
+                    self._data_bindings[fresh] = self._data_bindings.pop(holder.uid)
+                holder.uid = fresh
             self._reserved_uids.add(uid)
 
         dim = list(dim)  # classic API accepts torch.Size / tuples
@@ -247,8 +262,8 @@ class pygraph:
         return t
 
     def _check_mutable(self, what: str) -> None:
-        if self._lowered_graph is not None or self._plans:
-            raise RuntimeError(f"cannot {what} after lowering/planning — the graph is frozen (re-plan explicitly)")
+        if self._lowered_graph is not None or self._planning_done:
+            raise RuntimeError(f"cannot {what} after lowering/planning — the graph is frozen (planning is one-shot; build a new graph)")
 
     def _rename_tensor(self, t: Tensor, name: str) -> None:
         """Atomic rename keeping the name index coherent (duplicates rejected)."""
@@ -655,8 +670,9 @@ class pygraph:
         # re-planning — a second call there appends plans by accident, and no
         # user re-plans). Plan once; to plan differently, build a new graph
         # (IR construction is microseconds). Autotune re-selects WITHIN this
-        # plan set via select_plan().
-        if self._plans:
+        # plan set via select_plan(). Explicit state flag, not an
+        # is-the-list-nonempty proxy.
+        if self._planning_done:
             raise RuntimeError(
                 "create_execution_plans() was already called on this graph; planning is one-shot — build a new graph to re-plan, or use select_plan() to switch plans"
             )
@@ -668,6 +684,8 @@ class pygraph:
         from .engines.engine_ids import CUDNN_HEURISTIC_ENGINE_ID, is_python_engine
 
         registered = {e.engine_id for e in self._backends}
+        if not plans:
+            raise ValueError("router returned an empty plan list — there is no legal empty planning state (return the cuDNN delegating entry at minimum)")
         n_cudnn = 0
         for cfg in plans:
             if is_python_engine(cfg.engine_id):
@@ -680,6 +698,7 @@ class pygraph:
         if n_cudnn > 1:
             raise ValueError("router produced more than one cuDNN delegating entry")
         self._plans = plans
+        self._planning_done = True
         self._plan_index = 0
         self._cudnn_heuristics = heuristics  # applied when a cuDNN plan is built
         # Classic sequencing: if the graph was already lowered (no python
@@ -688,34 +707,44 @@ class pygraph:
         if self.selected_engine is None and self._lowered_graph is not None:
             self._lower_cudnn_plan()
 
+    def _has_cudnn_plan(self) -> bool:
+        from .engines.engine_ids import CUDNN_HEURISTIC_ENGINE_ID
+
+        return any(cfg.engine_id == CUDNN_HEURISTIC_ENGINE_ID for cfg in self._plans)
+
     def get_execution_plan_count(self) -> int:
-        """TWO-LEVEL plan model, with STABLE indices (they never shift when the
-        backend is lowered):
+        """Classic passthrough, ALWAYS: the cuDNN backend's plan count for this
+        graph (its plan list is discovered per graph from the lowered C++ graph
+        and addressed via the classic ``build_plan_at_index`` /
+        ``execute_plan_at_index`` / ``get_workspace_size_plan_at_index`` APIs).
+        The semantics never depend on whether python engines are registered.
 
-        * top level — the Router's entries verbatim: each python PlanConfig is
-          one index; the cuDNN delegating entry is ONE index (the classic
-          default path). ``select_plan()`` operates on this level only.
-        * backend level — the backend's own plans, counted/queried dynamically
-          from the lowered graph and addressed through the classic
-          ``build_plan_at_index`` / ``execute_plan_at_index`` /
-          ``get_workspace_size_plan_at_index`` APIs (delegated).
-
-        With no python engines registered this returns the backend's own count
-        (the exact classic semantic — classic callers see classic numbers);
-        with python engines it returns the top-level count.
+        The ROUTED plan list (the Router's entries: python plans + at most one
+        cuDNN delegating entry) is a separate index space: ``graph.plans``,
+        selected with ``select_plan()``. Its indices are stable — the cuDNN
+        entry is one index forever and never expands into this count.
         """
-        if not self._backends and self._lowered_graph is not None and self._cpp_plans_created:
+        if self._planning_done:
+            if not self._has_cudnn_plan():
+                raise RuntimeError(
+                    "this graph's Router produced python plans only (no cuDNN entry), so there are no backend plans — the routed plan list is graph.plans / select_plan()"
+                )
+            self._lower_cudnn_plan()  # backend plans exist on demand (one-shot)
             return self._lowered_graph.get_execution_plan_count()
-        return len(self._plans)
+        if self._lowered_graph is not None:
+            # classic pre-planning sequencing: delegate, C++ reports its state
+            return self._lowered_graph.get_execution_plan_count()
+        return 0  # classic: an unplanned graph has zero plans (not an error)
 
     def select_plan(self, index: int) -> "pygraph":
-        """Pick a top-level plan entry (stable index; see
-        get_execution_plan_count). Backend sub-plans are selected via the
-        classic at-index APIs instead."""
-        if not self._plans:
+        """Pick a ROUTED plan entry: the index is into ``graph.plans`` (the
+        Router's entries — stable, never shifted by backend lowering). Backend
+        sub-plans are a separate space, selected via the classic at-index APIs
+        (see get_execution_plan_count)."""
+        if not self._planning_done:
             raise RuntimeError("call create_execution_plans() before select_plan()")
         if not 0 <= index < len(self._plans):
-            raise IndexError(f"plan index {index} out of range for {len(self._plans)} top-level plan(s)")
+            raise IndexError(f"plan index {index} out of range for {len(self._plans)} routed plan(s) (graph.plans)")
         self._plan_index = index
         self._is_built = False
         return self
@@ -800,7 +829,7 @@ class pygraph:
             self.validate()
 
         self.build_operation_graph()
-        if not self._plans:  # never silently re-plan: preserves select_plan()
+        if not self._planning_done:  # never silently re-plan: preserves select_plan()
             self.create_execution_plans(heuristics)
         self.check_support()
         self.build_plans()
@@ -845,7 +874,7 @@ class pygraph:
             # handle HERE, the JIT compile must see it — plan first, then let
             # the python branch below compile with the caller's context instead
             # of running the generic build (which only knows the graph handle).
-            if not self._plans:
+            if not self._planning_done:
                 self.create_execution_plans()
             if self.selected_engine is None:
                 self.build()

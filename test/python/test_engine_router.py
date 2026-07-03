@@ -228,7 +228,7 @@ def test_compiled_plan_lifecycle_knobs_and_reuse():
     ws = torch.empty(4096, dtype=torch.uint8)
     out = torch.empty(2, 2)
     g.select_plan(1)  # the tile=256 plan
-    assert g.get_execution_plan_count() >= 2
+    assert len(g.plans) == 3  # two knob proposals + the cuDNN delegating entry
     g.build_plans()
     assert compiled_log == [{"tile": 256}]  # compiled once, correct knobs
     assert g.get_workspace_size() == 4096  # plan-specific workspace
@@ -311,14 +311,68 @@ def test_mixed_router_ordering_dispatch():
     g.create_execution_plans()
     # slot 0 = python A, slot 1 = cuDNN, slot 2 = python B
     assert g.selected_engine.name == "e61"
+    g.select_plan(1)  # the cuDNN delegating entry is selectable in place
+    assert g.selected_engine is None  # None == the cuDNN path
     g.select_plan(2)
     assert g.selected_engine.name == "e62"
     g.execute({C: torch.empty(2, 2)})
     assert ran[-1] == "B"
-    # the middle top-level entry is the cuDNN delegating one, and top-level
-    # indices are STABLE: python-B stays at index 2 regardless of lowering
+    # the middle routed entry is the cuDNN delegating one, and routed indices
+    # are STABLE: python-B stays at index 2 regardless of lowering. (Real
+    # execution THROUGH the cuDNN slot of a mixed router is the GPU test
+    # test_mixed_router_cudnn_slot_executes in test_native_cudnn_lowering.py.)
     assert g.plans[1].engine_id == CUDNN_HEURISTIC_ENGINE_ID
     assert g.selected_engine.name == "e62"
+
+
+def test_empty_router_output_rejected():
+    """A Router returning [] is an error — there is no legal empty planning
+    state (it would defeat the one-shot flag and every needs-planning check)."""
+
+    class Empty(Router):
+        def plan(self, graph, backends):
+            return []
+
+    g = pygraph(router=Empty())
+    g.matmul(torch.randn(2, 2), torch.randn(2, 2))
+    with pytest.raises(ValueError, match="empty plan list"):
+        g.create_execution_plans()
+    # the failed call did NOT consume the one-shot: fixing the router by
+    # rebuilding the graph is the documented path, but the graph must not be
+    # left half-planned either
+    assert not g._planning_done
+
+
+def test_set_router_frozen_after_planning():
+    """set_router() after planning raises (it could not affect the already
+    planned list; accepting it silently would lie)."""
+    g = pygraph()
+    g.register_backend(_mk_engine(70))
+    g.matmul(torch.randn(2, 2), torch.randn(2, 2))
+    g.create_execution_plans()
+    with pytest.raises(RuntimeError, match="one-shot"):
+        g.set_router(Router())
+
+
+def test_backend_count_is_a_separate_space():
+    """get_execution_plan_count() is the classic backend-count passthrough,
+    never the routed-list length; the routed list is graph.plans/select_plan.
+    A python-only routed graph has no backend plans and says so."""
+
+    class PythonOnly(Router):
+        def plan(self, graph, backends):
+            from cudnn.engines import PlanConfig
+
+            return [PlanConfig(backends[0].engine_id)]
+
+    g = pygraph(router=PythonOnly())
+    g.register_backend(_mk_engine(71))
+    C = g.matmul(torch.randn(2, 2), torch.randn(2, 2))
+    g.create_execution_plans()
+    assert len(g.plans) == 1
+    with pytest.raises(RuntimeError, match="graph.plans"):
+        g.get_execution_plan_count()  # no cuDNN entry -> no backend plans
+    g.execute({C: torch.empty(2, 2)})  # the routed python plan still runs
 
 
 def test_constructor_backends_validated_and_proposals_checked():

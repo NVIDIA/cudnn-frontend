@@ -172,7 +172,10 @@ class Testpygraph:
 
     def test_uid_ownership(self):
         """The IR owns the uid namespace: user-specified uids are reserved (auto
-        allocation skips them) and duplicates are rejected eagerly."""
+        allocation skips them). The SAME collision rule applies at creation as
+        at set_uid: a user uid landing on an auto-assigned one steals it (the
+        auto holder is renumbered — classic tensors have no uid until assigned,
+        so classic code cannot observe auto uids); user-user collisions raise."""
         g = pygraph()
         a = g.tensor(dim=[2, 2], uid=2, name="user_uid")  # reserve 2
         assert a.uid == 2 and a.uid_assigned
@@ -180,8 +183,12 @@ class Testpygraph:
         c = g.tensor(dim=[2, 2], name="auto2")  # auto: must skip reserved 2 -> 3
         assert b.uid == 1
         assert c.uid == 3
-        with pytest.raises(ValueError, match="already used"):
-            g.tensor(dim=[2, 2], uid=3, name="dup")
+        d = g.tensor(dim=[2, 2], uid=3, name="steals_from_auto")
+        assert d.uid == 3 and d.uid_assigned
+        assert c.uid not in (2, 3) and not c.uid_assigned  # renumbered
+        assert g._tensor_by_uid[c.uid] is c
+        with pytest.raises(ValueError, match="user-assigned"):
+            g.tensor(dim=[2, 2], uid=2, name="dup_user")  # user-user collides
 
     def test_matmul(self):
         g = pygraph()

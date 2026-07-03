@@ -347,3 +347,98 @@ def test_native_rmsnorm_lowers_to_cudnn():
     Yref = scale.float() * (xf * ivref) + bias.float()
     torch.testing.assert_close(Yb.float(), Yref, atol=3e-2, rtol=3e-2)
     torch.testing.assert_close(ivb, ivref, atol=5e-3, rtol=5e-3)
+
+
+def test_mixed_router_cudnn_slot_executes():
+    """Review round 4: the cuDNN entry of a MIXED router is selectable and
+    actually executes through the backend (lowering triggered), with routed
+    indices stable across that lowering; the pinned python plan still runs
+    afterwards with its own knobs."""
+    from cudnn.engines import BaseEngine, PlanConfig, Router
+    from cudnn.engines.engine_ids import CUDNN_HEURISTIC_ENGINE_ID, PYTHON_ENGINE_ID_BASE
+
+    ran = []
+
+    class PyMatmul(BaseEngine):
+        name = "py_matmul"
+        engine_id = PYTHON_ENGINE_ID_BASE + 90
+
+        def execute(self, graph, tensor_data, ctx=None):
+            node = graph.nodes[0]
+            a = tensor_data[node.inputs["A"].uid]
+            b = tensor_data[node.inputs["B"].uid]
+            c = tensor_data[node.outputs["C"].uid]
+            c.copy_((a.float() @ b.float()).to(c.dtype))
+            ran.append("python")
+
+    class CudnnFirst(Router):
+        def plan(self, graph, backends):
+            return [PlanConfig(CUDNN_HEURISTIC_ENGINE_ID), PlanConfig(backends[0].engine_id)]
+
+    h = _handle()
+    a = torch.randn(1, M, K, device="cuda", dtype=torch.float16)
+    b = torch.randn(1, K, N, device="cuda", dtype=torch.float16)
+    c = torch.empty(1, M, N, device="cuda", dtype=torch.float16)
+    ref = (a.float() @ b.float()).half()
+
+    g = pygraph(
+        handle=h, io_data_type=cudnn.data_type.HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT, router=CudnnFirst()
+    )
+    g.register_backend(PyMatmul())
+    A = g.tensor(dim=[1, M, K], stride=[M * K, K, 1])
+    B = g.tensor(dim=[1, K, N], stride=[K * N, N, 1])
+    C = g.matmul(A, B)
+    C.set_output(True).set_data_type(cudnn.data_type.HALF)
+
+    g.create_execution_plans()
+    assert [p.engine_id for p in g.plans] == [CUDNN_HEURISTIC_ENGINE_ID, PYTHON_ENGINE_ID_BASE + 90]
+
+    # slot 0 = cuDNN: this build/execute lowers and runs the real backend
+    assert g.selected_engine is None
+    g.build()
+    assert g._lowered_graph is not None  # lowering really happened
+    ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
+    g.execute({A: a, B: b, C: c}, ws, handle=h)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(c.float(), ref.float(), atol=2e-2, rtol=2e-2)
+    assert ran == []  # the python engine did NOT run
+
+    # backend count is the classic passthrough space; routed indices unmoved
+    assert g.get_execution_plan_count() >= 1
+    assert [p.engine_id for p in g.plans] == [CUDNN_HEURISTIC_ENGINE_ID, PYTHON_ENGINE_ID_BASE + 90]
+
+    # slot 1 = the python plan, still selectable AFTER backend lowering
+    c.zero_()
+    g.select_plan(1)
+    assert g.selected_engine.name == "py_matmul"
+    g.execute({A: a, B: b, C: c}, ws, handle=h)
+    torch.cuda.synchronize()
+    assert ran == ["python"]
+    torch.testing.assert_close(c.float(), ref.float(), atol=2e-2, rtol=2e-2)
+
+
+def test_planning_one_shot_cudnn_only():
+    """Review round 4: one-shot planning also covers the pure-cuDNN graph (no
+    python engines registered) — a second create_execution_plans() raises."""
+    h = _handle()
+    g = pygraph(handle=h, io_data_type=cudnn.data_type.HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    A = g.tensor(dim=[1, M, K], stride=[M * K, K, 1])
+    B = g.tensor(dim=[1, K, N], stride=[K * N, N, 1])
+    C = g.matmul(A, B)
+    C.set_output(True).set_data_type(cudnn.data_type.HALF)
+
+    g.validate()
+    g.build_operation_graph()
+    g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    with pytest.raises(RuntimeError, match="one-shot"):
+        g.create_execution_plans([cudnn.heur_mode.A])
+    # the first plan set is intact and usable
+    g.check_support()
+    g.build_plans()
+    a = torch.randn(1, M, K, device="cuda", dtype=torch.float16)
+    b = torch.randn(1, K, N, device="cuda", dtype=torch.float16)
+    c = torch.empty(1, M, N, device="cuda", dtype=torch.float16)
+    ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
+    g.execute({A: a, B: b, C: c}, ws, handle=h)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(c.float(), (a.float() @ b.float()), atol=2e-2, rtol=2e-2)

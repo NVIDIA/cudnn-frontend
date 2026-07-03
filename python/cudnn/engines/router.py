@@ -9,31 +9,38 @@ Implements the dispatch stage of the Python API unification proposal:
 
 Routing happens at ``create_execution_plans()`` time, NOT at graph construction,
 so graph building stays backend-agnostic (lazy lowering). The Router returns a
-flat list of ``PlanConfig(engine_id, knobs)`` — Python engines (ids in the
-reserved high region) whose ``check_support()`` accepts the graph, plus the
-cuDNN side. Dispatch on each plan's id (``is_python_engine``) decides whether to
-run via the Python registry or lower to the cuDNN C++ backend.
+flat list of ``PlanConfig(engine_id, knobs)``: Python engines (ids in the
+reserved high region) whose ``check_support()`` accepts the graph, plus AT MOST
+ONE cuDNN delegating entry (``CUDNN_HEURISTIC_ENGINE_ID``). Dispatch on each
+plan's id (``is_python_engine``) decides whether to run via the Python registry
+or lower to the cuDNN C++ backend.
 
-Contract for the future heuristics MR (ranking policy is intentionally NOT
-decided here — only the flexibility to decide it later):
+WHAT THIS MR SUPPORTS (the enforced contract — ``create_execution_plans()``
+validates the final Router output, whatever the Router implementation):
 
-1. Policy is pluggable at three levels: subclass ``Router`` and override
-   ``plan()``; pass per-graph via ``pygraph(router=...)`` / ``set_router()``;
-   or swap the process-wide ``default_router``.
-2. ``plan()`` may return ANY ordering/mix — python-first, cuDNN-first,
-   conditional on the graph — the lifecycle dispatches purely on each entry's
-   id (``is_python_engine``). The current default is a placeholder concat.
-3. "Query both": the Router receives the graph and may trigger lowering to ask
-   the loaded backend's own heuristics (get_engine_count /
-   get_engine_and_knobs_at_index on the lowered graph). Backend engine sets
-   vary by backend version and MUST be discovered per graph at plan time —
-   never statically enumerated in frontend code.
-4. Specific backend entries: ``PlanConfig(engine_id>=0, knobs)`` can carry a
-   concrete cuDNN engine config in the same list. Honoring it at build time
-   (cpp ``create_execution_plan(engine_id, knobs)`` instead of the heuristics
-   path) is the designated extension point in ``pygraph._lower_cudnn_plan``.
-   ``select_plan(i)`` + ``get_execution_plan_count()`` already expose the
-   ranked list for autotune-style selection.
+* python entries must name engines registered on the graph;
+* the only legal non-python entry is ONE cuDNN delegating sentinel — the
+  backend's own plans stay behind it, addressed via the classic at-index APIs
+  (a separate, backend-owned index space);
+* an empty plan list is rejected (there is no legal empty planning state).
+
+Concrete cuDNN engine configs as first-class routed entries
+(``PlanConfig(cudnn_engine_id, knobs)`` interleaved with python plans) are NOT
+representable in this MR: they need a typed plan representation and a build
+path via cpp ``create_execution_plan(engine_id, knobs)`` — that is the
+heuristics/autotune follow-up MR's job, not one extra lowering branch. What IS
+already decided and stable here: routed indices never shift (the sentinel never
+expands in place), and the backend engine set is discovered per graph at plan
+time (get_engine_count / get_engine_and_knobs_at_index on the lowered graph) —
+never statically enumerated in frontend code, because it varies by backend
+version.
+
+Policy remains pluggable at three levels: subclass ``Router`` and override
+``plan()``; pass per-graph via ``pygraph(router=...)`` / ``set_router()``
+(before planning); or swap the process-wide ``default_router``. ``plan()`` may
+return any ordering/mix of the representable entries — python-first,
+cuDNN-first, interleaved, conditional on the graph. The current default is a
+placeholder concat.
 """
 
 from typing import TYPE_CHECKING, List
