@@ -1071,12 +1071,22 @@ class pygraph:
             tensor_map[t.uid] = cpp
             return cpp
 
-        def push_ragged(out_t: Tensor, cpp_t: Any) -> None:
-            # output ragged offset AND its multiplier (missing the multiplier
-            # leaves the backend computing wrong addresses: cudaErrorMisalignedAddress)
-            cpp_t.set_ragged_offset(lower_tensor(out_t.ragged_offset))
-            if out_t.ragged_offset_multiplier not in (None, 1):
-                cpp_t.set_ragged_offset_multiplier(out_t.ragged_offset_multiplier)
+        def push_output_attrs(out_t: Tensor, cpp_t: Any) -> None:
+            # Every attribute a user may set on an OP OUTPUT via the classic
+            # setter chain must be pushed here (inputs get theirs through
+            # _make_tensor kwargs in lower_tensor). Missing one corrupts
+            # silently: no multiplier -> wrong GPU addresses (cudaErrorMisalignedAddress);
+            # no reordering -> the backend rejects or misreads the layout.
+            if out_t.ragged_offset is not None:
+                cpp_t.set_ragged_offset(lower_tensor(out_t.ragged_offset))
+                if out_t.ragged_offset_multiplier not in (None, 1):
+                    cpp_t.set_ragged_offset_multiplier(out_t.ragged_offset_multiplier)
+            if out_t.reordering_type is not None:
+                cpp_t.set_reordering_type(out_t.reordering_type)
+            if not out_t.is_virtual:
+                cpp_t.set_output(True)
+            if out_t.data_type:
+                cpp_t.set_data_type(out_t.data_type)
 
         for node in self._nodes:
             for t in node.inputs.values():
@@ -1138,12 +1148,7 @@ class pygraph:
                         cpp_t.set_dim(out_t.dim)
                     if out_t.stride:
                         cpp_t.set_stride(out_t.stride)
-                    if out_t.ragged_offset is not None:  # e.g. THD-layout O
-                        push_ragged(out_t, cpp_t)
-                    if not out_t.is_virtual:
-                        cpp_t.set_output(True)
-                    if out_t.data_type:
-                        cpp_t.set_data_type(out_t.data_type)
+                    push_output_attrs(out_t, cpp_t)
                 continue
             elif node.node_type in _STRUCTURED_BY_TYPE:
                 # Generic structured op (norms / reduction / block-scale / MoE /
@@ -1178,12 +1183,7 @@ class pygraph:
                         cpp_t.set_dim(out_t.dim)
                         if out_t.stride:
                             cpp_t.set_stride(out_t.stride)
-                    if out_t.ragged_offset is not None:
-                        push_ragged(out_t, cpp_t)
-                    if not out_t.is_virtual:
-                        cpp_t.set_output(True)
-                    if out_t.data_type:
-                        cpp_t.set_data_type(out_t.data_type)
+                    push_output_attrs(out_t, cpp_t)
                 continue
             else:
                 continue
@@ -1191,12 +1191,7 @@ class pygraph:
             # Map output
             for out_t in node.outputs.values():
                 tensor_map[out_t.uid] = cpp_out
-                if out_t.ragged_offset is not None:
-                    push_ragged(out_t, cpp_out)
-                if not out_t.is_virtual:
-                    cpp_out.set_output(True)
-                if out_t.data_type:
-                    cpp_out.set_data_type(out_t.data_type)
+                push_output_attrs(out_t, cpp_out)
 
         # ---- uid ownership -------------------------------------------------
         # The Python IR owns the whole uid namespace: every IR tensor gets a uid
