@@ -20,7 +20,7 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int32, const_expr
+from cutlass import Float32, Int32, Int64, const_expr
 from cutlass.cute.nvgpu import cpasync
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
 from cutlass.pipeline import (
@@ -73,6 +73,7 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
         is_varlen: bool = False,
         sf_vec_size: int = 32,
         compute_lse: bool = False,
+        is_compressed_logits: bool = False,
     ):
         # This specialization is deliberately narrow.  The current production
         # MXFP8 indexer path is D128/sf_vec_size=32 with 128x128 tiles; keeping
@@ -87,8 +88,16 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
         if qhead_per_kvhead != 64:
             raise ValueError("SM100 unified indexer MXFP8 currently requires qhead_per_kvhead=64")
         k_block_size = 64 if k_block_size is None else k_block_size
-        if k_block_size != 64:
-            raise ValueError("SM100 unified indexer MXFP8 currently requires k_block_size=64")
+        # k_block_size is an internal K-split knob (num_k_chunks = head_dim_padded //
+        # k_block_size; the per-chunk scale phase + base-class SMEM derive from it), so
+        # any multiple of sf_vec_size that divides head_dim_padded is valid (default 64).
+        _hd_padded = ((head_dim + 15) // 16) * 16
+        if k_block_size <= 0 or k_block_size % sf_vec_size != 0 or _hd_padded % k_block_size != 0:
+            raise ValueError(
+                "SM100 unified indexer MXFP8 requires k_block_size to be a "
+                f"positive multiple of sf_vec_size ({sf_vec_size}) that divides "
+                f"head_dim_padded ({_hd_padded}); got {k_block_size}"
+            )
 
         super().__init__(
             head_dim=head_dim,
@@ -100,6 +109,7 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
             ratio=ratio,
             is_varlen=is_varlen,
             compute_lse=compute_lse,
+            is_compressed_logits=is_compressed_logits,
         )
         # Base class initializes the BF16 dense-indexer tiler and the unified
         # epilogue state.  The fields below override the parts that differ for
@@ -170,6 +180,7 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
         mCuSeqlensK: cute.Tensor | None,
         mQCausalOffsets: cute.Tensor | None,
         stream: cuda.CUstream,
+        mCandBatchOffsets: cute.Tensor | None = None,
     ):
         # Runtime tensor metadata is needed to build CuTe layouts and compile
         # the matching kernel.  The element dtypes become compile-time constants
@@ -358,8 +369,9 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
         PerHead_transpose = [0, 1] if const_expr(is_varlen) else [1, 2, 0]
         mPerHead = cute.make_tensor(mPerHead.iterator, cute.select(mPerHead.layout, mode=PerHead_transpose))
 
-        Out_transpose = [0, 1] if const_expr(is_varlen) else [1, 2, 0]
-        mOut = cute.make_tensor(mOut.iterator, cute.select(mOut.layout, mode=Out_transpose))
+        if const_expr(not self.is_compressed_logits):
+            Out_transpose = [0, 1] if const_expr(is_varlen) else [1, 2, 0]
+            mOut = cute.make_tensor(mOut.iterator, cute.select(mOut.layout, mode=Out_transpose))
 
         Denom_transpose = [0] if const_expr(is_varlen) else [1, 0]
         mDenom = cute.make_tensor(mDenom.iterator, cute.select(mDenom.layout, mode=Denom_transpose))
@@ -397,6 +409,7 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
             mCuSeqlensQ,
             mCuSeqlensK,
             mQCausalOffsets,
+            mCandBatchOffsets,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -502,6 +515,8 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
         reduce_phase,
         softmax_scale,
         per_head_offset=None,
+        batch_idx=None,
+        cand_batch_offsets=None,
     ):
         """Epilogue fast path for one packed q token.
 
@@ -531,6 +546,16 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
 
         q_token_idx = m_block * q_tokens_per_tile + Int32(q_token_stage)
         col_limit = (q_causal_offset + q_token_idx + Int32(1)) // ratio
+        if cutlass.const_expr(self.is_compressed_logits):
+            q_global_start = Int64(q_causal_offset)
+            if cutlass.const_expr(cand_batch_offsets is not None):
+                cand_batch_base = Int64(cand_batch_offsets[batch_idx])
+            else:
+                cand_batch_base = Int64(batch_idx) * self._row_offset_i64(
+                    Int64(seqlen_q),
+                    q_global_start,
+                )
+            cand_row_offset = self._row_offset_i64(Int64(q_token_idx), q_global_start)
         local_max = -Float32.inf
         local_sum_exp = Float32(0.0)
         first_block = Int32(1)
@@ -624,7 +649,10 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
                 local_sum_hi = add_packed_f32x2(local_sum_2, local_sum_3)
                 local_sum = add_packed_f32x2(local_sum_lo, local_sum_hi)
                 score = (local_sum[0] + local_sum[1]) * Float32(softmax_scale)
-                mOut[q_token_idx, pos] = score
+                if cutlass.const_expr(self.is_compressed_logits):
+                    mOut[cand_batch_base + cand_row_offset + Int64(pos)] = score
+                else:
+                    mOut[q_token_idx, pos] = score
 
                 if cutlass.const_expr(self.compute_lse):
                     # Online LSE is numerically stable and avoids rereading the
@@ -712,6 +740,7 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
         mCuSeqlensQ: cute.Tensor | None,
         mCuSeqlensK: cute.Tensor | None,
         mQCausalOffsets: cute.Tensor | None,
+        mCandBatchOffsets: cute.Tensor | None = None,
     ):
         is_varlen = mCuSeqlensQ is not None
         if const_expr(is_varlen):
@@ -1238,7 +1267,10 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
                         q_causal_offset,
                     )
                     per_head_offset = (tile_count % 2) * self.m_block_size
-                    mOut_cur = seqlen.offset_batch_Q(mOut, batch_idx, dim=2)
+                    if cutlass.const_expr(self.is_compressed_logits):
+                        mOut_cur = mOut
+                    else:
+                        mOut_cur = seqlen.offset_batch_Q(mOut, batch_idx, dim=2)
                     mDenom_cur = seqlen.offset_batch_Q(mDenom, batch_idx, dim=1)
                     # First epilogue warpgroup owns q-token stage 0.
                     s_full_phase_bits, reduce_phase = self._epilogue_indexer_dense_single_q(
@@ -1262,6 +1294,8 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
                         reduce_phase,
                         softmax_scale,
                         per_head_offset=per_head_offset,
+                        batch_idx=batch_idx,
+                        cand_batch_offsets=mCandBatchOffsets,
                     )
                     tile_count = tile_count + 1
                 clc_pipeline.consumer_wait(clc_consumer_state)
@@ -1301,7 +1335,10 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
                         q_causal_offset,
                     )
                     per_head_offset = (tile_count % 2) * self.m_block_size
-                    mOut_cur = seqlen.offset_batch_Q(mOut, batch_idx, dim=2)
+                    if cutlass.const_expr(self.is_compressed_logits):
+                        mOut_cur = mOut
+                    else:
+                        mOut_cur = seqlen.offset_batch_Q(mOut, batch_idx, dim=2)
                     mDenom_cur = seqlen.offset_batch_Q(mDenom, batch_idx, dim=1)
                     # Second epilogue warpgroup owns q-token stage 1.
                     s_full_phase_bits, reduce_phase = self._epilogue_indexer_dense_single_q(
@@ -1325,6 +1362,8 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
                         reduce_phase,
                         softmax_scale,
                         per_head_offset=per_head_offset,
+                        batch_idx=batch_idx,
+                        cand_batch_offsets=mCandBatchOffsets,
                     )
                     tile_count = tile_count + 1
                 clc_pipeline.consumer_wait(clc_consumer_state)

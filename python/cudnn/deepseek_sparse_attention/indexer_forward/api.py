@@ -1,9 +1,10 @@
 """APIBase wrapper and dispatcher for indexer forward CuTe DSL score kernels.
 
-Produces dense indexer scores Q @ K^T with per-head ReLU, weighted head
-reduction, and a ratio causal mask. Does NOT fuse top-K — pair with
-:class:`cudnn.deepseek_sparse_attention.indexer_top_k.IndexerTopK` for a
-two-stage unfused path (score → top-K).
+``indexer_forward_wrapper`` produces dense indexer scores Q @ K^T with
+per-head ReLU, weighted head reduction, and a ratio causal mask.
+``indexer_forward_top_k_wrapper`` is the SM100 combined path that generates
+compact scores, selects Top-K, and optionally computes Top-K softmax without
+materializing the dense score tensor.
 """
 
 from __future__ import annotations
@@ -284,3 +285,102 @@ def indexer_forward_wrapper(
         current_stream=stream,
     )
     return TupleDict(scores=scores)
+
+
+def indexer_forward_top_k_wrapper(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    w: torch.Tensor,
+    top_k: int,
+    ratio: int = 4,
+    qhead_per_kv_head: Optional[int] = None,
+    m_block_size: int = 128,
+    n_block_size: int = 128,
+    q_stage: int = 2,
+    kv_stage: int = 4,
+    sm_scale: float = 1.0,
+    stream: Optional[cuda.CUstream] = None,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k: Optional[torch.Tensor] = None,
+    max_seqlen_q: Optional[int] = None,
+    max_seqlen_k: Optional[int] = None,
+    q_causal_offsets: Optional[torch.Tensor] = None,
+    precision: str = "bf16",
+    q_scale: Optional[torch.Tensor] = None,
+    k_scale: Optional[torch.Tensor] = None,
+    sf_vec_size: int = 32,
+    return_lse: bool = False,
+    lse_out: Optional[torch.Tensor] = None,
+    return_softmax: Optional[bool] = None,
+    softmax_out: Optional[torch.Tensor] = None,
+    microbatch_rows: int = -1,
+    topk_indices_global: bool = True,
+    cand_buffer: Optional[torch.Tensor] = None,
+    out_indices: Optional[torch.Tensor] = None,
+    out_logits: Optional[torch.Tensor] = None,
+    cand_batch_offsets: Optional[torch.Tensor] = None,
+) -> TupleDict:
+    """Combined SM100 indexer score generation and Top-K selection API.
+
+    Returns ``{'indices', 'logits', 'softmax'}`` by default, plus ``'lse'``
+    when requested. Set ``return_softmax=False`` to return only indices and
+    logits. Unlike :func:`indexer_forward_wrapper`, this path never
+    materializes the dense score tensor.
+
+    BSHD outputs have shape ``(B, S_q, top_k)`` and THD outputs have shape
+    ``(total_q, top_k)``. Caller-owned candidate and output buffers may be
+    supplied to avoid per-call allocation. Indices are global KV ids by
+    default; set ``topk_indices_global=False`` for local ids matching
+    ``indexer_top_k_wrapper``, and use the same convention downstream.
+    """
+    if device_major() < 10:
+        raise NotImplementedError("compressed indexer forward is SM100-only; standalone IndexerTopK remains SM90+")
+
+    result = indexer_fwd_sm100(
+        q,
+        k,
+        w,
+        ratio=ratio,
+        qhead_per_kv_head=qhead_per_kv_head,
+        m_block_size=m_block_size,
+        n_block_size=n_block_size,
+        num_threads=384,
+        q_stage=q_stage,
+        kv_stage=kv_stage,
+        sm_scale=sm_scale,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        q_causal_offsets=q_causal_offsets,
+        precision=precision,
+        q_scale=q_scale,
+        k_scale=k_scale,
+        sf_vec_size=sf_vec_size,
+        is_compressed_logits=True,
+        topk=top_k,
+        microbatch_rows=microbatch_rows,
+        topk_indices_global=topk_indices_global,
+        cand_buffer=cand_buffer,
+        out_indices=out_indices,
+        out_logits=out_logits,
+        cand_batch_offsets=cand_batch_offsets,
+        return_lse=return_lse,
+        lse_out=lse_out,
+        return_softmax=return_softmax,
+        softmax_out=softmax_out,
+        current_stream=stream,
+    )
+
+    want_softmax = (return_softmax is not False) or softmax_out is not None
+    want_lse = return_lse or lse_out is not None
+    result_iter = iter(result)
+    values = {
+        "indices": next(result_iter),
+        "logits": next(result_iter),
+    }
+    if want_softmax:
+        values["softmax"] = next(result_iter)
+    if want_lse:
+        values["lse"] = next(result_iter)
+    return TupleDict(**values)

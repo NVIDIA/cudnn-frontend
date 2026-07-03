@@ -1,3 +1,5 @@
+import inspect
+
 import pytest
 import torch
 
@@ -13,9 +15,43 @@ from fe_api.dsa.dsa_utils import (
     with_dsa_indexer_forward_params,
 )
 from fe_api.dsa.dsa_reference import (
+    check_ref_compressed_topk,
     check_ref_indexer_forward,
     ref_indexer_forward,
 )
+
+
+@pytest.mark.L0
+def test_DSA_indexer_forward_api_is_split_from_top_k():
+    try:
+        from cudnn import DSA
+        import cudnn.deepseek_sparse_attention as dsa
+        import cudnn.deepseek_sparse_attention.indexer_forward as indexer_forward
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    dense_parameters = inspect.signature(DSA.indexer_forward_wrapper).parameters
+    fused_parameters = inspect.signature(DSA.indexer_forward_top_k_wrapper).parameters
+    compressed_only = {
+        "top_k",
+        "return_softmax",
+        "softmax_out",
+        "microbatch_rows",
+        "topk_indices_global",
+        "cand_buffer",
+        "out_indices",
+        "out_logits",
+        "cand_batch_offsets",
+    }
+
+    assert compressed_only.isdisjoint(dense_parameters)
+    assert "is_compressed_logits" not in dense_parameters
+    assert "is_compressed_logits" not in fused_parameters
+    assert tuple(fused_parameters)[:4] == ("q", "k", "w", "top_k")
+    assert compressed_only <= fused_parameters.keys()
+    assert "indexer_forward_top_k_wrapper" in dsa.__all__
+    assert "indexer_forward_top_k_wrapper" in indexer_forward.__all__
+    assert DSA.indexer_forward_top_k_wrapper is indexer_forward.indexer_forward_top_k_wrapper
 
 
 def _allocate_inputs(cfg):
@@ -206,6 +242,30 @@ def test_DSA_indexer_forward_wrapper_mxfp8_matches_dequant_reference(request):
         q_causal_offsets=q_causal_offsets,
         atol=5e-3,
         rtol=5e-3,
+    )
+
+    compressed = DSA.indexer_forward_top_k_wrapper(
+        q,
+        k,
+        w,
+        top_k=min(32, s_k),
+        ratio=cfg["ratio"],
+        qhead_per_kv_head=qhpkv,
+        q_causal_offsets=q_causal_offsets,
+        precision="mxfp8",
+        q_scale=q_scale,
+        k_scale=k_scale,
+        topk_indices_global=False,
+        stream=stream,
+    )
+    torch.cuda.synchronize()
+    check_ref_compressed_topk(
+        result["scores"],
+        compressed["indices"],
+        compressed["logits"],
+        min(32, s_k),
+        atol=1e-4,
+        rtol=1e-4,
     )
 
 

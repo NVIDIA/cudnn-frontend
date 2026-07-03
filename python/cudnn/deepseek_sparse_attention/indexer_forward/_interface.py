@@ -64,6 +64,15 @@ _compile_cache: dict = {}
 _denom_placeholder_cache: dict = {}
 
 
+def _record_external_stream_usage(stream: torch.cuda.Stream, *values) -> None:
+    """Keep caller-owned tensors alive across asynchronous TVM-FFI launches."""
+    for value in values:
+        if isinstance(value, (tuple, list)):
+            _record_external_stream_usage(stream, *value)
+        elif isinstance(value, torch.Tensor) and value.is_cuda:
+            value.record_stream(stream)
+
+
 def _get_fwd_denom_placeholder(
     shape: tuple[int, ...],
     device: torch.device,
@@ -107,13 +116,29 @@ def indexer_fwd(
     q_scale: Optional[torch.Tensor] = None,
     k_scale: Optional[torch.Tensor] = None,
     sf_vec_size: int = 32,
+    is_compressed_logits: bool = False,
+    topk: int = 0,
+    microbatch_rows: int = -1,
+    topk_indices_global: bool = True,
+    cand_buffer: Optional[torch.Tensor] = None,
+    out_indices: Optional[torch.Tensor] = None,
+    out_logits: Optional[torch.Tensor] = None,
+    cand_batch_offsets: Optional[torch.Tensor] = None,
+    return_lse: bool = False,
+    lse_out: Optional[torch.Tensor] = None,
+    return_softmax: Optional[bool] = None,
+    softmax_out: Optional[torch.Tensor] = None,
     current_stream=None,
-) -> torch.Tensor:
+):
     """
     Indexer QK forward pass using CuTe DSL kernel.
 
     Computes S_sum = sm_scale * sum_h [(Q @ K^T).relu() * W] with a
-    ratio causal mask against compressed-KV positions.
+    ratio causal mask against compressed-KV positions. With
+    ``is_compressed_logits=True``, writes only causal-valid scores to compact
+    scratch storage and returns ``(topk_indices, topk_logits, topk_softmax[, lse])``
+    by default without materializing the dense score tensor. Pass
+    ``return_softmax=False`` to omit the fused top-k softmax.
     sm_scale is applied to the fp32 head-reduced score inside the kernel
     (higher precision than pre-multiplying onto bf16 W on the host).
 
@@ -151,6 +176,105 @@ def indexer_fwd(
         raise ValueError(f"SM100 indexer_fwd only supports num_threads=384, got {num_threads}")
     if q_stage != 2:
         raise ValueError(f"SM100 indexer_fwd only supports q_stage=2, got {q_stage}")
+
+    if is_compressed_logits:
+        if topk <= 0:
+            raise ValueError("is_compressed_logits=True requires topk > 0")
+        if out is not None:
+            raise ValueError("out is a dense-score buffer and cannot be used with is_compressed_logits=True")
+        if kv_stage != 4:
+            raise ValueError(f"SM100 compressed indexer forward only supports kv_stage=4, got {kv_stage}")
+        from ._compressed_top_k_sm100 import (
+            _indexer_fwd_compress_topk_thd,
+            indexer_fwd_compress_topk,
+        )
+
+        # All eager allocations, copies, both kernel launches, and the optional
+        # local-to-global conversion must use the caller-selected stream.
+        with _torch_stream_context(current_stream):
+            if cu_seqlens_q is not None or cu_seqlens_k is not None:
+                if cu_seqlens_q is None or cu_seqlens_k is None:
+                    raise ValueError("THD compressed-logits top-k requires both cu_seqlens_q and cu_seqlens_k")
+                result = _indexer_fwd_compress_topk_thd(
+                    q,
+                    k,
+                    w,
+                    topk,
+                    ratio=ratio,
+                    qhead_per_kv_head=qhead_per_kv_head,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k=cu_seqlens_k,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_k=max_seqlen_k,
+                    m_block_size=m_block_size,
+                    n_block_size=n_block_size,
+                    sm_scale=sm_scale,
+                    microbatch_rows=microbatch_rows,
+                    precision=precision,
+                    q_scale=q_scale,
+                    k_scale=k_scale,
+                    sf_vec_size=sf_vec_size,
+                    topk_indices_global=topk_indices_global,
+                    cand_buffer=cand_buffer,
+                    out_indices=out_indices,
+                    out_logits=out_logits,
+                    cand_batch_offsets=cand_batch_offsets,
+                    q_causal_offsets=q_causal_offsets,
+                    return_softmax=return_softmax,
+                    softmax_out=softmax_out,
+                    return_lse=return_lse,
+                    lse_out=lse_out,
+                )
+            else:
+                if cand_batch_offsets is not None:
+                    raise ValueError("cand_batch_offsets is only used by THD compressed top-k; " "BSHD computes its candidate offsets internally")
+                result = indexer_fwd_compress_topk(
+                    q,
+                    k,
+                    w,
+                    topk,
+                    ratio=ratio,
+                    qhead_per_kv_head=qhead_per_kv_head,
+                    m_block_size=m_block_size,
+                    n_block_size=n_block_size,
+                    sm_scale=sm_scale,
+                    microbatch_rows=microbatch_rows,
+                    precision=precision,
+                    q_scale=q_scale,
+                    k_scale=k_scale,
+                    sf_vec_size=sf_vec_size,
+                    topk_indices_global=topk_indices_global,
+                    cand_buffer=cand_buffer,
+                    out_indices=out_indices,
+                    out_logits=out_logits,
+                    return_lse=return_lse,
+                    lse_out=lse_out,
+                    return_softmax=return_softmax,
+                    softmax_out=softmax_out,
+                    q_causal_offsets=q_causal_offsets,
+                )
+
+            launch_stream = torch.cuda.current_stream(q.device)
+            _record_external_stream_usage(
+                launch_stream,
+                q,
+                k,
+                w,
+                q_scale,
+                k_scale,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                q_causal_offsets,
+                cand_buffer,
+                cand_batch_offsets,
+                out_indices,
+                out_logits,
+                softmax_out,
+                lse_out,
+                result,
+            )
+            return result
+
     if precision == "bf16":
         for tensor, name in ((q, "q"), (k, "k"), (w, "w")):
             assert tensor.dtype == torch.bfloat16, f"{name} must be bfloat16, got {tensor.dtype}"
@@ -306,6 +430,7 @@ def indexer_fwd(
                 is_varlen=is_varlen,
                 sf_vec_size=sf_vec_size,
                 compute_lse=False,
+                is_compressed_logits=False,
             )
 
             scale_arg = cutlass.Float32(sm_scale)
@@ -394,6 +519,7 @@ def indexer_fwd(
             ratio=ratio,
             is_varlen=is_varlen,
             compute_lse=False,
+            is_compressed_logits=False,
         )
 
         scale_arg = cutlass.Float32(sm_scale)

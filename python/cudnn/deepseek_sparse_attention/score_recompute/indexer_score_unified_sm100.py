@@ -15,7 +15,7 @@ import math
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int32
+from cutlass import Float32, Int32, Int64
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
 
 from .dense_score_recompute_sm100 import (
@@ -32,15 +32,36 @@ class IndexerScoreUnifiedSm100(DenseScoreRecomputeSm100):
         self,
         *args,
         compute_lse: bool = False,
+        is_compressed_logits: bool = False,
+        cand_2d: bool = False,
         **kwargs,
     ):
         # Reuse the dense-score base mainloop, but force its epilogue contract
         # to dense indexer score.
         kwargs["score_type"] = "indexer"
         super().__init__(*args, **kwargs)
-        # Compile-time key: forward score calls set this false and skip all
-        # denominator work; backward score calls keep it true and write LSE.
+        # Dense FE entry points remain the default. The compressed forward path
+        # opts in and writes only ratio-causal candidates into a compact buffer.
+        self.is_compressed_logits = is_compressed_logits
+        # BSHD BF16 may expose that compact buffer as (batch, per_batch_floats)
+        # so the hot epilogue carries an Int32 column offset instead of a flat
+        # Int64 address. Varlen and non-uniform batches retain the flat path.
+        self.cand_2d = cand_2d
+        # LSE is independent of output layout: dense recompute requests it, and
+        # compressed BF16 can request the per-row LSE.
         self.compute_lse = compute_lse
+
+    @cute.jit
+    def _g_prefix_i64(self, n):
+        """Prefix sum of ratio-causal candidate counts through row ``n``."""
+        ratio = Int64(self.ratio)
+        quotient = n // ratio
+        remainder = n - quotient * ratio
+        return ratio * quotient * (quotient - Int64(1)) // Int64(2) + quotient * (remainder + Int64(1))
+
+    @cute.jit
+    def _row_offset_i64(self, row, q_global_start):
+        return self._g_prefix_i64(q_global_start + row) - self._g_prefix_i64(q_global_start)
 
     @cute.jit
     def _epilogue_indexer_dense(
@@ -64,6 +85,8 @@ class IndexerScoreUnifiedSm100(DenseScoreRecomputeSm100):
         reduce_phase,
         softmax_scale,
         per_head_offset=None,
+        batch_idx=None,
+        cand_batch_offsets=None,
     ):
         """Indexer epilogue shared by score-only and score+LSE modes."""
         tidx_wg = tidx % self.WARPGROUP_SIZE
@@ -90,11 +113,23 @@ class IndexerScoreUnifiedSm100(DenseScoreRecomputeSm100):
         q_token_idxs = [q_token_base + Int32(qi) for qi in range(q_tokens_per_tile)]
         col_limits = [(q_causal_offset + q_token_idxs[qi] + Int32(1)) // ratio for qi in range(q_tokens_per_tile)]
 
+        if cutlass.const_expr(self.is_compressed_logits and self.cand_2d):
+            q_global_start = Int64(q_causal_offset)
+            cand_row_cols = [Int32(self._row_offset_i64(Int64(q_token_idxs[qi]), q_global_start)) for qi in range(q_tokens_per_tile)]
+        elif cutlass.const_expr(self.is_compressed_logits):
+            q_global_start = Int64(q_causal_offset)
+            if cutlass.const_expr(cand_batch_offsets is not None):
+                cand_batch_base = Int64(cand_batch_offsets[batch_idx])
+            else:
+                cand_per_batch = self._row_offset_i64(Int64(seqlen_q), q_global_start)
+                cand_batch_base = Int64(batch_idx) * cand_per_batch
+            cand_row_offsets = [self._row_offset_i64(Int64(q_token_idxs[qi]), q_global_start) for qi in range(q_tokens_per_tile)]
+
         local_max = [-Float32.inf for _ in range(q_tokens_per_tile)]
         local_sum_exp = [Float32(0.0) for _ in range(q_tokens_per_tile)]
         first_block = Int32(1)
 
-        n_blk = num_n_blocks_compute - 1
+        n_blk = num_n_blocks_compute - Int32(1)
         while n_blk >= Int32(0):
             tmem_load_atom = cute.make_copy_atom(
                 tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(self.tmem_repetition)),
@@ -190,11 +225,16 @@ class IndexerScoreUnifiedSm100(DenseScoreRecomputeSm100):
                     local_sum_hi = add_packed_f32x2(local_sum_2, local_sum_3)
                     local_sum = add_packed_f32x2(local_sum_lo, local_sum_hi)
                     score = (local_sum[0] + local_sum[1]) * Float32(softmax_scale)
-                    mOut[q_token_idx, pos] = score
+                    if cutlass.const_expr(self.is_compressed_logits and self.cand_2d):
+                        mOut[batch_idx, cand_row_cols[qi] + pos] = score
+                    elif cutlass.const_expr(self.is_compressed_logits):
+                        mOut[cand_batch_base + cand_row_offsets[qi] + Int64(pos)] = score
+                    else:
+                        mOut[q_token_idx, pos] = score
 
                     if cutlass.const_expr(self.compute_lse):
-                        # Online log-sum-exp over the dense score row.  This
-                        # runs only for the backward score path.
+                        # Online log-sum-exp over the full score row. This runs
+                        # for dense backward and compressed forward with LSE.
                         new_max = score if score > local_max[qi] else local_max[qi]
                         local_rescale = cute.math.exp2((local_max[qi] - new_max) * log2_e)
                         local_sum_exp[qi] = local_sum_exp[qi] * local_rescale + cute.math.exp2((score - new_max) * log2_e)

@@ -868,10 +868,13 @@ def _dense_indexer_score_recompute(
             raise ValueError("precision='mxfp8' dense indexer requires m_block_size=128")
         if n_block_size != 128:
             raise ValueError("precision='mxfp8' dense indexer requires n_block_size=128")
-        if k_block_size is not None and k_block_size != 64:
-            raise ValueError("precision='mxfp8' dense indexer requires k_block_size=64")
         m_block_size = 128
-        k_block_size = 64
+        # k_block_size is locked to 64 (the D128 two-chunk plan): kv_stage is
+        # hardcoded to 24 below, which keeps K-SMEM within the SM100 budget only
+        # at k_block=64 (k_block>64 overflows SMEM; k_block<64 under-pipelines).
+        k_block_size = 64 if k_block_size is None else k_block_size
+        if k_block_size != 64:
+            raise ValueError("precision='mxfp8' dense indexer requires k_block_size=64; " f"got {k_block_size}")
     elif m_block_size is None:
         m_block_size = qhead_per_kv_head
 
@@ -908,6 +911,8 @@ def _dense_indexer_score_recompute(
         k_block_size = _select_dense_k_block_size(head_dim_padded, m_block_size, n_block_size, per_head_elem_bytes=2)
     kv_stage = _compute_dense_kv_stage(head_dim_padded, m_block_size, n_block_size, k_block_size, per_head_elem_bytes=2)
     if precision == "mxfp8":
+        # K-SMEM = n_block * k_block_size(=64) * kv_stage (fp8); 24 fits the
+        # SM100 SMEM budget. k_block is locked to 64 above, so this is constant.
         kv_stage = 24
 
     compute_capability = _get_device_capability()
@@ -975,6 +980,7 @@ def _dense_indexer_score_recompute(
                 is_varlen=is_varlen,
                 sf_vec_size=sf_vec_size,
                 compute_lse=True,
+                is_compressed_logits=False,
             )
         else:
             q_scale_cute = None
@@ -989,6 +995,7 @@ def _dense_indexer_score_recompute(
                 ratio=ratio,
                 is_varlen=is_varlen,
                 compute_lse=True,
+                is_compressed_logits=False,
             )
         scale_arg = cutlass.Float32(sm_scale)
         max_q_arg = cutlass.Int32(seqlen_q)
