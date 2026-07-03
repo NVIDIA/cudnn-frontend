@@ -1071,6 +1071,13 @@ class pygraph:
             tensor_map[t.uid] = cpp
             return cpp
 
+        def push_ragged(out_t: Tensor, cpp_t: Any) -> None:
+            # output ragged offset AND its multiplier (missing the multiplier
+            # leaves the backend computing wrong addresses: cudaErrorMisalignedAddress)
+            cpp_t.set_ragged_offset(lower_tensor(out_t.ragged_offset))
+            if out_t.ragged_offset_multiplier not in (None, 1):
+                cpp_t.set_ragged_offset_multiplier(out_t.ragged_offset_multiplier)
+
         for node in self._nodes:
             for t in node.inputs.values():
                 if t:
@@ -1132,7 +1139,7 @@ class pygraph:
                     if out_t.stride:
                         cpp_t.set_stride(out_t.stride)
                     if out_t.ragged_offset is not None:  # e.g. THD-layout O
-                        cpp_t.set_ragged_offset(lower_tensor(out_t.ragged_offset))
+                        push_ragged(out_t, cpp_t)
                     if not out_t.is_virtual:
                         cpp_t.set_output(True)
                     if out_t.data_type:
@@ -1172,7 +1179,7 @@ class pygraph:
                         if out_t.stride:
                             cpp_t.set_stride(out_t.stride)
                     if out_t.ragged_offset is not None:
-                        cpp_t.set_ragged_offset(lower_tensor(out_t.ragged_offset))
+                        push_ragged(out_t, cpp_t)
                     if not out_t.is_virtual:
                         cpp_t.set_output(True)
                     if out_t.data_type:
@@ -1185,7 +1192,7 @@ class pygraph:
             for out_t in node.outputs.values():
                 tensor_map[out_t.uid] = cpp_out
                 if out_t.ragged_offset is not None:
-                    cpp_out.set_ragged_offset(lower_tensor(out_t.ragged_offset))
+                    push_ragged(out_t, cpp_out)
                 if not out_t.is_virtual:
                     cpp_out.set_output(True)
                 if out_t.data_type:
