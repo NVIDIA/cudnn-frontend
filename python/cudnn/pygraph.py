@@ -11,7 +11,7 @@ Execution flow (unification proposal):
 
 Example with a native backend (pass torch tensors directly):
     >>> graph = pygraph()
-    >>> graph.register_backend(MatmulCuTileEngine())
+    >>> graph.register_backend(MyDslEngine())  # any BaseEngine
     >>> C = graph.matmul(a_tensor, b_tensor)  # auto-creates descriptors
     >>> graph.execute({C: c_tensor})  # routes to a supporting backend, else cuDNN
 """
@@ -34,6 +34,11 @@ class GraphContext:
     io_data_type: Any = None
     intermediate_data_type: Any = None
     compute_data_type: Any = None
+
+    def __setattr__(self, name, value):
+        if getattr(self, "_frozen", False) and name != "_frozen":
+            raise RuntimeError("the graph is frozen after lowering/planning — build a new graph to change its configuration")
+        object.__setattr__(self, name, value)
 
 
 class pygraph:
@@ -94,6 +99,7 @@ class pygraph:
         self._router = router  # None => engines.router.default_router at route time
         self._plans: List[Any] = []  # list[PlanConfig], populated by create_execution_plans()
         self._planning_done: bool = False  # create_execution_plans() ran (one-shot)
+        self._frozen: bool = False  # whole-surface freeze (set by _freeze())
         self._plan_index: int = 0
         self._cudnn_heuristics: Optional[List] = None  # heur modes for a cuDNN plan
         self._cpp_plans_created: bool = False  # C++ create_execution_plans ran
@@ -212,6 +218,8 @@ class pygraph:
             is_virtual=is_virtual,
             uid=uid if uid is not None else self._alloc_uid(),
             uid_assigned=uid is not None,
+            dim_assigned=True,  # graph inputs: the user specified the layout
+            stride_assigned=stride is not None,
             **kwargs,
         )
         self._register_tensor(t)
@@ -262,8 +270,36 @@ class pygraph:
         return t
 
     def _check_mutable(self, what: str) -> None:
-        if self._lowered_graph is not None or self._planning_done:
+        if self._frozen:
             raise RuntimeError(f"cannot {what} after lowering/planning — the graph is frozen (planning is one-shot; build a new graph)")
+        # a mutation while merely validated (python-engine graphs stay mutable
+        # until planning) must re-validate later — never run on stale inference
+        self._is_validated = False
+
+    def _freeze(self) -> None:
+        """Freeze the ENTIRE public graph surface (not just the fluent API).
+
+        Called at lowering and at planning, whichever happens first. After
+        this, every mutation path raises: fluent setters and op builders (via
+        _check_mutable), attribute writes on Tensor/Node/GraphContext (their
+        __setattr__ guards), dict writes on node.inputs/outputs/params
+        (MappingProxy), and in-place list mutation of dim/stride (tuples).
+        The inspection surface stays fully readable for engines."""
+        if self._frozen:
+            return
+        from types import MappingProxyType
+
+        for node in self._nodes:
+            node.inputs = MappingProxyType(dict(node.inputs))
+            node.outputs = MappingProxyType(dict(node.outputs))
+            node.params = MappingProxyType(dict(node.params))
+            node._frozen = True
+        for t in self._tensor_by_uid.values():
+            t.dim = tuple(t.dim) if t.dim else t.dim
+            t.stride = tuple(t.stride) if t.stride else t.stride
+            t._frozen = True
+        self._context._frozen = True
+        self._frozen = True
 
     def _rename_tensor(self, t: Tensor, name: str) -> None:
         """Atomic rename keeping the name index coherent (duplicates rejected)."""
@@ -285,7 +321,8 @@ class pygraph:
         internal until lowering). Two USER-assigned uids colliding is an error.
         """
         if uid == t.uid:
-            t.uid_assigned = True
+            if not self._frozen:  # same-value set_uid is a no-op (classic allows it anytime)
+                t.uid_assigned = True
             return
         self._check_mutable("re-uid a tensor")
         holder = self._tensor_by_uid.get(uid)
@@ -526,13 +563,14 @@ class pygraph:
 
     @property
     def nodes(self) -> List[Node]:
-        """All nodes in the graph."""
-        return self._nodes
+        """All nodes in the graph (a copy — the graph's own list is not a
+        public mutation path)."""
+        return list(self._nodes)
 
     @property
     def tensors(self) -> Dict[str, Tensor]:
-        """All tensors by name."""
-        return self._tensors
+        """All tensors by name (a copy — see nodes)."""
+        return dict(self._tensors)
 
     @property
     def context(self) -> GraphContext:
@@ -699,6 +737,7 @@ class pygraph:
             raise ValueError("router produced more than one cuDNN delegating entry")
         self._plans = plans
         self._planning_done = True
+        self._freeze()  # plans reference the graph as-is: no mutation from here
         self._plan_index = 0
         self._cudnn_heuristics = heuristics  # applied when a cuDNN plan is built
         # Classic sequencing: if the graph was already lowered (no python
@@ -1025,6 +1064,8 @@ class pygraph:
         import cudnn
         from .datatypes import _library_type  # torch dtype -> cudnn enum (classic parity)
 
+        self._freeze()  # the lowered graph mirrors the IR from here on
+
         # The C++ graph rejects None (wants the enum). io_data_type may be unset
         # (block-scale tensors carry their own dtypes), but intermediate/compute
         # default to FLOAT — matching cudnn.graph() — so cuDNN can infer virtual
@@ -1077,6 +1118,14 @@ class pygraph:
             # _make_tensor kwargs in lower_tensor). Missing one corrupts
             # silently: no multiplier -> wrong GPU addresses (cudaErrorMisalignedAddress);
             # no reordering -> the backend rejects or misreads the layout.
+            # dim/stride: USER-assigned only — inferred IR strides are
+            # provisional row-major; the backend keeps its classic per-op
+            # layout inference (channels-last conv etc.) when the user did
+            # not pin one.
+            if out_t.dim_assigned and out_t.dim:
+                cpp_t.set_dim(out_t.dim)
+            if out_t.stride_assigned and out_t.stride:
+                cpp_t.set_stride(out_t.stride)
             if out_t.ragged_offset is not None:
                 cpp_t.set_ragged_offset(lower_tensor(out_t.ragged_offset))
                 if out_t.ragged_offset_multiplier not in (None, 1):

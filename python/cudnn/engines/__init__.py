@@ -6,7 +6,9 @@ construction stays backend-agnostic.
 
 Backends:
 - ReferenceMatmulEngine: pure-PyTorch correctness oracle (CPU/GPU, no JIT deps)
-- MatmulCuTileEngine: NVIDIA cuTile matmul (Blackwell SM100+); optional deps
+
+Real DSL engines (cuTile / CuTe-DSL GEMM fusion) plug in as separate PRs — an
+engine is one file implementing BaseEngine; nothing here changes.
 """
 
 from .base import BaseEngine, CompiledPlan, ExecutionContext, PlanConfig
@@ -26,12 +28,3 @@ __all__ = [
     "CUDNN_HEURISTIC_ENGINE_ID",
     "is_python_engine",
 ]
-
-# cuTile backend has optional native deps (cuda-tile / cuda-python); expose it
-# only when importable so a plain install still gets the reference backend.
-try:
-    from .matmul_cutile_engine import MatmulCuTileEngine  # noqa: F401
-
-    __all__.append("MatmulCuTileEngine")
-except Exception:  # noqa: BLE001
-    MatmulCuTileEngine = None  # type: ignore

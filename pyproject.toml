@@ -76,7 +76,3 @@ cutedsl = [
     "apache-tvm-ffi",
     "torch-c-dlpack-ext",
 ]
-cutile = [
-    "cuda-tile",
-    "cuda-python",
-]

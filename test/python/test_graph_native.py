@@ -289,7 +289,9 @@ class Testpygraph:
                 assert len(node.inputs) == len(argnames), op
                 assert out.dim == [] or out.dim == [4, 8]  # inferred at validate
                 g.validate()
-                assert node.outputs["OUT_0"].dim == [4, 8], op
+                # classic sequencing lowers (and freezes) at validate: sealed
+                # dims are tuples — compare by value
+                assert list(node.outputs["OUT_0"].dim) == [4, 8], op
 
     def test_all_structured_builders(self):
         """Every op in _STRUCTURED_OPS builds a first-class node: named ports
@@ -404,45 +406,6 @@ class Testpygraph:
         assert "O" in g.nodes[0].outputs
         assert "Stats" in g.nodes[0].outputs
         assert stats.dim == [2, 8, 128, 1]
-
-
-@pytest.mark.L1
-class TestCuTileEngine:
-    """Tests for MatmulCuTileEngine native execution with unified API."""
-
-    @pytest.fixture
-    def cutile_available(self):
-        try:
-            import cuda.tile  # noqa: F401
-            import cuda.bindings.runtime as cudart
-
-            err, device_id = cudart.cudaGetDevice()
-            err, props = cudart.cudaGetDeviceProperties(device_id)
-            return props.major * 10 + props.minor >= 100
-        except (ImportError, Exception):
-            return False
-
-    def test_matmul_cutile(self, cutile_available):
-        """Test matmul execution with torch tensors passed directly."""
-        if not cutile_available:
-            pytest.skip("cuTile or Blackwell GPU not available")
-
-        import torch
-
-        a_data = torch.randn(2, 3, 4, device="cuda", dtype=torch.float32)
-        b_data = torch.randn(2, 4, 5, device="cuda", dtype=torch.float32)
-        c_data = torch.empty(2, 3, 5, device="cuda", dtype=torch.float32)
-
-        # Pass torch tensors directly — no g.tensor() or set_output() needed
-        g = pygraph(use_native=True)
-        C = g.matmul(a_data, b_data)
-
-        # execute() lazy-builds; C is auto-marked as output (leaf tensor)
-        g.execute({C: c_data})
-
-        c_expected = torch.matmul(a_data, b_data)
-        assert c_data.shape == c_expected.shape
-        assert torch.allclose(c_data, c_expected, rtol=1e-5, atol=1e-5)
 
 
 @pytest.mark.L1
@@ -598,6 +561,65 @@ class TestReviewSemantics:
         for mutate in (lambda: A.set_dim([4, 4]), lambda: A.set_data_type("HALF"), lambda: A.set_output(True), lambda: A.set_stride([4, 1])):
             with pytest.raises(RuntimeError, match="frozen"):
                 mutate()
+
+    def test_freeze_covers_public_surface(self):
+        """Review round 5: the freeze must close EVERY public mutation path,
+        not only the fluent API — attribute writes, live containers, in-place
+        list edits, node params, and graph context."""
+        from cudnn.engines import BaseEngine, PYTHON_ENGINE_ID_BASE
+
+        class Dummy(BaseEngine):
+            engine_id = PYTHON_ENGINE_ID_BASE + 92
+
+            def execute(self, graph, tensor_data, ctx=None):
+                pass
+
+        g = pygraph(backends=[Dummy()])
+        A = g.tensor(dim=[1, 2, 2], name="A")
+        C = g.matmul(A, g.tensor(dim=[1, 2, 2], name="B"))
+        g.create_execution_plans()
+        node = g.nodes[0]
+
+        with pytest.raises(RuntimeError, match="frozen"):
+            A.dim = [9, 9]  # direct attribute write
+        with pytest.raises(TypeError):
+            A.dim[:] = [9]  # sealed to a tuple: no in-place edits
+        with pytest.raises(TypeError):
+            node.params["padding"] = 123  # MappingProxy
+        with pytest.raises(TypeError):
+            node.inputs["A"] = C  # MappingProxy
+        with pytest.raises(RuntimeError, match="frozen"):
+            node.inputs = {}  # attribute write on the node
+        with pytest.raises(RuntimeError, match="frozen"):
+            g.context.compute_data_type = "HALF"  # graph context
+        # live-container laundering: the public views are copies
+        g.nodes.clear()
+        g.tensors.clear()
+        assert len(g.nodes) == 1 and len(g.tensors) == 3
+        # the inspection surface stays readable for engines
+        assert list(node.inputs) == ["A", "B"] and list(C.dim) == [1, 2, 2]
+
+    def test_mutation_after_validate_revalidates(self):
+        """Review round 5: python-engine graphs stay mutable until planning —
+        but a mutation after validate() must invalidate _is_validated so stale
+        inference never reaches planning."""
+        from cudnn.engines import BaseEngine, PYTHON_ENGINE_ID_BASE
+
+        class Dummy(BaseEngine):
+            engine_id = PYTHON_ENGINE_ID_BASE + 93
+
+            def execute(self, graph, tensor_data, ctx=None):
+                pass
+
+        g = pygraph(backends=[Dummy()])
+        A = g.tensor(dim=[1, 2, 2], name="A")
+        g.matmul(A, g.tensor(dim=[1, 2, 2], name="B"))
+        g.validate()
+        assert g._is_validated and not g._frozen  # mutable until planning
+        A.set_data_type("HALF")  # allowed — and must force re-validation
+        assert not g._is_validated
+        g.create_execution_plans()
+        assert g._frozen
 
     def test_tensor_scalar_is_graph_owned(self):
         g = pygraph()

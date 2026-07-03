@@ -82,6 +82,13 @@ class Tensor:
     pass_by_value: Optional[Union[int, float]] = None
     uid: int = 0
     uid_assigned: bool = False
+    # user-assigned vs IR-inferred layout: only USER-assigned dim/stride are
+    # pushed to the lowered C++ output tensors — inferred values are
+    # provisional (row-major) and the backend applies its own classic
+    # per-op layout inference (e.g. channels-last conv). Internal inference
+    # writes the attributes directly and leaves these False.
+    dim_assigned: bool = False
+    stride_assigned: bool = False
     reordering_type: Any = None
     ragged_offset: Optional["Tensor"] = None
     ragged_offset_multiplier: int = 1
@@ -89,6 +96,13 @@ class Tensor:
     # weakref to the owning graph (set at registration): identity mutations
     # (set_name / set_uid) delegate to the graph so its indexes stay coherent.
     owner: Any = field(default=None, repr=False)
+
+    def __setattr__(self, name, value):
+        # direct attribute writes freeze with the owning graph (the fluent
+        # setters are guarded separately and give a richer error)
+        if getattr(self, "_frozen", False) and name != "_frozen":
+            raise RuntimeError(f"cannot set Tensor.{name}: the owning graph is frozen after lowering/planning")
+        object.__setattr__(self, name, value)
 
     def _guard(self, what: str = "mutate a tensor attribute") -> None:
         g = self.owner() if self.owner is not None else None
@@ -117,15 +131,17 @@ class Tensor:
         return self
 
     def set_dim(self, dim: List[int]) -> "Tensor":
-        """Set the tensor dimensions."""
+        """Set the tensor dimensions (user-assigned: pushed at lowering)."""
         self._guard()
-        self.dim = dim
+        self.dim = list(dim)
+        self.dim_assigned = True
         return self
 
     def set_stride(self, stride: List[int]) -> "Tensor":
-        """Set the tensor strides."""
+        """Set the tensor strides (user-assigned: pushed at lowering)."""
         self._guard()
-        self.stride = stride
+        self.stride = list(stride)
+        self.stride_assigned = True
         return self
 
     def set_uid(self, uid: int) -> "Tensor":

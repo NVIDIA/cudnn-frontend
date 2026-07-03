@@ -124,6 +124,8 @@ def test_native_block_scale_nvfp4_lowers_to_cudnn():
 def test_native_moe_grouped_matmul_lowers_to_cudnn():
     """moe_grouped_matmul (mode=NONE) built natively -> cuDNN, parity vs a
     self-contained per-expert reference."""
+    if cudnn.backend_version() < 91500:
+        pytest.skip("moe_grouped_matmul requires cuDNN 9.15+")
     h = _handle()
     E, T, Wt, Hd = 8, 256, 64, 128
     fto = [i * (T // E) for i in range(E)]  # one contiguous token chunk per expert
@@ -442,3 +444,47 @@ def test_planning_one_shot_cudnn_only():
     g.execute({A: a, B: b, C: c}, ws, handle=h)
     torch.cuda.synchronize()
     torch.testing.assert_close(c.float(), (a.float() @ b.float()), atol=2e-2, rtol=2e-2)
+
+
+def test_output_layout_contract():
+    """Review round 5: USER-assigned output dim/stride must reach the lowered
+    C++ tensor; IR-INFERRED strides must NOT be pushed — the backend keeps its
+    classic per-op layout inference (channels-last conv) when the user did not
+    pin one. Checked on the lowered graph JSON and by execution."""
+    import json
+
+    # (a) explicit matmul output stride is honored end to end
+    h = _handle()
+    g = pygraph(handle=h, io_data_type=cudnn.data_type.HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    A = g.tensor(dim=[1, M, K], stride=[M * K, K, 1])
+    B = g.tensor(dim=[1, K, N], stride=[K * N, N, 1])
+    C = g.matmul(A, B)
+    C.set_output(True).set_data_type(cudnn.data_type.HALF).set_dim([1, M, N]).set_stride([M * N, 1, M])  # column-major
+    g.build([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+
+    lowered = json.loads(str(g._lowered_graph))
+    (c_entry,) = [t for t in lowered["tensors"].values() if t["uid"] == C.uid]
+    assert c_entry["stride"] == [M * N, 1, M]  # user layout pushed verbatim
+
+    a = torch.randn(1, M, K, device="cuda", dtype=torch.float16)
+    b = torch.randn(1, K, N, device="cuda", dtype=torch.float16)
+    c = torch.empty(1, N, M, device="cuda", dtype=torch.float16).permute(0, 2, 1)  # column-major buffer
+    ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
+    g.execute({A: a, B: b, C: c}, ws, handle=h)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(c.float(), (a.float() @ b.float()), atol=2e-2, rtol=2e-2)
+
+    # (b) inferred conv output keeps the backend's channels-last inference
+    # (the IR's provisional row-major stride must NOT leak into C++)
+    h2 = _handle()
+    Nn, Cc, Hh, Ww, Kk = 4, 32, 16, 16, 16
+    g2 = pygraph(handle=h2, io_data_type=cudnn.data_type.HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    X = g2.tensor(dim=[Nn, Cc, Hh, Ww], stride=[Cc * Hh * Ww, 1, Cc * Ww, Cc])  # NHWC
+    W = g2.tensor(dim=[Kk, Cc, 3, 3], stride=[Cc * 9, 1, Cc * 3, Cc])
+    Y = g2.conv_fprop(X, W, padding=[1, 1], stride=[1, 1], dilation=[1, 1])
+    Y.set_output(True).set_data_type(cudnn.data_type.HALF)
+    g2.build([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+
+    lowered2 = json.loads(str(g2._lowered_graph))
+    (y_entry,) = [t for t in lowered2["tensors"].values() if t["uid"] == Y.uid]
+    assert y_entry["stride"][1] == 1, y_entry["stride"]  # channels-last kept, not row-major
