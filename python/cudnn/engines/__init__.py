@@ -12,7 +12,7 @@ engine is one file implementing BaseEngine; nothing here changes.
 """
 
 from .base import BaseEngine, CompiledPlan, ExecutionContext, PlanConfig
-from .engine_ids import PYTHON_ENGINE_ID_BASE, CUDNN_HEURISTIC_ENGINE_ID, is_python_engine
+from .engine_ids import PYTHON_ENGINE_ID_BASE, BACKEND_HEURISTIC_ENGINE_ID, is_python_engine
 from .router import Router, default_router
 from .reference_matmul_engine import ReferenceMatmulEngine
 
@@ -25,6 +25,6 @@ __all__ = [
     "default_router",
     "ReferenceMatmulEngine",
     "PYTHON_ENGINE_ID_BASE",
-    "CUDNN_HEURISTIC_ENGINE_ID",
+    "BACKEND_HEURISTIC_ENGINE_ID",
     "is_python_engine",
 ]

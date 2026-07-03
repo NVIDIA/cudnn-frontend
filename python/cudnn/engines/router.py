@@ -5,13 +5,13 @@ Implements the dispatch stage of the Python API unification proposal:
     Python Graph API -> create_execution_plans() -> Router -> ranked plan list
                                                              (one flat (engine_id,
                                                               knobs) list mixing
-                                                              python DSLs + cuDNN)
+                                                              python DSLs + backend)
 
 Routing happens at ``create_execution_plans()`` time, NOT at graph construction,
 so graph building stays backend-agnostic (lazy lowering). The Router returns a
 flat list of ``PlanConfig(engine_id, knobs)``: Python engines (ids in the
 reserved high region) whose ``check_support()`` accepts the graph, plus AT MOST
-ONE cuDNN delegating entry (``CUDNN_HEURISTIC_ENGINE_ID``). Dispatch on each
+ONE backend delegating entry (``BACKEND_HEURISTIC_ENGINE_ID``). Dispatch on each
 plan's id (``is_python_engine``) decides whether to run via the Python registry
 or lower to the cuDNN C++ backend.
 
@@ -19,12 +19,12 @@ WHAT THIS MR SUPPORTS (the enforced contract — ``create_execution_plans()``
 validates the final Router output, whatever the Router implementation):
 
 * python entries must name engines registered on the graph;
-* the only legal non-python entry is ONE cuDNN delegating sentinel — the
+* the only legal non-python entry is ONE backend delegating sentinel — the
   backend's own plans stay behind it, addressed via the classic at-index APIs
   (a separate, backend-owned index space);
 * an empty plan list is rejected (there is no legal empty planning state).
 
-Concrete cuDNN engine configs as first-class routed entries
+Concrete backend engine configs as first-class routed entries
 (``PlanConfig(cudnn_engine_id, knobs)`` interleaved with python plans) are NOT
 representable in this MR: they need a typed plan representation and a build
 path via cpp ``create_execution_plan(engine_id, knobs)`` — that is the
@@ -39,21 +39,21 @@ Policy remains pluggable at three levels: subclass ``Router`` and override
 ``plan()``; pass per-graph via ``pygraph(router=...)`` / ``set_router()``
 (before planning); or swap the process-wide ``default_router``. ``plan()`` may
 return any ordering/mix of the representable entries — python-first,
-cuDNN-first, interleaved, conditional on the graph. The current default is a
+backend-first, interleaved, conditional on the graph. The current default is a
 placeholder concat.
 """
 
 from typing import TYPE_CHECKING, List
 
 from .base import BaseEngine, PlanConfig
-from .engine_ids import CUDNN_HEURISTIC_ENGINE_ID
+from .engine_ids import BACKEND_HEURISTIC_ENGINE_ID
 
 if TYPE_CHECKING:
-    from ..pygraph import pygraph
+    from .._pygraph import pygraph
 
 
 class Router:
-    """Default policy: python engines that support the graph, then cuDNN."""
+    """Default policy: python engines that support the graph, then the backend."""
 
     def plan(self, graph: "pygraph", backends: List[BaseEngine]) -> List[PlanConfig]:
         """Return the ranked candidate plan list for ``graph``.
@@ -78,13 +78,13 @@ class Router:
                     raise ValueError(f"engine {engine.name!r} proposed a plan with foreign engine_id {pc.engine_id}")
             plans.extend(proposals)
 
-        # The cuDNN side is ONE delegating entry by design: the frontend owns
+        # The backend side is ONE delegating entry by design: the frontend owns
         # only its python-engine id segment and must work against any (incl.
         # future) backend version, so the backend's engine set can never be
         # statically enumerated here — it is discovered per graph at plan time
         # via the backend's own heuristics/query API (get_engine_and_knobs_at_
         # index on the lowered graph) when a caller wants to expand or autotune.
-        plans.append(PlanConfig(CUDNN_HEURISTIC_ENGINE_ID))
+        plans.append(PlanConfig(BACKEND_HEURISTIC_ENGINE_ID))
         return plans
 
 

@@ -11,13 +11,13 @@ torch = pytest.importorskip("torch")
 
 from cudnn._pygraph import pygraph
 from cudnn.engines import BaseEngine, Router, ReferenceMatmulEngine, PYTHON_ENGINE_ID_BASE, is_python_engine
-from cudnn.engines.engine_ids import CUDNN_HEURISTIC_ENGINE_ID
+from cudnn.engines.engine_ids import BACKEND_HEURISTIC_ENGINE_ID
 
 pytestmark = pytest.mark.L0
 
 
 def test_router_plan_list_includes_supporting_engines_then_cudnn():
-    """Plan list = supporting python engines (by id) + a trailing cuDNN entry."""
+    """Plan list = supporting python engines (by id) + a trailing backend entry."""
 
     class Declines(BaseEngine):
         name = "declines"
@@ -44,8 +44,8 @@ def test_router_plan_list_includes_supporting_engines_then_cudnn():
 
     plans = Router().plan(g, g.backends)
     ids = [p.engine_id for p in plans]
-    # Only the supporting python engine is included, then the cuDNN entry last.
-    assert ids == [PYTHON_ENGINE_ID_BASE + 10, CUDNN_HEURISTIC_ENGINE_ID]
+    # Only the supporting python engine is included, then the backend entry last.
+    assert ids == [PYTHON_ENGINE_ID_BASE + 10, BACKEND_HEURISTIC_ENGINE_ID]
     assert is_python_engine(ids[0]) and not is_python_engine(ids[-1])
 
 
@@ -174,7 +174,7 @@ def test_unexpected_engine_exception_propagates():
 
 
 def test_no_backend_plan_list_is_cudnn_only():
-    """With no python engine, the plan list is just the cuDNN entry (selected=None)."""
+    """With no python engine, the plan list is just the backend entry (selected=None)."""
     g = pygraph()
     a = g.tensor(dim=[4, 8], name="A")
     b = g.tensor(dim=[8, 4], name="B")
@@ -184,9 +184,9 @@ def test_no_backend_plan_list_is_cudnn_only():
     from cudnn.engines.router import default_router
 
     plans = default_router.plan(g, g.backends)
-    assert [p.engine_id for p in plans] == [CUDNN_HEURISTIC_ENGINE_ID]
+    assert [p.engine_id for p in plans] == [BACKEND_HEURISTIC_ENGINE_ID]
     g._plans = plans
-    assert g.selected_engine is None  # cuDNN path
+    assert g.selected_engine is None  # backend path
 
 
 def test_compiled_plan_lifecycle_knobs_and_reuse():
@@ -228,7 +228,7 @@ def test_compiled_plan_lifecycle_knobs_and_reuse():
     ws = torch.empty(4096, dtype=torch.uint8)
     out = torch.empty(2, 2)
     g.select_plan(1)  # the tile=256 plan
-    assert len(g.plans) == 3  # two knob proposals + the cuDNN delegating entry
+    assert len(g.plans) == 3  # two knob proposals + the backend delegating entry
     g.build_plans()
     assert compiled_log == [{"tile": 256}]  # compiled once, correct knobs
     assert g.get_workspace_size() == 4096  # plan-specific workspace
@@ -289,10 +289,10 @@ def test_planning_is_one_shot():
 
 
 def test_mixed_router_ordering_dispatch():
-    """Follow-up item 2: dispatch honors arbitrary Router ordering (cuDNN-first,
+    """Follow-up item 2: dispatch honors arbitrary Router ordering (backend-first,
     interleaved), never a python-prefix assumption."""
     from cudnn.engines import PlanConfig, Router
-    from cudnn.engines.engine_ids import CUDNN_HEURISTIC_ENGINE_ID
+    from cudnn.engines.engine_ids import BACKEND_HEURISTIC_ENGINE_ID
 
     ran = []
     ea, eb = _mk_engine(61, "A", ran), _mk_engine(62, "B", ran)
@@ -301,7 +301,7 @@ def test_mixed_router_ordering_dispatch():
         def plan(self, graph, backends):
             return [
                 PlanConfig(ea.engine_id, "A"),
-                PlanConfig(CUDNN_HEURISTIC_ENGINE_ID),
+                PlanConfig(BACKEND_HEURISTIC_ENGINE_ID),
                 PlanConfig(eb.engine_id, "B"),
             ]
 
@@ -311,17 +311,17 @@ def test_mixed_router_ordering_dispatch():
     g.create_execution_plans()
     # slot 0 = python A, slot 1 = cuDNN, slot 2 = python B
     assert g.selected_engine.name == "e61"
-    g.select_plan(1)  # the cuDNN delegating entry is selectable in place
-    assert g.selected_engine is None  # None == the cuDNN path
+    g.select_plan(1)  # the backend delegating entry is selectable in place
+    assert g.selected_engine is None  # None == the backend path
     g.select_plan(2)
     assert g.selected_engine.name == "e62"
     g.execute({C: torch.empty(2, 2)})
     assert ran[-1] == "B"
-    # the middle routed entry is the cuDNN delegating one, and routed indices
+    # the middle routed entry is the backend delegating one, and routed indices
     # are STABLE: python-B stays at index 2 regardless of lowering. (Real
-    # execution THROUGH the cuDNN slot of a mixed router is the GPU test
-    # test_mixed_router_cudnn_slot_executes in test_native_cudnn_lowering.py.)
-    assert g.plans[1].engine_id == CUDNN_HEURISTIC_ENGINE_ID
+    # execution THROUGH the backend slot of a mixed router is the GPU test
+    # test_mixed_router_backend_slot_executes in test_native_backend_lowering.py.)
+    assert g.plans[1].engine_id == BACKEND_HEURISTIC_ENGINE_ID
     assert g.selected_engine.name == "e62"
 
 
@@ -371,7 +371,7 @@ def test_backend_count_is_a_separate_space():
     g.create_execution_plans()
     assert len(g.plans) == 1
     with pytest.raises(RuntimeError, match="graph.plans"):
-        g.get_execution_plan_count()  # no cuDNN entry -> no backend plans
+        g.get_execution_plan_count()  # no backend entry -> no backend plans
     g.execute({C: torch.empty(2, 2)})  # the routed python plan still runs
 
 

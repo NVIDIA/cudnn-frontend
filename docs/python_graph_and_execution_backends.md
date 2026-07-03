@@ -12,7 +12,7 @@ lowering.
 ```
 cudnn.pygraph (Python IR)  →  create_execution_plans()  →  Router  →  routed plan list
   nodes / tensors / params        (route here,               PlanConfig(engine_id, knobs):
-  fully introspectable            lazy lowering)             python engines + one cuDNN entry
+  fully introspectable            lazy lowering)             python engines + one backend entry
 ```
 
 Why: python-DSL engines (CuTe-DSL / cuTile style GEMM and attention fusions)
@@ -55,17 +55,17 @@ is natively introspectable and an engine is one file implementing
 ### Router and the two plan-index spaces
 
 - The Router returns the routed plan list: python `PlanConfig` entries plus
-  AT MOST ONE cuDNN delegating entry (`CUDNN_HEURISTIC_ENGINE_ID`). The
+  AT MOST ONE backend delegating entry (`BACKEND_HEURISTIC_ENGINE_ID`). The
   final output is validated regardless of Router implementation (registered
   ids only, one sentinel max, never empty).
 - **Routed space**: `graph.plans`, selected with `select_plan()`. Indices are
-  stable — the cuDNN entry is one index forever and never expands in place.
+  stable — the backend entry is one index forever and never expands in place.
 - **Backend space**: the cuDNN backend's own plans, discovered per graph from
   the lowered graph and addressed via the classic
   `get_execution_plan_count()` / `*_plan_at_index()` APIs (pure delegation).
   The frontend never statically enumerates backend engines — backend engine
   sets vary by version and are discovered at plan time.
-- Concrete cuDNN engine configs as first-class routed entries need a typed
+- Concrete backend engine configs as first-class routed entries need a typed
   plan representation — heuristics/autotune follow-up scope, together with
   ranking policy (the Router is pluggable at three levels: subclass,
   per-graph `router=`, process-wide `default_router`).
@@ -80,7 +80,7 @@ is natively introspectable and an engine is one file implementing
   user-user collisions raise.
 - **Pure-python or pure-C++**: a graph routed to a python engine never
   touches C++ on the execute path; mixed construction is unsupported.
-  (Explicitly querying the backend plan space lowers the cuDNN entry on
+  (Explicitly querying the backend plan space lowers the backend entry on
   demand — that is the caller asking for the backend.)
 - **One-shot planning**: a second `create_execution_plans()` raises (the
   classic C++ graph never supported re-planning — it appends engine configs
@@ -111,9 +111,9 @@ is natively introspectable and an engine is one file implementing
   lowers to (renamed from its pre-flip public name to avoid two things called
   `pygraph`).
 
-## Testing the cuDNN path
+## Testing the backend path
 
-The `test_native_cudnn_lowering.py` suite builds graphs natively, lowers,
+The `test_native_backend_lowering.py` suite builds graphs natively, lowers,
 executes on GPU, and checks numerics against torch references. Dispatch-level
 assertions (`selected_engine is None`, backend plans created, lowered graph
 present) prove the execution went through the cuDNN backend plan path rather

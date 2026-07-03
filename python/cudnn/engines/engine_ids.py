@@ -20,11 +20,11 @@ autotune results and pinned plans stay reproducible across runs.
 # having to know cuDNN's actual maximum.
 PYTHON_ENGINE_ID_BASE = 1 << 20
 
-# The cuDNN side of the plan list: "delegate to the loaded backend's own
+# The backend side of the plan list: "delegate to the loaded backend's own
 # heuristics". Deliberately ONE entry — the backend's engine set varies by
 # backend version and is only discoverable per graph at plan time, never
 # statically enumerable by the frontend.
-CUDNN_HEURISTIC_ENGINE_ID = -1
+BACKEND_HEURISTIC_ENGINE_ID = -1
 
 
 def is_python_engine(engine_id: int) -> bool:

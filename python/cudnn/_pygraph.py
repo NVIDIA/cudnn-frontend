@@ -101,7 +101,7 @@ class pygraph:
         self._planning_done: bool = False  # create_execution_plans() ran (one-shot)
         self._frozen: bool = False  # whole-surface freeze (set by _freeze())
         self._plan_index: int = 0
-        self._cudnn_heuristics: Optional[List] = None  # heur modes for a cuDNN plan
+        self._backend_heuristics: Optional[List] = None  # heur modes for a backend plan
         self._cpp_plans_created: bool = False  # C++ create_execution_plans ran
         self._compiled_plans: Dict[int, Any] = {}  # plan_index -> CompiledPlan (python plans)
         self._cpp_bog_done: bool = False  # C++ build_operation_graph ran
@@ -171,7 +171,7 @@ class pygraph:
     @property
     def selected_engine(self) -> Optional["BaseEngine"]:
         """The python engine for the currently selected top-level plan entry,
-        or None for the cuDNN path. Populated after create_execution_plans()."""
+        or None for the backend path. Populated after create_execution_plans()."""
         cfg = self._selected_plan_config
         return self._engine_by_id(cfg.engine_id) if cfg is not None else None
 
@@ -690,14 +690,14 @@ class pygraph:
         """Build the ranked execution-plan list (the dispatch stage).
 
         The Router returns one flat list of PlanConfig(engine_id, knobs) mixing
-        python engines (reserved id region) and the cuDNN side, in one shared
+        python engines (reserved id region) and the backend side, in one shared
         engine-id space. Nothing is lowered here — a plan is built lazily when
         selected. ``_plan_index`` selects which plan runs (default 0, the
-        highest-ranked); cuDNN heuristic modes are carried on the cuDNN plan's
+        highest-ranked); cuDNN heuristic modes are carried on the backend plan's
         knobs.
 
         Args:
-            heuristics: cuDNN heuristic modes, carried to the cuDNN plan.
+            heuristics: cuDNN heuristic modes, carried to the backend plan.
         """
         if not self._is_validated:
             self.validate()
@@ -718,38 +718,38 @@ class pygraph:
         plans = router.plan(self, self._backends)
         # Validate the FINAL router output (a custom Router must not bypass
         # registration): python entries must name registered engines; the only
-        # non-python entry allowed is ONE cuDNN delegating sentinel.
-        from .engines.engine_ids import CUDNN_HEURISTIC_ENGINE_ID, is_python_engine
+        # non-python entry allowed is ONE backend delegating sentinel.
+        from .engines.engine_ids import BACKEND_HEURISTIC_ENGINE_ID, is_python_engine
 
         registered = {e.engine_id for e in self._backends}
         if not plans:
-            raise ValueError("router returned an empty plan list — there is no legal empty planning state (return the cuDNN delegating entry at minimum)")
+            raise ValueError("router returned an empty plan list — there is no legal empty planning state (return the backend delegating entry at minimum)")
         n_cudnn = 0
         for cfg in plans:
             if is_python_engine(cfg.engine_id):
                 if cfg.engine_id not in registered:
                     raise ValueError(f"router produced a plan for unregistered engine_id {cfg.engine_id}")
-            elif cfg.engine_id == CUDNN_HEURISTIC_ENGINE_ID:
+            elif cfg.engine_id == BACKEND_HEURISTIC_ENGINE_ID:
                 n_cudnn += 1
             else:
                 raise ValueError(f"router produced a plan with invalid engine_id {cfg.engine_id}")
         if n_cudnn > 1:
-            raise ValueError("router produced more than one cuDNN delegating entry")
+            raise ValueError("router produced more than one backend delegating entry")
         self._plans = plans
         self._planning_done = True
         self._freeze()  # plans reference the graph as-is: no mutation from here
         self._plan_index = 0
-        self._cudnn_heuristics = heuristics  # applied when a cuDNN plan is built
+        self._backend_heuristics = heuristics  # applied when a backend plan is built
         # Classic sequencing: if the graph was already lowered (no python
         # engines -> build_operation_graph lowered eagerly) and the selected
-        # plan is the cuDNN one, create the C++ plans now.
+        # plan is the backend one, create the C++ plans now.
         if self.selected_engine is None and self._lowered_graph is not None:
-            self._lower_cudnn_plan()
+            self._lower_backend_plan()
 
-    def _has_cudnn_plan(self) -> bool:
-        from .engines.engine_ids import CUDNN_HEURISTIC_ENGINE_ID
+    def _has_backend_plan(self) -> bool:
+        from .engines.engine_ids import BACKEND_HEURISTIC_ENGINE_ID
 
-        return any(cfg.engine_id == CUDNN_HEURISTIC_ENGINE_ID for cfg in self._plans)
+        return any(cfg.engine_id == BACKEND_HEURISTIC_ENGINE_ID for cfg in self._plans)
 
     def get_execution_plan_count(self) -> int:
         """Classic passthrough, ALWAYS: the cuDNN backend's plan count for this
@@ -759,16 +759,16 @@ class pygraph:
         The semantics never depend on whether python engines are registered.
 
         The ROUTED plan list (the Router's entries: python plans + at most one
-        cuDNN delegating entry) is a separate index space: ``graph.plans``,
+        backend delegating entry) is a separate index space: ``graph.plans``,
         selected with ``select_plan()``. Its indices are stable — the cuDNN
         entry is one index forever and never expands into this count.
         """
         if self._planning_done:
-            if not self._has_cudnn_plan():
+            if not self._has_backend_plan():
                 raise RuntimeError(
-                    "this graph's Router produced python plans only (no cuDNN entry), so there are no backend plans — the routed plan list is graph.plans / select_plan()"
+                    "this graph's Router produced python plans only (no backend entry), so there are no backend plans — the routed plan list is graph.plans / select_plan()"
                 )
-            self._lower_cudnn_plan()  # backend plans exist on demand (one-shot)
+            self._lower_backend_plan()  # backend plans exist on demand (one-shot)
             return self._lowered_graph.get_execution_plan_count()
         if self._lowered_graph is not None:
             # classic pre-planning sequencing: delegate, C++ reports its state
@@ -816,8 +816,8 @@ class pygraph:
             if cpp_uid != ir_uid:
                 raise RuntimeError(f"uid ownership violated: IR tensor uid {ir_uid} lowered to C++ uid {cpp_uid} — a lowering path failed to push the uid")
 
-    def _lower_cudnn_plan(self) -> None:
-        """Lower to C++ (if not already) and create the cuDNN plans (once)."""
+    def _lower_backend_plan(self) -> None:
+        """Lower to C++ (if not already) and create the backend plans (once)."""
         import cudnn
 
         if self._lowered_graph is None:
@@ -828,7 +828,7 @@ class pygraph:
             self._lowered_graph.build_operation_graph()
             self._cpp_bog_done = True
         if not self._cpp_plans_created:
-            heur = self._cudnn_heuristics or [cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK]
+            heur = self._backend_heuristics or [cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK]
             self._lowered_graph.create_execution_plans(heur)
             self._cpp_plans_created = True
 
@@ -836,28 +836,28 @@ class pygraph:
         """Check the selected plan's engine supports the graph.
 
         A python plan re-affirms its engine's check_support() (already passed
-        when the Router included it); a cuDNN plan lowers and checks C++ support.
+        when the Router included it); a backend plan lowers and checks C++ support.
         """
         eng = self.selected_engine
         if eng is not None:
             eng.check_support(self)
             return
         if self._lowered_graph is None:
-            self._lower_cudnn_plan()
+            self._lower_backend_plan()
         self._lowered_graph.check_support()
 
     def build_plans(self, *args) -> None:
         """Finalize the selected plan. A python plan compiles HERE (once per
         graph/plan; the CompiledPlan is cached on the graph and reused across
         executions). The classic optional build_plan_policy passes through on
-        the cuDNN path."""
+        the backend path."""
         eng = self.selected_engine
         if eng is not None:
             if self._plan_index not in self._compiled_plans:
                 self._compiled_plans[self._plan_index] = eng.build_plan(self, self._selected_plan_config, self._build_context())
         if eng is None:
             if self._lowered_graph is None or not self._cpp_plans_created:
-                self._lower_cudnn_plan()
+                self._lower_backend_plan()
             self._lowered_graph.build_plans(*args)
         self._is_built = True
 
@@ -875,7 +875,7 @@ class pygraph:
 
     def get_workspace_size(self, *args, **kwargs) -> int:
         """Workspace bytes for the selected plan. Classic overloads (handle /
-        dynamic-shape overrides) pass through on the cuDNN path."""
+        dynamic-shape overrides) pass through on the backend path."""
         if not self._is_built:
             raise RuntimeError("Call build() first")
 
@@ -897,7 +897,7 @@ class pygraph:
     ) -> None:
         """Execute the selected plan.
 
-        Both python engines and the cuDNN path write results directly into the
+        Both python engines and the backend path write results directly into the
         caller-provided output tensors (in-place). Automatically calls build()
         if it hasn't run yet. Dispatch is a single check on the plan's engine id.
 
@@ -906,7 +906,7 @@ class pygraph:
                          Must include both input and output tensors.
             workspace: Workspace buffer (ignored by python engines)
             handle: cuDNN handle (ignored by python engines)
-            override_uids/shapes/strides: dynamic-shape overrides (cuDNN path)
+            override_uids/shapes/strides: dynamic-shape overrides (backend path)
         """
         if not self._is_built:
             # Auto-build. When a python plan will run and the caller supplied a
@@ -994,7 +994,7 @@ class pygraph:
 
     @property
     def engine(self) -> Optional["BaseEngine"]:
-        """The python engine for the selected plan, or None for the cuDNN path.
+        """The python engine for the selected plan, or None for the backend path.
         Populated after create_execution_plans()."""
         return self.selected_engine
 

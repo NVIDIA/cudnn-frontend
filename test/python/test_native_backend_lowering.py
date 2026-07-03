@@ -22,9 +22,9 @@ def _handle():
     return cudnn.create_handle()
 
 
-def _assert_ran_on_cudnn(g):
+def _assert_ran_on_backend(g):
     """Dispatch-level proof the execution took the cuDNN backend plan path:
-    the selected routed plan is the cuDNN entry (no python engine), the graph
+    the selected routed plan is the backend entry (no python engine), the graph
     was really lowered, and backend plans were created and built. Kernel
     identity below the backend API is deliberately not asserted (kernel names
     are backend-internal and version-dependent)."""
@@ -33,7 +33,7 @@ def _assert_ran_on_cudnn(g):
     assert g._cpp_plans_created and g._is_built
 
 
-def test_native_matmul_lowers_to_cudnn():
+def test_native_matmul_lowers_to_backend():
     h = _handle()
     a = torch.randn(1, M, K, device="cuda", dtype=torch.float16)
     b = torch.randn(1, K, N, device="cuda", dtype=torch.float16)
@@ -49,12 +49,12 @@ def test_native_matmul_lowers_to_cudnn():
     ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
     g.execute({A: a, B: b, C: c}, ws, handle=h)
     torch.cuda.synchronize()
-    _assert_ran_on_cudnn(g)
+    _assert_ran_on_backend(g)
 
     torch.testing.assert_close(c.float(), a.float() @ b.float(), atol=2e-2, rtol=2e-2)
 
 
-def test_native_matmul_bias_relu_lowers_to_cudnn():
+def test_native_matmul_bias_relu_lowers_to_backend():
     h = _handle()
     a = torch.randn(1, M, K, device="cuda", dtype=torch.float16)
     b = torch.randn(1, K, N, device="cuda", dtype=torch.float16)
@@ -72,12 +72,12 @@ def test_native_matmul_bias_relu_lowers_to_cudnn():
     ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
     g.execute({A: a, B: b, Bi: bias, Y: c}, ws, handle=h)
     torch.cuda.synchronize()
-    _assert_ran_on_cudnn(g)
+    _assert_ran_on_backend(g)
 
     torch.testing.assert_close(c.float(), torch.relu(a.float() @ b.float() + bias.float()), atol=2e-2, rtol=2e-2)
 
 
-def test_native_matmul_reduction_lowers_to_cudnn():
+def test_native_matmul_reduction_lowers_to_backend():
     """matmul -> reduction(ADD) over N; cuDNN needs explicit reduced output dims."""
     h = _handle()
     a = torch.randn(1, M, K, device="cuda", dtype=torch.float16)
@@ -94,12 +94,12 @@ def test_native_matmul_reduction_lowers_to_cudnn():
     ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
     g.execute({A: a, B: b, R: r}, ws, handle=h)
     torch.cuda.synchronize()
-    _assert_ran_on_cudnn(g)
+    _assert_ran_on_backend(g)
 
     torch.testing.assert_close(r, (a.float() @ b.float()).sum(dim=2, keepdim=True), atol=5e-2, rtol=5e-2)
 
 
-def test_native_block_scale_nvfp4_lowers_to_cudnn():
+def test_native_block_scale_nvfp4_lowers_to_backend():
     """block_scale_dequantize(A)@block_scale_dequantize(B), nvfp4 -> cuDNN (SM100)."""
     if not hasattr(torch, "float4_e2m1fn_x2"):
         pytest.skip("torch lacks float4_e2m1fn_x2")
@@ -133,10 +133,10 @@ def test_native_block_scale_nvfp4_lowers_to_cudnn():
     ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
     g.execute({At: A, Bt: B, Ad: A_ds, Bd: B_ds, Cc: C}, ws, handle=h)
     torch.cuda.synchronize()
-    _assert_ran_on_cudnn(g)  # builds + executes without error (parity harness = repo's fp4 test)
+    _assert_ran_on_backend(g)  # builds + executes without error (parity harness = repo's fp4 test)
 
 
-def test_native_moe_grouped_matmul_lowers_to_cudnn():
+def test_native_moe_grouped_matmul_lowers_to_backend():
     """moe_grouped_matmul (mode=NONE) built natively -> cuDNN, parity vs a
     self-contained per-expert reference."""
     if cudnn.backend_version() < 91500:
@@ -160,7 +160,7 @@ def test_native_moe_grouped_matmul_lowers_to_cudnn():
     ws = torch.empty(max(g.get_workspace_size(), 1), dtype=torch.uint8, device="cuda")
     g.execute({tok: tok_d, wt: wt_d, off: off_d, out: out_d}, ws, handle=h)
     torch.cuda.synchronize()
-    _assert_ran_on_cudnn(g)
+    _assert_ran_on_backend(g)
 
     # reference: per-expert token-chunk @ weight[e] (weights stored H-contiguous)
     token = tok_d.view(T, Hd).float()
@@ -174,7 +174,7 @@ def test_native_moe_grouped_matmul_lowers_to_cudnn():
     torch.testing.assert_close(out_d.view(T, Wt).float(), ref.cuda(), rtol=5e-2, atol=5e-2)
 
 
-def test_native_sdpa_fwd_lowers_to_cudnn():
+def test_native_sdpa_fwd_lowers_to_backend():
     """sdpa (captured-op family) -> cuDNN execution parity vs torch SDPA."""
     h = _handle()
     B, Hh, S, D = 2, 4, 128, 64
@@ -196,12 +196,12 @@ def test_native_sdpa_fwd_lowers_to_cudnn():
     ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
     g.execute({Q: q, K: k, V: v, O: o}, ws, handle=h)
     torch.cuda.synchronize()
-    _assert_ran_on_cudnn(g)
+    _assert_ran_on_backend(g)
 
     torch.testing.assert_close(o, ref, atol=5e-2, rtol=5e-2)
 
 
-def test_native_conv_fprop_lowers_to_cudnn():
+def test_native_conv_fprop_lowers_to_backend():
     """conv_fprop (structured-table op) -> cuDNN parity vs torch conv2d (NHWC)."""
     h = _handle()
     x = torch.randn(4, 16, 32, 32, device="cuda", dtype=torch.float16).to(memory_format=torch.channels_last)
@@ -220,12 +220,12 @@ def test_native_conv_fprop_lowers_to_cudnn():
     ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
     g.execute({X: x, W: w, Y: y}, ws, handle=h)
     torch.cuda.synchronize()
-    _assert_ran_on_cudnn(g)
+    _assert_ran_on_backend(g)
 
     torch.testing.assert_close(y, ref, atol=5e-2, rtol=5e-2)
 
 
-def test_native_layernorm_fwd_bwd_lowers_to_cudnn():
+def test_native_layernorm_fwd_bwd_lowers_to_backend():
     """layernorm fwd (3 outputs) + layernorm_backward (3 outputs) through the
     generic structured-op lowering, parity vs torch autograd.
 
@@ -270,7 +270,7 @@ def test_native_layernorm_fwd_bwd_lowers_to_cudnn():
     ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
     g.execute({X: x.detach(), S: scale.detach(), Bi: bias.detach(), E: eps_cpu, Y: Yb, mean: mb, iv: ivb}, ws, handle=h)
     torch.cuda.synchronize()
-    _assert_ran_on_cudnn(g)
+    _assert_ran_on_backend(g)
     torch.testing.assert_close(Yb.float(), Y_ref, atol=3e-2, rtol=3e-2)
     torch.testing.assert_close(mb, mean_ref, atol=5e-3, rtol=5e-3)
     torch.testing.assert_close(ivb, inv_ref, atol=5e-3, rtol=5e-3)
@@ -292,13 +292,13 @@ def test_native_layernorm_fwd_bwd_lowers_to_cudnn():
     ws2 = torch.empty(max(g2.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
     g2.execute({DY: cl(grad.half()), X2: x.detach(), S2: scale.detach(), M2: mb, IV2: ivb, DX: dxb, DS: dsb, DB: dbb}, ws2, handle=h)
     torch.cuda.synchronize()
-    _assert_ran_on_cudnn(g2)
+    _assert_ran_on_backend(g2)
     torch.testing.assert_close(dxb.float(), x.grad.float(), atol=5e-2, rtol=5e-2)
     torch.testing.assert_close(dsb.float(), scale.grad.float(), atol=5e-2, rtol=5e-2)
     torch.testing.assert_close(dbb.float(), bias.grad.float(), atol=5e-2, rtol=5e-2)
 
 
-def test_native_pointwise_batch_lowers_to_cudnn():
+def test_native_pointwise_batch_lowers_to_backend():
     """Generated pointwise builders through real cuDNN: sqrt(abs(A@B)) clamped
     via binary max/min (keyword call style, input0/input1)."""
     h = _handle()
@@ -320,13 +320,13 @@ def test_native_pointwise_batch_lowers_to_cudnn():
     ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
     g.execute({A: a, B: b, Lo: lo, Hi: hi, Y: c}, ws, handle=h)
     torch.cuda.synchronize()
-    _assert_ran_on_cudnn(g)
+    _assert_ran_on_backend(g)
 
     ref = (a.float() @ b.float()).abs().sqrt().clamp(0.5, 2.0)
     torch.testing.assert_close(c.float(), ref, atol=2e-2, rtol=2e-2)
 
 
-def test_native_rmsnorm_lowers_to_cudnn():
+def test_native_rmsnorm_lowers_to_backend():
     """rmsnorm (multi-output: Y + inv_var, pass-by-value epsilon) -> cuDNN parity.
 
     Regression cover for uid ownership: the Python IR assigns every uid eagerly
@@ -364,7 +364,7 @@ def test_native_rmsnorm_lowers_to_cudnn():
     ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
     g.execute({X: x, S: scale, Bi: bias, E: eps_cpu, Y: Yb, iv: ivb}, ws, handle=h)
     torch.cuda.synchronize()
-    _assert_ran_on_cudnn(g)
+    _assert_ran_on_backend(g)
 
     xf = x.float()
     ivref = torch.rsqrt(xf.pow(2).mean(dim=(1, 2, 3), keepdim=True) + eps)
@@ -373,13 +373,13 @@ def test_native_rmsnorm_lowers_to_cudnn():
     torch.testing.assert_close(ivb, ivref, atol=5e-3, rtol=5e-3)
 
 
-def test_mixed_router_cudnn_slot_executes():
-    """Review round 4: the cuDNN entry of a MIXED router is selectable and
+def test_mixed_router_backend_slot_executes():
+    """Review round 4: the backend entry of a MIXED router is selectable and
     actually executes through the backend (lowering triggered), with routed
     indices stable across that lowering; the pinned python plan still runs
     afterwards with its own knobs."""
     from cudnn.engines import BaseEngine, PlanConfig, Router
-    from cudnn.engines.engine_ids import CUDNN_HEURISTIC_ENGINE_ID, PYTHON_ENGINE_ID_BASE
+    from cudnn.engines.engine_ids import BACKEND_HEURISTIC_ENGINE_ID, PYTHON_ENGINE_ID_BASE
 
     ran = []
 
@@ -397,7 +397,7 @@ def test_mixed_router_cudnn_slot_executes():
 
     class CudnnFirst(Router):
         def plan(self, graph, backends):
-            return [PlanConfig(CUDNN_HEURISTIC_ENGINE_ID), PlanConfig(backends[0].engine_id)]
+            return [PlanConfig(BACKEND_HEURISTIC_ENGINE_ID), PlanConfig(backends[0].engine_id)]
 
     h = _handle()
     a = torch.randn(1, M, K, device="cuda", dtype=torch.float16)
@@ -415,7 +415,7 @@ def test_mixed_router_cudnn_slot_executes():
     C.set_output(True).set_data_type(cudnn.data_type.HALF)
 
     g.create_execution_plans()
-    assert [p.engine_id for p in g.plans] == [CUDNN_HEURISTIC_ENGINE_ID, PYTHON_ENGINE_ID_BASE + 90]
+    assert [p.engine_id for p in g.plans] == [BACKEND_HEURISTIC_ENGINE_ID, PYTHON_ENGINE_ID_BASE + 90]
 
     # slot 0 = cuDNN: this build/execute lowers and runs the real backend
     assert g.selected_engine is None
@@ -424,13 +424,13 @@ def test_mixed_router_cudnn_slot_executes():
     ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
     g.execute({A: a, B: b, C: c}, ws, handle=h)
     torch.cuda.synchronize()
-    _assert_ran_on_cudnn(g)
+    _assert_ran_on_backend(g)
     torch.testing.assert_close(c.float(), ref.float(), atol=2e-2, rtol=2e-2)
     assert ran == []  # the python engine did NOT run
 
     # backend count is the classic passthrough space; routed indices unmoved
     assert g.get_execution_plan_count() >= 1
-    assert [p.engine_id for p in g.plans] == [CUDNN_HEURISTIC_ENGINE_ID, PYTHON_ENGINE_ID_BASE + 90]
+    assert [p.engine_id for p in g.plans] == [BACKEND_HEURISTIC_ENGINE_ID, PYTHON_ENGINE_ID_BASE + 90]
 
     # slot 1 = the python plan, still selectable AFTER backend lowering
     c.zero_()
@@ -443,7 +443,7 @@ def test_mixed_router_cudnn_slot_executes():
     torch.testing.assert_close(c.float(), ref.float(), atol=2e-2, rtol=2e-2)
 
 
-def test_planning_one_shot_cudnn_only():
+def test_planning_one_shot_backend_only():
     """Review round 4: one-shot planning also covers the pure-cuDNN graph (no
     python engines registered) — a second create_execution_plans() raises."""
     h = _handle()
@@ -467,7 +467,7 @@ def test_planning_one_shot_cudnn_only():
     ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
     g.execute({A: a, B: b, C: c}, ws, handle=h)
     torch.cuda.synchronize()
-    _assert_ran_on_cudnn(g)
+    _assert_ran_on_backend(g)
     torch.testing.assert_close(c.float(), (a.float() @ b.float()), atol=2e-2, rtol=2e-2)
 
 
@@ -497,7 +497,7 @@ def test_output_layout_contract():
     ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
     g.execute({A: a, B: b, C: c}, ws, handle=h)
     torch.cuda.synchronize()
-    _assert_ran_on_cudnn(g)
+    _assert_ran_on_backend(g)
     torch.testing.assert_close(c.float(), (a.float() @ b.float()), atol=2e-2, rtol=2e-2)
 
     # (b) inferred conv output keeps the backend's channels-last inference
