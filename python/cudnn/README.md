@@ -54,6 +54,7 @@ To add a new frontend-only API, follow these steps:
 - `Grouped Gemm + Quant (Legacy, Dense-only)`
 - `Grouped Gemm + Quant (Unified)`
 - `Grouped Gemm + Wgrad`
+- `Block Sparse Attention (BSA)`
 - `SDPA Forward (SM100, D=256)`
 - `SDPA Backward (SM100, D=256)`
 

@@ -19,6 +19,7 @@ This folder documents the Python FE APIs implemented under `python/cudnn`. For d
 - [Grouped GEMM + Quant (Legacy, Dense-only)](gemm_fusions/grouped_gemm_quant.md)
 - [Grouped GEMM + Quant (Unified)](gemm_fusions/grouped_gemm_quant_unified.md)
 - [Grouped GEMM + Wgrad](gemm_fusions/grouped_gemm_wgrad.md)
+- [Block Sparse Attention (BSA)](bsa.md)
 - [Native Sparse Attention (NSA)](nsa.md)
 - [RMSNorm + RHT + Amax](rmsnorm_rht_amax.md)
 - [SDPA Forward FE OSS API (SM100, D=256)](../operations/Attention.md#sdpa-forward-fe-oss-sm100-d256)
