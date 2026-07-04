@@ -246,6 +246,7 @@ def test_grouped_gemm_quant_wrapper_fp8(
         discrete_col_sfd=discrete_col_sfd,
         use_dynamic_sched=use_dynamic_sched,
         request=request,
+        provide_d_tensor=True,
     )
 
 
@@ -1110,6 +1111,7 @@ def _test_grouped_gemm_quant_wrapper(
     input_mutator=None,
     use_dynamic_sched=False,
     enable_bias=False,
+    provide_d_tensor=False,
 ):
     """Test GroupedGemmQuant API via the wrapper function (with caching)."""
     try:
@@ -1151,6 +1153,16 @@ def _test_grouped_gemm_quant_wrapper(
     if input_mutator is not None:
         input_mutator(inputs, cfg)
 
+    caller_d_tensor = None
+    if provide_d_tensor:
+        valid_m, n_out = inputs["a_tensor"].shape[0], cfg["n"]
+        caller_d_tensor = torch.empty_strided(
+            (valid_m, n_out, 1),
+            (n_out, 1, valid_m * n_out),
+            dtype=cfg["d_dtype"],
+            device=inputs["a_tensor"].device,
+        )
+
     try:
         for _ in range(2):  # Run twice to test caching path
             outputs = grouped_gemm_quant_wrapper_sm100(
@@ -1166,6 +1178,7 @@ def _test_grouped_gemm_quant_wrapper(
                 row_scale_tensor=inputs.get("row_scale_tensor"),
                 acc_dtype=cfg["acc_dtype"],
                 d_dtype=cfg["d_dtype"],
+                d_tensor=caller_d_tensor,
                 cd_major=cfg["cd_major"],
                 mma_tiler_mn=cfg["mma_tiler_mn"],
                 cluster_shape_mn=cfg["cluster_shape_mn"],
@@ -1178,6 +1191,9 @@ def _test_grouped_gemm_quant_wrapper(
             )
     except (ValueError, NotImplementedError) as e:
         pytest.skip(f"Unsupported testcase: {e}")
+
+    if provide_d_tensor:
+        assert outputs["d_tensor"].data_ptr() == caller_d_tensor.data_ptr()
 
     check_ref_grouped_gemm_quant(
         inputs,
