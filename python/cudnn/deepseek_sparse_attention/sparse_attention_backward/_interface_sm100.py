@@ -130,7 +130,8 @@ def flash_attn_bwd_sm100(
     current_stream = resolve_stream(current_stream)
 
     has_topk_length = topk_length is not None
-    compile_key = (dtype, head_dim, head_dim_v, num_head, block_tile, has_topk_length)
+    max_topk = topk_idxs.shape[1]
+    compile_key = (dtype, head_dim, head_dim_v, num_head, block_tile, max_topk, has_topk_length)
 
     if compile_key not in flash_attn_bwd_sm100.compile_cache:
         q_tensor = to_cute_tensor(q, divisibility=head_dim)
@@ -151,6 +152,7 @@ def flash_attn_bwd_sm100(
             head_dim=head_dim,
             head_dim_v=head_dim_v,
             block_tile=block_tile,
+            max_topk=max_topk,
         )
 
         with torch.cuda.nvtx.range("flash_attn_bwd_sm100_compile"):
