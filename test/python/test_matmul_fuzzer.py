@@ -326,6 +326,42 @@ class ConfigGenerator:
         N = self.random_dim()
         K = self.random_dim()
 
+        # Degenerate / GEMV shapes. random_dim() squares a sqrt-range int then rounds up
+        # to a multiple of 8, so M/N/K are always >= 8 and never 1 — the matrix-vector
+        # (M=1 / N=1) and tiny-K corners are structurally unreachable. Force them ~12% of
+        # the time. Caught class: NVBug 5866266 (force_jit core dump on a degenerate
+        # matmul) and 5990039 (no engine for IDENTITY/degenerate matmul).
+        #
+        # OPT-IN (default off): enabling this surfaced a real FORT-native matmul illegal
+        # memory access on K=1 with an int8 operand + large M (SM90, dev 9.30 + rel 9.24;
+        # root-caused to get_kernel_access_size() unclamped — bug filed separately). An IMA
+        # corrupts the CUDA context and kills the test process (it cannot be caught as a
+        # skip), so this axis is gated behind MATMUL_FUZZ_DEGENERATE=1 until that backend
+        # bug is fixed, after which the default can be flipped on.
+        if os.environ.get("MATMUL_FUZZ_DEGENERATE", "0") == "1" and self.rng.random() < 0.12:
+            kind = self.rng.choice(['m1', 'n1', 'tiny_k', 'm1_tiny_k', 'k1'])
+            if kind == 'm1':
+                M = 1
+            elif kind == 'n1':
+                N = 1
+            elif kind == 'tiny_k':
+                K = self.rng.choice([1, 2, 4, 8, 16])
+            elif kind == 'm1_tiny_k':
+                M = 1; K = self.rng.choice([1, 8, 16])
+            else:  # k1
+                K = 1
+
+        # Unaligned leading dims (K/N not a multiple of 4). random_dim() rounds up to mult-of-8,
+        # so the bits_per_access<32 corner is normally unreachable -- that's where the FORT-native
+        # engine takes the LDG+STS smem-staging path, which over-runs for a widening cast (int8/fp8
+        # -> fp16/fp32): silent wrong-results when K is unaligned, IMA when N is. Opt-in (IMA aborts).
+        if os.environ.get("MATMUL_FUZZ_UNALIGNED", "0") == "1" and self.rng.random() < 0.15:
+            unaligned = self.rng.choice([1, 2, 3, 5, 6, 7, 9, 13, 17, 30])  # bpa<32 for 8-bit load
+            if self.rng.random() < 0.5:
+                K = unaligned
+            else:
+                N = unaligned
+
         # Data types - ensure compatible combinations
         if self.rng.random() < 0.8:
             # 80% of tests use same dtype for A and B (more stable)
@@ -492,8 +528,19 @@ def compute_reference(config: MatmulConfig, A: torch.Tensor, B: torch.Tensor, bi
 
 
 def run_cudnn_matmul(config: MatmulConfig, A: torch.Tensor, B: torch.Tensor, C: torch.Tensor,
-                     bias: Optional[torch.Tensor], cudnn_handle) -> Tuple[bool, str]:
-    """Run matmul using cuDNN and return success status and message."""
+                     bias: Optional[torch.Tensor], cudnn_handle,
+                     det_reruns: Optional[int] = None) -> Tuple[bool, str]:
+    """Run matmul using cuDNN and return success status and message.
+
+    If det_reruns > 0, re-execute the *same built plan* that many extra times into a
+    freshly garbage-poisoned output (and re-poisoned workspace) and assert the output
+    hash is identical run-to-run. This catches nondeterministic kernels (lost-update /
+    smem-pipeline races, uninitialized split-K workspace) without needing a golden ref
+    and without re-running heuristics. Caught class: NVBug 5897577 (sm120 matmul buffer
+    race), 6140341 (matmul-fuzzer numeric regression), 6217343-class.
+    """
+    if det_reruns is None:
+        det_reruns = int(os.environ.get("MATMUL_DET_RERUNS", "2"))
     try:
         stream = torch.cuda.current_stream().cuda_stream
         cudnn.set_stream(handle=cudnn_handle, stream=stream)
@@ -544,6 +591,15 @@ def run_cudnn_matmul(config: MatmulConfig, A: torch.Tensor, B: torch.Tensor, C: 
         # Build and execute
         graph.validate()
         graph.build_operation_graph()
+        if det_reruns > 0:
+            # The determinism rerun-assert below must only judge plans cuDNN declares
+            # deterministic: a legitimate FP-atomic split-K plan carries the
+            # NONDETERMINISTIC numeric note and is *expected* to vary run-to-run, so
+            # deselect those here to avoid a spurious determinism failure.
+            try:
+                graph.deselect_numeric_notes([cudnn.numerical_note.NONDETERMINISTIC])
+            except Exception:
+                pass
         graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
         graph.check_support()
         graph.build_plans(cudnn.build_plan_policy.HEURISTICS_CHOICE)
@@ -551,11 +607,15 @@ def run_cudnn_matmul(config: MatmulConfig, A: torch.Tensor, B: torch.Tensor, C: 
         # Allocate workspace and fill with garbage to catch uninitialized memory bugs
         workspace_size = graph.get_workspace_size()
         workspace = torch.empty(workspace_size, device='cuda', dtype=torch.uint8)
-        if workspace_size > 0:
-            # Fill with random garbage + some NaN patterns to test proper workspace init
-            workspace.random_(0, 256)
-            nan_mask = torch.rand(workspace_size, device='cuda') < 0.1
-            workspace[nan_mask] = 0xFF
+
+        def poison_workspace():
+            if workspace_size > 0:
+                # Fill with random garbage + some NaN patterns to test proper workspace init
+                workspace.random_(0, 256)
+                nan_mask = torch.rand(workspace_size, device='cuda') < 0.1
+                workspace[nan_mask] = 0xFF
+
+        poison_workspace()
 
         # Build variant pack
         variant_pack = {A_tensor: A, B_tensor: B, result: C}
@@ -565,6 +625,20 @@ def run_cudnn_matmul(config: MatmulConfig, A: torch.Tensor, B: torch.Tensor, C: 
         # Execute
         graph.execute(variant_pack, workspace, handle=cudnn_handle)
         torch.cuda.synchronize()
+
+        # Determinism check: re-execute the SAME plan into a re-poisoned output and
+        # workspace; the output hash must be bit-identical run-to-run.
+        if det_reruns > 0:
+            h0 = print_tensor_stats(C, tag=None)
+            for _ in range(det_reruns):
+                fill_with_garbage(C)            # re-poison output: kernel must fully overwrite
+                poison_workspace()              # re-poison workspace: catches uninit split-K
+                graph.execute(variant_pack, workspace, handle=cudnn_handle)
+                torch.cuda.synchronize()
+                hi = print_tensor_stats(C, tag=None)
+                if hi != h0:
+                    return False, (f"NONDETERMINISTIC output: hash 0x{h0 >> 32:08X} != "
+                                   f"0x{hi >> 32:08X} across reruns (same plan, re-poisoned)")
 
         return True, "success"
 
@@ -711,8 +785,8 @@ def get_test_params(request):
 
 
 # Fixed test list for default runs
-DEFAULT_NUM_TESTS = 2048
-DEFAULT_SEED = 42
+DEFAULT_NUM_TESTS = int(os.environ.get("MATMUL_NUM_TESTS", "2048"))
+DEFAULT_SEED = int(os.environ.get("MATMUL_FUZZ_SEED", "42"))
 TEST_PARAMS = tlist_with_configs(num_tests=DEFAULT_NUM_TESTS, rng_seed=DEFAULT_SEED)
 
 
