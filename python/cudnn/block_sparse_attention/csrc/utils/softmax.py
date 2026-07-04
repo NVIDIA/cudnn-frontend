@@ -99,6 +99,7 @@ class Softmax(ParamsBase):
 
         return row_scale
 
+
 @dataclass
 class SoftmaxSm100(Softmax):
     rescale_threshold: cutlass.Constexpr[float] = 0.0
