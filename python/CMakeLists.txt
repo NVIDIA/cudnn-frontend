@@ -104,13 +104,17 @@ else()
     add_compile_options(-fvisibility=hidden)
 endif()
 
+target_link_options(
+    _compiled_module
+    PRIVATE
+    -Wl,--no-as-needed
+    -Wl,--enable-new-dtags
+    -Wl,-rpath,'$ORIGIN',-rpath,'$ORIGIN/../lib',-rpath,'$ORIGIN/../nvidia/cudnn/lib'
+)
+
 set_target_properties(
     _compiled_module
-
     PROPERTIES
-    LINK_FLAGS "-Wl,--no-as-needed"
-    LINK_FLAGS "-Wl,--enable-new-dtags"
-    LINK_FLAGS "-Wl,-rpath,'$ORIGIN',-rpath,'$ORIGIN/../lib',-rpath,'$ORIGIN/../nvidia/cudnn/lib'"
     LINK_WHAT_YOU_USE TRUE
 )
 
