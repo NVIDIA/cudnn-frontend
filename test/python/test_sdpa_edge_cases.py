@@ -5,7 +5,6 @@ import torch
 from sdpa.fp16 import TensorUid, exec_sdpa
 from sdpa.random_config import ExecConfig
 
-
 ZERO_SEQLEN_CASES = [
     ([0, 128, 0, 128], [128, 128, 128, 128]),
     ([128, 128, 128, 128], [0, 128, 0, 128]),
@@ -101,6 +100,10 @@ def check_negative_results(tensors):
 
 
 @pytest.mark.L0
+@pytest.mark.skipif(
+    cudnn.backend_version() < 92500,
+    reason="zero sequence length SDPA requires cuDNN >= 9.25.0",
+)
 @pytest.mark.parametrize(
     ("seq_len_q", "seq_len_kv"),
     ZERO_SEQLEN_CASES,
@@ -118,8 +121,8 @@ def test_thd_zero_seqlen(seq_len_q, seq_len_kv, request, cudnn_handle):
 
 @pytest.mark.L0
 @pytest.mark.skipif(
-    cudnn.backend_version() < 92400,
-    reason="cu_seq_len_q/cu_seq_len_kv require cuDNN >= 9.24.0",
+    cudnn.backend_version() < 92500,
+    reason="zero sequence length SDPA requires cuDNN >= 9.25.0",
 )
 @pytest.mark.parametrize(
     ("seq_len_q", "seq_len_kv"),
@@ -156,7 +159,9 @@ def test_sdpa_col_all_inf(request, cudnn_handle):
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("data_type", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.parametrize(
+    "data_type", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"]
+)
 def test_sdpa_slightly_negative_row_max(data_type, request, cudnn_handle):
     cfg = make_edge_config(data_type=data_type)
     exec_sdpa(
