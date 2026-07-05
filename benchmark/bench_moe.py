@@ -2,13 +2,14 @@
 Benchmark MoE Grouped Matmul with LLM-inspired shapes.
 
 Usage:
-    python benchmarks/bench_moe.py
-    python benchmarks/bench_moe.py --bench swiglu --mode e2e
-    python benchmarks/bench_moe.py --bench swiglu --autotune 10
+    python benchmark/bench_moe.py
+    python benchmark/bench_moe.py --bench swiglu --mode e2e
+    python benchmark/bench_moe.py --bench swiglu --autotune 10
 """
 
 import argparse
 import statistics
+from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -265,11 +266,11 @@ def bench_grouped_gemm_glu_vs_cudnn(warmup: int, repeat: int):
     CuteDSL: BlockScaledMoEGroupedGemmGluBiasKernel (FP4 in, BF16 out, fused SwiGLU+AMAX)
     cuDNN:   fused graph (2x moe_grouped_matmul + swish + mul, BF16)
     """
-    import sys, os
+    import sys
 
-    _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    sys.path.insert(0, os.path.join(_REPO, "cudnn_frontend/test/python/fe_api"))
-    sys.path.insert(0, os.path.join(_REPO, "cudnn_frontend/test/python"))
+    _REPO = Path(__file__).resolve().parents[1]
+    sys.path.insert(0, str(_REPO / "test/python/fe_api"))
+    sys.path.insert(0, str(_REPO / "test/python"))
 
     print()
     print("=" * 130)
