@@ -126,12 +126,11 @@ TEST_CASE("sdpa_mxfp8_fprop", "[graph][sdpa][mxfp8][forward]") {
                                      .set_data_type(fe::DataType_t::FP8_E8M0)
                                      .set_reordering_type(fe::TensorReordering_t::F8_128x4));
 
-    // Block scale tensor for V (FP8_E8M0 with F8_128x4 reordering)
-    // V scales the s (sequence) dimension since BMM2 (S @ V) contracts on s_kv
-    // The contracting dimension (s_scale) must be contiguous, so use COL_MAJOR-like strides
-    auto SF_V_dims = std::vector<int64_t>({b, h, s_scale_padded, d_padded});
-    auto SF_V_strides =
-        std::vector<int64_t>({h * s_scale_padded * d_padded, s_scale_padded * d_padded, 1, s_scale_padded});
+    // Block scale tensor for V (FP8_E8M0, F8_128x4). V is block-scaled along s; declared
+    // d-contiguous (stride[3]==1) uniformly with SF_Q/SF_K -- the kernel reads SF via the
+    // F8_128x4 swizzle, so the declared inner stride is not load-bearing.
+    auto SF_V_dims    = std::vector<int64_t>({b, h, s_scale_padded, d_padded});
+    auto SF_V_strides = std::vector<int64_t>({h * s_scale_padded * d_padded, s_scale_padded * d_padded, d_padded, 1});
 
     auto SF_V = mha_graph.tensor(fe::graph::Tensor_attributes()
                                      .set_name("SF_V")

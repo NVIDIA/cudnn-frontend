@@ -40,7 +40,7 @@ TEST_CASE("Boolean CMP_GT and LOGICAL_AND fusion", "[membound][boolean][pointwis
         SKIP("Boolean fusion sample requires cuDNN backend 9.22.0 or newer at runtime.");
     }
     if (!is_blackwell_computing_arch()) {
-        SKIP("Boolean fusion (TensorIR MemBound engine) is only supported on SM100-SM109 (data center Blackwell)");
+        SKIP("Boolean fusion (TensorIR MemBound engine) is only supported on Blackwell (data center Blackwell)");
     }
 
     constexpr int64_t d0 = 4, d1 = 8, d2 = 16;
@@ -52,8 +52,8 @@ TEST_CASE("Boolean CMP_GT and LOGICAL_AND fusion", "[membound][boolean][pointwis
     constexpr int64_t s2 = 1;
 
     auto boolean_storage_type = fe::DataType_t::BOOLEAN;
-#if (CUDNN_VERSION >= 93000)
-    if (cudnn_frontend::detail::get_backend_version() >= 93000) {
+#if (CUDNN_VERSION >= 92500)
+    if (cudnn_frontend::detail::get_backend_version() >= 92500) {
         boolean_storage_type = fe::DataType_t::BYTE_BOOLEAN;
     }
 #endif

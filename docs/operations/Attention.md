@@ -684,6 +684,13 @@ dK.set_output(True).set_dim(k_gpu.shape).set_stride(k_gpu.stride())
 dV.set_output(True).set_dim(v_gpu.shape).set_stride(v_gpu.stride())
 ```
 
+### Block Sparse Attention FE OSS API
+
+The experimental [Block Sparse Attention API](../fe-oss-apis/bsa.md) provides
+CuTe DSL forward and explicit backward kernels driven by per-query-block lists
+of selected key/value blocks. It is a standalone Python FE OSS API and is
+separate from the cuDNN Graph API described above.
+
 (sdpa-forward-fe-oss-sm100-d256)=
 ### SDPA Forward FE OSS API (SM100, D=256)
 
