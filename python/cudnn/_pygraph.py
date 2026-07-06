@@ -364,10 +364,12 @@ class pygraph:
         becomes ambiguous and leaves the unique-name index."""
         if name == t.name:
             return
-        self._check_mutable("rename a tensor")
+        # NOT freeze-guarded: names are labels (classic allows renaming after
+        # build — the lowered graph already carries the old label, and labels
+        # have no execution semantics).
         if self._tensors.get(t.name) is t:
             del self._tensors[t.name]
-        t.name = name
+        object.__setattr__(t, "name", name)  # label write is exempt from the freeze
         if name in self._tensors or name in self._ambiguous_names:
             self._tensors.pop(name, None)
             self._ambiguous_names.add(name)
@@ -1224,6 +1226,10 @@ class pygraph:
             # provisional row-major; the backend keeps its classic per-op
             # layout inference (channels-last conv etc.) when the user did
             # not pin one.
+            # the label too: classic renames act on the SAME object the cpp
+            # graph holds, so the lowered graph carries the user's name
+            if out_t.name:
+                cpp_t.set_name(out_t.name)
             if out_t.dim_assigned and out_t.dim:
                 cpp_t.set_dim(out_t.dim)
             if out_t.stride_assigned and out_t.stride:
