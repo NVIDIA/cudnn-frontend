@@ -353,7 +353,7 @@ class ConfigGenerator:
 
         # Unaligned leading dims (K/N not a multiple of 4). random_dim() rounds up to mult-of-8,
         # so the bits_per_access<32 corner is normally unreachable -- that's where the FORT-native
-        # engine takes the LDG+STS smem-staging path, which over-runs for a widening cast (int8/fp8
+        # engine takes the global-to-shared memory staging path, which over-runs for a widening cast (int8/fp8
         # -> fp16/fp32): silent wrong-results when K is unaligned, IMA when N is. Opt-in (IMA aborts).
         if os.environ.get("MATMUL_FUZZ_UNALIGNED", "0") == "1" and self.rng.random() < 0.15:
             unaligned = self.rng.choice([1, 2, 3, 5, 6, 7, 9, 13, 17, 30])  # bpa<32 for 8-bit load

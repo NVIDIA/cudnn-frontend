@@ -241,7 +241,7 @@ class BlockSparseAttnBackwardPostprocess:
                 mdQaccum_cur = cute.domain_offset((padded_offset_q * self.tile_hdim,), mdQaccum[head_idx, None])
                 head_dim = mdQ.shape[2]
 
-                # HACK: Compiler doesn't seem to recognize that padding
+                # NOTE: Compiler doesn't seem to recognize that padding
                 # by padded_offset_q * self.tile_hdim keeps alignment
                 # since statically divisible by 4
 
