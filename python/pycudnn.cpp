@@ -158,7 +158,7 @@ PYBIND11_MODULE(_compiled_module, m) {
 
 #endif
 
-#if CUDNN_VERSION >= 92300
+#if CUDNN_VERSION >= 92400
     m.def("causal_conv1d_nwh_forward",
           [](std::intptr_t stream,
              std::intptr_t x_ptr,

@@ -39,6 +39,8 @@ TEST_CASE("Causal conv1d NWH forward", "[causal_conv1d_nwh][forward]") {
     SKIP("cudnn_subquadratic_ops.h not available");
 #elif defined(_MSC_VER)
     SKIP("Causal conv1d kernels are not supported on Windows (MSVC)");
+#elif CUDNN_VERSION < 92400
+    SKIP("Causal conv1d NWH kernels require cuDNN 9.24.0 or newer (compiled CUDNN_VERSION >= 92400).");
 #else
     if (is_arch_supported_by_cudnn() == false) {
         SKIP("Architecture is not supported by current cudnn version");
@@ -77,6 +79,8 @@ TEST_CASE("Causal conv1d NWH backward", "[causal_conv1d_nwh][backward]") {
     SKIP("cudnn_subquadratic_ops.h not available");
 #elif defined(_MSC_VER)
     SKIP("Causal conv1d kernels are not supported on Windows (MSVC)");
+#elif CUDNN_VERSION < 92400
+    SKIP("Causal conv1d NWH kernels require cuDNN 9.24.0 or newer (compiled CUDNN_VERSION >= 92400).");
 #else
     if (is_arch_supported_by_cudnn() == false) {
         SKIP("Architecture is not supported by current cudnn version");

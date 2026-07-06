@@ -39,6 +39,8 @@ TEST_CASE("B2B causal conv1d forward", "[b2b_causal_conv1d][forward]") {
     SKIP("cudnn_subquadratic_ops.h not available");
 #elif defined(_MSC_VER)
     SKIP("Causal conv1d kernels are not supported on Windows (MSVC)");
+#elif CUDNN_VERSION < 92400
+    SKIP("B2B causal conv1d kernels require cuDNN 9.24.0 or newer (compiled CUDNN_VERSION >= 92400).");
 #else
     if (is_arch_supported_by_cudnn() == false) {
         SKIP("Architecture is not supported by current cudnn version");
@@ -82,6 +84,8 @@ TEST_CASE("B2B causal conv1d backward", "[b2b_causal_conv1d][backward]") {
     SKIP("cudnn_subquadratic_ops.h not available");
 #elif defined(_MSC_VER)
     SKIP("Causal conv1d kernels are not supported on Windows (MSVC)");
+#elif CUDNN_VERSION < 92400
+    SKIP("B2B causal conv1d kernels require cuDNN 9.24.0 or newer (compiled CUDNN_VERSION >= 92400).");
 #else
     if (is_arch_supported_by_cudnn() == false) {
         SKIP("Architecture is not supported by current cudnn version");

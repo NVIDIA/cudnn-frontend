@@ -489,7 +489,9 @@ causal_conv1d_backward(cudaStream_t stream,
                           dw_data_type,
                           activation);
 }
+#endif
 
+#if CUDNN_VERSION >= 92400
 inline cudnnStatus_t
 causal_conv1d_nwh_forward(cudaStream_t stream,
                           const void *x,
