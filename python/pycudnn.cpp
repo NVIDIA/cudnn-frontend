@@ -156,9 +156,6 @@ PYBIND11_MODULE(_compiled_module, m) {
                   throw std::runtime_error("cudnnCausalConv1dBackward failed with status " + std::to_string(status));
           });
 
-#endif
-
-#if CUDNN_VERSION >= 92400
     m.def("causal_conv1d_nwh_forward",
           [](std::intptr_t stream,
              std::intptr_t x_ptr,
