@@ -17,13 +17,17 @@ _ACTIVATION_TO_INT = {
 
 def _dtype_to_int(dtype: torch.dtype) -> int:
     if dtype not in _TORCH_DTYPE_TO_CUDNN:
-        raise ValueError(f"Unsupported dtype {dtype}. Supported: float32, float16, bfloat16.")
+        raise ValueError(
+            f"Unsupported dtype {dtype}. Supported: float32, float16, bfloat16."
+        )
     return _TORCH_DTYPE_TO_CUDNN[dtype]
 
 
 def _activation_to_int(activation: str) -> int:
     if activation not in _ACTIVATION_TO_INT:
-        raise ValueError(f"Unsupported activation '{activation}'. Supported: 'identity', 'silu'.")
+        raise ValueError(
+            f"Unsupported activation '{activation}'. Supported: 'identity', 'silu'."
+        )
     return _ACTIVATION_TO_INT[activation]
 
 
@@ -39,15 +43,26 @@ def _activation_to_int(activation: str) -> int:
 )
 def _fwd_primitive(x: Tensor, weight: Tensor, bias: Tensor, activation: str) -> Tensor:
     if x.dim() != 3 or weight.dim() != 2 or bias.dim() != 1:
-        raise ValueError(f"Expected x(3D), weight(2D), bias(1D); got {x.shape}, {weight.shape}, {bias.shape}")
+        raise ValueError(
+            f"Expected x(3D), weight(2D), bias(1D); got {x.shape}, {weight.shape}, {bias.shape}"
+        )
 
     if not (x.is_cuda and weight.is_cuda and bias.is_cuda):
-        raise ValueError(f"All tensors must be on CUDA: x.device={x.device}, " f"weight.device={weight.device}, bias.device={bias.device}")
+        raise ValueError(
+            f"All tensors must be on CUDA: x.device={x.device}, "
+            f"weight.device={weight.device}, bias.device={bias.device}"
+        )
     if not (x.device == weight.device == bias.device):
-        raise ValueError(f"All tensors must be on the same device: x.device={x.device}, " f"weight.device={weight.device}, bias.device={bias.device}")
+        raise ValueError(
+            f"All tensors must be on the same device: x.device={x.device}, "
+            f"weight.device={weight.device}, bias.device={bias.device}"
+        )
 
     if not (x.dtype == weight.dtype == bias.dtype):
-        raise TypeError(f"Dtype mismatch: x.dtype={x.dtype}, weight.dtype={weight.dtype}, " f"bias.dtype={bias.dtype} (all must match)")
+        raise TypeError(
+            f"Dtype mismatch: x.dtype={x.dtype}, weight.dtype={weight.dtype}, "
+            f"bias.dtype={bias.dtype} (all must match)"
+        )
 
     x = x.contiguous()
     weight = weight.contiguous()
@@ -57,10 +72,16 @@ def _fwd_primitive(x: Tensor, weight: Tensor, bias: Tensor, activation: str) -> 
     kernel_size = weight.shape[1]
 
     if weight.shape[0] != dim:
-        raise ValueError(f"Channel mismatch: x has dim={dim} but weight has shape {weight.shape} " f"(expected weight.shape[0]={dim})")
+        raise ValueError(
+            f"Channel mismatch: x has dim={dim} but weight has shape {weight.shape} "
+            f"(expected weight.shape[0]={dim})"
+        )
 
     if bias.shape[0] != dim:
-        raise ValueError(f"Bias mismatch: x has dim={dim} but bias has shape {bias.shape} " f"(expected bias.shape[0]={dim})")
+        raise ValueError(
+            f"Bias mismatch: x has dim={dim} but bias has shape {bias.shape} "
+            f"(expected bias.shape[0]={dim})"
+        )
 
     y = torch.empty_like(x)
 
@@ -97,33 +118,59 @@ def _fwd_fake(x: Tensor, weight: Tensor, bias: Tensor, activation: str) -> Tenso
     mutates_args=(),
     device_types="cuda",
 )
-def _bwd_primitive(grad_out: Tensor, x: Tensor, weight: Tensor, bias: Tensor, activation: str) -> List[Tensor]:
+def _bwd_primitive(
+    grad_out: Tensor, x: Tensor, weight: Tensor, bias: Tensor, activation: str
+) -> List[Tensor]:
     if x.dim() != 3 or weight.dim() != 2 or bias.dim() != 1:
-        raise ValueError(f"Expected x(3D), weight(2D), bias(1D); got {x.shape}, {weight.shape}, {bias.shape}")
+        raise ValueError(
+            f"Expected x(3D), weight(2D), bias(1D); got {x.shape}, {weight.shape}, {bias.shape}"
+        )
     if grad_out.shape != x.shape:
-        raise ValueError(f"Shape mismatch: dy has shape {grad_out.shape} but x has shape {x.shape} " f"(expected dy.shape == x.shape)")
+        raise ValueError(
+            f"Shape mismatch: dy has shape {grad_out.shape} but x has shape {x.shape} "
+            f"(expected dy.shape == x.shape)"
+        )
     if not grad_out.is_cuda:
         raise ValueError(f"grad_out must be on CUDA: grad_out.device={grad_out.device}")
     if grad_out.device != x.device:
-        raise ValueError(f"Device mismatch: grad_out.device={grad_out.device}, x.device={x.device}")
+        raise ValueError(
+            f"Device mismatch: grad_out.device={grad_out.device}, x.device={x.device}"
+        )
     if grad_out.dtype != x.dtype:
-        raise ValueError(f"Dtype mismatch: grad_out.dtype={grad_out.dtype}, x.dtype={x.dtype}")
+        raise ValueError(
+            f"Dtype mismatch: grad_out.dtype={grad_out.dtype}, x.dtype={x.dtype}"
+        )
 
     if not (x.is_cuda and weight.is_cuda and bias.is_cuda):
-        raise ValueError(f"All tensors must be on CUDA: x.device={x.device}, " f"weight.device={weight.device}, bias.device={bias.device}")
+        raise ValueError(
+            f"All tensors must be on CUDA: x.device={x.device}, "
+            f"weight.device={weight.device}, bias.device={bias.device}"
+        )
     if not (x.device == weight.device == bias.device):
-        raise ValueError(f"All tensors must be on the same device: x.device={x.device}, " f"weight.device={weight.device}, bias.device={bias.device}")
+        raise ValueError(
+            f"All tensors must be on the same device: x.device={x.device}, "
+            f"weight.device={weight.device}, bias.device={bias.device}"
+        )
 
     if not (x.dtype == weight.dtype == bias.dtype):
-        raise TypeError(f"Dtype mismatch: x.dtype={x.dtype}, weight.dtype={weight.dtype}, " f"bias.dtype={bias.dtype} (all must match)")
+        raise TypeError(
+            f"Dtype mismatch: x.dtype={x.dtype}, weight.dtype={weight.dtype}, "
+            f"bias.dtype={bias.dtype} (all must match)"
+        )
 
     batch, dim, seq_len = x.shape
 
     if weight.shape[0] != dim:
-        raise ValueError(f"Channel mismatch: x has dim={dim} but weight has shape {weight.shape} " f"(expected weight.shape[0]={dim})")
+        raise ValueError(
+            f"Channel mismatch: x has dim={dim} but weight has shape {weight.shape} "
+            f"(expected weight.shape[0]={dim})"
+        )
 
     if bias.shape[0] != dim:
-        raise ValueError(f"Bias mismatch: x has dim={dim} but bias has shape {bias.shape} " f"(expected bias.shape[0]={dim})")
+        raise ValueError(
+            f"Bias mismatch: x has dim={dim} but bias has shape {bias.shape} "
+            f"(expected bias.shape[0]={dim})"
+        )
 
     x = x.contiguous()
     weight = weight.contiguous()
@@ -159,7 +206,9 @@ def _bwd_primitive(grad_out: Tensor, x: Tensor, weight: Tensor, bias: Tensor, ac
 
 
 @torch.library.register_fake("cudnn::causal_conv1d_bwd_primitive")
-def _bwd_fake(grad_out: Tensor, x: Tensor, weight: Tensor, bias: Tensor, activation: str) -> List[Tensor]:
+def _bwd_fake(
+    grad_out: Tensor, x: Tensor, weight: Tensor, bias: Tensor, activation: str
+) -> List[Tensor]:
     return [torch.empty_like(x), torch.empty_like(weight), torch.empty_like(bias)]
 
 
@@ -177,7 +226,9 @@ def _setup_context(ctx, inputs, output):
 @torch.compiler.allow_in_graph
 def _autograd_bwd(ctx, grad_out):
     x, weight, bias = ctx.saved_tensors
-    dx, dw, db = torch.ops.cudnn.causal_conv1d_bwd_primitive(grad_out, x, weight, bias, ctx.activation)
+    dx, dw, db = torch.ops.cudnn.causal_conv1d_bwd_primitive(
+        grad_out, x, weight, bias, ctx.activation
+    )
     return dx, dw, db, None
 
 
@@ -225,7 +276,9 @@ def causal_conv1d(
         torch.Tensor: Output of shape ``(batch, dim, seq_len)``, same dtype as *x*.
     """
     if activation not in _ACTIVATION_TO_INT:
-        raise ValueError(f"Unsupported activation '{activation}'. Supported: 'identity', 'silu'.")
+        raise ValueError(
+            f"Unsupported activation '{activation}'. Supported: 'identity', 'silu'."
+        )
     if bias is None:
         bias = torch.zeros(weight.shape[0], device=x.device, dtype=x.dtype)
     return torch.ops.cudnn.causal_conv1d_fwd_primitive(x, weight, bias, activation)
@@ -246,17 +299,30 @@ def causal_conv1d(
     mutates_args=(),
     device_types="cuda",
 )
-def _nwh_fwd_primitive(x: Tensor, weight: Tensor, bias: Tensor, activation: str) -> Tensor:
+def _nwh_fwd_primitive(
+    x: Tensor, weight: Tensor, bias: Tensor, activation: str
+) -> Tensor:
     if x.dim() != 3 or weight.dim() != 2 or bias.dim() != 1:
-        raise ValueError(f"Expected x(3D), weight(2D), bias(1D); got {x.shape}, {weight.shape}, {bias.shape}")
+        raise ValueError(
+            f"Expected x(3D), weight(2D), bias(1D); got {x.shape}, {weight.shape}, {bias.shape}"
+        )
 
     if not (x.is_cuda and weight.is_cuda and bias.is_cuda):
-        raise ValueError(f"All tensors must be on CUDA: x.device={x.device}, " f"weight.device={weight.device}, bias.device={bias.device}")
+        raise ValueError(
+            f"All tensors must be on CUDA: x.device={x.device}, "
+            f"weight.device={weight.device}, bias.device={bias.device}"
+        )
     if not (x.device == weight.device == bias.device):
-        raise ValueError(f"All tensors must be on the same device: x.device={x.device}, " f"weight.device={weight.device}, bias.device={bias.device}")
+        raise ValueError(
+            f"All tensors must be on the same device: x.device={x.device}, "
+            f"weight.device={weight.device}, bias.device={bias.device}"
+        )
 
     if not (x.dtype == weight.dtype == bias.dtype):
-        raise TypeError(f"Dtype mismatch: x.dtype={x.dtype}, weight.dtype={weight.dtype}, " f"bias.dtype={bias.dtype} (all must match)")
+        raise TypeError(
+            f"Dtype mismatch: x.dtype={x.dtype}, weight.dtype={weight.dtype}, "
+            f"bias.dtype={bias.dtype} (all must match)"
+        )
 
     x = x.contiguous()
     weight = weight.contiguous()
@@ -266,10 +332,16 @@ def _nwh_fwd_primitive(x: Tensor, weight: Tensor, bias: Tensor, activation: str)
     kernel_size = weight.shape[0]
 
     if weight.shape[1] != dim:
-        raise ValueError(f"Channel mismatch: x has dim={dim} but weight has shape {weight.shape} " f"(expected weight.shape[1]={dim})")
+        raise ValueError(
+            f"Channel mismatch: x has dim={dim} but weight has shape {weight.shape} "
+            f"(expected weight.shape[1]={dim})"
+        )
 
     if bias.shape[0] != dim:
-        raise ValueError(f"Bias mismatch: x has dim={dim} but bias has shape {bias.shape} " f"(expected bias.shape[0]={dim})")
+        raise ValueError(
+            f"Bias mismatch: x has dim={dim} but bias has shape {bias.shape} "
+            f"(expected bias.shape[0]={dim})"
+        )
 
     y = torch.empty_like(x)
 
@@ -306,33 +378,59 @@ def _nwh_fwd_fake(x: Tensor, weight: Tensor, bias: Tensor, activation: str) -> T
     mutates_args=(),
     device_types="cuda",
 )
-def _nwh_bwd_primitive(grad_out: Tensor, x: Tensor, weight: Tensor, bias: Tensor, activation: str) -> List[Tensor]:
+def _nwh_bwd_primitive(
+    grad_out: Tensor, x: Tensor, weight: Tensor, bias: Tensor, activation: str
+) -> List[Tensor]:
     if x.dim() != 3 or weight.dim() != 2 or bias.dim() != 1:
-        raise ValueError(f"Expected x(3D), weight(2D), bias(1D); got {x.shape}, {weight.shape}, {bias.shape}")
+        raise ValueError(
+            f"Expected x(3D), weight(2D), bias(1D); got {x.shape}, {weight.shape}, {bias.shape}"
+        )
     if grad_out.shape != x.shape:
-        raise ValueError(f"Shape mismatch: dy has shape {grad_out.shape} but x has shape {x.shape} " f"(expected dy.shape == x.shape)")
+        raise ValueError(
+            f"Shape mismatch: dy has shape {grad_out.shape} but x has shape {x.shape} "
+            f"(expected dy.shape == x.shape)"
+        )
     if not grad_out.is_cuda:
         raise ValueError(f"grad_out must be on CUDA: grad_out.device={grad_out.device}")
     if grad_out.device != x.device:
-        raise ValueError(f"Device mismatch: grad_out.device={grad_out.device}, x.device={x.device}")
+        raise ValueError(
+            f"Device mismatch: grad_out.device={grad_out.device}, x.device={x.device}"
+        )
     if grad_out.dtype != x.dtype:
-        raise ValueError(f"Dtype mismatch: grad_out.dtype={grad_out.dtype}, x.dtype={x.dtype}")
+        raise ValueError(
+            f"Dtype mismatch: grad_out.dtype={grad_out.dtype}, x.dtype={x.dtype}"
+        )
 
     if not (x.is_cuda and weight.is_cuda and bias.is_cuda):
-        raise ValueError(f"All tensors must be on CUDA: x.device={x.device}, " f"weight.device={weight.device}, bias.device={bias.device}")
+        raise ValueError(
+            f"All tensors must be on CUDA: x.device={x.device}, "
+            f"weight.device={weight.device}, bias.device={bias.device}"
+        )
     if not (x.device == weight.device == bias.device):
-        raise ValueError(f"All tensors must be on the same device: x.device={x.device}, " f"weight.device={weight.device}, bias.device={bias.device}")
+        raise ValueError(
+            f"All tensors must be on the same device: x.device={x.device}, "
+            f"weight.device={weight.device}, bias.device={bias.device}"
+        )
 
     if not (x.dtype == weight.dtype == bias.dtype):
-        raise TypeError(f"Dtype mismatch: x.dtype={x.dtype}, weight.dtype={weight.dtype}, " f"bias.dtype={bias.dtype} (all must match)")
+        raise TypeError(
+            f"Dtype mismatch: x.dtype={x.dtype}, weight.dtype={weight.dtype}, "
+            f"bias.dtype={bias.dtype} (all must match)"
+        )
 
     batch, seq_len, dim = x.shape
 
     if weight.shape[1] != dim:
-        raise ValueError(f"Channel mismatch: x has dim={dim} but weight has shape {weight.shape} " f"(expected weight.shape[1]={dim})")
+        raise ValueError(
+            f"Channel mismatch: x has dim={dim} but weight has shape {weight.shape} "
+            f"(expected weight.shape[1]={dim})"
+        )
 
     if bias.shape[0] != dim:
-        raise ValueError(f"Bias mismatch: x has dim={dim} but bias has shape {bias.shape} " f"(expected bias.shape[0]={dim})")
+        raise ValueError(
+            f"Bias mismatch: x has dim={dim} but bias has shape {bias.shape} "
+            f"(expected bias.shape[0]={dim})"
+        )
 
     x = x.contiguous()
     weight = weight.contiguous()
@@ -368,7 +466,9 @@ def _nwh_bwd_primitive(grad_out: Tensor, x: Tensor, weight: Tensor, bias: Tensor
 
 
 @torch.library.register_fake("cudnn::causal_conv1d_nwh_bwd_primitive")
-def _nwh_bwd_fake(grad_out: Tensor, x: Tensor, weight: Tensor, bias: Tensor, activation: str) -> List[Tensor]:
+def _nwh_bwd_fake(
+    grad_out: Tensor, x: Tensor, weight: Tensor, bias: Tensor, activation: str
+) -> List[Tensor]:
     return [torch.empty_like(x), torch.empty_like(weight), torch.empty_like(bias)]
 
 
@@ -386,7 +486,9 @@ def _nwh_setup_context(ctx, inputs, output):
 @torch.compiler.allow_in_graph
 def _nwh_autograd_bwd(ctx, grad_out):
     x, weight, bias = ctx.saved_tensors
-    dx, dw, db = torch.ops.cudnn.causal_conv1d_nwh_bwd_primitive(grad_out, x, weight, bias, ctx.activation)
+    dx, dw, db = torch.ops.cudnn.causal_conv1d_nwh_bwd_primitive(
+        grad_out, x, weight, bias, ctx.activation
+    )
     return dx, dw, db, None
 
 
@@ -424,7 +526,9 @@ def causal_conv1d_nwh(
         torch.Tensor: Output of shape ``(batch, seq_len, dim)``.
     """
     if activation not in _ACTIVATION_TO_INT:
-        raise ValueError(f"Unsupported activation '{activation}'. Supported: 'identity', 'silu'.")
+        raise ValueError(
+            f"Unsupported activation '{activation}'. Supported: 'identity', 'silu'."
+        )
     if bias is None:
         bias = torch.zeros(weight.shape[1], device=x.device, dtype=x.dtype)
     return torch.ops.cudnn.causal_conv1d_nwh_fwd_primitive(x, weight, bias, activation)
@@ -445,9 +549,13 @@ def causal_conv1d_nwh(
     mutates_args=(),
     device_types="cuda",
 )
-def _b2b_fwd_primitive(x: Tensor, weights_proj: Tensor, weights_mixer: Tensor, skip_bias: Tensor) -> Tuple[Tensor, Tensor]:
+def _b2b_fwd_primitive(
+    x: Tensor, weights_proj: Tensor, weights_mixer: Tensor, skip_bias: Tensor
+) -> Tuple[Tensor, Tensor]:
     if x.dim() != 3:
-        raise ValueError(f"Expected x(3D) with shape (batch, 3*dim, seq_len); got {x.shape}")
+        raise ValueError(
+            f"Expected x(3D) with shape (batch, 3*dim, seq_len); got {x.shape}"
+        )
     batch = x.shape[0]
     if x.shape[1] % 3 != 0:
         raise ValueError(f"Expected x.shape[1] divisible by 3; got {x.shape[1]}")
@@ -455,24 +563,41 @@ def _b2b_fwd_primitive(x: Tensor, weights_proj: Tensor, weights_mixer: Tensor, s
     seq_len = x.shape[2]
 
     if weights_proj.dim() != 2 or weights_mixer.dim() != 2 or skip_bias.dim() != 1:
-        raise ValueError(f"Expected weights_proj(2D: 3*dim,K_proj), weights_mixer(2D: dim,K_mixer), skip_bias(1D: dim); "
-                         f"got {weights_proj.shape}, {weights_mixer.shape}, {skip_bias.shape}")
+        raise ValueError(
+            f"Expected weights_proj(2D: 3*dim,K_proj), weights_mixer(2D: dim,K_mixer), skip_bias(1D: dim); "
+            f"got {weights_proj.shape}, {weights_mixer.shape}, {skip_bias.shape}"
+        )
 
-    if not (x.is_cuda and weights_proj.is_cuda and weights_mixer.is_cuda and skip_bias.is_cuda):
+    if not (
+        x.is_cuda
+        and weights_proj.is_cuda
+        and weights_mixer.is_cuda
+        and skip_bias.is_cuda
+    ):
         raise ValueError("All tensors must be on CUDA")
-    if not (x.device == weights_proj.device == weights_mixer.device == skip_bias.device):
+    if not (
+        x.device == weights_proj.device == weights_mixer.device == skip_bias.device
+    ):
         raise ValueError("All tensors must be on the same device")
 
     if not (x.dtype == weights_proj.dtype == weights_mixer.dtype == skip_bias.dtype):
-        raise TypeError(f"Dtype mismatch: x.dtype={x.dtype}, weights_proj.dtype={weights_proj.dtype}, "
-                        f"weights_mixer.dtype={weights_mixer.dtype}, skip_bias.dtype={skip_bias.dtype}")
+        raise TypeError(
+            f"Dtype mismatch: x.dtype={x.dtype}, weights_proj.dtype={weights_proj.dtype}, "
+            f"weights_mixer.dtype={weights_mixer.dtype}, skip_bias.dtype={skip_bias.dtype}"
+        )
 
     if weights_proj.shape[0] != 3 * dim:
-        raise ValueError(f"Channel mismatch: x has 3*dim={3*dim} but weights_proj has shape {weights_proj.shape}")
+        raise ValueError(
+            f"Channel mismatch: x has 3*dim={3*dim} but weights_proj has shape {weights_proj.shape}"
+        )
     if weights_mixer.shape[0] != dim:
-        raise ValueError(f"Channel mismatch: x has dim={dim} but weights_mixer has shape {weights_mixer.shape}")
+        raise ValueError(
+            f"Channel mismatch: x has dim={dim} but weights_mixer has shape {weights_mixer.shape}"
+        )
     if skip_bias.shape[0] != dim:
-        raise ValueError(f"Channel mismatch: x has dim={dim} but skip_bias has shape {skip_bias.shape}")
+        raise ValueError(
+            f"Channel mismatch: x has dim={dim} but skip_bias has shape {skip_bias.shape}"
+        )
 
     x = x.contiguous()
     weights_proj = weights_proj.contiguous()
@@ -506,7 +631,9 @@ def _b2b_fwd_primitive(x: Tensor, weights_proj: Tensor, weights_mixer: Tensor, s
 
 
 @torch.library.register_fake("cudnn::b2b_causal_conv1d_fwd_primitive")
-def _b2b_fwd_fake(x: Tensor, weights_proj: Tensor, weights_mixer: Tensor, skip_bias: Tensor) -> Tuple[Tensor, Tensor]:
+def _b2b_fwd_fake(
+    x: Tensor, weights_proj: Tensor, weights_mixer: Tensor, skip_bias: Tensor
+) -> Tuple[Tensor, Tensor]:
     batch = x.shape[0]
     dim = x.shape[1] // 3
     seq_len = x.shape[2]
@@ -526,7 +653,12 @@ def _b2b_fwd_fake(x: Tensor, weights_proj: Tensor, weights_mixer: Tensor, skip_b
     device_types="cuda",
 )
 def _b2b_bwd_primitive(
-    grad_y: Tensor, x: Tensor, weights_proj: Tensor, weights_mixer: Tensor, skip_bias: Tensor, y: Tensor
+    grad_y: Tensor,
+    x: Tensor,
+    weights_proj: Tensor,
+    weights_mixer: Tensor,
+    skip_bias: Tensor,
+    y: Tensor,
 ) -> List[Tensor]:
     batch = x.shape[0]
     dim = x.shape[1] // 3
@@ -537,7 +669,9 @@ def _b2b_bwd_primitive(
     if not grad_y.is_cuda:
         raise ValueError(f"grad_y must be on CUDA: grad_y.device={grad_y.device}")
     if grad_y.dtype != x.dtype:
-        raise ValueError(f"Dtype mismatch: grad_y.dtype={grad_y.dtype}, x.dtype={x.dtype}")
+        raise ValueError(
+            f"Dtype mismatch: grad_y.dtype={grad_y.dtype}, x.dtype={x.dtype}"
+        )
 
     x = x.contiguous()
     weights_proj = weights_proj.contiguous()
@@ -550,8 +684,12 @@ def _b2b_bwd_primitive(
     kernel_size_mixer = weights_mixer.shape[1]
 
     dx = torch.empty_like(x)
-    dweights_proj = torch.zeros(weights_proj.shape, device=x.device, dtype=torch.float32)
-    dweights_mixer = torch.zeros(weights_mixer.shape, device=x.device, dtype=torch.float32)
+    dweights_proj = torch.zeros(
+        weights_proj.shape, device=x.device, dtype=torch.float32
+    )
+    dweights_mixer = torch.zeros(
+        weights_mixer.shape, device=x.device, dtype=torch.float32
+    )
     dskip_bias = torch.zeros(skip_bias.shape, device=x.device, dtype=torch.float32)
 
     import cudnn
@@ -576,14 +714,29 @@ def _b2b_bwd_primitive(
         _dtype_to_int(x.dtype),
         _dtype_to_int(torch.float32),
     )
-    return [dx, dweights_proj.to(x.dtype), dweights_mixer.to(x.dtype), dskip_bias.to(x.dtype)]
+    return [
+        dx,
+        dweights_proj.to(x.dtype),
+        dweights_mixer.to(x.dtype),
+        dskip_bias.to(x.dtype),
+    ]
 
 
 @torch.library.register_fake("cudnn::b2b_causal_conv1d_bwd_primitive")
 def _b2b_bwd_fake(
-    grad_y: Tensor, x: Tensor, weights_proj: Tensor, weights_mixer: Tensor, skip_bias: Tensor, y: Tensor
+    grad_y: Tensor,
+    x: Tensor,
+    weights_proj: Tensor,
+    weights_mixer: Tensor,
+    skip_bias: Tensor,
+    y: Tensor,
 ) -> List[Tensor]:
-    return [torch.empty_like(x), torch.empty_like(weights_proj), torch.empty_like(weights_mixer), torch.empty_like(skip_bias)]
+    return [
+        torch.empty_like(x),
+        torch.empty_like(weights_proj),
+        torch.empty_like(weights_mixer),
+        torch.empty_like(skip_bias),
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -643,5 +796,7 @@ def b2b_causal_conv1d(
         torch.Tensor: ``y_gated`` of shape ``(batch, dim, seq_len)`` — the
         post-gated final output of the fused Hyena-SE block.
     """
-    _, y_gated = torch.ops.cudnn.b2b_causal_conv1d_fwd_primitive(x, weights_proj, weights_mixer, skip_bias)
+    _, y_gated = torch.ops.cudnn.b2b_causal_conv1d_fwd_primitive(
+        x, weights_proj, weights_mixer, skip_bias
+    )
     return y_gated
