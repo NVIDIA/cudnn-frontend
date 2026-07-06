@@ -37,6 +37,19 @@ def _sm100_device(jax):
     pytest.skip("JAX SM100+ device is not available")
 
 
+def _swiglu_reference(jax, jnp, a, b, alpha):
+    ab12 = alpha * jnp.einsum(
+        "lmk,lnk->lmn",
+        a.astype(jnp.float32),
+        b.astype(jnp.float32),
+    )
+    batch, m, n = ab12.shape
+    blocks = ab12.reshape(batch, m, n // 32, 32)
+    input_blocks = blocks[:, :, 0::2].reshape(batch, m, n // 2)
+    gate_blocks = blocks[:, :, 1::2].reshape(batch, m, n // 2)
+    return ab12, input_blocks * gate_blocks * jax.nn.sigmoid(gate_blocks)
+
+
 @pytest.mark.L0
 def test_jax_dense_gemm_abstract_shapes():
     jax, jnp = _jax_dependencies()
@@ -66,6 +79,51 @@ def test_jax_dense_gemm_abstract_shapes():
     scales = jax.ShapeDtypeStruct((32, 4, 2, 4, 4, 2), jnp.float8_e8m0fnu)
     prob = jax.ShapeDtypeStruct((256, 1, 2), jnp.float32)
     c = jax.ShapeDtypeStruct((2, 256, 256), jnp.bfloat16)
+
+    swiglu_mxfp8 = jax.eval_shape(
+        lambda a, b, sfa, sfb: gemm_swiglu_wrapper_sm100(
+            a,
+            b,
+            sfa_tensor=sfa,
+            sfb_tensor=sfb,
+            sf_vec_size=32,
+            ab12_dtype=jnp.bfloat16,
+            c_dtype=jnp.bfloat16,
+        ),
+        a_fp8,
+        b_fp8,
+        scales,
+        scales,
+    )
+    assert swiglu_mxfp8["ab12_tensor"].shape == (2, 256, 256)
+    assert swiglu_mxfp8["ab12_tensor"].dtype == jnp.bfloat16
+    assert swiglu_mxfp8["c_tensor"].shape == (2, 256, 128)
+    assert swiglu_mxfp8["c_tensor"].dtype == jnp.bfloat16
+    assert swiglu_mxfp8["sfc_tensor"] is None
+    assert swiglu_mxfp8["amax_tensor"] is None
+
+    a_fp4 = jax.ShapeDtypeStruct((1, 128, 128), jnp.float4_e2m1fn)
+    b_fp4 = jax.ShapeDtypeStruct((1, 128, 128), jnp.float4_e2m1fn)
+    fp4_scales = jax.ShapeDtypeStruct((32, 4, 1, 4, 2, 1), jnp.float8_e4m3fn)
+    swiglu_fp4 = jax.eval_shape(
+        lambda a, b, sfa, sfb: gemm_swiglu_wrapper_sm100(
+            a,
+            b,
+            sfa_tensor=sfa,
+            sfb_tensor=sfb,
+            sf_vec_size=16,
+            c_dtype=jnp.bfloat16,
+        ),
+        a_fp4,
+        b_fp4,
+        fp4_scales,
+        fp4_scales,
+    )
+    assert swiglu_fp4["ab12_tensor"].shape == (1, 128, 128)
+    assert swiglu_fp4["c_tensor"].shape == (1, 128, 64)
+    assert swiglu_fp4["amax_tensor"].shape == (1, 1, 1)
+    assert swiglu_fp4["amax_tensor"].dtype == jnp.float32
+    assert swiglu_fp4["sfc_tensor"] is None
 
     amax = jax.eval_shape(
         gemm_amax_wrapper_sm100,
@@ -172,6 +230,150 @@ def test_jax_gemm_swiglu_jit():
             atol=8e-2,
             rtol=3e-2,
         )
+
+
+@pytest.mark.L0
+def test_jax_gemm_swiglu_mxfp8_jit():
+    jax, jnp = _jax_dependencies()
+    device = _sm100_device(jax)
+
+    from cudnn.jax import gemm_swiglu_wrapper_sm100
+
+    m = n = k = 128
+    batch = 1
+    a = jax.device_put(
+        jax.random.uniform(
+            jax.random.key(8),
+            (batch, m, k),
+            dtype=jnp.float32,
+            minval=-0.25,
+            maxval=0.25,
+        ).astype(jnp.float8_e4m3fn),
+        device,
+    )
+    b = jax.device_put(
+        jax.random.uniform(
+            jax.random.key(9),
+            (batch, n, k),
+            dtype=jnp.float32,
+            minval=-0.25,
+            maxval=0.25,
+        ).astype(jnp.float8_e4m3fn),
+        device,
+    )
+    scales = jax.device_put(
+        jnp.ones((32, 4, 1, 4, 1, batch), dtype=jnp.float32).astype(jnp.float8_e8m0fnu),
+        device,
+    )
+
+    @jax.jit
+    def run(a, b, sfa, sfb):
+        return gemm_swiglu_wrapper_sm100(
+            a,
+            b,
+            sfa_tensor=sfa,
+            sfb_tensor=sfb,
+            sf_vec_size=32,
+            ab12_dtype=jnp.bfloat16,
+            c_dtype=jnp.bfloat16,
+            vector_f32=True,
+            ab12_stages=3,
+        )
+
+    lowered = run.lower(a, b, scales, scales)
+    stablehlo = lowered.as_text("stablehlo")
+    assert stablehlo.count("stablehlo.custom_call") == 1
+    assert "CuteDSLRT_NvJaxCutlassCall" in stablehlo
+    result = lowered.compile()(a, b, scales, scales)
+    result["c_tensor"].block_until_ready()
+
+    expected_ab12, expected_c = _swiglu_reference(jax, jnp, a, b, 1.0)
+    assert jnp.allclose(
+        result["ab12_tensor"].astype(jnp.float32),
+        expected_ab12,
+        atol=3e-1,
+        rtol=5e-2,
+    )
+    assert jnp.allclose(
+        result["c_tensor"].astype(jnp.float32),
+        expected_c,
+        atol=5e-1,
+        rtol=8e-2,
+    )
+    assert result["sfc_tensor"] is None
+    assert result["amax_tensor"] is None
+
+
+@pytest.mark.L0
+def test_jax_gemm_swiglu_native_fp4_amax_jit():
+    jax, jnp = _jax_dependencies()
+    device = _sm100_device(jax)
+
+    from cudnn.jax import gemm_swiglu_wrapper_sm100
+
+    m = n = k = 128
+    batch = 1
+    a = jax.device_put(
+        jax.random.uniform(
+            jax.random.key(10),
+            (batch, m, k),
+            dtype=jnp.float32,
+            minval=-1.0,
+            maxval=1.0,
+        ).astype(jnp.float4_e2m1fn),
+        device,
+    )
+    b = jax.device_put(
+        jax.random.uniform(
+            jax.random.key(11),
+            (batch, n, k),
+            dtype=jnp.float32,
+            minval=-1.0,
+            maxval=1.0,
+        ).astype(jnp.float4_e2m1fn),
+        device,
+    )
+    scales = jax.device_put(
+        jnp.ones((32, 4, 1, 4, 2, batch), dtype=jnp.float32).astype(jnp.float8_e4m3fn),
+        device,
+    )
+
+    @jax.jit
+    def run(a, b, sfa, sfb):
+        return gemm_swiglu_wrapper_sm100(
+            a,
+            b,
+            sfa_tensor=sfa,
+            sfb_tensor=sfb,
+            sf_vec_size=16,
+            ab12_dtype=jnp.float32,
+            c_dtype=jnp.bfloat16,
+        )
+
+    lowered = run.lower(a, b, scales, scales)
+    stablehlo = lowered.as_text("stablehlo")
+    assert stablehlo.count("stablehlo.custom_call") == 1
+    assert "CuteDSLRT_NvJaxCutlassCall" in stablehlo
+    compiled = lowered.compile()
+
+    result = compiled(a, b, scales, scales)
+    result["amax_tensor"].block_until_ready()
+    expected_ab12, expected_c = _swiglu_reference(jax, jnp, a, b, 1.0)
+    expected_amax = jnp.max(jnp.abs(expected_c)).reshape(1, 1, 1)
+    assert jnp.allclose(result["ab12_tensor"], expected_ab12, atol=2e-1, rtol=3e-2)
+    assert jnp.allclose(
+        result["c_tensor"].astype(jnp.float32),
+        expected_c,
+        atol=5e-1,
+        rtol=5e-2,
+    )
+    assert jnp.allclose(result["amax_tensor"], expected_amax, atol=5e-1, rtol=5e-2)
+    assert result["sfc_tensor"] is None
+
+    zero_result = compiled(a, jnp.zeros_like(b), scales, scales)
+    zero_result["amax_tensor"].block_until_ready()
+    assert jnp.array_equal(zero_result["c_tensor"], jnp.zeros_like(zero_result["c_tensor"]))
+    assert jnp.array_equal(zero_result["amax_tensor"], jnp.zeros_like(zero_result["amax_tensor"]))
 
 
 @pytest.mark.L0

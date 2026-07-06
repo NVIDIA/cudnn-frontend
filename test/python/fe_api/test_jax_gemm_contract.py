@@ -145,6 +145,8 @@ class JaxGemmContractTest(unittest.TestCase):
         cls.float8_e4m3fn = _DType("float8_e4m3fn", 1)
         cls.float8_e5m2 = _DType("float8_e5m2", 1)
         cls.float8_e8m0fnu = _DType("float8_e8m0fnu", 1)
+        cls.float4_e2m1fn = _DType("float4_e2m1fn", 1)
+        cls.uint8 = _DType("uint8", 1)
 
         cls.fake_jnp = types.ModuleType("jax.numpy")
         for name in (
@@ -154,6 +156,8 @@ class JaxGemmContractTest(unittest.TestCase):
             "float8_e4m3fn",
             "float8_e5m2",
             "float8_e8m0fnu",
+            "float4_e2m1fn",
+            "uint8",
         ):
             setattr(cls.fake_jnp, name, getattr(cls, name))
         cls.fake_jnp.dtype = lambda value: value
@@ -170,6 +174,8 @@ class JaxGemmContractTest(unittest.TestCase):
         cls.fake_cutlass = types.ModuleType("cutlass")
         cls.fake_cutlass.__path__ = []
         cls.fake_cutlass.Constexpr = object
+        cls.fake_cutlass.Float32 = float
+        cls.fake_cutlass.utils = types.SimpleNamespace(HardwareInfo=lambda: types.SimpleNamespace(get_max_active_clusters=lambda _cluster_size: 8))
         cls.fake_cutlass_jax = types.ModuleType("cutlass.jax")
         cls.fake_cutlass_jax.is_available = lambda: True
         cls.fake_cutlass_jax.TensorSpec = _TensorSpec
@@ -195,9 +201,19 @@ class JaxGemmContractTest(unittest.TestCase):
         cls.quantized_swiglu_capabilities = _kernel_capabilities(
             _CUDNN_ROOT / "gemm_swiglu" / "dense_blockscaled_gemm_persistent_swiglu_interleaved_quant.py",
             "Sm100BlockScaledPersistentDenseGemmKernel",
-            _COMMON_KERNEL_CAPABILITIES | {"SWIGLU_BLOCK_COLUMNS", "SWIGLU_BLOCKS_PER_PAIR"},
+            _COMMON_KERNEL_CAPABILITIES | {"SF_VEC_SIZES", "SWIGLU_BLOCK_COLUMNS", "SWIGLU_BLOCKS_PER_PAIR"},
             _COMMON_KERNEL_METHODS | {"get_output_n"},
         )
+        cls.quantized_swiglu_capabilities.calls = []
+
+        def init_quantized_kernel(instance, **kwargs):
+            instance.config = kwargs
+
+        def call_quantized_kernel(instance, *args):
+            type(instance).calls.append((instance.config, args))
+
+        cls.quantized_swiglu_capabilities.__init__ = init_quantized_kernel
+        cls.quantized_swiglu_capabilities.__call__ = call_quantized_kernel
         cls.srelu_capabilities = _kernel_capabilities(
             _CUDNN_ROOT / "gemm_srelu" / "dense_blockscaled_gemm_persistent_srelu_quant.py",
             "Sm100BlockScaledPersistentDenseGemmKernel",
@@ -222,6 +238,11 @@ class JaxGemmContractTest(unittest.TestCase):
                 "gemm_swiglu.dense_gemm_persistent_swiglu",
                 "PersistentDenseGemmKernel",
                 cls.swiglu_capabilities,
+            ),
+            (
+                "gemm_swiglu.dense_blockscaled_gemm_persistent_swiglu_interleaved_quant",
+                "Sm100BlockScaledPersistentDenseGemmKernel",
+                cls.quantized_swiglu_capabilities,
             ),
             (
                 "gemm_amax.dense_blockscaled_gemm_persistent_amax",
@@ -459,17 +480,199 @@ class JaxGemmContractTest(unittest.TestCase):
         )
         self.assertEqual(tuple(result.keys()), ("c_tensor", "amax_tensor"))
 
-    def test_swiglu_rejects_quantized_arguments(self):
-        a = _Array((1, 128, 128), self.bfloat16)
-        b = _Array((1, 128, 128), self.bfloat16)
-        scale = _Array((1,), self.float8_e8m0fnu)
+    def test_swiglu_declares_mxfp8_quantized_call(self):
+        captured = {}
+        a = _Array((1, 128, 128), self.float8_e4m3fn)
+        b = _Array((1, 128, 128), self.float8_e4m3fn)
+        sfa = _Array((32, 4, 1, 4, 1, 1), self.float8_e8m0fnu)
+        sfb = _Array((32, 4, 1, 4, 1, 1), self.float8_e8m0fnu)
         with (
             self._optional_modules(),
-            self.assertRaisesRegex(NotImplementedError, "unquantized path"),
-            mock.patch.object(self.swiglu, "call_cutedsl") as lower,
+            mock.patch.object(
+                self.swiglu,
+                "call_cutedsl",
+                side_effect=self._fake_call(captured),
+            ),
         ):
-            self.swiglu.gemm_swiglu_wrapper_sm100(a, b, sfa_tensor=scale, sfb_tensor=scale)
-        lower.assert_not_called()
+            result = self.swiglu.gemm_swiglu_wrapper_sm100(
+                a,
+                b,
+                alpha=0.5,
+                ab12_dtype=self.bfloat16,
+                c_dtype=self.bfloat16,
+                sfa_tensor=sfa,
+                sfb_tensor=sfb,
+                sf_vec_size=32,
+                vector_f32=True,
+                ab12_stages=3,
+            )
+
+        self.assertIs(captured["launcher"], self.swiglu._launch_quantized)
+        self.assertEqual(captured["inputs"], (a, b, sfa, sfb))
+        self.assertEqual(
+            captured["static_args"],
+            {
+                "alpha": 0.5,
+                "sf_vec_size": 32,
+                "mma_tiler_mn": (128, 128),
+                "cluster_shape_mn": (1, 1),
+                "vector_f32": True,
+                "ab12_stages": 3,
+                "has_amax": False,
+                "cluster_overlap_margin": 0,
+            },
+        )
+        self.assertEqual(
+            [spec.layout for spec in captured["input_specs"]],
+            [
+                (2, 1, 0),
+                (2, 1, 0),
+                (2, 1, 4, 0, 3, 5),
+                (2, 1, 4, 0, 3, 5),
+            ],
+        )
+        self.assertEqual(
+            [(spec.name, spec.shape, spec.dtype, spec.fill_value) for spec in captured["outputs"]],
+            [
+                ("ab12_tensor", (1, 128, 128), self.bfloat16, None),
+                ("c_tensor", (1, 128, 64), self.bfloat16, None),
+            ],
+        )
+        self.assertEqual(tuple(result.keys()), ("ab12_tensor", "c_tensor", "sfc_tensor", "amax_tensor"))
+        self.assertIsNone(result["sfc_tensor"])
+        self.assertIsNone(result["amax_tensor"])
+
+    def test_swiglu_declares_native_fp4_amax_call(self):
+        captured = {}
+        a = _Array((1, 128, 128), self.float4_e2m1fn)
+        b = _Array((1, 128, 128), self.float4_e2m1fn)
+        sfa = _Array((32, 4, 1, 4, 2, 1), self.float8_e4m3fn)
+        sfb = _Array((32, 4, 1, 4, 2, 1), self.float8_e4m3fn)
+        with (
+            self._optional_modules(),
+            mock.patch.object(
+                self.swiglu,
+                "call_cutedsl",
+                side_effect=self._fake_call(captured),
+            ),
+        ):
+            result = self.swiglu.gemm_swiglu_wrapper_sm100(
+                a,
+                b,
+                ab12_dtype=self.bfloat16,
+                c_dtype=self.bfloat16,
+                sfa_tensor=sfa,
+                sfb_tensor=sfb,
+                sf_vec_size=16,
+                a_layout="LMK",
+                b_layout="LNK",
+                c_layout="LMN",
+            )
+
+        self.assertIs(captured["launcher"], self.swiglu._launch_quantized)
+        self.assertEqual(captured["inputs"], (a, b, sfa, sfb))
+        self.assertEqual(
+            captured["static_args"],
+            {
+                "alpha": 1.0,
+                "sf_vec_size": 16,
+                "mma_tiler_mn": (128, 128),
+                "cluster_shape_mn": (1, 1),
+                "vector_f32": False,
+                "ab12_stages": 4,
+                "has_amax": True,
+                "cluster_overlap_margin": 0,
+            },
+        )
+        self.assertEqual(
+            [(spec.name, spec.shape, spec.dtype, spec.fill_value) for spec in captured["outputs"]],
+            [
+                ("ab12_tensor", (1, 128, 128), self.bfloat16, None),
+                ("c_tensor", (1, 128, 64), self.bfloat16, None),
+                ("amax_tensor", (1, 1, 1), self.float32, float("-inf")),
+            ],
+        )
+        self.assertEqual(tuple(result.keys()), ("ab12_tensor", "c_tensor", "sfc_tensor", "amax_tensor"))
+        self.assertIsNone(result["sfc_tensor"])
+        self.assertEqual(result["amax_tensor"].shape, (1, 1, 1))
+
+    def test_swiglu_revalidation_rebuilds_conditional_outputs(self):
+        a = _Array((1, 128, 128), self.float4_e2m1fn)
+        b = _Array((1, 128, 128), self.float4_e2m1fn)
+        sfa = _Array((32, 4, 1, 4, 2, 1), self.float8_e4m3fn)
+        sfb = _Array((32, 4, 1, 4, 2, 1), self.float8_e4m3fn)
+
+        with self._optional_modules():
+            operation = self.swiglu.GemmSwigluSm100(
+                a,
+                b,
+                sample_sfa=sfa,
+                sample_sfb=sfb,
+                sf_vec_size=16,
+                ab12_dtype=self.bfloat16,
+                c_dtype=self.bfloat16,
+            )
+            self.assertTrue(operation.check_support())
+            self.assertIsNotNone(operation.amax_desc)
+
+            operation._c_dtype = self.float16
+            self.assertTrue(operation.check_support())
+            self.assertIsNone(operation.amax_desc)
+
+    def test_swiglu_quantized_launcher_uses_kernel_argument_order(self):
+        kernel = self.quantized_swiglu_capabilities
+        with self._optional_modules():
+            for optional_outputs, has_amax in (((), False), (("amax",), True)):
+                with self.subTest(has_amax=has_amax):
+                    kernel.calls.clear()
+                    self.swiglu._launch_quantized(
+                        "stream",
+                        "a",
+                        "b",
+                        "sfa",
+                        "sfb",
+                        "ab12",
+                        "c",
+                        *optional_outputs,
+                        alpha=0.5,
+                        sf_vec_size=16,
+                        mma_tiler_mn=(128, 128),
+                        cluster_shape_mn=(1, 1),
+                        vector_f32=True,
+                        ab12_stages=3,
+                        has_amax=has_amax,
+                        cluster_overlap_margin=1,
+                    )
+
+                    self.assertEqual(len(kernel.calls), 1)
+                    config, args = kernel.calls[0]
+                    self.assertEqual(
+                        config,
+                        {
+                            "sf_vec_size": 16,
+                            "mma_tiler_mn": (128, 128),
+                            "cluster_shape_mn": (1, 1),
+                            "vector_f32": True,
+                            "ab12_stages": 3,
+                        },
+                    )
+                    self.assertEqual(
+                        args,
+                        (
+                            "a",
+                            "b",
+                            "sfa",
+                            "sfb",
+                            "c",
+                            "ab12",
+                            "amax" if has_amax else None,
+                            None,
+                            None,
+                            0.5,
+                            7,
+                            "stream",
+                        ),
+                    )
 
     def test_swiglu_rejects_unused_nondefault_configuration(self):
         a = _Array((1, 128, 128), self.bfloat16)
@@ -477,9 +680,9 @@ class JaxGemmContractTest(unittest.TestCase):
 
         with self._optional_modules():
             for option, value, expected in (
-                ("sf_vec_size", 32, "sf_vec_size=16"),
-                ("vector_f32", True, "vector_f32=False"),
-                ("ab12_stages", 3, "ab12_stages=4"),
+                ("sf_vec_size", 32, "sf_vec_size applies only"),
+                ("vector_f32", True, "vector_f32 applies only"),
+                ("ab12_stages", 3, "ab12_stages applies only"),
             ):
                 with (
                     self.subTest(option=option),

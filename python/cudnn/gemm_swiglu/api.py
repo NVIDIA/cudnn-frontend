@@ -44,11 +44,11 @@ from cutlass.cute.runtime import make_fake_stream
 from cudnn.api_base import ApiBaseTorch, TupleDict, ceil_div
 from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.gemm_validation import (
-    block_scale_shape,
     require_contiguous_alignment,
     require_gemm_shapes,
     resolve_max_active_clusters,
 )
+from .validation import validate_quantized_gemm_swiglu
 import os
 
 
@@ -125,24 +125,17 @@ class GemmSwigluSm100(ApiBaseTorch):
             self._tensor_shape(self.b_desc, name="sample_b"),
         )
         n_2 = self._kernel.get_output_n(n)
-        self._check_tensor_shape(self.ab12_desc, (m, n, l), "AB12")
-        self._check_tensor_shape(self.c_desc, (m, n_2, l), "C")
-
-        if self._kernel is Sm100BlockScaledPersistentDenseGemmKernel:
-            self._check_tensor_shape(self.sfa_desc, block_scale_shape(m, k, l, self.sf_vec_size), "SFA")
-            self._check_tensor_shape(self.sfb_desc, block_scale_shape(n, k, l, self.sf_vec_size), "SFB")
-            self._check_tensor_shape(self.amax_desc, (1,), "amax")
-            self._check_tensor_shape(self.sfc_desc, block_scale_shape(m, n_2, l, self.sf_vec_size), "SFC")
-            self._check_tensor_shape(self.norm_const_desc, (1,), "norm_const")
-
-        _ = self._check_tensor_stride(self.a_desc, stride=[(1, m, m * k), (k, 1, m * k)])
-        _ = self._check_tensor_stride(self.b_desc, stride=[(1, n, n * k), (k, 1, n * k)])
-        _ = self._check_tensor_stride(self.ab12_desc, stride=[(1, m, m * n), (n, 1, m * n)])
-        _ = self._check_tensor_stride(self.c_desc, stride=[(1, m, m * n_2), (n_2, 1, m * n_2)])
-        self._value_error_if(
-            self.ab12_desc.stride_order != self.c_desc.stride_order,
-            f"AB12 and C tensor stride orders must match, got {self.ab12_desc.stride_order} and {self.c_desc.stride_order}",
-        )
+        if self._kernel is PersistentDenseGemmKernel:
+            self._check_tensor_shape(self.ab12_desc, (m, n, l), "AB12")
+            self._check_tensor_shape(self.c_desc, (m, n_2, l), "C")
+            self._check_tensor_stride(self.a_desc, stride=[(1, m, m * k), (k, 1, m * k)])
+            self._check_tensor_stride(self.b_desc, stride=[(1, n, n * k), (k, 1, n * k)])
+            self._check_tensor_stride(self.ab12_desc, stride=[(1, m, m * n), (n, 1, m * n)])
+            self._check_tensor_stride(self.c_desc, stride=[(1, m, m * n_2), (n_2, 1, m * n_2)])
+            self._value_error_if(
+                self.ab12_desc.stride_order != self.c_desc.stride_order,
+                f"AB12 and C tensor stride orders must match, got {self.ab12_desc.stride_order} and {self.c_desc.stride_order}",
+            )
 
         self._logger.debug("Checking data types")
         if self._kernel is PersistentDenseGemmKernel:
@@ -188,155 +181,65 @@ class GemmSwigluSm100(ApiBaseTorch):
                 case _:
                     raise ValueError(f"Unsupported acc_dtype: expected one of {{torch.float32, torch.float16}}, got {self.acc_dtype}")
             self.c_dtype = self._check_dtype(self.c_desc, dtype=[torch.float16, torch.bfloat16], name="C")
-        elif self._kernel is Sm100BlockScaledPersistentDenseGemmKernel:
-            self._value_error_if(
-                self.sfa_desc is None or self.sfb_desc is None,
-                "sfa and sfb must be provided for quantized GEMM swiglu kernel",
-            )
+        elif self._kernel is not Sm100BlockScaledPersistentDenseGemmKernel:
+            raise NotImplementedError(f"Unreachable: invalid kernel type {self._kernel}")
 
-            self.ab_dtype = self._check_dtype(
-                self.a_desc,
-                dtype=[
-                    torch.float4_e2m1fn_x2,
-                    torch.uint8,
-                    torch.float8_e5m2,
-                    torch.float8_e4m3fn,
-                ],
-                name="A (for quantized GEMM swiglu kernel)",
-            )
-            self.acc_dtype = self._check_dtype(
-                self.acc_dtype,
-                dtype=torch.float32,
-                name="Accumulator (for quantized GEMM swiglu kernel)",
-            )
-            self.ab12_dtype = self._check_dtype(
-                self.ab12_desc,
-                dtype=[
-                    torch.float32,
-                    torch.float16,
-                    torch.bfloat16,
-                    torch.float8_e4m3fn,
-                    torch.float8_e5m2,
-                ],
-                name="AB12 (for quantized GEMM swiglu kernel)",
-            )
-            self.c_dtype = self._check_dtype(
-                self.c_desc,
-                dtype=[
-                    torch.float32,
-                    torch.float16,
-                    torch.bfloat16,
-                    torch.float8_e4m3fn,
-                    torch.float8_e5m2,
-                ],
-                name="C (for quantized GEMM swiglu kernel)",
-            )
-
-            self._value_error_if(
-                self._is_fp4x2(self.ab_dtype) and self._is_fp8(self.c_dtype),
-                "Invalid dtype combination: fp4 ab_dtype is not compatible with fp8 c_dtype (recommended bf16)",
-            )
-
-            self._value_error_if(
-                self._is_fp8(self.c_dtype) and (self.sfc_desc is None or self.norm_const_desc is None),
-                "sfc and norm_const must be provided when c_dtype is fp8",
-            )
-            self._value_error_if(
-                (self._is_fp4x2(self.ab_dtype) and self.c_dtype == torch.bfloat16) and (self.amax_desc is None),
-                "amax must be provided when ab_dtype is fp4 and c_dtype is bf16",
-            )
-
-            self._not_implemented_error_if(
-                self.c_dtype == torch.float32 and self.ab12_dtype == torch.float32,
-                "float32 c_dtype and float32 ab12_dtype currently disabled due to kernel bug",
-            )
-
-            self._value_error_if(
-                self.sf_vec_size not in self._kernel.SF_VEC_SIZES,
-                f"sf_vec_size must be 16 or 32 when ab_dtype is {{torch.float8_e5m2, torch.float8_e4m3fn}}, got {self.sf_vec_size}",
-            )
-            self.sf_dtype = self._check_dtype(
-                self.sfa_desc,
-                dtype=[torch.float8_e8m0fnu, torch.float8_e4m3fn],
-                name="SFA",
-            )
+        if self._kernel is PersistentDenseGemmKernel:
             self._check_dtype(
-                self.sfb_desc,
-                dtype=self.sf_dtype,
-                name="SFB",
-                extra_error_msg="SFB must have the same dtype as SFA",
+                self.b_desc,
+                dtype=self.ab_dtype,
+                name="B",
+                extra_error_msg="A and B must have the same dtype",
             )
-            self._check_dtype(
-                self.sfc_desc,
-                dtype=self.sf_dtype,
-                name="SFC",
-                extra_error_msg="SFC must have the same dtype as SFA",
-            )
-            if self._is_fp8(self.ab_dtype):
-                self._value_error_if(
-                    not (self.sf_dtype == torch.float8_e8m0fnu and self.sf_vec_size == 32),
-                    "Invalid ab_dtype and sf_dtype/sf_vec_size combination: fp8 ab_dtype requires float8_e8m0fnu sf_dtype and 32 sf_vec_size",
-                )
-            elif self._is_fp4x2(self.ab_dtype):
-                self._value_error_if(
-                    self.sf_dtype == torch.float8_e4m3fn and self.sf_vec_size == 32,
-                    "Invalid ab_dtype and sf_dtype/sf_vec_size combination: fp4 ab_dtype not supported with float8_e4m3fn sf_dtype and 32 sf_vec_size",
-                )
-
-            if self._is_fp4x2(self.ab_dtype):
-                self._value_error_if(
-                    self.a_desc.stride_order != (1, 0, 2) or self.b_desc.stride_order != (1, 0, 2),
-                    "Invalid A or B tensor stride: fp4 dtype requires k-major layout",
-                )
-                self._value_error_if(
-                    self.ab12_desc.stride_order != (1, 0, 2),
-                    "Invalid AB12 tensor stride: fp4 dtype requires n-major layout",
-                )
-        self._check_dtype(
-            self.b_desc,
-            dtype=self.ab_dtype,
-            name="B",
-            extra_error_msg="A and B must have the same dtype",
-        )
 
         self._logger.debug("Checking MMA tile shape and cluster shape")
 
         self.mma_tiler_mn = self._kernel.require_mma_tiler(self.mma_tiler_mn)
-        if self._kernel is Sm100BlockScaledPersistentDenseGemmKernel and self._is_fp8(self.ab_dtype):
-            self._value_error_if(
-                self._is_fp8(self.c_dtype) or self._is_fp8(self.ab12_dtype) or self.ab12_dtype == torch.float32,
-                "For MXFP8 inputs for blockscaled quantized GEMM swiglu kernel, ab12_dtype and c_dtype cannot be FP8. ab12_dtype also cannot be float32",
-            )
-
         self.cluster_shape_mn = self._kernel.require_cluster_shape(
             self.cluster_shape_mn,
             mma_tiler_mn=self.mma_tiler_mn,
         )
 
-        self._logger.debug("Checking tensor alignment")
-
-        ab_bits = _convert_to_cutlass_data_type(
-            self.ab_dtype,
-            interpret_uint8_as_fp4x2=self._interpret_uint8_as_fp4x2,
-        ).width
-        ab12_bits = _convert_to_cutlass_data_type(
-            self.ab12_dtype,
-            interpret_uint8_as_fp4x2=self._interpret_uint8_as_fp4x2,
-        ).width
-        c_bits = _convert_to_cutlass_data_type(
-            self.c_dtype,
-            interpret_uint8_as_fp4x2=self._interpret_uint8_as_fp4x2,
-        ).width
-        require_contiguous_alignment("A", m if self.a_desc.stride_order == (0, 1, 2) else k, ab_bits)
-        require_contiguous_alignment("B", n if self.b_desc.stride_order == (0, 1, 2) else k, ab_bits)
-        require_contiguous_alignment("AB12", m if self.ab12_desc.stride_order == (0, 1, 2) else n, ab12_bits)
-        require_contiguous_alignment("C", m if self.c_desc.stride_order == (0, 1, 2) else n_2, c_bits)
-
         if self._kernel is Sm100BlockScaledPersistentDenseGemmKernel:
-            self._value_error_if(
-                m % self.mma_tiler_mn[0] != 0 or n % self.mma_tiler_mn[1] != 0,
-                "Invalid tensor alignment: m and n must be aligned to mma_tiler_mn",
+            plan = validate_quantized_gemm_swiglu(
+                self.a_desc,
+                self.b_desc,
+                self.ab12_desc,
+                self.c_desc,
+                sfa=self.sfa_desc,
+                sfb=self.sfb_desc,
+                amax=self.amax_desc,
+                sfc=self.sfc_desc,
+                norm_const=self.norm_const_desc,
+                acc_dtype=self.acc_dtype,
+                output_n=n_2,
+                sf_vec_size=self.sf_vec_size,
+                supported_sf_vec_sizes=self._kernel.SF_VEC_SIZES,
+                mma_tiler_mn=self.mma_tiler_mn,
             )
+            self.ab_dtype = self.a_desc.dtype
+            self.ab12_dtype = self.ab12_desc.dtype
+            self.c_dtype = self.c_desc.dtype
+            self.sf_dtype = self.sfa_desc.dtype
+            self._logger.debug("Resolved quantized GEMM + SwiGLU plan: %s", plan)
+        else:
+            self._logger.debug("Checking tensor alignment")
+            ab_bits = _convert_to_cutlass_data_type(
+                self.ab_dtype,
+                interpret_uint8_as_fp4x2=self._interpret_uint8_as_fp4x2,
+            ).width
+            ab12_bits = _convert_to_cutlass_data_type(
+                self.ab12_dtype,
+                interpret_uint8_as_fp4x2=self._interpret_uint8_as_fp4x2,
+            ).width
+            c_bits = _convert_to_cutlass_data_type(
+                self.c_dtype,
+                interpret_uint8_as_fp4x2=self._interpret_uint8_as_fp4x2,
+            ).width
+            require_contiguous_alignment("A", m if self.a_desc.stride_order == (0, 1, 2) else k, ab_bits)
+            require_contiguous_alignment("B", n if self.b_desc.stride_order == (0, 1, 2) else k, ab_bits)
+            require_contiguous_alignment("AB12", m if self.ab12_desc.stride_order == (0, 1, 2) else n, ab12_bits)
+            require_contiguous_alignment("C", m if self.c_desc.stride_order == (0, 1, 2) else n_2, c_bits)
 
         self._logger.debug("Checking environment")
         if not torch.cuda.is_available():
