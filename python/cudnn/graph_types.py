@@ -198,6 +198,13 @@ class Tensor:
         return list(self.stride)  # a copy, like the classic pybind getter
 
     def get_data_type(self) -> Any:
+        # classic parity: the pybind getter returns the cudnn enum even when
+        # the user set a torch dtype (classic converts at set time)
+        dt = self.data_type
+        if dt is not None and type(dt).__module__ == "torch":
+            from .datatypes import _torch_to_cudnn_data_type
+
+            return _torch_to_cudnn_data_type(dt)
         return self.data_type
 
     def get_is_virtual(self) -> bool:

@@ -309,7 +309,7 @@ class Testpygraph:
                     outs = getattr(g, op)(**tensors, **attrs, **lists)
                 else:
                     outs = getattr(g, op)(*tensors.values(), **attrs, **lists)
-                outs = outs if isinstance(outs, tuple) else (outs,)
+                outs = outs if isinstance(outs, (tuple, list)) else (outs,)  # classic returns a LIST for multi-output
                 (node,) = g.nodes
                 assert node.node_type == spec["node_type"], op
                 expect_ports = set(spec["inputs"]) | {f"{lp}_{i}" for lp in lists for i in range(2)}
@@ -489,8 +489,9 @@ class TestReviewSemantics:
         a.set_name("new")
         assert g.find_tensor("new") is a and g.find_tensor("old") is None
         g.tensor(dim=[2, 2], name="other")
-        with pytest.raises(ValueError, match="already used"):
-            a.set_name("other")
+        a.set_name("other")  # classic: labels may collide — becomes ambiguous
+        with pytest.raises(ValueError, match="ambiguous"):
+            g.find_tensor("other")
 
     def test_set_uid_steals_auto_uid_and_rejects_user_dup(self):
         """Classic parity: user set_uid wins over an auto-assigned holder (which
@@ -627,8 +628,21 @@ class TestReviewSemantics:
         s.set_name("renamed_scalar")
         assert g.find_tensor("renamed_scalar") is s
 
-    def test_duplicate_initial_name_rejected(self):
+    def test_duplicate_names_are_classic_labels(self):
+        """Classic parity: tensor names are debug labels — duplicates are legal
+        (pycudnnTest builds two tensors both named 'weight'). uid is the
+        identity; name-keyed lookups on an ambiguous label raise instead of
+        guessing, unique labels keep working."""
         g = pygraph()
-        g.tensor(dim=[2, 2], name="X")
-        with pytest.raises(ValueError, match="already used"):
-            g.tensor(dim=[2, 2], name="X")
+        a = g.tensor(dim=[2, 2], name="X")
+        b = g.tensor(dim=[2, 2], name="X")  # legal, like classic
+        assert a.name == b.name == "X" and a.uid != b.uid
+        with pytest.raises(ValueError, match="ambiguous"):
+            g.find_tensor("X")
+        assert g.find_tensor(a.uid) is a and g.find_tensor(b.uid) is b
+        u = g.tensor(dim=[2, 2], name="unique")
+        assert g.find_tensor("unique") is u
+        # renaming ONTO an existing label is equally legal — and makes it ambiguous
+        u.set_name("X")
+        with pytest.raises(ValueError, match="ambiguous"):
+            g.find_tensor("X")

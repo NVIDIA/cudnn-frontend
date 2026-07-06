@@ -52,7 +52,7 @@ class pygraph:
         >>> A = graph.tensor(dim=[8, 64, 128], name="A")
         >>> B = graph.tensor(dim=[8, 128, 256], name="B")
         >>> C = graph.matmul(A, B, name="mm1")
-        >>> # C is auto-marked as output (leaf tensor) during validate()
+        >>> C.set_output(True)  # outputs are explicit, like the classic API
         >>>
         >>> # Inspect graph
         >>> print(graph.nodes)  # [Node('mm1', MATMUL)]
@@ -62,10 +62,22 @@ class pygraph:
 
     def __init__(
         self,
+        # ---- classic pybind constructor, POSITIONALLY IDENTICAL (existing
+        # callers pass name/handle/sm_count/... by position; guarded by
+        # test_api_signature_parity) --------------------------------------
+        name: str = "test_graph",
         io_data_type: Any = None,
         intermediate_data_type: Any = None,
         compute_data_type: Any = None,
         handle: Any = None,
+        sm_count: Any = None,
+        sm_version: Any = None,
+        kernel_cache: Any = None,
+        device_property: Any = None,
+        is_dynamic_shape_enabled: bool = False,
+        is_override_shape_enabled: bool = False,
+        *,
+        # ---- new (keyword-only: never shifts the classic positional order) --
         backends: Optional[List["BaseEngine"]] = None,
         router: Any = None,
         **kwargs,
@@ -76,10 +88,22 @@ class pygraph:
             compute_data_type=compute_data_type or io_data_type,
         )
         self._handle = handle  # cuDNN handle for the cuDNN lowering path
-        # Classic graph-level kwargs (name, sm_count, sm_version, kernel_cache,
-        # device_property, is_dynamic_shape_enabled, ...) forwarded verbatim to
-        # the C++ graph at lowering.
+        # Classic graph-level configuration, forwarded verbatim to the C++
+        # graph at lowering (**kwargs covers future binding args).
         self._cpp_graph_kwargs = {k: v for k, v in kwargs.items() if v is not None}
+        self._cpp_graph_kwargs["name"] = name
+        for _k, _v in (
+            ("sm_count", sm_count),
+            ("sm_version", sm_version),
+            ("kernel_cache", kernel_cache),
+            ("device_property", device_property),
+        ):
+            if _v is not None:
+                self._cpp_graph_kwargs[_k] = _v
+        if is_dynamic_shape_enabled:
+            self._cpp_graph_kwargs["is_dynamic_shape_enabled"] = True
+        if is_override_shape_enabled:
+            self._cpp_graph_kwargs["is_override_shape_enabled"] = True
         self._nodes: List[Node] = []
         self._tensors: Dict[str, Tensor] = {}
         self._tensor_by_uid: Dict[int, Tensor] = {}
@@ -107,6 +131,7 @@ class pygraph:
         self._cpp_bog_done: bool = False  # C++ build_operation_graph ran
         self._cpp_tensors: Dict[int, Any] = {}  # IR uid -> lowered C++ tensor
         self._reserved_uids: set = set()  # user-specified uids _alloc_uid must skip
+        self._ambiguous_names: set = set()  # duplicate labels: excluded from the name index
         for _e in backends or ():  # constructor path uses the SAME validation
             self.register_backend(_e)
 
@@ -181,17 +206,30 @@ class pygraph:
 
     def tensor(
         self,
+        # classic public tensor() signature, POSITIONALLY IDENTICAL (guarded by
+        # test_api_signature_parity); classic unset sentinels (NOT_SET, -1,
+        # reordering NONE) are normalized to None below
         dim: List[int],
         stride: Optional[List[int]] = None,
         data_type: Any = None,
         is_virtual: bool = False,
+        is_pass_by_value: bool = False,
+        ragged_offset: Optional[Tensor] = None,
+        reordering_type: Any = None,
         name: str = "",
         uid: Optional[int] = None,
+        ragged_offset_multiplier: int = 1,
         **kwargs,
     ) -> Tensor:
         """Create a tensor."""
         if not name:
             name = f"tensor_{len(self._tensors)}"
+        if data_type is not None and getattr(data_type, "name", None) == "NOT_SET":
+            data_type = None
+        if reordering_type is not None and getattr(reordering_type, "name", None) == "NONE":
+            reordering_type = None
+        if uid == -1:  # classic unset sentinel
+            uid = None
 
         if uid is not None:
             # User-owned uid, same rule as set_uid (_reuid_tensor): classic
@@ -216,6 +254,10 @@ class pygraph:
             stride=list(stride) if stride else _row_major_stride(dim),
             data_type=data_type or (self._context.intermediate_data_type if is_virtual else self._context.io_data_type),
             is_virtual=is_virtual,
+            is_pass_by_value=is_pass_by_value,
+            ragged_offset=ragged_offset,
+            reordering_type=reordering_type,
+            ragged_offset_multiplier=ragged_offset_multiplier,
             uid=uid if uid is not None else self._alloc_uid(),
             uid_assigned=uid is not None,
             dim_assigned=True,  # graph inputs: the user specified the layout
@@ -239,8 +281,23 @@ class pygraph:
                 is_pass_by_value=template.is_pass_by_value,
                 name=name,
             )
-        dim = list(template.shape)
-        stride = list(template.stride()) if hasattr(template, "stride") else _row_major_stride(dim)
+        # Element strides via the DLPack protocol (classic tensor_like reads the
+        # DLPack capsule). torch's .stride() is element units, but e.g. CuPy
+        # exposes byte-unit .strides — so normalize any non-torch DLPack object
+        # through torch.from_dlpack first.
+        if hasattr(template, "stride") and callable(getattr(template, "stride", None)):
+            dim = list(template.shape)
+            stride = list(template.stride())
+        else:
+            try:
+                import torch as _torch
+
+                _view = _torch.from_dlpack(template)
+                dim = list(_view.shape)
+                stride = list(_view.stride())
+            except Exception:  # noqa: BLE001 — no torch / exotic dlpack: assume dense
+                dim = list(template.shape)
+                stride = _row_major_stride(dim)
 
         data_type = None
         try:
@@ -302,15 +359,20 @@ class pygraph:
         self._frozen = True
 
     def _rename_tensor(self, t: Tensor, name: str) -> None:
-        """Atomic rename keeping the name index coherent (duplicates rejected)."""
+        """Atomic rename keeping the name index coherent. Classic parity: names
+        are labels, so renaming ONTO an existing label is legal — the name just
+        becomes ambiguous and leaves the unique-name index."""
         if name == t.name:
             return
         self._check_mutable("rename a tensor")
-        if name in self._tensors:
-            raise ValueError(f"tensor name {name!r} is already used")
-        self._tensors.pop(t.name, None)
+        if self._tensors.get(t.name) is t:
+            del self._tensors[t.name]
         t.name = name
-        self._tensors[name] = t
+        if name in self._tensors or name in self._ambiguous_names:
+            self._tensors.pop(name, None)
+            self._ambiguous_names.add(name)
+        else:
+            self._tensors[name] = t
 
     def _reuid_tensor(self, t: Tensor, uid: int) -> None:
         """Atomic re-uid keeping indexes/bindings coherent.
@@ -351,6 +413,18 @@ class pygraph:
         self._next_uid += 1
         return uid
 
+    # Classic C++ auto-names op outputs "<node>::<OUTPUT_ENUM>" (graph_interface.h
+    # output_tensor calls). Ports whose name differs from the classic enum are
+    # mapped here so canonical names (wrapper.Graph lookups, JSON dumps) match.
+    _CLASSIC_OUT_SUFFIX = {
+        "inv_var": "INV_VARIANCE",
+        "mean": "MEAN",
+        "next_running_mean": "NEXT_RUNNING_MEAN",
+        "next_running_var": "NEXT_RUNNING_VAR",
+        "DScale": "DSCALE",
+        "DBias": "DBIAS",
+    }
+
     def _get_name(self, op: str, name: str) -> str:
         self._check_mutable(f"add a {op} op")
         if name:
@@ -370,10 +444,16 @@ class pygraph:
         )
 
     def _register_tensor(self, t: Tensor) -> None:
-        if t.name in self._tensors:
-            raise ValueError(f"tensor name {t.name!r} is already used")
         t.owner = weakref.ref(self)
-        self._tensors[t.name] = t
+        # Classic parity: names are debug LABELS — duplicates are legal
+        # (pycudnnTest builds two 'weight' tensors). uid is the identity; the
+        # name index serves only names that remain unique, and name-keyed
+        # lookups on an ambiguous name raise instead of guessing.
+        if t.name in self._tensors or t.name in self._ambiguous_names:
+            self._tensors.pop(t.name, None)
+            self._ambiguous_names.add(t.name)
+        else:
+            self._tensors[t.name] = t
         self._tensor_by_uid[t.uid] = t
 
     def _ensure_tensor(self, arg: Any, name: str = "") -> Tensor:
@@ -581,6 +661,8 @@ class pygraph:
         """Find tensor by name or UID."""
         if isinstance(name_or_uid, int):
             return self._tensor_by_uid.get(name_or_uid)
+        if name_or_uid in self._ambiguous_names:
+            raise ValueError(f"tensor name {name_or_uid!r} is ambiguous (duplicate labels are legal; look up by uid or Tensor)")
         return self._tensors.get(name_or_uid)
 
     def get_node(self, name: str) -> Optional[Node]:
@@ -626,16 +708,12 @@ class pygraph:
     def validate(self) -> None:
         """Validate graph and infer properties.
 
-        Automatically marks leaf output tensors (not consumed by any
-        subsequent op) as non-virtual (outputs).
+        Classic parity: op outputs stay VIRTUAL unless the user marks them
+        with set_output(True). A leaf output is NOT auto-marked — discarding
+        an op result (e.g. the Stats of a training SDPA) is legal classic
+        usage, and auto-marking it would make its uid required in the variant
+        pack.
         """
-        # Auto-mark leaf tensors as outputs
-        consumed = {t.uid for node in self._nodes for t in node.inputs.values() if t}
-        for node in self._nodes:
-            for t in node.outputs.values():
-                if t and t.is_virtual and t.uid not in consumed:
-                    t.set_output(True)  # dtype assigned by infer_properties below
-
         for node in self._nodes:
             node.infer_properties(self._context)
             # Table-driven shape inference, topologically: builder-time infer
@@ -685,6 +763,27 @@ class pygraph:
         if self._lowered_graph is not None and not self._cpp_bog_done:
             self._lowered_graph.build_operation_graph()
             self._cpp_bog_done = True
+            self._sync_ir_shapes_from_backend()
+
+    def _sync_ir_shapes_from_backend(self) -> None:
+        """After the backend's shape/layout inference (build_operation_graph),
+        reflect the REAL dim/stride back into the IR tensors. The IR's own
+        inferred strides are provisional row-major; the backend applies
+        classic per-op layout inference (channels-last conv etc.), and
+        consumers of the IR (wrapper.Graph buffer allocation, engines,
+        introspection) must see the layout that will actually execute."""
+        for ir_uid, cpp_t in self._cpp_tensors.items():
+            ir = self._tensor_by_uid.get(ir_uid)
+            if ir is None:
+                continue
+            try:
+                d, st = cpp_t.get_dim(), cpp_t.get_stride()
+            except Exception:  # noqa: BLE001 — some tensors have no dims (scalars)
+                continue
+            if d:
+                object.__setattr__(ir, "dim", tuple(d))  # sealed (graph is frozen)
+            if st:
+                object.__setattr__(ir, "stride", tuple(st))
 
     def create_execution_plans(self, heuristics: Optional[List] = None) -> None:
         """Build the ranked execution-plan list (the dispatch stage).
@@ -827,6 +926,7 @@ class pygraph:
         if not self._cpp_bog_done:
             self._lowered_graph.build_operation_graph()
             self._cpp_bog_done = True
+            self._sync_ir_shapes_from_backend()
         if not self._cpp_plans_created:
             heur = self._backend_heuristics or [cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK]
             self._lowered_graph.create_execution_plans(heur)
@@ -926,6 +1026,8 @@ class pygraph:
             if isinstance(key, Tensor):
                 uid = key.uid
             elif isinstance(key, str):
+                if key in self._ambiguous_names:
+                    raise ValueError(f"tensor name {key!r} is ambiguous (duplicate labels); key the variant pack by uid or Tensor")
                 uid = self._tensors[key].uid
             elif isinstance(key, int):
                 uid = key
@@ -1230,7 +1332,11 @@ class pygraph:
                     tensor_map[out_t.uid] = cpp_t
                     if push_dims and out_t.dim:  # ops whose output dims cuDNN can't infer
                         cpp_t.set_dim(out_t.dim)
-                        if out_t.stride:
+                        # stride only when USER-assigned: pushing the IR's
+                        # provisional row-major stride into an (e.g.) NHWC
+                        # graph makes the backend reject the fusion (classic
+                        # infers the stride when the user sets only dims)
+                        if out_t.stride_assigned and out_t.stride:
                             cpp_t.set_stride(out_t.stride)
                     push_output_attrs(out_t, cpp_t)
                 continue
@@ -1409,6 +1515,9 @@ _STRUCTURED_OPS = {
         inputs=("grad", "input", "scale", "inv_variance"),
         attrs=("has_dbias",),
         outputs=("DX", "DScale", "DBias"),
+        # classic rmsnorm_backward names its outputs ::Dscale/::Dbias (mixed
+        # case), unlike the other norm backwards (::DSCALE/::DBIAS)
+        out_suffix={"DScale": "Dscale", "DBias": "Dbias"},
         maybe={"DBias": lambda n: n.params.get("has_dbias", True) is not False},
         infer=_NORM_BWD_INFER,
     ),
@@ -1654,7 +1763,7 @@ def _install_structured_builders() -> None:
                 if cond is not None and not cond(node):
                     outs.append(None)  # classic returns None for absent outputs
                     continue
-                o = self._make_output(f"{name_}::{oport}")
+                o = self._make_output(f"{name_}::{spec.get('out_suffix', {}).get(oport) or self._CLASSIC_OUT_SUFFIX.get(oport, oport)}")
                 src = dtype_like.get(oport)
                 if src and src in node.inputs:
                     o.data_type = node.inputs[src].data_type
@@ -1671,7 +1780,7 @@ def _install_structured_builders() -> None:
                 self._register_tensor(o)
                 outs.append(o)
             self._nodes.append(node)
-            return outs[0] if len(outs) == 1 else tuple(outs)
+            return outs[0] if len(outs) == 1 else list(outs)  # classic multi-output ops return a LIST
 
         builder.__name__ = op
         builder.__qualname__ = f"pygraph.{op}"
@@ -1904,7 +2013,7 @@ def _install_captured_builders() -> None:
                 if cond is not None and not cond(node.params):
                     rets.append(None)  # e.g. Stats in inference mode (classic returns None)
                     continue
-                o = self._make_output(f"{name_}::{oport}")
+                o = self._make_output(f"{name_}::{spec.get('out_suffix', {}).get(oport) or self._CLASSIC_OUT_SUFFIX.get(oport, oport)}")
                 d = (out_dims or {}).get(oport)
                 if d is None:
                     try:
@@ -1918,7 +2027,7 @@ def _install_captured_builders() -> None:
                 self._register_tensor(o)
                 rets.append(o)
             self._nodes.append(node)
-            return tuple(rets)  # always full arity, matching the classic API
+            return list(rets)  # always full arity; classic returns a LIST
 
         builder.__name__ = op
         builder.__qualname__ = f"pygraph.{op}"
