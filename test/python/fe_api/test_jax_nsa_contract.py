@@ -44,6 +44,9 @@ class _Array:
         self.shape = tuple(shape)
         self.dtype = dtype
 
+    def astype(self, dtype):
+        return _Array(self.shape, dtype)
+
 
 class _TensorSpec:
     def __init__(
@@ -79,11 +82,16 @@ class JaxNsaContractTest(unittest.TestCase):
         cls.fake_jnp.int64 = cls.int64
         cls.fake_jnp.dtype = lambda value: value
         cls.fake_jnp.reshape = lambda value, shape: _Array(shape, value.dtype)
+        cls.fake_jnp.transpose = lambda value, axes: _Array(
+            tuple(value.shape[axis] for axis in axes),
+            value.dtype,
+        )
 
         cls.fake_jax = types.ModuleType("jax")
         cls.fake_jax.__path__ = []
         cls.fake_jax.__spec__ = ModuleSpec("jax", loader=None, is_package=True)
         cls.fake_jax.numpy = cls.fake_jnp
+        cls.fake_jax.nn = types.SimpleNamespace()
         cls.fake_jax.tree_util = types.SimpleNamespace(
             DictKey=lambda key: key,
             register_pytree_with_keys=lambda *_args: None,
@@ -118,9 +126,15 @@ class JaxNsaContractTest(unittest.TestCase):
             cls.nsa = importlib.import_module(f"{_TEST_PACKAGE}.native_sparse_attention")
             cls.compression_package = importlib.import_module(f"{_TEST_PACKAGE}.native_sparse_attention.compression")
             cls.selection_package = importlib.import_module(f"{_TEST_PACKAGE}.native_sparse_attention.selection")
+            cls.sliding_package = importlib.import_module(
+                f"{_TEST_PACKAGE}.native_sparse_attention.sliding_window_attention"
+            )
             cls.topk_package = importlib.import_module(f"{_TEST_PACKAGE}.native_sparse_attention.top_k")
             cls.compression = importlib.import_module(f"{_TEST_PACKAGE}.native_sparse_attention.compression.jax")
             cls.selection = importlib.import_module(f"{_TEST_PACKAGE}.native_sparse_attention.selection.jax")
+            cls.sliding = importlib.import_module(
+                f"{_TEST_PACKAGE}.native_sparse_attention.sliding_window_attention.jax"
+            )
             cls.topk = importlib.import_module(f"{_TEST_PACKAGE}.native_sparse_attention.top_k.jax")
 
     @classmethod
@@ -155,6 +169,10 @@ class JaxNsaContractTest(unittest.TestCase):
             sys.modules,
         )
         self.assertNotIn(
+            f"{_TEST_PACKAGE}.native_sparse_attention.sliding_window_attention.api",
+            sys.modules,
+        )
+        self.assertNotIn(
             f"{_TEST_PACKAGE}.native_sparse_attention.compression.fmha",
             sys.modules,
         )
@@ -168,7 +186,97 @@ class JaxNsaContractTest(unittest.TestCase):
         )
         self.assertIs(self.compression_package.jax, self.compression)
         self.assertIs(self.selection_package.jax, self.selection)
+        self.assertIs(self.sliding_package.jax, self.sliding)
         self.assertIs(self.topk_package.jax, self.topk)
+
+    def test_sliding_window_attention_uses_public_cudnn_lowering(self):
+        calls = []
+
+        def dot_product_attention(q, k, v, **options):
+            calls.append((q, k, v, options))
+            return _Array(q.shape, q.dtype)
+
+        q = _Array((2, 4, 16, 64), self.bfloat16)
+        k = _Array((2, 2, 16, 64), self.bfloat16)
+        v = _Array((2, 2, 16, 64), self.bfloat16)
+        with (
+            self._optional_modules(),
+            mock.patch.object(
+                self.fake_jax.nn,
+                "dot_product_attention",
+                side_effect=dot_product_attention,
+                create=True,
+            ),
+        ):
+            result = self.sliding.sliding_window_attention_wrapper(
+                q,
+                k,
+                v,
+                left_bound=8,
+                right_bound=0,
+                is_infer=True,
+                attn_scale=0.125,
+            )
+
+        self.assertEqual(
+            (result["o_tensor"].shape, result["o_tensor"].dtype),
+            (q.shape, self.bfloat16),
+        )
+        self.assertIsNone(result["stats_tensor"])
+        q_btnh, k_btnh, v_btnh, options = calls[0]
+        self.assertEqual(q_btnh.shape, (2, 16, 4, 64))
+        self.assertEqual(k_btnh.shape, (2, 16, 2, 64))
+        self.assertEqual(v_btnh.shape, (2, 16, 2, 64))
+        self.assertEqual(
+            options,
+            {
+                "scale": 0.125,
+                "is_causal": True,
+                "local_window_size": (7, 0),
+                "implementation": "cudnn",
+            },
+        )
+
+    def test_sliding_window_attention_rejects_unsupported_training_and_window(self):
+        q = _Array((2, 4, 16, 64), self.bfloat16)
+        k = _Array((2, 2, 16, 64), self.bfloat16)
+        v = _Array((2, 2, 16, 64), self.bfloat16)
+        with (
+            self._optional_modules(),
+            mock.patch.object(
+                self.fake_jax.nn,
+                "dot_product_attention",
+                create=True,
+            ) as attention,
+        ):
+            with self.assertRaisesRegex(NotImplementedError, "inference only"):
+                self.sliding.sliding_window_attention_wrapper(
+                    q,
+                    k,
+                    v,
+                    is_infer=False,
+                )
+            with self.assertRaisesRegex(NotImplementedError, "right_bound=0"):
+                self.sliding.sliding_window_attention_wrapper(
+                    q,
+                    k,
+                    v,
+                    right_bound=1,
+                )
+            with self.assertRaisesRegex(NotImplementedError, "S_q == S_k"):
+                self.sliding.sliding_window_attention_wrapper(
+                    q,
+                    _Array((2, 2, 8, 64), self.bfloat16),
+                    _Array((2, 2, 8, 64), self.bfloat16),
+                )
+            with self.assertRaisesRegex(ValueError, "at least 1"):
+                self.sliding.sliding_window_attention_wrapper(
+                    q,
+                    k,
+                    v,
+                    left_bound=0,
+                )
+        attention.assert_not_called()
 
     def test_selection_attention_declares_runtime_offsets_and_safe_outputs(self):
         captured = {}
@@ -210,7 +318,6 @@ class JaxNsaContractTest(unittest.TestCase):
         self.assertIs(captured["launcher"], self.selection._launch)
         self.assertEqual(tuple(value.shape for value in captured["inputs"][:3]), ((1, 16, 4, 128), (1, 16, 1, 128), (1, 16, 1, 64)))
         self.assertEqual(captured["inputs"][3:], (block_indices, block_counts, cum_q, cum_k))
-        self.assertTrue(captured["use_static_tensors"])
 
         output, lse_sum, row_max = captured["outputs"]
         self.assertEqual(output.shape, (1, 16, 4, 64))
@@ -349,7 +456,6 @@ class JaxNsaContractTest(unittest.TestCase):
         self.assertEqual((result["lse_tensor"].shape, result["lse_tensor"].dtype), ((2, 4, 16), self.float32))
         self.assertIs(captured["launcher"], self.compression._launch)
         self.assertEqual(captured["inputs"], (q, k, v))
-        self.assertTrue(captured["use_static_tensors"])
         self.assertEqual(len(captured["input_specs"]), 3)
         for spec in captured["input_specs"]:
             self.assertEqual(spec.layout, (3, 1, 2, 0))
@@ -470,7 +576,6 @@ class JaxNsaContractTest(unittest.TestCase):
         self.assertEqual((result["topk_indices_tensor"].shape, result["topk_indices_tensor"].dtype), ((2, 2, 16, 16), self.int32))
         self.assertEqual(captured["inputs"], (q, k, lse))
         self.assertIs(captured["launcher"], self.topk._launch)
-        self.assertTrue(captured["use_static_tensors"])
         scores, indices = captured["outputs"]
         self.assertEqual(scores.fill_value, float("-inf"))
         self.assertEqual(indices.fill_value, -1)

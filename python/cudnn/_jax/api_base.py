@@ -7,7 +7,8 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any, Optional, Tuple, final
 
 import cutlass
@@ -39,13 +40,21 @@ def as_optional_dtype(value: Any | None) -> Any | None:
 
 
 def require_dtype(
-    name: str,
     value: Any,
     valid_dtypes: Iterable[Any],
     *,
+    name: str | None = None,
     default: Any = _NO_DEFAULT,
 ) -> Any:
-    """Return a supported dtype from a dtype-like value or object with ``dtype``."""
+    """Return a supported dtype from a dtype-like value or object with ``dtype``.
+
+    The diagnostic name defaults to ``"<value.name>.dtype"`` for named
+    dtype-bearing values, then ``"dtype"``.
+    """
+
+    if not name:
+        value_name = getattr(value, "name", None) if not isinstance(value, type) and hasattr(value, "dtype") else None
+        name = f"{value_name}.dtype" if value_name else "dtype"
 
     if value is None:
         if default is _NO_DEFAULT:
@@ -58,6 +67,50 @@ def require_dtype(
         supported = ", ".join(item.name for item in valid_dtypes)
         raise ValueError(f"{name} must be one of {{{supported}}}, got {dtype}")
     return dtype
+
+
+def require_array(
+    value: Any,
+    *,
+    name: str | None = None,
+    rank: int | Iterable[int] | None = None,
+    shape: Sequence[Any] | None = None,
+    dtype: Any | Iterable[Any] | None = None,
+) -> tuple[Any, ...]:
+    """Validate array metadata and return its shape.
+
+    The diagnostic name defaults to a non-empty ``value.name``, then
+    ``"value"``. ``dtype`` accepts either one dtype or an iterable of supported
+    dtypes. Validation applies to the value's exposed shape. For a
+    :class:`JaxTensorDesc`, that is the kernel-visible shape; use
+    :attr:`JaxTensorDesc.array_shape` when validating a public JAX array against
+    a descriptor.
+    """
+
+    name = name or getattr(value, "name", None) or "value"
+    if not hasattr(value, "shape") or not hasattr(value, "dtype"):
+        raise TypeError(f"{name} must have shape and dtype metadata")
+
+    actual_shape = tuple(value.shape)
+    if rank is not None:
+        valid_ranks = (rank,) if isinstance(rank, int) else tuple(rank)
+        if len(actual_shape) not in valid_ranks:
+            if len(valid_ranks) == 1:
+                raise ValueError(f"{name} must have rank {valid_ranks[0]}, got shape {actual_shape}")
+            expected = ", ".join(str(item) for item in valid_ranks)
+            raise ValueError(f"{name} must have one of ranks {{{expected}}}, got shape {actual_shape}")
+
+    if shape is not None:
+        expected_shape = tuple(shape)
+        if actual_shape != expected_shape:
+            raise ValueError(f"{name} must have shape {expected_shape}, got {actual_shape}")
+
+    if dtype is not None:
+        is_dtype_collection = isinstance(dtype, Iterable) and not isinstance(dtype, (str, bytes, type)) and not hasattr(dtype, "dtype")
+        valid_dtypes = tuple(dtype) if is_dtype_collection else (dtype,)
+        require_dtype(value, valid_dtypes, name=f"{name}.dtype")
+
+    return actual_shape
 
 
 def _flatten_tuple_dict(value: TupleDict) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
@@ -87,29 +140,52 @@ if not getattr(TupleDict, "_jax_pytree_registered", False):
     TupleDict._jax_pytree_registered = True
 
 
+def _resolve_layout_mode(
+    rank: int,
+    *,
+    tensor_spec: TensorSpec | None,
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    layout = None if tensor_spec is None else tensor_spec.layout
+    mode = None if tensor_spec is None else tensor_spec.mode
+
+    dimensions = tuple(range(rank))
+    layout = tuple(reversed(dimensions)) if layout is None else tuple(layout)
+    mode = dimensions if mode is None else tuple(mode)
+    if tuple(sorted(layout)) != dimensions:
+        raise ValueError(f"layout must be a permutation for rank {rank}, got {layout}")
+    if tuple(sorted(mode)) != dimensions:
+        raise ValueError(f"mode must be a permutation for rank {rank}, got {mode}")
+    return layout, mode
+
+
 @dataclass(frozen=True, kw_only=True)
 class JaxTensorDesc(TensorDesc):
-    """Abstract JAX tensor metadata and its declared custom-call layout.
+    """Abstract JAX tensor metadata and its CUTLASS lowering specification.
 
     The descriptor reads only shape and dtype from an array-like value.  Its
     shape and stride describe the modes presented to the kernel after the
     declared ``TensorSpec.mode`` permutation.  The stride is derived from the
     compact layout requested from XLA; it never inspects a physical JAX buffer
-    or device.
+    or device. ``tensor_spec`` is retained unchanged for use by
+    :func:`call_cutedsl`; ``None`` preserves CUTLASS's inferred-default
+    behavior. The ``layout`` and ``mode`` properties expose normalized
+    defaults without rewriting that native object. Prefer :meth:`from_value`
+    for input metadata because it applies ``TensorSpec.mode`` to the public
+    array shape. A shape passed directly to the constructor must already be in
+    kernel-visible mode order.
     """
 
-    jax_layout: tuple[int, ...]
-    jax_mode: tuple[int, ...] | None = None
+    tensor_spec: TensorSpec | None = None
+    jax_layout: tuple[int, ...] = field(init=False)
+    jax_mode: tuple[int, ...] = field(init=False)
 
     def __post_init__(self) -> None:
         rank = len(tuple(self.shape))
-        layout = tuple(self.jax_layout)
-        mode = tuple(range(rank)) if self.jax_mode is None else tuple(self.jax_mode)
+        layout, mode = _resolve_layout_mode(
+            rank,
+            tensor_spec=self.tensor_spec,
+        )
         dimensions = tuple(range(rank))
-        if tuple(sorted(layout)) != dimensions:
-            raise ValueError(f"jax_layout must be a permutation for rank {rank}, got {layout}")
-        if tuple(sorted(mode)) != dimensions:
-            raise ValueError(f"jax_mode must be a permutation for rank {rank}, got {mode}")
 
         expected_order = tuple(sorted(dimensions, key=lambda dim: layout[mode[dim]]))
         if self.stride_order is None:
@@ -137,26 +213,34 @@ class JaxTensorDesc(TensorDesc):
         cls,
         value: Any,
         *,
+        tensor_spec: TensorSpec | None = None,
         layout: Sequence[int] | None = None,
         mode: Sequence[int] | None = None,
         name: str = "",
     ) -> "JaxTensorDesc":
-        if not hasattr(value, "shape") or not hasattr(value, "dtype"):
-            raise TypeError(f"{name or 'value'} must expose shape and dtype metadata")
-        input_shape = tuple(value.shape)
-        if layout is None:
-            layout = tuple(range(len(input_shape) - 1, -1, -1))
-        if mode is None:
-            mode = tuple(range(len(input_shape)))
-        mode = tuple(mode)
-        if tuple(sorted(mode)) != tuple(range(len(input_shape))):
-            raise ValueError(f"mode must be a permutation for rank {len(input_shape)}, got {mode}")
+        """Capture array metadata together with its native lowering spec.
+
+        ``layout`` and ``mode`` are convenience forms that construct a native
+        ``TensorSpec``. Supplying neither keeps ``tensor_spec=None`` so CUTLASS
+        can infer its complete default, including divisibility.
+        """
+
+        input_shape = require_array(value, name=name or None)
+        if tensor_spec is not None:
+            if layout is not None or mode is not None:
+                raise ValueError("tensor_spec cannot be combined with explicit layout or mode")
+        elif layout is not None or mode is not None:
+            tensor_spec = TensorSpec(
+                layout=None if layout is None else tuple(layout),
+                mode=None if mode is None else tuple(mode),
+            )
+
+        _, mode = _resolve_layout_mode(len(input_shape), tensor_spec=tensor_spec)
         shape = tuple(input_shape[dim] for dim in mode)
         return cls(
             dtype=value.dtype,
             shape=shape,
-            jax_layout=tuple(layout),
-            jax_mode=mode,
+            tensor_spec=tensor_spec,
             name=name,
         )
 
@@ -168,6 +252,15 @@ class JaxTensorDesc(TensorDesc):
     def mode(self) -> tuple[int, ...]:
         assert self.jax_mode is not None
         return self.jax_mode
+
+    @property
+    def array_shape(self) -> tuple[Any, ...]:
+        """Return the public JAX shape before ``TensorSpec.mode`` is applied."""
+
+        shape: list[Any] = [None] * self.ndim
+        for kernel_dim, array_dim in enumerate(self.mode):
+            shape[array_dim] = self.shape[kernel_dim]
+        return tuple(shape)
 
 
 class ApiBaseJax(ApiBase, ABC):
@@ -205,14 +298,13 @@ class ApiBaseJax(ApiBase, ABC):
 
         if self._is_supported:
             return True
-        if not self._check_support():
-            return False
+        self._check_support()
         object.__setattr__(self, "_is_supported", True)
         return True
 
     @abstractmethod
-    def _check_support(self) -> bool:
-        """Implement operation-specific support validation."""
+    def _check_support(self) -> None:
+        """Validate and resolve operation-specific configuration or raise."""
 
     @abstractmethod
     def _call_impl(self, *args: Any, **kwargs: Any) -> Any:
@@ -229,13 +321,20 @@ class ApiBaseJax(ApiBase, ABC):
         self,
         value: Any,
         *,
+        tensor_spec: TensorSpec | None = None,
         layout: Sequence[int] | None = None,
         mode: Sequence[int] | None = None,
         name: str = "",
     ) -> JaxTensorDesc:
-        """Return abstract JAX metadata without reading array values."""
+        """Return abstract JAX metadata using a declared CUTLASS tensor spec."""
 
-        return JaxTensorDesc.from_value(value, layout=layout, mode=mode, name=name)
+        return JaxTensorDesc.from_value(
+            value,
+            tensor_spec=tensor_spec,
+            layout=layout,
+            mode=mode,
+            name=name,
+        )
 
     def as_dtype(self, value: Any) -> Any:
         """Return a JAX dtype without retaining a dtype-bearing value."""
@@ -249,20 +348,21 @@ class ApiBaseJax(ApiBase, ABC):
 
     def require_dtype(
         self,
-        name: str,
         value: Any,
         valid_dtypes: Iterable[Any],
         *,
+        name: str | None = None,
         default: Any = _NO_DEFAULT,
     ) -> Any:
         """Return a supported dtype from a dtype-like value or descriptor."""
 
-        return require_dtype(name, value, valid_dtypes, default=default)
+        return require_dtype(value, valid_dtypes, name=name, default=default)
 
     def make_optional_tensor_desc(
         self,
         value: Any | None,
         *,
+        tensor_spec: TensorSpec | None = None,
         layout: Sequence[int] | None = None,
         mode: Sequence[int] | None = None,
         name: str = "",
@@ -271,7 +371,13 @@ class ApiBaseJax(ApiBase, ABC):
 
         if value is None:
             return None
-        return self.make_tensor_desc(value, layout=layout, mode=mode, name=name)
+        return self.make_tensor_desc(
+            value,
+            tensor_spec=tensor_spec,
+            layout=layout,
+            mode=mode,
+            name=name,
+        )
 
     def check_tensor_signature(
         self,
@@ -282,15 +388,14 @@ class ApiBaseJax(ApiBase, ABC):
     ) -> JaxTensorDesc:
         """Validate an invocation-time value against a sample descriptor."""
 
-        if hasattr(value, "shape") and len(tuple(value.shape)) != expected.ndim:
-            raise ValueError(f"{name} tensor shape mismatch: expected rank {expected.ndim}, got {tuple(value.shape)}")
+        actual_shape = require_array(value, name=name or None)
+        if actual_shape != expected.array_shape:
+            raise ValueError(f"{name} tensor shape mismatch: expected {expected.array_shape}, got {actual_shape}")
         actual = self.make_tensor_desc(
             value,
-            layout=expected.layout,
-            mode=expected.mode,
+            tensor_spec=expected.tensor_spec,
             name=name,
         )
-        self.check_tensor_shape(actual, expected.shape, name)
         self.check_dtype(actual, expected.dtype_name, name)
         return actual
 
@@ -310,6 +415,22 @@ class ApiBaseJax(ApiBase, ABC):
             actual_presence = "present" if value is not None else "absent"
             raise ValueError(f"{name} presence mismatch: expected {expected_presence}, got {actual_presence}")
         return self.check_tensor_signature(value, expected, name=name)
+
+    @staticmethod
+    def freeze_mapping(values: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Return an immutable copy suitable for persistent callable state."""
+
+        return MappingProxyType(dict(values))
+
+    def check_tensor_signatures(
+        self,
+        expected: Mapping[str, JaxTensorDesc | None],
+        values: Mapping[str, Any],
+    ) -> None:
+        """Validate invocation metadata against named sample descriptors."""
+
+        for name, expected_desc in expected.items():
+            self.check_optional_tensor_signature(values[name], expected_desc, name=name)
 
     def get_jax_callable(self) -> Callable[..., Any]:
         """Return this stable, un-jitted callable object."""
@@ -441,7 +562,7 @@ def call_cutedsl(
     static_args: Optional[Mapping[str, Any]] = None,
     allow_cuda_graph: bool = True,
     compile_options: Any = None,
-    use_static_tensors: bool = False,
+    use_static_tensors: bool = True,
 ) -> Tuple[Any, ...]:
     """Invoke a CuTe DSL launcher as a functional JAX operation.
 
@@ -457,10 +578,13 @@ def call_cutedsl(
     Inputs must be a flat sequence of array-like values; nested pytrees are
     intentionally outside the FE ABI. ``input_specs`` and
     ``BufferSpec.tensor_spec`` accept native ``cutlass.jax.TensorSpec`` objects;
-    validation is delegated to ``cutlass.jax.cutlass_call``. Filled buffers are
-    passed as internal aliased inputs so the public JAX function remains
-    functional. ``fn`` and every value in ``static_args`` must be immutable and
-    hashable because they participate in JAX and CUTLASS compilation cache keys.
+    validation is delegated to ``cutlass.jax.cutlass_call``. Tensor shapes and
+    strides are compile-time constants by default; pass
+    ``use_static_tensors=False`` for a future symbolic-shape path. Filled
+    buffers are passed as internal aliased inputs so the public JAX function
+    remains functional. ``fn`` and every value in ``static_args`` must be
+    immutable and hashable because they participate in JAX and CUTLASS
+    compilation cache keys.
     """
 
     inputs = tuple(inputs)
@@ -533,5 +657,6 @@ __all__ = [
     "as_dtype",
     "as_optional_dtype",
     "call_cutedsl",
+    "require_array",
     "require_dtype",
 ]

@@ -281,7 +281,6 @@ class CallCutedslAdapterTest(unittest.TestCase):
             input_specs=(input_spec,),
             allow_cuda_graph=False,
             compile_options="--example-option",
-            use_static_tensors=True,
         )
 
         self.assertEqual(len(result), 1)
@@ -290,7 +289,6 @@ class CallCutedslAdapterTest(unittest.TestCase):
         self.assertIs(options["output_spec"][0], output_spec)
         self.assertFalse(options["allow_cuda_graph"])
         self.assertEqual(options["compile_options"], "--example-option")
-        self.assertTrue(options["use_static_tensors"])
 
     def test_default_result_spec_uses_cutlass_inference(self):
         _, _, bridge = self._call(
@@ -300,6 +298,25 @@ class CallCutedslAdapterTest(unittest.TestCase):
         )
 
         self.assertIsNone(bridge.calls[0][1]["output_spec"][0])
+
+    def test_static_tensors_default_to_true(self):
+        _, _, bridge = self._call(
+            lambda stream, x, output: None,
+            (_Array((8,), "f32", "x"),),
+            outputs=(BufferSpec("output", (8,), "f32"),),
+        )
+
+        self.assertTrue(bridge.calls[0][1]["use_static_tensors"])
+
+    def test_static_tensors_can_be_disabled(self):
+        _, _, bridge = self._call(
+            lambda stream, x, output: None,
+            (_Array((8,), "f32", "x"),),
+            outputs=(BufferSpec("output", (8,), "f32"),),
+            use_static_tensors=False,
+        )
+
+        self.assertFalse(bridge.calls[0][1]["use_static_tensors"])
 
     def test_rejects_invalid_call_plans(self):
         with self.assertRaisesRegex(ValueError, "at least one public output"):

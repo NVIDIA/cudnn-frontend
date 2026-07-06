@@ -16,27 +16,8 @@ from ..._jax.api_base import (
     BufferSpec,
     TupleDict,
     call_cutedsl,
-    require_dtype,
+    require_array,
 )
-
-
-def require_array(
-    name: str,
-    value: Any,
-    *,
-    rank: int,
-    shape: Optional[tuple[int, ...]] = None,
-    dtype: Any,
-) -> None:
-    """Require an array with the expected rank, optional shape, and dtype."""
-
-    if not hasattr(value, "shape") or not hasattr(value, "dtype"):
-        raise TypeError(f"{name} must be a JAX array with shape and dtype metadata")
-    if len(value.shape) != rank:
-        raise ValueError(f"{name} must have rank {rank}, got shape {value.shape}")
-    if shape is not None and tuple(value.shape) != shape:
-        raise ValueError(f"{name} must have shape {shape}, got {tuple(value.shape)}")
-    require_dtype(f"{name}.dtype", value, (dtype,))
 
 
 def _launch_with_topk_length(
@@ -185,11 +166,11 @@ def _sparse_attention_backward_impl(
     Configuration values must be static under :func:`jax.jit`.
     """
 
-    require_array("q", q, rank=3, dtype=jnp.bfloat16)
-    require_array("kv", kv, rank=2, dtype=jnp.bfloat16)
+    q_shape = require_array(q, name="q", rank=3, dtype=jnp.bfloat16)
+    kv_shape = require_array(kv, name="kv", rank=2, dtype=jnp.bfloat16)
 
-    total_seqlen_q, num_heads, head_dim = tuple(q.shape)
-    total_seqlen_kv, kv_head_dim = tuple(kv.shape)
+    total_seqlen_q, num_heads, head_dim = q_shape
+    total_seqlen_kv, kv_head_dim = kv_shape
     dimensions = {
         "S_q": total_seqlen_q,
         "S_kv": total_seqlen_kv,
@@ -206,25 +187,26 @@ def _sparse_attention_backward_impl(
     if block_tile != 64:
         raise ValueError(f"block_tile must be 64, got {block_tile}")
 
-    q_shape = (total_seqlen_q, num_heads, head_dim)
-    require_array("out", out, rank=3, shape=q_shape, dtype=jnp.bfloat16)
-    require_array("dout", dout, rank=3, shape=q_shape, dtype=jnp.bfloat16)
+    require_array(out, name="out", shape=q_shape, dtype=jnp.bfloat16)
+    require_array(dout, name="dout", shape=q_shape, dtype=jnp.bfloat16)
     require_array(
-        "lse",
         lse,
-        rank=2,
+        name="lse",
         shape=(total_seqlen_q, num_heads),
         dtype=jnp.float32,
     )
     require_array(
-        "attn_sink",
         attn_sink,
-        rank=1,
+        name="attn_sink",
         shape=(num_heads,),
         dtype=jnp.float32,
     )
-    require_array("topk_idxs", topk_idxs, rank=2, dtype=jnp.int32)
-    topk_shape = tuple(topk_idxs.shape)
+    topk_shape = require_array(
+        topk_idxs,
+        name="topk_idxs",
+        rank=2,
+        dtype=jnp.int32,
+    )
     if topk_shape[0] != total_seqlen_q:
         raise ValueError(f"topk_idxs leading dimension must be S_q ({total_seqlen_q}), got {topk_shape[0]}")
     if topk_shape[1] <= 0:
@@ -232,9 +214,8 @@ def _sparse_attention_backward_impl(
 
     if topk_length is not None:
         require_array(
-            "topk_length",
             topk_length,
-            rank=1,
+            name="topk_length",
             shape=(total_seqlen_q,),
             dtype=jnp.int32,
         )
@@ -314,7 +295,6 @@ def _sparse_attention_backward_impl(
             "block_tile": int(block_tile),
             "softmax_scale": float(resolved_scale),
         },
-        use_static_tensors=True,
     )
     return TupleDict(dq=dq, dkv=dkv, d_sink=d_sink)
 
@@ -347,7 +327,7 @@ class SparseAttentionBackward(ApiBaseJax):
         self.softmax_scale = softmax_scale
         self.block_tile = block_tile
 
-    def _check_support(self) -> bool:
+    def _check_support(self) -> None:
         _sparse_attention_backward_impl(
             self.q_desc,
             self.kv_desc,
@@ -361,7 +341,6 @@ class SparseAttentionBackward(ApiBaseJax):
             self.block_tile,
             _validate_only=True,
         )
-        return True
 
     def __call__(
         self,

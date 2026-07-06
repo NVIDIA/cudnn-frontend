@@ -56,6 +56,7 @@ def _allocate(cfg, sm_scale: float, ratio: int, q_causal_offsets: torch.Tensor):
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
+@pytest.mark.parametrize("has_q_causal_offsets", [False, True])
 @with_dsa_dense_indexer_backward_params
 def test_DSA_dense_indexer_backward_wrapper(
     dtype,
@@ -64,6 +65,7 @@ def test_DSA_dense_indexer_backward_wrapper(
     qhead_per_kv_head,
     block_I,
     ratio,
+    has_q_causal_offsets,
     request,
 ):
     try:
@@ -87,7 +89,11 @@ def test_DSA_dense_indexer_backward_wrapper(
     sm_scale = 1.0
     b_cfg = cfg["b"]
     s_q_cfg = cfg["s_q"]
-    q_causal_offsets = torch.full((b_cfg,), 8, dtype=torch.int32, device="cuda")
+    q_causal_offsets = (
+        torch.full((b_cfg,), 8, dtype=torch.int32, device="cuda")
+        if has_q_causal_offsets
+        else None
+    )
     loss_coeff = float(b_cfg * s_q_cfg)
     grad_loss = 1.0
     grad_scale_expected = (loss_coeff / (b_cfg * s_q_cfg)) * grad_loss
@@ -125,6 +131,8 @@ def test_DSA_dense_indexer_backward_wrapper(
             stream=stream,
         )
     except (ValueError, NotImplementedError, RuntimeError) as e:
+        if torch.cuda.get_device_capability()[0] >= 10:
+            raise
         pytest.skip(f"Unsupported testcase: {e}")
     torch_stream.synchronize()
 

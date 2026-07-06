@@ -190,7 +190,6 @@ class JaxSdpaContractTest(unittest.TestCase):
         self.assertEqual(result["o_tensor"].shape, q.shape)
         self.assertEqual(result["lse_tensor"].shape, (2, 8, 64))
         self.assertEqual(captured["inputs"], (q, k, v))
-        self.assertTrue(captured["use_static_tensors"])
         self.assertNotIn("workspaces", captured)
         self.assertIs(captured["launcher"], self.forward._launch)
         self.assertEqual(
@@ -252,7 +251,6 @@ class JaxSdpaContractTest(unittest.TestCase):
         self.assertEqual(result["dk_tensor"].shape, k.shape)
         self.assertEqual(result["dv_tensor"].shape, v.shape)
         self.assertEqual(captured["inputs"], (q, k, v, output, doutput, lse))
-        self.assertTrue(captured["use_static_tensors"])
         self.assertIs(captured["launcher"], self.backward._launch)
         self.assertEqual(
             [(spec.name, spec.shape, spec.dtype) for spec in captured["outputs"]],

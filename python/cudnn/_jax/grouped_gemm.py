@@ -11,9 +11,8 @@ from typing import Any
 import jax.numpy as jnp
 from cutlass.jax import TensorSpec
 
-from ..gemm_validation import block_scale_shape, require_shape
-from .api_base import require_dtype
-from .gemm import require_array
+from ..gemm_validation import block_scale_shape
+from .api_base import as_dtype, require_array
 
 
 def require_grouped_gemm_inputs(
@@ -32,8 +31,16 @@ def require_grouped_gemm_inputs(
     runtime by ``padded_offsets``.
     """
 
-    a_shape = require_array("a_tensor", a_tensor, 3)
-    b_shape = require_array("b_tensor", b_tensor, 3)
+    if valid_ab_dtypes is None:
+        valid_ab_dtypes = (jnp.float8_e4m3fn, jnp.float8_e5m2)
+    a_shape = require_array(
+        a_tensor,
+        name="a_tensor",
+        rank=3,
+        dtype=valid_ab_dtypes,
+    )
+    a_dtype = as_dtype(a_tensor)
+    b_shape = require_array(b_tensor, name="b_tensor", rank=3, dtype=a_dtype)
     m, k, a_batch = a_shape
     n, b_k, experts = b_shape
     if a_batch != 1:
@@ -47,18 +54,18 @@ def require_grouped_gemm_inputs(
     if experts > max_experts:
         raise ValueError(f"The number of experts must be at most {max_experts}, got {experts}")
 
-    if valid_ab_dtypes is None:
-        valid_ab_dtypes = (jnp.float8_e4m3fn, jnp.float8_e5m2)
-    a_dtype = require_dtype("a_tensor.dtype", a_tensor, valid_ab_dtypes)
-    require_dtype("b_tensor.dtype", b_tensor, (a_dtype,))
-
-    offsets_shape = require_array("padded_offsets", padded_offsets, 1)
-    require_shape("padded_offsets", offsets_shape, (experts,))
-    require_dtype("padded_offsets.dtype", padded_offsets, (jnp.int32,))
-
-    alpha_shape = require_array("alpha_tensor", alpha_tensor, 1)
-    require_shape("alpha_tensor", alpha_shape, (experts,))
-    require_dtype("alpha_tensor.dtype", alpha_tensor, (jnp.float32,))
+    require_array(
+        padded_offsets,
+        name="padded_offsets",
+        shape=(experts,),
+        dtype=jnp.int32,
+    )
+    require_array(
+        alpha_tensor,
+        name="alpha_tensor",
+        shape=(experts,),
+        dtype=jnp.float32,
+    )
     return m, n, k, experts, a_dtype
 
 
@@ -99,12 +106,19 @@ def require_grouped_block_scales(
 ) -> Any:
     """Validate native block-scale shapes and a caller-supplied dtype set."""
 
-    sfa_shape = require_array("sfa_tensor", sfa_tensor, 6)
-    sfb_shape = require_array("sfb_tensor", sfb_tensor, 6)
-    require_shape("sfa_tensor", sfa_shape, block_scale_shape(m, k, 1, sf_vec_size))
-    require_shape("sfb_tensor", sfb_shape, block_scale_shape(n, k, experts, sf_vec_size))
-    sf_dtype = require_dtype("sfa_tensor.dtype", sfa_tensor, valid_dtypes)
-    require_dtype("sfb_tensor.dtype", sfb_tensor, (sf_dtype,))
+    require_array(
+        sfa_tensor,
+        name="sfa_tensor",
+        shape=block_scale_shape(m, k, 1, sf_vec_size),
+        dtype=valid_dtypes,
+    )
+    sf_dtype = as_dtype(sfa_tensor)
+    require_array(
+        sfb_tensor,
+        name="sfb_tensor",
+        shape=block_scale_shape(n, k, experts, sf_vec_size),
+        dtype=sf_dtype,
+    )
     return sf_dtype
 
 
@@ -119,17 +133,19 @@ def require_grouped_vector(
 
     if dtype is None:
         dtype = jnp.float32
-    shape = require_array(name, tensor, 1)
-    require_shape(name, shape, (length,))
-    return require_dtype(f"{name}.dtype", tensor, (dtype,))
+    require_array(tensor, name=name, shape=(length,), dtype=dtype)
+    return as_dtype(tensor)
 
 
 def require_grouped_probability(name: str, tensor: Any, *, m: int) -> None:
     """Validate a per-row FP32 probability tensor."""
 
-    shape = require_array(name, tensor, 3)
-    require_shape(name, shape, (m, 1, 1))
-    require_dtype(f"{name}.dtype", tensor, (jnp.float32,))
+    require_array(
+        tensor,
+        name=name,
+        shape=(m, 1, 1),
+        dtype=jnp.float32,
+    )
 
 
 def grouped_bias_tensor_spec() -> TensorSpec:

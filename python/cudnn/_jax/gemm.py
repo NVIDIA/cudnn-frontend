@@ -15,18 +15,64 @@ from ..gemm_validation import (
     require_contiguous_alignment,
     require_gemm_shapes,
 )
-from .api_base import require_dtype
+from .api_base import JaxTensorDesc, as_dtype, require_array
+
+GEMM_A_LAYOUTS = ("LMK", "LKM")
+GEMM_B_LAYOUTS = ("LNK", "LKN")
+GEMM_C_LAYOUTS = ("LMN", "LNM")
 
 
-def require_array(name: str, value: Any, rank: int) -> tuple[Any, ...]:
-    """Return an array-like value's shape after checking its rank."""
+def require_layout(name: str, value: str, supported: tuple[str, ...]) -> str:
+    """Return a canonical public axis-order string from a supported set."""
 
-    if not hasattr(value, "shape") or not hasattr(value, "dtype"):
-        raise TypeError(f"{name} must have shape and dtype metadata")
-    shape = tuple(value.shape)
-    if len(shape) != rank:
-        raise ValueError(f"{name} must have rank {rank}, got shape {shape}")
-    return shape
+    if not isinstance(value, str):
+        raise TypeError(f"{name} must be a string, got {type(value).__name__}")
+    value = value.upper()
+    if value not in supported:
+        choices = ", ".join(repr(item) for item in supported)
+        raise ValueError(f"{name} must be one of {{{choices}}}, got {value!r}")
+    return value
+
+
+def _gemm_tensor_spec(
+    name: str,
+    layout: str,
+    *,
+    kernel_modes: str,
+    supported: tuple[str, ...],
+) -> TensorSpec:
+    """Map a compact row-major public layout to canonical kernel modes."""
+
+    layout = require_layout(name, layout, supported)
+    mode = tuple(layout.index(dim) for dim in kernel_modes)
+    return TensorSpec(
+        layout=(2, 1, 0),
+        mode=mode,
+    )
+
+
+def as_gemm_tensor_desc(
+    name: str,
+    value: Any,
+    tensor_spec: TensorSpec,
+) -> JaxTensorDesc:
+    """Return kernel-visible GEMM metadata for an array or existing descriptor."""
+
+    if isinstance(value, JaxTensorDesc):
+        expected_layout = tuple(tensor_spec.layout)
+        expected_mode = tuple(tensor_spec.mode)
+        if value.layout != expected_layout or value.mode != expected_mode:
+            raise ValueError(
+                f"{name} descriptor layout does not match the requested GEMM layout: "
+                f"expected layout={expected_layout}, mode={expected_mode}; "
+                f"got layout={value.layout}, mode={value.mode}"
+            )
+        return value
+    return JaxTensorDesc.from_value(
+        value,
+        tensor_spec=tensor_spec,
+        name=name,
+    )
 
 
 def require_gemm_inputs(
@@ -35,13 +81,10 @@ def require_gemm_inputs(
 ) -> tuple[int, int, int, int, Any]:
     """Validate common dense GEMM metadata and return ``M, N, K, L, dtype``."""
 
-    a_shape = require_array("a_tensor", a_tensor, 3)
-    b_shape = require_array("b_tensor", b_tensor, 3)
+    a_shape = require_array(a_tensor, name="a_tensor", rank=3)
+    a_dtype = as_dtype(a_tensor)
+    b_shape = require_array(b_tensor, name="b_tensor", rank=3, dtype=a_dtype)
     m, n, k, batch = require_gemm_shapes(a_shape, b_shape)
-    a_dtype = jnp.dtype(a_tensor.dtype)
-    b_dtype = jnp.dtype(b_tensor.dtype)
-    if b_dtype != a_dtype:
-        raise ValueError(f"a_tensor and b_tensor dtypes must match, got {a_dtype} and {b_dtype}")
     return m, n, k, batch, a_dtype
 
 
@@ -59,8 +102,18 @@ def require_fp8_block_scales(
 
     if sf_vec_size != 32:
         raise NotImplementedError("The JAX MXFP8 path requires sf_vec_size=32, " f"got {sf_vec_size}")
-    sfa_shape = require_array("sfa_tensor", sfa_tensor, 6)
-    sfb_shape = require_array("sfb_tensor", sfb_tensor, 6)
+    sfa_shape = require_array(
+        sfa_tensor,
+        name="sfa_tensor",
+        rank=6,
+        dtype=jnp.float8_e8m0fnu,
+    )
+    sfb_shape = require_array(
+        sfb_tensor,
+        name="sfb_tensor",
+        rank=6,
+        dtype=jnp.float8_e8m0fnu,
+    )
     require_block_scale_shapes(
         sfa_shape,
         sfb_shape,
@@ -70,8 +123,6 @@ def require_fp8_block_scales(
         batch=batch,
         sf_vec_size=sf_vec_size,
     )
-    require_dtype("sfa_tensor.dtype", sfa_tensor, (jnp.float8_e8m0fnu,))
-    require_dtype("sfb_tensor.dtype", sfb_tensor, (jnp.float8_e8m0fnu,))
 
 
 def require_16_byte_extent(name: str, elements: int, dtype: Any) -> None:
@@ -81,34 +132,37 @@ def require_16_byte_extent(name: str, elements: int, dtype: Any) -> None:
     require_contiguous_alignment(name, elements, dtype.itemsize * 8)
 
 
-def gemm_a_tensor_spec(major: str) -> TensorSpec:
-    """Describe a logical ``(M, K, L)`` tensor with the requested major mode."""
+def gemm_a_tensor_spec(layout: str) -> TensorSpec:
+    """Describe public A layout ``LMK`` or ``LKM`` as kernel ``(M,K,L)``."""
 
-    try:
-        layout = {"m": (0, 1, 2), "k": (1, 0, 2)}[major]
-    except KeyError:
-        raise ValueError(f"a_major must be either 'm' or 'k', got {major!r}") from None
-    return TensorSpec(layout=layout, mode=(0, 1, 2))
-
-
-def gemm_b_tensor_spec(major: str) -> TensorSpec:
-    """Describe a logical ``(N, K, L)`` tensor with the requested major mode."""
-
-    try:
-        layout = {"n": (0, 1, 2), "k": (1, 0, 2)}[major]
-    except KeyError:
-        raise ValueError(f"b_major must be either 'n' or 'k', got {major!r}") from None
-    return TensorSpec(layout=layout, mode=(0, 1, 2))
+    return _gemm_tensor_spec(
+        "a_layout",
+        layout,
+        kernel_modes="MKL",
+        supported=GEMM_A_LAYOUTS,
+    )
 
 
-def gemm_c_tensor_spec(major: str) -> TensorSpec:
-    """Describe a logical ``(M, N, L)`` tensor with the requested major mode."""
+def gemm_b_tensor_spec(layout: str) -> TensorSpec:
+    """Describe public B layout ``LNK`` or ``LKN`` as kernel ``(N,K,L)``."""
 
-    try:
-        layout = {"m": (0, 1, 2), "n": (1, 0, 2)}[major]
-    except KeyError:
-        raise ValueError(f"c_major must be either 'm' or 'n', got {major!r}") from None
-    return TensorSpec(layout=layout, mode=(0, 1, 2))
+    return _gemm_tensor_spec(
+        "b_layout",
+        layout,
+        kernel_modes="NKL",
+        supported=GEMM_B_LAYOUTS,
+    )
+
+
+def gemm_c_tensor_spec(layout: str, *, name: str = "c_layout") -> TensorSpec:
+    """Describe public C/D layout ``LMN`` or ``LNM`` as kernel ``(M,N,L)``."""
+
+    return _gemm_tensor_spec(
+        name,
+        layout,
+        kernel_modes="MNL",
+        supported=GEMM_C_LAYOUTS,
+    )
 
 
 def block_scale_tensor_spec() -> TensorSpec:
@@ -127,13 +181,17 @@ def probability_tensor_spec() -> TensorSpec:
 
 
 __all__ = [
+    "GEMM_A_LAYOUTS",
+    "GEMM_B_LAYOUTS",
+    "GEMM_C_LAYOUTS",
+    "as_gemm_tensor_desc",
     "block_scale_tensor_spec",
     "gemm_a_tensor_spec",
     "gemm_b_tensor_spec",
     "gemm_c_tensor_spec",
     "probability_tensor_spec",
-    "require_array",
     "require_fp8_block_scales",
     "require_gemm_inputs",
     "require_16_byte_extent",
+    "require_layout",
 ]

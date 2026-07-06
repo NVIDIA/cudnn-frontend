@@ -167,7 +167,6 @@ class JaxGroupedGemmContractTest(unittest.TestCase):
         cls.calls = []
 
         def call_cutedsl(fn, inputs, *, outputs, input_specs, **kwargs):
-            del input_specs
             result_buffers = tuple(types.SimpleNamespace(name=spec.name) for spec in outputs)
             workspace_buffers = tuple(types.SimpleNamespace(name=spec.name, iterator=f"{spec.name}_ptr") for spec in kwargs.get("workspaces", ()))
             fn(
@@ -177,17 +176,31 @@ class JaxGroupedGemmContractTest(unittest.TestCase):
                 *workspace_buffers,
                 **kwargs.get("static_args", {}),
             )
-            cls.calls.append((tuple(outputs), {**kwargs, "launcher": fn}))
+            cls.calls.append((tuple(outputs), {**kwargs, "launcher": fn, "input_specs": tuple(input_specs)}))
             return result_buffers
 
         cls.fake_gemm = types.ModuleType(f"{_TEST_PACKAGE}._jax.gemm")
-        cls.fake_gemm.require_array = cls._require_array
         cls.fake_gemm.require_16_byte_extent = lambda *_: None
-        cls.fake_gemm.block_scale_tensor_spec = lambda: "scale_spec"
-        cls.fake_gemm.gemm_a_tensor_spec = lambda major: f"a_{major}"
-        cls.fake_gemm.gemm_b_tensor_spec = lambda major: f"b_{major}"
-        cls.fake_gemm.gemm_c_tensor_spec = lambda major: f"c_{major}"
-        cls.fake_gemm.probability_tensor_spec = lambda: "prob_spec"
+
+        def require_layout(name, value, supported):
+            value = value.upper()
+            if value not in supported:
+                raise ValueError(f"{name} must be one of {supported}, got {value!r}")
+            return value
+
+        def matrix_spec(name, value, supported, kernel_modes):
+            value = require_layout(name, value, supported)
+            return _TensorSpec(
+                layout=(2, 1, 0),
+                mode=tuple(value.index(dim) for dim in kernel_modes),
+            )
+
+        cls.fake_gemm.require_layout = require_layout
+        cls.fake_gemm.block_scale_tensor_spec = lambda: _TensorSpec(layout=(2, 1, 4, 0, 3, 5), mode=(0, 1, 2, 3, 4, 5))
+        cls.fake_gemm.gemm_a_tensor_spec = lambda value: matrix_spec("a_layout", value, ("LMK", "LKM"), "MKL")
+        cls.fake_gemm.gemm_b_tensor_spec = lambda value: matrix_spec("b_layout", value, ("LNK", "LKN"), "NKL")
+        cls.fake_gemm.gemm_c_tensor_spec = lambda value, *, name="c_layout": matrix_spec(name, value, ("LMN", "LNM"), "MNL")
+        cls.fake_gemm.probability_tensor_spec = lambda: _TensorSpec(layout=(0, 1, 2), mode=(0, 1, 2))
 
         cls.fake_kernel_modules = {}
         for suffix, class_name in (
@@ -260,6 +273,9 @@ class JaxGroupedGemmContractTest(unittest.TestCase):
             )
             jax_api_base.BufferSpec = _BufferSpec
             jax_api_base.call_cutedsl = call_cutedsl
+            cls.fake_gemm.as_gemm_tensor_desc = lambda name, value, tensor_spec: (
+                value if isinstance(value, jax_api_base.JaxTensorDesc) else jax_api_base.JaxTensorDesc.from_value(value, tensor_spec=tensor_spec, name=name)
+            )
             cls._load_source(
                 f"{_TEST_PACKAGE}._jax.grouped_gemm",
                 _CUDNN_ROOT / "_jax" / "grouped_gemm.py",
@@ -278,12 +294,6 @@ class JaxGroupedGemmContractTest(unittest.TestCase):
         for module_name in tuple(sys.modules):
             if module_name == _TEST_PACKAGE or module_name.startswith(f"{_TEST_PACKAGE}."):
                 sys.modules.pop(module_name, None)
-
-    @staticmethod
-    def _require_array(name, value, rank):
-        if len(value.shape) != rank:
-            raise ValueError(f"{name} must have rank {rank}")
-        return tuple(value.shape)
 
     @staticmethod
     def _make_package(name, path):
@@ -325,8 +335,8 @@ class JaxGroupedGemmContractTest(unittest.TestCase):
     def _inputs(self):
         m, n, k, experts = 256, 256, 64, 4
         return {
-            "a": _Array((m, k, 1), self.float8_e4m3fn),
-            "b": _Array((n, k, experts), self.float8_e4m3fn),
+            "a": _Array((1, m, k), self.float8_e4m3fn),
+            "b": _Array((experts, n, k), self.float8_e4m3fn),
             "sfa": _Array((32, 4, 2, 4, 1, 1), self.float8_e8m0fnu),
             "sfb": _Array((32, 4, 2, 4, 1, experts), self.float8_e8m0fnu),
             "offsets": _Array((experts,), self.int32),
@@ -361,6 +371,10 @@ class JaxGroupedGemmContractTest(unittest.TestCase):
             ],
         )
         specs, options = self.calls[-1]
+        self.assertEqual(next(spec.shape for spec in specs if spec.name == "c_tensor"), (1, 256, 256))
+        self.assertEqual(next(spec.shape for spec in specs if spec.name == "d_tensor"), (1, 256, 128))
+        self.assertEqual(options["input_specs"][0].mode, (1, 2, 0))
+        self.assertEqual(options["input_specs"][1].mode, (1, 2, 0))
         self.assertEqual(
             next(spec.fill_value for spec in specs if spec.name == "amax_tensor"),
             -float("inf"),
@@ -369,7 +383,6 @@ class JaxGroupedGemmContractTest(unittest.TestCase):
             next(spec.shape for spec in specs if spec.name == "sfd_row_tensor"),
             (32, 4, 2, 4, 1, 1),
         )
-        self.assertTrue(options["use_static_tensors"])
         self.assertIs(options["launcher"], self.swiglu._launch)
         self.assertEqual(options["static_args"]["expert_cnt"], 4)
         self.assertTrue(options["static_args"]["has_prob"])
@@ -408,9 +421,37 @@ class JaxGroupedGemmContractTest(unittest.TestCase):
             with self.assertRaisesRegex(AttributeError, "immutable after its first call"):
                 operation._config = {}
 
+    def test_environment_config_is_captured_at_construction(self):
+        values = self._inputs()
+        with self._modules(), mock.patch.object(self.swiglu.os, "getenv", return_value="3") as getenv:
+            operation = self.swiglu.GroupedGemmSwigluSm100(
+                values["a"],
+                values["b"],
+                values["sfa"],
+                values["sfb"],
+                values["offsets"],
+                values["alpha"],
+                values["norm"],
+                values["prob"],
+            )
+            getenv.return_value = "9"
+            operation(
+                values["a"],
+                values["b"],
+                values["sfa"],
+                values["sfb"],
+                values["offsets"],
+                values["alpha"],
+                values["norm"],
+                values["prob"],
+            )
+
+        self.assertEqual(getenv.call_count, 1)
+        self.assertEqual(self.calls[-1][1]["static_args"]["cluster_overlap_margin"], 3)
+
     def test_backward_zero_initializes_dprob(self):
         values = self._inputs()
-        c_tensor = _Array((256, 512, 1), self.bfloat16)
+        c_tensor = _Array((1, 256, 512), self.bfloat16)
         with self._modules():
             result = self.dswiglu.grouped_gemm_dswiglu_wrapper_sm100(
                 values["a"],
@@ -437,7 +478,9 @@ class JaxGroupedGemmContractTest(unittest.TestCase):
             ],
         )
         specs, _ = self.calls[-1]
-        self.assertEqual(next(spec.fill_value for spec in specs if spec.name == "dprob_tensor"), 0.0)
+        dprob_spec = next(spec for spec in specs if spec.name == "dprob_tensor")
+        self.assertEqual(dprob_spec.fill_value, 0.0)
+        self.assertEqual(dprob_spec.tensor_spec.layout, (0, 1, 2))
         self.assertEqual(
             next(spec.dtype for spec in specs if spec.name == "d_row_tensor"),
             self.float8_e4m3fn,
@@ -480,6 +523,57 @@ class JaxGroupedGemmContractTest(unittest.TestCase):
         self.assertEqual(workspace.dtype, self.uint8)
         self.assertEqual(workspace.tensor_spec.ptr_assumed_align, 128)
         self.assertTrue(_KernelSurface.calls[-1][0]["use_dynamic_sched"])
+
+    def test_quant_accepts_public_lkn_weight_layout(self):
+        values = self._inputs()
+        values["b"] = _Array((4, 64, 128), self.float8_e4m3fn)
+        values["sfb"] = _Array((32, 4, 1, 4, 1, 4), self.float8_e8m0fnu)
+        with self._modules():
+            self.quant.grouped_gemm_quant_wrapper_sm100(
+                values["a"],
+                values["sfa"],
+                values["offsets"],
+                values["alpha"],
+                values["b"],
+                values["sfb"],
+                prob_tensor=values["prob"],
+                b_layout="lkn",
+                mma_tiler_mn=(256, 128),
+            )
+
+        specs, options = self.calls[-1]
+        self.assertEqual(next(spec.shape for spec in specs if spec.name == "d_tensor"), (1, 256, 128))
+        self.assertEqual(options["input_specs"][1].layout, (2, 1, 0))
+        self.assertEqual(options["input_specs"][1].mode, (2, 1, 0))
+
+    def test_grouped_layouts_are_limited_by_kernel_capabilities(self):
+        values = self._inputs()
+        with self._modules():
+            with self.assertRaisesRegex(ValueError, "output_layout must be one of"):
+                self.quant.grouped_gemm_quant_wrapper_sm100(
+                    values["a"],
+                    values["sfa"],
+                    values["offsets"],
+                    values["alpha"],
+                    values["b"],
+                    values["sfb"],
+                    prob_tensor=values["prob"],
+                    output_layout="LNM",
+                )
+
+            with self.assertRaisesRegex(ValueError, "b_layout must be one of"):
+                self.glu.grouped_gemm_glu_wrapper_sm100(
+                    values["a"],
+                    values["sfa"],
+                    values["offsets"],
+                    values["alpha"],
+                    values["b"],
+                    values["sfb"],
+                    prob_tensor=values["prob"],
+                    b_layout="LKN",
+                )
+
+        self.assertFalse(self.calls)
 
     def test_srelu_nonquantized_output_initializes_amax(self):
         values = self._inputs()
@@ -576,7 +670,7 @@ class JaxGroupedGemmContractTest(unittest.TestCase):
 
     def test_dglu_zero_initializes_functional_reductions(self):
         values = self._inputs()
-        c_tensor = _Array((256, 512, 1), self.bfloat16)
+        c_tensor = _Array((1, 256, 512), self.bfloat16)
         beta = _Array((4,), self.float32)
         with self._modules():
             result = self.dglu.grouped_gemm_dglu_wrapper_sm100(
@@ -609,6 +703,10 @@ class JaxGroupedGemmContractTest(unittest.TestCase):
         specs, options = self.calls[-1]
         fills = {spec.name: spec.fill_value for spec in specs}
         self.assertEqual(fills["dprob_tensor"], 0.0)
+        self.assertEqual(
+            next(spec.tensor_spec.layout for spec in specs if spec.name == "dprob_tensor"),
+            (0, 1, 2),
+        )
         self.assertEqual(fills["dbias_tensor"], 0.0)
         self.assertEqual(options["workspaces"][0].shape, (4,))
         kernel_config, _, _ = _KernelSurface.calls[-1]
@@ -701,7 +799,7 @@ class JaxGroupedGemmContractTest(unittest.TestCase):
         specs, options = self.calls[-1]
         self.assertEqual(
             next(spec.shape for spec in specs if spec.name == "d_tensor"),
-            (256, 256, 1),
+            (1, 256, 256),
         )
         self.assertEqual(options["workspaces"][0].shape, (1,))
         self.assertEqual(options["workspaces"][0].fill_value, 0)
@@ -728,7 +826,7 @@ class JaxGroupedGemmContractTest(unittest.TestCase):
 
     def test_dsrelu_exposes_functional_outputs_and_hidden_workspace(self):
         values = self._inputs()
-        c_tensor = _Array((256, 256, 1), self.bfloat16)
+        c_tensor = _Array((1, 256, 256), self.bfloat16)
         with self._modules():
             result = self.dsrelu.grouped_gemm_dsrelu_wrapper_sm100(
                 values["a"],

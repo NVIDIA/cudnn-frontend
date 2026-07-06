@@ -162,20 +162,31 @@ def run(a, b, sfa, sfb, padded_offsets, alpha, prob, norm_const):
         prob_tensor=prob,
         norm_const_tensor=norm_const,
         d_dtype=jnp.float8_e4m3fn,
+        output_layout="LMN",
         mma_tiler_mn=(256, 256),
         cluster_shape_mn=(2, 1),
         sf_vec_size=32,
+        b_layout="LNK",
     )
 
 result = run(a, b, sfa, sfb, padded_offsets, alpha, prob, norm_const)
 d, d_col, amax, sfd_row, sfd_col = result
 ```
 
-The JAX API returns `TupleDict`. It supports dense FP8 A/B with
-E8M0 scales and `sf_vec_size=32`; FP8 D produces `d_col`, `sfd_row`, and
-`sfd_col`, while `amax` is `None`. Discrete weight pointers and packed FP4 are
-not exposed. Shapes, dtypes, layouts, and configuration arguments are static
-under `jax.jit`.
+The JAX API returns `TupleDict`. Its layout strings describe public axis order,
+not physical strides. `A` is fixed to `LMK` with shape `(1, valid_m, K)`.
+`b_layout="LNK"` uses shape `(L, N, K)` and `b_layout="LKN"` uses
+`(L, K, N)`, where `L` is the expert count. Matrix outputs are fixed to
+`output_layout="LMN"` and have shape `(1, valid_m, N)`. The batch/expert mode
+must remain outermost in these strings.
+
+The packed scale tensors, `prob`, and reduction outputs retain their
+operator-specific shapes documented below; the matrix layout strings do not
+reorder them. The JAX path supports dense FP8 A/B with E8M0 scales and
+`sf_vec_size=32`; FP8 D produces `d_col`, `sfd_row`, and `sfd_col`, while
+`amax` is `None`. Discrete weight pointers and packed FP4 are not exposed.
+Shapes, dtypes, layouts, and configuration arguments are static under
+`jax.jit`.
 
 `````
 

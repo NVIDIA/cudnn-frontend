@@ -163,21 +163,31 @@ def run(a, b, sfa, sfb, padded_offsets, alpha, prob, bias):
         bias_tensor=bias,
         c_dtype=jnp.bfloat16,
         d_dtype=jnp.bfloat16,
+        output_layout="LMN",
         mma_tiler_mn=(256, 256),
         cluster_shape_mn=(2, 1),
         sf_vec_size=16,
         act_func="swiglu",
+        b_layout="LNK",
     )
 
 result = run(a, b, sfa, sfb, padded_offsets, alpha, prob, bias)
 c, d, amax, post_rht_amax = result
 ```
 
-The JAX API returns `TupleDict`. Unlike the other grouped
-JAX wrappers, this kernel's supported input path is dense native FP4
-(`jnp.float4_e2m1fn`), with E8M0 or E4M3 scale factors. Raw packed `uint8`
-FP4 and discrete weight pointers are not exposed. Shapes, dtypes, layouts,
-and configuration arguments are static under `jax.jit`.
+The JAX matrix inputs have fixed public axis orders: `A` is `LMK` with shape
+`(1, valid_m, K)`, and the supported `b_layout="LNK"` uses shape `(L, N, K)`.
+The `LKN` B order is not supported by this kernel. Matrix outputs are fixed to
+`output_layout="LMN"`: `C` has shape `(1, valid_m, N)`, while `D` has shape
+`(1, valid_m, N/2)` for SwiGLU and GEGLU. The expert mode must remain outermost
+in layout strings.
+
+Packed scale tensors, `prob`, `bias`, and reduction outputs retain their
+specialized shapes documented below. Unlike the other grouped JAX wrappers,
+this kernel's supported input path is dense native FP4
+(`jnp.float4_e2m1fn`), with E8M0 or E4M3 scale factors. Raw packed `uint8` FP4
+and discrete weight pointers are not exposed. Shapes, dtypes, layouts, and
+configuration arguments are static under `jax.jit`.
 
 `````
 
@@ -302,8 +312,9 @@ Returns a `TupleDict` with keys:
 - `c_tensor`
 - `d_tensor`
 - `amax_tensor`
+- `post_rht_amax_tensor`
 
-Tuple unpacking order is: `(c_tensor, d_tensor, amax_tensor)`.
+Tuple unpacking order is: `(c_tensor, d_tensor, amax_tensor, post_rht_amax_tensor)`.
 
 ---
 

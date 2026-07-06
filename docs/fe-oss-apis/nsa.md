@@ -94,7 +94,7 @@ NSA.TopKReduction
 NSA.topk_reduction_wrapper
 ```
 
-The explicit JAX namespace exposes the functional CuTe-DSL subset:
+The explicit JAX namespace exposes the functional JAX subset:
 
 ```python
 from cudnn.jax import NSA
@@ -102,10 +102,11 @@ from cudnn.jax import NSA
 NSA.selection_attention_wrapper
 NSA.compression_attention_wrapper
 NSA.topk_reduction_wrapper
+NSA.sliding_window_attention_wrapper
 ```
 
-Sliding Window Attention uses the cuDNN backend and remains available only
-through the PyTorch-first namespace.
+Selection, compression, and top-K use CuTe DSL. Sliding-window inference uses
+JAX's registered cuDNN attention lowering.
 
 ---
 
@@ -457,7 +458,7 @@ This implementation is a wrapper around cudnn backend (and is not strictly open 
 For each query position $q$, attention is restricted to key positions within the window:
 
 $$
-O[q] = \sum_{k : q - L \leq k \leq q + R} \text{softmax}\left(\frac{Q[q] \cdot K[k]^T}{\sqrt{D}}\right) V[k]
+O[q] = \sum_{k : q - L < k \leq q + R} \text{softmax}\left(\frac{Q[q] \cdot K[k]^T}{\sqrt{D}}\right) V[k]
 $$
 
 where $L$ is `left_bound` and $R$ is `right_bound`.
@@ -499,9 +500,33 @@ o, stats = result
 `````{tab-item} JAX
 :sync: jax
 
-Sliding Window Attention is not exposed by `cudnn.jax.NSA`. This component
-uses the cuDNN backend rather than a frontend-only CuTe-DSL kernel, and its
-current wrapper remains PyTorch-only.
+```python
+import jax
+from cudnn.jax import NSA
+
+@jax.jit
+def sliding_window_attention(q, k, v):
+    return NSA.sliding_window_attention_wrapper(
+        q,
+        k,
+        v,
+        left_bound=512,
+        right_bound=0,
+        is_infer=True,
+        attn_scale=None,
+    )
+```
+
+The JAX binding covers fixed-shape FP16/BF16 `(B, H, S, D)` self-attention
+inference with `S_q == S_k`, `left_bound >= 1`, and `right_bound=0`. `D` must
+be 32, 64, or 128, `D_v == D`, and `H_q` must be divisible by `H_kv`. It
+lowers through JAX's registered cuDNN attention custom call, so XLA owns the
+stream, output, and workspace. `o_dtype` may be FP16 or BF16 and defaults to
+the input dtype. The JAX default `left_bound=1` selects only the current token;
+pass the intended window explicitly when porting a PyTorch call. Packed THD
+inputs, ragged offsets, and FP32 training statistics remain PyTorch-only. The
+result uses the same `o_tensor` and `stats_tensor` keys; `stats_tensor` is
+`None` for this inference-only subset.
 
 `````
 

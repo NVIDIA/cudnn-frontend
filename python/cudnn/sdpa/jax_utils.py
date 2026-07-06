@@ -11,7 +11,7 @@ from typing import Any
 import jax.numpy as jnp
 from cutlass.jax import TensorSpec
 
-from .._jax.api_base import require_dtype
+from .._jax.api_base import as_dtype, require_array
 
 
 def bhsd_tensor_spec() -> TensorSpec:
@@ -31,15 +31,19 @@ def bhsd_tensor_spec() -> TensorSpec:
 def require_bhsd_qkv(q: Any, k: Any, v: Any) -> tuple[int, int, int, int, int, int, Any]:
     """Validate fixed-shape BHSD Q/K/V tensors and return their dimensions."""
 
-    for name, value in (("q_tensor", q), ("k_tensor", k), ("v_tensor", v)):
-        if not hasattr(value, "shape") or not hasattr(value, "dtype"):
-            raise TypeError(f"{name} must be a JAX array with shape and dtype metadata")
-        if len(value.shape) != 4:
-            raise ValueError(f"{name} must have rank 4 (B, H, S, D), got shape {value.shape}")
+    q_shape = require_array(
+        q,
+        name="q_tensor",
+        rank=4,
+        dtype=(jnp.float16, jnp.bfloat16),
+    )
+    dtype = as_dtype(q)
+    k_shape = require_array(k, name="k_tensor", rank=4, dtype=dtype)
+    v_shape = require_array(v, name="v_tensor", rank=4, dtype=dtype)
 
-    batch, num_query_heads, seqlen_q, head_dim = tuple(q.shape)
-    k_batch, num_kv_heads, seqlen_k, k_head_dim = tuple(k.shape)
-    v_batch, num_value_heads, v_seqlen, value_dim = tuple(v.shape)
+    batch, num_query_heads, seqlen_q, head_dim = q_shape
+    k_batch, num_kv_heads, seqlen_k, k_head_dim = k_shape
+    v_batch, num_value_heads, v_seqlen, value_dim = v_shape
 
     dimensions = {
         "batch": batch,
@@ -63,9 +67,6 @@ def require_bhsd_qkv(q: Any, k: Any, v: Any) -> tuple[int, int, int, int, int, i
     if num_query_heads % num_kv_heads:
         raise ValueError(f"H_q ({num_query_heads}) must be divisible by H_kv ({num_kv_heads})")
 
-    dtype = require_dtype("q_tensor.dtype", q, (jnp.float16, jnp.bfloat16))
-    require_dtype("k_tensor.dtype", k, (dtype,))
-    require_dtype("v_tensor.dtype", v, (dtype,))
     return (
         batch,
         num_query_heads,
@@ -75,16 +76,6 @@ def require_bhsd_qkv(q: Any, k: Any, v: Any) -> tuple[int, int, int, int, int, i
         head_dim,
         dtype,
     )
-
-
-def require_array(name: str, value: Any, shape: tuple[int, ...], dtype: Any) -> None:
-    """Require a JAX array to match an expected shape and dtype."""
-
-    if not hasattr(value, "shape") or not hasattr(value, "dtype"):
-        raise TypeError(f"{name} must be a JAX array with shape and dtype metadata")
-    if tuple(value.shape) != tuple(shape):
-        raise ValueError(f"{name} must have shape {tuple(shape)}, got {tuple(value.shape)}")
-    require_dtype(f"{name}.dtype", value, (dtype,))
 
 
 def resolve_sdpa_config(
@@ -120,7 +111,6 @@ def resolve_sdpa_config(
 
 __all__ = [
     "bhsd_tensor_spec",
-    "require_array",
     "require_bhsd_qkv",
     "resolve_sdpa_config",
 ]

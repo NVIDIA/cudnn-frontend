@@ -10,7 +10,13 @@ from typing import Any, Optional
 import jax.numpy as jnp
 from cutlass.jax import TensorSpec
 
-from ..._jax.api_base import ApiBaseJax, BufferSpec, TupleDict, call_cutedsl
+from ..._jax.api_base import (
+    ApiBaseJax,
+    BufferSpec,
+    TupleDict,
+    call_cutedsl,
+    require_array,
+)
 
 _TMA_ALIGN_ELEMENTS = 4
 
@@ -115,16 +121,11 @@ def _indexer_forward_impl(
     before launching the kernel.
     """
 
-    if q.ndim != 4:
-        raise ValueError(f"q must have rank 4 (B, S_q, H_q, D), got {q.shape}")
-    if k.ndim != 4:
-        raise ValueError(f"k must have rank 4 (B, S_k, H_kv, D), got {k.shape}")
-    if w.ndim != 3:
-        raise ValueError(f"w must have rank 3 (B, S_q, H_q), got {w.shape}")
+    q_shape = require_array(q, name="q", rank=4, dtype=jnp.bfloat16)
+    k_shape = require_array(k, name="k", rank=4, dtype=jnp.bfloat16)
 
-    batch, seqlen_q, num_query_heads, head_dim = q.shape
-    k_batch, seqlen_k, num_kv_heads, k_head_dim = k.shape
-    w_batch, w_seqlen_q, w_num_query_heads = w.shape
+    batch, seqlen_q, num_query_heads, head_dim = q_shape
+    k_batch, seqlen_k, num_kv_heads, k_head_dim = k_shape
 
     dimensions = {
         "batch": batch,
@@ -138,19 +139,18 @@ def _indexer_forward_impl(
     if nonpositive:
         raise ValueError("Indexer-forward dimensions must be positive, got " + ", ".join(nonpositive))
 
-    if k_batch != batch or w_batch != batch:
-        raise ValueError(f"q, k, and w batch dimensions must match, got {batch}, " f"{k_batch}, and {w_batch}")
+    if k_batch != batch:
+        raise ValueError(f"q and k batch dimensions must match, got {batch} and {k_batch}")
     if k_head_dim != head_dim:
         raise ValueError(f"q and k head dimensions must match, got {head_dim} and {k_head_dim}")
     if head_dim != 128:
         raise ValueError(f"head dimension must be 128, got {head_dim}")
-    if (w_seqlen_q, w_num_query_heads) != (seqlen_q, num_query_heads):
-        raise ValueError(
-            "w shape must match q's batch, sequence, and query-head " f"dimensions; expected {(batch, seqlen_q, num_query_heads)}, " f"got {tuple(w.shape)}"
-        )
-
-    if q.dtype != jnp.bfloat16 or k.dtype != jnp.bfloat16 or w.dtype != jnp.bfloat16:
-        raise ValueError("q, k, and w must all have dtype bfloat16, " f"got {q.dtype}, {k.dtype}, and {w.dtype}")
+    require_array(
+        w,
+        name="w",
+        shape=(batch, seqlen_q, num_query_heads),
+        dtype=jnp.bfloat16,
+    )
 
     if ratio < 1:
         raise ValueError(f"ratio must be at least 1, got {ratio}")
@@ -210,7 +210,6 @@ def _indexer_forward_impl(
             "max_seqlen_k": int(seqlen_k),
             "sm_scale": float(sm_scale),
         },
-        use_static_tensors=True,
     )
     return TupleDict(scores=scores_padded[..., :seqlen_k])
 
@@ -244,7 +243,7 @@ class IndexerForward(ApiBaseJax):
         self.kv_stage = kv_stage
         self.sm_scale = sm_scale
 
-    def _check_support(self) -> bool:
+    def _check_support(self) -> None:
         _indexer_forward_impl(
             self.q_desc,
             self.k_desc,
@@ -258,7 +257,6 @@ class IndexerForward(ApiBaseJax):
             sm_scale=self.sm_scale,
             _validate_only=True,
         )
-        return True
 
     def __call__(self, q: Any, k: Any, w: Any) -> TupleDict:
         return super().__call__(q, k, w)

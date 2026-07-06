@@ -250,6 +250,7 @@ class JaxGemmContractTest(unittest.TestCase):
         sys.modules[_TEST_PACKAGE] = parent
         with cls._optional_modules():
             importlib.import_module(f"{_TEST_PACKAGE}.jax")
+            cls.gemm = importlib.import_module(f"{_TEST_PACKAGE}._jax.gemm")
             cls.swiglu = importlib.import_module(f"{_TEST_PACKAGE}.gemm_swiglu.jax")
             cls.amax = importlib.import_module(f"{_TEST_PACKAGE}.gemm_amax.jax")
             cls.srelu = importlib.import_module(f"{_TEST_PACKAGE}.gemm_srelu.jax")
@@ -286,8 +287,8 @@ class JaxGemmContractTest(unittest.TestCase):
 
     def test_swiglu_declares_logical_outputs_and_physical_layouts(self):
         captured = {}
-        a = _Array((128, 128, 1), self.bfloat16)
-        b = _Array((128, 128, 1), self.bfloat16)
+        a = _Array((2, 128, 256), self.bfloat16)
+        b = _Array((2, 128, 128), self.bfloat16)
         with (
             self._optional_modules(),
             mock.patch.object(
@@ -299,17 +300,16 @@ class JaxGemmContractTest(unittest.TestCase):
             result = self.swiglu.gemm_swiglu_wrapper_sm100(
                 a,
                 b,
-                c_major="m",
+                c_layout="LNM",
                 ab12_dtype=_Array((), self.float32),
                 c_dtype=_Array((), self.bfloat16),
                 acc_dtype=_Array((), self.float32),
-                a_major="m",
-                b_major="n",
+                a_layout="LKM",
+                b_layout="LKN",
             )
 
         self.assertIs(captured["launcher"], self.swiglu._launch)
         self.assertEqual(captured["inputs"], (a, b))
-        self.assertTrue(captured["use_static_tensors"])
         self.assertEqual(
             captured["static_args"],
             {
@@ -324,19 +324,63 @@ class JaxGemmContractTest(unittest.TestCase):
         self.assertEqual(
             [(spec.name, spec.shape, spec.dtype, spec.fill_value) for spec in captured["outputs"]],
             [
-                ("ab12_tensor", (128, 128, 1), self.float32, None),
-                ("c_tensor", (128, 64, 1), self.bfloat16, None),
+                ("ab12_tensor", (2, 128, 256), self.float32, None),
+                ("c_tensor", (2, 64, 256), self.bfloat16, None),
             ],
         )
-        self.assertEqual([spec.layout for spec in captured["input_specs"]], [(0, 1, 2), (0, 1, 2)])
-        self.assertEqual([spec.mode for spec in captured["input_specs"]], [(0, 1, 2), (0, 1, 2)])
+        self.assertEqual([spec.layout for spec in captured["input_specs"]], [(2, 1, 0), (2, 1, 0)])
+        self.assertEqual([spec.mode for spec in captured["input_specs"]], [(2, 1, 0), (2, 1, 0)])
         self.assertEqual(
             [spec.tensor_spec.layout for spec in captured["outputs"]],
-            [(0, 1, 2), (0, 1, 2)],
+            [(2, 1, 0), (2, 1, 0)],
         )
+        self.assertEqual([spec.tensor_spec.mode for spec in captured["outputs"]], [(2, 1, 0), (2, 1, 0)])
         self.assertEqual(tuple(result.keys()), ("ab12_tensor", "c_tensor", "sfc_tensor", "amax_tensor"))
         self.assertIsNone(result["sfc_tensor"])
         self.assertIsNone(result["amax_tensor"])
+
+    def test_layout_strings_map_public_shapes_to_canonical_kernel_metadata(self):
+        cases = (
+            (self.swiglu.gemm_a_tensor_spec, "lmk", (2, 3, 5), (3, 5, 2), (5, 1, 15), (1, 2, 0)),
+            (self.swiglu.gemm_a_tensor_spec, "LKM", (2, 5, 3), (3, 5, 2), (1, 3, 15), (2, 1, 0)),
+            (self.swiglu.gemm_b_tensor_spec, "LNK", (2, 7, 5), (7, 5, 2), (5, 1, 35), (1, 2, 0)),
+            (self.swiglu.gemm_b_tensor_spec, "LKN", (2, 5, 7), (7, 5, 2), (1, 7, 35), (2, 1, 0)),
+            (self.swiglu.gemm_c_tensor_spec, "LMN", (2, 3, 7), (3, 7, 2), (7, 1, 21), (1, 2, 0)),
+            (self.swiglu.gemm_c_tensor_spec, "LNM", (2, 7, 3), (3, 7, 2), (1, 3, 21), (2, 1, 0)),
+        )
+
+        with self._optional_modules():
+            for factory, layout, array_shape, kernel_shape, stride, mode in cases:
+                with self.subTest(layout=layout):
+                    spec = factory(layout)
+                    desc = self.swiglu.JaxTensorDesc.from_value(
+                        _Array(array_shape, self.bfloat16),
+                        tensor_spec=spec,
+                    )
+                    self.assertEqual(spec.layout, (2, 1, 0))
+                    self.assertEqual(spec.mode, mode)
+                    self.assertEqual(desc.array_shape, array_shape)
+                    self.assertEqual(desc.shape, kernel_shape)
+                    self.assertEqual(desc.stride, stride)
+
+            for factory, layout in (
+                (self.swiglu.gemm_a_tensor_spec, "MKL"),
+                (self.swiglu.gemm_b_tensor_spec, "NKL"),
+                (self.swiglu.gemm_c_tensor_spec, "MNL"),
+            ):
+                with self.subTest(layout=layout), self.assertRaisesRegex(ValueError, "must be one of"):
+                    factory(layout)
+
+            a_desc = self.swiglu.JaxTensorDesc.from_value(
+                _Array((2, 3, 5), self.bfloat16),
+                tensor_spec=self.gemm.gemm_a_tensor_spec("LMK"),
+            )
+            with self.assertRaisesRegex(ValueError, "descriptor layout does not match"):
+                self.gemm.as_gemm_tensor_desc(
+                    "a_tensor",
+                    a_desc,
+                    self.gemm.gemm_a_tensor_spec("LKM"),
+                )
 
     def test_kernel_capability_fields_are_public(self):
         for capabilities in (
@@ -366,8 +410,8 @@ class JaxGemmContractTest(unittest.TestCase):
 
     def test_amax_declares_scale_layout_and_initialized_reduction(self):
         captured = {}
-        a = _Array((128, 128, 1), self.float8_e4m3fn)
-        b = _Array((128, 128, 1), self.float8_e4m3fn)
+        a = _Array((1, 128, 128), self.float8_e4m3fn)
+        b = _Array((1, 128, 128), self.float8_e4m3fn)
         sfa = _Array((32, 4, 1, 4, 1, 1), self.float8_e8m0fnu)
         sfb = _Array((32, 4, 1, 4, 1, 1), self.float8_e8m0fnu)
         with (
@@ -383,13 +427,12 @@ class JaxGemmContractTest(unittest.TestCase):
                 b,
                 sfa,
                 sfb,
-                c_major="n",
+                c_layout="LMN",
                 c_dtype=self.float32,
             )
 
         self.assertEqual(captured["inputs"], (a, b, sfa, sfb))
         self.assertIs(captured["launcher"], self.amax._launch)
-        self.assertTrue(captured["use_static_tensors"])
         self.assertEqual(
             captured["static_args"],
             {
@@ -401,14 +444,15 @@ class JaxGemmContractTest(unittest.TestCase):
         )
         self.assertEqual(
             [spec.layout for spec in captured["input_specs"]],
-            [(1, 0, 2), (1, 0, 2), (2, 1, 4, 0, 3, 5), (2, 1, 4, 0, 3, 5)],
+            [(2, 1, 0), (2, 1, 0), (2, 1, 4, 0, 3, 5), (2, 1, 4, 0, 3, 5)],
         )
         c_spec, amax_spec = captured["outputs"]
         self.assertEqual(
             (c_spec.name, c_spec.shape, c_spec.dtype),
-            ("c_tensor", (128, 128, 1), self.float32),
+            ("c_tensor", (1, 128, 128), self.float32),
         )
-        self.assertEqual(c_spec.tensor_spec.layout, (1, 0, 2))
+        self.assertEqual(c_spec.tensor_spec.layout, (2, 1, 0))
+        self.assertEqual(c_spec.tensor_spec.mode, (1, 2, 0))
         self.assertEqual(
             (amax_spec.name, amax_spec.shape, amax_spec.dtype, amax_spec.fill_value),
             ("amax_tensor", (1, 1, 1), self.float32, float("-inf")),
@@ -416,8 +460,8 @@ class JaxGemmContractTest(unittest.TestCase):
         self.assertEqual(tuple(result.keys()), ("c_tensor", "amax_tensor"))
 
     def test_swiglu_rejects_quantized_arguments(self):
-        a = _Array((128, 128, 1), self.bfloat16)
-        b = _Array((128, 128, 1), self.bfloat16)
+        a = _Array((1, 128, 128), self.bfloat16)
+        b = _Array((1, 128, 128), self.bfloat16)
         scale = _Array((1,), self.float8_e8m0fnu)
         with (
             self._optional_modules(),
@@ -427,9 +471,27 @@ class JaxGemmContractTest(unittest.TestCase):
             self.swiglu.gemm_swiglu_wrapper_sm100(a, b, sfa_tensor=scale, sfb_tensor=scale)
         lower.assert_not_called()
 
+    def test_swiglu_rejects_unused_nondefault_configuration(self):
+        a = _Array((1, 128, 128), self.bfloat16)
+        b = _Array((1, 128, 128), self.bfloat16)
+
+        with self._optional_modules():
+            for option, value, expected in (
+                ("sf_vec_size", 32, "sf_vec_size=16"),
+                ("vector_f32", True, "vector_f32=False"),
+                ("ab12_stages", 3, "ab12_stages=4"),
+            ):
+                with (
+                    self.subTest(option=option),
+                    self.assertRaisesRegex(NotImplementedError, expected),
+                    mock.patch.object(self.swiglu, "call_cutedsl") as lower,
+                ):
+                    self.swiglu.gemm_swiglu_wrapper_sm100(a, b, **{option: value})
+                lower.assert_not_called()
+
     def test_swiglu_rejects_unsupported_epilogue_and_incomplete_2cta_tiles(self):
-        a = _Array((128, 128, 1), self.bfloat16)
-        b = _Array((64, 128, 1), self.bfloat16)
+        a = _Array((1, 128, 128), self.bfloat16)
+        b = _Array((1, 64, 128), self.bfloat16)
 
         with self._optional_modules():
             for mma_tiler_mn, message in (
@@ -445,8 +507,8 @@ class JaxGemmContractTest(unittest.TestCase):
                 lower.assert_not_called()
 
     def test_amax_validates_scale_shapes_before_lowering(self):
-        a = _Array((128, 128, 1), self.float8_e5m2)
-        b = _Array((128, 128, 1), self.float8_e5m2)
+        a = _Array((1, 128, 128), self.float8_e5m2)
+        b = _Array((1, 128, 128), self.float8_e5m2)
         bad_sfa = _Array((32, 4, 1, 4, 2, 1), self.float8_e8m0fnu)
         sfb = _Array((32, 4, 1, 4, 1, 1), self.float8_e8m0fnu)
         with (
@@ -458,9 +520,9 @@ class JaxGemmContractTest(unittest.TestCase):
         lower.assert_not_called()
 
     def test_srelu_and_dsrelu_declare_functional_outputs(self):
-        a = _Array((384, 512, 2), self.float8_e4m3fn)
-        b = _Array((256, 512, 2), self.float8_e4m3fn)
-        c = _Array((384, 256, 2), self.bfloat16)
+        a = _Array((2, 384, 512), self.float8_e4m3fn)
+        b = _Array((2, 256, 512), self.float8_e4m3fn)
+        c = _Array((2, 384, 256), self.bfloat16)
         sfa = _Array((32, 4, 3, 4, 4, 2), self.float8_e8m0fnu)
         sfb = _Array((32, 4, 2, 4, 4, 2), self.float8_e8m0fnu)
         prob = _Array((384, 1, 2), self.float32)
@@ -505,15 +567,15 @@ class JaxGemmContractTest(unittest.TestCase):
         self.assertEqual(
             [(spec.name, spec.shape, spec.dtype, spec.fill_value) for spec in srelu_captured["outputs"]],
             [
-                ("c_tensor", (384, 256, 2), self.bfloat16, None),
-                ("d_tensor", (384, 256, 2), self.bfloat16, None),
+                ("c_tensor", (2, 384, 256), self.bfloat16, None),
+                ("d_tensor", (2, 384, 256), self.bfloat16, None),
             ],
         )
         self.assertEqual(
             [spec.layout for spec in srelu_captured["input_specs"]],
             [
-                (1, 0, 2),
-                (1, 0, 2),
+                (2, 1, 0),
+                (2, 1, 0),
                 (2, 1, 4, 0, 3, 5),
                 (2, 1, 4, 0, 3, 5),
                 (0, 1, 2),
@@ -531,7 +593,7 @@ class JaxGemmContractTest(unittest.TestCase):
         d_spec, dprob_spec = dsrelu_captured["outputs"]
         self.assertEqual(
             (d_spec.name, d_spec.shape, d_spec.dtype),
-            ("d_tensor", (384, 256, 2), self.bfloat16),
+            ("d_tensor", (2, 384, 256), self.bfloat16),
         )
         self.assertEqual(
             (
@@ -542,17 +604,17 @@ class JaxGemmContractTest(unittest.TestCase):
             ),
             ("dprob_tensor", (384, 1, 2), self.float32, 0.0),
         )
+        self.assertEqual(dprob_spec.tensor_spec.layout, (0, 1, 2))
+        self.assertEqual(dprob_spec.tensor_spec.mode, (0, 1, 2))
         self.assertIsNone(dsrelu_result["amax_tensor"])
         self.assertIsNone(dsrelu_result["sfd_tensor"])
-        self.assertTrue(srelu_captured["use_static_tensors"])
-        self.assertTrue(dsrelu_captured["use_static_tensors"])
 
     def test_relu_wrappers_reject_unpredicated_partial_mma_tile(self):
         with self._optional_modules():
             for m, mma_tiler_mn in ((129, (128, 128)), (130, (256, 256))):
-                a = _Array((m, 512, 1), self.float8_e4m3fn)
-                b = _Array((256, 512, 1), self.float8_e4m3fn)
-                c = _Array((m, 256, 1), self.bfloat16)
+                a = _Array((1, m, 512), self.float8_e4m3fn)
+                b = _Array((1, 256, 512), self.float8_e4m3fn)
+                c = _Array((1, m, 256), self.bfloat16)
                 scale_m = (m + 127) // 128
                 sfa = _Array((32, 4, scale_m, 4, 4, 1), self.float8_e8m0fnu)
                 sfb = _Array((32, 4, 2, 4, 4, 1), self.float8_e8m0fnu)
@@ -572,8 +634,8 @@ class JaxGemmContractTest(unittest.TestCase):
                     lower.assert_not_called()
 
     def test_dense_class_uses_sample_metadata_without_retaining_arrays(self):
-        sample_a = _Array((128, 128, 1), self.float8_e4m3fn)
-        sample_b = _Array((128, 128, 1), self.float8_e4m3fn)
+        sample_a = _Array((1, 128, 128), self.float8_e4m3fn)
+        sample_b = _Array((1, 128, 128), self.float8_e4m3fn)
         sample_sfa = _Array((32, 4, 1, 4, 1, 1), self.float8_e8m0fnu)
         sample_sfb = _Array((32, 4, 1, 4, 1, 1), self.float8_e8m0fnu)
         samples = (sample_a, sample_b, sample_sfa, sample_sfb)
@@ -584,8 +646,10 @@ class JaxGemmContractTest(unittest.TestCase):
             self.assertTrue(operation.check_support())
 
         self.assertIs(operation.get_jax_callable(), operation)
-        self.assertEqual(operation.a_desc.shape, sample_a.shape)
+        self.assertEqual(operation.a_desc.shape, (128, 128, 1))
+        self.assertEqual(operation.a_desc.array_shape, sample_a.shape)
         self.assertEqual(operation.sfa_desc.shape, sample_sfa.shape)
+        self.assertFalse(any(name.endswith("_spec") for name in vars(operation)))
         self.assertTrue(all(stored is not sample for stored in vars(operation).values() for sample in samples))
         self.assertTrue(all(stored is not dtype_carrier for stored in vars(operation).values()))
 
@@ -604,6 +668,16 @@ class JaxGemmContractTest(unittest.TestCase):
         ):
             operation(actual_a, actual_b, actual_sfa, actual_sfb)
         self.assertEqual(captured["inputs"], (actual_a, actual_b, actual_sfa, actual_sfb))
+        self.assertEqual(
+            captured["input_specs"],
+            (
+                operation.a_desc.tensor_spec,
+                operation.b_desc.tensor_spec,
+                operation.sfa_desc.tensor_spec,
+                operation.sfb_desc.tensor_spec,
+            ),
+        )
+        self.assertIs(captured["outputs"][0].tensor_spec, operation.c_desc.tensor_spec)
 
         with (
             self._optional_modules(),
@@ -611,7 +685,7 @@ class JaxGemmContractTest(unittest.TestCase):
             mock.patch.object(self.amax, "call_cutedsl") as lower,
         ):
             operation(
-                _Array((64, 128, 1), self.float8_e4m3fn),
+                _Array((1, 64, 128), self.float8_e4m3fn),
                 actual_b,
                 actual_sfa,
                 actual_sfb,

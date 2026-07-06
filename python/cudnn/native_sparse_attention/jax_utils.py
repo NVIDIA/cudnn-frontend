@@ -10,7 +10,7 @@ from typing import Any
 import jax.numpy as jnp
 from cutlass.jax import TensorSpec
 
-from .._jax.api_base import require_dtype
+from .._jax.api_base import as_dtype, require_array
 
 
 def bhsd_storage_spec(*, present_as_bshd: bool) -> TensorSpec:
@@ -40,17 +40,20 @@ def require_bhsd_qkv(
 ) -> tuple[int, int, int, int, int, int, Any]:
     """Validate fixed-shape NSA BHSD inputs and return their dimensions."""
 
-    arrays = [("q_tensor", q_tensor), ("k_tensor", k_tensor)]
+    q_shape = require_array(
+        q_tensor,
+        name="q_tensor",
+        rank=4,
+        dtype=(jnp.float16, jnp.bfloat16),
+    )
+    dtype = as_dtype(q_tensor)
+    k_shape = require_array(k_tensor, name="k_tensor", rank=4, dtype=dtype)
+    v_shape = None
     if v_tensor is not None:
-        arrays.append(("v_tensor", v_tensor))
-    for name, value in arrays:
-        if not hasattr(value, "shape") or not hasattr(value, "dtype"):
-            raise TypeError(f"{name} must have shape and dtype metadata")
-        if len(value.shape) != 4:
-            raise ValueError(f"{name} must have rank 4 (B, H, S, D), got shape {value.shape}")
+        v_shape = require_array(v_tensor, name="v_tensor", rank=4, dtype=dtype)
 
-    batch, num_query_heads, seqlen_q, head_dim = tuple(q_tensor.shape)
-    k_batch, num_kv_heads, seqlen_k, k_head_dim = tuple(k_tensor.shape)
+    batch, num_query_heads, seqlen_q, head_dim = q_shape
+    k_batch, num_kv_heads, seqlen_k, k_head_dim = k_shape
     dimensions = {
         "batch": batch,
         "H_q": num_query_heads,
@@ -71,15 +74,8 @@ def require_bhsd_qkv(
     if num_query_heads % num_kv_heads:
         raise ValueError(f"H_q ({num_query_heads}) must be divisible by H_kv ({num_kv_heads})")
 
-    dtype = require_dtype(
-        "q_tensor.dtype",
-        q_tensor,
-        (jnp.float16, jnp.bfloat16),
-    )
-    require_dtype("k_tensor.dtype", k_tensor, (dtype,))
-
-    if v_tensor is not None:
-        v_batch, num_value_heads, v_seqlen, value_dim = tuple(v_tensor.shape)
+    if v_shape is not None:
+        v_batch, num_value_heads, v_seqlen, value_dim = v_shape
         if (v_batch, num_value_heads, v_seqlen) != (
             batch,
             num_kv_heads,
@@ -92,8 +88,6 @@ def require_bhsd_qkv(
             )
         if value_dim != head_dim:
             raise ValueError(f"V head dimension must match Q/K ({head_dim}), got {value_dim}")
-        require_dtype("v_tensor.dtype", v_tensor, (dtype,))
-
     return (
         batch,
         num_query_heads,

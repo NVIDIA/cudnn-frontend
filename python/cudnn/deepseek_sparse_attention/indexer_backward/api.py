@@ -384,12 +384,21 @@ class DenseIndexerBackward(ApiBaseTorch):
             grad_scale = float(loss_coeff) * grad_loss_value / max(int(self.normalization_tokens), 1)
 
             # Dense backward's dK path uses atomic/bulk reductions into fp32.
+            # SM100 clears the reduction target in its CuTe launch sequence;
+            # SM90 still requires a pre-zeroed buffer.
+            kernel_clears_d_index_k = not self._uses_current_stream_pipeline
             d_index_k_target = d_index_k
             if d_index_k.dtype == torch.float32:
                 d_index_k_f32 = d_index_k
-                d_index_k_f32.zero_()
+                if not kernel_clears_d_index_k:
+                    d_index_k_f32.zero_()
             else:
-                d_index_k_f32 = torch.zeros_like(d_index_k, dtype=torch.float32)
+                allocation = (
+                    torch.empty_like
+                    if kernel_clears_d_index_k
+                    else torch.zeros_like
+                )
+                d_index_k_f32 = allocation(d_index_k, dtype=torch.float32)
 
         self._compiled_kernel(
             index_q,

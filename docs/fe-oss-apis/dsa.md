@@ -140,6 +140,7 @@ DSA.sparse_attn_score_recompute_wrapper
 DSA.dense_indexer_score_recompute_wrapper
 DSA.dense_attn_score_recompute_wrapper
 DSA.indexer_backward_wrapper
+DSA.dense_indexer_backward_wrapper
 DSA.sparse_attention_backward_wrapper
 ```
 
@@ -711,12 +712,48 @@ result = DSA.dense_indexer_backward_wrapper(
 `````{tab-item} JAX
 :sync: jax
 
-Dense indexer backward is not exposed in the JAX namespace. Its current
-score-gradient boundary consumes `grad_loss` as a host scalar and overwrites
-the predict-score input before launching the GEMM stage. A functional JAX
-binding requires a runtime loss operand and a distinct gradient output buffer;
-the sparse wrapper above implements that ABI, but the dense kernel does not
-yet provide it.
+```python
+import jax
+from cudnn.jax import DSA
+
+@jax.jit
+def dense_indexer_bwd(
+    index_q,
+    weights,
+    index_k,
+    attn_score,
+    attn_l1norm,
+    index_score,
+    index_lse,
+    grad_loss,
+):
+    return DSA.dense_indexer_backward_wrapper(
+        index_q,
+        weights,
+        index_k,
+        attn_score,
+        attn_l1norm,
+        index_score,
+        index_lse,
+        sm_scale=1.0,
+        loss_coeff=1.0,
+        grad_loss=grad_loss,
+        block_I=128,
+        ratio=1,
+    )
+```
+
+The JAX binding covers fixed-shape SM100 BSHD inputs with `H=64`, `D=128`,
+and `block_I=128`. Inputs use BF16 model tensors, FP32 scores and
+denominators, and a runtime FP32 scalar or one-element `grad_loss` array.
+`sm_scale`, `loss_coeff`, `block_I`, and `ratio` are static compilation state.
+Packed THD inputs and `q_causal_offsets` remain PyTorch-only.
+
+Both score inputs remain immutable. The score-gradient and GEMM kernels run in
+one custom call on XLA's stream, using an XLA-owned FP32 `grad_signal`
+workspace. The GEMM launch clears its XLA-owned FP32 `d_index_k` accumulator
+before the bulk reductions. The returned
+`d_index_q`, `d_weights`, and `d_index_k` arrays are BF16.
 
 `````
 
@@ -736,8 +773,8 @@ yet provide it.
 - **Top-K only up to 2048**; `top_k > 2048` is not supported by the
   underlying radix top-K kernel.
 - **JAX coverage includes Indexer Forward, Indexer Top-K, sparse and dense
-  score recompute, sparse Indexer Backward, and Sparse Attention Backward.**
+  score recompute, sparse and dense Indexer Backward, and Sparse Attention
+  Backward.**
   The wrappers require concrete compact shapes and do not define autodiff,
   `vmap`, or automatic sharding rules. Their broader SM90/THD PyTorch paths
-  remain unchanged. Dense Indexer Backward is PyTorch-only for the ABI reason
-  described above.
+  remain unchanged.

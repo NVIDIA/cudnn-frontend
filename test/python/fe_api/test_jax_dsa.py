@@ -40,6 +40,7 @@ def test_jax_dsa_abstract_shapes():
 
     from cudnn.jax import (
         TupleDict,
+        dense_indexer_backward_wrapper,
         indexer_forward_wrapper,
         indexer_top_k_wrapper,
         sparse_attn_score_recompute_wrapper,
@@ -107,6 +108,29 @@ def test_jax_dsa_abstract_shapes():
     )["target"]
     assert target.shape == (1, 4, 128)
     assert target.dtype == jnp.float32
+
+    dense_q = jax.ShapeDtypeStruct((1, 2, 64, 128), jnp.bfloat16)
+    dense_weights = jax.ShapeDtypeStruct((1, 2, 64), jnp.bfloat16)
+    dense_k = jax.ShapeDtypeStruct((1, 128, 128), jnp.bfloat16)
+    dense_score = jax.ShapeDtypeStruct((1, 2, 128), jnp.float32)
+    dense_denom = jax.ShapeDtypeStruct((1, 2), jnp.float32)
+    dense_result = jax.eval_shape(
+        dense_indexer_backward_wrapper,
+        dense_q,
+        dense_weights,
+        dense_k,
+        dense_score,
+        dense_denom,
+        dense_score,
+        dense_denom,
+    )
+    assert isinstance(dense_result, TupleDict)
+    assert dense_result["d_index_q"].shape == dense_q.shape
+    assert dense_result["d_index_q"].dtype == jnp.bfloat16
+    assert dense_result["d_weights"].shape == dense_weights.shape
+    assert dense_result["d_weights"].dtype == jnp.bfloat16
+    assert dense_result["d_index_k"].shape == dense_k.shape
+    assert dense_result["d_index_k"].dtype == jnp.bfloat16
 
 
 @pytest.mark.L0
@@ -534,3 +558,202 @@ def test_jax_sparse_score_recompute_global_indices_and_partial_lengths():
     assert jnp.array_equal(target[0], jnp.zeros_like(target[0]))
     assert jnp.array_equal(predict[1, :, 73:], jnp.zeros_like(predict[1, :, 73:]))
     assert jnp.array_equal(target[1, :, 73:], jnp.zeros_like(target[1, :, 73:]))
+
+
+@pytest.mark.L0
+def test_jax_dense_indexer_backward_jit():
+    jax, jnp = _jax_dependencies()
+    device = _gpu_device(jax, 100)
+
+    from cudnn.jax import dense_indexer_backward_wrapper
+
+    batch, seqlen_q, seqlen_k = 1, 256, 512
+    heads, head_dim = 64, 128
+    sm_scale = 0.5
+    index_q = jax.device_put(
+        jax.random.normal(
+            jax.random.key(40),
+            (batch, seqlen_q, heads, head_dim),
+            dtype=jnp.bfloat16,
+        ),
+        device,
+    )
+    weights = jax.device_put(
+        jax.random.normal(
+            jax.random.key(41),
+            (batch, seqlen_q, heads),
+            dtype=jnp.bfloat16,
+        )
+        * jnp.bfloat16(1.0 / heads),
+        device,
+    )
+    index_k = jax.device_put(
+        jax.random.normal(
+            jax.random.key(42),
+            (batch, seqlen_k, head_dim),
+            dtype=jnp.bfloat16,
+        ),
+        device,
+    )
+    valid = (
+        jnp.arange(seqlen_k)[None, :]
+        < jnp.arange(seqlen_q)[:, None] + 1
+    )
+    attn_score = jax.device_put(
+        jax.random.uniform(
+            jax.random.key(43),
+            (batch, seqlen_q, seqlen_k),
+            dtype=jnp.float32,
+            minval=0.1,
+            maxval=1.0,
+        ),
+        device,
+    )
+    attn_score = jnp.where(valid[None, :, :], attn_score, 0.0)
+    attn_l1norm = jnp.sum(attn_score, axis=-1)
+    scores_per_head = jnp.einsum(
+        "bqhd,bkd->bqhk",
+        index_q.astype(jnp.float32),
+        index_k.astype(jnp.float32),
+    )
+    index_score = jnp.sum(
+        jnp.maximum(scores_per_head, 0.0)
+        * (weights.astype(jnp.float32) * sm_scale)[..., None],
+        axis=2,
+    )
+    index_lse = jax.nn.logsumexp(
+        jnp.where(valid[None, :, :], index_score, -jnp.inf),
+        axis=-1,
+    )
+
+    @jax.jit
+    def run(
+        index_q,
+        weights,
+        index_k,
+        attn_score,
+        attn_l1norm,
+        index_score,
+        index_lse,
+        grad_loss,
+    ):
+        return dense_indexer_backward_wrapper(
+            index_q,
+            weights,
+            index_k,
+            attn_score,
+            attn_l1norm,
+            index_score,
+            index_lse,
+            grad_loss=grad_loss,
+            sm_scale=sm_scale,
+        )
+
+    grad_loss = jax.device_put(jnp.ones((1,), dtype=jnp.float32), device)
+    lowered = run.lower(
+        index_q,
+        weights,
+        index_k,
+        attn_score,
+        attn_l1norm,
+        index_score,
+        index_lse,
+        grad_loss,
+    )
+    stablehlo = lowered.as_text("stablehlo")
+    assert stablehlo.count("stablehlo.custom_call") == 1
+    assert "CuteDSLRT_NvJaxCutlassCall" in stablehlo
+
+    compiled = lowered.compile()
+    result = compiled(
+        index_q,
+        weights,
+        index_k,
+        attn_score,
+        attn_l1norm,
+        index_score,
+        index_lse,
+        grad_loss,
+    )
+    result["d_index_k"].block_until_ready()
+    assert result["d_index_q"].shape == index_q.shape
+    assert result["d_weights"].shape == weights.shape
+    assert result["d_index_k"].shape == index_k.shape
+    assert result["d_index_q"].dtype == jnp.bfloat16
+    assert result["d_weights"].dtype == jnp.bfloat16
+    assert result["d_index_k"].dtype == jnp.bfloat16
+    assert all(jnp.all(jnp.isfinite(value)) for value in result.values())
+    assert any(jnp.any(value != 0) for value in result.values())
+    assert jnp.array_equal(
+        result["d_index_k"][:, seqlen_q:],
+        jnp.zeros_like(result["d_index_k"][:, seqlen_q:]),
+    )
+
+    target = attn_score / attn_l1norm[..., None]
+    predict = jax.nn.softmax(
+        jnp.where(valid[None, :, :], index_score, -jnp.inf),
+        axis=-1,
+    )
+    grad_scale = 1.0 / (batch * seqlen_q)
+    g = jnp.where(
+        valid[None, :, :],
+        -jnp.maximum(target, jnp.exp(-100.0)) * grad_scale,
+        0.0,
+    )
+    grad_signal = jnp.where(
+        valid[None, :, :],
+        g - predict * jnp.sum(g, axis=-1, keepdims=True),
+        0.0,
+    )
+
+    def raw_scores(q, w, k):
+        per_head = jnp.einsum("bqhd,bkd->bqhk", q, k)
+        return jnp.sum(
+            jnp.maximum(per_head, 0.0) * (w * sm_scale)[..., None],
+            axis=2,
+        )
+
+    _, pullback = jax.vjp(
+        raw_scores,
+        index_q.astype(jnp.float32),
+        weights.astype(jnp.float32),
+        index_k.astype(jnp.float32),
+    )
+    reference = pullback(grad_signal)
+    for name, expected in zip(
+        ("d_index_q", "d_weights", "d_index_k"),
+        reference,
+    ):
+        actual = result[name]
+        actual_f32 = actual.astype(jnp.float32).ravel()
+        expected_f32 = expected.astype(jnp.float32).ravel()
+        cosine = jnp.vdot(actual_f32, expected_f32) / (
+            jnp.linalg.norm(actual_f32) * jnp.linalg.norm(expected_f32)
+        )
+        relative_rms = jnp.sqrt(
+            jnp.mean(jnp.square(actual_f32 - expected_f32))
+        ) / jnp.sqrt(
+            jnp.mean(jnp.square(expected_f32))
+        )
+        assert cosine >= 0.97, (
+            f"{name} cosine similarity: {cosine}; "
+            f"actual norm: {jnp.linalg.norm(actual_f32)}; "
+            f"expected norm: {jnp.linalg.norm(expected_f32)}"
+        )
+        assert relative_rms <= 0.55, f"{name} relative RMS error: {relative_rms}"
+
+    zero_result = compiled(
+        index_q,
+        weights,
+        index_k,
+        attn_score,
+        attn_l1norm,
+        index_score,
+        index_lse,
+        jnp.zeros_like(grad_loss),
+    )
+    zero_result["d_index_k"].block_until_ready()
+    assert all(
+        jnp.array_equal(value, jnp.zeros_like(value))
+        for value in zero_result.values()
+    )

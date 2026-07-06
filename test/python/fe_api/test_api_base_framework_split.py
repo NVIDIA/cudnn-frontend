@@ -124,7 +124,24 @@ class ApiBaseFrameworkSplitTest(unittest.TestCase):
             return (lambda decorated_fn: decorated_fn) if fn is None else fn
 
         fake_cutlass_jax = types.ModuleType("cutlass.jax")
-        fake_cutlass_jax.TensorSpec = type("TensorSpec", (), {})
+
+        class _TensorSpec:
+            def __init__(
+                self,
+                *,
+                layout=None,
+                mode=None,
+                static=None,
+                ptr_assumed_align=256,
+                divisibility=None,
+            ):
+                self.layout = layout
+                self.mode = mode
+                self.static = static
+                self.ptr_assumed_align = ptr_assumed_align
+                self.divisibility = divisibility
+
+        fake_cutlass_jax.TensorSpec = _TensorSpec
         fake_cute = types.ModuleType("cutlass.cute")
         fake_cute.jit = identity_jit
         fake_cutlass = types.ModuleType("cutlass")
@@ -179,23 +196,155 @@ class ApiBaseFrameworkSplitTest(unittest.TestCase):
                 self.assertEqual(desc.stride_order, (3, 1, 0, 4, 2, 5))
                 self.assertEqual(desc.stride, (21, 7, 462, 1, 42, 2310))
                 self.assertEqual(desc.dtype_name, "float8_e4m3fn")
+                self.assertIsInstance(desc.tensor_spec, _TensorSpec)
+                self.assertEqual(desc.tensor_spec.layout, (2, 1, 4, 0, 3, 5))
 
-                transposed = module.JaxTensorDesc.from_value(
-                    types.SimpleNamespace(shape=(2, 3, 5), dtype=_DType("bfloat16", 2)),
+                mode_only = module.JaxTensorDesc.from_value(
+                    types.SimpleNamespace(shape=(2, 3), dtype=_DType("bfloat16", 2)),
+                    mode=(1, 0),
+                )
+                self.assertEqual(mode_only.shape, (3, 2))
+                self.assertIsNone(mode_only.tensor_spec.layout)
+                self.assertEqual(mode_only.tensor_spec.mode, (1, 0))
+
+                implicit = module.JaxTensorDesc.from_value(
+                    types.SimpleNamespace(shape=(2, 3), dtype=_DType("bfloat16", 2)),
+                )
+                self.assertIsNone(implicit.tensor_spec)
+                self.assertEqual(implicit.layout, (1, 0))
+
+                transposed_value = types.SimpleNamespace(shape=(2, 3, 5), dtype=_DType("bfloat16", 2))
+                transposed_spec = _TensorSpec(
                     layout=(2, 1, 0),
                     mode=(1, 2, 0),
+                )
+                transposed = module.JaxTensorDesc.from_value(
+                    transposed_value,
+                    tensor_spec=transposed_spec,
                 )
                 self.assertEqual(transposed.shape, (3, 5, 2))
                 self.assertEqual(transposed.stride, (5, 1, 15))
                 self.assertEqual(transposed.stride_order, (1, 0, 2))
                 self.assertEqual(transposed.mode, (1, 2, 0))
+                self.assertIs(transposed.tensor_spec, transposed_spec)
+
+                with self.subTest("shared array validation"):
+                    bfloat16 = transposed.dtype
+                    float32 = _DType("float32", 4)
+                    array = types.SimpleNamespace(shape=[3, 5, 2], dtype=bfloat16)
+
+                    self.assertEqual(
+                        module.require_array(
+                            array,
+                            name="array",
+                            rank=3,
+                            shape=(3, 5, 2),
+                            dtype=bfloat16,
+                        ),
+                        (3, 5, 2),
+                    )
+                    self.assertEqual(
+                        module.require_array(
+                            types.SimpleNamespace(shape=(3, 5, 2), dtype=float32),
+                            name="array",
+                            dtype=(bfloat16, float32),
+                        ),
+                        (3, 5, 2),
+                    )
+
+                    for incomplete in (
+                        types.SimpleNamespace(shape=(3, 5, 2)),
+                        types.SimpleNamespace(dtype=bfloat16),
+                    ):
+                        with self.assertRaisesRegex(TypeError, "must have shape and dtype metadata"):
+                            module.require_array(incomplete, name="array")
+
+                    with self.assertRaisesRegex(TypeError, "value must have shape and dtype metadata"):
+                        module.require_array(object())
+
+                    with self.assertRaisesRegex(ValueError, "array must have rank 2"):
+                        module.require_array(array, name="array", rank=2)
+                    with self.assertRaisesRegex(ValueError, "array must have shape"):
+                        module.require_array(array, name="array", shape=(2, 5, 3))
+                    with self.assertRaisesRegex(ValueError, "array.dtype must be one of"):
+                        module.require_array(
+                            array,
+                            name="array",
+                            dtype=(float32,),
+                        )
+
+                    # A descriptor exposes the shape seen by the kernel; its
+                    # public input shape remains available through array_shape.
+                    named_transposed = module.JaxTensorDesc.from_value(
+                        transposed_value,
+                        tensor_spec=transposed_spec,
+                        name="transposed",
+                    )
+                    self.assertEqual(
+                        module.require_array(
+                            named_transposed,
+                            shape=(3, 5, 2),
+                            dtype=bfloat16,
+                        ),
+                        named_transposed.shape,
+                    )
+                    self.assertEqual(named_transposed.array_shape, (2, 3, 5))
+                    with self.assertRaisesRegex(ValueError, "transposed must have shape"):
+                        module.require_array(
+                            named_transposed,
+                            shape=named_transposed.array_shape,
+                        )
+
+                inferred_spec = _TensorSpec()
+                default_spec = module.JaxTensorDesc.from_value(
+                    types.SimpleNamespace(shape=(2, 3), dtype=_DType("bfloat16", 2)),
+                    tensor_spec=inferred_spec,
+                )
+                self.assertEqual(default_spec.layout, (1, 0))
+                self.assertEqual(default_spec.mode, (0, 1))
+                self.assertEqual(default_spec.stride, (3, 1))
+                self.assertIs(default_spec.tensor_spec, inferred_spec)
+
+                direct = module.JaxTensorDesc(
+                    dtype=_DType("bfloat16", 2),
+                    shape=(3, 5, 2),
+                    tensor_spec=transposed_spec,
+                )
+                self.assertEqual(direct.layout, (2, 1, 0))
+                self.assertEqual(direct.mode, (1, 2, 0))
+                self.assertEqual(direct.stride, (5, 1, 15))
+                self.assertIs(direct.tensor_spec, transposed_spec)
+
+                lowering_hints = _TensorSpec(
+                    static=False,
+                    ptr_assumed_align=128,
+                    divisibility=(16, None),
+                )
+                hinted = module.JaxTensorDesc.from_value(
+                    types.SimpleNamespace(shape=(16, 3), dtype=_DType("bfloat16", 2)),
+                    tensor_spec=lowering_hints,
+                )
+                self.assertIs(hinted.tensor_spec, lowering_hints)
+
+                with self.assertRaisesRegex(ValueError, "tensor_spec cannot be combined"):
+                    module.JaxTensorDesc.from_value(
+                        transposed_value,
+                        tensor_spec=transposed_spec,
+                        layout=(2, 1, 0),
+                    )
+                with self.assertRaisesRegex(ValueError, "tensor_spec cannot be combined"):
+                    module.JaxTensorDesc.from_value(
+                        transposed_value,
+                        tensor_spec=transposed_spec,
+                        mode=(1, 2, 0),
+                    )
 
                 with self.assertRaisesRegex(ValueError, "stride_order must agree"):
                     module.JaxTensorDesc(
                         dtype=_DType("bfloat16", 2),
                         shape=(2, 3),
                         stride_order=(0, 1),
-                        jax_layout=(1, 0),
+                        tensor_spec=_TensorSpec(layout=(1, 0)),
                     )
 
                 with self.assertRaisesRegex(ValueError, "stride must describe the compact layout"):
@@ -203,7 +352,7 @@ class ApiBaseFrameworkSplitTest(unittest.TestCase):
                         dtype=_DType("bfloat16", 2),
                         shape=(2, 3),
                         stride=(1, 2),
-                        jax_layout=(1, 0),
+                        tensor_spec=_TensorSpec(layout=(1, 0)),
                     )
 
                 with self.assertRaisesRegex(ValueError, "mode must be a permutation"):
@@ -219,9 +368,8 @@ class ApiBaseFrameworkSplitTest(unittest.TestCase):
                         self.static_option = 1
                         self.check_count = 0
 
-                    def _check_support(self):
+                    def _check_support(self) -> None:
                         self.check_count += 1
-                        return True
 
                     def _call_impl(self, x):
                         self.check_tensor_signature(x, self.sample_desc, name="input")
@@ -229,24 +377,47 @@ class ApiBaseFrameworkSplitTest(unittest.TestCase):
 
                 api = _JaxApi(value)
                 self.assertTrue(all(stored is not value for stored in vars(api).values()))
+                self.assertEqual(
+                    api.make_tensor_desc(
+                        transposed_value,
+                        tensor_spec=transposed_spec,
+                    ),
+                    transposed,
+                )
+                self.assertEqual(
+                    api.make_optional_tensor_desc(
+                        transposed_value,
+                        tensor_spec=transposed_spec,
+                    ),
+                    transposed,
+                )
+                self.assertIsNone(api.make_optional_tensor_desc(None, tensor_spec=transposed_spec))
+                checked = api.check_tensor_signature(transposed_value, transposed, name="input")
+                self.assertIs(checked.tensor_spec, transposed_spec)
+                checked_default = api.check_tensor_signature(value, api.sample_desc, name="input")
+                self.assertIsNone(checked_default.tensor_spec)
                 self.assertIs(api.get_jax_callable(), api)
                 self.assertIs(api.as_dtype(value), value.dtype)
                 self.assertIs(api.as_optional_dtype(value), value.dtype)
                 self.assertIsNone(api.as_optional_dtype(None))
                 self.assertIs(
-                    api.require_dtype("sample.dtype", value, (value.dtype,)),
+                    api.require_dtype(api.sample_desc, (value.dtype,)),
                     value.dtype,
                 )
                 self.assertIs(
-                    api.require_dtype("output_dtype", None, (value.dtype,), default=value.dtype),
+                    api.require_dtype(
+                        None,
+                        (value.dtype,),
+                        name="output_dtype",
+                        default=value.dtype,
+                    ),
                     value.dtype,
                 )
                 with self.assertRaisesRegex(ValueError, "output_dtype must not be None"):
-                    api.require_dtype("output_dtype", None, (value.dtype,))
+                    api.require_dtype(None, (value.dtype,), name="output_dtype")
                 with self.assertRaisesRegex(ValueError, "sample.dtype must be one of"):
                     api.require_dtype(
-                        "sample.dtype",
-                        value,
+                        api.sample_desc,
                         (_DType("bfloat16", 2),),
                     )
                 self.assertEqual(api.check_tensor_signature(value, desc, name="scale"), desc)

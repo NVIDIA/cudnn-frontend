@@ -15,13 +15,14 @@ from ..._jax.api_base import (
     ApiBaseJax,
     BufferSpec,
     TupleDict,
+    as_dtype,
     call_cutedsl,
+    require_array,
     require_dtype,
 )
-from ..._jax.gemm import require_16_byte_extent, require_array
+from ..._jax.gemm import require_16_byte_extent
 from ..._jax.grouped_gemm import grouped_workspace_tensor_spec
-from ...gemm_validation import ceil_div, require_shape, resolve_max_active_clusters
-from .._jax_api import check_call_signatures, immutable_mapping
+from ...gemm_validation import ceil_div, resolve_max_active_clusters
 
 
 def wgrad_scale_shape(
@@ -148,6 +149,7 @@ def _grouped_gemm_wgrad_impl(
     sf_vec_size: int = 32,
     accumulate_on_output: bool = False,
     input_order: str = "tensor2d",
+    cluster_overlap_margin: int = 0,
     *,
     _validate_only: bool = False,
 ) -> TupleDict | dict[str, Any]:
@@ -175,8 +177,14 @@ def _grouped_gemm_wgrad_impl(
     )
 
     kernel = BlockScaledMoEGroupedGemmWgradKernel
-    a_shape = require_array("a_tensor", a_tensor, 2)
-    b_shape = require_array("b_tensor", b_tensor, 2)
+    a_shape = require_array(
+        a_tensor,
+        name="a_tensor",
+        rank=2,
+        dtype=(jnp.float8_e4m3fn, jnp.float8_e5m2),
+    )
+    ab_dtype = as_dtype(a_tensor)
+    b_shape = require_array(b_tensor, name="b_tensor", rank=2, dtype=ab_dtype)
     hidden, tokens = a_shape
     b_tokens, intermediate = b_shape
     if b_tokens != tokens:
@@ -190,67 +198,59 @@ def _grouped_gemm_wgrad_impl(
     if nonpositive:
         raise ValueError("Grouped-wgrad dimensions must be positive, got " + ", ".join(nonpositive))
 
-    ab_dtype = require_dtype(
-        "a_tensor.dtype",
-        a_tensor,
-        (jnp.float8_e4m3fn, jnp.float8_e5m2),
-    )
-    require_dtype("b_tensor.dtype", b_tensor, (ab_dtype,))
     if sf_vec_size != kernel.FP8_SF_VEC_SIZE:
         raise ValueError("The JAX FP8 grouped-wgrad path requires " f"sf_vec_size={kernel.FP8_SF_VEC_SIZE}, got {sf_vec_size}")
 
-    sfa_shape = require_array("sfa_tensor", sfa_tensor, 2)
-    sfb_shape = require_array("sfb_tensor", sfb_tensor, 2)
-    require_shape(
-        "sfa_tensor",
-        sfa_shape,
-        wgrad_scale_shape(hidden, tokens, sf_vec_size),
-    )
-    require_shape(
-        "sfb_tensor",
-        sfb_shape,
-        wgrad_scale_shape(intermediate, tokens, sf_vec_size),
-    )
-    sf_dtype = require_dtype(
-        "sfa_tensor.dtype",
+    require_array(
         sfa_tensor,
-        (jnp.float8_e8m0fnu,),
+        name="sfa_tensor",
+        shape=wgrad_scale_shape(hidden, tokens, sf_vec_size),
+        dtype=jnp.float8_e8m0fnu,
     )
-    require_dtype("sfb_tensor.dtype", sfb_tensor, (sf_dtype,))
+    sf_dtype = as_dtype(sfa_tensor)
+    require_array(
+        sfb_tensor,
+        name="sfb_tensor",
+        shape=wgrad_scale_shape(intermediate, tokens, sf_vec_size),
+        dtype=sf_dtype,
+    )
 
-    offsets_shape = require_array("offsets_tensor", offsets_tensor, 1)
+    offsets_shape = require_array(
+        offsets_tensor,
+        name="offsets_tensor",
+        rank=1,
+        dtype=jnp.int32,
+    )
     (expert_cnt,) = offsets_shape
     if expert_cnt <= 0:
         raise ValueError(f"offsets_tensor must contain at least one expert, got {expert_cnt}")
-    require_dtype("offsets_tensor.dtype", offsets_tensor, (jnp.int32,))
-
     has_global_scale = global_scale_a is not None or global_scale_b is not None
     if has_global_scale:
         if global_scale_a is None or global_scale_b is None:
             raise ValueError("global_scale_a and global_scale_b must be provided together")
-        require_shape(
-            "global_scale_a",
-            require_array("global_scale_a", global_scale_a, 1),
-            (expert_cnt,),
+        require_array(
+            global_scale_a,
+            name="global_scale_a",
+            shape=(expert_cnt,),
+            dtype=jnp.float32,
         )
-        require_shape(
-            "global_scale_b",
-            require_array("global_scale_b", global_scale_b, 1),
-            (expert_cnt,),
+        require_array(
+            global_scale_b,
+            name="global_scale_b",
+            shape=(expert_cnt,),
+            dtype=jnp.float32,
         )
-        require_dtype("global_scale_a.dtype", global_scale_a, (jnp.float32,))
-        require_dtype("global_scale_b.dtype", global_scale_b, (jnp.float32,))
 
     acc_dtype = require_dtype(
-        "acc_dtype",
         acc_dtype,
         (jnp.float32,),
+        name="acc_dtype",
         default=jnp.float32,
     )
     wgrad_dtype = require_dtype(
-        "wgrad_dtype",
         wgrad_dtype,
         (jnp.bfloat16, jnp.float16, jnp.float32),
+        name="wgrad_dtype",
         default=jnp.bfloat16,
     )
     mma_tiler_mn = kernel.require_mma_tiler(mma_tiler_mn)
@@ -299,7 +299,7 @@ def _grouped_gemm_wgrad_impl(
             "expert_cnt": expert_cnt,
             "input_order": input_order_value,
             "has_global_scale": has_global_scale,
-            "cluster_overlap_margin": int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0")),
+            "cluster_overlap_margin": int(cluster_overlap_margin),
         },
         outputs=(
             BufferSpec(
@@ -324,7 +324,6 @@ def _grouped_gemm_wgrad_impl(
             ),
         ),
         input_specs=input_specs,
-        use_static_tensors=True,
     )
     return TupleDict(wgrad_tensor=wgrad_tensor)
 
@@ -350,11 +349,14 @@ class GroupedGemmWgradSm100(ApiBaseJax):
         input_order: str = "tensor2d",
     ) -> None:
         super().__init__()
+        a_spec = wgrad_a_tensor_spec()
+        b_spec = wgrad_b_tensor_spec()
+        scale_spec = wgrad_scale_tensor_spec()
         self._sample_descs = {
-            "a_tensor": self.make_tensor_desc(sample_a_tensor, name="sample_a_tensor"),
-            "b_tensor": self.make_tensor_desc(sample_b_tensor, name="sample_b_tensor"),
-            "sfa_tensor": self.make_tensor_desc(sample_sfa_tensor, name="sample_sfa_tensor"),
-            "sfb_tensor": self.make_tensor_desc(sample_sfb_tensor, name="sample_sfb_tensor"),
+            "a_tensor": self.make_tensor_desc(sample_a_tensor, tensor_spec=a_spec, name="sample_a_tensor"),
+            "b_tensor": self.make_tensor_desc(sample_b_tensor, tensor_spec=b_spec, name="sample_b_tensor"),
+            "sfa_tensor": self.make_tensor_desc(sample_sfa_tensor, tensor_spec=scale_spec, name="sample_sfa_tensor"),
+            "sfb_tensor": self.make_tensor_desc(sample_sfb_tensor, tensor_spec=scale_spec, name="sample_sfb_tensor"),
             "offsets_tensor": self.make_tensor_desc(sample_offsets_tensor, name="sample_offsets_tensor"),
             "global_scale_a": self.make_optional_tensor_desc(sample_global_scale_a, name="sample_global_scale_a"),
             "global_scale_b": self.make_optional_tensor_desc(sample_global_scale_b, name="sample_global_scale_b"),
@@ -367,12 +369,13 @@ class GroupedGemmWgradSm100(ApiBaseJax):
             "sf_vec_size": sf_vec_size,
             "accumulate_on_output": accumulate_on_output,
             "input_order": input_order,
+            "cluster_overlap_margin": int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0")),
         }
 
-        self._sample_descs = immutable_mapping(self._sample_descs)
-        self._config = immutable_mapping(self._config)
+        self._sample_descs = self.freeze_mapping(self._sample_descs)
+        self._config = self.freeze_mapping(self._config)
 
-    def _check_support(self) -> bool:
+    def _check_support(self) -> None:
         resolved = _grouped_gemm_wgrad_impl(
             self._sample_descs["a_tensor"],
             self._sample_descs["b_tensor"],
@@ -384,8 +387,7 @@ class GroupedGemmWgradSm100(ApiBaseJax):
             **self._config,
             _validate_only=True,
         )
-        self._config = immutable_mapping({**self._config, **resolved})
-        return True
+        self._config = self.freeze_mapping({**self._config, **resolved})
 
     def __call__(
         self,
@@ -426,7 +428,7 @@ class GroupedGemmWgradSm100(ApiBaseJax):
             "global_scale_a": global_scale_a,
             "global_scale_b": global_scale_b,
         }
-        check_call_signatures(self, self._sample_descs, values)
+        self.check_tensor_signatures(self._sample_descs, values)
         return _grouped_gemm_wgrad_impl(**values, **self._config)
 
 

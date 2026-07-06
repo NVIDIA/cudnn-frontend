@@ -15,15 +15,18 @@ from ..._jax.api_base import (
     BufferSpec,
     TupleDict,
     call_cutedsl,
+    require_array,
     require_dtype,
 )
 from ..._jax.gemm import (
+    as_gemm_tensor_desc,
     block_scale_tensor_spec,
     gemm_a_tensor_spec,
     gemm_b_tensor_spec,
     gemm_c_tensor_spec,
     probability_tensor_spec,
     require_16_byte_extent,
+    require_layout,
 )
 from ..._jax.grouped_gemm import (
     grouped_bias_tensor_spec,
@@ -35,10 +38,8 @@ from ..._jax.grouped_gemm import (
 )
 from ...gemm_validation import (
     block_scale_shape,
-    require_shape,
     resolve_max_active_clusters,
 )
-from .._jax_api import check_call_signatures, immutable_mapping
 
 
 def _launch(
@@ -170,7 +171,7 @@ def _grouped_gemm_glu_impl(
     acc_dtype: Any = None,
     c_dtype: Any = None,
     d_dtype: Any = None,
-    cd_major: str = "n",
+    output_layout: str = "LMN",
     mma_tiler_mn: tuple[int, int] = (256, 256),
     cluster_shape_mn: Optional[tuple[int, int]] = None,
     sf_vec_size: int = 32,
@@ -183,13 +184,14 @@ def _grouped_gemm_glu_impl(
     glu_clamp_max: float = 7.0,
     glu_clamp_min: float = -7.0,
     use_dynamic_sched: bool = False,
+    cluster_overlap_margin: int = 0,
     *,
-    b_major: str = "k",
+    b_layout: str = "LNK",
     _validate_only: bool = False,
 ) -> TupleDict | dict[str, Any]:
     """Compute an MXFP8 dense-weight grouped GEMM with fused GLU.
 
-    Dense expert weights use shape ``(N, K, L)``. ``swiglu`` and ``geglu``
+    Dense expert weights use public shape ``(L, N, K)``. ``swiglu`` and ``geglu``
     produce ``N / 2`` output columns. FP8 output returns row/column E8M0
     scale factors; FP16/BF16 output returns an initialized per-expert amax.
     Temporary output and scheduler storage is owned by XLA.
@@ -200,9 +202,16 @@ def _grouped_gemm_glu_impl(
     )
 
     kernel = BlockScaledMoEGroupedGemmGluBiasKernel
+    output_layout = require_layout("output_layout", output_layout, ("LMN",))
+    b_layout = require_layout("b_layout", b_layout, ("LNK",))
+    a_spec = gemm_a_tensor_spec("LMK")
+    b_spec = gemm_b_tensor_spec(b_layout)
+    output_spec = gemm_c_tensor_spec(output_layout, name="output_layout")
+    a_desc = as_gemm_tensor_desc("a_tensor", a_tensor, a_spec)
+    b_desc = as_gemm_tensor_desc("b_tensor", b_tensor, b_spec)
     m, n, k, experts, ab_dtype = require_grouped_gemm_inputs(
-        a_tensor,
-        b_tensor,
+        a_desc,
+        b_desc,
         padded_offsets,
         alpha_tensor,
         max_experts=kernel.MAX_EXPERTS,
@@ -225,20 +234,24 @@ def _grouped_gemm_glu_impl(
     if prob_tensor is not None:
         require_grouped_probability("prob_tensor", prob_tensor, m=m)
     if bias_tensor is not None:
-        require_shape("bias_tensor", tuple(getattr(bias_tensor, "shape", ())), (n, experts))
-        require_dtype("bias_tensor.dtype", bias_tensor, (jnp.float16, jnp.bfloat16, jnp.float32))
+        require_array(
+            bias_tensor,
+            name="bias_tensor",
+            shape=(n, experts),
+            dtype=(jnp.float16, jnp.bfloat16, jnp.float32),
+        )
 
-    acc_dtype = require_dtype("acc_dtype", acc_dtype, (jnp.float32,), default=jnp.float32)
+    acc_dtype = require_dtype(acc_dtype, (jnp.float32,), name="acc_dtype", default=jnp.float32)
     c_dtype = require_dtype(
-        "c_dtype",
         c_dtype,
         (jnp.float32, jnp.float16, jnp.bfloat16, jnp.float8_e4m3fn, jnp.float8_e5m2),
+        name="c_dtype",
         default=jnp.bfloat16,
     )
     d_dtype = require_dtype(
-        "d_dtype",
         d_dtype,
         (jnp.float16, jnp.bfloat16, jnp.float8_e4m3fn, jnp.float8_e5m2),
+        name="d_dtype",
         default=jnp.bfloat16,
     )
     fp8_dtypes = {
@@ -254,10 +267,6 @@ def _grouped_gemm_glu_impl(
         norm_const_tensor = None
     if vector_f32 and c_dtype in fp8_dtypes:
         raise ValueError("vector_f32 does not support an FP8 c_dtype")
-    if cd_major != "n":
-        raise ValueError(f"cd_major must be 'n', got {cd_major!r}")
-    if b_major != "k":
-        raise ValueError(f"b_major must be 'k' for grouped GLU, got {b_major!r}")
     if act_func not in ("swiglu", "geglu"):
         raise ValueError(f"act_func must be 'swiglu' or 'geglu', got {act_func!r}")
     if linear_offset is None:
@@ -269,9 +278,6 @@ def _grouped_gemm_glu_impl(
     cluster_shape_mn = kernel.require_cluster_shape(cluster_shape_mn, mma_tiler_mn=mma_tiler_mn)
 
     output_n = n // 2
-    a_spec = gemm_a_tensor_spec("k")
-    b_spec = gemm_b_tensor_spec(b_major)
-    output_spec = gemm_c_tensor_spec("n")
     scale_spec = block_scale_tensor_spec()
     require_16_byte_extent("a_tensor", k, ab_dtype)
     require_16_byte_extent("b_tensor", k, ab_dtype)
@@ -308,8 +314,8 @@ def _grouped_gemm_glu_impl(
         input_specs.append(None)
 
     outputs = [
-        BufferSpec("c_tensor", (m, n, 1), c_dtype, tensor_spec=output_spec),
-        BufferSpec("d_tensor", (m, output_n, 1), d_dtype, tensor_spec=output_spec),
+        BufferSpec("c_tensor", (1, m, n), c_dtype, tensor_spec=output_spec),
+        BufferSpec("d_tensor", (1, m, output_n), d_dtype, tensor_spec=output_spec),
     ]
     workspaces = []
     if quantized_output:
@@ -317,7 +323,7 @@ def _grouped_gemm_glu_impl(
             (
                 BufferSpec(
                     "d_col_tensor",
-                    (m, output_n, 1),
+                    (1, m, output_n),
                     d_dtype,
                     tensor_spec=output_spec,
                 ),
@@ -340,7 +346,7 @@ def _grouped_gemm_glu_impl(
         workspaces.append(
             BufferSpec(
                 "d_col_scratch",
-                (m, output_n, 1),
+                (1, m, output_n),
                 d_dtype,
                 tensor_spec=output_spec,
             )
@@ -375,12 +381,11 @@ def _grouped_gemm_glu_impl(
             "geglu_alpha": float(geglu_alpha),
             "glu_clamp_max": float(glu_clamp_max),
             "glu_clamp_min": float(glu_clamp_min),
-            "cluster_overlap_margin": int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0")),
+            "cluster_overlap_margin": int(cluster_overlap_margin),
         },
         outputs=outputs,
         workspaces=workspaces,
         input_specs=input_specs,
-        use_static_tensors=True,
     )
     if quantized_output:
         c_tensor, d_tensor, d_col_tensor, sfd_row_tensor, sfd_col_tensor = results
@@ -417,7 +422,7 @@ class GroupedGemmGluSm100(ApiBaseJax):
         acc_dtype: Any = None,
         c_dtype: Any = None,
         d_dtype: Any = None,
-        cd_major: str = "n",
+        output_layout: str = "LMN",
         mma_tiler_mn: tuple[int, int] = (256, 256),
         cluster_shape_mn: Optional[tuple[int, int]] = None,
         sf_vec_size: int = 32,
@@ -431,25 +436,38 @@ class GroupedGemmGluSm100(ApiBaseJax):
         glu_clamp_min: float = -7.0,
         use_dynamic_sched: bool = False,
         *,
-        b_major: str = "k",
+        b_layout: str = "LNK",
     ) -> None:
         super().__init__()
+        output_layout = require_layout("output_layout", output_layout, ("LMN",))
+        b_layout = require_layout("b_layout", b_layout, ("LNK",))
+        a_spec = gemm_a_tensor_spec("LMK")
+        b_spec = gemm_b_tensor_spec(b_layout)
+        scale_spec = block_scale_tensor_spec()
         self._sample_descs = {
-            "a_tensor": self.make_tensor_desc(sample_a_tensor, name="sample_a_tensor"),
-            "sfa_tensor": self.make_tensor_desc(sample_sfa_tensor, name="sample_sfa_tensor"),
+            "a_tensor": self.make_tensor_desc(sample_a_tensor, tensor_spec=a_spec, name="sample_a_tensor"),
+            "sfa_tensor": self.make_tensor_desc(sample_sfa_tensor, tensor_spec=scale_spec, name="sample_sfa_tensor"),
             "padded_offsets": self.make_tensor_desc(sample_padded_offsets, name="sample_padded_offsets"),
             "alpha_tensor": self.make_tensor_desc(sample_alpha_tensor, name="sample_alpha_tensor"),
-            "b_tensor": self.make_tensor_desc(sample_b_tensor, name="sample_b_tensor"),
-            "sfb_tensor": self.make_tensor_desc(sample_sfb_tensor, name="sample_sfb_tensor"),
-            "bias_tensor": self.make_optional_tensor_desc(sample_bias_tensor, name="sample_bias_tensor"),
+            "b_tensor": self.make_tensor_desc(sample_b_tensor, tensor_spec=b_spec, name="sample_b_tensor"),
+            "sfb_tensor": self.make_tensor_desc(sample_sfb_tensor, tensor_spec=scale_spec, name="sample_sfb_tensor"),
+            "bias_tensor": self.make_optional_tensor_desc(
+                sample_bias_tensor,
+                tensor_spec=grouped_bias_tensor_spec(),
+                name="sample_bias_tensor",
+            ),
             "norm_const_tensor": self.make_optional_tensor_desc(sample_norm_const_tensor, name="sample_norm_const_tensor"),
-            "prob_tensor": self.make_optional_tensor_desc(sample_prob_tensor, name="sample_prob_tensor"),
+            "prob_tensor": self.make_optional_tensor_desc(
+                sample_prob_tensor,
+                tensor_spec=probability_tensor_spec(),
+                name="sample_prob_tensor",
+            ),
         }
         self._config = {
             "acc_dtype": self.as_optional_dtype(acc_dtype),
             "c_dtype": self.as_optional_dtype(c_dtype),
             "d_dtype": self.as_optional_dtype(d_dtype),
-            "cd_major": cd_major,
+            "output_layout": output_layout,
             "mma_tiler_mn": tuple(mma_tiler_mn),
             "cluster_shape_mn": (None if cluster_shape_mn is None else tuple(cluster_shape_mn)),
             "sf_vec_size": sf_vec_size,
@@ -462,13 +480,14 @@ class GroupedGemmGluSm100(ApiBaseJax):
             "glu_clamp_max": glu_clamp_max,
             "glu_clamp_min": glu_clamp_min,
             "use_dynamic_sched": use_dynamic_sched,
-            "b_major": b_major,
+            "b_layout": b_layout,
+            "cluster_overlap_margin": int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0")),
         }
 
-        self._sample_descs = immutable_mapping(self._sample_descs)
-        self._config = immutable_mapping(self._config)
+        self._sample_descs = self.freeze_mapping(self._sample_descs)
+        self._config = self.freeze_mapping(self._config)
 
-    def _check_support(self) -> bool:
+    def _check_support(self) -> None:
         resolved = _grouped_gemm_glu_impl(
             self._sample_descs["a_tensor"],
             self._sample_descs["sfa_tensor"],
@@ -482,8 +501,7 @@ class GroupedGemmGluSm100(ApiBaseJax):
             **self._config,
             _validate_only=True,
         )
-        self._config = immutable_mapping({**self._config, **resolved})
-        return True
+        self._config = self.freeze_mapping({**self._config, **resolved})
 
     def __call__(
         self,
@@ -532,7 +550,7 @@ class GroupedGemmGluSm100(ApiBaseJax):
             "norm_const_tensor": norm_const_tensor,
             "prob_tensor": prob_tensor,
         }
-        check_call_signatures(self, self._sample_descs, values)
+        self.check_tensor_signatures(self._sample_descs, values)
         return _grouped_gemm_glu_impl(**values, **self._config)
 
 
@@ -549,7 +567,7 @@ def grouped_gemm_glu_wrapper_sm100(
     acc_dtype: Any = None,
     c_dtype: Any = None,
     d_dtype: Any = None,
-    cd_major: str = "n",
+    output_layout: str = "LMN",
     mma_tiler_mn: tuple[int, int] = (256, 256),
     cluster_shape_mn: Optional[tuple[int, int]] = None,
     sf_vec_size: int = 32,
@@ -563,7 +581,7 @@ def grouped_gemm_glu_wrapper_sm100(
     glu_clamp_min: float = -7.0,
     use_dynamic_sched: bool = False,
     *,
-    b_major: str = "k",
+    b_layout: str = "LNK",
 ) -> TupleDict:
     """Compute an MXFP8 dense-weight grouped GEMM with fused GLU."""
 
@@ -580,7 +598,7 @@ def grouped_gemm_glu_wrapper_sm100(
         acc_dtype=acc_dtype,
         c_dtype=c_dtype,
         d_dtype=d_dtype,
-        cd_major=cd_major,
+        output_layout=output_layout,
         mma_tiler_mn=mma_tiler_mn,
         cluster_shape_mn=cluster_shape_mn,
         sf_vec_size=sf_vec_size,
@@ -593,7 +611,7 @@ def grouped_gemm_glu_wrapper_sm100(
         glu_clamp_max=glu_clamp_max,
         glu_clamp_min=glu_clamp_min,
         use_dynamic_sched=use_dynamic_sched,
-        b_major=b_major,
+        b_layout=b_layout,
     )
     return op(
         a_tensor,

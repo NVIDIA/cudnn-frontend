@@ -232,7 +232,6 @@ class JaxDsaSparseAttentionBackwardContractTest(unittest.TestCase):
             (q, kv, out, dout, lse, attn_sink, topk_idxs),
         )
         self.assertIs(captured["launcher"], launcher)
-        self.assertTrue(captured["use_static_tensors"])
         self.assertEqual(
             [(spec.name, spec.shape, spec.dtype, spec.fill_value) for spec in captured["outputs"]],
             [

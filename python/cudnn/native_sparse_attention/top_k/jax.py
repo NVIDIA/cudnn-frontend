@@ -16,6 +16,7 @@ from ..._jax.api_base import (
     BufferSpec,
     TupleDict,
     call_cutedsl,
+    require_array,
     require_dtype,
 )
 from ..jax_utils import bhsd_storage_spec, require_bhsd_qkv
@@ -136,12 +137,18 @@ def _topk_reduction_impl(
         head_dim,
         input_dtype,
     ) = require_bhsd_qkv(q_tensor, k_tensor)
-    require_dtype("acc_dtype", acc_dtype, (jnp.float32,), default=jnp.float32)
-    if not hasattr(lse_tensor, "shape") or not hasattr(lse_tensor, "dtype"):
-        raise TypeError("lse_tensor must have shape and dtype metadata")
-    if tuple(lse_tensor.shape) != (batch, num_query_heads, seqlen_q):
-        raise ValueError("lse_tensor must have shape " f"{(batch, num_query_heads, seqlen_q)}, got {lse_tensor.shape}")
-    require_dtype("lse_tensor.dtype", lse_tensor, (jnp.float32,))
+    require_dtype(
+        acc_dtype,
+        (jnp.float32,),
+        name="acc_dtype",
+        default=jnp.float32,
+    )
+    require_array(
+        lse_tensor,
+        name="lse_tensor",
+        shape=(batch, num_query_heads, seqlen_q),
+        dtype=jnp.float32,
+    )
     _require_topk_config(
         k_value=int(k_value),
         selection_block_size=int(selection_block_size),
@@ -190,7 +197,6 @@ def _topk_reduction_impl(
             "is_causal": bool(is_causal),
             "scale_softmax": resolved_scale,
         },
-        use_static_tensors=True,
     )
     return TupleDict(
         topk_scores_tensor=topk_scores,
@@ -226,7 +232,7 @@ class TopKReduction(ApiBaseJax):
         self.mma_tiler_mn = tuple(mma_tiler_mn)
         self.scale_softmax = scale_softmax
 
-    def _check_support(self) -> bool:
+    def _check_support(self) -> None:
         _topk_reduction_impl(
             self.q_desc,
             self.k_desc,
@@ -240,7 +246,6 @@ class TopKReduction(ApiBaseJax):
             self.scale_softmax,
             _validate_only=True,
         )
-        return True
 
     def __call__(self, q_tensor: Any, k_tensor: Any, lse_tensor: Any) -> TupleDict:
         return super().__call__(q_tensor, k_tensor, lse_tensor)

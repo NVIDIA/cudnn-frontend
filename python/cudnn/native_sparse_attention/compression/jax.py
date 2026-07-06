@@ -126,21 +126,21 @@ def _compression_attention_impl(
     ) = require_bhsd_qkv(q_tensor, k_tensor, v_tensor)
 
     require_dtype(
-        "qk_acc_dtype",
         qk_acc_dtype,
         (jnp.float32,),
+        name="qk_acc_dtype",
         default=jnp.float32,
     )
     require_dtype(
-        "pv_acc_dtype",
         pv_acc_dtype,
         (jnp.float32,),
+        name="pv_acc_dtype",
         default=jnp.float32,
     )
     output_dtype = require_dtype(
-        "o_dtype",
         o_dtype,
         (jnp.float16, jnp.bfloat16),
+        name="o_dtype",
         default=input_dtype,
     )
     if mma_tiler_mn != (128, 128):
@@ -192,7 +192,6 @@ def _compression_attention_impl(
             "scale_softmax": resolved_softmax_scale,
             "scale_output": resolved_output_scale,
         },
-        use_static_tensors=True,
     )
     return TupleDict(
         o_tensor=results[0],
@@ -236,7 +235,7 @@ class CompressionAttention(ApiBaseJax):
         self.inv_scale_o = inv_scale_o
         self.scale_softmax = scale_softmax
 
-    def _check_support(self) -> bool:
+    def _check_support(self) -> None:
         _compression_attention_impl(
             self.q_desc,
             self.k_desc,
@@ -254,7 +253,6 @@ class CompressionAttention(ApiBaseJax):
             self.scale_softmax,
             _validate_only=True,
         )
-        return True
 
     def __call__(self, q_tensor: Any, k_tensor: Any, v_tensor: Any) -> TupleDict:
         return super().__call__(q_tensor, k_tensor, v_tensor)

@@ -183,7 +183,6 @@ class JaxDsaContractTest(unittest.TestCase):
         self.assertEqual(result["scores"].shape, (1, 4, 5))
         self.assertIs(captured["launcher"], launcher)
         self.assertEqual(captured["inputs"], (q, k, w))
-        self.assertTrue(captured["use_static_tensors"])
         self.assertEqual(
             captured["static_args"],
             {
@@ -239,7 +238,6 @@ class JaxDsaContractTest(unittest.TestCase):
         self.assertEqual(result["values"].shape, (2, 8))
         self.assertIs(captured["launcher"], launcher)
         self.assertEqual(captured["inputs"], (input_values, seq_lens))
-        self.assertTrue(captured["use_static_tensors"])
         self.assertEqual(
             [(spec.name, spec.shape, spec.dtype) for spec in captured["outputs"]],
             [
@@ -347,8 +345,6 @@ class JaxDsaContractTest(unittest.TestCase):
             ],
         )
         self.assertEqual(compact_call["static_args"], {"rows": 6, "cols": 8})
-        self.assertTrue(global_call["use_static_tensors"])
-        self.assertTrue(compact_call["use_static_tensors"])
 
     def test_local_to_global_packed_inputs_remain_device_values(self):
         captured = {}
@@ -515,12 +511,10 @@ class JaxDsaContractTest(unittest.TestCase):
         self.assertEqual(indexer_call["outputs"][0].fill_value, float("-inf"))
         self.assertEqual(indexer_call["outputs"][1].name, "denom")
         self.assertIsNone(indexer_call["outputs"][1].fill_value)
-        self.assertTrue(indexer_call["use_static_tensors"])
 
         self.assertIs(attention_call["launcher"], attention_launcher)
         self.assertEqual(attention_call["inputs"], (q, k, lse))
         self.assertEqual(attention_call["outputs"][0].fill_value, float("-inf"))
-        self.assertTrue(attention_call["use_static_tensors"])
 
         indexer_config = indexer_call["static_args"]
         self.assertEqual(indexer_config["score_type"], "indexer")
@@ -596,8 +590,6 @@ class JaxDsaContractTest(unittest.TestCase):
         self.assertEqual(attention_call["inputs"], (q, k, lse, indices, lengths))
         self.assertEqual(attention_call["outputs"][0].name, "target")
         self.assertEqual(attention_call["workspaces"], ())
-        self.assertTrue(indexer_call["use_static_tensors"])
-        self.assertTrue(attention_call["use_static_tensors"])
 
         indexer_config = indexer_call["static_args"]
         self.assertEqual(indexer_config["score_type"], "indexer")
@@ -877,7 +869,7 @@ class JaxDsaContractTest(unittest.TestCase):
             self._optional_modules(),
             self.assertRaisesRegex(
                 ValueError,
-                "dtype bfloat16",
+                "q.dtype",
             ),
             mock.patch.object(self.forward, "call_cutedsl") as call_forward,
         ):

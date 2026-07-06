@@ -121,6 +121,8 @@ from cudnn.jax import gemm_dsrelu_wrapper_sm100
 
 @jax.jit
 def run(a, b, c, sfa, sfb, prob):
+    # A is (L, M, K); B is (L, N, K); C is (L, M, N).
+    # prob retains its specialized (M, 1, L) ABI.
     return gemm_dsrelu_wrapper_sm100(
         a,
         b,
@@ -129,16 +131,17 @@ def run(a, b, c, sfa, sfb, prob):
         sfb,
         prob,
         alpha=1.0,
-        d_major="n",
+        d_layout="LMN",
         d_dtype=jnp.bfloat16,
         mma_tiler_mn=(256, 256),
         cluster_shape_mn=(2, 1),
         sf_vec_size=32,
-        a_major="k",
-        b_major="k",
+        a_layout="LMK",
+        b_layout="LNK",
     )
 
 d, dprob, amax, sfd = run(a, b, c, sfa, sfb, prob)
+# d.shape == (L, M, N); dprob.shape == (M, 1, L)
 ```
 
 The JAX API supports FP8 A/B with E8M0 scale factors and
@@ -148,6 +151,13 @@ is not exposed, so `amax` and `sfd` are `None`. `M` must be divisible by the
 per-CTA M extent because the native probability load is not predicated for a
 partial final CTA tile. That extent is 128 rows for both `TILE_M=128` and the
 two-CTA `TILE_M=256` mode.
+
+Layout strings describe the public, batch-first axis order. `a_layout` accepts
+`"LMK"` or `"LKM"`, `b_layout` accepts `"LNK"` or `"LKN"`, and `d_layout`
+accepts `"LMN"` or `"LNM"` for both the C input and D output. All accepted
+layouts keep `L` outermost; the defaults are `"LMK"`, `"LNK"`, and `"LMN"`.
+The specialized scale-factor tensors retain the shapes above, while `prob` and
+`dprob` remain `(M, 1, L)`.
 
 `````
 
@@ -220,12 +230,14 @@ op = GemmDsreluSm100(
     sample_sfb=jax.ShapeDtypeStruct(sfb.shape, sfb.dtype),
     sample_prob=jax.ShapeDtypeStruct(prob.shape, prob.dtype),
     alpha=1.0,
-    d_major="n",
+    d_layout="LMN",
     d_dtype=jnp.bfloat16,
     acc_dtype=jnp.float32,
     mma_tiler_mn=(256, 256),
     cluster_shape_mn=(2, 1),
     sf_vec_size=32,
+    a_layout="LMK",
+    b_layout="LNK",
 )
 assert op.check_support()
 d, dprob, amax, sfd = jax.jit(op)(a, b, c, sfa, sfb, prob)
@@ -240,7 +252,11 @@ the JAX call; `amax` and `sfd` are `None` in the supported output modes.
 
 ---
 
-## Parameters
+## PyTorch parameter reference
+
+This section documents the existing PyTorch tensor shapes and major-mode
+arguments. The JAX public shapes and layout strings are described in the JAX
+usage tabs above.
 
 ### Input/Output tensors
 

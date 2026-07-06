@@ -14,7 +14,7 @@ from ..._jax.api_base import (
     BufferSpec,
     TupleDict,
     call_cutedsl,
-    require_dtype,
+    require_array,
 )
 from .config import (
     resolve_dense_score_kernel_config,
@@ -244,23 +244,11 @@ def _dense_score_recompute(
     q_causal_offsets: Any | None,
     _validate_only: bool = False,
 ) -> TupleDict:
-    arrays = (
-        ("q", q, 4),
-        ("k", k, 4),
-        (per_head_name, per_head, 3),
-    )
-    for name, value, rank in arrays:
-        if not hasattr(value, "shape") or not hasattr(value, "dtype"):
-            raise TypeError(f"{name} must have shape and dtype metadata")
-        if len(value.shape) != rank:
-            raise ValueError(f"{name} must have rank {rank}, got shape {value.shape}")
+    q_shape = require_array(q, name="q", rank=4, dtype=jnp.bfloat16)
+    k_shape = require_array(k, name="k", rank=4, dtype=jnp.bfloat16)
 
-    require_dtype("q.dtype", q, (jnp.bfloat16,))
-    require_dtype("k.dtype", k, (jnp.bfloat16,))
-    require_dtype(f"{per_head_name}.dtype", per_head, (per_head_dtype,))
-
-    batch, seqlen_q, num_query_heads, head_dim = q.shape
-    k_batch, seqlen_k, num_kv_heads, k_head_dim = k.shape
+    batch, seqlen_q, num_query_heads, head_dim = q_shape
+    k_batch, seqlen_k, num_kv_heads, k_head_dim = k_shape
     dimensions = {
         "batch": batch,
         "S_q": seqlen_q,
@@ -276,8 +264,12 @@ def _dense_score_recompute(
         raise ValueError(f"q and k batch dimensions must match, got {batch} and {k_batch}")
     if k_head_dim != head_dim:
         raise ValueError("q and k head dimensions must match, got " f"{head_dim} and {k_head_dim}")
-    if tuple(per_head.shape) != (batch, seqlen_q, num_query_heads):
-        raise ValueError(f"{per_head_name} shape must be " f"{(batch, seqlen_q, num_query_heads)}, got {per_head.shape}")
+    require_array(
+        per_head,
+        name=per_head_name,
+        shape=(batch, seqlen_q, num_query_heads),
+        dtype=per_head_dtype,
+    )
     if num_query_heads % num_kv_heads:
         raise ValueError(f"H_q ({num_query_heads}) must be divisible by H_kv ({num_kv_heads})")
 
@@ -291,14 +283,11 @@ def _dense_score_recompute(
 
     inputs = (q, k, per_head)
     if q_causal_offsets is not None:
-        if not hasattr(q_causal_offsets, "shape") or not hasattr(q_causal_offsets, "dtype"):
-            raise TypeError("q_causal_offsets must have shape and dtype metadata")
-        if tuple(q_causal_offsets.shape) != (batch,):
-            raise ValueError(f"q_causal_offsets must have shape {(batch,)}, got " f"{q_causal_offsets.shape}")
-        require_dtype(
-            "q_causal_offsets.dtype",
+        require_array(
             q_causal_offsets,
-            (jnp.int32,),
+            name="q_causal_offsets",
+            shape=(batch,),
+            dtype=jnp.int32,
         )
         inputs += (q_causal_offsets,)
 
@@ -328,7 +317,6 @@ def _dense_score_recompute(
             "max_seqlen_k": int(seqlen_k),
             "scale": resolved_scale,
         },
-        use_static_tensors=True,
     )
     return TupleDict(out=out, denom=denom)
 
@@ -349,27 +337,14 @@ def _sparse_score_recompute(
     topk_indices_global: bool,
     _validate_only: bool = False,
 ) -> Any:
-    arrays = (
-        ("q", q, 4),
-        ("k", k, 3),
-        (per_head_name, per_head, 3),
-        ("topk_indices", topk_indices, 3),
+    q_shape = require_array(q, name="q", rank=4, dtype=jnp.bfloat16)
+    k_shape = require_array(k, name="k", rank=3, dtype=jnp.bfloat16)
+    topk_shape = require_array(
+        topk_indices,
+        name="topk_indices",
+        rank=3,
+        dtype=jnp.int32,
     )
-    for name, value, rank in arrays:
-        if not hasattr(value, "shape") or not hasattr(value, "dtype"):
-            raise TypeError(f"{name} must be a JAX array with shape and dtype metadata")
-        if len(value.shape) != rank:
-            raise ValueError(f"{name} must have rank {rank}, got shape {value.shape}")
-
-    q_shape = tuple(q.shape)
-    k_shape = tuple(k.shape)
-    per_head_shape = tuple(per_head.shape)
-    topk_shape = tuple(topk_indices.shape)
-
-    require_dtype("q.dtype", q, (jnp.bfloat16,))
-    require_dtype("k.dtype", k, (jnp.bfloat16,))
-    require_dtype(f"{per_head_name}.dtype", per_head, (per_head_dtype,))
-    require_dtype("topk_indices.dtype", topk_indices, (jnp.int32,))
 
     batch, seqlen_q, num_query_heads, head_dim = q_shape
     k_batch, seqlen_k, k_head_dim = k_shape
@@ -389,8 +364,12 @@ def _sparse_score_recompute(
         raise ValueError(f"q and k batch dimensions must match, got {batch} and {k_batch}")
     if k_head_dim != head_dim:
         raise ValueError(f"q and k head dimensions must match, got {head_dim} and {k_head_dim}")
-    if per_head_shape != (batch, seqlen_q, num_query_heads):
-        raise ValueError(f"{per_head_name} shape must be {(batch, seqlen_q, num_query_heads)}, " f"got {per_head_shape}")
+    require_array(
+        per_head,
+        name=per_head_name,
+        shape=(batch, seqlen_q, num_query_heads),
+        dtype=per_head_dtype,
+    )
     if (topk_batch, topk_seqlen_q) != (batch, seqlen_q):
         raise ValueError(
             "topk_indices leading dimensions must match q's batch and sequence " f"dimensions {(batch, seqlen_q)}, got {(topk_batch, topk_seqlen_q)}"
@@ -402,14 +381,12 @@ def _sparse_score_recompute(
         raise ValueError("qhead_per_kv_head must equal H_q for the MQA sparse score kernel, " f"got {qhead_per_kv_head} and H_q={num_query_heads}")
 
     if topk_length is not None:
-        if not hasattr(topk_length, "shape") or not hasattr(topk_length, "dtype"):
-            raise TypeError("topk_length must be a JAX array with shape and dtype metadata")
-        if len(topk_length.shape) != 2:
-            raise ValueError(f"topk_length must have rank 2, got shape {topk_length.shape}")
-        topk_length_shape = tuple(topk_length.shape)
-        require_dtype("topk_length.dtype", topk_length, (jnp.int32,))
-        if topk_length_shape != (batch, seqlen_q):
-            raise ValueError(f"topk_length shape must be {(batch, seqlen_q)}, " f"got {topk_length_shape}")
+        require_array(
+            topk_length,
+            name="topk_length",
+            shape=(batch, seqlen_q),
+            dtype=jnp.int32,
+        )
 
     # Keep an explicit length on the compact path. The Torch-only optimization
     # that sometimes drops it assumes every tail index was already set to -1;
@@ -446,13 +423,12 @@ def _sparse_score_recompute(
             "topk": int(topk),
             "m_block_size": int(config.m_block_size),
             "n_block_size": int(config.n_block_size),
-            "k_block_size": None if config.k_block_size is None else int(config.k_block_size),
+            "k_block_size": (None if config.k_block_size is None else int(config.k_block_size)),
             "kv_stage": int(config.kv_stage),
             "topk_in_smem": bool(config.topk_in_smem),
             "topk_indices_global": bool(topk_indices_global),
             "softmax_scale": float(softmax_scale),
         },
-        use_static_tensors=True,
     )
     return out
 
@@ -479,7 +455,7 @@ class SparseIndexerScoreRecompute(ApiBaseJax):
         self.qhead_per_kv_head = qhead_per_kv_head
         self.topk_indices_global = topk_indices_global
 
-    def _check_support(self) -> bool:
+    def _check_support(self) -> None:
         _sparse_score_recompute(
             self.q_desc,
             self.k_desc,
@@ -495,7 +471,6 @@ class SparseIndexerScoreRecompute(ApiBaseJax):
             topk_indices_global=self.topk_indices_global,
             _validate_only=True,
         )
-        return True
 
     def __call__(
         self,
@@ -564,7 +539,7 @@ class SparseAttnScoreRecompute(ApiBaseJax):
         self.qhead_per_kv_head = qhead_per_kv_head
         self.topk_indices_global = topk_indices_global
 
-    def _check_support(self) -> bool:
+    def _check_support(self) -> None:
         _sparse_score_recompute(
             self.q_desc,
             self.k_desc,
@@ -580,7 +555,6 @@ class SparseAttnScoreRecompute(ApiBaseJax):
             topk_indices_global=self.topk_indices_global,
             _validate_only=True,
         )
-        return True
 
     def __call__(
         self,
@@ -647,7 +621,7 @@ class DenseIndexerScoreRecompute(ApiBaseJax):
         self.sm_scale = sm_scale
         self.ratio = ratio
 
-    def _check_support(self) -> bool:
+    def _check_support(self) -> None:
         _dense_score_recompute(
             self.q_desc,
             self.k_desc,
@@ -661,7 +635,6 @@ class DenseIndexerScoreRecompute(ApiBaseJax):
             q_causal_offsets=self.q_causal_offsets_desc,
             _validate_only=True,
         )
-        return True
 
     def __call__(self, q: Any, k: Any, weights: Any, q_causal_offsets: Any | None = None) -> TupleDict:
         return super().__call__(q, k, weights, q_causal_offsets)
@@ -707,7 +680,7 @@ class DenseAttnScoreRecompute(ApiBaseJax):
         self.qhead_per_kv_head = qhead_per_kv_head
         self.ratio = ratio
 
-    def _check_support(self) -> bool:
+    def _check_support(self) -> None:
         _dense_score_recompute(
             self.q_desc,
             self.k_desc,
@@ -721,7 +694,6 @@ class DenseAttnScoreRecompute(ApiBaseJax):
             q_causal_offsets=self.q_causal_offsets_desc,
             _validate_only=True,
         )
-        return True
 
     def __call__(self, q: Any, k: Any, lse: Any, q_causal_offsets: Any | None = None) -> TupleDict:
         return super().__call__(q, k, lse, q_causal_offsets)

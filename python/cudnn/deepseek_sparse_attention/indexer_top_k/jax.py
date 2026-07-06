@@ -14,8 +14,9 @@ from ..._jax.api_base import (
     ApiBaseJax,
     BufferSpec,
     TupleDict,
+    as_dtype,
     call_cutedsl,
-    require_dtype,
+    require_array,
 )
 
 _INT32_MAX = (1 << 31) - 1
@@ -185,17 +186,21 @@ def _indexer_top_k_impl(
     if not return_val:
         raise NotImplementedError("The JAX indexer_top_k_wrapper requires return_val=True")
 
-    if not hasattr(input_values, "shape") or not hasattr(input_values, "dtype"):
-        raise TypeError("input_values must be a JAX array with shape and dtype metadata")
-    if not hasattr(seq_lens, "shape") or not hasattr(seq_lens, "dtype"):
-        raise TypeError("seq_lens must be a JAX array with shape and dtype metadata")
-    if len(input_values.shape) != 2:
-        raise ValueError(f"input_values must have rank 2, got shape {input_values.shape}")
-    if len(seq_lens.shape) != 1:
-        raise ValueError(f"seq_lens must have rank 1, got shape {seq_lens.shape}")
+    input_shape = require_array(
+        input_values,
+        name="input_values",
+        rank=2,
+        dtype=(jnp.float16, jnp.bfloat16, jnp.float32),
+    )
+    seq_lens_shape = require_array(
+        seq_lens,
+        name="seq_lens",
+        rank=1,
+        dtype=jnp.int32,
+    )
 
-    num_rows, num_cols = input_values.shape
-    (batch_size,) = seq_lens.shape
+    num_rows, num_cols = input_shape
+    (batch_size,) = seq_lens_shape
 
     if num_rows <= 0 or num_cols <= 0:
         raise ValueError(f"input_values dimensions must be positive, got {(num_rows, num_cols)}")
@@ -213,12 +218,7 @@ def _indexer_top_k_impl(
     if copy_bytes & (copy_bytes - 1):
         raise ValueError("num_copy_bits must describe a power-of-two byte alignment, " f"got {num_copy_bits} bits ({copy_bytes} bytes)")
 
-    input_dtype = require_dtype(
-        "input_values.dtype",
-        input_values,
-        (jnp.float16, jnp.bfloat16, jnp.float32),
-    )
-    require_dtype("seq_lens.dtype", seq_lens, (jnp.int32,))
+    input_dtype = as_dtype(input_values)
 
     dtype_bits = input_dtype.itemsize * 8
     if num_copy_bits % dtype_bits != 0:
@@ -259,7 +259,6 @@ def _indexer_top_k_impl(
             "num_copy_bits": int(num_copy_bits),
             "large_occupancy": bool(num_rows > 148),
         },
-        use_static_tensors=True,
     )
     return TupleDict(indices=output_indices, values=output_values)
 
@@ -284,7 +283,7 @@ class IndexerTopK(ApiBaseJax):
         self.return_val = return_val
         self.num_copy_bits = num_copy_bits
 
-    def _check_support(self) -> bool:
+    def _check_support(self) -> None:
         _indexer_top_k_impl(
             self.input_desc,
             self.seq_lens_desc,
@@ -294,7 +293,6 @@ class IndexerTopK(ApiBaseJax):
             self.num_copy_bits,
             _validate_only=True,
         )
-        return True
 
     def __call__(self, input_values: Any, seq_lens: Any) -> TupleDict:
         return super().__call__(input_values, seq_lens)
@@ -347,8 +345,6 @@ def local_to_global_wrapper(
     the kernel and are not copied to the host while tracing.
     """
 
-    if not hasattr(local_indices, "shape") or not hasattr(local_indices, "dtype"):
-        raise TypeError("local_indices must have shape and dtype metadata")
     if seqlen_k <= 0:
         raise ValueError(f"seqlen_k must be positive, got {seqlen_k}")
 
@@ -356,30 +352,34 @@ def local_to_global_wrapper(
     if is_varlen:
         if cu_seqlens_q is None or cu_seqlens_k is None:
             raise ValueError("Packed local-to-global conversion requires both cu_seqlens_q " "and cu_seqlens_k")
-        if len(local_indices.shape) != 2:
-            raise ValueError("Packed local_indices must have rank 2, got shape " f"{local_indices.shape}")
-        for name, value in (
-            ("cu_seqlens_q", cu_seqlens_q),
-            ("cu_seqlens_k", cu_seqlens_k),
-        ):
-            if not hasattr(value, "shape") or not hasattr(value, "dtype"):
-                raise TypeError(f"{name} must have shape and dtype metadata")
-            if len(value.shape) != 1:
-                raise ValueError(f"{name} must have rank 1, got shape {value.shape}")
-            require_dtype(f"{name}.dtype", value, (jnp.int32,))
-        if tuple(cu_seqlens_q.shape) != tuple(cu_seqlens_k.shape):
-            raise ValueError("cu_seqlens_q and cu_seqlens_k must have the same shape, got " f"{cu_seqlens_q.shape} and {cu_seqlens_k.shape}")
+        local_shape = require_array(
+            local_indices,
+            name="local_indices",
+            rank=2,
+            dtype=(jnp.int32, jnp.int64),
+        )
+        cu_seqlens_shape = require_array(
+            cu_seqlens_q,
+            name="cu_seqlens_q",
+            rank=1,
+            dtype=jnp.int32,
+        )
+        require_array(
+            cu_seqlens_k,
+            name="cu_seqlens_k",
+            shape=cu_seqlens_shape,
+            dtype=jnp.int32,
+        )
         inputs = (local_indices, cu_seqlens_q, cu_seqlens_k)
     else:
-        if len(local_indices.shape) != 3:
-            raise ValueError("Fixed-shape local_indices must have rank 3, got shape " f"{local_indices.shape}")
+        local_shape = require_array(
+            local_indices,
+            name="local_indices",
+            rank=3,
+            dtype=(jnp.int32, jnp.int64),
+        )
         inputs = (local_indices,)
 
-    require_dtype(
-        "local_indices.dtype",
-        local_indices,
-        (jnp.int32, jnp.int64),
-    )
     launcher = _launch_local_to_global_varlen if is_varlen else _launch_local_to_global_fixed
     (global_indices,) = call_cutedsl(
         launcher,
@@ -387,12 +387,11 @@ def local_to_global_wrapper(
         outputs=(
             BufferSpec(
                 "indices",
-                tuple(local_indices.shape),
+                local_shape,
                 jnp.int32,
             ),
         ),
         static_args={"seqlen_k": int(seqlen_k)},
-        use_static_tensors=True,
     )
     return TupleDict(indices=global_indices)
 
@@ -406,18 +405,19 @@ def compactify_wrapper(indices: Any) -> TupleDict:
     number of nonnegative entries in every returned row.
     """
 
-    if not hasattr(indices, "shape") or not hasattr(indices, "dtype"):
-        raise TypeError("indices must have shape and dtype metadata")
-    if len(indices.shape) not in (2, 3):
-        raise ValueError(f"indices must have rank 2 or 3, got shape {indices.shape}")
-    require_dtype("indices.dtype", indices, (jnp.int32,))
+    indices_shape = require_array(
+        indices,
+        name="indices",
+        rank=(2, 3),
+        dtype=jnp.int32,
+    )
 
-    cols = indices.shape[-1]
+    cols = indices_shape[-1]
     rows = 1
-    for extent in indices.shape[:-1]:
+    for extent in indices_shape[:-1]:
         rows *= extent
     if rows <= 0 or cols <= 0:
-        raise ValueError(f"indices dimensions must be positive, got {indices.shape}")
+        raise ValueError(f"indices dimensions must be positive, got {indices_shape}")
 
     flat_indices = jnp.reshape(indices, (rows, cols))
     compact_indices, topk_length = call_cutedsl(
@@ -428,7 +428,6 @@ def compactify_wrapper(indices: Any) -> TupleDict:
             BufferSpec("topk_length", (rows,), jnp.int32),
         ),
         static_args={"rows": int(rows), "cols": int(cols)},
-        use_static_tensors=True,
     )
     return TupleDict(
         indices=compact_indices,

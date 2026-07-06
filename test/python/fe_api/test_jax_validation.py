@@ -43,8 +43,10 @@ class _Float32:
 
 
 class _ArrayMetadata:
-    def __init__(self, dtype):
+    def __init__(self, dtype, *, name=None):
         self.dtype = dtype
+        if name is not None:
+            self.name = name
 
 
 class JaxApiBaseValidationTest(unittest.TestCase):
@@ -116,14 +118,14 @@ class JaxApiBaseValidationTest(unittest.TestCase):
 
     def test_accepts_dtype_like_values_and_returns_normalized_dtype(self):
         self.assertIs(
-            self.api_base.require_dtype("dtype", "float32", (_Float16, _Float32)),
+            self.api_base.require_dtype("float32", (_Float16, _Float32)),
             self.float32,
         )
 
     def test_accepts_objects_with_dtype_metadata(self):
         value = _ArrayMetadata(self.float16)
         self.assertIs(
-            self.api_base.require_dtype("value", value, (_Float16, _Float32)),
+            self.api_base.require_dtype(value, (_Float16, _Float32)),
             self.float16,
         )
         self.assertIs(self.api_base.as_dtype(value), self.float16)
@@ -132,23 +134,43 @@ class JaxApiBaseValidationTest(unittest.TestCase):
 
     def test_does_not_unwrap_scalar_dtype_classes(self):
         self.assertIs(
-            self.api_base.require_dtype("dtype", _Float32, (_Float32,)),
+            self.api_base.require_dtype(_Float32, (_Float32,)),
             self.float32,
         )
 
     def test_applies_default_only_to_none(self):
         self.assertIs(
-            self.api_base.require_dtype("dtype", None, (_Float32,), default=_Float32),
+            self.api_base.require_dtype(
+                None,
+                (_Float32,),
+                name="output_dtype",
+                default=_Float32,
+            ),
             self.float32,
         )
-        with self.assertRaisesRegex(ValueError, "dtype must not be None"):
-            self.api_base.require_dtype("dtype", None, (_Float32,))
+        with self.assertRaisesRegex(ValueError, "output_dtype must not be None"):
+            self.api_base.require_dtype(None, (_Float32,), name="output_dtype")
 
-    def test_rejects_unsupported_and_invalid_dtype_values(self):
+    def test_infers_or_accepts_diagnostic_name(self):
+        named_value = _ArrayMetadata(self.float16, name="sample")
+        with self.assertRaisesRegex(
+            ValueError,
+            r"sample\.dtype must be one of \{float32\}, got float16",
+        ):
+            self.api_base.require_dtype(named_value, (_Float32,))
+
         with self.assertRaisesRegex(ValueError, r"dtype must be one of \{float32\}, got float16"):
-            self.api_base.require_dtype("dtype", _Float16, (_Float32,))
+            self.api_base.require_dtype(_Float16, (_Float32,))
+
+        with self.assertRaisesRegex(
+            ValueError,
+            r"compute_dtype must be one of \{float32\}, got float16",
+        ):
+            self.api_base.require_dtype(_Float16, (_Float32,), name="compute_dtype")
+
+    def test_rejects_invalid_dtype_values(self):
         with self.assertRaisesRegex(TypeError, "Cannot interpret"):
-            self.api_base.require_dtype("dtype", object(), (_Float32,))
+            self.api_base.require_dtype(object(), (_Float32,))
 
 
 if __name__ == "__main__":

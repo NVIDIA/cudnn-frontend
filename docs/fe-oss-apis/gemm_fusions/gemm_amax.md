@@ -104,28 +104,38 @@ from cudnn.jax import gemm_amax_wrapper_sm100
 
 @jax.jit
 def run(a, b, sfa, sfb):
+    # A is (L, M, K); B is (L, N, K).
     return gemm_amax_wrapper_sm100(
         a,
         b,
         sfa,
         sfb,
-        c_major="n",
+        c_layout="LMN",
         c_dtype=jnp.float32,
         mma_tiler_mn=(128, 128),
         cluster_shape_mn=(1, 1),
         sf_vec_size=32,
-        a_major="k",
-        b_major="k",
+        a_layout="LMK",
+        b_layout="LNK",
     )
 
 c, amax = run(a, b, sfa, sfb)
+# c.shape == (L, M, N)
 ```
 
 The JAX API supports FP8 A/B, E8M0 scale factors, `sf_vec_size=32`, and
-float32/float16/bfloat16 C. It preserves the logical Torch tensor shapes while
-using `a_major`, `b_major`, and `c_major` to constrain physical XLA layouts.
-Packed FP4x2 is not exposed because JAX's scalar FP4 type has a different
-storage ABI. JAX initializes the amax reduction on every invocation.
+float32/float16/bfloat16 C. Layout strings describe the public, batch-first
+axis order: `a_layout` accepts `"LMK"` or `"LKM"`, `b_layout` accepts
+`"LNK"` or `"LKN"`, and `c_layout` accepts `"LMN"` or `"LNM"`. All accepted
+layouts keep `L` outermost; the final letter is the contiguous mode of the
+compact row-major JAX array. The defaults are `"LMK"`, `"LNK"`, and `"LMN"`.
+The wrapper maps these arrays to the kernel's canonical `(M, K, L)`,
+`(N, K, L)`, and `(M, N, L)` tensor views.
+
+The specialized `SFA` and `SFB` shapes remain unchanged with `L` in their
+final dimension. Packed FP4x2 is not exposed because JAX's scalar FP4 type has
+a different storage ABI. JAX initializes the amax reduction on every
+invocation.
 
 `````
 
@@ -175,12 +185,14 @@ op = GemmAmaxSm100(
     sample_b=jax.ShapeDtypeStruct(b.shape, b.dtype),
     sample_sfa=jax.ShapeDtypeStruct(sfa.shape, sfa.dtype),
     sample_sfb=jax.ShapeDtypeStruct(sfb.shape, sfb.dtype),
-    c_major="n",
+    c_layout="LMN",
     c_dtype=jnp.float32,
     acc_dtype=jnp.float32,
     mma_tiler_mn=(128, 128),
     cluster_shape_mn=(1, 1),
     sf_vec_size=32,
+    a_layout="LMK",
+    b_layout="LNK",
 )
 assert op.check_support()
 c, amax = jax.jit(op)(a, b, sfa, sfb)
@@ -195,7 +207,11 @@ the JAX call.
 
 ---
 
-## Parameters
+## PyTorch parameter reference
+
+This section documents the existing PyTorch tensor shapes, strides, and
+major-mode arguments. The JAX public shapes and layout strings are described
+in the JAX usage tabs above.
 
 ### Input/Output tensors
 - Input tensor **A**: `a_tensor` (wrapper) or `sample_a`/`a_tensor` (class)

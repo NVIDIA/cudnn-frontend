@@ -107,28 +107,34 @@ from cudnn.jax import gemm_swiglu_wrapper_sm100
 
 @jax.jit
 def run(a, b):
+    # A is (L, M, K); B is (L, N, K).
     return gemm_swiglu_wrapper_sm100(
         a,
         b,
         alpha=1.0,
-        c_major="m",
+        c_layout="LNM",
         ab12_dtype=jnp.float32,
         c_dtype=jnp.float16,
         mma_tiler_mn=(128, 128),
         cluster_shape_mn=(1, 1),
-        a_major="k",
-        b_major="k",
+        a_layout="LMK",
+        b_layout="LNK",
     )
 
 ab12, c, sfc, amax = run(a, b)
+# ab12.shape == (L, N, M); c.shape == (L, N // 2, M)
 ```
 
-The JAX API supports the standard mode. It uses the same logical
-`(M, K, L)`, `(N, K, L)`, and `(M, N, L)` shapes while explicit major-mode
-arguments constrain the compact XLA layouts. `TILE_N` must be one of
-`{64, 128, 192, 256}` because the epilogue consumes 32-column subtiles in
-pairs. With `TILE_M=256`, `M` must be divisible by 256 so both CTAs in each
-MMA pair are present. `sfc` and `amax` are `None`.
+The JAX API supports the standard mode. Layout strings describe the public,
+batch-first axis order: `a_layout` accepts `"LMK"` or `"LKM"`, `b_layout`
+accepts `"LNK"` or `"LKN"`, and `c_layout` accepts `"LMN"` or `"LNM"` for
+both AB12 and C. All accepted layouts keep `L` outermost; the defaults are
+`"LMK"`, `"LNK"`, and `"LMN"`. The wrapper maps these arrays to the kernel's
+canonical `(M, K, L)`, `(N, K, L)`, and `(M, N, L)` tensor views.
+
+`TILE_N` must be one of `{64, 128, 192, 256}` because the epilogue consumes
+32-column subtiles in pairs. With `TILE_M=256`, `M` must be divisible by 256 so
+both CTAs in each MMA pair are present. `sfc` and `amax` are `None`.
 
 `````
 
@@ -211,12 +217,14 @@ gemm = GemmSwigluSm100(
     sample_a=jax.ShapeDtypeStruct(a.shape, a.dtype),
     sample_b=jax.ShapeDtypeStruct(b.shape, b.dtype),
     alpha=1.0,
-    c_major="m",
+    c_layout="LNM",
     ab12_dtype=jnp.float32,
     c_dtype=jnp.float16,
     acc_dtype=jnp.float32,
     mma_tiler_mn=(128, 128),
     cluster_shape_mn=(1, 1),
+    a_layout="LMK",
+    b_layout="LNK",
 )
 assert gemm.check_support()
 ab12, c, sfc, amax = jax.jit(gemm)(a, b)
@@ -282,7 +290,9 @@ gemm.execute(
 
 The quantized class path is not available in the JAX API. Passing
 `sample_sfa`, `sample_sfb`, or `sample_norm_const` causes `check_support()` to
-raise `NotImplementedError`.
+raise `NotImplementedError`. The quantization-only controls `sf_vec_size`,
+`vector_f32`, and `ab12_stages` must retain their standard-mode defaults until
+that path is implemented; non-default values are rejected rather than ignored.
 
 `````
 
@@ -290,7 +300,11 @@ raise `NotImplementedError`.
 
 ---
 
-## Parameters
+## PyTorch parameter reference
+
+This section documents the existing PyTorch tensor shapes, strides, and
+major-mode arguments. The JAX public shapes and layout strings are described
+in the JAX usage tabs above.
 
 ### Input/Output tensors
 

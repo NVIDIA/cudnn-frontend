@@ -45,7 +45,9 @@ from ..deepseek_sparse_attention.indexer_forward.jax import (
     indexer_forward_wrapper,
 )
 from ..deepseek_sparse_attention.indexer_backward.jax import (
+    DenseIndexerBackward,
     IndexerBackward,
+    dense_indexer_backward_wrapper,
     indexer_backward_wrapper,
 )
 from ..deepseek_sparse_attention.indexer_top_k.jax import (
@@ -122,6 +124,10 @@ from ..native_sparse_attention.selection.jax import (
     SelectionAttention,
     selection_attention_wrapper,
 )
+from ..native_sparse_attention.sliding_window_attention.jax import (
+    SlidingWindowAttention,
+    sliding_window_attention_wrapper,
+)
 from ..native_sparse_attention.top_k.jax import (
     TopKReduction,
     topk_reduction_wrapper,
@@ -134,6 +140,7 @@ from ..sdpa.bwd.jax import SdpabwdSm100D256, sdpa_bwd_wrapper_sm100_d256
 from ..sdpa.fwd.jax import SdpafwdSm100D256, sdpa_fwd_wrapper_sm100_d256
 
 DSA = SimpleNamespace(
+    DenseIndexerBackward=DenseIndexerBackward,
     IndexerBackward=IndexerBackward,
     IndexerForward=IndexerForward,
     IndexerTopK=IndexerTopK,
@@ -142,6 +149,7 @@ DSA = SimpleNamespace(
     DenseIndexerScoreRecompute=DenseIndexerScoreRecompute,
     DenseAttnScoreRecompute=DenseAttnScoreRecompute,
     SparseAttentionBackward=SparseAttentionBackward,
+    dense_indexer_backward_wrapper=dense_indexer_backward_wrapper,
     indexer_backward_wrapper=indexer_backward_wrapper,
     indexer_forward_wrapper=indexer_forward_wrapper,
     indexer_top_k_wrapper=indexer_top_k_wrapper,
@@ -157,9 +165,11 @@ DSA = SimpleNamespace(
 NSA = SimpleNamespace(
     CompressionAttention=CompressionAttention,
     SelectionAttention=SelectionAttention,
+    SlidingWindowAttention=SlidingWindowAttention,
     TopKReduction=TopKReduction,
     compression_attention_wrapper=compression_attention_wrapper,
     selection_attention_wrapper=selection_attention_wrapper,
+    sliding_window_attention_wrapper=sliding_window_attention_wrapper,
     topk_reduction_wrapper=topk_reduction_wrapper,
 )
 
@@ -169,6 +179,7 @@ __all__ = [
     "NSA",
     "CompressionAttention",
     "DenseAttnScoreRecompute",
+    "DenseIndexerBackward",
     "DenseIndexerScoreRecompute",
     "GemmAmaxSm100",
     "GemmDsreluSm100",
@@ -191,6 +202,7 @@ __all__ = [
     "SdpabwdSm100D256",
     "SdpafwdSm100D256",
     "SelectionAttention",
+    "SlidingWindowAttention",
     "SparseAttentionBackward",
     "SparseAttnScoreRecompute",
     "SparseIndexerScoreRecompute",
@@ -199,6 +211,7 @@ __all__ = [
     "compactify_wrapper",
     "compression_attention_wrapper",
     "dense_attn_score_recompute_wrapper",
+    "dense_indexer_backward_wrapper",
     "dense_indexer_score_recompute_wrapper",
     "indexer_forward_wrapper",
     "indexer_backward_wrapper",
@@ -221,6 +234,7 @@ __all__ = [
     "sdpa_bwd_wrapper_sm100_d256",
     "sdpa_fwd_wrapper_sm100_d256",
     "selection_attention_wrapper",
+    "sliding_window_attention_wrapper",
     "sparse_attention_backward_wrapper",
     "sparse_attn_score_recompute_wrapper",
     "sparse_indexer_score_recompute_wrapper",

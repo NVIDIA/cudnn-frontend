@@ -122,8 +122,18 @@ def _sdpa_fwd_impl(
         dtype,
     ) = require_bhsd_qkv(q_tensor, k_tensor, v_tensor)
 
-    require_dtype("qk_acc_dtype", qk_acc_dtype, (jnp.float32,), default=jnp.float32)
-    require_dtype("pv_acc_dtype", pv_acc_dtype, (jnp.float32,), default=jnp.float32)
+    require_dtype(
+        qk_acc_dtype,
+        (jnp.float32,),
+        name="qk_acc_dtype",
+        default=jnp.float32,
+    )
+    require_dtype(
+        pv_acc_dtype,
+        (jnp.float32,),
+        name="pv_acc_dtype",
+        default=jnp.float32,
+    )
     if mma_tiler_mn != (128, 128):
         raise ValueError(f"mma_tiler_mn must be (128, 128), got {mma_tiler_mn}")
 
@@ -170,7 +180,6 @@ def _sdpa_fwd_impl(
             "window_size_right": window_size_right,
             "mask_kind": mask_kind,
         },
-        use_static_tensors=True,
     )
     return TupleDict(o_tensor=o_tensor, lse_tensor=lse_tensor)
 
@@ -203,7 +212,7 @@ class SdpafwdSm100D256(ApiBaseJax):
         self.scale_softmax = scale_softmax
         self.scale_output = scale_output
 
-    def _check_support(self) -> bool:
+    def _check_support(self) -> None:
         _sdpa_fwd_impl(
             self.q_desc,
             self.k_desc,
@@ -217,7 +226,6 @@ class SdpafwdSm100D256(ApiBaseJax):
             self.scale_output,
             _validate_only=True,
         )
-        return True
 
     def __call__(self, q_tensor: Any, k_tensor: Any, v_tensor: Any) -> TupleDict:
         return super().__call__(q_tensor, k_tensor, v_tensor)

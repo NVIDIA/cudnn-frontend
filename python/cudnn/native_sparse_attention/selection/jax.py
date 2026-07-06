@@ -15,28 +15,11 @@ from ..._jax.api_base import (
     ApiBaseJax,
     BufferSpec,
     TupleDict,
+    as_dtype,
     call_cutedsl,
+    require_array,
     require_dtype,
 )
-
-
-def require_array(
-    name: str,
-    value: Any,
-    *,
-    rank: int,
-    dtype: Any | tuple[Any, ...],
-) -> tuple[tuple[int, ...], Any]:
-    """Require array shape/dtype metadata and return its shape and dtype."""
-
-    if not hasattr(value, "shape") or not hasattr(value, "dtype"):
-        raise TypeError(f"{name} must have shape and dtype metadata")
-    shape = tuple(value.shape)
-    if len(shape) != rank:
-        raise ValueError(f"{name} must have rank {rank}, got shape {shape}")
-    valid_dtypes = dtype if isinstance(dtype, tuple) else (dtype,)
-    resolved_dtype = require_dtype(f"{name}.dtype", value, valid_dtypes)
-    return shape, resolved_dtype
 
 
 def _launch(
@@ -128,14 +111,15 @@ def _selection_attention_impl(
     ``(T, H_q, 1)`` and dtype ``float32``.
     """
 
-    q_shape, input_dtype = require_array(
-        "q_tensor",
+    q_shape = require_array(
         q_tensor,
+        name="q_tensor",
         rank=3,
         dtype=(jnp.float16, jnp.bfloat16),
     )
-    k_shape, _ = require_array("k_tensor", k_tensor, rank=3, dtype=input_dtype)
-    v_shape, _ = require_array("v_tensor", v_tensor, rank=3, dtype=input_dtype)
+    input_dtype = as_dtype(q_tensor)
+    k_shape = require_array(k_tensor, name="k_tensor", rank=3, dtype=input_dtype)
+    v_shape = require_array(v_tensor, name="v_tensor", rank=3, dtype=input_dtype)
 
     total_tokens, num_query_heads, head_dim = q_shape
     k_total_tokens, num_kv_heads, k_head_dim = k_shape
@@ -164,37 +148,36 @@ def _selection_attention_impl(
     if gqa_group_size not in (1, 2, 4, 8):
         raise ValueError(f"H_q / H_kv must be one of {{1, 2, 4, 8}}, got {gqa_group_size}")
 
-    block_indices_shape, _ = require_array(
-        "block_indices_tensor",
+    block_indices_shape = require_array(
         block_indices_tensor,
+        name="block_indices_tensor",
         rank=3,
         dtype=jnp.int32,
     )
     if block_indices_shape[:2] != (total_tokens, num_kv_heads) or block_indices_shape[2] <= 0:
         raise ValueError("block_indices_tensor must have shape " f"(T, H_kv, K) with K > 0, got {block_indices_shape}")
-    block_counts_shape, _ = require_array(
-        "block_counts_tensor",
+    require_array(
         block_counts_tensor,
-        rank=2,
+        name="block_counts_tensor",
+        shape=(total_tokens, num_kv_heads),
         dtype=jnp.int32,
     )
-    if block_counts_shape != (total_tokens, num_kv_heads):
-        raise ValueError(f"block_counts_tensor must have shape {(total_tokens, num_kv_heads)}, " f"got {block_counts_shape}")
 
-    cum_q_shape, offsets_dtype = require_array(
-        "cum_seqlen_q_tensor",
+    cum_q_shape = require_array(
         cum_seqlen_q_tensor,
+        name="cum_seqlen_q_tensor",
         rank=1,
         dtype=(jnp.int32, jnp.int64),
     )
-    cum_k_shape, _ = require_array(
-        "cum_seqlen_k_tensor",
+    if cum_q_shape[0] < 2:
+        raise ValueError("cum_seqlen_q_tensor must have shape (B + 1,) with B > 0, " f"got {cum_q_shape}")
+    offsets_dtype = as_dtype(cum_seqlen_q_tensor)
+    require_array(
         cum_seqlen_k_tensor,
-        rank=1,
+        name="cum_seqlen_k_tensor",
+        shape=cum_q_shape,
         dtype=offsets_dtype,
     )
-    if cum_q_shape != cum_k_shape or cum_q_shape[0] < 2:
-        raise ValueError("cum_seqlen_q_tensor and cum_seqlen_k_tensor must have the same " f"shape (B + 1,) with B > 0, got {cum_q_shape} and {cum_k_shape}")
 
     if max_s_q <= 0 or max_s_k <= 0:
         raise ValueError(f"max_s_q and max_s_k must be positive, got {max_s_q} and {max_s_k}")
@@ -204,12 +187,17 @@ def _selection_attention_impl(
         raise ValueError(f"block_size must be 16, 32, or 64, got {block_size}")
 
     output_dtype = require_dtype(
-        "o_dtype",
         o_dtype,
         (input_dtype,),
+        name="o_dtype",
         default=input_dtype,
     )
-    require_dtype("acc_dtype", acc_dtype, (jnp.float32,), default=jnp.float32)
+    require_dtype(
+        acc_dtype,
+        (jnp.float32,),
+        name="acc_dtype",
+        default=jnp.float32,
+    )
     resolved_scale = 1.0 / math.sqrt(head_dim) if scale_softmax is None else float(scale_softmax)
     if _validate_only:
         return None
@@ -260,7 +248,6 @@ def _selection_attention_impl(
             "max_s_q": max_s_q,
             "scale_softmax": resolved_scale,
         },
-        use_static_tensors=True,
     )
     return TupleDict(
         o_tensor=jnp.reshape(o_storage, (total_tokens, num_query_heads, value_dim)),
@@ -304,7 +291,7 @@ class SelectionAttention(ApiBaseJax):
         self.o_dtype = self.as_optional_dtype(o_dtype)
         self.acc_dtype = self.as_optional_dtype(acc_dtype)
 
-    def _check_support(self) -> bool:
+    def _check_support(self) -> None:
         _selection_attention_impl(
             self.q_desc,
             self.k_desc,
@@ -321,7 +308,6 @@ class SelectionAttention(ApiBaseJax):
             acc_dtype=self.acc_dtype,
             _validate_only=True,
         )
-        return True
 
     def __call__(
         self,

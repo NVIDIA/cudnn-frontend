@@ -15,11 +15,11 @@ from ..._jax.api_base import (
     BufferSpec,
     TupleDict,
     call_cutedsl,
+    require_array,
     require_dtype,
 )
 from ..jax_utils import (
     bhsd_tensor_spec,
-    require_array,
     require_bhsd_qkv,
     resolve_sdpa_config,
 )
@@ -134,16 +134,31 @@ def _sdpa_bwd_impl(
         head_dim,
         dtype,
     ) = require_bhsd_qkv(q_tensor, k_tensor, v_tensor)
-    require_array("o_tensor", o_tensor, tuple(q_tensor.shape), dtype)
-    require_array("do_tensor", do_tensor, tuple(q_tensor.shape), dtype)
     require_array(
-        "lse_tensor",
+        o_tensor,
+        name="o_tensor",
+        shape=tuple(q_tensor.shape),
+        dtype=dtype,
+    )
+    require_array(
+        do_tensor,
+        name="do_tensor",
+        shape=tuple(q_tensor.shape),
+        dtype=dtype,
+    )
+    require_array(
         lse_tensor,
-        (batch, num_query_heads, seqlen_q),
-        jnp.float32,
+        name="lse_tensor",
+        shape=(batch, num_query_heads, seqlen_q),
+        dtype=jnp.float32,
     )
 
-    acc_dtype = require_dtype("acc_dtype", acc_dtype, (jnp.float32,), default=jnp.float32)
+    require_dtype(
+        acc_dtype,
+        (jnp.float32,),
+        name="acc_dtype",
+        default=jnp.float32,
+    )
     if mma_tiler_mn != (128, 128):
         raise ValueError(f"mma_tiler_mn must be (128, 128), got {mma_tiler_mn}")
     if dkdv_mma_tiler_mn != (128, 64):
@@ -217,7 +232,6 @@ def _sdpa_bwd_impl(
             "window_size_right": window_size_right,
             "mask_kind": mask_kind,
         },
-        use_static_tensors=True,
     )
     return TupleDict(
         dq_tensor=dq_tensor,
@@ -258,7 +272,7 @@ class SdpabwdSm100D256(ApiBaseJax):
         self.window_size = tuple(window_size)
         self.scale_softmax = scale_softmax
 
-    def _check_support(self) -> bool:
+    def _check_support(self) -> None:
         _sdpa_bwd_impl(
             self.q_desc,
             self.k_desc,
@@ -274,7 +288,6 @@ class SdpabwdSm100D256(ApiBaseJax):
             self.scale_softmax,
             _validate_only=True,
         )
-        return True
 
     def __call__(
         self,

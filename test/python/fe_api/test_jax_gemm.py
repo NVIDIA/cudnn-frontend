@@ -49,23 +49,23 @@ def test_jax_dense_gemm_abstract_shapes():
         gemm_swiglu_wrapper_sm100,
     )
 
-    a_bf16 = jax.ShapeDtypeStruct((128, 128, 1), jnp.bfloat16)
-    b_bf16 = jax.ShapeDtypeStruct((128, 128, 1), jnp.bfloat16)
+    a_bf16 = jax.ShapeDtypeStruct((1, 128, 128), jnp.bfloat16)
+    b_bf16 = jax.ShapeDtypeStruct((1, 128, 128), jnp.bfloat16)
     swiglu = jax.eval_shape(gemm_swiglu_wrapper_sm100, a_bf16, b_bf16)
     assert isinstance(swiglu, TupleDict)
     assert tuple(swiglu.keys()) == ("ab12_tensor", "c_tensor", "sfc_tensor", "amax_tensor")
-    assert swiglu["ab12_tensor"].shape == (128, 128, 1)
+    assert swiglu["ab12_tensor"].shape == (1, 128, 128)
     assert swiglu["ab12_tensor"].dtype == jnp.float32
-    assert swiglu["c_tensor"].shape == (128, 64, 1)
+    assert swiglu["c_tensor"].shape == (1, 128, 64)
     assert swiglu["c_tensor"].dtype == jnp.float16
     assert swiglu["sfc_tensor"] is None
     assert swiglu["amax_tensor"] is None
 
-    a_fp8 = jax.ShapeDtypeStruct((256, 512, 2), jnp.float8_e4m3fn)
-    b_fp8 = jax.ShapeDtypeStruct((256, 512, 2), jnp.float8_e4m3fn)
+    a_fp8 = jax.ShapeDtypeStruct((2, 256, 512), jnp.float8_e4m3fn)
+    b_fp8 = jax.ShapeDtypeStruct((2, 256, 512), jnp.float8_e4m3fn)
     scales = jax.ShapeDtypeStruct((32, 4, 2, 4, 4, 2), jnp.float8_e8m0fnu)
     prob = jax.ShapeDtypeStruct((256, 1, 2), jnp.float32)
-    c = jax.ShapeDtypeStruct((256, 256, 2), jnp.bfloat16)
+    c = jax.ShapeDtypeStruct((2, 256, 256), jnp.bfloat16)
 
     amax = jax.eval_shape(
         gemm_amax_wrapper_sm100,
@@ -74,7 +74,7 @@ def test_jax_dense_gemm_abstract_shapes():
         scales,
         scales,
     )
-    assert amax["c_tensor"].shape == (256, 256, 2)
+    assert amax["c_tensor"].shape == (2, 256, 256)
     assert amax["c_tensor"].dtype == jnp.float32
     assert amax["amax_tensor"].shape == (1, 1, 1)
     assert amax["amax_tensor"].dtype == jnp.float32
@@ -87,8 +87,8 @@ def test_jax_dense_gemm_abstract_shapes():
         scales,
         prob,
     )
-    assert srelu["c_tensor"].shape == (256, 256, 2)
-    assert srelu["d_tensor"].shape == (256, 256, 2)
+    assert srelu["c_tensor"].shape == (2, 256, 256)
+    assert srelu["d_tensor"].shape == (2, 256, 256)
     assert srelu["c_tensor"].dtype == jnp.bfloat16
     assert srelu["d_tensor"].dtype == jnp.bfloat16
     assert srelu["amax_tensor"] is None
@@ -103,7 +103,7 @@ def test_jax_dense_gemm_abstract_shapes():
         scales,
         prob,
     )
-    assert dsrelu["d_tensor"].shape == (256, 256, 2)
+    assert dsrelu["d_tensor"].shape == (2, 256, 256)
     assert dsrelu["d_tensor"].dtype == jnp.bfloat16
     assert dsrelu["dprob_tensor"].shape == (256, 1, 2)
     assert dsrelu["dprob_tensor"].dtype == jnp.float32
@@ -122,11 +122,11 @@ def test_jax_gemm_swiglu_jit():
     batch = 1
     alpha = 0.5
     a = jax.device_put(
-        jax.random.normal(jax.random.key(0), (m, k, batch), dtype=jnp.bfloat16),
+        jax.random.normal(jax.random.key(0), (batch, k, m), dtype=jnp.bfloat16),
         device,
     )
     b = jax.device_put(
-        jax.random.normal(jax.random.key(1), (n, k, batch), dtype=jnp.bfloat16),
+        jax.random.normal(jax.random.key(1), (batch, k, n), dtype=jnp.bfloat16),
         device,
     )
 
@@ -138,6 +138,9 @@ def test_jax_gemm_swiglu_jit():
             alpha=alpha,
             ab12_dtype=jnp.float32,
             c_dtype=jnp.bfloat16,
+            a_layout="LKM",
+            b_layout="LKN",
+            c_layout="LNM",
         )
 
     lowered = run.lower(a, b)
@@ -147,16 +150,16 @@ def test_jax_gemm_swiglu_jit():
     compiled = lowered.compile()
 
     def reference(a_value, b_value):
-        ab12 = alpha * jnp.einsum(
-            "mkl,nkl->mnl",
-            a_value.astype(jnp.float32),
-            b_value.astype(jnp.float32),
+        ab12_lmn = alpha * jnp.einsum(
+            "lmk,lnk->lmn",
+            a_value.transpose(0, 2, 1).astype(jnp.float32),
+            b_value.transpose(0, 2, 1).astype(jnp.float32),
         )
-        blocks = ab12.reshape(m, n // 32, 32, batch)
-        input_blocks = blocks[:, 0::2].reshape(m, n // 2, batch)
-        gate_blocks = blocks[:, 1::2].reshape(m, n // 2, batch)
-        c = input_blocks * gate_blocks * jax.nn.sigmoid(gate_blocks)
-        return ab12, c
+        blocks = ab12_lmn.reshape(batch, m, n // 32, 32)
+        input_blocks = blocks[:, :, 0::2].reshape(batch, m, n // 2)
+        gate_blocks = blocks[:, :, 1::2].reshape(batch, m, n // 2)
+        c_lmn = input_blocks * gate_blocks * jax.nn.sigmoid(gate_blocks)
+        return ab12_lmn.transpose(0, 2, 1), c_lmn.transpose(0, 2, 1)
 
     for a_value in (a, -a):
         result = compiled(a_value, b)
@@ -184,7 +187,7 @@ def test_jax_gemm_amax_jit_reinitializes_reduction():
     a = jax.device_put(
         jax.random.uniform(
             jax.random.key(2),
-            (m, k, batch),
+            (batch, m, k),
             dtype=jnp.float32,
             minval=-1.0,
             maxval=1.0,
@@ -194,7 +197,7 @@ def test_jax_gemm_amax_jit_reinitializes_reduction():
     b = jax.device_put(
         jax.random.uniform(
             jax.random.key(3),
-            (n, k, batch),
+            (batch, n, k),
             dtype=jnp.float32,
             minval=-1.0,
             maxval=1.0,
@@ -226,9 +229,9 @@ def test_jax_gemm_amax_jit_reinitializes_reduction():
     result = compiled(a, b, sfa, sfb)
     result["c_tensor"].block_until_ready()
     expected = jnp.einsum(
-        "mkl,nkl->mnl",
-        a.astype(jnp.float32) * jnp.repeat(sfa_canonical, 32, axis=1),
-        b.astype(jnp.float32) * jnp.repeat(sfb_canonical, 32, axis=1),
+        "lmk,lnk->lmn",
+        a.astype(jnp.float32) * jnp.repeat(sfa_canonical, 32, axis=1).transpose(2, 0, 1),
+        b.astype(jnp.float32) * jnp.repeat(sfb_canonical, 32, axis=1).transpose(2, 0, 1),
     )
     expected_amax = jnp.max(jnp.abs(expected)).reshape(1, 1, 1)
     assert jnp.allclose(result["c_tensor"], expected, atol=2e-1, rtol=3e-2)
@@ -256,7 +259,7 @@ def test_jax_gemm_squared_relu_forward_and_backward_jit():
     a = jax.device_put(
         jax.random.uniform(
             jax.random.key(4),
-            (m, k, batch),
+            (batch, m, k),
             dtype=jnp.float32,
             minval=-0.5,
             maxval=0.5,
@@ -266,7 +269,7 @@ def test_jax_gemm_squared_relu_forward_and_backward_jit():
     b = jax.device_put(
         jax.random.uniform(
             jax.random.key(5),
-            (n, k, batch),
+            (batch, n, k),
             dtype=jnp.float32,
             minval=-0.5,
             maxval=0.5,
@@ -276,7 +279,7 @@ def test_jax_gemm_squared_relu_forward_and_backward_jit():
     c_input = jax.device_put(
         jax.random.uniform(
             jax.random.key(6),
-            (m, n, batch),
+            (batch, m, n),
             dtype=jnp.float32,
             minval=-0.5,
             maxval=0.5,
@@ -331,15 +334,16 @@ def test_jax_gemm_squared_relu_forward_and_backward_jit():
         assert "CuteDSLRT_NvJaxCutlassCall" in stablehlo
 
     x = jnp.einsum(
-        "mkl,nkl->mnl",
+        "lmk,lnk->lmn",
         a.astype(jnp.float32),
         b.astype(jnp.float32),
     )
     relu_x = jnp.maximum(x, 0.0)
+    prob_lm1 = prob.transpose(2, 0, 1)
 
     forward_result = forward_lowered.compile()(a, b, scales, scales, prob)
     forward_result["d_tensor"].block_until_ready()
-    expected_forward = jnp.square(relu_x) * prob
+    expected_forward = jnp.square(relu_x) * prob_lm1
     assert jnp.allclose(
         forward_result["c_tensor"].astype(jnp.float32),
         x,
@@ -364,8 +368,8 @@ def test_jax_gemm_squared_relu_forward_and_backward_jit():
     )
     backward_result["dprob_tensor"].block_until_ready()
     c_f32 = c_input.astype(jnp.float32)
-    expected_d = c_f32 * prob * 2 * relu_x
-    expected_dprob = jnp.sum(c_f32 * jnp.square(relu_x), axis=1, keepdims=True)
+    expected_d = c_f32 * prob_lm1 * 2 * relu_x
+    expected_dprob = jnp.sum(c_f32 * jnp.square(relu_x), axis=2, keepdims=True).transpose(1, 2, 0)
     assert jnp.allclose(
         backward_result["d_tensor"].astype(jnp.float32),
         expected_d,

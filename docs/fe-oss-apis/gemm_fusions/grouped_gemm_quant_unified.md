@@ -166,9 +166,11 @@ def run(a, b, sfa, sfb, padded_offsets, alpha, prob, norm_const):
         prob_tensor=prob,
         norm_const_tensor=norm_const,
         d_dtype=jnp.float8_e4m3fn,
+        output_layout="LMN",
         mma_tiler_mn=(256, 256),
         cluster_shape_mn=(2, 1),
         sf_vec_size=32,
+        b_layout="LNK",
     )
 
 result = run(a, b, sfa, sfb, padded_offsets, alpha, prob, norm_const)
@@ -176,7 +178,14 @@ d, d_col, amax, sfd_row, sfd_col = result
 ```
 
 The JAX namespace currently exposes the dense-weight subset of this unified
-API. It returns `TupleDict` and supports FP8 A/B with E8M0 scales
+API. `A` has fixed public order `LMK` and shape `(1, valid_m, K)`.
+`b_layout="LNK"` uses shape `(L, N, K)`, while `b_layout="LKN"` uses
+`(L, K, N)`. Matrix outputs have fixed `output_layout="LMN"` and shape
+`(1, valid_m, N)`. The expert mode must remain outermost in these compact
+row-major public layouts.
+
+The packed scale tensors, `prob`, and reductions keep their operator-specific
+layouts. The wrapper returns `TupleDict` and supports FP8 A/B with E8M0 scales
 and `sf_vec_size=32`. FP8 D produces `d_col`, `sfd_row`, and `sfd_col`, while
 `amax` is `None`. Shapes, dtypes, layouts, and configuration arguments are
 static under `jax.jit`.
@@ -229,7 +238,11 @@ api.execute(
 
 ---
 
-## Parameters
+## PyTorch parameter reference
+
+This section documents the existing PyTorch tensor shapes and major-mode
+arguments. The JAX public shapes and layout strings are described in the JAX
+usage tab above.
 
 ### Input/Output Tensors
 

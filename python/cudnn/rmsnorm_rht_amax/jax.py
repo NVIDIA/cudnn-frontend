@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any, Optional
 
 import jax.numpy as jnp
@@ -13,13 +12,6 @@ from cutlass.jax import TensorSpec
 
 from .._jax.api_base import ApiBaseJax, BufferSpec, TupleDict, call_cutedsl
 from .config import RmsNormRhtAmaxPlan, validate_rmsnorm_rht_amax
-
-
-@dataclass(frozen=True)
-class _RmsNormRhtAmaxJaxConfig:
-    eps: float
-    num_threads: Optional[int]
-    rows_per_cta: Optional[int]
 
 
 def _launch(
@@ -68,28 +60,30 @@ class RmsNormRhtAmaxSm100(ApiBaseJax):
         super().__init__()
         self.x_desc = self.make_tensor_desc(sample_x, name="sample_x")
         self.w_desc = self.make_tensor_desc(sample_w, name="sample_w")
-        self._config = _RmsNormRhtAmaxJaxConfig(
-            eps=eps,
-            num_threads=num_threads,
-            rows_per_cta=rows_per_cta,
-        )
+        self.eps = eps
+        self.requested_num_threads = num_threads
+        self.requested_rows_per_cta = rows_per_cta
         self._plan: Optional[RmsNormRhtAmaxPlan] = None
-        self.num_threads: Optional[int] = None
-        self.rows_per_cta: Optional[int] = None
-        self.n: Optional[int] = None
 
-    def _check_support(self) -> bool:
-        config = self._config
+    @property
+    def num_threads(self) -> Optional[int]:
+        return None if self._plan is None else self._plan.num_threads
+
+    @property
+    def rows_per_cta(self) -> Optional[int]:
+        return None if self._plan is None else self._plan.rows_per_cta
+
+    @property
+    def n(self) -> Optional[int]:
+        return None if self._plan is None else self._plan.n
+
+    def _check_support(self) -> None:
         self._plan = validate_rmsnorm_rht_amax(
             self.x_desc,
             self.w_desc,
-            num_threads=config.num_threads,
-            rows_per_cta=config.rows_per_cta,
+            num_threads=self.requested_num_threads,
+            rows_per_cta=self.requested_rows_per_cta,
         )
-        self.num_threads = self._plan.num_threads
-        self.rows_per_cta = self._plan.rows_per_cta
-        self.n = self._plan.n
-        return True
 
     def __call__(self, x: Any, weight: Any) -> TupleDict:
         """Run with arrays matching the validated sample signature."""
@@ -131,9 +125,8 @@ class RmsNormRhtAmaxSm100(ApiBaseJax):
                 "n": plan.n,
                 "num_threads": plan.num_threads,
                 "rows_per_cta": plan.rows_per_cta,
-                "eps": self._config.eps,
+                "eps": self.eps,
             },
-            use_static_tensors=True,
         )
         return TupleDict(output=output, amax=amax)
 

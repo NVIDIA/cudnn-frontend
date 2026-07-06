@@ -70,6 +70,11 @@ class _Float32:
         self.value = value
 
 
+class _Int32:
+    def __init__(self, value=0):
+        self.value = value
+
+
 class _ScoreGradKernel:
     instances = []
 
@@ -108,6 +113,30 @@ class _BackwardKernel:
         self.calls.append(args)
 
 
+class _DenseScoreGradKernel:
+    instances = []
+
+    def __init__(self, *, ratio, block_I):
+        self.configuration = (ratio, block_I)
+        self.calls = []
+        self.instances.append(self)
+
+    def __call__(self, *args):
+        self.calls.append(args)
+
+
+class _DenseBackwardKernel:
+    instances = []
+
+    def __init__(self, *, head_dim, heads, block_I, ratio):
+        self.configuration = (head_dim, heads, block_I, ratio)
+        self.calls = []
+        self.instances.append(self)
+
+    def __call__(self, *args):
+        self.calls.append(args)
+
+
 class JaxDsaIndexerBackwardContractTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -137,6 +166,7 @@ class JaxDsaIndexerBackwardContractTest(unittest.TestCase):
         cls.fake_cutlass.__path__ = []
         cls.fake_cutlass.Constexpr = object
         cls.fake_cutlass.Float32 = _Float32
+        cls.fake_cutlass.Int32 = _Int32
         cls.fake_cutlass_cute = types.ModuleType("cutlass.cute")
         cls.fake_cutlass_cute.jit = _identity_jit
         cls.fake_cutlass.cute = cls.fake_cutlass_cute
@@ -149,6 +179,13 @@ class JaxDsaIndexerBackwardContractTest(unittest.TestCase):
         cls.kernel_module = types.ModuleType(cls.kernel_module_name)
         cls.kernel_module.ScoreGradSm100 = _ScoreGradKernel
         cls.kernel_module.IndexerBackwardSm100 = _BackwardKernel
+        cls.dense_kernel_module_name = (
+            f"{_TEST_PACKAGE}.deepseek_sparse_attention.indexer_backward."
+            "dense_indexer_backward_sm100"
+        )
+        cls.dense_kernel_module = types.ModuleType(cls.dense_kernel_module_name)
+        cls.dense_kernel_module.ScoreGradDense = _DenseScoreGradKernel
+        cls.dense_kernel_module.DenseIndexerBackward2QGemmSm100 = _DenseBackwardKernel
 
         package_paths = {
             _TEST_PACKAGE: _CUDNN_ROOT,
@@ -173,6 +210,8 @@ class JaxDsaIndexerBackwardContractTest(unittest.TestCase):
     def setUp(self):
         _ScoreGradKernel.instances.clear()
         _BackwardKernel.instances.clear()
+        _DenseScoreGradKernel.instances.clear()
+        _DenseBackwardKernel.instances.clear()
 
     @classmethod
     def _optional_modules(cls, *, include_kernel=False):
@@ -185,6 +224,7 @@ class JaxDsaIndexerBackwardContractTest(unittest.TestCase):
         }
         if include_kernel:
             modules[cls.kernel_module_name] = cls.kernel_module
+            modules[cls.dense_kernel_module_name] = cls.dense_kernel_module
         return mock.patch.dict(sys.modules, modules)
 
     @classmethod
@@ -198,6 +238,27 @@ class JaxDsaIndexerBackwardContractTest(unittest.TestCase):
         topk_indices = _Array(score_shape, cls.int32)
         return q, weights, k, attn_score, index_score, topk_indices
 
+    @classmethod
+    def _dense_inputs(cls):
+        q = _Array((2, 64, 64, 128), cls.bfloat16)
+        weights = _Array((2, 64, 64), cls.bfloat16)
+        k = _Array((2, 256, 128), cls.bfloat16)
+        score_shape = (2, 64, 256)
+        denom_shape = (2, 64)
+        attn_score = _Array(score_shape, cls.float32)
+        attn_l1norm = _Array(denom_shape, cls.float32)
+        index_score = _Array(score_shape, cls.float32)
+        index_lse = _Array(denom_shape, cls.float32)
+        return (
+            q,
+            weights,
+            k,
+            attn_score,
+            attn_l1norm,
+            index_score,
+            index_lse,
+        )
+
     @staticmethod
     def _fake_call(captured):
         def call(launcher, inputs, **options):
@@ -208,6 +269,32 @@ class JaxDsaIndexerBackwardContractTest(unittest.TestCase):
 
     def test_kernel_module_is_lazy(self):
         self.assertNotIn(self.kernel_module_name, sys.modules)
+        self.assertNotIn(self.dense_kernel_module_name, sys.modules)
+
+    def test_dense_shared_kernel_keeps_torch_support_lazy(self):
+        kernel_path = (
+            _CUDNN_ROOT
+            / "deepseek_sparse_attention"
+            / "indexer_backward"
+            / "dense_indexer_backward_sm100.py"
+        )
+        tree = ast.parse(kernel_path.read_text())
+        eager_imports = []
+        for node in tree.body:
+            if isinstance(node, ast.Import):
+                eager_imports.extend(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module is not None:
+                eager_imports.append(node.module)
+
+        self.assertNotIn("torch", eager_imports)
+        self.assertNotIn(
+            "cudnn.deepseek_sparse_attention.utils.compiler",
+            eager_imports,
+        )
+        self.assertNotIn(
+            "cudnn.deepseek_sparse_attention.utils.runtime",
+            eager_imports,
+        )
 
     def test_declares_functional_outputs_and_hidden_workspace(self):
         captured = {}
@@ -233,7 +320,6 @@ class JaxDsaIndexerBackwardContractTest(unittest.TestCase):
         self.assertEqual(captured["inputs"][:-1], inputs)
         grad_loss = captured["inputs"][-1]
         self.assertEqual((grad_loss.shape, grad_loss.dtype), ((1,), self.float32))
-        self.assertTrue(captured["use_static_tensors"])
         self.assertIs(captured["launcher"], launcher)
         self.assertEqual(
             [(spec.name, spec.shape, spec.dtype, spec.fill_value) for spec in captured["outputs"]],
@@ -326,6 +412,160 @@ class JaxDsaIndexerBackwardContractTest(unittest.TestCase):
         )
         self.assertEqual(backward_args[8].value, 0.125)
         self.assertIs(backward_args[9], placeholders[0])
+
+    def test_dense_declares_functional_outputs_and_hidden_workspace(self):
+        captured = {}
+        launcher = object()
+        inputs = self._dense_inputs()
+
+        with (
+            self._optional_modules(include_kernel=True),
+            mock.patch.object(self.module, "_launch_dense", new=launcher),
+            mock.patch.object(
+                self.module,
+                "call_cutedsl",
+                side_effect=self._fake_call(captured),
+            ),
+        ):
+            result = self.module.dense_indexer_backward_wrapper(*inputs)
+
+        q, weights, k, attn_score, attn_l1norm, index_score, index_lse = inputs
+        self.assertEqual(result["d_index_q"].shape, q.shape)
+        self.assertEqual(result["d_weights"].shape, weights.shape)
+        self.assertEqual(result["d_index_k"].shape, k.shape)
+        self.assertIs(result["d_index_k"].dtype, self.bfloat16)
+        self.assertEqual(captured["inputs"][:-1], inputs)
+        grad_loss = captured["inputs"][-1]
+        self.assertEqual((grad_loss.shape, grad_loss.dtype), ((1,), self.float32))
+        self.assertIs(captured["launcher"], launcher)
+        self.assertEqual(
+            [
+                (spec.name, spec.shape, spec.dtype, spec.fill_value)
+                for spec in captured["outputs"]
+            ],
+            [
+                ("d_index_q", q.shape, self.bfloat16, None),
+                ("d_weights", weights.shape, self.bfloat16, None),
+                ("d_index_k_accum", k.shape, self.float32, None),
+            ],
+        )
+        (workspace,) = captured["workspaces"]
+        self.assertEqual(
+            (workspace.name, workspace.shape, workspace.dtype, workspace.fill_value),
+            ("grad_signal", attn_score.shape, self.float32, None),
+        )
+        self.assertEqual(len(captured["input_specs"]), 8)
+        q_spec = captured["input_specs"][0]
+        k_spec = captured["input_specs"][2]
+        self.assertEqual((q_spec.layout, q_spec.divisibility), ((3, 2, 1, 0), 128))
+        self.assertEqual((k_spec.layout, k_spec.divisibility), ((2, 1, 0), 128))
+        self.assertIs(captured["outputs"][0].tensor_spec, q_spec)
+        self.assertIs(captured["outputs"][2].tensor_spec, k_spec)
+        self.assertIs(captured["inputs"][3], attn_score)
+        self.assertIs(captured["inputs"][4], attn_l1norm)
+        self.assertIs(captured["inputs"][5], index_score)
+        self.assertIs(captured["inputs"][6], index_lse)
+        self.assertEqual(
+            captured["static_args"],
+            {
+                "heads": 64,
+                "head_dim": 128,
+                "block_i": 128,
+                "ratio": 1,
+                "sm_scale": 1.0,
+                "grad_scale": 1.0 / (2 * 64),
+                "max_seqlen_q": 64,
+                "max_seqlen_k": 256,
+            },
+        )
+
+    def test_dense_launcher_orders_stages_and_uses_runtime_grad_loss(self):
+        placeholders = [object() for _ in range(13)]
+        with self._optional_modules(include_kernel=True):
+            self.module._launch_dense(
+                *placeholders,
+                heads=64,
+                head_dim=128,
+                block_i=128,
+                ratio=2,
+                sm_scale=0.125,
+                grad_scale=0.25,
+                max_seqlen_q=64,
+                max_seqlen_k=256,
+            )
+
+        score_grad = _DenseScoreGradKernel.instances[-1]
+        backward = _DenseBackwardKernel.instances[-1]
+        self.assertEqual(score_grad.configuration, (2, 128))
+        self.assertEqual(backward.configuration, (128, 64, 128, 2))
+
+        score_args = score_grad.calls[-1]
+        self.assertEqual(
+            score_args[:9],
+            (
+                placeholders[6],
+                placeholders[12],
+                placeholders[4],
+                placeholders[7],
+                placeholders[5],
+                None,
+                None,
+                None,
+                placeholders[8],
+            ),
+        )
+        self.assertEqual(score_args[9].value, 0.25)
+        self.assertEqual(score_args[10].value, 64)
+        self.assertEqual(score_args[11].value, 256)
+        self.assertIs(score_args[12], placeholders[0])
+
+        backward_args = backward.calls[-1]
+        self.assertEqual(
+            backward_args[:10],
+            (
+                placeholders[1],
+                placeholders[2],
+                placeholders[3],
+                placeholders[9],
+                placeholders[10],
+                placeholders[11],
+                placeholders[12],
+                None,
+                None,
+                None,
+            ),
+        )
+        self.assertEqual(backward_args[10].value, 0.125)
+        self.assertEqual(backward_args[11].value, 64)
+        self.assertEqual(backward_args[12].value, 256)
+        self.assertIs(backward_args[13], placeholders[0])
+
+    def test_dense_rejects_unsupported_shape_and_configuration(self):
+        q, weights, k, attn_score, attn_l1norm, index_score, index_lse = (
+            self._dense_inputs()
+        )
+        with self.assertRaisesRegex(ValueError, "heads=64 and head_dim=128"):
+            self.module.dense_indexer_backward_wrapper(
+                _Array((2, 64, 32, 128), self.bfloat16),
+                _Array((2, 64, 32), self.bfloat16),
+                k,
+                attn_score,
+                attn_l1norm,
+                index_score,
+                index_lse,
+            )
+
+        with self.assertRaisesRegex(ValueError, "block_I must be 128"):
+            self.module.dense_indexer_backward_wrapper(
+                q,
+                weights,
+                k,
+                attn_score,
+                attn_l1norm,
+                index_score,
+                index_lse,
+                block_I=64,
+            )
 
     def test_rejects_unsupported_dtype_shape_and_topk(self):
         q, weights, k, attn_score, index_score, topk_indices = self._inputs()

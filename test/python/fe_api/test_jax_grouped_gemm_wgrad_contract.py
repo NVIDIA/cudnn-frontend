@@ -238,6 +238,15 @@ class JaxGroupedGemmWgradContractTest(unittest.TestCase):
     def test_kernel_module_is_lazy(self):
         self.assertNotIn(self.kernel_module_name, sys.modules)
 
+    def test_sample_descriptors_use_the_lowering_tensor_specs(self):
+        with self._optional_modules(include_kernel=True):
+            operation = self.module.GroupedGemmWgradSm100(*self._inputs())
+
+        self.assertEqual(operation._sample_descs["a_tensor"].tensor_spec.layout, (1, 0))
+        self.assertEqual(operation._sample_descs["b_tensor"].tensor_spec.layout, (0, 1))
+        self.assertEqual(operation._sample_descs["sfa_tensor"].tensor_spec.layout, (1, 0))
+        self.assertEqual(operation._sample_descs["sfb_tensor"].tensor_spec.layout, (1, 0))
+
     def test_dense_output_and_workspace_are_xla_owned(self):
         captured = {}
         inputs = self._inputs()
@@ -254,7 +263,6 @@ class JaxGroupedGemmWgradContractTest(unittest.TestCase):
         self.assertEqual(result["wgrad_tensor"].shape, (2, 384, 640))
         self.assertIs(result["wgrad_tensor"].dtype, self.bfloat16)
         self.assertEqual(captured["inputs"], inputs)
-        self.assertTrue(captured["use_static_tensors"])
         self.assertIs(captured["launcher"], self.module._launch)
         self.assertEqual(
             captured["static_args"],
