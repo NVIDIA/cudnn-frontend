@@ -1904,27 +1904,27 @@ class NamedBarrierBwd(enum.IntEnum):
 
 
 MaskGenFn: TypeAlias = Callable[[int], Uint32]
-MASK_R2P_CHUNK_SIZE: int = 32
+PREDICATE_MASK_CHUNK_SIZE: int = 32
 
 
 @cute.jit
-def r2p_bitmask_below(limit: Int32, s: int) -> Uint32:
-    """32-bit R2P bitmask keeping positions < limit (exclusive upper bound).
+def predicate_bitmask_below(limit: Int32, s: int) -> Uint32:
+    """32-bit register-to-predicate bitmask keeping positions < limit.
 
     Positions 0..limit-1 in chunk `s` get bit=1 (keep), the rest bit=0 (mask).
     Uses inline PTX to avoid shift-by-type-width UB.
     """
-    m = max((s + 1) * MASK_R2P_CHUNK_SIZE - limit, 0)
+    m = max((s + 1) * PREDICATE_MASK_CHUNK_SIZE - limit, 0)
     return utils.shr_u32(Uint32(0xFFFFFFFF), Uint32(m))
 
 
 @cute.jit
-def mask_r2p_lambda(
+def apply_predicate_mask(
     X: cute.Tensor,
     mask_gen_fn: cutlass.Constexpr[MaskGenFn],
     rank1: bool = False,
 ) -> None:
-    """Apply R2P masking with a custom bitmask generator.
+    """Apply register-to-predicate masking with a custom bitmask generator.
 
     mask_gen_fn(chunk_idx: constexpr int) -> Uint32:
         Returns a 32-bit bitmask for the chunk. Bit i set means column
@@ -1932,10 +1932,10 @@ def mask_r2p_lambda(
     """
     ncol = const_expr(cute.size(X.shape[cute.rank(X) - 1]) if not rank1 else cute.size(X.shape))
     # 32-column chunks. The mask_gen_fn returns a Uint32 bitmask (1=keep).
-    CHUNK_SIZE = MASK_R2P_CHUNK_SIZE
+    CHUNK_SIZE = PREDICATE_MASK_CHUNK_SIZE
     for s in cutlass.range_constexpr(cute.ceil_div(ncol, CHUNK_SIZE)):
         mask = mask_gen_fn(s)
-        # This needs to be range_constexpr, o/w the compiler can't generate the R2P instruction
+        # This must be range_constexpr so the compiler can generate the register-to-predicate instruction.
         for i in cutlass.range_constexpr(min(CHUNK_SIZE, ncol - s * CHUNK_SIZE)):
             in_bound = cutlass.Boolean(mask & (Uint32(1) << i))
             c = s * CHUNK_SIZE + i
@@ -1947,12 +1947,12 @@ def mask_r2p_lambda(
 
 
 @cute.jit
-def sm90_col_to_r2p_idx(col_limit: Int32) -> Int32:
-    """Transform SM90 MMA column coordinate to R2P element index.
+def sm90_col_to_predicate_idx(col_limit: Int32) -> Int32:
+    """Transform SM90 MMA column coordinate to register-to-predicate element index.
 
     SM90 MMA accumulator column indices are non-contiguous: 0, 1, 8, 9, 16, 17, ...
     Element indices are contiguous: 0, 1, 2, 3, 4, 5, ...
-    This converts a column-space threshold to element-space for r2p_bitmask_below/above.
+    This converts a column-space threshold to element-space for predicate bitmasks.
     """
     return col_limit // 8 * 2 + min(col_limit % 8, 2)
 
@@ -1994,12 +1994,15 @@ class AttentionMask:
             seqlenk_col_limit = cutlass.min(seqlenk_col_limit, block_size_k)
         seqlenk_col_limit = seqlenk_col_limit - thr_col_offset
         if const_expr(mask_seqlen):
-            r2p = const_expr(not self.swap_AB)
-            if const_expr(not r2p):
+            use_predicate_mask = const_expr(not self.swap_AB)
+            if const_expr(not use_predicate_mask):
                 for c in cutlass.range(cute.size(tScS_mn.shape[1]), unroll_full=True):
                     oob = t0ScS_mn[0, c][COL] >= seqlenk_col_limit
                     for r in cutlass.range(cute.size(tScS_mn.shape[0]), unroll_full=True):
                         acc_S_mn[r, c] = -Float32.inf if oob else acc_S_mn[r, c]
             else:
-                seqlenk_col_limit_r2p = sm90_col_to_r2p_idx(seqlenk_col_limit)
-                mask_r2p_lambda(acc_S_mn, lambda s: r2p_bitmask_below(seqlenk_col_limit_r2p, s))
+                seqlenk_col_limit_predicate = sm90_col_to_predicate_idx(seqlenk_col_limit)
+                apply_predicate_mask(
+                    acc_S_mn,
+                    lambda s: predicate_bitmask_below(seqlenk_col_limit_predicate, s),
+                )

@@ -2325,27 +2325,27 @@ sm100_utils = _make_local_namespace(
 # =============================================================================
 # Mask Helpers
 # =============================================================================
-MASK_R2P_CHUNK_SIZE: int = 32
+PREDICATE_MASK_CHUNK_SIZE: int = 32
 
 MaskGenFn: TypeAlias = Callable[[int], Uint32]
 
 
 @cute.jit
-def r2p_bitmask_below(limit: Int32, s: int) -> Uint32:
-    """32-bit R2P bitmask keeping positions < limit (exclusive upper bound)."""
-    m = max((s + 1) * MASK_R2P_CHUNK_SIZE - limit, 0)
+def predicate_bitmask_below(limit: Int32, s: int) -> Uint32:
+    """32-bit register-to-predicate bitmask keeping positions < limit."""
+    m = max((s + 1) * PREDICATE_MASK_CHUNK_SIZE - limit, 0)
     return utils.shr_u32(Uint32(0xFFFFFFFF), Uint32(m))
 
 
 @cute.jit
-def mask_r2p_lambda(
+def apply_predicate_mask(
     X: cute.Tensor,
     mask_gen_fn: cutlass.Constexpr[MaskGenFn],
     rank1: bool = False,
 ) -> None:
-    """Apply R2P masking with a custom bitmask generator."""
+    """Apply register-to-predicate masking with a custom bitmask generator."""
     ncol = const_expr(cute.size(X.shape[cute.rank(X) - 1]) if not rank1 else cute.size(X.shape))
-    CHUNK_SIZE = MASK_R2P_CHUNK_SIZE
+    CHUNK_SIZE = PREDICATE_MASK_CHUNK_SIZE
     for s in cutlass.range_constexpr(cute.ceil_div(ncol, CHUNK_SIZE)):
         mask = mask_gen_fn(s)
         for i in cutlass.range_constexpr(min(CHUNK_SIZE, ncol - s * CHUNK_SIZE)):
@@ -2364,10 +2364,10 @@ def apply_block_size_mask(
     block_size: Int32,
     n_block_size: cutlass.Constexpr[int] = 128,
 ) -> None:
-    """Apply R2P bitmask masking positions >= block_size within a tile."""
+    """Mask positions >= block_size within a tile using predicate bits."""
     if block_size < n_block_size:
-        mask_r2p_lambda(
+        apply_predicate_mask(
             acc_S,
-            lambda s: r2p_bitmask_below(block_size, s),
+            lambda s: predicate_bitmask_below(block_size, s),
             rank1=True,
         )
