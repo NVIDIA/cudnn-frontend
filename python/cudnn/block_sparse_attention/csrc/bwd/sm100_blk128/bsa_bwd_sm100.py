@@ -858,37 +858,37 @@ class BlockSparseAttnBackwardSm100Blk128:
         )
 
         # UMMA producers and AsyncThread consumers
-        pipeline_producer_group_MMA_AsyncThread = cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread, len([self.mma_warp_id]))
-        pipeline_consumer_group_MMA_AsyncThread = cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread, len(self.compute_warp_ids))
+        pipeline_umma_producer_group = cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread, len([self.mma_warp_id]))
+        pipeline_async_consumer_group = cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread, len(self.compute_warp_ids))
         pipeline_S_P = cutlass.pipeline.PipelineUmmaAsync.create(
             num_stages=1,
-            producer_group=pipeline_producer_group_MMA_AsyncThread,
-            consumer_group=pipeline_consumer_group_MMA_AsyncThread,
+            producer_group=pipeline_umma_producer_group,
+            consumer_group=pipeline_async_consumer_group,
             barrier_storage=storage.S_mbar_ptr.data_ptr(),
             cta_layout_vmnk=cluster_layout_vmnk,
         )
         pipeline_dP = cutlass.pipeline.PipelineUmmaAsync.create(
             num_stages=1,
-            producer_group=pipeline_producer_group_MMA_AsyncThread,
-            consumer_group=pipeline_consumer_group_MMA_AsyncThread,
+            producer_group=pipeline_umma_producer_group,
+            consumer_group=pipeline_async_consumer_group,
             barrier_storage=storage.dP_mbar_ptr.data_ptr(),
             cta_layout_vmnk=cluster_layout_vmnk,
         )
         pipeline_dKV = cutlass.pipeline.PipelineUmmaAsync.create(
             num_stages=2,
-            producer_group=pipeline_producer_group_MMA_AsyncThread,
-            consumer_group=pipeline_consumer_group_MMA_AsyncThread,
+            producer_group=pipeline_umma_producer_group,
+            consumer_group=pipeline_async_consumer_group,
             barrier_storage=storage.dKV_mbar_ptr.data_ptr(),
             cta_layout_vmnk=cluster_layout_vmnk,
         )
-        pipeline_consumer_group_MMA_AsyncThread_dQ = cutlass.pipeline.CooperativeGroup(
+        pipeline_dQ_async_consumer_group = cutlass.pipeline.CooperativeGroup(
             cutlass.pipeline.Agent.Thread,
             len(self.reduce_warp_ids),
         )  # Compute
         pipeline_dQ = cutlass.pipeline.PipelineUmmaAsync.create(
             num_stages=1,
-            producer_group=pipeline_producer_group_MMA_AsyncThread,
-            consumer_group=pipeline_consumer_group_MMA_AsyncThread_dQ,
+            producer_group=pipeline_umma_producer_group,
+            consumer_group=pipeline_dQ_async_consumer_group,
             barrier_storage=storage.dQ_mbar_ptr.data_ptr(),
             cta_layout_vmnk=cluster_layout_vmnk,
         )
