@@ -12,6 +12,7 @@ from fe_api.test_grouped_gemm_wgrad_utils import (
     allocate_grouped_gemm_wgrad_tensors,
     allocate_grouped_gemm_wgrad_output,
     check_ref_grouped_gemm_wgrad,
+    wgrad_to_ragged_layout,
 )
 
 # ---------------------------------------------------------------------------
@@ -611,3 +612,77 @@ def test_grouped_gemm_wgrad_wrapper_dynamic_tokens_cache_behavior(monkeypatch, o
 
     assert compile_count["value"] == 1
     assert cache_entries == 1
+
+
+@pytest.mark.L0
+def test_grouped_gemm_wgrad_wrapper_input_order_cache_key(monkeypatch):
+    from cudnn.grouped_gemm.grouped_gemm_wgrad import api as grouped_gemm_wgrad_api
+
+    grouped_gemm_wgrad_api._cache_of_GroupedGemmWgradSm100Objects.clear()
+
+    compile_count = {"value": 0}
+
+    def counted_compile(self):
+        compile_count["value"] += 1
+
+    monkeypatch.setattr(grouped_gemm_wgrad_api.GroupedGemmWgradSm100, "check_support", lambda self: True)
+    monkeypatch.setattr(grouped_gemm_wgrad_api.GroupedGemmWgradSm100, "compile", counted_compile)
+    monkeypatch.setattr(grouped_gemm_wgrad_api.GroupedGemmWgradSm100, "execute", lambda self, **kwargs: None)
+
+    inputs = _make_wgrad_wrapper_cache_inputs([8, 12])
+
+    try:
+        for input_order in ("tensor2d", "tensor_ragged"):
+            cudnn.grouped_gemm_wgrad_wrapper_sm100(
+                **inputs,
+                output_mode="dense",
+                acc_dtype=torch.float32,
+                wgrad_dtype=torch.bfloat16,
+                mma_tiler_mn=(128, 128),
+                cluster_shape_mn=(1, 1),
+                sf_vec_size=16,
+                input_order=input_order,
+            )
+    finally:
+        cache_entries = len(grouped_gemm_wgrad_api._cache_of_GroupedGemmWgradSm100Objects)
+        grouped_gemm_wgrad_api._cache_of_GroupedGemmWgradSm100Objects.clear()
+
+    assert compile_count["value"] == 2
+    assert cache_entries == 2
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_grouped_gemm_wgrad_dense_wrapper_tensor_ragged_fp4():
+    cfg = grouped_gemm_wgrad_init(
+        ab_dtype=torch.float4_e2m1fn_x2,
+        wgrad_dtype=torch.bfloat16,
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(128, 128),
+        cluster_shape_mn=(1, 1),
+        sf_vec_size=16,
+        sf_dtype=torch.float8_e4m3fn,
+    )
+    inputs = allocate_grouped_gemm_wgrad_tensors(cfg)
+    a_ragged = wgrad_to_ragged_layout(inputs["a_tensor"], cfg["group_k_list"], k_dim=1)
+    b_ragged = wgrad_to_ragged_layout(inputs["b_tensor"], cfg["group_k_list"], k_dim=0)
+
+    result = cudnn.grouped_gemm_wgrad_wrapper_sm100(
+        a_tensor=a_ragged,
+        b_tensor=b_ragged,
+        sfa_tensor=inputs["sfa_tensor"],
+        sfb_tensor=inputs["sfb_tensor"],
+        offsets_tensor=inputs["offsets_tensor"],
+        output_mode="dense",
+        global_scale_a=inputs["global_scale_a"],
+        global_scale_b=inputs["global_scale_b"],
+        acc_dtype=cfg["acc_dtype"],
+        wgrad_dtype=cfg["wgrad_dtype"],
+        mma_tiler_mn=cfg["mma_tiler_mn"],
+        cluster_shape_mn=cfg["cluster_shape_mn"],
+        sf_vec_size=cfg["sf_vec_size"],
+        input_order="tensor_ragged",
+    )
+
+    torch.cuda.synchronize()
+    check_ref_grouped_gemm_wgrad(result["wgrad_tensor"], inputs["ref_result"], cfg["tolerance"])

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+#include <mutex>
 #include <unordered_map>
 #include <stdexcept>
 #include <string>
@@ -19,6 +21,8 @@
 #include "node/adaptive_layernorm.h"
 #include "node/instancenorm.h"
 #include "node/rmsnorm.h"
+#include "node/rope.h"
+#include "node/rope_backward.h"
 #include "node/resample.h"
 #include "node/reshape.h"
 #include "node/slice.h"
@@ -45,6 +49,7 @@ class Graph : public ICudnn, public INode {
     std::unordered_set<std::shared_ptr<Tensor_attributes>> full_graph_inputs;
     std::unordered_set<Tensor_attributes::uid_t> used_uids;
     int64_t fe_workspace_size = 0;
+    uint64_t graph_uid;
 
     std::unordered_set<std::shared_ptr<Tensor_attributes>> deserialized_tensor_properties;
     std::unordered_map<uid_t, pass_by_values_t> deserialized_pass_by_value;
@@ -267,6 +272,7 @@ class Graph : public ICudnn, public INode {
 #ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
         json j;
         serialize(j);
+        j.erase("graph_uid");
         if (remove_shape) {
             for (auto &tensor : j["tensors"]) {
                 tensor["dim"].clear();
@@ -595,7 +601,10 @@ class Graph : public ICudnn, public INode {
     }
 
    public:
-    Graph() : INode(detail::Context{}) {}
+    Graph() : INode(detail::Context{}) {
+        static std::atomic<uint64_t> next_graph_uid{1};
+        graph_uid = next_graph_uid.fetch_add(1, std::memory_order_relaxed);
+    }
 
     error_t
     update_cuda_graph(cudnnHandle_t handle,
@@ -998,9 +1007,28 @@ class Graph : public ICudnn, public INode {
         return ret_val;
     }
 
+    // Structured counterpart of get_plan_name_at_index(): engine index + knob
+    // choices, for replay via create_execution_plan().
+    error_t
+    get_engine_and_knobs_at_index(int64_t plan_index,
+                                  int64_t &engine_id,
+                                  std::unordered_map<KnobType_t, int64_t> &knobs) const {
+        return plans.get_engine_and_knobs_at_index(plan_index, engine_id, knobs);
+    }
+
     error_t
     get_workspace_size(int64_t &cudnn_workspace_size) const {
         return get_workspace_size_plan_at_index(plans.candidate, cudnn_workspace_size);
+    }
+
+    error_t
+    get_workspace_size(cudnnHandle_t handle,
+                       int64_t &cudnn_workspace_size,
+                       std::vector<int64_t> const &override_uids,
+                       std::vector<std::vector<int64_t>> const &override_shapes,
+                       std::vector<std::vector<int64_t>> const &override_strides) const {
+        return get_workspace_size_plan_at_index(
+            handle, plans.candidate, cudnn_workspace_size, override_uids, override_shapes, override_strides);
     }
 
     error_t
@@ -1030,15 +1058,117 @@ class Graph : public ICudnn, public INode {
         return {error_code_t::OK, ""};
     }
 
+    error_t
+    get_workspace_size_plan_at_index(cudnnHandle_t handle,
+                                     int64_t plan_index,
+                                     int64_t &cudnn_workspace_size,
+                                     std::vector<int64_t> const &override_uids,
+                                     std::vector<std::vector<int64_t>> const &override_shapes,
+                                     std::vector<std::vector<int64_t>> const &override_strides) const {
+        RETURN_CUDNN_FRONTEND_ERROR_IF(override_uids.size() != override_shapes.size(),
+                                       error_code_t::INVALID_VALUE,
+                                       "override_uids and override_shapes must have the same size.");
+        RETURN_CUDNN_FRONTEND_ERROR_IF(override_uids.size() != override_strides.size(),
+                                       error_code_t::INVALID_VALUE,
+                                       "override_uids and override_strides must have the same size.");
+
+        if (override_uids.empty()) {
+            return get_workspace_size_plan_at_index(plan_index, cudnn_workspace_size);
+        }
+
+        // OSS engines are not backed by cuDNN execution plans, so their workspace stays frontend-owned.
+        if (plan_index == graph::Execution_plan_list::OSS_SDPA_ENGINE_CANDIDATE ||
+            plan_index == graph::Execution_plan_list::OSS_RMS_NORM_SILU_ENGINE_CANDIDATE) {
+            return get_workspace_size_plan_at_index(plan_index, cudnn_workspace_size);
+        }
+
+        auto cudnn_ver_error = error_t{error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "Runtime workspace query with override shapes requires cuDNN v9.23.0"};
+        NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(92300, cudnn_ver_error);
+
+#if (CUDNN_VERSION < 92300)
+        return cudnn_ver_error;
+#endif
+
+        CHECK_CUDNN_FRONTEND_ERROR(plans.is_plan_index_executable(plan_index));
+
+        detail::backend_descriptor variant_pack_descriptor(CUDNN_BACKEND_VARIANT_PACK_DESCRIPTOR);
+        RETURN_CUDNN_FRONTEND_ERROR_IF(variant_pack_descriptor.get_status() != CUDNN_STATUS_SUCCESS,
+                                       error_code_t::CUDNN_BACKEND_API_FAILED,
+                                       "Failed to create variant pack's backend descriptor.");
+
+#if (CUDNN_VERSION >= 92100)
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(variant_pack_descriptor.get_ptr(),
+                                                       CUDNN_ATTR_VARIANT_PACK_OVERRIDE_UNIQUE_IDS,
+                                                       CUDNN_TYPE_INT64,
+                                                       override_uids.size(),
+                                                       override_uids.data()));
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(variant_pack_descriptor.get_ptr(),
+                                                       CUDNN_ATTR_VARIANT_PACK_OVERRIDE_SHAPES,
+                                                       CUDNN_TYPE_VOID_PTR,
+                                                       1,
+                                                       (void *)&override_shapes));
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(variant_pack_descriptor.get_ptr(),
+                                                       CUDNN_ATTR_VARIANT_PACK_OVERRIDE_STRIDES,
+                                                       CUDNN_TYPE_VOID_PTR,
+                                                       1,
+                                                       (void *)&override_strides));
+#else
+        CUDNN_FRONTEND_UNUSED(override_uids);
+        CUDNN_FRONTEND_UNUSED(override_shapes);
+        CUDNN_FRONTEND_UNUSED(override_strides);
+#endif
+
+        _CUDNN_CHECK_CUDNN_ERROR(detail::finalize(variant_pack_descriptor.get_ptr()));
+
+        size_t cudnn_ws = 0;
+        _CUDNN_CHECK_CUDNN_ERROR(detail::get_execution_plan_workspace_size(
+            handle, plans.execution_plans[plan_index]->get_raw_desc(), variant_pack_descriptor.get_ptr(), &cudnn_ws));
+        cudnn_workspace_size = cudnn_ws + fe_workspace_size;
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: get_workspace_size() is " << cudnn_workspace_size
+                                                                 << " (runtime override shape)");
+        return {error_code_t::OK, ""};
+    }
+
     int64_t
     get_workspace_size() const {
         return get_workspace_size_plan_at_index(plans.candidate);
     }
 
     int64_t
+    get_workspace_size(cudnnHandle_t handle,
+                       std::vector<int64_t> const &override_uids,
+                       std::vector<std::vector<int64_t>> const &override_shapes,
+                       std::vector<std::vector<int64_t>> const &override_strides) const {
+        int64_t cudnn_workspace = 0;
+        auto status = get_workspace_size(handle, cudnn_workspace, override_uids, override_shapes, override_strides);
+        if (status.is_bad()) {
+            CUDNN_FE_LOG_LABEL_ENDL("ERROR: Querying workspace failed.");
+        }
+        return cudnn_workspace;
+    }
+
+    int64_t
     get_workspace_size_plan_at_index(int64_t plan_index) const {
         int64_t cudnn_workspace = 0;
         auto status             = get_workspace_size_plan_at_index(plan_index, cudnn_workspace);
+        if (status.is_bad()) {
+            CUDNN_FE_LOG_LABEL_ENDL("ERROR: Querying workspace failed.");
+        }
+        return cudnn_workspace;
+    }
+
+    int64_t
+    get_workspace_size_plan_at_index(cudnnHandle_t handle,
+                                     int64_t plan_index,
+                                     std::vector<int64_t> const &override_uids,
+                                     std::vector<std::vector<int64_t>> const &override_shapes,
+                                     std::vector<std::vector<int64_t>> const &override_strides) const {
+        int64_t cudnn_workspace = 0;
+        auto status             = get_workspace_size_plan_at_index(
+            handle, plan_index, cudnn_workspace, override_uids, override_shapes, override_strides);
         if (status.is_bad()) {
             CUDNN_FE_LOG_LABEL_ENDL("ERROR: Querying workspace failed.");
         }
@@ -1124,8 +1254,8 @@ class Graph : public ICudnn, public INode {
         }
         plans.candidate = 0;
 
-        // Re-prepare the variant pack template to match the new plan ordering
-        CHECK_CUDNN_FRONTEND_ERROR(prepare_variant_pack_template());
+        // Re-prepare OSS slot indices to match the new plan ordering
+        apply_oss_slot_indices_to_plans();
 
         detail::cuda_event_destroy(start);
         detail::cuda_event_destroy(stop);
@@ -1215,7 +1345,7 @@ class Graph : public ICudnn, public INode {
                           std::vector<int64_t> const &override_uids                 = {},
                           std::vector<std::vector<int64_t>> const &override_shapes  = {},
                           std::vector<std::vector<int64_t>> const &override_strides = {}) const {
-        if (!varpack_template.prepared) {
+        if (!varpack_prep_state->prepared.load(std::memory_order_acquire)) {
             CHECK_CUDNN_FRONTEND_ERROR(const_cast<Graph *>(this)->prepare_variant_pack_template());
         }
         const int n_user        = (int)varpack_template.user_slots.size();
@@ -1247,7 +1377,7 @@ class Graph : public ICudnn, public INode {
                           std::vector<std::vector<int64_t>> const &override_shapes  = {},
                           std::vector<std::vector<int64_t>> const &override_strides = {}) const {
         // Lazy init: prepare template if not done (e.g. deserialized graphs, build_plan_at_index)
-        if (!varpack_template.prepared) {
+        if (!varpack_prep_state->prepared.load(std::memory_order_acquire)) {
             CHECK_CUDNN_FRONTEND_ERROR(const_cast<Graph *>(this)->prepare_variant_pack_template());
         }
 
@@ -1294,6 +1424,8 @@ class Graph : public ICudnn, public INode {
         // 4. Run auxiliary kernels (e.g. SDPA reduction accumulator init)
         CHECK_CUDNN_FRONTEND_ERROR(run_auxiliary_kernels(handle, workspace, cached_workspace_modifications));
 
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: Executing graph_uid " << graph_uid);
+
         // 5. Dispatch
         void *engine_workspace = static_cast<char *>(workspace) + fe_workspace_size;
 
@@ -1323,17 +1455,13 @@ class Graph : public ICudnn, public INode {
         }
 
         // Backend path
-        std::vector<void *> ptrs_vec(ptrs, ptrs + N);
         if (override_uids.empty()) {
-            CHECK_CUDNN_FRONTEND_ERROR(detail::execute(handle,
-                                                       plans.execution_plans[plan_index].get(),
-                                                       ptrs_vec,
-                                                       varpack_template.all_uids,
-                                                       engine_workspace));
+            CHECK_CUDNN_FRONTEND_ERROR(detail::execute(
+                handle, plans.execution_plans[plan_index].get(), ptrs, varpack_template.all_uids, engine_workspace));
         } else {
             CHECK_CUDNN_FRONTEND_ERROR(detail::execute(handle,
                                                        plans.execution_plans[plan_index].get(),
-                                                       ptrs_vec,
+                                                       ptrs,
                                                        varpack_template.all_uids,
                                                        engine_workspace,
                                                        override_uids,
@@ -1498,13 +1626,64 @@ class Graph : public ICudnn, public INode {
 #endif
     }
 
+    /**
+     * @brief Deserialize an execution plan from a serialized byte blob.
+     *
+     * Parses @p data with from_ubjson and delegates to the json overload. Callers that
+     * have already parsed the blob should call the json overload directly to avoid a
+     * second parse.
+     *
+     * @param handle              cuDNN handle used to rebuild the execution plan.
+     * @param data                UBJSON blob previously produced by serialize().
+     * @param enforce_precompiled When true, fail unless the blob carries a precompiled plan.
+     * @param run_warmup          When false, skip the throwaway warmup capture.
+     * @return error_t OK on success, otherwise an error code describing the failure.
+     */
     error_t
-    deserialize(cudnnHandle_t handle, std::vector<uint8_t> const &data) {
-        CUDNN_FE_LOG_BANNER(" DESERIALIZE PLAN WITH HANDLE  ");
+    deserialize(cudnnHandle_t handle,
+                std::vector<uint8_t> const &data,
+                bool const enforce_precompiled = false,
+                bool run_warmup                = true) {
+#ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
+        return deserialize(handle, json::from_ubjson(data), enforce_precompiled, run_warmup);
+#else
+        CUDNN_FRONTEND_UNUSED(handle);
+        CUDNN_FRONTEND_UNUSED(data);
+        CUDNN_FRONTEND_UNUSED(enforce_precompiled);
+        CUDNN_FRONTEND_UNUSED(run_warmup);
+        return {error_code_t::GRAPH_NOT_SUPPORTED, "unavailable when compiled with CUDNN_FRONTEND_SKIP_JSON_LIB"};
+#endif
+    }
 
 #ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
-        json j = json::from_ubjson(data);
+    /**
+     * @brief Deserialize an execution plan from an already-parsed json.
+     *
+     * Avoids a second from_ubjson parse. run_warmup=false skips the throwaway warmup capture.
+     *
+     * @param handle              cuDNN handle used to rebuild the execution plan.
+     * @param j                   Parsed json graph, as produced by serialize().
+     * @param enforce_precompiled When true, fail unless the json carries a precompiled plan.
+     * @param run_warmup          When false, skip the throwaway warmup capture.
+     * @return error_t OK on success, otherwise an error code describing the failure.
+     */
+    error_t
+    deserialize(cudnnHandle_t handle, json const &j, bool const enforce_precompiled = false, bool run_warmup = true) {
+        CUDNN_FE_LOG_BANNER(" DESERIALIZE PLAN WITH HANDLE  ");
 
+        // Clear deserialize-owned containers so a re-deserialize on the same Graph
+        // does not feed prepare_variant_pack_template() with stale entries from a
+        // prior deserialize(handle, old_data).
+        deserialized_tensor_properties.clear();
+        deserialized_pass_by_value.clear();
+        deserialized_workspace_modifications.clear();
+        tensors_to_dump.clear();
+
+        if (j.contains("graph_uid") && !j["graph_uid"].is_null()) {
+            graph_uid = j["graph_uid"].get<uint64_t>();
+        }
+
+        // Resolve tensor UIDs with deserialized_tensor_properties.
         if (j.contains("tensors")) {
             auto tensor_map = j["tensors"].get<std::unordered_map<std::string, json>>();
             for (const auto &tensor_info : tensor_map) {
@@ -1514,8 +1693,12 @@ class Graph : public ICudnn, public INode {
             }
         }
 
-        auto serialized_plan = j["cudnn_backend_data"];
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            enforce_precompiled && !j.contains("cudnn_backend_data"),
+            error_code_t::GRAPH_EXECUTION_PLAN_CREATION_FAILED,
+            "enforce_precompiled requested, but serialized graph has no precompiled execution plan");
 
+        auto serialized_plan = j["cudnn_backend_data"];
         CHECK_CUDNN_FRONTEND_ERROR(plans.build_plans(handle, serialized_plan));
 
         plans.behavior_notes = j["behavior_notes"].get<std::vector<std::vector<BehaviorNote_t>>>();
@@ -1553,6 +1736,14 @@ class Graph : public ICudnn, public INode {
         cached_pass_by_value           = deserialized_pass_by_value;
         cached_workspace_modifications = deserialized_workspace_modifications;
 
+        // Reset prep state in case this Graph is being re-deserialized; otherwise the
+        // eager prep below would early-return with the old slot layout.
+        varpack_prep_state->prepared.store(false, std::memory_order_release);
+        varpack_template = {};
+
+        // Eager prep, matching what build_plans() does for fresh-build graphs.
+        CHECK_CUDNN_FRONTEND_ERROR(prepare_variant_pack_template());
+
         if (j.contains("tensors_to_dump")) {
             auto dump_uids = j["tensors_to_dump"].get<std::vector<std::pair<uid_t, char>>>();
             for (auto const &[uid, fmt] : dump_uids) {
@@ -1565,17 +1756,15 @@ class Graph : public ICudnn, public INode {
             }
         }
 
-        CHECK_CUDNN_FRONTEND_ERROR(warmup(handle));
+        if (run_warmup) {
+            CHECK_CUDNN_FRONTEND_ERROR(warmup(handle));
+        }
 
         CUDNN_FE_LOG_BANNER(" DESERIALIZE PLAN WITH HANDLE (ALL OK) ");
 
         return {error_code_t::OK, ""};
-#else
-        CUDNN_FRONTEND_UNUSED(handle);
-        CUDNN_FRONTEND_UNUSED(data);
-        return {error_code_t::GRAPH_NOT_SUPPORTED, "unavailable when compiled with CUDNN_FRONTEND_SKIP_JSON_LIB"};
-#endif
     }
+#endif
 
     Type
     getType() override {
@@ -1713,6 +1902,14 @@ class Graph : public ICudnn, public INode {
     std::array<std::shared_ptr<Tensor_attributes>, 2> rmsnorm(std::shared_ptr<Tensor_attributes>,
                                                               std::shared_ptr<Tensor_attributes>,
                                                               Rmsnorm_attributes);
+
+    std::shared_ptr<Tensor_attributes> rope(std::shared_ptr<Tensor_attributes>,
+                                            std::shared_ptr<Tensor_attributes>,
+                                            RoPE_attributes);
+
+    std::shared_ptr<Tensor_attributes> rope_backward(std::shared_ptr<Tensor_attributes>,
+                                                     std::shared_ptr<Tensor_attributes>,
+                                                     RoPE_backward_attributes);
 
     std::array<std::shared_ptr<Tensor_attributes>, 3> rmsnorm_backward(std::shared_ptr<Tensor_attributes>,
                                                                        std::shared_ptr<Tensor_attributes>,
@@ -1918,33 +2115,67 @@ class Graph : public ICudnn, public INode {
         std::vector<std::pair<int, int64_t>> workspace_slots;  // (slot, byte_offset)
         std::vector<std::pair<int, std::pair<int, int64_t>>>
             replacement_slots;  // (dst_slot, (src_slot, offset)) — only used by Slice nodes
-
-        bool prepared = false;
     };
 
     VariantPackTemplate varpack_template;
 
+    // Per-Graph sync state for lazy varpack-template prep. Wrapped in a box so
+    // Graph stays default-copy/move-constructible (samples build Graphs into
+    // std::tuple by copy).
+    struct VarpackPrepState {
+        std::atomic<bool> prepared{false};
+        std::mutex mu;
+    };
+    struct VarpackPrepStateBox {
+        std::unique_ptr<VarpackPrepState> ptr                = std::make_unique<VarpackPrepState>();
+        VarpackPrepStateBox()                                = default;
+        VarpackPrepStateBox(VarpackPrepStateBox &&) noexcept = default;
+        VarpackPrepStateBox &
+        operator=(VarpackPrepStateBox &&) noexcept = default;
+        // Copy semantics: never copy the prepared flag. The cached template_ptrs
+        // store raw addresses into the source Graph's pass-by-value storage; a
+        // copied Graph must rebuild its own template on first use.
+        VarpackPrepStateBox(VarpackPrepStateBox const & /*other*/) : ptr(std::make_unique<VarpackPrepState>()) {}
+        VarpackPrepStateBox &
+        operator=(VarpackPrepStateBox const &other) {
+            if (this != &other) {
+                ptr = std::make_unique<VarpackPrepState>();
+            }
+            return *this;
+        }
+        VarpackPrepState *
+        operator->() const {
+            return ptr.get();
+        }
+    };
+    mutable VarpackPrepStateBox varpack_prep_state;
+
     // Prepares the variant pack template. Called automatically at the end of build_plans().
     error_t
     prepare_variant_pack_template() {
-        varpack_template = VariantPackTemplate{};
+        std::lock_guard<std::mutex> lk(varpack_prep_state->mu);
+        if (varpack_prep_state->prepared.load(std::memory_order_relaxed)) {
+            return {error_code_t::OK, ""};
+        }
+
+        VariantPackTemplate t;
 
         // 1. Start with variant_pack_uids + any replacement source UIDs not already included.
-        //    Replacement sources (e.g. full tensor before slicing) may not be in variant_pack_uids
-        //    because the backend only needs the sliced view, but we need the source to compute it.
-        varpack_template.all_uids.assign(variant_pack_uids.begin(), variant_pack_uids.end());
+        //    Replacement sources (e.g. slice input on cuDNN < 9.22 pointer-arithmetic fallback) may not
+        //    be in variant_pack_uids; we still need a slot for the source pointer when replacements apply.
+        t.all_uids.assign(variant_pack_uids.begin(), variant_pack_uids.end());
         for (auto const &[from_uid, value] : variant_pack_replacements) {
             if (variant_pack_uids.find(from_uid) == variant_pack_uids.end()) {
-                varpack_template.all_uids.push_back(from_uid);
+                t.all_uids.push_back(from_uid);
             }
         }
-        std::sort(varpack_template.all_uids.begin(), varpack_template.all_uids.end());
-        varpack_template.template_ptrs.resize(varpack_template.all_uids.size(), nullptr);
+        std::sort(t.all_uids.begin(), t.all_uids.end());
+        t.template_ptrs.assign(t.all_uids.size(), nullptr);
 
         // 2. Build UID → slot index
         std::unordered_map<int64_t, int> uid_to_slot;
-        for (int i = 0; i < (int)varpack_template.all_uids.size(); i++) {
-            uid_to_slot[varpack_template.all_uids[i]] = i;
+        for (int i = 0; i < (int)t.all_uids.size(); i++) {
+            uid_to_slot[t.all_uids[i]] = i;
         }
 
         // 3. Pre-fill pass_by_value entries (scalars like epsilon, alpha, beta)
@@ -1953,11 +2184,11 @@ class Graph : public ICudnn, public INode {
         for (auto const &[uid, ptr] : pbv_ptrs) {
             auto it = uid_to_slot.find(uid);
             if (it != uid_to_slot.end()) {
-                varpack_template.template_ptrs[it->second] = ptr;
+                t.template_ptrs[it->second] = ptr;
             } else {
-                int slot = (int)varpack_template.all_uids.size();
-                varpack_template.all_uids.push_back(uid);
-                varpack_template.template_ptrs.push_back(ptr);
+                int slot = (int)t.all_uids.size();
+                t.all_uids.push_back(uid);
+                t.template_ptrs.push_back(ptr);
                 uid_to_slot[uid] = slot;
             }
         }
@@ -1966,9 +2197,9 @@ class Graph : public ICudnn, public INode {
         for (auto const &[uid, data] : cached_workspace_modifications) {
             auto it = uid_to_slot.find(uid);
             if (it == uid_to_slot.end()) {
-                int slot = (int)varpack_template.all_uids.size();
-                varpack_template.all_uids.push_back(uid);
-                varpack_template.template_ptrs.push_back(nullptr);  // filled at execute time
+                int slot = (int)t.all_uids.size();
+                t.all_uids.push_back(uid);
+                t.template_ptrs.push_back(nullptr);  // filled at execute time
                 uid_to_slot[uid] = slot;
             }
         }
@@ -1983,11 +2214,11 @@ class Graph : public ICudnn, public INode {
             (void)from_uid;
             replacement_dst_uids.insert(value.first);  // value.first = to_uid (the destination)
         }
-        for (int i = 0; i < (int)varpack_template.template_ptrs.size(); i++) {
-            int64_t uid = varpack_template.all_uids[i];
-            if (varpack_template.template_ptrs[i] == nullptr && workspace_uids.find(uid) == workspace_uids.end() &&
+        for (int i = 0; i < (int)t.template_ptrs.size(); i++) {
+            int64_t uid = t.all_uids[i];
+            if (t.template_ptrs[i] == nullptr && workspace_uids.find(uid) == workspace_uids.end() &&
                 replacement_dst_uids.find(uid) == replacement_dst_uids.end()) {
-                varpack_template.user_slots.push_back(i);
+                t.user_slots.push_back(i);
             }
         }
 
@@ -1996,33 +2227,43 @@ class Graph : public ICudnn, public INode {
             const auto &[operation_type, offset, vec_data] = data;
             auto it                                        = uid_to_slot.find(uid);
             if (it != uid_to_slot.end()) {
-                varpack_template.workspace_slots.emplace_back(it->second, offset);
+                t.workspace_slots.emplace_back(it->second, offset);
             }
         }
 
         // 7. Pre-compute replacement slot indices
         // variant_pack_replacements: key = from_uid (source), value = {to_uid (destination), byte_offset}
-        // Meaning: ptr[to_uid] = ptr[from_uid] + byte_offset
+        // Meaning: ptr[to_uid] = ptr[from_uid] + byte_offset (e.g. legacy slice fallback on cuDNN < 9.22)
         for (auto const &[from_uid, value] : variant_pack_replacements) {
             const auto &[to_uid, byte_offset] = value;
             auto it_src                       = uid_to_slot.find(from_uid);
             auto it_dst                       = uid_to_slot.find(to_uid);
-            // Replacement: dst_ptr = src_ptr + byte_offset (currently only Slice nodes)
+            // Replacement: dst_ptr = src_ptr + byte_offset
             if (it_src != uid_to_slot.end() && it_dst != uid_to_slot.end()) {
-                varpack_template.replacement_slots.emplace_back(it_dst->second,
-                                                                std::make_pair(it_src->second, byte_offset));
+                t.replacement_slots.emplace_back(it_dst->second, std::make_pair(it_src->second, byte_offset));
             }
         }
 
-        // 8. Pre-compute OSS engine slot indices (if applicable)
-        plans.set_oss_slot_indices([&](int64_t uid) -> int {
-            if (uid < 0) return -1;
-            auto it = uid_to_slot.find(uid);
-            return (it != uid_to_slot.end()) ? it->second : -1;
-        });
+        varpack_template = std::move(t);
+        // Apply OSS slot indices before the release-store so a reader that
+        // observes prepared=true also sees the slot writes.
+        apply_oss_slot_indices_to_plans();
+        varpack_prep_state->prepared.store(true, std::memory_order_release);
 
-        varpack_template.prepared = true;
         return {error_code_t::OK, ""};
+    }
+
+    // Depends on plans.candidate; kept separate so autotune can re-apply without
+    // rebuilding the (candidate-independent) variant pack template.
+    void
+    apply_oss_slot_indices_to_plans() {
+        plans.set_oss_slot_indices([this](int64_t uid) -> int {
+            if (uid < 0) return -1;
+            for (size_t i = 0; i < varpack_template.all_uids.size(); ++i) {
+                if (varpack_template.all_uids[i] == uid) return static_cast<int>(i);
+            }
+            return -1;
+        });
     }
 
     std::vector<int64_t>
@@ -2135,6 +2376,7 @@ class Graph : public ICudnn, public INode {
         full_json["context"]["sm_count"]                  = context.get_target_sm_count();
         full_json["context"]["is_dynamic_shape_enabled"]  = context.get_dynamic_shape_enabled();
         full_json["context"]["is_override_shape_enabled"] = context.get_override_shape_enabled();
+        full_json["graph_uid"]                            = graph_uid;
 
         full_json.update(R"( {"tag": "GRAPH"})"_json);
         full_json["nodes"];
@@ -2144,7 +2386,8 @@ class Graph : public ICudnn, public INode {
             full_json["nodes"].push_back(j_sub_node);
         }
 
-        j["context"] = full_json["context"];
+        j["context"]   = full_json["context"];
+        j["graph_uid"] = full_json["graph_uid"];
 
         j["json_version"]           = "1.0";
         j["cudnn_backend_version"]  = detail::get_backend_version_string();
@@ -2260,7 +2503,12 @@ class Graph : public ICudnn, public INode {
     // TODO: temparorily placed in graphs class. This function needs to be a free standing function.
 #ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
     error_t
-    deserialize(const json &j) {
+    deserialize(const json &j, bool const enforce_precompiled = false) {
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            enforce_precompiled,
+            error_code_t::GRAPH_NOT_SUPPORTED,
+            "enforce_precompiled requires plan serialization; JSON deserialization reconstructs the graph");
+
         if (j.contains("context")) {
             const auto &j_context = j["context"];
             if (j_context.contains("compute_data_type") && !j_context["compute_data_type"].is_null()) {
@@ -2284,6 +2532,10 @@ class Graph : public ICudnn, public INode {
             if (j_context.contains("is_override_shape_enabled") && !j_context["is_override_shape_enabled"].is_null()) {
                 context.set_override_shape_enabled(j_context["is_override_shape_enabled"].get<bool>());
             }
+        }
+
+        if (j.contains("graph_uid") && !j["graph_uid"].is_null()) {
+            graph_uid = j["graph_uid"].get<uint64_t>();
         }
 
         std::map<std::string, std::shared_ptr<Tensor_attributes>> created_tensors;
@@ -3224,6 +3476,42 @@ Graph::rmsnorm(std::shared_ptr<Tensor_attributes> x,
     sub_nodes.emplace_back(std::make_unique<RMSNormNode>(std::move(attributes), context));
 
     return {Y, INV_VARIANCE};
+}
+
+inline std::shared_ptr<Tensor_attributes>
+Graph::rope(std::shared_ptr<Tensor_attributes> input,
+            std::shared_ptr<Tensor_attributes> freqs,
+            RoPE_attributes attributes) {
+    // RoPE writes to a user-bound buffer (no longer a virtual workspace tensor),
+    // because the rotated Q/K need to be saved across fwd→bwd for the bwd to consume them
+    // as inputs to SDPA bwd.
+    auto OUTPUT = attributes.outputs[RoPE_attributes::output_names::OUTPUT] =
+        output_tensor(attributes.name + "::OUTPUT");
+    OUTPUT->set_is_virtual(false);
+
+    // Set inputs
+    attributes.inputs[RoPE_attributes::input_names::INPUT] = input;
+    attributes.inputs[RoPE_attributes::input_names::FREQS] = freqs;
+
+    sub_nodes.emplace_back(std::make_unique<RoPENode>(std::move(attributes), context));
+
+    return OUTPUT;
+}
+
+inline std::shared_ptr<Tensor_attributes>
+Graph::rope_backward(std::shared_ptr<Tensor_attributes> dy,
+                     std::shared_ptr<Tensor_attributes> freqs,
+                     RoPE_backward_attributes attributes) {
+    // dX is a real (user-bound) tensor by default — symmetric to fwd RoPE's Y output.
+    auto DX = attributes.outputs[RoPE_backward_attributes::output_names::DX] = output_tensor(attributes.name + "::DX");
+    DX->set_is_virtual(false);
+
+    attributes.inputs[RoPE_backward_attributes::input_names::DY]    = dy;
+    attributes.inputs[RoPE_backward_attributes::input_names::FREQS] = freqs;
+
+    sub_nodes.emplace_back(std::make_unique<RoPEBackwardNode>(std::move(attributes), context));
+
+    return DX;
 }
 
 inline std::array<std::shared_ptr<Tensor_attributes>, 3>

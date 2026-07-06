@@ -194,7 +194,8 @@ def generate_graph_fwd(b, h_q, h_k, h_v,
                        cudnn_otype=cudnn.data_type.HALF,
                        left_bound=None, right_bound=None, diag_align=None,
                        with_sink_token=False,
-                       with_unfuse_fma=False):
+                       with_unfuse_fma=False,
+                       implementation=cudnn.attention_implementation.AUTO):
     # Compute padded dimensions for F8_128x4 scale factors
     s_q_padded = ceil_div(s_qo, 128) * 128
     s_kv_padded = ceil_div(s_kv, 128) * 128
@@ -280,6 +281,7 @@ def generate_graph_fwd(b, h_q, h_k, h_v,
         diagonal_band_right_bound=right_bound,
         sink_token=sink_token,
         unfuse_fma=with_unfuse_fma,
+        implementation=implementation,
     )
 
     # Set output tensor properties
@@ -541,6 +543,7 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
             left_bound=left_bound, right_bound=right_bound, diag_align=diag_align,
             with_sink_token=with_sink_token,
             with_unfuse_fma=with_unfuse_fma,
+            implementation=cfg.implementation,
         )
         graph_fwd.validate()
         graph_fwd.build_operation_graph()
@@ -592,6 +595,7 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
 
     # Execute
     workspace = torch.empty(graph_fwd.get_workspace_size(), dtype=torch.uint8, device="cuda")
+    torch.cuda.synchronize()
     if request.config.getoption("--perf"):
         times_ms = time_execution(graph_fwd.execute, variant_pack, workspace, cudnn_handle)
         print(f"@@@@ MXFP8 Fwd graph_fwd.execute avg_time_ms={times_ms.mean().item():.3f}")
@@ -691,12 +695,12 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
             variant_pack_bwd[int(GraphBwdUid.dSink_token)] = dSink_token_gpu
 
         # Execute backward graph
-        torch.cuda.synchronize()
         workspace_bwd = torch.empty(graph_bwd.get_workspace_size(), dtype=torch.uint8, device="cuda")
         if request.config.getoption("--perf"):
             times_ms = time_execution(graph_bwd.execute, variant_pack_bwd, workspace_bwd, cudnn_handle)
             print(f"@@@@ MXFP8 Bwd graph_bwd.execute avg_time_ms={times_ms.mean().item():.3f}")
             profile_execution(graph_bwd.execute, variant_pack_bwd, workspace_bwd, cudnn_handle)
+        torch.cuda.synchronize()
         graph_bwd.execute(variant_pack_bwd, workspace_bwd, handle=cudnn_handle)
         torch.cuda.synchronize()
 

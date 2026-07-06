@@ -60,7 +60,7 @@ for _optional_symbol in [
 
 from .datatypes import _library_type, _is_torch_tensor
 
-__version__ = "1.23.0"
+__version__ = "1.26.0"
 
 
 def _tensor(
@@ -74,6 +74,7 @@ def _tensor(
     reordering_type=tensor_reordering.NONE,
     name="",
     uid=-1,
+    ragged_offset_multiplier=1,
 ):
     """
     Create a tensor.
@@ -87,6 +88,7 @@ def _tensor(
         ragged_offset (cudnn_tensor): The ragged offset tensor.
         reordering_type (cudnn.tensor_reordering): The reordering type of the tensor.
         name (str): The name of the tensor.
+        ragged_offset_multiplier (int): Unit size of ragged offsets in tensor elements. A value of 1 means no multiplier.
 
     Returns:
         cudnn_tensor: The created tensor.
@@ -101,6 +103,7 @@ def _tensor(
         reordering_type=reordering_type,
         name=name,
         uid=uid,
+        ragged_offset_multiplier=ragged_offset_multiplier,
     )
 
 
@@ -151,7 +154,14 @@ def _execute(
     }
 
     workspace_pointer = _library_device_pointer(workspace)
-    self._execute(uid_to_tensor_pointer, workspace_pointer, handle)
+    self._execute(
+        uid_to_tensor_pointer,
+        workspace_pointer,
+        handle,
+        override_uids,
+        override_shapes,
+        override_strides,
+    )
 
 
 def _execute_plan_at_index(
@@ -210,7 +220,21 @@ def load_cudnn():
 
 
 def _dlopen_cudnn():
-    # First look at python site packages
+    # Honor the dynamic linker search path before packaged cuDNN so local backend
+    # builds can override the wheel dependency during development.
+    for library_dir in os.environ.get("LD_LIBRARY_PATH", "").split(os.pathsep):
+        if not library_dir:
+            continue
+        for library_name in ("libcudnn.so.9", "libcudnn.so"):
+            library_path = os.path.join(library_dir, library_name)
+            if not os.path.exists(library_path):
+                continue
+            lib = ctypes.CDLL(library_path)
+            handle = ctypes.cast(lib._handle, ctypes.c_void_p).value
+            _pybind_module._set_dlhandle_cudnn(handle)
+            return
+
+    # Then look at python site packages
     lib_path = glob.glob(os.path.join(sysconfig.get_path("purelib"), "nvidia/cudnn/lib/libcudnn.so.*[0-9]"))
 
     if not lib_path:
@@ -246,6 +270,10 @@ from typing import Any
 _OPTIONAL_DEPENDENCY_INSTALL_HINT = "Install with 'pip install nvidia-cudnn-frontend[cutedsl]'"
 
 _LAZY_OPTIONAL_IMPORTS = {
+    "BSA": (".block_sparse_attention", "BSA"),
+    "block_sparse_attention_forward": (".block_sparse_attention", "block_sparse_attention_forward"),
+    "block_sparse_attention_backward": (".block_sparse_attention", "block_sparse_attention_backward"),
+    "DSA": (".deepseek_sparse_attention", "DSA"),
     "NSA": (".native_sparse_attention", "NSA"),
     "GemmSwigluSm100": (".gemm_swiglu", "GemmSwigluSm100"),
     "gemm_swiglu_wrapper_sm100": (".gemm_swiglu", "gemm_swiglu_wrapper_sm100"),

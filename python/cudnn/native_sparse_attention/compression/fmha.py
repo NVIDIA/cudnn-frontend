@@ -35,6 +35,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
+from cutlass.cute.nvgpu import OperandMajorMode
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 import cutlass.utils.blackwell_helpers as sm100_utils
@@ -361,11 +362,11 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.v_major_mode = utils.LayoutEnum.from_tensor(v).mma_major_mode()
         self.o_layout = utils.LayoutEnum.from_tensor(o)
 
-        if cutlass.const_expr(self.q_major_mode != tcgen05.OperandMajorMode.K):
+        if cutlass.const_expr(self.q_major_mode != OperandMajorMode.K):
             raise RuntimeError("The layout of q is not supported")
-        if cutlass.const_expr(self.k_major_mode != tcgen05.OperandMajorMode.K):
+        if cutlass.const_expr(self.k_major_mode != OperandMajorMode.K):
             raise RuntimeError("The layout of k is not supported")
-        if cutlass.const_expr(self.v_major_mode != tcgen05.OperandMajorMode.MN):
+        if cutlass.const_expr(self.v_major_mode != OperandMajorMode.MN):
             raise RuntimeError("The layout of v is not supported")
 
         # check type consistency
@@ -378,8 +379,9 @@ class BlackwellFusedMultiHeadAttentionForward:
         cta_group = tcgen05.CtaGroup.ONE
         # the intermediate tensor p is from tmem & k-major
         p_source = tcgen05.OperandSource.TMEM
-        p_major_mode = tcgen05.OperandMajorMode.K
+        p_major_mode = OperandMajorMode.K
         qk_tiled_mma = sm100_utils.make_trivial_tiled_mma(
+            self.q_dtype,
             self.q_dtype,
             self.q_major_mode,
             self.k_major_mode,
@@ -388,6 +390,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             self.qk_mma_tiler[:2],
         )
         pv_tiled_mma = sm100_utils.make_trivial_tiled_mma(
+            self.v_dtype,
             self.v_dtype,
             p_major_mode,
             self.v_major_mode,
@@ -958,7 +961,7 @@ class BlackwellFusedMultiHeadAttentionForward:
 
             # Alloc tmem buffer
             tmem_alloc_cols = Int32(self.tmem_alloc_cols)
-            cute.arch.alloc_tmem(tmem_alloc_cols, storage.tmem_holding_buf)
+            cute.arch.alloc_tmem(tmem_alloc_cols, storage.tmem_holding_buf.ptr)
             cute.arch.barrier(
                 barrier_id=self.tmem_alloc_sync_bar_id,
                 number_of_threads=self.threads_per_warp,
@@ -1214,7 +1217,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             tmem_ptr = cute.arch.retrieve_tmem_ptr(
                 Float32,
                 alignment=16,
-                ptr_to_buffer_holding_addr=storage.tmem_holding_buf,
+                ptr_to_buffer_holding_addr=storage.tmem_holding_buf.ptr,
             )
             cute.arch.dealloc_tmem(tmem_ptr, tmem_alloc_cols)
 
@@ -1753,7 +1756,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         cum_seqlen_q: Optional[cute.Tensor],
         cum_seqlen_k: Optional[cute.Tensor],
         scale_softmax_log2: Float32,
-        qk_thr_mma: cute.core.ThrMma,
+        qk_thr_mma: cute.ThrMma,
         tStS: cute.Tensor,
         tStSi: cute.Tensor,
         window_size_left: Optional[Int32],
@@ -1788,7 +1791,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         :param scale_softmax_log2: Log2 scale factor for softmax operation
         :type scale_softmax_log2: Float32
         :param qk_thr_mma: Thread MMA operation for QK matrix multiplication
-        :type qk_thr_mma: cute.core.ThrMma
+        :type qk_thr_mma: cute.ThrMma
         :param tStS: Shared tensor for softmax input/output
         :type tStS: cute.Tensor
         :param tStSi: Input tensor containing attention scores
@@ -2053,7 +2056,7 @@ class BlackwellFusedMultiHeadAttentionForward:
     @cute.jit
     def correction_rescale(
         self,
-        thr_mma: cute.core.ThrMma,
+        thr_mma: cute.ThrMma,
         tOtO: cute.Tensor,
         scale: Float32,
     ):
@@ -2070,7 +2073,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         3. Store the rescaled results back to tensor memory
 
         :param thr_mma: Thread MMA operation for the computation
-        :type thr_mma: cute.core.ThrMma
+        :type thr_mma: cute.ThrMma
         :param tOtO: Tensor representing partial attention output to be rescaled
         :type tOtO: cute.Tensor
         :param scale: Scaling factor to apply to the partial results
@@ -2131,7 +2134,7 @@ class BlackwellFusedMultiHeadAttentionForward:
     @cute.jit
     def correction_epilog(
         self,
-        thr_mma: cute.core.ThrMma,
+        thr_mma: cute.ThrMma,
         tOtO: cute.Tensor,
         mLSE: cute.Tensor | None,
         tTMEM_LOAD_VECrS: cute.Tensor,
@@ -2157,7 +2160,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         5. Preparation for efficient TMA store operations
 
         :param thr_mma: Thread MMA operation for the computation
-        :type thr_mma: cute.core.ThrMma
+        :type thr_mma: cute.ThrMma
         :param tOtO: Tensor containing accumulated attention output
         :type tOtO: cute.Tensor
         :param mLSE: Tensor containing log-sum-exp values for LSE calculation

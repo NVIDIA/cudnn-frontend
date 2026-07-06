@@ -21,9 +21,90 @@ import os
 import numpy as np
 import functools
 import math
+import threading
+import time
 from typing import Optional, Dict, Any
 
 from torch.profiler import profile, record_function, ProfilerActivity
+
+
+# Dense MMA throughput (FLOPs / clock / SM) for Blackwell datacenter SKUs.
+# BF16/FP16 dense = 8192, FP8/MXFP8 dense = 16384 (MXFP8 uses the FP8
+# datapath with block scaling).
+# Keys match the strings accepted by the --data_type CLI flag.
+_BLACKWELL_DC_FLOPS_PER_CLOCK_PER_SM = {
+    "bfloat16":  8192,
+    "float16":   8192,
+    "fp8":      16384,
+    "mxfp8":    16384,
+}
+
+
+def _peak_flops_per_clock_per_sm(dtype_str):
+    """Return per-SM per-clock dense FLOPs for the current GPU + dtype.
+    Returns None on unsupported arch (anything other than Blackwell DC for now)."""
+    if not torch.cuda.is_available():
+        return None
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    if props.major != 10:  # only Blackwell DC is in scope
+        return None
+    return _BLACKWELL_DC_FLOPS_PER_CLOCK_PER_SM.get(dtype_str)
+
+
+class _SmClockSampler:
+    """Background thread that polls SM clock via NVML at ~1 kHz.
+
+    Used to capture the actual boost clock during the benchmark window.
+    `nvmlDeviceGetMaxClockInfo` is unreliable on some Blackwell datacenter
+    SKUs: it can report a value below the boost the kernel actually runs
+    at, producing nonsensical (>100%) SOL numbers downstream.
+    """
+
+    def __init__(self):
+        self._samples = []
+        self._stop = threading.Event()
+        self._thread = None
+        self._handle = None
+        self._pynvml = None
+
+    def start(self):
+        try:
+            import pynvml
+            pynvml.nvmlInit()
+            self._pynvml = pynvml
+            self._handle = pynvml.nvmlDeviceGetHandleByIndex(torch.cuda.current_device())
+        except Exception:
+            self._pynvml = None
+            return
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        pynvml = self._pynvml
+        while not self._stop.is_set():
+            try:
+                self._samples.append(pynvml.nvmlDeviceGetClockInfo(self._handle, pynvml.NVML_CLOCK_SM))
+            except Exception:
+                pass
+            # Sample at ~1 kHz; kernels run much longer than this in aggregate
+            # across warmup + measurement iterations.
+            time.sleep(0.001)
+
+    def stop(self):
+        if self._thread is None:
+            return
+        self._stop.set()
+        self._thread.join()
+        try:
+            if self._pynvml is not None:
+                self._pynvml.nvmlShutdown()
+        except Exception:
+            pass
+
+    def peak_mhz(self):
+        """Return max sampled SM clock (MHz), or None if no samples."""
+        return max(self._samples) if self._samples else None
+
 
 try:
     import cutlass.cute as cute
@@ -118,6 +199,12 @@ def parse_args():
     )
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
     parser.add_argument(
+        "--fa4_num_splits",
+        default=None,
+        type=int,
+        help="FlashAttention-4 only: force num_splits (KV split count). " "Default is None (FA4 picks automatically).",
+    )
+    parser.add_argument(
         "--fwd_bwd",
         action="store_true",
         help="Run both forward and backward pass (fwd only by default)",
@@ -132,7 +219,7 @@ def parse_args():
     parser.add_argument(
         "--deterministic_bwd",
         action="store_true",
-        help="Use deterministic algorithm for backward pass where supported (cudnn FP16/BF16/FP8)",
+        help="Use deterministic algorithm for backward pass where supported (cudnn FP16/BF16/FP8, flash_attention, flash_attention_3, flash_attention_4)",
     )
     parser.add_argument(
         "--attn_mask",
@@ -197,6 +284,7 @@ def run_benchmark(
     deterministic_bwd: bool = False,
     sliding_window_size: Optional[int] = None,
     verbose: bool = False,
+    fa4_num_splits: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Run a single SDPA benchmark.
@@ -226,17 +314,18 @@ def run_benchmark(
 
     Returns:
         Dict with keys:
-            - fwd_time_ms: Median forward time in milliseconds
-            - bwd_time_ms: Median backward time in milliseconds (0 if not run)
-            - fwd_tflops: Forward TFLOPS
-            - bwd_tflops: Backward TFLOPS
+            - time_ms: Median time of the requested pass in milliseconds
+            - tflops: TFLOPS for the requested pass
             - max_diff: Maximum difference vs reference
             - gpu_name: GPU name string
             - cudnn_version: cuDNN version (if available)
 
     Raises:
-        RuntimeError: If the benchmark subprocess fails
+        RuntimeError: If the benchmark subprocess fails or profile_pass=="both"
+            (callers must invoke once per pass so each has independent success)
     """
+    if profile_pass == "both":
+        raise RuntimeError("run_benchmark no longer accepts profile_pass='both'. Call once " "per pass ('fwd' or 'bwd') so failures remain independent.")
     import subprocess
     import sys
 
@@ -275,11 +364,8 @@ def run_benchmark(
     else:
         cmd.extend(["--head_dim", str(head_dim)])
 
-    # Handle profile pass
-    if profile_pass == "both":
-        cmd.append("--fwd_bwd")
-    elif profile_pass in ("fwd", "bwd"):
-        cmd.extend(["--profile_pass", profile_pass])
+    # Handle profile pass (single pass only)
+    cmd.extend(["--profile_pass", profile_pass])
 
     # Handle flags
     if skip_ref:
@@ -290,6 +376,8 @@ def run_benchmark(
         cmd.extend(["--sliding_window_size", str(sliding_window_size)])
     if verbose:
         cmd.append("--verbose")
+    if fa4_num_splits is not None:
+        cmd.extend(["--fa4_num_splits", str(fa4_num_splits)])
 
     # Run benchmark
     result = subprocess.run(
@@ -324,11 +412,18 @@ def run_benchmark(
     except ImportError:
         pass
 
+    # Subprocess CSV layout keeps both fwd and bwd columns; pick the one
+    # corresponding to the requested pass. The unused pass is 0 when not run.
+    if profile_pass == "fwd":
+        time_ms = float(parts[8])
+        tflops = float(parts[10])
+    else:  # "bwd"
+        time_ms = float(parts[9])
+        tflops = float(parts[11])
+
     return {
-        "fwd_time_ms": float(parts[8]),
-        "bwd_time_ms": float(parts[9]),
-        "fwd_tflops": float(parts[10]),
-        "bwd_tflops": float(parts[11]),
+        "time_ms": time_ms,
+        "tflops": tflops,
         "max_diff": float(parts[12]) if len(parts) > 12 else 0.0,
         "gpu_name": gpu_name,
         "cudnn_version": cudnn_version,
@@ -1068,14 +1163,28 @@ else:
         # Flash Attention Native
         def flash_attention_sdpa(query, key, value):
             window_size = (args.sliding_window_size, 0) if args.sliding_window_size else (None, None)
-            return flash_attn_func(query, key, value, causal=args.attn_mask != "no_mask", window_size=window_size)
+            return flash_attn_func(
+                query,
+                key,
+                value,
+                causal=args.attn_mask != "no_mask",
+                window_size=window_size,
+                deterministic=args.deterministic_bwd,
+            )
 
     if args.sdpa_backend == "flash_attention_3":
         import flash_attn_interface
 
         def flash_attention_3_sdpa(query, key, value):
             window_size = (args.sliding_window_size, 0) if args.sliding_window_size else (None, None)
-            output, _ = flash_attn_interface.flash_attn_func(query, key, value, causal=args.attn_mask != "no_mask", window_size=window_size)
+            output, _ = flash_attn_interface.flash_attn_func(
+                query,
+                key,
+                value,
+                causal=args.attn_mask != "no_mask",
+                window_size=window_size,
+                deterministic=args.deterministic_bwd,
+            )
             return output
 
     if args.sdpa_backend == "flash_attention_4" or (not args.skip_ref):
@@ -1083,7 +1192,19 @@ else:
 
         def flash_attention_4_sdpa(query, key, value):
             window_size = (args.sliding_window_size, 0) if args.sliding_window_size else (None, None)
-            output, _ = flash_attn_interface.flash_attn_func(query, key, value, causal=args.attn_mask != "no_mask", window_size=window_size)
+            kwargs = dict(
+                causal=args.attn_mask != "no_mask",
+                window_size=window_size,
+                deterministic=args.deterministic_bwd,
+            )
+            if args.fa4_num_splits is not None:
+                kwargs["num_splits"] = args.fa4_num_splits
+            output, _ = flash_attn_interface.flash_attn_func(
+                query,
+                key,
+                value,
+                **kwargs,
+            )
             return output
 
     def get_sdpa_function(backend):
@@ -1242,6 +1363,11 @@ else:
 
     first_error = True  # For suppressing error message beyond first error
     sdpa_function = get_sdpa_function(args.sdpa_backend)
+
+    # Sample SM clock throughout the benchmark window so SOL% uses the actual
+    # boost clock the kernel ran at rather than nvml's (often-stale) max.
+    _clock_sampler = _SmClockSampler()
+    _clock_sampler.start()
     for i in range(total_iters):
         # FP8/MXFP8 needs randn in bfloat16 then convert (randn doesn't support fp8 well)
         randn_dtype = torch.bfloat16 if args.data_type in ("fp8", "mxfp8") else target_dtype
@@ -1278,7 +1404,7 @@ else:
             amax_dP_gpu = torch.zeros(1, 1, 1, 1, dtype=torch.float, device=device)
 
         query, key, value = preprocess_qkv(query, key, value, args.sdpa_backend)
-        dOutput = torch.randn(query.shape, dtype=randn_dtype, device=device).to(target_dtype)
+        dOutput = torch.randn(*query.shape[:-1], head_dim_vo, dtype=randn_dtype, device=device).to(target_dtype)
 
         if args.sdpa_backend == "cudnn":
             if args.data_type == "mxfp8":
@@ -1571,6 +1697,8 @@ else:
         else:
             del query, key, value, output
 
+    _clock_sampler.stop()
+
     ## print results
     fwd_median_time = (
         np.median(np.array(forward_times[5:])) if len(forward_times) > 5 else (np.median(np.array(forward_times)) if len(forward_times) > 0 else 0.0)
@@ -1608,18 +1736,15 @@ else:
             args.sliding_window_size,
         )
 
-    # Compute MMA SOL%
+    # Compute MMA SOL% using the per-arch FLOPs/clk/SM table and the actual
+    # sampled boost clock observed during the benchmark window.
     _peak_mma_tflops = None
     try:
-        import pynvml
-
-        pynvml.nvmlInit()
-        _handle = pynvml.nvmlDeviceGetHandleByIndex(torch.cuda.current_device())
-        _max_clock_mhz = pynvml.nvmlDeviceGetMaxClockInfo(_handle, pynvml.NVML_CLOCK_SM)
-        pynvml.nvmlShutdown()
+        _flops_per_clk_per_sm = _peak_flops_per_clock_per_sm(args.data_type)
         _num_sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
-        _fma_per_clock = 8192 if args.data_type in ("fp8", "mxfp8") else 4096
-        _peak_mma_tflops = _fma_per_clock * 2 * _num_sms * _max_clock_mhz / 1e6
+        _sampled_mhz = _clock_sampler.peak_mhz()
+        if _flops_per_clk_per_sm is not None and _sampled_mhz is not None:
+            _peak_mma_tflops = _flops_per_clk_per_sm * _num_sms * _sampled_mhz / 1e6
     except Exception:
         pass
 

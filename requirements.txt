@@ -4,5 +4,5 @@ pybind11[global]>=2.13,<3
 pytest
 pytest-xdist
 looseversion
-black==26.1.0
+black==26.3.1
 clang-format==21.1.6

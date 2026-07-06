@@ -28,8 +28,13 @@
 TEST_CASE("Membound slice window with step", "[membound][slice][graph]") {
     namespace fe = cudnn_frontend;
 
-    if (!check_device_arch_newer_than("blackwell")) {
-        SKIP("TEST requires device blackwell or newer");
+#if CUDART_VERSION < 13010
+    SKIP("Test requires cuda toolkit 13.1 or above");
+    return;
+#endif
+
+    if (!is_blackwell_computing_arch()) {
+        SKIP("TensorIR MemBound engine is only supported on Blackwell (data center Blackwell)");
     }
 
 #if (CUDNN_VERSION < 92200)

@@ -9,8 +9,14 @@ from dataclasses import dataclass, field, asdict
 # fmt: off
 
 def generate_test_seeds(*, num_tests, rng_seed):
+    # Env overrides for focused/expanded sweeps without editing each suite:
+    #   MHAS_NUM_TESTS   - cap (or expand) the number of configs (e.g. small subset for sanitizer runs)
+    #   MHAS_SEED_OFFSET - shift the geometry RNG seed to explore a fresh set of configs
+    import os
+    rng_seed = rng_seed + int(os.environ.get("MHAS_SEED_OFFSET", "0"))
+    n = int(os.environ.get("MHAS_NUM_TESTS", "0")) or num_tests
     rng = random.Random(rng_seed)
-    return [(i+1, num_tests, rng.randint(65536, 2147483647)) for i in range(num_tests)]
+    return [(i+1, n, rng.randint(65536, 2147483647)) for i in range(n)]
 
 
 def get_strides_from_indices(shape, indices=[0, 1, 2, 3], gaps=[0, 0, 0, 0], rng_geom=None):
@@ -78,6 +84,10 @@ class ExecConfig:
     is_bias: bool = None
     is_block_mask: bool = None
     is_padding: bool = None
+    # When True, supply per-batch sequence lengths via cu_seq_len_q/cu_seq_len_kv
+    # (cumulative sequence-length tensors of shape (b+1, 1, 1, 1)) instead of
+    # the regular per-batch seq_len_q/seq_len_kv tensors. Implies is_padding=True.
+    is_cu_seq_len: bool = None
     is_ragged: bool = None
     is_dropout: bool = None
     is_determin: bool = None
@@ -87,6 +97,8 @@ class ExecConfig:
     with_score_sum_exp: bool = False
     with_sink_token: bool = False
     with_unfuse_fma: bool = False
+    with_rope: bool = False
+    with_ragged_offset_multiplier: bool = False
     rescale_threshold: float = None
 
     diag_align: cudnn.diagonal_alignment = None
@@ -251,8 +263,10 @@ class RandomizationContext:
         randoms_.d_qk, randoms_.d_v = randoms["d_qk_d_v"]
         randoms_.h_q, randoms_.h_k, randoms_.h_v = randoms["head_count"]
 
-        randoms_.is_ragged = randoms["is_ragged_or_padded_or_full"] == "ragged"
-        randoms_.is_padding = randoms["is_ragged_or_padded_or_full"] == "padded" or randoms["is_ragged_or_padded_or_full"] == "ragged"
+        randoms_.is_ragged = randoms["is_ragged_or_padded_or_full"] in ("ragged", "cu_ragged", "ragged_mult", "cu_ragged_mult")
+        randoms_.is_padding = randoms["is_ragged_or_padded_or_full"] in ("padded", "ragged", "cu_padded", "cu_ragged", "ragged_mult", "cu_ragged_mult")
+        randoms_.is_cu_seq_len = randoms["is_ragged_or_padded_or_full"] in ("cu_padded", "cu_ragged", "cu_ragged_mult")
+        randoms_.with_ragged_offset_multiplier = randoms["is_ragged_or_padded_or_full"] in ("ragged_mult", "cu_ragged_mult")
 
         if randoms["is_ragged_or_padded_or_full"] != "full":
             # ~10% chance of 0-length sequence for each batch
@@ -482,8 +496,15 @@ class RandomSequenceLength:
         s_kv_max: int,
         s_q_distribution: dict[Any, int],
     ):
+        # Cap sequence lengths at 1024 on SM80 (Ampere) to avoid OOMs for CI/CD.
+        if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 8:
+            s_q_max = min(s_q_max, 1024)
+            s_kv_max = min(s_kv_max, 1024)
+            s_q_min = min(s_q_min, s_q_max)
+            s_kv_min = min(s_kv_min, s_kv_max)
         self.s_q_gen = RandomIntValue(min=s_q_min, max=s_q_max)
         self.s_kv_gen = RandomIntValue(min=s_kv_min, max=s_kv_max)
+        self._s_q_max = s_q_max  # post-cap upper bound, used to clamp the s_q>s_kv branch
         self.distribution = RandomChoice(s_q_distribution)
 
     def __call__(self, rng):
@@ -496,6 +517,16 @@ class RandomSequenceLength:
             s_q = 1
         elif distribution == "s_q=s_kv":
             s_q = s_kv
+        elif distribution == "s_q>s_kv":
+            # Query longer than key/value (cross-attention, chunked prefill).
+            # The default "s_q=random" branch below structurally caps s_q<=s_kv, so
+            # this regime is otherwise never exercised. Caught class: NVBug 5829882
+            # (SDPA hang when S_Q > S_KV).
+            # Clamp to s_q_max so we don't overshoot the suite bound (esp. the SM80
+            # OOM cap) and trigger spurious torch CUDA OOM instead of testing cuDNN.
+            if s_kv < self._s_q_max:
+                s_q = min(s_kv + rng.randint(1, max(1, s_kv)), self._s_q_max)
+            # else: s_kv already at the cap -> no room for s_q>s_kv within bounds; leave s_q.
         else:
             s_q = self.s_q_gen(rng)
 

@@ -37,6 +37,8 @@
 TEST_CASE("Causal conv1d forward", "[causal_conv1d][forward]") {
 #if !HAS_SUBQUADRATIC_OPS
     SKIP("cudnn_subquadratic_ops.h not available");
+#elif defined(_MSC_VER)
+    SKIP("Causal conv1d kernels are not supported on Windows (MSVC)");
 #else
     if (is_arch_supported_by_cudnn() == false) {
         SKIP("Architecture is not supported by current cudnn version");
@@ -49,10 +51,10 @@ TEST_CASE("Causal conv1d forward", "[causal_conv1d][forward]") {
 
     cudaStream_t stream = nullptr;
 
-    Surface<half> x_tensor(batch * dim * seq_len, false);
-    Surface<half> w_tensor(dim * kernel_size, false);
-    Surface<half> bias_tensor(dim, false);
-    Surface<half> y_tensor(batch * dim * seq_len, false);
+    Surface<half> x_tensor(batch * dim * seq_len);
+    Surface<half> w_tensor(dim * kernel_size);
+    Surface<half> bias_tensor(dim);
+    Surface<half> y_tensor(batch * dim * seq_len);
 
     CUDNN_CHECK(cudnnCausalConv1dForward(stream,
                                          x_tensor.devPtr,
@@ -73,6 +75,8 @@ TEST_CASE("Causal conv1d forward", "[causal_conv1d][forward]") {
 TEST_CASE("Causal conv1d backward", "[causal_conv1d][backward]") {
 #if !HAS_SUBQUADRATIC_OPS
     SKIP("cudnn_subquadratic_ops.h not available");
+#elif defined(_MSC_VER)
+    SKIP("Causal conv1d kernels are not supported on Windows (MSVC)");
 #else
     if (is_arch_supported_by_cudnn() == false) {
         SKIP("Architecture is not supported by current cudnn version");
@@ -85,11 +89,11 @@ TEST_CASE("Causal conv1d backward", "[causal_conv1d][backward]") {
 
     cudaStream_t stream = nullptr;
 
-    Surface<half> x_tensor(batch * dim * seq_len, false);
-    Surface<half> w_tensor(dim * kernel_size, false);
-    Surface<half> bias_tensor(dim, false);
-    Surface<half> dy_tensor(batch * dim * seq_len, false);
-    Surface<half> dx_tensor(batch * dim * seq_len, false);
+    Surface<half> x_tensor(batch * dim * seq_len);
+    Surface<half> w_tensor(dim * kernel_size);
+    Surface<half> bias_tensor(dim);
+    Surface<half> dy_tensor(batch * dim * seq_len);
+    Surface<half> dx_tensor(batch * dim * seq_len);
     Surface<float> dw_tensor(dim * kernel_size, 0.0f);
     Surface<float> dbias_tensor(dim, 0.0f);
 

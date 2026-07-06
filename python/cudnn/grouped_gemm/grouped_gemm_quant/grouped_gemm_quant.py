@@ -22,7 +22,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync, tcgen05
-from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode
+from cutlass.cute.nvgpu import OperandMajorMode
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 import cutlass.utils.blackwell_helpers as sm100_utils
@@ -220,6 +220,7 @@ class BlockScaledMoEGroupedGemmQuantKernel:
 
         tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
             self.a_dtype,
+            self.b_dtype,
             self.a_major_mode,
             self.b_major_mode,
             self.sf_dtype,
@@ -229,6 +230,7 @@ class BlockScaledMoEGroupedGemmQuantKernel:
         )
         tiled_mma_sfb = sm100_utils.make_blockscaled_trivial_tiled_mma(
             self.a_dtype,
+            self.b_dtype,
             self.a_major_mode,
             self.b_major_mode,
             self.sf_dtype,
@@ -563,6 +565,7 @@ class BlockScaledMoEGroupedGemmQuantKernel:
         norm_const_tensor: Optional[cute.Tensor],
         padded_offsets: cute.Tensor,
         alpha: cute.Tensor,
+        row_scale: Optional[cute.Tensor],
         bias: Optional[cute.Tensor],
         prob: cute.Tensor,
         max_active_clusters: cutlass.Constexpr,
@@ -643,6 +646,7 @@ class BlockScaledMoEGroupedGemmQuantKernel:
         # ---- TMA atoms ----
         tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
             self.a_dtype,
+            self.b_dtype,
             self.a_major_mode,
             self.b_major_mode,
             self.sf_dtype,
@@ -652,6 +656,7 @@ class BlockScaledMoEGroupedGemmQuantKernel:
         )
         tiled_mma_sfb = sm100_utils.make_blockscaled_trivial_tiled_mma(
             self.a_dtype,
+            self.b_dtype,
             self.a_major_mode,
             self.b_major_mode,
             self.sf_dtype,
@@ -859,6 +864,7 @@ class BlockScaledMoEGroupedGemmQuantKernel:
             amax_tensor,
             padded_offsets,
             alpha,
+            row_scale,
             bias,
             prob,
             workspace_ptr,
@@ -1093,6 +1099,7 @@ class BlockScaledMoEGroupedGemmQuantKernel:
         mAmax_tensor: Optional[cute.Tensor],
         padded_offsets: cute.Tensor,
         alpha: cute.Tensor,
+        row_scale: Optional[cute.Tensor],
         mBias_nl: Optional[cute.Tensor],
         prob: cute.Tensor,
         workspace_ptr,
@@ -1195,11 +1202,11 @@ class BlockScaledMoEGroupedGemmQuantKernel:
         scheduler.internal_init()
 
         tmem = utils.TmemAllocator(
-            storage.tmem_holding_buf,
+            storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_alloc_barrier,
             allocator_warp_id=self.epilog_warp_id[0],
             is_two_cta=use_2cta_instrs,
-            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr,
+            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr.ptr,
         )
 
         if cute.size(self.cluster_shape_mn) > 1:
@@ -1309,7 +1316,7 @@ class BlockScaledMoEGroupedGemmQuantKernel:
                 bias_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.num_bias_stage)
                 tile_info_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.num_tile_stage)
                 bias_g2s_atom = cute.make_copy_atom(
-                    cute.nvgpu.cpasync.CopyG2SOp(cache_mode=cute.nvgpu.cpasync.LoadCacheMode.GLOBAL),
+                    cute.nvgpu.cpasync.CopyG2SOp(cache_mode=cute.nvgpu.LoadCacheMode.GLOBAL),
                     self.bias_dtype,
                     num_bits_per_copy=128,
                 )
@@ -1806,6 +1813,17 @@ class BlockScaledMoEGroupedGemmQuantKernel:
                 mPosition = epi_work_tile_info.tile_m_idx * self.cta_tile_shape_mnk[0] + tidx
                 real_prob, _ = epi_ext.get_gmem_tensor("prob", prob, padded_offsets, epi_work_tile_info)
                 mProb = real_prob[mPosition, 0, 0]
+                acc_scale = cutlass.Float32(alpha_val)
+                # Optional per-row epilogue scale, applied together with the
+                # per-expert alpha before output conversion.
+                if cutlass.const_expr(row_scale is not None):
+                    real_row_scale, _ = epi_ext.get_gmem_tensor(
+                        "row_scale",
+                        row_scale,
+                        padded_offsets,
+                        epi_work_tile_info,
+                    )
+                    acc_scale = acc_scale * real_row_scale[mPosition]
 
                 # C1 fix: phase-based acc stage indexing for overlapping_accum
                 if cutlass.const_expr(self.overlapping_accum):
@@ -1855,26 +1873,26 @@ class BlockScaledMoEGroupedGemmQuantKernel:
                                 )
                                 tTR_rAcc[i], tTR_rAcc[i + 1] = cute.arch.fma_packed_f32x2(
                                     (tTR_rAcc[i], tTR_rAcc[i + 1]),
-                                    (cutlass.Float32(alpha_val), cutlass.Float32(alpha_val)),
+                                    (acc_scale, acc_scale),
                                     (bias_f32_0, bias_f32_1),
                                     rnd="rn",
                                     ftz=False,
                                 )
                         else:
                             for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
-                                tTR_rAcc[i] = tTR_rAcc[i] * cutlass.Float32(alpha_val) + bias_vec[i].to(cutlass.Float32) * mProb
+                                tTR_rAcc[i] = tTR_rAcc[i] * acc_scale + bias_vec[i].to(cutlass.Float32) * mProb
                     else:
                         if cutlass.const_expr(self.vectorized_f32):
                             for i in cutlass.range_constexpr(0, cute.size(tTR_rAcc), 2):
                                 tTR_rAcc[i], tTR_rAcc[i + 1] = cute.arch.mul_packed_f32x2(
                                     (tTR_rAcc[i], tTR_rAcc[i + 1]),
-                                    (cutlass.Float32(alpha_val), cutlass.Float32(alpha_val)),
+                                    (acc_scale, acc_scale),
                                     rnd="rn",
                                     ftz=False,
                                 )
                         else:
                             for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
-                                tTR_rAcc[i] = tTR_rAcc[i] * cutlass.Float32(alpha_val)
+                                tTR_rAcc[i] = tTR_rAcc[i] * acc_scale
 
                     acc_vec = tTR_rAcc.load()
                     if cutlass.const_expr(not self.enable_bias):

@@ -276,6 +276,7 @@ def run_grouped_gemm_quant_ref(
     prob_tensor: torch.Tensor,
     aligned_group_m_list: List[int],
     valid_m: int,
+    row_scale_tensor: Optional[torch.Tensor] = None,
     generate_amax: bool = False,
     generate_sfd: bool = False,
     norm_const_tensor: Optional[torch.Tensor] = None,
@@ -315,7 +316,13 @@ def run_grouped_gemm_quant_ref(
         ref[start:end, :, 0] = ref[start:end, :, 0] * alpha_tensor[i].item()
         start = end
 
-    # Step 3: prob gating — without bias: multiply full result by prob. With bias: kernel
+    # Step 3: optional per-row epilogue scale. This intentionally scales only
+    # the GEMM accumulator path; fused bias keeps its existing bias * prob
+    # semantics.
+    if row_scale_tensor is not None:
+        ref = ref * row_scale_tensor[:valid_m].to(torch.float32).view(valid_m, 1, 1)
+
+    # Step 4: prob gating — without bias: multiply full result by prob. With bias: kernel
     # fuses (acc * alpha + bias * prob), so add bias * prob per row/expert and do not
     # multiply the GEMM part by prob again.
     if bias_ref is None:
@@ -486,6 +493,7 @@ def check_ref_grouped_gemm_quant(
         prob_tensor=inputs["prob_tensor"],
         aligned_group_m_list=inputs["aligned_group_m_list"],
         valid_m=inputs["valid_m"],
+        row_scale_tensor=inputs.get("row_scale_tensor"),
         generate_amax=(outputs.get("amax_tensor") is not None),
         generate_sfd=(outputs.get("sfd_row_tensor") is not None),
         norm_const_tensor=inputs.get("norm_const_tensor"),

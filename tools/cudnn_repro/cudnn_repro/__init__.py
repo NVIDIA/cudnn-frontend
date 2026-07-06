@@ -1,5 +1,10 @@
 """cuDNN SDPA reproducer tool."""
 
-from .__main__ import _build_cfg, _build_command, _iter_context_entries, main
 
-__all__ = ["_build_cfg", "_build_command", "_iter_context_entries", "main"]
+def main() -> None:
+    from .__main__ import main as run
+
+    run()
+
+
+__all__ = ["main"]

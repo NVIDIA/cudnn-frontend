@@ -36,8 +36,9 @@ python -m benchmark.norms.runner --config all_models
 # Dry run (show what would be executed)
 python -m benchmark.norms.runner --config llama3_8b --dry-run
 
-# Filter by backend
+# Filter by backend (cudnn, quack, pytorch, torch_compile)
 python -m benchmark.norms.runner --config all_models --backend cudnn
+python -m benchmark.norms.runner --config all_models --backend quack
 
 # Filter by data type
 python -m benchmark.norms.runner --config all_models --dtype bfloat16
@@ -176,6 +177,7 @@ runner.save_csv(results, config)
 | Backend | Description |
 |---------|-------------|
 | `cudnn` | cuDNN (native, via cuDNN Frontend) |
+| `quack` | Quack (CuTeDSL-based norm kernels) |
 | `pytorch` | PyTorch eager mode (`torch.nn.functional.rms_norm` / `layer_norm`) |
 | `torch_compile` | PyTorch with `torch.compile()` |
 

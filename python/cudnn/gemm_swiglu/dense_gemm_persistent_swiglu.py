@@ -214,6 +214,7 @@ class PersistentDenseGemmKernel:
         # Configure tiled mma
         tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.a_dtype,
+            self.b_dtype,
             self.a_major_mode,
             self.b_major_mode,
             self.acc_dtype,
@@ -372,6 +373,7 @@ class PersistentDenseGemmKernel:
 
         tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.a_dtype,
+            self.b_dtype,
             self.a_major_mode,
             self.b_major_mode,
             self.acc_dtype,
@@ -567,8 +569,8 @@ class PersistentDenseGemmKernel:
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
-        tmem_dealloc_mbar_ptr = storage.tmem_dealloc_mbar_ptr
-        tmem_holding_buf = storage.tmem_holding_buf
+        tmem_dealloc_mbar_ptr = storage.tmem_dealloc_mbar_ptr.ptr
+        tmem_holding_buf = storage.tmem_holding_buf.ptr
 
         # Initialize mainloop ab_pipeline (barrier) and states
         ab_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
@@ -1044,7 +1046,7 @@ class PersistentDenseGemmKernel:
                 #
                 # Wait for accumulator buffer full
                 #
-                acc_pipeline.consumer_wait(acc_consumer_state)  # Get for the single CGA
+                acc_pipeline.consumer_wait(acc_consumer_state)  # Get for the single cluster
                 tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
                 bSG_gAB12 = cute.group_modes(bSG_gAB12, 1, cute.rank(bSG_gAB12))
                 bSG_gC = cute.group_modes(bSG_gC, 1, cute.rank(bSG_gC))

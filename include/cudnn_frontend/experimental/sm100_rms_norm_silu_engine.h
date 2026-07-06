@@ -310,9 +310,9 @@ class Sm100RmsNormSiluEngine : public IOssNormEngine {
 
         // Add CUDA Toolkit include paths for NVRTC to resolve #include <cuda_bf16.h> etc.
         std::string cuda_include = "/usr/local/cuda/include";
-        if (auto env0 = std::getenv("CUDA_HOME")) {
+        if (auto env0 = get_environment("CUDA_HOME")) {
             cuda_include = std::string(env0) + "/include";
-        } else if (auto env1 = std::getenv("CUDA_PATH")) {
+        } else if (auto env1 = get_environment("CUDA_PATH")) {
             cuda_include = std::string(env1) + "/include";
         }
         flags.push_back("--include-path=" + cuda_include);

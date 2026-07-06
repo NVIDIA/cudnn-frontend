@@ -2,31 +2,22 @@
 
 ## Python Interface Samples
 Samples leveraging FE's Python interface are located in [samples/python](python/).
-* [01_epilogue](python/01_matmul_bias.ipynb)
-    Shows how to fuse elementwise functions to a GEMM graph.
-
-* [02_serialization](python/02_sdpa_graph_serialization.ipynb)
-    Shows how to serialize and deserialize a graph for future execution.
-
-* [03_mixed_precision](python/03_mixed_precision_matmul.ipynb)
-    Shows how to mutiply tensors of different data types.
-
 * [23_layer_norm](python/23_layernorm_with_pointwise_add_fusion.ipynb)
     Shows how to run pointwise add and layer norm fusion with intermediate bfloat16 output.
 
 * [26_layer_norm](python/26_layernorm_forward_training_and_backward_with_relu_bitmask.ipynb)
     Shows how to use layer norm with fusion pattern for relu using a bitmask.
 
-* [50_sdpa](python/50_scaled_dot_product_attention.ipynb)
+* [50_sdpa](python/50_sdpa_forward.ipynb)
     Shows how to run causal self attention with dropout in forward pass.
 
-* [51_sdpa](python/51_scaled_dot_product_attention_backward.ipynb)
+* [51_sdpa](python/51_sdpa_backward.ipynb)
     Shows how to run causal self attention in bprop.
 
-* [52_sdpa](python/52_scaled_dot_product_attention_with_paged_caches.ipynb)
+* [52_sdpa](python/52_sdpa_with_paged_caches.ipynb)
     Shows how to run scaled dot product attention (prefill phase) where the K and V caches are stored in non contiguous memory.
 
-* [53_sdpa](python/53_scaled_dot_product_attention_decode_with_paged_caches.ipynb)
+* [53_sdpa](python/53_sdpa_decode_with_paged_caches.ipynb)
     Shows how to run scaled dot product attention (decode phase) where the K and V caches are stored in non contiguous memory.
 
 ## C++ Interface Samples
@@ -124,7 +115,7 @@ Mixed precision multiplication between int8 and bf16 data-type with int8 operand
 
 Eg for layernorm training, inference and back propagation
 
-- [AdaLayerNorm](cpp/norm/adalayernorm.cpp)
+- [AdaLayerNorm](cpp/norm/adaptive_layernorm.cpp)
 
 Eg for adaptive layernorm training, inference and back propagation
 

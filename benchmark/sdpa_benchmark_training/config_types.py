@@ -132,12 +132,10 @@ class BenchmarkResult:
         num_kv_heads: Number of key/value heads
         head_dim_qk: Head dimension for Q/K
         head_dim_vo: Head dimension for V/O
-        profile_pass: Which pass was profiled
+        profile_pass: Which pass this row corresponds to ("fwd" or "bwd")
         deterministic_bwd: Whether deterministic backward was used
-        fwd_time_ms: Forward pass time in milliseconds
-        bwd_time_ms: Backward pass time in milliseconds (0 if not run)
-        fwd_tflops: Forward pass throughput in TFLOPS
-        bwd_tflops: Backward pass throughput in TFLOPS
+        time_ms: Measured time of this pass in milliseconds
+        tflops: Measured throughput of this pass in TFLOPS
         max_diff: Maximum difference vs reference (if validated)
         num_iterations: Number of iterations run
         success: Whether the benchmark completed successfully
@@ -166,11 +164,9 @@ class BenchmarkResult:
     profile_pass: str
     deterministic_bwd: bool
 
-    # Results
-    fwd_time_ms: float
-    bwd_time_ms: float
-    fwd_tflops: float
-    bwd_tflops: float
+    # Results (one row per pass)
+    time_ms: float
+    tflops: float
     max_diff: float
     num_iterations: int
 

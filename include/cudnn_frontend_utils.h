@@ -24,8 +24,10 @@
 #include <exception>
 #include <optional>
 #include <string>
+#include <algorithm>
 #include <variant>
 #include <vector>
+#include <utility>
 #include <iomanip>
 #include <sstream>
 #include <cmath>
@@ -712,6 +714,7 @@ enum class DataType_t {
     BFLOAT16,
     INT64,
     BOOLEAN,
+    BYTE_BOOLEAN,
     FP8_E4M3,
     FP8_E5M2,
     FAST_FLOAT_FOR_FP8,
@@ -737,6 +740,7 @@ NLOHMANN_JSON_SERIALIZE_ENUM(DataType_t,
                                  {DataType_t::BFLOAT16, "BFLOAT16"},
                                  {DataType_t::INT64, "INT64"},
                                  {DataType_t::BOOLEAN, "BOOLEAN"},
+                                 {DataType_t::BYTE_BOOLEAN, "BYTE_BOOLEAN"},
                                  {DataType_t::FP8_E4M3, "FP8_E4M3"},
                                  {DataType_t::FP8_E5M2, "FP8_E5M2"},
                                  {DataType_t::FAST_FLOAT_FOR_FP8, "FAST_FLOAT_FOR_FP8"},
@@ -1036,6 +1040,8 @@ get_data_type_size(DataType_t const data_type) {
         case DataType_t::FP8_E4M3:
         case DataType_t::FP8_E5M2:
             return 1;  // 8-bit float
+        case DataType_t::BYTE_BOOLEAN:
+            return 1;
         case DataType_t::NOT_SET:
         case DataType_t::BOOLEAN:
         default:
@@ -1110,6 +1116,14 @@ convert_to_cudnn_type(cudnn_frontend::DataType_t const mode, cudnnDataType_t& cu
         case DataType_t::BOOLEAN:
             cudnn_mode = CUDNN_DATA_BOOLEAN;
             return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+        case DataType_t::BYTE_BOOLEAN:
+#if (CUDNN_VERSION >= 92500)
+            NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(92500, cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE);
+            cudnn_mode = CUDNN_DATA_BYTE_BOOLEAN;
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+#else
+            return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
+#endif
         case DataType_t::FP8_E4M3:
 #if (CUDNN_VERSION >= 8600)
             NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(8600, cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE);
@@ -1701,7 +1715,7 @@ convert_to_cudnn_type(cudnn_frontend::DescriptorType_t const mode, cudnnBackendD
             return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
 #endif
         case DescriptorType_t::OPERATION_MOE_GROUPED_MATMUL_BWD_DESCRIPTOR:
-#if (CUDNN_VERSION >= 92200) && (CUDNN_VERSION < 99900)
+#if (CUDNN_VERSION >= 92200)
             NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(92200, cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE);
             cudnn_mode = CUDNN_BACKEND_OPERATION_MOE_GROUPED_MATMUL_BWD_DESCRIPTOR;
             return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
@@ -1709,7 +1723,7 @@ convert_to_cudnn_type(cudnn_frontend::DescriptorType_t const mode, cudnnBackendD
             return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
 #endif
         case DescriptorType_t::OPERATION_TRANSPOSE_DESCRIPTOR:
-#if (CUDNN_VERSION >= 92200) && (CUDNN_VERSION < 99900)
+#if (CUDNN_VERSION >= 92200)
             NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(92200, cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE);
             cudnn_mode = CUDNN_BACKEND_OPERATION_TRANSPOSE_DESCRIPTOR;
             return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
@@ -1717,7 +1731,7 @@ convert_to_cudnn_type(cudnn_frontend::DescriptorType_t const mode, cudnnBackendD
             return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
 #endif
         case DescriptorType_t::OPERATION_SLICE_DESCRIPTOR:
-#if (CUDNN_VERSION >= 92200) && (CUDNN_VERSION < 99900)
+#if (CUDNN_VERSION >= 92200)
             NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(92200, cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE);
             cudnn_mode = CUDNN_BACKEND_OPERATION_SLICE_DESCRIPTOR;
             return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
@@ -2170,12 +2184,12 @@ convert_from_cudnn_type(cudnnBackendDescriptorType_t const cudnn_mode) {
         case CUDNN_BACKEND_OPERATION_MOE_GROUPED_MATMUL_DESCRIPTOR:
             return DescriptorType_t::OPERATION_MOE_GROUPED_MATMUL_DESCRIPTOR;
 #endif
-#if (CUDNN_VERSION >= 92200) && (CUDNN_VERSION < 99900)
+#if (CUDNN_VERSION >= 92200)
         case CUDNN_BACKEND_OPERATION_MOE_GROUPED_MATMUL_BWD_DESCRIPTOR:
             return DescriptorType_t::OPERATION_MOE_GROUPED_MATMUL_BWD_DESCRIPTOR;
 #endif
 
-#if (CUDNN_VERSION >= 92200) && (CUDNN_VERSION < 99900)
+#if (CUDNN_VERSION >= 92200)
         case CUDNN_BACKEND_OPERATION_TRANSPOSE_DESCRIPTOR:
             return DescriptorType_t::OPERATION_TRANSPOSE_DESCRIPTOR;
         case CUDNN_BACKEND_OPERATION_SLICE_DESCRIPTOR:
@@ -2334,6 +2348,10 @@ convert_from_cudnn_type(cudnnDataType_t const cudnn_mode) {
             return DataType_t::INT64;
         case CUDNN_DATA_BOOLEAN:
             return DataType_t::BOOLEAN;
+#if (CUDNN_VERSION >= 92500)
+        case CUDNN_DATA_BYTE_BOOLEAN:
+            return DataType_t::BYTE_BOOLEAN;
+#endif
 #if (CUDNN_VERSION >= 8600)
         case CUDNN_DATA_FP8_E4M3:
             return DataType_t::FP8_E4M3;
@@ -2421,6 +2439,9 @@ get_element_size_in_bits(cudnn_frontend::DataType_t datatype) {
 #endif
         case DataType_t::BOOLEAN:
             return 1;
+            break;
+        case DataType_t::BYTE_BOOLEAN:
+            return 8;
             break;
         default:
             return 0;
@@ -2594,6 +2615,8 @@ std::string static get_engine_tag(ManagedOpaqueDescriptor const config) {
         return "INVALID_ENGINE_NAME_KNOB_COUNT";
     }
 
+    std::vector<std::pair<cudnnBackendKnobType_t, int64_t>> knob_choices;
+    knob_choices.reserve(static_cast<size_t>(numKnobs));
     for (size_t idx = 0; idx < static_cast<size_t>(numKnobs); ++idx) {
         const cudnnBackendDescriptor_t& knob = extractedKnobs_[idx];
         cudnnBackendKnobType_t type          = CUDNN_KNOB_TYPE_COUNTS;
@@ -2606,9 +2629,92 @@ std::string static get_engine_tag(ManagedOpaqueDescriptor const config) {
         if (status != CUDNN_STATUS_SUCCESS) {
             return "INVALID_ENGINE_NAME_KNOB_CHOICE_KNOB_VALUE";
         }
+        knob_choices.emplace_back(type, choice);
+    }
+    // Sort by knob type so the tag is a deterministic function of the engine
+    // config -- the knob-choice array order differs between the heuristics path
+    // and create_execution_plan (which iterates an unordered_map), but the
+    // engine + knob values are identical.
+    std::sort(knob_choices.begin(), knob_choices.end());
+    for (auto const& [type, choice] : knob_choices) {
         tag << "_k" << type << "=" << choice;
     }
     return tag.str();
+}
+
+// Structured counterpart of get_engine_tag(): engine global index + (knob type,
+// value) choices instead of a formatted string. Reads the same backend attributes.
+cudnnStatus_t static get_engine_id_and_knobs(ManagedOpaqueDescriptor const config,
+                                             int64_t& engineId,
+                                             std::vector<std::pair<cudnnBackendKnobType_t, int64_t>>& knobs) {
+    engineId = -1;
+    knobs.clear();
+
+    ManagedOpaqueDescriptor extractedEngine = make_shared_backend_pointer(CUDNN_BACKEND_ENGINE_DESCRIPTOR);
+    if (extractedEngine->get_status() != CUDNN_STATUS_SUCCESS) {
+        return extractedEngine->get_status();
+    }
+    cudnnBackendDescriptor_t extractedEngine_ = extractedEngine->get_backend_descriptor();
+
+    int64_t elemCount = 0;
+    auto status       = detail::get_attribute(config->get_backend_descriptor(),
+                                        CUDNN_ATTR_ENGINECFG_ENGINE,
+                                        CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                        1,
+                                        &elemCount,
+                                        &extractedEngine_);
+    if (status != CUDNN_STATUS_SUCCESS) {
+        return status;
+    }
+
+    std::array<ManagedOpaqueDescriptor, CUDNN_KNOB_TYPE_COUNTS> extractedKnobs{{nullptr}};
+    for (auto& knob : extractedKnobs) {
+        knob = make_shared_backend_pointer(CUDNN_BACKEND_KNOB_CHOICE_DESCRIPTOR);
+        if (knob->get_status() != CUDNN_STATUS_SUCCESS) {
+            return knob->get_status();
+        }
+    }
+    std::array<cudnnBackendDescriptor_t, CUDNN_KNOB_TYPE_COUNTS> extractedKnobs_{{nullptr}};
+    for (std::uint32_t i = 0; i < extractedKnobs.size(); i++) {
+        extractedKnobs_[i] = extractedKnobs[i]->get_backend_descriptor();
+    }
+
+    status = detail::get_attribute(
+        extractedEngine_, CUDNN_ATTR_ENGINE_GLOBAL_INDEX, CUDNN_TYPE_INT64, 1, &elemCount, &engineId);
+    if (status != CUDNN_STATUS_SUCCESS) {
+        return status;
+    }
+
+    int64_t numKnobs = 0;
+    status           = detail::get_attribute(config->get_backend_descriptor(),
+                                   CUDNN_ATTR_ENGINECFG_KNOB_CHOICES,
+                                   CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                   CUDNN_KNOB_TYPE_COUNTS,
+                                   &numKnobs,
+                                   &(extractedKnobs_[0]));
+    if (status != CUDNN_STATUS_SUCCESS) {
+        return status;
+    }
+    if (numKnobs > CUDNN_KNOB_TYPE_COUNTS) {
+        return CUDNN_STATUS_NOT_SUPPORTED;
+    }
+
+    knobs.reserve(static_cast<size_t>(numKnobs));
+    for (size_t idx = 0; idx < static_cast<size_t>(numKnobs); ++idx) {
+        const cudnnBackendDescriptor_t& knob = extractedKnobs_[idx];
+        cudnnBackendKnobType_t type          = CUDNN_KNOB_TYPE_COUNTS;
+        int64_t choice                       = -2;
+        status = detail::get_attribute(knob, CUDNN_ATTR_KNOB_CHOICE_KNOB_TYPE, CUDNN_TYPE_KNOB_TYPE, 1, nullptr, &type);
+        if (status != CUDNN_STATUS_SUCCESS) {
+            return status;
+        }
+        status = detail::get_attribute(knob, CUDNN_ATTR_KNOB_CHOICE_KNOB_VALUE, CUDNN_TYPE_INT64, 1, nullptr, &choice);
+        if (status != CUDNN_STATUS_SUCCESS) {
+            return status;
+        }
+        knobs.emplace_back(type, choice);
+    }
+    return CUDNN_STATUS_SUCCESS;
 }
 
 }  // namespace detail

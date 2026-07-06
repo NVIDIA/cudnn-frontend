@@ -25,6 +25,7 @@ add_executable(
     validate.cpp
     version.cpp
     tensor.cpp
+    get_engine_and_knobs.cpp
 )
 
 if (MSVC)

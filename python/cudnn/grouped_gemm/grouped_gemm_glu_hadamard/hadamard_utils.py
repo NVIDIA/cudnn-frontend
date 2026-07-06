@@ -8,7 +8,8 @@ import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cute.nvgpu import tcgen05
-from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode, OperandSource
+from cutlass.cute.nvgpu import OperandMajorMode
+from cutlass.cute.nvgpu.tcgen05 import OperandSource
 import torch
 
 HADAMARD_SIZE = 16
@@ -19,6 +20,7 @@ M_PER_CLUSTER = 256
 @cute.jit
 def hadamard_setup(g_hadamard, s_hadamard, tidx):
     tiled_hmma = sm100_utils.make_trivial_tiled_mma(
+        cutlass.BFloat16,
         cutlass.BFloat16,
         OperandMajorMode.K,
         OperandMajorMode.K,
@@ -91,6 +93,38 @@ def hadamard_in(rmem_src: cute.Tensor, cols: cutlass.Constexpr, tmem_ptr, tidx):
 
 
 @cute.jit
+def hadamard_transpose_in(sD, d_buffer, feature_offset: cutlass.Constexpr, tmem_ptr, tidx):
+    tmem_ptr = cute.make_ptr(
+        cutlass.Float32,
+        tmem_ptr.toint(),
+        cute.AddressSpace.tmem,
+        assumed_align=8,
+    )
+    tmem_tensor = cute.make_tensor(
+        tmem_ptr,
+        cute.make_layout((128, HADAMARD_SIZE), stride=(TMEM_ROW_STRIDE, 1)),
+    )
+
+    st_atom = cute.make_copy_atom(tcgen05.St32x32bOp(tcgen05.Repetition.x16), cutlass.Float32)
+    tiled_st = tcgen05.make_tmem_copy(st_atom, tmem_tensor)
+    thr_st = tiled_st.get_slice(tidx)
+
+    cT = cute.make_identity_tensor((128, HADAMARD_SIZE))
+    t_c_st = thr_st.partition_S(cT)
+    rmem_src = cute.make_rmem_tensor(t_c_st.shape, cutlass.BFloat16)
+    for i in cutlass.range_constexpr(cute.size(rmem_src)):
+        row = cute.get(t_c_st[i], mode=[0])
+        token_offset = cute.get(t_c_st[i], mode=[1])
+        token_block = row // HADAMARD_SIZE
+        feature = (row % HADAMARD_SIZE) + feature_offset
+        token = token_block * HADAMARD_SIZE + token_offset
+        rmem_src[i] = sD[(token, feature, d_buffer)].to(cutlass.BFloat16)
+
+    t_d_st = thr_st.partition_D(tmem_tensor)
+    cute.copy(thr_st, cute.recast_tensor(rmem_src, cutlass.Float32), t_d_st)
+
+
+@cute.jit
 def hadamard_out(rmem_dst: cute.Tensor, cols: cutlass.Constexpr, tmem_ptr, tidx):
     tmem_ptr = cute.make_ptr(
         cutlass.Float32,
@@ -120,6 +154,84 @@ def hadamard_out(rmem_dst: cute.Tensor, cols: cutlass.Constexpr, tmem_ptr, tidx)
         t_d_ld_.layout,
     )
     cute.copy(thr_ld, t_d_ld, cute.recast_tensor(rmem_dst, cutlass.Float32))
+
+
+@cute.jit
+def hadamard_transpose_out_amax(tmem_ptr, tidx, amax_fp32):
+    tmem_ptr = cute.make_ptr(
+        cutlass.Float32,
+        tmem_ptr.toint(),
+        cute.AddressSpace.tmem,
+        assumed_align=8,
+    )
+    tmem_tensor = cute.make_tensor(
+        tmem_ptr,
+        cute.make_layout((128, HADAMARD_SIZE), stride=(TMEM_ROW_STRIDE, 1)),
+    )
+
+    ld_atom = cute.make_copy_atom(tcgen05.Ld32x32bOp(tcgen05.Repetition.x16), cutlass.Float32)
+    tiled_ld = tcgen05.make_tmem_copy(ld_atom, tmem_tensor)
+    thr_ld = tiled_ld.get_slice(tidx)
+    t_d_ld_ = thr_ld.partition_D(tmem_tensor)
+    t_d_ld = cute.make_tensor(
+        cute.make_ptr(
+            cutlass.Float32,
+            t_d_ld_.iterator.toint(),
+            cute.AddressSpace.tmem,
+            assumed_align=8,
+        ),
+        t_d_ld_.layout,
+    )
+    rmem_dst = cute.make_rmem_tensor(t_d_ld.shape, cutlass.Float32)
+    cute.copy(thr_ld, t_d_ld, rmem_dst)
+
+    import cutlass._mlir.dialects.math as _math
+
+    for i in cutlass.range_constexpr(cute.size(rmem_dst)):
+        abs_val = cutlass.Float32(_math.absf(rmem_dst[i].ir_value()))
+        amax_fp32 = cute.arch.fmax(amax_fp32, abs_val)
+    return amax_fp32
+
+
+@cute.jit
+def hadamard_smem_transpose_fwht_amax(sD, d_buffer, feature_offset: cutlass.Constexpr, tidx, amax_fp32):
+    token_block = tidx // HADAMARD_SIZE
+    feature = (tidx % HADAMARD_SIZE) + feature_offset
+    token_base = token_block * HADAMARD_SIZE
+
+    rmem_vals = cute.make_rmem_tensor((HADAMARD_SIZE,), cutlass.Float32)
+    for i in cutlass.range_constexpr(HADAMARD_SIZE):
+        rmem_vals[i] = sD[(token_base + i, feature, d_buffer)].to(cutlass.BFloat16).to(cutlass.Float32)
+
+    for base in cutlass.range_constexpr(0, HADAMARD_SIZE, 2):
+        x = rmem_vals[base]
+        y = rmem_vals[base + 1]
+        rmem_vals[base] = x + y
+        rmem_vals[base + 1] = x - y
+    for base in cutlass.range_constexpr(0, HADAMARD_SIZE, 4):
+        for i in cutlass.range_constexpr(2):
+            x = rmem_vals[base + i]
+            y = rmem_vals[base + i + 2]
+            rmem_vals[base + i] = x + y
+            rmem_vals[base + i + 2] = x - y
+    for base in cutlass.range_constexpr(0, HADAMARD_SIZE, 8):
+        for i in cutlass.range_constexpr(4):
+            x = rmem_vals[base + i]
+            y = rmem_vals[base + i + 4]
+            rmem_vals[base + i] = x + y
+            rmem_vals[base + i + 4] = x - y
+    for i in cutlass.range_constexpr(8):
+        x = rmem_vals[i]
+        y = rmem_vals[i + 8]
+        rmem_vals[i] = x + y
+        rmem_vals[i + 8] = x - y
+
+    import cutlass._mlir.dialects.math as _math
+
+    for i in cutlass.range_constexpr(HADAMARD_SIZE):
+        abs_val = cutlass.Float32(_math.absf(rmem_vals[i].ir_value()))
+        amax_fp32 = cute.arch.fmax(amax_fp32, abs_val)
+    return amax_fp32
 
 
 def hadamard_matrix(n, dtype=None, device=None):

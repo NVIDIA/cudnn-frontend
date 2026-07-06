@@ -149,6 +149,8 @@ class INode {
         ADALAYERNORM,
         DADALAYERNORM,
         SDPA,
+        ROPE,
+        ROPE_BWD,
         MOE_GROUPED_MATMUL,
         MOE_GROUPED_MATMUL_BWD,
         DIAGONAL_BAND_MASK,
@@ -207,6 +209,12 @@ class INode {
 
     void
     reduction(std::shared_ptr<Tensor_attributes> a,
+              Reduction_attributes attributes,
+              std::shared_ptr<Tensor_attributes> c);
+
+    void
+    reduction(std::shared_ptr<Tensor_attributes> a,
+              std::shared_ptr<Tensor_attributes> group_offset,
               Reduction_attributes attributes,
               std::shared_ptr<Tensor_attributes> c);
 
@@ -402,6 +410,9 @@ class INode {
                                                  Pointwise_attributes);
 
     std::shared_ptr<Tensor_attributes> reduction(std::shared_ptr<Tensor_attributes>, Reduction_attributes);
+    std::shared_ptr<Tensor_attributes> reduction(std::shared_ptr<Tensor_attributes>,
+                                                 std::shared_ptr<Tensor_attributes>,
+                                                 Reduction_attributes);
     std::array<std::shared_ptr<Tensor_attributes>, 2> resample(std::shared_ptr<Tensor_attributes>, Resample_attributes);
     std::shared_ptr<Tensor_attributes> reshape(std::shared_ptr<Tensor_attributes>, Reshape_attributes);
     std::shared_ptr<Tensor_attributes> transpose(std::shared_ptr<Tensor_attributes>, Transpose_attributes);
@@ -416,6 +427,8 @@ class INode {
                        std::shared_ptr<Tensor_attributes> b,
                        std::shared_ptr<Tensor_attributes> seq_len_q,
                        std::shared_ptr<Tensor_attributes> seq_len_kv,
+                       std::shared_ptr<Tensor_attributes> cu_seq_len_q,
+                       std::shared_ptr<Tensor_attributes> cu_seq_len_kv,
                        std::shared_ptr<Tensor_attributes> left_bound,
                        std::shared_ptr<Tensor_attributes> shift_right_bound,
                        DiagonalBandMask_attributes attributes);

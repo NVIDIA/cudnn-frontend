@@ -53,7 +53,7 @@ from typing import Tuple, Optional
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode
+from cutlass.cute.nvgpu import OperandMajorMode
 from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
 from cudnn.datatypes import _convert_to_cutlass_data_type
@@ -137,6 +137,10 @@ class GroupedGemmDgluSm100(APIBase):
         b_major: str = "k",
         epilogue_op: Optional[str] = None,
         use_dynamic_sched: bool = False,
+        linear_offset: Optional[float] = None,
+        geglu_alpha: float = 1.702,
+        glu_clamp_max: float = 7.0,
+        glu_clamp_min: float = -7.0,
     ):
         """Initialize the GroupedGemmDgluSm100 API.
 
@@ -171,6 +175,15 @@ class GroupedGemmDgluSm100(APIBase):
         :param b_major: Major dimension for B tensor, one of "k" or "n"
         :param epilogue_op: Optional epilogue operation. Valid: None, "none", "identity", "relu", "srelu"
         :param use_dynamic_sched: Enable dynamic tile scheduling for load balancing
+        :param linear_offset: Compile-time linear offset for dGeGLU. When None,
+            defaults to 1.0 for dGeGLU and 0.0 for dSwiGLU.
+            Ignored when ``act_func == "dswiglu"``.
+        :param geglu_alpha: Compile-time dGeGLU GeGLU alpha. Ignored when
+            ``act_func == "dswiglu"``.
+        :param glu_clamp_max: Compile-time dGeGLU upper clamp. Ignored when
+            ``act_func == "dswiglu"``.
+        :param glu_clamp_min: Compile-time dGeGLU lower clamp. Ignored when
+            ``act_func == "dswiglu"``.
         """
         super().__init__()
 
@@ -254,6 +267,13 @@ class GroupedGemmDgluSm100(APIBase):
             raise ValueError(f"Invalid epilogue operation: {epilogue_op}. " f"Valid values: None, 'none', 'identity', 'relu', 'srelu'")
 
         self.use_dynamic_sched = use_dynamic_sched
+        if linear_offset is None:
+            self.linear_offset = 1.0 if self.act_func == "dgeglu" else 0.0
+        else:
+            self.linear_offset = float(linear_offset)
+        self.geglu_alpha = geglu_alpha
+        self.glu_clamp_max = glu_clamp_max
+        self.glu_clamp_min = glu_clamp_min
 
         self._interpret_uint8_as_fp4x2 = True
         self._has_dbias = self.dbias_desc is not None
@@ -853,10 +873,8 @@ class GroupedGemmDgluSm100(APIBase):
                     stride=(16, 4, stride_sfd_rest_m, 1, 512, stride_sfd_n_out),
                 )
 
-        # Compile with keyword args (dense mode uses the unified __call__ positional order)
+        # Compile with keyword args (dense mode uses the unified __call__ positional order).
         dbias_fake = self._make_fake_cute_tensor_from_desc(self.dbias_desc, assumed_align=16)
-
-        cached_linear_offset = cutlass.Float32(1.0 if self.act_func == "dgeglu" else 0.0)
 
         _compiled_kernel = cute.compile(
             gemm_dglu,
@@ -882,10 +900,13 @@ class GroupedGemmDgluSm100(APIBase):
             prob=prob_cute_fake,
             dprob=dprob_cute_fake,
             dbias_tensor=dbias_fake,
-            linear_offset=cached_linear_offset,
             max_active_clusters=max_active_clusters,
             stream=fake_stream,
             epilogue_op=self.epilogue_op,
+            linear_offset=self.linear_offset,
+            geglu_alpha=self.geglu_alpha,
+            glu_clamp_max=self.glu_clamp_max,
+            glu_clamp_min=self.glu_clamp_min,
             options="--enable-tvm-ffi",
         )
 
@@ -934,7 +955,6 @@ class GroupedGemmDgluSm100(APIBase):
                 beta_tensor,
                 prob_tensor,
                 dprob_tensor,
-                cached_linear_offset,
                 dbias_tensor,
                 stream,
             )
@@ -1041,37 +1061,38 @@ class GroupedGemmDgluSm100(APIBase):
 
         workspace_ptr_cute = from_dlpack(self._workspace, assumed_align=128).iterator
 
-        cached_linear_offset = cutlass.Float32(1.0 if self.act_func == "dgeglu" else 0.0)
-
         self._logger.debug("Compiling discrete grouped GEMM dGLU kernel")
         _compiled_kernel = cute.compile(
             gemm_dglu,
-            a_tensor,
-            b_ptrs_cute,
-            sfb_ptrs_cute,
-            cutlass.Int32(n),
-            cutlass.Int32(k),
-            cutlass.Int64(b_stride_size),
-            b_major_mode,
-            workspace_ptr_cute,
-            c_tensor,
-            d_row_tensor,
-            d_col_tensor,
-            sfa_tensor,
-            sfd_row_tensor,
-            sfd_col_tensor,
-            amax_tensor,
-            norm_const_tensor_cute,
-            padded_offsets_tensor,
-            alpha_tensor,
-            beta_tensor,
-            prob_tensor,
-            dprob_tensor,
-            cached_linear_offset,
-            dbias_tensor,
-            max_active_clusters,
-            fake_stream,
-            self.epilogue_op,
+            a=a_tensor,
+            b=b_ptrs_cute,
+            sfb=sfb_ptrs_cute,
+            n=cutlass.Int32(n),
+            k=cutlass.Int32(k),
+            b_stride_size=cutlass.Int64(b_stride_size),
+            b_major_mode=b_major_mode,
+            workspace_ptr=workspace_ptr_cute,
+            c=c_tensor,
+            d=d_row_tensor,
+            d_col=d_col_tensor,
+            sfa=sfa_tensor,
+            sfd_row_tensor=sfd_row_tensor,
+            sfd_col_tensor=sfd_col_tensor,
+            amax_tensor=amax_tensor,
+            norm_const_tensor=norm_const_tensor_cute,
+            padded_offsets=padded_offsets_tensor,
+            alpha=alpha_tensor,
+            beta=beta_tensor,
+            prob=prob_tensor,
+            dprob=dprob_tensor,
+            dbias_tensor=dbias_tensor,
+            max_active_clusters=max_active_clusters,
+            stream=fake_stream,
+            epilogue_op=self.epilogue_op,
+            linear_offset=self.linear_offset,
+            geglu_alpha=self.geglu_alpha,
+            glu_clamp_max=self.glu_clamp_max,
+            glu_clamp_min=self.glu_clamp_min,
             options="--enable-tvm-ffi",
         )
 
@@ -1130,7 +1151,6 @@ class GroupedGemmDgluSm100(APIBase):
                 beta_tensor,
                 prob_tensor,
                 dprob_tensor,
-                cached_linear_offset,
                 dbias_tensor,
                 stream,
             )
@@ -1296,6 +1316,10 @@ def grouped_gemm_dglu_wrapper_sm100(
     m_aligned: int = 256,
     discrete_col_sfd: bool = False,
     act_func: str = "dswiglu",
+    linear_offset: Optional[float] = None,
+    geglu_alpha: float = 1.702,
+    glu_clamp_max: float = 7.0,
+    glu_clamp_min: float = -7.0,
     epilogue_op: Optional[str] = None,
     use_dynamic_sched: bool = False,
     current_stream: Optional[cuda.CUstream] = None,
@@ -1338,6 +1362,22 @@ def grouped_gemm_dglu_wrapper_sm100(
         m_aligned: M alignment (must be 256)
         discrete_col_sfd: Generate discrete col-major scale factor tensor
         act_func: Activation function ("dswiglu" or "dgeglu")
+        linear_offset: Linear offset matching the forward GeGLU activation, i.e.
+            the same value used by ``grouped_gemm_glu_wrapper_sm100`` so the
+            backward gradients are mathematically consistent. Affects
+            ``act_func == "dgeglu"``; ignored when ``act_func == "dswiglu"``.
+            When ``None`` (default), the offset is chosen based on ``act_func``
+            for backwards compatibility: ``1.0`` for ``"dgeglu"`` and ``0.0``
+            for ``"dswiglu"``.
+        geglu_alpha: Pre-sigmoid scaling factor for the GeGLU activation being
+            differentiated. Must match the value used in the forward.
+            Default ``1.702``. Ignored when ``act_func == "dswiglu"``.
+        glu_clamp_max: Upper clamp limit applied to ``up`` and ``gate`` in the
+            forward GeGLU; the same limit drives the gradient mask here.
+            Default ``7.0``. Ignored when ``act_func == "dswiglu"``.
+        glu_clamp_min: Lower clamp limit applied to ``up`` only in the forward
+            GeGLU; the same limit drives the gradient mask here.
+            Default ``-7.0``. Ignored when ``act_func == "dswiglu"``.
         epilogue_op: Optional epilogue operation. Valid: None, "none", "identity", "relu", "srelu"
         use_dynamic_sched: Enable dynamic tile scheduling for load balancing
         current_stream: CUDA stream
@@ -1347,6 +1387,19 @@ def grouped_gemm_dglu_wrapper_sm100(
             dbias_tensor, amax_tensor, sfd_row_tensor, sfd_col_tensor
     """
     from cudnn.discrete_grouped_gemm.discrete_kernel_utils import _require_pointer_tensor
+
+    # Resolve linear_offset default: None means "use the activation-derived
+    # default" (1.0 for dgeglu, 0.0 for dswiglu).
+    if linear_offset is None:
+        linear_offset = 1.0 if act_func == "dgeglu" else 0.0
+    dgeglu_cache_signature = None
+    if act_func == "dgeglu":
+        dgeglu_cache_signature = (
+            float(linear_offset),
+            float(geglu_alpha),
+            float(glu_clamp_max),
+            float(glu_clamp_min),
+        )
 
     # ---- Auto-detect weight mode ----
     is_dense = b_tensor is not None
@@ -1452,6 +1505,7 @@ def grouped_gemm_dglu_wrapper_sm100(
         cache_key = (
             weight_mode,
             act_func,
+            dgeglu_cache_signature,
             epilogue_op,
             use_full_dynamic,
             a_tensor.shape[1:] if not use_full_dynamic else None,
@@ -1495,6 +1549,7 @@ def grouped_gemm_dglu_wrapper_sm100(
         cache_key = (
             weight_mode,
             act_func,
+            dgeglu_cache_signature,
             epilogue_op,
             *dynamic_m_tensor_signature(a_tensor, tuple(a_tensor.shape[1:]), dynamic_stride_dims=(2,)),
             b_shape,
@@ -1565,6 +1620,10 @@ def grouped_gemm_dglu_wrapper_sm100(
                 act_func=act_func,
                 epilogue_op=epilogue_op,
                 use_dynamic_sched=use_dynamic_sched,
+                linear_offset=linear_offset,
+                geglu_alpha=geglu_alpha,
+                glu_clamp_max=glu_clamp_max,
+                glu_clamp_min=glu_clamp_min,
             )
         else:
             api = GroupedGemmDgluSm100(
@@ -1597,6 +1656,10 @@ def grouped_gemm_dglu_wrapper_sm100(
                 b_major=b_major,
                 epilogue_op=epilogue_op,
                 use_dynamic_sched=use_dynamic_sched,
+                linear_offset=linear_offset,
+                geglu_alpha=geglu_alpha,
+                glu_clamp_max=glu_clamp_max,
+                glu_clamp_min=glu_clamp_min,
             )
 
         if not api.check_support():

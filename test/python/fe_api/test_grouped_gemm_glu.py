@@ -1301,3 +1301,514 @@ def _test_grouped_gemm_glu_discrete_wrapper_dynamic_m_cache_behavior(request, mo
         grouped_gemm_glu_api._cache_of_GroupedGemmGluSm100Objects.clear()
 
     return compile_count["value"], cache_entries
+
+
+# ---------------------------------------------------------------------------
+#  Linear-offset plumbing tests (act_func="geglu")
+# ---------------------------------------------------------------------------
+#
+# These tests verify that ``linear_offset`` is correctly threaded through the
+# wrapper / class API down to the kernel. The kernel computes
+#     d = (clamp(up, min=-7, max=7) + linear_offset) * silu_scaled(gate') * prob
+# where ``gate' = clamp(gate, max=7)``,
+# ``silu_scaled(x) = x * sigmoid(1.702 * x)``, and ``up`` / ``gate`` are taken
+# from interleaved 32-column blocks of the GEMM output ``c_tensor``.
+# Therefore, with the same inputs:
+#     d(linear_offset=L) - d(linear_offset=0) = L * silu_scaled(gate') * prob
+# We use this identity (rather than recomputing the full GeGLU reference) to
+# avoid duplicating the existing reference infrastructure and to keep the
+# tests cheap.
+
+
+def _interleaved_gate_up_from_c(c_tensor: torch.Tensor) -> "tuple[torch.Tensor, torch.Tensor]":
+    """Extract gate / up halves from the GEMM intermediate ``c_tensor``.
+
+    The kernel splits ``c`` along the N dimension into 32-column blocks and
+    treats even-indexed blocks as ``gate`` and odd-indexed blocks as ``up``
+    (matching the activation reference in ``test_grouped_gemm_swiglu_utils``).
+    ``c_tensor`` is expected to have shape ``(valid_m, n, 1)``.
+    """
+
+    _, n, last_dim = c_tensor.shape
+    group = 32
+    assert last_dim == 1
+    assert n % group == 0 and (n // group) % 2 == 0
+    cols = torch.arange(n, device=c_tensor.device)
+    block_cols = cols.view(n // group, group)
+    gate_idx = block_cols[0::2].reshape(-1)
+    up_idx = block_cols[1::2].reshape(-1)
+    return c_tensor.index_select(1, gate_idx), c_tensor.index_select(1, up_idx)
+
+
+def _expected_geglu_offset_delta(
+    c_tensor: torch.Tensor,
+    prob_tensor: torch.Tensor,
+    linear_offset: float,
+    glu_clamp_max: float = 7.0,
+) -> torch.Tensor:
+    """Return ``L * silu_scaled(clamp(gate)) * prob`` matching the kernel."""
+
+    gate, _ = _interleaved_gate_up_from_c(c_tensor.float())
+    gate = torch.clamp(gate, max=glu_clamp_max)
+    n_out = gate.shape[1]
+    silu_scaled = gate * torch.sigmoid(1.702 * gate)
+    prob_expanded = prob_tensor.float().expand(-1, n_out, -1)
+    return linear_offset * silu_scaled * prob_expanded
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+@pytest.mark.parametrize("linear_offset", [0.0, 0.5, 1.0])
+def test_grouped_gemm_glu_discrete_wrapper_linear_offset_geglu(linear_offset, request):
+    """Parity test: ``linear_offset`` reaches the kernel for the geglu activation.
+
+    The wrapper is invoked twice with the same inputs but different
+    ``linear_offset`` values; the difference between the two output ``d``
+    tensors must match ``linear_offset * silu_scaled(gate) * prob``, where
+    ``gate`` is read back from the intermediate ``c`` tensor.
+    """
+    try:
+        from cudnn import grouped_gemm_glu_wrapper_sm100
+        from cuda.bindings import driver as cuda
+    except ImportError:
+        pytest.skip("cudnn optional dependencies not installed")
+
+    cfg = discrete_grouped_gemm_init(
+        request=request,
+        ab_dtype=torch.float4_e2m1fn_x2,
+        c_dtype=torch.bfloat16,
+        d_dtype=torch.float32,
+        cd_major="n",
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=32,
+        sf_dtype=torch.float8_e8m0fnu,
+        vector_f32=False,
+        discrete_col_sfd=False,
+        act_func="geglu",
+        b_major="k",
+    )
+
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+    inputs = allocate_discrete_input_tensors(
+        n=cfg["n"],
+        k=cfg["k"],
+        num_experts=cfg["l"],
+        group_m_list=cfg["group_m_list"],
+        ab_dtype=cfg["ab_dtype"],
+        sf_dtype=cfg["sf_dtype"],
+        sf_vec_size=cfg["sf_vec_size"],
+        m_aligned=cfg["m_aligned"],
+        b_major=cfg["b_major"],
+    )
+
+    common_kwargs = dict(
+        a_tensor=inputs["a_tensor"],
+        sfa_tensor=inputs["sfa_tensor"],
+        padded_offsets=inputs["padded_offsets_tensor"],
+        alpha_tensor=inputs["alpha_tensor"],
+        b_ptrs=inputs["b_ptrs_tensor"],
+        sfb_ptrs=inputs["sfb_ptrs_tensor"],
+        n=cfg["n"],
+        b_dtype=inputs["b_list"][0].dtype,
+        b_major=cfg["b_major"],
+        norm_const_tensor=inputs.get("norm_const_tensor"),
+        prob_tensor=inputs.get("prob_tensor"),
+        acc_dtype=cfg["acc_dtype"],
+        c_dtype=cfg["c_dtype"],
+        d_dtype=cfg["d_dtype"],
+        cd_major=cfg["cd_major"],
+        mma_tiler_mn=cfg["mma_tiler_mn"],
+        cluster_shape_mn=cfg["cluster_shape_mn"],
+        sf_vec_size=cfg["sf_vec_size"],
+        vector_f32=cfg["vector_f32"],
+        m_aligned=cfg["m_aligned"],
+        discrete_col_sfd=cfg["discrete_col_sfd"],
+        act_func="geglu",
+        current_stream=stream,
+    )
+
+    try:
+        out_zero = grouped_gemm_glu_wrapper_sm100(linear_offset=0.0, **common_kwargs)
+        out_offset = grouped_gemm_glu_wrapper_sm100(linear_offset=linear_offset, **common_kwargs)
+    except (ValueError, NotImplementedError) as e:
+        pytest.skip(f"Unsupported testcase: {e}")
+
+    torch.cuda.synchronize()
+
+    valid_m = inputs["valid_m"]
+    d_zero = out_zero["d_tensor"][:valid_m].float()
+    d_offset = out_offset["d_tensor"][:valid_m].float()
+
+    expected_delta = _expected_geglu_offset_delta(
+        c_tensor=out_zero["c_tensor"][:valid_m],
+        prob_tensor=inputs["prob_tensor"][:valid_m],
+        linear_offset=linear_offset,
+    )
+
+    actual_delta = d_offset - d_zero
+    torch.testing.assert_close(actual_delta.cpu(), expected_delta.cpu(), atol=1e-1, rtol=1e-2)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_grouped_gemm_glu_discrete_wrapper_linear_offset_default_geglu_is_one(request):
+    """Default ``linear_offset=None`` must reproduce ``linear_offset=1.0`` for geglu.
+
+    This guards the documented backwards-compatibility behavior: callers that
+    do not pass ``linear_offset`` continue to get the legacy
+    ``1.0 if act_func == "geglu" else 0.0`` value.
+    """
+    try:
+        from cudnn import grouped_gemm_glu_wrapper_sm100
+        from cuda.bindings import driver as cuda
+    except ImportError:
+        pytest.skip("cudnn optional dependencies not installed")
+
+    cfg = discrete_grouped_gemm_init(
+        request=request,
+        ab_dtype=torch.float4_e2m1fn_x2,
+        c_dtype=torch.bfloat16,
+        d_dtype=torch.float32,
+        cd_major="n",
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=32,
+        sf_dtype=torch.float8_e8m0fnu,
+        vector_f32=False,
+        discrete_col_sfd=False,
+        act_func="geglu",
+        b_major="k",
+    )
+
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    inputs = allocate_discrete_input_tensors(
+        n=cfg["n"],
+        k=cfg["k"],
+        num_experts=cfg["l"],
+        group_m_list=cfg["group_m_list"],
+        ab_dtype=cfg["ab_dtype"],
+        sf_dtype=cfg["sf_dtype"],
+        sf_vec_size=cfg["sf_vec_size"],
+        m_aligned=cfg["m_aligned"],
+        b_major=cfg["b_major"],
+    )
+
+    common_kwargs = dict(
+        a_tensor=inputs["a_tensor"],
+        sfa_tensor=inputs["sfa_tensor"],
+        padded_offsets=inputs["padded_offsets_tensor"],
+        alpha_tensor=inputs["alpha_tensor"],
+        b_ptrs=inputs["b_ptrs_tensor"],
+        sfb_ptrs=inputs["sfb_ptrs_tensor"],
+        n=cfg["n"],
+        b_dtype=inputs["b_list"][0].dtype,
+        b_major=cfg["b_major"],
+        norm_const_tensor=inputs.get("norm_const_tensor"),
+        prob_tensor=inputs.get("prob_tensor"),
+        acc_dtype=cfg["acc_dtype"],
+        c_dtype=cfg["c_dtype"],
+        d_dtype=cfg["d_dtype"],
+        cd_major=cfg["cd_major"],
+        mma_tiler_mn=cfg["mma_tiler_mn"],
+        cluster_shape_mn=cfg["cluster_shape_mn"],
+        sf_vec_size=cfg["sf_vec_size"],
+        vector_f32=cfg["vector_f32"],
+        m_aligned=cfg["m_aligned"],
+        discrete_col_sfd=cfg["discrete_col_sfd"],
+        act_func="geglu",
+        current_stream=stream,
+    )
+
+    try:
+        out_default = grouped_gemm_glu_wrapper_sm100(**common_kwargs)
+        out_one = grouped_gemm_glu_wrapper_sm100(linear_offset=1.0, **common_kwargs)
+    except (ValueError, NotImplementedError) as e:
+        pytest.skip(f"Unsupported testcase: {e}")
+
+    torch.cuda.synchronize()
+    valid_m = inputs["valid_m"]
+    torch.testing.assert_close(
+        out_default["d_tensor"][:valid_m].float().cpu(),
+        out_one["d_tensor"][:valid_m].float().cpu(),
+        atol=0.0,
+        rtol=0.0,
+    )
+
+
+# ---------------------------------------------------------------------------
+#  Alpha + clamp plumbing tests (act_func="geglu")
+# ---------------------------------------------------------------------------
+#
+# Once linear_offset is wired, alpha (default 1.702) and the clamp limits
+# (default +-7.0) follow the same pattern: they are runtime cutlass.Float32
+# arguments, so the same compiled kernel must serve any value. The kernel
+# computes
+#     gate' = clamp(gate, max=glu_clamp_max)
+#     up'   = clamp(up,   min=glu_clamp_min, max=glu_clamp_max)
+#     d     = (up' + linear_offset) * gate' * sigmoid(alpha * gate') * prob
+# where gate / up are the interleaved 32-column halves of the GEMM
+# intermediate ``c_tensor``. We use this closed form (computed from C, which
+# is the *same* tensor across runs that only differ in alpha / clamp / offset)
+# as the reference, rather than re-running the full GeGLU reference path.
+
+
+def _expected_geglu_d(
+    c_tensor: torch.Tensor,
+    prob_tensor: torch.Tensor,
+    alpha: float,
+    linear_offset: float,
+    glu_clamp_max: float,
+    glu_clamp_min: float,
+) -> torch.Tensor:
+    """Closed-form fp32 reference for the kernel's geglu activation."""
+
+    gate, up = _interleaved_gate_up_from_c(c_tensor.float())
+    gate_clamped = torch.clamp(gate, max=glu_clamp_max)
+    up_clamped = torch.clamp(up, min=glu_clamp_min, max=glu_clamp_max)
+    silu_scaled = gate_clamped * torch.sigmoid(alpha * gate_clamped)
+    n_out = gate.shape[1]
+    prob_expanded = prob_tensor.float().expand(-1, n_out, -1)
+    return (up_clamped + linear_offset) * silu_scaled * prob_expanded
+
+
+def _run_geglu_wrapper(request, *, alpha, glu_clamp_max, glu_clamp_min, linear_offset):
+    """Helper: run grouped_gemm_glu_wrapper_sm100 with act_func="geglu" once."""
+
+    from cudnn import grouped_gemm_glu_wrapper_sm100
+    from cuda.bindings import driver as cuda
+
+    cfg = discrete_grouped_gemm_init(
+        request=request,
+        ab_dtype=torch.float4_e2m1fn_x2,
+        c_dtype=torch.bfloat16,
+        d_dtype=torch.float32,
+        cd_major="n",
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=32,
+        sf_dtype=torch.float8_e8m0fnu,
+        vector_f32=False,
+        discrete_col_sfd=False,
+        act_func="geglu",
+        b_major="k",
+    )
+
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+    inputs = allocate_discrete_input_tensors(
+        n=cfg["n"],
+        k=cfg["k"],
+        num_experts=cfg["l"],
+        group_m_list=cfg["group_m_list"],
+        ab_dtype=cfg["ab_dtype"],
+        sf_dtype=cfg["sf_dtype"],
+        sf_vec_size=cfg["sf_vec_size"],
+        m_aligned=cfg["m_aligned"],
+        b_major=cfg["b_major"],
+    )
+
+    out = grouped_gemm_glu_wrapper_sm100(
+        a_tensor=inputs["a_tensor"],
+        sfa_tensor=inputs["sfa_tensor"],
+        padded_offsets=inputs["padded_offsets_tensor"],
+        alpha_tensor=inputs["alpha_tensor"],
+        b_ptrs=inputs["b_ptrs_tensor"],
+        sfb_ptrs=inputs["sfb_ptrs_tensor"],
+        n=cfg["n"],
+        b_dtype=inputs["b_list"][0].dtype,
+        b_major=cfg["b_major"],
+        norm_const_tensor=inputs.get("norm_const_tensor"),
+        prob_tensor=inputs.get("prob_tensor"),
+        acc_dtype=cfg["acc_dtype"],
+        c_dtype=cfg["c_dtype"],
+        d_dtype=cfg["d_dtype"],
+        cd_major=cfg["cd_major"],
+        mma_tiler_mn=cfg["mma_tiler_mn"],
+        cluster_shape_mn=cfg["cluster_shape_mn"],
+        sf_vec_size=cfg["sf_vec_size"],
+        vector_f32=cfg["vector_f32"],
+        m_aligned=cfg["m_aligned"],
+        discrete_col_sfd=cfg["discrete_col_sfd"],
+        act_func="geglu",
+        linear_offset=linear_offset,
+        geglu_alpha=alpha,
+        glu_clamp_max=glu_clamp_max,
+        glu_clamp_min=glu_clamp_min,
+        current_stream=stream,
+    )
+    torch.cuda.synchronize()
+    return cfg, inputs, out
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+@pytest.mark.parametrize("alpha", [1.0, 1.702, 2.0])
+def test_grouped_gemm_glu_discrete_wrapper_geglu_alpha(alpha, request):
+    """Forward parity vs. closed-form reference for several ``alpha`` values."""
+    try:
+        import cudnn  # noqa: F401
+        from cuda.bindings import driver as cuda  # noqa: F401
+    except ImportError:
+        pytest.skip("cudnn optional dependencies not installed")
+
+    try:
+        _, inputs, out = _run_geglu_wrapper(
+            request,
+            alpha=alpha,
+            glu_clamp_max=7.0,
+            glu_clamp_min=-7.0,
+            linear_offset=1.0,
+        )
+    except (ValueError, NotImplementedError) as e:
+        pytest.skip(f"Unsupported testcase: {e}")
+
+    valid_m = inputs["valid_m"]
+    expected = _expected_geglu_d(
+        c_tensor=out["c_tensor"][:valid_m],
+        prob_tensor=inputs["prob_tensor"][:valid_m],
+        alpha=alpha,
+        linear_offset=1.0,
+        glu_clamp_max=7.0,
+        glu_clamp_min=-7.0,
+    )
+    actual = out["d_tensor"][:valid_m].float()
+    torch.testing.assert_close(actual.cpu(), expected.cpu(), atol=1e-1, rtol=1e-2)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+@pytest.mark.parametrize("glu_clamp_max", [3.5, 7.0, 1.0e6])
+def test_grouped_gemm_glu_discrete_wrapper_clamp_max_geglu(glu_clamp_max, request):
+    """Forward parity vs. closed-form reference for several upper-clamp values.
+
+    ``glu_clamp_max == 1e6`` exercises the "effectively no clamp" path; small
+    values like ``3.5`` exercise the path where many ``up`` / ``gate`` entries
+    are saturated.
+    """
+    try:
+        import cudnn  # noqa: F401
+        from cuda.bindings import driver as cuda  # noqa: F401
+    except ImportError:
+        pytest.skip("cudnn optional dependencies not installed")
+
+    try:
+        _, inputs, out = _run_geglu_wrapper(
+            request,
+            alpha=1.702,
+            glu_clamp_max=glu_clamp_max,
+            glu_clamp_min=-glu_clamp_max,
+            linear_offset=1.0,
+        )
+    except (ValueError, NotImplementedError) as e:
+        pytest.skip(f"Unsupported testcase: {e}")
+
+    valid_m = inputs["valid_m"]
+    expected = _expected_geglu_d(
+        c_tensor=out["c_tensor"][:valid_m],
+        prob_tensor=inputs["prob_tensor"][:valid_m],
+        alpha=1.702,
+        linear_offset=1.0,
+        glu_clamp_max=glu_clamp_max,
+        glu_clamp_min=-glu_clamp_max,
+    )
+    actual = out["d_tensor"][:valid_m].float()
+    torch.testing.assert_close(actual.cpu(), expected.cpu(), atol=1e-1, rtol=1e-2)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_grouped_gemm_glu_discrete_wrapper_alpha_default_is_1702(request):
+    """Default ``geglu_alpha`` must reproduce ``geglu_alpha=1.702`` for geglu."""
+    try:
+        import cudnn  # noqa: F401
+        from cuda.bindings import driver as cuda  # noqa: F401
+    except ImportError:
+        pytest.skip("cudnn optional dependencies not installed")
+
+    try:
+        from cudnn import grouped_gemm_glu_wrapper_sm100
+        from cuda.bindings import driver as cuda
+    except ImportError:
+        pytest.skip("cudnn optional dependencies not installed")
+
+    cfg = discrete_grouped_gemm_init(
+        request=request,
+        ab_dtype=torch.float4_e2m1fn_x2,
+        c_dtype=torch.bfloat16,
+        d_dtype=torch.float32,
+        cd_major="n",
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=32,
+        sf_dtype=torch.float8_e8m0fnu,
+        vector_f32=False,
+        discrete_col_sfd=False,
+        act_func="geglu",
+        b_major="k",
+    )
+
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    inputs = allocate_discrete_input_tensors(
+        n=cfg["n"],
+        k=cfg["k"],
+        num_experts=cfg["l"],
+        group_m_list=cfg["group_m_list"],
+        ab_dtype=cfg["ab_dtype"],
+        sf_dtype=cfg["sf_dtype"],
+        sf_vec_size=cfg["sf_vec_size"],
+        m_aligned=cfg["m_aligned"],
+        b_major=cfg["b_major"],
+    )
+
+    common_kwargs = dict(
+        a_tensor=inputs["a_tensor"],
+        sfa_tensor=inputs["sfa_tensor"],
+        padded_offsets=inputs["padded_offsets_tensor"],
+        alpha_tensor=inputs["alpha_tensor"],
+        b_ptrs=inputs["b_ptrs_tensor"],
+        sfb_ptrs=inputs["sfb_ptrs_tensor"],
+        n=cfg["n"],
+        b_dtype=inputs["b_list"][0].dtype,
+        b_major=cfg["b_major"],
+        norm_const_tensor=inputs.get("norm_const_tensor"),
+        prob_tensor=inputs.get("prob_tensor"),
+        acc_dtype=cfg["acc_dtype"],
+        c_dtype=cfg["c_dtype"],
+        d_dtype=cfg["d_dtype"],
+        cd_major=cfg["cd_major"],
+        mma_tiler_mn=cfg["mma_tiler_mn"],
+        cluster_shape_mn=cfg["cluster_shape_mn"],
+        sf_vec_size=cfg["sf_vec_size"],
+        vector_f32=cfg["vector_f32"],
+        m_aligned=cfg["m_aligned"],
+        discrete_col_sfd=cfg["discrete_col_sfd"],
+        act_func="geglu",
+        linear_offset=1.0,
+        current_stream=stream,
+    )
+
+    try:
+        out_default = grouped_gemm_glu_wrapper_sm100(**common_kwargs)
+        out_explicit = grouped_gemm_glu_wrapper_sm100(
+            geglu_alpha=1.702,
+            glu_clamp_max=7.0,
+            glu_clamp_min=-7.0,
+            **common_kwargs,
+        )
+    except (ValueError, NotImplementedError) as e:
+        pytest.skip(f"Unsupported testcase: {e}")
+
+    torch.cuda.synchronize()
+    valid_m = inputs["valid_m"]
+    torch.testing.assert_close(
+        out_default["d_tensor"][:valid_m].float().cpu(),
+        out_explicit["d_tensor"][:valid_m].float().cpu(),
+        atol=0.0,
+        rtol=0.0,
+    )

@@ -21,7 +21,7 @@ namespace graph {
 
 inline std::optional<float>
 get_rescale_threshold_from_env() {
-    auto const* env_value = std::getenv("CUDNN_RESCALE_THRESHOLD");
+    auto const* env_value = get_environment("CUDNN_RESCALE_THRESHOLD");
     if (env_value == nullptr || env_value[0] == '\0') {
         return std::nullopt;
     }
@@ -93,6 +93,15 @@ class Tensor_attributes {
             error_code_t::ATTRIBUTE_NOT_SET,
             "Tensor '" + name + "' can't have both compile-time constant and runtime pass_by_value.");
 
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            has_ragged_offset_multiplier() && !ragged_offset,
+            error_code_t::ATTRIBUTE_NOT_SET,
+            "Tensor '" + name + "' with ragged offset multiplier must also have a ragged offset tensor.");
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(ragged_offset_multiplier <= 0,
+                                       error_code_t::INVALID_VALUE,
+                                       "Tensor '" + name + "' ragged offset multiplier must be positive.");
+
         return {error_code_t::OK, ""};
     }
 
@@ -118,9 +127,10 @@ class Tensor_attributes {
     bool uid_assigned                  = false;
 
     std::shared_ptr<Tensor_attributes> ragged_offset;
-    int64_t alignment        = 16;  // Default to 16 bytes
-    int64_t vector_count     = 1;   // Default to 1 (no vectorization)
-    int64_t vector_dimension = -1;  // Default to -1 (not set)
+    int64_t ragged_offset_multiplier = 1;
+    int64_t alignment                = 16;  // Default to 16 bytes
+    int64_t vector_count             = 1;   // Default to 1 (no vectorization)
+    int64_t vector_dimension         = -1;  // Default to -1 (not set)
 
     auto
     fill_from_context(detail::Context const& context) -> Tensor_attributes& {
@@ -323,6 +333,16 @@ class Tensor_attributes {
         return ragged_offset;
     }
 
+    int64_t
+    get_ragged_offset_multiplier() const {
+        return ragged_offset_multiplier;
+    }
+
+    bool
+    has_ragged_offset_multiplier() const {
+        return ragged_offset_multiplier != 1;
+    }
+
     auto
     set_is_virtual(bool const value) -> Tensor_attributes& {
         is_virtual = value;
@@ -445,6 +465,12 @@ class Tensor_attributes {
     auto
     set_ragged_offset(std::shared_ptr<Tensor_attributes> const& value) -> Tensor_attributes& {
         ragged_offset = value;
+        return *this;
+    }
+
+    auto
+    set_ragged_offset_multiplier(int64_t value) -> Tensor_attributes& {
+        ragged_offset_multiplier = value;
         return *this;
     }
 };
@@ -1339,7 +1365,7 @@ class Reduction_attributes : public Attributes<Reduction_attributes> {
     bool is_deterministic = false;
 
    public:
-    enum class input_names { X };
+    enum class input_names { X, Group_offset };
     std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
     enum class output_names { Y };
     std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
@@ -1370,6 +1396,12 @@ class Reduction_attributes : public Attributes<Reduction_attributes> {
     Reduction_attributes&
     set_is_deterministic(bool value) {
         is_deterministic = value;
+        return *this;
+    }
+
+    Reduction_attributes&
+    set_group_offset(std::shared_ptr<Tensor_attributes> value) {
+        inputs[input_names::Group_offset] = std::move(value);
         return *this;
     }
 };
@@ -1703,6 +1735,80 @@ class Rmsnorm_attributes : public Attributes<Rmsnorm_attributes> {
     }
 };
 
+class RoPE_attributes : public Attributes<RoPE_attributes> {
+    friend class Attributes<RoPE_attributes>;
+    friend class RoPENode;
+    friend class Graph;
+
+   public:
+    enum class input_names { INPUT, FREQS };
+    std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
+    enum class output_names { OUTPUT };
+    std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
+
+    // Host-side scalar multiplied into cos/sin. Default 1.0 (identity).
+    // Use this to fold YARN mscale and/or attn_scale into RoPE so SDPA can skip its scale multiply.
+    float output_scale = 1.0f;
+
+    // Rotation width (last K dims). 0 = use input's head_dim (full rotation).
+    // When < head_dim, the kernel rotates the last rope_dim dims and scaled-pass-through
+    // copies the first (head_dim - rope_dim) dims. The freqs tensor's last dim must equal
+    // rope_dim (not head_dim). Used for DSv3-style MLA (rope_dim=64, head_dim=192).
+    int64_t rope_dim = 0;
+
+    RoPE_attributes&
+    set_output_scale(float scale) {
+        output_scale = scale;
+        return *this;
+    }
+
+    RoPE_attributes&
+    set_rope_dim(int64_t dim) {
+        rope_dim = dim;
+        return *this;
+    }
+
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE(RoPE_attributes, name, compute_data_type, inputs, outputs, output_scale, rope_dim)
+};
+
+class RoPE_backward_attributes : public Attributes<RoPE_backward_attributes> {
+    friend class Attributes<RoPE_backward_attributes>;
+    friend class RoPEBackwardNode;
+    friend class Graph;
+
+   public:
+    enum class input_names { DY, FREQS };
+    std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
+    enum class output_names { DX };
+    std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
+
+    // Same semantics as fwd: cos/sin pre-multiplied by output_scale, and the nope
+    // segment (head_dim - rope_dim) is scaled-pass-through. Should match the fwd's
+    // values for correct gradient flow.
+    float output_scale = 1.0f;
+    int64_t rope_dim   = 0;
+
+    RoPE_backward_attributes&
+    set_output_scale(float scale) {
+        output_scale = scale;
+        return *this;
+    }
+
+    RoPE_backward_attributes&
+    set_rope_dim(int64_t dim) {
+        rope_dim = dim;
+        return *this;
+    }
+
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE(RoPE_backward_attributes,
+                                   name,
+                                   compute_data_type,
+                                   inputs,
+                                   outputs,
+                                   output_scale,
+                                   rope_dim)
+};
+
 class Rmsnorm_backward_attributes : public Attributes<Rmsnorm_backward_attributes> {
     friend class Attributes<Rmsnorm_backward_attributes>;
     friend class DRMSNormNode;
@@ -1904,6 +2010,8 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
         Bias,
         SEQ_LEN_Q,
         SEQ_LEN_KV,
+        CU_SEQ_LEN_Q,
+        CU_SEQ_LEN_KV,
         Seed,
         Offset,
         Dropout_mask,
@@ -2026,6 +2134,18 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
     SDPA_attributes&
     set_seq_len_kv(std::shared_ptr<Tensor_attributes> value) {
         inputs[SDPA_attributes::input_names::SEQ_LEN_KV] = std::move(value);
+        return *this;
+    }
+
+    SDPA_attributes&
+    set_cu_seq_len_q(std::shared_ptr<Tensor_attributes> value) {
+        inputs[SDPA_attributes::input_names::CU_SEQ_LEN_Q] = std::move(value);
+        return *this;
+    }
+
+    SDPA_attributes&
+    set_cu_seq_len_kv(std::shared_ptr<Tensor_attributes> value) {
+        inputs[SDPA_attributes::input_names::CU_SEQ_LEN_KV] = std::move(value);
         return *this;
     }
 
@@ -2661,7 +2781,7 @@ class DiagonalBandMask_attributes : public Attributes<DiagonalBandMask_attribute
     PointwiseMode_t comparison_mode = PointwiseMode_t::CMP_GT;
 
    public:
-    enum class input_names { X, SEQ_LEN_Q, SEQ_LEN_KV, LeftBound, ShiftRightBound, B };
+    enum class input_names { X, SEQ_LEN_Q, SEQ_LEN_KV, CU_SEQ_LEN_Q, CU_SEQ_LEN_KV, LeftBound, ShiftRightBound, B };
     std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
     enum class output_names { Y };
     std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;

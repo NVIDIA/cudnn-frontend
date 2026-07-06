@@ -191,6 +191,7 @@ NLOHMANN_JSON_SERIALIZE_ENUM(Layernorm_backward_attributes::input_names,
                                  {Layernorm_backward_attributes::input_names::SCALE, "SCALE"},
                                  {Layernorm_backward_attributes::input_names::MEAN, "MEAN"},
                                  {Layernorm_backward_attributes::input_names::INV_VARIANCE, "INV_VARIANCE"},
+                                 {Layernorm_backward_attributes::input_names::EPSILON, "EPSILON"},
                              })
 
 NLOHMANN_JSON_SERIALIZE_ENUM(Layernorm_backward_attributes::output_names,
@@ -222,6 +223,7 @@ NLOHMANN_JSON_SERIALIZE_ENUM(AdaLayernorm_backward_attributes::input_names,
                                  {AdaLayernorm_backward_attributes::input_names::SCALE, "SCALE"},
                                  {AdaLayernorm_backward_attributes::input_names::MEAN, "MEAN"},
                                  {AdaLayernorm_backward_attributes::input_names::INV_VARIANCE, "INV_VARIANCE"},
+                                 {AdaLayernorm_backward_attributes::input_names::EPSILON, "EPSILON"},
                              })
 
 NLOHMANN_JSON_SERIALIZE_ENUM(AdaLayernorm_backward_attributes::output_names,
@@ -363,12 +365,15 @@ NLOHMANN_JSON_SERIALIZE_ENUM(SDPA_attributes::input_names,
                                  {SDPA_attributes::input_names::Bias, "Bias"},
                                  {SDPA_attributes::input_names::SEQ_LEN_Q, "SEQ_LEN_Q"},
                                  {SDPA_attributes::input_names::SEQ_LEN_KV, "SEQ_LEN_KV"},
+                                 {SDPA_attributes::input_names::CU_SEQ_LEN_Q, "CU_SEQ_LEN_Q"},
+                                 {SDPA_attributes::input_names::CU_SEQ_LEN_KV, "CU_SEQ_LEN_KV"},
                                  {SDPA_attributes::input_names::Seed, "Seed"},
                                  {SDPA_attributes::input_names::Offset, "Offset"},
                                  {SDPA_attributes::input_names::Dropout_mask, "Dropout_mask"},
                                  {SDPA_attributes::input_names::Dropout_scale, "Dropout_scale"},
                                  {SDPA_attributes::input_names::Page_table_K, "Page_table_K"},
                                  {SDPA_attributes::input_names::Page_table_V, "Page_table_V"},
+                                 {SDPA_attributes::input_names::Block_mask, "Block_mask"},
                                  // FP8-specific inputs
                                  {SDPA_attributes::input_names::Descale_Q, "Descale_Q"},
                                  {SDPA_attributes::input_names::Descale_K, "Descale_K"},
@@ -475,8 +480,61 @@ NLOHMANN_JSON_SERIALIZE_ENUM(SDPA_fp8_backward_attributes::output_names,
                                  {SDPA_fp8_backward_attributes::output_names::Amax_dQ, "Amax_dQ"},
                                  {SDPA_fp8_backward_attributes::output_names::Amax_dK, "Amax_dK"},
                                  {SDPA_fp8_backward_attributes::output_names::Amax_dV, "Amax_dV"},
-                                 {SDPA_fp8_backward_attributes::output_names::Amax_dP, "Amax_d"},
+                                 {SDPA_fp8_backward_attributes::output_names::Amax_dP, "Amax_dP"},
                                  {SDPA_fp8_backward_attributes::output_names::DSINK_TOKEN, "DSINK_TOKEN"},
+                             })
+
+NLOHMANN_JSON_SERIALIZE_ENUM(RoPE_attributes::input_names,
+                             {
+                                 {RoPE_attributes::input_names::INPUT, "INPUT"},
+                                 {RoPE_attributes::input_names::FREQS, "FREQS"},
+                             })
+
+NLOHMANN_JSON_SERIALIZE_ENUM(RoPE_attributes::output_names,
+                             {
+                                 {RoPE_attributes::output_names::OUTPUT, "OUTPUT"},
+                             })
+
+NLOHMANN_JSON_SERIALIZE_ENUM(RoPE_backward_attributes::input_names,
+                             {
+                                 {RoPE_backward_attributes::input_names::DY, "DY"},
+                                 {RoPE_backward_attributes::input_names::FREQS, "FREQS"},
+                             })
+
+NLOHMANN_JSON_SERIALIZE_ENUM(RoPE_backward_attributes::output_names,
+                             {
+                                 {RoPE_backward_attributes::output_names::DX, "DX"},
+                             })
+
+NLOHMANN_JSON_SERIALIZE_ENUM(Softmax_attributes::input_names,
+                             {
+                                 {Softmax_attributes::input_names::P, "P"},
+                                 {Softmax_attributes::input_names::SINK, "SINK"},
+                             })
+
+NLOHMANN_JSON_SERIALIZE_ENUM(Softmax_attributes::output_names,
+                             {
+                                 {Softmax_attributes::output_names::S, "S"},
+                                 {Softmax_attributes::output_names::Stats, "Stats"},
+                                 {Softmax_attributes::output_names::Max, "Max"},
+                                 {Softmax_attributes::output_names::Sum_exp, "Sum_exp"},
+                             })
+
+NLOHMANN_JSON_SERIALIZE_ENUM(DiagonalBandMask_attributes::input_names,
+                             {
+                                 {DiagonalBandMask_attributes::input_names::X, "X"},
+                                 {DiagonalBandMask_attributes::input_names::SEQ_LEN_Q, "SEQ_LEN_Q"},
+                                 {DiagonalBandMask_attributes::input_names::SEQ_LEN_KV, "SEQ_LEN_KV"},
+                                 {DiagonalBandMask_attributes::input_names::CU_SEQ_LEN_Q, "CU_SEQ_LEN_Q"},
+                                 {DiagonalBandMask_attributes::input_names::CU_SEQ_LEN_KV, "CU_SEQ_LEN_KV"},
+                                 {DiagonalBandMask_attributes::input_names::LeftBound, "LeftBound"},
+                                 {DiagonalBandMask_attributes::input_names::ShiftRightBound, "ShiftRightBound"},
+                                 {DiagonalBandMask_attributes::input_names::B, "B"},
+                             })
+
+NLOHMANN_JSON_SERIALIZE_ENUM(DiagonalBandMask_attributes::output_names,
+                             {
+                                 {DiagonalBandMask_attributes::output_names::Y, "Y"},
                              })
 
 NLOHMANN_JSON_SERIALIZE_ENUM(Block_scale_quantize_attributes::input_names,
@@ -548,6 +606,9 @@ to_json(nlohmann::json& j, const Tensor_attributes& ta) {
         j["ragged_offset_uid"]  = ta.ragged_offset->get_uid();
         j["ragged_offset_name"] = ta.ragged_offset->get_name();
     }
+    if (ta.has_ragged_offset_multiplier()) {
+        j["ragged_offset_multiplier"] = ta.ragged_offset_multiplier;
+    }
 }
 
 inline void
@@ -564,6 +625,18 @@ from_json(const nlohmann::json& j, Tensor_attributes& ta) {
 
     if (ta.is_pass_by_value && !j["pass_by_value"].is_null()) {
         ta.pass_by_value = j.at("pass_by_value");
+    }
+    if (j.contains("ragged_offset_uid")) {
+        auto ragged_offset          = std::make_shared<Tensor_attributes>();
+        ragged_offset->uid          = j.at("ragged_offset_uid").get<Tensor_attributes::uid_t>();
+        ragged_offset->uid_assigned = true;
+        if (j.contains("ragged_offset_name")) {
+            ragged_offset->name = j.at("ragged_offset_name").get<std::string>();
+        }
+        ta.ragged_offset = ragged_offset;
+    }
+    if (j.contains("ragged_offset_multiplier")) {
+        ta.ragged_offset_multiplier = j.at("ragged_offset_multiplier").get<int64_t>();
     }
 }
 
