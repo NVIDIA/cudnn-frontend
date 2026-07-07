@@ -23,6 +23,7 @@
 #pragma once
 
 #include <cuda.h>
+#include <algorithm>
 #include <cstdlib>
 
 #if defined NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING
@@ -554,6 +555,231 @@ inline constexpr size_t
 get_compiled_version(void) {
     return CUDNN_VERSION;
 }
+
+#if CUDNN_VERSION >= 92200
+inline cudnnStatus_t
+causal_conv1d_nwh_forward(cudaStream_t stream,
+                          const void *x,
+                          const void *weight,
+                          const void *bias,
+                          void *y,
+                          int batch,
+                          int dim,
+                          int seq_len,
+                          int kernel_size,
+                          cudnnDataType_t data_type,
+                          cudnnCausalConv1dActivation_t activation) {
+    auto effective_cudnn_ver = std::min(detail::get_compiled_version(), detail::get_backend_version());
+    if (effective_cudnn_ver < 92400) {
+        return CUDNN_STATUS_NOT_SUPPORTED;
+    }
+#if CUDNN_VERSION >= 92400
+    NV_FE_CALL_TO_BACKEND(causal_conv1d_nwh_forward,
+                          cudnnCausalConv1dNwhForward,
+                          stream,
+                          x,
+                          weight,
+                          bias,
+                          y,
+                          batch,
+                          dim,
+                          seq_len,
+                          kernel_size,
+                          data_type,
+                          activation);
+#else
+    (void)stream;
+    (void)x;
+    (void)weight;
+    (void)bias;
+    (void)y;
+    (void)batch;
+    (void)dim;
+    (void)seq_len;
+    (void)kernel_size;
+    (void)data_type;
+    (void)activation;
+    return CUDNN_STATUS_NOT_SUPPORTED;
+#endif
+}
+
+inline cudnnStatus_t
+causal_conv1d_nwh_backward(cudaStream_t stream,
+                           const void *x,
+                           const void *weight,
+                           const void *bias,
+                           const void *dy,
+                           void *dx,
+                           void *dweight,
+                           void *dbias,
+                           int batch,
+                           int dim,
+                           int seq_len,
+                           int kernel_size,
+                           cudnnDataType_t data_type,
+                           cudnnDataType_t dw_data_type,
+                           cudnnCausalConv1dActivation_t activation) {
+    auto effective_cudnn_ver = std::min(detail::get_compiled_version(), detail::get_backend_version());
+    if (effective_cudnn_ver < 92400) {
+        return CUDNN_STATUS_NOT_SUPPORTED;
+    }
+#if CUDNN_VERSION >= 92400
+    NV_FE_CALL_TO_BACKEND(causal_conv1d_nwh_backward,
+                          cudnnCausalConv1dNwhBackward,
+                          stream,
+                          x,
+                          weight,
+                          bias,
+                          dy,
+                          dx,
+                          dweight,
+                          dbias,
+                          batch,
+                          dim,
+                          seq_len,
+                          kernel_size,
+                          data_type,
+                          dw_data_type,
+                          activation);
+#else
+    (void)stream;
+    (void)x;
+    (void)weight;
+    (void)bias;
+    (void)dy;
+    (void)dx;
+    (void)dweight;
+    (void)dbias;
+    (void)batch;
+    (void)dim;
+    (void)seq_len;
+    (void)kernel_size;
+    (void)data_type;
+    (void)dw_data_type;
+    (void)activation;
+    return CUDNN_STATUS_NOT_SUPPORTED;
+#endif
+}
+
+inline cudnnStatus_t
+b2b_causal_conv1d_forward(cudaStream_t stream,
+                          const void *x,
+                          const void *weights_proj,
+                          const void *weights_mixer,
+                          const void *skip_bias,
+                          void *y,
+                          void *y_gated,
+                          int batch,
+                          int dim,
+                          int seq_len,
+                          int kernel_size_proj,
+                          int kernel_size_mixer,
+                          cudnnDataType_t data_type) {
+    auto effective_cudnn_ver = std::min(detail::get_compiled_version(), detail::get_backend_version());
+    if (effective_cudnn_ver < 92400) {
+        return CUDNN_STATUS_NOT_SUPPORTED;
+    }
+#if CUDNN_VERSION >= 92400
+    NV_FE_CALL_TO_BACKEND(b2b_causal_conv1d_forward,
+                          cudnnB2BCausalConv1dForward,
+                          stream,
+                          x,
+                          weights_proj,
+                          weights_mixer,
+                          skip_bias,
+                          y,
+                          y_gated,
+                          batch,
+                          dim,
+                          seq_len,
+                          kernel_size_proj,
+                          kernel_size_mixer,
+                          data_type);
+#else
+    (void)stream;
+    (void)x;
+    (void)weights_proj;
+    (void)weights_mixer;
+    (void)skip_bias;
+    (void)y;
+    (void)y_gated;
+    (void)batch;
+    (void)dim;
+    (void)seq_len;
+    (void)kernel_size_proj;
+    (void)kernel_size_mixer;
+    (void)data_type;
+    return CUDNN_STATUS_NOT_SUPPORTED;
+#endif
+}
+
+inline cudnnStatus_t
+b2b_causal_conv1d_backward(cudaStream_t stream,
+                           const void *x,
+                           const void *weights_proj,
+                           const void *weights_mixer,
+                           const void *skip_bias,
+                           const void *y,
+                           const void *dy,
+                           void *dx,
+                           void *dweights_proj,
+                           void *dweights_mixer,
+                           void *dskip_bias,
+                           int batch,
+                           int dim,
+                           int seq_len,
+                           int kernel_size_proj,
+                           int kernel_size_mixer,
+                           cudnnDataType_t data_type,
+                           cudnnDataType_t dw_data_type) {
+    auto effective_cudnn_ver = std::min(detail::get_compiled_version(), detail::get_backend_version());
+    if (effective_cudnn_ver < 92400) {
+        return CUDNN_STATUS_NOT_SUPPORTED;
+    }
+#if CUDNN_VERSION >= 92400
+    NV_FE_CALL_TO_BACKEND(b2b_causal_conv1d_backward,
+                          cudnnB2BCausalConv1dBackward,
+                          stream,
+                          x,
+                          weights_proj,
+                          weights_mixer,
+                          skip_bias,
+                          y,
+                          dy,
+                          dx,
+                          dweights_proj,
+                          dweights_mixer,
+                          dskip_bias,
+                          batch,
+                          dim,
+                          seq_len,
+                          kernel_size_proj,
+                          kernel_size_mixer,
+                          data_type,
+                          dw_data_type);
+#else
+    (void)stream;
+    (void)x;
+    (void)weights_proj;
+    (void)weights_mixer;
+    (void)skip_bias;
+    (void)y;
+    (void)dy;
+    (void)dx;
+    (void)dweights_proj;
+    (void)dweights_mixer;
+    (void)dskip_bias;
+    (void)batch;
+    (void)dim;
+    (void)seq_len;
+    (void)kernel_size_proj;
+    (void)kernel_size_mixer;
+    (void)data_type;
+    (void)dw_data_type;
+    return CUDNN_STATUS_NOT_SUPPORTED;
+#endif
+}
+#endif
 
 inline std::string
 convert_version_to_str(size_t const version) {
