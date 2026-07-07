@@ -648,7 +648,8 @@ def _b2b_setup_context(ctx, inputs, output):
 
 @torch.compiler.allow_in_graph
 def _b2b_autograd_bwd(ctx, grad_y, grad_y_gated):
-    if grad_y is not None:
+    # PyTorch may pass a ZeroTensor for the discarded intermediate output.
+    if grad_y is not None and not torch._is_zerotensor(grad_y) and torch.count_nonzero(grad_y).item() != 0:
         raise RuntimeError("Gradient for the intermediate B2B output y is not supported; use cudnn.ops.b2b_causal_conv1d")
     x, weights_proj, weights_mixer, skip_bias, y = ctx.saved_tensors
     dx, dwp, dwm, dsb = torch.ops.cudnn.b2b_causal_conv1d_bwd_primitive(grad_y_gated, x, weights_proj, weights_mixer, skip_bias, y)
