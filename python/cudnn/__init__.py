@@ -59,7 +59,7 @@ for _optional_symbol in [
 
 from .datatypes import _library_type, _is_torch_tensor
 
-__version__ = "1.26.0"
+__version__ = "1.27.0"
 
 
 def _tensor(
