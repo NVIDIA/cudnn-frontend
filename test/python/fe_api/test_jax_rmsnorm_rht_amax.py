@@ -22,25 +22,41 @@ def _hadamard_16(jnp):
     return jnp.asarray(values, dtype=jnp.float32) / math.sqrt(16)
 
 
+@pytest.fixture
+def device_compatibility_checks_disabled():
+    _jax_runtime()
+    from cudnn.jax import disable_device_compatibility_checks
+
+    disable_device_compatibility_checks(True)
+    try:
+        yield
+    finally:
+        disable_device_compatibility_checks(False)
+
+
 @pytest.mark.L0
-def test_jax_rmsnorm_rht_amax_abstract_contract():
+def test_jax_rmsnorm_rht_amax_abstract_contract(device_compatibility_checks_disabled):
     jax, jnp = _jax_runtime()
 
-    from cudnn import OpKernel, TensorDesc
+    from cudnn import Op, TensorDesc
     from cudnn.jax import JaxApiBase, RmsNormRhtAmaxSm100, rmsnorm_rht_amax_sm100
-    from cudnn.rmsnorm_rht_amax.kernel import RMSNormRHTAmaxKernel
+    from cudnn.rmsnorm_rht_amax.op import RmsNormRhtAmaxSm100Op
 
     sample_x = jax.ShapeDtypeStruct((256, 2048), jnp.bfloat16)
     sample_weight = jax.ShapeDtypeStruct((2048,), jnp.bfloat16)
     api = RmsNormRhtAmaxSm100(sample_x, sample_weight)
 
     assert isinstance(api, JaxApiBase)
-    assert isinstance(api.kernel, OpKernel)
-    assert isinstance(api.kernel, RMSNormRHTAmaxKernel)
+    assert isinstance(api._op, Op)
+    assert isinstance(api._op, RmsNormRhtAmaxSm100Op)
     assert isinstance(api.x_desc, TensorDesc)
     assert isinstance(api.w_desc, TensorDesc)
-    assert api.kernel.x is api.x_desc
-    assert api.kernel.weight is api.w_desc
+    assert isinstance(api.o_desc, TensorDesc)
+    assert isinstance(api.amax_desc, TensorDesc)
+    assert api._op.x is api.x_desc
+    assert api._op.weight is api.w_desc
+    assert api._op.output is api.o_desc
+    assert api._op.amax is api.amax_desc
     assert api.x_desc.dtype == jnp.dtype(jnp.bfloat16)
     assert api.x_desc.stride == (2048, 1)
     assert api.x_desc.stride_order == (1, 0)
@@ -51,6 +67,30 @@ def test_jax_rmsnorm_rht_amax_abstract_contract():
     assert output.dtype == jnp.bfloat16
     assert amax.shape == (128,)
     assert amax.dtype == jnp.float32
+
+    explicit_api = RmsNormRhtAmaxSm100(
+        sample_x,
+        sample_weight,
+        sample_o=jax.ShapeDtypeStruct((256, 2048), jnp.bfloat16),
+        sample_amax=jax.ShapeDtypeStruct((128,), jnp.float32),
+    )
+    explicit_output, explicit_amax = jax.eval_shape(explicit_api, sample_x, sample_weight)
+    assert explicit_output.shape == (256, 2048)
+    assert explicit_amax.shape == (128,)
+
+    array_api = RmsNormRhtAmaxSm100(
+        jnp.empty((2, 2048), jnp.bfloat16),
+        jnp.empty((2048,), jnp.bfloat16),
+    )
+    assert array_api.x_desc.shape == (2, 2048)
+    assert array_api.w_desc.shape == (2048,)
+
+    with pytest.raises(ValueError, match="sample_o and sample_amax must be provided together"):
+        RmsNormRhtAmaxSm100(
+            sample_x,
+            sample_weight,
+            sample_o=jax.ShapeDtypeStruct((256, 2048), jnp.bfloat16),
+        )
 
     functional_output, functional_amax = jax.eval_shape(
         lambda x, weight: rmsnorm_rht_amax_sm100(
@@ -72,29 +112,33 @@ def test_jax_rmsnorm_rht_amax_abstract_contract():
     with pytest.raises(ValueError, match="sample_x tensor shape mismatch"):
         jax.eval_shape(api, wrong_x, sample_weight)
 
-    api.kernel.requested_rows_per_cta = 3
+    invalid_api = RmsNormRhtAmaxSm100(sample_x, sample_weight, rows_per_cta=3)
     with pytest.raises(ValueError, match="M must be divisible by rows_per_cta"):
-        jax.eval_shape(lambda x, weight: api(x, weight), sample_x, sample_weight)
+        jax.eval_shape(invalid_api, sample_x, sample_weight)
 
 
 @pytest.mark.L0
 def test_jax_rmsnorm_rht_amax_jit():
     jax, jnp = _jax_runtime()
     gpu_devices = [device for device in jax.local_devices() if device.platform == "gpu"]
-    capable_devices = []
+    all_local_devices_are_supported = bool(gpu_devices)
     for device in gpu_devices:
         capability = getattr(device, "compute_capability", None)
         if capability is None:
-            continue
+            all_local_devices_are_supported = False
+            break
         major, minor = (int(value) for value in str(capability).split(".", 1))
-        if major * 10 + minor >= 100:
-            capable_devices.append(device)
-    if not capable_devices:
-        pytest.skip("RMSNorm + RHT requires an SM100+ JAX device")
+        if (major, minor) < (10, 0):
+            all_local_devices_are_supported = False
+            break
+    if not all_local_devices_are_supported:
+        pytest.skip("RMSNorm + RHT requires every local JAX GPU to be SM100+")
 
-    from cudnn.jax import rmsnorm_rht_amax_sm100
+    from cudnn.jax import disable_device_compatibility_checks, rmsnorm_rht_amax_sm100
 
-    device = capable_devices[0]
+    disable_device_compatibility_checks(False)
+
+    device = gpu_devices[0]
     m, n = 256, 2048
     rows_per_cta = 2
     eps = 1e-4

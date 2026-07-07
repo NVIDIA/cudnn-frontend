@@ -51,7 +51,7 @@ for _optional_symbol in ["causal_conv1d_forward", "causal_conv1d_backward"]:
     if hasattr(_pybind_module, _optional_symbol):
         globals()[_optional_symbol] = getattr(_pybind_module, _optional_symbol)
 
-from ._op_kernel import OpKernel
+from ._op import Op
 from ._tensor_desc import TensorDesc
 from .datatypes import _library_type, _is_torch_tensor
 

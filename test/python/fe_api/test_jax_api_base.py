@@ -50,6 +50,17 @@ class _ShapeDtypeStruct:
         self.dtype = dtype
 
 
+class _Device:
+    platform = "gpu"
+
+    def __init__(self, device_id, compute_capability):
+        self.id = device_id
+        self.compute_capability = compute_capability
+
+    def __str__(self):
+        return f"CudaDevice(id={self.id})"
+
+
 class JaxApiBaseTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -100,6 +111,91 @@ class JaxApiBaseTest(unittest.TestCase):
         for name in tuple(sys.modules):
             if name == _PACKAGE or name.startswith(f"{_PACKAGE}."):
                 sys.modules.pop(name, None)
+
+    def setUp(self) -> None:
+        self.module.disable_device_compatibility_checks(False)
+
+    def tearDown(self) -> None:
+        self.module.disable_device_compatibility_checks(False)
+
+    def test_checks_all_local_jax_gpu_compute_capabilities(self):
+        jax = types.ModuleType("jax")
+
+        def local_devices(*, backend):
+            self.assertEqual(backend, "gpu")
+            return (_Device(0, "10.0"), _Device(1, "12.0"))
+
+        jax.local_devices = local_devices
+        with mock.patch.dict(sys.modules, {"jax": jax}):
+            self.module.JaxApiBase._check_device_compatibility(
+                minimum_compute_capability=100,
+                operation_name="TestOp",
+            )
+
+    def test_rejects_an_incompatible_local_jax_gpu(self):
+        jax = types.ModuleType("jax")
+        jax.local_devices = lambda *, backend: (_Device(0, "10.0"), _Device(1, "9.0"))
+
+        with mock.patch.dict(sys.modules, {"jax": jax}):
+            with self.assertRaisesRegex(RuntimeError, r"TestOp requires SM100\+, found CudaDevice\(id=1\) \(SM90\)"):
+                self.module.JaxApiBase._check_device_compatibility(
+                    minimum_compute_capability=100,
+                    operation_name="TestOp",
+                )
+
+    def test_requires_an_explicit_opt_out_without_a_local_jax_gpu(self):
+        jax = types.ModuleType("jax")
+        jax.local_devices = lambda *, backend: ()
+
+        with mock.patch.dict(sys.modules, {"jax": jax}):
+            with self.assertRaisesRegex(RuntimeError, r"no local JAX GPU.*disable_device_compatibility_checks\(True\)"):
+                self.module.JaxApiBase._check_device_compatibility(
+                    minimum_compute_capability=100,
+                    operation_name="TestOp",
+                )
+
+    def test_reports_device_discovery_and_capability_failures(self):
+        jax = types.ModuleType("jax")
+
+        def fail_discovery(*, backend):
+            raise RuntimeError("GPU backend unavailable")
+
+        jax.local_devices = fail_discovery
+        with mock.patch.dict(sys.modules, {"jax": jax}):
+            with self.assertRaisesRegex(RuntimeError, r"could not discover a local GPU.*disable_device_compatibility_checks\(True\)"):
+                self.module.JaxApiBase._check_device_compatibility(
+                    minimum_compute_capability=100,
+                    operation_name="TestOp",
+                )
+
+        jax.local_devices = lambda *, backend: (_Device(0, "unknown"),)
+        with mock.patch.dict(sys.modules, {"jax": jax}):
+            with self.assertRaisesRegex(RuntimeError, r"invalid compute capability 'unknown'.*disable_device_compatibility_checks\(True\)"):
+                self.module.JaxApiBase._check_device_compatibility(
+                    minimum_compute_capability=100,
+                    operation_name="TestOp",
+                )
+
+    def test_device_compatibility_checks_can_be_disabled_and_reenabled(self):
+        self.module.disable_device_compatibility_checks(True)
+        with mock.patch.dict(sys.modules, {"jax": None}):
+            self.module.JaxApiBase._check_device_compatibility(
+                minimum_compute_capability=100,
+                operation_name="TestOp",
+            )
+
+        self.module.disable_device_compatibility_checks(False)
+        jax = types.ModuleType("jax")
+        jax.local_devices = lambda *, backend: ()
+        with mock.patch.dict(sys.modules, {"jax": jax}):
+            with self.assertRaises(RuntimeError):
+                self.module.JaxApiBase._check_device_compatibility(
+                    minimum_compute_capability=100,
+                    operation_name="TestOp",
+                )
+
+        with self.assertRaisesRegex(TypeError, "disabled must be a bool"):
+            self.module.disable_device_compatibility_checks(1)
 
     def test_converts_array_metadata_to_shared_tensor_desc(self):
         desc = self.module.JaxApiBase._to_tensor_desc(
@@ -249,53 +345,50 @@ class JaxApiBaseTest(unittest.TestCase):
         self.assertEqual(output.shape, (2, 3, 4))
         self.assertEqual(output.dtype, "bfloat16")
 
-    def test_calls_kernel_with_initialized_outputs_and_hidden_workspaces(self):
+    def test_calls_launch_hook_with_initialized_outputs_and_hidden_workspaces(self):
         tensor_module = self.tensor_module
         seen = {}
 
-        class Kernel:
-            def infer_output(self):
-                return (
-                    tensor_module.make_compact_tensor_desc(
-                        dtype=_DataType.FLOAT,
-                        shape=(2,),
-                        name="output",
-                    ),
-                    tensor_module.make_compact_tensor_desc(
-                        dtype=_DataType.FLOAT,
-                        shape=(4, 2, 3),
-                        name="amax",
-                        init_value=float("-inf"),
-                    ),
-                )
-
-            def infer_workspace(self):
-                return (
-                    tensor_module.make_compact_tensor_desc(
-                        dtype=_DataType.FLOAT,
-                        shape=(3,),
-                        name="counter",
-                        init_value=0,
-                    ),
-                    tensor_module.make_compact_tensor_desc(
-                        dtype=_DataType.BFLOAT16,
-                        shape=(5,),
-                        name="scratch",
-                    ),
-                )
-
-            def __call__(self, *args):
-                seen["kernel_args"] = args
+        output_descs = (
+            tensor_module.make_compact_tensor_desc(
+                dtype=_DataType.FLOAT,
+                shape=(2,),
+                name="output",
+            ),
+            tensor_module.make_compact_tensor_desc(
+                dtype=_DataType.FLOAT,
+                shape=(4, 2, 3),
+                name="amax",
+                init_value=float("-inf"),
+            ),
+        )
+        workspace_descs = (
+            tensor_module.make_compact_tensor_desc(
+                dtype=_DataType.FLOAT,
+                shape=(3,),
+                name="counter",
+                init_value=0,
+            ),
+            tensor_module.make_compact_tensor_desc(
+                dtype=_DataType.BFLOAT16,
+                shape=(5,),
+                name="scratch",
+            ),
+        )
 
         class Adapter(self.module.JaxApiBase):
-            def __init__(self):
-                self.kernel = Kernel()
-
             def check_support(self):
                 return True
 
             def __call__(self, value):
-                return self._call_kernel((value,))
+                return self._call_kernel(
+                    (value,),
+                    output_descs=output_descs,
+                    workspace_descs=workspace_descs,
+                )
+
+            def _launch(self, inputs, outputs, workspaces, stream):
+                seen["launch_args"] = (inputs, outputs, workspaces, stream)
 
         full_calls = []
         jax = types.ModuleType("jax")
@@ -357,14 +450,22 @@ class JaxApiBaseTest(unittest.TestCase):
         ):
             results = api._call_kernel(
                 (input_value,),
+                output_descs=output_descs,
+                workspace_descs=workspace_descs,
                 input_spec=(input_tensor_spec,),
                 output_spec=(None, initialized_output_spec),
             )
             with self.assertRaisesRegex(TypeError, "input #0 must have shape and dtype metadata"):
-                api._call_kernel(([input_value],))
+                api._call_kernel(
+                    ([input_value],),
+                    output_descs=output_descs,
+                    workspace_descs=workspace_descs,
+                )
             with self.assertRaisesRegex(TypeError, "output_spec must contain only TensorSpec or None"):
                 api._call_kernel(
                     (input_value,),
+                    output_descs=output_descs,
+                    workspace_descs=workspace_descs,
                     output_spec=((0,), initialized_output_spec),
                 )
 
@@ -380,13 +481,13 @@ class JaxApiBaseTest(unittest.TestCase):
         self.assertIs(seen["call_options"]["input_spec"][1], initialized_output_spec)
         self.assertIs(seen["call_options"]["input_spec"][2], seen["call_options"]["output_spec"][2])
 
-        kernel_args = seen["kernel_args"]
-        self.assertIs(kernel_args[0], input_value)
-        self.assertEqual(kernel_args[1].label, "allocated(0)")
-        self.assertIs(kernel_args[2], full_calls[0][3])
-        self.assertIs(kernel_args[3], full_calls[1][3])
-        self.assertEqual(kernel_args[4].label, "allocated(3)")
-        self.assertEqual(kernel_args[5], "stream")
+        launch_inputs, launch_outputs, launch_workspaces, stream = seen["launch_args"]
+        self.assertEqual(launch_inputs, (input_value,))
+        self.assertEqual(launch_outputs[0].label, "allocated(0)")
+        self.assertIs(launch_outputs[1], full_calls[0][3])
+        self.assertIs(launch_workspaces[0], full_calls[1][3])
+        self.assertEqual(launch_workspaces[1].label, "allocated(3)")
+        self.assertEqual(stream, "stream")
         self.assertEqual([result.label for result in results], ["allocated(0)", "full(-inf)"])
         self.assertNotIn(full_calls[0][3], vars(api).values())
         self.assertNotIn(full_calls[1][3], vars(api).values())
@@ -400,6 +501,9 @@ class JaxApiBaseTest(unittest.TestCase):
 
             def __call__(self):
                 return self.check_support()
+
+            def _launch(self, inputs, outputs, workspaces, stream):
+                raise AssertionError("not called")
 
         api = Adapter()
         api.option = 1

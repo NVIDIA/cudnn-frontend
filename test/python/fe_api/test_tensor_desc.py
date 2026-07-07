@@ -106,32 +106,6 @@ class TensorDescTest(unittest.TestCase):
         self.assertEqual(desc.stride, (12, 1, 3))
         self.assertEqual(desc.stride_order, (1, 2, 0))
 
-    def test_api_base_checks_torch_tensor_signature(self):
-        class Adapter(APIBase):
-            def check_support(self):
-                return True
-
-            def compile(self):
-                pass
-
-            def execute(self, *args, **kwargs):
-                pass
-
-        adapter = Adapter()
-        sample = torch.empty_strided((2, 3), (3, 1), dtype=torch.bfloat16)
-        expected = TorchTensorDesc.from_tensor(sample, "sample")
-        adapter._check_tensor_signature(sample, expected)
-
-        cases = (
-            (torch.empty((1, 3), dtype=torch.bfloat16), "sample tensor shape mismatch"),
-            (torch.empty_strided((2, 3), (1, 2), dtype=torch.bfloat16), "sample tensor stride mismatch"),
-            (torch.empty((2, 3), dtype=torch.float32), "sample dtype mismatch"),
-        )
-        for tensor, message in cases:
-            with self.subTest(message=message):
-                with self.assertRaisesRegex(ValueError, message):
-                    adapter._check_tensor_signature(tensor, expected)
-
     def test_torch_descriptor_constructs_from_tensor_metadata(self):
         tensor = torch.empty_strided((2, 3, 4), (12, 1, 3), dtype=torch.uint8)
         desc = TorchTensorDesc.from_tensor(

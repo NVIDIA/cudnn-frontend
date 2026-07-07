@@ -118,9 +118,11 @@ class RmsNormImportContractTest(unittest.TestCase):
             self.assertTrue(
                 {
                     "RMSNormRHTAmaxKernel",
+                    "RmsNormRhtAmaxSm100Op",
                     "RmsNormRhtAmaxSm100",
                     "api",
                     "kernel",
+                    "op",
                 }.issubset(dir(package))
             )
         finally:
@@ -153,6 +155,27 @@ class RmsNormImportContractTest(unittest.TestCase):
         finally:
             _remove_package(name)
 
+    def test_operation_exports_do_not_load_a_framework_adapter(self):
+        name = "cudnn_rmsnorm_op_route_test.rmsnorm_rht_amax"
+        op_sentinel = object()
+        best_num_threads_sentinel = object()
+        pick_rows_per_cta_sentinel = object()
+        op = types.ModuleType(f"{name}.op")
+        op.RmsNormRhtAmaxSm100Op = op_sentinel
+        op.best_num_threads = best_num_threads_sentinel
+        op.pick_rows_per_cta = pick_rows_per_cta_sentinel
+        try:
+            sys.modules[op.__name__] = op
+            package = _load_operation_package(name)
+            self.assertIs(package.RmsNormRhtAmaxSm100Op, op_sentinel)
+            self.assertIs(package.best_num_threads, best_num_threads_sentinel)
+            self.assertIs(package.pick_rows_per_cta, pick_rows_per_cta_sentinel)
+            self.assertNotIn(f"{name}.api", sys.modules)
+            self.assertNotIn(f"{name}.jax", sys.modules)
+            self.assertNotIn(f"{name}.kernel", sys.modules)
+        finally:
+            _remove_package(name)
+
     def test_static_import_directions(self):
         def all_imports(filename):
             path = Path(filename)
@@ -166,8 +189,11 @@ class RmsNormImportContractTest(unittest.TestCase):
                 return any(alias.name == framework or alias.name.startswith(f"{framework}.") for alias in node.names)
             return node.level == 0 and (node.module == framework or (node.module or "").startswith(f"{framework}."))
 
-        op_kernel_imports = all_imports(_CUDNN_ROOT / "_op_kernel.py")
-        self.assertFalse(any(imports_framework(node, framework) for node in op_kernel_imports for framework in ("torch", "jax", "cutlass", "cuda")))
+        base_op_imports = all_imports(_CUDNN_ROOT / "_op.py")
+        self.assertFalse(any(imports_framework(node, framework) for node in base_op_imports for framework in ("torch", "jax", "cutlass", "cuda")))
+
+        operation_imports = all_imports("op.py")
+        self.assertFalse(any(imports_framework(node, framework) for node in operation_imports for framework in ("torch", "jax", "cutlass", "cuda")))
 
         kernel_imports = all_imports("kernel.py")
         self.assertFalse(any(imports_framework(node, framework) for node in kernel_imports for framework in ("torch", "jax")))
@@ -183,6 +209,7 @@ class RmsNormImportContractTest(unittest.TestCase):
         jax_package_tree = ast.parse((_CUDNN_ROOT / "_jax" / "__init__.py").read_text(), filename="_jax/__init__.py")
         jax_facade_tree = ast.parse((_CUDNN_ROOT / "jax" / "__init__.py").read_text(), filename="jax/__init__.py")
         jax_base_tree = ast.parse((_CUDNN_ROOT / "_jax" / "api_base.py").read_text(), filename="_jax/api_base.py")
+        op_tree = ast.parse((_OPERATION_ROOT / "op.py").read_text(), filename="op.py")
         kernel_tree = ast.parse((_OPERATION_ROOT / "kernel.py").read_text(), filename="kernel.py")
         torch_adapter = next(node for node in api_tree.body if isinstance(node, ast.ClassDef) and node.name == "RmsNormRhtAmaxSm100")
         self.assertEqual([base.id for base in torch_adapter.bases if isinstance(base, ast.Name)], ["APIBase"])
@@ -190,17 +217,18 @@ class RmsNormImportContractTest(unittest.TestCase):
         required_argument_count = len(constructor.args.args) - len(constructor.args.defaults)
         self.assertEqual(
             [argument.arg for argument in constructor.args.args[:required_argument_count]],
-            ["self", "sample_x", "sample_w"],
+            ["self", "sample_x", "sample_w", "sample_o", "sample_amax"],
         )
         self.assertNotIn(
             "_kernel",
             [argument.arg for argument in (*constructor.args.args, *constructor.args.kwonlyargs)],
         )
-        kernel_constructors = [
-            node for node in ast.walk(api_tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "RMSNormRHTAmaxKernel"
+        op_constructors = [
+            node for node in ast.walk(api_tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "RmsNormRhtAmaxSm100Op"
         ]
-        self.assertEqual(len(kernel_constructors), 1)
-        self.assertIn(kernel_constructors[0], ast.walk(constructor))
+        self.assertEqual(len(op_constructors), 1)
+        self.assertIn(op_constructors[0], ast.walk(constructor))
+        self.assertTrue({"x", "weight", "output", "amax"}.issubset({keyword.arg for keyword in op_constructors[0].keywords}))
         self.assertFalse(
             any(
                 isinstance(node, ast.FunctionDef) and any(isinstance(decorator, ast.Name) and decorator.id == "property" for decorator in node.decorator_list)
@@ -208,6 +236,8 @@ class RmsNormImportContractTest(unittest.TestCase):
             )
         )
         torch_check_support = next(node for node in torch_adapter.body if isinstance(node, ast.FunctionDef) and node.name == "check_support")
+        self.assertTrue(any(isinstance(node, ast.Attribute) and node.attr == "check_support" for node in ast.walk(torch_check_support)))
+        self.assertFalse(any(isinstance(node, ast.Attribute) and node.attr == "check_output" for node in ast.walk(torch_check_support)))
         self.assertFalse(
             any(
                 isinstance(node, ast.Attribute)
@@ -215,7 +245,7 @@ class RmsNormImportContractTest(unittest.TestCase):
                 and isinstance(node.value, ast.Attribute)
                 and isinstance(node.value.value, ast.Name)
                 and node.value.value.id == "self"
-                and node.value.attr == "_kernel"
+                and node.value.attr == "_op"
                 for node in ast.walk(torch_check_support)
             )
         )
@@ -224,7 +254,13 @@ class RmsNormImportContractTest(unittest.TestCase):
         self.assertEqual([base.id for base in jax_adapter.bases if isinstance(base, ast.Name)], ["JaxApiBase"])
         self.assertFalse(jax_adapter.decorator_list)
         self.assertTrue(
-            any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "RMSNormRHTAmaxKernel" for node in ast.walk(jax_adapter))
+            any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "RmsNormRhtAmaxSm100Op" for node in ast.walk(jax_adapter))
+        )
+        jax_check_support = next(node for node in jax_adapter.body if isinstance(node, ast.FunctionDef) and node.name == "check_support")
+        self.assertTrue(any(isinstance(node, ast.Attribute) and node.attr == "_check_device_compatibility" for node in ast.walk(jax_check_support)))
+        jax_launch = next(node for node in jax_adapter.body if isinstance(node, ast.FunctionDef) and node.name == "_launch")
+        self.assertTrue(
+            any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "RMSNormRHTAmaxKernel" for node in ast.walk(jax_launch))
         )
 
         jax_wrapper = next(node for node in jax_tree.body if isinstance(node, ast.FunctionDef) and node.name == "rmsnorm_rht_amax_sm100")
@@ -251,22 +287,20 @@ class RmsNormImportContractTest(unittest.TestCase):
                 for node in ast.walk(torch_wrapper)
             )
         )
-        self.assertFalse(any(isinstance(node, ast.Name) and node.id in {"best_num_threads", "pick_rows_per_cta"} for node in ast.walk(torch_wrapper)))
         torch_api_construction = next(
             node for node in ast.walk(torch_wrapper) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "RmsNormRhtAmaxSm100"
         )
-        self.assertFalse({"sample_o", "sample_amax"} & {keyword.arg for keyword in torch_api_construction.keywords})
+        self.assertTrue({"sample_o", "sample_amax"}.issubset({keyword.arg for keyword in torch_api_construction.keywords}))
 
         torch_execute = next(node for node in torch_adapter.body if isinstance(node, ast.FunctionDef) and node.name == "execute")
         self.assertEqual(
             [argument.arg for argument in torch_execute.args.args],
-            ["self", "x_tensor", "w_tensor", "current_stream"],
+            ["self", "x_tensor", "w_tensor", "o_tensor", "amax_tensor", "current_stream"],
         )
-        self.assertTrue(any(isinstance(node, ast.Attribute) and node.attr == "infer_output" for node in ast.walk(torch_execute)))
-        self.assertTrue(any(isinstance(node, ast.Attribute) and node.attr == "materialize" for node in ast.walk(torch_execute)))
+        self.assertFalse(any(isinstance(node, ast.Attribute) and node.attr in {"infer_output", "materialize"} for node in ast.walk(torch_execute)))
 
         kernel_class = next(node for node in kernel_tree.body if isinstance(node, ast.ClassDef) and node.name == "RMSNormRHTAmaxKernel")
-        self.assertEqual([base.id for base in kernel_class.bases if isinstance(base, ast.Name)], ["OpKernel"])
+        self.assertFalse(kernel_class.bases)
         launcher = next(node for node in kernel_class.body if isinstance(node, ast.FunctionDef) and node.name == "__call__")
         self.assertEqual(
             [argument.arg for argument in launcher.args.args],
@@ -274,6 +308,11 @@ class RmsNormImportContractTest(unittest.TestCase):
         )
 
         compile_method = next(node for node in torch_adapter.body if isinstance(node, ast.FunctionDef) and node.name == "compile")
+        kernel_constructors = [
+            node for node in ast.walk(api_tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "RMSNormRHTAmaxKernel"
+        ]
+        self.assertEqual(len(kernel_constructors), 1)
+        self.assertIn(kernel_constructors[0], ast.walk(compile_method))
         self.assertTrue(
             {"n", "rows_per_cta"}.issubset(
                 {
@@ -283,7 +322,7 @@ class RmsNormImportContractTest(unittest.TestCase):
                     and isinstance(node.value, ast.Attribute)
                     and isinstance(node.value.value, ast.Name)
                     and node.value.value.id == "self"
-                    and node.value.attr == "_kernel"
+                    and node.value.attr == "_op"
                 }
             )
         )
@@ -296,11 +335,17 @@ class RmsNormImportContractTest(unittest.TestCase):
             ["x_tensor", "w_tensor", "o_tensor", "amax_tensor", "stream"],
         )
 
+        operation_class = next(node for node in op_tree.body if isinstance(node, ast.ClassDef) and node.name == "RmsNormRhtAmaxSm100Op")
+        self.assertEqual([base.id for base in operation_class.bases if isinstance(base, ast.Name)], ["Op"])
         self.assertTrue(any(isinstance(node, ast.Attribute) and node.attr == "_call_kernel" for node in ast.walk(jax_adapter)))
         self.assertFalse(
             any(isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "cutlass_call" for node in ast.walk(jax_adapter))
         )
         self.assertIn("_INSTALL_HINT", {node.id for node in ast.walk(jax_facade_tree) if isinstance(node, ast.Name)})
+        self.assertIn(
+            "disable_device_compatibility_checks",
+            {alias.name for node in ast.walk(jax_facade_tree) if isinstance(node, ast.ImportFrom) for alias in node.names},
+        )
         self.assertTrue(any(isinstance(node, ast.Attribute) and node.attr == "is_available" for node in ast.walk(jax_facade_tree)))
         self.assertTrue(any(isinstance(node, ast.Try) for node in jax_facade_tree.body))
         self.assertTrue(any(isinstance(node, ast.Import) and any(alias.name == "jax" for alias in node.names) for node in jax_tree.body))
@@ -319,7 +364,7 @@ class RmsNormImportContractTest(unittest.TestCase):
         self.assertNotIn("_trace_lock", {node.attr for node in ast.walk(jax_adapter) if isinstance(node, ast.Attribute)})
 
         root_source = (_CUDNN_ROOT / "__init__.py").read_text()
-        self.assertIn("from ._op_kernel import OpKernel", root_source)
+        self.assertIn("from ._op import Op", root_source)
         self.assertIn("from ._tensor_desc import TensorDesc", root_source)
         self.assertIn('if name == "jax":', root_source)
         self.assertIn('importlib.import_module(".jax", __name__)', root_source)

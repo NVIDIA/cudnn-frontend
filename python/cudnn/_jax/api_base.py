@@ -10,9 +10,25 @@ from collections.abc import Callable
 from typing import Any
 
 from .. import data_type
-from .._op_kernel import OpKernel
 from .._tensor_desc import TensorDesc
 from .layout import compact_stride, normalize_mode, to_canonical_axes, to_cutlass_layout, to_public_axes
+
+_DEVICE_COMPATIBILITY_CHECKS_DISABLED = False
+_DEVICE_COMPATIBILITY_CHECK_DISABLE_HINT = "Call cudnn.jax.disable_device_compatibility_checks(True) before tracing to allow AOT or remote compilation."
+
+
+def disable_device_compatibility_checks(disabled: bool) -> None:
+    """Enable or disable local-device compatibility checks for future traces.
+
+    This process-global setting does not invalidate existing JAX compilation
+    cache entries. Configure it before calling ``jax.jit`` or ``lower``.
+    """
+
+    if not isinstance(disabled, bool):
+        raise TypeError(f"disabled must be a bool, got {type(disabled).__name__}")
+
+    global _DEVICE_COMPATIBILITY_CHECKS_DISABLED
+    _DEVICE_COMPATIBILITY_CHECKS_DISABLED = disabled
 
 
 class JaxTensorDesc(TensorDesc[Any]):
@@ -62,9 +78,52 @@ def _require_array_metadata(value: Any, name: str) -> tuple[Any, ...]:
 
 
 class JaxApiBase(ABC):
-    """Common tensor metadata, validation, and kernel binding for JAX adapters."""
+    """Common tensor metadata, validation, and CuTe binding for JAX adapters."""
 
-    kernel: OpKernel
+    @staticmethod
+    def _check_device_compatibility(
+        *,
+        minimum_compute_capability: int,
+        operation_name: str,
+    ) -> None:
+        """Require every local JAX GPU to satisfy an operation's minimum SM."""
+
+        if _DEVICE_COMPATIBILITY_CHECKS_DISABLED:
+            return
+
+        import jax
+
+        def compatibility_error(reason: str) -> RuntimeError:
+            return RuntimeError(f"{operation_name} requires SM{minimum_compute_capability}+, {reason}. " f"{_DEVICE_COMPATIBILITY_CHECK_DISABLE_HINT}")
+
+        try:
+            devices = tuple(jax.local_devices(backend="gpu"))
+        except RuntimeError as error:
+            raise compatibility_error("but JAX could not discover a local GPU") from error
+
+        if not devices:
+            raise compatibility_error("but no local JAX GPU is available")
+
+        minimum_major, minimum_minor = divmod(minimum_compute_capability, 10)
+        incompatible = []
+        for device in devices:
+            reported_capability = getattr(device, "compute_capability", None)
+            try:
+                components = str(reported_capability).split(".")
+                if len(components) != 2:
+                    raise ValueError
+                major, minor = (int(value) for value in components)
+                if major < 0 or minor < 0:
+                    raise ValueError
+            except (TypeError, ValueError) as error:
+                raise compatibility_error(f"but JAX reported an invalid compute capability {reported_capability!r} for {device}") from error
+
+            if (major, minor) < (minimum_major, minimum_minor):
+                incompatible.append((device, major, minor))
+
+        if incompatible:
+            found = ", ".join(f"{device} (SM{major}{minor})" for device, major, minor in incompatible)
+            raise compatibility_error(f"found {found}")
 
     @staticmethod
     def _to_tensor_desc(
@@ -72,6 +131,7 @@ class JaxApiBase(ABC):
         name: str,
         *,
         mode: tuple[int, ...] | None = None,
+        init_value: bool | int | float | None = None,
     ) -> JaxTensorDesc:
         """Describe a public JAX array in canonical kernel-axis order.
 
@@ -92,6 +152,7 @@ class JaxApiBase(ABC):
             stride=to_canonical_axes(public_stride, mode),
             stride_order=tuple(canonical_axis_by_public_axis[axis] for axis in public_stride_order),
             name=name,
+            init_value=init_value,
         )
 
     @staticmethod
@@ -181,6 +242,8 @@ class JaxApiBase(ABC):
         self,
         inputs: tuple[Any, ...],
         *,
+        output_descs: tuple[TensorDesc[Any], ...],
+        workspace_descs: tuple[TensorDesc[Any], ...] = (),
         input_spec: tuple[Any | None, ...] | None = None,
         output_spec: tuple[Any | None, ...] | None = None,
         workspace_spec: tuple[Any | None, ...] | None = None,
@@ -188,10 +251,10 @@ class JaxApiBase(ABC):
         compile_options: Any = None,
         use_static_tensors: bool = True,
     ) -> tuple[Any, ...]:
-        """Bind the owned kernel to JAX and return its public outputs.
+        """Bind this adapter's launch hook to JAX and return public outputs.
 
         CUTLASS JAX supplies the stream first; the launcher adapts that call to
-        the kernel's ``inputs, outputs, workspaces, stream`` order. Workspaces
+        the adapter's ``inputs, outputs, workspaces, stream`` launch hook. Workspaces
         are declared as custom-call results so XLA owns their lifetime, then
         omitted from this method's return value. Descriptors with a non-``None``
         ``init_value`` are materialized as JAX inputs and aliased to their
@@ -205,15 +268,15 @@ class JaxApiBase(ABC):
         inputs = tuple(inputs)
         for index, value in enumerate(inputs):
             _require_array_metadata(value, f"input #{index}")
-        outputs = tuple(self.kernel.infer_output())
-        workspaces = tuple(self.kernel.infer_workspace())
+        outputs = tuple(output_descs)
+        workspaces = tuple(workspace_descs)
         if not outputs:
-            raise ValueError("A JAX operation must infer at least one output")
+            raise ValueError("A JAX operation must provide at least one output descriptor")
 
         for label, descs in (("output", outputs), ("workspace", workspaces)):
             for desc in descs:
                 if not isinstance(desc, TensorDesc):
-                    raise TypeError(f"{label} inference must return TensorDesc values, got {type(desc).__name__}")
+                    raise TypeError(f"{label}_descs must contain TensorDesc values, got {type(desc).__name__}")
 
         if input_spec is None:
             input_specs = (None,) * len(inputs)
@@ -273,7 +336,9 @@ class JaxApiBase(ABC):
                 ordered_buffers[index] = value
             for index, value in zip(uninitialized, allocated_buffers):
                 ordered_buffers[index] = value
-            self.kernel(*kernel_inputs, *ordered_buffers, stream)
+            output_buffers = tuple(ordered_buffers[: len(outputs)])
+            workspace_buffers = tuple(ordered_buffers[len(outputs) :])
+            self._launch(tuple(kernel_inputs), output_buffers, workspace_buffers, stream)
 
         call = cutlass_jax.cutlass_call(
             launcher,
@@ -291,6 +356,16 @@ class JaxApiBase(ABC):
         return tuple(results[: len(outputs)])
 
     @abstractmethod
+    def _launch(
+        self,
+        inputs: tuple[Any, ...],
+        outputs: tuple[Any, ...],
+        workspaces: tuple[Any, ...],
+        stream: Any,
+    ) -> None:
+        """Launch the concrete CuTe kernel for one traced custom call."""
+
+    @abstractmethod
     def check_support(self) -> bool:
         """Validate the operation signature and static configuration."""
 
@@ -304,4 +379,4 @@ class JaxApiBase(ABC):
         return self
 
 
-__all__ = ["JaxApiBase", "JaxTensorDesc"]
+__all__ = ["JaxApiBase", "JaxTensorDesc", "disable_device_compatibility_checks"]

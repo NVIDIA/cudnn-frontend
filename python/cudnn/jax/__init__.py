@@ -24,7 +24,7 @@ if not _cutlass_jax.is_available():
         f"Install the optional JAX dependencies with `{_INSTALL_HINT}`."
     )
 
-from .._jax import JaxApiBase, JaxTensorDesc
+from .._jax import JaxApiBase, JaxTensorDesc, disable_device_compatibility_checks
 from ..rmsnorm_rht_amax.jax import (
     RmsNormRhtAmaxSm100,
     rmsnorm_rht_amax_sm100,
@@ -33,6 +33,7 @@ from ..rmsnorm_rht_amax.jax import (
 __all__ = [
     "JaxApiBase",
     "JaxTensorDesc",
+    "disable_device_compatibility_checks",
     "RmsNormRhtAmaxSm100",
     "rmsnorm_rht_amax_sm100",
 ]

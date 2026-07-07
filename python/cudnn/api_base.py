@@ -949,22 +949,6 @@ class APIBase(ABC):
             raise ValueError(f"Expected dtype to be a torch.dtype or list, got {type(dtype)}")
         return tensor_dtype
 
-    def _check_tensor_signature(self, tensor: torch.Tensor, expected: TensorDesc) -> None:
-        """Validate a Torch tensor against a captured logical descriptor."""
-
-        if not isinstance(expected, TensorDesc):
-            raise TypeError(f"expected must be a TensorDesc, got {type(expected).__name__}")
-        name = expected.name or "tensor"
-        actual = self._make_tensor_desc(
-            tensor,
-            name=name,
-            interpret_uint8_as_fp4x2=expected.interpret_uint8_as_fp4x2,
-        )
-        self._check_tensor_shape(actual, expected.shape, name)
-        self._check_tensor_stride(actual, stride=expected.stride, stride_order=expected.stride_order, name=name)
-        self._check_dtype(actual, expected.dtype, name)
-        self._value_error_if(actual.device != expected.device, f"{name} tensor device mismatch: expected {expected.device}, got {actual.device}")
-
     def _value_error_if(self, condition: bool, error_msg: str) -> None:
         """Raise a ValueError if the condition is true.
 

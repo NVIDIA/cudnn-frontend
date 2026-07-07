@@ -59,7 +59,7 @@ def _assert_ref_close(x, w, o, amax, *, eps: float, rows_per_cta: int, skip_ref:
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 @pytest.mark.parametrize("n,num_threads", SUPPORTED_N_NUM_THREADS)
-def test_rmsnorm_rht_amax_class_call(n, num_threads, request):
+def test_rmsnorm_rht_amax_compile_execute(n, num_threads, request):
     try:
         from cudnn import RmsNormRhtAmaxSm100
     except ImportError:
@@ -70,10 +70,14 @@ def test_rmsnorm_rht_amax_class_call(n, num_threads, request):
     m = 256
     rows_per_cta = 2
     x, w = _make_inputs(m=m, n=n)
+    o = torch.empty_like(x)
+    amax = torch.full((m // rows_per_cta,), float("-inf"), dtype=torch.float32, device="cuda")
 
     api = RmsNormRhtAmaxSm100(
         sample_x=x,
         sample_w=w,
+        sample_o=o,
+        sample_amax=amax,
         eps=eps,
         num_threads=num_threads,
         rows_per_cta=rows_per_cta,
@@ -87,15 +91,14 @@ def test_rmsnorm_rht_amax_class_call(n, num_threads, request):
     except (ValueError, RuntimeError) as exc:
         pytest.skip(f"Unsupported testcase: {exc}")
 
-    outputs = api(x, w)
-    o, amax = outputs
-    assert outputs["o_tensor"] is o
-    assert outputs["amax_tensor"] is amax
+    api.compile()
+    result = api.execute(x_tensor=x, w_tensor=w, o_tensor=o, amax_tensor=amax)
+    assert result is None
     _assert_ref_close(x, w, o, amax, eps=eps, rows_per_cta=rows_per_cta, skip_ref=skip_ref)
 
 
 @pytest.mark.L0
-def test_rmsnorm_rht_amax_class_rejects_runtime_signature_mismatch(monkeypatch):
+def test_rmsnorm_rht_amax_class_rejects_invalid_output_exemplars(monkeypatch):
     try:
         from cudnn import RmsNormRhtAmaxSm100
     except ImportError:
@@ -103,14 +106,60 @@ def test_rmsnorm_rht_amax_class_rejects_runtime_signature_mismatch(monkeypatch):
 
     sample_x = torch.empty((4, 256), dtype=torch.bfloat16)
     sample_w = torch.empty((256,), dtype=torch.bfloat16)
-    api = RmsNormRhtAmaxSm100(sample_x, sample_w, num_threads=32, rows_per_cta=2)
-    api._compiled_kernel = lambda **_kwargs: None
-    monkeypatch.setattr(api._kernel, "infer_output", lambda: pytest.fail("output inference must follow runtime signature validation"))
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (10, 0))
 
-    with pytest.raises(ValueError, match="sample_x tensor shape mismatch"):
-        api.execute(torch.empty((2, 256), dtype=torch.bfloat16), sample_w)
-    with pytest.raises(ValueError, match="sample_w dtype mismatch"):
-        api.execute(sample_x, torch.empty((256,), dtype=torch.float32))
+    cases = (
+        (torch.empty((2, 256), dtype=torch.bfloat16), torch.empty((2,), dtype=torch.float32), "O must have shape"),
+        (torch.empty((4, 256), dtype=torch.float32), torch.empty((2,), dtype=torch.float32), "O must have dtype"),
+        (torch.empty_strided((4, 256), (1, 4), dtype=torch.bfloat16), torch.empty((2,), dtype=torch.float32), "O must be row-major contiguous"),
+        (torch.empty((4, 256), dtype=torch.bfloat16), torch.empty((1,), dtype=torch.float32), "Amax must have shape"),
+        (torch.empty((4, 256), dtype=torch.bfloat16), torch.empty((2,), dtype=torch.bfloat16), "Amax must have dtype"),
+    )
+    for sample_o, sample_amax, message in cases:
+        with pytest.raises(ValueError, match=message):
+            RmsNormRhtAmaxSm100(
+                sample_x,
+                sample_w,
+                sample_o,
+                sample_amax,
+                num_threads=32,
+                rows_per_cta=2,
+            ).check_support()
+
+    strided_amax = torch.empty_strided((2,), (2,), dtype=torch.float32)
+    assert RmsNormRhtAmaxSm100(
+        sample_x,
+        sample_w,
+        torch.empty_like(sample_x),
+        strided_amax,
+        num_threads=32,
+        rows_per_cta=2,
+    ).check_support()
+
+
+@pytest.mark.L0
+def test_rmsnorm_rht_amax_execute_checks_dynamic_amax_shape():
+    try:
+        from cudnn import RmsNormRhtAmaxSm100
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn optional dependencies not installed")
+
+    x = torch.empty((4, 256), dtype=torch.bfloat16)
+    w = torch.empty((256,), dtype=torch.bfloat16)
+    o = torch.empty_like(x)
+    amax = torch.empty((2,), dtype=torch.float32)
+    api = RmsNormRhtAmaxSm100(x, w, o, amax, num_threads=32, rows_per_cta=2)
+    api._op.check_support()
+    api._compiled_kernel = lambda **_kwargs: None
+
+    with pytest.raises(ValueError, match="Amax tensor shape mismatch"):
+        api.execute(x, w, o, torch.empty((1,), dtype=torch.float32))
+
+    dynamic_x = torch.empty((8, 256), dtype=torch.bfloat16)
+    dynamic_o = torch.empty_like(dynamic_x)
+    dynamic_amax = torch.empty((4,), dtype=torch.float32)
+    assert api.execute(dynamic_x, w, dynamic_o, dynamic_amax, current_stream=object()) is None
 
 
 @pytest.mark.L0
@@ -146,7 +195,7 @@ def test_rmsnorm_rht_amax_wrapper(n, num_threads, rows_per_cta, request):
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
-def test_rmsnorm_rht_amax_wrapper_reuses_owned_kernel(monkeypatch):
+def test_rmsnorm_rht_amax_wrapper_reuses_compiled_kernel(monkeypatch):
     try:
         from cudnn.rmsnorm_rht_amax import api as rmsnorm_api
     except ImportError:
@@ -163,32 +212,36 @@ def test_rmsnorm_rht_amax_wrapper_reuses_owned_kernel(monkeypatch):
     monkeypatch.setattr(rmsnorm_api.RMSNormRHTAmaxKernel, "__init__", counted_init)
     rmsnorm_api._cache_of_RmsNormRhtAmaxSm100Objects.clear()
 
-    m, n = 256, 2048
+    first_m, second_m, n = 256, 512, 2048
     rows_per_cta = 2
-    x, w = _make_inputs(m=m, n=n)
+    first_x, w = _make_inputs(m=first_m, n=n)
+    second_x, _ = _make_inputs(m=second_m, n=n)
     try:
-        first = rmsnorm_api.rmsnorm_rht_amax_wrapper_sm100(x, w, num_threads=128, rows_per_cta=rows_per_cta)
-        second = rmsnorm_api.rmsnorm_rht_amax_wrapper_sm100(x, w, num_threads=128, rows_per_cta=rows_per_cta)
-    except (ValueError, RuntimeError) as exc:
-        pytest.skip(f"Unsupported testcase: {exc}")
+        try:
+            first = rmsnorm_api.rmsnorm_rht_amax_wrapper_sm100(first_x, w, num_threads=128, rows_per_cta=rows_per_cta)
+        except (ValueError, RuntimeError) as exc:
+            pytest.skip(f"Unsupported testcase: {exc}")
+
+        second = rmsnorm_api.rmsnorm_rht_amax_wrapper_sm100(second_x, w, num_threads=128, rows_per_cta=rows_per_cta)
+        _assert_ref_close(second_x, w, second["o_tensor"], second["amax_tensor"], eps=1e-5, rows_per_cta=rows_per_cta)
+
+        assert construction_count == 1
+        assert first["o_tensor"].shape == (first_m, n)
+        assert second["o_tensor"].shape == (second_m, n)
+        assert first["amax_tensor"].shape == (first_m // rows_per_cta,)
+        assert second["amax_tensor"].shape == (second_m // rows_per_cta,)
     finally:
         rmsnorm_api._cache_of_RmsNormRhtAmaxSm100Objects.clear()
 
-    assert construction_count == 1
-    assert first["o_tensor"].shape == second["o_tensor"].shape == (m, n)
-    assert first["amax_tensor"].shape == second["amax_tensor"].shape == (m // rows_per_cta,)
-
 
 @pytest.mark.L0
-def test_rmsnorm_rht_amax_wrapper_delegates_output_allocation_to_class(monkeypatch):
+def test_rmsnorm_rht_amax_wrapper_passes_allocated_outputs_to_class(monkeypatch):
     try:
         from cudnn.rmsnorm_rht_amax import api as rmsnorm_api
     except ImportError:
         pytest.skip("Environment not supported: cudnn optional dependencies not installed")
 
     constructed = {}
-    output = torch.empty((3, 5), dtype=torch.bfloat16)
-    amax = torch.full((7,), -2.0, dtype=torch.float32)
 
     class FakeApi:
         def __init__(self, **kwargs):
@@ -202,20 +255,25 @@ def test_rmsnorm_rht_amax_wrapper_delegates_output_allocation_to_class(monkeypat
 
         def execute(self, **kwargs):
             constructed["execute"] = kwargs
-            return rmsnorm_api.TupleDict(o_tensor=output, amax_tensor=amax)
 
     monkeypatch.setattr(rmsnorm_api, "RmsNormRhtAmaxSm100", FakeApi)
     rmsnorm_api._cache_of_RmsNormRhtAmaxSm100Objects.clear()
 
-    x = torch.empty((4, 16), dtype=torch.bfloat16)
-    w = torch.empty((16,), dtype=torch.bfloat16)
+    x = torch.empty((4, 256), dtype=torch.bfloat16)
+    w = torch.empty((256,), dtype=torch.bfloat16)
     try:
-        result = rmsnorm_api.rmsnorm_rht_amax_wrapper_sm100(x, w, rows_per_cta=4)
+        result = rmsnorm_api.rmsnorm_rht_amax_wrapper_sm100(x, w, num_threads=32, rows_per_cta=4)
     finally:
         rmsnorm_api._cache_of_RmsNormRhtAmaxSm100Objects.clear()
 
-    assert set(constructed) == {"sample_x", "sample_w", "eps", "num_threads", "rows_per_cta", "execute"}
-    assert result["o_tensor"] is output
-    assert result["amax_tensor"] is amax
-    assert torch.all(result["amax_tensor"] == -2.0)
-    assert constructed["execute"] == {"x_tensor": x, "w_tensor": w, "current_stream": None}
+    assert set(constructed) == {"sample_x", "sample_w", "sample_o", "sample_amax", "eps", "num_threads", "rows_per_cta", "execute"}
+    assert constructed["sample_o"] is result["o_tensor"]
+    assert constructed["sample_amax"] is result["amax_tensor"]
+    assert torch.isneginf(result["amax_tensor"]).all()
+    assert constructed["execute"] == {
+        "x_tensor": x,
+        "w_tensor": w,
+        "o_tensor": result["o_tensor"],
+        "amax_tensor": result["amax_tensor"],
+        "current_stream": None,
+    }

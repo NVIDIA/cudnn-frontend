@@ -10,6 +10,7 @@ This frontend integration exposes the kernel as a standard FE-OSS Python API wit
 - a class API (`RmsNormRhtAmaxSm100`)
 - a wrapper API (`rmsnorm_rht_amax_wrapper_sm100`)
 - an explicit JAX API under `cudnn.jax`
+- a framework-neutral operation signature in `op.py` and a CUTE DSL implementation in `kernel.py`
 - grouped-gemm-style regression coverage for compile/execute, wrapper use, and cache reuse
 
 ## Shapes
@@ -81,17 +82,28 @@ from cudnn import RmsNormRhtAmaxSm100
 op = RmsNormRhtAmaxSm100(
     sample_x=x,
     sample_w=w,
+    sample_o=o,
+    sample_amax=amax,
     eps=1e-5,
     num_threads=128,
     rows_per_cta=2,
 )
-o, amax = op(x, w, current_stream=None)
+assert op.check_support()
+op.compile()
+op.execute(
+    x_tensor=x,
+    w_tensor=w,
+    o_tensor=o,
+    amax_tensor=amax,
+    current_stream=None,
+)
 ```
 
-The class infers and allocates its outputs from the validated sample input
-descriptors. Runtime inputs must match the sample shape, layout, dtype, and
-device. `check_support()` and `compile()` remain available when the caller
-wants to run those steps explicitly; the call operator performs them lazily.
+The PyTorch class preserves caller-owned output buffers. During
+`check_support()`, the framework-neutral operation validates the complete
+input and output exemplar signature and resolves the launch configuration.
+`compile()` then constructs the CUTE DSL kernel from that resolved
+configuration.
 
 ### JAX API
 
@@ -102,7 +114,8 @@ pip install 'nvidia-cudnn-frontend[jax]'
 ```
 
 ```python
-from cudnn.jax import rmsnorm_rht_amax_sm100
+import jax
+from cudnn.jax import RmsNormRhtAmaxSm100, rmsnorm_rht_amax_sm100
 
 o, amax = rmsnorm_rht_amax_sm100(
     x,
@@ -111,19 +124,47 @@ o, amax = rmsnorm_rht_amax_sm100(
     num_threads=128,
     rows_per_cta=2,
 )
+
+# The class API specializes from abstract placeholders, then accepts arrays
+# when called under JAX transformations.
+x_spec = jax.ShapeDtypeStruct(x.shape, x.dtype)
+w_spec = jax.ShapeDtypeStruct(w.shape, w.dtype)
+op = RmsNormRhtAmaxSm100(x_spec, w_spec, rows_per_cta=2)
+o, amax = jax.jit(op)(x, w)
 ```
 
 The function API is JIT-compiled and treats `eps`, `num_threads`, and
 `rows_per_cta` as static compilation options. Use `RmsNormRhtAmaxSm100`
-directly when the caller needs to control JAX transformations explicitly. Its
-class API follows the same `RmsNormRhtAmaxSm100(sample_x, sample_w)(x, w)`
-pattern as PyTorch.
+directly when the caller needs to control JAX transformations explicitly. A
+JAX array or another object exposing shape and dtype may be used instead of a
+`ShapeDtypeStruct` exemplar; only its metadata is retained. Unlike PyTorch,
+JAX derives output descriptors in its adapter and lets XLA allocate the
+results. Callers may instead provide both `sample_o` and `sample_amax` as
+explicit output placeholders. In either case, the common operation validates
+the complete signature through `check_support()`.
 
-JAX buffers remain row-major. Framework-specific mode metadata maps public JAX axes into the canonical kernel axis order without materializing a transpose.
+By default, JAX support validation requires every local GPU to meet the
+operation's SM100 minimum. AOT or remote compilation without a compatible
+local target device requires an explicit process-wide opt-out before tracing:
+
+```python
+import cudnn.jax
+
+cudnn.jax.disable_device_compatibility_checks(True)
+lowered = rmsnorm_rht_amax_sm100.lower(x_spec, w_spec)
+```
+
+Pass `False` to re-enable the checks. Changing this setting does not
+invalidate existing JAX compilation-cache entries, so configure it before the
+first `jax.jit` or `lower` call for a signature.
+
+The current JAX adapter models its buffers as row-major with the public and
+kernel axes in the same order. Additional JAX-specific axis mappings can be
+added without changing the framework-neutral operation signature.
 
 ## Parameters
 
-### Input tensors
+### PyTorch input and output tensors
 
 - `x_tensor` / `sample_x`
   - Shape: `(M, N)`
@@ -133,6 +174,16 @@ JAX buffers remain row-major. Framework-specific mode metadata maps public JAX a
   - Shape: `(N,)`
   - Layout: contiguous
   - Dtype: `torch.bfloat16`
+- `o_tensor` / `sample_o`
+  - Shape: `(M, N)`
+  - Layout: row-major contiguous
+  - Dtype: `torch.bfloat16`
+- `amax_tensor` / `sample_amax`
+  - Shape: `(M / rows_per_cta,)`
+  - Dtype: `torch.float32`
+
+The JAX API uses the same shapes and layouts with `jax.numpy.bfloat16` for
+`X`, `W`, and `O`, and `jax.numpy.float32` for `Amax`.
 
 ### Common parameters
 
@@ -142,11 +193,14 @@ JAX buffers remain row-major. Framework-specific mode metadata maps public JAX a
   - Threads per CTA. If omitted, the API uses the upstream-tuned table when possible, otherwise a valid fallback search.
 - `rows_per_cta: Optional[int]`
   - Rows processed by each CTA. If omitted, the wrapper uses the upstream-style heuristic over `{2, 4, 8}`.
-- CUDA stream (`current_stream`)
+
+The PyTorch `execute()` and wrapper APIs additionally accept the optional
+CUDA stream argument `current_stream`. JAX execution uses the stream supplied
+by XLA.
 
 ### Return values
 
-The PyTorch class and wrapper return a `TupleDict` with keys:
+The PyTorch wrapper returns a `TupleDict` with keys:
 
 - `o_tensor`
   - Shape: `(M, N)`
@@ -158,6 +212,9 @@ The PyTorch class and wrapper return a `TupleDict` with keys:
 
 Tuple unpacking order is `(o_tensor, amax_tensor)`.
 
+The class API writes into its caller-provided output tensors and returns
+`None`.
+
 ## Support surface and constraints
 
 - Requires SM100+.
@@ -166,7 +223,7 @@ Tuple unpacking order is `(o_tensor, amax_tensor)`.
 - `EPT = N / num_threads` must be at least `8` and divisible by `8`.
 - `M` must be divisible by `rows_per_cta`.
 - `X`, `W`, and `O` use bf16; `amax` uses float32.
-- PyTorch input tensors must be 16-byte aligned.
+- PyTorch input and output tensors must be 16-byte aligned.
 - The frontend integration matches the upstream RMSNorm kernel semantics; it does not expose full LayerNorm mean/bias behavior.
 
 ## Verification
