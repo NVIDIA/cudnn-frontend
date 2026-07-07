@@ -537,16 +537,41 @@ def _b2b_bwd_primitive(
     skip_bias: Tensor,
     y: Tensor,
 ) -> List[Tensor]:
+    if x.dim() != 3:
+        raise ValueError(f"Expected x(3D) with shape (batch, 3*dim, seq_len); got {x.shape}")
+    if x.shape[1] % 3 != 0:
+        raise ValueError(f"Expected x.shape[1] divisible by 3; got {x.shape[1]}")
     batch = x.shape[0]
     dim = x.shape[1] // 3
     seq_len = x.shape[2]
 
+    if weights_proj.dim() != 2 or weights_mixer.dim() != 2 or skip_bias.dim() != 1:
+        raise ValueError(
+            f"Expected weights_proj(2D: 3*dim,K_proj), weights_mixer(2D: dim,K_mixer), skip_bias(1D: dim); "
+            f"got {weights_proj.shape}, {weights_mixer.shape}, {skip_bias.shape}"
+        )
+    if y.shape != (batch, dim, seq_len):
+        raise ValueError(f"Shape mismatch: expected y shape {(batch, dim, seq_len)}; got {y.shape}")
     if grad_y.shape != y.shape:
         raise ValueError(f"Shape mismatch: grad_y {grad_y.shape} vs y {y.shape}")
-    if not grad_y.is_cuda:
-        raise ValueError(f"grad_y must be on CUDA: grad_y.device={grad_y.device}")
-    if grad_y.dtype != x.dtype:
-        raise ValueError(f"Dtype mismatch: grad_y.dtype={grad_y.dtype}, x.dtype={x.dtype}")
+    if not (x.is_cuda and weights_proj.is_cuda and weights_mixer.is_cuda and skip_bias.is_cuda and y.is_cuda and grad_y.is_cuda):
+        raise ValueError("All tensors must be on CUDA")
+    if not (x.device == weights_proj.device == weights_mixer.device == skip_bias.device == y.device == grad_y.device):
+        raise ValueError("All tensors must be on the same device")
+
+    if not (x.dtype == weights_proj.dtype == weights_mixer.dtype == skip_bias.dtype == y.dtype == grad_y.dtype):
+        raise TypeError(
+            f"Dtype mismatch: x.dtype={x.dtype}, weights_proj.dtype={weights_proj.dtype}, "
+            f"weights_mixer.dtype={weights_mixer.dtype}, skip_bias.dtype={skip_bias.dtype}, "
+            f"y.dtype={y.dtype}, grad_y.dtype={grad_y.dtype}"
+        )
+
+    if weights_proj.shape[0] != 3 * dim:
+        raise ValueError(f"Channel mismatch: x has 3*dim={3*dim} but weights_proj has shape {weights_proj.shape}")
+    if weights_mixer.shape[0] != dim:
+        raise ValueError(f"Channel mismatch: x has dim={dim} but weights_mixer has shape {weights_mixer.shape}")
+    if skip_bias.shape[0] != dim:
+        raise ValueError(f"Channel mismatch: x has dim={dim} but skip_bias has shape {skip_bias.shape}")
 
     x = x.contiguous()
     weights_proj = weights_proj.contiguous()
@@ -623,6 +648,8 @@ def _b2b_setup_context(ctx, inputs, output):
 
 @torch.compiler.allow_in_graph
 def _b2b_autograd_bwd(ctx, grad_y, grad_y_gated):
+    if grad_y is not None:
+        raise RuntimeError("Gradient for the intermediate B2B output y is not supported; use cudnn.ops.b2b_causal_conv1d")
     x, weights_proj, weights_mixer, skip_bias, y = ctx.saved_tensors
     dx, dwp, dwm, dsb = torch.ops.cudnn.b2b_causal_conv1d_bwd_primitive(grad_y_gated, x, weights_proj, weights_mixer, skip_bias, y)
     return dx, dwp, dwm, dsb
