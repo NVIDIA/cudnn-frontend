@@ -37,6 +37,12 @@ import logging
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import cudnn
+
+# Graph tensors come in two forms post-unification: the classic pybind
+# ``cudnn.tensor`` (deserialized/legacy graphs) and the Python-IR
+# ``cudnn.Tensor`` returned by ``cudnn.pygraph`` ops. Both duck-type the same
+# getters (get_name/get_uid/get_dim/...).
+_GRAPH_TENSOR_TYPES = (cudnn.tensor, cudnn.Tensor)
 import cudnn.datatypes
 from cudnn import data_type, heur_mode
 
@@ -112,7 +118,7 @@ def _find_tensor(
         for tensor_name, tensor_value in tensor_map.items():
             if tensor_value.get_uid() == tensor:
                 return tensor_name
-    elif isinstance(tensor, cudnn.tensor):
+    elif isinstance(tensor, _GRAPH_TENSOR_TYPES):
         for tensor_name, tensor_value in tensor_map.items():
             if tensor is tensor_value:
                 return tensor_name
@@ -398,7 +404,7 @@ class Graph:
                             if obj_id not in self.__tensor_map:
                                 self.__tensor_map[obj_id] = _graph_tensor(self.__graph, elem)
                             obj[j] = self.__tensor_map[obj_id]
-                        if isinstance(obj[j], cudnn.tensor):
+                        if isinstance(obj[j], _GRAPH_TENSOR_TYPES):
                             self.__tensor_in[f"{node_name}::{i}::{j}"] = obj[j]
                     obj = args[i] = tuple(obj)  # convert back to tuple
                 if hasattr(obj, "__dlpack__"):
@@ -406,7 +412,7 @@ class Graph:
                     if obj_id not in self.__tensor_map:
                         self.__tensor_map[obj_id] = _graph_tensor(self.__graph, obj)
                     obj = args[i] = self.__tensor_map[obj_id]
-                if isinstance(obj, cudnn.tensor):
+                if isinstance(obj, _GRAPH_TENSOR_TYPES):
                     self.__tensor_in[f"{node_name}::{i}"] = obj
             # process keyword arguments for dlpack tensors
             for key, obj in kwargs.items():
@@ -419,7 +425,7 @@ class Graph:
                             if obj_id not in self.__tensor_map:
                                 self.__tensor_map[obj_id] = _graph_tensor(self.__graph, elem)
                             obj[j] = self.__tensor_map[obj_id]
-                        if isinstance(obj[j], cudnn.tensor):
+                        if isinstance(obj[j], _GRAPH_TENSOR_TYPES):
                             self.__tensor_in[f"{node_name}::{key}::{j}"] = obj[j]
                     obj = kwargs[key] = tuple(obj)  # convert back to tuple
                 if hasattr(obj, "__dlpack__"):
@@ -427,16 +433,16 @@ class Graph:
                     if obj_id not in self.__tensor_map:
                         self.__tensor_map[obj_id] = _graph_tensor(self.__graph, obj)
                     obj = kwargs[key] = self.__tensor_map[obj_id]
-                if isinstance(obj, cudnn.tensor):
+                if isinstance(obj, _GRAPH_TENSOR_TYPES):
                     self.__tensor_in[f"{node_name}::{key}"] = obj
             # capturing node output
             output = attr(*args, **kwargs)
-            if isinstance(output, cudnn.tensor):
+            if isinstance(output, _GRAPH_TENSOR_TYPES):
                 output_list = [output]
             elif isinstance(output, (list, tuple)):
                 output_list = output
             for i, obj in enumerate(output_list):
-                if isinstance(obj, cudnn.tensor):
+                if isinstance(obj, _GRAPH_TENSOR_TYPES):
                     if hasattr(obj, "get_name") and obj.get_name():
                         tensor_name = obj.get_name()
                     else:

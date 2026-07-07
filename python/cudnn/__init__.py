@@ -33,7 +33,6 @@ symbols_to_import = [
     "data_type",
     "tensor_reordering",
     "heur_mode",
-    "pygraph",
     "tensor",
     "knob",
     "cudnnGraphNotSupportedError",
@@ -108,7 +107,7 @@ def _set_data_type(
 
 
 _pybind_module.tensor.set_data_type = _set_data_type
-pygraph.tensor = _tensor
+_pybind_module.backend_graph.tensor = _tensor
 
 
 def _library_device_pointer(input_tensor):
@@ -194,8 +193,8 @@ def _execute_plan_at_index(
     )
 
 
-pygraph.execute = _execute
-pygraph.execute_plan_at_index = _execute_plan_at_index
+_pybind_module.backend_graph.execute = _execute
+_pybind_module.backend_graph.execute_plan_at_index = _execute_plan_at_index
 
 
 def load_cudnn():
@@ -254,6 +253,15 @@ if is_windows():
     load_cudnn()
 else:
     _dlopen_cudnn()
+
+# The graph API: a Python-native IR with pluggable execution backends. The
+# public ``cudnn.pygraph`` IS the Python class; the C++ graph builder stays
+# internal at ``cudnn._pybind_module.backend_graph`` and is reached only through
+# lowering (a graph is pure-Python or pure-C++, never mixed). Imported before
+# .graph/.wrapper, which reference cudnn.pygraph at module load.
+from .graph_types import NodeType, Tensor
+from ._pygraph import pygraph, GraphContext
+from .nodes import Node
 
 from .graph import graph, jit, graph_cache
 from .wrapper import Graph

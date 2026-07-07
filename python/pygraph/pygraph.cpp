@@ -829,7 +829,7 @@ default_vector(void) {
 
 void
 init_pygraph_submodule(py::module_& m) {
-    py::class_<PyGraph> pygraph_(m, "pygraph");
+    py::class_<PyGraph> pygraph_(m, "backend_graph");
     pygraph_
         .def(py::init<std::string const&,
                       cudnn_frontend::DataType_t,
