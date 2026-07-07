@@ -56,5 +56,5 @@ def torch_stream_context(current_stream: Optional[cuda.CUstream] = None) -> Iter
     if current_stream is None:
         yield
         return
-    with torch.cuda.stream(torch.cuda.ExternalStream(int(current_stream))):
+    with torch.cuda.stream(torch.cuda.get_stream_from_external(int(current_stream))):
         yield
