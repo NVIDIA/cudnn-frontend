@@ -3,8 +3,11 @@
 
 """CUTE DSL kernel for fused RMSNorm + RHT + per-CTA amax."""
 
+from __future__ import annotations
+
 import math
 import operator
+from typing import Any, Optional
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -14,6 +17,40 @@ from cutlass import Float32, Int32
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.arch import shuffle_sync_bfly
 from cutlass.cutlass_dsl import T, dsl_user_op
+
+from .. import data_type
+from .._op_kernel import OpKernel
+from .._tensor_desc import TensorDesc, make_compact_tensor_desc
+
+DEFAULT_NUM_THREADS_BY_N = {
+    2048: 128,
+    4096: 256,
+    7168: 128,
+    8192: 512,
+    16384: 1024,
+    32768: 512,
+}
+RPC_CANDIDATES = (2, 4, 8)
+TARGET_MIN_CTAS = 148
+
+
+def best_num_threads(n: int) -> Optional[int]:
+    for num_threads in (1024, 512, 256, 128, 64):
+        if n % num_threads != 0:
+            continue
+        ept = n // num_threads
+        if ept >= 8 and ept % 8 == 0:
+            return num_threads
+    return None
+
+
+def pick_rows_per_cta(m: int) -> int:
+    for rows_per_cta in reversed(RPC_CANDIDATES):
+        if m % rows_per_cta != 0:
+            continue
+        if m // rows_per_cta >= TARGET_MIN_CTAS:
+            return rows_per_cta
+    return RPC_CANDIDATES[0]
 
 
 @dsl_user_op
@@ -68,35 +105,181 @@ def redux_sync_max_f32(val, *, loc=None, ip=None):
     return Float32(result)
 
 
-class RMSNormRHTAmaxKernel:
-    """Fused RMSNorm + block-diagonal Hadamard + running per-CTA amax."""
+class RMSNormRHTAmaxKernel(OpKernel):
+    """Fused RMSNorm + block-diagonal Hadamard + running per-CTA amax.
+
+    Framework adapters bind generic tensor descriptors, call
+    :meth:`check_support`, and materialize the descriptors returned by
+    :meth:`infer_output` in their own framework.
+    """
 
     COPY_BITS = 128
     HAD_BLOCK = 16
+    TENSOR_ALIGNMENT = COPY_BITS // 8
+    output_dtype = data_type.BFLOAT16
+    amax_dtype = data_type.FLOAT
 
-    def __init__(self, n, num_threads=256, eps=1e-5, rows_per_cta=8):
+    def __init__(
+        self,
+        *,
+        x: TensorDesc[Any],
+        weight: TensorDesc[Any],
+        output: Optional[TensorDesc[Any]] = None,
+        amax: Optional[TensorDesc[Any]] = None,
+        eps: float = 1e-5,
+        num_threads: Optional[int] = None,
+        rows_per_cta: Optional[int] = None,
+    ) -> None:
+        for name, desc in (("x", x), ("weight", weight)):
+            if not isinstance(desc, TensorDesc):
+                raise TypeError(f"{name} must be a TensorDesc, got {type(desc).__name__}")
+        for name, desc in (("output", output), ("amax", amax)):
+            if desc is not None and not isinstance(desc, TensorDesc):
+                raise TypeError(f"{name} must be a TensorDesc, got {type(desc).__name__}")
+
+        self.x = x
+        self.weight = weight
+        self.output = output
+        self.amax = amax
+        self.eps = eps
+        self.requested_num_threads = num_threads
+        self.requested_rows_per_cta = rows_per_cta
+
+        self.m: Optional[int] = None
+        self.n: Optional[int] = None
+        self.num_threads: Optional[int] = None
+        self.rows_per_cta: Optional[int] = None
+
+    def check_support(self) -> bool:
+        """Validate descriptors and resolve the kernel launch configuration."""
+
+        self.m = None
+        self.n = None
+        self.num_threads = None
+        self.rows_per_cta = None
+
+        if self.x.ndim != 2:
+            raise ValueError(f"X must have rank 2, got shape {self.x.shape}")
+        if self.weight.ndim != 1:
+            raise ValueError(f"W must have rank 1, got shape {self.weight.shape}")
+        if self.x.cudnn_dtype != data_type.BFLOAT16:
+            raise ValueError(f"X must have dtype bfloat16, got {self.x.dtype}")
+        if self.weight.cudnn_dtype != data_type.BFLOAT16:
+            raise ValueError(f"W must have dtype bfloat16, got {self.weight.dtype}")
+
+        m, n = self.x.shape
+        if m <= 0:
+            raise ValueError(f"M must be positive, got {m}")
+        if n <= 0:
+            raise ValueError(f"N must be positive, got {n}")
+        if self.weight.shape != (n,):
+            raise ValueError(f"W must have shape {(n,)}, got {self.weight.shape}")
+        if self.x.stride != (n, 1) or self.x.stride_order != (1, 0):
+            raise ValueError(f"X must be row-major contiguous, got stride {self.x.stride} " f"and stride order {self.x.stride_order}")
+        if self.weight.stride != (1,) or self.weight.stride_order != (0,):
+            raise ValueError(f"W must be contiguous, got stride {self.weight.stride} " f"and stride order {self.weight.stride_order}")
+        if n % self.HAD_BLOCK != 0:
+            raise ValueError(f"N must be divisible by {self.HAD_BLOCK} for the Hadamard block size, got {n}")
+
+        num_threads = self.requested_num_threads
+        if num_threads is None:
+            num_threads = DEFAULT_NUM_THREADS_BY_N.get(n, best_num_threads(n))
+        if num_threads is None:
+            raise ValueError(f"No valid num_threads found for N={n}")
+
+        rows_per_cta = self.requested_rows_per_cta
+        if rows_per_cta is None:
+            rows_per_cta = pick_rows_per_cta(m)
+
+        self._validate_launch_configuration(n, num_threads, rows_per_cta, m=m)
+
+        expected_output_shape = (m, n)
+        expected_amax_shape = (m // rows_per_cta,)
+        if self.output is not None:
+            if self.output.shape != expected_output_shape:
+                raise ValueError(f"O must have shape {expected_output_shape}, got {self.output.shape}")
+            if self.output.cudnn_dtype != self.output_dtype:
+                raise ValueError(f"O must have dtype bfloat16, got {self.output.dtype}")
+            if self.output.stride != (n, 1) or self.output.stride_order != (1, 0):
+                raise ValueError(f"O must be row-major contiguous, got stride {self.output.stride} " f"and stride order {self.output.stride_order}")
+        if self.amax is not None:
+            if self.amax.shape != expected_amax_shape:
+                raise ValueError(f"Amax must have shape {expected_amax_shape}, got {self.amax.shape}")
+            if self.amax.cudnn_dtype != self.amax_dtype:
+                raise ValueError(f"Amax must have dtype float32, got {self.amax.dtype}")
+
+        self.m = m
         self.n = n
         self.num_threads = num_threads
-        self.eps = eps
         self.rows_per_cta = rows_per_cta
-        self.vec_size = self.COPY_BITS // 16
-        self.ept = n // num_threads
+        self._configure_lowering_state()
+        return True
 
-        assert n % num_threads == 0, f"N={n} must be divisible by num_threads={num_threads}"
-        assert self.ept % self.vec_size == 0, f"EPT={self.ept} must be a multiple of vec_size={self.vec_size}"
-        assert self.ept >= self.vec_size, f"EPT={self.ept} must be >= vec_size={self.vec_size}"
+    def infer_output(self) -> tuple[TensorDesc[data_type], ...]:
+        """Infer compact output descriptors from validated input metadata."""
+
+        if self.m is None or self.n is None or self.rows_per_cta is None:
+            raise RuntimeError("check_support() must be called before inferring outputs")
+
+        return (
+            make_compact_tensor_desc(
+                dtype=self.output_dtype,
+                shape=(self.m, self.n),
+                name="output",
+            ),
+            make_compact_tensor_desc(
+                dtype=self.amax_dtype,
+                shape=(self.m // self.rows_per_cta,),
+                name="amax",
+            ),
+        )
+
+    @staticmethod
+    def _validate_launch_configuration(
+        n: int,
+        num_threads: int,
+        rows_per_cta: int,
+        *,
+        m: Optional[int] = None,
+    ) -> None:
+        if n <= 0:
+            raise ValueError(f"N must be positive, got {n}")
+        if num_threads <= 0:
+            raise ValueError(f"num_threads must be positive, got {num_threads}")
+        if num_threads % 32 != 0:
+            raise ValueError(f"num_threads must be warp-aligned, got {num_threads}")
+        if num_threads > 1024:
+            raise ValueError(f"num_threads must not exceed the CUDA block size limit, got {num_threads}")
+        if n % num_threads != 0:
+            raise ValueError(f"N={n} must be divisible by num_threads={num_threads}")
+
+        ept = n // num_threads
+        if ept < 8 or ept % 8 != 0:
+            raise ValueError(f"EPT={ept} must be >= 8 and divisible by 8")
+        if rows_per_cta <= 0:
+            raise ValueError(f"rows_per_cta must be positive, got {rows_per_cta}")
+        if m is not None and m % rows_per_cta != 0:
+            raise ValueError(f"M must be divisible by rows_per_cta, got M={m}, rows_per_cta={rows_per_cta}")
+
+    def _configure_lowering_state(self) -> None:
+        if self.n is None or self.num_threads is None or self.rows_per_cta is None:
+            raise RuntimeError("Kernel launch configuration has not been resolved")
+
+        self._validate_launch_configuration(self.n, self.num_threads, self.rows_per_cta, m=self.m)
+        self.vec_size = self.COPY_BITS // 16
+        self.ept = self.n // self.num_threads
 
         self.num_vec_blocks = self.ept // self.vec_size
-        self.warps_per_row = num_threads // 32
+        self.warps_per_row = self.num_threads // 32
         self.inv_sqrt_had = 1.0 / math.sqrt(self.HAD_BLOCK)
         self.num_intra_stages = int(math.log2(self.vec_size))
         self.num_cross_stages = 1
 
-        self.tv_shape = ((num_threads, 1), (self.vec_size, self.num_vec_blocks))
-        self.tv_stride = ((self.vec_size, 1), (1, self.vec_size * num_threads))
-        self.tiler_mn = (1, n)
+        self.tv_shape = ((self.num_threads, 1), (self.vec_size, self.num_vec_blocks))
+        self.tv_stride = ((self.vec_size, 1), (1, self.vec_size * self.num_threads))
+        self.tiler_mn = (1, self.n)
 
-        tile_bytes = n * 2
+        tile_bytes = self.n * 2
         reduce_bytes = self.warps_per_row * 4
         amax_bytes = self.warps_per_row * 4
         self.smem_bytes = tile_bytes + reduce_bytes + amax_bytes + 128
@@ -241,11 +424,26 @@ class RMSNormRHTAmaxKernel:
             m_amax[bid] = cta_max
 
     @cute.jit
-    def __call__(self, x_tensor: cute.Tensor, w_tensor: cute.Tensor, o_tensor: cute.Tensor, amax_tensor: cute.Tensor, eps: Float32, stream: cuda.CUstream):
+    def __call__(
+        self,
+        x_tensor: cute.Tensor,
+        w_tensor: cute.Tensor,
+        o_tensor: cute.Tensor,
+        amax_tensor: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
         m = x_tensor.shape[0]
         num_ctas = m // self.rows_per_cta
         tv_layout = cute.make_layout(self.tv_shape, stride=self.tv_stride)
-        self.kernel(x_tensor, w_tensor, o_tensor, amax_tensor, eps, tv_layout, self.tiler_mn).launch(
+        self.kernel(
+            x_tensor,
+            w_tensor,
+            o_tensor,
+            amax_tensor,
+            Float32(self.eps),
+            tv_layout,
+            self.tiler_mn,
+        ).launch(
             grid=(num_ctas, 1, 1),
             block=(self.num_threads, 1, 1),
             smem=self.smem_bytes,

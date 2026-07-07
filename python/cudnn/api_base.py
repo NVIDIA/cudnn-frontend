@@ -11,7 +11,7 @@ for cuDNN API wrapper classes, including validation, compilation, and execution 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, List, Tuple, Optional
 import logging
 import threading
@@ -20,8 +20,14 @@ import cutlass
 import torch
 
 import cutlass.cute as cute
+from cudnn import data_type
 from cudnn._experimental_warnings import warn_experimental_api_once
-from cudnn.datatypes import _convert_to_cutlass_data_type
+from cudnn._tensor_desc import TensorDesc as _TensorDesc
+from cudnn.datatypes import (
+    _convert_to_cutlass_data_type,
+    _cudnn_to_torch_data_type,
+    _torch_to_cudnn_data_type,
+)
 
 
 def ceil_div(a: int, b: int) -> int:
@@ -53,23 +59,37 @@ def _reset_experimental_api_warning_registry() -> None:
         _experimental_api_warnings_emitted.clear()
 
 
-@dataclass(frozen=True)
-class TensorDesc:
-    """Metadata needed to validate/compile tensor signatures without storage."""
+@dataclass(frozen=True, init=False)
+class TensorDesc(_TensorDesc[torch.dtype]):
+    """Torch tensor signature with device and packed-storage metadata."""
 
-    dtype: torch.dtype
-    shape: Tuple[int, ...]
-    stride: Tuple[int, ...]
-    stride_order: Tuple[int, ...]
     device: torch.device
     interpret_uint8_as_fp4x2: bool = False
-    ndim: int = field(init=False)
-    name: str = ""
+
+    def __init__(
+        self,
+        dtype: torch.dtype,
+        shape: Tuple[int, ...],
+        stride: Tuple[int, ...],
+        stride_order: Tuple[int, ...],
+        device: torch.device,
+        interpret_uint8_as_fp4x2: bool = False,
+        name: str = "",
+        init_value: bool | int | float | None = None,
+    ) -> None:
+        object.__setattr__(self, "device", device)
+        object.__setattr__(self, "interpret_uint8_as_fp4x2", interpret_uint8_as_fp4x2)
+        super().__init__(
+            dtype=dtype,
+            shape=shape,
+            stride=stride,
+            stride_order=stride_order,
+            name=name,
+            init_value=init_value,
+        )
 
     def __post_init__(self):
-        shape = tuple(self.shape)
-        stride = tuple(self.stride)
-        stride_order = tuple(self.stride_order)
+        super().__post_init__()
         device = self.device
         if not isinstance(device, torch.device):
             try:
@@ -77,19 +97,14 @@ class TensorDesc:
             except (TypeError, ValueError, RuntimeError) as exc:
                 raise TypeError(f"Invalid device for TensorDesc: {self.device!r}") from exc
 
-        ndim = len(shape)
-        if len(stride) != ndim:
-            raise ValueError(f"Stride rank mismatch: expected {ndim}, got {len(stride)}")
-        if len(stride_order) != ndim:
-            raise ValueError(f"Stride order rank mismatch: expected {ndim}, got {len(stride_order)}")
-        if tuple(sorted(stride_order)) != tuple(range(ndim)):
-            raise ValueError(f"Stride order must be a permutation of [0, {ndim - 1}], got {stride_order}")
-
-        object.__setattr__(self, "shape", shape)
-        object.__setattr__(self, "stride", stride)
-        object.__setattr__(self, "stride_order", stride_order)
         object.__setattr__(self, "device", device)
-        object.__setattr__(self, "ndim", ndim)
+
+    @property
+    def cudnn_dtype(self) -> data_type:
+        if self.interpret_uint8_as_fp4x2 and self.dtype == torch.uint8:
+            return data_type.FP4_E2M1
+        converted = _torch_to_cudnn_data_type(self.dtype)
+        return data_type.NOT_SET if converted is None else converted
 
     @staticmethod
     def _normalize_dim(dim: int, ndim: int, *, allow_new_dim: bool = False) -> int:
@@ -181,6 +196,7 @@ class TensorDesc:
             device=self.device,
             interpret_uint8_as_fp4x2=self.interpret_uint8_as_fp4x2,
             name=self.name,
+            init_value=self.init_value,
         )
 
     def __len__(self) -> int:
@@ -910,6 +926,63 @@ class APIBase(ABC):
             assumed_align=assumed_align,
         )
 
+    @staticmethod
+    def _to_tensor_desc(
+        tensor: torch.Tensor,
+        name: str = "",
+        *,
+        shape: Optional[Tuple[int, ...]] = None,
+        stride: Optional[Tuple[int, ...]] = None,
+        interpret_uint8_as_fp4x2: bool = False,
+    ) -> TensorDesc:
+        """Create a Torch descriptor from tensor and optional logical layout metadata."""
+
+        tensor_shape = tuple(tensor.shape) if shape is None else tuple(shape)
+        tensor_stride = tuple(tensor.stride()) if stride is None else tuple(stride)
+        tensor_stride_order = tuple(i for i, _ in sorted(enumerate(tensor_stride), key=lambda item: (item[1], tensor_shape[item[0]])))
+        return TensorDesc(
+            dtype=tensor.dtype,
+            shape=tensor_shape,
+            stride=tensor_stride,
+            stride_order=tensor_stride_order,
+            device=tensor.device,
+            interpret_uint8_as_fp4x2=interpret_uint8_as_fp4x2,
+            name=name,
+        )
+
+    @staticmethod
+    def _materialize_tensor_desc(
+        desc: _TensorDesc[Any],
+        *,
+        device: torch.device,
+        stream: Optional[cuda.CUstream] = None,
+    ) -> torch.Tensor:
+        """Allocate a Torch tensor from a canonical tensor descriptor."""
+
+        if not isinstance(desc, _TensorDesc):
+            raise TypeError(f"desc must be a TensorDesc, got {type(desc).__name__}")
+        dtype = _cudnn_to_torch_data_type(desc.cudnn_dtype)
+        if dtype is None:
+            raise ValueError(f"Unsupported Torch output dtype {desc.cudnn_dtype}")
+
+        def allocate() -> torch.Tensor:
+            tensor = torch.empty_strided(
+                desc.shape,
+                desc.stride,
+                dtype=dtype,
+                device=device,
+            )
+            if desc.init_value is not None:
+                tensor.fill_(desc.init_value)
+            return tensor
+
+        if stream is None:
+            return allocate()
+        if torch.device(device).type != "cuda":
+            raise ValueError("A CUDA stream can only be used to materialize a CUDA tensor")
+        with torch.cuda.stream(torch.cuda.ExternalStream(int(stream), device=device)):
+            return allocate()
+
     def _make_tensor_desc(
         self,
         tensor: Optional[torch.Tensor],
@@ -928,15 +1001,12 @@ class APIBase(ABC):
             tensor_stride = self._tensor_stride(tensor, name=name)
         finally:
             self._interpret_uint8_as_fp4x2 = prev_interpret
-        tensor_stride_order = tuple(i for i, s in sorted(enumerate(tensor_stride), key=lambda x: (x[1], tensor_shape[x[0]])))
-        return TensorDesc(
-            dtype=tensor.dtype,
+        return self._to_tensor_desc(
+            tensor,
+            name,
             shape=tensor_shape,
             stride=tensor_stride,
-            stride_order=tensor_stride_order,
-            device=tensor.device,
             interpret_uint8_as_fp4x2=interpret_uint8_as_fp4x2,
-            name=name,
         )
 
     def _make_fake_cute_tensor_from_desc(

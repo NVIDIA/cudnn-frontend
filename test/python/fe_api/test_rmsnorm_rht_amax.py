@@ -61,7 +61,8 @@ def _assert_ref_close(x, w, o, amax, *, eps: float, rows_per_cta: int, skip_ref:
 @pytest.mark.parametrize("n,num_threads", SUPPORTED_N_NUM_THREADS)
 def test_rmsnorm_rht_amax_compile_execute(n, num_threads, request):
     try:
-        from cudnn import RmsNormRhtAmaxSm100
+        from cudnn import OpKernel, RmsNormRhtAmaxSm100, TensorDesc
+        from cudnn.rmsnorm_rht_amax.kernel import RMSNormRHTAmaxKernel
     except ImportError:
         pytest.skip("Environment not supported: cudnn optional dependencies not installed")
 
@@ -82,11 +83,26 @@ def test_rmsnorm_rht_amax_compile_execute(n, num_threads, request):
         num_threads=num_threads,
         rows_per_cta=rows_per_cta,
     )
+    assert isinstance(api.kernel, OpKernel)
+    assert isinstance(api.kernel, RMSNormRHTAmaxKernel)
+    assert isinstance(api.kernel.x, TensorDesc)
+    assert isinstance(api.kernel.weight, TensorDesc)
+    assert api.kernel.x is api.x_desc
+    assert api.kernel.weight is api.w_desc
+    assert api.kernel.output is api.o_desc
+    assert api.kernel.amax is api.amax_desc
+    assert api.eps == eps
+    assert api.requested_num_threads == num_threads
+    assert api.requested_rows_per_cta == rows_per_cta
 
     try:
         assert api.check_support(), "Unsupported testcase"
     except (ValueError, RuntimeError) as exc:
         pytest.skip(f"Unsupported testcase: {exc}")
+
+    assert api.n == n
+    assert api.num_threads == num_threads
+    assert api.rows_per_cta == rows_per_cta
 
     api.compile()
     api.execute(x_tensor=x, w_tensor=w, o_tensor=o, amax_tensor=amax)
@@ -122,3 +138,38 @@ def test_rmsnorm_rht_amax_wrapper(n, num_threads, rows_per_cta, request):
     assert outputs["o_tensor"].shape == (m, n)
     assert outputs["amax_tensor"].shape == (m // rows_per_cta,)
     _assert_ref_close(x, w, outputs["o_tensor"], outputs["amax_tensor"], eps=eps, rows_per_cta=rows_per_cta, skip_ref=skip_ref)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_rmsnorm_rht_amax_wrapper_reuses_owned_kernel(monkeypatch):
+    try:
+        from cudnn.rmsnorm_rht_amax import api as rmsnorm_api
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn optional dependencies not installed")
+
+    construction_count = 0
+    original_init = rmsnorm_api.RMSNormRHTAmaxKernel.__init__
+
+    def counted_init(self, *args, **kwargs):
+        nonlocal construction_count
+        construction_count += 1
+        original_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(rmsnorm_api.RMSNormRHTAmaxKernel, "__init__", counted_init)
+    rmsnorm_api._cache_of_RmsNormRhtAmaxSm100Objects.clear()
+
+    m, n = 256, 2048
+    rows_per_cta = 2
+    x, w = _make_inputs(m=m, n=n)
+    try:
+        first = rmsnorm_api.rmsnorm_rht_amax_wrapper_sm100(x, w, num_threads=128, rows_per_cta=rows_per_cta)
+        second = rmsnorm_api.rmsnorm_rht_amax_wrapper_sm100(x, w, num_threads=128, rows_per_cta=rows_per_cta)
+    except (ValueError, RuntimeError) as exc:
+        pytest.skip(f"Unsupported testcase: {exc}")
+    finally:
+        rmsnorm_api._cache_of_RmsNormRhtAmaxSm100Objects.clear()
+
+    assert construction_count == 1
+    assert first["o_tensor"].shape == second["o_tensor"].shape == (m, n)
+    assert first["amax_tensor"].shape == second["amax_tensor"].shape == (m // rows_per_cta,)

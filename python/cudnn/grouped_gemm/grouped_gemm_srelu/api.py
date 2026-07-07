@@ -179,6 +179,7 @@ class GroupedGemmSreluSm100(APIBase):
                 stride_order=self.d_desc.stride_order,
                 device=self.d_desc.device,
                 name="sample_d_col",
+                init_value=self.d_desc.init_value,
             )
         self.sfd_row_desc = self._make_tensor_desc(sample_sfd_row, name="sample_sfd_row")
         self.sfd_col_desc = self._make_tensor_desc(sample_sfd_col, name="sample_sfd_col")

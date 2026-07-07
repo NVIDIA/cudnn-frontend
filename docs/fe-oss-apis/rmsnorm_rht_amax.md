@@ -9,6 +9,7 @@
 This frontend integration exposes the kernel as a standard FE-OSS Python API with:
 - a class API (`RmsNormRhtAmaxSm100`)
 - a wrapper API (`rmsnorm_rht_amax_wrapper_sm100`)
+- an explicit JAX API under `cudnn.jax`
 - grouped-gemm-style regression coverage for compile/execute, wrapper use, and cache reuse
 
 ## Shapes
@@ -97,6 +98,32 @@ op.execute(
 )
 ```
 
+### JAX API
+
+The CUDA 13 JAX packages require Python 3.11 or newer. Install the JAX integration explicitly:
+
+```bash
+pip install 'nvidia-cudnn-frontend[jax]'
+```
+
+```python
+from cudnn.jax import rmsnorm_rht_amax_sm100
+
+o, amax = rmsnorm_rht_amax_sm100(
+    x,
+    w,
+    eps=1e-5,
+    num_threads=128,
+    rows_per_cta=2,
+)
+```
+
+The function API is JIT-compiled and treats `eps`, `num_threads`, and
+`rows_per_cta` as static compilation options. Use `RmsNormRhtAmaxSm100`
+directly when the caller needs to control JAX transformations explicitly.
+
+JAX buffers remain row-major. Framework-specific mode metadata maps public JAX axes into the canonical kernel axis order without materializing a transpose.
+
 ## Parameters
 
 ### Input and output tensors
@@ -149,3 +176,4 @@ Tuple unpacking order is `(o_tensor, amax_tensor)`.
 
 Focused correctness and cache coverage live in:
 - `test/python/fe_api/test_rmsnorm_rht_amax.py`
+- `test/python/fe_api/test_jax_rmsnorm_rht_amax.py`
