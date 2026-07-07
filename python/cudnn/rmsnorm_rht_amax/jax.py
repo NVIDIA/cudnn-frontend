@@ -7,7 +7,9 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from .._jax import JaxApiBase, jax
+import jax
+
+from .._jax import JaxApiBase
 from .kernel import RMSNormRHTAmaxKernel
 
 

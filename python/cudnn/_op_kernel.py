@@ -6,8 +6,8 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from typing import Any
 
-from . import data_type
 from ._tensor_desc import TensorDesc
 
 
@@ -27,15 +27,15 @@ class OpKernel(ABC):
         """Validate the logical signature and resolve static kernel state."""
 
     @abstractmethod
-    def infer_output(self) -> tuple[TensorDesc[data_type], ...]:
-        """Return framework-neutral descriptors for the operation outputs.
+    def infer_output(self) -> tuple[TensorDesc[Any], ...]:
+        """Return operation outputs through the framework-neutral descriptor interface.
 
         A descriptor's ``init_value`` requests scalar initialization before
         launch; ``None`` leaves the output uninitialized.
         """
 
-    def infer_workspace(self) -> tuple[TensorDesc[data_type], ...]:
-        """Return framework-neutral workspace descriptors, if any.
+    def infer_workspace(self) -> tuple[TensorDesc[Any], ...]:
+        """Return workspaces through the framework-neutral descriptor interface.
 
         Workspace descriptors follow the same ``init_value`` convention as
         outputs but are not part of the framework-visible result.

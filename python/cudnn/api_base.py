@@ -99,12 +99,92 @@ class TensorDesc(_TensorDesc[torch.dtype]):
 
         object.__setattr__(self, "device", device)
 
+    @classmethod
+    def from_tensor(
+        cls,
+        tensor: torch.Tensor,
+        name: str = "",
+        *,
+        shape: Optional[Tuple[int, ...]] = None,
+        stride: Optional[Tuple[int, ...]] = None,
+        interpret_uint8_as_fp4x2: bool = False,
+    ) -> "TensorDesc":
+        """Capture a Torch tensor's physical or supplied logical layout."""
+
+        tensor_shape = tuple(tensor.shape) if shape is None else tuple(shape)
+        tensor_stride = tuple(tensor.stride()) if stride is None else tuple(stride)
+        tensor_stride_order = cls._compute_stride_order(tensor_shape, tensor_stride)
+        return cls(
+            dtype=tensor.dtype,
+            shape=tensor_shape,
+            stride=tensor_stride,
+            stride_order=tensor_stride_order,
+            device=tensor.device,
+            interpret_uint8_as_fp4x2=interpret_uint8_as_fp4x2,
+            name=name,
+        )
+
     @property
     def cudnn_dtype(self) -> data_type:
         if self.interpret_uint8_as_fp4x2 and self.dtype == torch.uint8:
             return data_type.FP4_E2M1
         converted = _torch_to_cudnn_data_type(self.dtype)
         return data_type.NOT_SET if converted is None else converted
+
+    def compact_like(
+        self,
+        *,
+        cudnn_dtype: data_type,
+        shape: tuple[int, ...],
+        stride_order: tuple[int, ...] | None = None,
+        name: str = "",
+        init_value: bool | int | float | None = None,
+    ) -> "TensorDesc":
+        """Create a compact Torch descriptor on this descriptor's device."""
+
+        canonical = super().compact_like(
+            cudnn_dtype=cudnn_dtype,
+            shape=shape,
+            stride_order=stride_order,
+            name=name,
+            init_value=init_value,
+        )
+        dtype = _cudnn_to_torch_data_type(cudnn_dtype)
+        if dtype is None:
+            raise ValueError(f"Unsupported Torch output dtype {cudnn_dtype}")
+        return TensorDesc(
+            dtype=dtype,
+            shape=canonical.shape,
+            stride=canonical.stride,
+            stride_order=canonical.stride_order,
+            device=self.device,
+            name=canonical.name,
+            init_value=canonical.init_value,
+        )
+
+    def materialize(self, stream: Optional[cuda.CUstream] = None) -> torch.Tensor:
+        """Allocate and optionally initialize a tensor described by this object."""
+
+        if self.interpret_uint8_as_fp4x2 and self.dtype == torch.uint8:
+            raise ValueError("Materializing a logical FP4 descriptor backed by uint8 storage is unsupported")
+
+        def allocate() -> torch.Tensor:
+            tensor = torch.empty_strided(
+                self.shape,
+                self.stride,
+                dtype=self.dtype,
+                device=self.device,
+            )
+            if self.init_value is not None:
+                tensor.fill_(self.init_value)
+            return tensor
+
+        if stream is None:
+            return allocate()
+        if self.device.type != "cuda":
+            raise ValueError("A CUDA stream can only be used to materialize a CUDA tensor")
+        with torch.cuda.stream(torch.cuda.ExternalStream(int(stream), device=self.device)):
+            return allocate()
 
     @staticmethod
     def _normalize_dim(dim: int, ndim: int, *, allow_new_dim: bool = False) -> int:
@@ -869,6 +949,22 @@ class APIBase(ABC):
             raise ValueError(f"Expected dtype to be a torch.dtype or list, got {type(dtype)}")
         return tensor_dtype
 
+    def _check_tensor_signature(self, tensor: torch.Tensor, expected: TensorDesc) -> None:
+        """Validate a Torch tensor against a captured logical descriptor."""
+
+        if not isinstance(expected, TensorDesc):
+            raise TypeError(f"expected must be a TensorDesc, got {type(expected).__name__}")
+        name = expected.name or "tensor"
+        actual = self._make_tensor_desc(
+            tensor,
+            name=name,
+            interpret_uint8_as_fp4x2=expected.interpret_uint8_as_fp4x2,
+        )
+        self._check_tensor_shape(actual, expected.shape, name)
+        self._check_tensor_stride(actual, stride=expected.stride, stride_order=expected.stride_order, name=name)
+        self._check_dtype(actual, expected.dtype, name)
+        self._value_error_if(actual.device != expected.device, f"{name} tensor device mismatch: expected {expected.device}, got {actual.device}")
+
     def _value_error_if(self, condition: bool, error_msg: str) -> None:
         """Raise a ValueError if the condition is true.
 
@@ -937,17 +1033,12 @@ class APIBase(ABC):
     ) -> TensorDesc:
         """Create a Torch descriptor from tensor and optional logical layout metadata."""
 
-        tensor_shape = tuple(tensor.shape) if shape is None else tuple(shape)
-        tensor_stride = tuple(tensor.stride()) if stride is None else tuple(stride)
-        tensor_stride_order = tuple(i for i, _ in sorted(enumerate(tensor_stride), key=lambda item: (item[1], tensor_shape[item[0]])))
-        return TensorDesc(
-            dtype=tensor.dtype,
-            shape=tensor_shape,
-            stride=tensor_stride,
-            stride_order=tensor_stride_order,
-            device=tensor.device,
+        return TensorDesc.from_tensor(
+            tensor,
+            name,
+            shape=shape,
+            stride=stride,
             interpret_uint8_as_fp4x2=interpret_uint8_as_fp4x2,
-            name=name,
         )
 
     @staticmethod

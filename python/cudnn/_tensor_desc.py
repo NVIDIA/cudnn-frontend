@@ -8,7 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from numbers import Real
 from operator import index
-from typing import Generic, TypeVar
+from typing import Any, Generic, TypeVar
 
 from . import data_type
 
@@ -86,6 +86,30 @@ class TensorDesc(Generic[DTypeT]):
         if not isinstance(self.dtype, data_type):
             raise TypeError(f"{type(self).__name__}.dtype must provide a cudnn.data_type mapping, " f"got {type(self.dtype).__name__}")
         return self.dtype
+
+    def compact_like(
+        self,
+        *,
+        cudnn_dtype: data_type,
+        shape: tuple[int, ...],
+        stride_order: tuple[int, ...] | None = None,
+        name: str = "",
+        init_value: bool | int | float | None = None,
+    ) -> "TensorDesc[Any]":
+        """Create a compact descriptor derived from this descriptor.
+
+        The framework-neutral implementation returns a canonical descriptor.
+        Framework-specific descriptors override this method to preserve their
+        native dtype and allocation metadata.
+        """
+
+        return make_compact_tensor_desc(
+            dtype=cudnn_dtype,
+            shape=shape,
+            stride_order=stride_order,
+            name=name,
+            init_value=init_value,
+        )
 
 
 def make_compact_tensor_desc(

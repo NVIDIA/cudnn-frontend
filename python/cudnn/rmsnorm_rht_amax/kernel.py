@@ -20,7 +20,7 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 
 from .. import data_type
 from .._op_kernel import OpKernel
-from .._tensor_desc import TensorDesc, make_compact_tensor_desc
+from .._tensor_desc import TensorDesc
 
 DEFAULT_NUM_THREADS_BY_N = {
     2048: 128,
@@ -108,9 +108,8 @@ def redux_sync_max_f32(val, *, loc=None, ip=None):
 class RMSNormRHTAmaxKernel(OpKernel):
     """Fused RMSNorm + block-diagonal Hadamard + running per-CTA amax.
 
-    Framework adapters bind generic tensor descriptors, call
-    :meth:`check_support`, and materialize the descriptors returned by
-    :meth:`infer_output` in their own framework.
+    Output inference preserves the framework descriptor specialization of the
+    input while validation and launch configuration remain framework-neutral.
     """
 
     COPY_BITS = 128
@@ -124,8 +123,6 @@ class RMSNormRHTAmaxKernel(OpKernel):
         *,
         x: TensorDesc[Any],
         weight: TensorDesc[Any],
-        output: Optional[TensorDesc[Any]] = None,
-        amax: Optional[TensorDesc[Any]] = None,
         eps: float = 1e-5,
         num_threads: Optional[int] = None,
         rows_per_cta: Optional[int] = None,
@@ -133,14 +130,9 @@ class RMSNormRHTAmaxKernel(OpKernel):
         for name, desc in (("x", x), ("weight", weight)):
             if not isinstance(desc, TensorDesc):
                 raise TypeError(f"{name} must be a TensorDesc, got {type(desc).__name__}")
-        for name, desc in (("output", output), ("amax", amax)):
-            if desc is not None and not isinstance(desc, TensorDesc):
-                raise TypeError(f"{name} must be a TensorDesc, got {type(desc).__name__}")
 
         self.x = x
         self.weight = weight
-        self.output = output
-        self.amax = amax
         self.eps = eps
         self.requested_num_threads = num_threads
         self.requested_rows_per_cta = rows_per_cta
@@ -149,6 +141,7 @@ class RMSNormRHTAmaxKernel(OpKernel):
         self.n: Optional[int] = None
         self.num_threads: Optional[int] = None
         self.rows_per_cta: Optional[int] = None
+        self._validated_x: Optional[TensorDesc[Any]] = None
 
     def check_support(self) -> bool:
         """Validate descriptors and resolve the kernel launch configuration."""
@@ -157,6 +150,7 @@ class RMSNormRHTAmaxKernel(OpKernel):
         self.n = None
         self.num_threads = None
         self.rows_per_cta = None
+        self._validated_x = None
 
         if self.x.ndim != 2:
             raise ValueError(f"X must have rank 2, got shape {self.x.shape}")
@@ -187,52 +181,46 @@ class RMSNormRHTAmaxKernel(OpKernel):
         if num_threads is None:
             raise ValueError(f"No valid num_threads found for N={n}")
 
-        rows_per_cta = self.requested_rows_per_cta
-        if rows_per_cta is None:
-            rows_per_cta = pick_rows_per_cta(m)
+        rows_per_cta = self._resolve_rows_per_cta(m, self.requested_rows_per_cta)
 
         self._validate_launch_configuration(n, num_threads, rows_per_cta, m=m)
-
-        expected_output_shape = (m, n)
-        expected_amax_shape = (m // rows_per_cta,)
-        if self.output is not None:
-            if self.output.shape != expected_output_shape:
-                raise ValueError(f"O must have shape {expected_output_shape}, got {self.output.shape}")
-            if self.output.cudnn_dtype != self.output_dtype:
-                raise ValueError(f"O must have dtype bfloat16, got {self.output.dtype}")
-            if self.output.stride != (n, 1) or self.output.stride_order != (1, 0):
-                raise ValueError(f"O must be row-major contiguous, got stride {self.output.stride} " f"and stride order {self.output.stride_order}")
-        if self.amax is not None:
-            if self.amax.shape != expected_amax_shape:
-                raise ValueError(f"Amax must have shape {expected_amax_shape}, got {self.amax.shape}")
-            if self.amax.cudnn_dtype != self.amax_dtype:
-                raise ValueError(f"Amax must have dtype float32, got {self.amax.dtype}")
 
         self.m = m
         self.n = n
         self.num_threads = num_threads
         self.rows_per_cta = rows_per_cta
         self._configure_lowering_state()
+        self._validated_x = self.x
         return True
 
-    def infer_output(self) -> tuple[TensorDesc[data_type], ...]:
+    def infer_output(self) -> tuple[TensorDesc[Any], ...]:
         """Infer compact output descriptors from validated input metadata."""
 
-        if self.m is None or self.n is None or self.rows_per_cta is None:
+        if self.m is None or self.n is None or self.rows_per_cta is None or self._validated_x is None:
             raise RuntimeError("check_support() must be called before inferring outputs")
 
         return (
-            make_compact_tensor_desc(
-                dtype=self.output_dtype,
+            self._validated_x.compact_like(
+                cudnn_dtype=self.output_dtype,
                 shape=(self.m, self.n),
                 name="output",
             ),
-            make_compact_tensor_desc(
-                dtype=self.amax_dtype,
+            self._validated_x.compact_like(
+                cudnn_dtype=self.amax_dtype,
                 shape=(self.m // self.rows_per_cta,),
                 name="amax",
             ),
         )
+
+    @staticmethod
+    def _resolve_rows_per_cta(m: int, rows_per_cta: Optional[int]) -> int:
+        if rows_per_cta is None:
+            rows_per_cta = pick_rows_per_cta(m)
+        if rows_per_cta <= 0:
+            raise ValueError(f"rows_per_cta must be positive, got {rows_per_cta}")
+        if m % rows_per_cta != 0:
+            raise ValueError(f"M must be divisible by rows_per_cta, got M={m}, rows_per_cta={rows_per_cta}")
+        return rows_per_cta
 
     @staticmethod
     def _validate_launch_configuration(

@@ -127,6 +127,29 @@ class JaxApiBaseTest(unittest.TestCase):
         self.assertEqual(desc.stride, (1, 12, 4))
         self.assertEqual(desc.stride_order, (0, 2, 1))
 
+    def test_jax_descriptor_derives_compact_output_metadata(self):
+        source = self.module.JaxApiBase._to_tensor_desc(
+            _ArrayMetadata((2, 3), "bfloat16"),
+            "input",
+        )
+
+        output = source.compact_like(
+            cudnn_dtype=_DataType.FLOAT,
+            shape=(5, 7),
+            stride_order=(0, 1),
+            name="output",
+            init_value=-2.0,
+        )
+
+        self.assertIsInstance(output, self.module.JaxTensorDesc)
+        self.assertEqual(output.dtype, "float32")
+        self.assertEqual(output.cudnn_dtype, _DataType.FLOAT)
+        self.assertEqual(output.shape, (5, 7))
+        self.assertEqual(output.stride, (1, 5))
+        self.assertEqual(output.stride_order, (0, 1))
+        self.assertEqual(output.name, "output")
+        self.assertEqual(output.init_value, -2.0)
+
     def test_checks_invocation_signature(self):
         desc = self.module.JaxApiBase._to_tensor_desc(_ArrayMetadata((2, 3), "bfloat16"), "sample")
         self.module.JaxApiBase._check_tensor_signature(_ArrayMetadata((2, 3), "bfloat16"), desc)

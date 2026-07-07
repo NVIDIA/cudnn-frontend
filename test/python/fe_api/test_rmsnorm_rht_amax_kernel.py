@@ -182,10 +182,51 @@ class RmsNormRhtAmaxKernelContractTest(unittest.TestCase):
             (amax.name, amax.dtype, amax.shape, amax.stride, amax.stride_order, amax.init_value),
             ("amax", _DataType.FLOAT, (128,), (1,), (0,), None),
         )
+
+        kernel.x = self._desc((128, 2048))
+        output, amax = kernel.infer_output()
+        self.assertEqual((output.shape, amax.shape), ((256, 2048), (128,)))
         self.assertEqual(kernel.infer_workspace(), ())
 
         self.assertNotIn(f"{_PACKAGE}.rmsnorm_rht_amax.api", sys.modules)
         self.assertNotIn(f"{_PACKAGE}.rmsnorm_rht_amax.jax", sys.modules)
+
+    def test_output_inference_preserves_descriptor_specialization(self):
+        tensor_module = self.tensor_module
+
+        class SpecializedTensorDesc(tensor_module.TensorDesc):
+            def compact_like(self, **kwargs):
+                canonical = super().compact_like(**kwargs)
+                return SpecializedTensorDesc(
+                    dtype=canonical.dtype,
+                    shape=canonical.shape,
+                    stride=canonical.stride,
+                    stride_order=canonical.stride_order,
+                    name=canonical.name,
+                    init_value=canonical.init_value,
+                )
+
+        x = SpecializedTensorDesc(
+            dtype=_DataType.BFLOAT16,
+            shape=(256, 2048),
+            stride=(2048, 1),
+            stride_order=(1, 0),
+        )
+
+        kernel = self.kernel_module.RMSNormRHTAmaxKernel(
+            x=x,
+            weight=SpecializedTensorDesc(
+                dtype=_DataType.BFLOAT16,
+                shape=(2048,),
+                stride=(1,),
+                stride_order=(0,),
+            ),
+        )
+        kernel.check_support()
+        output, amax = kernel.infer_output()
+
+        self.assertIsInstance(output, SpecializedTensorDesc)
+        self.assertIsInstance(amax, SpecializedTensorDesc)
 
     def test_requested_configuration_is_recomputed(self):
         kernel = self._kernel(num_threads=256, rows_per_cta=4)
@@ -194,7 +235,6 @@ class RmsNormRhtAmaxKernelContractTest(unittest.TestCase):
 
         kernel.requested_num_threads = 128
         kernel.requested_rows_per_cta = 8
-        kernel.amax = self._desc((32,), _DataType.FLOAT)
         kernel.check_support()
         self.assertEqual((kernel.num_threads, kernel.rows_per_cta), (128, 8))
         self.assertEqual(kernel.infer_output()[1].shape, (32,))
@@ -221,8 +261,6 @@ class RmsNormRhtAmaxKernelContractTest(unittest.TestCase):
         kernel = self.kernel_module.RMSNormRHTAmaxKernel(
             x=desc((256, 2048), "framework.bfloat16"),
             weight=desc((2048,), "framework.bfloat16"),
-            output=desc((256, 2048), "framework.bfloat16"),
-            amax=desc((128,), "framework.float32"),
         )
         self.assertTrue(kernel.check_support())
 
@@ -253,10 +291,6 @@ class RmsNormRhtAmaxKernelContractTest(unittest.TestCase):
             ({"num_threads": 2048}, "must not exceed the CUDA block size limit"),
             ({"rows_per_cta": 0}, "rows_per_cta must be positive"),
             ({"rows_per_cta": 3}, "M must be divisible by rows_per_cta"),
-            ({"output": self._desc((256, 1024))}, "O must have shape"),
-            ({"output": self._desc((256, 2048), _DataType.FLOAT)}, "O must have dtype bfloat16"),
-            ({"amax": self._desc((64,), _DataType.FLOAT)}, "Amax must have shape"),
-            ({"amax": self._desc((128,))}, "Amax must have dtype float32"),
         )
 
         for overrides, message in cases:

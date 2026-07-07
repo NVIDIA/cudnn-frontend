@@ -81,22 +81,17 @@ from cudnn import RmsNormRhtAmaxSm100
 op = RmsNormRhtAmaxSm100(
     sample_x=x,
     sample_w=w,
-    sample_o=o,
-    sample_amax=amax,
     eps=1e-5,
     num_threads=128,
     rows_per_cta=2,
 )
-assert op.check_support()
-op.compile()
-op.execute(
-    x_tensor=x,
-    w_tensor=w,
-    o_tensor=o,
-    amax_tensor=amax,
-    current_stream=None,
-)
+o, amax = op(x, w, current_stream=None)
 ```
+
+The class infers and allocates its outputs from the validated sample input
+descriptors. Runtime inputs must match the sample shape, layout, dtype, and
+device. `check_support()` and `compile()` remain available when the caller
+wants to run those steps explicitly; the call operator performs them lazily.
 
 ### JAX API
 
@@ -120,13 +115,15 @@ o, amax = rmsnorm_rht_amax_sm100(
 
 The function API is JIT-compiled and treats `eps`, `num_threads`, and
 `rows_per_cta` as static compilation options. Use `RmsNormRhtAmaxSm100`
-directly when the caller needs to control JAX transformations explicitly.
+directly when the caller needs to control JAX transformations explicitly. Its
+class API follows the same `RmsNormRhtAmaxSm100(sample_x, sample_w)(x, w)`
+pattern as PyTorch.
 
 JAX buffers remain row-major. Framework-specific mode metadata maps public JAX axes into the canonical kernel axis order without materializing a transpose.
 
 ## Parameters
 
-### Input and output tensors
+### Input tensors
 
 - `x_tensor` / `sample_x`
   - Shape: `(M, N)`
@@ -136,13 +133,6 @@ JAX buffers remain row-major. Framework-specific mode metadata maps public JAX a
   - Shape: `(N,)`
   - Layout: contiguous
   - Dtype: `torch.bfloat16`
-- `o_tensor` / `sample_o`
-  - Shape: `(M, N)`
-  - Layout: row-major contiguous
-  - Dtype: `torch.bfloat16`
-- `amax_tensor` / `sample_amax`
-  - Shape: `(M / rows_per_cta,)`
-  - Dtype: `torch.float32`
 
 ### Common parameters
 
@@ -154,11 +144,17 @@ JAX buffers remain row-major. Framework-specific mode metadata maps public JAX a
   - Rows processed by each CTA. If omitted, the wrapper uses the upstream-style heuristic over `{2, 4, 8}`.
 - CUDA stream (`current_stream`)
 
-### Wrapper return values
+### Return values
 
-Returns a `TupleDict` with keys:
+The PyTorch class and wrapper return a `TupleDict` with keys:
+
 - `o_tensor`
+  - Shape: `(M, N)`
+  - Layout: row-major contiguous
+  - Dtype: `torch.bfloat16`
 - `amax_tensor`
+  - Shape: `(M / rows_per_cta,)`
+  - Dtype: `torch.float32`
 
 Tuple unpacking order is `(o_tensor, amax_tensor)`.
 
@@ -169,11 +165,13 @@ Tuple unpacking order is `(o_tensor, amax_tensor)`.
 - `N` must be divisible by the resolved `num_threads`.
 - `EPT = N / num_threads` must be at least `8` and divisible by `8`.
 - `M` must be divisible by `rows_per_cta`.
-- Inputs and output are currently bf16 only.
+- `X`, `W`, and `O` use bf16; `amax` uses float32.
+- PyTorch input tensors must be 16-byte aligned.
 - The frontend integration matches the upstream RMSNorm kernel semantics; it does not expose full LayerNorm mean/bias behavior.
 
 ## Verification
 
 Focused correctness and cache coverage live in:
+
 - `test/python/fe_api/test_rmsnorm_rht_amax.py`
 - `test/python/fe_api/test_jax_rmsnorm_rht_amax.py`

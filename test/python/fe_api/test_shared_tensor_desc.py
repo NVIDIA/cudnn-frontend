@@ -87,6 +87,31 @@ class SharedTensorDescTest(unittest.TestCase):
                 init_value=[],
             )
 
+    def test_compact_like_derives_a_canonical_descriptor(self):
+        source = self.tensor_desc.TensorDesc(
+            dtype=_DataType.BFLOAT16,
+            shape=(7,),
+            stride=(1,),
+            stride_order=(0,),
+            name="input",
+        )
+
+        derived = source.compact_like(
+            cudnn_dtype=_DataType.FLOAT,
+            shape=(2, 3),
+            stride_order=(0, 1),
+            name="workspace",
+            init_value=0,
+        )
+
+        self.assertIs(type(derived), self.tensor_desc.TensorDesc)
+        self.assertEqual(derived.dtype, _DataType.FLOAT)
+        self.assertEqual(derived.shape, (2, 3))
+        self.assertEqual(derived.stride, (1, 2))
+        self.assertEqual(derived.stride_order, (0, 1))
+        self.assertEqual(derived.name, "workspace")
+        self.assertEqual(derived.init_value, 0)
+
     def test_compact_descriptor_supports_an_explicit_dimension_order(self):
         desc = self.tensor_desc.make_compact_tensor_desc(
             dtype=_DataType.FLOAT,

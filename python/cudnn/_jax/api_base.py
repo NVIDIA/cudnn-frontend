@@ -24,6 +24,36 @@ class JaxTensorDesc(TensorDesc[Any]):
 
         return jax_to_cudnn_dtype(self.dtype)
 
+    def compact_like(
+        self,
+        *,
+        cudnn_dtype: data_type,
+        shape: tuple[int, ...],
+        stride_order: tuple[int, ...] | None = None,
+        name: str = "",
+        init_value: bool | int | float | None = None,
+    ) -> "JaxTensorDesc":
+        """Create a compact JAX descriptor from canonical output metadata."""
+
+        canonical = super().compact_like(
+            cudnn_dtype=cudnn_dtype,
+            shape=shape,
+            stride_order=stride_order,
+            name=name,
+            init_value=init_value,
+        )
+
+        from .datatypes import cudnn_to_jax_dtype
+
+        return JaxTensorDesc(
+            dtype=cudnn_to_jax_dtype(cudnn_dtype),
+            shape=canonical.shape,
+            stride=canonical.stride,
+            stride_order=canonical.stride_order,
+            name=canonical.name,
+            init_value=canonical.init_value,
+        )
+
 
 def _require_array_metadata(value: Any, name: str) -> tuple[Any, ...]:
     if not hasattr(value, "shape") or not hasattr(value, "dtype"):

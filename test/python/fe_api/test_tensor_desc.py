@@ -106,6 +106,121 @@ class TensorDescTest(unittest.TestCase):
         self.assertEqual(desc.stride, (12, 1, 3))
         self.assertEqual(desc.stride_order, (1, 2, 0))
 
+    def test_api_base_checks_torch_tensor_signature(self):
+        class Adapter(APIBase):
+            def check_support(self):
+                return True
+
+            def compile(self):
+                pass
+
+            def execute(self, *args, **kwargs):
+                pass
+
+        adapter = Adapter()
+        sample = torch.empty_strided((2, 3), (3, 1), dtype=torch.bfloat16)
+        expected = TorchTensorDesc.from_tensor(sample, "sample")
+        adapter._check_tensor_signature(sample, expected)
+
+        cases = (
+            (torch.empty((1, 3), dtype=torch.bfloat16), "sample tensor shape mismatch"),
+            (torch.empty_strided((2, 3), (1, 2), dtype=torch.bfloat16), "sample tensor stride mismatch"),
+            (torch.empty((2, 3), dtype=torch.float32), "sample dtype mismatch"),
+        )
+        for tensor, message in cases:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ValueError, message):
+                    adapter._check_tensor_signature(tensor, expected)
+
+    def test_torch_descriptor_constructs_from_tensor_metadata(self):
+        tensor = torch.empty_strided((2, 3, 4), (12, 1, 3), dtype=torch.uint8)
+        desc = TorchTensorDesc.from_tensor(
+            tensor,
+            "logical_fp4",
+            shape=(2, 3, 8),
+            stride=(12, 1, 3),
+            interpret_uint8_as_fp4x2=True,
+        )
+
+        self.assertEqual(desc.dtype, torch.uint8)
+        self.assertEqual(desc.shape, (2, 3, 8))
+        self.assertEqual(desc.stride, (12, 1, 3))
+        self.assertEqual(desc.stride_order, (1, 2, 0))
+        self.assertEqual(desc.device, tensor.device)
+        self.assertEqual(desc.name, "logical_fp4")
+        self.assertTrue(desc.interpret_uint8_as_fp4x2)
+        self.assertEqual(desc.cudnn_dtype, data_type.FP4_E2M1)
+        self.assertEqual(
+            APIBase._to_tensor_desc(
+                tensor,
+                "logical_fp4",
+                shape=(2, 3, 8),
+                stride=(12, 1, 3),
+                interpret_uint8_as_fp4x2=True,
+            ),
+            desc,
+        )
+
+    def test_torch_descriptor_derives_and_materializes_compact_output(self):
+        source = TorchTensorDesc.from_tensor(
+            torch.empty((4, 8), dtype=torch.bfloat16),
+            "input",
+        )
+        output = source.compact_like(
+            cudnn_dtype=data_type.FLOAT,
+            shape=(3, 5),
+            stride_order=(0, 1),
+            name="output",
+            init_value=float("-inf"),
+        )
+
+        self.assertIsInstance(output, TorchTensorDesc)
+        self.assertEqual(output.dtype, torch.float32)
+        self.assertEqual(output.device, source.device)
+        self.assertEqual(output.shape, (3, 5))
+        self.assertEqual(output.stride, (1, 3))
+        self.assertEqual(output.stride_order, (0, 1))
+        self.assertEqual(output.name, "output")
+        self.assertEqual(output.init_value, float("-inf"))
+        self.assertFalse(output.interpret_uint8_as_fp4x2)
+
+        tensor = output.materialize()
+        self.assertEqual(tensor.dtype, torch.float32)
+        self.assertEqual(tuple(tensor.shape), output.shape)
+        self.assertEqual(tuple(tensor.stride()), output.stride)
+        self.assertTrue(torch.isneginf(tensor).all())
+
+    def test_torch_descriptor_materializes_false_and_zero_initializers(self):
+        source = TorchTensorDesc.from_tensor(torch.empty((1,), dtype=torch.float32))
+        for init_value in (False, 0):
+            with self.subTest(init_value=init_value):
+                output = source.compact_like(
+                    cudnn_dtype=data_type.FLOAT,
+                    shape=(4,),
+                    init_value=init_value,
+                )
+                self.assertTrue(torch.equal(output.materialize(), torch.zeros(4)))
+
+    def test_torch_descriptor_rejects_materializing_logical_packed_storage(self):
+        packed = TorchTensorDesc.from_tensor(
+            torch.empty((4,), dtype=torch.uint8),
+            interpret_uint8_as_fp4x2=True,
+        )
+
+        with self.assertRaisesRegex(ValueError, "logical FP4"):
+            packed.materialize()
+
+        unpacked = TorchTensorDesc(
+            dtype=torch.float32,
+            shape=(4,),
+            stride=(1,),
+            stride_order=(0,),
+            device="cpu",
+            interpret_uint8_as_fp4x2=True,
+            init_value=1,
+        )
+        self.assertTrue(torch.equal(unpacked.materialize(), torch.ones(4)))
+
     def test_api_base_materializes_a_canonical_descriptor(self):
         desc = SharedTensorDesc(
             dtype=data_type.FLOAT,
@@ -147,6 +262,16 @@ class TensorDescTest(unittest.TestCase):
         stream.synchronize()
 
         self.assertTrue(torch.equal(tensor.cpu(), torch.full((8,), 7.0)))
+
+        torch_desc = TorchTensorDesc.from_tensor(torch.empty((1,), dtype=torch.float32, device=device)).compact_like(
+            cudnn_dtype=data_type.FLOAT,
+            shape=(8,),
+            init_value=9,
+        )
+        tensor = torch_desc.materialize(stream=cuda.CUstream(stream.cuda_stream))
+        stream.synchronize()
+
+        self.assertTrue(torch.equal(tensor.cpu(), torch.full((8,), 9.0)))
 
 
 if __name__ == "__main__":
