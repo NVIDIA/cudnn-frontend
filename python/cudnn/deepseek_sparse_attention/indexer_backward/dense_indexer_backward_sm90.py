@@ -67,6 +67,7 @@ class ScoreGradDenseSm90:
         mCuSeqlensQ,
         mCuSeqlensK,
         mQCausalOffsets,
+        mGradLoss,
         grad_scale: Float32,
         max_seqlen_q: Int32,
         max_seqlen_k: Int32,
@@ -109,6 +110,7 @@ class ScoreGradDenseSm90:
             mCuSeqlensQ,
             mCuSeqlensK,
             mQCausalOffsets,
+            mGradLoss,
             grad_scale,
             seqlen_k_pad,
             max_seqlen_q,
@@ -129,6 +131,7 @@ class ScoreGradDenseSm90:
         mCuSeqlensQ,
         mCuSeqlensK,
         mQCausalOffsets,
+        mGradLoss,
         grad_scale: Float32,
         seqlen_k_pad: Int32,
         seqlen_q_static: Int32,
@@ -148,6 +151,7 @@ class ScoreGradDenseSm90:
             seqlen_k_static,
         )
         q_causal_offset_b = Int32(0) if const_expr(mQCausalOffsets is None) else mQCausalOffsets[batch_idx]
+        grad_scale_f32 = Float32(grad_scale) * Float32(mGradLoss[0])
 
         if seq_local < seqlen_q_b:
             smem = cutlass.utils.SmemAllocator()
@@ -195,7 +199,7 @@ class ScoreGradDenseSm90:
                 target = attn_raw / (attn_l1_val + Float32(EPS))
                 target_eff = target if target >= Float32(CLIP_PROB_MIN) else Float32(CLIP_PROB_MIN)
                 log_clip_mask = Float32(1.0) if score_minus_lse >= Float32(CLIP_LOG_MIN) else Float32(0.0)
-                local_sum = local_sum + (-target_eff * log_clip_mask * grad_scale)
+                local_sum = local_sum + (-target_eff * log_clip_mask * grad_scale_f32)
                 pos = pos + Int32(128)
 
             warp_sum = cute.arch.warp_reduction_sum(local_sum)
@@ -221,7 +225,7 @@ class ScoreGradDenseSm90:
                     target = attn_raw / (attn_l1_val + Float32(EPS))
                     target_eff = target if target >= Float32(CLIP_PROB_MIN) else Float32(CLIP_PROB_MIN)
                     log_clip_mask = Float32(1.0) if score_minus_lse >= Float32(CLIP_LOG_MIN) else Float32(0.0)
-                    g = -target_eff * log_clip_mask * grad_scale
+                    g = -target_eff * log_clip_mask * grad_scale_f32
                     mIdxScore_b[seq_local, pos] = g - predict * sum_grad
                 else:
                     mIdxScore_b[seq_local, pos] = Float32(0.0)
@@ -352,6 +356,7 @@ def _build_cute_dsl_dense_kernel(
         CuSeqlensQ,
         CuSeqlensK,
         QCausalOffsets,
+        GradLoss,
         grad_scale,
         current_stream=None,
     ):
@@ -369,6 +374,7 @@ def _build_cute_dsl_dense_kernel(
                 cuq_arg,
                 cuk_arg,
                 q_offsets_arg,
+                to_cute_tensor(GradLoss, assumed_align=4, leading_dim=0),
                 cutlass.Float32(float(grad_scale)),
                 cutlass.Int32(seqlen),
                 cutlass.Int32(seqlen_k),
@@ -381,12 +387,15 @@ def _build_cute_dsl_dense_kernel(
         IdxLSE,
         AttnScoreRaw,
         AttnL1Norm,
+        GradLoss,
         grad_scale,
         CuSeqlensQ=None,
         CuSeqlensK=None,
         QCausalOffsets=None,
         current_stream=None,
     ):
+        if GradLoss.ndim == 0:
+            GradLoss = GradLoss.reshape(1)
         if is_varlen:
             assert CuSeqlensQ is not None and CuSeqlensK is not None, "THD-compiled score-grad kernel requires cu_seqlens_q/k at runtime"
         else:
@@ -404,6 +413,7 @@ def _build_cute_dsl_dense_kernel(
             CuSeqlensQ,
             CuSeqlensK,
             QCausalOffsets,
+            GradLoss,
             grad_scale,
             current_stream=current_stream,
         )
@@ -415,6 +425,7 @@ def _build_cute_dsl_dense_kernel(
             CuSeqlensQ,
             CuSeqlensK,
             QCausalOffsets,
+            GradLoss,
             cutlass.Float32(float(grad_scale)),
             cutlass.Int32(seqlen),
             cutlass.Int32(seqlen_k),
@@ -488,6 +499,7 @@ def _build_cute_dsl_dense_kernel(
         attn_l1norm,
         idx_scores_raw,
         idx_lse,
+        GradLoss,
         grad_scale,
         CuSeqlensQ=None,
         CuSeqlensK=None,
@@ -503,6 +515,7 @@ def _build_cute_dsl_dense_kernel(
             idx_lse,
             attn_scores_raw,
             attn_l1norm,
+            GradLoss,
             grad_scale,
             CuSeqlensQ,
             CuSeqlensK,
