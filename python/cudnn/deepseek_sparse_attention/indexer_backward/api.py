@@ -380,8 +380,8 @@ class DenseIndexerBackward(APIBase):
     ) -> None:
         backend_stream = None if self._uses_current_stream_pipeline else current_stream
         with _torch_stream_context(backend_stream):
-            grad_loss_value = float(_as_grad_loss_tensor(grad_loss, index_q.device).item())
-            grad_scale = float(loss_coeff) * grad_loss_value / max(int(self.normalization_tokens), 1)
+            grad_loss_tensor = _as_grad_loss_tensor(grad_loss, index_q.device)
+            grad_scale = float(loss_coeff) / max(int(self.normalization_tokens), 1)
 
             # Dense backward's dK path uses atomic/bulk reductions into fp32.
             d_index_k_target = d_index_k
@@ -402,6 +402,7 @@ class DenseIndexerBackward(APIBase):
             attn_l1norm,
             index_score,
             index_lse,
+            grad_loss_tensor,
             grad_scale,
             cu_seqlens_q,
             cu_seqlens_k,
