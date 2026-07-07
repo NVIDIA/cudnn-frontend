@@ -57,7 +57,7 @@ class BlockScaleQuantizeNode : public NodeCRTP<BlockScaleQuantizeNode> {
             std::sort(indices.begin(), indices.end(), [&X_dim, &X_stride](int64_t i, int64_t j) {
                 // Prioritize singleton dimensions
                 if (X_stride[i] == X_stride[j]) {
-                    return (X_dim[i] == 1) || (X_dim[j] != 1);
+                    return (X_dim[i] == 1) && (X_dim[j] != 1);
                 }
                 return X_stride[i] < X_stride[j];
             });

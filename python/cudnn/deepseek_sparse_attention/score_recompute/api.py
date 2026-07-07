@@ -560,6 +560,7 @@ class DenseIndexerScoreRecompute(_ScoreRecomputeBase):
         cu_seqlens_k: Optional[torch.Tensor] = None,
         max_seqlen_q: Optional[int] = None,
         max_seqlen_k: Optional[int] = None,
+        q_causal_offsets: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
     ):
         scale = self.sm_scale if sm_scale is None else float(sm_scale)
@@ -585,6 +586,7 @@ class DenseIndexerScoreRecompute(_ScoreRecomputeBase):
                 cu_seqlens_k=cu_seqlens_k,
                 max_seqlen_q=max_seqlen_q,
                 max_seqlen_k=max_seqlen_k,
+                q_causal_offsets=q_causal_offsets,
                 current_stream=current_stream,
             )
         return _iface_sm100.dense_indexer_score_recompute(
@@ -600,6 +602,7 @@ class DenseIndexerScoreRecompute(_ScoreRecomputeBase):
             cu_seqlens_k=cu_seqlens_k,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
+            q_causal_offsets=q_causal_offsets,
             current_stream=current_stream,
         )
 
@@ -620,6 +623,7 @@ def dense_indexer_score_recompute_wrapper(
     cu_seqlens_k: Optional[torch.Tensor] = None,
     max_seqlen_q: Optional[int] = None,
     max_seqlen_k: Optional[int] = None,
+    q_causal_offsets: Optional[torch.Tensor] = None,
     stream: Optional[cuda.CUstream] = None,
 ) -> TupleDict:
     is_thd, max_q, max_k, out_shape, denom_shape = _dense_sample_shapes(
@@ -646,6 +650,7 @@ def dense_indexer_score_recompute_wrapper(
         max_k,
         tuple(cu_seqlens_q.shape) if cu_seqlens_q is not None else None,
         tuple(cu_seqlens_k.shape) if cu_seqlens_k is not None else None,
+        q_causal_offsets is not None,
     )
     obj = _cache_of_DenseIndexerScoreRecomputeObjects.get(key)
     if obj is None:
@@ -694,6 +699,7 @@ def dense_indexer_score_recompute_wrapper(
         cu_seqlens_k=cu_seqlens_k,
         max_seqlen_q=max_q if is_thd else max_seqlen_q,
         max_seqlen_k=max_k if is_thd else max_seqlen_k,
+        q_causal_offsets=q_causal_offsets,
         current_stream=stream,
     )
     return TupleDict(out=o, denom=d)
@@ -765,6 +771,7 @@ class DenseAttnScoreRecompute(_ScoreRecomputeBase):
         cu_seqlens_k: Optional[torch.Tensor] = None,
         max_seqlen_q: Optional[int] = None,
         max_seqlen_k: Optional[int] = None,
+        q_causal_offsets: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
     ):
         scale = self.softmax_scale if softmax_scale is None else float(softmax_scale)
@@ -790,6 +797,7 @@ class DenseAttnScoreRecompute(_ScoreRecomputeBase):
                 cu_seqlens_k=cu_seqlens_k,
                 max_seqlen_q=max_seqlen_q,
                 max_seqlen_k=max_seqlen_k,
+                q_causal_offsets=q_causal_offsets,
                 current_stream=current_stream,
             )
         return _iface_sm100.dense_attn_score_recompute(
@@ -805,6 +813,7 @@ class DenseAttnScoreRecompute(_ScoreRecomputeBase):
             cu_seqlens_k=cu_seqlens_k,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
+            q_causal_offsets=q_causal_offsets,
             current_stream=current_stream,
         )
 
@@ -825,6 +834,7 @@ def dense_attn_score_recompute_wrapper(
     cu_seqlens_k: Optional[torch.Tensor] = None,
     max_seqlen_q: Optional[int] = None,
     max_seqlen_k: Optional[int] = None,
+    q_causal_offsets: Optional[torch.Tensor] = None,
     stream: Optional[cuda.CUstream] = None,
 ) -> TupleDict:
     is_thd, max_q, max_k, out_shape, denom_shape = _dense_sample_shapes(
@@ -851,6 +861,7 @@ def dense_attn_score_recompute_wrapper(
         max_k,
         tuple(cu_seqlens_q.shape) if cu_seqlens_q is not None else None,
         tuple(cu_seqlens_k.shape) if cu_seqlens_k is not None else None,
+        q_causal_offsets is not None,
     )
     obj = _cache_of_DenseAttnScoreRecomputeObjects.get(key)
     if obj is None:
@@ -899,6 +910,7 @@ def dense_attn_score_recompute_wrapper(
         cu_seqlens_k=cu_seqlens_k,
         max_seqlen_q=max_q if is_thd else max_seqlen_q,
         max_seqlen_k=max_k if is_thd else max_seqlen_k,
+        q_causal_offsets=q_causal_offsets,
         current_stream=stream,
     )
     return TupleDict(out=o, denom=d)

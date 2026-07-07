@@ -5,13 +5,13 @@ from test_utils import torch_fork_set_rng
 
 from fe_api.dsa.dsa_utils import dsa_init, with_dsa_dense_indexer_backward_params
 from fe_api.dsa.dsa_reference import (
-    _bottom_right_causal_mask,
+    _batched_ratio_causal_mask,
     check_ref_dense_indexer_backward,
     ref_dense_indexer_score_recompute,
 )
 
 
-def _allocate(cfg, sm_scale: float, ratio: int):
+def _allocate(cfg, sm_scale: float, ratio: int, q_causal_offsets: torch.Tensor):
     b = cfg["b"]
     s_q = cfg["s_q"]
     s_k = cfg["s_kv"]
@@ -29,18 +29,18 @@ def _allocate(cfg, sm_scale: float, ratio: int):
             index_k.unsqueeze(2),
             weights,
             ratio=ratio,
+            q_causal_offsets=q_causal_offsets,
         )
+        valid = _batched_ratio_causal_mask(s_q, s_k, ratio, device, b, q_causal_offsets)
         if sm_scale != 1.0:
             index_score = index_score * sm_scale
-            valid = _bottom_right_causal_mask(s_q, s_k, ratio, device)
             index_lse = torch.logsumexp(
-                index_score.masked_fill(~valid.unsqueeze(0), float("-inf")),
+                index_score.masked_fill(~valid, float("-inf")),
                 dim=-1,
             )
 
-        valid = _bottom_right_causal_mask(s_q, s_k, ratio, device)
         attn_score = torch.rand(b, s_q, s_k, dtype=torch.float32, device=device)
-        attn_score = attn_score.masked_fill(~valid.unsqueeze(0), 0.0).contiguous()
+        attn_score = attn_score.masked_fill(~valid, 0.0).contiguous()
         attn_l1norm = attn_score.sum(dim=-1).contiguous()
 
     return (
@@ -87,6 +87,7 @@ def test_DSA_dense_indexer_backward_wrapper(
     sm_scale = 1.0
     b_cfg = cfg["b"]
     s_q_cfg = cfg["s_q"]
+    q_causal_offsets = torch.full((b_cfg,), 8, dtype=torch.int32, device="cuda")
     loss_coeff = float(b_cfg * s_q_cfg)
     grad_loss = 1.0
     grad_scale_expected = (loss_coeff / (b_cfg * s_q_cfg)) * grad_loss
@@ -99,7 +100,7 @@ def test_DSA_dense_indexer_backward_wrapper(
         attn_l1norm,
         index_score,
         index_lse,
-    ) = _allocate(cfg, sm_scale=sm_scale, ratio=ratio)
+    ) = _allocate(cfg, sm_scale=sm_scale, ratio=ratio, q_causal_offsets=q_causal_offsets)
     torch_stream = torch.cuda.Stream()
     stream = cuda.CUstream(torch_stream.cuda_stream)
 
@@ -120,6 +121,7 @@ def test_DSA_dense_indexer_backward_wrapper(
             grad_loss=grad_loss,
             block_I=block_I,
             ratio=ratio,
+            q_causal_offsets=q_causal_offsets,
             stream=stream,
         )
     except (ValueError, NotImplementedError, RuntimeError) as e:
@@ -150,4 +152,5 @@ def test_DSA_dense_indexer_backward_wrapper(
             sm_scale=sm_scale,
             ratio=ratio,
             grad_scale=grad_scale_expected,
+            q_causal_offsets=q_causal_offsets,
         )

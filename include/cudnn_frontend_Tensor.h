@@ -447,7 +447,7 @@ class TensorBuilder_v8 {
                 set_error_and_throw_exception(
                     &m_tensor,
                     status,
-                    "CUDNN_BACKEND_TENSOR_DESCRIPTOR: SetAttribute CUDNN_ATTR_TENSOR_BYTE_ALIGNMENT Failed");
+                    "CUDNN_BACKEND_TENSOR_DESCRIPTOR: SetAttribute CUDNN_ATTR_TENSOR_IS_VIRTUAL Failed");
                 return std::move(m_tensor);
             }
         }

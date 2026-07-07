@@ -620,11 +620,11 @@ PyGraph::serialize() const {
 }
 
 void
-PyGraph::deserialize(std::optional<std::intptr_t> handle_, py::object const& pyobj) {
+PyGraph::deserialize(std::optional<std::intptr_t> handle_, py::object const& pyobj, bool const enforce_precompiled) {
     if (py::isinstance<py::str>(pyobj)) {
         json j = json::parse(pyobj.cast<std::string>());
 
-        auto status = graph->deserialize(j);
+        auto status = graph->deserialize(j, enforce_precompiled);
 
         throw_if(status.is_bad(), status.get_code(), status.get_message());
 
@@ -634,16 +634,16 @@ PyGraph::deserialize(std::optional<std::intptr_t> handle_, py::object const& pyo
             handle_.has_value() ? static_cast<cudnnHandle_t>((void*)(handle_.value())) : this->handle;
 
         std::vector<uint8_t> data = pyobj.cast<std::vector<uint8_t>>();
-        auto status               = graph->deserialize(handle, data);
+        auto status               = graph->deserialize(handle, data, enforce_precompiled);
 
         throw_if(status.is_bad(), status.get_code(), status.get_message());
     }
 }
 
 void
-PyGraph::deserialize(py::object const& pyobj) {
+PyGraph::deserialize(py::object const& pyobj, bool const enforce_precompiled) {
     // Call the overloaded version with default handle (nullopt)
-    deserialize(std::nullopt, pyobj);
+    deserialize(std::nullopt, pyobj, enforce_precompiled);
 }
 
 void
@@ -1378,10 +1378,14 @@ init_pygraph_submodule(py::module_& m) {
         .def("update_cuda_graph", &PyGraph::update_cuda_graph)
         .def("serialize", &PyGraph::serialize)
         .def("deserialize",
-             (void (PyGraph::*)(std::optional<std::intptr_t>, py::object const&))&PyGraph::deserialize,
+             (void (PyGraph::*)(std::optional<std::intptr_t>, py::object const&, bool const))&PyGraph::deserialize,
              py::arg("handle_"),
-             py::arg("pyobj"))
-        .def("deserialize", (void (PyGraph::*)(py::object const&))&PyGraph::deserialize, py::arg("pyobj"))
+             py::arg("pyobj"),
+             py::arg("enforce_precompiled") = false)
+        .def("deserialize",
+             (void (PyGraph::*)(py::object const&, bool const))&PyGraph::deserialize,
+             py::arg("pyobj"),
+             py::arg("enforce_precompiled") = false)
         .def("_execute_plan_at_index",
              &PyGraph::execute_plan_at_index,
              py::arg("var_pack"),

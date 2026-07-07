@@ -540,7 +540,9 @@ PyGraph::sdpa_fp8(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
                   py::object const& generate_stats,
                   std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> score_max,
                   std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> score_sum_exp,
-                  std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> sink_token) {
+                  std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> sink_token,
+                  bool const unfuse_fma,
+                  cudnn_frontend::AttentionImplementation_t const& implementation) {
     cudnn_frontend::DataType_t mma_core_mode                             = cudnn_frontend::DataType_t::FP8_E4M3;
     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> block_mask = nullptr;
     // cu_seq_len_q/cu_seq_len_kv are not exposed via the fp8 path.
@@ -629,7 +631,9 @@ PyGraph::sdpa_fp8(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
                                          descale_v,
                                          descale_s,
                                          scale_s,
-                                         scale_o);
+                                         scale_o,
+                                         implementation,
+                                         unfuse_fma);
 
     // Return all 4 outputs as array for backward compatibility
     return {internal_result.O, internal_result.Stats, internal_result.Amax_S, internal_result.Amax_O};
@@ -653,7 +657,8 @@ PyGraph::sdpa_mxfp8(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q
                     std::string const& name,
                     py::object const& generate_stats,
                     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> sink_token,
-                    bool const unfuse_fma) {
+                    bool const unfuse_fma,
+                    cudnn_frontend::AttentionImplementation_t const& implementation) {
     auto attributes =
         cudnn_frontend::graph::SDPA_fp8_attributes().set_name(name).set_compute_data_type(compute_data_type);
 
@@ -733,6 +738,7 @@ PyGraph::sdpa_mxfp8(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q
         attributes.set_sink_token(sink_token);
     }
     attributes.set_unfuse_fma(unfuse_fma);
+    attributes.set_implementation(implementation);
 
     // Call the MXFP8 6-parameter overload of sdpa_fp8
     // This uses block scale factors (E8M0 + F8_128x4) instead of regular scalar descales
@@ -1263,6 +1269,8 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
           py::arg_v("score_max", nullptr),
           py::arg_v("score_sum_exp", nullptr),
           py::arg_v("sink_token", nullptr),
+          py::arg_v("unfuse_fma", false),
+          py::arg_v("implementation", cudnn_frontend::AttentionImplementation_t::AUTO),
           R"pbdoc(
                 Perform scaled dot product attention with fp8 datatype inputs and outputs.
 
@@ -1294,6 +1302,8 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
                     score_max (Optional[cudnn_tensor]): The max of attention score.
                     score_sum_exp (Optional[cudnn_tensor]): The numerically stable sum of exponents using normalized values wrt max score.
                     sink_token (Optional[cudnn_tensor]): Sink token bias for streaming attention. Default is None.
+                    unfuse_fma (Optional[bool]): For SM100: use unfused __fmul_rn + __fadd_rn instead of ffma2 in softmax. Default is False.
+                    implementation (Optional[cudnn.attention_implementation]): Which underlying implementation to use in the cuDNN backend. Default is AUTO (recommended).
                 Preferred masking Args:
                     diagonal_alignment (Optional[cudnn.diagonal_alignment]): One of {"TOP_LEFT", "BOTTOM_RIGHT"}. E.g., causal masking can be performed by setting diagonal_alignment=TOP_LEFT, and right_bound=0. Default is TOP_LEFT.
                     left_bound (Optional[int]): An integer >= 1 specifying the offset to the left of the main diagonal to attend to. Default is None, implying +Inf.
@@ -1330,6 +1340,7 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
           py::arg("generate_stats"),
           py::arg_v("sink_token", nullptr),
           py::arg_v("unfuse_fma", false),
+          py::arg_v("implementation", cudnn_frontend::AttentionImplementation_t::AUTO),
           R"pbdoc(
                 Perform MXFP8 (Microscaling FP8) scaled dot product attention.
 
@@ -1369,6 +1380,7 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
                     generate_stats (bool): If true, compute and output softmax stats (required for training).
                     sink_token (Optional[cudnn_tensor]): Sink token bias for streaming attention. Shape is (1, h_q, 1, 1), type is float32. Default is None.
                     unfuse_fma (Optional[bool]): For SM100: use unfused __fmul_rn + __fadd_rn instead of ffma2 in softmax. Default is False.
+                    implementation (Optional[cudnn.attention_implementation]): Which underlying implementation to use in the cuDNN backend. Default is AUTO (recommended).
 
                 Returns:
                     o (cudnn_tensor): The output data.

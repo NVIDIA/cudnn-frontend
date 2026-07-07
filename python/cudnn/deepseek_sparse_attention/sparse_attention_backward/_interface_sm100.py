@@ -7,6 +7,7 @@ import torch
 import cutlass
 import cutlass.cute as cute
 
+from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
 from cudnn.deepseek_sparse_attention.utils.runtime import resolve_stream
 from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
 from .dsa_bwd_sm100 import FlashAttentionDSABackwardSm100
@@ -129,7 +130,8 @@ def flash_attn_bwd_sm100(
     current_stream = resolve_stream(current_stream)
 
     has_topk_length = topk_length is not None
-    compile_key = (dtype, head_dim, head_dim_v, num_head, block_tile, has_topk_length)
+    max_topk = topk_idxs.shape[1]
+    compile_key = (dtype, head_dim, head_dim_v, num_head, block_tile, max_topk, has_topk_length)
 
     if compile_key not in flash_attn_bwd_sm100.compile_cache:
         q_tensor = to_cute_tensor(q, divisibility=head_dim)
@@ -150,6 +152,7 @@ def flash_attn_bwd_sm100(
             head_dim=head_dim,
             head_dim_v=head_dim_v,
             block_tile=block_tile,
+            max_topk=max_topk,
         )
 
         with torch.cuda.nvtx.range("flash_attn_bwd_sm100_compile"):
@@ -171,7 +174,7 @@ def flash_attn_bwd_sm100(
                 workspace_dKV_tensor,
                 softmax_scale,
                 current_stream,
-                options="--enable-tvm-ffi",
+                options=compile_options(),
             )
 
     with torch.cuda.nvtx.range("flash_attn_bwd_sm100_kernel"):

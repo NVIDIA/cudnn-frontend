@@ -78,8 +78,8 @@ class CompactifyKernel:
         row = bidx * ROWS_PER_CTA + warp_id
 
         if row < rows:
-            local_vals = cute.make_fragment((chunk,), Int32)
-            local_is_valid = cute.make_fragment((chunk,), cutlass.Boolean)
+            local_vals = cute.make_rmem_tensor((chunk,), Int32)
+            local_is_valid = cute.make_rmem_tensor((chunk,), cutlass.Boolean)
             cnt_v = Int32(0)
             cnt_i = Int32(0)
 

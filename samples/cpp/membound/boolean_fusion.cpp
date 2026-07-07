@@ -40,7 +40,7 @@ TEST_CASE("Boolean CMP_GT and LOGICAL_AND fusion", "[membound][boolean][pointwis
         SKIP("Boolean fusion sample requires cuDNN backend 9.22.0 or newer at runtime.");
     }
     if (!is_blackwell_computing_arch()) {
-        SKIP("Boolean fusion (TensorIR MemBound engine) is only supported on SM100-SM109 (data center Blackwell)");
+        SKIP("Boolean fusion (TensorIR MemBound engine) is only supported on Blackwell (data center Blackwell)");
     }
 
     constexpr int64_t d0 = 4, d1 = 8, d2 = 16;
@@ -50,6 +50,13 @@ TEST_CASE("Boolean CMP_GT and LOGICAL_AND fusion", "[membound][boolean][pointwis
     constexpr int64_t s0 = d1 * d2;
     constexpr int64_t s1 = d2;
     constexpr int64_t s2 = 1;
+
+    auto boolean_storage_type = fe::DataType_t::BOOLEAN;
+#if (CUDNN_VERSION >= 92500)
+    if (cudnn_frontend::detail::get_backend_version() >= 92500) {
+        boolean_storage_type = fe::DataType_t::BYTE_BOOLEAN;
+    }
+#endif
 
     fe::graph::Graph graph{};
     graph.set_compute_data_type(fe::DataType_t::FLOAT);
@@ -70,7 +77,7 @@ TEST_CASE("Boolean CMP_GT and LOGICAL_AND fusion", "[membound][boolean][pointwis
                               .set_name("B")
                               .set_dim({d0, d1, d2})
                               .set_stride({s0, s1, s2})
-                              .set_data_type(fe::DataType_t::BOOLEAN));
+                              .set_data_type(boolean_storage_type));
 
     auto after_cmp = graph.pointwise(X,
                                      threshold,
@@ -78,7 +85,7 @@ TEST_CASE("Boolean CMP_GT and LOGICAL_AND fusion", "[membound][boolean][pointwis
                                          .set_name("cmp_gt")
                                          .set_mode(fe::PointwiseMode_t::CMP_GT)
                                          .set_compute_data_type(fe::DataType_t::FLOAT));
-    after_cmp->set_data_type(fe::DataType_t::BOOLEAN);
+    after_cmp->set_data_type(boolean_storage_type);
 
     auto Y = graph.pointwise(after_cmp,
                              B,
@@ -86,7 +93,7 @@ TEST_CASE("Boolean CMP_GT and LOGICAL_AND fusion", "[membound][boolean][pointwis
                                  .set_name("logical_and")
                                  .set_mode(fe::PointwiseMode_t::LOGICAL_AND)
                                  .set_compute_data_type(fe::DataType_t::BOOLEAN));
-    Y->set_output(true).set_data_type(fe::DataType_t::BOOLEAN);
+    Y->set_output(true).set_data_type(boolean_storage_type);
 
     REQUIRE(graph.validate().is_good());
 
