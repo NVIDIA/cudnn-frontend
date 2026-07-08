@@ -36,7 +36,7 @@ The module packages the following operations:
 
 ### Architecture
 
-```
+```text
 Q, K, W ──► IndexerForward ──► scores ──► IndexerTopK ──► topk_idxs
                                                              │
                                                              v
