@@ -442,9 +442,9 @@ class IndexerBackwardSm100:
         storage = smem.allocate(SharedStorage)
         Q_mbar_ptr = storage.Q_mbar.data_ptr()
         mbar = storage.mbar.data_ptr()
-        tmem_holding_buf = storage.tmem_holding_buf
+        tmem_holding_buf = storage.tmem_holding_buf.ptr
         tmem = utils.TmemAllocator(
-            storage.tmem_holding_buf,
+            storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_alloc_barrier,
             allocator_warp_id=self.compute_warp_id[0],
         )

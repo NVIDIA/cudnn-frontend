@@ -407,7 +407,7 @@ class SparseScoreRecomputeSm100:
         S_mbar_ptr = storage.S_mbar_ptr.data_ptr()
         reduce_sync_mbar_ptr = storage.reduce_sync_mbar_ptr.data_ptr()
         tmem_dealloc_mbar_ptr = storage.tmem_dealloc_mbar_ptr.data_ptr()
-        tmem_holding_buf = storage.tmem_holding_buf
+        tmem_holding_buf = storage.tmem_holding_buf.ptr
         clc_mbar_ptr = storage.clc_mbar_ptr.data_ptr()
         clc_response_ptr = storage.clc_response.data_ptr()
         sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
