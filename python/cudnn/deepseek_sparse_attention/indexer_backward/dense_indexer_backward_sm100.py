@@ -2172,6 +2172,9 @@ def _build_cute_dsl_kernel(batch, max_seqlen_q, max_seqlen_k, heads, dim, sm_sca
         THD : pass packed tensors and CuSeqlens* (B+1,) int32.
         Kernel 3 (dK f32 → output dtype) is handled by the caller.
 
+        ``GradLoss`` is a single-element float32 tensor on the same CUDA device
+        as the inputs. Kernel 1 reads it at runtime, including during CUDA Graph
+        replay.
         ``grad_scale`` is a host scalar (Python float, ``loss_coeff /
         (b*sq)``); supplied at call time as a runtime ``Float32`` arg to
         kernel 1 so changing it does not require recompilation.

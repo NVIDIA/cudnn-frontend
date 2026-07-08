@@ -128,6 +128,7 @@ def test_DSA_dense_score_recompute_thd_q_causal_offsets_alignment():
     assert result["out"].shape == (batch * seqlen_q, seqlen_k)
     assert result["denom"].shape == (batch * seqlen_q,)
     assert torch.isfinite(result["out"]).any()
+    assert (torch.isfinite(result["out"]) | torch.isneginf(result["out"])).all()
     assert torch.isfinite(result["denom"]).all()
 
 
