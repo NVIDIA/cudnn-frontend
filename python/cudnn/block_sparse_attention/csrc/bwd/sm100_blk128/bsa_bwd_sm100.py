@@ -1,11 +1,14 @@
 # Copyright (c) 2025, Ted Zadouri, Markus Hoehnerbach, Jay Shah, Tri Dao.
+from __future__ import annotations
+
 import math
-from typing import Callable, NamedTuple, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, NamedTuple, Optional, Tuple
 from functools import partial
 
 import cuda.bindings.driver as cuda
 
-import torch
+if TYPE_CHECKING:
+    import torch
 
 import cutlass
 import cutlass.cute as cute
@@ -28,11 +31,6 @@ from cudnn.block_sparse_attention.csrc.utils import pipeline
 from cudnn.block_sparse_attention.csrc.utils.tcgen05_mma_helpers import gemm_w_idx, gemm_ptx_w_idx
 from cudnn.block_sparse_attention.csrc.utils.seqlen_info import SeqlenInfoQK
 from cudnn.block_sparse_attention.csrc.utils.block_info import BlockInfo
-from cudnn.block_sparse_attention.csrc.bwd.bsa_bwd_prepost import (
-    _bwd_postprocess_convert,
-    _bwd_preprocess,
-    _get_device_arch,
-)
 from cudnn.block_sparse_attention.csrc.utils.cute_dsl_utils import ParamsBase, sub_packed_f32x2
 from cudnn.block_sparse_attention.csrc.utils.tile_scheduler import (
     TileSchedulerArguments,
@@ -2193,6 +2191,14 @@ def bsa_sm100_blk128_bwd_bucketed_k2q_csr(
     dv: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """SM100/SM110 blk128 bwd entry receiving BSA bucketed k2q CSR."""
+    import torch
+
+    from cudnn.block_sparse_attention.csrc.bwd.bsa_bwd_prepost import (
+        _bwd_postprocess_convert,
+        _bwd_preprocess,
+        _get_device_arch,
+    )
+
     assert q.dtype == torch.bfloat16, "SM100 blk128 bwd only supports bfloat16"
     assert q.dtype == k.dtype == v.dtype == out.dtype == dout.dtype
     assert lse.dtype == torch.float32

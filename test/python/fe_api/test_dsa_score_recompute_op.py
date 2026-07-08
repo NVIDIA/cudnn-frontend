@@ -78,15 +78,21 @@ class DsaScoreRecomputeOpTest(unittest.TestCase):
             name=name,
         )
 
-    def sparse(self, *, target=100, score_type="indexer", with_length=False, **overrides):
+    def sparse(
+        self, *, target=100, score_type="indexer", with_length=False, **overrides
+    ):
         aux_dtype = _DataType.BFLOAT16 if score_type == "indexer" else _DataType.FLOAT
         arguments = {
             "q": self.desc((2, 4, 32, 128), name="q"),
             "k": self.desc((2, 256, 128), name="k"),
             "per_head": self.desc((2, 4, 32), aux_dtype, name="per_head"),
-            "topk_indices": self.desc((2, 4, 128), _DataType.INT32, name="topk_indices"),
+            "topk_indices": self.desc(
+                (2, 4, 128), _DataType.INT32, name="topk_indices"
+            ),
             "output": self.desc((2, 4, 128), _DataType.FLOAT, name="output"),
-            "topk_length": self.desc((2, 4), _DataType.INT32, name="topk_length") if with_length else None,
+            "topk_length": self.desc((2, 4), _DataType.INT32, name="topk_length")
+            if with_length
+            else None,
             "score_type": score_type,
             "softmax_scale": 0.125 if score_type == "attention" else 1.0,
             "target_compute_capability": target,
@@ -112,7 +118,9 @@ class DsaScoreRecomputeOpTest(unittest.TestCase):
             "k": self.desc(k_shape, name="k"),
             "per_head": self.desc(aux_shape, aux_dtype, name="per_head"),
             "output": self.desc(output_shape, _DataType.FLOAT, name="output"),
-            "denominator": self.desc(denominator_shape, _DataType.FLOAT, name="denominator"),
+            "denominator": self.desc(
+                denominator_shape, _DataType.FLOAT, name="denominator"
+            ),
             "score_type": score_type,
             "scale": 0.125 if score_type == "attention" else 1.0,
             "ratio": 2,
@@ -131,14 +139,23 @@ class DsaScoreRecomputeOpTest(unittest.TestCase):
         self.assertTrue(operation.check_support())
         self.assertEqual(operation.qhead_per_kv_head, 32)
         self.assertIsInstance(operation.config, self.config.SparseScoreKernelConfig)
-        self.assertEqual((operation.config.m_block_size, operation.config.n_block_size), (32, 128))
+        self.assertEqual(
+            (operation.config.m_block_size, operation.config.n_block_size), (32, 128)
+        )
         self.assertTrue(operation.config.have_topk_length)
 
     def test_sparse_resolves_sm90(self):
         operation = self.sparse(target=90)
         self.assertTrue(operation.check_support())
         self.assertIsInstance(operation.config, self.op.SparseScoreSm90Config)
-        self.assertEqual((operation.config.tile_m, operation.config.tile_n, operation.config.num_threads), (32, 64, 256))
+        self.assertEqual(
+            (
+                operation.config.tile_m,
+                operation.config.tile_n,
+                operation.config.num_threads,
+            ),
+            (32, 64, 256),
+        )
 
     def test_dense_bshd_and_thd_resolve_sm100(self):
         bshd = self.dense()
@@ -151,7 +168,9 @@ class DsaScoreRecomputeOpTest(unittest.TestCase):
         self.assertEqual((thd.max_seqlen_q, thd.max_seqlen_k), (4, 8))
 
     def test_dense_sm90_thd_is_explicitly_unsupported(self):
-        with self.assertRaisesRegex(NotImplementedError, "host-side sequence-length reads"):
+        with self.assertRaisesRegex(
+            NotImplementedError, "host-side sequence-length reads"
+        ):
             self.dense(target=90, thd=True).check_support()
 
     def test_complete_signatures_are_cross_checked(self):
@@ -164,18 +183,22 @@ class DsaScoreRecomputeOpTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "ratio must be >= 1"):
             self.dense(ratio=0).check_support()
 
-    def test_native_abi_descriptors_must_be_compact(self):
-        noncompact = self.tensor.TensorDesc(
+    def test_native_abi_feature_axes_must_be_contiguous(self):
+        unsupported_layout = self.tensor.TensorDesc(
             dtype=_DataType.BFLOAT16,
             shape=(2, 4, 32, 128),
             stride=(16384, 128, 512, 1),
             stride_order=(3, 1, 2, 0),
         )
-        with self.assertRaisesRegex(ValueError, "Q must be row-major compact"):
-            self.sparse(q=noncompact).check_support()
+        with self.assertRaisesRegex(
+            ValueError, "Q must have its final 2 axes contiguous"
+        ):
+            self.sparse(q=unsupported_layout).check_support()
 
     def test_sm100_configuration_rejects_incompatible_topk(self):
-        with self.assertRaisesRegex(ValueError, "multiple of the selected n_block_size"):
+        with self.assertRaisesRegex(
+            ValueError, "multiple of the selected n_block_size"
+        ):
             self.sparse(
                 topk_indices=self.desc((2, 4, 96), _DataType.INT32),
                 output=self.desc((2, 4, 96), _DataType.FLOAT),

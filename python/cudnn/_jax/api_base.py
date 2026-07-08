@@ -236,6 +236,19 @@ class JaxApiBase(ABC):
             raise ValueError("max_active_clusters must be positive after applying CUDNNFE_CLUSTER_OVERLAP_MARGIN")
         return max_active_clusters
 
+    def _get_device_multiprocessor_count(self) -> int:
+        """Return a cached local SM count before entering custom-call lowering."""
+
+        count = getattr(self, "_device_multiprocessor_count", None)
+        if count is None:
+            import cutlass
+
+            count = int(cutlass.utils.HardwareInfo().get_device_multiprocessor_count())
+            if count <= 0:
+                raise RuntimeError(f"CUDA reported an invalid multiprocessor count {count}")
+            self._device_multiprocessor_count = count
+        return count
+
     @staticmethod
     def _to_tensor_desc(
         value: Any,
@@ -357,6 +370,7 @@ class JaxApiBase(ABC):
         *,
         launch: Callable[..., None],
         output_descs: tuple[TensorDesc[Any], ...],
+        output_seeds: tuple[Any | None, ...] | None = None,
         workspace_descs: tuple[TensorDesc[Any], ...] = (),
         input_spec: tuple[Any | None, ...] | None = None,
         output_spec: tuple[Any | None, ...] | None = None,
@@ -372,8 +386,11 @@ class JaxApiBase(ABC):
         are declared as custom-call results so XLA owns their lifetime, then
         omitted from this method's return value. Descriptors with a non-``None``
         ``init_value`` are materialized as JAX inputs and aliased to their
-        corresponding custom-call results. Inputs are a flat tuple of arrays,
-        and all explicit specs are native CUTLASS ``TensorSpec`` values.
+        corresponding custom-call results. ``output_seeds`` supplies existing
+        JAX values for outputs that must be updated in place by the kernel;
+        these operands are likewise aliased to the corresponding results.
+        Inputs are a flat tuple of arrays, and all explicit specs are native
+        CUTLASS ``TensorSpec`` values.
         """
 
         import cutlass.jax as cutlass_jax
@@ -383,8 +400,8 @@ class JaxApiBase(ABC):
             raise TypeError(f"launch must be callable, got {type(launch).__name__}")
 
         inputs = tuple(inputs)
-        for index, value in enumerate(inputs):
-            _require_array_metadata(value, f"input #{index}")
+        for input_index, value in enumerate(inputs):
+            _require_array_metadata(value, f"input #{input_index}")
         outputs = tuple(output_descs)
         workspaces = tuple(workspace_descs)
         if not outputs:
@@ -425,18 +442,57 @@ class JaxApiBase(ABC):
         buffer_specs = output_specs + workspace_specs
         buffer_metadata = tuple(self._materialize_tensor_desc(desc, mode=getattr(spec, "mode", None)) for desc, spec in zip(buffers, buffer_specs))
 
-        initialized = tuple(index for index, desc in enumerate(buffers) if desc.init_value is not None)
-        uninitialized = tuple(index for index, desc in enumerate(buffers) if desc.init_value is None)
-        seed_inputs = tuple(
-            jnp.full(
-                buffer_metadata[index].shape,
-                buffers[index].init_value,
-                dtype=buffer_metadata[index].dtype,
-            )
-            for index in initialized
+        if output_seeds is None:
+            supplied_output_seeds = (None,) * len(outputs)
+        else:
+            supplied_output_seeds = tuple(output_seeds)
+            if len(supplied_output_seeds) != len(outputs):
+                raise ValueError(
+                    f"Expected {len(outputs)} output seeds, got {len(supplied_output_seeds)}"
+                )
+
+        seed_by_buffer: dict[int, Any] = {}
+        for output_index, seed in enumerate(supplied_output_seeds):
+            if seed is None:
+                continue
+            output_name = outputs[output_index].name or f"output #{output_index}"
+            if outputs[output_index].init_value is not None:
+                raise ValueError(
+                    f"{output_name} cannot have both an explicit seed and init_value"
+                )
+            _require_array_metadata(seed, f"output seed #{output_index}")
+            metadata = buffer_metadata[output_index]
+            if tuple(seed.shape) != tuple(metadata.shape):
+                raise ValueError(
+                    f"{output_name} seed shape mismatch: "
+                    f"expected {tuple(metadata.shape)}, got {tuple(seed.shape)}"
+                )
+            if seed.dtype != metadata.dtype:
+                raise ValueError(
+                    f"{output_name} seed dtype mismatch: "
+                    f"expected {metadata.dtype}, got {seed.dtype}"
+                )
+            seed_by_buffer[output_index] = seed
+
+        for buffer_index, desc in enumerate(buffers):
+            if desc.init_value is not None:
+                seed_by_buffer[buffer_index] = jnp.full(
+                    buffer_metadata[buffer_index].shape,
+                    desc.init_value,
+                    dtype=buffer_metadata[buffer_index].dtype,
+                )
+
+        initialized = tuple(sorted(seed_by_buffer))
+        uninitialized = tuple(
+            buffer_index
+            for buffer_index in range(len(buffers))
+            if buffer_index not in seed_by_buffer
         )
+        seed_inputs = tuple(seed_by_buffer[buffer_index] for buffer_index in initialized)
         aliases = {len(inputs) + seed_index: result_index for seed_index, result_index in enumerate(initialized)}
-        call_input_specs = input_specs + tuple(buffer_specs[index] for index in initialized)
+        call_input_specs = input_specs + tuple(
+            buffer_specs[buffer_index] for buffer_index in initialized
+        )
 
         input_count = len(inputs)
         seed_count = len(seed_inputs)
@@ -449,10 +505,10 @@ class JaxApiBase(ABC):
                 raise RuntimeError(f"Kernel received {len(allocated_buffers)} allocated buffers; expected {len(uninitialized)}")
 
             ordered_buffers: list[Any] = [None] * len(buffers)
-            for index, value in zip(initialized, seeded_buffers):
-                ordered_buffers[index] = value
-            for index, value in zip(uninitialized, allocated_buffers):
-                ordered_buffers[index] = value
+            for buffer_index, value in zip(initialized, seeded_buffers):
+                ordered_buffers[buffer_index] = value
+            for buffer_index, value in zip(uninitialized, allocated_buffers):
+                ordered_buffers[buffer_index] = value
             output_buffers = tuple(ordered_buffers[: len(outputs)])
             workspace_buffers = tuple(ordered_buffers[len(outputs) :])
             launch(stream, *kernel_inputs, *output_buffers, *workspace_buffers)

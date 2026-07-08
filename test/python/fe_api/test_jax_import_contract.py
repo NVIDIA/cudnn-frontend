@@ -25,7 +25,11 @@ _CUDNN_ROOT = _REPO_ROOT / "python" / "cudnn"
 
 def _module_name(path):
     relative = path.relative_to(_CUDNN_ROOT)
-    parts = relative.parts[:-1] if path.name == "__init__.py" else relative.with_suffix("").parts
+    parts = (
+        relative.parts[:-1]
+        if path.name == "__init__.py"
+        else relative.with_suffix("").parts
+    )
     return ".".join(("cudnn", *parts))
 
 
@@ -85,7 +89,10 @@ def _imports(path, *, all_scopes):
                 visit(child, torch_optional)
             return
         if isinstance(node, ast.Try):
-            catches_import = any(handler.type is not None and _catches_import_error(handler.type) for handler in node.handlers)
+            catches_import = any(
+                handler.type is not None and _catches_import_error(handler.type)
+                for handler in node.handlers
+            )
             for child in node.body:
                 visit(child, torch_optional or catches_import)
             for handler in node.handlers:
@@ -94,7 +101,9 @@ def _imports(path, *, all_scopes):
             for child in (*node.orelse, *node.finalbody):
                 visit(child, torch_optional)
             return
-        if not all_scopes and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+        if not all_scopes and isinstance(
+            node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+        ):
             return
         for child in ast.iter_child_nodes(node):
             visit(child, torch_optional)
@@ -111,8 +120,14 @@ def _import_targets(path, node, modules):
 
     if node.level:
         current_module = _module_name(path)
-        package = current_module if path.name == "__init__.py" else current_module.rpartition(".")[0]
-        base = importlib.util.resolve_name("." * node.level + (node.module or ""), package)
+        package = (
+            current_module
+            if path.name == "__init__.py"
+            else current_module.rpartition(".")[0]
+        )
+        base = importlib.util.resolve_name(
+            "." * node.level + (node.module or ""), package
+        )
     else:
         base = node.module or ""
 
@@ -148,50 +163,134 @@ def _jax_import_violations(root, modules):
 
     while queue:
         path, all_scopes, chain = queue.popleft()
-        if path in scanned_all_scopes or (not all_scopes and path in scanned_module_scope):
+        if path in scanned_all_scopes or (
+            not all_scopes and path in scanned_module_scope
+        ):
             continue
         (scanned_all_scopes if all_scopes else scanned_module_scope).add(path)
         visited.add(path)
 
         for node, torch_optional in _imports(path, all_scopes=all_scopes):
             for target in _import_targets(path, node, modules):
-                chain_text = " -> ".join(str(item.relative_to(_REPO_ROOT)) for item in chain)
+                chain_text = " -> ".join(
+                    str(item.relative_to(_REPO_ROOT)) for item in chain
+                )
                 if target == "torch" or target.startswith("torch."):
                     if not torch_optional:
-                        violations.append(f"{chain_text}:{node.lineno} imports {target}")
+                        violations.append(
+                            f"{chain_text}:{node.lineno} imports {target}"
+                        )
                     continue
 
                 dependency = modules.get(target)
                 if dependency is None:
                     continue
                 if dependency.name == "api.py":
-                    violations.append(f"{chain_text}:{node.lineno} imports Torch API module {dependency.relative_to(_REPO_ROOT)}")
+                    violations.append(
+                        f"{chain_text}:{node.lineno} imports Torch API module {dependency.relative_to(_REPO_ROOT)}"
+                    )
                     continue
-                queue.extend((initializer, False, (*chain, initializer)) for initializer in _package_initializers(dependency))
+                queue.extend(
+                    (initializer, False, (*chain, initializer))
+                    for initializer in _package_initializers(dependency)
+                )
                 queue.append((dependency, False, (*chain, dependency)))
 
     return visited, violations
 
 
 class JaxImportContractTest(unittest.TestCase):
-    def test_jax_dsa_facade_matches_the_torch_operation_surface(self):
-        def literal_assignment(path, name):
-            tree = ast.parse(path.read_text(), filename=str(path))
-            assignment = next(
-                node
-                for node in tree.body
-                if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == name for target in node.targets)
+    @staticmethod
+    def _literal_assignment(path, name):
+        tree = ast.parse(path.read_text(), filename=str(path))
+        assignment = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == name
+                for target in node.targets
             )
-            return ast.literal_eval(assignment.value)
+        )
+        return ast.literal_eval(assignment.value)
 
-        torch_exports = literal_assignment(
+    @staticmethod
+    def _operation_exports(path):
+        tree = ast.parse(path.read_text(), filename=str(path))
+        call = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "make_operation_api"
+        )
+        exports = ast.literal_eval(
+            next(keyword.value for keyword in call.keywords if keyword.arg == "exports")
+        )
+        return {name for module_exports in exports.values() for name in module_exports}
+
+    def test_jax_dsa_facade_matches_the_torch_operation_surface(self):
+        torch_exports = self._literal_assignment(
             _CUDNN_ROOT / "deepseek_sparse_attention" / "__init__.py",
             "_SYMBOLS",
         )
-        jax_exports = literal_assignment(_CUDNN_ROOT / "jax" / "__init__.py", "_OPERATION_EXPORTS")
-        jax_dsa_exports = {name for name, (module_name, _) in jax_exports.items() if module_name.startswith("..deepseek_sparse_attention.")}
+        jax_exports = self._literal_assignment(
+            _CUDNN_ROOT / "jax" / "__init__.py", "_OPERATION_EXPORTS"
+        )
+        jax_dsa_exports = {
+            name
+            for name, (module_name, _) in jax_exports.items()
+            if module_name.startswith("..deepseek_sparse_attention.")
+        }
 
         self.assertEqual(jax_dsa_exports, set(torch_exports))
+
+    def test_jax_facade_covers_the_remaining_cute_operation_packages(self):
+        jax_exports = self._literal_assignment(
+            _CUDNN_ROOT / "jax" / "__init__.py", "_OPERATION_EXPORTS"
+        )
+        grouped_families = (
+            "swiglu",
+            "dswiglu",
+            "quant",
+            "srelu",
+            "dsrelu",
+            "glu",
+            "glu_hadamard",
+            "dglu",
+            "wgrad",
+        )
+        grouped_names = {
+            name
+            for family in grouped_families
+            for name in (
+                f"GroupedGemm{''.join(part.capitalize() for part in family.split('_'))}Sm100",
+                f"grouped_gemm_{family}_wrapper_sm100",
+            )
+        }
+        discrete_names = {
+            "DiscreteGroupedGemmSwigluSm100",
+            "discrete_grouped_gemm_swiglu_wrapper_sm100",
+            "DiscreteGroupedGemmDswigluSm100",
+            "discrete_grouped_gemm_dswiglu_wrapper_sm100",
+        }
+        nsa_names = self._operation_exports(
+            _CUDNN_ROOT / "native_sparse_attention" / "__init__.py"
+        )
+        sdpa_names = self._operation_exports(_CUDNN_ROOT / "sdpa" / "__init__.py")
+        bsa_names = {
+            name
+            for name in self._literal_assignment(
+                _CUDNN_ROOT / "block_sparse_attention" / "__init__.py",
+                "_SYMBOLS",
+            )
+            if not name.endswith("Op")
+        }
+
+        self.assertLessEqual(
+            grouped_names | discrete_names | nsa_names | sdpa_names | bsa_names,
+            set(jax_exports),
+        )
 
     def test_jax_import_graph_has_no_required_torch_dependency(self):
         modules = {_module_name(path): path for path in _CUDNN_ROOT.rglob("*.py")}

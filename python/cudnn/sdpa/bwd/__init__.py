@@ -1,9 +1,12 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-from .api import SdpabwdSm100D256, sdpa_bwd_wrapper_sm100_d256
+"""Lazy Torch SDPA-backward API exports."""
 
-__all__ = [
-    "SdpabwdSm100D256",
-    "sdpa_bwd_wrapper_sm100_d256",
-]
+from ..._operation_api import make_operation_api
+
+__all__, __getattr__, __dir__ = make_operation_api(
+    globals(),
+    exports={"api": ("SdpabwdSm100D256", "sdpa_bwd_wrapper_sm100_d256")},
+    submodules=("api", "jax"),
+)

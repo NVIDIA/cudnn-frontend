@@ -1,28 +1,37 @@
-from .selection import SelectionAttention, selection_attention_wrapper
-from .compression import CompressionAttention, compression_attention_wrapper
-from .sliding_window_attention import (
-    SlidingWindowAttention,
-    sliding_window_attention_wrapper,
+"""Lazy Torch namespace for native sparse-attention operations."""
+
+from typing import Any
+
+from .._operation_api import make_operation_api
+
+__all__, __getattr__, __dir__ = make_operation_api(
+    globals(),
+    exports={
+        "selection": ("SelectionAttention", "selection_attention_wrapper"),
+        "compression": ("CompressionAttention", "compression_attention_wrapper"),
+        "sliding_window_attention": (
+            "SlidingWindowAttention",
+            "sliding_window_attention_wrapper",
+        ),
+        "top_k": ("TopKReduction", "topk_reduction_wrapper"),
+    },
 )
-from .top_k import TopKReduction, topk_reduction_wrapper
+_OPERATION_EXPORTS = frozenset(__all__)
 
 
 class NSANamespace:
-    SelectionAttention = staticmethod(SelectionAttention)
-    selection_attention_wrapper = staticmethod(selection_attention_wrapper)
+    def __getattr__(self, name: str) -> Any:
+        if name not in _OPERATION_EXPORTS:
+            raise AttributeError(f"NSA has no attribute {name!r}")
+        value = __getattr__(name)
+        setattr(self, name, value)
+        return value
 
-    SlidingWindowAttention = staticmethod(SlidingWindowAttention)
-    sliding_window_attention_wrapper = staticmethod(sliding_window_attention_wrapper)
-
-    CompressionAttention = staticmethod(CompressionAttention)
-    compression_attention_wrapper = staticmethod(compression_attention_wrapper)
-
-    TopKReduction = staticmethod(TopKReduction)
-    topk_reduction_wrapper = staticmethod(topk_reduction_wrapper)
+    def __dir__(self) -> list[str]:
+        return sorted((*vars(self), *_OPERATION_EXPORTS))
 
 
 NSA = NSANamespace()
 
-__all__ = [
-    "NSA",
-]
+# Preserve the historical root contract: operations are accessed through NSA.
+__all__ = ["NSA"]

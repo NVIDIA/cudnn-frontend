@@ -541,6 +541,7 @@ class JaxApiBaseTest(unittest.TestCase):
         cutlass.jax = cutlass_jax
 
         input_value = _ArrayMetadata((2,), "float32", label="input")
+        output_seed = _ArrayMetadata((2,), "float32", label="seed")
         input_tensor_spec = _TensorSpec(layout=(0,), mode=(0,))
         initialized_output_spec = _TensorSpec(layout=(2, 1, 0), mode=(2, 0, 1))
         api = Adapter()
@@ -557,10 +558,38 @@ class JaxApiBaseTest(unittest.TestCase):
                 (input_value,),
                 launch=launch,
                 output_descs=output_descs,
+                output_seeds=(output_seed, None),
                 workspace_descs=workspace_descs,
                 input_spec=(input_tensor_spec,),
                 output_spec=(None, initialized_output_spec),
             )
+            with self.assertRaisesRegex(ValueError, "Expected 2 output seeds, got 1"):
+                api._call_kernel(
+                    (input_value,),
+                    launch=launch,
+                    output_descs=output_descs,
+                    output_seeds=(output_seed,),
+                )
+            with self.assertRaisesRegex(ValueError, "output seed shape mismatch"):
+                api._call_kernel(
+                    (input_value,),
+                    launch=launch,
+                    output_descs=output_descs,
+                    output_seeds=(
+                        _ArrayMetadata((3,), "float32", label="wrong shape"),
+                        None,
+                    ),
+                )
+            with self.assertRaisesRegex(ValueError, "output seed dtype mismatch"):
+                api._call_kernel(
+                    (input_value,),
+                    launch=launch,
+                    output_descs=output_descs,
+                    output_seeds=(
+                        _ArrayMetadata((2,), "bfloat16", label="wrong dtype"),
+                        None,
+                    ),
+                )
             with self.assertRaisesRegex(TypeError, "input #0 must have shape and dtype metadata"):
                 api._call_kernel(
                     ([input_value],),
@@ -590,19 +619,26 @@ class JaxApiBaseTest(unittest.TestCase):
                 ((3,), 0, "float32"),
             ],
         )
-        self.assertEqual(seen["call_options"]["input_output_aliases"], {1: 1, 2: 2})
-        self.assertEqual(len(seen["call_options"]["input_spec"]), 3)
-        self.assertIs(seen["call_options"]["input_spec"][1], initialized_output_spec)
-        self.assertIs(seen["call_options"]["input_spec"][2], seen["call_options"]["output_spec"][2])
+        self.assertEqual(
+            seen["call_options"]["input_output_aliases"],
+            {1: 0, 2: 1, 3: 2},
+        )
+        self.assertEqual(len(seen["call_options"]["input_spec"]), 4)
+        self.assertIs(
+            seen["call_options"]["input_spec"][1],
+            seen["call_options"]["output_spec"][0],
+        )
+        self.assertIs(seen["call_options"]["input_spec"][2], initialized_output_spec)
+        self.assertIs(seen["call_options"]["input_spec"][3], seen["call_options"]["output_spec"][2])
 
         stream, launch_input, output, amax, counter, scratch = seen["launch_args"]
         self.assertEqual(stream, "stream")
         self.assertIs(launch_input, input_value)
-        self.assertEqual(output.label, "allocated(0)")
+        self.assertIs(output, output_seed)
         self.assertIs(amax, full_calls[0][3])
         self.assertIs(counter, full_calls[1][3])
         self.assertEqual(scratch.label, "allocated(3)")
-        self.assertEqual([result.label for result in results], ["allocated(0)", "full(-inf)"])
+        self.assertEqual([result.label for result in results], ["seed", "full(-inf)"])
         self.assertNotIn(full_calls[0][3], vars(api).values())
         self.assertNotIn(full_calls[1][3], vars(api).values())
 

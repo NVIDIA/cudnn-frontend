@@ -48,6 +48,12 @@ class _TupleDict(dict):
     pass
 
 
+class _TensorSpec:
+    def __init__(self, *, mode=None, divisibility=None):
+        self.mode = mode
+        self.divisibility = divisibility
+
+
 def _identity_jit(fn=None, **_kwargs):
     return (lambda decorated: decorated) if fn is None else fn
 
@@ -68,8 +74,12 @@ class JaxDsaScoreRecomputeContractTest(unittest.TestCase):
         fake_jnp.bfloat16 = _DataType.BFLOAT16
         fake_jnp.float32 = _DataType.FLOAT
         fake_jnp.int32 = _DataType.INT32
-        fake_jnp.expand_dims = lambda value, axis: _Array(value.shape[:axis] + (1,) + value.shape[axis:], value.dtype)
-        fake_jnp.transpose = lambda value, axes: _Array(tuple(value.shape[axis] for axis in axes), value.dtype)
+        fake_jnp.expand_dims = lambda value, axis: _Array(
+            value.shape[:axis] + (1,) + value.shape[axis:], value.dtype
+        )
+        fake_jnp.transpose = lambda value, axes: _Array(
+            tuple(value.shape[axis] for axis in axes), value.dtype
+        )
 
         fake_jax = types.ModuleType("jax")
         fake_jax.__path__ = []
@@ -83,10 +93,24 @@ class JaxDsaScoreRecomputeContractTest(unittest.TestCase):
         class FakeJaxApiBase:
             @staticmethod
             def _to_tensor_desc(value, name, *, mode=None, init_value=None):
-                del mode
-                return tensor_module.make_compact_tensor_desc(
+                public_shape = tuple(value.shape)
+                mode = tuple(range(len(public_shape))) if mode is None else tuple(mode)
+                public_stride = [0] * len(public_shape)
+                running = 1
+                for dimension in reversed(range(len(public_shape))):
+                    public_stride[dimension] = running
+                    running *= max(public_shape[dimension], 1)
+                canonical_axis_by_public = [0] * len(mode)
+                for canonical_axis, public_axis in enumerate(mode):
+                    canonical_axis_by_public[public_axis] = canonical_axis
+                return tensor_module.TensorDesc(
                     dtype=value.dtype,
-                    shape=value.shape,
+                    shape=tuple(public_shape[axis] for axis in mode),
+                    stride=tuple(public_stride[axis] for axis in mode),
+                    stride_order=tuple(
+                        canonical_axis_by_public[axis]
+                        for axis in reversed(range(len(public_shape)))
+                    ),
                     name=name,
                     init_value=init_value,
                 )
@@ -101,13 +125,20 @@ class JaxDsaScoreRecomputeContractTest(unittest.TestCase):
 
             @staticmethod
             def _check_tensor_signature(value, expected, *, mode=None):
-                del mode
-                if tuple(value.shape) != expected.shape:
+                mode = tuple(range(len(value.shape))) if mode is None else tuple(mode)
+                if tuple(value.shape[axis] for axis in mode) != expected.shape:
                     raise ValueError(f"{expected.name} tensor shape mismatch")
                 if value.dtype != expected.cudnn_dtype:
                     raise ValueError(f"{expected.name} tensor dtype mismatch")
 
-            def _call_kernel(self, inputs, *, launch, output_descs, workspace_descs=(), **options):
+            @staticmethod
+            def _to_tensor_spec(desc, *, mode=None, divisibility=None):
+                del desc
+                return _TensorSpec(mode=mode, divisibility=divisibility)
+
+            def _call_kernel(
+                self, inputs, *, launch, output_descs, workspace_descs=(), **options
+            ):
                 self.captured_call = {
                     "inputs": tuple(inputs),
                     "outputs": tuple(output_descs),
@@ -115,9 +146,34 @@ class JaxDsaScoreRecomputeContractTest(unittest.TestCase):
                     "launch": launch,
                     **options,
                 }
-                return tuple(_Array(desc.shape, desc.cudnn_dtype) for desc in output_descs)
+                specs = options.get("output_spec") or (None,) * len(output_descs)
+                outputs = []
+                for desc, spec in zip(output_descs, specs):
+                    mode = (
+                        tuple(range(desc.ndim))
+                        if spec is None or spec.mode is None
+                        else tuple(spec.mode)
+                    )
+                    canonical_axis_by_public = [0] * len(mode)
+                    for canonical_axis, public_axis in enumerate(mode):
+                        canonical_axis_by_public[public_axis] = canonical_axis
+                    outputs.append(
+                        _Array(
+                            tuple(
+                                desc.shape[canonical_axis_by_public[public_axis]]
+                                for public_axis in range(desc.ndim)
+                            ),
+                            desc.cudnn_dtype,
+                        )
+                    )
+                return tuple(outputs)
 
         fake_internal_jax = types.ModuleType(f"{_PACKAGE}._jax")
+        fake_internal_jax.__path__ = [str(_CUDNN_ROOT / "_jax")]
+        fake_internal_jax.__package__ = fake_internal_jax.__name__
+        fake_internal_jax.__spec__ = ModuleSpec(
+            fake_internal_jax.__name__, loader=None, is_package=True
+        )
         fake_internal_jax.JaxApiBase = FakeJaxApiBase
         fake_internal_jax.JaxTensorDesc = tensor_module.TensorDesc
         fake_internal_jax.TupleDict = _TupleDict
@@ -177,23 +233,47 @@ class JaxDsaScoreRecomputeContractTest(unittest.TestCase):
             self.array((2, 4, 128), _DataType.INT32),
         )
 
+    def sequence_major_sparse_samples(self):
+        return (
+            self.array((4, 2, 32, 128)),
+            self.array((256, 2, 128)),
+            self.array((4, 2, 32)),
+            self.array((4, 2, 128), _DataType.INT32),
+        )
+
     def dense_samples(self, *, attention=False):
         return (
             self.array((2, 4, 32, 128)),
             self.array((2, 8, 1, 128)),
-            self.array((2, 4, 32), _DataType.FLOAT if attention else _DataType.BFLOAT16),
+            self.array(
+                (2, 4, 32), _DataType.FLOAT if attention else _DataType.BFLOAT16
+            ),
+        )
+
+    def sequence_major_dense_samples(self):
+        return (
+            self.array((4, 2, 32, 128)),
+            self.array((8, 2, 1, 128)),
+            self.array((4, 2, 32)),
         )
 
     def test_sm100_sparse_infers_output_and_hidden_length_workspace(self):
         q, k, weights, indices = self.sparse_samples()
-        api = self.adapter.SparseIndexerScoreRecompute(q, k, weights, indices, target_compute_capability=100)
+        api = self.adapter.SparseIndexerScoreRecompute(
+            q, k, weights, indices, target_compute_capability=100
+        )
         result = api(q, k, weights, indices)
 
         self.assertIsInstance(result, _TupleDict)
-        self.assertEqual((result["predict"].shape, result["predict"].dtype), ((2, 4, 128), _DataType.FLOAT))
+        self.assertEqual(
+            (result["predict"].shape, result["predict"].dtype),
+            ((2, 4, 128), _DataType.FLOAT),
+        )
         self.assertEqual(len(api.captured_call["workspaces"]), 1)
         workspace = api.captured_call["workspaces"][0]
-        self.assertEqual((workspace.shape, workspace.cudnn_dtype), ((1, 1), _DataType.INT32))
+        self.assertEqual(
+            (workspace.shape, workspace.cudnn_dtype), ((1, 1), _DataType.INT32)
+        )
         self.assertEqual(api.captured_call["compile_options"], "--gpu-arch sm_100")
 
     def test_explicit_topk_length_remains_a_real_input(self):
@@ -218,13 +298,44 @@ class JaxDsaScoreRecomputeContractTest(unittest.TestCase):
 
     def test_sm90_sparse_adapts_k_and_per_head_layouts(self):
         q, k, weights, indices = self.sparse_samples()
-        api = self.adapter.SparseIndexerScoreRecompute(q, k, weights, indices, target_compute_capability=90)
+        api = self.adapter.SparseIndexerScoreRecompute(
+            q, k, weights, indices, target_compute_capability=90
+        )
         api(q, k, weights, indices)
 
         _, kernel_k, kernel_weights, _ = api.captured_call["inputs"]
         self.assertEqual(kernel_k.shape, (2, 256, 1, 128))
         self.assertEqual(kernel_weights.shape, (2, 32, 4))
         self.assertEqual(api.captured_call["workspaces"], ())
+
+    def test_sparse_sequence_major_layouts_preserve_public_shapes(self):
+        q, k, weights, indices = self.sequence_major_sparse_samples()
+        api = self.adapter.SparseIndexerScoreRecompute(
+            q,
+            k,
+            weights,
+            indices,
+            q_layout="SBHD",
+            k_layout="SBD",
+            per_head_layout="SBH",
+            score_layout="SBK",
+            output_layout="SBK",
+            target_compute_capability=90,
+        )
+        result = api(q, k, weights, indices)
+
+        self.assertEqual(result["predict"].shape, indices.shape)
+        _, kernel_k, kernel_weights, _ = api.captured_call["inputs"]
+        self.assertEqual(kernel_k.shape, (256, 2, 1, 128))
+        self.assertEqual(kernel_weights.shape, (2, 32, 4))
+        self.assertEqual(
+            tuple(spec.mode for spec in api.captured_call["input_spec"]),
+            ((1, 0, 2, 3), (1, 0, 2, 3), None, (1, 0, 2)),
+        )
+        self.assertEqual(
+            api.captured_call["output_spec"][0].mode,
+            (1, 0, 2),
+        )
 
     def test_dense_bshd_outputs_are_functional_and_initialized(self):
         q, k, weights = self.dense_samples()
@@ -255,6 +366,32 @@ class JaxDsaScoreRecomputeContractTest(unittest.TestCase):
         )
         self.assertEqual(explicit.out_desc.init_value, float("-inf"))
         self.assertIsNone(explicit.denom_desc.init_value)
+
+    def test_dense_sequence_major_layouts_preserve_public_shapes(self):
+        q, k, weights = self.sequence_major_dense_samples()
+        api = self.adapter.DenseIndexerScoreRecompute(
+            q,
+            k,
+            weights,
+            q_layout="SBHD",
+            k_layout="SBHD",
+            per_head_layout="SBH",
+            output_layout="SBK",
+            denom_layout="SB",
+            target_compute_capability=100,
+        )
+        result = api(q, k, weights)
+
+        self.assertEqual(result["out"].shape, (4, 2, 8))
+        self.assertEqual(result["denom"].shape, (4, 2))
+        self.assertEqual(
+            tuple(spec.mode for spec in api.captured_call["input_spec"]),
+            ((1, 0, 2, 3), (1, 0, 2, 3), (1, 0, 2)),
+        )
+        self.assertEqual(
+            tuple(spec.mode for spec in api.captured_call["output_spec"]),
+            ((1, 0, 2), (1, 0)),
+        )
 
     def test_dense_thd_sm100_and_sm90_rejection(self):
         q = self.array((7, 32, 128))
@@ -345,9 +482,13 @@ class JaxDsaScoreRecomputeContractTest(unittest.TestCase):
         sm100_module.SparseScoreRecomputeSm100 = FakeSm100Kernel
 
         q, k, weights, indices = self.sparse_samples()
-        sm90 = self.adapter.SparseIndexerScoreRecompute(q, k, weights, indices, target_compute_capability=90)
+        sm90 = self.adapter.SparseIndexerScoreRecompute(
+            q, k, weights, indices, target_compute_capability=90
+        )
         sm90.check_support()
-        sm100 = self.adapter.SparseIndexerScoreRecompute(q, k, weights, indices, target_compute_capability=100)
+        sm100 = self.adapter.SparseIndexerScoreRecompute(
+            q, k, weights, indices, target_compute_capability=100
+        )
         sm100.check_support()
         with mock.patch.dict(
             sys.modules,
@@ -358,15 +499,38 @@ class JaxDsaScoreRecomputeContractTest(unittest.TestCase):
             },
         ):
             sm90._launch_kernel("stream90", "q90", "k90", "aux90", "indices90", "out90")
-            sm100._launch_kernel("stream100", "q100", "k100", "aux100", "indices100", "out100", "dummy")
+            sm100._launch_kernel(
+                "stream100", "q100", "k100", "aux100", "indices100", "out100", "dummy"
+            )
 
         self.assertEqual(
             [entry for entry in calls if entry[0].endswith("call")],
             [
-                ("sm90_call", ("q90", "k90", "indices90", "stream90", "out90", "aux90", None, None)),
+                (
+                    "sm90_call",
+                    (
+                        "q90",
+                        "k90",
+                        "indices90",
+                        "stream90",
+                        "out90",
+                        "aux90",
+                        None,
+                        None,
+                    ),
+                ),
                 (
                     "sm100_call",
-                    ("q100", "k100", "aux100", "indices100", "out100", "dummy", ("Float32", 1.0), "stream100"),
+                    (
+                        "q100",
+                        "k100",
+                        "aux100",
+                        "indices100",
+                        "out100",
+                        "dummy",
+                        ("Float32", 1.0),
+                        "stream100",
+                    ),
                 ),
             ],
         )
@@ -424,13 +588,30 @@ class JaxDsaScoreRecomputeContractTest(unittest.TestCase):
                 sm100_module.__name__: sm100_module,
             },
         ):
-            sm90._launch_kernel("stream90", "q90", "k90", "aux90", "offset90", "out90", "denom90")
-            sm100._launch_kernel("stream100", "q100", "k100", "aux100", "offset100", "out100", "denom100")
+            sm90._launch_kernel(
+                "stream90", "q90", "k90", "aux90", "offset90", "out90", "denom90"
+            )
+            sm100._launch_kernel(
+                "stream100", "q100", "k100", "aux100", "offset100", "out100", "denom100"
+            )
 
         self.assertEqual(
             [entry for entry in calls if entry[0].endswith("call")],
             [
-                ("sm90_call", ("q90", "k90", None, "stream90", "out90", "aux90", None, "denom90", "offset90")),
+                (
+                    "sm90_call",
+                    (
+                        "q90",
+                        "k90",
+                        None,
+                        "stream90",
+                        "out90",
+                        "aux90",
+                        None,
+                        "denom90",
+                        "offset90",
+                    ),
+                ),
                 (
                     "sm100_call",
                     (
@@ -455,20 +636,37 @@ class JaxDsaScoreRecomputeContractTest(unittest.TestCase):
         def imports_framework(path, framework):
             tree = ast.parse(path.read_text(), filename=str(path))
             for node in ast.walk(tree):
-                if isinstance(node, ast.Import) and any(alias.name == framework or alias.name.startswith(f"{framework}.") for alias in node.names):
+                if isinstance(node, ast.Import) and any(
+                    alias.name == framework or alias.name.startswith(f"{framework}.")
+                    for alias in node.names
+                ):
                     return True
-                if isinstance(node, ast.ImportFrom) and node.level == 0 and (node.module == framework or (node.module or "").startswith(f"{framework}.")):
+                if (
+                    isinstance(node, ast.ImportFrom)
+                    and node.level == 0
+                    and (
+                        node.module == framework
+                        or (node.module or "").startswith(f"{framework}.")
+                    )
+                ):
                     return True
             return False
 
         for filename in ("config.py", "op.py"):
             path = _SCORE_ROOT / filename
             for framework in ("torch", "jax", "cutlass", "cuda"):
-                self.assertFalse(imports_framework(path, framework), f"{filename} imports {framework}")
+                self.assertFalse(
+                    imports_framework(path, framework),
+                    f"{filename} imports {framework}",
+                )
         self.assertFalse(imports_framework(_SCORE_ROOT / "jax.py", "torch"))
 
         init_tree = ast.parse((_SCORE_ROOT / "__init__.py").read_text())
-        imported_modules = {node.module for node in ast.walk(init_tree) if isinstance(node, ast.ImportFrom)}
+        imported_modules = {
+            node.module
+            for node in ast.walk(init_tree)
+            if isinstance(node, ast.ImportFrom)
+        }
         self.assertNotIn("api", imported_modules)
 
 

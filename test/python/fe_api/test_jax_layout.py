@@ -15,7 +15,9 @@ else:
     pytestmark = pytest.mark.L0
 
 
-_LAYOUT_FILE = Path(__file__).resolve().parents[3] / "python" / "cudnn" / "_jax" / "layout.py"
+_LAYOUT_FILE = (
+    Path(__file__).resolve().parents[3] / "python" / "cudnn" / "_jax" / "layout.py"
+)
 
 
 def _load_layout_module():
@@ -118,6 +120,33 @@ class JaxLayoutTest(unittest.TestCase):
             ),
             (2, 1, 0),
         )
+
+    def test_canonical_stride_order_maps_to_named_public_layout(self):
+        bhsd_to_bshd = self.layout.mode_from_layout("BHSD", kernel_axes="BSHD")
+        bshd_to_bshd = self.layout.mode_from_layout("BSHD", kernel_axes="BSHD")
+
+        self.assertEqual(
+            self.layout.stride_order_to_public((3, 2, 1, 0), bhsd_to_bshd),
+            (3, 1, 2, 0),
+        )
+        self.assertEqual(
+            self.layout.stride_order_to_public((3, 2, 1, 0), bshd_to_bshd),
+            (3, 2, 1, 0),
+        )
+
+        bshd_to_bhsd = self.layout.mode_from_layout("BSHD", kernel_axes="BHSD")
+        self.assertEqual(
+            self.layout.to_public_axes((2, 8, 32, 16), bshd_to_bhsd),
+            (2, 32, 8, 16),
+        )
+        self.assertEqual(
+            self.layout.stride_order_to_public((3, 1, 2, 0), bshd_to_bhsd),
+            (3, 2, 1, 0),
+        )
+
+    def test_canonical_stride_order_requires_a_permutation(self):
+        with self.assertRaisesRegex(ValueError, "must be a permutation"):
+            self.layout.stride_order_to_public((2, 2, 0))
 
     def test_invalid_mode_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "mode must be a permutation"):

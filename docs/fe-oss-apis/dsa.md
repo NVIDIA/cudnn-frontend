@@ -151,8 +151,10 @@ scores_sbk = result["scores"]
 ```
 
 The defaults are `q_layout="BSHD"`, `k_layout="BSHD"`,
-`w_layout="BSH"`, and `output_layout="BSK"`. Packed inputs use `THD` and
-`TH`, with a `TK` output. The adapter maps these public axes to the kernel's
+`w_layout="BSH"`, and `output_layout="BSK"`. Backward and score-recompute
+adapters use the same convention and additionally expose layout selectors for
+their score, denominator, and gradient tensors. Packed inputs use `THD` and
+`TH`, with a `TK` output. The adapters map these public axes to the kernel's
 canonical axes; callers do not need to transpose arrays into canonical order.
 
 Use the class API when the caller needs to choose the enclosing JAX
@@ -198,11 +200,11 @@ and SM107.
 | Sparse Attention Backward | Flat MQA tensors | Yes | Yes; inputs must be BF16 |
 | Indexer Forward | Fixed BSHD/SBHD or packed THD | Yes; `H_kv=1` and default tuning | Yes |
 | Indexer Top-K and index utilities | Flattened rows; fixed or packed index conversion | Yes | Yes |
-| Sparse score recompute | Fixed BSHD/MQA | Yes | Yes |
-| Dense score recompute | Fixed BSHD/MQA | Yes | Yes |
+| Sparse score recompute | Fixed BSHD/SBHD outer layouts, MQA | Yes | Yes |
+| Dense score recompute | Fixed BSHD/SBHD outer layouts, MQA | Yes | Yes |
 | Dense score recompute | Packed THD/MQA | No | Yes |
-| Indexer Backward | Fixed BSHD; JAX-only packed THD with global indices | Yes | Yes |
-| Dense Indexer Backward | Fixed BSHD or packed THD | Yes | Yes |
+| Indexer Backward | Fixed BSHD/SBHD; JAX-only packed THD with global indices | Yes | Yes |
+| Dense Indexer Backward | Fixed BSHD/SBHD or packed THD | Yes | Yes |
 
 SM90 packed THD dense score recompute is rejected because that backend needs
 host-side cumulative-length reads, which cannot be represented during JAX

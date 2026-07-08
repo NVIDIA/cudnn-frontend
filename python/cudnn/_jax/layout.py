@@ -23,13 +23,17 @@ def mode_from_layout(layout: str, *, kernel_axes: str) -> tuple[int, ...]:
     if not isinstance(kernel_axes, str):
         raise TypeError(f"kernel_axes must be a string, got {kernel_axes!r}")
     if len(layout) != len(kernel_axes):
-        raise ValueError(f"layout rank must match kernel_axes: got {layout!r} and {kernel_axes!r}")
+        raise ValueError(
+            f"layout rank must match kernel_axes: got {layout!r} and {kernel_axes!r}"
+        )
     if len(set(layout)) != len(layout):
         raise ValueError(f"layout axes must be unique, got {layout!r}")
     if len(set(kernel_axes)) != len(kernel_axes):
         raise ValueError(f"kernel_axes must be unique, got {kernel_axes!r}")
     if set(layout) != set(kernel_axes):
-        raise ValueError(f"layout must contain exactly the axes in {kernel_axes!r}, got {layout!r}")
+        raise ValueError(
+            f"layout must contain exactly the axes in {kernel_axes!r}, got {layout!r}"
+        )
     return tuple(layout.index(axis) for axis in kernel_axes)
 
 
@@ -62,7 +66,9 @@ def normalize_mode(rank: int, mode: tuple[int, ...] | None = None) -> tuple[int,
             raise TypeError(f"mode entries must be integers, got {axis!r}") from error
     normalized_mode = tuple(normalized)
     if tuple(sorted(normalized_mode)) != tuple(range(rank)):
-        raise ValueError(f"mode must be a permutation of [0, {rank - 1}], got {normalized_mode}")
+        raise ValueError(
+            f"mode must be a permutation of [0, {rank - 1}], got {normalized_mode}"
+        )
     return normalized_mode
 
 
@@ -88,10 +94,15 @@ def to_public_axes(
     canonical_axis_by_public_axis = [0] * len(mode)
     for canonical_axis, public_axis in enumerate(mode):
         canonical_axis_by_public_axis[public_axis] = canonical_axis
-    return tuple(canonical_values[canonical_axis_by_public_axis[public_axis]] for public_axis in range(len(mode)))
+    return tuple(
+        canonical_values[canonical_axis_by_public_axis[public_axis]]
+        for public_axis in range(len(mode))
+    )
 
 
-def compact_stride(shape: tuple[int, ...], stride_order: tuple[int, ...]) -> tuple[int, ...]:
+def compact_stride(
+    shape: tuple[int, ...], stride_order: tuple[int, ...]
+) -> tuple[int, ...]:
     """Return compact strides for dimensions ordered fastest to slowest."""
 
     stride = [0] * len(shape)
@@ -100,6 +111,24 @@ def compact_stride(shape: tuple[int, ...], stride_order: tuple[int, ...]) -> tup
         stride[dimension] = running
         running *= max(shape[dimension], 1)
     return tuple(stride)
+
+
+def stride_order_to_public(
+    canonical_stride_order: tuple[int, ...],
+    mode: tuple[int, ...] | None = None,
+) -> tuple[int, ...]:
+    """Map a fastest-to-slowest canonical axis order to public array axes."""
+
+    canonical_stride_order = tuple(canonical_stride_order)
+    mode = normalize_mode(len(canonical_stride_order), mode)
+    if tuple(sorted(canonical_stride_order)) != tuple(
+        range(len(canonical_stride_order))
+    ):
+        raise ValueError(
+            "canonical_stride_order must be a permutation of "
+            f"[0, {len(canonical_stride_order) - 1}], got {canonical_stride_order}"
+        )
+    return tuple(mode[canonical_axis] for canonical_axis in canonical_stride_order)
 
 
 def to_cutlass_layout(
@@ -117,7 +146,9 @@ def to_cutlass_layout(
     """
 
     if stride != compact_stride(shape, stride_order):
-        raise ValueError(f"JAX TensorSpec cannot represent non-compact stride {stride} for {name}")
+        raise ValueError(
+            f"JAX TensorSpec cannot represent non-compact stride {stride} for {name}"
+        )
 
     layout = [0] * len(stride_order)
     for rank, dimension in enumerate(stride_order):
@@ -129,6 +160,7 @@ __all__ = [
     "compact_stride",
     "mode_from_layout",
     "normalize_mode",
+    "stride_order_to_public",
     "to_canonical_axes",
     "to_cutlass_layout",
     "to_public_axes",

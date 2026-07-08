@@ -1,12 +1,10 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-from .api import (
-    GroupedGemmWgradSm100,
-    grouped_gemm_wgrad_wrapper_sm100,
-)
+from ..._operation_api import make_operation_api
 
-__all__ = [
-    "GroupedGemmWgradSm100",
-    "grouped_gemm_wgrad_wrapper_sm100",
-]
+__all__, __getattr__, __dir__ = make_operation_api(
+    globals(),
+    exports={"api": ("GroupedGemmWgradSm100", "grouped_gemm_wgrad_wrapper_sm100")},
+    submodules=("api", "jax"),
+)

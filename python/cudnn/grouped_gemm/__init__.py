@@ -1,68 +1,30 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-from .grouped_gemm_swiglu.api import (
-    GroupedGemmSwigluSm100,
-    grouped_gemm_swiglu_wrapper_sm100,
+"""Lazy Torch API exports for the grouped GEMM operation family."""
+
+from .._operation_api import make_operation_api
+
+_OPERATIONS = (
+    "swiglu",
+    "dswiglu",
+    "quant",
+    "srelu",
+    "dsrelu",
+    "glu",
+    "glu_hadamard",
+    "dglu",
+    "wgrad",
 )
 
-from .grouped_gemm_dswiglu.api import (
-    GroupedGemmDswigluSm100,
-    grouped_gemm_dswiglu_wrapper_sm100,
+__all__, __getattr__, __dir__ = make_operation_api(
+    globals(),
+    exports={
+        f"grouped_gemm_{operation}.api": (
+            f"GroupedGemm{''.join(part.capitalize() for part in operation.split('_'))}Sm100",
+            f"grouped_gemm_{operation}_wrapper_sm100",
+        )
+        for operation in _OPERATIONS
+    },
+    submodules=tuple(f"grouped_gemm_{operation}" for operation in _OPERATIONS),
 )
-
-from .grouped_gemm_quant.api import (
-    GroupedGemmQuantSm100,
-    grouped_gemm_quant_wrapper_sm100,
-)
-
-from .grouped_gemm_srelu.api import (
-    GroupedGemmSreluSm100,
-    grouped_gemm_srelu_wrapper_sm100,
-)
-
-from .grouped_gemm_dsrelu.api import (
-    GroupedGemmDsreluSm100,
-    grouped_gemm_dsrelu_wrapper_sm100,
-)
-
-from .grouped_gemm_glu.api import (
-    GroupedGemmGluSm100,
-    grouped_gemm_glu_wrapper_sm100,
-)
-
-from .grouped_gemm_glu_hadamard.api import (
-    GroupedGemmGluHadamardSm100,
-    grouped_gemm_glu_hadamard_wrapper_sm100,
-)
-
-from .grouped_gemm_dglu.api import (
-    GroupedGemmDgluSm100,
-    grouped_gemm_dglu_wrapper_sm100,
-)
-
-from .grouped_gemm_wgrad.api import (
-    GroupedGemmWgradSm100,
-    grouped_gemm_wgrad_wrapper_sm100,
-)
-
-__all__ = [
-    "GroupedGemmSwigluSm100",
-    "grouped_gemm_swiglu_wrapper_sm100",
-    "GroupedGemmDswigluSm100",
-    "grouped_gemm_dswiglu_wrapper_sm100",
-    "GroupedGemmQuantSm100",
-    "grouped_gemm_quant_wrapper_sm100",
-    "GroupedGemmSreluSm100",
-    "grouped_gemm_srelu_wrapper_sm100",
-    "GroupedGemmDsreluSm100",
-    "grouped_gemm_dsrelu_wrapper_sm100",
-    "GroupedGemmGluSm100",
-    "grouped_gemm_glu_wrapper_sm100",
-    "GroupedGemmGluHadamardSm100",
-    "grouped_gemm_glu_hadamard_wrapper_sm100",
-    "GroupedGemmDgluSm100",
-    "grouped_gemm_dglu_wrapper_sm100",
-    "GroupedGemmWgradSm100",
-    "grouped_gemm_wgrad_wrapper_sm100",
-]

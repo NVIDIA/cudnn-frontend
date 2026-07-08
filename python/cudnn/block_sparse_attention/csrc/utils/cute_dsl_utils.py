@@ -5,18 +5,25 @@
 # this file are adapted from quack-kernels 0.4.1 (Apache-2.0) and modified for
 # cudnn-frontend's CUTLASS DSL 4.5 integration.
 
+from __future__ import annotations
+
 from dataclasses import dataclass, fields
 from functools import partial
 from typing import Tuple, get_origin
-
-import torch
 
 import cutlass
 import cutlass.cute as cute
 from cutlass._mlir.dialects import nvvm
 from cutlass.base_dsl.tvm_ffi_builder import spec
 from cutlass.cutlass_dsl import NumericMeta
-from cutlass.cute.runtime import from_dlpack
+
+try:
+    import torch
+except ModuleNotFoundError:
+    # Kernel-only users, including cudnn.jax, must not require PyTorch.  The
+    # Torch conversion helpers below fail explicitly if they are invoked
+    # without the optional dependency.
+    torch = None
 
 # Python scalars and CuTe numeric types are compile-time values. Everything
 # else in a ParamsBase dataclass is flattened into MLIR values at JIT time.
@@ -51,13 +58,17 @@ def _install_constexpr_tvm_ffi_converter() -> None:
 
 _install_constexpr_tvm_ffi_converter()
 
-torch2cute_dtype_map = {
-    torch.float16: cutlass.Float16,
-    torch.bfloat16: cutlass.BFloat16,
-    torch.float32: cutlass.Float32,
-    torch.float8_e4m3fn: cutlass.Float8E4M3FN,
-    torch.float8_e5m2: cutlass.Float8E5M2,
-}
+torch2cute_dtype_map = (
+    {}
+    if torch is None
+    else {
+        torch.float16: cutlass.Float16,
+        torch.bfloat16: cutlass.BFloat16,
+        torch.float32: cutlass.Float32,
+        torch.float8_e4m3fn: cutlass.Float8E4M3FN,
+        torch.float8_e5m2: cutlass.Float8E5M2,
+    }
+)
 
 
 def _partition_param_fields(obj):
@@ -139,6 +150,11 @@ def assume_tensor_aligned(t):
 
 def to_cute_tensor(t, assumed_align=16, leading_dim=-1, fully_dynamic=False, enable_tvm_ffi=True):
     """Convert torch tensor to cute tensor for TVM FFI. leading_dim=-1 defaults to t.ndim-1."""
+    if torch is None:
+        raise ImportError("to_cute_tensor requires PyTorch")
+
+    from cutlass.cute.runtime import from_dlpack
+
     # NOTE: torch 2.9.1 doesn't support fp8 via DLPack but 2.11.0 nightly does
     # currently export raw bytes as uint8 and tell cutlass correct type
     # can directly export as fp8 when torch supports it

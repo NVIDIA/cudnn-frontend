@@ -128,7 +128,9 @@ class JaxIndexerBackwardContractTest(unittest.TestCase):
             def cudnn_dtype(self):
                 return cls.dtype_to_cudnn.get(self.dtype, _DataType.NOT_SET)
 
-            def compact_like(self, *, cudnn_dtype, shape, stride_order=None, name="", init_value=None):
+            def compact_like(
+                self, *, cudnn_dtype, shape, stride_order=None, name="", init_value=None
+            ):
                 canonical = tensor_module.make_compact_tensor_desc(
                     dtype=cudnn_dtype,
                     shape=shape,
@@ -150,18 +152,24 @@ class JaxIndexerBackwardContractTest(unittest.TestCase):
 
             @staticmethod
             def _to_tensor_desc(value, name, *, mode=None, init_value=None):
-                del mode
-                shape = tuple(value.shape)
-                stride = [0] * len(shape)
+                public_shape = tuple(value.shape)
+                mode = tuple(range(len(public_shape))) if mode is None else tuple(mode)
+                public_stride = [0] * len(public_shape)
                 running = 1
-                for dimension in reversed(range(len(shape))):
-                    stride[dimension] = running
-                    running *= max(shape[dimension], 1)
+                for dimension in reversed(range(len(public_shape))):
+                    public_stride[dimension] = running
+                    running *= max(public_shape[dimension], 1)
+                canonical_axis_by_public = [0] * len(mode)
+                for canonical_axis, public_axis in enumerate(mode):
+                    canonical_axis_by_public[public_axis] = canonical_axis
                 return JaxTensorDesc(
                     dtype=value.dtype,
-                    shape=shape,
-                    stride=tuple(stride),
-                    stride_order=tuple(reversed(range(len(shape)))),
+                    shape=tuple(public_shape[axis] for axis in mode),
+                    stride=tuple(public_stride[axis] for axis in mode),
+                    stride_order=tuple(
+                        canonical_axis_by_public[axis]
+                        for axis in reversed(range(len(public_shape)))
+                    ),
                     name=name,
                     init_value=init_value,
                 )
@@ -175,13 +183,19 @@ class JaxIndexerBackwardContractTest(unittest.TestCase):
 
             @staticmethod
             def _compute_capability_family(target, supported):
-                return max((value for value in supported if value <= target), default=None)
+                return max(
+                    (value for value in supported if value <= target), default=None
+                )
 
             @staticmethod
             def _check_tensor_signature(value, expected, *, mode=None):
-                del mode
+                mode = tuple(range(len(value.shape))) if mode is None else tuple(mode)
                 actual_dtype = cls.dtype_to_cudnn.get(value.dtype, _DataType.NOT_SET)
-                if tuple(value.shape) != expected.shape or actual_dtype != expected.cudnn_dtype:
+                actual_shape = tuple(value.shape[axis] for axis in mode)
+                if (
+                    actual_shape != expected.shape
+                    or actual_dtype != expected.cudnn_dtype
+                ):
                     raise ValueError(f"{expected.name} tensor signature mismatch")
 
             @staticmethod
@@ -192,9 +206,35 @@ class JaxIndexerBackwardContractTest(unittest.TestCase):
             def _call_kernel(self, inputs, *, launch, **options):
                 options["launch"] = launch
                 JaxApiBase.captured_call = (inputs, options)
-                return tuple(_Array(desc.shape, cls.cudnn_to_dtype[desc.cudnn_dtype]) for desc in options["output_descs"])
+                specs = options.get("output_spec") or (None,) * len(
+                    options["output_descs"]
+                )
+                results = []
+                for desc, spec in zip(options["output_descs"], specs):
+                    mode = (
+                        tuple(range(desc.ndim))
+                        if spec is None or spec.mode is None
+                        else tuple(spec.mode)
+                    )
+                    canonical_axis_by_public = [0] * len(mode)
+                    for canonical_axis, public_axis in enumerate(mode):
+                        canonical_axis_by_public[public_axis] = canonical_axis
+                    public_shape = tuple(
+                        desc.shape[canonical_axis_by_public[public_axis]]
+                        for public_axis in range(desc.ndim)
+                    )
+                    results.append(
+                        _Array(
+                            public_shape,
+                            cls.cudnn_to_dtype[desc.cudnn_dtype],
+                        )
+                    )
+                return tuple(results)
 
         internal = types.ModuleType(f"{_PACKAGE}._jax")
+        internal.__path__ = [str(_CUDNN_ROOT / "_jax")]
+        internal.__package__ = internal.__name__
+        internal.__spec__ = ModuleSpec(internal.__name__, loader=None, is_package=True)
         internal.JaxApiBase = JaxApiBase
         internal.JaxTensorDesc = JaxTensorDesc
         internal.TupleDict = _TupleDict
@@ -205,7 +245,9 @@ class JaxIndexerBackwardContractTest(unittest.TestCase):
         fake_jnp.float32 = cls.float32
         fake_jnp.int32 = cls.int32
         fake_jnp.dtype = lambda value: value.dtype if hasattr(value, "dtype") else value
-        fake_jnp.asarray = lambda value, dtype: _Array(getattr(value, "shape", ()), dtype)
+        fake_jnp.asarray = lambda value, dtype: _Array(
+            getattr(value, "shape", ()), dtype
+        )
         fake_jnp.reshape = lambda value, shape: _Array(shape, value.dtype)
 
         fake_jax = types.ModuleType("jax")
@@ -213,7 +255,9 @@ class JaxIndexerBackwardContractTest(unittest.TestCase):
         fake_jax.__spec__ = ModuleSpec("jax", loader=None, is_package=True)
         fake_jax.numpy = fake_jnp
         fake_jax.ShapeDtypeStruct = _Array
-        fake_jax.jit = lambda function=None, **_kwargs: (lambda fn: fn) if function is None else function
+        fake_jax.jit = lambda function=None, **_kwargs: (
+            (lambda fn: fn) if function is None else function
+        )
 
         try:
             with mock.patch.dict(sys.modules, {"jax": fake_jax, "jax.numpy": fake_jnp}):
@@ -259,6 +303,18 @@ class JaxIndexerBackwardContractTest(unittest.TestCase):
         )
 
     @classmethod
+    def _sparse_sequence_major_inputs(cls, *, topk=128):
+        score_shape = (64, 2, topk)
+        return (
+            _Array((64, 2, 64, 128), cls.bfloat16),
+            _Array((64, 2, 64), cls.bfloat16),
+            _Array((256, 2, 128), cls.bfloat16),
+            _Array(score_shape, cls.float32),
+            _Array(score_shape, cls.float32),
+            _Array(score_shape, cls.int32),
+        )
+
+    @classmethod
     def _dense_bshd_inputs(cls):
         return (
             _Array((2, 64, 64, 128), cls.bfloat16),
@@ -282,18 +338,37 @@ class JaxIndexerBackwardContractTest(unittest.TestCase):
             _Array((96,), cls.float32),
         )
 
+    @classmethod
+    def _dense_sequence_major_inputs(cls):
+        return (
+            _Array((64, 2, 64, 128), cls.bfloat16),
+            _Array((64, 2, 64), cls.bfloat16),
+            _Array((256, 2, 128), cls.bfloat16),
+            _Array((64, 2, 256), cls.float32),
+            _Array((64, 2), cls.float32),
+            _Array((64, 2, 256), cls.float32),
+            _Array((64, 2), cls.float32),
+        )
+
     def test_sparse_wrapper_declares_functional_outputs_and_zeroed_dk(self):
         inputs = self._sparse_inputs()
         with mock.patch.dict(sys.modules, self.fake_jax_modules):
-            result = self.module.indexer_backward_wrapper(*inputs, target_compute_capability=103)
+            result = self.module.indexer_backward_wrapper(
+                *inputs, target_compute_capability=103
+            )
 
-        self.assertEqual(tuple(result), (result["d_index_q"], result["d_weights"], result["d_index_k"]))
+        self.assertEqual(
+            tuple(result),
+            (result["d_index_q"], result["d_weights"], result["d_index_k"]),
+        )
         self.assertEqual(result["d_index_q"].shape, inputs[0].shape)
         self.assertEqual(result["d_weights"].shape, inputs[1].shape)
         self.assertEqual(result["d_index_k"].shape, inputs[2].shape)
         kernel_inputs, options = self.JaxApiBase.captured_call
         self.assertEqual(kernel_inputs[:-1], inputs)
-        self.assertEqual((kernel_inputs[-1].shape, kernel_inputs[-1].dtype), ((1,), self.float32))
+        self.assertEqual(
+            (kernel_inputs[-1].shape, kernel_inputs[-1].dtype), ((1,), self.float32)
+        )
         self.assertEqual(options["output_descs"][2].init_value, 0.0)
         self.assertEqual(options["workspace_descs"][0].shape, inputs[3].shape)
         self.assertIn("--gpu-arch sm_103a", options["compile_options"])
@@ -303,7 +378,9 @@ class JaxIndexerBackwardContractTest(unittest.TestCase):
     def test_sparse_packed_thd_signature_requires_global_indices(self):
         inputs = self._sparse_thd_inputs()
         with mock.patch.dict(sys.modules, self.fake_jax_modules):
-            with self.assertRaisesRegex(ValueError, "requires topk_indices_global=True"):
+            with self.assertRaisesRegex(
+                ValueError, "requires topk_indices_global=True"
+            ):
                 self.module.indexer_backward_wrapper(
                     *inputs,
                     target_compute_capability=100,
@@ -320,6 +397,39 @@ class JaxIndexerBackwardContractTest(unittest.TestCase):
         _, options = self.JaxApiBase.captured_call
         self.assertEqual(options["input_spec"][0].divisibility, (None, None, 128))
         self.assertEqual(options["input_spec"][2].divisibility, (None, 128))
+
+    def test_sparse_sequence_major_layouts_preserve_public_shapes(self):
+        inputs = self._sparse_sequence_major_inputs()
+        with mock.patch.dict(sys.modules, self.fake_jax_modules):
+            result = self.module.indexer_backward_wrapper(
+                *inputs,
+                q_layout="SBHD",
+                w_layout="SBH",
+                k_layout="SBD",
+                score_layout="SBK",
+                target_compute_capability=100,
+            )
+
+        self.assertEqual(result["d_index_q"].shape, inputs[0].shape)
+        self.assertEqual(result["d_weights"].shape, inputs[1].shape)
+        self.assertEqual(result["d_index_k"].shape, inputs[2].shape)
+        _, options = self.JaxApiBase.captured_call
+        self.assertEqual(
+            tuple(spec.mode for spec in options["input_spec"][:6]),
+            (
+                (1, 0, 2, 3),
+                (1, 0, 2),
+                (1, 0, 2),
+                (1, 0, 2),
+                (1, 0, 2),
+                (1, 0, 2),
+            ),
+        )
+        self.assertEqual(
+            tuple(spec.mode for spec in options["output_spec"]),
+            ((1, 0, 2, 3), (1, 0, 2), (1, 0, 2)),
+        )
+        self.assertEqual(options["workspace_spec"][0].mode, (1, 0, 2))
 
     def test_grad_loss_uses_a_fixed_runtime_abi_descriptor(self):
         inputs = self._sparse_inputs()
@@ -345,7 +455,9 @@ class JaxIndexerBackwardContractTest(unittest.TestCase):
         self.assertEqual(result["d_weights"].shape, inputs[1].shape)
         self.assertEqual(result["d_index_k"].shape, inputs[2].shape)
         kernel_inputs, options = self.JaxApiBase.captured_call
-        self.assertEqual((kernel_inputs[7].shape, kernel_inputs[7].dtype), ((1,), self.float32))
+        self.assertEqual(
+            (kernel_inputs[7].shape, kernel_inputs[7].dtype), ((1,), self.float32)
+        )
         self.assertEqual(options["output_descs"][2].init_value, 0.0)
         self.assertEqual(options["workspace_descs"][0].shape, inputs[3].shape)
         self.assertIn("--gpu-arch sm_100a", options["compile_options"])
@@ -380,6 +492,41 @@ class JaxIndexerBackwardContractTest(unittest.TestCase):
         self.assertEqual(options["input_spec"][2].divisibility, (None, 128))
         self.assertIn("--gpu-arch sm_90a", options["compile_options"])
 
+    def test_dense_sequence_major_layouts_preserve_public_shapes(self):
+        inputs = self._dense_sequence_major_inputs()
+        with mock.patch.dict(sys.modules, self.fake_jax_modules):
+            result = self.module.dense_indexer_backward_wrapper(
+                *inputs,
+                q_layout="SBHD",
+                w_layout="SBH",
+                k_layout="SBD",
+                score_layout="SBK",
+                denom_layout="SB",
+                target_compute_capability=100,
+            )
+
+        self.assertEqual(result["d_index_q"].shape, inputs[0].shape)
+        self.assertEqual(result["d_weights"].shape, inputs[1].shape)
+        self.assertEqual(result["d_index_k"].shape, inputs[2].shape)
+        _, options = self.JaxApiBase.captured_call
+        self.assertEqual(
+            tuple(spec.mode for spec in options["input_spec"][:7]),
+            (
+                (1, 0, 2, 3),
+                (1, 0, 2),
+                (1, 0, 2),
+                (1, 0, 2),
+                (1, 0),
+                (1, 0, 2),
+                (1, 0),
+            ),
+        )
+        self.assertEqual(
+            tuple(spec.mode for spec in options["output_spec"]),
+            ((1, 0, 2, 3), (1, 0, 2), (1, 0, 2)),
+        )
+        self.assertEqual(options["workspace_spec"][0].mode, (1, 0, 2))
+
     def _kernel_modules(self):
         package = self.module.__package__
 
@@ -397,7 +544,10 @@ class JaxIndexerBackwardContractTest(unittest.TestCase):
         dense_100.DenseIndexerBackward2QGemmSm100 = kernel("dense_gemm_100")
         dense_90 = types.ModuleType(f"{package}.dense_indexer_backward_sm90")
         dense_90.ScoreGradDenseSm90 = kernel("dense_score_90")
-        return {module.__name__: module for module in (sparse_100, sparse_90, dense_100, dense_90)}
+        return {
+            module.__name__: module
+            for module in (sparse_100, sparse_90, dense_100, dense_90)
+        }
 
     @staticmethod
     def _fake_cutlass():
@@ -414,7 +564,9 @@ class JaxIndexerBackwardContractTest(unittest.TestCase):
             shape=tuple(shape),
             stride=tuple(stride),
         )
-        cute.make_tensor = lambda _iterator, layout: _CuteTensor(layout.shape, layout.stride)
+        cute.make_tensor = lambda _iterator, layout: _CuteTensor(
+            layout.shape, layout.stride
+        )
         return cute
 
     @staticmethod
@@ -431,15 +583,26 @@ class JaxIndexerBackwardContractTest(unittest.TestCase):
         kernel_inputs = tuple(object() for _ in range(7))
         outputs = tuple(object() for _ in range(3))
         workspace = (object(),)
-        modules = {**self.fake_jax_modules, "cutlass": self._fake_cutlass(), **self._kernel_modules()}
+        modules = {
+            **self.fake_jax_modules,
+            "cutlass": self._fake_cutlass(),
+            **self._kernel_modules(),
+        }
 
-        for target, labels in ((100, ("sparse_score_100", "sparse_gemm_100")), (90, ("sparse_score_90", "sparse_gemm_90"))):
+        for target, labels in (
+            (100, ("sparse_score_100", "sparse_gemm_100")),
+            (90, ("sparse_score_90", "sparse_gemm_90")),
+        ):
             with self.subTest(target=target), mock.patch.dict(sys.modules, modules):
                 _RecordedKernel.events.clear()
-                api = self.module.IndexerBackward(*inputs, target_compute_capability=target)
+                api = self.module.IndexerBackward(
+                    *inputs, target_compute_capability=target
+                )
                 api.check_support()
                 api._launch_kernel(object(), *kernel_inputs, *outputs, *workspace)
-                self.assertEqual(tuple(event[0] for event in _RecordedKernel.events), labels)
+                self.assertEqual(
+                    tuple(event[0] for event in _RecordedKernel.events), labels
+                )
                 score_args = _RecordedKernel.events[0][2]
                 self.assertIs(score_args[-2 if target == 100 else -1], workspace[0])
                 gemm_args = _RecordedKernel.events[1][2]
@@ -456,7 +619,9 @@ class JaxIndexerBackwardContractTest(unittest.TestCase):
             "cutlass.cute": cute,
             **self._kernel_modules(),
         }
-        kernel_inputs = tuple(self._compact_cute(value.shape) for value in inputs) + (self._compact_cute((1,)),)
+        kernel_inputs = tuple(self._compact_cute(value.shape) for value in inputs) + (
+            self._compact_cute((1,)),
+        )
         outputs = (
             self._compact_cute(inputs[0].shape),
             self._compact_cute(inputs[1].shape),
@@ -464,7 +629,10 @@ class JaxIndexerBackwardContractTest(unittest.TestCase):
         )
         workspace = (self._compact_cute(inputs[3].shape),)
 
-        for target, labels in ((100, ("sparse_score_100", "sparse_gemm_100")), (90, ("sparse_score_90", "sparse_gemm_90"))):
+        for target, labels in (
+            (100, ("sparse_score_100", "sparse_gemm_100")),
+            (90, ("sparse_score_90", "sparse_gemm_90")),
+        ):
             with self.subTest(target=target), mock.patch.dict(sys.modules, modules):
                 _RecordedKernel.events.clear()
                 api = self.module.IndexerBackward(
@@ -475,7 +643,9 @@ class JaxIndexerBackwardContractTest(unittest.TestCase):
                 api.check_support()
                 api._launch_kernel(object(), *kernel_inputs, *outputs, *workspace)
 
-            self.assertEqual(tuple(event[0] for event in _RecordedKernel.events), labels)
+            self.assertEqual(
+                tuple(event[0] for event in _RecordedKernel.events), labels
+            )
             score_args = _RecordedKernel.events[0][2]
             self.assertEqual(score_args[0].shape, (1, 96, 128))
             self.assertEqual(score_args[1].shape, (1, 96, 128))
@@ -487,7 +657,11 @@ class JaxIndexerBackwardContractTest(unittest.TestCase):
             self.assertEqual(gemm_args[7].shape, (1, 96, 128))
 
     def test_dense_sm100_bshd_and_sm90_thd_launch_functionally(self):
-        modules = {**self.fake_jax_modules, "cutlass": self._fake_cutlass(), **self._kernel_modules()}
+        modules = {
+            **self.fake_jax_modules,
+            "cutlass": self._fake_cutlass(),
+            **self._kernel_modules(),
+        }
         outputs = tuple(object() for _ in range(3))
         workspace = (object(),)
 
@@ -497,7 +671,10 @@ class JaxIndexerBackwardContractTest(unittest.TestCase):
             api.check_support()
             kernel_inputs = tuple(object() for _ in range(8))
             api._launch_kernel(object(), *kernel_inputs, *outputs, *workspace)
-        self.assertEqual(tuple(event[0] for event in _RecordedKernel.events), ("dense_score_100", "dense_gemm_100"))
+        self.assertEqual(
+            tuple(event[0] for event in _RecordedKernel.events),
+            ("dense_score_100", "dense_gemm_100"),
+        )
         score_args = _RecordedKernel.events[0][2]
         self.assertIs(score_args[11], workspace[0])
         self.assertIs(score_args[12], kernel_inputs[7])
@@ -520,7 +697,10 @@ class JaxIndexerBackwardContractTest(unittest.TestCase):
             api.check_support()
             kernel_inputs = tuple(object() for _ in range(11))
             api._launch_kernel(object(), *kernel_inputs, *outputs, *workspace)
-        self.assertEqual(tuple(event[0] for event in _RecordedKernel.events), ("dense_score_90", "sparse_gemm_90"))
+        self.assertEqual(
+            tuple(event[0] for event in _RecordedKernel.events),
+            ("dense_score_90", "sparse_gemm_90"),
+        )
         score_args = _RecordedKernel.events[0][2]
         self.assertEqual(score_args[4:7], kernel_inputs[8:11])
         self.assertIs(score_args[11], workspace[0])

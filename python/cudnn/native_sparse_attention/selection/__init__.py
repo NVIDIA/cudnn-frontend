@@ -1,6 +1,9 @@
-from .api import SelectionAttention, selection_attention_wrapper
+"""Lazy Torch selection-attention API exports."""
 
-__all__ = [
-    "SelectionAttention",
-    "selection_attention_wrapper",
-]
+from ..._operation_api import make_operation_api
+
+__all__, __getattr__, __dir__ = make_operation_api(
+    globals(),
+    exports={"api": ("SelectionAttention", "selection_attention_wrapper")},
+    submodules=("api", "jax"),
+)

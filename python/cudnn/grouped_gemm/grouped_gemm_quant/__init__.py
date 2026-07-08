@@ -1,20 +1,10 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""
-Grouped GEMM Quant Kernel Module
+from ..._operation_api import make_operation_api
 
-This module provides the contiguous grouped GEMM with output quantization
-for MoE (Mixture of Experts) workloads on SM100+ GPUs.
-Used for FC2 (forward down-projection) and dFC1 (backward FC1 GEMMs).
-"""
-
-from .api import (
-    GroupedGemmQuantSm100,
-    grouped_gemm_quant_wrapper_sm100,
+__all__, __getattr__, __dir__ = make_operation_api(
+    globals(),
+    exports={"api": ("GroupedGemmQuantSm100", "grouped_gemm_quant_wrapper_sm100")},
+    submodules=("api", "jax"),
 )
-
-__all__ = [
-    "GroupedGemmQuantSm100",
-    "grouped_gemm_quant_wrapper_sm100",
-]

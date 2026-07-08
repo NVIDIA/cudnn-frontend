@@ -13,11 +13,27 @@ import jax.numpy as jnp
 
 from ... import data_type
 from ..._jax import JaxApiBase, JaxTensorDesc, TupleDict
+from ..._jax.layout import mode_from_layout
 from ..utils.compiler import compile_options_for_target
 from .op import DEFAULT_BLOCK_I, DenseIndexerBackwardOp, IndexerBackwardOp
 
 _SUPPORTED_COMPUTE_CAPABILITIES = (90, 100, 103, 107)
 _SUPPORTED_COMPUTE_CAPABILITY_FAMILIES = (90, 100)
+
+
+def _resolve_layout(
+    name: str,
+    layout: str | None,
+    *,
+    default: str,
+    kernel_axes: str,
+    supported: tuple[str, ...],
+) -> tuple[str, tuple[int, ...]]:
+    layout = default if layout is None else layout
+    if layout not in supported:
+        choices = ", ".join(repr(value) for value in supported)
+        raise ValueError(f"{name} must be one of ({choices}), got {layout!r}")
+    return layout, mode_from_layout(layout, kernel_axes=kernel_axes)
 
 
 def _grad_loss_operand(value: Any) -> Any:
@@ -53,10 +69,16 @@ class _IndexerJaxBase(JaxApiBase):
     @property
     def _architecture_family(self) -> int:
         if self.compute_capability is None:
-            raise RuntimeError("check_support() must resolve the compute capability before lowering")
-        family = self._compute_capability_family(self.compute_capability, _SUPPORTED_COMPUTE_CAPABILITY_FAMILIES)
+            raise RuntimeError(
+                "check_support() must resolve the compute capability before lowering"
+            )
+        family = self._compute_capability_family(
+            self.compute_capability, _SUPPORTED_COMPUTE_CAPABILITY_FAMILIES
+        )
         if family is None:
-            raise RuntimeError(f"No indexer-backward kernel for SM{self.compute_capability}")
+            raise RuntimeError(
+                f"No indexer-backward kernel for SM{self.compute_capability}"
+            )
         return family
 
     @staticmethod
@@ -67,14 +89,26 @@ class _IndexerJaxBase(JaxApiBase):
         cudnn_dtype: data_type,
         shape: tuple[int, ...],
         name: str,
+        mode: tuple[int, ...],
     ) -> JaxTensorDesc:
         if sample is not None:
-            return JaxApiBase._to_tensor_desc(sample, name)
-        return source.compact_like(cudnn_dtype=cudnn_dtype, shape=shape, name=name)
+            return JaxApiBase._to_tensor_desc(sample, name, mode=mode)
+        return source.compact_like(
+            cudnn_dtype=cudnn_dtype,
+            shape=shape,
+            stride_order=source.stride_order,
+            name=name,
+        )
 
-    def _last_axis_spec(self, desc: JaxTensorDesc, alignment: int) -> Any:
+    def _last_axis_spec(
+        self,
+        desc: JaxTensorDesc,
+        alignment: int,
+        mode: tuple[int, ...],
+    ) -> Any:
         return self._to_tensor_spec(
             desc,
+            mode=mode,
             divisibility=(None,) * (desc.ndim - 1) + (alignment,),
         )
 
@@ -103,20 +137,77 @@ class IndexerBackward(_IndexerJaxBase):
         loss_coeff: float = 1.0,
         block_I: int = DEFAULT_BLOCK_I,
         topk_indices_global: bool = False,
+        q_layout: str | None = None,
+        w_layout: str | None = None,
+        k_layout: str | None = None,
+        score_layout: str | None = None,
         target_compute_capability: int | None = None,
     ) -> None:
-        self.iq_desc = self._to_tensor_desc(sample_index_q, "sample_index_q")
-        self.w_desc = self._to_tensor_desc(sample_weights, "sample_weights")
-        self.ik_desc = self._to_tensor_desc(sample_index_k, "sample_index_k")
-        self.attn_desc = self._to_tensor_desc(sample_attn_score, "sample_attn_score")
-        self.idx_score_desc = self._to_tensor_desc(sample_index_score, "sample_index_score")
-        self.topk_desc = self._to_tensor_desc(sample_topk_indices, "sample_topk_indices")
+        is_thd = len(tuple(sample_index_q.shape)) == 3
+        if is_thd:
+            q_defaults = ("THD", "THD", ("THD",))
+            w_defaults = ("TH", "TH", ("TH",))
+            k_defaults = ("TD", "TD", ("TD",))
+            score_defaults = ("TK", "TK", ("TK",))
+        else:
+            q_defaults = ("BSHD", "BSHD", ("BSHD", "SBHD"))
+            w_defaults = ("BSH", "BSH", ("BSH", "SBH"))
+            k_defaults = ("BSD", "BSD", ("BSD", "SBD"))
+            score_defaults = ("BSK", "BSK", ("BSK", "SBK"))
+        self.q_layout, self.q_mode = _resolve_layout(
+            "q_layout",
+            q_layout,
+            default=q_defaults[0],
+            kernel_axes=q_defaults[1],
+            supported=q_defaults[2],
+        )
+        self.w_layout, self.w_mode = _resolve_layout(
+            "w_layout",
+            w_layout,
+            default=w_defaults[0],
+            kernel_axes=w_defaults[1],
+            supported=w_defaults[2],
+        )
+        self.k_layout, self.k_mode = _resolve_layout(
+            "k_layout",
+            k_layout,
+            default=k_defaults[0],
+            kernel_axes=k_defaults[1],
+            supported=k_defaults[2],
+        )
+        self.score_layout, self.score_mode = _resolve_layout(
+            "score_layout",
+            score_layout,
+            default=score_defaults[0],
+            kernel_axes=score_defaults[1],
+            supported=score_defaults[2],
+        )
+
+        self.iq_desc = self._to_tensor_desc(
+            sample_index_q, "sample_index_q", mode=self.q_mode
+        )
+        self.w_desc = self._to_tensor_desc(
+            sample_weights, "sample_weights", mode=self.w_mode
+        )
+        self.ik_desc = self._to_tensor_desc(
+            sample_index_k, "sample_index_k", mode=self.k_mode
+        )
+        self.attn_desc = self._to_tensor_desc(
+            sample_attn_score, "sample_attn_score", mode=self.score_mode
+        )
+        self.idx_score_desc = self._to_tensor_desc(
+            sample_index_score, "sample_index_score", mode=self.score_mode
+        )
+        self.topk_desc = self._to_tensor_desc(
+            sample_topk_indices, "sample_topk_indices", mode=self.score_mode
+        )
         self.diq_desc = self._output_desc(
             sample_d_index_q,
             source=self.iq_desc,
             cudnn_dtype=data_type.BFLOAT16,
             shape=self.iq_desc.shape,
             name="sample_d_index_q",
+            mode=self.q_mode,
         )
         self.dw_desc = self._output_desc(
             sample_d_weights,
@@ -124,6 +215,7 @@ class IndexerBackward(_IndexerJaxBase):
             cudnn_dtype=data_type.BFLOAT16,
             shape=self.w_desc.shape,
             name="sample_d_weights",
+            mode=self.w_mode,
         )
         self.dik_desc = self._output_desc(
             sample_d_index_k,
@@ -131,6 +223,7 @@ class IndexerBackward(_IndexerJaxBase):
             cudnn_dtype=data_type.BFLOAT16,
             shape=self.ik_desc.shape,
             name="sample_d_index_k",
+            mode=self.k_mode,
         )
         self.grad_loss_desc = self.iq_desc.compact_like(
             cudnn_dtype=data_type.FLOAT,
@@ -171,49 +264,64 @@ class IndexerBackward(_IndexerJaxBase):
         grad_loss: Any = 1.0,
     ) -> TupleDict:
         self.check_support()
-        for value, expected in (
-            (index_q, self.iq_desc),
-            (weights, self.w_desc),
-            (index_k, self.ik_desc),
-            (attn_score, self.attn_desc),
-            (index_score, self.idx_score_desc),
-            (topk_indices, self.topk_desc),
+        for value, expected, mode in (
+            (index_q, self.iq_desc, self.q_mode),
+            (weights, self.w_desc, self.w_mode),
+            (index_k, self.ik_desc, self.k_mode),
+            (attn_score, self.attn_desc, self.score_mode),
+            (index_score, self.idx_score_desc, self.score_mode),
+            (topk_indices, self.topk_desc, self.score_mode),
         ):
-            self._check_tensor_signature(value, expected)
+            self._check_tensor_signature(value, expected, mode=mode)
         grad_loss = _grad_loss_operand(grad_loss)
         self._check_tensor_signature(grad_loss, self.grad_loss_desc)
 
         dk_accum_desc = self.ik_desc.compact_like(
             cudnn_dtype=data_type.FLOAT,
             shape=self.ik_desc.shape,
+            stride_order=self.ik_desc.stride_order,
             name="d_index_k_accum",
             init_value=0.0,
         )
         grad_signal_desc = self.attn_desc.compact_like(
             cudnn_dtype=data_type.FLOAT,
             shape=self.attn_desc.shape,
+            stride_order=self.attn_desc.stride_order,
             name="grad_signal",
         )
         d_index_q, d_weights, d_index_k_accum = self._call_kernel(
-            (index_q, weights, index_k, attn_score, index_score, topk_indices, grad_loss),
+            (
+                index_q,
+                weights,
+                index_k,
+                attn_score,
+                index_score,
+                topk_indices,
+                grad_loss,
+            ),
             launch=self._launch_kernel,
             output_descs=(self.diq_desc, self.dw_desc, dk_accum_desc),
             workspace_descs=(grad_signal_desc,),
             input_spec=(
-                self._last_axis_spec(self.iq_desc, self._op.head_dim),
-                None,
-                self._last_axis_spec(self.ik_desc, self._op.head_dim),
-                None,
-                None,
-                None,
-                None,
+                self._last_axis_spec(self.iq_desc, self._op.head_dim, self.q_mode),
+                self._to_tensor_spec(self.w_desc, mode=self.w_mode),
+                self._last_axis_spec(self.ik_desc, self._op.head_dim, self.k_mode),
+                self._to_tensor_spec(self.attn_desc, mode=self.score_mode),
+                self._to_tensor_spec(self.idx_score_desc, mode=self.score_mode),
+                self._to_tensor_spec(self.topk_desc, mode=self.score_mode),
+                self._to_tensor_spec(self.grad_loss_desc),
             ),
             output_spec=(
-                self._last_axis_spec(self.diq_desc, self._op.head_dim),
-                None,
-                self._last_axis_spec(dk_accum_desc, self._op.head_dim),
+                self._last_axis_spec(self.diq_desc, self._op.head_dim, self.q_mode),
+                self._to_tensor_spec(self.dw_desc, mode=self.w_mode),
+                self._last_axis_spec(dk_accum_desc, self._op.head_dim, self.k_mode),
             ),
-            compile_options=compile_options_for_target(self.compute_capability, "--opt-level 3"),
+            workspace_spec=(
+                self._to_tensor_spec(grad_signal_desc, mode=self.score_mode),
+            ),
+            compile_options=compile_options_for_target(
+                self.compute_capability, "--opt-level 3"
+            ),
         )
         return TupleDict(
             d_index_q=d_index_q,
@@ -358,21 +466,92 @@ class DenseIndexerBackward(_IndexerJaxBase):
         loss_coeff: float = 1.0,
         block_I: int = DEFAULT_BLOCK_I,
         ratio: int = 1,
+        q_layout: str | None = None,
+        w_layout: str | None = None,
+        k_layout: str | None = None,
+        score_layout: str | None = None,
+        denom_layout: str | None = None,
         target_compute_capability: int | None = None,
     ) -> None:
-        self.iq_desc = self._to_tensor_desc(sample_index_q, "sample_index_q")
-        self.w_desc = self._to_tensor_desc(sample_weights, "sample_weights")
-        self.ik_desc = self._to_tensor_desc(sample_index_k, "sample_index_k")
-        self.attn_desc = self._to_tensor_desc(sample_attn_score, "sample_attn_score")
-        self.attn_denom_desc = self._to_tensor_desc(sample_attn_l1norm, "sample_attn_l1norm")
-        self.idx_score_desc = self._to_tensor_desc(sample_index_score, "sample_index_score")
-        self.idx_lse_desc = self._to_tensor_desc(sample_index_lse, "sample_index_lse")
+        is_thd = len(tuple(sample_index_q.shape)) == 3
+        if is_thd:
+            q_defaults = ("THD", "THD", ("THD",))
+            w_defaults = ("TH", "TH", ("TH",))
+            k_defaults = ("TD", "TD", ("TD",))
+            score_defaults = ("TK", "TK", ("TK",))
+            denom_defaults = ("T", "T", ("T",))
+        else:
+            q_defaults = ("BSHD", "BSHD", ("BSHD", "SBHD"))
+            w_defaults = ("BSH", "BSH", ("BSH", "SBH"))
+            k_defaults = ("BSD", "BSD", ("BSD", "SBD"))
+            score_defaults = ("BSK", "BSK", ("BSK", "SBK"))
+            denom_defaults = ("BS", "BS", ("BS", "SB"))
+        self.q_layout, self.q_mode = _resolve_layout(
+            "q_layout",
+            q_layout,
+            default=q_defaults[0],
+            kernel_axes=q_defaults[1],
+            supported=q_defaults[2],
+        )
+        self.w_layout, self.w_mode = _resolve_layout(
+            "w_layout",
+            w_layout,
+            default=w_defaults[0],
+            kernel_axes=w_defaults[1],
+            supported=w_defaults[2],
+        )
+        self.k_layout, self.k_mode = _resolve_layout(
+            "k_layout",
+            k_layout,
+            default=k_defaults[0],
+            kernel_axes=k_defaults[1],
+            supported=k_defaults[2],
+        )
+        self.score_layout, self.score_mode = _resolve_layout(
+            "score_layout",
+            score_layout,
+            default=score_defaults[0],
+            kernel_axes=score_defaults[1],
+            supported=score_defaults[2],
+        )
+        self.denom_layout, self.denom_mode = _resolve_layout(
+            "denom_layout",
+            denom_layout,
+            default=denom_defaults[0],
+            kernel_axes=denom_defaults[1],
+            supported=denom_defaults[2],
+        )
+
+        self.iq_desc = self._to_tensor_desc(
+            sample_index_q, "sample_index_q", mode=self.q_mode
+        )
+        self.w_desc = self._to_tensor_desc(
+            sample_weights, "sample_weights", mode=self.w_mode
+        )
+        self.ik_desc = self._to_tensor_desc(
+            sample_index_k, "sample_index_k", mode=self.k_mode
+        )
+        self.attn_desc = self._to_tensor_desc(
+            sample_attn_score, "sample_attn_score", mode=self.score_mode
+        )
+        self.attn_denom_desc = self._to_tensor_desc(
+            sample_attn_l1norm,
+            "sample_attn_l1norm",
+            mode=self.denom_mode,
+        )
+        self.idx_score_desc = self._to_tensor_desc(
+            sample_index_score, "sample_index_score", mode=self.score_mode
+        )
+        self.idx_lse_desc = self._to_tensor_desc(
+            sample_index_lse, "sample_index_lse", mode=self.denom_mode
+        )
         self.diq_desc = self._output_desc(
             sample_d_index_q,
             source=self.iq_desc,
             cudnn_dtype=data_type.BFLOAT16,
             shape=self.iq_desc.shape,
             name="sample_d_index_q",
+            mode=self.q_mode,
         )
         self.dw_desc = self._output_desc(
             sample_d_weights,
@@ -380,6 +559,7 @@ class DenseIndexerBackward(_IndexerJaxBase):
             cudnn_dtype=data_type.BFLOAT16,
             shape=self.w_desc.shape,
             name="sample_d_weights",
+            mode=self.w_mode,
         )
         self.dik_desc = self._output_desc(
             sample_d_index_k,
@@ -387,15 +567,30 @@ class DenseIndexerBackward(_IndexerJaxBase):
             cudnn_dtype=data_type.BFLOAT16,
             shape=self.ik_desc.shape,
             name="sample_d_index_k",
+            mode=self.k_mode,
         )
         self.grad_loss_desc = self.iq_desc.compact_like(
             cudnn_dtype=data_type.FLOAT,
             shape=(1,),
             name="grad_loss",
         )
-        self.cuq_desc = None if sample_cu_seqlens_q is None else self._to_tensor_desc(sample_cu_seqlens_q, "sample_cu_seqlens_q")
-        self.cuk_desc = None if sample_cu_seqlens_k is None else self._to_tensor_desc(sample_cu_seqlens_k, "sample_cu_seqlens_k")
-        self.q_offsets_desc = None if sample_q_causal_offsets is None else self._to_tensor_desc(sample_q_causal_offsets, "sample_q_causal_offsets")
+        self.cuq_desc = (
+            None
+            if sample_cu_seqlens_q is None
+            else self._to_tensor_desc(sample_cu_seqlens_q, "sample_cu_seqlens_q")
+        )
+        self.cuk_desc = (
+            None
+            if sample_cu_seqlens_k is None
+            else self._to_tensor_desc(sample_cu_seqlens_k, "sample_cu_seqlens_k")
+        )
+        self.q_offsets_desc = (
+            None
+            if sample_q_causal_offsets is None
+            else self._to_tensor_desc(
+                sample_q_causal_offsets, "sample_q_causal_offsets"
+            )
+        )
         self._op = DenseIndexerBackwardOp(
             index_q=self.iq_desc,
             weights=self.w_desc,
@@ -440,16 +635,16 @@ class DenseIndexerBackward(_IndexerJaxBase):
         q_causal_offsets: Any | None = None,
     ) -> TupleDict:
         self.check_support()
-        for value, expected in (
-            (index_q, self.iq_desc),
-            (weights, self.w_desc),
-            (index_k, self.ik_desc),
-            (attn_score, self.attn_desc),
-            (attn_l1norm, self.attn_denom_desc),
-            (index_score, self.idx_score_desc),
-            (index_lse, self.idx_lse_desc),
+        for value, expected, mode in (
+            (index_q, self.iq_desc, self.q_mode),
+            (weights, self.w_desc, self.w_mode),
+            (index_k, self.ik_desc, self.k_mode),
+            (attn_score, self.attn_desc, self.score_mode),
+            (attn_l1norm, self.attn_denom_desc, self.denom_mode),
+            (index_score, self.idx_score_desc, self.score_mode),
+            (index_lse, self.idx_lse_desc, self.denom_mode),
         ):
-            self._check_tensor_signature(value, expected)
+            self._check_tensor_signature(value, expected, mode=mode)
         for value, expected, name in (
             (cu_seqlens_q, self.cuq_desc, "cu_seqlens_q"),
             (cu_seqlens_k, self.cuk_desc, "cu_seqlens_k"),
@@ -462,19 +657,30 @@ class DenseIndexerBackward(_IndexerJaxBase):
         grad_loss = _grad_loss_operand(grad_loss)
         self._check_tensor_signature(grad_loss, self.grad_loss_desc)
 
-        inputs = (index_q, weights, index_k, attn_score, attn_l1norm, index_score, index_lse, grad_loss)
+        inputs = (
+            index_q,
+            weights,
+            index_k,
+            attn_score,
+            attn_l1norm,
+            index_score,
+            index_lse,
+            grad_loss,
+        )
         for optional in (cu_seqlens_q, cu_seqlens_k, q_causal_offsets):
             if optional is not None:
                 inputs += (optional,)
         dk_accum_desc = self.ik_desc.compact_like(
             cudnn_dtype=data_type.FLOAT,
             shape=self.ik_desc.shape,
+            stride_order=self.ik_desc.stride_order,
             name="d_index_k_accum",
             init_value=0.0,
         )
         grad_signal_desc = self.idx_score_desc.compact_like(
             cudnn_dtype=data_type.FLOAT,
             shape=self.idx_score_desc.shape,
+            stride_order=self.idx_score_desc.stride_order,
             name="grad_signal",
         )
         d_index_q, d_weights, d_index_k_accum = self._call_kernel(
@@ -483,17 +689,35 @@ class DenseIndexerBackward(_IndexerJaxBase):
             output_descs=(self.diq_desc, self.dw_desc, dk_accum_desc),
             workspace_descs=(grad_signal_desc,),
             input_spec=(
-                self._last_axis_spec(self.iq_desc, self._op.head_dim),
-                None,
-                self._last_axis_spec(self.ik_desc, self._op.head_dim),
+                self._last_axis_spec(self.iq_desc, self._op.head_dim, self.q_mode),
+                self._to_tensor_spec(self.w_desc, mode=self.w_mode),
+                self._last_axis_spec(self.ik_desc, self._op.head_dim, self.k_mode),
+                self._to_tensor_spec(self.attn_desc, mode=self.score_mode),
+                self._to_tensor_spec(self.attn_denom_desc, mode=self.denom_mode),
+                self._to_tensor_spec(self.idx_score_desc, mode=self.score_mode),
+                self._to_tensor_spec(self.idx_lse_desc, mode=self.denom_mode),
+                self._to_tensor_spec(self.grad_loss_desc),
             )
-            + (None,) * (len(inputs) - 3),
-            output_spec=(
-                self._last_axis_spec(self.diq_desc, self._op.head_dim),
-                None,
-                self._last_axis_spec(dk_accum_desc, self._op.head_dim),
+            + tuple(
+                self._to_tensor_spec(desc)
+                for desc in (
+                    self.cuq_desc,
+                    self.cuk_desc,
+                    self.q_offsets_desc,
+                )
+                if desc is not None
             ),
-            compile_options=compile_options_for_target(self.compute_capability, "--opt-level 3"),
+            output_spec=(
+                self._last_axis_spec(self.diq_desc, self._op.head_dim, self.q_mode),
+                self._to_tensor_spec(self.dw_desc, mode=self.w_mode),
+                self._last_axis_spec(dk_accum_desc, self._op.head_dim, self.k_mode),
+            ),
+            workspace_spec=(
+                self._to_tensor_spec(grad_signal_desc, mode=self.score_mode),
+            ),
+            compile_options=compile_options_for_target(
+                self.compute_capability, "--opt-level 3"
+            ),
         )
         return TupleDict(
             d_index_q=d_index_q,
@@ -505,7 +729,17 @@ class DenseIndexerBackward(_IndexerJaxBase):
         import cutlass
 
         *inputs, d_index_q, d_weights, d_index_k_accum, grad_signal = arguments
-        index_q, weights, index_k, attn_score, attn_l1norm, index_score, index_lse, grad_loss, *optional = inputs
+        (
+            index_q,
+            weights,
+            index_k,
+            attn_score,
+            attn_l1norm,
+            index_score,
+            index_lse,
+            grad_loss,
+            *optional,
+        ) = inputs
         cursor = 0
         cu_seqlens_q = cu_seqlens_k = q_causal_offsets = None
         if self._op.is_thd:
@@ -517,7 +751,10 @@ class DenseIndexerBackward(_IndexerJaxBase):
         grad_scale = self.loss_coeff / max(self._op.normalization_tokens, 1)
 
         if self._architecture_family == 100:
-            from .dense_indexer_backward_sm100 import DenseIndexerBackward2QGemmSm100, ScoreGradDense
+            from .dense_indexer_backward_sm100 import (
+                DenseIndexerBackward2QGemmSm100,
+                ScoreGradDense,
+            )
 
             ScoreGradDense(ratio=self._op.ratio, block_I=self._op.block_i)(
                 index_score,
@@ -601,7 +838,19 @@ class DenseIndexerBackward(_IndexerJaxBase):
         )
 
 
-@jax.jit(static_argnames=("sm_scale", "loss_coeff", "block_I", "topk_indices_global", "target_compute_capability"))
+@jax.jit(
+    static_argnames=(
+        "sm_scale",
+        "loss_coeff",
+        "block_I",
+        "topk_indices_global",
+        "q_layout",
+        "w_layout",
+        "k_layout",
+        "score_layout",
+        "target_compute_capability",
+    )
+)
 def indexer_backward_wrapper(
     index_q: Any,
     weights: Any,
@@ -614,6 +863,10 @@ def indexer_backward_wrapper(
     grad_loss: Any = 1.0,
     block_I: int = DEFAULT_BLOCK_I,
     topk_indices_global: bool = False,
+    q_layout: str | None = None,
+    w_layout: str | None = None,
+    k_layout: str | None = None,
+    score_layout: str | None = None,
     target_compute_capability: int | None = None,
 ) -> TupleDict:
     """Compute sparse indexer gradients for fixed BSHD or packed THD inputs.
@@ -621,13 +874,20 @@ def indexer_backward_wrapper(
     Packed THD callers must pass ``topk_indices_global=True``.
     """
 
-    samples = tuple(jax.ShapeDtypeStruct(value.shape, value.dtype) for value in (index_q, weights, index_k, attn_score, index_score, topk_indices))
+    samples = tuple(
+        jax.ShapeDtypeStruct(value.shape, value.dtype)
+        for value in (index_q, weights, index_k, attn_score, index_score, topk_indices)
+    )
     return IndexerBackward(
         *samples,
         sm_scale=sm_scale,
         loss_coeff=loss_coeff,
         block_I=block_I,
         topk_indices_global=topk_indices_global,
+        q_layout=q_layout,
+        w_layout=w_layout,
+        k_layout=k_layout,
+        score_layout=score_layout,
         target_compute_capability=target_compute_capability,
     )(index_q, weights, index_k, attn_score, index_score, topk_indices, grad_loss)
 
@@ -640,6 +900,11 @@ def indexer_backward_wrapper(
         "ratio",
         "max_seqlen_q",
         "max_seqlen_k",
+        "q_layout",
+        "w_layout",
+        "k_layout",
+        "score_layout",
+        "denom_layout",
         "target_compute_capability",
     )
 )
@@ -661,13 +926,30 @@ def dense_indexer_backward_wrapper(
     max_seqlen_q: int | None = None,
     max_seqlen_k: int | None = None,
     q_causal_offsets: Any | None = None,
+    q_layout: str | None = None,
+    w_layout: str | None = None,
+    k_layout: str | None = None,
+    score_layout: str | None = None,
+    denom_layout: str | None = None,
     target_compute_capability: int | None = None,
 ) -> TupleDict:
     core = (index_q, weights, index_k, attn_score, attn_l1norm, index_score, index_lse)
     samples = tuple(jax.ShapeDtypeStruct(value.shape, value.dtype) for value in core)
-    sample_cuq = None if cu_seqlens_q is None else jax.ShapeDtypeStruct(cu_seqlens_q.shape, cu_seqlens_q.dtype)
-    sample_cuk = None if cu_seqlens_k is None else jax.ShapeDtypeStruct(cu_seqlens_k.shape, cu_seqlens_k.dtype)
-    sample_offsets = None if q_causal_offsets is None else jax.ShapeDtypeStruct(q_causal_offsets.shape, q_causal_offsets.dtype)
+    sample_cuq = (
+        None
+        if cu_seqlens_q is None
+        else jax.ShapeDtypeStruct(cu_seqlens_q.shape, cu_seqlens_q.dtype)
+    )
+    sample_cuk = (
+        None
+        if cu_seqlens_k is None
+        else jax.ShapeDtypeStruct(cu_seqlens_k.shape, cu_seqlens_k.dtype)
+    )
+    sample_offsets = (
+        None
+        if q_causal_offsets is None
+        else jax.ShapeDtypeStruct(q_causal_offsets.shape, q_causal_offsets.dtype)
+    )
     return DenseIndexerBackward(
         *samples,
         sample_cu_seqlens_q=sample_cuq,
@@ -679,6 +961,11 @@ def dense_indexer_backward_wrapper(
         loss_coeff=loss_coeff,
         block_I=block_I,
         ratio=ratio,
+        q_layout=q_layout,
+        w_layout=w_layout,
+        k_layout=k_layout,
+        score_layout=score_layout,
+        denom_layout=denom_layout,
         target_compute_capability=target_compute_capability,
     )(
         *core,
