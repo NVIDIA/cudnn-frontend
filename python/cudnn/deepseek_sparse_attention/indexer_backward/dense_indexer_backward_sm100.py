@@ -53,7 +53,6 @@ from __future__ import annotations
 
 import math
 from functools import partial
-import torch
 import cuda.bindings.driver as cuda
 
 import cutlass
@@ -73,12 +72,7 @@ from cutlass.utils.layout import LayoutEnum
 
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
 
-from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
-
 from cudnn.deepseek_sparse_attention.utils.copy import cpasync_reduce_bulk_add_f32
-from cudnn.deepseek_sparse_attention.utils.runtime import (
-    resolve_stream as _resolve_stream,
-)
 from cudnn.deepseek_sparse_attention.utils.seqlen import seqlen_info as _seqlen_info
 
 mul_packed_f32x2 = partial(cute.arch.mul_packed_f32x2, rnd="rn")
@@ -151,7 +145,12 @@ class ScoreGradDense:
         max_seqlen_q: Int32,
         max_seqlen_k: Int32,
         stream,
+        mGradSignal=None,
+        mGradLoss=None,
     ):
+        if const_expr(mGradSignal is None):
+            mGradSignal = mPredictRaw
+
         # BSHD: mCuSeqlensQ/K = None; tensors carry batch dim.
         #   PredictRaw/TargetRaw: (B, S_q, S_k)   LSE/Denom: (B, S_q)
         # THD: mCuSeqlensQ/K provided; tensors are packed.
@@ -166,6 +165,10 @@ class ScoreGradDense:
             mPredictRaw = cute.make_tensor(
                 mPredictRaw.iterator,
                 cute.select(mPredictRaw.layout, mode=[1, 2, 0]),
+            )
+            mGradSignal = cute.make_tensor(
+                mGradSignal.iterator,
+                cute.select(mGradSignal.layout, mode=[1, 2, 0]),
             )
             mTargetRaw = cute.make_tensor(
                 mTargetRaw.iterator,
@@ -186,12 +189,14 @@ class ScoreGradDense:
 
         self.kernel_score_grad(
             mPredictRaw,
+            mGradSignal,
             mTargetRaw,
             mLSE,
             mDenomTarget,
             mCuSeqlensQ,
             mCuSeqlensK,
             mQCausalOffsets,
+            mGradLoss,
             grad_scale,
             seqlen_k_pad,
             max_seqlen_q,
@@ -206,12 +211,14 @@ class ScoreGradDense:
     def kernel_score_grad(
         self,
         mPredictRaw,
+        mGradSignal,
         mTargetRaw,
         mLSE,
         mDenomTarget,
         mCuSeqlensQ,
         mCuSeqlensK,
         mQCausalOffsets,
+        mGradLoss,
         grad_scale: Float32,
         seqlen_k_pad: Int32,
         seqlen_q_static: Int32,
@@ -252,11 +259,13 @@ class ScoreGradDense:
             #   THD : (T_q, max_K) -> domain-offset by q_offset along T_q; LSE/Denom (T_q,) similarly.
             if const_expr(is_varlen):
                 mPredict_b = cute.domain_offset((q_offset, Int32(0)), mPredictRaw)
+                mGradSignal_b = cute.domain_offset((q_offset, Int32(0)), mGradSignal)
                 mTarget_b = cute.domain_offset((q_offset, Int32(0)), mTargetRaw)
                 mLSE_b = cute.domain_offset((q_offset,), mLSE)
                 mDenom_b = cute.domain_offset((q_offset,), mDenomTarget)
             else:
                 mPredict_b = mPredictRaw[None, None, batch_idx]
+                mGradSignal_b = mGradSignal[None, None, batch_idx]
                 mTarget_b = mTargetRaw[None, None, batch_idx]
                 mLSE_b = mLSE[None, batch_idx]
                 mDenom_b = mDenomTarget[None, batch_idx]
@@ -264,6 +273,7 @@ class ScoreGradDense:
             # Scalar loads (shared across all threads in CTA)
             lse_val = mLSE_b[seq_local]
             denom_val = mDenom_b[seq_local]
+            effective_grad_scale = grad_scale if const_expr(mGradLoss is None) else grad_scale * mGradLoss[0]
 
             LOG2E = Float32(1.4426950408889634)
 
@@ -284,7 +294,7 @@ class ScoreGradDense:
                 target = tr / (denom_val + Float32(DENOM_EPS))
                 target_eff = target if target >= Float32(CLIP_PROB_MIN) else Float32(CLIP_PROB_MIN)
                 log_clip_mask = Float32(1.0) if score_minus_lse >= Float32(CLIP_LOG_MIN) else Float32(0.0)
-                g = -target_eff * log_clip_mask * grad_scale
+                g = -target_eff * log_clip_mask * effective_grad_scale
 
                 local_sum = local_sum + g
                 pos = pos + Int32(128)
@@ -324,14 +334,14 @@ class ScoreGradDense:
                     target = tr / (denom_val + Float32(DENOM_EPS))
                     target_eff = target if target >= Float32(CLIP_PROB_MIN) else Float32(CLIP_PROB_MIN)
                     log_clip_mask = Float32(1.0) if score_minus_lse >= Float32(CLIP_LOG_MIN) else Float32(0.0)
-                    g = -target_eff * log_clip_mask * grad_scale
+                    g = -target_eff * log_clip_mask * effective_grad_scale
 
                     grad_signal = g - predict * sum_grad
-                    mPredict_b[seq_local, pos] = grad_signal
+                    mGradSignal_b[seq_local, pos] = grad_signal
                 else:
                     # masked / padding: grad_signal must be 0 — downstream
                     # GEMM multiplies by this directly and must not contaminate dQ/dK/dW.
-                    mPredict_b[seq_local, pos] = Float32(0.0)
+                    mGradSignal_b[seq_local, pos] = Float32(0.0)
                 pos = pos + Int32(128)
 
 
@@ -1981,6 +1991,10 @@ def dense_indexer_backward_sm100(
 
 
 def _build_cute_dsl_kernel(batch, max_seqlen_q, max_seqlen_k, heads, dim, sm_scale, block_I, ratio, is_varlen, has_q_causal_offsets):
+    import torch
+
+    from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
+    from cudnn.deepseek_sparse_attention.utils.runtime import resolve_stream
     from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
 
     if torch.cuda.get_device_capability()[0] < 10:
@@ -2024,7 +2038,7 @@ def _build_cute_dsl_kernel(batch, max_seqlen_q, max_seqlen_k, heads, dim, sm_sca
         the runtime ``grad_scale`` differs from the value seen at compile.
         """
         if compile_key not in _score_grad_compile_cache:
-            s = _resolve_stream(current_stream)
+            s = resolve_stream(current_stream)
             cuq_arg = to_cute_tensor(CuSeqlensQ) if CuSeqlensQ is not None else None
             cuk_arg = to_cute_tensor(CuSeqlensK) if CuSeqlensK is not None else None
             q_offsets_arg = to_cute_tensor(QCausalOffsets) if QCausalOffsets is not None else None
@@ -2063,7 +2077,7 @@ def _build_cute_dsl_kernel(batch, max_seqlen_q, max_seqlen_k, heads, dim, sm_sca
         int32 cu_seqlens tensors of shape (B+1,).
         """
         if compile_key not in _gemm_compile_cache:
-            s = _resolve_stream(current_stream)
+            s = resolve_stream(current_stream)
             cuq_arg = to_cute_tensor(CuSeqlensQ) if CuSeqlensQ is not None else None
             cuk_arg = to_cute_tensor(CuSeqlensK) if CuSeqlensK is not None else None
             q_offsets_arg = to_cute_tensor(QCausalOffsets) if QCausalOffsets is not None else None
@@ -2110,7 +2124,7 @@ def _build_cute_dsl_kernel(batch, max_seqlen_q, max_seqlen_k, heads, dim, sm_sca
             assert QCausalOffsets is not None, "offset-compiled kernel requires q_causal_offsets at runtime"
         else:
             assert QCausalOffsets is None, "non-offset compiled kernel must not receive q_causal_offsets"
-        s = _resolve_stream(current_stream)
+        s = resolve_stream(current_stream)
         _ensure_compiled_gemm(
             IndexQ,
             Weights,
@@ -2177,7 +2191,7 @@ def _build_cute_dsl_kernel(batch, max_seqlen_q, max_seqlen_k, heads, dim, sm_sca
             assert QCausalOffsets is not None, "offset-compiled kernel requires q_causal_offsets at runtime"
         else:
             assert QCausalOffsets is None, "non-offset compiled kernel must not receive q_causal_offsets"
-        s = _resolve_stream(current_stream)
+        s = resolve_stream(current_stream)
 
         # Kernel 1 (CuTe DSL): in-place overwrites IdxScoreRaw with grad_signal.
         # Grid = (max_seqlen_q, B, 1); CTAs past per-batch seqlen exit early.

@@ -2,19 +2,11 @@
 
 from __future__ import annotations
 
-import torch
 import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, const_expr
-
-from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
-from cudnn.deepseek_sparse_attention.utils.runtime import (
-    resolve_stream as _resolve_stream,
-    torch_stream_context as _torch_stream_context,
-)
-from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
 
 from .indexer_backward_sm90 import (
     CLIP_LOG_MIN,
@@ -71,7 +63,12 @@ class ScoreGradDenseSm90:
         max_seqlen_q: Int32,
         max_seqlen_k: Int32,
         stream,
+        mGradSignal=None,
+        mGradLoss=None,
     ):
+        if const_expr(mGradSignal is None):
+            mGradSignal = mIdxScoreRaw
+
         # BSHD:
         #   IdxScoreRaw/AttnScoreRaw: (B, S_q, S_k), IdxLSE/AttnL1Norm: (B, S_q)
         # THD:
@@ -84,6 +81,10 @@ class ScoreGradDenseSm90:
             mIdxScoreRaw = cute.make_tensor(
                 mIdxScoreRaw.iterator,
                 cute.select(mIdxScoreRaw.layout, mode=[1, 2, 0]),
+            )
+            mGradSignal = cute.make_tensor(
+                mGradSignal.iterator,
+                cute.select(mGradSignal.layout, mode=[1, 2, 0]),
             )
             mAttnScoreRaw = cute.make_tensor(
                 mAttnScoreRaw.iterator,
@@ -103,12 +104,14 @@ class ScoreGradDenseSm90:
 
         self.kernel_score_grad(
             mIdxScoreRaw,
+            mGradSignal,
             mAttnScoreRaw,
             mIdxLSE,
             mAttnL1Norm,
             mCuSeqlensQ,
             mCuSeqlensK,
             mQCausalOffsets,
+            mGradLoss,
             grad_scale,
             seqlen_k_pad,
             max_seqlen_q,
@@ -123,12 +126,14 @@ class ScoreGradDenseSm90:
     def kernel_score_grad(
         self,
         mIdxScoreRaw,
+        mGradSignal,
         mAttnScoreRaw,
         mIdxLSE,
         mAttnL1Norm,
         mCuSeqlensQ,
         mCuSeqlensK,
         mQCausalOffsets,
+        mGradLoss,
         grad_scale: Float32,
         seqlen_k_pad: Int32,
         seqlen_q_static: Int32,
@@ -164,17 +169,20 @@ class ScoreGradDenseSm90:
 
             if const_expr(is_varlen):
                 mIdxScore_b = cute.domain_offset((q_offset, Int32(0)), mIdxScoreRaw)
+                mGradSignal_b = cute.domain_offset((q_offset, Int32(0)), mGradSignal)
                 mAttnScore_b = cute.domain_offset((q_offset, Int32(0)), mAttnScoreRaw)
                 mIdxLSE_b = cute.domain_offset((q_offset,), mIdxLSE)
                 mAttnL1_b = cute.domain_offset((q_offset,), mAttnL1Norm)
             else:
                 mIdxScore_b = mIdxScoreRaw[None, None, batch_idx]
+                mGradSignal_b = mGradSignal[None, None, batch_idx]
                 mAttnScore_b = mAttnScoreRaw[None, None, batch_idx]
                 mIdxLSE_b = mIdxLSE[None, batch_idx]
                 mAttnL1_b = mAttnL1Norm[None, batch_idx]
 
             idx_lse_val = mIdxLSE_b[seq_local]
             attn_l1_val = mAttnL1_b[seq_local]
+            effective_grad_scale = grad_scale if const_expr(mGradLoss is None) else grad_scale * mGradLoss[0]
             LOG2E = Float32(1.4426950408889634)
 
             ratio = Int32(self.ratio)
@@ -195,7 +203,7 @@ class ScoreGradDenseSm90:
                 target = attn_raw / (attn_l1_val + Float32(EPS))
                 target_eff = target if target >= Float32(CLIP_PROB_MIN) else Float32(CLIP_PROB_MIN)
                 log_clip_mask = Float32(1.0) if score_minus_lse >= Float32(CLIP_LOG_MIN) else Float32(0.0)
-                local_sum = local_sum + (-target_eff * log_clip_mask * grad_scale)
+                local_sum = local_sum + (-target_eff * log_clip_mask * effective_grad_scale)
                 pos = pos + Int32(128)
 
             warp_sum = cute.arch.warp_reduction_sum(local_sum)
@@ -221,10 +229,10 @@ class ScoreGradDenseSm90:
                     target = attn_raw / (attn_l1_val + Float32(EPS))
                     target_eff = target if target >= Float32(CLIP_PROB_MIN) else Float32(CLIP_PROB_MIN)
                     log_clip_mask = Float32(1.0) if score_minus_lse >= Float32(CLIP_LOG_MIN) else Float32(0.0)
-                    g = -target_eff * log_clip_mask * grad_scale
-                    mIdxScore_b[seq_local, pos] = g - predict * sum_grad
+                    g = -target_eff * log_clip_mask * effective_grad_scale
+                    mGradSignal_b[seq_local, pos] = g - predict * sum_grad
                 else:
-                    mIdxScore_b[seq_local, pos] = Float32(0.0)
+                    mGradSignal_b[seq_local, pos] = Float32(0.0)
                 pos = pos + Int32(128)
 
 
@@ -270,6 +278,12 @@ def _build_cute_dsl_dense_kernel(
     is_varlen,
     has_q_causal_offsets,
 ):
+    import torch
+
+    from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
+    from cudnn.deepseek_sparse_attention.utils.runtime import resolve_stream, torch_stream_context
+    from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
+
     cap = torch.cuda.get_device_capability()[0]
     if cap < 9:
         raise RuntimeError(f"Requires SM90+ (got SM{cap}0)")
@@ -295,7 +309,7 @@ def _build_cute_dsl_dense_kernel(
 
     def _get_dummy_topk(device, current_stream=None):
         if dummy_topk_holder[0] is None or dummy_topk_holder[0].device != device:
-            with _torch_stream_context(current_stream):
+            with torch_stream_context(current_stream):
                 dummy_topk_holder[0] = torch.zeros(batch, seqlen, seqlen_k, device=device, dtype=torch.int32)
         return dummy_topk_holder[0]
 
@@ -312,7 +326,7 @@ def _build_cute_dsl_dense_kernel(
         QCausalOffsets,
         current_stream=None,
     ):
-        s = _resolve_stream(current_stream)
+        s = resolve_stream(current_stream)
         if gemm_key not in _dense_compile_cache:
             dummy_topk = _get_dummy_topk(IndexQ.device, current_stream=current_stream)
             cuq_arg = to_cute_tensor(CuSeqlensQ) if CuSeqlensQ is not None else None
@@ -356,7 +370,7 @@ def _build_cute_dsl_dense_kernel(
         current_stream=None,
     ):
         if score_grad_key not in _dense_score_grad_compile_cache:
-            s = _resolve_stream(current_stream)
+            s = resolve_stream(current_stream)
             cuq_arg = to_cute_tensor(CuSeqlensQ) if CuSeqlensQ is not None else None
             cuk_arg = to_cute_tensor(CuSeqlensK) if CuSeqlensK is not None else None
             q_offsets_arg = to_cute_tensor(QCausalOffsets) if QCausalOffsets is not None else None
@@ -395,7 +409,7 @@ def _build_cute_dsl_dense_kernel(
             assert QCausalOffsets is not None, "offset-compiled score-grad kernel requires q_causal_offsets at runtime"
         else:
             assert QCausalOffsets is None, "non-offset compiled score-grad kernel must not receive q_causal_offsets"
-        s = _resolve_stream(current_stream)
+        s = resolve_stream(current_stream)
         _ensure_compiled_score_grad(
             IdxScoreRaw,
             IdxLSE,
@@ -444,7 +458,7 @@ def _build_cute_dsl_dense_kernel(
         else:
             assert QCausalOffsets is None, "non-offset compiled kernel must not receive q_causal_offsets"
         dummy_topk = _get_dummy_topk(IndexQ.device, current_stream=current_stream)
-        s = _resolve_stream(current_stream)
+        s = resolve_stream(current_stream)
 
         _ensure_compiled(
             IndexQ,
@@ -526,7 +540,7 @@ def _build_cute_dsl_dense_kernel(
                 current_stream=current_stream,
             )
         else:
-            with _torch_stream_context(current_stream):
+            with torch_stream_context(current_stream):
                 dIndexK_f32 = torch.zeros_like(dIndexK, dtype=torch.float32)
             _run_gemm_only(
                 IndexQ,
@@ -541,7 +555,7 @@ def _build_cute_dsl_dense_kernel(
                 QCausalOffsets,
                 current_stream=current_stream,
             )
-            with _torch_stream_context(current_stream):
+            with torch_stream_context(current_stream):
                 dIndexK.copy_(dIndexK_f32)
 
     _run.score_grad = _run_score_grad_only

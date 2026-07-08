@@ -132,6 +132,27 @@ class SharedTensorDescTest(unittest.TestCase):
         self.assertEqual(desc.stride, ())
         self.assertEqual(desc.stride_order, ())
         self.assertEqual(desc.ndim, 0)
+        self.assertTrue(desc.is_compact())
+
+    def test_is_compact_uses_canonical_or_explicit_dimension_order(self):
+        row_major = self.tensor_desc.make_compact_tensor_desc(
+            dtype=_DataType.FLOAT,
+            shape=(2, 3, 4),
+        )
+        self.assertTrue(row_major.is_compact())
+        self.assertTrue(row_major.is_compact((2, 1, 0)))
+        self.assertFalse(row_major.is_compact((0, 1, 2)))
+
+        size_one = self.tensor_desc.TensorDesc(
+            dtype=_DataType.FLOAT,
+            shape=(2, 1, 4),
+            stride=(4, 17, 1),
+            stride_order=(2, 0, 1),
+        )
+        self.assertTrue(size_one.is_compact((2, 1, 0)))
+
+        with self.assertRaisesRegex(ValueError, "must be a permutation"):
+            row_major.is_compact((2, 2, 0))
 
     def test_compact_descriptor_preserves_order_for_zero_extents(self):
         desc = self.tensor_desc.make_compact_tensor_desc(

@@ -17,7 +17,7 @@ DSA_PARAM_MARKS = [
 ]
 
 DSA_SPARSE_ATTENTION_BACKWARD_PARAM_MARKS = [
-    pytest.mark.parametrize("head_dim", [512]),
+    pytest.mark.parametrize("head_dim", [512, 576]),
     pytest.mark.parametrize("head_dim_v", [512]),
     pytest.mark.parametrize("num_heads", [64]),
     pytest.mark.parametrize("topk", [512]),

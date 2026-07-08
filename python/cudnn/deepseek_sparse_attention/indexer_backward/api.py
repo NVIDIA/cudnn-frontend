@@ -17,6 +17,8 @@ from typing import Optional, Union
 import torch
 import cuda.bindings.driver as cuda
 
+from cudnn import data_type
+from cudnn._tensor_desc import make_compact_tensor_desc
 from cudnn.api_base import APIBase, TupleDict
 from cudnn.deepseek_sparse_attention.utils.runtime import (
     torch_stream_context as _torch_stream_context,
@@ -27,6 +29,7 @@ from .dense_indexer_backward_sm100 import dense_indexer_backward_sm100
 from .dense_indexer_backward_sm90 import dense_indexer_backward_sm90
 from .indexer_backward_sm100 import indexer_backward_sm100
 from .indexer_backward_sm90 import indexer_backward_sm90
+from .op import DenseIndexerBackwardOp, IndexerBackwardOp
 
 
 def _as_grad_loss_tensor(grad_loss: Union[float, torch.Tensor], device: torch.device) -> torch.Tensor:
@@ -161,18 +164,20 @@ class IndexerBackward(APIBase):
         self.idx_score_desc = self._make_tensor_desc(sample_index_score, name="sample_index_score")
         self.topk_desc = self._make_tensor_desc(sample_topk_indices, name="sample_topk_indices")
 
-        b, s_q, h, d = sample_index_q.shape
-        s_k = sample_index_k.shape[1]
-        topk = sample_topk_indices.shape[-1]
-        self.batch = b
-        self.seqlen = s_q
-        self.seqlen_k = s_k
-        self.heads = h
-        self.head_dim = d
-        self.topk = topk
-        self.sm_scale = float(sm_scale)
-        self.block_I = int(block_I)
-        self.topk_indices_global = bool(topk_indices_global)
+        self._op = IndexerBackwardOp(
+            index_q=self.iq_desc,
+            weights=self.w_desc,
+            index_k=self.ik_desc,
+            d_index_q=self.diq_desc,
+            d_weights=self.dw_desc,
+            d_index_k=self.dik_desc,
+            attn_score=self.attn_desc,
+            index_score=self.idx_score_desc,
+            topk_indices=self.topk_desc,
+            sm_scale=sm_scale,
+            block_i=block_I,
+            topk_indices_global=topk_indices_global,
+        )
 
     def check_support(self) -> bool:
         major, _ = torch.cuda.get_device_capability()
@@ -180,12 +185,7 @@ class IndexerBackward(APIBase):
             major != 9 and major < 10,
             f"IndexerBackward requires SM90 or SM100+, found SM{major}",
         )
-        self._check_dtype(self.iq_desc, torch.bfloat16, name="index_q")
-        self._check_dtype(self.w_desc, torch.bfloat16, name="weights")
-        self._check_dtype(self.ik_desc, torch.bfloat16, name="index_k")
-        self._check_dtype(self.attn_desc, torch.float32, name="attn_score")
-        self._check_dtype(self.idx_score_desc, torch.float32, name="index_score")
-        self._check_dtype(self.topk_desc, torch.int32, name="topk_indices")
+        self._op.check_support()
         self._is_supported = True
         return True
 
@@ -201,15 +201,15 @@ class IndexerBackward(APIBase):
         major, _ = torch.cuda.get_device_capability()
         kernel_factory = indexer_backward_sm90 if major == 9 else indexer_backward_sm100
         self._compiled_kernel = kernel_factory(
-            self.batch,
-            self.seqlen,
-            self.seqlen_k,
-            self.heads,
-            self.head_dim,
-            self.topk,
-            sm_scale=self.sm_scale,
-            block_I=self.block_I,
-            topk_indices_global=self.topk_indices_global,
+            self._op.batch,
+            self._op.seqlen_q,
+            self._op.seqlen_k,
+            self._op.heads,
+            self._op.head_dim,
+            self._op.topk,
+            sm_scale=self._op.sm_scale,
+            block_I=self._op.block_i,
+            topk_indices_global=self._op.topk_indices_global,
         )
 
     def execute(
@@ -231,7 +231,7 @@ class IndexerBackward(APIBase):
         # ``grad_scale`` is forwarded as a runtime ``Float32`` arg; the
         # compiled kernel is reused when loss_coeff changes for the same
         # cached tensor shape.
-        grad_scale = float(loss_coeff) / (int(self.batch) * int(self.seqlen))
+        grad_scale = float(loss_coeff) / (int(self._op.batch) * int(self._op.seqlen_q))
         grad_loss_tensor = _as_grad_loss_tensor(grad_loss, index_q.device)
         self._compiled_kernel(
             index_q,
@@ -290,31 +290,35 @@ class DenseIndexerBackward(APIBase):
         self.idx_score_desc = self._make_tensor_desc(sample_index_score, name="sample_index_score")
         self.idx_lse_desc = self._make_tensor_desc(sample_index_lse, name="sample_index_lse")
 
-        self.sm_scale = float(sm_scale)
-        self.block_I = int(block_I)
-        self.ratio = int(ratio)
-        self.is_thd = bool(is_thd)
-        self.has_q_causal_offsets = bool(has_q_causal_offsets)
-
-        if self.is_thd:
-            total_q, heads, head_dim = sample_index_q.shape
-            total_k = sample_index_k.shape[0]
-            if batch is None or max_seqlen_q is None or max_seqlen_k is None:
-                raise ValueError("THD dense indexer backward requires batch and max_seqlen_q/k")
-            self.batch = int(batch)
-            self.normalization_tokens = int(total_q)
-            self.total_k = int(total_k)
-            self.max_seqlen_q = int(max_seqlen_q)
-            self.max_seqlen_k = int(max_seqlen_k)
-        else:
-            b, seqlen_q, heads, head_dim = sample_index_q.shape
-            self.batch = int(b)
-            self.normalization_tokens = int(b * seqlen_q)
-            self.total_k = int(b * sample_index_k.shape[1])
-            self.max_seqlen_q = int(seqlen_q)
-            self.max_seqlen_k = int(sample_index_k.shape[1])
-        self.heads = int(heads)
-        self.head_dim = int(head_dim)
+        is_thd = bool(is_thd)
+        if is_thd and batch is None:
+            raise ValueError("THD dense indexer backward requires batch")
+        inferred_batch = int(batch) if is_thd else int(sample_index_q.shape[0])
+        cu_seqlens_q_desc = make_compact_tensor_desc(dtype=data_type.INT32, shape=(inferred_batch + 1,), name="sample_cu_seqlens_q") if is_thd else None
+        cu_seqlens_k_desc = make_compact_tensor_desc(dtype=data_type.INT32, shape=(inferred_batch + 1,), name="sample_cu_seqlens_k") if is_thd else None
+        q_causal_offsets_desc = (
+            make_compact_tensor_desc(dtype=data_type.INT32, shape=(inferred_batch,), name="sample_q_causal_offsets") if has_q_causal_offsets else None
+        )
+        self._op = DenseIndexerBackwardOp(
+            index_q=self.iq_desc,
+            weights=self.w_desc,
+            index_k=self.ik_desc,
+            d_index_q=self.diq_desc,
+            d_weights=self.dw_desc,
+            d_index_k=self.dik_desc,
+            attn_score=self.attn_desc,
+            attn_l1norm=self.attn_denom_desc,
+            index_score=self.idx_score_desc,
+            index_lse=self.idx_lse_desc,
+            cu_seqlens_q=cu_seqlens_q_desc,
+            cu_seqlens_k=cu_seqlens_k_desc,
+            q_causal_offsets=q_causal_offsets_desc,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            sm_scale=sm_scale,
+            block_i=block_I,
+            ratio=ratio,
+        )
         self._uses_current_stream_pipeline = False
 
     def check_support(self) -> bool:
@@ -323,19 +327,7 @@ class DenseIndexerBackward(APIBase):
             major != 9 and major < 10,
             f"DenseIndexerBackward requires SM90 or SM100+, found SM{major}",
         )
-        self._check_dtype(self.iq_desc, torch.bfloat16, name="index_q")
-        self._check_dtype(self.w_desc, torch.bfloat16, name="weights")
-        self._check_dtype(self.ik_desc, torch.bfloat16, name="index_k")
-        self._check_dtype(self.diq_desc, torch.bfloat16, name="d_index_q")
-        self._check_dtype(self.dw_desc, torch.bfloat16, name="d_weights")
-        self._check_dtype(self.dik_desc, [torch.bfloat16, torch.float32], name="d_index_k")
-        self._check_dtype(self.attn_desc, torch.float32, name="attn_score")
-        self._check_dtype(self.attn_denom_desc, torch.float32, name="attn_l1norm")
-        self._check_dtype(self.idx_score_desc, torch.float32, name="index_score")
-        self._check_dtype(self.idx_lse_desc, torch.float32, name="index_lse")
-        self._value_error_if(self.block_I <= 0, f"block_I must be positive, got {self.block_I}")
-        self._value_error_if(self.ratio < 1, f"ratio must be >= 1, got {self.ratio}")
-        self._value_error_if(self.heads < 64, f"DenseIndexerBackward requires heads >= 64, got {self.heads}")
+        self._op.check_support()
         self._is_supported = True
         return True
 
@@ -347,16 +339,16 @@ class DenseIndexerBackward(APIBase):
         kernel_factory = dense_indexer_backward_sm90 if major == 9 else dense_indexer_backward_sm100
         self._uses_current_stream_pipeline = major == 9
         self._compiled_kernel = kernel_factory(
-            self.batch,
-            self.max_seqlen_q,
-            self.max_seqlen_k,
-            self.heads,
-            self.head_dim,
-            sm_scale=self.sm_scale,
-            block_I=self.block_I,
-            ratio=self.ratio,
-            is_varlen=self.is_thd,
-            has_q_causal_offsets=self.has_q_causal_offsets,
+            self._op.batch,
+            self._op.max_seqlen_q,
+            self._op.max_seqlen_k,
+            self._op.heads,
+            self._op.head_dim,
+            sm_scale=self._op.sm_scale,
+            block_I=self._op.block_i,
+            ratio=self._op.ratio,
+            is_varlen=self._op.is_thd,
+            has_q_causal_offsets=self._op.q_causal_offsets is not None,
         )
 
     def execute(
@@ -381,7 +373,7 @@ class DenseIndexerBackward(APIBase):
         backend_stream = None if self._uses_current_stream_pipeline else current_stream
         with _torch_stream_context(backend_stream):
             grad_loss_value = float(_as_grad_loss_tensor(grad_loss, index_q.device).item())
-            grad_scale = float(loss_coeff) * grad_loss_value / max(int(self.normalization_tokens), 1)
+            grad_scale = float(loss_coeff) * grad_loss_value / max(int(self._op.normalization_tokens), 1)
 
             # Dense backward's dK path uses atomic/bulk reductions into fp32.
             d_index_k_target = d_index_k
@@ -500,7 +492,7 @@ def indexer_backward_wrapper(
             block_I=block_I,
             topk_indices_global=topk_indices_global,
         )
-        assert obj.check_support()
+        obj.check_support()
         obj.compile()
         _cache_of_IndexerBackwardObjects[key] = obj
 
@@ -647,7 +639,7 @@ def dense_indexer_backward_wrapper(
             max_seqlen_k=max_k,
             has_q_causal_offsets=q_causal_offsets is not None,
         )
-        assert obj.check_support()
+        obj.check_support()
         obj.compile()
         _cache_of_DenseIndexerBackwardObjects[key] = obj
 

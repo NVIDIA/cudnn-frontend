@@ -1,13 +1,20 @@
-from .api import (
-    IndexerTopK,
-    indexer_top_k_wrapper,
-    local_to_global_wrapper,
-    compactify_wrapper,
-)
+"""Lazy Torch API and framework-neutral indexer top-K exports.
 
-__all__ = [
-    "IndexerTopK",
-    "indexer_top_k_wrapper",
-    "local_to_global_wrapper",
-    "compactify_wrapper",
-]
+JAX APIs are exported through :mod:`cudnn.jax`.
+"""
+
+from ..._operation_api import make_operation_api
+
+__all__, __getattr__, __dir__ = make_operation_api(
+    globals(),
+    exports={
+        "op": ("IndexerTopKOp", "bucket_num_cols"),
+        "api": (
+            "IndexerTopK",
+            "compactify_wrapper",
+            "indexer_top_k_wrapper",
+            "local_to_global_wrapper",
+        ),
+    },
+    submodules=("api", "op"),
+)

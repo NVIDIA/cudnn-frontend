@@ -11,6 +11,28 @@ from typing import TypeVar
 AxisValueT = TypeVar("AxisValueT")
 
 
+def mode_from_layout(layout: str, *, kernel_axes: str) -> tuple[int, ...]:
+    """Map named kernel axes to their positions in a public JAX layout.
+
+    Axis names are single, case-sensitive characters. The returned mapping
+    follows ``mode[kernel_axis] = public_axis``.
+    """
+
+    if not isinstance(layout, str):
+        raise TypeError(f"layout must be a string, got {layout!r}")
+    if not isinstance(kernel_axes, str):
+        raise TypeError(f"kernel_axes must be a string, got {kernel_axes!r}")
+    if len(layout) != len(kernel_axes):
+        raise ValueError(f"layout rank must match kernel_axes: got {layout!r} and {kernel_axes!r}")
+    if len(set(layout)) != len(layout):
+        raise ValueError(f"layout axes must be unique, got {layout!r}")
+    if len(set(kernel_axes)) != len(kernel_axes):
+        raise ValueError(f"kernel_axes must be unique, got {kernel_axes!r}")
+    if set(layout) != set(kernel_axes):
+        raise ValueError(f"layout must contain exactly the axes in {kernel_axes!r}, got {layout!r}")
+    return tuple(layout.index(axis) for axis in kernel_axes)
+
+
 def normalize_mode(rank: int, mode: tuple[int, ...] | None = None) -> tuple[int, ...]:
     """Return and validate a kernel-axis to public-axis mapping.
 
@@ -105,6 +127,7 @@ def to_cutlass_layout(
 
 __all__ = [
     "compact_stride",
+    "mode_from_layout",
     "normalize_mode",
     "to_canonical_axes",
     "to_cutlass_layout",

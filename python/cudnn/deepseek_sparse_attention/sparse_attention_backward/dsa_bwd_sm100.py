@@ -148,7 +148,7 @@ class FlashAttentionDSABackwardSm100:
         self.compute_tmastore_dQ_stage = 1
 
     @staticmethod
-    def _get_workspace_size_LSE_OdO(q: int, d: int, h: int, b: int, acc_dtype: Type[cutlass.Numeric]):
+    def get_workspace_size_lse_odo(q: int, d: int, h: int, b: int, acc_dtype: Type[cutlass.Numeric]):
         # q is total seqlen, b=1
         d = (d + 7) // 8 * 8  # round up to 8
         q = (q + 7) // 8 * 8  # round up to 8
@@ -161,12 +161,16 @@ class FlashAttentionDSABackwardSm100:
         return (b, h, q, workspace_bytes)
 
     @staticmethod
-    def _get_workspace_size_dKV(k: int, d: int, b: int, acc_dtype: Type[cutlass.Numeric]):
+    def get_workspace_size_dkv(k: int, d: int, b: int, acc_dtype: Type[cutlass.Numeric]):
         d = (d + 7) // 8 * 8  # round up to 8
         k = (k + 7) // 8 * 8  # round up to 8
         # FP32 versions of dKV
         workspace_bytes = d * acc_dtype.width // 8
         return (b, 1, k, workspace_bytes)
+
+    # Compatibility aliases for the existing Torch interface.
+    _get_workspace_size_LSE_OdO = get_workspace_size_lse_odo
+    _get_workspace_size_dKV = get_workspace_size_dkv
 
     def get_workspace_tensor(
         self,
@@ -563,25 +567,24 @@ class FlashAttentionDSABackwardSm100:
             stream=stream,
         )
 
-        if cutlass.const_expr(self.same_hdim_kv):
-            dSink_grid = (
-                cute.ceil_div(problem_shape[0], self.dSink_block_q),
-                problem_shape[3][0],
-                problem_shape[3][1],
-            )
-            self.sum_dSink(
-                sum_OdO,
-                scaled_LSE,
-                mAttnSink,
-                mdSink,
-                problem_shape,
-            ).launch(
-                grid=dSink_grid,
-                block=[self.dSink_num_threads, 1, 1],
-                cluster=[1, 1, 1],
-                stream=stream,
-                min_blocks_per_mp=1,
-            )
+        dSink_grid = (
+            cute.ceil_div(problem_shape[0], self.dSink_block_q),
+            problem_shape[3][0],
+            problem_shape[3][1],
+        )
+        self.sum_dSink(
+            sum_OdO,
+            scaled_LSE,
+            mAttnSink,
+            mdSink,
+            problem_shape,
+        ).launch(
+            grid=dSink_grid,
+            block=[self.dSink_num_threads, 1, 1],
+            cluster=[1, 1, 1],
+            stream=stream,
+            min_blocks_per_mp=1,
+        )
 
     @cute.kernel
     def convert(
@@ -665,21 +668,18 @@ class FlashAttentionDSABackwardSm100:
                     lse_bhq = lse[bidy, (idx_q + offset, bidz)]
                     sum_OdO_bhq = sum_OdO_scale * acc
 
-                    if cutlass.const_expr(self.same_hdim_kv):
-                        attn_sink_bh = attn_sink[bidy, (0, bidz)]
+                    attn_sink_bh = attn_sink[bidy, (0, bidz)]
 
-                        log2_e = -lse_scale
-                        lse_log2 = lse_bhq * log2_e
-                        sink_log2 = attn_sink_bh * log2_e
-                        lse_max_log2 = cute.arch.fmax(lse_log2, sink_log2)
-                        sum_exp2 = Float32(cute.math.exp2(lse_log2 - lse_max_log2) + cute.math.exp2(sink_log2 - lse_max_log2))
-                        lse_with_sink_log2 = lse_max_log2 + cute.math.log2(sum_exp2)
-                        scaled_lse_bhq = -lse_with_sink_log2
+                    log2_e = -lse_scale
+                    lse_log2 = lse_bhq * log2_e
+                    sink_log2 = attn_sink_bh * log2_e
+                    lse_max_log2 = cute.arch.fmax(lse_log2, sink_log2)
+                    sum_exp2 = Float32(cute.math.exp2(lse_log2 - lse_max_log2) + cute.math.exp2(sink_log2 - lse_max_log2))
+                    lse_with_sink_log2 = lse_max_log2 + cute.math.log2(sum_exp2)
+                    scaled_lse_bhq = -lse_with_sink_log2
 
-                        if lse_bhq == Float32(float("inf")):
-                            scaled_lse_bhq = Float32(float("-inf"))
-                    else:
-                        scaled_lse_bhq = lse_scale * lse_bhq
+                    if lse_bhq == Float32(float("inf")):
+                        scaled_lse_bhq = Float32(float("-inf"))
 
                     sum_OdO[bidy, (idx_q + offset, bidz)] = sum_OdO_bhq
                     scaled_lse[bidy, (idx_q + offset, bidz)] = scaled_lse_bhq
@@ -865,10 +865,14 @@ class FlashAttentionDSABackwardSm100:
 
         if cutlass.const_expr(mTopkLength is not None):
             topk = mTopkLength[token_idx]
+            topk = cutlass.max(Int32(0), cutlass.min(topk, Int32(self.max_topk)))
         else:
             topk = mTopkIdxs.shape[0]
 
-        tile_count = cute.ceil_div(topk, self.block_tile)
+        # Keep every warp role on the same balanced one-tile pipeline when a
+        # query has no selected KV rows. The partial-tile predicates below
+        # turn that synthetic tile into all zeros.
+        tile_count = cutlass.max(Int32(1), cute.ceil_div(topk, self.block_tile))
 
         if warp_idx == self.load_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_load)
@@ -1296,7 +1300,7 @@ class FlashAttentionDSABackwardSm100:
         load_mma_K_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.load_mma_K_stage)
 
         tile_index = tile_count - 1
-        full_tiles = (topk % self.block_tile) == 0
+        full_tiles = (topk > 0) and ((topk % self.block_tile) == 0)
         rows_per_warp = self.block_tile // self.num_load_KV_warps
         rTopkIdx = cute.make_rmem_tensor((rows_per_warp,), cutlass.Int32)
 
@@ -2127,7 +2131,7 @@ class FlashAttentionDSABackwardSm100:
         rTopkIdx = cute.make_rmem_tensor((8,), cutlass.Int32)
         if cutlass.const_expr(not self.same_hdim_kv):
             rTopkIdx_64 = cute.make_rmem_tensor((8,), cutlass.Int32)
-        full_tiles = (topk % self.block_tile) == 0
+        full_tiles = (topk > 0) and ((topk % self.block_tile) == 0)
         while tile_index >= 0:
             # Preload topk indices into rmem (shared across all 4 store_dKV calls)
             for i in cutlass.range_constexpr(8):

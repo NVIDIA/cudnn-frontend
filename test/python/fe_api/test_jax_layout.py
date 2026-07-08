@@ -43,6 +43,45 @@ class JaxLayoutTest(unittest.TestCase):
             (2, 0, 1),
         )
 
+    def test_named_layout_maps_kernel_axes_to_public_axes(self):
+        cases = (
+            ("LMK", "MKL", (1, 2, 0)),
+            ("LKM", "MKL", (2, 1, 0)),
+            ("LNK", "NKL", (1, 2, 0)),
+            ("LKN", "NKL", (2, 1, 0)),
+            ("LMN", "MNL", (1, 2, 0)),
+            ("LNM", "MNL", (2, 1, 0)),
+        )
+        for public_layout, kernel_axes, expected in cases:
+            with self.subTest(public_layout=public_layout, kernel_axes=kernel_axes):
+                self.assertEqual(
+                    self.layout.mode_from_layout(
+                        public_layout,
+                        kernel_axes=kernel_axes,
+                    ),
+                    expected,
+                )
+
+    def test_named_layout_requires_strings(self):
+        with self.assertRaisesRegex(TypeError, "layout must be a string"):
+            self.layout.mode_from_layout(("L", "M", "K"), kernel_axes="MKL")
+        with self.assertRaisesRegex(TypeError, "kernel_axes must be a string"):
+            self.layout.mode_from_layout("LMK", kernel_axes=("M", "K", "L"))
+
+    def test_named_layout_rejects_rank_mismatch(self):
+        with self.assertRaisesRegex(ValueError, "layout rank must match"):
+            self.layout.mode_from_layout("MK", kernel_axes="MKL")
+
+    def test_named_layout_rejects_duplicate_axes(self):
+        with self.assertRaisesRegex(ValueError, "layout axes must be unique"):
+            self.layout.mode_from_layout("MML", kernel_axes="MKL")
+        with self.assertRaisesRegex(ValueError, "kernel_axes must be unique"):
+            self.layout.mode_from_layout("MKL", kernel_axes="MML")
+
+    def test_named_layout_requires_the_exact_axis_set(self):
+        with self.assertRaisesRegex(ValueError, "layout must contain exactly"):
+            self.layout.mode_from_layout("MKN", kernel_axes="MKL")
+
     def test_noncompact_stride_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "cannot represent non-compact stride"):
             self.layout.to_cutlass_layout(

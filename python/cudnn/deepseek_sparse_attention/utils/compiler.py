@@ -18,18 +18,39 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-import torch
-
 # (compute_capability) → cute DSL --gpu-arch flag value.
 # H100, B200/B300, and sm_100f require architecture-specific variants because
 # the kernels use TMA / tcgen05 instructions that are only guaranteed to lower
 # correctly under the matching SASS gencode.
 _ARCH_MAP = {
-    (9, 0): "sm_90a",  # Hopper H100
-    (10, 0): "sm_100a",  # Blackwell B200
-    (10, 3): "sm_103a",  # Blackwell Ultra B300
-    (10, 7): "sm_100f",
+    90: "sm_90a",  # Hopper H100
+    100: "sm_100a",  # Blackwell B200
+    103: "sm_103a",  # Blackwell Ultra B300
+    107: "sm_100f",
 }
+
+
+def gpu_arch_flag_for_compute_capability(compute_capability: int) -> str:
+    """Return the CuTe architecture flag for an explicit compilation target."""
+
+    if isinstance(compute_capability, bool) or not isinstance(compute_capability, int):
+        raise TypeError(f"compute_capability must be an int, got {type(compute_capability).__name__}")
+    try:
+        return _ARCH_MAP[compute_capability]
+    except KeyError as error:
+        raise RuntimeError(
+            f"Unsupported GPU compute capability SM{compute_capability} for DSA CuTe kernels. "
+            "Add it to deepseek_sparse_attention/utils/compiler.py::_ARCH_MAP."
+        ) from error
+
+
+def compile_options_for_target(compute_capability: int, extra: str = "") -> str:
+    """Build CuTe compile options for a framework-supplied GPU target."""
+
+    parts = ["--enable-tvm-ffi", f"--gpu-arch {gpu_arch_flag_for_compute_capability(compute_capability)}"]
+    if extra:
+        parts.append(extra)
+    return " ".join(parts)
 
 
 @lru_cache(maxsize=None)
@@ -39,15 +60,12 @@ def gpu_arch_flag() -> str:
     Cached because torch.cuda.get_device_capability() is cheap but the
     function gets called inside every cute.compile site.
     """
+    import torch
+
     if not torch.cuda.is_available():
         raise RuntimeError("cute.compile requires CUDA; no GPU available")
-    cap = torch.cuda.get_device_capability()
-    arch = _ARCH_MAP.get(cap)
-    if arch is None:
-        raise RuntimeError(
-            f"Unsupported GPU compute capability {cap} for DSA CuTe kernels. " f"Add it to deepseek_sparse_attention/utils/compiler.py::_ARCH_MAP."
-        )
-    return arch
+    major, minor = torch.cuda.get_device_capability()
+    return gpu_arch_flag_for_compute_capability(major * 10 + minor)
 
 
 def compile_options(extra: str = "") -> str:
@@ -59,7 +77,8 @@ def compile_options(extra: str = "") -> str:
     Example:
         cute.compile(..., options=compile_options("--opt-level 3"))
     """
-    parts = ["--enable-tvm-ffi", f"--gpu-arch {gpu_arch_flag()}"]
+    arch = gpu_arch_flag()
+    parts = ["--enable-tvm-ffi", f"--gpu-arch {arch}"]
     if extra:
         parts.append(extra)
     return " ".join(parts)

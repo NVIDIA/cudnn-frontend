@@ -111,6 +111,26 @@ class TensorDesc(Generic[DTypeT]):
             init_value=init_value,
         )
 
+    def is_compact(self, stride_order: tuple[int, ...] | None = None) -> bool:
+        """Return whether the descriptor is contiguous in the given order.
+
+        Size-one dimensions may carry any non-negative stride because they do
+        not change the addressed storage. When no order is supplied, the
+        descriptor's canonical ``stride_order`` is used.
+        """
+
+        order = self.stride_order if stride_order is None else self._integer_tuple(stride_order, "stride_order")
+        if len(order) != self.ndim or tuple(sorted(order)) != tuple(range(self.ndim)):
+            raise ValueError(f"Stride order must be a permutation of [0, {self.ndim - 1}], got {order}")
+
+        expected_stride = 1
+        for dimension in order:
+            size = self.shape[dimension]
+            if size != 1 and self.stride[dimension] != expected_stride:
+                return False
+            expected_stride *= max(size, 1)
+        return True
+
 
 def make_compact_tensor_desc(
     *,

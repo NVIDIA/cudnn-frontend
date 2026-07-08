@@ -9,27 +9,26 @@ indices. BSHD-shaped inputs are flattened batch-major before launch.
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import TYPE_CHECKING, Optional, Tuple
 
-import torch
 import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, const_expr
 
-from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
-from cudnn.deepseek_sparse_attention.utils.runtime import (
-    device_major,
-    resolve_stream as _resolve_stream,
-)
-from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor as _to_cute
+if TYPE_CHECKING:
+    import torch
 
 WARPS_PER_CTA = 4
 ROWS_PER_CTA = WARPS_PER_CTA  # One warp per row.
 
 
 def is_available() -> bool:
+    import torch
+
+    from cudnn.deepseek_sparse_attention.utils.runtime import device_major
+
     return torch.cuda.is_available() and device_major() >= 9
 
 
@@ -124,6 +123,8 @@ _compile_cache: dict[tuple, object] = {}
 
 
 def _compile_or_fetch(key, kernel_obj, *args):
+    from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
+
     if key not in _compile_cache:
         _compile_cache[key] = cute.compile(kernel_obj, *args, options=compile_options("--opt-level 3"))
     return _compile_cache[key]
@@ -139,6 +140,11 @@ def compactify(
     batch-major to (B*S, K), matching DSA sparse attention's flat top-K
     layout. Returns (indices, topk_length).
     """
+    import torch
+
+    from cudnn.deepseek_sparse_attention.utils.runtime import resolve_stream as _resolve_stream
+    from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor as _to_cute
+
     if not is_available():
         raise RuntimeError("compactify requires SM90+ CUDA device")
     if idxs.dtype != torch.int32:

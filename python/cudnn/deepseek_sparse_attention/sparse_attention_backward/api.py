@@ -12,9 +12,22 @@ from typing import Optional, Tuple
 import torch
 import cuda.bindings.driver as cuda
 
+from cudnn import data_type
 from cudnn.api_base import APIBase, TupleDict
 
 from . import _interface_sm100 as _iface_sm100
+from .op import SparseAttentionBackwardOp
+
+
+def _compact_for_kernel(desc):
+    """Describe tensors that the Torch backends normalize before lowering."""
+
+    return desc.compact_like(
+        cudnn_dtype=desc.cudnn_dtype,
+        shape=desc.shape,
+        name=desc.name,
+        init_value=desc.init_value,
+    )
 
 
 class SparseAttentionBackward(APIBase):
@@ -42,33 +55,76 @@ class SparseAttentionBackward(APIBase):
         self.attn_sink_desc = self._make_tensor_desc(sample_attn_sink, name="sample_attn_sink")
         self.topk_idxs_desc = self._make_tensor_desc(sample_topk_idxs, name="sample_topk_idxs")
         self.topk_length_desc = self._make_tensor_desc(sample_topk_length, name="sample_topk_length")
-        self.block_tile = int(block_tile)
+        self.dq_desc = (
+            self._make_tensor_desc(sample_dq, name="sample_dq")
+            if sample_dq is not None
+            else self.q_desc.compact_like(
+                cudnn_dtype=self.q_desc.cudnn_dtype,
+                shape=self.q_desc.shape,
+                name="sample_dq",
+            )
+        )
+        self.dkv_desc = (
+            self._make_tensor_desc(sample_dkv, name="sample_dkv")
+            if sample_dkv is not None
+            else self.kv_desc.compact_like(
+                cudnn_dtype=self.kv_desc.cudnn_dtype,
+                shape=self.kv_desc.shape,
+                name="sample_dkv",
+            )
+        )
+        self.d_sink_desc = self.attn_sink_desc.compact_like(
+            cudnn_dtype=data_type.FLOAT,
+            shape=self.attn_sink_desc.shape,
+            name="sample_d_sink",
+        )
+        self._op = SparseAttentionBackwardOp(
+            q=_compact_for_kernel(self.q_desc),
+            kv=_compact_for_kernel(self.kv_desc),
+            output=_compact_for_kernel(self.out_desc),
+            doutput=_compact_for_kernel(self.dout_desc),
+            lse=_compact_for_kernel(self.lse_desc),
+            attn_sink=self.attn_sink_desc,
+            topk_idxs=self.topk_idxs_desc,
+            topk_length=self.topk_length_desc,
+            dq=self.dq_desc,
+            dkv=self.dkv_desc,
+            d_sink=self.d_sink_desc,
+            softmax_scale=softmax_scale,
+            block_tile=block_tile,
+        )
+        self.block_tile = self._op.block_tile
         self.softmax_scale = softmax_scale
 
     def check_support(self) -> bool:
-        major, _ = torch.cuda.get_device_capability()
+        major, minor = torch.cuda.get_device_capability(self.q_desc.device)
+        compute_capability = major * 10 + minor
         self._runtime_error_if(
-            major < 9,
-            f"SparseAttentionBackward requires SM90+, found SM{major}",
+            compute_capability < 90,
+            f"SparseAttentionBackward requires SM90+, found SM{compute_capability}",
         )
-        self._value_error_if(
-            self.q_desc.ndim != 3,
-            f"Q must be 3-D (total_S_q, H, D), got {self.q_desc.shape}",
-        )
-        self._value_error_if(
-            self.kv_desc.ndim != 2,
-            f"KV must be 2-D (total_S_kv, D), got {self.kv_desc.shape}",
-        )
-        self._check_dtype(self.q_desc, [torch.float16, torch.bfloat16], name="Q")
-        self._check_dtype(
-            self.kv_desc,
-            self.q_desc.dtype,
-            name="KV",
-            extra_error_msg="KV must have same dtype as Q",
-        )
-        self._check_dtype(self.lse_desc, torch.float32, name="LSE")
-        self._check_dtype(self.attn_sink_desc, torch.float32, name="attn_sink")
-        self._check_dtype(self.topk_idxs_desc, torch.int32, name="topk_idxs")
+        self._op.check_support()
+        if compute_capability >= 100 and self.q_desc.cudnn_dtype != data_type.BFLOAT16:
+            raise ValueError("SparseAttentionBackward on SM100+ currently requires bfloat16 inputs")
+
+        devices = {
+            desc.device
+            for desc in (
+                self.q_desc,
+                self.kv_desc,
+                self.out_desc,
+                self.dout_desc,
+                self.lse_desc,
+                self.attn_sink_desc,
+                self.topk_idxs_desc,
+                self.topk_length_desc,
+                self.dq_desc,
+                self.dkv_desc,
+                self.d_sink_desc,
+            )
+            if desc is not None
+        }
+        self._value_error_if(len(devices) != 1, f"All tensors must be on the same device, got {sorted(map(str, devices))}")
 
         self._is_supported = True
         return True
@@ -94,8 +150,8 @@ class SparseAttentionBackward(APIBase):
         softmax_scale: Optional[float] = None,
         current_stream: Optional[cuda.CUstream] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        major, _ = torch.cuda.get_device_capability()
-        scale = self.softmax_scale if softmax_scale is None else softmax_scale
+        major, _ = torch.cuda.get_device_capability(q.device)
+        scale = self._op.softmax_scale if softmax_scale is None else softmax_scale
         if major == 9:
             from . import _interface_sm90 as _iface_sm90
 
@@ -180,7 +236,7 @@ def sparse_attention_backward_wrapper(
             softmax_scale=softmax_scale,
             block_tile=block_tile,
         )
-        assert obj.check_support()
+        obj.check_support()
         obj.compile()
         _cache_of_SparseAttentionBackwardObjects[key] = obj
 

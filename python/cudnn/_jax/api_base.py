@@ -15,6 +15,7 @@ from .layout import compact_stride, normalize_mode, to_canonical_axes, to_cutlas
 
 _DEVICE_COMPATIBILITY_CHECKS_DISABLED = False
 _DEVICE_COMPATIBILITY_CHECK_DISABLE_HINT = "Call cudnn.jax.disable_device_compatibility_checks(True) before tracing to allow AOT or remote compilation."
+_TARGET_COMPUTE_CAPABILITY_HINT = "Pass target_compute_capability explicitly when tracing for AOT or on a host without the target GPU."
 
 
 def disable_device_compatibility_checks(disabled: bool) -> None:
@@ -81,6 +82,107 @@ class JaxApiBase(ABC):
     """Common tensor metadata, validation, and CuTe binding for JAX adapters."""
 
     @staticmethod
+    def _device_compute_capability(device: Any, operation_name: str) -> int:
+        """Normalize JAX's device capability metadata to ``major * 10 + minor``."""
+
+        reported = getattr(device, "compute_capability", None)
+        try:
+            if isinstance(reported, (tuple, list)):
+                if len(reported) < 2:
+                    raise ValueError
+                major, minor = int(reported[0]), int(reported[1])
+            else:
+                text = str(reported)
+                if "." in text:
+                    major_text, minor_text = text.split(".", 1)
+                    major, minor = int(major_text), int(minor_text)
+                else:
+                    capability = int(text)
+                    major, minor = divmod(capability, 10)
+            if major < 0 or minor < 0 or minor > 9:
+                raise ValueError
+        except (TypeError, ValueError) as error:
+            raise RuntimeError(f"{operation_name}: JAX reported an invalid compute capability {reported!r} for {device}") from error
+        return major * 10 + minor
+
+    @staticmethod
+    def _local_gpu_capabilities(operation_name: str) -> tuple[tuple[Any, int], ...]:
+        import jax
+
+        try:
+            devices = tuple(jax.local_devices(backend="gpu"))
+        except RuntimeError as error:
+            raise RuntimeError(f"{operation_name}: JAX could not discover a local GPU") from error
+        return tuple((device, JaxApiBase._device_compute_capability(device, operation_name)) for device in devices)
+
+    @staticmethod
+    def _compute_capability_family(
+        compute_capability: int,
+        supported_compute_capabilities: tuple[int, ...],
+    ) -> int | None:
+        compatible = tuple(capability for capability in supported_compute_capabilities if capability <= compute_capability)
+        return max(compatible, default=None)
+
+    @staticmethod
+    def _resolve_compute_capability(
+        target_compute_capability: int | None,
+        supported_compute_capabilities: tuple[int, ...],
+        operation_name: str,
+    ) -> int:
+        """Resolve an exact JAX compilation target for a multi-arch adapter.
+
+        ``supported_compute_capabilities`` lists the exact CuTe compilation
+        targets implemented by the adapter. The returned value remains exact
+        (for example ``103``) so the compiler selects the matching target.
+        With compatibility checks enabled, an explicit target must match every
+        local GPU exactly. Disable checks for cross-compilation.
+        """
+
+        supported = tuple(sorted(set(supported_compute_capabilities)))
+        if not supported or any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in supported):
+            raise ValueError(f"supported_compute_capabilities must contain positive integers, got {supported_compute_capabilities!r}")
+
+        if target_compute_capability is not None:
+            if isinstance(target_compute_capability, bool) or not isinstance(target_compute_capability, int):
+                raise TypeError(f"target_compute_capability must be an int or None, got {type(target_compute_capability).__name__}")
+            if target_compute_capability <= 0:
+                raise ValueError(f"target_compute_capability must be positive, got {target_compute_capability}")
+            if target_compute_capability not in supported:
+                supported_text = ", ".join(f"SM{value}" for value in supported)
+                raise ValueError(f"{operation_name} has no kernel for SM{target_compute_capability}; supported targets are {supported_text}")
+            if _DEVICE_COMPATIBILITY_CHECKS_DISABLED:
+                return target_compute_capability
+
+            local = JaxApiBase._local_gpu_capabilities(operation_name)
+            if not local:
+                raise RuntimeError(
+                    f"{operation_name} targets SM{target_compute_capability}, but no local JAX GPU is available. " f"{_DEVICE_COMPATIBILITY_CHECK_DISABLE_HINT}"
+                )
+            mismatched = tuple((device, capability) for device, capability in local if capability != target_compute_capability)
+            if mismatched:
+                found = ", ".join(f"{device} (SM{capability})" for device, capability in mismatched)
+                raise RuntimeError(f"{operation_name} targets SM{target_compute_capability}, but found {found}. " f"{_DEVICE_COMPATIBILITY_CHECK_DISABLE_HINT}")
+            return target_compute_capability
+
+        try:
+            local = JaxApiBase._local_gpu_capabilities(operation_name)
+        except RuntimeError as error:
+            raise RuntimeError(f"{error}. {_TARGET_COMPUTE_CAPABILITY_HINT}") from error
+        if not local:
+            raise RuntimeError(f"{operation_name}: no local JAX GPU is available. {_TARGET_COMPUTE_CAPABILITY_HINT}")
+
+        capabilities = tuple(sorted({capability for _, capability in local}))
+        if len(capabilities) != 1:
+            found = ", ".join(f"SM{capability}" for capability in capabilities)
+            raise RuntimeError(f"{operation_name}: local JAX GPUs have heterogeneous targets ({found}). {_TARGET_COMPUTE_CAPABILITY_HINT}")
+
+        resolved = capabilities[0]
+        if resolved not in supported:
+            supported_text = ", ".join(f"SM{value}" for value in supported)
+            raise RuntimeError(f"{operation_name} has no kernel for SM{resolved}; supported targets are {supported_text}")
+        return resolved
+
+    @staticmethod
     def _check_device_compatibility(
         *,
         minimum_compute_capability: int,
@@ -91,38 +193,28 @@ class JaxApiBase(ABC):
         if _DEVICE_COMPATIBILITY_CHECKS_DISABLED:
             return
 
-        import jax
-
         def compatibility_error(reason: str) -> RuntimeError:
             return RuntimeError(f"{operation_name} requires SM{minimum_compute_capability}+, {reason}. " f"{_DEVICE_COMPATIBILITY_CHECK_DISABLE_HINT}")
 
         try:
-            devices = tuple(jax.local_devices(backend="gpu"))
+            devices = JaxApiBase._local_gpu_capabilities(operation_name)
         except RuntimeError as error:
-            raise compatibility_error("but JAX could not discover a local GPU") from error
+            reason = str(error)
+            prefix = f"{operation_name}: "
+            if reason.startswith(prefix):
+                reason = reason[len(prefix) :]
+            raise compatibility_error(f"but {reason}") from error
 
         if not devices:
             raise compatibility_error("but no local JAX GPU is available")
 
-        minimum_major, minimum_minor = divmod(minimum_compute_capability, 10)
         incompatible = []
-        for device in devices:
-            reported_capability = getattr(device, "compute_capability", None)
-            try:
-                components = str(reported_capability).split(".")
-                if len(components) != 2:
-                    raise ValueError
-                major, minor = (int(value) for value in components)
-                if major < 0 or minor < 0:
-                    raise ValueError
-            except (TypeError, ValueError) as error:
-                raise compatibility_error(f"but JAX reported an invalid compute capability {reported_capability!r} for {device}") from error
-
-            if (major, minor) < (minimum_major, minimum_minor):
-                incompatible.append((device, major, minor))
+        for device, compute_capability in devices:
+            if compute_capability < minimum_compute_capability:
+                incompatible.append((device, compute_capability))
 
         if incompatible:
-            found = ", ".join(f"{device} (SM{major}{minor})" for device, major, minor in incompatible)
+            found = ", ".join(f"{device} (SM{compute_capability})" for device, compute_capability in incompatible)
             raise compatibility_error(f"found {found}")
 
     @staticmethod

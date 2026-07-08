@@ -51,7 +51,8 @@ from __future__ import annotations
 
 import math
 from functools import partial
-import torch
+from typing import Optional
+
 import cuda.bindings.driver as cuda
 
 import cutlass
@@ -70,12 +71,6 @@ from cutlass.utils.blackwell_helpers import (
 from cutlass.utils.layout import LayoutEnum
 
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
-
-from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
-from cudnn.deepseek_sparse_attention.utils.runtime import (
-    resolve_stream as _resolve_stream,
-    torch_stream_context as _torch_stream_context,
-)
 
 mul_packed_f32x2 = partial(cute.arch.mul_packed_f32x2, rnd="rn")
 fma_packed_f32x2 = partial(cute.arch.fma_packed_f32x2, rnd="rn")
@@ -1453,7 +1448,7 @@ def indexer_backward_sm100(
 
 
 class ScoreGradSm100:
-    """CuTe DSL kernel for in-place score_grad precompute."""
+    """CuTe DSL sparse score-gradient kernel with optional outputs."""
 
     THREADS_PER_CTA = 128
     WARP_SIZE = 32
@@ -1470,14 +1465,24 @@ class ScoreGradSm100:
         mGradLoss: cute.Tensor,
         grad_scale: Float32 | float,
         stream: cuda.CUstream,
+        mGradSignal: Optional[cute.Tensor] = None,
+        mSumGrad: Optional[cute.Tensor] = None,
     ):
+        write_sum_grad = mSumGrad is not None or mGradSignal is None
+        if cutlass.const_expr(mGradSignal is None):
+            mGradSignal = mAttnScore
+        if cutlass.const_expr(mSumGrad is None):
+            mSumGrad = mIndexScore
+
         # (b, s, t) -> (s, t, b): topk dim contiguous for per-CTA strided loops.
         mAttnScore = cute.make_tensor(mAttnScore.iterator, cute.select(mAttnScore.layout, mode=[1, 2, 0]))
         mIndexScore = cute.make_tensor(mIndexScore.iterator, cute.select(mIndexScore.layout, mode=[1, 2, 0]))
+        mGradSignal = cute.make_tensor(mGradSignal.iterator, cute.select(mGradSignal.layout, mode=[1, 2, 0]))
+        mSumGrad = cute.make_tensor(mSumGrad.iterator, cute.select(mSumGrad.layout, mode=[1, 2, 0]))
 
         seqlen = cute.size(mAttnScore.shape[0])
         batch_size = cute.size(mAttnScore.shape[2]) if cute.rank(mAttnScore.shape) > 2 else 1
-        self.kernel_score_grad(mAttnScore, mIndexScore, mGradLoss, grad_scale).launch(
+        self.kernel_score_grad(mAttnScore, mIndexScore, mGradLoss, mGradSignal, mSumGrad, grad_scale, write_sum_grad).launch(
             grid=(seqlen, batch_size, 1),
             block=[self.THREADS_PER_CTA, 1, 1],
             cluster=[1, 1, 1],
@@ -1486,7 +1491,9 @@ class ScoreGradSm100:
         )
 
     @cute.kernel
-    def kernel_score_grad(self, mAttnScore, mIndexScore, mGradLoss, grad_scale: Float32 | float):
+    def kernel_score_grad(
+        self, mAttnScore, mIndexScore, mGradLoss, mGradSignal, mSumGrad, grad_scale: Float32 | float, write_sum_grad: cutlass.Constexpr[bool]
+    ):
         tidx = cute.arch.thread_idx()[0]
         seq_idx = cute.arch.block_idx()[0]
         batch_idx = cute.arch.block_idx()[1]
@@ -1528,11 +1535,14 @@ class ScoreGradSm100:
             target_eff = cute.arch.fmax(target, Float32(CLIP_PROB_MIN))
             log_clip_mask = Float32(1.0) if predict >= Float32(CLIP_PROB_MIN) else Float32(0.0)
             g_i = -target_eff * log_clip_mask * grad_scale_f32
-            mAttnScore[seq_idx, pos, batch_idx] = g_i - predict * sum_grad
-            mIndexScore[seq_idx, pos, batch_idx] = sum_grad
+            mGradSignal[seq_idx, pos, batch_idx] = g_i - predict * sum_grad
+            if cutlass.const_expr(write_sum_grad):
+                mSumGrad[seq_idx, pos, batch_idx] = sum_grad
 
 
 def _score_grad_inplace_cute(AttnScore, IndexScore, GradLoss, grad_scale, current_stream=None):
+    from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
+    from cudnn.deepseek_sparse_attention.utils.runtime import resolve_stream
     from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
 
     # Kernel reads ``mGradLoss[0]`` so it must be at least 1-D. ``to_cute_tensor``
@@ -1544,7 +1554,7 @@ def _score_grad_inplace_cute(AttnScore, IndexScore, GradLoss, grad_scale, curren
 
     _, _, topk = AttnScore.shape
     compile_key = (topk,)
-    s = _resolve_stream(current_stream)
+    s = resolve_stream(current_stream)
     if compile_key not in _score_grad_cute_cache:
         kernel_obj = ScoreGradSm100(topk=topk)
         _score_grad_cute_cache[compile_key] = cute.compile(
@@ -1582,6 +1592,8 @@ def _score_grad_inplace(AttnScore, IndexScore, GradLoss, grad_scale, block_I=128
     #   target = clip(log_target)
     # dL/dlog_predict = -exp(target) * I(log_predict >= -100)
     # dL/dlogits = g - predict * sum(g)
+    import torch
+
     can_use_cute = (
         AttnScore.is_cuda
         and IndexScore.is_cuda
@@ -1598,6 +1610,10 @@ def _score_grad_inplace(AttnScore, IndexScore, GradLoss, grad_scale, block_I=128
 
 
 def _build_cute_dsl_kernel(heads, dim, topk, sm_scale, block_I, topk_indices_global: bool = True):
+    import torch
+
+    from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
+    from cudnn.deepseek_sparse_attention.utils.runtime import resolve_stream, torch_stream_context
     from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
 
     if torch.cuda.get_device_capability()[0] < 10:
@@ -1617,7 +1633,7 @@ def _build_cute_dsl_kernel(heads, dim, topk, sm_scale, block_I, topk_indices_glo
     def _ensure_compiled(IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK_f32, AttnScore, TopkIndices, current_stream=None):
         """Lazy-compile the GEMM kernel (kernel 2) on first execute (needs real tensors)."""
         if compile_key not in _compile_cache:
-            s = _resolve_stream(current_stream)
+            s = resolve_stream(current_stream)
             cute_args = [to_cute_tensor(t) for t in [IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK_f32, AttnScore, TopkIndices]]
             _compile_cache[compile_key] = cute.compile(
                 kernel_obj,
@@ -1629,7 +1645,7 @@ def _build_cute_dsl_kernel(heads, dim, topk, sm_scale, block_I, topk_indices_glo
 
     def _run_gemm_only(IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK_f32, GradSignal, TopkIndices, current_stream=None):
         """Run only kernel 2 (GEMM). Caller must have run kernel 1 and zeroed dIndexK_f32."""
-        s = _resolve_stream(current_stream)
+        s = resolve_stream(current_stream)
         _ensure_compiled(IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK_f32, GradSignal, TopkIndices, current_stream=current_stream)
         with torch.cuda.nvtx.range("indexer_backward_dsl_gemm"):
             _compile_cache[compile_key](
@@ -1660,10 +1676,10 @@ def _build_cute_dsl_kernel(heads, dim, topk, sm_scale, block_I, topk_indices_glo
             _run_gemm_only(IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK, AttnScore, TopkIndices, current_stream=current_stream)
         else:
             # Need a separate f32 buffer for atomicAdd, then cast back to output dtype.
-            with _torch_stream_context(current_stream):
+            with torch_stream_context(current_stream):
                 dIndexK_f32 = torch.zeros_like(dIndexK, dtype=torch.float32)
             _run_gemm_only(IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK_f32, AttnScore, TopkIndices, current_stream=current_stream)
-            with _torch_stream_context(current_stream):
+            with torch_stream_context(current_stream):
                 dIndexK.copy_(dIndexK_f32)
 
     _run.score_grad = partial(_score_grad_inplace, block_I=block_I)

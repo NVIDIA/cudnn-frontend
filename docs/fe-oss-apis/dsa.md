@@ -6,10 +6,9 @@
 
 The DeepSeek Sparse Attention (DSA) module integrates a set of CuTe-DSL
 kernels that support the sparse-attention path used by DeepSeek-style models.
-Most kernels target Hopper (SM90) and Blackwell (SM100+) GPUs; Indexer
-Forward and Indexer Top-K remain SM100+ only. The kernels are
-delivered as Python classes / wrappers that follow the same `APIBase`
-pattern as other cuDNN Frontend operations.
+The kernels target Hopper (SM90) and Blackwell (SM100+) GPUs and are exposed
+through PyTorch and JAX classes and convenience wrappers. See the JAX support
+matrix below for operation-specific layout restrictions.
 
 **Scope:** this module ships CuTe-DSL kernels for DSA backward, indexer
 scores/top-K, sparse/dense score recompute, and sparse/dense indexer
@@ -24,7 +23,7 @@ The module packages the following operations:
 2. **Indexer Forward** – CuTe-DSL score kernel (Q @ K^T, ReLU, head reduce,
    ratio causal mask). Non-fused; pair with **Indexer Top-K** for the
    top-K step.
-3. **Indexer Top-K** – SM100 CuTe-DSL radix top-K kernel with per-row
+3. **Indexer Top-K** – CuTe-DSL radix top-K kernel with per-row
    ``seq_lens``.
 4. **Sparse Indexer / Attention Score Recompute** – sparse (top-K) recompute
    of indexer and attention scores for training loss.
@@ -59,15 +58,23 @@ Training-score loss path:
 
 ## Installation
 
+PyTorch:
+
 ```bash
-pip install nvidia-cudnn-frontend[cutedsl]
+pip install 'nvidia-cudnn-frontend[cutedsl]'
+```
+
+JAX:
+
+```bash
+pip install 'nvidia-cudnn-frontend[jax]'
 ```
 
 ---
 
 ## API Usage
 
-### DSA Namespace
+### PyTorch namespace
 
 ```python
 from cudnn import DSA
@@ -100,6 +107,129 @@ DSA.DenseIndexerBackward
 DSA.dense_indexer_backward_wrapper
 ```
 
+### JAX namespace and wrappers
+
+Importing `cudnn.jax` validates the optional JAX and CUTLASS JAX
+dependencies. DSA operation classes and wrappers are then loaded lazily. Each
+public symbol is available both directly and through `cudnn.jax.DSA`:
+
+```python
+import cudnn.jax as cudnn_jax
+
+cudnn_jax.IndexerForward
+cudnn_jax.indexer_forward_wrapper
+
+cudnn_jax.DSA.IndexerForward
+cudnn_jax.DSA.indexer_forward_wrapper
+```
+
+The function wrappers are already decorated with `jax.jit`; their tuning and
+target arguments, including maximum sequence lengths, are static compilation
+options. They infer output metadata and return a `TupleDict` of JAX arrays:
+
+```python
+result = cudnn_jax.indexer_forward_wrapper(q, k, w, ratio=4)
+scores = result["scores"]
+```
+
+Layout strings describe the public JAX axis order and are static compilation
+arguments. `IndexerForward` accepts batch-major or sequence-major fixed
+inputs while keeping the head dimension contiguous:
+
+```python
+result = cudnn_jax.indexer_forward_wrapper(
+    q_sbhd,
+    k_sbhd,
+    w_sbh,
+    q_layout="SBHD",
+    k_layout="SBHD",
+    w_layout="SBH",
+    output_layout="SBK",
+    ratio=4,
+)
+scores_sbk = result["scores"]
+```
+
+The defaults are `q_layout="BSHD"`, `k_layout="BSHD"`,
+`w_layout="BSH"`, and `output_layout="BSK"`. Packed inputs use `THD` and
+`TH`, with a `TK` output. The adapter maps these public axes to the kernel's
+canonical axes; callers do not need to transpose arrays into canonical order.
+
+Use the class API when the caller needs to choose the enclosing JAX
+transformation. Classes specialize from array-like exemplars that expose
+`shape` and `dtype`; `jax.ShapeDtypeStruct` makes that intent explicit:
+
+```python
+import jax
+
+q_spec = jax.ShapeDtypeStruct(q.shape, q.dtype)
+k_spec = jax.ShapeDtypeStruct(k.shape, k.dtype)
+w_spec = jax.ShapeDtypeStruct(w.shape, w.dtype)
+
+op = cudnn_jax.IndexerForward(q_spec, k_spec, w_spec, ratio=4)
+scores = jax.jit(op)(q, k, w)["scores"]
+```
+
+The JAX adapters allocate outputs and private workspaces through XLA. Where a
+class accepts optional `sample_*` output arguments, those exemplars validate
+an explicit output signature; otherwise the adapter infers it. Backward APIs
+are functional: they do not update caller-owned gradient buffers in place.
+For `IndexerForward`, an explicit `sample_out` describes the physical FP32
+buffer whose last extent is rounded up to four; the returned `scores` view is
+sliced back to the logical K extent.
+`SparseAttentionBackward` returns `dq`, `dkv`, and `d_sink`;
+`IndexerBackward` and `DenseIndexerBackward` return `d_index_q`, `d_weights`,
+and `d_index_k`.
+
+### JAX target selection
+
+`target_compute_capability` is the exact compilation target, such as `90`,
+`100`, `103`, or `107`. When it is omitted, the adapter infers it from a
+homogeneous set of local JAX GPUs. With compatibility checks enabled, an
+explicit target must match every local GPU.
+
+For AOT or remote compilation without the target GPU, disable the local-device
+check and provide the target before tracing:
+
+```python
+cudnn_jax.disable_device_compatibility_checks(True)
+lowered = cudnn_jax.indexer_forward_wrapper.lower(
+    q_spec,
+    k_spec,
+    w_spec,
+    target_compute_capability=100,
+)
+```
+
+Pass `False` to re-enable checks. This process-wide setting only disables the
+local-device validation; it does not enable an unsupported kernel target.
+Changing it does not invalidate existing JAX compilation-cache entries, so
+configure it before the first `jax.jit` or `lower` call for a signature.
+
+### JAX support matrix
+
+The SM100+ column covers the implemented SM100-family targets: SM100, SM103,
+and SM107.
+
+| Operation | JAX layout | SM90 | SM100+ |
+| --- | --- | --- | --- |
+| Sparse Attention Backward | Flat MQA tensors | Yes | Yes; inputs must be BF16 |
+| Indexer Forward | Fixed BSHD/SBHD or packed THD | Yes; `H_kv=1` and default tuning | Yes |
+| Indexer Top-K and index utilities | Flattened rows; fixed or packed index conversion | Yes | Yes |
+| Sparse score recompute | Fixed BSHD/MQA | Yes | Yes |
+| Dense score recompute | Fixed BSHD/MQA | Yes | Yes |
+| Dense score recompute | Packed THD/MQA | No | Yes |
+| Indexer Backward | Fixed BSHD; JAX-only packed THD with global indices | Yes | Yes |
+| Dense Indexer Backward | Fixed BSHD or packed THD | Yes | Yes |
+
+SM90 packed THD dense score recompute is rejected because that backend needs
+host-side cumulative-length reads, which cannot be represented during JAX
+tracing. Sparse score recompute has no packed THD signature and its SM90
+kernel requires a top-K extent divisible by 128. Both indexer
+backward variants require `H >= 64`, `D == 128`, and `block_I == 128`; sparse
+Indexer Backward also requires its top-K extent to be divisible by 128. Its
+packed THD signature requires `topk_indices_global=True` on JAX.
+
 ---
 
 ## Components
@@ -118,7 +248,12 @@ Backward pass for DeepSeek Sparse Attention. Expects the forward outputs
   - `topk_idxs`: `(total_S_q, topk_max)` INT32 (global)
   - `topk_length` (optional): `(total_S_q,)` INT32 — per-query valid count
 - **Outputs** — tuple `(dq, dkv, d_sink)`
-- **Constraints** — SM90 or SM100; SM90 supports the FlashMLA DSA shape with `head_dim ∈ {512, 576}`
+- **Constraints** — SM90 or SM100+, `head_dim ∈ {512, 576}`. SM100+
+  currently requires BF16 inputs; SM90 also supports FP16. Every
+  `topk_length` value is interpreted on device and clamped to
+  `[0, topk_max]`; zero-length rows are supported. When `topk_length` is
+  supplied, every index before it must be in `[0, total_S_kv)`. When it is
+  omitted, negative entries are padding sentinels.
 
 ```python
 result = DSA.sparse_attention_backward_wrapper(
@@ -145,13 +280,17 @@ The K columns are assumed to be a compressed-KV prefix starting at global
 compressed column 0.
 
 - **Inputs**
-  - `q`: `(B, S_q, H_q, D)` BF16
-  - `k`: `(B, S_k, H_kv, D)` BF16
-  - `w`: `(B, S_q, H_q)` BF16
-  - `q_causal_offsets` (optional): CUDA INT32 tensor with one entry per
+  - Fixed: `q` `(B, S_q, H_q, D)`, `k` `(B, S_k, H_kv, D)`, and
+    `w` `(B, S_q, H_q)`, all BF16.
+  - Packed THD: `q` `(T_q, H_q, D)`, `k` `(T_k, H_kv, D)`, and
+    `w` `(T_q, H_q)`, with `cu_seqlens_q`, `cu_seqlens_k`,
+    `max_seqlen_q`, and `max_seqlen_k`.
+  - `q_causal_offsets` (optional): INT32 device array with one entry per
     batch/THD segment, on the same device as `q`.
-- **Output** — `scores`: `(B, S_q, S_k)` FP32
-- **Constraints** — SM100+, `head_dim == 128`, `qhead_per_kv_head ∈ {32, 64}`
+- **Output** — `scores`: `(B, S_q, S_k)` or `(T_q, max_seqlen_k)` FP32.
+- **Constraints** — SM90 or SM100+, `head_dim == 128`,
+  `qhead_per_kv_head ∈ {32, 64}`. SM90 requires `H_kv == 1` and the
+  default tuning configuration.
 
 ```python
 result = DSA.indexer_forward_wrapper(
@@ -170,7 +309,8 @@ with variable per-row effective length.
   - `seq_lens`: `(batch_size,)` INT32 (per-batch effective column count)
 - **Outputs** — tuple `(indices, values)` (values is `None` when
   `return_val=False`)
-- **Constraints** — SM100+, `top_k ≤ 2048`
+- **Constraints** — SM90 or SM100+, `top_k ≤ min(2048, num_cols)` and
+  `top_k + next_n - 1 ≤ seq_lens[b] ≤ num_cols` for every batch item.
 
 ```python
 result = DSA.indexer_top_k_wrapper(
@@ -179,6 +319,10 @@ result = DSA.indexer_top_k_wrapper(
 )
 indices, values = result["indices"], result["values"]
 ```
+
+JAX also exposes `local_to_global_wrapper` for fixed or packed local index
+conversion and `compactify_wrapper` for packing nonnegative indices and
+returning each row's valid `topk_length`.
 
 ### 4. Sparse Indexer Score Recompute
 
@@ -207,21 +351,34 @@ L1-normalised head-summed softmax over top-K entries:
 
 Full-KV (no top-K) analogues of §4 and §5. Each returns `{'out', 'denom'}`.
 They apply the same ratio-causal mask as Indexer Forward; masked positions are
-written as zero and excluded from `denom`. Pass the same `q_causal_offsets` to
-all dense score tensors that feed the same loss path.
+excluded from `denom`. JAX initializes skipped output positions to `-inf`.
+Pass the same `q_causal_offsets` to all dense score tensors that feed the same
+loss path.
 
 ### 7. Indexer Backward
 
 Three-stage sparse top-K pipeline that produces the training gradients for the
 indexer tower:
 
-1. `ScoreGradSm90` / `ScoreGradSm100` (kernel 1) — in-place score-grad precompute from
-   `attn_score` (target) and `index_score` (predict).
+1. `ScoreGradSm90` / `ScoreGradSm100` (kernel 1) — score-grad precompute from
+   `attn_score` (target) and `index_score` (predict) into a private temporary.
 2. `IndexerBackwardSm90` / `IndexerBackwardSm100` (kernel 2) — three
    warp-specialised GEMMs produce `d_index_q`, `d_weights`, and a
    `dIndexK_f32` accumulator.
-3. Pure-torch dtype cast (kernel 3) converts `dIndexK_f32` to the output
-   dtype.
+3. A dtype cast converts `dIndexK_f32` to the output dtype.
+
+The JAX wrapper treats `grad_loss` as a runtime array operand and returns new
+gradient arrays; no input or caller-owned output buffer is mutated.
+
+The common fixed signature uses `index_q` `(B, S_q, H, 128)`, `weights`
+`(B, S_q, H)`, `index_k` `(B, S_k, 128)`, and score/index tensors
+`(B, S_q, topk)`. JAX additionally accepts a packed signature with
+`index_q` `(T_q, H, 128)`, `weights` `(T_q, H)`, `index_k` `(T_k, 128)`, and
+score/index tensors `(T_q, topk)`. The packed adapter presents these tensors
+to the kernel as a synthetic batch of one, so it requires
+`topk_indices_global=True`; each top-K entry must address the flattened packed
+K range directly. It does not infer original batch-local IDs from cumulative
+sequence lengths. The PyTorch sparse wrapper remains fixed BSHD.
 
 **The TileLang fallback present in the upstream repo is dropped here
 (CuTe-DSL only).** If the CuTe-DSL path fails the wrapper raises
@@ -278,11 +435,13 @@ result = DSA.dense_indexer_backward_wrapper(
 ## Limitations
 
 - **Architecture support** — Sparse Attention Backward, Score Recompute, and
-  Indexer Backward support SM90 and SM100; Indexer Forward and Indexer Top-K
-  remain SM100+ only.
+  Indexer operations support SM90 and SM100+ subject to the layout restrictions
+  in the JAX support matrix.
 - **No fused forward** — the production forward is FlashMLA (C++); this
   module ships only the CuTe-DSL kernels.
 - **Indexer Forward only supports `head_dim = 128`** and
   `qhead_per_kv_head ∈ {32, 64}`.
 - **Top-K only up to 2048**; `top_k > 2048` is not supported by the
   underlying radix top-K kernel.
+- **JAX Top-K does not use the PyTorch row-chunking fallback** when its private
+  workspace would exceed the INT32 indexing range.

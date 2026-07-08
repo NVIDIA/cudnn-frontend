@@ -59,7 +59,8 @@ def flash_attn_bwd_sm100(
     head_dim_v = 512 if head_dim == 576 else head_dim
     device = q.device
 
-    assert q.dtype in [torch.float16, torch.bfloat16]
+    # The SM100 kernel currently fixes element storage to BFloat16.
+    assert q.dtype == torch.bfloat16
     assert q.dtype == kv.dtype == out.dtype == dout.dtype
     assert lse.dtype == torch.float32
     assert attn_sink.dtype == torch.float32
@@ -99,7 +100,7 @@ def flash_attn_bwd_sm100(
 
     # Allocate workspace tensors
     acc_dtype = cutlass.Float32
-    ws_lse_odo_shape = FlashAttentionDSABackwardSm100._get_workspace_size_LSE_OdO(
+    ws_lse_odo_shape = FlashAttentionDSABackwardSm100.get_workspace_size_lse_odo(
         total_S_q,
         head_dim,
         num_head,
@@ -112,7 +113,7 @@ def flash_attn_bwd_sm100(
         device=device,
     )
 
-    ws_dkv_shape = FlashAttentionDSABackwardSm100._get_workspace_size_dKV(
+    ws_dkv_shape = FlashAttentionDSABackwardSm100.get_workspace_size_dkv(
         total_S_kv,
         head_dim,
         batch_size,

@@ -12,14 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
 
 import cutlass
 import cutlass.cute as cute
-import torch
 from cutlass._mlir.dialects import llvm
 from cutlass.utils.distributed import atomicAdd
 
 from .block_scan import block_prefix_sum_kernel, fence_acq_rel_cta
+
+if TYPE_CHECKING:
+    import torch
 
 """
 top-k varlen utils. could be used by prefill and decode phase.
@@ -1089,6 +1094,8 @@ def create_random_logits(
     Returns:
         Tensor of shape (num_rows, max_row_length) with random values and -inf padding
     """
+    import torch
+
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     num_rows = row_starts.shape[0]
@@ -1145,6 +1152,8 @@ def compare_top_k_results(
     Returns:
         True if results match within tolerance, False otherwise
     """
+    import torch
+
     num_rows = cuda_indices.shape[0]
 
     # Calculate valid lengths for each row (vectorized)

@@ -7,10 +7,13 @@ from typing import Optional, Tuple
 import torch
 import cuda.bindings.driver as cuda
 
+from cudnn import data_type
 from cudnn.api_base import APIBase, TupleDict
+from cudnn.deepseek_sparse_attention.utils.runtime import torch_stream_context
 
 from .local_to_global_dsl import local_to_global as _local_to_global
 from .compactify import compactify as _compactify
+from .op import IndexerTopKOp
 
 _SUPPORTED_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
 
@@ -77,36 +80,51 @@ class IndexerTopK(APIBase):
         self.return_val = bool(return_val)
         self.num_copy_bits = int(num_copy_bits)
 
-    def check_support(self) -> bool:
-        self._logger.debug("Entering check_support")
+        if self.input_desc.ndim != 2:
+            raise ValueError(f"input_values must be 2-D, got {self.input_desc.shape}")
+        if self.seq_lens_desc.ndim != 1:
+            raise ValueError(f"seq_lens must be 1-D, got {self.seq_lens_desc.shape}")
         self._check_dtype(self.input_desc, list(_SUPPORTED_DTYPES), name="input_values")
-        self._check_dtype(self.seq_lens_desc, torch.int32, name="seq_lens")
-        self._value_error_if(
-            self.input_desc.ndim != 2,
-            f"input_values must be 2-D (n_rows, num_cols), got {self.input_desc.shape}",
+        if self.top_k <= 0:
+            raise ValueError(f"top_k must be positive, got {self.top_k}")
+
+        output_shape = (self.input_desc.shape[0], self.top_k)
+        self.indices_desc = self.input_desc.compact_like(
+            cudnn_dtype=data_type.INT32,
+            shape=output_shape,
+            name="indices",
         )
-        self._value_error_if(
-            self.seq_lens_desc.ndim != 1,
-            f"seq_lens must be 1-D, got {self.seq_lens_desc.shape}",
+        self.values_desc = (
+            self.input_desc.compact_like(
+                cudnn_dtype=self.input_desc.cudnn_dtype,
+                shape=output_shape,
+                name="values",
+            )
+            if self.return_val
+            else None
         )
-        self._value_error_if(
-            self.top_k <= 0 or self.top_k > 2048,
-            f"top_k must be in (0, 2048], got {self.top_k}",
+        buffer_count = 2 if self.input_desc.cudnn_dtype == data_type.FLOAT else 1
+        self.workspace_desc = self.input_desc.compact_like(
+            cudnn_dtype=data_type.INT32,
+            shape=(self.input_desc.shape[0], buffer_count, self.input_desc.shape[1]),
+            name="extra_buffer",
+        )
+        self._op = IndexerTopKOp(
+            input_values=self.input_desc,
+            seq_lens=self.seq_lens_desc,
+            output_indices=self.indices_desc,
+            output_values=self.values_desc,
+            workspace=self.workspace_desc,
+            top_k=self.top_k,
+            next_n=self.next_n,
+            return_val=self.return_val,
+            num_copy_bits=self.num_copy_bits,
+            target_compute_capability=90,
         )
 
-        # Enforce the kernel's n_rows == batch_size * next_n invariant
-        # up-front so misuse surfaces here rather than as silently-empty
-        # rows (the stagger formula produces non-positive lengths when
-        # next_n exceeds n_rows per batch).
-        n_rows = self.input_desc.shape[0]
-        batch_size = self.seq_lens_desc.shape[0]
-        self._value_error_if(
-            n_rows != batch_size * self.next_n,
-            f"n_rows ({n_rows}) must equal seq_lens.numel() * next_n "
-            f"({batch_size} * {self.next_n} = {batch_size * self.next_n}). "
-            f"For independent top-K over equal-length rows use "
-            f"next_n=1 and seq_lens of shape (n_rows,).",
-        )
+    def check_support(self) -> bool:
+        self._logger.debug("Entering check_support")
+        self._op.check_support()
 
         major, _ = torch.cuda.get_device_capability()
         self._runtime_error_if(
@@ -136,14 +154,15 @@ class IndexerTopK(APIBase):
             self.compile()
 
         kernel = self._compiled_kernel or _get_cute_dsl_topk_wrapper()
-        indices, values = kernel(
-            input_values,
-            seq_lens,
-            self.top_k,
-            self.next_n,
-            return_val=self.return_val,
-            num_copy_bits=self.num_copy_bits,
-        )
+        with torch_stream_context(current_stream):
+            indices, values = kernel(
+                input_values,
+                seq_lens,
+                self.top_k,
+                self.next_n,
+                return_val=self.return_val,
+                num_copy_bits=self.num_copy_bits,
+            )
         return indices, values
 
 
@@ -170,6 +189,8 @@ def indexer_top_k_wrapper(
     full details.
 
     ``values`` is ``None`` when ``return_val=False``.
+    Every runtime ``seq_lens[b]`` must satisfy
+    ``top_k + next_n - 1 <= seq_lens[b] <= input_values.shape[1]``.
     """
     cache_key = (
         input_values.dtype,
@@ -191,7 +212,7 @@ def indexer_top_k_wrapper(
             return_val=return_val,
             num_copy_bits=num_copy_bits,
         )
-        assert obj.check_support()
+        obj.check_support()
         obj.compile()
         _cache_of_IndexerTopKObjects[cache_key] = obj
 
