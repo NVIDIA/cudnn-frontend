@@ -1,0 +1,26 @@
+config_name,model_name,backend,data_type,attn_mask,batch_size,q_seqlen,kv_seqlen,num_q_heads,num_kv_heads,head_dim_qk,head_dim_vo,profile_pass,deterministic_bwd,time_ms,tflops,max_diff,num_iterations,sliding_window_size,success,error_message,gpu_name,cudnn_version,cudnn_backend_version
+qwen35,qwen35,cudnn,bfloat16,top_left,1,32768,32768,32,2,256,256,fwd,False,8.481,2074.000,0.000,10,,True,,NVIDIA GB300,1.27.0,92400.000
+qwen35,qwen35,cudnn,bfloat16,top_left,1,32768,32768,32,2,256,256,bwd,False,36.214,1215.000,0.000,10,,True,,NVIDIA GB300,1.27.0,92400.000
+qwen35,qwen35,cudnn,bfloat16,top_left,1,32768,32768,32,2,256,256,bwd,True,36.109,1218.000,0.000,10,,True,,NVIDIA GB300,1.27.0,92400.000
+qwen35,qwen35,flash_attention_4,bfloat16,top_left,1,32768,32768,32,2,256,256,fwd,False,10.472,1680.000,0.000,10,,True,,NVIDIA GB300,1.27.0,92400.000
+qwen35,qwen35,flash_attention_4,bfloat16,top_left,1,32768,32768,32,2,256,256,bwd,False,43.624,1008.000,0.000,10,,True,,NVIDIA GB300,1.27.0,92400.000
+qwen35,qwen35,cudnn,bfloat16,top_left,1,16384,16384,32,2,256,256,fwd,False,2.116,2079.000,0.000,10,,True,,NVIDIA GB300,1.27.0,92400.000
+qwen35,qwen35,cudnn,bfloat16,top_left,1,16384,16384,32,2,256,256,bwd,False,9.069,1212.000,0.000,10,,True,,NVIDIA GB300,1.27.0,92400.000
+qwen35,qwen35,cudnn,bfloat16,top_left,1,16384,16384,32,2,256,256,bwd,True,9.093,1209.000,0.000,10,,True,,NVIDIA GB300,1.27.0,92400.000
+qwen35,qwen35,flash_attention_4,bfloat16,top_left,1,16384,16384,32,2,256,256,fwd,False,3.102,1418.000,0.000,10,,True,,NVIDIA GB300,1.27.0,92400.000
+qwen35,qwen35,flash_attention_4,bfloat16,top_left,1,16384,16384,32,2,256,256,bwd,False,11.204,981.000,0.000,10,,True,,NVIDIA GB300,1.27.0,92400.000
+qwen35,qwen35,cudnn,bfloat16,top_left,1,8192,8192,32,2,256,256,fwd,False,0.554,1984.000,0.000,10,,True,,NVIDIA GB300,1.27.0,92400.000
+qwen35,qwen35,cudnn,bfloat16,top_left,1,8192,8192,32,2,256,256,bwd,False,2.443,1125.000,0.000,10,,True,,NVIDIA GB300,1.27.0,92400.000
+qwen35,qwen35,cudnn,bfloat16,top_left,1,8192,8192,32,2,256,256,bwd,True,2.447,1123.000,0.000,10,,True,,NVIDIA GB300,1.27.0,92400.000
+qwen35,qwen35,flash_attention_4,bfloat16,top_left,1,8192,8192,32,2,256,256,fwd,False,1.115,986.000,0.000,10,,True,,NVIDIA GB300,1.27.0,92400.000
+qwen35,qwen35,flash_attention_4,bfloat16,top_left,1,8192,8192,32,2,256,256,bwd,False,3.108,885.000,0.000,10,,True,,NVIDIA GB300,1.27.0,92400.000
+qwen35,qwen35,cudnn,bfloat16,top_left,1,4096,4096,32,2,256,256,fwd,False,0.155,1769.000,0.000,10,,True,,NVIDIA GB300,1.27.0,92400.000
+qwen35,qwen35,cudnn,bfloat16,top_left,1,4096,4096,32,2,256,256,bwd,False,0.716,961.000,0.000,10,,True,,NVIDIA GB300,1.27.0,92400.000
+qwen35,qwen35,cudnn,bfloat16,top_left,1,4096,4096,32,2,256,256,bwd,True,0.714,962.000,0.000,10,,True,,NVIDIA GB300,1.27.0,92400.000
+qwen35,qwen35,flash_attention_4,bfloat16,top_left,1,4096,4096,32,2,256,256,fwd,False,0.460,598.000,0.000,10,,True,,NVIDIA GB300,1.27.0,92400.000
+qwen35,qwen35,flash_attention_4,bfloat16,top_left,1,4096,4096,32,2,256,256,bwd,False,1.360,505.000,0.000,10,,True,,NVIDIA GB300,1.27.0,92400.000
+qwen35,qwen35,cudnn,bfloat16,top_left,1,2048,2048,32,2,256,256,fwd,False,0.051,1350.000,0.000,10,,True,,NVIDIA GB300,1.27.0,92400.000
+qwen35,qwen35,cudnn,bfloat16,top_left,1,2048,2048,32,2,256,256,bwd,False,0.246,698.000,0.000,10,,True,,NVIDIA GB300,1.27.0,92400.000
+qwen35,qwen35,cudnn,bfloat16,top_left,1,2048,2048,32,2,256,256,bwd,True,0.246,698.000,0.000,10,,True,,NVIDIA GB300,1.27.0,92400.000
+qwen35,qwen35,flash_attention_4,bfloat16,top_left,1,2048,2048,32,2,256,256,fwd,False,0.218,316.000,0.000,10,,True,,NVIDIA GB300,1.27.0,92400.000
+qwen35,qwen35,flash_attention_4,bfloat16,top_left,1,2048,2048,32,2,256,256,bwd,False,0.642,268.000,0.000,10,,True,,NVIDIA GB300,1.27.0,92400.000
