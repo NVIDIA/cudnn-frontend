@@ -18,7 +18,7 @@ import torch
 import cuda.bindings.driver as cuda
 
 from cudnn import data_type
-from cudnn._tensor_desc import make_compact_tensor_desc
+from cudnn.common.tensor_desc import make_compact_tensor_desc
 from cudnn.api_base import APIBase, TupleDict
 from cudnn.deepseek_sparse_attention.utils.runtime import (
     torch_stream_context as _torch_stream_context,

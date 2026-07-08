@@ -4,10 +4,10 @@
 """Framework-neutral dense GEMM + squared-ReLU backward operation."""
 
 from .. import data_type
-from .._gemm_relu import BlockScaledGemmReluSm100Op
+from ..gemm.srelu import BlockScaledGemmSreluSm100OpBase
 
 
-class GemmDsreluSm100Op(BlockScaledGemmReluSm100Op):
+class GemmDsreluSm100Op(BlockScaledGemmSreluSm100OpBase):
     """Logical signature for block-scaled GEMM + squared-ReLU backward."""
 
     def check_support(self) -> bool:

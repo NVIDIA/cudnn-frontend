@@ -70,6 +70,35 @@ def redux_sync_max_f32(val, *, loc=None, ip=None):
     return Float32(result)
 
 
+@dsl_user_op
+def _as_global_tensor(tensor: cute.Tensor, *, loc=None, ip=None) -> cute.Tensor:
+    """Preserve a generic kernel argument's global address space for cp.async."""
+
+    if tensor.memspace == cute.AddressSpace.gmem:
+        return tensor
+    if tensor.memspace != cute.AddressSpace.generic:
+        raise ValueError(f"Expected a global or generic tensor, got {tensor.memspace}")
+
+    pointer = tensor.iterator
+    global_pointer = llvm.addrspacecast(
+        llvm.PointerType.get(cute.AddressSpace.gmem),
+        pointer.llvm_ptr,
+        loc=loc,
+        ip=ip,
+    )
+    return cute.make_tensor(
+        cute.make_ptr(
+            tensor.element_type,
+            global_pointer,
+            cute.AddressSpace.gmem,
+            assumed_align=pointer.alignment,
+            loc=loc,
+            ip=ip,
+        ),
+        tensor.layout,
+    )
+
+
 class RMSNormRHTAmaxKernel:
     """CuTe implementation of fused RMSNorm + RHT + per-CTA amax."""
 
@@ -119,6 +148,7 @@ class RMSNormRHTAmaxKernel:
     @cute.kernel
     def kernel(self, m_x: cute.Tensor, m_w: cute.Tensor, m_o: cute.Tensor, m_amax: cute.Tensor, eps: Float32, tv_layout: cute.Layout, tiler_mn: cute.Shape):
         cfg = self
+        m_x = _as_global_tensor(m_x)
         tid = cute.arch.thread_idx()[0]
         bid = cute.arch.block_idx()[0]
         inv_sqrt_had = cutlass.Float32(cfg.inv_sqrt_had)

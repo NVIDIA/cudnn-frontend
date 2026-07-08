@@ -11,7 +11,10 @@ import types
 import pytest
 
 _CUDNN_ROOT = Path(__file__).resolve().parents[3] / "python" / "cudnn"
-_COMMON_SPEC = importlib.util.spec_from_file_location("_cudnn_result_contract", _CUDNN_ROOT / "_result.py")
+_COMMON_SPEC = importlib.util.spec_from_file_location(
+    "_cudnn_result_contract",
+    _CUDNN_ROOT / "common" / "result.py",
+)
 assert _COMMON_SPEC is not None and _COMMON_SPEC.loader is not None
 _COMMON_MODULE = importlib.util.module_from_spec(_COMMON_SPEC)
 _COMMON_SPEC.loader.exec_module(_COMMON_MODULE)
@@ -37,11 +40,14 @@ def test_tuple_dict_is_a_jax_pytree(monkeypatch):
     package_name = "_cudnn_result_jax_contract"
     package = types.ModuleType(package_name)
     package.__path__ = [str(_CUDNN_ROOT)]
+    common_package = types.ModuleType(f"{package_name}.common")
+    common_package.__path__ = [str(_CUDNN_ROOT / "common")]
     jax_package = types.ModuleType(f"{package_name}._jax")
     jax_package.__path__ = [str(_CUDNN_ROOT / "_jax")]
     monkeypatch.setitem(sys.modules, package_name, package)
+    monkeypatch.setitem(sys.modules, f"{package_name}.common", common_package)
     monkeypatch.setitem(sys.modules, f"{package_name}._jax", jax_package)
-    monkeypatch.setitem(sys.modules, f"{package_name}._result", _COMMON_MODULE)
+    monkeypatch.setitem(sys.modules, f"{package_name}.common.result", _COMMON_MODULE)
 
     spec = importlib.util.spec_from_file_location(
         f"{package_name}._jax.result",

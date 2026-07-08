@@ -50,10 +50,12 @@ def test_jax_gemm_relu_abstract_contract(monkeypatch):
     from cudnn._jax import JaxApiBase
     from cudnn.jax import GemmDsreluSm100, GemmSreluSm100, gemm_dsrelu_wrapper_sm100, gemm_srelu_wrapper_sm100
 
-    def abstract_call(self, _inputs, *, output_descs, output_spec, **_options):
+    def abstract_call(self, _inputs, *, output_descs, output_spec=None, **_options):
+        if output_spec is None:
+            output_spec = tuple(self._to_tensor_spec(desc) for desc in output_descs)
         return tuple(
             jnp.empty(
-                self._materialize_tensor_desc(desc, mode=spec.mode).shape,
+                self._to_shape_dtype_struct(desc, mode=spec.mode).shape,
                 dtype=desc.dtype,
             )
             for desc, spec in zip(output_descs, output_spec)
@@ -107,6 +109,8 @@ def test_jax_gemm_relu_abstract_contract(monkeypatch):
             probability,
             c_layout="LNM",
             sf_vec_size=32,
+            a_layout="LKM",
+            b_layout="LKN",
         ),
         jax.ShapeDtypeStruct((batch, k, m), jnp.float8_e4m3fn),
         jax.ShapeDtypeStruct((batch, k, n), jnp.float8_e4m3fn),
@@ -116,13 +120,11 @@ def test_jax_gemm_relu_abstract_contract(monkeypatch):
     )
     assert alternate["c_tensor"].shape == (batch, n, m)
 
-    norm_const = jax.ShapeDtypeStruct((1,), jnp.float32)
-    with pytest.raises(NotImplementedError, match="does not implement SFD generation"):
+    with pytest.raises(NotImplementedError, match="FP8 D output is unavailable"):
         jax.eval_shape(
             lambda *args: gemm_dsrelu_wrapper_sm100(
-                *args[:-1],
+                *args,
                 d_dtype=jnp.float8_e4m3fn,
-                norm_const_tensor=args[-1],
                 sf_vec_size=32,
             ),
             a,
@@ -131,7 +133,6 @@ def test_jax_gemm_relu_abstract_contract(monkeypatch):
             scales,
             scales,
             prob,
-            norm_const,
         )
 
     fp4_dtype = getattr(jnp, "float4_e2m1fn", None)

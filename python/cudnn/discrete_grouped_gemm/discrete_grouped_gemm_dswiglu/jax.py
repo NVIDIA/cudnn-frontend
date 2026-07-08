@@ -12,8 +12,8 @@ import jax
 import jax.numpy as jnp
 
 from ... import data_type
-from ..._cute_compiler import compile_options_for_target
-from ..._dense_gemm import (
+from ..._jax.compiler import compile_options_for_target
+from ...gemm.helpers import (
     block_scale_shape,
     require_16_byte_alignment,
     require_compact_major,
@@ -278,11 +278,9 @@ class DiscreteGroupedGemmDswigluSm100(DiscreteGroupedGemmJaxBase):
         self._check_runtime_common(
             a_tensor, b_tensor, sfa_tensor, sfb_tensor, padded_offsets, alpha_tensor
         )
-        self._check_tensor_signature(c_tensor, self.c_desc, mode=self.output_mode)
+        self._check_tensor_signature(c_tensor, self.c_desc)
         self._check_tensor_signature(beta_tensor, self.beta_desc)
-        self._check_tensor_signature(
-            prob_tensor, self.prob_desc, mode=self.probability_mode
-        )
+        self._check_tensor_signature(prob_tensor, self.prob_desc)
         if (norm_const_tensor is None) != (self.norm_const_desc is None):
             raise ValueError("norm_const_tensor presence must match sample_norm_const")
         if self.norm_const_desc is not None:
@@ -292,23 +290,13 @@ class DiscreteGroupedGemmDswigluSm100(DiscreteGroupedGemmJaxBase):
 
         if self.m == 0:
             return TupleDict(
-                d_row_tensor=self._materialize_output_desc(
-                    self.d_row_desc, mode=self.output_mode
-                ),
-                d_col_tensor=self._materialize_output_desc(
-                    self.d_col_desc, mode=self.output_mode
-                ),
-                dprob_tensor=self._materialize_output_desc(
-                    self.dprob_desc, mode=self.probability_mode
-                ),
+                d_row_tensor=self._materialize_output_desc(self.d_row_desc),
+                d_col_tensor=self._materialize_output_desc(self.d_col_desc),
+                dprob_tensor=self._materialize_output_desc(self.dprob_desc),
                 dbias_tensor=self._materialize_output_desc(self.dbias_desc),
                 amax_tensor=self._materialize_output_desc(self.amax_desc),
-                sfd_row_tensor=self._materialize_output_desc(
-                    self.sfd_row_desc, mode=self.scale_mode
-                ),
-                sfd_col_tensor=self._materialize_output_desc(
-                    self.sfd_col_desc, mode=self.scale_mode
-                ),
+                sfd_row_tensor=self._materialize_output_desc(self.sfd_row_desc),
+                sfd_col_tensor=self._materialize_output_desc(self.sfd_col_desc),
             )
 
         import cutlass
@@ -350,36 +338,30 @@ class DiscreteGroupedGemmDswigluSm100(DiscreteGroupedGemmJaxBase):
             beta_tensor,
             prob_tensor,
         ]
-        input_specs = [
-            self._to_tensor_spec(self.a_desc, mode=self.a_mode),
-            self._to_tensor_spec(self.b_desc, mode=self.b_mode),
-            self._to_tensor_spec(self.sfb_desc, mode=self.scale_mode),
-            self._to_tensor_spec(self.c_desc, mode=self.output_mode),
-            self._to_tensor_spec(self.sfa_desc, mode=self.scale_mode),
-            self._to_tensor_spec(self.padded_offsets_desc),
-            self._to_tensor_spec(self.alpha_desc),
-            self._to_tensor_spec(self.beta_desc),
-            self._to_tensor_spec(self.prob_desc, mode=self.probability_mode),
+        input_descs = [
+            self.a_desc,
+            self.b_desc,
+            self.sfb_desc,
+            self.c_desc,
+            self.sfa_desc,
+            self.padded_offsets_desc,
+            self.alpha_desc,
+            self.beta_desc,
+            self.prob_desc,
         ]
         if self.norm_const_desc is not None:
             inputs.append(norm_const_tensor)
-            input_specs.append(self._to_tensor_spec(self.norm_const_desc))
+            input_descs.append(self.norm_const_desc)
 
         output_descs = [self.d_row_desc, self.d_col_desc, self.dprob_desc]
-        output_specs = [
-            self._to_tensor_spec(self.d_row_desc, mode=self.output_mode),
-            self._to_tensor_spec(self.d_col_desc, mode=self.output_mode),
-            self._to_tensor_spec(self.dprob_desc, mode=self.probability_mode),
-        ]
-        for desc, mode in (
-            (self.dbias_desc, None),
-            (self.sfd_row_desc, self.scale_mode),
-            (self.sfd_col_desc, self.scale_mode),
-            (self.amax_desc, None),
+        for desc in (
+            self.dbias_desc,
+            self.sfd_row_desc,
+            self.sfd_col_desc,
+            self.amax_desc,
         ):
             if desc is not None:
                 output_descs.append(desc)
-                output_specs.append(self._to_tensor_spec(desc, mode=mode))
 
         has_norm = self.norm_const_desc is not None
         has_dbias = self.dbias_desc is not None
@@ -457,10 +439,8 @@ class DiscreteGroupedGemmDswigluSm100(DiscreteGroupedGemmJaxBase):
             tuple(inputs),
             launch=launch,
             output_descs=tuple(output_descs),
+            input_descs=tuple(input_descs),
             workspace_descs=(workspace_desc,),
-            input_spec=tuple(input_specs),
-            output_spec=tuple(output_specs),
-            workspace_spec=(self._workspace_tensor_spec(),),
             compile_options=compile_options_for_target(self.compute_capability),
         )
         result_index = 0
@@ -546,20 +526,16 @@ def discrete_grouped_gemm_dswiglu_wrapper_sm100(
     """Run discrete dSwiGLU with XLA-owned stacked expert operands."""
 
     operation = DiscreteGroupedGemmDswigluSm100(
-        jax.ShapeDtypeStruct(a_tensor.shape, a_tensor.dtype),
-        jax.ShapeDtypeStruct(b_tensor.shape, b_tensor.dtype),
-        jax.ShapeDtypeStruct(c_tensor.shape, c_tensor.dtype),
-        jax.ShapeDtypeStruct(sfa_tensor.shape, sfa_tensor.dtype),
-        jax.ShapeDtypeStruct(sfb_tensor.shape, sfb_tensor.dtype),
-        jax.ShapeDtypeStruct(padded_offsets.shape, padded_offsets.dtype),
-        jax.ShapeDtypeStruct(alpha_tensor.shape, alpha_tensor.dtype),
-        jax.ShapeDtypeStruct(beta_tensor.shape, beta_tensor.dtype),
-        jax.ShapeDtypeStruct(prob_tensor.shape, prob_tensor.dtype),
-        sample_norm_const=(
-            None
-            if norm_const_tensor is None
-            else jax.ShapeDtypeStruct(norm_const_tensor.shape, norm_const_tensor.dtype)
-        ),
+        a_tensor,
+        b_tensor,
+        c_tensor,
+        sfa_tensor,
+        sfb_tensor,
+        padded_offsets,
+        alpha_tensor,
+        beta_tensor,
+        prob_tensor,
+        sample_norm_const=norm_const_tensor,
         d_dtype=d_dtype,
         acc_dtype=acc_dtype,
         mma_tiler_mn=mma_tiler_mn,

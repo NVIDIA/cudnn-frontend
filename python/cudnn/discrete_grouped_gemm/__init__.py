@@ -6,7 +6,7 @@
 JAX APIs are exported through :mod:`cudnn.jax`.
 """
 
-from .._operation_api import make_operation_api
+from ..common.operation_api import make_operation_api
 
 __all__, __getattr__, __dir__ = make_operation_api(
     globals(),

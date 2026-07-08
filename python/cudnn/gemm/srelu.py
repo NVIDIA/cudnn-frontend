@@ -7,8 +7,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from . import data_type
-from ._dense_gemm import (
+from .. import data_type
+from ..common.op import Op
+from ..common.tensor_desc import TensorDesc
+from .helpers import (
     block_scale_shape,
     require_16_byte_alignment,
     require_block_scale_layout,
@@ -18,8 +20,6 @@ from ._dense_gemm import (
     require_mma_tiler,
     require_tensor_shape,
 )
-from ._op import Op
-from ._tensor_desc import TensorDesc
 
 _AB_DTYPES = frozenset(
     {
@@ -35,7 +35,7 @@ _WIDE_OUTPUT_DTYPES = frozenset({data_type.HALF, data_type.BFLOAT16, data_type.F
 _C_DTYPES = _WIDE_OUTPUT_DTYPES | _FP8_DTYPES
 
 
-class BlockScaledGemmReluSm100Op(Op):
+class BlockScaledGemmSreluSm100OpBase(Op):
     """Logical tensor signature shared by sReLU forward and backward."""
 
     def __init__(
@@ -215,6 +215,3 @@ class BlockScaledGemmReluSm100Op(Op):
         self.ab_dtype = ab_dtype
         self.a_major, self.b_major, self.output_major = a_major, b_major, c_major
         return True
-
-
-__all__ = ["BlockScaledGemmReluSm100Op"]

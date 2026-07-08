@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Dependency-free axis and layout conversion for CUTLASS JAX calls."""
+"""Axis and layout conversion for CUTLASS JAX calls."""
 
 from __future__ import annotations
 

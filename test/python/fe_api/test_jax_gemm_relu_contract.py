@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Dependency-free contracts for the JAX sReLU and dsReLU adapters."""
+"""Contracts for the JAX sReLU and dsReLU adapters."""
 
 from __future__ import annotations
 
@@ -89,11 +89,29 @@ class JaxGemmReluContractTest(unittest.TestCase):
         internal.__spec__ = ModuleSpec(internal_name, loader=None, is_package=True)
         sys.modules[internal_name] = internal
 
-        tensor_module = importlib.import_module(f"{_PACKAGE}._tensor_desc")
+        tensor_module = importlib.import_module(f"{_PACKAGE}.common.tensor_desc")
         layout_module = importlib.import_module(f"{internal_name}.layout")
-        result_module = importlib.import_module(f"{_PACKAGE}._result")
+        result_module = importlib.import_module(f"{_PACKAGE}.common.result")
 
         class JaxTensorDesc(tensor_module.TensorDesc):
+            @classmethod
+            def from_shape(cls, shape, dtype, *, name, mode=None, init_value=None):
+                public_shape = tuple(shape)
+                mode = layout_module.normalize_mode(len(public_shape), mode)
+                public_order = tuple(reversed(range(len(public_shape))))
+                public_stride = layout_module.compact_stride(public_shape, public_order)
+                canonical_axis_by_public_axis = layout_module.to_public_axes(tuple(range(len(public_shape))), mode)
+                desc = cls(
+                    dtype=dtype,
+                    shape=layout_module.to_canonical_axes(public_shape, mode),
+                    stride=layout_module.to_canonical_axes(public_stride, mode),
+                    stride_order=tuple(canonical_axis_by_public_axis[axis] for axis in public_order),
+                    name=name,
+                    init_value=init_value,
+                )
+                object.__setattr__(desc, "mode", mode)
+                return desc
+
             @property
             def cudnn_dtype(self):
                 return _DTYPE_TO_CUDNN.get(self.dtype, _DataType.NOT_SET)
@@ -123,7 +141,7 @@ class JaxGemmReluContractTest(unittest.TestCase):
                 public_order = tuple(reversed(range(len(public_shape))))
                 public_stride = layout_module.compact_stride(public_shape, public_order)
                 canonical_axis_by_public_axis = layout_module.to_public_axes(tuple(range(len(public_shape))), mode)
-                return JaxTensorDesc(
+                desc = JaxTensorDesc(
                     dtype=value.dtype,
                     shape=layout_module.to_canonical_axes(public_shape, mode),
                     stride=layout_module.to_canonical_axes(public_stride, mode),
@@ -131,6 +149,8 @@ class JaxGemmReluContractTest(unittest.TestCase):
                     name=name,
                     init_value=init_value,
                 )
+                object.__setattr__(desc, "mode", mode)
+                return desc
 
             @staticmethod
             def _resolve_compute_capability(target, supported, operation_name):
@@ -164,6 +184,15 @@ class JaxGemmReluContractTest(unittest.TestCase):
                 )
 
             def _call_kernel(self, inputs, **options):
+                input_descs = options.get("input_descs")
+                if input_descs is not None:
+                    for value, desc in zip(inputs, input_descs):
+                        self._check_tensor_signature(value, desc, mode=desc.mode)
+                    options["input_spec"] = tuple(self._to_tensor_spec(desc, mode=desc.mode) for desc in input_descs)
+                if "output_spec" not in options:
+                    options["output_spec"] = tuple(
+                        self._to_tensor_spec(desc, mode=getattr(desc, "mode", None)) for desc in options["output_descs"]
+                    )
                 self.captured_call = (tuple(inputs), options)
                 return tuple(
                     _Array(
@@ -271,7 +300,13 @@ class JaxGemmReluContractTest(unittest.TestCase):
         self.assertTrue(callable(forward_options["launch"]))
         self.assertEqual(
             tuple(spec.mode for spec in forward_options["input_spec"]),
-            (forward.a_mode, forward.b_mode, forward.scale_mode, forward.scale_mode, forward.probability_mode),
+            (
+                forward.a_desc.mode,
+                forward.b_desc.mode,
+                forward.sfa_desc.mode,
+                forward.sfb_desc.mode,
+                forward.prob_desc.mode,
+            ),
         )
         self.assertEqual(forward_options["input_spec"][2].layout, (5, 4, 3, 2, 1, 0))
         self.assertEqual(forward_options["input_spec"][4].layout, (2, 1, 0))
@@ -294,7 +329,6 @@ class JaxGemmReluContractTest(unittest.TestCase):
 
     def test_fp8_d_output_is_rejected_until_sfd_generation_is_implemented(self):
         a, b, c, sfa, sfb, prob = self._samples()
-        norm_const = _Array((1,), "float32")
         constructors = (
             lambda: self.srelu.GemmSreluSm100(
                 a,
@@ -302,7 +336,6 @@ class JaxGemmReluContractTest(unittest.TestCase):
                 sfa,
                 sfb,
                 prob,
-                sample_norm_const=norm_const,
                 d_dtype="float8_e4m3fn",
                 sf_vec_size=32,
             ),
@@ -313,14 +346,68 @@ class JaxGemmReluContractTest(unittest.TestCase):
                 sfa,
                 sfb,
                 prob,
-                sample_norm_const=norm_const,
                 d_dtype="float8_e4m3fn",
                 sf_vec_size=32,
             ),
         )
         for construct in constructors:
-            with self.subTest(construct=construct), self.assertRaisesRegex(NotImplementedError, "does not implement SFD generation"):
-                construct()
+            with self.subTest(construct=construct), self.assertRaisesRegex(NotImplementedError, "FP8 D output is unavailable"):
+                construct().check_support()
+
+    def test_explicit_output_samples_are_alternative_to_dtype_arguments(self):
+        a, b, c, sfa, sfb, prob = self._samples()
+        sample_d = _Array(c.shape, "bfloat16")
+        sample_dprob = _Array(prob.shape, "float32")
+
+        forward = self.srelu.GemmSreluSm100(
+            a,
+            b,
+            sfa,
+            sfb,
+            prob,
+            sample_c=c,
+            sample_d=sample_d,
+            sf_vec_size=32,
+        )
+        backward = self.dsrelu.GemmDsreluSm100(
+            a,
+            b,
+            c,
+            sfa,
+            sfb,
+            prob,
+            sample_d=sample_d,
+            sample_dprob=sample_dprob,
+            sf_vec_size=32,
+        )
+        self.assertTrue(forward.check_support())
+        self.assertTrue(backward.check_support())
+
+        with self.assertRaisesRegex(ValueError, "c_dtype and d_dtype cannot be specified"):
+            self.srelu.GemmSreluSm100(
+                a,
+                b,
+                sfa,
+                sfb,
+                prob,
+                sample_c=c,
+                sample_d=sample_d,
+                c_dtype="bfloat16",
+                sf_vec_size=32,
+            )
+        with self.assertRaisesRegex(ValueError, "d_dtype cannot be specified"):
+            self.dsrelu.GemmDsreluSm100(
+                a,
+                b,
+                c,
+                sfa,
+                sfb,
+                prob,
+                sample_d=sample_d,
+                sample_dprob=sample_dprob,
+                d_dtype="bfloat16",
+                sf_vec_size=32,
+            )
 
     def test_unit_scale_tiles_and_batch_preserve_packed_layout(self):
         a, b, c, sfa, sfb, prob = self._samples(batch=1, m=128, n=128, k=128)

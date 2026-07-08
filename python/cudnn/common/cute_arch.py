@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Dependency-free CuTe compilation options for framework adapters."""
+"""CuTe architecture naming shared by framework adapters."""
 
 from __future__ import annotations
 
@@ -27,16 +27,4 @@ def gpu_arch_flag_for_compute_capability(compute_capability: int) -> str:
         raise RuntimeError(f"Unsupported GPU compute capability SM{compute_capability} for CuTe kernels; supported targets are {supported}") from error
 
 
-def compile_options_for_target(compute_capability: int, extra: str = "") -> str:
-    """Build CuTe compile options for an explicit framework-supplied target."""
-
-    parts = [
-        "--enable-tvm-ffi",
-        f"--gpu-arch {gpu_arch_flag_for_compute_capability(compute_capability)}",
-    ]
-    if extra:
-        parts.append(extra)
-    return " ".join(parts)
-
-
-__all__ = ["compile_options_for_target", "gpu_arch_flag_for_compute_capability"]
+__all__ = ["gpu_arch_flag_for_compute_capability"]

@@ -14,22 +14,22 @@ import jax.numpy as jnp
 
 from .._jax_api import (
     ApiBaseJax,
+    BLOCK_SCALE_MODE,
     make_buffer_desc,
     FIX_PAD_SIZE,
     MAX_EXPERTS,
     TWO_CTA_MMA_TILER_M,
     TupleDict,
+    PROBABILITY_MODE,
     as_dtype,
     as_gemm_tensor_desc,
     block_scale_shape,
-    block_scale_tensor_spec,
     call_cutedsl,
-    gemm_a_tensor_spec,
-    gemm_b_tensor_spec,
-    gemm_c_tensor_spec,
+    gemm_a_mode,
+    gemm_b_mode,
+    gemm_output_mode,
     is_fp4_dtype,
     is_fp8_dtype,
-    probability_tensor_spec,
     require_16_byte_extent,
     require_dtype,
     require_grouped_cluster_shape,
@@ -166,13 +166,13 @@ def _grouped_gemm_dswiglu_impl(
     """
 
     output_layout = require_layout("output_layout", output_layout, ("LMN",))
-    a_spec = gemm_a_tensor_spec("LMK")
+    a_mode = gemm_a_mode("LMK")
     b_layout = require_layout("b_layout", b_layout, ("LNK", "LKN"))
-    b_spec = gemm_b_tensor_spec(b_layout)
-    output_spec = gemm_c_tensor_spec(output_layout, name="output_layout")
-    a_desc = as_gemm_tensor_desc("a_tensor", a_tensor, a_spec)
-    b_desc = as_gemm_tensor_desc("b_tensor", b_tensor, b_spec)
-    c_desc = as_gemm_tensor_desc("c_tensor", c_tensor, output_spec)
+    b_mode = gemm_b_mode(b_layout)
+    output_mode = gemm_output_mode(output_layout, name="output_layout")
+    a_desc = as_gemm_tensor_desc("a_tensor", a_tensor, mode=a_mode)
+    b_desc = as_gemm_tensor_desc("b_tensor", b_tensor, mode=b_mode)
+    c_desc = as_gemm_tensor_desc("c_tensor", c_tensor, mode=output_mode)
     m, n, k, experts, ab_dtype = require_grouped_gemm_inputs(
         a_desc,
         b_desc,
@@ -261,7 +261,6 @@ def _grouped_gemm_dswiglu_impl(
         cluster_shape_mn, mma_tiler_mn=mma_tiler_mn
     )
 
-    scale_spec = block_scale_tensor_spec()
     require_16_byte_extent("a_tensor", k, ab_dtype)
     require_16_byte_extent("b_tensor", k, ab_dtype)
     require_16_byte_extent("c_tensor", output_n, c_dtype)
@@ -287,33 +286,33 @@ def _grouped_gemm_dswiglu_impl(
         beta_tensor,
         prob_tensor,
     ]
-    input_specs = [
-        a_spec,
-        b_spec,
-        output_spec,
-        scale_spec,
-        scale_spec,
-        None,
-        None,
-        None,
-        probability_tensor_spec(),
+    input_descs = [
+        a_desc,
+        b_desc,
+        c_desc,
+        as_gemm_tensor_desc("sfa_tensor", sfa_tensor, mode=BLOCK_SCALE_MODE),
+        as_gemm_tensor_desc("sfb_tensor", sfb_tensor, mode=BLOCK_SCALE_MODE),
+        as_gemm_tensor_desc("padded_offsets", padded_offsets),
+        as_gemm_tensor_desc("alpha_tensor", alpha_tensor),
+        as_gemm_tensor_desc("beta_tensor", beta_tensor),
+        as_gemm_tensor_desc("prob_tensor", prob_tensor, mode=PROBABILITY_MODE),
     ]
     if generate_sfd:
         inputs.append(norm_const_tensor)
-        input_specs.append(None)
+        input_descs.append(as_gemm_tensor_desc("norm_const_tensor", norm_const_tensor))
 
     outputs = [
         make_buffer_desc(
-            "d_row_tensor", (1, m, output_n), d_dtype, tensor_spec=output_spec
+            "d_row_tensor", (1, m, output_n), d_dtype, mode=output_mode
         ),
         make_buffer_desc(
-            "d_col_tensor", (1, m, output_n), d_dtype, tensor_spec=output_spec
+            "d_col_tensor", (1, m, output_n), d_dtype, mode=output_mode
         ),
         make_buffer_desc(
             "dprob_tensor",
             (1, 1, m),
             jnp.float32,
-            tensor_spec=probability_tensor_spec(),
+            mode=PROBABILITY_MODE,
             init_value=0.0,
         ),
     ]
@@ -333,13 +332,13 @@ def _grouped_gemm_dswiglu_impl(
                     "sfd_row_tensor",
                     block_scale_shape(m, output_n, 1, sf_vec_size),
                     jnp.float8_e8m0fnu,
-                    tensor_spec=scale_spec,
+                    mode=BLOCK_SCALE_MODE,
                 ),
                 make_buffer_desc(
                     "sfd_col_tensor",
                     block_scale_shape(output_n, m, 1, sf_vec_size),
                     jnp.float8_e8m0fnu,
-                    tensor_spec=scale_spec,
+                    mode=BLOCK_SCALE_MODE,
                 ),
             )
         )
@@ -347,6 +346,7 @@ def _grouped_gemm_dswiglu_impl(
     results = call_cutedsl(
         _launch,
         inputs,
+        input_descs=input_descs,
         static_args={
             "acc_dtype": acc_dtype,
             "mma_tiler_mn": mma_tiler_mn,
@@ -361,7 +361,6 @@ def _grouped_gemm_dswiglu_impl(
             "cluster_overlap_margin": int(cluster_overlap_margin),
         },
         outputs=outputs,
-        input_specs=input_specs,
     )
     result_idx = 3
     d_row_tensor, d_col_tensor, dprob_tensor = results[:3]
@@ -408,26 +407,25 @@ class GroupedGemmDswigluSm100(ApiBaseJax):
     ) -> None:
         super().__init__()
         output_layout = require_layout("output_layout", output_layout, ("LMN",))
-        a_spec = gemm_a_tensor_spec("LMK")
+        a_mode = gemm_a_mode("LMK")
         b_layout = require_layout("b_layout", b_layout, ("LNK", "LKN"))
-        b_spec = gemm_b_tensor_spec(b_layout)
-        output_spec = gemm_c_tensor_spec(output_layout, name="output_layout")
-        scale_spec = block_scale_tensor_spec()
+        b_mode = gemm_b_mode(b_layout)
+        output_mode = gemm_output_mode(output_layout, name="output_layout")
         self._sample_descs = {
             "a_tensor": self.make_tensor_desc(
-                sample_a_tensor, tensor_spec=a_spec, name="sample_a_tensor"
+                sample_a_tensor, mode=a_mode, name="sample_a_tensor"
             ),
             "b_tensor": self.make_tensor_desc(
-                sample_b_tensor, tensor_spec=b_spec, name="sample_b_tensor"
+                sample_b_tensor, mode=b_mode, name="sample_b_tensor"
             ),
             "c_tensor": self.make_tensor_desc(
-                sample_c_tensor, tensor_spec=output_spec, name="sample_c_tensor"
+                sample_c_tensor, mode=output_mode, name="sample_c_tensor"
             ),
             "sfa_tensor": self.make_tensor_desc(
-                sample_sfa_tensor, tensor_spec=scale_spec, name="sample_sfa_tensor"
+                sample_sfa_tensor, mode=BLOCK_SCALE_MODE, name="sample_sfa_tensor"
             ),
             "sfb_tensor": self.make_tensor_desc(
-                sample_sfb_tensor, tensor_spec=scale_spec, name="sample_sfb_tensor"
+                sample_sfb_tensor, mode=BLOCK_SCALE_MODE, name="sample_sfb_tensor"
             ),
             "padded_offsets": self.make_tensor_desc(
                 sample_padded_offsets, name="sample_padded_offsets"
@@ -440,7 +438,7 @@ class GroupedGemmDswigluSm100(ApiBaseJax):
             ),
             "prob_tensor": self.make_tensor_desc(
                 sample_prob_tensor,
-                tensor_spec=probability_tensor_spec(),
+                mode=PROBABILITY_MODE,
                 name="sample_prob_tensor",
             ),
             "norm_const_tensor": self.make_optional_tensor_desc(

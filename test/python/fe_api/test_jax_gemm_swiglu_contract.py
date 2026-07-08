@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Dependency-free contracts for the standard JAX GEMM + SwiGLU adapter."""
+"""Contracts for the standard JAX GEMM + SwiGLU adapter."""
 
 from __future__ import annotations
 
@@ -88,11 +88,29 @@ class JaxGemmSwigluContractTest(unittest.TestCase):
         internal.__spec__ = ModuleSpec(internal_name, loader=None, is_package=True)
         sys.modules[internal_name] = internal
 
-        tensor_module = importlib.import_module(f"{_PACKAGE}._tensor_desc")
+        tensor_module = importlib.import_module(f"{_PACKAGE}.common.tensor_desc")
         layout_module = importlib.import_module(f"{internal_name}.layout")
-        result_module = importlib.import_module(f"{_PACKAGE}._result")
+        result_module = importlib.import_module(f"{_PACKAGE}.common.result")
 
         class JaxTensorDesc(tensor_module.TensorDesc):
+            @classmethod
+            def from_shape(cls, shape, dtype, *, name, mode=None, init_value=None):
+                public_shape = tuple(shape)
+                mode = layout_module.normalize_mode(len(public_shape), mode)
+                public_order = tuple(reversed(range(len(public_shape))))
+                public_stride = layout_module.compact_stride(public_shape, public_order)
+                canonical_axis_by_public_axis = layout_module.to_public_axes(tuple(range(len(public_shape))), mode)
+                desc = cls(
+                    dtype=dtype,
+                    shape=layout_module.to_canonical_axes(public_shape, mode),
+                    stride=layout_module.to_canonical_axes(public_stride, mode),
+                    stride_order=tuple(canonical_axis_by_public_axis[axis] for axis in public_order),
+                    name=name,
+                    init_value=init_value,
+                )
+                object.__setattr__(desc, "mode", mode)
+                return desc
+
             @property
             def cudnn_dtype(self):
                 return _DTYPE_TO_CUDNN.get(self.dtype, _DataType.NOT_SET)
@@ -105,7 +123,7 @@ class JaxGemmSwigluContractTest(unittest.TestCase):
                 public_order = tuple(reversed(range(len(public_shape))))
                 public_stride = layout_module.compact_stride(public_shape, public_order)
                 canonical_axis_by_public_axis = layout_module.to_public_axes(tuple(range(len(public_shape))), mode)
-                return JaxTensorDesc(
+                desc = JaxTensorDesc(
                     dtype=value.dtype,
                     shape=layout_module.to_canonical_axes(public_shape, mode),
                     stride=layout_module.to_canonical_axes(public_stride, mode),
@@ -113,6 +131,8 @@ class JaxGemmSwigluContractTest(unittest.TestCase):
                     name=name,
                     init_value=init_value,
                 )
+                object.__setattr__(desc, "mode", mode)
+                return desc
 
             @staticmethod
             def _resolve_compute_capability(target, supported, operation_name):
@@ -146,6 +166,15 @@ class JaxGemmSwigluContractTest(unittest.TestCase):
                 )
 
             def _call_kernel(self, inputs, *, launch, **options):
+                input_descs = options.get("input_descs")
+                if input_descs is not None:
+                    for value, desc in zip(inputs, input_descs):
+                        self._check_tensor_signature(value, desc, mode=desc.mode)
+                    options["input_spec"] = tuple(self._to_tensor_spec(desc, mode=desc.mode) for desc in input_descs)
+                if "output_spec" not in options:
+                    options["output_spec"] = tuple(
+                        self._to_tensor_spec(desc, mode=getattr(desc, "mode", None)) for desc in options["output_descs"]
+                    )
                 options["launch"] = launch
                 self.captured_call = (tuple(inputs), options)
                 return tuple(
@@ -236,9 +265,9 @@ class JaxGemmSwigluContractTest(unittest.TestCase):
             sample_b,
         )
 
-        self.assertEqual(api.a_mode, (1, 2, 0))
-        self.assertEqual(api.b_mode, (1, 2, 0))
-        self.assertEqual(api.output_mode, (1, 2, 0))
+        self.assertEqual(api.a_desc.mode, (1, 2, 0))
+        self.assertEqual(api.b_desc.mode, (1, 2, 0))
+        self.assertEqual(api.c_desc.mode, (1, 2, 0))
         self.assertEqual(api.a_desc.shape, (128, 64, 3))
         self.assertEqual(api.b_desc.shape, (192, 64, 3))
         self.assertEqual(api.ab12_desc.shape, (128, 192, 3))
@@ -266,11 +295,11 @@ class JaxGemmSwigluContractTest(unittest.TestCase):
         self.assertEqual(options["output_descs"], (api.ab12_desc, api.c_desc))
         self.assertEqual(
             tuple(spec.mode for spec in options["input_spec"]),
-            (api.a_mode, api.b_mode),
+            (api.a_desc.mode, api.b_desc.mode),
         )
         self.assertEqual(
             tuple(spec.mode for spec in options["output_spec"]),
-            (api.output_mode, api.output_mode),
+            (api.ab12_desc.mode, api.c_desc.mode),
         )
         self.assertEqual(
             tuple(spec.layout for spec in options["input_spec"]),
@@ -293,9 +322,9 @@ class JaxGemmSwigluContractTest(unittest.TestCase):
         )
         result = api(sample_a, sample_b)
 
-        self.assertEqual(api.a_mode, (2, 1, 0))
-        self.assertEqual(api.b_mode, (2, 1, 0))
-        self.assertEqual(api.output_mode, (2, 1, 0))
+        self.assertEqual(api.a_desc.mode, (2, 1, 0))
+        self.assertEqual(api.b_desc.mode, (2, 1, 0))
+        self.assertEqual(api.c_desc.mode, (2, 1, 0))
         self.assertEqual(api.a_desc.shape, (128, 64, 3))
         self.assertEqual(api.b_desc.shape, (192, 64, 3))
         self.assertEqual(api.a_desc.stride_order, (0, 1, 2))
@@ -315,8 +344,6 @@ class JaxGemmSwigluContractTest(unittest.TestCase):
             sample_b,
             sample_ab12=sample_ab12,
             sample_c=sample_c,
-            ab12_dtype="bfloat16",
-            c_dtype="bfloat16",
         )
         result = api(sample_a, sample_b)
         self.assertEqual(result["ab12_tensor"].dtype, "bfloat16")
@@ -328,7 +355,7 @@ class JaxGemmSwigluContractTest(unittest.TestCase):
                 sample_b,
                 sample_ab12=sample_ab12,
             )
-        with self.assertRaisesRegex(ValueError, "c_dtype=float16 does not match the explicit sample dtype"):
+        with self.assertRaisesRegex(ValueError, "ab12_dtype and c_dtype cannot be specified"):
             self.module.GemmSwigluSm100(
                 sample_a,
                 sample_b,
@@ -348,24 +375,17 @@ class JaxGemmSwigluContractTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "sample_b tensor dtype mismatch"):
             api(sample_a, _Array(sample_b.shape, "float16"))
 
-    def test_rejects_unreachable_fp8_c_and_block_only_standard_options(self):
+    def test_rejects_fp8_c_and_block_only_standard_options(self):
         sample_a, sample_b = self._samples()
         sample_ab12 = _Array((3, 128, 192), "bfloat16")
         sample_c_fp8 = _Array((3, 128, 96), "float8_e4m3fn")
-        with self.assertRaisesRegex(NotImplementedError, "does not support FP8 C"):
+        with self.assertRaisesRegex(ValueError, "C dtype must be float16 or bfloat16"):
             self.module.GemmSwigluSm100(
                 sample_a,
                 sample_b,
                 sample_ab12=sample_ab12,
                 sample_c=sample_c_fp8,
-            )
-
-        with self.assertRaisesRegex(NotImplementedError, "does not expose FP8 C or SFC"):
-            self.module.GemmSwigluSm100(
-                sample_a,
-                sample_b,
-                sample_sfc=_Array((1,), "float8_e8m0fnu"),
-            )
+            ).check_support()
 
         for option, value in (("sf_vec_size", 32), ("vector_f32", True), ("ab12_stages", 3)):
             with self.subTest(option=option), self.assertRaisesRegex(ValueError, "only applies to block-scaled"):
@@ -425,7 +445,7 @@ class JaxGemmSwigluContractTest(unittest.TestCase):
         )
 
         self.assertTrue(api.is_block_scaled)
-        self.assertEqual(api.scale_mode, (3, 4, 1, 5, 2, 0))
+        self.assertEqual(api.sfa_desc.mode, (3, 4, 1, 5, 2, 0))
         self.assertEqual(api.sfa_desc.shape, (32, 4, 1, 4, 1, batch))
         self.assertEqual(api.sfa_desc.stride_order, (3, 1, 0, 4, 2, 5))
         result = api(sample_a, sample_b, sample_sfa, sample_sfb)
@@ -440,9 +460,12 @@ class JaxGemmSwigluContractTest(unittest.TestCase):
         self.assertEqual(inputs, (sample_a, sample_b, sample_sfa, sample_sfb))
         self.assertEqual(
             tuple(spec.mode for spec in options["input_spec"]),
-            (api.a_mode, api.b_mode, api.scale_mode, api.scale_mode),
+            (api.a_desc.mode, api.b_desc.mode, api.sfa_desc.mode, api.sfb_desc.mode),
         )
-        self.assertEqual(tuple(spec.mode for spec in options["output_spec"]), (api.output_mode, api.output_mode))
+        self.assertEqual(
+            tuple(spec.mode for spec in options["output_spec"]),
+            (api.ab12_desc.mode, api.c_desc.mode),
+        )
         self.assertEqual(api.captured_active_cluster_queries, [(1, 0)])
 
         seen = {}

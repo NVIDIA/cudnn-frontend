@@ -11,18 +11,18 @@ from typing import Any, Optional
 
 import jax
 import jax.numpy as jnp
-from cutlass.jax import TensorSpec
 
 from .._jax_api import (
     ApiBaseJax,
+    GROUPED_WORKSPACE_ALIGNMENT,
     make_buffer_desc,
     TWO_CTA_MMA_TILER_M,
     TupleDict,
     as_dtype,
+    as_gemm_tensor_desc,
     call_cutedsl,
     ceil_div,
     grouped_wgrad_workspace_bytes,
-    grouped_workspace_tensor_spec,
     normalize_wgrad_input_order,
     require_16_byte_extent,
     require_array,
@@ -45,28 +45,10 @@ def wgrad_scale_shape(
     )
 
 
-def wgrad_a_tensor_spec() -> TensorSpec:
-    """Describe ``A=(hidden,tokens)`` with tokens contiguous."""
-
-    return TensorSpec(layout=(1, 0), mode=(0, 1), ptr_assumed_align=16)
-
-
-def wgrad_b_tensor_spec() -> TensorSpec:
-    """Describe ``B=(tokens,intermediate)`` with tokens contiguous."""
-
-    return TensorSpec(layout=(0, 1), mode=(0, 1), ptr_assumed_align=16)
-
-
-def wgrad_scale_tensor_spec() -> TensorSpec:
-    """Describe the packed two-dimensional scale buffers."""
-
-    return TensorSpec(layout=(1, 0), mode=(0, 1), ptr_assumed_align=16)
-
-
-def wgrad_output_tensor_spec() -> TensorSpec:
-    """Describe contiguous ``(experts,hidden,intermediate)`` output."""
-
-    return TensorSpec(layout=(2, 1, 0), mode=(0, 1, 2), ptr_assumed_align=16)
+WGRAD_ALIGNMENT = 16
+WGRAD_A_STRIDE_ORDER = (1, 0)
+WGRAD_B_STRIDE_ORDER = (0, 1)
+WGRAD_OUTPUT_STRIDE_ORDER = (2, 1, 0)
 
 
 def _launch(
@@ -147,7 +129,6 @@ def _grouped_gemm_wgrad_impl(
     offsets_tensor: Any,
     global_scale_a: Optional[Any] = None,
     global_scale_b: Optional[Any] = None,
-    wgrad_tensor: Optional[Any] = None,
     acc_dtype: Any = None,
     wgrad_dtype: Any = None,
     mma_tiler_mn: tuple[int, int] = (256, 256),
@@ -169,10 +150,9 @@ def _grouped_gemm_wgrad_impl(
     aligned to ``sf_vec_size``, and no greater than ``tokens``.
 
     The JAX surface exposes only the dense output mode; raw per-expert pointer
-    outputs are not accepted. When ``accumulate_on_output=True``, an optional
-    ``wgrad_tensor`` seeds the reducing epilogue and the returned value contains
-    the seed plus the newly computed gradients. Omitting the seed preserves the
-    simple fresh-output behavior by starting from zero.
+    outputs are not accepted. The output is inferred from the inputs and
+    allocated by JAX. When ``accumulate_on_output=True``, the reducing epilogue
+    starts from a zero-initialized output.
 
     ``input_order='tensor_ragged'`` is supported when A and B have already been
     packed expert-by-expert according to the runtime offsets. JAX cannot infer
@@ -239,9 +219,6 @@ def _grouped_gemm_wgrad_impl(
         )
     output_shape = (expert_cnt, hidden, intermediate)
 
-    if wgrad_tensor is not None and not accumulate_on_output:
-        raise ValueError("wgrad_tensor is only valid when accumulate_on_output=True")
-
     has_global_scale = global_scale_a is not None or global_scale_b is not None
     if has_global_scale:
         if global_scale_a is None or global_scale_b is None:
@@ -268,32 +245,12 @@ def _grouped_gemm_wgrad_impl(
         default=jnp.float32,
     )
     valid_wgrad_dtypes = (jnp.bfloat16, jnp.float16, jnp.float32)
-    if wgrad_tensor is not None:
-        require_array(
-            wgrad_tensor,
-            name="wgrad_tensor",
-            shape=output_shape,
-            dtype=valid_wgrad_dtypes,
-        )
-        seed_dtype = as_dtype(wgrad_tensor)
-        wgrad_dtype = require_dtype(
-            wgrad_dtype,
-            valid_wgrad_dtypes,
-            name="wgrad_dtype",
-            default=seed_dtype,
-        )
-        if wgrad_dtype != seed_dtype:
-            raise ValueError(
-                "wgrad_dtype must match wgrad_tensor.dtype, got "
-                f"{wgrad_dtype} and {seed_dtype}"
-            )
-    else:
-        wgrad_dtype = require_dtype(
-            wgrad_dtype,
-            valid_wgrad_dtypes,
-            name="wgrad_dtype",
-            default=jnp.bfloat16,
-        )
+    wgrad_dtype = require_dtype(
+        wgrad_dtype,
+        valid_wgrad_dtypes,
+        name="wgrad_dtype",
+        default=jnp.bfloat16,
+    )
     mma_tiler_mn = require_grouped_mma_tiler(mma_tiler_mn, allowed_m=(128, 256))
     if cluster_shape_mn is None:
         cluster_shape_mn = (2, 1) if mma_tiler_mn[0] == TWO_CTA_MMA_TILER_M else (1, 1)
@@ -316,20 +273,46 @@ def _grouped_gemm_wgrad_impl(
         }
 
     inputs = [a_tensor, b_tensor, sfa_tensor, sfb_tensor, offsets_tensor]
-    input_specs = [
-        wgrad_a_tensor_spec(),
-        wgrad_b_tensor_spec(),
-        wgrad_scale_tensor_spec(),
-        wgrad_scale_tensor_spec(),
-        None,
+    input_descs = [
+        as_gemm_tensor_desc(
+            "a_tensor",
+            a_tensor,
+            public_stride_order=WGRAD_A_STRIDE_ORDER,
+            ptr_assumed_align=WGRAD_ALIGNMENT,
+        ),
+        as_gemm_tensor_desc(
+            "b_tensor",
+            b_tensor,
+            public_stride_order=WGRAD_B_STRIDE_ORDER,
+            ptr_assumed_align=WGRAD_ALIGNMENT,
+        ),
+        as_gemm_tensor_desc(
+            "sfa_tensor",
+            sfa_tensor,
+            public_stride_order=WGRAD_A_STRIDE_ORDER,
+            ptr_assumed_align=WGRAD_ALIGNMENT,
+        ),
+        as_gemm_tensor_desc(
+            "sfb_tensor",
+            sfb_tensor,
+            public_stride_order=WGRAD_A_STRIDE_ORDER,
+            ptr_assumed_align=WGRAD_ALIGNMENT,
+        ),
+        as_gemm_tensor_desc("offsets_tensor", offsets_tensor),
     ]
     if has_global_scale:
         inputs.extend((global_scale_a, global_scale_b))
-        input_specs.extend((None, None))
+        input_descs.extend(
+            (
+                as_gemm_tensor_desc("global_scale_a", global_scale_a),
+                as_gemm_tensor_desc("global_scale_b", global_scale_b),
+            )
+        )
 
     (result_wgrad_tensor,) = call_cutedsl(
         _launch,
         inputs,
+        input_descs=input_descs,
         static_args={
             "acc_dtype": acc_dtype,
             "mma_tiler_mn": mma_tiler_mn,
@@ -346,13 +329,11 @@ def _grouped_gemm_wgrad_impl(
                 "wgrad_tensor",
                 output_shape,
                 wgrad_dtype,
-                tensor_spec=wgrad_output_tensor_spec(),
-                init_value=(
-                    0.0 if accumulate_on_output and wgrad_tensor is None else None
-                ),
+                public_stride_order=WGRAD_OUTPUT_STRIDE_ORDER,
+                ptr_assumed_align=WGRAD_ALIGNMENT,
+                init_value=0.0 if accumulate_on_output else None,
             ),
         ),
-        output_seeds=(wgrad_tensor,),
         workspaces=(
             make_buffer_desc(
                 "workspace",
@@ -363,10 +344,9 @@ def _grouped_gemm_wgrad_impl(
                     ),
                 ),
                 jnp.uint8,
-                tensor_spec=grouped_workspace_tensor_spec(),
+                ptr_assumed_align=GROUPED_WORKSPACE_ALIGNMENT,
             ),
         ),
-        input_specs=input_specs,
     )
     return TupleDict(wgrad_tensor=result_wgrad_tensor)
 
@@ -390,25 +370,32 @@ class GroupedGemmWgradSm100(ApiBaseJax):
         sf_vec_size: int = 32,
         accumulate_on_output: bool = False,
         input_order: str = "tensor2d",
-        *,
-        sample_wgrad_tensor: Optional[Any] = None,
     ) -> None:
         super().__init__()
-        a_spec = wgrad_a_tensor_spec()
-        b_spec = wgrad_b_tensor_spec()
-        scale_spec = wgrad_scale_tensor_spec()
         self._sample_descs = {
             "a_tensor": self.make_tensor_desc(
-                sample_a_tensor, tensor_spec=a_spec, name="sample_a_tensor"
+                sample_a_tensor,
+                public_stride_order=WGRAD_A_STRIDE_ORDER,
+                ptr_assumed_align=WGRAD_ALIGNMENT,
+                name="sample_a_tensor",
             ),
             "b_tensor": self.make_tensor_desc(
-                sample_b_tensor, tensor_spec=b_spec, name="sample_b_tensor"
+                sample_b_tensor,
+                public_stride_order=WGRAD_B_STRIDE_ORDER,
+                ptr_assumed_align=WGRAD_ALIGNMENT,
+                name="sample_b_tensor",
             ),
             "sfa_tensor": self.make_tensor_desc(
-                sample_sfa_tensor, tensor_spec=scale_spec, name="sample_sfa_tensor"
+                sample_sfa_tensor,
+                public_stride_order=WGRAD_A_STRIDE_ORDER,
+                ptr_assumed_align=WGRAD_ALIGNMENT,
+                name="sample_sfa_tensor",
             ),
             "sfb_tensor": self.make_tensor_desc(
-                sample_sfb_tensor, tensor_spec=scale_spec, name="sample_sfb_tensor"
+                sample_sfb_tensor,
+                public_stride_order=WGRAD_A_STRIDE_ORDER,
+                ptr_assumed_align=WGRAD_ALIGNMENT,
+                name="sample_sfb_tensor",
             ),
             "offsets_tensor": self.make_tensor_desc(
                 sample_offsets_tensor, name="sample_offsets_tensor"
@@ -418,11 +405,6 @@ class GroupedGemmWgradSm100(ApiBaseJax):
             ),
             "global_scale_b": self.make_optional_tensor_desc(
                 sample_global_scale_b, name="sample_global_scale_b"
-            ),
-            "wgrad_tensor": self.make_optional_tensor_desc(
-                sample_wgrad_tensor,
-                tensor_spec=wgrad_output_tensor_spec(),
-                name="sample_wgrad_tensor",
             ),
         }
         self._config = {
@@ -452,7 +434,6 @@ class GroupedGemmWgradSm100(ApiBaseJax):
             self._sample_descs["offsets_tensor"],
             self._sample_descs["global_scale_a"],
             self._sample_descs["global_scale_b"],
-            self._sample_descs["wgrad_tensor"],
             **self._config,
             _validate_only=True,
         )
@@ -467,7 +448,6 @@ class GroupedGemmWgradSm100(ApiBaseJax):
         offsets_tensor: Any,
         global_scale_a: Optional[Any] = None,
         global_scale_b: Optional[Any] = None,
-        wgrad_tensor: Optional[Any] = None,
     ) -> TupleDict:
         return super().__call__(
             a_tensor,
@@ -477,7 +457,6 @@ class GroupedGemmWgradSm100(ApiBaseJax):
             offsets_tensor,
             global_scale_a,
             global_scale_b,
-            wgrad_tensor,
         )
 
     def _call_impl(
@@ -489,7 +468,6 @@ class GroupedGemmWgradSm100(ApiBaseJax):
         offsets_tensor: Any,
         global_scale_a: Optional[Any] = None,
         global_scale_b: Optional[Any] = None,
-        wgrad_tensor: Optional[Any] = None,
     ) -> TupleDict:
         values = {
             "a_tensor": a_tensor,
@@ -499,7 +477,6 @@ class GroupedGemmWgradSm100(ApiBaseJax):
             "offsets_tensor": offsets_tensor,
             "global_scale_a": global_scale_a,
             "global_scale_b": global_scale_b,
-            "wgrad_tensor": wgrad_tensor,
         }
         self.check_tensor_signatures(self._sample_descs, values)
         return _grouped_gemm_wgrad_impl(**values, **self._config)
@@ -532,14 +509,12 @@ def grouped_gemm_wgrad_wrapper_sm100(
     sf_vec_size: int = 32,
     accumulate_on_output: bool = False,
     input_order: str = "tensor2d",
-    *,
-    wgrad_tensor: Optional[Any] = None,
 ) -> TupleDict:
     """Compute dense expert weight gradients using the SM100 grouped kernel.
 
-    Set ``accumulate_on_output=True`` and pass ``wgrad_tensor`` to accumulate
-    into an existing JAX value. If accumulation is enabled without a seed, the
-    returned gradient starts from zero. Pointer-table outputs are not supported.
+    The output is inferred and allocated by JAX. Set
+    ``accumulate_on_output=True`` to use the reducing epilogue with a
+    zero-initialized output. Pointer-table outputs are not supported.
     """
 
     op = GroupedGemmWgradSm100(
@@ -557,7 +532,6 @@ def grouped_gemm_wgrad_wrapper_sm100(
         sf_vec_size=sf_vec_size,
         accumulate_on_output=accumulate_on_output,
         input_order=input_order,
-        sample_wgrad_tensor=wgrad_tensor,
     )
     return op(
         a_tensor,
@@ -567,7 +541,6 @@ def grouped_gemm_wgrad_wrapper_sm100(
         offsets_tensor,
         global_scale_a,
         global_scale_b,
-        wgrad_tensor,
     )
 
 

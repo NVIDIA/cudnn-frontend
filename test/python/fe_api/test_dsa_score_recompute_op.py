@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Dependency-free contracts for DSA score-recompute operations."""
+"""Contracts for DSA score-recompute operations."""
 
 from enum import Enum, auto
 import importlib
@@ -57,7 +57,7 @@ class DsaScoreRecomputeOpTest(unittest.TestCase):
         sys.modules[score_name] = score
 
         try:
-            cls.tensor = importlib.import_module(f"{_PACKAGE}._tensor_desc")
+            cls.tensor = importlib.import_module(f"{_PACKAGE}.common.tensor_desc")
             cls.op = importlib.import_module(f"{score_name}.op")
             cls.config = importlib.import_module(f"{score_name}.config")
         except Exception:

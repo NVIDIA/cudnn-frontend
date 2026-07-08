@@ -3,10 +3,10 @@
 
 """Framework-neutral dense GEMM + squared-ReLU operation."""
 
-from .._gemm_relu import BlockScaledGemmReluSm100Op
+from ..gemm.srelu import BlockScaledGemmSreluSm100OpBase
 
 
-class GemmSreluSm100Op(BlockScaledGemmReluSm100Op):
+class GemmSreluSm100Op(BlockScaledGemmSreluSm100OpBase):
     """Logical signature for block-scaled GEMM + squared ReLU."""
 
     def check_support(self) -> bool:

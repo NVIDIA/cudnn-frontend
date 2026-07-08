@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Dependency-free contracts for JAX DSA score-recompute adapters."""
+"""Contracts for JAX DSA score-recompute adapters."""
 
 from enum import Enum, auto
 import ast
@@ -68,7 +68,7 @@ class JaxDsaScoreRecomputeContractTest(unittest.TestCase):
         root.data_type = _DataType
         sys.modules[_PACKAGE] = root
 
-        cls.tensor = importlib.import_module(f"{_PACKAGE}._tensor_desc")
+        cls.tensor = importlib.import_module(f"{_PACKAGE}.common.tensor_desc")
 
         fake_jnp = types.ModuleType("jax.numpy")
         fake_jnp.bfloat16 = _DataType.BFLOAT16
@@ -90,6 +90,29 @@ class JaxDsaScoreRecomputeContractTest(unittest.TestCase):
 
         tensor_module = cls.tensor
 
+        class JaxTensorDesc(tensor_module.TensorDesc):
+            @classmethod
+            def from_shape(
+                cls,
+                shape,
+                dtype,
+                *,
+                name="",
+                mode=None,
+                public_stride_order=None,
+                init_value=None,
+            ):
+                return FakeJaxApiBase._to_tensor_desc(
+                    _Array(shape, dtype),
+                    name,
+                    mode=mode,
+                    init_value=init_value,
+                )
+
+            @property
+            def cudnn_dtype(self):
+                return self.dtype
+
         class FakeJaxApiBase:
             @staticmethod
             def _to_tensor_desc(value, name, *, mode=None, init_value=None):
@@ -103,7 +126,7 @@ class JaxDsaScoreRecomputeContractTest(unittest.TestCase):
                 canonical_axis_by_public = [0] * len(mode)
                 for canonical_axis, public_axis in enumerate(mode):
                     canonical_axis_by_public[public_axis] = canonical_axis
-                return tensor_module.TensorDesc(
+                desc = JaxTensorDesc(
                     dtype=value.dtype,
                     shape=tuple(public_shape[axis] for axis in mode),
                     stride=tuple(public_stride[axis] for axis in mode),
@@ -114,6 +137,8 @@ class JaxDsaScoreRecomputeContractTest(unittest.TestCase):
                     name=name,
                     init_value=init_value,
                 )
+                object.__setattr__(desc, "mode", mode)
+                return desc
 
             @staticmethod
             def _resolve_compute_capability(target, supported, operation_name):
@@ -125,7 +150,7 @@ class JaxDsaScoreRecomputeContractTest(unittest.TestCase):
 
             @staticmethod
             def _check_tensor_signature(value, expected, *, mode=None):
-                mode = tuple(range(len(value.shape))) if mode is None else tuple(mode)
+                mode = expected.mode if mode is None else tuple(mode)
                 if tuple(value.shape[axis] for axis in mode) != expected.shape:
                     raise ValueError(f"{expected.name} tensor shape mismatch")
                 if value.dtype != expected.cudnn_dtype:
@@ -133,12 +158,23 @@ class JaxDsaScoreRecomputeContractTest(unittest.TestCase):
 
             @staticmethod
             def _to_tensor_spec(desc, *, mode=None, divisibility=None):
-                del desc
+                if mode is None:
+                    mode = desc.mode
                 return _TensorSpec(mode=mode, divisibility=divisibility)
 
             def _call_kernel(
                 self, inputs, *, launch, output_descs, workspace_descs=(), **options
             ):
+                input_descs = options.get("input_descs")
+                if input_descs is not None:
+                    for value, desc in zip(inputs, input_descs):
+                        self._check_tensor_signature(value, desc)
+                    options["input_spec"] = tuple(
+                        self._to_tensor_spec(desc) for desc in input_descs
+                    )
+                options["output_spec"] = tuple(
+                    self._to_tensor_spec(desc) for desc in output_descs
+                )
                 self.captured_call = {
                     "inputs": tuple(inputs),
                     "outputs": tuple(output_descs),
@@ -150,7 +186,7 @@ class JaxDsaScoreRecomputeContractTest(unittest.TestCase):
                 outputs = []
                 for desc, spec in zip(output_descs, specs):
                     mode = (
-                        tuple(range(desc.ndim))
+                        desc.mode
                         if spec is None or spec.mode is None
                         else tuple(spec.mode)
                     )
@@ -175,7 +211,7 @@ class JaxDsaScoreRecomputeContractTest(unittest.TestCase):
             fake_internal_jax.__name__, loader=None, is_package=True
         )
         fake_internal_jax.JaxApiBase = FakeJaxApiBase
-        fake_internal_jax.JaxTensorDesc = tensor_module.TensorDesc
+        fake_internal_jax.JaxTensorDesc = JaxTensorDesc
         fake_internal_jax.TupleDict = _TupleDict
 
         dsa_name = f"{_PACKAGE}.deepseek_sparse_attention"
@@ -193,9 +229,6 @@ class JaxDsaScoreRecomputeContractTest(unittest.TestCase):
         utils_name = f"{dsa_name}.utils"
         utils = types.ModuleType(utils_name)
         utils.__path__ = []
-        compiler = types.ModuleType(f"{utils_name}.compiler")
-        compiler.compile_options_for_target = lambda target: f"--gpu-arch sm_{target}"
-
         cls.optional_modules = {
             "jax": fake_jax,
             "jax.numpy": fake_jnp,
@@ -203,7 +236,6 @@ class JaxDsaScoreRecomputeContractTest(unittest.TestCase):
             dsa_name: dsa,
             score_name: score,
             utils_name: utils,
-            compiler.__name__: compiler,
         }
         sys.modules.update(cls.optional_modules)
         try:
@@ -274,7 +306,7 @@ class JaxDsaScoreRecomputeContractTest(unittest.TestCase):
         self.assertEqual(
             (workspace.shape, workspace.cudnn_dtype), ((1, 1), _DataType.INT32)
         )
-        self.assertEqual(api.captured_call["compile_options"], "--gpu-arch sm_100")
+        self.assertEqual(api.captured_call["compile_options"], "--gpu-arch sm_100a")
 
     def test_explicit_topk_length_remains_a_real_input(self):
         q, k, _, indices = self.sparse_samples()
@@ -330,7 +362,7 @@ class JaxDsaScoreRecomputeContractTest(unittest.TestCase):
         self.assertEqual(kernel_weights.shape, (2, 32, 4))
         self.assertEqual(
             tuple(spec.mode for spec in api.captured_call["input_spec"]),
-            ((1, 0, 2, 3), (1, 0, 2, 3), None, (1, 0, 2)),
+            ((1, 0, 2, 3), (1, 0, 2, 3), (0, 1, 2), (1, 0, 2)),
         )
         self.assertEqual(
             api.captured_call["output_spec"][0].mode,

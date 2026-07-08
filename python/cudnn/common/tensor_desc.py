@@ -10,7 +10,7 @@ from numbers import Real
 from operator import index
 from typing import Any, Generic, TypeVar
 
-from . import data_type
+from .. import data_type
 
 DTypeT = TypeVar("DTypeT")
 

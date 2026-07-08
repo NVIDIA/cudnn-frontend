@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Dependency-free JAX contracts for DSA sparse-attention backward."""
+"""JAX contracts for DSA sparse-attention backward."""
 
 from __future__ import annotations
 
@@ -88,7 +88,7 @@ class JaxSparseAttentionBackwardContractTest(unittest.TestCase):
         operation.__spec__ = ModuleSpec(operation_name, loader=None, is_package=True)
         sys.modules[operation_name] = operation
 
-        tensor_module = importlib.import_module(f"{_PACKAGE}._tensor_desc")
+        tensor_module = importlib.import_module(f"{_PACKAGE}.common.tensor_desc")
 
         class JaxTensorDesc(tensor_module.TensorDesc):
             @property
@@ -111,6 +111,18 @@ class JaxSparseAttentionBackwardContractTest(unittest.TestCase):
                     name=name,
                     init_value=init_value,
                 )
+
+            def with_divisibility(self, divisibility):
+                desc = JaxTensorDesc(
+                    dtype=self.dtype,
+                    shape=self.shape,
+                    stride=self.stride,
+                    stride_order=self.stride_order,
+                    name=self.name,
+                    init_value=self.init_value,
+                )
+                object.__setattr__(desc, "divisibility", tuple(divisibility))
+                return desc
 
         class JaxApiBase:
             captured_call = None
@@ -138,7 +150,7 @@ class JaxSparseAttentionBackwardContractTest(unittest.TestCase):
             def _resolve_compute_capability(target, supported, operation_name):
                 del supported, operation_name
                 if target is None:
-                    raise RuntimeError("target required by dependency-free test")
+                    raise RuntimeError("target required by test")
                 return target
 
             @staticmethod
@@ -162,6 +174,9 @@ class JaxSparseAttentionBackwardContractTest(unittest.TestCase):
                 return tuple(_Array(desc.shape, _CUDNN_TO_DTYPE[desc.cudnn_dtype]) for desc in options["output_descs"])
 
         internal = types.ModuleType(f"{_PACKAGE}._jax")
+        internal.__path__ = [str(_CUDNN_ROOT / "_jax")]
+        internal.__package__ = internal.__name__
+        internal.__spec__ = ModuleSpec(internal.__name__, loader=None, is_package=True)
         internal.JaxApiBase = JaxApiBase
         internal.JaxTensorDesc = JaxTensorDesc
         internal.TupleDict = _TupleDict

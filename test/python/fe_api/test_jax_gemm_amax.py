@@ -65,10 +65,12 @@ def test_jax_gemm_amax_abstract_contract(monkeypatch):
     from cudnn._jax import JaxApiBase
     from cudnn.jax import GemmAmaxSm100, gemm_amax_wrapper_sm100
 
-    def abstract_call(self, _inputs, *, output_descs, output_spec, **_options):
+    def abstract_call(self, _inputs, *, output_descs, output_spec=None, **_options):
+        if output_spec is None:
+            output_spec = tuple(self._to_tensor_spec(desc) for desc in output_descs)
         values = []
         for desc, spec in zip(output_descs, output_spec):
-            shape = self._materialize_tensor_desc(desc, mode=spec.mode).shape
+            shape = self._to_shape_dtype_struct(desc, mode=spec.mode).shape
             fill = 0 if desc.init_value is None else desc.init_value
             values.append(jnp.full(shape, fill, dtype=desc.dtype))
         return tuple(values)

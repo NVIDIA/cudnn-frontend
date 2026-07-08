@@ -8,7 +8,7 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from .. import data_type
-from .._dense_gemm import (
+from ..gemm.helpers import (
     block_scale_shape,
     require_16_byte_alignment,
     require_block_scale_layout,
@@ -18,8 +18,8 @@ from .._dense_gemm import (
     require_mma_tiler,
     require_tensor_shape,
 )
-from .._op import Op
-from .._tensor_desc import TensorDesc
+from ..common.op import Op
+from ..common.tensor_desc import TensorDesc
 
 _STANDARD_AB_DTYPES = frozenset(
     {

@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Dependency-free contracts for the RMSNorm CuTe kernel."""
+"""Contracts for the RMSNorm CuTe kernel."""
 
 import ast
 import importlib

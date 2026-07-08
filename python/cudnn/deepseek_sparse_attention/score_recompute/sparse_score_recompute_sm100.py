@@ -348,6 +348,7 @@ class SparseScoreRecomputeSm100:
         tile_sched_params: utils.ClcDynamicPersistentTileSchedulerParams,
     ):
         """Device-side kernel entry with CLC persistent scheduling."""
+        mK = copy_utils.as_global_tensor(mK)
         seqlen_q_packed = cute.size(mQ.shape[0])
         seqlen_k = cute.size(mK.shape[0])
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())

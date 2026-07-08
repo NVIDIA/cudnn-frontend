@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Dependency-free JAX contracts for DSA indexer backward."""
+"""JAX contracts for DSA indexer backward."""
 
 from __future__ import annotations
 
@@ -121,7 +121,7 @@ class JaxIndexerBackwardContractTest(unittest.TestCase):
         operation.__spec__ = ModuleSpec(operation_name, loader=None, is_package=True)
         sys.modules[operation_name] = operation
 
-        tensor_module = importlib.import_module(f"{_PACKAGE}._tensor_desc")
+        tensor_module = importlib.import_module(f"{_PACKAGE}.common.tensor_desc")
 
         class JaxTensorDesc(tensor_module.TensorDesc):
             @property
@@ -129,7 +129,14 @@ class JaxIndexerBackwardContractTest(unittest.TestCase):
                 return cls.dtype_to_cudnn.get(self.dtype, _DataType.NOT_SET)
 
             def compact_like(
-                self, *, cudnn_dtype, shape, stride_order=None, name="", init_value=None
+                self,
+                *,
+                cudnn_dtype,
+                shape,
+                stride_order=None,
+                name="",
+                init_value=None,
+                mode=None,
             ):
                 canonical = tensor_module.make_compact_tensor_desc(
                     dtype=cudnn_dtype,
@@ -138,7 +145,7 @@ class JaxIndexerBackwardContractTest(unittest.TestCase):
                     name=name,
                     init_value=init_value,
                 )
-                return JaxTensorDesc(
+                desc = JaxTensorDesc(
                     dtype=cls.cudnn_to_dtype[cudnn_dtype],
                     shape=canonical.shape,
                     stride=canonical.stride,
@@ -146,6 +153,25 @@ class JaxIndexerBackwardContractTest(unittest.TestCase):
                     name=name,
                     init_value=init_value,
                 )
+                object.__setattr__(
+                    desc,
+                    "mode",
+                    tuple(range(len(shape))) if mode is None else tuple(mode),
+                )
+                return desc
+
+            def with_divisibility(self, divisibility):
+                desc = JaxTensorDesc(
+                    dtype=self.dtype,
+                    shape=self.shape,
+                    stride=self.stride,
+                    stride_order=self.stride_order,
+                    name=self.name,
+                    init_value=self.init_value,
+                )
+                object.__setattr__(desc, "mode", self.mode)
+                object.__setattr__(desc, "divisibility", tuple(divisibility))
+                return desc
 
         class JaxApiBase:
             captured_call = None
@@ -162,7 +188,7 @@ class JaxIndexerBackwardContractTest(unittest.TestCase):
                 canonical_axis_by_public = [0] * len(mode)
                 for canonical_axis, public_axis in enumerate(mode):
                     canonical_axis_by_public[public_axis] = canonical_axis
-                return JaxTensorDesc(
+                desc = JaxTensorDesc(
                     dtype=value.dtype,
                     shape=tuple(public_shape[axis] for axis in mode),
                     stride=tuple(public_stride[axis] for axis in mode),
@@ -173,12 +199,14 @@ class JaxIndexerBackwardContractTest(unittest.TestCase):
                     name=name,
                     init_value=init_value,
                 )
+                object.__setattr__(desc, "mode", mode)
+                return desc
 
             @staticmethod
             def _resolve_compute_capability(target, supported, operation_name):
                 del supported, operation_name
                 if target is None:
-                    raise RuntimeError("target required by dependency-free test")
+                    raise RuntimeError("target required by test")
                 return target
 
             @staticmethod
@@ -189,7 +217,7 @@ class JaxIndexerBackwardContractTest(unittest.TestCase):
 
             @staticmethod
             def _check_tensor_signature(value, expected, *, mode=None):
-                mode = tuple(range(len(value.shape))) if mode is None else tuple(mode)
+                mode = expected.mode if mode is None else tuple(mode)
                 actual_dtype = cls.dtype_to_cudnn.get(value.dtype, _DataType.NOT_SET)
                 actual_shape = tuple(value.shape[axis] for axis in mode)
                 if (
@@ -200,11 +228,51 @@ class JaxIndexerBackwardContractTest(unittest.TestCase):
 
             @staticmethod
             def _to_tensor_spec(desc, *, mode=None, divisibility=None):
-                del desc
+                if mode is None:
+                    mode = desc.mode
+                if divisibility is None:
+                    divisibility = getattr(desc, "divisibility", None)
                 return _TensorSpec(mode=mode, divisibility=divisibility)
 
             def _call_kernel(self, inputs, *, launch, **options):
                 options["launch"] = launch
+                input_descs = options.get("input_descs")
+                if input_descs is not None:
+                    for value, desc in zip(inputs, input_descs):
+                        self._check_tensor_signature(value, desc)
+                    derived_specs = tuple(
+                        self._to_tensor_spec(desc) for desc in input_descs
+                    )
+                    supplied_specs = options.get("input_spec")
+                    options["input_spec"] = (
+                        derived_specs
+                        if supplied_specs is None
+                        else tuple(
+                            derived if supplied is None else supplied
+                            for derived, supplied in zip(
+                                derived_specs, supplied_specs
+                            )
+                        )
+                    )
+                output_descs = options["output_descs"]
+                derived_output_specs = tuple(
+                    self._to_tensor_spec(desc) for desc in output_descs
+                )
+                supplied_output_specs = options.get("output_spec")
+                options["output_spec"] = (
+                    derived_output_specs
+                    if supplied_output_specs is None
+                    else tuple(
+                        derived if supplied is None else supplied
+                        for derived, supplied in zip(
+                            derived_output_specs, supplied_output_specs
+                        )
+                    )
+                )
+                options["workspace_spec"] = tuple(
+                    self._to_tensor_spec(desc)
+                    for desc in options.get("workspace_descs", ())
+                )
                 JaxApiBase.captured_call = (inputs, options)
                 specs = options.get("output_spec") or (None,) * len(
                     options["output_descs"]
@@ -212,7 +280,7 @@ class JaxIndexerBackwardContractTest(unittest.TestCase):
                 results = []
                 for desc, spec in zip(options["output_descs"], specs):
                     mode = (
-                        tuple(range(desc.ndim))
+                        desc.mode
                         if spec is None or spec.mode is None
                         else tuple(spec.mode)
                     )

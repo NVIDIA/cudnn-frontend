@@ -8,8 +8,8 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from .. import data_type
-from .._op import Op
-from .._tensor_desc import TensorDesc
+from ..common.op import Op
+from ..common.tensor_desc import TensorDesc
 
 HAD_BLOCK = 16
 

@@ -8,8 +8,8 @@ from __future__ import annotations
 from operator import index
 from typing import Iterable
 
-from . import data_type
-from ._tensor_desc import TensorDesc
+from .. import data_type
+from ..common.tensor_desc import TensorDesc
 
 _STANDARD_MMA_M = (128, 256)
 _STANDARD_MMA_N = tuple(range(32, 257, 32))

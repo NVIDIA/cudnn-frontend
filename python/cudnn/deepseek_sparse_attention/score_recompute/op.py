@@ -11,8 +11,8 @@ from operator import index
 from typing import Any
 
 from ... import data_type
-from ..._op import Op
-from ..._tensor_desc import TensorDesc
+from ...common.op import Op
+from ...common.tensor_desc import TensorDesc
 from .config import (
     DenseScoreKernelConfig,
     SparseScoreKernelConfig,

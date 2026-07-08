@@ -105,7 +105,9 @@ class GemmReluImportContractTest(unittest.TestCase):
 
     def test_framework_neutral_op_modules_have_no_framework_imports(self):
         paths = [
-            _CUDNN_ROOT / "_gemm_relu.py",
+            _CUDNN_ROOT / "gemm" / "__init__.py",
+            _CUDNN_ROOT / "gemm" / "helpers.py",
+            _CUDNN_ROOT / "gemm" / "srelu.py",
             _CUDNN_ROOT / "gemm_srelu" / "op.py",
             _CUDNN_ROOT / "gemm_dsrelu" / "op.py",
         ]

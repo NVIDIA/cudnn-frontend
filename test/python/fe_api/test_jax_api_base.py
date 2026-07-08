@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Dependency-free contracts for the JAX API base."""
+"""Contracts for the JAX API base."""
 
 from enum import Enum, auto
 import importlib
@@ -38,10 +38,18 @@ class _ArrayMetadata:
 
 
 class _TensorSpec:
-    def __init__(self, *, layout=None, mode=None, divisibility=None):
+    def __init__(
+        self,
+        *,
+        layout=None,
+        mode=None,
+        divisibility=None,
+        ptr_assumed_align=None,
+    ):
         self.layout = layout
         self.mode = mode
         self.divisibility = divisibility
+        self.ptr_assumed_align = ptr_assumed_align
 
 
 class _ShapeDtypeStruct:
@@ -100,7 +108,7 @@ class JaxApiBaseTest(unittest.TestCase):
                     "cutlass.jax": None,
                 },
             ):
-                cls.tensor_module = importlib.import_module(f"{_PACKAGE}._tensor_desc")
+                cls.tensor_module = importlib.import_module(f"{_PACKAGE}.common.tensor_desc")
                 cls.module = importlib.import_module(f"{internal_name}.api_base")
         except Exception:
             cls.tearDownClass()
@@ -275,15 +283,31 @@ class JaxApiBaseTest(unittest.TestCase):
         self.assertEqual(desc.cudnn_dtype, _DataType.BFLOAT16)
 
     def test_converts_public_array_axes_to_canonical_descriptor_axes(self):
+        mode = (2, 0, 1)
         desc = self.module.JaxApiBase._to_tensor_desc(
             _ArrayMetadata((2, 3, 4), "bfloat16"),
             "sample",
-            mode=(2, 0, 1),
+            mode=mode,
         )
 
         self.assertEqual(desc.shape, (4, 2, 3))
         self.assertEqual(desc.stride, (1, 12, 4))
         self.assertEqual(desc.stride_order, (0, 2, 1))
+        self.assertEqual(desc.mode, mode)
+        self.assertEqual(desc.array_shape, (2, 3, 4))
+
+    def test_constructs_descriptor_directly_from_shape(self):
+        desc = self.module.JaxTensorDesc.from_shape(
+            (2, 3, 4),
+            "bfloat16",
+            name="sample",
+            mode=(2, 0, 1),
+        )
+
+        self.assertEqual(desc.shape, (4, 2, 3))
+        self.assertEqual(desc.array_shape, (2, 3, 4))
+        self.assertEqual(desc.mode, (2, 0, 1))
+        self.assertEqual(desc.cudnn_dtype, _DataType.BFLOAT16)
 
     def test_converts_public_physical_layout_to_canonical_descriptor_axes(self):
         desc = self.module.JaxApiBase._to_tensor_desc(
@@ -329,6 +353,7 @@ class JaxApiBaseTest(unittest.TestCase):
         self.assertEqual(output.stride_order, (0, 1))
         self.assertEqual(output.name, "output")
         self.assertEqual(output.init_value, -2.0)
+        self.assertEqual(output.mode, (0, 1))
 
     def test_checks_invocation_signature(self):
         desc = self.module.JaxApiBase._to_tensor_desc(_ArrayMetadata((2, 3), "bfloat16"), "sample")
@@ -350,13 +375,11 @@ class JaxApiBaseTest(unittest.TestCase):
         self.module.JaxApiBase._check_tensor_signature(
             _ArrayMetadata((2, 3, 4), "bfloat16"),
             desc,
-            mode=mode,
         )
         with self.assertRaisesRegex(ValueError, "sample tensor shape mismatch"):
             self.module.JaxApiBase._check_tensor_signature(
                 _ArrayMetadata((1, 3, 4), "bfloat16"),
                 desc,
-                mode=mode,
             )
 
     def test_builds_public_tensor_spec_from_canonical_metadata(self):
@@ -365,6 +388,8 @@ class JaxApiBaseTest(unittest.TestCase):
             _ArrayMetadata((2, 3, 4), "bfloat16"),
             "sample",
             mode=mode,
+            divisibility=(8, 2, 4),
+            ptr_assumed_align=64,
         )
         cutlass = types.ModuleType("cutlass")
         cutlass.__path__ = []
@@ -373,15 +398,12 @@ class JaxApiBaseTest(unittest.TestCase):
         cutlass.jax = cutlass_jax
 
         with mock.patch.dict(sys.modules, {"cutlass": cutlass, "cutlass.jax": cutlass_jax}):
-            spec = self.module.JaxApiBase._to_tensor_spec(
-                desc,
-                mode=mode,
-                divisibility=(8, 2, 4),
-            )
+            spec = self.module.JaxApiBase._to_tensor_spec(desc)
 
         self.assertEqual(spec.layout, (2, 1, 0))
         self.assertEqual(spec.mode, mode)
         self.assertEqual(spec.divisibility, (2, 4, 8))
+        self.assertEqual(spec.ptr_assumed_align, 64)
 
     def test_tensor_spec_preserves_explicit_public_physical_layout(self):
         mode = (1, 2, 0)
@@ -398,12 +420,12 @@ class JaxApiBaseTest(unittest.TestCase):
         cutlass.jax = cutlass_jax
 
         with mock.patch.dict(sys.modules, {"cutlass": cutlass, "cutlass.jax": cutlass_jax}):
-            spec = self.module.JaxApiBase._to_tensor_spec(desc, mode=mode)
+            spec = self.module.JaxApiBase._to_tensor_spec(desc)
 
         self.assertEqual(spec.layout, (0, 2, 1))
         self.assertEqual(spec.mode, mode)
 
-    def test_tensor_spec_defaults_to_identity_axis_binding(self):
+    def test_default_descriptor_uses_cutlass_default_tensor_spec(self):
         desc = self.module.JaxApiBase._to_tensor_desc(
             _ArrayMetadata((2, 3), "bfloat16"),
             "sample",
@@ -415,11 +437,7 @@ class JaxApiBaseTest(unittest.TestCase):
         cutlass.jax = cutlass_jax
 
         with mock.patch.dict(sys.modules, {"cutlass": cutlass, "cutlass.jax": cutlass_jax}):
-            spec = self.module.JaxApiBase._to_tensor_spec(desc)
-
-        self.assertEqual(spec.layout, (1, 0))
-        self.assertEqual(spec.mode, (0, 1))
-        self.assertIsNone(spec.divisibility)
+            self.assertIsNone(self.module.JaxApiBase._to_tensor_spec(desc))
 
     def test_tensor_spec_rejects_divisibility_with_the_wrong_rank(self):
         desc = self.module.JaxApiBase._to_tensor_desc(
@@ -428,54 +446,54 @@ class JaxApiBaseTest(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(ValueError, "divisibility rank mismatch"):
-            self.module.JaxApiBase._to_tensor_spec(desc, divisibility=(2,))
+            self.module.JaxTensorDesc.from_array(
+                _ArrayMetadata((2, 3), "bfloat16"),
+                name="sample",
+                divisibility=(2,),
+            )
 
-    def test_materializes_canonical_output_in_public_axis_order(self):
-        desc = self.tensor_module.TensorDesc(
-            dtype=_DataType.BFLOAT16,
-            shape=(4, 2, 3),
-            stride=(1, 12, 4),
-            stride_order=(0, 2, 1),
+    def test_builds_shape_dtype_struct_in_array_axis_order(self):
+        desc = self.module.JaxTensorDesc.from_shape(
+            (2, 3, 4),
+            "bfloat16",
+            mode=(2, 0, 1),
         )
         jax = types.ModuleType("jax")
         jax.ShapeDtypeStruct = _ShapeDtypeStruct
 
         with mock.patch.dict(sys.modules, {"jax": jax}):
-            output = self.module.JaxApiBase._materialize_tensor_desc(
-                desc,
-                mode=(2, 0, 1),
-            )
+            output = self.module.JaxApiBase._to_shape_dtype_struct(desc)
 
         self.assertEqual(output.shape, (2, 3, 4))
         self.assertEqual(output.dtype, "bfloat16")
 
-    def test_calls_explicit_launcher_with_initialized_outputs_and_hidden_workspaces(self):
-        tensor_module = self.tensor_module
+    def test_calls_explicit_launcher_with_initialized_and_fresh_outputs(self):
         seen = {}
 
         output_descs = (
-            tensor_module.make_compact_tensor_desc(
-                dtype=_DataType.FLOAT,
-                shape=(2,),
+            self.module.JaxTensorDesc.from_shape(
+                (2,),
+                "float32",
                 name="output",
             ),
-            tensor_module.make_compact_tensor_desc(
-                dtype=_DataType.FLOAT,
-                shape=(4, 2, 3),
+            self.module.JaxTensorDesc.from_shape(
+                (2, 3, 4),
+                "float32",
                 name="amax",
                 init_value=float("-inf"),
+                mode=(2, 0, 1),
             ),
         )
         workspace_descs = (
-            tensor_module.make_compact_tensor_desc(
-                dtype=_DataType.FLOAT,
-                shape=(3,),
+            self.module.JaxTensorDesc.from_shape(
+                (3,),
+                "float32",
                 name="counter",
                 init_value=0,
             ),
-            tensor_module.make_compact_tensor_desc(
-                dtype=_DataType.BFLOAT16,
-                shape=(5,),
+            self.module.JaxTensorDesc.from_shape(
+                (5,),
+                "bfloat16",
                 name="scratch",
             ),
         )
@@ -491,6 +509,7 @@ class JaxApiBaseTest(unittest.TestCase):
                 return self._call_kernel(
                     (value,),
                     launch=launch,
+                    input_descs=(input_desc,),
                     output_descs=output_descs,
                     workspace_descs=workspace_descs,
                 )
@@ -511,10 +530,23 @@ class JaxApiBaseTest(unittest.TestCase):
 
         cutlass = types.ModuleType("cutlass")
         cutlass.__path__ = []
+        cutlass_cute = types.ModuleType("cutlass.cute")
+
+        def cute_jit(*, preprocess):
+            self.assertFalse(preprocess)
+
+            def decorate(function):
+                seen["cute_launcher"] = function
+                return function
+
+            return decorate
+
+        cutlass_cute.jit = cute_jit
         cutlass_jax = types.ModuleType("cutlass.jax")
         cutlass_jax.TensorSpec = _TensorSpec
 
         def cutlass_call(launcher, **options):
+            seen["cutlass_launcher"] = launcher
             seen["call_options"] = options
 
             def invoke(*args):
@@ -538,12 +570,14 @@ class JaxApiBaseTest(unittest.TestCase):
             return invoke
 
         cutlass_jax.cutlass_call = cutlass_call
+        cutlass.cute = cutlass_cute
         cutlass.jax = cutlass_jax
 
         input_value = _ArrayMetadata((2,), "float32", label="input")
-        output_seed = _ArrayMetadata((2,), "float32", label="seed")
-        input_tensor_spec = _TensorSpec(layout=(0,), mode=(0,))
-        initialized_output_spec = _TensorSpec(layout=(2, 1, 0), mode=(2, 0, 1))
+        input_desc = self.module.JaxTensorDesc.from_array(
+            input_value,
+            name="input",
+        )
         api = Adapter()
         with mock.patch.dict(
             sys.modules,
@@ -551,64 +585,62 @@ class JaxApiBaseTest(unittest.TestCase):
                 "jax": jax,
                 "jax.numpy": jnp,
                 "cutlass": cutlass,
+                "cutlass.cute": cutlass_cute,
                 "cutlass.jax": cutlass_jax,
             },
         ):
             results = api._call_kernel(
                 (input_value,),
                 launch=launch,
+                input_descs=(input_desc,),
                 output_descs=output_descs,
-                output_seeds=(output_seed, None),
                 workspace_descs=workspace_descs,
-                input_spec=(input_tensor_spec,),
-                output_spec=(None, initialized_output_spec),
             )
-            with self.assertRaisesRegex(ValueError, "Expected 2 output seeds, got 1"):
-                api._call_kernel(
-                    (input_value,),
-                    launch=launch,
-                    output_descs=output_descs,
-                    output_seeds=(output_seed,),
-                )
-            with self.assertRaisesRegex(ValueError, "output seed shape mismatch"):
-                api._call_kernel(
-                    (input_value,),
-                    launch=launch,
-                    output_descs=output_descs,
-                    output_seeds=(
-                        _ArrayMetadata((3,), "float32", label="wrong shape"),
-                        None,
-                    ),
-                )
-            with self.assertRaisesRegex(ValueError, "output seed dtype mismatch"):
-                api._call_kernel(
-                    (input_value,),
-                    launch=launch,
-                    output_descs=output_descs,
-                    output_seeds=(
-                        _ArrayMetadata((2,), "bfloat16", label="wrong dtype"),
-                        None,
-                    ),
-                )
             with self.assertRaisesRegex(TypeError, "input #0 must have shape and dtype metadata"):
                 api._call_kernel(
                     ([input_value],),
                     launch=launch,
+                    input_descs=(input_desc,),
                     output_descs=output_descs,
                     workspace_descs=workspace_descs,
                 )
-            with self.assertRaisesRegex(TypeError, "output_spec must contain only TensorSpec or None"):
+            with self.assertRaisesRegex(ValueError, "Expected 1 input descriptors, got 0"):
                 api._call_kernel(
                     (input_value,),
                     launch=launch,
+                    input_descs=(),
                     output_descs=output_descs,
+                )
+            with self.assertRaisesRegex(TypeError, "input_descs must contain JaxTensorDesc"):
+                api._call_kernel(
+                    (input_value,),
+                    launch=launch,
+                    input_descs=(
+                        self.tensor_module.make_compact_tensor_desc(
+                            dtype=_DataType.FLOAT,
+                            shape=(2,),
+                        ),
+                    ),
+                    output_descs=output_descs,
+                )
+            with self.assertRaisesRegex(TypeError, "output_descs must contain JaxTensorDesc"):
+                api._call_kernel(
+                    (input_value,),
+                    launch=launch,
+                    input_descs=(input_desc,),
+                    output_descs=(
+                        self.tensor_module.make_compact_tensor_desc(
+                            dtype=_DataType.FLOAT,
+                            shape=(2,),
+                        ),
+                    ),
                     workspace_descs=workspace_descs,
-                    output_spec=((0,), initialized_output_spec),
                 )
             with self.assertRaisesRegex(TypeError, "launch must be callable"):
                 api._call_kernel(
                     (input_value,),
                     launch=None,
+                    input_descs=(input_desc,),
                     output_descs=output_descs,
                 )
 
@@ -621,24 +653,28 @@ class JaxApiBaseTest(unittest.TestCase):
         )
         self.assertEqual(
             seen["call_options"]["input_output_aliases"],
-            {1: 0, 2: 1, 3: 2},
+            {1: 1, 2: 2},
         )
-        self.assertEqual(len(seen["call_options"]["input_spec"]), 4)
+        self.assertEqual(len(seen["call_options"]["input_spec"]), 3)
+        self.assertIsNone(seen["call_options"]["input_spec"][0])
         self.assertIs(
             seen["call_options"]["input_spec"][1],
-            seen["call_options"]["output_spec"][0],
+            seen["call_options"]["output_spec"][1],
         )
-        self.assertIs(seen["call_options"]["input_spec"][2], initialized_output_spec)
-        self.assertIs(seen["call_options"]["input_spec"][3], seen["call_options"]["output_spec"][2])
+        self.assertIs(
+            seen["call_options"]["input_spec"][2],
+            seen["call_options"]["output_spec"][2],
+        )
 
         stream, launch_input, output, amax, counter, scratch = seen["launch_args"]
         self.assertEqual(stream, "stream")
+        self.assertIs(seen["cute_launcher"], seen["cutlass_launcher"])
         self.assertIs(launch_input, input_value)
-        self.assertIs(output, output_seed)
+        self.assertEqual(output.label, "allocated(0)")
         self.assertIs(amax, full_calls[0][3])
         self.assertIs(counter, full_calls[1][3])
         self.assertEqual(scratch.label, "allocated(3)")
-        self.assertEqual([result.label for result in results], ["seed", "full(-inf)"])
+        self.assertEqual([result.label for result in results], ["allocated(0)", "full(-inf)"])
         self.assertNotIn(full_calls[0][3], vars(api).values())
         self.assertNotIn(full_calls[1][3], vars(api).values())
 

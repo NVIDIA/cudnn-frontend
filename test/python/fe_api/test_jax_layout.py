@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Dependency-free tests for CUTLASS JAX layout conversion."""
+"""Tests for CUTLASS JAX layout conversion."""
 
 import importlib.util
 from pathlib import Path

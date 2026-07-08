@@ -10,7 +10,7 @@ from typing import Any
 
 import jax
 
-from .._result import TupleDict
+from ..common.result import TupleDict
 
 
 def _flatten(value: TupleDict) -> tuple[tuple[Any, ...], tuple[Any, ...]]:

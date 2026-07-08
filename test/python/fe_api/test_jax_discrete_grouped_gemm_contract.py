@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Dependency-free contracts for the discrete grouped GEMM JAX adapters."""
+"""Contracts for the discrete grouped GEMM JAX adapters."""
 
 from __future__ import annotations
 
@@ -101,11 +101,34 @@ class JaxDiscreteGroupedGemmContractTest(unittest.TestCase):
         internal.__spec__ = ModuleSpec(internal_name, loader=None, is_package=True)
         sys.modules[internal_name] = internal
 
-        tensor_module = importlib.import_module(f"{_PACKAGE}._tensor_desc")
+        tensor_module = importlib.import_module(f"{_PACKAGE}.common.tensor_desc")
         layout_module = importlib.import_module(f"{internal_name}.layout")
-        result_module = importlib.import_module(f"{_PACKAGE}._result")
+        result_module = importlib.import_module(f"{_PACKAGE}.common.result")
 
         class JaxTensorDesc(tensor_module.TensorDesc):
+            @classmethod
+            def from_shape(
+                cls,
+                shape,
+                dtype,
+                *,
+                name="",
+                mode=None,
+                public_stride_order=None,
+                init_value=None,
+                divisibility=None,
+                ptr_assumed_align=None,
+            ):
+                return JaxApiBase._to_tensor_desc(
+                    _Array(shape, dtype),
+                    name,
+                    mode=mode,
+                    public_stride_order=public_stride_order,
+                    init_value=init_value,
+                    divisibility=divisibility,
+                    ptr_assumed_align=ptr_assumed_align,
+                )
+
             @property
             def cudnn_dtype(self):
                 return _DTYPE_TO_CUDNN.get(self.dtype, _DataType.NOT_SET)
@@ -116,7 +139,16 @@ class JaxDiscreteGroupedGemmContractTest(unittest.TestCase):
                 return 100
 
             @staticmethod
-            def _to_tensor_desc(value, name, *, mode=None, init_value=None, **_unused):
+            def _to_tensor_desc(
+                value,
+                name,
+                *,
+                mode=None,
+                init_value=None,
+                divisibility=None,
+                ptr_assumed_align=None,
+                **_unused,
+            ):
                 public_shape = tuple(value.shape)
                 mode = layout_module.normalize_mode(len(public_shape), mode)
                 public_order = tuple(reversed(range(len(public_shape))))
@@ -124,7 +156,7 @@ class JaxDiscreteGroupedGemmContractTest(unittest.TestCase):
                 canonical_axis_by_public_axis = layout_module.to_public_axes(
                     tuple(range(len(public_shape))), mode
                 )
-                return JaxTensorDesc(
+                desc = JaxTensorDesc(
                     dtype=value.dtype,
                     shape=layout_module.to_canonical_axes(public_shape, mode),
                     stride=layout_module.to_canonical_axes(public_stride, mode),
@@ -134,9 +166,15 @@ class JaxDiscreteGroupedGemmContractTest(unittest.TestCase):
                     name=name,
                     init_value=init_value,
                 )
+                object.__setattr__(desc, "mode", mode)
+                object.__setattr__(desc, "divisibility", divisibility)
+                object.__setattr__(desc, "ptr_assumed_align", ptr_assumed_align)
+                return desc
 
             @staticmethod
             def _check_tensor_signature(value, expected, *, mode=None):
+                if mode is None:
+                    mode = expected.mode
                 actual = layout_module.to_canonical_axes(tuple(value.shape), mode)
                 if actual != expected.shape:
                     raise ValueError(
@@ -150,10 +188,19 @@ class JaxDiscreteGroupedGemmContractTest(unittest.TestCase):
 
             @staticmethod
             def _to_tensor_spec(_desc, *, mode=None, **_unused):
-                return _TensorSpec(mode)
+                if mode is None:
+                    mode = _desc.mode
+                return _TensorSpec(
+                    mode,
+                    ptr_assumed_align=getattr(
+                        _desc, "ptr_assumed_align", None
+                    ),
+                )
 
             @staticmethod
-            def _materialize_tensor_desc(desc, *, mode=None):
+            def _to_shape_dtype_struct(desc, *, mode=None):
+                if mode is None:
+                    mode = desc.mode
                 return _Array(
                     layout_module.to_public_axes(desc.shape, mode), desc.dtype
                 )
@@ -168,11 +215,23 @@ class JaxDiscreteGroupedGemmContractTest(unittest.TestCase):
                 *,
                 launch,
                 output_descs,
+                input_descs=None,
                 workspace_descs=(),
-                output_spec=(),
+                output_spec=None,
                 workspace_spec=None,
                 **options,
             ):
+                if input_descs is not None:
+                    for value, desc in zip(inputs, input_descs):
+                        self._check_tensor_signature(value, desc)
+                if output_spec is None:
+                    output_spec = tuple(
+                        self._to_tensor_spec(desc) for desc in output_descs
+                    )
+                if workspace_spec is None:
+                    workspace_spec = tuple(
+                        self._to_tensor_spec(desc) for desc in workspace_descs
+                    )
                 outputs = tuple(
                     _Array(
                         layout_module.to_public_axes(desc.shape, spec.mode), desc.dtype

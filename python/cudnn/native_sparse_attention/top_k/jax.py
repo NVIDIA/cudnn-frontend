@@ -13,8 +13,8 @@ import jax
 import jax.numpy as jnp
 
 from ... import data_type
-from ..._cute_compiler import compile_options_for_target
-from ..._jax import JaxApiBase, TupleDict
+from ..._jax.compiler import compile_options_for_target
+from ..._jax import JaxApiBase, JaxTensorDesc, TupleDict
 from ..._jax.layout import to_public_axes
 from ..jax_utils import (
     FIXED_LAYOUTS,
@@ -135,14 +135,16 @@ class TopKReduction(JaxApiBase):
             )
         else:
             output_shape = (self.total_q_tokens, self.num_kv_heads, self.k_value)
-            self.scores_desc = self._to_tensor_desc(
-                jax.ShapeDtypeStruct(output_shape, jnp.float32),
-                "topk_scores_tensor",
+            self.scores_desc = JaxTensorDesc.from_shape(
+                output_shape,
+                jnp.float32,
+                name="topk_scores_tensor",
                 init_value=float("-inf"),
             )
-            self.indices_desc = self._to_tensor_desc(
-                jax.ShapeDtypeStruct(output_shape, jnp.int32),
-                "topk_indices_tensor",
+            self.indices_desc = JaxTensorDesc.from_shape(
+                output_shape,
+                jnp.int32,
+                name="topk_indices_tensor",
                 init_value=-1,
             )
 
@@ -315,27 +317,22 @@ class TopKReduction(JaxApiBase):
         # These virtual rank-4 views preserve the packed THD byte order while
         # exposing the B,H,T,D shapes read by the CuTe kernel. LSE is likewise
         # presented as B,H,T, matching the Torch wrapper's transpose.
-        self.q_kernel_desc = self._to_tensor_desc(
-            jax.ShapeDtypeStruct(
-                (1, self.num_query_heads, self.total_q_tokens, self.head_dim),
-                self.q_desc.dtype,
-            ),
-            "q_tensor",
+        self.q_kernel_desc = JaxTensorDesc.from_shape(
+            (1, self.num_query_heads, self.total_q_tokens, self.head_dim),
+            self.q_desc.dtype,
+            name="q_tensor",
             public_stride_order=_KERNEL_DATA_STRIDE_ORDER,
         )
-        self.k_kernel_desc = self._to_tensor_desc(
-            jax.ShapeDtypeStruct(
-                (1, self.num_kv_heads, self.total_k_tokens, self.head_dim),
-                self.k_desc.dtype,
-            ),
-            "k_tensor",
+        self.k_kernel_desc = JaxTensorDesc.from_shape(
+            (1, self.num_kv_heads, self.total_k_tokens, self.head_dim),
+            self.k_desc.dtype,
+            name="k_tensor",
             public_stride_order=_KERNEL_DATA_STRIDE_ORDER,
         )
-        self.lse_kernel_desc = self._to_tensor_desc(
-            jax.ShapeDtypeStruct(
-                (1, self.num_query_heads, self.total_q_tokens), jnp.float32
-            ),
-            "lse_tensor",
+        self.lse_kernel_desc = JaxTensorDesc.from_shape(
+            (1, self.num_query_heads, self.total_q_tokens),
+            jnp.float32,
+            name="lse_tensor",
         )
 
     def _check_configuration(self) -> None:
@@ -383,20 +380,16 @@ class TopKReduction(JaxApiBase):
         cum_seqlen_k_tensor: Any | None = None,
     ) -> TupleDict:
         self.check_support()
-        self._check_tensor_signature(q_tensor, self.q_desc, mode=self.data_mode)
-        self._check_tensor_signature(k_tensor, self.k_desc, mode=self.data_mode)
-        self._check_tensor_signature(lse_tensor, self.lse_desc)
-
         if self.input_layout in FIXED_LAYOUTS:
             if cum_seqlen_q_tensor is not None or cum_seqlen_k_tensor is not None:
                 raise ValueError(
                     "cum_seqlen_q and cum_seqlen_k must be omitted for fixed layout"
                 )
             inputs = (q_tensor, k_tensor, lse_tensor)
-            input_spec = (
-                self._to_tensor_spec(self.q_kernel_desc, mode=self.data_mode),
-                self._to_tensor_spec(self.k_kernel_desc, mode=self.data_mode),
-                self._to_tensor_spec(self.lse_kernel_desc),
+            input_descs = (
+                self.q_kernel_desc,
+                self.k_kernel_desc,
+                self.lse_kernel_desc,
             )
             launch = self._launch_kernel
         else:
@@ -404,8 +397,12 @@ class TopKReduction(JaxApiBase):
                 raise ValueError(
                     "cum_seqlen_q and cum_seqlen_k are both required for THD layout"
                 )
-            self._check_tensor_signature(cum_seqlen_q_tensor, self.cum_seqlen_q_desc)
-            self._check_tensor_signature(cum_seqlen_k_tensor, self.cum_seqlen_k_desc)
+            for value, desc in (
+                (q_tensor, self.q_desc),
+                (k_tensor, self.k_desc),
+                (lse_tensor, self.lse_desc),
+            ):
+                self._check_tensor_signature(value, desc)
             q_storage = jnp.transpose(
                 jnp.reshape(
                     q_tensor,
@@ -431,25 +428,20 @@ class TopKReduction(JaxApiBase):
                 cum_seqlen_q_tensor,
                 cum_seqlen_k_tensor,
             )
-            input_spec = (
-                self._to_tensor_spec(self.q_kernel_desc),
-                self._to_tensor_spec(self.k_kernel_desc),
-                self._to_tensor_spec(self.lse_kernel_desc),
-                self._to_tensor_spec(self.cum_seqlen_q_desc),
-                self._to_tensor_spec(self.cum_seqlen_k_desc),
+            input_descs = (
+                self.q_kernel_desc,
+                self.k_kernel_desc,
+                self.lse_kernel_desc,
+                self.cum_seqlen_q_desc,
+                self.cum_seqlen_k_desc,
             )
             launch = self._launch_packed_kernel
 
-        output_mode = self.data_mode if self.input_layout in FIXED_LAYOUTS else None
         scores, indices = self._call_kernel(
             inputs,
             launch=launch,
             output_descs=(self.scores_desc, self.indices_desc),
-            input_spec=input_spec,
-            output_spec=(
-                self._to_tensor_spec(self.scores_desc, mode=output_mode),
-                self._to_tensor_spec(self.indices_desc, mode=output_mode),
-            ),
+            input_descs=input_descs,
             compile_options=compile_options_for_target(self.compute_capability),
         )
         return TupleDict(topk_scores_tensor=scores, topk_indices_tensor=indices)
@@ -585,24 +577,12 @@ def topk_reduction_wrapper(
     Fixed outputs follow ``layout``; fixed LSE remains ``(B, H, S)``.
     """
 
-    samples = tuple(
-        jax.ShapeDtypeStruct(value.shape, value.dtype)
-        for value in (q_tensor, k_tensor, lse_tensor)
-    )
-    sample_cum_seqlen_q = (
-        None
-        if cum_seqlen_q_tensor is None
-        else jax.ShapeDtypeStruct(cum_seqlen_q_tensor.shape, cum_seqlen_q_tensor.dtype)
-    )
-    sample_cum_seqlen_k = (
-        None
-        if cum_seqlen_k_tensor is None
-        else jax.ShapeDtypeStruct(cum_seqlen_k_tensor.shape, cum_seqlen_k_tensor.dtype)
-    )
     return TopKReduction(
-        *samples,
-        sample_cum_seqlen_q,
-        sample_cum_seqlen_k,
+        q_tensor,
+        k_tensor,
+        lse_tensor,
+        cum_seqlen_q_tensor,
+        cum_seqlen_k_tensor,
         max_s_q=max_s_q,
         max_s_k=max_s_k,
         acc_dtype=acc_dtype,

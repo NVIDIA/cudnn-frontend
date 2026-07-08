@@ -11,7 +11,7 @@ import jax
 
 from ... import data_type
 from ..._jax import JaxApiBase, JaxTensorDesc, TupleDict
-from ..utils.compiler import compile_options_for_target
+from ..._jax.compiler import compile_options_for_target
 from .op import BLOCK_TILE, SparseAttentionBackwardOp
 
 _SUPPORTED_COMPUTE_CAPABILITIES = (90, 100, 103, 107)
@@ -133,52 +133,51 @@ class SparseAttentionBackward(JaxApiBase):
         topk_length: Any | None = None,
     ) -> TupleDict:
         self.check_support()
-        for value, expected in (
-            (q, self.q_desc),
-            (kv, self.kv_desc),
-            (out, self.out_desc),
-            (dout, self.dout_desc),
-            (lse, self.lse_desc),
-            (attn_sink, self.attn_sink_desc),
-            (topk_idxs, self.topk_idxs_desc),
-        ):
-            self._check_tensor_signature(value, expected)
         if (topk_length is None) != (self.topk_length_desc is None):
             raise ValueError("topk_length presence must match sample_topk_length")
-        if topk_length is not None:
-            self._check_tensor_signature(topk_length, self.topk_length_desc)
 
         inputs = (q, kv, out, dout, lse, attn_sink, topk_idxs)
-        input_specs = self._input_specs()
+        q_desc = self.q_desc.with_divisibility(
+            (None, None, self._op.head_dim)
+        )
+        kv_desc = self.kv_desc.with_divisibility(
+            (None, self._op.head_dim)
+        )
+        out_desc = self.out_desc.with_divisibility(
+            (None, None, self._op.head_dim_v)
+        )
+        dout_desc = self.dout_desc.with_divisibility(
+            (None, None, self._op.head_dim_v)
+        )
+        input_descs = (
+            q_desc,
+            kv_desc,
+            out_desc,
+            dout_desc,
+            self.lse_desc,
+            self.attn_sink_desc,
+            self.topk_idxs_desc,
+        )
         if topk_length is not None:
             inputs += (topk_length,)
-            input_specs += (None,)
+            input_descs += (self.topk_length_desc,)
+
+        dq_desc = self.dq_desc.with_divisibility(
+            (None, None, self._op.head_dim)
+        )
+        dkv_desc = self.dkv_desc.with_divisibility(
+            (None, self._op.head_dim)
+        )
 
         dq, dkv, d_sink = self._call_kernel(
             inputs,
             launch=self._launch_kernel,
-            output_descs=(self.dq_desc, self.dkv_desc, self.d_sink_desc),
+            output_descs=(dq_desc, dkv_desc, self.d_sink_desc),
+            input_descs=input_descs,
             workspace_descs=self._workspace_descs(),
-            input_spec=input_specs,
-            output_spec=(
-                self._to_tensor_spec(self.dq_desc, divisibility=(None, None, self._op.head_dim)),
-                self._to_tensor_spec(self.dkv_desc, divisibility=(None, self._op.head_dim)),
-                None,
-            ),
             compile_options=compile_options_for_target(self.compute_capability),
         )
         return TupleDict(dq=dq, dkv=dkv, d_sink=d_sink)
-
-    def _input_specs(self) -> tuple[Any | None, ...]:
-        return (
-            self._to_tensor_spec(self.q_desc, divisibility=(None, None, self._op.head_dim)),
-            self._to_tensor_spec(self.kv_desc, divisibility=(None, self._op.head_dim)),
-            self._to_tensor_spec(self.out_desc, divisibility=(None, None, self._op.head_dim_v)),
-            self._to_tensor_spec(self.dout_desc, divisibility=(None, None, self._op.head_dim_v)),
-            None,
-            None,
-            None,
-        )
 
     def _workspace_descs(self) -> tuple[JaxTensorDesc, ...]:
         if self._architecture_family == 100:
@@ -447,11 +446,15 @@ def sparse_attention_backward_wrapper(
 ) -> TupleDict:
     """Compute DeepSeek sparse-attention gradients from JAX arrays."""
 
-    samples = tuple(jax.ShapeDtypeStruct(value.shape, value.dtype) for value in (q, kv, out, dout, lse, attn_sink, topk_idxs))
-    sample_topk_length = None if topk_length is None else jax.ShapeDtypeStruct(topk_length.shape, topk_length.dtype)
     return SparseAttentionBackward(
-        *samples,
-        sample_topk_length=sample_topk_length,
+        q,
+        kv,
+        out,
+        dout,
+        lse,
+        attn_sink,
+        topk_idxs,
+        sample_topk_length=topk_length,
         softmax_scale=softmax_scale,
         block_tile=block_tile,
         target_compute_capability=target_compute_capability,

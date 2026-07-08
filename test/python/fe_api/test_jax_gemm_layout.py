@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Dependency-free contracts for dense JAX GEMM axis bindings."""
+"""Contracts for dense JAX GEMM axis bindings."""
 
 import importlib
 from importlib.machinery import ModuleSpec

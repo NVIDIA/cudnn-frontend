@@ -12,8 +12,8 @@ import jax
 import jax.numpy as jnp
 
 from ... import data_type
-from ..._cute_compiler import compile_options_for_target
-from ..._dense_gemm import (
+from ..._jax.compiler import compile_options_for_target
+from ...gemm.helpers import (
     block_scale_shape,
     require_16_byte_alignment,
     require_compact_major,
@@ -90,12 +90,16 @@ class DiscreteGroupedGemmSwigluSm100(DiscreteGroupedGemmJaxBase):
         )
         self._uses_implicit_prob = sample_prob is None
         if sample_prob is None:
-            sample_prob = jax.ShapeDtypeStruct(
-                (1, 1, self.a_desc.shape[0]), jnp.float32
+            self.prob_desc = JaxTensorDesc.from_shape(
+                (1, 1, self.a_desc.shape[0]),
+                jnp.float32,
+                name="sample_prob",
+                mode=self.probability_mode,
             )
-        self.prob_desc = self._to_tensor_desc(
-            sample_prob, "sample_prob", mode=self.probability_mode
-        )
+        else:
+            self.prob_desc = self._to_tensor_desc(
+                sample_prob, "sample_prob", mode=self.probability_mode
+            )
         self.bias_desc = (
             None
             if sample_bias is None
@@ -260,31 +264,19 @@ class DiscreteGroupedGemmSwigluSm100(DiscreteGroupedGemmJaxBase):
                 )
             prob_tensor = jnp.ones((1, 1, self.m), dtype=jnp.float32)
         else:
-            self._check_tensor_signature(
-                prob_tensor, self.prob_desc, mode=self.probability_mode
-            )
-        self._check_optional_input(bias_tensor, self.bias_desc, mode=self.bias_mode)
+            self._check_tensor_signature(prob_tensor, self.prob_desc)
+        self._check_optional_input(bias_tensor, self.bias_desc)
         if linear_offset is None:
             linear_offset = 1.0 if self.act_func == "geglu" else 0.0
 
         if self.m == 0:
             return TupleDict(
-                c_tensor=self._materialize_output_desc(
-                    self.c_desc, mode=self.output_mode
-                ),
-                d_tensor=self._materialize_output_desc(
-                    self.d_desc, mode=self.output_mode
-                ),
-                d_col_tensor=self._materialize_output_desc(
-                    self.d_col_desc, mode=self.output_mode
-                ),
+                c_tensor=self._materialize_output_desc(self.c_desc),
+                d_tensor=self._materialize_output_desc(self.d_desc),
+                d_col_tensor=self._materialize_output_desc(self.d_col_desc),
                 amax_tensor=self._materialize_output_desc(self.amax_desc),
-                sfd_row_tensor=self._materialize_output_desc(
-                    self.sfd_row_desc, mode=self.scale_mode
-                ),
-                sfd_col_tensor=self._materialize_output_desc(
-                    self.sfd_col_desc, mode=self.scale_mode
-                ),
+                sfd_row_tensor=self._materialize_output_desc(self.sfd_row_desc),
+                sfd_col_tensor=self._materialize_output_desc(self.sfd_col_desc),
             )
 
         import cutlass
@@ -324,37 +316,31 @@ class DiscreteGroupedGemmSwigluSm100(DiscreteGroupedGemmJaxBase):
             padded_offsets,
             alpha_tensor,
         ]
-        input_specs = [
-            self._to_tensor_spec(self.a_desc, mode=self.a_mode),
-            self._to_tensor_spec(self.b_desc, mode=self.b_mode),
-            self._to_tensor_spec(self.sfb_desc, mode=self.scale_mode),
-            self._to_tensor_spec(self.sfa_desc, mode=self.scale_mode),
-            self._to_tensor_spec(self.padded_offsets_desc),
-            self._to_tensor_spec(self.alpha_desc),
+        input_descs = [
+            self.a_desc,
+            self.b_desc,
+            self.sfb_desc,
+            self.sfa_desc,
+            self.padded_offsets_desc,
+            self.alpha_desc,
         ]
-        for value, desc, mode in (
-            (norm_const_tensor, self.norm_const_desc, None),
-            (prob_tensor, self.prob_desc, self.probability_mode),
-            (bias_tensor, self.bias_desc, self.bias_mode),
+        for value, desc in (
+            (norm_const_tensor, self.norm_const_desc),
+            (prob_tensor, self.prob_desc),
+            (bias_tensor, self.bias_desc),
         ):
             if desc is not None:
                 inputs.append(value)
-                input_specs.append(self._to_tensor_spec(desc, mode=mode))
+                input_descs.append(desc)
 
         output_descs = [self.c_desc, self.d_desc, self.d_col_desc]
-        output_specs = [
-            self._to_tensor_spec(self.c_desc, mode=self.output_mode),
-            self._to_tensor_spec(self.d_desc, mode=self.output_mode),
-            self._to_tensor_spec(self.d_col_desc, mode=self.output_mode),
-        ]
-        for desc, mode in (
-            (self.sfd_row_desc, self.scale_mode),
-            (self.sfd_col_desc, self.scale_mode),
-            (self.amax_desc, None),
+        for desc in (
+            self.sfd_row_desc,
+            self.sfd_col_desc,
+            self.amax_desc,
         ):
             if desc is not None:
                 output_descs.append(desc)
-                output_specs.append(self._to_tensor_spec(desc, mode=mode))
 
         has_norm = self.norm_const_desc is not None
         has_prob = True
@@ -419,10 +405,8 @@ class DiscreteGroupedGemmSwigluSm100(DiscreteGroupedGemmJaxBase):
             tuple(inputs),
             launch=launch,
             output_descs=tuple(output_descs),
+            input_descs=tuple(input_descs),
             workspace_descs=(workspace_desc,),
-            input_spec=tuple(input_specs),
-            output_spec=tuple(output_specs),
-            workspace_spec=(self._workspace_tensor_spec(),),
             compile_options=compile_options_for_target(self.compute_capability),
         )
         result_index = 0
@@ -450,8 +434,6 @@ class DiscreteGroupedGemmSwigluSm100(DiscreteGroupedGemmJaxBase):
         self,
         value: Any | None,
         desc: JaxTensorDesc | None,
-        *,
-        mode: tuple[int, ...] | None = None,
     ) -> None:
         if (value is None) != (desc is None):
             name = "optional input" if desc is None else desc.name
@@ -459,7 +441,7 @@ class DiscreteGroupedGemmSwigluSm100(DiscreteGroupedGemmJaxBase):
                 f"{name} presence must match the sample passed to the constructor"
             )
         if desc is not None:
-            self._check_tensor_signature(value, desc, mode=mode)
+            self._check_tensor_signature(value, desc)
 
 
 @partial(
@@ -518,23 +500,15 @@ def discrete_grouped_gemm_swiglu_wrapper_sm100(
     """Run the discrete kernel with XLA-owned stacked expert operands."""
 
     operation = DiscreteGroupedGemmSwigluSm100(
-        jax.ShapeDtypeStruct(a_tensor.shape, a_tensor.dtype),
-        jax.ShapeDtypeStruct(b_tensor.shape, b_tensor.dtype),
-        jax.ShapeDtypeStruct(sfa_tensor.shape, sfa_tensor.dtype),
-        jax.ShapeDtypeStruct(sfb_tensor.shape, sfb_tensor.dtype),
-        jax.ShapeDtypeStruct(padded_offsets.shape, padded_offsets.dtype),
-        jax.ShapeDtypeStruct(alpha_tensor.shape, alpha_tensor.dtype),
-        sample_norm_const=(
-            None
-            if norm_const_tensor is None
-            else jax.ShapeDtypeStruct(norm_const_tensor.shape, norm_const_tensor.dtype)
-        ),
-        sample_prob=None
-        if prob_tensor is None
-        else jax.ShapeDtypeStruct(prob_tensor.shape, prob_tensor.dtype),
-        sample_bias=None
-        if bias_tensor is None
-        else jax.ShapeDtypeStruct(bias_tensor.shape, bias_tensor.dtype),
+        a_tensor,
+        b_tensor,
+        sfa_tensor,
+        sfb_tensor,
+        padded_offsets,
+        alpha_tensor,
+        sample_norm_const=norm_const_tensor,
+        sample_prob=prob_tensor,
+        sample_bias=bias_tensor,
         c_dtype=c_dtype,
         d_dtype=d_dtype,
         acc_dtype=acc_dtype,

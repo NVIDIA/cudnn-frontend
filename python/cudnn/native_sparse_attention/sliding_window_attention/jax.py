@@ -215,7 +215,7 @@ class SlidingWindowAttention(JaxApiBase):
             (k_tensor, self.k_desc),
             (v_tensor, self.v_desc),
         ):
-            self._check_tensor_signature(value, desc, mode=self.data_mode)
+            self._check_tensor_signature(value, desc)
 
         if self.input_layout == "BHSD":
             if cum_seqlen_q_tensor is not None or cum_seqlen_k_tensor is not None:
@@ -331,24 +331,12 @@ def sliding_window_attention_wrapper(
     intentionally outside this functional JAX API.
     """
 
-    samples = tuple(
-        jax.ShapeDtypeStruct(value.shape, value.dtype)
-        for value in (q_tensor, k_tensor, v_tensor)
-    )
-    sample_cum_seqlen_q = (
-        None
-        if cum_seqlen_q_tensor is None
-        else jax.ShapeDtypeStruct(cum_seqlen_q_tensor.shape, cum_seqlen_q_tensor.dtype)
-    )
-    sample_cum_seqlen_k = (
-        None
-        if cum_seqlen_k_tensor is None
-        else jax.ShapeDtypeStruct(cum_seqlen_k_tensor.shape, cum_seqlen_k_tensor.dtype)
-    )
     return SlidingWindowAttention(
-        *samples,
-        sample_cum_seqlen_q,
-        sample_cum_seqlen_k,
+        q_tensor,
+        k_tensor,
+        v_tensor,
+        cum_seqlen_q_tensor,
+        cum_seqlen_k_tensor,
         max_s_q=max_s_q,
         max_s_k=max_s_k,
         left_bound=left_bound,

@@ -13,7 +13,7 @@ import jax.numpy as jnp
 
 from ... import data_type
 from ..._jax import JaxApiBase, TupleDict
-from ..utils.compiler import compile_options_for_target
+from ..._jax.compiler import compile_options_for_target
 from .op import INT32_MAX, IndexerTopKOp, SUPPORTED_COMPUTE_CAPABILITIES, SUPPORTED_INPUT_DTYPES
 
 
@@ -99,16 +99,14 @@ class IndexerTopK(JaxApiBase):
 
     def __call__(self, input_values: Any, seq_lens: Any) -> TupleDict:
         self.check_support()
-        self._check_tensor_signature(input_values, self.input_desc)
-        self._check_tensor_signature(seq_lens, self.seq_lens_desc)
 
         output_descs = (self.indices_desc,) if self.values_desc is None else (self.indices_desc, self.values_desc)
         results = self._call_kernel(
             (input_values, seq_lens),
             launch=self._launch_kernel,
             output_descs=output_descs,
+            input_descs=(self.input_desc, self.seq_lens_desc),
             workspace_descs=(self.workspace_desc,),
-            input_spec=(self._to_tensor_spec(self.input_desc), self._to_tensor_spec(self.seq_lens_desc)),
             compile_options=compile_options_for_target(self.target_compute_capability),
         )
         indices = results[0]
@@ -225,16 +223,15 @@ class _LocalToGlobal(JaxApiBase):
         cu_seqlens_k: Any | None = None,
     ) -> TupleDict:
         self.check_support()
-        self._check_tensor_signature(local_indices, self.local_desc)
         inputs = [local_indices]
+        input_descs = [self.local_desc]
         if self.is_varlen:
             if cu_seqlens_q is None or cu_seqlens_k is None:
                 raise ValueError("Packed local-to-global requires both cumulative sequence tensors")
             if self.cu_q_desc is None or self.cu_k_desc is None:
                 raise RuntimeError("Packed cumulative sequence descriptors were not configured")
-            self._check_tensor_signature(cu_seqlens_q, self.cu_q_desc)
-            self._check_tensor_signature(cu_seqlens_k, self.cu_k_desc)
             inputs.extend((cu_seqlens_q, cu_seqlens_k))
+            input_descs.extend((self.cu_q_desc, self.cu_k_desc))
         elif cu_seqlens_q is not None or cu_seqlens_k is not None:
             raise ValueError("Fixed local-to-global does not accept cumulative sequence tensors")
 
@@ -242,6 +239,7 @@ class _LocalToGlobal(JaxApiBase):
             tuple(inputs),
             launch=self._launch_kernel,
             output_descs=(self.output_desc,),
+            input_descs=tuple(input_descs),
             compile_options=compile_options_for_target(self.target_compute_capability, "--opt-level 3"),
         )
         return TupleDict(indices=result)
@@ -302,11 +300,11 @@ class _Compactify(JaxApiBase):
 
     def __call__(self, indices: Any) -> TupleDict:
         self.check_support()
-        self._check_tensor_signature(indices, self.input_desc)
         compact_indices, topk_length = self._call_kernel(
             (indices,),
             launch=self._launch_kernel,
             output_descs=(self.output_desc, self.length_desc),
+            input_descs=(self.input_desc,),
             compile_options=compile_options_for_target(self.target_compute_capability, "--opt-level 3"),
         )
         return TupleDict(indices=compact_indices, topk_length=topk_length)
@@ -341,8 +339,8 @@ def indexer_top_k_wrapper(
     """
 
     return IndexerTopK(
-        jax.ShapeDtypeStruct(input_values.shape, input_values.dtype),
-        jax.ShapeDtypeStruct(seq_lens.shape, seq_lens.dtype),
+        input_values,
+        seq_lens,
         top_k,
         next_n=next_n,
         return_val=return_val,
@@ -362,13 +360,11 @@ def local_to_global_wrapper(
 ) -> TupleDict:
     """Convert local top-K indices to the global flattened KV index space."""
 
-    sample_cu_q = None if cu_seqlens_q is None else jax.ShapeDtypeStruct(cu_seqlens_q.shape, cu_seqlens_q.dtype)
-    sample_cu_k = None if cu_seqlens_k is None else jax.ShapeDtypeStruct(cu_seqlens_k.shape, cu_seqlens_k.dtype)
     return _LocalToGlobal(
-        jax.ShapeDtypeStruct(local_indices.shape, local_indices.dtype),
+        local_indices,
         seqlen_k,
-        sample_cu_seqlens_q=sample_cu_q,
-        sample_cu_seqlens_k=sample_cu_k,
+        sample_cu_seqlens_q=cu_seqlens_q,
+        sample_cu_seqlens_k=cu_seqlens_k,
         target_compute_capability=target_compute_capability,
     )(
         local_indices,
@@ -388,7 +384,7 @@ def compactify_wrapper(indices: Any, *, target_compute_capability: int | None = 
         rows *= extent
     flat_indices = jnp.reshape(indices, (rows, indices.shape[-1]))
     return _Compactify(
-        jax.ShapeDtypeStruct(flat_indices.shape, flat_indices.dtype),
+        flat_indices,
         target_compute_capability=target_compute_capability,
     )(flat_indices)
 

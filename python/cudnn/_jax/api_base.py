@@ -7,16 +7,109 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Callable
+from dataclasses import dataclass, field, replace
 from operator import index
 from typing import Any
 
 from .. import data_type
-from .._tensor_desc import TensorDesc
+from ..common.tensor_desc import TensorDesc
 from .layout import compact_stride, normalize_mode, to_canonical_axes, to_cutlass_layout, to_public_axes
 
 
+@dataclass(frozen=True)
 class JaxTensorDesc(TensorDesc[Any]):
-    """Framework-neutral tensor metadata backed by a JAX dtype."""
+    """JAX tensor metadata and CUTLASS lowering constraints."""
+
+    mode: tuple[int, ...] = field(default_factory=tuple)
+    divisibility: tuple[int | None, ...] | None = None
+    ptr_assumed_align: int | None = None
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        object.__setattr__(
+            self,
+            "mode",
+            normalize_mode(self.ndim, None if not self.mode else self.mode),
+        )
+        object.__setattr__(
+            self,
+            "divisibility",
+            _normalize_divisibility(self.ndim, self.divisibility),
+        )
+        object.__setattr__(
+            self,
+            "ptr_assumed_align",
+            _normalize_ptr_assumed_align(self.ptr_assumed_align),
+        )
+
+    @property
+    def array_shape(self) -> tuple[int, ...]:
+        """Return the shape in the axis order used by the JAX array."""
+
+        return to_public_axes(self.shape, self.mode)
+
+    @classmethod
+    def from_array(
+        cls,
+        value: Any,
+        *,
+        name: str = "",
+        mode: tuple[int, ...] | None = None,
+        public_stride_order: tuple[int, ...] | None = None,
+        init_value: bool | int | float | None = None,
+        divisibility: tuple[int | None, ...] | None = None,
+        ptr_assumed_align: int | None = None,
+    ) -> "JaxTensorDesc":
+        """Describe a JAX array-like value using its shape and dtype metadata."""
+
+        shape = _require_array_metadata(value, name or "value")
+        return cls.from_shape(
+            shape,
+            value.dtype,
+            name=name,
+            mode=mode,
+            public_stride_order=public_stride_order,
+            init_value=init_value,
+            divisibility=divisibility,
+            ptr_assumed_align=ptr_assumed_align,
+        )
+
+    @classmethod
+    def from_shape(
+        cls,
+        shape: tuple[int, ...],
+        dtype: Any,
+        *,
+        name: str = "",
+        mode: tuple[int, ...] | None = None,
+        public_stride_order: tuple[int, ...] | None = None,
+        init_value: bool | int | float | None = None,
+        divisibility: tuple[int | None, ...] | None = None,
+        ptr_assumed_align: int | None = None,
+    ) -> "JaxTensorDesc":
+        """Describe a compact JAX tensor from its user-facing shape and dtype."""
+
+        shape = tuple(shape)
+        rank = len(shape)
+        mode = normalize_mode(rank, mode)
+        public_stride_order = _normalize_stride_order(rank, public_stride_order)
+        public_stride = compact_stride(shape, public_stride_order)
+        canonical_axis_by_public_axis = to_public_axes(tuple(range(rank)), mode)
+
+        return cls(
+            dtype=dtype,
+            shape=to_canonical_axes(shape, mode),
+            stride=to_canonical_axes(public_stride, mode),
+            stride_order=tuple(
+                canonical_axis_by_public_axis[axis]
+                for axis in public_stride_order
+            ),
+            name=name,
+            init_value=init_value,
+            mode=mode,
+            divisibility=divisibility,
+            ptr_assumed_align=ptr_assumed_align,
+        )
 
     @property
     def cudnn_dtype(self) -> data_type:
@@ -32,6 +125,9 @@ class JaxTensorDesc(TensorDesc[Any]):
         stride_order: tuple[int, ...] | None = None,
         name: str = "",
         init_value: bool | int | float | None = None,
+        mode: tuple[int, ...] | None = None,
+        divisibility: tuple[int | None, ...] | None = None,
+        ptr_assumed_align: int | None = None,
     ) -> "JaxTensorDesc":
         """Create a compact JAX descriptor from canonical output metadata."""
 
@@ -52,7 +148,18 @@ class JaxTensorDesc(TensorDesc[Any]):
             stride_order=canonical.stride_order,
             name=canonical.name,
             init_value=canonical.init_value,
+            mode=normalize_mode(canonical.ndim, mode),
+            divisibility=divisibility,
+            ptr_assumed_align=ptr_assumed_align,
         )
+
+    def with_divisibility(
+        self,
+        divisibility: tuple[int | None, ...] | None,
+    ) -> "JaxTensorDesc":
+        """Return this descriptor with canonical-axis divisibility constraints."""
+
+        return replace(self, divisibility=divisibility)
 
 
 def _require_array_metadata(value: Any, name: str) -> tuple[Any, ...]:
@@ -80,6 +187,61 @@ def _normalize_stride_order(rank: int, stride_order: tuple[int, ...] | None) -> 
     if tuple(sorted(normalized_order)) != tuple(range(rank)):
         raise ValueError(f"public_stride_order must be a permutation of [0, {rank - 1}], got {normalized_order}")
     return normalized_order
+
+
+def _normalize_divisibility(
+    rank: int,
+    divisibility: tuple[int | None, ...] | None,
+) -> tuple[int | None, ...] | None:
+    if divisibility is None:
+        return None
+    divisibility = tuple(divisibility)
+    if len(divisibility) != rank:
+        raise ValueError(
+            f"divisibility rank mismatch: expected {rank}, got {len(divisibility)}"
+        )
+
+    normalized = []
+    for value in divisibility:
+        if value is None:
+            normalized.append(None)
+            continue
+        if isinstance(value, bool):
+            raise TypeError(
+                f"divisibility entries must be positive integers or None, got {value!r}"
+            )
+        try:
+            value = index(value)
+        except TypeError as error:
+            raise TypeError(
+                f"divisibility entries must be positive integers or None, got {value!r}"
+            ) from error
+        if value <= 0:
+            raise ValueError(
+                f"divisibility entries must be positive integers or None, got {value}"
+            )
+        normalized.append(value)
+    return tuple(normalized)
+
+
+def _normalize_ptr_assumed_align(value: int | None) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise TypeError(
+            f"ptr_assumed_align must be a positive integer or None, got {value!r}"
+        )
+    try:
+        value = index(value)
+    except TypeError as error:
+        raise TypeError(
+            f"ptr_assumed_align must be a positive integer or None, got {value!r}"
+        ) from error
+    if value <= 0:
+        raise ValueError(
+            f"ptr_assumed_align must be a positive integer or None, got {value}"
+        )
+    return value
 
 
 class JaxApiBase(ABC):
@@ -257,6 +419,8 @@ class JaxApiBase(ABC):
         mode: tuple[int, ...] | None = None,
         public_stride_order: tuple[int, ...] | None = None,
         init_value: bool | int | float | None = None,
+        divisibility: tuple[int | None, ...] | None = None,
+        ptr_assumed_align: int | None = None,
     ) -> JaxTensorDesc:
         """Describe a public JAX array in canonical kernel-axis order.
 
@@ -265,37 +429,32 @@ class JaxApiBase(ABC):
         to slowest. It defaults to compact row-major storage.
         """
 
-        public_shape = _require_array_metadata(value, name)
-        rank = len(public_shape)
-        mode = normalize_mode(rank, mode)
-        public_stride_order = _normalize_stride_order(rank, public_stride_order)
-        public_stride = compact_stride(public_shape, public_stride_order)
-        canonical_axis_by_public_axis = to_public_axes(tuple(range(rank)), mode)
-
-        return JaxTensorDesc(
-            dtype=value.dtype,
-            shape=to_canonical_axes(public_shape, mode),
-            stride=to_canonical_axes(public_stride, mode),
-            stride_order=tuple(canonical_axis_by_public_axis[axis] for axis in public_stride_order),
+        return JaxTensorDesc.from_array(
+            value,
             name=name,
+            mode=mode,
+            public_stride_order=public_stride_order,
             init_value=init_value,
+            divisibility=divisibility,
+            ptr_assumed_align=ptr_assumed_align,
         )
 
     @staticmethod
     def _check_tensor_signature(
         value: Any,
-        expected: TensorDesc[Any],
-        *,
-        mode: tuple[int, ...] | None = None,
+        expected: JaxTensorDesc,
     ) -> None:
         """Validate a public JAX value against a canonical descriptor."""
 
+        if not isinstance(expected, JaxTensorDesc):
+            raise TypeError(
+                f"expected must be a JaxTensorDesc, got {type(expected).__name__}"
+            )
         name = expected.name or "value"
         public_shape = _require_array_metadata(value, name)
-        mode = normalize_mode(expected.ndim, mode)
         if len(public_shape) != expected.ndim:
             raise ValueError(f"{name} tensor shape mismatch: expected {expected.shape}, got public shape {public_shape}")
-        actual_shape = to_canonical_axes(public_shape, mode)
+        actual_shape = to_canonical_axes(public_shape, expected.mode)
         if actual_shape != expected.shape:
             raise ValueError(f"{name} tensor shape mismatch: expected {expected.shape}, got {actual_shape}")
 
@@ -307,60 +466,71 @@ class JaxApiBase(ABC):
 
     @staticmethod
     def _to_tensor_spec(
-        desc: TensorDesc[Any],
-        *,
-        mode: tuple[int, ...] | None = None,
-        divisibility: tuple[int | None, ...] | None = None,
+        desc: JaxTensorDesc,
     ) -> Any:
         """Build a CUTLASS TensorSpec indexed by public JAX array axes.
 
-        ``desc`` and ``divisibility`` use canonical kernel axes. TensorSpec
+        ``desc.divisibility`` uses canonical kernel axes. TensorSpec
         layout and divisibility use public axes, while TensorSpec ``mode``
         records the canonical-to-public binding.
         """
 
-        mode = normalize_mode(desc.ndim, mode)
+        if not isinstance(desc, JaxTensorDesc):
+            raise TypeError(
+                f"desc must be a JaxTensorDesc, got {type(desc).__name__}"
+            )
         public_layout = to_cutlass_layout(
             desc.shape,
             desc.stride,
             desc.stride_order,
-            mode=mode,
+            mode=desc.mode,
             name=desc.name or "tensor",
         )
-        if divisibility is None:
+        default_mode = tuple(range(desc.ndim))
+        default_layout = tuple(reversed(range(desc.ndim)))
+        if (
+            desc.mode == default_mode
+            and public_layout == default_layout
+            and desc.divisibility is None
+            and desc.ptr_assumed_align is None
+        ):
+            return None
+
+        if desc.divisibility is None:
             public_divisibility = None
         else:
-            divisibility = tuple(divisibility)
-            if len(divisibility) != desc.ndim:
-                raise ValueError(f"divisibility rank mismatch: expected {desc.ndim}, got {len(divisibility)}")
-            public_divisibility = to_public_axes(divisibility, mode)
+            public_divisibility = to_public_axes(
+                desc.divisibility,
+                desc.mode,
+            )
 
         from cutlass.jax import TensorSpec
 
-        return TensorSpec(
+        options: dict[str, Any] = dict(
             layout=public_layout,
-            mode=mode,
-            divisibility=public_divisibility,
+            mode=desc.mode,
         )
+        if public_divisibility is not None:
+            options["divisibility"] = public_divisibility
+        if desc.ptr_assumed_align is not None:
+            options["ptr_assumed_align"] = desc.ptr_assumed_align
+        return TensorSpec(**options)
 
     @staticmethod
-    def _materialize_tensor_desc(
-        desc: TensorDesc[Any],
-        *,
-        mode: tuple[int, ...] | None = None,
+    def _to_shape_dtype_struct(
+        desc: JaxTensorDesc,
     ) -> Any:
-        """Declare a canonical descriptor as a public JAX output buffer."""
+        """Convert a canonical descriptor to abstract JAX output metadata."""
 
-        if not isinstance(desc, TensorDesc):
-            raise TypeError(f"desc must be a TensorDesc, got {type(desc).__name__}")
-        mode = normalize_mode(desc.ndim, mode)
+        if not isinstance(desc, JaxTensorDesc):
+            raise TypeError(f"desc must be a JaxTensorDesc, got {type(desc).__name__}")
 
         from jax import ShapeDtypeStruct
 
         from .datatypes import cudnn_to_jax_dtype
 
         return ShapeDtypeStruct(
-            to_public_axes(desc.shape, mode),
+            desc.array_shape,
             cudnn_to_jax_dtype(desc.cudnn_dtype),
         )
 
@@ -369,12 +539,9 @@ class JaxApiBase(ABC):
         inputs: tuple[Any, ...],
         *,
         launch: Callable[..., None],
-        output_descs: tuple[TensorDesc[Any], ...],
-        output_seeds: tuple[Any | None, ...] | None = None,
-        workspace_descs: tuple[TensorDesc[Any], ...] = (),
-        input_spec: tuple[Any | None, ...] | None = None,
-        output_spec: tuple[Any | None, ...] | None = None,
-        workspace_spec: tuple[Any | None, ...] | None = None,
+        input_descs: tuple[JaxTensorDesc, ...],
+        output_descs: tuple[JaxTensorDesc, ...],
+        workspace_descs: tuple[JaxTensorDesc, ...] = (),
         allow_cuda_graph: bool = True,
         compile_options: Any = None,
         use_static_tensors: bool = True,
@@ -386,13 +553,13 @@ class JaxApiBase(ABC):
         are declared as custom-call results so XLA owns their lifetime, then
         omitted from this method's return value. Descriptors with a non-``None``
         ``init_value`` are materialized as JAX inputs and aliased to their
-        corresponding custom-call results. ``output_seeds`` supplies existing
-        JAX values for outputs that must be updated in place by the kernel;
-        these operands are likewise aliased to the corresponding results.
-        Inputs are a flat tuple of arrays, and all explicit specs are native
-        CUTLASS ``TensorSpec`` values.
+        corresponding custom-call results. Outputs without an initial value
+        are allocated as custom-call results by XLA.
+        Descriptors validate input signatures and provide all CUTLASS
+        ``TensorSpec`` metadata.
         """
 
+        import cutlass.cute as cute
         import cutlass.jax as cutlass_jax
         import jax.numpy as jnp
 
@@ -407,105 +574,78 @@ class JaxApiBase(ABC):
         if not outputs:
             raise ValueError("A JAX operation must provide at least one output descriptor")
 
-        for label, descs in (("output", outputs), ("workspace", workspaces)):
+        input_descs = tuple(input_descs)
+        if len(input_descs) != len(inputs):
+            raise ValueError(
+                f"Expected {len(inputs)} input descriptors, got {len(input_descs)}"
+            )
+
+        for label, descs in (
+            ("input", input_descs),
+            ("output", outputs),
+            ("workspace", workspaces),
+        ):
             for desc in descs:
-                if not isinstance(desc, TensorDesc):
-                    raise TypeError(f"{label}_descs must contain TensorDesc values, got {type(desc).__name__}")
+                if not isinstance(desc, JaxTensorDesc):
+                    raise TypeError(
+                        f"{label}_descs must contain JaxTensorDesc values, "
+                        f"got {type(desc).__name__}"
+                    )
 
-        if input_spec is None:
-            input_specs = (None,) * len(inputs)
-        else:
-            input_specs = tuple(input_spec)
-            if len(input_specs) != len(inputs):
-                raise ValueError(f"Expected {len(inputs)} input specs, got {len(input_specs)}")
-        if any(spec is not None and not isinstance(spec, cutlass_jax.TensorSpec) for spec in input_specs):
-            raise TypeError("input_spec must contain only TensorSpec or None values")
+        for value, desc in zip(inputs, input_descs):
+            self._check_tensor_signature(value, desc)
 
-        def resolve_specs(
-            descs: tuple[TensorDesc[Any], ...],
-            supplied: tuple[Any | None, ...] | None,
-            label: str,
-        ) -> tuple[Any, ...]:
-            if supplied is None:
-                supplied = (None,) * len(descs)
-            else:
-                supplied = tuple(supplied)
-                if len(supplied) != len(descs):
-                    raise ValueError(f"Expected {len(descs)} {label} specs, got {len(supplied)}")
-                if any(spec is not None and not isinstance(spec, cutlass_jax.TensorSpec) for spec in supplied):
-                    raise TypeError(f"{label}_spec must contain only TensorSpec or None values")
-            return tuple(self._to_tensor_spec(desc) if spec is None else spec for desc, spec in zip(descs, supplied))
-
-        output_specs = resolve_specs(outputs, output_spec, "output")
-        workspace_specs = resolve_specs(workspaces, workspace_spec, "workspace")
+        input_specs = tuple(self._to_tensor_spec(desc) for desc in input_descs)
+        output_specs = tuple(self._to_tensor_spec(desc) for desc in outputs)
+        workspace_specs = tuple(self._to_tensor_spec(desc) for desc in workspaces)
         buffers = outputs + workspaces
         buffer_specs = output_specs + workspace_specs
-        buffer_metadata = tuple(self._materialize_tensor_desc(desc, mode=getattr(spec, "mode", None)) for desc, spec in zip(buffers, buffer_specs))
+        buffer_metadata = tuple(
+            self._to_shape_dtype_struct(desc) for desc in buffers
+        )
 
-        if output_seeds is None:
-            supplied_output_seeds = (None,) * len(outputs)
-        else:
-            supplied_output_seeds = tuple(output_seeds)
-            if len(supplied_output_seeds) != len(outputs):
-                raise ValueError(
-                    f"Expected {len(outputs)} output seeds, got {len(supplied_output_seeds)}"
-                )
-
-        seed_by_buffer: dict[int, Any] = {}
-        for output_index, seed in enumerate(supplied_output_seeds):
-            if seed is None:
-                continue
-            output_name = outputs[output_index].name or f"output #{output_index}"
-            if outputs[output_index].init_value is not None:
-                raise ValueError(
-                    f"{output_name} cannot have both an explicit seed and init_value"
-                )
-            _require_array_metadata(seed, f"output seed #{output_index}")
-            metadata = buffer_metadata[output_index]
-            if tuple(seed.shape) != tuple(metadata.shape):
-                raise ValueError(
-                    f"{output_name} seed shape mismatch: "
-                    f"expected {tuple(metadata.shape)}, got {tuple(seed.shape)}"
-                )
-            if seed.dtype != metadata.dtype:
-                raise ValueError(
-                    f"{output_name} seed dtype mismatch: "
-                    f"expected {metadata.dtype}, got {seed.dtype}"
-                )
-            seed_by_buffer[output_index] = seed
-
+        initialized_buffer_by_index: dict[int, Any] = {}
         for buffer_index, desc in enumerate(buffers):
             if desc.init_value is not None:
-                seed_by_buffer[buffer_index] = jnp.full(
+                initialized_buffer_by_index[buffer_index] = jnp.full(
                     buffer_metadata[buffer_index].shape,
                     desc.init_value,
                     dtype=buffer_metadata[buffer_index].dtype,
                 )
 
-        initialized = tuple(sorted(seed_by_buffer))
+        initialized = tuple(sorted(initialized_buffer_by_index))
         uninitialized = tuple(
             buffer_index
             for buffer_index in range(len(buffers))
-            if buffer_index not in seed_by_buffer
+            if buffer_index not in initialized_buffer_by_index
         )
-        seed_inputs = tuple(seed_by_buffer[buffer_index] for buffer_index in initialized)
-        aliases = {len(inputs) + seed_index: result_index for seed_index, result_index in enumerate(initialized)}
+        initialized_inputs = tuple(
+            initialized_buffer_by_index[buffer_index]
+            for buffer_index in initialized
+        )
+        aliases = {
+            len(inputs) + initialized_input_index: result_index
+            for initialized_input_index, result_index in enumerate(initialized)
+        }
         call_input_specs = input_specs + tuple(
             buffer_specs[buffer_index] for buffer_index in initialized
         )
 
         input_count = len(inputs)
-        seed_count = len(seed_inputs)
+        initialized_count = len(initialized_inputs)
 
+        @cute.jit(preprocess=False)
         def launcher(stream, *args):
             kernel_inputs = args[:input_count]
-            seeded_buffers = args[input_count : input_count + seed_count]
-            allocated_buffers = args[input_count + seed_count :]
+            initialized_buffers = args[
+                input_count : input_count + initialized_count
+            ]
+            allocated_buffers = args[input_count + initialized_count :]
             if len(allocated_buffers) != len(uninitialized):
                 raise RuntimeError(f"Kernel received {len(allocated_buffers)} allocated buffers; expected {len(uninitialized)}")
 
             ordered_buffers: list[Any] = [None] * len(buffers)
-            for buffer_index, value in zip(initialized, seeded_buffers):
+            for buffer_index, value in zip(initialized, initialized_buffers):
                 ordered_buffers[buffer_index] = value
             for buffer_index, value in zip(uninitialized, allocated_buffers):
                 ordered_buffers[buffer_index] = value
@@ -523,7 +663,7 @@ class JaxApiBase(ABC):
             compile_options=compile_options,
             use_static_tensors=use_static_tensors,
         )
-        results = call(*inputs, *seed_inputs)
+        results = call(*inputs, *initialized_inputs)
         if not isinstance(results, (tuple, list)):
             results = (results,)
         return tuple(results[: len(outputs)])

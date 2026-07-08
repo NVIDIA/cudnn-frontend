@@ -13,8 +13,8 @@ import jax
 import jax.numpy as jnp
 
 from .. import data_type
-from .._cute_compiler import compile_options_for_target
-from .._dense_gemm import require_gemm_inputs
+from .._jax.compiler import compile_options_for_target
+from ..gemm.helpers import require_gemm_inputs
 from .._jax import JaxApiBase, JaxTensorDesc, TupleDict
 from .._jax.datatypes import jax_to_cudnn_dtype, normalize_jax_dtype
 from .._jax.gemm import BLOCK_SCALE_MODE, PROBABILITY_MODE, gemm_a_mode, gemm_b_mode, gemm_output_mode
@@ -24,7 +24,6 @@ from .op import GemmSreluSm100Op
 SUPPORTED_COMPUTE_CAPABILITIES = (100, 103, 107)
 _JAX_INPUT_DTYPES = frozenset({data_type.FP4_E2M1, data_type.FP8_E4M3, data_type.FP8_E5M2})
 _WIDE_OUTPUT_DTYPES = frozenset({data_type.HALF, data_type.BFLOAT16, data_type.FLOAT})
-_JAX_C_DTYPES = _WIDE_OUTPUT_DTYPES | {data_type.FP8_E4M3, data_type.FP8_E5M2}
 
 
 class GemmSreluSm100(JaxApiBase):
@@ -40,7 +39,6 @@ class GemmSreluSm100(JaxApiBase):
         *,
         sample_c: Any | None = None,
         sample_d: Any | None = None,
-        sample_norm_const: Any | None = None,
         alpha: float = 1.0,
         c_layout: str = "LMN",
         c_dtype: Any | None = None,
@@ -53,38 +51,37 @@ class GemmSreluSm100(JaxApiBase):
         a_layout: str = "LMK",
         b_layout: str = "LNK",
     ) -> None:
-        self.a_mode = gemm_a_mode(a_layout)
-        self.b_mode = gemm_b_mode(b_layout)
-        self.output_mode = gemm_output_mode(c_layout)
-        self.scale_mode = BLOCK_SCALE_MODE
-        self.probability_mode = PROBABILITY_MODE
+        a_mode = gemm_a_mode(a_layout)
+        b_mode = gemm_b_mode(b_layout)
+        output_mode = gemm_output_mode(c_layout)
 
         self.compute_capability = self._resolve_compute_capability(
             None,
             SUPPORTED_COMPUTE_CAPABILITIES,
             "GemmSreluSm100",
         )
-        self.a_desc = self._to_tensor_desc(sample_a, "sample_a", mode=self.a_mode)
-        self.b_desc = self._to_tensor_desc(sample_b, "sample_b", mode=self.b_mode)
-        self.sfa_desc = self._to_tensor_desc(sample_sfa, "sample_sfa", mode=self.scale_mode)
-        self.sfb_desc = self._to_tensor_desc(sample_sfb, "sample_sfb", mode=self.scale_mode)
-        self.prob_desc = self._to_tensor_desc(sample_prob, "sample_prob", mode=self.probability_mode)
+        self.a_desc = self._to_tensor_desc(sample_a, "sample_a", mode=a_mode)
+        self.b_desc = self._to_tensor_desc(sample_b, "sample_b", mode=b_mode)
+        self.sfa_desc = self._to_tensor_desc(sample_sfa, "sample_sfa", mode=BLOCK_SCALE_MODE)
+        self.sfb_desc = self._to_tensor_desc(sample_sfb, "sample_sfb", mode=BLOCK_SCALE_MODE)
+        self.prob_desc = self._to_tensor_desc(sample_prob, "sample_prob", mode=PROBABILITY_MODE)
 
         self.acc_dtype = normalize_jax_dtype(acc_dtype, jnp.float32, "acc_dtype")
-        resolved_c_dtype = normalize_jax_dtype(c_dtype, jnp.bfloat16, "c_dtype")
-        resolved_d_dtype = normalize_jax_dtype(d_dtype, jnp.bfloat16, "d_dtype")
         if (sample_c is None) != (sample_d is None):
             raise ValueError("sample_c and sample_d must be provided together")
         if sample_c is None:
+            resolved_c_dtype = normalize_jax_dtype(c_dtype, jnp.bfloat16, "c_dtype")
+            resolved_d_dtype = normalize_jax_dtype(d_dtype, jnp.bfloat16, "d_dtype")
             self.c_desc, self.d_desc = self._default_output_descs(
                 resolved_c_dtype,
                 resolved_d_dtype,
+                output_mode,
             )
         else:
-            self.c_desc = self._to_tensor_desc(sample_c, "sample_c", mode=self.output_mode)
-            self.d_desc = self._to_tensor_desc(sample_d, "sample_d", mode=self.output_mode)
-            self._check_requested_output_dtype(c_dtype, self.c_desc, "c_dtype")
-            self._check_requested_output_dtype(d_dtype, self.d_desc, "d_dtype")
+            if c_dtype is not None or d_dtype is not None:
+                raise ValueError("c_dtype and d_dtype cannot be specified with sample_c and sample_d")
+            self.c_desc = self._to_tensor_desc(sample_c, "sample_c", mode=output_mode)
+            self.d_desc = self._to_tensor_desc(sample_d, "sample_d", mode=output_mode)
 
         self.amax_desc = None
         if self.a_desc.cudnn_dtype == data_type.FP4_E2M1 and self.d_desc.cudnn_dtype in _WIDE_OUTPUT_DTYPES:
@@ -94,13 +91,6 @@ class GemmSreluSm100(JaxApiBase):
                 name="amax_tensor",
                 init_value=float("-inf"),
             )
-        self.norm_const_desc = None
-        self.sfd_desc = None
-        if self.d_desc.cudnn_dtype in {data_type.FP8_E4M3, data_type.FP8_E5M2}:
-            raise NotImplementedError("FP8 D output is unavailable because the current sReLU kernel does not implement SFD generation")
-        if sample_norm_const is not None:
-            raise ValueError("sample_norm_const is only used with FP8 D output, which is not implemented")
-
         acc_cudnn_dtype = jax_to_cudnn_dtype(self.acc_dtype)
         if acc_cudnn_dtype == data_type.NOT_SET:
             raise ValueError(f"Unsupported JAX accumulator dtype {self.acc_dtype}")
@@ -115,9 +105,9 @@ class GemmSreluSm100(JaxApiBase):
             sfa=self.sfa_desc,
             sfb=self.sfb_desc,
             prob=self.prob_desc,
-            sfd=self.sfd_desc,
+            sfd=None,
             amax=self.amax_desc,
-            norm_const=self.norm_const_desc,
+            norm_const=None,
             alpha=alpha,
             acc_dtype=acc_cudnn_dtype,
             mma_tiler_mn=mma_tiler_mn,
@@ -127,37 +117,33 @@ class GemmSreluSm100(JaxApiBase):
         self.vector_f32 = vector_f32
         self.num_cluster_overlap_margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
 
-    def _default_output_descs(self, c_dtype: Any, d_dtype: Any) -> tuple[JaxTensorDesc, JaxTensorDesc]:
+    def _default_output_descs(
+        self,
+        c_dtype: Any,
+        d_dtype: Any,
+        output_mode: tuple[int, ...],
+    ) -> tuple[JaxTensorDesc, JaxTensorDesc]:
         m, n, _, batch = require_gemm_inputs(self.a_desc, self.b_desc)
-        public_shape = to_public_axes((m, n, batch), self.output_mode)
+        public_shape = to_public_axes((m, n, batch), output_mode)
         return (
-            self._to_tensor_desc(
-                jax.ShapeDtypeStruct(public_shape, c_dtype),
-                "sample_c",
-                mode=self.output_mode,
+            JaxTensorDesc.from_shape(
+                public_shape,
+                c_dtype,
+                name="sample_c",
+                mode=output_mode,
             ),
-            self._to_tensor_desc(
-                jax.ShapeDtypeStruct(public_shape, d_dtype),
-                "sample_d",
-                mode=self.output_mode,
+            JaxTensorDesc.from_shape(
+                public_shape,
+                d_dtype,
+                name="sample_d",
+                mode=output_mode,
             ),
         )
-
-    @staticmethod
-    def _check_requested_output_dtype(requested: Any | None, desc: JaxTensorDesc, name: str) -> None:
-        if requested is None:
-            return
-        requested_dtype = normalize_jax_dtype(requested, requested, name)
-        actual_dtype = jnp.dtype(desc.dtype)
-        if requested_dtype != actual_dtype:
-            raise ValueError(f"{name}={requested_dtype} does not match the explicit sample dtype {actual_dtype}")
 
     def check_support(self) -> bool:
         self._op.check_support()
         if self.a_desc.cudnn_dtype not in _JAX_INPUT_DTYPES:
             raise NotImplementedError("The JAX GEMM + sReLU API supports native FP4 and FP8 inputs")
-        if self.c_desc.cudnn_dtype not in _JAX_C_DTYPES or self.d_desc.cudnn_dtype not in _WIDE_OUTPUT_DTYPES:
-            raise NotImplementedError("The JAX GEMM + sReLU API received an unsupported output dtype")
         return True
 
     def __call__(
@@ -167,19 +153,8 @@ class GemmSreluSm100(JaxApiBase):
         sfa_tensor: Any,
         sfb_tensor: Any,
         prob_tensor: Any,
-        norm_const_tensor: Any | None = None,
     ) -> TupleDict:
         self.check_support()
-        for value, desc, mode in (
-            (a_tensor, self.a_desc, self.a_mode),
-            (b_tensor, self.b_desc, self.b_mode),
-            (sfa_tensor, self.sfa_desc, self.scale_mode),
-            (sfb_tensor, self.sfb_desc, self.scale_mode),
-            (prob_tensor, self.prob_desc, self.probability_mode),
-        ):
-            self._check_tensor_signature(value, desc, mode=mode)
-        if norm_const_tensor is not None:
-            raise ValueError("norm_const_tensor is only used with FP8 D output, which is not implemented")
 
         max_active_clusters = self._get_max_active_clusters(
             self._op.cluster_shape_mn[0] * self._op.cluster_shape_mn[1],
@@ -226,22 +201,11 @@ class GemmSreluSm100(JaxApiBase):
 
         optional_output_descs = () if self.amax_desc is None else (self.amax_desc,)
         output_descs = (self.c_desc, self.d_desc) + optional_output_descs
-        output_specs = (
-            self._to_tensor_spec(self.c_desc, mode=self.output_mode),
-            self._to_tensor_spec(self.d_desc, mode=self.output_mode),
-        ) + tuple(self._to_tensor_spec(desc) for desc in optional_output_descs)
         results = self._call_kernel(
             (a_tensor, b_tensor, sfa_tensor, sfb_tensor, prob_tensor),
             launch=launch,
+            input_descs=(self.a_desc, self.b_desc, self.sfa_desc, self.sfb_desc, self.prob_desc),
             output_descs=output_descs,
-            input_spec=(
-                self._to_tensor_spec(self.a_desc, mode=self.a_mode),
-                self._to_tensor_spec(self.b_desc, mode=self.b_mode),
-                self._to_tensor_spec(self.sfa_desc, mode=self.scale_mode),
-                self._to_tensor_spec(self.sfb_desc, mode=self.scale_mode),
-                self._to_tensor_spec(self.prob_desc, mode=self.probability_mode),
-            ),
-            output_spec=output_specs,
             compile_options=compile_options_for_target(self.compute_capability),
         )
         c_tensor, d_tensor, *optional_results = results
@@ -282,7 +246,6 @@ def gemm_srelu_wrapper_sm100(
     acc_dtype: Any | None = None,
     mma_tiler_mn: tuple[int, int] = (256, 256),
     cluster_shape_mn: tuple[int, int] | None = None,
-    norm_const_tensor: Any | None = None,
     sf_vec_size: int = 16,
     vector_f32: bool = False,
     *,
@@ -292,12 +255,11 @@ def gemm_srelu_wrapper_sm100(
     """Compute block-scaled GEMM and ``D = prob * relu(C) ** 2``."""
 
     return GemmSreluSm100(
-        jax.ShapeDtypeStruct(a_tensor.shape, a_tensor.dtype),
-        jax.ShapeDtypeStruct(b_tensor.shape, b_tensor.dtype),
-        jax.ShapeDtypeStruct(sfa_tensor.shape, sfa_tensor.dtype),
-        jax.ShapeDtypeStruct(sfb_tensor.shape, sfb_tensor.dtype),
-        jax.ShapeDtypeStruct(prob_tensor.shape, prob_tensor.dtype),
-        sample_norm_const=(None if norm_const_tensor is None else jax.ShapeDtypeStruct(norm_const_tensor.shape, norm_const_tensor.dtype)),
+        a_tensor,
+        b_tensor,
+        sfa_tensor,
+        sfb_tensor,
+        prob_tensor,
         alpha=alpha,
         c_layout=c_layout,
         c_dtype=c_dtype,
@@ -309,7 +271,7 @@ def gemm_srelu_wrapper_sm100(
         vector_f32=vector_f32,
         a_layout=a_layout,
         b_layout=b_layout,
-    )(a_tensor, b_tensor, sfa_tensor, sfb_tensor, prob_tensor, norm_const_tensor)
+    )(a_tensor, b_tensor, sfa_tensor, sfb_tensor, prob_tensor)
 
 
 __all__ = [

@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-from ..._cute_compiler import compile_options_for_target, gpu_arch_flag_for_compute_capability
+from ...common.cute_arch import gpu_arch_flag_for_compute_capability
 
 
 @lru_cache(maxsize=None)

@@ -13,8 +13,8 @@ import jax
 import jax.numpy as jnp
 
 from ... import data_type
-from ..._cute_compiler import compile_options_for_target
-from ..._jax import JaxApiBase, TupleDict
+from ..._jax.compiler import compile_options_for_target
+from ..._jax import JaxApiBase, JaxTensorDesc, TupleDict
 from ..jax_utils import normalize_supported_dtype
 
 SUPPORTED_COMPUTE_CAPABILITIES = (90, 100, 103, 107)
@@ -148,38 +148,37 @@ class SelectionAttention(JaxApiBase):
         self.target_compute_capability = target_compute_capability
         self.compute_capability: int | None = None
 
-        self.q_kernel_desc = self._to_tensor_desc(
-            jax.ShapeDtypeStruct((1, *self.q_desc.shape), self.q_desc.dtype),
-            "q_tensor",
+        self.q_kernel_desc = JaxTensorDesc.from_shape(
+            (1, *self.q_desc.shape),
+            self.q_desc.dtype,
+            name="q_tensor",
         )
-        self.k_kernel_desc = self._to_tensor_desc(
-            jax.ShapeDtypeStruct((1, *self.k_desc.shape), self.k_desc.dtype),
-            "k_tensor",
+        self.k_kernel_desc = JaxTensorDesc.from_shape(
+            (1, *self.k_desc.shape),
+            self.k_desc.dtype,
+            name="k_tensor",
         )
-        self.v_kernel_desc = self._to_tensor_desc(
-            jax.ShapeDtypeStruct((1, *self.v_desc.shape), self.v_desc.dtype),
-            "v_tensor",
+        self.v_kernel_desc = JaxTensorDesc.from_shape(
+            (1, *self.v_desc.shape),
+            self.v_desc.dtype,
+            name="v_tensor",
         )
-        self.o_desc = self._to_tensor_desc(
-            jax.ShapeDtypeStruct(
-                (1, self.total_tokens, self.num_query_heads, self.value_dim),
-                self.output_dtype,
-            ),
-            "o_tensor",
+        self.o_desc = JaxTensorDesc.from_shape(
+            (1, self.total_tokens, self.num_query_heads, self.value_dim),
+            self.output_dtype,
+            name="o_tensor",
             init_value=0,
         )
-        self.l_desc = self._to_tensor_desc(
-            jax.ShapeDtypeStruct(
-                (1, self.total_tokens, self.num_query_heads), jnp.float32
-            ),
-            "l_tensor",
+        self.l_desc = JaxTensorDesc.from_shape(
+            (1, self.total_tokens, self.num_query_heads),
+            jnp.float32,
+            name="l_tensor",
             init_value=0.0,
         )
-        self.m_desc = self._to_tensor_desc(
-            jax.ShapeDtypeStruct(
-                (1, self.total_tokens, self.num_query_heads), jnp.float32
-            ),
-            "m_tensor",
+        self.m_desc = JaxTensorDesc.from_shape(
+            (1, self.total_tokens, self.num_query_heads),
+            jnp.float32,
+            name="m_tensor",
             init_value=float("-inf"),
         )
 
@@ -205,9 +204,6 @@ class SelectionAttention(JaxApiBase):
             (q_tensor, self.q_desc),
             (k_tensor, self.k_desc),
             (v_tensor, self.v_desc),
-            (block_indices_tensor, self.block_indices_desc),
-            (block_counts_tensor, self.block_counts_desc),
-            (cum_seqlen_tensor, self.cum_seqlen_desc),
         ):
             self._check_tensor_signature(value, desc)
 
@@ -225,13 +221,13 @@ class SelectionAttention(JaxApiBase):
             ),
             launch=self._launch_kernel,
             output_descs=(self.o_desc, self.l_desc, self.m_desc),
-            input_spec=(
-                self._to_tensor_spec(self.q_kernel_desc),
-                self._to_tensor_spec(self.k_kernel_desc),
-                self._to_tensor_spec(self.v_kernel_desc),
-                self._to_tensor_spec(self.block_indices_desc),
-                self._to_tensor_spec(self.block_counts_desc),
-                self._to_tensor_spec(self.cum_seqlen_desc),
+            input_descs=(
+                self.q_kernel_desc,
+                self.k_kernel_desc,
+                self.v_kernel_desc,
+                self.block_indices_desc,
+                self.block_counts_desc,
+                self.cum_seqlen_desc,
             ),
             compile_options=compile_options_for_target(self.compute_capability),
         )
@@ -323,9 +319,8 @@ def selection_attention_wrapper(
         block_counts_tensor,
         cum_seqlen_tensor,
     )
-    samples = tuple(jax.ShapeDtypeStruct(value.shape, value.dtype) for value in values)
     return SelectionAttention(
-        *samples,
+        *values,
         max_s_q=max_s_q,
         max_s_k=max_s_k,
         block_size=block_size,

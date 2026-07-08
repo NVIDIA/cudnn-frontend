@@ -25,7 +25,7 @@ from .op import (
 
 
 def _compile_options(target_compute_capability: int) -> str:
-    from ..utils.compiler import compile_options_for_target
+    from ..._jax.compiler import compile_options_for_target
 
     return compile_options_for_target(target_compute_capability)
 
@@ -69,7 +69,6 @@ def _check_optional_signature(
         return
     if value is None:
         raise ValueError(f"{name} is required by the sample signature")
-    api._check_tensor_signature(value, expected, mode=mode)
 
 
 class _SparseScoreRecompute(JaxApiBase):
@@ -176,12 +175,10 @@ class _SparseScoreRecompute(JaxApiBase):
             raise ValueError(
                 f"topk_indices must have rank 3, got shape {self.topk_indices_desc.shape}"
             )
-        return self._to_tensor_desc(
-            jax.ShapeDtypeStruct(
-                to_public_axes(self.topk_indices_desc.shape, self.output_mode),
-                jnp.float32,
-            ),
-            "sample_out",
+        return JaxTensorDesc.from_shape(
+            to_public_axes(self.topk_indices_desc.shape, self.output_mode),
+            jnp.float32,
+            name="sample_out",
             mode=self.output_mode,
         )
 
@@ -192,13 +189,6 @@ class _SparseScoreRecompute(JaxApiBase):
         self, q: Any, k: Any, per_head: Any, topk_indices: Any, topk_length: Any | None
     ) -> Any:
         self.check_support()
-        for value, expected, mode in (
-            (q, self.q_desc, self.q_mode),
-            (k, self.k_desc, self.k_mode),
-            (per_head, self.per_head_desc, self.per_head_mode),
-            (topk_indices, self.topk_indices_desc, self.score_mode),
-        ):
-            self._check_tensor_signature(value, expected, mode=mode)
         _check_optional_signature(
             self,
             topk_length,
@@ -212,36 +202,36 @@ class _SparseScoreRecompute(JaxApiBase):
             kernel_k_layout = self.k_layout.replace("D", "HD")
             kernel_k_mode = mode_from_layout(kernel_k_layout, kernel_axes="BSHD")
             kernel_k_desc = self._to_tensor_desc(
-                jax.ShapeDtypeStruct(kernel_k.shape, kernel_k.dtype),
+                kernel_k,
                 "kernel_k",
                 mode=kernel_k_mode,
             )
             per_head_axes = tuple(self.per_head_layout.index(axis) for axis in "BHS")
             kernel_per_head = jnp.transpose(per_head, per_head_axes)
             kernel_per_head_desc = self._to_tensor_desc(
-                jax.ShapeDtypeStruct(kernel_per_head.shape, kernel_per_head.dtype),
+                kernel_per_head,
                 "kernel_per_head",
             )
             inputs = (q, kernel_k, kernel_per_head, topk_indices)
-            input_bindings = (
-                (self.q_desc, self.q_mode),
-                (kernel_k_desc, kernel_k_mode),
-                (kernel_per_head_desc, None),
-                (self.topk_indices_desc, self.score_mode),
+            input_descs = (
+                self.q_desc,
+                kernel_k_desc,
+                kernel_per_head_desc,
+                self.topk_indices_desc,
             )
         else:
             inputs = (q, k, per_head, topk_indices)
-            input_bindings = (
-                (self.q_desc, self.q_mode),
-                (self.k_desc, self.k_mode),
-                (self.per_head_desc, self.per_head_mode),
-                (self.topk_indices_desc, self.score_mode),
+            input_descs = (
+                self.q_desc,
+                self.k_desc,
+                self.per_head_desc,
+                self.topk_indices_desc,
             )
 
         workspace_descs = ()
         if topk_length is not None:
             inputs += (topk_length,)
-            input_bindings += ((self.topk_length_desc, self.length_mode),)
+            input_descs += (self.topk_length_desc,)
         elif self.target_compute_capability != 90:
             workspace_descs = (
                 self.topk_indices_desc.compact_like(
@@ -255,11 +245,8 @@ class _SparseScoreRecompute(JaxApiBase):
             inputs,
             launch=self._launch_kernel,
             output_descs=(self.out_desc,),
+            input_descs=input_descs,
             workspace_descs=workspace_descs,
-            input_spec=tuple(
-                self._to_tensor_spec(desc, mode=mode) for desc, mode in input_bindings
-            ),
-            output_spec=(self._to_tensor_spec(self.out_desc, mode=self.output_mode),),
             compile_options=_compile_options(self.target_compute_capability),
         )
         return output
@@ -599,19 +586,17 @@ class _DenseScoreRecompute(JaxApiBase):
                 f"Dense score inputs must both use BSHD or THD layout, got Q={self.q_desc.shape}, K={self.k_desc.shape}"
             )
         return (
-            self._to_tensor_desc(
-                jax.ShapeDtypeStruct(
-                    to_public_axes(out_shape, self.output_mode), jnp.float32
-                ),
-                "sample_out",
+            JaxTensorDesc.from_shape(
+                to_public_axes(out_shape, self.output_mode),
+                jnp.float32,
+                name="sample_out",
                 mode=self.output_mode,
                 init_value=float("-inf"),
             ),
-            self._to_tensor_desc(
-                jax.ShapeDtypeStruct(
-                    to_public_axes(denom_shape, self.denom_mode), jnp.float32
-                ),
-                "sample_denom_out",
+            JaxTensorDesc.from_shape(
+                to_public_axes(denom_shape, self.denom_mode),
+                jnp.float32,
+                name="sample_denom_out",
                 mode=self.denom_mode,
             ),
         )
@@ -629,12 +614,6 @@ class _DenseScoreRecompute(JaxApiBase):
         q_causal_offsets: Any | None,
     ) -> TupleDict:
         self.check_support()
-        for value, expected, mode in (
-            (q, self.q_desc, self.q_mode),
-            (k, self.k_desc, self.k_mode),
-            (per_head, self.per_head_desc, self.per_head_mode),
-        ):
-            self._check_tensor_signature(value, expected, mode=mode)
         _check_optional_signature(
             self, cu_seqlens_q, self.cu_seqlens_q_desc, "cu_seqlens_q"
         )
@@ -649,43 +628,37 @@ class _DenseScoreRecompute(JaxApiBase):
             per_head_axes = tuple(self.per_head_layout.index(axis) for axis in "BHS")
             kernel_per_head = jnp.transpose(per_head, per_head_axes)
             kernel_per_head_desc = self._to_tensor_desc(
-                jax.ShapeDtypeStruct(kernel_per_head.shape, kernel_per_head.dtype),
+                kernel_per_head,
                 "kernel_per_head",
             )
             inputs = (q, k, kernel_per_head)
-            input_bindings = (
-                (self.q_desc, self.q_mode),
-                (self.k_desc, self.k_mode),
-                (kernel_per_head_desc, None),
+            input_descs = (
+                self.q_desc,
+                self.k_desc,
+                kernel_per_head_desc,
             )
         else:
             inputs = (q, k, per_head)
-            input_bindings = (
-                (self.q_desc, self.q_mode),
-                (self.k_desc, self.k_mode),
-                (self.per_head_desc, self.per_head_mode),
+            input_descs = (
+                self.q_desc,
+                self.k_desc,
+                self.per_head_desc,
             )
             if self.is_thd:
                 inputs += (cu_seqlens_q, cu_seqlens_k)
-                input_bindings += (
-                    (self.cu_seqlens_q_desc, None),
-                    (self.cu_seqlens_k_desc, None),
+                input_descs += (
+                    self.cu_seqlens_q_desc,
+                    self.cu_seqlens_k_desc,
                 )
         if q_causal_offsets is not None:
             inputs += (q_causal_offsets,)
-            input_bindings += ((self.q_causal_offsets_desc, None),)
+            input_descs += (self.q_causal_offsets_desc,)
 
         output, denominator = self._call_kernel(
             inputs,
             launch=self._launch_kernel,
             output_descs=(self.out_desc, self.denom_desc),
-            input_spec=tuple(
-                self._to_tensor_spec(desc, mode=mode) for desc, mode in input_bindings
-            ),
-            output_spec=(
-                self._to_tensor_spec(self.out_desc, mode=self.output_mode),
-                self._to_tensor_spec(self.denom_desc, mode=self.denom_mode),
-            ),
+            input_descs=input_descs,
             compile_options=_compile_options(self.target_compute_capability),
         )
         return TupleDict(out=output, denom=denominator)
@@ -920,13 +893,11 @@ def sparse_indexer_score_recompute_wrapper(
     target_compute_capability: int | None = None,
 ) -> TupleDict:
     return SparseIndexerScoreRecompute(
-        jax.ShapeDtypeStruct(q_indexer.shape, q_indexer.dtype),
-        jax.ShapeDtypeStruct(k_indexer.shape, k_indexer.dtype),
-        jax.ShapeDtypeStruct(weights.shape, weights.dtype),
-        jax.ShapeDtypeStruct(topk_indices.shape, topk_indices.dtype),
-        sample_topk_length=None
-        if topk_length is None
-        else jax.ShapeDtypeStruct(topk_length.shape, topk_length.dtype),
+        q_indexer,
+        k_indexer,
+        weights,
+        topk_indices,
+        sample_topk_length=topk_length,
         qhead_per_kv_head=qhead_per_kv_head,
         topk_indices_global=topk_indices_global,
         q_layout=q_layout,
@@ -969,14 +940,12 @@ def sparse_attn_score_recompute_wrapper(
     target_compute_capability: int | None = None,
 ) -> TupleDict:
     return SparseAttnScoreRecompute(
-        jax.ShapeDtypeStruct(q_attn.shape, q_attn.dtype),
-        jax.ShapeDtypeStruct(k_attn.shape, k_attn.dtype),
-        jax.ShapeDtypeStruct(lse.shape, lse.dtype),
-        jax.ShapeDtypeStruct(topk_indices.shape, topk_indices.dtype),
+        q_attn,
+        k_attn,
+        lse,
+        topk_indices,
         softmax_scale,
-        sample_topk_length=None
-        if topk_length is None
-        else jax.ShapeDtypeStruct(topk_length.shape, topk_length.dtype),
+        sample_topk_length=topk_length,
         qhead_per_kv_head=qhead_per_kv_head,
         topk_indices_global=topk_indices_global,
         q_layout=q_layout,
@@ -1024,23 +993,17 @@ def dense_indexer_score_recompute_wrapper(
     target_compute_capability: int | None = None,
 ) -> TupleDict:
     return DenseIndexerScoreRecompute(
-        jax.ShapeDtypeStruct(q.shape, q.dtype),
-        jax.ShapeDtypeStruct(k.shape, k.dtype),
-        jax.ShapeDtypeStruct(weights.shape, weights.dtype),
+        q,
+        k,
+        weights,
         qhead_per_kv_head=qhead_per_kv_head,
         sm_scale=sm_scale,
         ratio=ratio,
-        sample_cu_seqlens_q=None
-        if cu_seqlens_q is None
-        else jax.ShapeDtypeStruct(cu_seqlens_q.shape, cu_seqlens_q.dtype),
-        sample_cu_seqlens_k=None
-        if cu_seqlens_k is None
-        else jax.ShapeDtypeStruct(cu_seqlens_k.shape, cu_seqlens_k.dtype),
+        sample_cu_seqlens_q=cu_seqlens_q,
+        sample_cu_seqlens_k=cu_seqlens_k,
         max_seqlen_q=max_seqlen_q,
         max_seqlen_k=max_seqlen_k,
-        sample_q_causal_offsets=None
-        if q_causal_offsets is None
-        else jax.ShapeDtypeStruct(q_causal_offsets.shape, q_causal_offsets.dtype),
+        sample_q_causal_offsets=q_causal_offsets,
         q_layout=q_layout,
         k_layout=k_layout,
         per_head_layout=per_head_layout,
@@ -1086,23 +1049,17 @@ def dense_attn_score_recompute_wrapper(
     target_compute_capability: int | None = None,
 ) -> TupleDict:
     return DenseAttnScoreRecompute(
-        jax.ShapeDtypeStruct(q.shape, q.dtype),
-        jax.ShapeDtypeStruct(k.shape, k.dtype),
-        jax.ShapeDtypeStruct(lse.shape, lse.dtype),
+        q,
+        k,
+        lse,
         softmax_scale,
         qhead_per_kv_head=qhead_per_kv_head,
         ratio=ratio,
-        sample_cu_seqlens_q=None
-        if cu_seqlens_q is None
-        else jax.ShapeDtypeStruct(cu_seqlens_q.shape, cu_seqlens_q.dtype),
-        sample_cu_seqlens_k=None
-        if cu_seqlens_k is None
-        else jax.ShapeDtypeStruct(cu_seqlens_k.shape, cu_seqlens_k.dtype),
+        sample_cu_seqlens_q=cu_seqlens_q,
+        sample_cu_seqlens_k=cu_seqlens_k,
         max_seqlen_q=max_seqlen_q,
         max_seqlen_k=max_seqlen_k,
-        sample_q_causal_offsets=None
-        if q_causal_offsets is None
-        else jax.ShapeDtypeStruct(q_causal_offsets.shape, q_causal_offsets.dtype),
+        sample_q_causal_offsets=q_causal_offsets,
         q_layout=q_layout,
         k_layout=k_layout,
         per_head_layout=per_head_layout,

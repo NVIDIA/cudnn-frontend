@@ -9,8 +9,8 @@ import math
 from typing import Any, Optional
 
 from ... import data_type
-from ..._op import Op
-from ..._tensor_desc import TensorDesc
+from ...common.op import Op
+from ...common.tensor_desc import TensorDesc
 
 SUPPORTED_HEAD_DIMS = (512, 576)
 BLOCK_TILE = 64

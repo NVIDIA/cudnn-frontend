@@ -3,7 +3,7 @@
 
 """Lazy Torch API exports for the grouped GEMM operation family."""
 
-from .._operation_api import make_operation_api
+from ..common.operation_api import make_operation_api
 
 _OPERATIONS = (
     "swiglu",

@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Dependency-free contracts for packed JAX NSA top-K reduction."""
+"""Contracts for packed JAX NSA top-K reduction."""
 
 from __future__ import annotations
 
@@ -97,11 +97,30 @@ class JaxNsaTopkThdContractTest(unittest.TestCase):
         internal.__spec__ = ModuleSpec(internal_name, loader=None, is_package=True)
         sys.modules[internal_name] = internal
 
-        tensor_module = importlib.import_module(f"{_PACKAGE}._tensor_desc")
+        tensor_module = importlib.import_module(f"{_PACKAGE}.common.tensor_desc")
         layout_module = importlib.import_module(f"{internal_name}.layout")
-        result_module = importlib.import_module(f"{_PACKAGE}._result")
+        result_module = importlib.import_module(f"{_PACKAGE}.common.result")
 
         class JaxTensorDesc(tensor_module.TensorDesc):
+            @classmethod
+            def from_shape(
+                cls,
+                shape,
+                dtype,
+                *,
+                name="",
+                mode=None,
+                public_stride_order=None,
+                init_value=None,
+            ):
+                return JaxApiBase._to_tensor_desc(
+                    _Array(shape, dtype),
+                    name,
+                    mode=mode,
+                    public_stride_order=public_stride_order,
+                    init_value=init_value,
+                )
+
             @property
             def cudnn_dtype(self):
                 return _DTYPE_TO_CUDNN.get(self.dtype, _DataType.NOT_SET)
@@ -134,7 +153,7 @@ class JaxNsaTopkThdContractTest(unittest.TestCase):
                 canonical_axis_by_public_axis = layout_module.to_public_axes(
                     tuple(range(len(public_shape))), mode
                 )
-                return JaxTensorDesc(
+                desc = JaxTensorDesc(
                     dtype=value.dtype,
                     shape=layout_module.to_canonical_axes(public_shape, mode),
                     stride=layout_module.to_canonical_axes(public_stride, mode),
@@ -145,9 +164,13 @@ class JaxNsaTopkThdContractTest(unittest.TestCase):
                     name=name,
                     init_value=init_value,
                 )
+                object.__setattr__(desc, "mode", mode)
+                return desc
 
             @staticmethod
             def _check_tensor_signature(value, expected, *, mode=None):
+                if mode is None:
+                    mode = expected.mode
                 actual_shape = layout_module.to_canonical_axes(tuple(value.shape), mode)
                 if actual_shape != expected.shape:
                     raise ValueError(f"{expected.name} shape mismatch")
@@ -159,6 +182,8 @@ class JaxNsaTopkThdContractTest(unittest.TestCase):
 
             @staticmethod
             def _to_tensor_spec(desc, *, mode=None, divisibility=None):
+                if mode is None:
+                    mode = desc.mode
                 mode = layout_module.normalize_mode(desc.ndim, mode)
                 return _TensorSpec(
                     layout=layout_module.to_cutlass_layout(
@@ -178,10 +203,22 @@ class JaxNsaTopkThdContractTest(unittest.TestCase):
                 *,
                 launch,
                 output_descs,
-                input_spec,
-                output_spec,
+                input_descs=None,
+                input_spec=None,
+                output_spec=None,
                 **options,
             ):
+                if input_descs is not None:
+                    for value, desc in zip(inputs, input_descs):
+                        self._check_tensor_signature(value, desc)
+                if input_spec is None:
+                    input_spec = tuple(
+                        self._to_tensor_spec(desc) for desc in input_descs or ()
+                    )
+                if output_spec is None:
+                    output_spec = tuple(
+                        self._to_tensor_spec(desc) for desc in output_descs
+                    )
                 self.captured_call = {
                     "inputs": tuple(inputs),
                     "launch": launch,
@@ -191,8 +228,11 @@ class JaxNsaTopkThdContractTest(unittest.TestCase):
                     **options,
                 }
                 return tuple(
-                    _Array(desc.shape, _CUDNN_TO_DTYPE[desc.cudnn_dtype])
-                    for desc in output_descs
+                    _Array(
+                        layout_module.to_public_axes(desc.shape, spec.mode),
+                        _CUDNN_TO_DTYPE[desc.cudnn_dtype],
+                    )
+                    for desc, spec in zip(output_descs, output_spec)
                 )
 
         internal.JaxApiBase = JaxApiBase

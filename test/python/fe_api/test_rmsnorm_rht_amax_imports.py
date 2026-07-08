@@ -189,7 +189,7 @@ class RmsNormImportContractTest(unittest.TestCase):
                 return any(alias.name == framework or alias.name.startswith(f"{framework}.") for alias in node.names)
             return node.level == 0 and (node.module == framework or (node.module or "").startswith(f"{framework}."))
 
-        base_op_imports = all_imports(_CUDNN_ROOT / "_op.py")
+        base_op_imports = all_imports(_CUDNN_ROOT / "common" / "op.py")
         self.assertFalse(any(imports_framework(node, framework) for node in base_op_imports for framework in ("torch", "jax", "cutlass", "cuda")))
 
         operation_imports = all_imports("op.py")
@@ -367,8 +367,8 @@ class RmsNormImportContractTest(unittest.TestCase):
         self.assertNotIn("_trace_lock", {node.attr for node in ast.walk(jax_adapter) if isinstance(node, ast.Attribute)})
 
         root_source = (_CUDNN_ROOT / "__init__.py").read_text()
-        self.assertIn("from ._op import Op", root_source)
-        self.assertIn("from ._tensor_desc import TensorDesc", root_source)
+        self.assertIn("from .common.op import Op", root_source)
+        self.assertIn("from .common.tensor_desc import TensorDesc", root_source)
         self.assertIn('if name == "jax":', root_source)
         self.assertIn('importlib.import_module(".jax", __name__)', root_source)
 

@@ -8,8 +8,8 @@ from __future__ import annotations
 from typing import Any
 
 from ... import data_type
-from ..._op import Op
-from ..._tensor_desc import TensorDesc
+from ...common.op import Op
+from ...common.tensor_desc import TensorDesc
 
 INT32_MAX = (1 << 31) - 1
 SUPPORTED_COMPUTE_CAPABILITIES = (90, 100, 103, 107)

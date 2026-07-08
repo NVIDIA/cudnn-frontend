@@ -14,25 +14,25 @@ import jax.numpy as jnp
 
 from .._jax_api import (
     ApiBaseJax,
+    BLOCK_SCALE_MODE,
     make_buffer_desc,
     FIX_PAD_SIZE,
     MAX_EXPERTS,
     TWO_CTA_MMA_TILER_M,
     TupleDict,
+    GROUPED_BIAS_MODE,
+    GROUPED_WORKSPACE_ALIGNMENT,
+    PROBABILITY_MODE,
     as_gemm_tensor_desc,
     block_scale_shape,
-    block_scale_tensor_spec,
     call_cutedsl,
     dense_workspace_bytes,
-    gemm_a_tensor_spec,
-    gemm_b_tensor_spec,
-    gemm_c_tensor_spec,
-    grouped_bias_tensor_spec,
-    grouped_workspace_tensor_spec,
+    gemm_a_mode,
+    gemm_b_mode,
+    gemm_output_mode,
     is_fp4_dtype,
     is_fp8_dtype,
     is_low_precision_output_dtype,
-    probability_tensor_spec,
     require_16_byte_extent,
     require_array,
     require_dtype,
@@ -173,11 +173,11 @@ def _grouped_gemm_quant_impl(
 
     output_layout = require_layout("output_layout", output_layout, ("LMN",))
     b_layout = require_layout("b_layout", b_layout, ("LNK", "LKN"))
-    a_spec = gemm_a_tensor_spec("LMK")
-    b_spec = gemm_b_tensor_spec(b_layout)
-    output_spec = gemm_c_tensor_spec(output_layout, name="output_layout")
-    a_desc = as_gemm_tensor_desc("a_tensor", a_tensor, a_spec)
-    b_desc = as_gemm_tensor_desc("b_tensor", b_tensor, b_spec)
+    a_mode = gemm_a_mode("LMK")
+    b_mode = gemm_b_mode(b_layout)
+    output_mode = gemm_output_mode(output_layout, name="output_layout")
+    a_desc = as_gemm_tensor_desc("a_tensor", a_tensor, mode=a_mode)
+    b_desc = as_gemm_tensor_desc("b_tensor", b_tensor, mode=b_mode)
     m, n, k, experts, ab_dtype = require_grouped_gemm_inputs(
         a_desc,
         b_desc,
@@ -256,7 +256,6 @@ def _grouped_gemm_quant_impl(
         cluster_shape_mn, mma_tiler_mn=mma_tiler_mn
     )
 
-    scale_spec = block_scale_tensor_spec()
     require_16_byte_extent("a_tensor", k, ab_dtype)
     require_16_byte_extent("b_tensor", n if b_layout == "LKN" else k, ab_dtype)
     require_16_byte_extent("d_tensor", n, d_dtype)
@@ -278,32 +277,34 @@ def _grouped_gemm_quant_impl(
         alpha_tensor,
         prob_tensor,
     ]
-    input_specs = [
-        a_spec,
-        b_spec,
-        scale_spec,
-        scale_spec,
-        None,
-        None,
-        probability_tensor_spec(),
+    input_descs = [
+        a_desc,
+        b_desc,
+        as_gemm_tensor_desc("sfa_tensor", sfa_tensor, mode=BLOCK_SCALE_MODE),
+        as_gemm_tensor_desc("sfb_tensor", sfb_tensor, mode=BLOCK_SCALE_MODE),
+        as_gemm_tensor_desc("padded_offsets", padded_offsets),
+        as_gemm_tensor_desc("alpha_tensor", alpha_tensor),
+        as_gemm_tensor_desc("prob_tensor", prob_tensor, mode=PROBABILITY_MODE),
     ]
     if row_scale_tensor is not None:
         inputs.append(row_scale_tensor)
-        input_specs.append(None)
+        input_descs.append(as_gemm_tensor_desc("row_scale_tensor", row_scale_tensor))
     if bias_tensor is not None:
         inputs.append(bias_tensor)
-        input_specs.append(grouped_bias_tensor_spec())
+        input_descs.append(
+            as_gemm_tensor_desc("bias_tensor", bias_tensor, mode=GROUPED_BIAS_MODE)
+        )
     if generate_sfd:
         inputs.append(norm_const_tensor)
-        input_specs.append(None)
+        input_descs.append(as_gemm_tensor_desc("norm_const_tensor", norm_const_tensor))
 
     outputs = [
-        make_buffer_desc("d_tensor", (1, m, n), d_dtype, tensor_spec=output_spec)
+        make_buffer_desc("d_tensor", (1, m, n), d_dtype, mode=output_mode)
     ]
     if generate_sfd:
         outputs.append(
             make_buffer_desc(
-                "d_col_tensor", (1, m, n), d_dtype, tensor_spec=output_spec
+                "d_col_tensor", (1, m, n), d_dtype, mode=output_mode
             )
         )
     if has_amax:
@@ -319,13 +320,13 @@ def _grouped_gemm_quant_impl(
                     "sfd_row_tensor",
                     block_scale_shape(m, n, 1, sf_vec_size),
                     jnp.float8_e8m0fnu,
-                    tensor_spec=scale_spec,
+                    mode=BLOCK_SCALE_MODE,
                 ),
                 make_buffer_desc(
                     "sfd_col_tensor",
                     block_scale_shape(n, m, 1, sf_vec_size),
                     jnp.float8_e8m0fnu,
-                    tensor_spec=scale_spec,
+                    mode=BLOCK_SCALE_MODE,
                 ),
             )
         )
@@ -334,6 +335,7 @@ def _grouped_gemm_quant_impl(
     results = call_cutedsl(
         _launch,
         inputs,
+        input_descs=input_descs,
         static_args={
             "acc_dtype": acc_dtype,
             "mma_tiler_mn": mma_tiler_mn,
@@ -355,10 +357,9 @@ def _grouped_gemm_quant_impl(
                 "workspace",
                 (workspace_bytes,),
                 jnp.uint8,
-                tensor_spec=grouped_workspace_tensor_spec(),
+                ptr_assumed_align=GROUPED_WORKSPACE_ALIGNMENT,
             ),
         ),
-        input_specs=input_specs,
     )
     result_idx = 1
     d_tensor = results[0]
@@ -408,15 +409,14 @@ class GroupedGemmQuantSm100(ApiBaseJax):
         super().__init__()
         output_layout = require_layout("output_layout", output_layout, ("LMN",))
         b_layout = require_layout("b_layout", b_layout, ("LNK", "LKN"))
-        a_spec = gemm_a_tensor_spec("LMK")
-        b_spec = gemm_b_tensor_spec(b_layout)
-        scale_spec = block_scale_tensor_spec()
+        a_mode = gemm_a_mode("LMK")
+        b_mode = gemm_b_mode(b_layout)
         self._sample_descs = {
             "a_tensor": self.make_tensor_desc(
-                sample_a_tensor, tensor_spec=a_spec, name="sample_a_tensor"
+                sample_a_tensor, mode=a_mode, name="sample_a_tensor"
             ),
             "sfa_tensor": self.make_tensor_desc(
-                sample_sfa_tensor, tensor_spec=scale_spec, name="sample_sfa_tensor"
+                sample_sfa_tensor, mode=BLOCK_SCALE_MODE, name="sample_sfa_tensor"
             ),
             "padded_offsets": self.make_tensor_desc(
                 sample_padded_offsets, name="sample_padded_offsets"
@@ -425,14 +425,14 @@ class GroupedGemmQuantSm100(ApiBaseJax):
                 sample_alpha_tensor, name="sample_alpha_tensor"
             ),
             "b_tensor": self.make_tensor_desc(
-                sample_b_tensor, tensor_spec=b_spec, name="sample_b_tensor"
+                sample_b_tensor, mode=b_mode, name="sample_b_tensor"
             ),
             "sfb_tensor": self.make_tensor_desc(
-                sample_sfb_tensor, tensor_spec=scale_spec, name="sample_sfb_tensor"
+                sample_sfb_tensor, mode=BLOCK_SCALE_MODE, name="sample_sfb_tensor"
             ),
             "bias_tensor": self.make_optional_tensor_desc(
                 sample_bias_tensor,
-                tensor_spec=grouped_bias_tensor_spec(),
+                mode=GROUPED_BIAS_MODE,
                 name="sample_bias_tensor",
             ),
             "norm_const_tensor": self.make_optional_tensor_desc(
@@ -440,7 +440,7 @@ class GroupedGemmQuantSm100(ApiBaseJax):
             ),
             "prob_tensor": self.make_optional_tensor_desc(
                 sample_prob_tensor,
-                tensor_spec=probability_tensor_spec(),
+                mode=PROBABILITY_MODE,
                 name="sample_prob_tensor",
             ),
             "row_scale_tensor": self.make_optional_tensor_desc(

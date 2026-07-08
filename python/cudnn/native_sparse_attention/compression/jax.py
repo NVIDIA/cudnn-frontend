@@ -13,12 +13,11 @@ import jax
 import jax.numpy as jnp
 
 from ... import data_type
-from ..._cute_compiler import compile_options_for_target
-from ..._jax import JaxApiBase, TupleDict
+from ..._jax.compiler import compile_options_for_target
+from ..._jax import JaxApiBase, JaxTensorDesc, TupleDict
 from ..jax_utils import (
     BHS_TO_BSH_MODE,
     FIXED_LAYOUTS,
-    describe_bhs_as_bsh,
     describe_fixed_data,
     fixed_data_mode,
     make_fixed_output,
@@ -182,19 +181,22 @@ class CompressionAttention(JaxApiBase):
                     "max_s_q and max_s_k must be positive and no larger than "
                     "their packed token counts"
                 )
-            self.q_kernel_desc = self._to_tensor_desc(
-                jax.ShapeDtypeStruct((1, *sample_q.shape), sample_q.dtype),
-                "q_tensor",
+            self.q_kernel_desc = JaxTensorDesc.from_shape(
+                (1, *sample_q.shape),
+                sample_q.dtype,
+                name="q_tensor",
                 public_stride_order=(3, 2, 0, 1),
             )
-            self.k_kernel_desc = self._to_tensor_desc(
-                jax.ShapeDtypeStruct((1, *sample_k.shape), sample_k.dtype),
-                "k_tensor",
+            self.k_kernel_desc = JaxTensorDesc.from_shape(
+                (1, *sample_k.shape),
+                sample_k.dtype,
+                name="k_tensor",
                 public_stride_order=(3, 2, 0, 1),
             )
-            self.v_kernel_desc = self._to_tensor_desc(
-                jax.ShapeDtypeStruct((1, *sample_v.shape), sample_v.dtype),
-                "v_tensor",
+            self.v_kernel_desc = JaxTensorDesc.from_shape(
+                (1, *sample_v.shape),
+                sample_v.dtype,
+                name="v_tensor",
                 public_stride_order=(3, 2, 0, 1),
             )
         if self.seqlen_q < self.seqlen_k or self.seqlen_q % self.seqlen_k:
@@ -240,12 +242,11 @@ class CompressionAttention(JaxApiBase):
             )
             self.o_kernel_desc = self.o_desc
             self.lse_desc = (
-                describe_bhs_as_bsh(
-                    jax.ShapeDtypeStruct(
-                        (self.batch, self.num_query_heads, self.seqlen_q),
-                        jnp.float32,
-                    ),
-                    "lse_tensor",
+                JaxTensorDesc.from_shape(
+                    (self.batch, self.num_query_heads, self.seqlen_q),
+                    jnp.float32,
+                    name="lse_tensor",
+                    mode=BHS_TO_BSH_MODE,
                 )
                 if self.enable_lse
                 else None
@@ -257,26 +258,29 @@ class CompressionAttention(JaxApiBase):
                 self.num_query_heads,
                 self.head_dim,
             )
-            self.o_desc = self._to_tensor_desc(
-                jax.ShapeDtypeStruct(output_shape, self.output_dtype), "o_tensor"
+            self.o_desc = JaxTensorDesc.from_shape(
+                output_shape, self.output_dtype, name="o_tensor"
             )
-            self.o_kernel_desc = self._to_tensor_desc(
-                jax.ShapeDtypeStruct((1, *output_shape), self.output_dtype),
-                "o_kernel_tensor",
+            self.o_kernel_desc = JaxTensorDesc.from_shape(
+                (1, *output_shape),
+                self.output_dtype,
+                name="o_kernel_tensor",
                 public_stride_order=(3, 2, 0, 1),
             )
             self.lse_desc = (
-                self._to_tensor_desc(
-                    jax.ShapeDtypeStruct(output_shape[:2], jnp.float32),
-                    "lse_tensor",
+                JaxTensorDesc.from_shape(
+                    output_shape[:2],
+                    jnp.float32,
+                    name="lse_tensor",
                 )
                 if self.enable_lse
                 else None
             )
             self.lse_kernel_desc = (
-                self._to_tensor_desc(
-                    jax.ShapeDtypeStruct((1, *output_shape[:2]), jnp.float32),
-                    "lse_kernel_tensor",
+                JaxTensorDesc.from_shape(
+                    (1, *output_shape[:2]),
+                    jnp.float32,
+                    name="lse_kernel_tensor",
                 )
                 if self.enable_lse
                 else None
@@ -301,40 +305,29 @@ class CompressionAttention(JaxApiBase):
         cum_seqlen_k_tensor: Any | None = None,
     ) -> TupleDict:
         self.check_support()
-        signature_mode = self.data_mode
-        for value, desc in (
-            (q_tensor, self.q_desc),
-            (k_tensor, self.k_desc),
-            (v_tensor, self.v_desc),
-        ):
-            self._check_tensor_signature(value, desc, mode=signature_mode)
-
         if self.input_layout in FIXED_LAYOUTS:
             if cum_seqlen_q_tensor is not None or cum_seqlen_k_tensor is not None:
                 raise ValueError(
                     "cumulative sequence lengths must be omitted for fixed inputs"
                 )
             inputs = (q_tensor, k_tensor, v_tensor)
-            input_specs = (
-                self._to_tensor_spec(self.q_kernel_desc, mode=self.data_mode),
-                self._to_tensor_spec(self.k_kernel_desc, mode=self.data_mode),
-                self._to_tensor_spec(self.v_kernel_desc, mode=self.data_mode),
+            input_descs = (
+                self.q_kernel_desc,
+                self.k_kernel_desc,
+                self.v_kernel_desc,
             )
-            output_specs = (
-                self._to_tensor_spec(self.o_kernel_desc, mode=self.data_mode),
-            )
-            if self.lse_kernel_desc is not None:
-                output_specs += (
-                    self._to_tensor_spec(self.lse_kernel_desc, mode=BHS_TO_BSH_MODE),
-                )
             launch = self._launch_kernel
         else:
             if cum_seqlen_q_tensor is None or cum_seqlen_k_tensor is None:
                 raise ValueError(
                     "packed THD inputs require cumulative Q and K sequence lengths"
                 )
-            self._check_tensor_signature(cum_seqlen_q_tensor, self.cum_q_desc)
-            self._check_tensor_signature(cum_seqlen_k_tensor, self.cum_k_desc)
+            for value, desc in (
+                (q_tensor, self.q_desc),
+                (k_tensor, self.k_desc),
+                (v_tensor, self.v_desc),
+            ):
+                self._check_tensor_signature(value, desc)
             q_tensor = jnp.reshape(q_tensor, self.q_kernel_desc.shape)
             k_tensor = jnp.reshape(k_tensor, self.k_kernel_desc.shape)
             v_tensor = jnp.reshape(v_tensor, self.v_kernel_desc.shape)
@@ -345,16 +338,13 @@ class CompressionAttention(JaxApiBase):
                 cum_seqlen_q_tensor,
                 cum_seqlen_k_tensor,
             )
-            input_specs = (
-                self._to_tensor_spec(self.q_kernel_desc),
-                self._to_tensor_spec(self.k_kernel_desc),
-                self._to_tensor_spec(self.v_kernel_desc),
-                self._to_tensor_spec(self.cum_q_desc),
-                self._to_tensor_spec(self.cum_k_desc),
+            input_descs = (
+                self.q_kernel_desc,
+                self.k_kernel_desc,
+                self.v_kernel_desc,
+                self.cum_q_desc,
+                self.cum_k_desc,
             )
-            output_specs = (self._to_tensor_spec(self.o_kernel_desc),)
-            if self.lse_kernel_desc is not None:
-                output_specs += (self._to_tensor_spec(self.lse_kernel_desc),)
             launch = self._launch_varlen_kernel
 
         results = self._call_kernel(
@@ -363,8 +353,7 @@ class CompressionAttention(JaxApiBase):
             output_descs=(self.o_kernel_desc,)
             if self.lse_kernel_desc is None
             else (self.o_kernel_desc, self.lse_kernel_desc),
-            input_spec=input_specs,
-            output_spec=output_specs,
+            input_descs=input_descs,
             compile_options=compile_options_for_target(self.compute_capability),
         )
         output = results[0]
@@ -510,24 +499,12 @@ def compression_attention_wrapper(
     Fixed outputs follow ``layout``; LSE remains ``(B, H, S)``.
     """
 
-    qkv_samples = tuple(
-        jax.ShapeDtypeStruct(value.shape, value.dtype)
-        for value in (q_tensor, k_tensor, v_tensor)
-    )
-    cum_q_sample = (
-        None
-        if cum_seqlen_q_tensor is None
-        else jax.ShapeDtypeStruct(cum_seqlen_q_tensor.shape, cum_seqlen_q_tensor.dtype)
-    )
-    cum_k_sample = (
-        None
-        if cum_seqlen_k_tensor is None
-        else jax.ShapeDtypeStruct(cum_seqlen_k_tensor.shape, cum_seqlen_k_tensor.dtype)
-    )
     return CompressionAttention(
-        *qkv_samples,
-        cum_q_sample,
-        cum_k_sample,
+        q_tensor,
+        k_tensor,
+        v_tensor,
+        cum_seqlen_q_tensor,
+        cum_seqlen_k_tensor,
         enable_lse=enable_lse,
         o_dtype=o_dtype,
         qk_acc_dtype=qk_acc_dtype,

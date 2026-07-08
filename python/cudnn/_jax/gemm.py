@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Dependency-free public-axis bindings for dense JAX GEMMs."""
+"""Public-axis bindings for dense JAX GEMMs."""
 
 from __future__ import annotations
 

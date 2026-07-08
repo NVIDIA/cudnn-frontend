@@ -6,15 +6,12 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
 from typing import Any
 
-import jax
 import jax.numpy as jnp
-from cutlass.jax import TensorSpec
 
-from .._cute_compiler import compile_options_for_target
-from .._dense_gemm import (
+from .._jax.compiler import compile_options_for_target
+from ..gemm.helpers import (
     block_scale_shape as _canonical_block_scale_shape,
     data_type_bits,
 )
@@ -136,85 +133,9 @@ def require_layout(name: str, value: str, supported: tuple[str, ...]) -> str:
     return value
 
 
-def _row_major_spec(rank: int, mode: tuple[int, ...]) -> TensorSpec:
-    return TensorSpec(layout=tuple(reversed(range(rank))), mode=mode)
-
-
-def gemm_a_tensor_spec(layout: str) -> TensorSpec:
-    return _row_major_spec(3, gemm_a_mode(layout))
-
-
-def gemm_b_tensor_spec(layout: str) -> TensorSpec:
-    return _row_major_spec(3, gemm_b_mode(layout))
-
-
-def gemm_c_tensor_spec(layout: str, *, name: str = "c_layout") -> TensorSpec:
-    return _row_major_spec(
-        3, gemm_output_mode(require_layout(name, layout, ("LMN", "LNM")), name=name)
-    )
-
-
-def block_scale_tensor_spec() -> TensorSpec:
-    """Describe public row-major ``L,tiles,tiles,32,4,4`` scale arrays."""
-
-    return _row_major_spec(6, BLOCK_SCALE_MODE)
-
-
-def probability_tensor_spec() -> TensorSpec:
-    """Map public row-major ``(L, 1, M)`` to canonical ``(M, 1, L)``."""
-
-    return _row_major_spec(3, (2, 1, 0))
-
-
-def grouped_bias_tensor_spec() -> TensorSpec:
-    """Map public row-major ``(L, N)`` to canonical ``(N, L)``."""
-
-    return _row_major_spec(2, (1, 0))
-
-
-def grouped_workspace_tensor_spec() -> TensorSpec:
-    return TensorSpec(ptr_assumed_align=128)
-
-
-@dataclass(frozen=True)
-class _SampleDesc(JaxTensorDesc):
-    """JAX descriptor retaining the native CUTLASS lowering specification."""
-
-    tensor_spec: Any = None
-    jax_mode: tuple[int, ...] = field(default_factory=tuple)
-
-    @property
-    def array_shape(self) -> tuple[int, ...]:
-        return to_public_axes(self.shape, self.jax_mode)
-
-
-def _make_desc(
-    value: Any,
-    *,
-    tensor_spec: TensorSpec | None,
-    name: str,
-    init_value: bool | int | float | None = None,
-) -> _SampleDesc:
-    public_shape = require_array(value, name=name)
-    mode = normalize_mode(
-        len(public_shape), None if tensor_spec is None else tensor_spec.mode
-    )
-    desc = JaxApiBase._to_tensor_desc(
-        value,
-        name,
-        mode=mode,
-        init_value=init_value,
-    )
-    return _SampleDesc(
-        dtype=desc.dtype,
-        shape=desc.shape,
-        stride=desc.stride,
-        stride_order=desc.stride_order,
-        name=desc.name,
-        init_value=desc.init_value,
-        tensor_spec=tensor_spec,
-        jax_mode=mode,
-    )
+PROBABILITY_MODE = (2, 1, 0)
+GROUPED_BIAS_MODE = (1, 0)
+GROUPED_WORKSPACE_ALIGNMENT = 128
 
 
 def make_buffer_desc(
@@ -222,29 +143,75 @@ def make_buffer_desc(
     shape: Sequence[int],
     dtype: Any,
     *,
-    tensor_spec: TensorSpec | None = None,
+    mode: tuple[int, ...] | None = None,
+    public_stride_order: tuple[int, ...] | None = None,
+    divisibility: tuple[int | None, ...] | None = None,
+    ptr_assumed_align: int | None = None,
     init_value: bool | int | float | None = None,
-) -> _SampleDesc:
+) -> JaxTensorDesc:
     """Describe an inferred JAX output or workspace buffer."""
 
     if not name:
         raise ValueError("buffer descriptor name must not be empty")
-    return _make_desc(
-        jax.ShapeDtypeStruct(tuple(shape), dtype),
-        tensor_spec=tensor_spec,
+    return JaxTensorDesc.from_shape(
+        tuple(shape),
+        dtype,
         name=name,
+        mode=mode,
+        public_stride_order=public_stride_order,
+        divisibility=divisibility,
+        ptr_assumed_align=ptr_assumed_align,
         init_value=init_value,
     )
 
 
-def as_gemm_tensor_desc(name: str, value: Any, tensor_spec: TensorSpec) -> _SampleDesc:
-    if isinstance(value, _SampleDesc):
-        if value.jax_mode != normalize_mode(value.ndim, tensor_spec.mode):
+def as_gemm_tensor_desc(
+    name: str,
+    value: Any,
+    *,
+    mode: tuple[int, ...] | None = None,
+    public_stride_order: tuple[int, ...] | None = None,
+    divisibility: tuple[int | None, ...] | None = None,
+    ptr_assumed_align: int | None = None,
+) -> JaxTensorDesc:
+    if isinstance(value, JaxTensorDesc):
+        if value.mode != normalize_mode(value.ndim, mode):
             raise ValueError(
                 f"{name} descriptor mode does not match the requested layout"
             )
+        expected = JaxTensorDesc.from_shape(
+            value.array_shape,
+            value.dtype,
+            name=name,
+            mode=mode,
+            public_stride_order=public_stride_order,
+            divisibility=divisibility,
+            ptr_assumed_align=ptr_assumed_align,
+        )
+        if (value.stride, value.stride_order) != (
+            expected.stride,
+            expected.stride_order,
+        ):
+            raise ValueError(
+                f"{name} descriptor stride order does not match the requested layout"
+            )
+        if value.divisibility != expected.divisibility:
+            raise ValueError(
+                f"{name} descriptor divisibility does not match the requested layout"
+            )
+        if value.ptr_assumed_align != expected.ptr_assumed_align:
+            raise ValueError(
+                f"{name} descriptor pointer alignment does not match the requested layout"
+            )
         return value
-    return _make_desc(value, tensor_spec=tensor_spec, name=name)
+    return JaxTensorDesc.from_array(
+        value,
+        name=name,
+        mode=mode,
+        public_stride_order=public_stride_order,
+        divisibility=divisibility,
+        ptr_assumed_align=ptr_assumed_align,
+    )
 
 
 class ApiBaseJax(JaxApiBase):
@@ -270,21 +237,45 @@ class ApiBaseJax(JaxApiBase):
         raise NotImplementedError
 
     def make_tensor_desc(
-        self, value: Any, *, tensor_spec: TensorSpec | None = None, name: str = ""
-    ) -> _SampleDesc:
-        return _make_desc(value, tensor_spec=tensor_spec, name=name or "value")
+        self,
+        value: Any,
+        *,
+        mode: tuple[int, ...] | None = None,
+        public_stride_order: tuple[int, ...] | None = None,
+        divisibility: tuple[int | None, ...] | None = None,
+        ptr_assumed_align: int | None = None,
+        name: str = "",
+    ) -> JaxTensorDesc:
+        return JaxTensorDesc.from_array(
+            value,
+            name=name or "value",
+            mode=mode,
+            public_stride_order=public_stride_order,
+            divisibility=divisibility,
+            ptr_assumed_align=ptr_assumed_align,
+        )
 
     def make_optional_tensor_desc(
         self,
         value: Any | None,
         *,
-        tensor_spec: TensorSpec | None = None,
+        mode: tuple[int, ...] | None = None,
+        public_stride_order: tuple[int, ...] | None = None,
+        divisibility: tuple[int | None, ...] | None = None,
+        ptr_assumed_align: int | None = None,
         name: str = "",
-    ) -> _SampleDesc | None:
+    ) -> JaxTensorDesc | None:
         return (
             None
             if value is None
-            else self.make_tensor_desc(value, tensor_spec=tensor_spec, name=name)
+            else self.make_tensor_desc(
+                value,
+                mode=mode,
+                public_stride_order=public_stride_order,
+                divisibility=divisibility,
+                ptr_assumed_align=ptr_assumed_align,
+                name=name,
+            )
         )
 
     @staticmethod
@@ -300,7 +291,7 @@ class ApiBaseJax(JaxApiBase):
 
     def check_tensor_signatures(
         self,
-        expected: Mapping[str, _SampleDesc | None],
+        expected: Mapping[str, JaxTensorDesc | None],
         values: Mapping[str, Any],
     ) -> None:
         for name, expected_desc in expected.items():
@@ -337,49 +328,35 @@ def call_cutedsl(
     fn: Any,
     inputs: Sequence[Any],
     *,
+    input_descs: Sequence[JaxTensorDesc],
     outputs: Sequence[JaxTensorDesc],
-    output_seeds: Sequence[Any | None] | None = None,
     workspaces: Sequence[JaxTensorDesc] = (),
-    input_specs: Sequence[TensorSpec | None] | None = None,
     static_args: Mapping[str, Any] | None = None,
     allow_cuda_graph: bool = True,
     use_static_tensors: bool = True,
 ) -> tuple[Any, ...]:
-    """Lower a grouped kernel with canonical stream/input/output/workspace order."""
+    """Lower a grouped kernel with canonical stream/input/output/workspace order.
+
+    Tensor descriptors retain framework metadata and all CUTLASS lowering
+    constraints.
+    """
 
     static = dict(static_args or {})
     cluster_shape = static.get("cluster_shape_mn")
     margin = int(static.pop("cluster_overlap_margin", 0))
 
-    output_specs = tuple(outputs)
-    workspace_specs = tuple(workspaces)
-    if output_seeds is None:
-        supplied_output_seeds = (None,) * len(output_specs)
-    else:
-        supplied_output_seeds = tuple(output_seeds)
-        if len(supplied_output_seeds) != len(output_specs):
-            raise ValueError(
-                f"Expected {len(output_specs)} output seeds, "
-                f"got {len(supplied_output_seeds)}"
-            )
+    input_descs = tuple(input_descs)
+    output_descs = tuple(outputs)
+    workspace_descs = tuple(workspaces)
+    if len(input_descs) != len(inputs):
+        raise ValueError(
+            f"Expected {len(inputs)} input descriptors, got {len(input_descs)}"
+        )
 
-    if any(0 in desc.shape for desc in output_specs):
+    if any(0 in desc.shape for desc in output_descs):
         results = []
-        for desc, seed in zip(output_specs, supplied_output_seeds):
-            spec = getattr(desc, "tensor_spec", None)
-            mode = None if spec is None else spec.mode
-            if seed is not None:
-                if desc.init_value is not None:
-                    raise ValueError(
-                        f"{desc.name} cannot have both an explicit seed and init_value"
-                    )
-                _CALLER._check_tensor_signature(seed, desc, mode=mode)
-                results.append(seed)
-                continue
-            metadata = _CALLER._materialize_tensor_desc(
-                desc,
-                mode=mode,
-            )
+        for desc in output_descs:
+            metadata = _CALLER._to_shape_dtype_struct(desc)
             if desc.init_value is None:
                 results.append(jnp.empty(metadata.shape, dtype=metadata.dtype))
             else:
@@ -409,14 +386,9 @@ def call_cutedsl(
     return _CALLER._call_kernel(
         tuple(inputs),
         launch=launch,
-        output_descs=output_specs,
-        output_seeds=supplied_output_seeds,
-        workspace_descs=workspace_specs,
-        input_spec=None if input_specs is None else tuple(input_specs),
-        output_spec=tuple(getattr(desc, "tensor_spec", None) for desc in output_specs),
-        workspace_spec=tuple(
-            getattr(desc, "tensor_spec", None) for desc in workspace_specs
-        ),
+        input_descs=input_descs,
+        output_descs=output_descs,
+        workspace_descs=workspace_descs,
         allow_cuda_graph=allow_cuda_graph,
         compile_options=compile_options_for_target(compute_capability),
         use_static_tensors=use_static_tensors,
@@ -679,9 +651,12 @@ def ceil_div(a: int, b: int) -> int:
 
 __all__ = [
     "ApiBaseJax",
+    "BLOCK_SCALE_MODE",
     "FIX_PAD_SIZE",
     "FP8_SF_VEC_SIZE",
     "HADAMARD_SIZE",
+    "GROUPED_BIAS_MODE",
+    "GROUPED_WORKSPACE_ALIGNMENT",
     "MAX_EXPERTS",
     "SF_VEC_SIZES",
     "TWO_CTA_MMA_TILER_M",
@@ -689,22 +664,19 @@ __all__ = [
     "as_dtype",
     "as_gemm_tensor_desc",
     "block_scale_shape",
-    "block_scale_tensor_spec",
     "call_cutedsl",
     "ceil_div",
     "dense_workspace_bytes",
-    "gemm_a_tensor_spec",
-    "gemm_b_tensor_spec",
-    "gemm_c_tensor_spec",
-    "grouped_bias_tensor_spec",
+    "gemm_a_mode",
+    "gemm_b_mode",
+    "gemm_output_mode",
     "grouped_wgrad_workspace_bytes",
-    "grouped_workspace_tensor_spec",
     "is_fp4_dtype",
     "is_fp8_dtype",
     "is_low_precision_output_dtype",
     "make_buffer_desc",
     "normalize_wgrad_input_order",
-    "probability_tensor_spec",
+    "PROBABILITY_MODE",
     "require_16_byte_extent",
     "require_array",
     "require_contiguous_alignment",

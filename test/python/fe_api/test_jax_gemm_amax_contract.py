@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Dependency-free contracts for the JAX GEMM + amax adapter."""
+"""Contracts for the JAX GEMM + amax adapter."""
 
 from __future__ import annotations
 
@@ -90,11 +90,29 @@ class JaxGemmAmaxContractTest(unittest.TestCase):
         internal.__spec__ = ModuleSpec(internal_name, loader=None, is_package=True)
         sys.modules[internal_name] = internal
 
-        tensor_module = importlib.import_module(f"{_PACKAGE}._tensor_desc")
+        tensor_module = importlib.import_module(f"{_PACKAGE}.common.tensor_desc")
         layout_module = importlib.import_module(f"{internal_name}.layout")
-        result_module = importlib.import_module(f"{_PACKAGE}._result")
+        result_module = importlib.import_module(f"{_PACKAGE}.common.result")
 
         class JaxTensorDesc(tensor_module.TensorDesc):
+            @classmethod
+            def from_shape(cls, shape, dtype, *, name, mode=None, init_value=None):
+                public_shape = tuple(shape)
+                mode = layout_module.normalize_mode(len(public_shape), mode)
+                public_order = tuple(reversed(range(len(public_shape))))
+                public_stride = layout_module.compact_stride(public_shape, public_order)
+                canonical_axis_by_public_axis = layout_module.to_public_axes(tuple(range(len(public_shape))), mode)
+                desc = cls(
+                    dtype=dtype,
+                    shape=layout_module.to_canonical_axes(public_shape, mode),
+                    stride=layout_module.to_canonical_axes(public_stride, mode),
+                    stride_order=tuple(canonical_axis_by_public_axis[axis] for axis in public_order),
+                    name=name,
+                    init_value=init_value,
+                )
+                object.__setattr__(desc, "mode", mode)
+                return desc
+
             @property
             def cudnn_dtype(self):
                 return _DTYPE_TO_CUDNN.get(self.dtype, _DataType.NOT_SET)
@@ -121,7 +139,7 @@ class JaxGemmAmaxContractTest(unittest.TestCase):
                     tuple(range(len(public_shape))),
                     mode,
                 )
-                return JaxTensorDesc(
+                desc = JaxTensorDesc(
                     dtype=value.dtype,
                     shape=layout_module.to_canonical_axes(public_shape, mode),
                     stride=layout_module.to_canonical_axes(public_stride, mode),
@@ -129,6 +147,8 @@ class JaxGemmAmaxContractTest(unittest.TestCase):
                     name=name,
                     init_value=init_value,
                 )
+                object.__setattr__(desc, "mode", mode)
+                return desc
 
             @staticmethod
             def _resolve_compute_capability(target, supported, operation_name):
@@ -163,6 +183,15 @@ class JaxGemmAmaxContractTest(unittest.TestCase):
                 )
 
             def _call_kernel(self, inputs, **options):
+                input_descs = options.get("input_descs")
+                if input_descs is not None:
+                    for value, desc in zip(inputs, input_descs):
+                        self._check_tensor_signature(value, desc, mode=desc.mode)
+                    options["input_spec"] = tuple(self._to_tensor_spec(desc, mode=desc.mode) for desc in input_descs)
+                if "output_spec" not in options:
+                    options["output_spec"] = tuple(
+                        self._to_tensor_spec(desc, mode=getattr(desc, "mode", None)) for desc in options["output_descs"]
+                    )
                 self.captured_call = (tuple(inputs), options)
                 return tuple(
                     _Array(
@@ -261,10 +290,10 @@ class JaxGemmAmaxContractTest(unittest.TestCase):
         samples = self._samples()
         api = self.module.GemmAmaxSm100(*samples)
 
-        self.assertEqual(api.a_mode, (1, 2, 0))
-        self.assertEqual(api.b_mode, (1, 2, 0))
-        self.assertEqual(api.output_mode, (1, 2, 0))
-        self.assertEqual(api.scale_mode, (3, 4, 1, 5, 2, 0))
+        self.assertEqual(api.a_desc.mode, (1, 2, 0))
+        self.assertEqual(api.b_desc.mode, (1, 2, 0))
+        self.assertEqual(api.c_desc.mode, (1, 2, 0))
+        self.assertEqual(api.sfa_desc.mode, (3, 4, 1, 5, 2, 0))
         self.assertEqual(api.sfa_desc.shape, (32, 4, 1, 4, 1, 2))
         self.assertEqual(api.sfa_desc.stride_order, (3, 1, 0, 4, 2, 5))
         self.assertEqual(api.amax_desc.init_value, float("-inf"))
@@ -280,7 +309,7 @@ class JaxGemmAmaxContractTest(unittest.TestCase):
         self.assertTrue(callable(options["launch"]))
         self.assertEqual(
             tuple(spec.mode for spec in options["input_spec"]),
-            (api.a_mode, api.b_mode, api.scale_mode, api.scale_mode),
+            (api.a_desc.mode, api.b_desc.mode, api.sfa_desc.mode, api.sfb_desc.mode),
         )
         self.assertEqual(options["input_spec"][2].layout, (5, 4, 3, 2, 1, 0))
         self.assertEqual(options["input_spec"][3].layout, (5, 4, 3, 2, 1, 0))
@@ -333,7 +362,6 @@ class JaxGemmAmaxContractTest(unittest.TestCase):
             *samples,
             sample_c=_Array((2, 128, 256), "bfloat16"),
             sample_amax=_Array((1, 1, 1), "float32"),
-            c_dtype="bfloat16",
         )
         result = api(*samples)
         self.assertEqual(result["c_tensor"].dtype, "bfloat16")
@@ -345,6 +373,13 @@ class JaxGemmAmaxContractTest(unittest.TestCase):
             self.module.GemmAmaxSm100(
                 *samples,
                 sample_c=_Array((2, 128, 256), "float32"),
+            )
+        with self.assertRaisesRegex(ValueError, "c_dtype cannot be specified"):
+            self.module.GemmAmaxSm100(
+                *samples,
+                sample_c=_Array((2, 128, 256), "bfloat16"),
+                sample_amax=_Array((1, 1, 1), "float32"),
+                c_dtype="bfloat16",
             )
         with self.assertRaisesRegex(ValueError, "sample_a tensor shape mismatch"):
             api(_Array((2, 64, 128), samples[0].dtype), *samples[1:])

@@ -81,17 +81,13 @@ class RmsNormRhtAmaxSm100(JaxApiBase):
 
     def __call__(self, x: Any, weight: Any) -> tuple[Any, Any]:
         self.check_support()
-        self._check_tensor_signature(x, self.x_desc)
-        self._check_tensor_signature(weight, self.w_desc)
 
-        x_spec = self._to_tensor_spec(
-            self.x_desc,
-            divisibility=(self._op.rows_per_cta, 16),
+        x_desc = self.x_desc.with_divisibility(
+            (self._op.rows_per_cta, 16)
         )
-        weight_spec = self._to_tensor_spec(self.w_desc, divisibility=(16,))
-        output_spec = self._to_tensor_spec(
-            self.o_desc,
-            divisibility=(self._op.rows_per_cta, 16),
+        weight_desc = self.w_desc.with_divisibility((16,))
+        output_desc = self.o_desc.with_divisibility(
+            (self._op.rows_per_cta, 16)
         )
 
         def launch(
@@ -112,9 +108,8 @@ class RmsNormRhtAmaxSm100(JaxApiBase):
         return self._call_kernel(
             (x, weight),
             launch=launch,
-            output_descs=(self.o_desc, self.amax_desc),
-            input_spec=(x_spec, weight_spec),
-            output_spec=(output_spec, None),
+            output_descs=(output_desc, self.amax_desc),
+            input_descs=(x_desc, weight_desc),
         )
 
 
@@ -129,11 +124,9 @@ def rmsnorm_rht_amax_sm100(
 ) -> tuple[Any, Any]:
     """Apply fused RMSNorm, 16-wide RHT, and per-CTA amax from JAX."""
 
-    sample_x = jax.ShapeDtypeStruct(x.shape, x.dtype)
-    sample_weight = jax.ShapeDtypeStruct(weight.shape, weight.dtype)
     return RmsNormRhtAmaxSm100(
-        sample_x,
-        sample_weight,
+        x,
+        weight,
         eps=eps,
         num_threads=num_threads,
         rows_per_cta=rows_per_cta,

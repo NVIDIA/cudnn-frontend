@@ -8,11 +8,10 @@ from __future__ import annotations
 import os
 from typing import Any
 
-import jax
 import jax.numpy as jnp
 
 from .. import data_type
-from .._dense_gemm import (
+from ..gemm.helpers import (
     block_scale_shape,
     require_16_byte_alignment,
     require_block_scale_layout,
@@ -255,12 +254,15 @@ class DiscreteGroupedGemmJaxBase(JaxApiBase):
         *,
         mode: tuple[int, ...] | None = None,
         init_value: bool | int | float | None = None,
+        ptr_assumed_align: int | None = None,
     ) -> JaxTensorDesc:
-        return self._to_tensor_desc(
-            jax.ShapeDtypeStruct(to_public_axes(shape, mode), dtype),
-            name,
+        return JaxTensorDesc.from_shape(
+            to_public_axes(shape, mode),
+            dtype,
+            name=name,
             mode=mode,
             init_value=init_value,
+            ptr_assumed_align=ptr_assumed_align,
         )
 
     def _workspace_desc(self, workspace_bytes: int) -> JaxTensorDesc:
@@ -268,30 +270,25 @@ class DiscreteGroupedGemmJaxBase(JaxApiBase):
             raise ValueError(
                 f"kernel workspace size must be positive, got {workspace_bytes}"
             )
-        return self._canonical_desc((workspace_bytes,), jnp.uint8, "workspace")
+        return self._canonical_desc(
+            (workspace_bytes,),
+            jnp.uint8,
+            "workspace",
+            ptr_assumed_align=128,
+        )
 
     def _materialize_output_desc(
         self,
         desc: JaxTensorDesc | None,
-        *,
-        mode: tuple[int, ...] | None = None,
     ) -> Any | None:
         """Materialize an inferred result without launching an empty GEMM."""
 
         if desc is None:
             return None
-        metadata = self._materialize_tensor_desc(desc, mode=mode)
+        metadata = self._to_shape_dtype_struct(desc)
         if desc.init_value is None:
             return jnp.empty(metadata.shape, dtype=metadata.dtype)
         return jnp.full(metadata.shape, desc.init_value, dtype=metadata.dtype)
-
-    @staticmethod
-    def _workspace_tensor_spec() -> Any:
-        """Require the alignment used by the kernel's TMA descriptor stores."""
-
-        from cutlass.jax import TensorSpec
-
-        return TensorSpec(ptr_assumed_align=128)
 
     def _check_runtime_common(
         self,
@@ -302,10 +299,10 @@ class DiscreteGroupedGemmJaxBase(JaxApiBase):
         padded_offsets: Any,
         alpha_tensor: Any,
     ) -> None:
-        self._check_tensor_signature(a_tensor, self.a_desc, mode=self.a_mode)
-        self._check_tensor_signature(b_tensor, self.b_desc, mode=self.b_mode)
-        self._check_tensor_signature(sfa_tensor, self.sfa_desc, mode=self.scale_mode)
-        self._check_tensor_signature(sfb_tensor, self.sfb_desc, mode=self.scale_mode)
+        self._check_tensor_signature(a_tensor, self.a_desc)
+        self._check_tensor_signature(b_tensor, self.b_desc)
+        self._check_tensor_signature(sfa_tensor, self.sfa_desc)
+        self._check_tensor_signature(sfb_tensor, self.sfb_desc)
         self._check_tensor_signature(padded_offsets, self.padded_offsets_desc)
         self._check_tensor_signature(alpha_tensor, self.alpha_desc)
 

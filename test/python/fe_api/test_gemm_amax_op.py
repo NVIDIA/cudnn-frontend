@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Dependency-free contracts for the dense GEMM + amax operation."""
+"""Contracts for the dense GEMM + amax operation."""
 
 from enum import Enum, auto
 import importlib
@@ -55,8 +55,8 @@ class GemmAmaxOpContractTest(unittest.TestCase):
         sys.modules[operation_name] = operation
 
         try:
-            cls.tensor_module = importlib.import_module(f"{_PACKAGE}._tensor_desc")
-            cls.base_module = importlib.import_module(f"{_PACKAGE}._op")
+            cls.tensor_module = importlib.import_module(f"{_PACKAGE}.common.tensor_desc")
+            cls.base_module = importlib.import_module(f"{_PACKAGE}.common.op")
             cls.op_module = importlib.import_module(f"{operation_name}.op")
         except Exception:
             cls.tearDownClass()

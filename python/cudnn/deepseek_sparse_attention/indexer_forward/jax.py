@@ -12,8 +12,8 @@ import jax
 import jax.numpy as jnp
 
 from ..._jax import JaxApiBase, JaxTensorDesc, TupleDict
+from ..._jax.compiler import compile_options_for_target
 from ..._jax.layout import mode_from_layout, to_public_axes
-from ..utils.compiler import compile_options_for_target
 from .op import IndexerForwardOp, SUPPORTED_COMPUTE_CAPABILITIES, TMA_ALIGN_ELEMENTS
 
 
@@ -200,12 +200,10 @@ class IndexerForward(JaxApiBase):
 
         padded_seqlen_k = ((logical_seqlen_k + TMA_ALIGN_ELEMENTS - 1) // TMA_ALIGN_ELEMENTS) * TMA_ALIGN_ELEMENTS
         canonical_shape = (*leading_shape, padded_seqlen_k)
-        return self._to_tensor_desc(
-            jax.ShapeDtypeStruct(
-                to_public_axes(canonical_shape, self.output_mode),
-                jnp.float32,
-            ),
-            "sample_out",
+        return JaxTensorDesc.from_shape(
+            to_public_axes(canonical_shape, self.output_mode),
+            jnp.float32,
+            name="sample_out",
             mode=self.output_mode,
             init_value=float("-inf"),
         )
@@ -224,19 +222,12 @@ class IndexerForward(JaxApiBase):
         q_causal_offsets: Any | None = None,
     ) -> TupleDict:
         self.check_support()
-        self._check_tensor_signature(q, self.q_desc, mode=self.q_mode)
-        self._check_tensor_signature(k, self.k_desc, mode=self.k_mode)
-        self._check_tensor_signature(w, self.w_desc, mode=self.w_mode)
         self._check_optional_signature(cu_seqlens_q, self.cu_seqlens_q_desc, "cu_seqlens_q")
         self._check_optional_signature(cu_seqlens_k, self.cu_seqlens_k_desc, "cu_seqlens_k")
         self._check_optional_signature(q_causal_offsets, self.q_causal_offsets_desc, "q_causal_offsets")
 
         inputs = [q, k, w]
-        input_bindings = [
-            (self.q_desc, self.q_mode),
-            (self.k_desc, self.k_mode),
-            (self.w_desc, self.w_mode),
-        ]
+        input_descs = [self.q_desc, self.k_desc, self.w_desc]
         for value, desc in (
             (cu_seqlens_q, self.cu_seqlens_q_desc),
             (cu_seqlens_k, self.cu_seqlens_k_desc),
@@ -244,21 +235,16 @@ class IndexerForward(JaxApiBase):
         ):
             if desc is not None:
                 inputs.append(value)
-                input_bindings.append((desc, None))
+                input_descs.append(desc)
 
-        output_divisibility = (None,) * (self.o_desc.ndim - 1) + (TMA_ALIGN_ELEMENTS,)
+        output_desc = self.o_desc.with_divisibility(
+            (None,) * (self.o_desc.ndim - 1) + (TMA_ALIGN_ELEMENTS,)
+        )
         (scores_padded,) = self._call_kernel(
             tuple(inputs),
             launch=self._launch_kernel,
-            output_descs=(self.o_desc,),
-            input_spec=tuple(self._to_tensor_spec(desc, mode=mode) for desc, mode in input_bindings),
-            output_spec=(
-                self._to_tensor_spec(
-                    self.o_desc,
-                    mode=self.output_mode,
-                    divisibility=output_divisibility,
-                ),
-            ),
+            output_descs=(output_desc,),
+            input_descs=tuple(input_descs),
             compile_options=compile_options_for_target(self.target_compute_capability),
         )
         if self._op.s_k is None:
@@ -272,8 +258,6 @@ class IndexerForward(JaxApiBase):
         if (value is None) != (desc is None):
             expected = "omitted" if desc is None else "provided"
             raise ValueError(f"{name} must be {expected} for this specialized callable")
-        if desc is not None:
-            JaxApiBase._check_tensor_signature(value, desc)
 
     def _launch_kernel(
         self,
@@ -383,26 +367,13 @@ def indexer_forward_wrapper(
 ) -> TupleDict:
     """Compute fixed batch/sequence-major or packed THD indexer scores."""
 
-    sample_q = jax.ShapeDtypeStruct(q.shape, q.dtype)
-    sample_k = jax.ShapeDtypeStruct(k.shape, k.dtype)
-    sample_w = jax.ShapeDtypeStruct(w.shape, w.dtype)
-    sample_cu_q = None if cu_seqlens_q is None else jax.ShapeDtypeStruct(cu_seqlens_q.shape, cu_seqlens_q.dtype)
-    sample_cu_k = None if cu_seqlens_k is None else jax.ShapeDtypeStruct(cu_seqlens_k.shape, cu_seqlens_k.dtype)
-    sample_offsets = (
-        None
-        if q_causal_offsets is None
-        else jax.ShapeDtypeStruct(
-            q_causal_offsets.shape,
-            q_causal_offsets.dtype,
-        )
-    )
     return IndexerForward(
-        sample_q,
-        sample_k,
-        sample_w,
-        sample_cu_seqlens_q=sample_cu_q,
-        sample_cu_seqlens_k=sample_cu_k,
-        sample_q_causal_offsets=sample_offsets,
+        q,
+        k,
+        w,
+        sample_cu_seqlens_q=cu_seqlens_q,
+        sample_cu_seqlens_k=cu_seqlens_k,
+        sample_q_causal_offsets=q_causal_offsets,
         ratio=ratio,
         qhead_per_kv_head=qhead_per_kv_head,
         max_seqlen_q=max_seqlen_q,

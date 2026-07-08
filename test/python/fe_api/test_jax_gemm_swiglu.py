@@ -52,10 +52,12 @@ def test_jax_gemm_swiglu_abstract_contract(
     from cudnn._jax import JaxApiBase
     from cudnn.jax import GemmSwigluSm100, gemm_swiglu_wrapper_sm100
 
-    def abstract_call(self, _inputs, *, output_descs, output_spec, **_options):
+    def abstract_call(self, _inputs, *, output_descs, output_spec=None, **_options):
+        if output_spec is None:
+            output_spec = tuple(self._to_tensor_spec(desc) for desc in output_descs)
         return tuple(
             jnp.empty(
-                self._materialize_tensor_desc(desc, mode=spec.mode).shape,
+                self._to_shape_dtype_struct(desc, mode=spec.mode).shape,
                 dtype=desc.dtype,
             )
             for desc, spec in zip(output_descs, output_spec)

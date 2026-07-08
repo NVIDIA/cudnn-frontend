@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Dependency-free tests for common JAX/cuDNN dtype conversion."""
+"""Tests for common JAX/cuDNN dtype conversion."""
 
 from enum import Enum, auto
 import importlib

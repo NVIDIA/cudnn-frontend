@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Dependency-free source contracts for JAX grouped GEMM adapters."""
+"""Source contracts for JAX grouped GEMM adapters."""
 
 from __future__ import annotations
 
@@ -120,9 +120,9 @@ def test_shared_adapter_uses_current_jax_api_base_and_call_kernel():
 def test_grouped_layouts_are_explicit_row_major_public_mappings():
     source = (_GROUPED_ROOT / "_jax_api.py").read_text()
 
-    assert "return _row_major_spec(6, BLOCK_SCALE_MODE)" in source
-    assert "return _row_major_spec(3, (2, 1, 0))" in source
-    assert "return _row_major_spec(2, (1, 0))" in source
+    assert "PROBABILITY_MODE = (2, 1, 0)" in source
+    assert "GROUPED_BIAS_MODE = (1, 0)" in source
+    assert "GROUPED_WORKSPACE_ALIGNMENT = 128" in source
     assert "_canonical_block_scale_shape(rows, k, batch, sf_vec_size)" in source
     assert "BLOCK_SCALE_MODE" in source
 
@@ -149,8 +149,34 @@ def test_grouped_buffers_use_tensor_descriptors_directly():
     source = (_GROUPED_ROOT / "_jax_api.py").read_text()
 
     assert "class BufferSpec" not in source
+    assert "class _SampleDesc" not in source
     assert "def make_buffer_desc(" in source
+    assert "JaxTensorDesc.from_shape(" in source
+    assert "JaxTensorDesc.from_array(" in source
     assert "init_value=init_value" in source
+
+
+@pytest.mark.parametrize("family", _FAMILIES)
+def test_grouped_lowerings_pass_descriptors_without_parallel_specs(family: str):
+    tree = ast.parse(_jax_path(family).read_text())
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "call_cutedsl"
+    ]
+
+    assert calls
+    for call in calls:
+        keywords = {keyword.arg for keyword in call.keywords}
+        assert "input_descs" in keywords
+        assert "outputs" in keywords
+        assert not {
+            "input_specs",
+            "output_specs",
+            "workspace_specs",
+        } & keywords
 
 
 @pytest.mark.parametrize("family", _NATIVE_FP4_FAMILIES)
@@ -338,20 +364,22 @@ def test_shared_layout_helpers_map_row_major_arrays_to_kernel_axes():
     with mock.patch.dict(sys.modules, modules):
         adapter = importlib.import_module(f"{package_name}.grouped_gemm._jax_api")
 
-        assert adapter.gemm_a_tensor_spec("LMK").mode == (1, 2, 0)
-        assert adapter.gemm_b_tensor_spec("LKN").mode == (2, 1, 0)
-        assert adapter.probability_tensor_spec().mode == (2, 1, 0)
-        assert adapter.grouped_bias_tensor_spec().mode == (1, 0)
+        assert adapter.gemm_a_mode("LMK") == (1, 2, 0)
+        assert adapter.gemm_b_mode("LKN") == (2, 1, 0)
+        assert adapter.PROBABILITY_MODE == (2, 1, 0)
+        assert adapter.GROUPED_BIAS_MODE == (1, 0)
         assert adapter.block_scale_shape(256, 64, 4, 32) == (4, 2, 1, 32, 4, 4)
 
         sample = ShapeDtypeStruct((1, 256, 64), "float8")
         desc = adapter.ApiBaseJax().make_tensor_desc(
             sample,
-            tensor_spec=adapter.gemm_a_tensor_spec("LMK"),
+            mode=adapter.gemm_a_mode("LMK"),
             name="sample_a",
         )
+        assert type(desc) is adapter.JaxTensorDesc
         assert desc.shape == (256, 64, 1)
         assert desc.stride == (64, 1, 16384)
+        assert desc.mode == (1, 2, 0)
         assert desc.array_shape == sample.shape
 
         fp4_sfa = ShapeDtypeStruct(
@@ -464,6 +492,12 @@ def test_shared_layout_helpers_map_row_major_arrays_to_kernel_axes():
             options["launch"]("stream", *inputs, "output", "workspace")
             return ("result",)
 
+        input_desc = adapter.as_gemm_tensor_desc(
+            "input",
+            sample,
+            mode=adapter.gemm_a_mode("LMK"),
+        )
+        output_mode = adapter.gemm_output_mode("LMN", name="output_layout")
         with (
             mock.patch.object(
                 adapter._CALLER, "_get_max_active_clusters", return_value=7
@@ -478,16 +512,23 @@ def test_shared_layout_helpers_map_row_major_arrays_to_kernel_axes():
             result = adapter.call_cutedsl(
                 launch,
                 (sample,),
+                input_descs=(input_desc,),
                 outputs=(
                     adapter.make_buffer_desc(
                         "output",
                         (1, 256, 128),
                         "bfloat16",
-                        tensor_spec=adapter.gemm_c_tensor_spec("LMN"),
+                        mode=output_mode,
                     ),
                 ),
-                workspaces=(adapter.make_buffer_desc("workspace", (4,), "uint8"),),
-                input_specs=(adapter.gemm_a_tensor_spec("LMK"),),
+                workspaces=(
+                    adapter.make_buffer_desc(
+                        "workspace",
+                        (4,),
+                        "uint8",
+                        ptr_assumed_align=adapter.GROUPED_WORKSPACE_ALIGNMENT,
+                    ),
+                ),
                 static_args={
                     "cluster_shape_mn": (2, 1),
                     "cluster_overlap_margin": 1,
@@ -511,11 +552,26 @@ def test_shared_layout_helpers_map_row_major_arrays_to_kernel_axes():
             )
         ]
         assert lowered["output_descs"][0].shape == (256, 128, 1)
+        assert type(lowered["output_descs"][0]) is adapter.JaxTensorDesc
+        assert lowered["output_descs"][0].mode == output_mode
+        assert lowered["input_descs"] == (input_desc,)
         assert lowered["workspace_descs"][0].shape == (4,)
+        assert (
+            lowered["workspace_descs"][0].ptr_assumed_align
+            == adapter.GROUPED_WORKSPACE_ALIGNMENT
+        )
 
-        def materialize(desc, *, mode=None):
+        with pytest.raises(ValueError, match="Expected 1 input descriptors, got 0"):
+            adapter.call_cutedsl(
+                launch,
+                (sample,),
+                input_descs=(),
+                outputs=(adapter.make_buffer_desc("output", (1, 0, 128), "bfloat16"),),
+            )
+
+        def materialize(desc):
             return ShapeDtypeStruct(
-                adapter.to_public_axes(desc.shape, mode),
+                desc.array_shape,
                 desc.dtype,
             )
 
@@ -534,19 +590,20 @@ def test_shared_layout_helpers_map_row_major_arrays_to_kernel_axes():
             ),
             mock.patch.object(
                 adapter._CALLER,
-                "_materialize_tensor_desc",
+                "_to_shape_dtype_struct",
                 side_effect=materialize,
             ),
         ):
             empty, initialized = adapter.call_cutedsl(
                 launch,
                 (sample,),
+                input_descs=(input_desc,),
                 outputs=(
                     adapter.make_buffer_desc(
                         "empty",
                         (1, 0, 128),
                         "bfloat16",
-                        tensor_spec=adapter.gemm_c_tensor_spec("LMN"),
+                        mode=output_mode,
                     ),
                     adapter.make_buffer_desc(
                         "amax",

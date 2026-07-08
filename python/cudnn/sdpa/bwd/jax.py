@@ -12,7 +12,7 @@ import jax
 import jax.numpy as jnp
 
 from ... import data_type
-from ..._cute_compiler import compile_options_for_target
+from ..._jax.compiler import compile_options_for_target
 from ..._jax import JaxApiBase, JaxTensorDesc, TupleDict
 from ..jax_utils import (
     FIXED_LAYOUTS,
@@ -147,29 +147,23 @@ class SdpabwdSm100D256(JaxApiBase):
             self.workspace_seqlen_q = self.seqlen_q
             self.workspace_batch = self.batch
         else:
-            self.dq_desc = self._to_tensor_desc(
-                jax.ShapeDtypeStruct(tuple(sample_q.shape), sample_q.dtype),
-                "dq_tensor",
+            self.dq_desc = JaxTensorDesc.from_shape(
+                tuple(sample_q.shape), sample_q.dtype, name="dq_tensor"
             )
-            self.dk_desc = self._to_tensor_desc(
-                jax.ShapeDtypeStruct(tuple(sample_k.shape), sample_k.dtype),
-                "dk_tensor",
+            self.dk_desc = JaxTensorDesc.from_shape(
+                tuple(sample_k.shape), sample_k.dtype, name="dk_tensor"
             )
-            self.dv_desc = self._to_tensor_desc(
-                jax.ShapeDtypeStruct(tuple(sample_v.shape), sample_v.dtype),
-                "dv_tensor",
+            self.dv_desc = JaxTensorDesc.from_shape(
+                tuple(sample_v.shape), sample_v.dtype, name="dv_tensor"
             )
-            self.dq_kernel_desc = self._to_tensor_desc(
-                jax.ShapeDtypeStruct((1, *sample_q.shape), sample_q.dtype),
-                "dq_kernel_tensor",
+            self.dq_kernel_desc = JaxTensorDesc.from_shape(
+                (1, *sample_q.shape), sample_q.dtype, name="dq_kernel_tensor"
             )
-            self.dk_kernel_desc = self._to_tensor_desc(
-                jax.ShapeDtypeStruct((1, *sample_k.shape), sample_k.dtype),
-                "dk_kernel_tensor",
+            self.dk_kernel_desc = JaxTensorDesc.from_shape(
+                (1, *sample_k.shape), sample_k.dtype, name="dk_kernel_tensor"
             )
-            self.dv_kernel_desc = self._to_tensor_desc(
-                jax.ShapeDtypeStruct((1, *sample_v.shape), sample_v.dtype),
-                "dv_kernel_tensor",
+            self.dv_kernel_desc = JaxTensorDesc.from_shape(
+                (1, *sample_v.shape), sample_v.dtype, name="dv_kernel_tensor"
             )
             # Workspace size follows the promoted (1, T, H, D) ABI, matching
             # the Torch adapter's use of s_qo=T and b=1.
@@ -353,27 +347,26 @@ class SdpabwdSm100D256(JaxApiBase):
                 "max_s_q and max_s_k must be positive and no larger than their packed token counts"
             )
 
-        self.q_kernel_desc = self._to_tensor_desc(
-            jax.ShapeDtypeStruct((1, *sample_q.shape), sample_q.dtype), "q_tensor"
+        self.q_kernel_desc = JaxTensorDesc.from_shape(
+            (1, *sample_q.shape), sample_q.dtype, name="q_tensor"
         )
-        self.k_kernel_desc = self._to_tensor_desc(
-            jax.ShapeDtypeStruct((1, *sample_k.shape), sample_k.dtype), "k_tensor"
+        self.k_kernel_desc = JaxTensorDesc.from_shape(
+            (1, *sample_k.shape), sample_k.dtype, name="k_tensor"
         )
-        self.v_kernel_desc = self._to_tensor_desc(
-            jax.ShapeDtypeStruct((1, *sample_v.shape), sample_v.dtype), "v_tensor"
+        self.v_kernel_desc = JaxTensorDesc.from_shape(
+            (1, *sample_v.shape), sample_v.dtype, name="v_tensor"
         )
-        self.o_kernel_desc = self._to_tensor_desc(
-            jax.ShapeDtypeStruct((1, *sample_o.shape), sample_o.dtype), "o_tensor"
+        self.o_kernel_desc = JaxTensorDesc.from_shape(
+            (1, *sample_o.shape), sample_o.dtype, name="o_tensor"
         )
-        self.do_kernel_desc = self._to_tensor_desc(
-            jax.ShapeDtypeStruct((1, *sample_do.shape), sample_do.dtype), "do_tensor"
+        self.do_kernel_desc = JaxTensorDesc.from_shape(
+            (1, *sample_do.shape), sample_do.dtype, name="do_tensor"
         )
         # The kernel addresses packed LSE as (1, H, T) with T contiguous.
-        self.lse_kernel_desc = self._to_tensor_desc(
-            jax.ShapeDtypeStruct(
-                (1, self.num_query_heads, self.total_q_tokens), jnp.float32
-            ),
-            "lse_tensor",
+        self.lse_kernel_desc = JaxTensorDesc.from_shape(
+            (1, self.num_query_heads, self.total_q_tokens),
+            jnp.float32,
+            name="lse_tensor",
         )
 
     def check_support(self) -> bool:
@@ -396,36 +389,19 @@ class SdpabwdSm100D256(JaxApiBase):
         cum_seqlen_k_tensor: Any | None = None,
     ) -> TupleDict:
         self.check_support()
-        signature_mode = self.data_mode
-        for value, desc in (
-            (q_tensor, self.q_desc),
-            (k_tensor, self.k_desc),
-            (v_tensor, self.v_desc),
-            (o_tensor, self.o_desc),
-            (do_tensor, self.do_desc),
-            (lse_tensor, self.lse_desc),
-        ):
-            mode = signature_mode if desc is not self.lse_desc else None
-            self._check_tensor_signature(value, desc, mode=mode)
-
         if self.input_layout in FIXED_LAYOUTS:
             if cum_seqlen_q_tensor is not None or cum_seqlen_k_tensor is not None:
                 raise ValueError(
                     "cum_seqlen_q and cum_seqlen_k must be omitted for fixed layout"
                 )
             inputs = (q_tensor, k_tensor, v_tensor, o_tensor, do_tensor, lse_tensor)
-            input_spec = (
-                self._to_tensor_spec(self.q_kernel_desc, mode=self.data_mode),
-                self._to_tensor_spec(self.k_kernel_desc, mode=self.data_mode),
-                self._to_tensor_spec(self.v_kernel_desc, mode=self.data_mode),
-                self._to_tensor_spec(self.o_kernel_desc, mode=self.data_mode),
-                self._to_tensor_spec(self.do_kernel_desc, mode=self.data_mode),
-                self._to_tensor_spec(self.lse_kernel_desc),
-            )
-            output_spec = (
-                self._to_tensor_spec(self.dq_kernel_desc, mode=self.data_mode),
-                self._to_tensor_spec(self.dk_kernel_desc, mode=self.data_mode),
-                self._to_tensor_spec(self.dv_kernel_desc, mode=self.data_mode),
+            input_descs = (
+                self.q_kernel_desc,
+                self.k_kernel_desc,
+                self.v_kernel_desc,
+                self.o_kernel_desc,
+                self.do_kernel_desc,
+                self.lse_kernel_desc,
             )
             launch = self._launch_kernel
         else:
@@ -433,8 +409,15 @@ class SdpabwdSm100D256(JaxApiBase):
                 raise ValueError(
                     "cum_seqlen_q and cum_seqlen_k are both required for THD layout"
                 )
-            self._check_tensor_signature(cum_seqlen_q_tensor, self.cum_q_desc)
-            self._check_tensor_signature(cum_seqlen_k_tensor, self.cum_k_desc)
+            for value, desc in (
+                (q_tensor, self.q_desc),
+                (k_tensor, self.k_desc),
+                (v_tensor, self.v_desc),
+                (o_tensor, self.o_desc),
+                (do_tensor, self.do_desc),
+                (lse_tensor, self.lse_desc),
+            ):
+                self._check_tensor_signature(value, desc)
             lse_storage = jnp.transpose(
                 jnp.reshape(
                     lse_tensor,
@@ -452,20 +435,15 @@ class SdpabwdSm100D256(JaxApiBase):
                 cum_seqlen_q_tensor,
                 cum_seqlen_k_tensor,
             )
-            input_spec = (
-                self._to_tensor_spec(self.q_kernel_desc),
-                self._to_tensor_spec(self.k_kernel_desc),
-                self._to_tensor_spec(self.v_kernel_desc),
-                self._to_tensor_spec(self.o_kernel_desc),
-                self._to_tensor_spec(self.do_kernel_desc),
-                self._to_tensor_spec(self.lse_kernel_desc),
-                self._to_tensor_spec(self.cum_q_desc),
-                self._to_tensor_spec(self.cum_k_desc),
-            )
-            output_spec = (
-                self._to_tensor_spec(self.dq_kernel_desc),
-                self._to_tensor_spec(self.dk_kernel_desc),
-                self._to_tensor_spec(self.dv_kernel_desc),
+            input_descs = (
+                self.q_kernel_desc,
+                self.k_kernel_desc,
+                self.v_kernel_desc,
+                self.o_kernel_desc,
+                self.do_kernel_desc,
+                self.lse_kernel_desc,
+                self.cum_q_desc,
+                self.cum_k_desc,
             )
             launch = self._launch_varlen_kernel
 
@@ -477,9 +455,8 @@ class SdpabwdSm100D256(JaxApiBase):
                 self.dk_kernel_desc,
                 self.dv_kernel_desc,
             ),
+            input_descs=input_descs,
             workspace_descs=(self._workspace_desc(),),
-            input_spec=input_spec,
-            output_spec=output_spec,
             compile_options=compile_options_for_target(self.compute_capability),
         )
         if self.input_layout == _PACKED_LAYOUT:
@@ -683,22 +660,15 @@ def sdpa_bwd_wrapper_sm100_d256(
     remains ``(B, H, S)``.
     """
 
-    values = (q_tensor, k_tensor, v_tensor, o_tensor, do_tensor, lse_tensor)
-    samples = tuple(jax.ShapeDtypeStruct(value.shape, value.dtype) for value in values)
-    sample_cum_seqlen_q = (
-        None
-        if cum_seqlen_q_tensor is None
-        else jax.ShapeDtypeStruct(cum_seqlen_q_tensor.shape, cum_seqlen_q_tensor.dtype)
-    )
-    sample_cum_seqlen_k = (
-        None
-        if cum_seqlen_k_tensor is None
-        else jax.ShapeDtypeStruct(cum_seqlen_k_tensor.shape, cum_seqlen_k_tensor.dtype)
-    )
     return SdpabwdSm100D256(
-        *samples,
-        sample_cum_seqlen_q,
-        sample_cum_seqlen_k,
+        q_tensor,
+        k_tensor,
+        v_tensor,
+        o_tensor,
+        do_tensor,
+        lse_tensor,
+        cum_seqlen_q_tensor,
+        cum_seqlen_k_tensor,
         max_s_q=max_s_q,
         max_s_k=max_s_k,
         acc_dtype=acc_dtype,

@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Dependency-free contracts for the JAX block-sparse attention adapters."""
+"""Contracts for the JAX block-sparse attention adapters."""
 
 from __future__ import annotations
 
@@ -81,22 +81,48 @@ class JaxBsaContractTest(unittest.TestCase):
         internal.__spec__ = ModuleSpec(internal_name, loader=None, is_package=True)
         sys.modules[internal_name] = internal
 
-        tensor_module = importlib.import_module(f"{_PACKAGE}._tensor_desc")
+        tensor_module = importlib.import_module(f"{_PACKAGE}.common.tensor_desc")
         layout_module = importlib.import_module(f"{internal_name}.layout")
-        result_module = importlib.import_module(f"{_PACKAGE}._result")
+        result_module = importlib.import_module(f"{_PACKAGE}.common.result")
 
         class JaxTensorDesc(tensor_module.TensorDesc):
+            @classmethod
+            def from_shape(
+                cls,
+                shape,
+                dtype,
+                *,
+                name="",
+                mode=None,
+                public_stride_order=None,
+                init_value=None,
+            ):
+                return JaxApiBase._to_tensor_desc(
+                    _Array(shape, dtype),
+                    name,
+                    mode=mode,
+                    public_stride_order=public_stride_order,
+                    init_value=init_value,
+                )
+
             @property
             def cudnn_dtype(self):
                 return _DTYPE_TO_CUDNN.get(self.dtype, _DataType.NOT_SET)
 
             def compact_like(
-                self, *, cudnn_dtype, shape, stride_order=None, name="", init_value=None
+                self,
+                *,
+                cudnn_dtype,
+                shape,
+                stride_order=None,
+                name="",
+                init_value=None,
+                mode=None,
             ):
                 if stride_order is None:
                     stride_order = tuple(reversed(range(len(shape))))
                 stride = layout_module.compact_stride(tuple(shape), tuple(stride_order))
-                return JaxTensorDesc(
+                desc = JaxTensorDesc(
                     dtype=_CUDNN_TO_DTYPE[cudnn_dtype],
                     shape=tuple(shape),
                     stride=stride,
@@ -104,6 +130,12 @@ class JaxBsaContractTest(unittest.TestCase):
                     name=name,
                     init_value=init_value,
                 )
+                object.__setattr__(
+                    desc,
+                    "mode",
+                    layout_module.normalize_mode(len(shape), mode),
+                )
+                return desc
 
         class JaxApiBase:
             @staticmethod
@@ -123,7 +155,7 @@ class JaxBsaContractTest(unittest.TestCase):
                 canonical_axis_by_public_axis = layout_module.to_public_axes(
                     tuple(range(len(public_shape))), mode
                 )
-                return JaxTensorDesc(
+                desc = JaxTensorDesc(
                     dtype=value.dtype,
                     shape=layout_module.to_canonical_axes(public_shape, mode),
                     stride=layout_module.to_canonical_axes(public_stride, mode),
@@ -133,9 +165,13 @@ class JaxBsaContractTest(unittest.TestCase):
                     name=name,
                     init_value=init_value,
                 )
+                object.__setattr__(desc, "mode", mode)
+                return desc
 
             @staticmethod
             def _check_tensor_signature(value, expected, *, mode=None):
+                if mode is None:
+                    mode = expected.mode
                 actual_shape = layout_module.to_canonical_axes(tuple(value.shape), mode)
                 if actual_shape != expected.shape:
                     raise ValueError(f"{expected.name} shape mismatch")
@@ -147,6 +183,8 @@ class JaxBsaContractTest(unittest.TestCase):
 
             @staticmethod
             def _to_tensor_spec(desc, *, mode=None, divisibility=None):
+                if mode is None:
+                    mode = desc.mode
                 return _TensorSpec(
                     layout=layout_module.to_cutlass_layout(
                         desc.shape,
@@ -159,7 +197,22 @@ class JaxBsaContractTest(unittest.TestCase):
                     divisibility=divisibility,
                 )
 
-            def _call_kernel(self, inputs, *, output_descs, output_spec, **options):
+            def _call_kernel(
+                self,
+                inputs,
+                *,
+                output_descs,
+                input_descs=None,
+                output_spec=None,
+                **options,
+            ):
+                if input_descs is not None:
+                    for value, desc in zip(inputs, input_descs):
+                        self._check_tensor_signature(value, desc)
+                if output_spec is None:
+                    output_spec = tuple(
+                        self._to_tensor_spec(desc) for desc in output_descs
+                    )
                 self.captured_call = {
                     "inputs": tuple(inputs),
                     "output_descs": tuple(output_descs),

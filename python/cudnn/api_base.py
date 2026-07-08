@@ -22,8 +22,8 @@ import torch
 import cutlass.cute as cute
 from cudnn import data_type
 from cudnn._experimental_warnings import warn_experimental_api_once
-from cudnn._tensor_desc import TensorDesc as _TensorDesc
-from cudnn._result import TupleDict as TupleDict
+from cudnn.common.result import TupleDict as TupleDict
+from cudnn.common.tensor_desc import TensorDesc as _TensorDesc
 from cudnn.datatypes import (
     _convert_to_cutlass_data_type,
     _cudnn_to_torch_data_type,

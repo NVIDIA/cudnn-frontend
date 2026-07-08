@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Dependency-free contracts for the DSA indexer logical operations."""
+"""Contracts for the DSA indexer logical operations."""
 
 import ast
 from enum import Enum, auto
@@ -98,8 +98,8 @@ class DsaIndexerOpContractTest(unittest.TestCase):
             module.__spec__ = ModuleSpec(name, loader=None, is_package=True)
             sys.modules[name] = module
 
-        cls.tensor = importlib.import_module(f"{_PACKAGE}._tensor_desc")
-        importlib.import_module(f"{_PACKAGE}._op")
+        cls.tensor = importlib.import_module(f"{_PACKAGE}.common.tensor_desc")
+        importlib.import_module(f"{_PACKAGE}.common.op")
         cls.forward = importlib.import_module(f"{dsa_name}.indexer_forward.op")
         cls.topk = importlib.import_module(f"{dsa_name}.indexer_top_k.op")
 
@@ -191,6 +191,21 @@ class DsaIndexerOpContractTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "canonical D axis contiguous"):
             operation.check_support()
+
+    def test_sm100_forward_requires_a_complete_packed_query_tile(self):
+        operation = self.forward.IndexerForwardOp(
+            q=self.desc((1, 4, 32, 128), _DataType.BFLOAT16),
+            k=self.desc((1, 5, 1, 128), _DataType.BFLOAT16),
+            weight=self.desc((1, 4, 32), _DataType.BFLOAT16),
+            output=self.desc((1, 4, 8), _DataType.FLOAT),
+            ratio=1,
+            target_compute_capability=100,
+        )
+        with self.assertRaisesRegex(ValueError, "complete packed query tile"):
+            operation.check_support()
+
+        operation.target_compute_capability = 90
+        self.assertTrue(operation.check_support())
 
     def make_topk(self, *, return_val=True, **overrides):
         input_values = self.desc((4, 64), _DataType.FLOAT)
@@ -388,10 +403,47 @@ class DsaIndexerJaxAdapterContractTest(unittest.TestCase):
     @staticmethod
     def fake_call(captured):
         def call(_inputs, *, output_descs, **options):
+            input_descs = options.get("input_descs")
+            if input_descs is not None:
+                derived_input_specs = tuple(
+                    DsaIndexerJaxAdapterContractTest.jax_base.JaxApiBase._to_tensor_spec(
+                        desc
+                    )
+                    for desc in input_descs
+                )
+                supplied_input_specs = options.get("input_spec")
+                options["input_spec"] = (
+                    derived_input_specs
+                    if supplied_input_specs is None
+                    else tuple(
+                        derived if supplied is None else supplied
+                        for derived, supplied in zip(
+                            derived_input_specs,
+                            supplied_input_specs,
+                        )
+                    )
+                )
+
+            derived_output_specs = tuple(
+                DsaIndexerJaxAdapterContractTest.jax_base.JaxApiBase._to_tensor_spec(
+                    desc
+                )
+                for desc in output_descs
+            )
+            supplied_output_specs = options.get("output_spec")
+            options["output_spec"] = (
+                derived_output_specs
+                if supplied_output_specs is None
+                else tuple(
+                    derived if supplied is None else supplied
+                    for derived, supplied in zip(
+                        derived_output_specs,
+                        supplied_output_specs,
+                    )
+                )
+            )
             captured.update(output_descs=output_descs, **options)
-            output_specs = options.get("output_spec")
-            if output_specs is None:
-                output_specs = (None,) * len(output_descs)
+            output_specs = options["output_spec"]
 
             def public_shape(desc, spec):
                 if spec is None or spec.mode is None:

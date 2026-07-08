@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Dependency-free source contracts for packed-THD JAX SDPA."""
+"""Source contracts for packed-THD JAX SDPA."""
 
 from __future__ import annotations
 
@@ -135,7 +135,8 @@ class JaxSdpaThdContractTest(unittest.TestCase):
         backward = _BACKWARD.read_text()
 
         for source in (forward, backward):
-            self.assertIn("jax.ShapeDtypeStruct((1, *sample_q.shape)", source)
+            self.assertIn("JaxTensorDesc.from_shape(", source)
+            self.assertIn("(1, *sample_q.shape)", source)
             self.assertIn("jnp.reshape(q_tensor, self.q_kernel_desc.shape)", source)
             self.assertIn("max_s_q and max_s_k are both required for THD", source)
 

@@ -7,7 +7,6 @@ from __future__ import annotations
 
 from typing import Any
 
-import jax
 import jax.numpy as jnp
 
 from .. import data_type
@@ -108,12 +107,18 @@ def make_fixed_output(
     kernel_stride_order: tuple[int, ...] | None = None,
     init_value: bool | int | float | None = None,
 ) -> JaxTensorDesc:
-    return describe_fixed_data(
-        jax.ShapeDtypeStruct(public_shape, dtype),
-        name,
-        layout=layout,
-        kernel_axes=kernel_axes,
-        kernel_stride_order=kernel_stride_order,
+    mode = fixed_data_mode(layout, kernel_axes=kernel_axes)
+    public_stride_order = (
+        None
+        if kernel_stride_order is None
+        else stride_order_to_public(kernel_stride_order, mode)
+    )
+    return JaxTensorDesc.from_shape(
+        public_shape,
+        dtype,
+        name=name,
+        mode=mode,
+        public_stride_order=public_stride_order,
         init_value=init_value,
     )
 

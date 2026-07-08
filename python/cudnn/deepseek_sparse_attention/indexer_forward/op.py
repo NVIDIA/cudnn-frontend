@@ -8,8 +8,8 @@ from __future__ import annotations
 from typing import Any
 
 from ... import data_type
-from ..._op import Op
-from ..._tensor_desc import TensorDesc
+from ...common.op import Op
+from ...common.tensor_desc import TensorDesc
 
 TMA_ALIGN_ELEMENTS = 4
 SUPPORTED_COMPUTE_CAPABILITIES = (90, 100, 103, 107)
@@ -141,6 +141,16 @@ class IndexerForwardOp(Op):
             raise ValueError(f"IndexerForward tuning values must be positive, got {tuning}")
         if self.target_compute_capability < 100 and tuning != (128, 128, 2, 4):
             raise ValueError("SM90 IndexerForward supports only m_block_size=128, n_block_size=128, " f"q_stage=2, kv_stage=4; got {tuning}")
+        if self.target_compute_capability >= 100:
+            packed_q = s_q * qhead_per_kv_head
+            minimum_packed_q = self.q_stage * self.m_block_size
+            if packed_q < minimum_packed_q:
+                raise ValueError(
+                    "SM100-family IndexerForward requires at least one complete packed query tile: max_seqlen_q * "
+                    f"qhead_per_kv_head >= q_stage * m_block_size, got "
+                    f"{s_q} * {qhead_per_kv_head} < {self.q_stage} * "
+                    f"{self.m_block_size}"
+                )
 
         if self.q_causal_offsets is not None:
             offsets = self.q_causal_offsets

@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Dependency-free contracts for framework-neutral dense GEMM helpers."""
+"""Contracts for framework-neutral dense GEMM helpers."""
 
 import ast
 from enum import Enum, auto
@@ -45,8 +45,8 @@ class DenseGemmHelperTest(unittest.TestCase):
         package.data_type = _DataType
         sys.modules[_PACKAGE] = package
 
-        cls.tensor_module = importlib.import_module(f"{_PACKAGE}._tensor_desc")
-        cls.helpers = importlib.import_module(f"{_PACKAGE}._dense_gemm")
+        cls.tensor_module = importlib.import_module(f"{_PACKAGE}.common.tensor_desc")
+        cls.helpers = importlib.import_module(f"{_PACKAGE}.gemm.helpers")
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -180,7 +180,7 @@ class DenseGemmHelperTest(unittest.TestCase):
                     self.helpers.require_cluster_shape(shape, **kwargs)
 
     def test_module_has_no_framework_or_kernel_dependencies(self):
-        tree = ast.parse((_CUDNN_ROOT / "_dense_gemm.py").read_text())
+        tree = ast.parse((_CUDNN_ROOT / "gemm" / "helpers.py").read_text())
         imports = []
         for node in tree.body:
             if isinstance(node, ast.Import):

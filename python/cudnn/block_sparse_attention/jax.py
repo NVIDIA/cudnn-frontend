@@ -12,7 +12,7 @@ import jax
 import jax.numpy as jnp
 
 from .. import data_type
-from .._cute_compiler import compile_options_for_target
+from .._jax.compiler import compile_options_for_target
 from .._jax import JaxApiBase, JaxTensorDesc, TupleDict
 from .._jax.layout import mode_from_layout, to_public_axes
 from .op import (
@@ -39,20 +39,12 @@ def _data_mode(layout: str) -> tuple[int, ...]:
     return mode_from_layout(normalized.upper(), kernel_axes="BHSD")
 
 
-def _shape_sample(
-    shape: tuple[int, ...], dtype: Any, mode: tuple[int, ...] | None = None
-) -> Any:
-    return jax.ShapeDtypeStruct(to_public_axes(shape, mode), dtype)
-
-
 def _optional_signature(
     value: Any | None, desc: JaxTensorDesc | None, name: str
 ) -> None:
     if (value is None) != (desc is None):
         expected = "omitted" if desc is None else "provided"
         raise ValueError(f"{name} must be {expected} for this specialized callable")
-    if desc is not None:
-        JaxApiBase._check_tensor_signature(value, desc)
 
 
 def _default_forward_sparse_block_size(target: int) -> int:
@@ -215,11 +207,10 @@ class BlockSparseAttentionForward(JaxApiBase):
         value_dim = self.v_desc.shape[3]
         canonical_output_shape = (batch, num_q_heads, seqlen_q, value_dim)
         if sample_o is None:
-            self.o_desc = self._to_tensor_desc(
-                _shape_sample(
-                    canonical_output_shape, self.q_desc.dtype, self.data_mode
-                ),
-                "sample_o",
+            self.o_desc = JaxTensorDesc.from_shape(
+                to_public_axes(canonical_output_shape, self.data_mode),
+                self.q_desc.dtype,
+                name="sample_o",
                 mode=self.data_mode,
             )
         else:
@@ -227,9 +218,10 @@ class BlockSparseAttentionForward(JaxApiBase):
                 sample_o, "sample_o", mode=self.data_mode
             )
         if sample_lse is None:
-            self.lse_desc = self._to_tensor_desc(
-                jax.ShapeDtypeStruct((batch, num_q_heads, seqlen_q), jnp.float32),
-                "sample_lse",
+            self.lse_desc = JaxTensorDesc.from_shape(
+                (batch, num_q_heads, seqlen_q),
+                jnp.float32,
+                name="sample_lse",
             )
         else:
             self.lse_desc = self._to_tensor_desc(sample_lse, "sample_lse")
@@ -297,23 +289,19 @@ class BlockSparseAttentionForward(JaxApiBase):
         q2k_block_nums: Any | None = None,
     ) -> TupleDict:
         self.check_support()
-        self._check_tensor_signature(q, self.q_desc, mode=self.data_mode)
-        self._check_tensor_signature(k, self.k_desc, mode=self.data_mode)
-        self._check_tensor_signature(v, self.v_desc, mode=self.data_mode)
-        self._check_tensor_signature(q2k_block_index, self.block_index_desc)
         _optional_signature(block_sizes, self.block_sizes_desc, "block_sizes")
         _optional_signature(q2k_block_nums, self.block_nums_desc, "q2k_block_nums")
 
         inputs: list[Any] = [q, k, v, q2k_block_index]
-        bindings: list[tuple[JaxTensorDesc, tuple[int, ...] | None]] = [
-            (self.q_desc, self.data_mode),
-            (self.k_desc, self.data_mode),
-            (self.v_desc, self.data_mode),
-            (self.block_index_desc, None),
+        input_descs: list[JaxTensorDesc] = [
+            self.q_desc,
+            self.k_desc,
+            self.v_desc,
+            self.block_index_desc,
         ]
         if self.block_sizes_desc is not None:
             inputs.append(block_sizes)
-            bindings.append((self.block_sizes_desc, None))
+            input_descs.append(self.block_sizes_desc)
 
         effective_block_nums = q2k_block_nums
         effective_block_nums_desc = self.block_nums_desc
@@ -329,13 +317,14 @@ class BlockSparseAttentionForward(JaxApiBase):
             effective_block_nums = jnp.full(
                 block_nums_shape, self.block_sparse_num, dtype=jnp.int32
             )
-            effective_block_nums_desc = self._to_tensor_desc(
-                jax.ShapeDtypeStruct(block_nums_shape, jnp.int32),
-                "effective_q2k_block_nums",
+            effective_block_nums_desc = JaxTensorDesc.from_shape(
+                block_nums_shape,
+                jnp.int32,
+                name="effective_q2k_block_nums",
             )
         if effective_block_nums is not None:
             inputs.append(effective_block_nums)
-            bindings.append((effective_block_nums_desc, None))
+            input_descs.append(effective_block_nums_desc)
 
         split_offsets_desc = None
         if self.kv_splits > 1:
@@ -371,11 +360,11 @@ class BlockSparseAttentionForward(JaxApiBase):
                 jnp.minimum(aligned_offsets, valid_kv[..., None]),
             ).astype(jnp.int32)
             split_offsets_desc = self._to_tensor_desc(
-                jax.ShapeDtypeStruct(split_offsets.shape, split_offsets.dtype),
+                split_offsets,
                 "split_offsets",
             )
             inputs.append(split_offsets)
-            bindings.append((split_offsets_desc, None))
+            input_descs.append(split_offsets_desc)
 
         self._forward_has_effective_block_nums = effective_block_nums is not None
         self._forward_has_split_offsets = split_offsets_desc is not None
@@ -406,14 +395,8 @@ class BlockSparseAttentionForward(JaxApiBase):
             tuple(inputs),
             launch=self._launch,
             output_descs=(self.o_desc, self.lse_desc),
+            input_descs=tuple(input_descs),
             workspace_descs=workspace_descs,
-            input_spec=tuple(
-                self._to_tensor_spec(desc, mode=mode) for desc, mode in bindings
-            ),
-            output_spec=(
-                self._to_tensor_spec(self.o_desc, mode=self.data_mode),
-                self._to_tensor_spec(self.lse_desc),
-            ),
             compile_options=compile_options_for_target(self.compute_capability),
         )
         return TupleDict(o_tensor=o, lse_tensor=lse)
@@ -787,9 +770,10 @@ class BlockSparseAttentionBackward(JaxApiBase):
         ) -> JaxTensorDesc:
             if sample is not None:
                 return self._to_tensor_desc(sample, name, mode=self.data_mode)
-            return self._to_tensor_desc(
-                _shape_sample(source.shape, source.dtype, self.data_mode),
-                name,
+            return JaxTensorDesc.from_shape(
+                to_public_axes(source.shape, self.data_mode),
+                source.dtype,
+                name=name,
                 mode=self.data_mode,
             )
 
@@ -1022,35 +1006,25 @@ class BlockSparseAttentionBackward(JaxApiBase):
         q2k_block_nums: Any | None = None,
     ) -> TupleDict:
         self.check_support()
-        for value, desc in (
-            (do, self.do_desc),
-            (q, self.q_desc),
-            (k, self.k_desc),
-            (v, self.v_desc),
-            (o, self.o_desc),
-        ):
-            self._check_tensor_signature(value, desc, mode=self.data_mode)
-        self._check_tensor_signature(lse, self.lse_desc)
-        self._check_tensor_signature(q2k_block_index, self.block_index_desc)
         _optional_signature(block_sizes, self.block_sizes_desc, "block_sizes")
         _optional_signature(q2k_block_nums, self.block_nums_desc, "q2k_block_nums")
 
         inputs: list[Any] = [do, q, k, v, o, lse, q2k_block_index]
-        bindings: list[tuple[JaxTensorDesc, tuple[int, ...] | None]] = [
-            (self.do_desc, self.data_mode),
-            (self.q_desc, self.data_mode),
-            (self.k_desc, self.data_mode),
-            (self.v_desc, self.data_mode),
-            (self.o_desc, self.data_mode),
-            (self.lse_desc, None),
-            (self.block_index_desc, None),
+        input_descs: list[JaxTensorDesc] = [
+            self.do_desc,
+            self.q_desc,
+            self.k_desc,
+            self.v_desc,
+            self.o_desc,
+            self.lse_desc,
+            self.block_index_desc,
         ]
         if self.block_sizes_desc is not None:
             inputs.append(block_sizes)
-            bindings.append((self.block_sizes_desc, None))
+            input_descs.append(self.block_sizes_desc)
         if self.block_nums_desc is not None:
             inputs.append(q2k_block_nums)
-            bindings.append((self.block_nums_desc, None))
+            input_descs.append(self.block_nums_desc)
         self._backward_input_count = len(inputs)
         workspace_items = self._workspace_descs()
         self._backward_workspace_names = tuple(name for name, _ in workspace_items)
@@ -1060,15 +1034,8 @@ class BlockSparseAttentionBackward(JaxApiBase):
             tuple(inputs),
             launch=self._launch,
             output_descs=(self.dq_desc, self.dk_desc, self.dv_desc),
+            input_descs=tuple(input_descs),
             workspace_descs=workspace_descs,
-            input_spec=tuple(
-                self._to_tensor_spec(desc, mode=mode) for desc, mode in bindings
-            ),
-            output_spec=(
-                self._to_tensor_spec(self.dq_desc, mode=self.data_mode),
-                self._to_tensor_spec(self.dk_desc, mode=self.data_mode),
-                self._to_tensor_spec(self.dv_desc, mode=self.data_mode),
-            ),
             compile_options=compile_options_for_target(self.compute_capability),
         )
         return TupleDict(dq_tensor=dq, dk_tensor=dk, dv_tensor=dv)
@@ -1328,16 +1295,13 @@ def block_sparse_attention_forward(
 ) -> TupleDict:
     """Run non-causal block-sparse attention from JAX arrays."""
 
-    def sample(value: Any | None) -> Any | None:
-        return None if value is None else jax.ShapeDtypeStruct(value.shape, value.dtype)
-
     return BlockSparseAttentionForward(
-        sample(q_tensor),
-        sample(k_tensor),
-        sample(v_tensor),
-        sample(q2k_block_index),
-        sample_block_sizes=sample(block_sizes),
-        sample_q2k_block_nums=sample(q2k_block_nums),
+        q_tensor,
+        k_tensor,
+        v_tensor,
+        q2k_block_index,
+        sample_block_sizes=block_sizes,
+        sample_q2k_block_nums=q2k_block_nums,
         block_sparse_num=block_sparse_num,
         sparse_block_size=sparse_block_size,
         allow_empty_block_nums=allow_empty_block_nums,
@@ -1388,19 +1352,16 @@ def block_sparse_attention_backward(
 ) -> TupleDict:
     """Compute explicit block-sparse attention gradients from JAX arrays."""
 
-    def sample(value: Any | None) -> Any | None:
-        return None if value is None else jax.ShapeDtypeStruct(value.shape, value.dtype)
-
     return BlockSparseAttentionBackward(
-        sample(do_tensor),
-        sample(q_tensor),
-        sample(k_tensor),
-        sample(v_tensor),
-        sample(o_tensor),
-        sample(lse_tensor),
-        sample(q2k_block_index),
-        sample_block_sizes=sample(block_sizes),
-        sample_q2k_block_nums=sample(q2k_block_nums),
+        do_tensor,
+        q_tensor,
+        k_tensor,
+        v_tensor,
+        o_tensor,
+        lse_tensor,
+        q2k_block_index,
+        sample_block_sizes=block_sizes,
+        sample_q2k_block_nums=q2k_block_nums,
         block_sparse_num=block_sparse_num,
         bucket_size_blocks=bucket_size_blocks,
         sparse_block_size=sparse_block_size,

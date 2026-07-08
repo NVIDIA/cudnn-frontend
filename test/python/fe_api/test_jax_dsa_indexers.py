@@ -58,21 +58,21 @@ def test_jax_dsa_indexer_abstract_shapes(monkeypatch):
 
     monkeypatch.setattr(JaxApiBase, "_local_gpu_capabilities", staticmethod(lambda _operation_name: ((object(), 100),)))
 
-    q = jax.ShapeDtypeStruct((1, 4, 32, 128), jnp.bfloat16)
+    q = jax.ShapeDtypeStruct((1, 8, 32, 128), jnp.bfloat16)
     k = jax.ShapeDtypeStruct((1, 5, 1, 128), jnp.bfloat16)
-    w = jax.ShapeDtypeStruct((1, 4, 32), jnp.bfloat16)
+    w = jax.ShapeDtypeStruct((1, 8, 32), jnp.bfloat16)
     fixed = jax.eval_shape(
         lambda q, k, w: indexer_forward_wrapper(q, k, w, ratio=1, target_compute_capability=100),
         q,
         k,
         w,
     )["scores"]
-    assert fixed.shape == (1, 4, 5)
+    assert fixed.shape == (1, 8, 5)
     assert fixed.dtype == jnp.float32
 
-    q_sequence_major = jax.ShapeDtypeStruct((4, 2, 32, 128), jnp.bfloat16)
+    q_sequence_major = jax.ShapeDtypeStruct((8, 2, 32, 128), jnp.bfloat16)
     k_sequence_major = jax.ShapeDtypeStruct((5, 2, 1, 128), jnp.bfloat16)
-    w_sequence_major = jax.ShapeDtypeStruct((4, 2, 32), jnp.bfloat16)
+    w_sequence_major = jax.ShapeDtypeStruct((8, 2, 32), jnp.bfloat16)
     sequence_major = jax.eval_shape(
         lambda q, k, w: indexer_forward_wrapper(
             q,
@@ -89,12 +89,12 @@ def test_jax_dsa_indexer_abstract_shapes(monkeypatch):
         k_sequence_major,
         w_sequence_major,
     )["scores"]
-    assert sequence_major.shape == (4, 2, 5)
+    assert sequence_major.shape == (8, 2, 5)
     assert sequence_major.dtype == jnp.float32
 
-    q_thd = jax.ShapeDtypeStruct((4, 32, 128), jnp.bfloat16)
+    q_thd = jax.ShapeDtypeStruct((8, 32, 128), jnp.bfloat16)
     k_thd = jax.ShapeDtypeStruct((5, 1, 128), jnp.bfloat16)
-    w_thd = jax.ShapeDtypeStruct((4, 32), jnp.bfloat16)
+    w_thd = jax.ShapeDtypeStruct((8, 32), jnp.bfloat16)
     cu = jax.ShapeDtypeStruct((2,), jnp.int32)
     packed = jax.eval_shape(
         lambda q, k, w, cu_q, cu_k: indexer_forward_wrapper(
@@ -104,7 +104,7 @@ def test_jax_dsa_indexer_abstract_shapes(monkeypatch):
             ratio=1,
             cu_seqlens_q=cu_q,
             cu_seqlens_k=cu_k,
-            max_seqlen_q=4,
+            max_seqlen_q=8,
             max_seqlen_k=5,
             target_compute_capability=100,
         ),
@@ -114,7 +114,7 @@ def test_jax_dsa_indexer_abstract_shapes(monkeypatch):
         cu,
         cu,
     )["scores"]
-    assert packed.shape == (4, 5)
+    assert packed.shape == (8, 5)
 
     values = jax.ShapeDtypeStruct((2, 64), jnp.float32)
     lengths = jax.ShapeDtypeStruct((2,), jnp.int32)
@@ -180,7 +180,7 @@ def test_jax_indexer_forward_jit_and_numerics():
     device, capability = _supported_gpu(jax, 90)
     from cudnn.jax import indexer_forward_wrapper
 
-    batch, seqlen_q, seqlen_k = 2, 4, 5
+    batch, seqlen_q, seqlen_k = 2, 8, 5
     num_query_heads, head_dim = 32, 128
     q = jax.device_put(
         jax.random.normal(jax.random.key(0), (batch, seqlen_q, num_query_heads, head_dim), dtype=jnp.bfloat16),

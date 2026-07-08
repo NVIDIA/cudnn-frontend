@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Dependency-free tests for framework-neutral tensor descriptors."""
+"""Tests for framework-neutral tensor descriptors."""
 
 from enum import Enum, auto
 import importlib
@@ -35,7 +35,7 @@ def _load_tensor_desc_module():
     package.__spec__ = ModuleSpec(_PACKAGE, loader=None, is_package=True)
     package.data_type = _DataType
     sys.modules[_PACKAGE] = package
-    return importlib.import_module(f"{_PACKAGE}._tensor_desc")
+    return importlib.import_module(f"{_PACKAGE}.common.tensor_desc")
 
 
 class SharedTensorDescTest(unittest.TestCase):
