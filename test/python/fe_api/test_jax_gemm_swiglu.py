@@ -63,7 +63,7 @@ def test_jax_gemm_swiglu_abstract_contract(
     jax, jnp = _jax_runtime()
 
     from cudnn._jax import JaxApiBase
-    from cudnn.jax import GemmSwigluSm100, gemm_swiglu_wrapper_sm100
+    from cudnn.jax import GemmSwigluSm100, gemm_swiglu_wrapper
 
     def abstract_call(self, _inputs, *, output_descs, output_spec, **_options):
         return tuple(
@@ -100,7 +100,7 @@ def test_jax_gemm_swiglu_abstract_contract(
     alternate_a = jax.ShapeDtypeStruct((3, 64, 128), jnp.bfloat16)
     alternate_b = jax.ShapeDtypeStruct((3, 64, 192), jnp.bfloat16)
     alternate = jax.eval_shape(
-        lambda a, b: gemm_swiglu_wrapper_sm100(
+        lambda a, b: gemm_swiglu_wrapper(
             a,
             b,
             a_layout="LKM",
@@ -133,7 +133,7 @@ def test_jax_gemm_swiglu_sm100_jit_and_numerics():
     jax, jnp = _jax_runtime()
     device, capability = _supported_gpu(jax)
 
-    from cudnn.jax import gemm_swiglu_wrapper_sm100
+    from cudnn.jax import gemm_swiglu_wrapper
 
     batch, m, n, k = 1, 128, 128, 128
     alpha = 0.5
@@ -156,7 +156,7 @@ def test_jax_gemm_swiglu_sm100_jit_and_numerics():
         device,
     )
 
-    lowered = gemm_swiglu_wrapper_sm100.lower(
+    lowered = gemm_swiglu_wrapper.lower(
         a,
         b,
         alpha=alpha,

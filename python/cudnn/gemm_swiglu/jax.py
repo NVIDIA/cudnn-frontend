@@ -238,7 +238,7 @@ class GemmSwigluSm100(JaxApiBase):
         "target_compute_capability",
     ),
 )
-def gemm_swiglu_wrapper_sm100(
+def gemm_swiglu_wrapper(
     a_tensor: Any,
     b_tensor: Any,
     alpha: float = 1.0,
@@ -253,7 +253,7 @@ def gemm_swiglu_wrapper_sm100(
     b_layout: str = "LNK",
     target_compute_capability: int | None = None,
 ) -> TupleDict:
-    """Compute the standard dense batched GEMM and fused SwiGLU projection."""
+    """Resolve a supported GPU target and compute the standard GEMM + SwiGLU projection."""
 
     return GemmSwigluSm100(
         jax.ShapeDtypeStruct(a_tensor.shape, a_tensor.dtype),
@@ -274,5 +274,5 @@ def gemm_swiglu_wrapper_sm100(
 __all__ = [
     "GemmSwigluSm100",
     "SUPPORTED_COMPUTE_CAPABILITIES",
-    "gemm_swiglu_wrapper_sm100",
+    "gemm_swiglu_wrapper",
 ]

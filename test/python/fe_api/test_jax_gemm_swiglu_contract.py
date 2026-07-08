@@ -336,7 +336,9 @@ class JaxGemmSwigluContractTest(unittest.TestCase):
             api(sample_a, _Array(sample_b.shape, "float16"))
 
     def test_wrapper_marks_configuration_as_static_and_remains_functional(self):
-        static = self.jit_static_argnames["gemm_swiglu_wrapper_sm100"]
+        self.assertIn("gemm_swiglu_wrapper", self.module.__all__)
+        self.assertNotIn("gemm_swiglu_wrapper_sm100", self.module.__all__)
+        static = self.jit_static_argnames["gemm_swiglu_wrapper"]
         self.assertEqual(
             static,
             (
@@ -354,7 +356,7 @@ class JaxGemmSwigluContractTest(unittest.TestCase):
         )
 
         sample_a, sample_b = self._samples(a_layout="LKM", b_layout="LKN")
-        result = self.module.gemm_swiglu_wrapper_sm100(
+        result = self.module.gemm_swiglu_wrapper(
             sample_a,
             sample_b,
             c_layout="LNM",

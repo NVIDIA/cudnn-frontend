@@ -190,10 +190,10 @@ row-major arrays whose axis order is described explicitly:
 import jax
 import jax.numpy as jnp
 
-from cudnn.jax import gemm_swiglu_wrapper_sm100
+from cudnn.jax import gemm_swiglu_wrapper
 
 # A: (L, M, K), B: (L, N, K)
-result = gemm_swiglu_wrapper_sm100(
+result = gemm_swiglu_wrapper(
     a,
     b,
     alpha=1.0,
@@ -325,7 +325,10 @@ also the Torch API order. JAX arrays use the public axis orders selected by
     - Number of pipeline stages for AB12 output
     - Default: `4`
 
-### Wrapper-specific parameters: `gemm_swiglu_wrapper_sm100`
+### Wrapper-specific parameters
+
+The Torch wrapper is `gemm_swiglu_wrapper_sm100`. The JAX wrapper is
+`gemm_swiglu_wrapper`; it resolves the concrete kernel target while tracing.
 
 - `a_tensor`, `b_tensor`: see Input/Output tensors
 - Torch: `c_major` selects `"m"` or `"n"`; `ab12_dtype` defaults to `torch.float32`; `c_dtype` defaults to `torch.float16`.
