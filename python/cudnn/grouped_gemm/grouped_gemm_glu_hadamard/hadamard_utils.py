@@ -10,7 +10,6 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.nvgpu import OperandMajorMode
 from cutlass.cute.nvgpu.tcgen05 import OperandSource
-import torch
 
 HADAMARD_SIZE = 16
 TMEM_ROW_STRIDE = 1 << 16
@@ -235,6 +234,8 @@ def hadamard_smem_transpose_fwht_amax(sD, d_buffer, feature_offset: cutlass.Cons
 
 
 def hadamard_matrix(n, dtype=None, device=None):
+    import torch
+
     if dtype is None:
         dtype = torch.float32
     if n < 1:

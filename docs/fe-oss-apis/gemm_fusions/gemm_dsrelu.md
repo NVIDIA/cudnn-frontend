@@ -7,7 +7,7 @@
 **Block-scaled GEMM + dsReLU backward fusion**: A persistent, batched dense GEMM on NVIDIA Blackwell GPUs (SM100+) that supports block-scaled FP4 and FP8 inputs and produces both the backward output `D` and the probability gradient `dprob` in a single kernel launch.
 
 - **Inputs**: quantized `A` and `B`, the forward/intermediate tensor `C`, scale-factor tensors `SFA` and `SFB`, and a per-row probability tensor `prob`
-- **Outputs**: backward output `D`, probability gradient `dprob`, and optional output scale factors `SFD` / `Amax`
+- **Outputs**: backward output `D`, probability gradient `dprob`, and optional `Amax`
 
 ### Shapes
 
@@ -22,7 +22,6 @@
 - **Outputs**
   - `D`: shape `(M, N, L)`
   - `dprob`: shape `(M, 1, L)`
-  - `SFD`: shape `(32, 4, ceil_div(M, 128), 4, ceil_div(ceil_div(N, sf_vec_size), 4), L)` when `D` is FP8
   - `Amax`: shape `(1,)` when FP4 input is written to fp16/bf16/fp32 output
 
 `L` is the batch dimension.
@@ -43,7 +42,9 @@ $$
 \mathrm{dprob}[m, 0, l] = \sum_n C[m, n, l] \cdot \mathrm{relu}(G[m, n, l])^2
 $$
 
-As with the forward `srelu` kernel, FP8 `D` also emits `SFD` using the provided `norm_const_tensor`, and FP4 input written to fp16/bf16/fp32 `D` can emit `Amax`.
+As with the forward `srelu` kernel, FP4 input written to fp16/bf16/fp32 `D`
+can emit `Amax`. The FP8 `D`/SFD epilogue is reserved by the API but is not
+implemented by the current kernel.
 
 ### Diagram
 
@@ -63,15 +64,17 @@ A (MxKxL), SFA                   B (NxKxL), SFB
                                               |
                                               +--> dprob (Mx1xL)
                                               |
-                                  +-----------+-----------+
-                                  |                       |
-                                  v                       v
-                                 SFD                    Amax
+                                              v
+                                             Amax
 ```
 
 ---
 
 ## API Usage
+
+The existing APIs in this section use Torch tensors. The JAX API is described
+separately below because its public arrays are row-major and name their logical
+axis order explicitly.
 
 ### High-level wrapper
 
@@ -142,6 +145,47 @@ op.execute(
 )
 ```
 
+### JAX API
+
+```python
+import jax.numpy as jnp
+from cudnn.jax import gemm_dsrelu_wrapper_sm100
+
+result = gemm_dsrelu_wrapper_sm100(
+    a,                       # (L, M, K), float4_e2m1fn or FP8
+    b,                       # (L, N, K), same dtype as A
+    c,                       # (L, M, N)
+    sfa,                     # (L, ceil(M/128), rest_k, 32, 4, 4)
+    sfb,                     # (L, ceil(N/128), rest_k, 32, 4, 4)
+    prob,                    # (L, 1, M), float32
+    d_dtype=jnp.bfloat16,
+    sf_vec_size=16,          # use 32 for MXFP8 + E8M0 scales
+)
+```
+
+`GemmDsreluSm100` provides the corresponding class API and accepts optional
+`sample_d` and `sample_dprob` output exemplars. The high-level wrapper is JIT
+compiled and infers its outputs.
+
+JAX arrays use compact row-major storage:
+
+- `a_layout="LMK"` and `"LKM"` map public A shapes `(L,M,K)` and `(L,K,M)`
+  to kernel axes `(M,K,L)`.
+- `b_layout="LNK"` and `"LKN"` map public B shapes `(L,N,K)` and `(L,K,N)`
+  to kernel axes `(N,K,L)`.
+- `d_layout="LMN"` consumes C and produces D as `(L,M,N)`; `"LNM"` uses
+  `(L,N,M)`.
+- SFA/SFB use public shape `(L, tiles, rest, 32, 4, 4)`. The adapter maps
+  this row-major representation to the packed six-dimensional kernel ABI.
+- `prob` and the inferred `dprob_tensor` use public shape `(L,1,M)`.
+
+Here `rest_k = ceil(ceil(K / sf_vec_size) / 4)`.
+
+Native JAX `float4_e2m1fn` inputs return an initialized `amax_tensor` with
+shape `(1,)`. JAX currently rejects FP8 `D`, `norm_const_tensor`, and SFD
+generation because the kernel's SFD epilogue is not implemented. `D` must use
+`float16`, `bfloat16`, or `float32`.
+
 ---
 
 ## Parameters
@@ -169,14 +213,14 @@ op.execute(
   - Dtype: `float32`
 - Output tensor **D**: `result["d_tensor"]` (wrapper) or `sample_d` / `d_tensor` (class)
   - Shape: `(M, N, L)`
-  - Dtype: `{float16, bfloat16, float32, float8_e4m3fn, float8_e5m2}`
+  - Functional dtypes: `{float16, bfloat16, float32}`
 - Output tensor **dprob**: `result["dprob_tensor"]` (wrapper) or `sample_dprob` / `dprob_tensor` (class)
   - Shape: `(M, 1, L)`
   - Dtype: `float32`
 - Output tensor **SFD**: `result["sfd_tensor"]` (wrapper) or `sample_sfd` / `sfd_tensor` (class)
   - Shape: `(32, 4, ceil_div(M, 128), 4, ceil_div(ceil_div(N, sf_vec_size), 4), L)`
   - Dtype: Must match `SFA`
-  - Required when `D` is FP8
+  - Reserved for FP8 `D`; generation is not implemented
 - Output tensor **Amax**: `result["amax_tensor"]` (wrapper) or `sample_amax` / `amax_tensor` (class)
   - Shape: `(1,)`
   - Dtype: `float32`
@@ -184,7 +228,7 @@ op.execute(
 - Input tensor **Norm Const**: `norm_const_tensor` (wrapper) or `sample_norm_const` / `norm_const_tensor` (class)
   - Shape: `(1,)`
   - Dtype: `float32`
-  - Required when `D` is FP8
+  - Reserved for FP8 `D`; currently unsupported
 
 ### Common parameters
 
@@ -237,11 +281,13 @@ Tuple unpacking order is: `(d_tensor, dprob_tensor, amax_tensor, sfd_tensor)`.
 - `sf_vec_size == 32` is unsupported with `sf_dtype == float8_e4m3fn`
 - FP8 input requires `sf_vec_size == 32`
 - FP4 input with FP8 `D` is unsupported
-- FP8 `D` requires both `SFD` and `norm_const_tensor`
+- FP8 `D` and SFD generation are not implemented
 
 ### Environment
 
 - Requires CUDA with SM100+ compute capability
+- The JAX API requires a homogeneous local SM100-family GPU and resolves
+  occupancy before CuTe lowering. Device-free compilation is not supported.
 
 ---
 
@@ -251,3 +297,4 @@ For end-to-end usage and regression coverage, see:
 
 - `test/python/fe_api/test_gemm_dsrelu.py`
 - `test/python/fe_api/test_gemm_dsrelu_utils.py`
+- `test/python/fe_api/test_jax_gemm_relu.py`

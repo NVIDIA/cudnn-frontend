@@ -19,6 +19,35 @@ def load_s2r(src: cute.Tensor, *, loc=None, ip=None) -> cute.Tensor:
     return dst
 
 
+@dsl_user_op
+def as_global_tensor(tensor: cute.Tensor, *, loc=None, ip=None) -> cute.Tensor:
+    """Cast a generic kernel tensor back to global memory for async copies."""
+
+    if tensor.memspace == cute.AddressSpace.gmem:
+        return tensor
+    if tensor.memspace != cute.AddressSpace.generic:
+        raise ValueError(f"Expected a global or generic tensor, got {tensor.memspace}")
+
+    pointer = tensor.iterator
+    global_pointer = llvm.addrspacecast(
+        llvm.PointerType.get(cute.AddressSpace.gmem),
+        pointer.llvm_ptr,
+        loc=loc,
+        ip=ip,
+    )
+    return cute.make_tensor(
+        cute.make_ptr(
+            tensor.element_type,
+            global_pointer,
+            cute.AddressSpace.gmem,
+            assumed_align=pointer.alignment,
+            loc=loc,
+            ip=ip,
+        ),
+        tensor.layout,
+    )
+
+
 def tiled_copy_1d(dtype: Type[cutlass.Numeric], num_threads: int, num_copy_elems: int = 1, is_async: bool = False) -> cute.TiledCopy:
     num_copy_bits = min(128, num_copy_elems * dtype.width)
     copy_op = cpasync.CopyG2SOp() if is_async else cute.nvgpu.CopyUniversalOp()

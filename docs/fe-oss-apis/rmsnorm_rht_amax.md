@@ -9,6 +9,8 @@
 This frontend integration exposes the kernel as a standard FE-OSS Python API with:
 - a class API (`RmsNormRhtAmaxSm100`)
 - a wrapper API (`rmsnorm_rht_amax_wrapper_sm100`)
+- an explicit JAX API under `cudnn.jax`
+- a framework-neutral operation signature in `op.py` and a CUTE DSL implementation in `kernel.py`
 - grouped-gemm-style regression coverage for compile/execute, wrapper use, and cache reuse
 
 ## Shapes
@@ -97,9 +99,60 @@ op.execute(
 )
 ```
 
+The PyTorch class preserves caller-owned output buffers. During
+`check_support()`, the framework-neutral operation validates the complete
+input and output exemplar signature and resolves the launch configuration.
+`compile()` then constructs the CUTE DSL kernel from that resolved
+configuration.
+
+### JAX API
+
+The CUDA 13 JAX packages require Python 3.11 or newer. Install the JAX integration explicitly:
+
+```bash
+pip install 'nvidia-cudnn-frontend[jax]'
+```
+
+```python
+import jax
+from cudnn.jax import RmsNormRhtAmaxSm100, rmsnorm_rht_amax_sm100
+
+o, amax = rmsnorm_rht_amax_sm100(
+    x,
+    w,
+    eps=1e-5,
+    num_threads=128,
+    rows_per_cta=2,
+)
+
+# The class API specializes from abstract placeholders, then accepts arrays
+# when called under JAX transformations.
+x_spec = jax.ShapeDtypeStruct(x.shape, x.dtype)
+w_spec = jax.ShapeDtypeStruct(w.shape, w.dtype)
+op = RmsNormRhtAmaxSm100(x_spec, w_spec, rows_per_cta=2)
+o, amax = jax.jit(op)(x, w)
+```
+
+The function API is JIT-compiled and treats `eps`, `num_threads`, and
+`rows_per_cta` as static compilation options. Use `RmsNormRhtAmaxSm100`
+directly when the caller needs to control JAX transformations explicitly. A
+JAX array or another object exposing shape and dtype may be used instead of a
+`ShapeDtypeStruct` exemplar; only its metadata is retained. Unlike PyTorch,
+JAX derives output descriptors in its adapter and lets XLA allocate the
+results. Callers may instead provide both `sample_o` and `sample_amax` as
+explicit output placeholders. In either case, the common operation validates
+the complete signature through `check_support()`.
+
+JAX support validation requires every local GPU to meet the operation's SM100
+minimum. Device-free AOT and remote compilation are not currently supported.
+
+The current JAX adapter models its buffers as row-major with the public and
+kernel axes in the same order. Additional JAX-specific axis mappings can be
+added without changing the framework-neutral operation signature.
+
 ## Parameters
 
-### Input and output tensors
+### PyTorch input and output tensors
 
 - `x_tensor` / `sample_x`
   - Shape: `(M, N)`
@@ -117,6 +170,9 @@ op.execute(
   - Shape: `(M / rows_per_cta,)`
   - Dtype: `torch.float32`
 
+The JAX API uses the same shapes and layouts with `jax.numpy.bfloat16` for
+`X`, `W`, and `O`, and `jax.numpy.float32` for `Amax`.
+
 ### Common parameters
 
 - `eps: float`
@@ -125,15 +181,27 @@ op.execute(
   - Threads per CTA. If omitted, the API uses the upstream-tuned table when possible, otherwise a valid fallback search.
 - `rows_per_cta: Optional[int]`
   - Rows processed by each CTA. If omitted, the wrapper uses the upstream-style heuristic over `{2, 4, 8}`.
-- CUDA stream (`current_stream`)
 
-### Wrapper return values
+The PyTorch `execute()` and wrapper APIs additionally accept the optional
+CUDA stream argument `current_stream`. JAX execution uses the stream supplied
+by XLA.
 
-Returns a `TupleDict` with keys:
+### Return values
+
+The PyTorch wrapper returns a `TupleDict` with keys:
+
 - `o_tensor`
+  - Shape: `(M, N)`
+  - Layout: row-major contiguous
+  - Dtype: `torch.bfloat16`
 - `amax_tensor`
+  - Shape: `(M / rows_per_cta,)`
+  - Dtype: `torch.float32`
 
 Tuple unpacking order is `(o_tensor, amax_tensor)`.
+
+The class API writes into its caller-provided output tensors and returns
+`None`.
 
 ## Support surface and constraints
 
@@ -142,10 +210,13 @@ Tuple unpacking order is `(o_tensor, amax_tensor)`.
 - `N` must be divisible by the resolved `num_threads`.
 - `EPT = N / num_threads` must be at least `8` and divisible by `8`.
 - `M` must be divisible by `rows_per_cta`.
-- Inputs and output are currently bf16 only.
+- `X`, `W`, and `O` use bf16; `amax` uses float32.
+- PyTorch input and output tensors must be 16-byte aligned.
 - The frontend integration matches the upstream RMSNorm kernel semantics; it does not expose full LayerNorm mean/bias behavior.
 
 ## Verification
 
 Focused correctness and cache coverage live in:
+
 - `test/python/fe_api/test_rmsnorm_rht_amax.py`
+- `test/python/fe_api/test_jax_rmsnorm_rht_amax.py`

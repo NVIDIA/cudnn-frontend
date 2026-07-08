@@ -101,6 +101,7 @@ class GroupedGemmWgradSm100(APIBase):
                 stride_order=tuple(i for i, s in sorted(enumerate(self.wgrad_desc.stride[1:]), key=lambda x: x[1])),
                 device=self.wgrad_desc.device,
                 name="single_expert_wgrad",
+                init_value=self.wgrad_desc.init_value,
             )
         else:  # MoEWeightMode.DISCRETE
             self.expert_cnt = num_experts

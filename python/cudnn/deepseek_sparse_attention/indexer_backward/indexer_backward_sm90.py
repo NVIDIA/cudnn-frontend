@@ -44,7 +44,6 @@ from functools import partial
 from typing import Optional
 
 import cuda.bindings.driver as cuda
-import torch
 
 import cutlass
 import cutlass.cute as cute
@@ -55,13 +54,7 @@ from cutlass.cute.nvgpu import cpasync, warp, warpgroup
 from cutlass.utils import LayoutEnum
 
 from cudnn.deepseek_sparse_attention.utils import copy as copy_ops
-from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
-from cudnn.deepseek_sparse_attention.utils.runtime import (
-    resolve_stream as _resolve_stream,
-    torch_stream_context as _torch_stream_context,
-)
 from cudnn.deepseek_sparse_attention.utils.seqlen import seqlen_info as _seqlen_info
-from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
 from cudnn.deepseek_sparse_attention.utils.sm90.mma import (
     gemm,
     gemm_zero_init,
@@ -1385,7 +1378,7 @@ def indexer_backward_sm90(
 
 
 class ScoreGradSm90:
-    """CuTe DSL kernel for in-place score_grad precompute (SM90)."""
+    """CuTe DSL sparse score-gradient kernel with an optional output."""
 
     THREADS_PER_CTA = 128
 
@@ -1401,14 +1394,19 @@ class ScoreGradSm90:
         mGradLoss: cute.Tensor,
         grad_scale: Float32 | float,
         stream: cuda.CUstream,
+        mGradSignal: Optional[cute.Tensor] = None,
     ):
+        if cutlass.const_expr(mGradSignal is None):
+            mGradSignal = mAttnScore
+
         # (b, s, t) -> (s, t, b): contiguous topk traversal per CTA.
         mAttnScore = cute.make_tensor(mAttnScore.iterator, cute.select(mAttnScore.layout, mode=[1, 2, 0]))
         mIndexScore = cute.make_tensor(mIndexScore.iterator, cute.select(mIndexScore.layout, mode=[1, 2, 0]))
+        mGradSignal = cute.make_tensor(mGradSignal.iterator, cute.select(mGradSignal.layout, mode=[1, 2, 0]))
 
         seqlen = cute.size(mAttnScore.shape[0])
         batch_size = cute.size(mAttnScore.shape[2]) if cute.rank(mAttnScore.shape) > 2 else 1
-        self.kernel_score_grad(mAttnScore, mIndexScore, mGradLoss, grad_scale).launch(
+        self.kernel_score_grad(mAttnScore, mIndexScore, mGradLoss, mGradSignal, grad_scale).launch(
             grid=(seqlen, batch_size, 1),
             block=[self.THREADS_PER_CTA, 1, 1],
             cluster=[1, 1, 1],
@@ -1417,7 +1415,7 @@ class ScoreGradSm90:
         )
 
     @cute.kernel
-    def kernel_score_grad(self, mAttnScore, mIndexScore, mGradLoss, grad_scale: Float32 | float):
+    def kernel_score_grad(self, mAttnScore, mIndexScore, mGradLoss, mGradSignal, grad_scale: Float32 | float):
         tidx = cute.arch.thread_idx()[0]
         seq_idx = cute.arch.block_idx()[0]
         batch_idx = cute.arch.block_idx()[1]
@@ -1473,7 +1471,7 @@ class ScoreGradSm90:
                     predict = Float32(mIndexScore[seq_idx, pos, batch_idx])
                     log_clip_mask = Float32(1.0) if predict >= Float32(CLIP_PROB_MIN) else Float32(0.0)
                 g_i = -target_eff * log_clip_mask * grad_scale_f32
-                mAttnScore[seq_idx, pos, batch_idx] = g_i - predict * sum_grad
+                mGradSignal[seq_idx, pos, batch_idx] = g_i - predict * sum_grad
 
 
 def _score_grad_inplace_cute(
@@ -1484,6 +1482,10 @@ def _score_grad_inplace_cute(
     index_is_log: bool = False,
     current_stream=None,
 ):
+    from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
+    from cudnn.deepseek_sparse_attention.utils.runtime import resolve_stream
+    from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
+
     # Kernel reads ``mGradLoss[0]`` so it must be at least 1-D; defend direct
     # factory callers passing a 0-D scalar (the public wrapper reshapes already).
     if GradLoss.ndim == 0:
@@ -1491,7 +1493,7 @@ def _score_grad_inplace_cute(
 
     _, _, topk = AttnScore.shape
     compile_key = (topk, bool(index_is_log))
-    s = _resolve_stream(current_stream)
+    s = resolve_stream(current_stream)
     if compile_key not in _score_grad_cute_cache:
         kernel_obj = ScoreGradSm90(
             topk=topk,
@@ -1538,6 +1540,8 @@ def _score_grad_inplace(
     #   target = clip(log_target)
     # dL/dlog_predict = -exp(target) * I(log_predict >= -100)
     # dL/dlogits = g - predict * sum(g)
+    import torch
+
     can_use_cute = (
         AttnScore.is_cuda
         and IndexScore.is_cuda
@@ -1571,6 +1575,12 @@ def _build_cute_dsl_kernel(
     score_input_is_log=True,
     topk_indices_global: bool = True,
 ):
+    import torch
+
+    from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
+    from cudnn.deepseek_sparse_attention.utils.runtime import resolve_stream, torch_stream_context
+    from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
+
     cap = torch.cuda.get_device_capability()[0]
     if cap < 9:
         raise RuntimeError(f"Requires SM90+ (got SM{cap}0)")
@@ -1603,7 +1613,7 @@ def _build_cute_dsl_kernel(
         current_stream=None,
     ):
         """Lazy-compile the GEMM kernel (kernel 2) on first execute (needs real tensors)."""
-        s = _resolve_stream(current_stream)
+        s = resolve_stream(current_stream)
         if compile_key not in _compile_cache:
             cute_args = [
                 to_cute_tensor(t)
@@ -1648,7 +1658,7 @@ def _build_cute_dsl_kernel(
         current_stream=None,
     ):
         """Run only kernel 2 (GEMM). Caller must have run kernel 1 and zeroed dIndexK_f32."""
-        s = _resolve_stream(current_stream)
+        s = resolve_stream(current_stream)
         _ensure_compiled(
             IndexQ,
             Weights,
@@ -1719,7 +1729,7 @@ def _build_cute_dsl_kernel(
             )
         else:
             # Need separate f32 buffer for atomicAdd, then convert back
-            with _torch_stream_context(current_stream):
+            with torch_stream_context(current_stream):
                 dIndexK_f32 = torch.zeros_like(dIndexK, dtype=torch.float32)
             _run_gemm_only(
                 IndexQ,
@@ -1732,7 +1742,7 @@ def _build_cute_dsl_kernel(
                 TopkIndices,
                 current_stream=current_stream,
             )
-            with _torch_stream_context(current_stream):
+            with torch_stream_context(current_stream):
                 dIndexK.copy_(dIndexK_f32)
 
     _run.score_grad = partial(_score_grad_inplace, index_is_log=score_input_is_log)

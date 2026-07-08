@@ -270,6 +270,7 @@ class BlockScaledDiscreteWeightDgluDbiasGroupedGemmKernel:
         expert_cnt: int,
         use_dynamic_sched: bool = False,
         act_func: str = "dswiglu",
+        stacked_expert_inputs: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel.
 
@@ -371,6 +372,10 @@ class BlockScaledDiscreteWeightDgluDbiasGroupedGemmKernel:
 
         self.vectorized_f32 = vectorized_f32
         self.use_dynamic_sched = use_dynamic_sched
+        # See the forward kernel for the JAX liveness rationale.  Torch keeps
+        # using device pointer tables; JAX passes stacked B/SFB operands whose
+        # expert addresses are derived here.
+        self.stacked_expert_inputs = stacked_expert_inputs
 
         # Amax reduction configuration
         self.num_epilog_warps = len(self.epilog_warp_id)
@@ -638,10 +643,15 @@ class BlockScaledDiscreteWeightDgluDbiasGroupedGemmKernel:
 
         expert_idx = cute.arch.block_idx()[0]
 
-        b_ptr_tensor = cute.make_tensor(cute.make_ptr(cutlass.Int64, ptrs_b.toint(), AddressSpace.gmem, assumed_align=8), cute.make_layout((self.expert_cnt,)))
-        sfb_ptr_tensor = cute.make_tensor(
-            cute.make_ptr(cutlass.Int64, ptrs_sfb.toint(), AddressSpace.gmem, assumed_align=8), cute.make_layout((self.expert_cnt,))
-        )
+        if cutlass.const_expr(not self.stacked_expert_inputs):
+            b_ptr_tensor = cute.make_tensor(
+                cute.make_ptr(cutlass.Int64, ptrs_b.toint(), AddressSpace.gmem, assumed_align=8),
+                cute.make_layout((self.expert_cnt,)),
+            )
+            sfb_ptr_tensor = cute.make_tensor(
+                cute.make_ptr(cutlass.Int64, ptrs_sfb.toint(), AddressSpace.gmem, assumed_align=8),
+                cute.make_layout((self.expert_cnt,)),
+            )
 
         c1 = cutlass.Int32(1)
         c0 = cutlass.Int64(0)
@@ -653,8 +663,12 @@ class BlockScaledDiscreteWeightDgluDbiasGroupedGemmKernel:
             stride_n = c1_64
             stride_k = b_stride_size
 
-        b_ptr_val = b_ptr_tensor[expert_idx]
-        b_ptr = cute.make_ptr(self.b_dtype, b_ptr_val, AddressSpace.gmem)
+        if cutlass.const_expr(self.stacked_expert_inputs):
+            b_base_ptr = cute.make_ptr(self.b_dtype, ptrs_b.toint(), AddressSpace.gmem, assumed_align=16)
+            b_ptr = b_base_ptr + cutlass.Int64(expert_idx) * cutlass.Int64(n) * cutlass.Int64(k)
+        else:
+            b_ptr_val = b_ptr_tensor[expert_idx]
+            b_ptr = cute.make_ptr(self.b_dtype, b_ptr_val, AddressSpace.gmem)
         b_tensor_i = cute.make_tensor(
             b_ptr,
             cute.make_layout((n, k, c1), stride=(stride_n, stride_k, c0)),
@@ -671,9 +685,13 @@ class BlockScaledDiscreteWeightDgluDbiasGroupedGemmKernel:
         workspace = TensormapWorkspace(workspace_ptr, ["b", "sfb"])
         store_tma_desc(tma_atom_b, workspace.get_ptr("b", expert_idx))
 
-        sfb_ptr_val = sfb_ptr_tensor[expert_idx]
-        sfb_ptr = cute.make_ptr(self.sf_dtype, sfb_ptr_val, AddressSpace.gmem)
         sfb_layout = blockscaled_utils.tile_atom_to_shape_SF((n, k, c1), self.sf_vec_size)
+        if cutlass.const_expr(self.stacked_expert_inputs):
+            sfb_base_ptr = cute.make_ptr(self.sf_dtype, ptrs_sfb.toint(), AddressSpace.gmem, assumed_align=16)
+            sfb_ptr = sfb_base_ptr + cutlass.Int64(expert_idx) * cutlass.Int64(cute.cosize(sfb_layout))
+        else:
+            sfb_ptr_val = sfb_ptr_tensor[expert_idx]
+            sfb_ptr = cute.make_ptr(self.sf_dtype, sfb_ptr_val, AddressSpace.gmem)
         sfb_tensor_i = cute.make_tensor(sfb_ptr, sfb_layout)
         tma_atom_sfb, _ = cute.nvgpu.make_tiled_tma_atom_B(
             sfb_tma_op_arg,

@@ -117,6 +117,10 @@ class GemmSreluSm100(APIBase):
             dtype=[torch.float16, torch.bfloat16, torch.float32, torch.float8_e4m3fn, torch.float8_e5m2],
             name="D",
         )
+        self._not_implemented_error_if(
+            self._is_fp8(self.d_dtype),
+            "FP8 D output is unavailable because the current sReLU kernel does not implement SFD generation",
+        )
         self._check_dtype(self.prob_desc, dtype=torch.float32, name="prob")
 
         self.sf_dtype = self._check_dtype(self.sfa_desc, dtype=[torch.float8_e8m0fnu, torch.float8_e4m3fn], name="SFA")
@@ -126,9 +130,6 @@ class GemmSreluSm100(APIBase):
         self._check_dtype(self.acc_dtype, dtype=torch.float32, name="Accumulator")
 
         self._value_error_if(self.sf_vec_size not in {16, 32}, f"sf_vec_size must be 16 or 32, got {self.sf_vec_size}")
-        self._value_error_if(
-            self._is_fp8(self.d_desc) and (self.sfd_desc is None or self.norm_const_desc is None), "sfd and norm_const are required when D is FP8"
-        )
         self._value_error_if(
             self._is_fp4x2(self.ab_dtype) and self.d_dtype in {torch.float8_e4m3fn, torch.float8_e5m2}, "FP4 input with FP8 output is not supported"
         )

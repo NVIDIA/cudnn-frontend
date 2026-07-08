@@ -3,6 +3,8 @@
 
 """CUTE DSL kernel for fused RMSNorm + RHT + per-CTA amax."""
 
+from __future__ import annotations
+
 import math
 import operator
 
@@ -10,7 +12,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils
-from cutlass import Float32, Int32
+from cutlass import Float32
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.arch import shuffle_sync_bfly
 from cutlass.cutlass_dsl import T, dsl_user_op
@@ -68,35 +70,67 @@ def redux_sync_max_f32(val, *, loc=None, ip=None):
     return Float32(result)
 
 
+@dsl_user_op
+def _as_global_tensor(tensor: cute.Tensor, *, loc=None, ip=None) -> cute.Tensor:
+    """Preserve a generic kernel argument's global address space for cp.async."""
+
+    if tensor.memspace == cute.AddressSpace.gmem:
+        return tensor
+    if tensor.memspace != cute.AddressSpace.generic:
+        raise ValueError(f"Expected a global or generic tensor, got {tensor.memspace}")
+
+    pointer = tensor.iterator
+    global_pointer = llvm.addrspacecast(
+        llvm.PointerType.get(cute.AddressSpace.gmem),
+        pointer.llvm_ptr,
+        loc=loc,
+        ip=ip,
+    )
+    return cute.make_tensor(
+        cute.make_ptr(
+            tensor.element_type,
+            global_pointer,
+            cute.AddressSpace.gmem,
+            assumed_align=pointer.alignment,
+            loc=loc,
+            ip=ip,
+        ),
+        tensor.layout,
+    )
+
+
 class RMSNormRHTAmaxKernel:
-    """Fused RMSNorm + block-diagonal Hadamard + running per-CTA amax."""
+    """CuTe implementation of fused RMSNorm + RHT + per-CTA amax."""
 
     COPY_BITS = 128
     HAD_BLOCK = 16
 
-    def __init__(self, n, num_threads=256, eps=1e-5, rows_per_cta=8):
+    def __init__(
+        self,
+        *,
+        n: int,
+        num_threads: int,
+        eps: float,
+        rows_per_cta: int,
+    ) -> None:
         self.n = n
         self.num_threads = num_threads
         self.eps = eps
         self.rows_per_cta = rows_per_cta
         self.vec_size = self.COPY_BITS // 16
-        self.ept = n // num_threads
-
-        assert n % num_threads == 0, f"N={n} must be divisible by num_threads={num_threads}"
-        assert self.ept % self.vec_size == 0, f"EPT={self.ept} must be a multiple of vec_size={self.vec_size}"
-        assert self.ept >= self.vec_size, f"EPT={self.ept} must be >= vec_size={self.vec_size}"
+        self.ept = self.n // self.num_threads
 
         self.num_vec_blocks = self.ept // self.vec_size
-        self.warps_per_row = num_threads // 32
+        self.warps_per_row = self.num_threads // 32
         self.inv_sqrt_had = 1.0 / math.sqrt(self.HAD_BLOCK)
         self.num_intra_stages = int(math.log2(self.vec_size))
         self.num_cross_stages = 1
 
-        self.tv_shape = ((num_threads, 1), (self.vec_size, self.num_vec_blocks))
-        self.tv_stride = ((self.vec_size, 1), (1, self.vec_size * num_threads))
-        self.tiler_mn = (1, n)
+        self.tv_shape = ((self.num_threads, 1), (self.vec_size, self.num_vec_blocks))
+        self.tv_stride = ((self.vec_size, 1), (1, self.vec_size * self.num_threads))
+        self.tiler_mn = (1, self.n)
 
-        tile_bytes = n * 2
+        tile_bytes = self.n * 2
         reduce_bytes = self.warps_per_row * 4
         amax_bytes = self.warps_per_row * 4
         self.smem_bytes = tile_bytes + reduce_bytes + amax_bytes + 128
@@ -114,6 +148,7 @@ class RMSNormRHTAmaxKernel:
     @cute.kernel
     def kernel(self, m_x: cute.Tensor, m_w: cute.Tensor, m_o: cute.Tensor, m_amax: cute.Tensor, eps: Float32, tv_layout: cute.Layout, tiler_mn: cute.Shape):
         cfg = self
+        m_x = _as_global_tensor(m_x)
         tid = cute.arch.thread_idx()[0]
         bid = cute.arch.block_idx()[0]
         inv_sqrt_had = cutlass.Float32(cfg.inv_sqrt_had)
@@ -241,11 +276,26 @@ class RMSNormRHTAmaxKernel:
             m_amax[bid] = cta_max
 
     @cute.jit
-    def __call__(self, x_tensor: cute.Tensor, w_tensor: cute.Tensor, o_tensor: cute.Tensor, amax_tensor: cute.Tensor, eps: Float32, stream: cuda.CUstream):
+    def __call__(
+        self,
+        x_tensor: cute.Tensor,
+        w_tensor: cute.Tensor,
+        o_tensor: cute.Tensor,
+        amax_tensor: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
         m = x_tensor.shape[0]
         num_ctas = m // self.rows_per_cta
         tv_layout = cute.make_layout(self.tv_shape, stride=self.tv_stride)
-        self.kernel(x_tensor, w_tensor, o_tensor, amax_tensor, eps, tv_layout, self.tiler_mn).launch(
+        self.kernel(
+            x_tensor,
+            w_tensor,
+            o_tensor,
+            amax_tensor,
+            Float32(self.eps),
+            tv_layout,
+            self.tiler_mn,
+        ).launch(
             grid=(num_ctas, 1, 1),
             block=(self.num_threads, 1, 1),
             smem=self.smem_bytes,

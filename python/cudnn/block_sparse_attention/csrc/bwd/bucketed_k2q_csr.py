@@ -1,11 +1,14 @@
-from typing import Optional, Tuple
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional, Tuple
+
+if TYPE_CHECKING:
+    import torch
 
 import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, const_expr
-from cutlass.cute.runtime import from_dlpack
 import cuda.bindings.driver as cuda
-import torch
 
 
 class BucketedK2QCsrUniversal:
@@ -240,6 +243,8 @@ def _bucketed_k2q_csr_compile_key(
 
 
 def _to_cute_tensor(tensor: torch.Tensor) -> cute.Tensor:
+    from cutlass.cute.runtime import from_dlpack
+
     return from_dlpack(
         tensor.detach(),
         assumed_align=4,
@@ -256,6 +261,8 @@ def build_bucketed_k2q_csr_cutedsl(
     q2k_block_nums: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, int, int]:
     """Build bucketed K-to-Q CSR metadata with CuTe DSL kernels."""
+    import torch
+
     assert q2k_block_index.dtype == torch.int32
     assert q2k_block_index.is_cuda
     assert q2k_block_index.ndim == 4

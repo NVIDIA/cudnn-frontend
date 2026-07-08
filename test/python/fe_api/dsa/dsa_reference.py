@@ -66,7 +66,10 @@ def ref_sparse_attention_forward(
 
     q_f = q.to(torch.float32)
     k_f = kv.to(torch.float32)
-    v_f = kv.to(torch.float32)
+    # MLA uses a 512-wide value projection for the 576-wide Q/K variant.
+    # K and V share storage, so V is the leading D_v slice of KV.
+    head_dim_v = 512 if d == 576 else d
+    v_f = kv[..., :head_dim_v].to(torch.float32)
 
     mask = _make_topk_mask(topk_idxs, topk_length, t_kv)  # (T, T_kv)
     mask = mask.unsqueeze(1).expand(t, h, t_kv)  # (T, H, T_kv)
@@ -76,8 +79,11 @@ def ref_sparse_attention_forward(
     scores = scores.masked_fill(~mask, float("-inf"))
 
     lse = torch.logsumexp(scores, dim=-1)  # (T, H), excludes sink
-    sink = attn_sink.view(1, h)
-    lse_with_sink = torch.logaddexp(lse, sink)
+    sink = attn_sink.view(1, h, 1).expand(t, h, 1)
+    # Include the finite sink directly in the reduction. Composing
+    # logaddexp(logsumexp(all -inf), sink) gives NaN score gradients in
+    # PyTorch even though the sink makes the mathematical denominator finite.
+    lse_with_sink = torch.logsumexp(torch.cat((scores, sink), dim=-1), dim=-1)
     weights = torch.exp(scores - lse_with_sink.unsqueeze(-1))
     out = torch.einsum("thk,kd->thd", weights, v_f)
 

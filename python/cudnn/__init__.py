@@ -57,6 +57,8 @@ for _optional_symbol in [
     if hasattr(_pybind_module, _optional_symbol):
         globals()[_optional_symbol] = getattr(_pybind_module, _optional_symbol)
 
+from .common.op import Op
+from .common.tensor_desc import TensorDesc
 from .datatypes import _library_type, _is_torch_tensor
 
 __version__ = "1.27.0"
@@ -348,6 +350,11 @@ def __getattr__(name: str) -> Any:
         _ops = importlib.import_module(".ops", __name__)
         globals()["ops"] = _ops
         return _ops
+
+    if name == "jax":
+        _jax = importlib.import_module(".jax", __name__)
+        globals()["jax"] = _jax
+        return _jax
 
     if name == "experimental":
         from . import experimental as _experimental

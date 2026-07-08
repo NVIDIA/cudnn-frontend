@@ -1174,9 +1174,12 @@ class FlashAttentionDSABackwardSm90:
 
             if const_expr(self.have_topk_length):
                 topK = mTopkLength[batch_idx, seq_idx]
+                topK = cutlass.max(Int32(0), cutlass.min(topK, Int32(self.max_topk)))
             else:
                 topK = self.max_topk
-            n_block_max = (topK + self.tile_n - 1) // self.tile_n
+            # A zero-length row still executes one fully predicated tile so
+            # both warp groups reach the same barriers and write zero dQ.
+            n_block_max = cutlass.max(Int32(1), (topK + self.tile_n - 1) // self.tile_n)
             topk_tail_rows = topK - (n_block_max - 1) * self.tile_n
             n_block = n_block_max - 1
 
@@ -1691,9 +1694,10 @@ class FlashAttentionDSABackwardSm90:
 
             if const_expr(self.have_topk_length):
                 topK = mTopkLength[batch_idx, seq_idx]
+                topK = cutlass.max(Int32(0), cutlass.min(topK, Int32(self.max_topk)))
             else:
                 topK = self.max_topk
-            n_block_max = (topK + self.tile_n - 1) // self.tile_n
+            n_block_max = cutlass.max(Int32(1), (topK + self.tile_n - 1) // self.tile_n)
 
             # scatter AtomicAdd — flat gmem dKVaccum for per-row addressing
             mdKVaccum_cur = mdKVaccum[None, head_idx_kv, batch_idx]

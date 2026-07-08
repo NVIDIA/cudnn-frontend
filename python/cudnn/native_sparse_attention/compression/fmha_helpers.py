@@ -137,6 +137,7 @@ class FmhaStaticTileScheduler:
     def get_grid_shape(
         params: FmhaStaticTileSchedulerParams,
         *,
+        persistent_sm_count: Optional[int] = None,
         loc=None,
         ip=None,
     ) -> cute.Shape:
@@ -154,10 +155,13 @@ class FmhaStaticTileScheduler:
         :rtype: cute.Shape
         """
         if params.is_persistent:
-            hardware_info = HardwareInfo()
-            sm_count = hardware_info.get_device_multiprocessor_count()
+            if persistent_sm_count is None:
+                hardware_info = HardwareInfo()
+                persistent_sm_count = hardware_info.get_device_multiprocessor_count()
+            if persistent_sm_count <= 0:
+                raise ValueError(f"persistent_sm_count must be positive, got {persistent_sm_count}")
             return (
-                min(sm_count, cute.size(params.problem_shape_mbh, loc=loc, ip=ip)),
+                min(persistent_sm_count, cute.size(params.problem_shape_mbh, loc=loc, ip=ip)),
                 1,
                 1,
             )
@@ -297,6 +301,7 @@ def compute_grid(
     o_shape: cute.Shape,
     cta_tiler: Tuple[int, int, int],
     is_persistent: bool,
+    persistent_sm_count: Optional[int] = None,
 ) -> Tuple[FmhaStaticTileSchedulerParams, Tuple[int, int, int]]:
     """
     Compute grid parameters for FMHA operation.
@@ -330,7 +335,10 @@ def compute_grid(
             cute.size(o_shape[2][1]),
         ),
     )
-    grid = FmhaStaticTileScheduler.get_grid_shape(tile_sched_params)
+    grid = FmhaStaticTileScheduler.get_grid_shape(
+        tile_sched_params,
+        persistent_sm_count=persistent_sm_count,
+    )
 
     return tile_sched_params, grid
 

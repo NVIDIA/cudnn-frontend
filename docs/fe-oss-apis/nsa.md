@@ -74,6 +74,46 @@ NSA.TopKReduction
 NSA.topk_reduction_wrapper
 ```
 
+### JAX namespace
+
+Install the optional integration with `nvidia-cudnn-frontend[jax]`, then use
+the lazy `cudnn.jax.NSA` namespace (the symbols are also available directly
+from `cudnn.jax`):
+
+```python
+import cudnn.jax as cudnn_jax
+
+result = cudnn_jax.NSA.compression_attention_wrapper(
+    q,
+    k,
+    v,
+    layout="BSHD",
+    enable_lse=True,
+)
+output = result["o_tensor"]
+lse = result["lse_tensor"]
+```
+
+Functional JAX wrappers are decorated with `jax.jit`. Their layout, tuning,
+maximum-sequence-length, and target arguments are static; cumulative sequence
+lengths remain dynamic array operands. Classes accept array-like exemplars and
+can be placed under a caller-owned JAX transformation.
+
+| Component | JAX public layouts |
+| --- | --- |
+| Selection | Packed `THD` |
+| Compression | Fixed `BHSD`/`BSHD` or packed `THD` |
+| Sliding Window | Fixed `BHSD`/`BSHD` or fully packed `THD` |
+| Top-K | Fixed `BHSD`/`BSHD` or packed `THD` |
+
+Packed calls require cumulative Q/K sequence lengths and static `max_s_q` and
+`max_s_k` bounds. The arrays must start at zero, be monotonic, end at the
+corresponding packed token count, and respect those bounds. Sliding Window
+uses those offsets to form padded cuDNN attention operands in the lowered
+computation; it does not accept arbitrary ragged byte-offset tensors. Fixed
+data outputs follow the selected layout, while LSE/statistics remain in
+`(B, H, S[, 1])` order.
+
 ---
 
 ## Components

@@ -104,6 +104,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         mma_tiler: Tuple[int, int, int],
         is_persistent: bool,
         mask_type: fmha_utils.MaskType,
+        persistent_sm_count: Optional[int] = None,
     ):
         """Initializes the configuration for a Blackwell Fused Multi-Head Attention (FMHA) kernel.
 
@@ -155,6 +156,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.cluster_shape_mn = (1, 1)
         self.is_persistent = is_persistent
         self.mask_type = mask_type
+        self.persistent_sm_count = persistent_sm_count
 
         self.softmax0_warp_ids = (0, 1, 2, 3)
         self.softmax1_warp_ids = (4, 5, 6, 7)
@@ -355,6 +357,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             cute.shape((s_q, d, ((h_r, h_k), b))),
             self.cta_tiler,
             self.is_persistent,
+            self.persistent_sm_count,
         )
 
         self.q_major_mode = utils.LayoutEnum.from_tensor(q).mma_major_mode()

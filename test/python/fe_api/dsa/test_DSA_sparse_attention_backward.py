@@ -40,8 +40,42 @@ def _allocate(cfg, has_topk_length: bool):
     topk_length = None
     if has_topk_length:
         topk_length = torch.randint(1, topk_k + 1, (total_s_q,), dtype=torch.int32, device=device)
+        # Empty compactified rows are valid: attention falls back entirely to
+        # the sink and all Q/KV gradients for that row are zero.
+        topk_length[0] = 0
 
     return q, kv, attn_sink, topk_idxs, topk_length
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("head_dim", [512, 576])
+def test_sparse_attention_reference_supports_empty_rows(head_dim):
+    """Keep the D=576 value width and sink-only rows numerically well-defined."""
+
+    torch.manual_seed(0)
+    total_q, total_kv, num_heads, topk = 2, 3, 2, 2
+    q = torch.randn(total_q, num_heads, head_dim, dtype=torch.float32, requires_grad=True)
+    kv = torch.randn(total_kv, head_dim, dtype=torch.float32, requires_grad=True)
+    attn_sink = torch.randn(num_heads, dtype=torch.float32, requires_grad=True)
+    topk_idxs = torch.tensor([[0, 1], [1, 2]], dtype=torch.int32)
+    topk_length = torch.tensor([0, topk], dtype=torch.int32)
+
+    out, lse = ref_sparse_attention_forward(
+        q,
+        kv,
+        attn_sink,
+        topk_idxs,
+        topk_length=topk_length,
+    )
+    out.sum().backward()
+
+    head_dim_v = 512 if head_dim == 576 else head_dim
+    assert out.shape == (total_q, num_heads, head_dim_v)
+    assert torch.isneginf(lse[0]).all()
+    assert torch.isfinite(q.grad).all()
+    assert torch.isfinite(kv.grad).all()
+    assert torch.isfinite(attn_sink.grad).all()
+    assert torch.count_nonzero(q.grad[0]) == 0
 
 
 @pytest.mark.L0
@@ -93,21 +127,18 @@ def test_DSA_sparse_attention_backward_wrapper(
     )
     dout = torch.randn_like(out)
 
-    try:
-        result = DSA.sparse_attention_backward_wrapper(
-            q,
-            kv,
-            out,
-            dout,
-            lse,
-            attn_sink,
-            topk_idxs,
-            softmax_scale=softmax_scale,
-            topk_length=topk_length,
-            stream=stream,
-        )
-    except (ValueError, NotImplementedError, RuntimeError) as e:
-        pytest.skip(f"Unsupported testcase: {e}")
+    result = DSA.sparse_attention_backward_wrapper(
+        q,
+        kv,
+        out,
+        dout,
+        lse,
+        attn_sink,
+        topk_idxs,
+        softmax_scale=softmax_scale,
+        topk_length=topk_length,
+        stream=stream,
+    )
 
     dq, dkv, d_sink = result["dq"], result["dkv"], result["d_sink"]
 

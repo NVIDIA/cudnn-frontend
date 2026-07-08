@@ -6,7 +6,13 @@ from importlib import import_module
 _SYMBOLS = {
     "block_sparse_attention_forward": (".api", "block_sparse_attention_forward"),
     "block_sparse_attention_backward": (".api", "block_sparse_attention_backward"),
+    "BlockSparseAttentionForwardOp": (".op", "BlockSparseAttentionForwardOp"),
+    "BlockSparseAttentionBackwardOp": (".op", "BlockSparseAttentionBackwardOp"),
 }
+
+_BSA_SYMBOLS = frozenset(
+    {"block_sparse_attention_forward", "block_sparse_attention_backward"}
+)
 
 
 def _load_symbol(name):
@@ -27,11 +33,11 @@ def __getattr__(name):
 
 class BSANamespace:
     def __getattr__(self, name):
-        if name in _SYMBOLS:
+        if name in _BSA_SYMBOLS:
             return _load_symbol(name)
         raise AttributeError(f"BSA has no attribute {name!r}")
 
 
 BSA = BSANamespace()
 
-__all__ = ["BSA", *_SYMBOLS.keys()]
+__all__ = ["BSA", *_SYMBOLS]

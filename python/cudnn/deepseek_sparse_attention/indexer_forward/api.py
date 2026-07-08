@@ -26,8 +26,9 @@ from cudnn.deepseek_sparse_attention.utils.runtime import device_major, resolve_
 from .indexer_fwd_sm100 import IndexerForwardSm100
 from ._interface import indexer_fwd as indexer_fwd_sm100
 from ._interface_sm90 import indexer_fwd as indexer_fwd_sm90
+from .op import IndexerForwardOp, TMA_ALIGN_ELEMENTS
 
-TMA_ALIGN_ELEMS = 4  # FP32 output => seqlen_k padded to multiples of 4 (16 B)
+TMA_ALIGN_ELEMS = TMA_ALIGN_ELEMENTS
 
 
 class IndexerForward(APIBase):
@@ -66,6 +67,21 @@ class IndexerForward(APIBase):
         self.sm_scale = float(sm_scale)
         self.qhead_per_kv_head = qhead_per_kv_head
 
+        self._op = IndexerForwardOp(
+            q=self.q_desc,
+            k=self.k_desc,
+            weight=self.w_desc,
+            output=self.o_desc,
+            ratio=self.ratio,
+            qhead_per_kv_head=self.qhead_per_kv_head,
+            m_block_size=self.m_block_size,
+            n_block_size=self.n_block_size,
+            q_stage=self.q_stage,
+            kv_stage=self.kv_stage,
+            sm_scale=self.sm_scale,
+            target_compute_capability=100,
+        )
+
         self.batch_size = None
         self.s_q = None
         self.s_k = None
@@ -76,55 +92,7 @@ class IndexerForward(APIBase):
 
     def check_support(self) -> bool:
         self._logger.debug("Entering check_support")
-        self._value_error_if(
-            self.q_desc.ndim != 4,
-            f"Q must be 4-D (B, S_q, H_q, D), got {self.q_desc.shape}",
-        )
-        self._value_error_if(
-            self.k_desc.ndim != 4,
-            f"K must be 4-D (B, S_k, H_kv, D), got {self.k_desc.shape}",
-        )
-        self._value_error_if(
-            self.w_desc.ndim != 3,
-            f"W must be 3-D (B, S_q, H_q), got {self.w_desc.shape}",
-        )
-        self._value_error_if(
-            self.o_desc.ndim != 3,
-            f"Out must be 3-D (B, S_q, S_k_padded), got {self.o_desc.shape}",
-        )
-
-        b, s_q, h_q, d = self.q_desc.shape
-        b_k, s_k, h_kv, d_k = self.k_desc.shape
-        b_o, s_q_out, s_k_padded_from_out = self.o_desc.shape
-        self._value_error_if(b != b_k, f"Batch size mismatch Q={b} vs K={b_k}")
-        self._value_error_if(b != b_o, f"Batch size mismatch Q={b} vs Out={b_o}")
-        self._value_error_if(s_q != s_q_out, f"S_q mismatch Q={s_q} vs Out={s_q_out}")
-        self._value_error_if(d != d_k, f"Head dim mismatch Q={d} vs K={d_k}")
-        self._value_error_if(
-            d != 128,
-            f"IndexerForward is tuned for head_dim=128 only, got {d}",
-        )
-
-        qhpkv = self.qhead_per_kv_head if self.qhead_per_kv_head is not None else (h_q // h_kv)
-        self._value_error_if(
-            qhpkv * h_kv != h_q,
-            f"qhead_per_kv_head * h_kv != h_q ({qhpkv} * {h_kv} != {h_q})",
-        )
-        self._value_error_if(
-            qhpkv not in (32, 64),
-            f"qhead_per_kv_head must be 32 or 64, got {qhpkv}",
-        )
-        self.qhead_per_kv_head = qhpkv
-
-        self._check_dtype(self.q_desc, torch.bfloat16, name="Q")
-        self._check_dtype(self.k_desc, torch.bfloat16, name="K")
-        self._check_dtype(self.w_desc, torch.bfloat16, name="W")
-        self._check_dtype(self.o_desc, torch.float32, name="Out")
-
-        self._value_error_if(
-            s_k_padded_from_out % TMA_ALIGN_ELEMS != 0,
-            f"Out seqlen_k dim must be a multiple of {TMA_ALIGN_ELEMS}, got {s_k_padded_from_out}",
-        )
+        self._op.check_support()
 
         major = device_major()
         self._runtime_error_if(
@@ -132,13 +100,14 @@ class IndexerForward(APIBase):
             f"IndexerForward requires SM100+ compute capability, found SM{major}",
         )
 
-        self.batch_size = b
-        self.s_q = s_q
-        self.s_k = s_k
-        self.s_k_padded = s_k_padded_from_out
-        self.h_q = h_q
-        self.h_kv = h_kv
-        self.head_dim = d
+        self.batch_size = self._op.batch_size
+        self.s_q = self._op.s_q
+        self.s_k = self._op.s_k
+        self.s_k_padded = self.o_desc.shape[-1]
+        self.h_q = self._op.h_q
+        self.h_kv = self._op.h_kv
+        self.head_dim = self._op.head_dim
+        self.qhead_per_kv_head = self._op.qhead_per_kv_head
         self._is_supported = True
         return True
 
@@ -172,6 +141,7 @@ class IndexerForward(APIBase):
             cutlass.Float32(self.sm_scale),
             None,
             None,
+            None,
             fake_stream,
             options=compile_options(),
         )
@@ -189,6 +159,7 @@ class IndexerForward(APIBase):
                 cutlass.Int32(self.s_q),
                 cutlass.Int32(self.s_k),
                 cutlass.Float32(self.sm_scale),
+                None,
                 None,
                 None,
                 stream,

@@ -17,17 +17,30 @@ import cuda.bindings.driver as cuda
 from cudnn.api_base import APIBase, TupleDict
 
 from . import _interface_sm100 as _iface_sm100
+from .op import DenseScoreRecomputeOp, SparseScoreRecomputeOp
 
 # ---------------------------------------------------------------------------
 # Base helpers
 # ---------------------------------------------------------------------------
 
 
-def _check_score_arch(api: APIBase) -> None:
-    major, _ = torch.cuda.get_device_capability()
+def _check_score_arch(api: APIBase) -> int:
+    major, minor = torch.cuda.get_device_capability()
     api._runtime_error_if(
         major != 9 and major < 10,
         f"{type(api).__name__} requires SM90 or SM100+ compute capability, found SM{major}",
+    )
+    return major * 10 + minor
+
+
+def _compact_for_kernel(desc):
+    if desc is None:
+        return None
+    return desc.compact_like(
+        cudnn_dtype=desc.cudnn_dtype,
+        shape=desc.shape,
+        name=desc.name,
+        init_value=desc.init_value,
     )
 
 
@@ -50,36 +63,6 @@ class _ScoreRecomputeBase(APIBase):
         # kernel launch, so this API validates eagerly and lets the backend cache
         # compile on first execute().
         self._compiled_kernel = True
-
-
-def _check_sparse_score_shapes(
-    api: APIBase,
-    q_desc,
-    k_desc,
-    aux_desc,
-    topk_desc,
-    out_desc,
-    topk_length_desc,
-    aux_name: str,
-    qhead_per_kv_head: Optional[int],
-) -> None:
-    api._value_error_if(q_desc.ndim != 4, f"Q must be 4-D (B, S_q, H_q, D), got {q_desc.shape}")
-    api._value_error_if(k_desc.ndim != 3, f"K must be 3-D (B, S_k, D) MQA, got {k_desc.shape}")
-    api._value_error_if(aux_desc.ndim != 3, f"{aux_name} must be 3-D (B, S_q, H_q), got {aux_desc.shape}")
-    api._value_error_if(topk_desc.ndim != 3, f"topk_indices must be 3-D (B, S_q, topk), got {topk_desc.shape}")
-    api._value_error_if(out_desc.ndim != 3, f"out must be 3-D (B, S_q, topk), got {out_desc.shape}")
-
-    b, s_q, h_q, d = q_desc.shape
-    api._value_error_if(k_desc.shape[0] != b, f"K batch dim {k_desc.shape[0]} must match Q batch dim {b}")
-    api._value_error_if(k_desc.shape[2] != d, f"K head dim {k_desc.shape[2]} must match Q head dim {d}")
-    api._value_error_if(aux_desc.shape != (b, s_q, h_q), f"{aux_name} shape must be {(b, s_q, h_q)}, got {aux_desc.shape}")
-    api._value_error_if(topk_desc.shape[:2] != (b, s_q), f"topk_indices leading dims must be {(b, s_q)}, got {topk_desc.shape[:2]}")
-    api._value_error_if(out_desc.shape != topk_desc.shape, f"out shape must match topk_indices shape {topk_desc.shape}, got {out_desc.shape}")
-    if qhead_per_kv_head is not None:
-        api._value_error_if(qhead_per_kv_head != h_q, f"qhead_per_kv_head must equal H_q ({h_q}) for MQA sparse score, got {qhead_per_kv_head}")
-    if topk_length_desc is not None:
-        api._check_dtype(topk_length_desc, torch.int32, name="topk_length")
-        api._value_error_if(topk_length_desc.shape != (b, s_q), f"topk_length must be shape {(b, s_q)}, got {topk_length_desc.shape}")
 
 
 def _check_dense_score_shapes(
@@ -154,25 +137,25 @@ class SparseIndexerScoreRecompute(_ScoreRecomputeBase):
         self.topk_length_desc = self._make_tensor_desc(sample_topk_length, name="sample_topk_length")
         self.qhead_per_kv_head = qhead_per_kv_head
         self.topk_indices_global = bool(topk_indices_global)
+        self._op = None
 
     def check_support(self) -> bool:
-        _check_score_arch(self)
-        self._check_dtype(self.q_desc, torch.bfloat16, name="Q")
-        self._check_dtype(self.k_desc, torch.bfloat16, name="K")
-        self._check_dtype(self.w_desc, torch.bfloat16, name="W")
-        self._check_dtype(self.topk_desc, torch.int32, name="topk_indices")
-        self._check_dtype(self.out_desc, torch.float32, name="out")
-        _check_sparse_score_shapes(
-            self,
-            self.q_desc,
-            self.k_desc,
-            self.w_desc,
-            self.topk_desc,
-            self.out_desc,
-            self.topk_length_desc,
-            "W",
-            self.qhead_per_kv_head,
-        )
+        target_compute_capability = _check_score_arch(self)
+        if self._op is None:
+            self._op = SparseScoreRecomputeOp(
+                q=_compact_for_kernel(self.q_desc),
+                k=_compact_for_kernel(self.k_desc),
+                per_head=_compact_for_kernel(self.w_desc),
+                topk_indices=_compact_for_kernel(self.topk_desc),
+                output=_compact_for_kernel(self.out_desc),
+                topk_length=_compact_for_kernel(self.topk_length_desc),
+                score_type="indexer",
+                softmax_scale=1.0,
+                qhead_per_kv_head=self.qhead_per_kv_head,
+                topk_indices_global=self.topk_indices_global,
+                target_compute_capability=target_compute_capability,
+            )
+        self._op.check_support()
         self._is_supported = True
         return True
 
@@ -269,7 +252,7 @@ def sparse_indexer_score_recompute_wrapper(
             qhead_per_kv_head=qhead_per_kv_head,
             topk_indices_global=topk_indices_global,
         )
-        assert obj.check_support()
+        obj.check_support()
         obj.compile()
         _cache_of_SparseIndexerScoreRecomputeObjects[key] = obj
 
@@ -320,25 +303,25 @@ class SparseAttnScoreRecompute(_ScoreRecomputeBase):
         self.softmax_scale = float(softmax_scale)
         self.qhead_per_kv_head = qhead_per_kv_head
         self.topk_indices_global = bool(topk_indices_global)
+        self._op = None
 
     def check_support(self) -> bool:
-        _check_score_arch(self)
-        self._check_dtype(self.q_desc, torch.bfloat16, name="Q")
-        self._check_dtype(self.k_desc, torch.bfloat16, name="K")
-        self._check_dtype(self.lse_desc, torch.float32, name="LSE")
-        self._check_dtype(self.topk_desc, torch.int32, name="topk_indices")
-        self._check_dtype(self.out_desc, torch.float32, name="out")
-        _check_sparse_score_shapes(
-            self,
-            self.q_desc,
-            self.k_desc,
-            self.lse_desc,
-            self.topk_desc,
-            self.out_desc,
-            self.topk_length_desc,
-            "LSE",
-            self.qhead_per_kv_head,
-        )
+        target_compute_capability = _check_score_arch(self)
+        if self._op is None:
+            self._op = SparseScoreRecomputeOp(
+                q=_compact_for_kernel(self.q_desc),
+                k=_compact_for_kernel(self.k_desc),
+                per_head=_compact_for_kernel(self.lse_desc),
+                topk_indices=_compact_for_kernel(self.topk_desc),
+                output=_compact_for_kernel(self.out_desc),
+                topk_length=_compact_for_kernel(self.topk_length_desc),
+                score_type="attention",
+                softmax_scale=self.softmax_scale,
+                qhead_per_kv_head=self.qhead_per_kv_head,
+                topk_indices_global=self.topk_indices_global,
+                target_compute_capability=target_compute_capability,
+            )
+        self._op.check_support()
         self._is_supported = True
         return True
 
@@ -442,7 +425,7 @@ def sparse_attn_score_recompute_wrapper(
             qhead_per_kv_head=qhead_per_kv_head,
             topk_indices_global=topk_indices_global,
         )
-        assert obj.check_support()
+        obj.check_support()
         obj.compile()
         _cache_of_SparseAttnScoreRecomputeObjects[key] = obj
 
@@ -524,9 +507,28 @@ class DenseIndexerScoreRecompute(_ScoreRecomputeBase):
         self.sm_scale = float(sm_scale)
         self.ratio = int(ratio)
         self.is_thd = bool(is_thd)
+        self._op = None
 
     def check_support(self) -> bool:
-        _check_score_arch(self)
+        target_compute_capability = _check_score_arch(self)
+        if not self.is_thd:
+            if self._op is None:
+                self._op = DenseScoreRecomputeOp(
+                    q=_compact_for_kernel(self.q_desc),
+                    k=_compact_for_kernel(self.k_desc),
+                    per_head=_compact_for_kernel(self.w_desc),
+                    output=_compact_for_kernel(self.out_desc),
+                    denominator=_compact_for_kernel(self.denom_desc),
+                    score_type="indexer",
+                    scale=self.sm_scale,
+                    ratio=self.ratio,
+                    qhead_per_kv_head=self.qhead_per_kv_head,
+                    is_thd=False,
+                    target_compute_capability=target_compute_capability,
+                )
+            self._op.check_support()
+            self._is_supported = True
+            return True
         self._check_dtype(self.q_desc, torch.bfloat16, name="Q")
         self._check_dtype(self.k_desc, torch.bfloat16, name="K")
         self._check_dtype(self.w_desc, torch.bfloat16, name="W")
@@ -683,7 +685,7 @@ def dense_indexer_score_recompute_wrapper(
             ratio=ratio,
             is_thd=is_thd,
         )
-        assert obj.check_support()
+        obj.check_support()
         obj.compile()
         _cache_of_DenseIndexerScoreRecomputeObjects[key] = obj
 
@@ -735,9 +737,28 @@ class DenseAttnScoreRecompute(_ScoreRecomputeBase):
         self.qhead_per_kv_head = qhead_per_kv_head
         self.ratio = int(ratio)
         self.is_thd = bool(is_thd)
+        self._op = None
 
     def check_support(self) -> bool:
-        _check_score_arch(self)
+        target_compute_capability = _check_score_arch(self)
+        if not self.is_thd:
+            if self._op is None:
+                self._op = DenseScoreRecomputeOp(
+                    q=_compact_for_kernel(self.q_desc),
+                    k=_compact_for_kernel(self.k_desc),
+                    per_head=_compact_for_kernel(self.lse_desc),
+                    output=_compact_for_kernel(self.out_desc),
+                    denominator=_compact_for_kernel(self.denom_desc),
+                    score_type="attention",
+                    scale=self.softmax_scale,
+                    ratio=self.ratio,
+                    qhead_per_kv_head=self.qhead_per_kv_head,
+                    is_thd=False,
+                    target_compute_capability=target_compute_capability,
+                )
+            self._op.check_support()
+            self._is_supported = True
+            return True
         self._check_dtype(self.q_desc, torch.bfloat16, name="Q")
         self._check_dtype(self.k_desc, torch.bfloat16, name="K")
         self._check_dtype(self.lse_desc, torch.float32, name="LSE")
@@ -894,7 +915,7 @@ def dense_attn_score_recompute_wrapper(
             ratio=ratio,
             is_thd=is_thd,
         )
-        assert obj.check_support()
+        obj.check_support()
         obj.compile()
         _cache_of_DenseAttnScoreRecomputeObjects[key] = obj
 
