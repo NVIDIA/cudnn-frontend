@@ -524,7 +524,9 @@ class PyGraph {
              std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> score_sum_exp,
              std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> sink_token,
              bool const unfuse_fma,
-             cudnn_frontend::AttentionImplementation_t const& implementation);
+             cudnn_frontend::AttentionImplementation_t const& implementation,
+             std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_q,
+             std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_kv);
 
     // MXFP8 SDPA forward - uses block-wise scale factors (E8M0 with F8_128x4 reordering)
     // return [o, stats, amax_o]
