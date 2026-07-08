@@ -46,6 +46,15 @@ def _make_mappings():
 _JAX_TO_CUDNN_DATA_TYPE, _CUDNN_TO_JAX_DATA_TYPE = _make_mappings()
 
 
+def normalize_jax_dtype(value: Any | None, default: Any, name: str) -> Any:
+    """Normalize a JAX dtype-like value and identify invalid arguments by name."""
+
+    try:
+        return jnp.dtype(default if value is None else value)
+    except TypeError as error:
+        raise TypeError(f"{name} must be a JAX dtype, got {value!r}") from error
+
+
 def jax_to_cudnn_dtype(dtype: Any) -> data_type:
     """Return the canonical cuDNN type for a JAX dtype-like value."""
 
@@ -61,4 +70,4 @@ def cudnn_to_jax_dtype(dtype: data_type) -> Any:
         raise ValueError(f"Unsupported JAX data type {dtype}") from error
 
 
-__all__ = ["cudnn_to_jax_dtype", "jax_to_cudnn_dtype"]
+__all__ = ["cudnn_to_jax_dtype", "jax_to_cudnn_dtype", "normalize_jax_dtype"]

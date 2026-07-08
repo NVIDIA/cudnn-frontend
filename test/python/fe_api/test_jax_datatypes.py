@@ -74,6 +74,14 @@ class JaxDataTypesTest(unittest.TestCase):
         self.assertEqual(self.module.cudnn_to_jax_dtype(_DataType.BFLOAT16), "bfloat16")
         self.assertEqual(self.module.cudnn_to_jax_dtype(_DataType.FLOAT), "float32")
 
+    def test_normalizes_dtype_values_and_defaults(self):
+        self.assertEqual(self.module.normalize_jax_dtype("bfloat16", "float32", "output_dtype"), "bfloat16")
+        self.assertEqual(self.module.normalize_jax_dtype(None, "float32", "output_dtype"), "float32")
+
+        with mock.patch.object(self.module.jnp, "dtype", side_effect=TypeError("invalid dtype")):
+            with self.assertRaisesRegex(TypeError, "output_dtype must be a JAX dtype, got 'invalid'"):
+                self.module.normalize_jax_dtype("invalid", "float32", "output_dtype")
+
     def test_unsupported_types_have_explicit_behavior(self):
         self.assertEqual(self.module.jax_to_cudnn_dtype("unsupported"), _DataType.NOT_SET)
         with self.assertRaisesRegex(ValueError, "Unsupported JAX data type"):

@@ -162,6 +162,7 @@ class JaxGemmSwigluContractTest(unittest.TestCase):
 
         datatypes = types.ModuleType(f"{internal_name}.datatypes")
         datatypes.jax_to_cudnn_dtype = lambda dtype: _DTYPE_TO_CUDNN.get(dtype, _DataType.NOT_SET)
+        datatypes.normalize_jax_dtype = lambda value, default, name: default if value is None else value
         datatypes.cudnn_to_jax_dtype = lambda dtype: _CUDNN_TO_DTYPE[dtype]
         sys.modules[datatypes.__name__] = datatypes
 

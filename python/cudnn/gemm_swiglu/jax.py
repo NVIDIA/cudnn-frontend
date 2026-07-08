@@ -16,19 +16,12 @@ from .. import data_type
 from .._cute_compiler import compile_options_for_target
 from .._dense_gemm import require_gemm_inputs
 from .._jax import JaxApiBase, JaxTensorDesc, TupleDict
-from .._jax.datatypes import jax_to_cudnn_dtype
+from .._jax.datatypes import jax_to_cudnn_dtype, normalize_jax_dtype
 from .._jax.gemm import gemm_a_mode, gemm_b_mode, gemm_output_mode
 from .._jax.layout import to_public_axes
 from .op import GemmSwigluSm100Op
 
 SUPPORTED_COMPUTE_CAPABILITIES = (100, 103, 107)
-
-
-def _normalize_dtype(value: Any | None, default: Any, name: str) -> Any:
-    try:
-        return jnp.dtype(default if value is None else value)
-    except TypeError as error:
-        raise TypeError(f"{name} must be a JAX dtype, got {value!r}") from error
 
 
 class GemmSwigluSm100(JaxApiBase):
@@ -74,13 +67,13 @@ class GemmSwigluSm100(JaxApiBase):
         )
         self.a_desc = self._to_tensor_desc(sample_a, "sample_a", mode=self.a_mode)
         self.b_desc = self._to_tensor_desc(sample_b, "sample_b", mode=self.b_mode)
-        self.acc_dtype = _normalize_dtype(acc_dtype, jnp.float32, "acc_dtype")
+        self.acc_dtype = normalize_jax_dtype(acc_dtype, jnp.float32, "acc_dtype")
 
         if (sample_ab12 is None) != (sample_c is None):
             raise ValueError("sample_ab12 and sample_c must be provided together")
         if sample_ab12 is None:
-            resolved_ab12_dtype = _normalize_dtype(ab12_dtype, jnp.float32, "ab12_dtype")
-            resolved_c_dtype = _normalize_dtype(c_dtype, jnp.float16, "c_dtype")
+            resolved_ab12_dtype = normalize_jax_dtype(ab12_dtype, jnp.float32, "ab12_dtype")
+            resolved_c_dtype = normalize_jax_dtype(c_dtype, jnp.float16, "c_dtype")
             self.ab12_desc, self.c_desc = self._default_output_descs(
                 resolved_ab12_dtype,
                 resolved_c_dtype,
@@ -151,7 +144,7 @@ class GemmSwigluSm100(JaxApiBase):
     ) -> None:
         if requested is None:
             return
-        requested_dtype = _normalize_dtype(requested, requested, name)
+        requested_dtype = normalize_jax_dtype(requested, requested, name)
         actual_dtype = jnp.dtype(desc.dtype)
         if requested_dtype != actual_dtype:
             raise ValueError(f"{name}={requested_dtype} does not match the explicit sample dtype {actual_dtype}")
