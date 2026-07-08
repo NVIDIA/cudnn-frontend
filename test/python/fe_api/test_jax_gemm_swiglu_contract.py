@@ -109,9 +109,8 @@ class JaxGemmSwigluContractTest(unittest.TestCase):
                 )
 
             @staticmethod
-            def _resolve_compute_capability(target, supported, operation_name, *, require_local=False):
+            def _resolve_compute_capability(target, supported, operation_name):
                 del operation_name
-                assert require_local
                 resolved = 100 if target is None else target
                 if resolved not in supported:
                     raise ValueError(f"unsupported target {resolved}")

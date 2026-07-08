@@ -17,45 +17,46 @@ def _jax_runtime():
 
 def _supported_gpu(jax, minimum=90):
     supported_targets = {90, 100, 103, 107}
-    for device in jax.local_devices():
-        if device.platform != "gpu":
-            continue
-        reported = getattr(device, "compute_capability", None)
-        if isinstance(reported, (tuple, list)):
-            major, minor = int(reported[0]), int(reported[1])
-        else:
-            text = str(reported)
-            if "." not in text:
-                continue
-            major_text, minor_text = text.split(".", 1)
-            major, minor = int(major_text), int(minor_text)
-        capability = major * 10 + minor
-        if capability >= minimum and capability in supported_targets:
-            return device, capability
-    pytest.skip(f"A supported JAX SM{minimum}+ GPU is not available")
-
-
-@pytest.fixture
-def disabled_device_checks():
-    _jax_runtime()
-    from cudnn.jax import disable_device_compatibility_checks
-
-    disable_device_compatibility_checks(True)
     try:
-        yield
-    finally:
-        disable_device_compatibility_checks(False)
+        devices = tuple(jax.local_devices(backend="gpu"))
+    except RuntimeError as error:
+        pytest.skip(f"A JAX GPU is not available: {error}")
+    if not devices:
+        pytest.skip("A JAX GPU is not available")
+
+    capabilities = []
+    for device in devices:
+        reported = getattr(device, "compute_capability", None)
+        try:
+            if isinstance(reported, (tuple, list)):
+                major, minor = int(reported[0]), int(reported[1])
+            else:
+                major_text, minor_text = str(reported).split(".", 1)
+                major, minor = int(major_text), int(minor_text)
+        except (TypeError, ValueError):
+            pytest.skip(f"JAX reported an unsupported compute capability {reported!r}")
+        capabilities.append(major * 10 + minor)
+
+    if len(set(capabilities)) != 1:
+        pytest.skip(f"DSA indexers require homogeneous local GPU targets, found {capabilities}")
+    capability = capabilities[0]
+    if capability < minimum or capability not in supported_targets:
+        pytest.skip(f"A supported JAX SM{minimum}+ GPU is not available")
+    return devices[0], capability
 
 
 @pytest.mark.L0
-def test_jax_dsa_indexer_abstract_shapes(disabled_device_checks):
+def test_jax_dsa_indexer_abstract_shapes(monkeypatch):
     jax, jnp = _jax_runtime()
+    from cudnn._jax import JaxApiBase
     from cudnn.jax import (
         compactify_wrapper,
         indexer_forward_wrapper,
         indexer_top_k_wrapper,
         local_to_global_wrapper,
     )
+
+    monkeypatch.setattr(JaxApiBase, "_local_gpu_capabilities", staticmethod(lambda _operation_name: ((object(), 100),)))
 
     q = jax.ShapeDtypeStruct((1, 4, 32, 128), jnp.bfloat16)
     k = jax.ShapeDtypeStruct((1, 5, 1, 128), jnp.bfloat16)
@@ -174,7 +175,7 @@ def test_jax_dsa_indexer_abstract_shapes(disabled_device_checks):
 
 
 @pytest.mark.L0
-def test_jax_indexer_forward_jit_and_numerics(disabled_device_checks):
+def test_jax_indexer_forward_jit_and_numerics():
     jax, jnp = _jax_runtime()
     device, capability = _supported_gpu(jax, 90)
     from cudnn.jax import indexer_forward_wrapper
@@ -251,7 +252,7 @@ def test_jax_indexer_forward_jit_and_numerics(disabled_device_checks):
 
 
 @pytest.mark.L0
-def test_jax_indexer_top_k_jit_and_numerics(disabled_device_checks):
+def test_jax_indexer_top_k_jit_and_numerics():
     jax, jnp = _jax_runtime()
     device, capability = _supported_gpu(jax, 90)
     from cudnn.jax import indexer_top_k_wrapper

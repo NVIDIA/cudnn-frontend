@@ -356,13 +356,30 @@ class DsaIndexerJaxAdapterContractTest(unittest.TestCase):
             sys.modules[name] = package
 
         cls.jax_base = importlib.import_module(f"{cls._PACKAGE}._jax")
-        cls.jax_base.disable_device_compatibility_checks(True)
+
+        def resolve_compute_capability(
+            target_compute_capability,
+            supported_compute_capabilities,
+            operation_name,
+        ):
+            del operation_name
+            resolved = 100 if target_compute_capability is None else target_compute_capability
+            if resolved not in supported_compute_capabilities:
+                raise ValueError(f"unsupported synthetic target SM{resolved}")
+            return resolved
+
+        cls.target_resolution_patch = mock.patch.object(
+            cls.jax_base.JaxApiBase,
+            "_resolve_compute_capability",
+            staticmethod(resolve_compute_capability),
+        )
+        cls.target_resolution_patch.start()
         cls.forward = importlib.import_module(f"{dsa_name}.indexer_forward.jax")
         cls.topk = importlib.import_module(f"{dsa_name}.indexer_top_k.jax")
 
     @classmethod
     def tearDownClass(cls) -> None:
-        cls.jax_base.disable_device_compatibility_checks(False)
+        cls.target_resolution_patch.stop()
         for name in tuple(sys.modules):
             if name == cls._PACKAGE or name.startswith(f"{cls._PACKAGE}."):
                 sys.modules.pop(name, None)

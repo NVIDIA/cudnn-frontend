@@ -71,7 +71,6 @@ class GemmSwigluSm100(JaxApiBase):
             None,
             SUPPORTED_COMPUTE_CAPABILITIES,
             "GemmSwigluSm100",
-            require_local=True,
         )
         self.a_desc = self._to_tensor_desc(sample_a, "sample_a", mode=self.a_mode)
         self.b_desc = self._to_tensor_desc(sample_b, "sample_b", mode=self.b_mode)

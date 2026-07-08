@@ -112,12 +112,6 @@ class JaxApiBaseTest(unittest.TestCase):
             if name == _PACKAGE or name.startswith(f"{_PACKAGE}."):
                 sys.modules.pop(name, None)
 
-    def setUp(self) -> None:
-        self.module.disable_device_compatibility_checks(False)
-
-    def tearDown(self) -> None:
-        self.module.disable_device_compatibility_checks(False)
-
     def test_checks_all_local_jax_gpu_compute_capabilities(self):
         jax = types.ModuleType("jax")
 
@@ -143,12 +137,12 @@ class JaxApiBaseTest(unittest.TestCase):
                     operation_name="TestOp",
                 )
 
-    def test_requires_an_explicit_opt_out_without_a_local_jax_gpu(self):
+    def test_requires_a_local_jax_gpu(self):
         jax = types.ModuleType("jax")
         jax.local_devices = lambda *, backend: ()
 
         with mock.patch.dict(sys.modules, {"jax": jax}):
-            with self.assertRaisesRegex(RuntimeError, r"no local JAX GPU.*disable_device_compatibility_checks\(True\)"):
+            with self.assertRaisesRegex(RuntimeError, r"no local JAX GPU"):
                 self.module.JaxApiBase._check_device_compatibility(
                     minimum_compute_capability=100,
                     operation_name="TestOp",
@@ -162,7 +156,7 @@ class JaxApiBaseTest(unittest.TestCase):
 
         jax.local_devices = fail_discovery
         with mock.patch.dict(sys.modules, {"jax": jax}):
-            with self.assertRaisesRegex(RuntimeError, r"could not discover a local GPU.*disable_device_compatibility_checks\(True\)"):
+            with self.assertRaisesRegex(RuntimeError, r"could not discover a local GPU"):
                 self.module.JaxApiBase._check_device_compatibility(
                     minimum_compute_capability=100,
                     operation_name="TestOp",
@@ -170,32 +164,11 @@ class JaxApiBaseTest(unittest.TestCase):
 
         jax.local_devices = lambda *, backend: (_Device(0, "unknown"),)
         with mock.patch.dict(sys.modules, {"jax": jax}):
-            with self.assertRaisesRegex(RuntimeError, r"invalid compute capability 'unknown'.*disable_device_compatibility_checks\(True\)"):
+            with self.assertRaisesRegex(RuntimeError, r"invalid compute capability 'unknown'"):
                 self.module.JaxApiBase._check_device_compatibility(
                     minimum_compute_capability=100,
                     operation_name="TestOp",
                 )
-
-    def test_device_compatibility_checks_can_be_disabled_and_reenabled(self):
-        self.module.disable_device_compatibility_checks(True)
-        with mock.patch.dict(sys.modules, {"jax": None}):
-            self.module.JaxApiBase._check_device_compatibility(
-                minimum_compute_capability=100,
-                operation_name="TestOp",
-            )
-
-        self.module.disable_device_compatibility_checks(False)
-        jax = types.ModuleType("jax")
-        jax.local_devices = lambda *, backend: ()
-        with mock.patch.dict(sys.modules, {"jax": jax}):
-            with self.assertRaises(RuntimeError):
-                self.module.JaxApiBase._check_device_compatibility(
-                    minimum_compute_capability=100,
-                    operation_name="TestOp",
-                )
-
-        with self.assertRaisesRegex(TypeError, "disabled must be a bool"):
-            self.module.disable_device_compatibility_checks(1)
 
     def test_resolves_exact_local_target_for_multi_arch_operation(self):
         jax = types.ModuleType("jax")
@@ -215,27 +188,22 @@ class JaxApiBaseTest(unittest.TestCase):
         jax.local_devices = lambda *, backend: (_Device(0, "10.0"), _Device(1, "10.3"))
 
         with mock.patch.dict(sys.modules, {"jax": jax}):
-            with self.assertRaisesRegex(RuntimeError, r"heterogeneous targets.*target_compute_capability"):
+            with self.assertRaisesRegex(RuntimeError, r"heterogeneous targets"):
                 self.module.JaxApiBase._resolve_compute_capability(None, (90, 100, 103, 107), "TestOp")
 
-    def test_explicit_cross_compile_target_requires_opt_out(self):
+    def test_explicit_target_must_match_local_devices(self):
         jax = types.ModuleType("jax")
         jax.local_devices = lambda *, backend: (_Device(0, "10.0"),)
 
         with mock.patch.dict(sys.modules, {"jax": jax}):
             with self.assertRaisesRegex(RuntimeError, r"targets SM90.*found CudaDevice\(id=0\) \(SM100\)"):
                 self.module.JaxApiBase._resolve_compute_capability(90, (90, 100, 103, 107), "TestOp")
-
-        self.module.disable_device_compatibility_checks(True)
-        with mock.patch.dict(sys.modules, {"jax": None}):
             self.assertEqual(
-                self.module.JaxApiBase._resolve_compute_capability(90, (90, 100), "TestOp"),
-                90,
+                self.module.JaxApiBase._resolve_compute_capability(100, (90, 100, 103, 107), "TestOp"),
+                100,
             )
 
     def test_rejects_unknown_explicit_target_before_lowering(self):
-        self.module.disable_device_compatibility_checks(True)
-
         with self.assertRaisesRegex(ValueError, r"no kernel for SM101.*supported targets"):
             self.module.JaxApiBase._resolve_compute_capability(
                 101,
@@ -243,28 +211,13 @@ class JaxApiBaseTest(unittest.TestCase):
                 "TestOp",
             )
 
-    def test_implicit_target_still_needs_a_device_when_checks_are_disabled(self):
-        self.module.disable_device_compatibility_checks(True)
+    def test_implicit_target_requires_a_local_device(self):
         jax = types.ModuleType("jax")
         jax.local_devices = lambda *, backend: ()
 
         with mock.patch.dict(sys.modules, {"jax": jax}):
-            with self.assertRaisesRegex(RuntimeError, r"no local JAX GPU.*target_compute_capability"):
+            with self.assertRaisesRegex(RuntimeError, r"no local JAX GPU"):
                 self.module.JaxApiBase._resolve_compute_capability(None, (90, 100), "TestOp")
-
-    def test_require_local_keeps_device_resolution_strict(self):
-        self.module.disable_device_compatibility_checks(True)
-        jax = types.ModuleType("jax")
-        jax.local_devices = lambda *, backend: ()
-
-        with mock.patch.dict(sys.modules, {"jax": jax}):
-            with self.assertRaisesRegex(RuntimeError, r"no local JAX GPU.*requires a homogeneous supported local JAX GPU"):
-                self.module.JaxApiBase._resolve_compute_capability(
-                    None,
-                    (100, 103, 107),
-                    "TestOp",
-                    require_local=True,
-                )
 
     def test_converts_array_metadata_to_shared_tensor_desc(self):
         desc = self.module.JaxApiBase._to_tensor_desc(

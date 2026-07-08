@@ -143,20 +143,8 @@ results. Callers may instead provide both `sample_o` and `sample_amax` as
 explicit output placeholders. In either case, the common operation validates
 the complete signature through `check_support()`.
 
-By default, JAX support validation requires every local GPU to meet the
-operation's SM100 minimum. AOT or remote compilation without a compatible
-local target device requires an explicit process-wide opt-out before tracing:
-
-```python
-import cudnn.jax
-
-cudnn.jax.disable_device_compatibility_checks(True)
-lowered = rmsnorm_rht_amax_sm100.lower(x_spec, w_spec)
-```
-
-Pass `False` to re-enable the checks. Changing this setting does not
-invalidate existing JAX compilation-cache entries, so configure it before the
-first `jax.jit` or `lower` call for a signature.
+JAX support validation requires every local GPU to meet the operation's SM100
+minimum. Device-free AOT and remote compilation are not currently supported.
 
 The current JAX adapter models its buffers as row-major with the public and
 kernel axes in the same order. Additional JAX-specific axis mappings can be

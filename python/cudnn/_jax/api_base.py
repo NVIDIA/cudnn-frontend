@@ -14,24 +14,6 @@ from .. import data_type
 from .._tensor_desc import TensorDesc
 from .layout import compact_stride, normalize_mode, to_canonical_axes, to_cutlass_layout, to_public_axes
 
-_DEVICE_COMPATIBILITY_CHECKS_DISABLED = False
-_DEVICE_COMPATIBILITY_CHECK_DISABLE_HINT = "Call cudnn.jax.disable_device_compatibility_checks(True) before tracing for a different or unavailable local GPU."
-_TARGET_COMPUTE_CAPABILITY_HINT = "Pass target_compute_capability explicitly when tracing for AOT or on a host without the target GPU."
-
-
-def disable_device_compatibility_checks(disabled: bool) -> None:
-    """Enable or disable local-device compatibility checks for future traces.
-
-    This process-global setting does not invalidate existing JAX compilation
-    cache entries. Configure it before calling ``jax.jit`` or ``lower``.
-    """
-
-    if not isinstance(disabled, bool):
-        raise TypeError(f"disabled must be a bool, got {type(disabled).__name__}")
-
-    global _DEVICE_COMPATIBILITY_CHECKS_DISABLED
-    _DEVICE_COMPATIBILITY_CHECKS_DISABLED = disabled
-
 
 class JaxTensorDesc(TensorDesc[Any]):
     """Framework-neutral tensor metadata backed by a JAX dtype."""
@@ -150,17 +132,13 @@ class JaxApiBase(ABC):
         target_compute_capability: int | None,
         supported_compute_capabilities: tuple[int, ...],
         operation_name: str,
-        *,
-        require_local: bool = False,
     ) -> int:
         """Resolve an exact JAX compilation target for a multi-arch adapter.
 
         ``supported_compute_capabilities`` lists the exact CuTe compilation
         targets implemented by the adapter. The returned value remains exact
         (for example ``103``) so the compiler selects the matching target.
-        With compatibility checks enabled, an explicit target must match every
-        local GPU exactly. Disable checks for cross-compilation. ``require_local``
-        keeps local-device resolution mandatory even when checks are disabled.
+        An explicit target must match every local GPU exactly.
         """
 
         supported = tuple(sorted(set(supported_compute_capabilities)))
@@ -175,32 +153,23 @@ class JaxApiBase(ABC):
             if target_compute_capability not in supported:
                 supported_text = ", ".join(f"SM{value}" for value in supported)
                 raise ValueError(f"{operation_name} has no kernel for SM{target_compute_capability}; supported targets are {supported_text}")
-            if _DEVICE_COMPATIBILITY_CHECKS_DISABLED and not require_local:
-                return target_compute_capability
-
             local = JaxApiBase._local_gpu_capabilities(operation_name)
             if not local:
-                raise RuntimeError(
-                    f"{operation_name} targets SM{target_compute_capability}, but no local JAX GPU is available. " f"{_DEVICE_COMPATIBILITY_CHECK_DISABLE_HINT}"
-                )
+                raise RuntimeError(f"{operation_name} targets SM{target_compute_capability}, but no local JAX GPU is available")
             mismatched = tuple((device, capability) for device, capability in local if capability != target_compute_capability)
             if mismatched:
                 found = ", ".join(f"{device} (SM{capability})" for device, capability in mismatched)
-                raise RuntimeError(f"{operation_name} targets SM{target_compute_capability}, but found {found}. " f"{_DEVICE_COMPATIBILITY_CHECK_DISABLE_HINT}")
+                raise RuntimeError(f"{operation_name} targets SM{target_compute_capability}, but found {found}")
             return target_compute_capability
 
-        local_target_hint = "This operation requires a homogeneous supported local JAX GPU." if require_local else _TARGET_COMPUTE_CAPABILITY_HINT
-        try:
-            local = JaxApiBase._local_gpu_capabilities(operation_name)
-        except RuntimeError as error:
-            raise RuntimeError(f"{error}. {local_target_hint}") from error
+        local = JaxApiBase._local_gpu_capabilities(operation_name)
         if not local:
-            raise RuntimeError(f"{operation_name}: no local JAX GPU is available. {local_target_hint}")
+            raise RuntimeError(f"{operation_name}: no local JAX GPU is available")
 
         capabilities = tuple(sorted({capability for _, capability in local}))
         if len(capabilities) != 1:
             found = ", ".join(f"SM{capability}" for capability in capabilities)
-            raise RuntimeError(f"{operation_name}: local JAX GPUs have heterogeneous targets ({found}). {local_target_hint}")
+            raise RuntimeError(f"{operation_name}: local JAX GPUs have heterogeneous targets ({found})")
 
         resolved = capabilities[0]
         if resolved not in supported:
@@ -216,11 +185,8 @@ class JaxApiBase(ABC):
     ) -> None:
         """Require every local JAX GPU to satisfy an operation's minimum SM."""
 
-        if _DEVICE_COMPATIBILITY_CHECKS_DISABLED:
-            return
-
         def compatibility_error(reason: str) -> RuntimeError:
-            return RuntimeError(f"{operation_name} requires SM{minimum_compute_capability}+, {reason}. " f"{_DEVICE_COMPATIBILITY_CHECK_DISABLE_HINT}")
+            return RuntimeError(f"{operation_name} requires SM{minimum_compute_capability}+, {reason}")
 
         try:
             devices = JaxApiBase._local_gpu_capabilities(operation_name)
@@ -499,4 +465,4 @@ class JaxApiBase(ABC):
         return self
 
 
-__all__ = ["JaxApiBase", "JaxTensorDesc", "disable_device_compatibility_checks"]
+__all__ = ["JaxApiBase", "JaxTensorDesc"]

@@ -42,7 +42,7 @@ def test_jax_dsa_backward_abstract_wrappers(monkeypatch):
     """Trace every backward signature on a CPU-only JAX installation."""
 
     jax, jnp = _jax_runtime()
-    from cudnn._jax import JaxApiBase, disable_device_compatibility_checks
+    from cudnn._jax import JaxApiBase
     from cudnn.deepseek_sparse_attention.indexer_backward.jax import (
         dense_indexer_backward_wrapper,
         indexer_backward_wrapper,
@@ -53,8 +53,23 @@ def test_jax_dsa_backward_abstract_wrappers(monkeypatch):
         return tuple(jnp.empty(desc.shape, dtype=desc.dtype) for desc in output_descs)
 
     monkeypatch.setattr(JaxApiBase, "_call_kernel", abstract_call)
-    disable_device_compatibility_checks(True)
-    try:
+
+    def resolve_compute_capability(
+        target_compute_capability,
+        supported_compute_capabilities,
+        operation_name,
+    ):
+        del operation_name
+        resolved = 100 if target_compute_capability is None else target_compute_capability
+        assert resolved in supported_compute_capabilities
+        return resolved
+
+    with monkeypatch.context() as target_resolution:
+        target_resolution.setattr(
+            JaxApiBase,
+            "_resolve_compute_capability",
+            staticmethod(resolve_compute_capability),
+        )
         q = jax.ShapeDtypeStruct((1, 2, 64, 128), jnp.bfloat16)
         weights = jax.ShapeDtypeStruct((1, 2, 64), jnp.bfloat16)
         k = jax.ShapeDtypeStruct((1, 128, 128), jnp.bfloat16)
@@ -195,8 +210,6 @@ def test_jax_dsa_backward_abstract_wrappers(monkeypatch):
         assert attention["dq"].shape == attn_q.shape
         assert attention["dkv"].shape == attn_kv.shape
         assert attention["d_sink"].shape == sink.shape
-    finally:
-        disable_device_compatibility_checks(False)
 
 
 @pytest.mark.L0

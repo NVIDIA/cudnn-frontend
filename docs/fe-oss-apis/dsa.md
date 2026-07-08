@@ -185,26 +185,8 @@ and `d_index_k`.
 
 `target_compute_capability` is the exact compilation target, such as `90`,
 `100`, `103`, or `107`. When it is omitted, the adapter infers it from a
-homogeneous set of local JAX GPUs. With compatibility checks enabled, an
-explicit target must match every local GPU.
-
-For AOT or remote compilation without the target GPU, disable the local-device
-check and provide the target before tracing:
-
-```python
-cudnn_jax.disable_device_compatibility_checks(True)
-lowered = cudnn_jax.indexer_forward_wrapper.lower(
-    q_spec,
-    k_spec,
-    w_spec,
-    target_compute_capability=100,
-)
-```
-
-Pass `False` to re-enable checks. This process-wide setting only disables the
-local-device validation; it does not enable an unsupported kernel target.
-Changing it does not invalidate existing JAX compilation-cache entries, so
-configure it before the first `jax.jit` or `lower` call for a signature.
+homogeneous set of local JAX GPUs. An explicit target must match every local
+GPU. Device-free AOT and remote compilation are not currently supported.
 
 ### JAX support matrix
 

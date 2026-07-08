@@ -342,10 +342,6 @@ class RmsNormImportContractTest(unittest.TestCase):
             any(isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "cutlass_call" for node in ast.walk(jax_adapter))
         )
         self.assertIn("_INSTALL_HINT", {node.id for node in ast.walk(jax_facade_tree) if isinstance(node, ast.Name)})
-        self.assertIn(
-            "disable_device_compatibility_checks",
-            {alias.name for node in ast.walk(jax_facade_tree) if isinstance(node, ast.ImportFrom) for alias in node.names},
-        )
         self.assertTrue(any(isinstance(node, ast.Attribute) and node.attr == "is_available" for node in ast.walk(jax_facade_tree)))
         self.assertTrue(any(isinstance(node, ast.Try) for node in jax_facade_tree.body))
         self.assertTrue(any(isinstance(node, ast.Import) and any(alias.name == "jax" for alias in node.names) for node in jax_tree.body))

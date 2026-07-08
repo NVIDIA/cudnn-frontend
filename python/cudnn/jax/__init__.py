@@ -32,7 +32,7 @@ if not _cutlass_jax.is_available():
         f"Install the optional JAX dependencies with `{_INSTALL_HINT}`."
     )
 
-from .._jax import JaxApiBase, JaxTensorDesc, TupleDict, disable_device_compatibility_checks  # noqa: E402
+from .._jax import JaxApiBase, JaxTensorDesc, TupleDict  # noqa: E402
 
 _OPERATION_EXPORTS = {
     "RmsNormRhtAmaxSm100": ("..rmsnorm_rht_amax.jax", "RmsNormRhtAmaxSm100"),
@@ -118,6 +118,5 @@ __all__ = [
     "JaxApiBase",
     "JaxTensorDesc",
     "TupleDict",
-    "disable_device_compatibility_checks",
     *_OPERATION_EXPORTS,
 ]

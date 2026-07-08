@@ -45,27 +45,18 @@ def _sm100_device(jax):
     return devices[0], capabilities[0]
 
 
-@pytest.fixture
-def disabled_device_checks():
-    _jax_runtime()
-    from cudnn.jax import disable_device_compatibility_checks
-
-    disable_device_compatibility_checks(True)
-    try:
-        yield
-    finally:
-        disable_device_compatibility_checks(False)
-
-
 @pytest.mark.L0
-def test_jax_score_recompute_eval_shapes(disabled_device_checks):
+def test_jax_score_recompute_eval_shapes(monkeypatch):
     jax, jnp = _jax_runtime()
+    from cudnn._jax import JaxApiBase
     from cudnn.jax import (
         dense_attn_score_recompute_wrapper,
         dense_indexer_score_recompute_wrapper,
         sparse_attn_score_recompute_wrapper,
         sparse_indexer_score_recompute_wrapper,
     )
+
+    monkeypatch.setattr(JaxApiBase, "_local_gpu_capabilities", staticmethod(lambda _operation_name: ((object(), 100),)))
 
     sparse_q = jax.ShapeDtypeStruct((1, 4, 32, 128), jnp.bfloat16)
     sparse_k = jax.ShapeDtypeStruct((1, 128, 128), jnp.bfloat16)
@@ -211,9 +202,8 @@ def test_jax_dense_score_recompute_jit_and_numerics():
 def test_jax_sparse_indexer_score_recompute_jit():
     jax, jnp = _jax_runtime()
     device, target_compute_capability = _sm100_device(jax)
-    from cudnn.jax import disable_device_compatibility_checks, sparse_indexer_score_recompute_wrapper
+    from cudnn.jax import sparse_indexer_score_recompute_wrapper
 
-    disable_device_compatibility_checks(False)
     batch, seqlen_q, seqlen_k = 1, 2, 128
     num_query_heads, head_dim, topk = 32, 128, 128
     q = jax.device_put(jax.random.normal(jax.random.key(10), (batch, seqlen_q, num_query_heads, head_dim), dtype=jnp.bfloat16), device)
@@ -251,9 +241,8 @@ def test_jax_sparse_indexer_score_recompute_jit():
 def test_jax_sparse_attn_score_recompute_jit():
     jax, jnp = _jax_runtime()
     device, target_compute_capability = _sm100_device(jax)
-    from cudnn.jax import disable_device_compatibility_checks, sparse_attn_score_recompute_wrapper
+    from cudnn.jax import sparse_attn_score_recompute_wrapper
 
-    disable_device_compatibility_checks(False)
     batch, seqlen_q, seqlen_k = 1, 2, 128
     num_query_heads, head_dim, topk = 32, 128, 128
     softmax_scale = head_dim**-0.5

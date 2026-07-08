@@ -22,25 +22,15 @@ def _hadamard_16(jnp):
     return jnp.asarray(values, dtype=jnp.float32) / math.sqrt(16)
 
 
-@pytest.fixture
-def device_compatibility_checks_disabled():
-    _jax_runtime()
-    from cudnn.jax import disable_device_compatibility_checks
-
-    disable_device_compatibility_checks(True)
-    try:
-        yield
-    finally:
-        disable_device_compatibility_checks(False)
-
-
 @pytest.mark.L0
-def test_jax_rmsnorm_rht_amax_abstract_contract(device_compatibility_checks_disabled):
+def test_jax_rmsnorm_rht_amax_abstract_contract(monkeypatch):
     jax, jnp = _jax_runtime()
 
     from cudnn import Op, TensorDesc
     from cudnn.jax import JaxApiBase, RmsNormRhtAmaxSm100, rmsnorm_rht_amax_sm100
     from cudnn.rmsnorm_rht_amax.op import RmsNormRhtAmaxSm100Op
+
+    monkeypatch.setattr(JaxApiBase, "_local_gpu_capabilities", staticmethod(lambda _operation_name: ((object(), 100),)))
 
     sample_x = jax.ShapeDtypeStruct((256, 2048), jnp.bfloat16)
     sample_weight = jax.ShapeDtypeStruct((2048,), jnp.bfloat16)
@@ -134,9 +124,7 @@ def test_jax_rmsnorm_rht_amax_jit():
     if not all_local_devices_are_supported:
         pytest.skip("RMSNorm + RHT requires every local JAX GPU to be SM100+")
 
-    from cudnn.jax import disable_device_compatibility_checks, rmsnorm_rht_amax_sm100
-
-    disable_device_compatibility_checks(False)
+    from cudnn.jax import rmsnorm_rht_amax_sm100
 
     device = gpu_devices[0]
     m, n = 256, 2048
