@@ -355,6 +355,7 @@ class JaxApiBase(ABC):
         self,
         inputs: tuple[Any, ...],
         *,
+        launch: Callable[..., None],
         output_descs: tuple[TensorDesc[Any], ...],
         workspace_descs: tuple[TensorDesc[Any], ...] = (),
         input_spec: tuple[Any | None, ...] | None = None,
@@ -364,10 +365,10 @@ class JaxApiBase(ABC):
         compile_options: Any = None,
         use_static_tensors: bool = True,
     ) -> tuple[Any, ...]:
-        """Bind this adapter's launch hook to JAX and return public outputs.
+        """Bind an explicit kernel launcher to JAX and return public outputs.
 
-        CUTLASS JAX supplies the stream first; the launcher adapts that call to
-        the adapter's ``inputs, outputs, workspaces, stream`` launch hook. Workspaces
+        CUTLASS JAX supplies the stream first; the launcher receives
+        ``stream, *inputs, *outputs, *workspaces`` in that order. Workspaces
         are declared as custom-call results so XLA owns their lifetime, then
         omitted from this method's return value. Descriptors with a non-``None``
         ``init_value`` are materialized as JAX inputs and aliased to their
@@ -377,6 +378,9 @@ class JaxApiBase(ABC):
 
         import cutlass.jax as cutlass_jax
         import jax.numpy as jnp
+
+        if not callable(launch):
+            raise TypeError(f"launch must be callable, got {type(launch).__name__}")
 
         inputs = tuple(inputs)
         for index, value in enumerate(inputs):
@@ -451,7 +455,7 @@ class JaxApiBase(ABC):
                 ordered_buffers[index] = value
             output_buffers = tuple(ordered_buffers[: len(outputs)])
             workspace_buffers = tuple(ordered_buffers[len(outputs) :])
-            self._launch(tuple(kernel_inputs), output_buffers, workspace_buffers, stream)
+            launch(stream, *kernel_inputs, *output_buffers, *workspace_buffers)
 
         call = cutlass_jax.cutlass_call(
             launcher,
@@ -467,16 +471,6 @@ class JaxApiBase(ABC):
         if not isinstance(results, (tuple, list)):
             results = (results,)
         return tuple(results[: len(outputs)])
-
-    @abstractmethod
-    def _launch(
-        self,
-        inputs: tuple[Any, ...],
-        outputs: tuple[Any, ...],
-        workspaces: tuple[Any, ...],
-        stream: Any,
-    ) -> None:
-        """Launch the concrete CuTe kernel for one traced custom call."""
 
     @abstractmethod
     def check_support(self) -> bool:

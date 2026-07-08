@@ -189,7 +189,8 @@ class JaxIndexerBackwardContractTest(unittest.TestCase):
                 del desc
                 return _TensorSpec(mode=mode, divisibility=divisibility)
 
-            def _call_kernel(self, inputs, **options):
+            def _call_kernel(self, inputs, *, launch, **options):
+                options["launch"] = launch
                 JaxApiBase.captured_call = (inputs, options)
                 return tuple(_Array(desc.shape, cls.cudnn_to_dtype[desc.cudnn_dtype]) for desc in options["output_descs"])
 
@@ -437,7 +438,7 @@ class JaxIndexerBackwardContractTest(unittest.TestCase):
                 _RecordedKernel.events.clear()
                 api = self.module.IndexerBackward(*inputs, target_compute_capability=target)
                 api.check_support()
-                api._launch(kernel_inputs, outputs, workspace, object())
+                api._launch_kernel(object(), *kernel_inputs, *outputs, *workspace)
                 self.assertEqual(tuple(event[0] for event in _RecordedKernel.events), labels)
                 score_args = _RecordedKernel.events[0][2]
                 self.assertIs(score_args[-2 if target == 100 else -1], workspace[0])
@@ -472,7 +473,7 @@ class JaxIndexerBackwardContractTest(unittest.TestCase):
                     target_compute_capability=target,
                 )
                 api.check_support()
-                api._launch(kernel_inputs, outputs, workspace, object())
+                api._launch_kernel(object(), *kernel_inputs, *outputs, *workspace)
 
             self.assertEqual(tuple(event[0] for event in _RecordedKernel.events), labels)
             score_args = _RecordedKernel.events[0][2]
@@ -495,7 +496,7 @@ class JaxIndexerBackwardContractTest(unittest.TestCase):
             api = self.module.DenseIndexerBackward(*bshd, target_compute_capability=100)
             api.check_support()
             kernel_inputs = tuple(object() for _ in range(8))
-            api._launch(kernel_inputs, outputs, workspace, object())
+            api._launch_kernel(object(), *kernel_inputs, *outputs, *workspace)
         self.assertEqual(tuple(event[0] for event in _RecordedKernel.events), ("dense_score_100", "dense_gemm_100"))
         score_args = _RecordedKernel.events[0][2]
         self.assertIs(score_args[11], workspace[0])
@@ -518,7 +519,7 @@ class JaxIndexerBackwardContractTest(unittest.TestCase):
             )
             api.check_support()
             kernel_inputs = tuple(object() for _ in range(11))
-            api._launch(kernel_inputs, outputs, workspace, object())
+            api._launch_kernel(object(), *kernel_inputs, *outputs, *workspace)
         self.assertEqual(tuple(event[0] for event in _RecordedKernel.events), ("dense_score_90", "sparse_gemm_90"))
         score_args = _RecordedKernel.events[0][2]
         self.assertEqual(score_args[4:7], kernel_inputs[8:11])

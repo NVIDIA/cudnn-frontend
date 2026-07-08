@@ -10,8 +10,9 @@ This API supports two modes:
 1. **Standard mode**: High-precision GEMM with SwiGLU epilogue
 2. **Quantized mode** (block-scaled): Low-precision GEMM using block scaling supporting FP4 and FP8 data types
 
-The Torch API supports both modes. The initial JAX API supports standard mode;
-the block-scaled JAX surface will be added with the shared scale-factor ABI.
+The Torch and JAX APIs support both modes. JAX scale-factor arrays use an
+ordinary row-major public shape and are mapped to the kernel's packed ABI by
+the adapter.
 
 ### Shapes
 
@@ -226,6 +227,42 @@ operation = GemmSwigluSm100(
 result = operation(a, b)
 ```
 
+### JAX API (Block-Scaled Mode)
+
+Providing both `sfa_tensor` and `sfb_tensor` selects the block-scaled kernel.
+The output dtypes remain explicit because the wrapper defaults are unchanged
+from standard mode; MXFP8 callers must request a supported AB12 dtype.
+
+```python
+from cudnn.jax import gemm_swiglu_wrapper_sm100
+
+# A: (L, M, K), B: (L, N, K)
+# SFA/SFB: (L, row_tiles, k_tiles, 32, 4, 4)
+result = gemm_swiglu_wrapper_sm100(
+    a_fp8,
+    b_fp8,
+    sfa_tensor=sfa_e8m0,
+    sfb_tensor=sfb_e8m0,
+    sf_vec_size=32,
+    ab12_dtype=jnp.bfloat16,
+    c_dtype=jnp.bfloat16,
+    a_layout="LMK",
+    b_layout="LNK",
+    c_layout="LMN",
+)
+```
+
+For a scale tensor associated with `rows` and reduction extent `K`, the public
+JAX shape is
+`(L, ceil(rows/128), ceil(ceil(K/sf_vec_size)/4), 32, 4, 4)`.
+Its fixed mode `(3, 4, 1, 5, 2, 0)` binds that row-major array to the canonical
+kernel shape `(32, 4, ceil(rows/128), 4, k_tiles, L)`.
+
+The current JAX surface supports `C` in `float16`, `bfloat16`, or `float32`.
+FP8 `C`, SFC generation, and `norm_const_tensor` are disabled because none of
+the currently supported input configurations can use the kernel's FP8-C path.
+`result["sfc_tensor"]` is therefore `None`.
+
 Supported public layouts are:
 
 - A: `LMK` (K-major) or `LKM` (M-major)
@@ -265,7 +302,7 @@ also the Torch API order. JAX arrays use the public axis orders selected by
     - Quantized mode: Must be `n`-major for FP4 outputs
   - Dtype (`ab12_dtype`, provided as `ab12_dtype` argument for wrapper):
     - Standard mode: `{float32, float16, bfloat16}` if `acc_dtype == float32`, `{float16, bfloat16}` if `acc_dtype == float16`
-    - Quantized mode: `{float32, float16, bfloat16, float8_e4m3fn, float8_e5m2}`
+    - Quantized mode: `{float32, float16, bfloat16}`
 - Output tensor **C**: `result["c_tensor"]` (wrapper) or `sample_c`, `c_tensor` (class)
   - Shape: `(M, N/2, L)`
   - Stride: `(1, M, M·N/2)` for `m`-major or `(N/2, 1, M·N/2)` for `n`-major. Must match with `AB12`
@@ -279,10 +316,12 @@ also the Torch API order. JAX arrays use the public axis orders selected by
   - Input tensor **SFB** (B scale factor): `sfb_tensor` (wrapper) or `sample_sfb`, `sfb_tensor` (class)
     - Shape: `(32, 4, ceil(N/128), 4, ceil(ceil(K/sf_vec_size)/4), L)`
     - Dtype: Must match `SFA`
+    - JAX public shape for SFA/SFB is
+      `(L, row_tiles, k_tiles, 32, 4, 4)` as described above.
   - Output tensor **SFC** (C scale factor, **Optional**): `result["sfc_tensor"]` (wrapper) or `sample_sfc`, `sfc_tensor` (class)
     - Shape: `(32, 4, ceil(M/128), 4, ceil(ceil((N/2)/sf_vec_size)/4), L)`
     - Dtype: Must match `SFA`
-    - **Required when**: `c_dtype ∈ {float8_e4m3fn, float8_e5m2}`
+    - Reserved for FP8 `C`; current supported input combinations reject FP8 `C`
   - Output tensor **AMAX** (**Optional**): `result["amax_tensor"]` (wrapper) or `sample_amax`, `amax_tensor` (class)
     - Shape: `(1,)`
     - Dtype: `float32`
@@ -290,7 +329,7 @@ also the Torch API order. JAX arrays use the public axis orders selected by
   - Input tensor **Norm Const** (**Optional**): `norm_const_tensor` (wrapper) or `sample_norm_const`, `norm_const_tensor` (class)
     - Shape: `(1,)`
     - Dtype: `float32`
-    - **Required when**: `c_dtype ∈ {float8_e4m3fn, float8_e5m2}`
+    - Reserved for FP8 `C`; currently unsupported
 
 ### Common parameters
 
@@ -333,7 +372,12 @@ the exact local SM100-family compilation target while tracing.
 - `a_tensor`, `b_tensor`: see Input/Output tensors
 - Torch: `c_major` selects `"m"` or `"n"`; `ab12_dtype` defaults to `torch.float32`; `c_dtype` defaults to `torch.float16`.
 - JAX: `a_layout`, `b_layout`, and `c_layout` select public axis order; `ab12_dtype` defaults to `jnp.float32`; `c_dtype` defaults to `jnp.float16`.
-- Torch quantized mode: `sfa_tensor`, `sfb_tensor`, `norm_const_tensor`, `sf_vec_size`, `vector_f32`, and `ab12_stages` use the quantization rules above.
+- Torch quantized mode: `sfa_tensor`, `sfb_tensor`, `norm_const_tensor`,
+  `sf_vec_size`, `vector_f32`, and `ab12_stages` use the quantization rules
+  above.
+- JAX block-scaled mode: `sfa_tensor`, `sfb_tensor`, `sf_vec_size`,
+  `vector_f32`, and `ab12_stages` are supported. `norm_const_tensor` is
+  rejected while FP8 `C` remains disabled.
 
 ### Wrapper return values
 
@@ -355,7 +399,10 @@ Tuple unpacking order is always:
 #### `GemmSwigluSm100` (constructor)
 
 - `sample_a`, `sample_b`, `sample_ab12`, `sample_c` – see Input/Output tensors. JAX requires only the input samples and accepts the output samples optionally.
-- `sample_sfa`, `sample_sfb`, `sample_sfc`, `sample_amax`, `sample_norm_const` – Torch quantized mode only.
+- `sample_sfa`, `sample_sfb`, `sample_sfc`, `sample_amax`,
+  `sample_norm_const` – quantized-mode samples. JAX supports SFA/SFB and can
+  infer AMAX; it rejects SFC and norm-constant samples while FP8 `C` remains
+  disabled.
 
 #### `GemmSwigluSm100.execute`
 
@@ -391,11 +438,14 @@ The quantized kernel supports the following configurations:
 | **MXFP4** | `float4_e2m1fn_x2` or `uint8` | `float8_e4m3fn` | 16 | NVF4 variant |
 | **MXFP8** | `float8_e4m3fn` or `float8_e5m2` | `float8_e8m0fnu` | 32 | Standard MX FP8 |
 
+JAX uses its native logical `float4_e2m1fn` dtype for FP4 when that dtype is
+available in the installed JAX runtime. The raw `uint8` packed-FP4 alias is a
+Torch compatibility path and is not reinterpreted by the JAX adapter.
+
 Additional constraints:
 - `acc_dtype` must be `float32`
 - Not compatible with FP8 c_dtype. BF16 `c_dtype` is expected.
-- For MXFP8 inputs, ab12_dtype` should be float16 or bfloat16.
-- When `c_dtype ∈ {float8_e4m3fn, float8_e5m2}`: `sfc_tensor` and `norm_const_tensor` are required
+- For MXFP8 inputs, `ab12_dtype` should be float16 or bfloat16.
 - When `ab_dtype` is FP4 and `c_dtype == bfloat16`: `amax_tensor` is required
 - `c_dtype` and `ab12_dtype` cannot both be `float32`
 

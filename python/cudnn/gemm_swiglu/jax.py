@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Optional JAX API for the standard dense GEMM + SwiGLU kernel."""
+"""Optional JAX API for standard and block-scaled dense GEMM + SwiGLU."""
 
 from __future__ import annotations
 
@@ -17,9 +17,9 @@ from .._cute_compiler import compile_options_for_target
 from .._dense_gemm import require_gemm_inputs
 from .._jax import JaxApiBase, JaxTensorDesc, TupleDict
 from .._jax.datatypes import jax_to_cudnn_dtype, normalize_jax_dtype
-from .._jax.gemm import gemm_a_mode, gemm_b_mode, gemm_output_mode
+from .._jax.gemm import BLOCK_SCALE_MODE, gemm_a_mode, gemm_b_mode, gemm_output_mode
 from .._jax.layout import to_public_axes
-from .op import GemmSwigluSm100Op
+from .op import BlockScaledGemmSwigluSm100Op, GemmSwigluSm100Op
 
 SUPPORTED_COMPUTE_CAPABILITIES = (100, 103, 107)
 
@@ -31,9 +31,9 @@ class GemmSwigluSm100(JaxApiBase):
     order. Descriptors stored by the operation remain in the kernel's
     canonical ``MKL``, ``NKL``, and ``MNL`` orders.
 
-    This first JAX surface intentionally selects only the standard dense
-    kernel. Block-scaled inputs and quantized outputs are added separately so
-    their packed scale-factor ABI does not complicate the base contract.
+    Providing SFA and SFB samples selects the block-scaled kernel. Public scale
+    arrays are compact row-major ``[L, row_tiles, k_tiles, 32, 4, 4]`` arrays;
+    the adapter maps them to the kernel's packed scale-factor layout.
     """
 
     def __init__(
@@ -43,6 +43,11 @@ class GemmSwigluSm100(JaxApiBase):
         *,
         sample_ab12: Any | None = None,
         sample_c: Any | None = None,
+        sample_sfa: Any | None = None,
+        sample_sfb: Any | None = None,
+        sample_sfc: Any | None = None,
+        sample_amax: Any | None = None,
+        sample_norm_const: Any | None = None,
         alpha: float = 1.0,
         c_layout: str = "LMN",
         ab12_dtype: Any | None = None,
@@ -50,6 +55,9 @@ class GemmSwigluSm100(JaxApiBase):
         acc_dtype: Any | None = None,
         mma_tiler_mn: tuple[int, int] = (128, 128),
         cluster_shape_mn: tuple[int, int] | None = None,
+        sf_vec_size: int = 16,
+        vector_f32: bool = False,
+        ab12_stages: int = 4,
         a_layout: str = "LMK",
         b_layout: str = "LNK",
     ) -> None:
@@ -59,6 +67,8 @@ class GemmSwigluSm100(JaxApiBase):
         self.a_mode = gemm_a_mode(a_layout)
         self.b_mode = gemm_b_mode(b_layout)
         self.output_mode = gemm_output_mode(c_layout)
+        self.scale_mode = BLOCK_SCALE_MODE
+        self.sf_vec_size = sf_vec_size
 
         self.compute_capability = self._resolve_compute_capability(
             None,
@@ -68,6 +78,29 @@ class GemmSwigluSm100(JaxApiBase):
         self.a_desc = self._to_tensor_desc(sample_a, "sample_a", mode=self.a_mode)
         self.b_desc = self._to_tensor_desc(sample_b, "sample_b", mode=self.b_mode)
         self.acc_dtype = normalize_jax_dtype(acc_dtype, jnp.float32, "acc_dtype")
+        if sample_sfc is not None or sample_norm_const is not None:
+            raise NotImplementedError("The JAX GEMM + SwiGLU API does not expose FP8 C or SFC because the current supported input combinations reject FP8 C")
+
+        self.is_block_scaled = any(
+            sample is not None
+            for sample in (
+                sample_sfa,
+                sample_sfb,
+                sample_amax,
+            )
+        )
+        if self.is_block_scaled and (sample_sfa is None or sample_sfb is None):
+            raise ValueError("sample_sfa and sample_sfb are required for block-scaled GEMM + SwiGLU")
+        if not self.is_block_scaled:
+            if sf_vec_size != 16:
+                raise ValueError("sf_vec_size only applies to block-scaled GEMM + SwiGLU")
+            if vector_f32:
+                raise ValueError("vector_f32 only applies to block-scaled GEMM + SwiGLU")
+            if ab12_stages != 4:
+                raise ValueError("ab12_stages only applies to block-scaled GEMM + SwiGLU")
+        self.sfa_desc = None if sample_sfa is None else self._to_tensor_desc(sample_sfa, "sample_sfa", mode=self.scale_mode)
+        self.sfb_desc = None if sample_sfb is None else self._to_tensor_desc(sample_sfb, "sample_sfb", mode=self.scale_mode)
+        self.norm_const_desc = None
 
         if (sample_ab12 is None) != (sample_c is None):
             raise ValueError("sample_ab12 and sample_c must be provided together")
@@ -92,20 +125,51 @@ class GemmSwigluSm100(JaxApiBase):
             self._check_requested_output_dtype(ab12_dtype, self.ab12_desc, "ab12_dtype")
             self._check_requested_output_dtype(c_dtype, self.c_desc, "c_dtype")
 
+        self.sfc_desc = None
+        self.amax_desc = None
+        if self.c_desc.cudnn_dtype in {data_type.FP8_E4M3, data_type.FP8_E5M2}:
+            raise NotImplementedError("The JAX GEMM + SwiGLU API does not support FP8 C output")
+        if self.is_block_scaled:
+            needs_amax = self.a_desc.cudnn_dtype == data_type.FP4_E2M1 and self.c_desc.cudnn_dtype == data_type.BFLOAT16
+            if sample_amax is not None:
+                self.amax_desc = self._to_tensor_desc(sample_amax, "sample_amax", init_value=float("-inf"))
+            elif needs_amax:
+                self.amax_desc = self._default_amax_desc()
+
         acc_cudnn_dtype = jax_to_cudnn_dtype(self.acc_dtype)
         if acc_cudnn_dtype == data_type.NOT_SET:
             raise ValueError(f"Unsupported JAX accumulator dtype {self.acc_dtype}")
 
-        self._op = GemmSwigluSm100Op(
-            a=self.a_desc,
-            b=self.b_desc,
-            ab12=self.ab12_desc,
-            c=self.c_desc,
-            alpha=alpha,
-            acc_dtype=acc_cudnn_dtype,
-            mma_tiler_mn=mma_tiler_mn,
-            cluster_shape_mn=cluster_shape_mn,
-        )
+        if self.is_block_scaled:
+            self._op = BlockScaledGemmSwigluSm100Op(
+                a=self.a_desc,
+                b=self.b_desc,
+                sfa=self.sfa_desc,
+                sfb=self.sfb_desc,
+                ab12=self.ab12_desc,
+                c=self.c_desc,
+                sfc=self.sfc_desc,
+                amax=self.amax_desc,
+                norm_const=self.norm_const_desc,
+                alpha=alpha,
+                acc_dtype=acc_cudnn_dtype,
+                mma_tiler_mn=mma_tiler_mn,
+                cluster_shape_mn=cluster_shape_mn,
+                sf_vec_size=sf_vec_size,
+                vector_f32=vector_f32,
+                ab12_stages=ab12_stages,
+            )
+        else:
+            self._op = GemmSwigluSm100Op(
+                a=self.a_desc,
+                b=self.b_desc,
+                ab12=self.ab12_desc,
+                c=self.c_desc,
+                alpha=alpha,
+                acc_dtype=acc_cudnn_dtype,
+                mma_tiler_mn=mma_tiler_mn,
+                cluster_shape_mn=cluster_shape_mn,
+            )
         self.num_cluster_overlap_margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
 
     def _default_output_descs(
@@ -136,6 +200,13 @@ class GemmSwigluSm100(JaxApiBase):
             ),
         )
 
+    def _default_amax_desc(self) -> JaxTensorDesc:
+        return self._to_tensor_desc(
+            jax.ShapeDtypeStruct((1,), jnp.float32),
+            "sample_amax",
+            init_value=float("-inf"),
+        )
+
     @staticmethod
     def _check_requested_output_dtype(
         requested: Any | None,
@@ -152,66 +223,156 @@ class GemmSwigluSm100(JaxApiBase):
     def check_support(self) -> bool:
         return self._op.check_support()
 
-    def __call__(self, a_tensor: Any, b_tensor: Any) -> TupleDict:
+    def __call__(
+        self,
+        a_tensor: Any,
+        b_tensor: Any,
+        sfa_tensor: Any | None = None,
+        sfb_tensor: Any | None = None,
+        norm_const_tensor: Any | None = None,
+    ) -> TupleDict:
         self.check_support()
         self._check_tensor_signature(a_tensor, self.a_desc, mode=self.a_mode)
         self._check_tensor_signature(b_tensor, self.b_desc, mode=self.b_mode)
-        self._max_active_clusters = self._get_max_active_clusters(
+        if self.is_block_scaled:
+            if sfa_tensor is None or sfb_tensor is None:
+                raise ValueError("sfa_tensor and sfb_tensor are required for this block-scaled callable")
+            self._check_tensor_signature(sfa_tensor, self.sfa_desc, mode=self.scale_mode)
+            self._check_tensor_signature(sfb_tensor, self.sfb_desc, mode=self.scale_mode)
+            if norm_const_tensor is not None:
+                raise NotImplementedError("norm_const_tensor is unavailable because the JAX API does not support FP8 C output")
+        elif sfa_tensor is not None or sfb_tensor is not None or norm_const_tensor is not None:
+            raise ValueError("Scale-factor tensors are not part of this standard GEMM + SwiGLU callable")
+
+        max_active_clusters = self._get_max_active_clusters(
             self._op.cluster_shape_mn[0] * self._op.cluster_shape_mn[1],
             overlap_margin=self.num_cluster_overlap_margin,
         )
 
-        ab12_tensor, c_tensor = self._call_kernel(
-            (a_tensor, b_tensor),
-            output_descs=(self.ab12_desc, self.c_desc),
-            input_spec=(
-                self._to_tensor_spec(self.a_desc, mode=self.a_mode),
-                self._to_tensor_spec(self.b_desc, mode=self.b_mode),
-            ),
-            output_spec=(
-                self._to_tensor_spec(self.ab12_desc, mode=self.output_mode),
-                self._to_tensor_spec(self.c_desc, mode=self.output_mode),
-            ),
+        if not self.is_block_scaled:
+
+            def launch(
+                stream: Any,
+                a: Any,
+                b: Any,
+                ab12: Any,
+                c: Any,
+            ) -> None:
+                import cutlass
+                from cutlass.jax import jax_to_cutlass_dtype
+
+                from .dense_gemm_persistent_swiglu import PersistentDenseGemmKernel
+
+                kernel = PersistentDenseGemmKernel(
+                    acc_dtype=jax_to_cutlass_dtype(self.acc_dtype),
+                    use_2cta_instrs=self._op.mma_tiler_mn[0] == 256,
+                    mma_tiler_mn=self._op.mma_tiler_mn,
+                    cluster_shape_mn=self._op.cluster_shape_mn,
+                )
+                kernel(
+                    a,
+                    b,
+                    ab12,
+                    c,
+                    cutlass.Float32(self._op.alpha),
+                    max_active_clusters,
+                    stream,
+                )
+
+            ab12_tensor, c_tensor = self._call_kernel(
+                (a_tensor, b_tensor),
+                launch=launch,
+                output_descs=(self.ab12_desc, self.c_desc),
+                input_spec=(
+                    self._to_tensor_spec(self.a_desc, mode=self.a_mode),
+                    self._to_tensor_spec(self.b_desc, mode=self.b_mode),
+                ),
+                output_spec=(
+                    self._to_tensor_spec(self.ab12_desc, mode=self.output_mode),
+                    self._to_tensor_spec(self.c_desc, mode=self.output_mode),
+                ),
+                compile_options=compile_options_for_target(self.compute_capability),
+            )
+            return TupleDict(
+                ab12_tensor=ab12_tensor,
+                c_tensor=c_tensor,
+                sfc_tensor=None,
+                amax_tensor=None,
+            )
+
+        kernel_inputs = (a_tensor, b_tensor, sfa_tensor, sfb_tensor)
+        input_specs = (
+            self._to_tensor_spec(self.a_desc, mode=self.a_mode),
+            self._to_tensor_spec(self.b_desc, mode=self.b_mode),
+            self._to_tensor_spec(self.sfa_desc, mode=self.scale_mode),
+            self._to_tensor_spec(self.sfb_desc, mode=self.scale_mode),
+        )
+
+        output_descs = (self.ab12_desc, self.c_desc)
+        output_specs = (
+            self._to_tensor_spec(self.ab12_desc, mode=self.output_mode),
+            self._to_tensor_spec(self.c_desc, mode=self.output_mode),
+        )
+        if self.amax_desc is not None:
+            output_descs += (self.amax_desc,)
+            output_specs += (self._to_tensor_spec(self.amax_desc),)
+
+        def launch_block_scaled(
+            stream: Any,
+            a: Any,
+            b: Any,
+            sfa: Any,
+            sfb: Any,
+            ab12: Any,
+            c: Any,
+            *optional_outputs: Any,
+        ) -> None:
+            expected_optional_outputs = int(self.amax_desc is not None)
+            if len(optional_outputs) != expected_optional_outputs:
+                raise RuntimeError(f"GemmSwigluSm100 received {len(optional_outputs)} optional output buffers; expected {expected_optional_outputs}")
+            amax = optional_outputs[0] if self.amax_desc is not None else None
+
+            import cutlass
+
+            from .dense_blockscaled_gemm_persistent_swiglu_interleaved_quant import Sm100BlockScaledPersistentDenseGemmKernel
+
+            kernel = Sm100BlockScaledPersistentDenseGemmKernel(
+                sf_vec_size=self._op.sf_vec_size,
+                mma_tiler_mn=self._op.mma_tiler_mn,
+                cluster_shape_mn=self._op.cluster_shape_mn,
+                vector_f32=self._op.vector_f32,
+                ab12_stages=self._op.ab12_stages,
+            )
+            kernel(
+                a,
+                b,
+                sfa,
+                sfb,
+                c,
+                ab12,
+                amax,
+                None,
+                None,
+                cutlass.Float32(self._op.alpha),
+                max_active_clusters,
+                stream,
+            )
+
+        results = self._call_kernel(
+            kernel_inputs,
+            launch=launch_block_scaled,
+            output_descs=output_descs,
+            input_spec=input_specs,
+            output_spec=output_specs,
             compile_options=compile_options_for_target(self.compute_capability),
         )
+        ab12_tensor, c_tensor, *optional_results = results
+        amax_tensor = optional_results[0] if self.amax_desc is not None else None
         return TupleDict(
             ab12_tensor=ab12_tensor,
             c_tensor=c_tensor,
             sfc_tensor=None,
-            amax_tensor=None,
-        )
-
-    def _launch(
-        self,
-        inputs: tuple[Any, ...],
-        outputs: tuple[Any, ...],
-        workspaces: tuple[Any, ...],
-        stream: Any,
-    ) -> None:
-        if workspaces:
-            raise RuntimeError(f"GemmSwigluSm100 received unexpected workspaces: {len(workspaces)}")
-        a, b = inputs
-        ab12, c = outputs
-
-        import cutlass
-        from cutlass.jax import jax_to_cutlass_dtype
-
-        from .dense_gemm_persistent_swiglu import PersistentDenseGemmKernel
-
-        kernel = PersistentDenseGemmKernel(
-            acc_dtype=jax_to_cutlass_dtype(self.acc_dtype),
-            use_2cta_instrs=self._op.mma_tiler_mn[0] == 256,
-            mma_tiler_mn=self._op.mma_tiler_mn,
-            cluster_shape_mn=self._op.cluster_shape_mn,
-        )
-        kernel(
-            a,
-            b,
-            ab12,
-            c,
-            cutlass.Float32(self._op.alpha),
-            self._max_active_clusters,
-            stream,
+            amax_tensor=amax_tensor,
         )
 
 
@@ -225,6 +386,9 @@ class GemmSwigluSm100(JaxApiBase):
         "acc_dtype",
         "mma_tiler_mn",
         "cluster_shape_mn",
+        "sf_vec_size",
+        "vector_f32",
+        "ab12_stages",
         "a_layout",
         "b_layout",
     ),
@@ -239,15 +403,24 @@ def gemm_swiglu_wrapper_sm100(
     acc_dtype: Any | None = None,
     mma_tiler_mn: tuple[int, int] = (128, 128),
     cluster_shape_mn: tuple[int, int] | None = None,
+    sfa_tensor: Any | None = None,
+    sfb_tensor: Any | None = None,
+    norm_const_tensor: Any | None = None,
+    sf_vec_size: int = 16,
+    vector_f32: bool = False,
+    ab12_stages: int = 4,
     *,
     a_layout: str = "LMK",
     b_layout: str = "LNK",
 ) -> TupleDict:
-    """Compute the standard GEMM + SwiGLU projection on a local SM100-family GPU."""
+    """Compute standard or block-scaled GEMM + SwiGLU on a local SM100-family GPU."""
 
     return GemmSwigluSm100(
         jax.ShapeDtypeStruct(a_tensor.shape, a_tensor.dtype),
         jax.ShapeDtypeStruct(b_tensor.shape, b_tensor.dtype),
+        sample_sfa=None if sfa_tensor is None else jax.ShapeDtypeStruct(sfa_tensor.shape, sfa_tensor.dtype),
+        sample_sfb=None if sfb_tensor is None else jax.ShapeDtypeStruct(sfb_tensor.shape, sfb_tensor.dtype),
+        sample_norm_const=None if norm_const_tensor is None else jax.ShapeDtypeStruct(norm_const_tensor.shape, norm_const_tensor.dtype),
         alpha=alpha,
         c_layout=c_layout,
         ab12_dtype=ab12_dtype,
@@ -255,9 +428,12 @@ def gemm_swiglu_wrapper_sm100(
         acc_dtype=acc_dtype,
         mma_tiler_mn=mma_tiler_mn,
         cluster_shape_mn=cluster_shape_mn,
+        sf_vec_size=sf_vec_size,
+        vector_f32=vector_f32,
+        ab12_stages=ab12_stages,
         a_layout=a_layout,
         b_layout=b_layout,
-    )(a_tensor, b_tensor)
+    )(a_tensor, b_tensor, sfa_tensor, sfb_tensor, norm_const_tensor)
 
 
 __all__ = [

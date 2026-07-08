@@ -8,7 +8,10 @@ from .._operation_api import make_operation_api
 __all__, __getattr__, __dir__ = make_operation_api(
     globals(),
     exports={
-        "op": ("GemmSwigluSm100Op",),
+        "op": (
+            "BlockScaledGemmSwigluSm100Op",
+            "GemmSwigluSm100Op",
+        ),
         "api": (
             "GemmSwigluSm100",
             "gemm_swiglu_wrapper_sm100",

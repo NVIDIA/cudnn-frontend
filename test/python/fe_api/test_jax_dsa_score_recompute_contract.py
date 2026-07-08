@@ -107,11 +107,12 @@ class JaxDsaScoreRecomputeContractTest(unittest.TestCase):
                 if value.dtype != expected.cudnn_dtype:
                     raise ValueError(f"{expected.name} tensor dtype mismatch")
 
-            def _call_kernel(self, inputs, *, output_descs, workspace_descs=(), **options):
+            def _call_kernel(self, inputs, *, launch, output_descs, workspace_descs=(), **options):
                 self.captured_call = {
                     "inputs": tuple(inputs),
                     "outputs": tuple(output_descs),
                     "workspaces": tuple(workspace_descs),
+                    "launch": launch,
                     **options,
                 }
                 return tuple(_Array(desc.shape, desc.cudnn_dtype) for desc in output_descs)
@@ -356,8 +357,8 @@ class JaxDsaScoreRecomputeContractTest(unittest.TestCase):
                 sm100_module.__name__: sm100_module,
             },
         ):
-            sm90._launch(("q90", "k90", "aux90", "indices90"), ("out90",), (), "stream90")
-            sm100._launch(("q100", "k100", "aux100", "indices100"), ("out100",), ("dummy",), "stream100")
+            sm90._launch_kernel("stream90", "q90", "k90", "aux90", "indices90", "out90")
+            sm100._launch_kernel("stream100", "q100", "k100", "aux100", "indices100", "out100", "dummy")
 
         self.assertEqual(
             [entry for entry in calls if entry[0].endswith("call")],
@@ -423,8 +424,8 @@ class JaxDsaScoreRecomputeContractTest(unittest.TestCase):
                 sm100_module.__name__: sm100_module,
             },
         ):
-            sm90._launch(("q90", "k90", "aux90", "offset90"), ("out90", "denom90"), (), "stream90")
-            sm100._launch(("q100", "k100", "aux100", "offset100"), ("out100", "denom100"), (), "stream100")
+            sm90._launch_kernel("stream90", "q90", "k90", "aux90", "offset90", "out90", "denom90")
+            sm100._launch_kernel("stream100", "q100", "k100", "aux100", "offset100", "out100", "denom100")
 
         self.assertEqual(
             [entry for entry in calls if entry[0].endswith("call")],

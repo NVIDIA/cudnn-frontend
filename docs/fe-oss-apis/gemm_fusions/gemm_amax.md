@@ -103,6 +103,66 @@ op.compile()
 op.execute(a, b, sfa, sfb, c, amax, current_stream=None)
 ```
 
+### JAX API
+
+The JAX wrapper is decorated with `jax.jit`. GEMM arrays are compact row-major
+arrays whose public axis order is selected explicitly:
+
+```python
+import jax
+import jax.numpy as jnp
+
+from cudnn.jax import gemm_amax_wrapper_sm100
+
+# A: (L, M, K), B: (L, N, K)
+# SFA/SFB: (L, ceil(rows/128), K_tiles, 32, 4, 4)
+result = gemm_amax_wrapper_sm100(
+    a,
+    b,
+    sfa,
+    sfb,
+    a_layout="LMK",
+    b_layout="LNK",
+    c_layout="LMN",
+    c_dtype=jnp.float32,
+    acc_dtype=jnp.float32,
+    sf_vec_size=32,
+)
+
+c = result["c_tensor"]       # (L, M, N)
+amax = result["amax_tensor"] # (1, 1, 1)
+```
+
+The scale arrays use ordinary row-major public storage with shape
+`(L, ceil(rows/128), ceil(ceil(K/sf_vec_size)/4), 32, 4, 4)`. The adapter
+maps that public representation to the kernel's canonical packed descriptor
+`(32, 4, row_tiles, 4, k_tiles, L)`.
+
+The advanced class specializes from shape/dtype metadata and optionally accepts
+explicit output exemplars:
+
+```python
+from cudnn.jax import GemmAmaxSm100
+
+operation = GemmAmaxSm100(
+    jax.ShapeDtypeStruct(a.shape, a.dtype),
+    jax.ShapeDtypeStruct(b.shape, b.dtype),
+    jax.ShapeDtypeStruct(sfa.shape, sfa.dtype),
+    jax.ShapeDtypeStruct(sfb.shape, sfb.dtype),
+)
+result = operation(a, b, sfa, sfb)
+```
+
+Supported public layouts are:
+
+- A: `LMK` (K-major) or `LKM` (M-major)
+- B: `LNK` (K-major) or `LKN` (N-major)
+- C: `LMN` (N-major) or `LNM` (M-major)
+
+JAX uses native FP4/FP8 dtypes. The Torch-only `uint8` packed-FP4 and `int8`
+E8M0 storage aliases are not accepted by the JAX adapter. The JAX API requires
+a homogeneous local GPU with an exact supported target in the SM100 family.
+
 ---
 
 ## Parameters
@@ -131,7 +191,7 @@ op.execute(a, b, sfa, sfb, c, amax, current_stream=None)
   - Dtype: `float32`
 
 ### Common parameters
-- `acc_dtype: torch.dtype`
+- `acc_dtype`: a Torch dtype or JAX dtype-like value
   - Accumulator dtype. Default: `torch.float32` (only supported value)
 - `mma_tiler_mn: Tuple[int, int]`
   - Kernel tile size `(TILE_M, TILE_N)`. Default: `(128, 128)`
@@ -143,11 +203,16 @@ op.execute(a, b, sfa, sfb, c, amax, current_stream=None)
 - `sf_vec_size: int`
   - Size of K-group per scale factor: `{16, 32}`. Default: `32`
 - CUDA stream (`current_stream` in class API, `stream` in wrapper)
+  JAX receives its stream from lowering and does not expose a stream argument.
 
 ### Wrapper-specific parameters: `gemm_amax_wrapper_sm100`
 - `a_tensor`, `b_tensor`, `sfa_tensor`, `sfb_tensor`: see Input/Output tensors
 - `c_major: str`:  see Input/Output tensors. Default: `"n"`
 - `c_dtype: torch.dtype`:  see Input/Output tensors. Default: `torch.float32`
+
+For JAX, `a_layout`, `b_layout`, and `c_layout` select the public axis orders
+listed above. `c_dtype` defaults to `jnp.float32`; output allocation and amax
+initialization are owned by the JAX wrapper.
 
 ### Wrapper return values
 

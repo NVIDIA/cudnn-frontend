@@ -35,12 +35,18 @@ class _DataType(Enum):
     FLOAT = auto()
     FP8_E4M3 = auto()
     FP8_E5M2 = auto()
+    FP8_E8M0 = auto()
+    FP4_E2M1 = auto()
 
 
 _DTYPE_TO_CUDNN = {
     "float16": _DataType.HALF,
     "bfloat16": _DataType.BFLOAT16,
     "float32": _DataType.FLOAT,
+    "float4_e2m1fn": _DataType.FP4_E2M1,
+    "float8_e4m3fn": _DataType.FP8_E4M3,
+    "float8_e5m2": _DataType.FP8_E5M2,
+    "float8_e8m0fnu": _DataType.FP8_E8M0,
 }
 _CUDNN_TO_DTYPE = {value: key for key, value in _DTYPE_TO_CUDNN.items()}
 
@@ -139,8 +145,8 @@ class JaxGemmSwigluContractTest(unittest.TestCase):
                     divisibility=divisibility,
                 )
 
-            def _call_kernel(self, inputs, **options):
-                self.captured_max_active_clusters_at_call = getattr(self, "_max_active_clusters", None)
+            def _call_kernel(self, inputs, *, launch, **options):
+                options["launch"] = launch
                 self.captured_call = (tuple(inputs), options)
                 return tuple(
                     _Array(
@@ -183,6 +189,10 @@ class JaxGemmSwigluContractTest(unittest.TestCase):
         fake_jnp.float16 = "float16"
         fake_jnp.bfloat16 = "bfloat16"
         fake_jnp.float32 = "float32"
+        fake_jnp.float4_e2m1fn = "float4_e2m1fn"
+        fake_jnp.float8_e4m3fn = "float8_e4m3fn"
+        fake_jnp.float8_e5m2 = "float8_e5m2"
+        fake_jnp.float8_e8m0fnu = "float8_e8m0fnu"
         fake_jax.numpy = fake_jnp
 
         try:
@@ -252,6 +262,7 @@ class JaxGemmSwigluContractTest(unittest.TestCase):
 
         inputs, options = api.captured_call
         self.assertEqual(inputs, (sample_a, sample_b))
+        self.assertTrue(callable(options["launch"]))
         self.assertEqual(options["output_descs"], (api.ab12_desc, api.c_desc))
         self.assertEqual(
             tuple(spec.mode for spec in options["input_spec"]),
@@ -337,6 +348,29 @@ class JaxGemmSwigluContractTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "sample_b tensor dtype mismatch"):
             api(sample_a, _Array(sample_b.shape, "float16"))
 
+    def test_rejects_unreachable_fp8_c_and_block_only_standard_options(self):
+        sample_a, sample_b = self._samples()
+        sample_ab12 = _Array((3, 128, 192), "bfloat16")
+        sample_c_fp8 = _Array((3, 128, 96), "float8_e4m3fn")
+        with self.assertRaisesRegex(NotImplementedError, "does not support FP8 C"):
+            self.module.GemmSwigluSm100(
+                sample_a,
+                sample_b,
+                sample_ab12=sample_ab12,
+                sample_c=sample_c_fp8,
+            )
+
+        with self.assertRaisesRegex(NotImplementedError, "does not expose FP8 C or SFC"):
+            self.module.GemmSwigluSm100(
+                sample_a,
+                sample_b,
+                sample_sfc=_Array((1,), "float8_e8m0fnu"),
+            )
+
+        for option, value in (("sf_vec_size", 32), ("vector_f32", True), ("ab12_stages", 3)):
+            with self.subTest(option=option), self.assertRaisesRegex(ValueError, "only applies to block-scaled"):
+                self.module.GemmSwigluSm100(sample_a, sample_b, **{option: value})
+
     def test_wrapper_marks_configuration_as_static_and_remains_functional(self):
         self.assertIn("gemm_swiglu_wrapper_sm100", self.module.__all__)
         self.assertNotIn("gemm_swiglu_wrapper", self.module.__all__)
@@ -351,6 +385,9 @@ class JaxGemmSwigluContractTest(unittest.TestCase):
                 "acc_dtype",
                 "mma_tiler_mn",
                 "cluster_shape_mn",
+                "sf_vec_size",
+                "vector_f32",
+                "ab12_stages",
                 "a_layout",
                 "b_layout",
             ),
@@ -367,6 +404,122 @@ class JaxGemmSwigluContractTest(unittest.TestCase):
         self.assertEqual(result["ab12_tensor"].shape, (3, 192, 128))
         self.assertEqual(result["c_tensor"].shape, (3, 96, 128))
 
+    def test_block_scaled_mxfp8_uses_packed_scale_modes_and_kernel_abi(self):
+        batch, m, n, k = 2, 128, 128, 128
+        sample_a = _Array((batch, m, k), "float8_e4m3fn")
+        sample_b = _Array((batch, n, k), "float8_e4m3fn")
+        scale_shape = (batch, 1, 1, 32, 4, 4)
+        sample_sfa = _Array(scale_shape, "float8_e8m0fnu")
+        sample_sfb = _Array(scale_shape, "float8_e8m0fnu")
+        api = self.module.GemmSwigluSm100(
+            sample_a,
+            sample_b,
+            sample_sfa=sample_sfa,
+            sample_sfb=sample_sfb,
+            alpha=0.5,
+            ab12_dtype="bfloat16",
+            c_dtype="bfloat16",
+            sf_vec_size=32,
+            vector_f32=True,
+            ab12_stages=3,
+        )
+
+        self.assertTrue(api.is_block_scaled)
+        self.assertEqual(api.scale_mode, (3, 4, 1, 5, 2, 0))
+        self.assertEqual(api.sfa_desc.shape, (32, 4, 1, 4, 1, batch))
+        self.assertEqual(api.sfa_desc.stride_order, (3, 1, 0, 4, 2, 5))
+        result = api(sample_a, sample_b, sample_sfa, sample_sfb)
+        self.assertEqual(result["ab12_tensor"].shape, (batch, m, n))
+        self.assertEqual(result["ab12_tensor"].dtype, "bfloat16")
+        self.assertEqual(result["c_tensor"].shape, (batch, m, n // 2))
+        self.assertEqual(result["c_tensor"].dtype, "bfloat16")
+        self.assertIsNone(result["sfc_tensor"])
+        self.assertIsNone(result["amax_tensor"])
+
+        inputs, options = api.captured_call
+        self.assertEqual(inputs, (sample_a, sample_b, sample_sfa, sample_sfb))
+        self.assertEqual(
+            tuple(spec.mode for spec in options["input_spec"]),
+            (api.a_mode, api.b_mode, api.scale_mode, api.scale_mode),
+        )
+        self.assertEqual(tuple(spec.mode for spec in options["output_spec"]), (api.output_mode, api.output_mode))
+        self.assertEqual(api.captured_active_cluster_queries, [(1, 0)])
+
+        seen = {}
+
+        class Kernel:
+            def __init__(self, **configuration):
+                seen["configuration"] = configuration
+
+            def __call__(self, *arguments):
+                seen["arguments"] = arguments
+
+        cutlass = types.ModuleType("cutlass")
+        cutlass.Float32 = lambda value: ("Float32", value)
+        kernel_module = types.ModuleType(f"{self.operation_name}.dense_blockscaled_gemm_persistent_swiglu_interleaved_quant")
+        kernel_module.Sm100BlockScaledPersistentDenseGemmKernel = Kernel
+        stream = object()
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "cutlass": cutlass,
+                kernel_module.__name__: kernel_module,
+            },
+        ):
+            options["launch"](stream, "A", "B", "SFA", "SFB", "AB12", "C")
+
+        self.assertEqual(
+            seen["configuration"],
+            {
+                "sf_vec_size": 32,
+                "mma_tiler_mn": (128, 128),
+                "cluster_shape_mn": (1, 1),
+                "vector_f32": True,
+                "ab12_stages": 3,
+            },
+        )
+        self.assertEqual(
+            seen["arguments"],
+            ("A", "B", "SFA", "SFB", "C", "AB12", None, None, None, ("Float32", 0.5), 12, stream),
+        )
+
+        wrapped = self.module.gemm_swiglu_wrapper_sm100(
+            sample_a,
+            sample_b,
+            alpha=0.5,
+            ab12_dtype="bfloat16",
+            c_dtype="bfloat16",
+            sfa_tensor=sample_sfa,
+            sfb_tensor=sample_sfb,
+            sf_vec_size=32,
+        )
+        self.assertEqual(wrapped["ab12_tensor"].shape, (batch, m, n))
+        self.assertEqual(wrapped["c_tensor"].shape, (batch, m, n // 2))
+
+    def test_block_scaled_fp4_infers_initialized_amax(self):
+        sample_a = _Array((1, 128, 128), "float4_e2m1fn")
+        sample_b = _Array((1, 128, 128), "float4_e2m1fn")
+        scale_shape = (1, 1, 2, 32, 4, 4)
+        sample_sfa = _Array(scale_shape, "float8_e8m0fnu")
+        sample_sfb = _Array(scale_shape, "float8_e8m0fnu")
+        api = self.module.GemmSwigluSm100(
+            sample_a,
+            sample_b,
+            sample_sfa=sample_sfa,
+            sample_sfb=sample_sfb,
+            c_dtype="bfloat16",
+            sf_vec_size=16,
+        )
+
+        result = api(sample_a, sample_b, sample_sfa, sample_sfb)
+        self.assertEqual(result["amax_tensor"].shape, (1,))
+        self.assertEqual(result["amax_tensor"].dtype, "float32")
+        self.assertEqual(api.amax_desc.init_value, float("-inf"))
+        self.assertEqual(api.captured_call[1]["output_descs"], (api.ab12_desc, api.c_desc, api.amax_desc))
+
+        with self.assertRaisesRegex(ValueError, "sample_sfa and sample_sfb are required"):
+            self.module.GemmSwigluSm100(sample_a, sample_b, sample_sfa=sample_sfa)
+
     def test_launch_constructs_the_kernel_internally_and_preserves_abi_order(self):
         _, sample_b = self._samples()
         sample_a = _Array((3, 256, 64), "bfloat16")
@@ -380,12 +533,12 @@ class JaxGemmSwigluContractTest(unittest.TestCase):
         self.assertFalse(hasattr(api, "captured_active_cluster_queries"))
         api(sample_a, sample_b)
         self.assertEqual(api.captured_active_cluster_queries, [(4, 2)])
-        self.assertEqual(api.captured_max_active_clusters_at_call, 10)
+        launch = api.captured_call[1]["launch"]
         seen = {}
 
         class HardwareInfo:
             def get_max_active_clusters(self, cluster_size):
-                raise AssertionError(f"HardwareInfo queried from _launch for cluster size {cluster_size}")
+                raise AssertionError(f"HardwareInfo queried from launch callback for cluster size {cluster_size}")
 
         class Kernel:
             def __init__(self, **configuration):
@@ -412,7 +565,7 @@ class JaxGemmSwigluContractTest(unittest.TestCase):
                 kernel_module.__name__: kernel_module,
             },
         ):
-            api._launch(("A", "B"), ("AB12", "C"), (), stream)
+            launch(stream, "A", "B", "AB12", "C")
 
         self.assertEqual(
             seen["configuration"],
@@ -428,8 +581,8 @@ class JaxGemmSwigluContractTest(unittest.TestCase):
             ("A", "B", "AB12", "C", ("Float32", 0.25), 10, stream),
         )
 
-        with self.assertRaisesRegex(RuntimeError, "unexpected workspaces"):
-            api._launch(("A", "B"), ("AB12", "C"), (object(),), stream)
+        with self.assertRaises(TypeError):
+            launch(stream, "A", "B", "AB12", "C", object())
 
     def test_adapter_import_does_not_load_torch_or_the_cute_kernel(self):
         self.assertNotIn(f"{self.operation_name}.api", sys.modules)

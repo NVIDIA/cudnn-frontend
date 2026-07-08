@@ -128,22 +128,26 @@ class _SparseScoreRecompute(JaxApiBase):
 
         (output,) = self._call_kernel(
             inputs,
+            launch=self._launch_kernel,
             output_descs=(self.out_desc,),
             workspace_descs=workspace_descs,
             compile_options=_compile_options(self.target_compute_capability),
         )
         return output
 
-    def _launch(
+    def _launch_kernel(
         self,
-        inputs: tuple[Any, ...],
-        outputs: tuple[Any, ...],
-        workspaces: tuple[Any, ...],
         stream: Any,
+        *arguments: Any,
     ) -> None:
-        output = outputs[0]
+        uses_workspace = self.topk_length_desc is None and self.target_compute_capability != 90
+        if uses_workspace:
+            *inputs, output, topk_length_workspace = arguments
+        else:
+            *inputs, output = arguments
+            topk_length_workspace = None
         q, k, per_head, topk_indices, *optional_inputs = inputs
-        topk_length = optional_inputs[0] if optional_inputs else (None if self.target_compute_capability == 90 else workspaces[0])
+        topk_length = optional_inputs[0] if optional_inputs else topk_length_workspace
 
         if self.target_compute_capability == 90:
             import cutlass
@@ -387,21 +391,19 @@ class _DenseScoreRecompute(JaxApiBase):
 
         output, denominator = self._call_kernel(
             inputs,
+            launch=self._launch_kernel,
             output_descs=(self.out_desc, self.denom_desc),
             compile_options=_compile_options(self.target_compute_capability),
         )
         return TupleDict(out=output, denom=denominator)
 
-    def _launch(
+    def _launch_kernel(
         self,
-        inputs: tuple[Any, ...],
-        outputs: tuple[Any, ...],
-        workspaces: tuple[Any, ...],
         stream: Any,
+        *arguments: Any,
     ) -> None:
-        del workspaces
+        *inputs, output, denominator = arguments
         q, k, per_head, *optional_inputs = inputs
-        output, denominator = outputs
 
         if self.target_compute_capability == 90:
             import cutlass

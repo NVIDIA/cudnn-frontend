@@ -12,7 +12,11 @@ GEMM_B_LAYOUTS = ("LNK", "LKN")
 GEMM_OUTPUT_LAYOUTS = ("LMN", "LNM")
 
 ROW_MAJOR_STRIDE_ORDER_3D = (2, 1, 0)
+# Public row-major shape: (L, tiles_M_or_N, rest_K_or_N, 32, 4, 4).
+BLOCK_SCALE_MODE = (3, 4, 1, 5, 2, 0)
 BLOCK_SCALE_STRIDE_ORDER = (3, 1, 0, 4, 2, 5)
+# Public row-major shape: (L, 1, M).
+PROBABILITY_MODE = (2, 1, 0)
 PROBABILITY_STRIDE_ORDER = (0, 1, 2)
 
 
@@ -49,10 +53,12 @@ def gemm_output_mode(layout: str, *, name: str = "c_layout") -> tuple[int, ...]:
 
 
 __all__ = [
+    "BLOCK_SCALE_MODE",
     "BLOCK_SCALE_STRIDE_ORDER",
     "GEMM_A_LAYOUTS",
     "GEMM_B_LAYOUTS",
     "GEMM_OUTPUT_LAYOUTS",
+    "PROBABILITY_MODE",
     "PROBABILITY_STRIDE_ORDER",
     "ROW_MAJOR_STRIDE_ORDER_3D",
     "gemm_a_mode",

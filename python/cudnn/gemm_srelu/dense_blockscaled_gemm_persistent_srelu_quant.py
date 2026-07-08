@@ -29,8 +29,6 @@
 from typing import Type, Tuple, Union, Optional
 
 import cuda.bindings.driver as cuda
-import torch
-
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync, tcgen05
@@ -1376,14 +1374,17 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     self.epilog_sync_barrier.arrive_and_wait()
 
                     #
+                    # Apply squared ReLU and the row probability to D.
+                    #
+                    acc_values = acc_vec.load()
+                    acc_values = epilogue_op(acc_values)
+                    acc_values = acc_values * mProb
+                    acc_vec.store(acc_values)
+
+                    #
                     # Generate amax
                     #
                     if cutlass.const_expr(self.generate_amax):
-                        acc_values = acc_vec.load()
-                        acc_values = epilogue_op(acc_values)
-                        acc_values = acc_values * mProb
-                        acc_vec.store(acc_values)
-
                         # Apply element-wise absolute value using math.absf (supports vectors)
                         abs_acc_values_ir = cutlass._mlir.dialects.math.absf(acc_values.ir_value())  # operand (positional)
                         abs_acc_values = type(acc_values)(abs_acc_values_ir, acc_values.shape, acc_values.dtype)

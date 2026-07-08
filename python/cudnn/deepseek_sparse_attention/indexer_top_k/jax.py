@@ -105,6 +105,7 @@ class IndexerTopK(JaxApiBase):
         output_descs = (self.indices_desc,) if self.values_desc is None else (self.indices_desc, self.values_desc)
         results = self._call_kernel(
             (input_values, seq_lens),
+            launch=self._launch_kernel,
             output_descs=output_descs,
             workspace_descs=(self.workspace_desc,),
             input_spec=(self._to_tensor_spec(self.input_desc), self._to_tensor_spec(self.seq_lens_desc)),
@@ -114,12 +115,12 @@ class IndexerTopK(JaxApiBase):
         values = results[1] if self.return_val else None
         return TupleDict(indices=indices, values=values)
 
-    def _launch(
+    def _launch_kernel(
         self,
-        inputs: tuple[Any, ...],
-        outputs: tuple[Any, ...],
-        workspaces: tuple[Any, ...],
         stream: Any,
+        input_values: Any,
+        seq_lens: Any,
+        *buffers: Any,
     ) -> None:
         import cutlass
 
@@ -130,10 +131,10 @@ class IndexerTopK(JaxApiBase):
             data_type.BFLOAT16: cutlass.BFloat16,
             data_type.FLOAT: cutlass.Float32,
         }
-        input_values, seq_lens = inputs
+        outputs = buffers[:-1]
+        extra_buffer = buffers[-1]
         output_indices = outputs[0]
         output_values = outputs[1] if self.return_val else None
-        (extra_buffer,) = workspaces
         resolved = (
             self._op.max_num_cols,
             self._op.large_occupancy,
@@ -239,24 +240,23 @@ class _LocalToGlobal(JaxApiBase):
 
         (result,) = self._call_kernel(
             tuple(inputs),
+            launch=self._launch_kernel,
             output_descs=(self.output_desc,),
             compile_options=compile_options_for_target(self.target_compute_capability, "--opt-level 3"),
         )
         return TupleDict(indices=result)
 
-    def _launch(self, inputs, outputs, workspaces, stream) -> None:
+    def _launch_kernel(self, stream, *arguments) -> None:
         from cutlass import Int32
 
         from .local_to_global_dsl import LocalToGlobalTopK
 
+        *inputs, output = arguments
         local_indices, *optional = inputs
         if self.is_varlen:
             cu_q, cu_k = optional
         else:
             cu_q = cu_k = None
-        (output,) = outputs
-        if workspaces:
-            raise RuntimeError("local_to_global does not use workspaces")
         LocalToGlobalTopK(is_varlen=self.is_varlen)(
             local_indices,
             output,
@@ -305,20 +305,17 @@ class _Compactify(JaxApiBase):
         self._check_tensor_signature(indices, self.input_desc)
         compact_indices, topk_length = self._call_kernel(
             (indices,),
+            launch=self._launch_kernel,
             output_descs=(self.output_desc, self.length_desc),
             compile_options=compile_options_for_target(self.target_compute_capability, "--opt-level 3"),
         )
         return TupleDict(indices=compact_indices, topk_length=topk_length)
 
-    def _launch(self, inputs, outputs, workspaces, stream) -> None:
+    def _launch_kernel(self, stream, indices, compact_indices, topk_length) -> None:
         from cutlass import Int32
 
         from .compactify import CompactifyKernel
 
-        (indices,) = inputs
-        compact_indices, topk_length = outputs
-        if workspaces:
-            raise RuntimeError("compactify does not use workspaces")
         CompactifyKernel(cols=self.cols)(indices, compact_indices, topk_length, Int32(self.rows), stream)
 
 

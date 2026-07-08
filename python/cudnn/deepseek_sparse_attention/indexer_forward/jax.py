@@ -249,6 +249,7 @@ class IndexerForward(JaxApiBase):
         output_divisibility = (None,) * (self.o_desc.ndim - 1) + (TMA_ALIGN_ELEMENTS,)
         (scores_padded,) = self._call_kernel(
             tuple(inputs),
+            launch=self._launch_kernel,
             output_descs=(self.o_desc,),
             input_spec=tuple(self._to_tensor_spec(desc, mode=mode) for desc, mode in input_bindings),
             output_spec=(
@@ -274,25 +275,20 @@ class IndexerForward(JaxApiBase):
         if desc is not None:
             JaxApiBase._check_tensor_signature(value, desc)
 
-    def _launch(
+    def _launch_kernel(
         self,
-        inputs: tuple[Any, ...],
-        outputs: tuple[Any, ...],
-        workspaces: tuple[Any, ...],
         stream: Any,
+        *arguments: Any,
     ) -> None:
         from cutlass import BFloat16, Float32, Int32
 
+        *inputs, output = arguments
         q, k, w, *optional_inputs = inputs
         cu_seqlens_q = optional_inputs.pop(0) if self.cu_seqlens_q_desc is not None else None
         cu_seqlens_k = optional_inputs.pop(0) if self.cu_seqlens_k_desc is not None else None
         q_causal_offsets = optional_inputs.pop(0) if self.q_causal_offsets_desc is not None else None
         if optional_inputs:
             raise RuntimeError("Unexpected IndexerForward kernel inputs")
-        (output,) = outputs
-        if workspaces:
-            raise RuntimeError("IndexerForward does not use workspaces")
-
         resolved = (
             self._op.head_dim,
             self._op.qhead_per_kv_head,

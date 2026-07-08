@@ -240,9 +240,6 @@ class JaxApiBaseTest(unittest.TestCase):
             def __call__(self):
                 return self.check_support()
 
-            def _launch(self, inputs, outputs, workspaces, stream):
-                raise AssertionError("not called")
-
         with mock.patch.dict(
             sys.modules,
             {
@@ -452,7 +449,7 @@ class JaxApiBaseTest(unittest.TestCase):
         self.assertEqual(output.shape, (2, 3, 4))
         self.assertEqual(output.dtype, "bfloat16")
 
-    def test_calls_launch_hook_with_initialized_outputs_and_hidden_workspaces(self):
+    def test_calls_explicit_launcher_with_initialized_outputs_and_hidden_workspaces(self):
         tensor_module = self.tensor_module
         seen = {}
 
@@ -483,6 +480,9 @@ class JaxApiBaseTest(unittest.TestCase):
             ),
         )
 
+        def launch(stream, *buffers):
+            seen["launch_args"] = (stream, *buffers)
+
         class Adapter(self.module.JaxApiBase):
             def check_support(self):
                 return True
@@ -490,12 +490,10 @@ class JaxApiBaseTest(unittest.TestCase):
             def __call__(self, value):
                 return self._call_kernel(
                     (value,),
+                    launch=launch,
                     output_descs=output_descs,
                     workspace_descs=workspace_descs,
                 )
-
-            def _launch(self, inputs, outputs, workspaces, stream):
-                seen["launch_args"] = (inputs, outputs, workspaces, stream)
 
         full_calls = []
         jax = types.ModuleType("jax")
@@ -557,6 +555,7 @@ class JaxApiBaseTest(unittest.TestCase):
         ):
             results = api._call_kernel(
                 (input_value,),
+                launch=launch,
                 output_descs=output_descs,
                 workspace_descs=workspace_descs,
                 input_spec=(input_tensor_spec,),
@@ -565,15 +564,23 @@ class JaxApiBaseTest(unittest.TestCase):
             with self.assertRaisesRegex(TypeError, "input #0 must have shape and dtype metadata"):
                 api._call_kernel(
                     ([input_value],),
+                    launch=launch,
                     output_descs=output_descs,
                     workspace_descs=workspace_descs,
                 )
             with self.assertRaisesRegex(TypeError, "output_spec must contain only TensorSpec or None"):
                 api._call_kernel(
                     (input_value,),
+                    launch=launch,
                     output_descs=output_descs,
                     workspace_descs=workspace_descs,
                     output_spec=((0,), initialized_output_spec),
+                )
+            with self.assertRaisesRegex(TypeError, "launch must be callable"):
+                api._call_kernel(
+                    (input_value,),
+                    launch=None,
+                    output_descs=output_descs,
                 )
 
         self.assertEqual(
@@ -588,13 +595,13 @@ class JaxApiBaseTest(unittest.TestCase):
         self.assertIs(seen["call_options"]["input_spec"][1], initialized_output_spec)
         self.assertIs(seen["call_options"]["input_spec"][2], seen["call_options"]["output_spec"][2])
 
-        launch_inputs, launch_outputs, launch_workspaces, stream = seen["launch_args"]
-        self.assertEqual(launch_inputs, (input_value,))
-        self.assertEqual(launch_outputs[0].label, "allocated(0)")
-        self.assertIs(launch_outputs[1], full_calls[0][3])
-        self.assertIs(launch_workspaces[0], full_calls[1][3])
-        self.assertEqual(launch_workspaces[1].label, "allocated(3)")
+        stream, launch_input, output, amax, counter, scratch = seen["launch_args"]
         self.assertEqual(stream, "stream")
+        self.assertIs(launch_input, input_value)
+        self.assertEqual(output.label, "allocated(0)")
+        self.assertIs(amax, full_calls[0][3])
+        self.assertIs(counter, full_calls[1][3])
+        self.assertEqual(scratch.label, "allocated(3)")
         self.assertEqual([result.label for result in results], ["allocated(0)", "full(-inf)"])
         self.assertNotIn(full_calls[0][3], vars(api).values())
         self.assertNotIn(full_calls[1][3], vars(api).values())
@@ -608,9 +615,6 @@ class JaxApiBaseTest(unittest.TestCase):
 
             def __call__(self):
                 return self.check_support()
-
-            def _launch(self, inputs, outputs, workspaces, stream):
-                raise AssertionError("not called")
 
         api = Adapter()
         api.option = 1

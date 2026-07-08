@@ -96,7 +96,9 @@ class JaxGemmLayoutTest(unittest.TestCase):
 
     def test_fixed_auxiliary_stride_orders_match_kernel_abis(self):
         self.assertEqual(self.module.ROW_MAJOR_STRIDE_ORDER_3D, (2, 1, 0))
+        self.assertEqual(self.module.BLOCK_SCALE_MODE, (3, 4, 1, 5, 2, 0))
         self.assertEqual(self.module.BLOCK_SCALE_STRIDE_ORDER, (3, 1, 0, 4, 2, 5))
+        self.assertEqual(self.module.PROBABILITY_MODE, (2, 1, 0))
         self.assertEqual(self.module.PROBABILITY_STRIDE_ORDER, (0, 1, 2))
 
         layout = importlib.import_module(f"{self.module.__package__}.layout")

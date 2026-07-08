@@ -156,6 +156,7 @@ class SparseAttentionBackward(JaxApiBase):
 
         dq, dkv, d_sink = self._call_kernel(
             inputs,
+            launch=self._launch_kernel,
             output_descs=(self.dq_desc, self.dkv_desc, self.d_sink_desc),
             workspace_descs=self._workspace_descs(),
             input_spec=input_specs,
@@ -239,13 +240,16 @@ class SparseAttentionBackward(JaxApiBase):
             raise RuntimeError(f"No sparse-attention backward kernel for SM{self.compute_capability}")
         return family
 
-    def _launch(
+    def _launch_kernel(
         self,
-        inputs: tuple[Any, ...],
-        outputs: tuple[Any, ...],
-        workspaces: tuple[Any, ...],
         stream: Any,
+        *arguments: Any,
     ) -> None:
+        workspace_count = len(self._workspace_descs())
+        input_count = len(arguments) - 3 - workspace_count
+        inputs = arguments[:input_count]
+        outputs = arguments[input_count : input_count + 3]
+        workspaces = arguments[input_count + 3 :]
         if self._architecture_family == 90:
             self._launch_sm90(inputs, outputs, workspaces, stream)
         else:

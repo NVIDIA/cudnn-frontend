@@ -156,7 +156,8 @@ class JaxSparseAttentionBackwardContractTest(unittest.TestCase):
                 del desc
                 return _TensorSpec(mode=mode, divisibility=divisibility)
 
-            def _call_kernel(self, inputs, **options):
+            def _call_kernel(self, inputs, *, launch, **options):
+                options["launch"] = launch
                 JaxApiBase.captured_call = (inputs, options)
                 return tuple(_Array(desc.shape, _CUDNN_TO_DTYPE[desc.cudnn_dtype]) for desc in options["output_descs"])
 

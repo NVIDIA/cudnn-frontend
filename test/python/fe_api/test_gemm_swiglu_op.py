@@ -92,6 +92,21 @@ class GemmSwigluOpContractTest(unittest.TestCase):
         arguments.update(overrides)
         return self.op_module.GemmSwigluSm100Op(**arguments)
 
+    def _block_op(self, **overrides):
+        m, n, k, batch = 128, 128, 128, 2
+        scale_order = (3, 1, 0, 4, 2, 5)
+        arguments = {
+            "a": self._desc((m, k, batch), _DataType.FP8_E4M3, (1, 0, 2), "A"),
+            "b": self._desc((n, k, batch), _DataType.FP8_E4M3, (1, 0, 2), "B"),
+            "sfa": self._desc((32, 4, 1, 4, 1, batch), _DataType.FP8_E8M0, scale_order, "SFA"),
+            "sfb": self._desc((32, 4, 1, 4, 1, batch), _DataType.FP8_E8M0, scale_order, "SFB"),
+            "ab12": self._desc((m, n, batch), _DataType.BFLOAT16, (1, 0, 2), "AB12"),
+            "c": self._desc((m, n // 2, batch), _DataType.BFLOAT16, (1, 0, 2), "C"),
+            "sf_vec_size": 32,
+        }
+        arguments.update(overrides)
+        return self.op_module.BlockScaledGemmSwigluSm100Op(**arguments)
+
     def test_validates_complete_signature_and_resolves_configuration(self):
         operation = self._op(alpha=0.5)
 
@@ -235,6 +250,82 @@ class GemmSwigluOpContractTest(unittest.TestCase):
 
         with self.assertRaisesRegex(TypeError, "acc_dtype must be a cudnn.data_type"):
             self._op(acc_dtype="float32")
+
+    def test_validates_block_scaled_mxfp8_signature(self):
+        operation = self._block_op(alpha=0.25, vector_f32=True, ab12_stages=3)
+
+        self.assertTrue(operation.check_support())
+        self.assertEqual((operation.m, operation.n, operation.k, operation.l), (128, 128, 128, 2))
+        self.assertEqual(operation.output_n, 64)
+        self.assertEqual((operation.ab_dtype, operation.sf_dtype), (_DataType.FP8_E4M3, _DataType.FP8_E8M0))
+        self.assertEqual((operation.ab12_dtype, operation.c_dtype), (_DataType.BFLOAT16, _DataType.BFLOAT16))
+        self.assertEqual(operation.mma_tiler_mn, (128, 128))
+        self.assertEqual(operation.cluster_shape_mn, (1, 1))
+        self.assertTrue(operation.vector_f32)
+        self.assertEqual(operation.ab12_stages, 3)
+
+    def test_validates_block_scaled_fp4_amax_signature(self):
+        m, n, k, batch = 256, 256, 128, 1
+        scale_order = (3, 1, 0, 4, 2, 5)
+        operation = self._block_op(
+            a=self._desc((m, k, batch), _DataType.FP4_E2M1, (1, 0, 2), "A"),
+            b=self._desc((n, k, batch), _DataType.FP4_E2M1, (1, 0, 2), "B"),
+            sfa=self._desc((32, 4, 2, 4, 2, batch), _DataType.FP8_E4M3, scale_order, "SFA"),
+            sfb=self._desc((32, 4, 2, 4, 2, batch), _DataType.FP8_E4M3, scale_order, "SFB"),
+            ab12=self._desc((m, n, batch), _DataType.HALF, (1, 0, 2), "AB12"),
+            c=self._desc((m, n // 2, batch), _DataType.BFLOAT16, (1, 0, 2), "C"),
+            amax=self._desc((1,), _DataType.FLOAT, (0,), "amax"),
+            sf_vec_size=16,
+            mma_tiler_mn=(256, 256),
+        )
+
+        self.assertTrue(operation.check_support())
+        self.assertEqual(operation.cluster_shape_mn, (2, 2))
+        self.assertEqual(operation.output_major, "n")
+
+    def test_rejects_invalid_block_scaled_signatures(self):
+        scale_order = (3, 1, 0, 4, 2, 5)
+        cases = (
+            (
+                {"sfa": self._desc((32, 4, 1, 4, 2, 2), _DataType.FP8_E8M0, scale_order, "SFA")},
+                ValueError,
+                "SFA must have shape",
+            ),
+            (
+                {"sfa": self._desc((32, 4, 1, 4, 1, 2), _DataType.FP8_E8M0, (5, 4, 3, 2, 1, 0), "SFA")},
+                ValueError,
+                "packed block-scale layout",
+            ),
+            (
+                {
+                    "sfa": self._desc((32, 4, 1, 4, 1, 2), _DataType.FP8_E4M3, scale_order, "SFA"),
+                    "sfb": self._desc((32, 4, 1, 4, 1, 2), _DataType.FP8_E4M3, scale_order, "SFB"),
+                },
+                ValueError,
+                "FP8 A and B require FP8_E8M0 scales with sf_vec_size=32",
+            ),
+            (
+                {"ab12": self._desc((128, 128, 2), _DataType.FLOAT, (1, 0, 2), "AB12")},
+                NotImplementedError,
+                "MXFP8 inputs require",
+            ),
+            (
+                {"mma_tiler_mn": (128, 192)},
+                ValueError,
+                "M and N must be divisible by mma_tiler_mn",
+            ),
+        )
+        for overrides, error_type, message in cases:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(error_type, message):
+                    self._block_op(**overrides).check_support()
+
+        fp4 = _DataType.FP4_E2M1
+        with self.assertRaisesRegex(ValueError, "amax is required"):
+            self._block_op(
+                a=self._desc((128, 128, 2), fp4, (1, 0, 2), "A"),
+                b=self._desc((128, 128, 2), fp4, (1, 0, 2), "B"),
+            ).check_support()
 
 
 if __name__ == "__main__":

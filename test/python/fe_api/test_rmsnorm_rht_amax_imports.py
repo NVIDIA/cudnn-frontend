@@ -258,10 +258,17 @@ class RmsNormImportContractTest(unittest.TestCase):
         )
         jax_check_support = next(node for node in jax_adapter.body if isinstance(node, ast.FunctionDef) and node.name == "check_support")
         self.assertTrue(any(isinstance(node, ast.Attribute) and node.attr == "_check_device_compatibility" for node in ast.walk(jax_check_support)))
-        jax_launch = next(node for node in jax_adapter.body if isinstance(node, ast.FunctionDef) and node.name == "_launch")
+        jax_call = next(node for node in jax_adapter.body if isinstance(node, ast.FunctionDef) and node.name == "__call__")
+        jax_launch = next(node for node in ast.walk(jax_call) if isinstance(node, ast.FunctionDef) and node.name == "launch")
         self.assertTrue(
             any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "RMSNormRHTAmaxKernel" for node in ast.walk(jax_launch))
         )
+        jax_kernel_call = next(
+            node for node in ast.walk(jax_call) if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "_call_kernel"
+        )
+        launch_keyword = next(keyword.value for keyword in jax_kernel_call.keywords if keyword.arg == "launch")
+        self.assertIsInstance(launch_keyword, ast.Name)
+        self.assertEqual(launch_keyword.id, "launch")
 
         jax_wrapper = next(node for node in jax_tree.body if isinstance(node, ast.FunctionDef) and node.name == "rmsnorm_rht_amax_sm100")
         jit_decorator = next(

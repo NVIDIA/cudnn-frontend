@@ -196,6 +196,7 @@ class IndexerBackward(_IndexerJaxBase):
         )
         d_index_q, d_weights, d_index_k_accum = self._call_kernel(
             (index_q, weights, index_k, attn_score, index_score, topk_indices, grad_loss),
+            launch=self._launch_kernel,
             output_descs=(self.diq_desc, self.dw_desc, dk_accum_desc),
             workspace_descs=(grad_signal_desc,),
             input_spec=(
@@ -220,12 +221,23 @@ class IndexerBackward(_IndexerJaxBase):
             d_index_k=d_index_k_accum.astype(self.dik_desc.dtype),
         )
 
-    def _launch(self, inputs, outputs, workspaces, stream) -> None:
+    def _launch_kernel(
+        self,
+        stream,
+        index_q,
+        weights,
+        index_k,
+        attn_score,
+        index_score,
+        topk_indices,
+        grad_loss,
+        d_index_q,
+        d_weights,
+        d_index_k_accum,
+        grad_signal,
+    ) -> None:
         import cutlass
 
-        index_q, weights, index_k, attn_score, index_score, topk_indices, grad_loss = inputs
-        d_index_q, d_weights, d_index_k_accum = outputs
-        (grad_signal,) = workspaces
         grad_scale = self.loss_coeff / (self._op.batch * self._op.seqlen_q)
 
         if self._op.is_thd:
@@ -467,6 +479,7 @@ class DenseIndexerBackward(_IndexerJaxBase):
         )
         d_index_q, d_weights, d_index_k_accum = self._call_kernel(
             inputs,
+            launch=self._launch_kernel,
             output_descs=(self.diq_desc, self.dw_desc, dk_accum_desc),
             workspace_descs=(grad_signal_desc,),
             input_spec=(
@@ -488,9 +501,10 @@ class DenseIndexerBackward(_IndexerJaxBase):
             d_index_k=d_index_k_accum.astype(self.dik_desc.dtype),
         )
 
-    def _launch(self, inputs, outputs, workspaces, stream) -> None:
+    def _launch_kernel(self, stream, *arguments) -> None:
         import cutlass
 
+        *inputs, d_index_q, d_weights, d_index_k_accum, grad_signal = arguments
         index_q, weights, index_k, attn_score, attn_l1norm, index_score, index_lse, grad_loss, *optional = inputs
         cursor = 0
         cu_seqlens_q = cu_seqlens_k = q_causal_offsets = None
@@ -500,8 +514,6 @@ class DenseIndexerBackward(_IndexerJaxBase):
         if self._op.q_causal_offsets is not None:
             q_causal_offsets = optional[cursor]
 
-        d_index_q, d_weights, d_index_k_accum = outputs
-        (grad_signal,) = workspaces
         grad_scale = self.loss_coeff / max(self._op.normalization_tokens, 1)
 
         if self._architecture_family == 100:

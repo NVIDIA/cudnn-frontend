@@ -93,29 +93,29 @@ class RmsNormRhtAmaxSm100(JaxApiBase):
             self.o_desc,
             divisibility=(self._op.rows_per_cta, 16),
         )
+
+        def launch(
+            stream: Any,
+            x: Any,
+            weight: Any,
+            output: Any,
+            amax: Any,
+        ) -> None:
+            kernel = RMSNormRHTAmaxKernel(
+                n=self._op.n,
+                num_threads=self._op.num_threads,
+                eps=self._op.eps,
+                rows_per_cta=self._op.rows_per_cta,
+            )
+            kernel(x, weight, output, amax, stream)
+
         return self._call_kernel(
             (x, weight),
+            launch=launch,
             output_descs=(self.o_desc, self.amax_desc),
             input_spec=(x_spec, weight_spec),
             output_spec=(output_spec, None),
         )
-
-    def _launch(
-        self,
-        inputs: tuple[Any, ...],
-        outputs: tuple[Any, ...],
-        workspaces: tuple[Any, ...],
-        stream: Any,
-    ) -> None:
-        x, weight = inputs
-        output, amax = outputs
-        kernel = RMSNormRHTAmaxKernel(
-            n=self._op.n,
-            num_threads=self._op.num_threads,
-            eps=self._op.eps,
-            rows_per_cta=self._op.rows_per_cta,
-        )
-        kernel(x, weight, output, amax, stream)
 
 
 @jax.jit(static_argnames=("eps", "num_threads", "rows_per_cta"))

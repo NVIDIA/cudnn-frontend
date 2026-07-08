@@ -13,6 +13,7 @@ from ._tensor_desc import TensorDesc
 
 _STANDARD_MMA_M = (128, 256)
 _STANDARD_MMA_N = tuple(range(32, 257, 32))
+BLOCK_SCALE_STRIDE_ORDER = (3, 1, 0, 4, 2, 5)
 
 _DATA_TYPE_BITS_BY_NAME = {
     "BOOLEAN": 8,
@@ -85,6 +86,40 @@ def require_gemm_inputs(a: TensorDesc, b: TensorDesc) -> tuple[int, int, int, in
     if (b_k, b_l) != (k, l):
         raise ValueError(f"B shape mismatch: expected (N, {k}, {l}), got {b.shape}")
     return m, n, k, l
+
+
+def block_scale_shape(
+    rows: int,
+    k: int,
+    batch: int,
+    sf_vec_size: int,
+) -> tuple[int, int, int, int, int, int]:
+    """Return the canonical packed scale-factor shape for a dense GEMM."""
+
+    if isinstance(sf_vec_size, bool):
+        raise TypeError(f"sf_vec_size must be an integer, got {sf_vec_size!r}")
+    try:
+        sf_vec_size = index(sf_vec_size)
+    except TypeError as error:
+        raise TypeError(f"sf_vec_size must be an integer, got {sf_vec_size!r}") from error
+    if sf_vec_size <= 0:
+        raise ValueError(f"sf_vec_size must be positive, got {sf_vec_size}")
+    row_tiles = (rows + 127) // 128
+    scale_k = (k + sf_vec_size - 1) // sf_vec_size
+    k_tiles = (scale_k + 3) // 4
+    return (32, 4, row_tiles, 4, k_tiles, batch)
+
+
+def require_block_scale_layout(tensor: TensorDesc, label: str) -> None:
+    """Require the packed scale-factor layout used by dense SM100 GEMMs."""
+
+    _require_tensor_desc(tensor, label)
+    if not tensor.is_compact(BLOCK_SCALE_STRIDE_ORDER):
+        raise ValueError(
+            f"{label} must use the packed block-scale layout with stride order "
+            f"{BLOCK_SCALE_STRIDE_ORDER}, got stride {tensor.stride} and "
+            f"stride order {tensor.stride_order}"
+        )
 
 
 def require_tensor_shape(
@@ -205,8 +240,11 @@ def require_cluster_shape(
 
 
 __all__ = [
+    "BLOCK_SCALE_STRIDE_ORDER",
+    "block_scale_shape",
     "data_type_bits",
     "require_16_byte_alignment",
+    "require_block_scale_layout",
     "require_cluster_shape",
     "require_compact_major",
     "require_gemm_inputs",

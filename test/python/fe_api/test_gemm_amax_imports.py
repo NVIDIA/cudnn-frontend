@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Import and Torch-adapter contracts for dense GEMM + SwiGLU."""
+"""Import and Torch-adapter contracts for dense GEMM + amax."""
 
 import ast
 import importlib.util
@@ -20,7 +20,7 @@ else:
 
 
 _CUDNN_ROOT = Path(__file__).resolve().parents[3] / "python" / "cudnn"
-_OPERATION_ROOT = _CUDNN_ROOT / "gemm_swiglu"
+_OPERATION_ROOT = _CUDNN_ROOT / "gemm_amax"
 
 
 def _load_operation_package(name: str):
@@ -38,7 +38,7 @@ def _load_operation_package(name: str):
         submodule_search_locations=[str(_OPERATION_ROOT)],
     )
     if spec is None or spec.loader is None:
-        raise RuntimeError("Unable to load GEMM + SwiGLU package")
+        raise RuntimeError("Unable to load GEMM + amax package")
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
     spec.loader.exec_module(module)
@@ -52,9 +52,9 @@ def _remove_package(name: str) -> None:
             sys.modules.pop(module_name, None)
 
 
-class GemmSwigluImportContractTest(unittest.TestCase):
+class GemmAmaxImportContractTest(unittest.TestCase):
     def test_package_import_loads_no_framework_adapter(self):
-        name = "cudnn_gemm_swiglu_import_test.gemm_swiglu"
+        name = "cudnn_gemm_amax_import_test.gemm_amax"
         blocked = {module_name: None for module_name in ("torch", "jax", "cutlass", "cuda")}
         try:
             with mock.patch.dict(sys.modules, blocked):
@@ -63,10 +63,9 @@ class GemmSwigluImportContractTest(unittest.TestCase):
             self.assertNotIn(f"{name}.op", sys.modules)
             self.assertTrue(
                 {
-                    "BlockScaledGemmSwigluSm100Op",
-                    "GemmSwigluSm100Op",
-                    "GemmSwigluSm100",
-                    "gemm_swiglu_wrapper_sm100",
+                    "GemmAmaxSm100Op",
+                    "GemmAmaxSm100",
+                    "gemm_amax_wrapper_sm100",
                     "api",
                     "op",
                 }.issubset(dir(package))
@@ -74,26 +73,7 @@ class GemmSwigluImportContractTest(unittest.TestCase):
         finally:
             _remove_package(name)
 
-    def test_exports_route_without_loading_the_other_layer(self):
-        name = "cudnn_gemm_swiglu_route_test.gemm_swiglu"
-        api_sentinel = object()
-        op_sentinel = object()
-        api = types.ModuleType(f"{name}.api")
-        api.GemmSwigluSm100 = api_sentinel
-        api.gemm_swiglu_wrapper_sm100 = object()
-        op = types.ModuleType(f"{name}.op")
-        op.BlockScaledGemmSwigluSm100Op = object()
-        op.GemmSwigluSm100Op = op_sentinel
-        try:
-            sys.modules[api.__name__] = api
-            sys.modules[op.__name__] = op
-            package = _load_operation_package(name)
-            self.assertIs(package.GemmSwigluSm100Op, op_sentinel)
-            self.assertIs(package.GemmSwigluSm100, api_sentinel)
-        finally:
-            _remove_package(name)
-
-    def test_static_adapter_boundaries_and_torch_constructor(self):
+    def test_static_adapter_boundaries_and_public_torch_signatures(self):
         def imports_framework(node, framework: str):
             if isinstance(node, ast.Import):
                 return any(alias.name == framework or alias.name.startswith(f"{framework}.") for alias in node.names)
@@ -106,11 +86,7 @@ class GemmSwigluImportContractTest(unittest.TestCase):
         self.assertFalse(any(imports_framework(node, framework) for node in op_imports for framework in ("torch", "jax", "cutlass", "cuda")))
         self.assertFalse(any(imports_framework(node, "jax") for node in api_imports))
 
-        adapter = next(node for node in api_tree.body if isinstance(node, ast.ClassDef) and node.name == "GemmSwigluSm100")
-        self.assertEqual(
-            [base.id for base in adapter.bases if isinstance(base, ast.Name)],
-            ["APIBase"],
-        )
+        adapter = next(node for node in api_tree.body if isinstance(node, ast.ClassDef) and node.name == "GemmAmaxSm100")
         constructor = next(node for node in adapter.body if isinstance(node, ast.FunctionDef) and node.name == "__init__")
         self.assertEqual(
             [argument.arg for argument in constructor.args.args],
@@ -118,32 +94,20 @@ class GemmSwigluImportContractTest(unittest.TestCase):
                 "self",
                 "sample_a",
                 "sample_b",
-                "sample_ab12",
+                "sample_sfa",
+                "sample_sfb",
                 "sample_c",
-                "alpha",
+                "sample_amax",
                 "acc_dtype",
                 "mma_tiler_mn",
                 "cluster_shape_mn",
-                "sample_sfa",
-                "sample_sfb",
-                "sample_amax",
-                "sample_sfc",
-                "sample_norm_const",
                 "sf_vec_size",
-                "vector_f32",
-                "ab12_stages",
             ],
         )
-        required_count = len(constructor.args.args) - len(constructor.args.defaults)
-        self.assertEqual(
-            [argument.arg for argument in constructor.args.args[:required_count]],
-            ["self", "sample_a", "sample_b", "sample_ab12", "sample_c"],
-        )
         op_constructors = [
-            node for node in ast.walk(constructor) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "GemmSwigluSm100Op"
+            node for node in ast.walk(constructor) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "GemmAmaxSm100Op"
         ]
         self.assertEqual(len(op_constructors), 1)
-        self.assertTrue({"a", "b", "ab12", "c"}.issubset({keyword.arg for keyword in op_constructors[0].keywords}))
 
         execute = next(node for node in adapter.body if isinstance(node, ast.FunctionDef) and node.name == "execute")
         self.assertEqual(
@@ -152,40 +116,32 @@ class GemmSwigluImportContractTest(unittest.TestCase):
                 "self",
                 "a_tensor",
                 "b_tensor",
-                "ab12_tensor",
-                "c_tensor",
                 "sfa_tensor",
                 "sfb_tensor",
+                "c_tensor",
                 "amax_tensor",
-                "sfc_tensor",
-                "norm_const_tensor",
-                "alpha",
                 "current_stream",
             ],
         )
 
-        wrapper = next(node for node in api_tree.body if isinstance(node, ast.FunctionDef) and node.name == "gemm_swiglu_wrapper_sm100")
+        wrapper = next(node for node in api_tree.body if isinstance(node, ast.FunctionDef) and node.name == "gemm_amax_wrapper_sm100")
         self.assertEqual(
             [argument.arg for argument in wrapper.args.args],
             [
                 "a_tensor",
                 "b_tensor",
-                "alpha",
+                "sfa_tensor",
+                "sfb_tensor",
                 "c_major",
-                "ab12_dtype",
                 "c_dtype",
                 "acc_dtype",
                 "mma_tiler_mn",
                 "cluster_shape_mn",
-                "sfa_tensor",
-                "sfb_tensor",
-                "norm_const_tensor",
                 "sf_vec_size",
-                "vector_f32",
-                "ab12_stages",
                 "stream",
             ],
         )
+        self.assertFalse(any(isinstance(node, ast.FunctionDef) and node.name.startswith("_check_torch_support") for node in adapter.body))
 
 
 if __name__ == "__main__":

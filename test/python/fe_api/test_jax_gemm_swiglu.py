@@ -118,6 +118,57 @@ def test_jax_gemm_swiglu_abstract_contract(
 
 
 @pytest.mark.L0
+def test_jax_gemm_swiglu_block_scaled_sm100_jit_and_numerics():
+    jax, jnp = _jax_runtime()
+    device = _supported_gpu(jax)
+    if not hasattr(jnp, "float8_e4m3fn") or not hasattr(jnp, "float8_e8m0fnu"):
+        pytest.skip("The installed JAX runtime does not expose MXFP8 dtypes")
+
+    from cudnn.jax import gemm_swiglu_wrapper_sm100
+
+    batch, m, n, k = 1, 128, 128, 128
+    alpha = 0.5
+    a = jax.device_put(
+        (jax.random.normal(jax.random.key(10), (batch, m, k), dtype=jnp.float32) * 0.1).astype(jnp.float8_e4m3fn),
+        device,
+    )
+    b = jax.device_put(
+        (jax.random.normal(jax.random.key(11), (batch, n, k), dtype=jnp.float32) * 0.1).astype(jnp.float8_e4m3fn),
+        device,
+    )
+    scale_shape = (batch, 1, 1, 32, 4, 4)
+    sfa = jax.device_put(jnp.ones(scale_shape, dtype=jnp.float32).astype(jnp.float8_e8m0fnu), device)
+    sfb = jax.device_put(jnp.ones(scale_shape, dtype=jnp.float32).astype(jnp.float8_e8m0fnu), device)
+
+    lowered = gemm_swiglu_wrapper_sm100.lower(
+        a,
+        b,
+        alpha=alpha,
+        ab12_dtype=jnp.bfloat16,
+        c_dtype=jnp.bfloat16,
+        sfa_tensor=sfa,
+        sfb_tensor=sfb,
+        sf_vec_size=32,
+    )
+    stablehlo = lowered.as_text("stablehlo")
+    assert stablehlo.count("stablehlo.custom_call") == 1
+    assert "CuteDSLRT_NvJaxCutlassCall" in stablehlo
+
+    result = lowered.compile()(a, b, sfa_tensor=sfa, sfb_tensor=sfb)
+    result["c_tensor"].block_until_ready()
+    reference_ab12 = alpha * jnp.einsum("lmk,lnk->lmn", a.astype(jnp.float32), b.astype(jnp.float32))
+    blocks = reference_ab12.reshape(batch, m, n // 32, 32)
+    input_blocks = blocks[:, :, 0::2].reshape(batch, m, n // 2)
+    gate_blocks = blocks[:, :, 1::2].reshape(batch, m, n // 2)
+    reference_c = input_blocks * jax.nn.silu(gate_blocks)
+
+    assert jnp.allclose(result["ab12_tensor"].astype(jnp.float32), reference_ab12, atol=8e-2, rtol=4e-2)
+    assert jnp.allclose(result["c_tensor"].astype(jnp.float32), reference_c, atol=1e-1, rtol=5e-2)
+    assert result["sfc_tensor"] is None
+    assert result["amax_tensor"] is None
+
+
+@pytest.mark.L0
 def test_jax_gemm_swiglu_sm100_jit_and_numerics():
     jax, jnp = _jax_runtime()
     device = _supported_gpu(jax)
