@@ -89,8 +89,8 @@ def test_DSA_dense_indexer_backward_wrapper(
     s_q_cfg = cfg["s_q"]
     q_causal_offsets = torch.full((b_cfg,), 8, dtype=torch.int32, device="cuda")
     loss_coeff = float(b_cfg * s_q_cfg)
-    grad_loss = 1.0
-    grad_scale_expected = (loss_coeff / (b_cfg * s_q_cfg)) * grad_loss
+    grad_loss = torch.ones((), dtype=torch.float32, device="cuda")
+    grad_scale_expected = loss_coeff / (b_cfg * s_q_cfg)
 
     (
         index_q,
