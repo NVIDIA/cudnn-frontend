@@ -45,10 +45,10 @@ import cutlass.cute as cute
 from cutlass.cute.runtime import make_fake_stream
 
 from cudnn.datatypes import _convert_to_cutlass_data_type
-from cudnn.api_base import APIBase, TupleDict, ceil_div, is_power_of_2
+from cudnn.api_base import ApiBaseTorch, TupleDict, ceil_div, is_power_of_2
 
 
-class GroupedGemmDswigluSm100(APIBase):
+class GroupedGemmDswigluSm100(ApiBaseTorch):
     """API class for Grouped GEMM dSwiGLU backward operation on SM100+ GPUs.
 
     This kernel performs contiguous grouped block-scaled GEMM backward pass

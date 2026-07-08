@@ -43,11 +43,31 @@ Each component can be used independently or combined for the full NSA pipeline.
 
 ## Installation
 
-Install the cuDNN Frontend package with the CuteDSL optional dependencies:
+``````{tab-set}
+:sync-group: frontend-framework
+
+`````{tab-item} PyTorch
+:sync: torch
+:selected:
 
 ```bash
 pip install nvidia-cudnn-frontend[cutedsl]
 ```
+
+`````
+
+`````{tab-item} JAX
+:sync: jax
+
+```bash
+pip install nvidia-cudnn-frontend[jax]
+```
+
+The JAX optional dependency set requires Python 3.11 or newer.
+
+`````
+
+``````
 
 ---
 
@@ -55,7 +75,7 @@ pip install nvidia-cudnn-frontend[cutedsl]
 
 ### NSA Namespace
 
-All NSA components are accessible through the `NSA` namespace:
+PyTorch exposes all NSA components through the `NSA` namespace:
 
 ```python
 from cudnn import NSA
@@ -73,6 +93,20 @@ NSA.sliding_window_attention_wrapper
 NSA.TopKReduction
 NSA.topk_reduction_wrapper
 ```
+
+The explicit JAX namespace exposes the functional JAX subset:
+
+```python
+from cudnn.jax import NSA
+
+NSA.selection_attention_wrapper
+NSA.compression_attention_wrapper
+NSA.topk_reduction_wrapper
+NSA.sliding_window_attention_wrapper
+```
+
+Selection, compression, and top-K use CuTe DSL. Sliding-window inference uses
+JAX's registered cuDNN attention lowering.
 
 ---
 
@@ -108,6 +142,13 @@ $$
 
 #### High-level Wrapper
 
+``````{tab-set}
+:sync-group: frontend-framework
+
+`````{tab-item} PyTorch
+:sync: torch
+:selected:
+
 ```python
 from cudnn import NSA
 
@@ -130,6 +171,48 @@ result = NSA.selection_attention_wrapper(
 o, l, m = result
 # Key access: result["o_tensor"], result["l_tensor"], result["m_tensor"]
 ```
+
+`````
+
+`````{tab-item} JAX
+:sync: jax
+
+```python
+import jax
+from cudnn.jax import NSA
+
+@jax.jit
+def selection(q, k, v, block_indices, block_counts, cum_q, cum_k):
+    return NSA.selection_attention_wrapper(
+        q,
+        k,
+        v,
+        block_indices,
+        block_counts,
+        cum_q,
+        cum_k,
+        max_s_q=1024,
+        max_s_k=1024,
+        block_size=64,
+    )
+
+result = selection(q, k, v, block_indices, block_counts, cum_seqlen_q, cum_seqlen_k)
+o, l, m = result["o_tensor"], result["l_tensor"], result["m_tensor"]
+```
+
+The JAX wrapper returns
+`TupleDict(o_tensor=..., l_tensor=..., m_tensor=...)`. It
+supports packed, compact THD self-attention on SM90: FP16/BF16 Q, K, and V,
+runtime cumulative lengths and block metadata, equal Q/KV token counts, and
+identical Q/K runtime cumulative-length values. `max_s_q` and `max_s_k` are
+required equal static integers. `block_size`, `scale_softmax`, output and
+accumulator dtypes, and the GQA/head geometry are also static at trace time.
+The current GQA ratio is one of `{1, 2, 4, 8}`; QK and V dimensions are
+positive multiples of 16. XLA owns and initializes all three outputs.
+
+`````
+
+``````
 
 #### Class API
 
@@ -221,6 +304,13 @@ where $\alpha_q$, $\alpha_k$, $\alpha_v$, $\alpha_o$ are optional scaling factor
 
 #### High-level Wrapper
 
+``````{tab-set}
+:sync-group: frontend-framework
+
+`````{tab-item} PyTorch
+:sync: torch
+:selected:
+
 ```python
 from cudnn import NSA
 
@@ -246,6 +336,42 @@ result = NSA.compression_attention_wrapper(
 o, lse = result
 # Key access: result["o_tensor"], result["lse_tensor"]
 ```
+
+`````
+
+`````{tab-item} JAX
+:sync: jax
+
+```python
+import jax
+from cudnn.jax import NSA
+
+@jax.jit
+def compression(q, k, v):
+    return NSA.compression_attention_wrapper(
+        q,
+        k,
+        v,
+        enable_lse=True,
+        mma_tiler_mn=(128, 128),
+        is_persistent=False,
+    )
+
+result = compression(q, k, v)
+o, lse = result["o_tensor"], result["lse_tensor"]
+```
+
+The JAX wrapper returns
+`TupleDict(o_tensor=..., lse_tensor=...)`, where
+`lse_tensor` is `None` when `enable_lse=False`. It supports fixed BHSD inputs
+on SM100 with matching FP16/BF16 Q, K, and V, `D` in `{32, 64, 128}`, and
+`S_q` an integer multiple of `S_k`. THD inputs and cumulative-length operands
+remain PyTorch-only. Tensor data is runtime; `enable_lse`, dtypes, tiling,
+persistence, all scale values, and the fixed shapes are compilation state.
+
+`````
+
+``````
 
 #### Class API
 
@@ -332,12 +458,19 @@ This implementation is a wrapper around cudnn backend (and is not strictly open 
 For each query position $q$, attention is restricted to key positions within the window:
 
 $$
-O[q] = \sum_{k : q - L \leq k \leq q + R} \text{softmax}\left(\frac{Q[q] \cdot K[k]^T}{\sqrt{D}}\right) V[k]
+O[q] = \sum_{k : q - L < k \leq q + R} \text{softmax}\left(\frac{Q[q] \cdot K[k]^T}{\sqrt{D}}\right) V[k]
 $$
 
 where $L$ is `left_bound` and $R$ is `right_bound`.
 
 #### High-level Wrapper
+
+``````{tab-set}
+:sync-group: frontend-framework
+
+`````{tab-item} PyTorch
+:sync: torch
+:selected:
 
 ```python
 from cudnn import NSA
@@ -361,6 +494,43 @@ result = NSA.sliding_window_attention_wrapper(
 o, stats = result
 # Key access: result["o_tensor"], result["stats_tensor"]
 ```
+
+`````
+
+`````{tab-item} JAX
+:sync: jax
+
+```python
+import jax
+from cudnn.jax import NSA
+
+@jax.jit
+def sliding_window_attention(q, k, v):
+    return NSA.sliding_window_attention_wrapper(
+        q,
+        k,
+        v,
+        left_bound=512,
+        right_bound=0,
+        is_infer=True,
+        attn_scale=None,
+    )
+```
+
+The JAX binding covers fixed-shape FP16/BF16 `(B, H, S, D)` self-attention
+inference with `S_q == S_k`, `left_bound >= 1`, and `right_bound=0`. `D` must
+be 32, 64, or 128, `D_v == D`, and `H_q` must be divisible by `H_kv`. It
+lowers through JAX's registered cuDNN attention custom call, so XLA owns the
+stream, output, and workspace. `o_dtype` may be FP16 or BF16 and defaults to
+the input dtype. The JAX default `left_bound=1` selects only the current token;
+pass the intended window explicitly when porting a PyTorch call. Packed THD
+inputs, ragged offsets, and FP32 training statistics remain PyTorch-only. The
+result uses the same `o_tensor` and `stats_tensor` keys; `stats_tensor` is
+`None` for this inference-only subset.
+
+`````
+
+``````
 
 #### Class API
 
@@ -454,6 +624,13 @@ $$
 
 #### High-level Wrapper
 
+``````{tab-set}
+:sync-group: frontend-framework
+
+`````{tab-item} PyTorch
+:sync: torch
+:selected:
+
 ```python
 from cudnn import NSA
 
@@ -477,6 +654,46 @@ result = NSA.topk_reduction_wrapper(
 topk_scores, topk_indices = result
 # Key access: result["topk_scores_tensor"], result["topk_indices_tensor"]
 ```
+
+`````
+
+`````{tab-item} JAX
+:sync: jax
+
+```python
+import jax
+from cudnn.jax import NSA
+
+@jax.jit
+def reduce_topk(q, k, lse):
+    return NSA.topk_reduction_wrapper(
+        q,
+        k,
+        lse,
+        k_value=16,
+        selection_block_size=64,
+        compress_stride=32,
+        is_causal=True,
+    )
+
+result = reduce_topk(q, k, lse)
+topk_scores = result["topk_scores_tensor"]
+topk_indices = result["topk_indices_tensor"]
+```
+
+The JAX wrapper returns
+`TupleDict(topk_scores_tensor=..., topk_indices_tensor=...)` with
+shape `(B,H_kv,S_q,k_value)`, FP32 scores, and INT32 indices. It supports
+fixed FP16/BF16 BHSD inputs on SM100; THD inputs, cumulative lengths, and
+`max_s_*` controls remain PyTorch-only. Q/K/LSE are runtime operands. Shapes,
+`k_value`, block/stride geometry, causality, tiling, accumulator dtype, and
+`scale_softmax` are static. `k_value` must be a positive multiple of four no
+larger than the per-tile candidate count. XLA initializes invalid scores to
+`-inf` and indices to `-1` before the kernel writes valid selections.
+
+`````
+
+``````
 
 #### Class API
 
@@ -551,6 +768,10 @@ topk.execute(
 | Sliding Window Attention | ✅ | ✅ |
 | Top-K Reduction | ✅ | ✅ |
 
+The table above describes the PyTorch surface. In JAX, Compression Attention
+and Top-K Reduction support fixed BHSD only, Selection Attention supports
+packed THD self-attention only, and Sliding Window Attention is unavailable.
+
 ### T,H,D Format (Variable-Length Batched)
 
 Used for sequences of varying lengths packed into a single tensor:
@@ -594,6 +815,10 @@ All components require `float32` accumulator dtype for numerical stability.
 ---
 
 ## Usage Examples
+
+The end-to-end example below uses the PyTorch surface because it includes
+Sliding Window Attention. The three CuTe-DSL stages can instead use the JAX
+wrappers shown in their component tabs.
 
 For complete usage examples and tests, see:
 

@@ -116,6 +116,13 @@ $$
 
 **Dense mode:**
 
+``````{tab-set}
+:sync-group: frontend-framework
+
+`````{tab-item} PyTorch
+:sync: torch
+:selected:
+
 ```python
 from cudnn import grouped_gemm_dglu_wrapper_sm100
 from cuda.bindings import driver as cuda
@@ -160,6 +167,62 @@ sfd_col = outputs["sfd_col_tensor"]
 # or tuple unpacking:
 d_row, d_col, dprob, dbias, amax, sfd_row, sfd_col = outputs
 ```
+
+`````
+
+`````{tab-item} JAX
+:sync: jax
+
+Install the JAX integration with `pip install nvidia-cudnn-frontend[jax]`.
+
+```python
+import jax
+import jax.numpy as jnp
+from cudnn.jax import grouped_gemm_dglu_wrapper_sm100
+
+@jax.jit
+def run(a, b, c, sfa, sfb, padded_offsets, alpha, beta, prob, norm_const):
+    return grouped_gemm_dglu_wrapper_sm100(
+        a_tensor=a,
+        c_tensor=c,
+        sfa_tensor=sfa,
+        padded_offsets=padded_offsets,
+        alpha_tensor=alpha,
+        beta_tensor=beta,
+        prob_tensor=prob,
+        b_tensor=b,
+        sfb_tensor=sfb,
+        generate_dbias=True,
+        norm_const_tensor=norm_const,
+        d_dtype=jnp.float8_e4m3fn,
+        output_layout="LMN",
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=32,
+        act_func="dswiglu",
+        b_layout="LNK",
+    )
+
+result = run(a, b, c, sfa, sfb, padded_offsets, alpha, beta, prob, norm_const)
+d_row, d_col, dprob, dbias, amax, sfd_row, sfd_col = result
+```
+
+The JAX layout strings describe public axis order, not physical strides. `A`
+is fixed to `LMK` with shape `(1, valid_m, K)`. `b_layout="LNK"` uses shape
+`(L, N, K)` and `b_layout="LKN"` uses `(L, K, N)`. The input `C` and matrix
+outputs are fixed to `output_layout="LMN"` and use shape
+`(1, valid_m, 2N)`. The expert mode `L` must remain outermost in these strings.
+
+Packed scale tensors, `prob`, `dprob`, and `dbias` retain their
+specialized shapes documented below. The JAX API returns `TupleDict`; `dprob`
+and optional `dbias` are fresh zero-initialized functional results. The current
+surface supports dense FP8 A/B and FP8 D with E8M0 scales and
+`sf_vec_size=32`; `amax` is `None`. Shapes, dtypes, layouts, and configuration
+arguments are static under `jax.jit`.
+
+`````
+
+``````
 
 **Discrete mode:**
 
@@ -347,9 +410,12 @@ Returns a `TupleDict` (dictionary + tuple unpacking):
 - `d_row_tensor`: Row-quantized dGLU output
 - `d_col_tensor`: Column-quantized dGLU output
 - `dprob_tensor`: Gradient of prob
+- `dbias_tensor`: Optional bias gradient
 - `amax_tensor`: Per-group amax (when `d_dtype` is bf16/fp16)
 - `sfd_row_tensor`: Row scale factors (when SFD enabled)
 - `sfd_col_tensor`: Column scale factors (when SFD enabled)
+
+Tuple unpacking order is: `(d_row_tensor, d_col_tensor, dprob_tensor, dbias_tensor, amax_tensor, sfd_row_tensor, sfd_col_tensor)`.
 
 ---
 

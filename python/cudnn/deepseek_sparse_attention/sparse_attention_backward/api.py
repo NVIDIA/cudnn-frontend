@@ -1,4 +1,4 @@
-"""APIBase wrapper for DeepSeek Sparse Attention backward.
+"""ApiBaseTorch wrapper for DeepSeek Sparse Attention backward.
 
 The wrapper dispatches to the Hopper (SM90) or Blackwell (SM100) CuTe DSL
 implementation based on the active CUDA device. It consumes the ``out`` and
@@ -12,12 +12,12 @@ from typing import Optional, Tuple
 import torch
 import cuda.bindings.driver as cuda
 
-from cudnn.api_base import APIBase, TupleDict
+from cudnn.api_base import ApiBaseTorch, TupleDict
 
 from . import _interface_sm100 as _iface_sm100
 
 
-class SparseAttentionBackward(APIBase):
+class SparseAttentionBackward(ApiBaseTorch):
     def __init__(
         self,
         sample_q: torch.Tensor,  # (total_S_q, H, D) BF16

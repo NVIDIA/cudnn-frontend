@@ -148,7 +148,7 @@ class FlashAttentionDSABackwardSm100:
         self.compute_tmastore_dQ_stage = 1
 
     @staticmethod
-    def _get_workspace_size_LSE_OdO(q: int, d: int, h: int, b: int, acc_dtype: Type[cutlass.Numeric]):
+    def get_workspace_size_lse_odo(q: int, d: int, h: int, b: int, acc_dtype: Type[cutlass.Numeric]):
         # q is total seqlen, b=1
         d = (d + 7) // 8 * 8  # round up to 8
         q = (q + 7) // 8 * 8  # round up to 8
@@ -161,12 +161,16 @@ class FlashAttentionDSABackwardSm100:
         return (b, h, q, workspace_bytes)
 
     @staticmethod
-    def _get_workspace_size_dKV(k: int, d: int, b: int, acc_dtype: Type[cutlass.Numeric]):
+    def get_workspace_size_dkv(k: int, d: int, b: int, acc_dtype: Type[cutlass.Numeric]):
         d = (d + 7) // 8 * 8  # round up to 8
         k = (k + 7) // 8 * 8  # round up to 8
         # FP32 versions of dKV
         workspace_bytes = d * acc_dtype.width // 8
         return (b, 1, k, workspace_bytes)
+
+    # Compatibility aliases for callers using the original internal names.
+    _get_workspace_size_LSE_OdO = get_workspace_size_lse_odo
+    _get_workspace_size_dKV = get_workspace_size_dkv
 
     def get_workspace_tensor(
         self,

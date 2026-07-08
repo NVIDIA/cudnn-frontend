@@ -64,6 +64,14 @@ A (MxKxL), SFA                   B (NxKxL), SFB
 ## API Usage
 
 ### High-level wrapper
+
+``````{tab-set}
+:sync-group: frontend-framework
+
+`````{tab-item} PyTorch
+:sync: torch
+:selected:
+
 ```python
 result = gemm_amax_wrapper_sm100(
     a_tensor,
@@ -82,7 +90,66 @@ c, amax = result
 # Key access: result["c_tensor"], result["amax_tensor"]
 ```
 
+`````
+
+`````{tab-item} JAX
+:sync: jax
+
+Install the JAX integration with `pip install nvidia-cudnn-frontend[jax]`.
+
+```python
+import jax
+import jax.numpy as jnp
+from cudnn.jax import gemm_amax_wrapper_sm100
+
+@jax.jit
+def run(a, b, sfa, sfb):
+    # A is (L, M, K); B is (L, N, K).
+    return gemm_amax_wrapper_sm100(
+        a,
+        b,
+        sfa,
+        sfb,
+        c_layout="LMN",
+        c_dtype=jnp.float32,
+        mma_tiler_mn=(128, 128),
+        cluster_shape_mn=(1, 1),
+        sf_vec_size=32,
+        a_layout="LMK",
+        b_layout="LNK",
+    )
+
+c, amax = run(a, b, sfa, sfb)
+# c.shape == (L, M, N)
+```
+
+The JAX API supports FP8 A/B, E8M0 scale factors, `sf_vec_size=32`, and
+float32/float16/bfloat16 C. Layout strings describe the public, batch-first
+axis order: `a_layout` accepts `"LMK"` or `"LKM"`, `b_layout` accepts
+`"LNK"` or `"LKN"`, and `c_layout` accepts `"LMN"` or `"LNM"`. All accepted
+layouts keep `L` outermost; the final letter is the contiguous mode of the
+compact row-major JAX array. The defaults are `"LMK"`, `"LNK"`, and `"LMN"`.
+The wrapper maps these arrays to the kernel's canonical `(M, K, L)`,
+`(N, K, L)`, and `(M, N, L)` tensor views.
+
+The specialized `SFA` and `SFB` shapes remain unchanged with `L` in their
+final dimension. Packed FP4x2 is not exposed because JAX's scalar FP4 type has
+a different storage ABI. JAX initializes the amax reduction on every
+invocation.
+
+`````
+
+``````
+
 ### Class API
+
+``````{tab-set}
+:sync-group: frontend-framework
+
+`````{tab-item} PyTorch
+:sync: torch
+:selected:
+
 ```python
 from cuda.bindings import driver as cuda
 
@@ -103,9 +170,48 @@ op.compile()
 op.execute(a, b, sfa, sfb, c, amax, current_stream=None)
 ```
 
+`````
+
+`````{tab-item} JAX
+:sync: jax
+
+```python
+import jax
+import jax.numpy as jnp
+from cudnn.jax import GemmAmaxSm100
+
+op = GemmAmaxSm100(
+    sample_a=jax.ShapeDtypeStruct(a.shape, a.dtype),
+    sample_b=jax.ShapeDtypeStruct(b.shape, b.dtype),
+    sample_sfa=jax.ShapeDtypeStruct(sfa.shape, sfa.dtype),
+    sample_sfb=jax.ShapeDtypeStruct(sfb.shape, sfb.dtype),
+    c_layout="LMN",
+    c_dtype=jnp.float32,
+    acc_dtype=jnp.float32,
+    mma_tiler_mn=(128, 128),
+    cluster_shape_mn=(1, 1),
+    sf_vec_size=32,
+    a_layout="LMK",
+    b_layout="LNK",
+)
+assert op.check_support()
+c, amax = jax.jit(op)(a, b, sfa, sfb)
+```
+
+The constructor retains only the input descriptors. Outputs are allocated by
+the JAX call.
+
+`````
+
+``````
+
 ---
 
-## Parameters
+## PyTorch parameter reference
+
+This section documents the existing PyTorch tensor shapes, strides, and
+major-mode arguments. The JAX public shapes and layout strings are described
+in the JAX usage tabs above.
 
 ### Input/Output tensors
 - Input tensor **A**: `a_tensor` (wrapper) or `sample_a`/`a_tensor` (class)
@@ -157,6 +263,8 @@ Returns a `TupleDict` with keys:
 - `amax_tensor`: Max-abs reduction output
 
 Tuple unpacking order is: `(c_tensor, amax_tensor)`.
+
+The JAX API returns the same `TupleDict` keys and unpacking order.
 
 ### Class-specific parameters: `GemmAmaxSm100`
 

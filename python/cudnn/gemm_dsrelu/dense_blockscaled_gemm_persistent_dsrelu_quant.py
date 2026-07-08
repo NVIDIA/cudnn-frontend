@@ -29,7 +29,6 @@
 from typing import Type, Tuple, Union, Optional
 
 import cuda.bindings.driver as cuda
-import torch
 
 import cutlass
 import cutlass.cute as cute
@@ -45,6 +44,9 @@ from cutlass.cute.typing import Float32
 from cutlass._mlir.dialects import llvm, nvvm
 from cutlass._mlir.dialects.nvvm import AtomicOpKind
 from cutlass.cutlass_dsl import T
+
+from ..gemm_validation import require_cluster_shape as _require_cluster_shape
+from ..gemm_validation import require_mma_tiler as _require_mma_tiler
 
 
 def atomic_add_float32(
@@ -107,6 +109,41 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         >>> gemm(a_tensor, b_tensor, sfa_tensor, sfb_tensor, c_tensor, d_tensor, prob_tensor, amax_tensor, sfd_tensor, norm_const_tensor, alpha, max_active_clusters, stream)
     """
 
+    # Configuration values supported by the FE Torch and JAX wrappers.
+    MMA_TILER_M = (128, 256)
+    MMA_TILER_N = (64, 128, 192, 256)
+    TWO_CTA_MMA_TILER_M = 256
+    MAX_CLUSTER_CTAS = 16
+    MAX_CLUSTER_DIMENSION = 4
+    SF_VEC_SIZES = (16, 32)
+
+    @classmethod
+    def require_mma_tiler(cls, mma_tiler_mn: Tuple[int, int]) -> Tuple[int, int]:
+        """Validate an FE-supported MMA tile."""
+
+        return _require_mma_tiler(
+            mma_tiler_mn,
+            allowed_m=cls.MMA_TILER_M,
+            allowed_n=cls.MMA_TILER_N,
+        )
+
+    @classmethod
+    def require_cluster_shape(
+        cls,
+        cluster_shape_mn: Tuple[int, int],
+        *,
+        mma_tiler_mn: Tuple[int, int],
+    ) -> Tuple[int, int]:
+        """Validate an FE-supported cluster shape for an MMA tile."""
+
+        return _require_cluster_shape(
+            cluster_shape_mn,
+            mma_m=mma_tiler_mn[0],
+            two_cta_mma_m=cls.TWO_CTA_MMA_TILER_M,
+            max_ctas=cls.MAX_CLUSTER_CTAS,
+            max_dimension=cls.MAX_CLUSTER_DIMENSION,
+        )
+
     def __init__(
         self,
         sf_vec_size: int,
@@ -136,7 +173,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
 
         self.acc_dtype = cutlass.Float32
         self.sf_vec_size = sf_vec_size
-        self.use_2cta_instrs = mma_tiler_mn[0] == 256
+        self.use_2cta_instrs = mma_tiler_mn[0] == self.TWO_CTA_MMA_TILER_M
         self.cluster_shape_mn = cluster_shape_mn
         # K dimension is deferred in _setup_attributes
         self.mma_tiler = (*mma_tiler_mn, 1)
@@ -1909,8 +1946,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             return 1 / 128.0
         return 1.0
 
-    @staticmethod
+    @classmethod
     def is_valid_dtypes_and_scale_factor_vec_size(
+        cls,
         ab_dtype: Type[cutlass.Numeric],
         sf_dtype: Type[cutlass.Numeric],
         sf_vec_size: int,
@@ -1943,7 +1981,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
 
         if ab_dtype in {cutlass.Float8E5M2, cutlass.Float8E4M3FN}:
             # Check valid sf_vec_size
-            if sf_vec_size not in {16, 32}:
+            if sf_vec_size not in cls.SF_VEC_SIZES:
                 is_valid = False
             # Check valid sf_dtype
             if sf_dtype not in {cutlass.Float8E8M0FNU, cutlass.Float8E4M3FN}:
@@ -2002,8 +2040,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
 
         return is_valid
 
-    @staticmethod
+    @classmethod
     def is_valid_mma_tiler_and_cluster_shape(
+        cls,
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
     ) -> bool:
@@ -2018,30 +2057,12 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         :return: True if the mma tiler and cluster shape are valid, False otherwise
         :rtype: bool
         """
-        is_valid = True
-        # Skip invalid mma tile shape
-        if mma_tiler_mn[0] not in [128, 256]:
-            is_valid = False
-        if mma_tiler_mn[1] not in [64, 128, 192, 256]:
-            is_valid = False
-        # Skip illegal cluster shape
-        if cluster_shape_mn[0] % (2 if mma_tiler_mn[0] == 256 else 1) != 0:
-            is_valid = False
-        # Skip invalid cluster shape
-        is_power_of_2 = lambda x: x > 0 and (x & (x - 1)) == 0
-        if (
-            cluster_shape_mn[0] * cluster_shape_mn[1] > 16
-            or cluster_shape_mn[0] <= 0
-            or cluster_shape_mn[1] <= 0
-            # Special cluster shape check for scale factor multicasts.
-            # Due to limited size of scale factors, we can't multicast among more than 4 CTAs.
-            or cluster_shape_mn[0] > 4
-            or cluster_shape_mn[1] > 4
-            or not is_power_of_2(cluster_shape_mn[0])
-            or not is_power_of_2(cluster_shape_mn[1])
-        ):
-            is_valid = False
-        return is_valid
+        try:
+            mma_tiler_mn = cls.require_mma_tiler(mma_tiler_mn)
+            cls.require_cluster_shape(cluster_shape_mn, mma_tiler_mn=mma_tiler_mn)
+        except (ValueError, NotImplementedError):
+            return False
+        return True
 
     @staticmethod
     def is_valid_tensor_alignment(
@@ -2096,8 +2117,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             is_valid = False
         return is_valid
 
-    @staticmethod
+    @classmethod
     def can_implement(
+        cls,
         ab_dtype: Type[cutlass.Numeric],
         sf_dtype: Type[cutlass.Numeric],
         sf_vec_size: int,
@@ -2147,16 +2169,16 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         """
         can_implement = True
         # Skip unsupported types
-        if not Sm100BlockScaledPersistentDenseGemmKernel.is_valid_dtypes_and_scale_factor_vec_size(ab_dtype, sf_dtype, sf_vec_size, d_dtype):
+        if not cls.is_valid_dtypes_and_scale_factor_vec_size(ab_dtype, sf_dtype, sf_vec_size, d_dtype):
             can_implement = False
         # Skip unsupported layouts
-        if not Sm100BlockScaledPersistentDenseGemmKernel.is_valid_layouts(ab_dtype, d_dtype, a_major, b_major, d_major):
+        if not cls.is_valid_layouts(ab_dtype, d_dtype, a_major, b_major, d_major):
             can_implement = False
         # Skip invalid mma tile shape and cluster shape
-        if not Sm100BlockScaledPersistentDenseGemmKernel.is_valid_mma_tiler_and_cluster_shape(mma_tiler_mn, cluster_shape_mn):
+        if not cls.is_valid_mma_tiler_and_cluster_shape(mma_tiler_mn, cluster_shape_mn):
             can_implement = False
         # Skip illegal problem shape for load/store alignment
-        if not Sm100BlockScaledPersistentDenseGemmKernel.is_valid_tensor_alignment(m, n, k, l, ab_dtype, d_dtype, a_major, b_major, d_major):
+        if not cls.is_valid_tensor_alignment(m, n, k, l, ab_dtype, d_dtype, a_major, b_major, d_major):
             can_implement = False
         return can_implement
 

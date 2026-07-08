@@ -63,6 +63,10 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass._mlir.dialects.nvvm import ReduxKind
 from cutlass.cute.typing import Float32, Int32, AddressSpace
+from ...gemm_validation import (
+    require_cluster_shape as _require_cluster_shape,
+    require_mma_tiler as _require_mma_tiler,
+)
 from ..moe_persistent_scheduler import (
     MoEPersistentTileScheduler,
     MoESchedulerParams,
@@ -117,7 +121,57 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
     :param enable_bias: Enable bias addition.
     """
 
+    MMA_TILER_M = (256,)
+    MMA_TILER_N = (256,)
+    TWO_CTA_MMA_TILER_M = 256
+    MAX_CLUSTER_CTAS = 16
+    MAX_CLUSTER_DIMENSION = 4
+    CLUSTER_TILER_M = (256,)
+    SF_VEC_SIZES = (16, 32)
+    MAX_EXPERTS = 1024
+    DYNAMIC_SCHED_WORKSPACE_BYTES = 4
+    HADAMARD_SIZE = HADAMARD_SIZE
     FIX_PAD_SIZE = 256
+
+    @classmethod
+    def require_mma_tiler(cls, mma_tiler_mn: Tuple[int, int]) -> Tuple[int, int]:
+        """Validate the MMA tile supported by the Hadamard fusion."""
+
+        return _require_mma_tiler(
+            mma_tiler_mn,
+            allowed_m=cls.MMA_TILER_M,
+            allowed_n=cls.MMA_TILER_N,
+        )
+
+    @classmethod
+    def require_cluster_shape(
+        cls,
+        cluster_shape_mn: Tuple[int, int],
+        *,
+        mma_tiler_mn: Tuple[int, int],
+    ) -> Tuple[int, int]:
+        """Validate the cluster shape supported by the Hadamard scheduler."""
+
+        cluster_shape_mn = _require_cluster_shape(
+            cluster_shape_mn,
+            mma_m=mma_tiler_mn[0],
+            two_cta_mma_m=cls.TWO_CTA_MMA_TILER_M,
+            max_ctas=cls.MAX_CLUSTER_CTAS,
+            max_dimension=cls.MAX_CLUSTER_DIMENSION,
+        )
+        cta_group_size = 2 if mma_tiler_mn[0] == cls.TWO_CTA_MMA_TILER_M else 1
+        cluster_tiler_m = cluster_shape_mn[0] // cta_group_size * mma_tiler_mn[0]
+        if cluster_tiler_m not in cls.CLUSTER_TILER_M:
+            raise ValueError(
+                f"cluster M tile must be one of {cls.CLUSTER_TILER_M}, " f"got {cluster_tiler_m} from MMA tile {mma_tiler_mn} and cluster {cluster_shape_mn}"
+            )
+        return cluster_shape_mn
+
+    @classmethod
+    def get_dense_workspace_bytes(cls, use_dynamic_sched: bool) -> int:
+        """Return the temporary workspace size for dense-weight mode."""
+
+        return cls.DYNAMIC_SCHED_WORKSPACE_BYTES if use_dynamic_sched else 0
 
     @staticmethod
     def can_implement(
@@ -457,7 +511,7 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
     def get_workspace_bytes(self) -> int:
         """Return total workspace size in bytes."""
         desc_workspace_bytes = self.get_desc_workspace_bytes()
-        dynamic_sched_bytes = 4 if self.use_dynamic_sched else 0
+        dynamic_sched_bytes = self.get_dense_workspace_bytes(self.use_dynamic_sched)
         return desc_workspace_bytes + dynamic_sched_bytes
 
     @cute.jit

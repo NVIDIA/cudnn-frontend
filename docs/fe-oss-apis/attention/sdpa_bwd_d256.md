@@ -45,6 +45,13 @@ Here, the `sum(dP \odot P)` term is reduced row-wise over the key/softmax dimens
 
 ### High-level wrapper
 
+``````{tab-set}
+:sync-group: frontend-framework
+
+`````{tab-item} PyTorch
+:sync: torch
+:selected:
+
 ```python
 import torch
 from cudnn import sdpa_bwd_wrapper_sm100_d256
@@ -72,6 +79,50 @@ result = sdpa_bwd_wrapper_sm100_d256(
 dq, dk, dv = result
 # Key access: result["dq_tensor"], result["dk_tensor"], result["dv_tensor"]
 ```
+
+`````
+
+`````{tab-item} JAX
+:sync: jax
+
+```python
+import jax
+from cudnn.jax import sdpa_bwd_wrapper_sm100_d256
+
+@jax.jit
+def sdpa_bwd(q, k, v, o, do, lse):
+    return sdpa_bwd_wrapper_sm100_d256(
+        q,
+        k,
+        v,
+        o,
+        do,
+        lse,
+        mma_tiler_mn=(128, 128),
+        dkdv_mma_tiler_mn=(128, 64),
+        is_causal=False,
+        window_size=(-1, -1),
+        scale_softmax=None,
+    )
+
+result = sdpa_bwd(q, k, v, o, do, lse)
+dq, dk, dv = result["dq"]_tensor, result["dk_tensor"], result["dv_tensor"]
+```
+
+The JAX wrapper returns
+`TupleDict(dq_tensor=..., dk_tensor=..., dv_tensor=...)`. It supports
+fixed BHSD arrays only: Q, K, V, O, and dO have logical shape
+`(B,H,S,256)`, all floating inputs except FP32 LSE share FP16 or BF16 dtype,
+and `H_q % H_kv == 0`. Packed THD inputs, cumulative lengths, `max_s_*`,
+explicit output buffers, and stream arguments remain PyTorch-only. Tensor
+inputs are runtime operands; shapes, dtypes, tilers, mask/window selection,
+and `scale_softmax` are static compilation state. XLA owns dQ/dK/dV and the
+zero-initialized hidden workspace used by the two-kernel implementation. This
+is an explicit backward operation and does not register a JAX autodiff rule.
+
+`````
+
+``````
 
 ### Class API
 
@@ -201,13 +252,16 @@ sdpa_bwd.execute(
 
 ### Wrapper return values
 
-Returns a `TupleDict` with keys:
+The PyTorch wrapper returns a `TupleDict` with keys:
 
 - `dq_tensor`
 - `dk_tensor`
 - `dv_tensor`
 
 Tuple unpacking order is: `(dq_tensor, dk_tensor, dv_tensor)`.
+
+The JAX wrapper returns `TupleDict` with the same field names and tuple
+order.
 
 ### Class-specific parameters: `SdpabwdSm100D256`
 
@@ -277,4 +331,3 @@ For runnable examples and reference-comparison checks, see:
 
 - `test/python/fe_api/test_sdpa_bwd.py`
 - `test/python/fe_api/test_sdpa_bwd_utils.py`
-

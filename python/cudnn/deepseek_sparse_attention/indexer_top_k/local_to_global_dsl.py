@@ -9,19 +9,16 @@ global id space with one small DSL kernel:
 
 from __future__ import annotations
 
-import torch
+from typing import TYPE_CHECKING
+
 import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Int64, const_expr
 
-from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
-from cudnn.deepseek_sparse_attention.utils.runtime import (
-    device_major as _get_device_capability,
-    resolve_stream,
-)
-from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor as _to_cute_tensor
+if TYPE_CHECKING:
+    import torch
 
 
 class LocalToGlobalTopK:
@@ -120,6 +117,12 @@ _compile_cache: dict[tuple, object] = {}
 
 
 def is_available() -> bool:
+    import torch
+
+    from cudnn.deepseek_sparse_attention.utils.runtime import (
+        device_major as _get_device_capability,
+    )
+
     # The kernel is arch-agnostic CuTe DSL: thread/block indexing, integer
     # ALU, and plain global mem load/store — no TMA / TMEM / tcgen05 / wgmma.
     # SM90+ is enough.
@@ -133,6 +136,14 @@ def local_to_global(
     cu_seqlens_k: torch.Tensor | None = None,
     stream: cuda.CUstream | None = None,
 ) -> torch.Tensor:
+    import torch
+
+    from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
+    from cudnn.deepseek_sparse_attention.utils.runtime import resolve_stream
+    from cudnn.deepseek_sparse_attention.utils.tensor_conversion import (
+        to_cute_tensor as _to_cute_tensor,
+    )
+
     if not is_available():
         raise RuntimeError("CuTe DSL local_to_global requires an SM90+ CUDA device")
     if not local_indices.is_cuda or not local_indices.is_contiguous():

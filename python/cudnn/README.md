@@ -14,27 +14,72 @@ A simplified view of package structure:
 pyproject.toml                       # Project metadata and dependencies. Optional dependencies for frontend-only APIs are registered here.
 python/cudnn/
 ├── __init__.py                     # Top-level exports (Graph, graph, jit, wrappers, kernels)
+├── _operation_api.py               # Shared lazy operation API exports
+├── jax/                            # Explicit JAX facade and shared CuTe/JAX adapter
 ├── graph.py                        # Low-level graph helpers (graph, jit, graph_cache)
 ├── wrapper.py                      # High-level Graph wrapper class
 ├── datatypes.py                    # Data type conversions and helpers
 ├── api_base.py                     # Abstract API base class for frontend-only APIs
 ├── {frontend-only-api-name}/
-│   ├── __init__.py                 # Frontend-only API class
-│   └── api.py                      # High-level API implementation
+│   ├── __init__.py                 # Lazy api.py exports and explicit .jax namespace
+│   ├── api.py                      # PyTorch API implementation
+│   ├── jax.py                      # Optional JAX functional API
+│   ├── config.py                   # Framework-neutral operator configuration
 │   └── {kernel_name}.py            # Kernel implementation, i.e CuteDSL
 test/python/                        # Test files
 └── fe_api/                         # Test files for frontend-only APIs
 ```
 
-## 
-
 ## Adding new frontend-only APIs
 
-To add a new frontend-only API, follow these steps:
-1. Create a new directory in the `python/cudnn` directory with the name of the API.
-2. Add your kernel implementation and implement the high level API implementation in `api.py`, extending the `APIBase` class in `api_base.py`.
-3. Expose the API import in `python/cudnn/__init__.py` and register the folder in `pyproject.toml`. Register any optional dependences if required.
-4. Add a sample usage/test file in `test/python/fe_api/`.
+The review unit is a user-visible operation, which may use one or more
+main/helper CuTe kernels. Existing unqualified names retain their PyTorch
+meaning; JAX is an explicit optional functional namespace. When both bindings
+exist, they should implement comparable functionality on their documented
+overlapping domain and use familiar terminology where practical:
+
+```python
+from cudnn import my_operation_wrapper
+torch_result = my_operation_wrapper(torch_inputs, ...)
+
+from cudnn.jax import my_operation
+jax_result = my_operation(jax_inputs, ...)
+```
+
+To add a new frontend-only API:
+
+1. Document logical inputs and outputs, supported shapes/dtypes/layouts,
+   workspace, aliasing, initialization, and transformation behavior.
+2. Add the CuTe implementation and preserve the existing PyTorch class/wrapper
+   conventions and compatibility behavior.
+3. If JAX support is in scope, add a functional adapter using
+   `cutlass.jax.cutlass_call`. It must infer outputs/workspace from abstract
+   metadata, accept XLA's stream, and avoid Torch imports or host reads during
+   tracing.
+4. Prefer recognizable operation, operand, option, and result names across
+   frameworks, but document intentional differences. Exact Python names,
+   signatures, defaults, layouts, result containers, and supported domains are
+   not required to match.
+5. Test each framework's lifecycle and compare numerical behavior on the domain
+   they share. JAX coverage should include `eval_shape`, `jit`, lowering, and
+   execution on supported hardware.
+6. During review, consider whether a new or modified PyTorch operation should
+   update JAX. Static lint or LLM review may report likely gaps or drift, but is
+   advisory rather than a public API contract or merge gate.
+7. Keep `api.py` as the PyTorch implementation and place an optional JAX
+   implementation in `jax.py` beside it. Unqualified operation symbols always
+   resolve from `api.py`; use `<operation>.jax` or `cudnn.jax` explicitly for
+   JAX. Dependency availability must not change a symbol's framework. Register
+   JAX dependencies only in the optional extra.
+
+Do not use tensor-type dispatch or a traced `target=` argument. JAX does not
+emulate the mutable `APIBase.compile()` / `execute()` lifecycle, and adding or
+updating a PyTorch operation does not require a JAX binding.
+
+The JAX import-boundary test discovers every `jax.py` automatically and follows
+its local kernel dependencies. New JAX operations do not require a per-kernel
+import allowlist; keep shared modules free of required module-scope Torch
+dependencies.
 
 **Currently implemented frontend-only APIs**:
 - `GEMM + Amax`
@@ -57,6 +102,7 @@ To add a new frontend-only API, follow these steps:
 - `Block Sparse Attention (BSA)`
 - `SDPA Forward (SM100, D=256)`
 - `SDPA Backward (SM100, D=256)`
+- `DeepSeek Sparse Attention (DSA) stages`
 
 **In progress frontend-only APIs**:
 - GEMM + Dswiglu

@@ -42,6 +42,9 @@ import cutlass.utils.blockscaled_layout as blockscaled_utils
 import cutlass.cute.math as math
 from cutlass.cute.typing import Float32
 
+from ..gemm_validation import require_cluster_shape as _require_cluster_shape
+from ..gemm_validation import require_mma_tiler as _require_mma_tiler
+
 
 def sigmoid_f32(a: Union[float, Float32], fastmath: bool = False) -> Union[float, Float32]:
     """
@@ -153,6 +156,52 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         >>> gemm(a_tensor, b_tensor, sfa_tensor, sfb_tensor, c_tensor, max_active_clusters, stream)
     """
 
+    # Configuration values supported by the FE Torch wrapper.
+    MMA_TILER_M = (128, 256)
+    MMA_TILER_N = (64, 128, 192, 256)
+    TWO_CTA_MMA_TILER_M = 256
+    MAX_CLUSTER_CTAS = 16
+    MAX_CLUSTER_DIMENSION = 4
+    SF_VEC_SIZES = (16, 32)
+    SWIGLU_BLOCK_COLUMNS = 32
+    SWIGLU_BLOCKS_PER_PAIR = 2
+
+    @classmethod
+    def require_mma_tiler(cls, mma_tiler_mn: Tuple[int, int]) -> Tuple[int, int]:
+        """Validate an FE-supported MMA tile."""
+
+        return _require_mma_tiler(
+            mma_tiler_mn,
+            allowed_m=cls.MMA_TILER_M,
+            allowed_n=cls.MMA_TILER_N,
+        )
+
+    @classmethod
+    def require_cluster_shape(
+        cls,
+        cluster_shape_mn: Tuple[int, int],
+        *,
+        mma_tiler_mn: Tuple[int, int],
+    ) -> Tuple[int, int]:
+        """Validate an FE-supported cluster shape for an MMA tile."""
+
+        return _require_cluster_shape(
+            cluster_shape_mn,
+            mma_m=mma_tiler_mn[0],
+            two_cta_mma_m=cls.TWO_CTA_MMA_TILER_M,
+            max_ctas=cls.MAX_CLUSTER_CTAS,
+            max_dimension=cls.MAX_CLUSTER_DIMENSION,
+        )
+
+    @classmethod
+    def get_output_n(cls, n: int) -> int:
+        """Validate the input N dimension and return the SwiGLU output N."""
+
+        required_columns = cls.SWIGLU_BLOCK_COLUMNS * cls.SWIGLU_BLOCKS_PER_PAIR
+        if n % required_columns:
+            raise ValueError(f"N must be divisible by {required_columns} for {cls.SWIGLU_BLOCK_COLUMNS}-column SwiGLU block pairs, got {n}")
+        return n // cls.SWIGLU_BLOCKS_PER_PAIR
+
     def __init__(
         self,
         sf_vec_size: int,
@@ -185,7 +234,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
 
         self.acc_dtype = cutlass.Float32
         self.sf_vec_size = sf_vec_size
-        self.use_2cta_instrs = mma_tiler_mn[0] == 256
+        self.use_2cta_instrs = mma_tiler_mn[0] == self.TWO_CTA_MMA_TILER_M
         self.cluster_shape_mn = cluster_shape_mn
         self.ab12_stages = ab12_stages
         # K dimension is deferred in _setup_attributes

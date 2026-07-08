@@ -20,10 +20,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils
-import torch
 from cutlass.utils.distributed import atomicAdd
-
-from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
 
 from .block_scan import block_prefix_sum_kernel
 from .indexer_top_k_varlen_util import IndexerTopKKernelVarlen
@@ -573,13 +570,6 @@ def _next_positive_power_of_2(x: int) -> int:
     return 1 << (x - 1).bit_length()
 
 
-_TORCH_TO_CUTLASS_DTYPE = {
-    torch.float16: cutlass.Float16,
-    torch.bfloat16: cutlass.BFloat16,
-    torch.float32: cutlass.Float32,
-}
-
-
 def _bucket_num_cols(num_cols: int) -> int:
     """Bucket num_cols to the next power of 2 for compilation caching.
 
@@ -603,8 +593,18 @@ def cute_dsl_topk_wrapper(
     load_balance=False,
     num_copy_bits=256,
 ):
+    # Keep Torch out of the framework-neutral kernel import path.  The JAX
+    # frontend imports ``IndexerTopKKernelVarlenDecode`` from this module.
+    import torch
+    from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
+
+    torch_to_cutlass_dtype = {
+        torch.float16: cutlass.Float16,
+        torch.bfloat16: cutlass.BFloat16,
+        torch.float32: cutlass.Float32,
+    }
     torch_dtype = input_values.dtype
-    dtype = _TORCH_TO_CUTLASS_DTYPE[torch_dtype]
+    dtype = torch_to_cutlass_dtype[torch_dtype]
     num_rows, num_cols = input_values.shape
     bucketed_num_cols = _bucket_num_cols(num_cols)
 

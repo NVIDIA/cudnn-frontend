@@ -75,6 +75,13 @@ A (MxKxL), SFA                   B (NxKxL), SFB
 
 ### High-level wrapper
 
+``````{tab-set}
+:sync-group: frontend-framework
+
+`````{tab-item} PyTorch
+:sync: torch
+:selected:
+
 ```python
 from cudnn import gemm_dsrelu_wrapper_sm100
 
@@ -100,7 +107,70 @@ result = gemm_dsrelu_wrapper_sm100(
 d, dprob, amax, sfd = result
 ```
 
+`````
+
+`````{tab-item} JAX
+:sync: jax
+
+Install the JAX integration with `pip install nvidia-cudnn-frontend[jax]`.
+
+```python
+import jax
+import jax.numpy as jnp
+from cudnn.jax import gemm_dsrelu_wrapper_sm100
+
+@jax.jit
+def run(a, b, c, sfa, sfb, prob):
+    # A is (L, M, K); B is (L, N, K); C is (L, M, N).
+    # prob retains its specialized (M, 1, L) ABI.
+    return gemm_dsrelu_wrapper_sm100(
+        a,
+        b,
+        c,
+        sfa,
+        sfb,
+        prob,
+        alpha=1.0,
+        d_layout="LMN",
+        d_dtype=jnp.bfloat16,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=32,
+        a_layout="LMK",
+        b_layout="LNK",
+    )
+
+d, dprob, amax, sfd = run(a, b, c, sfa, sfb, prob)
+# d.shape == (L, M, N); dprob.shape == (M, 1, L)
+```
+
+The JAX API supports FP8 A/B with E8M0 scale factors and
+`sf_vec_size=32`. C and D may be float32, float16, or bfloat16. The API
+creates and zero-initializes `dprob` for each invocation. Output quantization
+is not exposed, so `amax` and `sfd` are `None`. `M` must be divisible by the
+per-CTA M extent because the native probability load is not predicated for a
+partial final CTA tile. That extent is 128 rows for both `TILE_M=128` and the
+two-CTA `TILE_M=256` mode.
+
+Layout strings describe the public, batch-first axis order. `a_layout` accepts
+`"LMK"` or `"LKM"`, `b_layout` accepts `"LNK"` or `"LKN"`, and `d_layout`
+accepts `"LMN"` or `"LNM"` for both the C input and D output. All accepted
+layouts keep `L` outermost; the defaults are `"LMK"`, `"LNK"`, and `"LMN"`.
+The specialized scale-factor tensors retain the shapes above, while `prob` and
+`dprob` remain `(M, 1, L)`.
+
+`````
+
+``````
+
 ### Class API
+
+``````{tab-set}
+:sync-group: frontend-framework
+
+`````{tab-item} PyTorch
+:sync: torch
+:selected:
 
 ```python
 from cudnn import GemmDsreluSm100
@@ -142,9 +212,51 @@ op.execute(
 )
 ```
 
+`````
+
+`````{tab-item} JAX
+:sync: jax
+
+```python
+import jax
+import jax.numpy as jnp
+from cudnn.jax import GemmDsreluSm100
+
+op = GemmDsreluSm100(
+    sample_a=jax.ShapeDtypeStruct(a.shape, a.dtype),
+    sample_b=jax.ShapeDtypeStruct(b.shape, b.dtype),
+    sample_c=jax.ShapeDtypeStruct(c.shape, c.dtype),
+    sample_sfa=jax.ShapeDtypeStruct(sfa.shape, sfa.dtype),
+    sample_sfb=jax.ShapeDtypeStruct(sfb.shape, sfb.dtype),
+    sample_prob=jax.ShapeDtypeStruct(prob.shape, prob.dtype),
+    alpha=1.0,
+    d_layout="LMN",
+    d_dtype=jnp.bfloat16,
+    acc_dtype=jnp.float32,
+    mma_tiler_mn=(256, 256),
+    cluster_shape_mn=(2, 1),
+    sf_vec_size=32,
+    a_layout="LMK",
+    b_layout="LNK",
+)
+assert op.check_support()
+d, dprob, amax, sfd = jax.jit(op)(a, b, c, sfa, sfb, prob)
+```
+
+The constructor retains only the input descriptors. Outputs are allocated by
+the JAX call; `amax` and `sfd` are `None` in the supported output modes.
+
+`````
+
+``````
+
 ---
 
-## Parameters
+## PyTorch parameter reference
+
+This section documents the existing PyTorch tensor shapes and major-mode
+arguments. The JAX public shapes and layout strings are described in the JAX
+usage tabs above.
 
 ### Input/Output tensors
 
@@ -218,6 +330,8 @@ Returns a `TupleDict` with keys:
 - `sfd_tensor`
 
 Tuple unpacking order is: `(d_tensor, dprob_tensor, amax_tensor, sfd_tensor)`.
+
+The JAX API returns the same `TupleDict` keys and unpacking order.
 
 ---
 

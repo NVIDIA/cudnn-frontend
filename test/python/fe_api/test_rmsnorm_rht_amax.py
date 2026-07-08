@@ -122,3 +122,34 @@ def test_rmsnorm_rht_amax_wrapper(n, num_threads, rows_per_cta, request):
     assert outputs["o_tensor"].shape == (m, n)
     assert outputs["amax_tensor"].shape == (m // rows_per_cta,)
     _assert_ref_close(x, w, outputs["o_tensor"], outputs["amax_tensor"], eps=eps, rows_per_cta=rows_per_cta, skip_ref=skip_ref)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_rmsnorm_rht_amax_aligned_api(request):
+    try:
+        from cudnn import rmsnorm_rht_amax_sm100
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn optional dependencies not installed")
+
+    skip_ref = request.config.getoption("--skip-ref", default=False)
+    eps = 1e-5
+    m, n = 256, 2048
+    rows_per_cta = 2
+    x, weight = _make_inputs(m=m, n=n)
+
+    try:
+        result = rmsnorm_rht_amax_sm100(
+            x,
+            weight,
+            eps=eps,
+            num_threads=128,
+            rows_per_cta=rows_per_cta,
+        )
+    except (ValueError, RuntimeError) as exc:
+        pytest.skip(f"Unsupported testcase: {exc}")
+
+    assert tuple(result.keys()) == ("output", "amax")
+    assert result["output"].shape == (m, n)
+    assert result["amax"].shape == (m // rows_per_cta,)
+    _assert_ref_close(x, weight, result["output"], result["amax"], eps=eps, rows_per_cta=rows_per_cta, skip_ref=skip_ref)

@@ -1,10 +1,10 @@
-"""APIBase wrappers for the four DSA score-recompute operations.
+"""ApiBaseTorch wrappers for the four DSA score-recompute operations.
 
 Wraps the SM100 and SM90 CuTe-DSL score kernels. Each backend provides
 indexer and attention score variants, giving four public classes.
 
 Tile / SMEM dispatch logic and compile caching live in the backend interface
-modules. This module adapts those entry points to the APIBase contract.
+modules. This module adapts those entry points to the ApiBaseTorch contract.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from typing import Optional
 import torch
 import cuda.bindings.driver as cuda
 
-from cudnn.api_base import APIBase, TupleDict
+from cudnn.api_base import ApiBaseTorch, TupleDict
 
 from . import _interface_sm100 as _iface_sm100
 
@@ -23,7 +23,7 @@ from . import _interface_sm100 as _iface_sm100
 # ---------------------------------------------------------------------------
 
 
-def _check_score_arch(api: APIBase) -> None:
+def _check_score_arch(api: ApiBaseTorch) -> None:
     major, _ = torch.cuda.get_device_capability()
     api._runtime_error_if(
         major != 9 and major < 10,
@@ -31,8 +31,8 @@ def _check_score_arch(api: APIBase) -> None:
     )
 
 
-class _ScoreRecomputeBase(APIBase):
-    """Common APIBase shell for score-recompute ops.
+class _ScoreRecomputeBase(ApiBaseTorch):
+    """Common ApiBaseTorch shell for score-recompute ops.
 
     ``_interface.py`` owns compile caches keyed per-kernel; ``check_support``
     and ``compile`` are thin markers that simply gate invocation. ``execute``
@@ -53,7 +53,7 @@ class _ScoreRecomputeBase(APIBase):
 
 
 def _check_sparse_score_shapes(
-    api: APIBase,
+    api: ApiBaseTorch,
     q_desc,
     k_desc,
     aux_desc,
@@ -83,7 +83,7 @@ def _check_sparse_score_shapes(
 
 
 def _check_dense_score_shapes(
-    api: APIBase,
+    api: ApiBaseTorch,
     q_desc,
     k_desc,
     aux_desc,

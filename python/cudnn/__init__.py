@@ -292,6 +292,7 @@ _LAZY_OPTIONAL_IMPORTS = {
     "GemmAmaxSm100": (".gemm_amax", "GemmAmaxSm100"),
     "gemm_amax_wrapper_sm100": (".gemm_amax", "gemm_amax_wrapper_sm100"),
     "RmsNormRhtAmaxSm100": (".rmsnorm_rht_amax", "RmsNormRhtAmaxSm100"),
+    "rmsnorm_rht_amax_sm100": (".rmsnorm_rht_amax", "rmsnorm_rht_amax_sm100"),
     "rmsnorm_rht_amax_wrapper_sm100": (".rmsnorm_rht_amax", "rmsnorm_rht_amax_wrapper_sm100"),
     "grouped_gemm": (".grouped_gemm", None),
     "GroupedGemmSwigluSm100": (".grouped_gemm", "GroupedGemmSwigluSm100"),
@@ -354,6 +355,11 @@ def __getattr__(name: str) -> Any:
 
         globals()["experimental"] = _experimental
         return _experimental
+
+    if name == "jax":
+        _jax = importlib.import_module(".jax", __name__)
+        globals()["jax"] = _jax
+        return _jax
 
     if name in _LAZY_OPTIONAL_IMPORTS:
         return _load_optional_symbol(name)

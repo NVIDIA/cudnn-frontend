@@ -39,6 +39,10 @@ from cutlass.utils.gemm.sm100 import (
     epilogue_tmem_copy_and_partition,
     epilogue_smem_copy_and_partition,
 )
+from ...gemm_validation import (
+    require_cluster_shape as _require_cluster_shape,
+    require_mma_tiler as _require_mma_tiler,
+)
 from ..moe_persistent_scheduler import (
     MoEPersistentTileScheduler,
     MoESchedulerParams,
@@ -69,6 +73,82 @@ class BlockScaledMoEGroupedGemmWgradKernel:
     :param expert_cnt: Number of experts.
     :param weight_mode: ``MoEWeightMode.DENSE`` or ``MoEWeightMode.DISCRETE`` for output.
     """
+
+    MMA_TILER_M = (128, 256)
+    MMA_TILER_N = (128, 256)
+    TWO_CTA_MMA_TILER_M = 256
+    MAX_CLUSTER_CTAS = 16
+    MAX_CLUSTER_DIMENSION = 4
+    CLUSTER_TILER_M = (128, 256)
+    SF_VEC_SIZES = (16, 32)
+    FP8_SF_VEC_SIZE = 32
+
+    @classmethod
+    def require_mma_tiler(cls, mma_tiler_mn: Tuple[int, int]) -> Tuple[int, int]:
+        """Validate an FE-supported grouped-wgrad MMA tile."""
+
+        return _require_mma_tiler(
+            mma_tiler_mn,
+            allowed_m=cls.MMA_TILER_M,
+            allowed_n=cls.MMA_TILER_N,
+        )
+
+    @classmethod
+    def require_cluster_shape(
+        cls,
+        cluster_shape_mn: Tuple[int, int],
+        *,
+        mma_tiler_mn: Tuple[int, int],
+    ) -> Tuple[int, int]:
+        """Validate a cluster shape for the selected grouped-wgrad tile."""
+
+        cluster_shape_mn = _require_cluster_shape(
+            cluster_shape_mn,
+            mma_m=mma_tiler_mn[0],
+            two_cta_mma_m=cls.TWO_CTA_MMA_TILER_M,
+            max_ctas=cls.MAX_CLUSTER_CTAS,
+            max_dimension=cls.MAX_CLUSTER_DIMENSION,
+        )
+        cta_group_size = 2 if mma_tiler_mn[0] == cls.TWO_CTA_MMA_TILER_M else 1
+        cluster_tiler_m = cluster_shape_mn[0] // cta_group_size * mma_tiler_mn[0]
+        if cluster_tiler_m not in cls.CLUSTER_TILER_M:
+            raise ValueError(
+                f"cluster M tile must be one of {cls.CLUSTER_TILER_M}, "
+                f"got {cluster_tiler_m} from MMA tile {mma_tiler_mn} "
+                f"and cluster {cluster_shape_mn}"
+            )
+        return cluster_shape_mn
+
+    @staticmethod
+    def require_input_order(
+        input_order: WGradInputOrder | str,
+    ) -> WGradInputOrder:
+        """Normalize a supported grouped-wgrad input packing order."""
+
+        if isinstance(input_order, WGradInputOrder):
+            return input_order
+        try:
+            return WGradInputOrder(input_order)
+        except ValueError:
+            choices = ", ".join(order.value for order in WGradInputOrder)
+            raise ValueError(f"input_order must be one of {{{choices}}}, got {input_order!r}") from None
+
+    @classmethod
+    def get_dense_workspace_bytes(
+        cls,
+        expert_cnt: int,
+        input_order: WGradInputOrder | str = WGradInputOrder.Tensor2D,
+    ) -> int:
+        """Return TMA-descriptor workspace bytes for dense output mode."""
+
+        if expert_cnt < 0:
+            raise ValueError(f"expert_cnt must be non-negative, got {expert_cnt}")
+        input_order = cls.require_input_order(input_order)
+        return WgradSfTensormapConstructor.get_workspace_size(
+            input_order,
+            MoEWeightMode.DENSE,
+            expert_cnt,
+        )
 
     def __init__(
         self,
@@ -120,7 +200,16 @@ class BlockScaledMoEGroupedGemmWgradKernel:
     # ------------------------------------------------------------------
 
     def get_workspace_bytes(self) -> int:
-        return WgradSfTensormapConstructor.get_workspace_size(self.input_order, self.weight_mode, self.expert_cnt)
+        if self.weight_mode == MoEWeightMode.DENSE:
+            return self.get_dense_workspace_bytes(
+                self.expert_cnt,
+                self.input_order,
+            )
+        return WgradSfTensormapConstructor.get_workspace_size(
+            self.input_order,
+            self.weight_mode,
+            self.expert_cnt,
+        )
 
     # ------------------------------------------------------------------
     # _setup_attributes

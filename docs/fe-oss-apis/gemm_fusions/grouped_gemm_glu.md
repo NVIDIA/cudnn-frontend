@@ -119,6 +119,13 @@ $$
 
 **Dense mode:**
 
+``````{tab-set}
+:sync-group: frontend-framework
+
+`````{tab-item} PyTorch
+:sync: torch
+:selected:
+
 ```python
 from cudnn import grouped_gemm_glu_wrapper_sm100
 from cuda.bindings import driver as cuda
@@ -162,6 +169,62 @@ sfd_col = outputs["sfd_col_tensor"]
 # or tuple unpacking:
 c, d, d_col, amax, sfd_row, sfd_col = outputs
 ```
+
+`````
+
+`````{tab-item} JAX
+:sync: jax
+
+Install the JAX integration with `pip install nvidia-cudnn-frontend[jax]`.
+
+```python
+import jax
+import jax.numpy as jnp
+from cudnn.jax import grouped_gemm_glu_wrapper_sm100
+
+@jax.jit
+def run(a, b, sfa, sfb, padded_offsets, alpha, prob, norm_const, bias):
+    return grouped_gemm_glu_wrapper_sm100(
+        a_tensor=a,
+        sfa_tensor=sfa,
+        padded_offsets=padded_offsets,
+        alpha_tensor=alpha,
+        b_tensor=b,
+        sfb_tensor=sfb,
+        bias_tensor=bias,
+        norm_const_tensor=norm_const,
+        prob_tensor=prob,
+        c_dtype=jnp.bfloat16,
+        d_dtype=jnp.float8_e4m3fn,
+        output_layout="LMN",
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=32,
+        act_func="swiglu",
+        b_layout="LNK",
+    )
+
+result = run(a, b, sfa, sfb, padded_offsets, alpha, prob, norm_const, bias)
+c, d, d_col, amax, sfd_row, sfd_col = result
+```
+
+The JAX matrix inputs have fixed public axis orders: `A` is `LMK` with shape
+`(1, valid_m, K)`, and the supported `b_layout="LNK"` uses shape `(L, N, K)`.
+The `LKN` B order is not supported by this kernel. Matrix outputs are fixed to
+`output_layout="LMN"`: `C` has shape `(1, valid_m, N)`, while `D` and `D_col`
+have shape `(1, valid_m, N/2)` for GLU activations. The expert mode must remain
+outermost in layout strings.
+
+Packed scale tensors, `prob`, `bias`, and reduction outputs retain their
+specialized shapes documented below. The JAX API returns `TupleDict` and
+supports dense FP8 A/B with E8M0 scales and `sf_vec_size=32`; the FP8 D
+configuration above returns `d_col`, `sfd_row`, and `sfd_col`, with
+`amax=None`. Discrete weight pointers and packed FP4 are not exposed. Shapes,
+dtypes, layouts, and configuration arguments are static under `jax.jit`.
+
+`````
+
+``````
 
 **Discrete mode:**
 

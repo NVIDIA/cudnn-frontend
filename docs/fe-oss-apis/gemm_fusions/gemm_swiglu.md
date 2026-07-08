@@ -68,6 +68,13 @@ Notes:
 
 ### High-level wrapper (Standard Mode)
 
+``````{tab-set}
+:sync-group: frontend-framework
+
+`````{tab-item} PyTorch
+:sync: torch
+:selected:
+
 ```python
 result = gemm_swiglu_wrapper_sm100(
     a_tensor,
@@ -86,9 +93,63 @@ ab12, c, sfc, amax = result
 # Key access: result["ab12_tensor"], result["c_tensor"]
 ```
 
+`````
+
+`````{tab-item} JAX
+:sync: jax
+
+Install the JAX integration with `pip install nvidia-cudnn-frontend[jax]`.
+
+```python
+import jax
+import jax.numpy as jnp
+from cudnn.jax import gemm_swiglu_wrapper_sm100
+
+@jax.jit
+def run(a, b):
+    # A is (L, M, K); B is (L, N, K).
+    return gemm_swiglu_wrapper_sm100(
+        a,
+        b,
+        alpha=1.0,
+        c_layout="LNM",
+        ab12_dtype=jnp.float32,
+        c_dtype=jnp.float16,
+        mma_tiler_mn=(128, 128),
+        cluster_shape_mn=(1, 1),
+        a_layout="LMK",
+        b_layout="LNK",
+    )
+
+ab12, c, sfc, amax = run(a, b)
+# ab12.shape == (L, N, M); c.shape == (L, N // 2, M)
+```
+
+The JAX API supports the standard mode. Layout strings describe the public,
+batch-first axis order: `a_layout` accepts `"LMK"` or `"LKM"`, `b_layout`
+accepts `"LNK"` or `"LKN"`, and `c_layout` accepts `"LMN"` or `"LNM"` for
+both AB12 and C. All accepted layouts keep `L` outermost; the defaults are
+`"LMK"`, `"LNK"`, and `"LMN"`. The wrapper maps these arrays to the kernel's
+canonical `(M, K, L)`, `(N, K, L)`, and `(M, N, L)` tensor views.
+
+`TILE_N` must be one of `{64, 128, 192, 256}` because the epilogue consumes
+32-column subtiles in pairs. With `TILE_M=256`, `M` must be divisible by 256 so
+both CTAs in each MMA pair are present. `sfc` and `amax` are `None`.
+
+`````
+
+``````
+
 ### High-level wrapper (Quantized Mode)
 
 When scale factor tensors are provided, the wrapper uses the block-scaled quantized kernel.
+
+``````{tab-set}
+:sync-group: frontend-framework
+
+`````{tab-item} PyTorch
+:sync: torch
+:selected:
 
 ```python
 result = gemm_swiglu_wrapper_sm100(
@@ -114,7 +175,65 @@ ab12, c, sfc, amax = result
 # Key access: result["ab12_tensor"], result["c_tensor"], result["sfc_tensor"], result["amax_tensor"]
 ```
 
+`````
+
+`````{tab-item} JAX
+:sync: jax
+
+```python
+import jax
+import jax.numpy as jnp
+from cudnn.jax import gemm_swiglu_wrapper_sm100
+
+@jax.jit
+def run_mxfp8(a, b, sfa, sfb):
+    return gemm_swiglu_wrapper_sm100(
+        a,
+        b,
+        sfa_tensor=sfa,
+        sfb_tensor=sfb,
+        c_layout="LMN",
+        ab12_dtype=jnp.bfloat16,
+        c_dtype=jnp.bfloat16,
+        acc_dtype=jnp.float32,
+        sf_vec_size=32,
+        vector_f32=False,
+        ab12_stages=4,
+        a_layout="LMK",
+        b_layout="LNK",
+    )
+
+result = run_mxfp8(a, b, sfa, sfb)
+ab12, c, sfc, amax = result
+# sfc is None; amax is None for MXFP8 inputs.
+```
+
+The JAX block-scaled path supports MXFP8 inputs and native
+`jnp.float4_e2m1fn` inputs. Pass SFA and SFB together with shapes
+`(32, 4, ceil(M/128), 4, ceil(ceil(K/sf_vec_size)/4), L)` and
+`(32, 4, ceil(N/128), 4, ceil(ceil(K/sf_vec_size)/4), L)`, respectively.
+Native FP4 requires the default K-major input and N-major output layouts:
+`a_layout="LMK"`, `b_layout="LNK"`, and `c_layout="LMN"`. With native FP4
+inputs and `c_dtype=jnp.bfloat16`, the wrapper allocates and returns an
+initialized `(1, 1, 1)` FP32 AMAX tensor. `vector_f32` and `ab12_stages` are
+static block-scaled kernel controls and may be configured before tracing.
+
+Raw `uint8` FP4 payloads are specific to the PyTorch API and are not accepted
+by JAX. FP8 `C` output, SFC generation, and `norm_const_tensor` are not yet
+supported in the JAX API.
+
+`````
+
+``````
+
 ### Class API (Standard Mode)
+
+``````{tab-set}
+:sync-group: frontend-framework
+
+`````{tab-item} PyTorch
+:sync: torch
+:selected:
 
 ```python
 gemm = GemmSwigluSm100(
@@ -139,7 +258,48 @@ gemm.execute(
 )
 ```
 
+`````
+
+`````{tab-item} JAX
+:sync: jax
+
+```python
+import jax
+import jax.numpy as jnp
+from cudnn.jax import GemmSwigluSm100
+
+gemm = GemmSwigluSm100(
+    sample_a=jax.ShapeDtypeStruct(a.shape, a.dtype),
+    sample_b=jax.ShapeDtypeStruct(b.shape, b.dtype),
+    alpha=1.0,
+    c_layout="LNM",
+    ab12_dtype=jnp.float32,
+    c_dtype=jnp.float16,
+    acc_dtype=jnp.float32,
+    mma_tiler_mn=(128, 128),
+    cluster_shape_mn=(1, 1),
+    a_layout="LMK",
+    b_layout="LNK",
+)
+assert gemm.check_support()
+ab12, c, sfc, amax = jax.jit(gemm)(a, b)
+```
+
+The constructor retains only the input descriptors. Outputs are allocated by
+the JAX call; `sfc` and `amax` are `None` in standard mode.
+
+`````
+
+``````
+
 ### Class API (Quantized Mode)
+
+``````{tab-set}
+:sync-group: frontend-framework
+
+`````{tab-item} PyTorch
+:sync: torch
+:selected:
 
 ```python
 gemm = GemmSwigluSm100(
@@ -178,9 +338,57 @@ gemm.execute(
 )
 ```
 
+`````
+
+`````{tab-item} JAX
+:sync: jax
+
+```python
+import jax
+import jax.numpy as jnp
+from cudnn.jax import GemmSwigluSm100
+
+# a and b have dtype jnp.float4_e2m1fn; sfa and sfb use a supported FP8 scale dtype.
+gemm = GemmSwigluSm100(
+    sample_a=jax.ShapeDtypeStruct(a.shape, a.dtype),
+    sample_b=jax.ShapeDtypeStruct(b.shape, b.dtype),
+    sample_sfa=jax.ShapeDtypeStruct(sfa.shape, sfa.dtype),
+    sample_sfb=jax.ShapeDtypeStruct(sfb.shape, sfb.dtype),
+    alpha=1.0,
+    c_layout="LMN",
+    ab12_dtype=jnp.bfloat16,
+    c_dtype=jnp.bfloat16,
+    acc_dtype=jnp.float32,
+    mma_tiler_mn=(128, 128),
+    cluster_shape_mn=(1, 1),
+    sf_vec_size=16,
+    vector_f32=False,
+    ab12_stages=4,
+    a_layout="LMK",
+    b_layout="LNK",
+)
+assert gemm.check_support()
+ab12, c, sfc, amax = jax.jit(gemm)(a, b, sfa, sfb)
+# sfc is None; amax is an initialized FP32 result for FP4 inputs with BF16 C.
+```
+
+The JAX constructor binds input metadata and static kernel configuration. It
+derives and functionally allocates AB12, C, and any applicable AMAX output;
+there are no `sample_ab12`, `sample_c`, or `sample_amax` arguments. The
+application owns `jax.jit` and passes the invocation-time arrays to the
+callable object.
+
+`````
+
+``````
+
 ---
 
-## Parameters
+## PyTorch parameter reference
+
+This section documents the existing PyTorch tensor shapes, strides, and
+major-mode arguments. The JAX public shapes and layout strings are described
+in the JAX usage tabs above.
 
 ### Input/Output tensors
 
@@ -241,7 +449,7 @@ gemm.execute(
 - `mma_tiler_mn: Tuple[int, int]`
   - Kernel tile size `(TILE_M, TILE_N)`. Default: `(128, 128)`
   - `TILE_M ∈ {128, 256}`
-  - Standard mode: `TILE_N ∈ {32, 64, ..., 224, 256}`
+  - Standard mode: `TILE_N ∈ {64, 128, 192, 256}`
   - Quantized mode: `TILE_N ∈ {64, 128, 192, 256}`
 - `cluster_shape_mn: Tuple[int, int] | None`
   - Thread Block cluster shape `(CLUSTER_M, CLUSTER_N)`
@@ -286,6 +494,10 @@ Tuple unpacking order is always:
 - **Standard mode**: `sfc_tensor is None` and `amax_tensor is None`
 - **Quantized mode**: `sfc_tensor` and/or `amax_tensor` are populated based on dtype/configuration
 
+The JAX API returns the same four `TupleDict` keys and unpacking order. SFC is
+currently always `None`. AMAX is populated for native FP4 inputs with BF16 C;
+it is `None` in standard mode and for MXFP8 inputs.
+
 ### Class-specific parameters
 
 #### `GemmSwigluSm100` (constructor)
@@ -319,13 +531,26 @@ Tuple unpacking order is always:
 
 #### Quantized mode
 
-The quantized kernel supports the following configurations:
+The PyTorch quantized API supports the following configurations:
 
 | Format | ab_dtype | sf_dtype | sf_vec_size | Notes |
 |--------|-----------|----------|-------------|-------|
 | **MXFP4** | `float4_e2m1fn_x2` or `uint8` | `float8_e8m0fnu` | 16 | Standard MX FP4 |
 | **MXFP4** | `float4_e2m1fn_x2` or `uint8` | `float8_e4m3fn` | 16 | NVF4 variant |
 | **MXFP8** | `float8_e4m3fn` or `float8_e5m2` | `float8_e8m0fnu` | 32 | Standard MX FP8 |
+
+The JAX quantized API uses native JAX dtypes:
+
+| Format | A/B dtype | SFA/SFB dtype | sf_vec_size |
+|--------|-----------|---------------|-------------|
+| **NVFP4** | `jnp.float4_e2m1fn` | `jnp.float8_e4m3fn` or `jnp.float8_e8m0fnu` | 16 |
+| **MXFP4** | `jnp.float4_e2m1fn` | `jnp.float8_e8m0fnu` | 32 |
+| **MXFP8** | `jnp.float8_e4m3fn` or `jnp.float8_e5m2` | `jnp.float8_e8m0fnu` | 32 |
+
+JAX does not reinterpret `uint8` as packed FP4. Its FP4 arrays contain native
+logical FP4 elements. JAX currently supports FP16, BF16, or FP32 C output;
+SFC, FP8 C output, and `norm_const_tensor` are deferred. MXFP8 requires FP16
+or BF16 AB12. Native FP4 with BF16 C returns AMAX.
 
 Additional constraints:
 - `acc_dtype` must be `float32`

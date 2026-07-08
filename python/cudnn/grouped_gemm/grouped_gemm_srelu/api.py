@@ -43,7 +43,7 @@ import torch
 from cuda.bindings import driver as cuda
 from cutlass.cute.runtime import make_fake_stream
 
-from cudnn.api_base import APIBase, TensorDesc, TupleDict, ceil_div, is_power_of_2
+from cudnn.api_base import ApiBaseTorch, TorchTensorDesc, TupleDict, ceil_div, is_power_of_2
 from cudnn.datatypes import _convert_to_cutlass_data_type
 
 from .moe_blockscaled_grouped_gemm_srelu_quant import (
@@ -63,7 +63,7 @@ def _reinterpret_raw_grouped_fp4_tensor(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
-class GroupedGemmSreluSm100(APIBase):
+class GroupedGemmSreluSm100(ApiBaseTorch):
     """Unified API for grouped GEMM SReLU operation on SM100+ GPUs.
 
     This kernel performs block-scaled grouped GEMM with output SReLU output quantization
@@ -172,12 +172,13 @@ class GroupedGemmSreluSm100(APIBase):
         self._has_d_col = sample_d_col is not None
         self.d_col_desc = self._make_tensor_desc(sample_d_col, name="sample_d_col")
         if self.d_col_desc is None:
-            self.d_col_desc = TensorDesc(
+            self.d_col_desc = TorchTensorDesc(
                 dtype=self.d_desc.dtype,
                 shape=self.d_desc.shape,
                 stride=self.d_desc.stride,
                 stride_order=self.d_desc.stride_order,
                 device=self.d_desc.device,
+                packing=self.d_desc.packing,
                 name="sample_d_col",
             )
         self.sfd_row_desc = self._make_tensor_desc(sample_sfd_row, name="sample_sfd_row")

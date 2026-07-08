@@ -100,6 +100,13 @@ $$
 
 ### High-level Wrapper
 
+``````{tab-set}
+:sync-group: frontend-framework
+
+`````{tab-item} PyTorch
+:sync: torch
+:selected:
+
 ```python
 from cudnn import grouped_gemm_dswiglu_wrapper_sm100
 from cuda.bindings import driver as cuda
@@ -141,6 +148,58 @@ sfd_col = outputs["sfd_col_tensor"] # column scale factors (when d_dtype is FP8)
 # or tuple unpacking:
 d_row, d_col, dprob, amax, sfd_row, sfd_col = outputs
 ```
+
+`````
+
+`````{tab-item} JAX
+:sync: jax
+
+Install the JAX integration with `pip install nvidia-cudnn-frontend[jax]`.
+
+```python
+import jax
+import jax.numpy as jnp
+from cudnn.jax import grouped_gemm_dswiglu_wrapper_sm100
+
+@jax.jit
+def run(a, b, c, sfa, sfb, padded_offsets, alpha, beta, prob, norm_const):
+    return grouped_gemm_dswiglu_wrapper_sm100(
+        a,
+        b,
+        c,
+        sfa,
+        sfb,
+        padded_offsets,
+        alpha,
+        beta,
+        prob,
+        norm_const,
+        d_dtype=jnp.float8_e4m3fn,
+        output_layout="LMN",
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=32,
+    )
+
+result = run(a, b, c, sfa, sfb, padded_offsets, alpha, beta, prob, norm_const)
+d_row, d_col, dprob, amax, sfd_row, sfd_col = result
+```
+
+The JAX matrix inputs have fixed public axis orders: `A` is `LMK` with shape
+`(1, valid_m, K)`, and `B` is `LNK` with shape `(L, N, K)`. The input `C` and
+matrix outputs are fixed to `output_layout="LMN"`; for this backward fusion
+they use shape `(1, valid_m, 2N)`. These strings describe public axis order
+rather than physical strides, and the batch/expert mode must remain outermost.
+
+Packed scale tensors, `prob`, and `dprob` retain their specialized shapes
+documented below. The JAX API returns `TupleDict` and creates `dprob` as a
+fresh zero-initialized functional result. It supports dense FP8 A/B and FP8 D
+with E8M0 scales and `sf_vec_size=32`; `amax` is `None`. Shapes, dtypes,
+layouts, and configuration arguments are static under `jax.jit`.
+
+`````
+
+``````
 
 ### Class API
 

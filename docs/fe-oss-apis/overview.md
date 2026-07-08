@@ -2,6 +2,9 @@
 
 **FE-OSS APIs are experimental and subject to change.**
 
+Design work for tracing FE-OSS CuTe DSL kernels from JAX is documented in
+[CuTe DSL + JAX support for FE-OSS APIs](cutedsl-jax-design.md).
+
 This folder documents the Python FE APIs implemented under `python/cudnn`. For details on currently implemented operations, see:
 - [GEMM + Amax](gemm_fusions/gemm_amax.md)
 - [GEMM + SwiGLU](gemm_fusions/gemm_swiglu.md)
@@ -35,9 +38,69 @@ pip install nvidia-cudnn-frontend[cutedsl]
 
 After installation, you can import the APIs directly from the `cudnn` package, i.e. `from cudnn import {your_operation}`
 
+The JAX integration uses a separate optional dependency set:
+
+```bash
+pip install nvidia-cudnn-frontend[jax]
+```
+
+This optional dependency set requires Python 3.11 or newer, matching the JAX
+CUDA package requirement; the base frontend package retains its broader Python
+support.
+
+Importing `cudnn` does not load JAX or CuTe DSL. Importing `cudnn.jax`, or
+accessing `cudnn.jax` after importing `cudnn`, is the explicit JAX opt-in. It
+validates JAX and CuTe DSL availability and points missing installations to the
+`jax` extra, including checking `cutlass.jax.is_available()` and reporting
+CUTLASS's minimum supported JAX version when unavailable. It then loads the JAX
+operation wrappers and shared CuTe DSL bridge. Architecture-specific kernel
+modules remain deferred until an operation is traced. Each implemented
+operation keeps `api.py` as its Torch binding and a sibling `jax.py` as its JAX
+binding.
+
 ## API Usage
 
-Each operation exposes two APIs:
+PyTorch remains the default FE-OSS interface and preserves its existing
+wrappers and classes. Some operations also provide a functional JAX API under
+`cudnn.jax`. Each operation-backed JAX wrapper has a callable class with the
+aligned Torch class name; the two DSA layout helpers remain functional-only.
+Supported bindings also retain aligned functional names across the two
+namespaces:
+
+```python
+from cudnn import rmsnorm_rht_amax_sm100
+from cudnn.jax import rmsnorm_rht_amax_sm100
+
+from cudnn import gemm_swiglu_wrapper_sm100
+from cudnn.jax import gemm_swiglu_wrapper_sm100
+```
+
+JAX class constructors accept array-like samples, immediately reduce them to
+shape/dtype descriptors, and do not retain the sample arrays. Actual arrays are
+passed when the object is called. The object is intentionally not pre-jitted,
+so applications retain control over JIT, sharding, donation, and placement:
+
+```python
+import jax
+from cudnn.jax import RmsNormRhtAmaxSm100
+
+op = RmsNormRhtAmaxSm100(
+    jax.ShapeDtypeStruct(x.shape, x.dtype),
+    jax.ShapeDtypeStruct(weight.shape, weight.dtype),
+)
+op.check_support()
+output, amax = jax.jit(op)(x, weight)
+```
+
+Compile-time configuration becomes immutable on the first call because JAX
+caches by callable identity. Construct a new operation object to change static
+options after tracing.
+
+Where both bindings exist, they should offer comparable operation semantics and
+recognizable inputs, options, and results. Exact names, signatures, defaults,
+layouts, result containers, lifecycle controls, and supported domains may
+differ by framework. JAX does not replace or narrow the PyTorch APIs, and
+backend selection is never inferred from array types.
 
 ### 1. High-level wrapper
 

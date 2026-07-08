@@ -38,6 +38,9 @@ import cutlass.pipeline as pipeline
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.cute.math as math
 
+from ..gemm_validation import require_cluster_shape as _require_cluster_shape
+from ..gemm_validation import require_mma_tiler as _require_mma_tiler
+
 # Mathematical constant: log2(e) for converting exp(x) to exp2(x * log2(e))
 LOG2_E = 1.4426950408889634
 
@@ -78,7 +81,7 @@ Constraints are same as dense_gemm.py:
   see detailed valid dtype combinations in below PersistentDenseGemmKernel class documentation
 * A/B tensor must have the same data type
 * Mma tiler M must be 64/128 (use_2cta_instrs=False) or 128/256 (use_2cta_instrs=True)
-* Mma tiler N must be 32-256, step 32
+* Mma tiler N must be 64/128/192/256
 * Cluster shape M/N must be positive and power of 2, total cluster size <= 16
 * Cluster shape M must be multiple of 2 if use_2cta_instrs=True
 * The contiguous dimension of A/B/C tensors must be at least 16 bytes aligned,
@@ -125,7 +128,7 @@ class PersistentDenseGemmKernel:
 
     :note: Constraints:
         - MMA tiler M must be 64/128 (use_2cta_instrs=False) or 128/256 (use_2cta_instrs=True)
-        - MMA tiler N must be 32-256, step 32
+        - MMA tiler N must be 64/128/192/256
         - Cluster shape M must be multiple of 2 if use_2cta_instrs=True
         - Cluster shape M/N must be positive and power of 2, total cluster size <= 16
 
@@ -138,6 +141,55 @@ class PersistentDenseGemmKernel:
         ... )
         >>> gemm(a_tensor, b_tensor, c_tensor, max_active_clusters, stream)
     """
+
+    # Configuration values supported by the FE Torch and JAX wrappers.
+    MMA_TILER_M = (128, 256)
+    MMA_TILER_N = (64, 128, 192, 256)
+    TWO_CTA_MMA_TILER_M = 256
+    MAX_CLUSTER_CTAS = 16
+    MAX_CLUSTER_DIMENSION = None
+    SINGLE_CTA_CLUSTER_SHAPE = (1, 1)
+    SWIGLU_BLOCK_COLUMNS = 32
+    SWIGLU_BLOCKS_PER_PAIR = 2
+
+    @classmethod
+    def require_mma_tiler(cls, mma_tiler_mn: Tuple[int, int]) -> Tuple[int, int]:
+        """Validate an FE-supported MMA tile."""
+
+        return _require_mma_tiler(
+            mma_tiler_mn,
+            allowed_m=cls.MMA_TILER_M,
+            allowed_n=cls.MMA_TILER_N,
+        )
+
+    @classmethod
+    def require_cluster_shape(
+        cls,
+        cluster_shape_mn: Tuple[int, int],
+        *,
+        mma_tiler_mn: Tuple[int, int],
+    ) -> Tuple[int, int]:
+        """Validate an FE-supported cluster shape for an MMA tile."""
+
+        cluster_shape_mn = _require_cluster_shape(
+            cluster_shape_mn,
+            mma_m=mma_tiler_mn[0],
+            two_cta_mma_m=cls.TWO_CTA_MMA_TILER_M,
+            max_ctas=cls.MAX_CLUSTER_CTAS,
+            max_dimension=cls.MAX_CLUSTER_DIMENSION,
+        )
+        if mma_tiler_mn[0] != cls.TWO_CTA_MMA_TILER_M and cluster_shape_mn != cls.SINGLE_CTA_CLUSTER_SHAPE:
+            raise ValueError(f"cluster_shape_mn must be {cls.SINGLE_CTA_CLUSTER_SHAPE} for a single-CTA MMA tile")
+        return cluster_shape_mn
+
+    @classmethod
+    def get_output_n(cls, n: int) -> int:
+        """Validate the input N dimension and return the SwiGLU output N."""
+
+        required_columns = cls.SWIGLU_BLOCK_COLUMNS * cls.SWIGLU_BLOCKS_PER_PAIR
+        if n % required_columns:
+            raise ValueError(f"N must be divisible by {required_columns} for {cls.SWIGLU_BLOCK_COLUMNS}-column SwiGLU block pairs, got {n}")
+        return n // cls.SWIGLU_BLOCKS_PER_PAIR
 
     def __init__(
         self,
@@ -173,7 +225,7 @@ class PersistentDenseGemmKernel:
         """
 
         self.acc_dtype: Type[cutlass.Numeric] = acc_dtype
-        self.use_2cta_instrs = mma_tiler_mn[0] == 256
+        self.use_2cta_instrs = mma_tiler_mn[0] == self.TWO_CTA_MMA_TILER_M
         self.cluster_shape_mn = cluster_shape_mn
         # K dimension is deferred in _setup_attributes
         self.mma_tiler = (*mma_tiler_mn, 1)

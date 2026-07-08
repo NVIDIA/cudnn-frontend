@@ -1,4 +1,4 @@
-"""APIBase wrappers for sparse and dense indexer backward.
+"""ApiBaseTorch wrappers for sparse and dense indexer backward.
 
 Combines backend-specific CuTe-DSL kernels:
 
@@ -17,7 +17,7 @@ from typing import Optional, Union
 import torch
 import cuda.bindings.driver as cuda
 
-from cudnn.api_base import APIBase, TupleDict
+from cudnn.api_base import ApiBaseTorch, TupleDict
 from cudnn.deepseek_sparse_attention.utils.runtime import (
     torch_stream_context as _torch_stream_context,
     validate_q_causal_offsets,
@@ -121,7 +121,7 @@ def _dense_shapes(
     return False, batch, batch * seqlen_q, batch * seqlen_k, heads, head_dim, seqlen_q, seqlen_k
 
 
-class IndexerBackward(APIBase):
+class IndexerBackward(ApiBaseTorch):
     """End-to-end indexer backward (3 fused stages).
 
     Given the forward-computed ``AttnScore`` (target distribution) and
@@ -249,7 +249,7 @@ class IndexerBackward(APIBase):
         )
 
 
-class DenseIndexerBackward(APIBase):
+class DenseIndexerBackward(ApiBaseTorch):
     """Dense full-KV indexer backward.
 
     Consumes raw dense attention/indexer score tensors and their denominators,
@@ -384,12 +384,21 @@ class DenseIndexerBackward(APIBase):
             grad_scale = float(loss_coeff) * grad_loss_value / max(int(self.normalization_tokens), 1)
 
             # Dense backward's dK path uses atomic/bulk reductions into fp32.
+            # SM100 clears the reduction target in its CuTe launch sequence;
+            # SM90 still requires a pre-zeroed buffer.
+            kernel_clears_d_index_k = not self._uses_current_stream_pipeline
             d_index_k_target = d_index_k
             if d_index_k.dtype == torch.float32:
                 d_index_k_f32 = d_index_k
-                d_index_k_f32.zero_()
+                if not kernel_clears_d_index_k:
+                    d_index_k_f32.zero_()
             else:
-                d_index_k_f32 = torch.zeros_like(d_index_k, dtype=torch.float32)
+                allocation = (
+                    torch.empty_like
+                    if kernel_clears_d_index_k
+                    else torch.zeros_like
+                )
+                d_index_k_f32 = allocation(d_index_k, dtype=torch.float32)
 
         self._compiled_kernel(
             index_q,

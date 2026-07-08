@@ -1,4 +1,4 @@
-"""APIBase wrapper and dispatcher for indexer forward CuTe DSL score kernels.
+"""PyTorch ApiBaseTorch wrapper and dispatcher for indexer-forward score kernels.
 
 Produces dense indexer scores Q @ K^T with per-head ReLU, weighted head
 reduction, and a ratio causal mask. Does NOT fuse top-K — pair with
@@ -18,7 +18,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import make_fake_stream
 
-from cudnn.api_base import APIBase, TupleDict
+from cudnn.api_base import ApiBaseTorch, TupleDict
 
 from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
 from cudnn.deepseek_sparse_attention.utils.runtime import device_major, resolve_stream
@@ -30,8 +30,8 @@ from ._interface_sm90 import indexer_fwd as indexer_fwd_sm90
 TMA_ALIGN_ELEMS = 4  # FP32 output => seqlen_k padded to multiples of 4 (16 B)
 
 
-class IndexerForward(APIBase):
-    """SM100+ APIBase implementation used by ``indexer_forward_wrapper``.
+class IndexerForward(ApiBaseTorch):
+    """SM100+ ApiBaseTorch implementation used by ``indexer_forward_wrapper``.
 
     Hopper dispatch uses the direct SM90 wrapper in ``_interface_sm90.py``.
     """

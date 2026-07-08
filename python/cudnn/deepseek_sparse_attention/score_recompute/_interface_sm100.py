@@ -21,6 +21,10 @@ import cutlass.cute as cute
 
 from .sparse_score_recompute_sm100 import SparseScoreRecomputeSm100
 from .dense_score_recompute_sm100 import DenseScoreRecomputeSm100
+from .config import (
+    dispatch_sparse_attn_tile_params,
+    resolve_sparse_score_smem_config,
+)
 from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
 from cudnn.deepseek_sparse_attention.utils.runtime import (
     device_major as _get_device_capability,
@@ -97,29 +101,14 @@ def _sparse_indexer_score_recompute(
         with _torch_stream_context(current_stream):
             out = torch.empty((bs, seqlen_q, topk), dtype=torch.float32, device=device)
 
-    # Compute kv_stage and topk_in_smem from SMEM budget (SM100: 228 KB)
-    SM100_SMEM_BYTES = 228 * 1024
-    head_dim_padded = int(math.ceil(head_dim / 16) * 16)
-    sK_per_stage = n_block_size * head_dim_padded * 2  # BF16
-    sQ_size = m_block_size * head_dim_padded * 2  # BF16
-    sTopkIdx_bytes = topk * 2 * 4  # double-buffer, INT32
-    sPerHead_bytes = m_block_size * 2 * 2  # double-buffer, BF16
-    smem_fixed = sPerHead_bytes + 2048  # barriers, sScoreAll, alignment
-
-    topk_in_smem = True
-    smem_overhead = sTopkIdx_bytes + smem_fixed
-    kv_stage = min(4, max(1, (SM100_SMEM_BYTES - sQ_size - smem_overhead) // sK_per_stage))
-    total_smem_est = sQ_size + sK_per_stage * kv_stage + smem_overhead
-    if total_smem_est > SM100_SMEM_BYTES:
-        topk_in_smem = False
-        smem_overhead = smem_fixed
-        kv_stage = min(4, max(1, (SM100_SMEM_BYTES - sQ_size - smem_overhead) // sK_per_stage))
-        total_smem_est = sQ_size + sK_per_stage * kv_stage + smem_overhead
-        assert total_smem_est <= SM100_SMEM_BYTES, (
-            f"SMEM overflow ({total_smem_est} > {SM100_SMEM_BYTES}) even without sTopkIdx: "
-            f"topk={topk}, head_dim={head_dim}(padded={head_dim_padded}), "
-            f"m_block={m_block_size}, n_block={n_block_size}, kv_stage={kv_stage}."
-        )
+    kv_stage, topk_in_smem = resolve_sparse_score_smem_config(
+        score_type="indexer",
+        head_dim=head_dim,
+        m_block_size=m_block_size,
+        n_block_size=n_block_size,
+        k_block_size=None,
+        topk=topk,
+    )
 
     compute_capability = _get_device_capability()
 
@@ -319,30 +308,14 @@ def _sparse_attn_score_recompute(
         with _torch_stream_context(current_stream):
             out = torch.empty((bs, seqlen_q, topk), dtype=torch.float32, device=device)
 
-    # Compute kv_stage and topk_in_smem from SMEM budget (SM100: 228 KB)
-    SM100_SMEM_BYTES = 228 * 1024
-    head_dim_padded = int(math.ceil(head_dim / 16) * 16)
-    k_block_size_eff = k_block_size if k_block_size is not None else head_dim_padded
-    sK_per_stage = n_block_size * k_block_size_eff * 2  # BF16
-    sQ_size = m_block_size * head_dim_padded * 2  # BF16 (Q total unchanged)
-    sTopkIdx_bytes = topk * 2 * 4  # double-buffer, INT32
-    sPerHead_bytes = m_block_size * 2 * 4  # double-buffer, FP32
-    smem_fixed = sPerHead_bytes + 2048  # barriers, sScoreAll, alignment
-
-    topk_in_smem = True
-    smem_overhead = sTopkIdx_bytes + smem_fixed
-    kv_stage = min(4, max(1, (SM100_SMEM_BYTES - sQ_size - smem_overhead) // sK_per_stage))
-    total_smem_est = sQ_size + sK_per_stage * kv_stage + smem_overhead
-    if total_smem_est > SM100_SMEM_BYTES:
-        topk_in_smem = False
-        smem_overhead = smem_fixed
-        kv_stage = min(4, max(1, (SM100_SMEM_BYTES - sQ_size - smem_overhead) // sK_per_stage))
-        total_smem_est = sQ_size + sK_per_stage * kv_stage + smem_overhead
-        assert total_smem_est <= SM100_SMEM_BYTES, (
-            f"SMEM overflow ({total_smem_est} > {SM100_SMEM_BYTES}) even without sTopkIdx: "
-            f"topk={topk}, head_dim={head_dim}(padded={head_dim_padded}), "
-            f"m_block={m_block_size}, n_block={n_block_size}, kv_stage={kv_stage}."
-        )
+    kv_stage, topk_in_smem = resolve_sparse_score_smem_config(
+        score_type="attention",
+        head_dim=head_dim,
+        m_block_size=m_block_size,
+        n_block_size=n_block_size,
+        k_block_size=k_block_size,
+        topk=topk,
+    )
 
     compute_capability = _get_device_capability()
 
@@ -416,57 +389,6 @@ def _sparse_attn_score_recompute(
 _sparse_attn_score_recompute.compile_cache = {}
 
 
-def _dispatch_sparse_attn_tile_params(
-    head_dim: int,
-    qhead_per_kv_head: int,
-    topk: int,
-    compact: bool = False,
-):
-    """Select (m_block_size, n_block_size, k_block_size) for sparse attention backward.
-
-    Returns (m_block_size, n_block_size, k_block_size) where k_block_size=None
-    means no head_dim splitting.
-
-    Compact (have_topk_length) and non-compact have different optimal configs:
-    compact benefits from finer-grained early termination (smaller n, less
-    k-split overhead), non-compact benefits from n=128 + k-split for better
-    pipeline utilization.
-
-    Rules tuned on B200 via tests/sweep_tile_params.py (--compact / default).
-    """
-    m = qhead_per_kv_head
-
-    if compact:
-        # --- Compact tuned configs ---
-        # hd=512
-        if head_dim == 512 and qhead_per_kv_head == 64:
-            return m, 64, None  # kvs=2, ~789 TFLOPS
-        if head_dim == 512 and qhead_per_kv_head == 128:
-            return m, 128, 128  # kvs=2, ~844/1004 TFLOPS
-        # hd=576
-        if head_dim == 576 and qhead_per_kv_head == 64:
-            return m, 64, None  # kvs=2, ~827 TFLOPS
-        if head_dim == 576 and qhead_per_kv_head == 128:
-            return m, 64, 192  # kvs=2~3, ~677/1054 TFLOPS
-        return m, 64, None
-
-    # --- Non-compact tuned configs ---
-    # hd=512
-    if head_dim == 512 and qhead_per_kv_head == 64:
-        return m, 128, 256  # kvs=2, ~800 TFLOPS
-    if head_dim == 512 and qhead_per_kv_head == 128 and topk <= 512:
-        return m, 128, 128  # kvs=2, ~1000 TFLOPS
-    if head_dim == 512 and qhead_per_kv_head == 128:
-        return m, 128, 256  # kvs=1, ~910 TFLOPS
-    # hd=576
-    if head_dim == 576 and qhead_per_kv_head == 64:
-        return m, 128, 192  # kvs=3, ~770 TFLOPS
-    if head_dim == 576 and qhead_per_kv_head == 128:
-        return m, 128, 192  # kvs=1, ~830 TFLOPS
-
-    return m, 64, None
-
-
 def sparse_attn_score_recompute(
     q_attn: torch.Tensor,
     k_attn: torch.Tensor,
@@ -506,7 +428,7 @@ def sparse_attn_score_recompute(
     topk = topk_indices.shape[2]
 
     compact = topk_length is not None
-    m_block_size, n_block_size, k_block_size = _dispatch_sparse_attn_tile_params(
+    m_block_size, n_block_size, k_block_size = dispatch_sparse_attn_tile_params(
         head_dim,
         qhead_per_kv_head,
         topk,
@@ -520,7 +442,7 @@ def sparse_attn_score_recompute(
     # Invalid positions (topk_idx=-1) are skipped in K load and masked
     # in epilogue, preserving correctness.
     if compact:
-        nc_params = _dispatch_sparse_attn_tile_params(
+        nc_params = dispatch_sparse_attn_tile_params(
             head_dim,
             qhead_per_kv_head,
             topk,

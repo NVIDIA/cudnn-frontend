@@ -12,14 +12,14 @@ import torch
 import cutlass.cute as cute
 from cutlass.cute.runtime import make_fake_stream
 
-from cudnn.api_base import APIBase, TupleDict
+from cudnn.api_base import ApiBaseTorch, TupleDict
 from cudnn.datatypes import _convert_to_cutlass_data_type
 
 from .fmha_forward_sm100_d256 import BlackwellFusedMultiHeadAttentionForward
 from ..fmha_utils import MaskEnum
 
 
-class SdpafwdSm100D256(APIBase):
+class SdpafwdSm100D256(ApiBaseTorch):
     """API class for d=256 SDPA forward (SM100+) using the FE OSS CUTE DSL kernel."""
 
     def __init__(
