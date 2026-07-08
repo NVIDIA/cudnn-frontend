@@ -150,6 +150,8 @@ class JaxApiBase(ABC):
         target_compute_capability: int | None,
         supported_compute_capabilities: tuple[int, ...],
         operation_name: str,
+        *,
+        require_local: bool = False,
     ) -> int:
         """Resolve an exact JAX compilation target for a multi-arch adapter.
 
@@ -157,7 +159,8 @@ class JaxApiBase(ABC):
         targets implemented by the adapter. The returned value remains exact
         (for example ``103``) so the compiler selects the matching target.
         With compatibility checks enabled, an explicit target must match every
-        local GPU exactly. Disable checks for cross-compilation.
+        local GPU exactly. Disable checks for cross-compilation. ``require_local``
+        keeps local-device resolution mandatory even when checks are disabled.
         """
 
         supported = tuple(sorted(set(supported_compute_capabilities)))
@@ -172,7 +175,7 @@ class JaxApiBase(ABC):
             if target_compute_capability not in supported:
                 supported_text = ", ".join(f"SM{value}" for value in supported)
                 raise ValueError(f"{operation_name} has no kernel for SM{target_compute_capability}; supported targets are {supported_text}")
-            if _DEVICE_COMPATIBILITY_CHECKS_DISABLED:
+            if _DEVICE_COMPATIBILITY_CHECKS_DISABLED and not require_local:
                 return target_compute_capability
 
             local = JaxApiBase._local_gpu_capabilities(operation_name)
@@ -186,17 +189,18 @@ class JaxApiBase(ABC):
                 raise RuntimeError(f"{operation_name} targets SM{target_compute_capability}, but found {found}. " f"{_DEVICE_COMPATIBILITY_CHECK_DISABLE_HINT}")
             return target_compute_capability
 
+        local_target_hint = "This operation requires a homogeneous supported local JAX GPU." if require_local else _TARGET_COMPUTE_CAPABILITY_HINT
         try:
             local = JaxApiBase._local_gpu_capabilities(operation_name)
         except RuntimeError as error:
-            raise RuntimeError(f"{error}. {_TARGET_COMPUTE_CAPABILITY_HINT}") from error
+            raise RuntimeError(f"{error}. {local_target_hint}") from error
         if not local:
-            raise RuntimeError(f"{operation_name}: no local JAX GPU is available. {_TARGET_COMPUTE_CAPABILITY_HINT}")
+            raise RuntimeError(f"{operation_name}: no local JAX GPU is available. {local_target_hint}")
 
         capabilities = tuple(sorted({capability for _, capability in local}))
         if len(capabilities) != 1:
             found = ", ".join(f"SM{capability}" for capability in capabilities)
-            raise RuntimeError(f"{operation_name}: local JAX GPUs have heterogeneous targets ({found}). {_TARGET_COMPUTE_CAPABILITY_HINT}")
+            raise RuntimeError(f"{operation_name}: local JAX GPUs have heterogeneous targets ({found}). {local_target_hint}")
 
         resolved = capabilities[0]
         if resolved not in supported:

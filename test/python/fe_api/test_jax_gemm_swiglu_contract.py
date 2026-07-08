@@ -109,8 +109,9 @@ class JaxGemmSwigluContractTest(unittest.TestCase):
                 )
 
             @staticmethod
-            def _resolve_compute_capability(target, supported, operation_name):
+            def _resolve_compute_capability(target, supported, operation_name, *, require_local=False):
                 del operation_name
+                assert require_local
                 resolved = 100 if target is None else target
                 if resolved not in supported:
                     raise ValueError(f"unsupported target {resolved}")
@@ -216,7 +217,6 @@ class JaxGemmSwigluContractTest(unittest.TestCase):
         api = self.module.GemmSwigluSm100(
             sample_a,
             sample_b,
-            target_compute_capability=100,
         )
 
         self.assertEqual(api.a_mode, (1, 2, 0))
@@ -272,7 +272,6 @@ class JaxGemmSwigluContractTest(unittest.TestCase):
             a_layout="LKM",
             b_layout="LKN",
             c_layout="LNM",
-            target_compute_capability=103,
         )
         result = api(sample_a, sample_b)
 
@@ -287,7 +286,7 @@ class JaxGemmSwigluContractTest(unittest.TestCase):
         self.assertEqual(api.c_desc.stride_order, (0, 1, 2))
         self.assertEqual(result["ab12_tensor"].shape, (3, 192, 128))
         self.assertEqual(result["c_tensor"].shape, (3, 96, 128))
-        self.assertIn("--gpu-arch sm_103a", api.captured_call[1]["compile_options"])
+        self.assertIn("--gpu-arch sm_100a", api.captured_call[1]["compile_options"])
 
     def test_explicit_output_exemplars_are_checked_and_preserved(self):
         sample_a, sample_b = self._samples()
@@ -300,7 +299,6 @@ class JaxGemmSwigluContractTest(unittest.TestCase):
             sample_c=sample_c,
             ab12_dtype="bfloat16",
             c_dtype="bfloat16",
-            target_compute_capability=100,
         )
         result = api(sample_a, sample_b)
         self.assertEqual(result["ab12_tensor"].dtype, "bfloat16")
@@ -311,7 +309,6 @@ class JaxGemmSwigluContractTest(unittest.TestCase):
                 sample_a,
                 sample_b,
                 sample_ab12=sample_ab12,
-                target_compute_capability=100,
             )
         with self.assertRaisesRegex(ValueError, "c_dtype=float16 does not match the explicit sample dtype"):
             self.module.GemmSwigluSm100(
@@ -320,7 +317,6 @@ class JaxGemmSwigluContractTest(unittest.TestCase):
                 sample_ab12=sample_ab12,
                 sample_c=sample_c,
                 c_dtype="float16",
-                target_compute_capability=100,
             )
 
     def test_runtime_inputs_must_match_the_specialized_signature(self):
@@ -328,7 +324,6 @@ class JaxGemmSwigluContractTest(unittest.TestCase):
         api = self.module.GemmSwigluSm100(
             sample_a,
             sample_b,
-            target_compute_capability=100,
         )
         with self.assertRaisesRegex(ValueError, "sample_a tensor shape mismatch"):
             api(_Array((3, 64, 64), "bfloat16"), sample_b)
@@ -336,9 +331,9 @@ class JaxGemmSwigluContractTest(unittest.TestCase):
             api(sample_a, _Array(sample_b.shape, "float16"))
 
     def test_wrapper_marks_configuration_as_static_and_remains_functional(self):
-        self.assertIn("gemm_swiglu_wrapper", self.module.__all__)
-        self.assertNotIn("gemm_swiglu_wrapper_sm100", self.module.__all__)
-        static = self.jit_static_argnames["gemm_swiglu_wrapper"]
+        self.assertIn("gemm_swiglu_wrapper_sm100", self.module.__all__)
+        self.assertNotIn("gemm_swiglu_wrapper", self.module.__all__)
+        static = self.jit_static_argnames["gemm_swiglu_wrapper_sm100"]
         self.assertEqual(
             static,
             (
@@ -351,18 +346,16 @@ class JaxGemmSwigluContractTest(unittest.TestCase):
                 "cluster_shape_mn",
                 "a_layout",
                 "b_layout",
-                "target_compute_capability",
             ),
         )
 
         sample_a, sample_b = self._samples(a_layout="LKM", b_layout="LKN")
-        result = self.module.gemm_swiglu_wrapper(
+        result = self.module.gemm_swiglu_wrapper_sm100(
             sample_a,
             sample_b,
             c_layout="LNM",
             a_layout="LKM",
             b_layout="LKN",
-            target_compute_capability=107,
         )
         self.assertEqual(result["ab12_tensor"].shape, (3, 192, 128))
         self.assertEqual(result["c_tensor"].shape, (3, 96, 128))
@@ -376,7 +369,6 @@ class JaxGemmSwigluContractTest(unittest.TestCase):
                 sample_b,
                 alpha=0.25,
                 mma_tiler_mn=(256, 128),
-                target_compute_capability=100,
             )
         api.check_support()
         seen = {}

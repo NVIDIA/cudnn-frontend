@@ -59,7 +59,6 @@ class GemmSwigluSm100(JaxApiBase):
         cluster_shape_mn: tuple[int, int] | None = None,
         a_layout: str = "LMK",
         b_layout: str = "LNK",
-        target_compute_capability: int | None = None,
     ) -> None:
         self.a_layout = a_layout
         self.b_layout = b_layout
@@ -68,10 +67,11 @@ class GemmSwigluSm100(JaxApiBase):
         self.b_mode = gemm_b_mode(b_layout)
         self.output_mode = gemm_output_mode(c_layout)
 
-        self.target_compute_capability = self._resolve_compute_capability(
-            target_compute_capability,
+        self.compute_capability = self._resolve_compute_capability(
+            None,
             SUPPORTED_COMPUTE_CAPABILITIES,
             "GemmSwigluSm100",
+            require_local=True,
         )
         self.a_desc = self._to_tensor_desc(sample_a, "sample_a", mode=self.a_mode)
         self.b_desc = self._to_tensor_desc(sample_b, "sample_b", mode=self.b_mode)
@@ -176,7 +176,7 @@ class GemmSwigluSm100(JaxApiBase):
                 self._to_tensor_spec(self.ab12_desc, mode=self.output_mode),
                 self._to_tensor_spec(self.c_desc, mode=self.output_mode),
             ),
-            compile_options=compile_options_for_target(self.target_compute_capability),
+            compile_options=compile_options_for_target(self.compute_capability),
         )
         return TupleDict(
             ab12_tensor=ab12_tensor,
@@ -235,10 +235,9 @@ class GemmSwigluSm100(JaxApiBase):
         "cluster_shape_mn",
         "a_layout",
         "b_layout",
-        "target_compute_capability",
     ),
 )
-def gemm_swiglu_wrapper(
+def gemm_swiglu_wrapper_sm100(
     a_tensor: Any,
     b_tensor: Any,
     alpha: float = 1.0,
@@ -251,9 +250,8 @@ def gemm_swiglu_wrapper(
     *,
     a_layout: str = "LMK",
     b_layout: str = "LNK",
-    target_compute_capability: int | None = None,
 ) -> TupleDict:
-    """Resolve a supported GPU target and compute the standard GEMM + SwiGLU projection."""
+    """Compute the standard GEMM + SwiGLU projection on a local SM100-family GPU."""
 
     return GemmSwigluSm100(
         jax.ShapeDtypeStruct(a_tensor.shape, a_tensor.dtype),
@@ -267,12 +265,11 @@ def gemm_swiglu_wrapper(
         cluster_shape_mn=cluster_shape_mn,
         a_layout=a_layout,
         b_layout=b_layout,
-        target_compute_capability=target_compute_capability,
     )(a_tensor, b_tensor)
 
 
 __all__ = [
     "GemmSwigluSm100",
     "SUPPORTED_COMPUTE_CAPABILITIES",
-    "gemm_swiglu_wrapper",
+    "gemm_swiglu_wrapper_sm100",
 ]

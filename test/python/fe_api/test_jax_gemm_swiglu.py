@@ -40,30 +40,17 @@ def _supported_gpu(jax):
     capability = capabilities.pop()
     if capability not in {100, 103, 107}:
         pytest.skip("A supported JAX SM100-family GPU is not available")
-    return devices[0], capability
-
-
-@pytest.fixture
-def device_compatibility_checks_disabled():
-    _jax_runtime()
-    from cudnn.jax import disable_device_compatibility_checks
-
-    disable_device_compatibility_checks(True)
-    try:
-        yield
-    finally:
-        disable_device_compatibility_checks(False)
+    return devices[0]
 
 
 @pytest.mark.L0
 def test_jax_gemm_swiglu_abstract_contract(
     monkeypatch,
-    device_compatibility_checks_disabled,
 ):
     jax, jnp = _jax_runtime()
 
     from cudnn._jax import JaxApiBase
-    from cudnn.jax import GemmSwigluSm100, gemm_swiglu_wrapper
+    from cudnn.jax import GemmSwigluSm100, gemm_swiglu_wrapper_sm100
 
     def abstract_call(self, _inputs, *, output_descs, output_spec, **_options):
         return tuple(
@@ -75,13 +62,17 @@ def test_jax_gemm_swiglu_abstract_contract(
         )
 
     monkeypatch.setattr(JaxApiBase, "_call_kernel", abstract_call)
+    monkeypatch.setattr(
+        JaxApiBase,
+        "_resolve_compute_capability",
+        staticmethod(lambda _target, _supported, _operation, **_options: 100),
+    )
 
     sample_a = jax.ShapeDtypeStruct((3, 128, 64), jnp.bfloat16)
     sample_b = jax.ShapeDtypeStruct((3, 192, 64), jnp.bfloat16)
     api = GemmSwigluSm100(
         sample_a,
         sample_b,
-        target_compute_capability=100,
     )
     result = jax.eval_shape(api, sample_a, sample_b)
     assert tuple(result.keys()) == (
@@ -100,14 +91,13 @@ def test_jax_gemm_swiglu_abstract_contract(
     alternate_a = jax.ShapeDtypeStruct((3, 64, 128), jnp.bfloat16)
     alternate_b = jax.ShapeDtypeStruct((3, 64, 192), jnp.bfloat16)
     alternate = jax.eval_shape(
-        lambda a, b: gemm_swiglu_wrapper(
+        lambda a, b: gemm_swiglu_wrapper_sm100(
             a,
             b,
             a_layout="LKM",
             b_layout="LKN",
             c_layout="LNM",
             c_dtype=jnp.bfloat16,
-            target_compute_capability=103,
         ),
         alternate_a,
         alternate_b,
@@ -121,7 +111,6 @@ def test_jax_gemm_swiglu_abstract_contract(
         sample_b,
         sample_ab12=jax.ShapeDtypeStruct((3, 128, 192), jnp.bfloat16),
         sample_c=jax.ShapeDtypeStruct((3, 128, 96), jnp.bfloat16),
-        target_compute_capability=100,
     )
     explicit_result = jax.eval_shape(explicit, sample_a, sample_b)
     assert explicit_result["ab12_tensor"].dtype == jnp.bfloat16
@@ -131,9 +120,9 @@ def test_jax_gemm_swiglu_abstract_contract(
 @pytest.mark.L0
 def test_jax_gemm_swiglu_sm100_jit_and_numerics():
     jax, jnp = _jax_runtime()
-    device, capability = _supported_gpu(jax)
+    device = _supported_gpu(jax)
 
-    from cudnn.jax import gemm_swiglu_wrapper
+    from cudnn.jax import gemm_swiglu_wrapper_sm100
 
     batch, m, n, k = 1, 128, 128, 128
     alpha = 0.5
@@ -156,14 +145,13 @@ def test_jax_gemm_swiglu_sm100_jit_and_numerics():
         device,
     )
 
-    lowered = gemm_swiglu_wrapper.lower(
+    lowered = gemm_swiglu_wrapper_sm100.lower(
         a,
         b,
         alpha=alpha,
         a_layout="LKM",
         b_layout="LKN",
         c_layout="LNM",
-        target_compute_capability=capability,
     )
     stablehlo = lowered.as_text("stablehlo")
     assert stablehlo.count("stablehlo.custom_call") == 1

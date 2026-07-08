@@ -38,7 +38,7 @@ _OPERATION_EXPORTS = {
     "RmsNormRhtAmaxSm100": ("..rmsnorm_rht_amax.jax", "RmsNormRhtAmaxSm100"),
     "rmsnorm_rht_amax_sm100": ("..rmsnorm_rht_amax.jax", "rmsnorm_rht_amax_sm100"),
     "GemmSwigluSm100": ("..gemm_swiglu.jax", "GemmSwigluSm100"),
-    "gemm_swiglu_wrapper": ("..gemm_swiglu.jax", "gemm_swiglu_wrapper"),
+    "gemm_swiglu_wrapper_sm100": ("..gemm_swiglu.jax", "gemm_swiglu_wrapper_sm100"),
     "SparseAttentionBackward": ("..deepseek_sparse_attention.sparse_attention_backward.jax", "SparseAttentionBackward"),
     "sparse_attention_backward_wrapper": (
         "..deepseek_sparse_attention.sparse_attention_backward.jax",

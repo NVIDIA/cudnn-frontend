@@ -252,6 +252,20 @@ class JaxApiBaseTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, r"no local JAX GPU.*target_compute_capability"):
                 self.module.JaxApiBase._resolve_compute_capability(None, (90, 100), "TestOp")
 
+    def test_require_local_keeps_device_resolution_strict(self):
+        self.module.disable_device_compatibility_checks(True)
+        jax = types.ModuleType("jax")
+        jax.local_devices = lambda *, backend: ()
+
+        with mock.patch.dict(sys.modules, {"jax": jax}):
+            with self.assertRaisesRegex(RuntimeError, r"no local JAX GPU.*requires a homogeneous supported local JAX GPU"):
+                self.module.JaxApiBase._resolve_compute_capability(
+                    None,
+                    (100, 103, 107),
+                    "TestOp",
+                    require_local=True,
+                )
+
     def test_converts_array_metadata_to_shared_tensor_desc(self):
         desc = self.module.JaxApiBase._to_tensor_desc(
             _ArrayMetadata((2, 3, 4), "bfloat16"),

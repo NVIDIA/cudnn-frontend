@@ -190,10 +190,10 @@ row-major arrays whose axis order is described explicitly:
 import jax
 import jax.numpy as jnp
 
-from cudnn.jax import gemm_swiglu_wrapper
+from cudnn.jax import gemm_swiglu_wrapper_sm100
 
 # A: (L, M, K), B: (L, N, K)
-result = gemm_swiglu_wrapper(
+result = gemm_swiglu_wrapper_sm100(
     a,
     b,
     alpha=1.0,
@@ -232,10 +232,10 @@ Supported public layouts are:
 - B: `LNK` (K-major) or `LKN` (N-major)
 - AB12/C: `LMN` (N-major) or `LNM` (M-major)
 
-An explicit `target_compute_capability` may be used after calling
-`cudnn.jax.disable_device_compatibility_checks(True)` to bypass the local-device
-compatibility check. CuTe lowering still queries CUDA occupancy and therefore
-requires access to a CUDA device.
+The JAX API requires a homogeneous, supported local SM100-family GPU. It
+resolves the exact local compute capability for CuTe compilation and queries
+that GPU's occupancy during lowering. Disabling device compatibility checks
+does not enable deviceless or remote AOT compilation for this operation.
 
 ---
 
@@ -327,8 +327,8 @@ also the Torch API order. JAX arrays use the public axis orders selected by
 
 ### Wrapper-specific parameters
 
-The Torch wrapper is `gemm_swiglu_wrapper_sm100`. The JAX wrapper is
-`gemm_swiglu_wrapper`; it resolves the concrete kernel target while tracing.
+Torch and JAX both expose `gemm_swiglu_wrapper_sm100`. The JAX wrapper resolves
+the exact local SM100-family compilation target while tracing.
 
 - `a_tensor`, `b_tensor`: see Input/Output tensors
 - Torch: `c_major` selects `"m"` or `"n"`; `ab12_dtype` defaults to `torch.float32`; `c_dtype` defaults to `torch.float16`.
