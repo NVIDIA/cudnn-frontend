@@ -163,6 +163,10 @@ class GemmSwigluSm100(JaxApiBase):
         self.check_support()
         self._check_tensor_signature(a_tensor, self.a_desc, mode=self.a_mode)
         self._check_tensor_signature(b_tensor, self.b_desc, mode=self.b_mode)
+        self._max_active_clusters = self._get_max_active_clusters(
+            self._op.cluster_shape_mn[0] * self._op.cluster_shape_mn[1],
+            overlap_margin=self.num_cluster_overlap_margin,
+        )
 
         ab12_tensor, c_tensor = self._call_kernel(
             (a_tensor, b_tensor),
@@ -207,17 +211,13 @@ class GemmSwigluSm100(JaxApiBase):
             mma_tiler_mn=self._op.mma_tiler_mn,
             cluster_shape_mn=self._op.cluster_shape_mn,
         )
-        max_active_clusters = cutlass.utils.HardwareInfo().get_max_active_clusters(self._op.cluster_shape_mn[0] * self._op.cluster_shape_mn[1])
-        max_active_clusters -= self.num_cluster_overlap_margin
-        if max_active_clusters <= 0:
-            raise ValueError("max_active_clusters must be positive after applying CUDNNFE_CLUSTER_OVERLAP_MARGIN")
         kernel(
             a,
             b,
             ab12,
             c,
             cutlass.Float32(self._op.alpha),
-            max_active_clusters,
+            self._max_active_clusters,
             stream,
         )
 

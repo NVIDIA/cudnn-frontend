@@ -219,6 +219,49 @@ class JaxApiBaseTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, r"no local JAX GPU"):
                 self.module.JaxApiBase._resolve_compute_capability(None, (90, 100), "TestOp")
 
+    def test_caches_raw_max_active_clusters_per_instance_and_cluster_size(self):
+        query_calls = []
+
+        class HardwareInfo:
+            def get_max_active_clusters(self, cluster_size):
+                query_calls.append(cluster_size)
+                return {2: 8, 4: 12}[cluster_size]
+
+        cutlass = types.ModuleType("cutlass")
+        cutlass.__path__ = []
+        cutlass_utils = types.ModuleType("cutlass.utils")
+        cutlass_utils.HardwareInfo = HardwareInfo
+        cutlass.utils = cutlass_utils
+
+        class Adapter(self.module.JaxApiBase):
+            def check_support(self):
+                return True
+
+            def __call__(self):
+                return self.check_support()
+
+            def _launch(self, inputs, outputs, workspaces, stream):
+                raise AssertionError("not called")
+
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "cutlass": cutlass,
+                "cutlass.utils": cutlass_utils,
+            },
+        ):
+            api = Adapter()
+            self.assertEqual(api._get_max_active_clusters(4, overlap_margin=2), 10)
+            self.assertEqual(api._get_max_active_clusters(4, overlap_margin=3), 9)
+            self.assertEqual(api._get_max_active_clusters(2, overlap_margin=1), 7)
+            with self.assertRaisesRegex(ValueError, "max_active_clusters must be positive"):
+                api._get_max_active_clusters(4, overlap_margin=12)
+
+            other_api = Adapter()
+            self.assertEqual(other_api._get_max_active_clusters(4), 12)
+
+        self.assertEqual(query_calls, [4, 2, 4])
+
     def test_converts_array_metadata_to_shared_tensor_desc(self):
         desc = self.module.JaxApiBase._to_tensor_desc(
             _ArrayMetadata((2, 3, 4), "bfloat16"),

@@ -140,6 +140,7 @@ class JaxGemmSwigluContractTest(unittest.TestCase):
                 )
 
             def _call_kernel(self, inputs, **options):
+                self.captured_max_active_clusters_at_call = getattr(self, "_max_active_clusters", None)
                 self.captured_call = (tuple(inputs), options)
                 return tuple(
                     _Array(
@@ -148,6 +149,12 @@ class JaxGemmSwigluContractTest(unittest.TestCase):
                     )
                     for desc, spec in zip(options["output_descs"], options["output_spec"])
                 )
+
+            def _get_max_active_clusters(self, cluster_size, *, overlap_margin=0):
+                if not hasattr(self, "captured_active_cluster_queries"):
+                    self.captured_active_cluster_queries = []
+                self.captured_active_cluster_queries.append((cluster_size, overlap_margin))
+                return 12 - overlap_margin
 
         internal.JaxApiBase = JaxApiBase
         internal.JaxTensorDesc = JaxTensorDesc
@@ -369,13 +376,15 @@ class JaxGemmSwigluContractTest(unittest.TestCase):
                 alpha=0.25,
                 mma_tiler_mn=(256, 128),
             )
-        api.check_support()
+        self.assertFalse(hasattr(api, "captured_active_cluster_queries"))
+        api(sample_a, sample_b)
+        self.assertEqual(api.captured_active_cluster_queries, [(4, 2)])
+        self.assertEqual(api.captured_max_active_clusters_at_call, 10)
         seen = {}
 
         class HardwareInfo:
             def get_max_active_clusters(self, cluster_size):
-                seen["cluster_size"] = cluster_size
-                return 12
+                raise AssertionError(f"HardwareInfo queried from _launch for cluster size {cluster_size}")
 
         class Kernel:
             def __init__(self, **configuration):
@@ -413,7 +422,6 @@ class JaxGemmSwigluContractTest(unittest.TestCase):
                 "cluster_shape_mn": (2, 2),
             },
         )
-        self.assertEqual(seen["cluster_size"], 4)
         self.assertEqual(
             seen["arguments"],
             ("A", "B", "AB12", "C", ("Float32", 0.25), 10, stream),

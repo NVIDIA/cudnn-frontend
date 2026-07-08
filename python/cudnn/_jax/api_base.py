@@ -209,6 +209,33 @@ class JaxApiBase(ABC):
             found = ", ".join(f"{device} (SM{compute_capability})" for device, compute_capability in incompatible)
             raise compatibility_error(f"found {found}")
 
+    def _get_max_active_clusters(
+        self,
+        cluster_size: int,
+        *,
+        overlap_margin: int = 0,
+    ) -> int:
+        """Return cached occupancy for this adapter and cluster size.
+
+        The hardware query performs its own CuTe compilation, so adapters must
+        call this before entering ``cutlass.jax.cutlass_call`` lowering.
+        """
+
+        cache = getattr(self, "_max_active_clusters_cache", None)
+        if cache is None:
+            cache = {}
+            self._max_active_clusters_cache = cache
+
+        if cluster_size not in cache:
+            import cutlass
+
+            cache[cluster_size] = cutlass.utils.HardwareInfo().get_max_active_clusters(cluster_size)
+
+        max_active_clusters = cache[cluster_size] - overlap_margin
+        if max_active_clusters <= 0:
+            raise ValueError("max_active_clusters must be positive after applying CUDNNFE_CLUSTER_OVERLAP_MARGIN")
+        return max_active_clusters
+
     @staticmethod
     def _to_tensor_desc(
         value: Any,

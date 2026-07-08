@@ -234,8 +234,8 @@ Supported public layouts are:
 
 The JAX API requires a homogeneous, supported local SM100-family GPU. It
 resolves the exact local compute capability for CuTe compilation and queries
-that GPU's occupancy during lowering. Device-free AOT and remote compilation
-are not currently supported.
+that GPU's occupancy once per specialized adapter before CuTe lowering.
+Device-free AOT and remote compilation are not currently supported.
 
 ---
 
