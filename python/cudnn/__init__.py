@@ -46,13 +46,20 @@ symbols_to_import = [
 for symbol_name in symbols_to_import:
     globals()[symbol_name] = getattr(_pybind_module, symbol_name)
 
-for _optional_symbol in ["causal_conv1d_forward", "causal_conv1d_backward"]:
+for _optional_symbol in [
+    "causal_conv1d_forward",
+    "causal_conv1d_backward",
+    "causal_conv1d_nwh_forward",
+    "causal_conv1d_nwh_backward",
+    "b2b_causal_conv1d_forward",
+    "b2b_causal_conv1d_backward",
+]:
     if hasattr(_pybind_module, _optional_symbol):
         globals()[_optional_symbol] = getattr(_pybind_module, _optional_symbol)
 
 from .datatypes import _library_type, _is_torch_tensor
 
-__version__ = "1.26.0"
+__version__ = "1.27.0"
 
 
 def _tensor(

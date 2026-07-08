@@ -155,6 +155,140 @@ PYBIND11_MODULE(_compiled_module, m) {
               if (status != 0)
                   throw std::runtime_error("cudnnCausalConv1dBackward failed with status " + std::to_string(status));
           });
+
+    m.def("causal_conv1d_nwh_forward",
+          [](std::intptr_t stream,
+             std::intptr_t x_ptr,
+             std::intptr_t weight_ptr,
+             std::intptr_t bias_ptr,
+             std::intptr_t out_ptr,
+             int batch,
+             int dim,
+             int seq_len,
+             int kernel_size,
+             int data_type,
+             int activation) {
+              auto status = detail::causal_conv1d_nwh_forward(reinterpret_cast<cudaStream_t>(stream),
+                                                              reinterpret_cast<const void *>(x_ptr),
+                                                              reinterpret_cast<const void *>(weight_ptr),
+                                                              reinterpret_cast<const void *>(bias_ptr),
+                                                              reinterpret_cast<void *>(out_ptr),
+                                                              batch,
+                                                              dim,
+                                                              seq_len,
+                                                              kernel_size,
+                                                              static_cast<cudnnDataType_t>(data_type),
+                                                              static_cast<cudnnCausalConv1dActivation_t>(activation));
+              if (status != 0)
+                  throw std::runtime_error("cudnnCausalConv1dNwhForward failed with status " + std::to_string(status));
+          });
+
+    m.def("causal_conv1d_nwh_backward",
+          [](std::intptr_t stream,
+             std::intptr_t x_ptr,
+             std::intptr_t weight_ptr,
+             std::intptr_t bias_ptr,
+             std::intptr_t dy_ptr,
+             std::intptr_t dx_ptr,
+             std::intptr_t dweight_ptr,
+             std::intptr_t dbias_ptr,
+             int batch,
+             int dim,
+             int seq_len,
+             int kernel_size,
+             int data_type,
+             int dw_data_type,
+             int activation) {
+              auto status = detail::causal_conv1d_nwh_backward(reinterpret_cast<cudaStream_t>(stream),
+                                                               reinterpret_cast<const void *>(x_ptr),
+                                                               reinterpret_cast<const void *>(weight_ptr),
+                                                               reinterpret_cast<const void *>(bias_ptr),
+                                                               reinterpret_cast<const void *>(dy_ptr),
+                                                               reinterpret_cast<void *>(dx_ptr),
+                                                               reinterpret_cast<void *>(dweight_ptr),
+                                                               reinterpret_cast<void *>(dbias_ptr),
+                                                               batch,
+                                                               dim,
+                                                               seq_len,
+                                                               kernel_size,
+                                                               static_cast<cudnnDataType_t>(data_type),
+                                                               static_cast<cudnnDataType_t>(dw_data_type),
+                                                               static_cast<cudnnCausalConv1dActivation_t>(activation));
+              if (status != 0)
+                  throw std::runtime_error("cudnnCausalConv1dNwhBackward failed with status " + std::to_string(status));
+          });
+
+    m.def("b2b_causal_conv1d_forward",
+          [](std::intptr_t stream,
+             std::intptr_t x_ptr,
+             std::intptr_t weights_proj_ptr,
+             std::intptr_t weights_mixer_ptr,
+             std::intptr_t skip_bias_ptr,
+             std::intptr_t y_ptr,
+             std::intptr_t y_gated_ptr,
+             int batch,
+             int dim,
+             int seq_len,
+             int kernel_size_proj,
+             int kernel_size_mixer,
+             int data_type) {
+              auto status = detail::b2b_causal_conv1d_forward(reinterpret_cast<cudaStream_t>(stream),
+                                                              reinterpret_cast<const void *>(x_ptr),
+                                                              reinterpret_cast<const void *>(weights_proj_ptr),
+                                                              reinterpret_cast<const void *>(weights_mixer_ptr),
+                                                              reinterpret_cast<const void *>(skip_bias_ptr),
+                                                              reinterpret_cast<void *>(y_ptr),
+                                                              reinterpret_cast<void *>(y_gated_ptr),
+                                                              batch,
+                                                              dim,
+                                                              seq_len,
+                                                              kernel_size_proj,
+                                                              kernel_size_mixer,
+                                                              static_cast<cudnnDataType_t>(data_type));
+              if (status != 0)
+                  throw std::runtime_error("cudnnB2BCausalConv1dForward failed with status " + std::to_string(status));
+          });
+
+    m.def("b2b_causal_conv1d_backward",
+          [](std::intptr_t stream,
+             std::intptr_t x_ptr,
+             std::intptr_t weights_proj_ptr,
+             std::intptr_t weights_mixer_ptr,
+             std::intptr_t skip_bias_ptr,
+             std::intptr_t y_ptr,
+             std::intptr_t dy_ptr,
+             std::intptr_t dx_ptr,
+             std::intptr_t dweights_proj_ptr,
+             std::intptr_t dweights_mixer_ptr,
+             std::intptr_t dskip_bias_ptr,
+             int batch,
+             int dim,
+             int seq_len,
+             int kernel_size_proj,
+             int kernel_size_mixer,
+             int data_type,
+             int dw_data_type) {
+              auto status = detail::b2b_causal_conv1d_backward(reinterpret_cast<cudaStream_t>(stream),
+                                                               reinterpret_cast<const void *>(x_ptr),
+                                                               reinterpret_cast<const void *>(weights_proj_ptr),
+                                                               reinterpret_cast<const void *>(weights_mixer_ptr),
+                                                               reinterpret_cast<const void *>(skip_bias_ptr),
+                                                               reinterpret_cast<const void *>(y_ptr),
+                                                               reinterpret_cast<const void *>(dy_ptr),
+                                                               reinterpret_cast<void *>(dx_ptr),
+                                                               reinterpret_cast<void *>(dweights_proj_ptr),
+                                                               reinterpret_cast<void *>(dweights_mixer_ptr),
+                                                               reinterpret_cast<void *>(dskip_bias_ptr),
+                                                               batch,
+                                                               dim,
+                                                               seq_len,
+                                                               kernel_size_proj,
+                                                               kernel_size_mixer,
+                                                               static_cast<cudnnDataType_t>(data_type),
+                                                               static_cast<cudnnDataType_t>(dw_data_type));
+              if (status != 0)
+                  throw std::runtime_error("cudnnB2BCausalConv1dBackward failed with status " + std::to_string(status));
+          });
 #endif
 }
 
