@@ -189,7 +189,7 @@ class JaxImportContractTest(unittest.TestCase):
             "_SYMBOLS",
         )
         jax_exports = literal_assignment(_CUDNN_ROOT / "jax" / "__init__.py", "_OPERATION_EXPORTS")
-        jax_dsa_exports = {name for name in jax_exports if name not in {"RmsNormRhtAmaxSm100", "rmsnorm_rht_amax_sm100"}}
+        jax_dsa_exports = {name for name, (module_name, _) in jax_exports.items() if module_name.startswith("..deepseek_sparse_attention.")}
 
         self.assertEqual(jax_dsa_exports, set(torch_exports))
 

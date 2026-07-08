@@ -18,39 +18,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-# (compute_capability) → cute DSL --gpu-arch flag value.
-# H100, B200/B300, and sm_100f require architecture-specific variants because
-# the kernels use TMA / tcgen05 instructions that are only guaranteed to lower
-# correctly under the matching SASS gencode.
-_ARCH_MAP = {
-    90: "sm_90a",  # Hopper H100
-    100: "sm_100a",  # Blackwell B200
-    103: "sm_103a",  # Blackwell Ultra B300
-    107: "sm_100f",
-}
-
-
-def gpu_arch_flag_for_compute_capability(compute_capability: int) -> str:
-    """Return the CuTe architecture flag for an explicit compilation target."""
-
-    if isinstance(compute_capability, bool) or not isinstance(compute_capability, int):
-        raise TypeError(f"compute_capability must be an int, got {type(compute_capability).__name__}")
-    try:
-        return _ARCH_MAP[compute_capability]
-    except KeyError as error:
-        raise RuntimeError(
-            f"Unsupported GPU compute capability SM{compute_capability} for DSA CuTe kernels. "
-            "Add it to deepseek_sparse_attention/utils/compiler.py::_ARCH_MAP."
-        ) from error
-
-
-def compile_options_for_target(compute_capability: int, extra: str = "") -> str:
-    """Build CuTe compile options for a framework-supplied GPU target."""
-
-    parts = ["--enable-tvm-ffi", f"--gpu-arch {gpu_arch_flag_for_compute_capability(compute_capability)}"]
-    if extra:
-        parts.append(extra)
-    return " ".join(parts)
+from ..._cute_compiler import compile_options_for_target, gpu_arch_flag_for_compute_capability
 
 
 @lru_cache(maxsize=None)

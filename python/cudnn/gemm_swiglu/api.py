@@ -41,8 +41,10 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import make_fake_stream
 
-from cudnn.datatypes import _convert_to_cutlass_data_type
+from cudnn import data_type
+from cudnn.datatypes import _convert_to_cutlass_data_type, _torch_to_cudnn_data_type
 from cudnn.api_base import APIBase, TupleDict, ceil_div, is_power_of_2
+from .op import GemmSwigluSm100Op
 import os
 
 
@@ -104,6 +106,24 @@ class GemmSwigluSm100(APIBase):
             self._logger.debug("Quantization arguments provided, using quantized GEMM swiglu kernel")
             self._kernel = Sm100BlockScaledPersistentDenseGemmKernel
 
+        self._op = None
+        if self._kernel is PersistentDenseGemmKernel:
+            canonical_acc_dtype = _torch_to_cudnn_data_type(self.acc_dtype)
+            if canonical_acc_dtype is None:
+                canonical_acc_dtype = data_type.NOT_SET
+            self._op = GemmSwigluSm100Op(
+                a=self.a_desc,
+                b=self.b_desc,
+                ab12=self.ab12_desc,
+                c=self.c_desc,
+                alpha=self.alpha,
+                acc_dtype=canonical_acc_dtype,
+                mma_tiler_mn=self.mma_tiler_mn,
+                cluster_shape_mn=cluster_shape_mn,
+            )
+            self.mma_tiler_mn = self._op.mma_tiler_mn
+            self.cluster_shape_mn = self._op.cluster_shape_mn
+
         self._logger.debug(
             f"__init__ completed with args: sample_a {self.a_desc.shape}, sample_b {self.b_desc.shape}, sample_ab12 {self.ab12_desc.shape}, sample_c {self.c_desc.shape}, alpha {alpha}, acc_dtype {acc_dtype}, mma_tiler_mn {mma_tiler_mn}, cluster_shape_mn {cluster_shape_mn}, sample_sfa {self.sfa_desc.shape if self.sfa_desc is not None else None}, sample_sfb {self.sfb_desc.shape if self.sfb_desc is not None else None}, sample_amax {self.amax_desc.shape if self.amax_desc is not None else None}, sample_sfc {self.sfc_desc.shape if self.sfc_desc is not None else None}, sample_norm_const {self.norm_const_desc.shape if self.norm_const_desc is not None else None}, sf_vec_size {sf_vec_size}, vector_f32 {vector_f32}, ab12_stages {ab12_stages}"
         )
@@ -111,6 +131,38 @@ class GemmSwigluSm100(APIBase):
         self._interpret_uint8_as_fp4x2 = True
 
     def check_support(self) -> bool:
+        """Validate the shared operation contract and Torch device support."""
+
+        self._is_supported = False
+        if self._kernel is Sm100BlockScaledPersistentDenseGemmKernel:
+            return self._check_quantized_support()
+
+        if self._op is None:
+            raise RuntimeError("Standard GEMM + SwiGLU operation was not initialized")
+        self._op.check_support()
+        self.mma_tiler_mn = self._op.mma_tiler_mn
+        self.cluster_shape_mn = self._op.cluster_shape_mn
+
+        self.ab_dtype = self.a_desc.dtype
+        self.ab12_dtype = self.ab12_desc.dtype
+        self.c_dtype = self.c_desc.dtype
+
+        self._logger.debug("Checking environment")
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA is not available")
+        device = torch.cuda.current_device()
+        major, minor = torch.cuda.get_device_capability(device)
+        compute_capability = major * 10 + minor
+        if compute_capability < 100:
+            raise RuntimeError(f"GemmSwiglu requires SM100+ compute capability, but found SM{compute_capability} on device {device}")
+
+        self._is_supported = True
+        self._logger.debug("check_support completed successfully")
+        return True
+
+    def _check_quantized_support(self) -> bool:
+        """Preserve the existing Torch-only block-scaled validation path."""
+
         self._logger.debug("Entering check_support")
 
         self._logger.debug("Checking tensor shapes, strides, and dtypes")

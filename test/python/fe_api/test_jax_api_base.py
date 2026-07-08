@@ -278,6 +278,28 @@ class JaxApiBaseTest(unittest.TestCase):
         self.assertEqual(desc.stride, (1, 12, 4))
         self.assertEqual(desc.stride_order, (0, 2, 1))
 
+    def test_converts_public_physical_layout_to_canonical_descriptor_axes(self):
+        desc = self.module.JaxApiBase._to_tensor_desc(
+            _ArrayMetadata((2, 3, 4), "bfloat16"),
+            "sample",
+            mode=(1, 2, 0),
+            public_stride_order=(0, 2, 1),
+        )
+
+        self.assertEqual(desc.shape, (3, 4, 2))
+        self.assertEqual(desc.stride, (8, 2, 1))
+        self.assertEqual(desc.stride_order, (2, 1, 0))
+
+    def test_rejects_invalid_public_stride_orders(self):
+        value = _ArrayMetadata((2, 3, 4), "bfloat16")
+
+        with self.assertRaisesRegex(ValueError, "public_stride_order rank mismatch"):
+            self.module.JaxApiBase._to_tensor_desc(value, "sample", public_stride_order=(1, 0))
+        with self.assertRaisesRegex(ValueError, "public_stride_order must be a permutation"):
+            self.module.JaxApiBase._to_tensor_desc(value, "sample", public_stride_order=(2, 2, 0))
+        with self.assertRaisesRegex(TypeError, "public_stride_order entries must be integers"):
+            self.module.JaxApiBase._to_tensor_desc(value, "sample", public_stride_order=(2, True, 0))
+
     def test_jax_descriptor_derives_compact_output_metadata(self):
         source = self.module.JaxApiBase._to_tensor_desc(
             _ArrayMetadata((2, 3), "bfloat16"),
@@ -353,6 +375,26 @@ class JaxApiBaseTest(unittest.TestCase):
         self.assertEqual(spec.layout, (2, 1, 0))
         self.assertEqual(spec.mode, mode)
         self.assertEqual(spec.divisibility, (2, 4, 8))
+
+    def test_tensor_spec_preserves_explicit_public_physical_layout(self):
+        mode = (1, 2, 0)
+        desc = self.module.JaxApiBase._to_tensor_desc(
+            _ArrayMetadata((2, 3, 4), "bfloat16"),
+            "sample",
+            mode=mode,
+            public_stride_order=(0, 2, 1),
+        )
+        cutlass = types.ModuleType("cutlass")
+        cutlass.__path__ = []
+        cutlass_jax = types.ModuleType("cutlass.jax")
+        cutlass_jax.TensorSpec = _TensorSpec
+        cutlass.jax = cutlass_jax
+
+        with mock.patch.dict(sys.modules, {"cutlass": cutlass, "cutlass.jax": cutlass_jax}):
+            spec = self.module.JaxApiBase._to_tensor_spec(desc, mode=mode)
+
+        self.assertEqual(spec.layout, (0, 2, 1))
+        self.assertEqual(spec.mode, mode)
 
     def test_tensor_spec_defaults_to_identity_axis_binding(self):
         desc = self.module.JaxApiBase._to_tensor_desc(

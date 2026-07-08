@@ -10,6 +10,9 @@ This API supports two modes:
 1. **Standard mode**: High-precision GEMM with SwiGLU epilogue
 2. **Quantized mode** (block-scaled): Low-precision GEMM using block scaling supporting FP4 and FP8 data types
 
+The Torch API supports both modes. The initial JAX API supports standard mode;
+the block-scaled JAX surface will be added with the shared scale-factor ABI.
+
 ### Shapes
 
 - Inputs:
@@ -178,11 +181,71 @@ gemm.execute(
 )
 ```
 
+### JAX API (Standard Mode)
+
+The JAX wrapper is already decorated with `jax.jit`. Public arrays are compact
+row-major arrays whose axis order is described explicitly:
+
+```python
+import jax
+import jax.numpy as jnp
+
+from cudnn.jax import gemm_swiglu_wrapper_sm100
+
+# A: (L, M, K), B: (L, N, K)
+result = gemm_swiglu_wrapper_sm100(
+    a,
+    b,
+    alpha=1.0,
+    a_layout="LMK",
+    b_layout="LNK",
+    c_layout="LMN",
+    ab12_dtype=jnp.float32,
+    c_dtype=jnp.bfloat16,
+    acc_dtype=jnp.float32,
+)
+
+# AB12: (L, M, N), C: (L, M, N/2)
+ab12 = result["ab12_tensor"]
+c = result["c_tensor"]
+```
+
+The advanced class API specializes from shape/dtype metadata and may optionally
+accept explicit output exemplars:
+
+```python
+from cudnn.jax import GemmSwigluSm100
+
+operation = GemmSwigluSm100(
+    jax.ShapeDtypeStruct(a.shape, a.dtype),
+    jax.ShapeDtypeStruct(b.shape, b.dtype),
+    a_layout="LMK",
+    b_layout="LNK",
+    c_layout="LMN",
+)
+result = operation(a, b)
+```
+
+Supported public layouts are:
+
+- A: `LMK` (K-major) or `LKM` (M-major)
+- B: `LNK` (K-major) or `LKN` (N-major)
+- AB12/C: `LMN` (N-major) or `LNM` (M-major)
+
+An explicit `target_compute_capability` may be used after calling
+`cudnn.jax.disable_device_compatibility_checks(True)` to bypass the local-device
+compatibility check. CuTe lowering still queries CUDA occupancy and therefore
+requires access to a CUDA device.
+
 ---
 
 ## Parameters
 
 ### Input/Output tensors
+
+The shapes and strides below use the kernel's canonical axis order, which is
+also the Torch API order. JAX arrays use the public axis orders selected by
+`a_layout`, `b_layout`, and `c_layout` above.
 
 - Input tensor **A**: `a_tensor` (wrapper) or `sample_a`, `a_tensor` (class)
   - Shape: `(M, K, L)`
@@ -234,20 +297,20 @@ gemm.execute(
 - `alpha: float`
   - Scalar multiplier applied to the GEMM result before SwiGLU.
   - Default: `1.0`
-- `acc_dtype: torch.dtype`
+- `acc_dtype`: `torch.dtype` for Torch or a JAX dtype-like value for JAX
   - Accumulator dtype.
-  - Standard mode: `{float32, float16}`. Default: `torch.float32`
+  - Standard mode: `{float32, float16}`. Default: `float32`
   - Quantized mode: Must be `float32`
 - `mma_tiler_mn: Tuple[int, int]`
   - Kernel tile size `(TILE_M, TILE_N)`. Default: `(128, 128)`
   - `TILE_M ∈ {128, 256}`
-  - Standard mode: `TILE_N ∈ {32, 64, ..., 224, 256}`
+  - Standard mode: `TILE_N ∈ {64, 128, 192, 256}`
   - Quantized mode: `TILE_N ∈ {64, 128, 192, 256}`
 - `cluster_shape_mn: Tuple[int, int] | None`
   - Thread Block cluster shape `(CLUSTER_M, CLUSTER_N)`
   - Constraints: positive powers of 2, `CLUSTER_M*CLUSTER_N ≤ 16`.
   - Default: `(1,1)` if `mma_tiler_mn[0] != 256` else `(2,2)`.
-- CUDA stream (`current_stream` in class API, `stream` in wrapper)
+- CUDA stream (`current_stream` in the Torch class API, `stream` in the Torch wrapper). JAX supplies its stream during lowering.
 - **Quantization-specific parameters**
   - `sf_vec_size: int`
     - Scale factor vector size (number of elements per scale factor)
@@ -265,11 +328,9 @@ gemm.execute(
 ### Wrapper-specific parameters: `gemm_swiglu_wrapper_sm100`
 
 - `a_tensor`, `b_tensor`: see Input/Output tensors
-- `c_major: str`: see Input/Output tensors. Default: `"n"`
-- `ab12_dtype: torch.dtype`: see Input/Output tensors. Default: `torch.float32`
-- `c_dtype: torch.dtype`: see Input/Output tensors. Default: `torch.float16`
-- `sfa_tensor`, `sfb_tensor`, `norm_const_tensor`: see Quantization-specific tensors
-- `sf_vec_size`, `vector_f32`, `ab12_stages`: see Quantization-specific parameters
+- Torch: `c_major` selects `"m"` or `"n"`; `ab12_dtype` defaults to `torch.float32`; `c_dtype` defaults to `torch.float16`.
+- JAX: `a_layout`, `b_layout`, and `c_layout` select public axis order; `ab12_dtype` defaults to `jnp.float32`; `c_dtype` defaults to `jnp.float16`.
+- Torch quantized mode: `sfa_tensor`, `sfb_tensor`, `norm_const_tensor`, `sf_vec_size`, `vector_f32`, and `ab12_stages` use the quantization rules above.
 
 ### Wrapper return values
 
@@ -290,8 +351,8 @@ Tuple unpacking order is always:
 
 #### `GemmSwigluSm100` (constructor)
 
-- `sample_a`, `sample_b`, `sample_ab12`, `sample_c` – see Input/Output tensors
-- `sample_sfa`, `sample_sfb`, `sample_sfc`, `sample_amax`, `sample_norm_const` – see Scale factor tensors (quantized mode)
+- `sample_a`, `sample_b`, `sample_ab12`, `sample_c` – see Input/Output tensors. JAX requires only the input samples and accepts the output samples optionally.
+- `sample_sfa`, `sample_sfb`, `sample_sfc`, `sample_amax`, `sample_norm_const` – Torch quantized mode only.
 
 #### `GemmSwigluSm100.execute`
 
@@ -305,7 +366,7 @@ Tuple unpacking order is always:
 ### Layouts and strides
 
 - `AB12` and `C` must have the same major order.
-- `A`, `B`, `AB12` must be 16-byte aligned along the contiguous dimension.
+- `A`, `B`, `AB12`, and `C` must be 16-byte aligned along the contiguous dimension.
 - For FP4 inputs (quantized mode): `A` and `B` must be `k`-major, `AB12` must be `n`-major.
 
 ### Dtypes

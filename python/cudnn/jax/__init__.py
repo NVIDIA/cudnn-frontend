@@ -37,6 +37,8 @@ from .._jax import JaxApiBase, JaxTensorDesc, TupleDict, disable_device_compatib
 _OPERATION_EXPORTS = {
     "RmsNormRhtAmaxSm100": ("..rmsnorm_rht_amax.jax", "RmsNormRhtAmaxSm100"),
     "rmsnorm_rht_amax_sm100": ("..rmsnorm_rht_amax.jax", "rmsnorm_rht_amax_sm100"),
+    "GemmSwigluSm100": ("..gemm_swiglu.jax", "GemmSwigluSm100"),
+    "gemm_swiglu_wrapper_sm100": ("..gemm_swiglu.jax", "gemm_swiglu_wrapper_sm100"),
     "SparseAttentionBackward": ("..deepseek_sparse_attention.sparse_attention_backward.jax", "SparseAttentionBackward"),
     "sparse_attention_backward_wrapper": (
         "..deepseek_sparse_attention.sparse_attention_backward.jax",
@@ -74,7 +76,7 @@ _OPERATION_EXPORTS = {
     "dense_indexer_backward_wrapper": ("..deepseek_sparse_attention.indexer_backward.jax", "dense_indexer_backward_wrapper"),
 }
 
-_DSA_EXPORTS = frozenset(name for name in _OPERATION_EXPORTS if name not in {"RmsNormRhtAmaxSm100", "rmsnorm_rht_amax_sm100"})
+_DSA_EXPORTS = frozenset(name for name, (module_name, _) in _OPERATION_EXPORTS.items() if module_name.startswith("..deepseek_sparse_attention."))
 
 
 def _load_operation(name: str) -> Any:

@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Dependency-free contracts for DSA compilation targets."""
+"""Dependency-free contracts for JAX CuTe compilation targets."""
 
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
@@ -16,10 +16,10 @@ else:
     pytestmark = pytest.mark.L0
 
 
-_MODULE_PATH = Path(__file__).resolve().parents[3] / "python" / "cudnn" / "deepseek_sparse_attention" / "utils" / "compiler.py"
+_MODULE_PATH = Path(__file__).resolve().parents[3] / "python" / "cudnn" / "_cute_compiler.py"
 
 
-class DsaCompilerTest(unittest.TestCase):
+class JaxCompilerTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         spec = spec_from_file_location("dsa_compiler_contract", _MODULE_PATH)

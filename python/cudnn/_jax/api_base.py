@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Callable
+from operator import index
 from typing import Any
 
 from .. import data_type
@@ -14,7 +15,7 @@ from .._tensor_desc import TensorDesc
 from .layout import compact_stride, normalize_mode, to_canonical_axes, to_cutlass_layout, to_public_axes
 
 _DEVICE_COMPATIBILITY_CHECKS_DISABLED = False
-_DEVICE_COMPATIBILITY_CHECK_DISABLE_HINT = "Call cudnn.jax.disable_device_compatibility_checks(True) before tracing to allow AOT or remote compilation."
+_DEVICE_COMPATIBILITY_CHECK_DISABLE_HINT = "Call cudnn.jax.disable_device_compatibility_checks(True) before tracing for a different or unavailable local GPU."
 _TARGET_COMPUTE_CAPABILITY_HINT = "Pass target_compute_capability explicitly when tracing for AOT or on a host without the target GPU."
 
 
@@ -76,6 +77,27 @@ def _require_array_metadata(value: Any, name: str) -> tuple[Any, ...]:
     if not hasattr(value, "shape") or not hasattr(value, "dtype"):
         raise TypeError(f"{name} must have shape and dtype metadata")
     return tuple(value.shape)
+
+
+def _normalize_stride_order(rank: int, stride_order: tuple[int, ...] | None) -> tuple[int, ...]:
+    if stride_order is None:
+        return tuple(reversed(range(rank)))
+
+    normalized = []
+    for dimension in stride_order:
+        if isinstance(dimension, bool):
+            raise TypeError(f"public_stride_order entries must be integers, got {dimension!r}")
+        try:
+            normalized.append(index(dimension))
+        except TypeError as error:
+            raise TypeError(f"public_stride_order entries must be integers, got {dimension!r}") from error
+
+    normalized_order = tuple(normalized)
+    if len(normalized_order) != rank:
+        raise ValueError(f"public_stride_order rank mismatch: expected {rank}, got {len(normalized_order)}")
+    if tuple(sorted(normalized_order)) != tuple(range(rank)):
+        raise ValueError(f"public_stride_order must be a permutation of [0, {rank - 1}], got {normalized_order}")
+    return normalized_order
 
 
 class JaxApiBase(ABC):
@@ -223,18 +245,20 @@ class JaxApiBase(ABC):
         name: str,
         *,
         mode: tuple[int, ...] | None = None,
+        public_stride_order: tuple[int, ...] | None = None,
         init_value: bool | int | float | None = None,
     ) -> JaxTensorDesc:
         """Describe a public JAX array in canonical kernel-axis order.
 
         ``mode[kernel_axis]`` selects the corresponding public array axis.
-        Public JAX arrays are modeled as compact row-major buffers.
+        ``public_stride_order`` lists the public array dimensions from fastest
+        to slowest. It defaults to compact row-major storage.
         """
 
         public_shape = _require_array_metadata(value, name)
         rank = len(public_shape)
         mode = normalize_mode(rank, mode)
-        public_stride_order = tuple(reversed(range(rank)))
+        public_stride_order = _normalize_stride_order(rank, public_stride_order)
         public_stride = compact_stride(public_shape, public_stride_order)
         canonical_axis_by_public_axis = to_public_axes(tuple(range(rank)), mode)
 
