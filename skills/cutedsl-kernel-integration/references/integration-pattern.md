@@ -136,9 +136,9 @@ Add focused pytest coverage under `test/python/fe_api/`.
 
 Typical files:
 
-- `test/python/fe_api/test_<operation>.py`
-- `test/python/fe_api/test_<operation>_utils.py` for reusable test helpers or shape/reference utilities.
-- A family subdirectory when matching existing structure, such as `test/python/fe_api/nsa/`.
+- `test/python/fe_api/<feature>/test_<operation>.py`
+- `test/python/fe_api/<feature>/test_<operation>_utils.py` for reusable test helpers or shape/reference utilities.
+- A nested family subdirectory when matching existing structure, such as `test/python/fe_api/nsa/`.
 
 Coverage should include:
 

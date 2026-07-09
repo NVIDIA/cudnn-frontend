@@ -148,4 +148,4 @@ Tuple unpacking order is `(o_tensor, amax_tensor)`.
 ## Verification
 
 Focused correctness and cache coverage live in:
-- `test/python/fe_api/test_rmsnorm_rht_amax.py`
+- `test/python/fe_api/norm/test_rmsnorm_rht_amax.py`

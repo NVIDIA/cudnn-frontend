@@ -350,4 +350,4 @@ Additional constraints:
 
 ## Usage examples
 
-For usage examples, see test cases in `test/python/fe_api/test_gemm_swiglu.py`
+For usage examples, see test cases in `test/python/fe_api/gemm/test_gemm_swiglu.py`

@@ -275,6 +275,6 @@ Tuple unpacking order is: `(dq_tensor, dk_tensor, dv_tensor)`.
 
 For runnable examples and reference-comparison checks, see:
 
-- `test/python/fe_api/test_sdpa_bwd.py`
-- `test/python/fe_api/test_sdpa_bwd_utils.py`
+- `test/python/fe_api/sdpa/test_sdpa_bwd.py`
+- `test/python/fe_api/sdpa/test_sdpa_bwd_utils.py`
 
