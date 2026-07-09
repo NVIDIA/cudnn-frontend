@@ -26,8 +26,7 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-"""Fused projection GEMM + per-head YARN RoPE + dual-direction MXFP8 quantize (Blackwell / SM100).
-"""
+"""Fused projection GEMM + per-head YARN RoPE + dual-direction MXFP8 quantize (Blackwell / SM100)."""
 
 import cuda.bindings.driver as cuda
 import torch
@@ -45,11 +44,12 @@ from cutlass._mlir.dialects import llvm as _llvm_dialect
 from cutlass.cutlass_dsl import Float32 as _Float32Sym, Int32 as _Int32Sym
 
 # ---- DSv3 constants ----
-NUM_HEADS = 128
+NUM_HEADS = 128  # DSv3 default; the kernel DERIVES num_heads from the weight shape at
+# compile time (see run()), so this literal only documents the tuned value
 QK_NOPE = 128
 QK_ROPE = 64
 HALF = 32
-HEAD_DIM = 192          # 128 + 64
+HEAD_DIM = 192  # 128 + 64
 BLOCK = 32
 FP8_MAX = 448.0
 
@@ -57,23 +57,38 @@ FP8_MAX = 448.0
 io_dtype = cutlass.BFloat16
 acc_dtype = cutlass.Float32
 TILE_M = 128
-TILE_N = HEAD_DIM       # 192, one head per CTA
+TILE_N = HEAD_DIM  # 192, one head per CTA
 K_TILE = 64
-COLBLK = TILE_M // BLOCK   # col blocks per CTA along tokens
-stage_dtype = cutlass.BFloat16   # SMEM staging dtype for post-rope tile
+COLBLK = TILE_M // BLOCK  # col blocks per CTA along tokens
+stage_dtype = cutlass.BFloat16  # SMEM staging dtype for post-rope tile
 
 mma_inst_shape_mnk = (TILE_M, TILE_N, 16)
 mma_tiler_mnk = (TILE_M, TILE_N, K_TILE)
 
 ab_stages = 4
 acc_stages = 2
-NUM_EPI_WARPS = 12         # epilogue warps (rope + quant); 4 of them do T2R staging
-T2R_WARPS = 4              # warps that drain TMEM->SMEM (fixed by 128-thread T2R)
+NUM_EPI_WARPS = 12  # epilogue warps (rope + quant); 4 of them do T2R staging
+T2R_WARPS = 4  # warps that drain TMEM->SMEM (fixed by 128-thread T2R)
 threads_in_epilogue = NUM_EPI_WARPS * 32
-SACC_STRIDE = 196          # marginally better than 200 in testing
-FEATCELL = 64              # VEC2: feature-cell width; lane owns 2 contiguous feats
-N_FEATCELL = HEAD_DIM // FEATCELL   # 3
-HALFW = 16                 # lanes per 32-feature row-block within a featcell
+SACC_STRIDE = 196  # marginally better than 200 in testing
+FEATCELL = 64  # VEC2: feature-cell width; lane owns 2 contiguous feats
+N_FEATCELL = HEAD_DIM // FEATCELL  # 3
+HALFW = 16  # lanes per 32-feature row-block within a featcell
+
+# ---- Structural specialization (compile-time) ----
+# Like the SDPA kernels' fixed head_dim, this kernel is specialized for the DeepSeek-V3 Q up-proj
+# head geometry: HEAD_DIM=192 (QK_NOPE 128 + QK_ROPE 64), MXFP8 BLOCK=32, TILE_M=128. The epilogue's
+# VEC2 feature-cell layout, warp specialization, and single trailing rope cell depend on these exact
+# values -- changing them requires reworking the epilogue, not just editing a constant. These asserts
+# fail loudly at import if the constants are set to an unsupported combination. (NUM_HEADS is the one
+# dimension left general -- it is derived from the weight shape and only sizes the grid/output stride.)
+assert FEATCELL == 64, "FEATCELL is warp-size (32) x VEC2 (2); must be 64"
+assert QK_NOPE + QK_ROPE == HEAD_DIM, "QK_NOPE + QK_ROPE must equal HEAD_DIM"
+assert HEAD_DIM % FEATCELL == 0, "HEAD_DIM must be a whole number of 64-wide feature cells"
+assert QK_ROPE == FEATCELL, "the rope occupies exactly the trailing feature cell; QK_ROPE must equal FEATCELL"
+assert HALF == QK_ROPE // 2, "HALF must be QK_ROPE // 2"
+assert TILE_M % BLOCK == 0, "TILE_M must be a whole number of MXFP8 blocks"
+assert NUM_EPI_WARPS == COLBLK * N_FEATCELL, "epilogue warp count must equal COLBLK x N_FEATCELL"
 
 
 @cute.struct
@@ -175,6 +190,7 @@ def gemm_proj_rope_mxfp8_kernel(
     cta_layout_vmnk: cute.Layout,
     tile_sched_params: utils.PersistentTileSchedulerParams,
     num_tmem_cols: cutlass.Constexpr,
+    num_heads: cutlass.Constexpr,
 ):
     warp_idx = cute.arch.warp_idx()
     warp_idx = cute.arch.make_warp_uniform(warp_idx)
@@ -186,16 +202,9 @@ def gemm_proj_rope_mxfp8_kernel(
 
     smem = cutlass.utils.SmemAllocator()
     storage = smem.allocate(SharedStorage)
-    sA = smem.allocate_tensor(
-        element_type=io_dtype, layout=a_smem_layout.outer,
-        byte_alignment=128, swizzle=a_smem_layout.inner)
-    sB = smem.allocate_tensor(
-        element_type=io_dtype, layout=b_smem_layout.outer,
-        byte_alignment=128, swizzle=b_smem_layout.inner)
-    sACC = smem.allocate_tensor(
-        element_type=stage_dtype,
-        layout=cute.make_layout((TILE_M, TILE_N), stride=(SACC_STRIDE, 1)),
-        byte_alignment=128)
+    sA = smem.allocate_tensor(element_type=io_dtype, layout=a_smem_layout.outer, byte_alignment=128, swizzle=a_smem_layout.inner)
+    sB = smem.allocate_tensor(element_type=io_dtype, layout=b_smem_layout.outer, byte_alignment=128, swizzle=b_smem_layout.inner)
+    sACC = smem.allocate_tensor(element_type=stage_dtype, layout=cute.make_layout((TILE_M, TILE_N), stride=(SACC_STRIDE, 1)), byte_alignment=128)
 
     if warp_idx == tma_warp_id:
         cpasync.prefetch_descriptor(tma_atom_a)
@@ -204,10 +213,8 @@ def gemm_proj_rope_mxfp8_kernel(
     cta_rank_in_cluster = cute.arch.block_idx_in_cluster()
     cta_in_cluster_coord_vmnk = cta_layout_vmnk.get_flat_coord(cta_rank_in_cluster)
 
-    tma_mcast_mask_a = cpasync.create_tma_multicast_mask(
-        cta_layout_vmnk, cta_in_cluster_coord_vmnk, mcast_mode=2)
-    tma_mcast_mask_b = cpasync.create_tma_multicast_mask(
-        cta_layout_vmnk, cta_in_cluster_coord_vmnk, mcast_mode=1)
+    tma_mcast_mask_a = cpasync.create_tma_multicast_mask(cta_layout_vmnk, cta_in_cluster_coord_vmnk, mcast_mode=2)
+    tma_mcast_mask_b = cpasync.create_tma_multicast_mask(cta_layout_vmnk, cta_in_cluster_coord_vmnk, mcast_mode=1)
 
     gA = cute.local_tile(mA_mkl, cute.slice_(mma_tiler_mnk, (None, 0, None)), (None, None))
     gB = cute.local_tile(mB_nkl, cute.slice_(mma_tiler_mnk, (0, None, None)), (None, None))
@@ -222,28 +229,27 @@ def gemm_proj_rope_mxfp8_kernel(
     acc_shape = tiled_mma.partition_shape_C(mma_tiler_mnk[:2])
     tCtAcc_fake = tiled_mma.make_fragment_C(cute.append(acc_shape, acc_stages))
 
-    epilogue_sync_barrier = pipeline.NamedBarrier(
-        barrier_id=1, num_threads=threads_in_epilogue)
-    tmem_alloc_barrier = pipeline.NamedBarrier(
-        barrier_id=2, num_threads=32 * len((mma_warp_id, *epilogue_warp_ids)))
-    tmem = utils.TmemAllocator(
-        storage.tmem_holding_buffer,
-        barrier_for_retrieve=tmem_alloc_barrier,
-        allocator_warp_id=epilogue_warp_ids[0],
-        is_two_cta=False)
+    epilogue_sync_barrier = pipeline.NamedBarrier(barrier_id=1, num_threads=threads_in_epilogue)
+    tmem_alloc_barrier = pipeline.NamedBarrier(barrier_id=2, num_threads=32 * len((mma_warp_id, *epilogue_warp_ids)))
+    tmem = utils.TmemAllocator(storage.tmem_holding_buffer, barrier_for_retrieve=tmem_alloc_barrier, allocator_warp_id=epilogue_warp_ids[0], is_two_cta=False)
 
     tAsA, tAgA = cpasync.tma_partition(
-        tma_atom_a, cta_in_cluster_coord_vmnk[2],
+        tma_atom_a,
+        cta_in_cluster_coord_vmnk[2],
         cute.make_layout(cute.size(cta_layout_vmnk, mode=[2])),
-        cute.group_modes(sA, 0, 3), cute.group_modes(tCgA, 0, 3))
+        cute.group_modes(sA, 0, 3),
+        cute.group_modes(tCgA, 0, 3),
+    )
     tBsB, tBgB = cpasync.tma_partition(
-        tma_atom_b, cta_in_cluster_coord_vmnk[1],
+        tma_atom_b,
+        cta_in_cluster_coord_vmnk[1],
         cute.make_layout(cute.size(cta_layout_vmnk, mode=[1])),
-        cute.group_modes(sB, 0, 3), cute.group_modes(tCgB, 0, 3))
+        cute.group_modes(sB, 0, 3),
+        cute.group_modes(tCgB, 0, 3),
+    )
 
-    num_tma_copy_bytes = (
-        cute.size_in_bytes(io_dtype, cute.select(a_smem_layout, mode=[0, 1, 2]))
-        + cute.size_in_bytes(io_dtype, cute.select(b_smem_layout, mode=[0, 1, 2]))
+    num_tma_copy_bytes = cute.size_in_bytes(io_dtype, cute.select(a_smem_layout, mode=[0, 1, 2])) + cute.size_in_bytes(
+        io_dtype, cute.select(b_smem_layout, mode=[0, 1, 2])
     )
 
     mainloop_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
@@ -258,8 +264,7 @@ def gemm_proj_rope_mxfp8_kernel(
     ).make_participants()
 
     acc_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
-    acc_consumer_group = pipeline.CooperativeGroup(
-        pipeline.Agent.Thread, size=T2R_WARPS)
+    acc_consumer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, size=T2R_WARPS)
     acc_producer, acc_consumer = pipeline.PipelineUmmaAsync.create(
         barrier_storage=storage.acc_mbar_ptr.data_ptr(),
         num_stages=acc_stages,
@@ -270,8 +275,7 @@ def gemm_proj_rope_mxfp8_kernel(
 
     num_k_tiles = cute.size(tCgA, mode=[4])
 
-    tile_sched = utils.StaticPersistentTileScheduler.create(
-        tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim())
+    tile_sched = utils.StaticPersistentTileScheduler.create(tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim())
     work_tile = tile_sched.initial_work_tile_info()
 
     # ================= TMA load warp =================
@@ -284,12 +288,8 @@ def gemm_proj_rope_mxfp8_kernel(
             tBgB_slice = tBgB[(None, n_idx, None)]
             for k_tile_idx in cutlass.range(num_k_tiles):
                 handle = ab_producer.acquire_and_advance()
-                cute.copy(tma_atom_a, tAgA_slice[(None, k_tile_idx)],
-                          tAsA[(None, handle.index)],
-                          tma_bar_ptr=handle.barrier, mcast_mask=tma_mcast_mask_a)
-                cute.copy(tma_atom_b, tBgB_slice[(None, k_tile_idx)],
-                          tBsB[(None, handle.index)],
-                          tma_bar_ptr=handle.barrier, mcast_mask=tma_mcast_mask_b)
+                cute.copy(tma_atom_a, tAgA_slice[(None, k_tile_idx)], tAsA[(None, handle.index)], tma_bar_ptr=handle.barrier, mcast_mask=tma_mcast_mask_a)
+                cute.copy(tma_atom_b, tBgB_slice[(None, k_tile_idx)], tBsB[(None, handle.index)], tma_bar_ptr=handle.barrier, mcast_mask=tma_mcast_mask_b)
             tile_sched.advance_to_next_work()
             work_tile = tile_sched.get_current_work()
         ab_producer.tail()
@@ -320,17 +320,15 @@ def gemm_proj_rope_mxfp8_kernel(
         tmem_ptr = tmem.retrieve_ptr(acc_dtype)
         tCtAcc_base = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
 
-        copy_atom_t2r = cute.make_copy_atom(
-            tcgen05.Ld32x32bOp(tcgen05.Repetition.x32), cutlass.Float32)
+        copy_atom_t2r = cute.make_copy_atom(tcgen05.Ld32x32bOp(tcgen05.Repetition.x32), cutlass.Float32)
 
         sACC_epi = cute.flat_divide(sACC, epi_tile)
         buf0 = cute.make_rmem_tensor((BLOCK,), cutlass.Float32)
         buf1 = cute.make_rmem_tensor((BLOCK,), cutlass.Float32)
         rPr = cute.make_rmem_tensor((1,), cutlass.Uint16)
         rPc = cute.make_rmem_tensor((1,), cutlass.Uint16)
-        st16 = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(), cutlass.Uint16, num_bits_per_copy=16)
-        wid = warp_idx              # epilogue warp id 0..NUM_EPI_WARPS-1
+        st16 = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.Uint16, num_bits_per_copy=16)
+        wid = warp_idx  # epilogue warp id 0..NUM_EPI_WARPS-1
         lane = tidx % 32
 
         while work_tile.is_valid_tile:
@@ -347,10 +345,8 @@ def gemm_proj_rope_mxfp8_kernel(
                 thr_copy_t2r = tiled_copy_t2r.get_slice(tidx)
                 tTR_tAcc = thr_copy_t2r.partition_S(tCtAcc_epi)
                 tTR_sACC = thr_copy_t2r.partition_D(sACC_epi)
-                tTR_rAcc = cute.make_rmem_tensor(
-                    tTR_sACC[(None, None, None, 0, 0)].shape, cutlass.Float32)
-                tTR_rStg = cute.make_rmem_tensor(
-                    tTR_sACC[(None, None, None, 0, 0)].shape, stage_dtype)
+                tTR_rAcc = cute.make_rmem_tensor(tTR_sACC[(None, None, None, 0, 0)].shape, cutlass.Float32)
+                tTR_rStg = cute.make_rmem_tensor(tTR_sACC[(None, None, None, 0, 0)].shape, stage_dtype)
                 tTR_tAcc_g = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
                 tTR_sACC_g = cute.group_modes(tTR_sACC, 3, cute.rank(tTR_sACC))
                 subtile_cnt = cute.size(tTR_tAcc_g.shape, mode=[3])
@@ -367,12 +363,12 @@ def gemm_proj_rope_mxfp8_kernel(
 
             # ---- VEC2: lane owns 2 contiguous features; 12 cells = 12 warps ----
             cell = wid
-            cb = cell // N_FEATCELL          # token-block 0..3
-            fc = cell % N_FEATCELL           # feature-cell 0..2
+            cb = cell // N_FEATCELL  # token-block 0..3
+            fc = cell % N_FEATCELL  # feature-cell 0..2
             tok0 = cb * BLOCK
-            f0 = fc * FEATCELL + 2 * lane    # global feature (even)
+            f0 = fc * FEATCELL + 2 * lane  # global feature (even)
             f1 = f0 + 1
-            b = fc * 2 + (lane // HALFW)      # 32-feature row-block 0..5
+            b = fc * 2 + (lane // HALFW)  # 32-feature row-block 0..5
             col_amax0 = cutlass.Float32(0.0)
             col_amax1 = cutlass.Float32(0.0)
             is_rope = fc == (N_FEATCELL - 1)
@@ -394,12 +390,8 @@ def gemm_proj_rope_mxfp8_kernel(
                     q0 = sACC[tok0 + r, pcol0 + 1].to(cutlass.Float32)
                     p1 = sACC[tok0 + r, pcol1].to(cutlass.Float32)
                     q1 = sACC[tok0 + r, pcol1 + 1].to(cutlass.Float32)
-                    tcos = cute.make_tensor(cute.make_ptr(
-                        cutlass.BFloat16, cos_base + r * cos_row_bytes,
-                        cute.AddressSpace.gmem, assumed_align=4), (2,))
-                    tsin = cute.make_tensor(cute.make_ptr(
-                        cutlass.BFloat16, sin_base + r * cos_row_bytes,
-                        cute.AddressSpace.gmem, assumed_align=4), (2,))
+                    tcos = cute.make_tensor(cute.make_ptr(cutlass.BFloat16, cos_base + r * cos_row_bytes, cute.AddressSpace.gmem, assumed_align=4), (2,))
+                    tsin = cute.make_tensor(cute.make_ptr(cutlass.BFloat16, sin_base + r * cos_row_bytes, cute.AddressSpace.gmem, assumed_align=4), (2,))
                     c0 = tcos[0].to(cutlass.Float32)
                     s0 = tsin[0].to(cutlass.Float32)
                     c1 = tcos[1].to(cutlass.Float32)
@@ -430,9 +422,9 @@ def gemm_proj_rope_mxfp8_kernel(
             mScol[scol_row, head, f0] = cutlass.Uint8(sbc0)
             mScol[scol_row, head, f1] = cutlass.Uint8(sbc1)
             is_leader = (lane % HALFW) == 0
-            vchunk = f0 // 2                 # VEC=2 chunk index within HEAD_DIM
+            vchunk = f0 // 2  # VEC=2 chunk index within HEAD_DIM
 
-            row_bytes = NUM_HEADS * HEAD_DIM
+            row_bytes = num_heads * HEAD_DIM
             pr_base = mQrow[token_base + tok0, head, None].iterator.toint()
             pc_base = mQcol[token_base + tok0, head, None].iterator.toint()
             for r in cutlass.range_constexpr(BLOCK):
@@ -455,14 +447,8 @@ def gemm_proj_rope_mxfp8_kernel(
                 vc0, vc1 = cute.arch.mul_packed_f32x2((v0, v1), (invc0, invc1))
                 rPr[0] = cutlass.Uint16(_pack_e4m3x2(vr0, vr1))
                 rPc[0] = cutlass.Uint16(_pack_e4m3x2(vc0, vc1))
-                pr = cute.make_ptr(
-                    cutlass.Uint16,
-                    pr_base + r * row_bytes,
-                    cute.AddressSpace.gmem, assumed_align=16)
-                pc = cute.make_ptr(
-                    cutlass.Uint16,
-                    pc_base + r * row_bytes,
-                    cute.AddressSpace.gmem, assumed_align=16)
+                pr = cute.make_ptr(cutlass.Uint16, pr_base + r * row_bytes, cute.AddressSpace.gmem, assumed_align=16)
+                pc = cute.make_ptr(cutlass.Uint16, pc_base + r * row_bytes, cute.AddressSpace.gmem, assumed_align=16)
                 gr = cute.tiled_divide(cute.make_tensor(pr, (HEAD_DIM // 2,)), (1,))
                 gc = cute.tiled_divide(cute.make_tensor(pc, (HEAD_DIM // 2,)), (1,))
                 cute.copy(st16, rPr, gr[None, vchunk])
@@ -488,6 +474,7 @@ def gemm_proj_rope_mxfp8_host(
     mQcol: cute.Tensor,
     mScol: cute.Tensor,
     grid_m: cutlass.Constexpr,
+    num_heads: cutlass.Constexpr,
     max_active_clusters: cutlass.Constexpr,
     swizzle_size: cutlass.Constexpr,
     stream,
@@ -495,10 +482,7 @@ def gemm_proj_rope_mxfp8_host(
     a_major = utils.LayoutEnum.from_tensor(mA).mma_major_mode()
     b_major = utils.LayoutEnum.from_tensor(mB).mma_major_mode()
 
-    op = tcgen05.MmaF16BF16Op(
-        io_dtype, acc_dtype, mma_inst_shape_mnk,
-        tcgen05.CtaGroup.ONE, tcgen05.OperandSource.SMEM,
-        a_major, b_major)
+    op = tcgen05.MmaF16BF16Op(io_dtype, acc_dtype, mma_inst_shape_mnk, tcgen05.CtaGroup.ONE, tcgen05.OperandSource.SMEM, a_major, b_major)
     tiled_mma = cute.make_tiled_mma(op)
 
     a_smem_layout = sm100_utils.make_smem_layout_a(tiled_mma, mma_tiler_mnk, mA.element_type, ab_stages)
@@ -512,33 +496,40 @@ def gemm_proj_rope_mxfp8_host(
 
     a_smem_layout_1 = cute.slice_(a_smem_layout, (None, None, None, 0))
     b_smem_layout_1 = cute.slice_(b_smem_layout, (None, None, None, 0))
-    tma_atom_a, tma_tensor_a = cute.nvgpu.make_tiled_tma_atom_A(
-        tma_op, mA, a_smem_layout_1, mma_tiler_mnk, tiled_mma, cta_layout_vmnk.shape)
-    tma_atom_b, tma_tensor_b = cute.nvgpu.make_tiled_tma_atom_B(
-        tma_op, mB, b_smem_layout_1, mma_tiler_mnk, tiled_mma, cta_layout_vmnk.shape)
+    tma_atom_a, tma_tensor_a = cute.nvgpu.make_tiled_tma_atom_A(tma_op, mA, a_smem_layout_1, mma_tiler_mnk, tiled_mma, cta_layout_vmnk.shape)
+    tma_atom_b, tma_tensor_b = cute.nvgpu.make_tiled_tma_atom_B(tma_op, mB, b_smem_layout_1, mma_tiler_mnk, tiled_mma, cta_layout_vmnk.shape)
 
     cta_tile_shape_mnk = (mma_tiler_mnk[0], mma_tiler_mnk[1], mma_tiler_mnk[2])
     c_layout_kind = utils.LayoutEnum.ROW_MAJOR
-    epi_tile = utils.compute_epilogue_tile_shape(
-        cta_tile_shape_mnk, False, c_layout_kind, cutlass.Float32)
+    epi_tile = utils.compute_epilogue_tile_shape(cta_tile_shape_mnk, False, c_layout_kind, cutlass.Float32)
 
     acc_shape = tiled_mma.partition_shape_C(mma_tiler_mnk[:2])
     tCtAcc_fake = tiled_mma.make_fragment_C(cute.append(acc_shape, acc_stages))
     num_tmem_cols = utils.get_num_tmem_alloc_cols(tCtAcc_fake, arch="sm_100")
 
-    num_ctas_mnl = (grid_m, NUM_HEADS, 1)
-    tile_sched_params = utils.PersistentTileSchedulerParams(
-        num_ctas_mnl, cluster_shape_mnk, swizzle_size, True)
-    grid = utils.StaticPersistentTileScheduler.get_grid_shape(
-        tile_sched_params, max_active_clusters)
+    num_ctas_mnl = (grid_m, num_heads, 1)
+    tile_sched_params = utils.PersistentTileSchedulerParams(num_ctas_mnl, cluster_shape_mnk, swizzle_size, True)
+    grid = utils.StaticPersistentTileScheduler.get_grid_shape(tile_sched_params, max_active_clusters)
 
     gemm_proj_rope_mxfp8_kernel(
         tiled_mma,
-        tma_atom_a, tma_tensor_a, a_smem_layout,
-        tma_atom_b, tma_tensor_b, b_smem_layout,
-        mCos, mSin,
-        mQrow, mSrow, mQcol, mScol,
-        epi_tile, cta_layout_vmnk, tile_sched_params, num_tmem_cols,
+        tma_atom_a,
+        tma_tensor_a,
+        a_smem_layout,
+        tma_atom_b,
+        tma_tensor_b,
+        b_smem_layout,
+        mCos,
+        mSin,
+        mQrow,
+        mSrow,
+        mQcol,
+        mScol,
+        epi_tile,
+        cta_layout_vmnk,
+        tile_sched_params,
+        num_tmem_cols,
+        num_heads,
     ).launch(
         grid=grid,
         block=[(NUM_EPI_WARPS + 2) * 32, 1, 1],
@@ -550,8 +541,20 @@ def gemm_proj_rope_mxfp8_host(
 _cache = {}
 
 
-def run(x, w, cos, sin, q_fp8_row, q_scales_row, q_fp8_col, q_scales_col, w_out_in=False):
+def run(x, w, cos, sin, out_fp8_row, out_scales_row, out_fp8_col, out_scales_col, w_out_in=False):
     tokens = x.shape[0]
+    proj_dim = w.shape[0] if w_out_in else w.shape[1]
+    # Lightweight structural validation (run() is a public entry that skips check_support);
+    # catch the common misuses with a clear error instead of an opaque CUTLASS/CUDA crash.
+    if tokens % TILE_M != 0:
+        raise ValueError(f"tokens ({tokens}) must be a multiple of TILE_M ({TILE_M})")
+    if proj_dim % HEAD_DIM != 0:
+        raise ValueError(f"weight projected dim ({proj_dim}) must be a multiple of HEAD_DIM ({HEAD_DIM})")
+    if tuple(cos.shape) != (tokens, QK_ROPE) or tuple(sin.shape) != (tokens, QK_ROPE):
+        raise ValueError(f"cos/sin must both be ({tokens}, {QK_ROPE}); got {tuple(cos.shape)}, {tuple(sin.shape)}")
+    # Number of heads is derived from the weight's projected dimension (compile-time Constexpr);
+    # HEAD_DIM is the fixed per-head width the epilogue is specialized for.
+    num_heads = proj_dim // HEAD_DIM
     mA = from_dlpack(x.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=1)
     # Weight B operand. Two accepted layouts, both giving logical B=[N,K]=[out,in]:
     #   w_out_in=False (default): w is [K,N]=[in,out] contiguous -> transpose(0,1) view (N-contig).
@@ -563,25 +566,28 @@ def run(x, w, cos, sin, q_fp8_row, q_scales_row, q_fp8_col, q_scales_col, w_out_
         mB = from_dlpack(w.detach().transpose(0, 1), assumed_align=16).mark_layout_dynamic(leading_dim=0)
     mCos = from_dlpack(cos.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=1)
     mSin = from_dlpack(sin.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=1)
-    mQrow = from_dlpack(q_fp8_row, assumed_align=16).mark_layout_dynamic(leading_dim=2)
-    mSrow = from_dlpack(q_scales_row, assumed_align=16).mark_layout_dynamic(leading_dim=2)
-    mQcol = from_dlpack(q_fp8_col, assumed_align=16).mark_layout_dynamic(leading_dim=2)
-    mScol = from_dlpack(q_scales_col, assumed_align=16).mark_layout_dynamic(leading_dim=2)
+    mQrow = from_dlpack(out_fp8_row, assumed_align=16).mark_layout_dynamic(leading_dim=2)
+    mSrow = from_dlpack(out_scales_row, assumed_align=16).mark_layout_dynamic(leading_dim=2)
+    mQcol = from_dlpack(out_fp8_col, assumed_align=16).mark_layout_dynamic(leading_dim=2)
+    mScol = from_dlpack(out_scales_col, assumed_align=16).mark_layout_dynamic(leading_dim=2)
 
     # Launch on the CURRENT torch stream (required for CUDA-graph capture: null-stream
     # work is not captured -> empty graph). Mirrors the v3 winner's stream handling.
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     grid_m = tokens // TILE_M
-    key = (tokens, bool(w_out_in))
+    # Key on every dimension the compiled fn specializes on: grid (tokens), B-operand layout
+    # (w_out_in), the num_heads Constexpr, and the device (HardwareInfo/max_active_clusters are
+    # queried from the current device at compile time). Dtypes are fixed for this entry point.
+    key = (tokens, bool(w_out_in), num_heads, x.device.index)
     fn = _cache.get(key)
     if fn is None:
         hw = cutlass.utils.HardwareInfo()
         max_active_clusters = hw.get_max_active_clusters(1)
         swizzle_size = 8
-        fn = cute.compile(gemm_proj_rope_mxfp8_host, mA, mB, mCos, mSin,
-                          mQrow, mSrow, mQcol, mScol,
-                          grid_m, max_active_clusters, swizzle_size, current_stream)
+        fn = cute.compile(
+            gemm_proj_rope_mxfp8_host, mA, mB, mCos, mSin, mQrow, mSrow, mQcol, mScol, grid_m, num_heads, max_active_clusters, swizzle_size, current_stream
+        )
         _cache[key] = fn
     fn(mA, mB, mCos, mSin, mQrow, mSrow, mQcol, mScol, current_stream)
 
@@ -592,10 +598,12 @@ def run(x, w, cos, sin, q_fp8_row, q_scales_row, q_fp8_col, q_scales_col, w_out_
 def gemm_proj_rope_mxfp8_reference(x, w, cos, sin, w_out_in=False):
     E8M0_BIAS = 127
     tokens = x.shape[0]
+    # Heads derived from the weight's projected dimension (matches the kernel's Constexpr).
+    num_heads = (w.shape[0] if w_out_in else w.shape[1]) // HEAD_DIM
 
     # Projection GEMM (fp32 accumulate), reshaped to per-head.
-    w_eff = w.float().t() if w_out_in else w.float()          # -> [Q_LORA, NUM_HEADS*HEAD_DIM]
-    q = torch.matmul(x.float(), w_eff).view(tokens, NUM_HEADS, HEAD_DIM)
+    w_eff = w.float().t() if w_out_in else w.float()  # -> [Q_LORA, num_heads*HEAD_DIM]
+    q = torch.matmul(x.float(), w_eff).view(tokens, num_heads, HEAD_DIM)
 
     # Per-head YARN RoPE on the trailing QK_ROPE (interleaved-in, halves-out).
     q_nope, q_pe = q[..., :QK_NOPE], q[..., QK_NOPE:]
@@ -605,7 +613,7 @@ def gemm_proj_rope_mxfp8_reference(x, w, cos, sin, w_out_in=False):
     cr = cos[..., HALF:].unsqueeze(1).float()
     sr = sin[..., HALF:].unsqueeze(1).float()
     q_pe = torch.cat([x1 * cl - x2 * sl, x2 * cr + x1 * sr], dim=-1)
-    qf = torch.cat([q_nope, q_pe], dim=-1).contiguous()       # [tokens, NUM_HEADS, HEAD_DIM] fp32
+    qf = torch.cat([q_nope, q_pe], dim=-1).contiguous()  # [tokens, num_heads, HEAD_DIM] fp32
 
     def _e8m0_quant(blocks, amax_dim):
         amax = blocks.abs().amax(dim=amax_dim, keepdim=True).clamp(min=1e-30)
@@ -615,15 +623,15 @@ def gemm_proj_rope_mxfp8_reference(x, w, cos, sin, w_out_in=False):
         return data, scale
 
     # Rowwise (D-direction): 32-blocks along HEAD_DIM.
-    rb = qf.reshape(tokens, NUM_HEADS, HEAD_DIM // BLOCK, BLOCK)
+    rb = qf.reshape(tokens, num_heads, HEAD_DIM // BLOCK, BLOCK)
     rdata, rscale = _e8m0_quant(rb, amax_dim=-1)
-    q_fp8_row = rdata.reshape(tokens, NUM_HEADS, HEAD_DIM)
-    q_scales_row = rscale.squeeze(-1)                         # [tokens, NUM_HEADS, HEAD_DIM // BLOCK]
+    out_fp8_row = rdata.reshape(tokens, num_heads, HEAD_DIM)
+    out_scales_row = rscale.squeeze(-1)  # [tokens, num_heads, HEAD_DIM // BLOCK]
 
     # Columnwise (S-direction): 32-blocks along tokens.
-    cb = qf.reshape(tokens // BLOCK, BLOCK, NUM_HEADS, HEAD_DIM)
+    cb = qf.reshape(tokens // BLOCK, BLOCK, num_heads, HEAD_DIM)
     cdata, cscale = _e8m0_quant(cb, amax_dim=1)
-    q_fp8_col = cdata.reshape(tokens, NUM_HEADS, HEAD_DIM)
-    q_scales_col = cscale.squeeze(1)                          # [tokens // BLOCK, NUM_HEADS, HEAD_DIM]
+    out_fp8_col = cdata.reshape(tokens, num_heads, HEAD_DIM)
+    out_scales_col = cscale.squeeze(1)  # [tokens // BLOCK, num_heads, HEAD_DIM]
 
-    return q_fp8_row, q_scales_row, q_fp8_col, q_scales_col
+    return out_fp8_row, out_scales_row, out_fp8_col, out_scales_col

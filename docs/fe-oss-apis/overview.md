@@ -4,6 +4,7 @@
 
 This folder documents the Python FE APIs implemented under `python/cudnn`. For details on currently implemented operations, see:
 - [GEMM + Amax](gemm_fusions/gemm_amax.md)
+- [GEMM + RoPE + MXFP8 Projection](gemm_fusions/gemm_proj_rope_mxfp8.md)
 - [GEMM + SwiGLU](gemm_fusions/gemm_swiglu.md)
 - [GEMM + sReLU](gemm_fusions/gemm_srelu.md)
 - [GEMM + dsReLU](gemm_fusions/gemm_dsrelu.md)
