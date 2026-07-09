@@ -164,10 +164,9 @@ def flatten_pass_by_value(value: Any) -> list[int]:
     if isinstance(value, (int, float)):
         return [int(value)]
     if isinstance(value, str):
-        if value.startswith("0x"):
-            return [int(value, 16)]
+        base = 16 if value.startswith("0x") else 10
         try:
-            return [int(value)]
+            return [int(value, base)]
         except ValueError:
             return []
     if isinstance(value, list):
