@@ -712,6 +712,9 @@ TEST_CASE("serialize_structure flag controls structural payload", "[graph][seria
     // Default emits the structure; opting out drops it and shrinks the blob.
     REQUIRE(j_with.contains("nodes"));
     REQUIRE_FALSE(j_without.contains("nodes"));
+    REQUIRE(j_without.contains("json_version"));
+    REQUIRE_FALSE(j_without.contains("gid"));
+    REQUIRE_FALSE(j_without.contains("tensors"));
     REQUIRE(without_structure.size() < with_structure.size());
 
     // Both remain reloadable through the plan path with identical variant packs.
@@ -721,6 +724,12 @@ TEST_CASE("serialize_structure flag controls structural payload", "[graph][seria
         REQUIRE(reloaded.deserialize(handle, blob, /*enforce_precompiled=*/false, /*run_warmup=*/false).is_good());
         REQUIRE(reloaded.get_variant_pack_uids_sorted() == expected_uids);
     }
+
+    auto malformed_structure = j_with;
+    malformed_structure.erase("json_version");
+    fe::graph::Graph rejected;
+    REQUIRE(rejected.deserialize(handle, malformed_structure, false, false).get_code() ==
+            fe::error_code_t::UNSUPPORTED_GRAPH_FORMAT);
 
     cudnnDestroy(handle);
 }

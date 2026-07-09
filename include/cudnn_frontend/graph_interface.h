@@ -1655,6 +1655,7 @@ class Graph : public ICudnn, public INode {
 #ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
         CHECK_CUDNN_FRONTEND_ERROR(assign_uids());
         json j;
+        j["json_version"] = GRAPH_JSON_VERSION;
         // Optionally serialize the graph structure (nodes/tensors).
         if (serialize_structure) {
             serialize(j);
@@ -1784,12 +1785,15 @@ class Graph : public ICudnn, public INode {
         deserialized_workspace_modifications.clear();
         tensors_to_dump.clear();
 
-        gid = j["gid"].get<uint64_t>();
+        auto const has_graph_structure = j.contains("nodes") || j.contains("tensors");
+        if (has_graph_structure) {
+            gid = j["gid"].get<uint64_t>();
 
-        for (const auto &tensor_info : j.at("tensors")) {
-            auto tensor_attributes = std::make_shared<Tensor_attributes>();
-            from_json(tensor_info, *tensor_attributes);
-            deserialized_tensor_properties.insert(tensor_attributes);
+            for (const auto &tensor_info : j.at("tensors")) {
+                auto tensor_attributes = std::make_shared<Tensor_attributes>();
+                from_json(tensor_info, *tensor_attributes);
+                deserialized_tensor_properties.insert(tensor_attributes);
+            }
         }
 
         RETURN_CUDNN_FRONTEND_ERROR_IF(
