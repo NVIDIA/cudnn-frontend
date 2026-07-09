@@ -35,7 +35,7 @@ def gemm_proj_rope_mxfp8_init(request, tokens, w_out_in):
     major, minor = torch.cuda.get_device_capability()
     compute_capability = major * 10 + minor
     if compute_capability < 100:
-        pytest.skip(f"Environment not supported: requires compute capability >= 10, found {major}")
+        pytest.skip(f"Environment not supported: requires compute capability >= 100, found {compute_capability}")
 
     skip_ref = request.config.getoption("--skip-ref", default=False)
 

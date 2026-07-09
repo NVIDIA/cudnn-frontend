@@ -99,6 +99,14 @@ class GemmProjRopeMxfp8Sm100(APIBase):
             f"w projected dim must be an integer multiple of HEAD_DIM ({HEAD_DIM}); got weight "
             f"shape {tuple(self.w_desc.shape)} with w_out_in={self.w_out_in}",
         )
+        # GEMM contraction dim (Q_LORA): x's inner dim must match w's, or the fused kernel
+        # reads past the operands. w is [proj, K] when w_out_in else [K, proj].
+        k_dim = self.w_desc.shape[1] if self.w_out_in else self.w_desc.shape[0]
+        self._value_error_if(
+            self.x_desc.shape[1] != k_dim,
+            f"x contraction dim ({self.x_desc.shape[1]}) must match w's ({k_dim}); "
+            f"x {tuple(self.x_desc.shape)}, w {tuple(self.w_desc.shape)}, w_out_in={self.w_out_in}",
+        )
         num_heads = self.num_heads
         for name, desc in (("cos", self.cos_desc), ("sin", self.sin_desc)):
             self._value_error_if(

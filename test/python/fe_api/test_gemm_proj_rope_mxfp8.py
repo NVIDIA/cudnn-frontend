@@ -53,6 +53,43 @@ def test_gemm_proj_rope_mxfp8_check_support_rejects_unaligned_tokens(request):
         obj.check_support()
 
 
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_gemm_proj_rope_mxfp8_check_support_rejects_kdim_mismatch(request):
+    """check_support() must reject x whose contraction dim does not match the weight's."""
+    try:
+        import torch
+
+        from cudnn import GemmProjRopeMxfp8Sm100
+        from fe_api.test_gemm_proj_rope_mxfp8_utils import (
+            Q_LORA,
+            allocate_input_tensors,
+            allocate_output_tensors,
+            gemm_proj_rope_mxfp8_init,
+        )
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn optional dependencies not installed")
+
+    gemm_proj_rope_mxfp8_init(request, tokens=2048, w_out_in=False)  # arch skip if needed
+    tokens = 2048
+    x, w, cos, sin = allocate_input_tensors(tokens, w_out_in=False)
+    x = torch.randn(tokens, Q_LORA + 8, dtype=x.dtype, device=x.device)  # inner dim != w's K
+    out_fp8_row, out_scales_row, out_fp8_col, out_scales_col = allocate_output_tensors(tokens)
+    obj = GemmProjRopeMxfp8Sm100(
+        sample_x=x,
+        sample_w=w,
+        sample_cos=cos,
+        sample_sin=sin,
+        sample_out_fp8_row=out_fp8_row,
+        sample_out_scales_row=out_scales_row,
+        sample_out_fp8_col=out_fp8_col,
+        sample_out_scales_col=out_scales_col,
+        w_out_in=False,
+    )
+    with pytest.raises(ValueError):
+        obj.check_support()
+
+
 """
 GemmProjRopeMxfp8 API with explicit check_support, compile, and execute paths.
 Use this method when running one static configuration per object.
