@@ -1578,7 +1578,9 @@ class Graph : public ICudnn, public INode {
             j["variant_pack_uids"]  = variant_pack_uids;
         }
 
-        j["behavior_notes"] = plans.behavior_notes;
+        std::vector<BehaviorNote_t> selected_behavior_notes;
+        CHECK_CUDNN_FRONTEND_ERROR(plans.get_behavior_notes_at_index(candidate, selected_behavior_notes));
+        j["behavior_notes"] = std::vector<std::vector<BehaviorNote_t>>{std::move(selected_behavior_notes)};
 
         std::unordered_map<uid_t, pass_by_values_t> tensor_to_pass_by_value;
         CHECK_CUDNN_FRONTEND_ERROR(collect_pass_by_value_tensors_subtree(tensor_to_pass_by_value));

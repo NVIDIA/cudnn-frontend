@@ -186,6 +186,142 @@ TEST_CASE("CSBR Graph with serialization", "[conv][graph][serialization]") {
     REQUIRE(graph->execute(handle, variant_pack, workspace.devPtr).is_good());
 }
 
+TEST_CASE("XLA pointwise selected plan behavior notes with serialization", "[graph][serialization][behavior_notes]") {
+    namespace fe = cudnn_frontend;
+
+#if CUDART_VERSION < 13010
+    SKIP("Test requires cuda toolkit 13.1 or above");
+    return;
+#endif
+
+    if (!is_blackwell_computing_arch()) {
+        SKIP("TensorIR MemBound engine is only supported on Blackwell (data center Blackwell)");
+    }
+
+#if (CUDNN_VERSION < 92200)
+    SKIP("Membound graph samples require cuDNN 9.22.0 or newer (compiled CUDNN_VERSION >= 92200).");
+#endif
+    if (cudnn_frontend::detail::get_backend_version() < 92200) {
+        SKIP("Membound graph samples require cuDNN backend 9.22.0 or newer at runtime.");
+    }
+
+    // FE graph JSON captured from the XLA repro log. The regression under test
+    // below is the binary plan serialize()/deserialize() round trip.
+    auto const xla_graph = json::parse(R"json(
+{
+  "context": {
+    "compute_data_type": null,
+    "intermediate_data_type": "FLOAT",
+    "io_data_type": null,
+    "is_dynamic_shape_enabled": false,
+    "is_override_shape_enabled": false,
+    "name": "",
+    "sm_count": -1
+  },
+  "cudnn_backend_version": "9.30.0",
+  "cudnn_frontend_version": 12500,
+  "graph_uid": 12,
+  "json_version": "1.0",
+  "nodes": [
+    {
+      "axis": null,
+      "compute_data_type": "FLOAT",
+      "elu_alpha": null,
+      "inputs": {"IN_0": 1},
+      "mode": "ABS",
+      "name": "0",
+      "outputs": {"OUT_0": 2},
+      "relu_lower_clip": null,
+      "relu_lower_clip_slope": null,
+      "relu_upper_clip": null,
+      "softplus_beta": null,
+      "swish_beta": null,
+      "tag": "POINTWISE"
+    }
+  ],
+  "tensors": {
+    "1": {
+      "data_type": "HALF",
+      "dim": [2, 240, 160],
+      "is_pass_by_value": false,
+      "is_virtual": false,
+      "name": "param_0",
+      "pass_by_value": null,
+      "reordering_type": "NONE",
+      "stride": [38400, 160, 1],
+      "uid": 1,
+      "uid_assigned": true
+    },
+    "2": {
+      "data_type": "HALF",
+      "dim": [2, 240, 160],
+      "is_pass_by_value": false,
+      "is_virtual": false,
+      "name": "abs.1.1",
+      "pass_by_value": null,
+      "reordering_type": "NONE",
+      "stride": [38400, 160, 1],
+      "uid": 2,
+      "uid_assigned": true
+    }
+  }
+}
+)json");
+
+    auto handle_ptr = create_cudnn_handle();
+    auto handle     = *handle_ptr;
+
+    fe::graph::Graph graph;
+    REQUIRE(graph.deserialize(xla_graph).is_good());
+    REQUIRE(graph.validate().is_good());
+    REQUIRE(graph.build_operation_graph(handle).is_good());
+    REQUIRE(graph.create_execution_plans({fe::HeurMode_t::A, fe::HeurMode_t::FALLBACK}).is_good());
+
+    auto const plan_count = graph.get_execution_plan_count();
+    if (plan_count < 2) {
+        SKIP("XLA graph did not produce multiple execution plans on this backend.");
+    }
+
+    std::vector<fe::BehaviorNote_t> plan0_notes;
+    REQUIRE(graph.get_behavior_notes_for_plan_at_index(0, plan0_notes).is_good());
+
+    int64_t selected_plan_index = -1;
+    std::vector<fe::BehaviorNote_t> selected_notes;
+    for (int64_t i = 1; i < plan_count; ++i) {
+        std::vector<fe::BehaviorNote_t> notes;
+        if (graph.get_behavior_notes_for_plan_at_index(i, notes).is_bad()) {
+            continue;
+        }
+        if (notes == plan0_notes) {
+            continue;
+        }
+        if (graph.build_plan_at_index(i).is_good()) {
+            selected_plan_index = i;
+            selected_notes      = std::move(notes);
+            break;
+        }
+    }
+
+    if (selected_plan_index < 0) {
+        SKIP("No buildable nonzero execution plan with behavior notes different from plan 0 was found on this backend.");
+    }
+    REQUIRE(selected_notes != plan0_notes);
+    REQUIRE(selected_plan_index != 0);
+
+    std::vector<uint8_t> serialized_data;
+    REQUIRE(graph.serialize(serialized_data).is_good());
+
+    fe::graph::Graph graph_deserialized;
+    REQUIRE(graph_deserialized.deserialize(handle, serialized_data, true, false).is_good());
+
+    // Deserialization rebuilds a single execution plan at index 0 even though
+    // the serialized source plan came from selected_plan_index.
+    REQUIRE(graph_deserialized.get_execution_plan_count() == 1);
+    std::vector<fe::BehaviorNote_t> deserialized_notes;
+    REQUIRE(graph_deserialized.get_behavior_notes(deserialized_notes).is_good());
+    REQUIRE(deserialized_notes == selected_notes);
+}
+
 TEST_CASE("SDPA Graph with serialization", "[sdpa][graph][serialization]") {
     int64_t b    = 12;    // batch size
     int64_t h    = 6;     // head dim
