@@ -678,3 +678,107 @@ TEST_CASE("Plan deserialize with run_warmup=false still prepares template", "[gr
 
     cudnnDestroy(handle);
 }
+
+// serialize(data, serialize_structure=false) omits the graph structure
+// (nodes/tensors) while keeping the plan reloadable via deserialize(handle, ...).
+// The default (true) still emits the structure, so existing callers are unaffected.
+TEST_CASE("serialize_structure flag controls structural payload", "[graph][serialize][deserialize]") {
+    namespace fe = cudnn_frontend;
+
+    fe::graph::Graph graph;
+    graph.set_io_data_type(fe::DataType_t::HALF)
+        .set_intermediate_data_type(fe::DataType_t::FLOAT)
+        .set_compute_data_type(fe::DataType_t::FLOAT);
+
+    auto A = graph.tensor(
+        fe::graph::Tensor_attributes().set_name("A").set_dim({4, 16, 64}).set_stride({16 * 64, 64, 1}).set_uid(1));
+    auto B = graph.tensor(
+        fe::graph::Tensor_attributes().set_name("B").set_dim({4, 64, 32}).set_stride({64 * 32, 32, 1}).set_uid(2));
+    auto C = graph.matmul(A, B, fe::graph::Matmul_attributes().set_name("matmul"));
+    C->set_output(true).set_uid(3);
+
+    cudnnHandle_t handle;
+    cudnnCreate(&handle);
+
+    REQUIRE(graph.build(handle, {fe::HeurMode_t::A}).is_good());
+
+    std::vector<uint8_t> with_structure, without_structure;
+    REQUIRE(graph.serialize(with_structure).is_good());  // default: serialize_structure=true
+    REQUIRE(graph.serialize(without_structure, /*serialize_structure=*/false).is_good());
+
+    json const j_with    = json::from_ubjson(with_structure);
+    json const j_without = json::from_ubjson(without_structure);
+
+    // Default emits the structure; opting out drops it and shrinks the blob.
+    REQUIRE(j_with.contains("nodes"));
+    REQUIRE_FALSE(j_without.contains("nodes"));
+    REQUIRE(without_structure.size() < with_structure.size());
+
+    // Both remain reloadable through the plan path with identical variant packs.
+    auto const expected_uids = graph.get_variant_pack_uids_sorted();
+    for (auto const &blob : {with_structure, without_structure}) {
+        fe::graph::Graph reloaded;
+        REQUIRE(reloaded.deserialize(handle, blob, /*enforce_precompiled=*/false, /*run_warmup=*/false).is_good());
+        REQUIRE(reloaded.get_variant_pack_uids_sorted() == expected_uids);
+    }
+
+    cudnnDestroy(handle);
+}
+
+// A graph loaded via deserialize(handle, ...) might have no node subtree,
+// so serialize() must source its pass-by-value and workspace modifications from the
+// cached members instead of walking the (now empty) subtree.
+TEST_CASE("Plan re-serialize preserves pass-by-value and workspace modifications", "[graph][serialize][deserialize]") {
+    namespace fe = cudnn_frontend;
+
+    fe::graph::Graph graph;
+    graph.set_io_data_type(fe::DataType_t::HALF)
+        .set_intermediate_data_type(fe::DataType_t::FLOAT)
+        .set_compute_data_type(fe::DataType_t::FLOAT);
+
+    constexpr int64_t N = 4;
+    auto X              = graph.tensor(fe::graph::Tensor_attributes()
+                              .set_name("X")
+                              .set_dim({N, N, N})
+                              .set_stride({N * N, N, 1})
+                              .set_data_type(fe::DataType_t::HALF)
+                              .set_uid(1));
+    auto scalar         = graph.tensor(5.0f);
+    scalar->set_name("scalar").set_uid(2);
+    auto Y = graph.pointwise(X,
+                             scalar,
+                             fe::graph::Pointwise_attributes()
+                                 .set_name("add")
+                                 .set_mode(fe::PointwiseMode_t::ADD)
+                                 .set_compute_data_type(fe::DataType_t::FLOAT));
+    Y->set_output(true).set_data_type(fe::DataType_t::HALF).set_uid(3);
+
+    cudnnHandle_t handle;
+    cudnnCreate(&handle);
+
+    REQUIRE(graph.build(handle, {fe::HeurMode_t::A}).is_good());
+
+    std::vector<uint8_t> blob;
+    REQUIRE(graph.serialize(blob, /*serialize_structure=*/false).is_good());
+
+    // The fresh graph must actually carry pass-by-value data, else the test is moot.
+    json const j_fresh = json::from_ubjson(blob);
+    REQUIRE(j_fresh.contains("pass_by_values"));
+    REQUIRE_FALSE(j_fresh["pass_by_values"].empty());
+
+    auto const expected_uids = graph.get_variant_pack_uids_sorted();
+
+    fe::graph::Graph reloaded;
+    REQUIRE(reloaded.deserialize(handle, blob, /*enforce_precompiled=*/false, /*run_warmup=*/false).is_good());
+    REQUIRE(reloaded.get_variant_pack_uids_sorted() == expected_uids);
+
+    // Re-serialize the plan-only graph; the cached maps must survive intact.
+    std::vector<uint8_t> next;
+    REQUIRE(reloaded.serialize(next, /*serialize_structure=*/false).is_good());
+
+    json const j_next = json::from_ubjson(next);
+    REQUIRE(j_next["pass_by_values"] == j_fresh["pass_by_values"]);
+    REQUIRE(j_next["workspace_modifications"] == j_fresh["workspace_modifications"]);
+
+    cudnnDestroy(handle);
+}

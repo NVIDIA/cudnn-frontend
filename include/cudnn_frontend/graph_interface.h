@@ -1563,12 +1563,30 @@ class Graph : public ICudnn, public INode {
         return {error_code_t::OK, ""};
     }
 
+    /**
+     * @brief Serialize graph execution-plan payload, optionally with graph structure.
+     *
+     * When @p serialize_structure is true, the payload includes structural graph metadata
+     * (context/nodes/tensors) in addition to plan fields. When false, the payload is
+     * plan-only and is suitable for handle-based plan reload paths that do not rebuild
+     * graph structure. Plan execution remains valid in plan-only mode.
+     *
+     * Recommendation: if the consumer does not call explicit structural deserialize
+     * (deserialize(const json&, ...)), prefer serialize_structure=false.
+     *
+     * @param data Output UBJSON payload.
+     * @param serialize_structure Include structural graph metadata when true.
+     * @return error_t OK on success, otherwise an error code describing the failure.
+     */
     error_t
-    serialize(std::vector<uint8_t> &data) const {
+    serialize(std::vector<uint8_t> &data, bool serialize_structure = true) const {
         CUDNN_FE_LOG_BANNER(" SERIALIZE PLAN  ");
 #ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
         json j;
-        serialize(j);
+        // Optionally serialize the graph structure (nodes/tensors).
+        if (serialize_structure) {
+            serialize(j);
+        }
 
         auto const candidate = plans.candidate;
         auto execution_plan  = plans.execution_plans[candidate];
@@ -1581,7 +1599,12 @@ class Graph : public ICudnn, public INode {
         j["behavior_notes"] = plans.behavior_notes;
 
         std::unordered_map<uid_t, pass_by_values_t> tensor_to_pass_by_value;
-        CHECK_CUDNN_FRONTEND_ERROR(collect_pass_by_value_tensors_subtree(tensor_to_pass_by_value));
+        // Pass-by-value data lives in the cached member restored on deserialize.
+        if (sub_nodes.empty()) {
+            tensor_to_pass_by_value = cached_pass_by_value;
+        } else {
+            CHECK_CUDNN_FRONTEND_ERROR(collect_pass_by_value_tensors_subtree(tensor_to_pass_by_value));
+        }
 
         // Convert pass_by_values to JSON (unordered_map with numeric keys needs manual conversion)
         json pass_by_values_json = json::object();
@@ -1593,8 +1616,14 @@ class Graph : public ICudnn, public INode {
         j["pass_by_values"] = pass_by_values_json;
 
         std::unordered_map<uid_t, std::tuple<int64_t, int64_t, std::vector<float>>> workspace_modifications;
-        int64_t workspace_offset = 0;
-        CHECK_CUDNN_FRONTEND_ERROR(collect_tensors_in_workspace_subtree(workspace_modifications, workspace_offset));
+
+        // Workspace modifications are cached when the graph is deserialized, walked otherwise.
+        if (sub_nodes.empty()) {
+            workspace_modifications = cached_workspace_modifications;
+        } else {
+            int64_t workspace_offset = 0;
+            CHECK_CUDNN_FRONTEND_ERROR(collect_tensors_in_workspace_subtree(workspace_modifications, workspace_offset));
+        }
 
         // Convert workspace_modifications to JSON (nlohmann::json doesn't support std::tuple directly)
         json workspace_modifications_json = json::object();
