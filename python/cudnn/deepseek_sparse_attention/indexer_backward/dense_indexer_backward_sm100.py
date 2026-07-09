@@ -147,6 +147,7 @@ class ScoreGradDense:
         mCuSeqlensQ,
         mCuSeqlensK,
         mQCausalOffsets,
+        mGradLoss,
         grad_scale: Float32,
         max_seqlen_q: Int32,
         max_seqlen_k: Int32,
@@ -192,6 +193,7 @@ class ScoreGradDense:
             mCuSeqlensQ,
             mCuSeqlensK,
             mQCausalOffsets,
+            mGradLoss,
             grad_scale,
             seqlen_k_pad,
             max_seqlen_q,
@@ -212,6 +214,7 @@ class ScoreGradDense:
         mCuSeqlensQ,
         mCuSeqlensK,
         mQCausalOffsets,
+        mGradLoss,
         grad_scale: Float32,
         seqlen_k_pad: Int32,
         seqlen_q_static: Int32,
@@ -233,6 +236,7 @@ class ScoreGradDense:
             seqlen_k_static,
         )
         q_causal_offset_b = Int32(0) if const_expr(mQCausalOffsets is None) else mQCausalOffsets[batch_idx]
+        grad_scale_f32 = Float32(grad_scale) * Float32(mGradLoss[0])
 
         # Out-of-range CTAs (seq_local >= seqlen_q_b in this batch): skip work.
         # CuTe DSL forbids early `return`, so wrap the body in an `if` block.
@@ -284,7 +288,7 @@ class ScoreGradDense:
                 target = tr / (denom_val + Float32(DENOM_EPS))
                 target_eff = target if target >= Float32(CLIP_PROB_MIN) else Float32(CLIP_PROB_MIN)
                 log_clip_mask = Float32(1.0) if score_minus_lse >= Float32(CLIP_LOG_MIN) else Float32(0.0)
-                g = -target_eff * log_clip_mask * grad_scale
+                g = -target_eff * log_clip_mask * grad_scale_f32
 
                 local_sum = local_sum + g
                 pos = pos + Int32(128)
@@ -324,7 +328,7 @@ class ScoreGradDense:
                     target = tr / (denom_val + Float32(DENOM_EPS))
                     target_eff = target if target >= Float32(CLIP_PROB_MIN) else Float32(CLIP_PROB_MIN)
                     log_clip_mask = Float32(1.0) if score_minus_lse >= Float32(CLIP_LOG_MIN) else Float32(0.0)
-                    g = -target_eff * log_clip_mask * grad_scale
+                    g = -target_eff * log_clip_mask * grad_scale_f32
 
                     grad_signal = g - predict * sum_grad
                     mPredict_b[seq_local, pos] = grad_signal
@@ -2007,6 +2011,7 @@ def _build_cute_dsl_kernel(batch, max_seqlen_q, max_seqlen_k, heads, dim, sm_sca
         CuSeqlensQ,
         CuSeqlensK,
         QCausalOffsets,
+        GradLoss,
         grad_scale,
         current_stream=None,
     ):
@@ -2037,6 +2042,7 @@ def _build_cute_dsl_kernel(batch, max_seqlen_q, max_seqlen_k, heads, dim, sm_sca
                 cuq_arg,
                 cuk_arg,
                 q_offsets_arg,
+                to_cute_tensor(GradLoss, assumed_align=4, leading_dim=0),
                 cutlass.Float32(float(grad_scale)),
                 cutlass.Int32(max_seqlen_q),
                 cutlass.Int32(max_seqlen_k),
@@ -2153,6 +2159,7 @@ def _build_cute_dsl_kernel(batch, max_seqlen_q, max_seqlen_k, heads, dim, sm_sca
         AttnL1Norm,
         IdxScoreRaw,
         IdxLSE,
+        GradLoss,
         grad_scale,
         CuSeqlensQ=None,
         CuSeqlensK=None,
@@ -2165,6 +2172,9 @@ def _build_cute_dsl_kernel(batch, max_seqlen_q, max_seqlen_k, heads, dim, sm_sca
         THD : pass packed tensors and CuSeqlens* (B+1,) int32.
         Kernel 3 (dK f32 → output dtype) is handled by the caller.
 
+        ``GradLoss`` is a single-element float32 tensor on the same CUDA device
+        as the inputs. Kernel 1 reads it at runtime, including during CUDA Graph
+        replay.
         ``grad_scale`` is a host scalar (Python float, ``loss_coeff /
         (b*sq)``); supplied at call time as a runtime ``Float32`` arg to
         kernel 1 so changing it does not require recompilation.
@@ -2177,6 +2187,8 @@ def _build_cute_dsl_kernel(batch, max_seqlen_q, max_seqlen_k, heads, dim, sm_sca
             assert QCausalOffsets is not None, "offset-compiled kernel requires q_causal_offsets at runtime"
         else:
             assert QCausalOffsets is None, "non-offset compiled kernel must not receive q_causal_offsets"
+        if GradLoss.ndim == 0:
+            GradLoss = GradLoss.reshape(1)
         s = _resolve_stream(current_stream)
 
         # Kernel 1 (CuTe DSL): in-place overwrites IdxScoreRaw with grad_signal.
@@ -2189,6 +2201,7 @@ def _build_cute_dsl_kernel(batch, max_seqlen_q, max_seqlen_k, heads, dim, sm_sca
             CuSeqlensQ,
             CuSeqlensK,
             QCausalOffsets,
+            GradLoss,
             grad_scale,
             current_stream=current_stream,
         )
@@ -2201,6 +2214,7 @@ def _build_cute_dsl_kernel(batch, max_seqlen_q, max_seqlen_k, heads, dim, sm_sca
                 CuSeqlensQ,
                 CuSeqlensK,
                 QCausalOffsets,
+                GradLoss,
                 cutlass.Float32(float(grad_scale)),
                 cutlass.Int32(max_seqlen_q),
                 cutlass.Int32(max_seqlen_k),

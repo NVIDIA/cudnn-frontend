@@ -228,10 +228,11 @@ indexer tower:
 `RuntimeError` rather than silently falling back.
 
 ```python
+grad_loss = torch.ones((), dtype=torch.float32, device=index_q.device)
 result = DSA.indexer_backward_wrapper(
     index_q, weights, index_k,
     attn_score, index_score, topk_indices,
-    sm_scale=1.0, loss_coeff=1.0, grad_loss=1.0, block_I=128,
+    grad_loss=grad_loss, sm_scale=1.0, loss_coeff=1.0, block_I=128,
 )
 d_index_q, d_weights, d_index_k = (
     result["d_index_q"], result["d_weights"], result["d_index_k"],
@@ -255,6 +256,7 @@ and denominators produced by Dense Indexer / Dense Attn Score Recompute.
 - **Constraints** — SM90 or SM100+, `H >= 64`, `ratio >= 1`
 
 ```python
+grad_loss = torch.ones((), dtype=torch.float32, device=index_q.device)
 dense_index = DSA.dense_indexer_score_recompute_wrapper(
     index_q, index_k.unsqueeze(2), weights,
     q_causal_offsets=q_causal_offsets,
@@ -268,7 +270,7 @@ result = DSA.dense_indexer_backward_wrapper(
     index_q, weights, index_k,
     dense_attn["out"], dense_attn["denom"],
     dense_index["out"], dense_index["denom"],
-    sm_scale=1.0, loss_coeff=1.0, grad_loss=1.0, block_I=128, ratio=1,
+    grad_loss=grad_loss, sm_scale=1.0, loss_coeff=1.0, block_I=128, ratio=1,
     q_causal_offsets=q_causal_offsets,
 )
 ```

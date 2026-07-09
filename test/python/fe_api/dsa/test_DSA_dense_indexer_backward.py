@@ -89,8 +89,8 @@ def test_DSA_dense_indexer_backward_wrapper(
     s_q_cfg = cfg["s_q"]
     q_causal_offsets = torch.full((b_cfg,), 8, dtype=torch.int32, device="cuda")
     loss_coeff = float(b_cfg * s_q_cfg)
-    grad_loss = 1.0
-    grad_scale_expected = (loss_coeff / (b_cfg * s_q_cfg)) * grad_loss
+    grad_loss = torch.ones((), dtype=torch.float32, device="cuda")
+    grad_scale_expected = loss_coeff / (b_cfg * s_q_cfg)
 
     (
         index_q,
@@ -153,4 +153,84 @@ def test_DSA_dense_indexer_backward_wrapper(
             ratio=ratio,
             grad_scale=grad_scale_expected,
             q_causal_offsets=q_causal_offsets,
+        )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_DSA_dense_indexer_backward_cuda_graph():
+    if torch.cuda.get_device_capability()[0] < 9:
+        pytest.skip("Dense indexer backward requires SM90+")
+
+    try:
+        from cudnn import DSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    cfg = {
+        "b": 1,
+        "s_q": 128,
+        "s_kv": 128,
+        "head_dim": 128,
+        "qhead_per_kv_head": 64,
+    }
+    (
+        index_q,
+        weights,
+        index_k,
+        attn_score,
+        attn_l1norm,
+        index_score,
+        index_lse,
+    ) = _allocate(cfg, sm_scale=1.0, ratio=1, q_causal_offsets=None)
+    attn_score_source = attn_score.clone()
+    index_score_source = index_score.clone()
+    d_index_q = torch.empty_like(index_q)
+    d_weights = torch.empty_like(weights)
+    d_index_k = torch.empty_like(index_k, dtype=torch.float32)
+    grad_loss = torch.ones(1, dtype=torch.float32, device="cuda")
+
+    def run():
+        attn_score.copy_(attn_score_source)
+        index_score.copy_(index_score_source)
+        DSA.dense_indexer_backward_wrapper(
+            index_q,
+            weights,
+            index_k,
+            attn_score,
+            attn_l1norm,
+            index_score,
+            index_lse,
+            loss_coeff=float(cfg["b"] * cfg["s_q"]),
+            grad_loss=grad_loss,
+            block_I=128,
+            ratio=1,
+            d_index_q=d_index_q,
+            d_weights=d_weights,
+            d_index_k=d_index_k,
+        )
+
+    warmup_stream = torch.cuda.Stream()
+    warmup_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup_stream):
+        run()
+    torch.cuda.current_stream().wait_stream(warmup_stream)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+
+    for scale in (0.5, 1.5):
+        grad_loss.fill_(scale)
+        graph.replay()
+        check_ref_dense_indexer_backward(
+            index_q,
+            weights,
+            index_k,
+            attn_score_source,
+            attn_l1norm,
+            d_index_q,
+            d_weights,
+            d_index_k,
+            grad_scale=scale,
         )

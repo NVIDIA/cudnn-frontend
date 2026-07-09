@@ -87,6 +87,53 @@ def _allocate(cfg, score_type: str):
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
+def test_DSA_dense_score_recompute_thd_q_causal_offsets_alignment():
+    try:
+        from cudnn import DSA
+        from cuda.bindings import driver as cuda
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    if torch.cuda.get_device_capability()[0] != 9:
+        pytest.skip("This regression is specific to the SM90 THD adapter")
+
+    batch, seqlen_q, seqlen_k, heads, head_dim = 2, 256, 1024, 32, 128
+    # Use a non-default stream so this test exercises only the offset contract.
+    torch_stream = torch.cuda.Stream()
+    with torch.cuda.stream(torch_stream):
+        q = torch.randn(batch, seqlen_q, heads, head_dim, dtype=torch.bfloat16, device="cuda")
+        k = torch.randn(batch, seqlen_k, 1, head_dim, dtype=torch.bfloat16, device="cuda")
+        weights = torch.randn(batch, seqlen_q, heads, dtype=torch.bfloat16, device="cuda")
+        cu_seqlens_q = torch.arange(0, (batch + 1) * seqlen_q, seqlen_q, dtype=torch.int32, device="cuda")
+        cu_seqlens_k = torch.arange(0, (batch + 1) * seqlen_k, seqlen_k, dtype=torch.int32, device="cuda")
+        q_causal_offsets = cu_seqlens_q[:-1]
+
+        assert q_causal_offsets[1:].data_ptr() % 4 == 0
+        assert q_causal_offsets[1:].data_ptr() % 16 != 0
+
+        result = DSA.dense_indexer_score_recompute_wrapper(
+            q.flatten(0, 1),
+            k.flatten(0, 1),
+            weights.flatten(0, 1),
+            qhead_per_kv_head=heads,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=seqlen_q,
+            max_seqlen_k=seqlen_k,
+            q_causal_offsets=q_causal_offsets,
+            stream=cuda.CUstream(torch_stream.cuda_stream),
+        )
+
+    torch_stream.synchronize()
+    assert result["out"].shape == (batch * seqlen_q, seqlen_k)
+    assert result["denom"].shape == (batch * seqlen_q,)
+    assert torch.isfinite(result["out"]).any()
+    assert (torch.isfinite(result["out"]) | torch.isneginf(result["out"])).all()
+    assert torch.isfinite(result["denom"]).all()
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
 @with_dsa_score_recompute_params
 def test_DSA_dense_score_recompute_wrapper(
     dtype,
