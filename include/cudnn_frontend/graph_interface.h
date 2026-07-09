@@ -1651,6 +1651,7 @@ class Graph : public ICudnn, public INode {
         return {error_code_t::OK, ""};
 #else
         CUDNN_FRONTEND_UNUSED(data);
+        CUDNN_FRONTEND_UNUSED(serialize_structure);
         return {error_code_t::GRAPH_NOT_SUPPORTED, "unavailable when compiled with CUDNN_FRONTEND_SKIP_JSON_LIB"};
 #endif
     }
