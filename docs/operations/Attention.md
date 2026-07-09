@@ -70,6 +70,10 @@ The support matrix is based on the latest cudnn backend version 9.18.1
 - Contains cumulative token offsets in **elements** (not bytes)
 - Last element is the total number of tokens
 
+&nbsp;&nbsp; **Ragged Offset Multiplier (cuDNN 9.24+, UNIFIED forward only):**
+- `tensor.set_ragged_offset_multiplier(value)` lets the ragged offsets be stored in coarser units; the engine multiplies each offset by `value` to recover element offsets.
+- Example: with a multiplier of $H \times D$, a token-unit cumulative-sequence-length tensor (e.g. `cu_seq_len_q`) can be bound directly as the ragged offset, avoiding a conversion pass.
+
 &nbsp;&nbsp; **Memory Layout visualization:**
 
   &nbsp;&nbsp;&nbsp;&nbsp; *Example:*
@@ -216,6 +220,13 @@ SDPA_attributes& set_padding_mask(bool const value);
 // integer tensor that specifies the sequence length of each batch
 SDPA_attributes& set_seq_len_q(std::shared_ptr<Tensor_attributes> value);
 SDPA_attributes& set_seq_len_kv(std::shared_ptr<Tensor_attributes> value);
+
+// integer tensor of shape (B+1, 1, 1, 1) that specifies the cumulative sequence
+// lengths (prefix sums, leading 0) of each batch. Mutually exclusive with
+// set_seq_len_q/set_seq_len_kv; both tensors must be set together.
+// Requires cuDNN 9.24+ and the UNIFIED implementation.
+SDPA_attributes& set_cu_seq_len_q(std::shared_ptr<Tensor_attributes> value);
+SDPA_attributes& set_cu_seq_len_kv(std::shared_ptr<Tensor_attributes> value);
 // ==========================  END     var len options =====================
 
 // ========================== BEGIN score mod options =====================
@@ -284,6 +295,8 @@ graph.sdpa(
     use_padding_mask=False,               # Enable variable sequence length masking
     seq_len_q=None,                       # Per-batch query sequence lengths
     seq_len_kv=None,                      # Per-batch key/value sequence lengths
+    cu_seq_len_q=None,                    # Cumulative query sequence lengths (UNIFIED only)
+    cu_seq_len_kv=None,                   # Cumulative key/value sequence lengths (UNIFIED only)
     diagonal_alignment=TOP_LEFT,          # Diagonal alignment: TOP_LEFT or BOTTOM_RIGHT
     diagonal_band_left_bound=None,        # Left bound for sliding window (None = no bound)
     diagonal_band_right_bound=None,       # Right bound for causal mask (0 = causal, None = no bound)
@@ -311,6 +324,8 @@ graph.sdpa(
 - `use_padding_mask` (Optional[bool]): Enable variable sequence length masking. Must also provide `seq_len_q` and `seq_len_kv`.
 - `seq_len_q` (Optional[cudnn_tensor]): Per-batch query sequence lengths with shape $(B, 1, 1, 1)$.
 - `seq_len_kv` (Optional[cudnn_tensor]): Per-batch key/value sequence lengths with shape $(B, 1, 1, 1)$.
+- `cu_seq_len_q` (Optional[cudnn_tensor]): Cumulative query sequence lengths (prefix sums with a leading 0) with shape $(B+1, 1, 1, 1)$ or 1-D $(B+1,)$ (promoted automatically), int32 or int64. Mutually exclusive with `seq_len_q`/`seq_len_kv`; must be set together with `cu_seq_len_kv` and requires `use_padding_mask=True`. Requires cuDNN 9.24+ and the UNIFIED implementation.
+- `cu_seq_len_kv` (Optional[cudnn_tensor]): Cumulative key/value sequence lengths; same shape, type, and constraints as `cu_seq_len_q`.
 - `diagonal_alignment` (Optional[cudnn.diagonal_alignment]): Alignment for diagonal masking. `TOP_LEFT` for standard causal, `BOTTOM_RIGHT` for prefix-LM style.
 - `diagonal_band_left_bound` (Optional[int]): Left bound for sliding window attention. Masks columns at or before `row_idx - left_bound`.
 - `diagonal_band_right_bound` (Optional[int]): Right bound for causal masking. Set to 0 for causal mask. Masks columns beyond `row_idx + right_bound`.
@@ -893,6 +908,11 @@ Args:
     scale_o (cudnn_tensor): Scale factor for output.
     attn_scale (Optional[Union[float, cudnn_tensor]]): The scale factor for attention. Default is None.
     use_causal_mask (Optional[bool]): Whether to use causal mask. Default is False.
+    use_padding_mask (Optional[bool]): Enable variable sequence length masking. Requires seq_len_q/seq_len_kv or cu_seq_len_q/cu_seq_len_kv. Default is False.
+    seq_len_q (Optional[cudnn_tensor]): Per-batch query sequence lengths with shape (B, 1, 1, 1).
+    seq_len_kv (Optional[cudnn_tensor]): Per-batch key/value sequence lengths with shape (B, 1, 1, 1).
+    cu_seq_len_q (Optional[cudnn_tensor]): Cumulative query sequence lengths (prefix sums with a leading 0) with shape (B+1, 1, 1, 1) or 1-D (B+1,), int32 or int64. Mutually exclusive with seq_len_q/seq_len_kv; must be set together with cu_seq_len_kv. Requires cuDNN 9.25+ and the UNIFIED implementation.
+    cu_seq_len_kv (Optional[cudnn_tensor]): Cumulative key/value sequence lengths; same shape, type, and constraints as cu_seq_len_q.
     compute_data_type (Optional[cudnn.data_type]): The data type for computation. Default is NOT_SET.
     name (Optional[str]): The name of the operation.
     generate_stats (Optional[bool]): If true, compute and output softmax stats (useful at training time). Default is None, but one of {generate_stats, is_inference} must be set.
@@ -911,12 +931,13 @@ Returns:
 The current FP8 support is a subset of the options supported in FP16 and BF16 support.
 - Attention scale (`attn_scale`): Applies a scaling factor to attention scores before the softmax, such as $\frac{1}{\sqrt{\text{d}}}$. Set to 1.0 by default.
 - Causal mask: Fills the upper triangular matrix of attention scores with negative infinity.
+- Padding mask (`use_padding_mask`): Variable sequence lengths, provided either as per-batch lengths (`seq_len_q`/`seq_len_kv`) or as cumulative sequence lengths (`cu_seq_len_q`/`cu_seq_len_kv`; cuDNN 9.25+, UNIFIED implementation only).
 
 #### Limitations
 
 - Requires Hopper (SM90) or newer architecture.
 - Head dimension must be a multiple of 16.
-- Limited masking options compared to FP16/BF16 (causal mask only).
+- Limited masking options compared to FP16/BF16 (causal and padding masks only).
 - Requires explicit scale/descale tensors for all FP8 inputs and outputs.
 
 #### Tensors

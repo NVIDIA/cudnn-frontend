@@ -505,7 +505,6 @@ PyGraph::sdpa_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
     return {dQ, dK, dV};
 }
 
-// Deprecated, use sdpa_unified instead
 std::array<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>, 4>
 PyGraph::sdpa_fp8(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
                   std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& k,
@@ -542,12 +541,11 @@ PyGraph::sdpa_fp8(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
                   std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> score_sum_exp,
                   std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> sink_token,
                   bool const unfuse_fma,
-                  cudnn_frontend::AttentionImplementation_t const& implementation) {
+                  cudnn_frontend::AttentionImplementation_t const& implementation,
+                  std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_q,
+                  std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_kv) {
     cudnn_frontend::DataType_t mma_core_mode                             = cudnn_frontend::DataType_t::FP8_E4M3;
     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> block_mask = nullptr;
-    // cu_seq_len_q/cu_seq_len_kv are not exposed via the fp8 path.
-    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> cu_seq_len_q  = nullptr;
-    std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> cu_seq_len_kv = nullptr;
 
     // Handle sliding_window to left_bound mapping for backward compatibility
     py::object actual_left_bound = left_bound;
@@ -1271,6 +1269,8 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
           py::arg_v("sink_token", nullptr),
           py::arg_v("unfuse_fma", false),
           py::arg_v("implementation", cudnn_frontend::AttentionImplementation_t::AUTO),
+          py::arg_v("cu_seq_len_q", nullptr),
+          py::arg_v("cu_seq_len_kv", nullptr),
           R"pbdoc(
                 Perform scaled dot product attention with fp8 datatype inputs and outputs.
 
@@ -1304,6 +1304,8 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
                     sink_token (Optional[cudnn_tensor]): Sink token bias for streaming attention. Default is None.
                     unfuse_fma (Optional[bool]): For SM100: use unfused __fmul_rn + __fadd_rn instead of ffma2 in softmax. Default is False.
                     implementation (Optional[cudnn.attention_implementation]): Which underlying implementation to use in the cuDNN backend. Default is AUTO (recommended).
+                    cu_seq_len_q (Optional[cudnn_tensor]): Cumulative sequence length of the query, shape (b+1, 1, 1, 1) or 1-D (b+1,) (promoted automatically), int32 or int64. Mutually exclusive with seq_len_q; must be set together with cu_seq_len_kv and requires use_padding_mask=True. Requires cuDNN 9.25.0 or newer and the UNIFIED implementation.
+                    cu_seq_len_kv (Optional[cudnn_tensor]): Cumulative sequence length of the key, shape (b+1, 1, 1, 1) or 1-D (b+1,) (promoted automatically), int32 or int64. Mutually exclusive with seq_len_kv; must be set together with cu_seq_len_q and requires use_padding_mask=True. Requires cuDNN 9.25.0 or newer and the UNIFIED implementation.
                 Preferred masking Args:
                     diagonal_alignment (Optional[cudnn.diagonal_alignment]): One of {"TOP_LEFT", "BOTTOM_RIGHT"}. E.g., causal masking can be performed by setting diagonal_alignment=TOP_LEFT, and right_bound=0. Default is TOP_LEFT.
                     left_bound (Optional[int]): An integer >= 1 specifying the offset to the left of the main diagonal to attend to. Default is None, implying +Inf.
