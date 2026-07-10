@@ -1,0 +1,891 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+
+"""Correctness and support tests for Blackwell HSTU attention."""
+
+from __future__ import annotations
+
+import pytest
+import torch
+import torch.nn.functional as F
+from cuda.bindings import driver as cuda
+
+try:
+    import cutlass  # noqa: F401
+except (ImportError, OSError) as exc:
+    pytest.skip(f"CuTe DSL is unavailable: {exc}", allow_module_level=True)
+
+from cudnn.hstu_attention import (
+    HSTUBwdSm100,
+    HSTUFwdSm100,
+    hstu_attention_backward,
+    hstu_attention_forward,
+)
+from cudnn.hstu_attention import _interface
+
+
+pytestmark = [
+    pytest.mark.gpu_exclusive,
+    pytest.mark.xdist_group(name="gpu_exclusive"),
+]
+
+_HAS_CUDA = torch.cuda.is_available()
+_IS_SM10X = _HAS_CUDA and torch.cuda.get_device_capability()[0] == 10
+
+
+def _inputs(
+    *,
+    batch: int = 1,
+    heads: int = 2,
+    seqlen: int = 128,
+    head_dim: int = 64,
+    dtype: torch.dtype = torch.bfloat16,
+):
+    torch.manual_seed(123)
+    shape = (batch * seqlen, heads, head_dim)
+    q = torch.randn(shape, dtype=dtype, device="cuda") * 0.2
+    k = torch.randn(shape, dtype=dtype, device="cuda") * 0.2
+    v = torch.randn(shape, dtype=dtype, device="cuda") * 0.2
+    do = torch.randn(shape, dtype=dtype, device="cuda") * 0.2
+    cu = torch.arange(
+        0,
+        (batch + 1) * seqlen,
+        seqlen,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    return q, k, v, do, cu
+
+
+def _reference_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_q: torch.Tensor,
+    cu_k: torch.Tensor,
+    *,
+    alpha: float,
+    scaling_seqlen: float,
+    causal: bool,
+) -> torch.Tensor:
+    outputs = []
+    cu_q_cpu = cu_q.cpu()
+    cu_k_cpu = cu_k.cpu()
+    for batch_idx in range(cu_q.numel() - 1):
+        q_start, q_end = map(int, cu_q_cpu[batch_idx : batch_idx + 2])
+        k_start, k_end = map(int, cu_k_cpu[batch_idx : batch_idx + 2])
+        q_i = q[q_start:q_end].float()
+        k_i = k[k_start:k_end].float()
+        v_i = v[k_start:k_end].float()
+        scores = alpha * torch.einsum("qhd,khd->hqk", q_i, k_i)
+        weights = F.silu(scores)
+        if causal:
+            q_idx = torch.arange(q_i.shape[0], device=q.device)[:, None]
+            k_idx = torch.arange(k_i.shape[0], device=q.device)[None, :]
+            diagonal_offset = k_i.shape[0] - q_i.shape[0]
+            weights = torch.where(
+                (k_idx <= q_idx + diagonal_offset).unsqueeze(0),
+                weights,
+                torch.zeros_like(weights),
+            )
+        outputs.append(torch.einsum("hqk,khd->qhd", weights, v_i) / scaling_seqlen)
+    return torch.cat(outputs, dim=0)
+
+
+def _forward_api(q, k, v, cu, *, head_dim=64, scaling_seqlen=None):
+    out = torch.empty_like(q, memory_format=torch.contiguous_format)
+    return HSTUFwdSm100(
+        sample_q=q,
+        sample_k=k,
+        sample_v=v,
+        sample_o=out,
+        sample_cu_seqlens_q=cu,
+        sample_cu_seqlens_k=cu,
+        max_seqlen_q=128,
+        max_seqlen_k=128,
+        window_size=(-1, 0),
+        scaling_seqlen=scaling_seqlen,
+    )
+
+
+@pytest.mark.L0
+def test_top_level_exports():
+    import cudnn
+
+    assert cudnn.HSTUFwdSm100 is HSTUFwdSm100
+    assert cudnn.HSTUBwdSm100 is HSTUBwdSm100
+    assert cudnn.hstu_attention_forward is hstu_attention_forward
+    assert cudnn.hstu_attention_backward is hstu_attention_backward
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(not _HAS_CUDA, reason="requires CUDA")
+def test_support_validation_and_scaling_default(monkeypatch):
+    q, k, v, _, cu = _inputs()
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (10, 0))
+    api = _forward_api(q, k, v, cu)
+    assert api.check_support()
+    assert api.scaling_seqlen == 128.0
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(not _HAS_CUDA, reason="requires CUDA")
+def test_support_rejects_unsupported_combinations(monkeypatch):
+    q, k, v, do, cu = _inputs(head_dim=256)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (10, 0))
+
+    with pytest.raises(ValueError, match="head_dim"):
+        HSTUBwdSm100(
+            sample_do=do,
+            sample_q=q,
+            sample_k=k,
+            sample_v=v,
+            sample_dq=torch.empty_like(q),
+            sample_dk=torch.empty_like(k),
+            sample_dv=torch.empty_like(v),
+            sample_cu_seqlens_q=cu,
+            sample_cu_seqlens_k=cu,
+            max_seqlen_q=128,
+            max_seqlen_k=128,
+        ).check_support()
+
+    q, k, v, do, cu = _inputs()
+    with pytest.raises(NotImplementedError, match="deterministic"):
+        HSTUBwdSm100(
+            sample_do=do,
+            sample_q=q,
+            sample_k=k,
+            sample_v=v,
+            sample_dq=torch.empty_like(q),
+            sample_dk=torch.empty_like(k),
+            sample_dv=torch.empty_like(v),
+            sample_cu_seqlens_q=cu,
+            sample_cu_seqlens_k=cu,
+            max_seqlen_q=128,
+            max_seqlen_k=128,
+            deterministic=True,
+        ).check_support()
+
+    with pytest.raises(ValueError, match="scaling_seqlen"):
+        _forward_api(q, k, v, cu, scaling_seqlen=0).check_support()
+
+    even_func = torch.empty(
+        (1, 2, q.shape[0] + 256), dtype=torch.int32, device=q.device
+    )
+    with pytest.raises(ValueError, match="positive and odd"):
+        HSTUFwdSm100(
+            sample_q=q,
+            sample_k=k,
+            sample_v=v,
+            sample_o=torch.empty_like(q),
+            sample_cu_seqlens_q=cu,
+            sample_cu_seqlens_k=cu,
+            max_seqlen_q=128,
+            max_seqlen_k=128,
+            sample_func=even_func,
+        ).check_support()
+
+    odd_func = torch.empty((1, 1, q.shape[0] + 256), dtype=torch.int32, device=q.device)
+    with pytest.raises(ValueError, match="max_seqlen_k <= 65536"):
+        HSTUFwdSm100(
+            sample_q=q,
+            sample_k=k,
+            sample_v=v,
+            sample_o=torch.empty_like(q),
+            sample_cu_seqlens_q=cu,
+            sample_cu_seqlens_k=cu,
+            max_seqlen_q=128,
+            max_seqlen_k=65537,
+            sample_func=odd_func,
+        ).check_support()
+
+    with pytest.raises(ValueError, match="max_seqlen_q <= 32768"):
+        HSTUBwdSm100(
+            sample_do=do,
+            sample_q=q,
+            sample_k=k,
+            sample_v=v,
+            sample_dq=torch.empty_like(q),
+            sample_dk=torch.empty_like(k),
+            sample_dv=torch.empty_like(v),
+            sample_cu_seqlens_q=cu,
+            sample_cu_seqlens_k=cu,
+            max_seqlen_q=32769,
+            max_seqlen_k=32769,
+            sample_func=odd_func,
+        ).check_support()
+
+    with pytest.raises(ValueError, match="o_tensor storage must not overlap"):
+        HSTUFwdSm100(
+            sample_q=q,
+            sample_k=k,
+            sample_v=v,
+            sample_o=q,
+            sample_cu_seqlens_q=cu,
+            sample_cu_seqlens_k=cu,
+            max_seqlen_q=128,
+            max_seqlen_k=128,
+        ).check_support()
+
+    shared_grad = torch.empty_like(q)
+    with pytest.raises(ValueError, match="storage must not overlap"):
+        HSTUBwdSm100(
+            sample_do=do,
+            sample_q=q,
+            sample_k=k,
+            sample_v=v,
+            sample_dq=shared_grad,
+            sample_dk=shared_grad,
+            sample_dv=torch.empty_like(v),
+            sample_cu_seqlens_q=cu,
+            sample_cu_seqlens_k=cu,
+            max_seqlen_q=128,
+            max_seqlen_k=128,
+        ).check_support()
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
+def test_raw_default_stream_maps_to_pytorch_default(monkeypatch):
+    q, k, v, _, cu = _inputs()
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (10, 0))
+    api = _forward_api(q, k, v, cu)
+    api.check_support()
+    api.compile()
+    assert api.check_support()
+
+    def reject_external_stream(*args, **kwargs):
+        raise AssertionError("CUstream(0) must not construct an ExternalStream")
+
+    monkeypatch.setattr(torch.cuda, "ExternalStream", reject_external_stream)
+    api.execute(q, k, v, torch.empty_like(q), cu, cu, current_stream=cuda.CUstream(0))
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(not _HAS_CUDA, reason="requires CUDA")
+def test_rejects_unsafe_storage_metadata(monkeypatch):
+    q, k, v, _, cu = _inputs()
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (10, 0))
+
+    overlapping_q = q[:1].expand_as(q)
+    with pytest.raises(ValueError, match="non-overlapping strides"):
+        _forward_api(overlapping_q, k, v, cu).check_support()
+
+    unaligned_q = torch.empty(
+        (q.shape[0], q.shape[1], q.shape[2] + 1),
+        dtype=q.dtype,
+        device=q.device,
+    )[..., 1:]
+    with pytest.raises(ValueError, match="16-byte aligned"):
+        _forward_api(unaligned_q, k, v, cu).check_support()
+
+    unaligned_cu = torch.arange(
+        0,
+        3 * 128,
+        128,
+        dtype=torch.int32,
+        device=q.device,
+    )[1:]
+    with pytest.raises(ValueError, match="16-byte aligned"):
+        _forward_api(q, k, v, unaligned_cu).check_support()
+
+    paged_storage = torch.empty(
+        (1, 2, 128, q.shape[1], q.shape[2] * 2),
+        dtype=q.dtype,
+        device=q.device,
+    )
+    noncontiguous_paged_kv = paged_storage[..., ::2]
+    with pytest.raises(ValueError, match="paged_kv_tensor must be contiguous"):
+        HSTUFwdSm100(
+            sample_q=q,
+            sample_k=k,
+            sample_v=v,
+            sample_o=torch.empty_like(q),
+            sample_cu_seqlens_q=cu,
+            sample_cu_seqlens_k=cu,
+            max_seqlen_q=128,
+            max_seqlen_k=128,
+            window_size=(-1, 0),
+            sample_paged_kv=noncontiguous_paged_kv,
+            sample_page_ids=torch.tensor([0], dtype=torch.int32, device=q.device),
+            sample_page_indptrs=torch.tensor(
+                [0, 1], dtype=torch.int32, device=q.device
+            ),
+        ).check_support()
+
+    with pytest.raises(ValueError, match="num_pages > 0"):
+        HSTUFwdSm100(
+            sample_q=q,
+            sample_k=k,
+            sample_v=v,
+            sample_o=torch.empty_like(q),
+            sample_cu_seqlens_q=cu,
+            sample_cu_seqlens_k=cu,
+            max_seqlen_q=128,
+            max_seqlen_k=128,
+            window_size=(-1, 0),
+            sample_paged_kv=torch.empty(
+                (0, 2, 128, q.shape[1], q.shape[2]),
+                dtype=q.dtype,
+                device=q.device,
+            ),
+            sample_page_ids=torch.tensor([0], dtype=torch.int32, device=q.device),
+            sample_page_indptrs=torch.tensor(
+                [0, 1], dtype=torch.int32, device=q.device
+            ),
+        ).check_support()
+
+    qkv = torch.randn(
+        (q.shape[0], 3, q.shape[1], q.shape[2]),
+        dtype=q.dtype,
+        device=q.device,
+    )
+    dqkv = torch.empty_like(qkv)
+    packed_api = HSTUBwdSm100(
+        sample_do=torch.empty_like(q),
+        sample_q=qkv[:, 0],
+        sample_k=qkv[:, 1],
+        sample_v=qkv[:, 2],
+        sample_dq=dqkv[:, 0],
+        sample_dk=dqkv[:, 1],
+        sample_dv=dqkv[:, 2],
+        sample_cu_seqlens_q=cu,
+        sample_cu_seqlens_k=cu,
+        max_seqlen_q=128,
+        max_seqlen_k=128,
+    )
+    assert packed_api.check_support()
+
+    overlapping_grad_storage = torch.empty(
+        (q.shape[0], q.shape[1], q.shape[2] + 8),
+        dtype=q.dtype,
+        device=q.device,
+    )
+    with pytest.raises(ValueError, match="storage must not overlap"):
+        HSTUBwdSm100(
+            sample_do=torch.empty_like(q),
+            sample_q=q,
+            sample_k=k,
+            sample_v=v,
+            sample_dq=overlapping_grad_storage[..., : q.shape[2]],
+            sample_dk=overlapping_grad_storage[..., 8 : 8 + q.shape[2]],
+            sample_dv=torch.empty_like(v),
+            sample_cu_seqlens_q=cu,
+            sample_cu_seqlens_k=cu,
+            max_seqlen_q=128,
+            max_seqlen_k=128,
+        ).check_support()
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
+def test_explicit_api_rejects_runtime_stride_change():
+    q, k, v, _, cu = _inputs()
+    api = _forward_api(q, k, v, cu)
+    api.check_support()
+    api.compile()
+    q_head_major = q.permute(1, 0, 2).contiguous().permute(1, 0, 2)
+    with pytest.raises(ValueError, match="dtype/device/stride"):
+        api.execute(
+            q_head_major,
+            k,
+            v,
+            torch.empty_like(q),
+            cu,
+            cu,
+        )
+
+    misaligned_q = torch.empty(q.numel() + 1, dtype=q.dtype, device=q.device)[
+        1:
+    ].view_as(q)
+    with pytest.raises(ValueError, match="16-byte aligned"):
+        api.execute(
+            misaligned_q,
+            k,
+            v,
+            torch.empty_like(q),
+            cu,
+            cu,
+        )
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+def test_forward_matches_pytorch(dtype, head_dim):
+    q, k, v, _, cu = _inputs(dtype=dtype, head_dim=head_dim)
+    alpha = 0.7
+    scaling_seqlen = 64.0
+    actual = hstu_attention_forward(
+        q,
+        k,
+        v,
+        cu,
+        cu,
+        max_seqlen_q=128,
+        max_seqlen_k=128,
+        window_size=(-1, 0),
+        alpha=alpha,
+        scaling_seqlen=scaling_seqlen,
+    )["o_tensor"]
+    expected = _reference_forward(
+        q,
+        k,
+        v,
+        cu,
+        cu,
+        alpha=alpha,
+        scaling_seqlen=scaling_seqlen,
+        causal=True,
+    )
+    torch.testing.assert_close(
+        actual.float(),
+        expected,
+        rtol=3e-2,
+        atol=3e-2,
+    )
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_backward_matches_pytorch(dtype, head_dim):
+    q, k, v, do, cu = _inputs(dtype=dtype, head_dim=head_dim)
+    alpha = 0.7
+    scaling_seqlen = 64.0
+
+    q_ref = q.float().detach().requires_grad_(True)
+    k_ref = k.float().detach().requires_grad_(True)
+    v_ref = v.float().detach().requires_grad_(True)
+    out_ref = _reference_forward(
+        q_ref,
+        k_ref,
+        v_ref,
+        cu,
+        cu,
+        alpha=alpha,
+        scaling_seqlen=scaling_seqlen,
+        causal=True,
+    )
+    expected = torch.autograd.grad(
+        out_ref,
+        (q_ref, k_ref, v_ref),
+        do.float(),
+    )
+
+    actual = hstu_attention_backward(
+        do,
+        q,
+        k,
+        v,
+        cu,
+        cu,
+        max_seqlen_q=128,
+        max_seqlen_k=128,
+        window_size=(-1, 0),
+        alpha=alpha,
+        scaling_seqlen=scaling_seqlen,
+    )
+    for name, expected_grad in zip(("dq_tensor", "dk_tensor", "dv_tensor"), expected):
+        torch.testing.assert_close(
+            actual[name].float(),
+            expected_grad,
+            rtol=6e-2,
+            atol=6e-2,
+        )
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
+def test_varlen_tail_and_asymmetric_lengths_match_pytorch():
+    torch.manual_seed(321)
+    q_lengths = (37, 129)
+    k_lengths = (50, 173)
+    heads, head_dim = 1, 64
+    q = (
+        torch.randn(
+            (sum(q_lengths), heads, head_dim),
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        * 0.2
+    )
+    k = (
+        torch.randn(
+            (sum(k_lengths), heads, head_dim),
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        * 0.2
+    )
+    v = torch.randn_like(k) * 0.2
+    do = torch.randn_like(q) * 0.2
+    cu_q = torch.tensor(
+        [0, q_lengths[0], sum(q_lengths)], dtype=torch.int32, device="cuda"
+    )
+    cu_k = torch.tensor(
+        [0, k_lengths[0], sum(k_lengths)], dtype=torch.int32, device="cuda"
+    )
+    alpha = 0.7
+    scaling_seqlen = 96.0
+
+    expected_out = _reference_forward(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        alpha=alpha,
+        scaling_seqlen=scaling_seqlen,
+        causal=True,
+    )
+    actual_out = hstu_attention_forward(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        max_seqlen_q=max(q_lengths),
+        max_seqlen_k=max(k_lengths),
+        window_size=(-1, 0),
+        alpha=alpha,
+        scaling_seqlen=scaling_seqlen,
+    )["o_tensor"]
+    torch.testing.assert_close(actual_out.float(), expected_out, rtol=4e-2, atol=4e-2)
+
+    q_ref = q.float().detach().requires_grad_(True)
+    k_ref = k.float().detach().requires_grad_(True)
+    v_ref = v.float().detach().requires_grad_(True)
+    ref_for_grad = _reference_forward(
+        q_ref,
+        k_ref,
+        v_ref,
+        cu_q,
+        cu_k,
+        alpha=alpha,
+        scaling_seqlen=scaling_seqlen,
+        causal=True,
+    )
+    expected_grads = torch.autograd.grad(
+        ref_for_grad,
+        (q_ref, k_ref, v_ref),
+        do.float(),
+    )
+    actual_grads = hstu_attention_backward(
+        do,
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        max_seqlen_q=max(q_lengths),
+        max_seqlen_k=max(k_lengths),
+        window_size=(-1, 0),
+        alpha=alpha,
+        scaling_seqlen=scaling_seqlen,
+    )
+    for name, expected_grad in zip(
+        ("dq_tensor", "dk_tensor", "dv_tensor"), expected_grads
+    ):
+        torch.testing.assert_close(
+            actual_grads[name].float(), expected_grad, rtol=8e-2, atol=8e-2
+        )
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
+@pytest.mark.parametrize("mask_mode", ["full", "local", "target", "arbitrary"])
+def test_mask_modes_match_pytorch(mask_mode):
+    q, k, v, do, cu = _inputs(heads=1)
+    seqlen = q.shape[0]
+    alpha = 0.7
+    scaling_seqlen = 64.0
+    row = torch.arange(seqlen, device=q.device)[:, None]
+    col = torch.arange(seqlen, device=q.device)[None, :]
+
+    window_size = (-1, -1)
+    num_targets = None
+    target_group_size = 1
+    func = None
+    mask = torch.ones((seqlen, seqlen), dtype=torch.bool, device=q.device)
+    if mask_mode == "local":
+        window_size = (16, 8)
+        mask = (col >= row - 16) & (col <= row + 8)
+    elif mask_mode == "target":
+        window_size = (-1, 0)
+        target_group_size = 4
+        num_targets = torch.tensor([32], dtype=torch.int32, device=q.device)
+        history_len = seqlen - int(num_targets[0])
+        target_index = torch.div(
+            row - history_len,
+            target_group_size,
+            rounding_mode="floor",
+        )
+        target_left = history_len + target_index * target_group_size
+        mask = (col <= row) & ~(
+            (row >= history_len) & (col >= history_len) & (col < target_left)
+        )
+    elif mask_mode == "arbitrary":
+        func = torch.full(
+            (1, 3, seqlen + 256),
+            seqlen,
+            dtype=torch.int32,
+            device=q.device,
+        )
+        masked_start = (row[:, 0] * 3) % 32
+        masked_end = masked_start + 7
+        valid_upper = 96 + row[:, 0] % 32
+        func[0, 0, :seqlen] = masked_start
+        func[0, 1, :seqlen] = masked_end
+        func[0, 2, :seqlen] = valid_upper
+        mask = (col < masked_start[:, None]) | (
+            (col >= masked_end[:, None]) & (col < valid_upper[:, None])
+        )
+
+    q_ref = q.float().detach().requires_grad_(True)
+    k_ref = k.float().detach().requires_grad_(True)
+    v_ref = v.float().detach().requires_grad_(True)
+    scores = alpha * torch.einsum("qhd,khd->hqk", q_ref, k_ref)
+    weights = torch.where(
+        mask.unsqueeze(0),
+        F.silu(scores),
+        torch.zeros_like(scores),
+    )
+    out_ref = torch.einsum("hqk,khd->qhd", weights, v_ref) / scaling_seqlen
+
+    out = hstu_attention_forward(
+        q,
+        k,
+        v,
+        cu,
+        cu,
+        max_seqlen_q=seqlen,
+        max_seqlen_k=seqlen,
+        num_targets_tensor=num_targets,
+        target_group_size=target_group_size,
+        window_size=window_size,
+        alpha=alpha,
+        scaling_seqlen=scaling_seqlen,
+        func_tensor=func,
+    )["o_tensor"]
+    torch.testing.assert_close(out.float(), out_ref, rtol=4e-2, atol=4e-2)
+
+    expected_grads = torch.autograd.grad(
+        out_ref,
+        (q_ref, k_ref, v_ref),
+        do.float(),
+    )
+    actual_grads = hstu_attention_backward(
+        do,
+        q,
+        k,
+        v,
+        cu,
+        cu,
+        max_seqlen_q=seqlen,
+        max_seqlen_k=seqlen,
+        num_targets_tensor=num_targets,
+        target_group_size=target_group_size,
+        window_size=window_size,
+        alpha=alpha,
+        scaling_seqlen=scaling_seqlen,
+        func_tensor=func,
+    )
+    for name, expected_grad in zip(
+        ("dq_tensor", "dk_tensor", "dv_tensor"), expected_grads
+    ):
+        torch.testing.assert_close(
+            actual_grads[name].float(),
+            expected_grad,
+            rtol=8e-2,
+            atol=8e-2,
+        )
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
+@pytest.mark.parametrize("head_dim", [64, 256])
+def test_paged_kv_forward_matches_pytorch(head_dim):
+    q, k, v, _, cu = _inputs(heads=1, seqlen=256, head_dim=head_dim)
+    seqlen = q.shape[0]
+    alpha = 0.7
+    scaling_seqlen = 64.0
+    paged_kv = (
+        torch.randn(
+            (3, 2, 128, q.shape[1], q.shape[2]),
+            dtype=q.dtype,
+            device=q.device,
+        )
+        * 0.2
+    )
+    page_ids = torch.tensor([2, 0], dtype=torch.int32, device=q.device)
+    page_indptrs = torch.tensor([0, 2], dtype=torch.int32, device=q.device)
+    expected_k = torch.cat((paged_kv[2, 0], paged_kv[0, 0]), dim=0)
+    expected_v = torch.cat((paged_kv[2, 1], paged_kv[0, 1]), dim=0)
+
+    out = hstu_attention_forward(
+        q,
+        k,
+        v,
+        cu,
+        cu,
+        max_seqlen_q=seqlen,
+        max_seqlen_k=seqlen,
+        window_size=(-1, 0),
+        alpha=alpha,
+        scaling_seqlen=scaling_seqlen,
+        paged_kv_tensor=paged_kv,
+        page_ids_tensor=page_ids,
+        page_indptrs_tensor=page_indptrs,
+    )["o_tensor"]
+
+    scores = alpha * torch.einsum("qhd,khd->hqk", q.float(), expected_k.float())
+    row = torch.arange(seqlen, device=q.device)[:, None]
+    col = torch.arange(seqlen, device=q.device)[None, :]
+    weights = torch.where(
+        (col <= row).unsqueeze(0),
+        F.silu(scores),
+        torch.zeros_like(scores),
+    )
+    expected = (
+        torch.einsum("hqk,khd->qhd", weights, expected_v.float()) / scaling_seqlen
+    )
+    torch.testing.assert_close(out.float(), expected, rtol=4e-2, atol=4e-2)
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
+def test_cache_hit_does_not_inspect_cuda_metadata_values(monkeypatch):
+    q, k, v, do, cu = _inputs()
+    kwargs = {
+        "max_seqlen_q": 128,
+        "max_seqlen_k": 128,
+        "window_size": (-1, 0),
+        "scaling_seqlen": 64.0,
+    }
+    hstu_attention_forward(q, k, v, cu, cu, **kwargs)
+    hstu_attention_backward(do, q, k, v, cu, cu, **kwargs)
+    torch.cuda.synchronize()
+
+    def fail_d2h(*_args, **_kwargs):
+        raise AssertionError("unexpected CUDA metadata value inspection")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(torch.Tensor, "cpu", fail_d2h)
+        patch.setattr(torch.Tensor, "item", fail_d2h)
+        patch.setattr(torch.Tensor, "tolist", fail_d2h)
+        out = hstu_attention_forward(q, k, v, cu, cu, **kwargs)["o_tensor"]
+        grads = hstu_attention_backward(do, q, k, v, cu, cu, **kwargs)
+
+    torch.cuda.synchronize()
+    assert torch.isfinite(out).all()
+    assert all(torch.isfinite(grad).all() for grad in grads)
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
+def test_runtime_alpha_and_scaling_are_not_compile_time_constants():
+    q, k, v, do, cu = _inputs(heads=1)
+    scalar_configs = ((0.35, 32.0), (1.1, 96.0))
+
+    _interface.hstu_varlen_fwd_100.compile_cache.clear()
+    for alpha, scaling_seqlen in scalar_configs:
+        actual = hstu_attention_forward(
+            q,
+            k,
+            v,
+            cu,
+            cu,
+            max_seqlen_q=128,
+            max_seqlen_k=128,
+            window_size=(-1, 0),
+            alpha=alpha,
+            scaling_seqlen=scaling_seqlen,
+        )["o_tensor"]
+        expected = _reference_forward(
+            q,
+            k,
+            v,
+            cu,
+            cu,
+            alpha=alpha,
+            scaling_seqlen=scaling_seqlen,
+            causal=True,
+        )
+        torch.testing.assert_close(actual.float(), expected, rtol=4e-2, atol=4e-2)
+        assert len(_interface.hstu_varlen_fwd_100.compile_cache) == 1
+
+    _interface.hstu_varlen_bwd_100.compile_cache.clear()
+    for alpha, scaling_seqlen in scalar_configs:
+        q_ref = q.float().detach().requires_grad_(True)
+        k_ref = k.float().detach().requires_grad_(True)
+        v_ref = v.float().detach().requires_grad_(True)
+        expected_out = _reference_forward(
+            q_ref,
+            k_ref,
+            v_ref,
+            cu,
+            cu,
+            alpha=alpha,
+            scaling_seqlen=scaling_seqlen,
+            causal=True,
+        )
+        expected_grads = torch.autograd.grad(
+            expected_out,
+            (q_ref, k_ref, v_ref),
+            do.float(),
+        )
+        actual_grads = hstu_attention_backward(
+            do,
+            q,
+            k,
+            v,
+            cu,
+            cu,
+            max_seqlen_q=128,
+            max_seqlen_k=128,
+            window_size=(-1, 0),
+            alpha=alpha,
+            scaling_seqlen=scaling_seqlen,
+        )
+        for name, expected_grad in zip(
+            ("dq_tensor", "dk_tensor", "dv_tensor"), expected_grads
+        ):
+            torch.testing.assert_close(
+                actual_grads[name].float(), expected_grad, rtol=8e-2, atol=8e-2
+            )
+        assert len(_interface.hstu_varlen_bwd_100.compile_cache) == 1
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
+def test_current_stream_and_compile_cache():
+    q, k, v, _, cu = _inputs()
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        first = hstu_attention_forward(
+            q,
+            k,
+            v,
+            cu,
+            cu,
+            max_seqlen_q=128,
+            max_seqlen_k=128,
+            window_size=(-1, 0),
+            stream=stream,
+        )["o_tensor"]
+        second = hstu_attention_forward(
+            q,
+            k,
+            v,
+            cu,
+            cu,
+            max_seqlen_q=128,
+            max_seqlen_k=128,
+            window_size=(-1, 0),
+            stream=stream,
+        )["o_tensor"]
+    stream.synchronize()
+    torch.testing.assert_close(first, second, rtol=0, atol=0)
