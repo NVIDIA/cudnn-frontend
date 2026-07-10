@@ -44,8 +44,7 @@ from cutlass._mlir.dialects import llvm as _llvm_dialect
 from cutlass.cutlass_dsl import Float32 as _Float32Sym, Int32 as _Int32Sym
 
 # ---- DSv3 constants ----
-NUM_HEADS = 128  # DSv3 default; the kernel DERIVES num_heads from the weight shape at
-# compile time (see run()), so this literal only documents the tuned value
+# NUM_HEADS inferred
 QK_NOPE = 128
 QK_ROPE = 64
 HALF = 32
@@ -80,8 +79,7 @@ HALFW = 16  # lanes per 32-feature row-block within a featcell
 # head geometry: HEAD_DIM=192 (QK_NOPE 128 + QK_ROPE 64), MXFP8 BLOCK=32, TILE_M=128. The epilogue's
 # VEC2 feature-cell layout, warp specialization, and single trailing rope cell depend on these exact
 # values -- changing them requires reworking the epilogue, not just editing a constant. These asserts
-# fail loudly at import if the constants are set to an unsupported combination. (NUM_HEADS is the one
-# dimension left general -- it is derived from the weight shape and only sizes the grid/output stride.)
+# fail loudly at import if the constants are set to an unsupported combination.
 assert FEATCELL == 64, "FEATCELL is warp-size (32) x VEC2 (2); must be 64"
 assert QK_NOPE + QK_ROPE == HEAD_DIM, "QK_NOPE + QK_ROPE must equal HEAD_DIM"
 assert HEAD_DIM % FEATCELL == 0, "HEAD_DIM must be a whole number of 64-wide feature cells"
