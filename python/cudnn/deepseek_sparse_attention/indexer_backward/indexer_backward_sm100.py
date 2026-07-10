@@ -231,24 +231,27 @@ class IndexerBackwardSm100:
         # All GEMMs: SS path (A & B from SMEM, accumulator in TMEM)
         tmma1 = _make_trivial_tiled_mma(
             self.q_dtype,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.K,
+            self.q_dtype,
+            cute.nvgpu.OperandMajorMode.K,
+            cute.nvgpu.OperandMajorMode.K,
             self.acc_dtype,
             cta_group,
             self.gemm1_tiler[:2],
         )
         tmma2 = _make_trivial_tiled_mma(
             self.q_dtype,
-            tcgen05.OperandMajorMode.MN,
-            tcgen05.OperandMajorMode.MN,
+            self.q_dtype,
+            cute.nvgpu.OperandMajorMode.MN,
+            cute.nvgpu.OperandMajorMode.MN,
             self.acc_dtype,
             cta_group,
             self.gemm2_tiler[:2],
         )
         tmma3 = _make_trivial_tiled_mma(
             self.q_dtype,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.MN,
+            self.q_dtype,
+            cute.nvgpu.OperandMajorMode.K,
+            cute.nvgpu.OperandMajorMode.MN,
             self.acc_dtype,
             cta_group,
             self.gemm3_tiler[:2],
@@ -1063,7 +1066,7 @@ class IndexerBackwardSm100:
         s_full_1_phase = Int32(0)
 
         dw_accum = cute.make_rmem_tensor(tSrS_shape, Float32)
-        for ei in cutlass.range_constexpr(cute.size(dw_accum)):
+        for ei in cutlass.range(cute.size(dw_accum), unroll_full=True):
             dw_accum[ei] = Float32(0.0)
 
         tSrS = cute.make_rmem_tensor(tSrS_shape, Float32)
@@ -1118,16 +1121,16 @@ class IndexerBackwardSm100:
 
             # Phase 2: Convert dS f32→bf16, write to sdS via coordinate mapping.
             tSrS_f16 = cute.make_rmem_tensor(tSrS.shape, self.q_dtype)
-            for ei in cutlass.range_constexpr(cute.size(tSrS)):
+            for ei in cutlass.range(cute.size(tSrS), unroll_full=True):
                 tSrS_f16[ei] = self.q_dtype(tSrS[ei])
 
             if bi % 2 == 0:
-                for ei in cutlass.range_constexpr(cute.size(tSrS_f16)):
+                for ei in cutlass.range(cute.size(tSrS_f16), unroll_full=True):
                     h = cute.get(tCcS[ei], mode=[0, 0])
                     n = cute.get(tCcS[ei], mode=[0, 1])
                     sdS_gemm_view_0[h, n] = tSrS_f16[ei]
             else:
-                for ei in cutlass.range_constexpr(cute.size(tSrS_f16)):
+                for ei in cutlass.range(cute.size(tSrS_f16), unroll_full=True):
                     h = cute.get(tCcS[ei], mode=[0, 0])
                     n = cute.get(tCcS[ei], mode=[0, 1])
                     sdS_gemm_view_1[h, n] = tSrS_f16[ei]
@@ -1148,7 +1151,7 @@ class IndexerBackwardSm100:
         cute.copy(tiled_tmem_load_dq, tDqDq_t2r, tDQrDQ)
 
         tDQrDQ_bf16 = cute.make_rmem_tensor(tDQrDQ.shape, self.q_dtype)
-        for ei in cutlass.range_constexpr(cute.size(tDQrDQ)):
+        for ei in cutlass.range(cute.size(tDQrDQ), unroll_full=True):
             tDQrDQ_bf16[ei] = self.q_dtype(tDQrDQ[ei] * Float32(sm_scale))
 
         cute.arch.fence_view_async_tmem_load()
@@ -1158,7 +1161,7 @@ class IndexerBackwardSm100:
             sdQ_epi_slice,
             cute.make_layout((self.heads_padded, self.head_dim_padded)),
         )
-        for ei in cutlass.range_constexpr(cute.size(tDQrDQ_bf16)):
+        for ei in cutlass.range(cute.size(tDQrDQ_bf16), unroll_full=True):
             h = cute.get(tCcDQ[ei], mode=[0, 0])
             d = cute.get(tCcDQ[ei], mode=[0, 1])
             sdQ_gemm_view[h, d] = tDQrDQ_bf16[ei]
@@ -1177,7 +1180,7 @@ class IndexerBackwardSm100:
         for h_local in cutlass.range_constexpr(HEADS_PER_WARP):
             h = warp_base_h + h_local
             my_partial = Float32(0.0)
-            for ei in cutlass.range_constexpr(cute.size(dw_accum)):
+            for ei in cutlass.range(cute.size(dw_accum), unroll_full=True):
                 if cute.get(tCcS[ei], mode=[0, 0]) == h:
                     my_partial = my_partial + dw_accum[ei]
             total = cute.arch.warp_reduction_sum(my_partial)
@@ -1246,7 +1249,7 @@ class IndexerBackwardSm100:
             # local→global when topk_indices_global=False); gmem fallback
             # mirrors that conversion via const_expr branch.
             batch_offset_l2g = Int32(0) if const_expr(self.topk_indices_global) else batch_idx * (seqlen_k // batch_size)
-            for pair in cutlass.range_constexpr(cute.size(tDKrDK) // 2):
+            for pair in cutlass.range(cute.size(tDKrDK) // 2, unroll_full=True):
                 ei = pair * 2
                 n = cute.get(tCcDK[ei], mode=[0, 0])
                 d = cute.get(tCcDK[ei], mode=[0, 1])
@@ -1516,7 +1519,7 @@ class ScoreGradSm100:
 
         if tidx == 0:
             block_sum = Float32(0.0)
-            for i in cutlass.range_constexpr(self.THREADS_PER_CTA):
+            for i in cutlass.range(self.THREADS_PER_CTA, unroll_full=True):
                 block_sum += thread_sums[i]
             thread_sums[0] = block_sum
         cute.arch.sync_threads()

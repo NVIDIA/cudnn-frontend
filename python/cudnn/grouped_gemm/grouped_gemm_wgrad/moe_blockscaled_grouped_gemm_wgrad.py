@@ -257,6 +257,7 @@ class BlockScaledMoEGroupedGemmWgradKernel:
     def _create_tiled_mma(self):
         return sm100_utils.make_blockscaled_trivial_tiled_mma(
             self.a_dtype,
+            self.a_dtype,
             self.a_major_mode,
             self.b_major_mode,
             self.sf_dtype,
@@ -267,6 +268,7 @@ class BlockScaledMoEGroupedGemmWgradKernel:
 
     def _create_tiled_mma_sfb(self):
         return sm100_utils.make_blockscaled_trivial_tiled_mma(
+            self.a_dtype,
             self.a_dtype,
             self.a_major_mode,
             self.b_major_mode,
