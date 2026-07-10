@@ -303,7 +303,8 @@ TEST_CASE("XLA pointwise selected plan behavior notes with serialization", "[gra
     }
 
     if (selected_plan_index < 0) {
-        SKIP("No buildable nonzero execution plan with behavior notes different from plan 0 was found on this backend.");
+        SKIP(
+            "No buildable nonzero execution plan with behavior notes different from plan 0 was found on this backend.");
     }
     REQUIRE(selected_notes != plan0_notes);
     REQUIRE(selected_plan_index != 0);
