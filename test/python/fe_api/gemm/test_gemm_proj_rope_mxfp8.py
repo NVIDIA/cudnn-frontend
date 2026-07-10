@@ -3,7 +3,7 @@ import torch
 import pytest
 
 from test_utils import torch_fork_set_rng
-from fe_api.test_gemm_proj_rope_mxfp8_utils import with_gemm_proj_rope_mxfp8_params
+from fe_api.gemm.test_gemm_proj_rope_mxfp8_utils import with_gemm_proj_rope_mxfp8_params
 
 
 @pytest.mark.L0
@@ -26,7 +26,7 @@ def test_gemm_proj_rope_mxfp8_check_support_rejects_unaligned_tokens(request):
     """check_support() must reject a token count that is not a multiple of TILE_M."""
     try:
         from cudnn import GemmProjRopeMxfp8Sm100
-        from fe_api.test_gemm_proj_rope_mxfp8_utils import (
+        from fe_api.gemm.test_gemm_proj_rope_mxfp8_utils import (
             allocate_input_tensors,
             allocate_output_tensors,
             gemm_proj_rope_mxfp8_init,
@@ -61,7 +61,7 @@ def test_gemm_proj_rope_mxfp8_check_support_rejects_kdim_mismatch(request):
         import torch
 
         from cudnn import GemmProjRopeMxfp8Sm100
-        from fe_api.test_gemm_proj_rope_mxfp8_utils import (
+        from fe_api.gemm.test_gemm_proj_rope_mxfp8_utils import (
             Q_LORA,
             allocate_input_tensors,
             allocate_output_tensors,
@@ -99,7 +99,7 @@ def test_gemm_proj_rope_mxfp8_run_rejects_kdim_mismatch():
     tensors are enough to exercise the rejection (no SM100 device required)."""
     try:
         from cudnn.gemm_proj_rope_mxfp8 import run
-        from fe_api.test_gemm_proj_rope_mxfp8_utils import (
+        from fe_api.gemm.test_gemm_proj_rope_mxfp8_utils import (
             BLOCK,
             HEAD_DIM,
             NUM_HEADS,
@@ -136,7 +136,7 @@ def test_gemm_proj_rope_mxfp8_reference_contract(tokens, w_out_in):
     shapes/dtypes and carry only finite (dequantized) values."""
     try:
         from cudnn.gemm_proj_rope_mxfp8 import gemm_proj_rope_mxfp8_reference
-        from fe_api.test_gemm_proj_rope_mxfp8_utils import (
+        from fe_api.gemm.test_gemm_proj_rope_mxfp8_utils import (
             BLOCK,
             HEAD_DIM,
             NUM_HEADS,
@@ -176,7 +176,7 @@ def test_gemm_proj_rope_mxfp8_reference_w_out_in_equivalence(tokens):
     logical B=[out, in] operand)."""
     try:
         from cudnn.gemm_proj_rope_mxfp8 import gemm_proj_rope_mxfp8_reference
-        from fe_api.test_gemm_proj_rope_mxfp8_utils import QK_ROPE, Q_LORA, Q_OUT
+        from fe_api.gemm.test_gemm_proj_rope_mxfp8_utils import QK_ROPE, Q_LORA, Q_OUT
     except ImportError:
         pytest.skip("Environment not supported: cudnn optional dependencies not installed")
 
@@ -207,7 +207,7 @@ def _test_gemm_proj_rope_mxfp8_compile_execute(tokens, w_out_in, request):
     try:
         from cudnn import GemmProjRopeMxfp8Sm100
         from cuda.bindings import driver as cuda
-        from fe_api.test_gemm_proj_rope_mxfp8_utils import (
+        from fe_api.gemm.test_gemm_proj_rope_mxfp8_utils import (
             allocate_input_tensors,
             allocate_output_tensors,
             check_ref_gemm_proj_rope_mxfp8,
@@ -252,7 +252,7 @@ def _test_gemm_proj_rope_mxfp8_wrapper(tokens, w_out_in, request):
     try:
         from cudnn import gemm_proj_rope_mxfp8_wrapper_sm100
         from cuda.bindings import driver as cuda
-        from fe_api.test_gemm_proj_rope_mxfp8_utils import (
+        from fe_api.gemm.test_gemm_proj_rope_mxfp8_utils import (
             allocate_input_tensors,
             check_ref_gemm_proj_rope_mxfp8,
             gemm_proj_rope_mxfp8_init,
