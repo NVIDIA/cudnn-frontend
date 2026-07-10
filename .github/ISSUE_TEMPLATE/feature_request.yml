@@ -1,0 +1,93 @@
+name: Feature request
+description: Propose a scoped improvement or new capability.
+title: "[Feature]: "
+labels:
+  - cat-feature
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Search existing issues first. Concrete use cases and a small initial scope are easiest to evaluate.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and did not find a duplicate.
+          required: true
+        - label: I am describing a concrete problem or use case.
+          required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected area
+      options:
+        - C++ frontend API or graph construction
+        - Python API or bindings
+        - FE OSS kernels or CuTeDSL
+        - Build, packaging, or installation
+        - CI or test infrastructure
+        - Documentation or samples
+        - Benchmarks or performance
+        - Not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: What are you trying to do, and what is difficult or impossible today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the API, behavior, or workflow you want.
+    validations:
+      required: true
+
+  - type: textarea
+    id: value
+    attributes:
+      label: Why this matters
+      description: Who benefits, and what outcome does this unlock?
+    validations:
+      required: true
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: Smallest useful scope
+      description: Describe the narrowest first version that would solve the problem.
+    validations:
+      required: true
+
+  - type: textarea
+    id: constraints
+    attributes:
+      label: Environment or constraints
+      description: Note relevant GPU architectures, cuDNN/CUDA versions, frameworks, compatibility needs, or performance targets.
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Include current workarounds or other approaches you considered.
+
+  - type: textarea
+    id: references
+    attributes:
+      label: Additional context
+      description: Add examples, papers, mockups, related issues, or comparable APIs.
+
+  - type: checkboxes
+    id: contribution
+    attributes:
+      label: Contribution
+      options:
+        - label: I would be willing to help implement this feature.
