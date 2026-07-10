@@ -396,4 +396,4 @@ Returns a `TupleDict` (dictionary + tuple unpacking):
 
 ## Usage Examples
 
-For usage examples, see test cases in `test/python/fe_api/test_grouped_gemm_dglu.py` (dense mode, unified API) and `test/python/fe_api/test_discrete_grouped_gemm_dswiglu.py` (discrete mode).
+For usage examples, see test cases in `test/python/fe_api/grouped_gemm/test_grouped_gemm_dglu.py` (dense mode, unified API) and `test/python/fe_api/grouped_gemm/test_discrete_grouped_gemm_dswiglu.py` (discrete mode).
