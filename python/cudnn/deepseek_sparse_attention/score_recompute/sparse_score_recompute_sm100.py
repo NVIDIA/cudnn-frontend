@@ -249,7 +249,8 @@ class SparseScoreRecomputeSm100:
 
         tiled_mma_qk = _make_trivial_tiled_mma(
             self.q_dtype,
-            tcgen05.OperandMajorMode.K,
+            self.q_dtype,
+            cute.nvgpu.OperandMajorMode.K,
             self.q_major_mode,
             self.qk_acc_dtype,
             cta_group,

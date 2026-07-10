@@ -17,13 +17,22 @@ import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass._mlir.dialects import llvm
-from cutlass.utils.distributed import atomicAdd
+from cutlass.cutlass_dsl import dsl_user_op
 
 from .block_scan import block_prefix_sum_kernel, fence_acq_rel_cta
 
 """
 top-k varlen utils. could be used by prefill and decode phase.
 """
+
+
+@dsl_user_op
+def atomicAdd(dst_ptr: cute.Pointer, val: cutlass.Int32, *, loc=None, ip=None) -> cutlass.Int32:
+    """System-scope relaxed atomic add (drop-in for the deprecated
+    ``cutlass.utils.distributed.atomicAdd``)."""
+    return cute.arch.atomic_add(
+        dst_ptr.llvm_ptr, val, sem="relaxed", scope="sys", loc=loc, ip=ip
+    )
 
 
 def half_as_ushort(half_val):

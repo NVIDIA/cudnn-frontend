@@ -217,6 +217,7 @@ class IndexerForwardSm100:
 
         tiled_mma_qk = _make_trivial_tiled_mma(
             self.q_dtype,
+            self.q_dtype,
             self.k_major_mode,  # A operand major mode (K)
             self.q_major_mode,  # B operand major mode (Q)
             self.qk_acc_dtype,

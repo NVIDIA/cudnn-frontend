@@ -272,6 +272,7 @@ class BlockScaledMoEGroupedGemmQuantBwdKernel:
 
         tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
             self.a_dtype,
+            self.a_dtype,
             self.a_major_mode,
             self.b_major_mode,
             self.sf_dtype,
@@ -280,6 +281,7 @@ class BlockScaledMoEGroupedGemmQuantBwdKernel:
             self.mma_inst_shape_mn,
         )
         tiled_mma_sfb = sm100_utils.make_blockscaled_trivial_tiled_mma(
+            self.a_dtype,
             self.a_dtype,
             self.a_major_mode,
             self.b_major_mode,
@@ -707,6 +709,7 @@ class BlockScaledMoEGroupedGemmQuantBwdKernel:
         # ---- TMA atoms ----
         tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
             self.a_dtype,
+            self.a_dtype,
             self.a_major_mode,
             self.b_major_mode,
             self.sf_dtype,
@@ -715,6 +718,7 @@ class BlockScaledMoEGroupedGemmQuantBwdKernel:
             self.mma_inst_shape_mn,
         )
         tiled_mma_sfb = sm100_utils.make_blockscaled_trivial_tiled_mma(
+            self.a_dtype,
             self.a_dtype,
             self.a_major_mode,
             self.b_major_mode,

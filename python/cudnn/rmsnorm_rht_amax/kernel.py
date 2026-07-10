@@ -191,7 +191,7 @@ class RMSNormRHTAmaxKernel:
             w = t_xr_w.load().to(Float32)
             y = x * rstd * w
 
-            for elem_idx in cutlass.range_constexpr(cfg.ept):
+            for elem_idx in cutlass.range(cfg.ept, unroll_full=True):
                 reg[elem_idx] = y[elem_idx]
 
             for block_idx in cutlass.range_constexpr(cfg.num_vec_blocks):
@@ -208,14 +208,14 @@ class RMSNormRHTAmaxKernel:
             for cross_stage in cutlass.range_constexpr(cfg.num_cross_stages):
                 xor_mask = cutlass.Int32(1 << cross_stage)
                 is_lower = (tid & xor_mask) == cutlass.Int32(0)
-                for elem_idx in cutlass.range_constexpr(cfg.ept):
+                for elem_idx in cutlass.range(cfg.ept, unroll_full=True):
                     partner = shuffle_sync_bfly(reg[elem_idx], offset=xor_mask)
                     if is_lower:
                         reg[elem_idx] = reg[elem_idx] + partner
                     else:
                         reg[elem_idx] = partner - reg[elem_idx]
 
-            for elem_idx in cutlass.range_constexpr(cfg.ept):
+            for elem_idx in cutlass.range(cfg.ept, unroll_full=True):
                 scaled = reg[elem_idx] * inv_sqrt_had
                 abs_val = fabs_f32(scaled)
                 running_max = fmax_f32(running_max, abs_val)

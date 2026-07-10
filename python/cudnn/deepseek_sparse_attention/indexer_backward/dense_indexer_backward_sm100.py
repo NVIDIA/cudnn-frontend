@@ -488,24 +488,27 @@ class DenseIndexerBackward2QGemmSm100:
         # All GEMMs: SS path
         tmma1 = _make_trivial_tiled_mma(
             self.q_dtype,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.K,
+            self.q_dtype,
+            cute.nvgpu.OperandMajorMode.K,
+            cute.nvgpu.OperandMajorMode.K,
             self.acc_dtype,
             cta_group,
             self.gemm1_tiler[:2],
         )
         tmma2 = _make_trivial_tiled_mma(
             self.q_dtype,
-            tcgen05.OperandMajorMode.MN,
-            tcgen05.OperandMajorMode.MN,
+            self.q_dtype,
+            cute.nvgpu.OperandMajorMode.MN,
+            cute.nvgpu.OperandMajorMode.MN,
             self.acc_dtype,
             cta_group,
             self.gemm2_tiler[:2],
         )
         tmma3 = _make_trivial_tiled_mma(
             self.q_dtype,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.MN,
+            self.q_dtype,
+            cute.nvgpu.OperandMajorMode.K,
+            cute.nvgpu.OperandMajorMode.MN,
             self.acc_dtype,
             cta_group,
             self.gemm3_tiler[:2],

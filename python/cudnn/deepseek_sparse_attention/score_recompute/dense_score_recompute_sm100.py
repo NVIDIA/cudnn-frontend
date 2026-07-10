@@ -238,6 +238,7 @@ class DenseScoreRecomputeSm100:
 
         tiled_mma_qk = _make_trivial_tiled_mma(
             self.q_dtype,
+            self.q_dtype,
             self.k_major_mode,
             self.q_major_mode,
             self.qk_acc_dtype,
