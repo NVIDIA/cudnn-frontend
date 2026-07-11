@@ -15,9 +15,7 @@ body:
       label: Before submitting
       options:
         - label: I searched existing issues and did not find a duplicate.
-          required: true
         - label: I reduced the problem to the smallest reproducer I can provide.
-          required: true
 
   - type: dropdown
     id: area
@@ -32,9 +30,6 @@ body:
         - Documentation or samples
         - Benchmarks or performance
         - Not sure
-    validations:
-      required: true
-
   - type: textarea
     id: description
     attributes:
@@ -59,24 +54,18 @@ body:
     id: expected
     attributes:
       label: Expected behavior
-    validations:
-      required: true
 
   - type: textarea
     id: actual
     attributes:
       label: Actual behavior
       description: Include the exact error or incorrect result.
-    validations:
-      required: true
 
   - type: input
     id: frontend-version
     attributes:
       label: cuDNN Frontend version or commit
       placeholder: v1.26.0 or abc1234
-    validations:
-      required: true
 
   - type: input
     id: backend-version
@@ -97,9 +86,6 @@ body:
         Compiler: GCC 13.3
         Python: 3.12
         Framework: PyTorch 2.X
-    validations:
-      required: true
-
   - type: input
     id: last-known-good
     attributes:

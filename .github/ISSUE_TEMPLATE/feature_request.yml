@@ -15,9 +15,7 @@ body:
       label: Before submitting
       options:
         - label: I searched existing issues and did not find a duplicate.
-          required: true
         - label: I am describing a concrete problem or use case.
-          required: true
 
   - type: dropdown
     id: area
@@ -32,9 +30,6 @@ body:
         - Documentation or samples
         - Benchmarks or performance
         - Not sure
-    validations:
-      required: true
-
   - type: textarea
     id: problem
     attributes:
@@ -48,24 +43,18 @@ body:
     attributes:
       label: Proposed solution
       description: Describe the API, behavior, or workflow you want.
-    validations:
-      required: true
 
   - type: textarea
     id: value
     attributes:
       label: Why this matters
       description: Who benefits, and what outcome does this unlock?
-    validations:
-      required: true
 
   - type: textarea
     id: scope
     attributes:
       label: Smallest useful scope
       description: Describe the narrowest first version that would solve the problem.
-    validations:
-      required: true
 
   - type: textarea
     id: constraints
