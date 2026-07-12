@@ -1631,6 +1631,7 @@ class Graph : public ICudnn, public INode {
         CUDNN_FE_LOG_BANNER(" SERIALIZE PLAN  ");
 #ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
         json j;
+        j["json_version"] = GRAPH_JSON_VERSION;
         // Optionally serialize the graph structure (nodes/tensors).
         if (serialize_structure) {
             serialize(j);
@@ -1760,15 +1761,18 @@ class Graph : public ICudnn, public INode {
         deserialized_workspace_modifications.clear();
         tensors_to_dump.clear();
 
-        gid = j["gid"].get<uint64_t>();
+        auto const has_graph_structure = j.contains("nodes") || j.contains("tensors");
+        if (has_graph_structure) {
+            gid = j["gid"].get<uint64_t>();
 
-        RETURN_CUDNN_FRONTEND_ERROR_IF(!j.contains("tensors") || !j["tensors"].is_array(),
-                                       error_code_t::UNSUPPORTED_GRAPH_FORMAT,
-                                       "Serialized graph tensors must be a list.");
-        for (const auto &tensor_info : j["tensors"]) {
-            auto tensor_attributes = std::make_shared<Tensor_attributes>();
-            from_json(tensor_info, *tensor_attributes);
-            deserialized_tensor_properties.insert(tensor_attributes);
+            RETURN_CUDNN_FRONTEND_ERROR_IF(!j.contains("tensors") || !j["tensors"].is_array(),
+                                           error_code_t::UNSUPPORTED_GRAPH_FORMAT,
+                                           "Serialized graph tensors must be a list.");
+            for (const auto &tensor_info : j["tensors"]) {
+                auto tensor_attributes = std::make_shared<Tensor_attributes>();
+                from_json(tensor_info, *tensor_attributes);
+                deserialized_tensor_properties.insert(tensor_attributes);
+            }
         }
 
         RETURN_CUDNN_FRONTEND_ERROR_IF(
@@ -2529,12 +2533,12 @@ class Graph : public ICudnn, public INode {
 #ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
     error_t
     deserialize(const json &j, bool const enforce_precompiled = false) {
-        CHECK_CUDNN_FRONTEND_ERROR(check_graph_json_version(j));
-
         RETURN_CUDNN_FRONTEND_ERROR_IF(
             enforce_precompiled,
             error_code_t::GRAPH_NOT_SUPPORTED,
             "enforce_precompiled requires plan serialization; JSON deserialization reconstructs the graph");
+
+        CHECK_CUDNN_FRONTEND_ERROR(check_graph_json_version(j));
 
         if (j.contains("context")) {
             const auto &j_context = j["context"];

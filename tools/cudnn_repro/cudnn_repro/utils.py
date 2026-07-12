@@ -169,8 +169,20 @@ def has_ragged_offset_inputs(inputs: dict) -> bool:
     return any(name in inputs for name in RAGGED_OFFSET_INPUTS)
 
 
+def ragged_offset_entry(tensors: list, *entries: Optional[dict]) -> Optional[dict]:
+    for entry in entries:
+        if entry is None:
+            continue
+        tensor = tensor_entry(tensors, entry.get("ragged_offset_tid"))
+        if tensor is not None:
+            return tensor
+    return None
+
+
 def is_ragged_payload(inputs: dict, entries: tuple[Optional[dict], ...], payload: dict) -> bool:
     if has_ragged_offset_inputs(inputs):
+        return True
+    if any(entry is not None and entry.get("ragged_offset_tid") is not None for entry in entries):
         return True
     repro_metadata = payload.get("repro_metadata", {})
     if repro_metadata.get("ragged_offset_q") or repro_metadata.get("ragged_offset_kv"):

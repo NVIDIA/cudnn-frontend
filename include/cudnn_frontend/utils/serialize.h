@@ -606,7 +606,10 @@ to_json(nlohmann::json& j, const Tensor_attributes& ta) {
         j["name"] = ta.name;
     }
     if (ta.ragged_offset) {
-        j["ragged_offset_uid"] = ta.ragged_offset->get_uid();
+        j["ragged_offset_tid"] = ta.ragged_offset->get_tid();
+        if (ta.ragged_offset->has_uid()) {
+            j["ragged_offset_uid"] = ta.ragged_offset->get_uid();
+        }
         if (!ta.ragged_offset->get_name().empty()) {
             j["ragged_offset_name"] = ta.ragged_offset->get_name();
         }
@@ -632,10 +635,13 @@ from_json(const nlohmann::json& j, Tensor_attributes& ta) {
     if (ta.is_pass_by_value && !j["pass_by_value"].is_null()) {
         ta.pass_by_value = j.at("pass_by_value");
     }
-    if (j.contains("ragged_offset_uid")) {
-        auto ragged_offset          = std::make_shared<Tensor_attributes>();
-        ragged_offset->uid          = j.at("ragged_offset_uid").get<Tensor_attributes::uid_t>();
-        ragged_offset->uid_assigned = true;
+    if (j.contains("ragged_offset_tid")) {
+        auto ragged_offset = std::make_shared<Tensor_attributes>();
+        ragged_offset->tid = j.at("ragged_offset_tid").get<Tensor_attributes::tid_t>();
+        if (j.contains("ragged_offset_uid")) {
+            ragged_offset->uid          = j.at("ragged_offset_uid").get<Tensor_attributes::uid_t>();
+            ragged_offset->uid_assigned = true;
+        }
         if (j.contains("ragged_offset_name")) {
             ragged_offset->name = j.at("ragged_offset_name").get<std::string>();
         }

@@ -220,8 +220,8 @@ TEST_CASE("XLA pointwise selected plan behavior notes with serialization", "[gra
   },
   "cudnn_backend_version": "9.30.0",
   "cudnn_frontend_version": 12500,
-  "graph_uid": 12,
-  "json_version": "1.0",
+  "gid": 12,
+  "json_version": "2.0",
   "nodes": [
     {
       "axis": null,
@@ -239,8 +239,8 @@ TEST_CASE("XLA pointwise selected plan behavior notes with serialization", "[gra
       "tag": "POINTWISE"
     }
   ],
-  "tensors": {
-    "1": {
+  "tensors": [
+    {
       "data_type": "HALF",
       "dim": [2, 240, 160],
       "is_pass_by_value": false,
@@ -249,10 +249,11 @@ TEST_CASE("XLA pointwise selected plan behavior notes with serialization", "[gra
       "pass_by_value": null,
       "reordering_type": "NONE",
       "stride": [38400, 160, 1],
+      "tid": 1,
       "uid": 1,
       "uid_assigned": true
     },
-    "2": {
+    {
       "data_type": "HALF",
       "dim": [2, 240, 160],
       "is_pass_by_value": false,
@@ -261,10 +262,11 @@ TEST_CASE("XLA pointwise selected plan behavior notes with serialization", "[gra
       "pass_by_value": null,
       "reordering_type": "NONE",
       "stride": [38400, 160, 1],
+      "tid": 2,
       "uid": 2,
       "uid_assigned": true
     }
-  }
+  ]
 }
 )json");
 

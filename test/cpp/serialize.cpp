@@ -712,6 +712,9 @@ TEST_CASE("serialize_structure flag controls structural payload", "[graph][seria
     // Default emits the structure; opting out drops it and shrinks the blob.
     REQUIRE(j_with.contains("nodes"));
     REQUIRE_FALSE(j_without.contains("nodes"));
+    REQUIRE(j_without.contains("json_version"));
+    REQUIRE_FALSE(j_without.contains("gid"));
+    REQUIRE_FALSE(j_without.contains("tensors"));
     REQUIRE(without_structure.size() < with_structure.size());
 
     // Both remain reloadable through the plan path with identical variant packs.
@@ -723,6 +726,36 @@ TEST_CASE("serialize_structure flag controls structural payload", "[graph][seria
     }
 
     cudnnDestroy(handle);
+}
+
+TEST_CASE("Graph JSON keeps tid independent from uid", "[graph][serialize]") {
+    namespace fe = cudnn_frontend;
+
+    fe::graph::Graph graph;
+    auto A = graph.tensor(
+        fe::graph::Tensor_attributes().set_name("duplicate").set_dim({1, 2, 3}).set_stride({6, 3, 1}).set_uid(100));
+    auto B =
+        graph.tensor(fe::graph::Tensor_attributes().set_name("duplicate").set_dim({1, 3, 4}).set_stride({12, 4, 1}));
+    auto C = graph.matmul(A, B, fe::graph::Matmul_attributes().set_name("matmul"));
+    C->set_output(true).set_dim({1, 2, 4}).set_stride({8, 4, 1}).set_uid(42);
+
+    json serialized = graph;
+    REQUIRE(serialized["tensors"].size() == 3);
+    REQUIRE(serialized["nodes"][0]["inputs"]["A"] == A->get_tid());
+    REQUIRE(serialized["nodes"][0]["inputs"]["B"] == B->get_tid());
+    REQUIRE(A->get_tid() != A->get_uid());
+
+    auto tensor_by_tid = [&serialized](int64_t tid) -> json const & {
+        for (auto const &tensor : serialized["tensors"]) {
+            if (tensor["tid"] == tid) {
+                return tensor;
+            }
+        }
+        throw std::runtime_error("missing tensor tid");
+    };
+    REQUIRE(tensor_by_tid(A->get_tid())["uid"] == 100);
+    REQUIRE(tensor_by_tid(B->get_tid())["uid_assigned"] == false);
+    REQUIRE(tensor_by_tid(C->get_tid())["uid"] == 42);
 }
 
 // A graph loaded via deserialize(handle, ...) might have no node subtree,

@@ -42,7 +42,7 @@ def _normalize_tensor_entry(entry):
         "is_pass_by_value",
         "pass_by_value",
         "reordering_type",
-        "ragged_offset_uid",
+        "ragged_offset_tid",
     ):
         if key in entry:
             normalized[key] = entry[key]
