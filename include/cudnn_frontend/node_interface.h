@@ -1,5 +1,6 @@
 #pragma once
 
+#include <map>
 #include <memory>
 #include <vector>
 #include <unordered_map>
@@ -96,7 +97,8 @@ class INode {
     };
 
     virtual error_t
-    collect_tensors_to_dump_node(std::vector<std::pair<std::shared_ptr<Tensor_attributes>, char>>&) const {
+    collect_tensors_to_dump_node(
+        std::map<Tensor_attributes::uid_t, std::pair<std::shared_ptr<Tensor_attributes>, char>>&) const {
         return {error_code_t::OK, ""};
     };
 
@@ -351,7 +353,8 @@ class INode {
 
     error_t
     collect_tensors_to_dump_subtree(
-        std::vector<std::pair<std::shared_ptr<Tensor_attributes>, char>>& tensors_to_dump) const {
+        std::map<Tensor_attributes::uid_t, std::pair<std::shared_ptr<Tensor_attributes>, char>>& tensors_to_dump)
+        const {
         CHECK_CUDNN_FRONTEND_ERROR(collect_tensors_to_dump_node(tensors_to_dump));
         for (auto const& sub_node : sub_nodes) {
             CHECK_CUDNN_FRONTEND_ERROR(sub_node->collect_tensors_to_dump_subtree(tensors_to_dump));

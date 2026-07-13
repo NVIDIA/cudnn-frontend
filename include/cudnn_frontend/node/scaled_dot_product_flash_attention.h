@@ -522,15 +522,13 @@ class SDPANodeBase : public NodeCRTP<DerivedT> {
 
     error_t
     collect_tensors_to_dump_node(
-        std::vector<std::pair<std::shared_ptr<Tensor_attributes>, char>>& tensors_to_dump) const override final {
-        std::unordered_set<Tensor_attributes::uid_t> seen_uids;
-        auto add_tensor = [&tensors_to_dump, &seen_uids](std::shared_ptr<Tensor_attributes> const& tensor) {
+        std::map<Tensor_attributes::uid_t, std::pair<std::shared_ptr<Tensor_attributes>, char>>& tensors_to_dump)
+        const override final {
+        auto add_tensor = [&tensors_to_dump](std::shared_ptr<Tensor_attributes> const& tensor) {
             if (tensor == nullptr) {
                 return;
             }
-            if (seen_uids.insert(tensor->get_uid()).second) {
-                tensors_to_dump.emplace_back(tensor, 'd');
-            }
+            tensors_to_dump.emplace(tensor->get_uid(), std::make_pair(tensor, 'd'));
         };
 
         auto const seq_len_q_it = attributes.inputs.find(input_names::SEQ_LEN_Q);
@@ -2184,11 +2182,11 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
 
     error_t
     collect_tensors_to_dump_node(
-        std::vector<std::pair<std::shared_ptr<Tensor_attributes>, char>>& tensors_to_dump) const override final {
-        std::unordered_set<Tensor_attributes::uid_t> seen_uids;
-        auto add_tensor = [&tensors_to_dump, &seen_uids](std::shared_ptr<Tensor_attributes> const& tensor) {
-            if (tensor != nullptr && seen_uids.insert(tensor->get_uid()).second) {
-                tensors_to_dump.emplace_back(tensor, 'd');
+        std::map<Tensor_attributes::uid_t, std::pair<std::shared_ptr<Tensor_attributes>, char>>& tensors_to_dump)
+        const override final {
+        auto add_tensor = [&tensors_to_dump](std::shared_ptr<Tensor_attributes> const& tensor) {
+            if (tensor != nullptr) {
+                tensors_to_dump.emplace(tensor->get_uid(), std::make_pair(tensor, 'd'));
             }
         };
         auto add_input = [&](input_names name) {
