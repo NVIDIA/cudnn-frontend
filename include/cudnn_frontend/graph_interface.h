@@ -146,7 +146,8 @@ class Graph : public ICudnn, public INode {
     }
 
     error_t
-    log_tensor_dumps(cudnnHandle_t handle, std::unordered_map<int64_t, void *> const &tensor_uid_to_pointer_map) const {
+    log_tensors_to_dump_(cudnnHandle_t handle,
+                         std::unordered_map<int64_t, void *> const &tensor_uid_to_pointer_map) const {
         if (!isLoggingTensorDumpEnabled()) {
             return {error_code_t::OK, ""};
         }
