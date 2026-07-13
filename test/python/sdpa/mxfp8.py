@@ -529,10 +529,11 @@ def generate_graph_bwd(b, h_q, h_k, h_v,
 
     return graph_bwd
 
-def exec_sdpa_mxfp8(cfg, request, cudnn_handle, perf):
+def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
     """Execute MXFP8 SDPA test."""
     if request.config.option.dryrun:
         pytest.skip("dry run mode")
+    perf = request.config.getoption("--perf")
 
     cudnn_version = LooseVersion(cudnn.backend_version_string())
 
