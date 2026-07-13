@@ -491,7 +491,7 @@ def test_output_layout_contract():
     g.build([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
 
     lowered = json.loads(str(g._lowered_graph))
-    (c_entry,) = [t for t in lowered["tensors"].values() if t["uid"] == C.uid]
+    (c_entry,) = [t for t in lowered["tensors"] if t["uid"] == C.uid]
     assert c_entry["stride"] == [M * N, 1, M]  # user layout pushed verbatim
 
     a = torch.randn(1, M, K, device="cuda", dtype=torch.float16)
@@ -515,5 +515,5 @@ def test_output_layout_contract():
     g2.build([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
 
     lowered2 = json.loads(str(g2._lowered_graph))
-    (y_entry,) = [t for t in lowered2["tensors"].values() if t["uid"] == Y.uid]
+    (y_entry,) = [t for t in lowered2["tensors"] if t["uid"] == Y.uid]
     assert y_entry["stride"][1] == 1, y_entry["stride"]  # channels-last kept, not row-major

@@ -52,7 +52,8 @@ class Graph : public ICudnn, public INode {
 #ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
     static error_t
     check_graph_json_version(json const &j) {
-        RETURN_CUDNN_FRONTEND_ERROR_IF(j.value("json_version", std::string{}) != GRAPH_JSON_VERSION,
+        RETURN_CUDNN_FRONTEND_ERROR_IF(!j.contains("json_version") || !j["json_version"].is_string() ||
+                                           j["json_version"].get<std::string>() != GRAPH_JSON_VERSION,
                                        error_code_t::UNSUPPORTED_GRAPH_FORMAT,
                                        "Unsupported graph JSON version. Expected " + std::string(GRAPH_JSON_VERSION));
         return {error_code_t::OK, ""};
@@ -1789,7 +1790,10 @@ class Graph : public ICudnn, public INode {
         if (has_graph_structure) {
             gid = j["gid"].get<uint64_t>();
 
-            for (const auto &tensor_info : j.at("tensors")) {
+            RETURN_CUDNN_FRONTEND_ERROR_IF(!j.contains("tensors") || !j["tensors"].is_array(),
+                                           error_code_t::UNSUPPORTED_GRAPH_FORMAT,
+                                           "Serialized graph tensors must be a list.");
+            for (const auto &tensor_info : j["tensors"]) {
                 auto tensor_attributes = std::make_shared<Tensor_attributes>();
                 from_json(tensor_info, *tensor_attributes);
                 deserialized_tensor_properties.insert(tensor_attributes);
@@ -2559,12 +2563,12 @@ class Graph : public ICudnn, public INode {
 #ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
     error_t
     deserialize(const json &j, bool const enforce_precompiled = false) {
-        CHECK_CUDNN_FRONTEND_ERROR(check_graph_json_version(j));
-
         RETURN_CUDNN_FRONTEND_ERROR_IF(
             enforce_precompiled,
             error_code_t::GRAPH_NOT_SUPPORTED,
             "enforce_precompiled requires plan serialization; JSON deserialization reconstructs the graph");
+
+        CHECK_CUDNN_FRONTEND_ERROR(check_graph_json_version(j));
 
         if (j.contains("context")) {
             const auto &j_context = j["context"];
@@ -2593,9 +2597,15 @@ class Graph : public ICudnn, public INode {
 
         gid = j["gid"].get<uint64_t>();
 
+        RETURN_CUDNN_FRONTEND_ERROR_IF(!j.contains("tensors") || !j["tensors"].is_array(),
+                                       error_code_t::UNSUPPORTED_GRAPH_FORMAT,
+                                       "Serialized graph tensors must be a list.");
         std::map<Tensor_attributes::uid_t, json> tensor_table;
-        for (auto const &tensor_info : j.at("tensors")) {
-            tensor_table[tensor_info.at("uid").get<Tensor_attributes::uid_t>()] = tensor_info;
+        for (auto const &tensor_info : j["tensors"]) {
+            auto tensor_uid = tensor_info.at("uid").get<Tensor_attributes::uid_t>();
+            RETURN_CUDNN_FRONTEND_ERROR_IF(!tensor_table.emplace(tensor_uid, tensor_info).second,
+                                           error_code_t::UNSUPPORTED_GRAPH_FORMAT,
+                                           "Serialized graph has duplicate tensor uid " + std::to_string(tensor_uid));
         }
 
         std::map<Tensor_attributes::uid_t, std::shared_ptr<Tensor_attributes>> created_tensors;
@@ -2618,12 +2628,24 @@ class Graph : public ICudnn, public INode {
             tensor->set_ragged_offset(created_tensor->second);
         }
 
-        auto fill_tensor_refs = [&tensor_table](json const &tensor_refs, json &tensor_infos) -> error_t {
+        auto resolve_tensor_ref = [&tensor_table](json const &tensor_ref, json &tensor_info) -> error_t {
+            auto tensor_uid  = tensor_ref.get<Tensor_attributes::uid_t>();
+            auto tensor_iter = tensor_table.find(tensor_uid);
+            RETURN_CUDNN_FRONTEND_ERROR_IF(tensor_iter == tensor_table.end(),
+                                           error_code_t::UNSUPPORTED_GRAPH_FORMAT,
+                                           "Serialized graph is missing tensor for uid " + std::to_string(tensor_uid));
+
+            tensor_info = tensor_iter->second;
+            return {error_code_t::OK, ""};
+        };
+        auto fill_tensor_refs = [&resolve_tensor_ref](json const &tensor_refs, json &tensor_infos) -> error_t {
             if (!tensor_refs.is_object()) {
                 return {error_code_t::OK, ""};
             }
             for (auto &[port_name, tensor_ref] : tensor_refs.items()) {
-                tensor_infos.push_back({port_name, tensor_table.at(tensor_ref.get<Tensor_attributes::uid_t>())});
+                json tensor_info;
+                CHECK_CUDNN_FRONTEND_ERROR(resolve_tensor_ref(tensor_ref, tensor_info));
+                tensor_infos.push_back({port_name, tensor_info});
             }
             return {error_code_t::OK, ""};
         };
