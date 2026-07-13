@@ -4,6 +4,7 @@
 # Selected helpers are adapted from quack-kernels 0.4.1 (Apache-2.0) and
 # maintained locally so BSA does not require Quack at runtime.
 
+import contextlib
 from typing import Callable, Optional, Tuple, Type
 
 import cutlass
@@ -15,6 +16,31 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass._mlir.dialects import llvm
 import cutlass.pipeline
+
+
+def _cute_dsl_bulk_copy_self_elects() -> bool:
+    try:
+        return tuple(int(p) for p in cutlass.__version__.split(".")[:2]) >= (4, 6)
+    except (AttributeError, ValueError):
+        return True
+
+
+_BULK_COPY_SELF_ELECTS = _cute_dsl_bulk_copy_self_elects()
+
+
+def bulk_copy_elect_one():
+    """elect_one() guard for bulk-async copies (cpasync.CopyBulk*, TMA atoms).
+
+    On cute-dsl <= 4.5.x the bulk copy does not elect a lane internally, so the
+    caller must wrap it in cute.arch.elect_one() to issue it once per warp.
+    On cute-dsl >= 4.6.0 cute.copy elects internally via a warp-collective
+    elect; an outer elect_one() leaves only one lane active at that inner
+    collective and deadlocks the warp. Use this guard instead of a bare
+    elect_one() around such copies.
+    """
+    if _BULK_COPY_SELF_ELECTS:
+        return contextlib.nullcontext()
+    return cute.arch.elect_one()
 
 
 @dsl_user_op
