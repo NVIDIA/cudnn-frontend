@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <mutex>
 #include <unordered_map>
@@ -61,7 +62,7 @@ class Graph : public ICudnn, public INode {
     mutable std::unordered_map<uid_t, std::tuple<int64_t, int64_t, std::vector<float>>> cached_workspace_modifications;
 
     // char: 'x'=hex, 'd'=decimal, 'b'=base64
-    std::map<Tensor_attributes::uid_t, std::pair<std::shared_ptr<Tensor_attributes>, char>> tensors_to_dump;
+    std::vector<std::pair<std::shared_ptr<Tensor_attributes>, char>> tensors_to_dump;
 
     error_t
     get_pre_assigned_uids(std::unordered_set<Tensor_attributes::uid_t> &used_uids) {
@@ -105,9 +106,8 @@ class Graph : public ICudnn, public INode {
 
         cudaStream_t stream;
         _CUDNN_CHECK_CUDNN_ERROR(detail::get_stream(handle, &stream));
-        for (auto const &[uid, tensor_and_format] : tensors_to_dump) {
-            auto const &[tensor, fmt] = tensor_and_format;
-            auto it                   = tensor_uid_to_pointer_map.find(uid);
+        for (auto const &[tensor, fmt] : tensors_to_dump) {
+            auto it = tensor_uid_to_pointer_map.find(tensor->get_uid());
             if (it != tensor_uid_to_pointer_map.end()) {
                 auto const &dims    = tensor->get_dim();
                 size_t num_elements = 1;
@@ -976,6 +976,14 @@ class Graph : public ICudnn, public INode {
         CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensors_subtree(uid_to_tensors, start_uid, used_uids));
         tensors_to_dump.clear();
         CHECK_CUDNN_FRONTEND_ERROR(collect_tensors_to_dump_subtree(tensors_to_dump));
+        std::stable_sort(tensors_to_dump.begin(), tensors_to_dump.end(), [](auto const &lhs, auto const &rhs) {
+            return lhs.first->get_uid() < rhs.first->get_uid();
+        });
+        tensors_to_dump.erase(
+            std::unique(tensors_to_dump.begin(),
+                        tensors_to_dump.end(),
+                        [](auto const &lhs, auto const &rhs) { return lhs.first->get_uid() == rhs.first->get_uid(); }),
+            tensors_to_dump.end());
 
         CUDNN_FE_LOG_BANNER("  3/4 CREATE OPERATIONS  ");
         // INode keeps track of all uids that an operation graph uses.
@@ -1664,8 +1672,8 @@ class Graph : public ICudnn, public INode {
         j["fe_workspace_size"] = fe_workspace_size;
 
         std::vector<std::pair<uid_t, char>> tensors_to_dump_uids;
-        for (auto const &[uid, tensor_and_format] : tensors_to_dump) {
-            tensors_to_dump_uids.emplace_back(uid, tensor_and_format.second);
+        for (auto const &[tensor, fmt] : tensors_to_dump) {
+            tensors_to_dump_uids.emplace_back(tensor->get_uid(), fmt);
         }
         j["tensors_to_dump"] = tensors_to_dump_uids;
 
@@ -1802,7 +1810,7 @@ class Graph : public ICudnn, public INode {
             for (auto const &[uid, fmt] : dump_uids) {
                 for (auto const &tensor : deserialized_tensor_properties) {
                     if (tensor->get_uid() == uid) {
-                        tensors_to_dump.emplace(uid, std::make_pair(tensor, fmt));
+                        tensors_to_dump.emplace_back(tensor, fmt);
                         break;
                     }
                 }
