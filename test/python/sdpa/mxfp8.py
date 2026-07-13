@@ -41,15 +41,14 @@ def quantize_mxfp8_compact(tensor_2d, quantizer):
 
     chunk_rows = MXFP8_QUANTIZER_MAX_ROWS // 128 * 128
     results = [quantizer(chunk) for chunk in tensor_2d.split(chunk_rows, dim=0)]
-    metadata = [result.get_metadata() for result in results]
     return MXFP8Tensor(
         shape=tensor_2d.shape,
         dtype=tensor_2d.dtype,
         fp8_dtype=quantizer.dtype,
-        rowwise_data=torch.cat([item["rowwise_data"] for item in metadata], dim=0),
-        rowwise_scale_inv=torch.cat([item["rowwise_scale_inv"] for item in metadata], dim=0),
-        columnwise_data=torch.cat([item["columnwise_data"] for item in metadata], dim=0),
-        columnwise_scale_inv=torch.cat([item["columnwise_scale_inv"] for item in metadata], dim=0),
+        rowwise_data=torch.cat([result._rowwise_data for result in results], dim=0),
+        rowwise_scale_inv=torch.cat([result._rowwise_scale_inv for result in results], dim=0),
+        columnwise_data=torch.cat([result._columnwise_data for result in results], dim=0),
+        columnwise_scale_inv=torch.cat([result._columnwise_scale_inv for result in results], dim=0),
         quantizer=quantizer,
         requires_grad=False,
         with_gemm_swizzled_scales=False,
@@ -190,37 +189,35 @@ def quantize_to_mxfp8(
     # without swizzle
     quantizer = MXFP8Quantizer(fp8_dtype=te_dtype, rowwise=True, columnwise=True)
     mxfp8_result = quantize_mxfp8_compact(tensor_2d, quantizer)
-    metadata = mxfp8_result.get_metadata()
     # --- Rowwise results (quantized along D dimension) ---
-    fp8_data_d_flat = metadata["rowwise_data"]
+    fp8_data_d_flat = mxfp8_result._rowwise_data
     fp8_data_d = fp8_data_d_flat.reshape(l, s_padded, d_padded)[:, :s, :d].contiguous()
     fp8_data_d = fp8_data_d.view(fp8_dtype).reshape(b, h, s, d)
 
     sf_d_ref = None
     if with_ref:
-        scale_inv_d = metadata["rowwise_scale_inv"]
+        scale_inv_d = mxfp8_result._rowwise_scale_inv
         scale_inv_d_f32 = scale_inv_d.view(torch.float8_e8m0fnu).float()
         sf_d_ref = torch.repeat_interleave(scale_inv_d_f32.reshape(l, s_padded, d_scale_padded), repeats=32, dim=2)[:, :s, :d].contiguous()
 
     # --- Columnwise results (quantized along S dimension) ---
-    fp8_data_s_flat = metadata["columnwise_data"]
+    fp8_data_s_flat = mxfp8_result._columnwise_data
     fp8_data_s = fp8_data_s_flat.reshape(l, s_padded, d_padded)[:, :s, :d].contiguous()
     fp8_data_s = fp8_data_s.view(fp8_dtype).reshape(b, h, s, d)
 
     sf_s_ref = None
     if with_ref:
-        scale_inv_s = metadata["columnwise_scale_inv"]
+        scale_inv_s = mxfp8_result._columnwise_scale_inv
         scale_inv_s_f32 = scale_inv_s.view(torch.float8_e8m0fnu).float()
         sf_s_ref = torch.repeat_interleave(scale_inv_s_f32.reshape(l, s_scale_padded, d_padded), repeats=32, dim=1)[:, :s, :d].contiguous()
 
     # with swizzle
     tex.swizzle_scales_for_gemm_(mxfp8_result)
-    metadata = mxfp8_result.get_metadata()
     # --- Rowwise results (quantized along D dimension) ---
-    sf_d_swizzle = metadata["rowwise_scale_inv"]
+    sf_d_swizzle = mxfp8_result._rowwise_scale_inv
 
     # --- Columnwise results (quantized along S dimension) ---
-    sf_s_swizzle = metadata["columnwise_scale_inv"]
+    sf_s_swizzle = mxfp8_result._columnwise_scale_inv
 
     return fp8_data_d, sf_d_ref, sf_d_swizzle, fp8_data_s, sf_s_ref, sf_s_swizzle
 
