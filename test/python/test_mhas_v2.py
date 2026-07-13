@@ -966,7 +966,7 @@ def test_sdpa_mxfp8_fwd_L0(env_info, test_no, request, cudnn_handle):
     if request.node.name in test.blocked_tests:
         pytest.skip(f"blocked test: {request.node.name}")
     try:
-        exec_sdpa_mxfp8(test.cfg, request, cudnn_handle)
+        exec_sdpa_mxfp8(test.cfg, request, cudnn_handle, request.config.getoption("--perf"))
     finally:
         if "CUDNN_UNFUSE_FMA" in os.environ:
             del os.environ["CUDNN_UNFUSE_FMA"]
@@ -1015,25 +1015,14 @@ def test_sdpa_mxfp8_bwd_L0(env_info, test_no, request, cudnn_handle):
     if request.node.name in test.blocked_tests:
         pytest.skip(f"blocked test: {request.node.name}")
     try:
-        exec_sdpa_mxfp8(test.cfg, request, cudnn_handle)
+        exec_sdpa_mxfp8(test.cfg, request, cudnn_handle, request.config.getoption("--perf"))
     finally:
         if "CUDNN_RESCALE_THRESHOLD" in os.environ:
             del os.environ["CUDNN_RESCALE_THRESHOLD"]
 
 
 @pytest.mark.L0
-def test_sdpa_mxfp8_perf_L0(monkeypatch, request, cudnn_handle):
-    def fail_reference(*args, **kwargs):
-        raise AssertionError("reference called in perf mode")
-
-    getoption = request.config.getoption
-    def getoption_perf(name, *args, **kwargs):
-        return True if name == "--perf" else getoption(name, *args, **kwargs)
-
-    monkeypatch.setattr(request.config, "getoption", getoption_perf)
-    monkeypatch.setattr("sdpa.mxfp8.compute_ref", fail_reference)
-    monkeypatch.setattr("sdpa.mxfp8.compute_ref_backward", fail_reference)
-
+def test_sdpa_mxfp8_perf_L0(request, cudnn_handle):
     cfg = ExecConfig(
         data_type=torch.float8_e4m3fn,
         output_type=torch.bfloat16,
@@ -1051,7 +1040,7 @@ def test_sdpa_mxfp8_perf_L0(monkeypatch, request, cudnn_handle):
         d_v=64,
     )
     cfg.fill_derived_fields()
-    exec_sdpa_mxfp8(cfg, request, cudnn_handle)
+    exec_sdpa_mxfp8(cfg, request, cudnn_handle, perf=True)
 
 # # ===================
 # # Single repro test
@@ -1083,7 +1072,7 @@ def test_repro(env_info, request, cudnn_handle):
 
     try:
         if cfg.cfg.is_mxfp8:
-            exec_sdpa_mxfp8(cfg.cfg, request, cudnn_handle)
+            exec_sdpa_mxfp8(cfg.cfg, request, cudnn_handle, request.config.getoption("--perf"))
         elif cfg.cfg.data_type in (torch.float8_e4m3fn, torch.float8_e5m2):
             exec_sdpa_fp8(cfg.cfg, request, cudnn_handle)
         else:
