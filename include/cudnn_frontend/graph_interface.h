@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <mutex>
 #include <unordered_map>
@@ -975,6 +976,13 @@ class Graph : public ICudnn, public INode {
         CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensors_subtree(uid_to_tensors, start_uid, used_uids));
         tensors_to_dump.clear();
         CHECK_CUDNN_FRONTEND_ERROR(collect_tensors_to_dump_subtree(tensors_to_dump));
+        std::unordered_set<Tensor_attributes::uid_t> dumped_uids;
+        tensors_to_dump.erase(std::remove_if(tensors_to_dump.begin(),
+                                             tensors_to_dump.end(),
+                                             [&dumped_uids](auto const &entry) {
+                                                 return !dumped_uids.insert(entry.first->get_uid()).second;
+                                             }),
+                              tensors_to_dump.end());
 
         CUDNN_FE_LOG_BANNER("  3/4 CREATE OPERATIONS  ");
         // INode keeps track of all uids that an operation graph uses.
