@@ -2579,6 +2579,32 @@ class Graph : public ICudnn, public INode {
         }
 
         std::map<Tensor_attributes::tid_t, std::shared_ptr<Tensor_attributes>> created_tensors;
+        for (auto const &[tid, tensor_info] : tensor_table) {
+            auto tensor_attributes = std::make_shared<Tensor_attributes>();
+            from_json(tensor_info, *tensor_attributes);
+            created_tensors[tid] = tensor_attributes;
+            if (tid >= next_tid) {
+                next_tid = tid + 1;
+            }
+        }
+
+        std::vector<std::pair<std::shared_ptr<Tensor_attributes>, std::shared_ptr<Tensor_attributes>>> ragged_offsets;
+        for (auto const &[_, tensor] : created_tensors) {
+            auto ragged_offset = tensor->get_ragged_offset();
+            if (ragged_offset != nullptr) {
+                ragged_offsets.emplace_back(tensor, ragged_offset);
+            }
+        }
+        for (auto const &[tensor, ragged_offset] : ragged_offsets) {
+            auto const tid                  = ragged_offset->get_tid();
+            auto [created_tensor, inserted] = created_tensors.emplace(tid, ragged_offset);
+            (void)inserted;
+            tensor->set_ragged_offset(created_tensor->second);
+            if (tid >= next_tid) {
+                next_tid = tid + 1;
+            }
+        }
+
         auto resolve_tensor_ref = [&tensor_table](json const &tensor_ref, json &tensor_info) -> error_t {
             auto tensor_tid  = tensor_ref.get<Tensor_attributes::tid_t>();
             auto tensor_iter = tensor_table.find(tensor_tid);
@@ -2612,15 +2638,12 @@ class Graph : public ICudnn, public INode {
                 j_sub_node["inputs"]  = inputs;
                 j_sub_node["outputs"] = outputs;
 
-                auto check_if_pre_created_tensor = [this, &created_tensors](std::shared_ptr<Tensor_attributes> t) {
+                auto check_if_pre_created_tensor = [&created_tensors](std::shared_ptr<Tensor_attributes> t) {
                     if (t == nullptr) {
                         return t;
                     }
 
-                    auto const tid = t->get_tid();
-                    if (tid >= next_tid) {
-                        next_tid = tid + 1;
-                    }
+                    auto const tid                  = t->get_tid();
                     auto [created_tensor, inserted] = created_tensors.emplace(tid, t);
                     (void)inserted;
                     return created_tensor->second;

@@ -725,6 +725,36 @@ TEST_CASE("serialize_structure flag controls structural payload", "[graph][seria
         REQUIRE(reloaded.get_variant_pack_uids_sorted() == expected_uids);
     }
 
+    auto malformed_structure = j_with;
+    malformed_structure.erase("json_version");
+    fe::graph::Graph rejected;
+    REQUIRE(rejected.deserialize(handle, malformed_structure, false, false).get_code() ==
+            fe::error_code_t::UNSUPPORTED_GRAPH_FORMAT);
+
+    malformed_structure                 = j_with;
+    malformed_structure["json_version"] = 2;
+    fe::graph::Graph rejected_version_type;
+    REQUIRE(rejected_version_type.deserialize(handle, malformed_structure, false, false).get_code() ==
+            fe::error_code_t::UNSUPPORTED_GRAPH_FORMAT);
+
+    malformed_structure = j_with;
+    malformed_structure.erase("tensors");
+    fe::graph::Graph rejected_missing_tensors;
+    REQUIRE(rejected_missing_tensors.deserialize(malformed_structure).get_code() ==
+            fe::error_code_t::UNSUPPORTED_GRAPH_FORMAT);
+
+    malformed_structure = j_with;
+    malformed_structure["tensors"].push_back(malformed_structure["tensors"].front());
+    fe::graph::Graph rejected_duplicate_tid;
+    REQUIRE(rejected_duplicate_tid.deserialize(malformed_structure).get_code() ==
+            fe::error_code_t::UNSUPPORTED_GRAPH_FORMAT);
+
+    malformed_structure                                 = j_with;
+    malformed_structure["nodes"].front()["inputs"]["A"] = 999;
+    fe::graph::Graph rejected_missing_tid;
+    REQUIRE(rejected_missing_tid.deserialize(malformed_structure).get_code() ==
+            fe::error_code_t::UNSUPPORTED_GRAPH_FORMAT);
+
     cudnnDestroy(handle);
 }
 
@@ -738,12 +768,21 @@ TEST_CASE("Graph JSON keeps tid independent from uid", "[graph][serialize]") {
         graph.tensor(fe::graph::Tensor_attributes().set_name("duplicate").set_dim({1, 3, 4}).set_stride({12, 4, 1}));
     auto C = graph.matmul(A, B, fe::graph::Matmul_attributes().set_name("matmul"));
     C->set_output(true).set_dim({1, 2, 4}).set_stride({8, 4, 1}).set_uid(42);
+    auto D = graph.pointwise(C,
+                             fe::graph::Pointwise_attributes()
+                                 .set_name("abs")
+                                 .set_mode(fe::PointwiseMode_t::ABS)
+                                 .set_compute_data_type(fe::DataType_t::FLOAT));
+    D->set_output(true).set_dim({1, 2, 4}).set_stride({8, 4, 1}).set_uid(43);
 
     json serialized = graph;
-    REQUIRE(serialized["tensors"].size() == 3);
+    REQUIRE(serialized["tensors"].size() == 4);
     REQUIRE(serialized["nodes"][0]["inputs"]["A"] == A->get_tid());
     REQUIRE(serialized["nodes"][0]["inputs"]["B"] == B->get_tid());
+    REQUIRE(serialized["nodes"][1]["inputs"]["IN_0"] == C->get_tid());
+    REQUIRE(serialized["nodes"][1]["outputs"]["OUT_0"] == D->get_tid());
     REQUIRE(A->get_tid() != A->get_uid());
+    REQUIRE(C->get_tid() != D->get_tid());
 
     auto tensor_by_tid = [&serialized](int64_t tid) -> json const & {
         for (auto const &tensor : serialized["tensors"]) {
@@ -756,6 +795,46 @@ TEST_CASE("Graph JSON keeps tid independent from uid", "[graph][serialize]") {
     REQUIRE(tensor_by_tid(A->get_tid())["uid"] == 100);
     REQUIRE(tensor_by_tid(B->get_tid())["uid_assigned"] == false);
     REQUIRE(tensor_by_tid(C->get_tid())["uid"] == 42);
+    REQUIRE(tensor_by_tid(D->get_tid())["uid"] == 43);
+}
+
+TEST_CASE("Graph JSON deserialization canonicalizes shared ragged offsets", "[graph][serialize][deserialize]") {
+    namespace fe = cudnn_frontend;
+
+    fe::graph::Graph graph;
+    auto offset = graph.tensor(fe::graph::Tensor_attributes()
+                                   .set_name("offset")
+                                   .set_dim({2, 1, 1, 1})
+                                   .set_stride({1, 1, 1, 1})
+                                   .set_data_type(fe::DataType_t::INT64)
+                                   .set_uid(99));
+    auto A      = graph.tensor(fe::graph::Tensor_attributes()
+                              .set_name("A")
+                              .set_dim({1, 2, 3})
+                              .set_stride({6, 3, 1})
+                              .set_data_type(fe::DataType_t::HALF)
+                              .set_uid(10)
+                              .set_ragged_offset(offset));
+    auto B      = graph.tensor(fe::graph::Tensor_attributes()
+                              .set_name("B")
+                              .set_dim({1, 3, 4})
+                              .set_stride({12, 4, 1})
+                              .set_data_type(fe::DataType_t::HALF)
+                              .set_uid(20)
+                              .set_ragged_offset(offset));
+    auto C      = graph.matmul(A, B, fe::graph::Matmul_attributes().set_name("matmul"));
+    C->set_output(true).set_dim({1, 2, 4}).set_stride({8, 4, 1}).set_data_type(fe::DataType_t::HALF).set_uid(30);
+
+    json serialized = graph;
+    fe::graph::Graph reloaded;
+    REQUIRE(reloaded.deserialize(serialized).is_good());
+
+    fe::graph::Tensor_attributes reloaded_a;
+    fe::graph::Tensor_attributes reloaded_b;
+    REQUIRE(reloaded.query_tensor_attributes_of_uid(10, reloaded_a).is_good());
+    REQUIRE(reloaded.query_tensor_attributes_of_uid(20, reloaded_b).is_good());
+    REQUIRE(reloaded_a.get_ragged_offset() != nullptr);
+    REQUIRE(reloaded_a.get_ragged_offset() == reloaded_b.get_ragged_offset());
 }
 
 // A graph loaded via deserialize(handle, ...) might have no node subtree,
