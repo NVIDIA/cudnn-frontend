@@ -121,6 +121,25 @@ class Graph : public ICudnn, public INode {
     }
 
     error_t
+    log_tensors_to_dump_(cudnnHandle_t handle,
+                         std::vector<int64_t> const &tensor_uids,
+                         void *const *tensor_ptrs) const {
+        if (!isLoggingTensorDumpEnabled()) {
+            return {error_code_t::OK, ""};
+        }
+
+        std::unordered_map<uid_t, void *> tensor_uid_to_pointer_map;
+        tensor_uid_to_pointer_map.reserve(tensor_uids.size());
+        for (size_t i = 0; i < tensor_uids.size(); i++) {
+            if (tensor_ptrs[i] != nullptr) {
+                tensor_uid_to_pointer_map.emplace(tensor_uids[i], tensor_ptrs[i]);
+            }
+        }
+
+        return log_tensors_to_dump_(handle, tensor_uid_to_pointer_map);
+    }
+
+    error_t
     pre_validate_node() const override final {
         RETURN_CUDNN_FRONTEND_ERROR_IF(
             (context.get_dynamic_shape_enabled() || kernel_cache != nullptr) && detail::get_backend_version() < 90400,
@@ -1425,6 +1444,7 @@ class Graph : public ICudnn, public INode {
         CHECK_CUDNN_FRONTEND_ERROR(run_auxiliary_kernels(handle, workspace, cached_workspace_modifications));
 
         CUDNN_FE_LOG_LABEL_ENDL("INFO: Executing graph_uid " << graph_uid);
+        CHECK_CUDNN_FRONTEND_ERROR(log_tensors_to_dump_(handle, varpack_template.all_uids, ptrs));
 
         // 5. Dispatch
         void *engine_workspace = static_cast<char *>(workspace) + fe_workspace_size;
