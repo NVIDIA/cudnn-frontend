@@ -66,8 +66,8 @@ body:
     attributes:
       label: Environment (where applicable)
       placeholder: |
-        cuDNN Frontend Version:
-        cuDNN Backend Version:
+        cuDNN Frontend Version: 1.27.0
+        cuDNN Backend Version: 9.24.0
         CUDA Toolkit/Runtime Version: 13.4
         GPU: B200 (SM100)
         CUDA driver: 590.XX
