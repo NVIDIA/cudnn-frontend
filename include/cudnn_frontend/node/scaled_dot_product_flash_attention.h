@@ -523,14 +523,11 @@ class SDPANodeBase : public NodeCRTP<DerivedT> {
     error_t
     collect_tensors_to_dump_node(
         std::vector<std::pair<std::shared_ptr<Tensor_attributes>, char>>& tensors_to_dump) const override final {
-        std::unordered_set<Tensor_attributes::uid_t> seen_uids;
-        auto add_tensor = [&tensors_to_dump, &seen_uids](std::shared_ptr<Tensor_attributes> const& tensor) {
+        auto add_tensor = [&tensors_to_dump](std::shared_ptr<Tensor_attributes> const& tensor) {
             if (tensor == nullptr) {
                 return;
             }
-            if (seen_uids.insert(tensor->get_uid()).second) {
-                tensors_to_dump.emplace_back(tensor, 'd');
-            }
+            tensors_to_dump.emplace_back(tensor, 'd');
         };
 
         auto const seq_len_q_it = attributes.inputs.find(input_names::SEQ_LEN_Q);
@@ -2177,6 +2174,47 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
             workspace_modifications.emplace(workaround_padding_mask_seq_len_kv->get_uid(),
                                             std::make_tuple(0, offset, workaround_padding_mask_seq_len_kv_vec_float));
             offset = offset + batch_size_for_workaround_padding_mask * sizeof(float);
+        }
+
+        return {error_code_t::OK, ""};
+    }
+
+    error_t
+    collect_tensors_to_dump_node(
+        std::vector<std::pair<std::shared_ptr<Tensor_attributes>, char>>& tensors_to_dump) const override final {
+        auto add_tensor = [&tensors_to_dump](std::shared_ptr<Tensor_attributes> const& tensor) {
+            if (tensor != nullptr) {
+                tensors_to_dump.emplace_back(tensor, 'd');
+            }
+        };
+        auto add_input = [&](input_names name) {
+            auto it = attributes.inputs.find(name);
+            if (it != attributes.inputs.end()) {
+                add_tensor(it->second);
+            }
+        };
+        auto add_input_offset = [&](input_names name) {
+            auto it = attributes.inputs.find(name);
+            if (it != attributes.inputs.end() && it->second != nullptr) {
+                add_tensor(it->second->get_ragged_offset());
+            }
+        };
+        auto add_output_offset = [&](output_names name) {
+            auto it = attributes.outputs.find(name);
+            if (it != attributes.outputs.end() && it->second != nullptr) {
+                add_tensor(it->second->get_ragged_offset());
+            }
+        };
+
+        add_input(input_names::SEQ_LEN_Q);
+        add_input(input_names::SEQ_LEN_KV);
+
+        for (auto name :
+             {input_names::Q, input_names::K, input_names::V, input_names::O, input_names::dO, input_names::Stats}) {
+            add_input_offset(name);
+        }
+        for (auto name : {output_names::dQ, output_names::dK, output_names::dV}) {
+            add_output_offset(name);
         }
 
         return {error_code_t::OK, ""};

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <mutex>
 #include <unordered_map>
@@ -118,6 +119,25 @@ class Graph : public ICudnn, public INode {
         }
 
         return {error_code_t::OK, ""};
+    }
+
+    error_t
+    log_tensors_to_dump_(cudnnHandle_t handle,
+                         std::vector<int64_t> const &tensor_uids,
+                         void *const *tensor_ptrs) const {
+        if (!isLoggingTensorDumpEnabled()) {
+            return {error_code_t::OK, ""};
+        }
+
+        std::unordered_map<uid_t, void *> tensor_uid_to_pointer_map;
+        tensor_uid_to_pointer_map.reserve(tensor_uids.size());
+        for (size_t i = 0; i < tensor_uids.size(); i++) {
+            if (tensor_ptrs[i] != nullptr) {
+                tensor_uid_to_pointer_map.emplace(tensor_uids[i], tensor_ptrs[i]);
+            }
+        }
+
+        return log_tensors_to_dump_(handle, tensor_uid_to_pointer_map);
     }
 
     error_t
@@ -956,6 +976,14 @@ class Graph : public ICudnn, public INode {
         CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensors_subtree(uid_to_tensors, start_uid, used_uids));
         tensors_to_dump.clear();
         CHECK_CUDNN_FRONTEND_ERROR(collect_tensors_to_dump_subtree(tensors_to_dump));
+        std::stable_sort(tensors_to_dump.begin(), tensors_to_dump.end(), [](auto const &lhs, auto const &rhs) {
+            return lhs.first->get_uid() < rhs.first->get_uid();
+        });
+        tensors_to_dump.erase(
+            std::unique(tensors_to_dump.begin(),
+                        tensors_to_dump.end(),
+                        [](auto const &lhs, auto const &rhs) { return lhs.first->get_uid() == rhs.first->get_uid(); }),
+            tensors_to_dump.end());
 
         CUDNN_FE_LOG_BANNER("  3/4 CREATE OPERATIONS  ");
         // INode keeps track of all uids that an operation graph uses.
@@ -1425,6 +1453,7 @@ class Graph : public ICudnn, public INode {
         CHECK_CUDNN_FRONTEND_ERROR(run_auxiliary_kernels(handle, workspace, cached_workspace_modifications));
 
         CUDNN_FE_LOG_LABEL_ENDL("INFO: Executing graph_uid " << graph_uid);
+        CHECK_CUDNN_FRONTEND_ERROR(log_tensors_to_dump_(handle, varpack_template.all_uids, ptrs));
 
         // 5. Dispatch
         void *engine_workspace = static_cast<char *>(workspace) + fe_workspace_size;
