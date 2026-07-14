@@ -10,6 +10,12 @@ from typing import Optional, Tuple
 import pytest
 import torch
 
+
+def _require_sm90():
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9:
+        pytest.skip("SM90 GPU required")
+
+
 # Parameterization marks shared by every DSA test
 DSA_PARAM_MARKS = [
     pytest.mark.parametrize("dtype", [torch.bfloat16]),
@@ -17,9 +23,15 @@ DSA_PARAM_MARKS = [
 ]
 
 DSA_SPARSE_ATTENTION_BACKWARD_PARAM_MARKS = [
-    pytest.mark.parametrize("head_dim", [512]),
-    pytest.mark.parametrize("head_dim_v", [512]),
-    pytest.mark.parametrize("num_heads", [64]),
+    pytest.mark.parametrize(
+        "head_dim,head_dim_v,num_heads",
+        [
+            (512, 512, 64),
+            # Regression for a packed-M tile crossing query boundaries. This
+            # is the MLA shape that exposed catastrophic dQ/dKV corruption.
+            (576, 512, 32),
+        ],
+    ),
     pytest.mark.parametrize("topk", [512]),
     pytest.mark.parametrize("has_topk_length", [False, True]),
 ]

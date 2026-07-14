@@ -21,7 +21,7 @@ from cudnn.deepseek_sparse_attention.utils.tensor_conversion import (
     to_cute_tensor as _to_cute_tensor,
 )
 
-_SUPPORTED_QHPKV = (32, 64)
+_SUPPORTED_QHPKV = (16, 32, 64)
 _compile_cache: dict = {}
 
 torch2cute_dtype_map = {

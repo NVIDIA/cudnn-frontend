@@ -55,10 +55,7 @@ class IndexerForwardSm90:
         clean_logits: bool = True,
     ):
         assert head_dim == 128, f"SM90 direct forward supports head_dim=128, got {head_dim}"
-        assert qhead_per_kvhead in (
-            32,
-            64,
-        ), f"SM90 direct forward supports qhpkv in (32, 64), got {qhead_per_kvhead}"
+        assert qhead_per_kvhead in (16, 32, 64), f"SM90 direct forward supports qhpkv in (16, 32, 64), got {qhead_per_kvhead}"
         assert ratio >= 1, f"ratio must be >=1, got {ratio}"
         self.dtype = dtype
         self.head_dim = head_dim
@@ -77,6 +74,11 @@ class IndexerForwardSm90:
         self.q_tokens_per_stage = self.q_tokens_per_tile // self.q_stages
         assert self.q_per_stage == 64
         assert self.q_tokens_per_stage * self.qhead_per_kvhead == self.q_per_stage
+        # qh16 packs eight query tokens into one CTA. Their ratio-causal limits
+        # can straddle a 64-column boundary, so both rightmost N blocks need
+        # elementwise masking. Keep the existing one-block path unchanged for
+        # qh32/qh64 so those specializations lower exactly as before.
+        self.mask_two_rightmost_nblocks = self.qhead_per_kvhead == 16
 
         self.num_threads = 256
         self.num_threads_per_warp_group = 128
@@ -193,7 +195,7 @@ class IndexerForwardSm90:
         mOut: cute.Tensor,
         m_block: Int32,
         n_block: Int32,
-        is_first_nblock: Boolean,
+        apply_causal_mask: Boolean,
         seqlen_q: Int32,
         seqlen_k: Int32,
         max_seqlen_k: Int32,
@@ -237,7 +239,7 @@ class IndexerForwardSm90:
                     k_local = n_block * self.tile_n + kv_m
                     score = ps[mi, qi]
                     should_store = Boolean(True)
-                    if is_first_nblock:
+                    if apply_causal_mask:
                         col_lim = (q_causal_offset + q_local + Int32(1)) // Int32(self.ratio)
                         if k_local >= seqlen_k or k_local >= col_lim:
                             if const_expr(self.clean_logits):
@@ -486,7 +488,7 @@ class IndexerForwardSm90:
                         with cute.arch.elect_one():
                             cute.arch.mbarrier_arrive(mbar_KVEmpty1_ptr, arrive_count=128)
 
-                is_first = Boolean(iter_idx == Int32(0))
+                apply_causal_mask = Boolean(iter_idx < Int32(2)) if const_expr(self.mask_two_rightmost_nblocks) else Boolean(iter_idx == Int32(0))
                 self._epilogue_store_to_gmem(
                     0,
                     acc0,
@@ -494,7 +496,7 @@ class IndexerForwardSm90:
                     mOut,
                     m_block,
                     n_block,
-                    is_first,
+                    apply_causal_mask,
                     seqlen.seqlen_q,
                     seqlen.seqlen_k,
                     max_seqlen_k,
@@ -510,7 +512,7 @@ class IndexerForwardSm90:
                     mOut,
                     m_block,
                     n_block,
-                    is_first,
+                    apply_causal_mask,
                     seqlen.seqlen_q,
                     seqlen.seqlen_k,
                     max_seqlen_k,

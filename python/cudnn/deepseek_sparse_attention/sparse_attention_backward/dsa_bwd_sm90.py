@@ -9,9 +9,7 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.utils.hopper_helpers as sm90_utils_basic
 from cutlass import Boolean, Float32, Int32, const_expr
-from cutlass.cute import FastDivmodDivisor
 from cutlass.cute.nvgpu import cpasync, warpgroup
-from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.utils import LayoutEnum
 
 from cudnn.deepseek_sparse_attention.utils.copy import (
@@ -48,56 +46,26 @@ from cudnn.deepseek_sparse_attention.utils.sm90.primitives import (
 )
 
 
-@dsl_user_op
-def _elem_pointer_packed_mh_i64(
-    base_ptr_i64: cute.typing.Int,
-    h_idx: cute.typing.Int,
-    m_idx: cute.typing.Int,
-    num_head: cute.typing.Int,
-    elem_type: type,
-    memspace: cute.AddressSpace,
-    *,
-    loc=None,
-    ip=None,
-) -> cute.Pointer:
-    linear_idx = cutlass.Int64(m_idx) * cutlass.Int64(num_head) + cutlass.Int64(h_idx)
-    byte_offset = linear_idx * elem_type.width // 8
-    return cute.make_ptr(
-        elem_type,
-        cutlass.Int64(base_ptr_i64) + byte_offset,
-        memspace,
-        assumed_align=16,
-    )
-
-
 @cute.jit
-def _load_f32_packed_mh_to_smem(
-    base_ptr_i64: cutlass.Int64,
+def _load_f32_head_to_smem(
+    src: cute.Tensor,
     dst: cute.Tensor,
-    m_block: cutlass.Int32,
     tile_m: cutlass.Constexpr[int],
     tidx: cutlass.Int32,
     num_threads: cutlass.Constexpr[int],
-    qhead_per_kvhead: cutlass.Constexpr[int],
-    num_head: cutlass.Constexpr[int],
+    total_rows: cutlass.Constexpr[int],
+    head_tile: cutlass.Int32,
+    fill_value: Float32,
 ):
     rows_per_thread = cute.ceil_div(tile_m, num_threads)
     for i in cutlass.range_constexpr(rows_per_thread):
         row = i * num_threads + tidx
         if row < tile_m:
-            idx = m_block * tile_m + row
-            m_idx = idx // qhead_per_kvhead
-            h_idx = idx - m_idx * qhead_per_kvhead
-            ptr = _elem_pointer_packed_mh_i64(
-                base_ptr_i64,
-                h_idx,
-                m_idx,
-                num_head,
-                cutlass.Float32,
-                cute.AddressSpace.gmem,
-            )
-            gmem_val = cute.make_tensor(ptr, (1,))
-            dst[row] = gmem_val[0]
+            head = head_tile * tile_m + row
+            if head < total_rows:
+                dst[row] = src[head]
+            else:
+                dst[row] = fill_value
 
 
 class _FlashAttentionDSABackwardPreprocessSm90:
@@ -457,6 +425,7 @@ class FlashAttentionDSABackwardSm90:
         self.is_local = False
 
         self.tile_m = tile_m
+        self.qhead_tiles = (qhead_per_kvhead + tile_m - 1) // tile_m
         self.tile_n = tile_n
         self.num_threads = num_threads
         self.KV_stage = KV_stage
@@ -714,15 +683,19 @@ class FlashAttentionDSABackwardSm90:
         accum_transpose = [2, 1, 0]  # (b, n_kv, s*h) -> (s*h, n_kv, b)
         mdKV = select(mdKV, accum_transpose)
 
-        # Reshape tensor layouts so q-heads within a KV head are packed into M.
+        # Keep query position separate from the query-head tile. A Hopper MMA
+        # still consumes 64 rows, but qhpkv=32 is represented as a 32-row
+        # tensor extent so TMA zero-fills the remaining rows. This makes every
+        # CTA consume exactly one query's top-k row instead of letting a packed
+        # 64-row tile straddle two queries.
         qhpkv = self.qhead_per_kvhead
         num_head_kv = mKV.shape[2]
         mQ, mdO, mdQ = [
             cute.make_tensor(
                 mT.iterator,
                 cute.make_layout(
-                    ((qhpkv, mT.shape[0]), mT.shape[1], num_head_kv, *mT.shape[3:]),
-                    stride=((mT.stride[2], mT.stride[0]), mT.stride[1], mT.stride[2] * qhpkv, *mT.stride[3:]),
+                    (qhpkv, mT.shape[1], num_head_kv, mT.shape[0], *mT.shape[3:]),
+                    stride=(mT.stride[2], mT.stride[1], mT.stride[2] * qhpkv, mT.stride[0], *mT.stride[3:]),
                 ),
             )
             for mT in (mQ, mdO, mdQ)
@@ -731,8 +704,8 @@ class FlashAttentionDSABackwardSm90:
             cute.make_tensor(
                 mT.iterator,
                 cute.make_layout(
-                    ((qhpkv, mT.shape[1]), num_head_kv, mT.shape[0]),
-                    stride=((mT.stride[2], mT.stride[1]), mT.stride[2] * qhpkv, mT.stride[0]),
+                    (qhpkv, num_head_kv, mT.shape[1], mT.shape[0]),
+                    stride=(mT.stride[2], mT.stride[2] * qhpkv, mT.stride[1], mT.stride[0]),
                 ),
             )
             for mT in (mLSE, mdPsum)
@@ -782,21 +755,21 @@ class FlashAttentionDSABackwardSm90:
             (self.tile_m, 64),
         )
 
-        # TileScheduler by Q dimension (m_blocks)
+        # One CTA per query and query-head tile. The final head tile may be
+        # smaller than tile_m; TMA predicates the unused rows in that case.
         TileScheduler = SingleTileScheduler
         tile_sched_args = TileSchedulerArguments(
-            cute.ceil_div(cute.size(mQ.shape[0]), self.tile_m),
-            cute.size(mQ.shape[2]),
             cute.size(mQ.shape[3]),
+            cute.size(mQ.shape[2]) * self.qhead_tiles,
+            cute.size(mQ.shape[4]),
             1,  # num_splits
             cute.size(mKV.shape[0]),
             mQ.shape[1],
             mKV.shape[1],
-            total_q=cute.size(mQ.shape[0]) * cute.size(mQ.shape[3]),
+            total_q=cute.size(mQ.shape[3]) * cute.size(mQ.shape[4]),
             tile_shape_mn=(self.tile_m, self.tile_n),
             mCuSeqlensQ=None,
             mSeqUsedQ=None,
-            qhead_per_kvhead_packgqa=self.qhead_per_kvhead,
             element_size=self.dtype.width // 8,
         )
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
@@ -804,8 +777,6 @@ class FlashAttentionDSABackwardSm90:
 
         LOG2_E = math.log2(math.e)
         softmax_scale_log2 = softmax_scale * LOG2_E
-
-        qhead_per_kvhead_divmod = FastDivmodDivisor(self.qhead_per_kvhead)
 
         self.kernel(
             tma_tensor_Q,
@@ -845,7 +816,6 @@ class FlashAttentionDSABackwardSm90:
             tile_sched_params,
             TileScheduler,
             SharedStorage,
-            qhead_per_kvhead_divmod,
         ).launch(
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
@@ -894,7 +864,6 @@ class FlashAttentionDSABackwardSm90:
         tile_sched_params: ParamsBase,
         TileScheduler: cutlass.Constexpr[Callable],
         SharedStorage: cutlass.Constexpr[Callable],
-        qhead_per_kvhead_divmod: FastDivmodDivisor,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
@@ -986,7 +955,6 @@ class FlashAttentionDSABackwardSm90:
                 softmax_scale_log2,
                 softmax_scale,
                 TileSchedulerCls,
-                qhead_per_kvhead_divmod,
             )
         else:
             cute.arch.setmaxregister_increase(self.num_mma_regs)
@@ -1019,7 +987,6 @@ class FlashAttentionDSABackwardSm90:
                 mTopkIdxs,  # per-q length + scatter indices
                 tidx,
                 TileSchedulerCls,
-                qhead_per_kvhead_divmod,
             )
 
     @cute.jit
@@ -1056,7 +1023,6 @@ class FlashAttentionDSABackwardSm90:
         softmax_scale_log2: Float32,
         softmax_scale: Float32,
         TileSchedulerCls: Callable,
-        qhead_per_kvhead_divmod: FastDivmodDivisor,
     ):
         """WG0 mainloop: identical to V3.1 — dQ[0:256] = 128+128, no 576-specific logic."""
         wg_tidx = tidx % self.num_threads_per_warp_group  # 0..127
@@ -1165,12 +1131,11 @@ class FlashAttentionDSABackwardSm90:
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, _ = work_tile.tile_idx
-            head_idx_kv = head_idx
+            head_idx_kv = head_idx // self.qhead_tiles
+            head_tile = head_idx - head_idx_kv * self.qhead_tiles
 
-            # m_block indexes the packed M dimension (qhpkv * seqlen_q / tile_m).
-            # topk tensors are indexed by sequence position, not packed m_block.
-            # seq_idx = (m_block * tile_m) // qhead_per_kvhead
-            seq_idx = (m_block * self.tile_m) // qhead_per_kvhead_divmod
+            # The scheduler maps one CTA to exactly one query.
+            seq_idx = m_block
 
             if const_expr(self.have_topk_length):
                 topK = mTopkLength[batch_idx, seq_idx]
@@ -1183,10 +1148,10 @@ class FlashAttentionDSABackwardSm90:
             mKV_cur = mKV[None, None, head_idx_kv, batch_idx]
             mTopkIdxs_cur = mTopkIdxs[batch_idx, seq_idx, None]
 
-            mQ_cur = mQ[None, None, head_idx, batch_idx]
-            gQ = cute.local_tile(mQ_cur, (self.tile_m, self.tile_hdim), (m_block, 0))
-            mdO_cur = mdO[None, None, head_idx, batch_idx]
-            gdO = cute.local_tile(mdO_cur, (self.tile_m, self.tile_hdimv), (m_block, 0))
+            mQ_cur = mQ[None, None, head_idx_kv, seq_idx, batch_idx]
+            gQ = cute.local_tile(mQ_cur, (self.tile_m, self.tile_hdim), (head_tile, 0))
+            mdO_cur = mdO[None, None, head_idx_kv, seq_idx, batch_idx]
+            gdO = cute.local_tile(mdO_cur, (self.tile_m, self.tile_hdimv), (head_tile, 0))
 
             load_Q, _, _ = tma_get_copy_fn(tma_atom_Q, 0, cute.make_layout(1), gQ, sQ, single_stage=True)
             load_dO, _, _ = tma_get_copy_fn(tma_atom_dO, 0, cute.make_layout(1), gdO, sdO, single_stage=True)
@@ -1197,29 +1162,29 @@ class FlashAttentionDSABackwardSm90:
                 load_Q(tma_bar_ptr=mbar_QdO_ptr)
                 load_dO(tma_bar_ptr=mbar_QdO_ptr)
 
-            # All 128 threads: load packed-M LSE/dPsum from GMEM to SMEM.
-            mLSE_cur = mLSE[None, head_idx, batch_idx]
-            mdPsum_cur = mdPsum[None, head_idx, batch_idx]
-            num_head = self.qhead_per_kvhead * mLSE.shape[1]
-            _load_f32_packed_mh_to_smem(
-                mLSE_cur.iterator.toint(),
+            # All 128 threads load the query's head values. Rows beyond qhpkv
+            # are neutralized for the 64-row MMA tile.
+            mLSE_cur = mLSE[None, head_idx_kv, seq_idx, batch_idx]
+            mdPsum_cur = mdPsum[None, head_idx_kv, seq_idx, batch_idx]
+            _load_f32_head_to_smem(
+                mLSE_cur,
                 sLSE,
-                m_block,
                 self.tile_m,
                 wg_tidx,
                 self.num_threads_per_warp_group,
                 self.qhead_per_kvhead,
-                num_head,
+                head_tile,
+                Float32.inf,
             )
-            _load_f32_packed_mh_to_smem(
-                mdPsum_cur.iterator.toint(),
+            _load_f32_head_to_smem(
+                mdPsum_cur,
                 sdPsum,
-                m_block,
                 self.tile_m,
                 wg_tidx,
                 self.num_threads_per_warp_group,
                 self.qhead_per_kvhead,
-                num_head,
+                head_tile,
+                Float32(0.0),
             )
 
             # Fence SMEM writes (LSE/dPsum stores) + barrier to ensure visibility
@@ -1616,7 +1581,6 @@ class FlashAttentionDSABackwardSm90:
         mTopkIdxs: cute.Tensor,  # (batch, seqlen_q, topk_max) int32 for scatter
         tidx: Int32,
         TileSchedulerCls: Callable,
-        qhead_per_kvhead_divmod: FastDivmodDivisor,
     ):
         """WG1 mainloop: 9-chunk dKV pipeline + 2 G4_half (dQ) + AtomicAdd scatter."""
         wg_tidx = tidx % self.num_threads_per_warp_group  # 0..127
@@ -1684,10 +1648,9 @@ class FlashAttentionDSABackwardSm90:
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, _ = work_tile.tile_idx
-            head_idx_kv = head_idx
+            head_idx_kv = head_idx // self.qhead_tiles
 
-            # Convert packed-M m_block to sequence index for topk tensors.
-            seq_idx = (m_block * self.tile_m) // qhead_per_kvhead_divmod
+            seq_idx = m_block
 
             if const_expr(self.have_topk_length):
                 topK = mTopkLength[batch_idx, seq_idx]
@@ -2086,8 +2049,10 @@ class FlashAttentionDSABackwardSm90:
         # TMA S2G: sQ_half(256) → gdQ[:, 256:512]
         warp_idx_in_wg = wg_tidx // 32
         if warp_idx_in_wg == 0:
-            mdQ_cur = mdQ[None, None, head_idx, batch_idx]
-            gdQ_half = cute.local_tile(mdQ_cur, (self.tile_m, 256), (m_block, 1))  # col_block=1 → offset 256
+            head_idx_kv = head_idx // self.qhead_tiles
+            head_tile = head_idx - head_idx_kv * self.qhead_tiles
+            mdQ_cur = mdQ[None, None, head_idx_kv, m_block, batch_idx]
+            gdQ_half = cute.local_tile(mdQ_cur, (self.tile_m, 256), (head_tile, 1))  # col_block=1 → offset 256
             with cute.arch.elect_one():
                 store_dQ, _, _ = tma_get_copy_fn(tma_atom_dQ, 0, cute.make_layout(1), sQ_half, gdQ_half, single_stage=True)
                 store_dQ()
@@ -2097,8 +2062,10 @@ class FlashAttentionDSABackwardSm90:
         # Tail TMA: sQ_64_epi(64) → gdQ[:, 512:576] (only for d=576)
         if const_expr(not self.same_hdim_kv):
             if warp_idx_in_wg == 0:
-                mdQ_64_cur = mdQ_64[None, None, head_idx, batch_idx]
-                gdQ_64 = cute.local_tile(mdQ_64_cur, (self.tile_m, 64), (m_block, 8))  # col_block=8 → offset 512
+                head_idx_kv = head_idx // self.qhead_tiles
+                head_tile = head_idx - head_idx_kv * self.qhead_tiles
+                mdQ_64_cur = mdQ_64[None, None, head_idx_kv, m_block, batch_idx]
+                gdQ_64 = cute.local_tile(mdQ_64_cur, (self.tile_m, 64), (head_tile, 8))  # col_block=8 → offset 512
                 with cute.arch.elect_one():
                     store_dQ_64, _, _ = tma_get_copy_fn(tma_atom_dQ_64, 0, cute.make_layout(1), sQ_64_epi, gdQ_64, single_stage=True)
                     store_dQ_64()
@@ -2154,8 +2121,10 @@ class FlashAttentionDSABackwardSm90:
 
         warp_idx_in_wg = wg_tidx // 32
         if warp_idx_in_wg == 0:
-            mdQ_cur = mdQ[None, None, head_idx, batch_idx]
-            gdQ_half = cute.local_tile(mdQ_cur, (self.tile_m, 256), (m_block, wg_idx))
+            head_idx_kv = head_idx // self.qhead_tiles
+            head_tile = head_idx - head_idx_kv * self.qhead_tiles
+            mdQ_cur = mdQ[None, None, head_idx_kv, m_block, batch_idx]
+            gdQ_half = cute.local_tile(mdQ_cur, (self.tile_m, 256), (head_tile, wg_idx))
             with cute.arch.elect_one():
                 store_dQ, _, _ = tma_get_copy_fn(tma_atom_dQ, 0, cute.make_layout(1), sQ_half, gdQ_half, single_stage=True)
                 store_dQ()
