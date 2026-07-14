@@ -64,11 +64,11 @@ body:
   - type: textarea
     id: environment
     attributes:
-      label: Environment
+      label: Environment (where applicable)
       placeholder: |
         cuDNN Frontend Version:
         cuDNN Backend Version:
-        CUDA Toolkit/Runtime Version: 13.1
+        CUDA Toolkit/Runtime Version: 13.4
         GPU(s) SM Version:
         GPU: B200 (SM100)
         CUDA driver: 590.XX
