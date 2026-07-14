@@ -543,7 +543,7 @@ class pygraph:
         },
         # binary
         **{op: ("a", "b") for op in ("add", "add_square", "div", "logical_and", "logical_or", "mul", "sub")},
-        **{op: ("input0", "input1") for op in ("max", "min", "mod", "pow")},
+        **{op: ("input0", "input1") for op in ("max", "min", "mod", "floor_mod", "pow")},
         **{op: ("input", "comparison") for op in ("cmp_eq", "cmp_ge", "cmp_gt", "cmp_le", "cmp_lt", "cmp_neq")},
         "bias": ("input", "bias"),
         "scale": ("input", "scale"),

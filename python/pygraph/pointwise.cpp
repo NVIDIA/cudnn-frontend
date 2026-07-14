@@ -753,6 +753,24 @@ init_pygraph_pointwise_submodule(py::class_<PyGraph>& m) {
             Returns:
                 cudnn_tensor: The result of pointwise floating-point remainder of the input0 tensor's division by the input1 tensor
         )pbdoc");
+    m.def("floor_mod",
+          &PyGraph::pointwise_binary<cudnn_frontend::PointwiseMode_t::FLOOR_MOD>,
+          py::arg("input0"),
+          py::arg("input1"),
+          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
+          py::arg_v("name", ""),
+          R"pbdoc(
+            Compute the floored element-wise modulo (remainder) of two tensors: y = a - floor(a / b) * b. The result follows the sign of the divisor b. This differs from mod (truncated remainder, C fmod/%, result follows the sign of the dividend) only when a and b have opposite signs.
+
+            Args:
+                input0 (cudnn_tensor): The dividend tensor a.
+                input1 (cudnn_tensor): The divisor tensor b.
+                compute_data_type (Optional[cudnn.data_type]): The data type for computation. Default is NOT_SET.
+                name (Optional[str]): A name for the operation to be performed.
+
+            Returns:
+                cudnn_tensor: The result of the floored modulo operation.
+        )pbdoc");
     m.def("pow",
           &PyGraph::pointwise_binary<cudnn_frontend::PointwiseMode_t::POW>,
           py::arg("input0"),

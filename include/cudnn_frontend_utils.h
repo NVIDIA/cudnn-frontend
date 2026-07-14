@@ -556,6 +556,7 @@ enum class PointwiseMode_t {
     LOG,
     NEG,
     MOD,
+    FLOOR_MOD,
     POW,
     ABS,
     CEIL,
@@ -611,6 +612,7 @@ NLOHMANN_JSON_SERIALIZE_ENUM(PointwiseMode_t,
                                  {PointwiseMode_t::LOG, "LOG"},
                                  {PointwiseMode_t::NEG, "NEG"},
                                  {PointwiseMode_t::MOD, "MOD"},
+                                 {PointwiseMode_t::FLOOR_MOD, "FLOOR_MOD"},
                                  {PointwiseMode_t::POW, "POW"},
                                  {PointwiseMode_t::ABS, "ABS"},
                                  {PointwiseMode_t::CEIL, "CEIL"},
@@ -818,6 +820,7 @@ get_pointwise_mode_port_count(PointwiseMode_t const& mode) {
         case PointwiseMode_t::MIN:
         case PointwiseMode_t::MAX:
         case PointwiseMode_t::MOD:
+        case PointwiseMode_t::FLOOR_MOD:
         case PointwiseMode_t::RELU_BWD:
         case PointwiseMode_t::TANH_BWD:
         case PointwiseMode_t::SIGMOID_BWD:
@@ -1343,6 +1346,13 @@ convert_to_cudnn_type(cudnn_frontend::PointwiseMode_t const mode, cudnnPointwise
         case PointwiseMode_t::MOD:
             cudnn_mode = CUDNN_POINTWISE_MOD;
             return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+        case PointwiseMode_t::FLOOR_MOD:
+#if (CUDNN_VERSION >= 92600)
+            cudnn_mode = CUDNN_POINTWISE_FLOOR_MOD;
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+#else
+            return cudnnStatus_t::CUDNN_STATUS_NOT_SUPPORTED;
+#endif
         case PointwiseMode_t::POW:
             cudnn_mode = CUDNN_POINTWISE_POW;
             return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
@@ -2279,6 +2289,10 @@ convert_from_cudnn_type(cudnnPointwiseMode_t const cudnn_mode) {
             return PointwiseMode_t::NEG;
         case CUDNN_POINTWISE_MOD:
             return PointwiseMode_t::MOD;
+#if (CUDNN_VERSION >= 92600)
+        case CUDNN_POINTWISE_FLOOR_MOD:
+            return PointwiseMode_t::FLOOR_MOD;
+#endif
         case CUDNN_POINTWISE_POW:
             return PointwiseMode_t::POW;
         case CUDNN_POINTWISE_ABS:
