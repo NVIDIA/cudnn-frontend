@@ -15,68 +15,22 @@ body:
       label: Before submitting
       options:
         - label: I searched existing issues and did not find a duplicate.
-        - label: I am describing a concrete problem or use case.
 
-  - type: dropdown
-    id: area
-    attributes:
-      label: Affected area
-      options:
-        - C++ frontend API or graph construction
-        - Python API or bindings
-        - FE OSS kernels or CuTeDSL
-        - Build, packaging, or installation
-        - CI or test infrastructure
-        - Documentation or samples
-        - Benchmarks or performance
-        - Not sure
   - type: textarea
-    id: problem
+    id: request
     attributes:
-      label: Problem or use case
-      description: What are you trying to do, and what is difficult or impossible today?
+      label: Feature request
+      value: |
+        ### Problem or use case
+
+        <!-- What are you trying to do, and what is difficult or impossible today? -->
+
+        ### Proposed solution
+
+        <!-- Describe the API, behavior, or workflow you want. -->
+
+        ### Why is this important?
+
+        <!-- Who benefits, and what outcome does this unlock? -->
     validations:
       required: true
-
-  - type: textarea
-    id: proposal
-    attributes:
-      label: Proposed solution
-      description: Describe the API, behavior, or workflow you want.
-
-  - type: textarea
-    id: value
-    attributes:
-      label: Why this matters
-      description: Who benefits, and what outcome does this unlock?
-
-  - type: textarea
-    id: scope
-    attributes:
-      label: Smallest useful scope
-      description: Describe the narrowest first version that would solve the problem.
-
-  - type: textarea
-    id: constraints
-    attributes:
-      label: Environment or constraints
-      description: Note relevant GPU architectures, cuDNN/CUDA versions, frameworks, compatibility needs, or performance targets.
-
-  - type: textarea
-    id: alternatives
-    attributes:
-      label: Alternatives considered
-      description: Include current workarounds or other approaches you considered.
-
-  - type: textarea
-    id: references
-    attributes:
-      label: Additional context
-      description: Add examples, papers, mockups, related issues, or comparable APIs.
-
-  - type: checkboxes
-    id: contribution
-    attributes:
-      label: Contribution
-      options:
-        - label: I would be willing to help implement this feature.
