@@ -1,3 +1,12 @@
+## Before submitting
+
+- [ ] I agree to license this contribution under the terms of [LICENSE.txt](https://github.com/NVIDIA/cudnn-frontend/blob/develop/LICENSE.txt).
+- [ ] I ran `pre-commit run --all-files` and committed any formatting changes.
+
+## Affected area
+
+<!-- Choose one: C++ frontend API or graph construction; Python API or bindings; FE OSS kernels or CuTeDSL; Build, packaging, or installation; CI or test infrastructure; Documentation or samples; Benchmarks or performance; Not sure. -->
+
 ## Summary
 
 <!-- What changed? Keep the scope concise. -->
@@ -17,11 +26,3 @@
 ## Testing
 
 <!-- List exact commands and results. If something was not tested, explain why. -->
-
-## Checklist
-
-- [ ] This PR is focused and contains no unrelated changes.
-- [ ] I added or updated tests, or explained why tests are unnecessary.
-- [ ] I updated documentation for user-facing changes, or it is not applicable.
-- [ ] I ran `pre-commit run --all-files` and committed any formatting changes.
-- [ ] I listed the exact validation commands and results above.

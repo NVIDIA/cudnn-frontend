@@ -15,7 +15,6 @@ body:
       label: Before submitting
       options:
         - label: I searched existing issues and did not find a duplicate.
-        - label: I reduced the problem to the smallest reproducer I can provide.
 
   - type: dropdown
     id: area
@@ -31,41 +30,26 @@ body:
         - Benchmarks or performance
         - Not sure
   - type: textarea
-    id: description
+    id: report
     attributes:
-      label: Description
-      description: Clearly describe the problem and its impact.
-    validations:
-      required: true
+      label: Bug report
+      value: |
+        ### Description
 
-  - type: textarea
-    id: steps
-    attributes:
-      label: Steps to reproduce
-      description: Include a minimal runnable program or exact commands, inputs, and configuration.
-      placeholder: |
-        1. Install or build ...
-        2. Run ...
-        3. Observe ...
-    validations:
-      required: true
+        <!-- Clearly describe the problem and its impact. -->
 
-  - type: textarea
-    id: expected
-    attributes:
-      label: Expected behavior
+        ### Steps to reproduce
 
-  - type: textarea
-    id: actual
-    attributes:
-      label: Actual behavior
-      description: Include the exact error or incorrect result.
+        ### Expected behavior
 
-  - type: textarea
-    id: environment
-    attributes:
-      label: Environment (where applicable)
-      placeholder: |
+        <!-- What did you expect to happen? -->
+
+        ### Actual behavior
+
+        <!-- Include the exact error or incorrect result. -->
+
+        ### Environment (where applicable)
+
         cuDNN Frontend Version: 1.27.0
         cuDNN Backend Version: 9.24.0
         CUDA Toolkit/Runtime Version: 13.4
@@ -75,18 +59,23 @@ body:
         Compiler: GCC 13.3
         Python: 3.12
         Framework: PyTorch 2.X
-  - type: input
-    id: last-known-good
-    attributes:
-      label: Last known working version
-      description: For regressions, provide the last release or commit where this worked.
 
-  - type: textarea
-    id: logs
-    attributes:
-      label: Relevant logs
-      description: |
-        Paste the smallest relevant excerpt and attach full logs if needed. Redact secrets.
-        Frontend: CUDNN_FRONTEND_LOG_FILE=fe.log CUDNN_FRONTEND_LOG_INFO=1
-        Backend: CUDNN_LOGLEVEL_DBG=3 CUDNN_LOGDEST_DBG=be.log
-      render: shell
+        ### Last known working version
+
+        <!-- For regressions, provide the last release or commit where this worked. -->
+
+        ### Relevant logs
+
+        <!-- Paste the smallest relevant excerpt and attach full logs if needed. Redact secrets. -->
+
+        ```shell
+        # Frontend
+        export CUDNN_FRONTEND_LOG_FILE=fe.log
+        export CUDNN_FRONTEND_LOG_INFO=1
+
+        # Backend
+        export CUDNN_LOGLEVEL_DBG=3
+        export CUDNN_LOGDEST_DBG=be.log
+        ```
+    validations:
+      required: true
