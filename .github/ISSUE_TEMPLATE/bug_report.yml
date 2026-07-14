@@ -61,31 +61,15 @@ body:
       label: Actual behavior
       description: Include the exact error or incorrect result.
 
-  - type: input
-    id: frontend-version
-    attributes:
-      label: cuDNN Frontend version or commit
-      placeholder: v1.26.0 or abc1234
-
-  - type: input
-    id: backend-version
-    attributes:
-      label: cuDNN Backend version
-      placeholder: 9.24.0
-
   - type: textarea
     id: environment
     attributes:
       label: Environment
-      description: Include relevant GPU architecture, CUDA runtime and driver, OS, compiler, Python, and framework versions. Enter N/A where not applicable.
       placeholder: |
-        GPU: B200 (SM100)
-        CUDA runtime: 13.1
-        CUDA driver: 590.XX
-        OS: Ubuntu 24.04
-        Compiler: GCC 13.3
-        Python: 3.12
-        Framework: PyTorch 2.X
+        cuDNN Frontend Version:
+        cuDNN Backend Version:
+        CUDA Toolkit Version:
+        GPU(s) SM Version:
   - type: input
     id: last-known-good
     attributes:
@@ -101,9 +85,3 @@ body:
         Frontend: CUDNN_FRONTEND_LOG_FILE=fe.log CUDNN_FRONTEND_LOG_INFO=1
         Backend: CUDNN_LOGLEVEL_DBG=3 CUDNN_LOGDEST_DBG=be.log
       render: shell
-
-  - type: textarea
-    id: context
-    attributes:
-      label: Additional context
-      description: Add screenshots, profiler output, workarounds, suspected commits, or related issues.
