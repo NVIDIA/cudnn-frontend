@@ -278,6 +278,9 @@ from typing import Any
 _OPTIONAL_DEPENDENCY_INSTALL_HINT = "Install with 'pip install nvidia-cudnn-frontend[cutedsl]'"
 
 _LAZY_OPTIONAL_IMPORTS = {
+    "moe_ep": (".moe_ep", None),
+    "MoeEp": (".moe_ep", "MoeEp"),
+    "MoeFormat": (".moe_ep", "MoeFormat"),
     "BSA": (".block_sparse_attention", "BSA"),
     "block_sparse_attention_forward": (".block_sparse_attention", "block_sparse_attention_forward"),
     "block_sparse_attention_backward": (".block_sparse_attention", "block_sparse_attention_backward"),

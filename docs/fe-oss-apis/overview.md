@@ -26,6 +26,7 @@ This folder documents the Python FE APIs implemented under `python/cudnn`. For d
 - [SDPA Forward FE OSS API (SM100, D=256)](https://docs.nvidia.com/deeplearning/cudnn/frontend/latest/operations/Attention.html#sdpa-forward-fe-oss-sm100-d256)
 - [SDPA Backward FE OSS API (SM100, D=256)](https://docs.nvidia.com/deeplearning/cudnn/frontend/latest/operations/Attention.html#sdpa-backward-fe-oss-sm100-d256)
 - [RMSNorm + SiLU](rmsnorm_silu.md)
+- [MoE + Expert Parallel API proposal](moe_ep.md)
 
 ## Installation and setup
 
