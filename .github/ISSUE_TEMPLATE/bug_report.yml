@@ -68,10 +68,9 @@ body:
       placeholder: |
         cuDNN Frontend Version:
         cuDNN Backend Version:
-        CUDA Toolkit Version:
+        CUDA Toolkit/Runtime Version: 13.1
         GPU(s) SM Version:
         GPU: B200 (SM100)
-        CUDA runtime: 13.1
         CUDA driver: 590.XX
         OS: Ubuntu 24.04
         Compiler: GCC 13.3
