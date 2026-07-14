@@ -850,7 +850,7 @@ def cleanup_tensors(allocs):
     torch.cuda.empty_cache()
 
 
-def exec_sdpa(cfg, request, cudnn_handle):
+def exec_sdpa(cfg, request, cudnn_handle, tensor_initializer=None, tensor_checker=None):
     if request.config.option.dryrun:
         pytest.skip("dry run mode")
 
@@ -859,6 +859,8 @@ def exec_sdpa(cfg, request, cudnn_handle):
     perf = request.config.getoption("--perf")
     rng_data_gen = torch.Generator(device="cuda").manual_seed(cfg.rng_data_seed)
     allocs, tensors, max_t_q, max_t_kv = allocate_tensors(cfg, rng_data_gen, perf=perf)
+    if tensor_initializer is not None:
+        tensor_initializer(tensors, rng_data_gen)
 
     fwd_graph, fwd_pack = create_forward_graph(cfg, tensors, cudnn_handle)
     bwd_graph, bwd_pack = create_backward_graph(cfg, tensors, cudnn_handle, max_t_q, max_t_kv) if cfg.is_train else (None, None)
@@ -868,6 +870,9 @@ def exec_sdpa(cfg, request, cudnn_handle):
     if cfg.is_train:
         execute_graph(bwd_graph, bwd_pack, allocs, tensors, cudnn_handle, request, label="Backward")
         check_deterministic(cfg, tensors, allocs, bwd_graph, bwd_pack, cudnn_handle, request)
+
+    if tensor_checker is not None:
+        tensor_checker(tensors)
 
     if not perf:
         compute_and_compare_reference(cfg, allocs, tensors, request.config.getoption("--diffs"))
