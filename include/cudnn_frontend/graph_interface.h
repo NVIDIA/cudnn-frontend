@@ -174,7 +174,9 @@ class Graph : public ICudnn, public INode {
     }
 
     error_t
-    log_tensor_dumps(cudnnHandle_t handle, std::vector<int64_t> const &tensor_uids, void *const *tensor_ptrs) const {
+    log_tensors_to_dump_(cudnnHandle_t handle,
+                         std::vector<int64_t> const &tensor_uids,
+                         void *const *tensor_ptrs) const {
         if (!isLoggingTensorDumpEnabled()) {
             return {error_code_t::OK, ""};
         }
@@ -187,7 +189,7 @@ class Graph : public ICudnn, public INode {
             }
         }
 
-        return log_tensor_dumps(handle, tensor_uid_to_pointer_map);
+        return log_tensors_to_dump_(handle, tensor_uid_to_pointer_map);
     }
 
     error_t
@@ -1495,9 +1497,7 @@ class Graph : public ICudnn, public INode {
         CHECK_CUDNN_FRONTEND_ERROR(run_auxiliary_kernels(handle, workspace, cached_workspace_modifications));
 
         CUDNN_FE_LOG_LABEL_ENDL("INFO: Executing gid " << gid);
-        if (isLoggingEnabled()) {
-            CHECK_CUDNN_FRONTEND_ERROR(log_tensor_dumps(handle, varpack_template.all_uids, ptrs));
-        }
+        CHECK_CUDNN_FRONTEND_ERROR(log_tensors_to_dump_(handle, varpack_template.all_uids, ptrs));
 
         // 5. Dispatch
         void *engine_workspace = static_cast<char *>(workspace) + fe_workspace_size;
