@@ -5,7 +5,16 @@
 
 ## Affected area
 
-<!-- Choose one: C++ frontend API or graph construction; Python API or bindings; FE OSS kernels or CuTeDSL; Build, packaging, or installation; CI or test infrastructure; Documentation or samples; Benchmarks or performance; Not sure. -->
+<!-- Choose one:
+- C++ frontend API or graph construction
+- Python API or bindings
+- FE OSS kernels or CuTeDSL
+- Build, packaging, or installation
+- CI or test infrastructure
+- Documentation or samples
+- Benchmarks or performance
+- Not sure
+-->
 
 ## Summary
 
