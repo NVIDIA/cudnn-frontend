@@ -71,6 +71,18 @@ class MoeEp:
         | BlockScaledTensor
         | tuple[Tensor | BlockScaledTensor, Tensor, Tensor]
     ): ...
+
+    def backward(
+        self,
+        grad_output: Tensor,
+        activation: Tensor | BlockScaledTensor,
+        fc1_weight: Tensor | BlockScaledTensor,
+        fc2_weight: Tensor | BlockScaledTensor,
+        topk_idx: Tensor,
+        topk_weights: Tensor,
+        fc1_c: Tensor,
+        route_metadata: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]: ...
 ```
 
 An initialized `ep_group` enables EP. `None` deliberately means a one-rank
@@ -138,6 +150,32 @@ below.
 
 The return type is fixed by the constructor, so an individual module instance
 does not change its output structure across calls.
+
+### Backward call contract
+
+`backward` requires the operator to be constructed with `generate_c=True`; it
+consumes the forward stash and is executable today as
+`MoeEpReference.backward` (the device implementation is pending, like
+forward). It is a collective: every rank in `ep_group` must call it, because
+gradients re-dispatch along the identical forward routes.
+
+| Argument | Shape | Provided by |
+|---|---:|---|
+| `grad_output` | `(T, H)` | incoming gradient of the *dequantized* public output (all encodes are straight-through). |
+| `activation`, `fc1_weight`, `fc2_weight`, `topk_idx`, `topk_weights` | as in forward | the framework re-supplies the same forward inputs; `topk_idx` deterministically regenerates the dispatch plan. |
+| `fc1_c`, `route_metadata` | `(local_routes, 2I)`, `(local_routes, 4)` | the `generate_c=True` forward stash, passed back unchanged. |
+
+Returns four FP32 tensors:
+
+| Return | Shape | Meaning |
+|---|---:|---|
+| `grad_activation` | `(T, H)` | summed over this token's valid routes; gradients w.r.t. the dequantized activation values. |
+| `grad_fc1_weight` | `(E_local, H, 2I)` | accumulated over every route this rank's experts processed, from all source ranks. |
+| `grad_fc2_weight` | `(E_local, I, H)` | same accumulation domain as `grad_fc1_weight`. |
+| `grad_topk_weights` | `(T, K)` | per-route router-weight gradient; exact zero at `-1` slots. |
+
+The save-set, recompute rules, and numerical conventions behind this
+signature are specified in "Saved tensors for backward" below.
 
 ### Example
 

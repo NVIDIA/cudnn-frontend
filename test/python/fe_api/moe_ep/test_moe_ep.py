@@ -588,6 +588,90 @@ def test_moe_ep_api_generate_c_matches_reference():
     torch.testing.assert_close(actual_metadata, expected_metadata, atol=0, rtol=0)
 
 
+def test_moe_ep_api_backward_allocates_grads():
+    """MoeEp.backward returns the four gradient allocations of the contract."""
+
+    from cudnn import MoeEp
+
+    torch.manual_seed(53)
+    device = torch.device("cuda")
+    experts, tokens, hidden, intermediate, top_k = 2, 4, 32, 16, 2
+    api = MoeEp(
+        num_experts=experts,
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+        top_k=top_k,
+        generate_c=True,
+    )
+    activation = torch.randn(tokens, hidden, dtype=torch.bfloat16, device=device)
+    fc1_weight = torch.randn(experts, hidden, 2 * intermediate, dtype=torch.bfloat16, device=device)
+    fc2_weight = torch.randn(experts, intermediate, hidden, dtype=torch.bfloat16, device=device)
+    topk_idx = torch.tensor([[0, 1], [1, 0], [0, -1], [1, 0]], dtype=torch.int64, device=device)
+    topk_weights = torch.ones(tokens, top_k, device=device)
+
+    _, fc1_c, route_metadata = api(activation, fc1_weight, fc2_weight, topk_idx, topk_weights)
+    grads = api.backward(
+        torch.randn(tokens, hidden, device=device),
+        activation,
+        fc1_weight,
+        fc2_weight,
+        topk_idx,
+        topk_weights,
+        fc1_c,
+        route_metadata,
+    )
+
+    expected_shapes = [
+        (tokens, hidden),
+        (experts, hidden, 2 * intermediate),
+        (experts, intermediate, hidden),
+        (tokens, top_k),
+    ]
+    assert [tuple(grad.shape) for grad in grads] == expected_shapes
+    assert all(grad.dtype == torch.float32 for grad in grads)
+    assert all(grad.device.type == "cuda" for grad in grads)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="MoeEp.backward only allocates gradients; the device implementation is not wired yet",
+)
+def test_moe_ep_api_backward_matches_reference():
+    from cudnn import MoeEp
+
+    torch.manual_seed(59)
+    device = torch.device("cuda")
+    experts, tokens, hidden, intermediate, top_k = 2, 4, 32, 16, 2
+    activation = torch.randn(tokens, hidden, device=device)
+    fc1_weight = torch.randn(experts, hidden, 2 * intermediate, device=device) / 8
+    fc2_weight = torch.randn(experts, intermediate, hidden, device=device) / 8
+    topk_idx = torch.tensor([[0, 1], [1, 0], [0, -1], [1, 0]], dtype=torch.int64, device=device)
+    topk_weights = torch.tensor(
+        [[0.7, 0.3], [0.6, 0.4], [1.0, 0.0], [0.55, 0.45]],
+        dtype=torch.float32,
+        device=device,
+    )
+    grad_output = torch.randn(tokens, hidden, device=device)
+
+    kwargs = dict(
+        num_experts=experts,
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+        top_k=top_k,
+        generate_c=True,
+    )
+    api = MoeEp(**kwargs)
+    reference = MoeEpReference(**kwargs)
+    forward_args = (activation, fc1_weight, fc2_weight, topk_idx, topk_weights)
+    _, ref_fc1_c, ref_metadata = reference(*forward_args)
+    _, api_fc1_c, api_metadata = api(*forward_args)
+
+    actual = api.backward(grad_output, *forward_args, api_fc1_c, api_metadata)
+    expected = reference.backward(grad_output, *forward_args, ref_fc1_c, ref_metadata)
+    for actual_grad, expected_grad in zip(actual, expected):
+        torch.testing.assert_close(actual_grad, expected_grad, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("input_format", ["mxfp8", "nvfp4"])
 @pytest.mark.xfail(
     strict=True,

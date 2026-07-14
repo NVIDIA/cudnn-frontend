@@ -335,5 +335,56 @@ class MoeEp:
         route_metadata = torch.empty((local_routes, 4), dtype=torch.int32, device=device)
         return output, fc1_c, route_metadata
 
+    def backward(
+        self,
+        grad_output: torch.Tensor,
+        activation: MoeTensor,
+        fc1_weight: MoeTensor,
+        fc2_weight: MoeTensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        fc1_c: torch.Tensor,
+        route_metadata: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Allocate gradients for a future backend MoE+EP backward launch.
+
+        Requires ``generate_c=True``; consumes the forward stash
+        (``fc1_c``, ``route_metadata``) plus the re-supplied forward inputs.
+        Returns float32 ``(grad_activation, grad_fc1_weight, grad_fc2_weight,
+        grad_topk_weights)``.  Semantics are defined by
+        ``MoeEpReference.backward``.
+        """
+
+        if not self.generate_c:
+            raise RuntimeError("backward requires the operator to be constructed with generate_c=True")
+        token_count = topk_idx.shape[0]
+        if tuple(grad_output.shape) != (token_count, self.hidden_size):
+            raise ValueError(f"grad_output shape must be {(token_count, self.hidden_size)}, got {tuple(grad_output.shape)}")
+        if not grad_output.is_floating_point():
+            raise TypeError(f"grad_output must be floating point, got {grad_output.dtype}")
+        two_i = 2 * self.intermediate_size
+        if route_metadata.ndim != 2 or route_metadata.shape[1] != 4:
+            raise ValueError(f"route_metadata shape must be (local_routes, 4), got {tuple(route_metadata.shape)}")
+        if tuple(fc1_c.shape) != (int(route_metadata.shape[0]), two_i):
+            raise ValueError(f"fc1_c shape must be {(int(route_metadata.shape[0]), two_i)}, got {tuple(fc1_c.shape)}")
+
+        device = _tensor_device(activation)
+        # TODO: re-dispatch grad_output rows, recompute SwiGLU from fc1_c,
+        # accumulate weight gradients, and return route gradients to sources.
+        return (
+            torch.empty((token_count, self.hidden_size), dtype=torch.float32, device=device),
+            torch.empty(
+                (self.experts_per_rank, self.hidden_size, two_i),
+                dtype=torch.float32,
+                device=device,
+            ),
+            torch.empty(
+                (self.experts_per_rank, self.intermediate_size, self.hidden_size),
+                dtype=torch.float32,
+                device=device,
+            ),
+            torch.empty((token_count, self.top_k), dtype=torch.float32, device=device),
+        )
+
 
 __all__ = ["BlockScaledTensor", "MoeEp", "MoeFormat", "MoeTensor"]
