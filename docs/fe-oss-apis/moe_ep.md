@@ -1,16 +1,14 @@
 # MoE + Expert Parallel API proposal
 
 Status: public API stub, implementation proposal, and executable PyTorch
-reference. The API currently allocates uninitialized output storage without
-launching a device kernel. Its numerical comparison is therefore marked as a
-strict expected failure under `test/python/fe_api/moe_ep`; remove that marker
-when backend execution is connected.
+reference for both forward and backward. The API currently allocates
+uninitialized output storage without launching a device kernel. Its numerical
+comparison is therefore marked as a strict expected failure under
+`test/python/fe_api/moe_ep`; remove that marker when backend execution is
+connected.
 
-This design is based on `mxfp8_glu_mega_instro.html`. It preserves that
-kernel's routing, contiguous expert placement, SwiGLU, optional early router
-weight, internal per-top-k combine plane, and final top-k reduction. It removes
-workspace pointers, peer pointer mappers, streams, and scheduler tuning from the
-semantic user interface.
+The design removes workspace pointers, peer pointer mappers, streams, and
+scheduler tuning from the semantic user interface.
 
 ## Decision summary
 
@@ -25,9 +23,9 @@ semantic user interface.
 - The first half of FC1 is `gate`; the second half is `up`. SwiGLU is
   `silu(gate) * up`.
 - `output_format` means the public, post-top-k-reduction `(T, H)` result. This is
-  an extension of the HTML interface, whose public result is BF16.
+  an extension of the MegaMoE kernel interface, whose public result is BF16.
 - `combine_format` independently describes each per-route FC2 contribution on
-  the EP return path. This corresponds to the HTML's internal `combine_quant`
+  the EP return path. This corresponds to the `combine_quant`
   and `combine_sf` planes.
 - BF16, MXFP8, and NVFP4 are supported for both choices. Quantized output is a
   data-plus-scale object; it is never represented as a scale-free PyTorch
@@ -134,6 +132,10 @@ capacity-based route dropping are outside this first API.
   `logical_shape`, and the scaled axis. `dequantize()` reconstructs a regular
   tensor.
 
+With `generate_c=True`, the call instead returns
+`(output, fc1_c, route_metadata)`; see the training-integration sections
+below.
+
 The return type is fixed by the constructor, so an individual module instance
 does not change its output structure across calls.
 
@@ -185,7 +187,7 @@ public encoding is applied after reduction.
 
 Moving the router weight across FC2 is algebraically equivalent in exact
 arithmetic, but not necessarily after low-precision rounding. The option is
-therefore semantic and is fixed in the constructor, matching the HTML kernel.
+therefore semantic and is fixed in the constructor, matching the MegaMoE kernel.
 
 ## Block-scaled representation
 
@@ -272,9 +274,9 @@ inbound assignments for its documented capacity policy. The conservative bound
 is `ep_size * max_tokens_per_rank * top_k`; a smaller bound requires an explicit
 router capacity/drop contract.
 
-## Mapping to the MegaMoE HTML interface
+## Mapping to the MegaMoE interface
 
-| HTML concept | Proposed API |
+| concept | Proposed API |
 |---|---|
 | `static_expert_shape=(E, 2I, H)` | `num_experts`, `intermediate_size`, `hidden_size` |
 | `world_size` | inferred from `ep_group` |
@@ -412,8 +414,9 @@ The reference is a correctness oracle, not a performance model:
   accumulation order.
 - Scale tensors are logical, not atom-swizzled.
 - It uses collective push communication rather than NVSHMEM pull/remote store.
-- Distributed PyTorch collectives in this reference are not an autograd
-  implementation. The initial scope is inference forward.
+- Backward is an explicit `backward` method that re-dispatches gradients with
+  the same collectives; the reference is not wrapped in a
+  `torch.autograd.Function`, so framework integration supplies that layer.
 - It has no expert-capacity drop policy beyond explicit `-1` routes.
 
 ## Validation and test matrix
@@ -423,10 +426,18 @@ The accompanying tests cover:
 - MXFP8 and NVFP4 quantize/dequantize shape and dtype contracts;
 - quantization along the weight reduction axis;
 - BF16 output for both router-weight locations and gate/up clamp;
-- MXFP8 and NVFP4 public outputs;
+- MXFP8 and NVFP4 quantized combine round-trips;
 - mixed block-scaled activation, FC1, and FC2 inputs;
-- invalid expert IDs;
-- two EP ranks with unequal local token counts and cross-rank routes.
+- `fc1_c`/`route_metadata` capture: values, expert grouping, and row order;
+- backward against autograd replicas — fp32 and block-scaled inputs, both
+  router-weight locations, gate/up clamp, and zero gradient for `-1` routes;
+- four EP ranks (one GPU each, NCCL) with unequal local token counts and
+  cross-rank routes: forward, `fc1_c`/`route_metadata`, and backward gradients;
+- API acceptance of block-scaled inputs and the `generate_c` allocation
+  contract;
+- strict expected-failure gates comparing the API against the reference for
+  every output format, quantized inputs, and `generate_c`, armed until the
+  device kernel lands.
 
 Production validation should add CUDA/NVSHMEM runs for every pair of
 `combine_format` and `output_format`, skewed/all-to-one routing, empty experts,
@@ -443,6 +454,7 @@ more surface area:
 - no shared/dense expert inside this operator;
 - no implicit top-k normalization;
 - no capacity factor or implicit route drop;
-- no backward API;
-- no auxiliary FC1 capture;
+- backward semantics are fixed by `MoeEpReference.backward` (consuming the
+  `generate_c=True` stash); a fused device backward kernel and the
+  `torch.autograd` wrapper are not part of this first version;
 - logical scales at the Python boundary, backend swizzle internally.
