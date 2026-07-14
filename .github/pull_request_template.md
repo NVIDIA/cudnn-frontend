@@ -1,7 +1,7 @@
 ## Before submitting
 
 - [ ] I agree to license this contribution under the terms of [LICENSE.txt](https://github.com/NVIDIA/cudnn-frontend/blob/develop/LICENSE.txt).
-- [ ] I ran `pre-commit run --all-files` and committed any formatting changes.
+- [ ] I ran `pre-commit run` and committed any formatting changes.
 
 ## Affected area
 
