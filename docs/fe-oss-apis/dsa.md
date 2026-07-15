@@ -6,8 +6,8 @@
 
 The DeepSeek Sparse Attention (DSA) module integrates a set of CuTe-DSL
 kernels that support the sparse-attention path used by DeepSeek-style models.
-Most kernels target Hopper (SM90) and Blackwell (SM100+) GPUs; Indexer
-Forward and Indexer Top-K remain SM100+ only. The kernels are
+Most kernels target Hopper (SM90) and Blackwell (SM100+) GPUs; Indexer Top-K
+remains SM100+ only. The kernels are
 delivered as Python classes / wrappers that follow the same `APIBase`
 pattern as other cuDNN Frontend operations.
 
