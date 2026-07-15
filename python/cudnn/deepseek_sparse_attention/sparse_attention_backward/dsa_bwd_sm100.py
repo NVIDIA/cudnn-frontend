@@ -115,6 +115,14 @@ class FlashAttentionDSABackwardSm100:
             barrier_id=9,
             num_threads=(self.num_reduce_warps + 1) * self.threads_per_warp,
         )
+        # Orders the reduce warps dKV2/dKV3 T2R reads before the MMA warp
+        # overwrites those TMEM columns with the next iteration dKV0/dKV1
+        # (dKV2 aliases dKV0, dKV3 aliases dKV1). barrier_id 9 is taken by
+        # tmem_dealloc_barrier above, so this uses the next free slot.
+        self.t2r_dKV23_done_barrier = pipeline.NamedBarrier(
+            barrier_id=10,
+            num_threads=(self.num_reduce_warps + 1) * self.threads_per_warp,
+        )
 
         self.tmem_S_offset = 0
         self.tmem_dP_offset = 0
@@ -1506,6 +1514,15 @@ class FlashAttentionDSABackwardSm100:
             mma_reduce_dKV_pipeline.producer_acquire(mma_reduce_dKV_producer_state)
 
             # dKV0
+            # Wait for the reduce warps to finish the T2R of dKV2/dKV3 from
+            # the previous iteration before overwriting their TMEM columns:
+            # dKV0 aliases dKV2 and dKV1 aliases dKV3, and the producer_acquire
+            # above only orders against the consumer_release from two
+            # generations back (the dKV4 generation), not against the dKV2/dKV3
+            # reads of the previous generation.
+            if cutlass.const_expr(not self.same_hdim_kv):
+                if not is_first_mma:
+                    self.t2r_dKV23_done_barrier.arrive_and_wait()
             dOP_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
             for k_block in cutlass.range(0, cute.size(tdKVrP, mode=[2]), unroll=2):
                 cute.gemm(
@@ -1716,6 +1733,10 @@ class FlashAttentionDSABackwardSm100:
 
         if cutlass.const_expr(self.same_hdim_kv):
             self.t2r_dKV4_done_barrier.arrive_and_wait()
+        else:
+            # Balance the reduce warps' final t2r_dKV23_done arrive (the
+            # in-loop wait is skipped on the first iteration).
+            self.t2r_dKV23_done_barrier.arrive_and_wait()
 
         mma_compute_dQ_pipeline.producer_commit(mma_compute_dQ_producer_state)
         mma_compute_dQ_producer_state.advance()
@@ -2225,8 +2246,18 @@ class FlashAttentionDSABackwardSm100:
                 self.store_dKV(mdKV_acc, tdKVtdKV2, rTopkIdx, 2)
                 self.reduce_dKV_from_reg(mdKV_acc, rdKV3, rTopkIdx, 3)
             else:
-                self.store_dKV(mdKV_acc, tdKVtdKV2, rTopkIdx, 2)
-                self.store_dKV(mdKV_acc, tdKVtdKV3, rTopkIdx, 3)
+                # T2R dKV2/dKV3 into registers, then signal the MMA warp that
+                # the TMEM columns are free for the next iteration's dKV0/dKV1
+                # before doing the (slow) global atomic reduction. Reading
+                # them from TMEM inside store_dKV after this point would race
+                # the next iteration's dKV0/dKV1 overwrites, which nothing
+                # else orders against these reads.
+                rdKV2 = self.t2r_dKV(tdKVtdKV2)
+                rdKV3 = self.t2r_dKV(tdKVtdKV3)
+                cute.arch.fence_view_async_tmem_load()
+                self.t2r_dKV23_done_barrier.arrive_and_wait()
+                self.reduce_dKV_from_reg(mdKV_acc, rdKV2, rTopkIdx, 2)
+                self.reduce_dKV_from_reg(mdKV_acc, rdKV3, rTopkIdx, 3)
 
             mma_reduce_dKV_pipeline.consumer_release(mma_reduce_dKV_consumer_state)
             mma_reduce_dKV_consumer_state.advance()
