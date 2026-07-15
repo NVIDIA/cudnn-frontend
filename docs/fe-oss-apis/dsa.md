@@ -6,8 +6,8 @@
 
 The DeepSeek Sparse Attention (DSA) module integrates a set of CuTe-DSL
 kernels that support the sparse-attention path used by DeepSeek-style models.
-Most kernels target Hopper (SM90) and Blackwell (SM100+) GPUs; Indexer
-Forward and Indexer Top-K remain SM100+ only. The kernels are
+Most kernels target Hopper (SM90) and Blackwell (SM100+) GPUs; Indexer Top-K
+remains SM100+ only. The kernels are
 delivered as Python classes / wrappers that follow the same `APIBase`
 pattern as other cuDNN Frontend operations.
 
@@ -151,7 +151,9 @@ compressed column 0.
   - `q_causal_offsets` (optional): CUDA INT32 tensor with one entry per
     batch/THD segment, on the same device as `q`.
 - **Output** — `scores`: `(B, S_q, S_k)` FP32
-- **Constraints** — SM100+, `head_dim == 128`, `qhead_per_kv_head ∈ {32, 64}`
+- **Constraints** — `head_dim == 128`. The SM90 direct path supports
+  `qhead_per_kv_head ∈ {16, 32, 64}` and currently requires `H_kv == 1`;
+  SM100 supports `qhead_per_kv_head ∈ {32, 64}`.
 
 ```python
 result = DSA.indexer_forward_wrapper(
@@ -279,12 +281,13 @@ result = DSA.dense_indexer_backward_wrapper(
 
 ## Limitations
 
-- **Architecture support** — Sparse Attention Backward, Score Recompute, and
-  Indexer Backward support SM90 and SM100; Indexer Forward and Indexer Top-K
-  remain SM100+ only.
+- **Architecture support** — Sparse Attention Backward, Score Recompute,
+  Indexer Forward, and Indexer Backward support SM90 and SM100; Indexer Top-K
+  remains SM100+ only.
 - **No fused forward** — the production forward is FlashMLA (C++); this
   module ships only the CuTe-DSL kernels.
-- **Indexer Forward only supports `head_dim = 128`** and
+- **Indexer Forward only supports `head_dim = 128`**. SM90 supports
+  `qhead_per_kv_head ∈ {16, 32, 64}` with `H_kv = 1`; SM100 supports
   `qhead_per_kv_head ∈ {32, 64}`.
 - **Top-K only up to 2048**; `top_k > 2048` is not supported by the
   underlying radix top-K kernel.

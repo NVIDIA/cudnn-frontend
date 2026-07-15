@@ -66,7 +66,10 @@ def ref_sparse_attention_forward(
 
     q_f = q.to(torch.float32)
     k_f = kv.to(torch.float32)
-    v_f = kv.to(torch.float32)
+    # The 576-wide MLA path uses all 576 dimensions for QK and the first 512
+    # dimensions for V. The 512-wide path keeps K and V identical.
+    head_dim_v = 512 if d == 576 else d
+    v_f = kv[:, :head_dim_v].to(torch.float32)
 
     mask = _make_topk_mask(topk_idxs, topk_length, t_kv)  # (T, T_kv)
     mask = mask.unsqueeze(1).expand(t, h, t_kv)  # (T, H, T_kv)
