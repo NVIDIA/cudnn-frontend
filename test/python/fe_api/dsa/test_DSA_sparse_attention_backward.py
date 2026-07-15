@@ -216,3 +216,89 @@ def test_DSA_sparse_attention_backward_qh32_uses_per_query_topk_without_padding(
         atol=5e-2,
         rtol=5e-2,
     )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_DSA_sparse_attention_backward_staged_store():
+    """Regression test for the staged P/dS store paths of the SM100 kernel.
+
+    The compute->MMA smem handoff for P and dS must stay correct when
+    compute_mma_P_stage / compute_mma_dS_stage are raised above 1: the
+    store-side layouts and the per-iteration store slot have to follow the
+    producer pipeline state. This test deepens both pipelines to 2 and
+    requires dq to match the stage-1 baseline bitwise (dq is written by TMA
+    with a single writer per element, hence deterministic; dkv/d_sink are
+    fp32 atomic reductions, so they are only gated on NaN and relative
+    parity).
+    """
+    try:
+        from cudnn import DSA
+        from cudnn.deepseek_sparse_attention.sparse_attention_backward import (
+            api as _dsa_bwd_api,
+            _interface_sm100 as _dsa_bwd_iface,
+            dsa_bwd_sm100 as _dsa_bwd_kmod,
+        )
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    major, minor = torch.cuda.get_device_capability()
+    if major * 10 + minor < 100:
+        pytest.skip("staged-store regression test targets the SM100 kernel")
+
+    s_q = s_kv = 512
+    h, d, topk = 64, 512, 256  # topk/64 = 4 tiles -> the pipelines really cycle
+    device = "cuda"
+    q = torch.randn(s_q, h, d, dtype=torch.bfloat16, device=device) / 10
+    kv = torch.randn(s_kv, d, dtype=torch.bfloat16, device=device) / 10
+    attn_sink = torch.randn(h, dtype=torch.float32, device=device)
+    topk_idxs = torch.stack([torch.randperm(s_kv, device=device)[:topk] for _ in range(s_q)]).to(torch.int32)
+    topk_length = torch.full((s_q,), topk, dtype=torch.int32, device=device)
+    softmax_scale = 1.0 / math.sqrt(d)
+
+    out, lse = ref_sparse_attention_forward(q, kv, attn_sink, topk_idxs, topk_length=topk_length, softmax_scale=softmax_scale)
+    dout = torch.randn_like(out)
+
+    orig_setup = _dsa_bwd_kmod.FlashAttentionDSABackwardSm100._setup_attributes
+
+    def run(stage_overrides):
+        def patched(self):
+            orig_setup(self)
+            for name, value in stage_overrides.items():
+                setattr(self, name, value)
+
+        _dsa_bwd_kmod.FlashAttentionDSABackwardSm100._setup_attributes = patched
+        _dsa_bwd_iface.flash_attn_bwd_sm100.compile_cache.clear()
+        _dsa_bwd_api._cache_of_SparseAttentionBackwardObjects.clear()
+        try:
+            result = DSA.sparse_attention_backward_wrapper(
+                q,
+                kv,
+                out,
+                dout,
+                lse,
+                attn_sink,
+                topk_idxs,
+                softmax_scale=softmax_scale,
+                topk_length=topk_length,
+            )
+            torch.cuda.synchronize()
+            return result["dq"], result["dkv"], result["d_sink"]
+        finally:
+            _dsa_bwd_kmod.FlashAttentionDSABackwardSm100._setup_attributes = orig_setup
+            _dsa_bwd_iface.flash_attn_bwd_sm100.compile_cache.clear()
+            _dsa_bwd_api._cache_of_SparseAttentionBackwardObjects.clear()
+
+    dq_ref, dkv_ref, d_sink_ref = run({})
+    assert not torch.isnan(dq_ref).any(), "stage-1 baseline produced NaN"
+
+    dq, dkv, d_sink = run({"compute_mma_P_stage": 2, "compute_mma_dS_stage": 2})
+
+    assert not torch.isnan(dq).any() and not torch.isnan(dkv).any() and not torch.isnan(d_sink).any(), "staged store paths produced NaN gradients"
+    assert torch.equal(dq, dq_ref), "dq must be bitwise-identical between stage 1 and stage 2"
+
+    def rel_l2(a, b):
+        return ((a.float() - b.float()).norm() / b.float().norm().clamp_min(1e-30)).item()
+
+    assert rel_l2(dkv, dkv_ref) < 1e-4, "dkv parity vs stage-1 baseline"
+    assert rel_l2(d_sink, d_sink_ref) < 1e-4, "d_sink parity vs stage-1 baseline"
