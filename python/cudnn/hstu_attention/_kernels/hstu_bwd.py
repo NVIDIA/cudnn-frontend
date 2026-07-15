@@ -95,9 +95,6 @@ class HSTUAttentionBackwardSm100:
         kBlockN: int,
         is_causal: bool = False,
         is_local: bool = False,
-        is_context: bool = False,
-        is_target: bool = False,
-        target_group_size: int = 1,
         is_arbitrary: bool = False,
         func_num: int = 0,
     ):
@@ -147,12 +144,9 @@ class HSTUAttentionBackwardSm100:
         self.cluster_shape_mn = (1, 1)
         self.is_causal = is_causal
         self.is_local = is_local
-        self.is_context = is_context
-        self.is_target = is_target
-        self.target_group_size = target_group_size
         self.is_arbitrary = is_arbitrary
         self.func_num = func_num
-        assert not (self.is_arbitrary and (self.is_causal or self.is_local or self.is_context or self.is_target)), "a and b cannot both be True"
+        assert not (self.is_arbitrary and (self.is_causal or self.is_local)), "a and b cannot both be True"
 
         self.reduce_warp_id = (0, 1, 2, 3)
         self.compute_warp_id = (4, 5, 6, 7, 8, 9, 10, 11)
@@ -232,8 +226,6 @@ class HSTUAttentionBackwardSm100:
         cu_seqlens_k: cute.Tensor,
         window_size_left: Optional[Int32],
         window_size_right: Optional[Int32],
-        num_contexts: Optional[cute.Tensor],
-        num_targets: Optional[cute.Tensor],
         func: Optional[cute.Tensor],
         alpha: Float32,
         scaling_seqlen: Float32,
@@ -606,8 +598,6 @@ class HSTUAttentionBackwardSm100:
             cu_seqlens_k,
             window_size_left,
             window_size_right,
-            num_contexts,
-            num_targets,
             func,
             alpha,
             scaling_seqlen,
@@ -686,8 +676,6 @@ class HSTUAttentionBackwardSm100:
         cu_seqlens_k: Union[cute.Tensor, None],
         window_size_left: Optional[Int32],
         window_size_right: Optional[Int32],
-        num_contexts: Optional[cute.Tensor],
-        num_targets: Optional[cute.Tensor],
         func: Optional[cute.Tensor],
         alpha: Float32,
         scaling_seqlen: Float32,
@@ -849,14 +837,11 @@ class HSTUAttentionBackwardSm100:
         max_seqlen_k = Float32(problem_shape[1])
         Q_len_cur_batch = cu_seqlens_q[bidz + 1] - cu_seqlens_q[bidz]
         K_len_cur_batch = cu_seqlens_k[bidz + 1] - cu_seqlens_k[bidz]
-        num_contexts_cur_batch = num_contexts[bidz] if num_contexts is not None else 0
-        num_history_cur_batch = K_len_cur_batch - num_targets[bidz] if num_targets is not None else K_len_cur_batch
         func = func[0, None, None] if func is not None else None
         sValidBlockIdsTensor = cute.make_tensor(storage.sValidBlockIds.data_ptr(), self.MaxValidBlock)
         block_info = BWDBlockInfo(
             # This is cta_tiler, not mma_tiler_qk, since we move by block by (2 * mma_tiler[0], mma_tiler[1])
             self.kBlockM, self.kBlockN, self.cta_tiler, self.is_causal, self.is_local,
-            self.is_context, self.is_target, self.target_group_size,
             window_size_left, window_size_right,
             storage.sm_valid_block_max.data_ptr(), sValidBlockIdsTensor,
             self.func_num, func,
@@ -875,7 +860,6 @@ class HSTUAttentionBackwardSm100:
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
             cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
-            num_contexts=num_contexts, num_targets=num_targets,
         )
         problem_shape_cur_batch = (
             Q_len_cur_batch,
@@ -898,13 +882,13 @@ class HSTUAttentionBackwardSm100:
 
         AttentionMaskCls = partial(
             AttentionMask, self.kBlockM, self.kBlockN, self.cta_tiler,
-            self.is_arbitrary, self.is_causal, self.is_local, self.is_context, self.is_target,
-            target_group_size=self.target_group_size, func_num=self.func_num,
+            self.is_arbitrary, self.is_causal, self.is_local,
+            func_num=self.func_num,
             window_size_left=window_size_left, window_size_right=window_size_right,
             offset_dynamic=0,
             swapAB=True,
         )
-        mask = AttentionMaskCls(offset_q=cu_seqlens_q[bidz], seqlen_q=Q_len_cur_batch, seqlen_k=K_len_cur_batch, seqlen_c=num_contexts_cur_batch, seqlen_h=num_history_cur_batch, func=func)
+        mask = AttentionMaskCls(offset_q=cu_seqlens_q[bidz], seqlen_q=Q_len_cur_batch, seqlen_k=K_len_cur_batch, func=func)
 
         if bidx * self.tile_shape_K < problem_shape_cur_batch[1]:
             iter_count -= iter_start
@@ -1238,14 +1222,14 @@ class HSTUAttentionBackwardSm100:
          #compute m_block info & init m_block
         n_block = blk_coord_k
         offset_dynamic = 0
-        m_block_min, m_block_max, m_masking_steps, is_in_context, m_block_context = block_info.get_m_block_info(seqlen_obj, n_block, offset_dynamic)
+        m_block_min, m_block_max, m_masking_steps = block_info.get_m_block_info(seqlen_obj, n_block, offset_dynamic)
 
         if cutlass.const_expr(self.is_arbitrary):
             m_block_max, m_block_min = block_info.get_bwd_valid_block_ids(seqlen_obj, n_block, m_block_min, m_block_max, is_calwarp=True)
 
         sValidBlockIds = block_info.sValidBlockIds
 
-        m_block = 0 if is_in_context else m_block_min # we We start iterating from zero
+        m_block = m_block_min
 
         m_block = sValidBlockIds[m_block] if cutlass.const_expr(self.is_arbitrary) else m_block
 
@@ -1425,7 +1409,7 @@ class HSTUAttentionBackwardSm100:
         n_block = blk_coord_k
 
         offset_dynamic = 0
-        m_block_min, m_block_max, m_masking_steps, is_in_context, m_block_context = block_info.get_m_block_info(seqlen_obj, n_block, offset_dynamic) #TODO m_masking_steps what is m_masking_steps here? and  do we need it? [cause load don't need it]
+        m_block_min, m_block_max, m_masking_steps = block_info.get_m_block_info(seqlen_obj, n_block, offset_dynamic) #TODO m_masking_steps what is m_masking_steps here? and  do we need it? [cause load don't need it]
         if cutlass.const_expr(self.is_arbitrary):
             m_block_max, m_block_min = block_info.get_bwd_valid_block_ids(seqlen_obj, n_block, m_block_min, m_block_max, is_calwarp=False)
 
@@ -1740,12 +1724,12 @@ class HSTUAttentionBackwardSm100:
 
         n_block = blk_coord_k
         offset_dynamic = 0
-        m_block_min, m_block_max, m_masking_steps, is_in_context, m_block_context = block_info.get_m_block_info(seqlen_obj, n_block, offset_dynamic)
+        m_block_min, m_block_max, m_masking_steps = block_info.get_m_block_info(seqlen_obj, n_block, offset_dynamic)
 
         if cutlass.const_expr(self.is_arbitrary):
             m_block_max, m_block_min = block_info.get_bwd_valid_block_ids(seqlen_obj, n_block, m_block_min, m_block_max, is_calwarp=False)
         #define m_block
-        m_block = 0  if cutlass.const_expr(self.is_context) else m_block_min #so this m_block_min is 0 for is_arbitary
+        m_block = m_block_min
         sValidBlockIds = block_info.sValidBlockIds
 
         (
@@ -1871,28 +1855,19 @@ class HSTUAttentionBackwardSm100:
                     compute_mma_P_producer_state = compute_mma_P_producer_state,
                     mma_compute_dP_consumer_state = mma_compute_dP_consumer_state,
                     compute_mma_dS_producer_state = compute_mma_dS_producer_state,
-                    mask_fn = partial(mask_fn, mask_casual=True, mask_target=False, mask_seqlen=True))
+                    mask_fn = partial(mask_fn, mask_casual=True, mask_seqlen=True))
 
                     m_block += 1
 
             while m_block < m_block_max and masking_step < m_masking_steps:
                 m_block_valid = m_block
-                if cutlass.const_expr(self.is_target) and (n_block + 1) * self.kBlockN > seqlen_obj.seqlen_h:
-                    mma_compute_S_consumer_state, compute_mma_P_producer_state, mma_compute_dP_consumer_state, compute_mma_dS_producer_state = compute_mask_step(
-                    m_block_valid = m_block_valid,
-                    mma_compute_S_consumer_state = mma_compute_S_consumer_state,
-                    compute_mma_P_producer_state = compute_mma_P_producer_state,
-                    mma_compute_dP_consumer_state = mma_compute_dP_consumer_state,
-                    compute_mma_dS_producer_state = compute_mma_dS_producer_state,
-                    mask_fn = partial(mask_fn, mask_casual=True, mask_target=True, mask_seqlen=True))
-                else:
-                    mma_compute_S_consumer_state, compute_mma_P_producer_state, mma_compute_dP_consumer_state, compute_mma_dS_producer_state = compute_mask_step(
-                    m_block_valid = m_block_valid,
-                    mma_compute_S_consumer_state = mma_compute_S_consumer_state,
-                    compute_mma_P_producer_state = compute_mma_P_producer_state,
-                    mma_compute_dP_consumer_state = mma_compute_dP_consumer_state,
-                    compute_mma_dS_producer_state = compute_mma_dS_producer_state,
-                    mask_fn = partial(mask_fn, mask_casual=True, mask_target=False, mask_seqlen=True))
+                mma_compute_S_consumer_state, compute_mma_P_producer_state, mma_compute_dP_consumer_state, compute_mma_dS_producer_state = compute_mask_step(
+                m_block_valid = m_block_valid,
+                mma_compute_S_consumer_state = mma_compute_S_consumer_state,
+                compute_mma_P_producer_state = compute_mma_P_producer_state,
+                mma_compute_dP_consumer_state = mma_compute_dP_consumer_state,
+                compute_mma_dS_producer_state = compute_mma_dS_producer_state,
+                mask_fn = partial(mask_fn, mask_casual=True, mask_seqlen=True))
 
                 masking_step += 1
                 m_block += 1
@@ -1917,7 +1892,7 @@ class HSTUAttentionBackwardSm100:
                     compute_mma_P_producer_state = compute_mma_P_producer_state,
                     mma_compute_dP_consumer_state = mma_compute_dP_consumer_state,
                     compute_mma_dS_producer_state = compute_mma_dS_producer_state,
-                    mask_fn = partial(mask_fn, mask_casual=False, mask_target=False, mask_seqlen=True))
+                    mask_fn = partial(mask_fn, mask_casual=False, mask_seqlen=True))
 
                 m_block += 1
 
@@ -2088,12 +2063,12 @@ class HSTUAttentionBackwardSm100:
 
         n_block = blk_coord_k
         offset_dynamic = 0
-        m_block_min, m_block_max, m_masking_steps, is_in_context, m_block_context = block_info.get_m_block_info(seqlen_obj, n_block, offset_dynamic) #TODO m_masking_steps what is m_masking_steps here? and  do we need it? [cause load don't need it]
+        m_block_min, m_block_max, m_masking_steps = block_info.get_m_block_info(seqlen_obj, n_block, offset_dynamic) #TODO m_masking_steps what is m_masking_steps here? and  do we need it? [cause load don't need it]
 
         if cutlass.const_expr(self.is_arbitrary):
             m_block_max, m_block_min = block_info.get_bwd_valid_block_ids(seqlen_obj, n_block, m_block_min, m_block_max, is_calwarp=False)
         #define the init m_block id
-        m_block = 0 if cutlass.const_expr(self.is_context) else m_block_min
+        m_block = m_block_min
         sValidBlockIds = block_info.sValidBlockIds
 
         mma_reduce_dQ_pipeline, reduce_tma_store_pipeline = pipeline_args

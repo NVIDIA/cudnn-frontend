@@ -596,7 +596,7 @@ def test_varlen_tail_and_asymmetric_lengths_match_pytorch():
 
 @pytest.mark.L0
 @pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
-@pytest.mark.parametrize("mask_mode", ["full", "local", "target", "arbitrary"])
+@pytest.mark.parametrize("mask_mode", ["full", "local", "arbitrary"])
 def test_mask_modes_match_pytorch(mask_mode):
     q, k, v, do, cu = _inputs(heads=1)
     seqlen = q.shape[0]
@@ -606,27 +606,11 @@ def test_mask_modes_match_pytorch(mask_mode):
     col = torch.arange(seqlen, device=q.device)[None, :]
 
     window_size = (-1, -1)
-    num_targets = None
-    target_group_size = 1
     func = None
     mask = torch.ones((seqlen, seqlen), dtype=torch.bool, device=q.device)
     if mask_mode == "local":
         window_size = (16, 8)
         mask = (col >= row - 16) & (col <= row + 8)
-    elif mask_mode == "target":
-        window_size = (-1, 0)
-        target_group_size = 4
-        num_targets = torch.tensor([32], dtype=torch.int32, device=q.device)
-        history_len = seqlen - int(num_targets[0])
-        target_index = torch.div(
-            row - history_len,
-            target_group_size,
-            rounding_mode="floor",
-        )
-        target_left = history_len + target_index * target_group_size
-        mask = (col <= row) & ~(
-            (row >= history_len) & (col >= history_len) & (col < target_left)
-        )
     elif mask_mode == "arbitrary":
         func = torch.full(
             (1, 3, seqlen + 256),
@@ -663,8 +647,6 @@ def test_mask_modes_match_pytorch(mask_mode):
         cu,
         max_seqlen_q=seqlen,
         max_seqlen_k=seqlen,
-        num_targets_tensor=num_targets,
-        target_group_size=target_group_size,
         window_size=window_size,
         alpha=alpha,
         scaling_seqlen=scaling_seqlen,
@@ -686,8 +668,6 @@ def test_mask_modes_match_pytorch(mask_mode):
         cu,
         max_seqlen_q=seqlen,
         max_seqlen_k=seqlen,
-        num_targets_tensor=num_targets,
-        target_group_size=target_group_size,
         window_size=window_size,
         alpha=alpha,
         scaling_seqlen=scaling_seqlen,

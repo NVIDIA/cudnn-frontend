@@ -112,13 +112,9 @@ def hstu_varlen_fwd_100(
     cu_seqlens_k: torch.Tensor,
     max_seqlen_q: int,
     max_seqlen_k: int,
-    num_contexts: Optional[torch.Tensor],
-    num_targets: Optional[torch.Tensor],
-    target_group_size: int,
     window_size_left: int,
     window_size_right: int,
     alpha: float,
-    rab: torch.Tensor,
     func: torch.Tensor,
     paged_kv: Optional[torch.Tensor] = None,
     page_ids: Optional[torch.Tensor] = None,
@@ -141,8 +137,6 @@ def hstu_varlen_fwd_100(
     assert head_dim == head_dim_v, "head_dim and head_dim_v must be equal"
     assert head_dim in (64, 128, 256), "Only support head_dim 64, 128 and 256"
 
-    assert rab is None, "rab is not supported in Blackwell forward kernel"
-
     kBlockM = 128
     kBlockN = 128
     window_size_left = (
@@ -159,12 +153,6 @@ def hstu_varlen_fwd_100(
     is_local = (
         window_size_left < max_seqlen_k or window_size_right < max_seqlen_k
     ) and not is_causal
-    is_context = num_contexts is not None
-    assert not is_context, "HSTU-Blackwell does not support context mask (num_contexts)"
-    is_target = num_targets is not None
-    assert not (
-        is_target and not is_causal
-    ), "Target mask is True, but causal mask is False, this is undefined behavior."
     is_arbitrary = func is not None
     func_num = func.shape[-2] if func is not None else 0
     is_paged = paged_kv is not None
@@ -172,9 +160,9 @@ def hstu_varlen_fwd_100(
         assert (
             is_causal
         ), "Paged KV is True, but causal mask is False, this is not supported."
-        assert (not is_local) and (
-            not is_context
-        ), "Paged KV is True, but local/context mask is True, this is not supported."
+        assert not is_local, (
+            "Paged KV is True, but local mask is True, this is not supported."
+        )
         assert (
             not is_arbitrary
         ), "Paged KV is True, but arbitrary mask is True, this is not supported."
@@ -206,9 +194,6 @@ def hstu_varlen_fwd_100(
         kBlockN,
         is_causal,
         is_local,
-        is_context,
-        is_target,
-        target_group_size,
         is_arbitrary,
         is_paged,
         func_num,
@@ -251,10 +236,7 @@ def hstu_varlen_fwd_100(
             _mark_dynamic_tensor(tensor, tensor.ndim - 1)
             for tensor in (cu_seqlens_q, cu_seqlens_k)
         ]
-        num_contexts_tensor, num_targets_tensor, func_tensor = [
-            _mark_optional_tensor(tensor)
-            for tensor in (num_contexts, num_targets, func)
-        ]
+        func_tensor = _mark_optional_tensor(func)
         paged_kv_tensor, page_ids_tensor, page_indptrs_tensor = [
             _mark_optional_tensor(tensor)
             for tensor in (paged_kv_flat, page_ids, page_indptrs)
@@ -264,9 +246,6 @@ def hstu_varlen_fwd_100(
             head_dim=head_dim,
             is_causal=is_causal,
             is_local=is_local,
-            is_context=is_context,
-            is_target=is_target,
-            target_group_size=target_group_size,
             is_arbitrary=is_arbitrary,
             is_paged=is_paged,
             func_num=func_num,
@@ -284,8 +263,6 @@ def hstu_varlen_fwd_100(
                 max_seqlen_k,
                 cu_seqlens_q_tensor,
                 cu_seqlens_k_tensor,
-                num_contexts_tensor,
-                num_targets_tensor,
                 alpha,
                 scaling_seqlen,
                 compile_stream,
@@ -312,8 +289,6 @@ def hstu_varlen_fwd_100(
             max_seqlen_k,
             cu_seqlens_q,
             cu_seqlens_k,
-            num_contexts,
-            num_targets,
             alpha,
             scaling_seqlen,
             window_size_left,
@@ -342,14 +317,9 @@ def hstu_varlen_bwd_100(
     dq: Optional[torch.Tensor],
     dk: Optional[torch.Tensor],
     dv: Optional[torch.Tensor],
-    num_contexts: torch.Tensor,
-    num_targets: torch.Tensor,
-    target_group_size: int,
     window_size_left: int,
     window_size_right: int,
     alpha: float,
-    rab: torch.Tensor,
-    has_drab: bool,
     func: torch.Tensor,
     deterministic: bool,
     scaling_seqlen: Optional[float] = None,
@@ -398,18 +368,8 @@ def hstu_varlen_bwd_100(
     is_local = (
         window_size_left < max_seqlen_k or window_size_right < max_seqlen_k
     ) and not is_causal
-    is_context = num_contexts is not None
-    assert not is_context, "HSTU-Blackwell does not support context mask (num_contexts)"
-    is_target = num_targets is not None
-    assert not (
-        is_target and not is_causal
-    ), "Target mask is True, but causal mask is False, this is undefined behavior."
     is_arbitrary = func is not None
     func_num = func.shape[-2] if func is not None else 0
-
-    assert rab is None, "rab is not supported in Blackwell backward kernel"
-    assert not has_drab, "drab is not supported in Blackwell backward kernel"
-    drab = None
 
     q_orig, k_orig, v_orig = q, k, v
     dq_orig, dk_orig, dv_orig = dq, dk, dv
@@ -442,9 +402,6 @@ def hstu_varlen_bwd_100(
         use_original_grad_layout,
         is_causal,
         is_local,
-        is_context,
-        is_target,
-        target_group_size,
         is_arbitrary,
         func_num,
     )
@@ -454,7 +411,7 @@ def hstu_varlen_bwd_100(
                 torch.empty_like(tensor, memory_format=torch.preserve_format)
                 for tensor in (q_orig, k_orig, v_orig)
             ]
-        return dq_orig, dk_orig, dv_orig, drab
+        return dq_orig, dk_orig, dv_orig
 
     if use_original_qkv_layout:
         q = _as_bwd_original_qkv_layout(q)
@@ -551,10 +508,7 @@ def hstu_varlen_bwd_100(
             _mark_dynamic_tensor(tensor, tensor.ndim - 1)
             for tensor in (cu_seqlens_q, cu_seqlens_k)
         ]
-        num_contexts_tensor, num_targets_tensor, func_tensor = [
-            _mark_optional_tensor(tensor)
-            for tensor in (num_contexts, num_targets, func)
-        ]
+        func_tensor = _mark_optional_tensor(func)
         workspace = _mark_dynamic_tensor(
             workspace_torch,
             workspace_torch.ndim - 1,
@@ -567,9 +521,6 @@ def hstu_varlen_bwd_100(
             kBlockN=kBlockN,
             is_causal=is_causal,
             is_local=is_local,
-            is_context=is_context,
-            is_target=is_target,
-            target_group_size=target_group_size,
             is_arbitrary=is_arbitrary,
             func_num=func_num,
         )
@@ -588,8 +539,6 @@ def hstu_varlen_bwd_100(
                 cu_seqlens_k_tensor,
                 Int32(window_size_left),
                 Int32(window_size_right),
-                num_contexts_tensor,
-                num_targets_tensor,
                 func_tensor,
                 alpha,
                 scaling_seqlen,
@@ -599,7 +548,7 @@ def hstu_varlen_bwd_100(
             )
 
     if _compile_only:
-        return dq_orig, dk_orig, dv_orig, drab
+        return dq_orig, dk_orig, dv_orig
 
     with torch.cuda.nvtx.range("hstu_varlen_bwd_kernel"):
         compiled_bwd = hstu_varlen_bwd_100.compile_cache[compile_key]
@@ -616,8 +565,6 @@ def hstu_varlen_bwd_100(
             cu_seqlens_k,
             Int32(window_size_left),
             Int32(window_size_right),
-            num_contexts,
-            num_targets,
             func,
             alpha,
             scaling_seqlen,
@@ -625,7 +572,7 @@ def hstu_varlen_bwd_100(
         )
 
     if use_original_grad_layout:
-        return dq_orig, dk_orig, dv_orig, drab
+        return dq_orig, dk_orig, dv_orig
 
     dq = dq.squeeze(4).squeeze(2).permute(0, 2, 1)
     dk = dk.squeeze(4).squeeze(2).permute(0, 2, 1)
@@ -638,7 +585,7 @@ def hstu_varlen_bwd_100(
     if dv_orig is not None:
         dv_orig.copy_(dv)
 
-    return dq, dk, dv, drab
+    return dq, dk, dv
 
 
 hstu_varlen_bwd_100.compile_cache = {}

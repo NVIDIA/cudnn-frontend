@@ -10,7 +10,7 @@ attention head $h$, let $Q_h, K_h \in \mathbb{R}^{L \times d}$ and
 $V_h \in \mathbb{R}^{L \times d_v}$. The operation is
 
 $$
-S_h = \alpha Q_h K_h^T + R_h,
+S_h = \alpha Q_h K_h^T,
 $$
 
 $$
@@ -33,11 +33,6 @@ $L_{\mathrm{scale}}$ is exposed as `scaling_seqlen`. If
 Transformer attention, HSTU applies SiLU to the scores and does **not** perform
 row-wise softmax normalization. This matches the requested operation in
 [issue #369](https://github.com/NVIDIA/cudnn-frontend/issues/369).
-
-The current SM100 implementation does not support the optional relative
-attention bias $R_h$; callers must use `rab=None`. The equation above states
-the complete HSTU operator definition, while the support tables below describe
-the currently implemented subset.
 
 ## Installation
 
@@ -82,10 +77,10 @@ currently exposes multi-head attention rather than GQA or MQA.
 
 The API validates tensor metadata (rank, shape, dtype, device, and layout) but
 trusts the values stored in CUDA metadata tensors such as `cu_seqlens_q`,
-`cu_seqlens_k`, `num_targets`, `page_ids`, and `page_indptrs`. It does not copy
-those values to the host before launch. Callers provide `max_seqlen_q` and
-`max_seqlen_k` explicitly; `scaling_seqlen=None` then uses the supplied
-`max_seqlen_q` without inspecting `cu_seqlens_q` on the host.
+`cu_seqlens_k`, `page_ids`, and `page_indptrs`. It does not copy those values
+to the host before launch. Callers provide `max_seqlen_q` and `max_seqlen_k`
+explicitly; `scaling_seqlen=None` then uses the supplied `max_seqlen_q` without
+inspecting `cu_seqlens_q` on the host.
 
 Tensors must have non-overlapping storage and a 16-byte-aligned base pointer.
 The wrapper can adapt some otherwise non-contiguous packed views, but naturally
@@ -169,13 +164,10 @@ usage.
 | Full attention | `window_size=(-1, -1)` | Forward and backward |
 | Causal | `window_size=(-1, 0)` | Forward and backward |
 | Local/sliding window | finite left and/or right bound | Forward and backward |
-| Target-group mask | `num_targets` with a causal window | Forward and backward |
 | Arbitrary mask | CUDA `int32` `func` metadata | Forward and backward |
-| Context mask | `num_contexts` | Not supported |
 
-Target-group masking is defined only with causal attention. Arbitrary-mask
-metadata is a specialized kernel contract and cannot be combined with causal,
-local, target, context, or paged-KV modes.
+Arbitrary-mask metadata is a specialized kernel contract and cannot be
+combined with causal, local, or paged-KV modes.
 
 `func_tensor` has shape `(1, N, L)` and dtype `torch.int32`, where `N` is
 positive and odd and `L >= T_q + 256`. For every packed query row, its `N`
@@ -189,7 +181,7 @@ on the host.
 
 Forward also has a causal paged-KV path using `paged_kv`, `page_ids`, and
 `page_indptrs`. It requires a page size of 128 and cannot be combined with
-local, context, or arbitrary masking. Paged KV is not supported by backward.
+local or arbitrary masking. Paged KV is not supported by backward.
 `paged_kv` has shape `(num_pages, 2, 128, H, D)` with `num_pages > 0`; K/V is
 selected by the second dimension. `page_ids` is a contiguous one-dimensional
 `torch.int32` array of physical page indices. `page_indptrs` is a contiguous
@@ -206,9 +198,6 @@ on the GPU without host-side range or monotonicity checks.
 
 ## Current limitations
 
-- Relative attention bias is not implemented: `rab` must be `None` and dRAB
-  is unavailable.
-- Context masking through `num_contexts` is not implemented.
 - Backward is nondeterministic; requesting deterministic backward raises
   `NotImplementedError`.
 - Forward head dimension 256 does not have a corresponding backward kernel.

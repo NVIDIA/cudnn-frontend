@@ -230,14 +230,10 @@ class _HSTUBase(APIBase):
         sample_cu_seqlens_k: torch.Tensor,
         max_seqlen_q: int,
         max_seqlen_k: int,
-        sample_num_targets: Optional[torch.Tensor],
-        target_group_size: int,
         window_size: Tuple[int, int],
         alpha: float,
         scaling_seqlen: Optional[float],
         sample_func: Optional[torch.Tensor],
-        sample_num_contexts: Optional[torch.Tensor],
-        sample_rab: Optional[torch.Tensor],
     ) -> None:
         super().__init__()
         self._warn_experimental_api()
@@ -247,10 +243,7 @@ class _HSTUBase(APIBase):
         self._sample_v = sample_v
         self._sample_cu_seqlens_q = sample_cu_seqlens_q
         self._sample_cu_seqlens_k = sample_cu_seqlens_k
-        self._sample_num_targets = sample_num_targets
         self._sample_func = sample_func
-        self._sample_num_contexts = sample_num_contexts
-        self._sample_rab = sample_rab
 
         self.q_desc = self._make_tensor_desc(sample_q, name="q")
         self.k_desc = self._make_tensor_desc(sample_k, name="k")
@@ -261,9 +254,6 @@ class _HSTUBase(APIBase):
         self.cu_seqlens_k_desc = self._make_tensor_desc(
             sample_cu_seqlens_k, name="cu_seqlens_k"
         )
-        self.num_targets_desc = self._make_tensor_desc(
-            sample_num_targets, name="num_targets"
-        )
         self.func_desc = self._make_tensor_desc(sample_func, name="func")
 
         self.max_seqlen_q = None if max_seqlen_q is None else int(max_seqlen_q)
@@ -273,7 +263,6 @@ class _HSTUBase(APIBase):
                 f"window_size must contain two integers, got {window_size}"
             )
         self.window_size = (int(window_size[0]), int(window_size[1]))
-        self.target_group_size = int(target_group_size)
         self.alpha = float(alpha)
         self.scaling_seqlen = None if scaling_seqlen is None else float(scaling_seqlen)
 
@@ -298,10 +287,7 @@ class _HSTUBase(APIBase):
                 ("v_tensor", v),
                 ("cu_seqlens_q_tensor", cu_q),
                 ("cu_seqlens_k_tensor", cu_k),
-                ("num_targets_tensor", self._sample_num_targets),
                 ("func_tensor", self._sample_func),
-                ("num_contexts_tensor", self._sample_num_contexts),
-                ("rab_tensor", self._sample_rab),
             ),
         )
 
@@ -365,10 +351,6 @@ class _HSTUBase(APIBase):
                 "max_seqlen_q must be <= max_seqlen_k for the HSTU SM100 kernel"
             )
 
-        if self.target_group_size < 1:
-            raise ValueError(
-                f"target_group_size must be at least 1, got {self.target_group_size}"
-            )
         if not math.isfinite(self.alpha):
             raise ValueError(f"alpha must be finite, got {self.alpha}")
         if self.scaling_seqlen is None:
@@ -396,30 +378,6 @@ class _HSTUBase(APIBase):
             normalized_left < self.max_seqlen_k or normalized_right < self.max_seqlen_k
         ) and not self.is_causal
 
-        if self._sample_num_contexts is not None:
-            raise NotImplementedError(
-                "num_contexts/context masking is not supported by HSTU SM100"
-            )
-        if self._sample_rab is not None:
-            raise NotImplementedError(
-                "relative attention bias (RAB) is not supported by HSTU SM100"
-            )
-
-        if self._sample_num_targets is not None:
-            targets = self._sample_num_targets
-            if targets.ndim != 1 or targets.shape[0] != self.batch_size:
-                raise ValueError(
-                    f"num_targets_tensor must have shape ({self.batch_size},), "
-                    f"got {tuple(targets.shape)}"
-                )
-            if targets.dtype != torch.int32:
-                raise ValueError(
-                    f"num_targets_tensor must have dtype torch.int32, got {targets.dtype}"
-                )
-            _require_16_byte_alignment(targets, "num_targets_tensor")
-            if not self.is_causal:
-                raise ValueError("target masking requires window_size=(-1, 0)")
-
         if self._sample_func is not None:
             func = self._sample_func
             if func.ndim != 3:
@@ -441,10 +399,10 @@ class _HSTUBase(APIBase):
                     f"func_tensor's last dimension must be at least total_q + "
                     f"256 ({total_q + 256}), got {func.shape[2]}"
                 )
-            if self.is_causal or self.is_local or self._sample_num_targets is not None:
+            if self.is_causal or self.is_local:
                 raise ValueError(
-                    "arbitrary func masking cannot be combined with causal, local, "
-                    "or target masking"
+                    "arbitrary func masking cannot be combined with causal or local "
+                    "masking"
                 )
             self._func_num = int(func.shape[1])
 
@@ -466,7 +424,6 @@ class _HSTUBase(APIBase):
         v_tensor: torch.Tensor,
         cu_seqlens_q_tensor: torch.Tensor,
         cu_seqlens_k_tensor: torch.Tensor,
-        num_targets_tensor: Optional[torch.Tensor],
         func_tensor: Optional[torch.Tensor],
     ) -> None:
         for name, tensor, desc in (
@@ -500,27 +457,11 @@ class _HSTUBase(APIBase):
                 ("v_tensor", v_tensor),
                 ("cu_seqlens_q_tensor", cu_seqlens_q_tensor),
                 ("cu_seqlens_k_tensor", cu_seqlens_k_tensor),
-                ("num_targets_tensor", num_targets_tensor),
                 ("func_tensor", func_tensor),
             ),
         )
         _validate_cu_seqlens_metadata(cu_seqlens_q_tensor, "cu_seqlens_q_tensor")
         _validate_cu_seqlens_metadata(cu_seqlens_k_tensor, "cu_seqlens_k_tensor")
-
-        if (num_targets_tensor is None) != (self.num_targets_desc is None):
-            raise ValueError(
-                "num_targets_tensor presence must match the compiled configuration"
-            )
-        if num_targets_tensor is not None:
-            if tuple(num_targets_tensor.shape) != tuple(self.num_targets_desc.shape):
-                raise ValueError("num_targets_tensor shape changed after compilation")
-            if num_targets_tensor.dtype != torch.int32:
-                raise ValueError("num_targets_tensor must have dtype torch.int32")
-            if tuple(num_targets_tensor.stride()) != tuple(
-                self.num_targets_desc.stride
-            ):
-                raise ValueError("num_targets_tensor stride changed after compilation")
-            _require_16_byte_alignment(num_targets_tensor, "num_targets_tensor")
 
         if (func_tensor is None) != (self.func_desc is None):
             raise ValueError(
@@ -541,10 +482,7 @@ class _HSTUBase(APIBase):
         self._sample_v = None
         self._sample_cu_seqlens_q = None
         self._sample_cu_seqlens_k = None
-        self._sample_num_targets = None
         self._sample_func = None
-        self._sample_num_contexts = None
-        self._sample_rab = None
 
 
 class HSTUFwdSm100(_HSTUBase):
@@ -560,8 +498,6 @@ class HSTUFwdSm100(_HSTUBase):
         sample_cu_seqlens_k: torch.Tensor,
         max_seqlen_q: int,
         max_seqlen_k: int,
-        sample_num_targets: Optional[torch.Tensor] = None,
-        target_group_size: int = 1,
         window_size: Tuple[int, int] = (-1, -1),
         alpha: float = 1.0,
         scaling_seqlen: Optional[float] = None,
@@ -569,8 +505,6 @@ class HSTUFwdSm100(_HSTUBase):
         sample_paged_kv: Optional[torch.Tensor] = None,
         sample_page_ids: Optional[torch.Tensor] = None,
         sample_page_indptrs: Optional[torch.Tensor] = None,
-        sample_num_contexts: Optional[torch.Tensor] = None,
-        sample_rab: Optional[torch.Tensor] = None,
     ) -> None:
         self._init_common(
             sample_q=sample_q,
@@ -580,14 +514,10 @@ class HSTUFwdSm100(_HSTUBase):
             sample_cu_seqlens_k=sample_cu_seqlens_k,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
-            sample_num_targets=sample_num_targets,
-            target_group_size=target_group_size,
             window_size=window_size,
             alpha=alpha,
             scaling_seqlen=scaling_seqlen,
             sample_func=sample_func,
-            sample_num_contexts=sample_num_contexts,
-            sample_rab=sample_rab,
         )
         self._sample_o = sample_o
         self._sample_paged_kv = sample_paged_kv
@@ -696,13 +626,9 @@ class HSTUFwdSm100(_HSTUBase):
             self._sample_cu_seqlens_k,
             self.max_seqlen_q,
             self.max_seqlen_k,
-            self._sample_num_contexts,
-            self._sample_num_targets,
-            self.target_group_size,
             self.window_size[0],
             self.window_size[1],
             self.alpha,
-            self._sample_rab,
             self._sample_func,
             self._sample_paged_kv,
             self._sample_page_ids,
@@ -726,7 +652,6 @@ class HSTUFwdSm100(_HSTUBase):
         o_tensor: torch.Tensor,
         cu_seqlens_q_tensor: torch.Tensor,
         cu_seqlens_k_tensor: torch.Tensor,
-        num_targets_tensor: Optional[torch.Tensor] = None,
         func_tensor: Optional[torch.Tensor] = None,
         paged_kv_tensor: Optional[torch.Tensor] = None,
         page_ids_tensor: Optional[torch.Tensor] = None,
@@ -741,7 +666,6 @@ class HSTUFwdSm100(_HSTUBase):
             v_tensor=v_tensor,
             cu_seqlens_q_tensor=cu_seqlens_q_tensor,
             cu_seqlens_k_tensor=cu_seqlens_k_tensor,
-            num_targets_tensor=num_targets_tensor,
             func_tensor=func_tensor,
         )
         if tuple(o_tensor.shape) != tuple(self.o_desc.shape):
@@ -793,13 +717,9 @@ class HSTUFwdSm100(_HSTUBase):
                 cu_seqlens_k_tensor,
                 self.max_seqlen_q,
                 self.max_seqlen_k,
-                None,
-                num_targets_tensor,
-                self.target_group_size,
                 self.window_size[0],
                 self.window_size[1],
                 self.alpha,
-                None,
                 func_tensor,
                 paged_kv_tensor,
                 page_ids_tensor,
@@ -825,15 +745,10 @@ class HSTUBwdSm100(_HSTUBase):
         sample_cu_seqlens_k: torch.Tensor,
         max_seqlen_q: int,
         max_seqlen_k: int,
-        sample_num_targets: Optional[torch.Tensor] = None,
-        target_group_size: int = 1,
         window_size: Tuple[int, int] = (-1, -1),
         alpha: float = 1.0,
         scaling_seqlen: Optional[float] = None,
         sample_func: Optional[torch.Tensor] = None,
-        sample_num_contexts: Optional[torch.Tensor] = None,
-        sample_rab: Optional[torch.Tensor] = None,
-        has_drab: bool = False,
         deterministic: bool = False,
     ) -> None:
         self._init_common(
@@ -844,14 +759,10 @@ class HSTUBwdSm100(_HSTUBase):
             sample_cu_seqlens_k=sample_cu_seqlens_k,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
-            sample_num_targets=sample_num_targets,
-            target_group_size=target_group_size,
             window_size=window_size,
             alpha=alpha,
             scaling_seqlen=scaling_seqlen,
             sample_func=sample_func,
-            sample_num_contexts=sample_num_contexts,
-            sample_rab=sample_rab,
         )
         self._sample_do = sample_do
         self._sample_dq = sample_dq
@@ -861,7 +772,6 @@ class HSTUBwdSm100(_HSTUBase):
         self.dq_desc = self._make_tensor_desc(sample_dq, name="dq")
         self.dk_desc = self._make_tensor_desc(sample_dk, name="dk")
         self.dv_desc = self._make_tensor_desc(sample_dv, name="dv")
-        self.has_drab = bool(has_drab)
         self.deterministic = bool(deterministic)
 
     def check_support(self) -> bool:
@@ -894,8 +804,6 @@ class HSTUBwdSm100(_HSTUBase):
             if not _has_non_overlapping_strides(tensor):
                 raise ValueError(f"{name} must have non-overlapping strides")
             _require_16_byte_alignment(tensor, name)
-        if self.has_drab:
-            raise NotImplementedError("dRAB is not supported by HSTU SM100")
         if self.deterministic:
             raise NotImplementedError(
                 "deterministic HSTU backward is not supported by HSTU SM100"
@@ -940,14 +848,9 @@ class HSTUBwdSm100(_HSTUBase):
             self._sample_dq,
             self._sample_dk,
             self._sample_dv,
-            self._sample_num_contexts,
-            self._sample_num_targets,
-            self.target_group_size,
             self.window_size[0],
             self.window_size[1],
             self.alpha,
-            self._sample_rab,
-            self.has_drab,
             self._sample_func,
             self.deterministic,
             self.scaling_seqlen,
@@ -971,7 +874,6 @@ class HSTUBwdSm100(_HSTUBase):
         dv_tensor: torch.Tensor,
         cu_seqlens_q_tensor: torch.Tensor,
         cu_seqlens_k_tensor: torch.Tensor,
-        num_targets_tensor: Optional[torch.Tensor] = None,
         func_tensor: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream | torch.cuda.Stream] = None,
     ) -> None:
@@ -983,7 +885,6 @@ class HSTUBwdSm100(_HSTUBase):
             v_tensor=v_tensor,
             cu_seqlens_q_tensor=cu_seqlens_q_tensor,
             cu_seqlens_k_tensor=cu_seqlens_k_tensor,
-            num_targets_tensor=num_targets_tensor,
             func_tensor=func_tensor,
         )
         for name, tensor, desc in (
@@ -1030,14 +931,9 @@ class HSTUBwdSm100(_HSTUBase):
                 dq_tensor,
                 dk_tensor,
                 dv_tensor,
-                None,
-                num_targets_tensor,
-                self.target_group_size,
                 self.window_size[0],
                 self.window_size[1],
                 self.alpha,
-                None,
-                False,
                 func_tensor,
                 False,
                 self.scaling_seqlen,
@@ -1052,8 +948,6 @@ def hstu_attention_forward(
     cu_seqlens_k_tensor: torch.Tensor,
     max_seqlen_q: int,
     max_seqlen_k: int,
-    num_targets_tensor: Optional[torch.Tensor] = None,
-    target_group_size: int = 1,
     window_size: Tuple[int, int] = (-1, -1),
     alpha: float = 1.0,
     scaling_seqlen: Optional[float] = None,
@@ -1061,8 +955,6 @@ def hstu_attention_forward(
     paged_kv_tensor: Optional[torch.Tensor] = None,
     page_ids_tensor: Optional[torch.Tensor] = None,
     page_indptrs_tensor: Optional[torch.Tensor] = None,
-    num_contexts_tensor: Optional[torch.Tensor] = None,
-    rab_tensor: Optional[torch.Tensor] = None,
     stream: Optional[cuda.CUstream | torch.cuda.Stream] = None,
 ) -> TupleDict:
     """Allocate and compute packed HSTU forward on an SM10x GPU."""
@@ -1088,19 +980,15 @@ def hstu_attention_forward(
         _tensor_signature(v_tensor),
         _tensor_signature(cu_seqlens_q_tensor),
         _tensor_signature(cu_seqlens_k_tensor),
-        _tensor_signature(num_targets_tensor),
         _tensor_signature(func_tensor),
         _tensor_signature(paged_kv_tensor),
         _tensor_signature(page_ids_tensor),
         _tensor_signature(page_indptrs_tensor),
         resolved_max_q,
         resolved_max_k,
-        int(target_group_size),
         tuple(window_size),
         float(alpha),
         resolved_scaling,
-        num_contexts_tensor is not None,
-        rab_tensor is not None,
     )
     api = _cache_get(_FWD_CACHE, cache_key)
     if api is None:
@@ -1113,8 +1001,6 @@ def hstu_attention_forward(
             sample_cu_seqlens_k=cu_seqlens_k_tensor,
             max_seqlen_q=resolved_max_q,
             max_seqlen_k=resolved_max_k,
-            sample_num_targets=num_targets_tensor,
-            target_group_size=target_group_size,
             window_size=window_size,
             alpha=alpha,
             scaling_seqlen=resolved_scaling,
@@ -1122,8 +1008,6 @@ def hstu_attention_forward(
             sample_paged_kv=paged_kv_tensor,
             sample_page_ids=page_ids_tensor,
             sample_page_indptrs=page_indptrs_tensor,
-            sample_num_contexts=num_contexts_tensor,
-            sample_rab=rab_tensor,
         )
         api.check_support()
         api.compile()
@@ -1135,7 +1019,6 @@ def hstu_attention_forward(
         o_tensor=o_tensor,
         cu_seqlens_q_tensor=cu_seqlens_q_tensor,
         cu_seqlens_k_tensor=cu_seqlens_k_tensor,
-        num_targets_tensor=num_targets_tensor,
         func_tensor=func_tensor,
         paged_kv_tensor=paged_kv_tensor,
         page_ids_tensor=page_ids_tensor,
@@ -1154,15 +1037,10 @@ def hstu_attention_backward(
     cu_seqlens_k_tensor: torch.Tensor,
     max_seqlen_q: int,
     max_seqlen_k: int,
-    num_targets_tensor: Optional[torch.Tensor] = None,
-    target_group_size: int = 1,
     window_size: Tuple[int, int] = (-1, -1),
     alpha: float = 1.0,
     scaling_seqlen: Optional[float] = None,
     func_tensor: Optional[torch.Tensor] = None,
-    num_contexts_tensor: Optional[torch.Tensor] = None,
-    rab_tensor: Optional[torch.Tensor] = None,
-    has_drab: bool = False,
     deterministic: bool = False,
     stream: Optional[cuda.CUstream | torch.cuda.Stream] = None,
 ) -> TupleDict:
@@ -1188,17 +1066,12 @@ def hstu_attention_backward(
         _tensor_signature(v_tensor),
         _tensor_signature(cu_seqlens_q_tensor),
         _tensor_signature(cu_seqlens_k_tensor),
-        _tensor_signature(num_targets_tensor),
         _tensor_signature(func_tensor),
         resolved_max_q,
         resolved_max_k,
-        int(target_group_size),
         tuple(window_size),
         float(alpha),
         resolved_scaling,
-        num_contexts_tensor is not None,
-        rab_tensor is not None,
-        bool(has_drab),
         bool(deterministic),
     )
     api = _cache_get(_BWD_CACHE, cache_key)
@@ -1215,15 +1088,10 @@ def hstu_attention_backward(
             sample_cu_seqlens_k=cu_seqlens_k_tensor,
             max_seqlen_q=resolved_max_q,
             max_seqlen_k=resolved_max_k,
-            sample_num_targets=num_targets_tensor,
-            target_group_size=target_group_size,
             window_size=window_size,
             alpha=alpha,
             scaling_seqlen=resolved_scaling,
             sample_func=func_tensor,
-            sample_num_contexts=num_contexts_tensor,
-            sample_rab=rab_tensor,
-            has_drab=has_drab,
             deterministic=deterministic,
         )
         api.check_support()
@@ -1239,7 +1107,6 @@ def hstu_attention_backward(
         dv_tensor=dv_tensor,
         cu_seqlens_q_tensor=cu_seqlens_q_tensor,
         cu_seqlens_k_tensor=cu_seqlens_k_tensor,
-        num_targets_tensor=num_targets_tensor,
         func_tensor=func_tensor,
         current_stream=stream,
     )

@@ -42,9 +42,6 @@ class HSTUAttentionForwardSm100:
         qhead_per_kvhead: cutlass.Constexpr[int] = 1,
         is_causal: bool = False,
         is_local: bool = False,
-        is_context: bool = False,
-        is_target: bool = False,
-        target_group_size: int = 1,
         is_arbitrary: bool = False,
         is_paged: bool = False,
         func_num: int = 0,
@@ -82,13 +79,10 @@ class HSTUAttentionForwardSm100:
         self.is_persistent = is_persistent
         self.is_causal = is_causal
         self.is_local = is_local
-        self.is_context = is_context
-        self.is_target = is_target
         self.is_arbitrary = is_arbitrary
         self.is_paged = is_paged
         self.func_num = func_num
-        assert not (self.is_arbitrary and (self.is_causal or self.is_local or self.is_context or self.is_target)), "a and b cannot both be True"
-        self.target_group_size = target_group_size
+        assert not (self.is_arbitrary and (self.is_causal or self.is_local)), "a and b cannot both be True"
         self.qhead_per_kvhead = qhead_per_kvhead
         # Does S1 need to wait for S0 to finish
         self.s0_s1_barrier = self.head_dim_padded in [64, 96] and (not self.is_causal and not self.is_local) and self.q_stage == 2
@@ -188,8 +182,6 @@ class HSTUAttentionForwardSm100:
         max_seqlen_k: Int32,
         cu_seqlens_q: cute.Tensor,
         cu_seqlens_k: cute.Tensor,
-        num_contexts: Optional[cute.Tensor],
-        num_targets: Optional[cute.Tensor],
         score_scale: Float32,
         scaling_seqlen: Float32,
         stream: cuda.CUstream,
@@ -480,8 +472,6 @@ class HSTUAttentionForwardSm100:
             max_seqlen_k,
             cu_seqlens_q,
             cu_seqlens_k,
-            num_contexts,
-            num_targets,
             tma_atom_Q,
             tma_atom_K,
             tma_atom_V,
@@ -528,8 +518,6 @@ class HSTUAttentionForwardSm100:
         max_seqlen_k: Int32,
         cu_seqlens_q: cute.Tensor,
         cu_seqlens_k: cute.Tensor,
-        num_contexts: Optional[cute.Tensor],
-        num_targets: Optional[cute.Tensor],
         tma_atom_Q: cute.CopyAtom,
         tma_atom_K: cute.CopyAtom,
         tma_atom_V: cute.CopyAtom,
@@ -663,7 +651,7 @@ class HSTUAttentionForwardSm100:
         block_info = BlockInfo(
             # This is cta_tiler, not mma_tiler_qk, since we move by block by (2 * mma_tiler[0], mma_tiler[1])
             self.kBlockM, self.kBlockN, self.cta_tiler, self.is_causal, self.is_local,
-            self.is_context, self.is_target, self.target_group_size, self.is_paged,
+            self.is_paged,
             window_size_left, window_size_right,
             storage.sn_valid_block_max.data_ptr(), sValidBlockIdsTensor,
             storage.sBlockBound.data_ptr(), self.func_num, func_tensor,
@@ -682,13 +670,12 @@ class HSTUAttentionForwardSm100:
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
             cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
-            num_contexts=num_contexts, num_targets=num_targets,
             page_indptrs=page_indptrs,
         )
         AttentionMaskCls = partial(
             AttentionMask, kBlockM=self.kBlockM, kBlockN=self.kBlockN, cta_tiler=self.cta_tiler,
-            is_arbitrary=self.is_arbitrary, is_causal=self.is_causal, is_local=self.is_local, is_context=self.is_context, is_target=self.is_target,
-            target_group_size=self.target_group_size, func_num=self.func_num,
+            is_arbitrary=self.is_arbitrary, is_causal=self.is_causal, is_local=self.is_local,
+            func_num=self.func_num,
             window_size_left=window_size_left, window_size_right=window_size_right,
             swapAB=False,
         )
@@ -730,14 +717,10 @@ class HSTUAttentionForwardSm100:
                     thr_mma_qk,
                     thr_mma_pv,
                     mQ,
-                    mK,
-                    mV,
                     sQ,
                     sK,
                     sV,
                     tma_atom_Q,
-                    tma_atom_K,
-                    tma_atom_V,
                     pipeline_kv,
                     mbar_ptr,
                     block_info,
@@ -748,7 +731,6 @@ class HSTUAttentionForwardSm100:
                     mPagedK,
                     mPagedV,
                     page_ids,
-                    page_indptrs,
                 )
         # ///////////////////////////////////////////////////////////////////////////////
         #  MMA
@@ -936,13 +918,12 @@ class HSTUAttentionForwardSm100:
                 mbar_ptr + self.mbar_load_kv_full_offset, mbar_ptr + self.mbar_load_kv_empty_offset,
                 K_or_V="V",
             )
-            n_block_max, n_block_min, n_masking_steps, is_jump, n_block_history, _ = block_info.get_n_block_info(seqlen, m_block, offset_dynamic)
+            n_block_max, n_block_min, _ = block_info.get_n_block_info(seqlen, m_block, offset_dynamic)
             if const_expr(self.is_arbitrary):
                 n_block_max, n_block_min = block_info.get_valid_block_ids(seqlen, m_block, n_block_max, n_block_min, is_calwarp=True)
             sValidBlockIds = block_info.sValidBlockIds
 
             if const_expr(self.q_stage == 2):
-                masking_step = 0
                 n_block_valid = n_block_max - 1
                 n_block = sValidBlockIds[n_block_valid] if self.is_arbitrary else n_block_valid
                 load_Q(block=self.q_stage * m_block + 0, stage=0)  # Q0
@@ -953,9 +934,6 @@ class HSTUAttentionForwardSm100:
                 q_producer_phase ^= 1
                 load_V(block=n_block, producer_state=kv_producer_state, page_idx=None)  # V0
                 kv_producer_state.advance()
-                if is_jump and masking_step == n_masking_steps - 1:
-                    n_block_valid = min(n_block_valid, n_block_history)
-                masking_step += 1
                 n_block_valid -= 1
                 while n_block_valid >= n_block_min:
                     n_block = sValidBlockIds[n_block_valid] if self.is_arbitrary else n_block_valid
@@ -963,13 +941,8 @@ class HSTUAttentionForwardSm100:
                     kv_producer_state.advance()
                     load_V(block=n_block, producer_state=kv_producer_state, page_idx=None)  # Vi
                     kv_producer_state.advance()
-                    if is_jump and masking_step == n_masking_steps - 1:
-                        n_block_valid = min(n_block_valid, n_block_history)
-                    masking_step += 1
                     n_block_valid -= 1
             elif const_expr(self.q_stage == 1):
-                masking_step_k = 0
-                masking_step_v = 0
                 n_block_valid_k = n_block_max - 1
                 n_block_valid_v = n_block_max - 1
                 n_block_k = sValidBlockIds[n_block_valid_k] if self.is_arbitrary else n_block_valid_k
@@ -977,17 +950,11 @@ class HSTUAttentionForwardSm100:
                 q_producer_phase ^= 1
                 load_K(block=n_block_k, producer_state=kv_producer_state, page_idx=None)  # K0
                 kv_producer_state.advance()
-                if is_jump and masking_step_k == n_masking_steps - 1:
-                    n_block_valid_k = min(n_block_valid_k, n_block_history)
-                masking_step_k += 1
                 n_block_valid_k -= 1
                 if n_block_valid_k >= n_block_min:
                     n_block_k = sValidBlockIds[n_block_valid_k] if self.is_arbitrary else n_block_valid_k
                     load_K(block=n_block_k, producer_state=kv_producer_state, page_idx=None)  # K1
                     kv_producer_state.advance()
-                    if is_jump and masking_step_k == n_masking_steps - 1:
-                        n_block_valid_k = min(n_block_valid_k, n_block_history)
-                    masking_step_k += 1
                     n_block_valid_k -= 1
 
                 # load mainloop, V0 K2 V1 K3... Vi K(i+2)
@@ -996,15 +963,9 @@ class HSTUAttentionForwardSm100:
                     n_block_v = sValidBlockIds[n_block_valid_v] if self.is_arbitrary else n_block_valid_v
                     load_V(block=n_block_v, producer_state=kv_producer_state, page_idx=None)  # V1
                     kv_producer_state.advance()
-                    if is_jump and masking_step_v == n_masking_steps - 1:
-                        n_block_valid_v = min(n_block_valid_v, n_block_history)
-                    masking_step_v += 1
                     n_block_valid_v -= 1
                     load_K(block=n_block_k, producer_state=kv_producer_state, page_idx=None)  # Ki
                     kv_producer_state.advance()
-                    if is_jump and masking_step_k == n_masking_steps - 1:
-                        n_block_valid_k = min(n_block_valid_k, n_block_history)
-                    masking_step_k += 1
                     n_block_valid_k -= 1
 
                 # load epilogue, V1 V0
@@ -1012,9 +973,6 @@ class HSTUAttentionForwardSm100:
                     n_block_v = sValidBlockIds[n_block_valid_v] if self.is_arbitrary else n_block_valid_v
                     load_V(block=n_block_v, producer_state=kv_producer_state, page_idx=None)  # V1
                     kv_producer_state.advance()
-                    if is_jump and masking_step_v == n_masking_steps - 1:
-                        n_block_valid_v = min(n_block_valid_v, n_block_history)
-                    masking_step_v += 1
                     n_block_valid_v -= 1
 
             tile_scheduler.prefetch_next_work()
@@ -1028,14 +986,10 @@ class HSTUAttentionForwardSm100:
         thr_mma_qk: cute.core.ThrMma,
         thr_mma_pv: cute.core.ThrMma,
         mQ: cute.Tensor,
-        mK: cute.Tensor,
-        mV: cute.Tensor,
         sQ: cute.Tensor,
         sK: cute.Tensor,
         sV: cute.Tensor,
         tma_atom_Q: cute.CopyAtom,
-        tma_atom_K: cute.CopyAtom,
-        tma_atom_V: cute.CopyAtom,
         pipeline_kv: cutlass.pipeline.PipelineAsync,
         mbar_ptr: cute.Pointer,
         block_info: BlockInfo,
@@ -1046,7 +1000,6 @@ class HSTUAttentionForwardSm100:
         mPagedK: cute.Tensor,
         mPagedV: cute.Tensor,
         page_ids: cute.Tensor,
-        page_indptrs: cute.Tensor,
     ):
         q_producer_phase = Int32(1)
         kv_producer_state = cutlass.pipeline.make_pipeline_state(cutlass.pipeline.PipelineUserType.Producer, self.kv_stage)
@@ -1061,15 +1014,8 @@ class HSTUAttentionForwardSm100:
             mQ_cur = cute.domain_offset((offset - offset_dynamic, 0), mQ[None, None, head_idx])
             gQ = cute.local_tile(mQ_cur, cute.select(self.mma_tiler_qk, mode=[0, 2]), (None, 0))
             page_ind = seqlen.page_ind
-            page_idx = 0
 
             head_idx_kv = head_idx // self.qhead_per_kvhead
-
-            offset_kv = seqlen.offset_q + seqlen.seqlen_q + seqlen.seqlen_h - seqlen.seqlen_k
-            mK_cur = cute.domain_offset((offset_kv, 0), mK[None, None, head_idx_kv])
-            mV_cur = cute.domain_offset((0, offset_kv), mV[None, None, head_idx_kv])
-            gK = cute.local_tile(mK_cur, cute.select(self.mma_tiler_qk, mode=[1, 2]), (None, 0))
-            gV = cute.local_tile(mV_cur, cute.select(self.mma_tiler_pv, mode=[1, 2]), (0, None))
 
             mK_paged = mPagedK[None, None, head_idx_kv]  #(#tokens, headdim, head_idx)
             mV_paged = mPagedV[None, None, head_idx_kv]  #(headdim, #tokens, head_idx)
@@ -1077,28 +1023,12 @@ class HSTUAttentionForwardSm100:
             gV_paged = cute.local_tile(mV_paged, cute.select(self.mma_tiler_pv, mode=[1, 2]), (0, None))
 
             tSgQ = thr_mma_qk.partition_A(gQ)
-            tSgK = thr_mma_qk.partition_B(gK)
-            tOgV = thr_mma_pv.partition_B(gV)
             tQsQ, tQgQ = cpasync.tma_partition(
                 tma_atom_Q,
                 0,  # no multicast
                 cute.make_layout(1),
                 cute.group_modes(sQ, 0, 3),
                 cute.group_modes(tSgQ, 0, 3),
-            )
-            tKsK, tKgK = cpasync.tma_partition(
-                tma_atom_K,
-                0,  # no multicast
-                cute.make_layout(1),
-                cute.group_modes(sK, 0, 3),
-                cute.group_modes(tSgK, 0, 3),
-            )
-            tVsV, tVgV = cpasync.tma_partition(
-                tma_atom_V,
-                0,  # no multicast
-                cute.make_layout(1),
-                cute.group_modes(sV, 0, 3),
-                cute.group_modes(tOgV, 0, 3),
             )
 
             tSgKp = thr_mma_qk.partition_B(gK_paged)
@@ -1125,17 +1055,6 @@ class HSTUAttentionForwardSm100:
             )
             # We have to use mbarrier directly in the load for KV instead of replying on
             # pipeline_kv, because we could have different number of TMA bytes for K and V
-            load_K = partial(
-                self.load_KV, tma_atom_K, tKgK, tKsK,
-                mbar_ptr + self.mbar_load_kv_full_offset, mbar_ptr + self.mbar_load_kv_empty_offset,
-                K_or_V="K",
-            )
-            load_V = partial(
-                self.load_KV, tma_atom_V, tVgV, tVsV,
-                mbar_ptr + self.mbar_load_kv_full_offset, mbar_ptr + self.mbar_load_kv_empty_offset,
-                K_or_V="V",
-            )
-
             load_Kp = partial(
                 self.load_KV, tma_atom_Kp, tKgKp, tKsKp,
                 mbar_ptr + self.mbar_load_kv_full_offset, mbar_ptr + self.mbar_load_kv_empty_offset,
@@ -1146,43 +1065,19 @@ class HSTUAttentionForwardSm100:
                 mbar_ptr + self.mbar_load_kv_full_offset, mbar_ptr + self.mbar_load_kv_empty_offset,
                 K_or_V="V",
             )
-            tidx, _, _ = cute.arch.thread_idx()
-
-            n_block_max, n_block_min, n_masking_steps, is_jump, n_block_history, n_block_target_min = block_info.get_n_block_info(seqlen, m_block, offset_dynamic)
+            n_block_max, n_block_min, _ = block_info.get_n_block_info(seqlen, m_block, offset_dynamic)
             n_block = n_block_max - 1
 
             if const_expr(self.q_stage == 2):
                 load_Q(block=self.q_stage * m_block + 0, stage=0)  # Q0
-                if n_block < n_block_history:
-                    page_idx = page_ids[n_block + page_ind] * 2
-                    load_Kp(block=page_idx, producer_state=kv_producer_state)  # K0
-                else:
-                    load_K(block=n_block-n_block_history, producer_state=kv_producer_state)  # K0
+                page_idx = page_ids[n_block + page_ind] * 2
+                load_Kp(block=page_idx, producer_state=kv_producer_state)  # K0
                 kv_producer_state.advance()
                 load_Q(block=self.q_stage * m_block + 1, stage=1)  # Q1
                 q_producer_phase ^= 1
-                if n_block < n_block_history:
-                    page_idx = page_ids[n_block + page_ind] * 2 + 1
-                    load_Vp(block=page_idx, producer_state=kv_producer_state)  # V0
-                else:
-                    load_V(block=n_block-n_block_history, producer_state=kv_producer_state)  # V0
+                load_Vp(block=page_idx + 1, producer_state=kv_producer_state)  # V0
                 kv_producer_state.advance()
-                masking_step = 0
-                n_block_valid = n_block_max - 1
-                if is_jump and masking_step == n_masking_steps - 1:
-                    n_block_valid = min(n_block_valid, n_block_history)
-                masking_step += 1
-                n_block_valid -= 1
-
-                while n_block_valid >= n_block_target_min:
-                    n_block = n_block_valid - n_block_history
-                    load_K(block=n_block, producer_state=kv_producer_state)  # Ki
-                    kv_producer_state.advance()
-                    load_V(block=n_block, producer_state=kv_producer_state)  # Vi
-                    kv_producer_state.advance()
-                    n_block_valid -= 1
-                if n_block_max > n_block_history:
-                    n_block_valid = n_block_history - 1
+                n_block_valid = n_block - 1
 
                 while n_block_valid >= n_block_min:
                     n_block = n_block_valid
@@ -1200,36 +1095,11 @@ class HSTUAttentionForwardSm100:
             elif const_expr(self.q_stage == 1):
                 load_Q(block=self.q_stage * m_block + 0, stage=0)  # Q0
                 q_producer_phase ^= 1
-                page_idx_k = 0
-                page_idx_v = 0
-                if n_block < n_block_history:
-                    page_idx_k = page_ids[n_block + page_ind] * 2
-                    load_Kp(block=page_idx_k, producer_state=kv_producer_state)  # K0
-                    page_idx_v = page_idx_k + 1
-                else:
-                    load_K(block=n_block-n_block_history, producer_state=kv_producer_state)  # K0
+                page_idx_k = page_ids[n_block + page_ind] * 2
+                load_Kp(block=page_idx_k, producer_state=kv_producer_state)  # K0
+                page_idx_v = page_idx_k + 1
                 kv_producer_state.advance()
 
-                # From target: K(i+1), V(i)
-                while n_block > n_block_target_min:
-                    load_K(block=n_block-1-n_block_history, producer_state=kv_producer_state)
-                    kv_producer_state.advance()
-                    load_V(block=n_block-n_block_history, producer_state=kv_producer_state)
-                    kv_producer_state.advance()
-                    n_block -= 1
-
-                # From history: K(i+1); target: V(i)
-                if n_block == n_block_target_min:
-                    n_block_valid_k = min(n_block - 1, n_block_history - 1)
-                    page_idx_k = page_ids[n_block_valid_k + page_ind] * 2
-                    load_Kp(block=page_idx_k, producer_state=kv_producer_state)  # K0
-                    kv_producer_state.advance()
-                    load_V(block=n_block-n_block_history, producer_state=kv_producer_state)
-                    kv_producer_state.advance()
-                    n_block = n_block_valid_k
-                    page_idx_v = page_idx_k + 1
-
-                # From history: K(i+1), V(i)
                 while n_block - 1 >= n_block_min:
                     page_idx_k = page_ids[n_block - 1 + page_ind] * 2
                     load_Kp(block=page_idx_k, producer_state=kv_producer_state)  # K0
@@ -1239,7 +1109,6 @@ class HSTUAttentionForwardSm100:
                     n_block -= 1
                     page_idx_v = page_idx_k + 1
 
-                # assert n_block == n_block_min
                 load_Vp(block=page_idx_v, producer_state=kv_producer_state)  # V0
 
                 tile_scheduler.prefetch_next_work()
@@ -1310,12 +1179,10 @@ class HSTUAttentionForwardSm100:
             seqlen = SeqlenInfoCls(batch_idx)
             offset_dynamic = (self.cta_tiler[0] - (seqlen.seqlen_q & (self.cta_tiler[0] - 1))) & (self.cta_tiler[0] - 1)
             offset_dynamic = 0 if (offset_dynamic <= self.kBlockM or not self.enable_offset_dynamic) else offset_dynamic
-            n_block_max, n_block_min, n_masking_steps, is_jump, n_block_history, _ = block_info.get_n_block_info(seqlen, m_block, offset_dynamic)
+            n_block_max, n_block_min, _ = block_info.get_n_block_info(seqlen, m_block, offset_dynamic)
             if const_expr(self.is_arbitrary):
                 n_block_max, n_block_min = block_info.get_valid_block_ids(seqlen, m_block, n_block_max, n_block_min, is_calwarp=False)
             n_block_nums = n_block_max - n_block_min
-            if self.is_target and is_jump:  # TO calculate the number of blocks in the jump case
-                n_block_nums = min(n_block_history + n_masking_steps, n_block_nums) # TODO: check if this is correct
 
             for stage in cutlass.range_constexpr(self.q_stage):
                 # GEMM_QK00 (Q0 * K0 -> S0) or GEMM_QK01 (Q1 * K0 -> S1)
@@ -1509,13 +1376,11 @@ class HSTUAttentionForwardSm100:
             seqlen = SeqlenInfoCls(batch_idx)
             offset_dynamic = (self.cta_tiler[0] - (seqlen.seqlen_q & (self.cta_tiler[0] - 1))) & (self.cta_tiler[0] - 1)
             offset_dynamic = 0 if (offset_dynamic <= self.kBlockM or not self.enable_offset_dynamic) else offset_dynamic
-            n_block_max, n_block_min, n_masking_steps, is_jump, n_block_history, _ = block_info.get_n_block_info(seqlen, m_block, offset_dynamic)
+            n_block_max, n_block_min, _ = block_info.get_n_block_info(seqlen, m_block, offset_dynamic)
             if const_expr(self.is_arbitrary):
                 n_block_max, n_block_min = block_info.get_valid_block_ids(seqlen, m_block, n_block_max, n_block_min, is_calwarp=False)
             sValidBlockIds = block_info.sValidBlockIds
             n_block_nums = n_block_max - n_block_min
-            if self.is_target and is_jump:
-                n_block_nums = min(n_block_history + n_masking_steps, n_block_nums)
 
             # 1. wait for Q
             cute.arch.mbarrier_wait(mbar_ptr + self.mbar_load_q_full_offset, mma_q_consumer_phase)
@@ -1698,7 +1563,7 @@ class HSTUAttentionForwardSm100:
             seqlen = SeqlenInfoCls(batch_idx)
             offset_dynamic = (self.cta_tiler[0] - (seqlen.seqlen_q & (self.cta_tiler[0] - 1))) & (self.cta_tiler[0] - 1)
             offset_dynamic = 0 if (offset_dynamic <= self.kBlockM or not self.enable_offset_dynamic) else offset_dynamic
-            n_block_max, n_block_min, n_masking_steps, is_jump, n_block_history, n_block_target_min = block_info.get_n_block_info(seqlen, m_block, offset_dynamic)
+            n_block_max, n_block_min, n_masking_steps = block_info.get_n_block_info(seqlen, m_block, offset_dynamic)
             if const_expr(self.is_arbitrary):
                 n_block_max, n_block_min = block_info.get_valid_block_ids(seqlen, m_block, n_block_max, n_block_min, is_calwarp=False)
             sValidBlockIds = block_info.sValidBlockIds
@@ -1708,7 +1573,7 @@ class HSTUAttentionForwardSm100:
             # m_block consider q stage
             m_block = self.q_stage * m_block + (stage if self.q_stage == 2 else 0)
             mask = AttentionMaskCls(
-                offset_q=seqlen.offset_q, seqlen_q=seqlen.seqlen_q, seqlen_k=seqlen.seqlen_k, seqlen_c=seqlen.seqlen_c, seqlen_h=seqlen.seqlen_h, offset_dynamic=offset_dynamic, func=func_tensor)
+                offset_q=seqlen.offset_q, seqlen_q=seqlen.seqlen_q, seqlen_k=seqlen.seqlen_k, offset_dynamic=offset_dynamic, func=func_tensor)
             mask_fn = partial(
                 mask.apply_mask, m_block=m_block, thr_mma=thr_mma_qk, thr_tmem_load=thr_tmem_load
             )
@@ -1750,27 +1615,9 @@ class HSTUAttentionForwardSm100:
 
             while n_block_valid >= n_block_min and masking_step < n_masking_steps:
                 n_block = n_block_valid
-                if self.is_target and (n_block + 1) * self.kBlockN > seqlen.seqlen_h:
-                    if const_expr(not self.is_paged):
-                        mma_si_consumer_phase, s0_s1_sequence_phase = silu_step(mma_si_consumer_phase, s0_s1_sequence_phase, n_block, mask_fn=partial(mask_fn, mask_target=True))
-                    else:
-                        if n_block >= n_block_history:
-                            mma_si_consumer_phase, s0_s1_sequence_phase = silu_step(mma_si_consumer_phase, s0_s1_sequence_phase, (n_block - n_block_history), mask_fn=partial(mask_fn, mask_target=True, mask_paged=1))
-                        else:
-                            mma_si_consumer_phase, s0_s1_sequence_phase = silu_step(mma_si_consumer_phase, s0_s1_sequence_phase, n_block, mask_fn=partial(mask_fn, mask_paged=-1))
-                else:
-                    mma_si_consumer_phase, s0_s1_sequence_phase = silu_step(mma_si_consumer_phase, s0_s1_sequence_phase, n_block, mask_fn=partial(mask_fn, mask_target=False))
+                mma_si_consumer_phase, s0_s1_sequence_phase = silu_step(mma_si_consumer_phase, s0_s1_sequence_phase, n_block, mask_fn=partial(mask_fn))
                 masking_step += wg_stride
                 n_block_valid -= wg_stride
-
-            if is_jump and n_block_valid >= n_block_min:
-                n_block_valid = min(n_block_valid, n_block_history - 1) # 1
-                n_block_valid = n_block_valid if (self.q_stage == 2 or masking_step == n_masking_steps) else min(n_block_valid, n_block_history - 2)
-                if n_block_valid == n_block_history - 1:
-                    n_block = n_block_valid
-                    if (n_block + 1) * self.kBlockN > seqlen.seqlen_h:
-                        mma_si_consumer_phase, s0_s1_sequence_phase = silu_step(mma_si_consumer_phase, s0_s1_sequence_phase, n_block, mask_fn=partial(mask_fn, mask_history=True))
-                        n_block_valid -= wg_stride
 
             while n_block_valid >= n_block_min:
                 n_block = n_block_valid
