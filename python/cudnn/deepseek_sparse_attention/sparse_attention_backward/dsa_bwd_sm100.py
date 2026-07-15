@@ -105,6 +105,14 @@ class FlashAttentionDSABackwardSm100:
             barrier_id=8,
             num_threads=(self.num_reduce_warps + 1) * self.threads_per_warp,
         )
+        # TMEM dealloc (compute warp 0) must be ordered after the reduce
+        # warps' final dKV T2R has drained; otherwise a successor CTA can
+        # re-allocate the columns while T2R is still in flight. Participants:
+        # num_reduce_warps (arrive) + compute warp 0 (arrive_and_wait).
+        self.tmem_dealloc_barrier = pipeline.NamedBarrier(
+            barrier_id=9,
+            num_threads=(self.num_reduce_warps + 1) * self.threads_per_warp,
+        )
 
         self.tmem_S_offset = 0
         self.tmem_dP_offset = 0
@@ -1028,6 +1036,10 @@ class FlashAttentionDSABackwardSm100:
             )
 
             if warp_idx == self.compute_warp_id[0]:
+                # Wait until every reduce warp has finished (and fenced) its
+                # final dKV T2R before freeing the TMEM columns for successor
+                # CTAs.
+                self.tmem_dealloc_barrier.arrive_and_wait()
                 cute.arch.dealloc_tmem(tmem_ptr_base, self.num_tmem_alloc_cols)
 
         elif warp_idx in self.reduce_warp_id:
@@ -1048,6 +1060,11 @@ class FlashAttentionDSABackwardSm100:
                 topk,
                 mma_reduce_dKV_pipeline,
             )
+            # All T2R reads issued by this warp are complete here (each
+            # store_dKV / T2R block fences before its pipeline release);
+            # signal compute warp 0 that TMEM dealloc is now safe.
+            # arrive() only -- the reduce warps need not stall.
+            self.tmem_dealloc_barrier.arrive()
 
         elif warp_idx in self.load_KV_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_load_KV)
