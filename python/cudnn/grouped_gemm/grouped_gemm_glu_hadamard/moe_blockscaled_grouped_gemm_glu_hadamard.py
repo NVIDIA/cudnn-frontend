@@ -61,7 +61,6 @@ import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
-from cutlass._mlir.dialects.nvvm import ReduxKind
 from cutlass.cute.typing import Float32, Int32, AddressSpace
 from ..moe_persistent_scheduler import (
     MoEPersistentTileScheduler,
@@ -90,7 +89,6 @@ from ..moe_sched_extension import (
 from ..moe_kernel_helpers import (
     fmin,
     fmax,
-    warp_redux_sync,
     atomic_max_float32,
     silu_f32,
     silu_f32_geglu_scaled,
@@ -947,7 +945,7 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
 
     @cute.jit
     def amax_reduction_per_warp_and_cta(self, amax_fp32, warp_idx, amax_smem, amax_gmem):
-        warp_amax = warp_redux_sync(value=amax_fp32, kind=ReduxKind.MAX, mask_and_clamp=0xFFFFFFFF, nan=True)
+        warp_amax = cute.arch.warp_redux_sync(value=amax_fp32, kind="fmax", mask_and_clamp=0xFFFFFFFF, nan=True)
         if cute.arch.lane_idx() == 0:
             amax_smem[warp_idx & 0x3] = cutlass.Float32(warp_amax)
         self.epilog_sync_barrier_group0.arrive_and_wait()
@@ -959,7 +957,7 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
 
     @cute.jit
     def post_rht_amax_reduction_per_warp_and_cta(self, amax_fp32, warp_idx, amax_smem, amax_gmem):
-        warp_amax = warp_redux_sync(value=amax_fp32, kind=ReduxKind.MAX, mask_and_clamp=0xFFFFFFFF, nan=True)
+        warp_amax = cute.arch.warp_redux_sync(value=amax_fp32, kind="fmax", mask_and_clamp=0xFFFFFFFF, nan=True)
         if cute.arch.lane_idx() == 0:
             amax_smem[warp_idx & 0x3] = cutlass.Float32(warp_amax)
         self.epilog_sync_barrier_group1.arrive_and_wait()

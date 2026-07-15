@@ -52,7 +52,6 @@ from ..utils import (
     search_expert_idx_full,
     search_expert_idx_incremental,
     fmin,
-    warp_redux_sync_fmax,
     atomic_max_float32,
     silu_f32,
 )
@@ -998,9 +997,11 @@ class BlockScaledContiguousGroupedGemmKernel:
     @cute.jit
     def amax_reduction_per_warp_and_cta(self, amax_fp32, warp_idx, amax_smem, amax_gmem) -> None:
         # Warp-level reduction using wrapper function
-        warp_amax = warp_redux_sync_fmax(
+        warp_amax = cute.arch.warp_redux_sync(
             value=amax_fp32,
+            kind="fmax",
             mask_and_clamp=0xFFFFFFFF,
+            nan=True,
         )
         # Each epilogue warp's lane 0 writes warp amax to shared memory
         if cute.arch.lane_idx() == 0:
@@ -1162,9 +1163,11 @@ class BlockScaledContiguousGroupedGemmKernel:
         for vi in cutlass.range_constexpr(acc_frg.shape[0]):
             max_value_original = (
                 cutlass.Float32(
-                    warp_redux_sync_fmax(
+                    cute.arch.warp_redux_sync(
                         value=acc_frg[vi, 0],
+                        kind="fmax",
                         mask_and_clamp=0xFFFFFFFF,
+                        nan=True,
                     )
                 )
                 * rcp_limit

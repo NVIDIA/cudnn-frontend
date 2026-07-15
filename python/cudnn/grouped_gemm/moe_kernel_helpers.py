@@ -273,34 +273,6 @@ def atomic_add_bf16x2(ptr, val_fp32_lo, val_fp32_hi, *, loc=None, ip=None):
     )
 
 
-def warp_redux_sync(
-    value,
-    kind,
-    mask_and_clamp=0xFFFFFFFF,
-    abs: bool = False,
-    nan: bool = None,
-    *,
-    loc=None,
-    ip=None,
-):
-    value_type = type(value)
-    value_ir = value.ir_value(loc=loc, ip=ip)
-    mask_ir = Int32(mask_and_clamp).ir_value(loc=loc, ip=ip)
-    ptx_instr = f"redux.sync.max.abs.NaN.f32 $0, $1, $2;"
-
-    return value_type(
-        llvm.inline_asm(
-            T.f32(),
-            [value_ir, mask_ir],
-            f"{ptx_instr}",
-            f"=f,f,i",
-            has_side_effects=True,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
 def atomic_max_float32(
     ptr,
     value: Float32,
@@ -1046,8 +1018,6 @@ def quant_sfd_col(
     d_dtype,
     use_fp8_ptx_cvt,
 ):
-    from cutlass._mlir.dialects.nvvm import ReduxKind
-
     tTR_rAcc_frg = cute.logical_divide(src, cute.make_layout(sf_vec_size))
     acc_frg = tTR_rAcc_frg.load()
     abs_acc_frg_ir = cutlass._mlir.dialects.math.absf(acc_frg.ir_value())
@@ -1056,10 +1026,10 @@ def quant_sfd_col(
     fp32_max = cutlass.Float32(3.40282346638528859812e38)
     tidx, _, _ = cute.arch.thread_idx()
     for vi in cutlass.range_constexpr(0, acc_frg.shape[0], 4):
-        max_value0 = cutlass.Float32(warp_redux_sync(value=acc_frg[vi, 0], kind=ReduxKind.MAX, mask_and_clamp=0xFFFFFFFF, nan=True))
-        max_value1 = cutlass.Float32(warp_redux_sync(value=acc_frg[vi + 1, 0], kind=ReduxKind.MAX, mask_and_clamp=0xFFFFFFFF, nan=True))
-        max_value2 = cutlass.Float32(warp_redux_sync(value=acc_frg[vi + 2, 0], kind=ReduxKind.MAX, mask_and_clamp=0xFFFFFFFF, nan=True))
-        max_value3 = cutlass.Float32(warp_redux_sync(value=acc_frg[vi + 3, 0], kind=ReduxKind.MAX, mask_and_clamp=0xFFFFFFFF, nan=True))
+        max_value0 = cutlass.Float32(cute.arch.warp_redux_sync(value=acc_frg[vi, 0], kind="fmax", mask_and_clamp=0xFFFFFFFF, nan=True))
+        max_value1 = cutlass.Float32(cute.arch.warp_redux_sync(value=acc_frg[vi + 1, 0], kind="fmax", mask_and_clamp=0xFFFFFFFF, nan=True))
+        max_value2 = cutlass.Float32(cute.arch.warp_redux_sync(value=acc_frg[vi + 2, 0], kind="fmax", mask_and_clamp=0xFFFFFFFF, nan=True))
+        max_value3 = cutlass.Float32(cute.arch.warp_redux_sync(value=acc_frg[vi + 3, 0], kind="fmax", mask_and_clamp=0xFFFFFFFF, nan=True))
 
         scale = rcp_limit * norm_const
         max_value0, max_value1 = cute.arch.mul_packed_f32x2((max_value0, max_value1), (scale, scale), rnd="rn", ftz=False)

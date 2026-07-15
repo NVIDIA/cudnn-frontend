@@ -51,23 +51,6 @@ def fmax_f32(a, b, *, loc=None, ip=None):
     return Float32(result)
 
 
-@dsl_user_op
-def redux_sync_max_f32(val, *, loc=None, ip=None):
-    val_ir = val.ir_value(loc=loc, ip=ip)
-    result = llvm.inline_asm(
-        T.f32(),
-        [val_ir],
-        "redux.sync.max.f32 $0, $1, 0xffffffff;",
-        "=f,f",
-        has_side_effects=False,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-    return Float32(result)
-
-
 class RMSNormRHTAmaxKernel:
     """Fused RMSNorm + block-diagonal Hadamard + running per-CTA amax."""
 
@@ -228,7 +211,7 @@ class RMSNormRHTAmaxKernel:
             if row_idx < cfg.rows_per_cta - 1:
                 cute.arch.cp_async_wait_group(0)
 
-        warp_max = redux_sync_max_f32(running_max)
+        warp_max = cute.arch.warp_redux_sync(running_max, "fmax")
         if lane_id == 0:
             amax_buffer[0, warp_id] = warp_max
         cute.arch.barrier()
@@ -236,7 +219,7 @@ class RMSNormRHTAmaxKernel:
         amax_val = cutlass.Float32(0.0)
         if lane_id < cfg.warps_per_row:
             amax_val = amax_buffer[0, lane_id]
-        cta_max = redux_sync_max_f32(amax_val)
+        cta_max = cute.arch.warp_redux_sync(amax_val, "fmax")
         if tid == cutlass.Int32(0):
             m_amax[bid] = cta_max
 
