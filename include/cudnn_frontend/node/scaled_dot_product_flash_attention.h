@@ -1591,18 +1591,18 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
         // regular fp32 dQ-accum graph: bitwise deterministic with workspace
         // linear in sequence length. It trades speed for memory versus the
         // dP-workspace decomposition (the dQ reductions serialize per
-        // (batch, head)), so dense problems keep the dP path by default and
-        // only route to STAGES = 4 when the user explicitly constrains the
-        // dP workspace below its requirement via
+        // (batch, head)), so the dP path remains the default at any size and
+        // STAGES = 4 is strictly opt-in: it is selected only when the user
+        // explicitly constrains the dP workspace below its requirement via
         // CUDNN_FRONTEND_ATTN_DP_WORKSPACE_LIMIT (n = cap in bytes,
-        // 0 = never use dP, -1 = unlimited dP). Ragged/THD layouts route
-        // automatically: their dP workspace scales with total tokens squared,
-        // which makes long-sequence deterministic training infeasible, so
-        // there is no working dP configuration to preserve.
+        // 0 = never use dP, -1 = unlimited dP). This is how configurations
+        // whose dP workspace cannot be afforded (e.g. long-sequence THD,
+        // where it scales with the padded sequence lengths and fails to
+        // allocate) request the linear-workspace deterministic path. The
+        // dense-layout formula below is a lower bound for ragged layouts,
+        // so opting in is conservative there.
         if (attributes.is_deterministic_algorithm && (prop_major == 9) && (detail::get_backend_version() >= 92500) &&
             !attributes.outputs[output_names::dBias]) {
-            bool const is_ragged_layout = attributes.inputs.at(input_names::Q)->get_ragged_offset() != nullptr;
-
             bool user_opted_in = false;
             const char* env_dp_workspace_limit_char_sm90 = get_environment("CUDNN_FRONTEND_ATTN_DP_WORKSPACE_LIMIT");
             if (env_dp_workspace_limit_char_sm90) {
@@ -1617,7 +1617,7 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
                 }
             }
 
-            use_sm90_ordered_dq_deterministic = is_ragged_layout || user_opted_in;
+            use_sm90_ordered_dq_deterministic = user_opted_in;
         }
 
         // Force dP workspace implementation if:
