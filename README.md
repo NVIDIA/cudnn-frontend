@@ -155,6 +155,16 @@ export CUDNN_FRONTEND_LOG_FILE=execution_log.txt
 
 Alternatively, you can control logging programmatically via `cudnn_frontend::isLoggingEnabled()`.
 
+### Environment report
+
+When filing a bug, include the output of the environment collector — it reports the frontend/backend versions, GPU/driver properties, and every cuDNN/CUDA library copy on the system (loaded vs on disk):
+
+```bash
+python -m cudnn.collect_env
+```
+
+If `import cudnn` itself is broken, download [collect_env.py](python/cudnn/collect_env.py) and run it standalone with any Python.
+
 ### Overriding the CUDA runtime library
 
 When the frontend is built with dynamic loading enabled, it locates the CUDA runtime
