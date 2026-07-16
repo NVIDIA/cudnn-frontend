@@ -1586,37 +1586,38 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
             }
         }
 
-        // On Hopper with cuDNN >= 9.25, deterministic mode can be served by an
-        // engine option that serializes the fp32 dQ workspace reductions across
-        // KV-tile CTAs in a fixed order: bitwise deterministic with workspace
-        // linear in sequence length, instead of the dP-workspace decomposition
-        // whose workspace is quadratic (b*h*s_q_pad*s_kv_pad*2 bytes; for THD
-        // layouts b is total tokens, which makes long-sequence deterministic
-        // training infeasible). The dP path is faster on small dense problems,
-        // so it is kept whenever its workspace fits the dP workspace limit
-        // (256 MB default, CUDNN_FRONTEND_ATTN_DP_WORKSPACE_LIMIT to override);
-        // ragged/THD layouts and larger problems route to the ordered-dQ
-        // engine via override_heuristics_query().
+        // On Hopper with cuDNN >= 9.25, deterministic mode can be served by
+        // the backward engine's ordered dQ accumulation (STAGES = 4) on the
+        // regular fp32 dQ-accum graph: bitwise deterministic with workspace
+        // linear in sequence length. It trades speed for memory versus the
+        // dP-workspace decomposition (the dQ reductions serialize per
+        // (batch, head)), so dense problems keep the dP path by default and
+        // only route to STAGES = 4 when the user explicitly constrains the
+        // dP workspace below its requirement via
+        // CUDNN_FRONTEND_ATTN_DP_WORKSPACE_LIMIT (n = cap in bytes,
+        // 0 = never use dP, -1 = unlimited dP). Ragged/THD layouts route
+        // automatically: their dP workspace scales with total tokens squared,
+        // which makes long-sequence deterministic training infeasible, so
+        // there is no working dP configuration to preserve.
         if (attributes.is_deterministic_algorithm && (prop_major == 9) && (detail::get_backend_version() >= 92500) &&
             !attributes.outputs[output_names::dBias]) {
             bool const is_ragged_layout = attributes.inputs.at(input_names::Q)->get_ragged_offset() != nullptr;
 
-            int64_t max_dp_workspace_bytes                = 256 * 1024 * 1024;
-            const char* env_dp_workspace_limit_char_sm90  = get_environment("CUDNN_FRONTEND_ATTN_DP_WORKSPACE_LIMIT");
+            bool user_opted_in = false;
+            const char* env_dp_workspace_limit_char_sm90 = get_environment("CUDNN_FRONTEND_ATTN_DP_WORKSPACE_LIMIT");
             if (env_dp_workspace_limit_char_sm90) {
-                char* end_ptr          = nullptr;
-                int64_t const parsed   = std::strtoll(env_dp_workspace_limit_char_sm90, &end_ptr, 10);
-                if (end_ptr != nullptr && *end_ptr == '\0') {
-                    max_dp_workspace_bytes = parsed;
+                char* end_ptr        = nullptr;
+                int64_t const parsed = std::strtoll(env_dp_workspace_limit_char_sm90, &end_ptr, 10);
+                if (end_ptr != nullptr && *end_ptr == '\0' && parsed >= 0) {
+                    int64_t const workspace_s_q_sm90  = ((s_q + 64 - 1) / 64) * 64;
+                    int64_t const workspace_s_kv_sm90 = ((s_kv + 128 - 1) / 128) * 128;
+                    int64_t const required_dp_workspace_bytes_sm90 =
+                        b * h_q * workspace_s_q_sm90 * workspace_s_kv_sm90 * 2;
+                    user_opted_in = required_dp_workspace_bytes_sm90 > parsed;
                 }
             }
 
-            int64_t const workspace_s_q_sm90  = ((s_q + 64 - 1) / 64) * 64;
-            int64_t const workspace_s_kv_sm90 = ((s_kv + 128 - 1) / 128) * 128;
-            int64_t const required_dp_workspace_bytes_sm90 = b * h_q * workspace_s_q_sm90 * workspace_s_kv_sm90 * 2;
-
-            use_sm90_ordered_dq_deterministic =
-                is_ragged_layout || (max_dp_workspace_bytes >= 0 && required_dp_workspace_bytes_sm90 > max_dp_workspace_bytes);
+            use_sm90_ordered_dq_deterministic = is_ragged_layout || user_opted_in;
         }
 
         // Force dP workspace implementation if:
