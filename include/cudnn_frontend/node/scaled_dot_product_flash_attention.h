@@ -1095,6 +1095,10 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
         workaround_padding_mask_seq_len_kv;                                  // Will be edited in pre_validate_node()
     mutable int64_t batch_size_for_workaround_padding_mask         = 0;      // Will be edited in pre_validate_node()
     mutable bool is_deterministic_algorithm_supported_on_blackwell = false;  // Will be edited in pre_validate_node()
+    // Hopper deterministic bwd served by the backend's ordered-dQ engine
+    // option (bitwise-deterministic dQ accumulation with workspace linear in
+    // sequence length). Set at expand time when eligible.
+    mutable bool use_sm90_ordered_dq_deterministic = false;
     mutable bool is_d256_on_blackwell                              = false;  // Will be edited in pre_validate_node()
 
     // Promote any 1-D seq_len / ragged-offset index tensors to the 4-D
@@ -1582,10 +1586,45 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
             }
         }
 
+        // On Hopper with cuDNN >= 9.25, deterministic mode can be served by an
+        // engine option that serializes the fp32 dQ workspace reductions across
+        // KV-tile CTAs in a fixed order: bitwise deterministic with workspace
+        // linear in sequence length, instead of the dP-workspace decomposition
+        // whose workspace is quadratic (b*h*s_q_pad*s_kv_pad*2 bytes; for THD
+        // layouts b is total tokens, which makes long-sequence deterministic
+        // training infeasible). The dP path is faster on small dense problems,
+        // so it is kept whenever its workspace fits the dP workspace limit
+        // (256 MB default, CUDNN_FRONTEND_ATTN_DP_WORKSPACE_LIMIT to override);
+        // ragged/THD layouts and larger problems route to the ordered-dQ
+        // engine via override_heuristics_query().
+        if (attributes.is_deterministic_algorithm && (prop_major == 9) && (detail::get_backend_version() >= 92500) &&
+            !attributes.outputs[output_names::dBias]) {
+            bool const is_ragged_layout = attributes.inputs.at(input_names::Q)->get_ragged_offset() != nullptr;
+
+            int64_t max_dp_workspace_bytes                = 256 * 1024 * 1024;
+            const char* env_dp_workspace_limit_char_sm90  = get_environment("CUDNN_FRONTEND_ATTN_DP_WORKSPACE_LIMIT");
+            if (env_dp_workspace_limit_char_sm90) {
+                char* end_ptr          = nullptr;
+                int64_t const parsed   = std::strtoll(env_dp_workspace_limit_char_sm90, &end_ptr, 10);
+                if (end_ptr != nullptr && *end_ptr == '\0') {
+                    max_dp_workspace_bytes = parsed;
+                }
+            }
+
+            int64_t const workspace_s_q_sm90  = ((s_q + 64 - 1) / 64) * 64;
+            int64_t const workspace_s_kv_sm90 = ((s_kv + 128 - 1) / 128) * 128;
+            int64_t const required_dp_workspace_bytes_sm90 = b * h_q * workspace_s_q_sm90 * workspace_s_kv_sm90 * 2;
+
+            use_sm90_ordered_dq_deterministic =
+                is_ragged_layout || (max_dp_workspace_bytes >= 0 && required_dp_workspace_bytes_sm90 > max_dp_workspace_bytes);
+        }
+
         // Force dP workspace implementation if:
         //  - dBias is enabled (dBias is only supported on workspace implementation)
-        //  - the user force requests deterministic algorithm on hopper
-        if (attributes.outputs[output_names::dBias] || attributes.is_deterministic_algorithm) {
+        //  - the user force requests deterministic algorithm on hopper and the
+        //    ordered-dQ route is not taken
+        if (attributes.outputs[output_names::dBias] ||
+            (attributes.is_deterministic_algorithm && !use_sm90_ordered_dq_deterministic)) {
             use_dp_workspace = true;
         }
 
@@ -2086,6 +2125,16 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
             } else {
                 return {5, {{KnobType_t::KERNEL_CFG, 31}, {KnobType_t::STAGES, is_d256_on_blackwell ? 3 : 2}}};
             }
+        } else if (use_sm90_ordered_dq_deterministic && sm_version >= 90 && sm_version < 100) {
+            // Hopper bwd engine, 64x64 bprop tiles, ordered deterministic dQ
+            // accumulation (STAGES = 4).
+            return {6,
+                    {{KnobType_t::TILE_M, 2},
+                     {KnobType_t::TILE_N, 1},
+                     {KnobType_t::KERNEL_CFG, 2},
+                     {KnobType_t::STREAM_K, 0},
+                     {KnobType_t::TILE_CGA_M, 0},
+                     {KnobType_t::STAGES, 4}}};
         } else {
             return {-1, {}};
         }
