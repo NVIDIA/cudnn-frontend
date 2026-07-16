@@ -50,6 +50,11 @@ body:
 
         ### Environment (where applicable)
 
+        <!-- Python users: run `python -m cudnn.collect_env` and paste its output
+             here instead of filling the fields below. If `import cudnn` is broken,
+             download and run the script standalone with any Python:
+             https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/python/cudnn/collect_env.py -->
+
         cuDNN Frontend Version: 1.27.0
         cuDNN Backend Version: 9.24.0
         CUDA Toolkit/Runtime Version: 13.4
