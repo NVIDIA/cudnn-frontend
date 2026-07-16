@@ -183,7 +183,8 @@ run_batch_norm_forward(cudnnHandle_t &handle_,
     auto plan = plan_builder();
     std::cout << "Plan tag: " << plan.getTag() << std::endl;
 
-    handle_ptr.release();
+    // Transfer the cuDNN handle to the caller without leaking the pointer storage owned by handle_ptr.
+    delete handle_ptr.release();
     return plan;
 }
 
@@ -206,8 +207,8 @@ execute_batch_norm_forward(cudnnHandle_t &handle_,
                            double epsilon_val,
                            double exponential_decay_factor) {
     // This function completes the ownership transfer started by run_batch_norm_forward().
-    auto handle_ptr = std::unique_ptr<cudnnHandle_t, CudnnHandleDeleter>(new cudnnHandle_t(handle_),
-                                                                         CudnnHandleDeleter());
+    auto handle_ptr =
+        std::unique_ptr<cudnnHandle_t, CudnnHandleDeleter>(new cudnnHandle_t(handle_), CudnnHandleDeleter());
     try {
         auto workspace_size = plan.getWorkspaceSize();
         std::cout << plan.describe() << std::endl;
