@@ -69,7 +69,6 @@ from ..discrete_kernel_utils import (
     fmax,
     fmin_bf16x2,
     fmax_bf16x2,
-    warp_redux_sync,
     atomic_max_float32,
     atomic_add_float32,
     atomic_add_bf16x2,
@@ -1203,10 +1202,11 @@ class BlockScaledDiscreteWeightDgluDbiasGroupedGemmKernel:
     @cute.jit
     def amax_reduction_per_warp_and_cta(self, amax_fp32, warp_idx, amax_smem, amax_gmem) -> None:
         # Warp-level reduction using wrapper function
-        warp_amax = warp_redux_sync(
+        warp_amax = cute.arch.warp_redux_sync(
             value=amax_fp32,
-            kind=None,
+            kind="fmax",
             mask_and_clamp=0xFFFFFFFF,
+            nan=True,
         )
         # Each epilogue warp's lane 0 writes warp amax to shared memory
         lane_idx = cute.arch.thread_idx()[0] % 32
@@ -1406,6 +1406,8 @@ class BlockScaledDiscreteWeightDgluDbiasGroupedGemmKernel:
         tCompute.store(src)
         tTR_rAcc_frg = cute.logical_divide(tCompute, cute.make_layout(self.sf_vec_size))
         acc_frg = tTR_rAcc_frg.load()
+        abs_acc_frg_ir = cutlass._mlir.dialects.math.absf(acc_frg.ir_value())
+        acc_frg = type(acc_frg)(abs_acc_frg_ir, acc_frg.shape, acc_frg.dtype)
 
         tmp_fp32 = cutlass.Float32(0.0)
         fp32_max = cutlass.Float32(3.40282346638528859812e38)
@@ -1413,31 +1415,35 @@ class BlockScaledDiscreteWeightDgluDbiasGroupedGemmKernel:
 
         for vi in cutlass.range_constexpr(0, acc_frg.shape[0], 4):
             max_value0 = cutlass.Float32(
-                warp_redux_sync(
+                cute.arch.warp_redux_sync(
                     value=acc_frg[vi, 0],
-                    kind=None,
+                    kind="fmax",
                     mask_and_clamp=0xFFFFFFFF,
+                    nan=True,
                 )
             )
             max_value1 = cutlass.Float32(
-                warp_redux_sync(
+                cute.arch.warp_redux_sync(
                     value=acc_frg[vi + 1, 0],
-                    kind=None,
+                    kind="fmax",
                     mask_and_clamp=0xFFFFFFFF,
+                    nan=True,
                 )
             )
             max_value2 = cutlass.Float32(
-                warp_redux_sync(
+                cute.arch.warp_redux_sync(
                     value=acc_frg[vi + 2, 0],
-                    kind=None,
+                    kind="fmax",
                     mask_and_clamp=0xFFFFFFFF,
+                    nan=True,
                 )
             )
             max_value3 = cutlass.Float32(
-                warp_redux_sync(
+                cute.arch.warp_redux_sync(
                     value=acc_frg[vi + 3, 0],
-                    kind=None,
+                    kind="fmax",
                     mask_and_clamp=0xFFFFFFFF,
+                    nan=True,
                 )
             )
 

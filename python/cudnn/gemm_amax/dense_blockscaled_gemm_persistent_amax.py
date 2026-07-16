@@ -1300,16 +1300,12 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     self.epilog_sync_barrier.arrive_and_wait()
 
                 # Perform amax reduction after all subtiles are processed
-                _val_i32 = llvm.bitcast(T.i32(), thread_tile_amax.ir_value(), loc=None, ip=None)
-                _res_i32 = nvvm.redux_sync(
-                    res=T.i32(),
-                    val=_val_i32,
-                    kind=nvvm.ReduxKind.MAX,
-                    mask_and_clamp=cutlass.Int32(0xFFFFFFFF).ir_value(),
-                    loc=None,
-                    ip=None,
+                warp_amax = cute.arch.warp_redux_sync(
+                    value=thread_tile_amax,
+                    kind="fmax",
+                    mask_and_clamp=0xFFFFFFFF,
+                    nan=True,
                 )
-                warp_amax = cutlass.Float32(llvm.bitcast(T.f32(), _res_i32, loc=None, ip=None))
 
                 # Each epilogue warp's lane 0 writes warp amax to shared memory
                 if cute.arch.lane_idx() == 0:

@@ -291,34 +291,6 @@ def atomic_add_bf16x2(ptr, val_fp32_lo, val_fp32_hi, *, loc=None, ip=None):
     )
 
 
-def warp_redux_sync(
-    value,
-    kind,
-    mask_and_clamp=0xFFFFFFFF,
-    abs: bool = False,
-    nan: bool = None,
-    *,
-    loc=None,
-    ip=None,
-):
-    value_type = type(value)
-    value_ir = value.ir_value(loc=loc, ip=ip)
-    mask_ir = Int32(mask_and_clamp).ir_value(loc=loc, ip=ip)
-    ptx_instr = f"redux.sync.max.abs.NaN.f32 $0, $1, $2;"
-
-    return value_type(
-        llvm.inline_asm(
-            T.f32(),
-            [value_ir, mask_ir],
-            f"{ptx_instr}",
-            f"=f,f,i",
-            has_side_effects=True,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
 def atomic_max_float32(
     ptr,
     value: Float32,

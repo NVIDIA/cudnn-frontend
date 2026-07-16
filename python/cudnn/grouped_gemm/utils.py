@@ -201,31 +201,6 @@ def fmax(a: Union[float, Float32], b: Union[float, Float32], *, loc=None, ip=Non
     )
 
 
-def warp_redux_sync_fmax(
-    value,
-    mask_and_clamp=0xFFFFFFFF,
-    *,
-    loc=None,
-    ip=None,
-):
-    value_type = type(value)
-    value_ir = value.ir_value(loc=loc, ip=ip)
-    mask_ir = Int32(mask_and_clamp).ir_value(loc=loc, ip=ip)
-    ptx_instr = f"redux.sync.max.abs.NaN.f32 $0, $1, $2;"
-
-    return value_type(
-        llvm.inline_asm(
-            T.f32(),
-            [value_ir, mask_ir],
-            f"{ptx_instr}",
-            f"=f,f,i",
-            has_side_effects=True,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
 def logical_shape_fp4x2_aware(tensor: torch.Tensor) -> Tuple[int, ...]:
     """Return correct shapes for NVFP4 tensor."""
     if tensor.dtype == torch.float4_e2m1fn_x2:

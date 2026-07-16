@@ -30,7 +30,6 @@ import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
-from cutlass._mlir.dialects.nvvm import ReduxKind
 from cutlass.cute.typing import Float32, Int32, AddressSpace
 from ..moe_persistent_scheduler import (
     MoEPersistentTileScheduler,
@@ -50,7 +49,6 @@ from ..moe_sched_extension import (
 from ..moe_kernel_helpers import (
     fmin,
     fmax,
-    warp_redux_sync,
     atomic_max_float32,
     compute_stages,
     compute_grid,
@@ -957,9 +955,9 @@ class BlockScaledMoEGroupedGemmQuantKernel:
 
     @cute.jit
     def amax_reduction_per_warp_and_cta(self, amax_fp32, warp_idx, amax_smem, amax_gmem):
-        warp_amax = warp_redux_sync(
+        warp_amax = cute.arch.warp_redux_sync(
             value=amax_fp32,
-            kind=ReduxKind.MAX,
+            kind="fmax",
             mask_and_clamp=0xFFFFFFFF,
             nan=True,
         )
