@@ -452,6 +452,7 @@ class GroupedGemmWgradSm100(APIBase):
         cached_workspace = from_dlpack(self._workspace, assumed_align=128, enable_tvm_ffi=True)
 
         if self.weight_mode == MoEWeightMode.DENSE:
+
             def tensor_api(
                 a_tensor: torch.Tensor,
                 b_tensor: torch.Tensor,
@@ -651,20 +652,19 @@ def grouped_gemm_wgrad_wrapper_sm100(
         input_order,
     )
 
-    aot_mode = os.getenv("CUDNN_FE_AOT_MODE", "").strip().lower()
-    aot_artifact_dir = os.getenv("CUDNN_FE_AOT_DIR")
+    aot_mode = os.getenv("NV_CUDNN_FE_AOT_MODE", "").strip().lower()
+    aot_artifact_dir = os.getenv("NV_CUDNN_FE_AOT_DIR")
     if aot_mode and aot_mode not in {"read", "write", "readwrite"}:
-        raise ValueError(
-            "CUDNN_FE_AOT_MODE must be one of {'read', 'write', 'readwrite'}, "
-            f"got {aot_mode!r}"
-        )
+        raise ValueError("NV_CUDNN_FE_AOT_MODE must be one of {'read', 'write', 'readwrite'}, " f"got {aot_mode!r}")
     if aot_mode and not aot_artifact_dir:
-        raise ValueError("CUDNN_FE_AOT_DIR is required when CUDNN_FE_AOT_MODE is set")
-    use_cache = not aot_mode or aot_mode == "write"
-    if use_cache and cache_key in _cache_of_GroupedGemmWgradSm100Objects:
+        raise ValueError("NV_CUDNN_FE_AOT_DIR is required when NV_CUDNN_FE_AOT_MODE is set")
+    if cache_key in _cache_of_GroupedGemmWgradSm100Objects:
         op = _cache_of_GroupedGemmWgradSm100Objects[cache_key]
-        if aot_mode == "write" and op._raw_compiled_kernel is None:
-            op = None
+        if aot_mode == "write":
+            if op._raw_compiled_kernel is None:
+                op = None
+            else:
+                op.export_aot(aot_artifact_dir, cache_key)
     else:
         op = None
 

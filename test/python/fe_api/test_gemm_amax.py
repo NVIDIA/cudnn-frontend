@@ -174,9 +174,20 @@ def test_gemm_amax_aot_export_load(tmp_path, monkeypatch):
         return original_export_aot(self, *args, **kwargs)
 
     monkeypatch.setattr(gemm_amax_api.GemmAmaxSm100, "export_aot", counting_export_aot)
-    monkeypatch.setenv("CUDNN_FE_AOT_MODE", "write")
-    monkeypatch.setenv("CUDNN_FE_AOT_DIR", str(tmp_path))
+    monkeypatch.delenv("NV_CUDNN_FE_AOT_MODE", raising=False)
+    monkeypatch.delenv("NV_CUDNN_FE_AOT_DIR", raising=False)
+    compiled = gemm_amax_wrapper_sm100(a_torch, b_torch, sfa_torch, sfb_torch)
+    compiled_entry = next(iter(gemm_amax_api._cache_of_GemmAmaxSm100Objects.values()))
+    assert compiled_entry._raw_compiled_kernel is not None
+    check_ref_gemm_amax(a_ref, b_ref, sfa_ref, sfb_ref, compiled["c_tensor"], compiled["amax_tensor"])
+    assert list(tmp_path.iterdir()) == []
+    assert export_calls == 0
+
+    monkeypatch.setenv("NV_CUDNN_FE_AOT_MODE", "write")
+    monkeypatch.setenv("NV_CUDNN_FE_AOT_DIR", str(tmp_path))
     exported = gemm_amax_wrapper_sm100(a_torch, b_torch, sfa_torch, sfb_torch)
+    assert next(iter(gemm_amax_api._cache_of_GemmAmaxSm100Objects.values())) is compiled_entry
+    assert export_calls == 1
 
     metadata_files = list(tmp_path.glob("*.json"))
     assert len(metadata_files) == 1
@@ -186,14 +197,39 @@ def test_gemm_amax_aot_export_load(tmp_path, monkeypatch):
     check_ref_gemm_amax(a_ref, b_ref, sfa_ref, sfb_ref, exported["c_tensor"], exported["amax_tensor"])
     assert export_calls == 1
 
+    artifact_contents = {path.name: path.read_bytes() for path in tmp_path.iterdir()}
     cached = gemm_amax_wrapper_sm100(a_torch, b_torch, sfa_torch, sfb_torch)
     check_ref_gemm_amax(a_ref, b_ref, sfa_ref, sfb_ref, cached["c_tensor"], cached["amax_tensor"])
-    assert export_calls == 1
+    assert {path.name: path.read_bytes() for path in tmp_path.iterdir()} == artifact_contents
+    assert export_calls == 2
 
-    monkeypatch.setenv("CUDNN_FE_AOT_MODE", "read")
+    writer_entry = next(iter(gemm_amax_api._cache_of_GemmAmaxSm100Objects.values()))
+    monkeypatch.setenv("NV_CUDNN_FE_AOT_MODE", "read")
+    memory_hit = gemm_amax_wrapper_sm100(a_torch, b_torch, sfa_torch, sfb_torch)
+    assert next(iter(gemm_amax_api._cache_of_GemmAmaxSm100Objects.values())) is writer_entry
+    check_ref_gemm_amax(
+        a_ref,
+        b_ref,
+        sfa_ref,
+        sfb_ref,
+        memory_hit["c_tensor"],
+        memory_hit["amax_tensor"],
+    )
+
+    gemm_amax_api._cache_of_GemmAmaxSm100Objects.clear()
     loaded = gemm_amax_wrapper_sm100(a_torch, b_torch, sfa_torch, sfb_torch)
-
+    loaded_entry = next(iter(gemm_amax_api._cache_of_GemmAmaxSm100Objects.values()))
+    loaded_again = gemm_amax_wrapper_sm100(a_torch, b_torch, sfa_torch, sfb_torch)
+    assert next(iter(gemm_amax_api._cache_of_GemmAmaxSm100Objects.values())) is loaded_entry
     check_ref_gemm_amax(a_ref, b_ref, sfa_ref, sfb_ref, loaded["c_tensor"], loaded["amax_tensor"])
+    check_ref_gemm_amax(
+        a_ref,
+        b_ref,
+        sfa_ref,
+        sfb_ref,
+        loaded_again["c_tensor"],
+        loaded_again["amax_tensor"],
+    )
 
 
 """

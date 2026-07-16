@@ -837,18 +837,14 @@ def grouped_gemm_dswiglu_wrapper_sm100(
         mma_shape_col = (1, ceil_div(n * 2, 128), ceil_div(sf_k_col, 4), 32, 4, 4)
         sfd_col_tensor = torch.empty(mma_shape_col, dtype=sf_dtype, device=a_tensor.device).permute(mma_permute_order)
 
-    aot_mode = os.getenv("CUDNN_FE_AOT_MODE", "").strip().lower()
-    aot_artifact_dir = os.getenv("CUDNN_FE_AOT_DIR")
+    aot_mode = os.getenv("NV_CUDNN_FE_AOT_MODE", "").strip().lower()
+    aot_artifact_dir = os.getenv("NV_CUDNN_FE_AOT_DIR")
     if aot_mode and aot_mode not in {"read", "write", "readwrite"}:
-        raise ValueError(
-            "CUDNN_FE_AOT_MODE must be one of {'read', 'write', 'readwrite'}, "
-            f"got {aot_mode!r}"
-        )
+        raise ValueError("NV_CUDNN_FE_AOT_MODE must be one of {'read', 'write', 'readwrite'}, " f"got {aot_mode!r}")
     if aot_mode and not aot_artifact_dir:
-        raise ValueError("CUDNN_FE_AOT_DIR is required when CUDNN_FE_AOT_MODE is set")
+        raise ValueError("NV_CUDNN_FE_AOT_DIR is required when NV_CUDNN_FE_AOT_MODE is set")
 
-    use_cache = not aot_mode or aot_mode == "write"
-    if use_cache and cache_key in _cache_of_GroupedGemmDswigluSm100Objects:
+    if cache_key in _cache_of_GroupedGemmDswigluSm100Objects:
         _logger.debug("group_gemm_dswiglu_wrapper_sm100: Using previously cached GroupedGemmDswigluSm100 object")
         grouped_gemm_dswiglu, cached_amax_tensor, cached_beta_tensor = _cache_of_GroupedGemmDswigluSm100Objects[cache_key]
         amax_tensor = amax_tensor_buf if amax_tensor_buf is not None else cached_amax_tensor
@@ -860,8 +856,11 @@ def grouped_gemm_dswiglu_wrapper_sm100(
             # Fallback: cache was populated without beta caching (non-NVFP4 path),
             # but caller now passes None (NVFP4 path). Create ones tensor on-the-fly.
             effective_beta = torch.ones(l, dtype=torch.float32, device=a_tensor.device)
-        if aot_mode == "write" and grouped_gemm_dswiglu._raw_compiled_kernel is None:
-            grouped_gemm_dswiglu = None
+        if aot_mode == "write":
+            if grouped_gemm_dswiglu._raw_compiled_kernel is None:
+                grouped_gemm_dswiglu = None
+            else:
+                grouped_gemm_dswiglu.export_aot(aot_artifact_dir, cache_key)
     else:
         grouped_gemm_dswiglu = None
 

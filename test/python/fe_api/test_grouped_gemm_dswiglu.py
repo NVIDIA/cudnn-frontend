@@ -246,8 +246,8 @@ def test_grouped_gemm_dswiglu_aot_export_load(tmp_path, monkeypatch, request):
         return original_export_aot(self, *args, **kwargs)
 
     monkeypatch.setattr(grouped_gemm_dswiglu_api.GroupedGemmDswigluSm100, "export_aot", counting_export_aot)
-    monkeypatch.setenv("CUDNN_FE_AOT_MODE", "write")
-    monkeypatch.setenv("CUDNN_FE_AOT_DIR", str(tmp_path))
+    monkeypatch.setenv("NV_CUDNN_FE_AOT_MODE", "write")
+    monkeypatch.setenv("NV_CUDNN_FE_AOT_DIR", str(tmp_path))
 
     try:
         exported = grouped_gemm_dswiglu_wrapper_sm100(
@@ -306,9 +306,10 @@ def test_grouped_gemm_dswiglu_aot_export_load(tmp_path, monkeypatch, request):
         current_stream=stream,
     )
     check_ref_grouped_gemm_dswiglu(inputs, cached, cfg, skip_ref=cfg["skip_ref"])
-    assert export_calls == 1
+    assert export_calls == 2
 
-    monkeypatch.setenv("CUDNN_FE_AOT_MODE", "read")
+    monkeypatch.setenv("NV_CUDNN_FE_AOT_MODE", "read")
+    grouped_gemm_dswiglu_api._cache_of_GroupedGemmDswigluSm100Objects.clear()
     loaded = grouped_gemm_dswiglu_wrapper_sm100(
         a_tensor=inputs["a_tensor"],
         b_tensor=inputs["b_tensor"],
@@ -331,7 +332,32 @@ def test_grouped_gemm_dswiglu_aot_export_load(tmp_path, monkeypatch, request):
         discrete_col_sfd=cfg["discrete_col_sfd"],
         current_stream=stream,
     )
+    loaded_entry = next(iter(grouped_gemm_dswiglu_api._cache_of_GroupedGemmDswigluSm100Objects.values()))
+    loaded_again = grouped_gemm_dswiglu_wrapper_sm100(
+        a_tensor=inputs["a_tensor"],
+        b_tensor=inputs["b_tensor"],
+        c_tensor=inputs["c_tensor"],
+        sfa_tensor=inputs["sfa_tensor"],
+        sfb_tensor=inputs["sfb_tensor"],
+        padded_offsets=inputs["padded_offsets_tensor"],
+        alpha_tensor=inputs["alpha_tensor"],
+        beta_tensor=inputs["beta_tensor"],
+        prob_tensor=inputs["prob_tensor"],
+        norm_const_tensor=inputs.get("norm_const_tensor"),
+        acc_dtype=cfg["acc_dtype"],
+        d_dtype=cfg["d_dtype"],
+        cd_major=cfg["cd_major"],
+        mma_tiler_mn=cfg["mma_tiler_mn"],
+        cluster_shape_mn=cfg["cluster_shape_mn"],
+        sf_vec_size=cfg["sf_vec_size"],
+        vector_f32=cfg["vector_f32"],
+        m_aligned=cfg["m_aligned"],
+        discrete_col_sfd=cfg["discrete_col_sfd"],
+        current_stream=stream,
+    )
+    assert next(iter(grouped_gemm_dswiglu_api._cache_of_GroupedGemmDswigluSm100Objects.values())) is loaded_entry
     check_ref_grouped_gemm_dswiglu(inputs, loaded, cfg, skip_ref=cfg["skip_ref"])
+    check_ref_grouped_gemm_dswiglu(inputs, loaded_again, cfg, skip_ref=cfg["skip_ref"])
 
 
 @pytest.mark.L0

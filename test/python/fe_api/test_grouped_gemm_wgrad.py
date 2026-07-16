@@ -192,8 +192,8 @@ def test_grouped_gemm_wgrad_dense_aot_export_load(tmp_path, monkeypatch):
         return original_export_aot(self, *args, **kwargs)
 
     monkeypatch.setattr(grouped_gemm_wgrad_api.GroupedGemmWgradSm100, "export_aot", counting_export_aot)
-    monkeypatch.setenv("CUDNN_FE_AOT_MODE", "write")
-    monkeypatch.setenv("CUDNN_FE_AOT_DIR", str(tmp_path))
+    monkeypatch.setenv("NV_CUDNN_FE_AOT_MODE", "write")
+    monkeypatch.setenv("NV_CUDNN_FE_AOT_DIR", str(tmp_path))
 
     _test_grouped_gemm_wgrad_dense_wrapper(
         ab_dtype=torch.float4_e2m1fn_x2,
@@ -210,9 +210,10 @@ def test_grouped_gemm_wgrad_dense_aot_export_load(tmp_path, monkeypatch):
     metadata = json.loads(metadata_files[0].read_text(encoding="utf-8"))
     assert metadata["identity"]["kernel_name"] == "GroupedGemmWgradSm100"
     assert metadata["symbol"].startswith("cudnnfe_GroupedGemmWgradSm100_")
-    assert export_calls == 1
+    assert export_calls == 2
 
-    monkeypatch.setenv("CUDNN_FE_AOT_MODE", "read")
+    monkeypatch.setenv("NV_CUDNN_FE_AOT_MODE", "read")
+    grouped_gemm_wgrad_api._cache_of_GroupedGemmWgradSm100Objects.clear()
     _test_grouped_gemm_wgrad_dense_wrapper(
         ab_dtype=torch.float4_e2m1fn_x2,
         wgrad_dtype=torch.bfloat16,
@@ -222,9 +223,21 @@ def test_grouped_gemm_wgrad_dense_aot_export_load(tmp_path, monkeypatch):
         sf_vec_size=32,
         sf_dtype=torch.float8_e8m0fnu,
     )
-    assert export_calls == 1
+    loaded_entry = next(iter(grouped_gemm_wgrad_api._cache_of_GroupedGemmWgradSm100Objects.values()))
+    _test_grouped_gemm_wgrad_dense_wrapper(
+        ab_dtype=torch.float4_e2m1fn_x2,
+        wgrad_dtype=torch.bfloat16,
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=32,
+        sf_dtype=torch.float8_e8m0fnu,
+    )
+    assert next(iter(grouped_gemm_wgrad_api._cache_of_GroupedGemmWgradSm100Objects.values())) is loaded_entry
+    assert export_calls == 2
 
 
+@pytest.mark.L0
 def test_grouped_gemm_wgrad_discrete_aot_export_load(tmp_path, monkeypatch):
     pytest.importorskip("cutlass", reason="CuTe DSL is not installed")
     if not torch.cuda.is_available():
@@ -246,8 +259,8 @@ def test_grouped_gemm_wgrad_discrete_aot_export_load(tmp_path, monkeypatch):
         return original_export_aot(self, *args, **kwargs)
 
     monkeypatch.setattr(grouped_gemm_wgrad_api.GroupedGemmWgradSm100, "export_aot", counting_export_aot)
-    monkeypatch.setenv("CUDNN_FE_AOT_MODE", "write")
-    monkeypatch.setenv("CUDNN_FE_AOT_DIR", str(tmp_path))
+    monkeypatch.setenv("NV_CUDNN_FE_AOT_MODE", "write")
+    monkeypatch.setenv("NV_CUDNN_FE_AOT_DIR", str(tmp_path))
 
     _test_grouped_gemm_wgrad_discrete_wrapper(
         ab_dtype=torch.float4_e2m1fn_x2,
@@ -265,9 +278,10 @@ def test_grouped_gemm_wgrad_discrete_aot_export_load(tmp_path, monkeypatch):
     metadata = json.loads(metadata_files[0].read_text(encoding="utf-8"))
     assert metadata["identity"]["kernel_name"] == "GroupedGemmWgradSm100"
     assert metadata["symbol"].startswith("cudnnfe_GroupedGemmWgradSm100_")
-    assert export_calls == 1
+    assert export_calls == 2
 
-    monkeypatch.setenv("CUDNN_FE_AOT_MODE", "read")
+    monkeypatch.setenv("NV_CUDNN_FE_AOT_MODE", "read")
+    grouped_gemm_wgrad_api._cache_of_GroupedGemmWgradSm100Objects.clear()
     _test_grouped_gemm_wgrad_discrete_wrapper(
         ab_dtype=torch.float4_e2m1fn_x2,
         wgrad_dtype=torch.bfloat16,
@@ -278,7 +292,19 @@ def test_grouped_gemm_wgrad_discrete_aot_export_load(tmp_path, monkeypatch):
         sf_dtype=torch.float8_e8m0fnu,
         skip_unsupported=False,
     )
-    assert export_calls == 1
+    loaded_entry = next(iter(grouped_gemm_wgrad_api._cache_of_GroupedGemmWgradSm100Objects.values()))
+    _test_grouped_gemm_wgrad_discrete_wrapper(
+        ab_dtype=torch.float4_e2m1fn_x2,
+        wgrad_dtype=torch.bfloat16,
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=32,
+        sf_dtype=torch.float8_e8m0fnu,
+        skip_unsupported=False,
+    )
+    assert next(iter(grouped_gemm_wgrad_api._cache_of_GroupedGemmWgradSm100Objects.values())) is loaded_entry
+    assert export_calls == 2
 
 
 @pytest.mark.L0

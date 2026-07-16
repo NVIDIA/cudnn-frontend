@@ -46,8 +46,8 @@ def test_gemm_amax_aot_cpp_smoke(tmp_path, monkeypatch):
         "k",
     )
     gemm_amax_api._cache_of_GemmAmaxSm100Objects.clear()
-    monkeypatch.setenv("CUDNN_FE_AOT_MODE", "write")
-    monkeypatch.setenv("CUDNN_FE_AOT_DIR", str(tmp_path))
+    monkeypatch.setenv("NV_CUDNN_FE_AOT_MODE", "write")
+    monkeypatch.setenv("NV_CUDNN_FE_AOT_DIR", str(tmp_path))
     gemm_amax_wrapper_sm100(a_torch, b_torch, sfa_torch, sfb_torch)
     metadata_files = list(tmp_path.glob("*.json"))
     assert len(metadata_files) == 1
@@ -86,10 +86,7 @@ def test_gemm_amax_aot_cpp_smoke(tmp_path, monkeypatch):
     ]
     compile_result = subprocess.run(compile_cmd, text=True, capture_output=True)
     if compile_result.returncode != 0:
-        pytest.skip(
-            "TVM-FFI C++ smoke compiler setup is unavailable: "
-            + compile_result.stderr.strip()
-        )
+        pytest.skip("TVM-FFI C++ smoke compiler setup is unavailable: " + compile_result.stderr.strip())
 
     import cutlass.cute as cute
 
@@ -105,10 +102,7 @@ def test_gemm_amax_aot_cpp_smoke(tmp_path, monkeypatch):
     if runtime_library_dirs:
         env = {
             **os.environ,
-            "LD_LIBRARY_PATH": ":".join(
-                runtime_library_dirs
-                + ([os.environ["LD_LIBRARY_PATH"]] if "LD_LIBRARY_PATH" in os.environ else [])
-            ),
+            "LD_LIBRARY_PATH": ":".join(runtime_library_dirs + ([os.environ["LD_LIBRARY_PATH"]] if "LD_LIBRARY_PATH" in os.environ else [])),
         }
 
     run_result = subprocess.run(

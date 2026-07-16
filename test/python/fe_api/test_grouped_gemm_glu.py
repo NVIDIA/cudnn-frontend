@@ -667,8 +667,8 @@ def test_grouped_gemm_glu_dense_aot_export_load(tmp_path, monkeypatch, request):
         return original_export_aot(self, *args, **kwargs)
 
     monkeypatch.setattr(grouped_gemm_glu_api.GroupedGemmGluSm100, "export_aot", counting_export_aot)
-    monkeypatch.setenv("CUDNN_FE_AOT_MODE", "write")
-    monkeypatch.setenv("CUDNN_FE_AOT_DIR", str(tmp_path))
+    monkeypatch.setenv("NV_CUDNN_FE_AOT_MODE", "write")
+    monkeypatch.setenv("NV_CUDNN_FE_AOT_DIR", str(tmp_path))
 
     _test_grouped_gemm_glu_dense_wrapper(
         ab_dtype=torch.float4_e2m1fn_x2,
@@ -690,9 +690,10 @@ def test_grouped_gemm_glu_dense_aot_export_load(tmp_path, monkeypatch, request):
     metadata = json.loads(metadata_files[0].read_text(encoding="utf-8"))
     assert metadata["identity"]["kernel_name"] == "GroupedGemmGluSm100"
     assert metadata["symbol"].startswith("cudnnfe_GroupedGemmGluSm100_")
-    assert export_calls == 1
+    assert export_calls == 2
 
-    monkeypatch.setenv("CUDNN_FE_AOT_MODE", "read")
+    monkeypatch.setenv("NV_CUDNN_FE_AOT_MODE", "read")
+    grouped_gemm_glu_api._cache_of_GroupedGemmGluSm100Objects.clear()
     _test_grouped_gemm_glu_dense_wrapper(
         ab_dtype=torch.float4_e2m1fn_x2,
         c_dtype=torch.bfloat16,
@@ -707,7 +708,23 @@ def test_grouped_gemm_glu_dense_aot_export_load(tmp_path, monkeypatch, request):
         discrete_col_sfd=False,
         request=request,
     )
-    assert export_calls == 1
+    loaded_entry = next(iter(grouped_gemm_glu_api._cache_of_GroupedGemmGluSm100Objects.values()))
+    _test_grouped_gemm_glu_dense_wrapper(
+        ab_dtype=torch.float4_e2m1fn_x2,
+        c_dtype=torch.bfloat16,
+        d_dtype=torch.bfloat16,
+        cd_major="n",
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=32,
+        sf_dtype=torch.float8_e8m0fnu,
+        vector_f32=False,
+        discrete_col_sfd=False,
+        request=request,
+    )
+    assert next(iter(grouped_gemm_glu_api._cache_of_GroupedGemmGluSm100Objects.values())) is loaded_entry
+    assert export_calls == 2
 
 
 @pytest.mark.L0
@@ -733,8 +750,8 @@ def test_grouped_gemm_glu_discrete_aot_export_load(tmp_path, monkeypatch, reques
         return original_export_aot(self, *args, **kwargs)
 
     monkeypatch.setattr(grouped_gemm_glu_api.GroupedGemmGluSm100, "export_aot", counting_export_aot)
-    monkeypatch.setenv("CUDNN_FE_AOT_MODE", "write")
-    monkeypatch.setenv("CUDNN_FE_AOT_DIR", str(tmp_path))
+    monkeypatch.setenv("NV_CUDNN_FE_AOT_MODE", "write")
+    monkeypatch.setenv("NV_CUDNN_FE_AOT_DIR", str(tmp_path))
 
     _test_grouped_gemm_glu_discrete_wrapper(
         ab_dtype=torch.float4_e2m1fn_x2,
@@ -758,9 +775,10 @@ def test_grouped_gemm_glu_discrete_aot_export_load(tmp_path, monkeypatch, reques
     metadata = json.loads(metadata_files[0].read_text(encoding="utf-8"))
     assert metadata["identity"]["kernel_name"] == "GroupedGemmGluSm100"
     assert metadata["symbol"].startswith("cudnnfe_GroupedGemmGluSm100_")
-    assert export_calls == 1
+    assert export_calls == 2
 
-    monkeypatch.setenv("CUDNN_FE_AOT_MODE", "read")
+    monkeypatch.setenv("NV_CUDNN_FE_AOT_MODE", "read")
+    grouped_gemm_glu_api._cache_of_GroupedGemmGluSm100Objects.clear()
     _test_grouped_gemm_glu_discrete_wrapper(
         ab_dtype=torch.float4_e2m1fn_x2,
         c_dtype=torch.bfloat16,
@@ -777,7 +795,25 @@ def test_grouped_gemm_glu_discrete_aot_export_load(tmp_path, monkeypatch, reques
         request=request,
         skip_unsupported=False,
     )
-    assert export_calls == 1
+    loaded_entry = next(iter(grouped_gemm_glu_api._cache_of_GroupedGemmGluSm100Objects.values()))
+    _test_grouped_gemm_glu_discrete_wrapper(
+        ab_dtype=torch.float4_e2m1fn_x2,
+        c_dtype=torch.bfloat16,
+        d_dtype=torch.bfloat16,
+        cd_major="n",
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=32,
+        sf_dtype=torch.float8_e8m0fnu,
+        vector_f32=False,
+        discrete_col_sfd=False,
+        act_func="swiglu",
+        request=request,
+        skip_unsupported=False,
+    )
+    assert next(iter(grouped_gemm_glu_api._cache_of_GroupedGemmGluSm100Objects.values())) is loaded_entry
+    assert export_calls == 2
 
 
 @pytest.mark.L0

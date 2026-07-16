@@ -963,22 +963,21 @@ def grouped_gemm_swiglu_wrapper_sm100(
         prob_tensor is not None,
     )
 
-    aot_mode = os.getenv("CUDNN_FE_AOT_MODE", "").strip().lower()
-    aot_artifact_dir = os.getenv("CUDNN_FE_AOT_DIR")
+    aot_mode = os.getenv("NV_CUDNN_FE_AOT_MODE", "").strip().lower()
+    aot_artifact_dir = os.getenv("NV_CUDNN_FE_AOT_DIR")
     if aot_mode and aot_mode not in {"read", "write", "readwrite"}:
-        raise ValueError(
-            "CUDNN_FE_AOT_MODE must be one of {'read', 'write', 'readwrite'}, "
-            f"got {aot_mode!r}"
-        )
+        raise ValueError("NV_CUDNN_FE_AOT_MODE must be one of {'read', 'write', 'readwrite'}, " f"got {aot_mode!r}")
     if aot_mode and not aot_artifact_dir:
-        raise ValueError("CUDNN_FE_AOT_DIR is required when CUDNN_FE_AOT_MODE is set")
+        raise ValueError("NV_CUDNN_FE_AOT_DIR is required when NV_CUDNN_FE_AOT_MODE is set")
 
-    use_cache = not aot_mode or aot_mode == "write"
-    if use_cache and cache_key in _cache_of_GroupedGemmSwigluSm100Objects:
+    if cache_key in _cache_of_GroupedGemmSwigluSm100Objects:
         _logger.debug("group_gemm_swiglu_wrapper_sm100: Using previously cached GroupedGemmSwigluSm100 object")
         grouped_gemm_swiglu, amax_tensor = _cache_of_GroupedGemmSwigluSm100Objects[cache_key]
-        if aot_mode == "write" and grouped_gemm_swiglu._raw_compiled_kernel is None:
-            grouped_gemm_swiglu = None
+        if aot_mode == "write":
+            if grouped_gemm_swiglu._raw_compiled_kernel is None:
+                grouped_gemm_swiglu = None
+            else:
+                grouped_gemm_swiglu.export_aot(aot_artifact_dir, cache_key)
     else:
         grouped_gemm_swiglu = None
 

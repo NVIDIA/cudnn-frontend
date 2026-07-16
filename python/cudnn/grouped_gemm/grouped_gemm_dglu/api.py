@@ -1066,6 +1066,7 @@ class GroupedGemmDgluSm100(APIBase):
         cached_workspace_ptr = from_dlpack(self._workspace, assumed_align=128).iterator
 
         if self.weight_mode == MoEWeightMode.DENSE:
+
             def tensor_api(
                 a_tensor: torch.Tensor,
                 b_tensor: torch.Tensor,
@@ -1643,22 +1644,21 @@ def grouped_gemm_dglu_wrapper_sm100(
             num_experts,
         )
 
-    aot_mode = os.getenv("CUDNN_FE_AOT_MODE", "").strip().lower()
-    aot_artifact_dir = os.getenv("CUDNN_FE_AOT_DIR")
+    aot_mode = os.getenv("NV_CUDNN_FE_AOT_MODE", "").strip().lower()
+    aot_artifact_dir = os.getenv("NV_CUDNN_FE_AOT_DIR")
     if aot_mode and aot_mode not in {"read", "write", "readwrite"}:
-        raise ValueError(
-            "CUDNN_FE_AOT_MODE must be one of {'read', 'write', 'readwrite'}, "
-            f"got {aot_mode!r}"
-        )
+        raise ValueError("NV_CUDNN_FE_AOT_MODE must be one of {'read', 'write', 'readwrite'}, " f"got {aot_mode!r}")
     if aot_mode and not aot_artifact_dir:
-        raise ValueError("CUDNN_FE_AOT_DIR is required when CUDNN_FE_AOT_MODE is set")
+        raise ValueError("NV_CUDNN_FE_AOT_DIR is required when NV_CUDNN_FE_AOT_MODE is set")
     # ---- Cache lookup or create + compile ----
-    use_cache = not aot_mode or aot_mode == "write"
-    if use_cache and cache_key in _cache_of_GroupedGemmDgluSm100Objects:
+    if cache_key in _cache_of_GroupedGemmDgluSm100Objects:
         _logger.debug("grouped_gemm_dglu_wrapper_sm100: Using cached object")
         api = _cache_of_GroupedGemmDgluSm100Objects[cache_key]
-        if aot_mode == "write" and api._raw_compiled_kernel is None:
-            api = None
+        if aot_mode == "write":
+            if api._raw_compiled_kernel is None:
+                api = None
+            else:
+                api.export_aot(aot_artifact_dir, cache_key)
     else:
         api = None
 
