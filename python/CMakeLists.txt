@@ -114,8 +114,6 @@ set_target_properties(
     LINK_WHAT_YOU_USE TRUE
 )
 
-# using python bindings directly with cmake build system is not supported
-# Temparorily use below parameter
 option(CUDNN_FRONTEND_KEEP_PYBINDS_IN_BINARY_DIR "Whether pybinds should be kept inside build/cudnn directory." ON)
 if(CUDNN_FRONTEND_KEEP_PYBINDS_IN_BINARY_DIR)
 set_target_properties(
@@ -125,4 +123,94 @@ set_target_properties(
         LIBRARY_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/cudnn
     )
     file(COPY ${PROJECT_SOURCE_DIR}/python/cudnn DESTINATION ${PROJECT_BINARY_DIR})
+endif()
+
+# Optionally install the python bindings with `cmake --install`, for system
+# packagers and users who cannot go through pip/setup.py (see issue #149).
+# The layout matches what the wheel produces: the `cudnn` package (python
+# sources + compiled module) plus a PEP 376 `.dist-info` directory so the
+# install is visible to pip, importlib.metadata and other packaging tools.
+option(CUDNN_FRONTEND_INSTALL_PYTHON_BINDINGS "Whether `cmake --install` should install the python bindings into the python site-packages." OFF)
+if(CUDNN_FRONTEND_INSTALL_PYTHON_BINDINGS)
+    # Destination: absolute path, or path relative to CMAKE_INSTALL_PREFIX.
+    # Defaults to the platlib (site-packages) of the interpreter found above,
+    # which honors virtual environments.
+    set(CUDNN_FRONTEND_PYTHON_INSTALL_DIR "${Python_SITEARCH}" CACHE PATH "Directory the cudnn python package is installed to.")
+
+    if(IS_ABSOLUTE "${CUDNN_FRONTEND_PYTHON_INSTALL_DIR}")
+        set(_cudnn_fe_python_install_dir "${CUDNN_FRONTEND_PYTHON_INSTALL_DIR}")
+    else()
+        set(_cudnn_fe_python_install_dir "${CMAKE_INSTALL_PREFIX}/${CUDNN_FRONTEND_PYTHON_INSTALL_DIR}")
+    endif()
+    message(STATUS "cudnn python bindings will be installed to ${_cudnn_fe_python_install_dir}")
+
+    # Pure python sources of the `cudnn` package
+    install(
+        DIRECTORY ${PROJECT_SOURCE_DIR}/python/cudnn
+        DESTINATION ${_cudnn_fe_python_install_dir}
+        FILES_MATCHING PATTERN "*.py"
+        PATTERN "__pycache__" EXCLUDE
+    )
+
+    # Compiled extension module. cudnn/__init__.py imports it from
+    # `cudnn.Release` on Windows (multi-config layout), from `cudnn` elsewhere.
+    if(WIN32)
+        set(_cudnn_fe_module_subdir cudnn/Release)
+    else()
+        set(_cudnn_fe_module_subdir cudnn)
+    endif()
+    install(
+        TARGETS _compiled_module
+        LIBRARY DESTINATION ${_cudnn_fe_python_install_dir}/${_cudnn_fe_module_subdir}
+    )
+
+    # PEP 376 .dist-info so the install is discoverable by packaging tools
+    set(_cudnn_fe_dist_info "nvidia_cudnn_frontend-${PROJECT_VERSION}.dist-info")
+    file(CONFIGURE
+        OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/dist-info/METADATA
+        CONTENT
+"Metadata-Version: 2.1
+Name: nvidia-cudnn-frontend
+Version: @PROJECT_VERSION@
+Summary: NVIDIA cuDNN Frontend — Python and C++ Graph API
+Home-page: https://github.com/NVIDIA/cudnn-frontend
+License: MIT
+Requires-Python: >=3.9
+"
+        @ONLY
+    )
+    file(CONFIGURE OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/dist-info/INSTALLER CONTENT "cmake\n" @ONLY)
+    file(CONFIGURE OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/dist-info/top_level.txt CONTENT "cudnn\n" @ONLY)
+    install(
+        FILES
+            ${CMAKE_CURRENT_BINARY_DIR}/dist-info/METADATA
+            ${CMAKE_CURRENT_BINARY_DIR}/dist-info/INSTALLER
+            ${CMAKE_CURRENT_BINARY_DIR}/dist-info/top_level.txt
+        DESTINATION ${_cudnn_fe_python_install_dir}/${_cudnn_fe_dist_info}
+    )
+
+    # Generate the RECORD file at install time, once all files are in place,
+    # so that `pip uninstall nvidia-cudnn-frontend` works.
+    file(CONFIGURE
+        OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/dist-info/GenerateRecord.cmake
+        CONTENT
+[[set(_site_dir "$ENV{DESTDIR}@_cudnn_fe_python_install_dir@")
+set(_dist_info "@_cudnn_fe_dist_info@")
+file(GLOB_RECURSE _installed_files LIST_DIRECTORIES false
+    RELATIVE "${_site_dir}"
+    "${_site_dir}/cudnn/*"
+    "${_site_dir}/${_dist_info}/*"
+)
+list(REMOVE_ITEM _installed_files "${_dist_info}/RECORD")
+set(_record "")
+foreach(_file IN LISTS _installed_files)
+    string(APPEND _record "${_file},,\n")
+endforeach()
+string(APPEND _record "${_dist_info}/RECORD,,\n")
+file(WRITE "${_site_dir}/${_dist_info}/RECORD" "${_record}")
+message(STATUS "Generated: ${_site_dir}/${_dist_info}/RECORD")
+]]
+        @ONLY
+    )
+    install(SCRIPT ${CMAKE_CURRENT_BINARY_DIR}/dist-info/GenerateRecord.cmake)
 endif()
