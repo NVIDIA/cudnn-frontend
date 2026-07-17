@@ -119,6 +119,15 @@ Backward pass for DeepSeek Sparse Attention. Expects the forward outputs
   - `topk_length` (optional): `(total_S_q,)` INT32 — per-query valid count
 - **Outputs** — tuple `(dq, dkv, d_sink)`
 - **Constraints** — SM90 or SM100; SM90 supports the FlashMLA DSA shape with `head_dim ∈ {512, 576}`
+- **Top-k index semantics** — without `topk_length`, invalid `topk_idxs`
+  entries must be `-1` sentinels (the FlashMLA convention). With
+  `topk_length`, the first `topk_length[i]` entries of each row must all be
+  valid indices — this compact-prefix fast path skips per-row sentinel
+  checks, so `-1` entries inside the prefix are not allowed. `topk_length`
+  values must be `>= 1`; to make a query row inert (e.g. padding rows for
+  fixed-shape capture), use `topk_length = 1` with any valid index and a
+  zeroed `dout` row, which yields an exactly-zero `dq` row and no `dkv` /
+  `d_sink` contribution.
 
 ```python
 result = DSA.sparse_attention_backward_wrapper(

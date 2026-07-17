@@ -216,3 +216,47 @@ def test_DSA_sparse_attention_backward_qh32_uses_per_query_topk_without_padding(
         atol=5e-2,
         rtol=5e-2,
     )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_DSA_sparse_attention_backward_sentinel_matches_topk_length():
+    """-1-sentinel indices (FlashMLA convention) match the compact-prefix path.
+
+    Without ``topk_length``, invalid ``topk_idxs`` entries are ``-1``
+    sentinels and the kernel zero-fills those rows; with ``topk_length``,
+    valid indices must be a compact prefix and per-row sentinel checks are
+    skipped. The same valid index set must produce the same gradients either
+    way. The two modes are different compiled variants, so this also guards
+    the variant selection.
+    """
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("SM100+ GPU required")
+
+    s_q, s_kv, h, d, topk = 512, 2048, 64, 512, 256
+    device = "cuda"
+    q = torch.randn(s_q, h, d, dtype=torch.bfloat16, device=device)
+    kv = torch.randn(s_kv, d, dtype=torch.bfloat16, device=device)
+    attn_sink = torch.randn(h, dtype=torch.float32, device=device)
+    topk_idxs = torch.stack([torch.randperm(s_kv, device=device)[:topk] for _ in range(s_q)]).to(torch.int32)
+    topk_length = torch.randint(1, topk + 1, (s_q,), dtype=torch.int32, device=device)
+
+    # Sentinel variant: same valid prefix, -1 beyond each row's length.
+    slot = torch.arange(topk, device=device).unsqueeze(0).expand(s_q, topk)
+    idx_sentinel = torch.where(slot < topk_length.unsqueeze(1), topk_idxs, torch.full_like(topk_idxs, -1))
+
+    out, lse = ref_sparse_attention_forward(q, kv, attn_sink, topk_idxs, topk_length=topk_length)
+    dout = torch.randn_like(out)
+
+    try:
+        from cudnn import DSA
+
+        r_len = DSA.sparse_attention_backward_wrapper(q, kv, out, dout, lse, attn_sink, topk_idxs, topk_length=topk_length)
+        r_sen = DSA.sparse_attention_backward_wrapper(q, kv, out, dout, lse, attn_sink, idx_sentinel, topk_length=None)
+    except (ImportError, ValueError, NotImplementedError, RuntimeError) as e:
+        pytest.skip(f"Unsupported testcase: {e}")
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(r_len["dq"], r_sen["dq"], atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(r_len["dkv"], r_sen["dkv"], atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(r_len["d_sink"], r_sen["d_sink"], atol=1e-2, rtol=1e-2)
