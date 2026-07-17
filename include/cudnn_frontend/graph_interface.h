@@ -52,6 +52,12 @@ class Graph : public ICudnn, public INode {
     int64_t fe_workspace_size = 0;
     uint64_t graph_uid;
 
+    // Set during validate() when every non-virtual output tensor is zero-element
+    // (has a dimension of size 0, e.g. SDPA with batch size 0). Executing such a
+    // graph writes nothing, so backend lowering is skipped and all build/execute
+    // stages become no-ops. The backend does not accept 0-sized dimensions.
+    bool is_zero_element_graph_ = false;
+
     std::unordered_set<std::shared_ptr<Tensor_attributes>> deserialized_tensor_properties;
     std::unordered_map<uid_t, pass_by_values_t> deserialized_pass_by_value;
     std::unordered_map<uid_t, std::tuple<int64_t, int64_t, std::vector<float>>> deserialized_workspace_modifications;
@@ -90,6 +96,54 @@ class Graph : public ICudnn, public INode {
             }
         }
 
+        return {error_code_t::OK, ""};
+    }
+
+    // Detects zero-element (no-op) graphs. Called from validate(), after shape
+    // inference has filled in all tensor dims.
+    // A graph is a no-op iff it references at least one zero-element tensor and
+    // every non-virtual output tensor is zero-element: no output byte would ever
+    // be written, so all build/execute stages can safely be skipped.
+    // A graph that mixes zero-element tensors with non-zero-element outputs
+    // (e.g. a matmul whose contracted dimension is 0, whose output would need
+    // to be zero-filled) is rejected here with a clear message instead of
+    // failing later in the backend with a generic CUDNN_STATUS_BAD_PARAM.
+    error_t
+    detect_zero_element_graph() {
+        is_zero_element_graph_ = false;
+
+        bool has_zero_element_tensor  = false;
+        bool all_outputs_zero_element = true;
+        for (auto const &input : full_graph_inputs) {
+            if (input && input->get_volume() == 0) {
+                has_zero_element_tensor = true;
+            }
+        }
+        for (auto const &output : full_graph_outputs) {
+            if (output == nullptr || output->get_is_virtual()) {
+                continue;
+            }
+            if (output->get_volume() == 0) {
+                has_zero_element_tensor = true;
+            } else {
+                all_outputs_zero_element = false;
+            }
+        }
+
+        if (has_zero_element_tensor == false) {
+            return {error_code_t::OK, ""};
+        }
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            all_outputs_zero_element == false,
+            error_code_t::GRAPH_NOT_SUPPORTED,
+            "Graph mixes zero-element tensors (a dimension of size 0) with non-zero-element output tensors. "
+            "This is not supported: cuDNN cannot compute non-empty outputs from zero-element inputs.");
+
+        is_zero_element_graph_ = true;
+        CUDNN_FE_LOG_LABEL_ENDL(
+            "INFO: All output tensors are zero-element. Graph is treated as a no-op: build stages are skipped, "
+            "workspace size is 0, and execute() launches no work.");
         return {error_code_t::OK, ""};
     }
 
@@ -646,6 +700,12 @@ class Graph : public ICudnn, public INode {
                       std::unordered_map<Tensor_attributes::uid_t, void *> &uid_to_device_ptrs,
                       void *workspace,
                       cudaGraph_t cudnn_cuda_graph) {
+        // Zero-element no-op graph: populate_cuda_graph left the cuda graph empty; nothing to update.
+        if (is_zero_element_graph_) {
+            CUDNN_FE_LOG_LABEL_ENDL("INFO: Skipping cuda graph update of zero-element no-op graph.");
+            return {error_code_t::OK, ""};
+        }
+
         // Initializes this cudnn graph
         RETURN_CUDNN_FRONTEND_ERROR_IF(
             cudnn_cuda_graph == nullptr, error_code_t::INVALID_VALUE, "cudnn_cuda_graph should not be a nullptr");
@@ -788,6 +848,13 @@ class Graph : public ICudnn, public INode {
                         std::unordered_map<Tensor_attributes::uid_t, void *> &uid_to_device_ptrs,
                         void *workspace,
                         cudaGraph_t cudnn_cuda_graph) {
+        // Zero-element no-op graph: leave the provided cuda graph empty (an empty
+        // cuda graph is valid and instantiable).
+        if (is_zero_element_graph_) {
+            CUDNN_FE_LOG_LABEL_ENDL("INFO: Skipping cuda graph population of zero-element no-op graph.");
+            return {error_code_t::OK, ""};
+        }
+
         // Check if the cuda graph is empty
         size_t numNodes = 0;
         _CUDNN_CHECK_CUDA_ERROR(detail::cuda_graph_get_nodes(cudnn_cuda_graph, nullptr, &numNodes));
@@ -936,6 +1003,9 @@ class Graph : public ICudnn, public INode {
             CHECK_CUDNN_FRONTEND_ERROR(output->validate());
         }
 
+        // Now that all shapes are known, detect zero-element (no-op) graphs.
+        CHECK_CUDNN_FRONTEND_ERROR(detect_zero_element_graph());
+
         // Get all the pre assigned uids
         CHECK_CUDNN_FRONTEND_ERROR(get_pre_assigned_uids(used_uids));
         // Clear state
@@ -951,6 +1021,11 @@ class Graph : public ICudnn, public INode {
     build_operation_graph() {
         CUDNN_FE_LOG_BANNER("  BUILD OP GRAPH WITHOUT HANDLE  ");
 
+        if (is_zero_element_graph_) {
+            CUDNN_FE_LOG_BANNER("  SKIPPED BUILD OP GRAPH (ZERO-ELEMENT NO-OP GRAPH)  ");
+            return {error_code_t::OK, ""};
+        }
+
         if (device_properties == nullptr) {
             return {error_code_t::ATTRIBUTE_NOT_SET, "Device properties are not set."};
         }
@@ -961,6 +1036,11 @@ class Graph : public ICudnn, public INode {
     error_t
     build_operation_graph(cudnnHandle_t handle) {
         CUDNN_FE_LOG_BANNER("  BUILD OP GRAPH  ");
+
+        if (is_zero_element_graph_) {
+            CUDNN_FE_LOG_BANNER("  SKIPPED BUILD OP GRAPH (ZERO-ELEMENT NO-OP GRAPH)  ");
+            return {error_code_t::OK, ""};
+        }
 
         CUDNN_FE_LOG_BANNER("  1/4 INFER PROPERTIES OF NODES  ");
 
@@ -1061,6 +1141,13 @@ class Graph : public ICudnn, public INode {
 
     error_t
     get_workspace_size_plan_at_index(int64_t plan_index, int64_t &cudnn_workspace_size) const {
+        // Zero-element no-op graphs have no plans and need no workspace.
+        if (is_zero_element_graph_) {
+            cudnn_workspace_size = 0;
+            CUDNN_FE_LOG_LABEL_ENDL("INFO: get_workspace_size() is 0 (zero-element no-op graph)");
+            return {error_code_t::OK, ""};
+        }
+
         // OSS SDPA engine workspace: 16 bytes for tile_id_counter
         if (plan_index == graph::Execution_plan_list::OSS_SDPA_ENGINE_CANDIDATE) {
             cudnn_workspace_size = fe_workspace_size + experimental::Sm90SdpaPrefillEngine::get_workspace_size();
@@ -1093,6 +1180,17 @@ class Graph : public ICudnn, public INode {
                                      std::vector<int64_t> const &override_uids,
                                      std::vector<std::vector<int64_t>> const &override_shapes,
                                      std::vector<std::vector<int64_t>> const &override_strides) const {
+        // Zero-element no-op graphs have no plans and need no workspace.
+        if (is_zero_element_graph_) {
+            RETURN_CUDNN_FRONTEND_ERROR_IF(!override_uids.empty(),
+                                           error_code_t::GRAPH_NOT_SUPPORTED,
+                                           "Graph was built as a zero-element no-op; it has no execution plan to "
+                                           "apply shape overrides to. Build the graph with non-zero shapes instead.");
+            cudnn_workspace_size = 0;
+            CUDNN_FE_LOG_LABEL_ENDL("INFO: get_workspace_size() is 0 (zero-element no-op graph)");
+            return {error_code_t::OK, ""};
+        }
+
         RETURN_CUDNN_FRONTEND_ERROR_IF(override_uids.size() != override_shapes.size(),
                                        error_code_t::INVALID_VALUE,
                                        "override_uids and override_shapes must have the same size.");
@@ -1217,6 +1315,11 @@ class Graph : public ICudnn, public INode {
              void *workspace,
              void *user_impl = nullptr) {
         (void)user_impl;  // reserved for future use
+
+        if (is_zero_element_graph_) {
+            CUDNN_FE_LOG_LABEL_ENDL("INFO: Skipping autotune of zero-element no-op graph.");
+            return {error_code_t::OK, ""};
+        }
 
         const int maxIterCount = 100;
         const float threshold  = 0.95f;
@@ -1373,6 +1476,16 @@ class Graph : public ICudnn, public INode {
                           std::vector<int64_t> const &override_uids                 = {},
                           std::vector<std::vector<int64_t>> const &override_shapes  = {},
                           std::vector<std::vector<int64_t>> const &override_strides = {}) const {
+        // Zero-element no-op graph: all outputs are zero-element, nothing to compute.
+        if (is_zero_element_graph_) {
+            RETURN_CUDNN_FRONTEND_ERROR_IF(!override_uids.empty(),
+                                           error_code_t::GRAPH_NOT_SUPPORTED,
+                                           "Graph was built as a zero-element no-op; it has no execution plan to "
+                                           "apply shape overrides to. Build the graph with non-zero shapes instead.");
+            CUDNN_FE_LOG_LABEL_ENDL("INFO: Skipping execution of zero-element no-op graph.");
+            return {error_code_t::OK, ""};
+        }
+
         if (!varpack_prep_state->prepared.load(std::memory_order_acquire)) {
             CHECK_CUDNN_FRONTEND_ERROR(const_cast<Graph *>(this)->prepare_variant_pack_template());
         }
@@ -1404,6 +1517,16 @@ class Graph : public ICudnn, public INode {
                           std::vector<int64_t> const &override_uids                 = {},
                           std::vector<std::vector<int64_t>> const &override_shapes  = {},
                           std::vector<std::vector<int64_t>> const &override_strides = {}) const {
+        // Zero-element no-op graph: all outputs are zero-element, nothing to compute.
+        if (is_zero_element_graph_) {
+            RETURN_CUDNN_FRONTEND_ERROR_IF(!override_uids.empty(),
+                                           error_code_t::GRAPH_NOT_SUPPORTED,
+                                           "Graph was built as a zero-element no-op; it has no execution plan to "
+                                           "apply shape overrides to. Build the graph with non-zero shapes instead.");
+            CUDNN_FE_LOG_LABEL_ENDL("INFO: Skipping execution of zero-element no-op graph.");
+            return {error_code_t::OK, ""};
+        }
+
         // Lazy init: prepare template if not done (e.g. deserialized graphs, build_plan_at_index)
         if (!varpack_prep_state->prepared.load(std::memory_order_acquire)) {
             CHECK_CUDNN_FRONTEND_ERROR(const_cast<Graph *>(this)->prepare_variant_pack_template());
@@ -1502,6 +1625,11 @@ class Graph : public ICudnn, public INode {
 
     error_t
     warmup(cudnnHandle_t handle) {
+        if (is_zero_element_graph_) {
+            CUDNN_FE_LOG_LABEL_ENDL("INFO: Skipping warmup of zero-element no-op graph.");
+            return {error_code_t::OK, ""};
+        }
+
         cudaStream_t fake_stream;
 
         cudaStream_t original_stream;
@@ -1610,6 +1738,9 @@ class Graph : public ICudnn, public INode {
     error_t
     serialize(std::vector<uint8_t> &data, bool serialize_structure = true) const {
         CUDNN_FE_LOG_BANNER(" SERIALIZE PLAN  ");
+        RETURN_CUDNN_FRONTEND_ERROR_IF(is_zero_element_graph_,
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "Zero-element no-op graphs have no execution plan to serialize.");
 #ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
         json j;
         // Optionally serialize the graph structure (nodes/tensors).
@@ -2119,9 +2250,24 @@ class Graph : public ICudnn, public INode {
         return check_support();
     }
 
+    // Returns true if validate() determined this graph to be a zero-element no-op:
+    // it references zero-element tensors (a dimension of size 0, e.g. batch size 0)
+    // and every non-virtual output tensor is zero-element. Such graphs skip backend
+    // lowering, report a workspace size of 0, and execute() launches no work.
+    bool
+    is_zero_element_graph() const {
+        return is_zero_element_graph_;
+    }
+
     // overload for deviceless AoT compilation
     error_t
     check_support() {
+        // Zero-element no-op graphs are always supported: no backend plan is needed.
+        if (is_zero_element_graph_) {
+            CUDNN_FE_LOG_LABEL_ENDL("INFO: check_support() OK for zero-element no-op graph.");
+            return {error_code_t::OK, ""};
+        }
+
         // Check OSS engine first if registered
 
         CHECK_CUDNN_FRONTEND_ERROR(context.populate_sm_version_from_device());
@@ -2826,6 +2972,11 @@ inline error_t
 Graph::create_execution_plans(std::vector<HeurMode_t> const &mode) {
     CUDNN_FE_LOG_BANNER("  CREATE EXECUTION PLANS  (HEURISTICS QUERY)  ");
 
+    if (is_zero_element_graph_) {
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: Skipping execution plan creation of zero-element no-op graph.");
+        return {error_code_t::OK, ""};
+    }
+
     // CHECK IF NEED TO OVERRIDE HEURISTICS QUERY
     for (auto &sub_node : sub_nodes) {
         if (auto [engine_id, user_knobs] = sub_node->override_heuristics_query(); engine_id != -1) {
@@ -2896,6 +3047,12 @@ Graph::create_execution_plan(int64_t const engine_id, std::unordered_map<KnobTyp
     // first create the engine
     // this just uses the global engine id and operation graph
     CUDNN_FE_LOG_BANNER("  CREATE EXECUTION PLAN  for engine id " << engine_id << "  ");
+
+    if (is_zero_element_graph_) {
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: Skipping execution plan creation of zero-element no-op graph.");
+        return {error_code_t::OK, ""};
+    }
+
     detail::backend_descriptor engine(CUDNN_BACKEND_ENGINE_DESCRIPTOR);
     RETURN_CUDNN_FRONTEND_ERROR_IF(engine.get_status() != CUDNN_STATUS_SUCCESS,
                                    error_code_t::CUDNN_BACKEND_API_FAILED,
@@ -2919,6 +3076,11 @@ Graph::create_execution_plan(int64_t const engine_id, std::unordered_map<KnobTyp
 
 inline error_t
 Graph::build_plan_at_index(int64_t plan_index) {
+    if (is_zero_element_graph_) {
+        CUDNN_FE_LOG_LABEL_ENDL("INFO: Skipping plan build of zero-element no-op graph.");
+        return {error_code_t::OK, ""};
+    }
+
     CHECK_CUDNN_FRONTEND_ERROR(plans.build_plan_at_index(plan_index));
     return {error_code_t::OK, ""};
 }
@@ -2930,6 +3092,11 @@ Graph::build_plans(BuildPlanPolicy_t const policy, bool const do_multithreaded_b
 #else
     CUDNN_FE_LOG_BANNER("  BUILD PLANS  for policy " << static_cast<int>(policy) << "  ");
 #endif
+
+    if (is_zero_element_graph_) {
+        CUDNN_FE_LOG_BANNER("  SKIPPED BUILD PLANS (ZERO-ELEMENT NO-OP GRAPH)  ");
+        return {error_code_t::OK, ""};
+    }
 
     // Build OSS SDPA engine if it passed check_support
     if (plans.has_oss_sdpa_engine()) {

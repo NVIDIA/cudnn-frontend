@@ -122,3 +122,97 @@ TEST_CASE("Multiple validation", "[graph][validate]") {
     REQUIRE(graph.validate().is_good());
     REQUIRE(graph.validate().is_good());
 }
+
+TEST_CASE("Zero element graph is a no-op", "[graph][validate][zero_element]") {
+    namespace fe = cudnn_frontend;
+    fe::graph::Graph graph;
+
+    graph.set_io_data_type(fe::DataType_t::HALF)
+        .set_intermediate_data_type(fe::DataType_t::FLOAT)
+        .set_compute_data_type(fe::DataType_t::FLOAT);
+
+    auto A = graph.tensor(fe::graph::Tensor_attributes().set_name("A").set_dim({0, 8, 16}).set_stride({128, 16, 1}));
+    auto B = graph.tensor(fe::graph::Tensor_attributes().set_name("B").set_dim({0, 8, 16}).set_stride({128, 16, 1}));
+
+    auto C = graph.pointwise(A, B, fe::graph::Pointwise_attributes().set_mode(fe::PointwiseMode_t::ADD));
+    C->set_output(true);
+
+    REQUIRE(graph.validate().is_good());
+    REQUIRE(graph.is_zero_element_graph());
+
+    // The entire pipeline is a no-op and succeeds without a device or handle.
+    REQUIRE(graph.build_operation_graph(nullptr).is_good());
+    REQUIRE(graph.create_execution_plans({fe::HeurMode_t::A}).is_good());
+    REQUIRE(graph.check_support().is_good());
+    REQUIRE(graph.build_plans().is_good());
+    REQUIRE(graph.get_workspace_size() == 0);
+
+    std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void *> variant_pack = {
+        {A, nullptr}, {B, nullptr}, {C, nullptr}};
+    REQUIRE(graph.execute(nullptr, variant_pack, nullptr).is_good());
+}
+
+TEST_CASE("SDPA with batch size 0 is a no-op", "[graph][sdpa][validate][zero_element]") {
+    namespace fe = cudnn_frontend;
+
+    int64_t const b = 0, h = 4, s_q = 64, s_kv = 64, d = 64;
+
+    fe::graph::Graph graph;
+    graph.set_io_data_type(fe::DataType_t::HALF)
+        .set_intermediate_data_type(fe::DataType_t::FLOAT)
+        .set_compute_data_type(fe::DataType_t::FLOAT);
+
+    auto Q = graph.tensor(
+        fe::graph::Tensor_attributes().set_name("Q").set_dim({b, h, s_q, d}).set_stride({h * s_q * d, s_q * d, d, 1}));
+    auto K = graph.tensor(fe::graph::Tensor_attributes()
+                              .set_name("K")
+                              .set_dim({b, h, s_kv, d})
+                              .set_stride({h * s_kv * d, s_kv * d, d, 1}));
+    auto V = graph.tensor(fe::graph::Tensor_attributes()
+                              .set_name("V")
+                              .set_dim({b, h, s_kv, d})
+                              .set_stride({h * s_kv * d, s_kv * d, d, 1}));
+
+    auto sdpa_options = fe::graph::SDPA_attributes().set_name("sdpa").set_generate_stats(false).set_attn_scale(0.125f);
+
+    auto [O, Stats] = graph.sdpa(Q, K, V, sdpa_options);
+    O->set_output(true).set_dim({b, h, s_q, d}).set_stride({h * s_q * d, s_q * d, d, 1});
+    REQUIRE(Stats == nullptr);
+
+    REQUIRE(graph.validate().is_good());
+    REQUIRE(graph.is_zero_element_graph());
+
+    REQUIRE(graph.build_operation_graph(nullptr).is_good());
+    REQUIRE(graph.create_execution_plans({fe::HeurMode_t::A}).is_good());
+    REQUIRE(graph.check_support().is_good());
+    REQUIRE(graph.build_plans().is_good());
+    REQUIRE(graph.get_workspace_size() == 0);
+
+    std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void *> variant_pack = {
+        {Q, nullptr}, {K, nullptr}, {V, nullptr}, {O, nullptr}};
+    REQUIRE(graph.execute(nullptr, variant_pack, nullptr).is_good());
+}
+
+TEST_CASE("Mixed zero and non-zero element graph is rejected", "[graph][validate][zero_element]") {
+    namespace fe = cudnn_frontend;
+    fe::graph::Graph graph;
+
+    graph.set_io_data_type(fe::DataType_t::HALF)
+        .set_intermediate_data_type(fe::DataType_t::FLOAT)
+        .set_compute_data_type(fe::DataType_t::FLOAT);
+
+    // Matmul with a contracted dimension of 0: inputs are zero-element, but the
+    // output is not. This would require zero-filling the output, which cuDNN
+    // does not support; expect a clear validation error instead of a backend
+    // BAD_PARAM at build time.
+    auto A = graph.tensor(fe::graph::Tensor_attributes().set_name("A").set_dim({1, 4, 0}).set_stride({1, 1, 1}));
+    auto B = graph.tensor(fe::graph::Tensor_attributes().set_name("B").set_dim({1, 0, 8}).set_stride({1, 1, 1}));
+
+    auto C = graph.matmul(A, B, fe::graph::Matmul_attributes());
+    C->set_output(true);
+
+    auto status = graph.validate();
+    REQUIRE(status.get_code() == fe::error_code_t::GRAPH_NOT_SUPPORTED);
+    REQUIRE(status.get_message().find("zero-element") != std::string::npos);
+    REQUIRE_FALSE(graph.is_zero_element_graph());
+}

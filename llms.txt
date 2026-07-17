@@ -39,6 +39,7 @@ Published documentation: https://docs.nvidia.com/deeplearning/cudnn/latest/devel
 - [Dynamic kernel cache](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/dynamic-kernel-cache.md)
 - [Custom execution plans](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/custom-execution-plan.md)
 - [Compile-time constants](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/CompileTimeConstants.md)
+- [Zero-element (no-op) graphs](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/zero-element-graphs.md)
 - [Adding PyTorch custom ops](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/adding_torch_custom_ops.md)
 - [Python graph and execution backends](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/python_graph_and_execution_backends.md)
 
