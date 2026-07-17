@@ -197,6 +197,18 @@ def flash_attn_bwd_sm100(
             current_stream,
         )
 
+    if head_dim != head_dim_v:
+        # The kernel's sum_dSink postprocess only runs when D_qk == D_v; for
+        # the 576-wide MLA latent it leaves d_sink zeroed. The sink gradient
+        # has a closed form from tensors already at hand:
+        #   d_sink_h = -sum_t sigmoid(sink_h - lse[t,h]) * (out . dout)[t,h]
+        # which is the derivative of the sink-normalized softmax through the
+        # KV-only LSE. Precision matches the kernel's own D_qk == D_v
+        # sum_dSink path (both consume 16-bit out/dout).
+        odo = (out.float() * dout.float()).sum(-1)
+        p_sink = torch.sigmoid(attn_sink.unsqueeze(0) - lse)
+        d_sink.copy_(-(p_sink * odo).sum(0))
+
     return dq, dkv, d_sink
 
 
