@@ -88,6 +88,72 @@ repository.
 |     8192 |      8192 | 1024 |  4.538 |     605.76 |
 |     8192 |      8192 | 2048 |  8.562 |     642.06 |
 
+### B300
+
+Generated on an NVIDIA B300 (`nheads=64`, bf16, attention sink and
+`topk_length` enabled, `warmup=10`, `repeat=50`), using `torch 2.13.0+cu130`,
+`nvidia-cutlass-dsl 4.5.2`, CUDA 13.0, and `nvidia-cudnn-frontend` built from
+this repository.
+
+`d_qk = d_v = 512`:
+
+| seqlen_q | seqlen_kv | topk | BWD ms | BWD TFLOPS |
+|---------:|----------:|-----:|-------:|-----------:|
+|     1024 |      1024 |  512 |  0.344 |     500.08 |
+|     2048 |      2048 |  512 |  0.648 |     530.63 |
+|     4096 |      4096 |  512 |  1.238 |     555.26 |
+|     8192 |      8192 |  512 |  2.406 |     571.31 |
+|    16384 |     16384 |  512 |  4.789 |     574.04 |
+|    32768 |     32768 |  512 | 10.415 |     527.85 |
+|     2048 |      2048 | 2048 |  1.993 |     689.57 |
+|     4096 |      4096 | 2048 |  3.949 |     696.08 |
+|     8192 |      8192 | 2048 |  7.914 |     694.63 |
+|    16384 |     16384 | 2048 | 15.906 |     691.24 |
+|    32768 |     32768 | 2048 | 33.351 |     659.37 |
+
+`d_qk = 576` (512 value dims + 64 RoPE dims, `d_v = 512`):
+
+| seqlen_q | seqlen_kv | topk | BWD ms | BWD TFLOPS |
+|---------:|----------:|-----:|-------:|-----------:|
+|     2048 |      2048 | 2048 |  2.638 |     560.12 |
+|     4096 |      4096 | 2048 |  5.214 |     566.76 |
+|     8192 |      8192 | 2048 | 10.312 |     573.13 |
+|    16384 |     16384 | 2048 | 20.620 |     573.21 |
+|    32768 |     32768 | 2048 | 47.195 |     500.89 |
+
+### Tensor-pipe (MMA) utilization
+
+Nsight Compute speed-of-light numbers for the main warp-specialized backward
+kernel (`kernel_cutlass_bwd_*`, 97–98% of the pass at `topk=2048`), collected
+on the same B300 with
+`ncu --profile-from-start off -k regex:kernel_cutlass_bwd --metrics
+sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed`. ncu locks
+clocks to base during collection, so percentages are comparable across
+configs while the wall-clock numbers above reflect boost clocks. All tensor
+pipe activity is HMMA.
+
+| d_qk | topk | seqlen 1k | 2k | 4k | 8k | 16k | 32k |
+|-----:|-----:|----------:|-----:|-----:|-----:|-----:|-----:|
+|  512 |  512 |      36.7 | 37.5 | 38.3 | 38.7 | 38.7 | 38.4 |
+|  512 | 2048 |         — | 43.7 | 44.1 | 44.2 | 44.5 | 44.3 |
+|  576 | 2048 |         — | 36.8 | 36.9 | 37.1 | 37.2 | 34.2 |
+
+Observations:
+
+- MMA utilization is essentially **sequence-length invariant** at a fixed
+  top-k: the grid parallelizes over query tokens, so utilization is set by
+  the per-CTA inner loop (`topk / 64` MMA iterations amortizing a fixed
+  prologue/epilogue), not by problem size. `topk` is the utilization knob.
+- The kernel is memory-pipe-heavy rather than tensor-bound: L1TEX/memory
+  speed-of-light (62–68%) exceeds SM (49–57%) and MMA (34–45%) everywhere;
+  the top-k gather of KV rows plus fp32 dKV accumulation is the busiest pipe.
+- At `seqlen 32k` the KV working set (32k x 512 x 2B = 32 MB) exceeds L2 and
+  DRAM utilization jumps (1.8% -> 12.4% at `d_qk=512/topk=2048`,
+  6.5% -> 22.7% at `topk=512`, 1.6% -> 15.1% at `d_qk=576`), which is the
+  wall-clock dip in the tables above.
+- The 576-wide latent runs ~7 SOL points below 512 at the same top-k: the
+  non-128-aligned 64-dim RoPE tail takes separate tail-tile MMAs.
+
 ## Profiling
 
 `profile` mode runs a single warmed-up backward call (using the first value
