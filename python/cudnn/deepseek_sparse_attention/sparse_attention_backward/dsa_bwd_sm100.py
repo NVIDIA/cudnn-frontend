@@ -106,8 +106,10 @@ class FlashAttentionDSABackwardSm100:
             num_threads=(self.num_reduce_warps + 1) * self.threads_per_warp,
         )
         # TMEM dealloc (compute warp 0) must be ordered after the reduce
-        # warps' final dKV T2R has drained; otherwise a successor CTA can
-        # re-allocate the columns while T2R is still in flight. Participants:
+        # warps have drained their final dKV T2R reads (the reads that feed
+        # store_dKV); deallocating the TMEM columns while those T2R loads
+        # are still in flight would race them within the CTA. This is a
+        # within-CTA read-before-dealloc ordering. Participants:
         # num_reduce_warps (arrive) + compute warp 0 (arrive_and_wait).
         self.tmem_dealloc_barrier = pipeline.NamedBarrier(
             barrier_id=9,
@@ -1037,8 +1039,8 @@ class FlashAttentionDSABackwardSm100:
 
             if warp_idx == self.compute_warp_id[0]:
                 # Wait until every reduce warp has finished (and fenced) its
-                # final dKV T2R before freeing the TMEM columns for successor
-                # CTAs.
+                # final dKV T2R read before freeing the TMEM columns, so the
+                # dealloc cannot race those in-flight reads within the CTA.
                 self.tmem_dealloc_barrier.arrive_and_wait()
                 cute.arch.dealloc_tmem(tmem_ptr_base, self.num_tmem_alloc_cols)
 
