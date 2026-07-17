@@ -1,0 +1,56 @@
+# cuDNN Frontend
+
+> NVIDIA cuDNN Frontend (FE): a header-only C++ library and Python package (`nvidia-cudnn-frontend`, import `cudnn`) exposing the cuDNN Graph API, plus open-source CuTeDSL kernels (SDPA/Flash Attention, MoE grouped-GEMM fusions, fused normalizations) for Hopper and Blackwell GPUs.
+
+Published documentation: https://docs.nvidia.com/deeplearning/cudnn/latest/developer/overview.html
+
+## Start here
+
+- [README](https://github.com/NVIDIA/cudnn-frontend/blob/main/README.md): overview, installation, feature highlights
+- [AGENTS.md](https://github.com/NVIDIA/cudnn-frontend/blob/main/AGENTS.md): repo map, verified build/test/format commands, conventions
+- [Contributing](https://github.com/NVIDIA/cudnn-frontend/blob/main/CONTRIBUTING.md): development environment and PR workflow
+- [Python package guide](https://github.com/NVIDIA/cudnn-frontend/blob/main/python/cudnn/README.md): package structure, adding frontend-only APIs
+
+## Graph operation reference
+
+- [Attention (SDPA fwd/bwd, FP8)](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/operations/Attention.md)
+- [Matmul](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/operations/Matmul.md)
+- [Convolutions](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/operations/Convolutions.md)
+- [Normalizations (LayerNorm, RMSNorm, BatchNorm, InstanceNorm)](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/operations/Normalizations.md)
+- [MoE Grouped Matmul](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/operations/MoeGroupedMatmul.md)
+- [Pointwise](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/operations/Pointwise.md)
+- [Block Scaling (MXFP8/NVFP4 quantization)](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/operations/BlockScaling.md)
+- [RoPE](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/operations/RoPE.md)
+- [Causal Conv1d](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/operations/CausalConv1d.md)
+- [Concatenate](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/operations/Concatenate.md), [Reshape](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/operations/Reshape.md), [Slice](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/operations/Slice.md), [Transpose](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/operations/Transpose.md), [Resampling](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/operations/Resampling.md)
+
+## Open-source (frontend-only) kernel APIs
+
+- [FE OSS APIs overview — full catalog and usage pattern](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/fe-oss-apis/overview.md)
+- [SDPA forward d256](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/fe-oss-apis/attention/sdpa_fwd_d256.md), [SDPA backward d256](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/fe-oss-apis/attention/sdpa_bwd_d256.md)
+- [Block-sparse attention (BSA)](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/fe-oss-apis/bsa.md), [DeepSeek sparse attention (DSA)](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/fe-oss-apis/dsa.md), [Native sparse attention (NSA)](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/fe-oss-apis/nsa.md)
+- [GEMM fusions (amax, SwiGLU, sReLU, grouped/discrete MoE variants)](https://github.com/NVIDIA/cudnn-frontend/tree/main/docs/fe-oss-apis/gemm_fusions)
+- [RMSNorm + RHT + Amax](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/fe-oss-apis/rmsnorm_rht_amax.md), [RMSNorm + SiLU](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/fe-oss-apis/rmsnorm_silu.md)
+
+## How-to guides
+
+- [CUDA graphs](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/cuda-graphs.md)
+- [Deviceless ahead-of-time compilation](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/deviceless-ahead-of-time-compilation.md)
+- [Dynamic kernel cache](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/dynamic-kernel-cache.md)
+- [Custom execution plans](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/custom-execution-plan.md)
+- [Compile-time constants](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/CompileTimeConstants.md)
+- [Adding PyTorch custom ops](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/adding_torch_custom_ops.md)
+- [Python graph and execution backends](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/python_graph_and_execution_backends.md)
+
+## Examples
+
+- [C++ samples (Catch2)](https://github.com/NVIDIA/cudnn-frontend/tree/main/samples/cpp)
+- [Python notebook tutorials](https://github.com/NVIDIA/cudnn-frontend/tree/main/samples/python)
+- [SDPA training benchmark](https://github.com/NVIDIA/cudnn-frontend/tree/main/benchmark/sdpa_benchmark_training)
+
+## Optional
+
+- [Release notes](https://github.com/NVIDIA/cudnn-frontend/releases)
+- [PyPI package](https://pypi.org/project/nvidia-cudnn-frontend/)
+- [cuDNN backend API reference](https://docs.nvidia.com/deeplearning/cudnn/latest/api/overview.html)
+- [Acknowledgements](https://github.com/NVIDIA/cudnn-frontend/blob/main/ACKNOWLEDGEMENTS.md)
