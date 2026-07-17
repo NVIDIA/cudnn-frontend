@@ -32,6 +32,7 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+from ..nvvm_compat import atomicrmw as nvvm_atomicrmw
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass._mlir.dialects import math, nvvm, llvm
 from cutlass.cutlass_dsl import T
@@ -1324,7 +1325,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     # Global atomic max (accumulates across all tiles for final tensor amax)
                     # Since we compute absolute values, all values are non-negative
                     _value_int = llvm.bitcast(T.i32(), block_amax.ir_value(), loc=None, ip=None)
-                    _old_value_int = nvvm.atomicrmw(
+                    _old_value_int = nvvm_atomicrmw(
+                        T.i32(),
                         op=nvvm.AtomicOpKind.MAX,
                         ptr=mAmax.iterator.llvm_ptr,
                         a=_value_int,

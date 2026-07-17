@@ -51,6 +51,7 @@ from cutlass._mlir.dialects.nvvm import AtomicOpKind
 from cutlass.cutlass_dsl import T
 from cutlass.cute.typing import Float32, Int32
 import cutlass.cute as cute
+from ..nvvm_compat import atomicrmw as nvvm_atomicrmw
 import cutlass
 import torch
 import cutlass.pipeline as pipeline
@@ -75,7 +76,8 @@ def atomic_add_i32(
     ip=None,
 ) -> Int32:
     """Perform an atomic add on an int32 value in global memory."""
-    old_value = nvvm.atomicrmw(
+    old_value = nvvm_atomicrmw(
+        T.i32(),
         op=AtomicOpKind.ADD,
         ptr=ptr,
         a=value.ir_value(loc=loc, ip=ip),
@@ -229,7 +231,8 @@ def atomic_max_float32(
     """
     value_int = llvm.bitcast(T.i32(), value.ir_value(loc=loc, ip=ip), loc=loc, ip=ip)
 
-    old_value_int = nvvm.atomicrmw(
+    old_value_int = nvvm_atomicrmw(
+        T.i32(),
         op=cutlass._mlir.dialects.nvvm.AtomicOpKind.MAX,
         ptr=ptr,
         a=value_int,
@@ -253,7 +256,8 @@ def atomic_add_float32(
     :param value: The float32 value to add
     :return: The old value at the memory location
     """
-    old_value = nvvm.atomicrmw(
+    old_value = nvvm_atomicrmw(
+        T.f32(),
         op=cutlass._mlir.dialects.nvvm.AtomicOpKind.FADD,
         ptr=ptr,
         a=value.ir_value(loc=loc, ip=ip),

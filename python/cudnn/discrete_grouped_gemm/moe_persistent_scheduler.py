@@ -23,6 +23,7 @@ from typing import List, Tuple, Literal, Optional
 
 import cutlass
 import cutlass.cute as cute
+from ..nvvm_compat import atomicrmw as nvvm_atomicrmw
 from cutlass.cutlass_dsl import (
     Boolean,
     Int32,
@@ -59,7 +60,8 @@ def atomic_add_i32(
     ip=None,
 ) -> Int32:
     """Perform an atomic add on an int32 value in global memory."""
-    old_value = nvvm.atomicrmw(
+    old_value = nvvm_atomicrmw(
+        T.i32(),
         op=AtomicOpKind.ADD,
         ptr=ptr,
         a=value.ir_value(loc=loc, ip=ip),

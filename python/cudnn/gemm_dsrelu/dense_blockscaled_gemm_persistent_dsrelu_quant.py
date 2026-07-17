@@ -33,6 +33,7 @@ import torch
 
 import cutlass
 import cutlass.cute as cute
+from ..nvvm_compat import atomicrmw as nvvm_atomicrmw
 from cutlass.cute.nvgpu import cpasync, tcgen05
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
@@ -54,7 +55,8 @@ def atomic_add_float32(
     loc=None,
     ip=None,
 ) -> Float32:
-    old_value = nvvm.atomicrmw(
+    old_value = nvvm_atomicrmw(
+        T.f32(),
         AtomicOpKind.FADD,
         ptr,
         value.ir_value(loc=loc, ip=ip),

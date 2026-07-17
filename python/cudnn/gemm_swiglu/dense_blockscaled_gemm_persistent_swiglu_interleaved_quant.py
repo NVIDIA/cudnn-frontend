@@ -32,6 +32,7 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+from ..nvvm_compat import atomicrmw as nvvm_atomicrmw
 from cutlass.cute.nvgpu import cpasync, tcgen05
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
@@ -1704,7 +1705,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                             loc=None,
                             ip=None,
                         )
-                        _old_value_int = cutlass._mlir.dialects.nvvm.atomicrmw(
+                        _old_value_int = nvvm_atomicrmw(
+                            cutlass.cutlass_dsl.T.i32(),
                             op=cutlass._mlir.dialects.nvvm.AtomicOpKind.MAX,
                             ptr=mAmax_tensor.iterator.llvm_ptr,
                             a=_value_int,

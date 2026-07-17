@@ -44,6 +44,7 @@ import torch
 
 import cutlass
 import cutlass.cute as cute
+from ..nvvm_compat import atomicrmw as nvvm_atomicrmw
 import cutlass.cute.testing as testing
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cutlass_dsl import T, dsl_user_op
@@ -301,7 +302,8 @@ def atomic_max_float32(
 ) -> Float32:
     value_int = llvm.bitcast(T.i32(), value.ir_value(loc=loc, ip=ip), loc=loc, ip=ip)
 
-    old_value_int = nvvm.atomicrmw(
+    old_value_int = nvvm_atomicrmw(
+        T.i32(),
         op=cutlass._mlir.dialects.nvvm.AtomicOpKind.MAX,
         ptr=ptr,
         a=value_int,
@@ -320,7 +322,8 @@ def atomic_add_float32(
     ip=None,
 ) -> Float32:
     """Atomic FP32 addition in global memory (used for dprob gradient accumulation)."""
-    old_value = nvvm.atomicrmw(
+    old_value = nvvm_atomicrmw(
+        T.f32(),
         op=AtomicOpKind.FADD,
         ptr=ptr,
         a=value.ir_value(loc=loc, ip=ip),

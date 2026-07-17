@@ -9,6 +9,7 @@ from cutlass import Float32, cute
 from cutlass._mlir.dialects import llvm, nvvm  # noqa: PLC2701
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
+from ..nvvm_compat import atomicrmw as nvvm_atomicrmw
 
 ARCH_SM90 = 90
 ARCH_SM100 = 100
@@ -455,7 +456,7 @@ def fadd_reduce(x: cute.TensorSSA, init_val: float | Float32 | None = None, arch
 @dsl_user_op
 def atomic_add_fp32(a: float | Float32, gmem_ptr: cute.Pointer, *, loc=None, ip=None) -> None:
     """Wrapper of atomic add for fp32."""
-    nvvm.atomicrmw(op=nvvm.AtomicOpKind.FADD, ptr=gmem_ptr.llvm_ptr, a=Float32(a).ir_value(), loc=loc, ip=ip)
+    nvvm_atomicrmw(T.f32(), op=nvvm.AtomicOpKind.FADD, ptr=gmem_ptr.llvm_ptr, a=Float32(a).ir_value(), loc=loc, ip=ip)
 
 
 @dsl_user_op
