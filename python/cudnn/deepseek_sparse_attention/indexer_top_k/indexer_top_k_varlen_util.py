@@ -965,7 +965,9 @@ class IndexerTopKKernelVarlen:
                     cute.ceil_div(self.top_k, self.num_threads_per_cta),
                     self.num_copy_bits // self.dtype.width,
                     # TODO: only tested for float32. need to check for other dtypes.
-                    2,
+                    # Odd top_k cannot be tiled by width-2 vectorized stores (there is
+                    # no scalar tail), so fall back to scalar stores in that case.
+                    2 if self.top_k % 2 == 0 else 1,
                 )
             )
             assert self.top_k % vecsize_out == 0

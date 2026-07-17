@@ -43,7 +43,9 @@ DSA_INDEXER_FORWARD_PARAM_MARKS = [
 ]
 
 DSA_INDEXER_TOP_K_PARAM_MARKS = [
-    pytest.mark.parametrize("top_k", [512]),
+    # 705: regression for odd top_k > threads-per-CTA, which used to fail the
+    # width-2 vectorized-store assert at JIT compile time.
+    pytest.mark.parametrize("top_k", [512, 705]),
     pytest.mark.parametrize("next_n", [1]),
     pytest.mark.parametrize("return_val", [True, False]),
 ]
