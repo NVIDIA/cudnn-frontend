@@ -1538,9 +1538,6 @@ class FlashAttentionDSABackwardSm100:
                 dOP_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
 
             # dKV1
-            if cutlass.const_expr(self.same_hdim_kv):
-                if not is_first_mma:
-                    self.t2r_dKV4_done_barrier.arrive_and_wait()
             dOP_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
             for k_block in cutlass.range(0, cute.size(tdKVrP, mode=[2]), unroll=2):
                 cute.gemm(
@@ -1669,10 +1666,6 @@ class FlashAttentionDSABackwardSm100:
             load_mma_K_consumer_state.advance()
 
             # Gemm dKV = dO @ P part2
-            # Wait for reduce warps to finish T2R of dKV4 from TMEM,
-            # since dKV2 shares the same TMEM offset as dKV4/dKV0.
-            if cutlass.const_expr(not self.same_hdim_kv):
-            # Gemm dKV = dO @ P part2
             # Wait for reduce warps to finish T2R of the TMEM columns that
             # dKV2/dKV3 overwrite: dKV4 (not same_hdim) or dKV0/dKV1 (same_hdim).
             if cutlass.const_expr(not self.same_hdim_kv):
@@ -1693,8 +1686,6 @@ class FlashAttentionDSABackwardSm100:
                 dOP_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
 
             # dKV3
-            if cutlass.const_expr(self.same_hdim_kv):
-                self.t2r_dKV01_done_barrier.arrive_and_wait()
             dOP_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
             for k_block in cutlass.range(0, cute.size(tdKVrP, mode=[2]), unroll=2):
                 cute.gemm(
@@ -2213,20 +2204,6 @@ class FlashAttentionDSABackwardSm100:
 
             mma_reduce_dKV_pipeline.consumer_wait(mma_reduce_dKV_consumer_state)
 
-            if cutlass.const_expr(not self.same_hdim_kv):
-                # Split T2R and atomic_add: load dKV0/dKV1 from TMEM to registers,
-                # then signal MMA warp that TMEM is free for dKV4 overlap.
-                rdKV0 = self.t2r_dKV(tdKVtdKV0)
-                rdKV1 = self.t2r_dKV(tdKVtdKV1)
-                cute.arch.fence_view_async_tmem_load()
-                self.t2r_dKV01_done_barrier.arrive_and_wait()
-                self.reduce_dKV_from_reg(mdKV_acc, rdKV0, rTopkIdx, 0)
-                self.reduce_dKV_from_reg(mdKV_acc, rdKV1, rTopkIdx, 1)
-            else:
-                rdKV1 = self.t2r_dKV(tdKVtdKV1)
-                cute.arch.fence_view_async_tmem_load()
-                self.t2r_dKV01_done_barrier.arrive_and_wait()
-                self.store_dKV(mdKV_acc, tdKVtdKV0, rTopkIdx, 0)
             # Split T2R and atomic_add: load dKV0/dKV1 from TMEM to registers,
             # then signal MMA warp that TMEM is free to overwrite
             # (dKV4 if not same_hdim_kv, dKV2/dKV3 if same_hdim_kv).
@@ -2257,10 +2234,13 @@ class FlashAttentionDSABackwardSm100:
             mma_reduce_dKV_pipeline.consumer_wait(mma_reduce_dKV_consumer_state)
 
             if cutlass.const_expr(self.same_hdim_kv):
+                # Split T2R and atomic_add: load dKV2/dKV3 from TMEM to registers,
+                # then signal MMA warp that TMEM is free for next tile's dKV0/dKV1.
+                rdKV2 = self.t2r_dKV(tdKVtdKV2)
                 rdKV3 = self.t2r_dKV(tdKVtdKV3)
                 cute.arch.fence_view_async_tmem_load()
                 self.t2r_dKV4_done_barrier.arrive_and_wait()
-                self.store_dKV(mdKV_acc, tdKVtdKV2, rTopkIdx, 2)
+                self.reduce_dKV_from_reg(mdKV_acc, rdKV2, rTopkIdx, 2)
                 self.reduce_dKV_from_reg(mdKV_acc, rdKV3, rTopkIdx, 3)
             else:
                 # T2R dKV2/dKV3 into registers, then signal the MMA warp that
