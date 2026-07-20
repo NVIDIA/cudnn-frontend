@@ -525,12 +525,18 @@ class IndexerTopKKernelVarlen:
                     -tXrX.element_type.inf,
                 )
 
+                cur_tXcX = tXcX[None, None, None, tile_idx]
                 for i in cutlass.range(cute.size(tXrX), unroll_full=True):
-                    bin_val = self.to_coarse_key(tXrX[i])
-                    atomicAdd(
-                        s_histogram.iterator + cutlass.Int32(bin_val),
-                        val_one,
-                    )
+                    relative_idx = cutlass.Int32(cur_tXcX[i // vec_size][1] + i % vec_size)
+                    # The predicated copy fills lanes outside aligned_size with
+                    # -inf, but those lanes are not part of the input row and
+                    # must not contribute to the radix histogram.
+                    if relative_idx < aligned_size:
+                        bin_val = self.to_coarse_key(tXrX[i])
+                        atomicAdd(
+                            s_histogram.iterator + cutlass.Int32(bin_val),
+                            val_one,
+                        )
 
             # for initial scalar load part.
             for j in range(tidx, prologue_elems, self.num_threads_per_cta):
@@ -594,11 +600,13 @@ class IndexerTopKKernelVarlen:
                     )
                     for i in cutlass.range(cute.size(tXrX), unroll_full=True):
                         cur_tXcX = tXcX[None, None, None, tile_idx]
-                        bin_val = self.to_coarse_key(tXrX[i])
-                        if bin_val < threshold_bin:
-                            pos = atomicAdd(s_counter.iterator, val_one)
-                            idx = self.index_type(cur_tXcX[i // vec_size][1] + i % vec_size + vec_start)
-                            s_indices[pos] = idx
+                        relative_idx = cutlass.Int32(cur_tXcX[i // vec_size][1] + i % vec_size)
+                        if relative_idx < aligned_size:
+                            bin_val = self.to_coarse_key(tXrX[i])
+                            if bin_val < threshold_bin:
+                                pos = atomicAdd(s_counter.iterator, val_one)
+                                idx = self.index_type(relative_idx + vec_start)
+                                s_indices[pos] = idx
 
                 # for initial scalar load part.
                 for j in range(tidx, prologue_elems, self.num_threads_per_cta):
@@ -648,42 +656,44 @@ class IndexerTopKKernelVarlen:
                     )
 
                     for i in cutlass.range(cute.size(tXrX), unroll_full=True):
-                        raw_input = tXrX[i]
-                        bin_val = self.to_coarse_key(raw_input)
                         cur_tXcX = tXcX[None, None, None, tile_idx]
-                        idx = self.index_type(cur_tXcX[i // vec_size][1] + i % vec_size + vec_start)
-                        if bin_val < threshold_bin:
-                            pos = atomicAdd(s_counter.iterator, val_one)
-                            s_indices[pos] = idx
-                        elif bin_val == threshold_bin:
-                            # pos = atomicAdd(s_num_input[0], 1)
-                            pos = atomicAdd(s_num_input.iterator, val_one)
-                            if cutlass.const_expr(self.enable_gmem_store):
-                                if pos < self.indexer_topk_smem_input_size:
-                                    s_input_idx[0, pos] = idx
-                                else:
-                                    buffer_pos = atomicAdd(
-                                        g_num_input.iterator,
+                        relative_idx = cutlass.Int32(cur_tXcX[i // vec_size][1] + i % vec_size)
+                        if relative_idx < aligned_size:
+                            raw_input = tXrX[i]
+                            bin_val = self.to_coarse_key(raw_input)
+                            idx = self.index_type(relative_idx + vec_start)
+                            if bin_val < threshold_bin:
+                                pos = atomicAdd(s_counter.iterator, val_one)
+                                s_indices[pos] = idx
+                            elif bin_val == threshold_bin:
+                                # pos = atomicAdd(s_num_input[0], 1)
+                                pos = atomicAdd(s_num_input.iterator, val_one)
+                                if cutlass.const_expr(self.enable_gmem_store):
+                                    if pos < self.indexer_topk_smem_input_size:
+                                        s_input_idx[0, pos] = idx
+                                    else:
+                                        buffer_pos = atomicAdd(
+                                            g_num_input.iterator,
+                                            val_one,
+                                        )
+                                        buffer[0, buffer_pos] = cutlass.Int32(cutlass.Uint32(idx))
+                                    ordered = self.to_ordered(raw_input)
+                                    sub_bin = (ordered >> self.first_refine_shift) & 0xFF
+                                    # atomicAdd(s_histogram[sub_bin], 1)
+                                    atomicAdd(
+                                        s_histogram.iterator + cutlass.Int32(sub_bin),
                                         val_one,
                                     )
-                                    buffer[0, buffer_pos] = cutlass.Int32(cutlass.Uint32(idx))
-                                ordered = self.to_ordered(raw_input)
-                                sub_bin = (ordered >> self.first_refine_shift) & 0xFF
-                                # atomicAdd(s_histogram[sub_bin], 1)
-                                atomicAdd(
-                                    s_histogram.iterator + cutlass.Int32(sub_bin),
-                                    val_one,
-                                )
-                            else:
-                                if pos < self.indexer_topk_smem_input_size:
-                                    s_input_idx[0, pos] = idx
-                                ordered = self.to_ordered(raw_input)
-                                sub_bin = (ordered >> self.first_refine_shift) & 0xFF
-                                # atomicAdd(s_histogram[sub_bin], 1)
-                                atomicAdd(
-                                    s_histogram.iterator + cutlass.Int32(sub_bin),
-                                    val_one,
-                                )
+                                else:
+                                    if pos < self.indexer_topk_smem_input_size:
+                                        s_input_idx[0, pos] = idx
+                                    ordered = self.to_ordered(raw_input)
+                                    sub_bin = (ordered >> self.first_refine_shift) & 0xFF
+                                    # atomicAdd(s_histogram[sub_bin], 1)
+                                    atomicAdd(
+                                        s_histogram.iterator + cutlass.Int32(sub_bin),
+                                        val_one,
+                                    )
 
                 # for initial scalar load part.
                 for j in range(tidx, prologue_elems, self.num_threads_per_cta):
