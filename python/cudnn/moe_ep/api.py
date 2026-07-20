@@ -154,9 +154,13 @@ class MoeEp:
     ``(local_expert, src_rank, src_token, src_slot)``, row-aligned with
     ``fc1_c``, identifying each route for the backward gradient re-dispatch.
 
-    The backend launch is intentionally a TODO.  Until it is implemented,
-    ``__call__`` returns newly allocated, uninitialized output storage with the
-    correct public representation.
+    Backend execution: when the MegaMoE device backend is available and the
+    configuration is supported (see ``moe_ep._megamoe``), ``__call__`` and
+    ``backward`` launch the fused SM100 kernels and return real results.
+    Otherwise they fall back to returning newly allocated, uninitialized
+    output storage with the correct public representation (the original
+    API-stub behavior).  ``CUDNN_MOE_EP_BACKEND=megamoe|auto|none`` selects
+    the policy; ``CUDNN_MEGAMOE_ROOT`` locates the megamoe package.
     """
 
     def __init__(
@@ -211,6 +215,8 @@ class MoeEp:
         self.apply_topk_in_fc1 = bool(apply_topk_in_fc1)
         self.gate_up_clamp = None if gate_up_clamp is None else abs(float(gate_up_clamp))
         self.generate_c = bool(generate_c)
+        self._backend = None
+        self._backend_resolved = False
 
         for name, fmt in (
             ("output_format", self.output_format),
@@ -283,7 +289,8 @@ class MoeEp:
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
     ) -> Union[MoeTensor, Tuple[MoeTensor, torch.Tensor, torch.Tensor]]:
-        """Allocate the result for a future backend MoE+EP launch.
+        """Run the MoE+EP forward (MegaMoE backend when available, otherwise
+        allocate-only).
 
         Expected logical shapes are ``activation=(T,H)``,
         ``fc1_weight=(E_local,H,2I)``, ``fc2_weight=(E_local,I,H)``, and
@@ -321,8 +328,18 @@ class MoeEp:
             if _tensor_device(tensor) != device:
                 raise ValueError(f"{name} must be on {device}, got {_tensor_device(tensor)}")
 
-        # TODO: dispatch routes, launch local expert FC1/SwiGLU/FC2, return
-        # contributions, reduce top-k, and write this allocation.
+        if not self._backend_resolved:
+            from . import _megamoe
+
+            self._backend = _megamoe.maybe_create(self, device, token_count)
+            self._backend_resolved = True
+        if self._backend is not None:
+            return self._backend.forward(
+                activation, fc1_weight, fc2_weight, topk_idx, topk_weights
+            )
+
+        # No device backend for this configuration/environment: return newly
+        # allocated, uninitialized storage (the original API-stub contract).
         output = self._allocate_output(token_count, device)
         if not self.generate_c:
             return output
@@ -346,7 +363,8 @@ class MoeEp:
         fc1_c: torch.Tensor,
         route_metadata: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Allocate gradients for a future backend MoE+EP backward launch.
+        """Run the MoE+EP backward (MegaMoE backend when available, otherwise
+        allocate-only).
 
         Requires ``generate_c=True``; consumes the forward stash
         (``fc1_c``, ``route_metadata``) plus the re-supplied forward inputs.
@@ -369,8 +387,20 @@ class MoeEp:
             raise ValueError(f"fc1_c shape must be {(int(route_metadata.shape[0]), two_i)}, got {tuple(fc1_c.shape)}")
 
         device = _tensor_device(activation)
-        # TODO: re-dispatch grad_output rows, recompute SwiGLU from fc1_c,
-        # accumulate weight gradients, and return route gradients to sources.
+        if self._backend is not None:
+            return self._backend.backward(
+                grad_output,
+                activation,
+                fc1_weight,
+                fc2_weight,
+                topk_idx,
+                topk_weights,
+                fc1_c,
+                route_metadata,
+            )
+
+        # No device backend: return newly allocated, uninitialized gradient
+        # storage (the original API-stub contract).
         return (
             torch.empty((token_count, self.hidden_size), dtype=torch.float32, device=device),
             torch.empty(
