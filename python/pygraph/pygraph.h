@@ -672,6 +672,9 @@ class PyGraph {
     void
     check_support();
 
+    bool
+    is_zero_element_graph();
+
     void
     build(std::vector<cudnn_frontend::HeurMode_t> const&);
 

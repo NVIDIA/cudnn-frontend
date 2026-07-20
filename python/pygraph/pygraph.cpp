@@ -544,6 +544,11 @@ PyGraph::check_support() {
     throw_if(status.is_bad(), status.get_code(), status.get_message());
 }
 
+bool
+PyGraph::is_zero_element_graph() {
+    return graph->is_zero_element_graph();
+}
+
 int64_t
 PyGraph::get_workspace_size() {
     int64_t workspace = 0;
@@ -1280,6 +1285,14 @@ init_pygraph_submodule(py::module_& m) {
                     engine_id (int): The ID of the engine to query knob configurations for.
             )pbdoc")
         .def("check_support", &PyGraph::check_support)
+        .def("is_zero_element_graph",
+             &PyGraph::is_zero_element_graph,
+             R"pbdoc(
+                Returns True if validate() determined this graph to be a zero-element no-op:
+                it references zero-element tensors (a dimension of size 0, e.g. batch size 0)
+                and every non-virtual output tensor is zero-element. Such graphs skip backend
+                lowering, report a workspace size of 0, and execute() launches no work.
+            )pbdoc")
         .def("build_plans",
              &PyGraph::build_plans,
              py::arg("policy") = cudnn_frontend::BuildPlanPolicy_t::HEURISTICS_CHOICE)
