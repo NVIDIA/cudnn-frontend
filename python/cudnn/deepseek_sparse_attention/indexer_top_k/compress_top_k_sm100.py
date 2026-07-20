@@ -58,6 +58,11 @@ _NUM_BINS_10 = 1024  # 10-bit level (bin2)
 # the refinement passes fall back to a full-row re-scan.  16 KB smem (val+idx).
 _SHRINK_MAX = 2048
 
+# Sentinel for the deterministic tie-break's running min-set. Local KV indices
+# are int32 and strictly smaller than this value, so CTA-scoped atomic_min treats
+# it as positive infinity.
+_INT32_MAX = 0x7FFFFFFF
+
 
 def _float_as_uint32(float_val):
     """Reinterpret an fp32 register's bits as uint32 (no value change)."""
@@ -165,7 +170,14 @@ class CompressTopkStage2:
     Compile-time attributes: ``topk`` (K), ``ratio``, ``block_threads``.
     """
 
-    def __init__(self, topk: int, ratio: int, block_threads: int = 512, is_varlen: bool = False):
+    def __init__(
+        self,
+        topk: int,
+        ratio: int,
+        block_threads: int = 512,
+        is_varlen: bool = False,
+        deterministic: bool = False,
+    ):
         assert block_threads % 32 == 0
         assert _NUM_BINS_11 % block_threads == 0 and _NUM_BINS_10 % block_threads == 0, "block_threads must divide both 2048 and 1024"
         self.topk = int(topk)
@@ -176,6 +188,10 @@ class CompressTopkStage2:
         # locates its batch from cu_seqlens and reads the tight compact slab via
         # cand_batch_offsets.  BSHD (default): grid=(seqlen_q, bs), uniform layout.
         self.is_varlen = bool(is_varlen)
+        # Compile-time opt-in: exact-value ties at the K-th boundary select the
+        # smallest local KV indices. The default path keeps its existing shared
+        # memory footprint and scheduling-dependent tie-break.
+        self.deterministic = bool(deterministic)
 
     # ----- compact-layout arithmetic (Int64) -----
     @cute.jit
@@ -235,6 +251,22 @@ class CompressTopkStage2:
             running = running + c
         cute.arch.barrier()
         return s_thr[0], s_thr[1]
+
+    @cute.jit
+    def _tie_min_insert(self, s_tie: cute.Tensor, count: Int32, new_idx: Int32):
+        """Insert ``new_idx`` into the running ``count`` smallest tie indices.
+
+        Each slot applies CTA-scoped atomic-min and carries the displaced larger
+        value forward. Concurrent insertions therefore converge to the same set
+        independent of thread arrival order.
+        """
+        carry = new_idx
+        j = Int32(0)
+        while j < count:
+            previous = cute.arch.atomic_min(s_tie.iterator + j, carry, sem="relaxed", scope="cta")
+            if previous > carry:
+                carry = previous
+            j = j + Int32(1)
 
     @cute.kernel
     def kernel(
@@ -335,6 +367,14 @@ class CompressTopkStage2:
             layout=cute.make_ordered_layout((_SHRINK_MAX,), order=(0,)),
             byte_alignment=128,
         )
+        if const_expr(self.deterministic):
+            # Only the deterministic specialization pays this shared-memory cost.
+            # Pass 4 uses the first thr_count2 slots as a running min-set.
+            s_tie_idx = smem.allocate_tensor(
+                element_type=Int32,
+                layout=cute.make_ordered_layout((const_expr(self.topk),), order=(0,)),
+                byte_alignment=128,
+            )
 
         if tidx == 0:
             s_ctl[0] = Int32(0)
@@ -436,6 +476,11 @@ class CompressTopkStage2:
                 if thr_count1 > Int32(0):
                     thr_bin2, thr_count2 = self._find_threshold(s_hist, _NUM_BINS_10, thr_count1, s_warp_sums, s_thr, tidx)
 
+                    if const_expr(self.deterministic):
+                        for j in range(tidx, thr_count2, BT):
+                            s_tie_idx[j] = Int32(_INT32_MAX)
+                        cute.arch.barrier()
+
                     # ---- Pass 4: emit bin2 winners (gt) + exactly thr_count2 (eq) ----
                     if use_shrink:
                         for i in range(tidx, shrink_count, BT):
@@ -451,12 +496,15 @@ class CompressTopkStage2:
                                         mVal[ob, oq, dst] = v
                                         mIdx[ob, oq, dst] = idx
                                 elif b2 == thr_bin2:
-                                    slot = atomicAdd(s_ctl.iterator + Int32(1), Int32(1))
-                                    if slot < thr_count2:
-                                        dst = atomicAdd(s_ctl.iterator + Int32(0), Int32(1))
-                                        if dst < Int32(K):
-                                            mVal[ob, oq, dst] = v
-                                            mIdx[ob, oq, dst] = idx
+                                    if const_expr(self.deterministic):
+                                        self._tie_min_insert(s_tie_idx, thr_count2, idx)
+                                    else:
+                                        slot = atomicAdd(s_ctl.iterator + Int32(1), Int32(1))
+                                        if slot < thr_count2:
+                                            dst = atomicAdd(s_ctl.iterator + Int32(0), Int32(1))
+                                            if dst < Int32(K):
+                                                mVal[ob, oq, dst] = v
+                                                mIdx[ob, oq, dst] = idx
                     else:
                         for i in range(tidx, seg_len, BT):
                             v = mCand[row_base + Int64(i)]
@@ -472,13 +520,27 @@ class CompressTopkStage2:
                                             mVal[ob, oq, dst] = v
                                             mIdx[ob, oq, dst] = Int32(i)
                                     elif b2 == thr_bin2:
-                                        slot = atomicAdd(s_ctl.iterator + Int32(1), Int32(1))
-                                        if slot < thr_count2:
-                                            dst = atomicAdd(s_ctl.iterator + Int32(0), Int32(1))
-                                            if dst < Int32(K):
-                                                mVal[ob, oq, dst] = v
-                                                mIdx[ob, oq, dst] = Int32(i)
+                                        if const_expr(self.deterministic):
+                                            self._tie_min_insert(s_tie_idx, thr_count2, Int32(i))
+                                        else:
+                                            slot = atomicAdd(s_ctl.iterator + Int32(1), Int32(1))
+                                            if slot < thr_count2:
+                                                dst = atomicAdd(s_ctl.iterator + Int32(0), Int32(1))
+                                                if dst < Int32(K):
+                                                    mVal[ob, oq, dst] = v
+                                                    mIdx[ob, oq, dst] = Int32(i)
                     cute.arch.barrier()
+                    if const_expr(self.deterministic):
+                        # All collected ties have the exact threshold value. Emit
+                        # the selected smallest indices after the strict winners.
+                        for j in range(tidx, thr_count2, BT):
+                            tie_idx = s_tie_idx[j]
+                            if tie_idx != Int32(_INT32_MAX):
+                                dst = atomicAdd(s_ctl.iterator + Int32(0), Int32(1))
+                                if dst < Int32(K):
+                                    mVal[ob, oq, dst] = mCand[row_base + Int64(tie_idx)]
+                                    mIdx[ob, oq, dst] = tie_idx
+                        cute.arch.barrier()
 
             # ---- Pad the unfilled tail ----
             total_found = s_ctl[0]
@@ -645,6 +707,7 @@ def compress_stage2_topk(
     q_causal_offsets: Optional[torch.Tensor] = None,
     out_softmax: Optional[torch.Tensor] = None,
     return_softmax: bool = False,
+    deterministic: bool = False,
 ) -> tuple[torch.Tensor, ...]:
     """Run the stage-2 radix top-k over a compact cand_buffer.
 
@@ -664,6 +727,11 @@ def compress_stage2_topk(
     When ``return_softmax`` is true, or ``out_softmax`` is supplied, the
     kernel also emits the FP32 softmax over the selected logits. Padding maps
     to zero. ``out_softmax`` follows the same buffer rules as ``out_logits``.
+
+    When ``deterministic`` is true, exact-value ties at the K-th boundary select
+    the smallest local KV indices, making the selected set reproducible. The
+    within-row slot order remains unspecified. The default false path retains
+    the faster scheduling-dependent tie-break.
 
     Returns (topk_indices (bs, sq, topk) int32 local KV ids; -1 padded,
              topk_logits  (bs, sq, topk) fp32; -inf padded), plus
@@ -720,9 +788,10 @@ def compress_stage2_topk(
         cand_batch_offsets is not None,
         q_causal_offsets is not None,
         want_softmax,
+        bool(deterministic),
     )
     if compile_key not in _compile_cache:
-        kernel_obj = CompressTopkStage2(topk=topk, ratio=ratio, block_threads=block_threads)
+        kernel_obj = CompressTopkStage2(topk=topk, ratio=ratio, block_threads=block_threads, deterministic=deterministic)
         _compile_cache[compile_key] = cute.compile(
             kernel_obj,
             _to_cute_tensor(cand_buffer, leading_dim=0),
@@ -774,6 +843,7 @@ def compress_stage2_topk_varlen(
     q_causal_offsets: Optional[torch.Tensor] = None,
     out_softmax: Optional[torch.Tensor] = None,
     return_softmax: bool = False,
+    deterministic: bool = False,
 ) -> tuple[torch.Tensor, ...]:
     """Native varlen/THD stage-2 top-k over the tight per-batch compact cand_buffer.
 
@@ -790,6 +860,9 @@ def compress_stage2_topk_varlen(
              val (total_q, topk) fp32; -inf padded), plus topk_softmax
     (total_q, topk) fp32 when ``return_softmax`` is true or ``out_softmax``
     is supplied.
+
+    ``deterministic=True`` applies the smallest-local-index tie-break described
+    by :func:`compress_stage2_topk`.
 
     VALUE CONTRACT (caller-guaranteed; the kernel batch-scans cu_seqlens_q per token
     and would read past the end / mis-slab otherwise): cu_seqlens_q/k start at 0 and
@@ -879,9 +952,16 @@ def compress_stage2_topk_varlen(
         block_threads,
         q_causal_offsets is not None,
         want_softmax,
+        bool(deterministic),
     )
     if compile_key not in _compile_cache:
-        kernel_obj = CompressTopkStage2(topk=topk, ratio=ratio, block_threads=block_threads, is_varlen=True)
+        kernel_obj = CompressTopkStage2(
+            topk=topk,
+            ratio=ratio,
+            block_threads=block_threads,
+            is_varlen=True,
+            deterministic=deterministic,
+        )
         _compile_cache[compile_key] = cute.compile(
             kernel_obj,
             _to_cute_tensor(cand_buffer, leading_dim=0),

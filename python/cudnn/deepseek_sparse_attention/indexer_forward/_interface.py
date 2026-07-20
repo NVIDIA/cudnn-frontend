@@ -128,6 +128,7 @@ def indexer_fwd(
     lse_out: Optional[torch.Tensor] = None,
     return_softmax: Optional[bool] = None,
     softmax_out: Optional[torch.Tensor] = None,
+    deterministic: bool = False,
     current_stream=None,
 ):
     """
@@ -139,6 +140,9 @@ def indexer_fwd(
     scratch storage and returns ``(topk_indices, topk_logits, topk_softmax[, lse])``
     by default without materializing the dense score tensor. Pass
     ``return_softmax=False`` to omit the fused top-k softmax.
+    ``deterministic=True`` makes exact-value ties at the K-th boundary select
+    the smallest local KV indices; the selected set is reproducible while slot
+    order remains unspecified.
     sm_scale is applied to the fp32 head-reduced score inside the kernel
     (higher precision than pre-multiplying onto bf16 W on the host).
 
@@ -224,6 +228,7 @@ def indexer_fwd(
                     softmax_out=softmax_out,
                     return_lse=return_lse,
                     lse_out=lse_out,
+                    deterministic=deterministic,
                 )
             else:
                 if cand_batch_offsets is not None:
@@ -252,6 +257,7 @@ def indexer_fwd(
                     return_softmax=return_softmax,
                     softmax_out=softmax_out,
                     q_causal_offsets=q_causal_offsets,
+                    deterministic=deterministic,
                 )
 
             launch_stream = torch.cuda.current_stream(q.device)

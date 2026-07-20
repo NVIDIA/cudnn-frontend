@@ -319,6 +319,7 @@ def indexer_forward_top_k_wrapper(
     out_indices: Optional[torch.Tensor] = None,
     out_logits: Optional[torch.Tensor] = None,
     cand_batch_offsets: Optional[torch.Tensor] = None,
+    deterministic: bool = False,
 ) -> TupleDict:
     """Combined SM100 indexer score generation and Top-K selection API.
 
@@ -332,6 +333,9 @@ def indexer_forward_top_k_wrapper(
     supplied to avoid per-call allocation. Indices are global KV ids by
     default; set ``topk_indices_global=False`` for local ids matching
     ``indexer_top_k_wrapper``, and use the same convention downstream.
+    Set ``deterministic=True`` to resolve exact-value ties at the K-th boundary
+    toward the smallest local KV indices. This makes the selected set
+    reproducible, although output slot order remains unspecified.
     """
     if device_major() < 10:
         raise NotImplementedError("compressed indexer forward is SM100-only; standalone IndexerTopK remains SM90+")
@@ -369,6 +373,7 @@ def indexer_forward_top_k_wrapper(
         lse_out=lse_out,
         return_softmax=return_softmax,
         softmax_out=softmax_out,
+        deterministic=deterministic,
         current_stream=stream,
     )
 

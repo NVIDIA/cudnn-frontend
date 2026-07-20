@@ -188,7 +188,10 @@ scores. Pass
 `return_softmax=False` to omit `softmax`. BSHD output shape is
 `(B, S_q, top_k)`; THD output shape is `(total_q, top_k)`. Padded slots are
 `-1`/`-inf`. The selected set is Top-K, but its slot order is not guaranteed to
-be descending.
+be descending. Set `deterministic=True` to break exact-value ties at the K-th
+boundary toward the smallest local KV indices, making the selected set
+reproducible across launches. This does not sort the output slots; the default
+`False` path retains the faster scheduling-dependent tie-break.
 
 The combined compressed path is SM100-only. Both BSHD and THD support
 BF16 and MXFP8. `topk_indices_global=True` is the default. Optional caller-owned

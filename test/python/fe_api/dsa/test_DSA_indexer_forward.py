@@ -42,6 +42,7 @@ def test_DSA_indexer_forward_api_is_split_from_top_k():
         "out_indices",
         "out_logits",
         "cand_batch_offsets",
+        "deterministic",
     }
 
     assert compressed_only.isdisjoint(dense_parameters)

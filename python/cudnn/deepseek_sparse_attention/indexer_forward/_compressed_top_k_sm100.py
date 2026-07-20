@@ -276,6 +276,7 @@ def indexer_fwd_compress_topk(
     return_softmax: Optional[bool] = None,
     softmax_out: Optional[torch.Tensor] = None,
     q_causal_offsets: Optional[torch.Tensor] = None,
+    deterministic: bool = False,
     _cand_total_floats: Optional[int] = None,
     _cand_batch_offsets: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, ...]:
@@ -322,6 +323,10 @@ def indexer_fwd_compress_topk(
         topk_indices_global: when True, return public global KV ids
             (``b * seqlen_k + local``) to match indexer_topk / indexer_bwd; when
             False (default for this low-level entry), return raw local KV ids.
+        deterministic: when true, exact-value ties at the K-th boundary select
+            the smallest local KV indices, making the selected set reproducible.
+            The within-row slot order remains unspecified. Default false keeps
+            the faster scheduling-dependent tie-break.
 
     Returns:
         (topk_indices, topk_logits):
@@ -556,6 +561,7 @@ def indexer_fwd_compress_topk(
                 return_softmax=want_softmax,
                 softmax_out=(sm_out[:, rs : rs + mb, :] if want_softmax else None),
                 q_causal_offsets=wco,
+                deterministic=deterministic,
                 _cand_total_floats=bs * pbf,
                 _cand_batch_offsets=_slab_ramp * pbf,
             )
@@ -790,6 +796,7 @@ def indexer_fwd_compress_topk(
             q_causal_offsets=q_causal_offsets,
             out_softmax=softmax_out,
             return_softmax=want_softmax,
+            deterministic=deterministic,
         )
     if want_softmax:
         topk_indices, topk_logits, topk_softmax = stage2_out
@@ -1176,6 +1183,7 @@ def _indexer_fwd_compress_topk_thd(
     softmax_out: Optional[torch.Tensor] = None,
     return_lse: bool = False,
     lse_out: Optional[torch.Tensor] = None,
+    deterministic: bool = False,
 ) -> tuple[torch.Tensor, ...]:
     """THD/varlen compressed-logits top-k, supporting BF16 and MXFP8.
 
@@ -1212,6 +1220,8 @@ def _indexer_fwd_compress_topk_thd(
     per-batch offsets / the broadcast add); these are graph-capturable (no sync) but
     are recorded into the graph's private pool, so they are NOT zero-extra-allocation.
     Use ``topk_indices_global=False`` to strictly avoid the conversion temporaries.
+    ``deterministic=True`` makes exact-value ties at the K-th boundary select the
+    smallest local KV indices; output slot order is still unspecified.
     """
     from ..indexer_top_k.compress_top_k_sm100 import compress_stage2_topk_varlen
 
@@ -1504,6 +1514,7 @@ def _indexer_fwd_compress_topk_thd(
             q_causal_offsets=q_causal_offsets,
             out_softmax=softmax_out,
             return_softmax=want_softmax,
+            deterministic=deterministic,
         )
     if want_softmax:
         idx_out, val_out, sm_out = stage2_out
