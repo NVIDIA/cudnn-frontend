@@ -211,6 +211,22 @@ SDPA_attributes::validate_sdpa_support_surface(const detail::Context& context,
             error_code_t::GRAPH_NOT_SUPPORTED,
             "sdpa fp8 forward with HALF/BFLOAT16 output is only supported on Blackwell architecture "
             "with cuDNN version 9.13.0 and newer.");
+
+        // cuDNN 9.24 has a known bug on Blackwell: the heuristic can select a split-KV
+        // prefill kernel for FP8/MXFP8 forward graphs whose combine step encodes the
+        // result as FP16 regardless of the requested output type, corrupting BF16
+        // outputs (all values collapse to denormals). The kernel is only proposed for
+        // non-paged, non-ragged, non-dropout graphs without diagonal band bounds when
+        // s_q > 1 and s_kv is long. Fixed in cuDNN 9.25.0; versions before 9.24 do not
+        // have the kernel. Reject the exposed combination on 9.24.
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            (detail::get_backend_version() >= 92400 && detail::get_backend_version() < 92500) && (prop_major == 10) &&
+                (output_data_type == DataType_t::BFLOAT16) && (s_q > 1) && (s_kv >= 4096) && !left_bound.has_value() &&
+                !right_bound.has_value() && !is_dropout && !is_paged && !is_ragged,
+            error_code_t::GRAPH_NOT_SUPPORTED,
+            "sdpa fp8/mxfp8 forward with BF16 output and s_kv >= 4096 without diagonal band bounds can produce "
+            "incorrect results on cuDNN 9.24 due to a known bug in its split-KV prefill kernel. Please upgrade to "
+            "cuDNN 9.25.0 or newer.");
     } else if (mma_core_mode == DataType_t::HALF) {
         // FP16 specific validation
 
