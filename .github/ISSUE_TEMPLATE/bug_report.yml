@@ -51,7 +51,7 @@ body:
         ### Environment (where applicable)
 
         <!-- Python users: run `python -m cudnn.collect_env` and paste its output
-             here instead of filling the fields below. If `import cudnn` is broken,
+             here instead of filling the fields below. If `import cudnn` fails,
              download and run the script standalone with any Python:
              https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/python/cudnn/collect_env.py -->
 
