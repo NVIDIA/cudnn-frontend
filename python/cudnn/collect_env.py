@@ -33,7 +33,7 @@ import sys
 # Keys are display names, values are regexes matched against .so basenames.
 # libcudnn intentionally also matches the sublibraries (libcudnn_ops,
 # libcudnn_engines_precompiled, ...) — an install with mixed sublibrary
-# versions is a known inconsistent state this report must surface.
+# versions are a known inconsistent state this report must surface.
 _LIB_FAMILIES = {
     "libcudnn": r"libcudnn(?:_[a-z_]+)?\.so",
     "libcublas": r"libcublas(?:Lt)?\.so",
