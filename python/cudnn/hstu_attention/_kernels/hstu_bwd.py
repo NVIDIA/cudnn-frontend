@@ -41,7 +41,15 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cute.typing import Int32, Float32, Float16, BFloat16, Boolean
 
 from .mask import AttentionMask
-from .utils import split_wg, tanhf, mul_packed_f32x2, fma_packed_f32x2, sub_packed_f32x2, add_packed_f32x2
+from .utils import (
+    add_packed_f32x2,
+    domain_offset_i64,
+    fma_packed_f32x2,
+    mul_packed_f32x2,
+    split_wg,
+    sub_packed_f32x2,
+    tanhf,
+)
 from .fast_math import FastSilU
 from .block_info import BWDBlockInfo
 from .seqlen_info import SeqlenInfo
@@ -1079,7 +1087,10 @@ class HSTUAttentionBackwardSm100:
         for idx_s_t in cutlass.range(tidy, self.block_seq, self.num_threads_seq):
             idx_s = idx_s_t + self.block_seq * bidz
             if idx_s < seqlen:
-                dQ_acc_bhs = dQ_acc[idx_s, None, (bidx, bidy)]
+                dQ_acc_batch = domain_offset_i64(
+                    (0, 0, ((0, 0), bidy)), dQ_acc
+                )
+                dQ_acc_bhs = dQ_acc_batch[idx_s, None, (bidx, 0)]
                 dQ_acc_bhs = cute.logical_divide(
                     dQ_acc_bhs, cute.make_layout(self.convert_elem_per_load)
                 )
