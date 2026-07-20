@@ -105,6 +105,16 @@ class FlashAttentionDSABackwardSm100:
             barrier_id=8,
             num_threads=(self.num_reduce_warps + 1) * self.threads_per_warp,
         )
+        # TMEM dealloc (compute warp 0) must be ordered after the reduce
+        # warps have drained their final dKV T2R reads (the reads that feed
+        # store_dKV); deallocating the TMEM columns while those T2R loads
+        # are still in flight would race them within the CTA. This is a
+        # within-CTA read-before-dealloc ordering. Participants:
+        # num_reduce_warps (arrive) + compute warp 0 (arrive_and_wait).
+        self.tmem_dealloc_barrier = pipeline.NamedBarrier(
+            barrier_id=9,
+            num_threads=(self.num_reduce_warps + 1) * self.threads_per_warp,
+        )
 
         self.tmem_S_offset = 0
         self.tmem_dP_offset = 0
@@ -343,7 +353,7 @@ class FlashAttentionDSABackwardSm100:
         dOT_smem_layout_staged = sm100_utils.make_smem_layout_a(dOP_tiled_mma, self.dOP_cta_tiler, self.element_dtype, self.load_mma_QdO_stage)
         P_smem_layout_staged = sm100_utils.make_smem_layout_b(dOP_tiled_mma, self.dOP_mma_tiler, self.element_dtype, self.compute_mma_P_stage)
         P_smem_layout_store_staged = sm100_utils.make_smem_layout_epi(
-            self.element_dtype, utils.LayoutEnum.COL_MAJOR, self.QK_mma_tiler[:2], self.load_mma_K_stage
+            self.element_dtype, utils.LayoutEnum.COL_MAJOR, self.QK_mma_tiler[:2], self.compute_mma_P_stage
         )
         K_smem_layout_staged_2 = sm100_utils.make_smem_layout_a(KdS_tiled_mma, self.KdS_cta_tiler, self.element_dtype, self.load_mma_K_stage)
         if cutlass.const_expr(not self.same_hdim_kv):
@@ -364,7 +374,7 @@ class FlashAttentionDSABackwardSm100:
             QT_tail_smem_layout_staged = None
         dS_smem_layout_staged = sm100_utils.make_smem_layout_b(QdS_tiled_mma, self.QdS_mma_tiler, self.element_dtype, self.compute_mma_dS_stage)
         dS_smem_layout_store_staged = sm100_utils.make_smem_layout_epi(
-            self.element_dtype, utils.LayoutEnum.COL_MAJOR, self.dOV_mma_tiler[:2], self.load_mma_K_stage
+            self.element_dtype, utils.LayoutEnum.COL_MAJOR, self.dOV_mma_tiler[:2], self.compute_mma_dS_stage
         )
 
         dQ_smem_layout_staged = sm100_utils.make_smem_layout_epi(
@@ -1028,6 +1038,10 @@ class FlashAttentionDSABackwardSm100:
             )
 
             if warp_idx == self.compute_warp_id[0]:
+                # Wait until every reduce warp has finished (and fenced) its
+                # final dKV T2R read before freeing the TMEM columns, so the
+                # dealloc cannot race those in-flight reads within the CTA.
+                self.tmem_dealloc_barrier.arrive_and_wait()
                 cute.arch.dealloc_tmem(tmem_ptr_base, self.num_tmem_alloc_cols)
 
         elif warp_idx in self.reduce_warp_id:
@@ -1048,6 +1062,11 @@ class FlashAttentionDSABackwardSm100:
                 topk,
                 mma_reduce_dKV_pipeline,
             )
+            # All T2R reads issued by this warp are complete here (each
+            # store_dKV / T2R block fences before its pipeline release);
+            # signal compute warp 0 that TMEM dealloc is now safe.
+            # arrive() only -- the reduce warps need not stall.
+            self.tmem_dealloc_barrier.arrive()
 
         elif warp_idx in self.load_KV_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_load_KV)
@@ -1776,13 +1795,13 @@ class FlashAttentionDSABackwardSm100:
         thr_t2r_dP = tiled_t2r_dP.get_slice(tidx % 128)
 
         tTR_cS = thr_t2r_S.partition_D(cS)
-        tTR_sS = thr_t2r_S.partition_D(sP_store[None, None, compute_mma_P_producer_state.index])
+        tTR_sS = thr_t2r_S.partition_D(sP_store[None, None, 0])
         tTR_rS = cute.make_rmem_tensor(tTR_sS.shape, self.acc_dtype)
 
         tTR_tS = thr_t2r_S.partition_S(tStS)
 
         tTR_cdP = thr_t2r_dP.partition_D(cdP)
-        tTR_sdP = thr_t2r_dP.partition_D(sdS_store[None, None, compute_mma_dS_producer_state.index])
+        tTR_sdP = thr_t2r_dP.partition_D(sdS_store[None, None, 0])
         tTR_rdP = cute.make_rmem_tensor(tTR_sdP.shape, self.acc_dtype)
 
         tTR_tdP = thr_t2r_dP.partition_S(tdPtdP)
@@ -1799,15 +1818,15 @@ class FlashAttentionDSABackwardSm100:
         )
         smem_store_p = cute.make_tiled_copy_D(smem_store_atom, tiled_t2r_S)
         thr_smem_store_p = smem_store_p.get_slice(tidx % 128)
-        sP_store_slice = sP_store[None, None, compute_mma_P_producer_state.index]
-        tRS_sP = thr_smem_store_p.partition_D(sP_store_slice)
-        tRS_rP = cute.make_rmem_tensor(tRS_sP.shape, self.element_dtype)
+        # Keep the stage mode: the store slot must follow the producer state
+        # when compute_mma_P_stage > 1 (slot selection happens at the copy).
+        tRS_sP = thr_smem_store_p.partition_D(sP_store)
+        tRS_rP = cute.make_rmem_tensor(tRS_sP[None, None, None, 0].shape, self.element_dtype)
 
         smem_store_ds = cute.make_tiled_copy_D(smem_store_atom, tiled_t2r_dP)
         thr_smem_store_ds = smem_store_ds.get_slice(tidx % 128)
-        sdS_store_slice = sdS_store[None, None, compute_mma_dS_producer_state.index]
-        tRS_sdS = thr_smem_store_ds.partition_D(sdS_store_slice)
-        tRS_rdS = cute.make_rmem_tensor(tRS_sdS.shape, self.element_dtype)
+        tRS_sdS = thr_smem_store_ds.partition_D(sdS_store)
+        tRS_rdS = cute.make_rmem_tensor(tRS_sdS[None, None, None, 0].shape, self.element_dtype)
 
         tile_index = tile_count - 1
         while tile_index >= 0:
@@ -1838,7 +1857,10 @@ class FlashAttentionDSABackwardSm100:
 
             # ======= stsm ============
             tRS_rP.store(smem_store_p.retile(tTR_rS_f16).load())
-            cute.copy(smem_store_p, tRS_rP, tRS_sP)
+            if cutlass.const_expr(self.compute_mma_P_stage == 1):
+                cute.copy(smem_store_p, tRS_rP, tRS_sP[None, None, None, 0])
+            else:
+                cute.copy(smem_store_p, tRS_rP, tRS_sP[None, None, None, compute_mma_P_producer_state.index])
 
             # Fence for shared memory
             cute.arch.fence_proxy(
@@ -1883,7 +1905,10 @@ class FlashAttentionDSABackwardSm100:
             mma_compute_dP_consumer_state.advance()
 
             tRS_rdS.store(smem_store_ds.retile(tTR_rdP_f16).load())
-            cute.copy(smem_store_ds, tRS_rdS, tRS_sdS)
+            if cutlass.const_expr(self.compute_mma_dS_stage == 1):
+                cute.copy(smem_store_ds, tRS_rdS, tRS_sdS[None, None, None, 0])
+            else:
+                cute.copy(smem_store_ds, tRS_rdS, tRS_sdS[None, None, None, compute_mma_dS_producer_state.index])
 
             # self.compute_sync_barrier.arrive_and_wait()
 
