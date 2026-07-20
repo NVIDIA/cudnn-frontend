@@ -529,7 +529,7 @@ log_dump_tensor_content(int64_t uid,
         default:
             data_str = to_hex(host_buf.data(), num_elements, elem_size);
     }
-    CUDNN_FE_LOG_LABEL_ENDL("Tensor Dump Uid: " << uid << " Name: " << name << " Data: " << data_str);
+    CUDNN_FE_LOG_LABEL_ENDL("Tensor Dump uid: " << uid << " Name: " << name << " Data: " << data_str);
     return {error_code_t::OK, ""};
 }
 
@@ -562,7 +562,7 @@ log_variant_pack_memory_type(int64_t uid, void* ptr) {
     };
 
     // clang-format off
-    CUDNN_FE_LOG_LABEL_ENDL("Variant Pack" << std::setw(0) << " Uid: " << std::setw(20) << uid
+    CUDNN_FE_LOG_LABEL_ENDL("Variant Pack" << std::setw(0) << " uid: " << std::setw(20) << uid
                                            << std::setw(0) << " MemoryType: " << std::setw(12) << memory_type_to_string(attributes.type)
                                            << std::setw(0) << " Device: " << std::setw(4) << attributes.device
                                            << std::setw(0) << " UnifiedPtr: " << std::setw(20) << ptr_to_string(ptr)

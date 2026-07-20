@@ -592,19 +592,22 @@ NLOHMANN_JSON_SERIALIZE_ENUM(Moe_grouped_matmul_bwd_attributes::output_names,
 
 inline void
 to_json(nlohmann::json& j, const Tensor_attributes& ta) {
-    j = nlohmann::json{{"name", ta.name},
-                       {"data_type", ta.data_type},
+    j = nlohmann::json{{"data_type", ta.data_type},
                        {"dim", ta.dim},
                        {"stride", ta.stride},
                        {"is_virtual", ta.is_virtual},
                        {"pass_by_value", ta.pass_by_value},
                        {"is_pass_by_value", ta.is_pass_by_value},
                        {"reordering_type", ta.reordering_type},
-                       {"uid", ta.uid},
-                       {"uid_assigned", ta.uid_assigned}};
+                       {"uid", ta.get_uid()}};
+    if (!ta.name.empty()) {
+        j["name"] = ta.name;
+    }
     if (ta.ragged_offset) {
-        j["ragged_offset_uid"]  = ta.ragged_offset->get_uid();
-        j["ragged_offset_name"] = ta.ragged_offset->get_name();
+        j["ragged_offset_uid"] = ta.ragged_offset->get_uid();
+        if (!ta.ragged_offset->get_name().empty()) {
+            j["ragged_offset_name"] = ta.ragged_offset->get_name();
+        }
     }
     if (ta.has_ragged_offset_multiplier()) {
         j["ragged_offset_multiplier"] = ta.ragged_offset_multiplier;
@@ -613,23 +616,21 @@ to_json(nlohmann::json& j, const Tensor_attributes& ta) {
 
 inline void
 from_json(const nlohmann::json& j, Tensor_attributes& ta) {
-    ta.name             = j.at("name").get<std::string>();
+    ta.name             = j.contains("name") && !j["name"].is_null() ? j.at("name").get<std::string>() : "";
     ta.data_type        = j.at("data_type").get<DataType_t>();
     ta.dim              = j.at("dim").get<std::vector<int64_t>>();
     ta.stride           = j.at("stride").get<std::vector<int64_t>>();
     ta.is_virtual       = j.at("is_virtual").get<bool>();
     ta.is_pass_by_value = j.at("is_pass_by_value").get<bool>();
     ta.reordering_type  = j.at("reordering_type").get<TensorReordering_t>();
-    ta.uid              = j.at("uid").get<Tensor_attributes::uid_t>();
-    ta.uid_assigned     = j.at("uid_assigned").get<bool>();
+    ta.set_uid(j.at("uid").get<Tensor_attributes::uid_t>());
 
     if (ta.is_pass_by_value && !j["pass_by_value"].is_null()) {
         ta.pass_by_value = j.at("pass_by_value");
     }
     if (j.contains("ragged_offset_uid")) {
-        auto ragged_offset          = std::make_shared<Tensor_attributes>();
-        ragged_offset->uid          = j.at("ragged_offset_uid").get<Tensor_attributes::uid_t>();
-        ragged_offset->uid_assigned = true;
+        auto ragged_offset = std::make_shared<Tensor_attributes>();
+        ragged_offset->set_uid(j.at("ragged_offset_uid").get<Tensor_attributes::uid_t>());
         if (j.contains("ragged_offset_name")) {
             ragged_offset->name = j.at("ragged_offset_name").get<std::string>();
         }

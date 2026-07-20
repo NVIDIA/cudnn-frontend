@@ -9,6 +9,7 @@ from . import utils
 
 def build_cfg(raw_line: str, payload: dict, seed: Optional[int] = None) -> dict:
     """Build test configuration from JSON payload."""
+    utils.validate_payload_version(payload)
     node = None
     for candidate in payload.get("nodes", []):
         if candidate.get("tag") == "SDPA_FWD":
@@ -19,18 +20,17 @@ def build_cfg(raw_line: str, payload: dict, seed: Optional[int] = None) -> dict:
     if node is None:
         raise ValueError("SDPA node not found in log")
 
-    tensors = payload.get("tensors", {})
-    node_name = node.get("name")
+    tensors = payload.get("tensors", [])
     inputs = node.get("inputs", {})
     outputs = node.get("outputs", {})
 
-    q_entry = utils.tensor_entry(tensors, node_name, "Q", inputs.get("Q"))
-    k_entry = utils.tensor_entry(tensors, node_name, "K", inputs.get("K"))
-    v_entry = utils.tensor_entry(tensors, node_name, "V", inputs.get("V"))
-    o_entry = utils.tensor_entry(tensors, node_name, "O", outputs.get("O"))
+    q_entry = utils.tensor_entry(tensors, inputs.get("Q"))
+    k_entry = utils.tensor_entry(tensors, inputs.get("K"))
+    v_entry = utils.tensor_entry(tensors, inputs.get("V"))
+    o_entry = utils.tensor_entry(tensors, outputs.get("O"))
 
-    seq_q_entry = utils.tensor_entry(tensors, node_name, "SEQ_LEN_Q", inputs.get("SEQ_LEN_Q"))
-    seq_kv_entry = utils.tensor_entry(tensors, node_name, "SEQ_LEN_KV", inputs.get("SEQ_LEN_KV"))
+    seq_q_entry = utils.tensor_entry(tensors, inputs.get("SEQ_LEN_Q"))
+    seq_kv_entry = utils.tensor_entry(tensors, inputs.get("SEQ_LEN_KV"))
 
     shape_q = utils.shape(q_entry)
     shape_k = utils.shape(k_entry)
@@ -64,12 +64,7 @@ def build_cfg(raw_line: str, payload: dict, seed: Optional[int] = None) -> dict:
     diag_align = diag_align_map.get(node.get("diagonal_alignment", "TOP_LEFT"), 0)
 
     dropout_prob = utils.parse_hex_float(node.get("dropout_probability")) or 0.0
-    repro_metadata = payload.get("repro_metadata", {})
-    ragged_tensor_names = set(repro_metadata.get("ragged_tensor_names", []))
-    is_ragged = any(
-        entry is not None and (utils.parse_optional_int(entry.get("ragged_offset_uid")) is not None or entry.get("name") in ragged_tensor_names)
-        for entry in (q_entry, k_entry, v_entry, o_entry)
-    )
+    is_ragged = utils.is_ragged_payload(inputs, (q_entry, k_entry, v_entry, o_entry), payload)
 
     cfg = OrderedDict()
     cfg["data_type"] = utils.torch_dtype(payload.get("context", {}).get("io_data_type"))
@@ -79,7 +74,7 @@ def build_cfg(raw_line: str, payload: dict, seed: Optional[int] = None) -> dict:
     cfg["is_paged"] = any("PAGED_ATTENTION" in key for key in inputs)
     cfg["is_bias"] = utils.bool_from_inputs(inputs, "BIAS")
     cfg["is_block_mask"] = utils.bool_from_inputs(inputs, "BLOCK_MASK")
-    cfg["is_padding"] = node.get("padding_mask") or bool(seq_len_q or seq_len_kv)
+    cfg["is_padding"] = is_ragged or node.get("padding_mask") or bool(seq_len_q or seq_len_kv)
     cfg["is_ragged"] = is_ragged
     cfg["is_dropout"] = dropout_prob > 0.0
     cfg["is_determin"] = None
@@ -149,19 +144,25 @@ def extract_seq_and_ragged(payload: dict, seed: int) -> dict:
             "ragged_offset_kv": [],
         }
 
-    tensors = payload.get("tensors", {})
-    node_name = node.get("name")
+    tensors = payload.get("tensors", [])
     inputs = node.get("inputs", {})
 
-    seq_q_entry = utils.tensor_entry(tensors, node_name, "SEQ_LEN_Q", inputs.get("SEQ_LEN_Q"))
-    seq_kv_entry = utils.tensor_entry(tensors, node_name, "SEQ_LEN_KV", inputs.get("SEQ_LEN_KV"))
-    ragged_q_entry = utils.tensor_entry(tensors, node_name, "RAGGED_OFFSET_Q", inputs.get("RAGGED_OFFSET_Q"))
-    ragged_kv_entry = utils.tensor_entry(tensors, node_name, "RAGGED_OFFSET_KV", inputs.get("RAGGED_OFFSET_KV"))
+    seq_q_entry = utils.tensor_entry(tensors, inputs.get("SEQ_LEN_Q"))
+    seq_kv_entry = utils.tensor_entry(tensors, inputs.get("SEQ_LEN_KV"))
+    ragged_q_entry = utils.tensor_entry(tensors, inputs.get("RAGGED_OFFSET_Q"))
+    ragged_kv_entry = utils.tensor_entry(tensors, inputs.get("RAGGED_OFFSET_KV"))
 
     if ragged_q_entry is None:
-        ragged_q_entry = utils.tensor_entry(tensors, node_name, "RAGGED_OFFSETS_Q", inputs.get("RAGGED_OFFSETS_Q"))
+        ragged_q_entry = utils.tensor_entry(tensors, inputs.get("RAGGED_OFFSETS_Q"))
     if ragged_kv_entry is None:
-        ragged_kv_entry = utils.tensor_entry(tensors, node_name, "RAGGED_OFFSETS_KV", inputs.get("RAGGED_OFFSETS_KV"))
+        ragged_kv_entry = utils.tensor_entry(tensors, inputs.get("RAGGED_OFFSETS_KV"))
+    if ragged_q_entry is None:
+        q_entry = utils.tensor_entry(tensors, inputs.get("Q"))
+        ragged_q_entry = utils.ragged_offset_entry(tensors, q_entry)
+    if ragged_kv_entry is None:
+        k_entry = utils.tensor_entry(tensors, inputs.get("K"))
+        v_entry = utils.tensor_entry(tensors, inputs.get("V"))
+        ragged_kv_entry = utils.ragged_offset_entry(tensors, k_entry, v_entry)
 
     return {
         "seq_len_q": utils.seq_len(seq_q_entry),

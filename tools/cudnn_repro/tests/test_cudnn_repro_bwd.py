@@ -1,18 +1,20 @@
-import pytest
-
 import cudnn_repro.repro_command as repro_command
 import cudnn_repro.sdpa_bwd as sdpa_bwd
+
+from .helpers import tensor_list
 
 
 def test_build_bwd_cfg_simple_case():
     payload = {
+        "json_version": "2.0",
+        "gid": 1,
         "context": {"io_data_type": "BFLOAT16"},
         "nodes": [
             {
                 "tag": "SDPA_BWD",
                 "name": "sdpa_backward",
-                "inputs": {"Q": 0, "K": 1, "V": 2, "O": 3, "Stats": 4, "dO": 5},
-                "outputs": {"dQ": 6, "dK": 7, "dV": 8},
+                "inputs": {"Q": 1, "K": 2, "V": 3, "O": 4, "Stats": 5, "dO": 6},
+                "outputs": {"dQ": 7, "dK": 8, "dV": 9},
                 "diagonal_alignment": "TOP_LEFT",
                 "is_deterministic_algorithm": False,
                 "left_bound": None,
@@ -20,17 +22,19 @@ def test_build_bwd_cfg_simple_case():
                 "padding_mask": False,
             }
         ],
-        "tensors": {
-            "0": {"uid": 0, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
-            "1": {"uid": 1, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
-            "2": {"uid": 2, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
-            "3": {"uid": 3, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
-            "4": {"uid": 4, "dim": [2, 4, 16, 1], "stride": [64, 16, 1, 1]},
-            "5": {"uid": 5, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
-            "6": {"uid": 6, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
-            "7": {"uid": 7, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
-            "8": {"uid": 8, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
-        },
+        "tensors": tensor_list(
+            {
+                "1": {"uid": 1, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
+                "2": {"uid": 2, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
+                "3": {"uid": 3, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
+                "4": {"uid": 4, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
+                "5": {"uid": 5, "dim": [2, 4, 16, 1], "stride": [64, 16, 1, 1]},
+                "6": {"uid": 6, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
+                "7": {"uid": 7, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
+                "8": {"uid": 8, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
+                "9": {"uid": 9, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
+            }
+        ),
     }
 
     cfg = sdpa_bwd.build_cfg("{}", payload, seed=123)
@@ -49,29 +53,33 @@ def test_build_bwd_cfg_simple_case():
 
 def test_build_bwd_cfg_preserves_rope():
     payload = {
+        "json_version": "2.0",
+        "gid": 1,
         "context": {"io_data_type": "BFLOAT16"},
         "nodes": [
             {
                 "tag": "SDPA_BWD",
                 "name": "sdpa_backward",
-                "inputs": {"Q": 0, "K": 1, "V": 2, "O": 3, "Stats": 4, "dO": 5},
-                "outputs": {"dQ": 6, "dK": 7, "dV": 8},
+                "inputs": {"Q": 1, "K": 2, "V": 3, "O": 4, "Stats": 5, "dO": 6},
+                "outputs": {"dQ": 7, "dK": 8, "dV": 9},
                 "diagonal_alignment": "TOP_LEFT",
                 "padding_mask": False,
             },
             {"tag": "ROPE_BWD", "name": "RoPE_BWD_Q"},
         ],
-        "tensors": {
-            "0": {"uid": 0, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
-            "1": {"uid": 1, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
-            "2": {"uid": 2, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
-            "3": {"uid": 3, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
-            "4": {"uid": 4, "dim": [2, 4, 16, 1], "stride": [64, 16, 1, 1]},
-            "5": {"uid": 5, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
-            "6": {"uid": 6, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
-            "7": {"uid": 7, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
-            "8": {"uid": 8, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
-        },
+        "tensors": tensor_list(
+            {
+                "1": {"uid": 1, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
+                "2": {"uid": 2, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
+                "3": {"uid": 3, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
+                "4": {"uid": 4, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
+                "5": {"uid": 5, "dim": [2, 4, 16, 1], "stride": [64, 16, 1, 1]},
+                "6": {"uid": 6, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
+                "7": {"uid": 7, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
+                "8": {"uid": 8, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
+                "9": {"uid": 9, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
+            }
+        ),
     }
 
     cfg = sdpa_bwd.build_cfg("{}", payload, seed=123)
@@ -81,57 +89,80 @@ def test_build_bwd_cfg_preserves_rope():
     assert "'with_rope': True" in command
 
 
-def test_build_bwd_cfg_rejects_padding():
+def test_build_bwd_cfg_supports_ragged():
     payload = {
+        "json_version": "2.0",
+        "gid": 1,
         "context": {"io_data_type": "FLOAT16"},
         "nodes": [
             {
                 "tag": "SDPA_BWD",
                 "name": "sdpa_backward",
-                "inputs": {"Q": 0, "K": 1, "V": 2, "O": 3, "Stats": 4, "dO": 5, "RAGGED_OFFSET_Q": 9, "RAGGED_OFFSET_KV": 10},
-                "outputs": {"dQ": 6, "dK": 7, "dV": 8},
+                "inputs": {
+                    "Q": 1,
+                    "K": 2,
+                    "V": 3,
+                    "O": 4,
+                    "Stats": 5,
+                    "dO": 6,
+                    "SEQ_LEN_Q": 10,
+                    "SEQ_LEN_KV": 11,
+                    "RAGGED_OFFSET_Q": 12,
+                    "RAGGED_OFFSET_KV": 13,
+                },
+                "outputs": {"dQ": 7, "dK": 8, "dV": 9},
                 "diagonal_alignment": "TOP_LEFT",
-                "padding_mask": False,
+                "padding_mask": True,
             }
         ],
-        "tensors": {
-            "0": {"uid": 0, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
-            "1": {"uid": 1, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
-            "2": {"uid": 2, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
-            "3": {"uid": 3, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
-            "4": {"uid": 4, "dim": [2, 4, 16, 1], "stride": [64, 16, 1, 1]},
-            "5": {"uid": 5, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
-            "6": {"uid": 6, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
-            "7": {"uid": 7, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
-            "8": {"uid": 8, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
-            "9": {"uid": 9, "dim": [3, 1, 1, 1], "stride": [1, 1, 1, 1]},
-            "10": {"uid": 10, "dim": [3, 1, 1, 1], "stride": [1, 1, 1, 1]},
-        },
+        "tensors": tensor_list(
+            {
+                "1": {"uid": 1, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
+                "2": {"uid": 2, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
+                "3": {"uid": 3, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
+                "4": {"uid": 4, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
+                "5": {"uid": 5, "dim": [2, 4, 16, 1], "stride": [64, 16, 1, 1]},
+                "6": {"uid": 6, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
+                "7": {"uid": 7, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
+                "8": {"uid": 8, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
+                "9": {"uid": 9, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
+                "10": {"uid": 10, "data_type": "INT32", "dim": [2, 1, 1, 1], "stride": [1, 1, 1, 1], "pass_by_value": [13, 11]},
+                "11": {"uid": 11, "data_type": "INT32", "dim": [2, 1, 1, 1], "stride": [1, 1, 1, 1], "pass_by_value": [15, 9]},
+                "12": {"uid": 12, "data_type": "INT64", "dim": [3, 1, 1, 1], "stride": [1, 1, 1, 1], "pass_by_value": [0, 13, 24]},
+                "13": {"uid": 13, "data_type": "INT64", "dim": [3, 1, 1, 1], "stride": [1, 1, 1, 1], "pass_by_value": [0, 15, 24]},
+            }
+        ),
     }
 
-    with pytest.raises(NotImplementedError, match="ragged"):
-        sdpa_bwd.build_cfg("{}", payload, seed=123)
+    cfg = sdpa_bwd.build_cfg("{}", payload, seed=123)
+
+    assert cfg["is_ragged"] is True
+    assert cfg["is_padding"] is True
+    assert cfg["seq_len_q"] == [13, 11]
+    assert cfg["seq_len_kv"] == [15, 9]
 
 
 def test_build_bwd_cfg_supports_padding_sink_and_sliding_window():
     payload = {
+        "json_version": "2.0",
+        "gid": 1,
         "context": {"io_data_type": "BFLOAT16"},
         "nodes": [
             {
                 "tag": "SDPA_BWD",
                 "name": "sdpa_backward",
                 "inputs": {
-                    "Q": 0,
-                    "K": 1,
-                    "V": 2,
-                    "O": 3,
-                    "Stats": 4,
-                    "dO": 5,
-                    "SEQ_LEN_Q": 9,
-                    "SEQ_LEN_KV": 10,
-                    "SINK_TOKEN": 11,
+                    "Q": 1,
+                    "K": 2,
+                    "V": 3,
+                    "O": 4,
+                    "Stats": 5,
+                    "dO": 6,
+                    "SEQ_LEN_Q": 10,
+                    "SEQ_LEN_KV": 11,
+                    "SINK_TOKEN": 12,
                 },
-                "outputs": {"dQ": 6, "dK": 7, "dV": 8, "DSINK_TOKEN": 12},
+                "outputs": {"dQ": 7, "dK": 8, "dV": 9, "DSINK_TOKEN": 13},
                 "diagonal_alignment": "BOTTOM_RIGHT",
                 "is_deterministic_algorithm": True,
                 "left_bound": 8,
@@ -139,21 +170,23 @@ def test_build_bwd_cfg_supports_padding_sink_and_sliding_window():
                 "padding_mask": True,
             }
         ],
-        "tensors": {
-            "0": {"uid": 0, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
-            "1": {"uid": 1, "dim": [2, 1, 16, 64], "stride": [1024, 65536, 64, 1]},
-            "2": {"uid": 2, "dim": [2, 1, 16, 64], "stride": [1024, 65536, 64, 1]},
-            "3": {"uid": 3, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
-            "4": {"uid": 4, "dim": [2, 4, 16, 1], "stride": [64, 16, 1, 1]},
-            "5": {"uid": 5, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
-            "6": {"uid": 6, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
-            "7": {"uid": 7, "dim": [2, 1, 16, 64], "stride": [1024, 65536, 64, 1]},
-            "8": {"uid": 8, "dim": [2, 1, 16, 64], "stride": [1024, 65536, 64, 1]},
-            "9": {"uid": 9, "dim": [2, 1, 1, 1], "stride": [1, 1, 1, 1]},
-            "10": {"uid": 10, "dim": [2, 1, 1, 1], "stride": [1, 1, 1, 1]},
-            "11": {"uid": 11, "dim": [1, 4, 1, 1], "stride": [4, 1, 1, 1]},
-            "12": {"uid": 12, "dim": [1, 4, 1, 1], "stride": [4, 1, 1, 1]},
-        },
+        "tensors": tensor_list(
+            {
+                "1": {"uid": 1, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
+                "2": {"uid": 2, "dim": [2, 1, 16, 64], "stride": [1024, 65536, 64, 1]},
+                "3": {"uid": 3, "dim": [2, 1, 16, 64], "stride": [1024, 65536, 64, 1]},
+                "4": {"uid": 4, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
+                "5": {"uid": 5, "dim": [2, 4, 16, 1], "stride": [64, 16, 1, 1]},
+                "6": {"uid": 6, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
+                "7": {"uid": 7, "dim": [2, 4, 16, 64], "stride": [4096, 1024, 64, 1]},
+                "8": {"uid": 8, "dim": [2, 1, 16, 64], "stride": [1024, 65536, 64, 1]},
+                "9": {"uid": 9, "dim": [2, 1, 16, 64], "stride": [1024, 65536, 64, 1]},
+                "10": {"uid": 10, "dim": [2, 1, 1, 1], "stride": [1, 1, 1, 1]},
+                "11": {"uid": 11, "dim": [2, 1, 1, 1], "stride": [1, 1, 1, 1]},
+                "12": {"uid": 12, "dim": [1, 4, 1, 1], "stride": [4, 1, 1, 1]},
+                "13": {"uid": 13, "dim": [1, 4, 1, 1], "stride": [4, 1, 1, 1]},
+            }
+        ),
     }
 
     cfg = sdpa_bwd.build_cfg("{}", payload, seed=123)

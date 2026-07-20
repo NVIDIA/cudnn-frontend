@@ -50,15 +50,16 @@ def _normalize_tensor_entry(entry):
 
 
 def _normalize_payload(payload):
-    tensors = payload.get("tensors", {})
+    tensors = payload.get("tensors", [])
+    tensor_by_uid = {int(entry["uid"]): entry for entry in tensors}
 
     def resolve(uid):
-        return _normalize_tensor_entry(tensors[str(uid)])
+        return _normalize_tensor_entry(tensor_by_uid[int(uid)])
 
     normalized = {
         "context": payload.get("context"),
         "nodes": [],
-        "tensors": sorted(json.dumps(_normalize_tensor_entry(entry), sort_keys=True) for entry in tensors.values()),
+        "tensors": sorted(json.dumps(_normalize_tensor_entry(entry), sort_keys=True) for entry in tensors),
     }
     for node in payload.get("nodes", []):
         normalized_node = {}

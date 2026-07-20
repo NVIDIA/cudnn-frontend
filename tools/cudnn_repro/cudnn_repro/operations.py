@@ -4,10 +4,12 @@ from . import sdpa_bwd
 from . import sdpa_fp8_bwd
 from . import sdpa_fp8_fwd
 from . import sdpa_fwd
+from . import utils
 
 
 def detect_operation_key(payload: dict) -> str:
     """Detect the operation key from the JSON payload."""
+    utils.validate_payload_version(payload)
     for node in payload.get("nodes", []):
         tag = node.get("tag", "")
         if tag in ("SDPA_FP8_FWD", "SDPA_MXFP8_FWD"):

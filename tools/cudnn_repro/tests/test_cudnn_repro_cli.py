@@ -4,13 +4,16 @@ import subprocess
 import sys
 from pathlib import Path
 
+from .helpers import tensor_list
+
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 
 
-def fwd_payload(graph_uid, diagonal_alignment):
+def fwd_payload(gid, diagonal_alignment):
     return {
+        "json_version": "2.0",
         "context": {"io_data_type": "FLOAT16"},
-        "graph_uid": graph_uid,
+        "gid": gid,
         "nodes": [
             {
                 "tag": "SDPA_FWD",
@@ -24,12 +27,14 @@ def fwd_payload(graph_uid, diagonal_alignment):
                 "padding_mask": False,
             }
         ],
-        "tensors": {
-            "1": {"uid": 1, "dim": [1, 2, 16, 64], "stride": [2048, 1024, 64, 1]},
-            "2": {"uid": 2, "dim": [1, 2, 16, 64], "stride": [2048, 1024, 64, 1]},
-            "3": {"uid": 3, "dim": [1, 2, 16, 64], "stride": [2048, 1024, 64, 1]},
-            "4": {"uid": 4, "dim": [1, 2, 16, 64], "stride": [2048, 1024, 64, 1]},
-        },
+        "tensors": tensor_list(
+            {
+                "1": {"uid": 1, "dim": [1, 2, 16, 64], "stride": [2048, 1024, 64, 1]},
+                "2": {"uid": 2, "dim": [1, 2, 16, 64], "stride": [2048, 1024, 64, 1]},
+                "3": {"uid": 3, "dim": [1, 2, 16, 64], "stride": [2048, 1024, 64, 1]},
+                "4": {"uid": 4, "dim": [1, 2, 16, 64], "stride": [2048, 1024, 64, 1]},
+            }
+        ),
     }
 
 
@@ -86,7 +91,7 @@ def test_cli_debug_writes_default_files(tmp_path):
     payload = json.loads((tmp_path / "cudnn_repro_payload.json").read_text())
     assert (tmp_path / "cudnn_repro_log.txt").read_text().splitlines() == log_path.read_text().splitlines()
     assert "test/python/test_mhas_v2.py::test_repro" in (tmp_path / "cudnn_repro_command.txt").read_text()
-    assert payload["graph_uid"] == 22
+    assert payload["gid"] == 22
     assert "repro_metadata" in payload
 
 
@@ -95,8 +100,8 @@ def test_cli_debug_all_writes_indexed_files(tmp_path):
 
     run_cli(tmp_path, "--all", str(log_path), debug=True)
 
-    for idx, graph_uid in enumerate((11, 22)):
+    for idx, gid in enumerate((11, 22)):
         payload = json.loads((tmp_path / f"cudnn_repro_payload_{idx}.json").read_text())
         assert (tmp_path / f"cudnn_repro_log_{idx}.txt").read_text().splitlines() == log_path.read_text().splitlines()
         assert "test/python/test_mhas_v2.py::test_repro" in (tmp_path / f"cudnn_repro_command_{idx}.txt").read_text()
-        assert payload["graph_uid"] == graph_uid
+        assert payload["gid"] == gid

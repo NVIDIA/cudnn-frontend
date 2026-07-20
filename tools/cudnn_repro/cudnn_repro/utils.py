@@ -2,11 +2,19 @@
 
 import hashlib
 import json
-import re
 import struct
 import sys
 from pathlib import Path
 from typing import Any, Optional, Tuple
+
+GRAPH_JSON_VERSION = "2.0"
+RAGGED_OFFSET_INPUTS = ("RAGGED_OFFSET_Q", "RAGGED_OFFSET_KV", "RAGGED_OFFSETS_Q", "RAGGED_OFFSETS_KV")
+
+
+def validate_payload_version(payload: dict) -> None:
+    version = payload.get("json_version")
+    if version != GRAPH_JSON_VERSION:
+        raise ValueError(f"Unsupported graph JSON version. Expected {GRAPH_JSON_VERSION}, got {version!r}.")
 
 
 def sha1_seed(raw: str) -> int:
@@ -76,48 +84,14 @@ def parse_optional_int(value: Any) -> Optional[int]:
         return None
 
 
-def tensor_entry(tensors: dict, node_name: Optional[str], label: str, hint: Optional[str]) -> Optional[dict]:
-    """Find a tensor entry in the tensors dict by various lookup strategies."""
-    if not tensors:
+def tensor_entry(tensors: list, hint: Optional[str]) -> Optional[dict]:
+    """Find a tensor entry by uid reference."""
+    tensor_uid = parse_optional_int(hint)
+    if tensor_uid is None or not isinstance(tensors, list):
         return None
-
-    def _from_key(key: Any) -> Optional[dict]:
-        if key is None:
-            return None
-        str_key = str(int(key)) if isinstance(key, (int, float)) else str(key)
-        return tensors.get(str_key)
-
-    def _from_uid(uid: Any) -> Optional[dict]:
-        try:
-            uid_int = int(uid) if uid is not None else None
-        except (TypeError, ValueError):
-            return None
-        for value in tensors.values():
-            if value.get("uid") == uid_int:
-                return value
-        return None
-
-    candidates = []
-    if hint:
-        candidates.append(hint)
-        candidates.append(str(hint))
-    if node_name:
-        candidates.append(f"{node_name}::{label}")
-        candidates.append(f"{node_name}::{label.lower()}")
-        candidates.append(f"{node_name}::{label.upper()}")
-    candidates.extend([label, label.lower(), label.upper()])
-    for key in candidates:
-        entry = _from_key(key)
-        if entry:
+    for entry in tensors:
+        if isinstance(entry, dict) and parse_optional_int(entry.get("uid")) == tensor_uid:
             return entry
-    direct_uid = _from_uid(hint)
-    if direct_uid:
-        return direct_uid
-    suffix = f"::{label}"
-    for key, value in tensors.items():
-        skey = str(key)
-        if skey.endswith(suffix) or skey == label:
-            return value
     return None
 
 
@@ -191,6 +165,32 @@ def bool_from_inputs(inputs: dict, target: str) -> Optional[bool]:
     return target in inputs
 
 
+def has_ragged_offset_inputs(inputs: dict) -> bool:
+    return any(name in inputs for name in RAGGED_OFFSET_INPUTS)
+
+
+def ragged_offset_entry(tensors: list, *entries: Optional[dict]) -> Optional[dict]:
+    for entry in entries:
+        if entry is None:
+            continue
+        tensor = tensor_entry(tensors, entry.get("ragged_offset_uid"))
+        if tensor is not None:
+            return tensor
+    return None
+
+
+def is_ragged_payload(inputs: dict, entries: tuple[Optional[dict], ...], payload: dict) -> bool:
+    if has_ragged_offset_inputs(inputs):
+        return True
+    if any(entry is not None and entry.get("ragged_offset_uid") is not None for entry in entries):
+        return True
+    repro_metadata = payload.get("repro_metadata", {})
+    if repro_metadata.get("ragged_offset_q") or repro_metadata.get("ragged_offset_kv"):
+        return True
+    ragged_tensor_names = set(repro_metadata.get("ragged_tensor_names", []))
+    return any(entry is not None and entry.get("name") in ragged_tensor_names for entry in entries)
+
+
 def infer_block_size(page_table_entry: Optional[dict], seq_len_kv: list[int], k_entry: Optional[dict]) -> Optional[int]:
     """Infer paged-attention block size from serialized tensors."""
     if page_table_entry is None or k_entry is None:
@@ -216,12 +216,11 @@ def is_mxfp8_payload(payload: dict, node: dict) -> bool:
     if node.get("is_mxfp8") is True:
         return True
 
-    tensors = payload.get("tensors", {})
-    node_name = node.get("name")
+    tensors = payload.get("tensors", [])
     for label, hint in node.get("inputs", {}).items():
         if not label.startswith(("Descale_", "Scale_")):
             continue
-        entry = tensor_entry(tensors, node_name, label, hint)
+        entry = tensor_entry(tensors, hint)
         if entry is None:
             continue
         data_type = (entry.get("data_type") or "").upper()
@@ -231,39 +230,9 @@ def is_mxfp8_payload(payload: dict, node: dict) -> bool:
     return False
 
 
-def parse_ragged_tensor_names(log_text: Optional[str]) -> list[str]:
-    """Extract tensor names that have ragged offsets enabled from FE log text."""
-    if not log_text:
-        return []
-
-    uid_to_name = {}
-    current_descriptor_uid = None
-    ragged_tensor_names = []
-
-    for line in log_text.splitlines():
-        match = re.search(r"Backend Tensor named '([^']+)' with UID (\d+)", line)
-        if match:
-            uid_to_name[int(match.group(2))] = match.group(1)
-            continue
-
-        match = re.search(r"Id:\s+(\d+)", line)
-        if match:
-            current_descriptor_uid = int(match.group(1))
-            continue
-
-        if current_descriptor_uid is not None and "raggedOffset: Enabled UID:" in line:
-            tensor_name = uid_to_name.get(current_descriptor_uid)
-            if tensor_name is not None:
-                ragged_tensor_names.append(tensor_name)
-
-    return ragged_tensor_names
-
-
 def add_ragged_tensor_names(payload: dict, log_text: Optional[str]) -> None:
-    ragged_uids = (entry.get("ragged_offset_uid") for entry in payload.get("tensors", {}).values())
-    has_ragged_uids = any(parse_optional_int(uid) is not None for uid in ragged_uids)
-    names = [] if payload.get("graph_uid") is not None or has_ragged_uids else parse_ragged_tensor_names(log_text)
-    payload["repro_metadata"]["ragged_tensor_names"] = names
+    del log_text
+    payload["repro_metadata"]["ragged_tensor_names"] = []
 
 
 def json_with_max_indent(value: Any, depth: int = 0, indent: int = 2, max_indent_level: int = 3) -> str:

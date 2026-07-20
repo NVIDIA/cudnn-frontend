@@ -78,25 +78,21 @@ class SliceNode : public NodeCRTP<SliceNode> {
     }
 
     error_t
-    create_cudnn_tensors_node(std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors,
-                              int64_t& potential_uid,
-                              std::unordered_set<int64_t> const& used_uids) const override final {
+    create_cudnn_tensors_node(
+        std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors) const override final {
         getLogger() << "[cudnn_frontend] INFO: Creating cudnn tensors for SliceNode " << attributes.name << std::endl;
 
         auto const input  = attributes.inputs.at(Slice_attributes::input_names::X);
         auto const output = attributes.outputs.at(Slice_attributes::output_names::Y);
 
         if (detail::get_backend_version() >= 92200 && detail::get_compiled_version() >= 92200) {
-            CHECK_CUDNN_FRONTEND_ERROR(detail::create_cudnn_tensor(input, tensors, potential_uid, used_uids));
-            CHECK_CUDNN_FRONTEND_ERROR(detail::create_cudnn_tensor(output, tensors, potential_uid, used_uids));
+            CHECK_CUDNN_FRONTEND_ERROR(detail::create_cudnn_tensor(input, tensors));
+            CHECK_CUDNN_FRONTEND_ERROR(detail::create_cudnn_tensor(output, tensors));
             return {error_code_t::OK, ""};
         }
 
-        if (input->has_uid() == false) {
-            detail::assign_uid(input.get(), potential_uid, used_uids);
-        }
         output->set_is_virtual(false);
-        CHECK_CUDNN_FRONTEND_ERROR(detail::create_cudnn_tensor(output, tensors, potential_uid, used_uids));
+        CHECK_CUDNN_FRONTEND_ERROR(detail::create_cudnn_tensor(output, tensors));
 
         return {error_code_t::OK, ""};
     }

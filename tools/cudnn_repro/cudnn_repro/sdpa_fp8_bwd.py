@@ -16,25 +16,25 @@ def _find_node(payload: dict) -> dict:
 
 def build_cfg(raw_line: str, payload: dict, seed: Optional[int] = None) -> dict:
     """Build FP8 backward test configuration from JSON payload."""
+    utils.validate_payload_version(payload)
     node = _find_node(payload)
     is_mxfp8 = utils.is_mxfp8_payload(payload, node)
 
-    tensors = payload.get("tensors", {})
-    node_name = node.get("name")
+    tensors = payload.get("tensors", [])
     inputs = node.get("inputs", {})
     outputs = node.get("outputs", {})
 
-    q_entry = utils.tensor_entry(tensors, node_name, "Q", inputs.get("Q"))
-    k_entry = utils.tensor_entry(tensors, node_name, "K", inputs.get("K"))
-    v_entry = utils.tensor_entry(tensors, node_name, "V", inputs.get("V"))
-    o_entry = utils.tensor_entry(tensors, node_name, "O", inputs.get("O"))
-    stats_entry = utils.tensor_entry(tensors, node_name, "Stats", inputs.get("Stats"))
-    dq_entry = utils.tensor_entry(tensors, node_name, "dQ", outputs.get("dQ"))
-    dk_entry = utils.tensor_entry(tensors, node_name, "dK", outputs.get("dK"))
-    dv_entry = utils.tensor_entry(tensors, node_name, "dV", outputs.get("dV"))
-    seq_q_entry = utils.tensor_entry(tensors, node_name, "SEQ_LEN_Q", inputs.get("SEQ_LEN_Q"))
-    seq_kv_entry = utils.tensor_entry(tensors, node_name, "SEQ_LEN_KV", inputs.get("SEQ_LEN_KV"))
-    page_table_k_entry = utils.tensor_entry(tensors, node_name, "Page_table_K", inputs.get("Page_table_K"))
+    q_entry = utils.tensor_entry(tensors, inputs.get("Q"))
+    k_entry = utils.tensor_entry(tensors, inputs.get("K"))
+    v_entry = utils.tensor_entry(tensors, inputs.get("V"))
+    o_entry = utils.tensor_entry(tensors, inputs.get("O"))
+    stats_entry = utils.tensor_entry(tensors, inputs.get("Stats"))
+    dq_entry = utils.tensor_entry(tensors, outputs.get("dQ"))
+    dk_entry = utils.tensor_entry(tensors, outputs.get("dK"))
+    dv_entry = utils.tensor_entry(tensors, outputs.get("dV"))
+    seq_q_entry = utils.tensor_entry(tensors, inputs.get("SEQ_LEN_Q"))
+    seq_kv_entry = utils.tensor_entry(tensors, inputs.get("SEQ_LEN_KV"))
+    page_table_k_entry = utils.tensor_entry(tensors, inputs.get("Page_table_K"))
 
     output_dtypes = {dtype for dtype in (utils.tensor_dtype(dq_entry), utils.tensor_dtype(dk_entry), utils.tensor_dtype(dv_entry)) if dtype is not None}
     if len(output_dtypes) > 1:
@@ -57,12 +57,7 @@ def build_cfg(raw_line: str, payload: dict, seed: Optional[int] = None) -> dict:
     seq_len_kv = utils.seq_len(seq_kv_entry)
 
     is_paged = any(label.startswith("Page_table_") or "PAGED_ATTENTION" in label for label in inputs)
-    repro_metadata = payload.get("repro_metadata", {})
-    ragged_tensor_names = set(repro_metadata.get("ragged_tensor_names", []))
-    is_ragged = any(
-        entry is not None and (utils.parse_optional_int(entry.get("ragged_offset_uid")) is not None or entry.get("name") in ragged_tensor_names)
-        for entry in (q_entry, k_entry, v_entry, o_entry, dq_entry, dk_entry, dv_entry)
-    )
+    is_ragged = utils.is_ragged_payload(inputs, (q_entry, k_entry, v_entry, o_entry, dq_entry, dk_entry, dv_entry), payload)
 
     batches = shape_q[0] if shape_q else None
     h_q = shape_q[1] if shape_q else None
@@ -89,7 +84,7 @@ def build_cfg(raw_line: str, payload: dict, seed: Optional[int] = None) -> dict:
     cfg["is_paged"] = is_paged
     cfg["is_bias"] = utils.bool_from_inputs(inputs, "BIAS")
     cfg["is_block_mask"] = utils.bool_from_inputs(inputs, "BLOCK_MASK")
-    cfg["is_padding"] = node.get("padding_mask") or bool(seq_len_q or seq_len_kv)
+    cfg["is_padding"] = is_ragged or node.get("padding_mask") or bool(seq_len_q or seq_len_kv)
     cfg["is_ragged"] = is_ragged
     cfg["is_dropout"] = dropout_prob > 0.0
     cfg["is_determin"] = bool(node.get("is_deterministic_algorithm", False))
@@ -146,14 +141,20 @@ def build_cfg(raw_line: str, payload: dict, seed: Optional[int] = None) -> dict:
 def extract_seq_and_ragged(payload: dict, seed: int) -> dict:
     """Extract sequence lengths and ragged offsets from an FP8 backward payload."""
     node = _find_node(payload)
-    tensors = payload.get("tensors", {})
-    node_name = node.get("name")
+    tensors = payload.get("tensors", [])
     inputs = node.get("inputs", {})
+    ragged_offset_q = inputs.get("RAGGED_OFFSET_Q") or inputs.get("RAGGED_OFFSETS_Q")
+    ragged_offset_kv = inputs.get("RAGGED_OFFSET_KV") or inputs.get("RAGGED_OFFSETS_KV")
+    q_entry = utils.tensor_entry(tensors, inputs.get("Q"))
+    k_entry = utils.tensor_entry(tensors, inputs.get("K"))
+    v_entry = utils.tensor_entry(tensors, inputs.get("V"))
+    ragged_q_entry = utils.tensor_entry(tensors, ragged_offset_q) or utils.ragged_offset_entry(tensors, q_entry)
+    ragged_kv_entry = utils.tensor_entry(tensors, ragged_offset_kv) or utils.ragged_offset_entry(tensors, k_entry, v_entry)
     return {
-        "seq_len_q": utils.seq_len(utils.tensor_entry(tensors, node_name, "SEQ_LEN_Q", inputs.get("SEQ_LEN_Q"))),
-        "seq_len_kv": utils.seq_len(utils.tensor_entry(tensors, node_name, "SEQ_LEN_KV", inputs.get("SEQ_LEN_KV"))),
-        "ragged_offset_q": utils.seq_len(utils.tensor_entry(tensors, node_name, "RAGGED_OFFSET_Q", inputs.get("RAGGED_OFFSET_Q"))),
-        "ragged_offset_kv": utils.seq_len(utils.tensor_entry(tensors, node_name, "RAGGED_OFFSET_KV", inputs.get("RAGGED_OFFSET_KV"))),
+        "seq_len_q": utils.seq_len(utils.tensor_entry(tensors, inputs.get("SEQ_LEN_Q"))),
+        "seq_len_kv": utils.seq_len(utils.tensor_entry(tensors, inputs.get("SEQ_LEN_KV"))),
+        "ragged_offset_q": utils.seq_len(ragged_q_entry),
+        "ragged_offset_kv": utils.seq_len(ragged_kv_entry),
         "rng_data_seed": seed,
     }
 

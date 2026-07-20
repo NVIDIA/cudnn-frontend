@@ -123,8 +123,7 @@ class Tensor_attributes {
     std::optional<pass_by_values_t> compile_time_constant_value = std::nullopt;
 
     TensorReordering_t reordering_type = TensorReordering_t::NONE;
-    uid_t uid                          = 0;
-    bool uid_assigned                  = false;
+    std::optional<uid_t> uid           = std::nullopt;
 
     std::shared_ptr<Tensor_attributes> ragged_offset;
     int64_t ragged_offset_multiplier = 1;
@@ -440,25 +439,23 @@ class Tensor_attributes {
 
     uid_t
     get_uid() const {
-        return uid;
+        return uid.value_or(0);
     }
 
-    uid_t
+    bool
     has_uid() const {
-        return uid_assigned;
+        return uid.has_value();
     }
 
     auto
     clear_uid(void) -> Tensor_attributes& {
-        uid          = 0;
-        uid_assigned = false;
+        uid = std::nullopt;
         return *this;
     }
 
     auto
     set_uid(uid_t value) -> Tensor_attributes& {
-        uid          = value;
-        uid_assigned = true;
+        uid = value;
         return *this;
     }
 
@@ -549,6 +546,32 @@ class Attributes {
     }
 
    public:
+    void
+    fill_tensors(std::vector<std::shared_ptr<Tensor_attributes>>& tensors) const {
+        auto derived = static_cast<DerivedT const*>(this);
+
+        if constexpr (std::is_same_v<DerivedT, Concatenate_attributes>) {
+            for (auto& tensor : derived->inputs) {
+                tensors.push_back(tensor);
+            }
+        } else {
+            for (auto& [name, tensor] : derived->inputs) {
+                (void)name;
+                tensors.push_back(tensor);
+            }
+        }
+        for (auto& [name, tensor] : derived->outputs) {
+            (void)name;
+            tensors.push_back(tensor);
+        }
+        if constexpr (std::is_same_v<DerivedT, Batchnorm_attributes> ||
+                      std::is_same_v<DerivedT, Batchnorm_backward_attributes>) {
+            for (auto& tensor : derived->peer_stats) {
+                tensors.push_back(tensor);
+            }
+        }
+    }
+
     error_t
     fill_pass_by_value(std::unordered_map<Tensor_attributes::uid_t, Tensor_attributes::pass_by_values_t>&
                            tensor_to_pass_by_value) const {
