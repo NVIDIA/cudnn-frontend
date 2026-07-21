@@ -5,6 +5,8 @@ _SYMBOLS = {
     "sparse_attention_backward_wrapper": (".sparse_attention_backward", "sparse_attention_backward_wrapper"),
     "IndexerForward": (".indexer_forward", "IndexerForward"),
     "indexer_forward_wrapper": (".indexer_forward", "indexer_forward_wrapper"),
+    "IndexerForwardLean": (".indexer_forward", "IndexerForwardLean"),
+    "indexer_forward_lean_wrapper": (".indexer_forward", "indexer_forward_lean_wrapper"),
     "IndexerTopK": (".indexer_top_k", "IndexerTopK"),
     "indexer_top_k_wrapper": (".indexer_top_k", "indexer_top_k_wrapper"),
     "local_to_global_wrapper": (".indexer_top_k", "local_to_global_wrapper"),
