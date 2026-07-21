@@ -4,7 +4,10 @@
 
 ## Overview
 
-**Unified Grouped GEMM + GLU fusion**: A block-scaled grouped GEMM fused with a GLU epilogue (SwiGLU or GeGLU) on NVIDIA Blackwell GPUs (SM100+), designed for MoE (Mixture of Experts) workloads. Implemented with CUTLASS/CUTE.
+**Unified Grouped GEMM + GLU fusion**: one public class and wrapper select a
+plain BF16 or legacy block-scaled grouped GEMM fused with a GLU epilogue
+(SwiGLU or GeGLU) on NVIDIA Blackwell GPUs (SM100+). The operation is
+implemented with CUTLASS/CuTe DSL.
 
 This is a **unified API** that supports both weight layout modes:
 - **Dense mode**: All expert weights packed into a single contiguous `(N, K, L)` tensor
@@ -16,7 +19,71 @@ And both activation functions:
 
 Groups are contiguous in the M dimension and described by `padded_offsets` (cumulative aligned end offsets).
 
-This kernel performs:
+### Backend dispatch
+
+| Operand contract | Selected backend |
+| --- | --- |
+| `A` and `B` are BF16 | BF16 |
+| matching supported FP4/FP8 `A` and `B` plus scale descriptors | block-scaled |
+
+Mixed families and unsupported pairs are rejected before allocation or
+compilation. Each backend's argument contract is described below.
+
+## BF16 contract
+
+Pass `sfa_tensor=None`, `sfb_tensor=None` (or `sfb_ptrs=None`), and
+`norm_const_tensor=None`; keep `sf_vec_size=16` and `discrete_col_sfd=False`.
+Non-`None` scale controls are an error.
+
+### Tensors, layouts, and equation
+
+For padded rows `M`, reduction dimension `K`, pre-GLU width `N`, and `L`
+experts, BF16 uses:
+
+- `A`: `(M, K, 1)`, stride `(K, 1, M*K)`, BF16;
+- dense `B`: `(N, K, L)`, K-major stride `(K, 1, N*K)`, BF16;
+- discrete `b_ptrs`: contiguous CUDA int64 pointers to expert `(N, K)` BF16
+  matrices, with `n=N`, `b_dtype=torch.bfloat16`, and `b_major="k"` or `"n"`;
+- `padded_offsets`: `(L,)`, stride `(1,)`, int32 cumulative 256-aligned ends;
+- `alpha`: `(L,)`, FP32; `prob`: `(M, 1, 1)`, stride `(1, 1, 1)`, FP32;
+- optional bias: `(N, L)`, stride `(1, N)`, BF16/FP16/FP32;
+- `C`: `(M, N, 1)`, stride `(N, 1, M*N)`;
+- `D`: `(M, N/2, 1)`, stride `(N/2, 1, M*N/2)`.
+
+For expert `g`, first compute
+
+$$
+C_g = \alpha_g A_g B_g^T + \mathrm{bias}_g.
+$$
+
+Columns are paired as alternating 32-wide gate/up blocks. For SwiGLU,
+
+$$
+D_g = \mathrm{prob}_g \cdot \mathrm{up}(C_g) \cdot
+      \mathrm{silu}(\mathrm{gate}(C_g)).
+$$
+
+For GeGLU, let `gate = min(gate(C), 7)`,
+`up = clamp(up(C), -7, 7)`, `geglu_alpha=1.702`, and the default
+`linear_offset=1`:
+
+$$
+D_g = \mathrm{prob}_g \cdot (\mathrm{up}+\mathrm{linear\_offset})
+      \cdot \mathrm{gate} \cdot \sigma(1.702\,\mathrm{gate}).
+$$
+
+`C`/`D` may be BF16, FP16, or FP32. `N` is divisible by 64. The pointer-array
+tensor is stream-recorded; every pointed allocation must remain alive and
+unchanged until the launch stream completes.
+
+The wrapper return order is exactly `c_tensor`, `d_tensor`, `d_col_tensor`,
+`amax_tensor`, `sfd_row_tensor`, `sfd_col_tensor`. On BF16,
+`d_col_tensor`, `amax_tensor`, `sfd_row_tensor`, and `sfd_col_tensor` are
+always `None`; `c_tensor` is `None` unless `generate_c=True`.
+
+## Block-scaled contract
+
+The block-scaled backend performs:
 1. **Block-scaled grouped GEMM**: Low-precision GEMM (FP4, FP8) with per-block scale factors across multiple expert groups
 2. **GLU activation**: Fused SwiGLU or GeGLU activation applied to the GEMM output
 3. **Optional quantized output**: Produces row and column scale factors for downstream quantization
@@ -113,9 +180,81 @@ $$
 
 ---
 
-## API Usage
+## API usage
 
-### High-level Wrapper
+### BF16
+
+#### High-level wrapper
+
+```python
+import cudnn
+import torch
+
+# Dense wrapper. The required scale positions are explicitly None for BF16.
+out = cudnn.grouped_gemm_glu_wrapper_sm100(
+    a_tensor=a,
+    sfa_tensor=None,
+    padded_offsets=padded_offsets,
+    alpha_tensor=alpha,
+    b_tensor=b,
+    sfb_tensor=None,
+    bias_tensor=bias,
+    prob_tensor=prob,
+    act_func="swiglu",
+    generate_c=True,
+    use_dynamic_sched=True,
+)
+c, d, d_col, amax, sfd_row, sfd_col = out
+
+# Discrete wrapper.
+out = cudnn.grouped_gemm_glu_wrapper_sm100(
+    a_tensor=a,
+    sfa_tensor=None,
+    padded_offsets=padded_offsets,
+    alpha_tensor=alpha,
+    b_ptrs=b_ptrs,
+    sfb_ptrs=None,
+    n=N,
+    b_dtype=torch.bfloat16,
+    prob_tensor=prob,
+    act_func="geglu",
+)
+```
+
+#### Class API
+
+```python
+op = cudnn.GroupedGemmGluSm100(
+    sample_a=a,
+    sample_c=c,
+    sample_d=d,
+    sample_d_col=None,
+    sample_sfa=None,
+    sample_padded_offsets=padded_offsets,
+    sample_alpha=alpha,
+    sample_b=b,
+    sample_sfb=None,
+    sample_prob=prob,
+    act_func="swiglu",
+    generate_c=True,
+)
+assert op.check_support()
+op.compile()
+op.execute(
+    a_tensor=a, c_tensor=c, d_tensor=d, sfa_tensor=None,
+    padded_offsets=padded_offsets, alpha_tensor=alpha,
+    b_tensor=b, sfb_tensor=None, prob_tensor=prob,
+)
+```
+
+`use_dynamic_sched=False` uses static scheduling; `True` caches a dynamic-M
+callable for compatible shapes. Cache keys include compile-sensitive layouts,
+dtypes, features, activation, scheduler, tile/cluster, output policy, and
+overlap margin, but not the runtime GeGLU `linear_offset`.
+
+### Block-scaled
+
+#### High-level wrapper
 
 **Dense mode:**
 
@@ -187,7 +326,7 @@ outputs = grouped_gemm_glu_wrapper_sm100(
 
 `bias_tensor` must use the kernel layout expected by the fused bias path: shape `(N, L)` and stride `(1, N)`.
 
-### Class API
+#### Class API
 
 **Dense mode:**
 

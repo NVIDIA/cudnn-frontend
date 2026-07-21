@@ -7,6 +7,7 @@ and discrete weight modes, with dSwiGLU and dGeGLU activations.
 
 import torch
 import pytest
+import cudnn
 from test_utils import torch_fork_set_rng
 from fe_api.test_fe_api_utils import DYNAMIC_SHAPES_M_VALUES
 from fe_api.grouped_gemm.test_grouped_gemm_swiglu_utils import (
@@ -26,6 +27,11 @@ from fe_api.grouped_gemm.test_discrete_grouped_gemm_dswiglu_utils import (
     allocate_discrete_dswiglu_input_tensors,
     allocate_discrete_dswiglu_output_tensors,
     check_ref_discrete_dswiglu,
+)
+from test_grouped_gemm_dglu_bf16_utils import (
+    assert_grouped_gemm_dglu_close as assert_grouped_gemm_dglu_bf16_close,
+    grouped_gemm_dglu_bf16_reference,
+    make_grouped_gemm_dglu_bf16_problem,
 )
 
 with_scheduler_modes = pytest.mark.parametrize(
@@ -67,6 +73,40 @@ def _apply_grouped_gemm_cfg_overrides(cfg, cfg_overrides=None):
 # ---------------------------------------------------------------------------
 #  Dense mode: Class API
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    ("discrete", "b_major"),
+    [(False, "k"), (True, "k"), (True, "n")],
+    ids=["bf16-dense", "bf16-discrete-k-major", "bf16-discrete-n-major"],
+)
+def test_grouped_gemm_dglu_wrapper_bf16(discrete, b_major):
+    problem = make_grouped_gemm_dglu_bf16_problem(discrete=discrete, b_major=b_major)
+    expected_d, expected_dprob, _ = grouped_gemm_dglu_bf16_reference(
+        problem,
+        act_func="dswiglu",
+        linear_offset=0.0,
+        generate_dbias=False,
+    )
+    kwargs = dict(
+        a_tensor=problem["a"],
+        c_tensor=problem["c"],
+        sfa_tensor=None,
+        padded_offsets=problem["offsets"],
+        alpha_tensor=problem["alpha"],
+        beta_tensor=problem["beta"],
+        prob_tensor=problem["prob"],
+        dprob_tensor=problem["dprob"],
+        d_dtype=torch.bfloat16,
+    )
+    if discrete:
+        kwargs.update(b_ptrs=problem["b_ptrs"], n=problem["n"], b_dtype=torch.bfloat16, b_major=b_major)
+    else:
+        kwargs.update(b_tensor=problem["b"], sfb_tensor=None)
+    result = cudnn.grouped_gemm_dglu_wrapper_sm100(**kwargs)
+    assert_grouped_gemm_dglu_bf16_close(result["d_row_tensor"], expected_d)
+    assert_grouped_gemm_dglu_bf16_close(result["dprob_tensor"], expected_dprob)
 
 
 @pytest.mark.L0

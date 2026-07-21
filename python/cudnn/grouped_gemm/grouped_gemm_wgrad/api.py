@@ -5,42 +5,75 @@
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
-import logging
+from typing import Any, Optional, Tuple, overload
+import os
 
 import torch
-import cutlass
-import cutlass.cute as cute
 from cuda.bindings import driver as cuda
-from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
-from cudnn.api_base import APIBase, TensorDesc, TupleDict, ceil_div, is_power_of_2
-from cudnn.datatypes import _convert_to_cutlass_data_type
+from cudnn.api_base import APIBase, TupleDict
 from cudnn.discrete_grouped_gemm.discrete_kernel_utils import _require_pointer_tensor
 
-from .moe_blockscaled_grouped_gemm_wgrad import BlockScaledMoEGroupedGemmWgradKernel
-from ..moe_utils import MoEWeightMode, WGradInputOrder
+from ..grouped_gemm_utils import (
+    GroupedGemmBackend,
+    _torch_stream_context,
+    backend_cache_key,
+    select_grouped_gemm_backend,
+)
+from ..moe_utils import WGradInputOrder
+
+_BLOCK_SCALED_DTYPE_PAIRS = {
+    (dtype, dtype)
+    for dtype in (
+        torch.float4_e2m1fn_x2,
+        torch.uint8,
+        torch.float8_e5m2,
+        torch.float8_e4m3fn,
+    )
+}
+
+_cache_of_GroupedGemmWgradSm100Objects = {}
 
 
-def _round_up(a: int, b: int) -> int:
-    return ceil_div(a, b) * b
-
-
-def _normalize_input_order(input_order: WGradInputOrder | str) -> WGradInputOrder:
-    if isinstance(input_order, WGradInputOrder):
-        return input_order
-    return WGradInputOrder(input_order)
+from ._bf16_api import GroupedGemmWgradBf16API
+from ._blockscaled_api import GroupedGemmWgradBlockScaledAPI
 
 
 class GroupedGemmWgradSm100(APIBase):
-    """Unified grouped GEMM wgrad FE API for SM100+ GPUs."""
+    """Stable public facade that selects the WGrad backend during support checking."""
 
+    # BF16 implementation
+    @overload
+    def __init__(
+        self,
+        sample_a: torch.Tensor,
+        sample_b: torch.Tensor,
+        sample_sfa: None,
+        sample_sfb: None,
+        sample_offsets: torch.Tensor,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None: ...
+
+    # Block-scaled implementation
+    @overload
     def __init__(
         self,
         sample_a: torch.Tensor,
         sample_b: torch.Tensor,
         sample_sfa: torch.Tensor,
         sample_sfb: torch.Tensor,
+        sample_offsets: torch.Tensor,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None: ...
+
+    def __init__(
+        self,
+        sample_a: torch.Tensor,
+        sample_b: torch.Tensor,
+        sample_sfa: Optional[torch.Tensor],
+        sample_sfb: Optional[torch.Tensor],
         sample_offsets: torch.Tensor,
         sample_wgrad: Optional[torch.Tensor] = None,
         sample_wgrad_expert: Optional[torch.Tensor] = None,
@@ -55,442 +88,82 @@ class GroupedGemmWgradSm100(APIBase):
         sf_vec_size: int = 16,
         accumulate_on_output: bool = False,
         input_order: WGradInputOrder | str = WGradInputOrder.Tensor2D,
-    ):
+    ) -> None:
         super().__init__()
-        self._warn_experimental_api()
-        self.input_order = _normalize_input_order(input_order)
-
-        if sample_wgrad is not None and num_experts is None:
-            self.weight_mode = MoEWeightMode.DENSE
-        elif sample_wgrad is None and num_experts is not None:
-            self.weight_mode = MoEWeightMode.DISCRETE
-            if wgrad_shape is None or wgrad_dtype is None:
-                raise ValueError("wgrad_shape and wgrad_dtype are required in discrete mode")
-        else:
-            raise ValueError("Provide either sample_wgrad for dense mode or " "(num_experts, wgrad_shape, wgrad_dtype) for discrete mode, but not both")
-
-        self._interpret_uint8_as_fp4x2 = True
-        self.sample_a_tensor = sample_a if self._is_fp4x2(sample_a) else None
-        self.sample_b_tensor = sample_b if self._is_fp4x2(sample_b) else None
-        self.a_desc = self._make_tensor_desc(sample_a, name="sample_a")
-        self.b_desc = self._make_tensor_desc(sample_b, name="sample_b")
-        self.sfa_desc = self._make_tensor_desc(sample_sfa, name="sample_sfa")
-        self.sfb_desc = self._make_tensor_desc(sample_sfb, name="sample_sfb")
-        self.offsets_desc = self._make_tensor_desc(sample_offsets, name="sample_offsets")
-        self.global_scale_a_desc = self._make_tensor_desc(sample_global_scale_a, name="sample_global_scale_a")
-        self.global_scale_b_desc = self._make_tensor_desc(sample_global_scale_b, name="sample_global_scale_b")
-        self.sf_vec_size = sf_vec_size
-        tokens_sum_a = self.a_desc.shape[1]
-        tokens_sum_b = self.b_desc.shape[0]
-        self._value_error_if(
-            tokens_sum_a != tokens_sum_b,
-            f"sample_a and sample_b token dimensions must match, got {tokens_sum_a} and {tokens_sum_b}",
-        )
-        self._offset_values = self._validate_offsets(sample_offsets, tokens_sum_a, name="sample_offsets")
-        self._scale_cols = _round_up(ceil_div(tokens_sum_a, self.sf_vec_size), 4)
-
-        if self.weight_mode == MoEWeightMode.DENSE:
-            self.wgrad_desc = self._make_tensor_desc(sample_wgrad, name="sample_wgrad")
-            self.expert_cnt = self.wgrad_desc.shape[0]
-            self.wgrad_shape = self.wgrad_desc.shape[1:]
-            self.wgrad_dtype = self.wgrad_desc.dtype
-            self.single_expert_wgrad_desc = TensorDesc(
-                dtype=self.wgrad_desc.dtype,
-                shape=self.wgrad_desc.shape[1:],
-                stride=self.wgrad_desc.stride[1:],
-                stride_order=tuple(i for i, s in sorted(enumerate(self.wgrad_desc.stride[1:]), key=lambda x: x[1])),
-                device=self.wgrad_desc.device,
-                name="single_expert_wgrad",
-            )
-        else:  # MoEWeightMode.DISCRETE
-            self.expert_cnt = num_experts
-            self.wgrad_shape = tuple(wgrad_shape)
-            self.wgrad_dtype = wgrad_dtype
-            self.wgrad_desc = None
-            if sample_wgrad_expert is not None:
-                self.single_expert_wgrad_desc = self._make_tensor_desc(
-                    sample_wgrad_expert,
-                    name="sample_wgrad_expert",
-                )
-            else:
-                self.single_expert_wgrad_desc = TensorDesc(
-                    dtype=wgrad_dtype,
-                    shape=self.wgrad_shape,
-                    stride=(self.wgrad_shape[1], 1),
-                    stride_order=(1, 0),
-                    device=self.a_desc.device,
-                    name="single_expert_wgrad",
-                )
-
-        self.acc_dtype = acc_dtype
-        self.mma_tiler_mn = mma_tiler_mn
-        self.use_2cta_instrs = mma_tiler_mn[0] == 256
-        self.cluster_shape_mn = cluster_shape_mn or ((2, 1) if self.use_2cta_instrs else (1, 1))
-        self.accumulate_on_output = accumulate_on_output
-        self._kernel = BlockScaledMoEGroupedGemmWgradKernel
-        self._workspace = None
-
-    def _validate_offsets(self, offsets_tensor: torch.Tensor, tokens_sum: int, name: str) -> Tuple[int, ...]:
-        self._value_error_if(offsets_tensor.ndim != 1, f"{name} must be rank-1, got shape {tuple(offsets_tensor.shape)}")
-
-        offset_values = tuple(int(offset) for offset in offsets_tensor.detach().cpu().tolist())
-        prev_offset = 0
-        for idx, offset in enumerate(offset_values):
-            self._value_error_if(
-                offset < prev_offset,
-                f"{name} must be a non-decreasing cumulative sum, but index {idx} has {offset} after {prev_offset}",
-            )
-            prev_offset = offset
-
-        if offset_values:
-            self._value_error_if(
-                offset_values[-1] > tokens_sum,
-                f"{name} last value must not exceed total tokens {tokens_sum}, got {offset_values[-1]}",
-            )
-        else:
-            self._value_error_if(tokens_sum != 0, f"{name} cannot be empty when total tokens is {tokens_sum}")
-
-        return offset_values
+        self._pending_init_kwargs = dict(locals())
+        self._pending_init_kwargs.pop("self")
+        self._pending_init_kwargs.pop("__class__", None)
+        self._implementation = None
 
     def check_support(self) -> bool:
-        m, tokens_sum = self._tensor_shape(self.a_desc, name="sample_a")
-        _, n = self._tensor_shape(self.b_desc, name="sample_b")
-
-        _ = self._check_tensor_shape(self.a_desc, (m, tokens_sum), "sample_a")
-        _ = self._check_tensor_shape(self.b_desc, (tokens_sum, n), "sample_b")
-        _ = self._check_tensor_shape(self.sfa_desc, (_round_up(m, 128), self._scale_cols), "sample_sfa")
-        _ = self._check_tensor_shape(self.sfb_desc, (_round_up(n, 128), self._scale_cols), "sample_sfb")
-        _ = self._check_tensor_shape(self.offsets_desc, (self.expert_cnt,), "sample_offsets")
-
-        dtype = self._check_dtype(
-            self.a_desc, [torch.float4_e2m1fn_x2, torch.uint8, torch.float8_e5m2, torch.float8_e4m3fn, torch.bfloat16], "sample_a"
-        )  # TODO @mingyangw: check if bfloat16 is supported
-        self._check_dtype(self.b_desc, dtype, "sample_b", extra_error_msg="sample_b must have the same dtype as sample_a")
-        self._check_dtype(
-            self.sfa_desc,
-            [torch.float8_e8m0fnu, torch.float8_e4m3fn],
-            "sample_sfa",
-            extra_error_msg="sample_sfa must have dtype float8_e8m0fnu or float8_e4m3fn",
-        )
-        self._check_dtype(
-            self.sfb_desc,
-            [torch.float8_e8m0fnu, torch.float8_e4m3fn],
-            "sample_sfb",
-            extra_error_msg="sample_sfb must have dtype float8_e8m0fnu or float8_e4m3fn",
-        )
-        self._check_dtype(self.offsets_desc, torch.int32, "sample_offsets", extra_error_msg="sample_offsets must be int32")
-        self._check_dtype(
-            self.wgrad_dtype, [torch.bfloat16, torch.float16, torch.float32], "wgrad_dtype", extra_error_msg="wgrad_dtype must be bfloat16, float16, or float32"
-        )
-
-        if self.weight_mode == MoEWeightMode.DENSE:
-            self._check_tensor_shape(self.wgrad_desc, (self.expert_cnt, m, n), "sample_wgrad")
-        else:
-            self._check_tensor_shape(self.wgrad_shape, (m, n), "wgrad_shape")
-            self._check_tensor_shape(self.single_expert_wgrad_desc, (m, n), "single_expert_wgrad")
-            self._check_dtype(
-                self.single_expert_wgrad_desc,
-                self.wgrad_dtype,
-                "sample_wgrad_expert",
-                extra_error_msg="sample_wgrad_expert must have the same dtype as wgrad_dtype",
+        if self._implementation is None:
+            kwargs = self._pending_init_kwargs
+            backend = select_grouped_gemm_backend(
+                operation="grouped_gemm_wgrad_sm100",
+                a_dtype=kwargs["sample_a"].dtype,
+                b_dtype=kwargs["sample_b"].dtype,
+                scale_controls=(
+                    ("sample_sfa", kwargs["sample_sfa"]),
+                    ("sample_sfb", kwargs["sample_sfb"]),
+                    ("sample_global_scale_a", kwargs["sample_global_scale_a"]),
+                    ("sample_global_scale_b", kwargs["sample_global_scale_b"]),
+                    ("sf_vec_size", kwargs["sf_vec_size"] if kwargs["sf_vec_size"] != 16 else None),
+                ),
+                block_scaled_dtype_pairs=_BLOCK_SCALED_DTYPE_PAIRS,
             )
-
-        self._value_error_if(self.mma_tiler_mn[0] not in (128, 256), f"mma_tiler_mn[0] must be 128 or 256, got {self.mma_tiler_mn[0]}")
-        self._value_error_if(self.mma_tiler_mn[1] not in (128, 256), f"mma_tiler_mn[1] must be 128 or 256, got {self.mma_tiler_mn[1]}")
-        self._value_error_if(
-            self.cluster_shape_mn[0] % (2 if self.use_2cta_instrs else 1) != 0,
-            f"cluster_shape_mn[0] must be divisible by 2 when use_2cta_instrs=True, got {self.cluster_shape_mn[0]}",
-        )
-        self._value_error_if(self.cluster_shape_mn[0] * self.cluster_shape_mn[1] > 16, f"cluster shape product must be <= 16, got {self.cluster_shape_mn}")
-        self._value_error_if(
-            not (is_power_of_2(self.cluster_shape_mn[0]) and is_power_of_2(self.cluster_shape_mn[1])),
-            f"cluster shape values must be powers of 2, got {self.cluster_shape_mn}",
-        )
-
-        has_global_scale = self.global_scale_a_desc is not None or self.global_scale_b_desc is not None
-        if has_global_scale:
-            self._value_error_if(
-                self.global_scale_a_desc is None or self.global_scale_b_desc is None,
-                "sample_global_scale_a and sample_global_scale_b must be provided together",
-            )
-            self._value_error_if(
-                self.global_scale_a_desc.shape != (self.expert_cnt,),
-                f"sample_global_scale_a must have shape {(self.expert_cnt,)}, got {self.global_scale_a_desc.shape}",
-            )
-            self._value_error_if(
-                self.global_scale_b_desc.shape != (self.expert_cnt,),
-                f"sample_global_scale_b must have shape {(self.expert_cnt,)}, got {self.global_scale_b_desc.shape}",
-            )
-            self._check_dtype(self.global_scale_a_desc, torch.float32, "sample_global_scale_a")
-            self._check_dtype(self.global_scale_b_desc, torch.float32, "sample_global_scale_b")
-
-        requires_global_scale = (
-            self._is_fp4x2(self.a_desc) and self.sf_vec_size == 16 and self.sfa_desc.dtype == torch.float8_e4m3fn and self.sfb_desc.dtype == torch.float8_e4m3fn
-        )
-        self._value_error_if(requires_global_scale and not has_global_scale, "NVFP4 wgrad requires sample_global_scale_a and sample_global_scale_b")
-
-        if not torch.cuda.is_available():
-            raise RuntimeError("CUDA is not available")
-        device = torch.cuda.current_device()
-        major, minor = torch.cuda.get_device_capability(device)
-        compute_capability = major * 10 + minor
-        if compute_capability < 100:
-            raise RuntimeError(f"GroupedGemmWgrad requires SM100+ compute capability, but found SM{compute_capability} on device {device}")
-
-        self._is_supported = True
-        return True
+            self.backend = backend
+            if backend is GroupedGemmBackend.BF16:
+                self._implementation = GroupedGemmWgradBf16API(**kwargs)
+            else:
+                self._implementation = GroupedGemmWgradBlockScaledAPI(**kwargs)
+            self._kernel = self._implementation._kernel
+            self.weight_mode = self._implementation.weight_mode
+        supported = self._implementation.check_support()
+        self._is_supported = self._implementation._is_supported
+        if supported:
+            self._pending_init_kwargs = None
+        return supported
 
     def compile(self) -> None:
-        self._ensure_support_checked()
-        if self._compiled_kernel is not None:
-            return
+        if self._implementation is None:
+            self.check_support()
+        if self._is_supported:
+            self._implementation._is_supported = True
+        self._implementation.compile()
+        self._is_supported = self._implementation._is_supported
+        self._compiled_kernel = self._implementation._compiled_kernel
 
-        kernel = self._kernel(
-            sf_vec_size=self.sf_vec_size,
-            acc_dtype=_convert_to_cutlass_data_type(self.acc_dtype),
-            use_2cta_instrs=self.use_2cta_instrs,
-            mma_tiler_mn=self.mma_tiler_mn,
-            cluster_shape_mn=self.cluster_shape_mn,
-            accumulate_on_output=self.accumulate_on_output,
-            expert_cnt=self.expert_cnt,
-            weight_mode=self.weight_mode,
-            input_order=self.input_order,
-        )
+    # BF16 implementation
+    @overload
+    def execute(
+        self,
+        a_tensor: torch.Tensor,
+        b_tensor: torch.Tensor,
+        sfa_tensor: None,
+        sfb_tensor: None,
+        offsets_tensor: torch.Tensor,
+        wgrad_tensor: Optional[torch.Tensor] = None,
+        wgrad_ptrs: Optional[torch.Tensor] = None,
+        *,
+        global_scale_a: None = None,
+        global_scale_b: None = None,
+    ) -> None: ...
 
-        hardware_info = cutlass.utils.HardwareInfo()
-        max_active_clusters = hardware_info.get_max_active_clusters(self.cluster_shape_mn[0] * self.cluster_shape_mn[1])
-        self._workspace = torch.empty(max(kernel.get_workspace_bytes(), 1), dtype=torch.uint8, device=self.a_desc.device)
-        fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
-
-        if self.weight_mode == MoEWeightMode.DENSE:
-            self._compile_dense(kernel, max_active_clusters, fake_stream)
-        else:
-            self._compile_discrete(kernel, max_active_clusters, fake_stream)
-
-        if self.sample_a_tensor is not None:
-            del self.sample_a_tensor
-        if self.sample_b_tensor is not None:
-            del self.sample_b_tensor
-
-    def _compile_dense(self, kernel, max_active_clusters, fake_stream) -> None:
-        a_fake = (
-            from_dlpack(self.sample_a_tensor, assumed_align=16, enable_tvm_ffi=True).mark_compact_shape_dynamic(
-                mode=1,
-                stride_order=self.sample_a_tensor.dim_order(),
-                divisibility=16,
-            )
-            if self.sample_a_tensor is not None
-            else self._make_fake_cute_compact_tensor(
-                dtype=self.a_desc.dtype,
-                shape=self.a_desc.shape,
-                stride_order=self.a_desc.stride_order,
-                assumed_align=16,
-                dynamic_mode=1,
-                divisibility=16,
-            )
-        )
-        b_fake = (
-            from_dlpack(self.sample_b_tensor, assumed_align=16, enable_tvm_ffi=True).mark_compact_shape_dynamic(
-                mode=0,
-                stride_order=self.sample_b_tensor.dim_order(),
-                divisibility=16,
-            )
-            if self.sample_b_tensor is not None
-            else self._make_fake_cute_compact_tensor(
-                dtype=self.b_desc.dtype,
-                shape=self.b_desc.shape,
-                stride_order=self.b_desc.stride_order,
-                assumed_align=16,
-                dynamic_mode=0,
-                divisibility=16,
-            )
-        )
-        sfa_fake = self._make_fake_cute_compact_tensor(
-            dtype=self.sfa_desc.dtype,
-            shape=self.sfa_desc.shape,
-            stride_order=self.sfa_desc.stride_order,
-            assumed_align=16,
-            dynamic_mode=1,
-            divisibility=4,
-        )
-        sfb_fake = self._make_fake_cute_compact_tensor(
-            dtype=self.sfb_desc.dtype,
-            shape=self.sfb_desc.shape,
-            stride_order=self.sfb_desc.stride_order,
-            assumed_align=16,
-            dynamic_mode=1,
-            divisibility=4,
-        )
-        wgrad_fake = self._make_fake_cute_tensor_from_desc(self.wgrad_desc, assumed_align=16)
-        offsets_fake = self._make_fake_cute_tensor_from_desc(self.offsets_desc, assumed_align=4)
-        workspace_fake = from_dlpack(self._workspace, assumed_align=128, enable_tvm_ffi=True)
-        gs_a_fake = self._make_fake_cute_tensor_from_desc(self.global_scale_a_desc, assumed_align=4)
-        gs_b_fake = self._make_fake_cute_tensor_from_desc(self.global_scale_b_desc, assumed_align=4)
-
-        compiled = cute.compile(
-            kernel,
-            a_fake,
-            b_fake,
-            sfa_fake,
-            sfb_fake,
-            wgrad_fake,
-            offsets_fake,
-            workspace_fake,
-            max_active_clusters,
-            fake_stream,
-            gs_a_fake,
-            gs_b_fake,
-            None,
-            options="--enable-tvm-ffi",
-        )
-
-        cached_workspace = from_dlpack(self._workspace, assumed_align=128, enable_tvm_ffi=True)
-
-        def tensor_api(
-            a_tensor: torch.Tensor,
-            b_tensor: torch.Tensor,
-            sfa_tensor: torch.Tensor,
-            sfb_tensor: torch.Tensor,
-            wgrad_tensor: torch.Tensor,
-            offsets_tensor: torch.Tensor,
-            stream: cuda.CUstream,
-            global_scale_a: Optional[torch.Tensor],
-            global_scale_b: Optional[torch.Tensor],
-        ) -> None:
-            compiled(
-                a_tensor,
-                b_tensor,
-                sfa_tensor,
-                sfb_tensor,
-                wgrad_tensor,
-                offsets_tensor,
-                cached_workspace,
-                stream,
-                global_scale_a,
-                global_scale_b,
-                None,
-            )
-
-        self._compiled_kernel = tensor_api
-
-    def _compile_discrete(self, kernel, max_active_clusters, fake_stream) -> None:
-        a_fake = (
-            from_dlpack(self.sample_a_tensor, assumed_align=16, enable_tvm_ffi=True).mark_compact_shape_dynamic(
-                mode=1,
-                stride_order=self.sample_a_tensor.dim_order(),
-                divisibility=16,
-            )
-            if self.sample_a_tensor is not None
-            else self._make_fake_cute_compact_tensor(
-                dtype=self.a_desc.dtype,
-                shape=self.a_desc.shape,
-                stride_order=self.a_desc.stride_order,
-                assumed_align=16,
-                dynamic_mode=1,
-                divisibility=16,
-            )
-        )
-        b_fake = (
-            from_dlpack(self.sample_b_tensor, assumed_align=16, enable_tvm_ffi=True).mark_compact_shape_dynamic(
-                mode=0,
-                stride_order=self.sample_b_tensor.dim_order(),
-                divisibility=16,
-            )
-            if self.sample_b_tensor is not None
-            else self._make_fake_cute_compact_tensor(
-                dtype=self.b_desc.dtype,
-                shape=self.b_desc.shape,
-                stride_order=self.b_desc.stride_order,
-                assumed_align=16,
-                dynamic_mode=0,
-                divisibility=16,
-            )
-        )
-        sfa_fake = self._make_fake_cute_compact_tensor(
-            dtype=self.sfa_desc.dtype,
-            shape=self.sfa_desc.shape,
-            stride_order=self.sfa_desc.stride_order,
-            assumed_align=16,
-            dynamic_mode=1,
-            divisibility=4,
-        )
-        sfb_fake = self._make_fake_cute_compact_tensor(
-            dtype=self.sfb_desc.dtype,
-            shape=self.sfb_desc.shape,
-            stride_order=self.sfb_desc.stride_order,
-            assumed_align=16,
-            dynamic_mode=1,
-            divisibility=4,
-        )
-        offsets_fake = self._make_fake_cute_tensor_from_desc(self.offsets_desc, assumed_align=4)
-        workspace_fake = from_dlpack(self._workspace, assumed_align=128, enable_tvm_ffi=True)
-        gs_a_fake = self._make_fake_cute_tensor_from_desc(self.global_scale_a_desc, assumed_align=4)
-        gs_b_fake = self._make_fake_cute_tensor_from_desc(self.global_scale_b_desc, assumed_align=4)
-        wgrad_ptrs_placeholder = torch.empty((self.expert_cnt,), dtype=torch.int64, device=self.a_desc.device)
-        wgrad_ptrs_fake = from_dlpack(wgrad_ptrs_placeholder, assumed_align=8, enable_tvm_ffi=True).iterator
-        single_expert_fake = self._make_fake_cute_tensor(
-            dtype=self.single_expert_wgrad_desc.dtype,
-            shape=self.single_expert_wgrad_desc.shape,
-            stride=self.single_expert_wgrad_desc.stride,
-            assumed_align=16,
-        )
-
-        compiled = cute.compile(
-            kernel,
-            a_fake,
-            b_fake,
-            sfa_fake,
-            sfb_fake,
-            wgrad_ptrs_fake,
-            offsets_fake,
-            workspace_fake,
-            max_active_clusters,
-            fake_stream,
-            gs_a_fake,
-            gs_b_fake,
-            single_expert_fake,
-            options="--enable-tvm-ffi",
-        )
-
-        cached_workspace = from_dlpack(self._workspace, assumed_align=128, enable_tvm_ffi=True)
-        single_expert_placeholder = torch.empty_strided(
-            self.single_expert_wgrad_desc.shape,
-            self.single_expert_wgrad_desc.stride,
-            dtype=self.single_expert_wgrad_desc.dtype,
-            device=self.single_expert_wgrad_desc.device,
-        )
-        cached_single_expert = from_dlpack(
-            single_expert_placeholder,
-            assumed_align=16,
-            enable_tvm_ffi=True,
-        )
-
-        def tensor_api(
-            a_tensor: torch.Tensor,
-            b_tensor: torch.Tensor,
-            sfa_tensor: torch.Tensor,
-            sfb_tensor: torch.Tensor,
-            wgrad_ptrs: torch.Tensor,
-            offsets_tensor: torch.Tensor,
-            stream: cuda.CUstream,
-            global_scale_a: Optional[torch.Tensor],
-            global_scale_b: Optional[torch.Tensor],
-        ) -> None:
-            compiled(
-                a_tensor,
-                b_tensor,
-                sfa_tensor,
-                sfb_tensor,
-                wgrad_ptrs.data_ptr(),
-                offsets_tensor,
-                cached_workspace,
-                stream,
-                global_scale_a,
-                global_scale_b,
-                cached_single_expert,
-            )
-
-        self._compiled_kernel = tensor_api
+    # Block-scaled implementation
+    @overload
+    def execute(
+        self,
+        a_tensor: torch.Tensor,
+        b_tensor: torch.Tensor,
+        sfa_tensor: torch.Tensor,
+        sfb_tensor: torch.Tensor,
+        offsets_tensor: torch.Tensor,
+        wgrad_tensor: Optional[torch.Tensor] = None,
+        wgrad_ptrs: Optional[torch.Tensor] = None,
+        *,
+        global_scale_a: Optional[torch.Tensor] = None,
+        global_scale_b: Optional[torch.Tensor] = None,
+    ) -> None: ...
 
     def execute(
         self,
@@ -505,64 +178,29 @@ class GroupedGemmWgradSm100(APIBase):
         global_scale_b: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
     ) -> None:
-        current_stream = self._get_default_stream(current_stream)
-        self._runtime_error_if(self._compiled_kernel is None, "Kernel not compiled; call compile() first")
-
-        if self.weight_mode == MoEWeightMode.DENSE:
-            self._value_error_if(wgrad_tensor is None, "wgrad_tensor is required in dense mode")
-            self._compiled_kernel(
-                a_tensor,
-                b_tensor,
-                sfa_tensor,
-                sfb_tensor,
-                wgrad_tensor,
-                offsets_tensor,
-                current_stream,
-                global_scale_a,
-                global_scale_b,
-            )
-            return
-
-        if wgrad_ptrs is None:
-            self._value_error_if(wgrad_tensor is None, "Provide wgrad_tensor or wgrad_ptrs in discrete mode")
-            self._value_error_if(wgrad_tensor.ndim != 3, f"wgrad_tensor must be rank-3, got {tuple(wgrad_tensor.shape)}")
-            self._value_error_if(not wgrad_tensor.is_cuda, f"wgrad_tensor must be a CUDA tensor, got {wgrad_tensor.device}")
-            if wgrad_tensor.shape[0] == 0:
-                wgrad_ptrs = torch.empty((0,), dtype=torch.int64, device=wgrad_tensor.device)
-            else:
-                expert_stride_bytes = wgrad_tensor.stride(0) * wgrad_tensor.element_size()
-                ptrs = [wgrad_tensor.data_ptr() + i * expert_stride_bytes for i in range(wgrad_tensor.shape[0])]
-                wgrad_ptrs = torch.tensor(ptrs, dtype=torch.int64, device=wgrad_tensor.device)
-        _require_pointer_tensor(wgrad_ptrs, "wgrad_ptrs", self.expert_cnt)
-        self._compiled_kernel(
-            a_tensor,
-            b_tensor,
-            sfa_tensor,
-            sfb_tensor,
-            wgrad_ptrs,
-            offsets_tensor,
-            current_stream,
-            global_scale_a,
-            global_scale_b,
+        if self._implementation is None:
+            raise RuntimeError("Kernel not compiled; call compile() first")
+        self._implementation.execute(
+            a_tensor=a_tensor,
+            b_tensor=b_tensor,
+            sfa_tensor=sfa_tensor,
+            sfb_tensor=sfb_tensor,
+            offsets_tensor=offsets_tensor,
+            wgrad_tensor=wgrad_tensor,
+            wgrad_ptrs=wgrad_ptrs,
+            global_scale_a=global_scale_a,
+            global_scale_b=global_scale_b,
+            current_stream=current_stream,
         )
 
 
-_logger = logging.getLogger(__name__)
-_cache_of_GroupedGemmWgradSm100Objects = {}
-
-
-def _stride_order(tensor: torch.Tensor) -> Tuple[int, ...]:
-    return tuple(i for i, s in sorted(enumerate(tensor.stride()), key=lambda x: (x[1], tensor.shape[x[0]])))
-
-
-def _dynamic_dim_tensor_signature(
-    tensor: Optional[torch.Tensor],
-    dynamic_dims: Tuple[int, ...],
-) -> Tuple[Optional[Tuple[Optional[int], ...]], Optional[Tuple[int, ...]], Optional[torch.dtype]]:
+def _wgrad_tensor_signature(tensor: Optional[torch.Tensor], *, dynamic_dims: tuple[int, ...] = (), exact_stride: bool):
     if tensor is None:
-        return None, None, None
-    static_shape = tuple(None if i in dynamic_dims else int(dim) for i, dim in enumerate(tensor.shape))
-    return static_shape, _stride_order(tensor), tensor.dtype
+        return None
+    shape = tuple(None if index in dynamic_dims else int(value) for index, value in enumerate(tensor.shape))
+    stride = tuple(int(value) for value in tensor.stride())
+    layout = stride if exact_stride else tuple(index for index, _ in sorted(enumerate(stride), key=lambda item: (item[1], tensor.shape[item[0]])))
+    return (shape, layout, tensor.dtype, tensor.device)
 
 
 def grouped_gemm_wgrad_wrapper_sm100(
@@ -585,91 +223,94 @@ def grouped_gemm_wgrad_wrapper_sm100(
     input_order: WGradInputOrder | str = WGradInputOrder.Tensor2D,
     current_stream: Optional[cuda.CUstream] = None,
 ) -> TupleDict:
-    """Compile and execute grouped GEMM wgrad in one call."""
-    input_order = _normalize_input_order(input_order)
-    hidden, _ = a_tensor.shape
-    _, intermediate = b_tensor.shape
-    wgrad_shape = (hidden, intermediate)
-    expert_cnt = offsets_tensor.shape[0]
-
-    if output_mode not in {"dense", "discrete"}:
-        raise ValueError(f"output_mode must be 'dense' or 'discrete', got {output_mode}")
-
+    """Compile and execute grouped GEMM wgrad through the selected backend API."""
+    if output_mode not in ("dense", "discrete"):
+        raise ValueError(f'output_mode must be "dense" or "discrete", got {output_mode}')
+    if a_tensor.ndim != 2 or b_tensor.ndim != 2:
+        raise ValueError("a_tensor and b_tensor must both be rank-2")
+    hidden, tokens_sum = a_tensor.shape
+    tokens_b, intermediate = b_tensor.shape
+    if tokens_sum != tokens_b:
+        raise ValueError(f"a_tensor and b_tensor token dimensions must match, got {tokens_sum} and {tokens_b}")
+    if offsets_tensor.ndim != 1:
+        raise ValueError(f"offsets_tensor must be rank-1, got shape {tuple(offsets_tensor.shape)}")
+    input_order = WGradInputOrder(input_order)
+    expert_cnt = offsets_tensor.numel()
+    if output_mode == "dense" and wgrad_ptrs is not None:
+        raise ValueError("dense output_mode forbids wgrad_ptrs")
+    if wgrad_ptrs is not None:
+        _require_pointer_tensor(wgrad_ptrs, "wgrad_ptrs", expert_cnt)
+    backend = select_grouped_gemm_backend(
+        operation="grouped_gemm_wgrad_sm100",
+        a_dtype=a_tensor.dtype,
+        b_dtype=b_tensor.dtype,
+        scale_controls=(
+            ("sfa_tensor", sfa_tensor),
+            ("sfb_tensor", sfb_tensor),
+            ("global_scale_a", global_scale_a),
+            ("global_scale_b", global_scale_b),
+            ("sf_vec_size", sf_vec_size if sf_vec_size != 16 else None),
+        ),
+        block_scaled_dtype_pairs=_BLOCK_SCALED_DTYPE_PAIRS,
+    )
     if wgrad_tensor is None and wgrad_ptrs is None:
-        # Backward compatibility: Dense mode.
-        if accumulate_on_output:
-            wgrad_tensor = torch.zeros((expert_cnt, *wgrad_shape), dtype=wgrad_dtype, device=a_tensor.device)
-        else:
-            wgrad_tensor = torch.empty((expert_cnt, *wgrad_shape), dtype=wgrad_dtype, device=a_tensor.device)
-
-    cache_key = (
+        allocator = torch.zeros if accumulate_on_output else torch.empty
+        with _torch_stream_context(current_stream, a_tensor.device):
+            wgrad_tensor = allocator((expert_cnt, hidden, intermediate), dtype=wgrad_dtype, device=a_tensor.device)
+    cache_key = backend_cache_key(
+        backend,
         output_mode,
-        *_dynamic_dim_tensor_signature(a_tensor, dynamic_dims=(1,)),
-        *_dynamic_dim_tensor_signature(b_tensor, dynamic_dims=(0,)),
-        *_dynamic_dim_tensor_signature(sfa_tensor, dynamic_dims=(1,)),
-        *_dynamic_dim_tensor_signature(sfb_tensor, dynamic_dims=(1,)),
-        tuple(offsets_tensor.shape),
-        tuple(offsets_tensor.stride()),
-        offsets_tensor.dtype,
-        *_dynamic_dim_tensor_signature(wgrad_tensor, dynamic_dims=()),
-        tuple(global_scale_a.shape) if global_scale_a is not None else None,
-        global_scale_a.dtype if global_scale_a is not None else None,
-        tuple(global_scale_b.shape) if global_scale_b is not None else None,
-        global_scale_b.dtype if global_scale_b is not None else None,
+        _wgrad_tensor_signature(a_tensor, dynamic_dims=(1,), exact_stride=False),
+        _wgrad_tensor_signature(b_tensor, dynamic_dims=(0,), exact_stride=False),
+        _wgrad_tensor_signature(sfa_tensor, dynamic_dims=(1,), exact_stride=False),
+        _wgrad_tensor_signature(sfb_tensor, dynamic_dims=(1,), exact_stride=False),
+        _wgrad_tensor_signature(offsets_tensor, exact_stride=True),
+        _wgrad_tensor_signature(wgrad_tensor, exact_stride=True),
+        _wgrad_tensor_signature(wgrad_ptrs, exact_stride=True),
+        _wgrad_tensor_signature(global_scale_a, exact_stride=True),
+        _wgrad_tensor_signature(global_scale_b, exact_stride=True),
         acc_dtype,
         wgrad_dtype,
-        mma_tiler_mn,
-        cluster_shape_mn,
+        tuple(mma_tiler_mn),
+        tuple(cluster_shape_mn) if cluster_shape_mn is not None else None,
         sf_vec_size,
         accumulate_on_output,
         input_order,
+        int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0")),
     )
-
-    if cache_key in _cache_of_GroupedGemmWgradSm100Objects:
-        op = _cache_of_GroupedGemmWgradSm100Objects[cache_key]
-    else:
+    op = _cache_of_GroupedGemmWgradSm100Objects.get(cache_key)
+    if op is None:
+        common = dict(
+            sample_a=a_tensor,
+            sample_b=b_tensor,
+            sample_sfa=sfa_tensor,
+            sample_sfb=sfb_tensor,
+            sample_offsets=offsets_tensor,
+            sample_global_scale_a=global_scale_a,
+            sample_global_scale_b=global_scale_b,
+            acc_dtype=acc_dtype,
+            mma_tiler_mn=mma_tiler_mn,
+            cluster_shape_mn=cluster_shape_mn,
+            sf_vec_size=sf_vec_size,
+            accumulate_on_output=accumulate_on_output,
+            input_order=input_order,
+        )
         if output_mode == "dense":
-            op = GroupedGemmWgradSm100(
-                sample_a=a_tensor,
-                sample_b=b_tensor,
-                sample_sfa=sfa_tensor,
-                sample_sfb=sfb_tensor,
-                sample_offsets=offsets_tensor,
-                sample_wgrad=wgrad_tensor,
-                sample_global_scale_a=global_scale_a,
-                sample_global_scale_b=global_scale_b,
-                acc_dtype=acc_dtype,
-                mma_tiler_mn=mma_tiler_mn,
-                cluster_shape_mn=cluster_shape_mn,
-                sf_vec_size=sf_vec_size,
-                accumulate_on_output=accumulate_on_output,
-                input_order=input_order,
-            )
+            common["sample_wgrad"] = wgrad_tensor
         else:
-            sample_expert = torch.empty(wgrad_shape, dtype=wgrad_dtype, device=a_tensor.device)
-            op = GroupedGemmWgradSm100(
-                sample_a=a_tensor,
-                sample_b=b_tensor,
-                sample_sfa=sfa_tensor,
-                sample_sfb=sfb_tensor,
-                sample_offsets=offsets_tensor,
-                sample_wgrad_expert=sample_expert,
+            common.update(
+                sample_wgrad_expert=(
+                    wgrad_tensor[0] if wgrad_tensor is not None else torch.empty((hidden, intermediate), dtype=wgrad_dtype, device=a_tensor.device)
+                ),
                 num_experts=expert_cnt,
                 wgrad_shape=(hidden, intermediate),
                 wgrad_dtype=wgrad_dtype,
-                sample_global_scale_a=global_scale_a,
-                sample_global_scale_b=global_scale_b,
-                acc_dtype=acc_dtype,
-                mma_tiler_mn=mma_tiler_mn,
-                cluster_shape_mn=cluster_shape_mn,
-                sf_vec_size=sf_vec_size,
-                accumulate_on_output=accumulate_on_output,
-                input_order=input_order,
             )
-        assert op.check_support(), "Unsupported configuration"
+        op = GroupedGemmWgradSm100(**common)
+        if not op.check_support():
+            raise RuntimeError("Unsupported configuration")
         op.compile()
         _cache_of_GroupedGemmWgradSm100Objects[cache_key] = op
-
     op.execute(
         a_tensor=a_tensor,
         b_tensor=b_tensor,
@@ -682,5 +323,4 @@ def grouped_gemm_wgrad_wrapper_sm100(
         global_scale_b=global_scale_b,
         current_stream=current_stream,
     )
-
     return TupleDict(wgrad_tensor=wgrad_tensor)
