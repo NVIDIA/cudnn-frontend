@@ -9,6 +9,7 @@ two-stage unfused path (score → top-K).
 from __future__ import annotations
 
 import logging
+import os
 from typing import Optional
 
 import torch
@@ -26,8 +27,13 @@ from cudnn.deepseek_sparse_attention.utils.runtime import device_major, resolve_
 from .indexer_fwd_sm100 import IndexerForwardSm100
 from ._interface import indexer_fwd as indexer_fwd_sm100
 from ._interface_sm90 import indexer_fwd as indexer_fwd_sm90
+from . import api_lean as _api_lean
 
 TMA_ALIGN_ELEMS = 4  # FP32 output => seqlen_k padded to multiples of 4 (16 B)
+
+# escape hatch: set to any non-empty value to keep every configuration on
+# the legacy kernel (the lean fast path is dispatched transparently below)
+_DISABLE_LEAN_ENV = "CUDNNFE_DSA_INDEXER_FWD_DISABLE_LEAN"
 
 
 class IndexerForward(APIBase):
@@ -239,6 +245,13 @@ def indexer_forward_wrapper(
     positions outside the valid KV range with -inf. ``q_causal_offsets`` may
     specify the global uncompressed token index for each batch/THD segment's
     local q[0].
+
+    On SM100, uniform-length BSHD configurations inside the lean
+    specialization (``head_dim == 128``, ``qhead_per_kv_head == 64``,
+    ``h_kv == 1``, default tuning parameters, saturated grid) are served by
+    the lean fast-path kernel (:mod:`.api_lean`); set the
+    ``CUDNNFE_DSA_INDEXER_FWD_DISABLE_LEAN`` environment variable to force
+    the legacy kernel for every configuration.
     """
     if device_major() == 9:
         unsupported = []
@@ -272,6 +285,68 @@ def indexer_forward_wrapper(
             current_stream=stream,
         )
         return TupleDict(scores=scores)
+
+    # SM100 additive lean fast path: uniform-length BSHD configurations
+    # inside the lean specialization (H=64/D=128 MQA, BF16 Q/K, default
+    # tuning parameters, saturated persistent grid — see
+    # api_lean.IndexerForwardLean.check_support) are routed to the lean
+    # kernel transparently. Every other configuration — THD/varlen, H=32,
+    # non-default tuning knobs, SM90/SM110+, small grids, misaligned or
+    # non-contiguous tensors, ... — falls through to the legacy path
+    # below, which is unchanged.
+    if (
+        cu_seqlens_q is None
+        and cu_seqlens_k is None
+        and m_block_size == 128
+        and n_block_size == 128
+        and q_stage == 2
+        and kv_stage == 4
+        and not os.getenv(_DISABLE_LEAN_ENV)
+    ):
+        # cheap metadata screen for q_causal_offsets BEFORE any lean work
+        # (in particular before the lean JIT): malformed offsets fall
+        # through so the legacy path raises its own errors (it validates
+        # with the same shared helper).
+        offsets_ok = q_causal_offsets is None or (
+            q.ndim == 4
+            and q_causal_offsets.dtype == torch.int32
+            and q_causal_offsets.ndim == 1
+            and q_causal_offsets.shape[0] == q.shape[0]
+            and q_causal_offsets.is_cuda
+            and q_causal_offsets.device == q.device
+        )
+        lean_api = None
+        if offsets_ok:
+            try:
+                # _maybe_lean_api runs cheap non-throwing eligibility
+                # checks, then the cached check_support verdict + JIT.
+                # Only validation ValueErrors are caught (malformed
+                # cross-tensor combos: legacy reproduces its own error
+                # surface); a compile failure for an accepted config
+                # raises RuntimeError and deliberately escapes — a silent
+                # fallback would hide real lean-path bugs
+                # (CUDNNFE_DSA_INDEXER_FWD_DISABLE_LEAN is the escape
+                # hatch).
+                lean_api = _api_lean._maybe_lean_api(q, k, w, ratio, qhead_per_kv_head, sm_scale=sm_scale)
+            except ValueError:
+                lean_api = None
+        if lean_api is not None and not _api_lean._q_causal_offsets_within_int32(q_causal_offsets, q.shape[1]):
+            # legacy evaluates (offset + q_token + 1) in int32 on device;
+            # offsets large enough for that to overflow stay on the legacy
+            # path so dispatched behavior is unchanged (documented bound;
+            # costs one small D2H read, only on the offsets path).
+            lean_api = None
+        if lean_api is not None:
+            return _api_lean.indexer_forward_lean_wrapper(
+                q,
+                k,
+                w,
+                ratio=ratio,
+                qhead_per_kv_head=qhead_per_kv_head,
+                sm_scale=sm_scale,
+                q_causal_offsets=q_causal_offsets,
+                stream=stream,
+            )
 
     # BSHD and THD both go through indexer_fwd (it branches on cu_seqlens
     # internally): it owns output allocation + TMA padding and uses a single
