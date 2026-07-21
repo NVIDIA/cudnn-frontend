@@ -78,6 +78,9 @@ DSA.sparse_attention_backward_wrapper
 DSA.IndexerForward
 DSA.indexer_forward_wrapper
 
+DSA.IndexerForwardLean
+DSA.indexer_forward_lean_wrapper
+
 DSA.IndexerTopK
 DSA.indexer_top_k_wrapper
 
@@ -161,6 +164,60 @@ result = DSA.indexer_forward_wrapper(
 )
 scores = result["scores"]
 ```
+
+#### SM100 lean fast path (`IndexerForwardLean`)
+
+On SM100, `indexer_forward_wrapper` transparently dispatches eligible
+configurations to a specialized persistent kernel
+(`DSA.IndexerForwardLean` / `DSA.indexer_forward_lean_wrapper`) that is
+substantially faster than the generic SM100 kernel for the large-`S_q`
+H=64 regime. The lean path is **additive**: any configuration outside its
+support gate keeps using the existing kernel unchanged, and setting the
+environment variable `CUDNNFE_DSA_INDEXER_FWD_DISABLE_LEAN` (to any
+non-empty value) forces the legacy kernel for every configuration.
+
+The lean gate (`IndexerForwardLean.check_support()`) requires all of:
+
+- `head_dim == 128`, `qhead_per_kv_head == 64`, `H_kv == 1`
+- uniform-length batched BSHD (any `B`); THD/varlen (`cu_seqlens_*`)
+  always uses the legacy path — the lean schedule is a static
+  reversed-LPT single-wave persistent grid built around one uniform
+  triangular work distribution, and per-batch KV storage offsets would
+  break its 128-row-aligned dense KV-tile TMA sweep
+- BF16 `q`/`k`; BF16 **or** FP32 `w` (both ingested directly — BF16
+  weights are up-converted in-kernel, exactly); FP32 scores
+- contiguous inputs with 16-byte-aligned base pointers (a TMA
+  requirement — storage-offset views that break the alignment fall back
+  to the legacy kernel, they are never copied); `S_q` a multiple of 4;
+  any `S_k >= 1`
+- a saturated persistent grid: `S_q / 4 >= LEAN_MIN_WAVES * sm_count`
+  (see `api_lean.py`; below that q-tile count the static schedule loses
+  its load-balance advantage and the legacy kernel is used)
+- default tuning parameters on the wrapper call (`m_block_size=128`,
+  `n_block_size=128`, `q_stage=2`, `kv_stage=4`)
+
+`sm_scale` and `q_causal_offsets` are fully supported (offsets are folded
+into the per-row visibility windows on the host, in int64; offset windows
+are rebuilt per call, while the offset-free windows are cached per shape).
+One documented dispatch bound: the legacy kernel evaluates
+`(q_causal_offset + i + 1)` in int32 on device, so offsets with
+`offset + S_q + 1 > INT32_MAX` stay on the legacy path (keeping the
+dispatched behavior identical to legacy for extreme-but-valid offsets);
+enforcing the bound reads the small `(B,)` offsets tensor once per
+offsets call.
+The lean path compiles per `(S_q, S_k, W dtype, sm_scale variant,
+device)` (by design — the schedule is static; the batch size and `ratio`
+never affect the generated code, so one compiled kernel serves every `B`
+of a shape), and both the compiled-kernel and dispatch-verdict caches are
+bounded thread-safe LRUs. It is intended for the training-style regime
+where shapes repeat. A configuration the support gate accepts is expected
+to compile: a JIT failure raises `RuntimeError` (with the escape hatch
+named) instead of silently falling back, so real lean-path bugs cannot
+hide behind the legacy kernel. Scores returned by the lean path are
+always contiguous, and match
+the legacy kernel's values to FP32 accumulation-order rounding (both
+paths use BF16 tensor-core products with FP32 accumulation; the lean
+epilogue uses a fixed reduction order and is deterministic run-to-run).
 
 ### 3. Indexer Top-K
 
