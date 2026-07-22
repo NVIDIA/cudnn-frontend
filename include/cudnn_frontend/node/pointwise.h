@@ -262,15 +262,20 @@ class PointwiseNode : public NodeCRTP<PointwiseNode> {
             }
         }
 
-        // Set alpha scaling factors (always set to 1.0)
-        float alpha1 = 1.0f;
-        float alpha2 = 1.0f;
+        bool const is_double = (attributes.compute_data_type == DataType_t::DOUBLE);
+        cudnnBackendAttributeType_t const attr_type = is_double ? CUDNN_TYPE_DOUBLE : CUDNN_TYPE_FLOAT;
+
+        double const alpha1_d = 1.0, alpha2_d = 1.0;
+        float  const alpha1_f = 1.0f, alpha2_f = 1.0f;
+
+        void const* alpha1 = is_double ? static_cast<void const*>(&alpha1_d) : static_cast<void const*>(&alpha1_f);
+        void const* alpha2 = is_double ? static_cast<void const*>(&alpha2_d) : static_cast<void const*>(&alpha2_f);
 
         _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(
-            pointwise_operation.get_raw_desc(), CUDNN_ATTR_OPERATION_POINTWISE_ALPHA1, CUDNN_TYPE_FLOAT, 1, &alpha1));
+            pointwise_operation.get_raw_desc(), CUDNN_ATTR_OPERATION_POINTWISE_ALPHA1, attr_type, 1, alpha1));
 
         _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(
-            pointwise_operation.get_raw_desc(), CUDNN_ATTR_OPERATION_POINTWISE_ALPHA2, CUDNN_TYPE_FLOAT, 1, &alpha2));
+            pointwise_operation.get_raw_desc(), CUDNN_ATTR_OPERATION_POINTWISE_ALPHA2, attr_type, 1, alpha2));
 
         _CUDNN_CHECK_CUDNN_ERROR(detail::finalize(pointwise_operation.get_raw_desc()));
 
