@@ -82,6 +82,9 @@ def _apply_grouped_gemm_cfg_overrides(cfg, cfg_overrides=None):
     ids=["bf16-dense", "bf16-discrete-k-major", "bf16-discrete-n-major"],
 )
 def test_grouped_gemm_dglu_wrapper_bf16(discrete, b_major):
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("Requires SM100+ for grouped GEMM dGLU BF16 kernel.")
+
     problem = make_grouped_gemm_dglu_bf16_problem(discrete=discrete, b_major=b_major)
     expected_d, expected_dprob, _ = grouped_gemm_dglu_bf16_reference(
         problem,
