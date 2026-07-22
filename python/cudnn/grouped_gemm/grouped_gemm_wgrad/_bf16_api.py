@@ -5,7 +5,7 @@
 
 import os
 import weakref
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import cutlass
 import cutlass.cute as cute
@@ -46,7 +46,7 @@ class GroupedGemmWgradBf16API(APIBase):
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         sf_vec_size: int = 16,
         accumulate_on_output: bool = False,
-        input_order: WGradInputOrder | str = WGradInputOrder.Tensor2D,
+        input_order: Union[WGradInputOrder, str] = WGradInputOrder.Tensor2D,
     ) -> None:
         super().__init__()
         self._warn_experimental_api()

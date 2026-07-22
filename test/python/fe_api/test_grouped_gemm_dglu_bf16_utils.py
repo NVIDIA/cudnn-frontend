@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Fixtures and exact !35 Torch reference for the BF16 dGLU API."""
+"""Fixtures and exact Torch reference for the BF16 dGLU API."""
 
 from __future__ import annotations
 
@@ -92,7 +92,7 @@ def make_grouped_gemm_dglu_bf16_problem(
 
 
 def _interleaved_indices(n: int, device: torch.device) -> tuple[torch.Tensor, ...]:
-    """Return !35 gate/input destinations and the compact N source order."""
+    """Return gate/input destinations and the compact N source order."""
     columns_2n = torch.arange(2 * n, device=device).view((2 * n) // 32, 32)
     gate_columns = columns_2n[0::2].reshape(-1)
     input_columns = columns_2n[1::2].reshape(-1)
@@ -107,7 +107,7 @@ def grouped_gemm_dglu_bf16_reference(
     linear_offset: float,
     generate_dbias: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    """Return D, dprob, and optional dbias matching the exact !35 oracle."""
+    """Return D, dprob, and optional dbias matching the reference oracle."""
     a = problem["a"].float().squeeze(-1)
     b_storage = problem["b_reference"].float()
     c = problem["c"].float()

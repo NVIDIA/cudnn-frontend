@@ -3,7 +3,7 @@
 
 """Unified FE API for grouped GEMM wgrad on SM100+."""
 
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import torch
 import cutlass
@@ -45,7 +45,7 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         sf_vec_size: int = 16,
         accumulate_on_output: bool = False,
-        input_order: WGradInputOrder | str = WGradInputOrder.Tensor2D,
+        input_order: Union[WGradInputOrder, str] = WGradInputOrder.Tensor2D,
     ):
         super().__init__()
         self._warn_experimental_api()
