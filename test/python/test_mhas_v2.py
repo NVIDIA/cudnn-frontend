@@ -1024,6 +1024,67 @@ def test_sdpa_mxfp8_bwd_L0(env_info, test_no, request, cudnn_handle):
 # # Single repro test
 # # ===================
 
+MIXED_SEQ_LEN_FORM_CASES = [
+    ("q", cudnn.diagonal_alignment.TOP_LEFT, None),
+    ("kv", cudnn.diagonal_alignment.TOP_LEFT, None),
+    ("q", cudnn.diagonal_alignment.BOTTOM_RIGHT, 0),
+    ("kv", cudnn.diagonal_alignment.BOTTOM_RIGHT, 0),
+]
+
+
+@pytest.mark.parametrize(
+    "cu_sides,diag_align,right_bound",
+    MIXED_SEQ_LEN_FORM_CASES,
+    ids=["cu_q", "cu_kv", "cu_q_brcm", "cu_kv_brcm"],
+)
+@pytest.mark.L0
+def test_sdpa_mixed_seq_len_forms_L0(env_info, cu_sides, diag_align, right_bound, request, cudnn_handle):
+    """Mixed-form sequence lengths: cumulative on one side, per-batch on the other.
+
+    Deterministic configs with non-uniform per-batch lengths, so misreading one
+    side's form cannot produce a passing result. The bottom-right causal cases
+    guard the DiagonalBandMask alignment derivation, which must treat the two
+    sides' forms independently. Requires cuDNN 9.25+ (skips below via exec_sdpa).
+    """
+    # Mixed forms are gated in the UNIFIED surface; request it explicitly rather
+    # than relying on AUTO resolving to it.
+    test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.UNIFIED)
+    test.cfg = ExecConfig(
+        data_type=torch.bfloat16,
+        rng_data_seed=1234,
+        rng_geom_seed=5678,
+        is_alibi=False,
+        is_infer=True,
+        is_paged=False,
+        is_bias=False,
+        is_block_mask=False,
+        is_padding=True,
+        is_cu_seq_len=True,
+        cu_seq_len_sides=cu_sides,
+        is_ragged=False,
+        is_dropout=False,
+        is_determin=False,
+        batches=4,
+        d_qk=64,
+        d_v=64,
+        s_q=256,
+        s_kv=512,
+        h_q=3,
+        h_k=3,
+        h_v=3,
+        diag_align=diag_align,
+        left_bound=None,
+        right_bound=right_bound,
+        seq_len_q=[128, 100, 256, 37],
+        seq_len_kv=[96, 64, 512, 200],
+        implementation=cudnn.attention_implementation.UNIFIED,
+    )
+    test.cfg.fill_derived_fields()
+    test.showConfig((request.node.name, len(MIXED_SEQ_LEN_FORM_CASES)), request)
+
+    exec_sdpa(test.cfg, request, cudnn_handle)
+
+
 @pytest.mark.skipif("not config.getoption('--repro')", reason="used with '--repro' only")
 @pytest.mark.L0
 @pytest.mark.L1

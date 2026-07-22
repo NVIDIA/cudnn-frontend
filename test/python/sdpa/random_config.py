@@ -88,6 +88,10 @@ class ExecConfig:
     # (cumulative sequence-length tensors of shape (b+1, 1, 1, 1)) instead of
     # the regular per-batch seq_len_q/seq_len_kv tensors. Implies is_padding=True.
     is_cu_seq_len: bool = None
+    # Which sides use the cumulative form when is_cu_seq_len is True: "both"
+    # (default), "q" (cu_seq_len_q with seq_len_kv), or "kv" (seq_len_q with
+    # cu_seq_len_kv). The mixed forms require cuDNN 9.25+.
+    cu_seq_len_sides: str = "both"
     is_ragged: bool = None
     is_dropout: bool = None
     is_determin: bool = None
@@ -143,6 +147,12 @@ class ExecConfig:
     @property
     def is_train(self):
         return not self.is_infer
+
+    def is_cu_seq_len_q(self):
+        return bool(self.is_cu_seq_len) and self.cu_seq_len_sides in ("both", "q")
+
+    def is_cu_seq_len_kv(self):
+        return bool(self.is_cu_seq_len) and self.cu_seq_len_sides in ("both", "kv")
 
     def fill_derived_fields(self):
         """
