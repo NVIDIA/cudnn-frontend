@@ -174,16 +174,26 @@ substantially faster than the generic SM100 kernel for the large-`S_q`
 H=64 regime. The lean path is **additive**: any configuration outside its
 support gate keeps using the existing kernel unchanged, and setting the
 environment variable `CUDNNFE_DSA_INDEXER_FWD_DISABLE_LEAN` (to any
-non-empty value) forces the legacy kernel for every configuration.
+non-empty value) forces the legacy kernel for every transparently
+dispatched configuration. Calls made explicitly through
+`indexer_forward_lean_wrapper` do not consult the variable; in particular
+its THD mode has no legacy fallback (THD lean scores use a different
+output layout — see below), so opting a THD call site out of the lean
+path means calling `indexer_forward_wrapper` instead.
 
 The lean gate (`IndexerForwardLean.check_support()`) requires all of:
 
 - `head_dim == 128`, `qhead_per_kv_head == 64`, `H_kv == 1`
-- uniform-length batched BSHD (any `B`); THD/varlen (`cu_seqlens_*`)
-  always uses the legacy path — the lean schedule is a static
-  reversed-LPT single-wave persistent grid built around one uniform
-  triangular work distribution, and per-batch KV storage offsets would
-  break its 128-row-aligned dense KV-tile TMA sweep
+- uniform-length batched BSHD (any `B`) on the transparent wrapper.
+  THD/varlen (`cu_seqlens_*`) is served by the same lean kernel, but only
+  through the explicit `indexer_forward_lean_wrapper`: per-row absolute
+  compressed-KV windows carry the segment isolation and the ratio-causal
+  mask, and the scores come back in a global-compressed-KV-column
+  `(T_q, m_total)` layout (each segment's finite scores sit in its own
+  absolute column block), which intentionally differs from the legacy
+  `(total_q, max_seqlen_k)` local-column layout —
+  `indexer_forward_wrapper` therefore keeps routing THD calls to the
+  legacy kernel (`q_causal_offsets` with THD also stays legacy)
 - BF16 `q`/`k`; BF16 **or** FP32 `w` (both ingested directly — BF16
   weights are up-converted in-kernel, exactly); FP32 scores
 - contiguous inputs with 16-byte-aligned base pointers (a TMA

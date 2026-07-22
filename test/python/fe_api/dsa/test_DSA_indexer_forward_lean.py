@@ -492,3 +492,256 @@ def test_DSA_indexer_forward_dispatch_keeps_legacy_for_thd(monkeypatch):
             scores[q0:q1, :s_k].unsqueeze(0),
             ratio,
         )
+
+
+# ---------------------------------------------------------------------------
+# THD / varlen (ragged packed) lean fast path — GLOBAL compressed-KV columns
+# ---------------------------------------------------------------------------
+
+
+def _cu(seg_lens, device="cuda"):
+    """(len+1,) int32 cu_seqlens from per-segment lengths."""
+    cs = torch.tensor(seg_lens, dtype=torch.int64).cumsum(0).tolist()
+    return torch.tensor([0, *cs], dtype=torch.int32, device=device)
+
+
+def _alloc_thd(seg_q, seg_k, h_q=64, h_kv=1, d=128, w_dtype=torch.bfloat16):
+    """Packed THD inputs for unequal segments plus their cu_seqlens."""
+    t_q = int(sum(seg_q))
+    m_total = int(sum(seg_k))
+    q = torch.randn(t_q, h_q, d, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn(m_total, h_kv, d, dtype=torch.bfloat16, device="cuda")
+    w = torch.randn(t_q, h_q, dtype=torch.bfloat16, device="cuda").to(w_dtype)
+    return q, k, w, _cu(seg_q), _cu(seg_k)
+
+
+def _meta_samples_thd(seg_q, seg_k, h_q=64, h_kv=1, d=128, q_dtype=torch.bfloat16, w_dtype=torch.bfloat16, o_dtype=torch.float32):
+    t_q = int(sum(seg_q))
+    m_total = int(sum(seg_k))
+    q = _meta((t_q, h_q, d), q_dtype)
+    k = _meta((m_total, h_kv, d), q_dtype)
+    w = _meta((t_q, h_q), w_dtype)
+    o = _meta((t_q, m_total), o_dtype)
+    return q, k, w, o, _cu(seg_q), _cu(seg_k)
+
+
+def _thd_segments_saturating(api_lean, n_seg=3):
+    """Unequal q-segments whose T_q saturates the lean grid (each %4)."""
+    base = _lean_min_s_q(api_lean)  # already a multiple of LEAN_TILE_TOKENS
+    seg_q = [base + 4 * i for i in range(n_seg)]  # unequal, each %4, sums > base
+    seg_k = [max(s // 2, 4) for s in seg_q]  # ratio-2-like geometry, unequal
+    return seg_q, seg_k
+
+
+@pytest.mark.L0
+def test_DSA_indexer_forward_lean_thd_check_support_pass():
+    api_lean = _import_lean()
+    _require_sm100()
+    seg_q, seg_k = _thd_segments_saturating(api_lean)
+    for w_dtype in (torch.bfloat16, torch.float32):
+        q, k, w, o, cu_q, cu_k = _meta_samples_thd(seg_q, seg_k, w_dtype=w_dtype)
+        api = api_lean.IndexerForwardLean(q, k, w, o, ratio=2, cu_seqlens_q=cu_q, cu_seqlens_k=cu_k)
+        assert api.check_support() is True, f"expected THD supported for w_dtype={w_dtype}"
+        assert api._thd is True and api.s_q == int(sum(seg_q)) and api.s_k == int(sum(seg_k))
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("case", ["h32", "d64", "q_fp16", "grid_small", "tq_nonmult4"])
+def test_DSA_indexer_forward_lean_thd_check_support_false(case):
+    api_lean = _import_lean()
+    _require_sm100()
+    seg_q, seg_k = _thd_segments_saturating(api_lean)
+    kwargs = {
+        "h32": dict(h_q=32),
+        "d64": dict(d=64),
+        "q_fp16": dict(q_dtype=torch.float16),
+        "grid_small": None,  # handled below
+        "tq_nonmult4": None,
+    }[case]
+    if case == "grid_small":
+        seg_q, seg_k = [8], [4]
+        kwargs = {}
+    elif case == "tq_nonmult4":
+        seg_q = [_lean_min_s_q(api_lean) + 2]  # T_q not a multiple of 4
+        seg_k = [64]
+        kwargs = {}
+    q, k, w, o, cu_q, cu_k = _meta_samples_thd(seg_q, seg_k, **kwargs)
+    api = api_lean.IndexerForwardLean(q, k, w, o, ratio=2, cu_seqlens_q=cu_q, cu_seqlens_k=cu_k)
+    assert api.check_support() is False
+
+
+@pytest.mark.L0
+def test_DSA_indexer_forward_lean_thd_check_support_raises():
+    api_lean = _import_lean()
+    _require_sm100()
+    seg_q, seg_k = _thd_segments_saturating(api_lean, n_seg=2)
+    t_q, m_total = int(sum(seg_q)), int(sum(seg_k))
+
+    # missing cu_seqlens_k
+    q, k, w, o, cu_q, cu_k = _meta_samples_thd(seg_q, seg_k)
+    with pytest.raises(ValueError):
+        api_lean.IndexerForwardLean(q, k, w, o, ratio=2, cu_seqlens_q=cu_q).check_support()
+
+    # cu_seqlens_k[-1] disagrees with packed K rows (m_total)
+    q, k, w, o, cu_q, _ = _meta_samples_thd(seg_q, seg_k)
+    bad_k = torch.tensor([0, seg_k[0], m_total + 8], dtype=torch.int32, device="cuda")
+    with pytest.raises(ValueError):
+        api_lean.IndexerForwardLean(q, k, w, o, ratio=2, cu_seqlens_q=cu_q, cu_seqlens_k=bad_k).check_support()
+
+    # non-monotonic / non-zero-start cu_seqlens_q
+    q, k, w, o, _, cu_k = _meta_samples_thd(seg_q, seg_k)
+    nonmono = torch.tensor([seg_q[0], 0, t_q], dtype=torch.int32, device="cuda")
+    with pytest.raises(ValueError):
+        api_lean.IndexerForwardLean(q, k, w, o, ratio=2, cu_seqlens_q=nonmono, cu_seqlens_k=cu_k).check_support()
+
+
+def _check_thd_scores(api_lean, q, k, w, cu_q, cu_k, scores, ratio, sm_scale=1.0):
+    """Per-segment: global-column block matches the BSHD oracle; every
+    column outside a row's own segment block is -inf (segment isolation)."""
+    t_q, m_total = int(cu_q[-1]), int(cu_k[-1])
+    assert tuple(scores.shape) == (t_q, m_total)
+    assert scores.is_contiguous()
+    cu_q_host, cu_k_host = cu_q.tolist(), cu_k.tolist()
+    n_seg = len(cu_q_host) - 1
+    for b in range(n_seg):
+        q0, q1 = cu_q_host[b], cu_q_host[b + 1]
+        k0, k1 = cu_k_host[b], cu_k_host[b + 1]
+        if q1 <= q0:
+            continue
+        block = scores[q0:q1, k0:k1].unsqueeze(0)
+        ref = ref_indexer_forward(q[q0:q1].unsqueeze(0), k[k0:k1].unsqueeze(0), w[q0:q1].unsqueeze(0), ratio)
+        finite = torch.isfinite(ref)
+        assert torch.equal(torch.isneginf(block), torch.isneginf(ref)), f"seg {b} mask mismatch"
+        torch.testing.assert_close(block[finite], ref[finite] * sm_scale, atol=1e-4, rtol=1e-4)
+        # segment isolation: everything OUTSIDE this segment's KV block, for
+        # these rows, must be -inf (a query in segment b sees only seg b's KV)
+        outside = scores[q0:q1].clone()
+        outside[:, k0:k1] = float("-inf")
+        assert torch.isneginf(outside).all(), f"seg {b} leaked finite scores into another segment's columns"
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=20)
+@pytest.mark.parametrize("ratio", [2, 4])
+def test_DSA_indexer_forward_lean_thd_numerics_ragged(ratio):
+    """Ragged multi-segment THD vs the per-segment fp32 oracle + strict
+    segment isolation, at the same 1e-4 tolerance the BSHD/legacy suite uses."""
+    api_lean = _import_lean()
+    _require_sm100()
+    seg_q, seg_k = _thd_segments_saturating(api_lean, n_seg=3)
+    q, k, w, cu_q, cu_k = _alloc_thd(seg_q, seg_k)
+    scores = api_lean.indexer_forward_lean_wrapper(
+        q,
+        k,
+        w,
+        ratio=ratio,
+        cu_seqlens_q=cu_q,
+        cu_seqlens_k=cu_k,
+        max_seqlen_q=max(seg_q),
+        max_seqlen_k=max(seg_k),
+    )["scores"]
+    _check_thd_scores(api_lean, q, k, w, cu_q, cu_k, scores, ratio)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=21)
+def test_DSA_indexer_forward_lean_thd_sm_scale_and_fp32_w():
+    api_lean = _import_lean()
+    _require_sm100()
+    ratio, sm_scale = 4, 0.125
+    seg_q, seg_k = _thd_segments_saturating(api_lean, n_seg=2)
+    q, k, w, cu_q, cu_k = _alloc_thd(seg_q, seg_k, w_dtype=torch.float32)
+    scores = api_lean.indexer_forward_lean_wrapper(
+        q,
+        k,
+        w,
+        ratio=ratio,
+        sm_scale=sm_scale,
+        cu_seqlens_q=cu_q,
+        cu_seqlens_k=cu_k,
+        max_seqlen_q=max(seg_q),
+        max_seqlen_k=max(seg_k),
+    )["scores"]
+    _check_thd_scores(api_lean, q, k, w, cu_q, cu_k, scores, ratio, sm_scale=sm_scale)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=22)
+def test_DSA_indexer_forward_lean_thd_single_segment_equals_bshd():
+    """A single-segment THD problem (cu_seqlens = [0, T]) has ks == 0 windows
+    identical to the B=1 BSHD path, so the shared kernel must produce a
+    BITWISE-identical score matrix — proving THD reuses the exact schedule."""
+    api_lean = _import_lean()
+    _require_sm100()
+    ratio = 4
+    s_q = _lean_min_s_q(api_lean)
+    s_k = s_q // 2
+    q, k, w = _alloc_inputs(1, s_q, s_k)  # BSHD (1, s_q, H, D)
+
+    bshd = api_lean.indexer_forward_lean_wrapper(q, k, w, ratio=ratio)["scores"][0]
+
+    q_thd = q.view(s_q, 64, 128).contiguous()
+    k_thd = k.view(s_k, 1, 128).contiguous()
+    w_thd = w.view(s_q, 64).contiguous()
+    cu_q = torch.tensor([0, s_q], dtype=torch.int32, device="cuda")
+    cu_k = torch.tensor([0, s_k], dtype=torch.int32, device="cuda")
+    thd = api_lean.indexer_forward_lean_wrapper(
+        q_thd,
+        k_thd,
+        w_thd,
+        ratio=ratio,
+        cu_seqlens_q=cu_q,
+        cu_seqlens_k=cu_k,
+        max_seqlen_q=s_q,
+        max_seqlen_k=s_k,
+    )["scores"]
+    assert thd.shape == (s_q, s_k)
+    assert torch.equal(thd, bshd), "single-segment THD must be bitwise identical to B=1 BSHD"
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=23)
+def test_DSA_indexer_forward_lean_thd_q_causal_offsets_rejected():
+    """q_causal_offsets is intentionally unsupported on the THD lean path."""
+    api_lean = _import_lean()
+    _require_sm100()
+    seg_q, seg_k = _thd_segments_saturating(api_lean, n_seg=2)
+    q, k, w, cu_q, cu_k = _alloc_thd(seg_q, seg_k)
+    off = torch.zeros(2, dtype=torch.int32, device="cuda")
+    with pytest.raises(ValueError):
+        api_lean.indexer_forward_lean_wrapper(
+            q,
+            k,
+            w,
+            ratio=4,
+            cu_seqlens_q=cu_q,
+            cu_seqlens_k=cu_k,
+            max_seqlen_q=max(seg_q),
+            max_seqlen_k=max(seg_k),
+            q_causal_offsets=off,
+        )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=24)
+def test_DSA_indexer_forward_lean_thd_empty_and_tiny_segments():
+    """Empty query segment + a single-token KV segment: windows collapse to
+    empty ([-inf] rows) or 1-column, and the ragged K tail is exercised."""
+    api_lean = _import_lean()
+    _require_sm100()
+    ratio = 2
+    base = _lean_min_s_q(api_lean)
+    seg_q = [base, 0, 8]  # middle segment has zero queries
+    seg_k = [base // 2, 16, 1]
+    q, k, w, cu_q, cu_k = _alloc_thd(seg_q, seg_k)
+    scores = api_lean.indexer_forward_lean_wrapper(
+        q,
+        k,
+        w,
+        ratio=ratio,
+        cu_seqlens_q=cu_q,
+        cu_seqlens_k=cu_k,
+        max_seqlen_q=max(seg_q),
+        max_seqlen_k=max(seg_k),
+    )["scores"]
+    _check_thd_scores(api_lean, q, k, w, cu_q, cu_k, scores, ratio)
