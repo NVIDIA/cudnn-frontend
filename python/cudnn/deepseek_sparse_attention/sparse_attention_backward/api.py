@@ -73,6 +73,46 @@ class SparseAttentionBackward(APIBase):
         self._check_dtype(self.lse_desc, torch.float32, name="LSE")
         self._check_dtype(self.attn_sink_desc, torch.float32, name="attn_sink")
         self._check_dtype(self.topk_idxs_desc, torch.int32, name="topk_idxs")
+        self._check_dtype(self.out_desc, self.q_desc.dtype, name="out", extra_error_msg="out must have same dtype as Q")
+        self._check_dtype(self.dout_desc, self.q_desc.dtype, name="dout", extra_error_msg="dout must have same dtype as Q")
+        if self.topk_length_desc is not None:
+            self._check_dtype(self.topk_length_desc, torch.int32, name="topk_length")
+
+        # Cross-tensor shape contract: every companion tensor is indexed with
+        # coordinates derived from Q, so a mismatched shape silently reads or
+        # writes out of place at execution time instead of failing.
+        total_s_q, num_heads, head_dim = self.q_desc.shape
+        head_dim_v = 512 if head_dim == 576 else head_dim
+        expected_o_shape = (total_s_q, num_heads, head_dim_v)
+        self._value_error_if(
+            self.kv_desc.shape[1] != head_dim,
+            f"KV must have shape (total_S_kv, {head_dim}), got {self.kv_desc.shape}",
+        )
+        self._value_error_if(
+            self.out_desc.shape != expected_o_shape,
+            f"out must have shape {expected_o_shape}, got {self.out_desc.shape}",
+        )
+        self._value_error_if(
+            self.dout_desc.shape != expected_o_shape,
+            f"dout must have shape {expected_o_shape}, got {self.dout_desc.shape}",
+        )
+        self._value_error_if(
+            self.lse_desc.shape != (total_s_q, num_heads),
+            f"LSE must have shape {(total_s_q, num_heads)}, got {self.lse_desc.shape}",
+        )
+        self._value_error_if(
+            self.attn_sink_desc.shape != (num_heads,),
+            f"attn_sink must have shape {(num_heads,)}, got {self.attn_sink_desc.shape}",
+        )
+        self._value_error_if(
+            self.topk_idxs_desc.ndim != 2 or self.topk_idxs_desc.shape[0] != total_s_q,
+            f"topk_idxs must have shape ({total_s_q}, topk_max), got {self.topk_idxs_desc.shape}",
+        )
+        if self.topk_length_desc is not None:
+            self._value_error_if(
+                self.topk_length_desc.shape != (total_s_q,),
+                f"topk_length must have shape {(total_s_q,)}, got {self.topk_length_desc.shape}",
+            )
 
         self._is_supported = True
         return True
