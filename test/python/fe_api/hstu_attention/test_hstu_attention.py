@@ -131,7 +131,7 @@ def test_support_validation_and_scaling_default(monkeypatch):
 @pytest.mark.L0
 @pytest.mark.skipif(not _HAS_CUDA, reason="requires CUDA")
 def test_support_rejects_unsupported_combinations(monkeypatch):
-    q, k, v, do, cu = _inputs(head_dim=256)
+    q, k, v, do, cu = _inputs(head_dim=192)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (10, 0))
 
     with pytest.raises(ValueError, match="head_dim"):
@@ -450,7 +450,7 @@ def test_forward_matches_pytorch(dtype, head_dim):
 @pytest.mark.L0
 @pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
 def test_backward_matches_pytorch(dtype, head_dim):
     q, k, v, do, cu = _inputs(dtype=dtype, head_dim=head_dim)
     alpha = 0.7
@@ -499,11 +499,140 @@ def test_backward_matches_pytorch(dtype, head_dim):
 
 @pytest.mark.L0
 @pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
-def test_varlen_tail_and_asymmetric_lengths_match_pytorch():
+def test_d256_explicit_compile_and_packed_gradient_outputs():
+    from cudnn.hstu_attention._kernels.hstu_bwd_256_cute import (
+        hstu_varlen_bwd_256_cute,
+    )
+
+    hstu_varlen_bwd_256_cute.compile_cache.clear()
+    torch.manual_seed(456)
+    seqlen, heads, head_dim = 65, 2, 256
+    alpha = 0.7
+    scaling_seqlen = 37.0
+    qkv = (
+        torch.randn(
+            (seqlen, 3, heads, head_dim),
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        * 0.2
+    )
+    q, k, v = qkv.unbind(1)
+    do = (
+        torch.randn(
+            (seqlen, head_dim, heads),
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        .transpose(1, 2)
+        .mul_(0.2)
+    )
+    cu = torch.tensor((0, seqlen), dtype=torch.int32, device="cuda")
+    dqkv = torch.full_like(qkv, float("nan"))
+
+    api = HSTUBwdSm100(
+        sample_do=do,
+        sample_q=q,
+        sample_k=k,
+        sample_v=v,
+        sample_dq=dqkv[:, 0],
+        sample_dk=dqkv[:, 1],
+        sample_dv=dqkv[:, 2],
+        sample_cu_seqlens_q=cu,
+        sample_cu_seqlens_k=cu,
+        max_seqlen_q=seqlen,
+        max_seqlen_k=seqlen,
+        window_size=(-1, 0),
+        alpha=alpha,
+        scaling_seqlen=scaling_seqlen,
+    )
+    api.check_support()
+    api.compile()
+    torch.cuda.synchronize()
+    assert torch.isnan(dqkv.float()).all()
+
+    api.execute(
+        do,
+        q,
+        k,
+        v,
+        dqkv[:, 0],
+        dqkv[:, 1],
+        dqkv[:, 2],
+        cu,
+        cu,
+    )
+    assert torch.isfinite(dqkv.float()).all()
+
+    q_ref = q.float().detach().requires_grad_(True)
+    k_ref = k.float().detach().requires_grad_(True)
+    v_ref = v.float().detach().requires_grad_(True)
+    out_ref = _reference_forward(
+        q_ref,
+        k_ref,
+        v_ref,
+        cu,
+        cu,
+        alpha=alpha,
+        scaling_seqlen=scaling_seqlen,
+        causal=True,
+    )
+    expected = torch.autograd.grad(
+        out_ref,
+        (q_ref, k_ref, v_ref),
+        do.float(),
+    )
+    for actual, expected_grad in zip(dqkv.unbind(1), expected):
+        torch.testing.assert_close(
+            actual.float(),
+            expected_grad,
+            rtol=8e-2,
+            atol=8e-2,
+        )
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
+def test_d256_explicit_api_is_cuda_graph_capturable():
+    q, k, v, do, cu = _inputs(seqlen=64, head_dim=256)
+    dq, dk, dv = (torch.empty_like(q), torch.empty_like(k), torch.empty_like(v))
+    api = HSTUBwdSm100(
+        sample_do=do,
+        sample_q=q,
+        sample_k=k,
+        sample_v=v,
+        sample_dq=dq,
+        sample_dk=dk,
+        sample_dv=dv,
+        sample_cu_seqlens_q=cu,
+        sample_cu_seqlens_k=cu,
+        max_seqlen_q=64,
+        max_seqlen_k=64,
+        window_size=(-1, 0),
+        alpha=0.7,
+        scaling_seqlen=32.0,
+    )
+    api.check_support()
+    api.compile()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        api.execute(do, q, k, v, dq, dk, dv, cu, cu)
+    for _ in range(3):
+        graph.replay()
+    torch.cuda.synchronize()
+
+    assert all(torch.isfinite(grad.float()).all() for grad in (dq, dk, dv))
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
+@pytest.mark.parametrize("head_dim", [64, 256])
+def test_varlen_tail_and_asymmetric_lengths_match_pytorch(head_dim):
     torch.manual_seed(321)
     q_lengths = (37, 129)
     k_lengths = (50, 173)
-    heads, head_dim = 1, 64
+    heads = 1
     q = (
         torch.randn(
             (sum(q_lengths), heads, head_dim),
@@ -597,8 +726,9 @@ def test_varlen_tail_and_asymmetric_lengths_match_pytorch():
 @pytest.mark.L0
 @pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
 @pytest.mark.parametrize("mask_mode", ["full", "local", "arbitrary"])
-def test_mask_modes_match_pytorch(mask_mode):
-    q, k, v, do, cu = _inputs(heads=1)
+@pytest.mark.parametrize("head_dim", [64, 256])
+def test_mask_modes_match_pytorch(mask_mode, head_dim):
+    q, k, v, do, cu = _inputs(heads=1, head_dim=head_dim)
     seqlen = q.shape[0]
     alpha = 0.7
     scaling_seqlen = 64.0
@@ -686,6 +816,75 @@ def test_mask_modes_match_pytorch(mask_mode):
 
 @pytest.mark.L0
 @pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
+def test_d256_full_tile_arbitrary_mask_is_not_skipped():
+    torch.manual_seed(654)
+    seqlen, heads, head_dim = 128, 1, 256
+    alpha = 0.7
+    scaling_seqlen = 128.0
+    q, k, v, do = [
+        torch.empty(
+            (seqlen, heads, head_dim),
+            dtype=torch.bfloat16,
+            device="cuda",
+        ).uniform_(-1.0, 1.0)
+        for _ in range(4)
+    ]
+    cu = torch.tensor((0, seqlen), dtype=torch.int32, device="cuda")
+    func = torch.empty(
+        (1, 3, seqlen + 256),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    func[:, 0, :] = 0
+    func[:, 1, :] = 96
+    func[:, 2, :] = 112
+
+    q_ref = q.float().detach().requires_grad_(True)
+    k_ref = k.float().detach().requires_grad_(True)
+    v_ref = v.float().detach().requires_grad_(True)
+    scores = alpha * torch.einsum("qhd,khd->hqk", q_ref, k_ref)
+    columns = torch.arange(seqlen, device=q.device)[None, :]
+    mask = ((columns >= 96) & (columns < 112)).unsqueeze(0)
+    out_ref = (
+        torch.einsum(
+            "hqk,khd->qhd",
+            torch.where(mask, F.silu(scores), torch.zeros_like(scores)),
+            v_ref,
+        )
+        / scaling_seqlen
+    )
+    expected = torch.autograd.grad(
+        out_ref,
+        (q_ref, k_ref, v_ref),
+        do.float(),
+    )
+    actual = hstu_attention_backward(
+        do,
+        q,
+        k,
+        v,
+        cu,
+        cu,
+        max_seqlen_q=seqlen,
+        max_seqlen_k=seqlen,
+        window_size=(-1, -1),
+        alpha=alpha,
+        scaling_seqlen=scaling_seqlen,
+        func_tensor=func,
+    )
+
+    for name, expected_grad in zip(
+        ("dq_tensor", "dk_tensor", "dv_tensor"), expected
+    ):
+        max_error = (actual[name].float() - expected_grad).abs().max()
+        relative_error = max_error / (expected_grad.abs().max() + 1.0e-12)
+        assert relative_error < 3.0e-2, (
+            f"{name} relative max error is {relative_error.item():.4e}"
+        )
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
 @pytest.mark.parametrize("head_dim", [64, 256])
 def test_paged_kv_forward_matches_pytorch(head_dim):
     q, k, v, _, cu = _inputs(heads=1, seqlen=256, head_dim=head_dim)
@@ -766,8 +965,9 @@ def test_cache_hit_does_not_inspect_cuda_metadata_values(monkeypatch):
 
 @pytest.mark.L0
 @pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
-def test_runtime_alpha_and_scaling_are_not_compile_time_constants():
-    q, k, v, do, cu = _inputs(heads=1)
+@pytest.mark.parametrize("head_dim", [64, 256])
+def test_runtime_alpha_and_scaling_are_not_compile_time_constants(head_dim):
+    q, k, v, do, cu = _inputs(heads=1, head_dim=head_dim)
     scalar_configs = ((0.35, 32.0), (1.1, 96.0))
 
     _interface.hstu_varlen_fwd_100.compile_cache.clear()
@@ -797,7 +997,15 @@ def test_runtime_alpha_and_scaling_are_not_compile_time_constants():
         torch.testing.assert_close(actual.float(), expected, rtol=4e-2, atol=4e-2)
         assert len(_interface.hstu_varlen_fwd_100.compile_cache) == 1
 
-    _interface.hstu_varlen_bwd_100.compile_cache.clear()
+    if head_dim == 256:
+        from cudnn.hstu_attention._kernels.hstu_bwd_256_cute import (
+            hstu_varlen_bwd_256_cute,
+        )
+
+        bwd_compile_cache = hstu_varlen_bwd_256_cute.compile_cache
+    else:
+        bwd_compile_cache = _interface.hstu_varlen_bwd_100.compile_cache
+    bwd_compile_cache.clear()
     for alpha, scaling_seqlen in scalar_configs:
         q_ref = q.float().detach().requires_grad_(True)
         k_ref = k.float().detach().requires_grad_(True)
@@ -836,7 +1044,7 @@ def test_runtime_alpha_and_scaling_are_not_compile_time_constants():
             torch.testing.assert_close(
                 actual_grads[name].float(), expected_grad, rtol=8e-2, atol=8e-2
             )
-        assert len(_interface.hstu_varlen_bwd_100.compile_cache) == 1
+        assert len(bwd_compile_cache) == 1
 
 
 @pytest.mark.L0

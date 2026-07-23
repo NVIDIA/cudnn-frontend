@@ -139,6 +139,11 @@ The first call for a new static kernel configuration JIT-compiles a CuTe DSL
 kernel; subsequent calls reuse the in-process compile cache. Execution follows
 the current PyTorch CUDA stream through TVM FFI.
 
+Head dimension 256 backward uses dedicated two-CTA kernels, launching the dQ
+kernel before the dK/dV kernel. Inputs with non-compact strides are materialized
+into compact temporary buffers for this path, and preallocated gradient views
+are copied back without changing the public tensor-layout contract.
+
 ## Class APIs
 
 `HSTUFwdSm100` and `HSTUBwdSm100` provide the explicit FE OSS lifecycle for
@@ -194,13 +199,12 @@ on the GPU without host-side range or monotonicity checks.
 | Direction | Architecture | Dtype | Head dimension | Attention |
 | --- | --- | --- | --- | --- |
 | Forward | SM100/SM10x | FP16, BF16 | 64, 128, 256 | MHA |
-| Backward | SM100/SM10x | FP16, BF16 | 64, 128 | MHA |
+| Backward | SM100/SM10x | FP16, BF16 | 64, 128, 256 | MHA |
 
 ## Current limitations
 
 - Backward is nondeterministic; requesting deterministic backward raises
   `NotImplementedError`.
-- Forward head dimension 256 does not have a corresponding backward kernel.
 - GQA and MQA are not supported.
 - Padded BHSD/BSHD inputs and separate `seqused_q`/`seqused_k` valid-length
   tensors are not supported; use packed THD tensors and cumulative lengths.

@@ -347,10 +347,13 @@ def hstu_varlen_bwd_100(
     total_k = k.shape[0]
     num_heads_k = k.shape[1]
 
-    assert head_dim == 64 or head_dim == 128, "Only support head_dim 64 and 128"
+    assert head_dim in (64, 128, 256), "Only support head_dim 64, 128 and 256"
     assert (
         num_heads == num_heads_k
     ), "Number of heads in key/value and query must be equal"
+    assert k.shape[2] == head_dim, "k and q must have the same head_dim"
+    assert v.shape[2] == head_dim, "v and q must have the same head_dim"
+    assert do.shape == q.shape, "do and q must have the same shape"
 
     kBlockM = 128
     kBlockN = 128
@@ -370,6 +373,32 @@ def hstu_varlen_bwd_100(
     ) and not is_causal
     is_arbitrary = func is not None
     func_num = func.shape[-2] if func is not None else 0
+
+    if head_dim == 256:
+        # The fused one-CTA kernel's live TMEM ranges exceed the SM100
+        # 512-column capacity at D=256. Use the dedicated two-kernel path:
+        # dQ first, followed by dK/dV.
+        from ._kernels.hstu_bwd_256_cute import hstu_varlen_bwd_256_cute
+
+        return hstu_varlen_bwd_256_cute(
+            do,
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            dq,
+            dk,
+            dv,
+            window_size_left,
+            window_size_right,
+            alpha,
+            scaling_seqlen,
+            func=func,
+            _compile_only=_compile_only,
+        )
 
     q_orig, k_orig, v_orig = q, k, v
     dq_orig, dk_orig, dv_orig = dq, dk, dv
