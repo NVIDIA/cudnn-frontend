@@ -15,8 +15,9 @@ and numerics in
 [Megatron-LM issue #5968](https://github.com/NVIDIA/Megatron-LM/issues/5968)). The eager
 region they replace decomposes into ~39 forward and ~51 backward kernel launches per
 call (at `compress_ratio = 4`) and materializes `(total_comp, 2*ratio, 1, head_dim)`
-window intermediates; the fused path is 1 + 1 kernels (plus three grad-buffer zero-fills
-in backward).
+window intermediates; the fused path is 1 + 1 kernels (plus one fp32 `dAPE`-buffer
+zero-fill in backward — the backward kernel writes `dKV`/`dScore` in full, including
+exact zeros to never-consumed positions, so those buffers need no fills).
 
 ### Semantics
 
@@ -58,6 +59,7 @@ run-to-run deterministic; the backward APIs raise under
   validated)
 - BF16 `kv` / `score` / `out`, FP32 `ape`, int32 `cu_seqlens` / `cu_seqlens_comp`
 - int32 flat offsets: `total_tokens * coff * head_dim < 2**31`
+- `head_dim <= 8388480` (forward launch `gridDim.y` bound)
 - contiguous tensors on one CUDA device, with 16-byte-aligned base pointers (4-byte
   for the int32 cu_seqlens) — contiguity does not imply base alignment for
   storage-offset views, so this is checked per call
@@ -110,10 +112,15 @@ op.compile()
 op.execute(kv, score, ape, cu_seqlens, cu_seqlens_comp, out, current_stream=None)
 ```
 
-`CSACompressorBackward.execute` additionally takes `grad_out` and **zero-initialized**
-`grad_kv` / `grad_score` / `grad_ape` buffers (the kernel's stores are disjoint and
-atomic-free for `grad_kv`/`grad_score`; unconsumed positions keep their exact zeros,
-matching autograd).
+`CSACompressorBackward.execute` additionally takes `grad_out` and the
+`grad_kv` / `grad_score` / `grad_ape` buffers. `grad_kv` / `grad_score` may be
+**uninitialized**: the kernel writes every position (disjoint, atomic-free stores;
+never-consumed positions — segment tails, the last block's first-half columns, segments
+shorter than `ratio`, token-capacity padding beyond `cu_seqlens[-1]` — get exact zeros
+from their unique owning CTA, matching autograd). When `total_comp == 0` the kernel is
+not launched and the buffers are left untouched (zero them yourself if you need
+autograd's exact zeros; the high-level wrapper does). `grad_ape` must be
+**zero-initialized** (fp32 atomic accumulation).
 
 ### CUDA graphs
 
@@ -138,14 +145,14 @@ THD packs of 8192-token sequences; eager baseline = the exact replaced region of
 Megatron-LM `Compressor._forward_thd` on identical inputs.
 
 *Isolated GPU kernel time* (nsys, sum of kernel durations per iteration, 50 iterations
-after 20 warmup; no launch/host overhead; backward includes its grad-buffer zero-fills):
+after 20 warmup; no launch/host overhead; backward includes its `dAPE` zero-fill):
 
 | THD pack | head_dim | eager fwd | fused fwd | fwd | eager bwd | fused bwd | bwd |
 |---|---|---|---|---|---|---|---|
-| 1 x 8192 | 128 | 114.0 us | 6.0 us | **19.0x** | 184.8 us | 15.3 us | **12.1x** |
-| 3 x 8192 | 128 | 226.4 us | 12.5 us | **18.1x** | 351.2 us | 29.5 us | **11.9x** |
-| 1 x 8192 | 512 | 259.5 us | 15.9 us | **16.3x** | 421.7 us | 33.6 us | **12.6x** |
-| 3 x 8192 | 512 | 663.1 us | 42.0 us | **15.8x** | 1154.7 us | 90.8 us | **12.7x** |
+| 1 x 8192 | 128 | 117.8 us | 4.5 us | **26.5x** | 187.2 us | 12.8 us | **14.6x** |
+| 3 x 8192 | 128 | 229.8 us | 10.0 us | **23.0x** | 352.7 us | 22.2 us | **15.9x** |
+| 1 x 8192 | 512 | 263.3 us | 12.4 us | **21.2x** | 425.0 us | 22.8 us | **18.6x** |
+| 3 x 8192 | 512 | 664.3 us | 35.0 us | **19.0x** | 1155.8 us | 66.0 us | **17.5x** |
 
 *End-to-end wall clock of the same region* (CUDA events, median of 100; includes launch
 overhead; eager backward goes through torch autograd, fused backward is the explicit
@@ -154,16 +161,29 @@ kernel-time numbers):
 
 | THD pack | head_dim | eager fwd | fused fwd | fwd | eager bwd | fused bwd | bwd |
 |---|---|---|---|---|---|---|---|
-| 1 x 8192 | 128 | 339.7 us | 38.9 us | **8.7x** | 533.2 us | 55.3 us | **9.6x** |
-| 3 x 8192 | 128 | 372.4 us | 39.9 us | **9.3x** | 661.9 us | 62.9 us | **10.5x** |
-| 1 x 8192 | 512 | 405.7 us | 41.6 us | **9.8x** | 637.2 us | 63.9 us | **10.0x** |
-| 3 x 8192 | 512 | 821.6 us | 68.9 us | **11.9x** | 1475.3 us | 110.9 us | **13.3x** |
+| 1 x 8192 | 128 | 333.7 us | 37.8 us | **8.8x** | 506.7 us | 47.2 us | **10.7x** |
+| 3 x 8192 | 128 | 373.9 us | 35.1 us | **10.7x** | 561.9 us | 54.6 us | **10.3x** |
+| 1 x 8192 | 512 | 409.2 us | 39.7 us | **10.3x** | 646.3 us | 57.3 us | **11.3x** |
+| 3 x 8192 | 512 | 823.7 us | 61.4 us | **13.4x** | 1475.5 us | 101.8 us | **14.5x** |
 
 Environment: driver 590.48.01, PyTorch 2.13.0 (CUDA 13.3), `nvidia-cutlass-dsl` 4.6.1.
 Measurement basis: identical inputs over exactly the replaced region for both
 implementations; eager backward = torch autograd of the recorded eager graph; fused
-backward = the backward wrapper (kernel + three grad zero-fills + host validation, no
-autograd engine).
+backward = the backward wrapper (kernel + the fp32 `dAPE` zero-fill + host validation,
+no autograd engine).
+
+An ncu hardware-ceiling audit of the **ported kernels (prior to the two optimization
+commits)** — cache-flushed, `--set full`, all four benchmark shapes — showed measured
+DRAM read volume matching the algorithmically necessary bytes within 1% (the THD gather
+adds no over-read; stores fully coalesced at 32/32 bytes per sector, loads 29-30/32),
+with neither L2 (<27% of peak) nor DRAM (<33%) close to saturation at these
+microsecond-scale sizes: the gap to a pure DRAM-floor time was a mix of sub-wave grid
+width / occupancy, memory latency, and (at the largest shape) issue pressure — not
+wasted traffic. The two optimizations that audit identified are folded in here: 32-bit
+vectorized forward accesses and backward kernel-side zero-writes replacing the two bf16
+grad-buffer fills. They do not change the bytes the kernels must read, so the
+traffic-optimality conclusion carries over; the utilization percentages above predate
+them.
 
 ## Testing
 
@@ -173,5 +193,6 @@ pytest test/python/fe_api/csa/test_CSA_compressor.py
 
 The tests validate numerics against an fp32-intermediate eager reference (bitwise
 `dKV`/`dScore`), the upstream eager numerics, and an fp64 oracle, plus ragged packs,
-static-capacity padding, run-to-run determinism, CUDA-graph capture/replay, and
-`check_support` boundaries.
+static-capacity padding, kernel-side zero-writes into uninitialized gradient buffers
+(NaN-canary, including the `total_comp == 0` zeros fallback), run-to-run determinism,
+CUDA-graph capture/replay, and `check_support` boundaries.

@@ -8,6 +8,10 @@ measurements and numerics in https://github.com/NVIDIA/Megatron-LM/issues/5968).
     upstream eager numerics (tolerance), and vs an fp64 oracle (fused error <= eager
     error), over ragged THD packs including segments shorter than ``ratio``;
   - static-capacity padding rows (``total_comp > cu_seqlens_comp[-1]``);
+  - kernel-side zero-writes to never-consumed ``dKV``/``dScore`` slots: NaN-canary
+    (uninitialized) gradient buffers stay bitwise-equal to zero-initialized runs and to
+    the eager reference, and the ``total_comp == 0`` host fallback still hands back
+    exact zeros;
   - run-to-run determinism of forward / ``dKV`` / ``dScore`` (``dAPE`` uses fp32 atomics
     and is exempt by design; the backward refuses to run under
     ``torch.use_deterministic_algorithms(True)``);
@@ -314,6 +318,125 @@ def test_empty_output():
     assert grads["grad_kv"].abs().sum().item() == 0
     assert grads["grad_score"].abs().sum().item() == 0
     assert grads["grad_ape"].abs().sum().item() == 0
+
+
+@pytest.mark.L0
+def test_backward_wrapper_zeros_when_no_blocks():
+    """Multi-segment packs where NO segment reaches ratio tokens: total_comp == 0, so
+    the kernel cannot launch and the wrapper must hand back exact-zero grads (the
+    host-side zeros fallback behind the uninitialized-buffer optimization)."""
+    _require_sm100()
+    compressor = _import_compressor()
+    d, ratio, coff = 128, 4, 2
+    w = coff * d
+    lens = [3, 2, 1]
+    total = sum(lens)
+    kv = torch.randn(total, w, device="cuda").to(torch.bfloat16)
+    score = torch.randn(total, w, device="cuda").to(torch.bfloat16)
+    ape = torch.randn(ratio, w, device="cuda")
+    cu = torch.tensor([0, 3, 5, 6], dtype=torch.int32, device="cuda")
+    cuc = torch.tensor([0, 0, 0, 0], dtype=torch.int32, device="cuda")
+    go = torch.empty(0, d, dtype=torch.bfloat16, device="cuda")
+    grads = compressor.csa_compressor_backward_wrapper(kv, score, ape, cu, cuc, go, ratio=ratio, head_dim=d, coff=coff)
+    assert grads["grad_kv"].shape == kv.shape and grads["grad_kv"].abs().sum().item() == 0
+    assert grads["grad_score"].shape == score.shape and grads["grad_score"].abs().sum().item() == 0
+    assert grads["grad_ape"].abs().sum().item() == 0
+
+
+_CANARY_SHAPES = [
+    # (lens, head_dim, pad, tok_pad) — every never-consumed dKV/dScore slot class must
+    # be hit: segment tails (seqlen % ratio), the last block's first-half columns, whole
+    # segments shorter than ratio (zero blocks), static-capacity padding rows
+    # (pad > 0 extra grad_out rows), and static token-capacity padding of the gradient
+    # buffers themselves (tok_pad > 0 tokens beyond cu_seqlens[-1]).
+    pytest.param([2048], 128, 0, 0, id="b1-d128"),
+    pytest.param([1023, 2048, 509], 128, 0, 0, id="ragged3-d128"),
+    pytest.param([3, 515, 1024, 129], 128, 0, 0, id="short-seg-d128"),
+    pytest.param([5, 6, 7], 128, 0, 0, id="all-tiny-d128"),
+    pytest.param([1023, 2048, 509], 512, 0, 0, id="ragged3-d512"),
+    pytest.param([3, 515, 1024, 129], 128, 8, 0, id="short-seg-d128-padded"),
+    pytest.param([1023, 2048, 509], 128, 8, 0, id="ragged3-d128-padded"),
+    pytest.param([1023, 2048, 509], 128, 0, 37, id="ragged3-d128-tokpad"),
+    pytest.param([3, 515, 1024, 129], 128, 8, 21, id="short-seg-d128-padded-tokpad"),
+]
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("lens,d,pad,tok_pad", _CANARY_SHAPES)
+def test_backward_fills_uninitialized_buffers(lens, d, pad, tok_pad):
+    """NaN-canary: the backward kernel fully overwrites garbage dKV/dScore buffers.
+
+    The kernel writes exact zeros to every never-consumed slot itself (there are no
+    separate zero-fill kernels anymore), so running it into NaN-poisoned buffers must
+    produce bitwise the same dKV/dScore as running it into zero-initialized buffers.
+    """
+    _require_sm100()
+    compressor = _import_compressor()
+    ratio, coff = 4, 2
+    kv, score, ape, cu, cuc, total_true, _ = _make_inputs(lens, d, ratio, coff)
+    total_comp = total_true + pad
+    gen = torch.Generator(device="cpu").manual_seed(11)
+    go = torch.randn(total_comp, d, generator=gen, dtype=torch.float32).to(torch.bfloat16).cuda()
+    total = kv.shape[0] + tok_pad
+    kv2 = torch.cat([kv.view(kv.shape[0], -1), torch.randn(tok_pad, coff * d, generator=gen, dtype=torch.float32).to(torch.bfloat16).cuda()])
+    score2 = torch.cat([score.view(score.shape[0], -1), torch.randn(tok_pad, coff * d, generator=gen, dtype=torch.float32).to(torch.bfloat16).cuda()])
+
+    bwd = compressor.CSACompressorBackward(
+        sample_kv=kv2,
+        sample_score=score2,
+        sample_ape=ape,
+        sample_cu_seqlens=cu,
+        sample_cu_seqlens_comp=cuc,
+        sample_out=torch.empty(total_comp, d, dtype=torch.bfloat16, device="meta"),
+        ratio=ratio,
+        coff=coff,
+    )
+    assert bwd.check_support()
+    bwd.compile()
+
+    def run(poison):
+        grad_kv = torch.empty_like(kv2)
+        grad_score = torch.empty_like(score2)
+        if poison:
+            grad_kv.fill_(float("nan"))
+            grad_score.fill_(float("nan"))
+        else:
+            grad_kv.zero_()
+            grad_score.zero_()
+        grad_ape = torch.zeros_like(ape)
+        bwd.execute(kv2, score2, ape, cu, cuc, go, grad_kv, grad_score, grad_ape)
+        torch.cuda.synchronize()
+        return grad_kv, grad_score, grad_ape
+
+    gkv_ref, gs_ref, gape_ref = run(poison=False)
+    gkv_nan, gs_nan, gape_nan = run(poison=True)
+    assert not torch.isnan(gkv_nan).any(), "unwritten dKV slots survived (NaN canary)"
+    assert not torch.isnan(gs_nan).any(), "unwritten dScore slots survived (NaN canary)"
+    assert torch.equal(gkv_nan, gkv_ref)
+    assert torch.equal(gs_nan, gs_ref)
+    assert torch.allclose(gape_nan, gape_ref, rtol=0, atol=1e-3)
+
+    # And the zero-slot pattern matches autograd: never-consumed slots are exact zeros,
+    # bitwise as the fp32 eager reference computes them. (The fused backward ignores
+    # incoming gradients on static-capacity padding rows by design, so the eager
+    # reference runs with those rows zeroed.)
+    go_ref = go.clone()
+    go_ref[total_true:] = 0
+    r_fp32 = _run_eager(
+        kv2.view(total, 1, -1),
+        score2.view(total, 1, -1),
+        ape,
+        cu,
+        cuc,
+        total_comp,
+        ratio,
+        d,
+        coff,
+        go_ref.view(total_comp, 1, d),
+        mode="fp32",
+    )
+    assert torch.equal(gkv_nan.view_as(r_fp32[1]), r_fp32[1])
+    assert torch.equal(gs_nan.view_as(r_fp32[2]), r_fp32[2])
 
 
 # ---------------------------------------------------------------------------

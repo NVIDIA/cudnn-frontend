@@ -42,12 +42,17 @@ Backward:
   Atomic-free for ``dKV``/``dScore``: every consumed input element belongs to exactly one
   pooling window (for ``coff == 2``, first-half columns are consumed by the NEXT block's
   window and second-half columns by the OWN block's window), so gradient stores are
-  disjoint. Gradients of elements never consumed (segment-tail tokens; for ``coff == 2``
-  the first-half projection columns of each segment's last block) are exact zeros from
-  the zero-initialized gradient buffers, matching autograd. ``dAPE`` is accumulated in
-  registers over ``rows_per_cta`` blocks and then reduced with one fp32 atomic per
-  ``(k, dim)`` per CTA; ``dAPE`` is therefore not bitwise run-to-run deterministic
-  (forward, ``dKV`` and ``dScore`` are).
+  disjoint. Elements never consumed (segment-tail tokens; for ``coff == 2`` the
+  first-half projection columns of each segment's last block; all tokens of segments
+  shorter than ``ratio``; tokens beyond ``cu_seqlens[-1]`` when the gradient buffers
+  carry static token-capacity padding) are written as exact zeros by the kernel
+  itself — each such slot has a unique natural owner (see the kernel docstring) — so
+  ``dKV``/``dScore`` buffers need no zero-initialization and no separate fill kernels,
+  matching autograd output exactly. ``dAPE`` is accumulated in registers over ``rows_per_cta`` blocks and
+  then reduced with one fp32 atomic per ``(k, dim)`` per CTA into a buffer the caller
+  must still zero-initialize; ``dAPE`` is therefore not bitwise run-to-run deterministic
+  (forward, ``dKV`` and ``dScore`` are). When ``total_comp == 0`` no kernel is launched
+  and the buffers are left untouched (the wrapper falls back to allocating zeros).
 
 Static-capacity padding (``total_comp > cu_seqlens_comp[-1]``):
   Forward computes the padding rows exactly like the eager code: they gather the window
@@ -456,11 +461,12 @@ def _compressor_bwd_kernel(
     mCu: cute.Tensor,  # [n_seq + 1] int32
     mCuComp: cute.Tensor,  # [n_seq + 1] int32
     mGO: cute.Tensor,  # flat [nb_total * d] bf16
-    mGKV: cute.Tensor,  # flat [T * W] bf16 (zero-initialized)
-    mGS: cute.Tensor,  # flat [T * W] bf16 (zero-initialized)
+    mGKV: cute.Tensor,  # flat [T * W] bf16 (fully written; may be uninitialized)
+    mGS: cute.Tensor,  # flat [T * W] bf16 (fully written; may be uninitialized)
     mGAPE: cute.Tensor,  # flat [ratio * W] fp32 (zero-initialized)
     nb_total: cutlass.Int32,
     n_seq: cutlass.Int32,
+    total_tokens: cutlass.Int32,
     ratio: cutlass.Constexpr,
     d: cutlass.Constexpr,
     coff: cutlass.Constexpr,
@@ -469,14 +475,31 @@ def _compressor_bwd_kernel(
 ):
     """Backward: recompute window probs, disjoint ``dKV``/``dScore`` stores, ``dAPE`` atomics.
 
-    Rows in ``[cu_seqlens_comp[-1], nb_total)`` are static-capacity padding; their
-    incoming gradients are ignored.
+    ``dKV``/``dScore`` are FULLY written by the kernel: consumed positions get their
+    gradients, and every never-consumed position gets an exact zero from its unique
+    natural owner (see below), so the caller can pass uninitialized buffers instead of
+    paying two tensor-wide zero-fills. The zero-write ownership keeps all stores
+    disjoint (no atomics, bitwise run-to-run deterministic):
+
+      - for ``coff == 2``, the first-half columns of each segment's LAST block's own
+        tokens (no next block consumes them) — written by that last block;
+      - per-segment tail tokens (``seqlen % ratio``, both halves) — written by the
+        segment's last block;
+      - all tokens of segments with zero output blocks (``seqlen < ratio``) — written
+        by the CTA column ``bidx == 0``;
+      - tokens beyond ``cu_seqlens[-1]`` (static token-capacity padding of the
+        gradient buffers) — grid-strided across the CTA columns.
+
+    ``dAPE`` is still accumulated into a caller-zero-initialized buffer with one fp32
+    atomic per ``(k, dim)`` per CTA. Rows in ``[cu_seqlens_comp[-1], nb_total)`` are
+    static-capacity padding; their incoming gradients are ignored.
     """
     tidx, _, _ = cute.arch.thread_idx()
     bidx, bidy, _ = cute.arch.block_idx()
     dim = bidy * threads + tidx
     W: cutlass.Constexpr = coff * d
     win: cutlass.Constexpr = 2 * ratio if coff == 2 else ratio
+    ZERO_BF16 = cutlass.BFloat16(0.0)
 
     if dim < d:
         ape_k = []
@@ -490,6 +513,41 @@ def _compressor_bwd_kernel(
             dape.append(cutlass.Float32(0.0))
 
         nb_valid = mCuComp[n_seq]
+
+        # CTA column (0, bidy) zeroes both halves of every token in segments that have
+        # zero output blocks (seqlen < ratio): those tokens are never consumed by any
+        # pooling window, so no block-owning CTA would otherwise write them.
+        if bidx == 0:
+            for s in cutlass.range(n_seq):
+                if mCuComp[s + 1] == mCuComp[s]:
+                    t0 = mCu[s]
+                    t1 = mCu[s + 1]
+                    for tt in cutlass.range(t1 - t0):
+                        mGKV[(t0 + tt) * W + dim] = ZERO_BF16
+                        mGS[(t0 + tt) * W + dim] = ZERO_BF16
+                        if cutlass.const_expr(coff == 2):
+                            mGKV[(t0 + tt) * W + d + dim] = ZERO_BF16
+                            mGS[(t0 + tt) * W + d + dim] = ZERO_BF16
+
+        # Tokens in [cu_seqlens[-1], total_tokens) are static token-capacity padding of
+        # the gradient buffers (CUDA-graph static shapes): no segment owns them, so the
+        # CTA columns zero them in a grid-strided sweep. count == 0 in the common
+        # exact-size case. The quotient/remainder split keeps every intermediate within
+        # int32 for any count < 2**31.
+        gdimx, _, _ = cute.arch.grid_dim()
+        pad0 = mCu[n_seq]
+        pad_count = total_tokens - pad0
+        if bidx < pad_count:
+            my_count = pad_count // gdimx
+            if bidx < pad_count % gdimx:
+                my_count = my_count + 1
+            for i in cutlass.range(my_count):
+                t = pad0 + bidx + i * gdimx
+                mGKV[t * W + dim] = ZERO_BF16
+                mGS[t * W + dim] = ZERO_BF16
+                if cutlass.const_expr(coff == 2):
+                    mGKV[t * W + d + dim] = ZERO_BF16
+                    mGS[t * W + d + dim] = ZERO_BF16
 
         for rr in cutlass.range_constexpr(rows_per_cta):
             bb = bidx * rows_per_cta + rr
@@ -567,6 +625,25 @@ def _compressor_bwd_kernel(
                         mGS[offs[k]] = cutlass.BFloat16(ds)
                         dape[k] = dape[k] + ds
 
+                # The segment's last block additionally zeroes the never-consumed slots
+                # it is the unique natural owner of: (a) for coff == 2 the first-half
+                # columns of its own tokens (there is no next block to consume them),
+                # (b) the segment's tail tokens (seqlen % ratio, both halves).
+                is_last = bb + 1 == mCuComp[seq_idx + 1]
+                if is_last:
+                    if cutlass.const_expr(coff == 2):
+                        for k in cutlass.range_constexpr(ratio):
+                            mGKV[(tok0 + k) * W + dim] = ZERO_BF16
+                            mGS[(tok0 + k) * W + dim] = ZERO_BF16
+                    tail0 = tok0 + ratio
+                    tail1 = mCu[seq_idx + 1]
+                    for tt in cutlass.range(tail1 - tail0):
+                        mGKV[(tail0 + tt) * W + dim] = ZERO_BF16
+                        mGS[(tail0 + tt) * W + dim] = ZERO_BF16
+                        if cutlass.const_expr(coff == 2):
+                            mGKV[(tail0 + tt) * W + d + dim] = ZERO_BF16
+                            mGS[(tail0 + tt) * W + d + dim] = ZERO_BF16
+
         # One fp32 atomic per (k, dim) per CTA (amortized over rows_per_cta rows).
         for k in cutlass.range_constexpr(win):
             if cutlass.const_expr(coff == 2 and k < ratio):
@@ -639,6 +716,7 @@ def _compressor_bwd_launch(
     gape_ptr: cute.Pointer,
     nb_total: cutlass.Int32,
     n_seq: cutlass.Int32,
+    total_tokens: cutlass.Int32,
     stream: cuda_driver.CUstream,
     ratio: cutlass.Constexpr,
     d: cutlass.Constexpr,
@@ -671,6 +749,7 @@ def _compressor_bwd_launch(
         mGAPE,
         nb_total,
         n_seq,
+        total_tokens,
         ratio,
         d,
         coff,
@@ -810,6 +889,7 @@ def precompile_bwd(ratio, d, coff, device):
             _f32_ptr(scratch_f32),
             cutlass.Int32(0),
             cutlass.Int32(1),
+            cutlass.Int32(0),
             stream,
         )
         _compile_bwd(key, args, ratio, d, coff)
@@ -866,10 +946,12 @@ def run_fwd(kv, score, ape, cu_i, cuc_i, out, nb_total, ratio, d, coff, stream_h
 def run_bwd(kv, score, ape, cu_i, cuc_i, go, gkv, gs, gape, nb_total, ratio, d, coff, stream_handle=None):
     """Launch the backward kernel (cached fast path -> compiled slow path -> JIT).
 
-    Device-context anchoring as in :func:`run_fwd`.
+    Device-context anchoring as in :func:`run_fwd`. The gradient-buffer token capacity
+    (for the kernel's padding-token zero sweep) is derived from ``kv``'s element count.
     """
     dev = kv.device.index
     key = ("bwd", ratio, d, coff, dev)
+    total_tokens = kv.numel() // (coff * d)
     if stream_handle is None:
         stream_handle = _raw_stream(dev)
     with torch.cuda.device(dev):
@@ -887,7 +969,8 @@ def run_bwd(kv, score, ape, cu_i, cuc_i, go, gkv, gs, gape, nb_total, ratio, d, 
             slots[8].value = gape.data_ptr()
             slots[9].value = nb_total
             slots[10].value = cu_i.numel() - 1
-            slots[11].value = stream_handle
+            slots[11].value = total_tokens
+            slots[12].value = stream_handle
             launcher.launch()
             return
         stream = cuda_driver.CUstream(stream_handle)
@@ -903,6 +986,7 @@ def run_bwd(kv, score, ape, cu_i, cuc_i, go, gkv, gs, gape, nb_total, ratio, d, 
             _f32_ptr(gape),
             cutlass.Int32(nb_total),
             cutlass.Int32(cu_i.numel() - 1),
+            cutlass.Int32(total_tokens),
             stream,
         )
         fn = _COMPILED.get(key)

@@ -354,13 +354,20 @@ class CSACompressorForward(_CSACompressorBase):
 class CSACompressorBackward(_CSACompressorBase):
     """Fused CSA compressor backward: recompute window probs, write grads in one kernel.
 
-    ``grad_kv``/``grad_score``/``grad_ape`` must be zero-initialized by the caller: the
-    kernel only writes the positions its pooling windows consume (the stores are
-    disjoint, atomic-free for ``grad_kv``/``grad_score``), so unconsumed positions keep
-    their exact zeros, matching autograd. Incoming gradients on static-capacity padding
-    rows (``[cu_seqlens_comp[-1], total_comp)``) are ignored. ``grad_ape`` is accumulated
-    with fp32 atomics and is not bitwise run-to-run deterministic; ``execute`` raises
-    under ``torch.use_deterministic_algorithms(True)``.
+    ``grad_kv``/``grad_score`` may be UNINITIALIZED: the kernel writes every position —
+    consumed positions get their gradients (disjoint, atomic-free stores), and every
+    never-consumed position (segment-tail tokens; for ``coff == 2`` the first-half
+    columns of each segment's last block; tokens of segments shorter than ``ratio``;
+    tokens beyond ``cu_seqlens[-1]`` when the buffers carry static token-capacity
+    padding) gets an exact zero from its unique owning CTA — matching autograd without
+    separate zero-fill kernels. Exception: when ``total_comp == 0`` the kernel is not
+    launched and the buffers are left untouched, so a caller that needs autograd-exact
+    zeros in that case must zero them itself (the high-level wrapper does).
+    ``grad_ape`` must always be zero-initialized: it is accumulated with fp32 atomics
+    and is not bitwise run-to-run deterministic (``grad_kv``/``grad_score`` are);
+    ``execute`` raises under ``torch.use_deterministic_algorithms(True)``. Incoming
+    gradients on static-capacity padding rows (``[cu_seqlens_comp[-1], total_comp)``)
+    are ignored.
     """
 
     def compile(self) -> None:
@@ -401,12 +408,12 @@ class CSACompressorBackward(_CSACompressorBase):
         cu_seqlens: torch.Tensor,  # (B + 1,) INT32, contiguous
         cu_seqlens_comp: torch.Tensor,  # (B + 1,) INT32, contiguous
         grad_out: torch.Tensor,  # (total_comp, head_dim) BF16, contiguous
-        grad_kv: torch.Tensor,  # (total_tokens, coff * head_dim) BF16, ZERO-INITIALIZED
-        grad_score: torch.Tensor,  # (total_tokens, coff * head_dim) BF16, ZERO-INITIALIZED
+        grad_kv: torch.Tensor,  # (total_tokens, coff * head_dim) BF16 (may be uninitialized; fully written when total_comp > 0)
+        grad_score: torch.Tensor,  # (total_tokens, coff * head_dim) BF16 (may be uninitialized; fully written when total_comp > 0)
         grad_ape: torch.Tensor,  # (ratio, coff * head_dim) FP32, ZERO-INITIALIZED
         current_stream: Optional[cuda.CUstream] = None,
     ) -> None:
-        """Run the compiled backward kernel into the zero-initialized gradient buffers."""
+        """Run the compiled backward kernel into the gradient buffers (see class docs)."""
         self._logger.debug("Entering execute")
         if self._compiled_kernel is None:
             raise ValueError("CSACompressorBackward kernel not compiled")
@@ -536,10 +543,15 @@ def csa_compressor_backward_wrapper(
     coff: int = 2,
     stream: Optional[cuda.CUstream] = None,
 ) -> TupleDict:
-    """High-level backward wrapper. Allocates zero-initialized grads and fills them.
+    """High-level backward wrapper. Allocates the grad buffers and fills them.
 
     ``grad_out`` is ``(total_comp, head_dim)`` BF16 (the incoming gradient of the
     forward wrapper's ``out``); gradients on static-capacity padding rows are ignored.
+    ``grad_kv``/``grad_score`` are allocated UNINITIALIZED — the kernel writes every
+    position, storing exact zeros to never-consumed positions itself, so no zero-fill
+    kernels run; ``grad_ape`` is allocated zeroed (fp32 atomic accumulation). When
+    ``total_comp == 0`` the kernel is not launched and all three grads are allocated as
+    zeros instead, preserving autograd's exact-zero semantics.
     Raises ``RuntimeError`` under ``torch.use_deterministic_algorithms(True)`` because
     ``grad_ape`` is accumulated with fp32 atomics (``grad_kv``/``grad_score`` are
     deterministic and bitwise reproducible).
@@ -555,8 +567,13 @@ def csa_compressor_backward_wrapper(
         raise ValueError(f"grad_out must be 2-D (total_comp, head_dim), got {tuple(grad_out.shape)}")
     api = _get_api("bwd", kv, score, ape, cu_seqlens, cu_seqlens_comp, tuple(grad_out.shape), ratio, coff)
     with torch.cuda.device(kv.device), _torch_stream_context(stream, kv.device):
-        grad_kv = torch.zeros_like(kv)
-        grad_score = torch.zeros_like(score)
+        if grad_out.shape[0] == 0:
+            # No kernel launch below -> the buffers must carry autograd's exact zeros.
+            grad_kv = torch.zeros_like(kv)
+            grad_score = torch.zeros_like(score)
+        else:
+            grad_kv = torch.empty_like(kv)
+            grad_score = torch.empty_like(score)
         grad_ape = torch.zeros_like(ape, dtype=torch.float32)
     with torch.cuda.nvtx.range("csa_compressor_bwd_kernel"):
         api.execute(kv, score, ape, cu_seqlens, cu_seqlens_comp, grad_out, grad_kv, grad_score, grad_ape, current_stream=stream)
