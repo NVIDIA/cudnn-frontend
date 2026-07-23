@@ -11,9 +11,9 @@ runtime targets:
   L0: default smoke slice
   L1: expansion slice for longer runs
 
-Developer diagnostic engine-filter examples:
-  CUDNN_FUZZ_ENGINE_OP=fprop CUDNN_FUZZ_ENGINE_IDS=0 pytest ...
-  CUDNN_FUZZ_ENGINE_OP=fprop CUDNN_FUZZ_ENGINE_IDS=0 \
+Developer diagnostic graph-engine filter examples:
+  CUDNN_FUZZ_ENGINE_OP=fprop CUDNN_FUZZ_GRAPH_ENGINE_INDICES=0 pytest ...
+  CUDNN_FUZZ_ENGINE_OP=fprop CUDNN_FUZZ_GRAPH_ENGINE_INDICES=0 \
     CUDNN_FUZZ_REGEN_ON_UNSUPPORTED=1 CUDNN_FUZZ_REGEN_ATTEMPTS=50 pytest ...
 """
 
@@ -36,26 +36,26 @@ import torch
 # ---------------------------------------------------------------------------
 
 _WORKER_MEM_FRACTION = 0.80  # fraction of (total_gpu / workers) to budget per test
-_ENGINE_FILTER_OP_ENV = "CUDNN_FUZZ_ENGINE_OP"  # local-only op filter: fprop/dgrad/wgrad
-_ENGINE_FILTER_ENV = "CUDNN_FUZZ_ENGINE_IDS"  # local-only backend engine ids
+_GRAPH_ENGINE_OP_ENV = "CUDNN_FUZZ_ENGINE_OP"  # graph-specific op selector: fprop/dgrad/wgrad
+_GRAPH_ENGINE_INDICES_ENV = "CUDNN_FUZZ_GRAPH_ENGINE_INDICES"  # public operation-graph engine indices
 _REGEN_ON_UNSUPPORTED_ENV = "CUDNN_FUZZ_REGEN_ON_UNSUPPORTED"  # retry unsupported engine picks
 _REGEN_ATTEMPTS_ENV = "CUDNN_FUZZ_REGEN_ATTEMPTS"  # retry cap for regeneration
 _WORK_BUDGET_FLOPS_ENV = "CUDNN_FUZZ_WORK_BUDGET_FLOPS"  # override generated test work cap
 _NUM_TESTS_L0_ENV = "CUDNN_FUZZ_NUM_TESTS_L0"  # override L0 generated count
 _NUM_TESTS_L1_ENV = "CUDNN_FUZZ_NUM_TESTS_L1"  # override L1 generated count
-_REPRO_CONFIG_ENV = "CUDNN_FUZZ_REPRO_CONFIG"  # exact repro JSON payload
-_REPRO_FILE_ENV = "CUDNN_FUZZ_REPRO_FILE"  # path to exact repro JSON payload
-_BACKEND_ENGINE_MOD = 100  # backend enum suffix used by cudnnTest/backendEngine
+_REPRO_CONFIG_ENV = "CUDNN_FUZZ_REPRO_CONFIG"  # exact configuration JSON payload
+_REPRO_FILE_ENV = "CUDNN_FUZZ_REPRO_FILE"  # path to exact configuration JSON payload
 _REPRO_SCHEMA_VERSION = 1
 _REPRO_MESSAGE_LIMIT = 4096
 _DEFAULT_WORK_BUDGET_FLOPS = 100_000_000_000_000  # 100 TFLOP per generated test
 _SPARSE_INTEGER_REDUCTION_THRESHOLD = 1 << 20  # switch very large reductions off dense random data
 _SPARSE_INTEGER_TARGET_NONZERO = 32  # max nonzero filter values per output channel
 _SPARSE_INTEGER_RNG_SALT = 0x51A25EED  # split sparse-index RNG from tensor-value RNG
+_GRAPH_ENGINE_RNG_SALT = 0xE61A5EED  # split engine selection from config and tensor RNGs
 
 
 class _EngineFilterNotSupported(Exception):
-    """Selected-engine support miss, not a cuDNN execution failure."""
+    """Selected graph engine is unsupported, not a cuDNN execution failure."""
 
     pass
 
@@ -84,27 +84,35 @@ def _device_memory_budget(fraction: float = _WORKER_MEM_FRACTION) -> int:
     return 7 * (1 << 30)
 
 
-def _engine_filter_ids() -> List[int]:
-    """Parse the optional comma-separated backend engine id filter."""
-    raw = os.environ.get(_ENGINE_FILTER_ENV, "").strip()
-    op = os.environ.get(_ENGINE_FILTER_OP_ENV, "").strip()
-    if op and not raw:
-        raise ValueError(f"{_ENGINE_FILTER_ENV} must be set when {_ENGINE_FILTER_OP_ENV} is set")
+def _graph_engine_indices() -> List[int]:
+    """Parse the optional comma-separated public graph engine indices."""
+    raw = os.environ.get(_GRAPH_ENGINE_INDICES_ENV, "").strip()
+    op = os.environ.get(_GRAPH_ENGINE_OP_ENV, "").strip()
+    if raw and not op:
+        raise ValueError(f"{_GRAPH_ENGINE_OP_ENV} must be set when {_GRAPH_ENGINE_INDICES_ENV} is set")
     if not raw:
         return []
 
     try:
-        return [int(v.strip()) for v in raw.split(",") if v.strip()]
+        indices = [int(v.strip()) for v in raw.split(",") if v.strip()]
     except ValueError as e:
-        raise ValueError(f"{_ENGINE_FILTER_ENV} must be a comma-separated list of engine ids") from e
+        raise ValueError(f"{_GRAPH_ENGINE_INDICES_ENV} must be a comma-separated list of graph engine indices") from e
+    if not indices:
+        raise ValueError(f"{_GRAPH_ENGINE_INDICES_ENV} must contain at least one graph engine index")
+    seen = set()
+    for index in indices:
+        if index in seen:
+            raise ValueError(f"{_GRAPH_ENGINE_INDICES_ENV} contains duplicate graph engine index {index}")
+        seen.add(index)
+    return indices
 
 
-def _engine_filter_op() -> Optional["ConvType"]:
-    """Parse the convolution op paired with the engine-id filter."""
-    raw = os.environ.get(_ENGINE_FILTER_OP_ENV, "").strip().lower()
-    ids = os.environ.get(_ENGINE_FILTER_ENV, "").strip()
-    if ids and not raw:
-        raise ValueError(f"{_ENGINE_FILTER_OP_ENV} must be set when {_ENGINE_FILTER_ENV} is set")
+def _graph_engine_filter_op() -> Optional["ConvType"]:
+    """Parse the convolution op paired with the graph engine index filter."""
+    raw = os.environ.get(_GRAPH_ENGINE_OP_ENV, "").strip().lower()
+    indices = os.environ.get(_GRAPH_ENGINE_INDICES_ENV, "").strip()
+    if indices and not raw:
+        raise ValueError(f"{_GRAPH_ENGINE_OP_ENV} must be set when {_GRAPH_ENGINE_INDICES_ENV} is set")
     if not raw:
         return None
 
@@ -119,20 +127,24 @@ def _engine_filter_op() -> Optional["ConvType"]:
     try:
         return aliases[raw]
     except KeyError as e:
-        raise ValueError(f"{_ENGINE_FILTER_OP_ENV} must be one of fprop, dgrad, or wgrad") from e
+        raise ValueError(f"{_GRAPH_ENGINE_OP_ENV} must be one of fprop, dgrad, or wgrad") from e
 
 
 def _env_flag(name: str) -> bool:
-    """Interpret common truthy env-var values."""
+    """Interpret common boolean env-var values."""
     raw = os.environ.get(name, "").strip().lower()
-    return raw in ("1", "true", "yes", "on")
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("", "0", "false", "no", "off"):
+        return False
+    raise ValueError(f"{name} must be one of 1, true, yes, on, 0, false, no, or off")
 
 
 def _regen_on_unsupported() -> bool:
-    """Return whether local engine-filter runs should retry unsupported configs."""
+    """Return whether graph-engine filter runs should retry unsupported configs."""
     enabled = _env_flag(_REGEN_ON_UNSUPPORTED_ENV)
-    if enabled and not _engine_filter_ids():
-        raise ValueError(f"{_REGEN_ON_UNSUPPORTED_ENV} requires {_ENGINE_FILTER_OP_ENV} and " f"{_ENGINE_FILTER_ENV}")
+    if enabled and not _graph_engine_indices():
+        raise ValueError(f"{_REGEN_ON_UNSUPPORTED_ENV} requires {_GRAPH_ENGINE_OP_ENV} and " f"{_GRAPH_ENGINE_INDICES_ENV}")
     return enabled
 
 
@@ -180,9 +192,9 @@ def _num_tests(env_name: str, default: int) -> int:
     return value
 
 
-def _kernel_cfg_choices(graph, engine: int) -> List[dict]:
-    """Expand KERNEL_CFG knob values for one frontend engine."""
-    knobs = graph.get_knobs_for_engine(engine)
+def _kernel_cfg_choices(graph, engine_index: int) -> List[dict]:
+    """Expand KERNEL_CFG knob values for one public graph engine index."""
+    knobs = graph.get_knobs_for_engine(engine_index)
     kernel_cfg_knobs = [knob for knob in knobs if knob.type == cudnn.knob_type.KERNEL_CFG]
     if not kernel_cfg_knobs:
         return [{}]
@@ -199,34 +211,45 @@ def _kernel_cfg_choices(graph, engine: int) -> List[dict]:
     return choices
 
 
-def _create_filtered_execution_plans(graph, backend_engine_ids: List[int]) -> None:
-    """Create execution plans only for the requested backend engine ids."""
+def _validate_graph_engine_indices(graph, graph_engine_indices: List[int]) -> None:
+    """Validate requested public indices against this operation graph."""
     engine_count = graph.get_engine_count()
-    failures = []
+    invalid_indices = [index for index in graph_engine_indices if index < 0 or index >= engine_count]
+    if invalid_indices:
+        valid_range = f"0..{engine_count - 1}" if engine_count else "empty because the graph reports no engines"
+        invalid = ",".join(str(index) for index in invalid_indices)
+        noun = "index" if len(invalid_indices) == 1 else "indices"
+        raise ValueError(f"graph engine {noun} {invalid} is outside valid range {valid_range}")
+
+
+def _select_graph_engine_index(cfg: "LargeTensorConfig", graph_engine_indices: List[int]) -> int:
+    """Select one requested engine deterministically for this testcase."""
+    if not graph_engine_indices:
+        raise ValueError("Cannot select a graph engine from an empty index list")
+    rng = random.Random(cfg.rng_seed ^ _GRAPH_ENGINE_RNG_SALT)
+    return rng.choice(graph_engine_indices)
+
+
+def _create_filtered_execution_plans(graph, graph_engine_index: int) -> None:
+    """Create knob-derived plans for one selected public graph engine index."""
     created_count = 0
 
-    for backend_engine_id in backend_engine_ids:
-        engine = backend_engine_id % _BACKEND_ENGINE_MOD
-        if engine >= engine_count:
-            failures.append(f"backend engine {backend_engine_id} -> frontend engine {engine} " f"outside available range 0..{engine_count - 1}")
-            continue
+    try:
+        knob_choices = _kernel_cfg_choices(graph, graph_engine_index)
+    except cudnn.cudnnGraphNotSupportedError as e:
+        raise _EngineFilterNotSupported(f"graph engine index {graph_engine_index} knobs unavailable: {e}") from e
 
+    failures = []
+    for knob_choice in knob_choices:
         try:
-            knob_choices = _kernel_cfg_choices(graph, engine)
-        except RuntimeError as e:
-            failures.append(f"backend engine {backend_engine_id} knobs unavailable: {e}")
-            continue
-
-        for knob_choice in knob_choices:
-            try:
-                graph.create_execution_plan(engine, knob_choice)
-                created_count += 1
-            except (cudnn.cudnnGraphNotSupportedError, RuntimeError) as e:
-                failures.append(f"backend engine {backend_engine_id} knob choice {knob_choice} rejected: {e}")
+            graph.create_execution_plan(graph_engine_index, knob_choice)
+            created_count += 1
+        except cudnn.cudnnGraphNotSupportedError as e:
+            failures.append(f"knob choice {knob_choice} rejected: {e}")
 
     if created_count == 0:
         details = "; ".join(failures[:3]) if failures else "no candidate plans created"
-        raise _EngineFilterNotSupported(f"{_ENGINE_FILTER_ENV}={','.join(str(v) for v in backend_engine_ids)} " f"created no execution plans ({details})")
+        raise _EngineFilterNotSupported(f"graph engine index {graph_engine_index} created no execution plans ({details})")
 
 
 MEMORY_BUDGET_BYTES = _device_memory_budget()
@@ -679,6 +702,9 @@ def _repro_payload(
     test_id = None
     if test_num is not None and total_tests is not None and config_seed is not None:
         test_id = _test_id((test_num, total_tests, config_seed, cfg))
+    graph_engine_op = _graph_engine_filter_op()
+    graph_engine_indices = _graph_engine_indices()
+    selected_graph_engine_index = _select_graph_engine_index(cfg, graph_engine_indices) if graph_engine_indices else None
 
     metadata = {
         "test_id": test_id,
@@ -705,6 +731,9 @@ def _repro_payload(
         "tolerance_policy": _tolerance_policy_name(cfg),
         "rtol": rtol,
         "atol": atol,
+        "graph_engine_op": graph_engine_op.name.lower() if graph_engine_op is not None else None,
+        "requested_graph_engine_indices": graph_engine_indices,
+        "selected_graph_engine_index": selected_graph_engine_index,
     }
     return {
         "schema": _REPRO_SCHEMA_VERSION,
@@ -720,8 +749,15 @@ def _repro_json(payload: dict, *, pretty: bool = False) -> str:
 
 
 def _repro_command(payload: dict) -> str:
+    metadata = payload.get("metadata", {})
+    graph_engine_indices = metadata.get("requested_graph_engine_indices", [])
+    graph_filter = ""
+    if graph_engine_indices:
+        graph_engine_op = metadata["graph_engine_op"]
+        indices = ",".join(str(index) for index in graph_engine_indices)
+        graph_filter = f"{_GRAPH_ENGINE_OP_ENV}={shlex.quote(graph_engine_op)} " f"{_GRAPH_ENGINE_INDICES_ENV}={shlex.quote(indices)} "
     return (
-        f"{_REPRO_CONFIG_ENV}={shlex.quote(_repro_json(payload))} "
+        f"{graph_filter}{_REPRO_CONFIG_ENV}={shlex.quote(_repro_json(payload))} "
         f"{shlex.quote(sys.executable)} -m pytest test/python/test_conv_large_tensor_fuzzer.py "
         "-o addopts= -k test_conv_large_tensor_repro -s"
     )
@@ -744,7 +780,7 @@ def _format_repro_context(
     return (
         "\n\nLarge tensor fuzzer repro command:\n"
         f"{_repro_command(payload)}\n\n"
-        "Large tensor fuzzer repro JSON:\n"
+        "Large tensor fuzzer configuration JSON:\n"
         f"{_repro_json(payload, pretty=True)}\n\n"
         "Large tensor fuzzer context: "
         f"{_comparison_context(cfg, rtol, atol)}"
@@ -773,10 +809,19 @@ class LargeTensorConfigGenerator:
     _DTYPES = [torch.float16, torch.bfloat16, torch.float32]
     _POW2 = [1, 2, 4, 8, 16, 32, 64]
 
-    def __init__(self, seed: int, allow_unaligned: bool = False, include_extras: bool = False):
+    def __init__(
+        self,
+        seed: int,
+        allow_unaligned: bool = False,
+        include_extras: bool = False,
+        forced_conv_type: Optional[ConvType] = None,
+        force_plain_fprop: bool = False,
+    ):
         self.rng = random.Random(seed)
         self.allow_unaligned = allow_unaligned
         self.include_extras = include_extras
+        self.forced_conv_type = forced_conv_type
+        self.force_plain_fprop = force_plain_fprop
 
     def _ch(self, lo: int, hi: int) -> int:
         """Pick a channel count; aligned (power of 2) for L0, arbitrary for L1."""
@@ -802,12 +847,8 @@ class LargeTensorConfigGenerator:
         out_spatial = None  # None -> output 1x1 (valid conv)
 
         if shape_family == ShapeFamily.NARROW:
-            # Cap dims at 2048 and raise C to still hit C*R*S > 2^27 (the int32
-            # overflow threshold). NOTE: empirically on H100 NVL (cuDNN 9.2.3),
-            # 2D dgrad with any filter dim > ~2048 (e.g. R=2729, S=7023, f32)
-            # takes >900 s — cuDNN dgrad kernels appear to scale very poorly for
-            # large asymmetric 2D filter sizes. This is worth investigating in
-            # the cuDNN backend.
+            # Large asymmetric filters can dominate DGRAD runtime. Bound R and S
+            # here, then use C to preserve the target C*R*S coverage.
             r, s = rng.randint(512, 2048), rng.randint(512, 2048)
             c, k = self._ch(8, 64), self._ch(1, 4)
         elif shape_family == ShapeFamily.BALANCED:
@@ -888,14 +929,17 @@ class LargeTensorConfigGenerator:
         rng = self.rng
         for _ in range(MAX_REGEN_ATTEMPTS):
             dtype = rng.choice(self._DTYPES)
-            conv_type = rng.choices(self._OPS, weights=self._OP_WEIGHTS)[0]
+            conv_type = self.forced_conv_type
+            if conv_type is None:
+                conv_type = rng.choices(self._OPS, weights=self._OP_WEIGHTS)[0]
             shape_family = rng.choices(self._SHAPE_FAMILIES, weights=self._SHAPE_FAMILY_WEIGHTS)[0]
             sdims = rng.choices([2, 3], weights=[0.75, 0.25])[0]
 
             raw = self._raw2d(shape_family) if sdims == 2 else self._raw3d(shape_family)
 
-            # Epilogues only apply to FPROP
-            if conv_type != ConvType.FPROP:
+            # Epilogues only apply to FPROP, and engine-index filtering targets
+            # the plain convolution operation graph.
+            if conv_type != ConvType.FPROP or self.force_plain_fprop:
                 raw["epilogue"] = "none"
 
             cfg = LargeTensorConfig(
@@ -923,23 +967,28 @@ class LargeTensorConfigGenerator:
         )
 
 
-def tlist_with_configs(*, num_tests: int, rng_seed: int, allow_unaligned: bool = False, include_extras: bool = False) -> list:
+def tlist_with_configs(
+    *,
+    num_tests: int,
+    rng_seed: int,
+    allow_unaligned: bool = False,
+    include_extras: bool = False,
+    forced_conv_type: Optional[ConvType] = None,
+    force_plain_fprop: bool = False,
+) -> list:
     rng = random.Random(rng_seed)
     out = []
     for i in range(num_tests):
         config_seed = rng.randint(65536, 2**31 - 1)
-        gen = LargeTensorConfigGenerator(config_seed, allow_unaligned=allow_unaligned, include_extras=include_extras)
+        gen = LargeTensorConfigGenerator(
+            config_seed,
+            allow_unaligned=allow_unaligned,
+            include_extras=include_extras,
+            forced_conv_type=forced_conv_type,
+            force_plain_fprop=force_plain_fprop,
+        )
         out.append((i + 1, num_tests, config_seed, gen.generate()))
     return out
-
-
-def _filter_params_for_engine_op(params: list) -> list:
-    filtered_op = _engine_filter_op()
-    if filtered_op is None:
-        return params
-
-    _engine_filter_ids()  # validate that engine ids were supplied with the op
-    return [param for param in params if param[3].conv_type == filtered_op]
 
 
 # ---------------------------------------------------------------------------
@@ -1046,32 +1095,24 @@ def _run_cudnn(cfg: LargeTensorConfig, X: torch.Tensor, W: torch.Tensor, Y: torc
 
         graph.validate()
         graph.build_operation_graph()
-        filtered_op = _engine_filter_op()
-        filtered_backend_engines = _engine_filter_ids()
-        if filtered_backend_engines:
+        filtered_op = _graph_engine_filter_op()
+        filtered_graph_engine_indices = _graph_engine_indices()
+        if filtered_graph_engine_indices:
             if cfg.conv_type != filtered_op:
-                raise _EngineFilterNotSupported(f"{_ENGINE_FILTER_OP_ENV}={filtered_op.name.lower()} does not match " f"test op {cfg.conv_type.name.lower()}")
-            _create_filtered_execution_plans(graph, filtered_backend_engines)
+                raise ValueError(f"{_GRAPH_ENGINE_OP_ENV}={filtered_op.name.lower()} does not match " f"test op {cfg.conv_type.name.lower()}")
+            _validate_graph_engine_indices(graph, filtered_graph_engine_indices)
+            selected_graph_engine_index = _select_graph_engine_index(cfg, filtered_graph_engine_indices)
+            _create_filtered_execution_plans(graph, selected_graph_engine_index)
         else:
             graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
         graph.check_support()
         graph.build_plans()
 
-        if filtered_backend_engines:
-            if graph.get_execution_plan_count() <= 0:
-                raise _EngineFilterNotSupported(
-                    f"{_ENGINE_FILTER_ENV}={','.join(str(v) for v in filtered_backend_engines)} " "had no supported execution plans after check_support"
-                )
-            ws_size = graph.get_workspace_size_plan_at_index(0)
-        else:
-            ws_size = graph.get_workspace_size()
+        ws_size = graph.get_workspace_size()
         workspace = torch.empty(ws_size, device="cuda", dtype=torch.uint8)
         _poison_workspace(workspace)
 
-        if filtered_backend_engines:
-            graph.execute_plan_at_index(vpack, workspace, index=0, handle=handle)
-        else:
-            graph.execute(vpack, workspace, handle=handle)
+        graph.execute(vpack, workspace, handle=handle)
         torch.cuda.synchronize()
         return True, "ok"
 
@@ -1266,7 +1307,7 @@ def _run_single_config(
 
 
 def _run_test(cfg: LargeTensorConfig, cudnn_handle, test_num: int, total_tests: int, config_seed: int, allow_unaligned: bool, include_extras: bool) -> None:
-    if _regen_on_unsupported():
+    if _REGEN_ON_UNSUPPORTED_ENABLED:
         _run_test_with_regen(
             config_seed=config_seed,
             test_num=test_num,
@@ -1290,19 +1331,22 @@ def _run_test(cfg: LargeTensorConfig, cudnn_handle, test_num: int, total_tests: 
 
 
 def _run_test_with_regen(*, config_seed: int, test_num: int, total_tests: int, allow_unaligned: bool, include_extras: bool, cudnn_handle) -> None:
-    filtered_op = _engine_filter_op()
+    filtered_op = _graph_engine_filter_op()
     if filtered_op is None:
-        raise ValueError(f"{_REGEN_ON_UNSUPPORTED_ENV} requires {_ENGINE_FILTER_OP_ENV}")
+        raise ValueError(f"{_REGEN_ON_UNSUPPORTED_ENV} requires {_GRAPH_ENGINE_OP_ENV}")
 
-    gen = LargeTensorConfigGenerator(config_seed, allow_unaligned=allow_unaligned, include_extras=include_extras)
-    max_attempts = _regen_attempts()
+    gen = LargeTensorConfigGenerator(
+        config_seed,
+        allow_unaligned=allow_unaligned,
+        include_extras=include_extras,
+        forced_conv_type=filtered_op,
+        force_plain_fprop=bool(_graph_engine_indices()),
+    )
+    max_attempts = _REGEN_ATTEMPT_LIMIT
     last_unsupported = "no configs generated"
 
     for attempt in range(1, max_attempts + 1):
         candidate = gen.generate()
-        if candidate.conv_type != filtered_op:
-            last_unsupported = f"attempt {attempt}: generated {candidate.conv_type.name.lower()} " f"while {_ENGINE_FILTER_OP_ENV}={filtered_op.name.lower()}"
-            continue
 
         candidate_id = _test_id((test_num, total_tests, config_seed, candidate))
         try:
@@ -1335,8 +1379,8 @@ def _run_test_with_regen(*, config_seed: int, test_num: int, total_tests: int, a
         last_unsupported = f"attempt {attempt}: {candidate_id}: {msg}"
 
     pytest.skip(
-        f"No supported {_ENGINE_FILTER_OP_ENV}={filtered_op.name.lower()} config "
-        f"found for selected engine after {max_attempts} attempts; "
+        f"No supported {_GRAPH_ENGINE_OP_ENV}={filtered_op.name.lower()} config "
+        f"found for selected graph engine index after {max_attempts} attempts; "
         f"last unsupported: {last_unsupported}"
     )
 
@@ -1345,20 +1389,27 @@ def _run_test_with_regen(*, config_seed: int, test_num: int, total_tests: int, a
 # Pre-generated parameter lists (built at collection time)
 # ---------------------------------------------------------------------------
 
+_FORCED_CONV_TYPE = _graph_engine_filter_op()
+_COLLECTED_GRAPH_ENGINE_INDICES = _graph_engine_indices()
+_REGEN_ON_UNSUPPORTED_ENABLED = _regen_on_unsupported()
+_REGEN_ATTEMPT_LIMIT = _regen_attempts()
+
 TEST_PARAMS_L0 = tlist_with_configs(
     num_tests=DEFAULT_NUM_TESTS_L0,
     rng_seed=DEFAULT_SEED_L0,
     allow_unaligned=False,
     include_extras=False,
+    forced_conv_type=_FORCED_CONV_TYPE,
+    force_plain_fprop=bool(_COLLECTED_GRAPH_ENGINE_INDICES),
 )
-TEST_PARAMS_L0 = _filter_params_for_engine_op(TEST_PARAMS_L0)
 TEST_PARAMS_L1 = tlist_with_configs(
     num_tests=DEFAULT_NUM_TESTS_L1,
     rng_seed=DEFAULT_SEED_L1,
     allow_unaligned=True,
     include_extras=True,
+    forced_conv_type=_FORCED_CONV_TYPE,
+    force_plain_fprop=bool(_COLLECTED_GRAPH_ENGINE_INDICES),
 )
-TEST_PARAMS_L1 = _filter_params_for_engine_op(TEST_PARAMS_L1)
 
 # ---------------------------------------------------------------------------
 # Test functions
@@ -1368,7 +1419,7 @@ TEST_PARAMS_L1 = _filter_params_for_engine_op(TEST_PARAMS_L1)
 def test_conv_large_tensor_repro(cudnn_handle):
     cfg = _load_repro_config()
     if cfg is None:
-        pytest.skip(f"Set {_REPRO_CONFIG_ENV} or {_REPRO_FILE_ENV} to run an exact repro")
+        pytest.skip(f"Set {_REPRO_CONFIG_ENV} or {_REPRO_FILE_ENV} to run an exact configuration")
 
     ok, msg = _run_single_config(cfg, cudnn_handle)
     if ok:
