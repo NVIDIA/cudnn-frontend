@@ -47,12 +47,27 @@ def flash_attn_bwd_sm100(
         attn_sink: (nheads,) float32
         topk_idxs: (total_S_q, topk_max) int32, global indices
         softmax_scale: float (default: 1/sqrt(headdim))
-        topk_length: (total_S_q,) int32, per-query valid count, optional
+        topk_length: (total_S_q,) int32, per-query valid count, optional.
+            Every entry must be >= 1 (see Raises).
         dq: pre-allocated (total_S_q, nheads, headdim), optional
         dkv: pre-allocated (total_S_kv, headdim), optional
 
     Returns:
         (dq, dkv, d_sink) -- flat layout gradients
+
+    Raises:
+        ValueError: if any entry of ``topk_length`` is < 1 (validated outside
+            CUDA graph capture only -- during capture the required
+            device-to-host sync is not possible, and the caller must uphold
+            the precondition). A row with ``topk_length == 0`` gives the
+            kernel zero KV tiles to process, for which it has no defined
+            behavior: on the configuration we tested (B200, head_dim 512,
+            topk 512) the kernel never terminates -- the launch hangs at
+            100% SM until killed. Code inspection suggests a zero-tile
+            pipeline deadlock, and that a zero-tile token reaching the dq
+            epilogue would store accumulator TMEM no MMA has written. Drop
+            empty rows from the batch (or prevent them upstream of this
+            call).
     """
     total_S_q, num_head, head_dim = q.shape
     total_S_kv = kv.shape[0]
@@ -68,6 +83,23 @@ def flash_attn_bwd_sm100(
     if topk_length is not None:
         tensors_to_check.append(topk_length)
     assert all(t.is_cuda for t in tensors_to_check)
+
+    if topk_length is not None and not torch.cuda.is_current_stream_capturing():
+        # topk_length == 0 makes tile_count == 0 in the kernel, which has no
+        # defined behavior: measured on B200 (head_dim 512, topk 512) the
+        # launch hangs at 100% SM until killed. Code inspection suggests a
+        # zero-tile pipeline deadlock, and that a zero-tile token reaching
+        # the dq epilogue would store accumulator TMEM no MMA has written.
+        # Fail loudly here instead. Skipped under CUDA graph capture, where
+        # the required device-to-host sync is illegal -- the precondition
+        # itself still applies (documented above).
+        if bool((topk_length < 1).any()):
+            raise ValueError(
+                "topk_length must be >= 1 for every query: a row with topk_length == 0 "
+                "gives the SM100 backward kernel zero KV tiles, for which it has no "
+                "defined behavior (observed to hang the launch). Drop empty rows from "
+                "the batch or prevent them upstream."
+            )
 
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)

@@ -152,6 +152,13 @@ def sparse_attention_backward_wrapper(
 
     Dispatches to SM90 or SM100 based on the active CUDA device. The returned
     ``d_sink`` is computed from ``attn_sink`` and ``dout``.
+
+    ``topk_length``, when provided, must be >= 1 for every query. The SM100
+    path validates this outside CUDA graph capture and raises ``ValueError``
+    (under capture the required sync is not possible and the caller must
+    uphold the precondition): a row with ``topk_length == 0`` has no defined
+    kernel behavior -- on the configuration we tested the launch hangs until
+    killed (see ``_interface_sm100.flash_attn_bwd_sm100``).
     """
     key = (
         q.dtype,

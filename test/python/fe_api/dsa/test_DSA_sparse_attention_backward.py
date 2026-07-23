@@ -302,3 +302,51 @@ def test_DSA_sparse_attention_backward_staged_store():
 
     assert rel_l2(dkv, dkv_ref) < 1e-4, "dkv parity vs stage-1 baseline"
     assert rel_l2(d_sink, d_sink_ref) < 1e-4, "d_sink parity vs stage-1 baseline"
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_DSA_sparse_attention_backward_topk_length_zero_raises():
+    """Rows with topk_length == 0 must be rejected loudly on SM100.
+
+    A zero entry gives the kernel zero KV tiles for that token
+    (tile_count == 0 in dsa_bwd_sm100), which has no defined behavior:
+    measured at s_q=128, s_kv=4096, head_dim=512, topk=512 on B200, a call
+    whose topk_length contains zeros hangs until killed. The interface
+    validates the precondition (outside CUDA graph capture) and raises
+    before launch; this test exercises that guard path.
+    """
+    try:
+        from cudnn import DSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    major, _ = torch.cuda.get_device_capability()
+    if major != 10:
+        pytest.skip("the topk_length >= 1 guard is implemented on the SM100 interface")
+
+    s_q, s_kv, h, d, d_v, topk = 8, 256, 64, 576, 512, 64
+    device = "cuda"
+    q = torch.randn(s_q, h, d, dtype=torch.bfloat16, device=device)
+    kv = torch.randn(s_kv, d, dtype=torch.bfloat16, device=device)
+    out = torch.randn(s_q, h, d_v, dtype=torch.bfloat16, device=device)
+    dout = torch.randn_like(out)
+    lse = torch.randn(s_q, h, dtype=torch.float32, device=device)
+    attn_sink = torch.randn(h, dtype=torch.float32, device=device)
+    topk_idxs = torch.stack([torch.randperm(s_kv, device=device)[:topk] for _ in range(s_q)]).to(torch.int32)
+
+    for bad_value in (0, -3):
+        topk_length = torch.full((s_q,), topk, dtype=torch.int32, device=device)
+        topk_length[3] = bad_value
+        with pytest.raises(ValueError, match="topk_length"):
+            DSA.sparse_attention_backward_wrapper(
+                q,
+                kv,
+                out,
+                dout,
+                lse,
+                attn_sink,
+                topk_idxs,
+                softmax_scale=1.0 / math.sqrt(d),
+                topk_length=topk_length,
+            )
