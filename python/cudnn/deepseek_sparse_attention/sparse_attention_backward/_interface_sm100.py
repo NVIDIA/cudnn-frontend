@@ -59,7 +59,9 @@ def flash_attn_bwd_sm100(
     head_dim_v = 512 if head_dim == 576 else head_dim
     device = q.device
 
-    assert q.dtype in [torch.float16, torch.bfloat16]
+    # FlashAttentionDSABackwardSm100 hardcodes BF16 as its element type; fp16
+    # inputs compile and run but produce silently wrong gradients.
+    assert q.dtype == torch.bfloat16, f"flash_attn_bwd_sm100 only supports bfloat16 (the SM100 kernel is BF16-only), got {q.dtype}"
     assert q.dtype == kv.dtype == out.dtype == dout.dtype
     assert lse.dtype == torch.float32
     assert attn_sink.dtype == torch.float32

@@ -59,7 +59,11 @@ class SparseAttentionBackward(APIBase):
             self.kv_desc.ndim != 2,
             f"KV must be 2-D (total_S_kv, D), got {self.kv_desc.shape}",
         )
-        self._check_dtype(self.q_desc, [torch.float16, torch.bfloat16], name="Q")
+        # The SM90 kernels are dtype-parameterized (fp16 or bf16); the SM100
+        # backward kernel hardcodes BF16 as its element type, so fp16 must be
+        # rejected here rather than silently miscomputing gradients.
+        q_dtypes = [torch.float16, torch.bfloat16] if major == 9 else [torch.bfloat16]
+        self._check_dtype(self.q_desc, q_dtypes, name="Q")
         self._check_dtype(
             self.kv_desc,
             self.q_desc.dtype,

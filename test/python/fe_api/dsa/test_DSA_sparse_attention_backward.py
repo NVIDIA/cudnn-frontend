@@ -386,3 +386,57 @@ def test_DSA_sparse_attention_backward_nondefault_stream_zero_init_ordering():
     assert torch.equal(dq, dq_ref), "dq must not depend on the launch stream"
     assert rel_l2(dkv, dkv_ref) < 1e-4, "dkv parity vs default-stream control"
     assert rel_l2(d_sink, d_sink_ref) < 1e-4, "d_sink parity vs default-stream control"
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=16)
+def test_DSA_sparse_attention_backward_rejects_fp16_on_sm100():
+    """The SM100 backward kernel (FlashAttentionDSABackwardSm100) hardcodes
+    BF16 as its element type, while the SM90 kernels are dtype-parameterized.
+    Before the gate, fp16 inputs on SM100 passed the dtype checks, compiled,
+    ran without any error, and returned silently wrong gradients (~96% of dq
+    outside 5e-2 tolerances against the fp16 autograd reference, on the same
+    harness where bf16 passes). fp16 must be rejected loudly."""
+    try:
+        from cudnn import DSA
+        from cudnn.deepseek_sparse_attention.sparse_attention_backward import _interface_sm100
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    _require_sm100()
+    device = torch.device("cuda")
+    s_q, s_kv, num_heads = 4, 128, 64
+    head_dim, head_dim_v, topk = 576, 512, 64
+    softmax_scale = 1.0 / math.sqrt(head_dim)
+
+    q = torch.randn(s_q, num_heads, head_dim, dtype=torch.float16, device=device)
+    kv = torch.randn(s_kv, head_dim, dtype=torch.float16, device=device)
+    out = torch.randn(s_q, num_heads, head_dim_v, dtype=torch.float16, device=device)
+    dout = torch.randn_like(out)
+    lse = torch.randn(s_q, num_heads, dtype=torch.float32, device=device)
+    attn_sink = torch.randn(num_heads, dtype=torch.float32, device=device)
+    topk_idxs = torch.stack([torch.randperm(s_kv, device=device)[:topk] for _ in range(s_q)]).to(torch.int32)
+
+    with pytest.raises(ValueError, match="Q dtype mismatch"):
+        DSA.sparse_attention_backward_wrapper(
+            q,
+            kv,
+            out,
+            dout,
+            lse,
+            attn_sink,
+            topk_idxs,
+            softmax_scale=softmax_scale,
+        )
+
+    with pytest.raises(AssertionError, match="bfloat16"):
+        _interface_sm100.flash_attn_bwd_sm100(
+            q,
+            kv,
+            out,
+            dout,
+            lse,
+            attn_sink,
+            topk_idxs,
+            softmax_scale=softmax_scale,
+        )
