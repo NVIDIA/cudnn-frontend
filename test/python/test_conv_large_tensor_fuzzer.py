@@ -17,9 +17,12 @@ Developer diagnostic engine-filter examples:
     CUDNN_FUZZ_REGEN_ON_UNSUPPORTED=1 CUDNN_FUZZ_REGEN_ATTEMPTS=50 pytest ...
 """
 
+import json
 import math
 import os
 import random
+import shlex
+import sys
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import List, Optional, Tuple
@@ -40,7 +43,11 @@ _REGEN_ATTEMPTS_ENV = "CUDNN_FUZZ_REGEN_ATTEMPTS"  # retry cap for regeneration
 _WORK_BUDGET_FLOPS_ENV = "CUDNN_FUZZ_WORK_BUDGET_FLOPS"  # override generated test work cap
 _NUM_TESTS_L0_ENV = "CUDNN_FUZZ_NUM_TESTS_L0"  # override L0 generated count
 _NUM_TESTS_L1_ENV = "CUDNN_FUZZ_NUM_TESTS_L1"  # override L1 generated count
+_REPRO_CONFIG_ENV = "CUDNN_FUZZ_REPRO_CONFIG"  # exact repro JSON payload
+_REPRO_FILE_ENV = "CUDNN_FUZZ_REPRO_FILE"  # path to exact repro JSON payload
 _BACKEND_ENGINE_MOD = 100  # backend enum suffix used by cudnnTest/backendEngine
+_REPRO_SCHEMA_VERSION = 1
+_REPRO_MESSAGE_LIMIT = 4096
 _DEFAULT_WORK_BUDGET_FLOPS = 100_000_000_000_000  # 100 TFLOP per generated test
 _SPARSE_INTEGER_REDUCTION_THRESHOLD = 1 << 20  # switch very large reductions off dense random data
 _SPARSE_INTEGER_TARGET_NONZERO = 32  # max nonzero filter values per output channel
@@ -406,24 +413,35 @@ def _effective_reduction_size(cfg: LargeTensorConfig) -> int:
     return cfg.n * output_spatial
 
 
-def _uses_sparse_integer_data(cfg: LargeTensorConfig) -> bool:
+def _uses_integer_data(cfg: LargeTensorConfig) -> bool:
     """Return whether this config should avoid dense random large reductions.
 
     The finite mismatch class this policy targets was observed on large FPROP
-    style C * filter_spatial reductions. For DGRAD/WGRAD, this remains a
-    large-filter data policy rather than an exact statement about the op's
-    per-output accumulation depth.
+    style C * filter_spatial reductions. For DGRAD/WGRAD, this remains a large
+    filter data policy rather than an exact statement about the op's per-output
+    accumulation depth.
     """
     return _fprop_reduction_size(cfg) >= _SPARSE_INTEGER_REDUCTION_THRESHOLD
 
 
+def _uses_sparse_filter(cfg: LargeTensorConfig) -> bool:
+    """Return whether W is a sparse integer input, not an output prefill."""
+    return _uses_integer_data(cfg) and cfg.conv_type in (ConvType.FPROP, ConvType.DGRAD)
+
+
 def _data_policy_name(cfg: LargeTensorConfig) -> str:
-    return "sparse_integer" if _uses_sparse_integer_data(cfg) else "dense_random"
+    if not _uses_integer_data(cfg):
+        return "dense_random"
+    if _uses_sparse_filter(cfg):
+        return "sparse_filter_integer"
+    return "dense_integer"
 
 
 def _comparison_context(cfg: LargeTensorConfig, rtol: float, atol: float) -> str:
     return (
         f"data_policy={_data_policy_name(cfg)}, "
+        f"integer_data={_uses_integer_data(cfg)}, "
+        f"sparse_filter={_uses_sparse_filter(cfg)}, "
         f"fprop_reduction={_fprop_reduction_size(cfg)}, "
         f"effective_reduction={_effective_reduction_size(cfg)}, "
         f"sparse_threshold={_SPARSE_INTEGER_REDUCTION_THRESHOLD}, "
@@ -445,7 +463,7 @@ def _tolerances(cfg: LargeTensorConfig) -> Tuple[float, float]:
     bound on a "reference near zero" check, but that proved unreliable across
     architectures because `torch.randn` on CUDA is not bit-identical across
     GPU arches (parallel PRNG depends on thread launch geometry) and cuDNN's
-    engine selection differs per arch — both effects shift the |ref| value
+    engine selection differs per arch - both effects shift the |ref| value
     around the detection threshold.
     """
     accum = cfg.c * math.prod(cfg.filter_spatial)
@@ -490,6 +508,254 @@ def _poison_workspace(workspace: torch.Tensor) -> None:
     )
     poison_indices = torch.randint(ws_size, (poison_count,), device=workspace.device)
     workspace[poison_indices] = _WORKSPACE_POISON_BYTE
+
+
+_DTYPE_TO_REPRO_NAME = {
+    torch.float16: "float16",
+    torch.bfloat16: "bfloat16",
+    torch.float32: "float32",
+}
+_REPRO_NAME_TO_DTYPE = {
+    "float16": torch.float16,
+    "torch.float16": torch.float16,
+    "half": torch.float16,
+    "fp16": torch.float16,
+    "f16": torch.float16,
+    "bfloat16": torch.bfloat16,
+    "torch.bfloat16": torch.bfloat16,
+    "bf16": torch.bfloat16,
+    "float32": torch.float32,
+    "torch.float32": torch.float32,
+    "float": torch.float32,
+    "fp32": torch.float32,
+    "f32": torch.float32,
+}
+
+
+def _config_to_repro_config(cfg: LargeTensorConfig) -> dict:
+    """Serialize a config into stable JSON-compatible fields."""
+    return {
+        "conv_type": cfg.conv_type.name.lower(),
+        "spatial_dims": cfg.spatial_dims,
+        "dtype": _DTYPE_TO_REPRO_NAME[cfg.dtype],
+        "shape_family": cfg.shape_family.name.lower(),
+        "n": cfg.n,
+        "k": cfg.k,
+        "c": cfg.c,
+        "input_spatial": list(cfg.input_spatial),
+        "filter_spatial": list(cfg.filter_spatial),
+        "padding": list(cfg.padding),
+        "stride": list(cfg.stride),
+        "dilation": list(cfg.dilation),
+        "epilogue": cfg.epilogue,
+        "rng_seed": cfg.rng_seed,
+    }
+
+
+def _parse_conv_type(value) -> ConvType:
+    raw = str(value).strip().lower().removeprefix("convtype.")
+    aliases = {
+        "fprop": ConvType.FPROP,
+        "fp": ConvType.FPROP,
+        "dgrad": ConvType.DGRAD,
+        "dg": ConvType.DGRAD,
+        "wgrad": ConvType.WGRAD,
+        "wg": ConvType.WGRAD,
+    }
+    if raw in aliases:
+        return aliases[raw]
+    raise ValueError(f"Unsupported conv_type in repro config: {value!r}")
+
+
+def _parse_shape_family(value) -> ShapeFamily:
+    raw = str(value).strip().lower().removeprefix("shapefamily.")
+    aliases = {}
+    for family in ShapeFamily:
+        aliases[family.name.lower()] = family
+        aliases[family.value] = family
+    if raw in aliases:
+        return aliases[raw]
+    raise ValueError(f"Unsupported shape_family in repro config: {value!r}")
+
+
+def _parse_dtype(value) -> torch.dtype:
+    raw = str(value).strip().lower()
+    if raw in _REPRO_NAME_TO_DTYPE:
+        return _REPRO_NAME_TO_DTYPE[raw]
+    raise ValueError(f"Unsupported dtype in repro config: {value!r}")
+
+
+def _int_list(config: dict, key: str, length: int) -> List[int]:
+    try:
+        values = [int(v) for v in config[key]]
+    except KeyError as e:
+        raise ValueError(f"Missing {key!r} in repro config") from e
+    except TypeError as e:
+        raise ValueError(f"{key!r} in repro config must be a list") from e
+
+    if len(values) != length:
+        raise ValueError(f"{key!r} length {len(values)} does not match spatial_dims={length}")
+    return values
+
+
+def _config_from_repro_payload(payload: dict) -> LargeTensorConfig:
+    """Parse either the full emitted repro payload or just its config object."""
+    if not isinstance(payload, dict):
+        raise ValueError("Repro payload must be a JSON object")
+
+    if "config" in payload:
+        schema = payload.get("schema")
+        if schema != _REPRO_SCHEMA_VERSION:
+            raise ValueError(f"Unsupported repro schema {schema!r}; expected {_REPRO_SCHEMA_VERSION}")
+        config = payload["config"]
+    else:
+        config = payload
+
+    if not isinstance(config, dict):
+        raise ValueError("Repro payload 'config' must be a JSON object")
+
+    try:
+        spatial_dims = int(config["spatial_dims"])
+        epilogue = str(config.get("epilogue", "none"))
+        if epilogue not in ("none", "relu", "bias_relu"):
+            raise ValueError(f"Unsupported epilogue in repro config: {epilogue!r}")
+        return LargeTensorConfig(
+            conv_type=_parse_conv_type(config["conv_type"]),
+            spatial_dims=spatial_dims,
+            dtype=_parse_dtype(config["dtype"]),
+            shape_family=_parse_shape_family(config["shape_family"]),
+            n=int(config["n"]),
+            k=int(config["k"]),
+            c=int(config["c"]),
+            input_spatial=_int_list(config, "input_spatial", spatial_dims),
+            filter_spatial=_int_list(config, "filter_spatial", spatial_dims),
+            padding=_int_list(config, "padding", spatial_dims),
+            stride=_int_list(config, "stride", spatial_dims),
+            dilation=_int_list(config, "dilation", spatial_dims),
+            epilogue=epilogue,
+            rng_seed=int(config["rng_seed"]),
+        )
+    except KeyError as e:
+        raise ValueError(f"Missing {e.args[0]!r} in repro config") from e
+
+
+def _load_repro_payload() -> Optional[dict]:
+    raw = os.environ.get(_REPRO_CONFIG_ENV, "").strip()
+    source = _REPRO_CONFIG_ENV
+    if not raw:
+        repro_file = os.environ.get(_REPRO_FILE_ENV, "").strip()
+        if not repro_file:
+            return None
+        source = f"{_REPRO_FILE_ENV}={repro_file}"
+        try:
+            with open(repro_file, "r", encoding="utf-8") as f:
+                raw = f.read()
+        except OSError as e:
+            raise ValueError(f"Could not read repro file {repro_file!r}: {e}") from e
+
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"{source} must contain valid JSON: {e}") from e
+
+
+def _load_repro_config() -> Optional[LargeTensorConfig]:
+    payload = _load_repro_payload()
+    if payload is None:
+        return None
+    return _config_from_repro_payload(payload)
+
+
+def _trim_repro_message(message: Optional[str]) -> Optional[str]:
+    if message is None or len(message) <= _REPRO_MESSAGE_LIMIT:
+        return message
+    dropped = len(message) - _REPRO_MESSAGE_LIMIT
+    return f"{message[:_REPRO_MESSAGE_LIMIT]}... <truncated {dropped} chars>"
+
+
+def _repro_payload(
+    cfg: LargeTensorConfig,
+    *,
+    test_num: Optional[int] = None,
+    total_tests: Optional[int] = None,
+    config_seed: Optional[int] = None,
+    rtol: Optional[float] = None,
+    atol: Optional[float] = None,
+    message: Optional[str] = None,
+    attempt: Optional[int] = None,
+) -> dict:
+    test_id = None
+    if test_num is not None and total_tests is not None and config_seed is not None:
+        test_id = _test_id((test_num, total_tests, config_seed, cfg))
+
+    metadata = {
+        "test_id": test_id,
+        "test_num": test_num,
+        "total_tests": total_tests,
+        "config_seed": config_seed,
+        "attempt": attempt,
+        "message": _trim_repro_message(message),
+        "x_shape": cfg.x_shape,
+        "w_shape": cfg.w_shape,
+        "y_shape": cfg.y_shape,
+        "memory_budget_bytes": MEMORY_BUDGET_BYTES,
+        "worker_count": _pytest_worker_count(),
+        "work_budget_flops": WORK_BUDGET_FLOPS,
+        "estimated_bytes": _estimate_bytes(cfg),
+        "estimated_work_flops": _estimate_work_flops(cfg),
+        "fprop_reduction": _fprop_reduction_size(cfg),
+        "effective_reduction": _effective_reduction_size(cfg),
+        "sparse_threshold": _SPARSE_INTEGER_REDUCTION_THRESHOLD,
+        "sparse_target_nonzero": _SPARSE_INTEGER_TARGET_NONZERO,
+        "integer_data": _uses_integer_data(cfg),
+        "sparse_filter": _uses_sparse_filter(cfg),
+        "data_policy": _data_policy_name(cfg),
+        "rtol": rtol,
+        "atol": atol,
+    }
+    return {
+        "schema": _REPRO_SCHEMA_VERSION,
+        "config": _config_to_repro_config(cfg),
+        "metadata": metadata,
+    }
+
+
+def _repro_json(payload: dict, *, pretty: bool = False) -> str:
+    if pretty:
+        return json.dumps(payload, indent=2, sort_keys=True)
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def _repro_command(payload: dict) -> str:
+    return (
+        f"{_REPRO_CONFIG_ENV}={shlex.quote(_repro_json(payload))} "
+        f"{shlex.quote(sys.executable)} -m pytest test/python/test_conv_large_tensor_fuzzer.py "
+        "-o addopts= -k test_conv_large_tensor_repro -s"
+    )
+
+
+def _format_repro_context(
+    cfg: LargeTensorConfig,
+    *,
+    test_num: Optional[int] = None,
+    total_tests: Optional[int] = None,
+    config_seed: Optional[int] = None,
+    rtol: Optional[float] = None,
+    atol: Optional[float] = None,
+    message: Optional[str] = None,
+    attempt: Optional[int] = None,
+) -> str:
+    if rtol is None or atol is None:
+        rtol, atol = _tolerances(cfg)
+    payload = _repro_payload(cfg, test_num=test_num, total_tests=total_tests, config_seed=config_seed, rtol=rtol, atol=atol, message=message, attempt=attempt)
+    return (
+        "\n\nLarge tensor fuzzer repro command:\n"
+        f"{_repro_command(payload)}\n\n"
+        "Large tensor fuzzer repro JSON:\n"
+        f"{_repro_json(payload, pretty=True)}\n\n"
+        "Large tensor fuzzer context: "
+        f"{_comparison_context(cfg, rtol, atol)}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -820,12 +1086,8 @@ def _run_cudnn(cfg: LargeTensorConfig, X: torch.Tensor, W: torch.Tensor, Y: torc
         return False, f"not_supported: {e}"
     except cudnn.cudnnGraphNotSupportedError as e:
         return False, f"not_supported: {e}"
-    except torch.cuda.OutOfMemoryError as e:
-        # cuDNN requested a workspace larger than available GPU memory.
-        # This is configuration/arch dependent (e.g. wgrad workspace for very
-        # large filter sizes on some cuDNN builds).  Treat as not-supported so
-        # the test skips rather than failing.
-        return False, f"not_supported: OOM {e}"
+    except torch.cuda.OutOfMemoryError:
+        raise
     except (RuntimeError, OSError) as e:
         return False, f"error: {type(e).__name__}: {e}"
 
@@ -871,7 +1133,7 @@ def _to_cuda_conv_layout(cpu_tensor: torch.Tensor, memory_format) -> torch.Tenso
 def _make_x_cpu_tensor(cfg: LargeTensorConfig, gen: torch.Generator) -> torch.Tensor:
     # DGRAD writes X as the output buffer, so keep its prefill random to help
     # expose partial writes.
-    if _uses_sparse_integer_data(cfg) and cfg.conv_type in (ConvType.FPROP, ConvType.WGRAD):
+    if _uses_integer_data(cfg) and cfg.conv_type in (ConvType.FPROP, ConvType.WGRAD):
         return _dense_small_integer_cpu_tensor(cfg.x_shape, cfg.dtype, gen)
     return _dense_random_cpu_tensor(cfg.x_shape, cfg.dtype, gen)
 
@@ -879,20 +1141,20 @@ def _make_x_cpu_tensor(cfg: LargeTensorConfig, gen: torch.Generator) -> torch.Te
 def _make_w_cpu_tensor(cfg: LargeTensorConfig, gen: torch.Generator, sparse_rng: random.Random) -> torch.Tensor:
     # WGRAD writes W as the output buffer, so keep its prefill random to help
     # expose partial writes.
-    if _uses_sparse_integer_data(cfg) and cfg.conv_type in (ConvType.FPROP, ConvType.DGRAD):
+    if _uses_sparse_filter(cfg):
         return _sparse_filter_cpu_tensor(cfg, sparse_rng)
     return _dense_random_cpu_tensor(cfg.w_shape, cfg.dtype, gen)
 
 
 def _make_dy_cpu_tensor(cfg: LargeTensorConfig, gen: torch.Generator) -> torch.Tensor:
-    if _uses_sparse_integer_data(cfg):
+    if _uses_integer_data(cfg):
         return _dense_small_integer_cpu_tensor(cfg.y_shape, cfg.dtype, gen)
     return _dense_random_cpu_tensor(cfg.y_shape, cfg.dtype, gen)
 
 
 def _make_bias_cpu_tensor(cfg: LargeTensorConfig, gen: torch.Generator) -> torch.Tensor:
     shape = [1, cfg.k] + [1] * cfg.spatial_dims
-    if _uses_sparse_integer_data(cfg):
+    if _uses_integer_data(cfg):
         return _dense_small_integer_cpu_tensor(shape, cfg.dtype, gen)
     return _dense_random_cpu_tensor(shape, cfg.dtype, gen)
 
@@ -902,7 +1164,15 @@ def _make_bias_cpu_tensor(cfg: LargeTensorConfig, gen: torch.Generator) -> torch
 # ---------------------------------------------------------------------------
 
 
-def _run_single_config(cfg: LargeTensorConfig, cudnn_handle) -> Tuple[bool, str]:
+def _run_single_config(
+    cfg: LargeTensorConfig,
+    cudnn_handle,
+    *,
+    test_num: Optional[int] = None,
+    total_tests: Optional[int] = None,
+    config_seed: Optional[int] = None,
+    attempt: Optional[int] = None,
+) -> Tuple[bool, str]:
     # Generate inputs on CPU then move to GPU so the values are bit-identical
     # across GPU architectures. `torch.randn` on a CUDA generator is not
     # bit-identical across arches because the parallel PRNG depends on thread
@@ -914,53 +1184,85 @@ def _run_single_config(cfg: LargeTensorConfig, cudnn_handle) -> Tuple[bool, str]
     # default NCHW layout, the OLD valid-conv tests (output spatial 1x1) worked
     # by accident because spatial strides collapse when spatial==1, but tests
     # with non-trivial output spatial produce scrambled cuDNN output.
-    gen = torch.Generator(device="cpu")
-    gen.manual_seed(cfg.rng_seed)
-    sparse_rng = random.Random(cfg.rng_seed ^ _SPARSE_INTEGER_RNG_SALT)
-
-    if cfg.spatial_dims == 2:
-        memory_format = torch.channels_last
-    else:
-        memory_format = torch.channels_last_3d
-
-    X = _to_cuda_conv_layout(_make_x_cpu_tensor(cfg, gen), memory_format)
-    W = _to_cuda_conv_layout(_make_w_cpu_tensor(cfg, gen, sparse_rng), memory_format)
-    Y = torch.empty(cfg.y_shape, device="cuda", dtype=cfg.dtype).contiguous(memory_format=memory_format)
+    X = None
+    W = None
+    Y = None
     bias = None
-
-    if cfg.epilogue == "bias_relu":
-        bias = _make_bias_cpu_tensor(cfg, gen).to("cuda", non_blocking=True)
-
-    # Y holds the upstream gradient (dY) for backward passes
-    if cfg.conv_type in (ConvType.DGRAD, ConvType.WGRAD):
-        Y_cpu = _make_dy_cpu_tensor(cfg, gen)
-        Y.copy_(Y_cpu, non_blocking=True)
-        del Y_cpu
-
     actual = None
     ref = None
+    phase = "input setup"
     try:
+        gen = torch.Generator(device="cpu")
+        gen.manual_seed(cfg.rng_seed)
+        sparse_rng = random.Random(cfg.rng_seed ^ _SPARSE_INTEGER_RNG_SALT)
+
+        if cfg.spatial_dims == 2:
+            memory_format = torch.channels_last
+        else:
+            memory_format = torch.channels_last_3d
+
+        phase = "X allocation"
+        X = _to_cuda_conv_layout(_make_x_cpu_tensor(cfg, gen), memory_format)
+        phase = "W allocation"
+        W = _to_cuda_conv_layout(_make_w_cpu_tensor(cfg, gen, sparse_rng), memory_format)
+        phase = "Y allocation"
+        Y = torch.empty(cfg.y_shape, device="cuda", dtype=cfg.dtype).contiguous(memory_format=memory_format)
+
+        if cfg.epilogue == "bias_relu":
+            phase = "bias allocation"
+            bias = _make_bias_cpu_tensor(cfg, gen).to("cuda", non_blocking=True)
+
+        # Y holds the upstream gradient (dY) for backward passes.
+        if cfg.conv_type in (ConvType.DGRAD, ConvType.WGRAD):
+            phase = "upstream-gradient allocation"
+            Y_cpu = _make_dy_cpu_tensor(cfg, gen)
+            Y.copy_(Y_cpu, non_blocking=True)
+            del Y_cpu
+
+        rtol, atol = _tolerances(cfg)
+        active_payload = _repro_payload(
+            cfg,
+            test_num=test_num,
+            total_tests=total_tests,
+            config_seed=config_seed,
+            rtol=rtol,
+            atol=atol,
+            attempt=attempt,
+        )
+        print(f"Large tensor fuzzer active configuration: {_repro_json(active_payload)}", flush=True)
+
+        phase = "cuDNN execution"
         ok, msg = _run_cudnn(cfg, X, W, Y, bias, cudnn_handle)
         if not ok:
             return False, msg
 
+        phase = "result clone"
         actual = Y.clone() if cfg.conv_type == ConvType.FPROP else X.clone() if cfg.conv_type == ConvType.DGRAD else W.clone()
 
         # _reference returns f32; compare actual upcast to f32 vs f32 truth.
         # Avoids self-comparison artifacts from casting the reference back to
         # the compute dtype.
+        phase = "PyTorch reference"
         ref = _reference(cfg, X, W, Y, bias)
-        rtol, atol = _tolerances(cfg)
+        phase = "result comparison"
         try:
             torch.testing.assert_close(actual.to(torch.float32), ref, rtol=rtol, atol=atol)
         except AssertionError as e:
-            raise AssertionError(f"{e}\n\nLarge tensor fuzzer context: " f"{_comparison_context(cfg, rtol, atol)}") from e
+            context = _format_repro_context(
+                cfg, test_num=test_num, total_tests=total_tests, config_seed=config_seed, rtol=rtol, atol=atol, message=str(e), attempt=attempt
+            )
+            raise AssertionError(f"{e}{context}") from e
         return True, "ok"
 
+    except torch.cuda.OutOfMemoryError as e:
+        return False, f"insufficient_memory: {phase}: {e}"
     finally:
-        del X
-        del W
-        del Y
+        if X is not None:
+            del X
+        if W is not None:
+            del W
+        if Y is not None:
+            del Y
         if bias is not None:
             del bias
         if actual is not None:
@@ -982,12 +1284,16 @@ def _run_test(cfg: LargeTensorConfig, cudnn_handle, test_num: int, total_tests: 
         )
         return
 
-    ok, msg = _run_single_config(cfg, cudnn_handle)
+    ok, msg = _run_single_config(cfg, cudnn_handle, test_num=test_num, total_tests=total_tests, config_seed=config_seed)
     if ok:
         return
+    if msg.startswith("insufficient_memory"):
+        context = _format_repro_context(cfg, test_num=test_num, total_tests=total_tests, config_seed=config_seed, message=msg)
+        pytest.skip(f"Insufficient GPU memory: {msg}{context}")
     if msg.startswith("not_supported"):
         pytest.skip(f"Graph not supported on this arch: {msg}")
-    pytest.fail(f"cuDNN execution error: {msg}")
+    context = _format_repro_context(cfg, test_num=test_num, total_tests=total_tests, config_seed=config_seed, message=msg)
+    pytest.fail(f"cuDNN execution error: {msg}{context}")
 
 
 def _run_test_with_regen(*, config_seed: int, test_num: int, total_tests: int, allow_unaligned: bool, include_extras: bool, cudnn_handle) -> None:
@@ -1007,8 +1313,10 @@ def _run_test_with_regen(*, config_seed: int, test_num: int, total_tests: int, a
 
         candidate_id = _test_id((test_num, total_tests, config_seed, candidate))
         try:
-            ok, msg = _run_single_config(candidate, cudnn_handle)
-        except (AssertionError, RuntimeError, OSError) as e:
+            ok, msg = _run_single_config(candidate, cudnn_handle, test_num=test_num, total_tests=total_tests, config_seed=config_seed, attempt=attempt)
+        except AssertionError:
+            raise
+        except (RuntimeError, OSError) as e:
             raise type(e)(f"{e} [candidate={candidate_id}, attempt={attempt}]") from e
 
         if ok:
@@ -1018,8 +1326,19 @@ def _run_test_with_regen(*, config_seed: int, test_num: int, total_tests: int, a
                     flush=True,
                 )
             return
+        if msg.startswith("insufficient_memory"):
+            context = _format_repro_context(
+                candidate,
+                test_num=test_num,
+                total_tests=total_tests,
+                config_seed=config_seed,
+                message=msg,
+                attempt=attempt,
+            )
+            pytest.skip(f"Insufficient GPU memory for {candidate_id}: {msg}{context}")
         if not msg.startswith("not_supported"):
-            pytest.fail(f"cuDNN execution error for {candidate_id} " f"(regen attempt {attempt}): {msg}")
+            context = _format_repro_context(candidate, test_num=test_num, total_tests=total_tests, config_seed=config_seed, message=msg, attempt=attempt)
+            pytest.fail(f"cuDNN execution error for {candidate_id} " f"(regen attempt {attempt}): {msg}{context}")
         last_unsupported = f"attempt {attempt}: {candidate_id}: {msg}"
 
     pytest.skip(
@@ -1051,6 +1370,21 @@ TEST_PARAMS_L1 = _filter_params_for_engine_op(TEST_PARAMS_L1)
 # ---------------------------------------------------------------------------
 # Test functions
 # ---------------------------------------------------------------------------
+
+
+def test_conv_large_tensor_repro(cudnn_handle):
+    cfg = _load_repro_config()
+    if cfg is None:
+        pytest.skip(f"Set {_REPRO_CONFIG_ENV} or {_REPRO_FILE_ENV} to run an exact repro")
+
+    ok, msg = _run_single_config(cfg, cudnn_handle)
+    if ok:
+        return
+    if msg.startswith("insufficient_memory"):
+        pytest.skip(f"Insufficient GPU memory: {msg}" f"{_format_repro_context(cfg, message=msg)}")
+    if msg.startswith("not_supported"):
+        pytest.skip(f"Graph not supported on this arch: {msg}")
+    pytest.fail(f"cuDNN execution error: {msg}" f"{_format_repro_context(cfg, message=msg)}")
 
 
 @pytest.mark.L0
