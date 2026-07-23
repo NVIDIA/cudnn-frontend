@@ -285,6 +285,19 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
 
         self._logger.debug("__init__ completed")
 
+    @staticmethod
+    def _record_pointer_stream(pointers: torch.Tensor, current_stream: cuda.CUstream) -> None:
+        handle = int(current_stream)
+        torch_current = torch.cuda.current_stream(pointers.device)
+        torch_default = torch.cuda.default_stream(pointers.device)
+        if handle == torch_current.cuda_stream:
+            launch_stream = torch_current
+        elif handle == torch_default.cuda_stream:
+            launch_stream = torch_default
+        else:
+            launch_stream = torch.cuda.ExternalStream(handle, device=pointers.device)
+        pointers.record_stream(launch_stream)
+
     # --------------------------------------------------------------------- #
     #  check_support
     # --------------------------------------------------------------------- #
@@ -1252,6 +1265,8 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
                 stream=current_stream,
             )
         else:
+            self._record_pointer_stream(b_ptrs, current_stream)
+            self._record_pointer_stream(sfb_ptrs, current_stream)
             self._compiled_kernel(
                 a_tensor=a_tensor,
                 b_ptrs_device=b_ptrs,

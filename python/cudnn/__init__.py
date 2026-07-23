@@ -274,7 +274,30 @@ from .graph import graph, jit, graph_cache
 
 from typing import Any
 
-_EAGER_PUBLIC_NAMES = tuple(name for name in globals() if not name.startswith("_"))
+_EAGER_PUBLIC_NAMES = (
+    *symbols_to_import,
+    *(
+        symbol
+        for symbol in (
+            "causal_conv1d_forward",
+            "causal_conv1d_backward",
+            "causal_conv1d_nwh_forward",
+            "causal_conv1d_nwh_backward",
+            "b2b_causal_conv1d_forward",
+            "b2b_causal_conv1d_backward",
+        )
+        if symbol in globals()
+    ),
+    "__version__",
+    "NodeType",
+    "Tensor",
+    "pygraph",
+    "GraphContext",
+    "Node",
+    "graph",
+    "jit",
+    "graph_cache",
+)
 __all__ = [*_EAGER_PUBLIC_NAMES, "Graph", "wrapper"]
 
 _OPTIONAL_DEPENDENCY_INSTALL_HINT = "Install with 'pip install nvidia-cudnn-frontend[cutedsl]'"
