@@ -226,8 +226,8 @@ class DRMSNormNode : public NodeCRTP<DRMSNormNode> {
 
         attributes.fill_from_context(context);
 
-        auto X                  = attributes.inputs[Rmsnorm_backward_attributes::input_names::X];
-        auto const x_tensor_dim = X->get_dim();
+        auto X                     = attributes.inputs[Rmsnorm_backward_attributes::input_names::X];
+        auto const x_tensor_dim    = X->get_dim();
         auto const x_tensor_stride = X->get_stride();
 
         auto DY            = attributes.inputs[Rmsnorm_backward_attributes::input_names::DY];
