@@ -31,4 +31,6 @@ def __getattr__(name: str) -> Any:
 __all__ = [
     "moe_grouped_matmul",
     "swiglu_mlp",
+    "rms_norm",
+    "layer_norm",
 ]
