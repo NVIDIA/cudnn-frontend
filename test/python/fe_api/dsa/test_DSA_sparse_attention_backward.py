@@ -14,6 +14,7 @@ from test_utils import torch_fork_set_rng
 
 from fe_api.dsa.dsa_utils import (
     _require_sm90,
+    _require_sm100,
     dsa_init,
     with_dsa_sparse_attention_backward_params,
 )
@@ -302,3 +303,86 @@ def test_DSA_sparse_attention_backward_staged_store():
 
     assert rel_l2(dkv, dkv_ref) < 1e-4, "dkv parity vs stage-1 baseline"
     assert rel_l2(d_sink, d_sink_ref) < 1e-4, "d_sink parity vs stage-1 baseline"
+
+
+@pytest.mark.L0
+@pytest.mark.gpu_exclusive
+@pytest.mark.xdist_group(name="gpu_exclusive")
+@torch_fork_set_rng(seed=7)
+def test_DSA_sparse_attention_backward_nondefault_stream_zero_init_ordering():
+    """The SM100 interface allocates and zero-initializes dq/dkv/d_sink and the
+    two workspaces with plain torch calls, which enqueue on the ambient torch
+    stream, while the kernel launches on the caller-provided ``current_stream``.
+    Without explicit stream scoping the two are unordered: with a busy ambient
+    stream, the semantically required zero-fills land *after* the kernel and
+    wipe the dkv/d_sink accumulation (or, in the other interleaving, the kernel
+    accumulates on top of uninitialized memory).
+
+    The ambient default stream is parked on ``torch.cuda._sleep`` so the
+    unordered interleaving is reached reliably (the zero-fills cannot start
+    until the sleep retires, while the side-stream kernel is free to run);
+    the test needs the GPU to itself for that reason."""
+    try:
+        from cudnn import DSA
+        from cuda.bindings import driver as cuda
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    _require_sm100()
+    device = torch.device("cuda")
+    s_q, s_kv, num_heads = 256, 1024, 64
+    head_dim, topk = 512, 64
+    softmax_scale = 1.0 / math.sqrt(head_dim)
+
+    q = torch.randn(s_q, num_heads, head_dim, dtype=torch.bfloat16, device=device) / 10
+    kv = torch.randn(s_kv, head_dim, dtype=torch.bfloat16, device=device) / 10
+    attn_sink = torch.randn(num_heads, dtype=torch.float32, device=device)
+    topk_idxs = torch.stack([torch.randperm(s_kv, device=device)[:topk] for _ in range(s_q)]).to(torch.int32)
+
+    out, lse = ref_sparse_attention_forward(
+        q,
+        kv,
+        attn_sink,
+        topk_idxs,
+        softmax_scale=softmax_scale,
+    )
+    dout = torch.randn_like(out)
+
+    def run(stream):
+        result = DSA.sparse_attention_backward_wrapper(
+            q,
+            kv,
+            out,
+            dout,
+            lse,
+            attn_sink,
+            topk_idxs,
+            softmax_scale=softmax_scale,
+            stream=stream,
+        )
+        torch.cuda.synchronize()
+        return result["dq"], result["dkv"], result["d_sink"]
+
+    # Control on the ambient (default) stream; also primes the compile cache
+    # so the raced call below is a pure execute.
+    default_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    dq_ref, dkv_ref, d_sink_ref = run(default_stream)
+    assert (dkv_ref != 0).any(), "control dkv must have nonzero content"
+    assert (d_sink_ref != 0).any(), "control d_sink must have nonzero content"
+
+    # Park the ambient default stream, then launch on a side stream. The
+    # interface's zero-fills must be ordered with the side-stream kernel, not
+    # queued behind the sleep on the default stream.
+    side_stream = torch.cuda.Stream()
+    torch.cuda._sleep(2_000_000_000)
+    dq, dkv, d_sink = run(cuda.CUstream(side_stream.cuda_stream))
+
+    assert (dkv != 0).any(), "dkv accumulation was wiped by a zero-init racing on another stream"
+    assert (d_sink != 0).any(), "d_sink accumulation was wiped by a zero-init racing on another stream"
+
+    def rel_l2(a, b):
+        return ((a.float() - b.float()).norm() / b.float().norm().clamp_min(1e-30)).item()
+
+    assert torch.equal(dq, dq_ref), "dq must not depend on the launch stream"
+    assert rel_l2(dkv, dkv_ref) < 1e-4, "dkv parity vs default-stream control"
+    assert rel_l2(d_sink, d_sink_ref) < 1e-4, "d_sink parity vs default-stream control"

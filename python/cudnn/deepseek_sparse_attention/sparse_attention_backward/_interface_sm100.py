@@ -8,7 +8,7 @@ import cutlass
 import cutlass.cute as cute
 
 from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
-from cudnn.deepseek_sparse_attention.utils.runtime import resolve_stream
+from cudnn.deepseek_sparse_attention.utils.runtime import resolve_stream, torch_stream_context
 from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
 from .dsa_bwd_sm100 import FlashAttentionDSABackwardSm100
 
@@ -76,58 +76,65 @@ def flash_attn_bwd_sm100(
     num_head_blocks = (num_head + block_tile - 1) // block_tile
     batch_size = 1
 
-    # Ensure contiguous
-    q, kv, out, dout = [t.contiguous() for t in (q, kv, out, dout)]
-    lse = lse.contiguous()
+    current_stream = resolve_stream(current_stream)
 
-    # Allocate output tensors
-    if dq is None:
-        dq = torch.empty_like(q)
-    else:
-        assert dq.shape == q.shape, f"dq shape mismatch: expected {q.shape}, got {dq.shape}"
-        assert dq.dtype == q.dtype, f"dq dtype mismatch: expected {q.dtype}, got {dq.dtype}"
-        assert dq.device == device, f"dq device mismatch: expected {device}, got {dq.device}"
-    if dkv is None:
-        dkv = torch.zeros(total_S_kv, head_dim, dtype=kv.dtype, device=device)
-    else:
-        expected_dkv_shape = (total_S_kv, head_dim)
-        assert dkv.shape == expected_dkv_shape, f"dkv shape mismatch: expected {expected_dkv_shape}, got {dkv.shape}"
-        assert dkv.dtype == kv.dtype, f"dkv dtype mismatch: expected {kv.dtype}, got {dkv.dtype}"
-        assert dkv.device == device, f"dkv device mismatch: expected {device}, got {dkv.device}"
-        dkv.fill_(0)
-    d_sink = torch.zeros_like(attn_sink)
+    # Normalize inputs and allocate outputs/workspaces on the execution stream:
+    # the kernel below launches on `current_stream`, so the semantically
+    # required zero-initialization of dkv/d_sink and both workspaces (and any
+    # contiguity copies) must be stream-ordered with it, not with the ambient
+    # torch stream the caller happens to be on.
+    with torch_stream_context(current_stream):
+        # Ensure contiguous
+        q, kv, out, dout = [t.contiguous() for t in (q, kv, out, dout)]
+        lse = lse.contiguous()
 
-    # Allocate workspace tensors
-    acc_dtype = cutlass.Float32
-    ws_lse_odo_shape = FlashAttentionDSABackwardSm100._get_workspace_size_LSE_OdO(
-        total_S_q,
-        head_dim,
-        num_head,
-        batch_size,
-        acc_dtype,
-    )
-    workspace_LSE_OdO = torch.zeros(
-        *ws_lse_odo_shape,
-        dtype=torch.uint8,
-        device=device,
-    )
+        # Allocate output tensors
+        if dq is None:
+            dq = torch.empty_like(q)
+        else:
+            assert dq.shape == q.shape, f"dq shape mismatch: expected {q.shape}, got {dq.shape}"
+            assert dq.dtype == q.dtype, f"dq dtype mismatch: expected {q.dtype}, got {dq.dtype}"
+            assert dq.device == device, f"dq device mismatch: expected {device}, got {dq.device}"
+        if dkv is None:
+            dkv = torch.zeros(total_S_kv, head_dim, dtype=kv.dtype, device=device)
+        else:
+            expected_dkv_shape = (total_S_kv, head_dim)
+            assert dkv.shape == expected_dkv_shape, f"dkv shape mismatch: expected {expected_dkv_shape}, got {dkv.shape}"
+            assert dkv.dtype == kv.dtype, f"dkv dtype mismatch: expected {kv.dtype}, got {dkv.dtype}"
+            assert dkv.device == device, f"dkv device mismatch: expected {device}, got {dkv.device}"
+            dkv.fill_(0)
+        d_sink = torch.zeros_like(attn_sink)
 
-    ws_dkv_shape = FlashAttentionDSABackwardSm100._get_workspace_size_dKV(
-        total_S_kv,
-        head_dim,
-        batch_size,
-        acc_dtype,
-    )
-    workspace_dKV = torch.zeros(
-        *ws_dkv_shape,
-        dtype=torch.uint8,
-        device=device,
-    )
+        # Allocate workspace tensors
+        acc_dtype = cutlass.Float32
+        ws_lse_odo_shape = FlashAttentionDSABackwardSm100._get_workspace_size_LSE_OdO(
+            total_S_q,
+            head_dim,
+            num_head,
+            batch_size,
+            acc_dtype,
+        )
+        workspace_LSE_OdO = torch.zeros(
+            *ws_lse_odo_shape,
+            dtype=torch.uint8,
+            device=device,
+        )
+
+        ws_dkv_shape = FlashAttentionDSABackwardSm100._get_workspace_size_dKV(
+            total_S_kv,
+            head_dim,
+            batch_size,
+            acc_dtype,
+        )
+        workspace_dKV = torch.zeros(
+            *ws_dkv_shape,
+            dtype=torch.uint8,
+            device=device,
+        )
 
     problem_shape = (total_S_q, total_S_kv, head_dim, (num_head, batch_size))
 
     dtype = torch2cute_dtype_map[q.dtype]
-    current_stream = resolve_stream(current_stream)
 
     has_topk_length = topk_length is not None
     max_topk = topk_idxs.shape[1]
