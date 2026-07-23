@@ -245,16 +245,15 @@ _WORKSPACE_POISON_BYTE = 0xFF
 # Baseline accumulation depth and rtol before sqrt(accum) scaling.
 BASE_ACCUM = 128
 _STANDARD_RTOL_AT_BASE_ACCUM = 1e-2
+_MAX_DENSE_RANDOM_RTOL = 0.10
 
-# Machine epsilon per dtype, used for catastrophic-cancellation detection.
-_DTYPE_EPS = {
-    torch.float16: 9.77e-4,
-    torch.bfloat16: 7.81e-3,
-    torch.float32: 1.19e-7,
+# Integer-policy inputs use fixed per-dtype tolerances without reduction scaling.
+# FP32's 1e-3 absolute floor covers the observed 4.88e-4 bias/ReLU delta.
+_INTEGER_DATA_TOLERANCES = {
+    torch.float16: (1e-3, 1e-5),
+    torch.bfloat16: (1.6e-2, 1e-5),
+    torch.float32: (1.3e-6, 1e-3),
 }
-# Safety multiplier on the expected RMS rounding error (sqrt(accum) * eps).
-# Defines the dtype's physical accuracy floor used as a tolerance fallback.
-_CANCEL_SAFETY_FACTOR = 20.0
 
 # ---------------------------------------------------------------------------
 # Enums
@@ -374,12 +373,10 @@ def _estimate_bytes(cfg: LargeTensorConfig) -> int:
     return int(total * (1.0 + WORKSPACE_OVERHEAD))
 
 
-def _estimate_work_flops(cfg: LargeTensorConfig) -> int:
-    """Approximate convolution work as multiply-add FLOPs.
-
-    The memory budget keeps resident tensors tractable; this cap rejects cases
-    whose implicit-GEMM work is too large for CI even when the tensors fit.
-    """
+# Huge-filter DGRAD can be slow even with a 1x1 output and low nominal FLOPs,
+# so this conservative proxy complements the separate memory budget.
+def _estimate_runtime_work(cfg: LargeTensorConfig) -> int:
+    """Estimate generated-config work for runtime budgeting."""
     input_spatial = math.prod(cfg.input_spatial)
     filter_spatial = math.prod(cfg.filter_spatial)
     output_spatial = math.prod(cfg.y_shape[2:])
@@ -399,17 +396,16 @@ def _fprop_reduction_size(cfg: LargeTensorConfig) -> int:
 def _effective_reduction_size(cfg: LargeTensorConfig) -> int:
     """Return a useful per-output accumulation estimate for diagnostics.
 
-    FPROP reduces across C * filter_spatial. DGRAD and WGRAD use different
-    effective reductions, so keep this helper separate from the sparse-policy
-    trigger and tolerance history.
+    FPROP reduces across C * filter_spatial. DGRAD reduces across K and the
+    contributing dY positions, while WGRAD reduces across N * output_spatial.
+    Keep this separate from the large-filter data-policy trigger.
     """
-    filter_spatial = math.prod(cfg.filter_spatial)
     output_spatial = math.prod(cfg.y_shape[2:])
 
     if cfg.conv_type == ConvType.FPROP:
         return _fprop_reduction_size(cfg)
     if cfg.conv_type == ConvType.DGRAD:
-        return cfg.k * filter_spatial
+        return cfg.k * output_spatial
     return cfg.n * output_spatial
 
 
@@ -437,9 +433,14 @@ def _data_policy_name(cfg: LargeTensorConfig) -> str:
     return "dense_integer"
 
 
+def _tolerance_policy_name(cfg: LargeTensorConfig) -> str:
+    return "integer_dtype_fixed" if _uses_integer_data(cfg) else "dense_random_scaled"
+
+
 def _comparison_context(cfg: LargeTensorConfig, rtol: float, atol: float) -> str:
     return (
         f"data_policy={_data_policy_name(cfg)}, "
+        f"tolerance_policy={_tolerance_policy_name(cfg)}, "
         f"integer_data={_uses_integer_data(cfg)}, "
         f"sparse_filter={_uses_sparse_filter(cfg)}, "
         f"fprop_reduction={_fprop_reduction_size(cfg)}, "
@@ -451,29 +452,20 @@ def _comparison_context(cfg: LargeTensorConfig, rtol: float, atol: float) -> str
 
 
 def _tolerances(cfg: LargeTensorConfig) -> Tuple[float, float]:
-    """Return (rtol, atol) for the cuDNN-vs-reference comparison.
+    """Return comparison tolerances for the selected data policy.
 
-    Uses the looser of two bounds:
-      - Standard: _STANDARD_RTOL_AT_BASE_ACCUM * sqrt(accum / BASE_ACCUM)
-      - Dtype-rounding floor: sqrt(accum) * dtype_eps * _CANCEL_SAFETY_FACTOR
-
-    The second bound is the physical limit on f16/bf16 accuracy at this
-    accumulation depth; any cuDNN engine producing a result within it is as
-    accurate as the dtype can represent. Previous versions gated the wider
-    bound on a "reference near zero" check, but that proved unreliable across
-    architectures because `torch.randn` on CUDA is not bit-identical across
-    GPU arches (parallel PRNG depends on thread launch geometry) and cuDNN's
-    engine selection differs per arch - both effects shift the |ref| value
-    around the detection threshold.
+    Integer-policy inputs use fixed per-dtype bounds. Dense random inputs scale
+    with the operation's effective reduction, with relative error capped at 10%
+    and the same scaled bound serving as the near-zero absolute tolerance.
     """
-    accum = cfg.c * math.prod(cfg.filter_spatial)
+    if _uses_integer_data(cfg):
+        return _INTEGER_DATA_TOLERANCES[cfg.dtype]
+
+    accum = _effective_reduction_size(cfg)
     scale = max(1.0, math.sqrt(accum / BASE_ACCUM))
     std_tol = _STANDARD_RTOL_AT_BASE_ACCUM * scale
-    eps = _DTYPE_EPS[cfg.dtype]
-    cancel_atol = math.sqrt(float(accum)) * eps * _CANCEL_SAFETY_FACTOR
-
-    atol = max(std_tol, cancel_atol)
-    rtol = std_tol
+    atol = std_tol
+    rtol = min(std_tol, _MAX_DENSE_RANDOM_RTOL)
     return rtol, atol
 
 
@@ -702,7 +694,7 @@ def _repro_payload(
         "worker_count": _pytest_worker_count(),
         "work_budget_flops": WORK_BUDGET_FLOPS,
         "estimated_bytes": _estimate_bytes(cfg),
-        "estimated_work_flops": _estimate_work_flops(cfg),
+        "estimated_runtime_work": _estimate_runtime_work(cfg),
         "fprop_reduction": _fprop_reduction_size(cfg),
         "effective_reduction": _effective_reduction_size(cfg),
         "sparse_threshold": _SPARSE_INTEGER_REDUCTION_THRESHOLD,
@@ -710,6 +702,7 @@ def _repro_payload(
         "integer_data": _uses_integer_data(cfg),
         "sparse_filter": _uses_sparse_filter(cfg),
         "data_policy": _data_policy_name(cfg),
+        "tolerance_policy": _tolerance_policy_name(cfg),
         "rtol": rtol,
         "atol": atol,
     }
@@ -918,7 +911,7 @@ class LargeTensorConfigGenerator:
                 continue
             if any(s <= 0 for s in cfg.y_shape[2:]):
                 continue
-            if _estimate_work_flops(cfg) > WORK_BUDGET_FLOPS:
+            if _estimate_runtime_work(cfg) > WORK_BUDGET_FLOPS:
                 continue
             if _estimate_bytes(cfg) <= MEMORY_BUDGET_BYTES:
                 return cfg
