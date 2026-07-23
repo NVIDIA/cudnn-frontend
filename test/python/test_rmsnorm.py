@@ -55,15 +55,14 @@ def test_rmsnorm(param_extract, cudnn_handle):
     embedding_dim, input_type, has_bias = param_extract
 
     batch_size, seq_size = 16, 128
-    N, C, H, W = batch_size * seq_size, embedding_dim, 1, 1
 
     epsilon_value = 1e-3
 
-    x_gpu = 2 * torch.randn(N, C, H, W, requires_grad=True, device="cuda", dtype=input_type) - 1.25
-    scale_gpu = 3 * torch.randn(1, C, H, W, requires_grad=True, device="cuda", dtype=input_type) - 2.75
-    bias_gpu = torch.randn(1, C, H, W, requires_grad=True, device="cuda", dtype=input_type)
+    x_gpu = 2 * torch.randn(batch_size, seq_size, embedding_dim, requires_grad=True, device="cuda", dtype=input_type) - 1.25
+    scale_gpu = 3 * torch.randn(1, 1, embedding_dim, requires_grad=True, device="cuda", dtype=input_type) - 2.75
+    bias_gpu = torch.randn(1, 1, embedding_dim, requires_grad=True, device="cuda", dtype=input_type)
     epsilon_cpu = torch.full(
-        (1, 1, 1, 1),
+        (1, 1, 1),
         epsilon_value,
         requires_grad=False,
         device="cpu",
@@ -72,7 +71,7 @@ def test_rmsnorm(param_extract, cudnn_handle):
 
     print("Running reference")
 
-    model = RMSNorm(eps=epsilon_value, dim=(1, 2, 3)).float()
+    model = RMSNorm(eps=epsilon_value, dim=-1).float()
     Y_expected, inv_var_expected = model(x_gpu, scale_gpu, bias_gpu if has_bias else None)
 
     print("Building cudnn graph")
