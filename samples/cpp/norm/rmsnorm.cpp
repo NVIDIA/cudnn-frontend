@@ -37,12 +37,12 @@ TEST_CASE("RmsNorm Training", "[rmsnorm][graph]") {
     auto X     = graph.tensor(fe::graph::Tensor_attributes()
                               .set_name("X")
                               .set_data_type(fe::DataType_t::FLOAT)
-                              .set_dim({batch_size * seq_length, hidden_size, 1, 1})
-                              .set_stride({hidden_size, 1, hidden_size, hidden_size}));
+                              .set_dim({batch_size, seq_length, hidden_size})
+                              .set_stride({seq_length * hidden_size, hidden_size, 1}));
     auto scale = graph.tensor(fe::graph::Tensor_attributes()
                                   .set_name("scale")
-                                  .set_dim({1, hidden_size, 1, 1})
-                                  .set_stride({hidden_size, 1, hidden_size, hidden_size})
+                                  .set_dim({1, 1, hidden_size})
+                                  .set_stride({hidden_size, hidden_size, 1})
                                   .set_data_type(fe::DataType_t::FLOAT));
 
     float epsilon_cpu = 1e-05f;
@@ -77,7 +77,7 @@ TEST_CASE("RmsNorm Training", "[rmsnorm][graph]") {
     REQUIRE(graph.warmup(handle).is_good());
 
     Surface<float> X_tensor(batch_size * seq_length * hidden_size);
-    Surface<float> Var_tensor(batch_size * seq_length);
+    Surface<float> Inv_variance_tensor(batch_size * seq_length);
     Surface<float> Scale_tensor(hidden_size);
     Surface<float> Y_tensor(batch_size * seq_length * hidden_size);
 
@@ -86,7 +86,10 @@ TEST_CASE("RmsNorm Training", "[rmsnorm][graph]") {
     Surface<int8_t> workspace(workspace_size);
 
     std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>, void*> variant_pack = {
-        {X, X_tensor.devPtr}, {inv_variance, Var_tensor.devPtr}, {scale, Scale_tensor.devPtr}, {Y, Y_tensor.devPtr}};
+        {X, X_tensor.devPtr},
+        {inv_variance, Inv_variance_tensor.devPtr},
+        {scale, Scale_tensor.devPtr},
+        {Y, Y_tensor.devPtr}};
 
     REQUIRE(graph.execute(handle, variant_pack, workspace.devPtr).is_good());
 }
@@ -103,17 +106,17 @@ TEST_CASE("RmsNorm Inference", "[rmsnorm][graph]") {
     auto X     = graph.tensor(fe::graph::Tensor_attributes()
                               .set_name("X")
                               .set_data_type(fe::DataType_t::FLOAT)
-                              .set_dim({batch_size * seq_length, hidden_size, 1, 1})
-                              .set_stride({hidden_size, 1, hidden_size, hidden_size}));
+                              .set_dim({batch_size, seq_length, hidden_size})
+                              .set_stride({seq_length * hidden_size, hidden_size, 1}));
     auto scale = graph.tensor(fe::graph::Tensor_attributes()
                                   .set_name("scale")
-                                  .set_dim({1, hidden_size, 1, 1})
-                                  .set_stride({hidden_size, 1, hidden_size, hidden_size})
+                                  .set_dim({1, 1, hidden_size})
+                                  .set_stride({hidden_size, hidden_size, 1})
                                   .set_data_type(fe::DataType_t::FLOAT));
     auto bias  = graph.tensor(fe::graph::Tensor_attributes()
                                  .set_name("bias")
-                                 .set_dim({1, hidden_size, 1, 1})
-                                 .set_stride({hidden_size, 1, hidden_size, hidden_size})
+                                 .set_dim({1, 1, hidden_size})
+                                 .set_stride({hidden_size, hidden_size, 1})
                                  .set_data_type(fe::DataType_t::FLOAT));
 
     float epsilon_cpu = 1e-05f;
@@ -174,23 +177,23 @@ TEST_CASE("RmsNorm Backward", "[rmsnorm][graph]") {
     auto X  = graph.tensor(fe::graph::Tensor_attributes()
                               .set_name("X")
                               .set_data_type(fe::DataType_t::FLOAT)
-                              .set_dim({batch_size * seq_length, hidden_size, 1, 1})
-                              .set_stride({hidden_size, 1, hidden_size, hidden_size}));
+                              .set_dim({batch_size, seq_length, hidden_size})
+                              .set_stride({seq_length * hidden_size, hidden_size, 1}));
     auto DY = graph.tensor(fe::graph::Tensor_attributes()
                                .set_name("DY")
                                .set_data_type(fe::DataType_t::FLOAT)
-                               .set_dim({batch_size * seq_length, hidden_size, 1, 1})
-                               .set_stride({hidden_size, 1, hidden_size, hidden_size}));
+                               .set_dim({batch_size, seq_length, hidden_size})
+                               .set_stride({seq_length * hidden_size, hidden_size, 1}));
 
     auto scale        = graph.tensor(fe::graph::Tensor_attributes()
                                   .set_name("scale")
-                                  .set_dim({1, hidden_size, 1, 1})
-                                  .set_stride({hidden_size, 1, hidden_size, hidden_size})
+                                  .set_dim({1, 1, hidden_size})
+                                  .set_stride({hidden_size, hidden_size, 1})
                                   .set_data_type(fe::DataType_t::FLOAT));
     auto inv_variance = graph.tensor(fe::graph::Tensor_attributes()
                                          .set_name("inv_variance")
-                                         .set_dim({batch_size * seq_length, 1, 1, 1})
-                                         .set_stride({1, 1, 1, 1})
+                                         .set_dim({batch_size, seq_length, 1})
+                                         .set_stride({seq_length, 1, 1})
                                          .set_data_type(fe::DataType_t::FLOAT));
 
     auto DRMS_options        = fe::graph::Rmsnorm_backward_attributes().has_dbias(false);
@@ -221,11 +224,9 @@ TEST_CASE("RmsNorm Backward", "[rmsnorm][graph]") {
 
     Surface<float> X_tensor(batch_size * seq_length * hidden_size);
     Surface<float> DY_tensor(batch_size * seq_length * hidden_size);
-    Surface<float> Mean_tensor(batch_size * seq_length);
     Surface<float> Inv_variance_tensor(batch_size * seq_length);
     Surface<float> Scale_tensor(hidden_size);
     Surface<float> Dscale_tensor(hidden_size);
-    Surface<float> Dbias_tensor(hidden_size);
     Surface<float> DX_tensor(batch_size * seq_length * hidden_size);
 
     int64_t workspace_size = 0;
