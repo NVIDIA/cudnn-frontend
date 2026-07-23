@@ -33,4 +33,10 @@ class CSANamespace:
 
 CSA = CSANamespace()
 
-__all__ = ["CSA", *_SYMBOLS.keys()]
+__all__ = [
+    "CSA",
+    "CSACompressorBackward",
+    "CSACompressorForward",
+    "csa_compressor_backward_wrapper",
+    "csa_compressor_forward_wrapper",
+]

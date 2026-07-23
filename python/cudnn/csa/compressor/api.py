@@ -113,7 +113,7 @@ def _reject_deterministic_backward() -> None:
             "deterministic (eager) implementation instead."
         )
         if torch.is_deterministic_algorithms_warn_only_enabled():
-            warnings.warn(message, RuntimeWarning)
+            warnings.warn(message, RuntimeWarning, stacklevel=2)
         else:
             raise RuntimeError(message)
 

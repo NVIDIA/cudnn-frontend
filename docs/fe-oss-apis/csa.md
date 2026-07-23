@@ -58,7 +58,10 @@ run-to-run deterministic; the backward APIs raise under
   generic over `(ratio, head_dim, coff in {1, 2})` and the gate can be lifted once
   validated)
 - BF16 `kv` / `score` / `out`, FP32 `ape`, int32 `cu_seqlens` / `cu_seqlens_comp`
-- int32 flat offsets: `total_tokens * coff * head_dim < 2**31`
+- int32 flat offsets: `total_tokens * coff * head_dim < 2**31` and
+  `total_comp * head_dim < 2**31`
+- `total_comp > 0` requires `total_tokens >= ratio` (each compressed row gathers a
+  window of `ratio` tokens)
 - `head_dim <= 8388480` (forward launch `gridDim.y` bound)
 - contiguous tensors on one CUDA device, with 16-byte-aligned base pointers (4-byte
   for the int32 cu_seqlens) — contiguity does not imply base alignment for
@@ -188,7 +191,7 @@ them.
 ## Testing
 
 ```bash
-pytest test/python/fe_api/csa/test_CSA_compressor.py
+(cd test/python && pytest fe_api/csa/test_CSA_compressor.py)
 ```
 
 The tests validate numerics against an fp32-intermediate eager reference (bitwise

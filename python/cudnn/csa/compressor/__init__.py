@@ -6,8 +6,8 @@ from .api import (
 )
 
 __all__ = [
-    "CSACompressorForward",
     "CSACompressorBackward",
-    "csa_compressor_forward_wrapper",
+    "CSACompressorForward",
     "csa_compressor_backward_wrapper",
+    "csa_compressor_forward_wrapper",
 ]
