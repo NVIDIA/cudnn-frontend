@@ -362,7 +362,7 @@ TEST_CASE("LayerNorm Backward", "[layernorm][graph]") {
     dbias->set_output(true).set_data_type(fe::DataType_t::FLOAT);
 
 #if (CUDNN_VERSION < 8905)
-    SKIP("single GPU BN is not supported in cudnn versions prior to 8.7");
+    SKIP("LayerNorm is not supported in cudnn versions prior to 8.9.5");
 #endif
     if (check_device_arch_newer_than("ampere") == false) {
         SKIP("LayerNorm Backward requires Ampere and up");
