@@ -52,6 +52,10 @@ from .compressor_sm100 import (
 
 # int32 flat offsets: every element offset the kernels compute must fit in int32.
 _INT32_LIMIT = 2**31
+# Forward launch schedule gridDim.y bound: at 128 threads per column CTA the largest
+# launchable head_dim is 128 * 65535 (identical for the 64-thread vec == 2 path, which
+# halves the column count).
+_MAX_HEAD_DIM = 128 * 65535
 # Bound + eviction policy follow python/cudnn/graph.py's graph_cache precedent.
 _API_CACHE_MAXSIZE = 256
 
@@ -205,6 +209,13 @@ class _CSACompressorBase(APIBase):
         self._value_error_if(
             total_comp * head_dim >= _INT32_LIMIT,
             f"total_comp * head_dim must be < 2**31 for int32 flat offsets, got {total_comp} * {head_dim}",
+        )
+        # gridDim.y bound of the forward launch schedule (64/128-thread column groups):
+        # head_dims beyond this cannot be launched (the pre-vectorization schedule had
+        # the same 128 * 65535 envelope, just unchecked).
+        self._value_error_if(
+            head_dim > _MAX_HEAD_DIM,
+            f"head_dim must be <= {_MAX_HEAD_DIM} (forward launch gridDim.y bound), got {head_dim}",
         )
         # Rows (including static-capacity padding rows) gather a window of `ratio`
         # tokens; the eager gather has the same requirement.

@@ -191,6 +191,9 @@ _SHAPES = [
     pytest.param([1023, 2048, 509], 128, 4, 2, id="ragged3-d128-r4"),
     pytest.param([2048], 512, 4, 2, id="b1-d512-r4"),
     pytest.param([3, 515, 1024, 129], 128, 4, 2, id="short-seg-d128-r4"),
+    # odd head_dim exercises the scalar (vec == 1) forward layout; even head_dims all
+    # take the vectorized (vec == 2) one.
+    pytest.param([260], 65, 4, 2, id="b1-d65-odd-r4"),
 ]
 
 
@@ -543,6 +546,7 @@ def test_check_support_accepts_envelope():
         (dict(score_shape=(512, 128)), dict(), "score shape"),
         (dict(cuc_len=4), dict(), "B \\+ 1"),
         (dict(total=2**25, d=128), dict(), "int32 flat offsets"),
+        (dict(total=4, d=8388482, total_comp=1), dict(), "head_dim"),
         (dict(total=2, total_comp=1), dict(), "requires at least ratio"),
         (dict(kv_stride=(512, 2)), dict(), "contiguous"),
     ],

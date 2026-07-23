@@ -326,25 +326,48 @@ def _compressor_fwd_kernel(
     ratio: cutlass.Constexpr,
     d: cutlass.Constexpr,
     coff: cutlass.Constexpr,
+    vec: cutlass.Constexpr,
     rows_per_cta: cutlass.Constexpr,
     threads: cutlass.Constexpr,
 ):
-    """Forward: one thread per (output block, head dim), ``rows_per_cta`` blocks/CTA."""
+    """Forward: one thread per (output block, ``vec`` adjacent head dims).
+
+    ``vec == 2`` widens every bf16 access to one 32-bit load/store (``vec == 1`` is the
+    scalar layout for odd ``head_dim``). The per-thread window slices are contiguous and
+    ``vec``-aligned by construction (``W``, ``d`` and the thread's first column are all
+    multiples of ``vec``), which ``cute.assume`` makes provable so ``autovec_copy``
+    lowers each slice to a single ``vec * 16``-bit universal copy. Wider vectors were
+    measured and rejected: 64/128/256-bit variants cut instructions but blow up
+    registers (80/147/255 per thread) and occupancy, losing to ``vec == 2`` on every
+    production shape.
+
+    The per-lane fp32 math is IDENTICAL to the scalar kernel (same op order per output
+    element, one lane per head dim), so the output stays bitwise stable across the
+    ``vec`` configurations.
+    """
     tidx, _, _ = cute.arch.thread_idx()
     bidx, bidy, _ = cute.arch.block_idx()
-    dim = bidy * threads + tidx
+    ncol: cutlass.Constexpr = d // vec  # thread-column count per output row
+    col = bidy * threads + tidx
     W: cutlass.Constexpr = coff * d
     win: cutlass.Constexpr = 2 * ratio if coff == 2 else ratio
 
-    if dim < d:
-        # Hoist APE loads: constant per (k, dim) across all rows.
+    if col < ncol:
+        cvec = col * vec  # first head-dim column of this thread's lane group
+
+        # Hoist APE loads: constant per (k, lane) across all rows.
         ape_k = []
         for k in cutlass.range_constexpr(win):
             if cutlass.const_expr(coff == 2 and k < ratio):
-                col = dim
+                colbase = cvec
             else:
-                col = (d + dim) if cutlass.const_expr(coff == 2) else dim
-            ape_k.append(mAPE[(k % ratio) * W + col])
+                colbase = (d + cvec) if cutlass.const_expr(coff == 2) else cvec
+            fr_a = cute.make_rmem_tensor((vec,), cutlass.Float32)
+            aoff = cute.assume((k % ratio) * W + colbase, divby=vec)
+            gA = cute.make_tensor(mAPE.iterator + aoff, cute.make_layout(vec))
+            cute.autovec_copy(gA, fr_a)
+            for j in cutlass.range_constexpr(vec):
+                ape_k.append(cutlass.Float32(fr_a[j]))
 
         # True compressed row count; rows in [nb_valid, nb_total) are static-capacity
         # padding and gather the window from token 0 with first-in-segment semantics,
@@ -371,37 +394,58 @@ def _compressor_fwd_kernel(
                 sv = []
                 kvv = []
                 for k in cutlass.range_constexpr(win):
+                    fr_s = cute.make_rmem_tensor((vec,), cutlass.BFloat16)
+                    fr_k = cute.make_rmem_tensor((vec,), cutlass.BFloat16)
                     if cutlass.const_expr(coff == 2 and k < ratio):
-                        off = (tok0 - ratio + k) * W + dim
-                        v = cutlass.Float32(_NEG_INF)
-                        u = cutlass.Float32(0.0)
                         if bis > 0:
-                            v = cutlass.Float32(mScore[off]) + ape_k[k]
-                            u = cutlass.Float32(mKV[off])
+                            off = cute.assume((tok0 - ratio + k) * W + cvec, divby=vec)
+                            gS = cute.make_tensor(mScore.iterator + off, cute.make_layout(vec))
+                            gK = cute.make_tensor(mKV.iterator + off, cute.make_layout(vec))
+                            cute.autovec_copy(gS, fr_s)
+                            cute.autovec_copy(gK, fr_k)
+                        # Same value construction as the scalar kernel: the invalid
+                        # window contributes the CONSTANT -inf score (no APE add — APE
+                        # values are not required to be finite) and a zero kv lane.
+                        for j in cutlass.range_constexpr(vec):
+                            v = cutlass.Float32(_NEG_INF)
+                            u = cutlass.Float32(0.0)
+                            if bis > 0:
+                                v = cutlass.Float32(fr_s[j]) + ape_k[k * vec + j]
+                                u = cutlass.Float32(fr_k[j])
+                            sv.append(v)
+                            kvv.append(u)
                     else:
                         if cutlass.const_expr(coff == 2):
-                            off = (tok0 + k - ratio) * W + d + dim
+                            off = cute.assume((tok0 + k - ratio) * W + d + cvec, divby=vec)
                         else:
-                            off = (tok0 + k) * W + dim
-                        v = cutlass.Float32(mScore[off]) + ape_k[k]
-                        u = cutlass.Float32(mKV[off])
-                    sv.append(v)
-                    kvv.append(u)
+                            off = cute.assume((tok0 + k) * W + cvec, divby=vec)
+                        gS = cute.make_tensor(mScore.iterator + off, cute.make_layout(vec))
+                        gK = cute.make_tensor(mKV.iterator + off, cute.make_layout(vec))
+                        cute.autovec_copy(gS, fr_s)
+                        cute.autovec_copy(gK, fr_k)
+                        for j in cutlass.range_constexpr(vec):
+                            sv.append(cutlass.Float32(fr_s[j]) + ape_k[k * vec + j])
+                            kvv.append(cutlass.Float32(fr_k[j]))
 
-                mx = sv[0]
-                for k in cutlass.range_constexpr(1, win):
-                    if sv[k] > mx:
-                        mx = sv[k]
-                den = cutlass.Float32(0.0)
-                ex = []
-                for k in cutlass.range_constexpr(win):
-                    e = cute_math.exp(sv[k] - mx)
-                    den = den + e
-                    ex.append(e)
-                acc = cutlass.Float32(0.0)
-                for k in cutlass.range_constexpr(win):
-                    acc = acc + _fmul_rn(kvv[k], ex[k] / den)
-                mOut[bb * d + dim] = cutlass.BFloat16(acc)
+                fr_o = cute.make_rmem_tensor((vec,), cutlass.BFloat16)
+                for j in cutlass.range_constexpr(vec):
+                    mx = sv[j]
+                    for k in cutlass.range_constexpr(1, win):
+                        if sv[k * vec + j] > mx:
+                            mx = sv[k * vec + j]
+                    den = cutlass.Float32(0.0)
+                    ex = []
+                    for k in cutlass.range_constexpr(win):
+                        e = cute_math.exp(sv[k * vec + j] - mx)
+                        den = den + e
+                        ex.append(e)
+                    acc = cutlass.Float32(0.0)
+                    for k in cutlass.range_constexpr(win):
+                        acc = acc + _fmul_rn(kvv[k * vec + j], ex[k] / den)
+                    fr_o[j] = cutlass.BFloat16(acc)
+                ooff = cute.assume(bb * d + cvec, divby=vec)
+                gO = cute.make_tensor(mOut.iterator + ooff, cute.make_layout(vec))
+                cute.autovec_copy(fr_o, gO)
 
 
 @cute.kernel
@@ -549,6 +593,7 @@ def _compressor_fwd_launch(
     ratio: cutlass.Constexpr,
     d: cutlass.Constexpr,
     coff: cutlass.Constexpr,
+    vec: cutlass.Constexpr,
     rows_per_cta: cutlass.Constexpr,
     threads: cutlass.Constexpr,
 ):
@@ -560,8 +605,9 @@ def _compressor_fwd_launch(
     mCu = cute.make_tensor(cu_ptr, lay)
     mCuComp = cute.make_tensor(cuc_ptr, lay)
     mOut = cute.make_tensor(out_ptr, lay)
+    ncol = d // vec
     gx = (nb_total + rows_per_cta - 1) // rows_per_cta
-    gy = (d + threads - 1) // threads
+    gy = (ncol + threads - 1) // threads
     _compressor_fwd_kernel(
         mKV,
         mScore,
@@ -574,6 +620,7 @@ def _compressor_fwd_launch(
         ratio,
         d,
         coff,
+        vec,
         rows_per_cta,
         threads,
     ).launch(grid=(gx, gy, 1), block=(threads, 1, 1), stream=stream)
@@ -636,8 +683,28 @@ _COMPILED = {}
 # Serializes JIT compilation so concurrent same-config callers cannot compile the same
 # kernel twice (the compiled-function cache itself is a plain dict guarded by the GIL).
 _COMPILE_LOCK = threading.Lock()
-_FWD_ROWS, _FWD_THREADS = 4, 128
 _BWD_ROWS, _BWD_THREADS = 8, 128
+
+
+def _fwd_schedule(d):
+    """Forward launch schedule ``(vec, rows_per_cta, threads)`` for ``head_dim == d``.
+
+    ``vec = 2`` (32-bit paired bf16 accesses) whenever ``d`` is even, else the scalar
+    ``vec = 1`` layout. One output row per CTA with 64-thread column groups: measured
+    optimum across the production shapes (1x/3x 8192-token packs, head_dim 128/512) —
+    smaller CTAs raise the sub-wave grid width that limits the small shapes, and wider
+    per-thread vectors trade instructions for registers/occupancy at a loss (see the
+    kernel docstring). For enormous head_dims whose column count would overflow the
+    65535 ``gridDim.y`` limit at 64 threads, fall back to 128-thread CTAs (the previous
+    schedule's capability envelope).
+    """
+    vec = 2 if d % 2 == 0 else 1
+    ncol = d // vec
+    threads = 64 if ncol >= 64 else ncol
+    if (ncol + threads - 1) // threads > 65535:
+        threads = 128
+    return vec, 1, threads
+
 
 # make_ptr assumed alignments below. Contiguity does NOT imply base-pointer alignment
 # (storage-offset views), so the API layer checks every runtime tensor's data_ptr()
@@ -672,7 +739,7 @@ def _compile_fwd(key, args, ratio, d, coff):
                     "graph capture (JIT compilation is not capture-safe); compile() or "
                     "run one eager step for this configuration before capturing."
                 )
-            fn = cute.compile(_compressor_fwd_launch, *args, ratio, d, coff, _FWD_ROWS, _FWD_THREADS)
+            fn = cute.compile(_compressor_fwd_launch, *args, ratio, d, coff, *_fwd_schedule(d))
             _COMPILED[key] = fn
     return fn
 
