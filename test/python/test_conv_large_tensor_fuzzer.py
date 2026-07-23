@@ -1,9 +1,10 @@
 """
 Large-tensor convolution regression tests.
 
-Tests fprop, dgrad, and wgrad with filter sizes that stress implicit-GEMM
-offset calculations around C*R*S > 2^27. All cases execute the kernel and
-compare against a PyTorch float32 reference.
+Tests fprop, dgrad, and wgrad with large tensors and filters. FPROP and WGRAD
+include C*R*S > 2^27 boundary coverage; DGRAD remains conservatively
+runtime-bounded while exercising large problems. All cases execute the kernel
+and compare against a PyTorch float32 reference.
 
 Tune DEFAULT_NUM_TESTS_L0 / DEFAULT_NUM_TESTS_L1 to adjust local or downstream
 runtime targets:
@@ -36,7 +37,11 @@ _ENGINE_FILTER_OP_ENV = "CUDNN_FUZZ_ENGINE_OP"  # local-only op filter: fprop/dg
 _ENGINE_FILTER_ENV = "CUDNN_FUZZ_ENGINE_IDS"  # local-only backend engine ids
 _REGEN_ON_UNSUPPORTED_ENV = "CUDNN_FUZZ_REGEN_ON_UNSUPPORTED"  # retry unsupported engine picks
 _REGEN_ATTEMPTS_ENV = "CUDNN_FUZZ_REGEN_ATTEMPTS"  # retry cap for regeneration
+_WORK_BUDGET_FLOPS_ENV = "CUDNN_FUZZ_WORK_BUDGET_FLOPS"  # override generated test work cap
+_NUM_TESTS_L0_ENV = "CUDNN_FUZZ_NUM_TESTS_L0"  # override L0 generated count
+_NUM_TESTS_L1_ENV = "CUDNN_FUZZ_NUM_TESTS_L1"  # override L1 generated count
 _BACKEND_ENGINE_MOD = 100  # backend enum suffix used by cudnnTest/backendEngine
+_DEFAULT_WORK_BUDGET_FLOPS = 100_000_000_000_000  # 100 TFLOP per generated test
 
 
 class _EngineFilterNotSupported(Exception):
@@ -133,6 +138,38 @@ def _regen_attempts() -> int:
         raise ValueError(f"{_REGEN_ATTEMPTS_ENV} must be a positive integer") from e
 
 
+def _work_budget_flops() -> int:
+    """Return the per-config estimated work cap in FLOPs."""
+    raw = os.environ.get(_WORK_BUDGET_FLOPS_ENV, "").strip()
+    if not raw:
+        return _DEFAULT_WORK_BUDGET_FLOPS
+
+    try:
+        value = int(float(raw))
+    except ValueError as e:
+        raise ValueError(f"{_WORK_BUDGET_FLOPS_ENV} must be a positive number") from e
+
+    if value <= 0:
+        raise ValueError(f"{_WORK_BUDGET_FLOPS_ENV} must be a positive number")
+    return value
+
+
+def _num_tests(env_name: str, default: int) -> int:
+    """Return a generated test count, optionally overridden by an env var."""
+    raw = os.environ.get(env_name, "").strip()
+    if not raw:
+        return default
+
+    try:
+        value = int(raw)
+    except ValueError as e:
+        raise ValueError(f"{env_name} must be a positive integer") from e
+
+    if value <= 0:
+        raise ValueError(f"{env_name} must be a positive integer")
+    return value
+
+
 def _kernel_cfg_choices(graph, engine: int) -> List[dict]:
     """Expand KERNEL_CFG knob values for one frontend engine."""
     knobs = graph.get_knobs_for_engine(engine)
@@ -183,9 +220,10 @@ def _create_filtered_execution_plans(graph, backend_engine_ids: List[int]) -> No
 
 
 MEMORY_BUDGET_BYTES = _device_memory_budget()
+WORK_BUDGET_FLOPS = _work_budget_flops()
 WORKSPACE_OVERHEAD = 0.15  # fraction added for cuDNN workspace + allocator slack
-DEFAULT_NUM_TESTS_L0 = 48  # default smoke slice
-DEFAULT_NUM_TESTS_L1 = 64  # longer expansion slice
+DEFAULT_NUM_TESTS_L0 = _num_tests(_NUM_TESTS_L0_ENV, 48)  # default smoke slice
+DEFAULT_NUM_TESTS_L1 = _num_tests(_NUM_TESTS_L1_ENV, 64)  # longer expansion slice
 DEFAULT_SEED_L0 = 42
 DEFAULT_SEED_L1 = 12345
 MAX_REGEN_ATTEMPTS = 50
@@ -324,6 +362,23 @@ def _estimate_bytes(cfg: LargeTensorConfig) -> int:
 
     total = base + actual + reference + compare
     return int(total * (1.0 + WORKSPACE_OVERHEAD))
+
+
+def _estimate_work_flops(cfg: LargeTensorConfig) -> int:
+    """Approximate convolution work as multiply-add FLOPs.
+
+    The memory budget keeps resident tensors tractable; this cap rejects cases
+    whose implicit-GEMM work is too large for CI even when the tensors fit.
+    """
+    input_spatial = math.prod(cfg.input_spatial)
+    filter_spatial = math.prod(cfg.filter_spatial)
+    output_spatial = math.prod(cfg.y_shape[2:])
+
+    if cfg.conv_type == ConvType.FPROP:
+        return 2 * cfg.n * cfg.k * output_spatial * cfg.c * filter_spatial
+    if cfg.conv_type == ConvType.DGRAD:
+        return 2 * cfg.n * cfg.c * input_spatial * cfg.k * filter_spatial
+    return 2 * cfg.k * cfg.c * filter_spatial * cfg.n * output_spatial
 
 
 def _tolerances(cfg: LargeTensorConfig) -> Tuple[float, float]:
@@ -546,10 +601,16 @@ class LargeTensorConfigGenerator:
                 continue
             if any(s <= 0 for s in cfg.y_shape[2:]):
                 continue
+            if _estimate_work_flops(cfg) > WORK_BUDGET_FLOPS:
+                continue
             if _estimate_bytes(cfg) <= MEMORY_BUDGET_BYTES:
                 return cfg
 
-        raise RuntimeError(f"Could not generate a fitting config in {MAX_REGEN_ATTEMPTS} attempts. " "Adjust MEMORY_BUDGET_BYTES or generator shape ranges.")
+        raise RuntimeError(
+            f"Could not generate a fitting config in {MAX_REGEN_ATTEMPTS} attempts. "
+            f"Adjust MEMORY_BUDGET_BYTES, {_WORK_BUDGET_FLOPS_ENV}, "
+            "or generator shape ranges."
+        )
 
 
 def tlist_with_configs(*, num_tests: int, rng_seed: int, allow_unaligned: bool = False, include_extras: bool = False) -> list:
