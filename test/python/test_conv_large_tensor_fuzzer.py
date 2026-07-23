@@ -42,6 +42,9 @@ _NUM_TESTS_L0_ENV = "CUDNN_FUZZ_NUM_TESTS_L0"  # override L0 generated count
 _NUM_TESTS_L1_ENV = "CUDNN_FUZZ_NUM_TESTS_L1"  # override L1 generated count
 _BACKEND_ENGINE_MOD = 100  # backend enum suffix used by cudnnTest/backendEngine
 _DEFAULT_WORK_BUDGET_FLOPS = 100_000_000_000_000  # 100 TFLOP per generated test
+_SPARSE_INTEGER_REDUCTION_THRESHOLD = 1 << 20  # switch very large reductions off dense random data
+_SPARSE_INTEGER_TARGET_NONZERO = 32  # max nonzero filter values per output channel
+_SPARSE_INTEGER_RNG_SALT = 0x51A25EED  # split sparse-index RNG from tensor-value RNG
 
 
 class _EngineFilterNotSupported(Exception):
@@ -379,6 +382,54 @@ def _estimate_work_flops(cfg: LargeTensorConfig) -> int:
     if cfg.conv_type == ConvType.DGRAD:
         return 2 * cfg.n * cfg.c * input_spatial * cfg.k * filter_spatial
     return 2 * cfg.k * cfg.c * filter_spatial * cfg.n * output_spatial
+
+
+def _fprop_reduction_size(cfg: LargeTensorConfig) -> int:
+    """Return the FPROP per-output convolution accumulation depth."""
+    return cfg.c * math.prod(cfg.filter_spatial)
+
+
+def _effective_reduction_size(cfg: LargeTensorConfig) -> int:
+    """Return a useful per-output accumulation estimate for diagnostics.
+
+    FPROP reduces across C * filter_spatial. DGRAD and WGRAD use different
+    effective reductions, so keep this helper separate from the sparse-policy
+    trigger and tolerance history.
+    """
+    filter_spatial = math.prod(cfg.filter_spatial)
+    output_spatial = math.prod(cfg.y_shape[2:])
+
+    if cfg.conv_type == ConvType.FPROP:
+        return _fprop_reduction_size(cfg)
+    if cfg.conv_type == ConvType.DGRAD:
+        return cfg.k * filter_spatial
+    return cfg.n * output_spatial
+
+
+def _uses_sparse_integer_data(cfg: LargeTensorConfig) -> bool:
+    """Return whether this config should avoid dense random large reductions.
+
+    The finite mismatch class this policy targets was observed on large FPROP
+    style C * filter_spatial reductions. For DGRAD/WGRAD, this remains a
+    large-filter data policy rather than an exact statement about the op's
+    per-output accumulation depth.
+    """
+    return _fprop_reduction_size(cfg) >= _SPARSE_INTEGER_REDUCTION_THRESHOLD
+
+
+def _data_policy_name(cfg: LargeTensorConfig) -> str:
+    return "sparse_integer" if _uses_sparse_integer_data(cfg) else "dense_random"
+
+
+def _comparison_context(cfg: LargeTensorConfig, rtol: float, atol: float) -> str:
+    return (
+        f"data_policy={_data_policy_name(cfg)}, "
+        f"fprop_reduction={_fprop_reduction_size(cfg)}, "
+        f"effective_reduction={_effective_reduction_size(cfg)}, "
+        f"sparse_threshold={_SPARSE_INTEGER_REDUCTION_THRESHOLD}, "
+        f"sparse_target_nonzero={_SPARSE_INTEGER_TARGET_NONZERO}, "
+        f"rtol={rtol}, atol={atol}"
+    )
 
 
 def _tolerances(cfg: LargeTensorConfig) -> Tuple[float, float]:
@@ -780,6 +831,73 @@ def _run_cudnn(cfg: LargeTensorConfig, X: torch.Tensor, W: torch.Tensor, Y: torc
 
 
 # ---------------------------------------------------------------------------
+# Input tensor initialization
+# ---------------------------------------------------------------------------
+
+
+def _dense_random_cpu_tensor(shape: List[int], dtype: torch.dtype, gen: torch.Generator) -> torch.Tensor:
+    return torch.randn(shape, dtype=dtype, generator=gen)
+
+
+def _dense_small_integer_cpu_tensor(shape: List[int], dtype: torch.dtype, gen: torch.Generator) -> torch.Tensor:
+    values = torch.randint(0, 2, shape, dtype=torch.int8, generator=gen)
+    values.mul_(2).sub_(1)
+    return values.to(dtype=dtype)
+
+
+def _sparse_filter_cpu_tensor(cfg: LargeTensorConfig, rng: random.Random) -> torch.Tensor:
+    """Create a mostly-zero filter with bounded nonzeros per output channel."""
+    reduction_size = _fprop_reduction_size(cfg)
+    nonzero_count = min(_SPARSE_INTEGER_TARGET_NONZERO, reduction_size)
+    W = torch.zeros(cfg.w_shape, dtype=cfg.dtype)
+    if nonzero_count == 0:
+        return W
+
+    flat = W.view(cfg.k, reduction_size)
+    for k_idx in range(cfg.k):
+        positions = rng.sample(range(reduction_size), nonzero_count)
+        signs = [1 if rng.getrandbits(1) else -1 for _ in range(nonzero_count)]
+        indices = torch.tensor(positions, dtype=torch.long)
+        values = torch.tensor(signs, dtype=cfg.dtype)
+        flat[k_idx, indices] = values
+
+    return W
+
+
+def _to_cuda_conv_layout(cpu_tensor: torch.Tensor, memory_format) -> torch.Tensor:
+    return cpu_tensor.to("cuda", non_blocking=True).contiguous(memory_format=memory_format)
+
+
+def _make_x_cpu_tensor(cfg: LargeTensorConfig, gen: torch.Generator) -> torch.Tensor:
+    # DGRAD writes X as the output buffer, so keep its prefill random to help
+    # expose partial writes.
+    if _uses_sparse_integer_data(cfg) and cfg.conv_type in (ConvType.FPROP, ConvType.WGRAD):
+        return _dense_small_integer_cpu_tensor(cfg.x_shape, cfg.dtype, gen)
+    return _dense_random_cpu_tensor(cfg.x_shape, cfg.dtype, gen)
+
+
+def _make_w_cpu_tensor(cfg: LargeTensorConfig, gen: torch.Generator, sparse_rng: random.Random) -> torch.Tensor:
+    # WGRAD writes W as the output buffer, so keep its prefill random to help
+    # expose partial writes.
+    if _uses_sparse_integer_data(cfg) and cfg.conv_type in (ConvType.FPROP, ConvType.DGRAD):
+        return _sparse_filter_cpu_tensor(cfg, sparse_rng)
+    return _dense_random_cpu_tensor(cfg.w_shape, cfg.dtype, gen)
+
+
+def _make_dy_cpu_tensor(cfg: LargeTensorConfig, gen: torch.Generator) -> torch.Tensor:
+    if _uses_sparse_integer_data(cfg):
+        return _dense_small_integer_cpu_tensor(cfg.y_shape, cfg.dtype, gen)
+    return _dense_random_cpu_tensor(cfg.y_shape, cfg.dtype, gen)
+
+
+def _make_bias_cpu_tensor(cfg: LargeTensorConfig, gen: torch.Generator) -> torch.Tensor:
+    shape = [1, cfg.k] + [1] * cfg.spatial_dims
+    if _uses_sparse_integer_data(cfg):
+        return _dense_small_integer_cpu_tensor(shape, cfg.dtype, gen)
+    return _dense_random_cpu_tensor(shape, cfg.dtype, gen)
+
+
+# ---------------------------------------------------------------------------
 # Core test runner
 # ---------------------------------------------------------------------------
 
@@ -798,23 +916,24 @@ def _run_single_config(cfg: LargeTensorConfig, cudnn_handle) -> Tuple[bool, str]
     # with non-trivial output spatial produce scrambled cuDNN output.
     gen = torch.Generator(device="cpu")
     gen.manual_seed(cfg.rng_seed)
+    sparse_rng = random.Random(cfg.rng_seed ^ _SPARSE_INTEGER_RNG_SALT)
 
     if cfg.spatial_dims == 2:
         memory_format = torch.channels_last
     else:
         memory_format = torch.channels_last_3d
 
-    X = torch.randn(cfg.x_shape, dtype=cfg.dtype, generator=gen).to("cuda", non_blocking=True).contiguous(memory_format=memory_format)
-    W = torch.randn(cfg.w_shape, dtype=cfg.dtype, generator=gen).to("cuda", non_blocking=True).contiguous(memory_format=memory_format)
+    X = _to_cuda_conv_layout(_make_x_cpu_tensor(cfg, gen), memory_format)
+    W = _to_cuda_conv_layout(_make_w_cpu_tensor(cfg, gen, sparse_rng), memory_format)
     Y = torch.empty(cfg.y_shape, device="cuda", dtype=cfg.dtype).contiguous(memory_format=memory_format)
     bias = None
 
     if cfg.epilogue == "bias_relu":
-        bias = torch.randn([1, cfg.k] + [1] * cfg.spatial_dims, dtype=cfg.dtype, generator=gen).to("cuda", non_blocking=True)
+        bias = _make_bias_cpu_tensor(cfg, gen).to("cuda", non_blocking=True)
 
     # Y holds the upstream gradient (dY) for backward passes
     if cfg.conv_type in (ConvType.DGRAD, ConvType.WGRAD):
-        Y_cpu = torch.randn(cfg.y_shape, dtype=cfg.dtype, generator=gen)
+        Y_cpu = _make_dy_cpu_tensor(cfg, gen)
         Y.copy_(Y_cpu, non_blocking=True)
         del Y_cpu
 
@@ -832,7 +951,10 @@ def _run_single_config(cfg: LargeTensorConfig, cudnn_handle) -> Tuple[bool, str]
         # the compute dtype.
         ref = _reference(cfg, X, W, Y, bias)
         rtol, atol = _tolerances(cfg)
-        torch.testing.assert_close(actual.to(torch.float32), ref, rtol=rtol, atol=atol)
+        try:
+            torch.testing.assert_close(actual.to(torch.float32), ref, rtol=rtol, atol=atol)
+        except AssertionError as e:
+            raise AssertionError(f"{e}\n\nLarge tensor fuzzer context: " f"{_comparison_context(cfg, rtol, atol)}") from e
         return True, "ok"
 
     finally:
