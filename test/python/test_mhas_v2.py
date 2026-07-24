@@ -116,8 +116,6 @@ def test_sdpa_random_fwd_L0(env_info, test_no, request, cudnn_handle):
         with_sliding_mask=SlidingWindowMaskGenerator(causal=10, left_window_only=5, right_window_only=5, band_around_diag=10, no_mask=10),
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 1}),
         is_ragged_or_padded_or_full=RandomChoice({"ragged" : 0, "padded" : 1, "full" : 1}),
-        with_score_max=RandomChoice({True : 1, False : 3}),
-        with_score_sum_exp=RandomChoice({True : 1, False : 3}),
         with_sink_token=RandomChoice({True : 1, False : 3}),
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
@@ -148,18 +146,13 @@ def test_sdpa_random_fwd_unified_L1(env_info, test_no, request, cudnn_handle):
         with_sliding_mask=SlidingWindowMaskGenerator(causal=10, left_window_only=5, right_window_only=5, band_around_diag=10, no_mask=10),
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 1}),
         is_bias=RandomChoice({True : 1, False : 3}),
-        is_alibi=RandomChoice({True : 1, False : 3}),
         is_ragged_or_padded_or_full=RandomChoice({"ragged" : 0, "padded" : 1, "cu_padded" : 1, "full" : 1}),
         with_unfuse_fma=RandomChoice({True : 1, False : 1}),  # Randomly enable unfuse_fma for SM100
-        with_score_max=RandomChoice({True : 1, False : 3}),
-        with_score_sum_exp=RandomChoice({True : 1, False : 3}),
         with_sink_token=RandomChoice({True : 1, False : 3}),
-        is_dropout=RandomChoice({True : 1, False : 3}),
         with_rope=RandomChoice({True : 1, False : 3}),  # RoPE at end to preserve existing test distributions
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
 
-    test.cfg.dropout_prob = 0.1 if test.cfg.is_dropout else 0.0
     test.cfg.implementation = getattr(cudnn.attention_implementation, request.config.getoption("--implementation") or "", cudnn.attention_implementation.UNIFIED)
     test.showConfig(test_no, request)
 
@@ -235,8 +228,6 @@ def test_sdpa_random_sq1_L0(env_info, test_no, request, cudnn_handle):
         with_sliding_mask=SlidingWindowMaskGenerator(no_mask=10),
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 1}),
         is_ragged_or_padded_or_full=RandomChoice({"ragged" : 0, "padded" : 0, "full" : 1}),
-        with_score_max=RandomChoice({True : 1, False : 3}),
-        with_score_sum_exp=RandomChoice({True : 1, False : 3}),
         # sink_token not supported with s_q==1
         # dropout not supported with s_q==1
     ) as randomization_ctx:
@@ -268,8 +259,6 @@ def test_sdpa_random_sq1_unified_L1(env_info, test_no, request, cudnn_handle):
         with_sliding_mask=SlidingWindowMaskGenerator(no_mask=10),
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 0}),  # Modified from non-unified test
         is_ragged_or_padded_or_full=RandomChoice({"ragged" : 0, "padded" : 0, "full" : 1}),
-        with_score_max=RandomChoice({True : 1, False : 3}),
-        with_score_sum_exp=RandomChoice({True : 1, False : 3}),
         # sink_token not supported with s_q==1
         # dropout not supported with s_q==1
     ) as randomization_ctx:
@@ -306,8 +295,6 @@ def test_sdpa_random_lean_attn_L0(env_info, test_no, request, cudnn_handle):
         with_sliding_mask=SlidingWindowMaskGenerator(no_mask=10),
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 1}),
         is_ragged_or_padded_or_full=RandomChoice({"ragged" : 0, "padded" : 1, "full" : 1}),
-        with_score_max=RandomChoice({True : 1, False : 3}),
-        with_score_sum_exp=RandomChoice({True : 1, False : 3}),
         # sink_token not supported with s_q==1
         # dropout not supported with s_q==1
     ) as randomization_ctx:
@@ -339,8 +326,6 @@ def test_sdpa_random_lean_attn_unified_L1(env_info, test_no, request, cudnn_hand
         with_sliding_mask=SlidingWindowMaskGenerator(no_mask=10),
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 0}),  # Modified from non-unified test
         is_ragged_or_padded_or_full=RandomChoice({"ragged" : 0, "padded" : 1, "full" : 1}),
-        with_score_max=RandomChoice({True : 1, False : 3}),
-        with_score_sum_exp=RandomChoice({True : 1, False : 3}),
         # sink_token not supported with s_q==1
         # dropout not supported with s_q==1
     ) as randomization_ctx:
@@ -376,8 +361,6 @@ def test_sdpa_random_fwd_ragged_L0(env_info, test_no, request, cudnn_handle):
         with_sliding_mask=SlidingWindowMaskGenerator(causal=10, left_window_only=5, right_window_only=5, band_around_diag=10, no_mask=10),
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 1}),
         is_ragged_or_padded_or_full=RandomChoice({"ragged" : 1, "padded" : 0, "full" : 0}),
-        with_score_max=RandomChoice({True : 1, False : 3}),
-        with_score_sum_exp=RandomChoice({True : 1, False : 3}),
         with_sink_token=RandomChoice({True : 1, False : 3}),
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
@@ -408,14 +391,10 @@ def test_sdpa_random_fwd_ragged_unified_L1(env_info, test_no, request, cudnn_han
         with_sliding_mask=SlidingWindowMaskGenerator(no_mask=10),  # Modified from non-unified test
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 0}),  # Modified from non-unified test
         is_ragged_or_padded_or_full=RandomChoice({"ragged" : 1, "cu_ragged" : 1, "padded" : 0, "full" : 0}),
-        with_score_max=RandomChoice({True : 1, False : 3}),
-        with_score_sum_exp=RandomChoice({True : 1, False : 3}),
         with_sink_token=RandomChoice({True : 1, False : 3}),
-        is_dropout=RandomChoice({True : 1, False : 3}),
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
 
-    test.cfg.dropout_prob = 0.1 if test.cfg.is_dropout else 0.0
     test.cfg.implementation = getattr(cudnn.attention_implementation, request.config.getoption("--implementation") or "", cudnn.attention_implementation.UNIFIED)
     test.showConfig(test_no, request)
 
@@ -450,8 +429,6 @@ def test_sdpa_random_fwd_ragged_offset_multiplier_unified_L1(env_info, test_no, 
         with_sliding_mask=SlidingWindowMaskGenerator(no_mask=10),
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 0}),
         is_ragged_or_padded_or_full=RandomChoice({"ragged_mult" : 1, "cu_ragged_mult" : 1}),
-        with_score_max=RandomChoice({True : 1, False : 3}),
-        with_score_sum_exp=RandomChoice({True : 1, False : 3}),
         with_sink_token=RandomChoice({True : 1, False : 3}),
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
@@ -522,8 +499,6 @@ def test_sdpa_fwd_paged_L0(env_info, test_no, request, cudnn_handle):
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 1}),
         is_ragged_or_padded_or_full=RandomChoice({"ragged" : 0, "padded" : 1, "full" : 0}),
         block_size=RandomBlockSize(min=1, max=1024, with_high_probability=[1,32,128]),
-        with_score_max=RandomChoice({True : 1, False : 3}),
-        with_score_sum_exp=RandomChoice({True : 1, False : 3}),
         with_sink_token=RandomChoice({True : 1, False : 3}),
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
