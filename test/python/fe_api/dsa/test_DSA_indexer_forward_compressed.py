@@ -7,6 +7,10 @@ from fe_api.dsa.dsa_reference import (
     check_ref_compressed_topk,
     ref_indexer_forward,
 )
+from fe_api.dsa.dsa_utils import (
+    make_random_mxfp8_scale,
+    pack_mxfp8_scales_thd,
+)
 
 
 def _require_sm100():
@@ -823,16 +827,13 @@ def test_DSA_compressed_indexer_forward_thd_mxfp8_lse(deterministic):
         from cudnn import DSA
         from cudnn.deepseek_sparse_attention.utils.sm100.mxfp8_scale_utils import (
             pack_k_scale_bshd,
-            pack_k_scale_thd,
             pack_q_scale_bshd,
-            pack_q_scale_thd,
         )
-        from fe_api.dsa.dsa_utils import make_random_mxfp8_scale
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
     device = torch.device("cuda")
-    shapes = [(64, 32), (96, 32)]
+    shapes = [(127, 32), (129, 64)]
     ratio, top_k, h_q, h_kv, d = 4, 16, 64, 1, 128
     q_lengths = [shape[0] for shape in shapes]
     k_lengths = [shape[1] for shape in shapes]
@@ -853,17 +854,22 @@ def test_DSA_compressed_indexer_forward_thd_mxfp8_lse(deterministic):
     w = torch.randn(total_q, h_q, dtype=torch.bfloat16, device=device).abs() * 0.1
     q_scale_logical = make_random_mxfp8_scale((total_q, h_q, d // 32), device=device, seed=47)
     k_scale_logical = make_random_mxfp8_scale((total_k, h_kv, d // 32), device=device, seed=53)
-    q_scale = pack_q_scale_thd(
+    q_scale, k_scale, cu_q_scale, cu_k_scale = pack_mxfp8_scales_thd(
         q_scale_logical,
-        cu_q,
-        qhead_per_kv_head=h_q,
-        max_seqlen_q=max_q,
-    )
-    k_scale = pack_k_scale_thd(
         k_scale_logical,
+        cu_q,
         cu_k,
-        max_seqlen_k=max_k,
+        h_q // h_kv,
+        q_alignment=256,
+        k_alignment=256,
     )
+    expected_scale_prefix = torch.tensor(
+        [0, 256, 512],
+        dtype=torch.int32,
+        device=device,
+    )
+    assert torch.equal(cu_q_scale, expected_scale_prefix)
+    assert torch.equal(cu_k_scale, expected_scale_prefix)
     lse_out = torch.empty(total_q, dtype=torch.float32, device=device)
 
     result = DSA.indexer_forward_top_k_wrapper(
@@ -880,6 +886,8 @@ def test_DSA_compressed_indexer_forward_thd_mxfp8_lse(deterministic):
         precision="mxfp8",
         q_scale=q_scale,
         k_scale=k_scale,
+        cu_seqlens_q_scale_padded=cu_q_scale,
+        cu_seqlens_k_scale_padded=cu_k_scale,
         topk_indices_global=False,
         return_lse=True,
         lse_out=lse_out,

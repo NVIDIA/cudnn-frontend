@@ -5,6 +5,7 @@ Parameterization decorators and init helpers. Mirrors the NSA test utilities
 pattern (see test/python/fe_api/nsa/nsa_utils.py).
 """
 
+import math
 from typing import Optional, Tuple
 
 import pytest
@@ -151,6 +152,37 @@ def expand_mxfp8_scale(
 def quantize_mxfp8(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """Quantize a tensor to E4M3 using logical MXFP8 E8M0 scales."""
     return (x.float() / expand_mxfp8_scale(scale, x.shape[-1])).to(torch.float8_e4m3fn)
+
+
+def pack_mxfp8_scales_thd(
+    q_scale_logical: torch.Tensor,
+    k_scale_logical: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    qhead_per_kv_head: int,
+    *,
+    q_alignment: Optional[int] = None,
+    k_alignment: int = 128,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build padded prefixes and packed Q/K scales for THD MXFP8 tests."""
+    from cudnn.deepseek_sparse_attention.utils.sm100.mxfp8_scale_utils import (
+        make_scale_cu_seqlens_padded,
+        pack_k_scale_thd,
+        pack_q_scale_thd,
+    )
+
+    if q_alignment is None:
+        q_alignment = 128 // math.gcd(128, qhead_per_kv_head)
+    cu_q_scale = make_scale_cu_seqlens_padded(cu_seqlens_q, q_alignment)
+    cu_k_scale = make_scale_cu_seqlens_padded(cu_seqlens_k, k_alignment)
+    q_scale = pack_q_scale_thd(
+        q_scale_logical,
+        cu_seqlens_q,
+        cu_q_scale,
+        qhead_per_kv_head,
+    )
+    k_scale = pack_k_scale_thd(k_scale_logical, cu_seqlens_k, cu_k_scale)
+    return q_scale, k_scale, cu_q_scale, cu_k_scale
 
 
 def quantize_fp8_1x128(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

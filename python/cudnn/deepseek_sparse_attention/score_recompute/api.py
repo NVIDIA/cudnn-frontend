@@ -627,6 +627,8 @@ def dense_indexer_score_recompute_wrapper(
     precision: str = "bf16",
     q_scale: Optional[torch.Tensor] = None,
     k_scale: Optional[torch.Tensor] = None,
+    cu_seqlens_q_scale_padded: Optional[torch.Tensor] = None,
+    cu_seqlens_k_scale_padded: Optional[torch.Tensor] = None,
     sf_vec_size: int = 32,
     stream: Optional[cuda.CUstream] = None,
 ) -> TupleDict:
@@ -639,7 +641,7 @@ def dense_indexer_score_recompute_wrapper(
         max_seqlen_k,
     )
     precision = precision.lower()
-    if precision != "bf16" or q_scale is not None or k_scale is not None:
+    if precision != "bf16" or q_scale is not None or k_scale is not None or cu_seqlens_q_scale_padded is not None or cu_seqlens_k_scale_padded is not None:
         major, _ = torch.cuda.get_device_capability()
         if major == 9:
             raise NotImplementedError("Dense indexer score FP8/MXFP8 is SM100-only")
@@ -660,6 +662,8 @@ def dense_indexer_score_recompute_wrapper(
             precision=precision,
             q_scale=q_scale,
             k_scale=k_scale,
+            cu_seqlens_q_scale_padded=cu_seqlens_q_scale_padded,
+            cu_seqlens_k_scale_padded=cu_seqlens_k_scale_padded,
             sf_vec_size=sf_vec_size,
             current_stream=stream,
         )
@@ -868,6 +872,8 @@ def dense_attn_score_recompute_wrapper(
     precision: str = "bf16",
     q_scale: Optional[torch.Tensor] = None,
     k_scale: Optional[torch.Tensor] = None,
+    cu_seqlens_q_scale_padded: Optional[torch.Tensor] = None,
+    cu_seqlens_k_scale_padded: Optional[torch.Tensor] = None,
     sf_vec_size: int = 32,
     stream: Optional[cuda.CUstream] = None,
 ) -> TupleDict:
@@ -880,7 +886,7 @@ def dense_attn_score_recompute_wrapper(
         max_seqlen_k,
     )
     precision = precision.lower()
-    if precision != "bf16" or q_scale is not None or k_scale is not None:
+    if precision != "bf16" or q_scale is not None or k_scale is not None or cu_seqlens_q_scale_padded is not None or cu_seqlens_k_scale_padded is not None:
         major, _ = torch.cuda.get_device_capability()
         if major == 9:
             raise NotImplementedError("Dense attention score MXFP8 is SM100-only")
@@ -901,6 +907,8 @@ def dense_attn_score_recompute_wrapper(
             precision=precision,
             q_scale=q_scale,
             k_scale=k_scale,
+            cu_seqlens_q_scale_padded=cu_seqlens_q_scale_padded,
+            cu_seqlens_k_scale_padded=cu_seqlens_k_scale_padded,
             sf_vec_size=sf_vec_size,
             current_stream=stream,
         )

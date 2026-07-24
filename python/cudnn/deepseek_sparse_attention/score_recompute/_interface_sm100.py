@@ -46,12 +46,14 @@ def _normalize_dense_precision(
     precision: str,
     q_scale: Optional[torch.Tensor],
     k_scale: Optional[torch.Tensor],
+    cu_seqlens_q_scale_padded: Optional[torch.Tensor] = None,
+    cu_seqlens_k_scale_padded: Optional[torch.Tensor] = None,
 ) -> str:
     precision = precision.lower()
     if precision not in ("bf16", "mxfp8"):
         raise ValueError(f"precision must be 'bf16' or 'mxfp8', got {precision!r}")
-    if precision == "bf16" and (q_scale is not None or k_scale is not None):
-        raise ValueError("q_scale and k_scale are only valid with precision='mxfp8'")
+    if precision == "bf16" and (q_scale is not None or k_scale is not None or cu_seqlens_q_scale_padded is not None or cu_seqlens_k_scale_padded is not None):
+        raise ValueError("MXFP8 scales and scale padded cu_seqlens require precision='mxfp8'")
     return precision
 
 
@@ -63,6 +65,8 @@ def _validate_dense_mxfp8_contract(
     per_head_name: str,
     q_scale: Optional[torch.Tensor],
     k_scale: Optional[torch.Tensor],
+    cu_seqlens_q_scale_padded: Optional[torch.Tensor],
+    cu_seqlens_k_scale_padded: Optional[torch.Tensor],
     qhead_per_kv_head: int,
     head_dim: int,
     seqlen_q: int,
@@ -71,6 +75,7 @@ def _validate_dense_mxfp8_contract(
     n_heads_q: int,
     n_heads_kv: int,
     sf_vec_size: int,
+    is_varlen: bool,
 ) -> None:
     if q.dtype != torch.float8_e4m3fn or k.dtype != torch.float8_e4m3fn:
         raise TypeError("precision='mxfp8' requires q and k to be torch.float8_e4m3fn")
@@ -82,6 +87,9 @@ def _validate_dense_mxfp8_contract(
         raise ValueError("precision='mxfp8' requires q_scale and k_scale")
     if q_scale.dtype != torch.float8_e8m0fnu or k_scale.dtype != torch.float8_e8m0fnu:
         raise TypeError("precision='mxfp8' requires q_scale and k_scale to be " "torch.float8_e8m0fnu")
+    for scale, reference, name in ((q_scale, q, "q_scale"), (k_scale, k, "k_scale")):
+        if scale.device != reference.device:
+            raise ValueError(f"{name} must be on the same device as its data tensor")
     if sf_vec_size != 32:
         raise ValueError("precision='mxfp8' currently requires sf_vec_size=32")
     if head_dim != 128 and not (per_head_name == "lse" and head_dim == 512):
@@ -93,21 +101,36 @@ def _validate_dense_mxfp8_contract(
 
     sf_groups = _ceil_div(head_dim, sf_vec_size)
     sf_groups_padded = _ceil_div(sf_groups, 4) * 4
-    q_mn = seqlen_q * qhead_per_kv_head
-    q_shape = (
-        bs * n_heads_kv,
-        _ceil_div(q_mn, 128) * 128,
-        sf_groups_padded,
-    )
-    k_shape = (
-        bs * n_heads_kv,
-        _ceil_div(seqlen_k, 128) * 128,
-        sf_groups_padded,
-    )
-    if tuple(q_scale.shape) != q_shape:
-        raise ValueError(f"q_scale packed shape must be {q_shape}, got {tuple(q_scale.shape)}")
-    if tuple(k_scale.shape) != k_shape:
-        raise ValueError(f"k_scale packed shape must be {k_shape}, got {tuple(k_scale.shape)}")
+    if is_varlen:
+        if cu_seqlens_q_scale_padded is None or cu_seqlens_k_scale_padded is None:
+            raise ValueError("THD MXFP8 requires Q/K scale padded cu_seqlens")
+        for prefix, name in (
+            (cu_seqlens_q_scale_padded, "cu_seqlens_q_scale_padded"),
+            (cu_seqlens_k_scale_padded, "cu_seqlens_k_scale_padded"),
+        ):
+            if prefix.dtype != torch.int32 or prefix.ndim != 1 or prefix.shape[0] != bs + 1 or not prefix.is_contiguous() or prefix.device != q.device:
+                raise ValueError(f"{name} must be contiguous int32 shape ({bs + 1},) on {q.device}")
+        for scale, name in ((q_scale, "q_scale"), (k_scale, "k_scale")):
+            if scale.ndim != 3 or scale.shape[0] != n_heads_kv or scale.shape[1] % 128 != 0 or scale.shape[2] != sf_groups_padded:
+                raise ValueError(f"THD {name} must have shape ({n_heads_kv}, multiple_of_128, " f"{sf_groups_padded}), got {tuple(scale.shape)}")
+    else:
+        if cu_seqlens_q_scale_padded is not None or cu_seqlens_k_scale_padded is not None:
+            raise ValueError("BSHD MXFP8 requires scale padded cu_seqlens to be None")
+        q_mn = seqlen_q * qhead_per_kv_head
+        q_shape = (
+            bs * n_heads_kv,
+            _ceil_div(q_mn, 128) * 128,
+            sf_groups_padded,
+        )
+        k_shape = (
+            bs * n_heads_kv,
+            _ceil_div(seqlen_k, 128) * 128,
+            sf_groups_padded,
+        )
+        if tuple(q_scale.shape) != q_shape:
+            raise ValueError(f"q_scale packed shape must be {q_shape}, got {tuple(q_scale.shape)}")
+        if tuple(k_scale.shape) != k_shape:
+            raise ValueError(f"k_scale packed shape must be {k_shape}, got {tuple(k_scale.shape)}")
 
 
 def _sparse_indexer_score_recompute(
@@ -801,6 +824,8 @@ def _dense_indexer_score_recompute(
     precision: str = "bf16",
     q_scale: Optional[torch.Tensor] = None,
     k_scale: Optional[torch.Tensor] = None,
+    cu_seqlens_q_scale_padded: Optional[torch.Tensor] = None,
+    cu_seqlens_k_scale_padded: Optional[torch.Tensor] = None,
     sf_vec_size: int = 32,
     current_stream: Optional[cuda.CUstream] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -832,7 +857,13 @@ def _dense_indexer_score_recompute(
     q, k, weights = [maybe_contiguous(t, current_stream) for t in (q, k, weights)]
     q_scale = maybe_contiguous(q_scale, current_stream)
     k_scale = maybe_contiguous(k_scale, current_stream)
-    precision = _normalize_dense_precision(precision, q_scale, k_scale)
+    precision = _normalize_dense_precision(
+        precision,
+        q_scale,
+        k_scale,
+        cu_seqlens_q_scale_padded,
+        cu_seqlens_k_scale_padded,
+    )
     is_varlen_q = cu_seqlens_q is not None
     is_varlen_k = cu_seqlens_k is not None
     assert is_varlen_q == is_varlen_k, "THD input requires both cu_seqlens_q and cu_seqlens_k"
@@ -886,6 +917,8 @@ def _dense_indexer_score_recompute(
             per_head_name="weights",
             q_scale=q_scale,
             k_scale=k_scale,
+            cu_seqlens_q_scale_padded=cu_seqlens_q_scale_padded,
+            cu_seqlens_k_scale_padded=cu_seqlens_k_scale_padded,
             qhead_per_kv_head=qhead_per_kv_head,
             head_dim=head_dim,
             seqlen_q=seqlen_q,
@@ -894,6 +927,7 @@ def _dense_indexer_score_recompute(
             n_heads_q=n_heads_q,
             n_heads_kv=n_heads_kv,
             sf_vec_size=sf_vec_size,
+            is_varlen=is_varlen,
         )
 
     device = q.device
@@ -963,6 +997,8 @@ def _dense_indexer_score_recompute(
         denom_cute = to_cute_tensor(denom_out)
         cu_q_cute = to_cute_tensor(cu_seqlens_q, leading_dim=0) if is_varlen else None
         cu_k_cute = to_cute_tensor(cu_seqlens_k, leading_dim=0) if is_varlen else None
+        cu_q_scale_cute = to_cute_tensor(cu_seqlens_q_scale_padded, leading_dim=0) if is_varlen and precision == "mxfp8" else None
+        cu_k_scale_cute = to_cute_tensor(cu_seqlens_k_scale_padded, leading_dim=0) if is_varlen and precision == "mxfp8" else None
         q_offsets_cute = to_cute_tensor(q_causal_offsets, leading_dim=0) if q_causal_offsets is not None else None
 
         if precision == "mxfp8":
@@ -1016,6 +1052,8 @@ def _dense_indexer_score_recompute(
                 max_k_arg,
                 cu_q_cute,
                 cu_k_cute,
+                cu_q_scale_cute,
+                cu_k_scale_cute,
                 q_offsets_cute,
                 current_stream,
                 options=compile_options(),
@@ -1060,6 +1098,8 @@ def _dense_indexer_score_recompute(
                 max_k_arg,
                 cu_seqlens_q if is_varlen else None,
                 cu_seqlens_k if is_varlen else None,
+                cu_seqlens_q_scale_padded if is_varlen else None,
+                cu_seqlens_k_scale_padded if is_varlen else None,
                 q_causal_offsets,
                 current_stream,
             )
@@ -1105,6 +1145,8 @@ def _dense_attn_score_recompute(
     precision: str = "bf16",
     q_scale: Optional[torch.Tensor] = None,
     k_scale: Optional[torch.Tensor] = None,
+    cu_seqlens_q_scale_padded: Optional[torch.Tensor] = None,
+    cu_seqlens_k_scale_padded: Optional[torch.Tensor] = None,
     sf_vec_size: int = 32,
     current_stream: Optional[cuda.CUstream] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1132,7 +1174,13 @@ def _dense_attn_score_recompute(
     q, k = [maybe_contiguous(t, current_stream) for t in (q, k)]
     q_scale = maybe_contiguous(q_scale, current_stream)
     k_scale = maybe_contiguous(k_scale, current_stream)
-    precision = _normalize_dense_precision(precision, q_scale, k_scale)
+    precision = _normalize_dense_precision(
+        precision,
+        q_scale,
+        k_scale,
+        cu_seqlens_q_scale_padded,
+        cu_seqlens_k_scale_padded,
+    )
 
     is_varlen_q = cu_seqlens_q is not None
     is_varlen_k = cu_seqlens_k is not None
@@ -1177,6 +1225,8 @@ def _dense_attn_score_recompute(
             per_head_name="lse",
             q_scale=q_scale,
             k_scale=k_scale,
+            cu_seqlens_q_scale_padded=cu_seqlens_q_scale_padded,
+            cu_seqlens_k_scale_padded=cu_seqlens_k_scale_padded,
             qhead_per_kv_head=qhead_per_kv_head,
             head_dim=head_dim,
             seqlen_q=seqlen_q,
@@ -1185,6 +1235,7 @@ def _dense_attn_score_recompute(
             n_heads_q=n_heads_q,
             n_heads_kv=n_heads_kv,
             sf_vec_size=sf_vec_size,
+            is_varlen=is_varlen,
         )
 
     if out is None:
@@ -1266,6 +1317,8 @@ def _dense_attn_score_recompute(
         denom_cute = to_cute_tensor(denom_out)
         cu_q_cute = to_cute_tensor(cu_seqlens_q, leading_dim=0) if is_varlen else None
         cu_k_cute = to_cute_tensor(cu_seqlens_k, leading_dim=0) if is_varlen else None
+        cu_q_scale_cute = to_cute_tensor(cu_seqlens_q_scale_padded, leading_dim=0) if is_varlen and precision == "mxfp8" else None
+        cu_k_scale_cute = to_cute_tensor(cu_seqlens_k_scale_padded, leading_dim=0) if is_varlen and precision == "mxfp8" else None
         q_offsets_cute = to_cute_tensor(q_causal_offsets, leading_dim=0) if q_causal_offsets is not None else None
 
         if precision == "mxfp8":
@@ -1316,6 +1369,8 @@ def _dense_attn_score_recompute(
                 max_k_arg,
                 cu_q_cute,
                 cu_k_cute,
+                cu_q_scale_cute,
+                cu_k_scale_cute,
                 q_offsets_cute,
                 current_stream,
                 options=compile_options(),
@@ -1364,6 +1419,8 @@ def _dense_attn_score_recompute(
                 max_k_arg,
                 cu_seqlens_q if is_varlen else None,
                 cu_seqlens_k if is_varlen else None,
+                cu_seqlens_q_scale_padded if is_varlen else None,
+                cu_seqlens_k_scale_padded if is_varlen else None,
                 q_causal_offsets,
                 current_stream,
             )
@@ -1409,6 +1466,8 @@ def dense_indexer_score_recompute(
     precision: str = "bf16",
     q_scale: Optional[torch.Tensor] = None,
     k_scale: Optional[torch.Tensor] = None,
+    cu_seqlens_q_scale_padded: Optional[torch.Tensor] = None,
+    cu_seqlens_k_scale_padded: Optional[torch.Tensor] = None,
     sf_vec_size: int = 32,
     k_block_size: Optional[int] = None,
     current_stream: Optional[cuda.CUstream] = None,
@@ -1469,6 +1528,8 @@ def dense_indexer_score_recompute(
         precision=precision,
         q_scale=q_scale,
         k_scale=k_scale,
+        cu_seqlens_q_scale_padded=cu_seqlens_q_scale_padded,
+        cu_seqlens_k_scale_padded=cu_seqlens_k_scale_padded,
         sf_vec_size=sf_vec_size,
         current_stream=current_stream,
     )
@@ -1492,6 +1553,8 @@ def dense_attn_score_recompute(
     precision: str = "bf16",
     q_scale: Optional[torch.Tensor] = None,
     k_scale: Optional[torch.Tensor] = None,
+    cu_seqlens_q_scale_padded: Optional[torch.Tensor] = None,
+    cu_seqlens_k_scale_padded: Optional[torch.Tensor] = None,
     sf_vec_size: int = 32,
     k_block_size: Optional[int] = None,
     current_stream: Optional[cuda.CUstream] = None,
@@ -1550,6 +1613,8 @@ def dense_attn_score_recompute(
         precision=precision,
         q_scale=q_scale,
         k_scale=k_scale,
+        cu_seqlens_q_scale_padded=cu_seqlens_q_scale_padded,
+        cu_seqlens_k_scale_padded=cu_seqlens_k_scale_padded,
         sf_vec_size=sf_vec_size,
         current_stream=current_stream,
     )

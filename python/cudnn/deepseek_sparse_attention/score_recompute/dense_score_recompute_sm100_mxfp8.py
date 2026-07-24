@@ -217,6 +217,8 @@ class BwdDenseAttnScoreSm100Mxfp8(DenseScoreRecomputeSm100):
         max_seqlen_k: Int32,
         mCuSeqlensQ: cute.Tensor | None,
         mCuSeqlensK: cute.Tensor | None,
+        mCuSeqlensQScalePadded: cute.Tensor | None,
+        mCuSeqlensKScalePadded: cute.Tensor | None,
         mQCausalOffsets: cute.Tensor | None,
         stream: cuda.CUstream,
     ):
@@ -228,9 +230,13 @@ class BwdDenseAttnScoreSm100Mxfp8(DenseScoreRecomputeSm100):
         if const_expr(is_varlen):
             assert self.is_varlen
             assert mCuSeqlensQ is not None and mCuSeqlensK is not None
+            assert mCuSeqlensQScalePadded is not None
+            assert mCuSeqlensKScalePadded is not None
         else:
             assert not self.is_varlen
             assert mCuSeqlensQ is None and mCuSeqlensK is None
+            assert mCuSeqlensQScalePadded is None
+            assert mCuSeqlensKScalePadded is None
 
         Q_layout_transpose = [0, 2, 1] if const_expr(is_varlen) else [1, 3, 2, 0]
         K_layout_transpose = [0, 2, 1] if const_expr(is_varlen) else [1, 3, 2, 0]
@@ -238,16 +244,17 @@ class BwdDenseAttnScoreSm100Mxfp8(DenseScoreRecomputeSm100):
         mK = cute.make_tensor(mK.iterator, cute.select(mK.layout, mode=K_layout_transpose))
 
         seqlen_q_static = max_seqlen_q if const_expr(is_varlen) else cute.size(mQ.shape[0])
-        seqlen_k_static = max_seqlen_k if const_expr(is_varlen) else cute.size(mK.shape[0])
         seqlen_q_packed = seqlen_q_static * self.qhead_per_kvhead
 
+        # The packed scale tensors expose their caller-defined, atom-aligned MN
+        # address extent directly in the second mode.
         scale_l_size = cute.size(mQScale.shape[0])
         q_scale_layout = _blockscaled_layout.tile_atom_to_shape_SF(
-            (seqlen_q_packed, self.head_dim_padded, scale_l_size),
+            (cute.size(mQScale.shape[1]), self.head_dim_padded, scale_l_size),
             self.sf_vec_size,
         )
         k_scale_layout = _blockscaled_layout.tile_atom_to_shape_SF(
-            (seqlen_k_static, self.head_dim_padded, scale_l_size),
+            (cute.size(mKScale.shape[1]), self.head_dim_padded, scale_l_size),
             self.sf_vec_size,
         )
         mQScale = cute.make_tensor(mQScale.iterator, q_scale_layout)
@@ -432,6 +439,8 @@ class BwdDenseAttnScoreSm100Mxfp8(DenseScoreRecomputeSm100):
             max_seqlen_k,
             mCuSeqlensQ,
             mCuSeqlensK,
+            mCuSeqlensQScalePadded,
+            mCuSeqlensKScalePadded,
             mQCausalOffsets,
         ).launch(
             grid=grid_dim,
@@ -1042,13 +1051,19 @@ class BwdDenseAttnScoreSm100Mxfp8(DenseScoreRecomputeSm100):
         max_seqlen_k: Int32,
         mCuSeqlensQ: cute.Tensor | None,
         mCuSeqlensK: cute.Tensor | None,
+        mCuSeqlensQScalePadded: cute.Tensor | None,
+        mCuSeqlensKScalePadded: cute.Tensor | None,
         mQCausalOffsets: cute.Tensor | None,
     ):
         is_varlen = mCuSeqlensQ is not None
         if const_expr(is_varlen):
             assert self.is_varlen
+            assert mCuSeqlensQScalePadded is not None
+            assert mCuSeqlensKScalePadded is not None
         else:
             assert not self.is_varlen
+            assert mCuSeqlensQScalePadded is None
+            assert mCuSeqlensKScalePadded is None
 
         seqlen_q_static = max_seqlen_q if const_expr(is_varlen) else cute.size(mQ.shape[0]) // self.qhead_per_kvhead
         seqlen_k_static = max_seqlen_k if const_expr(is_varlen) else cute.size(mK.shape[0])
@@ -1264,12 +1279,23 @@ class BwdDenseAttnScoreSm100Mxfp8(DenseScoreRecomputeSm100):
                 rows_per_thread = cute.ceil_div(self.m_block_size, self.WARP_SIZE)
                 lane_id = tidx % self.WARP_SIZE
                 tile_count = Int32(0)
+                scale_batch_idx = Int32(-1)
+                q_scale_m_block = Int32(0)
+                k_scale_n_block = Int32(0)
 
                 while work_tile.is_valid_tile:
                     m_block_sched = work_tile.tile_idx[0]
                     batch_idx = work_tile.tile_idx[2]
                     seqlen = SeqlenInfoCls(batch_idx)
                     q_causal_offset = Int32(0) if const_expr(mQCausalOffsets is None) else mQCausalOffsets[batch_idx]
+                    if const_expr(is_varlen):
+                        scale_l_idx = 0
+                        if batch_idx != scale_batch_idx:
+                            q_scale_m_block = mCuSeqlensQScalePadded[batch_idx] * self.qhead_per_kvhead // self.m_block_size
+                            k_scale_n_block = mCuSeqlensKScalePadded[batch_idx] // self.n_block_size
+                            scale_batch_idx = batch_idx
+                    else:
+                        scale_l_idx = batch_idx
                     num_m_blocks_cur = cute.ceil_div(
                         seqlen.seqlen_q * self.qhead_per_kvhead,
                         self.m_block_size,
@@ -1300,7 +1326,6 @@ class BwdDenseAttnScoreSm100Mxfp8(DenseScoreRecomputeSm100):
 
                         cute.arch.fence_view_async_shared()
 
-                        scale_l_idx = batch_idx
                         Q_producer.reset()
                         mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, 0]
                         mQScale_cur = mQScale[None, None, scale_l_idx]
@@ -1327,7 +1352,7 @@ class BwdDenseAttnScoreSm100Mxfp8(DenseScoreRecomputeSm100):
                                 gQScale = cute.local_tile(
                                     mQScale_cur,
                                     (self.m_block_size, self.scale_tile_k),
-                                    (m_block, scale_chunk),
+                                    (q_scale_m_block + m_block, scale_chunk),
                                 )
                                 sQScale_cur = sQScale[
                                     None,
@@ -1372,7 +1397,7 @@ class BwdDenseAttnScoreSm100Mxfp8(DenseScoreRecomputeSm100):
                                     mKScale_cur,
                                     (self.n_block_size, self.scale_tile_k),
                                     (
-                                        n_block_k,
+                                        k_scale_n_block + n_block_k,
                                         const_expr(_kc // self.scale_chunks_per_tile if self.chunked_scale_pipeline else 0),
                                     ),
                                 )

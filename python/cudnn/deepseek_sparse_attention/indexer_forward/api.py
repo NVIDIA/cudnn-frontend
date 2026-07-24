@@ -202,6 +202,8 @@ def indexer_forward_wrapper(
     precision: str = "bf16",
     q_scale: Optional[torch.Tensor] = None,
     k_scale: Optional[torch.Tensor] = None,
+    cu_seqlens_q_scale_padded: Optional[torch.Tensor] = None,
+    cu_seqlens_k_scale_padded: Optional[torch.Tensor] = None,
     sf_vec_size: int = 32,
     return_lse: bool = False,
     lse_out: Optional[torch.Tensor] = None,
@@ -214,6 +216,8 @@ def indexer_forward_wrapper(
     local q[0].
     """
     if device_major() == 9:
+        if cu_seqlens_q_scale_padded is not None or cu_seqlens_k_scale_padded is not None:
+            raise NotImplementedError("MXFP8 scale padded cu_seqlens are only supported on SM100+")
         unsupported = []
         if m_block_size != 128:
             unsupported.append(f"m_block_size={m_block_size}")
@@ -281,6 +285,8 @@ def indexer_forward_wrapper(
         precision=precision,
         q_scale=q_scale,
         k_scale=k_scale,
+        cu_seqlens_q_scale_padded=cu_seqlens_q_scale_padded,
+        cu_seqlens_k_scale_padded=cu_seqlens_k_scale_padded,
         sf_vec_size=sf_vec_size,
         current_stream=stream,
     )
@@ -308,6 +314,8 @@ def indexer_forward_top_k_wrapper(
     precision: str = "bf16",
     q_scale: Optional[torch.Tensor] = None,
     k_scale: Optional[torch.Tensor] = None,
+    cu_seqlens_q_scale_padded: Optional[torch.Tensor] = None,
+    cu_seqlens_k_scale_padded: Optional[torch.Tensor] = None,
     sf_vec_size: int = 32,
     return_lse: bool = False,
     lse_out: Optional[torch.Tensor] = None,
@@ -360,6 +368,8 @@ def indexer_forward_top_k_wrapper(
         precision=precision,
         q_scale=q_scale,
         k_scale=k_scale,
+        cu_seqlens_q_scale_padded=cu_seqlens_q_scale_padded,
+        cu_seqlens_k_scale_padded=cu_seqlens_k_scale_padded,
         sf_vec_size=sf_vec_size,
         is_compressed_logits=True,
         topk=top_k,

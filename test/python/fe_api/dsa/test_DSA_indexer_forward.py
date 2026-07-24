@@ -10,6 +10,7 @@ from fe_api.dsa.dsa_utils import (
     dsa_init,
     expand_mxfp8_scale,
     make_random_mxfp8_scale,
+    pack_mxfp8_scales_thd,
     quantize_fp8_1x128,
     quantize_mxfp8,
     with_dsa_indexer_forward_params,
@@ -334,6 +335,162 @@ def test_DSA_indexer_forward_wrapper_qh16_thd_varlen_tails():
         )
         if s_k < max_seqlen_k:
             assert bool(torch.isneginf(scores[q0:q1, s_k:]).all())
+
+
+@pytest.mark.L0
+def test_DSA_indexer_forward_wrapper_mxfp8_requires_mqa():
+    try:
+        from cudnn import DSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("MXFP8 indexer forward requires SM100+")
+
+    scale_utils = pytest.importorskip("cudnn.deepseek_sparse_attention.utils.sm100.mxfp8_scale_utils")
+    device = torch.device("cuda")
+    b, s_q, s_k, h_q, h_kv, d = 1, 128, 32, 128, 2, 128
+    qhead_per_kv_head = h_q // h_kv
+    q = torch.zeros((b, s_q, h_q, d), dtype=torch.float8_e4m3fn, device=device)
+    k = torch.zeros((b, s_k, h_kv, d), dtype=torch.float8_e4m3fn, device=device)
+    w = torch.ones((b, s_q, h_q), dtype=torch.bfloat16, device=device)
+    q_scale_logical = torch.ones((b, s_q, h_q, d // 32), device=device).to(torch.float8_e8m0fnu)
+    k_scale_logical = torch.ones((b, s_k, h_kv, d // 32), device=device).to(torch.float8_e8m0fnu)
+    q_scale = scale_utils.pack_q_scale_bshd(q_scale_logical, qhead_per_kv_head)
+    k_scale = scale_utils.pack_k_scale_bshd(k_scale_logical)
+    common = {
+        "qhead_per_kv_head": qhead_per_kv_head,
+        "precision": "mxfp8",
+        "q_scale": q_scale,
+        "k_scale": k_scale,
+    }
+
+    with pytest.raises(ValueError, match="requires n_heads_kv=1"):
+        DSA.indexer_forward_wrapper(q, k, w, **common)
+
+    cu_q = torch.tensor([0, s_q], dtype=torch.int32, device=device)
+    cu_k = torch.tensor([0, s_k], dtype=torch.int32, device=device)
+    cu_q_scale = scale_utils.make_scale_cu_seqlens_padded(cu_q, token_alignment=2)
+    cu_k_scale = scale_utils.make_scale_cu_seqlens_padded(cu_k, token_alignment=128)
+    with pytest.raises(ValueError, match="requires n_heads_kv=1"):
+        DSA.indexer_forward_wrapper(
+            q[0],
+            k[0],
+            w[0],
+            cu_seqlens_q=cu_q,
+            cu_seqlens_k=cu_k,
+            max_seqlen_q=s_q,
+            max_seqlen_k=s_k,
+            cu_seqlens_q_scale_padded=cu_q_scale,
+            cu_seqlens_k_scale_padded=cu_k_scale,
+            **common,
+        )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=19)
+def test_DSA_indexer_forward_wrapper_thd_mxfp8_compact_padded_scales():
+    try:
+        from cudnn import DSA
+        from cuda.bindings import driver as cuda
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("THD MXFP8 indexer forward requires SM100+")
+
+    device = torch.device("cuda")
+    shapes = [(127, 32), (129, 64)]
+    ratio, h_q, h_kv, d = 4, 64, 1, 128
+    q_lengths = [s_q for s_q, _ in shapes]
+    k_lengths = [s_k for _, s_k in shapes]
+    cu_q = torch.tensor(
+        [0, *torch.tensor(q_lengths).cumsum(0).tolist()],
+        dtype=torch.int32,
+        device=device,
+    )
+    cu_k = torch.tensor(
+        [0, *torch.tensor(k_lengths).cumsum(0).tolist()],
+        dtype=torch.int32,
+        device=device,
+    )
+    total_q, total_k = int(cu_q[-1]), int(cu_k[-1])
+    max_q, max_k = max(q_lengths), max(k_lengths)
+
+    q_ref = torch.randn(total_q, h_q, d, dtype=torch.bfloat16, device=device)
+    k_ref = torch.randn(total_k, h_kv, d, dtype=torch.bfloat16, device=device)
+    w = torch.randn(total_q, h_q, dtype=torch.bfloat16, device=device).abs() * 0.1
+    q_scale_logical = make_random_mxfp8_scale(
+        (total_q, h_q, d // 32),
+        device=device,
+        seed=107,
+        exponent_min=-2,
+        exponent_max=3,
+    )
+    k_scale_logical = make_random_mxfp8_scale(
+        (total_k, h_kv, d // 32),
+        device=device,
+        seed=109,
+        exponent_min=-2,
+        exponent_max=3,
+    )
+    q = quantize_mxfp8(q_ref, q_scale_logical)
+    k = quantize_mxfp8(k_ref, k_scale_logical)
+    q_deq = q.float() * expand_mxfp8_scale(q_scale_logical, d)
+    k_deq = k.float() * expand_mxfp8_scale(k_scale_logical, d)
+    q_scale, k_scale, cu_q_scale, cu_k_scale = pack_mxfp8_scales_thd(
+        q_scale_logical,
+        k_scale_logical,
+        cu_q,
+        cu_k,
+        h_q // h_kv,
+        q_alignment=256,
+        k_alignment=256,
+    )
+    expected_scale_prefix = torch.tensor(
+        [0, 256, 512],
+        dtype=torch.int32,
+        device=device,
+    )
+    assert torch.equal(cu_q_scale, expected_scale_prefix)
+    assert torch.equal(cu_k_scale, expected_scale_prefix)
+    q_causal_offsets = torch.tensor([1, 17], dtype=torch.int32, device=device)
+
+    result = DSA.indexer_forward_wrapper(
+        q,
+        k,
+        w,
+        ratio=ratio,
+        qhead_per_kv_head=h_q // h_kv,
+        cu_seqlens_q=cu_q,
+        cu_seqlens_k=cu_k,
+        max_seqlen_q=max_q,
+        max_seqlen_k=max_k,
+        q_causal_offsets=q_causal_offsets,
+        precision="mxfp8",
+        q_scale=q_scale,
+        k_scale=k_scale,
+        cu_seqlens_q_scale_padded=cu_q_scale,
+        cu_seqlens_k_scale_padded=cu_k_scale,
+        stream=cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+    )
+    torch.cuda.synchronize()
+
+    assert result["scores"].shape == (total_q, max_k)
+    cu_q_host, cu_k_host = cu_q.tolist(), cu_k.tolist()
+    for batch, (_, s_k) in enumerate(shapes):
+        q0, q1 = cu_q_host[batch : batch + 2]
+        k0, k1 = cu_k_host[batch : batch + 2]
+        check_ref_indexer_forward(
+            q_deq[q0:q1].unsqueeze(0),
+            k_deq[k0:k1].unsqueeze(0),
+            w[q0:q1].unsqueeze(0),
+            result["scores"][q0:q1, :s_k].unsqueeze(0),
+            ratio,
+            q_causal_offsets=q_causal_offsets[batch : batch + 1],
+            atol=5e-3,
+            rtol=5e-3,
+        )
 
 
 @pytest.mark.L0

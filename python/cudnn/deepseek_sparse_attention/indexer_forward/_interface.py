@@ -43,6 +43,37 @@ def _packed_mxfp8_scale_shape(
     )
 
 
+def _validate_thd_mxfp8_scale_contract(
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor,
+    cu_seqlens_q_scale_padded: Optional[torch.Tensor],
+    cu_seqlens_k_scale_padded: Optional[torch.Tensor],
+    *,
+    bs: int,
+    n_heads_kv: int,
+    sf_groups: int,
+    device: torch.device,
+) -> None:
+    if cu_seqlens_q_scale_padded is None or cu_seqlens_k_scale_padded is None:
+        raise ValueError("THD MXFP8 requires Q/K scale padded cu_seqlens")
+
+    for prefix, name in (
+        (cu_seqlens_q_scale_padded, "cu_seqlens_q_scale_padded"),
+        (cu_seqlens_k_scale_padded, "cu_seqlens_k_scale_padded"),
+    ):
+        if prefix.dtype != torch.int32 or prefix.ndim != 1 or prefix.shape[0] != bs + 1 or not prefix.is_contiguous() or prefix.device != device:
+            raise ValueError(f"{name} must be contiguous int32 shape ({bs + 1},) on {device}")
+
+    sf_padded = _ceil_div(sf_groups, 4) * 4
+    for scale, name in ((q_scale, "q_scale"), (k_scale, "k_scale")):
+        if scale.ndim != 3:
+            raise ValueError(f"{name} must be a 3D packed scale tensor")
+        if scale.shape[0] != n_heads_kv or scale.shape[1] % 128 != 0 or scale.shape[2] != sf_padded:
+            raise ValueError(f"THD {name} must have shape ({n_heads_kv}, multiple_of_128, " f"{sf_padded}), got {tuple(scale.shape)}")
+        if scale.device != device:
+            raise ValueError("q_scale/k_scale must be on the same device as q/k")
+
+
 def _return_output(
     out: torch.Tensor,
     out_orig: Optional[torch.Tensor],
@@ -115,6 +146,8 @@ def indexer_fwd(
     precision: str = "bf16",
     q_scale: Optional[torch.Tensor] = None,
     k_scale: Optional[torch.Tensor] = None,
+    cu_seqlens_q_scale_padded: Optional[torch.Tensor] = None,
+    cu_seqlens_k_scale_padded: Optional[torch.Tensor] = None,
     sf_vec_size: int = 32,
     is_compressed_logits: bool = False,
     topk: int = 0,
@@ -161,6 +194,14 @@ def indexer_fwd(
             for the SM100 MXFP8 kernel.
         q_scale: blockscaled-packed E8M0 scale tensor for MXFP8 Q.
         k_scale: blockscaled-packed E8M0 scale tensor for MXFP8 K.
+        cu_seqlens_q_scale_padded: required THD MXFP8 prefix for scale storage.
+            Values are consumed as provided; each Q span must cover its logical
+            sequence, and ``span * qhead_per_kv_head`` must be a multiple of
+            128 packed-MN rows. Any span satisfying those requirements is valid.
+        cu_seqlens_k_scale_padded: required THD MXFP8 prefix for scale storage.
+            Values are consumed as provided; each K span must cover its logical
+            sequence and be a multiple of 128 tokens. Any span satisfying those
+            requirements is valid. Both scale prefixes must be ``None`` for BSHD.
         sf_vec_size: scale vector size for MXFP8, currently must be 32.
         q_causal_offsets: optional int32 CUDA tensor of shape ``(batch,)``.
             Each entry is the global uncompressed token index for local q[0].
@@ -217,6 +258,8 @@ def indexer_fwd(
                     precision=precision,
                     q_scale=q_scale,
                     k_scale=k_scale,
+                    cu_seqlens_q_scale_padded=cu_seqlens_q_scale_padded,
+                    cu_seqlens_k_scale_padded=cu_seqlens_k_scale_padded,
                     sf_vec_size=sf_vec_size,
                     topk_indices_global=topk_indices_global,
                     cand_buffer=cand_buffer,
@@ -270,6 +313,8 @@ def indexer_fwd(
                 k_scale,
                 cu_seqlens_q,
                 cu_seqlens_k,
+                cu_seqlens_q_scale_padded,
+                cu_seqlens_k_scale_padded,
                 q_causal_offsets,
                 cand_buffer,
                 cand_batch_offsets,
@@ -285,8 +330,8 @@ def indexer_fwd(
         for tensor, name in ((q, "q"), (k, "k"), (w, "w")):
             assert tensor.dtype == torch.bfloat16, f"{name} must be bfloat16, got {tensor.dtype}"
             assert tensor.is_cuda, f"{name} must be on CUDA device"
-        if q_scale is not None or k_scale is not None:
-            raise ValueError("q_scale and k_scale are only valid with precision='mxfp8'")
+        if q_scale is not None or k_scale is not None or cu_seqlens_q_scale_padded is not None or cu_seqlens_k_scale_padded is not None:
+            raise ValueError("q_scale, k_scale, and scale padded cu_seqlens are only valid " "with precision='mxfp8'")
     else:
         if q.dtype != torch.float8_e4m3fn or k.dtype != torch.float8_e4m3fn:
             raise TypeError("precision='mxfp8' requires q and k to be torch.float8_e4m3fn")
@@ -353,24 +398,40 @@ def indexer_fwd(
 
     if precision == "mxfp8":
         assert q_scale is not None and k_scale is not None
+        if n_heads_kv != 1:
+            raise ValueError("precision='mxfp8' dense score currently requires n_heads_kv=1")
         sf_groups = _ceil_div(head_dim, sf_vec_size)
-        q_shape = _packed_mxfp8_scale_shape(
-            bs=bs,
-            seqlen=seqlen_q_dim,
-            n_heads_kv=n_heads_kv,
-            sf_groups=sf_groups,
-            pack_q_heads=qhead_per_kv_head,
-        )
-        k_shape = _packed_mxfp8_scale_shape(
-            bs=bs,
-            seqlen=seqlen_k_dim,
-            n_heads_kv=n_heads_kv,
-            sf_groups=sf_groups,
-        )
-        if tuple(q_scale.shape) != q_shape:
-            raise ValueError(f"q_scale packed shape must be {q_shape}, got {tuple(q_scale.shape)}")
-        if tuple(k_scale.shape) != k_shape:
-            raise ValueError(f"k_scale packed shape must be {k_shape}, got {tuple(k_scale.shape)}")
+        if is_varlen:
+            _validate_thd_mxfp8_scale_contract(
+                q_scale,
+                k_scale,
+                cu_seqlens_q_scale_padded,
+                cu_seqlens_k_scale_padded,
+                bs=bs,
+                n_heads_kv=n_heads_kv,
+                sf_groups=sf_groups,
+                device=device,
+            )
+        else:
+            if cu_seqlens_q_scale_padded is not None or cu_seqlens_k_scale_padded is not None:
+                raise ValueError("BSHD MXFP8 requires scale padded cu_seqlens to be None")
+            q_shape = _packed_mxfp8_scale_shape(
+                bs=bs,
+                seqlen=seqlen_q_dim,
+                n_heads_kv=n_heads_kv,
+                sf_groups=sf_groups,
+                pack_q_heads=qhead_per_kv_head,
+            )
+            k_shape = _packed_mxfp8_scale_shape(
+                bs=bs,
+                seqlen=seqlen_k_dim,
+                n_heads_kv=n_heads_kv,
+                sf_groups=sf_groups,
+            )
+            if tuple(q_scale.shape) != q_shape:
+                raise ValueError(f"q_scale packed shape must be {q_shape}, got {tuple(q_scale.shape)}")
+            if tuple(k_scale.shape) != k_shape:
+                raise ValueError(f"k_scale packed shape must be {k_shape}, got {tuple(k_scale.shape)}")
 
     # TMA S2G requires globalStride aligned to 16 bytes.
     # For FP32, seqlen_k must be a multiple of 4 elements (4 × 4B = 16B).
@@ -423,6 +484,8 @@ def indexer_fwd(
             denom_cute = _to_cute_tensor(denom_tmp)
             cu_q_cute = _to_cute_tensor(cu_seqlens_q, leading_dim=0) if is_varlen else None
             cu_k_cute = _to_cute_tensor(cu_seqlens_k, leading_dim=0) if is_varlen else None
+            cu_q_scale_cute = _to_cute_tensor(cu_seqlens_q_scale_padded, leading_dim=0) if is_varlen else None
+            cu_k_scale_cute = _to_cute_tensor(cu_seqlens_k_scale_padded, leading_dim=0) if is_varlen else None
             q_offsets_cute = _to_cute_tensor(q_causal_offsets, leading_dim=0) if q_causal_offsets is not None else None
 
             kernel_obj = IndexerForwardSm100Mxfp8(
@@ -457,6 +520,8 @@ def indexer_fwd(
                 max_k_arg,
                 cu_q_cute,
                 cu_k_cute,
+                cu_q_scale_cute,
+                cu_k_scale_cute,
                 q_offsets_cute,
                 current_stream,
                 options=compile_options(),
@@ -481,6 +546,8 @@ def indexer_fwd(
                 max_k_arg,
                 cu_seqlens_q if is_varlen else None,
                 cu_seqlens_k if is_varlen else None,
+                cu_seqlens_q_scale_padded if is_varlen else None,
+                cu_seqlens_k_scale_padded if is_varlen else None,
                 q_causal_offsets,
                 current_stream,
             )
