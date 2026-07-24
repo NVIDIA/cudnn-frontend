@@ -357,7 +357,7 @@ def test_DSA_sparse_attention_backward_topk_length_zero_raises():
             )
 
 
-@pytest.mark.L0
+@pytest.mark.L1
 @torch_fork_set_rng(seed=0)
 def test_DSA_sparse_attention_backward_topk_length_guard_explicit_stream():
     """The topk_length guard must bind to the resolved launch stream.
