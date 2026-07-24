@@ -46,6 +46,11 @@ from .grouped_gemm_wgrad.api import (
     grouped_gemm_wgrad_wrapper_sm100,
 )
 
+from .grouped_gemm_unfused.api import (
+    GroupedGemmSm100,
+    grouped_gemm_wrapper_sm100,
+)
+
 __all__ = [
     "GroupedGemmSwigluSm100",
     "grouped_gemm_swiglu_wrapper_sm100",
@@ -65,4 +70,6 @@ __all__ = [
     "grouped_gemm_dglu_wrapper_sm100",
     "GroupedGemmWgradSm100",
     "grouped_gemm_wgrad_wrapper_sm100",
+    "GroupedGemmSm100",
+    "grouped_gemm_wrapper_sm100",
 ]

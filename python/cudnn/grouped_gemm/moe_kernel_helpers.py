@@ -754,6 +754,143 @@ def can_implement(
     return result
 
 
+def is_valid_bf16_grouped_gemm_dtypes(
+    ab_dtype: Type[cutlass.Numeric],
+    c_dtype: Type[cutlass.Numeric],
+    d_dtype: Type[cutlass.Numeric],
+    acc_dtype: Type[cutlass.Numeric],
+) -> bool:
+    """
+    Check if the BF16 grouped GEMM dtypes are valid.
+
+    :return: True if valid, False otherwise
+    """
+    is_valid = True
+
+    valid_output_dtypes = {cutlass.BFloat16, cutlass.Float16, cutlass.Float32}
+    if ab_dtype != cutlass.BFloat16:
+        is_valid = False
+    if c_dtype not in valid_output_dtypes:
+        is_valid = False
+    if d_dtype not in valid_output_dtypes:
+        is_valid = False
+    if acc_dtype != cutlass.Float32:
+        is_valid = False
+
+    return is_valid
+
+
+def is_valid_bf16_grouped_gemm_mma_tiler_and_cluster_shape(
+    use_2cta_instrs: bool,
+    mma_tiler_mn: Tuple[int, int],
+    cluster_shape_mn: Tuple[int, int],
+    m_aligned: int,
+    fix_pad_size: int = FIX_PAD_SIZE,
+    tile_n_align: int = 64,
+) -> bool:
+    """
+    Check if the BF16 grouped GEMM MMA tiler and cluster shape are valid.
+
+    :param fix_pad_size: The fixed pad size used by the kernel (default: FIX_PAD_SIZE).
+    :param tile_n_align: Required alignment of the MMA tile N (mma_tiler_mn[1]).
+        GLU needs 64 (its epilogue walks 32-column gate/up subtiles in pairs, so the
+        per-tile subtile count must be even). Plain unfused / DGLU only need 32 (their
+        epilogue walks independent 32-column subtiles). Default 64.
+    :return: True if valid, False otherwise
+    """
+    is_valid = True
+
+    if not ((not use_2cta_instrs and mma_tiler_mn[0] in [128]) or (use_2cta_instrs and mma_tiler_mn[0] in [256])):
+        is_valid = False
+    if mma_tiler_mn[1] not in range(tile_n_align, 257, tile_n_align):
+        is_valid = False
+    if cluster_shape_mn[0] % (2 if use_2cta_instrs else 1) != 0:
+        is_valid = False
+    is_power_of_2 = lambda x: x > 0 and (x & (x - 1)) == 0
+    if (
+        cluster_shape_mn[0] * cluster_shape_mn[1] > 16
+        or cluster_shape_mn[0] <= 0
+        or cluster_shape_mn[1] <= 0
+        or not is_power_of_2(cluster_shape_mn[0])
+        or not is_power_of_2(cluster_shape_mn[1])
+    ):
+        is_valid = False
+    cluster_tiler_m = (cluster_shape_mn[0] // (2 if use_2cta_instrs else 1)) * mma_tiler_mn[0]
+
+    if cluster_tiler_m not in [128, 256]:
+        is_valid = False
+
+    if m_aligned % mma_tiler_mn[0] != 0:
+        is_valid = False
+    if m_aligned != fix_pad_size:
+        is_valid = False
+
+    return is_valid
+
+
+def can_implement_bf16_grouped_gemm(
+    ab_dtype: Type[cutlass.Numeric],
+    c_dtype: Type[cutlass.Numeric],
+    d_dtype: Type[cutlass.Numeric],
+    acc_dtype: Type[cutlass.Numeric],
+    use_2cta_instrs: bool,
+    mma_tiler_mn: Tuple[int, int],
+    cluster_shape_mn: Tuple[int, int],
+    m: int,
+    n: int,
+    k: int,
+    l: int,
+    a_major: str,
+    b_major: str,
+    cd_major: str,
+    m_aligned: int,
+    fix_pad_size: int = FIX_PAD_SIZE,
+    n_align: int = 64,
+    tile_n_align: int = 64,
+) -> bool:
+    """
+    Check if the BF16 grouped GEMM can be implemented with the given parameters.
+
+    :param fix_pad_size: The fixed pad size used by the kernel (default: FIX_PAD_SIZE).
+    :param n_align: Required alignment of the problem N dimension. GLU needs 64
+        (gate/up are interleaved as even/odd 32-column blocks, so N must contain an
+        even number of 32-column blocks). Plain unfused / DGLU only need 32 (their
+        per-tile epilogue walks independent 32-column subtiles). Default 64.
+    :param tile_n_align: Required alignment of the MMA tile N (mma_tiler_mn[1]).
+        GLU needs 64 (subtiles consumed in gate/up pairs); unfused / DGLU need 32.
+        Default 64.
+    :return: True if implementable, False otherwise
+    """
+    result = True
+
+    if m_aligned != fix_pad_size:
+        result = False
+
+    if not is_valid_bf16_grouped_gemm_dtypes(ab_dtype, c_dtype, d_dtype, acc_dtype):
+        result = False
+
+    if not (a_major == "k" and b_major in ("k", "n") and cd_major == "n"):
+        result = False
+
+    if not is_valid_bf16_grouped_gemm_mma_tiler_and_cluster_shape(
+        use_2cta_instrs,
+        mma_tiler_mn,
+        cluster_shape_mn,
+        m_aligned,
+        fix_pad_size,
+        tile_n_align=tile_n_align,
+    ):
+        result = False
+
+    if not is_valid_tensor_alignment(m, n, k, l, ab_dtype, d_dtype, a_major, b_major, cd_major):
+        result = False
+
+    if n % n_align != 0 or m % 256 != 0:
+        result = False
+
+    return result
+
+
 def compute_stages(
     tiled_mma: cute.TiledMma,
     mma_tiler_mnk: Tuple[int, int, int],
@@ -912,6 +1049,52 @@ def compute_stages_wgrad(
     c_bytes = c_bytes_per_stage * num_c_stage
 
     num_ab_stage = (num_smem_capacity // occupancy - (mbar_helpers_bytes + c_bytes + sinfo_bytes)) // ab_bytes_per_stage
+
+    return num_acc_stage, num_ab_stage, num_c_stage
+
+
+def compute_stages_wgrad_bf16(
+    tiled_mma: cute.TiledMma,
+    mma_tiler_mnk: Tuple[int, int, int],
+    a_dtype: Type[cutlass.Numeric],
+    b_dtype: Type[cutlass.Numeric],
+    epi_tile: cute.Tile,
+    c_dtype: Type[cutlass.Numeric],
+    c_layout: utils.LayoutEnum,
+    num_smem_capacity: int,
+    occupancy: int,
+) -> Tuple[int, int, int]:
+    """Compute pipeline stages for BF16 wgrad kernel."""
+    num_acc_stage = 2
+    num_c_stage = 2
+    num_tile_stage = 2
+
+    a_smem_layout_stage_one = sm100_utils.make_smem_layout_a(
+        tiled_mma,
+        mma_tiler_mnk,
+        a_dtype,
+        1,
+    )
+    b_smem_layout_stage_one = sm100_utils.make_smem_layout_b(
+        tiled_mma,
+        mma_tiler_mnk,
+        b_dtype,
+        1,
+    )
+    c_smem_layout_stage_one = sm100_utils.make_smem_layout_epi(
+        c_dtype,
+        c_layout,
+        epi_tile,
+        1,
+    )
+
+    ab_bytes_per_stage = cute.size_in_bytes(a_dtype, a_smem_layout_stage_one) + cute.size_in_bytes(b_dtype, b_smem_layout_stage_one)
+    mbar_helpers_bytes = 1024
+    sinfo_bytes = 4 * 4 * num_tile_stage
+    c_bytes = cute.size_in_bytes(c_dtype, c_smem_layout_stage_one) * num_c_stage
+
+    fixed_overhead = mbar_helpers_bytes + c_bytes + sinfo_bytes
+    num_ab_stage = (num_smem_capacity // occupancy - fixed_overhead) // ab_bytes_per_stage
 
     return num_acc_stage, num_ab_stage, num_c_stage
 

@@ -7,6 +7,8 @@ and discrete weight modes, with dSwiGLU and dGeGLU activations.
 
 import torch
 import pytest
+import cudnn
+from unittest.mock import Mock
 from test_utils import torch_fork_set_rng
 from fe_api.test_fe_api_utils import DYNAMIC_SHAPES_M_VALUES
 from fe_api.grouped_gemm.test_grouped_gemm_swiglu_utils import (
@@ -26,6 +28,11 @@ from fe_api.grouped_gemm.test_discrete_grouped_gemm_dswiglu_utils import (
     allocate_discrete_dswiglu_input_tensors,
     allocate_discrete_dswiglu_output_tensors,
     check_ref_discrete_dswiglu,
+)
+from test_grouped_gemm_dglu_bf16_utils import (
+    assert_grouped_gemm_dglu_close as assert_grouped_gemm_dglu_bf16_close,
+    grouped_gemm_dglu_bf16_reference,
+    make_grouped_gemm_dglu_bf16_problem,
 )
 
 with_scheduler_modes = pytest.mark.parametrize(
@@ -64,9 +71,108 @@ def _apply_grouped_gemm_cfg_overrides(cfg, cfg_overrides=None):
     return cfg
 
 
+@pytest.mark.L0
+def test_grouped_gemm_dglu_blockscaled_discrete_records_pointer_streams(monkeypatch):
+    from cudnn.grouped_gemm.grouped_gemm_dglu._blockscaled_api import GroupedGemmDgluBlockScaledAPI
+
+    api = object.__new__(GroupedGemmDgluBlockScaledAPI)
+    api._logger = Mock()
+    api._get_default_stream = lambda stream: stream
+    api._runtime_error_if = lambda condition, message: None
+    api._has_dbias = False
+    api.weight_mode = None
+    api._compiled_kernel = Mock()
+
+    recorded = []
+    monkeypatch.setattr(
+        GroupedGemmDgluBlockScaledAPI,
+        "_record_pointer_stream",
+        staticmethod(lambda pointers, stream: recorded.append((pointers, stream))),
+        raising=False,
+    )
+
+    b_ptrs = object()
+    sfb_ptrs = object()
+    stream = object()
+    api.execute(
+        a_tensor=torch.ones(1),
+        c_tensor=object(),
+        d_row_tensor=object(),
+        d_col_tensor=object(),
+        sfa_tensor=object(),
+        padded_offsets=object(),
+        alpha_tensor=object(),
+        beta_tensor=object(),
+        prob_tensor=object(),
+        dprob_tensor=object(),
+        b_ptrs=b_ptrs,
+        sfb_ptrs=sfb_ptrs,
+        current_stream=stream,
+    )
+
+    assert recorded == [(b_ptrs, stream), (sfb_ptrs, stream)]
+
+
+@pytest.mark.L0
+def test_cudnn_all_excludes_module_implementation_helpers():
+    unexpected_names = {
+        "ctypes",
+        "glob",
+        "os",
+        "sys",
+        "sysconfig",
+        "importlib",
+        "is_windows",
+        "module_name",
+        "symbols_to_import",
+        "symbol_name",
+        "load_cudnn",
+        "Any",
+    }
+    assert unexpected_names.isdisjoint(cudnn.__all__)
+    assert {"backend_version", "__version__", "Node", "pygraph", "graph", "Graph", "wrapper"}.issubset(cudnn.__all__)
+
+
 # ---------------------------------------------------------------------------
 #  Dense mode: Class API
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    ("discrete", "b_major"),
+    [(False, "k"), (True, "k"), (True, "n")],
+    ids=["bf16-dense", "bf16-discrete-k-major", "bf16-discrete-n-major"],
+)
+def test_grouped_gemm_dglu_wrapper_bf16(discrete, b_major):
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("Requires SM100+ for grouped GEMM dGLU BF16 kernel.")
+
+    problem = make_grouped_gemm_dglu_bf16_problem(discrete=discrete, b_major=b_major)
+    expected_d, expected_dprob, _ = grouped_gemm_dglu_bf16_reference(
+        problem,
+        act_func="dswiglu",
+        linear_offset=0.0,
+        generate_dbias=False,
+    )
+    kwargs = dict(
+        a_tensor=problem["a"],
+        c_tensor=problem["c"],
+        sfa_tensor=None,
+        padded_offsets=problem["offsets"],
+        alpha_tensor=problem["alpha"],
+        beta_tensor=problem["beta"],
+        prob_tensor=problem["prob"],
+        dprob_tensor=problem["dprob"],
+        d_dtype=torch.bfloat16,
+    )
+    if discrete:
+        kwargs.update(b_ptrs=problem["b_ptrs"], n=problem["n"], b_dtype=torch.bfloat16, b_major=b_major)
+    else:
+        kwargs.update(b_tensor=problem["b"], sfb_tensor=None)
+    result = cudnn.grouped_gemm_dglu_wrapper_sm100(**kwargs)
+    assert_grouped_gemm_dglu_bf16_close(result["d_row_tensor"], expected_d)
+    assert_grouped_gemm_dglu_bf16_close(result["dprob_tensor"], expected_dprob)
 
 
 @pytest.mark.L0

@@ -4,7 +4,10 @@
 
 ## Overview
 
-**Unified Grouped GEMM + dGLU fusion**: A block-scaled grouped GEMM fused with a dGLU backward epilogue (dSwiGLU or dGeGLU) on NVIDIA Blackwell GPUs (SM100+), designed for MoE (Mixture of Experts) workloads. Implemented with CUTLASS/CUTE.
+**Unified Grouped GEMM + dGLU fusion**: one public class and wrapper select a
+plain BF16 or legacy block-scaled grouped GEMM fused with a dGLU backward
+epilogue (dSwiGLU or dGeGLU) on NVIDIA Blackwell GPUs (SM100+). The operation
+is implemented with CUTLASS/CuTe DSL.
 
 This is a **unified API** that supports both weight layout modes:
 - **Dense mode**: All expert weights packed into a single contiguous `(N, K, L)` tensor
@@ -16,7 +19,98 @@ And both backward activation functions:
 
 Groups are contiguous in the M dimension and described by `padded_offsets` (cumulative aligned end offsets).
 
-This kernel performs:
+### Backend dispatch
+
+| Operand contract | Selected backend |
+| --- | --- |
+| `A` and `B` are BF16 | BF16 |
+| matching supported FP4/FP8 `A` and `B` plus scale descriptors | block-scaled |
+
+Mixed families and unsupported pairs are rejected before allocation or
+compilation. Each backend's argument contract is described below.
+
+## BF16 contract
+
+Pass `sfa_tensor=None`, `sfb_tensor=None` (or `sfb_ptrs=None`), and
+`norm_const_tensor=None`; keep `sf_vec_size=16`, `discrete_col_sfd=False`, and
+`epilogue_op=None`. BF16 also uses the source GeGLU constants
+`geglu_alpha=1.702`, `glu_clamp_max=7`, and `glu_clamp_min=-7`.
+
+### Tensors, layouts, and equation
+
+For padded rows `M`, reduction dimension `K`, compact gradient width `N`, and
+`L` experts, BF16 uses:
+
+- `A`: `(M, K, 1)`, stride `(K, 1, M*K)`, BF16;
+- dense `B`: `(N, K, L)`, K-major stride `(K, 1, N*K)`, BF16;
+- discrete `b_ptrs`: contiguous CUDA int64 pointers to expert `(N, K)` BF16
+  matrices, with `n=N`, `b_dtype=torch.bfloat16`, and `b_major="k"` or `"n"`;
+- `C`: `(M, 2N, 1)`, stride `(2N, 1, 2M*N)`, BF16/FP16/FP32;
+- `padded_offsets`: `(L,)` int32 cumulative 256-aligned ends;
+- `alpha`, `beta`: `(L,)` FP32; `prob`: `(M, 1, 1)` FP32;
+- caller-zeroed `dprob`: `(M, 1, 1)`, stride `(1, 1, 1)`, FP32;
+- `D_row`: `(M, 2N, 1)`, stride `(2N, 1, 2M*N)`, BF16/FP16/FP32;
+- caller-zeroed optional `dbias`: `(L, 2N, 1)`, stride `(2N, 1, 1)`, BF16.
+
+For expert `g`, the compact GEMM gradient and scaled forward activation are
+
+$$
+R_g = \alpha_g^2 A_g B_g^T, \qquad X_g = \beta_g C_g.
+$$
+
+Split `X` into alternating 32-wide gate/input blocks. For dSwiGLU, with
+`s = sigmoid(gate)`:
+
+$$
+d\mathrm{input} = R\,\mathrm{prob}\,(\mathrm{gate}\,s),
+$$
+
+$$
+d\mathrm{gate} = R\,\mathrm{prob}\,\mathrm{input}\,s
+                  (1 + \mathrm{gate}(1-s)).
+$$
+
+For dGeGLU, distinguish raw values, clamped activation values, and the source's
+value-bearing filters:
+
+```text
+raw_gate = gate(X)
+raw_input = input(X)
+clamped_gate = min(raw_gate, 7)
+clamped_input = clamp(raw_input, -7, 7)
+gate_filter = raw_gate if raw_gate <= 7 else 0
+input_filter = raw_input if -7 <= raw_input <= 7 else 0
+s = sigmoid(1.702 * clamped_gate)
+```
+
+With the default `linear_offset=1`, the kernel computes
+
+$$
+d\mathrm{gate} = R\,\mathrm{prob}\,
+                  (\mathrm{clamped\_input}+\mathrm{linear\_offset})\,s
+                  (1 + 1.702\,\mathrm{clamped\_gate}(1-s))\,
+                  \mathrm{gate\_filter},
+$$
+
+$$
+d\mathrm{input} = R\,\mathrm{prob}\,\mathrm{clamped\_gate}\,s\,
+                   \mathrm{input\_filter}.
+$$
+
+`dprob` accumulates the row sum of the matching unscaled activation times `R`;
+`dbias` is the per-expert row reduction of interleaved `D_row`. The
+pointer-array tensor is stream-recorded, while every pointed allocation must
+remain alive and unchanged until that stream completes.
+
+The wrapper return order is exactly `d_row_tensor`, `d_col_tensor`,
+`dprob_tensor`, `dbias_tensor`, `amax_tensor`, `sfd_row_tensor`,
+`sfd_col_tensor`. On BF16, `d_col_tensor`, `amax_tensor`, `sfd_row_tensor`, and
+`sfd_col_tensor` are `None`; `dbias_tensor` is `None` unless
+`generate_dbias=True`.
+
+## Block-scaled contract
+
+The block-scaled backend performs:
 1. **Block-scaled grouped GEMM**: Low-precision GEMM (FP4, FP8) with per-block scale factors across multiple expert groups
 2. **dGLU backward epilogue**: Fused backward computation using the forward `C` tensor (input/gate interleaved)
 3. **Optional quantized output**: Produces row and column scale factors for downstream quantization
@@ -110,9 +204,74 @@ $$
 
 ---
 
-## API Usage
+## API usage
 
-### High-level Wrapper
+### BF16
+
+#### High-level wrapper
+
+```python
+import cudnn
+import torch
+
+dprob.zero_()
+out = cudnn.grouped_gemm_dglu_wrapper_sm100(
+    a_tensor=a,
+    c_tensor=c,
+    sfa_tensor=None,
+    padded_offsets=padded_offsets,
+    alpha_tensor=alpha,
+    beta_tensor=beta,
+    prob_tensor=prob,
+    dprob_tensor=dprob,
+    b_tensor=b,
+    sfb_tensor=None,
+    act_func="dswiglu",
+    generate_dbias=True,
+    use_dynamic_sched=True,
+)
+d_row, d_col, dprob, dbias, amax, sfd_row, sfd_col = out
+
+# Discrete mode replaces the dense weight arguments.
+out = cudnn.grouped_gemm_dglu_wrapper_sm100(
+    a_tensor=a, c_tensor=c, sfa_tensor=None,
+    padded_offsets=padded_offsets, alpha_tensor=alpha, beta_tensor=beta,
+    prob_tensor=prob, dprob_tensor=dprob,
+    b_ptrs=b_ptrs, sfb_ptrs=None, n=N, b_dtype=torch.bfloat16,
+    act_func="dgeglu",
+)
+```
+
+#### Class API
+
+```python
+op = cudnn.GroupedGemmDgluSm100(
+    sample_a=a, sample_c=c, sample_d_row=d_row, sample_d_col=None,
+    sample_sfa=None, sample_padded_offsets=padded_offsets,
+    sample_alpha=alpha, sample_beta=beta, sample_prob=prob,
+    sample_dprob=dprob, sample_dbias=dbias,
+    sample_b=b, sample_sfb=None, act_func="dswiglu",
+)
+assert op.check_support()
+op.compile()
+dprob.zero_()
+dbias.zero_()
+op.execute(
+    a_tensor=a, c_tensor=c, d_row_tensor=d_row, d_col_tensor=None,
+    sfa_tensor=None, padded_offsets=padded_offsets, alpha_tensor=alpha,
+    beta_tensor=beta, prob_tensor=prob, dprob_tensor=dprob,
+    dbias_tensor=dbias, b_tensor=b, sfb_tensor=None,
+)
+```
+
+`use_dynamic_sched=False` selects static scheduling; `True` caches a dynamic-M
+callable for compatible shapes. Cache keys retain compile-sensitive layouts,
+dtypes, activation, dbias policy, scheduler, tiles/clusters, features, and
+overlap margin.
+
+### Block-scaled
+
+#### High-level wrapper
 
 **Dense mode:**
 
@@ -185,7 +344,7 @@ outputs = grouped_gemm_dglu_wrapper_sm100(
 )
 ```
 
-### Class API
+#### Class API
 
 **Dense mode:**
 

@@ -418,3 +418,222 @@ class WgradScaledGemmSchedExtension(MoESchedExtension):
             return (real, desc)
 
         raise ValueError(f"WgradScaledGemmSchedExtension: unknown tensor '{tensor_name}'")
+
+
+class DiscreteWeightGroupedGemmSchedExtension(MoESchedExtension):
+    """
+    MoE scheduler extension for discrete-weight non-scaled grouped GEMM.
+
+    Handles domain conversion for: a, b, c, d, prob, bias.
+
+    B is discrete (per-expert pointer array) and uses expert-wise TMA
+    descriptors from workspace. A/C/D/prob are contiguous across experts and
+    indexed by padded token offset. Bias is a dense (N, L) tensor and selected
+    by expert index.
+
+    Domain conversion:
+        A:        (total_padded_M, K, 1) → domain_offset M by token_offset
+        B:        template (N, K, 1)     → rewrite L to dynamic 1,
+                                             expert-wise desc
+        C/D/prob: (total_padded_M, N, 1) → domain_offset M by token_offset
+        Bias:     (N, L)                 → domain_offset L by expert_idx
+
+    :param tensormap_ctor: Discrete-weight tensormap workspace accessor for B
+        descriptors.
+    """
+
+    def __init__(self, tensormap_ctor: OnlineTensormapDescCreator):
+        super().__init__(tensormap_ctor)
+
+    def __extract_mlir_values__(self):
+        return extract_mlir_values(self.tensormap_ctor)
+
+    def __new_from_mlir_values__(self, values):
+        new_ctor = new_from_mlir_values(self.tensormap_ctor, values)
+        return DiscreteWeightGroupedGemmSchedExtension(tensormap_ctor=new_ctor)
+
+    def update_expert_info(self, offs, expert_idx):
+        self.token_offset, self.tokens_i = compute_expert_token_range(offs, expert_idx)
+
+    @cute.jit
+    def get_gmem_tensor(
+        self,
+        tensor_name: str,
+        gmem_tensor_in_moe_view: cute.Tensor,
+        offs: cute.Tensor,
+        work_tile_info: MoEWorkTileInfo,
+    ):
+        expert_idx = work_tile_info.expert_idx
+        if cutlass.const_expr(hasattr(self, "token_offset")):
+            token_offset, tokens_i = self.token_offset, self.tokens_i
+        else:
+            token_offset, tokens_i = compute_expert_token_range(offs, expert_idx)
+
+        shape = gmem_tensor_in_moe_view.shape
+        c1 = cutlass.Int32(1)
+
+        if cutlass.const_expr(tensor_name == "a"):
+            real = cute.domain_offset((token_offset, 0, 0), gmem_tensor_in_moe_view)
+            real = rewrite_tensor_shape(real, (tokens_i, shape[1], c1))
+            return (real, None)
+
+        elif cutlass.const_expr(tensor_name == "b"):
+            real = rewrite_tensor_shape(gmem_tensor_in_moe_view, (shape[0], shape[1], c1))
+            desc = tensormap_ptr_for_copy(self.tensormap_ctor.get_desc_ptr("b", expert_idx))
+            return (real, desc)
+
+        elif cutlass.const_expr(tensor_name == "bias"):
+            real = cute.domain_offset((0, expert_idx), gmem_tensor_in_moe_view)
+            real = rewrite_tensor_shape(real, (shape[0], c1))
+            return (real, None)
+
+        else:
+            real = cute.domain_offset((token_offset, 0, 0), gmem_tensor_in_moe_view)
+            real = rewrite_tensor_shape(real, (tokens_i, shape[1], c1))
+            return (real, None)
+
+
+class ContiguousGroupedGemmSchedExtension(MoESchedExtension):
+    """
+    MoE scheduler extension for contiguous non-scaled grouped GEMM.
+
+    Handles domain conversion for: a, b, c, d, prob, bias.
+
+    All tensors use global TMA descriptors. A/C/D/prob are indexed by padded
+    token offset. B and bias select the expert through their L dimension.
+
+    Domain conversion:
+        A:        (total_padded_M, K, 1) → domain_offset M by token_offset
+        B:        (N, K, L)              → domain_offset L by expert_idx
+        C/D/prob: (total_padded_M, N, 1) → domain_offset M by token_offset
+        Bias:     (N, L)                 → domain_offset L by expert_idx
+
+    No constructor parameters are required because contiguous weights do not
+    use per-expert descriptor workspace.
+    """
+
+    def __init__(self):
+        super().__init__(tensormap_ctor=None)
+
+    def __extract_mlir_values__(self):
+        return []
+
+    def __new_from_mlir_values__(self, values):
+        return ContiguousGroupedGemmSchedExtension()
+
+    def update_expert_info(self, offs, expert_idx):
+        self.token_offset, self.tokens_i = compute_expert_token_range(offs, expert_idx)
+
+    @cute.jit
+    def get_gmem_tensor(
+        self,
+        tensor_name: str,
+        gmem_tensor_in_moe_view: cute.Tensor,
+        offs: cute.Tensor,
+        work_tile_info: MoEWorkTileInfo,
+    ):
+        expert_idx = work_tile_info.expert_idx
+        if cutlass.const_expr(hasattr(self, "token_offset")):
+            token_offset, tokens_i = self.token_offset, self.tokens_i
+        else:
+            token_offset, tokens_i = compute_expert_token_range(offs, expert_idx)
+
+        shape = gmem_tensor_in_moe_view.shape
+        c1 = cutlass.Int32(1)
+
+        if cutlass.const_expr(tensor_name == "a"):
+            real = cute.domain_offset((token_offset, 0, 0), gmem_tensor_in_moe_view)
+            real = rewrite_tensor_shape(real, (tokens_i, shape[1], c1))
+            return (real, None)
+
+        elif cutlass.const_expr(tensor_name == "b"):
+            real = cute.domain_offset((0, 0, expert_idx), gmem_tensor_in_moe_view)
+            real = rewrite_tensor_shape(real, (shape[0], shape[1], c1))
+            return (real, None)
+
+        elif cutlass.const_expr(tensor_name == "bias"):
+            real = cute.domain_offset((0, expert_idx), gmem_tensor_in_moe_view)
+            real = rewrite_tensor_shape(real, (shape[0], c1))
+            return (real, None)
+
+        else:
+            real = cute.domain_offset((token_offset, 0, 0), gmem_tensor_in_moe_view)
+            real = rewrite_tensor_shape(real, (tokens_i, shape[1], c1))
+            return (real, None)
+
+
+class WgradGemmSchedExtension(MoESchedExtension):
+    """
+    BF16 wgrad extension for Dense/Discrete output × Tensor2D/Ragged input.
+
+    Domain conversion (2Dx2D):
+        A (Tensor2D):     (M, total_padded_K, 1) -> domain_offset K, global desc
+        A (TensorRagged): (M, total_padded_K, 1) -> rewrite shape, expert-wise desc
+        B (Tensor2D):     (N, total_padded_K, 1) -> domain_offset K, global desc
+        B (TensorRagged): (N, total_padded_K, 1) -> rewrite shape, expert-wise desc
+        C (Dense):        (M, N, expert_cnt) -> domain_offset L by expert_idx, global
+        C (Discrete):     template (M, N, 1) -> rewrite L to dynamic 1, expert-wise
+    """
+
+    def __init__(
+        self,
+        tensormap_ctor,
+        weight_mode: MoEWeightMode,
+        input_order: WGradInputOrder = WGradInputOrder.Tensor2D,
+    ):
+        super().__init__(tensormap_ctor)
+        self.weight_mode = weight_mode
+        self.input_order = input_order
+
+    def __extract_mlir_values__(self):
+        return extract_mlir_values(self.tensormap_ctor)
+
+    def __new_from_mlir_values__(self, values):
+        new_ctor = new_from_mlir_values(self.tensormap_ctor, values)
+        return WgradGemmSchedExtension(
+            tensormap_ctor=new_ctor,
+            weight_mode=self.weight_mode,
+            input_order=self.input_order,
+        )
+
+    def update_expert_info(self, offs, expert_idx):
+        self.token_offset, self.tokens_i = compute_expert_token_range(offs, expert_idx)
+
+    @cute.jit
+    def get_gmem_tensor(
+        self,
+        tensor_name: str,
+        gmem_tensor_in_moe_view: cute.Tensor,
+        offs: cute.Tensor,
+        work_tile_info: MoEWorkTileInfo,
+    ):
+        expert_idx = work_tile_info.expert_idx
+        if cutlass.const_expr(hasattr(self, "token_offset")):
+            token_offset, tokens_i = self.token_offset, self.tokens_i
+        else:
+            token_offset, tokens_i = compute_expert_token_range(offs, expert_idx)
+
+        shape = gmem_tensor_in_moe_view.shape
+        c1 = cutlass.Int32(1)
+
+        if cutlass.const_expr(tensor_name in ("a", "b")):
+            if cutlass.const_expr(self.input_order == WGradInputOrder.TensorRagged):
+                per_expert_shape = (shape[0], tokens_i, c1)
+                real = rewrite_tensor_shape(gmem_tensor_in_moe_view, per_expert_shape)
+                desc = tensormap_ptr_for_copy(self.tensormap_ctor.get_desc_ptr(tensor_name, expert_idx))
+                return (real, desc)
+            real = cute.domain_offset((0, token_offset, 0), gmem_tensor_in_moe_view)
+            real = rewrite_tensor_shape(real, (shape[0], tokens_i, c1))
+            return (real, None)
+
+        elif cutlass.const_expr(tensor_name == "c"):
+            if cutlass.const_expr(self.weight_mode == MoEWeightMode.DENSE):
+                real = cute.domain_offset((0, 0, expert_idx), gmem_tensor_in_moe_view)
+                real = rewrite_tensor_shape(real, (shape[0], shape[1], c1))
+                return (real, None)
+            real = rewrite_tensor_shape(gmem_tensor_in_moe_view, (shape[0], shape[1], c1))
+            desc = tensormap_ptr_for_copy(self.tensormap_ctor.get_desc_ptr("c", expert_idx))
+            return (real, desc)
+
+        else:
+            raise ValueError(f"WgradGemmSchedExtension: unknown tensor '{tensor_name}'")

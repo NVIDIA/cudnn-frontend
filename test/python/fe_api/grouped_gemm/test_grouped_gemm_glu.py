@@ -7,6 +7,7 @@ and discrete weight modes, with SwiGLU and GeGLU activations.
 
 import torch
 import pytest
+import cudnn
 from test_utils import torch_fork_set_rng
 from fe_api.test_fe_api_utils import DYNAMIC_SHAPES_M_VALUES
 from fe_api.grouped_gemm.test_grouped_gemm_swiglu_utils import (
@@ -24,6 +25,11 @@ from fe_api.grouped_gemm.test_discrete_grouped_gemm_swiglu_utils import (
     allocate_discrete_input_tensors,
     allocate_discrete_output_tensors,
     check_ref_discrete_grouped_gemm,
+)
+from test_grouped_gemm_glu_bf16_utils import (
+    assert_grouped_gemm_glu_close as assert_grouped_gemm_glu_bf16_close,
+    grouped_gemm_glu_bf16_reference,
+    make_grouped_gemm_glu_bf16_problem,
 )
 
 with_scheduler_modes = pytest.mark.parametrize(
@@ -48,6 +54,44 @@ def _apply_grouped_gemm_cfg_overrides(cfg, cfg_overrides=None):
 # ---------------------------------------------------------------------------
 #  Dense mode: Class API (reuses same tensor setup as contiguous swiglu)
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    ("discrete", "b_major"),
+    [(False, "k"), (True, "k"), (True, "n")],
+    ids=["bf16-dense", "bf16-discrete-k-major", "bf16-discrete-n-major"],
+)
+def test_grouped_gemm_glu_wrapper_bf16(discrete, b_major):
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("Requires SM100+ for grouped GEMM GLU BF16 kernel.")
+
+    problem = make_grouped_gemm_glu_bf16_problem(discrete=discrete, b_major=b_major)
+    expected_c, expected_d = grouped_gemm_glu_bf16_reference(
+        problem,
+        act_func="swiglu",
+        linear_offset=0.0,
+        geglu_alpha=1.702,
+        glu_clamp_max=7.0,
+        glu_clamp_min=-7.0,
+    )
+    kwargs = dict(
+        a_tensor=problem["a"],
+        sfa_tensor=None,
+        padded_offsets=problem["offsets"],
+        alpha_tensor=problem["alpha"],
+        bias_tensor=problem["bias"],
+        prob_tensor=problem["prob"],
+        c_dtype=torch.bfloat16,
+        d_dtype=torch.bfloat16,
+    )
+    if discrete:
+        kwargs.update(b_ptrs=problem["b_ptrs"], n=problem["n"], b_dtype=torch.bfloat16, b_major=b_major)
+    else:
+        kwargs.update(b_tensor=problem["b"], sfb_tensor=None)
+    result = cudnn.grouped_gemm_glu_wrapper_sm100(generate_c=True, **kwargs)
+    assert_grouped_gemm_glu_bf16_close(result["d_tensor"], expected_d)
+    assert_grouped_gemm_glu_bf16_close(result["c_tensor"], expected_c)
 
 
 @pytest.mark.L0
