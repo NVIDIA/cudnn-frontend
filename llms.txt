@@ -22,6 +22,7 @@ Published documentation: https://docs.nvidia.com/deeplearning/cudnn/latest/devel
 - [Block Scaling (MXFP8/NVFP4 quantization)](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/operations/BlockScaling.md)
 - [RoPE](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/operations/RoPE.md)
 - [Causal Conv1d](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/operations/CausalConv1d.md)
+- [FFT Causal Conv1d](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/operations/FFTCausalConv1d.md)
 - [Concatenate](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/operations/Concatenate.md), [Reshape](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/operations/Reshape.md), [Slice](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/operations/Slice.md), [Transpose](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/operations/Transpose.md), [Resampling](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/operations/Resampling.md)
 
 ## Open-source (frontend-only) kernel APIs
