@@ -315,14 +315,19 @@ def test_DSA_sparse_attention_backward_topk_length_zero_raises():
     whose topk_length contains zeros hangs until killed. The interface
     validates the precondition (outside CUDA graph capture) and raises
     before launch; this test exercises that guard path.
+
+    L0 is intentional: the guard raises before the interface consults its
+    compile cache, and ``SparseAttentionBackward.compile()`` defers kernel
+    compilation to ``execute()`` (see api.py), so this test pays no CuTe
+    compilation cost even on a cold cache.
     """
     try:
         from cudnn import DSA
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
-    major, _ = torch.cuda.get_device_capability()
-    if major != 10:
+    major, minor = torch.cuda.get_device_capability()
+    if major * 10 + minor < 100:
         pytest.skip("the topk_length >= 1 guard is implemented on the SM100 interface")
 
     s_q, s_kv, h, d, d_v, topk = 8, 256, 64, 576, 512, 64
@@ -350,3 +355,86 @@ def test_DSA_sparse_attention_backward_topk_length_zero_raises():
                 softmax_scale=1.0 / math.sqrt(d),
                 topk_length=topk_length,
             )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_DSA_sparse_attention_backward_topk_length_guard_explicit_stream():
+    """The topk_length guard must bind to the resolved launch stream.
+
+    ``sparse_attention_backward_wrapper(..., stream=...)`` forwards an
+    explicit launch stream to the SM100 interface; the guard's capture
+    detection and its device-to-host sync must run on that stream, not on
+    whatever torch stream happens to be current at call time:
+
+    - outside capture, a zero row is rejected even when the launch targets
+      an explicit, non-current stream (the sync is ordered on that stream);
+    - while the explicit stream IS capturing and the torch-current stream
+      is a different, non-capturing stream, the guard must detect the
+      capture on the resolved stream and skip validation -- the documented
+      capture semantics (the caller upholds the precondition) -- instead of
+      syncing mid-capture. The captured graph is never replayed (a replay
+      would launch the kernel with a zero-length row).
+    """
+    try:
+        import cuda.bindings.driver as cuda_driver
+        from cudnn import DSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    major, minor = torch.cuda.get_device_capability()
+    if major * 10 + minor < 100:
+        pytest.skip("the topk_length >= 1 guard is implemented on the SM100 interface")
+
+    s_q, s_kv, h, d, d_v, topk = 8, 256, 64, 576, 512, 64
+    device = "cuda"
+    q = torch.randn(s_q, h, d, dtype=torch.bfloat16, device=device)
+    kv = torch.randn(s_kv, d, dtype=torch.bfloat16, device=device)
+    out = torch.randn(s_q, h, d_v, dtype=torch.bfloat16, device=device)
+    dout = torch.randn_like(out)
+    lse = torch.randn(s_q, h, dtype=torch.float32, device=device)
+    attn_sink = torch.randn(h, dtype=torch.float32, device=device)
+    topk_idxs = torch.stack([torch.randperm(s_kv, device=device)[:topk] for _ in range(s_q)]).to(torch.int32)
+
+    side_stream = torch.cuda.Stream()
+
+    def call(topk_length):
+        return DSA.sparse_attention_backward_wrapper(
+            q,
+            kv,
+            out,
+            dout,
+            lse,
+            attn_sink,
+            topk_idxs,
+            softmax_scale=1.0 / math.sqrt(d),
+            topk_length=topk_length,
+            stream=cuda_driver.CUstream(side_stream.cuda_stream),
+        )
+
+    bad_topk_length = torch.full((s_q,), topk, dtype=torch.int32, device=device)
+    bad_topk_length[3] = 0
+
+    # Outside capture, an explicit non-current launch stream still rejects
+    # zero rows (raises before the interface's compile cache is consulted).
+    with pytest.raises(ValueError, match="topk_length"):
+        call(bad_topk_length)
+
+    # Warm the compile cache off the capture path: capture must not compile.
+    good_topk_length = torch.full((s_q,), topk, dtype=torch.int32, device=device)
+    call(good_topk_length)
+    torch.cuda.synchronize()
+
+    # Capture on the explicit stream while the torch-current stream is a
+    # different, non-capturing stream. The guard must see the capture on the
+    # resolved stream and skip its sync; the pre-fix guard consulted the
+    # torch-current stream instead, ran the validation mid-capture, and
+    # raised here. Relaxed capture mode keeps the interface's unrelated
+    # eager work (output/workspace allocation) legal during capture.
+    other_stream = torch.cuda.Stream()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=side_stream, capture_error_mode="relaxed"):
+        with torch.cuda.stream(other_stream):
+            assert not torch.cuda.is_current_stream_capturing(), "the guard must not rely on the torch-current stream"
+            call(bad_topk_length)
+    del graph

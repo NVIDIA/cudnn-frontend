@@ -8,7 +8,7 @@ import cutlass
 import cutlass.cute as cute
 
 from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
-from cudnn.deepseek_sparse_attention.utils.runtime import resolve_stream
+from cudnn.deepseek_sparse_attention.utils.runtime import resolve_stream, torch_stream_context
 from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
 from .dsa_bwd_sm100 import FlashAttentionDSABackwardSm100
 
@@ -57,9 +57,11 @@ def flash_attn_bwd_sm100(
 
     Raises:
         ValueError: if any entry of ``topk_length`` is < 1 (validated outside
-            CUDA graph capture only -- during capture the required
-            device-to-host sync is not possible, and the caller must uphold
-            the precondition). A row with ``topk_length == 0`` gives the
+            CUDA graph capture only -- capture is detected on the resolved
+            launch stream, i.e. the explicit ``current_stream`` when one is
+            given, and the required device-to-host sync runs on that stream;
+            during capture the sync is not possible, and the caller must
+            uphold the precondition). A row with ``topk_length == 0`` gives the
             kernel zero KV tiles to process, for which it has no defined
             behavior: on the configuration we tested (B200, head_dim 512,
             topk 512) the kernel never terminates -- the launch hangs at
@@ -84,22 +86,30 @@ def flash_attn_bwd_sm100(
         tensors_to_check.append(topk_length)
     assert all(t.is_cuda for t in tensors_to_check)
 
-    if topk_length is not None and not torch.cuda.is_current_stream_capturing():
+    current_stream = resolve_stream(current_stream)
+
+    if topk_length is not None:
         # topk_length == 0 makes tile_count == 0 in the kernel, which has no
         # defined behavior: measured on B200 (head_dim 512, topk 512) the
         # launch hangs at 100% SM until killed. Code inspection suggests a
         # zero-tile pipeline deadlock, and that a zero-tile token reaching
         # the dq epilogue would store accumulator TMEM no MMA has written.
-        # Fail loudly here instead. Skipped under CUDA graph capture, where
-        # the required device-to-host sync is illegal -- the precondition
-        # itself still applies (documented above).
-        if bool((topk_length < 1).any()):
-            raise ValueError(
-                "topk_length must be >= 1 for every query: a row with topk_length == 0 "
-                "gives the SM100 backward kernel zero KV tiles, for which it has no "
-                "defined behavior (observed to hang the launch). Drop empty rows from "
-                "the batch or prevent them upstream."
-            )
+        # Fail loudly here instead. The guard binds to the resolved launch
+        # stream: capture detection and the device-to-host sync both run on
+        # ``current_stream`` (not on whatever torch stream happens to be
+        # current), so an explicit-stream capture is skipped correctly and
+        # the sync is ordered after the caller's producer work on that
+        # stream. Skipped under CUDA graph capture, where the required
+        # device-to-host sync is illegal -- the precondition itself still
+        # applies (documented above).
+        with torch_stream_context(current_stream):
+            if not torch.cuda.is_current_stream_capturing() and bool((topk_length < 1).any()):
+                raise ValueError(
+                    "topk_length must be >= 1 for every query: a row with topk_length == 0 "
+                    "gives the SM100 backward kernel zero KV tiles, for which it has no "
+                    "defined behavior (observed to hang the launch). Drop empty rows from "
+                    "the batch or prevent them upstream."
+                )
 
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
@@ -159,7 +169,6 @@ def flash_attn_bwd_sm100(
     problem_shape = (total_S_q, total_S_kv, head_dim, (num_head, batch_size))
 
     dtype = torch2cute_dtype_map[q.dtype]
-    current_stream = resolve_stream(current_stream)
 
     has_topk_length = topk_length is not None
     max_topk = topk_idxs.shape[1]
