@@ -55,7 +55,7 @@ def test_layernorm(param_extract, cudnn_handle):
         eps=epsilon_value,
     )
     mean_expected = x_gpu.to(torch.float32).mean(dim=-1, keepdim=True)
-    inv_var_expected = torch.rsqrt(torch.var(x_gpu.to(torch.float32), dim=-1, keepdim=True) + epsilon_value)
+    inv_var_expected = torch.rsqrt(torch.var(x_gpu.to(torch.float32), dim=-1, keepdim=True, correction=0) + epsilon_value)
 
     stream = torch.cuda.current_stream().cuda_stream
     cudnn.set_stream(handle=cudnn_handle, stream=stream)
