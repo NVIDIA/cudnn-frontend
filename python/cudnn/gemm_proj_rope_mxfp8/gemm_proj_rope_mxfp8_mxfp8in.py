@@ -299,9 +299,8 @@ def gemm_proj_rope_mxfp8_kernel(
         cute.group_modes(tCgB, 0, 3),
     )
 
-    num_tma_copy_bytes = (
-        cute.size_in_bytes(io_dtype, cute.select(a_smem_layout, mode=[0, 1, 2]))
-        + cute.size_in_bytes(io_dtype, cute.select(b_smem_layout, mode=[0, 1, 2]))
+    num_tma_copy_bytes = cute.size_in_bytes(io_dtype, cute.select(a_smem_layout, mode=[0, 1, 2])) + cute.size_in_bytes(
+        io_dtype, cute.select(b_smem_layout, mode=[0, 1, 2])
     )
 
     mainloop_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
@@ -473,14 +472,14 @@ def gemm_proj_rope_mxfp8_kernel(
             is_rope = fc == (N_FEATCELL - 1)
             if is_rope:
                 lib = lane % HALFW
-                pcol0 = QK_NOPE + 4 * lib   # sACC columns 128, 132, ..., 188
+                pcol0 = QK_NOPE + 4 * lib  # sACC columns 128, 132, ..., 188
                 pcol1 = pcol0 + 2
                 is_second_half = (lane // HALFW) == 1
                 roff = HALF * (lane // HALFW)
                 cidx0 = 2 * lib + roff
 
                 # BF16 pre-computed cos/sin tables, shape (T, QK_ROPE); matches TE precision
-                cs_row_bytes = QK_ROPE * 2   # BF16 = 2 bytes per element
+                cs_row_bytes = QK_ROPE * 2  # BF16 = 2 bytes per element
                 cos_base = mCos[token_base + tok0, None].iterator.toint() + cidx0 * 2
                 sin_base = mSin[token_base + tok0, None].iterator.toint() + cidx0 * 2
                 if is_second_half:

@@ -54,6 +54,7 @@ def gemm_proj_rope_mxfp8_init(request, tokens, w_out_in):
 
 # ------------------------------- BF16-input helpers -------------------------------
 
+
 def allocate_input_tensors(tokens, w_out_in):
     """Allocate bf16 activations, projection weight (in the requested layout), and rope tables."""
     dev = "cuda"
@@ -78,6 +79,7 @@ def allocate_output_tensors(tokens):
 
 
 # ------------------------------- MXFP8-input helpers -------------------------------
+
 
 def quant_mxfp8_rowwise(t):
     """Manual MXFP8 rowwise quantization of a 2-D [rows, K] tensor (no transformer_engine dep).
@@ -119,6 +121,7 @@ def allocate_mxfp8_input_tensors(tokens):
 
 
 # ------------------------------- reference comparison -------------------------------
+
 
 def _deq_row(data, scale):
     t = data.shape[0]

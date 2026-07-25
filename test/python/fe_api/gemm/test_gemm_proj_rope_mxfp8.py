@@ -62,9 +62,15 @@ def test_bf16in_check_support_rejects_unaligned_tokens(request):
     x, w, cos, sin = allocate_input_tensors(tokens, w_out_in=False)
     outs = allocate_output_tensors(tokens - 32)
     obj = GemmProjRopeMxfp8Bf16InSm100(
-        sample_x=x, sample_w=w, sample_cos=cos, sample_sin=sin,
-        sample_out_fp8_row=outs[0], sample_out_scales_row=outs[1],
-        sample_out_fp8_col=outs[2], sample_out_scales_col=outs[3], w_out_in=False,
+        sample_x=x,
+        sample_w=w,
+        sample_cos=cos,
+        sample_sin=sin,
+        sample_out_fp8_row=outs[0],
+        sample_out_scales_row=outs[1],
+        sample_out_fp8_col=outs[2],
+        sample_out_scales_col=outs[3],
+        w_out_in=False,
     )
     with pytest.raises(ValueError):
         obj.check_support()
@@ -77,7 +83,10 @@ def test_bf16in_check_support_rejects_kdim_mismatch(request):
     try:
         from cudnn import GemmProjRopeMxfp8Bf16InSm100
         from fe_api.gemm.test_gemm_proj_rope_mxfp8_utils import (
-            Q_LORA, allocate_input_tensors, allocate_output_tensors, gemm_proj_rope_mxfp8_init,
+            Q_LORA,
+            allocate_input_tensors,
+            allocate_output_tensors,
+            gemm_proj_rope_mxfp8_init,
         )
     except ImportError:
         pytest.skip("Environment not supported: cudnn optional dependencies not installed")
@@ -88,9 +97,15 @@ def test_bf16in_check_support_rejects_kdim_mismatch(request):
     x = torch.randn(tokens, Q_LORA + 8, dtype=x.dtype, device=x.device)  # inner dim != w's K
     outs = allocate_output_tensors(tokens)
     obj = GemmProjRopeMxfp8Bf16InSm100(
-        sample_x=x, sample_w=w, sample_cos=cos, sample_sin=sin,
-        sample_out_fp8_row=outs[0], sample_out_scales_row=outs[1],
-        sample_out_fp8_col=outs[2], sample_out_scales_col=outs[3], w_out_in=False,
+        sample_x=x,
+        sample_w=w,
+        sample_cos=cos,
+        sample_sin=sin,
+        sample_out_fp8_row=outs[0],
+        sample_out_scales_row=outs[1],
+        sample_out_fp8_col=outs[2],
+        sample_out_scales_col=outs[3],
+        w_out_in=False,
     )
     with pytest.raises(ValueError):
         obj.check_support()
@@ -103,7 +118,9 @@ def test_mxfp8in_check_support_rejects_bf16_code(request):
     try:
         from cudnn import GemmProjRopeMxfp8Mxfp8InSm100
         from fe_api.gemm.test_gemm_proj_rope_mxfp8_utils import (
-            allocate_mxfp8_input_tensors, allocate_output_tensors, gemm_proj_rope_mxfp8_init,
+            allocate_mxfp8_input_tensors,
+            allocate_output_tensors,
+            gemm_proj_rope_mxfp8_init,
         )
     except ImportError:
         pytest.skip("Environment not supported: cudnn optional dependencies not installed")
@@ -114,10 +131,16 @@ def test_mxfp8in_check_support_rejects_bf16_code(request):
     x_code = x_code.to(torch.bfloat16)  # wrong dtype for the MXFP8-input contract
     outs = allocate_output_tensors(tokens)
     obj = GemmProjRopeMxfp8Mxfp8InSm100(
-        sample_x_code=x_code, sample_x_scale=x_scale, sample_w_code=w_code, sample_w_scale=w_scale,
-        sample_cos=cos, sample_sin=sin,
-        sample_out_fp8_row=outs[0], sample_out_scales_row=outs[1],
-        sample_out_fp8_col=outs[2], sample_out_scales_col=outs[3],
+        sample_x_code=x_code,
+        sample_x_scale=x_scale,
+        sample_w_code=w_code,
+        sample_w_scale=w_scale,
+        sample_cos=cos,
+        sample_sin=sin,
+        sample_out_fp8_row=outs[0],
+        sample_out_scales_row=outs[1],
+        sample_out_fp8_col=outs[2],
+        sample_out_scales_col=outs[3],
     )
     with pytest.raises((ValueError, TypeError, NotImplementedError)):
         obj.check_support()
@@ -152,9 +175,7 @@ def test_wrapper_rejects_dtype_mismatch_and_missing_scales():
     w_bf16 = torch.empty(Q_OUT, Q_LORA, dtype=torch.bfloat16)
     bogus_scale = torch.empty(tokens, Q_LORA // 32, dtype=torch.uint8)
     with pytest.raises(AssertionError):
-        gemm_proj_rope_mxfp8_wrapper_sm100(
-            x_bf16, w_bf16, cos, sin, x_scale=bogus_scale, w_scale=bogus_scale, w_out_in=True
-        )
+        gemm_proj_rope_mxfp8_wrapper_sm100(x_bf16, w_bf16, cos, sin, x_scale=bogus_scale, w_scale=bogus_scale, w_out_in=True)
 
 
 # ======================================================================================
@@ -169,7 +190,12 @@ def test_gemm_proj_rope_mxfp8_reference_contract(tokens, w_out_in):
     try:
         from cudnn.gemm_proj_rope_mxfp8 import gemm_proj_rope_mxfp8_reference
         from fe_api.gemm.test_gemm_proj_rope_mxfp8_utils import (
-            BLOCK, HEAD_DIM, NUM_HEADS, QK_ROPE, Q_LORA, Q_OUT,
+            BLOCK,
+            HEAD_DIM,
+            NUM_HEADS,
+            QK_ROPE,
+            Q_LORA,
+            Q_OUT,
         )
     except ImportError:
         pytest.skip("Environment not supported: cudnn optional dependencies not installed")
@@ -200,8 +226,10 @@ def _test_bf16in_compile_execute(tokens, w_out_in, request):
         from cudnn import GemmProjRopeMxfp8Bf16InSm100
         from cuda.bindings import driver as cuda
         from fe_api.gemm.test_gemm_proj_rope_mxfp8_utils import (
-            allocate_input_tensors, allocate_output_tensors,
-            check_ref_gemm_proj_rope_mxfp8, gemm_proj_rope_mxfp8_init,
+            allocate_input_tensors,
+            allocate_output_tensors,
+            check_ref_gemm_proj_rope_mxfp8,
+            gemm_proj_rope_mxfp8_init,
         )
     except ImportError:
         pytest.skip("Environment not supported: cudnn optional dependencies not installed")
@@ -212,9 +240,15 @@ def _test_bf16in_compile_execute(tokens, w_out_in, request):
     outputs = allocate_output_tensors(cfg["tokens"])
 
     gemm = GemmProjRopeMxfp8Bf16InSm100(
-        sample_x=x, sample_w=w, sample_cos=cos, sample_sin=sin,
-        sample_out_fp8_row=outputs[0], sample_out_scales_row=outputs[1],
-        sample_out_fp8_col=outputs[2], sample_out_scales_col=outputs[3], w_out_in=cfg["w_out_in"],
+        sample_x=x,
+        sample_w=w,
+        sample_cos=cos,
+        sample_sin=sin,
+        sample_out_fp8_row=outputs[0],
+        sample_out_scales_row=outputs[1],
+        sample_out_fp8_col=outputs[2],
+        sample_out_scales_col=outputs[3],
+        w_out_in=cfg["w_out_in"],
     )
     try:
         assert gemm.check_support(), "Unsupported testcase"
@@ -230,7 +264,9 @@ def _test_bf16in_wrapper(tokens, w_out_in, request):
         from cudnn import gemm_proj_rope_mxfp8_wrapper_sm100
         from cuda.bindings import driver as cuda
         from fe_api.gemm.test_gemm_proj_rope_mxfp8_utils import (
-            allocate_input_tensors, check_ref_gemm_proj_rope_mxfp8, gemm_proj_rope_mxfp8_init,
+            allocate_input_tensors,
+            check_ref_gemm_proj_rope_mxfp8,
+            gemm_proj_rope_mxfp8_init,
         )
     except ImportError:
         pytest.skip("Environment not supported: cudnn optional dependencies not installed")
@@ -254,8 +290,10 @@ def _test_mxfp8in_compile_execute(tokens, request):
         from cudnn import GemmProjRopeMxfp8Mxfp8InSm100
         from cuda.bindings import driver as cuda
         from fe_api.gemm.test_gemm_proj_rope_mxfp8_utils import (
-            allocate_mxfp8_input_tensors, allocate_output_tensors,
-            check_ref_gemm_proj_rope_mxfp8, gemm_proj_rope_mxfp8_init,
+            allocate_mxfp8_input_tensors,
+            allocate_output_tensors,
+            check_ref_gemm_proj_rope_mxfp8,
+            gemm_proj_rope_mxfp8_init,
         )
     except ImportError:
         pytest.skip("Environment not supported: cudnn optional dependencies not installed")
@@ -266,10 +304,16 @@ def _test_mxfp8in_compile_execute(tokens, request):
     outputs = allocate_output_tensors(cfg["tokens"])
 
     gemm = GemmProjRopeMxfp8Mxfp8InSm100(
-        sample_x_code=x_code, sample_x_scale=x_scale, sample_w_code=w_code, sample_w_scale=w_scale,
-        sample_cos=cos, sample_sin=sin,
-        sample_out_fp8_row=outputs[0], sample_out_scales_row=outputs[1],
-        sample_out_fp8_col=outputs[2], sample_out_scales_col=outputs[3],
+        sample_x_code=x_code,
+        sample_x_scale=x_scale,
+        sample_w_code=w_code,
+        sample_w_scale=w_scale,
+        sample_cos=cos,
+        sample_sin=sin,
+        sample_out_fp8_row=outputs[0],
+        sample_out_scales_row=outputs[1],
+        sample_out_fp8_col=outputs[2],
+        sample_out_scales_col=outputs[3],
     )
     try:
         assert gemm.check_support(), "Unsupported testcase"
@@ -286,7 +330,9 @@ def _test_mxfp8in_wrapper(tokens, request):
         from cudnn import gemm_proj_rope_mxfp8_wrapper_sm100
         from cuda.bindings import driver as cuda
         from fe_api.gemm.test_gemm_proj_rope_mxfp8_utils import (
-            allocate_mxfp8_input_tensors, check_ref_gemm_proj_rope_mxfp8, gemm_proj_rope_mxfp8_init,
+            allocate_mxfp8_input_tensors,
+            check_ref_gemm_proj_rope_mxfp8,
+            gemm_proj_rope_mxfp8_init,
         )
     except ImportError:
         pytest.skip("Environment not supported: cudnn optional dependencies not installed")
@@ -297,9 +343,7 @@ def _test_mxfp8in_wrapper(tokens, request):
 
     try:
         for _ in range(2):  # run twice to exercise the object cache
-            out = gemm_proj_rope_mxfp8_wrapper_sm100(
-                x_code, w_code, cos, sin, x_scale=x_scale, w_scale=w_scale, w_out_in=True, stream=stream
-            )
+            out = gemm_proj_rope_mxfp8_wrapper_sm100(x_code, w_code, cos, sin, x_scale=x_scale, w_scale=w_scale, w_out_in=True, stream=stream)
     except (ValueError, NotImplementedError) as e:
         pytest.skip(f"Unsupported testcase: {e}")
 

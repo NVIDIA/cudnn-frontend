@@ -71,8 +71,14 @@ class GemmProjRopeMxfp8Bf16InSm100(APIBase):
         self.num_heads = proj_dim // HEAD_DIM
 
         self._samples = (
-            sample_x, sample_w, sample_cos, sample_sin,
-            sample_out_fp8_row, sample_out_scales_row, sample_out_fp8_col, sample_out_scales_col,
+            sample_x,
+            sample_w,
+            sample_cos,
+            sample_sin,
+            sample_out_fp8_row,
+            sample_out_scales_row,
+            sample_out_fp8_col,
+            sample_out_scales_col,
         )
         self._logger.debug(f"__init__ completed: x {self.x_desc.shape}, w {self.w_desc.shape}, w_out_in {self.w_out_in}")
 
@@ -128,8 +134,14 @@ class GemmProjRopeMxfp8Bf16InSm100(APIBase):
 
         _check_same_cuda_device(
             self,
-            self.x_desc, self.w_desc, self.cos_desc, self.sin_desc,
-            self.out_fp8_row_desc, self.out_scales_row_desc, self.out_fp8_col_desc, self.out_scales_col_desc,
+            self.x_desc,
+            self.w_desc,
+            self.cos_desc,
+            self.sin_desc,
+            self.out_fp8_row_desc,
+            self.out_scales_row_desc,
+            self.out_fp8_col_desc,
+            self.out_scales_col_desc,
         )
         _check_sm100(self)
 
@@ -163,13 +175,27 @@ class GemmProjRopeMxfp8Bf16InSm100(APIBase):
         swizzle_size = 8
         compile_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
         self._compiled_kernel = cute.compile(
-            _bf16in_host, *cute_tensors, grid_m, self.num_heads, max_active_clusters, swizzle_size, compile_stream,
+            _bf16in_host,
+            *cute_tensors,
+            grid_m,
+            self.num_heads,
+            max_active_clusters,
+            swizzle_size,
+            compile_stream,
         )
         self._samples = None
         self._logger.debug("Kernel compiled successfully")
 
     def execute(
-        self, x, w, cos, sin, out_fp8_row, out_scales_row, out_fp8_col, out_scales_col,
+        self,
+        x,
+        w,
+        cos,
+        sin,
+        out_fp8_row,
+        out_scales_row,
+        out_fp8_col,
+        out_scales_col,
         current_stream: Optional[cuda.CUstream] = None,
     ) -> None:
         current_stream = self._get_default_stream(current_stream)
@@ -226,8 +252,16 @@ class GemmProjRopeMxfp8Mxfp8InSm100(APIBase):
         self.num_heads = proj_dim // HEAD_DIM
 
         self._samples = (
-            sample_x_code, sample_x_scale, sample_w_code, sample_w_scale, sample_cos, sample_sin,
-            sample_out_fp8_row, sample_out_scales_row, sample_out_fp8_col, sample_out_scales_col,
+            sample_x_code,
+            sample_x_scale,
+            sample_w_code,
+            sample_w_scale,
+            sample_cos,
+            sample_sin,
+            sample_out_fp8_row,
+            sample_out_scales_row,
+            sample_out_fp8_col,
+            sample_out_scales_col,
         )
         self._logger.debug(f"__init__ completed: x_code {self.x_code_desc.shape}, w_code {self.w_code_desc.shape}")
 
@@ -265,8 +299,7 @@ class GemmProjRopeMxfp8Mxfp8InSm100(APIBase):
         )
         self._value_error_if(
             tuple(self.w_scale_desc.shape) != (self.num_heads * HEAD_DIM, self.k_dim // BLOCK),
-            f"w_scale must be [N, K//{BLOCK}] = [{self.num_heads * HEAD_DIM}, {self.k_dim // BLOCK}]; "
-            f"got {tuple(self.w_scale_desc.shape)}",
+            f"w_scale must be [N, K//{BLOCK}] = [{self.num_heads * HEAD_DIM}, {self.k_dim // BLOCK}]; " f"got {tuple(self.w_scale_desc.shape)}",
         )
         for name, desc in (("cos", self.cos_desc), ("sin", self.sin_desc)):
             self._value_error_if(
@@ -288,9 +321,16 @@ class GemmProjRopeMxfp8Mxfp8InSm100(APIBase):
 
         _check_same_cuda_device(
             self,
-            self.x_code_desc, self.x_scale_desc, self.w_code_desc, self.w_scale_desc,
-            self.cos_desc, self.sin_desc,
-            self.out_fp8_row_desc, self.out_scales_row_desc, self.out_fp8_col_desc, self.out_scales_col_desc,
+            self.x_code_desc,
+            self.x_scale_desc,
+            self.w_code_desc,
+            self.w_scale_desc,
+            self.cos_desc,
+            self.sin_desc,
+            self.out_fp8_row_desc,
+            self.out_scales_row_desc,
+            self.out_fp8_col_desc,
+            self.out_scales_col_desc,
         )
         _check_sm100(self)
 
@@ -311,8 +351,7 @@ class GemmProjRopeMxfp8Mxfp8InSm100(APIBase):
             swizzle_size = v
         return grid_m, t2r_x8, swizzle_size
 
-    def _to_cute_tensors(self, x_code, x_scale, w_code, w_scale, cos, sin,
-                         out_fp8_row, out_scales_row, out_fp8_col, out_scales_col):
+    def _to_cute_tensors(self, x_code, x_scale, w_code, w_scale, cos, sin, out_fp8_row, out_scales_row, out_fp8_col, out_scales_col):
         mA = from_dlpack(x_code.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=1)
         mSFA = _mxfp8_as_e8m0(x_scale)
         mB = from_dlpack(w_code.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=1)
@@ -335,15 +374,30 @@ class GemmProjRopeMxfp8Mxfp8InSm100(APIBase):
         max_active_clusters = cutlass.utils.HardwareInfo().get_max_active_clusters(1)
         compile_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
         self._compiled_kernel = cute.compile(
-            _mxfp8in_host, *cute_tensors,
-            grid_m, self.num_heads, max_active_clusters, swizzle_size, t2r_x8, compile_stream,
+            _mxfp8in_host,
+            *cute_tensors,
+            grid_m,
+            self.num_heads,
+            max_active_clusters,
+            swizzle_size,
+            t2r_x8,
+            compile_stream,
         )
         self._samples = None
         self._logger.debug("Kernel compiled successfully")
 
     def execute(
-        self, x_code, x_scale, w_code, w_scale, cos, sin,
-        out_fp8_row, out_scales_row, out_fp8_col, out_scales_col,
+        self,
+        x_code,
+        x_scale,
+        w_code,
+        w_scale,
+        cos,
+        sin,
+        out_fp8_row,
+        out_scales_row,
+        out_fp8_col,
+        out_scales_col,
         current_stream: Optional[cuda.CUstream] = None,
     ) -> None:
         current_stream = self._get_default_stream(current_stream)
@@ -352,8 +406,16 @@ class GemmProjRopeMxfp8Mxfp8InSm100(APIBase):
             "GemmProjRopeMxfp8Mxfp8InSm100 kernel not compiled; call compile() first",
         )
         cute_tensors = self._to_cute_tensors(
-            x_code, x_scale, w_code, w_scale, cos, sin,
-            out_fp8_row, out_scales_row, out_fp8_col, out_scales_col,
+            x_code,
+            x_scale,
+            w_code,
+            w_scale,
+            cos,
+            sin,
+            out_fp8_row,
+            out_scales_row,
+            out_fp8_col,
+            out_scales_col,
         )
         self._compiled_kernel(*cute_tensors, current_stream)
 
@@ -413,9 +475,7 @@ def gemm_proj_rope_mxfp8_wrapper_sm100(
     Returns:
         ``TupleDict(out_fp8_row, out_scales_row, out_fp8_col, out_scales_col)``.
     """
-    assert x.dtype == w.dtype, (
-        f"x and w must share a dtype (both bfloat16 or both float8_e4m3fn); got x {x.dtype}, w {w.dtype}"
-    )
+    assert x.dtype == w.dtype, f"x and w must share a dtype (both bfloat16 or both float8_e4m3fn); got x {x.dtype}, w {w.dtype}"
 
     tokens = x.shape[0]
     device = x.device
@@ -428,16 +488,19 @@ def gemm_proj_rope_mxfp8_wrapper_sm100(
     out_scales_col = torch.empty(tokens // BLOCK, num_heads, HEAD_DIM, dtype=torch.uint8, device=device)
 
     if x.dtype == torch.bfloat16:
-        assert x_scale is None and w_scale is None, (
-            "bf16 inputs must not be given MXFP8 scales (x_scale/w_scale); those are for the float8_e4m3fn path"
-        )
+        assert x_scale is None and w_scale is None, "bf16 inputs must not be given MXFP8 scales (x_scale/w_scale); those are for the float8_e4m3fn path"
         key = (tuple(x.shape), tuple(w.shape), bool(w_out_in), device)
         obj = _bf16in_obj_cache.get(key)
         if obj is None:
             obj = GemmProjRopeMxfp8Bf16InSm100(
-                sample_x=x, sample_w=w, sample_cos=cos, sample_sin=sin,
-                sample_out_fp8_row=out_fp8_row, sample_out_scales_row=out_scales_row,
-                sample_out_fp8_col=out_fp8_col, sample_out_scales_col=out_scales_col,
+                sample_x=x,
+                sample_w=w,
+                sample_cos=cos,
+                sample_sin=sin,
+                sample_out_fp8_row=out_fp8_row,
+                sample_out_scales_row=out_scales_row,
+                sample_out_fp8_col=out_fp8_col,
+                sample_out_scales_col=out_scales_col,
                 w_out_in=w_out_in,
             )
             assert obj.check_support()
@@ -446,9 +509,7 @@ def gemm_proj_rope_mxfp8_wrapper_sm100(
         obj.execute(x, w, cos, sin, out_fp8_row, out_scales_row, out_fp8_col, out_scales_col, current_stream=stream)
 
     elif x.dtype == torch.float8_e4m3fn:
-        assert x_scale is not None and w_scale is not None, (
-            "MXFP8 (float8_e4m3fn) inputs require x_scale and w_scale (E8M0 rowwise block scales)"
-        )
+        assert x_scale is not None and w_scale is not None, "MXFP8 (float8_e4m3fn) inputs require x_scale and w_scale (E8M0 rowwise block scales)"
         # the mxfp8in kernel expects the weight as [out, in]; transpose code + scale for [in, out].
         if w_out_in:
             wc, ws = w, w_scale
@@ -458,23 +519,36 @@ def gemm_proj_rope_mxfp8_wrapper_sm100(
         obj = _mxfp8in_obj_cache.get(key)
         if obj is None:
             obj = GemmProjRopeMxfp8Mxfp8InSm100(
-                sample_x_code=x, sample_x_scale=x_scale, sample_w_code=wc, sample_w_scale=ws,
-                sample_cos=cos, sample_sin=sin,
-                sample_out_fp8_row=out_fp8_row, sample_out_scales_row=out_scales_row,
-                sample_out_fp8_col=out_fp8_col, sample_out_scales_col=out_scales_col,
+                sample_x_code=x,
+                sample_x_scale=x_scale,
+                sample_w_code=wc,
+                sample_w_scale=ws,
+                sample_cos=cos,
+                sample_sin=sin,
+                sample_out_fp8_row=out_fp8_row,
+                sample_out_scales_row=out_scales_row,
+                sample_out_fp8_col=out_fp8_col,
+                sample_out_scales_col=out_scales_col,
             )
             assert obj.check_support()
             obj.compile()
             _mxfp8in_obj_cache[key] = obj
         obj.execute(
-            x, x_scale, wc, ws, cos, sin,
-            out_fp8_row, out_scales_row, out_fp8_col, out_scales_col, current_stream=stream,
+            x,
+            x_scale,
+            wc,
+            ws,
+            cos,
+            sin,
+            out_fp8_row,
+            out_scales_row,
+            out_fp8_col,
+            out_scales_col,
+            current_stream=stream,
         )
 
     else:
-        raise AssertionError(
-            f"unsupported input dtype {x.dtype}; expected bfloat16 (BF16 GEMM) or float8_e4m3fn (MXFP8 GEMM)"
-        )
+        raise AssertionError(f"unsupported input dtype {x.dtype}; expected bfloat16 (BF16 GEMM) or float8_e4m3fn (MXFP8 GEMM)")
 
     return TupleDict(
         out_fp8_row=out_fp8_row,
