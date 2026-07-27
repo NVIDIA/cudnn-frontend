@@ -130,6 +130,7 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
         act_func: str = "swiglu",
         b_major: str = "k",
         use_dynamic_sched: bool = False,
+        use_single_group_runtime_offsets: bool = False,
     ):
         """Initialize the GroupedGemmGluSm100 API.
 
@@ -233,6 +234,11 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
             self.b_major = b_major  # stored for both modes
 
         self.use_dynamic_sched = use_dynamic_sched
+        self._value_error_if(
+            use_single_group_runtime_offsets and self.expert_cnt != 1,
+            "use_single_group_runtime_offsets requires exactly one expert",
+        )
+        self.use_single_group_runtime_offsets = use_single_group_runtime_offsets
 
         self._interpret_uint8_as_fp4x2 = True
         self._has_bias = self.bias_desc is not None
@@ -622,6 +628,7 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
             act_func=self.act_func,
             enable_bias=self._has_bias,
             use_dynamic_sched=self.use_dynamic_sched,
+            use_single_group_runtime_offsets=self.use_single_group_runtime_offsets,
         )
 
         hardware_info = cutlass.utils.HardwareInfo()

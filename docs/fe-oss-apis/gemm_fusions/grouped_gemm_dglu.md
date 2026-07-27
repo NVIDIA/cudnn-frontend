@@ -546,6 +546,10 @@ Returns a `TupleDict` (dictionary + tuple unpacking):
 - Expert count must be `<= 1024`
 - Each group's M dimension is aligned to `m_aligned` (256)
 - In the class API, `dbias` is compiled in only when `sample_dbias` is provided; passing a runtime `dbias_tensor` without `sample_dbias` raises `ValueError`
+- `use_single_group_runtime_offsets=True` is supported only by the block-scaled
+  kernel with exactly one expert. In this mode the kernel derives
+  `padded_offsets[0]` from runtime `A.shape[0]` and does not load its value from
+  device memory; the argument must still be an int32 tensor with shape `(1,)`.
 
 ### Environment
 

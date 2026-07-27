@@ -277,6 +277,31 @@ def test_grouped_gemm_glu_dense_compile_execute_rectangular_zero_prob(request):
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
+def test_grouped_gemm_glu_dense_wrapper_without_prob(request):
+    def input_mutator(inputs, _cfg):
+        inputs["prob_tensor"].fill_(1.0)
+
+    _test_grouped_gemm_glu_dense_wrapper(
+        ab_dtype=torch.float8_e4m3fn,
+        c_dtype=torch.bfloat16,
+        d_dtype=torch.float8_e4m3fn,
+        cd_major="n",
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=32,
+        sf_dtype=torch.float8_e8m0fnu,
+        vector_f32=False,
+        discrete_col_sfd=True,
+        request=request,
+        cfg_overrides={"group_m_list": [256]},
+        input_mutator=input_mutator,
+        omit_prob=True,
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
 @with_grouped_gemm_swiglu_params_bias_fp4
 def test_grouped_gemm_glu_dense_compile_execute_with_bias_fp4(
     ab_dtype,
@@ -475,6 +500,8 @@ def _test_grouped_gemm_glu_dense_compile_execute(
     input_mutator=None,
     enable_bias=False,
     use_dynamic_sched=False,
+    omit_prob=False,
+    use_single_group_runtime_offsets=False,
 ):
     try:
         from cudnn import GroupedGemmGluSm100
@@ -557,6 +584,7 @@ def _test_grouped_gemm_glu_dense_compile_execute(
         discrete_col_sfd=cfg["discrete_col_sfd"],
         act_func="swiglu",
         use_dynamic_sched=use_dynamic_sched,
+        use_single_group_runtime_offsets=use_single_group_runtime_offsets,
     )
 
     try:
@@ -610,6 +638,8 @@ def _test_grouped_gemm_glu_dense_wrapper(
     input_mutator=None,
     enable_bias=False,
     use_dynamic_sched=False,
+    omit_prob=False,
+    use_single_group_runtime_offsets=False,
 ):
     try:
         from cudnn import grouped_gemm_glu_wrapper_sm100
@@ -664,7 +694,7 @@ def _test_grouped_gemm_glu_dense_wrapper(
                 sfb_tensor=inputs["sfb_tensor"],
                 # Common:
                 norm_const_tensor=inputs.get("norm_const_tensor"),
-                prob_tensor=inputs.get("prob_tensor"),
+                prob_tensor=None if omit_prob else inputs.get("prob_tensor"),
                 acc_dtype=cfg["acc_dtype"],
                 c_dtype=cfg["c_dtype"],
                 d_dtype=cfg["d_dtype"],
@@ -677,6 +707,7 @@ def _test_grouped_gemm_glu_dense_wrapper(
                 discrete_col_sfd=cfg["discrete_col_sfd"],
                 act_func="swiglu",
                 use_dynamic_sched=use_dynamic_sched,
+                use_single_group_runtime_offsets=use_single_group_runtime_offsets,
                 current_stream=stream,
             )
     except (ValueError, NotImplementedError) as e:
@@ -1855,4 +1886,31 @@ def test_grouped_gemm_glu_discrete_wrapper_alpha_default_is_1702(request):
         out_explicit["d_tensor"][:valid_m].float().cpu(),
         atol=0.0,
         rtol=0.0,
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_grouped_gemm_glu_single_group_runtime_offsets(request):
+    """The single-group kernel derives padded_offsets=[M] instead of loading the input value."""
+
+    def invalidate_runtime_offset(inputs, _cfg):
+        inputs["padded_offsets_tensor"].zero_()
+
+    _test_grouped_gemm_glu_dense_wrapper(
+        ab_dtype=torch.float8_e4m3fn,
+        c_dtype=torch.bfloat16,
+        d_dtype=torch.float8_e4m3fn,
+        cd_major="n",
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=32,
+        sf_dtype=torch.float8_e8m0fnu,
+        vector_f32=False,
+        discrete_col_sfd=False,
+        request=request,
+        cfg_overrides={"group_m_list": [256]},
+        input_mutator=invalidate_runtime_offset,
+        use_single_group_runtime_offsets=True,
     )

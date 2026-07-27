@@ -290,6 +290,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
         use_dynamic_sched: bool = False,
         act_func: str = "swiglu",
         enable_bias: bool = False,
+        use_single_group_runtime_offsets: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled grouped GEMM GLU kernel.
 
@@ -332,11 +333,14 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
             )
         if expert_cnt > 1024:
             raise ValueError("Expert count > 1024 is not supported.")
+        if use_single_group_runtime_offsets and expert_cnt != 1:
+            raise ValueError("use_single_group_runtime_offsets requires exactly one expert")
         if not isinstance(weight_mode, MoEWeightMode):
             raise TypeError(f"weight_mode must be a MoEWeightMode, got {type(weight_mode)}")
 
         self.sf_vec_size = sf_vec_size
         self.expert_cnt = expert_cnt
+        self.use_single_group_runtime_offsets = use_single_group_runtime_offsets
         self.acc_dtype: Type[cutlass.Numeric] = acc_dtype
         self.use_2cta_instrs = use_2cta_instrs
         self.cluster_shape_mn = cluster_shape_mn
@@ -832,6 +836,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
             sfd_col_tensor = cute.make_tensor(sfd_col_tensor.iterator, sfd_col_layout)
 
         self.generate_amax = amax_tensor is not None
+        self.has_prob = prob is not None
 
         tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
             self.a_dtype,
@@ -1498,20 +1503,22 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
                     rnd="rn",
                     ftz=False,
                 )
-                (
-                    tCompute[i],
-                    tCompute[i + 1],
-                ) = cute.arch.mul_packed_f32x2(
-                    (tCompute[i], tCompute[i + 1]),
-                    (mProb, mProb),
-                    rnd="rn",
-                    ftz=False,
-                )
+                if cutlass.const_expr(self.has_prob):
+                    (
+                        tCompute[i],
+                        tCompute[i + 1],
+                    ) = cute.arch.mul_packed_f32x2(
+                        (tCompute[i], tCompute[i + 1]),
+                        (mProb, mProb),
+                        rnd="rn",
+                        ftz=False,
+                    )
         else:
             # GeGlu Unpacked Version
             for i in cutlass.range_constexpr(cute.size(tCompute)):
                 tCompute[i] = (acc_vec_up[i] + linear_offset) * silu_f32_scaled(acc_vec_gate[i], alpha=alpha, fastmath=True)
-                tCompute[i] = tCompute[i] * mProb
+                if cutlass.const_expr(self.has_prob):
+                    tCompute[i] = tCompute[i] * mProb
 
     @cute.jit
     def swiglu_act(self, tCompute: cute.Tensor, acc_vec_up: cute.Tensor, acc_vec_gate: cute.Tensor, mProb: cute.Tensor):
@@ -1555,20 +1562,22 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
                     rnd="rn",
                     ftz=False,
                 )
-                (
-                    tCompute[i],
-                    tCompute[i + 1],
-                ) = cute.arch.mul_packed_f32x2(
-                    (tCompute[i], tCompute[i + 1]),
-                    (mProb, mProb),
-                    rnd="rn",
-                    ftz=False,
-                )
+                if cutlass.const_expr(self.has_prob):
+                    (
+                        tCompute[i],
+                        tCompute[i + 1],
+                    ) = cute.arch.mul_packed_f32x2(
+                        (tCompute[i], tCompute[i + 1]),
+                        (mProb, mProb),
+                        rnd="rn",
+                        ftz=False,
+                    )
         else:
             # SwiGlu Unpacked Version
             for i in cutlass.range_constexpr(cute.size(tCompute)):
                 tCompute[i] = acc_vec_up[i] * silu_f32(acc_vec_gate[i], fastmath=True)
-                tCompute[i] = tCompute[i] * mProb
+                if cutlass.const_expr(self.has_prob):
+                    tCompute[i] = tCompute[i] * mProb
 
     # GPU device kernel
     @cute.kernel
@@ -1638,6 +1647,10 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
                 cpasync.prefetch_descriptor(tma_atom_d_col)
 
         use_2cta_instrs = cute.size(tiled_mma.thr_id.shape) == 2
+        if cutlass.const_expr(self.use_single_group_runtime_offsets):
+            runtime_padded_offsets = cute.make_rmem_tensor((1,), cutlass.Int32)
+            runtime_padded_offsets[0] = cutlass.Int32(cute.size(mA_mkl.shape[0]))
+            padded_offsets = runtime_padded_offsets
         total_token = padded_offsets[self.expert_cnt - 1]
 
         #
@@ -2608,13 +2621,15 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
                 # Get PROB (per-expert via domain_offset)
                 # Note, it always assumes T2R_M/EPI_M is 1, otherwise it will break the result.
                 #
-                real_prob, _ = epi_ext.get_gmem_tensor("prob", prob, padded_offsets, epi_work_tile_info)
                 mPosition = (
                     (epi_work_tile_info.tile_m_idx // cute.size(tiled_mma.thr_id.shape)) * self.mma_tiler[0]
                     + mma_tile_coord_v * (self.mma_tiler[0] // cute.size(tiled_mma.thr_id.shape))
                     + tidx
                 )
-                mProb = real_prob[mPosition, 0, 0]
+                mProb = cutlass.Float32(1.0)
+                if cutlass.const_expr(self.has_prob):
+                    real_prob, _ = epi_ext.get_gmem_tensor("prob", prob, padded_offsets, epi_work_tile_info)
+                    mProb = real_prob[mPosition, 0, 0]
 
                 #
                 # Wait for accumulator buffer full
