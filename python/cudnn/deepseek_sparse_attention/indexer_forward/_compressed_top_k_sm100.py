@@ -87,6 +87,16 @@ _denom_placeholder_cache: dict = {}
 _RETURN_SOFTMAX_DEFAULT = True
 
 
+def _make_i64_cand_buffer_compile_tensor():
+    """Create the 1D candidate-buffer ABI with a 64-bit dynamic extent."""
+    return cute.runtime.make_fake_tensor(
+        dtype=cutlass.Float32,
+        shape=(cute.sym_int64(symbol="cand_buffer_numel"),),
+        stride=(1,),
+        assumed_align=16,
+    )
+
+
 def _get_fwd_unified_denom_placeholder(
     shape: tuple[int, ...],
     device: torch.device,
@@ -1039,7 +1049,7 @@ def _run_compress_gemm_varlen(
             w_cute = _to_cute_tensor(w)
             q_scale_cute = _to_cute_tensor(q_scale)
             k_scale_cute = _to_cute_tensor(k_scale)
-            cand_cute = _to_cute_tensor(cand, leading_dim=0)
+            cand_cute = _make_i64_cand_buffer_compile_tensor()
             denom_cute = _to_cute_tensor(denom_tmp)
             cu_q_cute = _to_cute_tensor(cu_seqlens_q, leading_dim=0)
             cu_k_cute = _to_cute_tensor(cu_seqlens_k, leading_dim=0)
@@ -1127,7 +1137,7 @@ def _run_compress_gemm_varlen(
         q_cute = _to_cute_tensor(q)
         k_cute = _to_cute_tensor(k)
         w_cute = _to_cute_tensor(w)
-        cand_cute = _to_cute_tensor(cand, leading_dim=0)
+        cand_cute = _make_i64_cand_buffer_compile_tensor()
         denom_cute = _to_cute_tensor(denom_tmp)
         cu_q_cute = _to_cute_tensor(cu_seqlens_q, leading_dim=0)
         cu_k_cute = _to_cute_tensor(cu_seqlens_k, leading_dim=0)

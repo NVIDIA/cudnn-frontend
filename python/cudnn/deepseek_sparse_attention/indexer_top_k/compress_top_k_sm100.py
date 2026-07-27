@@ -64,6 +64,16 @@ _SHRINK_MAX = 2048
 _INT32_MAX = 0x7FFFFFFF
 
 
+def _make_i64_cand_buffer_compile_tensor():
+    """Create the 1D candidate-buffer ABI with a 64-bit dynamic extent."""
+    return cute.runtime.make_fake_tensor(
+        dtype=cutlass.Float32,
+        shape=(cute.sym_int64(symbol="cand_buffer_numel"),),
+        stride=(1,),
+        assumed_align=16,
+    )
+
+
 def _float_as_uint32(float_val):
     """Reinterpret an fp32 register's bits as uint32 (no value change)."""
     return llvm.bitcast(cutlass.Uint32.mlir_type, float_val.ir_value())
@@ -964,7 +974,7 @@ def compress_stage2_topk_varlen(
         )
         _compile_cache[compile_key] = cute.compile(
             kernel_obj,
-            _to_cute_tensor(cand_buffer, leading_dim=0),
+            _make_i64_cand_buffer_compile_tensor(),
             _out_cute(idx3),
             _out_cute(val3),
             cutlass.Int32(int(max_seqlen_q)),
