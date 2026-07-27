@@ -23,7 +23,7 @@ The kernel is tuned for the DeepSeek-V3 Q up-projection shapes: `NUM_HEADS=128`,
 - **Inputs**
   - `x`: `(tokens, Q_LORA)` — `tokens % TILE_M == 0`. Dtype `bfloat16` (bf16 path) or `float8_e4m3fn` (MXFP8 path).
   - `w`: `(Q_LORA, NUM_HEADS·HEAD_DIM)` when `w_out_in=False`, or the transformer-engine-native transposed `(NUM_HEADS·HEAD_DIM, Q_LORA)` when `w_out_in=True`. Same dtype as `x`.
-  - `x_scale`, `w_scale` (MXFP8 path only): E8M0 rowwise block scales, `(tokens, Q_LORA // BLOCK)` and `(NUM_HEADS·HEAD_DIM, Q_LORA // BLOCK)`, `uint8`.
+  - `x_scale`, `w_scale` (MXFP8 path only): E8M0 rowwise block scales, `uint8`. `x_scale` is `(tokens, Q_LORA // BLOCK)`. `w_scale` follows `w`'s layout (the wrapper transposes it alongside `w`): `(NUM_HEADS·HEAD_DIM, Q_LORA // BLOCK)` when `w_out_in=True`, or `(Q_LORA // BLOCK, NUM_HEADS·HEAD_DIM)` when `w_out_in=False`.
   - `cos`, `sin`: `(tokens, QK_ROPE)`, `bfloat16`.
 
 - **Outputs**
@@ -120,7 +120,7 @@ op.execute(x_code, x_scale, w_code, w_scale, cos, sin,
 ### Input/Output tensors
 - Input **x**: `(tokens, Q_LORA)`; Dtype `bfloat16` (bf16 path) or `float8_e4m3fn` (MXFP8 path).
 - Input **w**: `(Q_LORA, NUM_HEADS·HEAD_DIM)` (`w_out_in=False`) or `(NUM_HEADS·HEAD_DIM, Q_LORA)` (`w_out_in=True`); same dtype as **x**.
-- Input **x_scale**, **w_scale** (MXFP8 path only): `(tokens, Q_LORA // BLOCK)` and `(NUM_HEADS·HEAD_DIM, Q_LORA // BLOCK)`; Dtype `uint8` (E8M0 rowwise block scales).
+- Input **x_scale**, **w_scale** (MXFP8 path only): Dtype `uint8` (E8M0 rowwise block scales). `x_scale` is `(tokens, Q_LORA // BLOCK)`. `w_scale`'s shape depends on `w_out_in` (transposed with `w`): `(NUM_HEADS·HEAD_DIM, Q_LORA // BLOCK)` for `w_out_in=True`, `(Q_LORA // BLOCK, NUM_HEADS·HEAD_DIM)` for `w_out_in=False`.
 - Input **cos**, **sin**: `(tokens, QK_ROPE)`; Dtype `bfloat16`.
 - Output **out_fp8_row** / **out_fp8_col**: `(tokens, NUM_HEADS, HEAD_DIM)`; Dtype `float8_e4m3fn`.
 - Output **out_scales_row**: `(tokens, NUM_HEADS, HEAD_DIM // BLOCK)`; Dtype `uint8` (E8M0).

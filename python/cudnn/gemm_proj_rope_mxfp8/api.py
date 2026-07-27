@@ -31,7 +31,7 @@ import cutlass.utils
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
-from cudnn.api_base import APIBase, TupleDict
+from cudnn.api_base import APIBase, TensorDesc, TupleDict
 
 
 # ======================================================================================
@@ -142,6 +142,17 @@ class GemmProjRopeMxfp8Bf16InSm100(APIBase):
             self.out_scales_row_desc,
             self.out_fp8_col_desc,
             self.out_scales_col_desc,
+        )
+        _check_contiguous(
+            self,
+            x=self.x_desc,
+            w=self.w_desc,
+            cos=self.cos_desc,
+            sin=self.sin_desc,
+            out_fp8_row=self.out_fp8_row_desc,
+            out_scales_row=self.out_scales_row_desc,
+            out_fp8_col=self.out_fp8_col_desc,
+            out_scales_col=self.out_scales_col_desc,
         )
         _check_sm100(self)
 
@@ -319,6 +330,13 @@ class GemmProjRopeMxfp8Mxfp8InSm100(APIBase):
                 f"{name} must have shape {shape}; got {tuple(desc.shape)}",
             )
 
+        # The SFB scale relay copies a 256-row (2*128) block shared across even/odd n_idx; the last
+        # head stays in-bounds only when num_heads is even (the odd-n_idx -QK_ROPE shift covers the
+        # pair). An odd num_heads reads past w_scale's [num_heads*HEAD_DIM, K//32] bounds.
+        self._value_error_if(
+            num_heads % 2 != 0,
+            f"num_heads ({num_heads}) must be even for the MXFP8-input kernel (SFB scale-relay pairing)",
+        )
         _check_same_cuda_device(
             self,
             self.x_code_desc,
@@ -331,6 +349,19 @@ class GemmProjRopeMxfp8Mxfp8InSm100(APIBase):
             self.out_scales_row_desc,
             self.out_fp8_col_desc,
             self.out_scales_col_desc,
+        )
+        _check_contiguous(
+            self,
+            x_code=self.x_code_desc,
+            x_scale=self.x_scale_desc,
+            w_code=self.w_code_desc,
+            w_scale=self.w_scale_desc,
+            cos=self.cos_desc,
+            sin=self.sin_desc,
+            out_fp8_row=self.out_fp8_row_desc,
+            out_scales_row=self.out_scales_row_desc,
+            out_fp8_col=self.out_fp8_col_desc,
+            out_scales_col=self.out_scales_col_desc,
         )
         _check_sm100(self)
 
@@ -372,6 +403,7 @@ class GemmProjRopeMxfp8Mxfp8InSm100(APIBase):
         cute_tensors = self._to_cute_tensors(*self._samples)
         grid_m, t2r_x8, swizzle_size = self._grid_params()
         max_active_clusters = cutlass.utils.HardwareInfo().get_max_active_clusters(1)
+        k_scale_words = self.k_dim // 128  # compact-scale uint32 words per row = K // 128 (deduced, not hardcoded)
         compile_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
         self._compiled_kernel = cute.compile(
             _mxfp8in_host,
@@ -381,6 +413,7 @@ class GemmProjRopeMxfp8Mxfp8InSm100(APIBase):
             max_active_clusters,
             swizzle_size,
             t2r_x8,
+            k_scale_words,
             compile_stream,
         )
         self._samples = None
@@ -429,6 +462,17 @@ def _check_same_cuda_device(api, *descs):
         len(devices) != 1 or next(iter(devices)).type != "cuda",
         f"all tensors must be on a single CUDA device; got devices {sorted(str(d) for d in devices)}",
     )
+
+
+def _check_contiguous(api, **named_descs):
+    # The epilogue writes/reads with hardcoded row strides (cos/sin: QK_ROPE*2; outputs:
+    # num_heads*HEAD_DIM) and the TMA / scale-relay assume packed operands, so every tensor must be
+    # C-contiguous -- a strided/sliced view would silently read/write the wrong addresses.
+    for name, desc in named_descs.items():
+        api._value_error_if(
+            tuple(desc.stride) != TensorDesc._compute_contiguous_stride(tuple(desc.shape)),
+            f"{name} must be C-contiguous; got shape {tuple(desc.shape)} stride {tuple(desc.stride)}",
+        )
 
 
 def _check_sm100(api):

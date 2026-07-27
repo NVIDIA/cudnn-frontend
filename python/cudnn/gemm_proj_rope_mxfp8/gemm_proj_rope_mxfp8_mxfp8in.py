@@ -62,8 +62,9 @@ TILE_N = HEAD_DIM  # 192, one head per CTA
 K_TILE = 128
 COLBLK = TILE_M // BLOCK  # col blocks per CTA along tokens
 stage_dtype = cutlass.BFloat16  # SMEM staging dtype for post-rope tile (matches TE BF16 RoPE precision)
-K_SCALE_GROUPS = 1536 // SF_VEC
-K_SCALE_WORDS = K_SCALE_GROUPS // 4
+# Compact-scale row stride (uint32 words per row) is K // 128. It is NOT hardcoded: the class deduces
+# it from the contraction dim (weight K) and threads it as a Constexpr (`k_scale_words`) into the host
+# -> kernel -> _relay_scale_words, so any K (not just DSv3's 1536) is indexed with the correct stride.
 SF_WORDS_PER_K_TILE = K_TILE // (SF_VEC * 4)
 SFB_RELAY_ROWS = 256
 
@@ -107,6 +108,21 @@ class SharedStorage:
 
 
 @cute.jit
+def _e8m0_inv(sbyte32):
+    """E8M0 byte -> its reciprocal scale in fp32 (the shared PTX snippet)."""
+    inv_bits = _llvm_dialect.inline_asm(
+        _mlir_ir.F32Type.get(),
+        [_Int32Sym(sbyte32).ir_value()],
+        "{ .reg .s32 t; sub.s32 t, 254, $1; shl.b32 t, t, 23; mov.b32 $0, t; }",
+        "=f,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=_llvm_dialect.AsmDialect.AD_ATT,
+    )
+    return cutlass.Float32(inv_bits)
+
+
+@cute.jit
 def _e8m0(amax):
     scaled = amax * cutlass.Float32(1.0 / FP8_MAX)
     packed_i16 = _llvm_dialect.inline_asm(
@@ -119,30 +135,7 @@ def _e8m0(amax):
         asm_dialect=_llvm_dialect.AsmDialect.AD_ATT,
     )
     sbyte32 = cutlass.Int32(packed_i16) & cutlass.Int32(0xFF)
-    inv_bits = _llvm_dialect.inline_asm(
-        _mlir_ir.F32Type.get(),
-        [_Int32Sym(sbyte32).ir_value()],
-        "{ .reg .s32 t; sub.s32 t, 254, $1; shl.b32 t, t, 23; mov.b32 $0, t; }",
-        "=f,r",
-        has_side_effects=False,
-        is_align_stack=False,
-        asm_dialect=_llvm_dialect.AsmDialect.AD_ATT,
-    )
-    return cutlass.Float32(inv_bits), sbyte32
-
-
-@cute.jit
-def _e8m0_inv(sbyte32):
-    inv_bits = _llvm_dialect.inline_asm(
-        _mlir_ir.F32Type.get(),
-        [_Int32Sym(sbyte32).ir_value()],
-        "{ .reg .s32 t; sub.s32 t, 254, $1; shl.b32 t, t, 23; mov.b32 $0, t; }",
-        "=f,r",
-        has_side_effects=False,
-        is_align_stack=False,
-        asm_dialect=_llvm_dialect.AsmDialect.AD_ATT,
-    )
-    return cutlass.Float32(inv_bits)
+    return _e8m0_inv(sbyte32), sbyte32
 
 
 @cute.jit
@@ -179,14 +172,15 @@ def _pack_e4m3x2(vlo, vhi):
 
 
 @cute.jit
-def _relay_scale_words(mSFA_compact, mSFB_compact, sSFA, sSFB, m_idx, n_idx, k_tile_idx, stage_idx, lane):
+def _relay_scale_words(mSFA_compact, mSFB_compact, sSFA, sSFB, m_idx, n_idx, k_tile_idx, stage_idx, lane, k_scale_words: cutlass.Constexpr):
+    # k_scale_words = K // 128 (uint32 words per compact-scale row); deduced from the contraction dim.
     gSFA_words = cute.make_tensor(
         cute.recast_ptr(mSFA_compact.iterator, dtype=cutlass.Uint32),
-        cute.make_layout((mSFA_compact.shape[0], K_SCALE_WORDS), stride=(K_SCALE_WORDS, 1)),
+        cute.make_layout((mSFA_compact.shape[0], k_scale_words), stride=(k_scale_words, 1)),
     )
     gSFB_words = cute.make_tensor(
         cute.recast_ptr(mSFB_compact.iterator, dtype=cutlass.Uint32),
-        cute.make_layout((mSFB_compact.shape[0], K_SCALE_WORDS), stride=(K_SCALE_WORDS, 1)),
+        cute.make_layout((mSFB_compact.shape[0], k_scale_words), stride=(k_scale_words, 1)),
     )
     sSFA_words = cute.make_tensor(
         cute.recast_ptr(sSFA.iterator, dtype=cutlass.Uint32),
@@ -242,6 +236,7 @@ def gemm_proj_rope_mxfp8_kernel(
     num_tmem_cols: cutlass.Constexpr,
     num_heads: cutlass.Constexpr,
     t2r_x8: cutlass.Constexpr,
+    k_scale_words: cutlass.Constexpr,
 ):
     warp_idx = cute.arch.warp_idx()
     warp_idx = cute.arch.make_warp_uniform(warp_idx)
@@ -339,7 +334,7 @@ def gemm_proj_rope_mxfp8_kernel(
             tBgB_slice = tBgB[(None, n_idx, None)]
             for k_tile_idx in cutlass.range(num_k_tiles):
                 handle = ab_producer.acquire_and_advance()
-                _relay_scale_words(mSFA_compact, mSFB_compact, sSFA, sSFB, m_idx, n_idx, k_tile_idx, handle.index, lane)
+                _relay_scale_words(mSFA_compact, mSFB_compact, sSFA, sSFB, m_idx, n_idx, k_tile_idx, handle.index, lane, k_scale_words)
                 cute.arch.sync_warp()
                 cute.arch.fence_view_async_shared()
                 cute.copy(tma_atom_a, tAgA_slice[(None, k_tile_idx)], tAsA[(None, handle.index)], tma_bar_ptr=handle.barrier)
@@ -389,7 +384,6 @@ def gemm_proj_rope_mxfp8_kernel(
             coord = work_tile.tile_idx
             n_idx = coord[1]
             tCtAcc = tCtAcc_base[(None, None, None, acc_empty.index)]
-            tCtSFB_mma = tCtSFB
             offset = cutlass.Int32((n_idx % 2) * 2)
             shifted_sfb_ptr = cute.recast_ptr(
                 tmem_ptr + NUM_ACCUMULATOR_TMEM_COLS + NUM_SFA_TMEM_COLS + offset,
@@ -603,6 +597,7 @@ def gemm_proj_rope_mxfp8_host(
     max_active_clusters: cutlass.Constexpr,
     swizzle_size: cutlass.Constexpr,
     t2r_x8: cutlass.Constexpr,
+    k_scale_words: cutlass.Constexpr,
     stream,
 ):
     a_major = utils.LayoutEnum.from_tensor(mA).mma_major_mode()
@@ -639,8 +634,8 @@ def gemm_proj_rope_mxfp8_host(
     c_layout_kind = utils.LayoutEnum.ROW_MAJOR
     epi_tile = utils.compute_epilogue_tile_shape(cta_tile_shape_mnk, False, c_layout_kind, cutlass.Float32)
 
-    acc_shape = tiled_mma.partition_shape_C(mma_tiler_mnk[:2])
-    tCtAcc_fake = tiled_mma.make_fragment_C(cute.append(acc_shape, acc_stages))
+    # TMEM budget is fixed for this tile config (accumulator + SFA/SFB scale factors); the kernel
+    # computes the accumulator fragment layout itself, so no host-side fake fragment is needed here.
     num_tmem_cols = NUM_TMEM_COLS
 
     num_ctas_mnl = (grid_m, num_heads, 1)
@@ -671,6 +666,7 @@ def gemm_proj_rope_mxfp8_host(
         num_tmem_cols,
         num_heads,
         t2r_x8,
+        k_scale_words,
     ).launch(
         grid=grid,
         block=[(NUM_EPI_WARPS + 2) * 32, 1, 1],

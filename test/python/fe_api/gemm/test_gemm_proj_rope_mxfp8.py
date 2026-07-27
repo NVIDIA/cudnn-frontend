@@ -26,16 +26,19 @@ def test_gemm_proj_rope_mxfp8_bf16in_wrapper(tokens, w_out_in, request):
 # ======================================================================================
 # MXFP8-input sibling: class compile/execute + wrapper
 # ======================================================================================
-@pytest.mark.L0
+# Keep the small case at L0 (fast); the large 4096-token case compiles a fresh SM100 kernel, so
+# park it at L1 to keep L0 quick.
+_MXFP8_TOKEN_PARAMS = [pytest.param(2048, marks=pytest.mark.L0), pytest.param(4096, marks=pytest.mark.L1)]
+
+
 @torch_fork_set_rng(seed=0)
-@pytest.mark.parametrize("tokens", [2048, 4096])
+@pytest.mark.parametrize("tokens", _MXFP8_TOKEN_PARAMS)
 def test_gemm_proj_rope_mxfp8_mxfp8in_compile_execute(tokens, request):
     _test_mxfp8in_compile_execute(tokens=tokens, request=request)
 
 
-@pytest.mark.L0
 @torch_fork_set_rng(seed=0)
-@pytest.mark.parametrize("tokens", [2048, 4096])
+@pytest.mark.parametrize("tokens", _MXFP8_TOKEN_PARAMS)
 def test_gemm_proj_rope_mxfp8_mxfp8in_wrapper(tokens, request):
     _test_mxfp8in_wrapper(tokens=tokens, request=request)
 
@@ -163,18 +166,18 @@ def test_wrapper_rejects_dtype_mismatch_and_missing_scales():
     # x and w disagree on dtype
     x_bf16 = torch.empty(tokens, Q_LORA, dtype=torch.bfloat16)
     w_fp8 = torch.empty(Q_OUT, Q_LORA, dtype=torch.float8_e4m3fn)
-    with pytest.raises(AssertionError):
+    with pytest.raises(AssertionError, match="must share a dtype"):
         gemm_proj_rope_mxfp8_wrapper_sm100(x_bf16, w_fp8, cos, sin, w_out_in=True)
 
     # fp8 inputs without scales
     x_fp8 = torch.empty(tokens, Q_LORA, dtype=torch.float8_e4m3fn)
-    with pytest.raises(AssertionError):
+    with pytest.raises(AssertionError, match="require x_scale and w_scale"):
         gemm_proj_rope_mxfp8_wrapper_sm100(x_fp8, w_fp8, cos, sin, w_out_in=True)
 
     # bf16 inputs given scales
     w_bf16 = torch.empty(Q_OUT, Q_LORA, dtype=torch.bfloat16)
     bogus_scale = torch.empty(tokens, Q_LORA // 32, dtype=torch.uint8)
-    with pytest.raises(AssertionError):
+    with pytest.raises(AssertionError, match="must not be given MXFP8 scales"):
         gemm_proj_rope_mxfp8_wrapper_sm100(x_bf16, w_bf16, cos, sin, x_scale=bogus_scale, w_scale=bogus_scale, w_out_in=True)
 
 
