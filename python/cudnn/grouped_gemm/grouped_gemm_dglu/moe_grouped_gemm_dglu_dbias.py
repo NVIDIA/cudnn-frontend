@@ -1771,7 +1771,6 @@ class MoEGroupedGemmDgluDbiasBf16Kernel:
                     #
                     # Load accumulator from tensor memory buffer to register
                     #
-                    # Don't ask why, AST is shit tracking the constexpr values to loop args.
                     copy_atom_t2r = sm100_utils.get_tmem_load_op(
                         self.cta_tile_shape_mnk,
                         self.d_layout,
