@@ -57,8 +57,7 @@ Options:
 - `--topks` — comma-separated top-k values.
 - `--nheads` — number of query heads (default 64).
 - `--head-dim` — QK head dim, `512` or `576`; `head_dim_v` is derived (512).
-- `--dtype` — `bfloat16` (default) or `float16` (`float16` is SM90-only;
-  the SM100 backward kernel is BF16-only and the combination is skipped).
+- `--dtype` — `bfloat16` (default) or `float16`.
 - `--no-attn-sink` — disable the attention sink (passes `-inf` sink logits).
 - `--no-topk-length` — omit the `topk_length` tensor. Kernels with and
   without `topk_length` are different compiled variants; the default

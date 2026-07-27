@@ -4,7 +4,7 @@ from typing import Tuple, Type, Optional
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.typing import Float32, Int32, BFloat16, Int64
+from cutlass.cute.typing import Float32, Int32, Int64
 import cutlass.pipeline as pipeline
 from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils
@@ -17,6 +17,7 @@ class FlashAttentionDSABackwardSm100:
 
     def __init__(
         self,
+        element_dtype: Type[cutlass.Numeric],
         head_dim: int,
         head_dim_v: int,
         block_tile: int,
@@ -40,9 +41,11 @@ class FlashAttentionDSABackwardSm100:
         self.QdS_cta_tiler = (head_dim_main, block_tile, block_tile)
         self.cluster_shape_mn = (1, 1)
 
-        self.element_dtype = BFloat16
-        # User constraint: dKV accumulation must stay FP32. BFloat16 is only
-        # used for element/output storage.
+        if element_dtype not in [cutlass.Float16, cutlass.BFloat16]:
+            raise ValueError(f"Unsupported element dtype: {element_dtype}")
+        self.element_dtype = element_dtype
+        # dKV accumulation stays FP32; element_dtype controls element/output
+        # storage.
         self.acc_dtype = Float32
 
         # =============== Sum OdO ================

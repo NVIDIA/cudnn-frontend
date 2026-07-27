@@ -39,10 +39,10 @@ def flash_attn_bwd_sm100(
     Internally wraps as batch=1 for the CuTe DSL kernel.
 
     Args:
-        q: (total_S_q, nheads, headdim) bfloat16
-        kv: (total_S_kv, headdim) bfloat16  (K=V, MQA h_kv=1)
-        out: (total_S_q, nheads, headdim_v) bfloat16
-        dout: (total_S_q, nheads, headdim_v) bfloat16
+        q: (total_S_q, nheads, headdim) float16 or bfloat16
+        kv: (total_S_kv, headdim) float16 or bfloat16  (K=V, MQA h_kv=1)
+        out: (total_S_q, nheads, headdim_v) float16 or bfloat16
+        dout: (total_S_q, nheads, headdim_v) float16 or bfloat16
         lse: (total_S_q, nheads) float32, FlashMLA KV-only LSE excluding sink
         attn_sink: (nheads,) float32
         topk_idxs: (total_S_q, topk_max) int32, global indices
@@ -59,9 +59,7 @@ def flash_attn_bwd_sm100(
     head_dim_v = 512 if head_dim == 576 else head_dim
     device = q.device
 
-    # FlashAttentionDSABackwardSm100 hardcodes BF16 as its element type; fp16
-    # inputs compile and run but produce silently wrong gradients.
-    assert q.dtype == torch.bfloat16, f"flash_attn_bwd_sm100 only supports bfloat16 (the SM100 kernel is BF16-only), got {q.dtype}"
+    assert q.dtype in [torch.float16, torch.bfloat16]
     assert q.dtype == kv.dtype == out.dtype == dout.dtype
     assert lse.dtype == torch.float32
     assert attn_sink.dtype == torch.float32
@@ -182,6 +180,7 @@ def flash_attn_bwd_sm100(
         workspace_dKV_tensor = to_cute_tensor(workspace_dKV)
 
         kernel_obj = FlashAttentionDSABackwardSm100(
+            element_dtype=dtype,
             head_dim=head_dim,
             head_dim_v=head_dim_v,
             block_tile=block_tile,

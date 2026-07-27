@@ -263,9 +263,6 @@ def main():
     if major not in (9, 10):
         print(f"SKIP: DSA backward requires a Hopper (SM90) or Blackwell (SM100) GPU, found SM{major}{minor}")
         return
-    if args.dtype == "float16" and major != 9:
-        print("SKIP: float16 is only supported by the SM90 DSA backward kernel (the SM100 kernel is BF16-only)")
-        return
     if DSA is None:
         print(f"SKIP: cudnn is not importable ({_CUDNN_IMPORT_ERROR})")
         print("Install with: pip install nvidia-cudnn-frontend[cutedsl]")

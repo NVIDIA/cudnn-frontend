@@ -110,7 +110,7 @@ Backward pass for DeepSeek Sparse Attention. Expects the forward outputs
 (`out`, `lse`) from FlashMLA (or the PyTorch reference).
 
 - **Inputs**
-  - `q`: `(total_S_q, H, D)` BF16 (FP16 additionally accepted on SM90; the SM100 kernel is BF16-only)
+  - `q`: `(total_S_q, H, D)` BF16/FP16
   - `kv`: `(total_S_kv, D)` (K = V; MQA)
   - `out`, `dout`: `(total_S_q, H, D_v)`
   - `lse`: `(total_S_q, H)` FP32

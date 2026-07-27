@@ -390,56 +390,72 @@ def test_DSA_sparse_attention_backward_nondefault_stream_zero_init_ordering():
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=16)
-def test_DSA_sparse_attention_backward_rejects_fp16_on_sm100():
-    """The SM100 backward kernel (FlashAttentionDSABackwardSm100) hardcodes
-    BF16 as its element type, while the SM90 kernels are dtype-parameterized.
-    Before the gate, fp16 inputs on SM100 passed the dtype checks, compiled,
-    ran without any error, and returned silently wrong gradients (~96% of dq
-    outside 5e-2 tolerances against the fp16 autograd reference, on the same
-    harness where bf16 passes). fp16 must be rejected loudly."""
+def test_DSA_sparse_attention_backward_fp16_sm100_numerics():
+    """SM100 must compile FP16 inputs with FP16 MMA/storage semantics."""
     try:
         from cudnn import DSA
-        from cudnn.deepseek_sparse_attention.sparse_attention_backward import _interface_sm100
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
     _require_sm100()
     device = torch.device("cuda")
     s_q, s_kv, num_heads = 4, 128, 64
-    head_dim, head_dim_v, topk = 576, 512, 64
+    head_dim, topk = 512, 64
     softmax_scale = 1.0 / math.sqrt(head_dim)
 
     q = torch.randn(s_q, num_heads, head_dim, dtype=torch.float16, device=device)
     kv = torch.randn(s_kv, head_dim, dtype=torch.float16, device=device)
-    out = torch.randn(s_q, num_heads, head_dim_v, dtype=torch.float16, device=device)
-    dout = torch.randn_like(out)
-    lse = torch.randn(s_q, num_heads, dtype=torch.float32, device=device)
-    attn_sink = torch.randn(num_heads, dtype=torch.float32, device=device)
+    attn_sink = torch.linspace(-2.0, 2.0, num_heads, dtype=torch.float32, device=device)
     topk_idxs = torch.stack([torch.randperm(s_kv, device=device)[:topk] for _ in range(s_q)]).to(torch.int32)
+    topk_length = torch.tensor([16, 32, 48, 64], dtype=torch.int32, device=device)
 
-    with pytest.raises(ValueError, match="Q dtype mismatch"):
-        DSA.sparse_attention_backward_wrapper(
-            q,
-            kv,
-            out,
-            dout,
-            lse,
-            attn_sink,
-            topk_idxs,
-            softmax_scale=softmax_scale,
-        )
+    out, lse = ref_sparse_attention_forward(
+        q,
+        kv,
+        attn_sink,
+        topk_idxs,
+        topk_length=topk_length,
+        softmax_scale=softmax_scale,
+    )
+    dout = torch.randn_like(out)
+    assert q.dtype == kv.dtype == out.dtype == dout.dtype == torch.float16
+    assert lse.dtype == torch.float32
 
-    with pytest.raises(AssertionError, match="bfloat16"):
-        _interface_sm100.flash_attn_bwd_sm100(
-            q,
-            kv,
-            out,
-            dout,
-            lse,
-            attn_sink,
-            topk_idxs,
-            softmax_scale=softmax_scale,
-        )
+    result = DSA.sparse_attention_backward_wrapper(
+        q,
+        kv,
+        out,
+        dout,
+        lse,
+        attn_sink,
+        topk_idxs,
+        softmax_scale=softmax_scale,
+        topk_length=topk_length,
+    )
+    torch.cuda.synchronize()
+    dq, dkv, d_sink = result["dq"], result["dkv"], result["d_sink"]
+
+    assert dq.dtype == dkv.dtype == torch.float16
+    assert d_sink.dtype == torch.float32
+    assert torch.isfinite(dq).all()
+    assert torch.isfinite(dkv).all()
+    assert torch.isfinite(d_sink).all()
+    check_ref_dsa_sparse_attention_backward(
+        q,
+        kv,
+        attn_sink,
+        topk_idxs,
+        out,
+        dout,
+        lse,
+        dq,
+        dkv,
+        d_sink,
+        softmax_scale=softmax_scale,
+        topk_length=topk_length,
+        atol=5e-2,
+        rtol=5e-2,
+    )
 
 
 @pytest.mark.L0
@@ -657,6 +673,11 @@ def test_DSA_sparse_attention_backward_check_support_validates_contract():
     )
     assert SparseAttentionBackward(**good).check_support()
 
+    fp16_good = dict(good)
+    for name in ("sample_q", "sample_kv", "sample_out", "sample_dout"):
+        fp16_good[name] = fp16_good[name].to(torch.float16)
+    assert SparseAttentionBackward(**fp16_good).check_support()
+
     bad_cases = {
         "sample_kv": kv[:, : head_dim - 64].contiguous(),
         "sample_out": out.transpose(1, 2).contiguous(),
@@ -665,14 +686,9 @@ def test_DSA_sparse_attention_backward_check_support_validates_contract():
         "sample_attn_sink": attn_sink[: num_heads // 2].contiguous(),
         "sample_topk_idxs": topk_idxs[: s_q - 1].contiguous(),
         "sample_topk_length": topk_length[: s_q - 1].contiguous(),
-        "sample_q": q.to(torch.float16),  # BF16-only on SM100
     }
     for name, bad_tensor in bad_cases.items():
         kwargs = dict(good)
         kwargs[name] = bad_tensor
-        if name == "sample_q":
-            kwargs["sample_kv"] = kv.to(torch.float16)
-            kwargs["sample_out"] = out.to(torch.float16)
-            kwargs["sample_dout"] = dout.to(torch.float16)
         with pytest.raises(ValueError):
             SparseAttentionBackward(**kwargs).check_support()
