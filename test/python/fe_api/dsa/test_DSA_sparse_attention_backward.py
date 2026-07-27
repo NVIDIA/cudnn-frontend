@@ -137,6 +137,118 @@ def test_DSA_sparse_attention_backward_wrapper(
 
 
 @pytest.mark.L0
+@torch_fork_set_rng(seed=433)
+@pytest.mark.parametrize(
+    "head_dim,num_heads,topk_length_values",
+    [
+        pytest.param(512, 64, (-3, 0, 1, 63, 64, 65, 128), id="d512-mixed"),
+        pytest.param(576, 32, None, id="d576-all-empty"),
+    ],
+)
+def test_DSA_sparse_attention_backward_sm100_zero_topk_length(head_dim, num_heads, topk_length_values):
+    """SM100 must treat a nonpositive top-k length as an empty attention row."""
+    if not torch.cuda.is_available():
+        pytest.skip("SM100 GPU required")
+    major, minor = torch.cuda.get_device_capability()
+    if major * 10 + minor < 100:
+        pytest.skip("zero top-k length regression test targets the SM100 kernel")
+
+    try:
+        from cudnn import DSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    device = torch.device("cuda")
+    s_q = len(topk_length_values) if topk_length_values is not None else 2
+    s_kv, topk = 256, 128
+    softmax_scale = 1.0 / math.sqrt(head_dim)
+
+    q = torch.randn(s_q, num_heads, head_dim, dtype=torch.bfloat16, device=device) / 10
+    kv = torch.randn(s_kv, head_dim, dtype=torch.bfloat16, device=device) / 10
+    attn_sink = torch.randn(num_heads, dtype=torch.float32, device=device)
+    base_topk_idxs = torch.stack([torch.randperm(s_kv, device=device)[:topk] for _ in range(s_q)]).to(torch.int32)
+
+    # The D512 mixed case covers defensive negative handling and both sides of
+    # the 64-row tile boundary. The all-empty cases make every expected
+    # gradient exactly zero; D576/H32 additionally covers the feature tail and
+    # a partial 64-head CTA.
+    topk_length_cases = [torch.zeros(s_q, dtype=torch.int32, device=device)]
+    if topk_length_values is not None:
+        topk_length_cases.insert(0, torch.tensor(topk_length_values, dtype=torch.int32, device=device))
+    positions = torch.arange(topk, device=device).unsqueeze(0)
+
+    for topk_length in topk_length_cases:
+        topk_idxs = base_topk_idxs.clone()
+        topk_idxs[positions >= topk_length.unsqueeze(1)] = -1
+        empty_rows = topk_length <= 0
+        # Invalid values in ignored slots exercise that the empty fast path
+        # does not consult topk_idxs before exiting.
+        topk_idxs[empty_rows] = torch.iinfo(torch.int32).max
+
+        out, lse = ref_sparse_attention_forward(
+            q,
+            kv,
+            attn_sink,
+            topk_idxs,
+            topk_length=topk_length,
+            softmax_scale=softmax_scale,
+        )
+        assert torch.equal(out[empty_rows], torch.zeros_like(out[empty_rows]))
+        assert torch.isneginf(lse[empty_rows]).all()
+        dout = torch.randn_like(out)
+
+        # In particular, the empty-row fast path must overwrite caller-owned
+        # storage; torch.empty_like() could otherwise hide a missing dQ store.
+        dq_buffer = torch.full_like(q, float("nan"))
+        dkv_buffer = torch.full_like(kv, float("nan"))
+        result = DSA.sparse_attention_backward_wrapper(
+            q,
+            kv,
+            out,
+            dout,
+            lse,
+            attn_sink,
+            topk_idxs,
+            softmax_scale=softmax_scale,
+            topk_length=topk_length,
+            dq=dq_buffer,
+            dkv=dkv_buffer,
+        )
+        # Reaching the synchronization is also the regression check for the
+        # empty-CTA barrier deadlock.
+        torch.cuda.synchronize()
+
+        dq, dkv, d_sink = result["dq"], result["dkv"], result["d_sink"]
+        assert dq.data_ptr() == dq_buffer.data_ptr()
+        assert dkv.data_ptr() == dkv_buffer.data_ptr()
+        assert torch.isfinite(dq).all()
+        assert torch.isfinite(dkv).all()
+        assert torch.isfinite(d_sink).all()
+        assert torch.equal(dq[empty_rows], torch.zeros_like(dq[empty_rows]))
+
+        check_ref_dsa_sparse_attention_backward(
+            q,
+            kv,
+            attn_sink,
+            topk_idxs,
+            out,
+            dout,
+            lse,
+            dq,
+            dkv,
+            d_sink,
+            softmax_scale=softmax_scale,
+            topk_length=topk_length,
+            atol=5e-2,
+            rtol=5e-2,
+        )
+
+        if torch.all(empty_rows):
+            assert torch.equal(dkv, torch.zeros_like(dkv))
+            assert torch.equal(d_sink, torch.zeros_like(d_sink))
+
+
+@pytest.mark.L0
 @torch_fork_set_rng(seed=385)
 def test_DSA_sparse_attention_backward_qh32_uses_per_query_topk_without_padding(monkeypatch):
     try:
