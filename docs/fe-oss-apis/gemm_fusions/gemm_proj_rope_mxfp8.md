@@ -85,14 +85,17 @@ out_fp8_row, out_scales_row, out_fp8_col, out_scales_col = result
 ```
 
 ### Class API — BF16 input
+
+The class constructor defaults to `w_out_in=False` (`w` stored `[in, out]`); pass `w_out_in=True` for TE-native `[out, in]` weights. (The high-level wrapper defaults the other way, to `w_out_in=True`.)
+
 ```python
-from cuda.bindings import driver as cuda
+from cudnn import GemmProjRopeMxfp8Bf16InSm100
 
 op = GemmProjRopeMxfp8Bf16InSm100(
     sample_x=x, sample_w=w, sample_cos=cos, sample_sin=sin,
     sample_out_fp8_row=out_fp8_row, sample_out_scales_row=out_scales_row,
     sample_out_fp8_col=out_fp8_col, sample_out_scales_col=out_scales_col,
-    w_out_in=False,
+    w_out_in=False,  # w is [in, out]; use w_out_in=True for TE-native [out, in]
 )
 assert op.check_support()
 op.compile()
@@ -100,13 +103,18 @@ op.execute(x, w, cos, sin, out_fp8_row, out_scales_row, out_fp8_col, out_scales_
 ```
 
 ### Class API — MXFP8 input
+
+Unlike the bf16 class, this class has **no `w_out_in` parameter**: `w_code`/`w_scale` must already be TE-native `[out, in] = [N, K]`. Use the high-level wrapper if your weight is `[in, out]` — it transposes the code and scale before constructing this API.
+
 ```python
+from cudnn import GemmProjRopeMxfp8Mxfp8InSm100
+
 op = GemmProjRopeMxfp8Mxfp8InSm100(
     sample_x_code=x_code, sample_x_scale=x_scale, sample_w_code=w_code, sample_w_scale=w_scale,
     sample_cos=cos, sample_sin=sin,
     sample_out_fp8_row=out_fp8_row, sample_out_scales_row=out_scales_row,
     sample_out_fp8_col=out_fp8_col, sample_out_scales_col=out_scales_col,
-)   # weight is TE-native [out, in]; the wrapper transposes the [in, out] layout for you
+)   # w_code/w_scale are TE-native [out, in] = [N, K] (no w_out_in on this class)
 assert op.check_support()
 op.compile()
 op.execute(x_code, x_scale, w_code, w_scale, cos, sin,
