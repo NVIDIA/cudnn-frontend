@@ -56,6 +56,10 @@ def flash_attn_bwd_sm100(
     """
     total_S_q, num_head, head_dim = q.shape
     total_S_kv = kv.shape[0]
+    # Mirror the check_support gate: the SM100 kernel is tiled only for
+    # head_dim in {512, 576}; any other value indexes shared memory out of
+    # bounds and crashes inside the kernel.
+    assert head_dim in (512, 576), f"head_dim must be 512 or 576, got {head_dim}"
     head_dim_v = 512 if head_dim == 576 else head_dim
     device = q.device
 

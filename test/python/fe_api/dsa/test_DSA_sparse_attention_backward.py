@@ -692,3 +692,61 @@ def test_DSA_sparse_attention_backward_check_support_validates_contract():
         kwargs[name] = bad_tensor
         with pytest.raises(ValueError):
             SparseAttentionBackward(**kwargs).check_support()
+
+    # Device placement: check_support must reject CPU inputs that the
+    # SM90/SM100 runtime would otherwise reject at launch time.
+    cpu_kwargs = {name: tensor.to("cpu") for name, tensor in good.items()}
+    with pytest.raises(ValueError, match="Q must live on CUDA"):
+        SparseAttentionBackward(**cpu_kwargs).check_support()
+
+    # Cross-device: Q stays on CUDA, KV moved to CPU (no new CUDA allocation;
+    # reuses the good tensors) -> device-consistency failure.
+    cross_kwargs = dict(good)
+    cross_kwargs["sample_kv"] = good["sample_kv"].to("cpu")
+    with pytest.raises(ValueError, match="must share Q's device"):
+        SparseAttentionBackward(**cross_kwargs).check_support()
+
+    # head_dim must be one of {512, 576}: the kernel is tiled only for those.
+    bad_head_dim = dict(good)
+    bad_head_dim["sample_q"] = torch.randn(s_q, num_heads, 128, dtype=torch.bfloat16, device=device)
+    bad_head_dim["sample_kv"] = torch.randn(s_kv, 128, dtype=torch.bfloat16, device=device)
+    with pytest.raises(ValueError, match="head_dim must be 512 or 576"):
+        SparseAttentionBackward(**bad_head_dim).check_support()
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=7)
+def test_DSA_sparse_attention_backward_rejects_unsupported_head_dim_runtime():
+    """The SM100 kernel is tiled only for head_dim in {512, 576}; any other
+    head_dim indexes shared memory out of bounds and crashes inside the kernel.
+    The interface must reject it before any compile/launch."""
+    try:
+        from cudnn.deepseek_sparse_attention.sparse_attention_backward import _interface_sm100
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    _require_sm100()
+    device = torch.device("cuda")
+    s_q, s_kv, num_heads = 4, 128, 64
+    head_dim, head_dim_v, topk = 128, 128, 64
+    softmax_scale = 1.0 / math.sqrt(head_dim)
+
+    q = torch.randn(s_q, num_heads, head_dim, dtype=torch.bfloat16, device=device)
+    kv = torch.randn(s_kv, head_dim, dtype=torch.bfloat16, device=device)
+    out = torch.randn(s_q, num_heads, head_dim_v, dtype=torch.bfloat16, device=device)
+    dout = torch.randn_like(out)
+    lse = torch.randn(s_q, num_heads, dtype=torch.float32, device=device)
+    attn_sink = torch.randn(num_heads, dtype=torch.float32, device=device)
+    topk_idxs = torch.stack([torch.randperm(s_kv, device=device)[:topk] for _ in range(s_q)]).to(torch.int32)
+
+    with pytest.raises(AssertionError, match="head_dim must be 512 or 576"):
+        _interface_sm100.flash_attn_bwd_sm100(
+            q,
+            kv,
+            out,
+            dout,
+            lse,
+            attn_sink,
+            topk_idxs,
+            softmax_scale=softmax_scale,
+        )
