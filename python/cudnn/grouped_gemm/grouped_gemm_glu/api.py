@@ -108,6 +108,7 @@ class GluCall:
     glu_clamp_max: float = 7.0
     glu_clamp_min: float = -7.0
     use_dynamic_sched: bool = False
+    use_single_group_runtime_offsets: bool = False
     current_stream: Optional[cuda.CUstream] = None
     generate_c: bool = False
     weight_mode: Optional[MoEWeightMode] = None
@@ -178,6 +179,7 @@ class GroupedGemmGluSm100(APIBase):
         act_func: str = "swiglu",
         b_major: str = "k",
         use_dynamic_sched: bool = False,
+        use_single_group_runtime_offsets: bool = False,
         generate_c: bool = False,
     ) -> None:
         super().__init__()
@@ -209,6 +211,10 @@ class GroupedGemmGluSm100(APIBase):
             )
             self.backend = backend
             if backend is GroupedGemmBackend.BF16:
+                self._value_error_if(
+                    kwargs["use_single_group_runtime_offsets"],
+                    "use_single_group_runtime_offsets is supported only by the block-scaled kernel",
+                )
                 self._implementation = GroupedGemmGluBf16API(
                     sample_a=kwargs["sample_a"],
                     sample_c=kwargs["sample_c"],
@@ -495,6 +501,7 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall) -> TupleDict:
     glu_clamp_max = call.glu_clamp_max
     glu_clamp_min = call.glu_clamp_min
     use_dynamic_sched = call.use_dynamic_sched
+    use_single_group_runtime_offsets = call.use_single_group_runtime_offsets
     current_stream = call.current_stream
 
     # Resolve linear_offset default: None means "use the activation-derived legacy
@@ -643,6 +650,7 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall) -> TupleDict:
             m_aligned,
             discrete_col_sfd,
             use_dynamic_sched,
+            use_single_group_runtime_offsets,
             *(dynamic_m_tensor_signature(prob_tensor, (1, 1)) if not use_full_dynamic else dynamic_tensor_signature(prob_tensor)),
         )
     else:
@@ -682,6 +690,7 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall) -> TupleDict:
             m_aligned,
             discrete_col_sfd,
             use_dynamic_sched,
+            use_single_group_runtime_offsets,
             b_major,
             num_experts,
         )
@@ -720,6 +729,7 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall) -> TupleDict:
                 discrete_col_sfd=discrete_col_sfd,
                 act_func=act_func,
                 use_dynamic_sched=use_dynamic_sched,
+                use_single_group_runtime_offsets=use_single_group_runtime_offsets,
             )
         else:
             api = GroupedGemmGluSm100(
@@ -749,6 +759,7 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall) -> TupleDict:
                 act_func=act_func,
                 b_major=b_major,
                 use_dynamic_sched=use_dynamic_sched,
+                use_single_group_runtime_offsets=use_single_group_runtime_offsets,
             )
 
         if not api.check_support():
@@ -892,6 +903,8 @@ def _normalize_glu_call(call: GluCall) -> tuple[GluCall, GroupedGemmBackend]:
     if backend is GroupedGemmBackend.BLOCK_SCALED:
         return normalized, backend
 
+    if call.use_single_group_runtime_offsets:
+        raise ValueError("use_single_group_runtime_offsets is supported only by the block-scaled kernel")
     if call.prob_tensor is None:
         raise ValueError("prob_tensor is required for BF16")
     if call.cd_major != "n":
@@ -1117,6 +1130,7 @@ def grouped_gemm_glu_wrapper_sm100(
     glu_clamp_max: float = 7.0,
     glu_clamp_min: float = -7.0,
     use_dynamic_sched: bool = False,
+    use_single_group_runtime_offsets: bool = False,
     current_stream: Optional[cuda.CUstream] = None,
     generate_c: bool = False,
 ) -> TupleDict:
@@ -1152,6 +1166,7 @@ def grouped_gemm_glu_wrapper_sm100(
         glu_clamp_max=glu_clamp_max,
         glu_clamp_min=glu_clamp_min,
         use_dynamic_sched=use_dynamic_sched,
+        use_single_group_runtime_offsets=use_single_group_runtime_offsets,
         current_stream=current_stream,
         generate_c=generate_c,
     )

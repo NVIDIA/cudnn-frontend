@@ -285,6 +285,7 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
         weight_mode: MoEWeightMode = MoEWeightMode.DISCRETE,
         use_dynamic_sched: bool = False,
         act_func: str = "dswiglu",
+        use_single_group_runtime_offsets: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled grouped GEMM dGLU kernel.
 
@@ -327,11 +328,14 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
             )
         if expert_cnt > 1024:
             raise ValueError("Expert count > 1024 is not supported.")
+        if use_single_group_runtime_offsets and expert_cnt != 1:
+            raise ValueError("use_single_group_runtime_offsets requires exactly one expert")
         if not isinstance(weight_mode, MoEWeightMode):
             raise TypeError(f"weight_mode must be a MoEWeightMode, got {type(weight_mode)}")
 
         self.sf_vec_size = sf_vec_size
         self.expert_cnt = expert_cnt
+        self.use_single_group_runtime_offsets = use_single_group_runtime_offsets
         self.acc_dtype: Type[cutlass.Numeric] = acc_dtype
         self.use_2cta_instrs = use_2cta_instrs
         self.cluster_shape_mn = cluster_shape_mn
@@ -587,9 +591,6 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
         # To prefetch more accumulator when overlapping_accum is enabled in epilogue
         self.epilogue_prefetch_more = self.d_dtype.width == 8 and self.a_dtype.width == 8
 
-        # To generate dprob
-        self.generate_dprob = True
-
         # Use ptx fp8 fp32 convert
         self.use_fp8_ptx_cvt = True
 
@@ -785,6 +786,8 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
         # dBias configuration
         self.generate_dbias = dbias_tensor is not None
         self.dbias_cross_warp_reduce = self.generate_dbias  # always cross-warp reduce
+        self.has_prob = prob is not None
+        self.generate_dprob = dprob is not None
 
         # Check if input data types are compatible with MMA instruction
         if cutlass.const_expr(self.a_dtype != self.b_dtype):
@@ -1800,10 +1803,12 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
                         (acc_vec[i + 0], acc_vec[i + 1]),
                     )
                 # calculate dswiglu
-                acc_vec_prob = cute.arch.mul_packed_f32x2(
-                    (acc_vec[i + 0], acc_vec[i + 1]),
-                    (mProb, mProb),
-                )
+                acc_vec_prob = (acc_vec[i + 0], acc_vec[i + 1])
+                if cutlass.const_expr(self.has_prob):
+                    acc_vec_prob = cute.arch.mul_packed_f32x2(
+                        acc_vec_prob,
+                        (mProb, mProb),
+                    )
                 # calculate d2_vec
                 (
                     d2_vec[i + 0],
@@ -1888,8 +1893,11 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
                 dprob_swiglu = acc_vec * dprob_swiglu
 
             # calculate dswiglu
-            d1_vec = acc_vec * mProb * ab2_vec_load * sig * (1 + ab1_vec_load * (1 - sig))
-            d2_vec = acc_vec * mProb * swish
+            acc_vec_prob = acc_vec
+            if cutlass.const_expr(self.has_prob):
+                acc_vec_prob = acc_vec * mProb
+            d1_vec = acc_vec_prob * ab2_vec_load * sig * (1 + ab1_vec_load * (1 - sig))
+            d2_vec = acc_vec_prob * swish
             return d1_vec, d2_vec, dprob_swiglu
 
     @cute.jit
@@ -1968,7 +1976,9 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
 
                 # g * sigmoid_out
                 acc_mul_sigmoid_out = fmul2(acc, (sigmoid_out_0, sigmoid_out_1))
-                acc_mul_sigmoid_prob = fmul2(acc_mul_sigmoid_out, mprob2)
+                acc_mul_sigmoid_prob = acc_mul_sigmoid_out
+                if cutlass.const_expr(self.has_prob):
+                    acc_mul_sigmoid_prob = fmul2(acc_mul_sigmoid_out, mprob2)
 
                 # y1 = 1 + alpha * y1 * (1 - sigmoid_out)
                 one_minus_sigmoid_0, one_minus_sigmoid_1 = fadd2(ones2, (-sigmoid_out_0, -sigmoid_out_1))
@@ -1987,7 +1997,8 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
                 )
                 # dy1 = g * sigmoid_out * (y2 + linear_offset) * (1 + alpha * y1 * (1 - sigmoid_out)) * mProb
                 dy1_0, dy1_1 = fmul2((dy1_pre_0, dy1_pre_1), y1_scaled)
-                dy1_0, dy1_1 = fmul2((dy1_0, dy1_1), mprob2)
+                if cutlass.const_expr(self.has_prob):
+                    dy1_0, dy1_1 = fmul2((dy1_0, dy1_1), mprob2)
 
                 x1_filter_0 = cutlass.Float32(1.0) if x1_0 <= geglu_max_value else cutlass.Float32(0.0)
                 x1_filter_1 = cutlass.Float32(1.0) if x1_1 <= geglu_max_value else cutlass.Float32(0.0)
@@ -2023,7 +2034,9 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
             # y1 = clamp(x1, max=glu_clamp_max); y2 = clamp(x2, min=glu_clamp_min, max=glu_clamp_max)
             for i in cutlass.range_constexpr(element_count):
                 fc2_dgrad = acc_vec[i] * square_alpha
-                g = fc2_dgrad * mProb
+                g = fc2_dgrad
+                if cutlass.const_expr(self.has_prob):
+                    g = fc2_dgrad * mProb
                 y1 = min(x1_vec_load[i], geglu_max_value_f32)
                 y2 = min(x2_vec_load[i], geglu_max_value_f32)
                 y2 = max(y2, geglu_min_value_f32)
@@ -2043,7 +2056,9 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
                     prob_grad = y1 * sigmoid_out * (y2 + linear_offset) * fc2_dgrad
                     dprob_swiglu[i] = prob_grad
 
-            return dx1_vec.load(), dx2_vec.load(), dprob_swiglu.load()
+            if cutlass.const_expr(self.generate_dprob):
+                dprob_swiglu = dprob_swiglu.load()
+            return dx1_vec.load(), dx2_vec.load(), dprob_swiglu
 
     # GPU device kernel
     @cute.kernel
@@ -2099,6 +2114,10 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
         warp_idx = tidx // 32
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
 
+        if cutlass.const_expr(self.use_single_group_runtime_offsets):
+            runtime_padded_offsets = cute.make_rmem_tensor((1,), cutlass.Int32)
+            runtime_padded_offsets[0] = cutlass.Int32(cute.size(mA_mkl.shape[0]))
+            padded_offsets = runtime_padded_offsets
         total_tokens = padded_offsets[self.expert_cnt - 1]
 
         #
@@ -2921,13 +2940,15 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
                 #
                 # Get PROB (per-expert local M position)
                 #
-                real_prob, _ = epi_ext.get_gmem_tensor("prob", prob, padded_offsets, epi_work_tile_info)
                 mPosition = (
                     (epi_work_tile_info.tile_m_idx // cute.size(tiled_mma.thr_id.shape)) * self.mma_tiler[0]
                     + mma_tile_coord_v * (self.mma_tiler[0] // cute.size(tiled_mma.thr_id.shape))
                     + tidx
                 )
-                mProb = real_prob[mPosition, 0, 0]
+                mProb = cutlass.Float32(1.0)
+                if cutlass.const_expr(self.has_prob):
+                    real_prob, _ = epi_ext.get_gmem_tensor("prob", prob, padded_offsets, epi_work_tile_info)
+                    mProb = real_prob[mPosition, 0, 0]
                 if cutlass.const_expr(self.generate_dprob):
                     dProbVal = cutlass.Float32(0.0)
 

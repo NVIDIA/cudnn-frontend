@@ -109,8 +109,8 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
         sample_padded_offsets: torch.Tensor,
         sample_alpha: torch.Tensor,
         sample_beta: torch.Tensor,
-        sample_prob: torch.Tensor,
-        sample_dprob: torch.Tensor,
+        sample_prob: Optional[torch.Tensor],
+        sample_dprob: Optional[torch.Tensor],
         # Dense mode (contiguous) -- provide these. sample_dbias is optional:
         sample_b: Optional[torch.Tensor] = None,
         sample_sfb: Optional[torch.Tensor] = None,
@@ -136,6 +136,7 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
         b_major: str = "k",
         epilogue_op: Optional[str] = None,
         use_dynamic_sched: bool = False,
+        use_single_group_runtime_offsets: bool = False,
         linear_offset: Optional[float] = None,
         geglu_alpha: float = 1.702,
         glu_clamp_max: float = 7.0,
@@ -266,6 +267,11 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
             raise ValueError(f"Invalid epilogue operation: {epilogue_op}. " f"Valid values: None, 'none', 'identity', 'relu', 'srelu'")
 
         self.use_dynamic_sched = use_dynamic_sched
+        self._value_error_if(
+            use_single_group_runtime_offsets and self.expert_cnt != 1,
+            "use_single_group_runtime_offsets requires exactly one expert",
+        )
+        self.use_single_group_runtime_offsets = use_single_group_runtime_offsets
         if linear_offset is None:
             self.linear_offset = 1.0 if self.act_func == "dgeglu" else 0.0
         else:
@@ -682,6 +688,7 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
             weight_mode=self.weight_mode,
             act_func=self.act_func,
             use_dynamic_sched=self.use_dynamic_sched,
+            use_single_group_runtime_offsets=self.use_single_group_runtime_offsets,
         )
 
         hardware_info = cutlass.utils.HardwareInfo()
@@ -751,16 +758,20 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
             sfb_cute_fake = self._make_fake_cute_tensor_from_desc(self.sfb_desc, assumed_align=16)
 
             beta_cute_fake = self._make_fake_cute_tensor_from_desc(self.beta_desc, assumed_align=16)
-            prob_cute_fake = self._make_fake_cute_compact_tensor(
-                dtype=self.prob_desc.dtype,
-                shape=(valid_m, 1, 1),
-                stride_order=self.prob_desc.stride_order,
-            )
-            dprob_cute_fake = self._make_fake_cute_compact_tensor(
-                dtype=self.dprob_desc.dtype,
-                shape=(valid_m, 1, 1),
-                stride_order=self.dprob_desc.stride_order,
-            )
+            prob_cute_fake = None
+            if self.prob_desc is not None:
+                prob_cute_fake = self._make_fake_cute_compact_tensor(
+                    dtype=self.prob_desc.dtype,
+                    shape=(valid_m, 1, 1),
+                    stride_order=self.prob_desc.stride_order,
+                )
+            dprob_cute_fake = None
+            if self.dprob_desc is not None:
+                dprob_cute_fake = self._make_fake_cute_compact_tensor(
+                    dtype=self.dprob_desc.dtype,
+                    shape=(valid_m, 1, 1),
+                    stride_order=self.dprob_desc.stride_order,
+                )
 
             sfd_row_fake = None
             sfd_col_fake = None
@@ -852,16 +863,20 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
             )
 
             beta_cute_fake = self._make_fake_cute_tensor_from_desc(self.beta_desc, assumed_align=16)
-            prob_cute_fake = self._make_fake_cute_tensor(
-                dtype=self.prob_desc.dtype,
-                shape=(valid_m, *self.prob_desc.shape[1:]),
-                stride=self.prob_desc.stride,
-            )
-            dprob_cute_fake = self._make_fake_cute_tensor(
-                dtype=self.dprob_desc.dtype,
-                shape=(valid_m, *self.dprob_desc.shape[1:]),
-                stride=self.dprob_desc.stride,
-            )
+            prob_cute_fake = None
+            if self.prob_desc is not None:
+                prob_cute_fake = self._make_fake_cute_tensor(
+                    dtype=self.prob_desc.dtype,
+                    shape=(valid_m, *self.prob_desc.shape[1:]),
+                    stride=self.prob_desc.stride,
+                )
+            dprob_cute_fake = None
+            if self.dprob_desc is not None:
+                dprob_cute_fake = self._make_fake_cute_tensor(
+                    dtype=self.dprob_desc.dtype,
+                    shape=(valid_m, *self.dprob_desc.shape[1:]),
+                    stride=self.dprob_desc.stride,
+                )
 
             sfd_row_fake = None
             sfd_col_fake = None
@@ -940,8 +955,8 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
             padded_offsets: torch.Tensor,
             alpha_tensor: torch.Tensor,
             beta_tensor: torch.Tensor,
-            prob_tensor: torch.Tensor,
-            dprob_tensor: torch.Tensor,
+            prob_tensor: Optional[torch.Tensor],
+            dprob_tensor: Optional[torch.Tensor],
             dbias_tensor: Optional[torch.Tensor],
             stream: cuda.CUstream,
         ) -> None:
@@ -1051,18 +1066,22 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
         padded_offsets_tensor = self._make_fake_cute_tensor_from_desc(self.padded_offsets_desc, assumed_align=16)
         alpha_tensor = self._make_fake_cute_tensor_from_desc(self.alpha_desc, assumed_align=16)
         beta_tensor = self._make_fake_cute_tensor_from_desc(self.beta_desc, assumed_align=16)
-        prob_tensor = self._make_fake_cute_tensor(
-            dtype=self.prob_desc.dtype,
-            shape=(valid_m, *self.prob_desc.shape[1:]),
-            stride=self.prob_desc.stride,
-            assumed_align=16,
-        )
-        dprob_tensor = self._make_fake_cute_tensor(
-            dtype=self.dprob_desc.dtype,
-            shape=(valid_m, *self.dprob_desc.shape[1:]),
-            stride=self.dprob_desc.stride,
-            assumed_align=16,
-        )
+        prob_tensor = None
+        if self.prob_desc is not None:
+            prob_tensor = self._make_fake_cute_tensor(
+                dtype=self.prob_desc.dtype,
+                shape=(valid_m, *self.prob_desc.shape[1:]),
+                stride=self.prob_desc.stride,
+                assumed_align=16,
+            )
+        dprob_tensor = None
+        if self.dprob_desc is not None:
+            dprob_tensor = self._make_fake_cute_tensor(
+                dtype=self.dprob_desc.dtype,
+                shape=(valid_m, *self.dprob_desc.shape[1:]),
+                stride=self.dprob_desc.stride,
+                assumed_align=16,
+            )
         dbias_tensor = self._make_fake_cute_tensor_from_desc(self.dbias_desc, assumed_align=16)
 
         # Compile-time pointer placeholders
@@ -1133,8 +1152,8 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
             padded_offsets: torch.Tensor,
             alpha_tensor: torch.Tensor,
             beta_tensor: torch.Tensor,
-            prob_tensor: torch.Tensor,
-            dprob_tensor: torch.Tensor,
+            prob_tensor: Optional[torch.Tensor],
+            dprob_tensor: Optional[torch.Tensor],
             dbias_tensor: Optional[torch.Tensor],
             stream: cuda.CUstream,
         ) -> None:
@@ -1183,8 +1202,8 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
         padded_offsets: torch.Tensor,
         alpha_tensor: torch.Tensor,
         beta_tensor: torch.Tensor,
-        prob_tensor: torch.Tensor,
-        dprob_tensor: torch.Tensor,
+        prob_tensor: Optional[torch.Tensor],
+        dprob_tensor: Optional[torch.Tensor],
         # Dense mode:
         b_tensor: Optional[torch.Tensor] = None,
         sfb_tensor: Optional[torch.Tensor] = None,

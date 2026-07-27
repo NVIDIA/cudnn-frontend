@@ -101,6 +101,7 @@ class GroupedGemmQuantSm100(APIBase):
         discrete_col_sfd: bool = False,
         b_major: str = "k",
         use_dynamic_sched: bool = False,
+        use_single_group_runtime_offsets: bool = False,
     ):
         """Initialize the GroupedGemmQuantSm100 API.
 
@@ -212,6 +213,11 @@ class GroupedGemmQuantSm100(APIBase):
         self.m_aligned = m_aligned
         self.discrete_col_sfd = discrete_col_sfd
         self.use_dynamic_sched = use_dynamic_sched
+        self._value_error_if(
+            use_single_group_runtime_offsets and self.expert_cnt != 1,
+            "use_single_group_runtime_offsets requires exactly one expert",
+        )
+        self.use_single_group_runtime_offsets = use_single_group_runtime_offsets
         if self.weight_mode == MoEWeightMode.DENSE:
             self.b_major = b_major
 
@@ -573,6 +579,7 @@ class GroupedGemmQuantSm100(APIBase):
             expert_cnt=self.expert_cnt,
             weight_mode=self.weight_mode,
             use_dynamic_sched=self.use_dynamic_sched,
+            use_single_group_runtime_offsets=self.use_single_group_runtime_offsets,
         )
 
         hardware_info = cutlass.utils.HardwareInfo()
@@ -1181,6 +1188,7 @@ def grouped_gemm_quant_wrapper_sm100(
     m_aligned: int = 256,
     discrete_col_sfd: bool = False,
     use_dynamic_sched: bool = False,
+    use_single_group_runtime_offsets: bool = False,
     current_stream: Optional[cuda.CUstream] = None,
 ) -> TupleDict:
     """Convenience wrapper for grouped GEMM Quant operation.
@@ -1443,6 +1451,7 @@ def grouped_gemm_quant_wrapper_sm100(
             m_aligned,
             discrete_col_sfd,
             use_dynamic_sched,
+            use_single_group_runtime_offsets,
         )
     else:
         cache_key = (
@@ -1479,6 +1488,7 @@ def grouped_gemm_quant_wrapper_sm100(
             m_aligned,
             discrete_col_sfd,
             use_dynamic_sched,
+            use_single_group_runtime_offsets,
             b_major,
             num_experts,
         )
@@ -1513,6 +1523,7 @@ def grouped_gemm_quant_wrapper_sm100(
                 m_aligned=m_aligned,
                 discrete_col_sfd=discrete_col_sfd,
                 use_dynamic_sched=use_dynamic_sched,
+                use_single_group_runtime_offsets=use_single_group_runtime_offsets,
             )
         else:
             grouped_gemm_quant = GroupedGemmQuantSm100(
@@ -1540,6 +1551,7 @@ def grouped_gemm_quant_wrapper_sm100(
                 m_aligned=m_aligned,
                 discrete_col_sfd=discrete_col_sfd,
                 use_dynamic_sched=use_dynamic_sched,
+                use_single_group_runtime_offsets=use_single_group_runtime_offsets,
                 b_major=b_major,
             )
 

@@ -85,8 +85,8 @@ class DgluCall:
     padded_offsets: torch.Tensor
     alpha_tensor: torch.Tensor
     beta_tensor: torch.Tensor
-    prob_tensor: torch.Tensor
-    dprob_tensor: torch.Tensor
+    prob_tensor: Optional[torch.Tensor]
+    dprob_tensor: Optional[torch.Tensor]
     b_tensor: Optional[torch.Tensor] = None
     sfb_tensor: Optional[torch.Tensor] = None
     generate_dbias: bool = False
@@ -112,6 +112,7 @@ class DgluCall:
     glu_clamp_min: float = -7.0
     epilogue_op: Optional[str] = None
     use_dynamic_sched: bool = False
+    use_single_group_runtime_offsets: bool = False
     current_stream: Optional[cuda.CUstream] = None
     weight_mode: Optional[MoEWeightMode] = None
     b_shape: Optional[Tuple[int, ...]] = None
@@ -151,8 +152,8 @@ class GroupedGemmDgluSm100(APIBase):
         sample_padded_offsets: torch.Tensor,
         sample_alpha: torch.Tensor,
         sample_beta: torch.Tensor,
-        sample_prob: torch.Tensor,
-        sample_dprob: torch.Tensor,
+        sample_prob: Optional[torch.Tensor],
+        sample_dprob: Optional[torch.Tensor],
         *args: Any,
         **kwargs: Any,
     ) -> None: ...
@@ -167,8 +168,8 @@ class GroupedGemmDgluSm100(APIBase):
         sample_padded_offsets: torch.Tensor,
         sample_alpha: torch.Tensor,
         sample_beta: torch.Tensor,
-        sample_prob: torch.Tensor,
-        sample_dprob: torch.Tensor,
+        sample_prob: Optional[torch.Tensor],
+        sample_dprob: Optional[torch.Tensor],
         sample_b: Optional[torch.Tensor] = None,
         sample_sfb: Optional[torch.Tensor] = None,
         sample_dbias: Optional[torch.Tensor] = None,
@@ -190,6 +191,7 @@ class GroupedGemmDgluSm100(APIBase):
         b_major: str = "k",
         epilogue_op: Optional[str] = None,
         use_dynamic_sched: bool = False,
+        use_single_group_runtime_offsets: bool = False,
         linear_offset: Optional[float] = None,
         geglu_alpha: float = 1.702,
         glu_clamp_max: float = 7.0,
@@ -231,6 +233,10 @@ class GroupedGemmDgluSm100(APIBase):
             if self.linear_offset is None:
                 self.linear_offset = 1.0 if kwargs["act_func"] == "dgeglu" else 0.0
             if backend is GroupedGemmBackend.BF16:
+                self._value_error_if(
+                    kwargs["use_single_group_runtime_offsets"],
+                    "use_single_group_runtime_offsets is supported only by the block-scaled kernel",
+                )
                 self._implementation = GroupedGemmDgluBf16API(
                     sample_a=kwargs["sample_a"],
                     sample_c=kwargs["sample_c"],
@@ -309,8 +315,8 @@ class GroupedGemmDgluSm100(APIBase):
         padded_offsets: torch.Tensor,
         alpha_tensor: torch.Tensor,
         beta_tensor: torch.Tensor,
-        prob_tensor: torch.Tensor,
-        dprob_tensor: torch.Tensor,
+        prob_tensor: Optional[torch.Tensor],
+        dprob_tensor: Optional[torch.Tensor],
         b_tensor: Optional[torch.Tensor] = None,
         *,
         sfb_tensor: Optional[torch.Tensor] = None,
@@ -331,8 +337,8 @@ class GroupedGemmDgluSm100(APIBase):
         padded_offsets: torch.Tensor,
         alpha_tensor: torch.Tensor,
         beta_tensor: torch.Tensor,
-        prob_tensor: torch.Tensor,
-        dprob_tensor: torch.Tensor,
+        prob_tensor: Optional[torch.Tensor],
+        dprob_tensor: Optional[torch.Tensor],
         b_tensor: Optional[torch.Tensor] = None,
         sfb_tensor: Optional[torch.Tensor] = None,
         dbias_tensor: Optional[torch.Tensor] = None,
@@ -508,6 +514,7 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall) -> TupleDict:
     glu_clamp_min = call.glu_clamp_min
     epilogue_op = call.epilogue_op
     use_dynamic_sched = call.use_dynamic_sched
+    use_single_group_runtime_offsets = call.use_single_group_runtime_offsets
     current_stream = call.current_stream
 
     # Resolve linear_offset default: None means "use the activation-derived
@@ -666,6 +673,7 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall) -> TupleDict:
             m_aligned,
             discrete_col_sfd,
             use_dynamic_sched,
+            use_single_group_runtime_offsets,
         )
     else:
         cache_key = (
@@ -703,6 +711,7 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall) -> TupleDict:
             m_aligned,
             discrete_col_sfd,
             use_dynamic_sched,
+            use_single_group_runtime_offsets,
             b_major,
             num_experts,
         )
@@ -742,6 +751,7 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall) -> TupleDict:
                 act_func=act_func,
                 epilogue_op=epilogue_op,
                 use_dynamic_sched=use_dynamic_sched,
+                use_single_group_runtime_offsets=use_single_group_runtime_offsets,
                 linear_offset=linear_offset,
                 geglu_alpha=geglu_alpha,
                 glu_clamp_max=glu_clamp_max,
@@ -778,6 +788,7 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall) -> TupleDict:
                 b_major=b_major,
                 epilogue_op=epilogue_op,
                 use_dynamic_sched=use_dynamic_sched,
+                use_single_group_runtime_offsets=use_single_group_runtime_offsets,
                 linear_offset=linear_offset,
                 geglu_alpha=geglu_alpha,
                 glu_clamp_max=glu_clamp_max,
@@ -922,6 +933,11 @@ def _normalize_dglu_call(
     )
     if backend is GroupedGemmBackend.BLOCK_SCALED:
         return normalized, backend
+
+    if call.use_single_group_runtime_offsets:
+        raise ValueError("use_single_group_runtime_offsets is supported only by the block-scaled kernel")
+    if call.prob_tensor is None or call.dprob_tensor is None:
+        raise ValueError("BF16 grouped GEMM dGLU requires prob_tensor and dprob_tensor")
 
     if call.cd_major != "n":
         raise ValueError(f"cd_major must be 'n', got {call.cd_major}")
@@ -1128,8 +1144,8 @@ def grouped_gemm_dglu_wrapper_sm100(
     padded_offsets: torch.Tensor,
     alpha_tensor: torch.Tensor,
     beta_tensor: torch.Tensor,
-    prob_tensor: torch.Tensor,
-    dprob_tensor: torch.Tensor,
+    prob_tensor: Optional[torch.Tensor],
+    dprob_tensor: Optional[torch.Tensor],
     b_tensor: Optional[torch.Tensor] = None,
     sfb_tensor: Optional[torch.Tensor] = None,
     generate_dbias: bool = False,
@@ -1155,6 +1171,7 @@ def grouped_gemm_dglu_wrapper_sm100(
     glu_clamp_min: float = -7.0,
     epilogue_op: Optional[str] = None,
     use_dynamic_sched: bool = False,
+    use_single_group_runtime_offsets: bool = False,
     current_stream: Optional[cuda.CUstream] = None,
 ) -> TupleDict:
     """Dispatch grouped GEMM dGLU once from an immutable normalized call."""
@@ -1192,6 +1209,7 @@ def grouped_gemm_dglu_wrapper_sm100(
         glu_clamp_min=glu_clamp_min,
         epilogue_op=epilogue_op,
         use_dynamic_sched=use_dynamic_sched,
+        use_single_group_runtime_offsets=use_single_group_runtime_offsets,
         current_stream=current_stream,
     )
     normalized, backend = _normalize_dglu_call(call)

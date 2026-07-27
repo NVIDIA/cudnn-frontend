@@ -519,6 +519,10 @@ Returns a `TupleDict` (dictionary + tuple unpacking):
 - Expert count must be `<= 1024`
 - Each group's M dimension is aligned to `m_aligned` (256)
 - All supported kernel configurations require `mma_tiler_mn[1] == 256`
+- `use_single_group_runtime_offsets=True` is supported only by the block-scaled
+  kernel with exactly one expert. In this mode the kernel derives
+  `padded_offsets[0]` from runtime `A.shape[0]` and does not load its value from
+  device memory; the argument must still be an int32 tensor with shape `(1,)`.
 
 ### Environment
 
