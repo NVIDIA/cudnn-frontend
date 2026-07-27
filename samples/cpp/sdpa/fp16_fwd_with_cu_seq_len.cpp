@@ -43,12 +43,15 @@ For example, with b=3 and actual_seq_len = {12, 20, 8}, cu_seq_len = {0, 12, 32,
 A 1-D (b+1,) tensor is also accepted and promoted automatically to (b+1, 1, 1, 1).
 
 Constraints (enforced by the frontend; see SDPA_attributes::validate_sdpa_support_surface):
-    - cu_seq_len_q and cu_seq_len_kv must both be set or both unset.
-    - cu_seq_len_* are mutually exclusive with seq_len_q / seq_len_kv.
-    - padding_mask must be true when cu_seq_len_* are set.
+    - A Q-side and a KV-side sequence length tensor must both be provided (or both
+      omitted). Each side independently uses at most one form: per-batch (seq_len_*)
+      or cumulative (cu_seq_len_*); the two forms cannot both be set on the same side.
+    - The two sides may use different forms (e.g. cu_seq_len_q with seq_len_kv). Such
+      mixed forms require cuDNN >= 9.25.0; this sample uses cu_seq_len on both sides.
+    - padding_mask must be true when sequence length tensors are set.
     - Only the UNIFIED SDPA implementation supports cu_seq_len_*; the COMPOSITE path
       will reject the inputs explicitly.
-    - Requires cuDNN >= 9.24.0.
+    - Supplying cu_seq_len_* requires cuDNN >= 9.24.0.
 */
 
 // Tensors in forward pass
