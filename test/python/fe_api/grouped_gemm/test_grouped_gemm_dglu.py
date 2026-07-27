@@ -176,6 +176,38 @@ def test_grouped_gemm_dglu_wrapper_bf16(discrete, b_major):
 
 
 @pytest.mark.L0
+def test_grouped_gemm_dglu_class_bf16_rejects_single_group_runtime_offsets():
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("Requires SM100+ for grouped GEMM dGLU BF16 kernel.")
+
+    problem = make_grouped_gemm_dglu_bf16_problem(discrete=False, b_major="k")
+    expected_d, _, _ = grouped_gemm_dglu_bf16_reference(
+        problem,
+        act_func="dswiglu",
+        linear_offset=0.0,
+        generate_dbias=False,
+    )
+    api = cudnn.GroupedGemmDgluSm100(
+        sample_a=problem["a"],
+        sample_c=problem["c"],
+        sample_d_row=torch.empty_like(expected_d),
+        sample_d_col=None,
+        sample_sfa=None,
+        sample_padded_offsets=problem["offsets"],
+        sample_alpha=problem["alpha"],
+        sample_beta=problem["beta"],
+        sample_prob=problem["prob"],
+        sample_dprob=problem["dprob"],
+        sample_b=problem["b"],
+        sample_sfb=None,
+        use_single_group_runtime_offsets=True,
+    )
+
+    with pytest.raises(ValueError, match="supported only by the block-scaled kernel"):
+        api.check_support()
+
+
+@pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 @with_scheduler_modes
 @with_grouped_gemm_dswiglu_params_fp4

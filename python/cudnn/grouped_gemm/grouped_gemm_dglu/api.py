@@ -233,6 +233,10 @@ class GroupedGemmDgluSm100(APIBase):
             if self.linear_offset is None:
                 self.linear_offset = 1.0 if kwargs["act_func"] == "dgeglu" else 0.0
             if backend is GroupedGemmBackend.BF16:
+                self._value_error_if(
+                    kwargs["use_single_group_runtime_offsets"],
+                    "use_single_group_runtime_offsets is supported only by the block-scaled kernel",
+                )
                 self._implementation = GroupedGemmDgluBf16API(
                     sample_a=kwargs["sample_a"],
                     sample_c=kwargs["sample_c"],

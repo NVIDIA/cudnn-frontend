@@ -211,6 +211,10 @@ class GroupedGemmGluSm100(APIBase):
             )
             self.backend = backend
             if backend is GroupedGemmBackend.BF16:
+                self._value_error_if(
+                    kwargs["use_single_group_runtime_offsets"],
+                    "use_single_group_runtime_offsets is supported only by the block-scaled kernel",
+                )
                 self._implementation = GroupedGemmGluBf16API(
                     sample_a=kwargs["sample_a"],
                     sample_c=kwargs["sample_c"],
