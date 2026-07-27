@@ -114,9 +114,9 @@ def make_inputs(lens, d, ratio, coff, seed=1234, device="cuda"):
     kv = torch.randn(total, 1, w, generator=gen, dtype=torch.float32).to(torch.bfloat16)
     score = (torch.randn(total, 1, w, generator=gen, dtype=torch.float32).mul_(1.5)).to(torch.bfloat16)
     ape = torch.randn(ratio, w, generator=gen, dtype=torch.float32).mul_(0.25)
-    cu = torch.tensor([0] + list(torch.tensor(lens).cumsum(0)), dtype=torch.int32, device=device)
+    cu = torch.tensor([0, *torch.tensor(lens).cumsum(0)], dtype=torch.int32, device=device)
     seg_comp = torch.tensor([seg_len // ratio for seg_len in lens])
-    cuc = torch.tensor([0] + list(seg_comp.cumsum(0)), dtype=torch.int32, device=device)
+    cuc = torch.tensor([0, *seg_comp.cumsum(0)], dtype=torch.int32, device=device)
     total_comp = int(cuc[-1].item())
     go = torch.randn(total_comp, 1, d, generator=gen, dtype=torch.float32).to(torch.bfloat16)
     return kv.to(device), score.to(device), ape.to(device), cu, cuc, total_comp, go.to(device)
@@ -268,9 +268,7 @@ def _capture_eager_total(kv, score, ape, cu, cuc, total_comp, go, ratio, d, coff
     Returns ``(graph, check)`` where ``check`` compares one graph replay's grads against a
     fresh non-graph backward (graph-vs-fresh numerical-consistency evidence).
     """
-    kvl = kv.clone().requires_grad_(True)
-    scl = score.clone().requires_grad_(True)
-    apl = ape.clone().requires_grad_(True)
+    kvl, scl, apl = _make_leaves(kv, score, ape)
     # Stable zero grad buffers: fixed addresses the captured graph can replay against.
     kvl.grad = torch.zeros_like(kvl)
     scl.grad = torch.zeros_like(scl)
@@ -301,9 +299,7 @@ def _capture_eager_total(kv, score, ape, cu, cuc, total_comp, go, ratio, d, coff
     torch.cuda.synchronize()
     gk, gs, ga = kvl.grad.clone(), scl.grad.clone(), apl.grad.clone()
 
-    ref_k = kv.clone().requires_grad_(True)
-    ref_s = score.clone().requires_grad_(True)
-    ref_a = ape.clone().requires_grad_(True)
+    ref_k, ref_s, ref_a = _make_leaves(kv, score, ape)
     o_ref = eager_forward(ref_k, ref_s, ref_a, cu, cuc, total_comp, ratio, d, coff)
     o_ref.backward(go)
     torch.cuda.synchronize()
@@ -338,9 +334,7 @@ def measure(lens, d, ratio, coff, warmup, iters, seed=1234):
 
     # eager backward per-call: forward (builds grad graph) outside timing, backward timed.
     def _fwd_for_bwd():
-        kvl = kv.clone().requires_grad_(True)
-        scl = score.clone().requires_grad_(True)
-        apl = ape.clone().requires_grad_(True)
+        kvl, scl, apl = _make_leaves(kv, score, ape)
         o = eager_forward(kvl, scl, apl, cu, cuc, total_comp, ratio, d, coff)
         return kvl, scl, apl, o
 
@@ -381,14 +375,19 @@ def _fmt(ms):
     return f"{ms * 1000:7.1f}"
 
 
+def _make_leaves(kv, score, ape):
+    """Fresh grad-enabled leaf clones of the three inputs (one construction site)."""
+    return kv.clone().requires_grad_(True), score.clone().requires_grad_(True), ape.clone().requires_grad_(True)
+
+
 def _x(num, den):
     """Speedup helper (callers pass displayed 1-decimal values)."""
-    return num / den
+    return float("inf") if den == 0 else num / den
 
 
 def _xtrunc1(num, den):
     """Speedup from displayed 1-decimal values, truncated to 1 decimal (never rounded up)."""
-    return math.floor((num / den) * 10) / 10
+    return float("inf") if den == 0 else math.floor((num / den) * 10) / 10
 
 
 def main():
@@ -421,7 +420,7 @@ def main():
     h1 = f"{'shape':>14} | {'eager_fwd':>9} {'fused_fwd':>9} | {'eager_bwd':>9} {'fused_bwd':>9}"
     print(h1)
     print("-" * len(h1))
-    for tag, d, r in rows:
+    for tag, _, r in rows:
         print(f"{tag:>14} | {_fmt(r['eager_fwd'])} {_fmt(r['fused_fwd'])} | " f"{_fmt(r['eager_bwd'])} {_fmt(r['fused_bwd'])}")
 
     # ---- graph table (fwd-graph and total-graph, directly measured; no bwd-graph) ----
@@ -429,7 +428,7 @@ def main():
     h2 = f"{'shape':>14} | {'e_fgraph':>9} {'f_fgraph':>9} {'fwd':>6} | " f"{'e_tgraph':>9} {'f_tgraph':>9} {'total':>6}"
     print(h2)
     print("-" * len(h2))
-    for tag, d, r in rows:
+    for tag, _, r in rows:
         efg = round(r["eager_fwd_graph"] * 1000, 1)
         ffg = round(r["fused_fwd_graph"] * 1000, 1)
         etg = round(r["eager_total_graph"] * 1000, 1)
@@ -442,7 +441,7 @@ def main():
 
     # ---- speedup summary (eager / fused), per-call and graph, from displayed values ----
     print("\n# speedup (eager / fused), from displayed values:")
-    for tag, d, r in rows:
+    for tag, _, r in rows:
         ef = round(r["eager_fwd"] * 1000, 1)
         ff = round(r["fused_fwd"] * 1000, 1)
         eb = round(r["eager_bwd"] * 1000, 1)
@@ -451,11 +450,11 @@ def main():
         ffg = round(r["fused_fwd_graph"] * 1000, 1)
         etg = round(r["eager_total_graph"] * 1000, 1)
         ftg = round(r["fused_total_graph"] * 1000, 1)
-        print(f"  {tag:>14}: fwd {ef / ff:5.2f}x (fwd-graph {_x(efg, ffg):5.2f}x) | " f"bwd {eb / fb:5.2f}x | total-graph {_x(etg, ftg):5.2f}x")
+        print(f"  {tag:>14}: fwd {_x(ef, ff):5.2f}x (fwd-graph {_x(efg, ffg):5.2f}x) | " f"bwd {_x(eb, fb):5.2f}x | total-graph {_x(etg, ftg):5.2f}x")
 
     # ---- eager graph-vs-fresh-backward numerics cross-check ----
     print("\n# eager total-graph vs fresh non-graph backward (numerical consistency):")
-    for tag, d, r in rows:
+    for tag, _, r in rows:
         c = r["check"]
         flag = "PASS" if c["allclose"] else "FAIL"
         print(
