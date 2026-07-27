@@ -788,6 +788,25 @@ class FlashAttentionDSABackwardSm100:
 
         max_seqlen_q, max_seqlen_kv, head_dim, (num_heads, batch_size) = problem_shape
 
+        if cutlass.const_expr(mTopkLength is not None):
+            topk = mTopkLength[token_idx]
+        else:
+            topk = mTopkIdxs.shape[0]
+
+        # topk is CTA-uniform (one value per query token). Handle an empty
+        # sparse row before initializing any async pipeline or allocating
+        # TMEM: the row contributes nothing to dKV and its dQ tile is zero.
+        # Treat malformed negative lengths as empty as well so they cannot
+        # enter the same zero-tile pipeline path.
+        if topk <= 0:
+            for linear_idx in cutlass.range(tidx, self.head_dim * self.block_tile, self.threads_per_cta):
+                head_offset = linear_idx // self.head_dim
+                dim_idx = linear_idx % self.head_dim
+                head_idx = head_block_idx * self.block_tile + head_offset
+                if head_idx < num_heads:
+                    mdQ[dim_idx, head_idx, (token_idx, batch_idx)] = mdQ.element_type(0.0)
+            cute.arch.nvvm.exit()
+
         if warp_idx == self.load_warp_id:
             cpasync.prefetch_descriptor(tma_atom_Q)
             cpasync.prefetch_descriptor(tma_atom_dO)
@@ -880,11 +899,6 @@ class FlashAttentionDSABackwardSm100:
             sdQ4 = cute.make_tensor(sdQ4_ptr, dQ4_smem_layout_staged.outer)
 
         pipeline.pipeline_init_wait()
-
-        if cutlass.const_expr(mTopkLength is not None):
-            topk = mTopkLength[token_idx]
-        else:
-            topk = mTopkIdxs.shape[0]
 
         tile_count = cute.ceil_div(topk, self.block_tile)
 
