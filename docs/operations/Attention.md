@@ -16,9 +16,9 @@ cudnn SDPA operation requires SM80 (Ampere) or newer architectures and cuda tool
 The support matrix is based on the latest cudnn backend version 9.18.1
 
 
-| Arch <br> | Datatype  <br>  | Layout  <br>                      | Paged  <br>  Attn| Masking     | Deterministic | Head dim |  
-|-----------|-------------|-------------------------------|----------|-------------------------------------------| ------------- | ---- | 
-| Ampere/Ada <br> (Prefill) |  fp16, bf16 | BHSD, BSHD, Interleaved¹, <br> Padded², Ragged³ | Yes | Yes⁴ | Yes | d <= 256 | 
+| Arch <br> | Datatype  <br>  | Layout  <br>                      | Paged  <br>  Attn| Masking     | Deterministic | Head dim |
+|-----------|-------------|-------------------------------|----------|-------------------------------------------| ------------- | ---- |
+| Ampere/Ada <br> (Prefill) |  fp16, bf16 | BHSD, BSHD, Interleaved¹, <br> Padded², Ragged³ | Yes | Yes⁴ | Yes | d <= 256 |
 | Ampere/Ada <br> (Decode)  |  fp16, bf16 | BHSD, BSHD, Interleaved, <br> Padded, Ragged | Yes | Yes | Yes | d <= 128  |
 | Ampere/Ada <br> (Bprop)   |  fp16, bf16 | BHSD, BSHD, Interleaved, <br> Padded, Ragged | NA | Yes | Yes | d <= 128 |
 ||
@@ -41,9 +41,9 @@ The support matrix is based on the latest cudnn backend version 9.18.1
 ² Padded, variable length sequences (requires padding mask). When sequences in a batch have different lengths, use `use_padding_mask=True` with sequence length tensors.
 
 &nbsp;&nbsp; *Setup:* <br>
-    &nbsp;&nbsp; - Set `use_padding_mask=True`  
-    &nbsp;&nbsp; -  Provide `seq_len_q` tensor of shape `(B, 1, 1, 1)` with actual query sequence lengths  
-    &nbsp;&nbsp; -  Provide `seq_len_kv` tensor of shape `(B, 1, 1, 1)` with actual key/value sequence lengths  
+    &nbsp;&nbsp; - Set `use_padding_mask=True`
+    &nbsp;&nbsp; -  Provide `seq_len_q` tensor of shape `(B, 1, 1, 1)` with actual query sequence lengths
+    &nbsp;&nbsp; -  Provide `seq_len_kv` tensor of shape `(B, 1, 1, 1)` with actual key/value sequence lengths
 
 &nbsp;&nbsp; *Example:*<br>
 &nbsp;&nbsp; Batch with sequences "aa" (length 2) and "bbb" (length 3), max length `S=8`:
@@ -91,7 +91,7 @@ The support matrix is based on the latest cudnn backend version 9.18.1
   - **Ragged offset:** $[0, 2 \times H \times D, 5 \times H \times D] = [0, 128, 320]$
 
   &nbsp;&nbsp;&nbsp;&nbsp; *Partially Packed Layout:*<br>
-  
+
   &nbsp;&nbsp;&nbsp;&nbsp; Tokens within each batch can be contiguous without being globally packed.<br>
 
   - Ragged offset: $[0, 4 \times H \times D, 7 \times H \times D] = [0, 256, 448]$
@@ -107,7 +107,7 @@ The support matrix is based on the latest cudnn backend version 9.18.1
       ```
       Q = a0abbb00bb000000  (tokens interleaved - NOT SUPPORTED)
       ```
-&nbsp;&nbsp; **Note that Q,K,V and their gradients can be individually ragged or not.**<br> 
+&nbsp;&nbsp; **Note that Q,K,V and their gradients can be individually ragged or not.**<br>
 
 &nbsp;&nbsp; **Backward Pass with THD:**
 
@@ -139,7 +139,7 @@ The support matrix is based on the latest cudnn backend version 9.18.1
 To run the sdpa benchmarks, refer to [benchmarks/sdpa](https://github.com/NVIDIA/cudnn-frontend/blob/main/benchmark/sdpa_benchmark_training/README.md) folder. Current results:
 
 ### GB200 - Llama 3.1 Causal (top_left)
-![Llama 3.1 Causal on GB200](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/benchmark/sdpa_benchmark_training/results/llama3.1/gb200/llama3.1_top_left.png) 
+![Llama 3.1 Causal on GB200](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/benchmark/sdpa_benchmark_training/results/llama3.1/gb200/llama3.1_top_left.png)
 - SDPA parameters: `batch=1; num_q_heads=64; num_kv_heads=8; head_dim=128; is_causal=True`
 - Sequence lengths shown on x-axis
 - Results obtained on NVIDIA GB200 GPU
@@ -176,13 +176,13 @@ To run the sdpa benchmarks, refer to [benchmarks/sdpa](https://github.com/NVIDIA
 
 ## API
 (scaled-dot-product-attention-fp16bf16-forward)=
-### SDPA FP16/BF16 Forward 
+### SDPA FP16/BF16 Forward
 
 #### C++ API
 
 ```cpp
 // returns [output, softmax_stats]
-std::array<std::shared_ptr<Tensor_attributes>, 2> 
+std::array<std::shared_ptr<Tensor_attributes>, 2>
 sdpa(std::shared_ptr<Tensor_attributes> q,
      std::shared_ptr<Tensor_attributes> k,
      std::shared_ptr<Tensor_attributes> v,
@@ -712,7 +712,10 @@ The experimental [HSTU Attention API](../fe-oss-apis/attention/hstu.md)
 provides packed-variable-length forward and backward CuTe DSL kernels for
 Blackwell. HSTU applies SiLU to scaled QK scores without softmax, supports its
 specialized mask modes, and exposes the sequence normalization factor
-separately as `scaling_seqlen`.
+separately as `scaling_seqlen`. FP16 and BF16 arbitrary-mask forward and
+backward automatically build private block metadata on the active CUDA stream
+without adding public API parameters; D256 backward builds both Q-to-K and
+K-to-Q views from one coarse classification.
 
 (sdpa-forward-fe-oss-sm100-d256)=
 ### SDPA Forward FE OSS API (SM100, D=256)

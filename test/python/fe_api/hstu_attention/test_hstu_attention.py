@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import inspect
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -22,7 +24,6 @@ from cudnn.hstu_attention import (
     hstu_attention_forward,
 )
 from cudnn.hstu_attention import _interface
-
 
 pytestmark = [
     pytest.mark.gpu_exclusive,
@@ -118,6 +119,174 @@ def test_top_level_exports():
     assert cudnn.hstu_attention_backward is hstu_attention_backward
 
 
+def _assert_public_signature(callable_obj, names, defaults) -> None:
+    parameters = inspect.signature(callable_obj).parameters
+    assert tuple(parameters) == tuple(names)
+    for name, parameter in parameters.items():
+        assert parameter.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+        assert parameter.default == defaults.get(name, inspect.Parameter.empty)
+
+
+@pytest.mark.L0
+def test_public_functional_and_class_signatures_are_stable():
+    common_defaults = {
+        "window_size": (-1, -1),
+        "alpha": 1.0,
+        "scaling_seqlen": None,
+    }
+    _assert_public_signature(
+        hstu_attention_forward,
+        (
+            "q_tensor",
+            "k_tensor",
+            "v_tensor",
+            "cu_seqlens_q_tensor",
+            "cu_seqlens_k_tensor",
+            "max_seqlen_q",
+            "max_seqlen_k",
+            "window_size",
+            "alpha",
+            "scaling_seqlen",
+            "func_tensor",
+            "paged_kv_tensor",
+            "page_ids_tensor",
+            "page_indptrs_tensor",
+            "stream",
+        ),
+        {
+            **common_defaults,
+            "func_tensor": None,
+            "paged_kv_tensor": None,
+            "page_ids_tensor": None,
+            "page_indptrs_tensor": None,
+            "stream": None,
+        },
+    )
+    _assert_public_signature(
+        hstu_attention_backward,
+        (
+            "do_tensor",
+            "q_tensor",
+            "k_tensor",
+            "v_tensor",
+            "cu_seqlens_q_tensor",
+            "cu_seqlens_k_tensor",
+            "max_seqlen_q",
+            "max_seqlen_k",
+            "window_size",
+            "alpha",
+            "scaling_seqlen",
+            "func_tensor",
+            "deterministic",
+            "stream",
+        ),
+        {
+            **common_defaults,
+            "func_tensor": None,
+            "deterministic": False,
+            "stream": None,
+        },
+    )
+    _assert_public_signature(
+        HSTUFwdSm100,
+        (
+            "sample_q",
+            "sample_k",
+            "sample_v",
+            "sample_o",
+            "sample_cu_seqlens_q",
+            "sample_cu_seqlens_k",
+            "max_seqlen_q",
+            "max_seqlen_k",
+            "window_size",
+            "alpha",
+            "scaling_seqlen",
+            "sample_func",
+            "sample_paged_kv",
+            "sample_page_ids",
+            "sample_page_indptrs",
+        ),
+        {
+            **common_defaults,
+            "sample_func": None,
+            "sample_paged_kv": None,
+            "sample_page_ids": None,
+            "sample_page_indptrs": None,
+        },
+    )
+    _assert_public_signature(
+        HSTUBwdSm100,
+        (
+            "sample_do",
+            "sample_q",
+            "sample_k",
+            "sample_v",
+            "sample_dq",
+            "sample_dk",
+            "sample_dv",
+            "sample_cu_seqlens_q",
+            "sample_cu_seqlens_k",
+            "max_seqlen_q",
+            "max_seqlen_k",
+            "window_size",
+            "alpha",
+            "scaling_seqlen",
+            "sample_func",
+            "deterministic",
+        ),
+        {
+            **common_defaults,
+            "sample_func": None,
+            "deterministic": False,
+        },
+    )
+    _assert_public_signature(
+        HSTUFwdSm100.execute,
+        (
+            "self",
+            "q_tensor",
+            "k_tensor",
+            "v_tensor",
+            "o_tensor",
+            "cu_seqlens_q_tensor",
+            "cu_seqlens_k_tensor",
+            "func_tensor",
+            "paged_kv_tensor",
+            "page_ids_tensor",
+            "page_indptrs_tensor",
+            "current_stream",
+        ),
+        {
+            "func_tensor": None,
+            "paged_kv_tensor": None,
+            "page_ids_tensor": None,
+            "page_indptrs_tensor": None,
+            "current_stream": None,
+        },
+    )
+    _assert_public_signature(
+        HSTUBwdSm100.execute,
+        (
+            "self",
+            "do_tensor",
+            "q_tensor",
+            "k_tensor",
+            "v_tensor",
+            "dq_tensor",
+            "dk_tensor",
+            "dv_tensor",
+            "cu_seqlens_q_tensor",
+            "cu_seqlens_k_tensor",
+            "func_tensor",
+            "current_stream",
+        ),
+        {
+            "func_tensor": None,
+            "current_stream": None,
+        },
+    )
+
+
 @pytest.mark.L0
 @pytest.mark.skipif(not _HAS_CUDA, reason="requires CUDA")
 def test_support_validation_and_scaling_default(monkeypatch):
@@ -169,9 +338,7 @@ def test_support_rejects_unsupported_combinations(monkeypatch):
     with pytest.raises(ValueError, match="scaling_seqlen"):
         _forward_api(q, k, v, cu, scaling_seqlen=0).check_support()
 
-    even_func = torch.empty(
-        (1, 2, q.shape[0] + 256), dtype=torch.int32, device=q.device
-    )
+    even_func = torch.empty((1, 2, q.shape[0] + 256), dtype=torch.int32, device=q.device)
     with pytest.raises(ValueError, match="positive and odd"):
         HSTUFwdSm100(
             sample_q=q,
@@ -186,34 +353,33 @@ def test_support_rejects_unsupported_combinations(monkeypatch):
         ).check_support()
 
     odd_func = torch.empty((1, 1, q.shape[0] + 256), dtype=torch.int32, device=q.device)
-    with pytest.raises(ValueError, match="max_seqlen_k <= 65536"):
-        HSTUFwdSm100(
-            sample_q=q,
-            sample_k=k,
-            sample_v=v,
-            sample_o=torch.empty_like(q),
-            sample_cu_seqlens_q=cu,
-            sample_cu_seqlens_k=cu,
-            max_seqlen_q=128,
-            max_seqlen_k=65537,
-            sample_func=odd_func,
-        ).check_support()
+    q_fp16, k_fp16, v_fp16, do_fp16, cu_fp16 = _inputs(dtype=torch.float16)
+    assert HSTUFwdSm100(
+        sample_q=q_fp16,
+        sample_k=k_fp16,
+        sample_v=v_fp16,
+        sample_o=torch.empty_like(q_fp16),
+        sample_cu_seqlens_q=cu_fp16,
+        sample_cu_seqlens_k=cu_fp16,
+        max_seqlen_q=128,
+        max_seqlen_k=65537,
+        sample_func=odd_func,
+    ).check_support()
 
-    with pytest.raises(ValueError, match="max_seqlen_q <= 32768"):
-        HSTUBwdSm100(
-            sample_do=do,
-            sample_q=q,
-            sample_k=k,
-            sample_v=v,
-            sample_dq=torch.empty_like(q),
-            sample_dk=torch.empty_like(k),
-            sample_dv=torch.empty_like(v),
-            sample_cu_seqlens_q=cu,
-            sample_cu_seqlens_k=cu,
-            max_seqlen_q=32769,
-            max_seqlen_k=32769,
-            sample_func=odd_func,
-        ).check_support()
+    assert HSTUBwdSm100(
+        sample_do=do_fp16,
+        sample_q=q_fp16,
+        sample_k=k_fp16,
+        sample_v=v_fp16,
+        sample_dq=torch.empty_like(q_fp16),
+        sample_dk=torch.empty_like(k_fp16),
+        sample_dv=torch.empty_like(v_fp16),
+        sample_cu_seqlens_q=cu_fp16,
+        sample_cu_seqlens_k=cu_fp16,
+        max_seqlen_q=32769,
+        max_seqlen_k=32769,
+        sample_func=odd_func,
+    ).check_support()
 
     with pytest.raises(ValueError, match="o_tensor storage must not overlap"):
         HSTUFwdSm100(
@@ -308,9 +474,7 @@ def test_rejects_unsafe_storage_metadata(monkeypatch):
             window_size=(-1, 0),
             sample_paged_kv=noncontiguous_paged_kv,
             sample_page_ids=torch.tensor([0], dtype=torch.int32, device=q.device),
-            sample_page_indptrs=torch.tensor(
-                [0, 1], dtype=torch.int32, device=q.device
-            ),
+            sample_page_indptrs=torch.tensor([0, 1], dtype=torch.int32, device=q.device),
         ).check_support()
 
     with pytest.raises(ValueError, match="num_pages > 0"):
@@ -330,9 +494,7 @@ def test_rejects_unsafe_storage_metadata(monkeypatch):
                 device=q.device,
             ),
             sample_page_ids=torch.tensor([0], dtype=torch.int32, device=q.device),
-            sample_page_indptrs=torch.tensor(
-                [0, 1], dtype=torch.int32, device=q.device
-            ),
+            sample_page_indptrs=torch.tensor([0, 1], dtype=torch.int32, device=q.device),
         ).check_support()
 
     qkv = torch.randn(
@@ -395,9 +557,7 @@ def test_explicit_api_rejects_runtime_stride_change():
             cu,
         )
 
-    misaligned_q = torch.empty(q.numel() + 1, dtype=q.dtype, device=q.device)[
-        1:
-    ].view_as(q)
+    misaligned_q = torch.empty(q.numel() + 1, dtype=q.dtype, device=q.device)[1:].view_as(q)
     with pytest.raises(ValueError, match="16-byte aligned"):
         api.execute(
             misaligned_q,
@@ -417,7 +577,7 @@ def test_forward_matches_pytorch(dtype, head_dim):
     q, k, v, _, cu = _inputs(dtype=dtype, head_dim=head_dim)
     alpha = 0.7
     scaling_seqlen = 64.0
-    actual = hstu_attention_forward(
+    result = hstu_attention_forward(
         q,
         k,
         v,
@@ -428,7 +588,9 @@ def test_forward_matches_pytorch(dtype, head_dim):
         window_size=(-1, 0),
         alpha=alpha,
         scaling_seqlen=scaling_seqlen,
-    )["o_tensor"]
+    )
+    assert tuple(result.keys()) == ("o_tensor",)
+    actual = result["o_tensor"]
     expected = _reference_forward(
         q,
         k,
@@ -488,6 +650,7 @@ def test_backward_matches_pytorch(dtype, head_dim):
         alpha=alpha,
         scaling_seqlen=scaling_seqlen,
     )
+    assert tuple(actual.keys()) == ("dq_tensor", "dk_tensor", "dv_tensor")
     for name, expected_grad in zip(("dq_tensor", "dk_tensor", "dv_tensor"), expected):
         torch.testing.assert_close(
             actual[name].float(),
@@ -651,12 +814,8 @@ def test_varlen_tail_and_asymmetric_lengths_match_pytorch(head_dim):
     )
     v = torch.randn_like(k) * 0.2
     do = torch.randn_like(q) * 0.2
-    cu_q = torch.tensor(
-        [0, q_lengths[0], sum(q_lengths)], dtype=torch.int32, device="cuda"
-    )
-    cu_k = torch.tensor(
-        [0, k_lengths[0], sum(k_lengths)], dtype=torch.int32, device="cuda"
-    )
+    cu_q = torch.tensor([0, q_lengths[0], sum(q_lengths)], dtype=torch.int32, device="cuda")
+    cu_k = torch.tensor([0, k_lengths[0], sum(k_lengths)], dtype=torch.int32, device="cuda")
     alpha = 0.7
     scaling_seqlen = 96.0
 
@@ -715,18 +874,14 @@ def test_varlen_tail_and_asymmetric_lengths_match_pytorch(head_dim):
         alpha=alpha,
         scaling_seqlen=scaling_seqlen,
     )
-    for name, expected_grad in zip(
-        ("dq_tensor", "dk_tensor", "dv_tensor"), expected_grads
-    ):
-        torch.testing.assert_close(
-            actual_grads[name].float(), expected_grad, rtol=8e-2, atol=8e-2
-        )
+    for name, expected_grad in zip(("dq_tensor", "dk_tensor", "dv_tensor"), expected_grads):
+        torch.testing.assert_close(actual_grads[name].float(), expected_grad, rtol=8e-2, atol=8e-2)
 
 
 @pytest.mark.L0
 @pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
 @pytest.mark.parametrize("mask_mode", ["full", "local", "arbitrary"])
-@pytest.mark.parametrize("head_dim", [64, 256])
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
 def test_mask_modes_match_pytorch(mask_mode, head_dim):
     q, k, v, do, cu = _inputs(heads=1, head_dim=head_dim)
     seqlen = q.shape[0]
@@ -754,9 +909,7 @@ def test_mask_modes_match_pytorch(mask_mode, head_dim):
         func[0, 0, :seqlen] = masked_start
         func[0, 1, :seqlen] = masked_end
         func[0, 2, :seqlen] = valid_upper
-        mask = (col < masked_start[:, None]) | (
-            (col >= masked_end[:, None]) & (col < valid_upper[:, None])
-        )
+        mask = (col < masked_start[:, None]) | ((col >= masked_end[:, None]) & (col < valid_upper[:, None]))
 
     q_ref = q.float().detach().requires_grad_(True)
     k_ref = k.float().detach().requires_grad_(True)
@@ -803,9 +956,7 @@ def test_mask_modes_match_pytorch(mask_mode, head_dim):
         scaling_seqlen=scaling_seqlen,
         func_tensor=func,
     )
-    for name, expected_grad in zip(
-        ("dq_tensor", "dk_tensor", "dv_tensor"), expected_grads
-    ):
+    for name, expected_grad in zip(("dq_tensor", "dk_tensor", "dv_tensor"), expected_grads):
         torch.testing.assert_close(
             actual_grads[name].float(),
             expected_grad,
@@ -873,14 +1024,10 @@ def test_d256_full_tile_arbitrary_mask_is_not_skipped():
         func_tensor=func,
     )
 
-    for name, expected_grad in zip(
-        ("dq_tensor", "dk_tensor", "dv_tensor"), expected
-    ):
+    for name, expected_grad in zip(("dq_tensor", "dk_tensor", "dv_tensor"), expected):
         max_error = (actual[name].float() - expected_grad).abs().max()
         relative_error = max_error / (expected_grad.abs().max() + 1.0e-12)
-        assert relative_error < 3.0e-2, (
-            f"{name} relative max error is {relative_error.item():.4e}"
-        )
+        assert relative_error < 3.0e-2, f"{name} relative max error is {relative_error.item():.4e}"
 
 
 @pytest.mark.L0
@@ -928,9 +1075,7 @@ def test_paged_kv_forward_matches_pytorch(head_dim):
         F.silu(scores),
         torch.zeros_like(scores),
     )
-    expected = (
-        torch.einsum("hqk,khd->qhd", weights, expected_v.float()) / scaling_seqlen
-    )
+    expected = torch.einsum("hqk,khd->qhd", weights, expected_v.float()) / scaling_seqlen
     torch.testing.assert_close(out.float(), expected, rtol=4e-2, atol=4e-2)
 
 
@@ -1038,12 +1183,8 @@ def test_runtime_alpha_and_scaling_are_not_compile_time_constants(head_dim):
             alpha=alpha,
             scaling_seqlen=scaling_seqlen,
         )
-        for name, expected_grad in zip(
-            ("dq_tensor", "dk_tensor", "dv_tensor"), expected_grads
-        ):
-            torch.testing.assert_close(
-                actual_grads[name].float(), expected_grad, rtol=8e-2, atol=8e-2
-            )
+        for name, expected_grad in zip(("dq_tensor", "dk_tensor", "dv_tensor"), expected_grads):
+            torch.testing.assert_close(actual_grads[name].float(), expected_grad, rtol=8e-2, atol=8e-2)
         assert len(bwd_compile_cache) == 1
 
 

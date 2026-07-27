@@ -481,11 +481,30 @@ def shuffle_sync(
 
 @dsl_user_op
 def shr_u32(val: cutlass.Uint32, shift: cutlass.Uint32, *, loc=None, ip=None) -> cutlass.Uint32:
+    """Unsigned right shift with PTX's defined zero result for shifts >= 32."""
+
     return cutlass.Uint32(
         llvm.inline_asm(
             T.i32(),
             [cutlass.Uint32(val).ir_value(loc=loc, ip=ip), cutlass.Uint32(shift).ir_value(loc=loc, ip=ip)],
-            "shr.s32 $0, $1, $2;",
+            "shr.u32 $0, $1, $2;",
+            "=r,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def shl_b32(val: cutlass.Uint32, shift: cutlass.Uint32, *, loc=None, ip=None) -> cutlass.Uint32:
+    """32-bit left shift with PTX's defined zero result for shifts >= 32."""
+
+    return cutlass.Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [cutlass.Uint32(val).ir_value(loc=loc, ip=ip), cutlass.Uint32(shift).ir_value(loc=loc, ip=ip)],
+            "shl.b32 $0, $1, $2;",
             "=r,r,r",
             has_side_effects=False,
             is_align_stack=False,

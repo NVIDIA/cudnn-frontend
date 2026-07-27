@@ -27,6 +27,11 @@ from .utils import (
     sub_packed_f32x2,
     tanhf,
 )
+from .block_sparsity import (
+    HSTUBlockSparseTensors,
+    get_q2k_block_for_iteration,
+    get_q2k_block_sparse_consumer_row,
+)
 
 
 class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
@@ -42,6 +47,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         skip_residual_mask: bool = False,
         is_arbitrary: bool = False,
         func_num: int = 0,
+        use_auto_block_metadata: bool = False,
     ):
         self.acc_dtype = acc_dtype
         self.is_causal = is_causal
@@ -57,8 +63,10 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         self.skip_residual_mask = skip_residual_mask
         self.is_arbitrary = is_arbitrary
         self.func_num = func_num
+        self.use_auto_block_metadata = use_auto_block_metadata
         assert not self.is_arbitrary or not (self.is_causal or self.is_local or self.is_target)
         assert not self.is_arbitrary or (self.func_num > 0 and self.func_num % 2 == 1)
+        assert not self.use_auto_block_metadata or self.is_arbitrary
         assert not self.is_target or self.is_causal
         assert not self.is_target or self.target_group_size > 0
         assert mma_tiler[0] == 128 and mma_tiler[1] == 128, "Only 128x128 tile impl is supported"
@@ -157,6 +165,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         max_seqlen_k: Int32,
         scale_softmax: cutlass.Float32,
         scale_gradient: cutlass.Float32,
+        block_sparse_tensors: Optional[HSTUBlockSparseTensors],
         stream: cuda.CUstream,
     ):
         varlen = cum_seqlen_q is not None or cum_seqlen_k is not None
@@ -231,6 +240,9 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         self.v_dtype = v.element_type
         self.do_dtype = do.element_type
         self.dq_dtype = dq.element_type
+        if cutlass.const_expr(self.use_auto_block_metadata):
+            assert isinstance(block_sparse_tensors, HSTUBlockSparseTensors)
+            assert self.q_dtype in (cutlass.Float16, cutlass.BFloat16)
 
         self.tile_sched_params, grid = compute_grid(
             (s_q, dq.shape[1], dq.shape[2]) if cum_seqlen_q is not None else dq.shape,
@@ -442,6 +454,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
             cum_seqlen_k,
             num_targets,
             func,
+            block_sparse_tensors,
             scale_softmax,
             scale_gradient,
             self.window_size_left,
@@ -484,6 +497,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         cum_seqlen_k: Optional[cute.Tensor],
         num_targets: Optional[cute.Tensor],
         func: Optional[cute.Tensor],
+        block_sparse_tensors: Optional[HSTUBlockSparseTensors],
         scale_softmax: Float32,
         scale_gradient: Float32,
         window_size_left: Optional[Int32],
@@ -717,6 +731,12 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                 seqlen_k = mK_kdl.shape[0]
                 cuseqlen_q = Int32(0)
                 cuseqlen_k = Int32(0)
+                seqlen_kv_loop_start = Int32(0)
+                seqlen_kv_loop_steps = Int32(0)
+                mask_block_cnt = None
+                mask_block_idx = None
+                full_block_cnt = None
+                full_block_idx = None
                 block_offset = (
                     Int32(0),
                     Int32(0),
@@ -741,7 +761,35 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                         mma_block_coord[0],
                         seqlen_q,
                     )
-                if not continue_cond:
+                if cutlass.const_expr(self.use_auto_block_metadata):
+                    assert isinstance(block_sparse_tensors, HSTUBlockSparseTensors)
+                    (
+                        seqlen_kv_loop_steps,
+                        mask_block_cnt,
+                        mask_block_idx,
+                        full_block_cnt,
+                        full_block_idx,
+                    ) = get_q2k_block_sparse_consumer_row(
+                        block_sparse_tensors,
+                        batch_coord,
+                        mma_block_coord[0],
+                    )
+                elif not continue_cond:
+                    (
+                        seqlen_kv_loop_start,
+                        seqlen_kv_loop_steps,
+                    ) = FusedMask.get_trip_start_count_via_block_info(
+                        mma_block_coord,
+                        self.qk_mma_tiler,
+                        seqlen_q,
+                        seqlen_k,
+                        self.is_causal,
+                        self.is_local,
+                        window_size_left,
+                        window_size_right,
+                    )
+                has_work = not continue_cond and seqlen_kv_loop_steps > 0
+                if has_work:
                     mQ_qdl_ = cute.domain_offset(cute.select(block_offset, mode=[0, 2, 3]), mQ_qdl)
                     mK_kdl_ = cute.domain_offset(cute.select(block_offset, mode=[1, 2, 3]), mK_kdl)
                     mdO_qdl_ = cute.domain_offset(cute.select(block_offset, mode=[0, 2, 3]), mdO_qdl)
@@ -812,16 +860,6 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                     # ((atom_v, rest_v), RestN, RestK)
                     tKTgKT = tKgK_dkl[None, None, None, mma_block_coord[2]]
 
-                    seqlen_kv_loop_start, seqlen_kv_loop_steps = FusedMask.get_trip_start_count_via_block_info(
-                        mma_block_coord,
-                        self.qk_mma_tiler,
-                        seqlen_q,
-                        seqlen_k,
-                        self.is_causal,
-                        self.is_local,
-                        window_size_left,
-                        window_size_right,
-                    )
                     # Q
                     for iter in cutlass.range(self.iterations_qk, unroll=1):
                         q_handle = load_q_producer.acquire_and_advance()
@@ -841,8 +879,16 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                             tma_bar_ptr=do_handle.barrier,
                         )
 
-                    kv_coord = seqlen_kv_loop_start
                     for i in cutlass.range(0, seqlen_kv_loop_steps, 1, unroll=1):
+                        kv_coord = seqlen_kv_loop_start + i
+                        if cutlass.const_expr(self.use_auto_block_metadata):
+                            kv_coord, _ = get_q2k_block_for_iteration(
+                                mask_block_cnt,
+                                mask_block_idx,
+                                full_block_cnt,
+                                full_block_idx,
+                                i,
+                            )
                         # Ki
                         for iter in cutlass.range(self.iterations_qk, unroll=1):
                             k_handle = load_k_producer.acquire_and_advance()
@@ -870,8 +916,6 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                                 tKTsKT[None, kt_handle.index],
                                 tma_bar_ptr=kt_handle.barrier,
                             )
-                        kv_coord += 1
-
                 work_tile = tile_sched.advance_to_next_work()
                 # End of static tile scheduler loop
             load_k_producer.tail()
@@ -896,6 +940,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                 continue_cond = False
                 seqlen_q = mQ_qdl.shape[0]
                 seqlen_k = mK_kdl.shape[0]
+                seqlen_kv_loop_start = Int32(0)
+                seqlen_kv_loop_steps = Int32(0)
                 batch_coord = curr_block_coord[2][1]
                 if cutlass.const_expr(cum_seqlen_q is not None):
                     cuseqlen_q = cum_seqlen_q[batch_coord]
@@ -911,17 +957,30 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                         cuseqlen_k = cum_seqlen_k[batch_coord]
                         seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
 
-                    seqlen_kv_loop_start, seqlen_kv_loop_steps = FusedMask.get_trip_start_count_via_block_info(
-                        mma_block_coord,
-                        self.qk_mma_tiler,
-                        seqlen_q,
-                        seqlen_k,
-                        self.is_causal,
-                        self.is_local,
-                        window_size_left,
-                        window_size_right,
-                    )
+                    if cutlass.const_expr(self.use_auto_block_metadata):
+                        assert isinstance(block_sparse_tensors, HSTUBlockSparseTensors)
+                        seqlen_kv_loop_steps = get_q2k_block_sparse_consumer_row(
+                            block_sparse_tensors,
+                            batch_coord,
+                            mma_block_coord[0],
+                        )[0]
+                    else:
+                        (
+                            seqlen_kv_loop_start,
+                            seqlen_kv_loop_steps,
+                        ) = FusedMask.get_trip_start_count_via_block_info(
+                            mma_block_coord,
+                            self.qk_mma_tiler,
+                            seqlen_q,
+                            seqlen_k,
+                            self.is_causal,
+                            self.is_local,
+                            window_size_left,
+                            window_size_right,
+                        )
 
+                has_work = not continue_cond and seqlen_kv_loop_steps > 0
+                if has_work:
                     cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
                     is_leader_cta = cta_rank_in_cluster % 2 == 0
                     # dq_handle = mma_dq_producer.acquire_and_advance()
@@ -1487,6 +1546,13 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                 seqlen_q = mQ_qdl.shape[0]
                 seqlen_k = mK_kdl.shape[0]
                 cuseqlen_q = Int32(0)
+                start_count = Int32(0)
+                trip_count = Int32(0)
+                mask_block_cnt = None
+                mask_block_idx = None
+                full_block_cnt = None
+                full_block_idx = None
+                num_targets_cur_batch = Int32(0)
                 if cutlass.const_expr(cum_seqlen_q is not None):
                     cuseqlen_q = cum_seqlen_q[batch_coord]
                     seqlen_q = cum_seqlen_q[batch_coord + 1] - cuseqlen_q
@@ -1500,11 +1566,24 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                         cuseqlen_k = cum_seqlen_k[batch_coord]
                         seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
 
-                    num_targets_cur_batch = Int32(0)
                     if cutlass.const_expr(self.is_target):
                         assert isinstance(num_targets, cute.Tensor)
                         num_targets_cur_batch = num_targets[batch_coord]
 
+                if cutlass.const_expr(self.use_auto_block_metadata):
+                    assert isinstance(block_sparse_tensors, HSTUBlockSparseTensors)
+                    (
+                        trip_count,
+                        mask_block_cnt,
+                        mask_block_idx,
+                        full_block_cnt,
+                        full_block_idx,
+                    ) = get_q2k_block_sparse_consumer_row(
+                        block_sparse_tensors,
+                        batch_coord,
+                        mma_block_coord[0],
+                    )
+                elif not continue_cond:
                     start_count, trip_count = FusedMask.get_trip_start_count_via_block_info(
                         mma_block_coord,
                         self.qk_mma_tiler,
@@ -1515,6 +1594,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                         window_size_left,
                         window_size_right,
                     )
+                has_work = not continue_cond and trip_count > 0
+                if has_work:
                     end_count = start_count + trip_count
                     if cutlass.const_expr(self.use_semantic_trip_range):
                         n_block_min_causal_local_mask, n_block_min_before_local_mask = FusedMask.get_trip_mask_bounds_via_block_info(
@@ -1532,7 +1613,17 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                     cS = cute.domain_offset((mma_block_coord[0] * self.qk_mma_tiler[0], 0), cS_base)
                     cdP_base = cute.make_identity_tensor((self.dov_mma_tiler[0], self.dov_mma_tiler[1]))
                     cdP = cute.domain_offset((mma_block_coord[0] * self.dov_mma_tiler[0], 0), cdP_base)
-                    for step in cutlass.range(start_count, end_count, 1, unroll=1):
+                    for iteration in cutlass.range(0, trip_count, 1, unroll=1):
+                        step = start_count + iteration
+                        is_mask_block = False
+                        if cutlass.const_expr(self.use_auto_block_metadata):
+                            step, is_mask_block = get_q2k_block_for_iteration(
+                                mask_block_cnt,
+                                mask_block_idx,
+                                full_block_cnt,
+                                full_block_idx,
+                                iteration,
+                            )
                         cS_iter = cute.domain_offset((0, step * self.qk_mma_tiler[1]), cS)
                         tScS_iter = qk_thr_mma.partition_C(cS_iter)
 
@@ -1540,31 +1631,50 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
 
                         tdPcdP_iter = dov_thr_mma.partition_C(cdP_iter)
 
-                        # Si, dPi -> dSi
-                        if cutlass.const_expr(self.is_arbitrary):
-                            need_apply_mask = True
-                        elif cutlass.const_expr(self.use_semantic_trip_range):
-                            need_apply_mask = step >= n_block_min_causal_local_mask or step < n_block_min_before_local_mask
-                        else:
+                        mask_args = (window_size_left, window_size_right)
+                        value_args = (
+                            seqlen_q,
+                            seqlen_k,
+                            cuseqlen_q,
+                            scale_softmax,
+                            scale_gradient,
+                            num_targets_cur_batch,
+                        )
+                        tensor_args = (tStS, tScS_iter, tdPtdP, tdPcdP_iter, func)
+                        pipeline_args = (
+                            mma_s_consumer,
+                            mma_dp_consumer,
+                            ds_mma_producer,
+                        )
+
+                        # Si, dPi -> dSi.  Separate compile-time call sites keep
+                        # FULL interior free of predicate fragments and func
+                        # loads, while FULL tails retain only the seqlen guard.
+                        mask_kind = Int32(0)
+                        if cutlass.const_expr(self.use_auto_block_metadata):
                             residual_q = (mma_block_coord[0] + 1) * self.qk_mma_tiler[0] > seqlen_q
                             residual_k = (step + 1) * self.qk_mma_tiler[1] > seqlen_k
-                            need_apply_mask = residual_q or residual_k
+                            if is_mask_block:
+                                mask_kind = Int32(2)
+                            elif residual_q or residual_k:
+                                mask_kind = Int32(1)
+                        else:
+                            if cutlass.const_expr(self.is_arbitrary):
+                                need_apply_mask = True
+                            elif cutlass.const_expr(self.use_semantic_trip_range):
+                                need_apply_mask = step >= n_block_min_causal_local_mask or step < n_block_min_before_local_mask
+                            else:
+                                residual_q = (mma_block_coord[0] + 1) * self.qk_mma_tiler[0] > seqlen_q
+                                residual_k = (step + 1) * self.qk_mma_tiler[1] > seqlen_k
+                                need_apply_mask = residual_q or residual_k
+                            if need_apply_mask:
+                                mask_kind = Int32(2)
                         mma_s_consumer, mma_dp_consumer, ds_mma_producer = self.compute_step(
-                            (need_apply_mask, window_size_left, window_size_right),
-                            (
-                                seqlen_q,
-                                seqlen_k,
-                                cuseqlen_q,
-                                scale_softmax,
-                                scale_gradient,
-                                num_targets_cur_batch,
-                            ),
-                            (tStS, tScS_iter, tdPtdP, tdPcdP_iter, func),
-                            (
-                                mma_s_consumer,
-                                mma_dp_consumer,
-                                ds_mma_producer,
-                            ),
+                            mask_args,
+                            value_args,
+                            tensor_args,
+                            pipeline_args,
+                            mask_kind,
                         )
                 work_tile = tile_sched.advance_to_next_work()
             ds_mma_producer.tail()
@@ -1588,6 +1698,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                 seqlen_k = mK_kdl.shape[0]
                 continue_cond = False
                 cuseqlen_q = Int32(0)
+                trip_count = Int32(0)
                 if cutlass.const_expr(cum_seqlen_q is not None):
                     cuseqlen_q = cum_seqlen_q[batch_coord]
                     seqlen_q = cum_seqlen_q[batch_coord + 1] - cuseqlen_q
@@ -1601,6 +1712,25 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                     if cutlass.const_expr(cum_seqlen_k is not None):
                         cuseqlen_k = cum_seqlen_k[batch_coord]
                         seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
+
+                    if cutlass.const_expr(self.use_auto_block_metadata):
+                        assert isinstance(block_sparse_tensors, HSTUBlockSparseTensors)
+                        trip_count = get_q2k_block_sparse_consumer_row(
+                            block_sparse_tensors,
+                            batch_coord,
+                            mma_block_coord[0],
+                        )[0]
+                    else:
+                        _, trip_count = FusedMask.get_trip_start_count_via_block_info(
+                            mma_block_coord,
+                            self.qk_mma_tiler,
+                            seqlen_q,
+                            seqlen_k,
+                            self.is_causal,
+                            self.is_local,
+                            window_size_left,
+                            window_size_right,
+                        )
 
                     mdQ_qdl_eff = mdQ_qdl
                     if cutlass.const_expr(cum_seqlen_q is not None):
@@ -1622,12 +1752,23 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                     gdQ_staged = gdQ_qdl[None, None, curr_block_coord[0], None, curr_block_coord[2]]
                     cdQ_staged = cdQ_qdl[None, None, curr_block_coord[0], None, curr_block_coord[2]]
 
-                    # dQ TMEM to GMEM
-                    mma_dq_consumer = self.dQ_epilogue(
-                        (seqlen_q, cuseqlen_q, mQ_qdl.shape[0], batch_coord),
-                        (mma_dq_consumer, gdQ_staged, cdQ_staged, tdQtdQ_staged),
-                        self.epi_tile,
-                    )
+                    if trip_count > 0:
+                        # dQ TMEM to GMEM
+                        mma_dq_consumer = self.dQ_epilogue(
+                            (seqlen_q, cuseqlen_q, mQ_qdl.shape[0], batch_coord),
+                            (mma_dq_consumer, gdQ_staged, cdQ_staged, tdQtdQ_staged),
+                            self.epi_tile,
+                        )
+                    else:
+                        # This physical Q128 CTA owns the output tile.  The
+                        # sparse row has neither MASK nor FULL blocks, so no
+                        # dQ pipeline handoff exists and the owner writes zero
+                        # directly to global memory.
+                        self.dQ_epilogue_write_zero(
+                            seqlen_q,
+                            (gdQ_staged, cdQ_staged, tdQtdQ_staged),
+                            self.epi_tile,
+                        )
                 work_tile = tile_sched.advance_to_next_work()
             # TMEM is released after every warp in this CTA leaves the work loop.
 
@@ -1646,10 +1787,178 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
             barrier_id=self.cta_sync_bar_id,
             number_of_threads=self.threads_per_cta,
         )
+        # Empty metadata rows intentionally have no dQ pipeline handoff.  A
+        # cluster rendezvous keeps the paired CTAs in the same TMEM lifetime
+        # epoch before the two-CTA allocator performs its deallocation.
+        cute.arch.cluster_arrive()
+        cute.arch.cluster_wait()
         tmem.relinquish_alloc_permit()
         tmem.free(tmem_ptr)
 
         return
+
+    @cute.jit
+    def is_auto_score_valid(
+        self,
+        index_qk: cute.Coord,
+        seqlen_q: Int32,
+        seqlen_k: Int32,
+        query_offset: Int32,
+        apply_func: cutlass.Constexpr[bool],
+        func: cute.Tensor,
+    ) -> cutlass.Boolean:
+        """Validate a tail/MASK score with compile-time func elimination."""
+
+        index_q, index_k = index_qk
+        valid = index_q < seqlen_q and index_k < seqlen_k
+        if cutlass.const_expr(apply_func):
+            if valid:
+                func_row = query_offset + index_q
+                value_valid = index_k < func[0, 0, func_row]
+                for interval_idx in cutlass.range(self.func_num // 2, unroll_full=True):
+                    interval_start = func[0, 2 * interval_idx + 1, func_row]
+                    interval_end = func[0, 2 * interval_idx + 2, func_row]
+                    value_valid = value_valid | (
+                        (index_k >= interval_start) & (index_k < interval_end)
+                    )
+                valid = valid and value_valid
+        return valid
+
+    @cute.jit
+    def apply_auto_silu_derivative(
+        self,
+        scores: cute.Tensor,
+        score_coords: cute.Tensor,
+        seqlen_q: Int32,
+        seqlen_k: Int32,
+        query_offset: Int32,
+        scale_softmax: Float32,
+        func: cute.Tensor,
+        mask_kind: cutlass.Constexpr[int],
+    ) -> None:
+        """Apply an unmasked, seqlen-only, or exact SiLU derivative."""
+
+        endpoint_cache = None
+        q_in_bounds = cutlass.Boolean(False)
+        if cutlass.const_expr(mask_kind == 2 and self.func_num <= 7):
+            # The D256 dQ TMEM load maps one thread to one Q row and all 128
+            # K columns.  Prefetch that row's endpoints once instead of
+            # reloading them for every score element.  Larger odd func counts
+            # retain the scalar exact path to avoid an unbounded GPR cache.
+            endpoint_cache = cute.make_rmem_tensor(
+                (self.func_num,),
+                cutlass.Int32,
+            )
+            for endpoint in cutlass.range_constexpr(
+                self.func_num,
+                unroll_full=True,
+            ):
+                endpoint_cache[endpoint] = Int32(0)
+            index_q, _ = score_coords[0]
+            q_in_bounds = index_q < seqlen_q
+            if q_in_bounds:
+                func_row = query_offset + index_q
+                for endpoint in cutlass.range_constexpr(
+                    self.func_num,
+                    unroll_full=True,
+                ):
+                    endpoint_cache[endpoint] = func[0, endpoint, func_row]
+
+        for k in cutlass.range(0, cute.size(scores), 2, unroll_full=True):
+            x0, x1 = mul_packed_f32x2(
+                (scores[k], scores[k + 1]),
+                (scale_softmax, scale_softmax),
+            )
+            tanh0 = tanhf(x0 * 0.5)
+            tanh1 = tanhf(x1 * 0.5)
+            sigmoid0, sigmoid1 = fma_packed_f32x2(
+                (0.5, 0.5),
+                (tanh0, tanh1),
+                (0.5, 0.5),
+            )
+            if cutlass.const_expr(mask_kind != 0):
+                if cutlass.const_expr(mask_kind == 2):
+                    if cutlass.const_expr(self.func_num <= 7):
+                        assert isinstance(endpoint_cache, cute.Tensor)
+                        _, index_k0 = score_coords[k]
+                        _, index_k1 = score_coords[k + 1]
+                        valid0 = q_in_bounds and index_k0 < seqlen_k
+                        valid1 = q_in_bounds and index_k1 < seqlen_k
+                        if valid0:
+                            value_valid0 = index_k0 < endpoint_cache[0]
+                            for interval_idx in cutlass.range_constexpr(
+                                self.func_num // 2,
+                                unroll_full=True,
+                            ):
+                                interval_start = endpoint_cache[2 * interval_idx + 1]
+                                interval_end = endpoint_cache[2 * interval_idx + 2]
+                                value_valid0 = value_valid0 | (
+                                    (index_k0 >= interval_start)
+                                    & (index_k0 < interval_end)
+                                )
+                            valid0 = valid0 and value_valid0
+                        if valid1:
+                            value_valid1 = index_k1 < endpoint_cache[0]
+                            for interval_idx in cutlass.range_constexpr(
+                                self.func_num // 2,
+                                unroll_full=True,
+                            ):
+                                interval_start = endpoint_cache[2 * interval_idx + 1]
+                                interval_end = endpoint_cache[2 * interval_idx + 2]
+                                value_valid1 = value_valid1 | (
+                                    (index_k1 >= interval_start)
+                                    & (index_k1 < interval_end)
+                                )
+                            valid1 = valid1 and value_valid1
+                    else:
+                        valid0 = self.is_auto_score_valid(
+                            score_coords[k],
+                            seqlen_q,
+                            seqlen_k,
+                            query_offset,
+                            True,
+                            func,
+                        )
+                        valid1 = self.is_auto_score_valid(
+                            score_coords[k + 1],
+                            seqlen_q,
+                            seqlen_k,
+                            query_offset,
+                            True,
+                            func,
+                        )
+                else:
+                    valid0 = self.is_auto_score_valid(
+                        score_coords[k],
+                        seqlen_q,
+                        seqlen_k,
+                        query_offset,
+                        False,
+                        func,
+                    )
+                    valid1 = self.is_auto_score_valid(
+                        score_coords[k + 1],
+                        seqlen_q,
+                        seqlen_k,
+                        query_offset,
+                        False,
+                        func,
+                    )
+                sigmoid0 = sigmoid0 if valid0 else self.acc_dtype(0)
+                sigmoid1 = sigmoid1 if valid1 else self.acc_dtype(0)
+            one_minus0, one_minus1 = sub_packed_f32x2(
+                (1.0, 1.0),
+                (sigmoid0, sigmoid1),
+            )
+            inner0, inner1 = fma_packed_f32x2(
+                (x0, x1),
+                (one_minus0, one_minus1),
+                (1.0, 1.0),
+            )
+            scores[k], scores[k + 1] = mul_packed_f32x2(
+                (sigmoid0, sigmoid1),
+                (inner0, inner1),
+            )
 
     @cute.jit
     def compute_step(
@@ -1658,8 +1967,9 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         value_args: Tuple,
         tensor_args: Tuple,
         pipeline_args: Tuple,
+        mask_kind: Int32,
     ) -> Tuple[Float32, Float32, pipeline.PipelineConsumer, pipeline.PipelineProducer]:
-        need_apply_mask, window_size_left, window_size_right = mask_args
+        window_size_left, window_size_right = mask_args
         (
             seqlen_q,
             seqlen_k,
@@ -1685,11 +1995,12 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         cute.copy(tmem_tiled_load, tTMEM_LOADtS, tTMEM_LOADrS)
         cute.arch.fence_view_async_tmem_load()
         s_handle.release()
-        if cutlass.const_expr(not self.skip_residual_mask):
+        score_predicates = None
+        if cutlass.const_expr(not self.use_auto_block_metadata and not self.skip_residual_mask):
             score_predicates = cute.make_rmem_tensor(tTMEM_LOADrS.shape, cutlass.Boolean)
             for k in cutlass.range(cute.size(score_predicates), unroll_full=True):
                 score_predicates[k] = True
-            if need_apply_mask:
+            if mask_kind != 0:
                 FusedMask.apply_mask_via_causal_local(
                     score_predicates,
                     tTMEM_LOADcS,
@@ -1708,23 +2019,74 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                     func,
                     cuseqlen_q,
                 )
+        if cutlass.const_expr(self.use_auto_block_metadata):
+            assert isinstance(func, cute.Tensor)
 
         # HSTU uses P=silu(alpha*S), not softmax. Keep the SiLU derivative in
         # the score fragment so it can be multiplied with dP below.
-        for k in cutlass.range(0, cute.size(tTMEM_LOADrS), 2, unroll_full=True):
-            x0, x1 = mul_packed_f32x2(
-                (tTMEM_LOADrS[k], tTMEM_LOADrS[k + 1]),
-                (scale_softmax, scale_softmax),
-            )
-            tanh0 = tanhf(x0 * 0.5)
-            tanh1 = tanhf(x1 * 0.5)
-            sigmoid0, sigmoid1 = fma_packed_f32x2((0.5, 0.5), (tanh0, tanh1), (0.5, 0.5))
-            if cutlass.const_expr(not self.skip_residual_mask):
-                sigmoid0 = sigmoid0 if score_predicates[k] else self.acc_dtype(0)
-                sigmoid1 = sigmoid1 if score_predicates[k + 1] else self.acc_dtype(0)
-            one_minus0, one_minus1 = sub_packed_f32x2((1.0, 1.0), (sigmoid0, sigmoid1))
-            inner0, inner1 = fma_packed_f32x2((x0, x1), (one_minus0, one_minus1), (1.0, 1.0))
-            tTMEM_LOADrS[k], tTMEM_LOADrS[k + 1] = mul_packed_f32x2((sigmoid0, sigmoid1), (inner0, inner1))
+        if cutlass.const_expr(self.use_auto_block_metadata):
+            if mask_kind == 2:
+                self.apply_auto_silu_derivative(
+                    tTMEM_LOADrS,
+                    tTMEM_LOADcS,
+                    seqlen_q,
+                    seqlen_k,
+                    cuseqlen_q,
+                    scale_softmax,
+                    func,
+                    2,
+                )
+            elif mask_kind == 1:
+                self.apply_auto_silu_derivative(
+                    tTMEM_LOADrS,
+                    tTMEM_LOADcS,
+                    seqlen_q,
+                    seqlen_k,
+                    cuseqlen_q,
+                    scale_softmax,
+                    func,
+                    1,
+                )
+            else:
+                self.apply_auto_silu_derivative(
+                    tTMEM_LOADrS,
+                    tTMEM_LOADcS,
+                    seqlen_q,
+                    seqlen_k,
+                    cuseqlen_q,
+                    scale_softmax,
+                    func,
+                    0,
+                )
+        else:
+            for k in cutlass.range(0, cute.size(tTMEM_LOADrS), 2, unroll_full=True):
+                x0, x1 = mul_packed_f32x2(
+                    (tTMEM_LOADrS[k], tTMEM_LOADrS[k + 1]),
+                    (scale_softmax, scale_softmax),
+                )
+                tanh0 = tanhf(x0 * 0.5)
+                tanh1 = tanhf(x1 * 0.5)
+                sigmoid0, sigmoid1 = fma_packed_f32x2(
+                    (0.5, 0.5),
+                    (tanh0, tanh1),
+                    (0.5, 0.5),
+                )
+                if cutlass.const_expr(score_predicates is not None):
+                    sigmoid0 = sigmoid0 if score_predicates[k] else self.acc_dtype(0)
+                    sigmoid1 = sigmoid1 if score_predicates[k + 1] else self.acc_dtype(0)
+                one_minus0, one_minus1 = sub_packed_f32x2(
+                    (1.0, 1.0),
+                    (sigmoid0, sigmoid1),
+                )
+                inner0, inner1 = fma_packed_f32x2(
+                    (x0, x1),
+                    (one_minus0, one_minus1),
+                    (1.0, 1.0),
+                )
+                tTMEM_LOADrS[k], tTMEM_LOADrS[k + 1] = mul_packed_f32x2(
+                    (sigmoid0, sigmoid1),
+                    (inner0, inner1),
+                )
 
         dp_handle = mma_dp_consumer.wait_and_advance()
         tdPtdP_slice = tdPtdP[(None, None), 0, 0, dp_handle.index]
@@ -1812,3 +2174,36 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                     cute.autovec_copy(tSMrdQ, tTMEM_LOADgdQ_i)
         dq_handle.release()
         return mma_dq_consumer
+
+    @cute.jit
+    def dQ_epilogue_write_zero(
+        self,
+        seqlen_q: Int32,
+        dq_args: Tuple,
+        epi_tile: cute.Tile,
+    ) -> None:
+        """Write zeros for an EMPTY Q-owner tile without touching dQ phases."""
+        gdQ_staged, cdQ_staged, tdQtdQ_staged = dq_args
+
+        for iter in cutlass.range(self.iterations_dsk):
+            gdQ = gdQ_staged[None, None, iter]
+            cdQ = cdQ_staged[None, None, iter]
+            tdQtdQ = tdQtdQ_staged[(None, None), 0, 0, iter]
+            tdQtdQ_epi = cute.zipped_divide(tdQtdQ, epi_tile)
+            cdQ_epi = cute.zipped_divide(cdQ, epi_tile)
+            gdQ_epi = cute.zipped_divide(gdQ, epi_tile)
+            tidx, _, _ = cute.arch.thread_idx()
+            thread_idx = tidx % (self.threads_per_warp * len(self.epilogue_warp_ids))
+            tmem_copy_atom = cute.make_copy_atom(tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), self.acc_dtype)
+            tiled_tmem_load = tcgen05.make_tmem_copy(tmem_copy_atom, tdQtdQ_epi)
+            thr_tmem_load = tiled_tmem_load.get_slice(thread_idx)
+            tTMEM_LOADgdQ = thr_tmem_load.partition_D(gdQ_epi)
+            tTMEM_LOADcdQ = thr_tmem_load.partition_D(cdQ_epi)
+
+            for i in cutlass.range(cute.size(tTMEM_LOADgdQ, mode=[1]), unroll_full=True):
+                tTMEM_LOADgdQ_i = tTMEM_LOADgdQ[None, i, 0]
+                tTMEM_LOADcdQ_i = tTMEM_LOADcdQ[None, i, 0]
+                zero_dq = cute.make_rmem_tensor(tTMEM_LOADcdQ_i.shape, self.q_dtype)
+                zero_dq.fill(0)
+                if cute.elem_less(tTMEM_LOADcdQ_i[0][0], seqlen_q):
+                    cute.autovec_copy(zero_dq, tTMEM_LOADgdQ_i)

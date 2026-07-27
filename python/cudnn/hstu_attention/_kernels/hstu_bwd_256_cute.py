@@ -28,6 +28,8 @@ from .hstu_bwd_256_cute_dkdv import (
 from .hstu_bwd_256_cute_dq import (
     BlackwellFusedMultiHeadAttentionBackwardDQKernel,
 )
+from .block_sparse_builder import build_hstu_d256_bwd_block_sparse
+from .block_sparsity import HSTUBlockSparseTensors
 
 
 def _as_bshkrd_tensor(
@@ -85,6 +87,7 @@ class HSTUAttentionBackwardSm100D256:
         window_size_left: Optional[int],
         window_size_right: Optional[int],
         skip_residual_mask: bool,
+        use_auto_block_metadata: bool = False,
     ):
         self.is_causal = is_causal
         self.is_local = is_local
@@ -101,6 +104,7 @@ class HSTUAttentionBackwardSm100D256:
             skip_residual_mask=skip_residual_mask,
             is_arbitrary=is_arbitrary,
             func_num=func_num,
+            use_auto_block_metadata=use_auto_block_metadata,
         )
         self.dkdv_kernel = BlackwellFusedMultiHeadAttentionBackwardDKDVKernel(
             cutlass.Float32,
@@ -113,6 +117,7 @@ class HSTUAttentionBackwardSm100D256:
             skip_residual_mask=skip_residual_mask,
             is_arbitrary=is_arbitrary,
             func_num=func_num,
+            use_auto_block_metadata=use_auto_block_metadata,
         )
 
     @cute.jit
@@ -133,6 +138,8 @@ class HSTUAttentionBackwardSm100D256:
         max_seqlen_k: Int32,
         alpha: cutlass.Float32,
         normalization_scale: cutlass.Float32,
+        q2k_block_sparse_tensors: Optional[HSTUBlockSparseTensors],
+        k2q_block_sparse_tensors: Optional[HSTUBlockSparseTensors],
         stream: cuda.CUstream,
     ):
         varlen = True
@@ -172,6 +179,7 @@ class HSTUAttentionBackwardSm100D256:
             max_seqlen_k,
             alpha,
             alpha * normalization_scale,
+            q2k_block_sparse_tensors,
             stream,
         )
         self.dkdv_kernel(
@@ -189,6 +197,7 @@ class HSTUAttentionBackwardSm100D256:
             max_seqlen_k,
             alpha,
             normalization_scale,
+            k2q_block_sparse_tensors,
             stream,
         )
 
@@ -201,6 +210,20 @@ def _dynamic_optional_tensor(
     tensor: Optional[torch.Tensor],
 ) -> Optional[cute.Tensor]:
     return None if tensor is None else _dynamic_tensor(tensor, tensor.ndim - 1)
+
+
+def _dynamic_block_sparse_tensors(
+    tensors,
+) -> Optional[HSTUBlockSparseTensors]:
+    if tensors is None:
+        return None
+    return HSTUBlockSparseTensors(*(_dynamic_tensor(tensor, tensor.ndim - 1) for tensor in tensors[:6]))
+
+
+def _runtime_block_sparse_tensors(tensors):
+    if tensors is None:
+        return None
+    return tuple(tensors[:6])
 
 
 def _copy_to_optional_output(
@@ -299,6 +322,22 @@ def hstu_varlen_bwd_256_cute(
         func_num = func.shape[-2]
         assert func_num > 0 and func_num % 2 == 1
 
+    use_auto_block_metadata = is_arbitrary
+    q2k_block_sparse_tensors = None
+    k2q_block_sparse_tensors = None
+    if use_auto_block_metadata:
+        (
+            q2k_block_sparse_tensors,
+            k2q_block_sparse_tensors,
+        ) = build_hstu_d256_bwd_block_sparse(
+            func,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            compile_only=_compile_only,
+        )
+
     batch_size = cu_seqlens_q.numel() - 1
     # Full tiles may skip predicates only when no semantic mask remains.
     skip_residual_mask = (
@@ -320,6 +359,7 @@ def hstu_varlen_bwd_256_cute(
         window_size_left if is_local else None,
         window_size_right if is_local else None,
         skip_residual_mask,
+        use_auto_block_metadata,
     )
     if _compile_only and compile_key in hstu_varlen_bwd_256_cute.compile_cache:
         return tuple(
@@ -342,6 +382,8 @@ def hstu_varlen_bwd_256_cute(
         dq_tensor, dk_tensor, dv_tensor = [_dynamic_tensor(tensor, tensor.ndim - 1) for tensor in (dq_work, dk_work, dv_work)]
         cu_q_tensor, cu_k_tensor = [_dynamic_tensor(tensor, 0) for tensor in (cu_seqlens_q, cu_seqlens_k)]
         func_tensor = _dynamic_optional_tensor(func)
+        q2k_block_sparse_cute = _dynamic_block_sparse_tensors(q2k_block_sparse_tensors)
+        k2q_block_sparse_cute = _dynamic_block_sparse_tensors(k2q_block_sparse_tensors)
         compile_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         kernel = HSTUAttentionBackwardSm100D256(
             is_causal=is_causal,
@@ -353,6 +395,7 @@ def hstu_varlen_bwd_256_cute(
             window_size_left=window_size_left if is_local else None,
             window_size_right=window_size_right if is_local else None,
             skip_residual_mask=skip_residual_mask,
+            use_auto_block_metadata=use_auto_block_metadata,
         )
         hstu_varlen_bwd_256_cute.compile_cache[compile_key] = cute.compile(
             kernel,
@@ -371,6 +414,8 @@ def hstu_varlen_bwd_256_cute(
             Int32(max_seqlen_k),
             alpha,
             normalization_scale,
+            q2k_block_sparse_cute,
+            k2q_block_sparse_cute,
             compile_stream,
             options="--enable-tvm-ffi",
         )
@@ -395,6 +440,8 @@ def hstu_varlen_bwd_256_cute(
         Int32(max_seqlen_k),
         alpha,
         normalization_scale,
+        _runtime_block_sparse_tensors(q2k_block_sparse_tensors),
+        _runtime_block_sparse_tensors(k2q_block_sparse_tensors),
     )
     return (
         _copy_to_optional_output(dq_work, dq),

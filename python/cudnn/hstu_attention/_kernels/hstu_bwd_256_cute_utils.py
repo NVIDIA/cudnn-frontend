@@ -221,12 +221,14 @@ class HSTUFusedMask:
             if cutlass.const_expr(is_arbitrary):
                 assert isinstance(func, cute.Tensor)
                 func_row = query_offset + index_q
+                value_valid = index_k < func[0, 0, func_row]
                 for interval_idx in cutlass.range(func_num // 2, unroll_full=True):
-                    interval_start = func[0, 2 * interval_idx, func_row]
-                    interval_end = func[0, 2 * interval_idx + 1, func_row]
-                    in_hole = index_k >= interval_start and index_k < interval_end
-                    valid = valid and not in_hole
-                valid = valid and index_k < func[0, func_num - 1, func_row]
+                    interval_start = func[0, 2 * interval_idx + 1, func_row]
+                    interval_end = func[0, 2 * interval_idx + 2, func_row]
+                    value_valid = value_valid | (
+                        (index_k >= interval_start) & (index_k < interval_end)
+                    )
+                valid = valid and value_valid
             elif cutlass.const_expr(apply_semantic_window and (is_causal or is_local)):
                 score_row = index_q + offset
                 right = Int32(0) if window_size_right is None else window_size_right

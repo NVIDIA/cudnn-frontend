@@ -175,14 +175,35 @@ Arbitrary-mask metadata is a specialized kernel contract and cannot be
 combined with causal, local, or paged-KV modes.
 
 `func_tensor` has shape `(1, N, L)` and dtype `torch.int32`, where `N` is
-positive and odd and `L >= T_q + 256`. For every packed query row, its `N`
-entries encode alternating masked interval boundaries followed by the
-valid-key upper bound. The first dimension is currently fixed to one; the 256
-extra columns are kernel padding. Arbitrary-mask forward requires
-`max_seqlen_k <= 65536`, and backward requires `max_seqlen_q <= 32768`, matching
-the kernels' fixed valid-block scratch capacity. The API trusts the
+positive and odd and `L >= T_q + 256`. For every packed query row, endpoints
+`F0, F1, ...` encode the valid-key union
+`[0, F0) ∪ [F1, F2) ∪ [F3, F4) ∪ ...`. Intervals are interpreted
+independently, so they may overlap and their endpoints need not be globally
+ordered; sequence-length bounds still exclude keys outside the current packed
+sequence. The first dimension is currently fixed to one; the 256 extra columns
+are kernel padding.
+
+For native FP16 and BF16 arbitrary-mask forward and backward, the interface
+automatically builds private block metadata from `func_tensor` on every
+execution. Forward uses Q-to-K metadata; fused D64/D128 backward uses K-to-Q
+metadata. The D256 two-kernel backward builds Q-to-K and K-to-Q views together
+from one Q256-by-K128 classification. The device-only builder and attention
+kernels run in order on the caller's current CUDA stream; metadata is not
+exposed through either public API. Empty blocks are skipped, partially valid
+blocks retain the exact token predicate, and fully valid blocks avoid reading
+`func_tensor` (sequence-tail blocks still apply packed-length bounds).
+Rebuilding on every execution means an in-place change to `func_tensor` is
+visible, including during CUDA Graph replay.
+
+Both dtypes use device-built metadata for D64, D128, and D256. The API trusts
 device-resident boundary values and does not validate their ordering or range
 on the host.
+
+When both the mask and full counts of a metadata row are zero, the owning
+attention-kernel tile writes zero directly to its real output rows. D256
+kernels retain the required paired-CTA, cluster, and TMEM lifetime protocol
+around this zero epilogue. No whole-output initialization is required from the
+interface, and the behavior is preserved during CUDA Graph replay.
 
 Forward also has a causal paged-KV path using `paged_kv`, `page_ids`, and
 `page_indptrs`. It requires a page size of 128 and cannot be combined with

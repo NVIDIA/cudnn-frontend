@@ -15,6 +15,11 @@ from cutlass.cute.typing import Float32, Int32, Float16, BFloat16
 
 from ._kernels.hstu_fwd import HSTUAttentionForwardSm100
 from ._kernels.hstu_bwd import HSTUAttentionBackwardSm100
+from ._kernels.block_sparse_builder import (
+    build_hstu_k2q_block_sparse,
+    build_hstu_q2k_block_sparse,
+)
+from ._kernels.block_sparsity import HSTUBlockSparseTensors
 
 
 def _normalize_scaling_seqlen(
@@ -37,9 +42,7 @@ def _mark_dynamic_tensor(
 ):
     if tensor.data_ptr() % 16 != 0:
         raise ValueError("HSTU CuTe tensor storage must be 16-byte aligned")
-    cute_tensor = from_dlpack(
-        tensor.detach(), assumed_align=16, enable_tvm_ffi=True
-    ).mark_layout_dynamic(leading_dim=leading_dim)
+    cute_tensor = from_dlpack(tensor.detach(), assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=leading_dim)
     if compact:
         cute_tensor = cute_tensor.mark_compact_shape_dynamic(
             mode=1,
@@ -53,6 +56,18 @@ def _mark_optional_tensor(tensor: Optional[torch.Tensor]):
     if tensor is None:
         return None
     return _mark_dynamic_tensor(tensor, tensor.ndim - 1)
+
+
+def _mark_block_sparse_tensors(tensors):
+    if tensors is None:
+        return None
+    return HSTUBlockSparseTensors(*(_mark_dynamic_tensor(tensor, tensor.ndim - 1) for tensor in tensors[:6]))
+
+
+def _runtime_block_sparse_tensors(tensors):
+    if tensors is None:
+        return None
+    return tuple(tensors[:6])
 
 
 def _is_head_major_compact(t: torch.Tensor) -> bool:
@@ -89,11 +104,7 @@ def _supports_bwd_original_qkv_layout(t: torch.Tensor) -> bool:
         return False
     if t.data_ptr() % 16 != 0:
         return False
-    dimensions = sorted(
-        (int(stride), int(size))
-        for size, stride in zip(t.shape, t.stride())
-        if size > 1
-    )
+    dimensions = sorted((int(stride), int(size)) for size, stride in zip(t.shape, t.stride()) if size > 1)
     covered_span = 1
     for stride, size in dimensions:
         if stride < covered_span:
@@ -126,9 +137,7 @@ def hstu_varlen_fwd_100(
 ):
     scaling_seqlen = _normalize_scaling_seqlen(scaling_seqlen, max_seqlen_q)
     q_dtype = q.dtype
-    assert (
-        q_dtype == torch.bfloat16 or q_dtype == torch.float16
-    ), "Only support bf16 and fp16"
+    assert q_dtype == torch.bfloat16 or q_dtype == torch.float16, "Only support bf16 and fp16"
     assert k.dtype == q_dtype, "k and q must have the same dtype"
     assert v.dtype == q_dtype, "v and q must have the same dtype"
 
@@ -139,39 +148,20 @@ def hstu_varlen_fwd_100(
 
     kBlockM = 128
     kBlockN = 128
-    window_size_left = (
-        max_seqlen_k
-        if window_size_left < 0 or window_size_left > max_seqlen_k
-        else window_size_left
-    )
-    window_size_right = (
-        max_seqlen_k
-        if window_size_right < 0 or window_size_right > max_seqlen_k
-        else window_size_right
-    )
+    window_size_left = max_seqlen_k if window_size_left < 0 or window_size_left > max_seqlen_k else window_size_left
+    window_size_right = max_seqlen_k if window_size_right < 0 or window_size_right > max_seqlen_k else window_size_right
     is_causal = window_size_left == max_seqlen_k and window_size_right == 0
-    is_local = (
-        window_size_left < max_seqlen_k or window_size_right < max_seqlen_k
-    ) and not is_causal
+    is_local = (window_size_left < max_seqlen_k or window_size_right < max_seqlen_k) and not is_causal
     is_arbitrary = func is not None
+    use_auto_block_metadata = is_arbitrary
     func_num = func.shape[-2] if func is not None else 0
     is_paged = paged_kv is not None
     if is_paged:
-        assert (
-            is_causal
-        ), "Paged KV is True, but causal mask is False, this is not supported."
-        assert not is_local, (
-            "Paged KV is True, but local mask is True, this is not supported."
-        )
-        assert (
-            not is_arbitrary
-        ), "Paged KV is True, but arbitrary mask is True, this is not supported."
-        assert (
-            page_ids is not None and page_indptrs is not None
-        ), "Paged KV is True, but page metadata is missing."
-        assert (
-            paged_kv.dim() == 5 and paged_kv.shape[0] > 0 and paged_kv.shape[2] == 128
-        ), "Only accept a non-empty 5-D paged KV table with page_size=128"
+        assert is_causal, "Paged KV is True, but causal mask is False, this is not supported."
+        assert not is_local, "Paged KV is True, but local mask is True, this is not supported."
+        assert not is_arbitrary, "Paged KV is True, but arbitrary mask is True, this is not supported."
+        assert page_ids is not None and page_indptrs is not None, "Paged KV is True, but page metadata is missing."
+        assert paged_kv.dim() == 5 and paged_kv.shape[0] > 0 and paged_kv.shape[2] == 128, "Only accept a non-empty 5-D paged KV table with page_size=128"
 
     # Keep the public output in the standard contiguous (T, H, D) layout so
     # downstream callers can flatten it with view() without an extra copy.
@@ -179,9 +169,7 @@ def hstu_varlen_fwd_100(
         out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
     else:
         if out.shape != q.shape:
-            raise ValueError(
-                f"out must have shape {tuple(q.shape)}, got {tuple(out.shape)}"
-            )
+            raise ValueError(f"out must have shape {tuple(q.shape)}, got {tuple(out.shape)}")
         if out.dtype != q.dtype or out.device != q.device:
             raise ValueError("out must have the same dtype and device as q")
         if not out.is_contiguous():
@@ -197,7 +185,25 @@ def hstu_varlen_fwd_100(
         is_arbitrary,
         is_paged,
         func_num,
+        use_auto_block_metadata,
     )
+
+    block_sparse_tensors = None
+    if use_auto_block_metadata:
+        q2k_block_size = (
+            kBlockM if head_dim == 256 else 2 * kBlockM,
+            kBlockN,
+        )
+        with torch.cuda.nvtx.range("hstu_q2k_block_sparse_builder"):
+            block_sparse_tensors = build_hstu_q2k_block_sparse(
+                func,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+                block_size=q2k_block_size,
+                compile_only=_compile_only,
+            )
 
     if _compile_only and compile_key in hstu_varlen_fwd_100.compile_cache:
         return out, None
@@ -208,17 +214,10 @@ def hstu_varlen_fwd_100(
     # aligned token/head strides, feed them in their original layout and skip the
     # contiguous copy. Non-aligned execution inputs use a real D2D clone; a
     # compile-only miss only needs matching empty layout samples.
-    needs_contiguous_inputs = not (
-        _supports_bwd_original_qkv_layout(q)
-        and _supports_bwd_original_qkv_layout(k)
-        and _supports_bwd_original_qkv_layout(v)
-    )
+    needs_contiguous_inputs = not (_supports_bwd_original_qkv_layout(q) and _supports_bwd_original_qkv_layout(k) and _supports_bwd_original_qkv_layout(v))
     if needs_contiguous_inputs:
         if _compile_only:
-            q, k, v = [
-                torch.empty(tensor.shape, dtype=tensor.dtype, device=tensor.device)
-                for tensor in (q, k, v)
-            ]
+            q, k, v = [torch.empty(tensor.shape, dtype=tensor.dtype, device=tensor.device) for tensor in (q, k, v)]
         else:
             q = q.clone(memory_format=torch.contiguous_format)
             k = k.clone(memory_format=torch.contiguous_format)
@@ -229,18 +228,11 @@ def hstu_varlen_fwd_100(
         paged_kv_flat = paged_kv.view(-1, paged_kv.shape[-2], paged_kv.shape[-1])
 
     if compile_key not in hstu_varlen_fwd_100.compile_cache:
-        q_tensor, k_tensor, v_tensor, o_tensor = [
-            _mark_dynamic_tensor(tensor, tensor.ndim - 1) for tensor in (q, k, v, out)
-        ]
-        cu_seqlens_q_tensor, cu_seqlens_k_tensor = [
-            _mark_dynamic_tensor(tensor, tensor.ndim - 1)
-            for tensor in (cu_seqlens_q, cu_seqlens_k)
-        ]
+        q_tensor, k_tensor, v_tensor, o_tensor = [_mark_dynamic_tensor(tensor, tensor.ndim - 1) for tensor in (q, k, v, out)]
+        cu_seqlens_q_tensor, cu_seqlens_k_tensor = [_mark_dynamic_tensor(tensor, tensor.ndim - 1) for tensor in (cu_seqlens_q, cu_seqlens_k)]
         func_tensor = _mark_optional_tensor(func)
-        paged_kv_tensor, page_ids_tensor, page_indptrs_tensor = [
-            _mark_optional_tensor(tensor)
-            for tensor in (paged_kv_flat, page_ids, page_indptrs)
-        ]
+        paged_kv_tensor, page_ids_tensor, page_indptrs_tensor = [_mark_optional_tensor(tensor) for tensor in (paged_kv_flat, page_ids, page_indptrs)]
+        block_sparse_cute = _mark_block_sparse_tensors(block_sparse_tensors)
         compile_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         hstu_fwd_sm100 = HSTUAttentionForwardSm100(
             head_dim=head_dim,
@@ -251,6 +243,7 @@ def hstu_varlen_fwd_100(
             func_num=func_num,
             kBlockM=kBlockM,
             kBlockN=kBlockN,
+            use_auto_block_metadata=use_auto_block_metadata,
         )
         with torch.cuda.nvtx.range("hstu_varlen_fwd_kernel"):
             hstu_varlen_fwd_100.compile_cache[compile_key] = cute.compile(
@@ -272,6 +265,7 @@ def hstu_varlen_fwd_100(
                 paged_kv_tensor,
                 page_ids_tensor,
                 page_indptrs_tensor,
+                block_sparse_cute,
                 options="--enable-tvm-ffi",
             )
 
@@ -297,6 +291,7 @@ def hstu_varlen_fwd_100(
             paged_kv_flat,
             page_ids,
             page_indptrs,
+            _runtime_block_sparse_tensors(block_sparse_tensors),
         )
 
     return out, None
@@ -331,9 +326,7 @@ def hstu_varlen_bwd_100(
         raise NotImplementedError("deterministic HSTU backward is not supported")
     # asserts
     q_dtype = q.dtype
-    assert (
-        q_dtype == torch.bfloat16 or q_dtype == torch.float16
-    ), "Only support bf16 and fp16"
+    assert q_dtype == torch.bfloat16 or q_dtype == torch.float16, "Only support bf16 and fp16"
     assert k.dtype == q_dtype, "k and q must have the same dtype"
     assert v.dtype == q_dtype, "v and q must have the same dtype"
     assert do.dtype == q_dtype, "do and q must have the same dtype"
@@ -348,29 +341,17 @@ def hstu_varlen_bwd_100(
     num_heads_k = k.shape[1]
 
     assert head_dim in (64, 128, 256), "Only support head_dim 64, 128 and 256"
-    assert (
-        num_heads == num_heads_k
-    ), "Number of heads in key/value and query must be equal"
+    assert num_heads == num_heads_k, "Number of heads in key/value and query must be equal"
     assert k.shape[2] == head_dim, "k and q must have the same head_dim"
     assert v.shape[2] == head_dim, "v and q must have the same head_dim"
     assert do.shape == q.shape, "do and q must have the same shape"
 
     kBlockM = 128
     kBlockN = 128
-    window_size_left = (
-        max_seqlen_k
-        if window_size_left < 0 or window_size_left > max_seqlen_k
-        else window_size_left
-    )
-    window_size_right = (
-        max_seqlen_k
-        if window_size_right < 0 or window_size_right > max_seqlen_k
-        else window_size_right
-    )
+    window_size_left = max_seqlen_k if window_size_left < 0 or window_size_left > max_seqlen_k else window_size_left
+    window_size_right = max_seqlen_k if window_size_right < 0 or window_size_right > max_seqlen_k else window_size_right
     is_causal = window_size_left == max_seqlen_k and window_size_right == 0
-    is_local = (
-        window_size_left < max_seqlen_k or window_size_right < max_seqlen_k
-    ) and not is_causal
+    is_local = (window_size_left < max_seqlen_k or window_size_right < max_seqlen_k) and not is_causal
     is_arbitrary = func is not None
     func_num = func.shape[-2] if func is not None else 0
 
@@ -400,13 +381,25 @@ def hstu_varlen_bwd_100(
             _compile_only=_compile_only,
         )
 
+    use_auto_block_metadata = is_arbitrary
+    block_sparse_tensors = None
+    if use_auto_block_metadata:
+        # Build on every execution so in-place func updates, including CUDA
+        # Graph replay updates, are visible to the consumer.  The private K2Q
+        # layout is fixed by the fused D64/D128 backward tile contract.
+        block_sparse_tensors = build_hstu_k2q_block_sparse(
+            func,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            block_size=(kBlockM, kBlockN),
+            compile_only=_compile_only,
+        )
+
     q_orig, k_orig, v_orig = q, k, v
     dq_orig, dk_orig, dv_orig = dq, dk, dv
-    use_original_qkv_layout = (
-        _supports_bwd_original_qkv_layout(q)
-        and _supports_bwd_original_qkv_layout(k)
-        and _supports_bwd_original_qkv_layout(v)
-    )
+    use_original_qkv_layout = _supports_bwd_original_qkv_layout(q) and _supports_bwd_original_qkv_layout(k) and _supports_bwd_original_qkv_layout(v)
     use_original_do_layout = _supports_bwd_original_qkv_layout(do)
     no_preallocated_grads = dq is None and dk is None and dv is None
     preallocated_original_grads = (
@@ -417,9 +410,7 @@ def hstu_varlen_bwd_100(
         and _supports_bwd_original_qkv_layout(dk)
         and _supports_bwd_original_qkv_layout(dv)
     )
-    use_original_grad_layout = use_original_qkv_layout and (
-        no_preallocated_grads or preallocated_original_grads
-    )
+    use_original_grad_layout = use_original_qkv_layout and (no_preallocated_grads or preallocated_original_grads)
     compile_key = (
         q_orig.device,
         q_dtype,
@@ -433,13 +424,11 @@ def hstu_varlen_bwd_100(
         is_local,
         is_arbitrary,
         func_num,
+        use_auto_block_metadata,
     )
     if _compile_only and compile_key in hstu_varlen_bwd_100.compile_cache:
         if no_preallocated_grads:
-            dq_orig, dk_orig, dv_orig = [
-                torch.empty_like(tensor, memory_format=torch.preserve_format)
-                for tensor in (q_orig, k_orig, v_orig)
-            ]
+            dq_orig, dk_orig, dv_orig = [torch.empty_like(tensor, memory_format=torch.preserve_format) for tensor in (q_orig, k_orig, v_orig)]
         return dq_orig, dk_orig, dv_orig
 
     if use_original_qkv_layout:
@@ -477,10 +466,7 @@ def hstu_varlen_bwd_100(
                 )
                 for tensor in (q_orig, k_orig, v_orig)
             ]
-        dq, dk, dv = [
-            _as_bwd_original_qkv_layout(tensor)
-            for tensor in (dq_orig, dk_orig, dv_orig)
-        ]
+        dq, dk, dv = [_as_bwd_original_qkv_layout(tensor) for tensor in (dq_orig, dk_orig, dv_orig)]
     elif use_original_qkv_layout:
         dq = _empty_bwd_compact_layout_like(q_orig)
         dk = _empty_bwd_compact_layout_like(k_orig)
@@ -527,21 +513,17 @@ def hstu_varlen_bwd_100(
                 tensor,
                 1,
                 compact=True,
-                stride_order=(
-                    (0, 2, 3, 4, 1) if use_original_grad_layout else (2, 3, 0, 4, 1)
-                ),
+                stride_order=((0, 2, 3, 4, 1) if use_original_grad_layout else (2, 3, 0, 4, 1)),
             )
             for tensor in (dq, dk, dv)
         ]
-        cu_seqlens_q_tensor, cu_seqlens_k_tensor = [
-            _mark_dynamic_tensor(tensor, tensor.ndim - 1)
-            for tensor in (cu_seqlens_q, cu_seqlens_k)
-        ]
+        cu_seqlens_q_tensor, cu_seqlens_k_tensor = [_mark_dynamic_tensor(tensor, tensor.ndim - 1) for tensor in (cu_seqlens_q, cu_seqlens_k)]
         func_tensor = _mark_optional_tensor(func)
         workspace = _mark_dynamic_tensor(
             workspace_torch,
             workspace_torch.ndim - 1,
         )
+        block_sparse_cute = _mark_block_sparse_tensors(block_sparse_tensors)
         compile_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         hstu_bwd_sm100 = HSTUAttentionBackwardSm100(
             element_dtype=Float16 if q_dtype == torch.float16 else BFloat16,
@@ -552,6 +534,7 @@ def hstu_varlen_bwd_100(
             is_local=is_local,
             is_arbitrary=is_arbitrary,
             func_num=func_num,
+            use_auto_block_metadata=use_auto_block_metadata,
         )
         with torch.cuda.nvtx.range("hstu_varlen_bwd_kernel"):
             hstu_varlen_bwd_100.compile_cache[compile_key] = cute.compile(
@@ -572,6 +555,7 @@ def hstu_varlen_bwd_100(
                 alpha,
                 scaling_seqlen,
                 workspace,
+                block_sparse_cute,
                 compile_stream,
                 options="--enable-tvm-ffi",
             )
@@ -598,6 +582,7 @@ def hstu_varlen_bwd_100(
             alpha,
             scaling_seqlen,
             workspace_torch,
+            _runtime_block_sparse_tensors(block_sparse_tensors),
         )
 
     if use_original_grad_layout:

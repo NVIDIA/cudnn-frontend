@@ -10,6 +10,7 @@ from cutlass._mlir.dialects import llvm
 
 from .utils import tanhf, mul_packed_f32x2, fma_packed_f32x2, sub_packed_f32x2, add_packed_f32x2
 
+
 @cute.jit
 def clz(x: Int32) -> Int32:
     # for i in cutlass.range_constexpr(32):
@@ -47,9 +48,7 @@ def umulhi(a: Int32, b: Int32, *, loc=None, ip=None) -> Uint32:
 
 
 class FastDivmod:
-    def __init__(
-        self, divisor: Int32, multipler: Uint32, shift_right: Uint32, *, loc=None, ip=None
-    ):
+    def __init__(self, divisor: Int32, multipler: Uint32, shift_right: Uint32, *, loc=None, ip=None):
         self.divisor = divisor
         self.multiplier = multipler
         self.shift_right = shift_right
@@ -69,11 +68,7 @@ class FastDivmod:
 
     @cute.jit
     def div(self, dividend: Int32) -> Int32:
-        return (
-            Int32(umulhi(dividend, self.multiplier) >> self.shift_right)
-            if self.divisor != 1
-            else dividend
-        )
+        return Int32(umulhi(dividend, self.multiplier) >> self.shift_right) if self.divisor != 1 else dividend
 
     def divmod(self, dividend: Int32) -> Tuple[Int32, Int32]:
         quotient = self.div(dividend)
@@ -90,12 +85,11 @@ class FastDivmod:
 
     def __new_from_mlir_values__(self, values):
         obj_list = []
-        for obj, n_items in zip(
-            [self.divisor, self.multiplier, self.shift_right], self._values_pos
-        ):
+        for obj, n_items in zip([self.divisor, self.multiplier, self.shift_right], self._values_pos):
             obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
             values = values[n_items:]
         return FastDivmod(*(tuple(obj_list)), loc=self._loc)
+
 
 class FastSilU:
     def __init__(self, score_scale: Float32, loc=None, ip=None):
@@ -108,8 +102,10 @@ class FastSilU:
         self,
         acc_S: cute.Tensor,
         acc_S_converted: cute.Tensor,
-        preds: cute.Tensor,
+        preds: Optional[cute.Tensor],
+        r2p_masks: Optional[cute.Tensor] = None,
         mask_fn: Optional[Callable] = None,
+        r2p_mask_fn: Optional[Callable] = None,
     ):
         for i in cutlass.range_constexpr(0, cute.size(acc_S), 2):
             v0, v1 = mul_packed_f32x2(
@@ -131,6 +127,13 @@ class FastSilU:
         if const_expr(mask_fn is not None):
             for i in cutlass.range_constexpr(cute.size(acc_S), unroll_full=True):
                 acc_S[i] = acc_S[i] if preds[i] else acc_S.element_type(0)
+        if const_expr(r2p_mask_fn is not None):
+            for chunk in cutlass.range_constexpr(cute.size(r2p_masks), unroll_full=True):
+                keep_mask = r2p_masks[chunk]
+                for bit in cutlass.range_constexpr(32, unroll_full=True):
+                    i = chunk * 32 + bit
+                    in_bound = cutlass.Boolean(keep_mask & (Uint32(1) << bit))
+                    acc_S[i] = acc_S[i] if in_bound else acc_S.element_type(0)
         acc_S_converted.store(acc_S.load().to(acc_S_converted.element_type))
         # if const_expr(mask_fn is not None):
         #     for i in cutlass.range_constexpr(cute.size(acc_S_converted), unroll_full=True):
@@ -141,7 +144,7 @@ class FastSilU:
         self,
         acc_S: cute.Tensor,
         acc_S_silu: cute.Tensor,
-        preds: cute.Tensor,
+        preds: Optional[cute.Tensor],
         score_scale: Float32,
         mask_fn: Optional[Callable] = None,
     ):
@@ -151,8 +154,9 @@ class FastSilU:
             tanh_v0 = tanhf(tanh_in0)
             tanh_v1 = tanhf(tanh_in1)
             sigmoid_v0, sigmoid_v1 = fma_packed_f32x2((0.5, 0.5), (tanh_v0, tanh_v1), (0.5, 0.5))
-            sigmoid_v0 = sigmoid_v0 if preds[i] else acc_S.element_type(0)
-            sigmoid_v1 = sigmoid_v1 if preds[i + 1] else acc_S.element_type(0)
+            if const_expr(mask_fn is not None):
+                sigmoid_v0 = sigmoid_v0 if preds[i] else acc_S.element_type(0)
+                sigmoid_v1 = sigmoid_v1 if preds[i + 1] else acc_S.element_type(0)
             out_v0, out_v1 = mul_packed_f32x2((v0, v1), (sigmoid_v0, sigmoid_v1))
             one_minus_sig0, one_minus_sig1 = sub_packed_f32x2((1.0, 1.0), (sigmoid_v0, sigmoid_v1))
             inner0, inner1 = fma_packed_f32x2((v0, v1), (one_minus_sig0, one_minus_sig1), (1.0, 1.0))

@@ -9,6 +9,8 @@ Constraints:
 * Batch size must be the same for Q, K, and V tensors
 """
 
+from typing import Optional
+
 import cuda.bindings.driver as cuda
 
 import cutlass
@@ -24,6 +26,11 @@ from .hstu_bwd_256_cute_utils import (
     SM100_TMEM_CAPACITY_COLUMNS,
     make_sm100_thread_cooperative_group as make_thread_cooperative_group,
     Sm100FmhaStaticTileSchedulerParams as FmhaStaticTileSchedulerParams,
+)
+from .block_sparsity import (
+    HSTUBlockSparseTensors,
+    get_k2q_block_sparse_consumer_row,
+    get_k2q_q_block_for_subtile_iteration,
 )
 from .utils import (
     fma_packed_f32x2,
@@ -91,6 +98,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         skip_residual_mask: bool = False,
         is_arbitrary: bool = False,
         func_num: int = 0,
+        use_auto_block_metadata: bool = False,
     ):
         """Initialization."""
         self.acc_dtype = acc_dtype
@@ -130,6 +138,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         self.skip_residual_mask = skip_residual_mask
         self.is_arbitrary = is_arbitrary
         self.func_num = func_num
+        self.use_auto_block_metadata = use_auto_block_metadata
+        self.subtile_factor = 2
         assert not self.is_target or self.is_causal
         assert not self.is_target or self.target_group_size > 0
         self.window_size_left: int = -1 if window_size_left is None else window_size_left
@@ -137,6 +147,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         self.has_sliding_window = not self.is_causal and (window_size_left is not None or window_size_right is not None)
         assert not self.is_arbitrary or not (self.is_causal or self.has_sliding_window or self.is_target)
         assert not self.is_arbitrary or (self.func_num > 0 and self.func_num % 2 == 1)
+        assert not self.use_auto_block_metadata or self.is_arbitrary
         if self.is_causal:
             self.window_size_right = 0
 
@@ -196,6 +207,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         max_seqlen_k: Int32,
         scale_softmax: cutlass.Float32,
         normalization_scale: cutlass.Float32,
+        block_sparse_tensors: Optional[HSTUBlockSparseTensors],
         stream: cuda.CUstream,
     ):
         """Host function to launch CuTeDSL kernel."""
@@ -290,6 +302,10 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 ),
             ),
         )
+
+        if cutlass.const_expr(self.use_auto_block_metadata):
+            assert isinstance(block_sparse_tensors, HSTUBlockSparseTensors)
+            assert Q.element_type in (cutlass.Float16, cutlass.BFloat16)
 
         self.Q_major_mode = utils.LayoutEnum.from_tensor(Q).mma_major_mode()
         self.K_major_mode = utils.LayoutEnum.from_tensor(K).mma_major_mode()
@@ -566,6 +582,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             cumulative_s_k,
             num_targets,
             func,
+            block_sparse_tensors,
             self.cluster_layout_vmnk,
             K_smem_layout_staged,
             Q_smem_layout_staged,
@@ -615,6 +632,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         cumulative_s_k: cute.Tensor | None,
         num_targets: cute.Tensor | None,
         func: cute.Tensor | None,
+        block_sparse_tensors: Optional[HSTUBlockSparseTensors],
         cluster_layout_vmnk: cute.Layout,
         K_smem_layout_staged: cute.ComposedLayout,
         Q_smem_layout_staged: cute.ComposedLayout,
@@ -834,12 +852,26 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 ((Int32(0), Int32(0)), Int32(0)),
             )
 
-        iter_start, iter_end = self.get_Q_block_min_max(
-            seqlen_q_cur_batch,
-            seqlen_k_cur_batch,
-            blk_coord[1],
-            is_2cta=True,
-        )
+        m_block_max = cute.ceil_div(seqlen_q_cur_batch, self.tile_shape_Q)
+        if cutlass.const_expr(self.use_auto_block_metadata):
+            assert isinstance(block_sparse_tensors, HSTUBlockSparseTensors)
+            # A metadata row is a K128 cluster work unit.  Both physical K64
+            # CTAs therefore use bidx // 2 and observe the same exact loop
+            # count, avoiding divergent 2-CTA pipeline phases.
+            k_cluster = blk_coord[1] // 2
+            sparse_coarse_count = get_k2q_block_sparse_consumer_row(
+                block_sparse_tensors,
+                bidz,
+                k_cluster,
+            )[0]
+            iter_start = Int32(0)
+            iter_end = sparse_coarse_count * self.subtile_factor
+        else:
+            iter_start, iter_end = self.get_Q_block_min_max(
+                seqlen_q_cur_batch,
+                seqlen_k_cur_batch,
+                blk_coord[1],
+            )
 
         # Cluster wait
         pipeline_init_wait(cluster_shape_mn=cluster_layout_vmnk)
@@ -852,6 +884,9 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             problem_shape[3],
         )
         if iter_count <= 0:
+            # This physical K64 CTA owns its dK/dV output tile.  EMPTY sparse
+            # rows do not advance a producer/consumer phase, but they still
+            # write a defined zero tile before the common CTA/TMEM teardown.
             if bidx * self.tile_shape_K < seqlen_k_cur_batch:
                 self.epilogue_clear(
                     blk_coord,
@@ -895,6 +930,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 iter_count,
                 iter_start,
                 iter_end,
+                m_block_max,
+                block_sparse_tensors,
                 load_mma_Q_producer,
                 load_mma_Q_consumer,
                 load_mma_K_producer,
@@ -974,6 +1011,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 normalization_scale,
                 num_targets,
                 func,
+                block_sparse_tensors,
                 mma_compute_S_producer,
                 mma_compute_S_consumer,
                 compute_mma_P_producer,
@@ -1011,7 +1049,6 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         seq_Q: Int32,
         seq_K: Int32,
         blk_coord_k: Int32,
-        is_2cta: bool,
     ):
         """Get Q tiles range."""
         Q_block_max = cute.ceil_div(seq_Q, self.tile_shape_Q)
@@ -1066,6 +1103,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         iter_count: Int32,
         iter_start: Int32,
         iter_end: Int32,
+        m_block_max: Int32,
+        block_sparse_tensors: Optional[HSTUBlockSparseTensors],
         load_mma_Q_producer,
         load_mma_Q_consumer,
         load_mma_K_producer,
@@ -1086,6 +1125,23 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         iter_index = iter_start
         mma_tile_coord_v = blk_coord_k % cute.size(KQ_tiled_mma.thr_id.shape)
         mma_tile_coord_m = blk_coord_k // cute.size(KQ_tiled_mma.thr_id.shape)
+        mask_block_cnt = None
+        mask_block_idx = None
+        full_block_cnt = None
+        full_block_idx = None
+        if cutlass.const_expr(self.use_auto_block_metadata):
+            assert isinstance(block_sparse_tensors, HSTUBlockSparseTensors)
+            (
+                _,
+                mask_block_cnt,
+                mask_block_idx,
+                full_block_cnt,
+                full_block_idx,
+            ) = get_k2q_block_sparse_consumer_row(
+                block_sparse_tensors,
+                blk_coord_b,
+                mma_tile_coord_m,
+            )
 
         K = cute.domain_offset(cute.select(blk_offset, mode=[1, 2, 3]), K_in)
         V = cute.domain_offset(cute.select(blk_offset, mode=[1, 2, 3]), V_in)
@@ -1168,10 +1224,25 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             tma_bar_ptr=k_handle.barrier,
         )
 
+        m_block_for_load = iter_index
+        if cutlass.const_expr(self.use_auto_block_metadata):
+            m_block_for_load, _ = get_k2q_q_block_for_subtile_iteration(
+                mask_block_cnt,
+                mask_block_idx,
+                full_block_cnt,
+                full_block_idx,
+                iter_index,
+                self.subtile_factor,
+            )
+            # A Q256 tail may have no physical second Q128 subtile.  Duplicate
+            # the last valid load while compute predicates the logical subtile
+            # to zero, avoiding a packed-varlen cross-sequence TMA read.
+            m_block_for_load = min(m_block_for_load, m_block_max - 1)
+
         q_handle = load_mma_Q_producer.acquire_and_advance()
         cute.copy(
             tma_atom_Q,
-            tQgQ_mkl[(None, iter_index, 0, (blk_coord_h, blk_coord_b))],
+            tQgQ_mkl[(None, m_block_for_load, 0, (blk_coord_h, blk_coord_b))],
             tQsQ[None, q_handle.index],
             tma_bar_ptr=q_handle.barrier,
         )
@@ -1187,7 +1258,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         do_handle = load_mma_dO_producer.acquire_and_advance()
         cute.copy(
             tma_atom_dO,
-            tdOgdO_mkl[(None, iter_index, 0, (blk_coord_h, blk_coord_b))],
+            tdOgdO_mkl[(None, m_block_for_load, 0, (blk_coord_h, blk_coord_b))],
             tdOsdO[(None, do_handle.index)],
             tma_bar_ptr=do_handle.barrier,
         )
@@ -1195,7 +1266,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         dot_handle = load_mma_dOT_producer.acquire_and_advance()
         cute.copy(
             tma_atom_dOT,
-            tdOTgdOT_mkl[(None, 0, iter_index, (blk_coord_h, blk_coord_b))],
+            tdOTgdOT_mkl[(None, 0, m_block_for_load, (blk_coord_h, blk_coord_b))],
             tdOTsdOT[None, dot_handle.index],
             tma_bar_ptr=dot_handle.barrier,
         )
@@ -1203,7 +1274,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         qt_handle = load_mma_QT_producer.acquire_and_advance()
         cute.copy(
             tma_atom_QT,
-            tQTgQT_mkl[(None, 0, iter_index, (blk_coord_h, blk_coord_b))],
+            tQTgQT_mkl[(None, 0, m_block_for_load, (blk_coord_h, blk_coord_b))],
             tQTsQT[None, qt_handle.index],
             tma_bar_ptr=qt_handle.barrier,
         )
@@ -1217,10 +1288,22 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 blk_coord_h_r += 1
                 blk_coord_h = (blk_coord_h_r, blk_coord_h_k)
 
+            m_block_for_load = iter_index
+            if cutlass.const_expr(self.use_auto_block_metadata):
+                m_block_for_load, _ = get_k2q_q_block_for_subtile_iteration(
+                    mask_block_cnt,
+                    mask_block_idx,
+                    full_block_cnt,
+                    full_block_idx,
+                    iter_index,
+                    self.subtile_factor,
+                )
+                m_block_for_load = min(m_block_for_load, m_block_max - 1)
+
             q_handle = load_mma_Q_producer.acquire_and_advance()
             cute.copy(
                 tma_atom_Q,
-                tQgQ_mkl[(None, iter_index, 0, (blk_coord_h, blk_coord_b))],
+                tQgQ_mkl[(None, m_block_for_load, 0, (blk_coord_h, blk_coord_b))],
                 tQsQ[None, q_handle.index],
                 tma_bar_ptr=q_handle.barrier,
             )
@@ -1228,7 +1311,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             do_handle = load_mma_dO_producer.acquire_and_advance()
             cute.copy(
                 tma_atom_dO,
-                tdOgdO_mkl[(None, iter_index, 0, (blk_coord_h, blk_coord_b))],
+                tdOgdO_mkl[(None, m_block_for_load, 0, (blk_coord_h, blk_coord_b))],
                 tdOsdO[None, do_handle.index],
                 tma_bar_ptr=do_handle.barrier,
             )
@@ -1236,7 +1319,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             dot_handle = load_mma_dOT_producer.acquire_and_advance()
             cute.copy(
                 tma_atom_dOT,
-                tdOTgdOT_mkl[(None, 0, iter_index, (blk_coord_h, blk_coord_b))],
+                tdOTgdOT_mkl[(None, 0, m_block_for_load, (blk_coord_h, blk_coord_b))],
                 tdOTsdOT[None, dot_handle.index],
                 tma_bar_ptr=dot_handle.barrier,
             )
@@ -1244,7 +1327,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             qt_handle = load_mma_QT_producer.acquire_and_advance()
             cute.copy(
                 tma_atom_QT,
-                tQTgQT_mkl[(None, 0, iter_index, (blk_coord_h, blk_coord_b))],
+                tQTgQT_mkl[(None, 0, m_block_for_load, (blk_coord_h, blk_coord_b))],
                 tQTsQT[None, qt_handle.index],
                 tma_bar_ptr=qt_handle.barrier,
             )
@@ -1648,6 +1731,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         normalization_scale: cutlass.Float32,
         num_targets: cute.Tensor | None,
         func: cute.Tensor | None,
+        block_sparse_tensors: Optional[HSTUBlockSparseTensors],
         mma_compute_S_producer,
         mma_compute_S_consumer,
         compute_mma_P_producer,
@@ -1668,6 +1752,23 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         _, blk_coord_k, _, _ = blk_coord
 
         iter_index = iter_start
+        mask_block_cnt = None
+        mask_block_idx = None
+        full_block_cnt = None
+        full_block_idx = None
+        if cutlass.const_expr(self.use_auto_block_metadata):
+            assert isinstance(block_sparse_tensors, HSTUBlockSparseTensors)
+            (
+                _,
+                mask_block_cnt,
+                mask_block_idx,
+                full_block_cnt,
+                full_block_idx,
+            ) = get_k2q_block_sparse_consumer_row(
+                block_sparse_tensors,
+                blk_coord[3][1],
+                blk_coord_k // 2,
+            )
 
         # adi: TMEM_ST, TMEM_DPT
         tmem_load_op = tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(16))
@@ -1709,6 +1810,18 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             num_targets_cur_batch = num_targets[blk_coord[3][1]]
 
         while iter_count > 0:
+            m_block = iter_index
+            is_mask_block = cutlass.Boolean(False)
+            if cutlass.const_expr(self.use_auto_block_metadata):
+                m_block, is_mask_block = get_k2q_q_block_for_subtile_iteration(
+                    mask_block_cnt,
+                    mask_block_idx,
+                    full_block_cnt,
+                    full_block_idx,
+                    iter_index,
+                    self.subtile_factor,
+                )
+
             s_handle = mma_compute_S_consumer.wait_and_advance()
             p_handle = compute_mma_P_producer.acquire_and_advance()
 
@@ -1730,49 +1843,114 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 leading_causal_masking = leading_causal_masking or need_additional_mask
                 leading_causal_masking = cute.arch.shuffle_sync(leading_causal_masking, 0)
 
-            residual_q = (iter_index + 1) * self.tile_shape_Q > Q
+            residual_q = (m_block + 1) * self.tile_shape_Q > Q
             trailing_residual_masking = residual_q or is_residual_k
             trailing_residual_masking = cute.arch.shuffle_sync(trailing_residual_masking, 0)
 
-            is_masked_tile = (
-                leading_causal_masking
-                or trailing_residual_masking
-                or self.has_sliding_window
-                or cutlass.const_expr(self.is_causal)
-                or cutlass.const_expr(self.is_arbitrary)
-            )
-
             # Compute HSTU P=silu(alpha*S) and retain silu' for dS.
             cute.copy(tiled_t2r, tTR_tST, tTR_rST)
-            if cutlass.const_expr(not self.skip_residual_mask):
-                score_predicates = cute.make_rmem_tensor(tTR_rST.shape, cutlass.Boolean)
-                for i in cutlass.range(cute.size(score_predicates), unroll_full=True):
-                    score_predicates[i] = True
+            tTR_rdSilu = cute.make_rmem_tensor(tTR_rST.shape, self.acc_dtype)
+            if cutlass.const_expr(self.use_auto_block_metadata):
+                # Keep three distinct CuTe call sites.  The FULL-interior path
+                # neither accepts func nor materializes a predicate fragment;
+                # only MASK performs endpoint loads, while FULL-tail uses a
+                # seqlen-only predicate.
+                if is_mask_block:
+                    assert isinstance(func, cute.Tensor)
+                    self.silu_bwd_auto_exact_step(
+                        tTR_rST,
+                        tTR_rdSilu,
+                        tTR_cST,
+                        Q,
+                        K,
+                        m_block,
+                        blk_coord_k,
+                        blk_offset[0],
+                        scale_softmax,
+                        func,
+                    )
+                elif trailing_residual_masking:
+                    self.silu_bwd_auto_seqlen_step(
+                        tTR_rST,
+                        tTR_rdSilu,
+                        tTR_cST,
+                        Q,
+                        K,
+                        m_block,
+                        blk_coord_k,
+                        scale_softmax,
+                    )
+                else:
+                    self.silu_bwd_step(
+                        tTR_rST,
+                        tTR_rdSilu,
+                        scale_softmax,
+                        None,
+                    )
+            else:
+                apply_arbitrary_mask = cutlass.const_expr(self.is_arbitrary)
+                is_masked_tile = (
+                    leading_causal_masking or trailing_residual_masking or self.has_sliding_window or cutlass.const_expr(self.is_causal) or apply_arbitrary_mask
+                )
+                if cutlass.const_expr(not self.skip_residual_mask) and is_masked_tile:
+                    score_predicates = cute.make_rmem_tensor(
+                        tTR_rST.shape,
+                        cutlass.Boolean,
+                    )
+                    for i in cutlass.range(
+                        cute.size(score_predicates),
+                        unroll_full=True,
+                    ):
+                        score_predicates[i] = True
 
-                if is_masked_tile:
                     for i in cutlass.range(cute.size(tTR_rST), unroll_full=True):
                         c_transpose = tTR_cST[i]
                         pos = (
-                            cute.get(c_transpose, mode=[1]) + iter_index * self.tile_shape_Q,
+                            cute.get(c_transpose, mode=[1]) + m_block * self.tile_shape_Q,
                             cute.get(c_transpose, mode=[0]) + blk_coord_k * self.tile_shape_K,
                         )
                         if cutlass.const_expr(self.is_arbitrary):
                             assert isinstance(func, cute.Tensor)
-                            func_row = blk_offset[0] + pos[0]
-                            for interval_idx in cutlass.range(self.func_num // 2, unroll_full=True):
-                                interval_start = func[0, 2 * interval_idx, func_row]
-                                interval_end = func[0, 2 * interval_idx + 1, func_row]
-                                if pos[1] >= interval_start and pos[1] < interval_end:
+                            # Guard the packed-varlen Q tail before forming the
+                            # func row, preserving the non-metadata traversal.
+                            if cute.elem_less(pos, (Q, K)):
+                                func_row = blk_offset[0] + pos[0]
+                                keep = cutlass.Boolean(
+                                    pos[1] < func[0, 0, func_row]
+                                )
+                                for interval_idx in cutlass.range(
+                                    self.func_num // 2,
+                                    unroll_full=True,
+                                ):
+                                    interval_start = func[
+                                        0,
+                                        2 * interval_idx + 1,
+                                        func_row,
+                                    ]
+                                    interval_end = func[
+                                        0,
+                                        2 * interval_idx + 2,
+                                        func_row,
+                                    ]
+                                    if pos[1] >= interval_start and pos[1] < interval_end:
+                                        keep = True
+                                if not keep:
                                     score_predicates[i] = False
-                            if pos[1] >= func[0, self.func_num - 1, func_row]:
+                            else:
                                 score_predicates[i] = False
                         if cutlass.const_expr(self.has_sliding_window):
                             if cutlass.const_expr(self.window_size_left < 0):
                                 if pos[1] > pos[0] + K - Q + self.window_size_right:
                                     score_predicates[i] = False
                             else:
-                                max_K_index = min(pos[0] + K - Q + self.window_size_right, K)
-                                min_K_index = max(0, pos[0] + K - Q - self.window_size_left)
+                                max_K_index = min(
+                                    pos[0] + K - Q + self.window_size_right,
+                                    K,
+                                )
+                                min_K_index = max(
+                                    0,
+                                    pos[0] + K - Q - self.window_size_left,
+                                )
                                 if pos[1] > max_K_index or pos[1] < min_K_index:
                                     score_predicates[i] = False
                         if cutlass.const_expr(self.is_causal) and (pos[0] + K - Q < pos[1] or not cute.elem_less(pos, (Q, K))):
@@ -1787,22 +1965,19 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                         if not cute.elem_less(pos, (Q, K)):
                             score_predicates[i] = False
 
-            tTR_rdSilu = cute.make_rmem_tensor(tTR_rST.shape, self.acc_dtype)
-            for i in cutlass.range(0, cute.size(tTR_rST), 2, unroll_full=True):
-                x0, x1 = mul_packed_f32x2(
-                    (tTR_rST[i], tTR_rST[i + 1]),
-                    (scale_softmax, scale_softmax),
-                )
-                tanh0 = tanhf(x0 * 0.5)
-                tanh1 = tanhf(x1 * 0.5)
-                sigmoid0, sigmoid1 = fma_packed_f32x2((0.5, 0.5), (tanh0, tanh1), (0.5, 0.5))
-                if cutlass.const_expr(not self.skip_residual_mask):
-                    sigmoid0 = sigmoid0 if score_predicates[i] else self.acc_dtype(0)
-                    sigmoid1 = sigmoid1 if score_predicates[i + 1] else self.acc_dtype(0)
-                tTR_rST[i], tTR_rST[i + 1] = mul_packed_f32x2((x0, x1), (sigmoid0, sigmoid1))
-                one_minus0, one_minus1 = sub_packed_f32x2((1.0, 1.0), (sigmoid0, sigmoid1))
-                inner0, inner1 = fma_packed_f32x2((x0, x1), (one_minus0, one_minus1), (1.0, 1.0))
-                tTR_rdSilu[i], tTR_rdSilu[i + 1] = mul_packed_f32x2((sigmoid0, sigmoid1), (inner0, inner1))
+                    self.silu_bwd_step(
+                        tTR_rST,
+                        tTR_rdSilu,
+                        scale_softmax,
+                        score_predicates,
+                    )
+                else:
+                    self.silu_bwd_step(
+                        tTR_rST,
+                        tTR_rdSilu,
+                        scale_softmax,
+                        None,
+                    )
 
             # convert fp32 P to fp16 P which will be used in the PdO
             tTR_rPT = self.quantize(tTR_rST, dV.element_type)  # tTR_rST is ST in fp32 in RF.
@@ -1843,7 +2018,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 for i in cutlass.range(cute.size(tTR_rdPT), unroll_full=True):
                     c_transpose = tTR_cdPT[i]
                     pos = (
-                        cute.get(c_transpose, mode=[1]) + iter_index * self.tile_shape_Q,
+                        cute.get(c_transpose, mode=[1]) + m_block * self.tile_shape_Q,
                         cute.get(c_transpose, mode=[0]) + blk_coord_k * self.tile_shape_K,
                     )
                     if pos[0] + K - Q < pos[1] or not cute.elem_less(pos, (Q, K)):
@@ -1905,6 +2080,146 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         )
 
     @cute.jit
+    def silu_bwd_auto_seqlen_step(
+        self,
+        scores: cute.Tensor,
+        silu_derivative: cute.Tensor,
+        score_coords: cute.Tensor,
+        seqlen_q: Int32,
+        seqlen_k: Int32,
+        m_block: Int32,
+        k_block: Int32,
+        scale_softmax: cutlass.Float32,
+    ):
+        """Apply the FULL-tail seqlen guard without accepting func."""
+
+        score_predicates = cute.make_rmem_tensor(
+            scores.shape,
+            cutlass.Boolean,
+        )
+        for i in cutlass.range(cute.size(scores), unroll_full=True):
+            c_transpose = score_coords[i]
+            pos = (
+                cute.get(c_transpose, mode=[1]) + m_block * self.tile_shape_Q,
+                cute.get(c_transpose, mode=[0]) + k_block * self.tile_shape_K,
+            )
+            score_predicates[i] = cute.elem_less(pos, (seqlen_q, seqlen_k))
+        self.silu_bwd_step(
+            scores,
+            silu_derivative,
+            scale_softmax,
+            score_predicates,
+        )
+
+    @cute.jit
+    def silu_bwd_auto_exact_step(
+        self,
+        scores: cute.Tensor,
+        silu_derivative: cute.Tensor,
+        score_coords: cute.Tensor,
+        seqlen_q: Int32,
+        seqlen_k: Int32,
+        m_block: Int32,
+        k_block: Int32,
+        query_offset: Int32,
+        scale_softmax: cutlass.Float32,
+        func: cute.Tensor,
+    ):
+        """Apply the exact arbitrary predicate for a metadata MASK tile."""
+
+        score_predicates = cute.make_rmem_tensor(
+            scores.shape,
+            cutlass.Boolean,
+        )
+        for i in cutlass.range(cute.size(scores), unroll_full=True):
+            c_transpose = score_coords[i]
+            pos = (
+                cute.get(c_transpose, mode=[1]) + m_block * self.tile_shape_Q,
+                cute.get(c_transpose, mode=[0]) + k_block * self.tile_shape_K,
+            )
+            valid = cute.elem_less(pos, (seqlen_q, seqlen_k))
+            if valid:
+                func_row = query_offset + pos[0]
+                valid = cutlass.Boolean(
+                    pos[1] < func[0, 0, func_row]
+                )
+                for interval_idx in cutlass.range(
+                    self.func_num // 2,
+                    unroll_full=True,
+                ):
+                    interval_start = func[
+                        0,
+                        2 * interval_idx + 1,
+                        func_row,
+                    ]
+                    interval_end = func[
+                        0,
+                        2 * interval_idx + 2,
+                        func_row,
+                    ]
+                    if pos[1] >= interval_start and pos[1] < interval_end:
+                        valid = True
+            score_predicates[i] = valid
+        self.silu_bwd_step(
+            scores,
+            silu_derivative,
+            scale_softmax,
+            score_predicates,
+        )
+
+    @cute.jit
+    def silu_bwd_step(
+        self,
+        scores: cute.Tensor,
+        silu_derivative: cute.Tensor,
+        scale_softmax: cutlass.Float32,
+        predicates: Optional[cute.Tensor],
+    ):
+        """Apply HSTU SiLU and retain its derivative for one score tile."""
+
+        for i in cutlass.range(
+            0,
+            cute.size(scores),
+            2,
+            unroll_full=True,
+        ):
+            x0, x1 = mul_packed_f32x2(
+                (scores[i], scores[i + 1]),
+                (scale_softmax, scale_softmax),
+            )
+            tanh0 = tanhf(x0 * 0.5)
+            tanh1 = tanhf(x1 * 0.5)
+            sigmoid0, sigmoid1 = fma_packed_f32x2(
+                (0.5, 0.5),
+                (tanh0, tanh1),
+                (0.5, 0.5),
+            )
+            if cutlass.const_expr(predicates is not None):
+                assert isinstance(predicates, cute.Tensor)
+                sigmoid0 = sigmoid0 if predicates[i] else self.acc_dtype(0)
+                sigmoid1 = sigmoid1 if predicates[i + 1] else self.acc_dtype(0)
+            scores[i], scores[i + 1] = mul_packed_f32x2(
+                (x0, x1),
+                (sigmoid0, sigmoid1),
+            )
+            one_minus0, one_minus1 = sub_packed_f32x2(
+                (1.0, 1.0),
+                (sigmoid0, sigmoid1),
+            )
+            inner0, inner1 = fma_packed_f32x2(
+                (x0, x1),
+                (one_minus0, one_minus1),
+                (1.0, 1.0),
+            )
+            (
+                silu_derivative[i],
+                silu_derivative[i + 1],
+            ) = mul_packed_f32x2(
+                (sigmoid0, sigmoid1),
+                (inner0, inner1),
+            )
+
+    @cute.jit
     def quantize(
         self,
         input_t: cute.Tensor,
@@ -1939,7 +2254,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         dK: cute.Tensor,
         dV: cute.Tensor,
     ):
-        """Early stopping needs to clear dK and dV."""
+        """Write zeros for an EMPTY K-owner tile."""
         tidx, _, _ = cute.arch.thread_idx()
         block_dim_x, _, _ = cute.arch.block_dim()
         _, K, _, HB = problem_shape
@@ -1950,11 +2265,13 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             dK.iterator + mdK_offset,
             cute.make_layout((K, self.tile_shape_dQ_K, HB), stride=dK.stride),
         )
-        gdK = cute.local_tile(mdK, (self.dSQ_mma_tiler[0], self.dSQ_mma_tiler[1]), (None, None, None))
+        # Each physical CTA owns one K64-by-D tile.  The MMA tilers are
+        # cluster-wide K128 shapes and must not be used for EMPTY stores.
+        gdK = cute.local_tile(mdK, (self.cta_tiler[1], self.cta_tiler[2]), (None, None, None))
         gdK = gdK[None, None, blk_coord_k, 0, blk_coord_batch]
         cdK = cute.domain_offset(
             (blk_coord_k * self.tile_shape_K, 0),
-            cute.make_identity_tensor((self.dSQ_mma_tiler[0], self.dSQ_mma_tiler[1])),
+            cute.make_identity_tensor((self.cta_tiler[1], self.cta_tiler[2])),
         )
 
         mdV_offset = cute.assume(blk_offset[1] * dV.stride[0], divby=64)
@@ -1962,22 +2279,22 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             dV.iterator + mdV_offset,
             cute.make_layout((K, self.tile_shape_dV_dO, HB), stride=dV.stride),
         )
-        gdV = cute.local_tile(mdV, (self.PdO_mma_tiler[0], self.PdO_mma_tiler[1]), (None, None, None))
+        gdV = cute.local_tile(mdV, (self.cta_tiler[1], self.cta_tiler[2]), (None, None, None))
         gdV = gdV[None, None, blk_coord_k, 0, blk_coord_batch]
         cdV = cute.domain_offset(
             (blk_coord_k * self.tile_shape_K, 0),
-            cute.make_identity_tensor((self.PdO_mma_tiler[0], self.PdO_mma_tiler[1])),
+            cute.make_identity_tensor((self.cta_tiler[1], self.cta_tiler[2])),
         )
 
-        for i in cutlass.range(tidx * 8, cute.size(gdK), block_dim_x * 8):
+        # Index through the tensor layout instead of treating its iterator as
+        # a flat pointer: the residual K row is strided in packed H/K/D views.
+        for i in cutlass.range(tidx, cute.size(gdK), block_dim_x):
             if cute.elem_less(cdK[i], cute.select(problem_shape, mode=[1, 2])):
-                gdK_i = cute.make_tensor(gdK.iterator + cute.assume(i, divby=8), (8))
-                gdK_i.fill(0)
+                gdK[i] = dK.element_type(0)
 
-        for i in cutlass.range(tidx * 8, cute.size(gdV), block_dim_x * 8):
+        for i in cutlass.range(tidx, cute.size(gdV), block_dim_x):
             if cute.elem_less(cdV[i], cute.select(problem_shape, mode=[1, 2])):
-                gdV_i = cute.make_tensor(gdV.iterator + cute.assume(i, divby=8), (8))
-                gdV_i.fill(0)
+                gdV[i] = dV.element_type(0)
 
     @cute.jit
     def epilogue(
