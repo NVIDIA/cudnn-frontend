@@ -157,23 +157,63 @@ after 20 warmup; no launch/host overhead; backward includes its `dAPE` zero-fill
 | 1 x 8192 | 512 | 263.3 us | 12.4 us | **21.2x** | 425.0 us | 22.8 us | **18.6x** |
 | 3 x 8192 | 512 | 664.3 us | 35.0 us | **19.0x** | 1155.8 us | 66.0 us | **17.5x** |
 
-*End-to-end wall clock of the same region* (CUDA events, median of 100; includes launch
-overhead; eager backward goes through torch autograd, fused backward is the explicit
-backward wrapper call — see the measurement-basis note above; not comparable to the
-kernel-time numbers):
+*End-to-end wall clock of the same region* (CUDA events, median of 100 after 30 warmup;
+includes launch overhead; eager backward goes through torch autograd with the forward
+outside the timed region, fused backward is the explicit backward wrapper call — not
+comparable to the kernel-time numbers above):
 
 | THD pack | head_dim | eager fwd | fused fwd | fwd | eager bwd | fused bwd | bwd |
 |---|---|---|---|---|---|---|---|
-| 1 x 8192 | 128 | 333.7 us | 37.8 us | **8.8x** | 506.7 us | 47.2 us | **10.7x** |
-| 3 x 8192 | 128 | 373.9 us | 35.1 us | **10.7x** | 561.9 us | 54.6 us | **10.3x** |
-| 1 x 8192 | 512 | 409.2 us | 39.7 us | **10.3x** | 646.3 us | 57.3 us | **11.3x** |
-| 3 x 8192 | 512 | 823.7 us | 61.4 us | **13.4x** | 1475.5 us | 101.8 us | **14.5x** |
+| 1 x 8192 | 128 | 343.7 us | 37.4 us | **9.2x** | 558.7 us | 51.9 us | **10.8x** |
+| 3 x 8192 | 128 | 389.3 us | 38.2 us | **10.2x** | 585.8 us | 62.4 us | **9.4x** |
+| 1 x 8192 | 512 | 423.3 us | 39.9 us | **10.6x** | 666.5 us | 62.8 us | **10.6x** |
+| 3 x 8192 | 512 | 831.7 us | 62.7 us | **13.3x** | 1503.6 us | 108.3 us | **13.9x** |
+
+The previously published per-call wall clock (commit `b3ceb7c`) was `333.7 / 37.8 / 506.7
+/ 47.2 us` at `1 x 8192 / 128` (and analogously for the other packs). The re-run above
+reproduces the forward columns within ~±4% and the fused/backward columns within +2-14%:
+the fused per-call wall clock carries the cached-launcher host optimization, whose
+snapshot replay jitters run-to-run (the published fused-forward is even non-monotonic in
+pack size, `37.8 -> 35.1 us`), and eager backward drifts with GPU boost-clock state. The
+CUDA-graph replay numbers below collapse that host jitter into a single replay.
+
+*CUDA-graph replay of the same region, both implementations captured symmetrically as a
+forward-only graph and a forward+backward graph* (median of 100 after 30 warmup, replay
+timing via `benchmark/csa/bench_csa_compressor.py`; capturing each side into a graph
+collapses its per-operation launches into a single replay, so this is the fairest
+wall-clock basis for launch-bound shapes):
+
+| THD pack | head_dim | eager fwd | fused fwd | fwd | eager total | fused total | total |
+|---|---|---|---|---|---|---|---|
+| 1 x 8192 | 128 | 119.2 us | 10.8 us | **11.0x** | 364.6 us | 22.8 us | **15.9x** |
+| 3 x 8192 | 128 | 235.3 us | 14.8 us | **15.8x** | 668.4 us | 38.6 us | **17.3x** |
+| 1 x 8192 | 512 | 269.8 us | 17.1 us | **15.7x** | 802.5 us | 40.0 us | **20.0x** |
+| 3 x 8192 | 512 | 673.1 us | 39.2 us | **17.1x** | 2057.6 us | 107.8 us | **19.0x** |
+
+`eager total` / `fused total` capture forward + backward together. The eager total graph
+captures the autograd backward of the captured forward against stable, pre-allocated zero
+`.grad` buffers (the captured region zeros them in place, then runs forward + backward, so
+every replay accumulates into a zeroed buffer — numerically identical to a single fresh
+backward, verified per shape in the harness); the fused total graph captures the forward
+wrapper immediately followed by the backward wrapper. The backward replay alone is not a
+separately captured quantity — it is approximately `total - fwd` and is reported only as
+that reference, never as a measured column. Graph speedups are `eager / fused` of the
+displayed µs, truncated to one decimal.
+
+Capturing each side into a graph narrows the absolute eager-vs-fused forward gap most on
+the smallest, launch-bound shape (about 2.8x at `1 x 8192 / 128` forward) and barely on
+the largest, less launch-bound shape (1.2x at `3 x 8192 / 512`); the speedup ratio is
+similar to or larger than per-call because a graph replay collapses each side's
+per-operation launches into one.
 
 Environment: driver 590.48.01, PyTorch 2.13.0 (CUDA 13.3), `nvidia-cutlass-dsl` 4.6.1.
 Measurement basis: identical inputs over exactly the replaced region for both
-implementations; eager backward = torch autograd of the recorded eager graph; fused
-backward = the backward wrapper (kernel + the fp32 `dAPE` zero-fill + host validation,
-no autograd engine).
+implementations; per-call eager backward = the torch autograd backward with the forward
+outside the timed region; graph eager backward = the autograd backward of the captured
+forward, captured together with it against stable zero `.grad` buffers; fused backward =
+the backward wrapper (kernel + the fp32 `dAPE` zero-fill + host validation, no autograd
+engine). Both wall-clock tables above (per-call and graph) are from a single run of
+`benchmark/csa/bench_csa_compressor.py`; the kernel-time table is from nsys.
 
 An ncu hardware-ceiling audit of the **ported kernels (prior to the two optimization
 commits)** — cache-flushed, `--set full`, all four benchmark shapes — showed measured
