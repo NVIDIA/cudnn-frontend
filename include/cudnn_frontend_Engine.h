@@ -93,7 +93,7 @@ class Engine_v8 : public BackendDescriptor {
 
         int64_t
         getMaxValue() const {
-            return minValue;
+            return maxValue;
         }
 
         int64_t
