@@ -164,7 +164,7 @@ When filing a bug, include the output of the environment collector — it report
 python -m cudnn.collect_env
 ```
 
-If `import cudnn` itself is broken, download [collect_env.py](python/cudnn/collect_env.py) and run it standalone with any Python.
+If `import cudnn` itself fails, download [collect_env.py](python/cudnn/collect_env.py) and run it standalone with any Python.
 
 ### Overriding the CUDA runtime library
 

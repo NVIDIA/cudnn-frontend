@@ -4,13 +4,13 @@ Usage (any of):
 
     python -m cudnn.collect_env
     python -m cudnn.collect_env --json
-    # If `import cudnn` itself is broken, download and run standalone:
+    # If `import cudnn` itself fails, download and run standalone:
     curl -OL https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/python/cudnn/collect_env.py
     python collect_env.py
 
 Design constraints (please preserve when editing):
 - Only stdlib imports at module level, so the file runs standalone even when
-  cudnn / torch are broken or absent.
+  cudnn / torch fail to import or are absent.
 - Every probe is individually guarded; a failure becomes a value in the
   report, never an exception. The report must always print.
 - Strictly offline and read-only.
@@ -33,7 +33,7 @@ import sys
 # Keys are display names, values are regexes matched against .so basenames.
 # libcudnn intentionally also matches the sublibraries (libcudnn_ops,
 # libcudnn_engines_precompiled, ...) — an install with mixed sublibrary
-# versions is a classic broken state this report must surface.
+# versions are a known inconsistent state this report must surface.
 _LIB_FAMILIES = {
     "libcudnn": r"libcudnn(?:_[a-z_]+)?\.so",
     "libcublas": r"libcublas(?:Lt)?\.so",
