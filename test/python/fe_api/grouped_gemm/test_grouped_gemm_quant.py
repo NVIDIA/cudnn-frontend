@@ -1112,6 +1112,7 @@ def _test_grouped_gemm_quant_wrapper(
     use_dynamic_sched=False,
     enable_bias=False,
     provide_d_tensor=False,
+    use_single_group_runtime_offsets=False,
 ):
     """Test GroupedGemmQuant API via the wrapper function (with caching)."""
     try:
@@ -1187,6 +1188,7 @@ def _test_grouped_gemm_quant_wrapper(
                 m_aligned=cfg["m_aligned"],
                 discrete_col_sfd=cfg["discrete_col_sfd"],
                 use_dynamic_sched=use_dynamic_sched,
+                use_single_group_runtime_offsets=use_single_group_runtime_offsets,
                 current_stream=stream,
             )
     except (ValueError, NotImplementedError) as e:
@@ -1329,6 +1331,33 @@ def _test_grouped_gemm_quant_discrete_compile_execute(
         skip_ref=cfg["skip_ref"],
     )
     return inputs, outputs, cfg
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_grouped_gemm_quant_single_group_runtime_offsets(request):
+    """The single-group kernel derives padded_offsets=[M] instead of loading the input value."""
+
+    def invalidate_runtime_offset(inputs, _cfg):
+        inputs["padded_offsets_tensor"].zero_()
+
+    _test_grouped_gemm_quant_wrapper(
+        ab_dtype=torch.float8_e4m3fn,
+        c_dtype=torch.bfloat16,
+        d_dtype=torch.float8_e4m3fn,
+        cd_major="n",
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=32,
+        sf_dtype=torch.float8_e8m0fnu,
+        vector_f32=False,
+        discrete_col_sfd=False,
+        request=request,
+        cfg_overrides={"group_m_list": [256]},
+        input_mutator=invalidate_runtime_offset,
+        use_single_group_runtime_offsets=True,
+    )
 
 
 def _test_grouped_gemm_quant_discrete_wrapper(

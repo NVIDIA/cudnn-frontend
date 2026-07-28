@@ -2510,6 +2510,24 @@ class Graph : public ICudnn, public INode {
         j["nodes"]                  = json::array();
         j["tensors"]                = json::array();
         std::map<Tensor_attributes::uid_t, json> tensors;
+        std::vector<std::shared_ptr<Tensor_attributes>> tensors_in_graph;
+        status = collect_tensor_attributes_subtree(tensors_in_graph);
+        if (status.is_bad()) {
+            throw std::runtime_error(status.get_message());
+        }
+        std::unordered_set<Tensor_attributes const *> collected_ragged_offsets;
+        auto add_ragged_offsets = [&](auto const &self, std::shared_ptr<Tensor_attributes> const &tensor) -> void {
+            if (tensor == nullptr || !collected_ragged_offsets.insert(tensor.get()).second) {
+                return;
+            }
+            tensors.emplace(tensor->get_uid(), json(*tensor));
+            self(self, tensor->get_ragged_offset());
+        };
+        for (auto const &tensor : tensors_in_graph) {
+            if (tensor != nullptr) {
+                add_ragged_offsets(add_ragged_offsets, tensor->get_ragged_offset());
+            }
+        }
         auto add_tensor = [&](json &refs, std::string const &port_name, json const &tensor_info) {
             if (tensor_info.is_null()) {
                 return;

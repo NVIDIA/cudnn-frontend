@@ -7,6 +7,7 @@ and discrete weight modes, with SwiGLU and GeGLU activations.
 
 import torch
 import pytest
+import cudnn
 from test_utils import torch_fork_set_rng
 from fe_api.test_fe_api_utils import DYNAMIC_SHAPES_M_VALUES
 from fe_api.grouped_gemm.test_grouped_gemm_swiglu_utils import (
@@ -24,6 +25,11 @@ from fe_api.grouped_gemm.test_discrete_grouped_gemm_swiglu_utils import (
     allocate_discrete_input_tensors,
     allocate_discrete_output_tensors,
     check_ref_discrete_grouped_gemm,
+)
+from test_grouped_gemm_glu_bf16_utils import (
+    assert_grouped_gemm_glu_close as assert_grouped_gemm_glu_bf16_close,
+    grouped_gemm_glu_bf16_reference,
+    make_grouped_gemm_glu_bf16_problem,
 )
 
 with_scheduler_modes = pytest.mark.parametrize(
@@ -48,6 +54,77 @@ def _apply_grouped_gemm_cfg_overrides(cfg, cfg_overrides=None):
 # ---------------------------------------------------------------------------
 #  Dense mode: Class API (reuses same tensor setup as contiguous swiglu)
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    ("discrete", "b_major"),
+    [(False, "k"), (True, "k"), (True, "n")],
+    ids=["bf16-dense", "bf16-discrete-k-major", "bf16-discrete-n-major"],
+)
+def test_grouped_gemm_glu_wrapper_bf16(discrete, b_major):
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("Requires SM100+ for grouped GEMM GLU BF16 kernel.")
+
+    problem = make_grouped_gemm_glu_bf16_problem(discrete=discrete, b_major=b_major)
+    expected_c, expected_d = grouped_gemm_glu_bf16_reference(
+        problem,
+        act_func="swiglu",
+        linear_offset=0.0,
+        geglu_alpha=1.702,
+        glu_clamp_max=7.0,
+        glu_clamp_min=-7.0,
+    )
+    kwargs = dict(
+        a_tensor=problem["a"],
+        sfa_tensor=None,
+        padded_offsets=problem["offsets"],
+        alpha_tensor=problem["alpha"],
+        bias_tensor=problem["bias"],
+        prob_tensor=problem["prob"],
+        c_dtype=torch.bfloat16,
+        d_dtype=torch.bfloat16,
+    )
+    if discrete:
+        kwargs.update(b_ptrs=problem["b_ptrs"], n=problem["n"], b_dtype=torch.bfloat16, b_major=b_major)
+    else:
+        kwargs.update(b_tensor=problem["b"], sfb_tensor=None)
+    result = cudnn.grouped_gemm_glu_wrapper_sm100(generate_c=True, **kwargs)
+    assert_grouped_gemm_glu_bf16_close(result["d_tensor"], expected_d)
+    assert_grouped_gemm_glu_bf16_close(result["c_tensor"], expected_c)
+
+
+@pytest.mark.L0
+def test_grouped_gemm_glu_class_bf16_rejects_single_group_runtime_offsets():
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("Requires SM100+ for grouped GEMM GLU BF16 kernel.")
+
+    problem = make_grouped_gemm_glu_bf16_problem(discrete=False, b_major="k")
+    expected_c, expected_d = grouped_gemm_glu_bf16_reference(
+        problem,
+        act_func="swiglu",
+        linear_offset=0.0,
+        geglu_alpha=1.702,
+        glu_clamp_max=7.0,
+        glu_clamp_min=-7.0,
+    )
+    api = cudnn.GroupedGemmGluSm100(
+        sample_a=problem["a"],
+        sample_c=torch.empty_like(expected_c),
+        sample_d=torch.empty_like(expected_d),
+        sample_sfa=None,
+        sample_padded_offsets=problem["offsets"],
+        sample_alpha=problem["alpha"],
+        sample_d_col=None,
+        sample_b=problem["b"],
+        sample_sfb=None,
+        sample_bias=problem["bias"],
+        sample_prob=problem["prob"],
+        use_single_group_runtime_offsets=True,
+    )
+
+    with pytest.raises(ValueError, match="supported only by the block-scaled kernel"):
+        api.check_support()
 
 
 @pytest.mark.L0
@@ -229,6 +306,31 @@ def test_grouped_gemm_glu_dense_compile_execute_rectangular_zero_prob(request):
 
     assert torch.count_nonzero(outputs["c_tensor"][: inputs["valid_m"]]).item() > 0
     assert torch.count_nonzero(outputs["d_tensor"][: inputs["valid_m"]]).item() == 0
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_grouped_gemm_glu_dense_wrapper_without_prob(request):
+    def input_mutator(inputs, _cfg):
+        inputs["prob_tensor"].fill_(1.0)
+
+    _test_grouped_gemm_glu_dense_wrapper(
+        ab_dtype=torch.float8_e4m3fn,
+        c_dtype=torch.bfloat16,
+        d_dtype=torch.float8_e4m3fn,
+        cd_major="n",
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=32,
+        sf_dtype=torch.float8_e8m0fnu,
+        vector_f32=False,
+        discrete_col_sfd=True,
+        request=request,
+        cfg_overrides={"group_m_list": [256]},
+        input_mutator=input_mutator,
+        omit_prob=True,
+    )
 
 
 @pytest.mark.L0
@@ -431,6 +533,8 @@ def _test_grouped_gemm_glu_dense_compile_execute(
     input_mutator=None,
     enable_bias=False,
     use_dynamic_sched=False,
+    omit_prob=False,
+    use_single_group_runtime_offsets=False,
 ):
     try:
         from cudnn import GroupedGemmGluSm100
@@ -513,6 +617,7 @@ def _test_grouped_gemm_glu_dense_compile_execute(
         discrete_col_sfd=cfg["discrete_col_sfd"],
         act_func="swiglu",
         use_dynamic_sched=use_dynamic_sched,
+        use_single_group_runtime_offsets=use_single_group_runtime_offsets,
     )
 
     try:
@@ -566,6 +671,8 @@ def _test_grouped_gemm_glu_dense_wrapper(
     input_mutator=None,
     enable_bias=False,
     use_dynamic_sched=False,
+    omit_prob=False,
+    use_single_group_runtime_offsets=False,
 ):
     try:
         from cudnn import grouped_gemm_glu_wrapper_sm100
@@ -620,7 +727,7 @@ def _test_grouped_gemm_glu_dense_wrapper(
                 sfb_tensor=inputs["sfb_tensor"],
                 # Common:
                 norm_const_tensor=inputs.get("norm_const_tensor"),
-                prob_tensor=inputs.get("prob_tensor"),
+                prob_tensor=None if omit_prob else inputs.get("prob_tensor"),
                 acc_dtype=cfg["acc_dtype"],
                 c_dtype=cfg["c_dtype"],
                 d_dtype=cfg["d_dtype"],
@@ -633,6 +740,7 @@ def _test_grouped_gemm_glu_dense_wrapper(
                 discrete_col_sfd=cfg["discrete_col_sfd"],
                 act_func="swiglu",
                 use_dynamic_sched=use_dynamic_sched,
+                use_single_group_runtime_offsets=use_single_group_runtime_offsets,
                 current_stream=stream,
             )
     except (ValueError, NotImplementedError) as e:
@@ -1811,4 +1919,31 @@ def test_grouped_gemm_glu_discrete_wrapper_alpha_default_is_1702(request):
         out_explicit["d_tensor"][:valid_m].float().cpu(),
         atol=0.0,
         rtol=0.0,
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_grouped_gemm_glu_single_group_runtime_offsets(request):
+    """The single-group kernel derives padded_offsets=[M] instead of loading the input value."""
+
+    def invalidate_runtime_offset(inputs, _cfg):
+        inputs["padded_offsets_tensor"].zero_()
+
+    _test_grouped_gemm_glu_dense_wrapper(
+        ab_dtype=torch.float8_e4m3fn,
+        c_dtype=torch.bfloat16,
+        d_dtype=torch.float8_e4m3fn,
+        cd_major="n",
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=32,
+        sf_dtype=torch.float8_e8m0fnu,
+        vector_f32=False,
+        discrete_col_sfd=False,
+        request=request,
+        cfg_overrides={"group_m_list": [256]},
+        input_mutator=invalidate_runtime_offset,
+        use_single_group_runtime_offsets=True,
     )

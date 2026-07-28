@@ -271,9 +271,34 @@ from ._pygraph import pygraph, GraphContext
 from .nodes import Node
 
 from .graph import graph, jit, graph_cache
-from .wrapper import Graph
 
 from typing import Any
+
+_EAGER_PUBLIC_NAMES = (
+    *symbols_to_import,
+    *(
+        symbol
+        for symbol in (
+            "causal_conv1d_forward",
+            "causal_conv1d_backward",
+            "causal_conv1d_nwh_forward",
+            "causal_conv1d_nwh_backward",
+            "b2b_causal_conv1d_forward",
+            "b2b_causal_conv1d_backward",
+        )
+        if symbol in globals()
+    ),
+    "__version__",
+    "NodeType",
+    "Tensor",
+    "pygraph",
+    "GraphContext",
+    "Node",
+    "graph",
+    "jit",
+    "graph_cache",
+)
+__all__ = [*_EAGER_PUBLIC_NAMES, "Graph", "wrapper"]
 
 _OPTIONAL_DEPENDENCY_INSTALL_HINT = "Install with 'pip install nvidia-cudnn-frontend[cutedsl]'"
 
@@ -296,6 +321,8 @@ _LAZY_OPTIONAL_IMPORTS = {
     "RmsNormRhtAmaxSm100": (".rmsnorm_rht_amax", "RmsNormRhtAmaxSm100"),
     "rmsnorm_rht_amax_wrapper_sm100": (".rmsnorm_rht_amax", "rmsnorm_rht_amax_wrapper_sm100"),
     "grouped_gemm": (".grouped_gemm", None),
+    "GroupedGemmSm100": (".grouped_gemm", "GroupedGemmSm100"),
+    "grouped_gemm_wrapper_sm100": (".grouped_gemm", "grouped_gemm_wrapper_sm100"),
     "GroupedGemmSwigluSm100": (".grouped_gemm", "GroupedGemmSwigluSm100"),
     "grouped_gemm_swiglu_wrapper_sm100": (".grouped_gemm", "grouped_gemm_swiglu_wrapper_sm100"),
     "GroupedGemmDswigluSm100": (".grouped_gemm", "GroupedGemmDswigluSm100"),
@@ -339,6 +366,12 @@ def _load_optional_symbol(name: str) -> Any:
 
 
 def __getattr__(name: str) -> Any:
+    if name in ("Graph", "wrapper"):
+        _wrapper = importlib.import_module(".wrapper", __name__)
+        globals()["wrapper"] = _wrapper
+        globals()["Graph"] = _wrapper.Graph
+        return globals()[name]
+
     if name == "ops":
         # Use importlib rather than "from . import ops" to avoid infinite
         # recursion. The cycle:
@@ -361,3 +394,7 @@ def __getattr__(name: str) -> Any:
         return _load_optional_symbol(name)
 
     raise AttributeError(name)
+
+
+def __dir__():
+    return sorted(set(globals()) | set(__all__))

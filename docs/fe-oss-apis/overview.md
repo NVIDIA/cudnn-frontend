@@ -8,6 +8,7 @@ This folder documents the Python FE APIs implemented under `python/cudnn`. For d
 - [GEMM + SwiGLU](gemm_fusions/gemm_swiglu.md)
 - [GEMM + sReLU](gemm_fusions/gemm_srelu.md)
 - [GEMM + dsReLU](gemm_fusions/gemm_dsrelu.md)
+- [Grouped GEMM (BF16)](gemm_fusions/grouped_gemm.md)
 - [Grouped GEMM + GLU (Unified)](gemm_fusions/grouped_gemm_glu.md)
 - [Grouped GEMM + GLU + Hadamard](gemm_fusions/grouped_gemm_glu_hadamard.md)
 - [Grouped GEMM + dGLU (Unified)](gemm_fusions/grouped_gemm_dglu.md)
@@ -29,7 +30,7 @@ This folder documents the Python FE APIs implemented under `python/cudnn`. For d
 
 ## Installation and setup
 
-All Frontend OSS APIs come installed with the `nvidia-cudnn-frontend` package. However, each API may require additional optional dependencies defined in the `pyproject.toml` file. For instance, GEMM + Amax and GEMM + SwiGLU require the `cute-dsl` optional dependency, which can be installed via:
+All Frontend OSS APIs come installed with the `nvidia-cudnn-frontend` package. However, each API may require additional optional dependencies defined in the `pyproject.toml` file. For instance, GEMM + Amax, GEMM + SwiGLU, and the grouped GEMM APIs require the `cutedsl` optional dependency, which can be installed via:
 ```bash
 pip install nvidia-cudnn-frontend[cutedsl]
 ```

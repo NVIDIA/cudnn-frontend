@@ -14,10 +14,43 @@ from fe_api.grouped_gemm.test_grouped_gemm_wgrad_utils import (
     check_ref_grouped_gemm_wgrad,
     wgrad_to_ragged_layout,
 )
+from test_grouped_gemm_wgrad_bf16_utils import (
+    assert_grouped_gemm_wgrad_close as assert_grouped_gemm_wgrad_bf16_close,
+    grouped_gemm_wgrad_bf16_reference,
+    make_grouped_gemm_wgrad_bf16_problem,
+)
 
 # ---------------------------------------------------------------------------
 # Dense mode: Class API
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("discrete", [False, True], ids=["bf16-dense", "bf16-discrete"])
+def test_grouped_gemm_wgrad_wrapper_bf16(discrete):
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("Requires SM100+ for grouped GEMM WGrad BF16 kernel.")
+
+    problem = make_grouped_gemm_wgrad_bf16_problem(discrete=discrete)
+    expected = grouped_gemm_wgrad_bf16_reference(problem)
+    kwargs = dict(
+        a_tensor=problem["a"],
+        b_tensor=problem["b"],
+        sfa_tensor=None,
+        sfb_tensor=None,
+        offsets_tensor=problem["offsets"],
+        output_mode="discrete" if discrete else "dense",
+        wgrad_tensor=problem["output"],
+        wgrad_ptrs=problem["output_ptrs"],
+        acc_dtype=torch.float32,
+        wgrad_dtype=problem["output_dtype"],
+        mma_tiler_mn=(128, 128),
+        cluster_shape_mn=(1, 1),
+        input_order=problem["input_order"],
+    )
+    result = cudnn.grouped_gemm_wgrad_wrapper_sm100(**kwargs)
+    assert result["wgrad_tensor"] is problem["output"]
+    assert_grouped_gemm_wgrad_bf16_close(result["wgrad_tensor"], expected)
 
 
 def _test_grouped_gemm_wgrad_dense_compile_execute(
@@ -583,6 +616,11 @@ def test_grouped_gemm_wgrad_wrapper_dynamic_tokens_cache_behavior(monkeypatch, o
     monkeypatch.setattr(grouped_gemm_wgrad_api.GroupedGemmWgradSm100, "check_support", lambda self: True)
     monkeypatch.setattr(grouped_gemm_wgrad_api.GroupedGemmWgradSm100, "compile", counted_compile)
     monkeypatch.setattr(grouped_gemm_wgrad_api.GroupedGemmWgradSm100, "execute", lambda self, **kwargs: None)
+    monkeypatch.setattr(
+        grouped_gemm_wgrad_api,
+        "select_grouped_gemm_backend",
+        lambda **_: grouped_gemm_wgrad_api.GroupedGemmBackend.BLOCK_SCALED,
+    )
 
     first_inputs = _make_wgrad_wrapper_cache_inputs([8, 12])
     second_inputs = _make_wgrad_wrapper_cache_inputs([80, 80])
@@ -628,6 +666,11 @@ def test_grouped_gemm_wgrad_wrapper_input_order_cache_key(monkeypatch):
     monkeypatch.setattr(grouped_gemm_wgrad_api.GroupedGemmWgradSm100, "check_support", lambda self: True)
     monkeypatch.setattr(grouped_gemm_wgrad_api.GroupedGemmWgradSm100, "compile", counted_compile)
     monkeypatch.setattr(grouped_gemm_wgrad_api.GroupedGemmWgradSm100, "execute", lambda self, **kwargs: None)
+    monkeypatch.setattr(
+        grouped_gemm_wgrad_api,
+        "select_grouped_gemm_backend",
+        lambda **_: grouped_gemm_wgrad_api.GroupedGemmBackend.BLOCK_SCALED,
+    )
 
     inputs = _make_wgrad_wrapper_cache_inputs([8, 12])
 
