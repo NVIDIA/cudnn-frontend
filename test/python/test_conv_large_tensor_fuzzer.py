@@ -361,11 +361,14 @@ class LargeTensorConfig:
 
 
 def _cudnn_dtype(t: torch.dtype):
-    return {
+    dtype_map = {
         torch.float16: cudnn.data_type.HALF,
         torch.bfloat16: cudnn.data_type.BFLOAT16,
         torch.float32: cudnn.data_type.FLOAT,
-    }[t]
+    }
+    if t not in dtype_map:
+        raise ValueError(f"Unsupported tensor dtype: {t}")
+    return dtype_map[t]
 
 
 def _estimate_bytes(cfg: LargeTensorConfig) -> int:
@@ -702,8 +705,8 @@ def _repro_payload(
     test_id = None
     if test_num is not None and total_tests is not None and config_seed is not None:
         test_id = _test_id((test_num, total_tests, config_seed, cfg))
-    graph_engine_op = _graph_engine_filter_op()
-    graph_engine_indices = _graph_engine_indices()
+    graph_engine_op = _FORCED_CONV_TYPE
+    graph_engine_indices = _COLLECTED_GRAPH_ENGINE_INDICES
     selected_graph_engine_index = _select_graph_engine_index(cfg, graph_engine_indices) if graph_engine_indices else None
 
     metadata = {
@@ -1095,8 +1098,8 @@ def _run_cudnn(cfg: LargeTensorConfig, X: torch.Tensor, W: torch.Tensor, Y: torc
 
         graph.validate()
         graph.build_operation_graph()
-        filtered_op = _graph_engine_filter_op()
-        filtered_graph_engine_indices = _graph_engine_indices()
+        filtered_op = _FORCED_CONV_TYPE
+        filtered_graph_engine_indices = _COLLECTED_GRAPH_ENGINE_INDICES
         if filtered_graph_engine_indices:
             if cfg.conv_type != filtered_op:
                 raise ValueError(f"{_GRAPH_ENGINE_OP_ENV}={filtered_op.name.lower()} does not match " f"test op {cfg.conv_type.name.lower()}")
@@ -1308,6 +1311,8 @@ def _run_single_config(
 
 def _run_test(cfg: LargeTensorConfig, cudnn_handle, test_num: int, total_tests: int, config_seed: int, allow_unaligned: bool, include_extras: bool) -> None:
     if _REGEN_ON_UNSUPPORTED_ENABLED:
+        # Replay from config_seed so regeneration can advance past unsupported
+        # candidates; cfg is the first candidate from the same generator.
         _run_test_with_regen(
             config_seed=config_seed,
             test_num=test_num,
@@ -1331,7 +1336,7 @@ def _run_test(cfg: LargeTensorConfig, cudnn_handle, test_num: int, total_tests: 
 
 
 def _run_test_with_regen(*, config_seed: int, test_num: int, total_tests: int, allow_unaligned: bool, include_extras: bool, cudnn_handle) -> None:
-    filtered_op = _graph_engine_filter_op()
+    filtered_op = _FORCED_CONV_TYPE
     if filtered_op is None:
         raise ValueError(f"{_REGEN_ON_UNSUPPORTED_ENV} requires {_GRAPH_ENGINE_OP_ENV}")
 
@@ -1340,7 +1345,7 @@ def _run_test_with_regen(*, config_seed: int, test_num: int, total_tests: int, a
         allow_unaligned=allow_unaligned,
         include_extras=include_extras,
         forced_conv_type=filtered_op,
-        force_plain_fprop=bool(_graph_engine_indices()),
+        force_plain_fprop=bool(_COLLECTED_GRAPH_ENGINE_INDICES),
     )
     max_attempts = _REGEN_ATTEMPT_LIMIT
     last_unsupported = "no configs generated"
