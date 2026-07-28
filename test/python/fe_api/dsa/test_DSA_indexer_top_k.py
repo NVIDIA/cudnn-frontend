@@ -143,3 +143,57 @@ def test_DSA_indexer_top_k_wrapper(
             values,
             return_val,
         )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_DSA_indexer_top_k_wrapper_ignores_vector_padding_with_negative_infinity():
+    """OOB vector lanes must not join a real -inf threshold bin."""
+    try:
+        from cudnn import DSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    if torch.cuda.get_device_capability()[0] < 9:
+        pytest.skip("Indexer top-k requires compute capability 9.0 or newer")
+
+    num_rows = 633
+    num_cols = 768
+    seq_len = 633
+    finite_values = 475
+    top_k = 512
+
+    input_values = torch.full(
+        (num_rows, num_cols),
+        float("-inf"),
+        dtype=torch.float32,
+        device="cuda",
+    )
+    input_values[:, :finite_values] = torch.randn(
+        num_rows,
+        finite_values,
+        dtype=torch.float32,
+        device="cuda",
+    )
+    seq_lens = torch.full((num_rows,), seq_len, dtype=torch.int32, device="cuda")
+
+    result = DSA.indexer_top_k_wrapper(
+        input_values,
+        seq_lens,
+        top_k=top_k,
+        next_n=1,
+        return_val=False,
+    )
+    torch.cuda.synchronize()
+
+    indices = result["indices"]
+    assert torch.all((indices >= 0) & (indices < seq_len)).item()
+
+    selected_values = torch.gather(input_values, 1, indices.to(torch.int64))
+    expected_values = torch.topk(input_values[:, :seq_len], top_k, dim=1).values
+    torch.testing.assert_close(
+        torch.sort(selected_values, dim=1).values,
+        torch.sort(expected_values, dim=1).values,
+        atol=0.0,
+        rtol=0.0,
+    )
