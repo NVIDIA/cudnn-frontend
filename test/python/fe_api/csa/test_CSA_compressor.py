@@ -36,6 +36,7 @@ import torch
 
 
 def _import_compressor():
+    """Import ``cudnn.csa.compressor``, skipping only on a missing cutedsl stack."""
     # Skip only when the optional cutedsl dependency stack is missing; a broken
     # cudnn.csa package itself must fail the tests, not skip them.
     pytest.importorskip("cutlass", reason="Environment not supported: cudnn[cutedsl] not installed")
@@ -46,6 +47,7 @@ def _import_compressor():
 
 
 def _require_sm100():
+    """Skip the test unless a CC 10.0 (Blackwell) CUDA GPU is available."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA GPU required")
     if torch.cuda.get_device_capability() != (10, 0):
@@ -83,6 +85,7 @@ def _overlap_transform_thd(tensor, is_first_in_seg, head_dim, fill_value=0):
 
 
 def _eager_pool(kv, score, ape, cu_seqlens, cu_seqlens_comp, total_comp, ratio, d, coff, mode):
+    """Eager pooling region (see module docstring); ``coff == 1`` skips the overlap transform."""
     device = kv.device
     row_idx = torch.arange(total_comp, device=device, dtype=cu_seqlens_comp.dtype)
     batch_ids = _batch_of_row(cu_seqlens_comp, total_comp)
@@ -129,6 +132,7 @@ def _eager_pool(kv, score, ape, cu_seqlens, cu_seqlens_comp, total_comp, ratio, 
 
 
 def _make_inputs(lens, d, ratio, coff, seed=1234, device="cuda"):
+    """Build a seeded random THD pack (kv, score, ape, cu, cuc, total_comp, grad_out) for ``lens``."""
     total = sum(lens)
     w = coff * d
     gen = torch.Generator(device="cpu").manual_seed(seed)
@@ -412,6 +416,7 @@ def test_backward_fills_uninitialized_buffers(lens, d, pad, tok_pad, coff):
     bwd.compile()
 
     def run(poison):
+        """One backward into poisoned (NaN) or zeroed grad buffers; returns the grads."""
         grad_kv = torch.empty_like(kv2)
         grad_score = torch.empty_like(score2)
         if poison:
@@ -533,6 +538,7 @@ def test_cuda_graph_capture(coff):
     go_s[:total_true] = torch.randn(total_true, d, device="cuda").to(torch.bfloat16)
 
     def _fused_fwd_bwd():
+        """One fused forward + backward over the static-capacity buffers."""
         out = compressor.csa_compressor_forward_wrapper(kv_s, score_s, ape_s, cu, cuc, ratio=ratio, head_dim=d, coff=coff, total_comp=capacity)["out"]
         grads = compressor.csa_compressor_backward_wrapper(kv_s, score_s, ape_s, cu, cuc, go_s, ratio=ratio, head_dim=d, coff=coff)
         return out, grads
@@ -646,6 +652,7 @@ def _meta_samples(
     cuc_len=None,
     kv_stride=None,
 ):
+    """Consistent meta-device sample-tensor kwargs, with per-field overrides for negatives."""
     w = coff * d
     if total_comp is None:
         total_comp = total // ratio

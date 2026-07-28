@@ -1,3 +1,5 @@
+"""Public surface for the fused CSA/HCA Compressor kernels (re-exports from ``.api``)."""
+
 from .api import (
     CSACompressorForward,
     CSACompressorBackward,

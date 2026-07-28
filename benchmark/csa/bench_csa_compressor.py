@@ -58,6 +58,7 @@ import cudnn.csa
 
 
 def _batch_of_row(cu_seqlens, total):
+    """Segment index owning each packed row (mirror of Megatron-LM ``batch_of_row``)."""
     n_seg = cu_seqlens.shape[0] - 1
     row_idx = torch.arange(total, device=cu_seqlens.device, dtype=torch.int64)
     return torch.bucketize(row_idx, cu_seqlens[1:], right=True).clamp(max=max(n_seg - 1, 0))
@@ -108,6 +109,7 @@ def eager_pool(kv, score, ape, cu_seqlens, cu_seqlens_comp, total_comp, ratio, d
 
 
 def make_inputs(lens, d, ratio, coff, seed=1234, device="cuda"):
+    """Build a random THD pack (kv, score, ape, cu, cuc, total_comp, grad_out) for ``lens``."""
     total = sum(lens)
     w = coff * d
     gen = torch.Generator(device="cpu").manual_seed(seed)
@@ -128,6 +130,7 @@ def make_inputs(lens, d, ratio, coff, seed=1234, device="cuda"):
 
 
 def fused_forward(kv, score, ape, cu, cuc, total_comp, ratio, d, coff):
+    """One fused forward wrapper call; returns the pooled output."""
     total = kv.shape[0]
     return cudnn.csa.csa_compressor_forward_wrapper(
         kv.view(total, -1),
@@ -143,6 +146,7 @@ def fused_forward(kv, score, ape, cu, cuc, total_comp, ratio, d, coff):
 
 
 def fused_backward(kv, score, ape, cu, cuc, go, ratio, d, coff):
+    """One fused backward wrapper call; returns the gradient TupleDict."""
     total = kv.shape[0]
     return cudnn.csa.csa_compressor_backward_wrapper(
         kv.view(total, -1),
@@ -164,6 +168,7 @@ def fused_forward_backward(kv, score, ape, cu, cuc, go, total_comp, ratio, d, co
 
 
 def eager_forward(kv, score, ape, cu, cuc, total_comp, ratio, d, coff):
+    """One eager forward over the replaced region (verbatim upstream numerics)."""
     return eager_pool(kv, score, ape, cu, cuc, total_comp, ratio, d, coff)
 
 
@@ -173,6 +178,7 @@ def eager_forward(kv, score, ape, cu, cuc, total_comp, ratio, d, coff):
 
 
 def _noop():
+    """Do nothing (placeholder ``pre`` hook for graph replay timing)."""
     pass
 
 
@@ -275,6 +281,7 @@ def _capture_eager_total(kv, score, ape, cu, cuc, total_comp, go, ratio, d, coff
     apl.grad = torch.zeros_like(apl)
 
     def _fwd_bwd():
+        """The captured region: zero the kept grad buffers, then eager fwd + bwd."""
         # In-place zero of the SAME buffers each replay (kept, not released).
         kvl.grad.zero_()
         scl.grad.zero_()
@@ -325,6 +332,11 @@ def _capture_eager_total(kv, score, ape, cu, cuc, total_comp, go, ratio, d, coff
 
 
 def measure(lens, d, ratio, coff, warmup, iters, seed=1234):
+    """Measure per-call and graph-replay wall clock for one shape (eager vs fused).
+
+    Returns a dict of median CUDA-event timings (ms) plus a numerics ``check`` comparing
+    one eager total-graph replay against a fresh non-graph backward.
+    """
     kv, score, ape, cu, cuc, total_comp, go = make_inputs(lens, d, ratio, coff, seed)
     out = {}
 
@@ -334,6 +346,7 @@ def measure(lens, d, ratio, coff, warmup, iters, seed=1234):
 
     # eager backward per-call: forward (builds grad graph) outside timing, backward timed.
     def _fwd_for_bwd():
+        """Fresh leaves + eager forward (outside timing) feeding one timed backward."""
         kvl, scl, apl = _make_leaves(kv, score, ape)
         o = eager_forward(kvl, scl, apl, cu, cuc, total_comp, ratio, d, coff)
         return kvl, scl, apl, o
@@ -372,6 +385,7 @@ def measure(lens, d, ratio, coff, warmup, iters, seed=1234):
 
 
 def _fmt(ms):
+    """Format a millisecond value as a fixed-width microsecond column."""
     return f"{ms * 1000:7.1f}"
 
 
@@ -391,6 +405,7 @@ def _xtrunc1(num, den):
 
 
 def main():
+    """Run all shapes and print the per-call/graph tables, checks, and JSON payload."""
     p = argparse.ArgumentParser()
     p.add_argument("--iters", type=int, default=50)
     p.add_argument("--warmup", type=int, default=20)

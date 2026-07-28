@@ -66,11 +66,13 @@ class _LruDict:
     """Bounded thread-safe LRU mapping (per ``graph.py``'s ``graph_cache`` precedent)."""
 
     def __init__(self, maxsize: int = _API_CACHE_MAXSIZE):
+        """Create an empty LRU mapping evicting past ``maxsize`` entries."""
         self._data: OrderedDict = OrderedDict()
         self._lock = threading.Lock()
         self._maxsize = maxsize
 
     def get(self, key, default=None):
+        """Return the value for ``key`` (refreshing its recency) or ``default``."""
         with self._lock:
             if key not in self._data:
                 return default
@@ -78,6 +80,7 @@ class _LruDict:
             return self._data[key]
 
     def put(self, key, value) -> None:
+        """Insert ``key -> value`` as most recent, evicting past ``maxsize``."""
         with self._lock:
             self._data[key] = value
             self._data.move_to_end(key)
@@ -134,6 +137,12 @@ class _CSACompressorBase(APIBase):
         ratio: int = 4,
         coff: int = 2,
     ):
+        """Capture tensor descriptors and the ``(ratio, coff)`` configuration.
+
+        The ``sample_*`` tensors provide shape/dtype/stride/device metadata only (meta
+        tensors are accepted); validation runs later in ``check_support`` and nothing
+        is read or launched until ``execute``.
+        """
         super().__init__()
         self._warn_experimental_api()
 
@@ -311,6 +320,7 @@ class CSACompressorForward(_CSACompressorBase):
     """
 
     def compile(self) -> None:
+        """JIT-compile the forward kernel for this ``(ratio, head_dim, coff, device)`` (idempotent)."""
         self._logger.debug("Entering compile")
         self._ensure_support_checked()
         if self._compiled_kernel is not None:
@@ -320,6 +330,7 @@ class CSACompressorForward(_CSACompressorBase):
         ratio, head_dim, coff = self.ratio, self.head_dim, self.coff
 
         def tensor_api(kv, score, ape, cu_seqlens, cu_seqlens_comp, out, stream_handle):
+            """Per-config closure: invoke ``run_fwd`` with the bound ``(ratio, head_dim, coff)``."""
             run_fwd(kv, score, ape, cu_seqlens, cu_seqlens_comp, out, out.shape[0], ratio, head_dim, coff, stream_handle=stream_handle)
 
         self._compiled_kernel = tensor_api
@@ -373,6 +384,7 @@ class CSACompressorBackward(_CSACompressorBase):
     """
 
     def compile(self) -> None:
+        """JIT-compile the backward kernel for this ``(ratio, head_dim, coff, device)`` (idempotent)."""
         self._logger.debug("Entering compile")
         self._ensure_support_checked()
         if self._compiled_kernel is not None:
@@ -382,6 +394,7 @@ class CSACompressorBackward(_CSACompressorBase):
         ratio, head_dim, coff = self.ratio, self.head_dim, self.coff
 
         def tensor_api(kv, score, ape, cu_seqlens, cu_seqlens_comp, grad_out, grad_kv, grad_score, grad_ape, stream_handle):
+            """Per-config closure: invoke ``run_bwd`` with the bound ``(ratio, head_dim, coff)``."""
             run_bwd(
                 kv,
                 score,

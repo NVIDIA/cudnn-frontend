@@ -168,6 +168,7 @@ class _FastLauncher:
     __slots__ = ("slots", "_capi", "_packed", "_res", "_has_res", "_keep")
 
     def __init__(self, fn, args):
+        """Snapshot the launch state of one ``fn(*args)`` call for later replay."""
         # Must run after the wrapper's first real `fn(*args)` call so the default
         # executor (device context, loaded modules) exists.
         exe_args, adapted = fn.execution_args.generate_execution_args(args, {})
@@ -226,6 +227,7 @@ class _FastCache:
     """
 
     def __init__(self):
+        """Create the empty per-thread launcher storage."""
         self._tls = threading.local()
 
     def _map(self):
