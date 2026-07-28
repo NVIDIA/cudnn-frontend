@@ -454,7 +454,6 @@ class BlockScaledMoEGroupedGemmWgradKernel:
         # Dense passes None for C-related params; no if-else branch needed.
         sfa_smem_layout = cute.slice_(self.sfa_smem_layout_staged, (None, None, None, 0))
         sfb_smem_layout = cute.slice_(self.sfb_smem_layout_staged, (None, None, None, 0))
-        epi_smem_layout_helper = cute.select(self.c_smem_layout_staged, mode=[0, 1]) if cutlass.const_expr(self.weight_mode == MoEWeightMode.DISCRETE) else None
         if cutlass.const_expr(self.input_order == WGradInputOrder.TensorRagged):
             a_gemm_helper = a_gemm
             b_gemm_helper = b_gemm
@@ -485,9 +484,6 @@ class BlockScaledMoEGroupedGemmWgradKernel:
             self.cluster_layout_sfb_vmnk.shape,
             out if cutlass.const_expr(self.weight_mode == MoEWeightMode.DISCRETE) else None,
             c_gemm if cutlass.const_expr(self.weight_mode == MoEWeightMode.DISCRETE) else None,
-            c_tma_op if cutlass.const_expr(self.weight_mode == MoEWeightMode.DISCRETE) else None,
-            epi_smem_layout_helper,
-            self.epi_tile if cutlass.const_expr(self.weight_mode == MoEWeightMode.DISCRETE) else None,
             a_gemm_helper,
             b_gemm_helper,
             a_op_helper,
@@ -616,9 +612,6 @@ class BlockScaledMoEGroupedGemmWgradKernel:
         cluster_layout_sfb_vmnk_shape: cutlass.Constexpr,
         c_ptrs=None,
         c_single_expert=None,
-        c_tma_op: cutlass.Constexpr = None,
-        epi_smem_layout=None,
-        epi_tile=None,
         a_tensor=None,
         b_tensor=None,
         a_tma_op: cutlass.Constexpr = None,
@@ -642,6 +635,18 @@ class BlockScaledMoEGroupedGemmWgradKernel:
                 c_tma_op = cpasync.CopyReduceBulkTensorTileS2GOp()
             else:
                 c_tma_op = cpasync.CopyBulkTensorTileS2GOp()
+            c_smem_layout_staged = sm100_utils.make_smem_layout_epi(
+                self.c_dtype,
+                self.c_layout,
+                self.epi_tile,
+                self.num_c_stage,
+            )
+            epi_smem_layout = cute.select(c_smem_layout_staged, mode=[0, 1])
+            epi_tile = self.epi_tile
+        else:
+            c_tma_op = None
+            epi_smem_layout = None
+            epi_tile = None
 
         ctor = WgradSfTensormapConstructor(
             sf_vec_size=self.sf_vec_size,
