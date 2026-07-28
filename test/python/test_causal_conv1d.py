@@ -96,7 +96,7 @@ def test_causal_conv1d_rejects_unsupported_kernel_size(binding_name, args, kerne
         binding(*args)
 
 _TOLERANCES = {
-    torch.float64: (1e-6, 1e-6),
+    torch.float64: (5e-12, 5e-12),
     torch.float32: (5e-6, 5e-6),
     torch.float16: (5e-3, 5e-3),
     torch.bfloat16: (1e-2, 1e-2),

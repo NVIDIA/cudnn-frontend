@@ -10,7 +10,7 @@ Supports forward and backward passes with `torch.autograd` and `torch.compile`.
 
 ## Support
 
-- **Architectures**: Turing (SM75) or later
+- **Architectures**: Turing (SM75) and newer, subject to available dynamic shared memory
 - **Data types**: FP64, FP32, FP16, BF16
 - **Activations**: `identity` and `silu` for NHW and NWH; B2B uses fixed gating
 

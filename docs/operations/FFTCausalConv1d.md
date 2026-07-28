@@ -16,10 +16,11 @@ For `x` shaped `(batch, dim, seq_len)` and `weight` shaped
 `(dim, kernel_size)`, the operation computes:
 
 ```text
-y[t] = sum(x[t - j] * weight[j], j=0..kernel_size-1)
+y[b, c, t] = sum(x[b, c, t - j] * weight[c, j], j=0..kernel_size-1)
 ```
 
-Samples before the start of `x` are zero. This is FIR-order weight storage:
+Here, `x[b, c, t - j]` is zero when `t - j` is outside the input sequence.
+This is FIR-order weight storage:
 `weight[0]` multiplies the current sample. It is reversed relative to
 `cudnn.ops.causal_conv1d`, whose first stored weight multiplies the oldest
 sample in the causal window.

@@ -9,7 +9,14 @@ from cudnn.ops.fft_causal_conv1d import _long_buffer_size_bytes, fft_causal_conv
 
 
 def _require_fft_causal_conv1d():
-    if cudnn.backend_version() < 92600 or not hasattr(cudnn, "fft_causal_conv1d_forward"):
+    required_symbols = (
+        "fft_causal_conv1d_forward",
+        "fft_causal_conv1d_backward",
+        "long_fft_causal_conv1d_get_buffer_sizes",
+        "long_fft_causal_conv1d_forward",
+        "long_fft_causal_conv1d_backward",
+    )
+    if cudnn.backend_version() < 92600 or any(not hasattr(cudnn, name) for name in required_symbols):
         pytest.skip("FFT causal conv1d requires cuDNN 9.26.0 or newer bindings and backend")
 
 
