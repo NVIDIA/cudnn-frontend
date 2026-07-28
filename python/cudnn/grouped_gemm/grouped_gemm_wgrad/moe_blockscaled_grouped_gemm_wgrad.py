@@ -633,6 +633,16 @@ class BlockScaledMoEGroupedGemmWgradKernel:
         """
         from ..moe_utils import WgradSfTensormapConstructor
 
+        # Build C's operation in the helper-kernel IR context. In particular,
+        # TMA reduce requires its SMEM layout and CTA V-map to be static in
+        # that context; reusing the host-created operation leaves a dynamic
+        # CTA V-map for discrete accumulated wgrad.
+        if cutlass.const_expr(self.weight_mode == MoEWeightMode.DISCRETE):
+            if cutlass.const_expr(self.accumulate_on_output):
+                c_tma_op = cpasync.CopyReduceBulkTensorTileS2GOp()
+            else:
+                c_tma_op = cpasync.CopyBulkTensorTileS2GOp()
+
         ctor = WgradSfTensormapConstructor(
             sf_vec_size=self.sf_vec_size,
             weight_mode=self.weight_mode,
