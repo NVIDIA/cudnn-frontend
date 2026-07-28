@@ -226,54 +226,41 @@ class DRMSNormNode : public NodeCRTP<DRMSNormNode> {
 
         attributes.fill_from_context(context);
 
-        // TODO: Only inferencing from X works today.
-        auto X                  = attributes.inputs[Rmsnorm_backward_attributes::input_names::X];
-        auto const x_tensor_dim = X->get_dim();
+        auto X                     = attributes.inputs[Rmsnorm_backward_attributes::input_names::X];
+        auto const x_tensor_dim    = X->get_dim();
+        auto const x_tensor_stride = X->get_stride();
 
         auto DY            = attributes.inputs[Rmsnorm_backward_attributes::input_names::DY];
         auto dy_tensor_dim = DY->get_dim();
 
         // Only infer dims and strides if user did not set them
         if (dy_tensor_dim.empty()) {
-            dy_tensor_dim.resize(x_tensor_dim.size());
             DY->set_dim(x_tensor_dim);
         }
         if (DY->get_stride().empty()) {
-            auto const& DY_dim = DY->get_dim();
-            // Default to NHWC
-            auto const& stride_order = detail::generate_NHWC_stride_order(DY_dim.size());
-            DY->set_stride(detail::generate_stride(DY_dim, stride_order));
+            DY->set_stride(x_tensor_stride);
         }
 
         auto DX            = attributes.outputs[Rmsnorm_backward_attributes::output_names::DX];
         auto dx_tensor_dim = DX->get_dim();
         // Only infer dims and strides if user did not set them
         if (dx_tensor_dim.empty()) {
-            dx_tensor_dim.resize(x_tensor_dim.size());
             DX->set_dim(x_tensor_dim);
         }
         if (DX->get_stride().empty()) {
-            auto const& DX_dim = DX->get_dim();
-            // Default to NHWC
-            auto const& stride_order = detail::generate_NHWC_stride_order(DX_dim.size());
-            DX->set_stride(detail::generate_stride(DX_dim, stride_order));
+            DX->set_stride(x_tensor_stride);
         }
 
-        auto scale_bias_dim = X->get_dim();
-        scale_bias_dim[0]   = 1;
+        auto scale = attributes.inputs[Rmsnorm_backward_attributes::input_names::SCALE];
 
-        // Set channel length tensors
-        auto infer_scale_bias_tensors = [&scale_bias_dim](std::shared_ptr<Tensor_attributes>& T) {
-            auto tensor_dim = T->get_dim();
+        // Infer dscale/dbias from scale
+        auto infer_scale_bias_tensors = [&scale](std::shared_ptr<Tensor_attributes>& T) {
             // Only infer dims and strides if user did not set them
-            if (tensor_dim.empty()) {
-                T->set_dim(scale_bias_dim);
+            if (T->get_dim().empty()) {
+                T->set_dim(scale->get_dim());
             }
             if (T->get_stride().empty()) {
-                auto const& T_dim = T->get_dim();
-                // Default to NHWC
-                auto const& stride_order = detail::generate_NHWC_stride_order(T_dim.size());
-                T->set_stride(detail::generate_stride(T_dim, stride_order));
+                T->set_stride(scale->get_stride());
             }
         };
 

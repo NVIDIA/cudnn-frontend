@@ -33,15 +33,14 @@ def test_layernorm(param_extract, cudnn_handle):
         atol, rtol = 1e-2, 1e-2
 
     batch_size, seq_size = 16, 128
-    N, C, H, W = batch_size * seq_size, embedding_dim, 1, 1
 
     epsilon_value = 1e-3
 
-    x_gpu = 3 * torch.randn(N, C, H, W, requires_grad=True, device="cuda", dtype=input_type).to(memory_format=torch.channels_last) - 0.5
-    scale_gpu = 5 * torch.randn(1, C, H, W, requires_grad=True, device="cuda", dtype=input_type).to(memory_format=torch.channels_last) - 1
-    bias_gpu = 7 * torch.randn(1, C, H, W, requires_grad=True, device="cuda", dtype=input_type).to(memory_format=torch.channels_last) - 2
+    x_gpu = 3 * torch.randn(batch_size, seq_size, embedding_dim, requires_grad=True, device="cuda", dtype=input_type) - 0.5
+    scale_gpu = 5 * torch.randn(1, 1, embedding_dim, requires_grad=True, device="cuda", dtype=input_type) - 1
+    bias_gpu = 7 * torch.randn(1, 1, embedding_dim, requires_grad=True, device="cuda", dtype=input_type) - 2
     epsilon_cpu = torch.full(
-        (1, 1, 1, 1),
+        (1, 1, 1),
         epsilon_value,
         requires_grad=False,
         device="cpu",
@@ -50,13 +49,13 @@ def test_layernorm(param_extract, cudnn_handle):
 
     Y_expected = torch.nn.functional.layer_norm(
         x_gpu,
-        [C, H, W],
-        weight=scale_gpu.squeeze(0),
-        bias=bias_gpu.squeeze(0),
+        [embedding_dim],
+        weight=scale_gpu.reshape(-1),
+        bias=bias_gpu.reshape(-1),
         eps=epsilon_value,
     )
-    mean_expected = x_gpu.to(torch.float32).mean(dim=(1, 2, 3), keepdim=True)
-    inv_var_expected = torch.rsqrt(torch.var(x_gpu.to(torch.float32), dim=(1, 2, 3), keepdim=True) + epsilon_value)
+    mean_expected = x_gpu.to(torch.float32).mean(dim=-1, keepdim=True)
+    inv_var_expected = torch.rsqrt(torch.var(x_gpu.to(torch.float32), dim=-1, keepdim=True, correction=0) + epsilon_value)
 
     stream = torch.cuda.current_stream().cuda_stream
     cudnn.set_stream(handle=cudnn_handle, stream=stream)

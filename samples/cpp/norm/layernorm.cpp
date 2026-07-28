@@ -181,17 +181,17 @@ TEST_CASE("LayerNorm Training", "[layernorm][graph]") {
 
     auto X     = graph.tensor(fe::graph::Tensor_attributes()
                               .set_name("X")
-                              .set_dim({batch_size * seq_length, hidden_size, 1, 1})
-                              .set_stride({hidden_size, 1, hidden_size, hidden_size}));
+                              .set_dim({batch_size, seq_length, hidden_size})
+                              .set_stride({seq_length * hidden_size, hidden_size, 1}));
     auto scale = graph.tensor(fe::graph::Tensor_attributes()
                                   .set_name("scale")
-                                  .set_dim({1, hidden_size, 1, 1})
-                                  .set_stride({hidden_size, 1, hidden_size, hidden_size})
+                                  .set_dim({1, 1, hidden_size})
+                                  .set_stride({hidden_size, hidden_size, 1})
                                   .set_data_type(fe::DataType_t::FLOAT));
     auto bias  = graph.tensor(fe::graph::Tensor_attributes()
                                  .set_name("bias")
-                                 .set_dim({1, hidden_size, 1, 1})
-                                 .set_stride({hidden_size, 1, hidden_size, hidden_size})
+                                 .set_dim({1, 1, hidden_size})
+                                 .set_stride({hidden_size, hidden_size, 1})
                                  .set_data_type(fe::DataType_t::FLOAT));
 
     float epsilon_cpu = 1e-05f;
@@ -260,17 +260,17 @@ TEST_CASE("LayerNorm Inference", "[layernorm][graph]") {
 
     auto X     = graph.tensor(fe::graph::Tensor_attributes()
                               .set_name("X")
-                              .set_dim({batch_size * seq_length, hidden_size, 1, 1})
-                              .set_stride({hidden_size, 1, hidden_size, hidden_size}));
+                              .set_dim({batch_size, seq_length, hidden_size})
+                              .set_stride({seq_length * hidden_size, hidden_size, 1}));
     auto scale = graph.tensor(fe::graph::Tensor_attributes()
                                   .set_name("scale")
-                                  .set_dim({1, hidden_size, 1, 1})
-                                  .set_stride({hidden_size, 1, hidden_size, hidden_size})
+                                  .set_dim({1, 1, hidden_size})
+                                  .set_stride({hidden_size, hidden_size, 1})
                                   .set_data_type(fe::DataType_t::FLOAT));
     auto bias  = graph.tensor(fe::graph::Tensor_attributes()
                                  .set_name("bias")
-                                 .set_dim({1, hidden_size, 1, 1})
-                                 .set_stride({hidden_size, 1, hidden_size, hidden_size})
+                                 .set_dim({1, 1, hidden_size})
+                                 .set_stride({hidden_size, hidden_size, 1})
                                  .set_data_type(fe::DataType_t::FLOAT));
 
     float epsilon_cpu = 1e-05f;
@@ -332,27 +332,27 @@ TEST_CASE("LayerNorm Backward", "[layernorm][graph]") {
 
     auto X  = graph.tensor(fe::graph::Tensor_attributes()
                               .set_name("X")
-                              .set_dim({batch_size * seq_length, hidden_size, 1, 1})
-                              .set_stride({hidden_size, 1, hidden_size, hidden_size}));
+                              .set_dim({batch_size, seq_length, hidden_size})
+                              .set_stride({seq_length * hidden_size, hidden_size, 1}));
     auto DY = graph.tensor(fe::graph::Tensor_attributes()
                                .set_name("DY")
-                               .set_dim({batch_size * seq_length, hidden_size, 1, 1})
-                               .set_stride({hidden_size, 1, hidden_size, hidden_size}));
+                               .set_dim({batch_size, seq_length, hidden_size})
+                               .set_stride({seq_length * hidden_size, hidden_size, 1}));
 
     auto scale        = graph.tensor(fe::graph::Tensor_attributes()
                                   .set_name("scale")
-                                  .set_dim({1, hidden_size, 1, 1})
-                                  .set_stride({hidden_size, 1, hidden_size, hidden_size})
+                                  .set_dim({1, 1, hidden_size})
+                                  .set_stride({hidden_size, hidden_size, 1})
                                   .set_data_type(fe::DataType_t::FLOAT));
     auto mean         = graph.tensor(fe::graph::Tensor_attributes()
                                  .set_name("mean")
-                                 .set_dim({batch_size * seq_length, 1, 1, 1})
-                                 .set_stride({1, 1, 1, 1})
+                                 .set_dim({batch_size, seq_length, 1})
+                                 .set_stride({seq_length, 1, 1})
                                  .set_data_type(fe::DataType_t::FLOAT));
     auto inv_variance = graph.tensor(fe::graph::Tensor_attributes()
                                          .set_name("inv_variance")
-                                         .set_dim({batch_size * seq_length, 1, 1, 1})
-                                         .set_stride({1, 1, 1, 1})
+                                         .set_dim({batch_size, seq_length, 1})
+                                         .set_stride({seq_length, 1, 1})
                                          .set_data_type(fe::DataType_t::FLOAT));
 
     auto DLN_options = fe::graph::Layernorm_backward_attributes().set_saved_mean_and_inv_variance(mean, inv_variance);
@@ -362,7 +362,7 @@ TEST_CASE("LayerNorm Backward", "[layernorm][graph]") {
     dbias->set_output(true).set_data_type(fe::DataType_t::FLOAT);
 
 #if (CUDNN_VERSION < 8905)
-    SKIP("single GPU BN is not supported in cudnn versions prior to 8.7");
+    SKIP("LayerNorm is not supported in cudnn versions prior to 8.9.5");
 #endif
     if (check_device_arch_newer_than("ampere") == false) {
         SKIP("LayerNorm Backward requires Ampere and up");
