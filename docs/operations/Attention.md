@@ -321,10 +321,10 @@ graph.sdpa(
 - `bias` (Optional[cudnn_tensor]): Additive bias mask for attention scores. Supports broadcasting.
 - `block_mask` (Optional[cudnn_tensor]): Block-level mask for 128x128 tiles. Only supported with UNIFIED implementation.
 - `use_alibi_mask` (Optional[bool]): Enable ALiBi (Attention with Linear Biases) positional encoding. Requires `diagonal_band_right_bound=0`.
-- `use_padding_mask` (Optional[bool]): Enable variable sequence length masking. Must also provide `seq_len_q` and `seq_len_kv`.
+- `use_padding_mask` (Optional[bool]): Enable variable sequence length masking. Must also provide a Q-side and a KV-side length tensor, each in per-batch (`seq_len_q`/`seq_len_kv`) or cumulative (`cu_seq_len_q`/`cu_seq_len_kv`) form.
 - `seq_len_q` (Optional[cudnn_tensor]): Per-batch query sequence lengths with shape $(B, 1, 1, 1)$.
 - `seq_len_kv` (Optional[cudnn_tensor]): Per-batch key/value sequence lengths with shape $(B, 1, 1, 1)$.
-- `cu_seq_len_q` (Optional[cudnn_tensor]): Cumulative query sequence lengths (prefix sums with a leading 0) with shape $(B+1, 1, 1, 1)$ or 1-D $(B+1,)$ (promoted automatically), int32 or int64. Mutually exclusive with `seq_len_q`/`seq_len_kv`; must be set together with `cu_seq_len_kv` and requires `use_padding_mask=True`. Requires cuDNN 9.24+ and the UNIFIED implementation.
+- `cu_seq_len_q` (Optional[cudnn_tensor]): Cumulative query sequence lengths (prefix sums with a leading 0) with shape $(B+1, 1, 1, 1)$ or 1-D $(B+1,)$ (promoted automatically), int32 or int64. Mutually exclusive with `seq_len_q` (a side cannot use both forms); a KV-side length tensor (`seq_len_kv` or `cu_seq_len_kv`) must also be provided, and `use_padding_mask=True` is required. The two sides may use different forms (e.g. `cu_seq_len_q` with `seq_len_kv`), which requires cuDNN 9.25+. Supplying `cu_seq_len_q` requires cuDNN 9.24+ and the UNIFIED implementation.
 - `cu_seq_len_kv` (Optional[cudnn_tensor]): Cumulative key/value sequence lengths; same shape, type, and constraints as `cu_seq_len_q`.
 - `diagonal_alignment` (Optional[cudnn.diagonal_alignment]): Alignment for diagonal masking. `TOP_LEFT` for standard causal, `BOTTOM_RIGHT` for prefix-LM style.
 - `diagonal_band_left_bound` (Optional[int]): Left bound for sliding window attention. Masks columns at or before `row_idx - left_bound`.
@@ -911,7 +911,7 @@ Args:
     use_padding_mask (Optional[bool]): Enable variable sequence length masking. Requires seq_len_q/seq_len_kv or cu_seq_len_q/cu_seq_len_kv. Default is False.
     seq_len_q (Optional[cudnn_tensor]): Per-batch query sequence lengths with shape (B, 1, 1, 1).
     seq_len_kv (Optional[cudnn_tensor]): Per-batch key/value sequence lengths with shape (B, 1, 1, 1).
-    cu_seq_len_q (Optional[cudnn_tensor]): Cumulative query sequence lengths (prefix sums with a leading 0) with shape (B+1, 1, 1, 1) or 1-D (B+1,), int32 or int64. Mutually exclusive with seq_len_q/seq_len_kv; must be set together with cu_seq_len_kv. Requires cuDNN 9.25+ and the UNIFIED implementation.
+    cu_seq_len_q (Optional[cudnn_tensor]): Cumulative query sequence lengths (prefix sums with a leading 0) with shape (B+1, 1, 1, 1) or 1-D (B+1,), int32 or int64. Mutually exclusive with seq_len_q (a side cannot use both forms); a KV-side length tensor (seq_len_kv or cu_seq_len_kv) must also be provided. The two sides may use different forms (e.g. cu_seq_len_q with seq_len_kv). Requires cuDNN 9.25+ and the UNIFIED implementation (the FP8 path requires 9.25+ for cumulative sequence lengths in any form).
     cu_seq_len_kv (Optional[cudnn_tensor]): Cumulative key/value sequence lengths; same shape, type, and constraints as cu_seq_len_q.
     compute_data_type (Optional[cudnn.data_type]): The data type for computation. Default is NOT_SET.
     name (Optional[str]): The name of the operation.

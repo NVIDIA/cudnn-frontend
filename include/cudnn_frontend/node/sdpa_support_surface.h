@@ -84,26 +84,32 @@ SDPA_attributes::validate_sdpa_support_surface(const detail::Context& context,
                                    error_code_t::GRAPH_NOT_SUPPORTED,
                                    "Bias mask data type cannot be boolean");
 
-    // validate options for padding mask: padding requires per-sequence length tensors,
-    // either as (SEQ_LEN_Q + SEQ_LEN_KV) or as (CU_SEQ_LEN_Q + CU_SEQ_LEN_KV).
+    // validate options for padding mask: padding requires a per-sequence length
+    // tensor on each side. Each side independently uses exactly one
+    // representation -- per-batch (seq_len_*) or cumulative (cu_seq_len_*) --
+    // and the two sides may use different forms, e.g. cumulative Q lengths
+    // with per-batch KV lengths.
+    bool const has_any_seq_len_q  = has_seq_len_q || has_cu_seq_len_q;
+    bool const has_any_seq_len_kv = has_seq_len_kv || has_cu_seq_len_kv;
+    RETURN_CUDNN_FRONTEND_ERROR_IF(padding_mask && !(has_any_seq_len_q && has_any_seq_len_kv),
+                                   error_code_t::ATTRIBUTE_NOT_SET,
+                                   "Padding mask requires seq_len_q/seq_len_kv (or cu_seq_len_q/cu_seq_len_kv) "
+                                   "to be set.");
     RETURN_CUDNN_FRONTEND_ERROR_IF(
-        padding_mask && (!has_seq_len_q || !has_seq_len_kv) && (!has_cu_seq_len_q || !has_cu_seq_len_kv),
-        error_code_t::ATTRIBUTE_NOT_SET,
-        "Padding mask requires seq_len_q/seq_len_kv (or cu_seq_len_q/cu_seq_len_kv) to be set.");
-    RETURN_CUDNN_FRONTEND_ERROR_IF(
-        (!padding_mask && !attention_score_modifier) &&
-            (has_seq_len_q || has_seq_len_kv || has_cu_seq_len_q || has_cu_seq_len_kv),
+        (!padding_mask && !attention_score_modifier) && (has_any_seq_len_q || has_any_seq_len_kv),
         error_code_t::ATTRIBUTE_NOT_SET,
         "seq_len_q/seq_len_kv (or cu_seq_len_q/cu_seq_len_kv) needs to be set only if padding mask is enabled.");
 
-    // Cumulative sequence length tensors must be set together, and are mutually
-    // exclusive with the (per-batch) seq_len tensors.
-    RETURN_CUDNN_FRONTEND_ERROR_IF(has_cu_seq_len_q != has_cu_seq_len_kv,
-                                   error_code_t::ATTRIBUTE_NOT_SET,
-                                   "cu_seq_len_q and cu_seq_len_kv must both be set or both unset.");
-    RETURN_CUDNN_FRONTEND_ERROR_IF((has_cu_seq_len_q || has_cu_seq_len_kv) && (has_seq_len_q || has_seq_len_kv),
+    RETURN_CUDNN_FRONTEND_ERROR_IF(has_seq_len_q && has_cu_seq_len_q,
                                    error_code_t::INVALID_VALUE,
-                                   "Cannot specify both seq_len tensors and cu_seq_len tensors.");
+                                   "seq_len_q and cu_seq_len_q cannot both be set.");
+    RETURN_CUDNN_FRONTEND_ERROR_IF(has_seq_len_kv && has_cu_seq_len_kv,
+                                   error_code_t::INVALID_VALUE,
+                                   "seq_len_kv and cu_seq_len_kv cannot both be set.");
+    RETURN_CUDNN_FRONTEND_ERROR_IF(has_any_seq_len_q != has_any_seq_len_kv,
+                                   error_code_t::ATTRIBUTE_NOT_SET,
+                                   "A Q-side and a KV-side sequence length tensor must be provided together "
+                                   "(each side may independently use seq_len_* or cu_seq_len_*).");
 
     RETURN_CUDNN_FRONTEND_ERROR_IF(is_ragged && ((padding_mask == false) && (attention_score_modifier == nullptr)),
                                    error_code_t::GRAPH_NOT_SUPPORTED,
@@ -301,10 +307,10 @@ SDPA_attributes::validate_sdpa_support_surface(const detail::Context& context,
                                        "Paged caches are not supported in combination with ragged offsets.");
 
         RETURN_CUDNN_FRONTEND_ERROR_IF(
-            is_paged && !((has_seq_len_q && has_seq_len_kv) || (has_cu_seq_len_q && has_cu_seq_len_kv)),
+            is_paged && !(has_any_seq_len_q && has_any_seq_len_kv),
             error_code_t::GRAPH_NOT_SUPPORTED,
             "Paged caches can only be used in combination with padding mask and variable sequence lengths "
-            "for both Q and KV (via seq_len_q/seq_len_kv or cu_seq_len_q/cu_seq_len_kv).");
+            "for both Q and KV (each side independently via seq_len_* or cu_seq_len_*).");
 
         RETURN_CUDNN_FRONTEND_ERROR_IF(
             !is_paged && max_seq_kv_explicit,
@@ -389,21 +395,24 @@ SDPA_attributes::validate_sdpa_support_surface(const detail::Context& context,
 inline error_t
 SDPA_attributes::verify_sdpa_support_surface_for_implementation(const detail::Context& context,
                                                                 AttentionImplementation_t impl) const {
+    auto const has_input = [this](input_names name) {
+        auto const it = inputs.find(name);
+        return it != inputs.end() && it->second != nullptr;
+    };
+
     switch (impl) {
         case AttentionImplementation_t::AUTO:
             // This function should not be called with AUTO.
             return {error_code_t::INVALID_VALUE,
                     "Can't call verify_sdpa_support_surface_for_implementation with impl=AUTO"};
         case AttentionImplementation_t::COMPOSITE:
-            for (const auto& [key, value] : inputs) {
-                RETURN_CUDNN_FRONTEND_ERROR_IF(key == input_names::Block_mask && value != nullptr,
-                                               error_code_t::GRAPH_NOT_SUPPORTED,
-                                               "Composite SDPA node doesn't support Block_mask input");
-                RETURN_CUDNN_FRONTEND_ERROR_IF(
-                    (key == input_names::CU_SEQ_LEN_Q || key == input_names::CU_SEQ_LEN_KV) && value != nullptr,
-                    error_code_t::GRAPH_NOT_SUPPORTED,
-                    "Composite SDPA node doesn't support CU_SEQ_LEN_Q / CU_SEQ_LEN_KV inputs");
-            }
+            RETURN_CUDNN_FRONTEND_ERROR_IF(has_input(input_names::Block_mask),
+                                           error_code_t::GRAPH_NOT_SUPPORTED,
+                                           "Composite SDPA node doesn't support Block_mask input");
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                has_input(input_names::CU_SEQ_LEN_Q) || has_input(input_names::CU_SEQ_LEN_KV),
+                error_code_t::GRAPH_NOT_SUPPORTED,
+                "Composite SDPA node doesn't support CU_SEQ_LEN_Q / CU_SEQ_LEN_KV inputs");
             // The ragged offset multiplier is only supported by the unified forward engine.
             // Reject it here so auto-select routes such graphs to the unified implementation.
             for (const auto& [key, value] : inputs) {
@@ -457,6 +466,14 @@ SDPA_attributes::verify_sdpa_support_surface_for_implementation(const detail::Co
             if (effective_cudnn_ver >= 92400) {
                 allowed_input_names.insert({input_names::CU_SEQ_LEN_Q, input_names::CU_SEQ_LEN_KV});
                 allowed_input_msg += ", CU_SEQ_LEN_Q, CU_SEQ_LEN_KV";
+            }
+
+            if (effective_cudnn_ver < 92500) {
+                RETURN_CUDNN_FRONTEND_ERROR_IF(
+                    has_input(input_names::CU_SEQ_LEN_Q) != has_input(input_names::CU_SEQ_LEN_KV),
+                    error_code_t::GRAPH_NOT_SUPPORTED,
+                    "Mixed-form sequence lengths (cu_seq_len on one side with seq_len on the other) "
+                    "require cuDNN 9.25.0 or above");
             }
 
             if (effective_cudnn_ver >= 92500) {

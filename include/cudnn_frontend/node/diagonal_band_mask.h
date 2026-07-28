@@ -29,10 +29,12 @@ class DiagonalBandMaskNodeBase : public NodeCRTP<DerivedT> {
         RETURN_CUDNN_FRONTEND_ERROR_IF(has_left_bound() && has_shift_right_bound(),
                                        error_code_t::INVALID_VALUE,
                                        "DiagonalBandMaskNode cannot have both left_bound and shift_right_bound");
-        RETURN_CUDNN_FRONTEND_ERROR_IF(
-            (has_seq_len_q() || has_seq_len_kv()) && (has_cu_seq_len_q() || has_cu_seq_len_kv()),
-            error_code_t::INVALID_VALUE,
-            "SEQ_LEN_Q / SEQ_LEN_KV and CU_SEQ_LEN_Q / CU_SEQ_LEN_KV are mutually exclusive");
+        RETURN_CUDNN_FRONTEND_ERROR_IF(has_seq_len_q() && has_cu_seq_len_q(),
+                                       error_code_t::INVALID_VALUE,
+                                       "SEQ_LEN_Q and CU_SEQ_LEN_Q are mutually exclusive");
+        RETURN_CUDNN_FRONTEND_ERROR_IF(has_seq_len_kv() && has_cu_seq_len_kv(),
+                                       error_code_t::INVALID_VALUE,
+                                       "SEQ_LEN_KV and CU_SEQ_LEN_KV are mutually exclusive");
 
         return pre_validate_node_extra();
     }
