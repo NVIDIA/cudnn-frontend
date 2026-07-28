@@ -112,8 +112,9 @@ class BlockScaledMoEGroupedGemmWgradKernel:
         self.tmem_alloc_sync_bar_id = 2
         self.tmem_dealloc_sync_bar_id = 3
 
-        self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
-        self.num_tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols("sm_100")
+        self.architecture = "sm_100"
+        self.smem_capacity = utils.get_smem_capacity_in_bytes(self.architecture)
+        self.num_tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols(self.architecture)
 
     # ------------------------------------------------------------------
     # Workspace
@@ -139,6 +140,9 @@ class BlockScaledMoEGroupedGemmWgradKernel:
         mma_inst_shape_k = cute.size(tiled_mma.shape_mnk, mode=[2])
         mma_inst_tile_k = 4
         mma_tiler_k = mma_inst_shape_k * mma_inst_tile_k
+        self.sf_window_k = mma_tiler_k
+        self.num_sf_windows_per_ab_stage = 1
+        self.num_mma_instructions_per_sf_window = mma_inst_tile_k
         self.mma_tiler = (
             self.mma_inst_shape_mn[0],
             self.mma_inst_shape_mn[1],
@@ -785,6 +789,7 @@ class BlockScaledMoEGroupedGemmWgradKernel:
             allocator_warp_id=self.epilogue_warp_id[0],
             is_two_cta=use_2cta_instrs,
             two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr.ptr,
+            arch=self.architecture,
         )
 
         # Scheduler (CLC-based for 2Dx2D)
@@ -1134,11 +1139,25 @@ class BlockScaledMoEGroupedGemmWgradKernel:
                 acc_tmem_ptr + self.num_accumulator_tmem_cols,
                 dtype=self.sf_dtype,
             )
+            sf_window_tiler_mnk = (
+                self.mma_tiler[0],
+                self.mma_tiler[1],
+                self.sf_window_k,
+            )
+            sfa_window_smem_layout = cute.slice_(
+                blockscaled_utils.make_smem_layout_sfa(
+                    tiled_mma,
+                    sf_window_tiler_mnk,
+                    self.sf_vec_size,
+                    1,
+                ),
+                (None, None, None, 0),
+            )
             tCtSFA_layout = blockscaled_utils.make_tmem_layout_sfa(
                 tiled_mma,
-                self.mma_tiler,
+                sf_window_tiler_mnk,
                 self.sf_vec_size,
-                cute.slice_(sfa_smem_layout_staged, (None, None, None, 0)),
+                sfa_window_smem_layout,
             )
             tCtSFA = cute.make_tensor(sfa_tmem_ptr, tCtSFA_layout)
 
@@ -1146,11 +1165,20 @@ class BlockScaledMoEGroupedGemmWgradKernel:
                 acc_tmem_ptr + self.num_accumulator_tmem_cols + self.num_sfa_tmem_cols,
                 dtype=self.sf_dtype,
             )
+            sfb_window_smem_layout = cute.slice_(
+                blockscaled_utils.make_smem_layout_sfb(
+                    tiled_mma,
+                    sf_window_tiler_mnk,
+                    self.sf_vec_size,
+                    1,
+                ),
+                (None, None, None, 0),
+            )
             tCtSFB_layout = blockscaled_utils.make_tmem_layout_sfb(
                 tiled_mma,
-                self.mma_tiler,
+                sf_window_tiler_mnk,
                 self.sf_vec_size,
-                cute.slice_(sfb_smem_layout_staged, (None, None, None, 0)),
+                sfb_window_smem_layout,
             )
             tCtSFB = cute.make_tensor(sfb_tmem_ptr, tCtSFB_layout)
 
@@ -1214,27 +1242,100 @@ class BlockScaledMoEGroupedGemmWgradKernel:
                         if handle.count + 1 < k_tile_cnt:
                             peek_ab_full_status = ab_consumer.try_wait()
 
-                        s2t_stage_coord = (None, None, None, None, handle.index)
-                        cute.copy(
-                            tiled_copy_s2t_sfa,
-                            tCsSFA_compact_s2t[s2t_stage_coord],
-                            tCtSFA_compact_s2t,
-                        )
-                        cute.copy(
-                            tiled_copy_s2t_sfb,
-                            tCsSFB_compact_s2t[s2t_stage_coord],
-                            tCtSFB_compact_s2t,
-                        )
+                        if cutlass.const_expr(self.num_sf_windows_per_ab_stage == 1):
+                            s2t_stage_coord = (None, None, None, None, handle.index)
+                            cute.copy(
+                                tiled_copy_s2t_sfa,
+                                tCsSFA_compact_s2t[s2t_stage_coord],
+                                tCtSFA_compact_s2t,
+                            )
+                            cute.copy(
+                                tiled_copy_s2t_sfb,
+                                tCsSFB_compact_s2t[s2t_stage_coord],
+                                tCtSFB_compact_s2t,
+                            )
 
-                        tiled_mma.set(tcgen05.Field.ACCUMULATE, k_tile != 0)
-                        tile_crd = (None, None, None, handle.index)
-                        cute.gemm(
-                            tiled_mma,
-                            tCtAcc,
-                            [tCrA[tile_crd], tCtSFA],
-                            [tCrB[tile_crd], tCtSFB_mma],
-                            tCtAcc,
-                        )
+                            tiled_mma.set(tcgen05.Field.ACCUMULATE, k_tile != 0)
+                            tile_crd = (None, None, None, handle.index)
+                            cute.gemm(
+                                tiled_mma,
+                                tCtAcc,
+                                [tCrA[tile_crd], tCtSFA],
+                                [tCrB[tile_crd], tCtSFB_mma],
+                                tCtAcc,
+                            )
+                        else:
+                            for sf_window_idx in cutlass.range_constexpr(
+                                self.num_sf_windows_per_ab_stage
+                            ):
+                                for window_k_block in cutlass.range_constexpr(
+                                    self.num_mma_instructions_per_sf_window
+                                ):
+                                    stage_k_block = (
+                                        sf_window_idx
+                                        * self.num_mma_instructions_per_sf_window
+                                        + window_k_block
+                                    )
+                                    s2t_source_coord = (
+                                        None,
+                                        None,
+                                        None,
+                                        stage_k_block,
+                                        handle.index,
+                                    )
+                                    s2t_destination_coord = (
+                                        None,
+                                        None,
+                                        None,
+                                        window_k_block,
+                                    )
+                                    cute.copy(
+                                        tiled_copy_s2t_sfa,
+                                        tCsSFA_compact_s2t[s2t_source_coord],
+                                        tCtSFA_compact_s2t[s2t_destination_coord],
+                                    )
+                                    cute.copy(
+                                        tiled_copy_s2t_sfb,
+                                        tCsSFB_compact_s2t[s2t_source_coord],
+                                        tCtSFB_compact_s2t[s2t_destination_coord],
+                                    )
+
+                                for window_k_block in cutlass.range_constexpr(
+                                    self.num_mma_instructions_per_sf_window
+                                ):
+                                    stage_k_block = (
+                                        sf_window_idx
+                                        * self.num_mma_instructions_per_sf_window
+                                        + window_k_block
+                                    )
+                                    tiled_mma.set(
+                                        tcgen05.Field.ACCUMULATE,
+                                        k_tile != 0 if stage_k_block == 0 else True,
+                                    )
+                                    ab_stage_coord = (
+                                        None,
+                                        None,
+                                        stage_k_block,
+                                        handle.index,
+                                    )
+                                    sf_window_coord = (
+                                        None,
+                                        None,
+                                        window_k_block,
+                                    )
+                                    cute.gemm(
+                                        tiled_mma,
+                                        tCtAcc,
+                                        [
+                                            tCrA[ab_stage_coord],
+                                            tCtSFA[sf_window_coord],
+                                        ],
+                                        [
+                                            tCrB[ab_stage_coord],
+                                            tCtSFB[sf_window_coord],
+                                        ],
+                                        tCtAcc,
+                                    )
                         handle.release()
 
                     if k_tile_cnt > 0:
