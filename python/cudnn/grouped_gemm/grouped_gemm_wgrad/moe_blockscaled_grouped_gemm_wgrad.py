@@ -1524,7 +1524,10 @@ class BlockScaledMoEGroupedGemmWgradKernel:
                     cute.arch.fence_proxy("async.shared", space="cta")
                     epilog_sync_barrier.arrive_and_wait()
 
-                    if warp_idx == self.epilogue_warp_id[0]:
+                    # A 2-CTA MMA exposes the same completed accumulator to
+                    # both participating CTAs. Only the leader may issue the
+                    # final store; otherwise TMA reduce adds every tile twice.
+                    if warp_idx == self.epilogue_warp_id[0] and is_leader_cta:
                         cute.copy(
                             tma_atom_c,
                             bSG_sC[(None, c_buffer)],
