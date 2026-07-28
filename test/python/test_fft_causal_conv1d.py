@@ -24,7 +24,7 @@ def _make_inputs(batch, dim, seq_len, kernel_size, dtype):
     return x, weight
 
 
-@pytest.mark.L2
+@pytest.mark.L0
 @pytest.mark.parametrize(
     "batch,dim,seq_len,kernel_size,dtype,atol,rtol",
     [
@@ -54,7 +54,7 @@ def test_fft_causal_conv1d_forward_and_backward(batch, dim, seq_len, kernel_size
     torch.testing.assert_close(weight.grad, weight_ref.grad.to(dtype), atol=atol, rtol=rtol)
 
 
-@pytest.mark.L2
+@pytest.mark.L0
 @pytest.mark.parametrize(
     "dtype,atol,rtol",
     [
@@ -84,7 +84,7 @@ def test_medium_fft_supported_dtypes(dtype, atol, rtol):
     torch.testing.assert_close(weight.grad, weight_ref.grad.to(dtype), atol=atol, rtol=rtol)
 
 
-@pytest.mark.L1
+@pytest.mark.L0
 def test_long_fft_fake_buffer_formula_matches_backend_query():
     _require_fft_causal_conv1d()
     batch, dim, seq_len, kernel_size = 2, 3, 4096, 4096
