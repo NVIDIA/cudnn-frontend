@@ -473,7 +473,10 @@ def _test_grouped_gemm_wgrad_dynamic_tokens_compile_execute(
         sf_vec_size=sf_vec_size,
         sf_dtype=sf_dtype,
     )
-    runtime_cfg = _cfg_with_group_k_list(compile_cfg, [128, 128])
+    runtime_group_k_list = [128, 128]
+    if torch.cuda.get_device_capability() == (10, 7) and ab_dtype == torch.float4_e2m1fn_x2:
+        runtime_group_k_list = [256, 256]
+    runtime_cfg = _cfg_with_group_k_list(compile_cfg, runtime_group_k_list)
 
     compile_inputs = allocate_grouped_gemm_wgrad_tensors(compile_cfg)
     runtime_inputs = allocate_grouped_gemm_wgrad_tensors(runtime_cfg)
