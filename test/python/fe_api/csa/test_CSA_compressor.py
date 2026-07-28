@@ -18,14 +18,15 @@ measurements and numerics in https://github.com/NVIDIA/Megatron-LM/issues/5968).
   - CUDA graph capture: warmup -> capture fwd+bwd -> replay (including replay with new
     data and a smaller device-side true row count), and the loud error when the first
     call for a configuration would JIT under capture;
-  - ``check_support`` boundaries (validated envelope: CC 10.0, ratio 4, coff 2, BF16
-    kv/score, FP32 ape, int32 cu_seqlens and int32 flat-offset bounds).
+  - ``check_support`` boundaries (validated envelope: CC 10.0, ratio 4, coff in {1, 2},
+    BF16 kv/score, FP32 ape, int32 cu_seqlens and int32 flat-offset bounds).
 
 The eager reference below mirrors the exact region of Megatron-LM
 ``Compressor._forward_thd`` (non-pre-grouped THD path) that the fused kernels replace:
-gather-index build -> gather -> ``+ APE`` -> overlap-window transform (``coff == 2``,
-``Compressor._overlap_transform_thd``) -> fp32 softmax -> gated weighted sum -> bf16
-cast. ``mode`` selects the numerics: "upstream" reproduces the eager code exactly
+gather-index build -> gather -> ``+ APE`` -> overlap-window transform (``coff == 2``
+only, ``Compressor._overlap_transform_thd``; ``coff == 1`` keeps the block's own
+``ratio``-token window) -> fp32 softmax -> gated weighted sum -> bf16 cast. ``mode``
+selects the numerics: "upstream" reproduces the eager code exactly
 (softmax weights rounded to bf16, bf16 multiply); "fp32" keeps all intermediates fp32
 with a single final bf16 rounding (the fused kernels' numerics); "fp64" is an oracle.
 """
@@ -198,6 +199,15 @@ _SHAPES = [
     # odd head_dim exercises the scalar (vec == 1) forward layout; even head_dims all
     # take the vectorized (vec == 2) one.
     pytest.param([260], 65, 4, 2, id="b1-d65-odd-r4"),
+    # a zero-length segment inside the pack (degenerate cu_seqlens entry).
+    pytest.param([64, 0, 253, 3], 128, 4, 2, id="empty-seg-d128-r4"),
+    # coff == 1: the non-overlapping window form (win = ratio, own-block tokens only).
+    pytest.param([2048], 128, 4, 1, id="b1-d128-r4-coff1"),
+    pytest.param([1023, 2048, 509], 128, 4, 1, id="ragged3-d128-r4-coff1"),
+    pytest.param([2048], 512, 4, 1, id="b1-d512-r4-coff1"),
+    pytest.param([3, 515, 1024, 129], 128, 4, 1, id="short-seg-d128-r4-coff1"),
+    pytest.param([260], 65, 4, 1, id="b1-d65-odd-r4-coff1"),
+    pytest.param([64, 0, 253, 3], 128, 4, 1, id="empty-seg-d128-r4-coff1"),
 ]
 
 
@@ -243,11 +253,12 @@ def test_numerics_vs_references(lens, d, ratio, coff):
 
 
 @pytest.mark.L0
-def test_replay_determinism():
+@pytest.mark.parametrize("coff", [1, 2])
+def test_replay_determinism(coff):
     """Forward, dKV and dScore replay bitwise identically run to run (dAPE is exempt)."""
     _require_sm100()
-    kv, score, ape, cu, cuc, total_comp, go = _make_inputs([1023, 2048, 509], 128, 4, 2)
-    runs = [_run_fused(kv, score, ape, cu, cuc, total_comp, 4, 128, 2, go) for _ in range(3)]
+    kv, score, ape, cu, cuc, total_comp, go = _make_inputs([1023, 2048, 509], 128, 4, coff)
+    runs = [_run_fused(kv, score, ape, cu, cuc, total_comp, 4, 128, coff, go) for _ in range(3)]
     for other in runs[1:]:
         assert torch.equal(runs[0][0], other[0])
         assert torch.equal(runs[0][1], other[1])
@@ -262,6 +273,8 @@ _PADDING_SHAPES = [
     # span a segment boundary -- exactly like the eager gather.
     ([3, 515, 1024, 129], 128, 4, 2, 8),
     ([1023, 2048, 509], 128, 4, 2, 8),
+    ([3, 515, 1024, 129], 128, 4, 1, 8),
+    ([1023, 2048, 509], 128, 4, 1, 8),
 ]
 
 
@@ -301,11 +314,12 @@ def test_static_capacity_padding(lens, d, ratio, coff, pad):
 
 
 @pytest.mark.L0
-def test_empty_output():
+@pytest.mark.parametrize("coff", [1, 2])
+def test_empty_output(coff):
     """total_comp == 0 launches nothing and returns well-formed empty/zero tensors."""
     _require_sm100()
     compressor = _import_compressor()
-    d, ratio, coff = 128, 4, 2
+    d, ratio = 128, 4
     w = coff * d
     kv = torch.randn(2, w, device="cuda").to(torch.bfloat16)
     score = torch.randn(2, w, device="cuda").to(torch.bfloat16)
@@ -321,13 +335,14 @@ def test_empty_output():
 
 
 @pytest.mark.L0
-def test_backward_wrapper_zeros_when_no_blocks():
+@pytest.mark.parametrize("coff", [1, 2])
+def test_backward_wrapper_zeros_when_no_blocks(coff):
     """Multi-segment packs where NO segment reaches ratio tokens: total_comp == 0, so
     the kernel cannot launch and the wrapper must hand back exact-zero grads (the
     host-side zeros fallback behind the uninitialized-buffer optimization)."""
     _require_sm100()
     compressor = _import_compressor()
-    d, ratio, coff = 128, 4, 2
+    d, ratio = 128, 4
     w = coff * d
     lens = [3, 2, 1]
     total = sum(lens)
@@ -345,10 +360,11 @@ def test_backward_wrapper_zeros_when_no_blocks():
 
 _CANARY_SHAPES = [
     # (lens, head_dim, pad, tok_pad) — every never-consumed dKV/dScore slot class must
-    # be hit: segment tails (seqlen % ratio), the last block's first-half columns, whole
-    # segments shorter than ratio (zero blocks), static-capacity padding rows
-    # (pad > 0 extra grad_out rows), and static token-capacity padding of the gradient
-    # buffers themselves (tok_pad > 0 tokens beyond cu_seqlens[-1]).
+    # be hit: segment tails (seqlen % ratio), the last block's first-half columns
+    # (coff == 2 only), whole segments shorter than ratio (zero blocks),
+    # static-capacity padding rows (pad > 0 extra grad_out rows), and static
+    # token-capacity padding of the gradient buffers themselves (tok_pad > 0 tokens
+    # beyond cu_seqlens[-1]).
     pytest.param([2048], 128, 0, 0, id="b1-d128"),
     pytest.param([1023, 2048, 509], 128, 0, 0, id="ragged3-d128"),
     pytest.param([3, 515, 1024, 129], 128, 0, 0, id="short-seg-d128"),
@@ -362,8 +378,9 @@ _CANARY_SHAPES = [
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("coff", [1, 2])
 @pytest.mark.parametrize("lens,d,pad,tok_pad", _CANARY_SHAPES)
-def test_backward_fills_uninitialized_buffers(lens, d, pad, tok_pad):
+def test_backward_fills_uninitialized_buffers(lens, d, pad, tok_pad, coff):
     """NaN-canary: the backward kernel fully overwrites garbage dKV/dScore buffers.
 
     The kernel writes exact zeros to every never-consumed slot itself (there are no
@@ -372,7 +389,7 @@ def test_backward_fills_uninitialized_buffers(lens, d, pad, tok_pad):
     """
     _require_sm100()
     compressor = _import_compressor()
-    ratio, coff = 4, 2
+    ratio = 4
     kv, score, ape, cu, cuc, total_true, _ = _make_inputs(lens, d, ratio, coff)
     total_comp = total_true + pad
     gen = torch.Generator(device="cpu").manual_seed(11)
@@ -445,11 +462,12 @@ def test_backward_fills_uninitialized_buffers(lens, d, pad, tok_pad):
 
 
 @pytest.mark.L0
-def test_backward_rejects_deterministic_mode():
+@pytest.mark.parametrize("coff", [1, 2])
+def test_backward_rejects_deterministic_mode(coff):
     """The backward raises under torch.use_deterministic_algorithms (dAPE fp32 atomics)."""
     _require_sm100()
     compressor = _import_compressor()
-    kv, score, ape, cu, cuc, total_comp, go = _make_inputs([512, 256], 128, 4, 2)
+    kv, score, ape, cu, cuc, total_comp, go = _make_inputs([512, 256], 128, 4, coff)
     total = kv.shape[0]
     # Forward is deterministic and keeps working.
     prev_det = torch.are_deterministic_algorithms_enabled()
@@ -457,31 +475,32 @@ def test_backward_rejects_deterministic_mode():
     torch.use_deterministic_algorithms(True, warn_only=False)
     try:
         out = compressor.csa_compressor_forward_wrapper(
-            kv.view(total, -1), score.view(total, -1), ape, cu, cuc, ratio=4, head_dim=128, coff=2, total_comp=total_comp
+            kv.view(total, -1), score.view(total, -1), ape, cu, cuc, ratio=4, head_dim=128, coff=coff, total_comp=total_comp
         )["out"]
         assert out.shape == (total_comp, 128)
         with pytest.raises(RuntimeError, match="not deterministic"):
             compressor.csa_compressor_backward_wrapper(
-                kv.view(total, -1), score.view(total, -1), ape, cu, cuc, go.view(total_comp, 128), ratio=4, head_dim=128, coff=2
+                kv.view(total, -1), score.view(total, -1), ape, cu, cuc, go.view(total_comp, 128), ratio=4, head_dim=128, coff=coff
             )
     finally:
         torch.use_deterministic_algorithms(prev_det, warn_only=prev_warn)
 
 
 @pytest.mark.L0
-def test_backward_warns_in_warn_only_deterministic_mode():
+@pytest.mark.parametrize("coff", [1, 2])
+def test_backward_warns_in_warn_only_deterministic_mode(coff):
     """warn_only deterministic mode warns (torch semantics) and still runs the backward."""
     _require_sm100()
     compressor = _import_compressor()
-    kv, score, ape, cu, cuc, total_comp, go = _make_inputs([512, 256], 128, 4, 2)
-    r_ref = _run_fused(kv, score, ape, cu, cuc, total_comp, 4, 128, 2, go)
+    kv, score, ape, cu, cuc, total_comp, go = _make_inputs([512, 256], 128, 4, coff)
+    r_ref = _run_fused(kv, score, ape, cu, cuc, total_comp, 4, 128, coff, go)
     prev_det = torch.are_deterministic_algorithms_enabled()
     prev_warn = torch.is_deterministic_algorithms_warn_only_enabled()
     torch.use_deterministic_algorithms(True, warn_only=True)
     try:
         with pytest.warns(RuntimeWarning, match="not deterministic"):
             grads = compressor.csa_compressor_backward_wrapper(
-                kv.view(kv.shape[0], -1), score.view(score.shape[0], -1), ape, cu, cuc, go.view(total_comp, 128), ratio=4, head_dim=128, coff=2
+                kv.view(kv.shape[0], -1), score.view(score.shape[0], -1), ape, cu, cuc, go.view(total_comp, 128), ratio=4, head_dim=128, coff=coff
             )
     finally:
         torch.use_deterministic_algorithms(prev_det, warn_only=prev_warn)
@@ -496,11 +515,12 @@ def test_backward_warns_in_warn_only_deterministic_mode():
 
 @pytest.mark.L0
 @pytest.mark.filterwarnings("ignore::UserWarning")
-def test_cuda_graph_capture():
+@pytest.mark.parametrize("coff", [1, 2])
+def test_cuda_graph_capture(coff):
     """Warmup -> capture fwd+bwd -> replay; JIT under capture raises a clear error."""
     _require_sm100()
     compressor = _import_compressor()
-    ratio, d, coff = 4, 128, 2
+    ratio, d = 4, 128
     lens = [512, 256]
     kv, score, ape, cu, cuc, total_true, _ = _make_inputs(lens, d, ratio, coff)
     capacity = total_true + 8  # static capacity, as with CUDA-graph static shapes
@@ -576,8 +596,8 @@ def test_cuda_graph_capture():
 
     # A first call for a NEW configuration under capture must raise loudly instead of
     # JIT-compiling (which is not capture-safe). head_dim 192 is used by no other test
-    # in this module, so this configuration is guaranteed to be uncompiled regardless of
-    # test execution order.
+    # in this module (and kernels are compiled per (ratio, head_dim, coff)), so this
+    # configuration is guaranteed to be uncompiled regardless of test execution order.
     d_new = 192
     kv3 = torch.randn(256, coff * d_new, device="cuda").to(torch.bfloat16)
     score3 = torch.randn(256, coff * d_new, device="cuda").to(torch.bfloat16)
@@ -646,12 +666,13 @@ def _meta_samples(
 
 
 @pytest.mark.L0
-def test_check_support_accepts_envelope():
+@pytest.mark.parametrize("coff", [1, 2])
+def test_check_support_accepts_envelope(coff):
     """Metadata-only samples inside the validated envelope pass check_support."""
     _require_sm100()
     compressor = _import_compressor()
     for cls in (compressor.CSACompressorForward, compressor.CSACompressorBackward):
-        api = cls(**_meta_samples(), ratio=4, coff=2)
+        api = cls(**_meta_samples(coff=coff), ratio=4, coff=coff)
         assert api.check_support() is True
         assert api.head_dim == 128 and api.total_tokens == 512 and api.total_comp == 128
 
@@ -660,8 +681,10 @@ def test_check_support_accepts_envelope():
 @pytest.mark.parametrize(
     "kwargs,ctor,match",
     [
-        (dict(), dict(ratio=128, coff=1), "validated for ratio=4, coff=2"),
-        (dict(), dict(ratio=8, coff=2), "validated for ratio=4, coff=2"),
+        (dict(coff=1), dict(ratio=128, coff=1), "validated for ratio=4"),
+        (dict(), dict(ratio=8, coff=2), "validated for ratio=4"),
+        (dict(coff=3), dict(ratio=4, coff=3), "coff in"),
+        (dict(), dict(ratio=4, coff=0), "coff in"),
         (dict(kv_dtype=torch.float16), dict(), "kv"),
         (dict(ape_dtype=torch.bfloat16), dict(), "ape"),
         (dict(cu_dtype=torch.int64), dict(), "cu_seqlens"),
@@ -702,11 +725,12 @@ def test_check_support_rejects_cpu_tensors():
 
 
 @pytest.mark.L0
-def test_class_api_matches_wrapper():
+@pytest.mark.parametrize("coff", [1, 2])
+def test_class_api_matches_wrapper(coff):
     """The explicit class API produces bitwise-identical results to the wrappers."""
     _require_sm100()
     compressor = _import_compressor()
-    ratio, d, coff = 4, 128, 2
+    ratio, d = 4, 128
     kv, score, ape, cu, cuc, total_comp, go = _make_inputs([1023, 509], d, ratio, coff)
     total = kv.shape[0]
     kv2, score2, go2 = kv.view(total, -1), score.view(total, -1), go.view(total_comp, d)

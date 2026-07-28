@@ -8,17 +8,19 @@ pooling region of the CSA/HCA ``Compressor`` for the THD packed layout:
 
     out[b, j] = sum_k kv[w(b, k), c(k, j)] * softmax_k(score[w(b, k), c(k, j)] + ape[k % ratio, c(k, j)])
 
-over the per-block window ``w`` (``2 * ratio`` entries for the overlapping ``coff == 2``
-form; the previous block's half-window is invalid for each segment's first block). The
-framework-side autograd wiring stays in the caller (e.g. a ``torch.autograd.Function``
+over the per-block window ``w``: ``2 * ratio`` entries for the overlapping ``coff == 2``
+form (the previous block's half-window is invalid for each segment's first block), or
+``ratio`` entries for the own-block ``coff == 1`` form (no overlap, every window valid).
+The framework-side autograd wiring stays in the caller (e.g. a ``torch.autograd.Function``
 that calls the forward wrapper in ``forward()`` and the backward wrapper in
 ``backward()``); these APIs are pure kernels-plus-validation.
 
 Validated envelope (``check_support``): compute capability 10.0, ``ratio == 4``,
-``coff == 2`` (the production CSA/HCA configuration), BF16 ``kv``/``score``/``out``,
-FP32 ``ape``, int32 ``cu_seqlens``/``cu_seqlens_comp``, and int32 flat offsets
-(``total_tokens * coff * head_dim < 2**31``). The kernels themselves are generic over
-``(ratio, head_dim, coff in {1, 2})``; wider gates can be lifted once validated.
+``coff in {1, 2}`` (``coff == 2`` is the production CSA/HCA configuration), BF16
+``kv``/``score``/``out``, FP32 ``ape``, int32 ``cu_seqlens``/``cu_seqlens_comp``, and
+int32 flat offsets (``total_tokens * coff * head_dim < 2**31``). The kernels themselves
+are generic over ``ratio`` and ``head_dim`` too; the ratio gate can be lifted once
+validated.
 
 Numerics contract (see ``compressor_sm100.py`` for details): fp32 arithmetic with one
 final bf16 rounding, ``mul.rn``/``fma.rn`` pinned in PTX. Forward, ``dKV`` and ``dScore``
@@ -160,8 +162,8 @@ class _CSACompressorBase(APIBase):
         """
         self._logger.debug("Entering check_support")
         self._value_error_if(
-            self.ratio != 4 or self.coff != 2,
-            f"CSA compressor is validated for ratio=4, coff=2 only (the production CSA/HCA configuration), got ratio={self.ratio}, coff={self.coff}",
+            self.ratio != 4 or self.coff not in (1, 2),
+            f"CSA compressor is validated for ratio=4, coff in {{1, 2}} (coff=2 is the production CSA/HCA form); got ratio={self.ratio}, coff={self.coff}",
         )
         self._value_error_if(
             self.kv_desc.ndim != 2,
@@ -509,7 +511,9 @@ def csa_compressor_forward_wrapper(
             ``cu_seqlens_comp[b + 1] - cu_seqlens_comp[b] == seqlen_b // ratio``.
         ratio: compression ratio (tokens per output block); validated envelope: 4.
         head_dim: output feature dimension; inferred from ``kv`` width when omitted.
-        coff: 2 for the overlapping window form; validated envelope: 2.
+        coff: 1 for the own-block window form (window = ``ratio`` tokens, no overlap) or
+            2 for the overlapping-window form (window = ``2 * ratio``); validated
+            envelope: {1, 2}.
         total_comp: output row count. Defaults to ``cu_seqlens_comp[-1]`` (synchronizes);
             pass it explicitly (e.g. a static CUDA-graph capacity, which must be
             ``>= cu_seqlens_comp[-1]``) to stay capture-safe.

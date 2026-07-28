@@ -14,7 +14,7 @@ The kernels were ported from Megatron-LM at the maintainers' request
 and numerics in
 [Megatron-LM issue #5968](https://github.com/NVIDIA/Megatron-LM/issues/5968)). The eager
 region they replace decomposes into ~39 forward and ~51 backward kernel launches per
-call (at `compress_ratio = 4`) and materializes `(total_comp, 2*ratio, 1, head_dim)`
+call (at `compress_ratio = 4`, `coff = 2`) and materializes `(total_comp, 2*ratio, 1, head_dim)`
 window intermediates; the fused path is 1 + 1 kernels (plus one fp32 `dAPE`-buffer
 zero-fill in backward — the backward kernel writes `dKV`/`dScore` in full, including
 exact zeros to never-consumed positions, so those buffers need no fills).
@@ -28,6 +28,10 @@ For each THD segment `s` (`cu_seqlens[s]..cu_seqlens[s+1]`) and each output bloc
   — invalid for the segment's first block (score `-inf`, kv `0`);
 - `k in [ratio, 2*ratio)`: own block's token, second-half projection column, APE row
   `k - ratio`.
+
+The own-block window form (`coff == 1`, window size `ratio`) drops the overlap: every
+`k in [0, ratio)` is the block's own token on projection column `j` with APE row `k`, and
+every window is fully valid (no first-block exception).
 
 ```text
 out[b, j] = sum_k kv[w(b,k), c(k,j)] * softmax_k(score[w(b,k), c(k,j)] + ape[k % ratio, c(k,j)])
@@ -54,9 +58,9 @@ run-to-run deterministic; the backward APIs raise under
 
 - Compute capability **10.0** (the only validated architecture so far; the kernels use
   no arch-specific features, wider enablement is possible after validation)
-- `ratio == 4`, `coff == 2` (the production CSA/HCA configuration; the kernels are
-  generic over `(ratio, head_dim, coff in {1, 2})` and the gate can be lifted once
-  validated)
+- `ratio == 4`, `coff in {1, 2}` (`coff == 2` is the production CSA/HCA configuration,
+  `coff == 1` the own-block window form; the kernels are generic over `ratio` and
+  `head_dim` too and the ratio gate can be lifted once validated)
 - BF16 `kv` / `score` / `out`, FP32 `ape`, int32 `cu_seqlens` / `cu_seqlens_comp`
 - int32 flat offsets: `total_tokens * coff * head_dim < 2**31` and
   `total_comp * head_dim < 2**31`
@@ -98,6 +102,10 @@ grads = CSA.csa_compressor_backward_wrapper(
 grad_kv, grad_score, grad_ape = grads  # BF16, BF16, FP32
 ```
 
+Set `coff=1` for the `ratio`-token own-block window (and use `kv` / `score` tensors whose
+packed width is `head_dim`); `coff=2` selects the `2 * ratio` overlapping window shown
+above.
+
 The wrappers cache compiled API instances; the underlying JIT is shared per
 `(ratio, head_dim, coff, device)`, so runtime shape changes never recompile.
 
@@ -118,8 +126,9 @@ op.execute(kv, score, ape, cu_seqlens, cu_seqlens_comp, out, current_stream=None
 `CSACompressorBackward.execute` additionally takes `grad_out` and the
 `grad_kv` / `grad_score` / `grad_ape` buffers. `grad_kv` / `grad_score` may be
 **uninitialized**: the kernel writes every position (disjoint, atomic-free stores;
-never-consumed positions — segment tails, the last block's first-half columns, segments
-shorter than `ratio`, token-capacity padding beyond `cu_seqlens[-1]` — get exact zeros
+never-consumed positions — segment tails, the last block's first-half columns
+(`coff == 2` only; `coff == 1` has no first-half columns), segments shorter than `ratio`,
+token-capacity padding beyond `cu_seqlens[-1]` — get exact zeros
 from their unique owning CTA, matching autograd). When `total_comp == 0` the kernel is
 not launched and the buffers are left untouched (zero them yourself if you need
 autograd's exact zeros; the high-level wrapper does). `grad_ape` must be
