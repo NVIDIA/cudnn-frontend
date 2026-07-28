@@ -828,6 +828,7 @@ class BlockScaledMoEGroupedGemmGluKernel:
             sfd_col_tensor = cute.make_tensor(sfd_col_tensor.iterator, sfd_col_layout)
 
         self.generate_amax = amax_tensor is not None
+        self.has_prob = prob is not None
 
         # K dim of the MMA instruction shape on Rubin sm107:
         #  - SM107MmaMXF4NVF4Op (FP4 x FP4) requires K=128
@@ -1561,22 +1562,24 @@ class BlockScaledMoEGroupedGemmGluKernel:
                     rnd='rn',
                     ftz=False,
                 )
-                (
-                    tCompute[i],
-                    tCompute[i + 1],
-                ) = cute.arch.mul_packed_f32x2(
-                    (tCompute[i], tCompute[i + 1]),
-                    (mProb, mProb),
-                    rnd='rn',
-                    ftz=False,
-                )
+                if cutlass.const_expr(self.has_prob):
+                    (
+                        tCompute[i],
+                        tCompute[i + 1],
+                    ) = cute.arch.mul_packed_f32x2(
+                        (tCompute[i], tCompute[i + 1]),
+                        (mProb, mProb),
+                        rnd='rn',
+                        ftz=False,
+                    )
         else:
             # GeGlu Unpacked Version
             for i in cutlass.range_constexpr(cute.size(tCompute)):
                 tCompute[i] = (acc_vec_up[i] + linear_offset) * silu_f32_geglu_scaled(
                     acc_vec_gate[i], fastmath=True
                 )
-                tCompute[i] = tCompute[i] * mProb
+                if cutlass.const_expr(self.has_prob):
+                    tCompute[i] = tCompute[i] * mProb
 
     @cute.jit
     def swiglu_act(self, tCompute: cute.Tensor, acc_vec_up: cute.Tensor, acc_vec_gate: cute.Tensor, mProb: cute.Tensor):
@@ -1620,22 +1623,24 @@ class BlockScaledMoEGroupedGemmGluKernel:
                     rnd='rn',
                     ftz=False,
                 )
-                (
-                    tCompute[i],
-                    tCompute[i + 1],
-                ) = cute.arch.mul_packed_f32x2(
-                    (tCompute[i], tCompute[i + 1]),
-                    (mProb, mProb),
-                    rnd='rn',
-                    ftz=False,
-                )
+                if cutlass.const_expr(self.has_prob):
+                    (
+                        tCompute[i],
+                        tCompute[i + 1],
+                    ) = cute.arch.mul_packed_f32x2(
+                        (tCompute[i], tCompute[i + 1]),
+                        (mProb, mProb),
+                        rnd='rn',
+                        ftz=False,
+                    )
         else:
             # SwiGlu Unpacked Version
             for i in cutlass.range_constexpr(cute.size(tCompute)):
                 tCompute[i] = acc_vec_up[i] * silu_f32(
                     acc_vec_gate[i], fastmath=True
                 )
-                tCompute[i] = tCompute[i] * mProb
+                if cutlass.const_expr(self.has_prob):
+                    tCompute[i] = tCompute[i] * mProb
 
 
     # GPU device kernel
@@ -2885,22 +2890,26 @@ class BlockScaledMoEGroupedGemmGluKernel:
                 if cutlass.const_expr(self.generate_amax):
                     thread_tile_amax = cutlass.Float32(0.0)
 
-                real_prob, _ = epi_ext.get_gmem_tensor(
-                    "prob", prob, padded_offsets, epi_work_tile_info
-                )
                 mPosition_base = (
                     (epi_work_tile_info.tile_m_idx // cute.size(tiled_mma.thr_id.shape))
                     * self.mma_tiler[0]
                     + mma_tile_coord_v * (self.mma_tiler[0] // cute.size(tiled_mma.thr_id.shape))
                     + tidx
                 )
-                mProb = real_prob[mPosition_base, 0, 0]
-                # For breuse: also compute the breuse-half prob;
-                mProb_bk = mProb
-                mProb_br = mProb
-                if cutlass.const_expr(self.enable_breuse):
+                mProb = cutlass.Float32(1.0)
+                mProb_bk = cutlass.Float32(1.0)
+                mProb_br = cutlass.Float32(1.0)
+                if cutlass.const_expr(self.has_prob):
+                    real_prob, _ = epi_ext.get_gmem_tensor(
+                        "prob", prob, padded_offsets, epi_work_tile_info
+                    )
+                    mProb = real_prob[mPosition_base, 0, 0]
                     mProb_bk = mProb
-                    mProb_br = real_prob[mPosition_base + (self.cta_tile_shape_mnk[0] // 2), 0, 0]
+                    mProb_br = mProb
+                    if cutlass.const_expr(self.enable_breuse):
+                        mProb_br = real_prob[
+                            mPosition_base + (self.cta_tile_shape_mnk[0] // 2), 0, 0
+                        ]
 
                 #
                 # Wait for accumulator buffer full
@@ -3353,4 +3362,3 @@ class BlockScaledMoEGroupedGemmGluKernel:
         # (R2S, R2S_M, R2S_N)
         tRS_rD = tiled_copy_r2s.retile(tTR_rC)
         return tiled_copy_r2s, tRS_rD, tRS_sD
-
