@@ -28,7 +28,6 @@
 
 """Fused projection GEMM + per-head YARN RoPE + dual-direction MXFP8 quantize (Blackwell / SM100)."""
 
-import cuda.bindings.driver as cuda
 import torch
 
 import cutlass
@@ -38,7 +37,6 @@ import cutlass.pipeline as pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.cute.nvgpu import cpasync, tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils
-from cutlass.cute.runtime import from_dlpack
 from cutlass._mlir import ir as _mlir_ir
 from cutlass._mlir.dialects import llvm as _llvm_dialect
 from cutlass.cutlass_dsl import Float32 as _Float32Sym, Int32 as _Int32Sym
@@ -229,7 +227,7 @@ def gemm_proj_rope_mxfp8_kernel(
 
     epilogue_sync_barrier = pipeline.NamedBarrier(barrier_id=1, num_threads=threads_in_epilogue)
     tmem_alloc_barrier = pipeline.NamedBarrier(barrier_id=2, num_threads=32 * len((mma_warp_id, *epilogue_warp_ids)))
-    tmem = utils.TmemAllocator(storage.tmem_holding_buffer, barrier_for_retrieve=tmem_alloc_barrier, allocator_warp_id=epilogue_warp_ids[0], is_two_cta=False)
+    tmem = utils.TmemAllocator(storage.tmem_holding_buffer.ptr, barrier_for_retrieve=tmem_alloc_barrier, allocator_warp_id=epilogue_warp_ids[0], is_two_cta=False)
 
     tAsA, tAgA = cpasync.tma_partition(
         tma_atom_a,
@@ -534,72 +532,6 @@ def gemm_proj_rope_mxfp8_host(
         cluster=cluster_shape_mnk,
         stream=stream,
     )
-
-
-_cache = {}
-
-
-def run(x, w, cos, sin, out_fp8_row, out_scales_row, out_fp8_col, out_scales_col, w_out_in=False):
-    tokens = x.shape[0]
-    proj_dim = w.shape[0] if w_out_in else w.shape[1]
-    k_dim = w.shape[1] if w_out_in else w.shape[0]  # GEMM contraction dim (Q_LORA)
-    # Lightweight structural validation (run() is a public entry that skips check_support);
-    # catch the common misuses with a clear error instead of an opaque CUTLASS/CUDA crash.
-    if tokens % TILE_M != 0:
-        raise ValueError(f"tokens ({tokens}) must be a multiple of TILE_M ({TILE_M})")
-    if proj_dim % HEAD_DIM != 0:
-        raise ValueError(f"weight projected dim ({proj_dim}) must be a multiple of HEAD_DIM ({HEAD_DIM})")
-    if x.shape[1] != k_dim:
-        raise ValueError(f"x contraction dim ({x.shape[1]}) must match w's ({k_dim}); " f"x {tuple(x.shape)}, w {tuple(w.shape)}, w_out_in={w_out_in}")
-    if tuple(cos.shape) != (tokens, QK_ROPE) or tuple(sin.shape) != (tokens, QK_ROPE):
-        raise ValueError(f"cos/sin must both be ({tokens}, {QK_ROPE}); got {tuple(cos.shape)}, {tuple(sin.shape)}")
-    # Every tensor must live on x's device: the stream and HardwareInfo below are read from
-    # the active device, and the kernel launch dereferences all operands on it.
-    operands = (x, w, cos, sin, out_fp8_row, out_scales_row, out_fp8_col, out_scales_col)
-    if any(t.device != x.device for t in operands):
-        raise ValueError(f"all tensors must be on the same device as x ({x.device}); got {[str(t.device) for t in operands]}")
-    # Number of heads is derived from the weight's projected dimension (compile-time Constexpr);
-    # HEAD_DIM is the fixed per-head width the epilogue is specialized for.
-    num_heads = proj_dim // HEAD_DIM
-
-    # Bind the active device to x's device so the stream, HardwareInfo, and launch below all
-    # target the tensors' device (not whatever device happened to be current on entry).
-    with torch.cuda.device(x.device):
-        mA = from_dlpack(x.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=1)
-        # Weight B operand. Two accepted layouts, both giving logical B=[N,K]=[out,in]:
-        #   w_out_in=False (default): w is [K,N]=[in,out] contiguous -> transpose(0,1) view (N-contig).
-        #   w_out_in=True: w is the NATIVE TE weight [N,K]=[out,in] (K-contig) -> consume directly, no
-        #     transposed-contiguous copy needed (cutlass handles the major mode like cuBLAS's transb).
-        if w_out_in:
-            mB = from_dlpack(w.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=1)
-        else:
-            mB = from_dlpack(w.detach().transpose(0, 1), assumed_align=16).mark_layout_dynamic(leading_dim=0)
-        mCos = from_dlpack(cos.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=1)
-        mSin = from_dlpack(sin.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=1)
-        mQrow = from_dlpack(out_fp8_row, assumed_align=16).mark_layout_dynamic(leading_dim=2)
-        mSrow = from_dlpack(out_scales_row, assumed_align=16).mark_layout_dynamic(leading_dim=2)
-        mQcol = from_dlpack(out_fp8_col, assumed_align=16).mark_layout_dynamic(leading_dim=2)
-        mScol = from_dlpack(out_scales_col, assumed_align=16).mark_layout_dynamic(leading_dim=2)
-
-        # Launch on the CURRENT torch stream (required for CUDA-graph capture: null-stream
-        # work is not captured -> empty graph). Mirrors the v3 winner's stream handling.
-        current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-
-        grid_m = tokens // TILE_M
-        # Key on every dimension the compiled fn specializes on: grid (tokens), B-operand layout
-        # (w_out_in), the num_heads Constexpr, and the device (HardwareInfo/max_active_clusters are
-        # queried from the current device at compile time). Dtypes are fixed for this entry point.
-        key = (tokens, bool(w_out_in), num_heads, x.device.index)
-        fn = _cache.get(key)
-        if fn is None:
-            hw = cutlass.utils.HardwareInfo()
-            max_active_clusters = hw.get_max_active_clusters(1)
-            swizzle_size = 8
-            fn = cute.compile(
-                gemm_proj_rope_mxfp8_host, mA, mB, mCos, mSin, mQrow, mSrow, mQcol, mScol, grid_m, num_heads, max_active_clusters, swizzle_size, current_stream
-            )
-            _cache[key] = fn
-        fn(mA, mB, mCos, mSin, mQrow, mSrow, mQcol, mScol, current_stream)
 
 
 # ---------------------------------------------------------------------------
