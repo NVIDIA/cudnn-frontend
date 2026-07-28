@@ -315,13 +315,14 @@ class BlockScaledMoEGroupedGemmWgradKernel:
         out_single_expert: Optional[cute.Tensor] = None,
     ) -> None:
 
-        # This should be removed after from_dlpack fix.
-        if cutlass.const_expr(mat_a.iterator.dtype.width < 8):
+        # SM100 still needs the packed-FP4 from_dlpack layout workaround.
+        # Rubin consumes the native 4-bit layout directly.
+        if cutlass.const_expr(self.architecture != "sm_107" and mat_a.iterator.dtype.width < 8):
             mat_a = cute.make_tensor(
                 mat_a.iterator,
                 cute.recast_layout(mat_a.iterator.dtype.width, 8, mat_a.layout),
             )
-        if cutlass.const_expr(mat_b.iterator.dtype.width < 8):
+        if cutlass.const_expr(self.architecture != "sm_107" and mat_b.iterator.dtype.width < 8):
             mat_b = cute.make_tensor(
                 mat_b.iterator,
                 cute.recast_layout(mat_b.iterator.dtype.width, 8, mat_b.layout),
