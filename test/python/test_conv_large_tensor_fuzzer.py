@@ -254,8 +254,8 @@ def _create_filtered_execution_plans(graph, graph_engine_index: int) -> None:
 MEMORY_BUDGET_BYTES = _device_memory_budget()
 WORK_BUDGET_FLOPS = _work_budget_flops()
 WORKSPACE_OVERHEAD = 0.15  # fraction added for cuDNN workspace + allocator slack
-DEFAULT_NUM_TESTS_L0 = _num_tests(_NUM_TESTS_L0_ENV, 48)  # default smoke slice
-DEFAULT_NUM_TESTS_L1 = _num_tests(_NUM_TESTS_L1_ENV, 64)  # longer expansion slice
+DEFAULT_NUM_TESTS_L0 = _num_tests(_NUM_TESTS_L0_ENV, 64)  # default smoke slice
+DEFAULT_NUM_TESTS_L1 = _num_tests(_NUM_TESTS_L1_ENV, 448)  # longer expansion slice
 DEFAULT_SEED_L0 = 42
 DEFAULT_SEED_L1 = 12345
 MAX_REGEN_ATTEMPTS = 50
