@@ -15,17 +15,36 @@ The framework-side autograd wiring stays in the caller (e.g. a ``torch.autograd.
 that calls the forward wrapper in ``forward()`` and the backward wrapper in
 ``backward()``); these APIs are pure kernels-plus-validation.
 
-Validated envelope (``check_support``): compute capability 10.0, ``ratio == 4``,
-``coff in {1, 2}`` (``coff == 2`` is the production CSA/HCA configuration), BF16
-``kv``/``score``/``out``, FP32 ``ape``, int32 ``cu_seqlens``/``cu_seqlens_comp``, and
-int32 flat offsets (``total_tokens * coff * head_dim < 2**31``). The kernels themselves
-are generic over ``ratio`` and ``head_dim`` too; the ratio gate can be lifted once
-validated.
+Validated envelope (``check_support``): compute capability 10.0, BF16 ``kv``/``score``/
+``out``, FP32 ``ape``, int32 ``cu_seqlens``/``cu_seqlens_comp``, int32 flat offsets
+(``total_tokens * coff * head_dim < 2**31``), and per ratio:
 
-Numerics contract (see ``compressor_sm100.py`` for details): fp32 arithmetic with one
-final bf16 rounding, ``mul.rn``/``fma.rn`` pinned in PTX. Forward, ``dKV`` and ``dScore``
-are bitwise run-to-run deterministic; ``dAPE`` uses one fp32 atomic per ``(k, dim)`` per
-CTA and is not (the backward APIs refuse to run under
+- ``ratio == 4``, ``coff in {1, 2}`` (``coff == 2`` is the production CSA/HCA
+  configuration, ``coff == 1`` the own-block window form) — served by the generic
+  kernels in ``compressor_sm100.py`` (whole window in registers; optimal at small
+  ratios, register-bound beyond ``ratio = 32``);
+- ``ratio == 128``, ``coff in {1, 2}``, ``head_dim in {128, 512}`` — served by the
+  dedicated kernels in ``compressor_sm100_r128.py`` (bucketed-schedule chunked-softmax
+  forward; staged smem backward with fused per-chunk reductions). The wrappers route
+  by ``ratio`` transparently. NOTE: the numerics contracts differ per family — see
+  below.
+
+Numerics contract (see the kernel modules and docs/fe-oss-apis/csa.md for details):
+fp32 arithmetic with one final bf16 rounding, ``mul.rn``/``fma.rn`` pinned in PTX.
+Forward, ``dKV`` and ``dScore`` are bitwise run-to-run deterministic in BOTH families.
+At ``ratio == 4`` dKV/dScore are additionally bit-identical to the fp32-intermediate
+eager autograd; at ``ratio == 128`` the contract is faithfulness to that
+fp32-intermediate eager reference: out/dKV/dScore match it within final-bf16 rounding
+at the gate tolerances (differing elements <= max(1, 0.1%), max_abs <= 1.6e-2,
+calibrated on the documented gate input distribution — absolute bf16 deviations scale
+with the input magnitudes), inputs that overflow the reference's fp32 intermediates
+reproduce its NaN/Inf propagation (both sides compute in fp32; gate-tested), and on
+inputs whose fp32 intermediates stay finite those outputs additionally carry
+fp64-oracle parity (at least as close to an fp64 oracle as the eager reference). That
+is the approved deterministic tolerance contract (reduction reorders + fast-exp
+buckets).
+``dAPE`` uses one fp32 atomic per ``(k, dim)`` per CTA in both families and is not
+run-to-run deterministic (the backward APIs refuse to run under
 ``torch.use_deterministic_algorithms(True)``).
 """
 
@@ -50,6 +69,12 @@ from .compressor_sm100 import (
     precompile_fwd,
     run_bwd,
     run_fwd,
+)
+from .compressor_sm100_r128 import (
+    precompile_bwd_r128,
+    precompile_fwd_r128,
+    run_bwd_r128,
+    run_fwd_r128,
 )
 
 # int32 flat offsets: every element offset the kernels compute must fit in int32.
@@ -170,10 +195,21 @@ class _CSACompressorBase(APIBase):
         APIs; there is no soft fallback path inside this API.
         """
         self._logger.debug("Entering check_support")
-        self._value_error_if(
-            self.ratio != 4 or self.coff not in (1, 2),
-            f"CSA compressor is validated for ratio=4, coff in {{1, 2}} (coff=2 is the production CSA/HCA form); got ratio={self.ratio}, coff={self.coff}",
-        )
+        if self.ratio == 4:
+            self._value_error_if(
+                self.coff not in (1, 2),
+                f"CSA compressor at ratio=4 is validated for coff in {{1, 2}} (coff=2 is the production CSA/HCA form), got coff={self.coff}",
+            )
+        elif self.ratio == 128:
+            self._value_error_if(
+                self.coff not in (1, 2),
+                f"CSA compressor at ratio=128 supports coff in {{1, 2}}, got coff={self.coff}",
+            )
+        else:
+            self._value_error_if(
+                True,
+                f"CSA compressor is validated for ratio in {{4, 128}} only, got ratio={self.ratio}, coff={self.coff}",
+            )
         self._value_error_if(
             self.kv_desc.ndim != 2,
             f"kv must be 2-D (total_tokens, coff * head_dim), got {self.kv_desc.shape}",
@@ -221,6 +257,12 @@ class _CSACompressorBase(APIBase):
             total_comp * head_dim >= _INT32_LIMIT,
             f"total_comp * head_dim must be < 2**31 for int32 flat offsets, got {total_comp} * {head_dim}",
         )
+        # APE is indexed as (k % ratio) * width + col with the same int32 arithmetic
+        # (only reachable at extreme head_dims, but cheap to pin explicitly).
+        self._value_error_if(
+            self.ratio * width >= _INT32_LIMIT,
+            f"ratio * coff * head_dim must be < 2**31 for int32 APE offsets, got {self.ratio} * {width}",
+        )
         # gridDim.y bound of the forward launch schedule (64/128-thread column groups):
         # head_dims beyond this cannot be launched (the pre-vectorization schedule had
         # the same 128 * 65535 envelope, just unchecked).
@@ -228,6 +270,15 @@ class _CSACompressorBase(APIBase):
             head_dim > _MAX_HEAD_DIM,
             f"head_dim must be <= {_MAX_HEAD_DIM} (forward launch gridDim.y bound), got {head_dim}",
         )
+        # The ratio=128 kernels are gated to the head_dims actually validated on
+        # hardware (numerics gate + ptxas 0-spill + benchmark, see
+        # compressor_sm100_r128.py); the kernels are generic and the gate can be
+        # widened per head_dim once validated.
+        if self.ratio == 128:
+            self._value_error_if(
+                head_dim not in (128, 512),
+                f"CSA compressor at ratio=128 is validated for head_dim in {{128, 512}} only, got head_dim={head_dim}",
+            )
         # Rows (including static-capacity padding rows) gather a window of `ratio`
         # tokens; the eager gather has the same requirement.
         self._value_error_if(
@@ -325,13 +376,23 @@ class CSACompressorForward(_CSACompressorBase):
         self._ensure_support_checked()
         if self._compiled_kernel is not None:
             return
-        precompile_fwd(self.ratio, self.head_dim, self.coff, self.target_device)
+        # Route by ratio: the dedicated ratio=128 kernels share the launch machinery
+        # and cache pattern with the generic kernels (JIT cache keyed per
+        # (ratio, head_dim, coff, device) plus the compile-time schedule); the
+        # numerics contracts intentionally DIFFER per family — see the module
+        # docstring and docs/fe-oss-apis/csa.md.
+        if self.ratio == 128:
+            precompile_fwd_r128(self.ratio, self.head_dim, self.coff, self.target_device)
+            run = run_fwd_r128
+        else:
+            precompile_fwd(self.ratio, self.head_dim, self.coff, self.target_device)
+            run = run_fwd
 
         ratio, head_dim, coff = self.ratio, self.head_dim, self.coff
 
         def tensor_api(kv, score, ape, cu_seqlens, cu_seqlens_comp, out, stream_handle):
-            """Per-config closure: invoke ``run_fwd`` with the bound ``(ratio, head_dim, coff)``."""
-            run_fwd(kv, score, ape, cu_seqlens, cu_seqlens_comp, out, out.shape[0], ratio, head_dim, coff, stream_handle=stream_handle)
+            """Per-config closure: invoke the routed forward with the bound ``(ratio, head_dim, coff)``."""
+            run(kv, score, ape, cu_seqlens, cu_seqlens_comp, out, out.shape[0], ratio, head_dim, coff, stream_handle=stream_handle)
 
         self._compiled_kernel = tensor_api
         self._logger.debug("Kernel compiled successfully")
@@ -376,8 +437,13 @@ class CSACompressorBackward(_CSACompressorBase):
     separate zero-fill kernels. Exception: when ``total_comp == 0`` the kernel is not
     launched and the buffers are left untouched, so a caller that needs autograd-exact
     zeros in that case must zero them itself (the high-level wrapper does).
-    ``grad_ape`` must always be zero-initialized: it is accumulated with fp32 atomics
-    and is not bitwise run-to-run deterministic (``grad_kv``/``grad_score`` are);
+    ``grad_ape`` must be zero-initialized by the caller before EVERY ``execute`` call
+    and before every CUDA-graph replay that reuses the buffer: the kernel only
+    ACCUMULATES into it (fp32 atomics, not bitwise run-to-run deterministic —
+    ``grad_kv``/``grad_score`` are) and never clears it, so a reused buffer otherwise
+    carries the previous invocation's sums. (The high-level wrapper allocates a fresh
+    zeroed buffer per call; because that zero-fill is captured together with the
+    kernel, wrapper graph replays re-zero automatically.)
     ``execute`` raises under ``torch.use_deterministic_algorithms(True)``. Incoming
     gradients on static-capacity padding rows (``[cu_seqlens_comp[-1], total_comp)``)
     are ignored.
@@ -389,13 +455,19 @@ class CSACompressorBackward(_CSACompressorBase):
         self._ensure_support_checked()
         if self._compiled_kernel is not None:
             return
-        precompile_bwd(self.ratio, self.head_dim, self.coff, self.target_device)
+        # Route by ratio, as in the forward.
+        if self.ratio == 128:
+            precompile_bwd_r128(self.ratio, self.head_dim, self.coff, self.target_device)
+            run = run_bwd_r128
+        else:
+            precompile_bwd(self.ratio, self.head_dim, self.coff, self.target_device)
+            run = run_bwd
 
         ratio, head_dim, coff = self.ratio, self.head_dim, self.coff
 
         def tensor_api(kv, score, ape, cu_seqlens, cu_seqlens_comp, grad_out, grad_kv, grad_score, grad_ape, stream_handle):
-            """Per-config closure: invoke ``run_bwd`` with the bound ``(ratio, head_dim, coff)``."""
-            run_bwd(
+            """Per-config closure: invoke the routed backward with the bound ``(ratio, head_dim, coff)``."""
+            run(
                 kv,
                 score,
                 ape,
@@ -425,7 +497,7 @@ class CSACompressorBackward(_CSACompressorBase):
         grad_out: torch.Tensor,  # (total_comp, head_dim) BF16, contiguous
         grad_kv: torch.Tensor,  # (total_tokens, coff * head_dim) BF16 (may be uninitialized; fully written when total_comp > 0)
         grad_score: torch.Tensor,  # (total_tokens, coff * head_dim) BF16 (may be uninitialized; fully written when total_comp > 0)
-        grad_ape: torch.Tensor,  # (ratio, coff * head_dim) FP32, ZERO-INITIALIZED
+        grad_ape: torch.Tensor,  # (ratio, coff * head_dim) FP32, zero-initialized before EVERY call/replay (kernel accumulates)
         current_stream: Optional[cuda.CUstream] = None,
     ) -> None:
         """Run the compiled backward kernel into the gradient buffers (see class docs)."""
@@ -522,11 +594,13 @@ def csa_compressor_forward_wrapper(
         cu_seqlens: ``(B + 1,)`` int32 cumulative token counts per segment.
         cu_seqlens_comp: ``(B + 1,)`` int32 cumulative compressed-block counts,
             ``cu_seqlens_comp[b + 1] - cu_seqlens_comp[b] == seqlen_b // ratio``.
-        ratio: compression ratio (tokens per output block); validated envelope: 4.
+        ratio: compression ratio (tokens per output block); validated envelope:
+            {4, 128} (the wrappers route to the matching kernel family by ratio).
         head_dim: output feature dimension; inferred from ``kv`` width when omitted.
         coff: 1 for the own-block window form (window = ``ratio`` tokens, no overlap) or
             2 for the overlapping-window form (window = ``2 * ratio``); validated
-            envelope: {1, 2}.
+            envelope: {1, 2} at both ratios (ratio=128 additionally requires head_dim
+            in {128, 512}).
         total_comp: output row count. Defaults to ``cu_seqlens_comp[-1]`` (synchronizes);
             pass it explicitly (e.g. a static CUDA-graph capacity, which must be
             ``>= cu_seqlens_comp[-1]``) to stay capture-safe.
@@ -579,7 +653,6 @@ def csa_compressor_backward_wrapper(
            'grad_ape': (ratio, coff * head_dim) FP32}``
     """
     head_dim = _infer_head_dim(kv, head_dim, coff)
-    _reject_deterministic_backward()
     if grad_out.ndim != 2:
         raise ValueError(f"grad_out must be 2-D (total_comp, head_dim), got {tuple(grad_out.shape)}")
     api = _get_api("bwd", kv, score, ape, cu_seqlens, cu_seqlens_comp, tuple(grad_out.shape), ratio, coff)
