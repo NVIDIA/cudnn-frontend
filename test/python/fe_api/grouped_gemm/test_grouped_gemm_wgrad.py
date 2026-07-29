@@ -73,8 +73,6 @@ def _test_grouped_gemm_wgrad_dense_compile_execute(
     )
     inputs = allocate_grouped_gemm_wgrad_tensors(cfg)
     wgrad_tensor = allocate_grouped_gemm_wgrad_output(cfg)
-    if accumulate_on_output:
-        wgrad_tensor.zero_()
 
     op = cudnn.GroupedGemmWgradSm100(
         sample_a=inputs["a_tensor"],
@@ -273,7 +271,12 @@ def _test_grouped_gemm_wgrad_discrete_compile_execute(
         sf_dtype=sf_dtype,
     )
     inputs = allocate_grouped_gemm_wgrad_tensors(cfg)
-    wgrad_tensor = allocate_grouped_gemm_wgrad_output(cfg)
+    wgrad_tensor = allocate_grouped_gemm_wgrad_output(cfg, accumulate_on_output=accumulate_on_output)
+    expected = inputs["ref_result"]
+    if accumulate_on_output:
+        wgrad_tensor.fill_(1)
+        if expected is not None:
+            expected = expected + 1
 
     op = cudnn.GroupedGemmWgradSm100(
         sample_a=inputs["a_tensor"],
@@ -309,7 +312,7 @@ def _test_grouped_gemm_wgrad_discrete_compile_execute(
         global_scale_b=inputs["global_scale_b"],
     )
     torch.cuda.synchronize()
-    check_ref_grouped_gemm_wgrad(wgrad_tensor, inputs["ref_result"], cfg["tolerance"])
+    check_ref_grouped_gemm_wgrad(wgrad_tensor, expected, cfg["tolerance"])
 
 
 @pytest.mark.L0
