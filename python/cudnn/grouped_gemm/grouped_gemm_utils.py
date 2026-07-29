@@ -56,3 +56,19 @@ def select_grouped_gemm_backend(
 
 def backend_cache_key(backend, *components):
     return (backend.value, *components)
+
+
+def rubin_single_group_offsets_kwarg(is_rubin_kernel, use_single_group_runtime_offsets):
+    """Return the ``use_single_group_runtime_offsets`` kwarg for a kernel constructor.
+
+    The Rubin (sm107) grouped GEMM kernels predate ``use_single_group_runtime_offsets``
+    and do not accept it, so forwarding it unconditionally is a ``TypeError`` even when
+    it is ``False``. Send it only to kernels that implement it, and reject an explicit
+    request on Rubin rather than silently ignoring it and running a different schedule
+    than the caller asked for.
+    """
+    if not is_rubin_kernel:
+        return {"use_single_group_runtime_offsets": use_single_group_runtime_offsets}
+    if use_single_group_runtime_offsets:
+        raise NotImplementedError("The Rubin grouped GEMM kernels do not support use_single_group_runtime_offsets")
+    return {}

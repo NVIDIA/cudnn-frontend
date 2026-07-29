@@ -50,6 +50,7 @@ from .grouped_gemm_quant import (
     BlockScaledMoEGroupedGemmQuantKernel,
 )
 from ..moe_utils import MoEWeightMode
+from ..grouped_gemm_utils import rubin_single_group_offsets_kwarg
 from cutlass.cute.nvgpu import OperandMajorMode
 from cutlass.cute.runtime import from_dlpack
 
@@ -594,7 +595,7 @@ class GroupedGemmQuantSm100(APIBase):
             expert_cnt=self.expert_cnt,
             weight_mode=self.weight_mode,
             use_dynamic_sched=self.use_dynamic_sched,
-            use_single_group_runtime_offsets=self.use_single_group_runtime_offsets,
+            **rubin_single_group_offsets_kwarg(self._is_rubin_kernel, self.use_single_group_runtime_offsets),
         )
         if self._is_rubin_kernel:
             # The Rubin quant kernel supports optional C materialization, but

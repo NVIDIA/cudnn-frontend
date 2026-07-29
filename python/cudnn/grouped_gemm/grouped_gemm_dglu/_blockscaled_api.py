@@ -45,6 +45,7 @@ Discrete mode
 
 from .moe_blockscaled_grouped_gemm_dglu_dbias import BlockScaledMoEGroupedGemmDgluDbiasKernel
 from ..moe_utils import MoEWeightMode
+from ..grouped_gemm_utils import rubin_single_group_offsets_kwarg
 from cuda.bindings import driver as cuda
 import os
 import torch
@@ -717,7 +718,7 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
             weight_mode=self.weight_mode,
             act_func=self.act_func,
             use_dynamic_sched=self.use_dynamic_sched,
-            use_single_group_runtime_offsets=self.use_single_group_runtime_offsets,
+            **rubin_single_group_offsets_kwarg(self._is_rubin_kernel, self.use_single_group_runtime_offsets),
         )
 
         hardware_info = cutlass.utils.HardwareInfo()
