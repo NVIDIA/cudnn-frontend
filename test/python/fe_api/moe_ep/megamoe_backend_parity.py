@@ -82,14 +82,8 @@ def main():
     x = (torch.randn((TOKENS, HIDDEN), device=device, generator=gen) / 10).bfloat16()
     # PR layouts: fc1 (E_local, H, 2I) gate-first, fc2 (E_local, I, H)
     e_local = EXPERTS // world
-    fc1_w = (
-        torch.randn((e_local, HIDDEN, 2 * INTERMEDIATE), device=device, generator=gen)
-        * 0.05
-    ).bfloat16()
-    fc2_w = (
-        torch.randn((e_local, INTERMEDIATE, HIDDEN), device=device, generator=gen)
-        * 0.05
-    ).bfloat16()
+    fc1_w = (torch.randn((e_local, HIDDEN, 2 * INTERMEDIATE), device=device, generator=gen) * 0.05).bfloat16()
+    fc2_w = (torch.randn((e_local, INTERMEDIATE, HIDDEN), device=device, generator=gen) * 0.05).bfloat16()
     scores = torch.rand((TOKENS, EXPERTS), device=device, generator=gen)
     _, ids = scores.topk(TOPK, dim=-1)
     ids = ids.long()
@@ -138,9 +132,7 @@ def main():
     }
     dtw_drop_zero = bool((dtw[0, TOPK - 1] == 0).item())
     print(
-        f"[rank {rank}] bwd rel_err: "
-        + "  ".join(f"{k}={v:.3e}" for k, v in errs.items())
-        + f"  dtw[-1 slot]==0: {dtw_drop_zero}",
+        f"[rank {rank}] bwd rel_err: " + "  ".join(f"{k}={v:.3e}" for k, v in errs.items()) + f"  dtw[-1 slot]==0: {dtw_drop_zero}",
         flush=True,
     )
 

@@ -334,9 +334,7 @@ class MoeEp:
             self._backend = _megamoe.maybe_create(self, device, token_count)
             self._backend_resolved = True
         if self._backend is not None:
-            return self._backend.forward(
-                activation, fc1_weight, fc2_weight, topk_idx, topk_weights
-            )
+            return self._backend.forward(activation, fc1_weight, fc2_weight, topk_idx, topk_weights)
 
         # No device backend for this configuration/environment: return newly
         # allocated, uninitialized storage (the original API-stub contract).

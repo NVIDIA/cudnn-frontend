@@ -63,8 +63,8 @@ _COMBINE_WIRE = {
 }
 
 _state = {
-    "modules": None,       # imported megamoe modules, once per process
-    "mode": None,          # "no_dist" | "dist"
+    "modules": None,  # imported megamoe modules, once per process
+    "mode": None,  # "no_dist" | "dist"
     "nvshmem_ready": False,
     "warned": False,
 }
@@ -92,10 +92,7 @@ def _import_megamoe(single_rank: bool):
     if _state["modules"] is not None:
         want = "no_dist" if single_rank else "dist"
         if _state["mode"] != want:
-            raise BackendUnavailable(
-                f"megamoe already imported in {_state['mode']!r} mode; cannot "
-                f"serve a {want!r} MoeEp in the same process"
-            )
+            raise BackendUnavailable(f"megamoe already imported in {_state['mode']!r} mode; cannot " f"serve a {want!r} MoeEp in the same process")
         return _state["modules"]
 
     root = os.environ.get("CUDNN_MEGAMOE_ROOT")
@@ -160,42 +157,23 @@ def _check_supported(op) -> None:
         raise BackendUnavailable("CUDA is not available")
     major, _ = torch.cuda.get_device_capability()
     if major < 10:
-        raise BackendUnavailable(
-            f"MegaMoE kernels need SM100+, found SM{major}x"
-        )
+        raise BackendUnavailable(f"MegaMoE kernels need SM100+, found SM{major}x")
     if not op.apply_topk_in_fc1:
         raise BackendUnavailable("kernel supports apply_topk_in_fc1=True only")
     if op.hidden_size % 32 or op.intermediate_size % 32:
-        raise BackendUnavailable(
-            "hidden_size and intermediate_size must be multiples of 32"
-        )
+        raise BackendUnavailable("hidden_size and intermediate_size must be multiples of 32")
     if op.generate_c and (op.hidden_size % 128 or op.intermediate_size % 128):
-        raise BackendUnavailable(
-            "generate_c/backward path needs hidden_size and intermediate_size "
-            "to be multiples of 128"
-        )
+        raise BackendUnavailable("generate_c/backward path needs hidden_size and intermediate_size " "to be multiples of 128")
     if op.combine_format not in _COMBINE_WIRE:
-        raise BackendUnavailable(
-            f"combine_format={op.combine_format.value!r} has no MXFP8-kernel "
-            "wire format"
-        )
+        raise BackendUnavailable(f"combine_format={op.combine_format.value!r} has no MXFP8-kernel " "wire format")
     if op.generate_c and op.combine_format is not MoeFormat.BF16:
-        raise BackendUnavailable(
-            "generate_c/backward needs combine_format='bf16' (dtw reads the "
-            "bf16 combine staging)"
-        )
+        raise BackendUnavailable("generate_c/backward needs combine_format='bf16' (dtw reads the " "bf16 combine staging)")
     if op.ep_group is None:
         if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
-            raise BackendUnavailable(
-                "ep_group=None (one-rank execution) inside an initialized "
-                "multi-rank process is not supported"
-            )
+            raise BackendUnavailable("ep_group=None (one-rank execution) inside an initialized " "multi-rank process is not supported")
     else:
         if dist.get_world_size(op.ep_group) != dist.get_world_size():
-            raise BackendUnavailable(
-                "ep_group must span the entire torch.distributed world "
-                "(NVSHMEM is bootstrapped over the global world)"
-            )
+            raise BackendUnavailable("ep_group must span the entire torch.distributed world " "(NVSHMEM is bootstrapped over the global world)")
 
 
 def maybe_create(op, device: torch.device, token_count: int):
@@ -313,9 +291,9 @@ class _MegamoeBackend:
             raise BackendUnavailable("cannot size kernel buffers for 0 tokens")
         self._max_tokens = max_tokens
 
-        self._layer = None            # built on first forward (needs weights)
+        self._layer = None  # built on first forward (needs weights)
         self._weight_sig = None
-        self._stash_serial = 0        # forward serial whose pools are live
+        self._stash_serial = 0  # forward serial whose pools are live
         self._done_serial = 0
 
     # -- construction ---------------------------------------------------
@@ -388,8 +366,7 @@ class _MegamoeBackend:
         T = x.shape[0]
         if T > self._max_tokens:
             raise RuntimeError(
-                f"token count {T} exceeds the backend capacity {self._max_tokens} "
-                "(pass max_tokens_per_rank to MoeEp to size the kernel buffers)"
+                f"token count {T} exceeds the backend capacity {self._max_tokens} " "(pass max_tokens_per_rank to MoeEp to size the kernel buffers)"
             )
         self._sync_weights(fc1_weight, fc2_weight)
         idx = topk_idx.to(torch.int64)
@@ -428,45 +405,29 @@ class _MegamoeBackend:
                 group=op.ep_group,
             )
             if not bool((t_all == T).all().item()):
-                raise RuntimeError(
-                    "megamoe backend requires the same token count on every "
-                    f"EP rank, got {t_all.tolist()}"
-                )
+                raise RuntimeError("megamoe backend requires the same token count on every " f"EP rank, got {t_all.tolist()}")
             ids_all = torch.empty((world, T, K), dtype=topk_idx.dtype, device=device)
-            dist.all_gather_into_tensor(
-                ids_all, topk_idx.contiguous(), group=op.ep_group
-            )
+            dist.all_gather_into_tensor(ids_all, topk_idx.contiguous(), group=op.ep_group)
         else:
             ids_all = topk_idx.view(1, T, K)
 
         local = ids_all.reshape(-1) - op.ep_rank * E_local
-        counts = torch.bincount(
-            local[(local >= 0) & (local < E_local)], minlength=E_local
-        )
+        counts = torch.bincount(local[(local >= 0) & (local < E_local)], minlength=E_local)
         counts_list = counts.tolist()
         padded = [-(-n // 128) * 128 for n in counts_list]
         Mp = max(sum(padded), 128)
         doffs = [sum(padded[:i]) for i in range(E_local)]
         if sum(counts_list):
-            valid = torch.cat(
-                [
-                    torch.arange(o, o + n, device=device)
-                    for o, n in zip(doffs, counts_list)
-                ]
-            )
+            valid = torch.cat([torch.arange(o, o + n, device=device) for o, n in zip(doffs, counts_list)])
         else:
             valid = torch.empty(0, dtype=torch.long, device=device)
 
         lv = mods["local_pool_views"](fwd)
-        src_rank, src_token, src_topk, _, _ = mods["decode_token_src_metadata"](
-            lv["token_src_metadata"][:Mp]
-        )
+        src_rank, src_token, src_topk, _, _ = mods["decode_token_src_metadata"](lv["token_src_metadata"][:Mp])
         sr = src_rank[valid].long()
         st = src_token[valid].long()
         sk = src_topk[valid].long()
-        expert = torch.repeat_interleave(
-            torch.arange(E_local, dtype=torch.long, device=device), counts
-        )
+        expert = torch.repeat_interleave(torch.arange(E_local, dtype=torch.long, device=device), counts)
 
         # contract row order: expert asc, then (src_rank, src_token, src_slot)
         key = ((expert * world + sr) * T + st) * K + sk
@@ -475,13 +436,9 @@ class _MegamoeBackend:
         rows = fwd.fc1_c[:Mp][valid][order]
         n = rows.shape[0]
         pair = rows.view(n, I // 32, 2, 32)
-        fc1_c = torch.cat(
-            [pair[:, :, 0].reshape(n, I), pair[:, :, 1].reshape(n, I)], dim=-1
-        ).contiguous()
+        fc1_c = torch.cat([pair[:, :, 0].reshape(n, I), pair[:, :, 1].reshape(n, I)], dim=-1).contiguous()
 
-        route_metadata = torch.stack(
-            [expert[order], sr[order], st[order], sk[order]], dim=-1
-        ).to(torch.int32)
+        route_metadata = torch.stack([expert[order], sr[order], st[order], sk[order]], dim=-1).to(torch.int32)
         return fc1_c, route_metadata
 
     # -- backward ---------------------------------------------------------
@@ -501,10 +458,7 @@ class _MegamoeBackend:
         if self._layer is None or self._stash_serial == 0:
             raise RuntimeError("backward called before any forward on this MoeEp")
         if self._done_serial == self._stash_serial:
-            raise RuntimeError(
-                "backward already consumed this forward's stash; run another "
-                "forward first"
-            )
+            raise RuntimeError("backward already consumed this forward's stash; run another " "forward first")
         self._sync_weights(fc1_weight, fc2_weight)
 
         layer = self._layer
