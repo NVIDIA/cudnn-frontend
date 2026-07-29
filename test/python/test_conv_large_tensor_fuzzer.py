@@ -23,6 +23,7 @@ import os
 import random
 import shlex
 import sys
+from collections import Counter
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import List, Optional, Tuple
@@ -99,11 +100,9 @@ def _graph_engine_indices() -> List[int]:
         raise ValueError(f"{_GRAPH_ENGINE_INDICES_ENV} must be a comma-separated list of graph engine indices") from e
     if not indices:
         raise ValueError(f"{_GRAPH_ENGINE_INDICES_ENV} must contain at least one graph engine index")
-    seen = set()
-    for index in indices:
-        if index in seen:
-            raise ValueError(f"{_GRAPH_ENGINE_INDICES_ENV} contains duplicate graph engine index {index}")
-        seen.add(index)
+    duplicates = [value for value, count in Counter(indices).items() if count > 1]
+    if duplicates:
+        raise ValueError(f"{_GRAPH_ENGINE_INDICES_ENV} contains duplicate graph engine indices: {duplicates}")
     return indices
 
 
@@ -1155,7 +1154,7 @@ def _sparse_filter_cpu_tensor(cfg: LargeTensorConfig, rng: random.Random) -> tor
     flat = W.view(cfg.k, reduction_size)
     for k_idx in range(cfg.k):
         positions = rng.sample(range(reduction_size), nonzero_count)
-        signs = [1 if rng.getrandbits(1) else -1 for _ in range(nonzero_count)]
+        signs = rng.choices((-1, 1), k=nonzero_count)
         indices = torch.tensor(positions, dtype=torch.long)
         values = torch.tensor(signs, dtype=cfg.dtype)
         flat[k_idx, indices] = values
