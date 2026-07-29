@@ -93,6 +93,7 @@ class DenseScoreRecomputeSm100:
     arch = 100
     WARP_SIZE = 32
     WARPGROUP_SIZE = 128
+    max_q_tokens_per_tile = 2
 
     def __init__(
         self,
@@ -133,7 +134,9 @@ class DenseScoreRecomputeSm100:
         self.num_k_chunks = self.head_dim_padded // self.k_block_size
 
         self.q_tokens_per_tile = m_block_size // qhead_per_kvhead
-        assert self.q_tokens_per_tile <= 2, f"q_tokens_per_tile ({self.q_tokens_per_tile}) must be 1 or 2"
+        assert (
+            self.q_tokens_per_tile <= self.max_q_tokens_per_tile
+        ), f"q_tokens_per_tile ({self.q_tokens_per_tile}) must not exceed {self.max_q_tokens_per_tile}"
 
         self.tmem_repetition = self.m_block_size // 4
 

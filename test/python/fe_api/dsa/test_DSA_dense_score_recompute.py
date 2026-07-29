@@ -274,10 +274,19 @@ def test_DSA_dense_score_recompute_wrapper(
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("score_type", ["indexer", "attention"])
+@pytest.mark.parametrize(
+    "score_type,qhead_per_kv_head,s_q_default",
+    [
+        pytest.param("indexer", 64, 128, id="indexer_qh64"),
+        pytest.param("attention", 64, 128, id="attention_qh64"),
+        pytest.param("indexer", 32, 5, id="indexer_qh32_query_tail"),
+    ],
+)
 @torch_fork_set_rng(seed=13)
 def test_DSA_dense_score_recompute_wrapper_mxfp8_matches_dequant_reference(
     score_type,
+    qhead_per_kv_head,
+    s_q_default,
     request,
 ):
     try:
@@ -290,11 +299,11 @@ def test_DSA_dense_score_recompute_wrapper_mxfp8_matches_dequant_reference(
     cfg = dsa_init(
         request=request,
         head_dim=128,
-        qhead_per_kv_head=64,
+        qhead_per_kv_head=qhead_per_kv_head,
         score_type=score_type,
         min_compute_capability=100,
         b_default=1,
-        s_q_default=128,
+        s_q_default=s_q_default,
         s_kv_default=128,
     )
     ratio = 4

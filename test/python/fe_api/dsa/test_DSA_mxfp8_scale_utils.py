@@ -30,24 +30,40 @@ def test_mxfp8_scale_pack_uses_blackwell_datapath_order_host_only():
     assert torch.equal(packed[16:32], expected_second_datapath_words)
 
 
-def test_mxfp8_scale_pack_order_bshd_q_host_only():
-    bs, seqlen_q, n_heads_q, sf_groups = 2, 2, 64, 4
+@pytest.mark.parametrize(
+    "qhead_per_kv_head,seqlen_q",
+    [
+        pytest.param(64, 2, id="qh64"),
+        pytest.param(32, 4, id="qh32"),
+    ],
+)
+def test_mxfp8_scale_pack_order_bshd_q_host_only(qhead_per_kv_head, seqlen_q):
+    bs, n_heads_q, sf_groups = 2, qhead_per_kv_head, 4
     batch = torch.arange(bs, dtype=torch.int64).view(bs, 1, 1, 1) * 100_000
     token = torch.arange(seqlen_q, dtype=torch.int64).view(1, seqlen_q, 1, 1) * 1_000
     head = torch.arange(n_heads_q, dtype=torch.int64).view(1, 1, n_heads_q, 1) * 10
     group = torch.arange(sf_groups, dtype=torch.int64).view(1, 1, 1, sf_groups)
     q_scale = batch + token + head + group
 
-    q_mkl = mxfp8_scale_utils.logical_q_scale_to_mkl(q_scale, qhead_per_kv_head=64)
+    q_mkl = mxfp8_scale_utils.logical_q_scale_to_mkl(
+        q_scale,
+        qhead_per_kv_head=qhead_per_kv_head,
+    )
 
     assert q_mkl.shape == (128, 4, 2)
     assert torch.equal(q_mkl[0, :, 0], q_scale[0, 0, 0, :])
-    assert torch.equal(q_mkl[63, :, 0], q_scale[0, 0, 63, :])
-    assert torch.equal(q_mkl[64, :, 0], q_scale[0, 1, 0, :])
-    assert torch.equal(q_mkl[127, :, 0], q_scale[0, 1, 63, :])
+    assert torch.equal(
+        q_mkl[qhead_per_kv_head - 1, :, 0],
+        q_scale[0, 0, qhead_per_kv_head - 1, :],
+    )
+    assert torch.equal(q_mkl[qhead_per_kv_head, :, 0], q_scale[0, 1, 0, :])
+    assert torch.equal(q_mkl[127, :, 0], q_scale[0, seqlen_q - 1, qhead_per_kv_head - 1, :])
     assert torch.equal(q_mkl[0, :, 1], q_scale[1, 0, 0, :])
 
-    q_packed = mxfp8_scale_utils.pack_q_scale_bshd(q_scale, qhead_per_kv_head=64)
+    q_packed = mxfp8_scale_utils.pack_q_scale_bshd(
+        q_scale,
+        qhead_per_kv_head=qhead_per_kv_head,
+    )
     q_unpacked = mxfp8_scale_utils.unpack_blockscaled_scale_mkl(q_packed, mn=128, sf_groups=4)
     assert torch.equal(q_unpacked, q_mkl)
 
@@ -173,3 +189,67 @@ def test_mxfp8_scale_pack_thd_custom_256_padding_host_only():
     assert k_packed.shape == (1, 512, 4)
     assert torch.equal(q_mkl[256 * 64, :, 0], q_scale[1, 0])
     assert torch.equal(k_mkl[256, :, 0], k_scale[1, 0])
+
+
+def test_blockscaled_umma_descriptor_bitfields_host_only():
+    cutlass = pytest.importorskip("cutlass")
+    mma_desc = pytest.importorskip("cudnn.deepseek_sparse_attention.utils.sm100.mma_desc")
+
+    desc = mma_desc.make_blockscaled_instr_desc(
+        cutlass.Float8E4M3FN,
+        cutlass.Float8E5M2,
+        M=256,
+        N=64,
+        a_major=mma_desc.Major.MN,
+        b_major=mma_desc.Major.K,
+        a_sf_id=3,
+        b_sf_id=2,
+        scale_format=1,
+        is_sparse=True,
+    )
+
+    assert (desc >> 2) & 0x1 == 1  # sparse
+    assert (desc >> 4) & 0x3 == 2  # B scale-factor ID
+    assert (desc >> 7) & 0x7 == mma_desc.MXF8F6F4Format.E4M3
+    assert (desc >> 10) & 0x7 == mma_desc.MXF8F6F4Format.E5M2
+    assert (desc >> 15) & 0x1 == mma_desc.Major.MN
+    assert (desc >> 16) & 0x1 == mma_desc.Major.K
+    assert (desc >> 17) & 0x3F == 64 // 8
+    assert (desc >> 23) & 0x1 == 1  # E8M0 scale format
+    assert (desc >> 24) & 0x1F == 256 // 16
+    assert (desc >> 29) & 0x3 == 3  # A scale-factor ID
+
+    reserved_mask = 0x3 | (1 << 3) | (1 << 6) | (0x3 << 13) | (1 << 31)
+    assert desc & reserved_mask == 0
+
+
+def test_blockscaled_mma_op_adapter_maps_scale_and_major_modes_host_only():
+    from types import SimpleNamespace
+
+    cutlass = pytest.importorskip("cutlass")
+    cute = pytest.importorskip("cutlass.cute")
+    mma_desc = pytest.importorskip("cudnn.deepseek_sparse_attention.utils.sm100.mma_desc")
+
+    op = SimpleNamespace(
+        a_dtype=cutlass.Float8E4M3FN,
+        b_dtype=cutlass.Float8E5M2,
+        shape_mnk=(128, 256, 64),
+        a_major_mode=cute.nvgpu.tcgen05.mma.OperandMajorMode.K,
+        b_major_mode=cute.nvgpu.tcgen05.mma.OperandMajorMode.MN,
+    )
+    desc = mma_desc.blockscaled_mma_op_to_idesc(op, sf_id=2)
+
+    assert (desc >> 4) & 0x3 == 2
+    assert (desc >> 15) & 0x1 == mma_desc.Major.K
+    assert (desc >> 16) & 0x1 == mma_desc.Major.MN
+    assert (desc >> 29) & 0x3 == 2
+    assert desc == mma_desc.make_blockscaled_instr_desc(
+        op.a_dtype,
+        op.b_dtype,
+        M=128,
+        N=256,
+        a_major=mma_desc.Major.K,
+        b_major=mma_desc.Major.MN,
+        a_sf_id=2,
+        b_sf_id=2,
+    )

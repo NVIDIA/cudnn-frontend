@@ -166,7 +166,20 @@ def test_DSA_indexer_forward_wrapper_qh16_causal_block_boundary():
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=11)
-def test_DSA_indexer_forward_wrapper_mxfp8_matches_dequant_reference(request):
+@pytest.mark.parametrize(
+    "qhead_per_kv_head,s_q_default,ratio",
+    [
+        pytest.param(64, 128, 4, id="qh64"),
+        pytest.param(32, 5, 4, id="qh32_query_tail"),
+        pytest.param(32, 5, 1, id="qh32_ratio1_query_tail"),
+    ],
+)
+def test_DSA_indexer_forward_wrapper_mxfp8_matches_dequant_reference(
+    request,
+    qhead_per_kv_head,
+    s_q_default,
+    ratio,
+):
     try:
         from cudnn import DSA
         from cuda.bindings import driver as cuda
@@ -177,11 +190,11 @@ def test_DSA_indexer_forward_wrapper_mxfp8_matches_dequant_reference(request):
     cfg = dsa_init(
         request=request,
         head_dim=128,
-        qhead_per_kv_head=64,
-        ratio=4,
+        qhead_per_kv_head=qhead_per_kv_head,
+        ratio=ratio,
         min_compute_capability=100,
         b_default=1,
-        s_q_default=128,
+        s_q_default=s_q_default,
         s_kv_default=128,
     )
 
@@ -389,7 +402,8 @@ def test_DSA_indexer_forward_wrapper_mxfp8_requires_mqa():
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=19)
-def test_DSA_indexer_forward_wrapper_thd_mxfp8_compact_padded_scales():
+@pytest.mark.parametrize("h_q", [64, 32], ids=["qh64", "qh32"])
+def test_DSA_indexer_forward_wrapper_thd_mxfp8_compact_padded_scales(h_q):
     try:
         from cudnn import DSA
         from cuda.bindings import driver as cuda
@@ -401,7 +415,7 @@ def test_DSA_indexer_forward_wrapper_thd_mxfp8_compact_padded_scales():
 
     device = torch.device("cuda")
     shapes = [(127, 32), (129, 64)]
-    ratio, h_q, h_kv, d = 4, 64, 1, 128
+    ratio, h_kv, d = 4, 1, 128
     q_lengths = [s_q for s_q, _ in shapes]
     k_lengths = [s_k for _, s_k in shapes]
     cu_q = torch.tensor(
@@ -495,20 +509,19 @@ def test_DSA_indexer_forward_wrapper_thd_mxfp8_compact_padded_scales():
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=12)
-def test_DSA_indexer_forward_wrapper_fp8_sm90_matches_dequant_reference(request):
+@pytest.mark.parametrize("qhead_per_kv_head", [32, 64])
+def test_DSA_indexer_forward_wrapper_fp8_sm90_matches_dequant_reference(request, qhead_per_kv_head):
     try:
         from cudnn import DSA
         from cuda.bindings import driver as cuda
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
-    major, _ = torch.cuda.get_device_capability()
-    if major != 9:
-        pytest.skip("SM90 FP8 indexer forward path requires Hopper")
+    _require_sm90()
     cfg = dsa_init(
         request=request,
         head_dim=128,
-        qhead_per_kv_head=64,
+        qhead_per_kv_head=qhead_per_kv_head,
         ratio=4,
         min_compute_capability=90,
         b_default=1,
@@ -576,3 +589,91 @@ def test_DSA_indexer_forward_wrapper_fp8_sm90_matches_dequant_reference(request)
         atol=5e-3,
         rtol=5e-3,
     )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=15)
+def test_DSA_indexer_forward_wrapper_fp8_sm90_thd_matches_dequant_reference():
+    try:
+        from cudnn import DSA
+        from cuda.bindings import driver as cuda
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    _require_sm90()
+    device = torch.device("cuda")
+    shapes = [(5, 67), (7, 70)]
+    ratio, h_q, h_kv, d = 4, 32, 1, 128
+    q_lengths = [s_q for s_q, _ in shapes]
+    k_lengths = [s_k for _, s_k in shapes]
+    cu_q = torch.tensor(
+        [0, *torch.tensor(q_lengths).cumsum(0).tolist()],
+        dtype=torch.int32,
+        device=device,
+    )
+    cu_k = torch.tensor(
+        [0, *torch.tensor(k_lengths).cumsum(0).tolist()],
+        dtype=torch.int32,
+        device=device,
+    )
+    total_q, total_k = int(cu_q[-1]), int(cu_k[-1])
+
+    q_ref = torch.randn(total_q, h_q, d, dtype=torch.bfloat16, device=device)
+    k_ref = torch.randn(total_k, h_kv, d, dtype=torch.bfloat16, device=device)
+    w = torch.randn(total_q, h_q, dtype=torch.bfloat16, device=device).abs() * 0.1
+    q, q_scale = quantize_fp8_1x128(q_ref)
+    k, k_scale = quantize_fp8_1x128(k_ref)
+    q_deq = q.float() * q_scale.unsqueeze(-1)
+    k_deq = k.float() * k_scale.unsqueeze(-1)
+    q_causal_offsets = torch.tensor(
+        [s_k * ratio - s_q for s_q, s_k in shapes],
+        dtype=torch.int32,
+        device=device,
+    )
+
+    result = DSA.indexer_forward_wrapper(
+        q,
+        k,
+        w,
+        ratio=ratio,
+        qhead_per_kv_head=h_q,
+        cu_seqlens_q=cu_q,
+        cu_seqlens_k=cu_k,
+        max_seqlen_q=max(q_lengths),
+        max_seqlen_k=max(k_lengths),
+        q_causal_offsets=q_causal_offsets,
+        precision="fp8",
+        q_scale=q_scale,
+        k_scale=k_scale,
+        return_lse=True,
+        stream=cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+    )
+    torch.cuda.synchronize()
+
+    assert result["scores"].shape == (total_q, max(k_lengths))
+    assert result["lse"].shape == (total_q,)
+    cu_q_host, cu_k_host = cu_q.tolist(), cu_k.tolist()
+    for batch, (_, s_k) in enumerate(shapes):
+        q0, q1 = cu_q_host[batch : batch + 2]
+        k0, k1 = cu_k_host[batch : batch + 2]
+        scores_ref = ref_indexer_forward(
+            q_deq[q0:q1].unsqueeze(0),
+            k_deq[k0:k1].unsqueeze(0),
+            w[q0:q1].unsqueeze(0),
+            ratio,
+            q_causal_offsets=q_causal_offsets[batch : batch + 1],
+        ).squeeze(0)
+        torch.testing.assert_close(
+            result["scores"][q0:q1, :s_k],
+            scores_ref,
+            atol=2e-3,
+            rtol=2e-3,
+        )
+        torch.testing.assert_close(
+            result["lse"][q0:q1],
+            torch.logsumexp(scores_ref, dim=-1),
+            atol=5e-3,
+            rtol=5e-3,
+        )
+        if s_k < max(k_lengths):
+            assert bool(torch.isneginf(result["scores"][q0:q1, s_k:]).all())

@@ -893,8 +893,8 @@ def _dense_indexer_score_recompute(
     if qhead_per_kv_head is None:
         qhead_per_kv_head = n_heads_q // n_heads_kv
     if precision == "mxfp8":
-        if qhead_per_kv_head != 64:
-            raise ValueError("precision='mxfp8' dense indexer requires qhead_per_kv_head=64")
+        if qhead_per_kv_head not in (32, 64):
+            raise ValueError("precision='mxfp8' dense indexer requires qhead_per_kv_head=32 or 64")
         if m_block_size is not None and m_block_size != 128:
             raise ValueError("precision='mxfp8' dense indexer requires m_block_size=128")
         if n_block_size != 128:

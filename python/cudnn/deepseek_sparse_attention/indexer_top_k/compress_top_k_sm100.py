@@ -879,9 +879,8 @@ def compress_stage2_topk_varlen(
     are monotonically non-decreasing, ``total_q == cu_seqlens_q[-1]``, and
     ``cand_batch_offsets`` are the prefix sums from
     ``compress_topk_cand_buffer_size_thd`` (consistent with cu_seqlens / ratio).  The
-    cheap OOB-preventing parts (start-at-0, monotonic, total_q match) are verified in
-    EAGER mode (a host sync); during CUDA-graph capture all value checks are skipped,
-    so the caller must have validated in warmup."""
+    interface validates metadata only and never reads these device values back to
+    the host."""
     if device_major() < 9:
         raise RuntimeError("CuTeDSL compress stage-2 topk requires SM90+")
     if not cand_buffer.is_cuda or cand_buffer.dtype != torch.float32:
@@ -917,21 +916,6 @@ def compress_stage2_topk_varlen(
     # so a shorter cu_seqlens_k is an out-of-bounds read.  (Structural, sync-free.)
     if bs < 1 or cu_seqlens_k.numel() != cu_seqlens_q.numel():
         raise ValueError("cu_seqlens_q and cu_seqlens_k must have equal length bs+1 (>= 2); got " f"numel {cu_seqlens_q.numel()} and {cu_seqlens_k.numel()}")
-    # Value contract (see docstring): verify the cheap OOB-preventing parts in EAGER
-    # mode only — these need a .item() host sync, illegal during CUDA-graph capture
-    # (there the caller must have validated in warmup).  They also protect a DIRECT
-    # low-level caller from a total_q / cu_seqlens mismatch that would overrun the
-    # kernel batch scan.
-    if not torch.cuda.is_current_stream_capturing():
-        if int(cu_seqlens_q[0].item()) != 0 or int(cu_seqlens_k[0].item()) != 0:
-            raise ValueError("cu_seqlens_q/k must start at 0")
-        if int(cu_seqlens_q[-1].item()) != total_q:
-            raise ValueError(
-                f"total_q ({total_q}) must equal cu_seqlens_q[-1] " f"({int(cu_seqlens_q[-1].item())}); else the kernel batch scan " "overruns cu_seqlens_q"
-            )
-        if bool(((cu_seqlens_q[1:] - cu_seqlens_q[:-1]) < 0).any().item()) or bool(((cu_seqlens_k[1:] - cu_seqlens_k[:-1]) < 0).any().item()):
-            raise ValueError("cu_seqlens_q/k must be monotonically non-decreasing")
-
     out_shape = (total_q, topk)
     out_indices = _validate_out_buffer(out_indices, "out_indices", out_shape, torch.int32, device)
     out_logits = _validate_out_buffer(out_logits, "out_logits", out_shape, torch.float32, device)

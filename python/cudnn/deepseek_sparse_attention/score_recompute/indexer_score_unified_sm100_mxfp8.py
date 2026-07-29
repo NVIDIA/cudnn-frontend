@@ -60,6 +60,7 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
     """Shared MXFP8 dense score kernel with unified indexer output semantics."""
 
     arch = 100
+    max_q_tokens_per_tile = 4
 
     def __init__(
         self,
@@ -85,8 +86,8 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
             raise ValueError("SM100 dense score MXFP8 currently requires sf_vec_size=32")
         if m_block_size != 128 or n_block_size != 128:
             raise ValueError("SM100 dense score MXFP8 currently requires m_block_size=n_block_size=128")
-        if qhead_per_kvhead != 64:
-            raise ValueError("SM100 unified indexer MXFP8 currently requires qhead_per_kvhead=64")
+        if qhead_per_kvhead not in (32, 64):
+            raise ValueError("SM100 unified indexer MXFP8 currently requires qhead_per_kvhead=32 or 64")
         k_block_size = 64 if k_block_size is None else k_block_size
         # k_block_size is an internal K-split knob (num_k_chunks = head_dim_padded //
         # k_block_size; the per-chunk scale phase + base-class SMEM derive from it), so
@@ -138,8 +139,8 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
         self.sScoreAll_single_size = self.num_warps_in_epi_wg * 2
         # Warpgroups:
         #   WG0: load/MMA/scheduler warps
-        #   WG1: q-token stage 0 epilogue
-        #   WG2: q-token stage 1 epilogue
+        #   WG1: QH64 stage 0 / QH32 stages 0-1 epilogue
+        #   WG2: QH64 stage 1 / QH32 stages 2-3 epilogue
         self.epilogue_wg0_warp_ids = (4, 5, 6, 7)
         self.epilogue_wg1_warp_ids = (8, 9, 10, 11)
         self.num_warps = 12
@@ -231,9 +232,9 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
         mQScale = cute.make_tensor(mQScale.iterator, q_scale_layout)
         mKScale = cute.make_tensor(mKScale.iterator, k_scale_layout)
 
-        # Fold qhead_per_kvhead into the M dimension so one m tile covers either
-        # one q token with many heads or two q tokens for the common H64/D128
-        # shape.  The epilogue reverses this packed index when writing outputs.
+        # Fold qhead_per_kvhead into the M dimension so one m tile covers two
+        # QH64 tokens or four QH32 tokens. The epilogue reverses this packed
+        # index when writing outputs.
         shape_Q_packed = (
             (self.qhead_per_kvhead, mQ.shape[0]),
             mQ.shape[1],
@@ -716,6 +717,227 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
         if q_token_idx < seqlen_q:
             with cute.arch.elect_one():
                 mDenom[q_token_idx] = lse_val
+
+        return s_full_phase_bits, reduce_phase
+
+    @cute.jit
+    def _epilogue_indexer_dense_qh32_pair(
+        self,
+        q_token_stage_base: cutlass.Constexpr[int],
+        tiled_mma_qk,
+        tStS_ref,
+        sW,
+        sScoreAll,
+        S_mbar_ptr,
+        reduce_sync_mbar_ptr,
+        mOut,
+        mDenom,
+        num_n_blocks_compute,
+        seqlen_k,
+        seqlen_q,
+        max_seqlen_k,
+        q_causal_offset,
+        m_block,
+        tidx,
+        s_full_phase_bits,
+        reduce_phase,
+        softmax_scale,
+        per_head_offset=None,
+        batch_idx=None,
+        cand_batch_offsets=None,
+    ):
+        """QH32 epilogue for two packed q tokens in one warpgroup.
+
+        The accumulator remains a 128-row tile. Each epilogue warpgroup consumes
+        one 64-row half as two 32-head query tokens while retaining the existing
+        single TMEM wait/load/release per n block.
+        """
+        tidx_wg = tidx % self.WARPGROUP_SIZE
+
+        sW_off = Int32(0) if per_head_offset is None else per_head_offset
+        qhpkv = self.qhead_per_kvhead
+        q_tokens_per_tile = self.q_tokens_per_tile
+        ratio = Int32(self.ratio)
+
+        W_ILP = 4 if cutlass.const_expr(self.ratio == 1) else 8
+        sW_1d = cute.make_tensor(
+            sW.iterator + sW_off,
+            cute.make_layout((self.m_block_size,)),
+        )
+        rW_all = cute.make_rmem_tensor((self.m_block_size,), Float32)
+
+        warp_id_in_wg = tidx_wg // self.WARP_SIZE
+        log2_e = Float32(math.log2(math.e))
+
+        q_token_base = m_block * q_tokens_per_tile + Int32(q_token_stage_base)
+        q_token_idxs = [q_token_base + Int32(qi) for qi in range(2)]
+        col_limits = [(q_causal_offset + q_token_idxs[qi] + Int32(1)) // ratio for qi in range(2)]
+        if cutlass.const_expr(self.is_compressed_logits):
+            q_global_start = Int64(q_causal_offset)
+            if cutlass.const_expr(cand_batch_offsets is not None):
+                cand_batch_base = Int64(cand_batch_offsets[batch_idx])
+            else:
+                cand_batch_base = Int64(batch_idx) * self._row_offset_i64(
+                    Int64(seqlen_q),
+                    q_global_start,
+                )
+            cand_row_offsets = [self._row_offset_i64(Int64(q_token_idxs[qi]), q_global_start) for qi in range(2)]
+
+        local_max = [-Float32.inf for _ in range(2)]
+        local_sum_exp = [Float32(0.0) for _ in range(2)]
+        first_block = Int32(1)
+
+        n_blk = num_n_blocks_compute - Int32(1)
+        while n_blk >= Int32(0):
+            tmem_load_atom = cute.make_copy_atom(
+                tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(self.tmem_repetition)),
+                Float32,
+            )
+            thr_tmem_load = tcgen05.make_tmem_copy(tmem_load_atom, tStS_ref).get_slice(tidx_wg)
+            thr_mma = tiled_mma_qk.get_slice(tidx_wg)
+            cS = cute.make_identity_tensor(self.mma_tiler_qk[:2])
+            tScS = thr_tmem_load.partition_D(thr_mma.partition_C(cS))
+            tSrS_shape = thr_tmem_load.partition_D(cute.make_identity_tensor(tStS_ref.shape)).shape
+            tSrS = cute.make_rmem_tensor(tSrS_shape, Float32)
+
+            slot = n_blk % Int32(self.num_tmem_slots)
+            s_full_phase = self._phase_for_slot(s_full_phase_bits, slot)
+            cute.arch.mbarrier_wait(S_mbar_ptr + 2 * slot, s_full_phase)
+
+            if first_block == Int32(1):
+                cute.autovec_copy(sW_1d, rW_all)
+                first_block = Int32(0)
+
+            tmem_ptr_cur = cute.make_ptr(
+                Float32,
+                slot * self.tmem_s_stride,
+                mem_space=cute.AddressSpace.tmem,
+                assumed_align=16,
+            )
+            tStS_cur = cute.make_tensor(tmem_ptr_cur, tStS_ref.layout)
+            tStS_t2r_cur = thr_tmem_load.partition_S(tStS_cur)
+
+            cute.copy(thr_tmem_load, tStS_t2r_cur, tSrS)
+            cute.arch.fence_view_async_tmem_load()
+
+            cute.arch.mbarrier_arrive(S_mbar_ptr + 2 * slot + 1)
+            s_full_phase_bits = self._toggle_phase_for_slot(
+                s_full_phase_bits,
+                slot,
+            )
+
+            kv_offset = tScS[0][0]
+            pos = kv_offset + n_blk * self.n_block_size
+
+            for qi in cutlass.range_constexpr(2):
+                q_token_idx = q_token_idxs[qi]
+                col_limit = col_limits[qi]
+                if q_token_idx < seqlen_q and pos < col_limit and pos < seqlen_k:
+                    local_sum_0 = (Float32(0.0), Float32(0.0))
+                    local_sum_1 = (Float32(0.0), Float32(0.0))
+                    local_sum_2 = (Float32(0.0), Float32(0.0))
+                    local_sum_3 = (Float32(0.0), Float32(0.0))
+                    for ho in cutlass.range_constexpr(qhpkv // 2 // W_ILP):
+                        for ci in cutlass.range_constexpr(W_ILP):
+                            idx0 = (q_token_stage_base + qi) * qhpkv + (ho * W_ILP + ci) * 2
+                            idx1 = idx0 + 1
+                            w_pair = (rW_all[idx0], rW_all[idx1])
+
+                            val0 = tSrS[idx0]
+                            val0 = val0 if val0 > Float32(0.0) else Float32(0.0)
+                            val1 = tSrS[idx1]
+                            val1 = val1 if val1 > Float32(0.0) else Float32(0.0)
+
+                            if cutlass.const_expr(ci < W_ILP // 4):
+                                local_sum_0 = fma_packed_f32x2(
+                                    (val0, val1),
+                                    w_pair,
+                                    local_sum_0,
+                                )
+                            elif cutlass.const_expr(ci < W_ILP // 2):
+                                local_sum_1 = fma_packed_f32x2(
+                                    (val0, val1),
+                                    w_pair,
+                                    local_sum_1,
+                                )
+                            elif cutlass.const_expr(ci < (W_ILP * 3) // 4):
+                                local_sum_2 = fma_packed_f32x2(
+                                    (val0, val1),
+                                    w_pair,
+                                    local_sum_2,
+                                )
+                            else:
+                                local_sum_3 = fma_packed_f32x2(
+                                    (val0, val1),
+                                    w_pair,
+                                    local_sum_3,
+                                )
+
+                    local_sum_lo = add_packed_f32x2(local_sum_0, local_sum_1)
+                    local_sum_hi = add_packed_f32x2(local_sum_2, local_sum_3)
+                    local_sum = add_packed_f32x2(local_sum_lo, local_sum_hi)
+                    score = (local_sum[0] + local_sum[1]) * Float32(softmax_scale)
+                    if cutlass.const_expr(self.is_compressed_logits):
+                        mOut[cand_batch_base + cand_row_offsets[qi] + Int64(pos)] = score
+                    else:
+                        mOut[q_token_idx, pos] = score
+
+                    if cutlass.const_expr(self.compute_lse):
+                        new_max = score if score > local_max[qi] else local_max[qi]
+                        local_rescale = cute.math.exp2(
+                            (local_max[qi] - new_max) * log2_e,
+                            fastmath=True,
+                        )
+                        local_sum_exp[qi] = local_sum_exp[qi] * local_rescale + cute.math.exp2(
+                            (score - new_max) * log2_e,
+                            fastmath=True,
+                        )
+                        local_max[qi] = new_max
+            n_blk = n_blk - 1
+
+        if cutlass.const_expr(not self.compute_lse):
+            return s_full_phase_bits, reduce_phase
+
+        sScoreAll_sum = cute.make_tensor(
+            sScoreAll.iterator + self.num_warps_in_epi_wg,
+            cute.make_layout((self.num_warps_in_epi_wg,), stride=(1,)),
+        )
+        inv_log2_e = Float32(1.0 / math.log2(math.e))
+
+        for qi in cutlass.range_constexpr(2):
+            global_max, reduce_phase = self._intra_inter_warp_reduce_max(
+                sScoreAll,
+                reduce_sync_mbar_ptr,
+                reduce_phase,
+                warp_id_in_wg,
+                local_max[qi],
+            )
+
+            lse_val = -Float32.inf
+            if global_max > Float32(-1e30):
+                global_rescale = cute.math.exp2(
+                    (local_max[qi] - global_max) * log2_e,
+                    fastmath=True,
+                )
+                adjusted_sum = local_sum_exp[qi] * global_rescale
+
+                global_sum_exp, reduce_phase = self._intra_inter_warp_reduce_sum(
+                    sScoreAll_sum,
+                    reduce_sync_mbar_ptr,
+                    reduce_phase,
+                    warp_id_in_wg,
+                    adjusted_sum,
+                )
+                lse_val = global_max + cute.math.log2(global_sum_exp) * inv_log2_e
+            else:
+                cute.arch.mbarrier_arrive(reduce_sync_mbar_ptr)
+                cute.arch.mbarrier_wait(reduce_sync_mbar_ptr, reduce_phase)
+                reduce_phase = reduce_phase ^ 1
+
+            q_token_idx = q_token_idxs[qi]
+            if q_token_idx < seqlen_q:
+                with cute.arch.elect_one():
+                    mDenom[q_token_idx] = lse_val
 
         return s_full_phase_bits, reduce_phase
 
@@ -1294,31 +1516,57 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
                     else:
                         mOut_cur = seqlen.offset_batch_Q(mOut, batch_idx, dim=2)
                     mDenom_cur = seqlen.offset_batch_Q(mDenom, batch_idx, dim=1)
-                    # First epilogue warpgroup owns q-token stage 0.
-                    s_full_phase_bits, reduce_phase = self._epilogue_indexer_dense_single_q(
-                        0,
-                        tiled_mma_qk,
-                        tStS_ref,
-                        sPerHead,
-                        sScoreAll_epi0,
-                        S_mbar_ptr,
-                        reduce_sync_mbar_ptr,
-                        mOut_cur,
-                        mDenom_cur,
-                        num_n_blocks_compute,
-                        seqlen.seqlen_k,
-                        seqlen.seqlen_q,
-                        max_seqlen_k,
-                        q_causal_offset,
-                        m_block,
-                        tidx,
-                        s_full_phase_bits,
-                        reduce_phase,
-                        softmax_scale,
-                        per_head_offset=per_head_offset,
-                        batch_idx=batch_idx,
-                        cand_batch_offsets=mCandBatchOffsets,
-                    )
+                    if cutlass.const_expr(self.qhead_per_kvhead == 64):
+                        # Preserve the tuned QH64 single-token specialization.
+                        s_full_phase_bits, reduce_phase = self._epilogue_indexer_dense_single_q(
+                            0,
+                            tiled_mma_qk,
+                            tStS_ref,
+                            sPerHead,
+                            sScoreAll_epi0,
+                            S_mbar_ptr,
+                            reduce_sync_mbar_ptr,
+                            mOut_cur,
+                            mDenom_cur,
+                            num_n_blocks_compute,
+                            seqlen.seqlen_k,
+                            seqlen.seqlen_q,
+                            max_seqlen_k,
+                            q_causal_offset,
+                            m_block,
+                            tidx,
+                            s_full_phase_bits,
+                            reduce_phase,
+                            softmax_scale,
+                            per_head_offset=per_head_offset,
+                            batch_idx=batch_idx,
+                            cand_batch_offsets=mCandBatchOffsets,
+                        )
+                    else:
+                        s_full_phase_bits, reduce_phase = self._epilogue_indexer_dense_qh32_pair(
+                            0,
+                            tiled_mma_qk,
+                            tStS_ref,
+                            sPerHead,
+                            sScoreAll_epi0,
+                            S_mbar_ptr,
+                            reduce_sync_mbar_ptr,
+                            mOut_cur,
+                            mDenom_cur,
+                            num_n_blocks_compute,
+                            seqlen.seqlen_k,
+                            seqlen.seqlen_q,
+                            max_seqlen_k,
+                            q_causal_offset,
+                            m_block,
+                            tidx,
+                            s_full_phase_bits,
+                            reduce_phase,
+                            softmax_scale,
+                            per_head_offset=per_head_offset,
+                            batch_idx=batch_idx,
+                            cand_batch_offsets=mCandBatchOffsets,
+                        )
                     tile_count = tile_count + 1
                 clc_pipeline.consumer_wait(clc_consumer_state)
                 work_tile = tile_sched.get_current_work()
@@ -1362,31 +1610,57 @@ class IndexerScoreUnifiedSm100Mxfp8(IndexerScoreUnifiedSm100):
                     else:
                         mOut_cur = seqlen.offset_batch_Q(mOut, batch_idx, dim=2)
                     mDenom_cur = seqlen.offset_batch_Q(mDenom, batch_idx, dim=1)
-                    # Second epilogue warpgroup owns q-token stage 1.
-                    s_full_phase_bits, reduce_phase = self._epilogue_indexer_dense_single_q(
-                        1,
-                        tiled_mma_qk,
-                        tStS_ref,
-                        sPerHead,
-                        sScoreAll_epi1,
-                        S_mbar_ptr,
-                        reduce_sync_mbar_ptr_epi1,
-                        mOut_cur,
-                        mDenom_cur,
-                        num_n_blocks_compute,
-                        seqlen.seqlen_k,
-                        seqlen.seqlen_q,
-                        max_seqlen_k,
-                        q_causal_offset,
-                        m_block,
-                        tidx,
-                        s_full_phase_bits,
-                        reduce_phase,
-                        softmax_scale,
-                        per_head_offset=per_head_offset,
-                        batch_idx=batch_idx,
-                        cand_batch_offsets=mCandBatchOffsets,
-                    )
+                    if cutlass.const_expr(self.qhead_per_kvhead == 64):
+                        # Preserve the tuned QH64 single-token specialization.
+                        s_full_phase_bits, reduce_phase = self._epilogue_indexer_dense_single_q(
+                            1,
+                            tiled_mma_qk,
+                            tStS_ref,
+                            sPerHead,
+                            sScoreAll_epi1,
+                            S_mbar_ptr,
+                            reduce_sync_mbar_ptr_epi1,
+                            mOut_cur,
+                            mDenom_cur,
+                            num_n_blocks_compute,
+                            seqlen.seqlen_k,
+                            seqlen.seqlen_q,
+                            max_seqlen_k,
+                            q_causal_offset,
+                            m_block,
+                            tidx,
+                            s_full_phase_bits,
+                            reduce_phase,
+                            softmax_scale,
+                            per_head_offset=per_head_offset,
+                            batch_idx=batch_idx,
+                            cand_batch_offsets=mCandBatchOffsets,
+                        )
+                    else:
+                        s_full_phase_bits, reduce_phase = self._epilogue_indexer_dense_qh32_pair(
+                            2,
+                            tiled_mma_qk,
+                            tStS_ref,
+                            sPerHead,
+                            sScoreAll_epi1,
+                            S_mbar_ptr,
+                            reduce_sync_mbar_ptr_epi1,
+                            mOut_cur,
+                            mDenom_cur,
+                            num_n_blocks_compute,
+                            seqlen.seqlen_k,
+                            seqlen.seqlen_q,
+                            max_seqlen_k,
+                            q_causal_offset,
+                            m_block,
+                            tidx,
+                            s_full_phase_bits,
+                            reduce_phase,
+                            softmax_scale,
+                            per_head_offset=per_head_offset,
+                            batch_idx=batch_idx,
+                            cand_batch_offsets=mCandBatchOffsets,
+                        )
                     tile_count = tile_count + 1
                 clc_pipeline.consumer_wait(clc_consumer_state)
                 work_tile = tile_sched.get_current_work()

@@ -74,6 +74,12 @@ def _validate_thd_mxfp8_scale_contract(
             raise ValueError("q_scale/k_scale must be on the same device as q/k")
 
 
+def _validate_indexer_qhead_per_kv_head(qhead_per_kv_head: int, precision: str) -> None:
+    supported = (32, 64)
+    if qhead_per_kv_head not in supported:
+        raise ValueError(f"precision={precision!r} indexer requires " f"qhead_per_kv_head=32 or 64, got {qhead_per_kv_head}")
+
+
 def _return_output(
     out: torch.Tensor,
     out_orig: Optional[torch.Tensor],
@@ -93,15 +99,6 @@ def _return_output(
 # Module-level compile cache
 _compile_cache: dict = {}
 _denom_placeholder_cache: dict = {}
-
-
-def _record_external_stream_usage(stream: torch.cuda.Stream, *values) -> None:
-    """Keep caller-owned tensors alive across asynchronous TVM-FFI launches."""
-    for value in values:
-        if isinstance(value, (tuple, list)):
-            _record_external_stream_usage(stream, *value)
-        elif isinstance(value, torch.Tensor) and value.is_cuda:
-            value.record_stream(stream)
 
 
 def _get_fwd_denom_placeholder(
@@ -221,10 +218,12 @@ def indexer_fwd(
         raise ValueError(f"SM100 indexer_fwd only supports num_threads=384, got {num_threads}")
     if q_stage != 2:
         raise ValueError(f"SM100 indexer_fwd only supports q_stage=2, got {q_stage}")
+    if ratio <= 0:
+        raise ValueError(f"ratio must be > 0, got {ratio}")
 
     if is_compressed_logits:
-        if topk <= 0:
-            raise ValueError("is_compressed_logits=True requires topk > 0")
+        if topk <= 0 or topk > 2048:
+            raise ValueError("is_compressed_logits=True requires topk in (0, 2048], " f"got {topk}")
         if out is not None:
             raise ValueError("out is a dense-score buffer and cannot be used with is_compressed_logits=True")
         if kv_stage != 4:
@@ -240,7 +239,7 @@ def indexer_fwd(
             if cu_seqlens_q is not None or cu_seqlens_k is not None:
                 if cu_seqlens_q is None or cu_seqlens_k is None:
                     raise ValueError("THD compressed-logits top-k requires both cu_seqlens_q and cu_seqlens_k")
-                result = _indexer_fwd_compress_topk_thd(
+                return _indexer_fwd_compress_topk_thd(
                     q,
                     k,
                     w,
@@ -276,7 +275,7 @@ def indexer_fwd(
             else:
                 if cand_batch_offsets is not None:
                     raise ValueError("cand_batch_offsets is only used by THD compressed top-k; " "BSHD computes its candidate offsets internally")
-                result = indexer_fwd_compress_topk(
+                return indexer_fwd_compress_topk(
                     q,
                     k,
                     w,
@@ -302,29 +301,6 @@ def indexer_fwd(
                     q_causal_offsets=q_causal_offsets,
                     deterministic=deterministic,
                 )
-
-            launch_stream = torch.cuda.current_stream(q.device)
-            _record_external_stream_usage(
-                launch_stream,
-                q,
-                k,
-                w,
-                q_scale,
-                k_scale,
-                cu_seqlens_q,
-                cu_seqlens_k,
-                cu_seqlens_q_scale_padded,
-                cu_seqlens_k_scale_padded,
-                q_causal_offsets,
-                cand_buffer,
-                cand_batch_offsets,
-                out_indices,
-                out_logits,
-                softmax_out,
-                lse_out,
-                result,
-            )
-            return result
 
     if precision == "bf16":
         for tensor, name in ((q, "q"), (k, "k"), (w, "w")):
@@ -365,8 +341,6 @@ def indexer_fwd(
         assert cu_seqlens_q.shape == (bs + 1,), "cu_seqlens_q must have shape (batch_size + 1,)"
         assert head_dim == head_dim_k, f"q head_dim ({head_dim}) != k head_dim ({head_dim_k})"
         assert w.shape == (total_q, n_heads_q), f"THD w shape must be ({total_q}, {n_heads_q}), got {tuple(w.shape)}"
-        if qhead_per_kv_head is None:
-            qhead_per_kv_head = n_heads_q // n_heads_kv
         if max_seqlen_q is None or max_seqlen_k is None:
             raise ValueError("THD input requires max_seqlen_q and max_seqlen_k")
         seqlen_q_dim = int(max_seqlen_q)
@@ -375,9 +349,6 @@ def indexer_fwd(
         out_shape = (total_q, seqlen_k_dim)
         out_buf_shape = None
     else:
-        if qhead_per_kv_head is None:
-            qhead_per_kv_head = q.shape[2] // k.shape[2]
-
         bs, seqlen_q_dim, n_heads_q, head_dim = q.shape
         _, seqlen_k_dim, n_heads_kv, _ = k.shape
         device = q.device
@@ -385,6 +356,15 @@ def indexer_fwd(
             raise ValueError(f"seqlen_q ({seqlen_q_dim}) must be <= seqlen_k * ratio " f"({seqlen_k_dim * ratio})")
         out_shape = (bs, seqlen_q_dim, seqlen_k_dim)
         out_buf_shape = None
+
+    if n_heads_kv != 1:
+        raise ValueError("SM100 indexer forward currently requires n_heads_kv=1 (MQA); " f"got n_heads_kv={n_heads_kv}")
+    expected_qhead_per_kv_head = n_heads_q // n_heads_kv
+    if qhead_per_kv_head is None:
+        qhead_per_kv_head = expected_qhead_per_kv_head
+    elif qhead_per_kv_head != expected_qhead_per_kv_head:
+        raise ValueError(f"qhead_per_kv_head ({qhead_per_kv_head}) must equal " f"n_heads_q // n_heads_kv ({expected_qhead_per_kv_head})")
+    _validate_indexer_qhead_per_kv_head(qhead_per_kv_head, precision)
 
     q_causal_offsets = validate_q_causal_offsets(q_causal_offsets, int(bs), q.device, stream=current_stream)
 
@@ -395,11 +375,11 @@ def indexer_fwd(
             raise ValueError(
                 "SM100 indexer_fwd supports at most 2 q tokens per tile; got " f"m_block_size={m_block_size}, qhead_per_kv_head={qhead_per_kv_head}"
             )
+    if m_block_size % qhead_per_kv_head != 0:
+        raise ValueError(f"m_block_size ({m_block_size}) must be divisible by " f"qhead_per_kv_head ({qhead_per_kv_head})")
 
     if precision == "mxfp8":
         assert q_scale is not None and k_scale is not None
-        if n_heads_kv != 1:
-            raise ValueError("precision='mxfp8' dense score currently requires n_heads_kv=1")
         sf_groups = _ceil_div(head_dim, sf_vec_size)
         if is_varlen:
             _validate_thd_mxfp8_scale_contract(

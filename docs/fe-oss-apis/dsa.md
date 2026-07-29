@@ -166,10 +166,21 @@ compressed column 0.
     `lse_out`) to compute LSE in the same kernel invocation.
   - SM100 `precision="mxfp8"`: Q/K use E4M3 with block-scaled, packed E8M0
     scale tensors; `sf_vec_size` is currently fixed at 32 and
-    `qhead_per_kv_head` is currently fixed at 64.
+    `qhead_per_kv_head ∈ {32, 64}`.
+    THD inputs additionally require
+    `cu_seqlens_q_scale_padded`/`cu_seqlens_k_scale_padded`: contiguous CUDA
+    INT32 prefix tensors of shape `(B + 1,)` on the Q/K device. The interface
+    deliberately performs no device-to-host copy to inspect their values.
+    The caller guarantees that each device-side prefix starts at zero, is
+    monotonic, covers the corresponding logical sequence, satisfies the
+    packed-row alignment (each Q span times `qhead_per_kv_head` is a multiple
+    of 128 rows; each K span is a multiple of 128 tokens), and stays within
+    the packed scale storage.
 - **Constraints** — `head_dim == 128`. The SM90 direct path supports
   `qhead_per_kv_head ∈ {16, 32, 64}` and currently requires `H_kv == 1`;
-  SM100 supports `qhead_per_kv_head ∈ {32, 64}`.
+  SM100 BF16 dense and combined Top-K paths support
+  `qhead_per_kv_head ∈ {32, 64}`, as do their MXFP8 paths. All currently
+  require `H_kv == 1` (MQA).
 
 ```python
 result = DSA.indexer_forward_wrapper(
@@ -204,7 +215,9 @@ be combined with LSE or explicit `q_causal_offsets`. BSHD with explicit
 and is not CUDA-graph-capturable; THD capture requires the caller-provided
 offsets and buffers returned by `compress_topk_cand_buffer_size_thd`. Compact
 addressing requires `0 <= q_causal_offsets[b]`; rows extending beyond the KV
-prefix are clamped to `seqlen_k_b`.
+prefix are clamped to `seqlen_k_b`. THD MXFP8 uses the same caller-guaranteed
+device-side scale-prefix contract described in §2; the interface does not
+validate prefix values with a device-to-host copy.
 
 ```python
 cand_floats = DSA.compress_topk_cand_buffer_size(
@@ -368,11 +381,13 @@ result = DSA.dense_indexer_backward_wrapper(
 - **No fused forward** — the production forward is FlashMLA (C++); this
   module ships only the CuTe-DSL kernels.
 - **Indexer Forward only supports `head_dim = 128`**. SM90 supports
-  `qhead_per_kv_head ∈ {16, 32, 64}` with `H_kv = 1`; SM100 supports
-  `qhead_per_kv_head ∈ {32, 64}`.
+  `qhead_per_kv_head ∈ {16, 32, 64}` with `H_kv = 1`; SM100 BF16 and MXFP8
+  support `qhead_per_kv_head ∈ {32, 64}`. Both the dense and combined Top-K
+  paths require `H_kv = 1`.
 - **Standalone Top-K only up to 2048**; `top_k > 2048` is not supported by
   its radix Top-K kernel. The combined compressed path uses a separate stage-2
   implementation.
 - **Compressed-path limits** — the stage-1 compact score kernel is MQA-only
-  (`H_kv = 1`); MXFP8 requires `qhead_per_kv_head = 64`; explicit microbatching
-  cannot be combined with MXFP8, LSE, or explicit per-batch causal offsets.
+  (`H_kv = 1`); MXFP8 requires `qhead_per_kv_head ∈ {32, 64}`; explicit
+  microbatching cannot be combined with MXFP8, LSE, or explicit per-batch
+  causal offsets.

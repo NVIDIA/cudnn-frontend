@@ -41,90 +41,22 @@ def _check_fused_softmax(
 
 @pytest.mark.L0
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_compressed_buffer_contract_rejects_unsafe_offsets():
+def test_compressed_indexer_rejects_unsupported_qhead_group_before_launch():
     from cudnn import DSA
-    from cudnn.deepseek_sparse_attention.indexer_forward._compressed_top_k_sm100 import (
-        _indexer_fwd_compress_topk_thd,
-    )
 
     device = torch.device("cuda")
-    with pytest.raises(ValueError, match="0 <= q_causal_offsets"):
-        DSA.compress_topk_cand_buffer_size(
-            1,
-            8,
-            2,
-            4,
-            q_causal_offsets=torch.tensor([-1], dtype=torch.int32, device=device),
-        )
-    # A positive offset may move the query segment beyond the KV prefix; valid
-    # row lengths clamp to S_k, matching the dense indexer mask semantics.
-    shifted_bshd_floats = DSA.compress_topk_cand_buffer_size(
-        1,
-        8,
-        2,
-        4,
-        q_causal_offsets=torch.tensor([1], dtype=torch.int32, device=device),
-    )
-    assert shifted_bshd_floats > 0
+    q = torch.randn((1, 8, 8, 128), dtype=torch.bfloat16, device=device)
+    k = torch.randn((1, 2, 1, 128), dtype=torch.bfloat16, device=device)
+    w = torch.randn((1, 8, 8), dtype=torch.bfloat16, device=device)
 
-    cu_q = torch.tensor([0, 8], dtype=torch.int32, device=device)
-    cu_k = torch.tensor([0, 2], dtype=torch.int32, device=device)
-    with pytest.raises(ValueError, match="0 <= q_causal_offsets"):
-        DSA.compress_topk_cand_buffer_size_thd(
-            cu_q,
-            cu_k,
-            4,
-            q_causal_offsets=torch.tensor([-1], dtype=torch.int32, device=device),
-        )
-    shifted_offsets, shifted_thd_floats = DSA.compress_topk_cand_buffer_size_thd(
-        cu_q,
-        cu_k,
-        4,
-        q_causal_offsets=torch.tensor([1], dtype=torch.int32, device=device),
-    )
-    assert int(shifted_offsets[-1]) == shifted_thd_floats > 0
-    offsets, cand_floats = DSA.compress_topk_cand_buffer_size_thd(cu_q, cu_k, 4)
-    q = torch.randn((8, 64, 128), dtype=torch.bfloat16, device=device)
-    k = torch.randn((2, 1, 128), dtype=torch.bfloat16, device=device)
-    w = torch.randn((8, 64), dtype=torch.bfloat16, device=device)
-    out_indices = torch.empty((8, 1), dtype=torch.int32, device=device)
-    out_logits = torch.empty((8, 1), dtype=torch.float32, device=device)
-
-    bad_offsets = offsets.clone()
-    bad_offsets[-1] += 1
-    with pytest.raises(ValueError, match="cand_batch_offsets do not match"):
-        _indexer_fwd_compress_topk_thd(
+    with pytest.raises(ValueError, match="qhead_per_kv_head=32 or 64"):
+        DSA.indexer_forward_top_k_wrapper(
             q,
             k,
             w,
-            1,
-            ratio=4,
-            qhead_per_kv_head=64,
-            cu_seqlens_q=cu_q,
-            cu_seqlens_k=cu_k,
-            max_seqlen_q=8,
-            max_seqlen_k=2,
-            cand_buffer=torch.empty(cand_floats + 1, device=device),
-            cand_batch_offsets=bad_offsets,
-            out_indices=out_indices,
-            out_logits=out_logits,
-        )
-    with pytest.raises(ValueError, match="cand_buffer too small"):
-        _indexer_fwd_compress_topk_thd(
-            q,
-            k,
-            w,
-            1,
-            ratio=4,
-            qhead_per_kv_head=64,
-            cu_seqlens_q=cu_q,
-            cu_seqlens_k=cu_k,
-            max_seqlen_q=8,
-            max_seqlen_k=2,
-            cand_buffer=torch.empty(cand_floats - 1, device=device),
-            cand_batch_offsets=offsets,
-            out_indices=out_indices,
-            out_logits=out_logits,
+            top_k=1,
+            qhead_per_kv_head=8,
+            return_softmax=False,
         )
 
 

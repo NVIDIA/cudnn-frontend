@@ -79,6 +79,12 @@ def _validate_thd_mxfp8_scale_contract(
             raise ValueError("q_scale/k_scale must be on the same device as q/k")
 
 
+def _validate_indexer_qhead_per_kv_head(qhead_per_kv_head: int, precision: str) -> None:
+    supported = (32, 64)
+    if qhead_per_kv_head not in supported:
+        raise ValueError(f"precision={precision!r} indexer requires " f"qhead_per_kv_head=32 or 64, got {qhead_per_kv_head}")
+
+
 _compile_cache: dict = {}
 _denom_placeholder_cache: dict = {}
 
@@ -215,11 +221,6 @@ def compress_topk_cand_buffer_size(
     if q_causal_offsets is not None:
         if not q_causal_offsets.is_cuda or q_causal_offsets.dtype != torch.int32 or q_causal_offsets.ndim != 1 or q_causal_offsets.shape[0] != bs:
             raise ValueError(f"q_causal_offsets must be a 1D CUDA int32 tensor of shape ({bs},)")
-        qgs = q_causal_offsets.to(torch.int64)
-        invalid = qgs < 0
-        if bool(invalid.any().item()):
-            bad = invalid.nonzero(as_tuple=True)[0].tolist()
-            raise ValueError("compressed top-k requires 0 <= q_causal_offsets[b]; " f"violated at batch(es) {bad}")
         # Explicit per-batch offsets ⇒ per_batch_floats is non-uniform; the buffer is the
         # per-batch sum (microbatch is disabled under offsets; LSE is per-row, unaffected).
         return int(_bshd_cand_batch_offsets(int(bs), int(seqlen_q), int(ratio), q_causal_offsets)[bs].item())
@@ -448,6 +449,7 @@ def indexer_fwd_compress_topk(
         qhead_per_kv_head = n_heads_q // n_heads_kv
     elif qhead_per_kv_head != n_heads_q // n_heads_kv:
         raise ValueError(f"qhead_per_kv_head ({qhead_per_kv_head}) must equal n_heads_q // " f"n_heads_kv ({n_heads_q // n_heads_kv})")
+    _validate_indexer_qhead_per_kv_head(qhead_per_kv_head, precision)
     if n_heads_kv != 1:
         raise ValueError("compress-logits top-k currently requires n_heads_kv=1 (MQA); " f"got n_heads_kv={n_heads_kv}. The stage-1 GEMM reads only KV head 0.")
     if precision == "bf16" and m_block_size // qhead_per_kv_head > 2:
@@ -459,6 +461,8 @@ def indexer_fwd_compress_topk(
                 f"per tile; got m_block_size={m_block_size}, "
                 f"qhead_per_kv_head={qhead_per_kv_head}"
             )
+    if m_block_size % qhead_per_kv_head != 0:
+        raise ValueError(f"m_block_size ({m_block_size}) must be divisible by " f"qhead_per_kv_head ({qhead_per_kv_head})")
     if seqlen_q > seqlen_k * ratio:
         raise ValueError(f"seqlen_q ({seqlen_q}) must be <= seqlen_k * ratio ({seqlen_k * ratio})")
     device = q.device
@@ -470,12 +474,6 @@ def indexer_fwd_compress_topk(
     # (the 2D compact store needs a uniform pbf; mxfp8 is 1D-only regardless).  Microbatch
     # windowing assumes the default offset-0 and is rejected with explicit offsets below.
     q_causal_offsets = validate_q_causal_offsets(q_causal_offsets, int(bs), device)
-    if q_causal_offsets is not None and not torch.cuda.is_current_stream_capturing():
-        qgs = q_causal_offsets.to(torch.int64)
-        invalid = qgs < 0
-        if bool(invalid.any().item()):
-            bad = invalid.nonzero(as_tuple=True)[0].tolist()
-            raise ValueError("compressed top-k requires 0 <= q_causal_offsets[b]; " f"violated at batch(es) {bad}")
 
     out_shape = (bs, seqlen_q, topk)
     if out_indices is not None and (
@@ -635,8 +633,15 @@ def indexer_fwd_compress_topk(
         # otherwise dominated compress's "others" GPU time at long seqlen (one chain/window).
         # The passed bases are bit-identical to the _bshd output for a uniform offset.
         cand_batch_offsets = _cand_batch_offsets if _cand_batch_offsets is not None else _bshd_cand_batch_offsets(bs, seqlen_q, ratio, q_causal_offsets)
-        total_floats = _cand_total_floats if _cand_total_floats is not None else int(cand_batch_offsets[bs].item())
-        cand = _resolve_cand_buffer(cand_buffer, total_floats, device)
+        if _cand_total_floats is not None:
+            cand = _resolve_cand_buffer(cand_buffer, _cand_total_floats, device)
+        elif cand_buffer is None:
+            # Internal allocation requires a host-visible size.
+            cand = _resolve_cand_buffer(None, int(cand_batch_offsets[bs].item()), device)
+        else:
+            # The required size depends on device-resident offsets. Validate
+            # only host-visible scratch metadata and trust the caller's sizing.
+            cand = _resolve_cand_buffer(cand_buffer, cand_buffer.numel(), device)
         cand_2d = False
         cand_gemm = cand
 
@@ -902,40 +907,27 @@ def compress_topk_cand_buffer_size_thd(
         offsets (``[b]`` = batch b's compact start; ``[bs]`` = total).
       * ``total_floats`` — float32 element count the ``cand_buffer`` must hold.
 
-    Validates the per-batch ratio-causal contract (``sq_b <= sk_b*ratio``) and
-    requires non-negative causal offsets.  Positive offsets may extend the local
-    query segment past the KV prefix; row lengths are clamped to ``sk_b``.  Feed
-    the returned ``cand_batch_offsets`` (plus a float32 ``cand_buffer`` with
+    Device values are consumed as provided; callers own the per-batch
+    ratio-causal and non-negative offset contracts. Feed the returned
+    ``cand_batch_offsets`` (plus a float32 ``cand_buffer`` with
     ``total_floats`` elements and ``out_indices``/``out_logits``) back into
     ``indexer_forward_top_k_wrapper(...)`` to make the THD path
     CUDA-graph capturable with no
     internal offset compute + ``.item()`` sync per call.  (Strictly zero extra
     transient allocation additionally needs ``topk_indices_global=False``; the
     default global-id conversion records transients into the graph pool — no sync.)"""
-    cu_q = cu_seqlens_q.to(torch.int64)
-    cu_k = cu_seqlens_k.to(torch.int64)
-    if cu_q.ndim != 1 or cu_k.ndim != 1 or cu_q.numel() != cu_k.numel() or cu_q.numel() < 2:
+    if cu_seqlens_q.ndim != 1 or cu_seqlens_k.ndim != 1 or cu_seqlens_q.numel() != cu_seqlens_k.numel() or cu_seqlens_q.numel() < 2:
         raise ValueError("cu_seqlens_q/k must be 1D of equal length (bs+1) >= 2")
-    sq = cu_q[1:] - cu_q[:-1]
-    sk = cu_k[1:] - cu_k[:-1]
-    if q_causal_offsets is None:
-        qgs = torch.zeros_like(sq)
-    else:
+    bs = cu_seqlens_q.numel() - 1
+    if q_causal_offsets is not None:
         if (
             not q_causal_offsets.is_cuda
             or q_causal_offsets.dtype != torch.int32
             or q_causal_offsets.ndim != 1
-            or q_causal_offsets.numel() != sq.numel()
+            or q_causal_offsets.numel() != bs
             or q_causal_offsets.device != cu_seqlens_q.device
         ):
             raise ValueError("q_causal_offsets must be a 1D CUDA int32 tensor of shape (bs,) " "on the same device as cu_seqlens_q")
-        qgs = q_causal_offsets.to(torch.int64)
-    viol = (qgs < 0) | (sq > sk * ratio)
-    if bool(viol.any().item()):
-        bad = viol.nonzero(as_tuple=True)[0].tolist()
-        raise ValueError(
-            "THD compressed-logits top-k requires 0 <= q_causal_offsets[b] and " "sq_b <= sk_b*ratio for EVERY batch; " f"violated at batch(es) {bad}"
-        )
     offsets = _compress_cand_batch_offsets(cu_seqlens_q, cu_seqlens_k, ratio, q_causal_offsets)
     total_floats = int(offsets[-1].item())
     return offsets, total_floats
@@ -999,16 +991,9 @@ def _run_compress_gemm_varlen(
     else:
         if not cand_buffer.is_cuda or cand_buffer.dtype != torch.float32 or not cand_buffer.is_contiguous() or cand_buffer.device != device:
             raise ValueError("cand_buffer must be a contiguous CUDA float32 tensor on the input device")
-        if cand_batch_offsets is None:
-            # offsets were computed internally ⇒ total is cheaply known, so check
-            # the caller's buffer is big enough (this path is not sync-free anyway).
-            need = int(offsets[bs].item())
-            if cand_buffer.numel() < need:
-                raise ValueError(
-                    f"cand_buffer too small: need >= {need} float32 elements " f"(use compress_topk_cand_buffer_size_thd), got {cand_buffer.numel()}"
-                )
-        # else: caller-supplied offsets ⇒ caller sized the buffer via the helper;
-        # skip the .item() so the graph-capture path stays sync-free.
+        # The required size depends on device-resident offsets. Avoid reading
+        # offsets back merely to validate caller-owned scratch; the caller
+        # guarantees that the buffer was sized for the supplied sequence data.
         cand = cand_buffer.view(-1)
     denom_tmp = lse_out if want_lse else _get_fwd_unified_denom_placeholder((total_q,), device)
 
@@ -1260,9 +1245,9 @@ def _indexer_fwd_compress_topk_thd(
     Omitting ``max_seqlen_*`` (derived via ``.max().item()``) or ``cand_buffer`` /
     ``cand_batch_offsets`` (internal scratch sizing via ``.item()``) needs a host
     sync that is illegal mid-capture; omitting ``out_indices`` / ``out_logits``
-    would allocate the output mid-capture.  Each raises a clear ValueError here.
-    The eager value checks are likewise skipped during capture, so the caller must
-    have validated in warmup.
+    would allocate the output mid-capture. Each raises a clear ValueError here.
+    Device-resident prefix and offset values are always trusted; only their
+    host-visible metadata is validated.
 
     Scope of "allocation-free": the above makes the path graph-capturable with NO
     host sync, and — with ``topk_indices_global=False`` (local KV ids) — with no
@@ -1332,6 +1317,7 @@ def _indexer_fwd_compress_topk_thd(
         qhead_per_kv_head = n_heads_q // k.shape[1]
     elif qhead_per_kv_head != n_heads_q // k.shape[1]:
         raise ValueError(f"qhead_per_kv_head ({qhead_per_kv_head}) must equal n_heads_q // " f"n_heads_kv ({n_heads_q // k.shape[1]})")
+    _validate_indexer_qhead_per_kv_head(qhead_per_kv_head, precision)
     if k.shape[1] != 1:
         raise ValueError(
             "THD compress-logits top-k currently requires n_heads_kv=1 (MQA); " f"got n_heads_kv={k.shape[1]}. The stage-1 GEMM reads only KV head 0."
@@ -1356,6 +1342,8 @@ def _indexer_fwd_compress_topk_thd(
                 f"per tile; got m_block_size={m_block_size}, "
                 f"qhead_per_kv_head={qhead_per_kv_head}"
             )
+    if m_block_size % qhead_per_kv_head != 0:
+        raise ValueError(f"m_block_size ({m_block_size}) must be divisible by " f"qhead_per_kv_head ({qhead_per_kv_head})")
     cu_q32 = cu_seqlens_q.to(torch.int32)
     cu_k32 = cu_seqlens_k.to(torch.int32)
     capturing = torch.cuda.is_current_stream_capturing()
@@ -1434,50 +1422,10 @@ def _indexer_fwd_compress_topk_thd(
                 "cand_batch_offsets must be a contiguous 1D int64 CUDA tensor of " "length bs+1 on the input device (use " "compress_topk_cand_buffer_size_thd)"
             )
 
-    # Per-batch query/key counts (sq_b/sk_b) feed BOTH the eager-only value checks
-    # below and the global-id conversion at the end.  Compute them LAZILY — only
-    # when actually needed — so the strict local-id capture path
-    # (topk_indices_global=False while capturing) stays zero-extra-allocation: no
-    # sq_b/sk_b tensors get recorded into the CUDA-graph pool.
-    sq_b = sk_b = None
-
-    # Value checks (a)-(c) below need device->host syncs (.item() / .any().item()),
-    # which are ILLEGAL during CUDA-graph capture.  Run them whenever NOT capturing
-    # (i.e. eager mode, including the warmup that necessarily precedes capture) so a
-    # too-small max_seqlen or an inconsistent cu_seqlens is caught even on the
-    # pre-allocated / cand_batch_offsets path: the offsets encode the per-batch
-    # compact SIZES, not max_seqlen_q/k, so a correct-offsets + wrong-max_seqlen
-    # combo would otherwise under-cover query rows and SILENTLY produce wrong
-    # output.  During capture they are skipped (no sync is possible mid-capture);
-    # the caller is responsible for having validated in warmup — the standard
-    # graph-capture contract.
-    if not capturing:
-        sq_b = (cu_q32[1:] - cu_q32[:-1]).to(torch.int64)
-        sk_b = (cu_k32[1:] - cu_k32[:-1]).to(torch.int64)
-        # (a) cu_seqlens: start at 0, end at total_q/total_k, monotonic non-neg.
-        if int(cu_q32[0].item()) != 0 or int(cu_k32[0].item()) != 0 or int(cu_q32[-1].item()) != total_q or int(cu_k32[-1].item()) != k.shape[0]:
-            raise ValueError(
-                "cu_seqlens must start at 0 and end at total_q / total_k "
-                f"(cu_q[-1]={int(cu_q32[-1].item())} vs total_q={total_q}; "
-                f"cu_k[-1]={int(cu_k32[-1].item())} vs total_k={k.shape[0]})"
-            )
-        if bool((sq_b < 0).any().item()) or bool((sk_b < 0).any().item()):
-            raise ValueError("cu_seqlens must be monotonically non-decreasing")
-        # (b) an explicit max_seqlen must cover the actual per-batch maxima (else the
-        # stage-1 scheduler under-covers query rows → uninitialised / wrong output).
-        if max_seqlen_q < int(sq_b.max().item()) or max_seqlen_k < int(sk_b.max().item()):
-            raise ValueError(
-                "max_seqlen_q/k must be >= the per-batch maxima "
-                f"(max_seqlen_q={max_seqlen_q} vs {int(sq_b.max().item())}; "
-                f"max_seqlen_k={max_seqlen_k} vs {int(sk_b.max().item())})"
-            )
-        # (c) per-batch ratio-causal validity: a mixed batch can satisfy the global
-        # max check yet have sk_b*ratio < sq_b for some batch → qgs<0 → negative
-        # compact offsets / OOB.
-        viol = sq_b > sk_b * ratio
-        if bool(viol.any().item()):
-            bad = viol.nonzero(as_tuple=True)[0].tolist()
-            raise ValueError("THD compressed-logits top-k requires sq_b <= sk_b*ratio for EVERY batch; " f"violated at batch(es) {bad}")
+    # Only needed for the optional GPU-side local-to-global conversion. Device
+    # prefix values are caller-owned and are not copied to the host for
+    # validation.
+    sq_b = None
 
     # Caller output buffers: validate up front (same contract as the stage-2
     # kernel: shape (total_q, topk), dtype, same device, contiguous last/topk dim).
@@ -1503,34 +1451,6 @@ def _indexer_fwd_compress_topk_thd(
         or q_causal_offsets.device != device
     ):
         raise ValueError(f"q_causal_offsets must be a contiguous 1D int32 CUDA tensor of shape ({bs},) " f"on {device}")
-    if not capturing:
-        assert sq_b is not None and sk_b is not None
-        qgs = torch.zeros_like(sq_b) if q_causal_offsets is None else q_causal_offsets.to(torch.int64)
-        invalid = qgs < 0
-        if bool(invalid.any().item()):
-            bad = invalid.nonzero(as_tuple=True)[0].tolist()
-            raise ValueError("THD compressed-logits top-k requires 0 <= q_causal_offsets[b]; " f"violated at batch(es) {bad}")
-
-        # Caller-provided offsets are trusted during graph capture, so validate
-        # them against the current sequence geometry during eager warmup. This
-        # prevents stale offsets or an undersized scratch buffer from turning
-        # into stage-1 writes / stage-2 reads outside cand_buffer.
-        if cand_batch_offsets is not None:
-            expected_offsets = _compress_cand_batch_offsets(
-                cu_q32,
-                cu_k32,
-                ratio,
-                q_causal_offsets,
-            )
-            if not torch.equal(cand_batch_offsets, expected_offsets):
-                raise ValueError(
-                    "cand_batch_offsets do not match the current cu_seqlens, "
-                    "ratio, and q_causal_offsets; regenerate them with "
-                    "compress_topk_cand_buffer_size_thd"
-                )
-            required_floats = int(expected_offsets[-1].item())
-            if cand_buffer is not None and cand_buffer.numel() < required_floats:
-                raise ValueError(f"cand_buffer too small: need >= {required_floats} float32 " f"elements, got {cand_buffer.numel()}")
 
     # Stage 1: native varlen compress GEMM → tight per-batch compact buffer.
     cand, offsets = _run_compress_gemm_varlen(
