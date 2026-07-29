@@ -399,6 +399,10 @@ SDPA_attributes::verify_sdpa_support_surface_for_implementation(const detail::Co
         auto const it = inputs.find(name);
         return it != inputs.end() && it->second != nullptr;
     };
+    auto const has_output = [this](output_names name) {
+        auto const it = outputs.find(name);
+        return it != outputs.end() && it->second != nullptr;
+    };
 
     switch (impl) {
         case AttentionImplementation_t::AUTO:
@@ -435,6 +439,27 @@ SDPA_attributes::verify_sdpa_support_surface_for_implementation(const detail::Co
             RETURN_CUDNN_FRONTEND_ERROR_IF(context.get_dynamic_shape_enabled(),
                                            error_code_t::GRAPH_NOT_SUPPORTED,
                                            "Unified SDPA node doesn't yet support dynamic shape");
+
+            // The unified engine only implements FP16/BF16/FP8/MXFP8 inputs/outputs.
+            // NOT_SET is allowed to pass (the dtype is resolved from the graph default before
+            // real validation re-runs this check).
+            auto const io_dtype_supported = [](DataType_t dt) {
+                return dt == DataType_t::NOT_SET || dt == DataType_t::HALF || dt == DataType_t::BFLOAT16 ||
+                       dt == DataType_t::FP8_E4M3 || dt == DataType_t::FP8_E5M2;
+            };
+            bool bad_io = false;
+            for (auto const name : {input_names::Q, input_names::K, input_names::V}) {
+                if (has_input(name) && !io_dtype_supported(inputs.at(name)->get_data_type())) {
+                    bad_io = true;
+                }
+            }
+            if (has_output(output_names::O) && !io_dtype_supported(outputs.at(output_names::O)->get_data_type())) {
+                bad_io = true;
+            }
+            RETURN_CUDNN_FRONTEND_ERROR_IF(bad_io,
+                                           error_code_t::GRAPH_NOT_SUPPORTED,
+                                           "Unified SDPA node only supports FP16/BF16/FP8 Q/K/V/O I/O (FP32 I/O is not "
+                                           "supported); use the composite implementation for FP32.");
 
             // TODO: Provide smarter error messages that provide the required cuDNN version for each input.
             std::unordered_set<SDPA_attributes::input_names> allowed_input_names{
