@@ -363,6 +363,30 @@ def test_grouped_gemm_wgrad_discrete_compile_execute_fp8(
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
+@with_grouped_gemm_wgrad_params_fp4
+def test_grouped_gemm_wgrad_discrete_accumulate_compile_execute_fp4(
+    ab_dtype,
+    wgrad_dtype,
+    acc_dtype,
+    mma_tiler_mn,
+    cluster_shape_mn,
+    sf_vec_size,
+    sf_dtype,
+):
+    _test_grouped_gemm_wgrad_discrete_compile_execute(
+        ab_dtype=ab_dtype,
+        wgrad_dtype=wgrad_dtype,
+        acc_dtype=acc_dtype,
+        mma_tiler_mn=mma_tiler_mn,
+        cluster_shape_mn=cluster_shape_mn,
+        sf_vec_size=sf_vec_size,
+        sf_dtype=sf_dtype,
+        accumulate_on_output=True,
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
 @with_grouped_gemm_wgrad_params_fp8
 def test_grouped_gemm_wgrad_discrete_accumulate_compile_execute_fp8(
     ab_dtype,
