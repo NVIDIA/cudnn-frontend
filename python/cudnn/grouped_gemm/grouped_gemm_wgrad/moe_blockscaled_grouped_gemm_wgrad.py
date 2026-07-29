@@ -730,10 +730,10 @@ class BlockScaledMoEGroupedGemmWgradKernel:
 
         bidx, bidy, bidz = cute.arch.block_idx()
         mma_tile_coord_v = bidx % cute.size(tiled_mma.thr_id.shape)
-        is_leader_cta = mma_tile_coord_v == 0
         cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(cta_rank_in_cluster)
         block_in_cluster_coord_sfb_vmnk = cluster_layout_sfb_vmnk.get_flat_coord(cta_rank_in_cluster)
+        is_leader_cta = block_in_cluster_coord_vmnk[0] == 0
         tidx, _, _ = cute.arch.thread_idx()
 
         # =================================================================
