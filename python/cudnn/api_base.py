@@ -33,6 +33,16 @@ def is_power_of_2(n: int) -> bool:
     return n > 0 and (n & (n - 1)) == 0
 
 
+def is_sm107_device() -> bool:
+    """Return True when the current CUDA device is Rubin (SM107)."""
+    return torch.cuda.is_available() and torch.cuda.get_device_capability(torch.cuda.current_device()) == (10, 7)
+
+
+def get_device_type() -> str:
+    """Return the architecture family used by SM100 grouped GEMM wrappers."""
+    return "rubin" if is_sm107_device() else "blackwell"
+
+
 _experimental_api_warnings_emitted = set()
 _experimental_api_warnings_lock = threading.Lock()
 
@@ -379,12 +389,16 @@ class APIBase(ABC):
         - self._is_supported: Flag indicating if configuration is validated
         - self._kernel: Kernel instance
         - self._compiled_kernel: Cache for compiled kernel
+        - self._device_type: Architecture family used for dispatch/cache keys
+        - self._is_rubin_kernel: True when running on Rubin (SM107)
         - self._logger: Logger instance for this class
         """
         self._is_supported = False
         self._kernel = None
         self._compiled_kernel = None
         self._interpret_uint8_as_fp4x2 = False
+        self._device_type = get_device_type()
+        self._is_rubin_kernel = self._device_type == "rubin"
         self._logger = logging.getLogger(self.__class__.__name__)
 
     def _warn_experimental_api(self) -> None:

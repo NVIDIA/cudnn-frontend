@@ -45,6 +45,7 @@ Discrete mode
 
 from .moe_blockscaled_grouped_gemm_dglu_dbias import BlockScaledMoEGroupedGemmDgluDbiasKernel
 from ..moe_utils import MoEWeightMode
+from ..grouped_gemm_utils import rubin_single_group_offsets_kwarg
 from cuda.bindings import driver as cuda
 import os
 import torch
@@ -57,6 +58,29 @@ from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
 from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.api_base import APIBase, ceil_div, is_power_of_2
+
+
+def _get_rubin_kernel():
+    from .moe_blockscaled_grouped_gemm_dglu_rubin import (
+        BlockScaledMoEGroupedGemmDgluKernel as RubinBlockScaledMoEGroupedGemmDgluKernel,
+    )
+
+    return RubinBlockScaledMoEGroupedGemmDgluKernel
+
+
+_GEGGLU_ALPHA_DEFAULT = 1.702
+_GLU_CLAMP_MAX_DEFAULT = 7.0
+_GLU_CLAMP_MIN_DEFAULT = -7.0
+
+
+def _reject_unsupported_rubin_glu_tune_params(
+    is_rubin_kernel: bool,
+    geglu_alpha: float,
+    glu_clamp_max: float,
+    glu_clamp_min: float,
+) -> None:
+    if is_rubin_kernel and (geglu_alpha != _GEGGLU_ALPHA_DEFAULT or glu_clamp_max != _GLU_CLAMP_MAX_DEFAULT or glu_clamp_min != _GLU_CLAMP_MIN_DEFAULT):
+        raise NotImplementedError("Rubin grouped GEMM dGLU does not support geglu_alpha, glu_clamp_max, or glu_clamp_min tuning")
 
 
 class GroupedGemmDgluBlockScaledAPI(APIBase):
@@ -279,10 +303,16 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
         self.geglu_alpha = geglu_alpha
         self.glu_clamp_max = glu_clamp_max
         self.glu_clamp_min = glu_clamp_min
+        _reject_unsupported_rubin_glu_tune_params(
+            self._is_rubin_kernel,
+            self.geglu_alpha,
+            self.glu_clamp_max,
+            self.glu_clamp_min,
+        )
 
         self._interpret_uint8_as_fp4x2 = True
         self._has_dbias = self.dbias_desc is not None
-        self._kernel = BlockScaledMoEGroupedGemmDgluDbiasKernel
+        self._kernel = _get_rubin_kernel() if self._is_rubin_kernel else BlockScaledMoEGroupedGemmDgluDbiasKernel
 
         self.num_cluster_overlap_margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
         self._logger.debug(f"setting num_cluster_overlap_margin: {self.num_cluster_overlap_margin}")
@@ -605,8 +635,8 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
             f"m_aligned must be divisible by mma_tiler_mn[0], got {self.m_aligned} % {self.mma_tiler_mn[0]} != 0",
         )
         self._value_error_if(
-            self.m_aligned != BlockScaledMoEGroupedGemmDgluDbiasKernel.FIX_PAD_SIZE,
-            f"m_aligned must be {BlockScaledMoEGroupedGemmDgluDbiasKernel.FIX_PAD_SIZE} (FIX_PAD_SIZE), got {self.m_aligned}",
+            self.m_aligned != self._kernel.FIX_PAD_SIZE,
+            f"m_aligned must be {self._kernel.FIX_PAD_SIZE} (FIX_PAD_SIZE), got {self.m_aligned}",
         )
 
         # ---- Tensor alignment ----
@@ -688,7 +718,7 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
             weight_mode=self.weight_mode,
             act_func=self.act_func,
             use_dynamic_sched=self.use_dynamic_sched,
-            use_single_group_runtime_offsets=self.use_single_group_runtime_offsets,
+            **rubin_single_group_offsets_kwarg(self._is_rubin_kernel, self.use_single_group_runtime_offsets),
         )
 
         hardware_info = cutlass.utils.HardwareInfo()
@@ -903,8 +933,7 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
         # Compile with keyword args (dense mode uses the unified __call__ positional order).
         dbias_fake = self._make_fake_cute_tensor_from_desc(self.dbias_desc, assumed_align=16)
 
-        _compiled_kernel = cute.compile(
-            gemm_dglu,
+        compile_kwargs = dict(
             a=a_cute_fake,
             b=b_cute_fake,
             sfb=sfb_cute_fake,
@@ -930,12 +959,18 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
             max_active_clusters=max_active_clusters,
             stream=fake_stream,
             epilogue_op=self.epilogue_op,
-            linear_offset=self.linear_offset,
-            geglu_alpha=self.geglu_alpha,
-            glu_clamp_max=self.glu_clamp_max,
-            glu_clamp_min=self.glu_clamp_min,
+            linear_offset=cutlass.Float32(self.linear_offset) if self._is_rubin_kernel else self.linear_offset,
             options="--enable-tvm-ffi",
         )
+        if not self._is_rubin_kernel:
+            compile_kwargs.update(
+                {
+                    "geglu_alpha": self.geglu_alpha,
+                    "glu_clamp_max": self.glu_clamp_max,
+                    "glu_clamp_min": self.glu_clamp_min,
+                }
+            )
+        _compiled_kernel = cute.compile(gemm_dglu, **compile_kwargs)
 
         # Cache workspace pointer for the tensor_api closure
         cached_workspace_ptr = from_dlpack(self._workspace, assumed_align=128).iterator
@@ -961,7 +996,7 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
             stream: cuda.CUstream,
         ) -> None:
             norm_const_tensor = self._unpad_tensor_to_ndim(norm_const_tensor, 1, "norm_const")
-            _compiled_kernel(
+            kernel_args = (
                 a_tensor,
                 b_tensor,
                 sfb_tensor,
@@ -982,9 +1017,11 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
                 beta_tensor,
                 prob_tensor,
                 dprob_tensor,
-                dbias_tensor,
-                stream,
             )
+            if self._is_rubin_kernel:
+                _compiled_kernel(*kernel_args, cutlass.Float32(self.linear_offset), dbias_tensor, stream)
+            else:
+                _compiled_kernel(*kernel_args, dbias_tensor, stream)
 
         self._compiled_kernel = tensor_api
 
@@ -1093,8 +1130,7 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
         workspace_ptr_cute = from_dlpack(self._workspace, assumed_align=128).iterator
 
         self._logger.debug("Compiling discrete grouped GEMM dGLU kernel")
-        _compiled_kernel = cute.compile(
-            gemm_dglu,
+        compile_kwargs = dict(
             a=a_tensor,
             b=b_ptrs_cute,
             sfb=sfb_ptrs_cute,
@@ -1120,12 +1156,18 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
             max_active_clusters=max_active_clusters,
             stream=fake_stream,
             epilogue_op=self.epilogue_op,
-            linear_offset=self.linear_offset,
-            geglu_alpha=self.geglu_alpha,
-            glu_clamp_max=self.glu_clamp_max,
-            glu_clamp_min=self.glu_clamp_min,
+            linear_offset=cutlass.Float32(self.linear_offset) if self._is_rubin_kernel else self.linear_offset,
             options="--enable-tvm-ffi",
         )
+        if not self._is_rubin_kernel:
+            compile_kwargs.update(
+                {
+                    "geglu_alpha": self.geglu_alpha,
+                    "glu_clamp_max": self.glu_clamp_max,
+                    "glu_clamp_min": self.glu_clamp_min,
+                }
+            )
+        _compiled_kernel = cute.compile(gemm_dglu, **compile_kwargs)
 
         self._n = n
         self._k = k
@@ -1161,7 +1203,7 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
             b_ptrs_addr = int(b_ptrs_device.data_ptr())
             sfb_ptrs_addr = int(sfb_ptrs_device.data_ptr())
 
-            _compiled_kernel(
+            kernel_args = (
                 a_tensor,
                 b_ptrs_addr,
                 sfb_ptrs_addr,
@@ -1182,9 +1224,11 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
                 beta_tensor,
                 prob_tensor,
                 dprob_tensor,
-                dbias_tensor,
-                stream,
             )
+            if self._is_rubin_kernel:
+                _compiled_kernel(*kernel_args, cutlass.Float32(self.linear_offset), dbias_tensor, stream)
+            else:
+                _compiled_kernel(*kernel_args, dbias_tensor, stream)
 
         self._compiled_kernel = tensor_api
 

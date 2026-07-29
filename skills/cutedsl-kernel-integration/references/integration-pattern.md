@@ -24,6 +24,8 @@ Nested API families are also valid when matching existing structure, for example
 
 Choose the closest existing family before creating a new top-level package.
 
+When an existing SM100 kernel needs a Rubin-specific CuTeDSL implementation, keep the public API unchanged and add an internal architecture dispatch layer. See [Architecture-Specific Kernel Variants](#architecture-specific-kernel-variants-rubin--sm107) below.
+
 Use this routing table before choosing the package namespace:
 
 | Kernel shape | Preferred family |
@@ -70,6 +72,68 @@ Follow the closest template instead of inventing a new lifecycle.
   - Keep `__all__` complete and explicit.
 
 Use existing helpers from `api_base.py`, `datatypes.py`, and family utility modules before adding new helpers.
+
+## Architecture-Specific Kernel Variants (Rubin / SM107)
+
+Use this pattern when the public API stays the same but Rubin (`sm107`, compute capability `(10, 7)`) needs a different CuTeDSL kernel module than the default SM100 implementation.
+
+Current examples:
+
+- `python/cudnn/grouped_gemm/grouped_gemm_quant/`
+- `python/cudnn/grouped_gemm/grouped_gemm_glu/`
+- `python/cudnn/grouped_gemm/grouped_gemm_dglu/`
+
+### File layout
+
+Keep the default kernel module unchanged and add a Rubin sibling:
+
+```text
+python/cudnn/grouped_gemm/<operation>/
+|-- api.py
+|-- <default_kernel_module>.py
+`-- <default_kernel_module_basename>_rubin.py
+```
+
+Examples:
+
+- `moe_blockscaled_grouped_gemm_quant.py` + `moe_blockscaled_grouped_gemm_quant_rubin.py`
+- `moe_blockscaled_grouped_gemm_glu_rubin.py`
+- `moe_blockscaled_grouped_gemm_dglu_rubin.py`
+
+Rubin kernel modules are internal implementation details. Do not add new public exports or lazy imports for them.
+
+### Rubin kernel module conventions
+
+- Import `cutlass.utils.rubin_helpers as sm107_utils` for MMA/tile setup that differs from SM100.
+- Keep the kernel class name aligned with the upstream CuTeDSL source when possible so `api.py` can alias it cleanly.
+- Preserve MoE helper/scheduler topology from the default kernel unless the Rubin source explicitly changes it.
+
+### `api.py` dispatch conventions
+
+Device gating lives in `cudnn.api_base`: `is_sm107_device()` and `self._is_rubin_kernel` (set in `APIBase.__init__`).
+
+Add a lazy Rubin kernel loader near the top of `api.py`:
+
+```python
+def _get_rubin_kernel():
+    from .<rubin_module> import <RubinKernelClass> as RubinKernelAlias
+    return RubinKernelAlias
+```
+
+In `__init__` (after `super().__init__()`):
+
+```python
+self._kernel = _get_rubin_kernel() if self._is_rubin_kernel else DefaultKernelClass
+```
+
+Then:
+
+- Replace hard-coded references like `DefaultKernelClass.FIX_PAD_SIZE` with `self._kernel.FIX_PAD_SIZE`.
+- Include `get_device_type()` (`"blackwell"` or `"rubin"`) in wrapper cache keys whenever the wrapper can dispatch to architecture-specific kernels.
+- Lazy-import the Rubin module inside `_get_rubin_kernel()` so non-Rubin environments do not pay import cost up front.
+- Branch in `compile()` / `execute()` only when the Rubin kernel signature or epilogue contract differs from the default kernel. `grouped_gemm_glu` and `grouped_gemm_dglu` only swap the kernel class; `grouped_gemm_quant` additionally adapts compile/execute kwargs for Rubin's optional `c` materialization path and omits `row_scale` on Rubin while keeping it on non-Rubin architectures.
+
+Do not expose `_is_rubin_kernel`, `_get_rubin_kernel()`, or Rubin module paths in public docs unless the user-visible contract changes.
 
 ## Public Exports
 
