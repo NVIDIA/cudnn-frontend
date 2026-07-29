@@ -115,6 +115,20 @@ def _supports_bwd_original_qkv_layout(t: torch.Tensor) -> bool:
     return t.stride(0) % 8 == 0 and t.stride(1) % 8 == 0
 
 
+def _supports_bwd_direct_grad_layout(t: torch.Tensor) -> bool:
+    """Return whether the fused epilogue can write directly to ``t``.
+
+    The D64/D128 epilogue uses 128-bit stores, so the unit-stride head
+    dimension and the token/head offsets must remain 16-byte aligned.
+    The kernel restores those dynamic-stride divisibility assumptions before
+    constructing its output views.
+    """
+    # Keep zero strides out of this dynamic-layout cache variant. DLPack/CuTe
+    # represents broadcast strides as static zero, so mixing them with a
+    # previously compiled nonzero-stride descriptor would not be type-safe.
+    return _supports_bwd_original_qkv_layout(t) and t.stride(0) != 0 and t.stride(1) != 0
+
+
 def hstu_varlen_fwd_100(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -402,15 +416,18 @@ def hstu_varlen_bwd_100(
     use_original_qkv_layout = _supports_bwd_original_qkv_layout(q) and _supports_bwd_original_qkv_layout(k) and _supports_bwd_original_qkv_layout(v)
     use_original_do_layout = _supports_bwd_original_qkv_layout(do)
     no_preallocated_grads = dq is None and dk is None and dv is None
-    preallocated_original_grads = (
+    implicit_direct_grads = no_preallocated_grads and all(_supports_bwd_direct_grad_layout(tensor) for tensor in (q_orig, k_orig, v_orig))
+    preallocated_direct_grads = (
         dq is not None
         and dk is not None
         and dv is not None
-        and _supports_bwd_original_qkv_layout(dq)
-        and _supports_bwd_original_qkv_layout(dk)
-        and _supports_bwd_original_qkv_layout(dv)
+        and _supports_bwd_direct_grad_layout(dq)
+        and _supports_bwd_direct_grad_layout(dk)
+        and _supports_bwd_direct_grad_layout(dv)
     )
-    use_original_grad_layout = use_original_qkv_layout and (no_preallocated_grads or preallocated_original_grads)
+    # Gradient stores are independent of whether q/k/v use their original
+    # layouts or compact read-only staging buffers.
+    use_original_grad_layout = implicit_direct_grads or preallocated_direct_grads
     compile_key = (
         q_orig.device,
         q_dtype,
@@ -512,8 +529,7 @@ def hstu_varlen_bwd_100(
             _mark_dynamic_tensor(
                 tensor,
                 1,
-                compact=True,
-                stride_order=((0, 2, 3, 4, 1) if use_original_grad_layout else (2, 3, 0, 4, 1)),
+                compact=not use_original_grad_layout,
             )
             for tensor in (dq, dk, dv)
         ]
@@ -594,10 +610,13 @@ def hstu_varlen_bwd_100(
 
     if dq_orig is not None:
         dq_orig.copy_(dq)
+        dq = dq_orig
     if dk_orig is not None:
         dk_orig.copy_(dk)
+        dk = dk_orig
     if dv_orig is not None:
         dv_orig.copy_(dv)
+        dv = dv_orig
 
     return dq, dk, dv
 

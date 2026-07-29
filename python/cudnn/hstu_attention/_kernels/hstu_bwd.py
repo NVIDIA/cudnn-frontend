@@ -245,6 +245,20 @@ class HSTUAttentionBackwardSm100:
         h, b = hb
         h_r, h_k = h
 
+        def assume_strides_aligned(tensor: cute.Tensor) -> cute.Tensor:
+            """Restore the 128-bit stride contract for gradient stores.
+
+            Direct outputs are host-validated; scratch outputs are compact.
+            Thus every dynamic non-unit stride in these rank-5 views is a
+            multiple of one 128-bit vector.
+            """
+            divby = 128 // tensor.element_type.width
+            strides = tuple(stride if isinstance(stride, int) else cute.assume(stride, divby=divby) for stride in tensor.stride[:-1])
+            return cute.make_tensor(
+                tensor.iterator,
+                cute.make_layout(tensor.shape, stride=(*strides, tensor.stride[-1])),
+            )
+
         def make_q_like_tensor(tensor: cute.Tensor) -> cute.Tensor:
             return cute.make_tensor(
                 tensor.iterator,
@@ -284,6 +298,7 @@ class HSTUAttentionBackwardSm100:
         # (s, d, 1, h_k, b) -> (s, d, ((1, h_k), b))
         V = make_kv_like_tensor(V)
 
+        dQ, dK, dV = [assume_strides_aligned(tensor) for tensor in (dQ, dK, dV)]
         dQ = make_q_like_tensor(dQ)
         dK = make_kv_like_tensor(dK)
         dV = make_kv_like_tensor(dV)
@@ -490,6 +505,7 @@ class HSTUAttentionBackwardSm100:
         self.tma_copy_K_bytes = cute.size_in_bytes(self.element_dtype, K_smem_layout)
         self.tma_copy_V_bytes = cute.size_in_bytes(self.element_dtype, V_smem_layout)
         self.tma_copy_dO_bytes = cute.size_in_bytes(self.element_dtype, dO_smem_layout)
+
         @cute.struct
         class SharedStorage:
             # Pipeline barriers
@@ -2379,7 +2395,11 @@ class HSTUAttentionBackwardSm100:
         tdKtdK = tdKtdK[(None, None), 0, 0]
 
         mdK = cute.make_tensor(
-            dK.iterator + cute.assume(blk_offset[1] * dK.stride[0], divby=64),
+            dK.iterator
+            + cute.assume(
+                blk_offset[1] * dK.stride[0],
+                divby=128 // self.element_dtype.width,
+            ),
             cute.make_layout((K, self.tile_shape_dQ_K, HB), stride=dK.stride),
         )
         gdK = cute.local_tile(mdK, (self.dSQ_mma_tiler[0], self.dSQ_mma_tiler[1]), (None, None, None))
@@ -2407,7 +2427,11 @@ class HSTUAttentionBackwardSm100:
 
         mdV_in = cute.make_tensor(dV.iterator, cute.make_layout((K, self.cta_tiler[2], HB), stride=dV.stride))
         mdV = cute.make_tensor(
-            mdV_in.iterator + cute.assume(blk_offset[1] * mdV_in.stride[0], divby=64),
+            mdV_in.iterator
+            + cute.assume(
+                blk_offset[1] * mdV_in.stride[0],
+                divby=128 // self.element_dtype.width,
+            ),
             mdV_in.layout,
         )
         gdV = cute.local_tile(mdV, (self.PdO_mma_tiler[0], self.PdO_mma_tiler[1]), (None, None, None))

@@ -119,6 +119,15 @@ def test_top_level_exports():
     assert cudnn.hstu_attention_backward is hstu_attention_backward
 
 
+@pytest.mark.L0
+def test_bwd_direct_grad_layout_rejects_static_zero_stride():
+    storage = torch.empty((4, 64), dtype=torch.bfloat16)
+    grad = storage.as_strided((4, 1, 64), (64, 0, 1))
+
+    assert _interface._supports_bwd_original_qkv_layout(grad)
+    assert not _interface._supports_bwd_direct_grad_layout(grad)
+
+
 def _assert_public_signature(callable_obj, names, defaults) -> None:
     parameters = inspect.signature(callable_obj).parameters
     assert tuple(parameters) == tuple(names)
@@ -658,6 +667,216 @@ def test_backward_matches_pytorch(dtype, head_dim):
             rtol=6e-2,
             atol=6e-2,
         )
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
+def test_d128_explicit_api_supports_padded_gradient_outputs(monkeypatch):
+    _interface.hstu_varlen_bwd_100.compile_cache.clear()
+    torch.manual_seed(456)
+    seqlen, heads, padded_heads, head_dim = 128, 8, 16, 128
+    alpha = 0.7
+    scaling_seqlen = 64.0
+
+    input_storage = [
+        torch.randn(
+            (seqlen, padded_heads, head_dim),
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        * 0.2
+        for _ in range(4)
+    ]
+    q, k, v, do = (storage[:, :heads] for storage in input_storage)
+    cu = torch.tensor((0, seqlen), dtype=torch.int32, device="cuda")
+
+    padding_sentinel = 7.0
+    grad_storage = [
+        torch.full(
+            (seqlen, padded_heads, head_dim),
+            padding_sentinel,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        for _ in range(3)
+    ]
+    dq, dk, dv = (storage[:, :heads] for storage in grad_storage)
+    for grad in (dq, dk, dv):
+        assert grad.stride() == (2048, 128, 1)
+        assert not grad.is_contiguous()
+
+    api = HSTUBwdSm100(
+        sample_do=do,
+        sample_q=q,
+        sample_k=k,
+        sample_v=v,
+        sample_dq=dq,
+        sample_dk=dk,
+        sample_dv=dv,
+        sample_cu_seqlens_q=cu,
+        sample_cu_seqlens_k=cu,
+        max_seqlen_q=seqlen,
+        max_seqlen_k=seqlen,
+        window_size=(-1, 0),
+        alpha=alpha,
+        scaling_seqlen=scaling_seqlen,
+    )
+    assert api.check_support()
+    api.compile()
+    torch.cuda.synchronize()
+    for storage in grad_storage:
+        torch.testing.assert_close(
+            storage,
+            torch.full_like(storage, padding_sentinel),
+            rtol=0,
+            atol=0,
+        )
+
+    def fail_copy(*_args, **_kwargs):
+        raise AssertionError("padded gradient outputs must be written directly")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(torch.Tensor, "copy_", fail_copy)
+        api.execute(do, q, k, v, dq, dk, dv, cu, cu)
+
+    q_ref = q.float().detach().requires_grad_(True)
+    k_ref = k.float().detach().requires_grad_(True)
+    v_ref = v.float().detach().requires_grad_(True)
+    out_ref = _reference_forward(
+        q_ref,
+        k_ref,
+        v_ref,
+        cu,
+        cu,
+        alpha=alpha,
+        scaling_seqlen=scaling_seqlen,
+        causal=True,
+    )
+    expected = torch.autograd.grad(
+        out_ref,
+        (q_ref, k_ref, v_ref),
+        do.float(),
+    )
+    for actual, expected_grad, storage in zip((dq, dk, dv), expected, grad_storage):
+        torch.testing.assert_close(
+            actual.float(),
+            expected_grad,
+            rtol=8e-2,
+            atol=8e-2,
+        )
+        torch.testing.assert_close(
+            storage[:, heads:],
+            torch.full_like(storage[:, heads:], padding_sentinel),
+            rtol=0,
+            atol=0,
+        )
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
+def test_explicit_api_reuses_direct_grad_kernel_for_aligned_strides(monkeypatch):
+    _interface.hstu_varlen_bwd_100.compile_cache.clear()
+    batch, seqlen, heads, head_dim = 2, 37, 2, 64
+    torch.manual_seed(123)
+    input_storage = [
+        torch.randn(
+            (batch * seqlen, heads, head_dim + 1),
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        * 0.2
+        for _ in range(4)
+    ]
+    q, k, v, do = (storage[..., :head_dim] for storage in input_storage)
+    cu = torch.arange(
+        0,
+        (batch + 1) * seqlen,
+        seqlen,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    assert all(not _interface._supports_bwd_original_qkv_layout(tensor) for tensor in (q, k, v, do))
+    alpha = 0.7
+    scaling_seqlen = 32.0
+    padding_sentinel = 7.0
+
+    q_ref = q.float().detach().requires_grad_(True)
+    k_ref = k.float().detach().requires_grad_(True)
+    v_ref = v.float().detach().requires_grad_(True)
+    out_ref = _reference_forward(
+        q_ref,
+        k_ref,
+        v_ref,
+        cu,
+        cu,
+        alpha=alpha,
+        scaling_seqlen=scaling_seqlen,
+        causal=True,
+    )
+    expected = torch.autograd.grad(
+        out_ref,
+        (q_ref, k_ref, v_ref),
+        do.float(),
+    )
+
+    def fail_copy(*_args, **_kwargs):
+        raise AssertionError("aligned strided gradients must be written directly")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(torch.Tensor, "copy_", fail_copy)
+        for feature_paddings in ((8, 16, 24), (40, 48, 56)):
+            grad_storage = [
+                torch.full(
+                    (batch * seqlen, heads, head_dim + padding),
+                    padding_sentinel,
+                    dtype=q.dtype,
+                    device=q.device,
+                )
+                for padding in feature_paddings
+            ]
+            dq, dk, dv = (storage[..., :head_dim] for storage in grad_storage)
+            for grad in (dq, dk, dv):
+                assert grad.stride(0) % 8 == 0
+                assert grad.stride(1) % 8 == 0
+                assert grad.stride(0) % 64 != 0
+
+            api = HSTUBwdSm100(
+                sample_do=do,
+                sample_q=q,
+                sample_k=k,
+                sample_v=v,
+                sample_dq=dq,
+                sample_dk=dk,
+                sample_dv=dv,
+                sample_cu_seqlens_q=cu,
+                sample_cu_seqlens_k=cu,
+                max_seqlen_q=seqlen,
+                max_seqlen_k=seqlen,
+                window_size=(-1, 0),
+                alpha=alpha,
+                scaling_seqlen=scaling_seqlen,
+            )
+            assert api.check_support()
+            api.compile()
+            assert len(_interface.hstu_varlen_bwd_100.compile_cache) == 1
+            api.execute(do, q, k, v, dq, dk, dv, cu, cu)
+
+            for actual, expected_grad, storage in zip((dq, dk, dv), expected, grad_storage):
+                torch.testing.assert_close(
+                    actual.float(),
+                    expected_grad,
+                    rtol=8e-2,
+                    atol=8e-2,
+                )
+                torch.testing.assert_close(
+                    storage[..., head_dim:],
+                    torch.full_like(
+                        storage[..., head_dim:],
+                        padding_sentinel,
+                    ),
+                    rtol=0,
+                    atol=0,
+                )
 
 
 @pytest.mark.L0
