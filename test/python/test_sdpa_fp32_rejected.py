@@ -8,9 +8,11 @@ HALF in ``Graph::sdpa()`` regardless of the I/O dtype, so an FP32 graph would
 previously build and then dispatch a half-precision kernel onto 4-byte data,
 reading/writing shared memory out of bounds (a CUDA invalid memory reference).
 
-The support surface now rejects unsupported unified Q/K/V/O I/O dtypes, so such a
-graph fails cleanly at build time with GRAPH_NOT_SUPPORTED. Under AUTO, FP32 is
-routed to the composite implementation, which does support FP32 I/O.
+``verify_sdpa_support_surface_for_implementation`` now checks each Q/K/V/O I/O
+dtype against an allowlist on both paths: the unified path allows FP16/BF16/FP8,
+the composite path additionally allows FP32; neither allows FP64 or anything
+else. Unsupported dtypes fail cleanly at build time with GRAPH_NOT_SUPPORTED.
+Under AUTO, FP32 is routed to the composite implementation.
 """
 
 import cudnn
@@ -26,20 +28,32 @@ _DTYPE = {
     torch.bfloat16: cudnn.data_type.BFLOAT16,
 }
 
+_PORTS = ["q", "k", "v", "o"]
 
-def _build_sdpa(io_dtype, implementation):
+
+def _build_sdpa(implementation, base_dtype=torch.float16, *, overrides=None):
+    """Build and finalize an SDPA graph.
+
+    Every Q/K/V/O tensor uses ``base_dtype`` except the ports named in
+    ``overrides`` ({port: torch_dtype}). Overriding a single port lets each
+    port's dtype check be exercised independently.
+    """
+    overrides = overrides or {}
     b, h, s, d = 2, 4, 128, 64
-    cudnn_dtype = _DTYPE[io_dtype]
+
+    def dt(port):
+        return _DTYPE[overrides.get(port, base_dtype)]
+
     graph = cudnn.pygraph(
-        io_data_type=cudnn_dtype,
+        io_data_type=_DTYPE[base_dtype],
         intermediate_data_type=cudnn.data_type.FLOAT,
         compute_data_type=cudnn.data_type.FLOAT,
     )
     dim = [b, h, s, d]
     stride = [h * s * d, s * d, d, 1]
-    q = graph.tensor(name="q", dim=dim, stride=stride, data_type=cudnn_dtype)
-    k = graph.tensor(name="k", dim=dim, stride=stride, data_type=cudnn_dtype)
-    v = graph.tensor(name="v", dim=dim, stride=stride, data_type=cudnn_dtype)
+    q = graph.tensor(name="q", dim=dim, stride=stride, data_type=dt("q"))
+    k = graph.tensor(name="k", dim=dim, stride=stride, data_type=dt("k"))
+    v = graph.tensor(name="v", dim=dim, stride=stride, data_type=dt("v"))
     o, _ = graph.sdpa(
         name="sdpa",
         q=q,
@@ -49,7 +63,7 @@ def _build_sdpa(io_dtype, implementation):
         attn_scale=1.0 / (d**0.5),
         implementation=implementation,
     )
-    o.set_output(True).set_dim(dim).set_stride(stride)
+    o.set_output(True).set_dim(dim).set_stride(stride).set_data_type(dt("o"))
 
     graph.validate()
     graph.build_operation_graph()
@@ -59,31 +73,45 @@ def _build_sdpa(io_dtype, implementation):
     return graph
 
 
-def test_fp32_unified_rejected():
-    """FP32 forced onto the unified node fails cleanly (it has no FP32 kernel)
-    instead of crashing -- the original issue #424."""
-    with pytest.raises(cudnn.cudnnGraphNotSupportedError):
-        _build_sdpa(torch.float32, cudnn.attention_implementation.UNIFIED)
+@pytest.mark.parametrize("bad_dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("port", _PORTS)
+def test_unified_rejects_unsupported_io_dtype(port, bad_dtype):
+    """Each Q/K/V/O port is checked independently on the unified path: an
+    unsupported dtype on any single port (the rest FP16) is rejected by the
+    unified support surface. Covers FP32 (issue #424) and FP64. The ``match``
+    asserts the rejection comes from our dtype check, not an incidental one."""
+    with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="Unified SDPA node"):
+        _build_sdpa(
+            cudnn.attention_implementation.UNIFIED,
+            torch.float16,
+            overrides={port: bad_dtype},
+        )
 
 
-@pytest.mark.parametrize(
-    "implementation",
-    [cudnn.attention_implementation.UNIFIED, cudnn.attention_implementation.COMPOSITE],
-)
-def test_fp64_rejected(implementation):
-    """FP64 I/O is supported by no SDPA engine and must be rejected on both the
-    unified and composite paths. The guards are allowlists, so they cover dtypes
-    beyond the FP32 case from issue #424 (e.g. avoid 'someone files a bug for
-    FP64 next'). Under AUTO, neither path accepts FP64, so auto-select instead
-    fails to find any implementation -- covered by the framework, not here."""
-    with pytest.raises(cudnn.cudnnGraphNotSupportedError):
-        _build_sdpa(torch.float64, implementation)
+@pytest.mark.parametrize("port", _PORTS)
+def test_composite_rejects_fp64_io_dtype(port):
+    """The composite path additionally supports FP32 but not FP64; an FP64 dtype
+    on any single port (the rest FP16) is rejected, per-port, by our check."""
+    with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="Composite SDPA node"):
+        _build_sdpa(
+            cudnn.attention_implementation.COMPOSITE,
+            torch.float16,
+            overrides={port: torch.float64},
+        )
 
 
 @pytest.mark.parametrize("io_dtype", [torch.float16, torch.bfloat16])
 def test_fp16_bf16_unified_supported(io_dtype):
     """The FP32/FP64 guard must not over-reject the supported FP16/BF16 dtypes."""
-    _build_sdpa(io_dtype, cudnn.attention_implementation.UNIFIED)
+    try:
+        _build_sdpa(cudnn.attention_implementation.UNIFIED, io_dtype)
+    except cudnn.cudnnGraphNotSupportedError as e:
+        # Our dtype allowlist must never reject FP16/BF16; a rejection naming the
+        # I/O data type is exactly the over-rejection this test guards against.
+        # Anything else means unified SDPA is unsupported on this cuDNN/GPU combo
+        # (e.g. too-old backend), so skip rather than fail.
+        assert "data type" not in str(e), f"FP16/BF16 wrongly rejected by the guard: {e}"
+        pytest.skip(f"unified FP16/BF16 SDPA unsupported on this setup: {e}")
 
 
 @pytest.mark.parametrize(
@@ -94,8 +122,10 @@ def test_fp32_composite_supported(implementation):
     """FP32 must not be routed to the unified node; it is accepted by the
     composite engines (AUTO auto-selects composite for FP32)."""
     try:
-        _build_sdpa(torch.float32, implementation)
-    except cudnn.cudnnGraphNotSupportedError:
-        # No composite FP32 engine available on this architecture; the important
-        # invariant (FP32 is not silently sent to the unified node) still holds.
+        _build_sdpa(implementation, torch.float32)
+    except cudnn.cudnnGraphNotSupportedError as e:
+        # A unified-routing rejection here would be a real regression (FP32 must
+        # never reach the unified node), so only skip on a genuine
+        # composite-engine unavailability -- never on the unified rejection.
+        assert "Unified" not in str(e), f"FP32 wrongly rejected by the unified node: {e}"
         pytest.skip("no composite FP32 SDPA engine available on this GPU")
