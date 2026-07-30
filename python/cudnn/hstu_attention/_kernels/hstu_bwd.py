@@ -2560,7 +2560,6 @@ class HSTUAttentionBackwardSm100:
         mma_compute_S_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread,
             self.num_compute_warps * self.threads_per_warp,
-            self.num_compute_warps * self.threads_per_warp,
         )
         return pipeline.PipelineUmmaAsync.create(
             barrier_storage=mma_compute_S_mbar_ptr,
@@ -2576,7 +2575,6 @@ class HSTUAttentionBackwardSm100:
         )
         mma_compute_dP_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread,
-            self.num_compute_warps * self.threads_per_warp,
             self.num_compute_warps * self.threads_per_warp,
         )
         return pipeline.PipelineUmmaAsync.create(
@@ -2594,7 +2592,6 @@ class HSTUAttentionBackwardSm100:
         mma_reduce_dQ_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread,
             self.num_reduce_warps * self.threads_per_warp,
-            self.num_reduce_warps * self.threads_per_warp,
         )
         return pipeline.PipelineUmmaAsync.create(
             barrier_storage=mma_reduce_dQ_mbar_ptr,
@@ -2606,7 +2603,6 @@ class HSTUAttentionBackwardSm100:
     def make_and_init_compute_mma_P_pipeline(self, compute_mma_P_mbar_ptr):
         compute_mma_P_producer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread,
-            self.num_compute_warps * self.threads_per_warp,
             self.num_compute_warps * self.threads_per_warp,
         )
         compute_mma_P_consumer_group = pipeline.CooperativeGroup(
@@ -2623,7 +2619,6 @@ class HSTUAttentionBackwardSm100:
     def make_and_init_compute_mma_dS_pipeline(self, compute_mma_dS_mbar_ptr):
         compute_mma_dS_producer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread,
-            self.num_compute_warps * self.threads_per_warp,
             self.num_compute_warps * self.threads_per_warp,
         )
         compute_mma_dS_consumer_group = pipeline.CooperativeGroup(
@@ -2646,7 +2641,6 @@ class HSTUAttentionBackwardSm100:
         mma_compute_dKdV_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread,
             self.num_compute_warps * self.threads_per_warp,
-            self.num_compute_warps * self.threads_per_warp,
         )
         return pipeline.PipelineUmmaAsync.create(
             barrier_storage=mma_compute_dKdV_mbar_ptr,
@@ -2658,7 +2652,6 @@ class HSTUAttentionBackwardSm100:
     def make_and_init_reduce_tma_store_pipeline(self):
         reduce_tma_store_producer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread,
-            self.num_reduce_warps * self.threads_per_warp,
             self.num_reduce_warps * self.threads_per_warp,
         )
         return pipeline.PipelineTmaStore.create(
