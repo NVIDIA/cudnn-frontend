@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """APIBase wrapper for DeepSeek Sparse Attention backward.
 
 The wrapper dispatches to the Hopper (SM90) or Blackwell (SM100) CuTe DSL

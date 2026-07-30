@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from .dense_blockscaled_gemm_persistent_amax import (
     Sm100BlockScaledPersistentDenseGemmKernel,
 )

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Benchmark DeepSeek Sparse Attention (DSA) backward in cuDNN Frontend.
 
 Times the public ``cudnn.DSA.sparse_attention_backward_wrapper`` API, which

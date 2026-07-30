@@ -1,4 +1,5 @@
 # Copyright (c) 2025, Tri Dao.
+# SPDX-License-Identifier: MIT
 #
 # Adapted from quack-kernels 0.4.1 (Apache-2.0). These helpers are local to
 # BSA to avoid coupling the cudnn-frontend CuTe DSL package to Quack.

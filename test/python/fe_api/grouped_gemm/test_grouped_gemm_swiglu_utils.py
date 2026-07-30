@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Utilities and parameterization for Grouped GEMM SwiGLU tests.
 Contains test configuration fixtures, tensor creation, and reference implementations.

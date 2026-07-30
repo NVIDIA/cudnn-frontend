@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Router: builds the ranked execution-plan list at plan-creation time.
 
 Implements the dispatch stage of the Python API unification proposal:

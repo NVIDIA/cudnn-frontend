@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """APIBase wrappers for the fused CSA/HCA Compressor gated-pooling CuTe-DSL kernels.
 
 ``CSACompressorForward`` / ``CSACompressorBackward`` wrap the forward and backward

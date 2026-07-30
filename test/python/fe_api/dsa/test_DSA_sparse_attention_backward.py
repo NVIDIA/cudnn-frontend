@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Tests for SparseAttentionBackward.
 
 The forward pass is a PyTorch reference (see dsa_reference.ref_sparse_attention_forward);

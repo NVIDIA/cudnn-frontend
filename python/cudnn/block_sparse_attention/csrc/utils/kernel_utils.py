@@ -1,4 +1,5 @@
 # Copyright (c) 2025, Tri Dao.
+# SPDX-License-Identifier: MIT
 
 import math
 import inspect

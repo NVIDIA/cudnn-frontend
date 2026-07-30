@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from .NSA_select_attn_fwd_hmma import HopperSelectAttentionFwd
 from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.api_base import APIBase, TupleDict

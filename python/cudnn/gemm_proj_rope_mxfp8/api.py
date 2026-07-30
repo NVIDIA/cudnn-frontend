@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Frontend-only API for the fused projection GEMM + YARN RoPE + dual-direction MXFP8 quantize.
 
 The operation (GEMM -> per-head RoPE on the trailing 64 -> rowwise+columnwise MXFP8 output) has two

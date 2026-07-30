@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Pure Python data types for cuDNN Frontend graph representation.
 
 This module provides Python dataclasses for tensor attributes and node types,

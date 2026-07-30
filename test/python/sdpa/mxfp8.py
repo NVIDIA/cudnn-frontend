@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # Try to import TransformerEngine (>= 2.12) for MXFP8 quantization
 # NOTE: TE must be imported BEFORE cudnn to avoid library loading conflicts
 from looseversion import LooseVersion

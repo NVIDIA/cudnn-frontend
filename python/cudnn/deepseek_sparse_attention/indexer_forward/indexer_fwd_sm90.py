@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """SM90 indexer forward kernel - direct CuTeDSL port of the old C++ path.
 
 This kernel intentionally keeps the SM90 C++ Q/K staging topology:

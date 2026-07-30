@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2021 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+
 cmake_minimum_required(VERSION 3.23)
 
 project(cudnn_frontend VERSION 1.27.0)

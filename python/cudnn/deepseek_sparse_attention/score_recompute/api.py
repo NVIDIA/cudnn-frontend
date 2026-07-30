@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """APIBase wrappers for the four DSA score-recompute operations.
 
 Wraps the SM100 and SM90 CuTe-DSL score kernels. Each backend provides

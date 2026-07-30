@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Backend (engine) contract for the Python graph: plan -> compile -> execute.
 
 A backend is one of the interchangeable implementations the Router dispatches

@@ -1,4 +1,5 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
 """ratio=128 CSA fused-compressor numerics contract gate (see docs/fe-oss-apis/csa.md).
 

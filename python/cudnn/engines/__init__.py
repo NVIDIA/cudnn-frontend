@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Execution backends for pygraph.
 
 Pluggable execution backends in one flat engine-id space with the cuDNN backend.
