@@ -21,6 +21,7 @@ pytestmark = pytest.mark.L0
 
 _DTYPE = {
     torch.float32: cudnn.data_type.FLOAT,
+    torch.float64: cudnn.data_type.DOUBLE,
     torch.float16: cudnn.data_type.HALF,
     torch.bfloat16: cudnn.data_type.BFLOAT16,
 }
@@ -59,22 +60,41 @@ def _build_sdpa(io_dtype, implementation):
 
 
 def test_fp32_unified_rejected():
-    """FP32 forced onto the unified node fails cleanly instead of crashing."""
+    """FP32 forced onto the unified node fails cleanly (it has no FP32 kernel)
+    instead of crashing -- the original issue #424."""
     with pytest.raises(cudnn.cudnnGraphNotSupportedError):
         _build_sdpa(torch.float32, cudnn.attention_implementation.UNIFIED)
 
 
+@pytest.mark.parametrize(
+    "implementation",
+    [cudnn.attention_implementation.UNIFIED, cudnn.attention_implementation.COMPOSITE],
+)
+def test_fp64_rejected(implementation):
+    """FP64 I/O is supported by no SDPA engine and must be rejected on both the
+    unified and composite paths. The guards are allowlists, so they cover dtypes
+    beyond the FP32 case from issue #424 (e.g. avoid 'someone files a bug for
+    FP64 next'). Under AUTO, neither path accepts FP64, so auto-select instead
+    fails to find any implementation -- covered by the framework, not here."""
+    with pytest.raises(cudnn.cudnnGraphNotSupportedError):
+        _build_sdpa(torch.float64, implementation)
+
+
 @pytest.mark.parametrize("io_dtype", [torch.float16, torch.bfloat16])
 def test_fp16_bf16_unified_supported(io_dtype):
-    """The FP32 guard must not over-reject the supported FP16/BF16 I/O dtypes."""
+    """The FP32/FP64 guard must not over-reject the supported FP16/BF16 dtypes."""
     _build_sdpa(io_dtype, cudnn.attention_implementation.UNIFIED)
 
 
-def test_fp32_auto_routes_to_composite():
-    """Under AUTO, FP32 must not be routed to the unified node; it builds via
-    the composite implementation where a real FP32 kernel exists."""
+@pytest.mark.parametrize(
+    "implementation",
+    [cudnn.attention_implementation.COMPOSITE, cudnn.attention_implementation.AUTO],
+)
+def test_fp32_composite_supported(implementation):
+    """FP32 must not be routed to the unified node; it is accepted by the
+    composite engines (AUTO auto-selects composite for FP32)."""
     try:
-        _build_sdpa(torch.float32, cudnn.attention_implementation.AUTO)
+        _build_sdpa(torch.float32, implementation)
     except cudnn.cudnnGraphNotSupportedError:
         # No composite FP32 engine available on this architecture; the important
         # invariant (FP32 is not silently sent to the unified node) still holds.
