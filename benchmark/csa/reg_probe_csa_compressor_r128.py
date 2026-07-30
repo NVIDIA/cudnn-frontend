@@ -80,8 +80,8 @@ def main():
             vec, tchunks, threads_x, twophase, fastexp = sched
             tag = f"fwd_c{coff}d{d}_v{vec}t{tchunks}x{threads_x}" + ("_2ph" if twophase else "") + ("_fexp" if fastexp else "")
         else:
-            vec, tchunks, threads_x, fastexp = sched
-            tag = f"bwd_c{coff}d{d}_v{vec}t{tchunks}x{threads_x}" + ("_fexp" if fastexp else "")
+            vec, tchunks, threads_x, fastexp, goreuse = sched
+            tag = f"bwd_c{coff}d{d}_v{vec}t{tchunks}x{threads_x}" + ("_fexp" if fastexp else "") + ("_gor" if goreuse else "")
         # __ptx__ is the DSL's documented PTX accessor (a JitCompiledFunction
         # property); it is None when PTX retention is off, and can be a stale dump
         # path (no newline) if the dump file vanished before the handle read it.
