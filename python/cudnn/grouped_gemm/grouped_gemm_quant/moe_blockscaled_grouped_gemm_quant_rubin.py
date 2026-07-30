@@ -337,7 +337,9 @@ class BlockScaledMoEGroupedGemmQuantKernel:
         )
 
         mma_inst_shape_k = cute.size(tiled_mma.shape_mnk, mode=[2])
-        mma_inst_tile_k = 2 if (self.a_dtype.width == 4 and self.sf_vec_size == 16) else 4
+        # NVFP4 and FP8 use 2 k-substeps (tileK = 2*inst_k, e.g. 128 for FP8 like NVJET);
+        # MXFP4 keeps 4.
+        mma_inst_tile_k = 2 if ((self.a_dtype.width == 4 and self.sf_vec_size == 16) or self.a_dtype.width == 8) else 4
         self.mma_tiler = (
             self.mma_tiler[0],
             self.mma_tiler[1],
@@ -550,6 +552,16 @@ class BlockScaledMoEGroupedGemmQuantKernel:
 
         epi_bytes = c_bytes + d_bytes + amax_bytes + bias_bytes
         num_ab_stage = (num_smem_capacity // occupancy - (mbar_helpers_bytes + epi_bytes + sinfo_bytes)) // ab_bytes_per_stage
+
+        d_stage_bytes = d_bytes_per_stage * (2 if generate_sfd else 1)
+        # Reserve headroom: the aligned SharedStorage struct consumes ~1.5 KB more than this
+        # byte sum (the sC/sD/sD_col MemRanges are 1024-B aligned, adding padding). Without it
+        # the extra D stage can push tight tiles (e.g. 256x256, which already packs 9 A/B stages)
+        # past the sm_107 SMEM cap and fail the launch config. 512x256 keeps its extra stage.
+        smem_headroom = 1536
+        leftover = num_smem_capacity // occupancy - (mbar_helpers_bytes + epi_bytes + sinfo_bytes) - ab_bytes_per_stage * num_ab_stage - smem_headroom
+        if leftover > 0:
+            num_d_stage += leftover // d_stage_bytes
 
         return num_acc_stage, num_ab_stage, num_c_stage, num_d_stage, num_tile_stage, num_bias_stage
 
