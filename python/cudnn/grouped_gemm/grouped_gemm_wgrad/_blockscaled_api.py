@@ -19,6 +19,23 @@ from .moe_blockscaled_grouped_gemm_wgrad import BlockScaledMoEGroupedGemmWgradKe
 from ..moe_utils import MoEWeightMode, WGradInputOrder
 
 
+def _get_rubin_kernel():
+    from .moe_blockscaled_grouped_gemm_wgrad_rubin import (
+        BlockScaledMoEGroupedGemmWgradRubinKernel,
+    )
+
+    return BlockScaledMoEGroupedGemmWgradRubinKernel
+
+
+def _is_supported_rubin_quantization(ab_dtype: torch.dtype, sf_dtype: torch.dtype, sf_vec_size: int) -> bool:
+    is_fp4 = ab_dtype in (torch.float4_e2m1fn_x2, torch.uint8)
+    if is_fp4:
+        return (sf_dtype == torch.float8_e4m3fn and sf_vec_size == 16) or (
+            sf_dtype == torch.float8_e8m0fnu and sf_vec_size == 32
+        )
+    return ab_dtype in (torch.float8_e4m3fn, torch.float8_e5m2) and sf_dtype == torch.float8_e8m0fnu and sf_vec_size == 32
+
+
 def _round_up(a: int, b: int) -> int:
     return ceil_div(a, b) * b
 
@@ -118,7 +135,7 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
         self.cluster_shape_mn = cluster_shape_mn or ((2, 1) if self.use_2cta_instrs else (1, 1))
         self.accumulate_on_output = accumulate_on_output
-        self._kernel = BlockScaledMoEGroupedGemmWgradKernel
+        self._kernel = _get_rubin_kernel() if self._is_rubin_kernel else BlockScaledMoEGroupedGemmWgradKernel
         self._workspace = None
 
     def _validate_offsets(self, offsets_tensor: torch.Tensor, tokens_sum: int, name: str) -> Tuple[int, ...]:
@@ -142,6 +159,27 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
             self._value_error_if(tokens_sum != 0, f"{name} cannot be empty when total tokens is {tokens_sum}")
 
         return offset_values
+
+    def _check_rubin_quantization_support(self) -> None:
+        if not self._is_rubin_kernel:
+            return
+
+        self._value_error_if(
+            self.sfa_desc.dtype != self.sfb_desc.dtype,
+            "Rubin wgrad requires sample_sfa and sample_sfb to have the same dtype",
+        )
+        self._value_error_if(
+            not _is_supported_rubin_quantization(self.a_desc.dtype, self.sfa_desc.dtype, self.sf_vec_size),
+            "Rubin wgrad supports NVFP4 (E2M1/E4M3, vec16), MXFP4 "
+            "(E2M1/E8M0, vec32), and MXFP8 (E4M3 or E5M2/E8M0, vec32)",
+        )
+        self._value_error_if(self.acc_dtype != torch.float32, "Rubin wgrad requires float32 accumulation")
+
+        if self._is_fp4x2(self.a_desc):
+            self._value_error_if(
+                self.a_desc.stride[1] != 1 or self.b_desc.stride[0] != 1,
+                "Four-bit Rubin wgrad requires K-major sample_a and sample_b layouts",
+            )
 
     def check_support(self) -> bool:
         m, tokens_sum = self._tensor_shape(self.a_desc, name="sample_a")
@@ -167,6 +205,7 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
             "sample_sfb",
             extra_error_msg="sample_sfb must have dtype float8_e8m0fnu or float8_e4m3fn",
         )
+        self._check_rubin_quantization_support()
         self._check_dtype(self.offsets_desc, torch.int32, "sample_offsets", extra_error_msg="sample_offsets must be int32")
         self._check_dtype(
             self.wgrad_dtype, [torch.bfloat16, torch.float16, torch.float32], "wgrad_dtype", extra_error_msg="wgrad_dtype must be bfloat16, float16, or float32"

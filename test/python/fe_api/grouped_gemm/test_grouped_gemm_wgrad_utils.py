@@ -176,11 +176,17 @@ def grouped_gemm_wgrad_init(
     if compute_capability < 100:
         pytest.skip(f"Environment not supported: requires compute capability >= 100, found {compute_capability}")
 
+    group_k_list = [256, 384]
+    if compute_capability == 107 and ab_dtype == torch.float4_e2m1fn_x2:
+        # The upstream Rubin FP4 wgrad contract requires each expert K to be
+        # a multiple of its fixed 256-token padding granularity.
+        group_k_list = [256, 512]
+
     return {
         "m": 384,
         "n": 640,
         "l": 2,
-        "group_k_list": [256, 384],
+        "group_k_list": group_k_list,
         "ab_dtype": ab_dtype,
         "wgrad_dtype": wgrad_dtype,
         "acc_dtype": acc_dtype,

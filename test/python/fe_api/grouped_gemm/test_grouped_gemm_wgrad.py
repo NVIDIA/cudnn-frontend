@@ -17,7 +17,7 @@ from fe_api.grouped_gemm.test_grouped_gemm_wgrad_utils import (
     check_ref_grouped_gemm_wgrad,
     wgrad_to_ragged_layout,
 )
-from test_grouped_gemm_wgrad_bf16_utils import (
+from fe_api.test_grouped_gemm_wgrad_bf16_utils import (
     assert_grouped_gemm_wgrad_close as assert_grouped_gemm_wgrad_bf16_close,
     grouped_gemm_wgrad_bf16_reference,
     make_grouped_gemm_wgrad_bf16_problem,
@@ -262,6 +262,7 @@ def _test_grouped_gemm_wgrad_discrete_compile_execute(
     cluster_shape_mn,
     sf_vec_size,
     sf_dtype,
+    accumulate_on_output=False,
 ):
     cfg = grouped_gemm_wgrad_init(
         ab_dtype=ab_dtype,
@@ -273,7 +274,12 @@ def _test_grouped_gemm_wgrad_discrete_compile_execute(
         sf_dtype=sf_dtype,
     )
     inputs = allocate_grouped_gemm_wgrad_tensors(cfg)
-    wgrad_tensor = allocate_grouped_gemm_wgrad_output(cfg)
+    wgrad_tensor = allocate_grouped_gemm_wgrad_output(cfg, accumulate_on_output=accumulate_on_output)
+    expected = inputs["ref_result"]
+    if accumulate_on_output:
+        wgrad_tensor.fill_(1)
+        if expected is not None:
+            expected = expected + 1
 
     op = cudnn.GroupedGemmWgradSm100(
         sample_a=inputs["a_tensor"],
@@ -291,6 +297,7 @@ def _test_grouped_gemm_wgrad_discrete_compile_execute(
         mma_tiler_mn=cfg["mma_tiler_mn"],
         cluster_shape_mn=cfg["cluster_shape_mn"],
         sf_vec_size=cfg["sf_vec_size"],
+        accumulate_on_output=accumulate_on_output,
     )
     try:
         assert op.check_support()
@@ -308,7 +315,7 @@ def _test_grouped_gemm_wgrad_discrete_compile_execute(
         global_scale_b=inputs["global_scale_b"],
     )
     torch.cuda.synchronize()
-    check_ref_grouped_gemm_wgrad(wgrad_tensor, inputs["ref_result"], cfg["tolerance"])
+    check_ref_grouped_gemm_wgrad(wgrad_tensor, expected, cfg["tolerance"])
 
 
 @pytest.mark.L0
@@ -354,6 +361,54 @@ def test_grouped_gemm_wgrad_discrete_compile_execute_fp8(
         cluster_shape_mn=cluster_shape_mn,
         sf_vec_size=sf_vec_size,
         sf_dtype=sf_dtype,
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+@with_grouped_gemm_wgrad_params_fp4
+def test_grouped_gemm_wgrad_discrete_accumulate_compile_execute_fp4(
+    ab_dtype,
+    wgrad_dtype,
+    acc_dtype,
+    mma_tiler_mn,
+    cluster_shape_mn,
+    sf_vec_size,
+    sf_dtype,
+):
+    _test_grouped_gemm_wgrad_discrete_compile_execute(
+        ab_dtype=ab_dtype,
+        wgrad_dtype=wgrad_dtype,
+        acc_dtype=acc_dtype,
+        mma_tiler_mn=mma_tiler_mn,
+        cluster_shape_mn=cluster_shape_mn,
+        sf_vec_size=sf_vec_size,
+        sf_dtype=sf_dtype,
+        accumulate_on_output=True,
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+@with_grouped_gemm_wgrad_params_fp8
+def test_grouped_gemm_wgrad_discrete_accumulate_compile_execute_fp8(
+    ab_dtype,
+    wgrad_dtype,
+    acc_dtype,
+    mma_tiler_mn,
+    cluster_shape_mn,
+    sf_vec_size,
+    sf_dtype,
+):
+    _test_grouped_gemm_wgrad_discrete_compile_execute(
+        ab_dtype=ab_dtype,
+        wgrad_dtype=wgrad_dtype,
+        acc_dtype=acc_dtype,
+        mma_tiler_mn=mma_tiler_mn,
+        cluster_shape_mn=cluster_shape_mn,
+        sf_vec_size=sf_vec_size,
+        sf_dtype=sf_dtype,
+        accumulate_on_output=True,
     )
 
 
@@ -476,7 +531,10 @@ def _test_grouped_gemm_wgrad_dynamic_tokens_compile_execute(
         sf_vec_size=sf_vec_size,
         sf_dtype=sf_dtype,
     )
-    runtime_cfg = _cfg_with_group_k_list(compile_cfg, [128, 128])
+    runtime_group_k_list = [128, 128]
+    if torch.cuda.get_device_capability() == (10, 7) and ab_dtype == torch.float4_e2m1fn_x2:
+        runtime_group_k_list = [256, 256]
+    runtime_cfg = _cfg_with_group_k_list(compile_cfg, runtime_group_k_list)
 
     compile_inputs = allocate_grouped_gemm_wgrad_tensors(compile_cfg)
     runtime_inputs = allocate_grouped_gemm_wgrad_tensors(runtime_cfg)

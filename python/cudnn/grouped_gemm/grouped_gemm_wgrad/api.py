@@ -11,7 +11,7 @@ import os
 import torch
 from cuda.bindings import driver as cuda
 
-from cudnn.api_base import APIBase, TupleDict
+from cudnn.api_base import APIBase, TupleDict, get_device_type
 from cudnn.discrete_grouped_gemm.discrete_kernel_utils import _require_pointer_tensor
 
 from ..grouped_gemm_utils import (
@@ -36,7 +36,11 @@ _cache_of_GroupedGemmWgradSm100Objects = {}
 
 
 from ._bf16_api import GroupedGemmWgradBf16API
-from ._blockscaled_api import GroupedGemmWgradBlockScaledAPI
+from ._blockscaled_api import (
+    GroupedGemmWgradBlockScaledAPI,
+    _get_rubin_kernel,
+    _is_supported_rubin_quantization,
+)
 
 
 class GroupedGemmWgradSm100(APIBase):
@@ -259,6 +263,7 @@ def grouped_gemm_wgrad_wrapper_sm100(
             wgrad_tensor = allocator((expert_cnt, hidden, intermediate), dtype=wgrad_dtype, device=a_tensor.device)
     cache_key = backend_cache_key(
         backend,
+        get_device_type(),
         output_mode,
         _wgrad_tensor_signature(a_tensor, dynamic_dims=(1,), exact_stride=False),
         _wgrad_tensor_signature(b_tensor, dynamic_dims=(0,), exact_stride=False),

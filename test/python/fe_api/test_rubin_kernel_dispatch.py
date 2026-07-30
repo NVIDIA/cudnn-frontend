@@ -41,6 +41,13 @@ RUBIN_DISPATCH_CASES = [
         "moe_blockscaled_grouped_gemm_dglu_rubin.py",
         id="grouped_gemm_dglu",
     ),
+    pytest.param(
+        "cudnn.grouped_gemm.grouped_gemm_wgrad.api",
+        "cudnn.grouped_gemm.grouped_gemm_wgrad.moe_blockscaled_grouped_gemm_wgrad",
+        "BlockScaledMoEGroupedGemmWgradKernel",
+        "moe_blockscaled_grouped_gemm_wgrad_rubin.py",
+        id="grouped_gemm_wgrad",
+    ),
 ]
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -121,7 +128,10 @@ def test_get_rubin_kernel_lazy_import(
 
     assert rubin_kernel is not default_kernel
     assert rubin_kernel.__name__ != default_kernel.__name__ or rubin_kernel.__module__ != default_kernel.__module__
-    assert rubin_kernel.FIX_PAD_SIZE == default_kernel.FIX_PAD_SIZE == 256
+    if hasattr(default_kernel, "FIX_PAD_SIZE"):
+        assert rubin_kernel.FIX_PAD_SIZE == default_kernel.FIX_PAD_SIZE == 256
+    else:
+        assert rubin_kernel.FIX_PAD_SIZE == 256
 
 
 @pytest.mark.parametrize(
@@ -168,3 +178,50 @@ def test_grouped_gemm_quant_has_rubin_compile_branches():
     assert 'kernel_kwargs["generate_c"] = False' in source
     assert 'compile_kwargs["c"]' in source
     assert "if self._is_rubin_kernel:" in source
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "ab_dtype_name,sf_dtype_name,sf_vec_size,expected",
+    [
+        ("float4_e2m1fn_x2", "float8_e4m3fn", 16, True),
+        ("float4_e2m1fn_x2", "float8_e8m0fnu", 32, True),
+        ("float8_e4m3fn", "float8_e8m0fnu", 32, True),
+        ("float8_e5m2", "float8_e8m0fnu", 32, True),
+        ("float4_e2m1fn_x2", "float8_e4m3fn", 32, False),
+        ("float8_e4m3fn", "float8_e4m3fn", 16, False),
+        ("bfloat16", "float8_e8m0fnu", 32, False),
+    ],
+)
+def test_grouped_gemm_wgrad_rubin_quantization_validation(
+    ab_dtype_name,
+    sf_dtype_name,
+    sf_vec_size,
+    expected,
+):
+    api_mod = _import_api_module("cudnn.grouped_gemm.grouped_gemm_wgrad.api")
+    torch = api_mod.torch
+
+    assert (
+        api_mod._is_supported_rubin_quantization(
+            getattr(torch, ab_dtype_name),
+            getattr(torch, sf_dtype_name),
+            sf_vec_size,
+        )
+        is expected
+    )
+
+
+@pytest.mark.L0
+def test_grouped_gemm_wgrad_rubin_tmem_plan_rejects_invalid_sf_vector():
+    rubin_mod = importlib.import_module(
+        "cudnn.grouped_gemm.grouped_gemm_wgrad.moe_blockscaled_grouped_gemm_wgrad_rubin"
+    )
+
+    with pytest.raises(ValueError, match="divisible by sf_vec_size"):
+        rubin_mod._make_tmem_plan(
+            tile_n=256,
+            tile_k=256,
+            sf_vec_size=24,
+            architecture="sm_107",
+        )
