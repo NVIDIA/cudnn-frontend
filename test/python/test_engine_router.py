@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """CPU tests for the backend Router + BaseEngine contract.
 
 These run without a GPU or cuDNN: they exercise pygraph -> Router -> ranked

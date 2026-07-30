@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Regression test for https://github.com/NVIDIA/cudnn-frontend/issues/424.
 
 The unified SDPA node has no FP32 I/O kernel: ``mma_core_mode`` is auto-set to

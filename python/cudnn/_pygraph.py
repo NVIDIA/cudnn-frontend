@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Pure Python graph representation for cuDNN Frontend.
 
 All graph structure and attributes are kept in Python. Graph construction is

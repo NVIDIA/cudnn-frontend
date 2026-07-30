@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Test suite for MoE Grouped Matmul and MoE Grouped Matmul Bwd Python API.
 Based on samples/cpp/moe_grouped_matmul/moe_grouped_matmul.cpp

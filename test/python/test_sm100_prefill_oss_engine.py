@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Test SM100 Prefill SDPA: cuDNN Graph API (HeurMode A) vs OSS Engine (HeurMode OPENSOURCE).
 

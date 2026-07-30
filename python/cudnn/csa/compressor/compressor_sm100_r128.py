@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Dedicated ratio=128 CSA/HCA ``Compressor`` forward + backward kernels.
 
 The generic ``compressor_sm100.py`` kernels keep the ENTIRE pooling window in per-thread

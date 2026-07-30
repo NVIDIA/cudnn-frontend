@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Dedicated coverage for rarely-used SDPA features that are no longer exercised
 by the randomized configurations in test_mhas_v2.py: ALiBi masking, the

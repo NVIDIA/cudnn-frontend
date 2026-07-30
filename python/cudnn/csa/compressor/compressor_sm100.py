@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Fused CuTe-DSL forward+backward kernels for the CSA/HCA ``Compressor`` gated pooling.
 
 Ported from Megatron-LM (https://github.com/NVIDIA/Megatron-LM/pull/5984, see also

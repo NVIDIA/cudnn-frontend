@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Wrapper for cuDNN frontend to improve user experience.
 
 This wrapper provides a more user-friendly interface for cuDNN frontend.

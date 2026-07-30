@@ -1,4 +1,5 @@
 # Copyright (c) 2025, Tri Dao, Siyu Wang, Shengbin Di, Yuxi Chi, Johnsonms, Linfeng Zheng, Haoyan Huang, Lanbo Li, Yun Zhong, Man Yuan, Minmin Sun, Yong Li, Wei Lin.
+# SPDX-License-Identifier: MIT
 
 from enum import IntEnum, auto
 from typing import Optional, Tuple

@@ -1,4 +1,5 @@
 # Copyright (c) 2025, Ted Zadouri, Markus Hoehnerbach, Jay Shah, Tri Dao.
+# SPDX-License-Identifier: MIT
 import math
 from typing import Callable, NamedTuple, Optional, Tuple
 from functools import partial

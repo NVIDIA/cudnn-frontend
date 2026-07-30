@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # Check if CUDNN:: targets already exist (integrated build)
 if(TARGET CUDNN::cudnn AND TARGET CUDNN::cudnn_all)
     message(STATUS "cuDNN: Using existing CMake targets")

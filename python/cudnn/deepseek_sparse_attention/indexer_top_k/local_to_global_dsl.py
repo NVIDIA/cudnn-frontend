@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """CuTe DSL local-to-global topK index conversion.
 
 The topK backends return local K ids.  This module converts them to the public

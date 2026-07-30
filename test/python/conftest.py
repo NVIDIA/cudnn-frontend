@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import os
 
 # Caps peak GPU memory across long pytest-xdist runs (e.g. test_mhas_v2 ~2.5k

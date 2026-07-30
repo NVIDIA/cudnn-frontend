@@ -1,4 +1,5 @@
 # Copyright (c) 2025, Tri Dao.
+# SPDX-License-Identifier: MIT
 """SM90 backward tile schedulers shared by DSA kernels."""
 
 from typing import Optional, Tuple

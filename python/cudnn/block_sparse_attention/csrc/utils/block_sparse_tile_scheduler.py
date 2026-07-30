@@ -1,4 +1,5 @@
 # Copyright (c) 2025, Tri Dao.
+# SPDX-License-Identifier: MIT
 
 from typing import Tuple, Protocol, runtime_checkable
 from dataclasses import dataclass

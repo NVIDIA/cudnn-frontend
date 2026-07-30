@@ -1,4 +1,5 @@
 # Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
+# SPDX-License-Identifier: MIT
 """Common CuTe DSL copy utilities used by DSA kernels."""
 
 import math

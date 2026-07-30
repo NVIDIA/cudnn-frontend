@@ -1,5 +1,6 @@
 # Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
 # Copyright (c) 2025-2026, QuACK team.
+# SPDX-License-Identifier: MIT
 #
 # Selected helpers are adapted from quack-kernels 0.4.1 (Apache-2.0) and
 # maintained locally so BSA does not require Quack at runtime.

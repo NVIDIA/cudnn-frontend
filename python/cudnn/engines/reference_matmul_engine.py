@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Pure-PyTorch reference backend — a correctness baseline with no GPU/JIT deps.
 
 This backend exists so the pygraph + BaseEngine + Router contract can be

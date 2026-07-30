@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """This script creates a PyTorch implementation of the Llama 3.1 8B model
 using Hugging Face transformers library and loads the pretrained weights.
 

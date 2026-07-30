@@ -4,7 +4,7 @@
 [![PyPI version](https://img.shields.io/pypi/v/nvidia-cudnn-frontend.svg)](https://pypi.org/project/nvidia-cudnn-frontend/)
 [![PyPI downloads](https://img.shields.io/pypi/dm/nvidia-cudnn-frontend.svg)](https://pypi.org/project/nvidia-cudnn-frontend/)
 [![Python versions](https://img.shields.io/pypi/pyversions/nvidia-cudnn-frontend.svg)](https://pypi.org/project/nvidia-cudnn-frontend/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE.txt)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE.txt)
 [![Docs](https://img.shields.io/badge/docs-nvidia.github.io-blue.svg)](https://nvidia.github.io/cudnn-frontend/)
 
 **cuDNN Frontend** is NVIDIA's modern, open-source entry point to the cuDNN library and a growing collection of high-performance open-source kernels — scaled dot-product attention (**SDPA / Flash Attention**), grouped GEMM fusions for **Mixture-of-Experts (MoE)** training, fused normalization + activation, and more.
@@ -186,4 +186,9 @@ export CUDNN_FRONTEND_CUDART_LIB_NAME=/usr/local/cuda/lib64/libcudart.so.13
 
 ## License
 
-This project is licensed under the [MIT License](LICENSE.txt).
+This project is distributed primarily under the [Apache License 2.0](LICENSE.txt).
+A subset of files remain under the [MIT License](LICENSE-MIT.txt); each source
+file declares its license with an SPDX `SPDX-License-Identifier:` tag. See
+[LICENSING.md](LICENSING.md) for the full list of MIT-licensed files and the
+rationale, and [THIRD_PARTY_LICENSES.txt](THIRD_PARTY_LICENSES.txt) for
+third-party attributions.

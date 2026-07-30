@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """``cudnn.csa`` — CuTe-DSL kernels for the CSA/HCA experimental attention variants.
 
 Symbols (the fused ``Compressor`` APIs) resolve lazily on first attribute access, so
