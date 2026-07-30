@@ -119,7 +119,7 @@ def _make_dense_dsrelu_cfg(request, m: int, n: int = 256, k: int = 512, l: int =
 def _test_gemm_dsrelu_wrapper_dynamic_m_cache_behavior(request, monkeypatch, use_dynamic_m):
     try:
         from cudnn import gemm_dsrelu_wrapper_sm100
-        from cudnn.gemm_dsrelu import api as gemm_dsrelu_api
+        from cudnn.gemm.cutedsl.dense.dsrelu import api as gemm_dsrelu_api
     except ImportError:
         pytest.skip("Environment not supported: cudnn optional dependencies not installed")
 
@@ -169,7 +169,7 @@ def _test_gemm_dsrelu_wrapper_dynamic_m_cache_behavior(request, monkeypatch, use
 def _test_gemm_dsrelu_wrapper_full_dynamic_cache_behavior(request, monkeypatch):
     try:
         from cudnn import gemm_dsrelu_wrapper_sm100
-        from cudnn.gemm_dsrelu import api as gemm_dsrelu_api
+        from cudnn.gemm.cutedsl.dense.dsrelu import api as gemm_dsrelu_api
     except ImportError:
         pytest.skip("Environment not supported: cudnn optional dependencies not installed")
 
@@ -313,7 +313,7 @@ def test_gemm_dsrelu_wrapper_cache_dynamic_m_smoke(request, monkeypatch):
 def test_gemm_dsrelu_wrapper_dynamic_m_fp4(request, monkeypatch):
     try:
         import cudnn
-        from cudnn.gemm_dsrelu import api as gemm_dsrelu_api
+        from cudnn.gemm.cutedsl.dense.dsrelu import api as gemm_dsrelu_api
     except ImportError:
         pytest.skip("Environment not supported: cudnn optional dependencies not installed")
 
@@ -362,7 +362,7 @@ def test_gemm_dsrelu_wrapper_cache_full_dynamic_smoke(request, monkeypatch):
 def test_gemm_dsrelu_wrapper_full_dynamic_fp4(request, monkeypatch):
     try:
         import cudnn
-        from cudnn.gemm_dsrelu import api as gemm_dsrelu_api
+        from cudnn.gemm.cutedsl.dense.dsrelu import api as gemm_dsrelu_api
     except ImportError:
         pytest.skip("Environment not supported: cudnn optional dependencies not installed")
 

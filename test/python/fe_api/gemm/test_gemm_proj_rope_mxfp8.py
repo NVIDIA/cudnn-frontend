@@ -194,7 +194,7 @@ def test_wrapper_rejects_dtype_mismatch_and_missing_scales():
 def test_gemm_proj_rope_mxfp8_reference_contract(tokens, w_out_in):
     """The reference oracle's four outputs must have the documented shapes/dtypes and be finite."""
     try:
-        from cudnn.gemm_proj_rope_mxfp8 import gemm_proj_rope_mxfp8_reference
+        from cudnn.gemm.cutedsl.dense.proj_rope_mxfp8 import gemm_proj_rope_mxfp8_reference
         from fe_api.gemm.test_gemm_proj_rope_mxfp8_utils import (
             BLOCK,
             HEAD_DIM,

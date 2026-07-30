@@ -76,7 +76,7 @@ def _apply_grouped_gemm_cfg_overrides(cfg, cfg_overrides=None):
 
 @pytest.mark.L0
 def test_grouped_gemm_dglu_blockscaled_discrete_records_pointer_streams(monkeypatch):
-    from cudnn.grouped_gemm.grouped_gemm_dglu._blockscaled_api import GroupedGemmDgluBlockScaledAPI
+    from cudnn.gemm.cutedsl.grouped.dglu._blockscaled_api import GroupedGemmDgluBlockScaledAPI
 
     api = object.__new__(GroupedGemmDgluBlockScaledAPI)
     api._logger = Mock()
@@ -872,7 +872,7 @@ def test_grouped_gemm_dglu_dense_wrapper_cache_full_dynamic_smoke(request, monke
 def _test_grouped_gemm_dglu_dense_wrapper_dynamic_m_cache_behavior(request, monkeypatch, use_full_dynamic, ab_dtype):
     try:
         from cudnn import grouped_gemm_dglu_wrapper_sm100
-        from cudnn.grouped_gemm.grouped_gemm_dglu import api as grouped_gemm_dglu_api
+        from cudnn.gemm.cutedsl.grouped.dglu import api as grouped_gemm_dglu_api
         from cuda.bindings import driver as cuda
     except ImportError:
         pytest.skip("Environment not supported: cudnn optional dependencies not installed")
@@ -973,7 +973,7 @@ def _test_grouped_gemm_dglu_dense_wrapper_dynamic_m_cache_behavior(request, monk
 def _test_grouped_gemm_dglu_dense_wrapper_dynamic_nk_cache_behavior(request, monkeypatch, ab_dtype):
     try:
         from cudnn import grouped_gemm_dglu_wrapper_sm100
-        from cudnn.grouped_gemm.grouped_gemm_dglu import api as grouped_gemm_dglu_api
+        from cudnn.gemm.cutedsl.grouped.dglu import api as grouped_gemm_dglu_api
         from cuda.bindings import driver as cuda
     except ImportError:
         pytest.skip("Environment not supported: cudnn optional dependencies not installed")
@@ -1454,7 +1454,7 @@ def test_grouped_gemm_dglu_discrete_wrapper_cache_dynamic_m_smoke(request, monke
 def _test_grouped_gemm_dglu_discrete_wrapper_dynamic_m_cache_behavior(request, monkeypatch):
     try:
         from cudnn import grouped_gemm_dglu_wrapper_sm100
-        from cudnn.grouped_gemm.grouped_gemm_dglu import api as grouped_gemm_dglu_api
+        from cudnn.gemm.cutedsl.grouped.dglu import api as grouped_gemm_dglu_api
         from cuda.bindings import driver as cuda
     except ImportError:
         pytest.skip("Environment not supported: cudnn optional dependencies not installed")

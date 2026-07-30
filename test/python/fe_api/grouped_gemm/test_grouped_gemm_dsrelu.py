@@ -848,7 +848,7 @@ def _test_grouped_gemm_dsrelu_wrapper_dynamic_shape_cache_behavior(
 ):
     try:
         from cudnn import grouped_gemm_dsrelu_wrapper_sm100
-        from cudnn.grouped_gemm.grouped_gemm_dsrelu import api as grouped_gemm_dsrelu_api
+        from cudnn.gemm.cutedsl.grouped.dsrelu import api as grouped_gemm_dsrelu_api
         from cuda.bindings import driver as cuda
     except ImportError:
         pytest.skip("Environment not supported: cudnn optional dependencies not installed")
@@ -993,7 +993,7 @@ def _test_grouped_gemm_dsrelu_wrapper_zero_m_cache_behavior(
 ):
     try:
         from cudnn import grouped_gemm_dsrelu_wrapper_sm100
-        from cudnn.grouped_gemm.grouped_gemm_dsrelu import api as grouped_gemm_dsrelu_api
+        from cudnn.gemm.cutedsl.grouped.dsrelu import api as grouped_gemm_dsrelu_api
         from cuda.bindings import driver as cuda
     except ImportError:
         pytest.skip("Environment not supported: cudnn optional dependencies not installed")

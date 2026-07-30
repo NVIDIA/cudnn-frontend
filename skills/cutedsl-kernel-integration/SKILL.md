@@ -22,7 +22,7 @@ Use this skill to add or update a CuTeDSL frontend-only API in cuDNN Frontend. T
 
 ## Integration Workflow
 
-1. Add or update the operation package under the closest existing family, such as `python/cudnn/<operation>/`, `python/cudnn/grouped_gemm/<operation>/`, `python/cudnn/discrete_grouped_gemm/<operation>/`, or `python/cudnn/sdpa/<direction>/`.
+1. Add or update the operation package under the closest existing family, such as `python/cudnn/<operation>/`, `python/cudnn/gemm/cutedsl/dense/<operation>/`, `python/cudnn/gemm/cutedsl/grouped/<operation>/`, `python/cudnn/gemm/cutedsl/discrete_grouped/<operation>/`, or `python/cudnn/sdpa/<direction>/`.
 2. Implement the class API by extending `APIBase`; keep constructor descriptors, `check_support()`, `compile()`, and `execute()` consistent with the closest template.
 3. Add a high-level wrapper that allocates outputs, caches/reuses compiled kernels where the template does, and returns a `TupleDict`.
 4. Export the public class and wrapper through the operation/family `__init__.py` files and `_LAZY_OPTIONAL_IMPORTS` in `python/cudnn/__init__.py`.

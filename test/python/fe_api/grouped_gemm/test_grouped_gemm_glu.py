@@ -791,7 +791,7 @@ def test_grouped_gemm_glu_dense_wrapper_cache_full_dynamic_smoke(request, monkey
 def _test_grouped_gemm_glu_dense_wrapper_dynamic_m_cache_behavior(request, monkeypatch, use_full_dynamic, ab_dtype):
     try:
         from cudnn import grouped_gemm_glu_wrapper_sm100
-        from cudnn.grouped_gemm.grouped_gemm_glu import api as grouped_gemm_glu_api
+        from cudnn.gemm.cutedsl.grouped.glu import api as grouped_gemm_glu_api
         from cuda.bindings import driver as cuda
     except ImportError:
         pytest.skip("Environment not supported: cudnn optional dependencies not installed")
@@ -875,7 +875,7 @@ def _test_grouped_gemm_glu_dense_wrapper_dynamic_m_cache_behavior(request, monke
 def _test_grouped_gemm_glu_dense_wrapper_dynamic_nk_cache_behavior(request, monkeypatch, ab_dtype):
     try:
         from cudnn import grouped_gemm_glu_wrapper_sm100
-        from cudnn.grouped_gemm.grouped_gemm_glu import api as grouped_gemm_glu_api
+        from cudnn.gemm.cutedsl.grouped.glu import api as grouped_gemm_glu_api
         from cuda.bindings import driver as cuda
     except ImportError:
         pytest.skip("Environment not supported: cudnn optional dependencies not installed")
@@ -1330,7 +1330,7 @@ def test_grouped_gemm_glu_discrete_wrapper_cache_dynamic_m_smoke(request, monkey
 def _test_grouped_gemm_glu_discrete_wrapper_dynamic_m_cache_behavior(request, monkeypatch):
     try:
         from cudnn import grouped_gemm_glu_wrapper_sm100
-        from cudnn.grouped_gemm.grouped_gemm_glu import api as grouped_gemm_glu_api
+        from cudnn.gemm.cutedsl.grouped.glu import api as grouped_gemm_glu_api
         from cuda.bindings import driver as cuda
     except ImportError:
         pytest.skip("Environment not supported: cudnn optional dependencies not installed")
