@@ -6,6 +6,7 @@
 # maintained locally so BSA does not require Quack at runtime.
 
 import contextlib
+import re
 from typing import Callable, Optional, Tuple, Type
 
 import cutlass
@@ -18,12 +19,30 @@ from cutlass.cutlass_dsl import dsl_user_op
 from cutlass._mlir.dialects import llvm
 import cutlass.pipeline
 
+# cute.copy elects a single lane internally for raw bulk-copy atoms only on
+# cute-dsl 4.6.0 and 4.6.1; on every other version the caller must elect.
+_ELECT_FIRST = (4, 6, 0)
+_ELECT_LAST = (4, 6, 1)
+
+_VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?P<pre>.*)$")
+
 
 def _cute_dsl_bulk_copy_self_elects() -> bool:
-    try:
-        return tuple(int(p) for p in cutlass.__version__.split(".")[:2]) >= (4, 6)
-    except (AttributeError, ValueError):
-        return True
+    """Whether cute.copy already elects a single lane for raw bulk-copy atoms.
+
+    Either answer hangs the warp if it is wrong: electing around a copy that
+    already elects deadlocks at the inner election, and not electing lets all 32
+    lanes issue the copy and over-complete the mbarrier transaction.
+    """
+    version = getattr(cutlass, "__version__", "").strip().split("+", 1)[0]
+    match = _VERSION_RE.match(version)
+    if match is None:
+        return False
+    if not _ELECT_FIRST <= tuple(int(part) for part in match.group(1, 2, 3)) <= _ELECT_LAST:
+        return False
+    # Within that range only the final releases shipped the internal election;
+    # a pre-release such as 4.6.0.dev0 predates it.
+    return not match.group("pre")
 
 
 _BULK_COPY_SELF_ELECTS = _cute_dsl_bulk_copy_self_elects()
@@ -32,12 +51,14 @@ _BULK_COPY_SELF_ELECTS = _cute_dsl_bulk_copy_self_elects()
 def bulk_copy_elect_one():
     """elect_one() guard for bulk-async copies (cpasync.CopyBulk*, TMA atoms).
 
-    On cute-dsl <= 4.5.x the bulk copy does not elect a lane internally, so the
-    caller must wrap it in cute.arch.elect_one() to issue it once per warp.
-    On cute-dsl >= 4.6.0 cute.copy elects internally via a warp-collective
-    elect; an outer elect_one() leaves only one lane active at that inner
-    collective and deadlocks the warp. Use this guard instead of a bare
-    elect_one() around such copies.
+    A raw bulk copy is a per-thread issue path, so on most cute-dsl versions the
+    caller must wrap it in cute.arch.elect_one() to issue it once per warp;
+    otherwise all 32 lanes issue, each completing the mbarrier transaction, and
+    the over-completed barrier desynchronises the pipeline. On the 4.6.0/4.6.1
+    releases cute.copy elects internally instead, and there an outer elect_one()
+    leaves a single lane at the inner warp-collective elect and deadlocks. Use
+    this guard rather than a bare elect_one() so the right one is chosen; see
+    _cute_dsl_bulk_copy_self_elects() for the version rule and the evidence.
     """
     if _BULK_COPY_SELF_ELECTS:
         return contextlib.nullcontext()
