@@ -31,6 +31,17 @@ _DTYPE = {
 _PORTS = ["q", "k", "v", "o"]
 
 
+def _is_dtype_allowlist_rejection(exc):
+    """Whether ``exc`` is our unified/composite support-surface dtype rejection.
+
+    Both allowlist messages lead with "<impl> SDPA node supports only ... I/O",
+    so a positive test that hits this has been wrongly rejected by the very
+    contract under test (a regression) -- as opposed to a genuine engine/backend
+    unavailability, which raises a different message and is safe to skip.
+    """
+    return "SDPA node supports only" in str(exc)
+
+
 def _build_sdpa(implementation, base_dtype=torch.float16, *, overrides=None):
     """Build and finalize an SDPA graph.
 
@@ -106,11 +117,11 @@ def test_fp16_bf16_unified_supported(io_dtype):
     try:
         _build_sdpa(cudnn.attention_implementation.UNIFIED, io_dtype)
     except cudnn.cudnnGraphNotSupportedError as e:
-        # Our dtype allowlist must never reject FP16/BF16; a rejection naming the
-        # I/O data type is exactly the over-rejection this test guards against.
-        # Anything else means unified SDPA is unsupported on this cuDNN/GPU combo
-        # (e.g. too-old backend), so skip rather than fail.
-        assert "data type" not in str(e), f"FP16/BF16 wrongly rejected by the guard: {e}"
+        # Our dtype allowlist must never reject FP16/BF16 -- that over-rejection is
+        # exactly what this test guards against. Any other rejection means unified
+        # SDPA is unsupported on this cuDNN/GPU combo (e.g. too-old backend), so
+        # skip rather than fail.
+        assert not _is_dtype_allowlist_rejection(e), f"FP16/BF16 wrongly rejected by the guard: {e}"
         pytest.skip(f"unified FP16/BF16 SDPA unsupported on this setup: {e}")
 
 
@@ -124,8 +135,9 @@ def test_fp32_composite_supported(implementation):
     try:
         _build_sdpa(implementation, torch.float32)
     except cudnn.cudnnGraphNotSupportedError as e:
-        # A unified-routing rejection here would be a real regression (FP32 must
-        # never reach the unified node), so only skip on a genuine
-        # composite-engine unavailability -- never on the unified rejection.
-        assert "Unified" not in str(e), f"FP32 wrongly rejected by the unified node: {e}"
+        # Either a unified misroute (FP32 must never reach the unified node) or a
+        # composite over-rejection would surface as our allowlist message and is a
+        # real regression -- fail. Only skip on a genuine composite-engine
+        # unavailability, which raises a different message.
+        assert not _is_dtype_allowlist_rejection(e), f"FP32 wrongly rejected by a support surface: {e}"
         pytest.skip("no composite FP32 SDPA engine available on this GPU")
