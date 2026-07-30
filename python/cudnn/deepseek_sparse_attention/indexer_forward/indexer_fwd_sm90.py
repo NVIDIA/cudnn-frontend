@@ -922,7 +922,9 @@ class IndexerForwardSm90:
                     lse_max1,
                     lse_sum1,
                     1,
-                    16,
+                    # The BF16 consumer handles both Q stages serially, so the
+                    # 32-float reduction scratch can be reused.
+                    0,
                     LSE_BARRIER_STAGE0,
                     m_block,
                     seqlen.seqlen_q,

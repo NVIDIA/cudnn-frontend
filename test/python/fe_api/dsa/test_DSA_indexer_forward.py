@@ -138,14 +138,16 @@ def test_DSA_indexer_forward_wrapper_qh16_causal_block_boundary():
     w = torch.randn(b, s_q, h_q, dtype=torch.bfloat16, device=device)
     q_causal_offsets = torch.tensor([252], dtype=torch.int32, device=device)
 
-    scores = DSA.indexer_forward_wrapper(
+    result = DSA.indexer_forward_wrapper(
         q,
         k,
         w,
         ratio=ratio,
         qhead_per_kv_head=h_q,
         q_causal_offsets=q_causal_offsets,
-    )["scores"]
+        return_lse=True,
+    )
+    scores = result["scores"]
     torch.cuda.synchronize()
 
     # The causal limit moves from 63 to 64 inside the CTA. In particular,
@@ -161,6 +163,19 @@ def test_DSA_indexer_forward_wrapper_qh16_causal_block_boundary():
         scores,
         ratio,
         q_causal_offsets=q_causal_offsets,
+    )
+    scores_ref = ref_indexer_forward(
+        q,
+        k,
+        w,
+        ratio,
+        q_causal_offsets=q_causal_offsets,
+    )
+    torch.testing.assert_close(
+        result["lse"],
+        torch.logsumexp(scores_ref, dim=-1),
+        atol=5e-3,
+        rtol=5e-3,
     )
 
 
@@ -318,7 +333,7 @@ def test_DSA_indexer_forward_wrapper_qh16_thd_varlen_tails():
         device=device,
     )
 
-    scores = DSA.indexer_forward_wrapper(
+    result = DSA.indexer_forward_wrapper(
         q,
         k,
         w,
@@ -329,7 +344,9 @@ def test_DSA_indexer_forward_wrapper_qh16_thd_varlen_tails():
         max_seqlen_q=max(q_lengths),
         max_seqlen_k=max(k_lengths),
         q_causal_offsets=q_causal_offsets,
-    )["scores"]
+        return_lse=True,
+    )
+    scores = result["scores"]
     torch.cuda.synchronize()
 
     cu_q_host = cu_seqlens_q.tolist()
@@ -345,6 +362,19 @@ def test_DSA_indexer_forward_wrapper_qh16_thd_varlen_tails():
             scores[q0:q1, :s_k].unsqueeze(0),
             ratio,
             q_causal_offsets=q_causal_offsets[batch : batch + 1],
+        )
+        scores_ref = ref_indexer_forward(
+            q[q0:q1].unsqueeze(0),
+            k[k0:k1].unsqueeze(0),
+            w[q0:q1].unsqueeze(0),
+            ratio,
+            q_causal_offsets=q_causal_offsets[batch : batch + 1],
+        ).squeeze(0)
+        torch.testing.assert_close(
+            result["lse"][q0:q1],
+            torch.logsumexp(scores_ref, dim=-1),
+            atol=5e-3,
+            rtol=5e-3,
         )
         if s_k < max_seqlen_k:
             assert bool(torch.isneginf(scores[q0:q1, s_k:]).all())

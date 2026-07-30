@@ -40,9 +40,12 @@ def _check_fused_softmax(
 
 
 @pytest.mark.L0
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_compressed_indexer_rejects_unsupported_qhead_group_before_launch():
-    from cudnn import DSA
+    _require_sm100()
+    try:
+        from cudnn import DSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
     device = torch.device("cuda")
     q = torch.randn((1, 8, 8, 128), dtype=torch.bfloat16, device=device)
@@ -58,6 +61,35 @@ def test_compressed_indexer_rejects_unsupported_qhead_group_before_launch():
             qhead_per_kv_head=8,
             return_softmax=False,
         )
+
+
+@pytest.mark.L0
+def test_indexer_denom_placeholders_use_stable_power_of_two_buckets():
+    _require_sm100()
+    try:
+        from cudnn.deepseek_sparse_attention.indexer_forward import _compressed_top_k_sm100 as compressed_impl
+        from cudnn.deepseek_sparse_attention.indexer_forward import _interface as dense_impl
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    device = torch.device("cuda")
+    for getter in (
+        compressed_impl._get_fwd_unified_denom_placeholder,
+        dense_impl._get_fwd_denom_placeholder,
+    ):
+        bucket_8_view_5 = getter((5,), device)
+        bucket_8_view_8 = getter((8,), device)
+        bucket_16_view_9 = getter((9,), device)
+        bucket_8_view_5_again = getter((5,), device)
+        rank_2_bucket_8 = getter((1, 5), device)
+
+        assert bucket_8_view_5.shape == (5,)
+        assert bucket_8_view_5.untyped_storage().nbytes() == 8 * bucket_8_view_5.element_size()
+        assert bucket_8_view_5.data_ptr() == bucket_8_view_8.data_ptr()
+        assert bucket_16_view_9.untyped_storage().nbytes() == 16 * bucket_16_view_9.element_size()
+        assert bucket_16_view_9.data_ptr() != bucket_8_view_5.data_ptr()
+        assert bucket_8_view_5_again.data_ptr() == bucket_8_view_5.data_ptr()
+        assert rank_2_bucket_8.data_ptr() != bucket_8_view_5.data_ptr()
 
 
 @pytest.mark.L0

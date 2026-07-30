@@ -7,6 +7,7 @@ BSHD/THD buffer management for indexer_forward.
 
 from __future__ import annotations
 
+from threading import Lock
 from typing import Optional
 
 import torch
@@ -87,6 +88,7 @@ def _validate_indexer_qhead_per_kv_head(qhead_per_kv_head: int, precision: str) 
 
 _compile_cache: dict = {}
 _denom_placeholder_cache: dict = {}
+_denom_placeholder_cache_lock = Lock()
 
 # Stage-2 fuses softmax over the selected logits. It is returned by default
 # because the indexer backward KL-loss path consumes this probability tensor.
@@ -107,18 +109,29 @@ def _get_fwd_unified_denom_placeholder(
     shape: tuple[int, ...],
     device: torch.device,
 ) -> torch.Tensor:
+    """Return a shaped view backed by a stable power-of-two capacity bucket."""
     if device.type == "cuda":
         device_index = torch.cuda.current_device() if device.index is None else device.index
         alloc_device = torch.device("cuda", device_index)
     else:
         device_index = device.index
         alloc_device = device
-    key = (alloc_device.type, device_index, shape)
-    cached = _denom_placeholder_cache.get(key)
-    if cached is None or cached.device != alloc_device:
-        cached = torch.empty(shape, dtype=torch.float32, device=alloc_device)
-        _denom_placeholder_cache[key] = cached
-    return cached
+
+    numel = 1
+    for dim in shape:
+        numel *= int(dim)
+    capacity = 1 << (max(1, numel) - 1).bit_length()
+    key = (alloc_device.type, device_index, len(shape), capacity)
+
+    # Buckets are never replaced or evicted: CUDA graphs may retain the
+    # placeholder address captured during warmup. The lock prevents concurrent
+    # first-use allocations from racing to populate the same bucket.
+    with _denom_placeholder_cache_lock:
+        cached = _denom_placeholder_cache.get(key)
+        if cached is None:
+            cached = torch.empty((capacity,), dtype=torch.float32, device=alloc_device)
+            _denom_placeholder_cache[key] = cached
+    return cached[:numel].view(shape)
 
 
 def _compress_local_to_global_bshd_(idx: torch.Tensor, seqlen_k: int) -> torch.Tensor:
