@@ -14,7 +14,7 @@ from fe_api.grouped_gemm.test_grouped_gemm_wgrad_utils import (
     check_ref_grouped_gemm_wgrad,
     wgrad_to_ragged_layout,
 )
-from test_grouped_gemm_wgrad_bf16_utils import (
+from fe_api.test_grouped_gemm_wgrad_bf16_utils import (
     assert_grouped_gemm_wgrad_close as assert_grouped_gemm_wgrad_bf16_close,
     grouped_gemm_wgrad_bf16_reference,
     make_grouped_gemm_wgrad_bf16_problem,
