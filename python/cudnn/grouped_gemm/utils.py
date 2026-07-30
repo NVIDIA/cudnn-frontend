@@ -6,6 +6,15 @@ Shared utilities for grouped GEMM kernels.
 This module contains the tile scheduler classes and helper functions used by both
 the forward (grouped_gemm_swiglu) and backward (grouped_gemm_dswiglu) kernels.
 """
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
+
+from cudnn._deps import torch_dep
+
+if TYPE_CHECKING:
+    import torch
+
 
 from typing import Tuple, Union
 
@@ -26,7 +35,6 @@ from cutlass.cutlass_dsl import T
 from cutlass.cute.typing import Float32, Int32
 import cutlass.cute as cute
 import cutlass
-import torch
 import cutlass.pipeline as pipeline
 from cutlass.pipeline import (
     Agent,
@@ -177,6 +185,7 @@ def fmax(a: Union[float, Float32], b: Union[float, Float32], *, loc=None, ip=Non
 
 def logical_shape_fp4x2_aware(tensor: torch.Tensor) -> Tuple[int, ...]:
     """Return correct shapes for NVFP4 tensor."""
+    torch = torch_dep.require("cudnn.grouped_gemm.utils.logical_shape_fp4x2_aware")
     if tensor.dtype == torch.float4_e2m1fn_x2:
         innermost_dim_index = next((i for i, s in enumerate(tensor.stride()) if s == 1), None)
         if innermost_dim_index is None:

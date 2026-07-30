@@ -2,6 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """Local Hadamard helpers for the grouped GEMM GLU hadamard kernel."""
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
+
+from cudnn._deps import torch_dep
+
+if TYPE_CHECKING:
+    import torch
+
 
 import cutlass
 import cutlass.cute as cute
@@ -10,7 +19,6 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.nvgpu import OperandMajorMode
 from cutlass.cute.nvgpu.tcgen05 import OperandSource
-import torch
 
 HADAMARD_SIZE = 16
 TMEM_ROW_STRIDE = 1 << 16
@@ -235,6 +243,7 @@ def hadamard_smem_transpose_fwht_amax(sD, d_buffer, feature_offset: cutlass.Cons
 
 
 def hadamard_matrix(n, dtype=None, device=None):
+    torch = torch_dep.require("cudnn.grouped_gemm.grouped_gemm_glu_hadamard.hadamard_utils.hadamard_matrix")
     if dtype is None:
         dtype = torch.float32
     if n < 1:

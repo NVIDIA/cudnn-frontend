@@ -2,12 +2,19 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """Indexer forward interface for the SM90 CuTe DSL backend."""
-
 from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
+
+from cudnn._deps import torch_dep
+
+if TYPE_CHECKING:
+    import torch
+
+
 
 from typing import Optional
 
-import torch
 
 import cutlass
 import cutlass.cute as cute
@@ -27,14 +34,18 @@ from cudnn.deepseek_sparse_attention.utils.tensor_conversion import (
 _SUPPORTED_QHPKV = (16, 32, 64)
 _compile_cache: dict = {}
 
-torch2cute_dtype_map = {
-    torch.float16: cutlass.Float16,
-    torch.bfloat16: cutlass.BFloat16,
-    torch.float32: cutlass.Float32,
-}
+def _get_torch2cute_dtype_map():
+    """Lazily resolve _get_torch2cute_dtype_map(); PyTorch types are only touched on demand."""
+    torch = torch_dep.require("cudnn.deepseek_sparse_attention.indexer_forward._interface_sm90")
+    return {
+        torch.float16: cutlass.Float16,
+        torch.bfloat16: cutlass.BFloat16,
+        torch.float32: cutlass.Float32,
+    }
 
 
 def _validate_common(q: torch.Tensor, k: torch.Tensor, w: torch.Tensor) -> None:
+    torch = torch_dep.require("cudnn.deepseek_sparse_attention.indexer_forward._interface_sm90._validate_common")
     assert q.dtype == torch.bfloat16, f"q must be bfloat16, got {q.dtype}"
     assert k.dtype == torch.bfloat16, f"k must be bfloat16, got {k.dtype}"
     assert w.dtype == torch.bfloat16, f"w must be bfloat16, got {w.dtype}"
@@ -57,6 +68,7 @@ def indexer_fwd(
     current_stream=None,
 ) -> torch.Tensor:
     """Indexer QK forward pass using the direct SM90 CuTe DSL port."""
+    torch = torch_dep.require("cudnn.deepseek_sparse_attention.indexer_forward._interface_sm90.indexer_fwd")
     _validate_common(q, k, w)
     if ratio < 1:
         raise ValueError(f"ratio must be >= 1, got {ratio}")
@@ -140,7 +152,7 @@ def indexer_fwd(
         cu_k_cute = _to_cute_tensor(cu_seqlens_k, leading_dim=0) if is_varlen else None
         q_offsets_cute = _to_cute_tensor(q_causal_offsets, leading_dim=0) if q_causal_offsets is not None else None
         kernel_obj = IndexerForwardSm90(
-            torch2cute_dtype_map[q.dtype],
+            _get_torch2cute_dtype_map()[q.dtype],
             head_dim=int(head_dim),
             qhead_per_kvhead=int(qhead_per_kv_head),
             ratio=int(ratio),

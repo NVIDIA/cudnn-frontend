@@ -39,15 +39,22 @@ Barriers:
 SMEM (kernel 2): sGradSignal[topk] holds precomputed grad_signal from kernel 1.
 Grid: (seqlen, batch, 1). Each CTA handles one query position.
 """
-
 from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
+
+from cudnn._deps import torch_dep
+
+if TYPE_CHECKING:
+    import torch
+
+
 
 import math
 from functools import partial
 from typing import Optional
 
 import cuda.bindings.driver as cuda
-import torch
 
 import cutlass
 import cutlass.cute as cute
@@ -1541,6 +1548,7 @@ def _score_grad_inplace(
     #   target = clip(log_target)
     # dL/dlog_predict = -exp(target) * I(log_predict >= -100)
     # dL/dlogits = g - predict * sum(g)
+    torch = torch_dep.require("cudnn.deepseek_sparse_attention.indexer_backward.indexer_backward_sm90._score_grad_inplace")
     can_use_cute = (
         AttnScore.is_cuda
         and IndexScore.is_cuda
@@ -1574,6 +1582,7 @@ def _build_cute_dsl_kernel(
     score_input_is_log=True,
     topk_indices_global: bool = True,
 ):
+    torch = torch_dep.require("cudnn.deepseek_sparse_attention.indexer_backward.indexer_backward_sm90._build_cute_dsl_kernel")
     cap = torch.cuda.get_device_capability()[0]
     if cap < 9:
         raise RuntimeError(f"Requires SM90+ (got SM{cap}0)")

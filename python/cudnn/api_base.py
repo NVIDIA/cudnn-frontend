@@ -12,16 +12,36 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, List, Tuple, Optional
+from typing import TYPE_CHECKING, Any, List, Tuple, Optional
 import logging
 import threading
 import cuda.bindings.driver as cuda
 import cutlass
-import torch
 
 import cutlass.cute as cute
+from cudnn._deps import torch_dep
 from cudnn._experimental_warnings import warn_experimental_api_once
 from cudnn.datatypes import _convert_to_cutlass_data_type
+
+if TYPE_CHECKING:
+    import torch
+
+
+def _maybe_torch():
+    """Return the ``torch`` module if importable, else ``None``. Never raises.
+
+    Used by the framework-neutral predicates below, which must keep working on
+    :class:`TensorDesc` inputs when PyTorch is absent.
+    """
+    if torch_dep.is_available():
+        return torch_dep.require("cudnn tensor introspection")
+    return None
+
+
+def _is_torch_tensor(obj) -> bool:
+    """``isinstance(obj, torch.Tensor)`` that is False when PyTorch is absent."""
+    torch = _maybe_torch()
+    return torch is not None and isinstance(obj, torch.Tensor)
 
 
 def ceil_div(a: int, b: int) -> int:
@@ -34,7 +54,16 @@ def is_power_of_2(n: int) -> bool:
 
 
 def is_sm107_device() -> bool:
-    """Return True when the current CUDA device is Rubin (SM107)."""
+    """Return True when the current CUDA device is Rubin (SM107).
+
+    This is a capability probe, so it stays non-throwing: without PyTorch there
+    is no Torch device context to interrogate and it reports False. Entry points
+    that actually operate on Torch tensors raise
+    :class:`~cudnn.TorchNotAvailableError` at their first Torch use.
+    """
+    torch = _maybe_torch()
+    if torch is None:
+        return False
     return torch.cuda.is_available() and torch.cuda.get_device_capability(torch.cuda.current_device()) == (10, 7)
 
 
@@ -81,6 +110,7 @@ class TensorDesc:
         stride = tuple(self.stride)
         stride_order = tuple(self.stride_order)
         device = self.device
+        torch = torch_dep.require("cudnn.api_base.TensorDesc")
         if not isinstance(device, torch.device):
             try:
                 device = torch.device(device)
@@ -200,6 +230,7 @@ class TensorDesc:
 
     def size(self, dim: Optional[int] = None) -> torch.Size | int:
         if dim is None:
+            torch = torch_dep.require("cudnn.api_base.TensorDesc.size")
             return torch.Size(self.shape)
         dim = self._normalize_dim(int(dim), self.ndim)
         return self.shape[dim]
@@ -260,7 +291,15 @@ class TensorDesc:
         new_stride = self.stride[:dim] + (inserted_stride,) + self.stride[dim:]
         return self._with_layout(new_shape, new_stride)
 
-    def is_contiguous(self, memory_format: torch.memory_format = torch.contiguous_format) -> bool:
+    def is_contiguous(self, memory_format: Optional[torch.memory_format] = None) -> bool:
+        """Check contiguity under a Torch memory format.
+
+        :param memory_format: Torch memory format to test against. ``None``
+            means ``torch.contiguous_format``.
+        """
+        torch = torch_dep.require("cudnn.api_base.TensorDesc.is_contiguous")
+        if memory_format is None:
+            memory_format = torch.contiguous_format
         if memory_format in {torch.contiguous_format, torch.preserve_format}:
             if self._numel(self.shape) == 0:
                 return True
@@ -615,12 +654,13 @@ class APIBase(ABC):
         if isinstance(tensor_or_dtype, TensorDesc):
             dtype = tensor_or_dtype.dtype
             interpret_uint8_as_fp4x2 = tensor_or_dtype.interpret_uint8_as_fp4x2
-        elif isinstance(tensor_or_dtype, torch.Tensor):
+        elif _is_torch_tensor(tensor_or_dtype):
             dtype = tensor_or_dtype.dtype
             interpret_uint8_as_fp4x2 = self._interpret_uint8_as_fp4x2
         else:
             dtype = tensor_or_dtype
             interpret_uint8_as_fp4x2 = self._interpret_uint8_as_fp4x2
+        torch = torch_dep.require("cudnn FP4x2 dtype check")
         return (dtype == torch.float4_e2m1fn_x2) or (interpret_uint8_as_fp4x2 and dtype == torch.uint8)
 
     def _is_fp8(self, tensor_or_dtype: torch.Tensor | torch.dtype | TensorDesc) -> bool:
@@ -633,7 +673,8 @@ class APIBase(ABC):
         """
         if tensor_or_dtype is None:
             return False
-        dtype = tensor_or_dtype.dtype if isinstance(tensor_or_dtype, (torch.Tensor, TensorDesc)) else tensor_or_dtype
+        dtype = tensor_or_dtype.dtype if (_is_torch_tensor(tensor_or_dtype) or isinstance(tensor_or_dtype, TensorDesc)) else tensor_or_dtype
+        torch = torch_dep.require("cudnn FP8 dtype check")
         return dtype in {torch.float8_e5m2, torch.float8_e4m3fn}
 
     def _is_f16(self, tensor_or_dtype: torch.Tensor | torch.dtype | TensorDesc) -> bool:
@@ -646,7 +687,8 @@ class APIBase(ABC):
         """
         if tensor_or_dtype is None:
             return False
-        dtype = tensor_or_dtype.dtype if isinstance(tensor_or_dtype, (torch.Tensor, TensorDesc)) else tensor_or_dtype
+        dtype = tensor_or_dtype.dtype if (_is_torch_tensor(tensor_or_dtype) or isinstance(tensor_or_dtype, TensorDesc)) else tensor_or_dtype
+        torch = torch_dep.require("cudnn F16 dtype check")
         return dtype in {torch.float16, torch.bfloat16}
 
     def _get_innermost_stride_dim(self, tensor: torch.Tensor, name: str = "") -> int:
@@ -744,7 +786,11 @@ class APIBase(ABC):
         """
         if tensor_or_shape is None:
             return None
-        tensor_shape = self._tensor_shape(tensor_or_shape, name=name) if isinstance(tensor_or_shape, (torch.Tensor, TensorDesc)) else tensor_or_shape
+        tensor_shape = (
+            self._tensor_shape(tensor_or_shape, name=name)
+            if (_is_torch_tensor(tensor_or_shape) or isinstance(tensor_or_shape, TensorDesc))
+            else tensor_or_shape
+        )
         if isinstance(shape, tuple):
             if tensor_shape != shape:
                 raise ValueError(f"{name} tensor shape mismatch: expected {shape}, got {tensor_shape}")
@@ -784,7 +830,7 @@ class APIBase(ABC):
         if isinstance(tensor_or_stride, TensorDesc):
             tensor_stride = tensor_or_stride.stride
             tensor_stride_order = tensor_or_stride.stride_order
-        elif isinstance(tensor_or_stride, torch.Tensor):
+        elif _is_torch_tensor(tensor_or_stride):
             tensor_stride = self._tensor_stride(tensor_or_stride, name=name)
             tensor_stride_order = tuple(i for i, s in sorted(enumerate(tensor_stride), key=lambda x: x[1]))
         else:
@@ -850,7 +896,8 @@ class APIBase(ABC):
         """
         if tensor_or_dtype is None:
             return None
-        tensor_dtype = tensor_or_dtype.dtype if isinstance(tensor_or_dtype, (torch.Tensor, TensorDesc)) else tensor_or_dtype
+        tensor_dtype = tensor_or_dtype.dtype if (_is_torch_tensor(tensor_or_dtype) or isinstance(tensor_or_dtype, TensorDesc)) else tensor_or_dtype
+        torch = torch_dep.require("cudnn dtype validation")
         if isinstance(dtype, torch.dtype):
             if tensor_dtype != dtype:
                 error_msg = f"{name} dtype mismatch: expected {dtype}, got {tensor_dtype}"

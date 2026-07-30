@@ -1,9 +1,17 @@
 # Copyright (c) 2026, Jerry Chen
 # SPDX-License-Identifier: MIT
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
+
+from cudnn._deps import torch_dep
+
+if TYPE_CHECKING:
+    import torch
+
 import math
 from typing import Optional, Tuple
 
-import torch
 
 import cutlass
 import cutlass.cute as cute
@@ -13,11 +21,14 @@ from cudnn.deepseek_sparse_attention.utils.runtime import resolve_stream
 from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
 from .dsa_bwd_sm100 import FlashAttentionDSABackwardSm100
 
-torch2cute_dtype_map = {
-    torch.float16: cutlass.Float16,
-    torch.bfloat16: cutlass.BFloat16,
-    torch.float32: cutlass.Float32,
-}
+def _get_torch2cute_dtype_map():
+    """Lazily resolve _get_torch2cute_dtype_map(); PyTorch types are only touched on demand."""
+    torch = torch_dep.require("cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100")
+    return {
+        torch.float16: cutlass.Float16,
+        torch.bfloat16: cutlass.BFloat16,
+        torch.float32: cutlass.Float32,
+    }
 
 
 def flash_attn_bwd_sm100(
@@ -55,6 +66,7 @@ def flash_attn_bwd_sm100(
     Returns:
         (dq, dkv, d_sink) -- flat layout gradients
     """
+    torch = torch_dep.require("cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100.flash_attn_bwd_sm100")
     total_S_q, num_head, head_dim = q.shape
     total_S_kv = kv.shape[0]
     head_dim_v = 512 if head_dim == 576 else head_dim
@@ -127,7 +139,7 @@ def flash_attn_bwd_sm100(
 
     problem_shape = (total_S_q, total_S_kv, head_dim, (num_head, batch_size))
 
-    dtype = torch2cute_dtype_map[q.dtype]
+    dtype = _get_torch2cute_dtype_map()[q.dtype]
     current_stream = resolve_stream(current_stream)
 
     has_topk_length = topk_length is not None

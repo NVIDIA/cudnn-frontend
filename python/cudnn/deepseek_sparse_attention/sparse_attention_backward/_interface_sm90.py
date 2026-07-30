@@ -1,10 +1,18 @@
 # Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
 # Copyright (c) 2026, Jerry Chen
 # SPDX-License-Identifier: MIT
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
+
+from cudnn._deps import torch_dep
+
+if TYPE_CHECKING:
+    import torch
+
 import math
 from typing import Optional, Tuple
 
-import torch
 
 import cutlass
 import cutlass.cute as cute
@@ -22,11 +30,14 @@ from .dsa_bwd_sm90 import (
     _FlashAttentionDSABackwardPreprocessSm90,
 )
 
-torch2cute_dtype_map = {
-    torch.float16: cutlass.Float16,
-    torch.bfloat16: cutlass.BFloat16,
-    torch.float32: cutlass.Float32,
-}
+def _get_torch2cute_dtype_map():
+    """Lazily resolve _get_torch2cute_dtype_map(); PyTorch types are only touched on demand."""
+    torch = torch_dep.require("cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm90")
+    return {
+        torch.float16: cutlass.Float16,
+        torch.bfloat16: cutlass.BFloat16,
+        torch.float32: cutlass.Float32,
+    }
 
 
 def flash_attn_bwd_sm90(
@@ -70,6 +81,7 @@ def flash_attn_bwd_sm90(
     Returns:
         (dq, dkv) or (dq, dkv, d_sink) — flat layout gradients
     """
+    torch = torch_dep.require("cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm90.flash_attn_bwd_sm90")
     compute_capability = _get_device_capability()
     assert compute_capability == 9, f"Only SM90, got SM{compute_capability}0"
 
@@ -168,7 +180,7 @@ def flash_attn_bwd_sm90(
     else:
         dkv_accum.fill_(0)
 
-    dtype = torch2cute_dtype_map[q4.dtype]
+    dtype = _get_torch2cute_dtype_map()[q4.dtype]
     current_stream = resolve_stream(current_stream)
     arch = 90
     num_threads = 256

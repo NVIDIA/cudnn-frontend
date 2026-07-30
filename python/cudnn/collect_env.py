@@ -31,6 +31,7 @@ import platform
 import re
 import subprocess
 import sys
+from cudnn._deps import torch_dep
 
 # Library families whose loaded-vs-installed identity we disambiguate.
 # Keys are display names, values are regexes matched against .so basenames.
@@ -212,7 +213,7 @@ def _get_gpu_info():
             info[f"GPU {idx.strip()} (nvidia-smi order)"] = rest.strip()
 
     try:
-        import torch
+        torch = torch_dep.require("cudnn.collect_env")
 
         if not torch.cuda.is_available():
             info["GPUs (torch)"] = "torch.cuda.is_available() == False"
@@ -254,7 +255,7 @@ def _get_cuda_toolkit_info():
 def _get_torch_info():
     info = {}
     try:
-        import torch
+        torch = torch_dep.require("cudnn.collect_env")
     except Exception as e:
         info["torch"] = f"<import failed: {type(e).__name__}: {e}>"
         return info
@@ -321,7 +322,7 @@ def _force_load_gpu_libs():
     /proc/self/maps reflects reality. Every step is optional."""
 
     def _f():
-        import torch
+        torch = torch_dep.require("cudnn.collect_env")
 
         torch.backends.cudnn.version()  # loads torch's libcudnn
         if torch.cuda.is_available():

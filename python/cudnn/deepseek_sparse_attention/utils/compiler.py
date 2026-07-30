@@ -16,12 +16,19 @@ So we always pass an explicit ``--gpu-arch`` chosen at runtime from the
 device capability. ``compile_options(extra)`` is the single entry point;
 DSA ``cute.compile`` call sites should route through it.
 """
-
 from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
+
+from cudnn._deps import torch_dep
+
+if TYPE_CHECKING:
+    import torch
+
+
 
 from functools import lru_cache
 
-import torch
 
 # (compute_capability) → cute DSL --gpu-arch flag value.
 # H100, B200/B300, and sm_100f require architecture-specific variants because
@@ -42,6 +49,7 @@ def gpu_arch_flag() -> str:
     Cached because torch.cuda.get_device_capability() is cheap but the
     function gets called inside every cute.compile site.
     """
+    torch = torch_dep.require("cudnn.deepseek_sparse_attention.utils.compiler.gpu_arch_flag")
     if not torch.cuda.is_available():
         raise RuntimeError("cute.compile requires CUDA; no GPU available")
     cap = torch.cuda.get_device_capability()

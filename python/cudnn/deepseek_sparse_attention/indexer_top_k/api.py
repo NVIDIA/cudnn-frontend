@@ -2,12 +2,19 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """APIBase wrapper for the DSA indexer top-K CuTe DSL kernel."""
-
 from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
+
+from cudnn._deps import torch_dep
+
+if TYPE_CHECKING:
+    import torch
+
+
 
 from typing import Optional, Tuple
 
-import torch
 import cuda.bindings.driver as cuda
 
 from cudnn.api_base import APIBase, TupleDict
@@ -15,7 +22,10 @@ from cudnn.api_base import APIBase, TupleDict
 from .local_to_global_dsl import local_to_global as _local_to_global
 from .compactify import compactify as _compactify
 
-_SUPPORTED_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
+def _get_supported_dtypes():
+    """Lazily resolve _get_supported_dtypes(); PyTorch types are only touched on demand."""
+    torch = torch_dep.require("cudnn.deepseek_sparse_attention.indexer_top_k.api")
+    return (torch.float32, torch.float16, torch.bfloat16)
 
 
 def _get_cute_dsl_topk_wrapper():
@@ -81,8 +91,9 @@ class IndexerTopK(APIBase):
         self.num_copy_bits = int(num_copy_bits)
 
     def check_support(self) -> bool:
+        torch = torch_dep.require("cudnn.deepseek_sparse_attention.indexer_top_k.api.check_support")
         self._logger.debug("Entering check_support")
-        self._check_dtype(self.input_desc, list(_SUPPORTED_DTYPES), name="input_values")
+        self._check_dtype(self.input_desc, list(_get_supported_dtypes()), name="input_values")
         self._check_dtype(self.seq_lens_desc, torch.int32, name="seq_lens")
         self._value_error_if(
             self.input_desc.ndim != 2,

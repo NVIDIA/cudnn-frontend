@@ -9,12 +9,19 @@ tensor is expected to already be in the index space consumed by downstream
 sparse attention kernels; use local_to_global before compactifying local top-K
 indices. BSHD-shaped inputs are flattened batch-major before launch.
 """
-
 from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
+
+from cudnn._deps import torch_dep
+
+if TYPE_CHECKING:
+    import torch
+
+
 
 from typing import Optional, Tuple
 
-import torch
 import cuda.bindings.driver as cuda
 
 import cutlass
@@ -33,6 +40,7 @@ ROWS_PER_CTA = WARPS_PER_CTA  # One warp per row.
 
 
 def is_available() -> bool:
+    torch = torch_dep.require("cudnn.deepseek_sparse_attention.indexer_top_k.compactify.is_available")
     return torch.cuda.is_available() and device_major() >= 9
 
 
@@ -142,6 +150,7 @@ def compactify(
     batch-major to (B*S, K), matching DSA sparse attention's flat top-K
     layout. Returns (indices, topk_length).
     """
+    torch = torch_dep.require("cudnn.deepseek_sparse_attention.indexer_top_k.compactify.compactify")
     if not is_available():
         raise RuntimeError("compactify requires SM90+ CUDA device")
     if idxs.dtype != torch.int32:

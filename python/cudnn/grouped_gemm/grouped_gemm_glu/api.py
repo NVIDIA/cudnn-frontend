@@ -16,6 +16,15 @@ Discrete mode
     ``num_experts``, ``b_shape``, ``b_dtype``, and per-expert pointer arrays
     at execution time.
 """
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
+
+from cudnn._deps import torch_dep
+
+if TYPE_CHECKING:
+    import torch
+
 
 from dataclasses import dataclass, replace
 
@@ -28,20 +37,22 @@ from ..moe_utils import MoEWeightMode
 from cuda.bindings import driver as cuda
 import logging
 import os
-import torch
 from typing import Any, Tuple, Optional, overload
 
 from cudnn.api_base import APIBase, TupleDict, ceil_div, get_device_type
 
-_BLOCK_SCALED_DTYPE_PAIRS = {
-    (dtype, dtype)
-    for dtype in (
-        torch.float4_e2m1fn_x2,
-        torch.uint8,
-        torch.float8_e5m2,
-        torch.float8_e4m3fn,
-    )
-}
+def _get_block_scaled_dtype_pairs():
+    """Lazily resolve _get_block_scaled_dtype_pairs(); PyTorch types are only touched on demand."""
+    torch = torch_dep.require("cudnn.grouped_gemm.grouped_gemm_glu.api")
+    return {
+        (dtype, dtype)
+        for dtype in (
+            torch.float4_e2m1fn_x2,
+            torch.uint8,
+            torch.float8_e5m2,
+            torch.float8_e4m3fn,
+        )
+    }
 
 
 from ._bf16_api import GroupedGemmGluBf16API
@@ -69,9 +80,9 @@ class GluCall:
     b_major: str = "k"
     norm_const_tensor: Optional[torch.Tensor] = None
     prob_tensor: Optional[torch.Tensor] = None
-    acc_dtype: torch.dtype = torch.float32
-    c_dtype: torch.dtype = torch.bfloat16
-    d_dtype: torch.dtype = torch.bfloat16
+    acc_dtype: Optional[torch.dtype] = None
+    c_dtype: Optional[torch.dtype] = None
+    d_dtype: Optional[torch.dtype] = None
     cd_major: str = "n"
     mma_tiler_mn: Tuple[int, int] = (256, 256)
     cluster_shape_mn: Optional[Tuple[int, int]] = None
@@ -91,6 +102,22 @@ class GluCall:
     weight_mode: Optional[MoEWeightMode] = None
     b_shape: Optional[Tuple[int, ...]] = None
     num_experts: Optional[int] = None
+
+    def __post_init__(self):
+        """Resolve the PyTorch-valued defaults.
+
+        ``None`` means ``torch.float32`` for ``acc_dtype`` and ``torch.bfloat16``
+        for ``c_dtype``/``d_dtype``; the effective values are unchanged from
+        before these parameters became ``None``-defaulted. Uses
+        ``object.__setattr__`` because the dataclass is frozen.
+        """
+        torch = torch_dep.require("cudnn.grouped_gemm.grouped_gemm_glu.GluCall")
+        if self.acc_dtype is None:
+            object.__setattr__(self, "acc_dtype", torch.float32)
+        if self.c_dtype is None:
+            object.__setattr__(self, "c_dtype", torch.bfloat16)
+        if self.d_dtype is None:
+            object.__setattr__(self, "d_dtype", torch.bfloat16)
 
 
 class GroupedGemmGluSm100(APIBase):
@@ -146,7 +173,7 @@ class GroupedGemmGluSm100(APIBase):
         sample_amax: Optional[torch.Tensor] = None,
         sample_norm_const: Optional[torch.Tensor] = None,
         sample_prob: Optional[torch.Tensor] = None,
-        acc_dtype: torch.dtype = torch.float32,
+        acc_dtype: Optional[torch.dtype] = None,
         mma_tiler_mn: Tuple[int, int] = (256, 256),
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         sf_vec_size: int = 16,
@@ -159,6 +186,9 @@ class GroupedGemmGluSm100(APIBase):
         use_single_group_runtime_offsets: bool = False,
         generate_c: bool = False,
     ) -> None:
+        torch = torch_dep.require("cudnn.grouped_gemm.grouped_gemm_glu.api.__init__")
+        if acc_dtype is None:
+            acc_dtype = torch.float32
         super().__init__()
         self._pending_init_kwargs = dict(locals())
         self._pending_init_kwargs.pop("self")
@@ -184,7 +214,7 @@ class GroupedGemmGluSm100(APIBase):
                     ("sf_vec_size", kwargs["sf_vec_size"] if kwargs["sf_vec_size"] != 16 else None),
                     ("discrete_col_sfd", kwargs["discrete_col_sfd"] if kwargs["discrete_col_sfd"] else None),
                 ),
-                block_scaled_dtype_pairs=_BLOCK_SCALED_DTYPE_PAIRS,
+                block_scaled_dtype_pairs=_get_block_scaled_dtype_pairs(),
             )
             self.backend = backend
             if backend is GroupedGemmBackend.BF16:
@@ -446,6 +476,7 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall) -> TupleDict:
         TupleDict with keys: c_tensor, d_tensor, d_col_tensor, amax_tensor,
             sfd_row_tensor, sfd_col_tensor
     """
+    torch = torch_dep.require("cudnn.grouped_gemm.grouped_gemm_glu.api._grouped_gemm_glu_block_scaled_call")
     from cudnn.discrete_grouped_gemm.discrete_kernel_utils import _require_pointer_tensor
 
     a_tensor = call.a_tensor
@@ -807,6 +838,7 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall) -> TupleDict:
 
 
 def _normalize_glu_call(call: GluCall) -> tuple[GluCall, GroupedGemmBackend]:
+    torch = torch_dep.require("cudnn.grouped_gemm.grouped_gemm_glu.api._normalize_glu_call")
     from cudnn.discrete_grouped_gemm.discrete_kernel_utils import _require_pointer_tensor
 
     is_dense = call.b_tensor is not None
@@ -867,7 +899,7 @@ def _normalize_glu_call(call: GluCall) -> tuple[GluCall, GroupedGemmBackend]:
                 call.glu_clamp_min if call.glu_clamp_min != -7.0 else None,
             ),
         ),
-        block_scaled_dtype_pairs=_BLOCK_SCALED_DTYPE_PAIRS,
+        block_scaled_dtype_pairs=_get_block_scaled_dtype_pairs(),
     )
 
     linear_offset = call.linear_offset
@@ -946,6 +978,7 @@ def _glu_tensor_signature(tensor: Optional[torch.Tensor], *, dynamic_m: bool = F
 
 
 def _grouped_gemm_glu_bf16_call(call: GluCall) -> TupleDict:
+    torch = torch_dep.require("cudnn.grouped_gemm.grouped_gemm_glu.api._grouped_gemm_glu_bf16_call")
     valid_m, k, _ = call.a_tensor.shape
     if call.weight_mode == MoEWeightMode.DENSE:
         n_full = call.b_tensor.shape[0]
@@ -1095,9 +1128,9 @@ def grouped_gemm_glu_wrapper_sm100(
     b_major: str = "k",
     norm_const_tensor: Optional[torch.Tensor] = None,
     prob_tensor: Optional[torch.Tensor] = None,
-    acc_dtype: torch.dtype = torch.float32,
-    c_dtype: torch.dtype = torch.bfloat16,
-    d_dtype: torch.dtype = torch.bfloat16,
+    acc_dtype: Optional[torch.dtype] = None,
+    c_dtype: Optional[torch.dtype] = None,
+    d_dtype: Optional[torch.dtype] = None,
     cd_major: str = "n",
     mma_tiler_mn: Tuple[int, int] = (256, 256),
     cluster_shape_mn: Optional[Tuple[int, int]] = None,
@@ -1116,6 +1149,13 @@ def grouped_gemm_glu_wrapper_sm100(
     generate_c: bool = False,
 ) -> TupleDict:
     """Dispatch grouped GEMM GLU once from an immutable normalized call."""
+    torch = torch_dep.require("cudnn.grouped_gemm.grouped_gemm_glu.api.grouped_gemm_glu_wrapper_sm100")
+    if acc_dtype is None:
+        acc_dtype = torch.float32
+    if c_dtype is None:
+        c_dtype = torch.bfloat16
+    if d_dtype is None:
+        d_dtype = torch.bfloat16
     _reject_unsupported_rubin_glu_tune_params(
         get_device_type() == "rubin",
         geglu_alpha,

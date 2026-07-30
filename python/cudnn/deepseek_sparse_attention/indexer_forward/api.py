@@ -8,13 +8,20 @@ reduction, and a ratio causal mask. Does NOT fuse top-K — pair with
 :class:`cudnn.deepseek_sparse_attention.indexer_top_k.IndexerTopK` for a
 two-stage unfused path (score → top-K).
 """
-
 from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
+
+from cudnn._deps import torch_dep
+
+if TYPE_CHECKING:
+    import torch
+
+
 
 import logging
 from typing import Optional
 
-import torch
 import cuda.bindings.driver as cuda
 
 import cutlass
@@ -78,6 +85,7 @@ class IndexerForward(APIBase):
         self.head_dim = None
 
     def check_support(self) -> bool:
+        torch = torch_dep.require("cudnn.deepseek_sparse_attention.indexer_forward.api.check_support")
         self._logger.debug("Entering check_support")
         self._value_error_if(
             self.q_desc.ndim != 4,

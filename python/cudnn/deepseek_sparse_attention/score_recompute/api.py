@@ -9,12 +9,19 @@ indexer and attention score variants, giving four public classes.
 Tile / SMEM dispatch logic and compile caching live in the backend interface
 modules. This module adapts those entry points to the APIBase contract.
 """
-
 from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
+
+from cudnn._deps import torch_dep
+
+if TYPE_CHECKING:
+    import torch
+
+
 
 from typing import Optional
 
-import torch
 import cuda.bindings.driver as cuda
 
 from cudnn.api_base import APIBase, TupleDict
@@ -27,6 +34,7 @@ from . import _interface_sm100 as _iface_sm100
 
 
 def _check_score_arch(api: APIBase) -> None:
+    torch = torch_dep.require("cudnn.deepseek_sparse_attention.score_recompute.api._check_score_arch")
     major, _ = torch.cuda.get_device_capability()
     api._runtime_error_if(
         major != 9 and major < 10,
@@ -66,6 +74,7 @@ def _check_sparse_score_shapes(
     aux_name: str,
     qhead_per_kv_head: Optional[int],
 ) -> None:
+    torch = torch_dep.require("cudnn.deepseek_sparse_attention.score_recompute.api._check_sparse_score_shapes")
     api._value_error_if(q_desc.ndim != 4, f"Q must be 4-D (B, S_q, H_q, D), got {q_desc.shape}")
     api._value_error_if(k_desc.ndim != 3, f"K must be 3-D (B, S_k, D) MQA, got {k_desc.shape}")
     api._value_error_if(aux_desc.ndim != 3, f"{aux_name} must be 3-D (B, S_q, H_q), got {aux_desc.shape}")
@@ -159,6 +168,7 @@ class SparseIndexerScoreRecompute(_ScoreRecomputeBase):
         self.topk_indices_global = bool(topk_indices_global)
 
     def check_support(self) -> bool:
+        torch = torch_dep.require("cudnn.deepseek_sparse_attention.score_recompute.api.check_support")
         _check_score_arch(self)
         self._check_dtype(self.q_desc, torch.bfloat16, name="Q")
         self._check_dtype(self.k_desc, torch.bfloat16, name="K")
@@ -189,6 +199,7 @@ class SparseIndexerScoreRecompute(_ScoreRecomputeBase):
         topk_length: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
     ) -> torch.Tensor:
+        torch = torch_dep.require("cudnn.deepseek_sparse_attention.score_recompute.api.execute")
         major, _ = torch.cuda.get_device_capability()
         if major == 9:
             from . import _interface_sm90 as _iface_sm90
@@ -236,6 +247,7 @@ def sparse_indexer_score_recompute_wrapper(
     ``topk_indices_global=True`` when passing ids encoded as
     ``batch_idx * S_k + local_idx``.
     """
+    torch = torch_dep.require("cudnn.deepseek_sparse_attention.score_recompute.api.sparse_indexer_score_recompute_wrapper")
     key = (
         q_indexer.dtype,
         q_indexer.shape,
@@ -325,6 +337,7 @@ class SparseAttnScoreRecompute(_ScoreRecomputeBase):
         self.topk_indices_global = bool(topk_indices_global)
 
     def check_support(self) -> bool:
+        torch = torch_dep.require("cudnn.deepseek_sparse_attention.score_recompute.api.check_support")
         _check_score_arch(self)
         self._check_dtype(self.q_desc, torch.bfloat16, name="Q")
         self._check_dtype(self.k_desc, torch.bfloat16, name="K")
@@ -356,6 +369,7 @@ class SparseAttnScoreRecompute(_ScoreRecomputeBase):
         softmax_scale: Optional[float] = None,
         current_stream: Optional[cuda.CUstream] = None,
     ) -> torch.Tensor:
+        torch = torch_dep.require("cudnn.deepseek_sparse_attention.score_recompute.api.execute")
         scale = self.softmax_scale if softmax_scale is None else float(softmax_scale)
         major, _ = torch.cuda.get_device_capability()
         if major == 9:
@@ -407,6 +421,7 @@ def sparse_attn_score_recompute_wrapper(
     ``topk_indices_global=True`` when passing ids encoded as
     ``batch_idx * S_k + local_idx``.
     """
+    torch = torch_dep.require("cudnn.deepseek_sparse_attention.score_recompute.api.sparse_attn_score_recompute_wrapper")
     key = (
         q_attn.dtype,
         q_attn.shape,
@@ -529,6 +544,7 @@ class DenseIndexerScoreRecompute(_ScoreRecomputeBase):
         self.is_thd = bool(is_thd)
 
     def check_support(self) -> bool:
+        torch = torch_dep.require("cudnn.deepseek_sparse_attention.score_recompute.api.check_support")
         _check_score_arch(self)
         self._check_dtype(self.q_desc, torch.bfloat16, name="Q")
         self._check_dtype(self.k_desc, torch.bfloat16, name="K")
@@ -566,6 +582,7 @@ class DenseIndexerScoreRecompute(_ScoreRecomputeBase):
         q_causal_offsets: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
     ):
+        torch = torch_dep.require("cudnn.deepseek_sparse_attention.score_recompute.api.execute")
         scale = self.sm_scale if sm_scale is None else float(sm_scale)
         ratio_value = self.ratio if ratio is None else int(ratio)
         if cu_seqlens_q is not None:
@@ -629,6 +646,7 @@ def dense_indexer_score_recompute_wrapper(
     q_causal_offsets: Optional[torch.Tensor] = None,
     stream: Optional[cuda.CUstream] = None,
 ) -> TupleDict:
+    torch = torch_dep.require("cudnn.deepseek_sparse_attention.score_recompute.api.dense_indexer_score_recompute_wrapper")
     is_thd, max_q, max_k, out_shape, denom_shape = _dense_sample_shapes(
         q,
         k,
@@ -740,6 +758,7 @@ class DenseAttnScoreRecompute(_ScoreRecomputeBase):
         self.is_thd = bool(is_thd)
 
     def check_support(self) -> bool:
+        torch = torch_dep.require("cudnn.deepseek_sparse_attention.score_recompute.api.check_support")
         _check_score_arch(self)
         self._check_dtype(self.q_desc, torch.bfloat16, name="Q")
         self._check_dtype(self.k_desc, torch.bfloat16, name="K")
@@ -777,6 +796,7 @@ class DenseAttnScoreRecompute(_ScoreRecomputeBase):
         q_causal_offsets: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
     ):
+        torch = torch_dep.require("cudnn.deepseek_sparse_attention.score_recompute.api.execute")
         scale = self.softmax_scale if softmax_scale is None else float(softmax_scale)
         ratio_value = self.ratio if ratio is None else int(ratio)
         if cu_seqlens_q is not None:
@@ -840,6 +860,7 @@ def dense_attn_score_recompute_wrapper(
     q_causal_offsets: Optional[torch.Tensor] = None,
     stream: Optional[cuda.CUstream] = None,
 ) -> TupleDict:
+    torch = torch_dep.require("cudnn.deepseek_sparse_attention.score_recompute.api.dense_attn_score_recompute_wrapper")
     is_thd, max_q, max_k, out_shape, denom_shape = _dense_sample_shapes(
         q,
         k,

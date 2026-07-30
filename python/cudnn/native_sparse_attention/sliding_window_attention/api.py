@@ -2,9 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
+
+from cudnn._deps import torch_dep
+
+if TYPE_CHECKING:
+    import torch
+
 import math
 import cudnn
-import torch
 
 from cuda.bindings import driver as cuda
 from cudnn.datatypes import _torch_to_cudnn_data_type
@@ -34,10 +41,15 @@ class SlidingWindowAttention(APIBase):
         max_seq_len_q: Optional[int] = None,
         max_seq_len_kv: Optional[int] = None,
         attn_scale: Optional[float] = None,
-        intermediate_data_type: torch.dtype = torch.float32,
-        compute_data_type: torch.dtype = torch.float32,
+        intermediate_data_type: Optional[torch.dtype] = None,
+        compute_data_type: Optional[torch.dtype] = None,
         cudnn_handle: Optional[cudnn.handle] = None,
     ):
+        torch = torch_dep.require("cudnn.native_sparse_attention.sliding_window_attention.api.__init__")
+        if intermediate_data_type is None:
+            intermediate_data_type = torch.float32
+        if compute_data_type is None:
+            compute_data_type = torch.float32
         super().__init__()
         self._logger.debug("Entering __init__")
 
@@ -93,6 +105,7 @@ class SlidingWindowAttention(APIBase):
     ):
         """Calculate ragged offsets for fully packed THD layout."""
 
+        torch = torch_dep.require("cudnn.native_sparse_attention.sliding_window_attention.api._calculate_ragged_offsets")
         def compute_exclusive_prefix_sum(tensor):
             assert tensor.shape[1:] == (
                 1,
@@ -122,6 +135,7 @@ class SlidingWindowAttention(APIBase):
         )
 
     def check_support(self) -> bool:
+        torch = torch_dep.require("cudnn.native_sparse_attention.sliding_window_attention.api.check_support")
         self._logger.debug("Entering check_support")
 
         if not torch.cuda.is_available():
@@ -392,6 +406,7 @@ class SlidingWindowAttention(APIBase):
         cudnn_handle: Optional[cudnn.handle] = None,
         skip_compile: bool = False,
     ) -> None:
+        torch = torch_dep.require("cudnn.native_sparse_attention.sliding_window_attention.api.execute")
         self._logger.debug("Entering execute")
         cudnn_handle = self._cudnn_handle if cudnn_handle is None else cudnn_handle
         if current_stream is not None:
@@ -505,11 +520,16 @@ def sliding_window_attention_wrapper(
     is_infer: bool = False,
     attn_scale: Optional[float] = None,
     o_dtype: Optional[torch.dtype] = None,
-    intermediate_data_type: torch.dtype = torch.float32,
-    compute_data_type: torch.dtype = torch.float32,
+    intermediate_data_type: Optional[torch.dtype] = None,
+    compute_data_type: Optional[torch.dtype] = None,
     cudnn_handle: Optional[cudnn.handle] = None,
     stream: Optional[cuda.CUstream] = None,
 ) -> TupleDict:
+    torch = torch_dep.require("cudnn.native_sparse_attention.sliding_window_attention.api.sliding_window_attention_wrapper")
+    if intermediate_data_type is None:
+        intermediate_data_type = torch.float32
+    if compute_data_type is None:
+        compute_data_type = torch.float32
     o_tensor, stats_tensor = None, None
     o_dtype = o_dtype if o_dtype is not None else q_tensor.dtype
     if q_tensor.ndim == 3:  # thd

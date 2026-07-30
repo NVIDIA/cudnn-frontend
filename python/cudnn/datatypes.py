@@ -4,6 +4,8 @@
 import sys
 import importlib
 
+from ._deps import torch_dep
+
 
 def is_windows():
     return sys.platform.startswith("win")
@@ -24,11 +26,16 @@ _torch_to_cutlass_data_type_dict = None
 
 
 def is_torch_available():
+    """Compatibility Boolean probe for PyTorch availability. Never raises.
+
+    Backed by :mod:`cudnn._deps.torch_dep`; the Torch-to-cuDNN dtype map is
+    built once on the first successful probe.
+    """
     global torch_available, _torch_to_cudnn_data_type_dict
     # this condition ensures that datatype mapping is only created once
     if torch_available is None:
-        try:
-            import torch
+        if torch_dep.is_available():
+            torch = torch_dep.require("cudnn dtype conversion")
 
             torch_available = True
             _torch_to_cudnn_data_type_dict = {
@@ -58,20 +65,34 @@ def is_torch_available():
             possibly_add_type("float8_e8m0fnu", cudnn_data_type.FP8_E8M0)
             possibly_add_type("float4_e2m1fn_x2", cudnn_data_type.FP4_E2M1)
 
-        except ImportError:
+        else:
             torch_available = False
             _torch_to_cudnn_data_type_dict = {}
     return torch_available
 
 
 def is_cutlass_available():
+    """Return whether CUTLASS is importable, independently of PyTorch.
+
+    The Torch-to-CUTLASS dtype map is only meaningful when both are present, so
+    it is built behind its own Torch guard. This keeps CUTLASS-native
+    ``cutlass.Numeric`` types usable when CUTLASS is installed and PyTorch is
+    not.
+    """
     global cutlass_available, _torch_to_cutlass_data_type_dict
     if cutlass_available is None:
         try:
-            import torch
             import cutlass
+        except ImportError:
+            cutlass_available = False
+            _torch_to_cutlass_data_type_dict = {}
+            return cutlass_available
 
-            cutlass_available = True
+        cutlass_available = True
+        _torch_to_cutlass_data_type_dict = {}
+
+        if torch_dep.is_available():
+            torch = torch_dep.require("cudnn CUTLASS dtype conversion")
             mapping = {
                 torch.half: getattr(cutlass, "Float16", None),
                 getattr(torch, "float16", torch.half): getattr(cutlass, "Float16", None),
@@ -91,9 +112,6 @@ def is_cutlass_available():
                 getattr(torch, "float4_e2m1fn_x2", None): getattr(cutlass, "Float4E2M1FN", None),
             }
             _torch_to_cutlass_data_type_dict = {t: c for t, c in mapping.items() if t is not None and c is not None}
-        except ImportError:
-            cutlass_available = False
-            _torch_to_cutlass_data_type_dict = {}
     return cutlass_available
 
 
@@ -107,7 +125,7 @@ def _torch_to_cudnn_data_type(torch_data_type) -> cudnn_data_type:
 
 def _torch_to_cutlass_data_type(data_type, interpret_uint8_as_fp4x2: bool = False):
     if is_cutlass_available() and is_torch_available():
-        import torch
+        torch = torch_dep.require("cudnn CUTLASS dtype conversion")
 
         if interpret_uint8_as_fp4x2 and data_type == torch.uint8:
             import cutlass
@@ -155,8 +173,10 @@ def _library_type(input_type):
         return input_type
 
     for cvt_fn in [
+        # Framework-specific converters. Each returns None when its framework is
+        # absent or the type is unrecognized, so the sequence degrades cleanly.
+        # Add more DL libraries to support here (e.g. a future JAX converter).
         _torch_to_cudnn_data_type,
-        # Add more DL libraries to support here
     ]:
         out = cvt_fn(input_type)
         if out is not None:
@@ -167,7 +187,7 @@ def _library_type(input_type):
 
 def _is_torch_tensor(input_tensor) -> bool:
     if is_torch_available():
-        import torch
+        torch = torch_dep.require("cudnn tensor type check")
 
         return isinstance(input_tensor, torch.Tensor)
     return False

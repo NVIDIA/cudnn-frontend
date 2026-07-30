@@ -14,11 +14,6 @@ elementwise ops, and writes results into the caller-provided output buffers.
 
 from typing import TYPE_CHECKING, Any, Dict
 
-try:
-    import torch
-except ImportError:
-    torch = None
-
 from .base import BaseEngine
 from .engine_ids import PYTHON_ENGINE_ID_BASE
 from ..graph_types import NodeType
@@ -28,14 +23,17 @@ if TYPE_CHECKING:
 
 # POINTWISE ops this reference understands, keyed by the op kind
 # (params["mode"] == the pygraph method name).
-_UNARY = {
-    "relu": lambda x: x.clamp_min(0),
-    "gelu": lambda x: torch.nn.functional.gelu(x),
-    "sigmoid": lambda x: torch.sigmoid(x),
-    "tanh": lambda x: torch.tanh(x),
-    "exp": lambda x: torch.exp(x),
-    "identity": lambda x: x,
-}
+def _get_unary():
+    """Lazily resolve _get_unary(); PyTorch types are only touched on demand."""
+    torch = torch_dep.require("cudnn.engines.reference_matmul_engine")
+    return {
+        "relu": lambda x: x.clamp_min(0),
+        "gelu": lambda x: torch.nn.functional.gelu(x),
+        "sigmoid": lambda x: torch.sigmoid(x),
+        "tanh": lambda x: torch.tanh(x),
+        "exp": lambda x: torch.exp(x),
+        "identity": lambda x: x,
+    }
 _BINARY = {
     "add": lambda a, b: a + b,
     "mul": lambda a, b: a * b,
@@ -57,14 +55,14 @@ class ReferenceMatmulEngine(BaseEngine):
     engine_id = PYTHON_ENGINE_ID_BASE + 0  # stable id (a correctness oracle)
 
     def check_support(self, graph: "pygraph") -> None:
-        if torch is None:
+        if not torch_dep.is_available():
             raise NotImplementedError("ReferenceMatmulEngine requires PyTorch")
         for node in graph.nodes:
             if node.node_type == NodeType.MATMUL:
                 continue
             if node.node_type == NodeType.POINTWISE:
                 mode = _mode_name(node.params.get("mode"))
-                if mode not in _UNARY and mode not in _BINARY:
+                if mode not in _get_unary() and mode not in _BINARY:
                     raise NotImplementedError(f"ReferenceMatmulEngine: unsupported pointwise mode {mode!r}")
                 if any(k != "mode" for k in node.params):
                     # scalar attributes (clips / negative_slope / ...) not implemented
@@ -85,7 +83,7 @@ class ReferenceMatmulEngine(BaseEngine):
             elif node.node_type == NodeType.POINTWISE:
                 mode = _mode_name(node.params.get("mode"))
                 ins = [values[t.uid] for t in node.inputs.values()]
-                out = _UNARY[mode](ins[0]) if mode in _UNARY else _BINARY[mode](ins[0], ins[1])
+                out = _get_unary()[mode](ins[0]) if mode in _get_unary() else _BINARY[mode](ins[0], ins[1])
             else:  # pragma: no cover — guarded by check_support
                 raise NotImplementedError(node.node_type.name)
 

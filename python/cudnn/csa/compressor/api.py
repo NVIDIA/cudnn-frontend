@@ -50,8 +50,16 @@ buckets).
 run-to-run deterministic (the backward APIs refuse to run under
 ``torch.use_deterministic_algorithms(True)``).
 """
-
 from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
+
+from cudnn._deps import torch_dep
+
+if TYPE_CHECKING:
+    import torch
+
+
 
 import threading
 import warnings
@@ -59,7 +67,6 @@ from collections import OrderedDict
 from contextlib import contextmanager
 from typing import Iterator, Optional
 
-import torch
 import cuda.bindings.driver as cuda
 
 from cudnn.api_base import APIBase, TupleDict
@@ -126,6 +133,7 @@ def _resolve_stream_handle(current_stream: Optional[cuda.CUstream]) -> Optional[
 @contextmanager
 def _torch_stream_context(current_stream: Optional[cuda.CUstream], device: torch.device) -> Iterator[None]:
     """Run torch work on ``current_stream`` (device-tagged) when one is given."""
+    torch = torch_dep.require("cudnn.csa.compressor.api._torch_stream_context")
     if current_stream is None:
         yield
         return
@@ -139,6 +147,7 @@ def _reject_deterministic_backward() -> None:
     Mirrors torch's deterministic-mode semantics: strict mode raises, warn-only mode
     warns and runs.
     """
+    torch = torch_dep.require("cudnn.csa.compressor.api._reject_deterministic_backward")
     if torch.are_deterministic_algorithms_enabled():
         message = (
             "CSA compressor backward accumulates dAPE with fp32 atomics and is not "
@@ -197,6 +206,7 @@ class _CSACompressorBase(APIBase):
         (device-capability failures raise ``RuntimeError``), mirroring the other FE-OSS
         APIs; there is no soft fallback path inside this API.
         """
+        torch = torch_dep.require("cudnn.csa.compressor.api.check_support")
         self._logger.debug("Entering check_support")
         if self.ratio == 4:
             self._value_error_if(
@@ -358,6 +368,7 @@ class _CSACompressorBase(APIBase):
         is pending. Only needed for explicit streams — with ``current_stream=None`` the
         launch lands on torch's current stream and ordinary stream semantics apply.
         """
+        torch = torch_dep.require("cudnn.csa.compressor.api._record_streams")
         if current_stream is None:
             return
         consumer = torch.cuda.get_stream_from_external(int(current_stream), device)
@@ -411,6 +422,7 @@ class CSACompressorForward(_CSACompressorBase):
         current_stream: Optional[cuda.CUstream] = None,
     ) -> None:
         """Run the compiled forward kernel; ``out`` is fully overwritten."""
+        torch = torch_dep.require("cudnn.csa.compressor.api.execute")
         self._logger.debug("Entering execute")
         if self._compiled_kernel is None:
             raise ValueError("CSACompressorForward kernel not compiled")
@@ -504,6 +516,7 @@ class CSACompressorBackward(_CSACompressorBase):
         current_stream: Optional[cuda.CUstream] = None,
     ) -> None:
         """Run the compiled backward kernel into the gradient buffers (see class docs)."""
+        torch = torch_dep.require("cudnn.csa.compressor.api.execute")
         self._logger.debug("Entering execute")
         if self._compiled_kernel is None:
             raise ValueError("CSACompressorBackward kernel not compiled")
@@ -538,6 +551,7 @@ _api_build_lock = threading.Lock()
 
 def _get_api(kind, kv, score, ape, cu_seqlens, cu_seqlens_comp, out_shape, ratio, coff):
     """Build (or fetch) a compiled forward/backward API instance for these tensors."""
+    torch = torch_dep.require("cudnn.csa.compressor.api._get_api")
     key = (kind, int(ratio), int(coff), out_shape[1], tuple(kv.shape), out_shape[0], cu_seqlens.shape[0], kv.device.index)
     api = _api_cache.get(key)
     if api is not None:
@@ -612,6 +626,7 @@ def csa_compressor_forward_wrapper(
     Returns:
         ``{'out': (total_comp, head_dim) BF16}`` pooled output (pre-RMSNorm).
     """
+    torch = torch_dep.require("cudnn.csa.compressor.api.csa_compressor_forward_wrapper")
     head_dim = _infer_head_dim(kv, head_dim, coff)
     if total_comp is None:
         if cu_seqlens_comp.numel() < 1:
@@ -655,6 +670,7 @@ def csa_compressor_backward_wrapper(
            'grad_score': (total_tokens, coff * head_dim) BF16,
            'grad_ape': (ratio, coff * head_dim) FP32}``
     """
+    torch = torch_dep.require("cudnn.csa.compressor.api.csa_compressor_backward_wrapper")
     head_dim = _infer_head_dim(kv, head_dim, coff)
     if grad_out.ndim != 2:
         raise ValueError(f"grad_out must be 2-D (total_comp, head_dim), got {tuple(grad_out.shape)}")

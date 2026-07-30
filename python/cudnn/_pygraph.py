@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 from .graph_types import NodeType, Tensor
 from .nodes import Node, _row_major_stride
+from ._deps import torch_dep
 
 if TYPE_CHECKING:
     from .engines.base import BaseEngine
@@ -293,7 +294,7 @@ class pygraph:
             stride = list(template.stride())
         else:
             try:
-                import torch as _torch
+                _torch = torch_dep.require("cudnn.pygraph DLPack tensor introspection")
 
                 _view = _torch.from_dlpack(template)
                 dim = list(_view.shape)

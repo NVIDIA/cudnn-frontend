@@ -1,11 +1,19 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
+
+from cudnn._deps import torch_dep
+
+if TYPE_CHECKING:
+    import torch
+
 import os
 import re
 from functools import lru_cache
 
-import torch
 
 import cutlass.cute as cute
 from cutlass import Float32, Int32
@@ -27,6 +35,7 @@ def _parse_arch_str(arch_str: str) -> int:
 
 @lru_cache(maxsize=None)
 def _get_device_arch_for_device(device_index: int, arch_override: str | None):
+    torch = torch_dep.require("cudnn.block_sparse_attention.csrc.bwd.bsa_bwd_prepost._get_device_arch_for_device")
     if arch_override is not None:
         return _parse_arch_str(arch_override)
     major, minor = torch.cuda.get_device_capability(device_index)
@@ -34,6 +43,7 @@ def _get_device_arch_for_device(device_index: int, arch_override: str | None):
 
 
 def _get_device_arch():
+    torch = torch_dep.require("cudnn.block_sparse_attention.csrc.bwd.bsa_bwd_prepost._get_device_arch")
     return _get_device_arch_for_device(
         torch.cuda.current_device(),
         os.environ.get("CUDNN_BSA_ARCH", None),

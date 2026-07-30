@@ -1,8 +1,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Fused projection GEMM + per-head YARN RoPE + dual-direction MXFP8 quantize (Blackwell / SM100)."""
+from __future__ import annotations
 
-import torch
+from typing import TYPE_CHECKING, Optional
+
+from cudnn._deps import torch_dep
+
+if TYPE_CHECKING:
+    import torch
+
+
 
 import cutlass
 import cutlass.cute as cute
@@ -512,6 +520,7 @@ def gemm_proj_rope_mxfp8_host(
 # PyTorch reference (oracle) for the fused kernel above.
 # ---------------------------------------------------------------------------
 def gemm_proj_rope_mxfp8_reference(x, w, cos, sin, w_out_in=False):
+    torch = torch_dep.require("cudnn.gemm_proj_rope_mxfp8.gemm_proj_rope_mxfp8_bf16in.gemm_proj_rope_mxfp8_reference")
     E8M0_BIAS = 127
     tokens = x.shape[0]
     # Heads derived from the weight's projected dimension (matches the kernel's Constexpr).

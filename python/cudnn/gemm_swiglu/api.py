@@ -1,5 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
+
+from cudnn._deps import torch_dep
+
+if TYPE_CHECKING:
+    import torch
+
 from .dense_gemm_persistent_swiglu import (
     PersistentDenseGemmKernel,
 )
@@ -7,7 +16,6 @@ from .dense_blockscaled_gemm_persistent_swiglu_interleaved_quant import (
     Sm100BlockScaledPersistentDenseGemmKernel,
 )
 from cuda.bindings import driver as cuda
-import torch
 from typing import Tuple, Optional
 
 import cutlass
@@ -27,7 +35,7 @@ class GemmSwigluSm100(APIBase):
         sample_ab12: torch.Tensor,
         sample_c: torch.Tensor,
         alpha: float = 1.0,
-        acc_dtype: torch.dtype = torch.float32,
+        acc_dtype: Optional[torch.dtype] = None,
         mma_tiler_mn: Tuple[int, int] = (128, 128),
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         ### Quantize only arguments
@@ -40,6 +48,9 @@ class GemmSwigluSm100(APIBase):
         vector_f32: bool = False,
         ab12_stages: int = 4,
     ):
+        torch = torch_dep.require("cudnn.gemm_swiglu.api.__init__")
+        if acc_dtype is None:
+            acc_dtype = torch.float32
         super().__init__()
 
         self._warn_experimental_api()
@@ -84,6 +95,7 @@ class GemmSwigluSm100(APIBase):
         self._interpret_uint8_as_fp4x2 = True
 
     def check_support(self) -> bool:
+        torch = torch_dep.require("cudnn.gemm_swiglu.api.check_support")
         self._logger.debug("Entering check_support")
 
         self._logger.debug("Checking tensor shapes, strides, and dtypes")
@@ -541,9 +553,9 @@ def gemm_swiglu_wrapper_sm100(
     b_tensor: torch.Tensor,
     alpha: float = 1.0,
     c_major: str = "n",
-    ab12_dtype: torch.dtype = torch.float32,
-    c_dtype: torch.dtype = torch.float16,
-    acc_dtype: torch.dtype = torch.float32,
+    ab12_dtype: Optional[torch.dtype] = None,
+    c_dtype: Optional[torch.dtype] = None,
+    acc_dtype: Optional[torch.dtype] = None,
     mma_tiler_mn: Tuple[int, int] = (128, 128),
     cluster_shape_mn: Optional[Tuple[int, int]] = None,
     ### Quantize only arguments
@@ -556,6 +568,13 @@ def gemm_swiglu_wrapper_sm100(
     stream: Optional[cuda.CUstream] = None,
 ) -> TupleDict:
 
+    torch = torch_dep.require("cudnn.gemm_swiglu.api.gemm_swiglu_wrapper_sm100")
+    if ab12_dtype is None:
+        ab12_dtype = torch.float32
+    if c_dtype is None:
+        c_dtype = torch.float16
+    if acc_dtype is None:
+        acc_dtype = torch.float32
     _logger.debug("gemm_swiglu_wrapper_sm100: Creating empty output tensors ab12 and c")
     m, k, l = a_tensor.shape
     n, k, l = b_tensor.shape

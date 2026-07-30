@@ -16,13 +16,21 @@ Discrete mode
     ``num_experts``, ``b_shape``, ``b_dtype``, and per-expert pointer arrays
     at execution time.
 """
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
+
+from cudnn._deps import torch_dep
+
+if TYPE_CHECKING:
+    import torch
+
 
 from .moe_blockscaled_grouped_gemm_glu_bias import BlockScaledMoEGroupedGemmGluBiasKernel
 from ..grouped_gemm_utils import _torch_stream_context, rubin_single_group_offsets_kwarg
 from ..moe_utils import MoEWeightMode
 from cuda.bindings import driver as cuda
 import os
-import torch
 from typing import Tuple, Optional
 
 import cutlass
@@ -117,7 +125,7 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
         sample_norm_const: Optional[torch.Tensor] = None,
         sample_prob: Optional[torch.Tensor] = None,
         # Configuration
-        acc_dtype: torch.dtype = torch.float32,
+        acc_dtype: Optional[torch.dtype] = None,
         mma_tiler_mn: Tuple[int, int] = (256, 256),
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         sf_vec_size: int = 16,
@@ -150,7 +158,7 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
         :param sample_amax: Optional amax tensor for quantization
         :param sample_norm_const: Optional normalization constant
         :param sample_prob: Optional probability tensor for gating
-        :param acc_dtype: Accumulator data type
+        :param acc_dtype: Accumulator data type ``None`` means ``torch.float32``.
         :param mma_tiler_mn: MMA tiler shape (M, N)
         :param cluster_shape_mn: Cluster shape (M, N)
         :param sf_vec_size: Scale factor vector size
@@ -161,6 +169,9 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
         :param b_major: Major dimension for B tensor, one of "k" or "n"
         :param use_dynamic_sched: Enable dynamic tile scheduling for load balancing
         """
+        torch = torch_dep.require("cudnn.grouped_gemm.grouped_gemm_glu._blockscaled_api.__init__")
+        if acc_dtype is None:
+            acc_dtype = torch.float32
         super().__init__()
 
         self._warn_experimental_api()
@@ -257,6 +268,7 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
 
         :return: True if supported, raises exception otherwise
         """
+        torch = torch_dep.require("cudnn.grouped_gemm.grouped_gemm_glu._blockscaled_api.check_support")
         self._logger.debug("Entering check_support")
 
         # ---- SFD group validation ----
@@ -601,6 +613,7 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
 
     def compile(self) -> None:
         """Compile the kernel."""
+        torch = torch_dep.require("cudnn.grouped_gemm.grouped_gemm_glu._blockscaled_api.compile")
         self._logger.debug("Entering compile")
         self._ensure_support_checked()
         if self._compiled_kernel is not None:
@@ -931,6 +944,7 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
 
     def _compile_discrete(self, gemm_glu, max_active_clusters, fake_stream) -> None:
         """Compile for discrete (per-expert pointer) weight mode."""
+        torch = torch_dep.require("cudnn.grouped_gemm.grouped_gemm_glu._blockscaled_api._compile_discrete")
         if len(self.b_shape) == 2:
             n, k = self.b_shape
         else:

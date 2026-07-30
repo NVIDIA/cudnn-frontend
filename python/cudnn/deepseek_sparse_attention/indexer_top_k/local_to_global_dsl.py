@@ -9,10 +9,17 @@ global id space with one small DSL kernel:
 * BSHD: global = local + batch_idx * seqlen_k
 * THD:  global = local + cu_seqlens_k[batch_idx]
 """
-
 from __future__ import annotations
 
-import torch
+from typing import TYPE_CHECKING, Optional
+
+from cudnn._deps import torch_dep
+
+if TYPE_CHECKING:
+    import torch
+
+
+
 import cuda.bindings.driver as cuda
 
 import cutlass
@@ -126,6 +133,7 @@ def is_available() -> bool:
     # The kernel is arch-agnostic CuTe DSL: thread/block indexing, integer
     # ALU, and plain global mem load/store — no TMA / TMEM / tcgen05 / wgmma.
     # SM90+ is enough.
+    torch = torch_dep.require("cudnn.deepseek_sparse_attention.indexer_top_k.local_to_global_dsl.is_available")
     return torch.cuda.is_available() and _get_device_capability() >= 9
 
 
@@ -136,6 +144,7 @@ def local_to_global(
     cu_seqlens_k: torch.Tensor | None = None,
     stream: cuda.CUstream | None = None,
 ) -> torch.Tensor:
+    torch = torch_dep.require("cudnn.deepseek_sparse_attention.indexer_top_k.local_to_global_dsl.local_to_global")
     if not is_available():
         raise RuntimeError("CuTe DSL local_to_global requires an SM90+ CUDA device")
     if not local_indices.is_cuda or not local_indices.is_contiguous():

@@ -31,13 +31,20 @@ Workflow (host-side, called once at model init)::
     k_rot = graph.rope(k, freqs, output_scale=mscale)
     o = graph.sdpa(q=q_rot, k=k_rot, v=v, attn_scale=1.0/sqrt(d))
 """
-
 from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
+
+from cudnn._deps import torch_dep
+
+if TYPE_CHECKING:
+    import torch
+
+
 
 import math
 from typing import Tuple
 
-import torch
 
 
 def _yarn_find_correction_dim(num_rotations: float, dim: int, base: float, max_position: int) -> float:
@@ -62,6 +69,7 @@ def _yarn_find_correction_range(beta_fast: float, beta_slow: float, dim: int, ba
 
 def _yarn_linear_ramp_mask(low: int, high: int, num_dims: int, *, device, dtype) -> torch.Tensor:
     """Build a [num_dims] linear ramp clamped to [0, 1], rising from low to high."""
+    torch = torch_dep.require("cudnn.yarn._yarn_linear_ramp_mask")
     if low == high:
         high = high + 0.001  # avoid division by zero
     idx = torch.arange(num_dims, device=device, dtype=dtype)
@@ -89,7 +97,7 @@ def compute_yarn_inv_freq(
     beta_fast: float = 32.0,
     beta_slow: float = 1.0,
     device: torch.device | str = "cuda",
-    dtype: torch.dtype = torch.float32,
+    dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
     """Compute the YARN-blended inverse frequency table.
 
@@ -99,6 +107,9 @@ def compute_yarn_inv_freq(
     For ``scaling_factor <= 1`` this reduces to the standard RoPE inv_freq
     (no blending applied).
     """
+    torch = torch_dep.require("cudnn.yarn.compute_yarn_inv_freq")
+    if dtype is None:
+        dtype = torch.float32
     if head_dim % 2 != 0:
         raise ValueError(f"YARN/RoPE require even head_dim, got {head_dim}")
 
@@ -128,7 +139,7 @@ def compute_yarn_freqs(
     mscale_factor: float = 1.0,
     mscale_all_dim_factor: float = 0.0,
     device: torch.device | str = "cuda",
-    dtype: torch.dtype = torch.float32,
+    dtype: Optional[torch.dtype] = None,
 ) -> Tuple[torch.Tensor, float]:
     """Compute the YARN ``freqs`` tensor and corresponding ``mscale``.
 
@@ -150,6 +161,9 @@ def compute_yarn_freqs(
     With both factors equal (DSv3 default 1.0/1.0), this collapses to 1.0.
     With ``mscale_all_dim_factor=0`` (default here), only the numerator applies.
     """
+    torch = torch_dep.require("cudnn.yarn.compute_yarn_freqs")
+    if dtype is None:
+        dtype = torch.float32
     inv_freq = compute_yarn_inv_freq(
         head_dim,
         base=base,

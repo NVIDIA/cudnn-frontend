@@ -7,13 +7,21 @@ This module provides a single API class that supports both dense (contiguous)
 and discrete weight modes for grouped block-scaled GEMM with output
 quantization in MoE (Mixture of Experts) workloads.
 """
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
+
+from cudnn._deps import torch_dep
+
+if TYPE_CHECKING:
+    import torch
+
 
 import os
 from typing import Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
-import torch
 from cuda.bindings import driver as cuda
 from cutlass.cute.runtime import make_fake_stream
 
@@ -75,7 +83,7 @@ class GroupedGemmQuantSm100(APIBase):
         sample_prob: Optional[torch.Tensor] = None,
         sample_row_scale: Optional[torch.Tensor] = None,
         # Configuration
-        acc_dtype: torch.dtype = torch.float32,
+        acc_dtype: Optional[torch.dtype] = None,
         mma_tiler_mn: Tuple[int, int] = (256, 256),
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         sf_vec_size: int = 16,
@@ -109,7 +117,7 @@ class GroupedGemmQuantSm100(APIBase):
         :param sample_row_scale: Optional 1-D FP32 row-scale tensor. When
             provided, the epilogue scales GEMM accumulators by
             ``alpha[expert] * row_scale[m]`` before output conversion.
-        :param acc_dtype: Accumulator data type
+        :param acc_dtype: Accumulator data type ``None`` means ``torch.float32``.
         :param mma_tiler_mn: MMA tiler shape (M, N)
         :param cluster_shape_mn: Cluster shape (M, N)
         :param sf_vec_size: Scale factor vector size
@@ -119,6 +127,9 @@ class GroupedGemmQuantSm100(APIBase):
         :param b_major: Major dimension for B tensor, one of "k" or "n"
         :param use_dynamic_sched: Enable dynamic tile scheduling for load balancing
         """
+        torch = torch_dep.require("cudnn.grouped_gemm.grouped_gemm_quant.api.__init__")
+        if acc_dtype is None:
+            acc_dtype = torch.float32
         super().__init__()
 
         self._warn_experimental_api()
@@ -219,6 +230,7 @@ class GroupedGemmQuantSm100(APIBase):
 
         :return: True if supported, raises exception otherwise
         """
+        torch = torch_dep.require("cudnn.grouped_gemm.grouped_gemm_quant.api.check_support")
         self._logger.debug("Entering check_support")
 
         all_none = all(x is None for x in [self.sfd_row_desc, self.sfd_col_desc, self.norm_const_desc])
@@ -545,6 +557,7 @@ class GroupedGemmQuantSm100(APIBase):
 
     def compile(self) -> None:
         """Compile the kernel."""
+        torch = torch_dep.require("cudnn.grouped_gemm.grouped_gemm_quant.api.compile")
         self._logger.debug("Entering compile")
         self._ensure_support_checked()
         if self._compiled_kernel is not None:
@@ -883,6 +896,7 @@ class GroupedGemmQuantSm100(APIBase):
 
     def _compile_discrete(self, gemm_quant, max_active_clusters, fake_stream) -> None:
         """Compile for discrete (per-expert pointer) weight mode."""
+        torch = torch_dep.require("cudnn.grouped_gemm.grouped_gemm_quant.api._compile_discrete")
         if len(self.b_shape) == 2:
             n, k = self.b_shape
         else:
@@ -1232,8 +1246,8 @@ def grouped_gemm_quant_wrapper_sm100(
     norm_const_tensor: Optional[torch.Tensor] = None,
     prob_tensor: Optional[torch.Tensor] = None,
     row_scale_tensor: Optional[torch.Tensor] = None,
-    acc_dtype: torch.dtype = torch.float32,
-    d_dtype: torch.dtype = torch.bfloat16,
+    acc_dtype: Optional[torch.dtype] = None,
+    d_dtype: Optional[torch.dtype] = None,
     d_tensor: Optional[torch.Tensor] = None,
     cd_major: str = "n",
     mma_tiler_mn: Tuple[int, int] = (256, 256),
@@ -1309,6 +1323,11 @@ def grouped_gemm_quant_wrapper_sm100(
                 # Integer indexing
                 d = result[0]  # d_tensor
     """
+    torch = torch_dep.require("cudnn.grouped_gemm.grouped_gemm_quant.api.grouped_gemm_quant_wrapper_sm100")
+    if acc_dtype is None:
+        acc_dtype = torch.float32
+    if d_dtype is None:
+        d_dtype = torch.bfloat16
     from cudnn.discrete_grouped_gemm.discrete_kernel_utils import _require_pointer_tensor
 
     is_dense = b_tensor is not None

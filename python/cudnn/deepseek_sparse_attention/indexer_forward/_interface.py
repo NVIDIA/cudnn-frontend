@@ -7,12 +7,19 @@ Indexer Forward Interface — CuTe DSL backend.
 Wraps IndexerForwardSm100 (DSL kernel) with compile caching, TMA padding,
 and torch.Tensor ↔ cute.Tensor conversion.
 """
-
 from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
+
+from cudnn._deps import torch_dep
+
+if TYPE_CHECKING:
+    import torch
+
+
 
 from typing import Optional
 
-import torch
 
 import cutlass
 import cutlass.cute as cute
@@ -78,6 +85,7 @@ def indexer_fwd(
         S_sum: BSHD ``(bs, seqlen_q, seqlen_k)`` or THD
                ``(total_q, max_seqlen_k)`` [FP32]
     """
+    torch = torch_dep.require("cudnn.deepseek_sparse_attention.indexer_forward._interface.indexer_fwd")
     current_stream = resolve_stream(current_stream)
     q, k, w = [_maybe_contiguous(t, current_stream) for t in (q, k, w)]
     for tensor, name in ((q, "q"), (k, "k"), (w, "w")):

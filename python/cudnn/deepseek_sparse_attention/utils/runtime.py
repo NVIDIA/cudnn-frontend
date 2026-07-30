@@ -2,17 +2,26 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """Runtime helpers shared by DSA Python wrappers."""
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
+
+from cudnn._deps import torch_dep
+
+if TYPE_CHECKING:
+    import torch
+
 
 from contextlib import contextmanager
 from functools import lru_cache
 from typing import Iterator, Optional
 
-import torch
 import cuda.bindings.driver as cuda
 
 
 @lru_cache(maxsize=None)
 def device_major() -> int:
+    torch = torch_dep.require("cudnn.deepseek_sparse_attention.utils.runtime.device_major")
     return torch.cuda.get_device_capability()[0]
 
 
@@ -32,6 +41,7 @@ def validate_q_causal_offsets(
     device: torch.device,
     stream: Optional[cuda.CUstream] = None,
 ) -> torch.Tensor | None:
+    torch = torch_dep.require("cudnn.deepseek_sparse_attention.utils.runtime.validate_q_causal_offsets")
     if q_causal_offsets is None:
         return None
     if q_causal_offsets.dtype != torch.int32:
@@ -49,6 +59,7 @@ def validate_q_causal_offsets(
 
 
 def resolve_stream(current_stream: Optional[cuda.CUstream] = None) -> cuda.CUstream:
+    torch = torch_dep.require("cudnn.deepseek_sparse_attention.utils.runtime.resolve_stream")
     if current_stream is not None:
         return current_stream
     return cuda.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -56,6 +67,7 @@ def resolve_stream(current_stream: Optional[cuda.CUstream] = None) -> cuda.CUstr
 
 @contextmanager
 def torch_stream_context(current_stream: Optional[cuda.CUstream] = None) -> Iterator[None]:
+    torch = torch_dep.require("cudnn.deepseek_sparse_attention.utils.runtime.torch_stream_context")
     if current_stream is None:
         yield
         return

@@ -2,13 +2,20 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """Neutral public API for SM100 unfused BF16 grouped GEMM."""
-
 from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
+
+from cudnn._deps import torch_dep
+
+if TYPE_CHECKING:
+    import torch
+
+
 
 import os
 from typing import Optional, Tuple
 
-import torch
 from cuda.bindings import driver as cuda
 
 from cudnn.api_base import APIBase, TupleDict
@@ -37,7 +44,7 @@ class GroupedGemmSm100(APIBase):
         num_experts: Optional[int] = None,
         b_shape: Optional[Tuple[int, ...]] = None,
         b_dtype: Optional[torch.dtype] = None,
-        acc_dtype: torch.dtype = torch.float32,
+        acc_dtype: Optional[torch.dtype] = None,
         mma_tiler_mn: Tuple[int, int] = (256, 256),
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         vector_f32: bool = False,
@@ -46,6 +53,9 @@ class GroupedGemmSm100(APIBase):
         b_major: str = "k",
         use_dynamic_sched: bool = False,
     ) -> None:
+        torch = torch_dep.require("cudnn.grouped_gemm.grouped_gemm_unfused.api.__init__")
+        if acc_dtype is None:
+            acc_dtype = torch.float32
         super().__init__()
         self._pending_init_kwargs = dict(locals())
         self._pending_init_kwargs.pop("self")
@@ -157,6 +167,7 @@ def _normalize_call(
     cd_major: str,
     m_aligned: int,
 ) -> tuple[bool, int, int, int]:
+    torch = torch_dep.require("cudnn.grouped_gemm.grouped_gemm_unfused.api._normalize_call")
     is_dense = b_tensor is not None
     is_discrete = b_ptrs is not None
     if is_dense and is_discrete:
@@ -234,9 +245,9 @@ def grouped_gemm_wrapper_sm100(
     b_dtype: Optional[torch.dtype] = None,
     b_major: str = "k",
     prob_tensor: Optional[torch.Tensor] = None,
-    acc_dtype: torch.dtype = torch.float32,
-    c_dtype: torch.dtype = torch.bfloat16,
-    d_dtype: torch.dtype = torch.bfloat16,
+    acc_dtype: Optional[torch.dtype] = None,
+    c_dtype: Optional[torch.dtype] = None,
+    d_dtype: Optional[torch.dtype] = None,
     c_tensor: Optional[torch.Tensor] = None,
     d_tensor: Optional[torch.Tensor] = None,
     cd_major: str = "n",
@@ -248,6 +259,13 @@ def grouped_gemm_wrapper_sm100(
     use_dynamic_sched: bool = False,
     current_stream: Optional[cuda.CUstream] = None,
 ) -> TupleDict:
+    torch = torch_dep.require("cudnn.grouped_gemm.grouped_gemm_unfused.api.grouped_gemm_wrapper_sm100")
+    if acc_dtype is None:
+        acc_dtype = torch.float32
+    if c_dtype is None:
+        c_dtype = torch.bfloat16
+    if d_dtype is None:
+        d_dtype = torch.bfloat16
     is_dense, tensor_m, n_out, expert_cnt = _normalize_call(
         a_tensor,
         padded_offsets,

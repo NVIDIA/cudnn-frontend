@@ -78,12 +78,19 @@ tokens at ratio=128).
 This file intentionally does not touch the ratio=4 path; launch machinery mirrors
 ``compressor_sm100.py`` and reuses its cached fast-launcher infrastructure.
 """
-
 from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
+
+from cudnn._deps import torch_dep
+
+if TYPE_CHECKING:
+    import torch
+
+
 
 import threading
 
-import torch
 import cuda.bindings.driver as cuda_driver
 
 import cutlass
@@ -521,6 +528,7 @@ def _fwd_schedule_r128(ratio, d, coff, nb_total=None):
 
 def _compile_fwd_r128(key, args, ratio, d, coff, schedule):
     """JIT-compile the forward launch entry for ``key`` (capture-guarded)."""
+    torch = torch_dep.require("cudnn.csa.compressor.compressor_sm100_r128._compile_fwd_r128")
     with _COMPILE_LOCK:
         fn = _COMPILED.get(key)
         if fn is None:
@@ -542,6 +550,7 @@ def precompile_fwd_r128(ratio, d, coff, device, nb_total=None):
     without it, compiles every bucket this config can select at runtime (small /
     default / large), so a subsequent CUDA-graph capture cannot hit a cold bucket.
     """
+    torch = torch_dep.require("cudnn.csa.compressor.compressor_sm100_r128.precompile_fwd_r128")
     if nb_total is not None:
         candidates = [nb_total]
     else:
@@ -578,6 +587,7 @@ def run_fwd_r128(kv, score, ape, cu_i, cuc_i, out, nb_total, ratio, d, coff, str
     ``nb_total == 0`` launches nothing. The launch schedule is bucketed by ``nb_total``
     (see ``_fwd_schedule_r128``); each bucket JIT-compiles once per config.
     """
+    torch = torch_dep.require("cudnn.csa.compressor.compressor_sm100_r128.run_fwd_r128")
     if nb_total == 0:
         return
     dev = kv.device.index
@@ -1051,6 +1061,7 @@ _SM_COUNT_CACHE = {}
 
 def _sm_count(dev):
     """SM count for device index ``dev`` (cached; used by the rows_per_cta pick)."""
+    torch = torch_dep.require("cudnn.csa.compressor.compressor_sm100_r128._sm_count")
     n = _SM_COUNT_CACHE.get(dev)
     if n is None:
         n = torch.cuda.get_device_properties(dev).multi_processor_count
@@ -1124,6 +1135,7 @@ def _bwd_rows_per_cta(nb_total, ratio, d, coff, dev):
 
 def _compile_bwd_r128(key, args, ratio, d, coff, schedule):
     """JIT-compile the backward launch entry for ``key`` (capture-guarded)."""
+    torch = torch_dep.require("cudnn.csa.compressor.compressor_sm100_r128._compile_bwd_r128")
     with _COMPILE_LOCK:
         fn = _COMPILED.get(key)
         if fn is None:
@@ -1145,6 +1157,7 @@ def precompile_bwd_r128(ratio, d, coff, device, nb_total=None):
     without it, compiles every bucket this config can select at runtime (small /
     default), so a subsequent CUDA-graph capture cannot hit a cold bucket.
     """
+    torch = torch_dep.require("cudnn.csa.compressor.compressor_sm100_r128.precompile_bwd_r128")
     if nb_total is not None:
         candidates = [nb_total]
     else:
@@ -1187,6 +1200,7 @@ def run_bwd_r128(kv, score, ape, cu_i, cuc_i, go, gkv, gs, gape, nb_total, ratio
     (fp32 atomics), launch anchored in ``kv``'s device. ``nb_total == 0`` launches
     nothing.
     """
+    torch = torch_dep.require("cudnn.csa.compressor.compressor_sm100_r128.run_bwd_r128")
     if nb_total == 0:
         return
     dev = kv.device.index

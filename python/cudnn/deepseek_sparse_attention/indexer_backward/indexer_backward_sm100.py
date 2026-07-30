@@ -49,12 +49,19 @@ Barriers for kernel 2:
 Each warp/warpgroup has its own independent loop, communicating via barriers.
 No CLC persistent scheduling (simple grid = batch × seqlen).
 """
-
 from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
+
+from cudnn._deps import torch_dep
+
+if TYPE_CHECKING:
+    import torch
+
+
 
 import math
 from functools import partial
-import torch
 import cuda.bindings.driver as cuda
 
 import cutlass
@@ -1588,6 +1595,7 @@ def _score_grad_inplace(AttnScore, IndexScore, GradLoss, grad_scale, block_I=128
     #   target = clip(log_target)
     # dL/dlog_predict = -exp(target) * I(log_predict >= -100)
     # dL/dlogits = g - predict * sum(g)
+    torch = torch_dep.require("cudnn.deepseek_sparse_attention.indexer_backward.indexer_backward_sm100._score_grad_inplace")
     can_use_cute = (
         AttnScore.is_cuda
         and IndexScore.is_cuda
@@ -1604,6 +1612,7 @@ def _score_grad_inplace(AttnScore, IndexScore, GradLoss, grad_scale, block_I=128
 
 
 def _build_cute_dsl_kernel(heads, dim, topk, sm_scale, block_I, topk_indices_global: bool = True):
+    torch = torch_dep.require("cudnn.deepseek_sparse_attention.indexer_backward.indexer_backward_sm100._build_cute_dsl_kernel")
     from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
 
     if torch.cuda.get_device_capability()[0] < 10:

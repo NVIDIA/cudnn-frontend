@@ -2,13 +2,20 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """Unified FE API for grouped GEMM wgrad on SM100+."""
-
 from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
+
+from cudnn._deps import torch_dep
+
+if TYPE_CHECKING:
+    import torch
+
+
 
 from typing import Any, Optional, Tuple, overload
 import os
 
-import torch
 from cuda.bindings import driver as cuda
 
 from cudnn.api_base import APIBase, TupleDict
@@ -22,15 +29,18 @@ from ..grouped_gemm_utils import (
 )
 from ..moe_utils import WGradInputOrder
 
-_BLOCK_SCALED_DTYPE_PAIRS = {
-    (dtype, dtype)
-    for dtype in (
-        torch.float4_e2m1fn_x2,
-        torch.uint8,
-        torch.float8_e5m2,
-        torch.float8_e4m3fn,
-    )
-}
+def _get_block_scaled_dtype_pairs():
+    """Lazily resolve _get_block_scaled_dtype_pairs(); PyTorch types are only touched on demand."""
+    torch = torch_dep.require("cudnn.grouped_gemm.grouped_gemm_wgrad.api")
+    return {
+        (dtype, dtype)
+        for dtype in (
+            torch.float4_e2m1fn_x2,
+            torch.uint8,
+            torch.float8_e5m2,
+            torch.float8_e4m3fn,
+        )
+    }
 
 _cache_of_GroupedGemmWgradSm100Objects = {}
 
@@ -82,13 +92,16 @@ class GroupedGemmWgradSm100(APIBase):
         wgrad_dtype: Optional[torch.dtype] = None,
         sample_global_scale_a: Optional[torch.Tensor] = None,
         sample_global_scale_b: Optional[torch.Tensor] = None,
-        acc_dtype: torch.dtype = torch.float32,
+        acc_dtype: Optional[torch.dtype] = None,
         mma_tiler_mn: Tuple[int, int] = (256, 256),
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         sf_vec_size: int = 16,
         accumulate_on_output: bool = False,
         input_order: WGradInputOrder | str = WGradInputOrder.Tensor2D,
     ) -> None:
+        torch = torch_dep.require("cudnn.grouped_gemm.grouped_gemm_wgrad.api.__init__")
+        if acc_dtype is None:
+            acc_dtype = torch.float32
         super().__init__()
         self._pending_init_kwargs = dict(locals())
         self._pending_init_kwargs.pop("self")
@@ -109,7 +122,7 @@ class GroupedGemmWgradSm100(APIBase):
                     ("sample_global_scale_b", kwargs["sample_global_scale_b"]),
                     ("sf_vec_size", kwargs["sf_vec_size"] if kwargs["sf_vec_size"] != 16 else None),
                 ),
-                block_scaled_dtype_pairs=_BLOCK_SCALED_DTYPE_PAIRS,
+                block_scaled_dtype_pairs=_get_block_scaled_dtype_pairs(),
             )
             self.backend = backend
             if backend is GroupedGemmBackend.BF16:
@@ -214,8 +227,8 @@ def grouped_gemm_wgrad_wrapper_sm100(
     wgrad_ptrs: Optional[torch.Tensor] = None,
     global_scale_a: Optional[torch.Tensor] = None,
     global_scale_b: Optional[torch.Tensor] = None,
-    acc_dtype: torch.dtype = torch.float32,
-    wgrad_dtype: torch.dtype = torch.bfloat16,
+    acc_dtype: Optional[torch.dtype] = None,
+    wgrad_dtype: Optional[torch.dtype] = None,
     mma_tiler_mn: Tuple[int, int] = (256, 256),
     cluster_shape_mn: Optional[Tuple[int, int]] = None,
     sf_vec_size: int = 16,
@@ -224,6 +237,11 @@ def grouped_gemm_wgrad_wrapper_sm100(
     current_stream: Optional[cuda.CUstream] = None,
 ) -> TupleDict:
     """Compile and execute grouped GEMM wgrad through the selected backend API."""
+    torch = torch_dep.require("cudnn.grouped_gemm.grouped_gemm_wgrad.api.grouped_gemm_wgrad_wrapper_sm100")
+    if acc_dtype is None:
+        acc_dtype = torch.float32
+    if wgrad_dtype is None:
+        wgrad_dtype = torch.bfloat16
     if output_mode not in ("dense", "discrete"):
         raise ValueError(f'output_mode must be "dense" or "discrete", got {output_mode}')
     if a_tensor.ndim != 2 or b_tensor.ndim != 2:
@@ -251,7 +269,7 @@ def grouped_gemm_wgrad_wrapper_sm100(
             ("global_scale_b", global_scale_b),
             ("sf_vec_size", sf_vec_size if sf_vec_size != 16 else None),
         ),
-        block_scaled_dtype_pairs=_BLOCK_SCALED_DTYPE_PAIRS,
+        block_scaled_dtype_pairs=_get_block_scaled_dtype_pairs(),
     )
     if wgrad_tensor is None and wgrad_ptrs is None:
         allocator = torch.zeros if accumulate_on_output else torch.empty

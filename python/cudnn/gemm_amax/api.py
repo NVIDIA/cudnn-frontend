@@ -1,13 +1,21 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
+
+from cudnn._deps import torch_dep
+
+if TYPE_CHECKING:
+    import torch
+
 from .dense_blockscaled_gemm_persistent_amax import (
     Sm100BlockScaledPersistentDenseGemmKernel,
 )
 
 from cuda.bindings import driver as cuda
 import os
-import torch
 from typing import Tuple, Optional
 
 import cutlass
@@ -27,11 +35,14 @@ class GemmAmaxSm100(APIBase):
         sample_sfb: torch.Tensor,
         sample_c: torch.Tensor,
         sample_amax: torch.Tensor,
-        acc_dtype: torch.dtype = torch.float32,
+        acc_dtype: Optional[torch.dtype] = None,
         mma_tiler_mn: Tuple[int, int] = (128, 128),
         cluster_shape_mn: Tuple[int, int] = (1, 1),
         sf_vec_size: int = 32,
     ):
+        torch = torch_dep.require("cudnn.gemm_amax.api.__init__")
+        if acc_dtype is None:
+            acc_dtype = torch.float32
         super().__init__()
 
         self._warn_experimental_api()
@@ -62,6 +73,7 @@ class GemmAmaxSm100(APIBase):
         )
 
     def check_support(self) -> bool:
+        torch = torch_dep.require("cudnn.gemm_amax.api.check_support")
         self._logger.debug("Entering check_support")
 
         self._logger.debug("Checking dtypes and sf_vec_size")
@@ -381,14 +393,19 @@ def gemm_amax_wrapper_sm100(
     sfa_tensor: torch.Tensor,
     sfb_tensor: torch.Tensor,
     c_major: str = "n",
-    c_dtype: torch.dtype = torch.float32,
-    acc_dtype: torch.dtype = torch.float32,
+    c_dtype: Optional[torch.dtype] = None,
+    acc_dtype: Optional[torch.dtype] = None,
     mma_tiler_mn: Tuple[int, int] = (128, 128),
     cluster_shape_mn: Tuple[int, int] = (1, 1),
     sf_vec_size: int = 32,
     stream: Optional[cuda.CUstream] = None,
 ) -> TupleDict:
 
+    torch = torch_dep.require("cudnn.gemm_amax.api.gemm_amax_wrapper_sm100")
+    if c_dtype is None:
+        c_dtype = torch.float32
+    if acc_dtype is None:
+        acc_dtype = torch.float32
     _logger.debug("gemm_amax_wrapper_sm100: Creating empty output tensors c and amax")
 
     m, _, l = a_tensor.shape

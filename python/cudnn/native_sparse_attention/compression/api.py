@@ -1,11 +1,19 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
+
+from cudnn._deps import torch_dep
+
+if TYPE_CHECKING:
+    import torch
+
 from typing import Tuple, Optional
 import math
 
 from cuda.bindings import driver as cuda
-import torch
 
 import cutlass
 import cutlass.cute as cute
@@ -30,8 +38,8 @@ class CompressionAttention(APIBase):
         sample_lse: Optional[torch.Tensor] = None,
         sample_cum_seqlen_q: Optional[torch.Tensor] = None,
         sample_cum_seqlen_k: Optional[torch.Tensor] = None,
-        qk_acc_dtype: torch.dtype = torch.float32,
-        pv_acc_dtype: torch.dtype = torch.float32,
+        qk_acc_dtype: Optional[torch.dtype] = None,
+        pv_acc_dtype: Optional[torch.dtype] = None,
         mma_tiler_mn: Tuple[int, int] = (128, 128),
         is_persistent: bool = False,
         scale_q: float = 1.0,
@@ -40,6 +48,11 @@ class CompressionAttention(APIBase):
         inv_scale_o: float = 1.0,
         scale_softmax: Optional[float] = None,
     ):
+        torch = torch_dep.require("cudnn.native_sparse_attention.compression.api.__init__")
+        if qk_acc_dtype is None:
+            qk_acc_dtype = torch.float32
+        if pv_acc_dtype is None:
+            pv_acc_dtype = torch.float32
         super().__init__()
         self._kernel = BlackwellFusedMultiHeadAttentionForward
 
@@ -86,6 +99,7 @@ class CompressionAttention(APIBase):
         )
 
     def check_support(self) -> bool:
+        torch = torch_dep.require("cudnn.native_sparse_attention.compression.api.check_support")
         self._logger.debug("Entering check_support")
 
         # shape normalization and validation
@@ -391,8 +405,8 @@ def compression_attention_wrapper(
     cum_seqlen_k_tensor: Optional[torch.Tensor] = None,
     enable_lse: bool = False,
     o_dtype: Optional[torch.dtype] = None,
-    qk_acc_dtype: torch.dtype = torch.float32,
-    pv_acc_dtype: torch.dtype = torch.float32,
+    qk_acc_dtype: Optional[torch.dtype] = None,
+    pv_acc_dtype: Optional[torch.dtype] = None,
     mma_tiler_mn: Tuple[int, int] = (128, 128),
     is_persistent: bool = False,
     scale_q: float = 1.0,
@@ -408,6 +422,11 @@ def compression_attention_wrapper(
     Returns:
         TupleDict: (o_tensor, lse_tensor | None)
     """
+    torch = torch_dep.require("cudnn.native_sparse_attention.compression.api.compression_attention_wrapper")
+    if qk_acc_dtype is None:
+        qk_acc_dtype = torch.float32
+    if pv_acc_dtype is None:
+        pv_acc_dtype = torch.float32
     _logger.debug("compression_attention_wrapper: Creating empty output tensor o and optional lse")
 
     o_tensor, lse_tensor = None, None

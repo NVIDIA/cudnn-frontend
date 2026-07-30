@@ -1,13 +1,21 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
+
+from cudnn._deps import torch_dep
+
+if TYPE_CHECKING:
+    import torch
+
 from typing import Optional, Tuple
 import logging
 import math
 
 from cuda.bindings import driver as cuda
 import cutlass
-import torch
 
 import cutlass.cute as cute
 from cutlass.cute.runtime import make_fake_stream
@@ -33,14 +41,19 @@ class SdpafwdSm100D256(APIBase):
         sample_cum_seqlen_k: Optional[torch.Tensor] = None,
         max_s_q: Optional[int] = None,
         max_s_k: Optional[int] = None,
-        qk_acc_dtype: torch.dtype = torch.float32,
-        pv_acc_dtype: torch.dtype = torch.float32,
+        qk_acc_dtype: Optional[torch.dtype] = None,
+        pv_acc_dtype: Optional[torch.dtype] = None,
         mma_tiler_mn: Tuple[int, int] = (128, 128),
         is_causal: bool = False,
         window_size: Tuple[int, int] = (-1, -1),
         scale_softmax: Optional[float] = None,
         scale_output: float = 1.0,
     ):
+        torch = torch_dep.require("cudnn.sdpa.fwd.api.__init__")
+        if qk_acc_dtype is None:
+            qk_acc_dtype = torch.float32
+        if pv_acc_dtype is None:
+            pv_acc_dtype = torch.float32
         super().__init__()
         self._kernel = BlackwellFusedMultiHeadAttentionForward
 
@@ -93,6 +106,7 @@ class SdpafwdSm100D256(APIBase):
         self._logger.debug("__init__ completed")
 
     def check_support(self) -> bool:
+        torch = torch_dep.require("cudnn.sdpa.fwd.api.check_support")
         self._logger.debug("Entering check_support")
 
         if self.cum_seqlen_q_desc is None and self.cum_seqlen_k_desc is None:
@@ -376,6 +390,7 @@ def _allocate_lse_tensor(
     q_tensor: torch.Tensor,
     cum_seqlen_q_tensor: Optional[torch.Tensor],
 ) -> torch.Tensor:
+    torch = torch_dep.require("cudnn.sdpa.fwd.api._allocate_lse_tensor")
     if cum_seqlen_q_tensor is None:
         if q_tensor.ndim != 4:
             raise ValueError(f"Expected BHSD q_tensor to be rank-4, got {q_tensor.ndim}")
@@ -396,8 +411,8 @@ def sdpa_fwd_wrapper_sm100_d256(
     cum_seqlen_k_tensor: Optional[torch.Tensor] = None,
     max_s_q: Optional[int] = None,
     max_s_k: Optional[int] = None,
-    qk_acc_dtype: torch.dtype = torch.float32,
-    pv_acc_dtype: torch.dtype = torch.float32,
+    qk_acc_dtype: Optional[torch.dtype] = None,
+    pv_acc_dtype: Optional[torch.dtype] = None,
     mma_tiler_mn: Tuple[int, int] = (128, 128),
     is_causal: bool = False,
     window_size: Tuple[int, int] = (-1, -1),
@@ -407,6 +422,11 @@ def sdpa_fwd_wrapper_sm100_d256(
 ) -> TupleDict:
     """Convenience wrapper for the d=256 SDPA forward SM100 kernel."""
 
+    torch = torch_dep.require("cudnn.sdpa.fwd.api.sdpa_fwd_wrapper_sm100_d256")
+    if qk_acc_dtype is None:
+        qk_acc_dtype = torch.float32
+    if pv_acc_dtype is None:
+        pv_acc_dtype = torch.float32
     o_tensor = torch.empty_like(q_tensor)
     lse_tensor = _allocate_lse_tensor(q_tensor, cum_seqlen_q_tensor)
 

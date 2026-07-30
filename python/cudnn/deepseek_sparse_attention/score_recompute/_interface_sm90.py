@@ -20,12 +20,19 @@ longer exposes the legacy 1-WG/2-WG dense variants.
 The legacy ``indexer_scores_bwd`` compatibility shim was removed; callers
 should use the explicit sparse/dense score entry points below.
 """
-
 from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
+
+from cudnn._deps import torch_dep
+
+if TYPE_CHECKING:
+    import torch
+
+
 
 from typing import Optional
 
-import torch
 import cuda.bindings.driver as cuda
 
 import cutlass
@@ -49,11 +56,14 @@ from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
 _DENSE_NUM_THREADS = 384
 
 
-torch2cute_dtype_map = {
-    torch.float16: cutlass.Float16,
-    torch.bfloat16: cutlass.BFloat16,
-    torch.float32: cutlass.Float32,
-}
+def _get_torch2cute_dtype_map():
+    """Lazily resolve _get_torch2cute_dtype_map(); PyTorch types are only touched on demand."""
+    torch = torch_dep.require("cudnn.deepseek_sparse_attention.score_recompute._interface_sm90")
+    return {
+        torch.float16: cutlass.Float16,
+        torch.bfloat16: cutlass.BFloat16,
+        torch.float32: cutlass.Float32,
+    }
 
 
 # =============================================================================
@@ -86,6 +96,7 @@ def _validate_and_prepare_common(
 
     Returns (q, kv, weights_or_lse) after maybe_contiguous.
     """
+    torch = torch_dep.require("cudnn.deepseek_sparse_attention.score_recompute._interface_sm90._validate_and_prepare_common")
     assert q.dtype in [torch.float16, torch.bfloat16], f"q dtype must be half precision, got {q.dtype}"
     assert q.dtype == kv.dtype, f"q/kv dtype mismatch: q={q.dtype}, kv={kv.dtype}"
     if is_index_scores:
@@ -118,6 +129,7 @@ def _sparse_score_recompute(
     """Compile + launch sparse score kernel. Internal helper used by the four
     public entry points; they own the ``(k, weights_or_lse)`` layout conversion
     so the kernel sees the legacy SM90 layout (kv 4D + weights (B,H,S))."""
+    torch = torch_dep.require("cudnn.deepseek_sparse_attention.score_recompute._interface_sm90._sparse_score_recompute")
     compute_capability = _get_device_capability()
     assert compute_capability == 9, f"SM90 kernel on compute capability {compute_capability}"
 
@@ -150,7 +162,7 @@ def _sparse_score_recompute(
             with _torch_stream_context(current_stream):
                 out = out.contiguous()
 
-    dtype = torch2cute_dtype_map[q.dtype]
+    dtype = _get_torch2cute_dtype_map()[q.dtype]
     # Sparse path: num_threads fixed at 256 (1 producer WG + 1 consumer WG).
     num_threads = 256
 
@@ -324,6 +336,7 @@ def _dense_score_recompute(
     current_stream: Optional[cuda.CUstream] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compile + launch the dense 3-WG score kernel."""
+    torch = torch_dep.require("cudnn.deepseek_sparse_attention.score_recompute._interface_sm90._dense_score_recompute")
     compute_capability = _get_device_capability()
     assert compute_capability == 9, f"SM90 kernel on compute capability {compute_capability}"
     assert ratio >= 1, f"ratio must be >= 1, got {ratio}"
@@ -355,7 +368,7 @@ def _dense_score_recompute(
             with _torch_stream_context(current_stream):
                 denom_out = denom_out.contiguous()
 
-    dtype = torch2cute_dtype_map[q.dtype]
+    dtype = _get_torch2cute_dtype_map()[q.dtype]
     # Dense path never consumes topk_idxs / topk_length; pass topk_max = seqlen_k
     # so the kernel iterates the full KV sequence like the legacy fused path did.
     topk_max = seqlen_k
@@ -463,6 +476,7 @@ def _dense_score_recompute_varlen(
     launching the existing BSHD kernel, then copying results back into the
     packed ``(total_q, max_seqlen_k)`` output layout.
     """
+    torch = torch_dep.require("cudnn.deepseek_sparse_attention.score_recompute._interface_sm90._dense_score_recompute_varlen")
     compute_capability = _get_device_capability()
     assert compute_capability == 9, f"SM90 kernel on compute capability {compute_capability}"
     assert ratio >= 1, f"ratio must be >= 1, got {ratio}"
@@ -670,5 +684,5 @@ __all__ = [
     "dense_attn_score_recompute",
     "to_cute_tensor",
     "maybe_contiguous",
-    "torch2cute_dtype_map",
+    "_get_torch2cute_dtype_map",
 ]

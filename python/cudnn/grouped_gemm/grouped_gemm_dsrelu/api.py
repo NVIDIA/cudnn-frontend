@@ -16,6 +16,15 @@ Discrete mode
     ``num_experts``, ``b_shape``, ``b_dtype``, and per-expert pointer arrays
     at execution time.
 """
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
+
+from cudnn._deps import torch_dep
+
+if TYPE_CHECKING:
+    import torch
+
 
 from .moe_blockscaled_grouped_gemm_dsrelu_quant import (
     BlockScaledMoEGroupedGemmQuantBwdKernel,
@@ -25,7 +34,6 @@ from ..moe_utils import MoEWeightMode
 from cuda.bindings import driver as cuda
 import logging
 import os
-import torch
 from typing import Tuple, Optional
 
 import cutlass
@@ -38,6 +46,7 @@ from cudnn.api_base import APIBase, TupleDict, ceil_div, is_power_of_2
 
 
 def _reinterpret_raw_grouped_fp4_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    torch = torch_dep.require("cudnn.grouped_gemm.grouped_gemm_dsrelu.api._reinterpret_raw_grouped_fp4_tensor")
     if tensor.dtype == torch.uint8:
         cute_tensor = from_dlpack(tensor, assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=1)
         cute_tensor.element_type = cutlass.Float4E2M1FN
@@ -112,7 +121,7 @@ class GroupedGemmDsreluSm100(APIBase):
         sample_amax: Optional[torch.Tensor] = None,
         sample_norm_const: Optional[torch.Tensor] = None,
         # Configuration
-        acc_dtype: torch.dtype = torch.float32,
+        acc_dtype: Optional[torch.dtype] = None,
         mma_tiler_mn: Tuple[int, int] = (256, 256),
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         sf_vec_size: int = 16,
@@ -144,7 +153,7 @@ class GroupedGemmDsreluSm100(APIBase):
         :param sample_sfd_col: Optional column scale factor for D
         :param sample_amax: Optional amax tensor for quantization, shape (expert_cnt, 1)
         :param sample_norm_const: Optional normalization constant
-        :param acc_dtype: Accumulator data type
+        :param acc_dtype: Accumulator data type ``None`` means ``torch.float32``.
         :param mma_tiler_mn: MMA tiler shape (M, N)
         :param cluster_shape_mn: Cluster shape (M, N)
         :param sf_vec_size: Scale factor vector size
@@ -155,6 +164,9 @@ class GroupedGemmDsreluSm100(APIBase):
         :param use_dynamic_sched: Enable dynamic tile scheduling for load balancing
         :param use_dsrelu_reuse: Reuse relu(C)^2 between d_srelu and dprob
         """
+        torch = torch_dep.require("cudnn.grouped_gemm.grouped_gemm_dsrelu.api.__init__")
+        if acc_dtype is None:
+            acc_dtype = torch.float32
         super().__init__()
 
         self._warn_experimental_api()
@@ -249,6 +261,7 @@ class GroupedGemmDsreluSm100(APIBase):
 
         :return: True if supported, raises exception otherwise
         """
+        torch = torch_dep.require("cudnn.grouped_gemm.grouped_gemm_dsrelu.api.check_support")
         self._logger.debug("Entering check_support")
 
         # ---- SFD group validation ----
@@ -604,6 +617,7 @@ class GroupedGemmDsreluSm100(APIBase):
 
     def compile(self) -> None:
         """Compile the kernel."""
+        torch = torch_dep.require("cudnn.grouped_gemm.grouped_gemm_dsrelu.api.compile")
         self._logger.debug("Entering compile")
         self._ensure_support_checked()
         if self._compiled_kernel is not None:
@@ -654,6 +668,7 @@ class GroupedGemmDsreluSm100(APIBase):
 
     def _compile_dense(self, gemm_dsrelu, max_active_clusters, fake_stream) -> None:
         """Compile for dense (contiguous) weight mode."""
+        torch = torch_dep.require("cudnn.grouped_gemm.grouped_gemm_dsrelu.api._compile_dense")
         self._logger.debug("Compiling grouped_gemm_dsrelu kernel")
         use_full_dynamic = self._use_full_dynamic_mnkl
 
@@ -946,6 +961,7 @@ class GroupedGemmDsreluSm100(APIBase):
 
     def _compile_discrete(self, gemm_dsrelu, max_active_clusters, fake_stream) -> None:
         """Compile for discrete (per-expert pointer) weight mode."""
+        torch = torch_dep.require("cudnn.grouped_gemm.grouped_gemm_dsrelu.api._compile_discrete")
         if len(self.b_shape) == 2:
             n, k = self.b_shape
         else:
@@ -1290,8 +1306,8 @@ def grouped_gemm_dsrelu_wrapper_sm100(
     b_major: str = "k",
     # Common:
     norm_const_tensor: Optional[torch.Tensor] = None,
-    acc_dtype: torch.dtype = torch.float32,
-    d_dtype: torch.dtype = torch.bfloat16,
+    acc_dtype: Optional[torch.dtype] = None,
+    d_dtype: Optional[torch.dtype] = None,
     cd_major: str = "n",
     mma_tiler_mn: Tuple[int, int] = (256, 256),
     cluster_shape_mn: Optional[Tuple[int, int]] = None,
@@ -1347,6 +1363,11 @@ def grouped_gemm_dsrelu_wrapper_sm100(
         TupleDict with keys: d_row_tensor, d_col_tensor, dprob_tensor,
             dbias_tensor, amax_tensor, sfd_row_tensor, sfd_col_tensor
     """
+    torch = torch_dep.require("cudnn.grouped_gemm.grouped_gemm_dsrelu.api.grouped_gemm_dsrelu_wrapper_sm100")
+    if acc_dtype is None:
+        acc_dtype = torch.float32
+    if d_dtype is None:
+        d_dtype = torch.bfloat16
     from cudnn.discrete_grouped_gemm.discrete_kernel_utils import _require_pointer_tensor
 
     is_dense = b_tensor is not None

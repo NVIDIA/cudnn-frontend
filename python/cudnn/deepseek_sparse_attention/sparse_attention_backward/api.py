@@ -7,12 +7,19 @@ The wrapper dispatches to the Hopper (SM90) or Blackwell (SM100) CuTe DSL
 implementation based on the active CUDA device. It consumes the ``out`` and
 ``lse`` tensors produced by the DSA sparse-attention forward path.
 """
-
 from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
+
+from cudnn._deps import torch_dep
+
+if TYPE_CHECKING:
+    import torch
+
+
 
 from typing import Optional, Tuple
 
-import torch
 import cuda.bindings.driver as cuda
 
 from cudnn.api_base import APIBase, TupleDict
@@ -49,6 +56,7 @@ class SparseAttentionBackward(APIBase):
         self.softmax_scale = softmax_scale
 
     def check_support(self) -> bool:
+        torch = torch_dep.require("cudnn.deepseek_sparse_attention.sparse_attention_backward.api.check_support")
         major, _ = torch.cuda.get_device_capability()
         self._runtime_error_if(
             major < 9,
@@ -97,6 +105,7 @@ class SparseAttentionBackward(APIBase):
         softmax_scale: Optional[float] = None,
         current_stream: Optional[cuda.CUstream] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        torch = torch_dep.require("cudnn.deepseek_sparse_attention.sparse_attention_backward.api.execute")
         major, _ = torch.cuda.get_device_capability()
         scale = self.softmax_scale if softmax_scale is None else softmax_scale
         if major == 9:

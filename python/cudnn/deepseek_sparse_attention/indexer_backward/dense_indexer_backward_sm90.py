@@ -2,10 +2,17 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """Dense Indexer Backward — SM90 CuTe-DSL factory."""
-
 from __future__ import annotations
 
-import torch
+from typing import TYPE_CHECKING, Optional
+
+from cudnn._deps import torch_dep
+
+if TYPE_CHECKING:
+    import torch
+
+
+
 import cuda.bindings.driver as cuda
 
 import cutlass
@@ -277,6 +284,7 @@ def _build_cute_dsl_dense_kernel(
     is_varlen,
     has_q_causal_offsets,
 ):
+    torch = torch_dep.require("cudnn.deepseek_sparse_attention.indexer_backward.dense_indexer_backward_sm90._build_cute_dsl_dense_kernel")
     cap = torch.cuda.get_device_capability()[0]
     if cap < 9:
         raise RuntimeError(f"Requires SM90+ (got SM{cap}0)")
