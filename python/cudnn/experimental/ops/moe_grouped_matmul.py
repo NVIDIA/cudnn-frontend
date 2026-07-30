@@ -33,12 +33,15 @@ _cudnn_handles = {}
 _graph_cache: Dict[tuple, tuple] = {}
 
 # Dtype mapping (module-level constant)
-_TORCH_DTYPE_TO_CUDNN = {
-    torch.float16: cudnn.data_type.HALF,
-    torch.bfloat16: cudnn.data_type.BFLOAT16,
-    torch.float32: cudnn.data_type.FLOAT,
-    torch.int32: cudnn.data_type.INT32,
-}
+def _get_torch_dtype_to_cudnn():
+    """Lazily resolve _get_torch_dtype_to_cudnn(); PyTorch types are only touched on demand."""
+    torch = torch_dep.require("cudnn.experimental.ops.moe_grouped_matmul")
+    return {
+        torch.float16: cudnn.data_type.HALF,
+        torch.bfloat16: cudnn.data_type.BFLOAT16,
+        torch.float32: cudnn.data_type.FLOAT,
+        torch.int32: cudnn.data_type.INT32,
+    }
 
 # Mode string to cuDNN enum mapping (lazily initialised to avoid import-time
 # failures on cuDNN versions that pre-date MoE support).
@@ -91,7 +94,7 @@ def _get_handle(device: torch.device):
 
 def _torch_dtype_to_cudnn(dtype: torch.dtype):
     """Map a PyTorch dtype to a cuDNN data_type enum."""
-    return _TORCH_DTYPE_TO_CUDNN[dtype]
+    return _get_torch_dtype_to_cudnn()[dtype]
 
 
 def _make_cache_key(

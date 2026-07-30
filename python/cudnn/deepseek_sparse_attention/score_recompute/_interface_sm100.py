@@ -10,13 +10,20 @@ Orchestrates compilation, caching, and kernel dispatch for:
   - dense_indexer_score_recompute: dense index scores + LSE denom
   - dense_attn_score_recompute: dense attention scores + L1-norm denom
 """
-
 from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
+
+from cudnn._deps import torch_dep
+
+if TYPE_CHECKING:
+    import torch
+
+
 
 import math
 from typing import Optional
 
-import torch
 import cuda.bindings.driver as cuda
 
 import cutlass
@@ -34,11 +41,14 @@ from cudnn.deepseek_sparse_attention.utils.runtime import (
 )
 from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
 
-torch2cute_dtype_map = {
-    torch.float16: cutlass.Float16,
-    torch.bfloat16: cutlass.BFloat16,
-    torch.float32: cutlass.Float32,
-}
+def _get_torch2cute_dtype_map():
+    """Lazily resolve _get_torch2cute_dtype_map(); PyTorch types are only touched on demand."""
+    torch = torch_dep.require("cudnn.deepseek_sparse_attention.score_recompute._interface_sm100")
+    return {
+        torch.float16: cutlass.Float16,
+        torch.bfloat16: cutlass.BFloat16,
+        torch.float32: cutlass.Float32,
+    }
 
 
 def _sparse_indexer_score_recompute(
@@ -71,6 +81,7 @@ def _sparse_indexer_score_recompute(
     Returns:
         predict: (bs, seqlen_q, topk) [FP32] — softmax of sparse index scores
     """
+    torch = torch_dep.require("cudnn.deepseek_sparse_attention.score_recompute._interface_sm100._sparse_indexer_score_recompute")
     current_stream = _resolve_stream(current_stream)
     q_indexer, k_indexer, weights = [maybe_contiguous(t, current_stream) for t in (q_indexer, k_indexer, weights)]
     with _torch_stream_context(current_stream):
@@ -291,6 +302,7 @@ def _sparse_attn_score_recompute(
         target: (bs, seqlen_q, topk) [FP32] — L1-normalized attention scores
     """
 
+    torch = torch_dep.require("cudnn.deepseek_sparse_attention.score_recompute._interface_sm100._sparse_attn_score_recompute")
     current_stream = _resolve_stream(current_stream)
     q_attn, k_attn = [maybe_contiguous(t, current_stream) for t in (q_attn, k_attn)]
     with _torch_stream_context(current_stream):
@@ -721,6 +733,7 @@ def _dense_indexer_score_recompute(
     Returns:
         (out, denom_out)
     """
+    torch = torch_dep.require("cudnn.deepseek_sparse_attention.score_recompute._interface_sm100._dense_indexer_score_recompute")
     current_stream = _resolve_stream(current_stream)
     q, k, weights = [maybe_contiguous(t, current_stream) for t in (q, k, weights)]
 
@@ -899,6 +912,7 @@ def _dense_attn_score_recompute(
     Returns:
         (out, denom_out)
     """
+    torch = torch_dep.require("cudnn.deepseek_sparse_attention.score_recompute._interface_sm100._dense_attn_score_recompute")
     current_stream = _resolve_stream(current_stream)
     q, k = [maybe_contiguous(t, current_stream) for t in (q, k)]
 

@@ -1,12 +1,20 @@
 # Copyright (c) 2025, Ted Zadouri, Markus Hoehnerbach, Jay Shah, Tri Dao.
 # SPDX-License-Identifier: MIT
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
+
+from cudnn._deps import torch_dep
+
+if TYPE_CHECKING:
+    import torch
+
 import math
 from typing import Callable, NamedTuple, Optional, Tuple
 from functools import partial
 
 import cuda.bindings.driver as cuda
 
-import torch
 
 import cutlass
 import cutlass.cute as cute
@@ -2194,6 +2202,7 @@ def bsa_sm100_blk128_bwd_bucketed_k2q_csr(
     dv: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """SM100/SM110 blk128 bwd entry receiving BSA bucketed k2q CSR."""
+    torch = torch_dep.require("cudnn.block_sparse_attention.csrc.bwd.sm100_blk128.bsa_bwd_sm100.bsa_sm100_blk128_bwd_bucketed_k2q_csr")
     assert q.dtype == torch.bfloat16, "SM100 blk128 bwd only supports bfloat16"
     assert q.dtype == k.dtype == v.dtype == out.dtype == dout.dtype
     assert lse.dtype == torch.float32

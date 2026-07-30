@@ -55,12 +55,17 @@ classifiers = [
 "Release Notes" = "https://github.com/NVIDIA/cudnn-frontend/releases"
 
 [project.optional-dependencies]
+# PyTorch is deliberately NOT declared here. Installing a Torch build is
+# CUDA-environment specific, so consumers install it themselves; the optional
+# accelerator torch-c-dlpack-ext is omitted for the same reason, since it hard-
+# depends on torch and would pull in an unintended default build. Install order:
+#   1. the PyTorch build matching your CUDA environment
+#   2. nvidia-cudnn-frontend[cutedsl]
+#   3. optionally torch-c-dlpack-ext, to restore its AOT Torch->DLPack fast path
 cutedsl = [
     "nvidia-cutlass-dsl[cu13]>=4.5.0",
     "cuda-python",
-    "torch",
     "apache-tvm-ffi",
-    "torch-c-dlpack-ext",
 ]
 
 [dependency-groups]

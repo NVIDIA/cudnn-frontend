@@ -1,10 +1,18 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
+
+from cudnn._deps import torch_dep
+
+if TYPE_CHECKING:
+    import torch
+
 from .nsa_top_k_reduction_fwd import FineGrainedReductionQK
 
 from cuda.bindings import driver as cuda
-import torch
 from typing import Tuple, Optional
 import math
 
@@ -39,7 +47,7 @@ class TopKReduction(APIBase):
         sample_cum_seqlen_k: Optional[torch.Tensor] = None,
         max_s_q: Optional[int] = None,
         max_s_k: Optional[int] = None,
-        acc_dtype: torch.dtype = torch.float32,
+        acc_dtype: Optional[torch.dtype] = None,
         k_value: int = 16,
         selection_block_size: int = 64,
         compress_stride: int = 32,
@@ -47,6 +55,9 @@ class TopKReduction(APIBase):
         mma_tiler_mn: Tuple[int, int] = (128, 128),
         scale_softmax: Optional[float] = None,
     ):
+        torch = torch_dep.require("cudnn.native_sparse_attention.top_k.api.__init__")
+        if acc_dtype is None:
+            acc_dtype = torch.float32
         super().__init__()
         self._kernel = FineGrainedReductionQK
 
@@ -78,6 +89,7 @@ class TopKReduction(APIBase):
         self.scale_softmax = scale_softmax
 
     def check_support(self) -> bool:
+        torch = torch_dep.require("cudnn.native_sparse_attention.top_k.api.check_support")
         self._logger.debug("Entering check_support")
 
         self._logger.debug("Checking shape normalization and validation")
@@ -295,7 +307,7 @@ def topk_reduction_wrapper(
     cum_seqlen_k_tensor: Optional[torch.Tensor] = None,
     max_s_q: Optional[int] = None,
     max_s_k: Optional[int] = None,
-    acc_dtype: torch.dtype = torch.float32,
+    acc_dtype: Optional[torch.dtype] = None,
     k_value: int = 16,
     selection_block_size: int = 64,
     compress_stride: int = 32,
@@ -305,6 +317,9 @@ def topk_reduction_wrapper(
     current_stream: Optional[cuda.CUstream] = None,
 ) -> TupleDict:
 
+    torch = torch_dep.require("cudnn.native_sparse_attention.top_k.api.topk_reduction_wrapper")
+    if acc_dtype is None:
+        acc_dtype = torch.float32
     _logger.debug("topk_reduction_wrapper: Entering topk_reduction_wrapper")
     topk_scores_tensor, topk_indices_tensor = None, None
     if cum_seqlen_q_tensor is not None and cum_seqlen_k_tensor is not None:  # T,H,D

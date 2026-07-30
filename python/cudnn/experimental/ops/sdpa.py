@@ -35,13 +35,16 @@ _bprop_cache: Dict[tuple, tuple] = {}
 _sdpa_oss_layout_copy_warned = False
 
 # Dtype mapping (module-level constant)
-_TORCH_DTYPE_TO_CUDNN = {
-    torch.float16: cudnn.data_type.HALF,
-    torch.bfloat16: cudnn.data_type.BFLOAT16,
-    torch.float32: cudnn.data_type.FLOAT,
-    torch.int32: cudnn.data_type.INT32,
-    torch.int64: cudnn.data_type.INT64,
-}
+def _get_torch_dtype_to_cudnn():
+    """Lazily resolve _get_torch_dtype_to_cudnn(); PyTorch types are only touched on demand."""
+    torch = torch_dep.require("cudnn.experimental.ops.sdpa")
+    return {
+        torch.float16: cudnn.data_type.HALF,
+        torch.bfloat16: cudnn.data_type.BFLOAT16,
+        torch.float32: cudnn.data_type.FLOAT,
+        torch.int32: cudnn.data_type.INT32,
+        torch.int64: cudnn.data_type.INT64,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -104,7 +107,7 @@ def _cudnn_backend_supports_d256() -> bool:
 
 def _torch_dtype_to_cudnn(dtype: torch.dtype):
     """Map a PyTorch dtype to a cuDNN data_type enum."""
-    return _TORCH_DTYPE_TO_CUDNN[dtype]
+    return _get_torch_dtype_to_cudnn()[dtype]
 
 
 def _diagonal_alignment_enum(val: int):
@@ -584,9 +587,12 @@ def _build_bprop_graph(
 # ---------------------------------------------------------------------------
 
 
-_lib = torch.library.Library("cudnn", "DEF")
+def _get_lib():
+    """Lazily resolve _get_lib(); PyTorch types are only touched on demand."""
+    torch = torch_dep.require("cudnn.experimental.ops.sdpa")
+    return torch.library.Library("cudnn", "DEF")
 
-_lib.define(
+_get_lib().define(
     "sdpa(Tensor q, Tensor k, Tensor v, float attn_scale, "
     "bool is_causal=False, int diagonal_alignment=0, "
     "int left_bound=-1, int right_bound=-1, "
@@ -595,7 +601,7 @@ _lib.define(
     ") -> (Tensor, Tensor)"
 )
 
-_lib.define(
+_get_lib().define(
     "sdpa_bwd(Tensor dO, Tensor q, Tensor k, Tensor v, Tensor o, Tensor stats, "
     "float attn_scale, bool is_causal=False, int diagonal_alignment=0, "
     "int left_bound=-1, int right_bound=-1, "
@@ -766,7 +772,7 @@ def _sdpa_impl(
     return o_gpu, stats_gpu
 
 
-_lib.impl("sdpa", _sdpa_impl, "CUDA")
+_get_lib().impl("sdpa", _sdpa_impl, "CUDA")
 
 
 @torch.library.register_fake("cudnn::sdpa")
@@ -1065,7 +1071,7 @@ def _sdpa_bwd_impl(
     return dQ_gpu, dK_gpu, dV_gpu
 
 
-_lib.impl("sdpa_bwd", _sdpa_bwd_impl, "CUDA")
+_get_lib().impl("sdpa_bwd", _sdpa_bwd_impl, "CUDA")
 
 
 @torch.library.register_fake("cudnn::sdpa_bwd")

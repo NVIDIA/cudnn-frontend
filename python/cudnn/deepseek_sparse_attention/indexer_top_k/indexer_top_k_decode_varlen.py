@@ -14,6 +14,15 @@
 # limitations under the License.
 
 """SM90+ CuTe DSL indexer top-K decode kernel."""
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
+
+from cudnn._deps import torch_dep
+
+if TYPE_CHECKING:
+    import torch
+
 
 import math
 
@@ -21,7 +30,6 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils
-import torch
 from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
 
 from .block_scan import block_prefix_sum_kernel
@@ -572,11 +580,14 @@ def _next_positive_power_of_2(x: int) -> int:
     return 1 << (x - 1).bit_length()
 
 
-_TORCH_TO_CUTLASS_DTYPE = {
-    torch.float16: cutlass.Float16,
-    torch.bfloat16: cutlass.BFloat16,
-    torch.float32: cutlass.Float32,
-}
+def _get_torch_to_cutlass_dtype():
+    """Lazily resolve _get_torch_to_cutlass_dtype(); PyTorch types are only touched on demand."""
+    torch = torch_dep.require("cudnn.deepseek_sparse_attention.indexer_top_k.indexer_top_k_decode_varlen")
+    return {
+        torch.float16: cutlass.Float16,
+        torch.bfloat16: cutlass.BFloat16,
+        torch.float32: cutlass.Float32,
+    }
 
 
 def _bucket_num_cols(num_cols: int) -> int:
@@ -602,8 +613,9 @@ def cute_dsl_topk_wrapper(
     load_balance=False,
     num_copy_bits=256,
 ):
+    torch = torch_dep.require("cudnn.deepseek_sparse_attention.indexer_top_k.indexer_top_k_decode_varlen.cute_dsl_topk_wrapper")
     torch_dtype = input_values.dtype
-    dtype = _TORCH_TO_CUTLASS_DTYPE[torch_dtype]
+    dtype = _get_torch_to_cutlass_dtype()[torch_dtype]
     num_rows, num_cols = input_values.shape
     bucketed_num_cols = _bucket_num_cols(num_cols)
 

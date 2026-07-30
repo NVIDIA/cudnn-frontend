@@ -2,11 +2,19 @@
 # SPDX-License-Identifier: MIT
 # BSA attention interface for SM90/SM100 block-sparse kernels.
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
+
+from cudnn._deps import torch_dep
+
+if TYPE_CHECKING:
+    import torch
+
 import math
 from functools import lru_cache
 from typing import Optional, Tuple
 
-import torch
 
 import cuda.bindings.driver as cuda
 
@@ -77,11 +85,13 @@ from cudnn.block_sparse_attention.csrc.bwd.bucketed_k2q_csr import build_buckete
 
 @lru_cache(maxsize=None)
 def _get_device_arch_for_device(device_index: int):
+    torch = torch_dep.require("cudnn.block_sparse_attention._interface._get_device_arch_for_device")
     major, minor = torch.cuda.get_device_capability(device_index)
     return major * 10 + int(minor)
 
 
 def _get_device_arch():
+    torch = torch_dep.require("cudnn.block_sparse_attention._interface._get_device_arch")
     return _get_device_arch_for_device(torch.cuda.current_device())
 
 
@@ -137,19 +147,25 @@ def _to_sm90_bwd_cute_tensor(t: torch.Tensor, assumed_align: int = 16, enable_tv
     )
 
 
-torch2cute_dtype_map = {
-    torch.float16: cutlass.Float16,
-    torch.bfloat16: cutlass.BFloat16,
-    torch.float32: cutlass.Float32,
-}
+def _get_torch2cute_dtype_map():
+    """Lazily resolve _get_torch2cute_dtype_map(); PyTorch types are only touched on demand."""
+    torch = torch_dep.require("cudnn.block_sparse_attention._interface")
+    return {
+        torch.float16: cutlass.Float16,
+        torch.bfloat16: cutlass.BFloat16,
+        torch.float32: cutlass.Float32,
+    }
 
-_SM100_BLK64_INT32_MAX = torch.iinfo(torch.int32).max
+def _get_sm100_blk64_int32_max():
+    """Lazily resolve _get_sm100_blk64_int32_max(); PyTorch types are only touched on demand."""
+    torch = torch_dep.require("cudnn.block_sparse_attention._interface")
+    return torch.iinfo(torch.int32).max
 
 
 def _sm100_blk64_require_int32(name: str, value: int) -> int:
     value = int(value)
-    if value < 0 or value > _SM100_BLK64_INT32_MAX:
-        raise ValueError(f"SM100 blk64 {name}={value} must fit in int32 " f"(<= {_SM100_BLK64_INT32_MAX})")
+    if value < 0 or value > _get_sm100_blk64_int32_max():
+        raise ValueError(f"SM100 blk64 {name}={value} must fit in int32 " f"(<= {_get_sm100_blk64_int32_max()})")
     return value
 
 
@@ -212,7 +228,7 @@ def _sm100_blk64_requires_int64_kv_strides(
             64 * stride_s,
             stride_b,
         )
-        if any(stride < 0 or stride > _SM100_BLK64_INT32_MAX for stride in rank6_stride):
+        if any(stride < 0 or stride > _get_sm100_blk64_int32_max() for stride in rank6_stride):
             return True
         # Rank-6 to rank-5 TMA lowering groups sparse-block and batch bases.
         # Its BF16 dynamic scale overflows when either active basis reaches 2^27.
@@ -369,6 +385,7 @@ def _build_sm100_blk64_kv_split_offsets(
     device: torch.device,
 ) -> torch.Tensor:
     """Build 8-block-aligned split offsets for the blk64 forward kernels."""
+    torch = torch_dep.require("cudnn.block_sparse_attention._interface._build_sm100_blk64_kv_split_offsets")
     assert 1 <= kv_splits <= 256, "kv_splits must be in [1, 256]"
     if q2k_block_nums is not None and q2k_block_nums.numel() > 0:
         valid_kv = q2k_block_nums.to(torch.int32).contiguous().clamp_min(0)
@@ -427,6 +444,7 @@ def _resolve_blk64_split_workspace(
     allow_fallback: bool,
 ) -> int:
     """Fit split-KV workspace to currently available CUDA allocator capacity."""
+    torch = torch_dep.require("cudnn.block_sparse_attention._interface._resolve_blk64_split_workspace")
     kv_splits = int(kv_splits)
     if kv_splits <= 1 or not q.is_cuda:
         return kv_splits
@@ -497,6 +515,7 @@ def _empty_bwd_workspace_with_zeroed_accum(
     zero_dq_accum: bool,
     device: torch.device,
 ) -> torch.Tensor:
+    torch = torch_dep.require("cudnn.block_sparse_attention._interface._empty_bwd_workspace_with_zeroed_accum")
     q_rounded = ((seqlen_q + round_q_to - 1) // round_q_to) * round_q_to
     k_rounded = ((seqlen_k + round_k_to - 1) // round_k_to) * round_k_to
     d_rounded = ((head_dim + round_d_to - 1) // round_d_to) * round_d_to
@@ -539,6 +558,7 @@ def _bsa_attn_fwd_sm90_blk64(
     allow_empty_block_nums: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Launch the SM90 blk64 sparse forward kernel on BHSD tensors."""
+    torch = torch_dep.require("cudnn.block_sparse_attention._interface._bsa_attn_fwd_sm90_blk64")
     assert q.dtype in (torch.float16, torch.bfloat16), "SM90 blk64 fwd supports fp16/bf16"
     assert q.dtype == k.dtype == v.dtype
     assert q.is_cuda and k.is_cuda and v.is_cuda
@@ -672,7 +692,7 @@ def _bsa_attn_fwd_sm90_blk64(
         value_dim=v.shape[-1],
         blocksparse_blocksize_q=SM90_FWD_BLOCK_SIZE,
         blocksparse_blocksize_k=SM90_FWD_BLOCK_SIZE,
-        dtype=torch2cute_dtype_map[q.dtype],
+        dtype=_get_torch2cute_dtype_map()[q.dtype],
         acc_dtype=cutlass.Float32,
         has_block_sizes=has_block_sizes,
         num_splits=kv_splits,
@@ -744,6 +764,7 @@ def _bsa_attn_fwd_sm120_blk64(
     out: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Launch the SM120 blk64 sparse forward kernel on BHSD tensors."""
+    torch = torch_dep.require("cudnn.block_sparse_attention._interface._bsa_attn_fwd_sm120_blk64")
     assert q.dtype in (torch.float16, torch.bfloat16), "SM120 blk64 fwd supports fp16/bf16"
     assert q.dtype == k.dtype == v.dtype
     assert q.is_cuda and k.is_cuda and v.is_cuda
@@ -826,7 +847,7 @@ def _bsa_attn_fwd_sm120_blk64(
         value_dim=v.shape[-1],
         blocksparse_blocksize_q=SM120_FWD_BLOCK_SIZE,
         blocksparse_blocksize_k=SM120_FWD_BLOCK_SIZE,
-        dtype=torch2cute_dtype_map[q.dtype],
+        dtype=_get_torch2cute_dtype_map()[q.dtype],
         acc_dtype=cutlass.Float32,
         has_block_sizes=has_block_sizes,
         has_block_nums=has_block_nums,
@@ -885,6 +906,7 @@ def _combine_blk64_kv_bucketed_partials(
     kv_splits: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Combine KV-bucketed partial outputs using the shared CuTeDSL combine kernel."""
+    torch = torch_dep.require("cudnn.block_sparse_attention._interface._combine_blk64_kv_bucketed_partials")
     if BlockSparseAttnForwardCombine is None:
         raise ImportError("BlockSparseAttnForwardCombine is unavailable. Ensure local CuTe " "helpers are importable.")
 
@@ -926,7 +948,7 @@ def _combine_blk64_kv_bucketed_partials(
         dtype=torch.float32,
         device=q.device,
     )
-    dtype = torch2cute_dtype_map[q.dtype]
+    dtype = _get_torch2cute_dtype_map()[q.dtype]
     log_max_splits = _ceil_log2_int(kv_splits)
     # Baseline combine geometry; a single configuration is easier to maintain.
     combine_tile_m = 16
@@ -1073,6 +1095,7 @@ def bsa_attn_fwd_blk64_cutedsl(
     kv_splits: int | str = 1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """BSA forward attention through an independent blk64 CuTeDSL kernel class."""
+    torch = torch_dep.require("cudnn.block_sparse_attention._interface.bsa_attn_fwd_blk64_cutedsl")
     assert q.dtype == torch.bfloat16, "blk64 CuTeDSL requires bf16"
     assert q.is_cuda and k.is_cuda and v.is_cuda
     assert q.dim() == 4 and k.dim() == 4 and v.dim() == 4
@@ -1145,7 +1168,7 @@ def bsa_attn_fwd_blk64_cutedsl(
     if softmax_scale is None:
         softmax_scale = head_dim**-0.5
 
-    dtype = torch2cute_dtype_map[q_bhsd.dtype]
+    dtype = _get_torch2cute_dtype_map()[q_bhsd.dtype]
     arch = _get_device_arch()
     allow_empty_block_nums = has_variable_block_nums and allow_empty_block_nums
     sparse_block_size = 64
@@ -1373,6 +1396,7 @@ def bsa_attn_fwd(
         lse: Pre-allocated LSE tensor
         layout: "bhsd" (default) or "bshd". Output follows the same layout as input.
     """
+    torch = torch_dep.require("cudnn.block_sparse_attention._interface.bsa_attn_fwd")
     assert layout in ("bhsd", "bshd"), f"layout must be 'bhsd' or 'bshd', got {layout!r}"
     q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
     if layout == "bhsd":
@@ -1542,7 +1566,7 @@ def bsa_attn_fwd(
     if lse is None:
         lse = torch.empty(lse_shape, dtype=torch.float32, device=device) if requires_grad or return_lse else None
 
-    dtype = torch2cute_dtype_map[q.dtype]
+    dtype = _get_torch2cute_dtype_map()[q.dtype]
 
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
@@ -1712,6 +1736,7 @@ def bsa_attn_bwd(
         * SM90 uses blk64. SM100/SM110 supports blk64 and blk128; blk128 routes
           to FA4's SM100 128x128 backward kernel with BSA block-sparse metadata.
     """
+    torch = torch_dep.require("cudnn.block_sparse_attention._interface.bsa_attn_bwd")
     assert layout in ("bhsd", "bshd"), f"layout must be 'bhsd' or 'bshd', got {layout!r}"
     q, k, v, out, dout = [maybe_contiguous(t) for t in (q, k, v, out, dout)]
     lse = maybe_contiguous(lse)
@@ -1924,6 +1949,7 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
     on every call, so this path is suitable when the sparse pattern changes
     each backward.
     """
+    torch = torch_dep.require("cudnn.block_sparse_attention._interface._bsa_attn_bwd_bucketed_k2q_csr")
     q, k, v, out, dout = [maybe_contiguous(t) for t in (q, k, v, out, dout)]
     lse = maybe_contiguous(lse)
 
@@ -1996,7 +2022,7 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
 
         block_sizes_sm90 = variable_block_sizes if has_block_sizes else None
 
-        dtype = torch2cute_dtype_map[q.dtype]
+        dtype = _get_torch2cute_dtype_map()[q.dtype]
         workspace = _empty_bwd_workspace_with_zeroed_accum(
             batch_size=batch_size,
             num_heads=num_heads,

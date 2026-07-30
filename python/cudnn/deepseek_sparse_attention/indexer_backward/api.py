@@ -12,12 +12,19 @@ Combines backend-specific CuTe-DSL kernels:
 A pure-torch dtype cast for ``dIndexK`` (FP32 → output dtype) finishes the
 pipeline (kernel 3).
 """
-
 from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
+
+from cudnn._deps import torch_dep
+
+if TYPE_CHECKING:
+    import torch
+
+
 
 from typing import Optional
 
-import torch
 import cuda.bindings.driver as cuda
 
 from cudnn.api_base import APIBase, TupleDict
@@ -33,6 +40,7 @@ from .indexer_backward_sm90 import indexer_backward_sm90
 
 
 def _validate_grad_loss_tensor(grad_loss: torch.Tensor, device: torch.device) -> torch.Tensor:
+    torch = torch_dep.require("cudnn.deepseek_sparse_attention.indexer_backward.api._validate_grad_loss_tensor")
     if not torch.is_tensor(grad_loss):
         raise TypeError("grad_loss must be a torch.Tensor")
     if grad_loss.numel() != 1 or grad_loss.dtype != torch.float32 or grad_loss.device != device:
@@ -51,6 +59,7 @@ def _contiguous_mutable(tensor: torch.Tensor) -> tuple[torch.Tensor, Optional[to
 
 
 def _contiguous_output(tensor: torch.Tensor) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    torch = torch_dep.require("cudnn.deepseek_sparse_attention.indexer_backward.api._contiguous_output")
     if tensor.is_contiguous():
         return tensor, None
     return torch.empty_like(tensor, memory_format=torch.contiguous_format), tensor
@@ -62,6 +71,7 @@ def _copy_back_if_needed(tensor: torch.Tensor, original: Optional[torch.Tensor])
 
 
 def _max_from_cu_seqlens(cu_seqlens: torch.Tensor, name: str) -> int:
+    torch = torch_dep.require("cudnn.deepseek_sparse_attention.indexer_backward.api._max_from_cu_seqlens")
     if cu_seqlens is None:
         raise ValueError(f"{name} is required")
     if cu_seqlens.dtype != torch.int32 or cu_seqlens.ndim != 1 or not cu_seqlens.is_cuda:
@@ -180,6 +190,7 @@ class IndexerBackward(APIBase):
         self.topk_indices_global = bool(topk_indices_global)
 
     def check_support(self) -> bool:
+        torch = torch_dep.require("cudnn.deepseek_sparse_attention.indexer_backward.api.check_support")
         major, _ = torch.cuda.get_device_capability()
         self._runtime_error_if(
             major != 9 and major < 10,
@@ -195,6 +206,7 @@ class IndexerBackward(APIBase):
         return True
 
     def compile(self) -> None:
+        torch = torch_dep.require("cudnn.deepseek_sparse_attention.indexer_backward.api.compile")
         self._ensure_support_checked()
         if self._compiled_kernel is not None:
             return
@@ -323,6 +335,7 @@ class DenseIndexerBackward(APIBase):
         self._uses_current_stream_pipeline = False
 
     def check_support(self) -> bool:
+        torch = torch_dep.require("cudnn.deepseek_sparse_attention.indexer_backward.api.check_support")
         major, _ = torch.cuda.get_device_capability()
         self._runtime_error_if(
             major != 9 and major < 10,
@@ -345,6 +358,7 @@ class DenseIndexerBackward(APIBase):
         return True
 
     def compile(self) -> None:
+        torch = torch_dep.require("cudnn.deepseek_sparse_attention.indexer_backward.api.compile")
         self._ensure_support_checked()
         if self._compiled_kernel is not None:
             return
@@ -383,6 +397,7 @@ class DenseIndexerBackward(APIBase):
         q_causal_offsets: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
     ) -> None:
+        torch = torch_dep.require("cudnn.deepseek_sparse_attention.indexer_backward.api.execute")
         backend_stream = None if self._uses_current_stream_pipeline else current_stream
         with _torch_stream_context(backend_stream):
             grad_loss_tensor = _validate_grad_loss_tensor(grad_loss, index_q.device)
@@ -459,6 +474,7 @@ def indexer_backward_wrapper(
             ``index_q``. The kernel reads its value at runtime, including on
             CUDA Graph replay.
     """
+    torch = torch_dep.require("cudnn.deepseek_sparse_attention.indexer_backward.api.indexer_backward_wrapper")
     with _torch_stream_context(stream):
         if d_index_q is None:
             d_index_q = torch.empty_like(index_q)
@@ -564,6 +580,7 @@ def dense_indexer_backward_wrapper(
     device as ``index_q``. The kernel reads its value at runtime, including on
     CUDA Graph replay.
     """
+    torch = torch_dep.require("cudnn.deepseek_sparse_attention.indexer_backward.api.dense_indexer_backward_wrapper")
     major, _ = torch.cuda.get_device_capability()
     backend_stream = None if major == 9 else stream
 

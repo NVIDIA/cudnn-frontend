@@ -72,14 +72,21 @@ CUDA graphs:
 ``CUDNNFE_CSA_COMPRESSOR_FAST_LAUNCH=0`` disables only the cached-launch optimization
 (see ``_FastLauncher``).
 """
-
 from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
+
+from cudnn._deps import torch_dep
+
+if TYPE_CHECKING:
+    import torch
+
+
 
 import ctypes
 import os
 import threading
 
-import torch
 import cuda.bindings.driver as cuda_driver
 
 import cutlass
@@ -114,12 +121,20 @@ SUPPORTED_COMPUTE_CAPABILITY = (10, 0)
 # torch's raw current-stream query (~0.5 us) vs `torch.cuda.current_stream` object
 # construction (~2-3 us). Same handle the slow path ends up passing. Private API: guard
 # the bind so module import survives torch builds that do not expose it.
-_raw_stream = getattr(torch._C, "_cuda_getCurrentRawStream", None)
-if _raw_stream is None:  # pragma: no cover - older/stripped torch builds
+def _raw_stream(device_index=None):
+    """Return the current CUDA stream handle for ``device_index``.
 
-    def _raw_stream(device_index=None):
-        """Fallback raw-stream query via the public torch API."""
-        return torch.cuda.current_stream(device_index).cuda_stream
+    Prefers torch's private raw-stream query (~0.5 us) over constructing a
+    ``torch.cuda.current_stream`` object (~2-3 us); both yield the same handle.
+    Falls back to the public API on torch builds that do not expose the private
+    entry point. Resolved on first call so importing this module stays
+    PyTorch-free.
+    """
+    torch = torch_dep.require("cudnn.csa.compressor.compressor_sm100")
+    fast = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+    if fast is not None:
+        return fast(device_index)
+    return torch.cuda.current_stream(device_index).cuda_stream
 
 
 def _fast_launch_enabled() -> bool:
@@ -814,6 +829,7 @@ def _i32_ptr(t):
 
 def _compile_fwd(key, args, ratio, d, coff):
     """JIT-compile the forward launch entry for ``key`` (capture-guarded)."""
+    torch = torch_dep.require("cudnn.csa.compressor.compressor_sm100._compile_fwd")
     with _COMPILE_LOCK:
         fn = _COMPILED.get(key)
         if fn is None:
@@ -830,6 +846,7 @@ def _compile_fwd(key, args, ratio, d, coff):
 
 def _compile_bwd(key, args, ratio, d, coff):
     """JIT-compile the backward launch entry for ``key`` (capture-guarded)."""
+    torch = torch_dep.require("cudnn.csa.compressor.compressor_sm100._compile_bwd")
     with _COMPILE_LOCK:
         fn = _COMPILED.get(key)
         if fn is None:
@@ -850,6 +867,7 @@ def precompile_fwd(ratio, d, coff, device):
     Compilation only traces types (pointers/scalars/stream are runtime arguments), so
     tiny scratch buffers stand in for the real tensors; nothing is launched.
     """
+    torch = torch_dep.require("cudnn.csa.compressor.compressor_sm100.precompile_fwd")
     key = ("fwd", ratio, d, coff, device.index)
     if key in _COMPILED:
         return
@@ -874,6 +892,7 @@ def precompile_fwd(ratio, d, coff, device):
 
 def precompile_bwd(ratio, d, coff, device):
     """Ensure the backward kernel for ``(ratio, d, coff, device)`` is JIT-compiled."""
+    torch = torch_dep.require("cudnn.csa.compressor.compressor_sm100.precompile_bwd")
     key = ("bwd", ratio, d, coff, device.index)
     if key in _COMPILED:
         return
@@ -908,6 +927,7 @@ def run_fwd(kv, score, ape, cu_i, cuc_i, out, nb_total, ratio, d, coff, stream_h
     compiled module and the default-stream query are per-device, and launching from a
     foreign current device silently misbehaves.
     """
+    torch = torch_dep.require("cudnn.csa.compressor.compressor_sm100.run_fwd")
     dev = kv.device.index
     key = ("fwd", ratio, d, coff, dev)
     if stream_handle is None:
@@ -954,6 +974,7 @@ def run_bwd(kv, score, ape, cu_i, cuc_i, go, gkv, gs, gape, nb_total, ratio, d, 
     Device-context anchoring as in :func:`run_fwd`. The gradient-buffer token capacity
     (for the kernel's padding-token zero sweep) is derived from ``kv``'s element count.
     """
+    torch = torch_dep.require("cudnn.csa.compressor.compressor_sm100.run_bwd")
     dev = kv.device.index
     key = ("bwd", ratio, d, coff, dev)
     total_tokens = kv.numel() // (coff * d)

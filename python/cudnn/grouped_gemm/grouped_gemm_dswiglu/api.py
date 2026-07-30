@@ -6,12 +6,20 @@ API for Grouped GEMM dSwiGLU Backward Kernel (SM100+)
 This module provides the API class for contiguous grouped block-scaled GEMM
 backward pass with dSwiGLU activation gradient for MoE (Mixture of Experts) workloads.
 """
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
+
+from cudnn._deps import torch_dep
+
+if TYPE_CHECKING:
+    import torch
+
 
 from .grouped_gemm_dswiglu_quant import (
     BlockScaledContiguousGroupedGemmKernel,
 )
 from cuda.bindings import driver as cuda
-import torch
 from typing import Tuple, Optional
 
 import cutlass
@@ -64,7 +72,7 @@ class GroupedGemmDswigluSm100(APIBase):
         sample_amax: Optional[torch.Tensor] = None,
         sample_norm_const: Optional[torch.Tensor] = None,
         # Configuration
-        acc_dtype: torch.dtype = torch.float32,
+        acc_dtype: Optional[torch.dtype] = None,
         mma_tiler_mn: Tuple[int, int] = (256, 256),
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         sf_vec_size: int = 16,
@@ -91,7 +99,7 @@ class GroupedGemmDswigluSm100(APIBase):
         :param sample_sfd_col: Optional column scale factor for D
         :param sample_amax: Optional amax tensor for quantization, shape (l, 2, 1)
         :param sample_norm_const: Optional normalization constant
-        :param acc_dtype: Accumulator data type
+        :param acc_dtype: Accumulator data type ``None`` means ``torch.float32``.
         :param mma_tiler_mn: MMA tiler shape (M, N)
         :param cluster_shape_mn: Cluster shape (M, N)
         :param sf_vec_size: Scale factor vector size
@@ -100,6 +108,9 @@ class GroupedGemmDswigluSm100(APIBase):
         :param discrete_col_sfd: Boolean, True to generate discrete col-major scale factor tensor
         :param epilogue_op: Optional epilogue operation. Valid values: None, "none", "identity", "relu", "srelu"
         """
+        torch = torch_dep.require("cudnn.grouped_gemm.grouped_gemm_dswiglu.api.__init__")
+        if acc_dtype is None:
+            acc_dtype = torch.float32
         super().__init__()
 
         self._warn_experimental_api()
@@ -162,6 +173,7 @@ class GroupedGemmDswigluSm100(APIBase):
 
         :return: True if supported, raises exception otherwise
         """
+        torch = torch_dep.require("cudnn.grouped_gemm.grouped_gemm_dswiglu.api.check_support")
         self._logger.debug("Entering check_support")
 
         all_none = all(x is None for x in [self.sfd_row_desc, self.sfd_col_desc, self.norm_const_desc])
@@ -679,8 +691,8 @@ def grouped_gemm_dswiglu_wrapper_sm100(
     beta_tensor: Optional[torch.Tensor],
     prob_tensor: torch.Tensor,
     norm_const_tensor: Optional[torch.Tensor] = None,
-    acc_dtype: torch.dtype = torch.float32,
-    d_dtype: torch.dtype = torch.bfloat16,
+    acc_dtype: Optional[torch.dtype] = None,
+    d_dtype: Optional[torch.dtype] = None,
     cd_major: str = "n",
     mma_tiler_mn: Tuple[int, int] = (256, 256),
     cluster_shape_mn: Optional[Tuple[int, int]] = None,
@@ -731,6 +743,11 @@ def grouped_gemm_dswiglu_wrapper_sm100(
             - **sfd_row_tensor** (torch.Tensor or None): Row-wise scale factors for D
             - **sfd_col_tensor** (torch.Tensor or None): Column-wise scale factors for D
     """
+    torch = torch_dep.require("cudnn.grouped_gemm.grouped_gemm_dswiglu.api.grouped_gemm_dswiglu_wrapper_sm100")
+    if acc_dtype is None:
+        acc_dtype = torch.float32
+    if d_dtype is None:
+        d_dtype = torch.bfloat16
     valid_m = a_tensor.shape[0]
     n, _, l = b_tensor.shape
 

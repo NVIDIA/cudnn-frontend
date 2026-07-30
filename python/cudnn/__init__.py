@@ -301,9 +301,18 @@ _EAGER_PUBLIC_NAMES = (
     "jit",
     "graph_cache",
 )
-__all__ = [*_EAGER_PUBLIC_NAMES, "Graph", "wrapper"]
+__all__ = [*_EAGER_PUBLIC_NAMES, "Graph", "wrapper", "TorchNotAvailableError"]
 
-_OPTIONAL_DEPENDENCY_INSTALL_HINT = "Install with 'pip install nvidia-cudnn-frontend[cutedsl]'"
+# Public error for the missing-PyTorch case. Imported before the lazy
+# optional-symbol loader below so that loader can let it pass through unchanged.
+# Only this name is re-exported; the rest of the dependency layer stays private.
+from ._deps.torch_dep import TorchNotAvailableError
+
+_OPTIONAL_DEPENDENCY_INSTALL_HINT = (
+    "Install with 'pip install nvidia-cudnn-frontend[cutedsl]'. "
+    "PyTorch is not installed by this extra; install a build matching your CUDA "
+    "environment separately if you use the PyTorch-based APIs"
+)
 
 _LAZY_OPTIONAL_IMPORTS = {
     "BSA": (".block_sparse_attention", "BSA"),
@@ -367,6 +376,10 @@ def _load_optional_symbol(name: str) -> Any:
     try:
         module = importlib.import_module(module_name, package=__name__)
         value = module if attr_name is None else getattr(module, attr_name)
+    except TorchNotAvailableError:
+        # The missing-PyTorch case is already a precise, public, actionable
+        # error; do not rewrap it in the generic optional-dependency hint.
+        raise
     except Exception as e:
         raise ImportError(f"{name} requires optional dependencies. {_OPTIONAL_DEPENDENCY_INSTALL_HINT}: {e}") from e
 

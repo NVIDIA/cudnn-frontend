@@ -6,11 +6,19 @@
 # this file are adapted from quack-kernels 0.4.1 (Apache-2.0) and modified for
 # cudnn-frontend's CUTLASS DSL 4.5 integration.
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
+
+from cudnn._deps import torch_dep
+
+if TYPE_CHECKING:
+    import torch
+
 from dataclasses import dataclass, fields
 from functools import partial
 from typing import Tuple, get_origin
 
-import torch
 
 import cutlass
 import cutlass.cute as cute
@@ -52,13 +60,16 @@ def _install_constexpr_tvm_ffi_converter() -> None:
 
 _install_constexpr_tvm_ffi_converter()
 
-torch2cute_dtype_map = {
-    torch.float16: cutlass.Float16,
-    torch.bfloat16: cutlass.BFloat16,
-    torch.float32: cutlass.Float32,
-    torch.float8_e4m3fn: cutlass.Float8E4M3FN,
-    torch.float8_e5m2: cutlass.Float8E5M2,
-}
+def _get_torch2cute_dtype_map():
+    """Lazily resolve _get_torch2cute_dtype_map(); PyTorch types are only touched on demand."""
+    torch = torch_dep.require("cudnn.block_sparse_attention.csrc.utils.cute_dsl_utils")
+    return {
+        torch.float16: cutlass.Float16,
+        torch.bfloat16: cutlass.BFloat16,
+        torch.float32: cutlass.Float32,
+        torch.float8_e4m3fn: cutlass.Float8E4M3FN,
+        torch.float8_e5m2: cutlass.Float8E5M2,
+    }
 
 
 def _partition_param_fields(obj):
@@ -143,6 +154,7 @@ def to_cute_tensor(t, assumed_align=16, leading_dim=-1, fully_dynamic=False, ena
     # NOTE: torch 2.9.1 doesn't support fp8 via DLPack but 2.11.0 nightly does
     # currently export raw bytes as uint8 and tell cutlass correct type
     # can directly export as fp8 when torch supports it
+    torch = torch_dep.require("cudnn.block_sparse_attention.csrc.utils.cute_dsl_utils.to_cute_tensor")
     if t.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
         tensor = from_dlpack(
             t.view(torch.uint8).detach(),

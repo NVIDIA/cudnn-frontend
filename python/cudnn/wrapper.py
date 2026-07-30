@@ -49,10 +49,7 @@ _GRAPH_TENSOR_TYPES = (cudnn.tensor, cudnn.Tensor)
 import cudnn.datatypes
 from cudnn import data_type, heur_mode
 
-try:
-    import torch
-except ImportError:
-    torch = None
+from cudnn._deps import torch_dep
 
 __all__ = ["Graph", "data_type", "heur_mode", "cudnn"]
 
@@ -170,8 +167,7 @@ def _tensor_like(cudnn_tensor: cudnn.tensor, tensor_type: str = "pyt") -> "torch
     """
     if tensor_type != "pyt":
         raise NotImplementedError("Only PyTorch tensor is supported for now")
-    if not cudnn.datatypes.is_torch_available():
-        raise RuntimeError("PyTorch is not available")
+    torch = torch_dep.require("cudnn.wrapper._tensor_like")
     dtype = cudnn.datatypes._cudnn_to_torch_data_type(cudnn_tensor.get_data_type())
     if dtype is None:
         raise TypeError(f"cuDNN uses an unsupported data type in PyTorch: {cudnn_tensor.get_data_type()}")
@@ -181,9 +177,8 @@ def _tensor_like(cudnn_tensor: cudnn.tensor, tensor_type: str = "pyt") -> "torch
 
 def get_default_handle(stream: Optional["torch.cuda.Stream"] = None) -> CudnnHandle:
     """Get the default cuDNN handle and set to torch's current stream"""
+    torch = torch_dep.require("cudnn.wrapper.get_default_handle")
     global _default_cudnn_handle
-    if torch is None:
-        raise RuntimeError("PyTorch is not available")
     if _default_cudnn_handle is None:
         _default_cudnn_handle = cudnn.create_handle()
     if stream is None:
@@ -231,8 +226,11 @@ class Graph:
         workspace_alloc: bool = True,
         **kwargs,
     ) -> None:
-        if torch is None:
-            raise RuntimeError("PyTorch is not available")
+        # Graph is deliberately PyTorch-only: it allocates outputs/workspace as
+        # Torch tensors and manages the default Torch stream, so it fails fast
+        # rather than handing back a partially usable object. The framework-
+        # neutral route is cudnn.pygraph plus integer/DLPack buffers.
+        torch_dep.require("cudnn.wrapper.Graph")
         if inputs and not isinstance(inputs, (list, tuple)):
             raise ValueError("inputs must be a list or tuple")
         if outputs and not isinstance(outputs, (list, tuple)):
@@ -306,6 +304,7 @@ class Graph:
         self.__graph.build_plans()
         # Set up workspace if not forbidden by user, then set up I/O tensor orders
         if not hasattr(self, "__workspace"):
+            torch = torch_dep.require("cudnn.wrapper.Graph workspace allocation")
             self.__workspace = torch.empty(
                 self.__graph.get_workspace_size(),
                 device="cuda",

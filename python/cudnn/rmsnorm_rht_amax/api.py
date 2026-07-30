@@ -2,6 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """FE API for fused RMSNorm + RHT + per-CTA amax."""
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
+
+from cudnn._deps import torch_dep
+
+if TYPE_CHECKING:
+    import torch
+
 
 import logging
 from typing import Optional
@@ -9,7 +18,6 @@ from typing import Optional
 from cuda.bindings import driver as cuda
 import cutlass
 import cutlass.cute as cute
-import torch
 from cutlass import Float32
 from cutlass.cute.runtime import make_fake_stream
 
@@ -79,6 +87,7 @@ class RmsNormRhtAmaxSm100(APIBase):
         self.n = None
 
     def check_support(self) -> bool:
+        torch = torch_dep.require("cudnn.rmsnorm_rht_amax.api.check_support")
         m, n = self._tensor_shape(self.x_desc, name="sample_x")
         w_n = self._tensor_shape(self.w_desc, name="sample_w")[0]
         o_m, o_n = self._tensor_shape(self.o_desc, name="sample_o")
@@ -215,6 +224,7 @@ class RmsNormRhtAmaxSm100(APIBase):
         amax_tensor: torch.Tensor,
         current_stream: Optional[cuda.CUstream] = None,
     ) -> None:
+        torch = torch_dep.require("cudnn.rmsnorm_rht_amax.api.execute")
         self._runtime_error_if(self._compiled_kernel is None, "RmsNormRhtAmaxSm100 kernel not compiled; call compile() first")
 
         x_tensor = self._unpad_tensor_to_ndim(x_tensor, 2, "x_tensor")
@@ -248,6 +258,7 @@ def rmsnorm_rht_amax_wrapper_sm100(
 ) -> TupleDict:
     """High-level wrapper for the RMSNorm + RHT + per-CTA amax kernel."""
 
+    torch = torch_dep.require("cudnn.rmsnorm_rht_amax.api.rmsnorm_rht_amax_wrapper_sm100")
     x_tensor = x_tensor.squeeze(-1) if x_tensor.ndim == 3 and x_tensor.shape[-1] == 1 else x_tensor
     w_tensor = w_tensor.squeeze(-1) if w_tensor.ndim == 2 and w_tensor.shape[-1] == 1 else w_tensor
 

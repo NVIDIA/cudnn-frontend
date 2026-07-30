@@ -1,9 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
+
+from cudnn._deps import torch_dep
+
+if TYPE_CHECKING:
+    import torch
+
 from typing import Tuple, Optional
 
-import torch
 
 
 def make_tensor_strided_like(
@@ -16,6 +24,7 @@ def make_tensor_strided_like(
     Create an empty tensor with the given shape that mimics the layout/strides of
     the provided `q_tensor` as closely as possible.
     """
+    torch = torch_dep.require("cudnn.native_sparse_attention.utils.make_tensor_strided_like")
     q_strides = q_tensor.stride()
     rank_out = len(o_shape)
     order = tuple(sorted(range(min(len(q_strides), rank_out)), key=lambda i: q_strides[i]))

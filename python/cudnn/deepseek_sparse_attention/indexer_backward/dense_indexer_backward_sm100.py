@@ -51,12 +51,19 @@ Ratio causal mask:
     valid if k_local < col_limit
   q_causal_offset_b defaults to 0 when no offset tensor is provided.
 """
-
 from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
+
+from cudnn._deps import torch_dep
+
+if TYPE_CHECKING:
+    import torch
+
+
 
 import math
 from functools import partial
-import torch
 import cuda.bindings.driver as cuda
 
 import cutlass
@@ -1991,6 +1998,7 @@ def dense_indexer_backward_sm100(
 
 
 def _build_cute_dsl_kernel(batch, max_seqlen_q, max_seqlen_k, heads, dim, sm_scale, block_I, ratio, is_varlen, has_q_causal_offsets):
+    torch = torch_dep.require("cudnn.deepseek_sparse_attention.indexer_backward.dense_indexer_backward_sm100._build_cute_dsl_kernel")
     from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
 
     if torch.cuda.get_device_capability()[0] < 10:

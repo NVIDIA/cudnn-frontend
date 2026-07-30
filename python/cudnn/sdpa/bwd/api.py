@@ -1,12 +1,20 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
+
+from cudnn._deps import torch_dep
+
+if TYPE_CHECKING:
+    import torch
+
 from typing import Optional, Tuple
 import logging
 import math
 
 from cuda.bindings import driver as cuda
-import torch
 
 import cutlass.cute as cute
 from cutlass.cute.runtime import make_fake_stream
@@ -43,7 +51,7 @@ class SdpabwdSm100D256(APIBase):
         sample_cum_seqlen_k: Optional[torch.Tensor] = None,
         max_s_q: Optional[int] = None,
         max_s_k: Optional[int] = None,
-        acc_dtype: torch.dtype = torch.float32,
+        acc_dtype: Optional[torch.dtype] = None,
         mma_tiler_mn: Tuple[int, int] = (128, 128),
         dkdv_mma_tiler_mn: Tuple[int, int] = (128, 64),
         is_causal: bool = False,
@@ -73,6 +81,9 @@ class SdpabwdSm100D256(APIBase):
             window_size: Sliding-window tuple `(left, right)`. Use `(-1, -1)` for full window.
             scale_softmax: Optional softmax scaling factor. Defaults to `1/sqrt(D)` when omitted or set to `0.0`.
         """
+        torch = torch_dep.require("cudnn.sdpa.bwd.api.__init__")
+        if acc_dtype is None:
+            acc_dtype = torch.float32
         super().__init__()
         self._kernel = BlackwellFusedMultiHeadAttentionBackward
 
@@ -134,6 +145,7 @@ class SdpabwdSm100D256(APIBase):
         self._logger.debug("__init__ completed")
 
     def check_support(self) -> bool:
+        torch = torch_dep.require("cudnn.sdpa.bwd.api.check_support")
         self._logger.debug("Entering check_support")
 
         # shape normalization and validation
@@ -279,6 +291,7 @@ class SdpabwdSm100D256(APIBase):
         return True
 
     def compile(self) -> None:
+        torch = torch_dep.require("cudnn.sdpa.bwd.api.compile")
         self._logger.debug("Entering compile")
         self._ensure_support_checked()
         if self._compiled_kernel is not None:
@@ -400,6 +413,7 @@ class SdpabwdSm100D256(APIBase):
         scale_softmax: Optional[float] = None,
         current_stream: Optional[cuda.CUstream] = None,
     ) -> None:
+        torch = torch_dep.require("cudnn.sdpa.bwd.api.execute")
         self._logger.debug("Entering execute")
         current_stream = self._get_default_stream(current_stream)
 
@@ -454,7 +468,7 @@ def sdpa_bwd_wrapper_sm100_d256(
     cum_seqlen_k_tensor: Optional[torch.Tensor] = None,
     max_s_q: Optional[int] = None,
     max_s_k: Optional[int] = None,
-    acc_dtype: torch.dtype = torch.float32,
+    acc_dtype: Optional[torch.dtype] = None,
     mma_tiler_mn: Tuple[int, int] = (128, 128),
     dkdv_mma_tiler_mn: Tuple[int, int] = (128, 64),
     is_causal: bool = False,
@@ -468,6 +482,9 @@ def sdpa_bwd_wrapper_sm100_d256(
         TupleDict: `(dq_tensor, dk_tensor, dv_tensor)`
     """
 
+    torch = torch_dep.require("cudnn.sdpa.bwd.api.sdpa_bwd_wrapper_sm100_d256")
+    if acc_dtype is None:
+        acc_dtype = torch.float32
     dq_tensor = torch.empty_like(q_tensor)
     dk_tensor = torch.empty_like(k_tensor)
     dv_tensor = torch.empty_like(v_tensor)

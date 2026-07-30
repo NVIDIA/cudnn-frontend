@@ -3,13 +3,20 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING, Optional
+
+from cudnn._deps import torch_dep
+
+if TYPE_CHECKING:
+    import torch
+
+
 import logging
 import os
 from typing import Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
-import torch
 from cuda.bindings import driver as cuda
 from cutlass.cute.runtime import make_fake_stream
 
@@ -43,12 +50,15 @@ class GemmSreluSm100(APIBase):
         sample_amax: Optional[torch.Tensor] = None,
         sample_norm_const: Optional[torch.Tensor] = None,
         alpha: float = 1.0,
-        acc_dtype: torch.dtype = torch.float32,
+        acc_dtype: Optional[torch.dtype] = None,
         mma_tiler_mn: Tuple[int, int] = (256, 256),
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         sf_vec_size: int = 16,
         vector_f32: bool = False,
     ):
+        torch = torch_dep.require("cudnn.gemm_srelu.api.__init__")
+        if acc_dtype is None:
+            acc_dtype = torch.float32
         super().__init__()
 
         self._warn_experimental_api()
@@ -80,6 +90,7 @@ class GemmSreluSm100(APIBase):
         self._kernel = Sm100BlockScaledPersistentDenseGemmKernel
 
     def check_support(self) -> bool:
+        torch = torch_dep.require("cudnn.gemm_srelu.api.check_support")
         m, k, l = self._tensor_shape(self.a_desc, name="sample_a")
         n, b_k, b_l = self._tensor_shape(self.b_desc, name="sample_b")
         c_m, c_n, c_l = self._tensor_shape(self.c_desc, name="sample_c")
@@ -427,6 +438,7 @@ _DENSE_GEMM_DYNAMIC_MNKL_ENV = "CUDNN_FE_GEMM_DYNAMIC_MNKL"
 
 
 def _allocate_dense_output(shape: Tuple[int, int, int], major: str, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    torch = torch_dep.require("cudnn.gemm_srelu.api._allocate_dense_output")
     m, n, l = shape
     if major == "m":
         return torch.empty_strided((m, n, l), (1, m, m * n), dtype=dtype, device=device)
@@ -443,9 +455,9 @@ def gemm_srelu_wrapper_sm100(
     prob_tensor: torch.Tensor,
     alpha: float = 1.0,
     c_major: str = "n",
-    c_dtype: torch.dtype = torch.bfloat16,
-    d_dtype: torch.dtype = torch.bfloat16,
-    acc_dtype: torch.dtype = torch.float32,
+    c_dtype: Optional[torch.dtype] = None,
+    d_dtype: Optional[torch.dtype] = None,
+    acc_dtype: Optional[torch.dtype] = None,
     mma_tiler_mn: Tuple[int, int] = (256, 256),
     cluster_shape_mn: Optional[Tuple[int, int]] = None,
     norm_const_tensor: Optional[torch.Tensor] = None,
@@ -453,6 +465,13 @@ def gemm_srelu_wrapper_sm100(
     vector_f32: bool = False,
     stream: Optional[cuda.CUstream] = None,
 ) -> TupleDict:
+    torch = torch_dep.require("cudnn.gemm_srelu.api.gemm_srelu_wrapper_sm100")
+    if c_dtype is None:
+        c_dtype = torch.bfloat16
+    if d_dtype is None:
+        d_dtype = torch.bfloat16
+    if acc_dtype is None:
+        acc_dtype = torch.float32
     m, k, l = a_tensor.shape
     n, _, _ = b_tensor.shape
 

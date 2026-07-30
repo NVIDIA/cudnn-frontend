@@ -1,11 +1,19 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
+
+from cudnn._deps import torch_dep
+
+if TYPE_CHECKING:
+    import torch
+
 from contextlib import contextmanager
 from enum import Enum
 from typing import Iterator, Optional
 
-import torch
 from cuda.bindings import driver as cuda
 
 
@@ -17,6 +25,7 @@ class GroupedGemmBackend(str, Enum):
 @contextmanager
 def _torch_stream_context(current_stream: Optional[cuda.CUstream], device: torch.device) -> Iterator[None]:
     """Run PyTorch work on the CUDA stream used for the kernel launch."""
+    torch = torch_dep.require("cudnn.grouped_gemm.grouped_gemm_utils._torch_stream_context")
     if current_stream is None:
         yield
         return
@@ -41,6 +50,7 @@ def select_grouped_gemm_backend(
     scale_controls,
     block_scaled_dtype_pairs,
 ):
+    torch = torch_dep.require("cudnn.grouped_gemm.grouped_gemm_utils.select_grouped_gemm_backend")
     bf16_operands = (a_dtype == torch.bfloat16, b_dtype == torch.bfloat16)
     if any(bf16_operands):
         if not all(bf16_operands):

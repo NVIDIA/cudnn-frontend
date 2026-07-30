@@ -6,11 +6,14 @@ from typing import List, Optional, Tuple
 import torch
 from torch import Tensor
 
-_TORCH_DTYPE_TO_CUDNN = {
-    torch.float32: 0,  # CUDNN_DATA_FLOAT
-    torch.float16: 2,  # CUDNN_DATA_HALF
-    torch.bfloat16: 9,  # CUDNN_DATA_BFLOAT16
-}
+def _get_torch_dtype_to_cudnn():
+    """Lazily resolve _get_torch_dtype_to_cudnn(); PyTorch types are only touched on demand."""
+    torch = torch_dep.require("cudnn.ops.causal_conv1d")
+    return {
+        torch.float32: 0,  # CUDNN_DATA_FLOAT
+        torch.float16: 2,  # CUDNN_DATA_HALF
+        torch.bfloat16: 9,  # CUDNN_DATA_BFLOAT16
+    }
 
 _ACTIVATION_TO_INT = {
     "identity": 0,  # CUDNN_CAUSAL_CONV1D_ACTIVATION_IDENTITY
@@ -19,9 +22,9 @@ _ACTIVATION_TO_INT = {
 
 
 def _dtype_to_int(dtype: torch.dtype) -> int:
-    if dtype not in _TORCH_DTYPE_TO_CUDNN:
+    if dtype not in _get_torch_dtype_to_cudnn():
         raise ValueError(f"Unsupported dtype {dtype}. Supported: float32, float16, bfloat16.")
-    return _TORCH_DTYPE_TO_CUDNN[dtype]
+    return _get_torch_dtype_to_cudnn()[dtype]
 
 
 def _activation_to_int(activation: str) -> int:

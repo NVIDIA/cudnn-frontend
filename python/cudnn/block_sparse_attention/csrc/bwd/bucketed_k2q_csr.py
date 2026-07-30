@@ -1,6 +1,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
+
+from cudnn._deps import torch_dep
+
+if TYPE_CHECKING:
+    import torch
+
 from typing import Optional, Tuple
 
 import cutlass
@@ -8,7 +17,6 @@ import cutlass.cute as cute
 from cutlass import Int32, const_expr
 from cutlass.cute.runtime import from_dlpack
 import cuda.bindings.driver as cuda
-import torch
 
 
 class BucketedK2QCsrUniversal:
@@ -259,6 +267,7 @@ def build_bucketed_k2q_csr_cutedsl(
     q2k_block_nums: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, int, int]:
     """Build bucketed K-to-Q CSR metadata with CuTe DSL kernels."""
+    torch = torch_dep.require("cudnn.block_sparse_attention.csrc.bwd.bucketed_k2q_csr.build_bucketed_k2q_csr_cutedsl")
     assert q2k_block_index.dtype == torch.int32
     assert q2k_block_index.is_cuda
     assert q2k_block_index.ndim == 4

@@ -14,9 +14,17 @@
 # limitations under the License.
 
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
+
+from cudnn._deps import torch_dep
+
+if TYPE_CHECKING:
+    import torch
+
 import cutlass
 import cutlass.cute as cute
-import torch
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import dsl_user_op
 
@@ -1111,6 +1119,7 @@ def create_random_logits(
     Returns:
         Tensor of shape (num_rows, max_row_length) with random values and -inf padding
     """
+    torch = torch_dep.require("cudnn.deepseek_sparse_attention.indexer_top_k.indexer_top_k_varlen_util.create_random_logits")
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     num_rows = row_starts.shape[0]
@@ -1167,6 +1176,7 @@ def compare_top_k_results(
     Returns:
         True if results match within tolerance, False otherwise
     """
+    torch = torch_dep.require("cudnn.deepseek_sparse_attention.indexer_top_k.indexer_top_k_varlen_util.compare_top_k_results")
     num_rows = cuda_indices.shape[0]
 
     # Calculate valid lengths for each row (vectorized)

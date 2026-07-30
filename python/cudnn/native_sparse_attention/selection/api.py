@@ -1,6 +1,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
+
+from cudnn._deps import torch_dep
+
+if TYPE_CHECKING:
+    import torch
+
 from .NSA_select_attn_fwd_hmma import HopperSelectAttentionFwd
 from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.api_base import APIBase, TupleDict
@@ -9,7 +18,6 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import make_fake_stream
 from cuda.bindings import driver as cuda
-import torch
 from typing import Tuple, Optional
 import math
 
@@ -29,10 +37,13 @@ class SelectionAttention(APIBase):
         sample_cum_seqlen_k: Optional[torch.Tensor] = None,
         max_s_q: Optional[int] = 1024,
         max_s_k: Optional[int] = 1024,
-        acc_dtype: torch.dtype = torch.float32,
+        acc_dtype: Optional[torch.dtype] = None,
         block_size: int = 64,
         scale_softmax: Optional[float] = None,
     ):
+        torch = torch_dep.require("cudnn.native_sparse_attention.selection.api.__init__")
+        if acc_dtype is None:
+            acc_dtype = torch.float32
         super().__init__()
         self._kernel = HopperSelectAttentionFwd
 
@@ -75,6 +86,7 @@ class SelectionAttention(APIBase):
         )
 
     def check_support(self) -> bool:
+        torch = torch_dep.require("cudnn.native_sparse_attention.selection.api.check_support")
         self._logger.debug("Entering check_support")
 
         # Shape normalization and validation
@@ -305,7 +317,7 @@ def selection_attention_wrapper(
     block_size: int = 64,
     scale_softmax: Optional[float] = None,
     o_dtype: Optional[torch.dtype] = None,
-    acc_dtype: torch.dtype = torch.float32,
+    acc_dtype: Optional[torch.dtype] = None,
     max_s_q: Optional[int] = None,
     max_s_k: Optional[int] = None,
     stream: Optional[cuda.CUstream] = None,
@@ -316,6 +328,9 @@ def selection_attention_wrapper(
     Returns:
         TupleDict: (o_tensor, l_tensor, m_tensor) - Output, logsumexp, and max tensors
     """
+    torch = torch_dep.require("cudnn.native_sparse_attention.selection.api.selection_attention_wrapper")
+    if acc_dtype is None:
+        acc_dtype = torch.float32
     _logger.debug("selection_attention_wrapper: Creating empty output tensors o, l, and m")
 
     max_s_q = max(cum_seqlen_q_tensor[1:] - cum_seqlen_q_tensor[:-1]).item() if max_s_q is None else max_s_q

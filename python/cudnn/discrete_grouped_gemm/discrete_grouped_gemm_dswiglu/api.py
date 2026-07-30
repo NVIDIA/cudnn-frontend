@@ -6,6 +6,15 @@ API for Discrete-weight Grouped GEMM dGLU Backward Kernel (SM100+)
 This module provides the API class for discrete-weight block-scaled grouped GEMM
 backward pass with dGLU (dSwiGLU/dGeGLU) activation gradient for MoE workloads.
 """
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
+
+from cudnn._deps import torch_dep
+
+if TYPE_CHECKING:
+    import torch
+
 
 from .discrete_B_blockscaled_grouped_gemm_dglu_dbias import (
     BlockScaledDiscreteWeightDgluDbiasGroupedGemmKernel,
@@ -13,7 +22,6 @@ from .discrete_B_blockscaled_grouped_gemm_dglu_dbias import (
 from cuda.bindings import driver as cuda
 import logging
 import os
-import torch
 from typing import Tuple, Optional
 
 import cutlass
@@ -61,7 +69,7 @@ class DiscreteGroupedGemmDswigluSm100(APIBase):
         sample_sfd_col: Optional[torch.Tensor] = None,
         sample_amax: Optional[torch.Tensor] = None,
         sample_norm_const: Optional[torch.Tensor] = None,
-        acc_dtype: torch.dtype = torch.float32,
+        acc_dtype: Optional[torch.dtype] = None,
         mma_tiler_mn: Tuple[int, int] = (256, 256),
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         sf_vec_size: int = 16,
@@ -93,7 +101,7 @@ class DiscreteGroupedGemmDswigluSm100(APIBase):
         :param sample_sfd_col: Optional column scale factor for D
         :param sample_amax: Optional amax tensor, shape (expert_cnt, 2, 1)
         :param sample_norm_const: Optional normalization constant
-        :param acc_dtype: Accumulator data type
+        :param acc_dtype: Accumulator data type ``None`` means ``torch.float32``.
         :param mma_tiler_mn: MMA tiler shape (M, N)
         :param cluster_shape_mn: Cluster shape (M, N)
         :param sf_vec_size: Scale factor vector size
@@ -105,6 +113,9 @@ class DiscreteGroupedGemmDswigluSm100(APIBase):
         :param epilogue_op: Optional epilogue operation ("relu", "srelu", or None)
         :param use_dynamic_sched: Enable dynamic tile scheduling for load balancing
         """
+        torch = torch_dep.require("cudnn.discrete_grouped_gemm.discrete_grouped_gemm_dswiglu.api.__init__")
+        if acc_dtype is None:
+            acc_dtype = torch.float32
         super().__init__()
 
         self._warn_experimental_api()
@@ -177,6 +188,7 @@ class DiscreteGroupedGemmDswigluSm100(APIBase):
 
     def check_support(self) -> bool:
         """Check if the kernel configuration is supported."""
+        torch = torch_dep.require("cudnn.discrete_grouped_gemm.discrete_grouped_gemm_dswiglu.api.check_support")
         self._logger.debug("Entering check_support")
 
         all_none = all(x is None for x in [self.sfd_row_desc, self.sfd_col_desc, self.norm_const_desc])
@@ -437,6 +449,7 @@ class DiscreteGroupedGemmDswigluSm100(APIBase):
 
     def compile(self) -> None:
         """Compile the backward kernel from tensor descriptors captured in __init__."""
+        torch = torch_dep.require("cudnn.discrete_grouped_gemm.discrete_grouped_gemm_dswiglu.api.compile")
         self._logger.debug("Entering compile")
         self._ensure_support_checked()
         if self._compiled_kernel is not None:
@@ -788,8 +801,8 @@ def discrete_grouped_gemm_dswiglu_wrapper_sm100(
     b_dtype: torch.dtype,
     generate_dbias: bool = False,
     norm_const_tensor: Optional[torch.Tensor] = None,
-    acc_dtype: torch.dtype = torch.float32,
-    d_dtype: torch.dtype = torch.bfloat16,
+    acc_dtype: Optional[torch.dtype] = None,
+    d_dtype: Optional[torch.dtype] = None,
     cd_major: str = "n",
     mma_tiler_mn: Tuple[int, int] = (256, 256),
     cluster_shape_mn: Optional[Tuple[int, int]] = None,
@@ -849,6 +862,11 @@ def discrete_grouped_gemm_dswiglu_wrapper_sm100(
     """
     # Resolve linear_offset default: None means "use the activation-derived legacy
     # default" (1.0 for dgeglu, 0.0 for dswiglu) for backwards compatibility.
+    torch = torch_dep.require("cudnn.discrete_grouped_gemm.discrete_grouped_gemm_dswiglu.api.discrete_grouped_gemm_dswiglu_wrapper_sm100")
+    if acc_dtype is None:
+        acc_dtype = torch.float32
+    if d_dtype is None:
+        d_dtype = torch.bfloat16
     if linear_offset is None:
         linear_offset = 1.0 if act_func == "dgeglu" else 0.0
     valid_m, k_physical, _ = a_tensor.shape
