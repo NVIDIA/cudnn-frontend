@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Engine-id namespace shared by cuDNN and Python backends.
 
 Execution engines live in one flat integer id space, exactly like cuDNN's own

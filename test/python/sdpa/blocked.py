@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # Blocked tests configuration
 # Format: "test_name": {"sms": ["SM_90", "SM_100"], "cudnn_versions": ["91100"]}
 # - sms: List of GPU architectures to block on (e.g., "SM_90", "SM_100")

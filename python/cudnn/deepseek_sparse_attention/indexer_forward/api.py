@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """APIBase wrapper and dispatcher for indexer forward CuTe DSL score kernels.
 
 Produces dense indexer scores Q @ K^T with per-head ReLU, weighted head

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Shared cute.compile option helpers.
 
 The cute DSL compiler accepts ``--gpu-arch <sm_XXX>`` to lock SASS to a

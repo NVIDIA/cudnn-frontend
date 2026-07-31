@@ -1,4 +1,5 @@
 # Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
+# SPDX-License-Identifier: MIT
 """SM90 named-barrier id table for the FA / DSA backward kernels.
 
 SM90 hardware named barriers are addressed by a 4-bit operand: only ids in

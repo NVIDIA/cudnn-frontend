@@ -22,9 +22,25 @@ python/cudnn/
 │   ├── __init__.py                 # Frontend-only API class
 │   └── api.py                      # High-level API implementation
 │   └── {kernel_name}.py            # Kernel implementation, i.e CuteDSL
+├── gemm/                           # The GEMM operation family (see below)
 test/python/                        # Test files
 └── fe_api/                         # Test files for frontend-only APIs
 ```
+
+All GEMM fusions live under `gemm/`, grouped by operand layout:
+
+```
+python/cudnn/gemm/
+├── cutedsl/
+│   ├── dense/{amax,dsrelu,proj_rope_mxfp8,srelu,swiglu}/
+│   ├── grouped/{dglu,dsrelu,dswiglu,glu,glu_hadamard,quant,srelu,swiglu,unfused,wgrad}/
+│   └── discrete_grouped/{dswiglu,swiglu}/        # per-expert discrete weight pointers
+├── ops/                                          # backend-independent torch custom-op contracts
+└── reference/                                    # pure-PyTorch correctness engine
+```
+
+Every public GEMM symbol is re-exported at the top level (`cudnn.<symbol>`), which
+is the supported entry point — the directory layout is an implementation detail.
 
 ## 
 

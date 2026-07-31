@@ -17,8 +17,9 @@ python/cudnn/<operation>/
 
 Nested API families are also valid when matching existing structure, for example:
 
-- `python/cudnn/grouped_gemm/<operation>/`
-- `python/cudnn/discrete_grouped_gemm/<operation>/`
+- `python/cudnn/gemm/cutedsl/dense/<operation>/`
+- `python/cudnn/gemm/cutedsl/grouped/<operation>/`
+- `python/cudnn/gemm/cutedsl/discrete_grouped/<operation>/`
 - `python/cudnn/sdpa/fwd/` or `python/cudnn/sdpa/bwd/`
 - `python/cudnn/native_sparse_attention/<component>/`
 
@@ -33,10 +34,10 @@ Use this routing table before choosing the package namespace:
 | Plain dense GEMM or alpha/beta GEMM | Dense frontend-only package under `python/cudnn/<operation>/` |
 | Dense GEMM with a fused pointwise epilogue, scale, amax, or auxiliary output | GEMM-fusion package under `python/cudnn/<operation>/` |
 | Dense GEMM with distributed all-reduce | Dense package only after documenting distributed runtime requirements |
-| Grouped GEMM with packed or contiguous grouped inputs | `python/cudnn/grouped_gemm/<operation>/` |
-| Grouped GEMM with `padded_offsets`, `expert_cnt`, or scheduler workspace | `python/cudnn/grouped_gemm/<operation>/`, regardless of "dense" wording in source comments |
-| Grouped GEMM with `group_count`, `problem_shape_mnkl`, `strides_abc`, or `tensor_address_*` arrays | `python/cudnn/grouped_gemm/<operation>/` with per-group metadata |
-| Grouped GEMM with per-expert discrete weight pointers | `python/cudnn/discrete_grouped_gemm/<operation>/` |
+| Grouped GEMM with packed or contiguous grouped inputs | `python/cudnn/gemm/cutedsl/grouped/<operation>/` |
+| Grouped GEMM with `padded_offsets`, `expert_cnt`, or scheduler workspace | `python/cudnn/gemm/cutedsl/grouped/<operation>/`, regardless of "dense" wording in source comments |
+| Grouped GEMM with `group_count`, `problem_shape_mnkl`, `strides_abc`, or `tensor_address_*` arrays | `python/cudnn/gemm/cutedsl/grouped/<operation>/` with per-group metadata |
+| Grouped GEMM with per-expert discrete weight pointers | `python/cudnn/gemm/cutedsl/discrete_grouped/<operation>/` |
 | SDPA/FMHA-style attention kernel | `python/cudnn/sdpa/<direction>/` |
 | SDPA/FMHA two-kernel backward with DQ plus DK/DV subkernels | `python/cudnn/sdpa/bwd/`, preserving orchestrator and helper modules |
 | Multi-component sparse attention API | `python/cudnn/native_sparse_attention/<component>/` |
@@ -79,16 +80,16 @@ Use this pattern when the public API stays the same but Rubin (`sm107`, compute 
 
 Current examples:
 
-- `python/cudnn/grouped_gemm/grouped_gemm_quant/`
-- `python/cudnn/grouped_gemm/grouped_gemm_glu/`
-- `python/cudnn/grouped_gemm/grouped_gemm_dglu/`
+- `python/cudnn/gemm/cutedsl/grouped/quant/`
+- `python/cudnn/gemm/cutedsl/grouped/glu/`
+- `python/cudnn/gemm/cutedsl/grouped/dglu/`
 
 ### File layout
 
 Keep the default kernel module unchanged and add a Rubin sibling:
 
 ```text
-python/cudnn/grouped_gemm/<operation>/
+python/cudnn/gemm/cutedsl/grouped/<operation>/
 |-- api.py
 |-- <default_kernel_module>.py
 `-- <default_kernel_module_basename>_rubin.py
@@ -156,7 +157,7 @@ The loader already formats optional dependency failures as:
 raise ImportError(f"{name} requires optional dependencies. {_OPTIONAL_DEPENDENCY_INSTALL_HINT}: {e}") from e
 ```
 
-For family modules such as `grouped_gemm`, `discrete_grouped_gemm`, or `sdpa`, also update the family `__init__.py` if the class or wrapper should be available from that namespace.
+For family modules such as `gemm.cutedsl.grouped`, `gemm.cutedsl.discrete_grouped`, or `sdpa`, also update the family `__init__.py` if the class or wrapper should be available from that namespace.
 
 ## Dependencies
 

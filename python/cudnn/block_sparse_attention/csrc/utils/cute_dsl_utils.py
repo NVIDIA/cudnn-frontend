@@ -1,5 +1,6 @@
 # Copyright (c) 2025, Tri Dao.
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
 #
 # The ParamsBase, make_fake_tensor, and sub_packed_f32x2 implementations in
 # this file are adapted from quack-kernels 0.4.1 (Apache-2.0) and modified for

@@ -1,4 +1,5 @@
 # Copyright (c) 2026, Jerry Chen
+# SPDX-License-Identifier: MIT
 import math
 from typing import Optional, Tuple
 

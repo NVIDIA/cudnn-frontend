@@ -1,5 +1,7 @@
-// Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: MIT
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
 #pragma once
 // Auto-generated — do not edit manually.
 // Lightweight LN headers (~3K lines) replacing the 151K-line embedded version.
