@@ -22,6 +22,7 @@ Scheduler: moe_persistent_scheduler.py (CLC mode, scenario="2Dx2D")
 Extension: moe_sched_extension.py (WgradDense / WgradDiscrete)
 """
 
+from importlib.metadata import PackageNotFoundError, version
 from typing import Type, Tuple, Optional
 
 import cuda.bindings.driver as cuda
@@ -55,6 +56,17 @@ from ..moe_sched_extension import (
 from ..moe_kernel_helpers import (
     compute_stages_wgrad,
 )
+
+
+def _using_internal_cutlass_dsl() -> bool:
+    try:
+        version("nvidia-cutlass-dsl-internal")
+    except PackageNotFoundError:
+        return False
+    return True
+
+
+_USING_INTERNAL_CUTLASS_DSL = _using_internal_cutlass_dsl()
 
 
 class BlockScaledMoEGroupedGemmWgradKernel:
@@ -315,14 +327,22 @@ class BlockScaledMoEGroupedGemmWgradKernel:
         out_single_expert: Optional[cute.Tensor] = None,
     ) -> None:
 
-        # SM100 still needs the packed-FP4 from_dlpack layout workaround.
-        # Rubin consumes the native 4-bit layout directly.
-        if cutlass.const_expr(self.architecture != "sm_107" and mat_a.iterator.dtype.width < 8):
+        # Public CUTLASS DSL 4.5 needs the packed-FP4 from_dlpack layout
+        # workaround. Rubin and the internal DSL wheel consume the native
+        # 4-bit layout directly.
+        needs_fp4_layout_workaround = (
+            self.architecture != "sm_107" and not _USING_INTERNAL_CUTLASS_DSL
+        )
+        if cutlass.const_expr(
+            needs_fp4_layout_workaround and mat_a.iterator.dtype.width < 8
+        ):
             mat_a = cute.make_tensor(
                 mat_a.iterator,
                 cute.recast_layout(mat_a.iterator.dtype.width, 8, mat_a.layout),
             )
-        if cutlass.const_expr(self.architecture != "sm_107" and mat_b.iterator.dtype.width < 8):
+        if cutlass.const_expr(
+            needs_fp4_layout_workaround and mat_b.iterator.dtype.width < 8
+        ):
             mat_b = cute.make_tensor(
                 mat_b.iterator,
                 cute.recast_layout(mat_b.iterator.dtype.width, 8, mat_b.layout),
