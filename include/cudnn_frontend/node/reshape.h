@@ -112,14 +112,23 @@ class ReshapeNode : public NodeCRTP<ReshapeNode> {
                                                        1,
                                                        &x_desc));
 #if (CUDNN_VERSION >= 92200)
-        // Set reshape mode
-        cudnnBackendReshapeMode_t cudnn_reshape_mode;
-        _CUDNN_CHECK_CUDNN_ERROR(detail::convert_to_cudnn_type(attributes.get_reshape_mode(), cudnn_reshape_mode));
-        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(reshape_operation.get_raw_desc(),
-                                                       CUDNN_ATTR_OPERATION_RESHAPE_MODE,
-                                                       CUDNN_TYPE_RESHAPE_MODE,
-                                                       1,
-                                                       &cudnn_reshape_mode));
+        // Pre-9.22 reshape is view-only, so skipping the attribute matches it; an explicit LOGICAL
+        // cannot be honoured there, hence reject rather than silently downgrade.
+        // NV_CUDNN_FE_DYNAMIC_CHECK_* is avoided on purpose: it is a no-op unless
+        // NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING is defined (cudnn_frontend_shim.h:213-215).
+        if (detail::get_backend_version() >= 92200) {
+            cudnnBackendReshapeMode_t cudnn_reshape_mode;
+            _CUDNN_CHECK_CUDNN_ERROR(detail::convert_to_cudnn_type(attributes.get_reshape_mode(), cudnn_reshape_mode));
+            _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(reshape_operation.get_raw_desc(),
+                                                           CUDNN_ATTR_OPERATION_RESHAPE_MODE,
+                                                           CUDNN_TYPE_RESHAPE_MODE,
+                                                           1,
+                                                           &cudnn_reshape_mode));
+        } else {
+            RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.get_reshape_mode() == ReshapeMode_t::LOGICAL,
+                                           error_code_t::GRAPH_NOT_SUPPORTED,
+                                           "Reshape mode LOGICAL requires cuDNN 9.22.0 or newer at runtime");
+        }
 #endif
         // Set output tensor Y
         CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(Y, Reshape_attributes::output_names::Y);
