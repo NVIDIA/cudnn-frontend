@@ -51,7 +51,7 @@ RUBIN_DISPATCH_CASES = [
 ]
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
-_GROUPED_GEMM_ROOT = _REPO_ROOT / "python" / "cudnn" / "grouped_gemm"
+_GROUPED_GEMM_ROOT = _REPO_ROOT / "python" / "cudnn" / "gemm" / "cutedsl" / "grouped"
 
 
 def _import_api_module(module_path: str):
@@ -214,6 +214,10 @@ def test_grouped_gemm_wgrad_rubin_quantization_validation(
 
 @pytest.mark.L0
 def test_grouped_gemm_wgrad_rubin_tmem_plan_rejects_invalid_sf_vector():
+    pytest.importorskip(
+        "cutlass.utils.rubin_helpers",
+        reason="Rubin helpers are unavailable in this CUTLASS DSL wheel",
+    )
     rubin_mod = importlib.import_module(
         "cudnn.gemm.cutedsl.grouped.wgrad.moe_blockscaled_grouped_gemm_wgrad_rubin"
     )

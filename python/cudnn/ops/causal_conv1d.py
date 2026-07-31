@@ -217,9 +217,10 @@ def causal_conv1d(
 
     Args:
         x (torch.Tensor): Input tensor of shape ``(batch, dim, seq_len)``.
-            Must be BF16, FP16, or FP32. Must be contiguous and on CUDA.
+            Must be BF16, FP16, or FP32 and on CUDA.
         weight (torch.Tensor): Filter tensor of shape ``(dim, kernel_size)``.
-            Same dtype as *x*.
+            Same dtype as *x*. ``kernel_size`` must be between 2 and 256,
+            inclusive.
         bias (torch.Tensor | None): Optional bias of shape ``(dim,)``.
             Same dtype as *x*. Defaults to zeros if ``None``.
         activation (str): ``"identity"`` (default) or ``"silu"``.
@@ -417,9 +418,13 @@ def causal_conv1d_nwh(
 
         y = activation(conv1d_causal(x, weight) + bias)
 
+    Supports ``torch.compile`` and ``torch.autograd`` — backward is handled
+    automatically when inputs require gradients.
+
     Args:
         x (torch.Tensor): Input tensor of shape ``(batch, seq_len, dim)``.
         weight (torch.Tensor): Filter tensor of shape ``(kernel_size, dim)``.
+            ``kernel_size`` must be between 2 and 128, inclusive.
         bias (torch.Tensor | None): Optional bias of shape ``(dim,)``.
         activation (str): ``"identity"`` (default) or ``"silu"``.
 
@@ -683,13 +688,18 @@ def b2b_causal_conv1d(
 
         proj       = causal_conv1d(x, weights_proj)            # (batch, 3*dim, seq_len)
         gated      = proj[:, 1::3, :] * proj[:, 2::3, :]       # Q * K gate
-        y          = causal_conv1d(gated, weights_mixer) + skip_bias * gated
+        y          = causal_conv1d(gated, weights_mixer) + skip_bias[:, None] * gated
         y_gated    = y * proj[:, 0::3, :]                      # final * V
+
+    Supports ``torch.compile`` and ``torch.autograd`` — backward is handled
+    automatically when inputs require gradients.
 
     Args:
         x (torch.Tensor): Input tensor of shape ``(batch, 3*dim, seq_len)``.
         weights_proj (torch.Tensor): Projection filter ``(3*dim, kernel_size_proj)``.
+            ``kernel_size_proj`` must be between 2 and 32, inclusive.
         weights_mixer (torch.Tensor): Mixer filter ``(dim, kernel_size_mixer)``.
+            ``kernel_size_mixer`` must be between 2 and 256, inclusive.
         skip_bias (torch.Tensor): Skip-connection bias ``(dim,)``.
 
     Returns:
