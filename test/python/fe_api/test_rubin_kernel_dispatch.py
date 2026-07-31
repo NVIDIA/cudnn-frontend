@@ -211,6 +211,10 @@ def test_grouped_gemm_wgrad_rubin_quantization_validation(
 
 @pytest.mark.L0
 def test_grouped_gemm_wgrad_rubin_tmem_plan_rejects_invalid_sf_vector():
+    pytest.importorskip(
+        "cutlass.utils.rubin_helpers",
+        reason="Rubin helpers are unavailable in this CUTLASS DSL wheel",
+    )
     rubin_mod = importlib.import_module(
         "cudnn.grouped_gemm.grouped_gemm_wgrad.moe_blockscaled_grouped_gemm_wgrad_rubin"
     )
