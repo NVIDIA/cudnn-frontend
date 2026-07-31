@@ -1,10 +1,14 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Large-tensor convolution regression tests.
 
 Tests fprop, dgrad, and wgrad with large tensors and filters. FPROP and WGRAD
-include C*R*S > 2^27 boundary coverage; DGRAD remains conservatively
-runtime-bounded while exercising large problems. All cases execute the kernel
-and compare against a PyTorch float32 reference.
+target C*R*S > 2^27 boundary coverage when the per-worker memory budget
+permits; DGRAD remains conservatively runtime-bounded while exercising large
+problems. All cases execute the kernel and compare against a PyTorch float32
+reference.
 
 Tune DEFAULT_NUM_TESTS_L0 / DEFAULT_NUM_TESTS_L1 to adjust local or downstream
 runtime targets:
@@ -15,6 +19,9 @@ Developer diagnostic graph-engine filter examples:
   CUDNN_FUZZ_ENGINE_OP=fprop CUDNN_FUZZ_GRAPH_ENGINE_INDICES=0 pytest ...
   CUDNN_FUZZ_ENGINE_OP=fprop CUDNN_FUZZ_GRAPH_ENGINE_INDICES=0 \
     CUDNN_FUZZ_REGEN_ON_UNSUPPORTED=1 CUDNN_FUZZ_REGEN_ATTEMPTS=50 pytest ...
+
+When regeneration advances past attempt 1, the pytest node ID still describes
+the initial config; diagnostics identify the active regenerated candidate.
 """
 
 import json
@@ -41,14 +48,16 @@ _GRAPH_ENGINE_OP_ENV = "CUDNN_FUZZ_ENGINE_OP"  # graph-specific op selector: fpr
 _GRAPH_ENGINE_INDICES_ENV = "CUDNN_FUZZ_GRAPH_ENGINE_INDICES"  # public operation-graph engine indices
 _REGEN_ON_UNSUPPORTED_ENV = "CUDNN_FUZZ_REGEN_ON_UNSUPPORTED"  # retry unsupported engine picks
 _REGEN_ATTEMPTS_ENV = "CUDNN_FUZZ_REGEN_ATTEMPTS"  # retry cap for regeneration
-_WORK_BUDGET_FLOPS_ENV = "CUDNN_FUZZ_WORK_BUDGET_FLOPS"  # override generated test work cap
+_RUNTIME_WORK_BUDGET_ENV = "CUDNN_FUZZ_RUNTIME_WORK_BUDGET"  # override generated test runtime-work cap
 _NUM_TESTS_L0_ENV = "CUDNN_FUZZ_NUM_TESTS_L0"  # override L0 generated count
 _NUM_TESTS_L1_ENV = "CUDNN_FUZZ_NUM_TESTS_L1"  # override L1 generated count
 _REPRO_CONFIG_ENV = "CUDNN_FUZZ_REPRO_CONFIG"  # exact configuration JSON payload
 _REPRO_FILE_ENV = "CUDNN_FUZZ_REPRO_FILE"  # path to exact configuration JSON payload
 _REPRO_SCHEMA_VERSION = 1
 _REPRO_MESSAGE_LIMIT = 4096
-_DEFAULT_WORK_BUDGET_FLOPS = 100_000_000_000_000  # 100 TFLOP per generated test
+_DEFAULT_RUNTIME_WORK_BUDGET = 100_000_000_000_000
+_MAX_CONFIG_GENERATION_ATTEMPTS = 50
+_DEFAULT_ENGINE_REGEN_ATTEMPTS = 50
 _SPARSE_INTEGER_REDUCTION_THRESHOLD = 1 << 20  # switch very large reductions off dense random data
 _SPARSE_INTEGER_TARGET_NONZERO = 32  # max nonzero filter values per output channel
 _SPARSE_INTEGER_RNG_SALT = 0x51A25EED  # split sparse-index RNG from tensor-value RNG
@@ -151,7 +160,7 @@ def _regen_attempts() -> int:
     """Return the retry cap for regenerating unsupported configs."""
     raw = os.environ.get(_REGEN_ATTEMPTS_ENV, "").strip()
     if not raw:
-        return MAX_REGEN_ATTEMPTS
+        return _DEFAULT_ENGINE_REGEN_ATTEMPTS
 
     try:
         return max(1, int(raw))
@@ -159,19 +168,19 @@ def _regen_attempts() -> int:
         raise ValueError(f"{_REGEN_ATTEMPTS_ENV} must be a positive integer") from e
 
 
-def _work_budget_flops() -> int:
-    """Return the per-config estimated work cap in FLOPs."""
-    raw = os.environ.get(_WORK_BUDGET_FLOPS_ENV, "").strip()
+def _runtime_work_budget() -> int:
+    """Return the per-config conservative runtime-work budget."""
+    raw = os.environ.get(_RUNTIME_WORK_BUDGET_ENV, "").strip()
     if not raw:
-        return _DEFAULT_WORK_BUDGET_FLOPS
+        return _DEFAULT_RUNTIME_WORK_BUDGET
 
     try:
         value = int(float(raw))
     except ValueError as e:
-        raise ValueError(f"{_WORK_BUDGET_FLOPS_ENV} must be a positive number") from e
+        raise ValueError(f"{_RUNTIME_WORK_BUDGET_ENV} must be a positive number") from e
 
     if value <= 0:
-        raise ValueError(f"{_WORK_BUDGET_FLOPS_ENV} must be a positive number")
+        raise ValueError(f"{_RUNTIME_WORK_BUDGET_ENV} must be a positive number")
     return value
 
 
@@ -252,13 +261,12 @@ def _create_filtered_execution_plans(graph, graph_engine_index: int) -> None:
 
 
 MEMORY_BUDGET_BYTES = _device_memory_budget()
-WORK_BUDGET_FLOPS = _work_budget_flops()
+RUNTIME_WORK_BUDGET = _runtime_work_budget()
 WORKSPACE_OVERHEAD = 0.15  # fraction added for cuDNN workspace + allocator slack
 DEFAULT_NUM_TESTS_L0 = _num_tests(_NUM_TESTS_L0_ENV, 64)  # default smoke slice
 DEFAULT_NUM_TESTS_L1 = _num_tests(_NUM_TESTS_L1_ENV, 448)  # longer expansion slice
 DEFAULT_SEED_L0 = 42
 DEFAULT_SEED_L1 = 12345
-MAX_REGEN_ATTEMPTS = 50
 INT32_MAX = (1 << 31) - 1  # 2_147_483_647
 _WORKSPACE_POISON_DIVISOR = 1000
 _MAX_WORKSPACE_POISON_COUNT = 1_000_000
@@ -269,7 +277,7 @@ BASE_ACCUM = 128
 _STANDARD_RTOL_AT_BASE_ACCUM = 1e-2
 _MAX_DENSE_RANDOM_RTOL = 0.10
 
-# Integer-policy inputs use fixed per-dtype tolerances without reduction scaling.
+# Integer-policy inputs use fixed dtype-level bounds rather than reduction scaling.
 # FP32's 1e-3 absolute floor covers the observed 4.88e-4 bias/ReLU delta.
 _INTEGER_DATA_TOLERANCES = {
     torch.float16: (1e-3, 1e-5),
@@ -295,7 +303,7 @@ class ShapeFamily(Enum):
     BATCHED = "bat"  # N > 1, valid conv (exercises reduction-axis indexing)
     # Input strictly larger than filter, producing output spatial > 1x1 with
     # pad=0 stride=1. Distinguishes from the families where input is sized
-    # exactly to make output 1x1. Keep the "nvc" value stable for pytest IDs.
+    # exactly to make output 1x1. Use a compact value in generated pytest IDs.
     NON_UNIT_OUTPUT = "nvc"
     RANDOM = "rnd"  # uniform random within budget
 
@@ -720,7 +728,7 @@ def _repro_payload(
         "y_shape": cfg.y_shape,
         "memory_budget_bytes": MEMORY_BUDGET_BYTES,
         "worker_count": _pytest_worker_count(),
-        "work_budget_flops": WORK_BUDGET_FLOPS,
+        "runtime_work_budget": RUNTIME_WORK_BUDGET,
         "estimated_bytes": _estimate_bytes(cfg),
         "estimated_runtime_work": _estimate_runtime_work(cfg),
         "fprop_reduction": _fprop_reduction_size(cfg),
@@ -929,7 +937,7 @@ class LargeTensorConfigGenerator:
 
     def generate(self) -> LargeTensorConfig:
         rng = self.rng
-        for _ in range(MAX_REGEN_ATTEMPTS):
+        for _ in range(_MAX_CONFIG_GENERATION_ATTEMPTS):
             dtype = rng.choice(self._DTYPES)
             conv_type = self.forced_conv_type
             if conv_type is None:
@@ -957,14 +965,14 @@ class LargeTensorConfigGenerator:
                 continue
             if any(s <= 0 for s in cfg.y_shape[2:]):
                 continue
-            if _estimate_runtime_work(cfg) > WORK_BUDGET_FLOPS:
+            if _estimate_runtime_work(cfg) > RUNTIME_WORK_BUDGET:
                 continue
             if _estimate_bytes(cfg) <= MEMORY_BUDGET_BYTES:
                 return cfg
 
         raise RuntimeError(
-            f"Could not generate a fitting config in {MAX_REGEN_ATTEMPTS} attempts. "
-            f"Adjust MEMORY_BUDGET_BYTES, {_WORK_BUDGET_FLOPS_ENV}, "
+            f"Could not generate a fitting config in {_MAX_CONFIG_GENERATION_ATTEMPTS} attempts. "
+            f"Adjust MEMORY_BUDGET_BYTES, {_RUNTIME_WORK_BUDGET_ENV}, "
             "or generator shape ranges."
         )
 
@@ -1209,17 +1217,12 @@ def _run_single_config(
     config_seed: Optional[int] = None,
     attempt: Optional[int] = None,
 ) -> Tuple[bool, str]:
-    # Generate inputs on CPU then move to GPU so the values are bit-identical
-    # across GPU architectures. `torch.randn` on a CUDA generator is not
-    # bit-identical across arches because the parallel PRNG depends on thread
-    # launch geometry; that arch-dependence makes failures non-reproducible
-    # across H100 / A100 / B100.
+    # Generate inputs on CPU so values are bit-identical across GPU
+    # architectures. CUDA random generation depends on launch geometry and can
+    # make the same seed produce different values on different architectures.
     #
-    # After transfer, convert to channels-last memory format (NHWC / NDHWC),
-    # which is what cuDNN's heuristic engines expect for conv kernels. With
-    # default NCHW layout, the OLD valid-conv tests (output spatial 1x1) worked
-    # by accident because spatial strides collapse when spatial==1, but tests
-    # with non-trivial output spatial produce scrambled cuDNN output.
+    # Convert transferred tensors to channels-last memory format (NHWC / NDHWC)
+    # so graph strides are correct for both unit and non-unit output spatial.
     X = None
     W = None
     Y = None
@@ -1358,7 +1361,8 @@ def _run_test_with_regen(*, config_seed: int, test_num: int, total_tests: int, a
         except AssertionError:
             raise
         except (RuntimeError, OSError) as e:
-            raise type(e)(f"{e} [candidate={candidate_id}, attempt={attempt}]") from e
+            details = f"regenerated candidate={candidate_id}, attempt={attempt}; pytest node ID identifies attempt 1"
+            raise RuntimeError(f"{e} [{details}]") from e
 
         if ok:
             if attempt > 1:
@@ -1379,7 +1383,9 @@ def _run_test_with_regen(*, config_seed: int, test_num: int, total_tests: int, a
             pytest.skip(f"Insufficient GPU memory for {candidate_id}: {msg}{context}")
         if not msg.startswith("not_supported"):
             context = _format_repro_context(candidate, test_num=test_num, total_tests=total_tests, config_seed=config_seed, message=msg, attempt=attempt)
-            pytest.fail(f"cuDNN execution error for {candidate_id} " f"(regen attempt {attempt}): {msg}{context}")
+            identity = f"attempt {attempt}; pytest node ID identifies attempt 1"
+            failure = f"cuDNN execution error for regenerated candidate {candidate_id} ({identity}): {msg}{context}"
+            pytest.fail(failure)
         last_unsupported = f"attempt {attempt}: {candidate_id}: {msg}"
 
     pytest.skip(
