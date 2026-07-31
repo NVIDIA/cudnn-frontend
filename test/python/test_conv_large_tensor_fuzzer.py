@@ -62,6 +62,7 @@ _SPARSE_INTEGER_REDUCTION_THRESHOLD = 1 << 20  # switch very large reductions of
 _SPARSE_INTEGER_TARGET_NONZERO = 32  # max nonzero filter values per output channel
 _SPARSE_INTEGER_RNG_SALT = 0x51A25EED  # split sparse-index RNG from tensor-value RNG
 _GRAPH_ENGINE_RNG_SALT = 0xE61A5EED  # split engine selection from config and tensor RNGs
+_OP_SCHEDULE_RNG_SALT = 0x0F5C4ED  # split operation ordering from config generation
 
 
 class _EngineFilterNotSupported(Exception):
@@ -952,11 +953,12 @@ class LargeTensorConfigGenerator:
 
     def generate(self) -> LargeTensorConfig:
         rng = self.rng
+        conv_type = self.forced_conv_type
+        if conv_type is None:
+            conv_type = rng.choices(self._OPS, weights=self._OP_WEIGHTS)[0]
+
         for _ in range(_MAX_CONFIG_GENERATION_ATTEMPTS):
             dtype = rng.choice(self._DTYPES)
-            conv_type = self.forced_conv_type
-            if conv_type is None:
-                conv_type = rng.choices(self._OPS, weights=self._OP_WEIGHTS)[0]
             shape_family = rng.choices(self._SHAPE_FAMILIES, weights=self._SHAPE_FAMILY_WEIGHTS)[0]
             sdims = rng.choices([2, 3], weights=[0.75, 0.25])[0]
 
@@ -992,6 +994,25 @@ class LargeTensorConfigGenerator:
         )
 
 
+def _conv_type_schedule(num_tests: int, rng_seed: int) -> List[ConvType]:
+    """Return a deterministic schedule matching the configured op weights."""
+    total_weight = sum(LargeTensorConfigGenerator._OP_WEIGHTS)
+    exact_counts = [num_tests * weight / total_weight for weight in LargeTensorConfigGenerator._OP_WEIGHTS]
+    counts = [math.floor(count) for count in exact_counts]
+    remainder = num_tests - sum(counts)
+    largest_remainders = sorted(
+        range(len(counts)),
+        key=lambda index: (exact_counts[index] - counts[index], -index),
+        reverse=True,
+    )
+    for index in largest_remainders[:remainder]:
+        counts[index] += 1
+
+    schedule = [conv_type for conv_type, count in zip(LargeTensorConfigGenerator._OPS, counts) for _ in range(count)]
+    random.Random(rng_seed ^ _OP_SCHEDULE_RNG_SALT).shuffle(schedule)
+    return schedule
+
+
 def tlist_with_configs(
     *,
     num_tests: int,
@@ -1002,14 +1023,15 @@ def tlist_with_configs(
     force_plain_fprop: bool = False,
 ) -> list:
     rng = random.Random(rng_seed)
+    conv_types = [forced_conv_type] * num_tests if forced_conv_type is not None else _conv_type_schedule(num_tests, rng_seed)
     out = []
-    for i in range(num_tests):
+    for i, conv_type in enumerate(conv_types):
         config_seed = rng.randint(65536, 2**31 - 1)
         gen = LargeTensorConfigGenerator(
             config_seed,
             allow_unaligned=allow_unaligned,
             include_extras=include_extras,
-            forced_conv_type=forced_conv_type,
+            forced_conv_type=conv_type,
             force_plain_fprop=force_plain_fprop,
         )
         out.append((i + 1, num_tests, config_seed, gen.generate()))
