@@ -22,6 +22,7 @@ Scheduler: moe_persistent_scheduler.py (CLC mode, scenario="2Dx2D")
 Extension: moe_sched_extension.py (WgradDense / WgradDiscrete)
 """
 
+from importlib.metadata import PackageNotFoundError, version
 from typing import Type, Tuple, Optional
 
 import cuda.bindings.driver as cuda
@@ -55,6 +56,17 @@ from ..moe_sched_extension import (
 from ..moe_kernel_helpers import (
     compute_stages_wgrad,
 )
+
+
+def _using_internal_cutlass_dsl() -> bool:
+    try:
+        version("nvidia-cutlass-dsl-internal")
+    except PackageNotFoundError:
+        return False
+    return True
+
+
+_USING_INTERNAL_CUTLASS_DSL = _using_internal_cutlass_dsl()
 
 
 class BlockScaledMoEGroupedGemmWgradKernel:
@@ -315,14 +327,22 @@ class BlockScaledMoEGroupedGemmWgradKernel:
         out_single_expert: Optional[cute.Tensor] = None,
     ) -> None:
 
-        # SM100 still needs the packed-FP4 from_dlpack layout workaround.
-        # Rubin consumes the native 4-bit layout directly.
-        if cutlass.const_expr(self.architecture != "sm_107" and mat_a.iterator.dtype.width < 8):
+        # Public CUTLASS DSL 4.5 needs the packed-FP4 from_dlpack layout
+        # workaround. Rubin and the internal DSL wheel consume the native
+        # 4-bit layout directly.
+        needs_fp4_layout_workaround = (
+            self.architecture != "sm_107" and not _USING_INTERNAL_CUTLASS_DSL
+        )
+        if cutlass.const_expr(
+            needs_fp4_layout_workaround and mat_a.iterator.dtype.width < 8
+        ):
             mat_a = cute.make_tensor(
                 mat_a.iterator,
                 cute.recast_layout(mat_a.iterator.dtype.width, 8, mat_a.layout),
             )
-        if cutlass.const_expr(self.architecture != "sm_107" and mat_b.iterator.dtype.width < 8):
+        if cutlass.const_expr(
+            needs_fp4_layout_workaround and mat_b.iterator.dtype.width < 8
+        ):
             mat_b = cute.make_tensor(
                 mat_b.iterator,
                 cute.recast_layout(mat_b.iterator.dtype.width, 8, mat_b.layout),
@@ -469,6 +489,23 @@ class BlockScaledMoEGroupedGemmWgradKernel:
             a_smem_layout_helper = None
             b_smem_layout_helper = None
 
+        # Blackwell's epilogue tile is an MLIR-backed layout and must be
+        # created outside the isolated helper-kernel region. Rubin uses a
+        # static tuple and rebuilds the C TMA metadata inside the helper.
+        if cutlass.const_expr(
+            self.weight_mode == MoEWeightMode.DISCRETE
+            and self.architecture != "sm_107"
+        ):
+            c_tma_op_helper = c_tma_op
+            epi_smem_layout_helper = cute.select(
+                self.c_smem_layout_staged, mode=[0, 1]
+            )
+            epi_tile_helper = self.epi_tile
+        else:
+            c_tma_op_helper = None
+            epi_smem_layout_helper = None
+            epi_tile_helper = None
+
         self.helper_kernel(
             sfa_gemm,
             sfb_gemm,
@@ -484,6 +521,9 @@ class BlockScaledMoEGroupedGemmWgradKernel:
             self.cluster_layout_sfb_vmnk.shape,
             out if cutlass.const_expr(self.weight_mode == MoEWeightMode.DISCRETE) else None,
             c_gemm if cutlass.const_expr(self.weight_mode == MoEWeightMode.DISCRETE) else None,
+            c_tma_op_helper,
+            epi_smem_layout_helper,
+            epi_tile_helper,
             a_gemm_helper,
             b_gemm_helper,
             a_op_helper,
@@ -612,6 +652,9 @@ class BlockScaledMoEGroupedGemmWgradKernel:
         cluster_layout_sfb_vmnk_shape: cutlass.Constexpr,
         c_ptrs=None,
         c_single_expert=None,
+        c_tma_op: cutlass.Constexpr = None,
+        epi_smem_layout=None,
+        epi_tile=None,
         a_tensor=None,
         b_tensor=None,
         a_tma_op: cutlass.Constexpr = None,
@@ -626,11 +669,13 @@ class BlockScaledMoEGroupedGemmWgradKernel:
         """
         from ..moe_utils import WgradSfTensormapConstructor
 
-        # Build C's operation in the helper-kernel IR context. In particular,
-        # TMA reduce requires its SMEM layout and CTA V-map to be static in
-        # that context; reusing the host-created operation leaves a dynamic
-        # CTA V-map for discrete accumulated wgrad.
-        if cutlass.const_expr(self.weight_mode == MoEWeightMode.DISCRETE):
+        # Rubin requires C's TMA operation and static layout to be built in
+        # the helper-kernel IR context. Blackwell receives host-built values
+        # because its MLIR-backed epilogue tile cannot cross region isolation.
+        if cutlass.const_expr(
+            self.weight_mode == MoEWeightMode.DISCRETE
+            and self.architecture == "sm_107"
+        ):
             if cutlass.const_expr(self.accumulate_on_output):
                 c_tma_op = cpasync.CopyReduceBulkTensorTileS2GOp()
             else:
@@ -643,10 +688,6 @@ class BlockScaledMoEGroupedGemmWgradKernel:
             )
             epi_smem_layout = cute.select(c_smem_layout_staged, mode=[0, 1])
             epi_tile = self.epi_tile
-        else:
-            c_tma_op = None
-            epi_smem_layout = None
-            epi_tile = None
 
         ctor = WgradSfTensormapConstructor(
             sf_vec_size=self.sf_vec_size,
