@@ -89,7 +89,7 @@ def _device_memory_budget(fraction: float = _WORKER_MEM_FRACTION) -> int:
     (e.g. dry-run collection on a CPU-only node).
     """
     if torch.cuda.is_available():
-        total = torch.cuda.get_device_properties(0).total_memory
+        total = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory
         return int(total / _pytest_worker_count() * fraction)
     return 7 * (1 << 30)
 
@@ -206,17 +206,14 @@ def _kernel_cfg_choices(graph, engine_index: int) -> List[dict]:
     kernel_cfg_knobs = [knob for knob in knobs if knob.type == cudnn.knob_type.KERNEL_CFG]
     if not kernel_cfg_knobs:
         return [{}]
+    if len(kernel_cfg_knobs) > 1:
+        detail = "an execution plan can represent only one value per knob type"
+        raise RuntimeError(f"graph engine index {engine_index} reports multiple KERNEL_CFG knobs, but {detail}")
 
-    choices = [{}]
-    for knob in kernel_cfg_knobs:
-        next_choices = []
-        for value in range(knob.min_value, knob.max_value + 1, knob.stride):
-            for choice in choices:
-                candidate = dict(choice)
-                candidate[knob.type] = value
-                next_choices.append(candidate)
-        choices = next_choices
-    return choices
+    knob = kernel_cfg_knobs[0]
+    if knob.stride <= 0:
+        raise RuntimeError(f"graph engine index {engine_index} reports invalid KERNEL_CFG stride {knob.stride}")
+    return [{knob.type: value} for value in range(knob.min_value, knob.max_value + 1, knob.stride)]
 
 
 def _validate_graph_engine_indices(graph, graph_engine_indices: List[int]) -> None:
@@ -612,15 +609,33 @@ def _parse_dtype(value) -> torch.dtype:
 
 def _int_list(config: dict, key: str, length: int) -> List[int]:
     try:
-        values = [int(v) for v in config[key]]
+        raw_values = config[key]
     except KeyError as e:
         raise ValueError(f"Missing {key!r} in repro config") from e
-    except TypeError as e:
-        raise ValueError(f"{key!r} in repro config must be a list") from e
+
+    if not isinstance(raw_values, list):
+        raise ValueError(f"{key!r} in repro config must be a list")
+    try:
+        values = [int(v) for v in raw_values]
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"{key!r} in repro config must contain integers") from e
 
     if len(values) != length:
         raise ValueError(f"{key!r} length {len(values)} does not match spatial_dims={length}")
     return values
+
+
+def _parse_spatial_dims(config: dict) -> int:
+    try:
+        spatial_dims = int(config["spatial_dims"])
+    except KeyError as e:
+        raise ValueError("Missing 'spatial_dims' in repro config") from e
+    except (TypeError, ValueError) as e:
+        raise ValueError("'spatial_dims' in repro config must be 2 or 3") from e
+
+    if spatial_dims not in (2, 3):
+        raise ValueError("'spatial_dims' in repro config must be 2 or 3")
+    return spatial_dims
 
 
 def _config_from_repro_payload(payload: dict) -> LargeTensorConfig:
@@ -640,7 +655,7 @@ def _config_from_repro_payload(payload: dict) -> LargeTensorConfig:
         raise ValueError("Repro payload 'config' must be a JSON object")
 
     try:
-        spatial_dims = int(config["spatial_dims"])
+        spatial_dims = _parse_spatial_dims(config)
         epilogue = str(config.get("epilogue", "none"))
         if epilogue not in ("none", "relu", "bias_relu"):
             raise ValueError(f"Unsupported epilogue in repro config: {epilogue!r}")
@@ -1312,6 +1327,9 @@ def _run_single_config(
 
 
 def _run_test(cfg: LargeTensorConfig, cudnn_handle, test_num: int, total_tests: int, config_seed: int, allow_unaligned: bool, include_extras: bool) -> None:
+    if cudnn_handle is None:
+        pytest.skip("cuDNN handle not available")
+
     if _REGEN_ON_UNSUPPORTED_ENABLED:
         # Replay from config_seed so regeneration can advance past unsupported
         # candidates; cfg is the first candidate from the same generator.
@@ -1430,6 +1448,8 @@ def test_conv_large_tensor_repro(cudnn_handle):
     cfg = _load_repro_config()
     if cfg is None:
         pytest.skip(f"Set {_REPRO_CONFIG_ENV} or {_REPRO_FILE_ENV} to run an exact configuration")
+    if cudnn_handle is None:
+        pytest.skip("cuDNN handle not available")
 
     ok, msg = _run_single_config(cfg, cudnn_handle)
     if ok:
