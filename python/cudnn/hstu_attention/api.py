@@ -909,21 +909,34 @@ def hstu_attention_backward(
     func_tensor: Optional[torch.Tensor] = None,
     deterministic: bool = False,
     stream: Optional[cuda.CUstream | torch.cuda.Stream] = None,
+    dq_tensor: Optional[torch.Tensor] = None,
+    dk_tensor: Optional[torch.Tensor] = None,
+    dv_tensor: Optional[torch.Tensor] = None,
 ) -> TupleDict:
-    """Allocate and compute packed HSTU backward on an SM10x GPU."""
+    """Compute packed HSTU backward on an SM10x GPU.
+
+    Any gradient output tensor that is not provided is allocated by this
+    function. Caller-provided gradient outputs are overwritten and returned.
+    """
     _validate_cu_seqlens_metadata(cu_seqlens_q_tensor, "cu_seqlens_q_tensor")
     _validate_cu_seqlens_metadata(cu_seqlens_k_tensor, "cu_seqlens_k_tensor")
     resolved_max_q = _resolve_max_seqlen(max_seqlen_q, q_tensor.shape[0], "max_seqlen_q")
     resolved_max_k = _resolve_max_seqlen(max_seqlen_k, k_tensor.shape[0], "max_seqlen_k")
     resolved_scaling = float(resolved_max_q if scaling_seqlen is None else scaling_seqlen)
-    dq_tensor = _empty_grad_like(q_tensor)
-    dk_tensor = _empty_grad_like(k_tensor)
-    dv_tensor = _empty_grad_like(v_tensor)
+    if dq_tensor is None:
+        dq_tensor = _empty_grad_like(q_tensor)
+    if dk_tensor is None:
+        dk_tensor = _empty_grad_like(k_tensor)
+    if dv_tensor is None:
+        dv_tensor = _empty_grad_like(v_tensor)
     cache_key = (
         _tensor_signature(do_tensor),
         _tensor_signature(q_tensor),
         _tensor_signature(k_tensor),
         _tensor_signature(v_tensor),
+        _tensor_signature(dq_tensor),
+        _tensor_signature(dk_tensor),
+        _tensor_signature(dv_tensor),
         _tensor_signature(cu_seqlens_q_tensor),
         _tensor_signature(cu_seqlens_k_tensor),
         _tensor_signature(func_tensor),

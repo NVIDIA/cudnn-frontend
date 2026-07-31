@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 import inspect
 
 import pytest
@@ -23,7 +24,7 @@ from cudnn.hstu_attention import (
     hstu_attention_backward,
     hstu_attention_forward,
 )
-from cudnn.hstu_attention import _interface
+from cudnn.hstu_attention import _interface, api as _api
 
 pytestmark = [
     pytest.mark.gpu_exclusive,
@@ -188,12 +189,18 @@ def test_public_functional_and_class_signatures_are_stable():
             "func_tensor",
             "deterministic",
             "stream",
+            "dq_tensor",
+            "dk_tensor",
+            "dv_tensor",
         ),
         {
             **common_defaults,
             "func_tensor": None,
             "deterministic": False,
             "stream": None,
+            "dq_tensor": None,
+            "dk_tensor": None,
+            "dv_tensor": None,
         },
     )
     _assert_public_signature(
@@ -667,6 +674,87 @@ def test_backward_matches_pytorch(dtype, head_dim):
             rtol=6e-2,
             atol=6e-2,
         )
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
+@pytest.mark.parametrize("head_dim", [64, 256])
+def test_backward_supports_optional_gradient_outputs(head_dim, monkeypatch):
+    cache = OrderedDict()
+    monkeypatch.setattr(_api, "_BWD_CACHE", cache)
+    q, k, v, do, cu = _inputs(head_dim=head_dim)
+    kwargs = {
+        "max_seqlen_q": 128,
+        "max_seqlen_k": 128,
+        "window_size": (-1, 0),
+        "alpha": 0.7,
+        "scaling_seqlen": 64.0,
+    }
+
+    expected = hstu_attention_backward(do, q, k, v, cu, cu, **kwargs)
+    assert len(cache) == 1
+
+    padded_outputs = [
+        torch.full(
+            (reference.shape[0], reference.shape[1] + 2, reference.shape[2]),
+            float("nan"),
+            dtype=reference.dtype,
+            device=reference.device,
+        )
+        for reference in (q, k, v)
+    ]
+    dq, dk, dv = (
+        storage[:, : reference.shape[1]]
+        for storage, reference in zip(padded_outputs, (q, k, v))
+    )
+    actual = hstu_attention_backward(
+        do,
+        q,
+        k,
+        v,
+        cu,
+        cu,
+        **kwargs,
+        dq_tensor=dq,
+        dk_tensor=dk,
+        dv_tensor=dv,
+    )
+
+    assert len(cache) == 2
+    for name, output in zip(("dq_tensor", "dk_tensor", "dv_tensor"), (dq, dk, dv)):
+        assert actual[name] is output
+        torch.testing.assert_close(actual[name], expected[name], rtol=1e-2, atol=1e-2)
+
+    partial_dq_storage = torch.full_like(padded_outputs[0], float("nan"))
+    partial_dq = partial_dq_storage[:, : q.shape[1]]
+    partial = hstu_attention_backward(
+        do,
+        q,
+        k,
+        v,
+        cu,
+        cu,
+        **kwargs,
+        dq_tensor=partial_dq,
+    )
+
+    assert len(cache) == 3
+    assert partial["dq_tensor"] is partial_dq
+    for name in ("dq_tensor", "dk_tensor", "dv_tensor"):
+        torch.testing.assert_close(partial[name], expected[name], rtol=1e-2, atol=1e-2)
+
+    with pytest.raises(ValueError, match="dq_tensor storage must not overlap q_tensor storage"):
+        hstu_attention_backward(
+            do,
+            q,
+            k,
+            v,
+            cu,
+            cu,
+            **kwargs,
+            dq_tensor=q,
+        )
+    assert len(cache) == 3
 
 
 @pytest.mark.L0

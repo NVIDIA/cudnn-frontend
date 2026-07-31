@@ -130,6 +130,11 @@ dk = grads["dk_tensor"]
 dv = grads["dv_tensor"]
 ```
 
+The optional `dq_tensor`, `dk_tensor`, and `dv_tensor` arguments provide
+caller-owned gradient output buffers. They can be supplied independently; the
+function allocates any omitted output. Supplied buffers are overwritten and
+returned in the result dictionary.
+
 Forward and backward must use the same `alpha`, `scaling_seqlen`, mask
 configuration, and sequence metadata. `scaling_seqlen` must be positive. It is
 a runtime normalization factor rather than the number of valid tokens in each
