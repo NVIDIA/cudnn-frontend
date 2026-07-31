@@ -431,11 +431,6 @@ class GroupedGemmQuantSm100(APIBase):
                 extra_error_msg="row_scale must be float32",
             )
 
-        self._not_implemented_error_if(
-            self._is_fp4x2(self.ab_dtype) and self.sf_vec_size == 16 and self.d_dtype == torch.float32,
-            "Invalid configuration: fp4 ab_dtype, sf_vec_size 16, d_dtype float32 is not supported. Please use sf_vec_size 32 or d_dtype bf16 instead",
-        )
-
         if self.weight_mode == MoEWeightMode.DISCRETE:
             self._value_error_if(
                 self.b_major not in ["k", "n"],
@@ -951,7 +946,14 @@ class GroupedGemmQuantSm100(APIBase):
                 stride=self.prob_desc.stride,
                 assumed_align=16,
             )
-        row_scale_tensor = self._make_fake_cute_tensor_from_desc(self.row_scale_desc, assumed_align=16)
+        row_scale_tensor = None
+        if self.row_scale_desc is not None:
+            row_scale_tensor = self._make_fake_cute_tensor(
+                dtype=self.row_scale_desc.dtype,
+                shape=(valid_m,),
+                stride=self.row_scale_desc.stride,
+                assumed_align=16,
+            )
         bias_cute_fake = self._make_fake_cute_tensor_from_desc(self.bias_desc, assumed_align=16)
 
         b_ptrs_placeholder = torch.empty((self.expert_cnt,), dtype=torch.int64, device="cuda")

@@ -346,7 +346,10 @@ def run_grouped_gemm_quant_ref(
         start = 0
         for i, group_m in enumerate(aligned_group_m_list):
             end = start + group_m
-            amax_ref[i] = compute_reference_amax(ref[start:end, :, 0].clone())
+            if group_m == 0:
+                amax_ref[i] = float("-inf")
+            else:
+                amax_ref[i] = compute_reference_amax(ref[start:end, :, 0].clone())
             start = end
         ref_tensors["amax_ref"] = amax_ref
 
