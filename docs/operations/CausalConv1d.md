@@ -1,6 +1,6 @@
 # Causal Conv1d
 
-The NCW and NWH APIs compute depthwise causal 1-D convolution with optional fused activation:
+The NHW and NWH APIs compute depthwise causal 1-D convolution with optional fused activation:
 
 $$ y = \text{activation}(\text{conv1d\_causal}(x, w) + b) $$
 
@@ -12,7 +12,7 @@ Supports forward and backward passes with `torch.autograd` and `torch.compile`.
 
 - **Architectures**: Turing (SM75) or later
 - **Data types**: FP32, FP16, BF16
-- **Activations**: `identity` and `silu` for NCW and NWH; B2B uses fixed gating
+- **Activations**: `identity` and `silu` for NHW and NWH; B2B uses fixed gating
 
 ### Kernel sizes
 
@@ -20,7 +20,7 @@ The supported kernel-size range depends on the layout and, for the fused B2B ope
 
 | Frontend entry point | Kernel role | Supported kernel size |
 |---|---|---:|
-| `cudnn.ops.causal_conv1d` | NCW convolution | 2–256 |
+| `cudnn.ops.causal_conv1d` | NHW convolution | 2–256 |
 | `cudnn.ops.causal_conv1d_nwh` | NWH convolution | 2–128 |
 | `cudnn.ops.b2b_causal_conv1d` | Projection | 2–32 |
 | `cudnn.ops.b2b_causal_conv1d` | Mixer | 2–256 |
@@ -29,11 +29,11 @@ The same limits apply to forward and backward execution.
 
 ## Python API
 
-Three high-level Python APIs are available for NCW, NWH, and fused back-to-back (B2B) causal convolution.
+Three high-level Python APIs are available for NHW, NWH, and fused back-to-back (B2B) causal convolution.
 
 ### `cudnn.ops.causal_conv1d`
 
-Runs depthwise causal convolution with NCW tensor layout:
+Runs depthwise causal convolution with NHW tensor layout:
 
 ```python
 import cudnn
@@ -62,7 +62,7 @@ Where:
 - $L$ is the sequence length
 - $K$ is the kernel size
 
-See the [NCW forward notebook](../../samples/python/60_causal_conv1d_forward.ipynb) and [NCW backward notebook](../../samples/python/61_causal_conv1d_backward.ipynb) for PyTorch references and numerical comparisons.
+See the [NHW forward notebook](../../samples/python/60_causal_conv1d_forward.ipynb) and [NHW backward notebook](../../samples/python/61_causal_conv1d_backward.ipynb) for PyTorch references and numerical comparisons.
 
 ### `cudnn.ops.causal_conv1d_nwh`
 
@@ -72,15 +72,15 @@ Runs the same depthwise causal convolution with NWH tensor layout. NWH stores th
 import torch
 
 K, D = weight.shape
-x_ncw = x.transpose(1, 2)                             # (B, D, L)
-weight_ncw = weight.T.unsqueeze(1)                    # (D, 1, K)
-x_padded = torch.nn.functional.pad(x_ncw, (K - 1, 0))
-y_ncw = torch.nn.functional.conv1d(
-    x_padded, weight_ncw, bias=bias, groups=D
+x_nhw = x.transpose(1, 2)                             # (B, D, L)
+weight_nhw = weight.T.unsqueeze(1)                    # (D, 1, K)
+x_padded = torch.nn.functional.pad(x_nhw, (K - 1, 0))
+y_nhw = torch.nn.functional.conv1d(
+    x_padded, weight_nhw, bias=bias, groups=D
 )
 if activation == "silu":
-    y_ncw = torch.nn.functional.silu(y_ncw)
-y = y_ncw.transpose(1, 2)                             # (B, L, D)
+    y_nhw = torch.nn.functional.silu(y_nhw)
+y = y_nhw.transpose(1, 2)                             # (B, L, D)
 ```
 
 Each channel is convolved independently, and causal padding adds $K-1$ elements on the left and none on the right.
@@ -153,7 +153,7 @@ See the [B2B forward notebook](../../samples/python/64_b2b_causal_conv1d_forward
 
 The forward and backward C-level bindings are re-exported at the top level:
 
-NCW layout, requiring cuDNN 9.22.0 or later and supporting kernel size 2–256:
+NHW layout, requiring cuDNN 9.22.0 or later and supporting kernel size 2–256:
 
 - `cudnn.causal_conv1d_forward(stream, x_ptr, weight_ptr, bias_ptr, out_ptr, batch, dim, seq_len, kernel_size, data_type, activation)`
 - `cudnn.causal_conv1d_backward(stream, x_ptr, weight_ptr, bias_ptr, dy_ptr, dx_ptr, dweight_ptr, dbias_ptr, batch, dim, seq_len, kernel_size, data_type, dw_data_type, activation)`
