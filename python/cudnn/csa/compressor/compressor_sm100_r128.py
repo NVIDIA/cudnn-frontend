@@ -125,9 +125,18 @@ _L2E_HI = 1.4426950216293335  # fp32(log2(e))
 _L2E_LO = 1.925963033500011e-08  # fp32(log2(e) - _L2E_HI); residual ~4e-16
 
 
+# ``cute.math.exp2``'s ``approx``/``ftz`` keywords are newer than the
+# ``nvidia-cutlass-dsl>=4.5.0`` floor this project's dependency spec resolves to, so the
+# same instruction is requested through ``fastmath=True``, which both versions accept.
+# Both spellings lower to ``ex2.approx.ftz.f32`` -- the form the tolerance contract is
+# calibrated on: on 4.6.1 the 16-kernel ``reg_probe_csa_compressor_r128.py`` PTX is
+# byte-identical either way (1104 ``ex2.approx.ftz.f32``, same registers, no spills), and
+# on 4.5.0 the same 1104 instructions are emitted.
+
+
 def _exp_fast(x):
     y = _ffma_rn(x, cutlass.Float32(_L2E_LO), _fmul_rn(x, cutlass.Float32(_L2E_HI)))
-    return cute_math.exp2(y, approx=True, ftz=True)
+    return cute_math.exp2(y, fastmath=True)
 
 
 @cute.kernel
