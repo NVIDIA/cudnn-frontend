@@ -86,9 +86,10 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 3. NVIDIA CUTLASS
    https://github.com/NVIDIA/cutlass
 
-Portions of the CuTe DSL GEMM kernels under python/cudnn/ (gemm_*,
-grouped_gemm*, discrete_grouped_gemm*, native_sparse_attention, and
-related utilities) are derived from CUTLASS CuTe DSL examples. CUTLASS
+Portions of the CuTe DSL GEMM kernels under python/cudnn/ (gemm/cutedsl/*
+covering the dense, grouped, and discrete_grouped families,
+native_sparse_attention, and related utilities) are derived from CUTLASS
+CuTe DSL examples. CUTLASS
 is also consumed at runtime as the nvidia-cutlass-dsl PyPI package
 (optional dependency).
 

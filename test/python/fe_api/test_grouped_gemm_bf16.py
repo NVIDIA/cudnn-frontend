@@ -27,7 +27,7 @@ def require_sm100():
 @pytest.mark.L0
 @pytest.mark.parametrize("discrete", [False, True], ids=["bf16-dense", "bf16-discrete"])
 def test_grouped_gemm_bf16_wrapper(discrete):
-    from cudnn.grouped_gemm.grouped_gemm_unfused import grouped_gemm_wrapper_sm100
+    from cudnn import grouped_gemm_wrapper_sm100
 
     problem = make_grouped_gemm_bf16_problem(discrete=discrete, enable_bias=True)
     expected_c, expected_d = grouped_gemm_bf16_reference(problem)

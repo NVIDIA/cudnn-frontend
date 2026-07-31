@@ -21,29 +21,29 @@ pytest.importorskip("cutlass")
 
 RUBIN_DISPATCH_CASES = [
     pytest.param(
-        "cudnn.grouped_gemm.grouped_gemm_quant.api",
-        "cudnn.grouped_gemm.grouped_gemm_quant.grouped_gemm_quant",
+        "cudnn.gemm.cutedsl.grouped.quant.api",
+        "cudnn.gemm.cutedsl.grouped.quant.grouped_gemm_quant",
         "BlockScaledMoEGroupedGemmQuantKernel",
         "moe_blockscaled_grouped_gemm_quant_rubin.py",
         id="grouped_gemm_quant",
     ),
     pytest.param(
-        "cudnn.grouped_gemm.grouped_gemm_glu.api",
-        "cudnn.grouped_gemm.grouped_gemm_glu.moe_blockscaled_grouped_gemm_glu_bias",
+        "cudnn.gemm.cutedsl.grouped.glu.api",
+        "cudnn.gemm.cutedsl.grouped.glu.moe_blockscaled_grouped_gemm_glu_bias",
         "BlockScaledMoEGroupedGemmGluBiasKernel",
         "moe_blockscaled_grouped_gemm_glu_rubin.py",
         id="grouped_gemm_glu",
     ),
     pytest.param(
-        "cudnn.grouped_gemm.grouped_gemm_dglu.api",
-        "cudnn.grouped_gemm.grouped_gemm_dglu.moe_blockscaled_grouped_gemm_dglu_dbias",
+        "cudnn.gemm.cutedsl.grouped.dglu.api",
+        "cudnn.gemm.cutedsl.grouped.dglu.moe_blockscaled_grouped_gemm_dglu_dbias",
         "BlockScaledMoEGroupedGemmDgluDbiasKernel",
         "moe_blockscaled_grouped_gemm_dglu_rubin.py",
         id="grouped_gemm_dglu",
     ),
     pytest.param(
-        "cudnn.grouped_gemm.grouped_gemm_wgrad.api",
-        "cudnn.grouped_gemm.grouped_gemm_wgrad.moe_blockscaled_grouped_gemm_wgrad",
+        "cudnn.gemm.cutedsl.grouped.wgrad.api",
+        "cudnn.gemm.cutedsl.grouped.wgrad.moe_blockscaled_grouped_gemm_wgrad",
         "BlockScaledMoEGroupedGemmWgradKernel",
         "moe_blockscaled_grouped_gemm_wgrad_rubin.py",
         id="grouped_gemm_wgrad",
@@ -171,7 +171,7 @@ def test_kernel_selection_uses_rubin_on_sm107(
 @pytest.mark.L0
 def test_grouped_gemm_quant_has_rubin_compile_branches():
     """Quant adapts compile/execute kwargs on Rubin; keep this contract covered."""
-    api_mod = _import_api_module("cudnn.grouped_gemm.grouped_gemm_quant.api")
+    api_mod = _import_api_module("cudnn.gemm.cutedsl.grouped.quant.api")
     source = Path(api_mod.__file__).read_text(encoding="utf-8")
 
     assert "self._is_rubin_kernel" in source
@@ -199,7 +199,7 @@ def test_grouped_gemm_wgrad_rubin_quantization_validation(
     sf_vec_size,
     expected,
 ):
-    api_mod = _import_api_module("cudnn.grouped_gemm.grouped_gemm_wgrad.api")
+    api_mod = _import_api_module("cudnn.gemm.cutedsl.grouped.wgrad.api")
     torch = api_mod.torch
 
     assert (
@@ -215,7 +215,7 @@ def test_grouped_gemm_wgrad_rubin_quantization_validation(
 @pytest.mark.L0
 def test_grouped_gemm_wgrad_rubin_tmem_plan_rejects_invalid_sf_vector():
     rubin_mod = importlib.import_module(
-        "cudnn.grouped_gemm.grouped_gemm_wgrad.moe_blockscaled_grouped_gemm_wgrad_rubin"
+        "cudnn.gemm.cutedsl.grouped.wgrad.moe_blockscaled_grouped_gemm_wgrad_rubin"
     )
 
     with pytest.raises(ValueError, match="divisible by sf_vec_size"):
