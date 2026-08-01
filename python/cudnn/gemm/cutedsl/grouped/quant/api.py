@@ -267,11 +267,6 @@ class GroupedGemmQuantSm100(APIBase):
         self._check_tensor_shape(self.sfd_col_desc, (32, 4, ceil_div(n, 128), 4, rest_m, 1), "SFD_col")
 
         self._check_tensor_shape(self.alpha_desc, (self.expert_cnt,), "alpha")
-        self._value_error_if(
-            self.prob_desc is None,
-            "prob_tensor is required: the kernel unconditionally multiplies output by per-row gating probability. "
-            "Pass a tensor of ones with shape (valid_m, 1, 1) if no gating is needed.",
-        )
         self._check_tensor_shape(self.prob_desc, (tensor_m, 1, 1), "prob")
         self._not_implemented_error_if(
             self._is_rubin_kernel and self.row_scale_desc is not None,
@@ -948,12 +943,14 @@ class GroupedGemmQuantSm100(APIBase):
         norm_const_tensor_cute = self._make_fake_cute_tensor_from_desc(self.norm_const_desc, assumed_align=16)
         padded_offsets_tensor = self._make_fake_cute_tensor_from_desc(self.padded_offsets_desc, assumed_align=16)
         alpha_tensor = self._make_fake_cute_tensor_from_desc(self.alpha_desc, assumed_align=16)
-        prob_tensor = self._make_fake_cute_tensor(
-            dtype=self.prob_desc.dtype,
-            shape=(valid_m, *self.prob_desc.shape[1:]),
-            stride=self.prob_desc.stride,
-            assumed_align=16,
-        )
+        prob_tensor = None
+        if self.prob_desc is not None:
+            prob_tensor = self._make_fake_cute_tensor(
+                dtype=self.prob_desc.dtype,
+                shape=(valid_m, *self.prob_desc.shape[1:]),
+                stride=self.prob_desc.stride,
+                assumed_align=16,
+            )
         row_scale_tensor = self._make_fake_cute_tensor_from_desc(self.row_scale_desc, assumed_align=16)
         bias_cute_fake = self._make_fake_cute_tensor_from_desc(self.bias_desc, assumed_align=16)
 
@@ -1112,7 +1109,8 @@ class GroupedGemmQuantSm100(APIBase):
         :param sfd_col_tensor: Optional column scale factor D
         :param amax_tensor: Optional amax tensor
         :param norm_const_tensor: Optional normalization constant
-        :param prob_tensor: Probability tensor for per-row gating. Required.
+        :param prob_tensor: Optional probability tensor for per-row gating. When
+            omitted, the kernel compiles out the probability load and multiply.
         :param row_scale_tensor: Optional contiguous FP32 tensor of shape ``(valid_m,)``.
             When provided, the epilogue multiplies accumulators by
             ``alpha_tensor[expert] * row_scale_tensor[m]`` before output
@@ -1136,11 +1134,6 @@ class GroupedGemmQuantSm100(APIBase):
                 "d_col_tensor is required when SFD outputs are generated",
             )
             d_col_tensor = d_tensor
-        self._value_error_if(
-            prob_tensor is None,
-            "prob_tensor is required: the kernel unconditionally multiplies output by per-row gating probability. "
-            "Pass a tensor of ones with shape (valid_m, 1, 1) if no gating is needed.",
-        )
         if self._has_bias:
             self._value_error_if(
                 bias_tensor is None,
@@ -1268,8 +1261,9 @@ def grouped_gemm_quant_wrapper_sm100(
         norm_const_tensor: Optional normalization constant. Required when using FP8
             input configurations (i.e., when a_tensor.dtype is FP8 and sfa_tensor.dtype is FP8).
             Should be None for FP4/BF16 input configurations.
-        prob_tensor: Probability tensor for per-row gating (shape `(valid_m, 1, 1)`).
-            This argument is required. Pass a tensor of ones when no gating is needed.
+        prob_tensor: Optional probability tensor for per-row gating (shape
+            `(valid_m, 1, 1)`). When omitted, the kernel compiles out the
+            probability load and multiply.
         row_scale_tensor: Optional FP32 tensor of shape `(valid_m,)`.
             When provided, the epilogue multiplies accumulators by
             `alpha_tensor[expert] * row_scale_tensor[m]` before output
@@ -1424,11 +1418,6 @@ def grouped_gemm_quant_wrapper_sm100(
         _logger.debug("grouped_gemm_quant_wrapper_sm100: Detected bf16/float16 d_dtype, constructing amax_tensor")
         amax_tensor = torch.full((l, 1), float("-inf"), dtype=torch.float32, device=a_tensor.device)
 
-    if prob_tensor is None:
-        raise ValueError(
-            "prob_tensor is required: the kernel unconditionally multiplies output by per-row gating probability. "
-            "Pass a tensor of ones with shape (valid_m, 1, 1) if no gating is needed."
-        )
     device_type = get_device_type()
     if row_scale_tensor is not None:
         if device_type == "rubin":

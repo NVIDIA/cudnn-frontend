@@ -569,7 +569,7 @@ class BlockScaledMoEGroupedGemmQuantKernel:
         alpha: cute.Tensor,
         row_scale: Optional[cute.Tensor],
         bias: Optional[cute.Tensor],
-        prob: cute.Tensor,
+        prob: Optional[cute.Tensor],
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
@@ -644,6 +644,7 @@ class BlockScaledMoEGroupedGemmQuantKernel:
             sfd_col_tensor = cute.make_tensor(sfd_col_tensor.iterator, sfd_col_layout)
 
         self.generate_amax = amax_tensor is not None
+        self.has_prob = prob is not None
 
         # ---- TMA atoms ----
         tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
@@ -1103,7 +1104,7 @@ class BlockScaledMoEGroupedGemmQuantKernel:
         alpha: cute.Tensor,
         row_scale: Optional[cute.Tensor],
         mBias_nl: Optional[cute.Tensor],
-        prob: cute.Tensor,
+        prob: Optional[cute.Tensor],
         workspace_ptr,
         cluster_layout_vmnk: cute.Layout,
         cluster_layout_sfb_vmnk: cute.Layout,
@@ -1817,8 +1818,10 @@ class BlockScaledMoEGroupedGemmQuantKernel:
                     thread_tile_amax = cutlass.Float32(0.0)
 
                 mPosition = epi_work_tile_info.tile_m_idx * self.cta_tile_shape_mnk[0] + tidx
-                real_prob, _ = epi_ext.get_gmem_tensor("prob", prob, padded_offsets, epi_work_tile_info)
-                mProb = real_prob[mPosition, 0, 0]
+                mProb = cutlass.Float32(1.0)
+                if cutlass.const_expr(self.has_prob):
+                    real_prob, _ = epi_ext.get_gmem_tensor("prob", prob, padded_offsets, epi_work_tile_info)
+                    mProb = real_prob[mPosition, 0, 0]
                 acc_scale = cutlass.Float32(alpha_val)
                 # Optional per-row epilogue scale, applied together with the
                 # per-expert alpha before output conversion.
@@ -1871,12 +1874,13 @@ class BlockScaledMoEGroupedGemmQuantKernel:
                             for i in cutlass.range_constexpr(0, cute.size(tTR_rAcc), 2):
                                 bias_f32_0 = bias_vec[i].to(cutlass.Float32)
                                 bias_f32_1 = bias_vec[i + 1].to(cutlass.Float32)
-                                bias_f32_0, bias_f32_1 = cute.arch.mul_packed_f32x2(
-                                    (mProb, mProb),
-                                    (bias_f32_0, bias_f32_1),
-                                    rnd="rn",
-                                    ftz=False,
-                                )
+                                if cutlass.const_expr(self.has_prob):
+                                    bias_f32_0, bias_f32_1 = cute.arch.mul_packed_f32x2(
+                                        (mProb, mProb),
+                                        (bias_f32_0, bias_f32_1),
+                                        rnd="rn",
+                                        ftz=False,
+                                    )
                                 tTR_rAcc[i], tTR_rAcc[i + 1] = cute.arch.fma_packed_f32x2(
                                     (tTR_rAcc[i], tTR_rAcc[i + 1]),
                                     (acc_scale, acc_scale),
@@ -1886,7 +1890,10 @@ class BlockScaledMoEGroupedGemmQuantKernel:
                                 )
                         else:
                             for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
-                                tTR_rAcc[i] = tTR_rAcc[i] * acc_scale + bias_vec[i].to(cutlass.Float32) * mProb
+                                bias_val = bias_vec[i].to(cutlass.Float32)
+                                if cutlass.const_expr(self.has_prob):
+                                    bias_val = bias_val * mProb
+                                tTR_rAcc[i] = tTR_rAcc[i] * acc_scale + bias_val
                     else:
                         if cutlass.const_expr(self.vectorized_f32):
                             for i in cutlass.range_constexpr(0, cute.size(tTR_rAcc), 2):
@@ -1903,17 +1910,20 @@ class BlockScaledMoEGroupedGemmQuantKernel:
                     acc_vec = tTR_rAcc.load()
                     if cutlass.const_expr(not self.enable_bias):
                         tCompute = cute.make_rmem_tensor(acc_vec.shape, self.acc_dtype)
-                        if cutlass.const_expr(self.vectorized_f32):
-                            for i in cutlass.range_constexpr(0, cute.size(tTR_rAcc), 2):
-                                tCompute[i], tCompute[i + 1] = cute.arch.mul_packed_f32x2(
-                                    (acc_vec[i], acc_vec[i + 1]),
-                                    (mProb, mProb),
-                                    rnd="rn",
-                                    ftz=False,
-                                )
+                        if cutlass.const_expr(self.has_prob):
+                            if cutlass.const_expr(self.vectorized_f32):
+                                for i in cutlass.range_constexpr(0, cute.size(tTR_rAcc), 2):
+                                    tCompute[i], tCompute[i + 1] = cute.arch.mul_packed_f32x2(
+                                        (acc_vec[i], acc_vec[i + 1]),
+                                        (mProb, mProb),
+                                        rnd="rn",
+                                        ftz=False,
+                                    )
+                            else:
+                                for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
+                                    tCompute[i] = acc_vec[i] * mProb
                         else:
-                            for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
-                                tCompute[i] = acc_vec[i] * mProb
+                            tCompute.store(acc_vec)
                     else:
                         tCompute = tTR_rAcc
 

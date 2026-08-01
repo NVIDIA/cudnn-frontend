@@ -182,6 +182,22 @@ def test_grouped_gemm_quant_has_rubin_compile_branches():
 
 @pytest.mark.L0
 @pytest.mark.parametrize(
+    "kernel_path",
+    [
+        "grouped_gemm_quant/grouped_gemm_quant.py",
+        "grouped_gemm_quant/moe_blockscaled_grouped_gemm_quant_rubin.py",
+    ],
+)
+def test_grouped_gemm_quant_kernels_support_optional_prob(kernel_path):
+    """Blackwell and Rubin quant kernels compile out an omitted probability."""
+    source = (_GROUPED_GEMM_ROOT / kernel_path).read_text(encoding="utf-8")
+
+    assert "self.has_prob = prob is not None" in source
+    assert "if cutlass.const_expr(self.has_prob):" in source
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
     "ab_dtype_name,sf_dtype_name,sf_vec_size,expected",
     [
         ("float4_e2m1fn_x2", "float8_e4m3fn", 16, True),
@@ -218,9 +234,7 @@ def test_grouped_gemm_wgrad_rubin_tmem_plan_rejects_invalid_sf_vector():
         "cutlass.utils.rubin_helpers",
         reason="Rubin helpers are unavailable in this CUTLASS DSL wheel",
     )
-    rubin_mod = importlib.import_module(
-        "cudnn.gemm.cutedsl.grouped.wgrad.moe_blockscaled_grouped_gemm_wgrad_rubin"
-    )
+    rubin_mod = importlib.import_module("cudnn.gemm.cutedsl.grouped.wgrad.moe_blockscaled_grouped_gemm_wgrad_rubin")
 
     with pytest.raises(ValueError, match="divisible by sf_vec_size"):
         rubin_mod._make_tmem_plan(
