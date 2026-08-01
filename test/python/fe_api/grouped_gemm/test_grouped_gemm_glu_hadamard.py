@@ -40,7 +40,7 @@ def _make_cfg(request, *, ab_dtype, sf_dtype, sf_vec_size, enable_bias=False) ->
 
 
 def _apply_transpose_hadamard(d_ref: torch.Tensor, aligned_group_m_list) -> torch.Tensor:
-    from cudnn.grouped_gemm.grouped_gemm_glu_hadamard.hadamard_utils import HADAMARD_SIZE, hadamard_matrix
+    from cudnn.gemm.cutedsl.grouped.glu_hadamard.hadamard_utils import HADAMARD_SIZE, hadamard_matrix
 
     valid_m, n_out, _ = d_ref.shape
     hadamard = hadamard_matrix(HADAMARD_SIZE, dtype=torch.float32, device=d_ref.device)
@@ -372,7 +372,7 @@ def test_grouped_gemm_glu_hadamard_wrapper_with_bias(request):
 @pytest.mark.parametrize("group_m_list", [[256, 256, 256, 256], DYNAMIC_SHAPES_M_VALUES])
 def test_grouped_gemm_glu_hadamard_wrapper_cache_dynamic_m_smoke(request, monkeypatch, group_m_list):
     from cudnn import grouped_gemm_glu_hadamard_wrapper_sm100
-    from cudnn.grouped_gemm.grouped_gemm_glu_hadamard import api as grouped_gemm_glu_hadamard_api
+    from cudnn.gemm.cutedsl.grouped.glu_hadamard import api as grouped_gemm_glu_hadamard_api
 
     grouped_gemm_glu_hadamard_api._cache_of_GroupedGemmGluHadamardSm100Objects.clear()
 

@@ -730,7 +730,7 @@ def _test_grouped_gemm_quant_wrapper_dynamic_m_cache_behavior(
 ):
     try:
         from cudnn import grouped_gemm_quant_wrapper_sm100
-        from cudnn.grouped_gemm.grouped_gemm_quant import api as grouped_gemm_quant_api
+        from cudnn.gemm.cutedsl.grouped.quant import api as grouped_gemm_quant_api
         from cuda.bindings import driver as cuda
     except ImportError:
         pytest.skip("Environment not supported: cudnn optional dependencies not installed")
@@ -819,7 +819,7 @@ def _test_grouped_gemm_quant_wrapper_dynamic_nk_cache_behavior(
 ):
     try:
         from cudnn import grouped_gemm_quant_wrapper_sm100
-        from cudnn.grouped_gemm.grouped_gemm_quant import api as grouped_gemm_quant_api
+        from cudnn.gemm.cutedsl.grouped.quant import api as grouped_gemm_quant_api
         from cuda.bindings import driver as cuda
     except ImportError:
         pytest.skip("Environment not supported: cudnn optional dependencies not installed")
@@ -902,7 +902,7 @@ def _test_grouped_gemm_quant_discrete_wrapper_dynamic_m_cache_behavior(
 ):
     try:
         from cudnn import grouped_gemm_quant_wrapper_sm100
-        from cudnn.grouped_gemm.grouped_gemm_quant import api as grouped_gemm_quant_api
+        from cudnn.gemm.cutedsl.grouped.quant import api as grouped_gemm_quant_api
         from cuda.bindings import driver as cuda
     except ImportError:
         pytest.skip("Environment not supported: cudnn optional dependencies not installed")

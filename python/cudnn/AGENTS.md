@@ -11,13 +11,26 @@ The `cudnn` Python package: pybind11-backed graph API plus pure-Python **fronten
 ## Frontend-only kernel package layout
 
 ```
-python/cudnn/<operation>/            # or grouped_gemm/<op>/, discrete_grouped_gemm/<op>/, sdpa/<direction>/
+python/cudnn/<operation>/            # or sdpa/<direction>/, gemm/cutedsl/<layout>/<fusion>/
 ├── __init__.py                      # exports API class + wrapper via __all__
 ├── api.py                           # APIBase subclass + <operation>_wrapper() function
 └── <kernel_module>.py               # CuTeDSL kernel implementation(s); some families use csrc/ per-arch trees
 ```
 
-Shared helpers (schedulers, metadata utils, e.g. `grouped_gemm/moe_*.py`) stay internal to the family package — never exported through `cudnn`.
+All GEMM fusions live under `gemm/`, grouped by how the operands are laid out:
+
+```
+python/cudnn/gemm/
+├── cutedsl/
+│   ├── dense/<fusion>/              # amax, dsrelu, proj_rope_mxfp8, srelu, swiglu
+│   ├── grouped/<fusion>/            # dglu, dsrelu, dswiglu, glu, glu_hadamard,
+│   │                                #   quant, srelu, swiglu, unfused, wgrad
+│   └── discrete_grouped/<fusion>/   # dswiglu, swiglu (per-expert weight pointers)
+├── ops/                             # backend-independent torch custom-op contracts
+└── reference/                       # pure-PyTorch MATMUL/POINTWISE correctness engine
+```
+
+Shared helpers (schedulers, metadata utils, e.g. `gemm/cutedsl/grouped/moe_*.py`) stay internal to the family package — never exported through `cudnn`.
 
 ## The APIBase contract (`api_base.py`)
 

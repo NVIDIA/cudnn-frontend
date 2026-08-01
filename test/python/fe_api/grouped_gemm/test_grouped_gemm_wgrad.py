@@ -665,7 +665,7 @@ def _make_wgrad_wrapper_cache_inputs(group_k_list, sf_vec_size=16):
 
 @pytest.mark.parametrize("output_mode", ["dense", "discrete"])
 def test_grouped_gemm_wgrad_wrapper_dynamic_tokens_cache_behavior(monkeypatch, output_mode):
-    from cudnn.grouped_gemm.grouped_gemm_wgrad import api as grouped_gemm_wgrad_api
+    from cudnn.gemm.cutedsl.grouped.wgrad import api as grouped_gemm_wgrad_api
 
     grouped_gemm_wgrad_api._cache_of_GroupedGemmWgradSm100Objects.clear()
 
@@ -715,7 +715,7 @@ def test_grouped_gemm_wgrad_wrapper_dynamic_tokens_cache_behavior(monkeypatch, o
 
 @pytest.mark.L0
 def test_grouped_gemm_wgrad_wrapper_input_order_cache_key(monkeypatch):
-    from cudnn.grouped_gemm.grouped_gemm_wgrad import api as grouped_gemm_wgrad_api
+    from cudnn.gemm.cutedsl.grouped.wgrad import api as grouped_gemm_wgrad_api
 
     grouped_gemm_wgrad_api._cache_of_GroupedGemmWgradSm100Objects.clear()
 
