@@ -8,10 +8,9 @@ from typing import Optional
 
 import torch
 
-import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
-from cutlass.cute.typing import Float32, Int32, Float16, BFloat16
+from cutlass.cute.typing import Int32, Float16, BFloat16
 
 from ._kernels.hstu_fwd import HSTUAttentionForwardSm100
 from ._kernels.hstu_bwd import HSTUAttentionBackwardSm100
@@ -31,6 +30,14 @@ def _normalize_scaling_seqlen(
     if value <= 0.0:
         raise ValueError(f"scaling_seqlen must be positive, got {value}")
     return value
+
+
+def _sm100_compile_options(device: torch.device) -> str:
+    """Select the public SM100-family CUTLASS DSL target."""
+    capability = torch.cuda.get_device_capability(device)
+    if capability not in ((10, 0), (10, 3), (10, 7)):
+        raise RuntimeError(f"HSTU SM100 kernels require compute capability 10.0, 10.3, or 10.7, got {capability}")
+    return "--enable-tvm-ffi --gpu-arch sm_100f"
 
 
 def _mark_dynamic_tensor(
@@ -96,7 +103,18 @@ def _empty_bwd_compact_layout_like(t: torch.Tensor) -> torch.Tensor:
 
 
 def _as_bwd_original_qkv_layout(t: torch.Tensor) -> torch.Tensor:
-    return t.permute(0, 2, 1).unsqueeze(2).unsqueeze(4)
+    total_tokens, num_heads, head_dim = t.shape
+    stride_token, stride_head, stride_dim = t.stride()
+    return t.as_strided(
+        (total_tokens, head_dim, 1, num_heads, 1),
+        (
+            stride_token,
+            stride_dim,
+            stride_head * num_heads,
+            stride_head,
+            stride_dim,
+        ),
+    )
 
 
 def _supports_bwd_original_qkv_layout(t: torch.Tensor) -> bool:
@@ -170,6 +188,15 @@ def hstu_varlen_fwd_100(
     use_auto_block_metadata = is_arbitrary
     func_num = func.shape[-2] if func is not None else 0
     is_paged = paged_kv is not None
+    use_2cta_instrs = (
+        torch.cuda.get_device_capability(q.device) == (10, 7)
+        and head_dim == 128
+        and is_causal
+        and not is_local
+        and not is_arbitrary
+        and not is_paged
+        and q.shape[1] == k.shape[1] == v.shape[1]
+    )
     if is_paged:
         assert is_causal, "Paged KV is True, but causal mask is False, this is not supported."
         assert not is_local, "Paged KV is True, but local mask is True, this is not supported."
@@ -200,6 +227,7 @@ def hstu_varlen_fwd_100(
         is_paged,
         func_num,
         use_auto_block_metadata,
+        use_2cta_instrs,
     )
 
     block_sparse_tensors = None
@@ -258,6 +286,7 @@ def hstu_varlen_fwd_100(
             kBlockM=kBlockM,
             kBlockN=kBlockN,
             use_auto_block_metadata=use_auto_block_metadata,
+            use_2cta_instrs=use_2cta_instrs,
         )
         with torch.cuda.nvtx.range("hstu_varlen_fwd_kernel"):
             hstu_varlen_fwd_100.compile_cache[compile_key] = cute.compile(
@@ -280,7 +309,7 @@ def hstu_varlen_fwd_100(
                 page_ids_tensor,
                 page_indptrs_tensor,
                 block_sparse_cute,
-                options="--enable-tvm-ffi",
+                options=_sm100_compile_options(q.device),
             )
 
     if _compile_only:
@@ -348,10 +377,8 @@ def hstu_varlen_bwd_100(
     assert cu_seqlens_k.dtype == torch.int32, "cu_seqlens_k must have dtype int32"
 
     batch_size = cu_seqlens_q.shape[0] - 1
-    total_q = q.shape[0]
     num_heads = q.shape[1]
     head_dim = q.shape[2]
-    total_k = k.shape[0]
     num_heads_k = k.shape[1]
 
     assert head_dim in (64, 128, 256), "Only support head_dim 64, 128 and 256"
@@ -360,15 +387,15 @@ def hstu_varlen_bwd_100(
     assert v.shape[2] == head_dim, "v and q must have the same head_dim"
     assert do.shape == q.shape, "do and q must have the same shape"
 
-    kBlockM = 128
-    kBlockN = 128
+    m_block_size = 128
+    n_block_size = 128
     window_size_left = max_seqlen_k if window_size_left < 0 or window_size_left > max_seqlen_k else window_size_left
     window_size_right = max_seqlen_k if window_size_right < 0 or window_size_right > max_seqlen_k else window_size_right
     is_causal = window_size_left == max_seqlen_k and window_size_right == 0
     is_local = (window_size_left < max_seqlen_k or window_size_right < max_seqlen_k) and not is_causal
     is_arbitrary = func is not None
     func_num = func.shape[-2] if func is not None else 0
-
+    use_2cta_instrs = head_dim == 128 and not is_arbitrary
     if head_dim == 256:
         # The fused one-CTA kernel's live TMEM ranges exceed the SM100
         # 512-column capacity at D=256. Use the dedicated two-kernel path:
@@ -407,7 +434,7 @@ def hstu_varlen_bwd_100(
             cu_seqlens_k,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
-            block_size=(kBlockM, kBlockN),
+            block_size=(m_block_size, n_block_size),
             compile_only=_compile_only,
         )
 
@@ -432,8 +459,8 @@ def hstu_varlen_bwd_100(
         q_orig.device,
         q_dtype,
         head_dim,
-        kBlockM,
-        kBlockN,
+        m_block_size,
+        n_block_size,
         use_original_qkv_layout,
         use_original_do_layout,
         use_original_grad_layout,
@@ -442,6 +469,7 @@ def hstu_varlen_bwd_100(
         is_arbitrary,
         func_num,
         use_auto_block_metadata,
+        use_2cta_instrs,
     )
     if _compile_only and compile_key in hstu_varlen_bwd_100.compile_cache:
         if no_preallocated_grads:
@@ -459,12 +487,7 @@ def hstu_varlen_bwd_100(
         k = _as_bwd_compact_layout(k)
         v = _as_bwd_compact_layout(v)
 
-    # `do` shares the same original-layout fast path as q/k/v: when its layout is
-    # 128-bit aligned, hand it to the kernel directly (a permute/view) instead of
-    # cloning into the head-major compact layout. The kernel reads do as a K-major
-    # TMA-B operand and adapts to the strides, exactly as it already does for q.
-    # A non-head-major `do` (the common autograd grad layout) otherwise pays a real
-    # ~90us (D128) / ~34us (D64) clone per backward call.
+    # Preserve an aligned dO layout and avoid a compact staging copy.
     if use_original_do_layout:
         do = _as_bwd_original_qkv_layout(do)
     elif _compile_only:
@@ -493,13 +516,15 @@ def hstu_varlen_bwd_100(
         dk = torch.empty_strided(k.shape, k.stride(), dtype=k.dtype, device=k.device)
         dv = torch.empty_strided(v.shape, v.stride(), dtype=v.dtype, device=v.device)
 
-    workspace_seqlen = (max_seqlen_q + 7) // 8 * 8
     workspace_head_dim = (head_dim + 7) // 8 * 8
-    # Use torch.empty on GPU + .zero_() instead of torch.zeros(...).cuda()
-    # torch.zeros().cuda() creates a CPU zero tensor then copies to GPU (~34ms for 128MB)
-    # torch.empty().zero_() allocates on GPU directly and zeros via GPU kernel (~0.1ms)
+    # Allocate and initialize the accumulation workspace directly on the GPU.
+    workspace_padding_rows = batch_size * m_block_size if use_2cta_instrs else 0
     workspace_torch = torch.empty(
-        (batch_size, num_heads, workspace_seqlen, workspace_head_dim),
+        (
+            num_heads,
+            q.shape[0] + workspace_padding_rows,
+            workspace_head_dim,
+        ),
         dtype=torch.float32,
         device=q.device,
     )
@@ -544,13 +569,14 @@ def hstu_varlen_bwd_100(
         hstu_bwd_sm100 = HSTUAttentionBackwardSm100(
             element_dtype=Float16 if q_dtype == torch.float16 else BFloat16,
             head_dim=head_dim,
-            kBlockM=kBlockM,
-            kBlockN=kBlockN,
+            tile_m=m_block_size,
+            tile_n=n_block_size,
             is_causal=is_causal,
             is_local=is_local,
             is_arbitrary=is_arbitrary,
             func_num=func_num,
             use_auto_block_metadata=use_auto_block_metadata,
+            use_2cta_instrs=use_2cta_instrs,
         )
         with torch.cuda.nvtx.range("hstu_varlen_bwd_kernel"):
             hstu_varlen_bwd_100.compile_cache[compile_key] = cute.compile(
@@ -573,7 +599,7 @@ def hstu_varlen_bwd_100(
                 workspace,
                 block_sparse_cute,
                 compile_stream,
-                options="--enable-tvm-ffi",
+                options=_sm100_compile_options(q_orig.device),
             )
 
     if _compile_only:

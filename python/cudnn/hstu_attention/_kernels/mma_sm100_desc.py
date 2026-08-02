@@ -138,24 +138,24 @@ def make_instr_desc(
     if N < 8 or N > 256 or (N & 7):
         raise ValueError("N must be a multiple of 8 in the range 8…256")
 
-    m_dim = M >> 4            # 5-bit field
-    n_dim = N >> 3            # 6-bit field
+    m_dim = M >> 4  # 5-bit field
+    n_dim = N >> 3  # 6-bit field
 
     # --- pack the bit-fields -----------------------------------------------------
     desc = 0
-    desc |= (0                 & 0x3) << 0        # sparse_id2 (always 0 here)
-    desc |= (int(is_sparse)    & 0x1) << 2        # sparse_flag
-    desc |= (int(c_sat)        & 0x1) << 3        # saturate
-    desc |= (c_fmt             & 0x3) << 4        # c_format
-    desc |= (a_fmt             & 0x7) << 7        # a_format
-    desc |= (b_fmt             & 0x7) << 10       # b_format
-    desc |= (int(a_neg)        & 0x1) << 13       # a_negate
-    desc |= (int(b_neg)        & 0x1) << 14       # b_negate
-    desc |= (int(a_major)      & 0x1) << 15       # a_major
-    desc |= (int(b_major)      & 0x1) << 16       # b_major
-    desc |= (n_dim             & 0x3F) << 17      # n_dim (6 bits)
-    desc |= (m_dim             & 0x1F) << 24      # m_dim (5 bits)
-    desc |= (int(max_shift)    & 0x3) << 30       # max_shift (2 bits)
+    desc |= (0 & 0x3) << 0  # sparse_id2 (always 0 here)
+    desc |= (int(is_sparse) & 0x1) << 2  # sparse_flag
+    desc |= (int(c_sat) & 0x1) << 3  # saturate
+    desc |= (c_fmt & 0x3) << 4  # c_format
+    desc |= (a_fmt & 0x7) << 7  # a_format
+    desc |= (b_fmt & 0x7) << 10  # b_format
+    desc |= (int(a_neg) & 0x1) << 13  # a_negate
+    desc |= (int(b_neg) & 0x1) << 14  # b_negate
+    desc |= (int(a_major) & 0x1) << 15  # a_major
+    desc |= (int(b_major) & 0x1) << 16  # b_major
+    desc |= (n_dim & 0x3F) << 17  # n_dim (6 bits)
+    desc |= (m_dim & 0x1F) << 24  # m_dim (5 bits)
+    desc |= (int(max_shift) & 0x3) << 30  # max_shift (2 bits)
 
     return desc & 0xFFFF_FFFF  # ensure 32-bit result
 
@@ -167,8 +167,8 @@ def mma_op_to_idesc(op: cute.nvgpu.tcgen05.mma.MmaOp):
         op.acc_dtype,
         op.shape_mnk[0],
         op.shape_mnk[1],
-        Major.K if op.a_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K else Major.MN,
-        Major.K if op.b_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K else Major.MN,
+        (Major.K if op.a_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K else Major.MN),
+        (Major.K if op.b_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K else Major.MN),
     )
 
 
@@ -187,21 +187,22 @@ class LayoutType(IntEnum):  # occupies the top-3 bits [61:64)
 
 
 def _layout_type(swizzle: cute.Swizzle) -> LayoutType:
-    # No idea what the right way to get B, M, S is – so we're just parsing it from the __str__
-    # Swizzle string has the form "S<B,M,S>"
-    swz_str = str(swizzle)
-    inside = swz_str[swz_str.index("<") + 1 : swz_str.index(">")]  # '3,4,3'
-    B, M, S = [int(x) for x in inside.split(",")]  # [3, 4, 3]
+    B, M, S = (
+        swizzle.num_bits,
+        swizzle.num_base,
+        swizzle.num_shift,
+    )
 
     if M == 4:  # Swizzle<*,4,3>
         if S != 3:
             raise ValueError("Unexpected swizzle shift – want S==3 for M==4")
-        return {
+        layout_types = {
             0: LayoutType.SWIZZLE_NONE,
             1: LayoutType.SWIZZLE_32B,
             2: LayoutType.SWIZZLE_64B,
             3: LayoutType.SWIZZLE_128B,
-        }[B]  # KeyError ⇒ invalid B→ raise
+        }
+        return layout_types[B]
     if M == 5:  # Swizzle<2,5,2> (the only legal triple for M==5)
         if (B, S) != (2, 2):
             raise ValueError("Only Swizzle<2,5,2> supported for 128B_BASE32B")
@@ -244,7 +245,10 @@ def make_smem_desc_base(layout: cute.Layout, swizzle: cute.Swizzle, major: Major
         stride_10 = canonical_layout.stride[1][0]
         if stride_10 != swizzle_atom_mn_size:
             raise ValueError("Not a canonical UMMA_MN Layout: Expected stride failure.")
-        stride_01, stride_11 = canonical_layout.stride[0][1], canonical_layout.stride[1][1]
+        stride_01, stride_11 = (
+            canonical_layout.stride[0][1],
+            canonical_layout.stride[1][1],
+        )
         if layout_type is LayoutType.SWIZZLE_NONE:
             stride_byte_offset, leading_byte_offset = stride_01, stride_11
         else:
@@ -287,3 +291,18 @@ def make_smem_desc_base(layout: cute.Layout, swizzle: cute.Swizzle, major: Major
 def make_smem_desc_start_addr(start_addr: cute.Pointer) -> cutlass.Int32:
     # 14 bits, remove 4 LSB (bits 0-13 in desc)
     return (start_addr.toint() & 0x3FFFF) >> 4
+
+
+def smem_desc_base_from_tensor(
+    tensor: cute.Tensor,
+    major: Major,
+) -> int:
+    return make_smem_desc_base(
+        cute.recast_layout(
+            128,
+            tensor.element_type.width,
+            tensor.layout[0],
+        ),
+        tensor.iterator.type.swizzle_type,
+        major,
+    )

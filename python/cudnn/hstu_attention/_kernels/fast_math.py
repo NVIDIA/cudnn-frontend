@@ -1,6 +1,6 @@
 # Copyright (c) 2025, Tri Dao.
 
-from typing import Tuple, Optional, Callable
+from typing import Callable, Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
@@ -8,16 +8,12 @@ from cutlass import Int32, Uint32, Float32, const_expr
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
 
-from .utils import tanhf, mul_packed_f32x2, fma_packed_f32x2, sub_packed_f32x2, add_packed_f32x2
+from .utils import fma_packed_f32x2, mul_packed_f32x2, sub_packed_f32x2, tanhf
 
 
 @cute.jit
 def clz(x: Int32) -> Int32:
-    # for i in cutlass.range_constexpr(32):
-    #     if (1 << (31 - i)) & x:
-    #         return Int32(i)
-    # return Int32(32)
-    # Early exit is not supported yet
+    # CuTe DSL does not support an early return from this loop.
     res = Int32(32)
     done = False
     for i in cutlass.range(32):
@@ -48,9 +44,17 @@ def umulhi(a: Int32, b: Int32, *, loc=None, ip=None) -> Uint32:
 
 
 class FastDivmod:
-    def __init__(self, divisor: Int32, multipler: Uint32, shift_right: Uint32, *, loc=None, ip=None):
+    def __init__(
+        self,
+        divisor: Int32,
+        multiplier: Uint32,
+        shift_right: Uint32,
+        *,
+        loc=None,
+        ip=None,
+    ):
         self.divisor = divisor
-        self.multiplier = multipler
+        self.multiplier = multiplier
         self.shift_right = shift_right
         self._loc = loc
 
@@ -92,10 +96,16 @@ class FastDivmod:
 
 
 class FastSilU:
-    def __init__(self, score_scale: Float32, loc=None, ip=None):
+    def __init__(
+        self,
+        score_scale: Float32,
+        score_scale_half: Optional[Float32] = None,
+        loc=None,
+        ip=None,
+    ):
         self._loc = loc
         self.score_scale = score_scale
-        self.score_scale_half = score_scale * 0.5
+        self.score_scale_half = score_scale * 0.5 if score_scale_half is None else score_scale_half
 
     @cute.jit
     def silu_x2(
@@ -121,9 +131,6 @@ class FastSilU:
             )
             acc_S[i] = out_v0
             acc_S[i + 1] = out_v1
-        # this could get better performance than mask silu, it could elim the instructions of PRMT
-        # it have better performance than comment code below (82us vs 84us) and has less instructions
-        # i can not understand
         if const_expr(mask_fn is not None):
             for i in cutlass.range_constexpr(cute.size(acc_S), unroll_full=True):
                 acc_S[i] = acc_S[i] if preds[i] else acc_S.element_type(0)
@@ -135,15 +142,12 @@ class FastSilU:
                     in_bound = cutlass.Boolean(keep_mask & (Uint32(1) << bit))
                     acc_S[i] = acc_S[i] if in_bound else acc_S.element_type(0)
         acc_S_converted.store(acc_S.load().to(acc_S_converted.element_type))
-        # if const_expr(mask_fn is not None):
-        #     for i in cutlass.range_constexpr(cute.size(acc_S_converted), unroll_full=True):
-        #         acc_S_converted[i] = acc_S_converted[i] if preds[i] else acc_S_converted.element_type(0)
 
     @cute.jit
     def dsilu_bwd_x2(
         self,
         acc_S: cute.Tensor,
-        acc_S_silu: cute.Tensor,
+        acc_P: cute.Tensor,
         preds: Optional[cute.Tensor],
         score_scale: Float32,
         mask_fn: Optional[Callable] = None,
@@ -163,5 +167,68 @@ class FastSilU:
             dsilu0, dsilu1 = mul_packed_f32x2((sigmoid_v0, sigmoid_v1), (inner0, inner1))
             acc_S[i] = dsilu0
             acc_S[i + 1] = dsilu1
-            acc_S_silu[i] = out_v0
-            acc_S_silu[i + 1] = out_v1
+            acc_P[i] = out_v0
+            acc_P[i + 1] = out_v1
+
+    @cute.jit
+    def dsilu_bwd_quantize_x2(
+        self,
+        acc_S: cute.Tensor,
+        acc_P: cute.Tensor,
+        preds: Optional[cute.Tensor],
+        r2p_mask: Optional[Uint32] = None,
+    ):
+        """Compute FP32 SiLU derivative and quantized SiLU output."""
+        if const_expr(r2p_mask is not None):
+            for i in cutlass.range_constexpr(0, cute.size(acc_S), 2):
+                acc_S[i], acc_S[i + 1] = mul_packed_f32x2(
+                    (acc_S[i], acc_S[i + 1]),
+                    (self.score_scale_half, self.score_scale_half),
+                )
+            for i in cutlass.range_constexpr(
+                cute.size(acc_S),
+                unroll_full=True,
+            ):
+                valid = cutlass.Boolean(r2p_mask & (Uint32(1) << i))
+                # tanh.approx(-128) saturates to -1, so both outputs become zero.
+                acc_S[i] = acc_S[i] if valid else acc_S.element_type(-128.0)
+        for i in cutlass.range_constexpr(0, cute.size(acc_S), 2):
+            if const_expr(r2p_mask is not None):
+                half_x0, half_x1 = acc_S[i], acc_S[i + 1]
+            else:
+                half_x0, half_x1 = mul_packed_f32x2(
+                    (acc_S[i], acc_S[i + 1]),
+                    (self.score_scale_half, self.score_scale_half),
+                )
+            tanh_v0 = tanhf(half_x0)
+            tanh_v1 = tanhf(half_x1)
+            out_v0, out_v1 = fma_packed_f32x2(
+                (half_x0, half_x1),
+                (tanh_v0, tanh_v1),
+                (half_x0, half_x1),
+            )
+            sigmoid_v0, sigmoid_v1 = fma_packed_f32x2(
+                (0.5, 0.5),
+                (tanh_v0, tanh_v1),
+                (0.5, 0.5),
+            )
+            one_minus_sig0, one_minus_sig1 = sub_packed_f32x2(
+                (1.0, 1.0),
+                (sigmoid_v0, sigmoid_v1),
+            )
+            dsilu0, dsilu1 = fma_packed_f32x2(
+                (out_v0, out_v1),
+                (one_minus_sig0, one_minus_sig1),
+                (sigmoid_v0, sigmoid_v1),
+            )
+            if const_expr(preds is not None):
+                valid0 = preds[i]
+                valid1 = preds[i + 1]
+                dsilu0 = dsilu0 if valid0 else acc_S.element_type(0)
+                dsilu1 = dsilu1 if valid1 else acc_S.element_type(0)
+                out_v0 = out_v0 if valid0 else acc_S.element_type(0)
+                out_v1 = out_v1 if valid1 else acc_S.element_type(0)
+            acc_S[i] = dsilu0
+            acc_S[i + 1] = dsilu1
+            acc_P[i] = acc_P.element_type(out_v0)
+            acc_P[i + 1] = acc_P.element_type(out_v1)

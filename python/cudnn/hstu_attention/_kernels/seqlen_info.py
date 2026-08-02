@@ -9,6 +9,7 @@ the gmem reads once at the beginning of each tile, rather than having to repeat 
 to compute various things like n_block_min, n_block_max, etc.
 """
 
+
 class SeqlenInfo:
     def __init__(
         self,
@@ -18,10 +19,15 @@ class SeqlenInfo:
         cu_seqlens_q: cute.Tensor,
         cu_seqlens_k: cute.Tensor,
         page_indptrs: Optional[cute.Tensor] = None,
+        tile_m: int = 128,
     ):
         assert cu_seqlens_q is not None and cu_seqlens_k is not None
         self.offset_q = cu_seqlens_q[batch_idx]
         self.offset_k = cu_seqlens_k[batch_idx]
+        self.padded_offset_q = cute.assume(
+            (self.offset_q + batch_idx * tile_m) // tile_m * tile_m,
+            divby=tile_m,
+        )
         self.seqlen_q = cu_seqlens_q[batch_idx + 1] - self.offset_q
         self.seqlen_k = cu_seqlens_k[batch_idx + 1] - self.offset_k
 

@@ -87,23 +87,14 @@ class AttentionMask:
             elif cutlass.const_expr(self.is_arbitrary):
                 if q_in_bounds:
                     func_row = q_row + self.offset_q
-                    # Match FA4's kept-interval union:
+                    # Keep the interval union:
                     # [0, F0) U [F1, F2) U [F3, F4) ...
-                    preds[i] = Boolean(
-                        col < self.seqlen_k
-                        and col < self.func[0, func_row].value
-                    )
+                    preds[i] = Boolean(col < self.seqlen_k and col < self.func[0, func_row].value)
                     for interval in cutlass.range(
                         self.func_num // 2,
                         unroll_full=True,
                     ):
-                        if (
-                            col < self.seqlen_k
-                            and col
-                            >= self.func[2 * interval + 1, func_row].value
-                            and col
-                            < self.func[2 * interval + 2, func_row].value
-                        ):
+                        if col < self.seqlen_k and col >= self.func[2 * interval + 1, func_row].value and col < self.func[2 * interval + 2, func_row].value:
                             preds[i] = True
                 else:
                     preds[i] = False
@@ -150,37 +141,65 @@ class AttentionMask:
         # A packed residual Q tile can overlap the next sequence.  Guard the
         # func loads themselves, not just the resulting score predicates.
         if q_in_bounds:
-            func_row = q_row + self.offset_q
-            col_limits = cute.make_rmem_tensor((self.func_num,), cutlass.Int32)
-            for endpoint in cutlass.range_constexpr(self.func_num, unroll_full=True):
-                col_limits[endpoint] = max(
-                    self.func[endpoint, func_row].value - base_col,
-                    0,
+            if cutlass.const_expr(self.is_arbitrary):
+                func_row = q_row + self.offset_q
+                col_limits = cute.make_rmem_tensor(
+                    (self.func_num,),
+                    cutlass.Int32,
                 )
-            seqlen_k_limit = max(self.seqlen_k - base_col, 0)
-
-            for chunk in cutlass.range_constexpr(num_chunks, unroll_full=True):
-                # Match FA4's interval-union R2P construction directly:
-                # [0, F0) U [F1, F2) U [F3, F4) ...
-                combined_mask = _r2p_bitmask_below(col_limits[0], chunk)
-                for interval in cutlass.range_constexpr(
-                    self.func_num // 2,
+                for endpoint in cutlass.range_constexpr(
+                    self.func_num,
                     unroll_full=True,
                 ):
-                    interval_mask = _r2p_bitmask_above(
-                        col_limits[2 * interval + 1],
-                        chunk,
-                    ) & _r2p_bitmask_below(
-                        col_limits[2 * interval + 2],
+                    col_limits[endpoint] = max(
+                        self.func[endpoint, func_row].value - base_col,
+                        0,
+                    )
+                seqlen_k_limit = max(self.seqlen_k - base_col, 0)
+
+                for chunk in cutlass.range_constexpr(
+                    num_chunks,
+                    unroll_full=True,
+                ):
+                    # Construct the interval union directly with R2P masks:
+                    # [0, F0) U [F1, F2) U [F3, F4) ...
+                    combined_mask = _r2p_bitmask_below(
+                        col_limits[0],
                         chunk,
                     )
-                    combined_mask = combined_mask | interval_mask
-                # HSTU packed-varlen tiles still need the physical K bound,
-                # which is independent of the arbitrary interval metadata.
-                keep_masks[chunk] = combined_mask & _r2p_bitmask_below(
-                    seqlen_k_limit,
-                    chunk,
+                    for interval in cutlass.range_constexpr(
+                        self.func_num // 2,
+                        unroll_full=True,
+                    ):
+                        interval_mask = _r2p_bitmask_above(
+                            col_limits[2 * interval + 1],
+                            chunk,
+                        ) & _r2p_bitmask_below(
+                            col_limits[2 * interval + 2],
+                            chunk,
+                        )
+                        combined_mask = combined_mask | interval_mask
+                    # HSTU packed-varlen tiles still need the physical K bound,
+                    # which is independent of the arbitrary interval metadata.
+                    keep_masks[chunk] = combined_mask & _r2p_bitmask_below(
+                        seqlen_k_limit,
+                        chunk,
+                    )
+            else:
+                seqlen_offset = self.seqlen_k - self.seqlen_q
+                col_limit = min(
+                    self.seqlen_k,
+                    q_row + seqlen_offset + 1 + self.window_size_right,
                 )
+                col_limit = max(col_limit - base_col, 0)
+                for chunk in cutlass.range_constexpr(
+                    num_chunks,
+                    unroll_full=True,
+                ):
+                    keep_masks[chunk] = _r2p_bitmask_below(
+                        col_limit,
+                        chunk,
+                    )
 
     @cute.jit
     def apply_mask_seqlen(
@@ -209,19 +228,13 @@ class AttentionMask:
     def apply_mask_swapAB(
         self,
         preds: cute.Tensor,
-        wg_idx: cutlass.Int32,
         m_block: cutlass.Int32,
         n_block: cutlass.Int32,
-        thr_mma: cute.TiledMma,
-        thr_tmem_load: cute.TiledCopy,
-        mask_casual: cutlass.Constexpr[bool] = False,
+        tScS_t2r: cute.Tensor,
+        mask_causal: cutlass.Constexpr[bool] = False,
         mask_seqlen: cutlass.Constexpr[bool] = False,
     ) -> None:
         seqlen_offset = self.seqlen_k - self.seqlen_q
-        cS = cute.make_identity_tensor((self.kBlockM, self.kBlockN))
-        tScS = thr_mma.partition_C(cS)
-        tScS_t2r = thr_tmem_load.partition_D(cS)
-        tScS_t2r = split_wg(tScS_t2r, 2, wg_idx)
         base_row = m_block * self.kBlockM + seqlen_offset
         base_col = n_block * self.kBlockN
         row_id, col_id = (1, 0) if cutlass.const_expr(self.swapAB) else (0, 1)
@@ -248,32 +261,61 @@ class AttentionMask:
                 # sequence.  Do not even form a func load for those rows.
                 if q_in_bounds:
                     func_row = q_row + self.offset_q
-                    # Match FA4's kept-interval union:
+                    # Keep the interval union:
                     # [0, F0) U [F1, F2) U [F3, F4) ...
-                    preds[i] = Boolean(
-                        col < self.seqlen_k
-                        and col < self.func[0, func_row].value
-                    )
+                    preds[i] = Boolean(col < self.seqlen_k and col < self.func[0, func_row].value)
                     for interval in cutlass.range(
                         self.func_num // 2,
                         unroll_full=True,
                     ):
-                        if (
-                            col < self.seqlen_k
-                            and col
-                            >= self.func[2 * interval + 1, func_row].value
-                            and col
-                            < self.func[2 * interval + 2, func_row].value
-                        ):
+                        if col < self.seqlen_k and col >= self.func[2 * interval + 1, func_row].value and col < self.func[2 * interval + 2, func_row].value:
                             preds[i] = True
                 else:
                     preds[i] = False
             else:
-                if col >= col_limit_right(row) and mask_casual:
+                if col >= col_limit_right(row) and mask_causal:
                     preds[i] = False
                 if cutlass.const_expr(self.is_local):
                     if col < col_limit_left(row):
                         preds[i] = False
+
+    @cute.jit
+    def build_mask_swapAB_r2p(
+        self,
+        keep_masks: cute.Tensor,
+        m_block: cutlass.Int32,
+        n_block: cutlass.Int32,
+        tScS_t2r: cute.Tensor,
+    ) -> None:
+        """Build packed predicates for the transposed causal backward tile."""
+
+        assert self.is_causal and not self.is_local and not self.is_arbitrary
+        row_id, col_id = (1, 0) if cutlass.const_expr(self.swapAB) else (0, 1)
+        assert cute.size(tScS_t2r) == cute.size(keep_masks) * _R2P_CHUNK_SIZE
+
+        thread_row_offset = cute.get(tScS_t2r[0], mode=[row_id])
+        thread_col_offset = cute.get(tScS_t2r[0], mode=[col_id])
+        seqlen_q_row_limit = self.seqlen_q - m_block * self.kBlockM - thread_row_offset
+        seqlen_k_col_limit = self.seqlen_k - n_block * self.kBlockN - thread_col_offset
+        row_limit_lower = seqlen_q_row_limit - seqlen_k_col_limit
+        row_limit_upper = seqlen_q_row_limit
+
+        num_rep = cutlass.const_expr(cute.size(tScS_t2r, mode=[0]))
+        num_warp_groups = 2
+        num_scores = cutlass.const_expr(cute.size(tScS_t2r))
+        row_limit_lower = row_limit_lower // (num_rep * num_warp_groups) * num_rep + min(row_limit_lower % (num_rep * num_warp_groups), num_rep)
+        row_limit_upper = row_limit_upper // (num_rep * num_warp_groups) * num_rep + min(row_limit_upper % (num_rep * num_warp_groups), num_rep)
+        row_limit_lower = min(max(row_limit_lower, 0), num_scores)
+        row_limit_upper = min(max(row_limit_upper, 0), num_scores)
+        for chunk in cutlass.range_constexpr(cute.size(keep_masks)):
+            keep_mask = _r2p_bitmask_above(
+                row_limit_lower,
+                chunk,
+            ) & _r2p_bitmask_below(
+                row_limit_upper,
+                chunk,
+            )
+            keep_masks[chunk] = keep_mask if seqlen_k_col_limit > 0 else cutlass.Uint32(0)
 
     @cute.jit
     def apply_mask_swapAB_arbitrary_prefetch(
@@ -291,7 +333,7 @@ class AttentionMask:
         endpoints cannot be shared as a forward-style R2P mask.  Endpoint
         planes are loaded eight rows at a time before they are consumed.  Two
         eight-element caches bound register pressure independently of
-        ``func_num`` while preserving FA4's exact kept-interval union:
+        ``func_num`` while preserving the interval-union semantics:
         ``[0, F0) U [F1, F2) U [F3, F4) ...``.
         """
 
