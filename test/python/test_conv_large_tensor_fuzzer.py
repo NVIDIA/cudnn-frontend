@@ -63,12 +63,29 @@ _SPARSE_INTEGER_TARGET_NONZERO = 32  # max nonzero filter values per output chan
 _SPARSE_INTEGER_RNG_SALT = 0x51A25EED  # split sparse-index RNG from tensor-value RNG
 _GRAPH_ENGINE_RNG_SALT = 0xE61A5EED  # split engine selection from config and tensor RNGs
 _OP_SCHEDULE_RNG_SALT = 0x0F5C4ED  # split operation ordering from config generation
+_NVRTC_COMPILATION_STATUS = "CUDNN_STATUS_INTERNAL_ERROR_COMPILATION_FAILED"
+_PLAN_BUILD_ERROR_LIMIT = 1024
 
 
 class _EngineFilterNotSupported(Exception):
     """Selected graph engine is unsupported, not a cuDNN execution failure."""
 
     pass
+
+
+@dataclass(frozen=True)
+class _PlanBuildSelection:
+    selected_plan_index: Optional[int]
+    candidate_count: int
+    nvrtc_failures: Tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _CudnnRunResult:
+    ok: bool
+    message: str
+    selected_plan_index: Optional[int] = None
+    nvrtc_failures: Tuple[str, ...] = ()
 
 
 def _pytest_worker_count() -> int:
@@ -1102,7 +1119,59 @@ def _reference(cfg: LargeTensorConfig, X: torch.Tensor, W: torch.Tensor, Y: torc
 # ---------------------------------------------------------------------------
 
 
-def _run_cudnn(cfg: LargeTensorConfig, X: torch.Tensor, W: torch.Tensor, Y: torch.Tensor, bias: Optional[torch.Tensor], handle) -> Tuple[bool, str]:
+def _nvrtc_plan_build_failure(plan_index: int, error: Exception) -> Optional[str]:
+    """Return a bounded diagnostic when the immediate plan error is NVRTC."""
+    backend_error = cudnn.get_last_error_string().strip()
+    detail = "\n".join(part for part in (str(error).strip(), backend_error) if part)
+    if _NVRTC_COMPILATION_STATUS not in detail:
+        return None
+
+    detail = " ".join(detail.split())
+    if len(detail) > _PLAN_BUILD_ERROR_LIMIT:
+        detail = f"{detail[:_PLAN_BUILD_ERROR_LIMIT]}..."
+    return f"plan index {plan_index}: {detail}"
+
+
+def _build_first_supported_plan(graph, rng_seed: int) -> _PlanBuildSelection:
+    """Build plans in priority order, preserving any NVRTC failures."""
+    candidate_count = graph.get_execution_plan_count()
+    nvrtc_failures = []
+
+    for plan_index in range(candidate_count):
+        try:
+            graph.build_plan_at_index(plan_index)
+        except cudnn.cudnnGraphNotSupportedError as e:
+            nvrtc_failure = _nvrtc_plan_build_failure(plan_index, e)
+            if nvrtc_failure is not None:
+                nvrtc_failures.append(nvrtc_failure)
+                outcome = "NVRTC compilation failure"
+            else:
+                outcome = "unsupported"
+            print(f"Large tensor fuzzer plan rng_seed={rng_seed} index={plan_index}: {outcome}", flush=True)
+            continue
+        except RuntimeError as e:
+            nvrtc_failure = _nvrtc_plan_build_failure(plan_index, e)
+            if nvrtc_failure is None:
+                raise
+            nvrtc_failures.append(nvrtc_failure)
+            print(f"Large tensor fuzzer plan rng_seed={rng_seed} index={plan_index}: NVRTC compilation failure", flush=True)
+            continue
+
+        print(
+            f"Large tensor fuzzer plan rng_seed={rng_seed} index={plan_index}: " "built successfully; selected for execution",
+            flush=True,
+        )
+        return _PlanBuildSelection(plan_index, candidate_count, tuple(nvrtc_failures))
+
+    print(
+        f"Large tensor fuzzer plan rng_seed={rng_seed}: exhausted {candidate_count} candidates without a buildable plan",
+        flush=True,
+    )
+    return _PlanBuildSelection(None, candidate_count, tuple(nvrtc_failures))
+
+
+def _run_cudnn(cfg: LargeTensorConfig, X: torch.Tensor, W: torch.Tensor, Y: torch.Tensor, bias: Optional[torch.Tensor], handle) -> _CudnnRunResult:
+    selection = _PlanBuildSelection(None, 0, ())
     try:
         cudnn.set_stream(handle=handle, stream=torch.cuda.current_stream().cuda_stream)
         io_dt = _cudnn_dtype(cfg.dtype)
@@ -1154,25 +1223,59 @@ def _run_cudnn(cfg: LargeTensorConfig, X: torch.Tensor, W: torch.Tensor, Y: torc
             _create_filtered_execution_plans(graph, selected_graph_engine_index)
         else:
             graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
-        graph.check_support()
-        graph.build_plans()
+        selection = _build_first_supported_plan(graph, cfg.rng_seed)
+        if selection.selected_plan_index is None:
+            if selection.nvrtc_failures:
+                detail = "; ".join(selection.nvrtc_failures)
+                return _CudnnRunResult(
+                    False,
+                    f"error: NVRTC compilation failed and no fallback plan built: {detail}",
+                    nvrtc_failures=selection.nvrtc_failures,
+                )
+            return _CudnnRunResult(False, f"not_supported: no buildable execution plan among {selection.candidate_count} candidates")
 
-        ws_size = graph.get_workspace_size()
+        plan_index = selection.selected_plan_index
+        ws_size = graph.get_workspace_size_plan_at_index(plan_index)
         workspace = torch.empty(ws_size, device="cuda", dtype=torch.uint8)
         _poison_workspace(workspace)
 
-        graph.execute(vpack, workspace, handle=handle)
+        graph.execute_plan_at_index(vpack, workspace, index=plan_index, handle=handle)
         torch.cuda.synchronize()
-        return True, "ok"
+        print(f"Large tensor fuzzer plan rng_seed={cfg.rng_seed} index={plan_index}: execution passed", flush=True)
+        return _CudnnRunResult(True, "ok", plan_index, selection.nvrtc_failures)
 
     except _EngineFilterNotSupported as e:
-        return False, f"not_supported: {e}"
+        return _CudnnRunResult(False, f"not_supported: {e}", nvrtc_failures=selection.nvrtc_failures)
     except cudnn.cudnnGraphNotSupportedError as e:
-        return False, f"not_supported: {e}"
-    except torch.cuda.OutOfMemoryError:
+        if selection.nvrtc_failures:
+            prior_failures = "; ".join(selection.nvrtc_failures)
+            return _CudnnRunResult(
+                False,
+                f"error: fallback plan index {selection.selected_plan_index} became unsupported after "
+                f"NVRTC compilation failure(s): {e}; prior plan-build failures: {prior_failures}",
+                selection.selected_plan_index,
+                selection.nvrtc_failures,
+            )
+        return _CudnnRunResult(False, f"not_supported: {e}", nvrtc_failures=selection.nvrtc_failures)
+    except torch.cuda.OutOfMemoryError as e:
+        if selection.nvrtc_failures:
+            prior_failures = "; ".join(selection.nvrtc_failures)
+            return _CudnnRunResult(
+                False,
+                f"error: fallback plan index {selection.selected_plan_index} ran out of memory after "
+                f"NVRTC compilation failure(s): {e}; prior plan-build failures: {prior_failures}",
+                selection.selected_plan_index,
+                selection.nvrtc_failures,
+            )
         raise
     except (RuntimeError, OSError) as e:
-        return False, f"error: {type(e).__name__}: {e}"
+        prior_failures = f"; prior plan-build failures: {'; '.join(selection.nvrtc_failures)}" if selection.nvrtc_failures else ""
+        return _CudnnRunResult(
+            False,
+            f"error: {type(e).__name__}: {e}{prior_failures}",
+            selection.selected_plan_index,
+            selection.nvrtc_failures,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1264,6 +1367,7 @@ def _run_single_config(
     bias = None
     actual = None
     ref = None
+    cudnn_result = None
     phase = "input setup"
     try:
         gen = torch.Generator(device="cpu")
@@ -1314,9 +1418,9 @@ def _run_single_config(
         print(f"Large tensor fuzzer active configuration: {_repro_json(active_payload)}", flush=True)
 
         phase = "cuDNN execution"
-        ok, msg = _run_cudnn(cfg, X, W, Y, bias, cudnn_handle)
-        if not ok:
-            return False, msg
+        cudnn_result = _run_cudnn(cfg, X, W, Y, bias, cudnn_handle)
+        if not cudnn_result.ok:
+            return False, cudnn_result.message
 
         phase = "result clone"
         actual = Y.clone() if cfg.conv_type == ConvType.FPROP else X.clone() if cfg.conv_type == ConvType.DGRAD else W.clone()
@@ -1330,13 +1434,42 @@ def _run_single_config(
         try:
             torch.testing.assert_close(actual.to(torch.float32), ref, rtol=rtol, atol=atol)
         except AssertionError as e:
+            print(
+                f"Large tensor fuzzer plan rng_seed={cfg.rng_seed} index={cudnn_result.selected_plan_index}: numerical comparison failed",
+                flush=True,
+            )
             context = _format_repro_context(
                 cfg, test_num=test_num, total_tests=total_tests, config_seed=config_seed, rtol=rtol, atol=atol, message=str(e), attempt=attempt
             )
+            if cudnn_result.nvrtc_failures:
+                plan_failures = "\n".join(cudnn_result.nvrtc_failures)
+                raise AssertionError(
+                    f"NVRTC compilation failure(s) occurred before fallback plan index "
+                    f"{cudnn_result.selected_plan_index} executed:\n{plan_failures}\n"
+                    f"The fallback plan also failed numerical comparison:\n{e}{context}"
+                ) from e
             raise AssertionError(f"{e}{context}") from e
+
+        print(
+            f"Large tensor fuzzer plan rng_seed={cfg.rng_seed} index={cudnn_result.selected_plan_index}: numerical comparison passed",
+            flush=True,
+        )
+        if cudnn_result.nvrtc_failures:
+            plan_failures = "; ".join(cudnn_result.nvrtc_failures)
+            return (
+                False,
+                f"error: NVRTC compilation failure(s) occurred before fallback plan index "
+                f"{cudnn_result.selected_plan_index} executed and passed numerical comparison: {plan_failures}",
+            )
         return True, "ok"
 
     except torch.cuda.OutOfMemoryError as e:
+        if cudnn_result is not None and cudnn_result.nvrtc_failures:
+            plan_failures = "; ".join(cudnn_result.nvrtc_failures)
+            return (
+                False,
+                f"error: {phase} ran out of memory after NVRTC compilation failure(s): {e}; " f"prior plan-build failures: {plan_failures}",
+            )
         return False, f"insufficient_memory: {phase}: {e}"
     finally:
         if X is not None:
