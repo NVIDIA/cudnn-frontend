@@ -409,12 +409,39 @@ SDPA_attributes::verify_sdpa_support_surface_for_implementation(const detail::Co
         return it != outputs.end() && it->second != nullptr;
     };
 
+    // Whether every present Q/K/V/O I/O tensor uses a dtype within `allowed`. NOT_SET
+    // passes: the dtype is resolved from the graph default before real validation
+    // re-runs this check.
+    auto const io_dtypes_within = [this, &has_input, &has_output](std::unordered_set<DataType_t> const& allowed) {
+        auto const ok = [&allowed](DataType_t dt) {
+            return dt == DataType_t::NOT_SET || allowed.find(dt) != allowed.end();
+        };
+        for (auto const name : {input_names::Q, input_names::K, input_names::V}) {
+            if (has_input(name) && !ok(inputs.at(name)->get_data_type())) {
+                return false;
+            }
+        }
+        if (has_output(output_names::O) && !ok(outputs.at(output_names::O)->get_data_type())) {
+            return false;
+        }
+        return true;
+    };
+
     switch (impl) {
         case AttentionImplementation_t::AUTO:
             // This function should not be called with AUTO.
             return {error_code_t::INVALID_VALUE,
                     "Can't call verify_sdpa_support_surface_for_implementation with impl=AUTO"};
         case AttentionImplementation_t::COMPOSITE:
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                !io_dtypes_within({DataType_t::HALF,
+                                   DataType_t::BFLOAT16,
+                                   DataType_t::FP8_E4M3,
+                                   DataType_t::FP8_E5M2,
+                                   DataType_t::FLOAT}),
+                error_code_t::GRAPH_NOT_SUPPORTED,
+                "Composite SDPA node supports only FP16/BF16/FP8/FP32 Q/K/V/O I/O; the requested "
+                "I/O data type is not supported.");
             RETURN_CUDNN_FRONTEND_ERROR_IF(has_input(input_names::Block_mask),
                                            error_code_t::GRAPH_NOT_SUPPORTED,
                                            "Composite SDPA node doesn't support Block_mask input");
@@ -441,30 +468,17 @@ SDPA_attributes::verify_sdpa_support_surface_for_implementation(const detail::Co
                                            error_code_t::GRAPH_NOT_SUPPORTED,
                                            "Unified SDPA node requires cuDNN 9.13.1");
 
-            RETURN_CUDNN_FRONTEND_ERROR_IF(context.get_dynamic_shape_enabled(),
-                                           error_code_t::GRAPH_NOT_SUPPORTED,
-                                           "Unified SDPA node doesn't yet support dynamic shape");
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                context.get_dynamic_shape_enabled(),
+                error_code_t::GRAPH_NOT_SUPPORTED,
+                "Unified SDPA node doesn't support dynamic shape. Use override shape instead.");
 
-            // The unified engine only implements FP16/BF16/FP8/MXFP8 inputs/outputs.
-            // NOT_SET is allowed to pass (the dtype is resolved from the graph default before
-            // real validation re-runs this check).
-            auto const io_dtype_supported = [](DataType_t dt) {
-                return dt == DataType_t::NOT_SET || dt == DataType_t::HALF || dt == DataType_t::BFLOAT16 ||
-                       dt == DataType_t::FP8_E4M3 || dt == DataType_t::FP8_E5M2;
-            };
-            bool bad_io = false;
-            for (auto const name : {input_names::Q, input_names::K, input_names::V}) {
-                if (has_input(name) && !io_dtype_supported(inputs.at(name)->get_data_type())) {
-                    bad_io = true;
-                }
-            }
-            if (has_output(output_names::O) && !io_dtype_supported(outputs.at(output_names::O)->get_data_type())) {
-                bad_io = true;
-            }
-            RETURN_CUDNN_FRONTEND_ERROR_IF(bad_io,
-                                           error_code_t::GRAPH_NOT_SUPPORTED,
-                                           "Unified SDPA node only supports FP16/BF16/FP8 Q/K/V/O I/O (FP32 I/O is not "
-                                           "supported); use the composite implementation for FP32.");
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                !io_dtypes_within({DataType_t::HALF, DataType_t::BFLOAT16, DataType_t::FP8_E4M3, DataType_t::FP8_E5M2}),
+                error_code_t::GRAPH_NOT_SUPPORTED,
+                "Unified SDPA node supports only FP16/BF16/FP8 Q/K/V/O I/O; the requested I/O data "
+                "type is not supported by the unified implementation. (FP32 I/O is available via the "
+                "composite implementation, e.g. AttentionImplementation_t::AUTO.)");
 
             // TODO: Provide smarter error messages that provide the required cuDNN version for each input.
             std::unordered_set<SDPA_attributes::input_names> allowed_input_names{
