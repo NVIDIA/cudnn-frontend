@@ -95,6 +95,7 @@ def test_causal_conv1d_rejects_unsupported_kernel_size(binding_name, args, kerne
     with pytest.raises(ValueError, match=message):
         binding(*args)
 
+
 _TOLERANCES = {
     torch.float64: (5e-12, 5e-12),
     torch.float32: (5e-6, 5e-6),

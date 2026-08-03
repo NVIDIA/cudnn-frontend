@@ -16,7 +16,7 @@ def _require_fft_causal_conv1d():
         "long_fft_causal_conv1d_forward",
         "long_fft_causal_conv1d_backward",
     )
-    if cudnn.backend_version() < 92600 or any(not hasattr(cudnn, name) for name in required_symbols):
+    if cudnn.backend_version() < 92600 or any(getattr(cudnn, name, None) is None for name in required_symbols):
         pytest.skip("FFT causal conv1d requires cuDNN 9.26.0 or newer bindings and backend")
 
 
