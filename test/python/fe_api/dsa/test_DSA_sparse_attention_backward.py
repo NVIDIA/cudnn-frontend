@@ -141,6 +141,80 @@ def test_DSA_sparse_attention_backward_wrapper(
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("has_topk_length", [False, True], ids=["full-topk", "lengths"])
+@torch_fork_set_rng(seed=418)
+def test_DSA_sparse_attention_backward_sm100_576_includes_sink_in_normalization(has_topk_length):
+    """The 576/512 specialization must include sink mass in every gradient."""
+    try:
+        from cudnn import DSA
+        from cuda.bindings import driver as cuda
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    major, minor = torch.cuda.get_device_capability()
+    if major * 10 + minor < 100:
+        pytest.skip("sink-normalization regression test targets the SM100 kernel")
+
+    device = torch.device("cuda")
+    s_q = 5
+    s_kv = topk = 512
+    num_heads, head_dim = 32, 576
+    softmax_scale = 1.0 / math.sqrt(head_dim)
+
+    q = torch.randn(s_q, num_heads, head_dim, dtype=torch.bfloat16, device=device)
+    kv = torch.randn(s_kv, head_dim, dtype=torch.bfloat16, device=device)
+    # Keep the sink probability significant even for the full-top-k row so
+    # both compiled variants fail clearly if they normalize by KV-only LSE.
+    attn_sink = torch.full((num_heads,), math.log(topk), dtype=torch.float32, device=device)
+    topk_idxs = torch.arange(topk, dtype=torch.int32, device=device).expand(s_q, -1).contiguous()
+    lengths = torch.tensor([1, 63, 64, 65, 512], dtype=torch.int32, device=device)
+    topk_length = lengths if has_topk_length else None
+
+    out, lse = ref_sparse_attention_forward(
+        q,
+        kv,
+        attn_sink,
+        topk_idxs,
+        topk_length=topk_length,
+        softmax_scale=softmax_scale,
+    )
+    # O.dO is positive for every head, so a zero d_sink cannot pass by
+    # landing inside the absolute tolerance.
+    dout = out.clone()
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+    result = DSA.sparse_attention_backward_wrapper(
+        q,
+        kv,
+        out,
+        dout,
+        lse,
+        attn_sink,
+        topk_idxs,
+        softmax_scale=softmax_scale,
+        topk_length=topk_length,
+        stream=stream,
+    )
+
+    check_ref_dsa_sparse_attention_backward(
+        q,
+        kv,
+        attn_sink,
+        topk_idxs,
+        out,
+        dout,
+        lse,
+        result["dq"],
+        result["dkv"],
+        result["d_sink"],
+        softmax_scale=softmax_scale,
+        topk_length=topk_length,
+        atol=5e-2,
+        rtol=5e-2,
+    )
+
+
+@pytest.mark.L0
 @torch_fork_set_rng(seed=433)
 @pytest.mark.parametrize(
     "head_dim,num_heads,topk_length_values",
