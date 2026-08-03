@@ -23,8 +23,8 @@ from . import _interface_sm100 as _iface_sm100
 class SparseAttentionBackward(APIBase):
     def __init__(
         self,
-        sample_q: torch.Tensor,  # (total_S_q, H, D) BF16
-        sample_kv: torch.Tensor,  # (total_S_kv, D) BF16 (K=V)
+        sample_q: torch.Tensor,  # (total_S_q, H, D) FP16/BF16
+        sample_kv: torch.Tensor,  # (total_S_kv, D) FP16/BF16 (K=V)
         sample_out: torch.Tensor,  # (total_S_q, H, D_v)
         sample_dout: torch.Tensor,  # (total_S_q, H, D_v)
         sample_lse: torch.Tensor,  # (total_S_q, H) FP32, KV-only LSE
@@ -72,6 +72,79 @@ class SparseAttentionBackward(APIBase):
         self._check_dtype(self.lse_desc, torch.float32, name="LSE")
         self._check_dtype(self.attn_sink_desc, torch.float32, name="attn_sink")
         self._check_dtype(self.topk_idxs_desc, torch.int32, name="topk_idxs")
+        self._check_dtype(self.out_desc, self.q_desc.dtype, name="out", extra_error_msg="out must have same dtype as Q")
+        self._check_dtype(self.dout_desc, self.q_desc.dtype, name="dout", extra_error_msg="dout must have same dtype as Q")
+        if self.topk_length_desc is not None:
+            self._check_dtype(self.topk_length_desc, torch.int32, name="topk_length")
+
+        # Device placement + cross-tensor device consistency. The SM90/SM100
+        # kernels are CUDA-only and reject CPU or cross-device inputs at
+        # execution time (see the is_cuda / same-device assert in
+        # ``_interface_sm100.flash_attn_bwd_sm100``), so a placement mismatch
+        # must fail the support gate here rather than compile/launch and crash.
+        ref_device = self.q_desc.device
+        descriptors = [
+            self.q_desc,
+            self.kv_desc,
+            self.out_desc,
+            self.dout_desc,
+            self.lse_desc,
+            self.attn_sink_desc,
+            self.topk_idxs_desc,
+        ]
+        if self.topk_length_desc is not None:
+            descriptors.append(self.topk_length_desc)
+        self._value_error_if(
+            ref_device.type != "cuda",
+            f"Q must live on CUDA, got {ref_device}",
+        )
+        self._value_error_if(
+            any(desc.device != ref_device for desc in descriptors),
+            f"All inputs must share Q's device {ref_device}, got {[desc.device for desc in descriptors]}",
+        )
+
+        # Cross-tensor shape contract: every companion tensor is indexed with
+        # coordinates derived from Q, so a mismatched shape silently reads or
+        # writes out of place at execution time instead of failing.
+        total_s_q, num_heads, head_dim = self.q_desc.shape
+        # The SM100 kernel is tiled only for head_dim in {512, 576} (the 576
+        # MLA case splits QK=576 / V=512); any other head_dim compiles to a
+        # layout that indexes shared memory out of bounds and crashes.
+        self._value_error_if(
+            head_dim not in (512, 576),
+            f"head_dim must be 512 or 576, got {head_dim}",
+        )
+        head_dim_v = 512 if head_dim == 576 else head_dim
+        expected_o_shape = (total_s_q, num_heads, head_dim_v)
+        self._value_error_if(
+            self.kv_desc.shape[1] != head_dim,
+            f"KV must have shape (total_S_kv, {head_dim}), got {self.kv_desc.shape}",
+        )
+        self._value_error_if(
+            self.out_desc.shape != expected_o_shape,
+            f"out must have shape {expected_o_shape}, got {self.out_desc.shape}",
+        )
+        self._value_error_if(
+            self.dout_desc.shape != expected_o_shape,
+            f"dout must have shape {expected_o_shape}, got {self.dout_desc.shape}",
+        )
+        self._value_error_if(
+            self.lse_desc.shape != (total_s_q, num_heads),
+            f"LSE must have shape {(total_s_q, num_heads)}, got {self.lse_desc.shape}",
+        )
+        self._value_error_if(
+            self.attn_sink_desc.shape != (num_heads,),
+            f"attn_sink must have shape {(num_heads,)}, got {self.attn_sink_desc.shape}",
+        )
+        self._value_error_if(
+            self.topk_idxs_desc.ndim != 2 or self.topk_idxs_desc.shape[0] != total_s_q,
+            f"topk_idxs must have shape ({total_s_q}, topk_max), got {self.topk_idxs_desc.shape}",
+        )
+        if self.topk_length_desc is not None:
+            self._value_error_if(
+                self.topk_length_desc.shape != (total_s_q,),
+                f"topk_length must have shape {(total_s_q,)}, got {self.topk_length_desc.shape}",
+            )
 
         self._is_supported = True
         return True

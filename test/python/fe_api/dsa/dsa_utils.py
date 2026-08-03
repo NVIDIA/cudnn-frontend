@@ -19,6 +19,11 @@ def _require_sm90():
         pytest.skip("SM90 GPU required")
 
 
+def _require_sm100():
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("SM100 GPU required")
+
+
 # Parameterization marks shared by every DSA test
 DSA_PARAM_MARKS = [
     pytest.mark.parametrize("dtype", [torch.bfloat16]),
