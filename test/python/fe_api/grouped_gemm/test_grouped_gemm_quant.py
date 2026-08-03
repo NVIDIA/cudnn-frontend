@@ -520,8 +520,8 @@ def test_grouped_gemm_quant_discrete_wrapper_fp4_row_scale(request):
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
-def test_grouped_gemm_quant_wrapper_requires_prob_tensor(request):
-    """Wrapper should fail fast when prob_tensor is omitted."""
+def test_grouped_gemm_quant_wrapper_without_prob_tensor(request):
+    """The block-scaled wrapper supports a compile-time unit probability."""
     try:
         from cudnn import grouped_gemm_quant_wrapper_sm100
     except ImportError:
@@ -553,26 +553,39 @@ def test_grouped_gemm_quant_wrapper_requires_prob_tensor(request):
         m_aligned=cfg["m_aligned"],
     )
 
-    with pytest.raises(ValueError, match="prob_tensor is required"):
-        grouped_gemm_quant_wrapper_sm100(
-            a_tensor=inputs["a_tensor"],
-            b_tensor=inputs["b_tensor"],
-            sfa_tensor=inputs["sfa_tensor"],
-            sfb_tensor=inputs["sfb_tensor"],
-            padded_offsets=inputs["padded_offsets_tensor"],
-            alpha_tensor=inputs["alpha_tensor"],
-            norm_const_tensor=inputs.get("norm_const_tensor"),
-            prob_tensor=None,
-            acc_dtype=cfg["acc_dtype"],
-            d_dtype=cfg["d_dtype"],
-            cd_major=cfg["cd_major"],
-            mma_tiler_mn=cfg["mma_tiler_mn"],
-            cluster_shape_mn=cfg["cluster_shape_mn"],
-            sf_vec_size=cfg["sf_vec_size"],
-            vector_f32=cfg["vector_f32"],
-            m_aligned=cfg["m_aligned"],
-            discrete_col_sfd=cfg["discrete_col_sfd"],
-        )
+    kwargs = dict(
+        a_tensor=inputs["a_tensor"],
+        b_tensor=inputs["b_tensor"],
+        sfa_tensor=inputs["sfa_tensor"],
+        sfb_tensor=inputs["sfb_tensor"],
+        padded_offsets=inputs["padded_offsets_tensor"],
+        alpha_tensor=inputs["alpha_tensor"],
+        norm_const_tensor=inputs.get("norm_const_tensor"),
+        acc_dtype=cfg["acc_dtype"],
+        d_dtype=cfg["d_dtype"],
+        cd_major=cfg["cd_major"],
+        mma_tiler_mn=cfg["mma_tiler_mn"],
+        cluster_shape_mn=cfg["cluster_shape_mn"],
+        sf_vec_size=cfg["sf_vec_size"],
+        vector_f32=cfg["vector_f32"],
+        m_aligned=cfg["m_aligned"],
+        discrete_col_sfd=cfg["discrete_col_sfd"],
+    )
+    inputs["prob_tensor"].fill_(1.0)
+    with_prob = grouped_gemm_quant_wrapper_sm100(
+        **kwargs,
+        prob_tensor=inputs["prob_tensor"],
+    )
+    without_prob = grouped_gemm_quant_wrapper_sm100(
+        **kwargs,
+        prob_tensor=None,
+    )
+    torch.testing.assert_close(
+        without_prob["d_tensor"],
+        with_prob["d_tensor"],
+        rtol=0,
+        atol=0,
+    )
 
 
 @pytest.mark.L0
