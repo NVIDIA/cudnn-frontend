@@ -528,24 +528,25 @@ class IndexerBackwardSm100:
             cute.group_modes(gdQ, 0, 2),
         )
 
-        # Init all barriers (warp 0)
+        # Init all barriers (single lane of warp 0)
         if warp_idx == 0:
-            cute.arch.mbarrier_init(mbar + MBAR_S_FULL_0, 1)
-            cute.arch.mbarrier_init(mbar + MBAR_S_FULL_1, 1)
-            cute.arch.mbarrier_init(mbar + MBAR_DS_READY_0, self.WARPGROUP_SIZE)
-            cute.arch.mbarrier_init(mbar + MBAR_DS_READY_1, self.WARPGROUP_SIZE)
-            cute.arch.mbarrier_init(mbar + MBAR_DK_FULL_0, 1)
-            cute.arch.mbarrier_init(mbar + MBAR_DK_FULL_1, 1)
-            cute.arch.mbarrier_init(mbar + MBAR_DK_EMPTY_0, self.WARPGROUP_SIZE)
-            cute.arch.mbarrier_init(mbar + MBAR_DK_EMPTY_1, self.WARPGROUP_SIZE)
-            cute.arch.mbarrier_init(mbar + MBAR_K_LOADED_0, self.WARPGROUP_SIZE)
-            cute.arch.mbarrier_init(mbar + MBAR_K_LOADED_1, self.WARPGROUP_SIZE)
-            cute.arch.mbarrier_init(mbar + MBAR_K_LOADED_2, self.WARPGROUP_SIZE)
-            cute.arch.mbarrier_init(mbar + MBAR_K_CONSUMED_0, 1)
-            cute.arch.mbarrier_init(mbar + MBAR_K_CONSUMED_1, 1)
-            cute.arch.mbarrier_init(mbar + MBAR_K_CONSUMED_2, 1)
-            cute.arch.mbarrier_init(mbar + MBAR_W_LOADED, 1)
-            cute.arch.mbarrier_init(mbar + MBAR_DQ_DONE, 1)
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_init(mbar + MBAR_S_FULL_0, 1)
+                cute.arch.mbarrier_init(mbar + MBAR_S_FULL_1, 1)
+                cute.arch.mbarrier_init(mbar + MBAR_DS_READY_0, self.WARPGROUP_SIZE)
+                cute.arch.mbarrier_init(mbar + MBAR_DS_READY_1, self.WARPGROUP_SIZE)
+                cute.arch.mbarrier_init(mbar + MBAR_DK_FULL_0, 1)
+                cute.arch.mbarrier_init(mbar + MBAR_DK_FULL_1, 1)
+                cute.arch.mbarrier_init(mbar + MBAR_DK_EMPTY_0, self.WARPGROUP_SIZE)
+                cute.arch.mbarrier_init(mbar + MBAR_DK_EMPTY_1, self.WARPGROUP_SIZE)
+                cute.arch.mbarrier_init(mbar + MBAR_K_LOADED_0, self.WARPGROUP_SIZE)
+                cute.arch.mbarrier_init(mbar + MBAR_K_LOADED_1, self.WARPGROUP_SIZE)
+                cute.arch.mbarrier_init(mbar + MBAR_K_LOADED_2, self.WARPGROUP_SIZE)
+                cute.arch.mbarrier_init(mbar + MBAR_K_CONSUMED_0, 1)
+                cute.arch.mbarrier_init(mbar + MBAR_K_CONSUMED_1, 1)
+                cute.arch.mbarrier_init(mbar + MBAR_K_CONSUMED_2, 1)
+                cute.arch.mbarrier_init(mbar + MBAR_W_LOADED, self.WARP_SIZE)
+                cute.arch.mbarrier_init(mbar + MBAR_DQ_DONE, 1)
         cute.arch.sync_threads()
 
         # Pre-load topk indices into SMEM cooperatively (all 512 threads).
@@ -748,9 +749,13 @@ class IndexerBackwardSm100:
                 sW[idx] = mW[seq_idx, idx, batch_idx]
 
         cute.arch.fence_view_async_shared()
-        # Signal W + grad_signal loaded for compute warpgroup
-        with cute.arch.elect_one():
-            cute.arch.mbarrier_arrive(mbar + MBAR_W_LOADED)
+        # Signal W + grad_signal loaded for compute warpgroup.
+        # All 32 lanes arrive (count = WARP_SIZE): mbarrier.arrive has release
+        # semantics for the *executing thread* only, so a single elected
+        # arrival would not order the other 31 lanes' sW/sGradSignal stores
+        # before the consumer's mbarrier_wait (racecheck flags exactly those
+        # 31 lanes). Whole-warp arrival closes the happens-before chain.
+        cute.arch.mbarrier_arrive(mbar + MBAR_W_LOADED)
 
         # --- TMA Q load (dsa-next pattern: cute.copy with pre-partitioned tensors) ---
         Q_producer.reset()
