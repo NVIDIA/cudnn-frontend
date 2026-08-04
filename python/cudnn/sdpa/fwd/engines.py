@@ -501,6 +501,13 @@ def lower_dsl_prefill(
 
     seq_q_t = facts.seq_q_t if facts.padded else None
     seq_kv_t = facts.seq_kv_t if facts.padded else None
+    # Mirrors the seq_q_lens_present constructor argument below. Execute
+    # forwards seq_q only when the compiled specialization consumes it (or THD,
+    # which sources cu_seqlens from it) — the adapter rejects mismatches, so a
+    # buffer the FP8/MXFP8 kernels can't honor (dense padded-Q trim is not
+    # plumbed there — known gap) is dropped here rather than erroring at
+    # execute.
+    seq_q_lens_present = facts.padded and not facts.thd and facts.seq_q_t is not None and not (facts.is_mxfp8 or facts.is_fp8)
     api = api_type(
         sample_q=ga.tensor_desc_from_ir(facts.q_t, name="q"),
         sample_k=ga.tensor_desc_from_ir(facts.k_t, name="k"),
@@ -516,7 +523,7 @@ def lower_dsl_prefill(
         # enabled whenever a dense padded graph carries per-batch Q lengths.
         # THD carries Q lengths via cu_seqlens; the FP8/MXFP8 kernels are not
         # plumbed (their specs also keep padded_stats=False).
-        seq_q_lens_present=(facts.padded and not facts.thd and facts.seq_q_t is not None and not (facts.is_mxfp8 or facts.is_fp8)),
+        seq_q_lens_present=seq_q_lens_present,
         has_sink=facts.has_sink,
         thd=facts.thd,
         dtype_o=facts.dtype_o if (facts.is_mxfp8 or facts.is_fp8) else None,
@@ -636,7 +643,7 @@ def lower_dsl_prefill(
             scale_softmax=facts.scale,
             sinks=sinks_buf,
             seq_kv_lens=seq_kv_buf,
-            seq_q_lens=seq_q_buf,
+            seq_q_lens=seq_q_buf if (seq_q_lens_present or facts.thd) else None,
             # Stream from the execute-time handle (raw CUstream int, the
             # ExecutionContext's stream); None keeps the default stream.
             current_stream=_cuda_driver.CUstream(stream) if stream is not None else None,

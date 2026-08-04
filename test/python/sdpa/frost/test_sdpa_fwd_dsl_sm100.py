@@ -326,6 +326,14 @@ def test_dsl_sm100_execute_sink_lse_contract():
     api.compile()
     with pytest.raises(ValueError, match="without sink support"):
         api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, sinks=sink)
+    # Same contract for per-batch lengths: a specialization compiled without
+    # them must not silently ignore a provided tensor (nor, the other way,
+    # substitute a zeros dummy that would mask every row).
+    seq_kv = torch.full((b,), s, dtype=torch.int32, device="cuda")
+    with pytest.raises(ValueError, match="without per-batch KV lengths"):
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_kv_lens=seq_kv)
+    with pytest.raises(ValueError, match="without per-batch Q lengths"):
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=seq_kv)
     # No sample_lse and no lse_tensor: the kernel's mandatory LSE write lands
     # in a cached dummy — no per-execute allocation, output still correct.
     api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o)

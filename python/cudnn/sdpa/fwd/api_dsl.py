@@ -332,6 +332,59 @@ class SdpaFwdDsl(APIBase):
         )
         return sinks.reshape(-1)
 
+    def _checked_seq_lens(self, seq_lens: torch.Tensor, name: str) -> torch.Tensor:
+        """Validate caller-provided per-batch lengths and return the kernel's (B,) int32 view.
+
+        Strictly a view: an implicit ``.to(torch.int32)`` here would allocate
+        and launch a cast kernel on the execute hot path (and break CUDA-graph
+        pointer stability).
+        """
+        self._value_error_if(
+            seq_lens.dtype != torch.int32,
+            f"{name} must be int32; got {seq_lens.dtype}",
+        )
+        self._value_error_if(
+            seq_lens.numel() != self.batch_size,
+            f"{name} must have B = {self.batch_size} elements; got {seq_lens.numel()}",
+        )
+        self._value_error_if(
+            not seq_lens.is_contiguous(),
+            f"{name} must be contiguous (bound to the kernel as a flat (B,) view)",
+        )
+        return seq_lens.reshape(-1)
+
+    def _check_seq_lens_contract(self, seq_q_lens, seq_kv_lens) -> None:
+        """Reject seq-length tensors inconsistent with the compiled specialization.
+
+        Like sinks, presence is a compile-time specialization: substituting a
+        zeros dummy for a required tensor masks every row (silently wrong
+        output), and lengths passed to a specialization compiled without them
+        are silently ignored. THD is exempt — it always requires both (they
+        source the packed cu_seqlens metadata).
+        """
+        if self.thd:
+            self._value_error_if(
+                seq_q_lens is None or seq_kv_lens is None,
+                "THD execute requires seq_q_lens and seq_kv_lens",
+            )
+            return
+        self._value_error_if(
+            self.seq_kv_lens_present and seq_kv_lens is None,
+            "seq_kv_lens is required by this compiled specialization",
+        )
+        self._value_error_if(
+            not self.seq_kv_lens_present and seq_kv_lens is not None,
+            "this specialization was compiled without per-batch KV lengths; construct the API with seq_kv_lens_present=True",
+        )
+        self._value_error_if(
+            self.seq_q_lens_present and seq_q_lens is None,
+            "seq_q_lens is required by this compiled specialization",
+        )
+        self._value_error_if(
+            not self.seq_q_lens_present and seq_q_lens is not None,
+            "this specialization was compiled without per-batch Q lengths; construct the API with seq_q_lens_present=True",
+        )
+
     @abstractmethod
     def scratch_workspace_bytes(self) -> int:
         """Return the per-execution scratch requirement for this implementation."""
@@ -735,6 +788,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             not self.has_sink and sinks is not None,
             "this specialization was compiled without sink support; construct the API with has_sink=True",
         )
+        self._check_seq_lens_contract(seq_q_lens, seq_kv_lens)
         self._value_error_if(
             self.lse_desc is not None and lse_tensor is None,
             "lse_tensor is required by this compiled specialization",
@@ -819,26 +873,17 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             else self._dummy("sinks", device, lambda: torch.zeros(self.h_q, dtype=torch.float32, device=device))
         )
         seq_kv_t = (
-            seq_kv_lens.reshape(-1).to(torch.int32)
+            self._checked_seq_lens(seq_kv_lens, "seq_kv_lens")
             if seq_kv_lens is not None
             else self._dummy("seq_kv", device, lambda: torch.zeros(self.batch_size, dtype=torch.int32, device=device))
         )
         # Dense padded-Q trim: per-batch Q lengths are their OWN kernel
         # parameter (compiled in only when seq_q_lens_present — the kernel
         # signature is specialized on `None`, so the flag-off ABI is
-        # unchanged). The caller's (B,)-int32 device tensor is bound
-        # directly: reshape(-1) is a view and .to(torch.int32) a no-op for
-        # the canonical contiguous int32 input, so the execute hot path
-        # performs zero allocations/copies and the kernel sees a stable
-        # pointer (CUDA-graph-capture friendly).
-        seq_q_t = None
-        if self.seq_q_lens_present:
-            if seq_q_lens is None:
-                raise ValueError("SdpaFwdDsl.execute: seq_q_lens_present requires a seq_len_q tensor")
-            # Direct bind (no cat, no carve): reshape(-1)/.to(int32) are
-            # no-op views for the canonical contiguous int32 input, so this
-            # path needs no workspace scratch at all.
-            seq_q_t = seq_q_lens.reshape(-1).to(torch.int32)
+        # unchanged). The caller's (B,)-int32 device tensor is bound directly
+        # as a validated view — zero allocations/copies on the execute hot
+        # path, stable pointer (CUDA-graph-capture friendly).
+        seq_q_t = self._checked_seq_lens(seq_q_lens, "seq_q_lens") if self.seq_q_lens_present else None
         o_desc_dummy = self._dummy("o_desc", device, lambda: torch.zeros(1, dtype=torch.int64, device=device))
 
         import cutlass
@@ -875,18 +920,18 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         import cutlass
 
         dev = q_buf.device
-        if seq_q_lens is None or seq_len_kv is None:
-            raise ValueError("THD execute requires seq_len_q and seq_len_kv")
-        b = seq_q_lens.numel()
+        slq_v = self._checked_seq_lens(seq_q_lens, "seq_q_lens")
+        slk_v = self._checked_seq_lens(seq_len_kv, "seq_kv_lens")
+        b = slq_v.numel()
         carver = WorkspaceCarver(workspace, self.scratch_workspace_bytes(), "SdpaFwdDslSm100 (THD)") if workspace is not None else None
         if carver is not None:
             slq = carver.take(b, torch.int32)
-            slq.copy_(seq_q_lens.reshape(-1))
+            slq.copy_(slq_v)
             slk = carver.take(b, torch.int32)
-            slk.copy_(seq_len_kv.reshape(-1))
+            slk.copy_(slk_v)
         else:
-            slq = seq_q_lens.reshape(-1).to(torch.int32)
-            slk = seq_len_kv.reshape(-1).to(torch.int32)
+            slq = slq_v
+            slk = slk_v
         # Metadata buffer: [ seq_kv_lens(B) | cu_seqlens_q(B+1) | cu_seqlens_k(B+1) ],
         # with the cumulative sums built in place (no torch.cat temporaries).
         meta = carver.take(3 * b + 2, torch.int32) if carver is not None else torch.empty(3 * b + 2, dtype=torch.int32, device=dev)
@@ -1029,7 +1074,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             self._checked_sinks_1d(sinks) if sinks is not None else self._dummy("sinks", device, lambda: torch.zeros(h_q, dtype=torch.float32, device=device))
         )
         seq_kv_t = (
-            seq_kv_lens.reshape(-1).to(torch.int32)
+            self._checked_seq_lens(seq_kv_lens, "seq_kv_lens")
             if seq_kv_lens is not None
             else self._dummy("seq_kv", device, lambda: torch.zeros(b, dtype=torch.int32, device=device))
         )
@@ -1117,7 +1162,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             self._checked_sinks_1d(sinks) if sinks is not None else self._dummy("sinks", device, lambda: torch.zeros(h_q, dtype=torch.float32, device=device))
         )
         seq_kv_t = (
-            seq_kv_lens.reshape(-1).to(torch.int32)
+            self._checked_seq_lens(seq_kv_lens, "seq_kv_lens")
             if seq_kv_lens is not None
             else self._dummy("seq_kv", device, lambda: torch.zeros(b, dtype=torch.int32, device=device))
         )
@@ -1598,6 +1643,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             not self.has_sink and sinks is not None,
             "this specialization was compiled without sink support; construct the API with has_sink=True",
         )
+        self._check_seq_lens_contract(seq_q_lens, seq_kv_lens)
         scale_val = self.scale_softmax if scale_softmax is None or scale_softmax == 0.0 else float(scale_softmax)
         scale_softmax_log2 = scale_val * math.log2(math.e)
         if self.thd:
@@ -1626,7 +1672,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         lse = self._checked_lse_view(lse_tensor) if lse_tensor is not None else None
         sinks_t = self._checked_sinks_1d(sinks) if sinks is not None else None
         seq_q_lens = (
-            seq_q_lens.reshape(-1).to(torch.int32)
+            self._checked_seq_lens(seq_q_lens, "seq_q_lens")
             if seq_q_lens is not None
             else self._dummy(
                 "seq_q_lens",
@@ -1635,7 +1681,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             )
         )
         seq_kv_lens = (
-            seq_kv_lens.reshape(-1).to(torch.int32)
+            self._checked_seq_lens(seq_kv_lens, "seq_kv_lens")
             if seq_kv_lens is not None
             else self._dummy(
                 "seq_kv_lens",
@@ -1686,14 +1732,16 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         dev = q_buf.device
         carver = WorkspaceCarver(workspace, self.scratch_workspace_bytes(), "SdpaFwdDslSm120 (THD)") if workspace is not None else None
 
+        slq_v = self._checked_seq_lens(seq_q_lens, "seq_q_lens")
+        slk_v = self._checked_seq_lens(seq_kv_lens, "seq_kv_lens")
         if carver is not None:
             slq = carver.take(b, torch.int32)
-            slq.copy_(seq_q_lens.reshape(-1))
+            slq.copy_(slq_v)
             slk = carver.take(b, torch.int32)
-            slk.copy_(seq_kv_lens.reshape(-1))
+            slk.copy_(slk_v)
         else:
-            slq = seq_q_lens.reshape(-1).to(torch.int32)
-            slk = seq_kv_lens.reshape(-1).to(torch.int32)
+            slq = slq_v
+            slk = slk_v
         # [seq_kv(B) | cu_q(B+1) | cu_k(B+1)] — bound as the kernel's
         # seq_kv_lens tensor; the leading B words alias the per-sequence KV
         # lengths so the kernel's existing padded-mask read works unchanged.

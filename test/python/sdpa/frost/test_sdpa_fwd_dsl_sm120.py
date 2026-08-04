@@ -738,6 +738,14 @@ def test_dsl_sm120_execute_contract_mismatches():
         api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, sinks=sinks)
     with pytest.raises(ValueError, match="without an LSE output"):
         api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=lse)
+    # Same contract for per-batch lengths: a specialization compiled without
+    # them must not silently ignore a provided tensor (nor, the other way,
+    # substitute a zeros dummy that would mask every row).
+    seq_kv = torch.full((1,), 128, dtype=torch.int32, device="cuda")
+    with pytest.raises(ValueError, match="without per-batch KV lengths"):
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_kv_lens=seq_kv)
+    with pytest.raises(ValueError, match="without per-batch Q lengths"):
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=seq_kv)
     api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o)
     torch.cuda.synchronize()
     expected = _ref_sdpa_full(q, k, v, scale=1.0 / math.sqrt(128))
