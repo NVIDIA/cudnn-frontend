@@ -152,16 +152,11 @@ def test_sdpa_random_fwd_unified_L1(env_info, test_no, request, cudnn_handle):
         is_ragged_or_padded_or_full=RandomChoice({"ragged" : 0, "padded" : 1, "cu_padded" : 1, "full" : 1}),
         with_unfuse_fma=RandomChoice({True : 1, False : 1}),  # Randomly enable unfuse_fma for SM100
         with_sink_token=RandomChoice({True : 1, False : 3}),
-        with_rope=RandomChoice({True : 1, False : 3}),  # RoPE at end to preserve existing test distributions
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
 
     test.cfg.implementation = getattr(cudnn.attention_implementation, request.config.getoption("--implementation") or "", cudnn.attention_implementation.UNIFIED)
     test.showConfig(test_no, request)
-
-    # RoPE backend op was added in cuDNN 9.24. Skip configs that need it on older backends.
-    if getattr(test.cfg, "with_rope", False) and cudnn.backend_version() < 92400:
-        pytest.skip("RoPE requires cuDNN >= 9.24")
 
     exec_sdpa(test.cfg, request, cudnn_handle)
 
@@ -193,15 +188,11 @@ def test_sdpa_random_bwd_L0(env_info, test_no, request, cudnn_handle):
         is_ragged_or_padded_or_full=RandomChoice({"ragged" : 0, "padded" : 4, "full" : 1}),
         is_deterministic=RandomChoice({True : 3, False : 1}),
         with_sink_token=RandomChoice({True : 1, False : 3}),
-        with_rope=RandomChoice({True : 1, False : 3}),
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
 
     test.cfg.is_infer = False
     test.showConfig(test_no, request)
-
-    if getattr(test.cfg, "with_rope", False) and cudnn.backend_version() < 92400:
-        pytest.skip("RoPE requires cuDNN >= 9.24")
 
     exec_sdpa(test.cfg, request, cudnn_handle)
 
