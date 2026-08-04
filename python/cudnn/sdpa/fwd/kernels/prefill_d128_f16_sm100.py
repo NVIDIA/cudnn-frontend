@@ -22,10 +22,7 @@ SM100 resource layout:
   3. **Manual row-max** on the MASK_NONE fast path — ``tcgen05_ld`` +
      ``row_max_reduction`` (the masked path's pattern) instead of
      ``tmem_load_max_reduction_tile`` (LDTM.STAT).
-  4. SM100 launch: ``cluster=(CTA_MMA, 1, 1)``; compile drops
-     ``--ptxas-options -uumn`` (cfence not honored on SM100) and the
-     ``cute.nvgpu`` scheduling hints (cfence / sched_res_busy) that
-     ``-uumn`` gated.
+  4. SM100 launch: ``cluster=(CTA_MMA, 1, 1)``.
 
 Supported: FP16 / BF16 (``DTYPE_QKV ∈ {2, 3}``); masks none / causal / SWA /
 padded and all pairwise combos (causal+swa, causal+padded, swa+padded);
@@ -1730,8 +1727,6 @@ def _correction_warp_group(
                 # vec_scale_pair emits nvvm.mul_packed_f32x2 → FMUL2.  Without it
                 # plain o_chunk*alpha lowers to scalar FMUL inside the runtime-if
                 # (downstream fp32 tcgen05_st doesn't force packed regs).
-                # Per-chunk cfence keeps ptxas from sinking the next chunk's
-                # tcgen05_ld ahead of the prior tcgen05_st (TMEM-col anti-dep).
                 if ~all_alpha_one:
                     for chunk_idx in cutlass.range_constexpr(N_CHUNKS_O):
                         o_addr = tmem_base_iter + cutlass.Int32(tmem_O_off + chunk_idx * O_CHUNK)
@@ -2123,7 +2118,5 @@ def compile(b: int = 1, qh: int = 1, kh: int = 1, sq: int = 256, skv: int = 128,
         cutlass.Int32(0),
         fake_seq_q_lens,
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
-        # SM100: drop --ptxas-options -uumn — cfence is not honored on
-        # Blackwell, and this kernel emits no cfence.
         options="--enable-tvm-ffi",
     )

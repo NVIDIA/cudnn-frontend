@@ -1235,7 +1235,7 @@ def _softmax_kv_body(
     reg_S = RegTile(reg_S_vec, size=CFG.TILE_N)
     current_max = current_max_unscaled * scale_log2
 
-    # cfence pins ptxas scheduler from hoisting stat-store across the wg sync.
+    # sync the warpgroups before the stat-store.
     if sub_tile_id == 1:
         nvvm.barrier_cta_sync(barrier_id=8, thread_count=256)
 
@@ -2043,5 +2043,5 @@ def compile(b: int = 1, qh: int = 1, kh: int = 1, sq: int = 256, skv: int = 128)
         fake_amax_s,
         fake_amax_o,
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
-        options="--enable-tvm-ffi",  # SM100: cfence not honored / not emitted
+        options="--enable-tvm-ffi",
     )

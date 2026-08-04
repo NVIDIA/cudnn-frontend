@@ -26,6 +26,7 @@ from cudnn.frost.tile_dsl.constants import (
     MASK_NONE,
     MASK_PADDED,
     MASK_SWA,
+    SCHED_LPT,
     SCHED_NATURAL,
 )
 from cudnn.sdpa.fwd.config_sm100 import TemplateParams as Sm100TemplateParams
@@ -566,6 +567,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # picks the fused path with no user action.
         mxfp8 = self._fp8 and not self._pertensor
         fused_ldtm_stat = mxfp8 and (self._device_cc == (10, 3))
+        sched_policy = self.sched_policy
+        if mxfp8 and sched_policy == SCHED_NATURAL and (self.mask_flags & MASK_CAUSAL):
+            sched_policy = SCHED_LPT
         params = Sm100TemplateParams(
             dtype_qkv=_SM100_DTYPE_QKV_CODE[self.dtype],
             dtype_o=_SM100_DTYPE_QKV_CODE[self.dtype_o],
@@ -575,7 +579,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             has_sink=self.has_sink,
             seq_kv_lens_present=self.seq_kv_lens_present,
             seq_q_lens_present=self.seq_q_lens_present,
-            sched_policy=self.sched_policy,
+            sched_policy=sched_policy,
             thd_varlen=self.thd,
             fused_ldtm_stat=fused_ldtm_stat,
         )
@@ -971,6 +975,13 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         )
         o_desc_dummy = self._dummy("o_desc", device, lambda: torch.zeros(1, dtype=torch.int64, device=device))
 
+        amax_o_buf = (
+            amax_o.reshape(-1)[:1]
+            if amax_o is not None
+            else self._dummy("amax_o", device, lambda: torch.zeros(1, dtype=torch.float32, device=device))
+        )
+        amax_o_buf.zero_()
+
         self._compiled_kernel(
             Q,
             K,
@@ -980,6 +991,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             sf_k_v,
             sf_v_v,
             lse,
+            amax_o_buf,
             sinks_t,
             seq_kv_t,
             o_desc_dummy,
@@ -992,12 +1004,6 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         )
         if o_needs_copy_back:
             O_view.copy_(O)
-        if amax_o is not None:
-            # Cast to fp32 before abs(): torch has no abs for fp8 output dtypes. For
-            # FP8 O this is the amax of the (already-quantized) output — exact when
-            # no saturation, which the direct-cast (scale=1) epilogue guarantees for
-            # in-range attention outputs.
-            amax_o.reshape(-1)[:1] = O_view.to(torch.float32).abs().max()
         self._logger.debug("execute (MXFP8) completed")
 
     def _execute_fp8(
