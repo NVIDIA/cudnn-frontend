@@ -231,6 +231,62 @@ def test_bsa_fp8_sm100_sm110_auto_kv_splits(heads, seqlen_q, topk, expected_spli
 
 
 @pytest.mark.L0
+def test_bsa_fp8_sm100_auto_split_uses_workspace_fallback(monkeypatch):
+    _require_sm100_fp8()
+    interface = importlib.import_module("cudnn.block_sparse_attention._interface")
+    monkeypatch.setattr(interface, "_get_device_arch", lambda: 100)
+
+    batch, heads, seqlen_q, seqlen_k, head_dim, topk = 1, 4, 64, 64, 128, 128
+    q = torch.empty((batch, heads, seqlen_q, head_dim), device="cuda", dtype=torch.float8_e4m3fn)
+    k = torch.empty((batch, heads, seqlen_k, head_dim), device="cuda", dtype=torch.float8_e4m3fn)
+    v = torch.empty_like(k)
+    q_scale = torch.empty((batch, heads, seqlen_q), device="cuda", dtype=torch.float32)
+    k_scale = torch.empty((batch, heads, seqlen_k // 16), device="cuda", dtype=torch.float32)
+    v_scale = torch.empty((heads, head_dim), device="cuda", dtype=torch.float32)
+    q2k = torch.zeros((batch, heads, 1, topk), device="cuda", dtype=torch.int32)
+
+    class WorkspaceFallbackCalled(Exception):
+        pass
+
+    def workspace_fallback(q_arg, value_dim, kv_splits, allow_fallback, output_dtype=None):
+        assert q_arg is q
+        assert value_dim == head_dim
+        assert kv_splits == 16
+        assert allow_fallback is True
+        assert output_dtype is torch.bfloat16
+        raise WorkspaceFallbackCalled
+
+    monkeypatch.setattr(interface, "_resolve_blk64_split_workspace", workspace_fallback)
+    with pytest.raises(WorkspaceFallbackCalled):
+        interface._bsa_fp8_blk64_fwd_quantized(
+            q,
+            k,
+            v,
+            q_scale,
+            k_scale,
+            v_scale,
+            q2k,
+            topk,
+        )
+
+
+@pytest.mark.L0
+def test_bsa_fp8_split_workspace_estimate_uses_bf16_output_size():
+    _import_bsa()
+    interface = importlib.import_module("cudnn.block_sparse_attention._interface")
+
+    batch, heads, seqlen_q, value_dim, kv_splits = 1, 4, 64, 128, 2
+    q = torch.empty((batch, heads, seqlen_q, value_dim), dtype=torch.float8_e4m3fn)
+    rows = batch * heads * seqlen_q
+    num_q_blocks = math.ceil(seqlen_q / 64)
+    expected_bytes = (
+        kv_splits * rows * (value_dim + 1) * 4 + rows * (value_dim * torch.bfloat16.itemsize + 4) + batch * heads * num_q_blocks * (kv_splits + 1) * 4
+    )
+
+    assert interface._blk64_split_workspace_bytes(q, value_dim, kv_splits, output_dtype=torch.bfloat16) == expected_bytes
+
+
+@pytest.mark.L0
 @torch_fork_set_rng(seed=2026)
 def test_bsa_fp8_sm100_bf16_forward_matches_reference():
     BSA = _require_sm100_fp8()

@@ -467,13 +467,15 @@ def _blk64_split_workspace_bytes(
     q: torch.Tensor,
     value_dim: int,
     kv_splits: int,
+    output_dtype: Optional[torch.dtype] = None,
 ) -> int:
     """Estimate live split-KV partial, combine-output, and offset storage."""
     batch, num_heads, seqlen_q, _ = q.shape
     num_q_blocks = _ceil_div_int(seqlen_q, 64)
     rows = batch * num_heads * seqlen_q
+    output_element_size = q.element_size() if output_dtype is None else output_dtype.itemsize
     partial_bytes = kv_splits * rows * (value_dim + 1) * 4
-    final_bytes = rows * (value_dim * q.element_size() + 4)
+    final_bytes = rows * (value_dim * output_element_size + 4)
     offset_bytes = batch * num_heads * num_q_blocks * (kv_splits + 1) * 4
     return int(partial_bytes + final_bytes + offset_bytes)
 
@@ -483,6 +485,7 @@ def _resolve_blk64_split_workspace(
     value_dim: int,
     kv_splits: int,
     allow_fallback: bool,
+    output_dtype: Optional[torch.dtype] = None,
 ) -> int:
     """Fit split-KV workspace to currently available CUDA allocator capacity."""
     kv_splits = int(kv_splits)
@@ -499,7 +502,7 @@ def _resolve_blk64_split_workspace(
 
     candidate = kv_splits
     while candidate > 1:
-        required_bytes = _blk64_split_workspace_bytes(q, value_dim, candidate)
+        required_bytes = _blk64_split_workspace_bytes(q, value_dim, candidate, output_dtype)
         if required_bytes <= budget_bytes:
             return candidate
         if not allow_fallback:
@@ -1396,16 +1399,24 @@ def bsa_attn_fwd_blk64_cutedsl(
     tile_m = 64
     tile_n = 256
     if auto_kv_splits:
-        kv_splits_i = _sm100_blk64_auto_kv_splits(
-            q_bhsd,
-            q2k_block_index,
-            uniform_block_sparse_num,
-        )
+        if is_sage_fp8:
+            kv_splits_i = _sm100_blk64_auto_fp8_kv_splits(
+                uniform_block_sparse_num,
+                num_head,
+                seqlen_q,
+            )
+        else:
+            kv_splits_i = _sm100_blk64_auto_kv_splits(
+                q_bhsd,
+                q2k_block_index,
+                uniform_block_sparse_num,
+            )
     kv_splits_i = _resolve_blk64_split_workspace(
         q_bhsd,
         head_dim_v,
         kv_splits_i,
         allow_fallback=auto_kv_splits,
+        output_dtype=output_dtype,
     )
     allow_empty_block_nums = (has_variable_block_nums and allow_empty_block_nums) or kv_splits_i > 1
     if use_clc is None:
@@ -1669,11 +1680,6 @@ def _bsa_fp8_blk64_fwd_quantized(
 
     assert q2k_block_nums is None, "SM100/SM110 FP8 does not support q2k_block_nums"
     assert block_sizes is None, "SM100/SM110 FP8 does not support block_sizes"
-    kv_splits = _sm100_blk64_auto_fp8_kv_splits(
-        block_sparse_num,
-        heads,
-        seqlen_q,
-    )
     out, _ = bsa_attn_fwd_blk64_cutedsl(
         q_fp8,
         k_fp8,
@@ -1684,7 +1690,7 @@ def _bsa_fp8_blk64_fwd_quantized(
         layout="bhsd",
         block_sparse_num=block_sparse_num,
         use_clc=False,
-        kv_splits=kv_splits,
+        kv_splits="auto",
         q_scale=q_scale.contiguous(),
         k_scale=k_scale.contiguous(),
         v_scale=v_scale.contiguous(),

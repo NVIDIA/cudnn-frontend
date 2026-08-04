@@ -391,7 +391,7 @@ def test_bsa_attention_forward_sm100_blk64_workspace_fallback(monkeypatch):
     monkeypatch.setattr(
         interface,
         "_blk64_split_workspace_bytes",
-        lambda q, value_dim, kv_splits: kv_splits * gib // 2,
+        lambda q, value_dim, kv_splits, output_dtype=None: kv_splits * gib // 2,
     )
 
     assert interface._resolve_blk64_split_workspace(fake_q, 128, 8, allow_fallback=True) == 2
@@ -420,11 +420,12 @@ def test_bsa_attention_forward_sm100_blk64_auto_uses_workspace_fallback(monkeypa
 
     monkeypatch.setattr(interface, "_sm100_blk64_auto_kv_splits", lambda *args, **kwargs: 2)
 
-    def workspace_fallback(q_arg, value_dim, kv_splits, allow_fallback):
+    def workspace_fallback(q_arg, value_dim, kv_splits, allow_fallback, output_dtype=None):
         assert q_arg is not None
         assert value_dim == 128
         assert kv_splits == 2
         assert allow_fallback is True
+        assert output_dtype is torch.bfloat16
         raise WorkspaceFallbackCalled
 
     monkeypatch.setattr(interface, "_resolve_blk64_split_workspace", workspace_fallback)
