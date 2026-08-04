@@ -5,57 +5,27 @@
 # NOTE: TE must be imported BEFORE cudnn to avoid library loading conflicts
 from looseversion import LooseVersion
 
-try:
-    import transformer_engine
-
-    if LooseVersion(transformer_engine.__version__) < LooseVersion("2.12.0"):
-        raise ImportError(f"TransformerEngine >= 2.12.0 required, found {transformer_engine.__version__}")
-    from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer, MXFP8Tensor
-    import transformer_engine_torch as tex
-
-    HAS_TE = True
-except Exception:
-    HAS_TE = False
-    tex = None
-    MXFP8Quantizer = None
-    MXFP8Tensor = None
-
 import cudnn
 import pytest
 import torch
 import math
 from enum import IntEnum
 
-from .helpers import exact_equal, fill_sparse_small_int, time_execution, profile_execution
+from .helpers import exact_equal, fill_sparse_small_int, time_execution, profile_execution, note_frost_routing
 from .mxfp8_ref import compute_ref, compute_ref_backward
+
+# Torch-only MXFP8 block quantization + F8_128x4 swizzle (replicates the
+# TransformerEngine MXFP8Quantizer / tex.swizzle_scales_for_gemm_ semantics —
+# see mxfp8_quant.py for the source-level derivation).  TransformerEngine is
+# no longer required to run the MXFP8 SDPA tests; TE-parity of these
+# primitives is covered by test_mxfp8_quant.py (which only runs when TE is
+# installed).
+from .mxfp8_quant import quantize_to_mxfp8  # noqa: F401  (re-exported; mxfp8_ref imports it from here)
 
 # fmt: off
 
 def ceil_div(a: int, b: int) -> int:
     return (a + b - 1) // b
-
-
-MXFP8_QUANTIZER_MAX_ROWS = 65535 * 64
-
-
-def quantize_mxfp8_compact(tensor_2d, quantizer):
-    if tensor_2d.shape[0] <= MXFP8_QUANTIZER_MAX_ROWS:
-        return quantizer(tensor_2d)
-
-    chunk_rows = MXFP8_QUANTIZER_MAX_ROWS // 128 * 128
-    results = [quantizer(chunk) for chunk in tensor_2d.split(chunk_rows, dim=0)]
-    return MXFP8Tensor(
-        shape=tensor_2d.shape,
-        dtype=tensor_2d.dtype,
-        fp8_dtype=quantizer.dtype,
-        rowwise_data=torch.cat([result._rowwise_data for result in results], dim=0),
-        rowwise_scale_inv=torch.cat([result._rowwise_scale_inv for result in results], dim=0),
-        columnwise_data=torch.cat([result._columnwise_data for result in results], dim=0),
-        columnwise_scale_inv=torch.cat([result._columnwise_scale_inv for result in results], dim=0),
-        quantizer=quantizer,
-        requires_grad=False,
-        with_gemm_swizzled_scales=False,
-    )
 
 
 class GraphFwdUid(IntEnum):
@@ -159,70 +129,6 @@ def compute_mxfp8_scale_dims(s, d, block_size=32):
         "d_padded": d_padded,
     }
 
-
-
-def quantize_to_mxfp8(
-    tensor,
-    b,
-    h,
-    s,
-    d,
-    block_size=32,
-    fp8_dtype=torch.float8_e4m3fn,
-    with_ref=True,
-):
-    l = b * h
-    te_dtype = tex.DType.kFloat8E4M3 if fp8_dtype == torch.float8_e4m3fn else tex.DType.kFloat8E5M2
-
-    d_scale = ceil_div(d, block_size)
-    d_scale_padded = ceil_div(d_scale, 4) * 4
-    d_padded = d_scale_padded * block_size
-
-    s_scale = ceil_div(s, block_size)
-    s_scale_padded = ceil_div(s_scale, 4) * 4
-    s_padded = s_scale_padded * block_size
-
-    tensor_3d = tensor.float().reshape(l, s, d)
-    pad_d = d_padded - d
-    pad_s = s_padded - s
-    if pad_s > 0 or pad_d > 0:
-        tensor_3d = torch.nn.functional.pad(tensor_3d, (0, pad_d, 0, pad_s))
-    tensor_2d = tensor_3d.reshape(l * s_padded, d_padded)
-
-    # without swizzle
-    quantizer = MXFP8Quantizer(fp8_dtype=te_dtype, rowwise=True, columnwise=True)
-    mxfp8_result = quantize_mxfp8_compact(tensor_2d, quantizer)
-    # --- Rowwise results (quantized along D dimension) ---
-    fp8_data_d_flat = mxfp8_result._rowwise_data
-    fp8_data_d = fp8_data_d_flat.reshape(l, s_padded, d_padded)[:, :s, :d].contiguous()
-    fp8_data_d = fp8_data_d.view(fp8_dtype).reshape(b, h, s, d)
-
-    sf_d_ref = None
-    if with_ref:
-        scale_inv_d = mxfp8_result._rowwise_scale_inv
-        scale_inv_d_f32 = scale_inv_d.view(torch.float8_e8m0fnu).float()
-        sf_d_ref = torch.repeat_interleave(scale_inv_d_f32.reshape(l, s_padded, d_scale_padded), repeats=32, dim=2)[:, :s, :d].contiguous()
-
-    # --- Columnwise results (quantized along S dimension) ---
-    fp8_data_s_flat = mxfp8_result._columnwise_data
-    fp8_data_s = fp8_data_s_flat.reshape(l, s_padded, d_padded)[:, :s, :d].contiguous()
-    fp8_data_s = fp8_data_s.view(fp8_dtype).reshape(b, h, s, d)
-
-    sf_s_ref = None
-    if with_ref:
-        scale_inv_s = mxfp8_result._columnwise_scale_inv
-        scale_inv_s_f32 = scale_inv_s.view(torch.float8_e8m0fnu).float()
-        sf_s_ref = torch.repeat_interleave(scale_inv_s_f32.reshape(l, s_scale_padded, d_padded), repeats=32, dim=1)[:, :s, :d].contiguous()
-
-    # with swizzle
-    tex.swizzle_scales_for_gemm_(mxfp8_result)
-    # --- Rowwise results (quantized along D dimension) ---
-    sf_d_swizzle = mxfp8_result._rowwise_scale_inv
-
-    # --- Columnwise results (quantized along S dimension) ---
-    sf_s_swizzle = mxfp8_result._columnwise_scale_inv
-
-    return fp8_data_d, sf_d_ref, sf_d_swizzle, fp8_data_s, sf_s_ref, sf_s_swizzle
 
 
 def generate_graph_fwd(b, h_q, h_k, h_v,
@@ -540,9 +446,6 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
 
     cudnn_version = LooseVersion(cudnn.backend_version_string())
 
-    if not HAS_TE:
-        pytest.skip("TransformerEngine is not installed; skipping MXFP8 tests.")
-
     # Extract config
     b = cfg.batches
     h_q, h_k, h_v = cfg.h_q, cfg.h_k, cfg.h_v
@@ -589,6 +492,7 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
         graph_fwd.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
         graph_fwd.check_support()
         graph_fwd.build_plans()
+        note_frost_routing(graph_fwd, label="mxfp8-fwd")
     except cudnn.cudnnGraphNotSupportedError as e:
         pytest.skip(f"MXFP8 SDPA not supported: {e}")
     except Exception as e:
@@ -681,6 +585,7 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
             graph_bwd.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
             graph_bwd.check_support()
             graph_bwd.build_plans()
+            note_frost_routing(graph_bwd, label="mxfp8-bwd")
         except cudnn.cudnnGraphNotSupportedError as e:
             pytest.skip(f"MXFP8 SDPA not supported: {e}")
         except Exception as e:

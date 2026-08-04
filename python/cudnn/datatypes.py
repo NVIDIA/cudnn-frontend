@@ -162,7 +162,13 @@ def _library_type(input_type):
         if out is not None:
             return out
 
-    raise Exception(f"No available conversion from type {input_type} to a library type.")
+    # An unmappable dtype is an unsupported GRAPH, not an internal error: say so
+    # with the type callers already catch, so a routing layer can read it as
+    # "the backend cannot represent this" instead of guessing from a bare
+    # Exception.
+    import cudnn
+
+    raise cudnn.cudnnGraphNotSupportedError(f"No available conversion from type {input_type} to a library type.")
 
 
 def _is_torch_tensor(input_tensor) -> bool:

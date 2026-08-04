@@ -523,10 +523,10 @@ class TestReviewSemantics:
         assert d[A] == "x"
 
     def test_identity_mutation_frozen_after_planning(self):
-        from cudnn.engines import BaseEngine, PYTHON_ENGINE_ID_BASE
+        from cudnn.engines import BaseEngine, OUT_OF_TREE_ID_BASE
 
         class Dummy(BaseEngine):
-            engine_id = PYTHON_ENGINE_ID_BASE + 90
+            engine_id = OUT_OF_TREE_ID_BASE + 90
 
             def execute(self, graph, tensor_data, ctx=None):
                 pass
@@ -550,10 +550,10 @@ class TestReviewSemantics:
         assert "dSink_token" in node.outputs and "dSink_token" not in node.inputs
 
     def test_semantic_setters_frozen_after_planning(self):
-        from cudnn.engines import BaseEngine, PYTHON_ENGINE_ID_BASE
+        from cudnn.engines import BaseEngine, OUT_OF_TREE_ID_BASE
 
         class Dummy(BaseEngine):
-            engine_id = PYTHON_ENGINE_ID_BASE + 91
+            engine_id = OUT_OF_TREE_ID_BASE + 91
 
             def execute(self, graph, tensor_data, ctx=None):
                 pass
@@ -570,10 +570,10 @@ class TestReviewSemantics:
         """Review round 5: the freeze must close EVERY public mutation path,
         not only the fluent API — attribute writes, live containers, in-place
         list edits, node params, and graph context."""
-        from cudnn.engines import BaseEngine, PYTHON_ENGINE_ID_BASE
+        from cudnn.engines import BaseEngine, OUT_OF_TREE_ID_BASE
 
         class Dummy(BaseEngine):
-            engine_id = PYTHON_ENGINE_ID_BASE + 92
+            engine_id = OUT_OF_TREE_ID_BASE + 92
 
             def execute(self, graph, tensor_data, ctx=None):
                 pass
@@ -607,10 +607,10 @@ class TestReviewSemantics:
         """Review round 5: python-engine graphs stay mutable until planning —
         but a mutation after validate() must invalidate _is_validated so stale
         inference never reaches planning."""
-        from cudnn.engines import BaseEngine, PYTHON_ENGINE_ID_BASE
+        from cudnn.engines import BaseEngine, OUT_OF_TREE_ID_BASE
 
         class Dummy(BaseEngine):
-            engine_id = PYTHON_ENGINE_ID_BASE + 93
+            engine_id = OUT_OF_TREE_ID_BASE + 93
 
             def execute(self, graph, tensor_data, ctx=None):
                 pass

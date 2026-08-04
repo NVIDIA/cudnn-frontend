@@ -24,6 +24,7 @@ from .helpers import (
     convert_uniform_to_packed,
     time_execution,
     profile_execution,
+    note_frost_routing,
 )
 
 # fmt: off
@@ -384,6 +385,7 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
         graph_fwd.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
         graph_fwd.check_support()
         graph_fwd.build_plans()
+        note_frost_routing(graph_fwd, label="fp8-fwd")
     except cudnn.cudnnGraphNotSupportedError as e:
         pytest.skip(f"unsupported forward graph: {e}")
     except Exception as e:
@@ -582,6 +584,7 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
             graph_bwd.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
             graph_bwd.check_support()
             graph_bwd.build_plans()
+            note_frost_routing(graph_bwd, label="fp8-bwd")
         except cudnn.cudnnGraphNotSupportedError as e:
             pytest.skip(f"unsupported backward graph: {e}")
         except Exception as e:

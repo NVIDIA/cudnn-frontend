@@ -204,6 +204,51 @@ def test_native_sdpa_fwd_lowers_to_backend():
     torch.testing.assert_close(o, ref, atol=5e-2, rtol=5e-2)
 
 
+def test_a_replayed_plan_reports_its_own_notes():
+    """query_properties() re-scanned every engine_config each call, so the one
+    create_execution_plan() appends pushed a SECOND full set of notes and the
+    indices stopped lining up: the replayed config reported config 0's notes,
+    filter_*_notes matched it against them, and indices past the plan count
+    stayed readable."""
+    g = pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    a = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+    b = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+    c = g.matmul(A=a, B=b, name="mm")
+    c.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
+    g.create_execution_plans([cudnn.heur_mode.A])
+
+    src = next((i for i in range(len(g.plans)) if g.get_behavior_notes_for_plan_at_index(i)), None)
+    if src is None:
+        pytest.skip("no backend plan on this machine carries a behaviour note")
+    want = g.get_behavior_notes_for_plan_at_index(src)
+
+    eid, knobs = g.get_engine_and_knobs_at_index(src)
+    g.create_execution_plan(eid, knobs)
+    appended = g.get_execution_plan_count() - 1
+    g.select_plan(appended)
+    g.build_plans()
+
+    assert g.get_behavior_notes_for_plan_at_index(appended) == want
+    with pytest.raises(Exception):  # one past the end is out of range again
+        g._lowered_graph.get_behavior_notes_for_plan_at_index(g._lowered_graph.get_execution_plan_count())
+
+
+def test_key_before_planning_leaves_the_graph_buildable():
+    """key() lowers, and lowering freezes the IR. Called first it froze a graph
+    that had not been validated, so the validate() inside the next
+    create_execution_plans() hit a frozen graph and the graph was permanently
+    unbuildable: "cannot set Tensor.data_type: the owning graph is frozen"."""
+    g = pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    a = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+    b = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+    out = g.relu(g.matmul(A=a, B=b, name="mm"), name="act")  # relu output needs inference
+    out.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
+
+    assert g.key() is not None
+    g.create_execution_plans([cudnn.heur_mode.A])
+    assert len(g.plans) > 0
+
+
 def test_native_conv_fprop_lowers_to_backend():
     """conv_fprop (structured-table op) -> cuDNN parity vs torch conv2d (NHWC)."""
     h = _handle()
@@ -381,26 +426,33 @@ def test_mixed_router_backend_slot_executes():
     actually executes through the backend (lowering triggered), with routed
     indices stable across that lowering; the pinned python plan still runs
     afterwards with its own knobs."""
-    from cudnn.engines import BaseEngine, PlanConfig, Router
-    from cudnn.engines.engine_ids import BACKEND_HEURISTIC_ENGINE_ID, PYTHON_ENGINE_ID_BASE
+    from cudnn.engines import BaseEngine, PlanConfig, Router, is_backend_engine
+    from cudnn.engines.engine_ids import OUT_OF_TREE_ID_BASE
 
     ran = []
 
     class PyMatmul(BaseEngine):
         name = "py_matmul"
-        engine_id = PYTHON_ENGINE_ID_BASE + 90
+        engine_id = OUT_OF_TREE_ID_BASE + 90
 
-        def execute(self, graph, tensor_data, ctx=None):
+        def execute(self, graph, uid_to_data, ctx=None):
+            from cudnn.engines.base import resolve_node_buffers
+
             node = graph.nodes[0]
-            a = tensor_data[node.inputs["A"].uid]
-            b = tensor_data[node.inputs["B"].uid]
-            c = tensor_data[node.outputs["C"].uid]
+            nb = resolve_node_buffers(graph, uid_to_data)[node]
+            a = nb.inputs["A"]
+            b = nb.inputs["B"]
+            c = nb.outputs["C"]
             c.copy_((a.float() @ b.float()).to(c.dtype))
             ran.append("python")
 
+    py_engine = PyMatmul()
+
     class CudnnFirst(Router):
         def plan(self, graph, backends):
-            return [PlanConfig(BACKEND_HEURISTIC_ENGINE_ID), PlanConfig(backends[0].engine_id)]
+            # ``backends`` also carries the in-tree manifest candidates, so name
+            # the engine this test means instead of taking the first one.
+            return graph.backend_plan_entries() + [PlanConfig(py_engine.engine_id)]
 
     h = _handle()
     a = torch.randn(1, M, K, device="cuda", dtype=torch.float16)
@@ -411,14 +463,20 @@ def test_mixed_router_backend_slot_executes():
     g = pygraph(
         handle=h, io_data_type=cudnn.data_type.HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT, router=CudnnFirst()
     )
-    g.register_backend(PyMatmul())
+    g.register_backend(py_engine)
     A = g.tensor(dim=[1, M, K], stride=[M * K, K, 1])
     B = g.tensor(dim=[1, K, N], stride=[K * N, N, 1])
     C = g.matmul(A, B)
     C.set_output(True).set_data_type(cudnn.data_type.HALF)
 
     g.create_execution_plans()
-    assert [p.engine_id for p in g.plans] == [BACKEND_HEURISTIC_ENGINE_ID, PYTHON_ENGINE_ID_BASE + 90]
+    # the router's backend MARKER is expanded in place into the backend's own
+    # ranked entries before the list is observable, so the python plan sits
+    # after them — never at the marker's index.
+    routed = [p.engine_id for p in g.plans]
+    python_slot = len(routed) - 1
+    assert all(is_backend_engine(i) for i in routed[:python_slot])
+    assert routed[python_slot] == OUT_OF_TREE_ID_BASE + 90
 
     # slot 0 = cuDNN: this build/execute lowers and runs the real backend
     assert g.selected_engine is None
@@ -431,13 +489,13 @@ def test_mixed_router_backend_slot_executes():
     torch.testing.assert_close(c.float(), ref.float(), atol=2e-2, rtol=2e-2)
     assert ran == []  # the python engine did NOT run
 
-    # backend count is the classic passthrough space; routed indices unmoved
-    assert g.get_execution_plan_count() >= 1
-    assert [p.engine_id for p in g.plans] == [BACKEND_HEURISTIC_ENGINE_ID, PYTHON_ENGINE_ID_BASE + 90]
+    # ONE list: the count IS the routed list, and lowering moved no index
+    assert g.get_execution_plan_count() == len(routed)
+    assert [p.engine_id for p in g.plans] == routed
 
-    # slot 1 = the python plan, still selectable AFTER backend lowering
+    # the python plan is still selectable AFTER backend lowering
     c.zero_()
-    g.select_plan(1)
+    g.select_plan(python_slot)
     assert g.selected_engine.name == "py_matmul"
     g.execute({A: a, B: b, C: c}, ws, handle=h)
     torch.cuda.synchronize()
@@ -494,7 +552,9 @@ def test_output_layout_contract():
     g.build([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
 
     lowered = json.loads(str(g._lowered_graph))
-    (c_entry,) = [t for t in lowered["tensors"] if t["uid"] == C.uid]
+    tensors = lowered["tensors"]
+    tensors = tensors.values() if isinstance(tensors, dict) else tensors  # dict keyed by uid since cuDNN 9.26
+    (c_entry,) = [t for t in tensors if t["uid"] == C.uid]
     assert c_entry["stride"] == [M * N, 1, M]  # user layout pushed verbatim
 
     a = torch.randn(1, M, K, device="cuda", dtype=torch.float16)
@@ -518,5 +578,7 @@ def test_output_layout_contract():
     g2.build([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
 
     lowered2 = json.loads(str(g2._lowered_graph))
-    (y_entry,) = [t for t in lowered2["tensors"] if t["uid"] == Y.uid]
+    tensors2 = lowered2["tensors"]
+    tensors2 = tensors2.values() if isinstance(tensors2, dict) else tensors2
+    (y_entry,) = [t for t in tensors2 if t["uid"] == Y.uid]
     assert y_entry["stride"][1] == 1, y_entry["stride"]  # channels-last kept, not row-major

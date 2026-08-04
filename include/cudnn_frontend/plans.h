@@ -350,8 +350,14 @@ class Execution_plan_list {
         barred_indices.resize(engine_configs.size(), 0);
         execution_plans.resize(engine_configs.size());
 
-        for (auto& engine_config : engine_configs) {
-            int64_t elem_count = 0;
+        // Only the configs whose notes are not computed yet. create_execution_plan()
+        // appends one config and calls this again, so re-scanning from the start
+        // appended a second full set of notes and the indices stopped lining up
+        // with engine_configs: the replayed config reported config 0's notes, and
+        // filter_*_notes matched it against them.
+        for (auto config_index = numeric_notes.size(); config_index < engine_configs.size(); config_index++) {
+            auto& engine_config = engine_configs[config_index];
+            int64_t elem_count  = 0;
             std::vector<cudnnBackendNumericalNote_t> numeric;
             std::vector<cudnnBackendBehaviorNote_t> behavior;
 

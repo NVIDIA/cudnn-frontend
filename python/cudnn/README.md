@@ -18,7 +18,15 @@ python/cudnn/
 ├── wrapper.py                      # High-level Graph wrapper class
 ├── datatypes.py                    # Data type conversions and helpers
 ├── api_base.py                     # Abstract API base class for frontend-only APIs
-├── {frontend-only-api-name}/
+├── gemm/                           # GEMM operation family (operation-first layout)
+│   ├── ops/                        # Backend-independent contracts (torch custom ops)
+│   ├── frost/                      # FROST GEMM engine (graph analysis, codegen, JIT)
+│   ├── reference/                  # Pure-PyTorch correctness engine
+│   └── cutedsl/                    # Direct CuTe DSL kernels
+│       ├── dense/{operation}/      # __init__.py + api.py + {kernel_name}.py
+│       ├── grouped/{operation}/
+│       └── discrete_grouped/{operation}/
+├── {frontend-only-api-name}/       # Families not yet migrated (attention etc.)
 │   ├── __init__.py                 # Frontend-only API class
 │   └── api.py                      # High-level API implementation
 │   └── {kernel_name}.py            # Kernel implementation, i.e CuteDSL
@@ -47,7 +55,7 @@ is the supported entry point — the directory layout is an implementation detai
 ## Adding new frontend-only APIs
 
 To add a new frontend-only API, follow these steps:
-1. Create a new directory in the `python/cudnn` directory with the name of the API.
+1. Choose the operation family first. GEMM-family kernels go under `python/cudnn/gemm/cutedsl/{dense,grouped,discrete_grouped}/{api-name}/`; only non-GEMM families still use a top-level directory.
 2. Add your kernel implementation and implement the high level API implementation in `api.py`, extending the `APIBase` class in `api_base.py`.
 3. Expose the API import in `python/cudnn/__init__.py` and register the folder in `pyproject.toml`. Register any optional dependences if required.
 4. Add a sample usage/test file in `test/python/fe_api/`.

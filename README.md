@@ -19,6 +19,7 @@ We will begin open-sourcing kernels based on customer needs, with the goal to ed
 
 We are now shipping **OSS kernels**, allowing you to inspect, modify, and contribute to the core logic. Check out our latest implementations:
 
+*   **[FROST GEMM engine](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/gemm/frost):** JIT-compiled Blackwell GEMM engine reachable through the ordinary `cudnn.pygraph` API — matmul, grouped (MoE) matmul, block-scaled FP4/FP8, and chained pointwise epilogues are fused into one kernel from the graph you already built. Opt in with `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1`; it is then a candidate for every matmul graph it can serve, ranked against the backend's own plans.
 *   **[GEMM + Amax](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/gemm/cutedsl/dense/amax):** Optimized FP8 matrix multiplication with absolute maximum calculation.
 *   **[GEMM + SwiGLU](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/gemm/cutedsl/dense/swiglu):** High-performance implementation of the SwiGLU activation fused with GEMM.
 *   **[GEMM + sReLU](https://github.com/NVIDIA/cudnn-frontend/tree/main/python/cudnn/gemm/cutedsl/dense/srelu):** High-performance implementation of squared-ReLU fused with GEMM.
@@ -155,6 +156,26 @@ export CUDNN_FRONTEND_LOG_FILE=execution_log.txt
 - `CUDNN_FRONTEND_LOG_INFO=10`: Basic logging (safe for CUDA graph capture)
 
 Alternatively, you can control logging programmatically via `cudnn_frontend::isLoggingEnabled()`.
+
+**OSS engine selection:**
+
+The open-source engines are opt-in while they mature: set the flag below and they become candidates
+for every graph they can serve, ranked against the cuDNN backend's own engines in one list. Engines
+that are the only implementation of their operation (GDN/KDA) need no flag.
+
+```bash
+# Offer the maturing open-source engines (FROST GEMM / SDPA) as plan candidates.
+export CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1
+
+# Where JIT-compiled kernels are cached (default: $XDG_CACHE_HOME/cudnn_gemm/kernel_cache).
+export CUDNN_FRONTEND_GEMM_KERNEL_CACHE=/path/to/cache
+```
+
+`graph.plans` is the ranked list and `graph.get_plan_name_at_index(i)` names each entry — an OSS
+engine reports its engine name, the backend reports the backend plan name. Pin one with
+`graph.select_plan(i)` (strict: that plan runs or the build fails) and exclude by name with the
+classic `graph.deselect_engines([...])`. `graph.selected_engine` is the engine that ran, or None
+when the backend served the graph.
 
 ### Environment report
 
