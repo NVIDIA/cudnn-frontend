@@ -221,6 +221,7 @@ class SdpaFwdDsl(APIBase):
         is_causal: bool = False,
         causal_bottom_right: bool = False,
         window_size_left: Optional[int] = None,
+        window_size_right: Optional[int] = None,
         scale_softmax: Optional[float] = None,
         seq_kv_lens_present: bool = False,
         seq_q_lens_present: bool = False,
@@ -254,6 +255,11 @@ class SdpaFwdDsl(APIBase):
         self.causal_bottom_right = bool(causal_bottom_right)
         # window_size_left is an offset W ("keep k in [q-W, q]"); callers pass W = L - 1 for a cuDNN window length L.
         self.window_size_left = window_size_left
+        # window_size_right is the diagonal-band right bound R ("keep k in
+        # [.., q+R]", cuDNN diagonal_band_right_bound): the causal upper limit
+        # widened by R columns. None = no right band; requires is_causal (the
+        # band is the causal diagonal, possibly widened).
+        self.window_size_right = window_size_right
         self.scale_softmax = scale_softmax
         self.seq_kv_lens_present = bool(seq_kv_lens_present)
         # Dense padded-Q trim (cuDNN >= 9.14): q rows >= seq_len_q[b] write
@@ -611,6 +617,15 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             swa_left is not None and swa_left < 0,
             f"window_size_left must be >= 0; got {swa_left}",
         )
+        band_right = self.window_size_right
+        self._value_error_if(
+            band_right is not None and band_right < 0,
+            f"window_size_right must be >= 0; got {band_right}",
+        )
+        self._value_error_if(
+            band_right is not None and not self.is_causal,
+            "SM100 DSL SDPA: window_size_right widens the causal diagonal and requires is_causal=True",
+        )
         # The kernels' bottom-right diagonal path supports plain causal only:
         # CAUSAL_BOTTOM_RIGHT requires MASK_CAUSAL and excludes MASK_SWA
         # (see config._validate_knobs).
@@ -677,7 +692,11 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # kv > q for every query row). Otherwise the tail columns leak into
         # the softmax and the output is silently wrong.
         if int(s_kv) % _SM100_TILE_N != 0:
-            causal_covers_tail = self.is_causal and (self.causal_bottom_right or int(s_qo) <= int(s_kv))
+            # A right-widened band pushes the last unmasked column to
+            # (S_q - 1) + R (top-left) or (S_kv - 1) + R (bottom-right), so the
+            # KV tail is only provably masked when it stays below S_kv.
+            _br = int(self.window_size_right or 0)
+            causal_covers_tail = self.is_causal and ((self.causal_bottom_right and _br == 0) or (not self.causal_bottom_right and int(s_qo) + _br <= int(s_kv)))
             self._value_error_if(
                 not (self.seq_kv_lens_present or causal_covers_tail),
                 f"S_kv ({s_kv}) must be a multiple of {_SM100_TILE_N} unless a "
@@ -717,6 +736,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             dtype_o=_SM100_DTYPE_QKV_CODE[self.dtype_o],
             mask_flags=self.mask_flags,
             swa_window=int(self.swa_window_runtime),
+            band_right=int(self.window_size_right or 0),
             causal_bottom_right=self.causal_bottom_right,
             has_sink=self.has_sink,
             seq_kv_lens_present=self.seq_kv_lens_present,
@@ -1331,6 +1351,7 @@ class _SdpaFwdCacheKey:
     is_causal: bool
     causal_bottom_right: bool
     window_size_left: Optional[int]
+    window_size_right: Optional[int]
     scale_softmax: Optional[float]
     seq_q_lens_present: bool
     seq_kv_lens_present: bool
@@ -1366,6 +1387,7 @@ def _make_cache_key(
     is_causal: bool = False,
     causal_bottom_right: bool = False,
     window_size_left: Optional[int] = None,
+    window_size_right: Optional[int] = None,
     scale_softmax: Optional[float] = None,
     seq_q_lens_present: bool = False,
     seq_kv_lens_present: bool = False,
@@ -1386,6 +1408,7 @@ def _make_cache_key(
         is_causal=is_causal,
         causal_bottom_right=causal_bottom_right,
         window_size_left=window_size_left,
+        window_size_right=window_size_right,
         scale_softmax=scale_softmax,
         has_sink=has_sink,
         seq_q_lens_present=seq_q_lens_present,
@@ -1537,6 +1560,10 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         if self.thd:
             self._value_error_if(self.seq_q_lens_present, "seq_q_lens_present is dense-only (THD carries per-sequence Q lengths via cu_seqlens)")
             self.seq_kv_lens_present = True
+        self._value_error_if(
+            self.window_size_right is not None,
+            "SM120 DSL SDPA: window_size_right (causal right-band widening) is not plumbed for this kernel",
+        )
         self._value_error_if(
             self.sched_policy is not None and self.sched_policy != SCHED_NATURAL,
             f"SM120 DSL SDPA only supports sched_policy={SCHED_NATURAL}",

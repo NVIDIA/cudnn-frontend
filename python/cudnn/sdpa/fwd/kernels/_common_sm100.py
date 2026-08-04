@@ -208,7 +208,11 @@ def compute_kv_loop_bounds(
     tile_n: int,
     cga_tile_m: int,
     causal_bottom_right: bool = False,
+    band_right: int = 0,
 ) -> KvLoopBounds:
+    # band_right: compile-time diagonal-band right bound (cuDNN
+    # diagonal_band_right_bound) — the causal upper limit is widened by
+    # band_right columns. 0 = plain causal; folds out entirely.
     left = cutlass.Int32(0)
     right = _div_up(seq_kv_len, tile_n)
 
@@ -218,7 +222,7 @@ def compute_kv_loop_bounds(
         causal_diag = cutlass.Int32(0)
 
     if cutlass.const_expr(mask_flags & MASK_CAUSAL):
-        kv_hi_caus = _div_up(q_row_coord + cutlass.Int32(cga_tile_m) + causal_diag, tile_n)
+        kv_hi_caus = _div_up(q_row_coord + cutlass.Int32(cga_tile_m + band_right) + causal_diag, tile_n)
         right = cute.math.min(right, kv_hi_caus)
 
     if cutlass.const_expr(mask_flags & MASK_SWA):
@@ -245,7 +249,7 @@ def compute_kv_loop_bounds(
         )
         unmasked_hi = cute.math.min(unmasked_hi, lo_pad)
     if cutlass.const_expr(mask_flags & MASK_CAUSAL):
-        lo_caus = (q_row_coord + causal_diag) // cutlass.Int32(tile_n)
+        lo_caus = (q_row_coord + cutlass.Int32(band_right) + causal_diag) // cutlass.Int32(tile_n)
         unmasked_hi = cute.math.min(unmasked_hi, lo_caus)
     unmasked_hi = cute.math.max(unmasked_hi, left)
 
@@ -290,6 +294,7 @@ class SdpaHelpers(NamedTuple):
     bounds_for_tile: object
     bounds_for_tile_qtrim: object
     resolve_seqlen_kv: object
+    resolve_seqlen_q: object
     thd_decode: object
     dispatch_decode_initial: object
     dispatch_decode_payload: object
@@ -356,6 +361,7 @@ def make_sdpa_helpers(CFG, lpt_q_tiles_in_cga_units: bool = False) -> SdpaHelper
             CFG.TILE_N,
             cga_tile_m,
             causal_bottom_right=bool(CFG.CAUSAL_BOTTOM_RIGHT),
+            band_right=int(getattr(CFG, "BAND_RIGHT", 0)),
         )
 
     @cute.jit
@@ -397,6 +403,23 @@ def make_sdpa_helpers(CFG, lpt_q_tiles_in_cga_units: bool = False) -> SdpaHelper
             arr = cutlass.make_array_view(seq_kv_lens_tensor)
             return cutlass.Int32(arr[batch_idx])
         return scalar_seqlen_kv
+
+    @cute.jit
+    def _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, scalar_seqlen_q, n_batch):
+        """Per-sequence Q length for the bottom-right causal diagonal.
+
+        THD anchors the BR diagonal at the per-sequence corner
+        (seq_len_q[b], seq_len_kv[b]): the actual Q length is the cu_seqlen_q
+        difference from the packed [kv_lens | cu_q | cu_kv] metadata buffer
+        (same layout _thd_decode / _thd_tma_offsets read). Dense graphs (and
+        every non-BR mask, where seqlen_q only feeds the unused diagonal)
+        keep the scalar S_q, so this folds out unless THD_VARLEN and
+        CAUSAL_BOTTOM_RIGHT are both set."""
+        if cutlass.const_expr(int(getattr(CFG, "THD_VARLEN", 0)) == 1 and int(CFG.CAUSAL_BOTTOM_RIGHT) == 1):
+            cu = cutlass.make_array_view(seq_kv_lens_tensor)
+            q0 = n_batch
+            return cutlass.Int32(cu[q0 + batch_idx + cutlass.Int32(1)]) - cutlass.Int32(cu[q0 + batch_idx])
+        return scalar_seqlen_q
 
     _thd_on = int(getattr(CFG, "THD_VARLEN", 0))
 
@@ -467,6 +490,7 @@ def make_sdpa_helpers(CFG, lpt_q_tiles_in_cga_units: bool = False) -> SdpaHelper
         bounds_for_tile=_bounds_for_tile,
         bounds_for_tile_qtrim=_bounds_for_tile_qtrim,
         resolve_seqlen_kv=_resolve_seqlen_kv,
+        resolve_seqlen_q=_resolve_seqlen_q,
         thd_decode=_thd_decode,
         dispatch_decode_initial=_dispatch_decode_initial,
         dispatch_decode_payload=_dispatch_decode_payload,

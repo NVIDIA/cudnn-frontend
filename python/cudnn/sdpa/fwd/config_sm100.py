@@ -65,6 +65,7 @@ class TemplateParams:
     dtype_o: int = -1  # output dtype (0..3); -1 = inherit dtype_qkv. MXFP8 writes BF16/FP16.
     mask_flags: int = MASK_NONE
     swa_window: int = 0  # runtime left-window offset W (keep kv in [q-W, q])
+    band_right: int = 0  # diagonal-band right bound R (keep kv in [.., q+R]); 0 = plain causal
     causal_bottom_right: bool = False
     has_sink: bool = False
     seq_kv_lens_present: bool = False
@@ -99,6 +100,10 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
             raise ValueError(f"{flavor}: CAUSAL_BOTTOM_RIGHT requires MASK_CAUSAL (bit 1)")
         if k.mask_flags & MASK_SWA:
             raise ValueError(f"{flavor}: CAUSAL_BOTTOM_RIGHT + SWA is not supported")
+    if k.band_right < 0:
+        raise ValueError(f"{flavor}: BAND_RIGHT must be >= 0; got {k.band_right}")
+    if k.band_right > 0 and not (k.mask_flags & MASK_CAUSAL):
+        raise ValueError(f"{flavor}: BAND_RIGHT > 0 requires MASK_CAUSAL (the band's upper bound)")
     if k.thd_varlen:
         if not (k.mask_flags & MASK_PADDED):
             raise ValueError(f"{flavor}: THD/varlen implies per-sequence padded masking (MASK_PADDED)")
@@ -231,6 +236,7 @@ class CfgD256:
 
     MASK_FLAGS: int = MASK_NONE
     SWA_WINDOW: int = 0
+    BAND_RIGHT: int = 0
     HAS_SINK: int = 0
     CAUSAL_BOTTOM_RIGHT: int = 0
 
@@ -303,6 +309,7 @@ def make_cfg_d256(params: TemplateParams) -> Tuple[CfgD256, TmaIters]:
         TILE_K_HW_BMM2=tile_k_hw(params.dtype_qkv),
         MASK_FLAGS=params.mask_flags,
         SWA_WINDOW=params.swa_window,
+        BAND_RIGHT=params.band_right,
         HAS_SINK=int(params.has_sink),
         CAUSAL_BOTTOM_RIGHT=int(params.causal_bottom_right),
         SCHEDULER_POLICY=params.sched_policy,
@@ -365,6 +372,7 @@ class CfgD512:
 
     MASK_FLAGS: int = MASK_NONE
     SWA_WINDOW: int = 0
+    BAND_RIGHT: int = 0
     HAS_SINK: int = 0
     CAUSAL_BOTTOM_RIGHT: int = 0
 
@@ -444,6 +452,7 @@ def make_cfg_d512(params: TemplateParams) -> Tuple[CfgD512, TmaIters]:
         TILE_K_HW_BMM2=tile_k_hw(params.dtype_qkv),
         MASK_FLAGS=params.mask_flags,
         SWA_WINDOW=params.swa_window,
+        BAND_RIGHT=params.band_right,
         HAS_SINK=int(params.has_sink),
         CAUSAL_BOTTOM_RIGHT=int(params.causal_bottom_right),
         SCHEDULER_POLICY=params.sched_policy,
@@ -508,6 +517,7 @@ class CfgD128:
 
     MASK_FLAGS: int = MASK_NONE
     SWA_WINDOW: int = 0
+    BAND_RIGHT: int = 0
     HAS_SINK: int = 0
     CAUSAL_BOTTOM_RIGHT: int = 0
 
@@ -602,6 +612,7 @@ def make_cfg_d128(params: TemplateParams) -> Tuple[CfgD128, TmaIters]:
         STAGES_KV=4 if fp8 else 2,
         MASK_FLAGS=params.mask_flags,
         SWA_WINDOW=params.swa_window,
+        BAND_RIGHT=params.band_right,
         HAS_SINK=int(params.has_sink),
         CAUSAL_BOTTOM_RIGHT=int(params.causal_bottom_right),
         SCHEDULER_POLICY=params.sched_policy,
@@ -670,6 +681,7 @@ def make_cfg_d192(params: TemplateParams) -> Tuple[CfgD192, TmaIters]:
         TILE_K_HW_BMM2=tile_k_hw(params.dtype_qkv),
         MASK_FLAGS=params.mask_flags,
         SWA_WINDOW=params.swa_window,
+        BAND_RIGHT=params.band_right,
         HAS_SINK=int(params.has_sink),
         CAUSAL_BOTTOM_RIGHT=int(params.causal_bottom_right),
         SCHEDULER_POLICY=1,

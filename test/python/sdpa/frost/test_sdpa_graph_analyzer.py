@@ -317,11 +317,12 @@ def test_probe_accepts_thd_top_left_causal():
     assert engines.engine_name(512) in _eligible(g)
 
 
-def test_probe_rejects_thd_bottom_right():
-    # THD + bottom-right causal is a kernel gap (BR diagonal needs global, not per-sequence, Q length).
+def test_probe_accepts_thd_bottom_right():
+    # The SM100 kernels anchor the THD bottom-right diagonal at each sequence's
+    # own (seq_len_q[b], seq_len_kv[b]) via the cu_seqlen metadata.
     g = _mk_graph()
     _mk_thd_qkvo(g, mask_kwargs=dict(use_causal_mask_bottom_right=True))
-    assert not _eligible(g)
+    assert engines.engine_name(512) in _eligible(g)
 
 
 def test_probe_accepts_thd_stats():
@@ -361,10 +362,25 @@ def test_probe_accepts_thd_stats():
     assert engines.engine_name(512) in _eligible(g)
 
 
-def test_probe_rejects_right_band_widening():
+def test_probe_accepts_right_band_widening():
+    # diagonal_band_right_bound > 0 lowers as MASK_CAUSAL with a compile-time
+    # BAND_RIGHT diagonal offset.
     g = _mk_graph()
     q, k, v, dims, strides = _mk_qkv(g)
     o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True, diagonal_band_right_bound=16)
+    _finish_output(o, dims, strides)
+    assert engines.engine_name(512) in _eligible(g)
+    facts = ga.analyze(g)
+    assert facts.right_band_widening and facts.right_bound == 16 and not facts.causal
+
+
+def test_probe_rejects_negative_right_band():
+    g = _mk_graph()
+    q, k, v, dims, strides = _mk_qkv(g)
+    try:
+        o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True, diagonal_band_right_bound=-4)
+    except (RuntimeError, ValueError):
+        return  # the pygraph binding may reject it before the probe ever runs
     _finish_output(o, dims, strides)
     assert not _eligible(g)
 

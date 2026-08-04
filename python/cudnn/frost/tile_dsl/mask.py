@@ -21,6 +21,7 @@ def apply_mask_chunk(
     causal_bottom_right: int = 0,
     causal_diag=None,
     mask_value: float = _NEG_INF_BITS,
+    band_right: int = 0,
 ):
     # mask_value: what a masked score becomes.  Default is the legacy finite
     # sentinel; the f16 prefill kernels pass float("-inf") so a fully-masked
@@ -31,10 +32,15 @@ def apply_mask_chunk(
 
     neg_inf = cutlass.Float32(mask_value)
     q_minus_w = q_abs - cutlass.Int32(swa_window) if (mask_flags & MASK_SWA) else None
+    # band_right is the compile-time diagonal-band right bound (cuDNN
+    # diagonal_band_right_bound): kv columns up to q + band_right (plus the
+    # bottom-right diagonal offset) stay unmasked. 0 = plain causal.
     if cutlass.const_expr((mask_flags & MASK_CAUSAL) and causal_bottom_right):
         q_caus_lim = q_abs + causal_diag
     else:
         q_caus_lim = q_abs
+    if cutlass.const_expr((mask_flags & MASK_CAUSAL) and band_right != 0):
+        q_caus_lim = q_caus_lim + cutlass.Int32(band_right)
 
     elems = []
     for i in range(N):
