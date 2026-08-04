@@ -10,7 +10,7 @@ be its query-block index and let `K_m` be the union of the key/value blocks
 listed for that query block. The operation is
 
 $$
-O_i = \operatorname{softmax}_{j \in K_m}
+O_i = \text{softmax}_{j \in K_m}
 \left(\frac{Q_i K_j^T}{\sqrt{D}}\right)V_j.
 $$
 
@@ -270,5 +270,7 @@ Correctness tests and FP32 references are under
 
 ## Acknowledgements
 
-We thank <huangyitong.hyt@alibaba-inc.com> and
-<wenting.swt@alibaba-inc.com> for testing the BSA kernels and reporting issues.
+We would like to express our gratitude to <huangyitong.hyt@alibaba-inc.com> and
+<wenting.swt@alibaba-inc.com> for providing testing and optimization feedback
+throughout the deployment process, which has continuously advanced the BSA kernel
+toward Speed of Light.
