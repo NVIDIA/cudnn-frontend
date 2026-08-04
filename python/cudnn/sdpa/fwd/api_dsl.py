@@ -9,8 +9,9 @@ import logging
 import math
 import os
 from abc import abstractmethod
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Callable, Hashable, Optional
+from typing import Callable, Hashable, Iterator, Optional
 
 import torch
 from cuda.bindings import driver as cuda
@@ -72,6 +73,25 @@ _SM120_DTYPE_QKV_CODE = {
 # the cuTensorMap GMEM alignment (64 B) with margin. torch storage bases are
 # 512 B aligned, so 128 B-multiple offsets stay 128 B aligned absolutely.
 _WS_ALIGN = 128
+
+
+@contextmanager
+def _torch_stream_context(current_stream: Optional[cuda.CUstream], device: torch.device) -> Iterator[None]:
+    """Run PyTorch work on the CUDA stream used for the kernel launch."""
+    if current_stream is None:
+        yield
+        return
+    handle = int(current_stream)
+    torch_current = torch.cuda.current_stream(device)
+    torch_default = torch.cuda.default_stream(device)
+    if handle == torch_current.cuda_stream:
+        launch_stream = torch_current
+    elif handle == torch_default.cuda_stream:
+        launch_stream = torch_default
+    else:
+        launch_stream = torch.cuda.ExternalStream(handle, device=device)
+    with torch.cuda.stream(launch_stream):
+        yield
 
 
 def ws_align(nbytes: int) -> int:
@@ -980,7 +1000,11 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             if amax_o is not None
             else self._dummy("amax_o", device, lambda: torch.zeros(1, dtype=torch.float32, device=device))
         )
-        amax_o_buf.zero_()
+        # Must be enqueued on the SAME stream as the kernel launch below, else the
+        # reset and the kernel's atomicMax are unordered (and the reset is missing
+        # from a CUDA-graph capture taken on the handle's stream).
+        with _torch_stream_context(current_stream, device):
+            amax_o_buf.zero_()
 
         self._compiled_kernel(
             Q,
@@ -1072,8 +1096,11 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # dividing by scale_o below yields the pre-quant output amax.
         amax_s_buf = amax_s.reshape(-1)[:1] if amax_s is not None else self._dummy("amax_s", device, lambda: torch.zeros(1, dtype=torch.float32, device=device))
         amax_o_buf = amax_o.reshape(-1)[:1] if amax_o is not None else self._dummy("amax_o", device, lambda: torch.zeros(1, dtype=torch.float32, device=device))
-        amax_s_buf.zero_()
-        amax_o_buf.zero_()
+        # Same-stream ordering as MXFP8: the resets must precede the kernel's
+        # atomicMax on the launch stream, not on torch's current stream.
+        with _torch_stream_context(current_stream, device):
+            amax_s_buf.zero_()
+            amax_o_buf.zero_()
 
         self._compiled_kernel(
             Q,
