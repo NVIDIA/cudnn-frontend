@@ -289,6 +289,36 @@ class SdpaFwdDsl(APIBase):
             self._dummy_cache[cache_key] = tensor
         return tensor
 
+    def _checked_lse_view(self, lse_tensor: torch.Tensor) -> torch.Tensor:
+        """Validate a caller-provided LSE buffer and return the kernel's (B, H_q, S_q) view.
+
+        The kernel WRITES through the returned view, so this must be a true
+        view: a silent ``reshape`` copy of a non-contiguous buffer would
+        receive the output and be dropped, leaving the caller's LSE unwritten.
+        """
+        self._value_error_if(
+            lse_tensor.dtype != torch.float32,
+            f"lse_tensor must be float32; got {lse_tensor.dtype}",
+        )
+        expected = self.batch_size * self.h_q * self.s_q_max
+        self._value_error_if(
+            lse_tensor.numel() != expected,
+            f"lse_tensor must have B*H_q*S_q = {expected} elements; got {lse_tensor.numel()}",
+        )
+        self._value_error_if(
+            not lse_tensor.is_contiguous(),
+            "lse_tensor must be contiguous (the kernel writes through this buffer)",
+        )
+        return lse_tensor.view(self.batch_size, self.h_q, self.s_q_max)
+
+    def _checked_sinks_1d(self, sinks: torch.Tensor) -> torch.Tensor:
+        """Validate caller-provided sink logits and return the kernel's (H_q,) fp32 view."""
+        self._value_error_if(
+            sinks.numel() != self.h_q,
+            f"sinks must have H_q = {self.h_q} elements; got {sinks.numel()}",
+        )
+        return sinks.reshape(-1).to(torch.float32)
+
     @abstractmethod
     def scratch_workspace_bytes(self) -> int:
         """Return the per-execution scratch requirement for this implementation."""
@@ -685,11 +715,34 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         scale_softmax_log2 = scale_val * math.log2(math.e)
 
         self._value_error_if(
+            self.has_sink and sinks is None,
+            "sinks is required by this compiled specialization",
+        )
+        self._value_error_if(
+            not self.has_sink and sinks is not None,
+            "this specialization was compiled without sink support; construct the API with has_sink=True",
+        )
+        self._value_error_if(
             self.lse_desc is not None and lse_tensor is None,
             "lse_tensor is required by this compiled specialization",
         )
-        if lse_tensor is None:
-            lse_tensor = torch.empty((self.batch_size, self.h_q, self.s_q_max), dtype=torch.float32, device=q_tensor.device)
+        if self.thd:
+            # THD ignores lse_tensor: the packed LSE is api-level workspace scratch.
+            pass
+        elif lse_tensor is not None:
+            lse_tensor = self._checked_lse_view(lse_tensor)
+        else:
+            # The SM100 kernels always write an LSE (no has_lse specialization
+            # yet — follow-up): with no Stats output requested the write lands
+            # in a cached write-only dummy, allocated once per device rather
+            # than per execute. The FROST dispatch path never reaches this:
+            # engines.lower_dsl_prefill carves the dummy from the caller's
+            # workspace instead.
+            lse_tensor = self._dummy(
+                "lse",
+                q_tensor.device,
+                lambda: torch.empty((self.batch_size, self.h_q, self.s_q_max), dtype=torch.float32, device=q_tensor.device),
+            )
 
         if self._fp8 and self._pertensor:
             # Per-tensor FP8 (sdpa_fp8): scalar descales fold into the softmax scale
@@ -748,7 +801,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
 
         device = q_tensor.device
         sinks_t = (
-            sinks.reshape(-1).to(torch.float32)
+            self._checked_sinks_1d(sinks)
             if sinks is not None
             else self._dummy("sinks", device, lambda: torch.zeros(self.h_q, dtype=torch.float32, device=device))
         )
@@ -1504,6 +1557,9 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             sq=self.s_q_max,
             skv=self.s_k_max,
             d=self.head_dim,
+            # No sample_lse -> the LSE store is compiled out; execute() then
+            # binds no LSE buffer at all (no dummy, no allocation).
+            has_lse=self.lse_desc is not None,
         )
         self._logger.debug("compile completed")
 
@@ -1554,18 +1610,12 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             self.lse_desc is not None and lse_tensor is None,
             "lse_tensor is required by this compiled specialization",
         )
-        if lse_tensor is None:
-            lse_tensor = torch.empty((self.batch_size, self.h_q, self.s_q_max), dtype=torch.float32, device=q_tensor.device)
-        lse = lse_tensor.reshape(self.batch_size, self.h_q, self.s_q_max)
-        sinks_t = (
-            sinks.reshape(-1).to(torch.float32)
-            if sinks is not None
-            else self._dummy(
-                "sinks",
-                q_tensor.device,
-                lambda: torch.zeros(self.h_q, dtype=torch.float32, device=q_tensor.device),
-            )
+        self._value_error_if(
+            self.lse_desc is None and lse_tensor is not None,
+            "this specialization was compiled without an LSE output; construct the API with sample_lse",
         )
+        lse = self._checked_lse_view(lse_tensor) if lse_tensor is not None else None
+        sinks_t = self._checked_sinks_1d(sinks) if sinks is not None else None
         seq_q_lens = (
             seq_q_lens.reshape(-1).to(torch.int32)
             if seq_q_lens is not None
@@ -1660,15 +1710,10 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             o_buf.as_strided((t_q * qh * d,), (1,), o_buf.storage_offset()).zero_()
             return
 
-        # Packed dummy LSE (THD stats are not plumbed): carved at the runtime
-        # t_q, always within the compile-time bound qh * B * S_q_max.
-        lse = carver.take(qh * t_q, torch.float32) if carver is not None else torch.empty(qh * t_q, dtype=torch.float32, device=dev)
-        lse = lse.reshape(1, qh, t_q)
-        if sinks is not None:
-            sinks_t = sinks.reshape(-1).to(torch.float32)
-        else:
-            sinks_t = carver.take(qh, torch.float32) if carver is not None else torch.empty(qh, dtype=torch.float32, device=dev)
-            sinks_t.zero_()
+        # THD stats are not plumbed: the kernel compiles with has_lse=False, so
+        # there is no packed-LSE buffer (dummy or otherwise) to bind. Sinks are
+        # None-specialized the same way when the graph has no sink token.
+        sinks_t = self._checked_sinks_1d(sinks) if sinks is not None else None
         seq_q_dummy = self._dummy(
             "seq_q_lens",
             dev,
@@ -1693,13 +1738,14 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             skv=t_kv,
             d=d,
             max_sq=max_sq,
+            has_lse=False,
         )
         fn(
             _packed(q_buf, t_q),
             _packed(k_buf, t_kv),
             _packed(v_buf, t_kv),
             _packed(o_buf, t_q),
-            lse,
+            None,
             sinks_t,
             seq_q_dummy,
             meta,
@@ -1709,13 +1755,14 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
 
     def scratch_workspace_bytes(self) -> int:
         if self.thd:
-            # [slq32 | slk32 | meta(seq_kv, cu_q, cu_k) | packed LSE | sinks dummy].
-            # The packed LSE is sized for the worst case t_q = B * S_q_max; every
-            # per-execute carve stays within this bound.
-            # No O-descriptor chunk: SM120 stores O with plain guarded GMEM stores,
-            # so THD needs no per-sequence tensor maps.
-            b, qh = self.batch_size, self.h_q
-            return 2 * ws_align(b * 4) + ws_align((3 * b + 2) * 4) + ws_align(qh * b * self.s_q_max * 4) + (0 if self.has_sink else ws_align(qh * 4))
+            # [slq32 | slk32 | meta(seq_kv, cu_q, cu_k)].
+            # No packed-LSE chunk: THD stats are not plumbed and the kernel is
+            # compiled with has_lse=False, so no LSE buffer exists at all. No
+            # sinks-dummy chunk either: the kernel None-specializes on sinks.
+            # No O-descriptor chunk: SM120 stores O with plain guarded GMEM
+            # stores, so THD needs no per-sequence tensor maps.
+            b = self.batch_size
+            return 2 * ws_align(b * 4) + ws_align((3 * b + 2) * 4)
         return 0
 
 
