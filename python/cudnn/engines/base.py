@@ -14,10 +14,13 @@ lifecycle mirrors a real JIT/DSL engine:
      run ONCE per (graph, selected plan) at ``graph.build_plans()`` time; the
      compiled artifact lives on the graph, so one engine instance is safely
      reusable across graphs.
-  3. ``CompiledPlan.execute(graph, tensor_data, ctx)`` — hot path. The
+  3. ``CompiledPlan.execute(graph, uid_to_data, ctx)`` — hot path.
+     ``uid_to_data`` is the caller's variant pack (tensor uid -> device
+     buffer, exactly as the classic backend receives it); the
      ``ExecutionContext`` carries the caller's handle / stream / workspace /
-     dynamic-shape overrides explicitly; engines must not hard-code a stream or
-     silently allocate hidden workspace.
+     dynamic-shape overrides explicitly; engines must not hard-code a stream
+     or silently allocate hidden workspace. Engines that address buffers by
+     port name call ``resolve_node_buffers(graph, uid_to_data)`` (see below).
 
 Simple eager engines only implement ``execute()`` — the default ``build_plan``
 wraps it in a trivial ``CompiledPlan``.
@@ -32,7 +35,8 @@ Example:
                 if node.node_type != NodeType.MATMUL:
                     raise NotImplementedError(...)
 
-        def execute(self, graph, tensor_data, ctx):
+        def execute(self, graph, uid_to_data, ctx):
+            node_buffers = resolve_node_buffers(graph, uid_to_data)
             ...  # write results into caller-provided output buffers
 """
 
@@ -55,10 +59,15 @@ class PlanConfig:
     plan's source is derived from the id via ``is_python_engine`` — no separate
     field, so cuDNN and python plans are interchangeable in the ranked list.
     One engine may propose several plans differing only in knobs.
+
+    ``cpp_index`` is set only on backend entries: the position this plan holds
+    in the lowered graph's own plan list, so building it is one
+    ``build_plan_at_index`` instead of a rebuild from (engine_id, knobs).
     """
 
     engine_id: int
     knobs: Any = None
+    cpp_index: Any = None
 
 
 @dataclass(frozen=True)
@@ -79,6 +88,46 @@ class ExecutionContext:
     override_strides: Any = None
 
 
+@dataclass(frozen=True)
+class NodeBuffers:
+    """Per-node ``{port_name: caller buffer}`` maps, the result of
+    ``resolve_node_buffers``. Only WIRED, NON-VIRTUAL ports
+    appear, and every one is guaranteed a buffer (a missing buffer raises at
+    resolution). Torch tensors arrive detached — both DLPack and
+    ``__cuda_array_interface__`` refuse to export ``requires_grad`` tensors,
+    and graph-level gradients are the backward nodes' contract, never
+    autograd tracing through an engine. Virtual intermediates carry no
+    caller buffers; engines that chain them across nodes key their own
+    scratch by ``node.inputs[port].uid``."""
+
+    inputs: Dict[str, Any]
+    outputs: Dict[str, Any]
+
+
+def resolve_node_buffers(graph: "pygraph", uid_to_data: Dict[int, Any]) -> Dict[Any, NodeBuffers]:
+    """Join each node's wired ports with the caller's variant pack into
+    per-node ``NodeBuffers``. Strict: every non-virtual port must have a
+    buffer. Torch tensors are detached here (DLPack and
+    ``__cuda_array_interface__`` refuse ``requires_grad`` export; graph-level
+    gradients belong to the backward nodes, not to autograd tracing through
+    engines)."""
+
+    def resolve(node, ports, direction):
+        bufs = {}
+        for port, t in ports.items():
+            if t is None:
+                continue
+            b = uid_to_data.get(t.uid)
+            if b is None:
+                if t.is_virtual:
+                    continue  # engine-internal intermediate
+                raise ValueError(f"node {node.name!r}: no buffer for {direction} port {port!r} (tensor {t.name!r})")
+            bufs[port] = b.detach() if hasattr(b, "detach") else b
+        return bufs
+
+    return {node: NodeBuffers(resolve(node, node.inputs, "input"), resolve(node, node.outputs, "output")) for node in graph.nodes}
+
+
 class CompiledPlan:
     """A compiled (graph, plan) artifact. Subclass for real JIT engines."""
 
@@ -86,7 +135,7 @@ class CompiledPlan:
         """Workspace bytes this plan needs at execute time (default 0)."""
         return 0
 
-    def execute(self, graph: "pygraph", tensor_data: Dict[int, Any], ctx: ExecutionContext) -> None:
+    def execute(self, graph: "pygraph", uid_to_data: Dict[int, Any], ctx: ExecutionContext) -> None:
         raise NotImplementedError
 
 
@@ -100,8 +149,8 @@ class _EagerPlan(CompiledPlan):
     def get_workspace_size(self) -> int:
         return self.engine.get_workspace_size()
 
-    def execute(self, graph, tensor_data, ctx: ExecutionContext) -> None:
-        self.engine.execute(graph, tensor_data, ctx)
+    def execute(self, graph, uid_to_data, ctx: ExecutionContext) -> None:
+        self.engine.execute(graph, uid_to_data, ctx)
 
 
 class BaseEngine(ABC):
@@ -113,6 +162,11 @@ class BaseEngine(ABC):
             Python region (>= PYTHON_ENGINE_ID_BASE). Subclasses MUST declare it;
             the base default (None) is rejected at register_backend().
         default_knobs: Optional default tuning knobs for this engine's plan.
+        behavior_notes / numerical_notes: what this engine's plans are, in the
+            same vocabulary the backend's plans answer in, so
+            deselect_behavior_notes(...) and friends mean one thing across the
+            ranked list. Declared, not inferred — an engine that says nothing
+            is simply never filtered out by a note.
     """
 
     name: str = "base"
@@ -121,9 +175,35 @@ class BaseEngine(ABC):
     # instead of silently colliding with another engine.
     engine_id: Any = None
     default_knobs: Any = None
+    behavior_notes: tuple = ()
+    numerical_notes: tuple = ()
 
     def __init__(self):
         pass
+
+    # Exclusive end of the id block this engine owns; the default block is the
+    # single id. DECLARE a range rather than override a predicate: registration
+    # has to prove two engines' blocks are disjoint, and an arbitrary predicate
+    # cannot be intersected — two engines could each answer True for some third
+    # id and both be accepted, leaving _engine_for() with two owners.
+    id_end: Any = None
+
+    @property
+    def owned_id_range(self) -> "tuple[int, int]":
+        """``[start, end)`` of the ids this engine answers for."""
+        end = self.id_end if self.id_end is not None else self.engine_id + 1
+        if end <= self.engine_id:
+            raise ValueError(f"engine {self.name!r} declares id_end={self.id_end} at or below its engine_id={self.engine_id}")
+        return (self.engine_id, end)
+
+    def owns_id(self, engine_id: int) -> bool:
+        """Whether ``engine_id`` falls in this engine's declared block.
+
+        Convenience only — dispatch and registration read ``owned_id_range``
+        directly, so overriding this cannot make an engine answer for an id it
+        did not declare."""
+        lo, hi = self.owned_id_range
+        return lo <= engine_id < hi
 
     def check_support(self, graph: "pygraph") -> None:
         """Raise to decline ``graph``.
@@ -157,12 +237,13 @@ class BaseEngine(ABC):
         """Workspace bytes for eager engines (compiled plans report their own)."""
         return 0
 
-    def execute(self, graph: "pygraph", tensor_data: Dict[int, Any], ctx: ExecutionContext) -> None:
+    def execute(self, graph: "pygraph", uid_to_data: Dict[int, Any], ctx: ExecutionContext) -> None:
         """Eager execution hook (used by the default ``build_plan``).
 
-        ``tensor_data`` maps tensor UIDs (inputs + outputs) to their device
-        data. Write results directly into the caller-provided output buffers,
-        on ``ctx.stream`` when set.
+        ``uid_to_data`` maps tensor UIDs (inputs + outputs) to their device
+        data; call ``resolve_node_buffers`` to address buffers by port name.
+        Write results directly into the caller-provided output buffers, on
+        ``ctx.stream`` when set.
         """
         raise NotImplementedError(f"Engine '{self.name}' must implement execute() or build_plan()")
 

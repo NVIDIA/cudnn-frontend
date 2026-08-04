@@ -1104,7 +1104,7 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
     // option (bitwise-deterministic dQ accumulation with workspace linear in
     // sequence length). Set at expand time when eligible.
     mutable bool use_sm90_ordered_dq_deterministic = false;
-    mutable bool is_d256_on_blackwell                              = false;  // Will be edited in pre_validate_node()
+    mutable bool is_d256_on_blackwell              = false;  // Will be edited in pre_validate_node()
 
     // Promote any 1-D seq_len / ragged-offset index tensors to the 4-D
     // [n, 1, 1, 1] form the cuDNN backend requires (see promote_1d_index_tensor_to_4d).
@@ -1608,7 +1608,7 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
         // so opting in is conservative there.
         if (attributes.is_deterministic_algorithm && (prop_major == 9) && (detail::get_backend_version() >= 92500) &&
             !attributes.outputs[output_names::dBias]) {
-            bool user_opted_in = false;
+            bool user_opted_in                           = false;
             const char* env_dp_workspace_limit_char_sm90 = get_environment("CUDNN_FRONTEND_ATTN_DP_WORKSPACE_LIMIT");
             if (env_dp_workspace_limit_char_sm90) {
                 char* end_ptr        = nullptr;

@@ -13,6 +13,7 @@ os.environ.setdefault(
 )
 
 import sys
+import time
 import traceback
 import pytest
 
@@ -43,6 +44,85 @@ def cuda_synchronize_safe(*args, **kwargs):
         os._exit(os.EX_SOFTWARE)
 
 torch.cuda.synchronize = cuda_synchronize_safe
+
+# =================== GPU memory gate (pytest-xdist) =====================
+# Several xdist workers share one GPU. A memory-hungry test in one worker (a
+# large sdpa bwd config can legitimately hold >12 GiB of a 16 GiB device) makes
+# unrelated tests in the other workers fail with OutOfMemoryError on tiny
+# allocations. Two mitigations, both no-ops in single-process runs:
+#   1. Before each test, wait (bounded) until a floor of device memory is free,
+#      so tests do not start while a sibling worker holds the GPU.
+#   2. If a test still hits torch.OutOfMemoryError, wait for the pressure to
+#      clear and re-run it once (pytest_runtest_call hookwrapper below).
+# Teardown returns this worker's cached blocks to the driver after every test
+# (effective because expandable_segments is set above), so a worker's
+# high-water mark is not held against the siblings for the rest of the session.
+
+_MEM_GATE_FRACTION = float(os.environ.get("CUDNN_TEST_MEM_GATE_FRACTION", "0.2"))
+_MEM_GATE_TIMEOUT_S = float(os.environ.get("CUDNN_TEST_MEM_GATE_TIMEOUT", "30"))
+
+
+def _under_xdist():
+    return int(os.environ.get("PYTEST_XDIST_WORKER_COUNT", "1")) > 1
+
+
+def _wait_for_free_gpu_memory(context):
+    # Best effort: proceed after the timeout even if the floor was not reached,
+    # so a worker can never deadlock the run; the allocation itself then either
+    # succeeds or fails with the usual OOM.
+    free, total = torch.cuda.mem_get_info()
+    floor = _MEM_GATE_FRACTION * total
+    if free >= floor:
+        return
+    torch.cuda.empty_cache()
+    deadline = time.monotonic() + _MEM_GATE_TIMEOUT_S
+    waited = False
+    while time.monotonic() < deadline:
+        free, _ = torch.cuda.mem_get_info()
+        if free >= floor:
+            break
+        waited = True
+        time.sleep(2)
+    if waited:
+        # sys.__stderr__ bypasses pytest capture so the message reaches the CI log.
+        print(
+            f"[mem-gate] {context}: waited for GPU memory "
+            f"(free {free / 2**30:.2f} GiB, floor {floor / 2**30:.2f} GiB)",
+            file=sys.__stderr__,
+            flush=True,
+        )
+
+
+def _is_cuda_oom(exc):
+    # torch.OutOfMemoryError only exists on newer torch; the cuda alias is old.
+    return isinstance(exc, torch.cuda.OutOfMemoryError)
+
+
+@pytest.fixture(autouse=True)
+def _gpu_memory_gate(request):
+    if _under_xdist():
+        _wait_for_free_gpu_memory(request.node.name)
+    yield
+    if _under_xdist():
+        torch.cuda.empty_cache()
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_call(item):
+    outcome = yield
+    if not _under_xdist() or outcome.excinfo is None or not _is_cuda_oom(outcome.excinfo[1]):
+        return
+    # OOM under xdist is usually transient sibling-worker pressure, not a
+    # property of this test: release our cache, wait for the device, retry once.
+    print(f"[mem-gate] {item.nodeid}: OOM under xdist, retrying once", file=sys.__stderr__, flush=True)
+    torch.cuda.empty_cache()
+    _wait_for_free_gpu_memory(item.nodeid)
+    try:
+        item.runtest()
+    except Exception:
+        return  # keep the original OOM report
+    outcome.force_result(None)
+
 
 # =================== Fixtures =====================
 @pytest.fixture(scope="session", autouse=True)
@@ -152,3 +232,71 @@ def pytest_addoption(parser):
     parser.addoption("--grouped-gemm-nkl", action="store", default=None, type=str, help="[test_grouped_gemm_swiglu.py] N,K,L dimensions as comma-separated values (e.g., '512,512,4')")
     parser.addoption("--grouped-gemm-group-m", action="store", default=None, type=str, help="[test_grouped_gemm_swiglu.py] M values per group as comma-separated values (e.g., '256,512,256,256')")
 # fmt: on
+
+
+# =================== FROST routing summary =====================
+# We are transitioning ops from the native cuDNN backend to FROST engines; the
+# end state is every graph on FROST. This summary shows, per test run, how many
+# graphs each path served ("frost:<engine>" vs "native:<harness site>"), so the
+# remaining native population is visible per op family. Counts come from the
+# test-side frost_routing tally (recorded by the sdpa harness after build_plans,
+# once the plan walk has resolved — the cudnn package itself is not
+# instrumented). Under pytest-xdist each worker persists its per-process counts
+# to a file at session finish and the controller aggregates them in the terminal
+# summary.
+
+_FROST_ROUTING_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".frost_routing")
+
+
+def _frost_routing_counts():
+    try:
+        import frost_routing
+
+        return frost_routing.snapshot()
+    except Exception:
+        return None
+
+
+def pytest_sessionstart(session):
+    # Controller (or single-process run): drop stale worker files from a previous run.
+    if os.environ.get("PYTEST_XDIST_WORKER") is None and os.path.isdir(_FROST_ROUTING_DIR):
+        import shutil
+
+        shutil.rmtree(_FROST_ROUTING_DIR, ignore_errors=True)
+
+
+def pytest_sessionfinish(session, exitstatus):
+    counts = _frost_routing_counts()
+    worker = os.environ.get("PYTEST_XDIST_WORKER")
+    if counts and worker is not None:
+        import json
+
+        os.makedirs(_FROST_ROUTING_DIR, exist_ok=True)
+        with open(os.path.join(_FROST_ROUTING_DIR, f"{worker}.json"), "w") as f:
+            json.dump(counts, f)
+
+
+def pytest_terminal_summary(terminalreporter, exitstatus, config):
+    if os.environ.get("PYTEST_XDIST_WORKER") is not None:
+        return  # workers report via files; only the controller prints
+    counts = dict(_frost_routing_counts() or {})
+    if os.path.isdir(_FROST_ROUTING_DIR):
+        import json
+        import shutil
+
+        for fname in sorted(os.listdir(_FROST_ROUTING_DIR)):
+            try:
+                with open(os.path.join(_FROST_ROUTING_DIR, fname)) as f:
+                    for key, n in json.load(f).items():
+                        counts[key] = counts.get(key, 0) + n
+            except Exception:
+                pass
+        shutil.rmtree(_FROST_ROUTING_DIR, ignore_errors=True)
+    if not counts:
+        return
+    total = sum(counts.values())
+    frost_total = sum(n for key, n in counts.items() if key.startswith("frost:"))
+    terminalreporter.section("FROST routing")
+    terminalreporter.write_line(f"graphs on FROST engines: {frost_total}/{total} ({100.0 * frost_total / total:.1f}%) -- transition goal is all-FROST")
+    for key in sorted(counts):
+        terminalreporter.write_line(f"  {key}: {counts[key]}")

@@ -4,18 +4,18 @@ This reference captures the local cuDNN Frontend pattern for integrating a CuTeD
 
 ## Package Layout
 
-Create or update an operation package under `python/cudnn/`.
-
-Typical layout:
+Create or update an operation package under the operation-first layout
+(`python/cudnn/<operation-family>/<implementation>/`). GEMM-family CuTe DSL
+kernels live under `python/cudnn/gemm/cutedsl/`:
 
 ```text
-python/cudnn/<operation>/
+python/cudnn/gemm/cutedsl/<dense|grouped|discrete_grouped>/<operation>/
 |-- __init__.py
 |-- api.py
 `-- <cutedsl_kernel_module>.py
 ```
 
-Nested API families are also valid when matching existing structure, for example:
+Other families keep their existing structure, for example:
 
 - `python/cudnn/gemm/cutedsl/dense/<operation>/`
 - `python/cudnn/gemm/cutedsl/grouped/<operation>/`
@@ -23,7 +23,8 @@ Nested API families are also valid when matching existing structure, for example
 - `python/cudnn/sdpa/fwd/` or `python/cudnn/sdpa/bwd/`
 - `python/cudnn/native_sparse_attention/<component>/`
 
-Choose the closest existing family before creating a new top-level package.
+Choose the closest existing family; do not create a new top-level package under
+`python/cudnn/` for a GEMM kernel.
 
 When an existing SM100 kernel needs a Rubin-specific CuTeDSL implementation, keep the public API unchanged and add an internal architecture dispatch layer. See [Architecture-Specific Kernel Variants](#architecture-specific-kernel-variants-rubin--sm107) below.
 
@@ -31,8 +32,8 @@ Use this routing table before choosing the package namespace:
 
 | Kernel shape | Preferred family |
 | --- | --- |
-| Plain dense GEMM or alpha/beta GEMM | Dense frontend-only package under `python/cudnn/<operation>/` |
-| Dense GEMM with a fused pointwise epilogue, scale, amax, or auxiliary output | GEMM-fusion package under `python/cudnn/<operation>/` |
+| Plain dense GEMM or alpha/beta GEMM | Dense GEMM package under `python/cudnn/gemm/cutedsl/dense/<operation>/` |
+| Dense GEMM with a fused pointwise epilogue, scale, amax, or auxiliary output | GEMM-fusion package under `python/cudnn/gemm/cutedsl/dense/<operation>/` |
 | Dense GEMM with distributed all-reduce | Dense package only after documenting distributed runtime requirements |
 | Grouped GEMM with packed or contiguous grouped inputs | `python/cudnn/gemm/cutedsl/grouped/<operation>/` |
 | Grouped GEMM with `padded_offsets`, `expert_cnt`, or scheduler workspace | `python/cudnn/gemm/cutedsl/grouped/<operation>/`, regardless of "dense" wording in source comments |
@@ -157,7 +158,7 @@ The loader already formats optional dependency failures as:
 raise ImportError(f"{name} requires optional dependencies. {_OPTIONAL_DEPENDENCY_INSTALL_HINT}: {e}") from e
 ```
 
-For family modules such as `gemm.cutedsl.grouped`, `gemm.cutedsl.discrete_grouped`, or `sdpa`, also update the family `__init__.py` if the class or wrapper should be available from that namespace.
+For family modules such as `gemm.cutedsl.grouped`, `gemm.cutedsl.discrete_grouped`, or `sdpa`, also update the family `__init__.py` (and the lazy-export table in `python/cudnn/__init__.py`) if the class or wrapper should be available from that namespace.
 
 ## Dependencies
 

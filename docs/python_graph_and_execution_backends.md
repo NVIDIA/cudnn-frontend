@@ -41,34 +41,107 @@ is natively introspectable and an engine is one file implementing
 - `BaseEngine`: `propose_plans(graph) → [PlanConfig]` (several knob configs
   per engine), `build_plan(graph, plan, ctx) → CompiledPlan` (the expensive
   JIT step, once per graph/plan, cached on the graph),
-  `CompiledPlan.execute(graph, tensor_data, ExecutionContext)` with explicit
-  handle/stream/workspace/overrides. Simple eager engines implement
+  `CompiledPlan.execute(graph, uid_to_data, ExecutionContext)` with explicit
+  handle/stream/workspace/overrides. `uid_to_data` is the caller's variant
+  pack, exactly as the classic backend receives it; engines that address
+  buffers by port name call `resolve_node_buffers(graph, uid_to_data)`
+  (`engines/base.py`), which joins the pack with each node's wired ports —
+  strict missing-buffer validation, torch tensors detached once (DLPack/CAI
+  refuse `requires_grad` export) — into per-node `NodeBuffers`
+  (`{port_name: caller buffer}`). Simple eager engines implement
   `execute()` only.
-- Every engine owns a stable `engine_id` in a reserved region
-  (`PYTHON_ENGINE_ID_BASE = 1 << 20`) — reproducible pinning/autotune.
+- Every engine owns a stable `engine_id` in one flat id space
+  (`engines/engine_ids.py`: backend `[0, 10_000)`, C++ OSS `[10_000, 20_000)`,
+  python `[20_000, …)` with a block per family, out-of-tree `30_000+`) —
+  reproducible pinning/autotune.
 - An engine declines a graph ONLY via `NotImplementedError` or
   `cudnn.cudnnGraphNotSupportedError`; anything else is an engine bug and
   propagates.
-- `ReferenceMatmulEngine` (pure PyTorch) is the in-tree contract oracle; real
-  DSL engines land as separate PRs, one file each.
+- The contract oracle is `TorchMatmulEngine` in
+  `test/python/test_engine_router.py` (pure PyTorch, CPU): the dispatch
+  contract is proven end to end without a GPU, and no oracle ships in the
+  package.
+- `GdnCuTileEngine` executes the single-node `gdn` and `gdn_bwd` ops (Gated
+  DeltaNet linear attention) via the cuTile chunked kernels. Both ops are
+  THD-only: token-packed `[total_T, heads, dim]` tensors with a required
+  `cu_seqlens` (a dense batch is `[0, T, 2T, ...]`). `gdn_bwd` takes the
+  forward inputs plus `dO` (and optionally `d_final_state`) and produces
+  `dQ/dK/dV/dG/dBeta` (+ `d_initial_state` iff `initial_state` is given);
+  the cumulative gate and intra-chunk WY matrix are recomputed inside the
+  engine, so the graph contract carries no forward intermediates. Both are
+  python-engine-only ops: they have no cuDNN backend lowering, so routing
+  them to the backend entry raises `cudnnGraphNotSupportedError` at
+  lowering. The kernels live in `cudnn.linear_attention.cutile.kernels.gdn_chunk_cutile`;
+  the torch custom op `cudnn.linear_attention.ops.gated_delta_net` is a thin
+  adapter that builds and executes cached `gdn`/`gdn_bwd` graphs (the SDPA
+  op pattern), so it inherits whatever engine the planner selects. The
+  optional `use_qk_l2norm` attribute asks the engine to L2-normalize the q/k
+  rows in-kernel; `GdnFrostEngine` (the SM100/SM103 forward default) declines
+  such graphs, the cuTile engine serves them.
+- `KdaFrostEngine` / `KdaCuTileEngine` do the same for the single-node
+  `kda` / `kda_bwd` ops (Kimi Delta Attention). KDA is GDN with a
+  per-key-channel decay: its `g` is the log-space vector gate
+  `[total_T, HV, K]` (GDN's is the scalar `[total_T, HV]`); `beta` stays
+  scalar. The FROST engine (`cudnn.linear_attention.frost.kda_engine`) is
+  the forward default on SM100/SM103; the node's `use_qk_l2norm` attribute
+  (in-kernel L2-normalization of q/k — the KDA model's feature map) passes
+  through to the kernel (without the in-kernel norm the caller owns the q/k
+  conditioning). It declines `kda_bwd` (its backward
+  kernel is a stub), so gradients route to the cuTile engine
+  (`cudnn.linear_attention.cutile.kernels.kda_chunk_cutile`); the torch op
+  is `cudnn.linear_attention.ops.kimi_delta_attention`.
+- Gated DeltaNet v2 (`gdn2` / `gdn2_bwd`) has channel-wise gates — `g`/`beta`
+  `[total_T, HO, K]` plus a NEW per-value write gate `w` `[total_T, HO, V]`.
+  GDN-2 has **no** cuTile engine; `Gdn2FrostEngine`
+  (`cudnn.linear_attention.frost.gdn2_engine`, SM100/SM103) is its only
+  engine, passes the `use_qk_l2norm` attribute through to the kernel (like
+  `KdaFrostEngine`), and declines `gdn2_bwd` (stub backward kernel), so the
+  op (`cudnn.linear_attention.ops.gated_delta_net_v2`) is forward-only for
+  now.
+- The FROST engines are pure pass-through: `check_support` requires the
+  kernel-native dtypes (fp32 gates — io-dtype `beta`/`w` for GDN-2 — int32
+  `cu_seqlens`, fp32-or-bf16 state ports with matching initial/final dtypes,
+  fp32 state gradients) and execute hands the caller's buffers straight to
+  the kernels, carving any scratch it needs out of the explicit workspace as
+  DLPack views. The cuTile engines follow the same buffer contract: outputs
+  are written in place (the caller's output buffers, required in the
+  kernel-native dtypes, are planted under the pipelines' terminal workspace
+  names), and their chunk-index tables are built on device from
+  `cu_seqlens`, so execution stays sync-free. Buffers only need
+  `__cuda_array_interface__` or `__dlpack__`; the torch custom ops do the
+  dtype normalization on their side.
 
-### Router and the two plan-index spaces
+### Router and the one plan list
 
-- The Router returns the routed plan list: python `PlanConfig` entries plus
-  AT MOST ONE backend delegating entry (`BACKEND_HEURISTIC_ENGINE_ID`). The
-  final output is validated regardless of Router implementation (registered
-  ids only, one sentinel max, never empty).
-- **Routed space**: `graph.plans`, selected with `select_plan()`. Indices are
-  stable — the backend entry is one index forever and never expands in place.
-- **Backend space**: the cuDNN backend's own plans, discovered per graph from
-  the lowered graph and addressed via the classic
-  `get_execution_plan_count()` / `*_plan_at_index()` APIs (pure delegation).
-  The frontend never statically enumerates backend engines — backend engine
-  sets vary by version and are discovered at plan time.
-- Concrete backend engine configs as first-class routed entries need a typed
-  plan representation — heuristics/autotune follow-up scope, together with
-  ranking policy (the Router is pluggable at three levels: subclass,
-  per-graph `router=`, process-wide `default_router`).
+- `create_execution_plans()` collects both sides and ranks them into ONE list:
+  the python engines that claim the graph (from `engines/manifest.py`, plus
+  anything `register_backend()` added) and the backend's own ranked
+  `(engine_id, knobs)` recommendation from `backend_plan_entries()`.
+  `engines/heuristics.py::heuristics_sort` decides the order.
+- The list IS `graph.plans`, and the classic at-index APIs
+  (`get_execution_plan_count()`, `get_plan_name_at_index()`,
+  `build_plan_at_index()`, `execute_plan_at_index()`,
+  `get_workspace_size_plan_at_index()`) address it, so code that loops over the
+  plan count picks up python engines with no change.
+- A backend entry carries the `cpp_index` it holds in the lowered graph's own
+  plan list, so building it is one `build_plan_at_index`. Backend engine sets
+  are still never statically enumerated: they are discovered per graph at plan
+  time, and `backend_plan_entries()` returns `[]` when the backend declines the
+  graph or is not installed — the backend participates in the ranking, it is
+  not a hard dependency.
+- A Router places the backend's entries by calling `backend_plan_entries()`
+  (answered once per graph) and putting the result where it wants; nothing
+  rewrites the list it returns, so a routed index means what the Router said.
+  `BACKEND_HEURISTIC_ENGINE_ID` names one thing only: the delegating entry that
+  method appends under `heur_mode.OPENSOURCE`, where the backend picks among
+  candidates it never exposes as plans.
+- `build_plans()` walks the list from the selected index and takes the first
+  entry that builds; a decline (`NotImplementedError` /
+  `cudnnGraphNotSupportedError`) advances to the next. `select_plan(i)` pins,
+  and a pinned decline raises instead of running something else.
+- Ranking policy is pluggable at three levels: subclass `Router`, per-graph
+  `router=`, process-wide `default_router` — plus `heuristics_sort` itself,
+  which is the seam a real cost model replaces.
 
 ## Key invariants
 

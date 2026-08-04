@@ -20,11 +20,23 @@ Example with a native backend (pass torch tensors directly):
 """
 
 from dataclasses import dataclass
+import logging
 import weakref
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 from .graph_types import NodeType, Tensor
 from .nodes import Node, _row_major_stride
+
+_LOG = logging.getLogger("cudnn.pygraph")
+
+
+def cudnn_graph_not_supported(message: str) -> Exception:
+    """The classic unsupported-graph error (built lazily: importing cudnn at
+    module scope here would be circular)."""
+    import cudnn
+
+    return cudnn.cudnnGraphNotSupportedError(message)
+
 
 if TYPE_CHECKING:
     from .engines.base import BaseEngine
@@ -135,6 +147,13 @@ class pygraph:
         self._cpp_tensors: Dict[int, Any] = {}  # IR uid -> lowered C++ tensor
         self._reserved_uids: set = set()  # user-specified uids _alloc_uid must skip
         self._ambiguous_names: set = set()  # duplicate labels: excluded from the name index
+        self._candidates: Optional[List["BaseEngine"]] = None  # manifest matches + registered
+        self._backend_declined: Optional[Exception] = None  # why the backend has no entries
+        self._backend_entries: Optional[List[Any]] = None  # backend_plan_entries(), once
+        self._barred_names: set = set()  # deselect_engines()
+        self._workspace_limit: Optional[int] = None  # deselect_workspace_greater_than()
+        self._note_filters: List[Any] = []  # (kind, note, keep) from the classic note filters
+        self._plan_pinned: bool = False  # select_plan() => the walk is strict
         for _e in backends or ():  # constructor path uses the SAME validation
             self.register_backend(_e)
 
@@ -147,16 +166,46 @@ class pygraph:
         create_execution_plans() time when its check_support() accepts the graph.
 
         Validated at registration (not at failure time): the engine must declare
-        a stable engine_id in the reserved python region, ids must be unique per
-        graph, and registration after planning is rejected (planning is
-        one-shot — build a new graph)."""
-        from .engines.engine_ids import is_python_engine
+        a stable engine_id in the reserved python region, that id must not fall
+        in a block the in-tree manifest reserves nor overlap another registered
+        engine's block, and registration after planning is rejected (planning is
+        one-shot — build a new graph).
+
+        The id checks are what make ``_engine_for()`` a lookup rather than a
+        guess: two engines owning the same id would let one of them execute the
+        other's plan. Blocks are declared as intervals precisely so that
+        disjointness can be PROVEN here instead of hoped for."""
+        from .engines.engine_ids import OUT_OF_TREE_ID_BASE
+        from .engines.manifest import MANIFEST
 
         eid = getattr(engine, "engine_id", None)
-        if not isinstance(eid, int) or not is_python_engine(eid):
-            raise ValueError(f"engine {engine!r} must declare a stable integer engine_id >= PYTHON_ENGINE_ID_BASE (got {eid!r})")
-        if any(e.engine_id == eid for e in self._backends):
-            raise ValueError(f"engine_id {eid} is already registered on this graph")
+        if not isinstance(eid, int):
+            raise ValueError(f"engine {engine!r} must declare a stable integer engine_id (got {eid!r})")
+        lo, hi = engine.owned_id_range
+        for row in MANIFEST:  # blocks are intervals, so disjointness is decidable
+            if lo < row.id_end and row.engine_id < hi:
+                # Registering the in-tree engine that OWNS the block is normal
+                # (a test or a caller pinning one specific engine); it is the
+                # same implementation the manifest would have instantiated.
+                # Anything else claiming that range would receive its plans.
+                if type(engine).__module__ == row.module and row.engine_id <= lo and hi <= row.id_end:
+                    break
+                raise ValueError(
+                    f"engine {engine.name!r} ({type(engine).__module__}) claims ids [{lo}, {hi}), which overlaps the "
+                    f"block [{row.engine_id}, {row.id_end}) the in-tree manifest reserves for {row.name!r} "
+                    f"({row.module}); an engine from outside the library uses ids >= {OUT_OF_TREE_ID_BASE}"
+                )
+        else:
+            if lo < OUT_OF_TREE_ID_BASE:
+                raise ValueError(
+                    f"engine {engine.name!r} claims ids [{lo}, {hi}); ids below {OUT_OF_TREE_ID_BASE} are the in-tree "
+                    f"region (cudnn/engines/engine_ids.py) — an engine registered from outside the library uses the "
+                    f"out-of-tree range"
+                )
+        for other in self._backends:
+            o_lo, o_hi = other.owned_id_range
+            if lo < o_hi and o_lo < hi:
+                raise ValueError(f"engine {engine.name!r} claims ids [{lo}, {hi}), which overlaps [{o_lo}, {o_hi}) already registered by {other.name!r}")
         if self._planning_done:
             raise RuntimeError("cannot register a backend after create_execution_plans(); planning is one-shot — build a new graph")
         self._backends.append(engine)
@@ -171,15 +220,11 @@ class pygraph:
         self._router = router
         return self
 
-    def _engine_by_id(self, engine_id: int) -> "BaseEngine":
-        for e in self._backends:
-            if e.engine_id == engine_id:
-                return e
-        raise KeyError(f"no registered python engine with id {engine_id}")
-
     @property
     def backends(self) -> List["BaseEngine"]:
-        """Registered candidate python engines."""
+        """Engines added with ``register_backend()`` (the out-of-tree hatch).
+        The full candidate set for a graph — these plus the matching manifest
+        rows — is ``_candidate_engines()``."""
         return list(self._backends)
 
     @property
@@ -196,12 +241,56 @@ class pygraph:
         cfg = self._plans[self._plan_index]
         return cfg if is_python_engine(cfg.engine_id) else None
 
+    def _engine_for(self, cfg) -> Optional["BaseEngine"]:
+        """The python engine that owns ``cfg``'s id, or None for a backend entry."""
+        from .engines.engine_ids import is_python_engine
+
+        if cfg is None or not is_python_engine(cfg.engine_id):
+            return None
+        owners = self._owners_for_id(cfg.engine_id)
+        if not owners:
+            raise KeyError(f"no python engine declares id {cfg.engine_id}")
+        if len(owners) > 1:  # registration proves this cannot happen; assert it anyway
+            raise KeyError(f"id {cfg.engine_id} is declared by {[e.name for e in owners]} — dispatch is ambiguous")
+        return owners[0]
+
+    def _owners_for_id(self, engine_id: int) -> List["BaseEngine"]:
+        """Candidate engines whose DECLARED range contains ``engine_id``.
+
+        The single owner lookup: dispatch, the Router's output validation and
+        replay all go through it, so "who runs this id" has one answer computed
+        one way. Never a subclass predicate — registration can prove intervals
+        disjoint, and cannot prove anything about an arbitrary ``owns_id``."""
+        out = []
+        for engine in self._candidate_engines():
+            lo, hi = engine.owned_id_range
+            if lo <= engine_id < hi:
+                out.append(engine)
+        return out
+
+    def _barred_indices(self) -> set:
+        """Plan INDICES excluded by ``deselect_engines()`` (classic: match by
+        name substring) or by a note filter. Per index, not per engine: one
+        engine proposes several knob configurations and a name may match only
+        one of them."""
+        barred = set()
+        if self._barred_names:
+            barred |= {i for i in range(len(self._plans)) if any(p in self.get_plan_name_at_index(i) for p in self._barred_names)}
+        # Same rule the backend applies per note (plans.h::filter_behavior_notes):
+        # bar a plan that HAS the note when deselecting, or LACKS it when selecting.
+        for kind, note, keep in self._note_filters:
+            for i, cfg in enumerate(self._plans):
+                if self._engine_for(cfg) is None:
+                    continue  # backend entry: the backend already filtered it
+                if (note in self._notes_of(cfg, kind)) != keep:
+                    barred.add(i)
+        return barred
+
     @property
     def selected_engine(self) -> Optional["BaseEngine"]:
-        """The python engine for the currently selected top-level plan entry,
-        or None for the backend path. Populated after create_execution_plans()."""
-        cfg = self._selected_plan_config
-        return self._engine_by_id(cfg.engine_id) if cfg is not None else None
+        """The python engine for the currently selected plan entry, or None for
+        the backend path. Populated after create_execution_plans()."""
+        return self._engine_for(self._selected_plan_config)
 
     # =========================================================================
     # Tensor Creation
@@ -744,10 +833,11 @@ class pygraph:
             if not t.is_pass_by_value:
                 t.validate()
         self._is_validated = True
-        # Classic parity: with no python engines registered, C++ validation
-        # happens HERE — tests catch cudnnGraphNotSupportedError around
-        # graph.validate() (unsupported configs must skip, not fail later).
-        if not self._backends and self._lowered_graph is None:
+        # Classic parity: C++ validation happens HERE, so a config the backend
+        # rejects raises from validate() where callers catch it to skip. Skipped
+        # only for a graph the backend has no lowering for (GDN/KDA/...), or when
+        # the caller registered its own engine — the pre-existing exemption.
+        if not self._backends and self._backend_lowerable() and self._lowered_graph is None:
             self._lowered_graph = self._lower_to_cpp()
             self._lowered_graph.validate()
             self._verify_uid_ownership()
@@ -776,7 +866,16 @@ class pygraph:
         inferred strides are provisional row-major; the backend applies
         classic per-op layout inference (channels-last conv etc.), and
         consumers of the IR (wrapper.Graph buffer allocation, engines,
-        introspection) must see the layout that will actually execute."""
+        introspection) must see the layout that will actually execute.
+
+        USER-assigned dim/stride are never overwritten: they describe the
+        caller's actual buffers and are the authoritative API-level layout.
+        Some composite nodes remap their C++ input descriptors in place to
+        the backend's internal convention (the fp8/mxfp8 SDPA nodes swap K's
+        dim/stride to the KT = (B, H, D, S) view the backend wants — same
+        memory, transposed description); reflecting that back would corrupt
+        the IR's user-facing (B, H, S, D) contract that graph analyzers and
+        python engines consume."""
         for ir_uid, cpp_t in self._cpp_tensors.items():
             ir = self._tensor_by_uid.get(ir_uid)
             if ir is None:
@@ -785,23 +884,24 @@ class pygraph:
                 d, st = cpp_t.get_dim(), cpp_t.get_stride()
             except Exception:  # noqa: BLE001 — some tensors have no dims (scalars)
                 continue
-            if d:
+            if d and not ir.dim_assigned:
                 object.__setattr__(ir, "dim", tuple(d))  # sealed (graph is frozen)
-            if st:
+            if st and not ir.stride_assigned:
                 object.__setattr__(ir, "stride", tuple(st))
 
     def create_execution_plans(self, heuristics: Optional[List] = None) -> None:
         """Build the ranked execution-plan list (the dispatch stage).
 
-        The Router returns one flat list of PlanConfig(engine_id, knobs) mixing
-        python engines (reserved id region) and the backend side, in one shared
-        engine-id space. Nothing is lowered here — a plan is built lazily when
-        selected. ``_plan_index`` selects which plan runs (default 0, the
-        highest-ranked); cuDNN heuristic modes are carried on the backend plan's
-        knobs.
+        Both sides are collected here and ranked into ONE flat list of
+        ``PlanConfig(engine_id, knobs)``: the python engines that claim the
+        graph (discovered from ``engines.manifest`` — no registration call, no
+        environment variable) and the backend's own ranked recommendation
+        (``backend_plan_entries()``, [] when the backend declined the graph or
+        is not installed). ``engines.heuristics.heuristics_sort`` decides the
+        order; ``build_plans()`` walks it.
 
         Args:
-            heuristics: cuDNN heuristic modes, carried to the backend plan.
+            heuristics: cuDNN heuristic modes for the backend's recommendation.
         """
         if not self._is_validated:
             self.validate()
@@ -818,85 +918,294 @@ class pygraph:
             raise RuntimeError(
                 "create_execution_plans() was already called on this graph; planning is one-shot — build a new graph to re-plan, or use select_plan() to switch plans"
             )
+        self._backend_heuristics = heuristics  # read by backend_plan_entries()
         router = self._router or default_router
-        plans = router.plan(self, self._backends)
-        # Validate the FINAL router output (a custom Router must not bypass
-        # registration): python entries must name registered engines; the only
-        # non-python entry allowed is ONE backend delegating sentinel.
-        from .engines.engine_ids import BACKEND_HEURISTIC_ENGINE_ID, is_python_engine
+        plans = list(router.plan(self, self._candidate_engines()))
+        # Validate the FINAL router output: every entry must name an engine this
+        # graph can actually dispatch to.
+        from .engines.engine_ids import is_python_engine
 
-        registered = {e.engine_id for e in self._backends}
-        if not plans:
-            raise ValueError("router returned an empty plan list — there is no legal empty planning state (return the backend delegating entry at minimum)")
-        n_cudnn = 0
+        known = {e.engine_id for e in self._candidate_engines()}
         for cfg in plans:
-            if is_python_engine(cfg.engine_id):
-                if cfg.engine_id not in registered:
-                    raise ValueError(f"router produced a plan for unregistered engine_id {cfg.engine_id}")
-            elif cfg.engine_id == BACKEND_HEURISTIC_ENGINE_ID:
-                n_cudnn += 1
-            else:
-                raise ValueError(f"router produced a plan with invalid engine_id {cfg.engine_id}")
-        if n_cudnn > 1:
-            raise ValueError("router produced more than one backend delegating entry")
+            if is_python_engine(cfg.engine_id) and not self._owners_for_id(cfg.engine_id):
+                raise ValueError(f"router produced a plan for unknown python engine_id {cfg.engine_id} (known: {sorted(known)})")
+        if not plans:
+            # Say WHY, or the user is left guessing which side had nothing: the
+            # backend's own rejection is the usual answer.
+            why = f" (the backend declined: {self._backend_declined})" if self._backend_declined is not None else ""
+            raise cudnn_graph_not_supported(f"no engine — python or backend — proposed a plan for this graph{why}")
         self._plans = plans
         self._planning_done = True
         self._freeze()  # plans reference the graph as-is: no mutation from here
         self._plan_index = 0
-        self._backend_heuristics = heuristics  # applied when a backend plan is built
-        # Classic sequencing: if the graph was already lowered (no python
-        # engines -> build_operation_graph lowered eagerly) and the selected
-        # plan is the backend one, create the C++ plans now.
-        if self.selected_engine is None and self._lowered_graph is not None:
-            self._lower_backend_plan()
 
-    def _has_backend_plan(self) -> bool:
+    def _candidate_engines(self) -> List["BaseEngine"]:
+        """The python engines this graph may dispatch to: anything
+        ``register_backend()`` added, then the in-tree manifest rows whose
+        coarse key matches. Registered engines lead because bringing your own
+        engine is an explicit act; the library's own table is the default.
+        (Candidate ORDER is not rank — ``heuristics_sort`` ranks.) Cached: the
+        graph is frozen at planning time anyway."""
+        if self._candidates is None:
+            from .engines import manifest
+            from .frost.buffers import current_sm
+
+            # Registering an in-tree engine pins THAT instance: the manifest
+            # must not also offer its own copy, or the id has two owners.
+            claimed = [e.owned_id_range for e in self._backends]
+            from_manifest = [
+                e for e in manifest.engines_for(self, current_sm()) if not any(lo < e.owned_id_range[1] and e.owned_id_range[0] < hi for lo, hi in claimed)
+            ]
+            self._candidates = list(self._backends) + from_manifest
+        return self._candidates
+
+    def _unlowerable_node(self) -> Optional[Node]:
+        """The first node with no C++ lowering, or None when the whole graph has one.
+
+        This — not "does a python engine claim the graph" — is what decides
+        whether ``validate()`` lowers eagerly. Classic error timing depends on
+        it: a config the backend rejects (alibi with a right bound, bottom-right
+        causal with dropout, ...) must raise ``cudnnGraphNotSupportedError`` from
+        ``validate()``, where callers catch it to skip. An op the backend has no
+        node for at all (GDN/KDA/...) must NOT be lowered — the lowering loop
+        silently skips such nodes and would hand C++ an incomplete graph.
+        """
+        for node in self._nodes:
+            if node.node_type in (NodeType.MATMUL, NodeType.POINTWISE):
+                continue
+            spec_entry = _CAPTURED_BY_TYPE.get(node.node_type) or _STRUCTURED_BY_TYPE.get(node.node_type)
+            if spec_entry is None:
+                return node  # no lowering branch at all
+            if spec_entry[1].get("python_only"):
+                return node  # declared python-only: lowering raises by design
+        return None
+
+    def _backend_lowerable(self) -> bool:
+        return self._unlowerable_node() is None
+
+    def backend_plan_entries(self) -> List[Any]:
+        """The backend's own ranked ``(engine_id, knobs)`` recommendation, as
+        PlanConfig entries carrying their C++ plan index.
+
+        Returns [] for the two things that legitimately mean "no backend entries":
+        the backend DECLINED the graph (``cudnnGraphNotSupportedError``) or is not
+        installed at all (``AttributeError``/``ImportError`` reaching for it).
+        Everything else — a CUDA failure, a bad handle, a backend API error, all
+        of which the binding surfaces as ``RuntimeError`` — propagates: swallowing
+        those would silently run a python engine on a failing device and call it a
+        routing decision.
+
+        The query costs a real ``create_execution_plans`` on the lowered graph
+        (~178 ms on sm100/9.26 for a 1024^3 bf16 matmul): there is no cheaper way
+        to obtain a RANKED list today, since ``get_engine_and_knobs_at_index``
+        indexes the plan list, not the engine list.
+
+        Answered ONCE per graph: a second C++ create_execution_plans() appends
+        to the same plan list (``enqueue_engine_configs`` -> ``back_inserter``),
+        so re-querying would report every backend plan twice. A Router may
+        therefore call it freely to place the entries where it wants.
+        """
+        import cudnn
+
+        from .engines.base import PlanConfig
+
+        if self._backend_entries is not None:
+            return self._backend_entries
+
+        unlowerable = self._unlowerable_node()
+        if unlowerable is not None:
+            # Known statically: the backend has no node for this op (GDN/KDA/...).
+            # Asking anyway costs a lowering that must fail, once per graph, and
+            # reports an expected routing outcome as a warning. Worded as the
+            # backend words it — callers match on "No valid engine configs".
+            name = unlowerable.node_type.name
+            self._backend_declined = cudnn_graph_not_supported(
+                f"No valid engine configs for {name}: {name.lower()} has no cuDNN backend lowering; it runs on a python engine"
+            )
+            self._backend_entries = []
+            return self._backend_entries
+
+        try:
+            # Can the backend express this graph at all? Only the types the
+            # BINDING raises count; an AssertionError/KeyError/TypeError here is
+            # our own translator bug and must not read as a decline.
+            self._lower_backend_graph()
+        except (cudnn.cudnnGraphNotSupportedError, RuntimeError, ImportError, AttributeError) as exc:
+            self._backend_declined = exc
+            # RuntimeError here is overloaded by the binding: a rejected
+            # descriptor (cannot represent) and a failing device look the same.
+            # Treat it as a decline so a python engine can still serve the
+            # graph, but say so at WARNING and re-raise it if nothing does.
+            _LOG.warning("backend could not lower this graph, treating as a decline: %s", exc)
+            # Roll back: a half-lowered graph makes a later build_operation_graph()
+            # walk into the descriptor that just failed.
+            self._lowered_graph = None
+            self._cpp_tensors.clear()
+            self._cpp_bog_done = False
+            self._cpp_plans_created = False
+            self._backend_entries = []
+            return self._backend_entries
+        try:
+            # "Which engines does it offer?" — here only an unsupported-graph
+            # answer is a decline. A CUDA failure, a bad handle or a backend API
+            # error arrives as RuntimeError and must NOT be read as routing:
+            # swallowing it would run a python engine on a failing device and
+            # call that a decision.
+            self._create_backend_plans()
+        except cudnn.cudnnGraphNotSupportedError as exc:
+            # Lowering succeeded, so the only decline left is "no engine for it";
+            # an AttributeError here is a binding mismatch, not an absent backend.
+            self._backend_declined = exc
+            _LOG.debug("backend has no engine for this graph: %s", exc)
+            self._backend_entries = []
+            return self._backend_entries
         from .engines.engine_ids import BACKEND_HEURISTIC_ENGINE_ID
 
-        return any(cfg.engine_id == BACKEND_HEURISTIC_ENGINE_ID for cfg in self._plans)
+        entries = []
+        for i in range(self._lowered_graph.get_execution_plan_count()):
+            engine_id, knobs = self._lowered_graph.get_engine_and_knobs_at_index(i)
+            entries.append(PlanConfig(engine_id, knobs, cpp_index=i))
+        import cudnn
+
+        asked_oss = any(h == cudnn.heur_mode.OPENSOURCE for h in (self._backend_heuristics or []))
+        if asked_oss or (not entries and self._lowered_graph.get_engine_count()):
+            # OSS candidates are registered in the backend's CANDIDATE space and
+            # never surface as plans, so they cannot be enumerated: one
+            # delegating entry, built and run by C++ itself. FIRST, because
+            # Graph::build_plans tries the OSS engine before engine_configs and
+            # returns as soon as it builds — ranking it after the concrete plans
+            # would hand an OPENSOURCE caller a native kernel instead.
+            entries.insert(0, PlanConfig(BACKEND_HEURISTIC_ENGINE_ID))
+        self._backend_entries = entries
+        return entries
 
     def get_execution_plan_count(self) -> int:
-        """Classic passthrough, ALWAYS: the cuDNN backend's plan count for this
-        graph (its plan list is discovered per graph from the lowered C++ graph
-        and addressed via the classic ``build_plan_at_index`` /
-        ``execute_plan_at_index`` / ``get_workspace_size_plan_at_index`` APIs).
-        The semantics never depend on whether python engines are registered.
+        """The number of ranked plans for this graph — ONE list, python engines
+        and backend engines alike (``graph.plans``).
 
-        The ROUTED plan list (the Router's entries: python plans + at most one
-        backend delegating entry) is a separate index space: ``graph.plans``,
-        selected with ``select_plan()``. Its indices are stable — the cuDNN
-        entry is one index forever and never expands into this count.
+        The classic at-index APIs (``get_plan_name_at_index`` /
+        ``build_plan_at_index`` / ``execute_plan_at_index`` /
+        ``get_workspace_size_plan_at_index``) address this same list, so code
+        that loops over the count picks up python engines with no change.
         """
         if self._planning_done:
-            if not self._has_backend_plan():
-                raise RuntimeError(
-                    "this graph's Router produced python plans only (no backend entry), so there are no backend plans — the routed plan list is graph.plans / select_plan()"
-                )
-            self._lower_backend_plan()  # backend plans exist on demand (one-shot)
-            return self._lowered_graph.get_execution_plan_count()
+            return len(self._plans)
         if self._lowered_graph is not None:
             # classic pre-planning sequencing: delegate, C++ reports its state
             return self._lowered_graph.get_execution_plan_count()
         return 0  # classic: an unplanned graph has zero plans (not an error)
 
+    def get_plan_name_at_index(self, index: int) -> str:
+        """Name of the plan at ``index`` in the ranked list. A python plan
+        reports its engine name (plus its knobs when it has several plans); a
+        backend plan reports the backend's own name."""
+        if not self._planning_done:
+            return self._lowered_graph.get_plan_name_at_index(index)
+        cfg = self._plans[self._check_plan_index(index)]
+        eng = self._engine_for(cfg)
+        if eng is not None:
+            return f"{eng.name}[{cfg.knobs}]" if cfg.knobs is not None else eng.name
+        cfg = self._materialize_backend_plan(index)
+        if cfg.cpp_index is None:
+            # Delegating entry: the backend holds candidates it does not expose
+            # as plans, so there is no C++ index to name (indexing an empty
+            # engine_configs is unchecked on the C++ side).
+            return "backend_heuristics"
+        self._lower_backend_plan()
+        return self._lowered_graph.get_plan_name_at_index(cfg.cpp_index)
+
     def select_plan(self, index: int) -> "pygraph":
-        """Pick a ROUTED plan entry: the index is into ``graph.plans`` (the
-        Router's entries — stable, never shifted by backend lowering). Backend
-        sub-plans are a separate space, selected via the classic at-index APIs
-        (see get_execution_plan_count)."""
+        """Pin the plan at ``index`` in the ranked list (``graph.plans``).
+
+        A pin is STRICT: ``build_plans()`` starts there and a decline raises
+        instead of quietly running a different plan."""
         if not self._planning_done:
             raise RuntimeError("call create_execution_plans() before select_plan()")
         if not 0 <= index < len(self._plans):
-            raise IndexError(f"plan index {index} out of range for {len(self._plans)} routed plan(s) (graph.plans)")
+            raise IndexError(f"plan index {index} out of range for {len(self._plans)} plan(s) (graph.plans)")
         self._plan_index = index
+        self._plan_pinned = True
         self._is_built = False
         return self
+
+    def deselect_workspace_greater_than(self, workspace_limit: int) -> "pygraph":
+        """Classic: exclude plans needing more than ``workspace_limit`` bytes.
+
+        Recorded here as well as forwarded, because a python plan's workspace is
+        known only to its CompiledPlan and the backend cannot filter it."""
+        self._workspace_limit = workspace_limit
+        if self._lowered_graph is not None:
+            self._lowered_graph.deselect_workspace_greater_than(workspace_limit)
+        return self
+
+    def deselect_engines(self, engine_names: List[str]) -> "pygraph":
+        """Classic: exclude plans whose name contains any of ``engine_names``.
+
+        Applies to the whole ranked list — a python engine name excludes that
+        engine exactly as a backend engine name excludes a backend plan."""
+        self._barred_names.update(engine_names)
+        if self._lowered_graph is not None:
+            self._lowered_graph.deselect_engines(list(engine_names))
+        if self._is_built and self._planning_done and self._plan_index in self._barred_indices():
+            self._is_built = False  # the built plan is no longer allowed to run
+        return self
+
+    def deselect_behavior_notes(self, notes: List[Any]) -> "pygraph":
+        """Classic: exclude plans carrying any of ``notes``."""
+        return self._filter_notes("behavior", notes, keep=False)
+
+    def select_behavior_notes(self, notes: List[Any]) -> "pygraph":
+        """Classic: keep only plans carrying ``notes``."""
+        return self._filter_notes("behavior", notes, keep=True)
+
+    def deselect_numeric_notes(self, notes: List[Any]) -> "pygraph":
+        """Classic: exclude plans carrying any of ``notes``."""
+        return self._filter_notes("numerical", notes, keep=False)
+
+    def select_numeric_notes(self, notes: List[Any]) -> "pygraph":
+        """Classic: keep only plans carrying ``notes``."""
+        return self._filter_notes("numerical", notes, keep=True)
+
+    def _filter_notes(self, kind: str, notes: List[Any], *, keep: bool) -> "pygraph":
+        """Record a note filter and forward it to the backend.
+
+        Recorded here as well as forwarded because a python plan's notes are
+        declared by its engine, not by the backend's engine config — without
+        this the four classic note filters silently skipped every python plan.
+        """
+        self._note_filters.extend((kind, note, keep) for note in notes)
+        # Only once the backend HAS plans: its filters mark indices into
+        # engine_configs (plans.h::filter_behavior_notes), so a filter forwarded
+        # while that list is empty marks nothing and is silently lost. Anything
+        # set earlier is replayed by _create_backend_plans().
+        if self._backend_has_plans():
+            getattr(self._lowered_graph, f"{'select' if keep else 'deselect'}_{'behavior' if kind == 'behavior' else 'numeric'}_notes")(list(notes))
+        if self._is_built and self._planning_done and self._plan_index in self._barred_indices():
+            self._is_built = False  # the built plan is no longer allowed to run
+        return self
+
+    def _backend_has_plans(self) -> bool:
+        """Whether the backend has anything for a note filter to mark. Its
+        filters index engine_configs, so one forwarded earlier marks nothing."""
+        return self._lowered_graph is not None and (self._cpp_plans_created or bool(self._lowered_graph.get_execution_plan_count()))
+
+    def _forward_note_filters(self) -> None:
+        """Push every recorded note filter at the backend. Idempotent — the C++
+        side ORs into barred_indices — so replaying is safe."""
+        for kind, note, keep in self._note_filters:
+            getattr(self._lowered_graph, f"{'select' if keep else 'deselect'}_{'behavior' if kind == 'behavior' else 'numeric'}_notes")([note])
+
+    def _notes_of(self, cfg: Any, kind: str) -> tuple:
+        """The declared notes of a python plan; () for a backend entry, whose
+        notes the backend owns and filters itself."""
+        eng = self._engine_for(cfg)
+        return tuple(getattr(eng, f"{kind}_notes", ()) or ()) if eng is not None else ()
 
     def _resolve_stream(self, handle: Any) -> Any:
         """Stream for a supplied handle (classic set_stream semantics). A failed
         query on a SUPPLIED handle is a correctness error and raises — never a
-        silent fall-back to another stream. No handle -> None (the engine must
-        resolve deterministically from its framework, e.g. torch current stream)."""
+        silent fall-back to another stream. No handle -> None (kernel wrappers
+        fall back to the default stream)."""
         if handle is None:
             return None
         import cudnn
@@ -918,57 +1227,209 @@ class pygraph:
         for ir_uid, cpp_t in self._cpp_tensors.items():
             cpp_uid = cpp_t.get_uid()
             if cpp_uid != ir_uid:
-                raise RuntimeError(f"uid ownership violated: IR tensor uid {ir_uid} lowered to C++ uid {cpp_uid} — a lowering path failed to push the uid")
+                raise AssertionError(f"uid ownership violated: IR tensor uid {ir_uid} lowered to C++ uid {cpp_uid} — a lowering path failed to push the uid")
 
-    def _lower_backend_plan(self) -> None:
-        """Lower to C++ (if not already) and create the backend plans (once)."""
-        import cudnn
+    def _lower_backend_graph(self) -> None:
+        """Lower to C++ and build its operation graph (once).
 
+        Kept separate from plan creation because the two failures mean different
+        things: a failure HERE is "the backend cannot represent this graph"
+        (a node it has no lowering for, a dtype/layout its descriptors reject),
+        which is a decline; a failure in plan creation is about engines."""
         if self._lowered_graph is None:
             self._lowered_graph = self._lower_to_cpp()
             self._lowered_graph.validate()
             self._verify_uid_ownership()
+            # Replay the plan filters: with a python engine registered nothing is
+            # lowered at build_operation_graph() time, so a deselect_* call made
+            # at that stage reached only pygraph.
+            if self._barred_names:
+                self._lowered_graph.deselect_engines(list(self._barred_names))
+            if self._workspace_limit is not None:
+                self._lowered_graph.deselect_workspace_greater_than(self._workspace_limit)
+
         if not self._cpp_bog_done:
             self._lowered_graph.build_operation_graph()
             self._cpp_bog_done = True
             self._sync_ir_shapes_from_backend()
+
+    def _create_backend_plans(self) -> None:
+        """Run the backend's heuristics for the lowered graph (once)."""
+        import cudnn
+
         if not self._cpp_plans_created:
             heur = self._backend_heuristics or [cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK]
             self._lowered_graph.create_execution_plans(heur)
             self._cpp_plans_created = True
+            self._forward_note_filters()  # deferred from _filter_notes(): the plans exist now
+
+    def _lower_backend_plan(self) -> None:
+        """Lower to C++ (if not already) and create the backend plans (once)."""
+        self._lower_backend_graph()
+        self._create_backend_plans()
+
+    def _check_plan_index(self, index: int) -> int:
+        """Reject an out-of-range index instead of letting python's negative
+        indexing quietly run the last plan."""
+        if not isinstance(index, int) or not 0 <= index < len(self._plans):
+            raise IndexError(f"plan index {index} out of range for {len(self._plans)} plan(s)")
+        return index
+
+    def _materialize_backend_plan(self, index: int):
+        """Ensure the backend entry at ``index`` has a real C++ plan index.
+
+        A replayed entry (``cpp_index=None``, from a custom Router or an
+        autotune result) does not exist in the backend's list until it is
+        appended. Every entry point that needs a concrete plan — check_support,
+        the build walk, workspace, behaviour notes, execute — goes through here,
+        so none of them can be reached with an entry the backend has never seen.
+        Returns the (possibly updated) PlanConfig."""
+        from .engines.base import PlanConfig
+
+        from .engines.engine_ids import BACKEND_HEURISTIC_ENGINE_ID
+
+        cfg = self._plans[index]
+        if cfg.cpp_index is not None or cfg.engine_id == BACKEND_HEURISTIC_ENGINE_ID:
+            return cfg  # already placed, or the delegating entry C++ owns
+        cfg = PlanConfig(cfg.engine_id, cfg.knobs, cpp_index=self._append_backend_plan(cfg.engine_id, cfg.knobs))
+        self._plans[index] = cfg
+        return cfg
+
+    def _append_backend_plan(self, engine_id: int, knobs: Any) -> int:
+        """Append one explicit ``(engine_id, knobs)`` plan to the BACKEND's list
+        and return the C++ index it landed at.
+
+        ``Graph::create_execution_plan`` appends (``enqueue_engine_configs`` ->
+        ``back_inserter``), and ``build_plans(HEURISTICS_CHOICE)`` short-circuits
+        once a candidate exists (plans.h), so the appended plan is neither built
+        nor selected by the plain calls. Everything downstream therefore has to
+        address it BY INDEX — which is why this returns one."""
+        self._lower_backend_graph()  # heuristics would only add plans nobody asked for
+        at = self._lowered_graph.get_execution_plan_count()
+        self._lowered_graph.create_execution_plan(engine_id, knobs or {})
+        self._forward_note_filters()  # an explicitly appended config is filterable too
+        return at
 
     def check_support(self) -> None:
-        """Check the selected plan's engine supports the graph.
+        """Check that the graph can be served.
 
         A python plan re-affirms its engine's check_support() (already passed
-        when the Router included it); a backend plan lowers and checks C++ support.
+        when it proposed the plan); a backend plan asks C++.
+
+        A decline from the SELECTED entry is only fatal when no other entry
+        could serve the graph. The backend's ``check_support()`` is aggregate —
+        it answers for the backend as a whole, not for one plan — so letting it
+        raise here would abort ``build()`` before the walk ever reached a python
+        entry that can run. Tolerating it and letting ``build_plans()`` walk is
+        what makes "backend first, python next" actually reachable; if nothing
+        builds, the walk raises with every failure listed.
         """
+        from .engines.router import decline_types
+
         eng = self.selected_engine
         if eng is not None:
             eng.check_support(self)
             return
-        if self._lowered_graph is None:
+        if self._plans and self._plans[self._plan_index].cpp_index is None:
+            self._materialize_backend_plan(self._plan_index)  # else C++ is asked about a plan it has never seen
+        elif self._lowered_graph is None:
             self._lower_backend_plan()
-        self._lowered_graph.check_support()
+        try:
+            self._lowered_graph.check_support()
+        except decline_types() as exc:
+            others = [i for i, cfg in enumerate(self._plans) if i != self._plan_index and self._engine_for(cfg) is not None]
+            if self._plan_pinned or not others:
+                raise
+            self._backend_declined = exc
+            _LOG.info("backend check_support declined the graph (%s); the plan walk still has %d python entr(y|ies)", exc, len(others))
 
-    def build_plans(self, *args) -> None:
-        """Finalize the selected plan. A python plan compiles HERE (once per
-        graph/plan; the CompiledPlan is cached on the graph and reused across
-        executions). The classic optional build_plan_policy passes through on
-        the backend path."""
-        eng = self.selected_engine
+    def build_plans(self, *args, ctx: Any = None, **kwargs) -> None:
+        """Walk the ranked plan list from the selected index and finalize the
+        first entry that builds.
+
+        One rule for both sides: look the entry's ``engine_id`` up, try to build
+        it, and on a decline move to the next entry. A python plan JIT-compiles
+        here (cached on the graph, reused across executions); a backend plan is
+        finalized by the backend. Only a decline
+        (``NotImplementedError`` / ``cudnnGraphNotSupportedError``) advances the
+        walk — any other exception is a bug in that engine and propagates.
+
+        An explicit ``select_plan(i)`` is strict: the walk starts at ``i``, and
+        both a decline there and that plan being barred raise rather than
+        silently running a different plan.
+        """
+        import cudnn
+
+        from .engines.router import decline_types
+
+        if not self._planning_done:
+            self.create_execution_plans()
+        # ALL means "build every entry" (autotune times each index afterwards);
+        # the default stops at the first that builds.
+        build_all = any(a == cudnn.build_plan_policy.ALL for a in args) or kwargs.get("policy") == cudnn.build_plan_policy.ALL
+        strict = self._plan_pinned
+        barred = self._barred_indices()  # once: resolving names can lower the backend
+        failures = []
+        for index in range(self._plan_index, len(self._plans)):
+            if index in barred:
+                if strict:  # select_plan and deselect_engines contradict each other
+                    raise ValueError(
+                        f"plan {index} ({self.get_plan_name_at_index(index)!r}) is pinned by select_plan() but "
+                        f"excluded by deselect_engines(); drop one of the two instructions"
+                    )
+                continue
+            try:
+                self._build_plan_at(index, *args, ctx=ctx, **kwargs)
+                if self._workspace_limit is not None and self._engine_for(self._plans[index]) is not None:
+                    need = self._compiled_plans[index].get_workspace_size()
+                    if need > self._workspace_limit:
+                        raise cudnn_graph_not_supported(f"needs {need} workspace bytes, over the {self._workspace_limit} limit")
+            except decline_types() as exc:
+                if strict:
+                    raise
+                failures.append(f"[{index}] {self.get_plan_name_at_index(index)}: {exc}")
+                _LOG.info("plan %d declined at build time (%s); trying the next entry", index, exc)
+                continue
+            if not build_all:
+                self._plan_index = index
+                self._is_built = True
+                return
+            if not self._is_built:  # ALL: the first success is still the selection
+                self._plan_index, self._is_built = index, True
+        if self._is_built:
+            return
+        if self._backend_declined is not None and not failures:
+            raise self._backend_declined  # nothing else ran: the backend's failure IS the answer
+        raise cudnn_graph_not_supported("no plan in the list could be built:\n  " + "\n  ".join(failures or ["the plan list is empty"]))
+
+    def _build_plan_at(self, index: int, *args, ctx: Any = None, **kwargs) -> None:
+        """Build one entry — the single place the two sides diverge.
+
+        ``ctx`` is the caller's ExecutionContext when the build was triggered
+        from ``execute(..., handle=...)``: a JIT engine compiles for the device
+        and stream it will actually run on, so the handle must reach it here and
+        not be replaced by the graph's own."""
+        cfg = self._plans[index]
+        eng = self._engine_for(cfg)
         if eng is not None:
-            if self._plan_index not in self._compiled_plans:
-                self._compiled_plans[self._plan_index] = eng.build_plan(self, self._selected_plan_config, self._build_context())
-        if eng is None:
-            if self._lowered_graph is None or not self._cpp_plans_created:
-                self._lower_backend_plan()
-            self._lowered_graph.build_plans(*args)
-        self._is_built = True
+            if index not in self._compiled_plans:
+                self._compiled_plans[index] = eng.build_plan(self, cfg, ctx or self._build_context())
+            return
+        cfg = self._materialize_backend_plan(index)
+        if cfg.cpp_index is None:  # delegating entry: the backend picks
+            self._lower_backend_plan()
+            self._lowered_graph.build_plans(*args, **kwargs)
+        else:
+            self._lower_backend_plan()
+            self._lowered_graph.build_plan_at_index(cfg.cpp_index)
 
-    def build(self, heuristics: Optional[List] = None) -> None:
+    def build(self, heuristics: Optional[List] = None, ctx: Any = None) -> None:
         """Convenience: validate -> build_operation_graph -> create_execution_plans
-        -> check_support -> build_plans, in sequence."""
+        -> check_support -> build_plans, in sequence.
+
+        ``ctx`` is forwarded to whichever plan the walk builds, so an auto-build
+        triggered from ``execute(..., handle=...)`` compiles for the caller's
+        device and stream."""
         if not self._is_validated:
             self.validate()
 
@@ -976,7 +1437,7 @@ class pygraph:
         if not self._planning_done:  # never silently re-plan: preserves select_plan()
             self.create_execution_plans(heuristics)
         self.check_support()
-        self.build_plans()
+        self.build_plans(ctx=ctx)
 
     def get_workspace_size(self, *args, **kwargs) -> int:
         """Workspace bytes for the selected plan. Classic overloads (handle /
@@ -985,11 +1446,194 @@ class pygraph:
             raise RuntimeError("Call build() first")
 
         if self.selected_engine is not None:
-            if args or kwargs:
-                raise NotImplementedError("dynamic workspace-query overrides are not supported by python plans")
+            # Classic overloads (handle, override_uids/shapes/strides) describe
+            # the problem, and CompiledPlan.get_workspace_size() takes none of
+            # them: a compiled python plan's workspace is a property of the plan.
+            # A shape-dependent one would have to say so through that API.
             return self._compiled_plans[self._plan_index].get_workspace_size()
 
+        # Same reason execute() addresses by index; classic overloads pass through.
+        cfg = self._materialize_backend_plan(self._plan_index) if self._plans else None
+        if not args and not kwargs and cfg is not None and cfg.cpp_index is not None:
+            return self._lowered_graph.get_workspace_size_plan_at_index(cfg.cpp_index)
         return self._lowered_graph.get_workspace_size(*args, **kwargs)
+
+    def get_workspace_size_plan_at_index(self, index: int, *args, **kwargs) -> int:
+        """Workspace bytes for the plan at ``index`` in the ranked list."""
+        if not self._planning_done:  # e.g. a deserialized graph: C++ owns the list
+            return self._lowered_graph.get_workspace_size_plan_at_index(index, *args, **kwargs)
+        self._reject_if_barred(self._check_plan_index(index))
+        cfg = self._plans[index]
+        if self._engine_for(cfg) is not None:
+            # Overload args accepted and not consulted — see get_workspace_size().
+            if index not in self._compiled_plans:
+                self._build_plan_at(index)
+            return self._compiled_plans[index].get_workspace_size()
+        cfg = self._materialize_backend_plan(index)
+        if cfg.cpp_index is None:  # delegating entry
+            return self._lowered_graph.get_workspace_size(*args, **kwargs)
+        return self._lowered_graph.get_workspace_size_plan_at_index(cfg.cpp_index, *args, **kwargs)
+
+    def _reject_if_barred(self, index: int) -> None:
+        """The ranked list is never filtered (indices stay stable), so every
+        path that reaches a plan BY INDEX has to apply the exclusions itself."""
+        if index in self._barred_indices():
+            raise ValueError(f"plan {index} ({self.get_plan_name_at_index(index)!r}) is excluded by deselect_engines()/a note filter")
+
+    def build_plan_at_index(self, index: int) -> "pygraph":
+        """Build the plan at ``index`` and select it.
+
+        Selecting is what makes the autotune idiom work: build index i, then
+        get_workspace_size()/execute() refer to i rather than to whatever the
+        walk last settled on."""
+        if not self._planning_done:
+            return self._lowered_graph.build_plan_at_index(index)
+        self._check_plan_index(index)
+        self._reject_if_barred(index)
+        self._build_plan_at(index)
+        if self._workspace_limit is not None and self._engine_for(self._plans[index]) is not None:
+            need = self._compiled_plans[index].get_workspace_size()
+            if need > self._workspace_limit:
+                raise cudnn_graph_not_supported(f"plan {index} needs {need} workspace bytes, over the {self._workspace_limit} limit")
+        self._plan_index, self._is_built = index, True
+        return self
+
+    def get_engine_and_knobs_at_index(self, index: int):
+        """The ``(engine_id, knobs)`` of the plan at ``index`` in the ranked list.
+
+        Answered from the unified list, NOT forwarded to C++ with a unified
+        index — that would report the backend's entry for a python plan's slot.
+        The pair is what ``create_execution_plan()`` replays, so it must name the
+        same engine the caller just looked at."""
+        from .engines.engine_ids import BACKEND_HEURISTIC_ENGINE_ID
+
+        if not self._planning_done:
+            return self._lowered_graph.get_engine_and_knobs_at_index(index)
+        cfg = self._plans[self._check_plan_index(index)]
+        if cfg.engine_id == BACKEND_HEURISTIC_ENGINE_ID:
+            raise NotImplementedError(
+                f"plan {index} delegates to the backend's own choice among candidates it does not expose "
+                f"as plans (heur_mode.OPENSOURCE); there is no (engine_id, knobs) pair to replay"
+            )
+        return (cfg.engine_id, cfg.knobs)
+
+    def get_behavior_notes_for_plan_at_index(self, index: int, *args, **kwargs):
+        """Classic backend behaviour notes for the plan at ``index``.
+
+        Backend-only by construction: a python plan has no ``BehaviorNote_t``.
+        Saying so is better than forwarding the index and returning some other
+        plan's notes."""
+        if not self._planning_done:
+            return self._lowered_graph.get_behavior_notes_for_plan_at_index(index, *args, **kwargs)
+        cfg = self._plans[self._check_plan_index(index)]
+        if self._engine_for(cfg) is not None:
+            return list(self._notes_of(cfg, "behavior"))
+        cfg = self._materialize_backend_plan(index)
+        if cfg.cpp_index is None:
+            raise NotImplementedError(f"plan {index} delegates to the backend's own choice and has no position in its plan list")
+        return self._lowered_graph.get_behavior_notes_for_plan_at_index(cfg.cpp_index, *args, **kwargs)
+
+    def get_behavior_notes(self, *args, **kwargs):
+        """Classic behaviour notes for the SELECTED plan — backend-only, for the
+        same reason as the at-index query."""
+        eng = self.selected_engine
+        if eng is not None:
+            return list(self._notes_of(self._selected_plan_config, "behavior"))
+        if not self._planning_done:  # e.g. a deserialized graph: C++ owns the built plan
+            return self._lowered_graph.get_behavior_notes(*args, **kwargs)
+        self._lower_backend_plan()
+        return self._lowered_graph.get_behavior_notes(*args, **kwargs)
+
+    def populate_cuda_graph(self, *args, **kwargs):
+        """Classic CUDA-graph capture — the backend's, so a python plan declines.
+
+        Capture itself is not the obstacle (the python engines run on the
+        execute-time handle's stream); this API records the BACKEND's plan."""
+        return self._cuda_graph_call("populate_cuda_graph", *args, **kwargs)
+
+    def update_cuda_graph(self, *args, **kwargs):
+        """Classic CUDA-graph update — backend plans only, as above."""
+        return self._cuda_graph_call("update_cuda_graph", *args, **kwargs)
+
+    def _cuda_graph_call(self, name: str, *args, **kwargs):
+        eng = self.selected_engine
+        if eng is not None:
+            raise cudnn_graph_not_supported(f"{name}() records a cuDNN backend plan; the selected plan is served by the python engine {eng.name!r}")
+        if self._planning_done:
+            self._lower_backend_plan()
+        return getattr(self._lowered_graph, name)(*args, **kwargs)
+
+    def key(self, *args, **kwargs):
+        """Classic cache key. The backend computes it, so the graph must lower —
+        and it does NOT yet distinguish which python engine serves the graph."""
+        if self._lowered_graph is None:  # a deserialized graph already has one, and no op tree to rebuild
+            node = self._unlowerable_node()
+            if node is not None:
+                raise cudnn_graph_not_supported(f"key() is the cuDNN backend's cache key; {node.node_type.name} has no backend lowering")
+            if not self._is_validated:
+                self.validate()  # lowering freezes the IR; validate() is what infers into it first
+            self._lower_backend_graph()
+        return self._lowered_graph.key(*args, **kwargs)
+
+    def create_execution_plan(self, engine_id: int, knobs: Any = None) -> "pygraph":
+        """APPEND one plan for an explicit ``(engine_id, knobs)`` to the ranked list.
+
+        This is the deterministic-replay entry point: an autotune result or a
+        perf sweep records ``(engine_id, knobs)`` and rebuilds exactly that plan
+        later. It appends to ``graph.plans``, so the classic idiom
+        ``create_execution_plan(...)`` then ``get_execution_plan_count() - 1``
+        addresses the plan just added — for a python engine id as well as a
+        backend one, which is the whole point of one id space.
+        """
+        from .engines.base import PlanConfig
+        from .engines.engine_ids import is_python_engine
+
+        if not self._is_validated:
+            self.validate()
+        if is_python_engine(engine_id):
+            owners = self._owners_for_id(engine_id)
+            if not owners:
+                raise ValueError(f"no python engine on this graph owns engine_id {engine_id}")
+            if len(owners) > 1:
+                raise ValueError(f"engine_id {engine_id} is owned by {[e.name for e in owners]} — ambiguous dispatch")
+            entry = PlanConfig(engine_id, knobs)
+        else:
+            entry = PlanConfig(engine_id, knobs, cpp_index=self._append_backend_plan(engine_id, knobs))
+        self._plans = list(self._plans) + [entry]
+        self._planning_done = True
+        # Same contract as create_execution_plans(): a plan refers to the graph
+        # as it is now, so the graph stops accepting nodes. Without this a
+        # replay on a fresh graph left it mutable while _is_built said the plan
+        # was ready, and a node added afterwards silently diverged from it.
+        self._freeze()
+        return self
+
+    def execute_plan_at_index(self, tensor_dict, workspace=None, index: int = 0, handle=None, *args, **kwargs) -> None:
+        """Execute the plan at ``index`` in the ranked list (classic at-index API)."""
+        if not self._planning_done:  # e.g. a deserialized graph: C++ owns the list
+            uid_to_data = self._uid_to_data(tensor_dict)
+            var_pack, ws_ptr = self._native_var_pack(uid_to_data, workspace)
+            return self._lowered_graph._execute_plan_at_index(var_pack, ws_ptr, index, handle, *args, **kwargs)
+        self._reject_if_barred(self._check_plan_index(index))
+        cfg = self._plans[index]
+        if self._engine_for(cfg) is not None:
+            keep_index, keep_pin, keep_built = self._plan_index, self._plan_pinned, self._is_built
+            try:
+                self._plan_index, self._plan_pinned = index, True
+                if index not in self._compiled_plans:
+                    self._build_plan_at(index, ctx=self._build_context(handle) if handle is not None else None)
+                self._is_built = True
+                self.execute(tensor_dict, workspace, handle, *args, **kwargs)
+            finally:
+                self._plan_index, self._plan_pinned, self._is_built = keep_index, keep_pin, keep_built
+            return
+        cfg = self._materialize_backend_plan(index)
+        uid_to_data = self._uid_to_data(tensor_dict)
+        var_pack, ws_ptr = self._native_var_pack(uid_to_data, workspace)
+        if cfg.cpp_index is None:  # delegating entry
+            self._lowered_graph._execute(var_pack, ws_ptr, handle, *args, **kwargs)
+            return
+        self._lowered_graph._execute_plan_at_index(var_pack, ws_ptr, cfg.cpp_index, handle, *args, **kwargs)
 
     def execute(
         self,
@@ -1009,37 +1653,20 @@ class pygraph:
         Args:
             tensor_dict: Dict mapping tensors (by Tensor, name, or uid) to data.
                          Must include both input and output tensors.
-            workspace: Workspace buffer (ignored by python engines)
-            handle: cuDNN handle (ignored by python engines)
+            workspace: Workspace buffer (python engines receive it via the
+                       ExecutionContext; plans that need one require it)
+            handle: cuDNN handle; kernels launch on its stream (classic
+                    ``set_stream`` semantics, both python engines and backend)
             override_uids/shapes/strides: dynamic-shape overrides (backend path)
         """
+        # A JIT engine must compile for the device/stream it will run on.
+        caller_ctx = self._build_context(handle) if handle is not None else None
         if not self._is_built:
-            # Auto-build. When a python plan will run and the caller supplied a
-            # handle HERE, the JIT compile must see it — plan first, then let
-            # the python branch below compile with the caller's context instead
-            # of running the generic build (which only knows the graph handle).
             if not self._planning_done:
                 self.create_execution_plans()
-            if self.selected_engine is None:
-                self.build()
+            self.build(ctx=caller_ctx)
 
-        # Start with auto-bound inputs, then overlay user-provided (user wins)
-        uid_to_data = dict(self._data_bindings)
-        for key, data in tensor_dict.items():
-            if key is None:
-                continue  # classic API tolerates None keys (optional tensors)
-            if isinstance(key, Tensor):
-                uid = key.uid
-            elif isinstance(key, str):
-                if key in self._ambiguous_names:
-                    raise ValueError(f"tensor name {key!r} is ambiguous (duplicate labels); key the variant pack by uid or Tensor")
-                uid = self._tensors[key].uid
-            elif isinstance(key, int):
-                uid = key
-            else:  # a lowered C++ tensor (advanced/interop) — trust its uid
-                uid = key.get_uid()
-            uid_to_data[uid] = data
-
+        uid_to_data = self._uid_to_data(tensor_dict)
         eng = self.selected_engine
         if eng is not None:  # python engine (plan id in the reserved region)
             from .engines.base import ExecutionContext
@@ -1061,9 +1688,38 @@ class pygraph:
             self._compiled_plans[self._plan_index].execute(self, uid_to_data, ctx)
             return
 
-        # cuDNN execution path (plan id < PYTHON_ENGINE_ID_BASE). Variant-pack
-        # keys are IR uids — identical to the C++ uids by construction (the IR
-        # owns the uid namespace and lowering pushes every uid explicitly).
+        # Backend path. Variant-pack keys are IR uids == the C++ uids by
+        # construction. Address the plan the WALK built, not the backend's own
+        # selection: they differ once the walk has skipped an entry.
+        var_pack, ws_ptr = self._native_var_pack(uid_to_data, workspace)
+        cfg = self._materialize_backend_plan(self._plan_index) if self._plans else None
+        if cfg is not None and cfg.cpp_index is not None:
+            self._lowered_graph._execute_plan_at_index(var_pack, ws_ptr, cfg.cpp_index, handle, override_uids, override_shapes, override_strides)
+            return
+        self._lowered_graph._execute(var_pack, ws_ptr, handle, override_uids, override_shapes, override_strides)
+
+    def _uid_to_data(self, tensor_dict) -> Dict[int, Any]:
+        """Normalize a variant pack keyed by Tensor / name / uid to uid -> data,
+        starting from the graph's auto-bound inputs (user keys win)."""
+        uid_to_data = dict(self._data_bindings)
+        for key, data in tensor_dict.items():
+            if key is None:
+                continue  # classic API tolerates None keys (optional tensors)
+            if isinstance(key, Tensor):
+                uid = key.uid
+            elif isinstance(key, str):
+                if key in self._ambiguous_names:
+                    raise ValueError(f"tensor name {key!r} is ambiguous (duplicate labels); key the variant pack by uid or Tensor")
+                uid = self._tensors[key].uid
+            elif isinstance(key, int):
+                uid = key
+            else:  # a lowered C++ tensor (advanced/interop) — trust its uid
+                uid = key.get_uid()
+            uid_to_data[uid] = data
+        return uid_to_data
+
+    def _native_var_pack(self, uid_to_data: Dict[int, Any], workspace: Any):
+        """uid -> device pointer, plus the workspace pointer, for the backend."""
         from .datatypes import _is_torch_tensor
 
         def _ptr(d):
@@ -1075,9 +1731,7 @@ class pygraph:
 
             return cudnn._pybind_module._get_data_ptr(d)  # dlpack fallback
 
-        var_pack = {uid: _ptr(d) for uid, d in uid_to_data.items()}
-        ws_ptr = _ptr(workspace) if workspace is not None else 0
-        self._lowered_graph._execute(var_pack, ws_ptr, handle, override_uids, override_shapes, override_strides)
+        return {uid: _ptr(d) for uid, d in uid_to_data.items()}, (_ptr(workspace) if workspace is not None else 0)
 
     def __getattr__(self, name: str):
         # Plan-configuration and query methods (deselect_engines,
@@ -1316,6 +1970,12 @@ class pygraph:
                 # kwargs, so lowering is kwargs assembly + one call + zipping
                 # the returned tuple with the declared output ports.
                 method, spec = _STRUCTURED_BY_TYPE[node.node_type]
+                if spec.get("python_only"):
+                    raise cudnn.cudnnGraphNotSupportedError(
+                        f"[cudnn_frontend] Error: No valid engine configs for {method.upper()}: "
+                        f"{method} has no cuDNN backend lowering; register a python engine "
+                        f"(e.g. cudnn.engines.GdnCuTileEngine)"
+                    )
                 kw = {"name": node.name}
                 if not spec.get("no_cdt") and node.compute_data_type is not None:
                     kw["compute_data_type"] = _library_type(node.compute_data_type)
@@ -1489,6 +2149,31 @@ def _moe_bwd_dweight_dims(node):
     return [fto[0], tok[-1], do[-1]]  # [E, H, N]
 
 
+def _linear_attention_final_state_dims(node):
+    # [N, HO, K, V]: N sequences (cu_seqlens carries N+1 boundaries), HO =
+    # max(q, v) heads — the recurrent state lives at the gate heads
+    q, v = node.inputs["q"].dim, node.inputs["v"].dim
+    cu = node.inputs.get("cu_seqlens")
+    if cu is None or not cu.dim:
+        return None
+    return [cu.dim[0] - 1, max(q[1], v[1]), q[2], v[2]]
+
+
+def _linear_attention_h_dims(node):
+    # [total_h, HO, K, V] at capacity: sum_b (sl_b - 1) // N <= total_T // N
+    n = int(node.params.get("checkpoint_every_n_tokens", 0) or 0)
+    q, v = node.inputs["q"].dim, node.inputs["v"].dim
+    if not n or not q or not v:
+        return None
+    return [max(v[0] // n, 1), max(q[1], v[1]), q[2], v[2]]
+
+
+def _linear_attention_o_dims(node):
+    # [total_T, HO, V]: the output lives at the gate heads (HO = max(q, v))
+    q, v = node.inputs["q"].dim, node.inputs["v"].dim
+    return [v[0], max(q[1], v[1]), v[2]]
+
+
 def _block_quant_scale_dims(node):
     d = list(node.inputs["input"].dim)
     bs = node.params.get("block_size")
@@ -1625,7 +2310,7 @@ _STRUCTURED_OPS = {
     ),
     "block_scale_quantize": dict(
         node_type=NodeType.BLOCK_SCALE_QUANTIZE,
-        inputs=("input",),
+        inputs=("input", "group_offset"),
         attrs=("block_size", "axis", "transpose"),
         outputs=("Y", "scale"),
         infer={"Y": _like("input"), "scale": _block_quant_scale_dims},
@@ -1643,6 +2328,78 @@ _STRUCTURED_OPS = {
         outputs=("dweight",),
         infer={"dweight": _moe_bwd_dweight_dims},
         push_output_dims=True,
+    ),
+    # ---- linear attention ----------------------------------------------------
+    "gdn": dict(
+        node_type=NodeType.GDN,
+        inputs=("q", "k", "v", "g", "beta", "cu_seqlens", "initial_state"),
+        attrs=("scale", "output_final_state", "use_qk_l2norm", "checkpoint_every_n_tokens"),
+        outputs=("O", "final_state", "H"),
+        maybe={
+            "final_state": lambda n: bool(n.params.get("output_final_state", False)),
+            "H": lambda n: bool(n.params.get("checkpoint_every_n_tokens") or 0),
+        },
+        infer={"O": _linear_attention_o_dims, "final_state": _linear_attention_final_state_dims, "H": _linear_attention_h_dims},
+        python_only=True,
+    ),
+    "gdn_bwd": dict(
+        node_type=NodeType.GDN_BWD,
+        inputs=("q", "k", "v", "g", "beta", "cu_seqlens", "dO", "h", "initial_state", "d_final_state"),
+        attrs=("scale", "use_qk_l2norm"),
+        outputs=("dQ", "dK", "dV", "dG", "dBeta", "d_initial_state"),
+        maybe={"d_initial_state": lambda n: "initial_state" in n.inputs},
+        infer={"dQ": _like("q"), "dK": _like("k"), "dV": _like("v"), "dG": _like("g"), "dBeta": _like("beta"), "d_initial_state": _like("initial_state")},
+        python_only=True,
+    ),
+    "kda": dict(
+        node_type=NodeType.KDA,
+        inputs=("q", "k", "v", "g", "beta", "cu_seqlens", "initial_state", "a_log", "dt_bias"),
+        attrs=("scale", "output_final_state", "use_qk_l2norm", "checkpoint_every_n_tokens", "use_beta_sigmoid", "safe_gate", "gate_lower_bound"),
+        outputs=("O", "final_state", "H"),
+        maybe={
+            "final_state": lambda n: bool(n.params.get("output_final_state", False)),
+            "H": lambda n: bool(n.params.get("checkpoint_every_n_tokens") or 0),
+        },
+        infer={"O": _like("v"), "final_state": _linear_attention_final_state_dims, "H": _linear_attention_h_dims},
+        python_only=True,
+    ),
+    "kda_bwd": dict(
+        node_type=NodeType.KDA_BWD,
+        inputs=("q", "k", "v", "g", "beta", "cu_seqlens", "dO", "h", "initial_state", "d_final_state"),
+        attrs=("scale", "use_qk_l2norm"),
+        outputs=("dQ", "dK", "dV", "dG", "dBeta", "d_initial_state"),
+        maybe={"d_initial_state": lambda n: "initial_state" in n.inputs},
+        infer={"dQ": _like("q"), "dK": _like("k"), "dV": _like("v"), "dG": _like("g"), "dBeta": _like("beta"), "d_initial_state": _like("initial_state")},
+        python_only=True,
+    ),
+    "gdn2": dict(
+        node_type=NodeType.GDN2,
+        inputs=("q", "k", "v", "g", "beta", "w", "cu_seqlens", "initial_state"),
+        attrs=("scale", "output_final_state", "use_qk_l2norm", "checkpoint_every_n_tokens", "use_beta_w_sigmoid"),
+        outputs=("O", "final_state", "H"),
+        maybe={
+            "final_state": lambda n: bool(n.params.get("output_final_state", False)),
+            "H": lambda n: bool(n.params.get("checkpoint_every_n_tokens") or 0),
+        },
+        infer={"O": _like("v"), "final_state": _linear_attention_final_state_dims, "H": _linear_attention_h_dims},
+        python_only=True,
+    ),
+    "gdn2_bwd": dict(
+        node_type=NodeType.GDN2_BWD,
+        inputs=("q", "k", "v", "g", "beta", "w", "cu_seqlens", "dO", "h", "initial_state", "d_final_state"),
+        attrs=("scale",),
+        outputs=("dQ", "dK", "dV", "dG", "dBeta", "dW", "d_initial_state"),
+        maybe={"d_initial_state": lambda n: "initial_state" in n.inputs},
+        infer={
+            "dQ": _like("q"),
+            "dK": _like("k"),
+            "dV": _like("v"),
+            "dG": _like("g"),
+            "dBeta": _like("beta"),
+            "dW": _like("w"),
+            "d_initial_state": _like("initial_state"),
+        },
+        python_only=True,
     ),
     # ---- convolution ---------------------------------------------------------
     "conv_fprop": dict(

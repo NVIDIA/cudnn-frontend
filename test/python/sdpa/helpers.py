@@ -8,6 +8,25 @@ import time
 
 # fmt: off
 
+def note_frost_routing(graph, label="graph"):
+    """Tally which engine serves this built graph ("frost:<engine>" vs
+    "native:<label>") in frost_routing.
+
+    Which entry of the ranked plan list runs resolves at build_plans(), so call
+    this AFTER it: graph.selected_engine is the python engine that serves the
+    graph, or None for the cuDNN backend. conftest.py prints the aggregate at
+    the end of the run so the FROST-vs-native split stays visible while ops
+    transition to FROST.
+    """
+    import frost_routing
+
+    engine = getattr(graph, "selected_engine", None)
+    if engine is not None:
+        print(f"@@@@ {label} graph: python engine '{engine.name}' serves this graph")
+        frost_routing.note(f"frost:{engine.name}")
+    else:
+        frost_routing.note(f"native:{label}")
+
 def fill_sparse_small_int(tensor, rng, sparsity=0.8, abs_max=2):
     """
     Fill tensor with sparse small integers for better low-precision testing.

@@ -21,6 +21,7 @@ from .helpers import (
     time_execution_cupti,
     profile_execution,
     print_tensor_stats,
+    note_frost_routing,
 )
 
 # fmt: off
@@ -382,6 +383,9 @@ def create_forward_graph(cfg, tensors, cudnn_handle):
         graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
         graph.check_support()
         graph.build_plans()
+        # FROST auto-selection resolved at build_plans (first eligible engine,
+        # native fallback on build failure); tally the outcome.
+        note_frost_routing(graph, label="fp16-fwd")
     except cudnn.cudnnGraphNotSupportedError as e:
         print(f"@@@@ Overall result: WAIVED, not supported forward graph. {e}")
         pytest.skip("not supported forward graph")
@@ -530,6 +534,7 @@ def create_backward_graph(cfg, tensors, cudnn_handle, max_t_q, max_t_kv):
         graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
         graph.check_support()
         graph.build_plans()
+        note_frost_routing(graph, label="fp16-bwd")
     except cudnn.cudnnGraphNotSupportedError as e:
         print(f"@@@@ Overall result: WAIVED, not supported backward graph. {e}")
         pytest.skip("not supported backward graph")

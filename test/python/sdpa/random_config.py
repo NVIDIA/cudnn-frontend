@@ -509,8 +509,13 @@ class RandomSequenceLength:
         s_kv_max: int,
         s_q_distribution: dict[Any, int],
     ):
-        # Cap sequence lengths at 1024 on SM80 (Ampere) to avoid OOMs for CI/CD.
-        if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 8:
+        # Cap sequence lengths at 1024 on SM80 (Ampere) and on small-memory GPUs
+        # to avoid OOMs for CI/CD. A 4k bwd config holds >12 GiB, which starves
+        # sibling pytest-xdist workers on e.g. the 16 GiB RTX 5080 sm120 runner;
+        # the cap keys on device memory, not arch, so big Blackwells stay at 4k.
+        if torch.cuda.is_available() and (
+            torch.cuda.get_device_capability()[0] == 8 or torch.cuda.get_device_properties(0).total_memory < 20 * 2**30
+        ):
             s_q_max = min(s_q_max, 1024)
             s_kv_max = min(s_kv_max, 1024)
             s_q_min = min(s_q_min, s_q_max)
