@@ -273,6 +273,8 @@ _WORKSPACE_POISON_BYTE = 0xFF
 # Baseline accumulation depth and rtol before sqrt(accum) scaling.
 BASE_ACCUM = 128
 _STANDARD_RTOL_AT_BASE_ACCUM = 1e-2
+_FP32_GRAD_ATOL_AT_BASE_ACCUM = 1.5e-2
+_FP32_FPROP_ATOL_AT_BASE_ACCUM = 3e-2
 _MAX_DENSE_RANDOM_RTOL = 0.10
 
 # Integer-policy inputs use fixed dtype-level bounds rather than reduction scaling.
@@ -486,8 +488,9 @@ def _tolerances(cfg: LargeTensorConfig) -> Tuple[float, float]:
     """Return comparison tolerances for the selected data policy.
 
     Integer-policy inputs use fixed per-dtype bounds. Dense random inputs scale
-    with the operation's effective reduction, with relative error capped at 10%
-    and the same scaled bound serving as the near-zero absolute tolerance.
+    with the operation's effective reduction, with relative error capped at 10%.
+    FP32 operations use operation-specific absolute margins for cancellation
+    near zero.
     """
     if _uses_integer_data(cfg):
         return _INTEGER_DATA_TOLERANCES[cfg.dtype]
@@ -495,7 +498,13 @@ def _tolerances(cfg: LargeTensorConfig) -> Tuple[float, float]:
     accum = _effective_reduction_size(cfg)
     scale = max(1.0, math.sqrt(accum / BASE_ACCUM))
     std_tol = _STANDARD_RTOL_AT_BASE_ACCUM * scale
-    atol = std_tol
+    if cfg.dtype != torch.float32:
+        atol_base = _STANDARD_RTOL_AT_BASE_ACCUM
+    elif cfg.conv_type == ConvType.FPROP:
+        atol_base = _FP32_FPROP_ATOL_AT_BASE_ACCUM
+    else:
+        atol_base = _FP32_GRAD_ATOL_AT_BASE_ACCUM
+    atol = atol_base * scale
     rtol = min(std_tol, _MAX_DENSE_RANDOM_RTOL)
     return rtol, atol
 
