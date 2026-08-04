@@ -316,6 +316,10 @@ def test_dsl_sm100_execute_sink_lse_contract():
         api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=lse)
     with pytest.raises(ValueError, match="lse_tensor is required"):
         api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, sinks=sink)
+    # Sinks are consumed as fp32 directly — no implicit cast (which would
+    # allocate and launch a kernel on the execute hot path).
+    with pytest.raises(ValueError, match="sinks must be float32"):
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=lse, sinks=sink.to(torch.bfloat16))
 
     api = SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, is_causal=True)
     assert api.check_support()

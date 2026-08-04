@@ -724,6 +724,10 @@ def test_dsl_sm120_execute_contract_mismatches():
         api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=lse)
     with pytest.raises(ValueError, match="lse_tensor is required"):
         api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, sinks=sinks)
+    # Sinks are consumed as fp32 directly — no implicit cast (which would
+    # allocate and launch a kernel on the execute hot path).
+    with pytest.raises(ValueError, match="sinks must be float32"):
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=lse, sinks=sinks.to(torch.bfloat16))
 
     # Compiled WITHOUT sink or LSE: providing either is rejected, and the
     # matching call runs with no LSE buffer anywhere (store compiled out).

@@ -312,12 +312,25 @@ class SdpaFwdDsl(APIBase):
         return lse_tensor.view(self.batch_size, self.h_q, self.s_q_max)
 
     def _checked_sinks_1d(self, sinks: torch.Tensor) -> torch.Tensor:
-        """Validate caller-provided sink logits and return the kernel's (H_q,) fp32 view."""
+        """Validate caller-provided sink logits and return the kernel's (H_q,) fp32 view.
+
+        Strictly a view: the kernels consume fp32 sinks directly, and an
+        implicit ``.to(float32)`` here would allocate and launch a cast kernel
+        on the execute hot path (and break CUDA-graph pointer stability).
+        """
+        self._value_error_if(
+            sinks.dtype != torch.float32,
+            f"sinks must be float32; got {sinks.dtype}",
+        )
         self._value_error_if(
             sinks.numel() != self.h_q,
             f"sinks must have H_q = {self.h_q} elements; got {sinks.numel()}",
         )
-        return sinks.reshape(-1).to(torch.float32)
+        self._value_error_if(
+            not sinks.is_contiguous(),
+            "sinks must be contiguous (bound to the kernel as a flat (H_q,) view)",
+        )
+        return sinks.reshape(-1)
 
     @abstractmethod
     def scratch_workspace_bytes(self) -> int:
@@ -930,7 +943,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         else:
             LSE = torch.zeros(1, qh, t_q, dtype=torch.float32, device=dev)
         if sinks is not None:
-            sinks_t = sinks.reshape(-1).to(torch.float32)
+            sinks_t = self._checked_sinks_1d(sinks)
         elif carver is not None:
             sinks_t = carver.take(qh, torch.float32)
             sinks_t.zero_()
@@ -1013,9 +1026,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
 
         lse = lse_tensor.reshape(b, h_q, sq)
         sinks_t = (
-            sinks.reshape(-1).to(torch.float32)
-            if sinks is not None
-            else self._dummy("sinks", device, lambda: torch.zeros(h_q, dtype=torch.float32, device=device))
+            self._checked_sinks_1d(sinks) if sinks is not None else self._dummy("sinks", device, lambda: torch.zeros(h_q, dtype=torch.float32, device=device))
         )
         seq_kv_t = (
             seq_kv_lens.reshape(-1).to(torch.int32)
@@ -1103,9 +1114,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
 
         lse = lse_tensor.reshape(b, h_q, sq)
         sinks_t = (
-            sinks.reshape(-1).to(torch.float32)
-            if sinks is not None
-            else self._dummy("sinks", device, lambda: torch.zeros(h_q, dtype=torch.float32, device=device))
+            self._checked_sinks_1d(sinks) if sinks is not None else self._dummy("sinks", device, lambda: torch.zeros(h_q, dtype=torch.float32, device=device))
         )
         seq_kv_t = (
             seq_kv_lens.reshape(-1).to(torch.int32)

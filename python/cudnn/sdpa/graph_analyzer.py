@@ -355,6 +355,12 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         sink_dim = tuple(sink_token.get_dim())
         if sink_dim != (1, h_q, 1, 1):
             return _invalid(f"sink_token must be (1, H_q, 1, 1); got {sink_dim}")
+        # The kernels consume fp32 sink logits directly; there is no implicit
+        # conversion anywhere on the execute path (it would allocate and
+        # launch a cast kernel).
+        sink_dtype = _DTYPE_FROM_CUDNN.get(sink_token.get_data_type())
+        if sink_dtype != torch.float32:
+            return _invalid(f"sink_token must be float32; got {sink_dtype}")
 
     generate_stats = rec.get("generate_stats")
     is_inference = rec.get("is_inference")

@@ -323,6 +323,20 @@ def test_probe_rejects_bad_sink_shape():
     assert not _eligible(g)
 
 
+def test_probe_rejects_non_fp32_sink():
+    """The kernels consume fp32 sink logits directly — no implicit cast anywhere
+    on the execute path — so a non-fp32 sink token is ineligible up front."""
+    g = _mk_graph()
+    q, k, v, dims, strides = _mk_qkv(g)
+    bad_sink = g.tensor(dim=(1, H, 1, 1), stride=(H, 1, 1, 1), data_type=cudnn.data_type.BFLOAT16, name="bf16sink")
+    try:
+        o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True, sink_token=bad_sink)
+    except TypeError:
+        pytest.skip("this cuDNN wheel's sdpa() binding predates sink_token")
+    _finish_output(o, dims, strides)
+    assert not _eligible(g)
+
+
 def test_resolve_causal_plus_swa():
     g = _mk_graph()
     q, k, v, dims, strides = _mk_qkv(g)
