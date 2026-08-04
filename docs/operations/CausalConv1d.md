@@ -10,8 +10,8 @@ Supports forward and backward passes with `torch.autograd` and `torch.compile`.
 
 ## Support
 
-- **Architectures**: Turing (SM75) and newer, subject to available dynamic shared memory
-- **Data types**: FP64, FP32, FP16, BF16
+- **Architectures**: Turing (SM75) or later
+- **Data types**: FP32, FP16, BF16
 - **Activations**: `identity` and `silu` for NHW and NWH; B2B uses fixed gating
 
 ### Kernel sizes
@@ -171,7 +171,3 @@ B2B, requiring cuDNN 9.24.0 or later, with projection kernel size 2–32 and mix
 The low-level B2B forward binding writes both the mixer-plus-skip intermediate `y` and the final post-gated `y_gated`; the high-level API returns only `y_gated`.
 
 In most cases, use the corresponding `cudnn.ops` API, which handles autograd, `torch.compile`, and tensor management automatically.
-
-The backend accumulation buffers for `dweight` and `dbias` are FP32 for
-FP16, BF16, and FP32 inputs, and FP64 for FP64 inputs. The Python autograd
-results are returned in the corresponding input tensor dtype.
