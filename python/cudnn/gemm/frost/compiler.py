@@ -42,6 +42,7 @@ from .dtypes import (
     DTYPE_BYTES,
     DTYPE_TO_CUTLASS,
     DTYPE_TO_MMA_KIND,
+    MAX_EPI_CHUNK_ELEMS,
     _allowed_vsize,
     _aux_align_reqs,
     _compute_output_vec_bytes,
@@ -2127,12 +2128,16 @@ def _check_cta_group_geometry(config: TileConfig, cta_group: int) -> None:
         # Empirically (B200): tcgen05.mma cta_group::2 with n_dim not a
         # multiple of 16 raises an illegal-instruction fault (n_dim=8/24/40
         # fault, 16/32/48/240 run); 1-CTA MMA accepts any multiple of 8.
-        raise NotImplementedError(f"2-CTA MMA needs mma_inst_n % 16 == 0 (pair MMA instruction n_dim); " f"config {config.name!r} has mma_inst_n={config.mma_inst_n}")
+        raise NotImplementedError(
+            f"2-CTA MMA needs mma_inst_n % 16 == 0 (pair MMA instruction n_dim); " f"config {config.name!r} has mma_inst_n={config.mma_inst_n}"
+        )
     if config.cta_tile_n % 16 != 0:
         # The pair splits B's N across the two CTAs: per-CTA SMEM/TMA N is
         # cta_tile_n // 2, which must stay a multiple of 8 (the 8-row tcgen05
         # core-matrix chunk / TileConfig's N granularity).
-        raise NotImplementedError(f"2-CTA MMA needs cta_tile_n % 16 == 0 (pair splits B's N in SMEM); " f"config {config.name!r} has cta_tile_n={config.cta_tile_n}")
+        raise NotImplementedError(
+            f"2-CTA MMA needs cta_tile_n % 16 == 0 (pair splits B's N in SMEM); " f"config {config.name!r} has cta_tile_n={config.cta_tile_n}"
+        )
 
 
 def _check_dtype_config_compat(chain: FusionChain, config: TileConfig, cta_group: int) -> None:
@@ -2405,6 +2410,7 @@ def _use_tma_store_epi(chain, cfg, vec_bytes_epi: int, cta_group: int) -> bool:
         return chain.matmul.M % m_align == 0
     return True
 
+
 def _check_block_quant_supported(
     chain: FusionChain,
     vec_bytes_epi: int,
@@ -2420,7 +2426,36 @@ def _check_block_quant_supported(
     elem_bytes = DTYPE_BYTES[chain.output_dtype]
     vsize = vec_bytes_epi // elem_bytes
     cols_per_acc_stage = _epi_tile_cols(config, cta_group)
+    # A quant pins the chunk to its block size, so — unlike every other chain,
+    # where the chunk is derived from the outputs' own layouts — the two
+    # divisibility properties the epilogue relies on have to be asserted here:
+    # the drain walks whole chunks (`for j in range(subtile_w // vsize)`) and
+    # stores only whole chunks (`if col_j + vsize <= N`).
+    subtile_w = _pow2_floor(cols_per_acc_stage, MAX_EPI_CHUNK_ELEMS)
+    if subtile_w % vsize != 0:
+        raise NotImplementedError(
+            f"block_scale_quantize epilogue chunk ({vsize} elements, from block sizes "
+            f"{sorted({q.block_size for q in chain.quants})}) must divide the {subtile_w}-column "
+            f"drain subtile of cols_per_acc_stage={cols_per_acc_stage} "
+            f"(config={config.name}, cta_group={cta_group})"
+        )
+    if chain.matmul.N % vsize != 0:
+        raise NotImplementedError(
+            f"block_scale_quantize requires N % chunk == 0 — the epilogue stores whole "
+            f"chunks only, so a partial trailing chunk is dropped; got N={chain.matmul.N}, "
+            f"chunk={vsize} elements"
+        )
     for q in chain.quants:
+        # Applies to col quants too: `_emit_block_quant_col` maps chunk column
+        # i to lane i % block_size, so a chunk narrower than the block leaves
+        # the upper lanes storing a scale they never computed.
+        if vsize % q.block_size != 0:
+            raise NotImplementedError(
+                "block_scale_quantize requires block_size to divide the epilogue chunk "
+                f"width (= the largest quant block, clamped to the lowest set bit of "
+                f"cols_per_acc_stage={cols_per_acc_stage} and to {MAX_EPI_CHUNK_ELEMS} "
+                f"elements); got block_size={q.block_size}, vsize={vsize}"
+            )
         if q.axis == 1:
             # Col quant: a warp (block 32) or half-warp (block 16) of rows is
             # one M block; the redux needs every row guard uniform across the
@@ -2454,11 +2489,6 @@ def _check_block_quant_supported(
                         "F8_128x4 col block_scale_quantize scale output currently requires " f"scale_dim={expected_scale_dim}; got {q.scale_dim}"
                     )
             continue
-        if vsize % q.block_size != 0:
-            raise NotImplementedError(
-                "block_scale_quantize requires block_size to divide the epilogue "
-                f"chunk width (= the largest quant block); got block_size={q.block_size}, vsize={vsize}"
-            )
         if cols_per_acc_stage < q.block_size or cols_per_acc_stage % q.block_size != 0:
             raise NotImplementedError(
                 "block_scale_quantize epilogue requires each CTA epilogue drain to "

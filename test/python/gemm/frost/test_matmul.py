@@ -31,7 +31,7 @@ pytestmark = [pytest.mark.L0, requires_sm100]
 
 import cudnn
 import cudnn.gemm.frost  # noqa: F401  — installs the cudnn.pygraph recorder hook
-from cudnn.gemm.frost.compiler import _current_arch
+from cudnn.gemm.frost.compiler import _current_arch, _epi_vec_bytes
 from cudnn.gemm.frost.tile_config import CATALOG
 
 # INT8 matmul runs only on SM 100 or SM 110 (disjoint range).
@@ -1392,6 +1392,86 @@ def test_dense_block_scale_quant_with_dense_tap() -> None:
     torch.testing.assert_close(tap.float(), ref_sw, atol=0, rtol=0)
     torch.testing.assert_close(q_scale.float(), scale_ref.float(), atol=0, rtol=0)
     torch.testing.assert_close(q.float(), q_ref.float(), atol=0, rtol=0)
+
+
+def test_dense_block_scale_quant_with_fp32_dense_tap() -> None:
+    """The chunk stays pinned to the quant block even when the widest dense
+    output is 4 bytes: 32 elements x 4 B = 128 B, split into four 32 B stores."""
+    cfg, cta_group, scheduler = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    M = N = K = 128
+    block_size = 32
+    g = cudnn.pygraph(
+        io_data_type=cudnn.data_type.BFLOAT16,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+    )
+    A = g.tensor(name="A", dim=[1, M, K], stride=_a_stride_batched(M, K, "k"))
+    B = g.tensor(name="B", dim=[1, K, N], stride=_b_stride_batched(N, K, "k"))
+    C = g.matmul(A=A, B=B, name="mm")
+    C.set_output(True).set_data_type(cudnn.data_type.FLOAT)
+    Q, QS = g.block_scale_quantize(input=C, block_size=block_size, name="q")
+    Q.set_output(True).set_data_type(cudnn.data_type.FP8_E4M3)
+    QS.set_output(True).set_data_type(cudnn.data_type.FP8_E8M0)
+
+    compiled = _plan(g, config=cfg, cta_group=cta_group, scheduler=scheduler)
+    assert _epi_vec_bytes(compiled.chain, cfg, cta_group) == block_size * 4
+
+    a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
+    tap = torch.empty(1, M, N, dtype=torch.float32, device="cuda")
+    q = torch.empty(1, M, N, dtype=torch.float8_e4m3fn, device="cuda")
+    q_scale = torch.empty(1, M, N // block_size, dtype=torch.float8_e8m0fnu, device="cuda")
+    compiled(_vp(compiled, a, b, [tap, q, q_scale]))
+    torch.cuda.synchronize()
+
+    ref = torch.einsum("bmk,bnk->bmn", a.to(torch.float32), b.to(torch.float32))
+    q_ref, scale_ref = _block_quant_reference(ref, block_size, torch.float8_e4m3fn, torch.float8_e8m0fnu)
+    torch.testing.assert_close(tap, ref, atol=0, rtol=0)
+    torch.testing.assert_close(q_scale.float(), scale_ref.float(), atol=0, rtol=0)
+    torch.testing.assert_close(q.float(), q_ref.float(), atol=0, rtol=0)
+
+
+def test_dense_col_block_scale_quant_with_dense_tap() -> None:
+    """Col quant behind a 2-byte dense tap. The chunk must stay as wide as the
+    32-lane block group: a narrower one has the upper lanes store a scale they
+    never computed, to columns past the chunk (and past the scale tensor on the
+    last chunk of a row block)."""
+    cfg, cta_group, scheduler = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    M, N, K, bs = 256, 128, 128, 32
+    g = cudnn.pygraph(
+        io_data_type=cudnn.data_type.BFLOAT16,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+    )
+    A = g.tensor(name="A", dim=[1, M, K], stride=_a_stride_batched(M, K, "k"))
+    B = g.tensor(name="B", dim=[1, K, N], stride=_b_stride_batched(N, K, "k"))
+    C = g.matmul(A=A, B=B, name="mm")
+    S = g.swish(input=C, name="sw")
+    S.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
+    Q, QS = g.block_scale_quantize(input=S, block_size=bs, axis=1, name="q")
+    Q.set_output(True).set_data_type(cudnn.data_type.FP8_E4M3)
+    QS.set_dim([1, M // bs, N]).set_stride([M // bs * N, N, 1])
+    QS.set_output(True).set_data_type(cudnn.data_type.FP8_E8M0)
+
+    compiled = _plan(g, config=cfg, cta_group=cta_group, scheduler=scheduler)
+    assert _epi_vec_bytes(compiled.chain, cfg, cta_group) == bs * 2
+
+    a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
+    tap = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
+    q = torch.empty(1, M, N, dtype=torch.float8_e4m3fn, device="cuda")
+    # One guard row past the scale tensor catches an over-wide scale store.
+    n_scale = (M // bs) * N
+    scale_buf = torch.full((n_scale + N,), 0x7F, dtype=torch.uint8, device="cuda")
+    q_scale = scale_buf.view(torch.float8_e8m0fnu)[:n_scale].view(1, M // bs, N)
+    compiled(_vp(compiled, a, b, [tap, q, q_scale]))
+    torch.cuda.synchronize()
+
+    ref_mm = torch.einsum("bmk,bnk->bmn", a.to(torch.float32), b.to(torch.float32))
+    ref_sw = (ref_mm * torch.sigmoid(ref_mm)).to(torch.bfloat16).float()
+    q_ref, scale_ref = _col_quant_reference(ref_sw, bs, torch.float8_e4m3fn, torch.float8_e8m0fnu)
+    torch.testing.assert_close(tap.float(), ref_sw, atol=0, rtol=0)
+    torch.testing.assert_close(q_scale.float(), scale_ref.float(), atol=0, rtol=0)
+    torch.testing.assert_close(q.float(), q_ref.float(), atol=0, rtol=0)
+    assert (scale_buf[n_scale:] == 0x7F).all()
 
 
 def test_dense_dual_block_scale_quant() -> None:

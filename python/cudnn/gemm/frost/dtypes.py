@@ -83,6 +83,13 @@ CUDNN_FROM_DTYPE: dict[Dtype, Any] = {v: k for k, v in DTYPE_FROM_CUDNN.items()}
 
 MAX_MEM_ACCESS_BYTES = 32
 
+# Widest epilogue chunk in ELEMENTS (not bytes). The epilogue drains the
+# accumulator in <= 32-column subtiles (tcgen05_ld SHAPE_32X32B, num <= 32) and
+# the codegen walks a chunk with `range(32)` + `const_expr(i < vsize)` guards,
+# so a chunk can never hold more elements than this. It CAN span more than
+# MAX_MEM_ACCESS_BYTES: a wide dtype splits its chunk into several stores.
+MAX_EPI_CHUNK_ELEMS = 32
+
 
 def _pow2_floor(x: int, cap: int = MAX_MEM_ACCESS_BYTES) -> int:
     """Largest power of 2 (<= cap) dividing ``x``; ``cap`` when ``x`` is 0 (no
@@ -175,6 +182,12 @@ def _compute_output_vec_bytes(chain: FusionChain, tile_cols: "int | None" = None
     block size; otherwise vsize = the min over every dense output's widest
     allowed store. M-major output → elem_bytes (scalar / TMA store).
 
+    The chunk is a shared ELEMENT count, not one memory access — every output
+    reads/writes the same columns but splits the chunk into its own
+    ``MAX_MEM_ACCESS_BYTES``-wide accesses (``epilogue_codegen._tap_store_elems``).
+    So a 2-byte output co-materialized with a 32-element block quant keeps the
+    32-element chunk the quant needs and stores it as 2 x 32 B.
+
     ``tile_cols`` (the per-CTA epilogue drain width in accumulator columns, when
     the tile config is known) additionally clamps the chunk so it divides every
     power-of-2 subtile span the epilogue decomposes the tile into — i.e. vsize
@@ -190,10 +203,10 @@ def _compute_output_vec_bytes(chain: FusionChain, tile_cols: "int | None" = None
             (_allowed_vsize(chain, spec.dtype, spec.dim, spec.stride) for spec in chain.output_specs if spec.dtype != "fp4_e2m1"),
             default=_allowed_vsize(chain, chain.output_dtype),
         )
-    vec_bytes = vsize * elem_bytes
+    vsize = min(vsize, MAX_EPI_CHUNK_ELEMS)
     if tile_cols is not None:
-        vec_bytes = min(vec_bytes, _pow2_floor(tile_cols * elem_bytes))
-    return vec_bytes
+        vsize = min(vsize, _pow2_floor(tile_cols, cap=MAX_EPI_CHUNK_ELEMS))
+    return vsize * elem_bytes
 
 
 def _aux_align_reqs(chain: FusionChain, vec_bytes: "int | None" = None) -> dict:
