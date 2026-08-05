@@ -30,12 +30,15 @@ namespace experimental {
 
 /// @brief Look up the SM100 kernel specification for a given head dimension.
 /// @param d Head dimension (d_qk). Currently supports 64 and 128.
-/// @param sm_version SM version from cudaDeviceProp (e.g. 100, 101).
+/// @param sm_version SM version from cudaDeviceProp (e.g. 100).
 /// @return Pointer to static KernelSpec, or nullptr if unsupported.
 inline const KernelSpec*
 lookup_sm100_kernel_spec(int d, int sm_version) {
-    // SM100 family: sm_version 100..109
-    if (sm_version / 10 != 10) return nullptr;
+    // SM100 only: the kernels below are compiled with --gpu-architecture=sm_100a,
+    // an architecture-specific binary that does not load on other SM10x parts
+    // (sm_101, sm_103, ...). Admitting them here makes check_support() pass and
+    // build() fail later with "OSS SDPA engine not built".
+    if (sm_version != 100) return nullptr;
 
     static const KernelSpec spec_d128 = {
         generated::sm100_d128_fprop_source,
