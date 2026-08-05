@@ -38,8 +38,7 @@ def tmem_load_max_reduction(tmem_addr, num: cutlass.Constexpr = 64):
     thread count (= TILE_N/2 for the current dual-MMA softmax path).
     """
     _data_ops = ", ".join("{$w%d}" % i for i in range(num))
-    _ptx = ("tcgen05.ld.red.sync.aligned.32x32b.x%d.f32.max "
-            "{" + _data_ops + "}, {$w%d}, [{$r0}];") % (num, num)
+    _ptx = ("tcgen05.ld.red.sync.aligned.32x32b.x%d.f32.max " "{" + _data_ops + "}, {$w%d}, [{$r0}];") % (num, num)
     outs = inline_ptx(
         _ptx,
         write_only_types=[cutlass.Int32] * (num + 1),

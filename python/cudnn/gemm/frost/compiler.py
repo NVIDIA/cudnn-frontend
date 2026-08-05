@@ -2127,12 +2127,16 @@ def _check_cta_group_geometry(config: TileConfig, cta_group: int) -> None:
         # Empirically (B200): tcgen05.mma cta_group::2 with n_dim not a
         # multiple of 16 raises an illegal-instruction fault (n_dim=8/24/40
         # fault, 16/32/48/240 run); 1-CTA MMA accepts any multiple of 8.
-        raise NotImplementedError(f"2-CTA MMA needs mma_inst_n % 16 == 0 (pair MMA instruction n_dim); " f"config {config.name!r} has mma_inst_n={config.mma_inst_n}")
+        raise NotImplementedError(
+            f"2-CTA MMA needs mma_inst_n % 16 == 0 (pair MMA instruction n_dim); " f"config {config.name!r} has mma_inst_n={config.mma_inst_n}"
+        )
     if config.cta_tile_n % 16 != 0:
         # The pair splits B's N across the two CTAs: per-CTA SMEM/TMA N is
         # cta_tile_n // 2, which must stay a multiple of 8 (the 8-row tcgen05
         # core-matrix chunk / TileConfig's N granularity).
-        raise NotImplementedError(f"2-CTA MMA needs cta_tile_n % 16 == 0 (pair splits B's N in SMEM); " f"config {config.name!r} has cta_tile_n={config.cta_tile_n}")
+        raise NotImplementedError(
+            f"2-CTA MMA needs cta_tile_n % 16 == 0 (pair splits B's N in SMEM); " f"config {config.name!r} has cta_tile_n={config.cta_tile_n}"
+        )
 
 
 def _check_dtype_config_compat(chain: FusionChain, config: TileConfig, cta_group: int) -> None:
@@ -2404,6 +2408,7 @@ def _use_tma_store_epi(chain, cfg, vec_bytes_epi: int, cta_group: int) -> bool:
         m_align = 16 // DTYPE_BYTES[chain.output_dtype]
         return chain.matmul.M % m_align == 0
     return True
+
 
 def _check_block_quant_supported(
     chain: FusionChain,

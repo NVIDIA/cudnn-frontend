@@ -30,9 +30,7 @@ def _get_rubin_kernel():
 def _is_supported_rubin_quantization(ab_dtype: torch.dtype, sf_dtype: torch.dtype, sf_vec_size: int) -> bool:
     is_fp4 = ab_dtype in (torch.float4_e2m1fn_x2, torch.uint8)
     if is_fp4:
-        return (sf_dtype == torch.float8_e4m3fn and sf_vec_size == 16) or (
-            sf_dtype == torch.float8_e8m0fnu and sf_vec_size == 32
-        )
+        return (sf_dtype == torch.float8_e4m3fn and sf_vec_size == 16) or (sf_dtype == torch.float8_e8m0fnu and sf_vec_size == 32)
     return ab_dtype in (torch.float8_e4m3fn, torch.float8_e5m2) and sf_dtype == torch.float8_e8m0fnu and sf_vec_size == 32
 
 
@@ -170,8 +168,7 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
         )
         self._value_error_if(
             not _is_supported_rubin_quantization(self.a_desc.dtype, self.sfa_desc.dtype, self.sf_vec_size),
-            "Rubin wgrad supports NVFP4 (E2M1/E4M3, vec16), MXFP4 "
-            "(E2M1/E8M0, vec32), and MXFP8 (E4M3 or E5M2/E8M0, vec32)",
+            "Rubin wgrad supports NVFP4 (E2M1/E4M3, vec16), MXFP4 " "(E2M1/E8M0, vec32), and MXFP8 (E4M3 or E5M2/E8M0, vec32)",
         )
         self._value_error_if(self.acc_dtype != torch.float32, "Rubin wgrad requires float32 accumulation")
 

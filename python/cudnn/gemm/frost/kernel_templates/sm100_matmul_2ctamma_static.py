@@ -83,6 +83,7 @@ def _l2_swizzle_tile(raw_m, raw_n, nt_m, nt_n, swizzle_w):
     log_n = base_n + off - log_m * cur_S
     return log_m, log_n
 
+
 def _epi_subtile_spans(cols):
     spans = []
     off = 0
