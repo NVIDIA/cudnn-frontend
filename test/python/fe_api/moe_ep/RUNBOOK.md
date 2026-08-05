@@ -27,6 +27,46 @@ wheel to graft the `moe_ep` package onto (see §4).  A known-good container:
 /lustre/fsw/coreai_libraries_cudnn/mhoqueanik/flashinfer-ep-pt2605-mega_moe_ep-20260712.sqsh
 ```
 
+### 2a. Creating the environment from scratch
+
+Start from the NVIDIA PyTorch NGC image (known-good base:
+`nvcr.io/nvidia/pytorch:26.05-py3` — torch 2.10 / CUDA 13.x on SM100) and
+install the kernel dependencies pinned in the bundle:
+
+```bash
+docker run --gpus all -it --network=host --ipc=host \
+  -v <clone>:/workspace/cudnn-frontend \
+  nvcr.io/nvidia/pytorch:26.05-py3
+
+# inside the container; PIP_CONSTRAINT= overrides the NGC image's constraint
+# file so the requirements' own pins (cutlass-dsl 4.5.2, nvshmem4py) resolve
+PIP_CONSTRAINT="" pip install --no-cache-dir \
+  -r /workspace/cudnn-frontend/python/cudnn/moe_ep/_megamoe_backend/cutedsl_megamoe/ci/requirements.txt
+```
+
+The pins that matter are `nvidia-cutlass-dsl[cu13]==4.5.2` (the CuTe DSL
+version the kernels are written against — other versions may not compile),
+`nvshmem4py-cu13>=0.1.3`, and `torch>=2.10`; `pytest>=8.0` covers the test
+suite.  Smoke-check before running anything:
+
+```bash
+python - <<'EOF'
+import cutlass; assert cutlass.__version__.startswith("4.5.2"), cutlass.__version__
+import cutlass.cute, nvshmem.core, cuda.bindings.driver, torch
+print("torch", torch.__version__, "cuda", torch.version.cuda,
+      "sm", torch.cuda.get_device_capability())
+EOF
+```
+
+Expect `sm (10, 0)` — the kernels are SM100-only.  To bake a reusable sqsh
+for SLURM/pyxis clusters, run the same pip install under
+`srun --container-image=nvcr.io/nvidia/pytorch:26.05-py3
+--container-save=<out>.sqsh`.
+
+Multi-rank (EP) runs additionally need NVSHMEM's usual fabric access
+(`--ipc=host`, and on SLURM the pyxis defaults suffice); single-rank runs
+with `MEGA_NO_DIST=1` need none of that.
+
 Backend policy knob (the only env variable):
 
 | `CUDNN_MOE_EP_BACKEND` | Meaning |

@@ -23,5 +23,6 @@ Provenance (copied 2026-08-05, excluding only `__pycache__`/`.git`):
   (source of `megamoe/`, `pt/`)
 - `cutedsl_megamoe` @ `8ff233d6040d522dba536a6179a5e67af950c52f`
   (https://gitlab-master.nvidia.com/bangyus/cutedsl_megamoe; only the four
-  subpackages above plus `README.md` are vendored — `ci/`, `tester/`,
+  subpackages above plus `README.md` and `ci/requirements.txt` (the pip
+  environment pins) are vendored — the rest of `ci/`, `tester/`,
   `scripts/`, `tests/` are not needed at runtime)
