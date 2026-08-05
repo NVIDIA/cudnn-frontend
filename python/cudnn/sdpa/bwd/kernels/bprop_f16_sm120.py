@@ -44,7 +44,7 @@ from cutlass._mlir.dialects import arith
 
 from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_FP16
 from cudnn.frost.tile_dsl.mma import ptx_mma_m16n8k16_f32
-from cudnn.frost.tile_dsl.swizzle import get_swizzled_col
+from cudnn.frost.tile_dsl.swizzle import swizzle_xor
 from cudnn.sdpa.bwd.config_sm120 import TemplateParams, validate_params
 
 # The FROST loader injects one immutable specialization before executing this
@@ -91,7 +91,7 @@ def tile_ptr(
     """Element pointer into a paged+swizzled smem tile."""
     pg = col // page
     in_col = col % page
-    off = pg * (rows * page) + row * page + get_swizzled_col(row, in_col, page, 2)
+    off = pg * (rows * page) + row * page + swizzle_xor(row, in_col, page, 2)
     return sbuf.subview(off).data_ptr()
 
 

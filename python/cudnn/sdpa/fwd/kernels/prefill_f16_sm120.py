@@ -50,7 +50,7 @@ import cutlass.cute as cute
 from cutlass.experimental import primitives as prims
 from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_FP16
 from cudnn.frost.tile_dsl.mma import ptx_mma_m16n8k16_f32
-from cudnn.frost.tile_dsl.swizzle import get_swizzled_col
+from cudnn.frost.tile_dsl.swizzle import swizzle_xor
 from cudnn.sdpa.fwd.config_sm120 import (
     SEQ_KV_TILES as _SEQ_KV_TILES,
     SEQ_Q_TILES as _SEQ_Q_TILES,
@@ -396,7 +396,7 @@ class SM120FusedMultiHeadAttentionForward:
             k_smem_ptr = (
                 mma_params.sK.data_ptr()
                 + k_physical_row * self.tma_swizzle_chunk_elems
-                + get_swizzled_col(
+                + swizzle_xor(
                     k_physical_row,
                     k_col_in_chunk,
                     self.tma_swizzle_chunk_elems,
@@ -610,7 +610,7 @@ class SM120FusedMultiHeadAttentionForward:
             sV_ptr = (
                 mma_params.sV.data_ptr()
                 + v_physical_row * self.tma_swizzle_chunk_elems
-                + get_swizzled_col(
+                + swizzle_xor(
                     v_physical_row,
                     v_col_in_chunk,
                     self.tma_swizzle_chunk_elems,
