@@ -149,8 +149,8 @@ def test_probe_envelope_covers_small_head_dim():
 
 
 def test_probe_envelope_mixed_dims_pick_covering_flavor():
-    # (d_qk=192, d_v=128) needs one flavor covering BOTH dims: d256 (and d512),
-    # never d128; registration order auto-selects d256.
+    # (d_qk=192, d_v=128) uses the native d192/d128 flavor; larger envelopes
+    # remain eligible for explicit A/B selection.
     g = _mk_graph()
     d_qk, d_v = 192, 128
     q = g.tensor(dim=(B, H, S, d_qk), stride=(S * H * d_qk, d_qk, H * d_qk, 1), data_type=DTYPE, name="q")
@@ -160,9 +160,9 @@ def test_probe_envelope_mixed_dims_pick_covering_flavor():
     _finish_output(o, (B, H, S, d_v), (S * H * d_v, d_v, H * d_v, 1))
     elig = _eligible(g)
     assert engines.engine_name(128) not in elig
-    assert {engines.engine_name(256), engines.engine_name(512)} <= elig
+    assert {engines.engine_name(192, d_v=128), engines.engine_name(256), engines.engine_name(512)} <= elig
     ordered = [s.name for s in engines.ENGINE_SPECS if s.name in elig]
-    assert ordered[0] == engines.engine_name(256)
+    assert ordered[0] == engines.engine_name(192, d_v=128)
 
 
 def test_probe_rejects_wrong_device_family(monkeypatch):

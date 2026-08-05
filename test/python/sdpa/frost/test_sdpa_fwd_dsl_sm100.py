@@ -47,7 +47,7 @@ pytestmark = pytest.mark.skipif(
 
 
 def _ref_sdpa(q, k, v, *, is_causal, scale):
-    """Reference SDPA in fp32 (DSv4 v1 scope: dense, top-left causal or none)."""
+    """Reference SDPA in fp32 (dense, top-left causal or none)."""
     q_ref, k_ref, v_ref = q.to(torch.float32), k.to(torch.float32), v.to(torch.float32)
     scores = torch.matmul(q_ref, k_ref.transpose(-1, -2)) * scale
     if is_causal:
@@ -214,13 +214,32 @@ def _run_dsl_graph(q_gpu, k_gpu, v_gpu, *, scale, dtype, sdpa_kwargs, seq_len_kv
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name(q_gpu.shape[-1]))
+    _select_engine(g, engine_name(q_gpu.shape[-1], d_v=d_v))
     g.check_support()
     g.build_plans()
     vp[o] = o_gpu
     g.execute(vp, torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8))
     torch.cuda.synchronize()
     return o_gpu
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("dtype", _DTYPES, ids=_DTYPE_IDS)
+@pytest.mark.parametrize("is_causal", [False, True], ids=["dense", "causal"])
+@torch_fork_set_rng(seed=0)
+def test_dsl_sm100_d192_d128(dtype, is_causal):
+    """Native DSv3 MLA shape: Q/K use d_qk=192 while V/O use d_v=128."""
+    _require_dsl()
+    b, h, s = 2, 8, 256
+    d_qk, d_v = 192, 128
+    scale = 1.0 / math.sqrt(d_qk)
+    q = _bhsd(b, h, s, d_qk, dtype)
+    k = _bhsd(b, h, s, d_qk, dtype)
+    v = _bhsd(b, h, s, d_v, dtype)
+
+    o = _run_dsl_graph(q, k, v, scale=scale, dtype=dtype, sdpa_kwargs=dict(use_causal_mask=is_causal))
+    o_ref = _ref_sdpa(q, k, v, is_causal=is_causal, scale=scale)
+    torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
 
 
 @pytest.mark.L0
