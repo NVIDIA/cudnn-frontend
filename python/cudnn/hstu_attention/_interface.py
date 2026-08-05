@@ -32,14 +32,6 @@ def _normalize_scaling_seqlen(
     return value
 
 
-def _sm100_compile_options(device: torch.device) -> str:
-    """Select the public SM100-family CUTLASS DSL target."""
-    capability = torch.cuda.get_device_capability(device)
-    if capability not in ((10, 0), (10, 3), (10, 7)):
-        raise RuntimeError(f"HSTU SM100 kernels require compute capability 10.0, 10.3, or 10.7, got {capability}")
-    return "--enable-tvm-ffi --gpu-arch sm_100f"
-
-
 def _mark_dynamic_tensor(
     tensor: torch.Tensor,
     leading_dim: int,
@@ -309,7 +301,7 @@ def hstu_varlen_fwd_100(
                 page_ids_tensor,
                 page_indptrs_tensor,
                 block_sparse_cute,
-                options=_sm100_compile_options(q.device),
+                options="--enable-tvm-ffi",
             )
 
     if _compile_only:
@@ -599,7 +591,7 @@ def hstu_varlen_bwd_100(
                 workspace,
                 block_sparse_cute,
                 compile_stream,
-                options=_sm100_compile_options(q_orig.device),
+                options="--enable-tvm-ffi",
             )
 
     if _compile_only:
