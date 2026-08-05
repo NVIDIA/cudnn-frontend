@@ -1221,16 +1221,12 @@ def _to_cuda_conv_layout(cpu_tensor: torch.Tensor, memory_format) -> torch.Tenso
 
 
 def _make_x_cpu_tensor(cfg: LargeTensorConfig, gen: torch.Generator) -> torch.Tensor:
-    # DGRAD writes X as the output buffer, so keep its prefill random to help
-    # expose partial writes.
     if _uses_integer_data(cfg) and cfg.conv_type in (ConvType.FPROP, ConvType.WGRAD):
         return _dense_small_integer_cpu_tensor(cfg.x_shape, cfg.dtype, gen)
     return _dense_random_cpu_tensor(cfg.x_shape, cfg.dtype, gen)
 
 
 def _make_w_cpu_tensor(cfg: LargeTensorConfig, gen: torch.Generator, sparse_rng: random.Random) -> torch.Tensor:
-    # WGRAD writes W as the output buffer, so keep its prefill random to help
-    # expose partial writes.
     if _uses_sparse_filter(cfg):
         return _sparse_filter_cpu_tensor(cfg, sparse_rng)
     return _dense_random_cpu_tensor(cfg.w_shape, cfg.dtype, gen)
@@ -1303,6 +1299,16 @@ def _run_single_config(
             Y_cpu = _make_dy_cpu_tensor(cfg, gen)
             Y.copy_(Y_cpu, non_blocking=True)
             del Y_cpu
+
+        # Poison the output after seeded input generation so incomplete writes
+        # fail comparison without changing deterministic input values.
+        phase = "output prefill"
+        if cfg.conv_type == ConvType.FPROP:
+            Y.fill_(float("nan"))
+        elif cfg.conv_type == ConvType.DGRAD:
+            X.fill_(float("nan"))
+        else:
+            W.fill_(float("nan"))
 
         rtol, atol = _tolerances(cfg)
         active_payload = _repro_payload(
