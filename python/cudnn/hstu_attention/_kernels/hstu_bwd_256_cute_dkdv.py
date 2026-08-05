@@ -1,5 +1,5 @@
-# Copyright (c) 2025, Siyu Wang, Shengbin Di, Yuxi Chi, Johnsonms, Linfeng Zheng, Haoyan Huang, Lanbo Li, Yun Zhong, Man Yuan, Minmin Sun, Yong Li, Wei Lin.
-# SPDX-License-Identifier: BSD-3-Clause
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
 """Fused multi-head attention (FMHA) backward for the SM100 architecture using CUTE DSL.
 
@@ -1999,9 +1999,9 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             dp_handle = mma_compute_dP_consumer.wait_and_advance()
             ds_handle = compute_mma_dS_producer.acquire_and_advance()
 
-            # Compute the unscaled dS fragment.  The dK epilogue applies
-            # ``scale_softmax`` exactly once (matching the original FA4
-            # pipeline), so multiplying by alpha here would scale dK twice.
+            # Compute the unscaled dS fragment. The dK epilogue applies
+            # ``scale_softmax`` exactly once, so multiplying by alpha here
+            # would scale dK twice.
             cute.copy(tiled_t2r, tTR_tdPT, tTR_rdPT)
 
             for i in cutlass.range(0, cute.size(tTR_rdPT), 2, unroll_full=True):

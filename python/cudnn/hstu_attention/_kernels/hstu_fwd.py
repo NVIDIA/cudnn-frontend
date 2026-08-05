@@ -1,6 +1,5 @@
-# Based on the cutlass example and cute-dsl example:
-# https://github.com/NVIDIA/cutlass/tree/main/examples/77_blackwell_fmha
-# https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/blackwell/fmha.py
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
 
@@ -35,7 +34,7 @@ from .tile_scheduler import (
     SingleTileVarlenScheduler,
     TileSchedulerArguments,
 )
-from .named_barrier import NamedBarrierFwd
+from .named_barrier import EPILOGUE_BARRIER_BASE, TMEM_POINTER_BARRIER, TMEM_RELEASE_BARRIER
 from .block_sparsity import (
     HSTUBlockSparseTensors,
     get_q2k_block_for_reverse_slot,
@@ -212,7 +211,7 @@ class HSTUAttentionForwardSm100:
         - Configures pipeline stages for SiLU, MMA, and epilogue operations
         """
 
-        # Derive kv_stage from smem budget (224KB limit), matching FA4's approach
+        # Size the KV pipeline to fit the 224 KiB shared-memory budget.
         smem_size_q = self.q_stage * self.kBlockM * self.head_dim_padded * self.q_dtype.width // 8
         smem_size_o = self.q_stage * self.kBlockM * self.head_dim_v_padded * self.q_dtype.width // 8
         smem_size_q_o = max(smem_size_q, smem_size_o) if self.overlap_sO_sQ else (smem_size_q + smem_size_o)
@@ -782,11 +781,11 @@ class HSTUAttentionForwardSm100:
                 defer_sync=True,
             )
             tmem_alloc_barrier = cutlass.pipeline.NamedBarrier(
-                barrier_id=int(NamedBarrierFwd.TmemPtr),
+                barrier_id=TMEM_POINTER_BARRIER,
                 num_threads=cute.arch.WARP_SIZE,
             )
             tmem_free_barrier = cutlass.pipeline.NamedBarrier(
-                barrier_id=int(NamedBarrierFwd.TmemFree),
+                barrier_id=TMEM_RELEASE_BARRIER,
                 num_threads=cute.arch.WARP_SIZE * (1 + len(self.silu0_warp_ids) + len(self.silu1_warp_ids)),
             )
             tmem = cutlass.utils.TmemAllocator(
@@ -2930,7 +2929,7 @@ class HSTUAttentionForwardSm100:
             if tidx < cute.arch.WARP_SIZE:
                 cute.arch.cp_async_bulk_wait_group(0, read=True)
             cute.arch.barrier(
-                barrier_id=NamedBarrierFwd.Epilogue + stage,
+                barrier_id=EPILOGUE_BARRIER_BASE + stage,
                 number_of_threads=(cute.arch.WARP_SIZE * len(self.silu1_warp_ids)),
             )
 
@@ -3086,7 +3085,7 @@ class HSTUAttentionForwardSm100:
             if tidx < cute.arch.WARP_SIZE:
                 cute.arch.cp_async_bulk_wait_group(0, read=True)
             cute.arch.barrier(
-                barrier_id=NamedBarrierFwd.Epilogue + stage,
+                barrier_id=EPILOGUE_BARRIER_BASE + stage,
                 number_of_threads=(cute.arch.WARP_SIZE * len(self.silu1_warp_ids)),
             )
         offset_dynamic = (self.logical_cta_tiler[0] - (seqlen.seqlen_q & (self.logical_cta_tiler[0] - 1))) & (self.logical_cta_tiler[0] - 1)
@@ -3167,7 +3166,7 @@ class HSTUAttentionForwardSm100:
                 cute.arch.fence_view_async_tmem_load()
                 pipeline_o.consumer_release(o_consumer_state)
 
-        cute.arch.barrier(barrier_id=NamedBarrierFwd.Epilogue + stage, number_of_threads=cute.arch.WARP_SIZE * len(self.silu1_warp_ids))
+        cute.arch.barrier(barrier_id=EPILOGUE_BARRIER_BASE + stage, number_of_threads=cute.arch.WARP_SIZE * len(self.silu1_warp_ids))
 
         logical_stage_start = m_block * self.kBlockM - offset_dynamic
         valid_rows = min(

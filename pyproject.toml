@@ -4,7 +4,7 @@ dynamic = ["version"]
 description = "NVIDIA cuDNN Frontend — Python and C++ Graph API with SOTA attention (SDPA / Flash Attention), MoE grouped GEMM fusions, and FP8/MXFP8 kernels for Hopper and Blackwell GPUs."
 readme = "README.md"
 requires-python = ">=3.9"
-license = {text = "Apache-2.0 AND MIT"}
+license = {text = "Apache-2.0 AND MIT AND BSD-3-Clause"}
 keywords = [
     "cudnn",
     "cuda",
@@ -31,6 +31,7 @@ classifiers = [
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: Apache Software License",
+    "License :: OSI Approved :: BSD License",
     "License :: OSI Approved :: MIT License",
     "Operating System :: POSIX :: Linux",
     "Operating System :: Microsoft :: Windows",
@@ -83,6 +84,7 @@ build-backend = "setuptools.build_meta"
 packages = {find = {where = ["python", "."], include = ["cudnn*", "include"], namespaces = true}}
 package-dir = {"" = "python", "include" = "include"}
 include-package-data = true
+license-files = ["LICENSE*", "NOTICE", "THIRD_PARTY_LICENSES.txt"]
 
 [tool.setuptools.dynamic]
 version = {attr = "cudnn.__version__"}

@@ -1,4 +1,4 @@
-# HSTU Attention (SM100)
+# HSTU Attention (Blackwell SM100/SM103)
 
 **This is an experimental API and subject to change.**
 
@@ -33,6 +33,13 @@ $L_{\mathrm{scale}}$ is exposed as `scaling_seqlen`. If
 Transformer attention, HSTU applies SiLU to the scores and does **not** perform
 row-wise softmax normalization. This matches the requested operation in
 [issue #369](https://github.com/NVIDIA/cudnn-frontend/issues/369).
+
+The HSTU kernels and cuDNN Frontend integration were developed by NVIDIA. The
+forward and backward kernels and public API use the Apache License 2.0. Some
+low-level attention utility files build on FlashAttention and NVIDIA
+CUTLASS/CuTe DSL work and retain the BSD 3-Clause license; see the repository's
+[licensing guide](../../../LICENSING.md) and [third-party
+notices](../../../THIRD_PARTY_LICENSES.txt).
 
 ## Installation
 
@@ -72,8 +79,9 @@ HSTU uses packed variable-length, or THD, tensors:
 `T_q` and `T_k` are the total query and key/value token counts across the
 batch. Cumulative-length tensors start with zero and delimit each packed
 sequence; `max_seqlen_q` and `max_seqlen_k` give the maximum sequence lengths
-for the batch. Q, K, and V use the same number of heads, so this implementation
-currently exposes multi-head attention rather than GQA or MQA.
+for the batch. The kernel requires `max_seqlen_q <= max_seqlen_k`. Q, K, and V
+use the same number of heads, so this implementation currently exposes
+multi-head attention rather than GQA or MQA.
 
 The API validates tensor metadata (rank, shape, dtype, device, and layout) but
 trusts the values stored in CUDA metadata tensors such as `cu_seqlens_q`,
@@ -224,8 +232,8 @@ on the GPU without host-side range or monotonicity checks.
 
 | Direction | Architecture | Dtype | Head dimension | Attention |
 | --- | --- | --- | --- | --- |
-| Forward | SM100/SM10x | FP16, BF16 | 64, 128, 256 | MHA |
-| Backward | SM100/SM10x | FP16, BF16 | 64, 128, 256 | MHA |
+| Forward | Blackwell SM100/SM103 | FP16, BF16 | 64, 128, 256 | MHA |
+| Backward | Blackwell SM100/SM103 | FP16, BF16 | 64, 128, 256 | MHA |
 
 ## Current limitations
 
@@ -234,4 +242,5 @@ on the GPU without host-side range or monotonicity checks.
 - GQA and MQA are not supported.
 - Padded BHSD/BSHD inputs and separate `seqused_q`/`seqused_k` valid-length
   tensors are not supported; use packed THD tensors and cumulative lengths.
-- The implementation requires NVIDIA Blackwell compute capability SM10x.
+- The implementation requires NVIDIA Blackwell SM100/SM103.
+- `max_seqlen_q` must be less than or equal to `max_seqlen_k`.

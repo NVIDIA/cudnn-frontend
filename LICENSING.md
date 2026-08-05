@@ -1,33 +1,40 @@
 # Licensing
 
 cudnn-frontend is distributed primarily under the **Apache License 2.0**
-(see [LICENSE.txt](LICENSE.txt)). A subset of files remain under the **MIT
-License** (see [LICENSE-MIT.txt](LICENSE-MIT.txt)). Every source file carries
-an SPDX `SPDX-License-Identifier:` tag declaring which license applies to it.
+(see [LICENSE.txt](LICENSE.txt)). Subsets of files use the **MIT License** (see
+[LICENSE-MIT.txt](LICENSE-MIT.txt)) or the **BSD 3-Clause License** (reproduced
+in [THIRD_PARTY_LICENSES.txt](THIRD_PARTY_LICENSES.txt)). Every source file
+carries an SPDX `SPDX-License-Identifier:` tag declaring which license applies
+to it.
 
 To find the license of any file, read its SPDX tag, e.g.:
 
 ```
 SPDX-License-Identifier: Apache-2.0   # most files
-SPDX-License-Identifier: MIT          # the files listed below
+SPDX-License-Identifier: MIT          # legacy and derived files listed below
+SPDX-License-Identifier: BSD-3-Clause # HSTU and other BSD files listed below
 ```
 
 Third-party attributions are in [THIRD_PARTY_LICENSES.txt](THIRD_PARTY_LICENSES.txt).
 
-## Why some files remain under MIT
+## Why some files use another license
 
 The repository's original license was MIT. During the MIT → Apache 2.0
 relicensing ([PR #408](https://github.com/NVIDIA/cudnn-frontend/pull/408),
 sign-off [issue #431](https://github.com/NVIDIA/cudnn-frontend/issues/431)),
 files were converted to Apache 2.0 **only** when all of their surviving code is
-owned by NVIDIA. Files are kept under MIT in two cases:
+owned by NVIDIA. Files remain under MIT when external-contributor consent is
+pending. Other non-Apache files retain a compatible license appropriate to
+their source and provenance:
 
-1. **Pending external-contributor consent** — the file contains code
+1. **Pending external-contributor consent (MIT)** — the file contains code
    contributed by a non-NVIDIA contributor whose consent to relicense has not
    (yet) been obtained. Determined by `git blame` on `develop`: a file stays
    MIT if any external contributor's lines survive in it.
-2. **Third-party-derived code** — the file is derived from external open
-   source (FlashAttention, QuACK) and carries the original author's copyright.
+2. **Third-party-derived code (MIT or BSD-3-Clause)** — the file is derived
+   from external open source (FlashAttention, QuACK, or CUTLASS),
+   carries the original authors' copyright, and declares its applicable
+   license in the SPDX header.
 
 If/when a listed external contributor grants consent, the files attributed to
 them below can be moved to Apache 2.0 by flipping their SPDX tag.
@@ -103,12 +110,14 @@ surviving external line(s) in each file (blame on `origin/develop`).
 > Note: `dlpack_version.txt` is a plain version-string file that cannot carry
 > a header comment; it is listed here and governed by MIT via this manifest.
 
-## Category 2 — MIT, third-party-derived (29 files)
+## Category 2 — MIT or BSD-3-Clause, non-Apache (36 files)
 
-Derived from FlashAttention (BSD-3-Clause) and/or QuACK (Apache-2.0); they
-retain their original authors' copyright notices. See THIRD_PARTY_LICENSES.txt.
-The commit link(s) are the NVIDIA import commits that introduced the surviving
-derived lines.
+These files are derived from FlashAttention (BSD-3-Clause), QuACK
+(Apache-2.0), and/or CUTLASS (BSD-3-Clause). They retain their applicable author
+notices. Existing FlashAttention/QuACK-derived files below declare MIT, while
+the remaining HSTU low-level utilities listed below declare BSD-3-Clause.
+Apache-2.0 HSTU files are not listed. See THIRD_PARTY_LICENSES.txt. The commit
+link(s) are the NVIDIA import commits that introduced the surviving lines.
 
 | File | Import commit(s) |
 |------|------------------|
@@ -141,4 +150,10 @@ derived lines.
 | `python/cudnn/deepseek_sparse_attention/utils/sm90/bwd_tile_scheduler.py` | [`c4a9762`](https://github.com/NVIDIA/cudnn-frontend/commit/c4a97621eca52fa0c3a1862a411a16be580b25c6) (#241) |
 | `python/cudnn/deepseek_sparse_attention/utils/sm90/mma.py` | [`c4a9762`](https://github.com/NVIDIA/cudnn-frontend/commit/c4a97621eca52fa0c3a1862a411a16be580b25c6) (#241)<br>[`74efc0d`](https://github.com/NVIDIA/cudnn-frontend/commit/74efc0d44a11005326e797201b58adb1399b4733) (#321) |
 | `python/cudnn/deepseek_sparse_attention/utils/sm90/primitives.py` | [`c4a9762`](https://github.com/NVIDIA/cudnn-frontend/commit/c4a97621eca52fa0c3a1862a411a16be580b25c6) (#241)<br>[`7016b04`](https://github.com/NVIDIA/cudnn-frontend/commit/7016b04077c4c53ee00ba39a86ab1067a7542e8c) (#316) |
-
+| `python/cudnn/hstu_attention/_kernels/blackwell_helpers.py` | [`c5471cb`](https://github.com/NVIDIA/cudnn-frontend/commit/c5471cbf68aaea8f232e94c3b77168f8185ad6f2) |
+| `python/cudnn/hstu_attention/_kernels/block_info.py` | [`c5471cb`](https://github.com/NVIDIA/cudnn-frontend/commit/c5471cbf68aaea8f232e94c3b77168f8185ad6f2) |
+| `python/cudnn/hstu_attention/_kernels/fast_math.py` | [`c5471cb`](https://github.com/NVIDIA/cudnn-frontend/commit/c5471cbf68aaea8f232e94c3b77168f8185ad6f2) |
+| `python/cudnn/hstu_attention/_kernels/mask.py` | [`c5471cb`](https://github.com/NVIDIA/cudnn-frontend/commit/c5471cbf68aaea8f232e94c3b77168f8185ad6f2) |
+| `python/cudnn/hstu_attention/_kernels/mma_sm100_desc.py` | [`c5471cb`](https://github.com/NVIDIA/cudnn-frontend/commit/c5471cbf68aaea8f232e94c3b77168f8185ad6f2) |
+| `python/cudnn/hstu_attention/_kernels/tile_scheduler.py` | [`c5471cb`](https://github.com/NVIDIA/cudnn-frontend/commit/c5471cbf68aaea8f232e94c3b77168f8185ad6f2) |
+| `python/cudnn/hstu_attention/_kernels/utils.py` | [`c5471cb`](https://github.com/NVIDIA/cudnn-frontend/commit/c5471cbf68aaea8f232e94c3b77168f8185ad6f2) |

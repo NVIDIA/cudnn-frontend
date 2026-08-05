@@ -1,9 +1,10 @@
-# Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
-import enum
+"""Named-barrier IDs used by the HSTU forward pipeline."""
 
-
-class NamedBarrierFwd(enum.IntEnum):
-    Epilogue = enum.auto()  # starts from 1 as barrier 0 is reserved for sync_threads()
-    TmemPtr = 3
-    TmemFree = 4
+# ID 0 remains available for block synchronization. The epilogue uses this
+# base plus its stage index, reserving IDs 1 and 2.
+EPILOGUE_BARRIER_BASE = 1
+TMEM_POINTER_BARRIER = 3
+TMEM_RELEASE_BARRIER = 4

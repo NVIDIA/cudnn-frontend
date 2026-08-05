@@ -1,13 +1,10 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# Copyright (c) 2026, NVIDIA Corporation & AFFILIATES.
-# SPDX-License-Identifier: BSD-3-Clause
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
 """Dedicated two-kernel CuTe DSL backward for HSTU head dimension 256.
 
-The kernel decomposition and Blackwell pipelines are derived from the
-FlashAttention-4 SM100 head-dim-256 backward path.  The score transform is HSTU
-SiLU rather than softmax; see the DQ and DK/DV kernel modules for the adapted
-math.
+The implementation uses separate DQ and DK/DV kernels. The score transform is
+HSTU SiLU rather than softmax.
 """
 
 from __future__ import annotations

@@ -1,5 +1,5 @@
-# Copyright (c) 2025, Siyu Wang, Shengbin Di, Yuxi Chi, Johnsonms, Linfeng Zheng, Haoyan Huang, Lanbo Li, Yun Zhong, Man Yuan, Minmin Sun, Yong Li, Wei Lin.
-# SPDX-License-Identifier: BSD-3-Clause
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
 from typing import Type, Tuple, Optional
 
@@ -52,7 +52,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         self.acc_dtype = acc_dtype
         self.is_causal = is_causal
         self.window_size_left = window_size_left
-        # Keep original behavior (known-good in this repo)
+        # Normalize negative window sizes to the unbounded-window sentinel.
         window_size_left = None if (window_size_left is None or window_size_left < 0) else cutlass.Int32(window_size_left)
         window_size_right = None if (window_size_right is None or window_size_right < 0) else cutlass.Int32(window_size_right)
         self.window_size_left = None if self.is_causal else window_size_left

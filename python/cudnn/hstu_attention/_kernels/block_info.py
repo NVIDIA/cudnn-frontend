@@ -1,4 +1,6 @@
 # Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
+# SPDX-License-Identifier: BSD-3-Clause
+
 from typing import Tuple, Optional
 from dataclasses import dataclass
 

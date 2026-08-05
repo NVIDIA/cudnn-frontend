@@ -40,3 +40,15 @@ modules in `python/cudnn/`:
 
 Thank you also to the broader CUTLASS/CuTe DSL and infrastructure teams who
 supported the original kernel development.
+
+## HSTU attention
+
+The HSTU attention kernels and cuDNN Frontend integration were developed by
+NVIDIA. Low-level attention utilities build on FlashAttention and NVIDIA
+CUTLASS/CuTe DSL work. We thank the FlashAttention and CUTLASS contributors
+whose work made this integration possible.
+
+The retained file-level notices credit NVIDIA, Tri Dao, Jay Shah, Ganesh
+Bikshandi, Ying Zhang, Vijay Thakkar, and Pradeep Ramani. See
+[THIRD_PARTY_LICENSES.txt](THIRD_PARTY_LICENSES.txt) for the legal attributions
+and BSD 3-Clause license text.

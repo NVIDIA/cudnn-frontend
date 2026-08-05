@@ -1,16 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Batch-local sequence metadata for HSTU attention kernels."""
+
 from typing import Optional
 
 import cutlass
 import cutlass.cute as cute
 
-"""
-This consolidates all the info related to sequence length. This is so that we can do all
-the gmem reads once at the beginning of each tile, rather than having to repeat these reads
-to compute various things like n_block_min, n_block_max, etc.
-"""
-
 
 class SeqlenInfo:
+    """Load and cache one packed sequence's offsets and lengths."""
+
     def __init__(
         self,
         batch_idx: cutlass.Int32,
@@ -21,16 +22,27 @@ class SeqlenInfo:
         page_indptrs: Optional[cute.Tensor] = None,
         tile_m: int = 128,
     ):
-        assert cu_seqlens_q is not None and cu_seqlens_k is not None
-        self.offset_q = cu_seqlens_q[batch_idx]
-        self.offset_k = cu_seqlens_k[batch_idx]
-        self.padded_offset_q = cute.assume(
-            (self.offset_q + batch_idx * tile_m) // tile_m * tile_m,
-            divby=tile_m,
-        )
-        self.seqlen_q = cu_seqlens_q[batch_idx + 1] - self.offset_q
-        self.seqlen_k = cu_seqlens_k[batch_idx + 1] - self.offset_k
+        if cu_seqlens_q is None or cu_seqlens_k is None:
+            raise AssertionError("packed HSTU attention requires Q and K sequence offsets")
+
+        next_batch_idx = batch_idx + 1
+        q_start = cu_seqlens_q[batch_idx]
+        k_start = cu_seqlens_k[batch_idx]
+        q_end = cu_seqlens_q[next_batch_idx]
+        k_end = cu_seqlens_k[next_batch_idx]
+
+        self.offset_q = q_start
+        self.offset_k = k_start
+        self.seqlen_q = q_end - q_start
+        self.seqlen_k = k_end - k_start
 
         self.max_seqlen_q = max_seqlen_q
         self.max_seqlen_k = max_seqlen_k
-        self.page_ind = page_indptrs[batch_idx] if page_indptrs is not None else 0
+
+        padded_q_block = q_start // tile_m + batch_idx
+        self.padded_offset_q = cute.assume(padded_q_block * tile_m, divby=tile_m)
+
+        if page_indptrs is None:
+            self.page_ind = 0
+        else:
+            self.page_ind = page_indptrs[batch_idx]

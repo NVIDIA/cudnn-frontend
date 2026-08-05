@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
-# Portions Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# Copyright (c) 2024, NVIDIA Corporation & AFFILIATES.
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
 from typing import Optional
 

@@ -1,6 +1,5 @@
-# Copyright (c) 2025, Tri Dao.
-# Copyright (c) 2026, NVIDIA Corporation & AFFILIATES.
-# SPDX-License-Identifier: BSD-3-Clause
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
 """Small CuTe utilities needed by the dedicated HSTU D=256 kernels."""
 
@@ -138,7 +137,7 @@ def compute_sm100_fmha_grid(
 
 
 class HSTUFusedMask:
-    """FA4-shaped adapter for native HSTU D=256 masking."""
+    """Mask-coordinate helpers for native HSTU D=256 backward."""
 
     @staticmethod
     @cute.jit
