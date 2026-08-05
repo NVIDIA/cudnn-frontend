@@ -1,7 +1,7 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
-"""Public FE-OSS API for the Blackwell HSTU attention kernels."""
+"""Public FE-OSS API for the SM10x HSTU attention kernels."""
 
 from __future__ import annotations
 
@@ -163,13 +163,34 @@ def _stream_context(
 ):
     if stream is None:
         return nullcontext()
+    return torch.cuda.stream(_as_torch_stream(stream, device))
+
+
+def _as_torch_stream(
+    stream: cuda.CUstream | torch.cuda.Stream,
+    device: torch.device,
+) -> torch.cuda.Stream:
     if isinstance(stream, torch.cuda.Stream):
-        torch_stream = stream
-    elif int(stream) == 0:
-        torch_stream = torch.cuda.default_stream(device)
-    else:
-        torch_stream = torch.cuda.ExternalStream(int(stream), device=device)
-    return torch.cuda.stream(torch_stream)
+        if stream.device != device:
+            raise ValueError(f"stream must be on {device}, got {stream.device}")
+        return stream
+    if int(stream) == 0:
+        return torch.cuda.default_stream(device)
+    return torch.cuda.ExternalStream(int(stream), device=device)
+
+
+def _record_streams(
+    tensors: Tuple[Optional[torch.Tensor], ...],
+    stream: Optional[cuda.CUstream | torch.cuda.Stream],
+    device: torch.device,
+) -> None:
+    """Keep raw-pointer operands alive until an explicit-stream launch completes."""
+    if stream is None:
+        return
+    consumer = _as_torch_stream(stream, device)
+    for tensor in tensors:
+        if tensor is not None and tensor.is_cuda:
+            tensor.record_stream(consumer)
 
 
 def _empty_grad_like(tensor: torch.Tensor) -> torch.Tensor:
@@ -329,7 +350,7 @@ class _HSTUBase(APIBase):
 
         major, minor = torch.cuda.get_device_capability(q.device)
         if major != 10:
-            raise RuntimeError("HSTU SM100 requires an SM10x Blackwell GPU; found " f"SM{major}{minor} on {q.device}")
+            raise RuntimeError("HSTU SM100 requires an SM10x GPU; found " f"SM{major}{minor} on {q.device}")
 
         self.head_dim = int(q_dim)
         self.num_heads = int(q_heads)
@@ -492,7 +513,12 @@ class HSTUFwdSm100(_HSTUBase):
                 ("q_tensor", q),
                 ("k_tensor", self._sample_k),
                 ("v_tensor", self._sample_v),
+                ("cu_seqlens_q_tensor", self._sample_cu_seqlens_q),
+                ("cu_seqlens_k_tensor", self._sample_cu_seqlens_k),
+                ("func_tensor", self._sample_func),
                 ("paged_kv_tensor", paged),
+                ("page_ids_tensor", page_ids),
+                ("page_indptrs_tensor", page_indptrs),
             ),
         )
 
@@ -589,7 +615,12 @@ class HSTUFwdSm100(_HSTUBase):
                 ("q_tensor", q_tensor),
                 ("k_tensor", k_tensor),
                 ("v_tensor", v_tensor),
+                ("cu_seqlens_q_tensor", cu_seqlens_q_tensor),
+                ("cu_seqlens_k_tensor", cu_seqlens_k_tensor),
+                ("func_tensor", func_tensor),
                 ("paged_kv_tensor", paged_kv_tensor),
+                ("page_ids_tensor", page_ids_tensor),
+                ("page_indptrs_tensor", page_indptrs_tensor),
             ),
         )
 
@@ -612,6 +643,22 @@ class HSTUFwdSm100(_HSTUBase):
                 self.scaling_seqlen,
                 out=o_tensor,
             )
+        _record_streams(
+            (
+                q_tensor,
+                k_tensor,
+                v_tensor,
+                o_tensor,
+                cu_seqlens_q_tensor,
+                cu_seqlens_k_tensor,
+                func_tensor,
+                paged_kv_tensor,
+                page_ids_tensor,
+                page_indptrs_tensor,
+            ),
+            current_stream,
+            q_tensor.device,
+        )
 
 
 class HSTUBwdSm100(_HSTUBase):
@@ -699,6 +746,9 @@ class HSTUBwdSm100(_HSTUBase):
                 ("q_tensor", q),
                 ("k_tensor", k),
                 ("v_tensor", v),
+                ("cu_seqlens_q_tensor", self._sample_cu_seqlens_q),
+                ("cu_seqlens_k_tensor", self._sample_cu_seqlens_k),
+                ("func_tensor", self._sample_func),
             ),
         )
         self._is_supported = True
@@ -787,6 +837,9 @@ class HSTUBwdSm100(_HSTUBase):
                 ("q_tensor", q_tensor),
                 ("k_tensor", k_tensor),
                 ("v_tensor", v_tensor),
+                ("cu_seqlens_q_tensor", cu_seqlens_q_tensor),
+                ("cu_seqlens_k_tensor", cu_seqlens_k_tensor),
+                ("func_tensor", func_tensor),
             ),
         )
 
@@ -810,6 +863,22 @@ class HSTUBwdSm100(_HSTUBase):
                 False,
                 self.scaling_seqlen,
             )
+        _record_streams(
+            (
+                do_tensor,
+                q_tensor,
+                k_tensor,
+                v_tensor,
+                dq_tensor,
+                dk_tensor,
+                dv_tensor,
+                cu_seqlens_q_tensor,
+                cu_seqlens_k_tensor,
+                func_tensor,
+            ),
+            current_stream,
+            q_tensor.device,
+        )
 
 
 def hstu_attention_forward(
@@ -835,11 +904,12 @@ def hstu_attention_forward(
     resolved_max_q = _resolve_max_seqlen(max_seqlen_q, q_tensor.shape[0], "max_seqlen_q")
     resolved_max_k = _resolve_max_seqlen(max_seqlen_k, k_tensor.shape[0], "max_seqlen_k")
     resolved_scaling = float(resolved_max_q if scaling_seqlen is None else scaling_seqlen)
-    o_tensor = torch.empty(
-        q_tensor.shape,
-        dtype=q_tensor.dtype,
-        device=q_tensor.device,
-    )
+    with torch.cuda.device(q_tensor.device), _stream_context(stream, q_tensor.device):
+        o_tensor = torch.empty(
+            q_tensor.shape,
+            dtype=q_tensor.dtype,
+            device=q_tensor.device,
+        )
     cache_key = (
         _tensor_signature(q_tensor),
         _tensor_signature(k_tensor),
@@ -923,12 +993,13 @@ def hstu_attention_backward(
     resolved_max_q = _resolve_max_seqlen(max_seqlen_q, q_tensor.shape[0], "max_seqlen_q")
     resolved_max_k = _resolve_max_seqlen(max_seqlen_k, k_tensor.shape[0], "max_seqlen_k")
     resolved_scaling = float(resolved_max_q if scaling_seqlen is None else scaling_seqlen)
-    if dq_tensor is None:
-        dq_tensor = _empty_grad_like(q_tensor)
-    if dk_tensor is None:
-        dk_tensor = _empty_grad_like(k_tensor)
-    if dv_tensor is None:
-        dv_tensor = _empty_grad_like(v_tensor)
+    with torch.cuda.device(q_tensor.device), _stream_context(stream, q_tensor.device):
+        if dq_tensor is None:
+            dq_tensor = _empty_grad_like(q_tensor)
+        if dk_tensor is None:
+            dk_tensor = _empty_grad_like(k_tensor)
+        if dv_tensor is None:
+            dv_tensor = _empty_grad_like(v_tensor)
     cache_key = (
         _tensor_signature(do_tensor),
         _tensor_signature(q_tensor),

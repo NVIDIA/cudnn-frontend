@@ -1,5 +1,5 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
 """Tests for FP16/BF16 HSTU arbitrary-mask block metadata and consumption."""
 
@@ -876,7 +876,7 @@ def test_d256_bwd_paired_builder_is_graph_replayable_after_func_mutation():
     )
 
 
-@pytest.mark.L0
+@pytest.mark.L1
 @pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("head_dim", [64, 128, 256])
@@ -933,7 +933,7 @@ def test_arbitrary_forward_packed_tails_match_pytorch(dtype, head_dim, pattern):
         assert int(torch.count_nonzero(actual)) == 0
 
 
-@pytest.mark.L0
+@pytest.mark.L1
 @pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
 @pytest.mark.parametrize("head_dim", [64, 128, 256])
 @pytest.mark.parametrize(
@@ -1174,7 +1174,7 @@ def test_forward_graph_rebuilds_metadata_after_func_mutation(dtype):
     torch.testing.assert_close(out, full_output, rtol=0, atol=0)
 
 
-@pytest.mark.L0
+@pytest.mark.L1
 @pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("head_dim", [64, 128, 256])
@@ -1348,7 +1348,7 @@ def test_arbitrary_overlapping_intervals_match_union_semantics(
         )
 
 
-@pytest.mark.L0
+@pytest.mark.L1
 @pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
 @pytest.mark.parametrize("head_dim", [64, 128, 256])
 @pytest.mark.parametrize(
@@ -1451,7 +1451,7 @@ def test_arbitrary_backward_endpoint_prefetch_tracks_each_query_row(
         )
 
 
-@pytest.mark.L0
+@pytest.mark.L1
 @pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("head_dim", [64, 128, 256])
