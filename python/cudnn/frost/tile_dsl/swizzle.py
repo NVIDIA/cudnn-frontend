@@ -7,6 +7,39 @@ import cutlass.cute as cute
 
 
 @cute.jit
+def get_swizzled_col(
+    row: cutlass.Int32,
+    col: cutlass.Int32,
+    row_stride: cutlass.Constexpr[int],
+    elem_bytes: cutlass.Constexpr[int],
+) -> cutlass.Int32:
+    """Return the physical SMEM column for an XOR-swizzled row-major tile.
+
+    The XOR is applied at the 16-byte boundary for all element widths.
+    ``elem_bytes`` selects the element-domain shift and swizzle chunk size.
+    """
+    row_stride_bytes = row_stride * elem_bytes
+    chunk_bytes = 32
+    sw_bits = 1
+    row_shift = 2
+    if row_stride_bytes % 128 == 0:
+        chunk_bytes = 128
+        sw_bits = 3
+        row_shift = 0
+    elif row_stride_bytes % 64 == 0:
+        chunk_bytes = 64
+        sw_bits = 2
+        row_shift = 1
+    chunk_size = chunk_bytes // elem_bytes
+    elems_per_16b = 16 // elem_bytes
+    sw_base = elems_per_16b.bit_length() - 1
+    chunk = col // chunk_size
+    col_in_chunk = col % chunk_size
+    bit_msk = (1 << sw_bits) - 1
+    return chunk * chunk_size + (col_in_chunk ^ (((row >> row_shift) & bit_msk) << sw_base))
+
+
+@cute.jit
 def swizzle_xor_128b(row, col_elem, *, elem_bytes: cutlass.Constexpr[int] = 2):
     chunk_elems = 16 // elem_bytes
     chunk_idx = col_elem // chunk_elems
