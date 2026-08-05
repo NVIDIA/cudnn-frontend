@@ -32,6 +32,7 @@ from cutlass.experimental.cuda import tensor_map as tmap
 from cutlass._mlir.dialects import arith
 
 import cutlass
+from cutlass.base_dsl.typing import Pointer
 from cutlass.experimental import primitives as prims
 import cutlass.cute as cute
 import cuda.bindings.driver as _cuda_driver  # noqa: F401
@@ -330,6 +331,7 @@ def _kernel(
     tma_k_sf_desc: cutlass.GridConstant[tmap.TensorMap],
     tma_v_sf_desc: cutlass.GridConstant[tmap.TensorMap],
     lse_tensor: cute.Tensor,
+    amax_o_tensor: cute.Tensor,
     sinks_tensor: cute.Tensor,
     seq_kv_lens_tensor: cute.Tensor,
     o_desc_words: cute.Tensor,
@@ -573,6 +575,7 @@ def _kernel(
             bars=bars,
             sched=sched,
             lse_tensor=lse_tensor,
+            amax_o_tensor=amax_o_tensor,
             sinks_tensor=sinks_tensor,
             seq_kv_lens_tensor=seq_kv_lens_tensor,
             n_q_supers=n_q_supers,
@@ -1712,7 +1715,7 @@ def _softmax_kv_body(
 
     current_max = cute.math.max(max_a, max_b) * scale_log2
 
-    # cfence pins ptxas from hoisting stat-store work across the wg0/wg1 sync.
+    # sync the two softmax warpgroups before the stat-store.
     if sub_tile_id == 1:
         nvvm.barrier_cta_sync(barrier_id=8, thread_count=256)
 
@@ -1741,7 +1744,6 @@ def _softmax_kv_body(
     nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
     bars.mb_stat_full[sub_tile_id].arrive()
 
-    # SchedResBusyXU64 around exp2 biases ptxas to keep MUFU/exp pipe busy across dependent FFMA chain.
     reg_S_a = reg_S_a * scale_log2 - new_total_max
     reg_S_b = reg_S_b * scale_log2 - new_total_max
     reg_P_a = cute.math.exp2(reg_S_a, fastmath=True)
@@ -1968,6 +1970,7 @@ def _correction_warp_group(
     bars,
     sched,
     lse_tensor: cute.Tensor,
+    amax_o_tensor: cute.Tensor,
     sinks_tensor: cute.Tensor,
     seq_kv_lens_tensor,
     n_q_supers,
@@ -2056,7 +2059,6 @@ def _correction_warp_group(
                 bars.mb_bmm2_done[qs].wait(bmm2_done_phase)
 
                 # vec_scale_pair emits mul_packed_f32x2; without it the DSL lowers to scalar FMUL inside this runtime-if.
-                # cfence after each chunk keeps ptxas from sinking next tcgen05_ld ahead of prior tcgen05_st (TMEM anti-dep).
                 if ~all_alpha_one:
                     for chunk_idx in cutlass.range_constexpr(N_CHUNKS_O):
                         o_addr = tmem_base_iter + cutlass.Int32(tmem_O_off + chunk_idx * O_CHUNK)
@@ -2126,17 +2128,22 @@ def _correction_warp_group(
                 _cu = cutlass.make_array_view(seq_kv_lens_tensor)
                 _cu_q_b = cutlass.Int32(_cu[n_batch + batch_idx])
                 _s_q_b = cutlass.Int32(_cu[n_batch + batch_idx + cutlass.Int32(1)]) - _cu_q_b
-                if q_row_global < _s_q_b:
+                _row_valid = q_row_global < _s_q_b
+                if _row_valid:
                     lse_arr = cutlass.make_array_view(lse_tensor)
                     lse_row = lse_arr[cutlass.Int32(0), head_idx, :]
                     lse_row[_cu_q_b + q_row_global] = lse_val
             else:
-                if q_row_global < seqlen_q:
+                _row_valid = q_row_global < seqlen_q
+                if _row_valid:
                     lse_arr = cutlass.make_array_view(lse_tensor)
                     lse_row = lse_arr[batch_idx, head_idx, :]
                     lse_row[q_row_global] = lse_val
 
             sO_sub_base = sO[qs].base
+
+            _amax_o_ptr = Pointer(amax_o_tensor.iterator.raw_ptr(), dtype=cutlass.Int32)
+            _amax_o_local = cutlass.Float32(0.0)
 
             for chunk_idx in cutlass.range_constexpr(N_CHUNKS_O):
                 o_addr = tmem_base_epi + cutlass.Int32(tmem_O_off + chunk_idx * O_CHUNK)
@@ -2147,6 +2154,9 @@ def _correction_warp_group(
                 )
                 nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
                 o_scaled = o_chunk * inv_sum
+                for _i in cutlass.range_constexpr(O_CHUNK):
+                    _e = o_scaled[_i]
+                    _amax_o_local = cute.math.max(_amax_o_local, cute.math.max(_e, -_e))
                 o_out = o_scaled.to(OUT_STORAGE_DTYPE)
 
                 col_offset_const = (chunk_idx * O_CHUNK) % D_BLOCK_SIZE
@@ -2159,6 +2169,10 @@ def _correction_warp_group(
                 if chunk_idx == 0:
                     bars.mb_o_empty[qs].wait(o_empty_phase)
                 smem_ptr.store_swizzled(o_out, alignment=64, swizzle=_O_SMEM_SWIZZLE)
+
+            # One atomic per valid row (invalid/OOB rows must not poison the global amax).
+            if _row_valid:
+                nvvm.atomicrmw(nvvm.AtomicOp.MAX, _amax_o_ptr, _amax_o_local.bitcast(cutlass.Int32))
 
             # fence_proxy needed before TMA reads SMEM written by tcgen05_st.
             nvvm.fence_proxy("async.shared", space="cta")
@@ -2208,6 +2222,7 @@ def _host(
     sf_k_tensor: cute.Tensor,
     sf_v_tensor: cute.Tensor,
     lse_tensor: cute.Tensor,
+    amax_o_tensor: cute.Tensor,
     sinks_tensor: cute.Tensor,
     seq_kv_lens_tensor: cute.Tensor,
     o_desc_words: cute.Tensor,
@@ -2339,6 +2354,7 @@ def _host(
         tma_k_sf_desc,
         tma_v_sf_desc,
         lse_tensor,
+        amax_o_tensor,
         sinks_tensor,
         seq_kv_lens_tensor,
         o_desc_words,
@@ -2432,6 +2448,12 @@ def compile(
         stride_order=(2, 1, 0),
         assumed_align=16,
     )
+    fake_amax_o = cute.runtime.make_fake_compact_tensor(
+        cutlass.Float32,
+        (1,),
+        stride_order=(0,),
+        assumed_align=16,
+    )
     fake_sinks = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32,
         (qh,),
@@ -2466,6 +2488,7 @@ def compile(
         fake_sf_k,
         fake_sf_v,
         fake_lse,
+        fake_amax_o,
         fake_sinks,
         fake_seq_kv_lens,
         fake_o_desc,
@@ -2475,5 +2498,5 @@ def compile(
         cutlass.Int32(_q_sf_tiles),
         cutlass.Int32(_kv_sf_tiles),
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
-        options="--enable-tvm-ffi",  # SM100: cfence not honored / not emitted
+        options="--enable-tvm-ffi",
     )

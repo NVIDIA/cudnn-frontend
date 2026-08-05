@@ -9,8 +9,9 @@ import logging
 import math
 import os
 from abc import abstractmethod
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Callable, Hashable, Optional
+from typing import Callable, Hashable, Iterator, Optional
 
 import torch
 from cuda.bindings import driver as cuda
@@ -26,6 +27,7 @@ from cudnn.frost.tile_dsl.constants import (
     MASK_NONE,
     MASK_PADDED,
     MASK_SWA,
+    SCHED_LPT,
     SCHED_NATURAL,
 )
 from cudnn.sdpa.fwd.config_sm100 import TemplateParams as Sm100TemplateParams
@@ -71,6 +73,25 @@ _SM120_DTYPE_QKV_CODE = {
 # the cuTensorMap GMEM alignment (64 B) with margin. torch storage bases are
 # 512 B aligned, so 128 B-multiple offsets stay 128 B aligned absolutely.
 _WS_ALIGN = 128
+
+
+@contextmanager
+def _torch_stream_context(current_stream: Optional[cuda.CUstream], device: torch.device) -> Iterator[None]:
+    """Run PyTorch work on the CUDA stream used for the kernel launch."""
+    if current_stream is None:
+        yield
+        return
+    handle = int(current_stream)
+    torch_current = torch.cuda.current_stream(device)
+    torch_default = torch.cuda.default_stream(device)
+    if handle == torch_current.cuda_stream:
+        launch_stream = torch_current
+    elif handle == torch_default.cuda_stream:
+        launch_stream = torch_default
+    else:
+        launch_stream = torch.cuda.ExternalStream(handle, device=device)
+    with torch.cuda.stream(launch_stream):
+        yield
 
 
 def ws_align(nbytes: int) -> int:
@@ -566,6 +587,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # picks the fused path with no user action.
         mxfp8 = self._fp8 and not self._pertensor
         fused_ldtm_stat = mxfp8 and (self._device_cc == (10, 3))
+        sched_policy = self.sched_policy
+        if mxfp8 and sched_policy == SCHED_NATURAL and (self.mask_flags & MASK_CAUSAL):
+            sched_policy = SCHED_LPT
         params = Sm100TemplateParams(
             dtype_qkv=_SM100_DTYPE_QKV_CODE[self.dtype],
             dtype_o=_SM100_DTYPE_QKV_CODE[self.dtype_o],
@@ -575,7 +599,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             has_sink=self.has_sink,
             seq_kv_lens_present=self.seq_kv_lens_present,
             seq_q_lens_present=self.seq_q_lens_present,
-            sched_policy=self.sched_policy,
+            sched_policy=sched_policy,
             thd_varlen=self.thd,
             fused_ldtm_stat=fused_ldtm_stat,
         )
@@ -971,6 +995,17 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         )
         o_desc_dummy = self._dummy("o_desc", device, lambda: torch.zeros(1, dtype=torch.int64, device=device))
 
+        amax_o_buf = (
+            amax_o.reshape(-1)[:1]
+            if amax_o is not None
+            else self._dummy("amax_o", device, lambda: torch.zeros(1, dtype=torch.float32, device=device))
+        )
+        # Must be enqueued on the SAME stream as the kernel launch below, else the
+        # reset and the kernel's atomicMax are unordered (and the reset is missing
+        # from a CUDA-graph capture taken on the handle's stream).
+        with _torch_stream_context(current_stream, device):
+            amax_o_buf.zero_()
+
         self._compiled_kernel(
             Q,
             K,
@@ -980,6 +1015,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             sf_k_v,
             sf_v_v,
             lse,
+            amax_o_buf,
             sinks_t,
             seq_kv_t,
             o_desc_dummy,
@@ -992,12 +1028,6 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         )
         if o_needs_copy_back:
             O_view.copy_(O)
-        if amax_o is not None:
-            # Cast to fp32 before abs(): torch has no abs for fp8 output dtypes. For
-            # FP8 O this is the amax of the (already-quantized) output — exact when
-            # no saturation, which the direct-cast (scale=1) epilogue guarantees for
-            # in-range attention outputs.
-            amax_o.reshape(-1)[:1] = O_view.to(torch.float32).abs().max()
         self._logger.debug("execute (MXFP8) completed")
 
     def _execute_fp8(
@@ -1066,8 +1096,11 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # dividing by scale_o below yields the pre-quant output amax.
         amax_s_buf = amax_s.reshape(-1)[:1] if amax_s is not None else self._dummy("amax_s", device, lambda: torch.zeros(1, dtype=torch.float32, device=device))
         amax_o_buf = amax_o.reshape(-1)[:1] if amax_o is not None else self._dummy("amax_o", device, lambda: torch.zeros(1, dtype=torch.float32, device=device))
-        amax_s_buf.zero_()
-        amax_o_buf.zero_()
+        # Same-stream ordering as MXFP8: the resets must precede the kernel's
+        # atomicMax on the launch stream, not on torch's current stream.
+        with _torch_stream_context(current_stream, device):
+            amax_s_buf.zero_()
+            amax_o_buf.zero_()
 
         self._compiled_kernel(
             Q,

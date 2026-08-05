@@ -32,6 +32,7 @@ from cudnn.frost.tile_dsl.constants import (
     MASK_NONE,
     MASK_PADDED,
     MASK_SWA,
+    SCHED_LPT,
     SCHED_NATURAL,
 )
 
@@ -108,8 +109,8 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
             raise ValueError(f"{flavor}: SEQ_Q_LENS_PRESENT is dense-only (THD carries per-sequence Q lengths via cu_seqlens)")
         if not k.seq_kv_lens_present:
             raise ValueError(f"{flavor}: SEQ_Q_LENS_PRESENT requires SEQ_KV_LENS_PRESENT (padding mask)")
-    if k.sched_policy != SCHED_NATURAL:
-        raise ValueError(f"{flavor}: only SCHED_NATURAL (0) is wired up; got {k.sched_policy}")
+    if k.sched_policy not in (SCHED_NATURAL, SCHED_LPT):
+        raise ValueError(f"{flavor}: only SCHED_NATURAL (0) / SCHED_LPT (1) are wired up; got {k.sched_policy}")
 
 
 # ---------------------------------------------------------------------------
