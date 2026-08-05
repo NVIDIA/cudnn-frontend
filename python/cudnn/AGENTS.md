@@ -8,6 +8,31 @@ The `cudnn` Python package: pybind11-backed graph API plus pure-Python **fronten
 - Never add an eager `import torch` / `import cutlass` to `__init__.py` or anything it imports transitively. `api_base.py` itself imports them at top level, which is why kernel classes must only be reachable through the lazy table.
 - Reuse the existing `[cutedsl]` extra (`pyproject.toml` optional-dependencies) unless a kernel truly needs a new package.
 
+## Hard rules
+
+Numbered so reviews can cite them; the list grows — append, never renumber.
+
+**Rule 1 — `execute()` is a zero-surprise hot path: validate, never convert, never allocate.**
+
+- **No implicit conversions.** Never `.to(dtype)`, and never a `reshape()` that can
+  copy, on an execute argument: both silently allocate and launch a kernel per
+  call, and the fresh pointer breaks CUDA-graph capture. Worse, for an *output*
+  tensor a reshape copy swallows the kernel's write. Validate dtype / shape /
+  contiguity and bind a true view (`.view()` or a checked `reshape`), raising
+  `ValueError` otherwise — see `_checked_lse_view` / `_checked_sinks_1d` /
+  `_checked_seq_lens` in `sdpa/fwd/api_dsl.py`.
+- **No per-execute allocations.** No `torch.empty`/`torch.zeros` inside
+  `execute()`: scratch is carved from the caller's workspace
+  (`scratch_workspace_bytes()` contract), and a dead ABI slot may use a
+  one-time cached dummy (`_dummy`) at most. Prefer compiling the unused
+  operand out entirely (CuTeDSL specializes on `None` via
+  `cutlass.const_expr` — see the SM120 SDPA kernel's optional lse/sinks).
+- **Init-time flags are compile-time specializations; `execute()` must match
+  them exactly, in both directions.** A required-but-missing tensor must
+  raise, never fall back to a zeros dummy (zeros sinks change the softmax
+  denominator; zeros seq lens mask every row — silently wrong output). A
+  provided-but-uncompiled tensor must also raise, never be silently ignored.
+
 ## Frontend-only kernel package layout
 
 ```
