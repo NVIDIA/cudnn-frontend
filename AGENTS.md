@@ -94,3 +94,10 @@ Reusable task recipes live in `skills/` (auto-discovered by Claude Code via `.cl
 - Published documentation: <https://docs.nvidia.com/deeplearning/cudnn/latest/developer/overview.html>
 - In-repo docs index: [llms.txt](llms.txt) · operation reference in [docs/operations/](docs/operations/) · OSS kernel APIs in [docs/fe-oss-apis/overview.md](docs/fe-oss-apis/overview.md)
 - PyPI: <https://pypi.org/project/nvidia-cudnn-frontend/>
+
+
+## PR labels
+
+When opening a pull request, apply **at minimum one label from each group**: one `cat-*` (change type), one or more `mod-*` (affected module), and one `orig-*` (originator). See the full label list at <https://github.com/NVIDIA/cudnn-frontend/labels>.
+
+Leave `closed-*` and `open-*` labels for maintainers.
