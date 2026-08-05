@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from .nsa_top_k_reduction_fwd import FineGrainedReductionQK
 
 from cuda.bindings import driver as cuda

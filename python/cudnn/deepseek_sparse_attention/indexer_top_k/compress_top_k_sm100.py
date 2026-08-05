@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """CuTeDSL stage-2 top-k over the *compact* (compressed-logits) cand_buffer.
 
 Stage 1 (the logits GEMM epilogue, in compress mode) writes only the valid

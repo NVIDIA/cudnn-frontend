@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """The public ``cudnn.pygraph`` surface must be POSITIONALLY identical to the
 classic API (callers pass name/handle/stride/... by position — pycudnnTest
 does exactly that for the constructor). New parameters must be keyword-only so

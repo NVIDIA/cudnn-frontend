@@ -1,10 +1,13 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import cuda.bindings.driver as cuda
 import math
 from typing import Tuple, Type, Optional
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.typing import Float32, Int32, BFloat16, Int64
+from cutlass.cute.typing import Float32, Int32, Int64
 import cutlass.pipeline as pipeline
 from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils
@@ -17,6 +20,7 @@ class FlashAttentionDSABackwardSm100:
 
     def __init__(
         self,
+        element_dtype: Type[cutlass.Numeric],
         head_dim: int,
         head_dim_v: int,
         block_tile: int,
@@ -40,9 +44,11 @@ class FlashAttentionDSABackwardSm100:
         self.QdS_cta_tiler = (head_dim_main, block_tile, block_tile)
         self.cluster_shape_mn = (1, 1)
 
-        self.element_dtype = BFloat16
-        # User constraint: dKV accumulation must stay FP32. BFloat16 is only
-        # used for element/output storage.
+        if element_dtype not in [cutlass.Float16, cutlass.BFloat16]:
+            raise ValueError(f"Unsupported element dtype: {element_dtype}")
+        self.element_dtype = element_dtype
+        # dKV accumulation stays FP32; element_dtype controls element/output
+        # storage.
         self.acc_dtype = Float32
 
         # =============== Sum OdO ================
@@ -581,25 +587,24 @@ class FlashAttentionDSABackwardSm100:
             stream=stream,
         )
 
-        if cutlass.const_expr(self.same_hdim_kv):
-            dSink_grid = (
-                cute.ceil_div(problem_shape[0], self.dSink_block_q),
-                problem_shape[3][0],
-                problem_shape[3][1],
-            )
-            self.sum_dSink(
-                sum_OdO,
-                scaled_LSE,
-                mAttnSink,
-                mdSink,
-                problem_shape,
-            ).launch(
-                grid=dSink_grid,
-                block=[self.dSink_num_threads, 1, 1],
-                cluster=[1, 1, 1],
-                stream=stream,
-                min_blocks_per_mp=1,
-            )
+        dSink_grid = (
+            cute.ceil_div(problem_shape[0], self.dSink_block_q),
+            problem_shape[3][0],
+            problem_shape[3][1],
+        )
+        self.sum_dSink(
+            sum_OdO,
+            scaled_LSE,
+            mAttnSink,
+            mdSink,
+            problem_shape,
+        ).launch(
+            grid=dSink_grid,
+            block=[self.dSink_num_threads, 1, 1],
+            cluster=[1, 1, 1],
+            stream=stream,
+            min_blocks_per_mp=1,
+        )
 
     @cute.kernel
     def convert(
@@ -683,21 +688,20 @@ class FlashAttentionDSABackwardSm100:
                     lse_bhq = lse[bidy, (idx_q + offset, bidz)]
                     sum_OdO_bhq = sum_OdO_scale * acc
 
-                    if cutlass.const_expr(self.same_hdim_kv):
-                        attn_sink_bh = attn_sink[bidy, (0, bidz)]
+                    # FlashMLA LSE excludes the sink for every head-dim
+                    # specialization, so always fold it into the denominator.
+                    attn_sink_bh = attn_sink[bidy, (0, bidz)]
 
-                        log2_e = -lse_scale
-                        lse_log2 = lse_bhq * log2_e
-                        sink_log2 = attn_sink_bh * log2_e
-                        lse_max_log2 = cute.arch.fmax(lse_log2, sink_log2)
-                        sum_exp2 = Float32(cute.math.exp2(lse_log2 - lse_max_log2) + cute.math.exp2(sink_log2 - lse_max_log2))
-                        lse_with_sink_log2 = lse_max_log2 + cute.math.log2(sum_exp2)
-                        scaled_lse_bhq = -lse_with_sink_log2
+                    log2_e = -lse_scale
+                    lse_log2 = lse_bhq * log2_e
+                    sink_log2 = attn_sink_bh * log2_e
+                    lse_max_log2 = cute.arch.fmax(lse_log2, sink_log2)
+                    sum_exp2 = Float32(cute.math.exp2(lse_log2 - lse_max_log2) + cute.math.exp2(sink_log2 - lse_max_log2))
+                    lse_with_sink_log2 = lse_max_log2 + cute.math.log2(sum_exp2)
+                    scaled_lse_bhq = -lse_with_sink_log2
 
-                        if lse_bhq == Float32(float("inf")):
-                            scaled_lse_bhq = Float32(float("-inf"))
-                    else:
-                        scaled_lse_bhq = lse_scale * lse_bhq
+                    if lse_bhq == Float32(float("inf")):
+                        scaled_lse_bhq = Float32(float("-inf"))
 
                     sum_OdO[bidy, (idx_q + offset, bidz)] = sum_OdO_bhq
                     scaled_lse[bidy, (idx_q + offset, bidz)] = scaled_lse_bhq

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Test suite for block_scale_quantize Python API.
 Based on blackwell_nvfp4_mxfp8_block_scale_matmul.cpp

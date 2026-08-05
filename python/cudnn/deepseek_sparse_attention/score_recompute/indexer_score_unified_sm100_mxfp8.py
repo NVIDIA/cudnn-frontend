@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """SM100 CuTeDSL unified MXFP8 dense indexer-score kernel.
 
 This module owns the MXFP8 blockscaled QK producer and unified indexer epilogue

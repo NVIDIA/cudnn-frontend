@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Tests for Discrete-weight Grouped GEMM dGLU Backward Kernel (SM100+)
 """
@@ -620,7 +623,7 @@ def test_discrete_dswiglu_wrapper_cache_dynamic_m_smoke(request, monkeypatch):
 def _test_discrete_dswiglu_wrapper_dynamic_m_cache_behavior(request, monkeypatch):
     try:
         from cudnn import discrete_grouped_gemm_dswiglu_wrapper_sm100
-        from cudnn.discrete_grouped_gemm.discrete_grouped_gemm_dswiglu import api as discrete_grouped_gemm_dswiglu_api
+        from cudnn.gemm.cutedsl.discrete_grouped.dswiglu import api as discrete_grouped_gemm_dswiglu_api
         from cuda.bindings import driver as cuda
     except ImportError:
         pytest.skip("Environment not supported: cudnn optional dependencies not installed")

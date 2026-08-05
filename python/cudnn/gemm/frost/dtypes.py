@@ -1,0 +1,244 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+
+"""
+Shared dtype conversion tables for the GEMM engine (single source of truth).
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+import cudnn
+
+from .fusion_ir import Dtype, FusionChain
+
+# internal dtype -> cute-DSL / cutlass type name (same string serves both the
+# `.to(<type>)` DSL casts and the `cutlass.<Type>` enum args). FP4 is packed
+# 2-per-byte as Float4E2M1FNx2.
+DTYPE_TO_CUTLASS: dict[Dtype, str] = {
+    "bf16": "cutlass.BFloat16",
+    "fp16": "cutlass.Float16",
+    "fp32": "cutlass.Float32",
+    "int8": "cutlass.Int8",
+    "fp8_e4m3": "cutlass.Float8E4M3FN",
+    "fp8_e5m2": "cutlass.Float8E5M2",
+    "fp8_e8m0": "cutlass.Float8E8M0FNU",
+    "fp4_e2m1": "cutlass.Float4E2M1FNx2",
+    "uint8": "cutlass.Uint8",
+    "int32": "cutlass.Int32",
+    "int64": "cutlass.Int64",
+}
+
+# internal dtype -> element size in bytes (FP4 packs 2/byte; counted as 1 here).
+DTYPE_BYTES: dict[Dtype, int] = {
+    "bf16": 2,
+    "fp16": 2,
+    "fp32": 4,
+    "int8": 1,
+    "fp8_e4m3": 1,
+    "fp8_e5m2": 1,
+    "fp8_e8m0": 1,
+    "fp4_e2m1": 1,
+    "uint8": 1,
+    "int32": 4,
+    "int64": 8,
+}
+
+# Element width in BITS. Only sub-byte dtypes differ from DTYPE_BYTES * 8 — fp4
+# is stored packed 2/byte, so DTYPE_BYTES reads 1 and cannot tell fp4 from fp8.
+DTYPE_BITS: dict[Dtype, int] = {**{dt: nbytes * 8 for dt, nbytes in DTYPE_BYTES.items()}, "fp4_e2m1": 4}
+
+# input dtype -> tcgen05 MMA kind.
+DTYPE_TO_MMA_KIND: dict[Dtype, str] = {
+    "bf16": "nvvm.Tcgen05MMAKind.F16",
+    "fp16": "nvvm.Tcgen05MMAKind.F16",
+    "fp8_e4m3": "nvvm.Tcgen05MMAKind.F8F6F4",
+    "fp8_e5m2": "nvvm.Tcgen05MMAKind.F8F6F4",
+    "int8": "nvvm.Tcgen05MMAKind.INT8",
+}
+
+# cudnn.data_type <-> internal dtype.
+DTYPE_FROM_CUDNN: dict[Any, Dtype] = {
+    cudnn.data_type.BFLOAT16: "bf16",
+    cudnn.data_type.HALF: "fp16",
+    cudnn.data_type.FLOAT: "fp32",
+    cudnn.data_type.INT8: "int8",
+    cudnn.data_type.FP8_E4M3: "fp8_e4m3",
+    cudnn.data_type.FP8_E5M2: "fp8_e5m2",
+    cudnn.data_type.FP8_E8M0: "fp8_e8m0",
+    cudnn.data_type.FP4_E2M1: "fp4_e2m1",
+    cudnn.data_type.UINT8: "uint8",
+    cudnn.data_type.INT32: "int32",
+    cudnn.data_type.INT64: "int64",
+}
+
+CUDNN_FROM_DTYPE: dict[Dtype, Any] = {v: k for k, v in DTYPE_FROM_CUDNN.items()}
+
+
+# --- Memory alignment ------------------------------------------------------
+# A tensor's alignment is one number (bytes, a power of 2 in {1,2,4,8,16,32})
+# that bounds the widest load/store vector its accesses can use. It is the min
+# of three sub-alignments; 32 is the cap (the widest HW memory access).
+
+MAX_MEM_ACCESS_BYTES = 32
+
+
+def _pow2_floor(x: int, cap: int = MAX_MEM_ACCESS_BYTES) -> int:
+    """Largest power of 2 (<= cap) dividing ``x``; ``cap`` when ``x`` is 0 (no
+    constraint) or divisible by a higher power than the cap."""
+    if x <= 0:
+        return cap
+    return min(x & (-x), cap)  # x & -x isolates the lowest set bit
+
+
+def tensor_alignment(shape, stride, elem_bytes: int, ptr: "int | None" = None, cap: int = MAX_MEM_ACCESS_BYTES) -> int:
+    """Byte alignment of a tensor = ``min(A_ptr, A_stride, A_shape)`` capped at
+    ``cap``. Strides/shapes are element counts; alignment is measured in bytes,
+    so each is scaled by ``elem_bytes``.
+
+    - **A_ptr**: largest power of 2 dividing the base byte address. Included only
+      when ``ptr`` is given — at compile time the pointer alignment is a promise
+      (``assumed_align``), not yet a value, so it is omitted.
+    - **A_stride**: min over dims with ``shape!=1 and stride!=1`` of
+      ``pow2(stride*elem_bytes)``; no such dim -> ``cap`` (no row stride to honor).
+    - **A_shape**: ``pow2(leading_shape*elem_bytes)`` where the leading dim is the
+      one with ``stride==1 and shape!=1``; no such dim -> ``elem_bytes`` (nothing
+      is contiguous, so only a single element can be moved at a time).
+    """
+    a = cap
+    if ptr is not None:
+        a = min(a, _pow2_floor(int(ptr), cap))
+
+    stride_align = cap
+    for sh, st in zip(shape, stride):
+        if sh != 1 and st != 1:
+            stride_align = min(stride_align, _pow2_floor(int(st) * elem_bytes, cap))
+    a = min(a, stride_align)
+
+    shape_align = None
+    for sh, st in zip(shape, stride):
+        if st == 1 and sh != 1:
+            shape_align = _pow2_floor(int(sh) * elem_bytes, cap)
+            break
+    if shape_align is None:
+        shape_align = min(elem_bytes, cap)
+    a = min(a, shape_align)
+    return a
+
+
+def allowed_store_vsize(dim, stride, dtype: str) -> int:
+    """Widest STG vector (element count) a dense output allows = the tensor's OWN
+    declared-layout alignment (``tensor_alignment`` over its ``dim`` + ``stride``)
+    in elements. The store width is derived from the tensor, not fixed then
+    rejected — it never exceeds what the buffer's row stride / contiguous extent
+    can address (the ptr layer is re-checked at run time). Raises below the
+    4-byte scalar-store floor."""
+    elem_bytes = DTYPE_BYTES[dtype]
+    align_bytes = tensor_alignment(dim, stride, elem_bytes)
+    if align_bytes < 4:
+        raise ValueError(
+            f"output row stride must be at least 4-byte aligned but got alignment "
+            f"{align_bytes} bytes for dim={dim}, stride={stride}, dtype={dtype!r}. "
+            f"PTX scalar store requires 4-byte natural alignment; sub-32-bit "
+            f"element stores are not supported by this kernel."
+        )
+    return align_bytes // elem_bytes
+
+
+def dense_output_layout(chain: FusionChain, dtype: "str", dim, stride) -> tuple:
+    """A dense output's ``(dim, stride)``, filling in what the graph didn't
+    record. cuDNN assigns a derived tensor's dim only at ``build_operation_graph``
+    time, so a recorded stride usually arrives WITHOUT one — recover the dim from
+    the problem size (the logical output shape, fp4 packed 2/byte along N) instead
+    of discarding the stride. Both missing (e.g. MoE outputs, compact by
+    construction) → the compact N-major layout."""
+    mm = chain.matmul
+    if not stride:
+        return (mm.batch, mm.M, mm.N), (mm.M * mm.N, mm.N, 1)
+    if not dim:
+        n = mm.N // 2 if dtype == "fp4_e2m1" else mm.N
+        dim = (mm.batch, mm.M, n)
+    return dim, stride
+
+
+def _allowed_vsize(chain: FusionChain, dtype: "str", dim=None, stride=None) -> int:
+    """This dense output's widest STG vector (elements) = its OWN declared-layout
+    alignment."""
+    dim, stride = dense_output_layout(chain, dtype, dim, stride)
+    return allowed_store_vsize(dim, stride, dtype)
+
+
+def _compute_output_vec_bytes(chain: FusionChain, tile_cols: "int | None" = None) -> int:
+    """Epilogue chunk width in bytes of the first dense output's dtype. The
+    chunk ELEMENT count (vsize) is order-independent: a quant pins vsize to its
+    block size; otherwise vsize = the min over every dense output's widest
+    allowed store. M-major output → elem_bytes (scalar / TMA store).
+
+    ``tile_cols`` (the per-CTA epilogue drain width in accumulator columns, when
+    the tile config is known) additionally clamps the chunk so it divides every
+    power-of-2 subtile span the epilogue decomposes the tile into — i.e. vsize
+    never exceeds the lowest set bit of ``tile_cols``. Without it a chunk wider
+    than the N-tile would make interior tiles store into their neighbours."""
+    elem_bytes = DTYPE_BYTES[chain.output_dtype]
+    if chain.out_major == "m":
+        return elem_bytes
+    if chain.quants:
+        vsize = max(q.block_size for q in chain.quants)
+    else:
+        vsize = min(
+            (_allowed_vsize(chain, spec.dtype, spec.dim, spec.stride) for spec in chain.output_specs if spec.dtype != "fp4_e2m1"),
+            default=_allowed_vsize(chain, chain.output_dtype),
+        )
+    vec_bytes = vsize * elem_bytes
+    if tile_cols is not None:
+        vec_bytes = min(vec_bytes, _pow2_floor(tile_cols * elem_bytes))
+    return vec_bytes
+
+
+def _aux_align_reqs(chain: FusionChain, vec_bytes: "int | None" = None) -> dict:
+    """Per-aux required byte alignment = the width its LDG uses (matches
+    ``epilogue_codegen``): per-col/per-elem read a ``vsize``-element vector at
+    ``min(aux alignment, vsize*elem_bytes)``; scalar/per-row read one element.
+    ``vec_bytes`` overrides the chain-derived chunk width (pass the tile-clamped
+    value the kernel was rendered with)."""
+    reqs: dict = {}
+    if vec_bytes is None:
+        vec_bytes = _compute_output_vec_bytes(chain)
+    vsize = vec_bytes // DTYPE_BYTES[chain.output_dtype]
+    for aux in chain.aux_tensors:
+        aeb = DTYPE_BYTES[aux.dtype]
+        if aux.bcast_mode in ("per_col", "per_elem"):
+            reqs[aux.name] = min(tensor_alignment(aux.dim, aux.stride, aeb), vsize * aeb)
+        else:
+            reqs[aux.name] = aeb
+    return reqs
+
+
+def _output_align_reqs(chain: FusionChain, use_tma_store: bool, vec_bytes: "int | None" = None) -> "list[int]":
+    """Per-output required byte alignment, one per ``chain.outputs`` slot (dense
+    specs, then reductions, then quant scales) = the width its store uses
+    (matches the epilogue): reduction / quant-scale side outputs store scalar
+    (1); an M-major dense output uses 16 on the TMA path, else a scalar scatter;
+    the TMA-store dense output needs 16; fp4 data packs 2/byte; everything else
+    stores ``vsize`` elements. Major is read per slot — ``chain.out_major`` only
+    governs the shared epilogue chunk, and a tap may carry the other major.
+    ``vec_bytes`` overrides the chain-derived chunk width (pass the tile-clamped
+    value the kernel was rendered with)."""
+    if vec_bytes is None:
+        vec_bytes = _compute_output_vec_bytes(chain)
+    vsize = 1 if chain.out_major == "m" else vec_bytes // DTYPE_BYTES[chain.output_dtype]
+    reqs = []
+    for i, out in enumerate(chain.outputs):
+        eb = DTYPE_BYTES[out.dtype]
+        if out.is_reduction or out.is_quant_scale:
+            reqs.append(1)
+        elif chain.output_specs[i].major == "m":
+            reqs.append(16 if use_tma_store else eb)
+        elif use_tma_store and i == 0:
+            reqs.append(16)
+        elif out.dtype == "fp4_e2m1":
+            reqs.append(max(vsize // 2, 4))
+        else:
+            reqs.append(min(vsize, _allowed_vsize(chain, out.dtype, out.dim, out.stride)) * eb)
+    return reqs

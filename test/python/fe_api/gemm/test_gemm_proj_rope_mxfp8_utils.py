@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Utilities and parameterization for the fused GEMM + per-head RoPE + MXFP8 projection tests.
 
@@ -146,7 +149,7 @@ def check_ref_gemm_proj_rope_mxfp8(x, w, cos, sin, outputs, w_out_in, skip_ref=F
         print("Skipping reference check")
         return
 
-    from cudnn.gemm_proj_rope_mxfp8 import gemm_proj_rope_mxfp8_reference
+    from cudnn.gemm.cutedsl.dense.proj_rope_mxfp8 import gemm_proj_rope_mxfp8_reference
 
     out_fp8_row, out_scales_row, out_fp8_col, out_scales_col = outputs
     ref_qr, ref_sr, ref_qc, ref_sc = gemm_proj_rope_mxfp8_reference(x, w, cos, sin, w_out_in=w_out_in)

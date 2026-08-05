@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Utilities for DSA (DeepSeek Sparse Attention) tests.
 
@@ -15,6 +18,11 @@ import torch
 def _require_sm90():
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9:
         pytest.skip("SM90 GPU required")
+
+
+def _require_sm100():
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("SM100 GPU required")
 
 
 # Parameterization marks shared by every DSA test

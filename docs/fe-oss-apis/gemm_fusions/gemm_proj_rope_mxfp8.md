@@ -165,8 +165,8 @@ Returns a `TupleDict` with keys `out_fp8_row`, `out_scales_row`, `out_fp8_col`, 
 
 Integrated from the DeepSeek-V3 MLA fused Q up-projection kernel developed for Megatron-LM MXFP8 training (Blackwell / customte CUTLASS 4.4.1); originally added in the GEMM+RoPE+MXFP8 fusion commit. The BF16-GEMM and MXFP8-GEMM variants were consolidated into two input-precision kernel modules selected by input dtype:
 
-- `python/cudnn/gemm_proj_rope_mxfp8/gemm_proj_rope_mxfp8_bf16in.py` — BF16-input kernel; also hosts the pure-PyTorch oracle `gemm_proj_rope_mxfp8_reference(...)`.
-- `python/cudnn/gemm_proj_rope_mxfp8/gemm_proj_rope_mxfp8_mxfp8in.py` — MXFP8-input kernel.
+- `python/cudnn/gemm/cutedsl/dense/proj_rope_mxfp8/gemm_proj_rope_mxfp8_bf16in.py` — BF16-input kernel; also hosts the pure-PyTorch oracle `gemm_proj_rope_mxfp8_reference(...)`.
+- `python/cudnn/gemm/cutedsl/dense/proj_rope_mxfp8/gemm_proj_rope_mxfp8_mxfp8in.py` — MXFP8-input kernel.
 
 The compiled-kernel lifecycle (`check_support`/`compile`/`execute`) lives in the APIBase classes in `api.py`; the wrapper caches the compiled objects (matching the sibling GEMM-fusion packages).
 

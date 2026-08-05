@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Compressed-logits + stage-2 Top-K orchestration for SM100.
 
 The shared score kernels remain owned by score_recompute. This module only

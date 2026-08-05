@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Indexer Forward Interface - SM90 direct CuTe DSL backend.
 
 This wrapper launches ``IndexerForwardSm90``, a direct CuTeDSL port of the old
@@ -75,8 +78,8 @@ def indexer_fwd(
     w: torch.Tensor,
     ratio: int = 4,
     qhead_per_kv_head: Optional[int] = None,
-    out: Optional[torch.Tensor] = None,
     sm_scale: float = 1.0,
+    out: Optional[torch.Tensor] = None,
     cu_seqlens_q: Optional[torch.Tensor] = None,
     cu_seqlens_k: Optional[torch.Tensor] = None,
     max_seqlen_q: Optional[int] = None,

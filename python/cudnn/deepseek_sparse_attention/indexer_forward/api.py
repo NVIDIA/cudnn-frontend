@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """APIBase wrapper and dispatcher for indexer forward CuTe DSL score kernels.
 
 ``indexer_forward_wrapper`` produces dense indexer scores Q @ K^T with
@@ -193,6 +196,7 @@ def indexer_forward_wrapper(
     q_stage: int = 2,
     kv_stage: int = 4,
     sm_scale: float = 1.0,
+    out: Optional[torch.Tensor] = None,
     stream: Optional[cuda.CUstream] = None,
     cu_seqlens_q: Optional[torch.Tensor] = None,
     cu_seqlens_k: Optional[torch.Tensor] = None,
@@ -241,6 +245,7 @@ def indexer_forward_wrapper(
             ratio=ratio,
             qhead_per_kv_head=qhead_per_kv_head,
             sm_scale=sm_scale,
+            out=out,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
             max_seqlen_q=max_seqlen_q,
@@ -271,6 +276,7 @@ def indexer_forward_wrapper(
         w,
         ratio=ratio,
         qhead_per_kv_head=qhead_per_kv_head,
+        out=out,
         m_block_size=m_block_size,
         n_block_size=n_block_size,
         num_threads=384,

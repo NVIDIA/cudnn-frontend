@@ -1,4 +1,5 @@
 # Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
+# SPDX-License-Identifier: MIT
 from typing import Tuple, Optional
 from dataclasses import dataclass
 

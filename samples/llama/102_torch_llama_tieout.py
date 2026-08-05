@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Build a concise PyTorch implementation of the Llama 3.1 8B model that can seamlessly
 accept the LlamaModel model weight from Hugging Face.
 

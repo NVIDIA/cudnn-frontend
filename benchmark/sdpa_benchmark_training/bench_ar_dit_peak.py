@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Peak-vs-peak SDPA bench for the autoregressive DiT shape.
 
 Sweeps FAv4 ``num_splits`` and reports the best, paired against cuDNN

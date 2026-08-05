@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Pure Python data types for cuDNN Frontend graph representation.
 
 This module provides Python dataclasses for tensor attributes and node types,
@@ -48,6 +51,12 @@ class NodeType(Enum):
     SDPA_FP8_BWD = auto()
     SDPA_MXFP8 = auto()
     SDPA_MXFP8_BWD = auto()
+    GDN = auto()
+    GDN_BWD = auto()
+    KDA = auto()
+    KDA_BWD = auto()
+    GDN2 = auto()
+    GDN2_BWD = auto()
     MOE_GROUPED_MATMUL = auto()
     BLOCK_SCALE_QUANTIZE = auto()
     BLOCK_SCALE_DEQUANTIZE = auto()
