@@ -12,7 +12,7 @@ https://github.com/Dao-AILab/flash-attention, BSD-3-Clause): a
 KV-stationary, seq-KV-parallel single pass in which each CTA owns one KV
 tile and walks the query tiles in descending order, computing the five
 chained GEMMs (S = Q*K^T, dP = dO*V^T, dV += P^T*dO, dQ = dS*K,
-dK += dS^T*Q) with the softmax VJP fused in registers.  dK/dV accumulate
+dK += dS^T*Q) with the softmax VJP fused in registers. dK/dV accumulate
 in registers across the whole pass (no atomics); dQ is reduced through an
 fp32 workspace and finalized by a small convert kernel.
 
@@ -144,7 +144,7 @@ def load_a_frag_transposed(
 
 @cute.jit
 def copy16_smem_to_gmem(sptr, gptr):
-    """One 16-byte smem->gmem chunk (FA2's vectorized output copies)."""
+    """One 16-byte smem->gmem chunk."""
     v = sptr.load(count=8)
     gptr.store(v, alignment=16)
 

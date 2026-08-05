@@ -184,11 +184,6 @@ class SdpaGraphFacts:
     sink_t: Any = None
     seq_kv_t: Any = None
     seq_q_t: Any = None
-    # MXFP8 block-scale (descale) tensors + Amax_O output.
-    bias_t: Any = None
-    block_mask_t: Any = None
-    score_max_t: Any = None
-    score_sum_exp_t: Any = None
     # backward-only refs
     do_t: Any = None
     dq_t: Any = None
@@ -196,6 +191,7 @@ class SdpaGraphFacts:
     dv_t: Any = None
     dbias_t: Any = None
     dsink_t: Any = None
+    # MXFP8 block-scale (descale) tensors + Amax_O output.
     sf_q_t: Any = None
     sf_k_t: Any = None
     sf_v_t: Any = None

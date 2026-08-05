@@ -733,7 +733,7 @@ def _mk_bwd_graph(
         data_type=cudnn.data_type.FLOAT,
         name="stats",
     )
-    if bias or dbias:
+    if bias:
         bias_t = g.tensor(dim=(1, H, s_q, s_kv), stride=(H * s_q * s_kv, s_q * s_kv, s_kv, 1), data_type=DTYPE, name="bias")
         bwd_kwargs.update(bias=bias_t)
     if dbias:
