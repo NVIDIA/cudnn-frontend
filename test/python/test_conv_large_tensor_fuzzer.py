@@ -77,18 +77,40 @@ class _EngineFilterNotSupported(Exception):
 
 
 @dataclass(frozen=True)
+class _PlanIdentity:
+    execution_plan_index: int
+    graph_engine_index: int
+    knob_choices: Tuple[Tuple[str, int], ...]
+
+    def as_dict(self) -> dict:
+        return {
+            "execution_plan_index": self.execution_plan_index,
+            "graph_engine_index": self.graph_engine_index,
+            "knob_choices": dict(self.knob_choices),
+        }
+
+
+@dataclass(frozen=True)
 class _PlanBuildSelection:
-    selected_plan_index: Optional[int]
+    selected_plan: Optional[_PlanIdentity]
     candidate_count: int
     nvrtc_failures: Tuple[str, ...]
+
+    @property
+    def selected_plan_index(self) -> Optional[int]:
+        return self.selected_plan.execution_plan_index if self.selected_plan is not None else None
 
 
 @dataclass(frozen=True)
 class _CudnnRunResult:
     ok: bool
     message: str
-    selected_plan_index: Optional[int] = None
+    selected_plan: Optional[_PlanIdentity] = None
     nvrtc_failures: Tuple[str, ...] = ()
+
+    @property
+    def selected_plan_index(self) -> Optional[int]:
+        return self.selected_plan.execution_plan_index if self.selected_plan is not None else None
 
 
 def _pytest_worker_count() -> int:
@@ -745,13 +767,14 @@ def _repro_payload(
     atol: Optional[float] = None,
     message: Optional[str] = None,
     attempt: Optional[int] = None,
+    selected_plan: Optional[_PlanIdentity] = None,
 ) -> dict:
     test_id = None
     if test_num is not None and total_tests is not None and config_seed is not None:
         test_id = _test_id((test_num, total_tests, config_seed, cfg))
     graph_engine_op = _FORCED_CONV_TYPE
     graph_engine_indices = _COLLECTED_GRAPH_ENGINE_INDICES
-    selected_graph_engine_index = _select_graph_engine_index(cfg, graph_engine_indices) if graph_engine_indices else None
+    requested_graph_engine_index = _select_graph_engine_index(cfg, graph_engine_indices) if graph_engine_indices else None
 
     metadata = {
         "test_id": test_id,
@@ -780,7 +803,10 @@ def _repro_payload(
         "atol": atol,
         "graph_engine_op": graph_engine_op.name.lower() if graph_engine_op is not None else None,
         "requested_graph_engine_indices": graph_engine_indices,
-        "selected_graph_engine_index": selected_graph_engine_index,
+        "requested_graph_engine_index": requested_graph_engine_index,
+        "execution_plan_index": selected_plan.execution_plan_index if selected_plan is not None else None,
+        "graph_engine_index": selected_plan.graph_engine_index if selected_plan is not None else None,
+        "knob_choices": dict(selected_plan.knob_choices) if selected_plan is not None else None,
     }
     return {
         "schema": _REPRO_SCHEMA_VERSION,
@@ -865,10 +891,21 @@ def _format_repro_context(
     atol: Optional[float] = None,
     message: Optional[str] = None,
     attempt: Optional[int] = None,
+    selected_plan: Optional[_PlanIdentity] = None,
 ) -> str:
     if rtol is None or atol is None:
         rtol, atol = _tolerances(cfg)
-    payload = _repro_payload(cfg, test_num=test_num, total_tests=total_tests, config_seed=config_seed, rtol=rtol, atol=atol, message=message, attempt=attempt)
+    payload = _repro_payload(
+        cfg,
+        test_num=test_num,
+        total_tests=total_tests,
+        config_seed=config_seed,
+        rtol=rtol,
+        atol=atol,
+        message=message,
+        attempt=attempt,
+        selected_plan=selected_plan,
+    )
     return (
         "\n\nLarge tensor fuzzer repro command:\n"
         f"{_repro_command(payload)}\n\n"
@@ -1167,17 +1204,45 @@ def _reference(cfg: LargeTensorConfig, X: torch.Tensor, W: torch.Tensor, Y: torc
 # ---------------------------------------------------------------------------
 
 
-def _nvrtc_plan_build_failure(plan_index: int, error: Exception) -> Optional[str]:
-    """Return a bounded diagnostic when the immediate plan error is NVRTC."""
+def _plan_identity(graph, plan_index: int) -> _PlanIdentity:
+    graph_engine_index, knob_choices = graph.get_engine_and_knobs_at_index(plan_index)
+    serialized_knobs = tuple(sorted((knob.name, int(value)) for knob, value in knob_choices.items()))
+    return _PlanIdentity(plan_index, int(graph_engine_index), serialized_knobs)
+
+
+def _plan_identity_text(plan: _PlanIdentity) -> str:
+    knobs = json.dumps(dict(plan.knob_choices), sort_keys=True, separators=(",", ":"))
+    return f"plan_index={plan.execution_plan_index} graph_engine_index={plan.graph_engine_index} knobs={knobs}"
+
+
+def _bounded_cudnn_error_detail(error: Exception) -> str:
     backend_error = cudnn.get_last_error_string().strip()
     detail = "\n".join(part for part in (str(error).strip(), backend_error) if part)
-    if _NVRTC_COMPILATION_STATUS not in detail:
-        return None
-
     detail = " ".join(detail.split())
     if len(detail) > _PLAN_BUILD_ERROR_LIMIT:
         detail = f"{detail[:_PLAN_BUILD_ERROR_LIMIT]}..."
-    return f"plan index {plan_index}: {detail}"
+    return detail
+
+
+def _nvrtc_plan_build_failure(plan: _PlanIdentity, detail: str) -> Optional[str]:
+    """Return a bounded diagnostic when the immediate plan error is NVRTC."""
+    if _NVRTC_COMPILATION_STATUS not in detail:
+        return None
+    return f"{_plan_identity_text(plan)}: {detail}"
+
+
+def _emit_plan_event(
+    event_type: str, plan: _PlanIdentity, rng_seed: int, outcome: str, *, detail: Optional[str] = None, workspace_bytes: Optional[int] = None
+) -> None:
+    payload = {
+        "rng_seed": rng_seed,
+        **plan.as_dict(),
+        "outcome": outcome,
+        "detail": detail,
+        "workspace_bytes": workspace_bytes,
+    }
+    human_message = f"Large tensor fuzzer plan rng_seed={rng_seed} {_plan_identity_text(plan)}: {outcome}"
+    _emit_diagnostic_event(event_type, payload, human_message=human_message)
 
 
 def _build_first_supported_plan(graph, rng_seed: int) -> _PlanBuildSelection:
@@ -1186,30 +1251,30 @@ def _build_first_supported_plan(graph, rng_seed: int) -> _PlanBuildSelection:
     nvrtc_failures = []
 
     for plan_index in range(candidate_count):
+        plan = _plan_identity(graph, plan_index)
         try:
             graph.build_plan_at_index(plan_index)
         except cudnn.cudnnGraphNotSupportedError as e:
-            nvrtc_failure = _nvrtc_plan_build_failure(plan_index, e)
+            detail = _bounded_cudnn_error_detail(e)
+            nvrtc_failure = _nvrtc_plan_build_failure(plan, detail)
             if nvrtc_failure is not None:
                 nvrtc_failures.append(nvrtc_failure)
                 outcome = "NVRTC compilation failure"
             else:
                 outcome = "unsupported"
-            print(f"Large tensor fuzzer plan rng_seed={rng_seed} index={plan_index}: {outcome}", flush=True)
+            _emit_plan_event("plan_build", plan, rng_seed, outcome, detail=detail)
             continue
         except RuntimeError as e:
-            nvrtc_failure = _nvrtc_plan_build_failure(plan_index, e)
+            detail = _bounded_cudnn_error_detail(e)
+            nvrtc_failure = _nvrtc_plan_build_failure(plan, detail)
             if nvrtc_failure is None:
                 raise
             nvrtc_failures.append(nvrtc_failure)
-            print(f"Large tensor fuzzer plan rng_seed={rng_seed} index={plan_index}: NVRTC compilation failure", flush=True)
+            _emit_plan_event("plan_build", plan, rng_seed, "NVRTC compilation failure", detail=detail)
             continue
 
-        print(
-            f"Large tensor fuzzer plan rng_seed={rng_seed} index={plan_index}: " "built successfully; selected for execution",
-            flush=True,
-        )
-        return _PlanBuildSelection(plan_index, candidate_count, tuple(nvrtc_failures))
+        _emit_plan_event("plan_build", plan, rng_seed, "built successfully; selected for execution")
+        return _PlanBuildSelection(plan, candidate_count, tuple(nvrtc_failures))
 
     print(
         f"Large tensor fuzzer plan rng_seed={rng_seed}: exhausted {candidate_count} candidates without a buildable plan",
@@ -1267,12 +1332,12 @@ def _run_cudnn(cfg: LargeTensorConfig, X: torch.Tensor, W: torch.Tensor, Y: torc
             if cfg.conv_type != filtered_op:
                 raise ValueError(f"{_GRAPH_ENGINE_OP_ENV}={filtered_op.name.lower()} does not match " f"test op {cfg.conv_type.name.lower()}")
             _validate_graph_engine_indices(graph, filtered_graph_engine_indices)
-            selected_graph_engine_index = _select_graph_engine_index(cfg, filtered_graph_engine_indices)
-            _create_filtered_execution_plans(graph, selected_graph_engine_index)
+            requested_graph_engine_index = _select_graph_engine_index(cfg, filtered_graph_engine_indices)
+            _create_filtered_execution_plans(graph, requested_graph_engine_index)
         else:
             graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
         selection = _build_first_supported_plan(graph, cfg.rng_seed)
-        if selection.selected_plan_index is None:
+        if selection.selected_plan is None:
             if selection.nvrtc_failures:
                 detail = "; ".join(selection.nvrtc_failures)
                 return _CudnnRunResult(
@@ -1282,46 +1347,53 @@ def _run_cudnn(cfg: LargeTensorConfig, X: torch.Tensor, W: torch.Tensor, Y: torc
                 )
             return _CudnnRunResult(False, f"not_supported: no buildable execution plan among {selection.candidate_count} candidates")
 
-        plan_index = selection.selected_plan_index
+        plan = selection.selected_plan
+        plan_index = plan.execution_plan_index
         ws_size = graph.get_workspace_size_plan_at_index(plan_index)
         workspace = torch.empty(ws_size, device="cuda", dtype=torch.uint8)
         _poison_workspace(workspace)
 
         graph.execute_plan_at_index(vpack, workspace, index=plan_index, handle=handle)
         torch.cuda.synchronize()
-        print(f"Large tensor fuzzer plan rng_seed={cfg.rng_seed} index={plan_index}: execution passed", flush=True)
-        return _CudnnRunResult(True, "ok", plan_index, selection.nvrtc_failures)
+        _emit_plan_event("plan_execution", plan, cfg.rng_seed, "execution passed", workspace_bytes=ws_size)
+        return _CudnnRunResult(True, "ok", plan, selection.nvrtc_failures)
 
     except _EngineFilterNotSupported as e:
         return _CudnnRunResult(False, f"not_supported: {e}", nvrtc_failures=selection.nvrtc_failures)
     except cudnn.cudnnGraphNotSupportedError as e:
+        if selection.selected_plan is not None:
+            _emit_plan_event("plan_execution", selection.selected_plan, cfg.rng_seed, "execution failed", detail=_bounded_cudnn_error_detail(e))
         if selection.nvrtc_failures:
             prior_failures = "; ".join(selection.nvrtc_failures)
             return _CudnnRunResult(
                 False,
                 f"error: fallback plan index {selection.selected_plan_index} became unsupported after "
                 f"NVRTC compilation failure(s): {e}; prior plan-build failures: {prior_failures}",
-                selection.selected_plan_index,
+                selection.selected_plan,
                 selection.nvrtc_failures,
             )
         return _CudnnRunResult(False, f"not_supported: {e}", nvrtc_failures=selection.nvrtc_failures)
     except torch.cuda.OutOfMemoryError as e:
+        if selection.selected_plan is not None:
+            _emit_plan_event("plan_execution", selection.selected_plan, cfg.rng_seed, "out of memory", detail=str(e))
         if selection.nvrtc_failures:
             prior_failures = "; ".join(selection.nvrtc_failures)
             return _CudnnRunResult(
                 False,
                 f"error: fallback plan index {selection.selected_plan_index} ran out of memory after "
                 f"NVRTC compilation failure(s): {e}; prior plan-build failures: {prior_failures}",
-                selection.selected_plan_index,
+                selection.selected_plan,
                 selection.nvrtc_failures,
             )
         raise
     except (RuntimeError, OSError) as e:
+        if selection.selected_plan is not None:
+            _emit_plan_event("plan_execution", selection.selected_plan, cfg.rng_seed, "execution failed", detail=_bounded_cudnn_error_detail(e))
         prior_failures = f"; prior plan-build failures: {'; '.join(selection.nvrtc_failures)}" if selection.nvrtc_failures else ""
         return _CudnnRunResult(
             False,
             f"error: {type(e).__name__}: {e}{prior_failures}",
-            selection.selected_plan_index,
+            selection.selected_plan,
             selection.nvrtc_failures,
         )
 
@@ -1483,12 +1555,19 @@ def _run_single_config(
         try:
             torch.testing.assert_close(actual.to(torch.float32), ref, rtol=rtol, atol=atol)
         except AssertionError as e:
-            print(
-                f"Large tensor fuzzer plan rng_seed={cfg.rng_seed} index={cudnn_result.selected_plan_index}: numerical comparison failed",
-                flush=True,
-            )
+            selected_plan = cudnn_result.selected_plan
+            if selected_plan is not None:
+                _emit_plan_event("comparison", selected_plan, cfg.rng_seed, "numerical comparison failed")
             context = _format_repro_context(
-                cfg, test_num=test_num, total_tests=total_tests, config_seed=config_seed, rtol=rtol, atol=atol, message=str(e), attempt=attempt
+                cfg,
+                test_num=test_num,
+                total_tests=total_tests,
+                config_seed=config_seed,
+                rtol=rtol,
+                atol=atol,
+                message=str(e),
+                attempt=attempt,
+                selected_plan=selected_plan,
             )
             if cudnn_result.nvrtc_failures:
                 plan_failures = "\n".join(cudnn_result.nvrtc_failures)
@@ -1499,10 +1578,9 @@ def _run_single_config(
                 ) from e
             raise AssertionError(f"{e}{context}") from e
 
-        print(
-            f"Large tensor fuzzer plan rng_seed={cfg.rng_seed} index={cudnn_result.selected_plan_index}: numerical comparison passed",
-            flush=True,
-        )
+        selected_plan = cudnn_result.selected_plan
+        if selected_plan is not None:
+            _emit_plan_event("comparison", selected_plan, cfg.rng_seed, "numerical comparison passed")
         if cudnn_result.nvrtc_failures:
             plan_failures = "; ".join(cudnn_result.nvrtc_failures)
             return (
