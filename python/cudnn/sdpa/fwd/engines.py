@@ -300,14 +300,16 @@ class EngineSpec:
     lower: "Callable[[EngineSpec, ga.SdpaGraphFacts, Optional[SdpaFwdKnobs]], Any]"
 
 
-def _sm100_spec(d: int) -> EngineSpec:
+def _sm100_spec(d: int, d_v: Optional[int] = None) -> EngineSpec:
+    d_v = d if d_v is None else d_v
+    suffix = f"d{d}" if d_v == d else f"d{d}_d{d_v}"
     return EngineSpec(
-        name=f"sdpa_fwd_prefill_sm100_d{d}",
+        name=f"sdpa_fwd_prefill_sm100_{suffix}",
         capabilities=Capabilities(
             arches=_BLACKWELL_ARCHES,
             phase="prefill",
             d_qk=frozenset({d}),
-            d_v=frozenset({d}),
+            d_v=frozenset({d_v}),
             d_envelope=True,  # native tile box d; smaller dims via TMA zero-padding
             dtypes=frozenset({torch.float16, torch.bfloat16}),
             causal=True,
@@ -661,12 +663,16 @@ def engine_name(
     arch: str = "sm100",
     mxfp8: bool = False,
     fp8: bool = False,
+    d_v: Optional[int] = None,
 ) -> str:
     """The registered engine name for a coverage cell (test/user convenience)."""
 
     name = f"sdpa_fwd_{phase}_{arch}"
     if d is not None:
-        name += f"_d{d}"
+        if d_v is None or d_v == d:
+            name += f"_d{d}"
+        else:
+            name += f"_d{d}_d{d_v}"
     suffix = "_mxfp8" if mxfp8 else "_fp8" if fp8 else ""
     return name + suffix
 
@@ -684,6 +690,7 @@ def engine_name(
 # engine._ID_OFFSETS and never move.
 ENGINE_SPECS = (
     _sm100_spec(128),
+    _sm100_spec(192, d_v=128),
     _sm100_spec(256),
     _sm100_spec(512),
     _sm100_mxfp8_spec(128),

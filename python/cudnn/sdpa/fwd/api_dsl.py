@@ -38,11 +38,17 @@ from cudnn.sdpa.fwd.config_sm120 import (
     TemplateParams as Sm120TemplateParams,
 )
 
-_SM100_FLAVOR_DIMS = {512: (512, 512), 256: (256, 256), 128: (128, 128)}  # template key -> (max D_QK, max D_V) envelope
+_SM100_FLAVORS = (
+    (128, 128),
+    (192, 128),
+    (256, 256),
+    (512, 512),
+)  # ordered smallest-first: (max D_QK, max D_V) envelope
 _SM100_KERNEL_FILES = {
-    512: "prefill_d512_f16_sm100.py",
-    256: "prefill_d256_f16_sm100.py",
-    128: "prefill_d128_f16_sm100.py",
+    (512, 512): "prefill_d512_f16_sm100.py",
+    (256, 256): "prefill_d256_f16_sm100.py",
+    (192, 128): "prefill_d192_d128_f16_sm100.py",
+    (128, 128): "prefill_d128_f16_sm100.py",
 }
 # DTYPE_* codes: E4M3=0, E5M2=1, BF16=2, FP16=3. FP8 inputs (0/1) route to the
 # block-scale MXFP8 kernel (d128 only); the output dtype is encoded the same way.
@@ -150,11 +156,16 @@ class WorkspaceCarver:
         return self._flat[self._off :]
 
 
-def _pick_flavor(d_qk: int, d_v: int) -> int:
+def _flavor_tag(flavor: tuple[int, int]) -> str:
+    d_qk, d_v = flavor
+    return f"d{d_qk}" if d_qk == d_v else f"d{d_qk}_d{d_v}"
+
+
+def _pick_flavor(d_qk: int, d_v: int) -> tuple[int, int]:
     """Smallest flavor whose envelope covers ``(d_qk, d_v)`` (f16/bf16 only).
 
-    ENVELOPE (zero-padding) semantics: one flavor D >= max(d_qk, d_v) serves
-    both head dims jointly — e.g. (192, 128) runs on the d256 kernel. The
+    ENVELOPE (zero-padding) semantics: one flavor covers ``d_qk`` and ``d_v``
+    with its own max extents — e.g. (192, 128) runs on the d192/d128 kernel. The
     kernel's TMA descriptors are built from the ACTUAL tensor extents while
     the tile box stays the compile-time D, so loads past d_qk / d_v hardware
     zero-fill (adding exact zero terms to every QK^T dot product — S, softmax
@@ -163,13 +174,13 @@ def _pick_flavor(d_qk: int, d_v: int) -> int:
     check_support); alignment (d % 8, the TMA 16-byte global-stride rule at
     2 bytes/elem) is also gated in check_support / engines.mismatch.
     """
-    for flavor in sorted(_SM100_FLAVOR_DIMS):
-        fdqk, fdv = _SM100_FLAVOR_DIMS[flavor]
+    for flavor in _SM100_FLAVORS:
+        fdqk, fdv = flavor
         if d_qk <= fdqk and d_v <= fdv:
             return flavor
     raise ValueError(
         f"Frost SM100 DSL SDPA: no flavor envelope covers (D_QK={d_qk}, D_V={d_v}); "
-        f"largest supported: {_SM100_FLAVOR_DIMS[max(_SM100_FLAVOR_DIMS)]} (d128/d256/d512 envelopes)."
+        f"largest supported: {_SM100_FLAVORS[-1]} (d128/d192-d128/d256/d512 envelopes)."
     )
 
 
@@ -180,15 +191,16 @@ def _load_kernel_template(filename: str, params: Hashable, tag: str):
     return load_template(path, params, tag=tag)
 
 
-def _load_sm100_kernel_module(flavor: int, params: Sm100TemplateParams, fp8: bool = False, pertensor: bool = False):
+def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplateParams, fp8: bool = False, pertensor: bool = False):
     """Load one SM100 module for the selected flavor and quantization path."""
 
+    tag = _flavor_tag(flavor)
     if fp8:
         filename = _SM100_FP8_KERNEL_FILE if pertensor else _SM100_MXFP8_KERNEL_FILE
-        tag = f"sdpa_fwd_sm100_{'fp8' if pertensor else 'mxfp8'}_d{flavor}"
+        tag = f"sdpa_fwd_sm100_{'fp8' if pertensor else 'mxfp8'}_{tag}"
     else:
         filename = _SM100_KERNEL_FILES[flavor]
-        tag = f"sdpa_fwd_sm100_d{flavor}"
+        tag = f"sdpa_fwd_sm100_{tag}"
     return _load_kernel_template(filename, params, tag)
 
 
@@ -348,7 +360,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
     """SM100 (Blackwell) SDPA forward via the FROST DSL template kernels."""
 
     def _initialize_implementation(self) -> None:
-        self.flavor: Optional[int] = None
+        self.flavor: Optional[tuple[int, int]] = None
         self.mask_flags = 0
         self.swa_window_runtime = 0
         self._k_mod = None

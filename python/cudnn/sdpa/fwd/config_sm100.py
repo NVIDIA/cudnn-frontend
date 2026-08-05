@@ -613,4 +613,74 @@ def make_cfg_d128(params: TemplateParams) -> Tuple[CfgD128, TmaIters]:
     return cfg, _tma_iters(cfg)
 
 
-MAKE_CFG = {128: make_cfg_d128, 256: make_cfg_d256, 512: make_cfg_d512}
+# ---------------------------------------------------------------------------
+# d192/d128 flavor — DSv3 MLA logical d_qk = 192, d_v = 128, SM100, cga2
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CfgD192(CfgD128):
+    TILE_K: int = 192
+    TILE_O: int = 128
+    QO_ALIAS: int = 1
+    SOFTMAX_REGS: int = 192
+    CORRECTION_REGS: int = 88
+
+
+def _validate_cfg_d192(cfg: CfgD192) -> None:
+    """Consistency checks on the native DSv3 d192/d128 geometry."""
+    checks = (
+        (cfg.DTYPE_QKV in (DTYPE_BF16, DTYPE_FP16), "d192: only BF16/FP16 inputs are supported"),
+        (cfg.DTYPE_O == cfg.DTYPE_QKV, "d192: DTYPE_O must equal DTYPE_QKV"),
+        (cfg.MMA_REGS == cfg.TMALDG_REGS == cfg.TMASTG_REGS == cfg.SCHEDULER_REGS, "d192: MMA/TMALDG/TMASTG/SCHEDULER regs must match"),
+        (cfg.MMA_REGS + cfg.CORRECTION_REGS + cfg.SOFTMAX_WARPGROUPS * cfg.SOFTMAX_REGS <= 512, "d192: register budget over 512"),
+        (cfg.MMA_REGS % 8 == 0 and cfg.CORRECTION_REGS % 8 == 0 and cfg.SOFTMAX_REGS % 8 == 0, "d192: per-role regs must be multiples of 8"),
+        (cfg.CGA_M == 2 and cfg.CTA_MMA == 2, "d192 SM100 is cga2-only (CGA_M == CTA_MMA == 2)"),
+        (cfg.TILE_K == 192 and cfg.TILE_O == 128, "d192: expected D_QK tile 192 and D_V tile 128"),
+        (cfg.QO_ALIAS == 1, "d192: Q/O SMEM alias is required to stay within SM100 SMEM budget"),
+        (cfg.TILES_Q == 2, "d192: TILES_Q must be 2"),
+        (cfg.SOFTMAX_WARPGROUPS == 2, "d192: SOFTMAX_WARPGROUPS must be 2"),
+        (cfg.CORRECTION_WARPS == 4, "d192: CORRECTION_WARPS must be 4"),
+        (cfg.TOTAL_WARPS == 16 and cfg.THREADS_PER_CTA == 512, "d192: 16 warps / 512 threads"),
+        (cfg.READ_TILE_ARRIVERS == 15, f"d192: expected READ_TILE_ARRIVERS=15, got {cfg.READ_TILE_ARRIVERS}"),
+        (cfg.STAGES_KV == 2, "d192 SM100: STAGES_KV must be 2 for BF16/FP16"),
+        (cfg.TILE_K_HW_BMM1 == 16 and cfg.TILE_K_HW_BMM2 == 16, "d192: TILE_K_HW must be 16 for BF16/FP16 on SM10x"),
+        (cfg.Q_SWZ_BYTES == 128 and cfg.K_SWZ_BYTES == 128, "d192: Q/K swizzle must be 128B"),
+        (cfg.V_SWZ_BYTES == 128 and cfg.O_SWZ_BYTES == 128, "d192: V/O swizzle must be 128B"),
+    )
+    for ok, msg in checks:
+        if not ok:
+            raise ValueError(msg)
+
+
+def make_cfg_d192(params: TemplateParams) -> Tuple[CfgD192, TmaIters]:
+    _validate_params("d192", params)
+    b = bpe(params.dtype_qkv)
+    cfg = CfgD192(
+        DTYPE_QKV=params.dtype_qkv,
+        DTYPE_O=params.dtype_qkv,
+        BPE=b,
+        BPE_O=b,
+        Q_SWZ_BYTES=q_swz_bytes(192, b),
+        K_SWZ_BYTES=q_swz_bytes(192, b),
+        V_SWZ_BYTES=v_swz_bytes(128, 2, b),
+        O_SWZ_BYTES=o_swz_bytes(128, b),
+        RESCALE_THRESHOLD=rescale_threshold(params.dtype_qkv),
+        TILE_K_HW_BMM1=tile_k_hw(params.dtype_qkv),
+        TILE_K_HW_BMM2=tile_k_hw(params.dtype_qkv),
+        MASK_FLAGS=params.mask_flags,
+        SWA_WINDOW=params.swa_window,
+        HAS_SINK=int(params.has_sink),
+        CAUSAL_BOTTOM_RIGHT=int(params.causal_bottom_right),
+        SCHEDULER_POLICY=1,
+        SOFTMAX_REGS=216 if params.mask_flags == MASK_NONE else 192,
+        CORRECTION_REGS=40 if params.mask_flags == MASK_NONE else 88,
+        SEQ_KV_LENS_PRESENT=1 if (params.thd_varlen or params.seq_kv_lens_present) else 0,
+        SEQ_Q_LENS_PRESENT=int(params.seq_q_lens_present),
+        THD_VARLEN=int(params.thd_varlen),
+    )
+    _validate_cfg_d192(cfg)
+    return cfg, _tma_iters(cfg)
+
+
+MAKE_CFG = {128: make_cfg_d128, 192: make_cfg_d192, 256: make_cfg_d256, 512: make_cfg_d512}

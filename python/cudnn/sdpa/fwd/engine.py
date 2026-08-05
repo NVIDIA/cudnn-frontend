@@ -134,6 +134,7 @@ _ID_OFFSETS = {
     "sdpa_fwd_prefill_sm100_d128_mxfp8": 3,
     "sdpa_fwd_prefill_sm100_d128_fp8": 4,
     "sdpa_fwd_prefill_sm120": 5,
+    "sdpa_fwd_prefill_sm100_d192_d128": 6,
 }
 
 
