@@ -105,6 +105,13 @@ def compute_capability(device: int) -> tuple[int, int]:
 
 
 @functools.lru_cache(maxsize=None)
+def multiprocessor_count(device: int) -> int:
+    drv = _driver()
+    handle = _device_handle(device)
+    return int(_ck(*drv.cuDeviceGetAttribute(drv.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, handle)))
+
+
+@functools.lru_cache(maxsize=None)
 def shared_memory_per_block_optin(device: int) -> int:
     drv = _driver()
     handle = _device_handle(device)
