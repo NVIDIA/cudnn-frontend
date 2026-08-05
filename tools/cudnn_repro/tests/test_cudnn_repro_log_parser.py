@@ -34,6 +34,8 @@ def test_iter_context_entries_falls_back_without_execution_markers():
     entries = list(log_parser.iter_context_entries([json.dumps(payload1), json.dumps(payload2)]))
 
     assert [payload.get("gid") for _, payload in entries] == [11, 22]
+
+
 def test_iter_context_entries_does_not_reuse_tensor_dumps_across_gids():
     payload1 = payload(11, "SDPA_FWD", "HALF")
     payload2 = payload(22, "SDPA_BWD", "HALF")
