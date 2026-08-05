@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS, _output_align_reqs, allowed_store_vsize, dense_output_layout, tensor_alignment
+from .dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS, MAX_EPI_CHUNK_ELEMS, _output_align_reqs, allowed_store_vsize, dense_output_layout, tensor_alignment
 from .fusion_ir import (
     BlockQuantizeSpec,
     Dtype,
@@ -851,9 +851,13 @@ def _emit_block_quant_col(
     p = f"_q{quant_idx}"
     scale_dtype = DTYPE_TO_CUTLASS[quant.scale_dtype]
     G = 16 if quant.block_size == 16 else 32
-    if vsize % G != 0 and vsize >= G:
-        raise NotImplementedError(f"col block-quantize: store vector {vsize} must be a multiple of the {G}-lane block group (or smaller than it)")
-    n_groups = max(vsize // G, 1)
+    if vsize % G != 0:
+        raise NotImplementedError(
+            f"col block-quantize: store vector {vsize} must be a multiple of the {G}-lane "
+            f"block group — every lane stores column `col_j + lane % {G}`, so a narrower "
+            f"chunk would store scales for columns it never computed"
+        )
+    n_groups = vsize // G
     lines: list[str] = [
         f"{p}_lane = tidx % 32",
         f"{p}_src = ({source_var}).to(cutlass.Float32)",
@@ -1159,15 +1163,20 @@ def generate(
     all per-tap plumbing. ``vec_bytes_epi`` / ``output_elem_bytes`` (from the
     compiler) fix the inner-loop chunk size: each tap stores
     ``vsize = vec_bytes_epi // output_elem_bytes`` elements per chunk."""
+    vsize = vec_bytes_epi // output_elem_bytes
+    if vsize > MAX_EPI_CHUNK_ELEMS:
+        raise NotImplementedError(
+            f"epilogue chunk of {vsize} elements exceeds the {MAX_EPI_CHUNK_ELEMS}-element "
+            f"drain subtile (vec_bytes_epi={vec_bytes_epi}, output_elem_bytes={output_elem_bytes})"
+        )
     # aux_views snippet. `row` is defined by the template just before this hook
     # (M-aware: differs for MMA_M=64 vs MMA_M>=128) — we just consume it.
     aux_lines: list[str] = []
     for aux in chain.aux_tensors:
-        if aux.grouped_by_moe and aux.bcast_mode == "per_col" and (aux.stride[0] * DTYPE_BYTES[aux.dtype]) % vec_bytes_epi != 0:
+        if aux.grouped_by_moe and aux.bcast_mode == "per_col" and aux.stride[0] % vsize != 0:
             raise NotImplementedError(
-                f"per-group per-col aux {aux.name!r}: group stride "
-                f"{aux.stride[0]} x {DTYPE_BYTES[aux.dtype]} B must be a multiple of the "
-                f"epilogue vector width ({vec_bytes_epi} B) for aligned vector loads"
+                f"per-group per-col aux {aux.name!r}: group stride {aux.stride[0]} must be "
+                f"a multiple of the epilogue chunk ({vsize} elements) for aligned vector loads"
             )
         aux_lines.append(f"{_aux_ptr_var(aux.name)} = {aux.name}.iterator.raw_ptr()")
         if aux.bcast_mode == "scalar":
@@ -1243,7 +1252,6 @@ def generate(
     def _scale_tap_idx(qi: int) -> int:
         return n_dense_taps + len(chain.reductions) + qi
 
-    vsize = vec_bytes_epi // output_elem_bytes
     for si, spec in enumerate(specs):
         src = _parent_value(spec.source_ref)
         if use_tma_store and si == 0:
