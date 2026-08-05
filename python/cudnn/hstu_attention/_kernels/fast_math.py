@@ -1,5 +1,5 @@
 # Copyright (c) 2025, Tri Dao.
-# SPDX-License-Identifier: BSD-3-Clause
+# SPDX-License-Identifier: MIT
 
 from typing import Callable, Optional, Tuple
 

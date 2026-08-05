@@ -5,10 +5,10 @@ This product includes software developed at NVIDIA CORPORATION
 (https://www.nvidia.com/).
 
 This product is distributed primarily under the Apache License, Version 2.0
-(see LICENSE.txt). Subsets of files use the MIT License (see LICENSE-MIT.txt)
-or the BSD 3-Clause License; each file declares its license via an SPDX
-`SPDX-License-Identifier:` tag. See LICENSING.md for the full list of files
-that do not use the primary Apache-2.0 license and the rationale.
+(see LICENSE.txt). A subset of files remain under the MIT License (see
+LICENSE-MIT.txt); each file declares its license via an SPDX
+`SPDX-License-Identifier:` tag. See LICENSING.md for the full list of
+MIT-licensed files and the rationale.
 
 This product also bundles, derives from, or fetches at build time third-party
 open source software. See THIRD_PARTY_LICENSES.txt for the complete list of

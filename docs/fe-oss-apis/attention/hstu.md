@@ -37,9 +37,9 @@ row-wise softmax normalization. This matches the requested operation in
 The HSTU kernels and cuDNN Frontend integration were developed by NVIDIA. The
 forward and backward kernels and public API use the Apache License 2.0. Some
 low-level attention utility files build on FlashAttention and NVIDIA
-CUTLASS/CuTe DSL work and retain the BSD 3-Clause license; see the repository's
-[licensing guide](../../../LICENSING.md) and [third-party
-notices](../../../THIRD_PARTY_LICENSES.txt).
+CUTLASS/CuTe DSL work and are distributed under the MIT License while retaining
+their original author copyright notices; see the repository's [licensing
+guide](../../../LICENSING.md) and [third-party notices](../../../THIRD_PARTY_LICENSES.txt).
 
 ## Installation
 

@@ -209,9 +209,8 @@ export CUDNN_FRONTEND_CUDART_LIB_NAME=/usr/local/cuda/lib64/libcudart.so.13
 ## License
 
 This project is distributed primarily under the [Apache License 2.0](LICENSE.txt).
-Subsets of files use the [MIT License](LICENSE-MIT.txt) or the BSD 3-Clause
-License; each source file declares its license with an SPDX
-`SPDX-License-Identifier:` tag. See [LICENSING.md](LICENSING.md) for the full
-list of files that do not use the primary Apache-2.0 license and the rationale,
-and [THIRD_PARTY_LICENSES.txt](THIRD_PARTY_LICENSES.txt) for third-party
-attributions.
+A subset of files remain under the [MIT License](LICENSE-MIT.txt); each source
+file declares its license with an SPDX `SPDX-License-Identifier:` tag. See
+[LICENSING.md](LICENSING.md) for the full list of MIT-licensed files and the
+rationale, and [THIRD_PARTY_LICENSES.txt](THIRD_PARTY_LICENSES.txt) for
+third-party attributions.
