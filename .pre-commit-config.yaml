@@ -1,3 +1,6 @@
+# Vendored third-party sources are kept byte-for-byte as upstream ships them.
+exclude: '^include/cudnn_frontend/thirdparty/'
+
 repos:
 -   repo: https://github.com/pre-commit/mirrors-clang-format
     rev: v21.1.6
