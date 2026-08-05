@@ -341,6 +341,12 @@ def test_dsl_sm100_execute_sink_lse_contract():
     o_ref = _ref_sdpa_full(q, k, v, scale=scale, is_causal=True)
     torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
 
+    # THD LSE output is not plumbed (packed (1, H, T) layout != cuDNN's ragged
+    # Stats contract): requesting it is rejected up front instead of being
+    # silently ignored.
+    with pytest.raises(NotImplementedError, match="THD stats/LSE"):
+        SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, sample_lse=lse, thd=True).check_support()
+
 
 @pytest.mark.L0
 @pytest.mark.parametrize("d", _FLAVORS, ids=_FLAVOR_IDS)

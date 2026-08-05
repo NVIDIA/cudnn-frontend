@@ -751,6 +751,12 @@ def test_dsl_sm120_execute_contract_mismatches():
     expected = _ref_sdpa_full(q, k, v, scale=1.0 / math.sqrt(128))
     torch.testing.assert_close(o.float(), expected, atol=0.1, rtol=5e-2)
 
+    # THD LSE output is not plumbed (packed (1, H, T) layout != cuDNN's ragged
+    # Stats contract): requesting it is rejected up front instead of being
+    # silently ignored.
+    with pytest.raises(NotImplementedError, match="THD stats/LSE"):
+        SdpaFwdDslSm120(sample_q=q, sample_k=k, sample_v=v, sample_o=o, sample_lse=lse, thd=True).check_support()
+
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=22)

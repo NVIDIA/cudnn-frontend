@@ -512,6 +512,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             )
             self.dtype_o = self.dtype
         if self.lse_desc is not None:
+            # THD stats are not plumbed (the kernel's packed (1, H, T) LSE does
+            # not match cuDNN's ragged Stats contract) — reject the request
+            # instead of silently never writing the user's LSE.
+            self._not_implemented_error_if(self.thd, "THD stats/LSE output is not plumbed yet; construct without sample_lse")
             self._check_dtype(self.lse_desc, torch.float32, name="LSE")
             self._check_tensor_shape(self.lse_desc, (b, h_qo, s_qo), name="LSE")
             self._value_error_if(not self.lse_desc.is_contiguous(), "LSE must be contiguous on SM100 DSL")
@@ -794,8 +798,11 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             "lse_tensor is required by this compiled specialization",
         )
         if self.thd:
-            # THD ignores lse_tensor: the packed LSE is api-level workspace scratch.
-            pass
+            # The kernel's packed-LSE scratch is api-level workspace; a
+            # user-facing THD LSE output is not plumbed, so reject rather than
+            # silently never writing the caller's buffer (check_support already
+            # rejects thd + sample_lse).
+            self._not_implemented_error_if(lse_tensor is not None, "THD stats/LSE output is not plumbed yet")
         elif lse_tensor is not None:
             lse_tensor = self._checked_lse_view(lse_tensor)
         else:
@@ -1473,6 +1480,10 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         self._check_tensor_shape(self.v_desc, (b, h_kv, s_kv, d_q), name="V")
         self._check_tensor_shape(self.o_desc, (b, h_q, s_q, d_q), name="O")
         if self.lse_desc is not None:
+            # THD stats are not plumbed (the kernel's packed (1, H, T) LSE does
+            # not match cuDNN's ragged Stats contract) — reject the request
+            # instead of silently never writing the user's LSE.
+            self._not_implemented_error_if(self.thd, "THD stats/LSE output is not plumbed yet; construct without sample_lse")
             self._check_dtype(self.lse_desc, torch.float32, name="LSE")
             self._check_tensor_shape(self.lse_desc, (b, h_q, s_q), name="LSE")
             self._value_error_if(not self.lse_desc.is_contiguous(), "LSE must be contiguous on SM120 DSL")
