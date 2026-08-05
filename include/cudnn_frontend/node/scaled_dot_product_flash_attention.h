@@ -142,6 +142,11 @@ class SDPANodeBase : public NodeCRTP<DerivedT> {
     SDPANodeBase(SDPA_attributes&& attributes_, detail::Context const& context)
         : NodeCRTP<DerivedT>(context), attributes(std::move(attributes_)) {}
 
+    SDPA_attributes const*
+    get_sdpa_attributes() const override {
+        return &attributes;
+    }
+
     bool
     is_paged_v() const {
         auto page_table_v_it = attributes.inputs.find(input_names::Page_table_V);

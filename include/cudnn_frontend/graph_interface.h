@@ -424,15 +424,13 @@ class Graph : public ICudnn, public INode {
     // Register an OSS NVRTC engine for SDPA by extracting tensor metadata from the SDPA node's attributes
     error_t
     register_oss_engine_() {
-        // Find the SDPA node in the graph's sub_nodes via dynamic_cast
+        // Find the SDPA node in the graph's sub_nodes. Uses the virtual get_sdpa_attributes()
+        // accessor rather than dynamic_cast so this header compiles under -fno-rtti / /GR-.
+        // Covers both CompositeSDPANode and UnifiedSDPANode, which share SDPANodeBase.
         SDPA_attributes const *sdpa_attrs = nullptr;
         for (auto const &sub_node : sub_nodes) {
-            if (auto *composite = dynamic_cast<CompositeSDPANode *>(sub_node.get())) {
-                sdpa_attrs = &composite->attributes;
-                break;
-            }
-            if (auto *unified = dynamic_cast<UnifiedSDPANode *>(sub_node.get())) {
-                sdpa_attrs = &unified->attributes;
+            if (auto const *attrs = sub_node->get_sdpa_attributes()) {
+                sdpa_attrs = attrs;
                 break;
             }
         }
@@ -544,11 +542,14 @@ class Graph : public ICudnn, public INode {
         std::shared_ptr<Tensor_attributes> swish_output;
 
         for (size_t i = 0; i + 1 < sub_nodes.size(); ++i) {
-            auto *rmsnorm_node = dynamic_cast<RMSNormNode *>(sub_nodes[i].get());
-            if (!rmsnorm_node) continue;
+            // getType() + static_cast rather than dynamic_cast so this header compiles under
+            // -fno-rtti / /GR-. RMSNORM and POINTWISE are distinct Type values, so this is an
+            // exact substitute for the type-check the dynamic_casts performed.
+            if (sub_nodes[i]->getType() != Type::RMSNORM) continue;
+            auto *rmsnorm_node = static_cast<RMSNormNode *>(sub_nodes[i].get());
 
-            auto *pointwise_node = dynamic_cast<PointwiseNode *>(sub_nodes[i + 1].get());
-            if (!pointwise_node) continue;
+            if (sub_nodes[i + 1]->getType() != Type::POINTWISE) continue;
+            auto *pointwise_node = static_cast<PointwiseNode *>(sub_nodes[i + 1].get());
 
             if (pointwise_node->attributes.get_mode() != PointwiseMode_t::SWISH_FWD) continue;
 

@@ -9,11 +9,18 @@ option(CUDNN_FRONTEND_SKIP_JSON_LIB "Defines whether FE should not include nlohm
 option(CUDNN_FRONTEND_BUILD_SAMPLES "Defines if samples are built or not." ON)
 option(CUDNN_FRONTEND_BUILD_TESTS "Defines if unittests are built or not." ON)
 option(CUDNN_FRONTEND_BUILD_PYTHON_BINDINGS "Defines if python bindings are built or not." OFF)
+option(CUDNN_FRONTEND_ENABLE_RTTI "Build in-tree targets with RTTI. Off by default so the headers stay compilable for consumers that disable it." OFF)
 
 if(MSVC OR MSYS OR MINGW)
     add_compile_options(/W4 /WX)
+    if(NOT CUDNN_FRONTEND_ENABLE_RTTI)
+        add_compile_options(/GR-)
+    endif()
 else()
     add_compile_options(-Wall -Wextra -Wpedantic -Werror -Wno-error=attributes -Wno-attributes -Wno-error=unused-function -Wno-unused-function)
+    if(NOT CUDNN_FRONTEND_ENABLE_RTTI)
+        add_compile_options(-fno-rtti)
+    endif()
 endif()
 
 add_library(cudnn_frontend INTERFACE)
