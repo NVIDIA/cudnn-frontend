@@ -125,16 +125,8 @@ def _graph_engine_filter_op() -> Optional["ConvType"]:
     if not raw:
         return None
 
-    aliases = {
-        "fprop": ConvType.FPROP,
-        "fp": ConvType.FPROP,
-        "dgrad": ConvType.DGRAD,
-        "dg": ConvType.DGRAD,
-        "wgrad": ConvType.WGRAD,
-        "wg": ConvType.WGRAD,
-    }
     try:
-        return aliases[raw]
+        return _CONV_TYPE_ALIASES[raw]
     except KeyError as e:
         raise ValueError(f"{_GRAPH_ENGINE_OP_ENV} must be one of fprop, dgrad, or wgrad") from e
 
@@ -278,7 +270,7 @@ _FP32_FPROP_ATOL_AT_BASE_ACCUM = 3e-2
 _MAX_DENSE_RANDOM_RTOL = 0.10
 
 # Integer-policy inputs use fixed dtype-level bounds rather than reduction scaling.
-# FP32's 1e-3 absolute floor covers the observed 4.88e-4 bias/ReLU delta.
+# FP32 keeps a small absolute floor for fused bias/ReLU rounding near zero.
 _INTEGER_DATA_TOLERANCES = {
     torch.float16: (1e-3, 1e-5),
     torch.bfloat16: (1.6e-2, 1e-5),
@@ -294,6 +286,16 @@ class ConvType(Enum):
     FPROP = auto()
     DGRAD = auto()
     WGRAD = auto()
+
+
+_CONV_TYPE_ALIASES = {
+    "fprop": ConvType.FPROP,
+    "fp": ConvType.FPROP,
+    "dgrad": ConvType.DGRAD,
+    "dg": ConvType.DGRAD,
+    "wgrad": ConvType.WGRAD,
+    "wg": ConvType.WGRAD,
+}
 
 
 class ShapeFamily(Enum):
@@ -406,8 +408,7 @@ def _estimate_bytes(cfg: LargeTensorConfig) -> int:
     return int(total * (1.0 + WORKSPACE_OVERHEAD))
 
 
-# Huge-filter DGRAD can be slow even with a 1x1 output and low nominal FLOPs,
-# so this conservative proxy complements the separate memory budget.
+# The default cap mainly filters huge-filter DGRAD cases, which can be slow even with small outputs.
 def _estimate_runtime_work(cfg: LargeTensorConfig) -> int:
     """Estimate generated-config work for runtime budgeting."""
     input_spatial = math.prod(cfg.input_spatial)
@@ -445,10 +446,9 @@ def _effective_reduction_size(cfg: LargeTensorConfig) -> int:
 def _uses_integer_data(cfg: LargeTensorConfig) -> bool:
     """Return whether this config should avoid dense random large reductions.
 
-    The finite mismatch class this policy targets was observed on large FPROP
-    style C * filter_spatial reductions. For DGRAD/WGRAD, this remains a large
-    filter data policy rather than an exact statement about the op's per-output
-    accumulation depth.
+    The policy is keyed to the FPROP-style C * filter_spatial reduction. For
+    DGRAD/WGRAD, it is a large-filter policy rather than the operation's exact
+    per-output accumulation depth.
     """
     return _fprop_reduction_size(cfg) >= _SPARSE_INTEGER_REDUCTION_THRESHOLD
 
@@ -586,16 +586,8 @@ def _config_to_repro_config(cfg: LargeTensorConfig) -> dict:
 
 def _parse_conv_type(value) -> ConvType:
     raw = str(value).strip().lower().removeprefix("convtype.")
-    aliases = {
-        "fprop": ConvType.FPROP,
-        "fp": ConvType.FPROP,
-        "dgrad": ConvType.DGRAD,
-        "dg": ConvType.DGRAD,
-        "wgrad": ConvType.WGRAD,
-        "wg": ConvType.WGRAD,
-    }
-    if raw in aliases:
-        return aliases[raw]
+    if raw in _CONV_TYPE_ALIASES:
+        return _CONV_TYPE_ALIASES[raw]
     raise ValueError(f"Unsupported conv_type in repro config: {value!r}")
 
 
@@ -1055,6 +1047,7 @@ def tlist_with_configs(
 def _reference(cfg: LargeTensorConfig, X: torch.Tensor, W: torch.Tensor, Y: torch.Tensor, bias: Optional[torch.Tensor]) -> torch.Tensor:
     f32 = torch.float32
     fn = torch.nn.functional.conv2d if cfg.spatial_dims == 2 else torch.nn.functional.conv3d
+    # Explicit deletes release large temporaries that exception tracebacks may otherwise retain.
 
     with torch.backends.cudnn.flags(enabled=False):
         if cfg.conv_type == ConvType.FPROP:
@@ -1300,8 +1293,6 @@ def _run_single_config(
             Y.copy_(Y_cpu, non_blocking=True)
             del Y_cpu
 
-        # Poison the output after seeded input generation so incomplete writes
-        # fail comparison without changing deterministic input values.
         phase = "output prefill"
         if cfg.conv_type == ConvType.FPROP:
             Y.fill_(float("nan"))
