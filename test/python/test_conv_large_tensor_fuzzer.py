@@ -53,8 +53,11 @@ _NUM_TESTS_L0_ENV = "CUDNN_FUZZ_NUM_TESTS_L0"  # override L0 generated count
 _NUM_TESTS_L1_ENV = "CUDNN_FUZZ_NUM_TESTS_L1"  # override L1 generated count
 _REPRO_CONFIG_ENV = "CUDNN_FUZZ_REPRO_CONFIG"  # exact configuration JSON payload
 _REPRO_FILE_ENV = "CUDNN_FUZZ_REPRO_FILE"  # path to exact configuration JSON payload
+_EVENTS_DIR_ENV = "CUDNN_FUZZ_EVENTS_DIR"  # optional per-worker JSONL diagnostic output
 _REPRO_SCHEMA_VERSION = 1
+_EVENT_SCHEMA_VERSION = 1
 _REPRO_MESSAGE_LIMIT = 4096
+_EVENT_PREFIX = "CUDNN_FUZZ_EVENT"
 _DEFAULT_RUNTIME_WORK_BUDGET = 100_000_000_000_000
 _MAX_CONFIG_GENERATION_ATTEMPTS = 50
 _DEFAULT_ENGINE_REGEN_ATTEMPTS = 50
@@ -792,6 +795,51 @@ def _repro_json(payload: dict, *, pretty: bool = False) -> str:
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 
+def _emit_diagnostic_event(event_type: str, payload: dict, *, human_message: Optional[str] = None) -> None:
+    event = {
+        "schema": _EVENT_SCHEMA_VERSION,
+        "event": event_type,
+        "payload": payload,
+    }
+    encoded = json.dumps(event, sort_keys=True, separators=(",", ":"))
+    if human_message is not None:
+        print(human_message, flush=True)
+    print(f"{_EVENT_PREFIX} {encoded}", flush=True)
+
+    events_dir = os.environ.get(_EVENTS_DIR_ENV, "").strip()
+    if events_dir:
+        os.makedirs(events_dir, exist_ok=True)
+        worker = os.environ.get("PYTEST_XDIST_WORKER", f"pid{os.getpid()}")
+        events_path = os.path.join(events_dir, f"events_{worker}.jsonl")
+        with open(events_path, "a", encoding="ascii") as events_file:
+            events_file.write(encoded + "\n")
+
+
+def _emit_outcome_event(
+    event_type: str,
+    status: str,
+    cfg: LargeTensorConfig,
+    *,
+    test_num: Optional[int] = None,
+    total_tests: Optional[int] = None,
+    config_seed: Optional[int] = None,
+    message: Optional[str] = None,
+    attempt: Optional[int] = None,
+) -> None:
+    rtol, atol = _tolerances(cfg)
+    repro = _repro_payload(
+        cfg,
+        test_num=test_num,
+        total_tests=total_tests,
+        config_seed=config_seed,
+        rtol=rtol,
+        atol=atol,
+        message=message,
+        attempt=attempt,
+    )
+    _emit_diagnostic_event(event_type, {"status": status, "repro": repro})
+
+
 def _repro_command(payload: dict) -> str:
     metadata = payload.get("metadata", {})
     graph_engine_indices = metadata.get("requested_graph_engine_indices", [])
@@ -1415,7 +1463,8 @@ def _run_single_config(
             atol=atol,
             attempt=attempt,
         )
-        print(f"Large tensor fuzzer active configuration: {_repro_json(active_payload)}", flush=True)
+        active_json = _repro_json(active_payload)
+        _emit_diagnostic_event("active_config", active_payload, human_message=f"Large tensor fuzzer active configuration: {active_json}")
 
         phase = "cuDNN execution"
         cudnn_result = _run_cudnn(cfg, X, W, Y, bias, cudnn_handle)
@@ -1504,14 +1553,72 @@ def _run_test(cfg: LargeTensorConfig, cudnn_handle, test_num: int, total_tests: 
         )
         return
 
-    ok, msg = _run_single_config(cfg, cudnn_handle, test_num=test_num, total_tests=total_tests, config_seed=config_seed)
+    try:
+        ok, msg = _run_single_config(cfg, cudnn_handle, test_num=test_num, total_tests=total_tests, config_seed=config_seed)
+    except AssertionError as e:
+        _emit_outcome_event(
+            "failure",
+            "numeric_mismatch",
+            cfg,
+            test_num=test_num,
+            total_tests=total_tests,
+            config_seed=config_seed,
+            message=str(e),
+        )
+        raise
+    except (RuntimeError, OSError) as e:
+        _emit_outcome_event(
+            "failure",
+            "frontend_error",
+            cfg,
+            test_num=test_num,
+            total_tests=total_tests,
+            config_seed=config_seed,
+            message=str(e),
+        )
+        raise
     if ok:
+        _emit_outcome_event(
+            "test_complete",
+            "passed",
+            cfg,
+            test_num=test_num,
+            total_tests=total_tests,
+            config_seed=config_seed,
+        )
         return
     if msg.startswith("insufficient_memory"):
+        _emit_outcome_event(
+            "skip",
+            "insufficient_memory",
+            cfg,
+            test_num=test_num,
+            total_tests=total_tests,
+            config_seed=config_seed,
+            message=msg,
+        )
         context = _format_repro_context(cfg, test_num=test_num, total_tests=total_tests, config_seed=config_seed, message=msg)
         pytest.skip(f"Insufficient GPU memory: {msg}{context}")
     if msg.startswith("not_supported"):
+        _emit_outcome_event(
+            "skip",
+            "not_supported",
+            cfg,
+            test_num=test_num,
+            total_tests=total_tests,
+            config_seed=config_seed,
+            message=msg,
+        )
         pytest.skip(f"Graph not supported on this arch: {msg}")
+    _emit_outcome_event(
+        "failure",
+        "cudnn_execution_error",
+        cfg,
+        test_num=test_num,
+        total_tests=total_tests,
+        config_seed=config_seed,
+        message=msg,
+    )
     context = _format_repro_context(cfg, test_num=test_num, total_tests=total_tests, config_seed=config_seed, message=msg)
     pytest.fail(f"cuDNN execution error: {msg}{context}")
 
@@ -1537,13 +1644,42 @@ def _run_test_with_regen(*, config_seed: int, test_num: int, total_tests: int, a
         candidate_id = _test_id((test_num, total_tests, config_seed, candidate))
         try:
             ok, msg = _run_single_config(candidate, cudnn_handle, test_num=test_num, total_tests=total_tests, config_seed=config_seed, attempt=attempt)
-        except AssertionError:
+        except AssertionError as e:
+            _emit_outcome_event(
+                "failure",
+                "numeric_mismatch",
+                candidate,
+                test_num=test_num,
+                total_tests=total_tests,
+                config_seed=config_seed,
+                message=str(e),
+                attempt=attempt,
+            )
             raise
         except (RuntimeError, OSError) as e:
+            _emit_outcome_event(
+                "failure",
+                "frontend_error",
+                candidate,
+                test_num=test_num,
+                total_tests=total_tests,
+                config_seed=config_seed,
+                message=str(e),
+                attempt=attempt,
+            )
             details = f"regenerated candidate={candidate_id}, attempt={attempt}; pytest node ID identifies attempt 1"
             raise RuntimeError(f"{e} [{details}]") from e
 
         if ok:
+            _emit_outcome_event(
+                "test_complete",
+                "passed",
+                candidate,
+                test_num=test_num,
+                total_tests=total_tests,
+                config_seed=config_seed,
+                attempt=attempt,
+            )
             if attempt > 1:
                 print(
                     f"{_REGEN_ON_UNSUPPORTED_ENV}: selected {candidate_id} " f"after {attempt} attempts; last unsupported: {last_unsupported}",
@@ -1551,6 +1687,16 @@ def _run_test_with_regen(*, config_seed: int, test_num: int, total_tests: int, a
                 )
             return
         if msg.startswith("insufficient_memory"):
+            _emit_outcome_event(
+                "skip",
+                "insufficient_memory",
+                candidate,
+                test_num=test_num,
+                total_tests=total_tests,
+                config_seed=config_seed,
+                message=msg,
+                attempt=attempt,
+            )
             context = _format_repro_context(
                 candidate,
                 test_num=test_num,
@@ -1561,12 +1707,32 @@ def _run_test_with_regen(*, config_seed: int, test_num: int, total_tests: int, a
             )
             pytest.skip(f"Insufficient GPU memory for {candidate_id}: {msg}{context}")
         if not msg.startswith("not_supported"):
+            _emit_outcome_event(
+                "failure",
+                "cudnn_execution_error",
+                candidate,
+                test_num=test_num,
+                total_tests=total_tests,
+                config_seed=config_seed,
+                message=msg,
+                attempt=attempt,
+            )
             context = _format_repro_context(candidate, test_num=test_num, total_tests=total_tests, config_seed=config_seed, message=msg, attempt=attempt)
             identity = f"attempt {attempt}; pytest node ID identifies attempt 1"
             failure = f"cuDNN execution error for regenerated candidate {candidate_id} ({identity}): {msg}{context}"
             pytest.fail(failure)
         last_unsupported = f"attempt {attempt}: {candidate_id}: {msg}"
 
+    _emit_outcome_event(
+        "skip",
+        "not_supported_after_regeneration",
+        candidate,
+        test_num=test_num,
+        total_tests=total_tests,
+        config_seed=config_seed,
+        message=last_unsupported,
+        attempt=max_attempts,
+    )
     pytest.skip(
         f"No supported {_GRAPH_ENGINE_OP_ENV}={filtered_op.name.lower()} config "
         f"found for selected graph engine index after {max_attempts} attempts; "
@@ -1612,13 +1778,24 @@ def test_conv_large_tensor_repro(cudnn_handle):
     if cudnn_handle is None:
         pytest.skip("cuDNN handle not available")
 
-    ok, msg = _run_single_config(cfg, cudnn_handle)
+    try:
+        ok, msg = _run_single_config(cfg, cudnn_handle)
+    except AssertionError as e:
+        _emit_outcome_event("failure", "numeric_mismatch", cfg, message=str(e))
+        raise
+    except (RuntimeError, OSError) as e:
+        _emit_outcome_event("failure", "frontend_error", cfg, message=str(e))
+        raise
     if ok:
+        _emit_outcome_event("test_complete", "passed", cfg)
         return
     if msg.startswith("insufficient_memory"):
+        _emit_outcome_event("skip", "insufficient_memory", cfg, message=msg)
         pytest.skip(f"Insufficient GPU memory: {msg}" f"{_format_repro_context(cfg, message=msg)}")
     if msg.startswith("not_supported"):
+        _emit_outcome_event("skip", "not_supported", cfg, message=msg)
         pytest.skip(f"Graph not supported on this arch: {msg}")
+    _emit_outcome_event("failure", "cudnn_execution_error", cfg, message=msg)
     pytest.fail(f"cuDNN execution error: {msg}" f"{_format_repro_context(cfg, message=msg)}")
 
 
