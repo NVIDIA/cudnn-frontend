@@ -710,6 +710,7 @@ def _mk_bwd_graph(
     stats_stride: tuple | None = None,
     grad_strides: tuple | None = None,
     bias: bool = False,
+    dbias: bool = False,
     **bwd_kwargs,
 ):
     g = _mk_graph()
@@ -732,10 +733,12 @@ def _mk_bwd_graph(
         data_type=cudnn.data_type.FLOAT,
         name="stats",
     )
-    if bias:
+    if bias or dbias:
         bias_t = g.tensor(dim=(1, H, s_q, s_kv), stride=(H * s_q * s_kv, s_q * s_kv, s_kv, 1), data_type=DTYPE, name="bias")
+        bwd_kwargs.update(bias=bias_t)
+    if dbias:
         dbias_t = g.tensor(dim=(1, H, s_q, s_kv), stride=(H * s_q * s_kv, s_q * s_kv, s_kv, 1), data_type=DTYPE, name="dBias")
-        bwd_kwargs.update(bias=bias_t, dBias=dbias_t)
+        bwd_kwargs.update(dBias=dbias_t)
     dq, dk, dv = g.sdpa_backward(name="sb", q=q, k=k, v=v, o=o, dO=do, stats=stats, attn_scale=0.125, **bwd_kwargs)
     _finish_output(dq, q_dims, grad_strides or _bshd_strides(H, s_q, d))
     _finish_output(dk, (B, h_kv, s_kv, d), grad_strides or _bshd_strides(h_kv, s_kv, d))
@@ -822,9 +825,14 @@ def test_bwd_probe_rejects_deterministic(monkeypatch):
     assert not _bwd_eligible(_mk_bwd_graph(use_deterministic_algorithm=True))
 
 
-def test_bwd_probe_rejects_dbias(monkeypatch):
+def test_bwd_probe_rejects_bias(monkeypatch):
     monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
     assert not _bwd_eligible(_mk_bwd_graph(bias=True))
+
+
+def test_bwd_probe_rejects_dbias(monkeypatch):
+    monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
+    assert not _bwd_eligible(_mk_bwd_graph(dbias=True))
 
 
 def test_bwd_probe_rejects_non_bshd_layout(monkeypatch):

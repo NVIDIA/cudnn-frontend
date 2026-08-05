@@ -371,4 +371,4 @@ def engine_name(arch: str = "sm120") -> str:
 # cudnn/sdpa/bwd/engine.py, which wraps each spec as a BaseEngine).
 ENGINE_SPECS = (_sm120_spec(),)
 
-__all__ = ["Capabilities", "EngineSpec", "ENGINE_SPECS", "SdpaBwdKnobs", "analyze_for", "engine_name", "mismatch"]
+__all__ = ["ENGINE_SPECS", "Capabilities", "EngineSpec", "SdpaBwdKnobs", "analyze_for", "engine_name", "mismatch"]

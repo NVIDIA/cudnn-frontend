@@ -209,7 +209,8 @@ class SdpaGraphFacts:
 
 
 def _single_sdpa_node(graph: "cudnn.pygraph") -> Optional[Any]:
-    """The graph's sole SDPA-forward node, or None if the graph is anything else."""
+    """The graph's sole SDPA node (forward, backward, or an FP8/MXFP8 flavor),
+    or None if the graph is anything else."""
     try:
         nodes = graph.nodes
     except Exception:  # noqa: BLE001 — non-IR graph objects
@@ -309,11 +310,18 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
     # the underlying buffer keeps the user's (B, H, S, D) shape.  Canonicalize
     # so probing works both before and after the native build.
     if is_backward:
-        if k_dim[3] != d_qk and k_dim[2] == d_qk:
+
+        def _square_transposed(dim: tuple, stride: tuple) -> bool:
+            """Square (S == D) rewritten views are extent-ambiguous; the stride
+            order disambiguates: the transposed view keeps the buffer's unit
+            stride, which lands on axis 2 instead of axis 3."""
+            return dim[2] == dim[3] != 1 and stride[2] == 1 and stride[3] != 1
+
+        if (k_dim[3] != d_qk and k_dim[2] == d_qk) or _square_transposed(k_dim, k_stride):
             k_dim = (k_dim[0], k_dim[1], k_dim[3], k_dim[2])
             k_stride = (k_stride[0], k_stride[1], k_stride[3], k_stride[2])
         _, h_kv, s_kv, _ = k_dim
-        if v_dim[2] != s_kv and v_dim[3] == s_kv:
+        if (v_dim[2] != s_kv and v_dim[3] == s_kv) or _square_transposed(v_dim, v_stride):
             v_dim = (v_dim[0], v_dim[1], v_dim[3], v_dim[2])
             v_stride = (v_stride[0], v_stride[1], v_stride[3], v_stride[2])
         dims["k"], dims["v"] = k_dim, v_dim

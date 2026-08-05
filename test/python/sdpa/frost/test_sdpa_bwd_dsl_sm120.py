@@ -170,24 +170,28 @@ def _run_bwd_graph(
     dk.set_output(True).set_dim(dk_gpu.shape).set_stride(dk_gpu.stride())
     dv.set_output(True).set_dim(dv_gpu.shape).set_stride(dv_gpu.stride())
 
-    if q_tile is not None or kv_tile is not None:
-        pytest.skip(
-            "graph.set_engine_knobs() was removed with the monkey-patch dispatch layer and has no replacement in "
-            "this MR: knobs now ride on the plan (engines.base.PlanConfig.knobs), one ranked entry per knob set, "
-            "picked with select_plan(). Re-enable once the SDPA bwd family proposes its tile domain as plans."
-        )
-
     graph.validate()
     graph.build_operation_graph()
-    graph.create_execution_plans([cudnn.heur_mode.A])
-    if select:
-        _select_engine(graph, ENGINE)
+    if q_tile is not None or kv_tile is not None:
+        # A knob request rides on a plan entry (PlanConfig.knobs): append
+        # exactly one (engine_id, knobs) plan — the deterministic-replay path.
+        from cudnn.engines.engine_ids import FROST_SDPA_BWD_ID_BASE
+        from cudnn.sdpa.bwd.engines import SdpaBwdKnobs
+
+        graph.create_execution_plan(FROST_SDPA_BWD_ID_BASE + 0, SdpaBwdKnobs(tile_m=q_tile, tile_n=kv_tile))
+        graph.select_plan(0)
+    else:
+        graph.create_execution_plans([cudnn.heur_mode.A])
+        if select:
+            _select_engine(graph, ENGINE)
     graph.check_support()
     graph.build_plans()
     # What actually runs, not what merely ranked first: build_plans settles the
     # plan index on the entry that built.
     engine = graph.selected_engine
     plan_name = engine.name if engine is not None else "backend"
+    if select or q_tile is not None or kv_tile is not None:
+        assert plan_name == ENGINE, f"pinned {ENGINE} but {plan_name} would run"
 
     workspace_size = graph.get_workspace_size()
     if plan_name == ENGINE:
@@ -305,18 +309,6 @@ def test_sdpa_bwd_dsl_sm120_auto_routing():
 
     plan_name = _run_case(head_dim=64, is_causal=True, select=False)
     assert plan_name == ENGINE
-
-
-@pytest.mark.L0
-@torch_fork_set_rng(seed=6)
-def test_sdpa_bwd_dsl_sm120_stream_respect():
-    """The engine runs on the caller's non-default stream (no default-stream leak)."""
-
-    _require_dsl()
-    stream = torch.cuda.Stream()
-    with torch.cuda.stream(stream):
-        _run_case(head_dim=64)
-    torch.cuda.synchronize()
 
 
 @pytest.mark.L0

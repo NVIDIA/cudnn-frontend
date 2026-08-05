@@ -104,10 +104,21 @@ class SdpaBwdDsl(APIBase):
 
     @staticmethod
     def _to_bshd(tensor: torch.Tensor) -> torch.Tensor:
-        """Return the compact kernel-facing BSHD tensor for logical BHSD."""
+        """Return the compact kernel-facing BSHD tensor for a logical-BHSD INPUT."""
 
         view = tensor.transpose(1, 2)
         return view if view.is_contiguous() else view.contiguous()
+
+    @staticmethod
+    def _out_bshd(tensor: torch.Tensor) -> torch.Tensor:
+        """The compact BSHD view of a logical-BHSD OUTPUT, or raise."""
+
+        view = tensor.transpose(1, 2)
+        if not view.is_contiguous():
+            raise ValueError(
+                "output tensor must be logical (B, H, S, D) over compact BSHD storage; " f"got stride {tuple(tensor.stride())} shape {tuple(tensor.shape)}"
+            )
+        return view
 
     @abstractmethod
     def scratch_workspace_bytes(self) -> int:
@@ -330,15 +341,14 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
 
         import cutlass
 
-        # Zero-copy: the BSHD-physical layout was gated in check_support.
         q = self._to_bshd(q_tensor)
         k = self._to_bshd(k_tensor)
         v = self._to_bshd(v_tensor)
         o = self._to_bshd(o_tensor)
         do = self._to_bshd(do_tensor)
-        dq = self._to_bshd(dq_tensor)
-        dk = self._to_bshd(dk_tensor)
-        dv = self._to_bshd(dv_tensor)
+        dq = self._out_bshd(dq_tensor)
+        dk = self._out_bshd(dk_tensor)
+        dv = self._out_bshd(dv_tensor)
         lse = stats_tensor.reshape(self.batch_size, self.h_q, self.s_q_max)
 
         kernels = self._compiled_kernel
