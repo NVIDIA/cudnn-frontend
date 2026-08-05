@@ -8,6 +8,7 @@ Parameterization decorators and init helpers. Mirrors the NSA test utilities
 pattern (see test/python/fe_api/nsa/nsa_utils.py).
 """
 
+import math
 from typing import Optional, Tuple
 
 import pytest
@@ -116,6 +117,94 @@ def with_dsa_indexer_backward_params(func):
 
 def with_dsa_dense_indexer_backward_params(func):
     return _apply(DSA_PARAM_MARKS + DSA_DENSE_INDEXER_BACKWARD_PARAM_MARKS, func)
+
+
+def make_random_mxfp8_scale(
+    shape: Tuple[int, ...],
+    *,
+    device: torch.device | str,
+    seed: Optional[int] = None,
+    exponent_min: int = -4,
+    exponent_max: int = 4,
+) -> torch.Tensor:
+    """Create random power-of-two E8M0 scales for MXFP8 test inputs."""
+    if exponent_min > exponent_max:
+        raise ValueError("exponent_min must be <= exponent_max")
+    generator = None
+    if seed is not None:
+        generator = torch.Generator(device=device)
+        generator.manual_seed(seed)
+    exponents = torch.randint(
+        exponent_min,
+        exponent_max + 1,
+        shape,
+        device=device,
+        generator=generator,
+        dtype=torch.int32,
+    )
+    if exponents.numel() > 0 and bool((exponents == 0).all().item()):
+        exponents.reshape(-1)[0] = exponent_min if exponent_min != 0 else exponent_max
+    values = torch.ldexp(torch.ones(shape, device=device, dtype=torch.float32), exponents)
+    return values.to(torch.float8_e8m0fnu)
+
+
+def expand_mxfp8_scale(
+    scale: torch.Tensor,
+    head_dim: int,
+    sf_vec_size: int = 32,
+) -> torch.Tensor:
+    """Expand one MXFP8 scale per scale-vector group to elementwise scales."""
+    return scale.float().repeat_interleave(sf_vec_size, dim=-1)[..., :head_dim]
+
+
+def quantize_mxfp8(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """Quantize a tensor to E4M3 using logical MXFP8 E8M0 scales."""
+    return (x.float() / expand_mxfp8_scale(scale, x.shape[-1])).to(torch.float8_e4m3fn)
+
+
+def pack_mxfp8_scales_thd(
+    q_scale_logical: torch.Tensor,
+    k_scale_logical: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    qhead_per_kv_head: int,
+    *,
+    q_alignment: Optional[int] = None,
+    k_alignment: int = 128,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build padded prefixes and packed Q/K scales for THD MXFP8 tests."""
+    from cudnn.deepseek_sparse_attention.utils.sm100.mxfp8_scale_utils import (
+        make_scale_cu_seqlens_padded,
+        pack_k_scale_thd,
+        pack_q_scale_thd,
+    )
+
+    if q_alignment is None:
+        q_alignment = 128 // math.gcd(128, qhead_per_kv_head)
+    cu_q_scale = make_scale_cu_seqlens_padded(cu_seqlens_q, q_alignment)
+    cu_k_scale = make_scale_cu_seqlens_padded(cu_seqlens_k, k_alignment)
+    q_scale = pack_q_scale_thd(
+        q_scale_logical,
+        cu_seqlens_q,
+        cu_q_scale,
+        qhead_per_kv_head,
+    )
+    k_scale = pack_k_scale_thd(k_scale_logical, cu_seqlens_k, cu_k_scale)
+    return q_scale, k_scale, cu_q_scale, cu_k_scale
+
+
+def quantize_fp8_1x128(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize rows to E4M3 with one floating-point descale per row."""
+    x_f32 = x.float()
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    amax = x_f32.abs().amax(dim=-1)
+    descale = torch.where(amax > 0, amax / fp8_max, torch.ones_like(amax))
+    q = torch.clamp(
+        x_f32 / descale.unsqueeze(-1),
+        min=-fp8_max,
+        max=fp8_max,
+    ).to(torch.float8_e4m3fn)
+    return q, descale.float()
 
 
 def dsa_init(

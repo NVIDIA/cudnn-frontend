@@ -96,6 +96,7 @@ class DenseScoreRecomputeSm100:
     arch = 100
     WARP_SIZE = 32
     WARPGROUP_SIZE = 128
+    max_q_tokens_per_tile = 2
 
     def __init__(
         self,
@@ -119,6 +120,9 @@ class DenseScoreRecomputeSm100:
         self.kv_stage = kv_stage
         self.ratio = ratio
         self.is_varlen = is_varlen
+        # Unified forward specializations opt in to compact output. The base
+        # dense score kernel always retains its dense output contract.
+        self.is_compressed_logits = False
         self.sched_warp_id = 2
         self.num_clc_stage = 1
         self.num_clc_response_bytes = 16
@@ -133,7 +137,9 @@ class DenseScoreRecomputeSm100:
         self.num_k_chunks = self.head_dim_padded // self.k_block_size
 
         self.q_tokens_per_tile = m_block_size // qhead_per_kvhead
-        assert self.q_tokens_per_tile <= 2, f"q_tokens_per_tile ({self.q_tokens_per_tile}) must be 1 or 2"
+        assert (
+            self.q_tokens_per_tile <= self.max_q_tokens_per_tile
+        ), f"q_tokens_per_tile ({self.q_tokens_per_tile}) must not exceed {self.max_q_tokens_per_tile}"
 
         self.tmem_repetition = self.m_block_size // 4
 
@@ -191,8 +197,14 @@ class DenseScoreRecomputeSm100:
         mCuSeqlensK: cute.Tensor | None,
         mQCausalOffsets: cute.Tensor | None,
         stream: cuda.CUstream,
+        mCandBatchOffsets: cute.Tensor | None = None,
     ):
-        """Host-side: layout transpose, PackGQA, TMA creation, kernel launch."""
+        """Host-side: layout transpose, PackGQA, TMA creation, kernel launch.
+
+        ``mCandBatchOffsets`` contains compact-buffer slab bases for batches
+        whose candidate counts differ. It is unused by dense score recompute
+        and attention.
+        """
 
         self.q_dtype = mQ.element_type
         self.k_dtype = mK.element_type
@@ -298,8 +310,9 @@ class DenseScoreRecomputeSm100:
         mPerHead = cute.make_tensor(mPerHead.iterator, cute.select(mPerHead.layout, mode=PerHead_transpose))
 
         # --- Output layout: BSS (bs, sq, sk) -> (sq, sk, bs) ; TS (total_q, max_sk) stays ---
-        Out_transpose = [0, 1] if const_expr(is_varlen) else [1, 2, 0]
-        mOut = cute.make_tensor(mOut.iterator, cute.select(mOut.layout, mode=Out_transpose))
+        if const_expr(not self.is_compressed_logits):
+            Out_transpose = [0, 1] if const_expr(is_varlen) else [1, 2, 0]
+            mOut = cute.make_tensor(mOut.iterator, cute.select(mOut.layout, mode=Out_transpose))
 
         # --- Denom layout: BS (bs, sq) -> (sq, bs) ; T (total_q,) stays ---
         Denom_transpose = [0] if const_expr(is_varlen) else [1, 0]
@@ -311,7 +324,10 @@ class DenseScoreRecomputeSm100:
         seqlen_q_static = max_seqlen_q if const_expr(is_varlen) else cute.size(mQ.shape[0]) // self.qhead_per_kvhead
         num_m_blocks = cute.ceil_div(seqlen_q_static * self.qhead_per_kvhead, self.m_block_size)
         batch_size = cute.size(mCuSeqlensQ.shape[0]) - 1 if const_expr(is_varlen) else cute.size(mQ.shape[3])
-        tile_sched_params = utils.ClcDynamicPersistentTileSchedulerParams((num_m_blocks, 1, batch_size), (*self.cluster_shape_mn, 1))
+        tile_sched_params = utils.ClcDynamicPersistentTileSchedulerParams(
+            (num_m_blocks, 1, batch_size),
+            (*self.cluster_shape_mn, 1),
+        )
         grid_dim = utils.ClcDynamicPersistentTileScheduler.get_grid_shape(tile_sched_params)
         self.kernel(
             mQ,
@@ -331,6 +347,7 @@ class DenseScoreRecomputeSm100:
             mCuSeqlensQ,
             mCuSeqlensK,
             mQCausalOffsets,
+            mCandBatchOffsets,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -361,6 +378,7 @@ class DenseScoreRecomputeSm100:
         mCuSeqlensQ: cute.Tensor | None,
         mCuSeqlensK: cute.Tensor | None,
         mQCausalOffsets: cute.Tensor | None,
+        mCandBatchOffsets: cute.Tensor | None = None,
     ):
         """Device-side kernel entry with CLC persistent scheduling."""
         is_varlen = mCuSeqlensQ is not None
@@ -595,7 +613,7 @@ class DenseScoreRecomputeSm100:
                         # TMA K load (reverse order, matching MMA direction)
                         K_producer.reset()
                         mK_cur = seqlen.offset_batch_K(mK, batch_idx, dim=3)[None, None, 0]
-                        n_block_k = num_n_blocks_compute - 1
+                        n_block_k = num_n_blocks_compute - Int32(1)
                         while n_block_k >= Int32(0):
                             for _kc in cutlass.range_constexpr(self.num_k_chunks):
                                 handle_K = K_producer.acquire_and_advance()
@@ -660,7 +678,7 @@ class DenseScoreRecomputeSm100:
                         tSrQ = tiled_mma_qk.make_fragment_B(sQ)
                         qk_mma_op = tiled_mma_qk.op
 
-                        n_block = num_n_blocks_compute - 1
+                        n_block = num_n_blocks_compute - Int32(1)
 
                         while n_block >= Int32(0):
                             slot = n_block % Int32(self.num_tmem_slots)
@@ -757,9 +775,9 @@ class DenseScoreRecomputeSm100:
                         q_causal_offset,
                     )
                     per_head_offset = (tile_count % 2) * self.m_block_size
-                    mOut_cur = seqlen.offset_batch_Q(mOut, batch_idx, dim=2)
                     mDenom_cur = seqlen.offset_batch_Q(mDenom, batch_idx, dim=1)
                     if cutlass.const_expr(self.score_type == "attention"):
+                        mOut_cur = seqlen.offset_batch_Q(mOut, batch_idx, dim=2)
                         s_full_phase_bits, reduce_phase = self._epilogue_attention_dense(
                             tiled_mma_qk,
                             tStS_ref,
@@ -781,7 +799,35 @@ class DenseScoreRecomputeSm100:
                             softmax_scale,
                             per_head_offset=per_head_offset,
                         )
+                    elif cutlass.const_expr(self.is_compressed_logits):
+                        # Compact indexer output. The single CTA walks the full
+                        # K range and writes the full-row LSE when requested.
+                        lse_dst = mDenom_cur
+                        s_full_phase_bits, reduce_phase = self._epilogue_indexer_dense(
+                            tiled_mma_qk,
+                            tStS_ref,
+                            sPerHead,
+                            sScoreAll,
+                            S_mbar_ptr,
+                            reduce_sync_mbar_ptr,
+                            mOut,
+                            lse_dst,
+                            num_n_blocks_compute,
+                            seqlen.seqlen_k,
+                            seqlen.seqlen_q,
+                            max_seqlen_k,
+                            q_causal_offset,
+                            m_block,
+                            tidx,
+                            s_full_phase_bits,
+                            reduce_phase,
+                            softmax_scale,
+                            per_head_offset=per_head_offset,
+                            batch_idx=batch_idx,
+                            cand_batch_offsets=mCandBatchOffsets,
+                        )
                     else:
+                        mOut_cur = seqlen.offset_batch_Q(mOut, batch_idx, dim=2)
                         s_full_phase_bits, reduce_phase = self._epilogue_indexer_dense(
                             tiled_mma_qk,
                             tStS_ref,

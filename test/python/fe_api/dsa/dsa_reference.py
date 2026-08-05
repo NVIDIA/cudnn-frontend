@@ -191,6 +191,54 @@ def check_ref_indexer_forward(
     )
 
 
+def check_ref_compressed_topk(
+    dense_scores: torch.Tensor,
+    indices: torch.Tensor,
+    logits: torch.Tensor,
+    top_k: int,
+    *,
+    atol: float = 1e-4,
+    rtol: float = 1e-4,
+) -> None:
+    """Validate local compressed Top-K ids/logits against dense scores.
+
+    The radix emit order is intentionally unspecified, so this checks the
+    selected set after sorting. Rows with fewer than ``top_k`` finite
+    candidates must use ``-1``/``-inf`` padding.
+    """
+    assert indices.shape == logits.shape == (*dense_scores.shape[:-1], top_k)
+    assert indices.dtype == torch.int32
+    assert logits.dtype == torch.float32
+
+    valid = indices >= 0
+    expected_count = torch.isfinite(dense_scores).sum(dim=-1).clamp(max=top_k)
+    assert torch.equal(valid.sum(dim=-1), expected_count)
+    assert bool(((indices < dense_scores.shape[-1]) | ~valid).all())
+
+    gathered = torch.gather(dense_scores, -1, indices.clamp(min=0).long())
+    if bool(valid.any()):
+        torch.testing.assert_close(
+            logits[valid],
+            gathered[valid],
+            atol=atol,
+            rtol=rtol,
+        )
+    if bool((~valid).any()):
+        assert bool(torch.isneginf(logits[~valid]).all())
+
+    expected_values = torch.topk(dense_scores, top_k, dim=-1).values
+    actual_values = torch.sort(logits, dim=-1, descending=True).values
+    expected_finite = torch.isfinite(expected_values)
+    assert torch.equal(torch.isfinite(actual_values), expected_finite)
+    if bool(expected_finite.any()):
+        torch.testing.assert_close(
+            actual_values[expected_finite],
+            expected_values[expected_finite],
+            atol=atol,
+            rtol=rtol,
+        )
+
+
 def ref_indexer_top_k(
     input_values: torch.Tensor,  # (n_rows, num_cols)
     seq_lens: torch.Tensor,  # (batch_size,)

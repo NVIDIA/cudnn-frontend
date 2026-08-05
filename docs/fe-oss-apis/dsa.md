@@ -6,10 +6,11 @@
 
 The DeepSeek Sparse Attention (DSA) module integrates a set of CuTe-DSL
 kernels that support the sparse-attention path used by DeepSeek-style models.
-Most kernels target Hopper (SM90) and Blackwell (SM100+) GPUs; Indexer Top-K
-remains SM100+ only. The kernels are
-delivered as Python classes / wrappers that follow the same `APIBase`
-pattern as other cuDNN Frontend operations.
+Most kernels target Hopper (SM90) and Blackwell (SM100+) GPUs. Dense Indexer
+Forward and standalone Indexer Top-K support both architectures; the combined
+compressed-logits + Top-K path is SM100-only. The kernels are delivered as
+Python classes / wrappers that follow the same `APIBase` pattern as other
+cuDNN Frontend operations.
 
 **Scope:** this module ships CuTe-DSL kernels for DSA backward, indexer
 scores/top-K, sparse/dense score recompute, and sparse/dense indexer
@@ -22,22 +23,24 @@ The module packages the following operations:
 
 1. **Sparse Attention Backward** – DSA backward (FlashMLA-shape, SM90/SM100).
 2. **Indexer Forward** – CuTe-DSL score kernel (Q @ K^T, ReLU, head reduce,
-   ratio causal mask). Non-fused; pair with **Indexer Top-K** for the
-   top-K step.
-3. **Indexer Top-K** – SM100 CuTe-DSL radix top-K kernel with per-row
+   ratio causal mask) that materializes dense scores.
+3. **Combined Indexer Forward + Top-K** – SM100 compact score generation,
+   Top-K selection, and optional Top-K softmax in one public API call.
+4. **Indexer Top-K** – SM90+ CuTe-DSL radix top-K kernel with per-row
    ``seq_lens``.
-4. **Sparse Indexer / Attention Score Recompute** – sparse (top-K) recompute
+5. **Sparse Indexer / Attention Score Recompute** – sparse (top-K) recompute
    of indexer and attention scores for training loss.
-5. **Dense Indexer / Attention Score Recompute** – dense (full-KV) analogues
+6. **Dense Indexer / Attention Score Recompute** – dense (full-KV) analogues
    of the above.
-6. **Indexer Backward** – three-stage pipeline (score-grad, three
+7. **Indexer Backward** – three-stage pipeline (score-grad, three
    GEMMs, dtype cast) for sparse top-K score tensors.
-7. **Dense Indexer Backward** – full-KV counterpart of Indexer Backward.
+8. **Dense Indexer Backward** – full-KV counterpart of Indexer Backward.
 
 ### Architecture
 
 ```text
-Q, K, W ──► IndexerForward ──► scores ──► IndexerTopK ──► topk_idxs
+Q, K, W ──┬─► IndexerForward ──► scores ──► IndexerTopK ──► topk_idxs
+          └─► IndexerForwardTopK ──► topk_idxs, logits, predict
                                                              │
                                                              v
                       [FlashMLA fwd — external, C++] ──► out, lse
@@ -77,6 +80,9 @@ DSA.sparse_attention_backward_wrapper
 
 DSA.IndexerForward
 DSA.indexer_forward_wrapper
+DSA.indexer_forward_top_k_wrapper
+DSA.compress_topk_cand_buffer_size
+DSA.compress_topk_cand_buffer_size_thd
 
 DSA.IndexerTopK
 DSA.indexer_top_k_wrapper
@@ -129,7 +135,7 @@ result = DSA.sparse_attention_backward_wrapper(
 dq, dkv, d_sink = result["dq"], result["dkv"], result["d_sink"]
 ```
 
-### 2. Indexer Forward (score-only)
+### 2. Indexer Forward
 
 Computes dense indexer scores:
 ``S[b, q, k] = sum_h ReLU(Q_h · K_h^T) · W_h`` with a ratio-causal mask.
@@ -145,15 +151,36 @@ The K columns are assumed to be a compressed-KV prefix starting at global
 compressed column 0.
 
 - **Inputs**
-  - `q`: `(B, S_q, H_q, D)` BF16
-  - `k`: `(B, S_k, H_kv, D)` BF16
-  - `w`: `(B, S_q, H_q)` BF16
+  - `q`: `(B, S_q, H_q, D)` BF16, or the architecture-specific FP8 format
+    described below.
+  - `k`: `(B, S_k, H_kv, D)` BF16, or the architecture-specific FP8 format
+    described below.
+  - `w`: `(B, S_q, H_q)` BF16. The SM90 FP8 path also accepts FP32 when
+    weights have already been pre-scaled by `q_scale * sm_scale`.
   - `q_causal_offsets` (optional): CUDA INT32 tensor with one entry per
     batch/THD segment, on the same device as `q`.
-- **Output** — `scores`: `(B, S_q, S_k)` FP32
+- **Output** — `scores`: `(B, S_q, S_k)` FP32.
+- **Precision paths**
+  - SM90 `precision="fp8"`: Q/K use E4M3 and `q_scale`/`k_scale` are FP32
+    descales with one value per token/head. Set `return_lse=True` (or provide
+    `lse_out`) to compute LSE in the same kernel invocation.
+  - SM100 `precision="mxfp8"`: Q/K use E4M3 with block-scaled, packed E8M0
+    scale tensors; `sf_vec_size` is currently fixed at 32 and
+    `qhead_per_kv_head ∈ {32, 64}`.
+    THD inputs additionally require
+    `cu_seqlens_q_scale_padded`/`cu_seqlens_k_scale_padded`: contiguous CUDA
+    INT32 prefix tensors of shape `(B + 1,)` on the Q/K device. The interface
+    deliberately performs no device-to-host copy to inspect their values.
+    The caller guarantees that each device-side prefix starts at zero, is
+    monotonic, covers the corresponding logical sequence, satisfies the
+    packed-row alignment (each Q span times `qhead_per_kv_head` is a multiple
+    of 128 rows; each K span is a multiple of 128 tokens), and stays within
+    the packed scale storage.
 - **Constraints** — `head_dim == 128`. The SM90 direct path supports
   `qhead_per_kv_head ∈ {16, 32, 64}` and currently requires `H_kv == 1`;
-  SM100 supports `qhead_per_kv_head ∈ {32, 64}`.
+  SM100 BF16 dense and combined Top-K paths support
+  `qhead_per_kv_head ∈ {32, 64}`, as do their MXFP8 paths. All currently
+  require `H_kv == 1` (MQA).
 
 ```python
 result = DSA.indexer_forward_wrapper(
@@ -162,7 +189,54 @@ result = DSA.indexer_forward_wrapper(
 scores = result["scores"]
 ```
 
-### 3. Indexer Top-K
+### 3. Combined Indexer Forward + Top-K
+
+`DSA.indexer_forward_top_k_wrapper` provides a one-call alternative to the
+two-call dense `indexer_forward_wrapper` + `indexer_top_k_wrapper` sequence
+when compact score generation is desired. It returns aligned `indices` INT32
+and `logits` FP32, plus `softmax` FP32 by default, without materializing dense
+scores. Pass
+`return_softmax=False` to omit `softmax`. BSHD output shape is
+`(B, S_q, top_k)`; THD output shape is `(total_q, top_k)`. Padded slots are
+`-1`/`-inf`. The selected set is Top-K, but its slot order is not guaranteed to
+be descending. Set `deterministic=True` to break exact-value ties at the K-th
+boundary toward the smallest local KV indices, making the selected set
+reproducible across launches. This does not sort the output slots; the default
+`False` path retains the faster scheduling-dependent tie-break.
+
+The combined compressed path is SM100-only. Both BSHD and THD support
+BF16 and MXFP8. `topk_indices_global=True` is the default. Optional caller-owned
+candidate/output/softmax/LSE buffers avoid per-call allocations; size the
+candidate buffer with `compress_topk_cand_buffer_size` for BSHD or
+`compress_topk_cand_buffer_size_thd` for THD. LSE is supported for BSHD and THD
+with both BF16 and MXFP8. Explicit microbatching is BF16 BSHD-only and cannot
+be combined with LSE or explicit `q_causal_offsets`. BSHD with explicit
+`q_causal_offsets` currently computes its per-batch candidate offsets eagerly
+and is not CUDA-graph-capturable; THD capture requires the caller-provided
+offsets and buffers returned by `compress_topk_cand_buffer_size_thd`. Compact
+addressing requires `0 <= q_causal_offsets[b]`; rows extending beyond the KV
+prefix are clamped to `seqlen_k_b`. THD MXFP8 uses the same caller-guaranteed
+device-side scale-prefix contract described in §2; the interface does not
+validate prefix values with a device-to-host copy.
+
+```python
+cand_floats = DSA.compress_topk_cand_buffer_size(
+    B, S_q, S_k, ratio=4, return_lse=True,
+)
+cand = torch.empty(cand_floats, dtype=torch.float32, device=q.device)
+
+result = DSA.indexer_forward_top_k_wrapper(
+    q, k, w, top_k=512,
+    ratio=4,
+    cand_buffer=cand,
+    return_lse=True,
+)
+topk_indices, topk_logits = result["indices"], result["logits"]
+predict = result["softmax"]
+lse = result["lse"]
+```
+
+### 4. Indexer Top-K
 
 Radix top-K kernel for selecting candidate KV indices from indexer scores,
 with variable per-row effective length.
@@ -172,7 +246,7 @@ with variable per-row effective length.
   - `seq_lens`: `(batch_size,)` INT32 (per-batch effective column count)
 - **Outputs** — tuple `(indices, values)` (values is `None` when
   `return_val=False`)
-- **Constraints** — SM100+, `top_k ≤ 2048`
+- **Constraints** — SM90+, `top_k ≤ 2048`
 
 ```python
 result = DSA.indexer_top_k_wrapper(
@@ -182,7 +256,7 @@ result = DSA.indexer_top_k_wrapper(
 indices, values = result["indices"], result["values"]
 ```
 
-### 4. Sparse Indexer Score Recompute
+### 5. Sparse Indexer Score Recompute
 
 Computes softmax over top-K entries of the indexer score:
 ``predict[b, q, i] = softmax_i(sum_h ReLU(Q_h · K_{topk[i]}^T) · W_h)``.
@@ -193,7 +267,7 @@ Computes softmax over top-K entries of the indexer score:
   `batch_idx * S_k + local_idx`.
 - **Output** — `predict`: `(B, S_q, topk)` FP32.
 
-### 5. Sparse Attn Score Recompute
+### 6. Sparse Attn Score Recompute
 
 L1-normalised head-summed softmax over top-K entries:
 ``target[b, q, i] = sum_h exp(Q_h · K_{topk[i]}^T · scale - LSE_h) / Z``.
@@ -205,14 +279,21 @@ L1-normalised head-summed softmax over top-K entries:
 - **Output** — `target`: `(B, S_q, topk)` FP32.
 - Note: the wrapper handles the `-log2(e) * lse` preprocessing internally.
 
-### 6. Dense Indexer / Dense Attn Score Recompute
+### 7. Dense Indexer / Dense Attn Score Recompute
 
-Full-KV (no top-K) analogues of §4 and §5. Each returns `{'out', 'denom'}`.
+Full-KV (no top-K) analogues of §5 and §6. Each returns `{'out', 'denom'}`.
 They apply the same ratio-causal mask as Indexer Forward; masked positions are
-written as zero and excluded from `denom`. Pass the same `q_causal_offsets` to
+written as `-inf` and excluded from `denom`. Pass the same `q_causal_offsets` to
 all dense score tensors that feed the same loss path.
 
-### 7. Indexer Backward
+On SM100, Indexer Forward and Dense Indexer Score Recompute use the same
+unified kernel implementation: forward runs it with `compute_lse=False`, while
+dense indexer score recompute runs it with `compute_lse=True`. The shared
+implementation lives in `score_recompute`; `indexer_forward` only imports it.
+Dense Attention Score Recompute has a separate MXFP8 kernel because its score
+and normalization semantics differ from the indexer path.
+
+### 8. Indexer Backward
 
 Three-stage sparse top-K pipeline that produces the training gradients for the
 indexer tower:
@@ -241,7 +322,19 @@ d_index_q, d_weights, d_index_k = (
 )
 ```
 
-### 8. Dense Indexer Backward
+When compressed forward returns its fused `softmax`, backward can skip both
+indexer Q@K score recompute and the separate logits softmax. Pass `softmax`
+directly as `index_score`; backward consumes and overwrites this buffer, so
+pass `softmax.clone()` if it must be preserved. `attn_score` must use the same
+valid-slot mask. Because compressed forward returns global indices by default,
+also pass `topk_indices_global=True` unless forward used
+`topk_indices_global=False`. The public sparse `indexer_backward_wrapper` has a
+BSHD-shaped interface; BF16 THD tensors can use zero-copy `B=1` views (squeeze
+the singleton K head and add a batch dimension) together with global Top-K
+indices. FP8 and MXFP8 indexer backward are not currently supported because
+the backward wrapper requires BF16 Q/K/W inputs.
+
+### 9. Dense Indexer Backward
 
 Full-KV counterpart to Indexer Backward. It consumes raw dense score tensors
 and denominators produced by Dense Indexer / Dense Attn Score Recompute.
@@ -282,12 +375,19 @@ result = DSA.dense_indexer_backward_wrapper(
 ## Limitations
 
 - **Architecture support** — Sparse Attention Backward, Score Recompute,
-  Indexer Forward, and Indexer Backward support SM90 and SM100; Indexer Top-K
-  remains SM100+ only.
+  Indexer Forward, Indexer Top-K, and Indexer Backward support SM90 and SM100.
+  The combined compressed-logits + Top-K forward is SM100-only; the standalone
+  Indexer Top-K remains SM90+.
 - **No fused forward** — the production forward is FlashMLA (C++); this
   module ships only the CuTe-DSL kernels.
 - **Indexer Forward only supports `head_dim = 128`**. SM90 supports
-  `qhead_per_kv_head ∈ {16, 32, 64}` with `H_kv = 1`; SM100 supports
-  `qhead_per_kv_head ∈ {32, 64}`.
-- **Top-K only up to 2048**; `top_k > 2048` is not supported by the
-  underlying radix top-K kernel.
+  `qhead_per_kv_head ∈ {16, 32, 64}` with `H_kv = 1`; SM100 BF16 and MXFP8
+  support `qhead_per_kv_head ∈ {32, 64}`. Both the dense and combined Top-K
+  paths require `H_kv = 1`.
+- **Standalone Top-K only up to 2048**; `top_k > 2048` is not supported by
+  its radix Top-K kernel. The combined compressed path uses a separate stage-2
+  implementation.
+- **Compressed-path limits** — the stage-1 compact score kernel is MQA-only
+  (`H_kv = 1`); MXFP8 requires `qhead_per_kv_head ∈ {32, 64}`; explicit
+  microbatching cannot be combined with MXFP8, LSE, or explicit per-batch
+  causal offsets.

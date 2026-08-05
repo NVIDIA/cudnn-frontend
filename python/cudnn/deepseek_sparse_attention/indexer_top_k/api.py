@@ -11,6 +11,9 @@ import torch
 import cuda.bindings.driver as cuda
 
 from cudnn.api_base import APIBase, TupleDict
+from cudnn.deepseek_sparse_attention.utils.runtime import (
+    torch_stream_context as _torch_stream_context,
+)
 
 from .local_to_global_dsl import local_to_global as _local_to_global
 from .compactify import compactify as _compactify
@@ -139,14 +142,30 @@ class IndexerTopK(APIBase):
             self.compile()
 
         kernel = self._compiled_kernel or _get_cute_dsl_topk_wrapper()
-        indices, values = kernel(
-            input_values,
-            seq_lens,
-            self.top_k,
-            self.next_n,
-            return_val=self.return_val,
-            num_copy_bits=self.num_copy_bits,
-        )
+        # The compiled wrapper uses the TVM-FFI environment stream. Put the
+        # entire allocation + launch sequence under the caller's stream so
+        # that ``current_stream`` is honored rather than silently falling
+        # back to the ambient PyTorch stream.
+        with _torch_stream_context(current_stream):
+            indices, values = kernel(
+                input_values,
+                seq_lens,
+                self.top_k,
+                self.next_n,
+                return_val=self.return_val,
+                num_copy_bits=self.num_copy_bits,
+            )
+
+            # TVM-FFI launches are invisible to PyTorch's dispatcher. Tell the
+            # caching allocator that the external kernel reads the inputs and
+            # writes the outputs on this stream, otherwise their storage may be
+            # recycled while the asynchronous launch is still in flight.
+            launch_stream = torch.cuda.current_stream(input_values.device)
+            input_values.record_stream(launch_stream)
+            seq_lens.record_stream(launch_stream)
+            indices.record_stream(launch_stream)
+            if values is not None:
+                values.record_stream(launch_stream)
         return indices, values
 
 
