@@ -21,13 +21,9 @@ sources — nothing is loaded from an external checkout).
 
 Requirements for the device backend: SM100+ GPU (GB200), PyTorch with CUDA
 13.x, `nvidia-cutlass-dsl` (CuTe DSL), `nvshmem4py`, and a `cudnn` Python
-wheel to graft the `moe_ep` package onto (see §4).  A known-good container:
+wheel to graft the `moe_ep` package onto (see §4).
 
-```
-/lustre/fsw/coreai_libraries_cudnn/mhoqueanik/flashinfer-ep-pt2605-mega_moe_ep-20260712.sqsh
-```
-
-### 2a. Creating the environment from scratch
+### 2a. Creating the environment
 
 Start from the NVIDIA PyTorch NGC image (known-good base:
 `nvcr.io/nvidia/pytorch:26.05-py3` — torch 2.10 / CUDA 13.x on SM100) and
@@ -58,10 +54,11 @@ print("torch", torch.__version__, "cuda", torch.version.cuda,
 EOF
 ```
 
-Expect `sm (10, 0)` — the kernels are SM100-only.  To bake a reusable sqsh
-for SLURM/pyxis clusters, run the same pip install under
+Expect `sm (10, 0)` — the kernels are SM100-only.  On SLURM/pyxis clusters
+you can bake a reusable image once by running the same pip install under
 `srun --container-image=nvcr.io/nvidia/pytorch:26.05-py3
---container-save=<out>.sqsh`.
+--container-save=<out>.sqsh`, then pass `--container-image=<out>.sqsh` to
+later jobs.
 
 Multi-rank (EP) runs additionally need NVSHMEM's usual fabric access
 (`--ipc=host`, and on SLURM the pyxis defaults suffice); single-rank runs
@@ -82,13 +79,19 @@ is the safe habit).
 ## 3. One-shot validation (recommended)
 
 Runs the pytest suite, a bundled-kernel import check (FP4 forward + FP8 mega
-backward), and the single-rank kernel parity, in that order:
+backward), and the single-rank kernel parity, in that order.  From inside
+the §2a environment (the script locates the clone from its own path):
 
 ```bash
-ROOT=/lustre/fsw/coreai_libraries_cudnn/mhoqueanik   # container/mount root
-srun -A coreai_libraries_cudnn -p batch -N1 --ntasks=1 -t 60 \
-  --container-image=$ROOT/flashinfer-ep-pt2605-mega_moe_ep-20260712.sqsh \
-  --container-mounts=$ROOT:$ROOT \
+bash <clone>/test/python/fe_api/moe_ep/run_pr_tests.sh
+```
+
+On a SLURM/pyxis cluster, the same thing as a one-node GPU job:
+
+```bash
+srun -N1 --ntasks=1 --gpus-per-node=1 -t 60 \
+  --container-image=<env-image>.sqsh \
+  --container-mounts=<clone>:<clone> \
   bash <clone>/test/python/fe_api/moe_ep/run_pr_tests.sh
 ```
 
