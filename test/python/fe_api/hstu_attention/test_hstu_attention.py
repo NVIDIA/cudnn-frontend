@@ -703,10 +703,7 @@ def test_backward_supports_optional_gradient_outputs(head_dim, monkeypatch):
         )
         for reference in (q, k, v)
     ]
-    dq, dk, dv = (
-        storage[:, : reference.shape[1]]
-        for storage, reference in zip(padded_outputs, (q, k, v))
-    )
+    dq, dk, dv = (storage[:, : reference.shape[1]] for storage, reference in zip(padded_outputs, (q, k, v)))
     actual = hstu_attention_backward(
         do,
         q,

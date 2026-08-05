@@ -1818,9 +1818,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                 for interval_idx in cutlass.range(self.func_num // 2, unroll_full=True):
                     interval_start = func[0, 2 * interval_idx + 1, func_row]
                     interval_end = func[0, 2 * interval_idx + 2, func_row]
-                    value_valid = value_valid | (
-                        (index_k >= interval_start) & (index_k < interval_end)
-                    )
+                    value_valid = value_valid | ((index_k >= interval_start) & (index_k < interval_end))
                 valid = valid and value_valid
         return valid
 
@@ -1892,10 +1890,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                             ):
                                 interval_start = endpoint_cache[2 * interval_idx + 1]
                                 interval_end = endpoint_cache[2 * interval_idx + 2]
-                                value_valid0 = value_valid0 | (
-                                    (index_k0 >= interval_start)
-                                    & (index_k0 < interval_end)
-                                )
+                                value_valid0 = value_valid0 | ((index_k0 >= interval_start) & (index_k0 < interval_end))
                             valid0 = valid0 and value_valid0
                         if valid1:
                             value_valid1 = index_k1 < endpoint_cache[0]
@@ -1905,10 +1900,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                             ):
                                 interval_start = endpoint_cache[2 * interval_idx + 1]
                                 interval_end = endpoint_cache[2 * interval_idx + 2]
-                                value_valid1 = value_valid1 | (
-                                    (index_k1 >= interval_start)
-                                    & (index_k1 < interval_end)
-                                )
+                                value_valid1 = value_valid1 | ((index_k1 >= interval_start) & (index_k1 < interval_end))
                             valid1 = valid1 and value_valid1
                     else:
                         valid0 = self.is_auto_score_valid(

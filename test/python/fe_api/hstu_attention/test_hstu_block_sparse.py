@@ -1739,9 +1739,7 @@ def test_fp16_arbitrary_backward_uses_auto_metadata(monkeypatch, head_dim):
     )
 
     original_k2q_builder = _interface.build_hstu_k2q_block_sparse
-    original_paired_builder = (
-        hstu_bwd_256_cute_module.build_hstu_d256_bwd_block_sparse
-    )
+    original_paired_builder = hstu_bwd_256_cute_module.build_hstu_d256_bwd_block_sparse
     k2q_builder_calls = []
     paired_builder_calls = 0
 
@@ -1794,10 +1792,7 @@ def test_fp16_arbitrary_backward_uses_auto_metadata(monkeypatch, head_dim):
         assert not k2q_builder_calls
     else:
         assert k2q_builder_calls
-        assert all(
-            block_size == (128, 128)
-            for block_size in k2q_builder_calls
-        )
+        assert all(block_size == (128, 128) for block_size in k2q_builder_calls)
         assert paired_builder_calls == 0
 
 

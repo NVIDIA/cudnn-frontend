@@ -225,9 +225,7 @@ class HSTUFusedMask:
                 for interval_idx in cutlass.range(func_num // 2, unroll_full=True):
                     interval_start = func[0, 2 * interval_idx + 1, func_row]
                     interval_end = func[0, 2 * interval_idx + 2, func_row]
-                    value_valid = value_valid | (
-                        (index_k >= interval_start) & (index_k < interval_end)
-                    )
+                    value_valid = value_valid | ((index_k >= interval_start) & (index_k < interval_end))
                 valid = valid and value_valid
             elif cutlass.const_expr(apply_semantic_window and (is_causal or is_local)):
                 score_row = index_q + offset

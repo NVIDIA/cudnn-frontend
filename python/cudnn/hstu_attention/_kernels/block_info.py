@@ -71,7 +71,11 @@ class BWDBlockInfo:
         m_masking_block_min = max(0, n_block * self.cta_tiler[1] - seqlen_offset) // self.cta_tiler[0]
         m_masking_steps = m_masking_block_max - m_masking_block_min if self.is_causal else 1
 
-        m_block_min = 0 if (not self.is_causal and not self.is_local) else max(0, (n_block * self.cta_tiler[1] - seqlen_offset - self.window_size_right) // self.cta_tiler[0])
+        m_block_min = (
+            0
+            if (not self.is_causal and not self.is_local)
+            else max(0, (n_block * self.cta_tiler[1] - seqlen_offset - self.window_size_right) // self.cta_tiler[0])
+        )
         m_block_max = cute.ceil_div(seqlen_info.seqlen_q, self.cta_tiler[0])
 
         if self.is_local:

@@ -1915,9 +1915,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                             # func row, preserving the non-metadata traversal.
                             if cute.elem_less(pos, (Q, K)):
                                 func_row = blk_offset[0] + pos[0]
-                                keep = cutlass.Boolean(
-                                    pos[1] < func[0, 0, func_row]
-                                )
+                                keep = cutlass.Boolean(pos[1] < func[0, 0, func_row])
                                 for interval_idx in cutlass.range(
                                     self.func_num // 2,
                                     unroll_full=True,
@@ -2140,9 +2138,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             valid = cute.elem_less(pos, (seqlen_q, seqlen_k))
             if valid:
                 func_row = query_offset + pos[0]
-                valid = cutlass.Boolean(
-                    pos[1] < func[0, 0, func_row]
-                )
+                valid = cutlass.Boolean(pos[1] < func[0, 0, func_row])
                 for interval_idx in cutlass.range(
                     self.func_num // 2,
                     unroll_full=True,
