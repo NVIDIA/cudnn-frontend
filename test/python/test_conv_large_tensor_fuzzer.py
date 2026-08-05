@@ -68,6 +68,7 @@ _GRAPH_ENGINE_RNG_SALT = 0xE61A5EED  # split engine selection from config and te
 _OP_SCHEDULE_RNG_SALT = 0x0F5C4ED  # split operation ordering from config generation
 _NVRTC_COMPILATION_STATUS = "CUDNN_STATUS_INTERNAL_ERROR_COMPILATION_FAILED"
 _PLAN_BUILD_ERROR_LIMIT = 1024
+_MISMATCH_SAMPLE_LIMIT = 8
 
 
 class _EngineFilterNotSupported(Exception):
@@ -1199,6 +1200,104 @@ def _reference(cfg: LargeTensorConfig, X: torch.Tensor, W: torch.Tensor, Y: torc
                     del fwd
 
 
+def _json_float(value: float) -> object:
+    value = float(value)
+    if math.isfinite(value):
+        return value
+    if math.isnan(value):
+        return "nan"
+    return "inf" if value > 0 else "-inf"
+
+
+def _flat_index_to_coordinates(flat_index: int, shape: torch.Size) -> List[int]:
+    coordinates = []
+    for size in reversed(shape):
+        coordinates.append(flat_index % size)
+        flat_index //= size
+    return list(reversed(coordinates))
+
+
+def _top_ranked_indices(score: torch.Tensor, mismatch: torch.Tensor, count: int) -> List[int]:
+    if count == 0:
+        return []
+    ranked = torch.where(mismatch, score, torch.full_like(score, -math.inf))
+    return [int(index) for index in torch.topk(ranked, k=count).indices.cpu().tolist()]
+
+
+def _mismatch_diagnostics(actual: torch.Tensor, reference: torch.Tensor, rtol: float, atol: float) -> dict:
+    actual_flat = actual.reshape(-1)
+    reference_flat = reference.reshape(-1)
+    absolute_error = (actual_flat - reference_flat).abs()
+    reference_abs = reference_flat.abs()
+    allowed_error = atol + rtol * reference_abs
+    finite_pair = torch.isfinite(actual_flat) & torch.isfinite(reference_flat)
+    mismatch = (finite_pair & (absolute_error > allowed_error)) | (~finite_pair & (actual_flat != reference_flat))
+    mismatch_count = int(mismatch.sum().item())
+    candidate_count = min(_MISMATCH_SAMPLE_LIMIT, mismatch_count)
+
+    absolute_rank = torch.nan_to_num(absolute_error, nan=math.inf, posinf=math.inf, neginf=math.inf)
+    relative_error = absolute_error / reference_abs
+    relative_error = torch.where((absolute_error == 0) & (reference_abs == 0), 0.0, relative_error)
+    relative_rank = torch.nan_to_num(relative_error, nan=math.inf, posinf=math.inf, neginf=math.inf)
+    absolute_indices = _top_ranked_indices(absolute_rank, mismatch, candidate_count)
+    relative_indices = _top_ranked_indices(relative_rank, mismatch, candidate_count)
+
+    selected_indices = []
+    selection_basis = {}
+    for rank in range(candidate_count):
+        for basis, candidates in (("absolute_error", absolute_indices), ("relative_error", relative_indices)):
+            index = candidates[rank]
+            if index not in selection_basis:
+                selection_basis[index] = basis
+                selected_indices.append(index)
+            if len(selected_indices) == candidate_count:
+                break
+        if len(selected_indices) == candidate_count:
+            break
+
+    selected = torch.tensor(selected_indices, device=actual.device, dtype=torch.long)
+    actual_values = actual_flat[selected].cpu().tolist()
+    reference_values = reference_flat[selected].cpu().tolist()
+    absolute_values = absolute_error[selected].cpu().tolist()
+    relative_values = relative_error[selected].cpu().tolist()
+    samples = [
+        {
+            "flat_index": flat_index,
+            "index": _flat_index_to_coordinates(flat_index, actual.shape),
+            "selected_by": selection_basis[flat_index],
+            "actual": _json_float(actual_value),
+            "reference": _json_float(reference_value),
+            "absolute_error": _json_float(absolute_value),
+            "relative_error": _json_float(relative_value),
+        }
+        for flat_index, actual_value, reference_value, absolute_value, relative_value in zip(
+            selected_indices,
+            actual_values,
+            reference_values,
+            absolute_values,
+            relative_values,
+        )
+    ]
+    return {
+        "mismatch_count": mismatch_count,
+        "sample_limit": _MISMATCH_SAMPLE_LIMIT,
+        "samples": samples,
+    }
+
+
+def _emit_mismatch_event(plan: _PlanIdentity, rng_seed: int, rtol: float, atol: float, diagnostics: dict) -> None:
+    payload = {
+        "rng_seed": rng_seed,
+        **plan.as_dict(),
+        "rtol": rtol,
+        "atol": atol,
+        **diagnostics,
+    }
+    samples = json.dumps(diagnostics, sort_keys=True, separators=(",", ":"))
+    human_message = f"Large tensor fuzzer mismatch samples rng_seed={rng_seed} {_plan_identity_text(plan)}: {samples}"
+    _emit_diagnostic_event("comparison_mismatch", payload, human_message=human_message)
+
+
 # ---------------------------------------------------------------------------
 # cuDNN graph execution
 # ---------------------------------------------------------------------------
@@ -1486,6 +1585,7 @@ def _run_single_config(
     Y = None
     bias = None
     actual = None
+    actual_f32 = None
     ref = None
     cudnn_result = None
     phase = "input setup"
@@ -1552,11 +1652,22 @@ def _run_single_config(
         phase = "PyTorch reference"
         ref = _reference(cfg, X, W, Y, bias)
         phase = "result comparison"
+        actual_f32 = actual.to(torch.float32)
         try:
-            torch.testing.assert_close(actual.to(torch.float32), ref, rtol=rtol, atol=atol)
+            torch.testing.assert_close(actual_f32, ref, rtol=rtol, atol=atol)
         except AssertionError as e:
             selected_plan = cudnn_result.selected_plan
             if selected_plan is not None:
+                try:
+                    diagnostics = _mismatch_diagnostics(actual_f32, ref, rtol, atol)
+                except (RuntimeError, OSError) as diagnostic_error:
+                    diagnostics = {
+                        "mismatch_count": None,
+                        "sample_limit": _MISMATCH_SAMPLE_LIMIT,
+                        "samples": [],
+                        "diagnostic_error": f"{type(diagnostic_error).__name__}: {diagnostic_error}",
+                    }
+                _emit_mismatch_event(selected_plan, cfg.rng_seed, rtol, atol, diagnostics)
                 _emit_plan_event("comparison", selected_plan, cfg.rng_seed, "numerical comparison failed")
             context = _format_repro_context(
                 cfg,
@@ -1609,6 +1720,8 @@ def _run_single_config(
             del bias
         if actual is not None:
             del actual
+        if actual_f32 is not None:
+            del actual_f32
         if ref is not None:
             del ref
         torch.cuda.empty_cache()
