@@ -16,6 +16,8 @@ repos:
         require_serial: true
         types_or: [python, pyi]
         args: ["--line-length", "160"]
+        # verbatim vendored copy of the megamoe/CuTe DSL kernel sources
+        exclude: ^python/cudnn/moe_ep/_megamoe_backend/
     -   id: black-jupyter
         name: black-jupyter
         description:
@@ -27,3 +29,4 @@ repos:
         types_or: [python, pyi, jupyter]
         additional_dependencies: [".[jupyter]"]
         args: ["--line-length", "160"]
+        exclude: ^python/cudnn/moe_ep/_megamoe_backend/

@@ -16,9 +16,11 @@ Environment:
 - ``CUDNN_MOE_EP_BACKEND``: ``auto`` (default; use megamoe when possible,
   warn once and fall back otherwise), ``megamoe`` (required; raise if the
   backend cannot be built), ``none`` (never use a backend).
-- ``CUDNN_MEGAMOE_ROOT``: path to the ``moe_ep_training`` checkout that
-  contains the ``megamoe`` package (with its sibling ``cutedsl_megamoe``
-  kernel clone).  Not needed when ``megamoe`` is already importable.
+- ``CUDNN_MEGAMOE_ROOT``: optional override pointing at a ``moe_ep_training``
+  checkout that contains the ``megamoe`` package (with its sibling
+  ``cutedsl_megamoe`` kernel clone).  By default the copy vendored in
+  ``_megamoe_backend/`` (kernels included) is used, so no external checkout
+  is needed.
 
 Backend requirements and deviations from the pure reference:
 
@@ -74,6 +76,17 @@ class BackendUnavailable(RuntimeError):
     """Raised when the megamoe backend cannot serve this MoeEp config."""
 
 
+def bundled_root() -> Optional[str]:
+    """Path of the vendored ``_megamoe_backend`` tree (megamoe + pt +
+    cutedsl_megamoe kernels), or ``None`` if it was stripped from this
+    install."""
+
+    root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_megamoe_backend")
+    if os.path.isdir(os.path.join(root, "megamoe")):
+        return root
+    return None
+
+
 def _policy() -> str:
     value = os.environ.get("CUDNN_MOE_EP_BACKEND", "auto").lower()
     if value in ("", "auto"):
@@ -95,7 +108,7 @@ def _import_megamoe(single_rank: bool):
             raise BackendUnavailable(f"megamoe already imported in {_state['mode']!r} mode; cannot " f"serve a {want!r} MoeEp in the same process")
         return _state["modules"]
 
-    root = os.environ.get("CUDNN_MEGAMOE_ROOT")
+    root = os.environ.get("CUDNN_MEGAMOE_ROOT") or bundled_root()
     if root and root not in sys.path:
         sys.path.insert(0, root)
     if single_rank:

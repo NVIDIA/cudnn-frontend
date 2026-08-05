@@ -160,7 +160,9 @@ class MoeEp:
     Otherwise they fall back to returning newly allocated, uninitialized
     output storage with the correct public representation (the original
     API-stub behavior).  ``CUDNN_MOE_EP_BACKEND=megamoe|auto|none`` selects
-    the policy; ``CUDNN_MEGAMOE_ROOT`` locates the megamoe package.
+    the policy; the megamoe package (with its CuTe DSL kernels) ships
+    vendored in ``moe_ep/_megamoe_backend`` and ``CUDNN_MEGAMOE_ROOT`` can
+    point at an external checkout instead.
     """
 
     def __init__(
