@@ -251,7 +251,9 @@ def gemm_proj_rope_mxfp8_kernel(
 
     epilogue_sync_barrier = pipeline.NamedBarrier(barrier_id=1, num_threads=threads_in_epilogue)
     tmem_alloc_barrier = pipeline.NamedBarrier(barrier_id=2, num_threads=32 * len((mma_warp_id, *epilogue_warp_ids)))
-    tmem = utils.TmemAllocator(storage.tmem_holding_buffer.ptr, barrier_for_retrieve=tmem_alloc_barrier, allocator_warp_id=epilogue_warp_ids[0], is_two_cta=False)
+    tmem = utils.TmemAllocator(
+        storage.tmem_holding_buffer.ptr, barrier_for_retrieve=tmem_alloc_barrier, allocator_warp_id=epilogue_warp_ids[0], is_two_cta=False
+    )
 
     tAsA, tAgA = cpasync.tma_partition(
         tma_atom_a,

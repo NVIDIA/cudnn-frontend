@@ -153,6 +153,7 @@ def _moe_swizzle_tile(t, nt_m, nt_n, swizzle_w):
     tile_n = base_n + off - tile_m * cur_S
     return tile_m, tile_n
 
+
 def _epi_subtile_spans(cols):
     spans = []
     off = 0

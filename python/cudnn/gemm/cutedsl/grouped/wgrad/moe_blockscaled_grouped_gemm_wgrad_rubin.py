@@ -35,10 +35,7 @@ def _round_tmem_allocation_columns(used_columns: int, capacity_columns: int) -> 
     else:
         allocation_columns = (used_columns + 31) // 32 * 32
     if allocation_columns > capacity_columns:
-        raise ValueError(
-            f"Rubin wgrad needs {allocation_columns} TMEM columns, "
-            f"exceeding {capacity_columns}."
-        )
+        raise ValueError(f"Rubin wgrad needs {allocation_columns} TMEM columns, " f"exceeding {capacity_columns}.")
     return allocation_columns
 
 
@@ -57,16 +54,12 @@ def _make_tmem_plan(
     if tile_k % sf_vec_size != 0:
         raise ValueError("SF window K must be divisible by sf_vec_size.")
     if tile_k % (sf_vec_size * 4) != 0:
-        raise ValueError(
-            "SF window K must contain complete block-scaled basic chunks."
-        )
+        raise ValueError("SF window K must contain complete block-scaled basic chunks.")
     capacity_columns = cute.arch.get_max_tmem_alloc_cols(architecture)
     sfa_columns = tile_k // sf_vec_size
     sfb_columns = max(tile_n // 128, 1) * tile_k // sf_vec_size
     scale_factor_columns = sfa_columns + sfb_columns
-    accumulator_stage_count = (
-        capacity_columns - scale_factor_columns
-    ) // tile_n
+    accumulator_stage_count = (capacity_columns - scale_factor_columns) // tile_n
     if accumulator_stage_count < 1:
         raise ValueError("Scale-factor TMEM leaves no accumulator stage.")
 
@@ -85,9 +78,7 @@ def _make_tmem_plan(
     )
 
 
-class BlockScaledMoEGroupedGemmWgradRubinKernel(
-    BlockScaledMoEGroupedGemmWgradKernel
-):
+class BlockScaledMoEGroupedGemmWgradRubinKernel(BlockScaledMoEGroupedGemmWgradKernel):
     """SM107 specialization retaining the cuDNN FE wgrad scheduler topology."""
 
     FIX_PAD_SIZE = 256
@@ -96,9 +87,7 @@ class BlockScaledMoEGroupedGemmWgradRubinKernel(
         super().__init__(*args, **kwargs)
         self.architecture = "sm_107"
         self.smem_capacity = utils.get_smem_capacity_in_bytes(self.architecture)
-        self.num_tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols(
-            self.architecture
-        )
+        self.num_tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols(self.architecture)
 
     def _setup_attributes(self) -> None:
         mma_cta_count = 2 if self.use_2cta_instrs else 1
@@ -109,16 +98,7 @@ class BlockScaledMoEGroupedGemmWgradRubinKernel(
         valid_quantization = (
             self.a_dtype is cutlass.Float4E2M1FN
             and self.b_dtype is cutlass.Float4E2M1FN
-            and (
-                (
-                    self.sf_dtype is cutlass.Float8E4M3FN
-                    and self.sf_vec_size == 16
-                )
-                or (
-                    self.sf_dtype is cutlass.Float8E8M0FNU
-                    and self.sf_vec_size == 32
-                )
-            )
+            and ((self.sf_dtype is cutlass.Float8E4M3FN and self.sf_vec_size == 16) or (self.sf_dtype is cutlass.Float8E8M0FNU and self.sf_vec_size == 32))
         ) or (
             self.a_dtype in (cutlass.Float8E4M3FN, cutlass.Float8E5M2)
             and self.b_dtype is self.a_dtype
@@ -126,19 +106,11 @@ class BlockScaledMoEGroupedGemmWgradRubinKernel(
             and self.sf_vec_size == 32
         )
         if not valid_quantization:
-            raise ValueError(
-                "Rubin wgrad supports NVFP4, MXFP4, MXFP8-E4M3, "
-                "or MXFP8-E5M2 block scaling."
-            )
+            raise ValueError("Rubin wgrad supports NVFP4, MXFP4, MXFP8-E4M3, " "or MXFP8-E5M2 block scaling.")
         if self.acc_dtype is not cutlass.Float32:
             raise ValueError("Rubin wgrad requires Float32 accumulators.")
-        if self.a_dtype.width == 4 and (
-            self.a_major_mode != OperandMajorMode.K
-            or self.b_major_mode != OperandMajorMode.K
-        ):
-            raise ValueError(
-                "Four-bit Rubin TCGen05 operands require K-major A and B."
-            )
+        if self.a_dtype.width == 4 and (self.a_major_mode != OperandMajorMode.K or self.b_major_mode != OperandMajorMode.K):
+            raise ValueError("Four-bit Rubin TCGen05 operands require K-major A and B.")
 
         self.mma_inst_shape_mn = (self.mma_tiler[0], self.mma_tiler[1])
         self.mma_inst_shape_mnk = (*self.mma_inst_shape_mn, self.instruction_k)
@@ -153,21 +125,10 @@ class BlockScaledMoEGroupedGemmWgradRubinKernel(
         self.mma_tiler = (*self.mma_inst_shape_mn, mma_tiler_k)
         self.mma_tiler_sfb = (*self.mma_inst_shape_mn_sfb, mma_tiler_k)
 
-        use_sf_window = (
-            self.sf_vec_size == 16
-            and self.sf_dtype is cutlass.Float8E4M3FN
-            and self.mma_tiler[1] == 256
-            and self.mma_tiler[2] == 512
-        )
-        self.sf_window_k = (
-            self.instruction_k * 2 if use_sf_window else self.mma_tiler[2]
-        )
-        self.num_mma_instructions_per_sf_window = (
-            self.sf_window_k // self.instruction_k
-        )
-        self.num_sf_windows_per_ab_stage = (
-            self.mma_tiler[2] // self.sf_window_k
-        )
+        use_sf_window = self.sf_vec_size == 16 and self.sf_dtype is cutlass.Float8E4M3FN and self.mma_tiler[1] == 256 and self.mma_tiler[2] == 512
+        self.sf_window_k = self.instruction_k * 2 if use_sf_window else self.mma_tiler[2]
+        self.num_mma_instructions_per_sf_window = self.sf_window_k // self.instruction_k
+        self.num_sf_windows_per_ab_stage = self.mma_tiler[2] // self.sf_window_k
 
         tiled_mma = self._create_tiled_mma()
         tiled_mma_sfb = self._create_tiled_mma_sfb()
@@ -257,34 +218,20 @@ class BlockScaledMoEGroupedGemmWgradRubinKernel(
         self.num_tmem_alloc_cols = tmem_plan.allocation_columns
         self.num_accumulator_tmem_cols = tmem_plan.accumulator_columns
         self.num_acc_stage = tmem_plan.accumulator_stage_count
-        self.num_acc_pipeline_stages = (
-            tmem_plan.accumulator_pipeline_stages
-        )
+        self.num_acc_pipeline_stages = tmem_plan.accumulator_pipeline_stages
         self.num_sfa_tmem_cols = tmem_plan.sfa_columns
         self.num_sfb_tmem_cols = tmem_plan.sfb_columns
-        self.num_sf_tmem_cols = (
-            self.num_sfa_tmem_cols + self.num_sfb_tmem_cols
-        )
+        self.num_sf_tmem_cols = self.num_sfa_tmem_cols + self.num_sfb_tmem_cols
         self.overlapping_accum = False
         self.iter_acc_early_release_in_epilogue = 0
 
         atom_thr_size = cute.size(tiled_mma.thr_id.shape)
         stage = (None, None, None, 0)
-        a_copy_size = cute.size_in_bytes(
-            self.a_dtype, cute.slice_(self.a_smem_layout_staged, stage)
-        )
-        b_copy_size = cute.size_in_bytes(
-            self.b_dtype, cute.slice_(self.b_smem_layout_staged, stage)
-        )
-        sfa_copy_size = cute.size_in_bytes(
-            self.sf_dtype, cute.slice_(self.sfa_smem_layout_staged, stage)
-        )
-        sfb_copy_size = cute.size_in_bytes(
-            self.sf_dtype, cute.slice_(self.sfb_smem_layout_staged, stage)
-        )
-        self.num_tma_load_bytes = (
-            a_copy_size + b_copy_size + sfa_copy_size + sfb_copy_size
-        ) * atom_thr_size
+        a_copy_size = cute.size_in_bytes(self.a_dtype, cute.slice_(self.a_smem_layout_staged, stage))
+        b_copy_size = cute.size_in_bytes(self.b_dtype, cute.slice_(self.b_smem_layout_staged, stage))
+        sfa_copy_size = cute.size_in_bytes(self.sf_dtype, cute.slice_(self.sfa_smem_layout_staged, stage))
+        sfb_copy_size = cute.size_in_bytes(self.sf_dtype, cute.slice_(self.sfb_smem_layout_staged, stage))
+        self.num_tma_load_bytes = (a_copy_size + b_copy_size + sfa_copy_size + sfb_copy_size) * atom_thr_size
 
     def _create_tiled_mma(self):
         return sm107_utils.make_blockscaled_trivial_tiled_mma(
@@ -330,20 +277,12 @@ class BlockScaledMoEGroupedGemmWgradRubinKernel(
             cute.group_modes(broadcast_layout, 0),
             cute.get(compact_smem.layout, mode=[1]),
         )
-        broadcast_layout = cute.append(
-            broadcast_layout, cute.get(compact_smem.layout, mode=[2])
-        )
-        broadcast_layout = cute.append(
-            broadcast_layout, cute.get(compact_smem.layout, mode=[3])
-        )
-        broadcast_smem = cute.make_tensor(
-            compact_smem.iterator, broadcast_layout
-        )
+        broadcast_layout = cute.append(broadcast_layout, cute.get(compact_smem.layout, mode=[2]))
+        broadcast_layout = cute.append(broadcast_layout, cute.get(compact_smem.layout, mode=[3]))
+        broadcast_smem = cute.make_tensor(compact_smem.iterator, broadcast_layout)
 
         partitioned_smem = thread_copy.partition_S(broadcast_smem)
-        partitioned_smem = tcgen05.get_s2t_smem_desc_tensor(
-            tiled_copy, partitioned_smem
-        )
+        partitioned_smem = tcgen05.get_s2t_smem_desc_tensor(tiled_copy, partitioned_smem)
         partitioned_tmem = thread_copy.partition_D(compact_tmem)
         return tiled_copy, partitioned_smem, partitioned_tmem
 

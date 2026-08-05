@@ -1007,11 +1007,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         )
         o_desc_dummy = self._dummy("o_desc", device, lambda: torch.zeros(1, dtype=torch.int64, device=device))
 
-        amax_o_buf = (
-            amax_o.reshape(-1)[:1]
-            if amax_o is not None
-            else self._dummy("amax_o", device, lambda: torch.zeros(1, dtype=torch.float32, device=device))
-        )
+        amax_o_buf = amax_o.reshape(-1)[:1] if amax_o is not None else self._dummy("amax_o", device, lambda: torch.zeros(1, dtype=torch.float32, device=device))
         # Must be enqueued on the SAME stream as the kernel launch below, else the
         # reset and the kernel's atomicMax are unordered (and the reset is missing
         # from a CUDA-graph capture taken on the handle's stream).

@@ -330,19 +330,13 @@ class BlockScaledMoEGroupedGemmWgradKernel:
         # Public CUTLASS DSL 4.5 needs the packed-FP4 from_dlpack layout
         # workaround. Rubin and the internal DSL wheel consume the native
         # 4-bit layout directly.
-        needs_fp4_layout_workaround = (
-            self.architecture != "sm_107" and not _USING_INTERNAL_CUTLASS_DSL
-        )
-        if cutlass.const_expr(
-            needs_fp4_layout_workaround and mat_a.iterator.dtype.width < 8
-        ):
+        needs_fp4_layout_workaround = self.architecture != "sm_107" and not _USING_INTERNAL_CUTLASS_DSL
+        if cutlass.const_expr(needs_fp4_layout_workaround and mat_a.iterator.dtype.width < 8):
             mat_a = cute.make_tensor(
                 mat_a.iterator,
                 cute.recast_layout(mat_a.iterator.dtype.width, 8, mat_a.layout),
             )
-        if cutlass.const_expr(
-            needs_fp4_layout_workaround and mat_b.iterator.dtype.width < 8
-        ):
+        if cutlass.const_expr(needs_fp4_layout_workaround and mat_b.iterator.dtype.width < 8):
             mat_b = cute.make_tensor(
                 mat_b.iterator,
                 cute.recast_layout(mat_b.iterator.dtype.width, 8, mat_b.layout),
@@ -492,14 +486,9 @@ class BlockScaledMoEGroupedGemmWgradKernel:
         # Blackwell's epilogue tile is an MLIR-backed layout and must be
         # created outside the isolated helper-kernel region. Rubin uses a
         # static tuple and rebuilds the C TMA metadata inside the helper.
-        if cutlass.const_expr(
-            self.weight_mode == MoEWeightMode.DISCRETE
-            and self.architecture != "sm_107"
-        ):
+        if cutlass.const_expr(self.weight_mode == MoEWeightMode.DISCRETE and self.architecture != "sm_107"):
             c_tma_op_helper = c_tma_op
-            epi_smem_layout_helper = cute.select(
-                self.c_smem_layout_staged, mode=[0, 1]
-            )
+            epi_smem_layout_helper = cute.select(self.c_smem_layout_staged, mode=[0, 1])
             epi_tile_helper = self.epi_tile
         else:
             c_tma_op_helper = None
@@ -672,10 +661,7 @@ class BlockScaledMoEGroupedGemmWgradKernel:
         # Rubin requires C's TMA operation and static layout to be built in
         # the helper-kernel IR context. Blackwell receives host-built values
         # because its MLIR-backed epilogue tile cannot cross region isolation.
-        if cutlass.const_expr(
-            self.weight_mode == MoEWeightMode.DISCRETE
-            and self.architecture == "sm_107"
-        ):
+        if cutlass.const_expr(self.weight_mode == MoEWeightMode.DISCRETE and self.architecture == "sm_107"):
             if cutlass.const_expr(self.accumulate_on_output):
                 c_tma_op = cpasync.CopyReduceBulkTensorTileS2GOp()
             else:
@@ -1322,17 +1308,9 @@ class BlockScaledMoEGroupedGemmWgradKernel:
                                 tCtAcc,
                             )
                         else:
-                            for sf_window_idx in cutlass.range_constexpr(
-                                self.num_sf_windows_per_ab_stage
-                            ):
-                                for window_k_block in cutlass.range_constexpr(
-                                    self.num_mma_instructions_per_sf_window
-                                ):
-                                    stage_k_block = (
-                                        sf_window_idx
-                                        * self.num_mma_instructions_per_sf_window
-                                        + window_k_block
-                                    )
+                            for sf_window_idx in cutlass.range_constexpr(self.num_sf_windows_per_ab_stage):
+                                for window_k_block in cutlass.range_constexpr(self.num_mma_instructions_per_sf_window):
+                                    stage_k_block = sf_window_idx * self.num_mma_instructions_per_sf_window + window_k_block
                                     s2t_source_coord = (
                                         None,
                                         None,
@@ -1357,14 +1335,8 @@ class BlockScaledMoEGroupedGemmWgradKernel:
                                         tCtSFB_compact_s2t[s2t_destination_coord],
                                     )
 
-                                for window_k_block in cutlass.range_constexpr(
-                                    self.num_mma_instructions_per_sf_window
-                                ):
-                                    stage_k_block = (
-                                        sf_window_idx
-                                        * self.num_mma_instructions_per_sf_window
-                                        + window_k_block
-                                    )
+                                for window_k_block in cutlass.range_constexpr(self.num_mma_instructions_per_sf_window):
+                                    stage_k_block = sf_window_idx * self.num_mma_instructions_per_sf_window + window_k_block
                                     tiled_mma.set(
                                         tcgen05.Field.ACCUMULATE,
                                         k_tile != 0 if stage_k_block == 0 else True,

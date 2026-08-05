@@ -30,16 +30,15 @@ from typing import Optional, Dict, Any
 
 from torch.profiler import profile, record_function, ProfilerActivity
 
-
 # Dense MMA throughput (FLOPs / clock / SM) for Blackwell datacenter SKUs.
 # BF16/FP16 dense = 8192, FP8/MXFP8 dense = 16384 (MXFP8 uses the FP8
 # datapath with block scaling).
 # Keys match the strings accepted by the --data_type CLI flag.
 _BLACKWELL_DC_FLOPS_PER_CLOCK_PER_SM = {
-    "bfloat16":  8192,
-    "float16":   8192,
-    "fp8":      16384,
-    "mxfp8":    16384,
+    "bfloat16": 8192,
+    "float16": 8192,
+    "fp8": 16384,
+    "mxfp8": 16384,
 }
 
 
@@ -73,6 +72,7 @@ class _SmClockSampler:
     def start(self):
         try:
             import pynvml
+
             pynvml.nvmlInit()
             self._pynvml = pynvml
             self._handle = pynvml.nvmlDeviceGetHandleByIndex(torch.cuda.current_device())

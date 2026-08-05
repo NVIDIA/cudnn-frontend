@@ -33,9 +33,7 @@ def test_analytic_selection_is_always_runnable(block_scale, supports_static):
     for M in MS:
         for N in NS:
             for K in KS:
-                cfg, cta_group, sched = select_config(
-                    M, N, 1, K=K, block_scale=block_scale, supports_static=supports_static
-                )
+                cfg, cta_group, sched = select_config(M, N, 1, K=K, block_scale=block_scale, supports_static=supports_static)
                 assert by_name(cfg.name) is cfg, f"{cfg.name} not in CATALOG"
                 assert sched in ("clc", "static")
                 if cta_group == 2:
