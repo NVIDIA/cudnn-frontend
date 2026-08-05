@@ -25,7 +25,7 @@ def heuristics_sort(graph: "pygraph", python_plans: List[PlanConfig], backend_pl
     """Rank the two sides into one list. Either side may be empty.
 
     Which python engines are in the list at all is the manifest's decision
-    (``EngineRow.matches``, where ``CUDNN_FRONTEND_ENABLE_FROST_ENGINES`` is
+    (``EngineFamily.matches``, where ``CUDNN_FRONTEND_ENABLE_FROST_ENGINES`` is
     read); a plan that reaches here has already been admitted.
     """
     return python_plans + backend_plans

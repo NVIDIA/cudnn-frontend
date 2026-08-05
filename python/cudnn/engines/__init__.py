@@ -25,7 +25,7 @@ from .engine_ids import (
     is_python_engine,
 )
 from .heuristics import heuristics_sort
-from .manifest import MANIFEST, EngineRow
+from .manifest import MANIFEST, EngineFamily
 from .router import Router, decline_types, default_router
 
 
@@ -54,7 +54,7 @@ __all__ = [
     "decline_types",
     "heuristics_sort",
     "MANIFEST",
-    "EngineRow",
+    "EngineFamily",
     "BACKEND_ENGINE_ID_BASE",
     "CPP_OSS_ENGINE_ID_BASE",
     "PYTHON_ENGINE_ID_BASE",

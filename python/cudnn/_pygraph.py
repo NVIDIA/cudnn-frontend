@@ -148,6 +148,7 @@ class pygraph:
         self._reserved_uids: set = set()  # user-specified uids _alloc_uid must skip
         self._ambiguous_names: set = set()  # duplicate labels: excluded from the name index
         self._candidates: Optional[List["BaseEngine"]] = None  # manifest matches + registered
+        self._facts: Dict[str, Any] = {}  # analyzer key -> (node count, facts); see facts()
         self._backend_declined: Optional[Exception] = None  # why the backend has no entries
         self._backend_entries: Optional[List[Any]] = None  # backend_plan_entries(), once
         self._barred_names: set = set()  # deselect_engines()
@@ -182,18 +183,18 @@ class pygraph:
         if not isinstance(eid, int):
             raise ValueError(f"engine {engine!r} must declare a stable integer engine_id (got {eid!r})")
         lo, hi = engine.owned_id_range
-        for row in MANIFEST:  # blocks are intervals, so disjointness is decidable
-            if lo < row.id_end and row.engine_id < hi:
+        for family in MANIFEST:  # blocks are intervals, so disjointness is decidable
+            if lo < family.id_end and family.engine_id < hi:
                 # Registering the in-tree engine that OWNS the block is normal
                 # (a test or a caller pinning one specific engine); it is the
                 # same implementation the manifest would have instantiated.
                 # Anything else claiming that range would receive its plans.
-                if type(engine).__module__ == row.module and row.engine_id <= lo and hi <= row.id_end:
+                if type(engine).__module__ == family.module and family.engine_id <= lo and hi <= family.id_end:
                     break
                 raise ValueError(
                     f"engine {engine.name!r} ({type(engine).__module__}) claims ids [{lo}, {hi}), which overlaps the "
-                    f"block [{row.engine_id}, {row.id_end}) the in-tree manifest reserves for {row.name!r} "
-                    f"({row.module}); an engine from outside the library uses ids >= {OUT_OF_TREE_ID_BASE}"
+                    f"block [{family.engine_id}, {family.id_end}) the in-tree manifest reserves for {family.name!r} "
+                    f"({family.module}); an engine from outside the library uses ids >= {OUT_OF_TREE_ID_BASE}"
                 )
         else:
             if lo < OUT_OF_TREE_ID_BASE:
@@ -833,6 +834,7 @@ class pygraph:
             if not t.is_pass_by_value:
                 t.validate()
         self._is_validated = True
+        self._attach_facts()  # dims/strides are settled above; facts read them
         # Classic parity: C++ validation happens HERE, so a config the backend
         # rejects raises from validate() where callers catch it to skip. Skipped
         # only for a graph the backend has no lowering for (GDN/KDA/...), or when
@@ -888,6 +890,10 @@ class pygraph:
                 object.__setattr__(ir, "dim", tuple(d))  # sealed (graph is frozen)
             if st and not ir.stride_assigned:
                 object.__setattr__(ir, "stride", tuple(st))
+        # Facts describe layout, and the layout just changed under them: the
+        # node count is unchanged, so nothing else would catch this.
+        self._facts.clear()
+        self._attach_facts()
 
     def create_execution_plans(self, heuristics: Optional[List] = None) -> None:
         """Build the ranked execution-plan list (the dispatch stage).
@@ -941,7 +947,7 @@ class pygraph:
 
     def _candidate_engines(self) -> List["BaseEngine"]:
         """The python engines this graph may dispatch to: anything
-        ``register_backend()`` added, then the in-tree manifest rows whose
+        ``register_backend()`` added, then the in-tree manifest families whose
         coarse key matches. Registered engines lead because bringing your own
         engine is an explicit act; the library's own table is the default.
         (Candidate ORDER is not rank — ``heuristics_sort`` ranks.) Cached: the
@@ -958,6 +964,42 @@ class pygraph:
             ]
             self._candidates = list(self._backends) + from_manifest
         return self._candidates
+
+    def _attach_facts(self) -> None:
+        """Describe this graph in each matching family's own vocabulary.
+
+        Part of validate(), not something a caller invokes: the graph finds its
+        own families through the manifest and hangs one record per family off
+        itself, as an optional payload. A graph no family claims carries none.
+
+        Facts are family-scoped by construction — an SDPA fact means nothing to
+        a GEMM engine — so this is a mapping, never a union record that every
+        family would have to widen.
+        """
+        from .engines import manifest
+        from .frost.buffers import current_sm
+
+        for family in manifest.candidate_families(manifest.graph_node_types(self), current_sm()):
+            analyzer = manifest.resolve_analyzer(family)
+            if analyzer is not None:
+                self._facts_for(analyzer)
+
+    def _facts_for(self, analyzer):
+        """The record ``analyzer`` produced for this graph, computing it once.
+
+        Keyed by the analyzer itself, so the ranking (which resolves it from
+        ``EngineFamily.analyzer`` before any engine is imported) and the engine
+        (which passes the callable it already imports) reach ONE record with no
+        family name to keep in sync. Two extractions of the same graph is how a
+        heuristics feature vector drifts from what the kernel actually does.
+        """
+        key = f"{analyzer.__module__}.{analyzer.__qualname__}"
+        n = len(self.nodes)
+        hit = self._facts.get(key)
+        if hit is None or hit[0] != n:  # node count guards against mid-build reads
+            hit = (n, analyzer(self))
+            self._facts[key] = hit
+        return hit[1]
 
     def _unlowerable_node(self) -> Optional[Node]:
         """The first node with no C++ lowering, or None when the whole graph has one.

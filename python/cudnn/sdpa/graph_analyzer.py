@@ -7,8 +7,10 @@
 directly, exposed via ``graph.nodes`` — no construction-time hooks are needed.
 This module extracts *facts* (what the graph asks for) without judging
 supportedness; each registered engine matches the facts against its own
-capability declaration (see ``cudnn.sdpa.fwd.engines``). The parse runs once
-per graph and is cached.
+capability declaration (see ``cudnn.sdpa.fwd.engines``). :func:`analyze` is the
+callable the SDPA family names in ``engines/manifest.py``; validate() runs it
+once per graph and attaches the record, so the ranking and the engine share it
+rather than each parsing the graph.
 
 Also hosts the graph-side runtime helpers shared by every SDPA engine:
 variant-pack resolution and TensorDesc construction.
@@ -17,7 +19,6 @@ variant-pack resolution and TensorDesc construction.
 from __future__ import annotations
 
 import logging
-import weakref
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -168,6 +169,11 @@ class SdpaGraphFacts:
 
     padded: bool = False  # per-batch KV lengths present (padding mask or THD)
     thd: bool = False  # ragged (THD) Q/K/V
+    # cu_seq_len_q / cu_seq_len_kv (cuDNN 9.24+): prefix sums, a contract of
+    # their own — neither seq_len_* nor ragged_offset. A fact, not a verdict:
+    # no engine here implements it yet, but reading the graph as plain padded
+    # gave wrong output (14.9% of O on test_sdpa_mixed_seq_len_forms_L0[cu_q_brcm]).
+    has_cu_seq_len: bool = False
     has_sink: bool = False
     wants_stats: bool = False
 
@@ -393,13 +399,7 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         return _invalid(f"sliding-window length must be >= 1; got {left_bound}")
     window_left = (left_bound - 1) if left_bound is not None else None
 
-    # cu_seq_len_q / cu_seq_len_kv (cuDNN 9.24+) are prefix-sum tensors, a
-    # different contract from seq_len_* and from ragged_offset: the kernels here
-    # implement neither, and reading the graph as plain padded silently produced
-    # wrong output (14.9% of O on test_sdpa_mixed_seq_len_forms_L0[cu_q_brcm]).
-    for name in ("cu_seq_len_q", "cu_seq_len_kv"):
-        if rec.get(name) is not None:
-            return _invalid(f"{name} is not supported")
+    has_cu_seq_len = any(rec.get(name) is not None for name in ("cu_seq_len_q", "cu_seq_len_kv"))
 
     # Padding / THD.
     thd = getattr(q, "ragged_offset", None) is not None
@@ -499,6 +499,7 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         seq_q_trim=seq_q_trim,
         padded=padded,
         thd=thd,
+        has_cu_seq_len=has_cu_seq_len,
         has_sink=sink_token is not None,
         wants_stats=wants_stats,
         scale=scale,
@@ -530,31 +531,18 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
     )
 
 
-# Parse cache: one facts extraction per graph, because N registered engines
-# each probe the same graph (create_execution_plans, then again at build) and
-# the graph walk is the expensive part — capability matching is cheap field
-# comparisons. Keyed weakly so graphs can be GC'd; invalidated if the node
-# count changes (a graph mutated after probing gets re-parsed).
-_FACTS_CACHE: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
-
-
 def analyze(graph: "cudnn.pygraph") -> Optional[SdpaGraphFacts]:
-    """Facts for a single-SDPA graph, or None if the graph is anything else."""
+    """Facts for a single-SDPA graph, or None if the graph is anything else.
+
+    Pure: attaching and caching is the graph's job (validate() ->
+    _attach_facts), so the ranking and the engine share one record instead of
+    each holding a private one. This is the callable the manifest names in the
+    SDPA family's ``analyzer``.
+    """
     node = _single_sdpa_node(graph)
     if node is None:
         return None
-    try:
-        cached = _FACTS_CACHE.get(graph)
-    except TypeError:  # non-weakrefable graph objects
-        cached = None
-    if cached is not None and cached[0] == len(graph.nodes):
-        return cached[1]
-    facts = _extract_facts(_record_from_node(node))
-    try:
-        _FACTS_CACHE[graph] = (len(graph.nodes), facts)
-    except TypeError:
-        pass
-    return facts
+    return _extract_facts(_record_from_node(node))
 
 
 # ---------------------------------------------------------------------------

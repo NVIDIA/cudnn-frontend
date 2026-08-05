@@ -574,20 +574,20 @@ def test_failed_stream_query_on_supplied_handle_raises(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# The opt-in gate: a manifest row may be withheld until the engine is mature.
+# The opt-in gate: a manifest family may be withheld until its engines mature.
 # ---------------------------------------------------------------------------
 
 
-def _row(name):
+def _family(name):
     from cudnn.engines.manifest import MANIFEST
 
-    return next(r for r in MANIFEST if r.name == name)
+    return next(f for f in MANIFEST if f.name == name)
 
 
 def test_a_claiming_engine_is_tried_before_the_backend():
     """Ranking the python side second is how the frost job reported 0/3201
     graphs on FROST while passing. The opt-in is not a ranking concept: it
-    decides which engines are offered, in manifest.EngineRow.matches."""
+    decides which engines are offered, in manifest.EngineFamily.matches."""
     from cudnn.engines import heuristics
     from cudnn.engines.base import PlanConfig
 
@@ -757,37 +757,37 @@ def test_key_says_which_op_has_no_backend_lowering():
         g.key()
 
 
-def test_opt_in_rows_are_withheld_by_default(monkeypatch):
-    """An ``opt_in=True`` row is offered only with the env flag set.
+def test_opt_in_families_are_withheld_by_default(monkeypatch):
+    """An ``opt_in=True`` family is offered only with the env flag set.
 
     The flag is read live (not cached at import) so a process can flip it, and
-    it gates NOTHING but candidacy: a withheld row is simply absent from the
+    it gates NOTHING but candidacy: a withheld family is simply absent from the
     plan list, never a different ranking or a silent fallback."""
     from cudnn.engines import manifest
 
-    row = _row("frost_gemm")
-    assert row.opt_in, "frost_gemm is expected to still be maturing"
-    key, sm = frozenset({"MATMUL"}), row.sm_lo
+    family = _family("frost_gemm")
+    assert family.opt_in, "frost_gemm is expected to still be maturing"
+    key, sm = frozenset({"MATMUL"}), family.sm_lo
 
     monkeypatch.delenv(manifest._ENABLE_ENV, raising=False)
-    assert not row.matches(key, sm)
-    assert row not in manifest.candidate_rows(key, sm)
+    assert not family.matches(key, sm)
+    assert family not in manifest.candidate_families(key, sm)
 
     monkeypatch.setenv(manifest._ENABLE_ENV, "1")
-    assert row.matches(key, sm)
-    assert row in manifest.candidate_rows(key, sm)
+    assert family.matches(key, sm)
+    assert family in manifest.candidate_families(key, sm)
 
 
-def test_sole_implementation_rows_are_never_gated(monkeypatch):
+def test_sole_implementation_families_are_never_gated(monkeypatch):
     """An engine that is the ONLY implementation of its op must not be gated —
     the backend has no lowering for GDN/KDA/GDN2 nodes, so withholding those
-    rows would delete the operation rather than defer an optimization."""
+    families would delete the operation rather than defer an optimization."""
     from cudnn.engines import manifest
 
     monkeypatch.delenv(manifest._ENABLE_ENV, raising=False)
     for name in ("gdn_frost", "gdn_cutile", "kda_frost", "kda_cutile", "gdn2_frost"):
-        row = _row(name)
-        assert not row.opt_in, f"{name} is the only implementation of its op and must not be opt-in"
+        family = _family(name)
+        assert not family.opt_in, f"{name} is the only implementation of its op and must not be opt-in"
 
 
 @pytest.mark.parametrize("value,offered", [("1", True), ("true", True), ("on", True), ("0", False), ("", False), ("no", False)])
@@ -796,6 +796,123 @@ def test_opt_in_flag_spellings(monkeypatch, value, offered):
 
     monkeypatch.setenv(manifest._ENABLE_ENV, value)
     assert manifest.opt_in_engines_enabled() is offered
+
+
+def test_a_closure_only_names_node_types_the_family_serves(monkeypatch):
+    """``closed_under`` is a promise, not a wish list.
+
+    RESHAPE used to sit in the gemm closure with nothing in gemm/frost
+    consuming it, so ``matmul -> reshape`` matched, only the matmul was
+    compiled, and execute then demanded a buffer the caller never binds."""
+    from cudnn.engines import manifest
+
+    monkeypatch.setenv(manifest._ENABLE_ENV, "1")
+    family = _family("frost_gemm")
+    assert family.matches(frozenset({"MATMUL"}), family.sm_lo)
+    assert not family.matches(frozenset({"MATMUL", "RESHAPE"}), family.sm_lo)
+
+
+def test_family_id_blocks_are_disjoint():
+    """A family IS its id block: two families sharing one id would make the
+    engine an autotune result names ambiguous."""
+    from cudnn.engines.manifest import MANIFEST
+
+    blocks = sorted((f.engine_id, f.id_end, f.name) for f in MANIFEST)
+    for (_, prev_end, prev_name), (lo, _, name) in zip(blocks, blocks[1:]):
+        assert lo >= prev_end, f"{prev_name} and {name} overlap in the id space"
+
+
+# ---------------------------------------------------------------------------
+# Facts: family-scoped, attached to the graph, read once.
+# ---------------------------------------------------------------------------
+
+
+def test_declared_analyzers_are_importable():
+    """``analyzer`` is a pair of strings so matching stays import-free — which
+    means a typo in it survives until something tries to rank that family."""
+    from cudnn.engines import manifest
+
+    for family in manifest.MANIFEST:
+        analyzer = manifest.resolve_analyzer(family)
+        if family.analyzer is None:
+            assert analyzer is None
+        else:
+            assert callable(analyzer), family.name
+
+
+_PROBE_CALLS = []
+
+
+def _probe_analyzer(graph):
+    """Stands in for a family's analyzer; named at module scope so a manifest
+    entry can reference it the way a real family does (module, callable)."""
+    _PROBE_CALLS.append(graph)
+    return {"nodes": len(graph.nodes)}
+
+
+def test_validate_attaches_facts_without_anyone_asking(monkeypatch):
+    """Facts are not a call the user makes. validate() finds the graph's
+    families through the manifest, runs each declared analyzer once, and hangs
+    the records off the graph as an optional payload — a graph no family claims
+    carries none."""
+    from cudnn.engines import manifest
+
+    _PROBE_CALLS.clear()
+    family = manifest.EngineFamily(
+        _OOT + 900,
+        "probe_family",
+        __name__,
+        "unused_factory",
+        frozenset({"MATMUL"}),
+        analyzer=(__name__, "_probe_analyzer"),
+    )
+    monkeypatch.setattr(manifest, "MANIFEST", (family,))
+
+    g = pygraph()
+    g.matmul(torch.randn(2, 3), torch.randn(3, 2))
+    g.validate()
+
+    assert len(_PROBE_CALLS) == 1, "validate() runs the family's analyzer itself"
+    assert g._facts_for(_probe_analyzer) == {"nodes": 1}
+    assert len(_PROBE_CALLS) == 1, "reading the payload must not re-parse"
+
+    unclaimed = pygraph()  # no MATMUL: no family, so no payload
+    unclaimed.relu(torch.randn(2, 2))
+    unclaimed.validate()
+    assert unclaimed._facts == {}
+
+
+def test_one_record_per_graph_shared_by_ranking_and_engine():
+    """The ranking resolves the analyzer from EngineFamily.analyzer before any
+    engine is imported; the engine passes the callable it already imports.
+    Keying on the analyzer itself is what makes those the SAME record — the
+    drift the backend's SDPA heuristics have, where the feature vector and the
+    engine's own view of the graph are extracted separately."""
+    from cudnn.engines import manifest
+
+    sdpa = _family("frost_sdpa_fwd")
+    assert manifest.resolve_analyzer(sdpa) is manifest.resolve_analyzer(sdpa)
+
+    _PROBE_CALLS.clear()
+    g = pygraph()
+    g.matmul(torch.randn(2, 3), torch.randn(3, 2))
+    first = g._facts_for(_probe_analyzer)
+    assert g._facts_for(_probe_analyzer) is first
+    assert len(_PROBE_CALLS) == 1
+
+
+def test_facts_are_recomputed_when_the_graph_grows():
+    """Facts describe the graph AS READ; a graph that gained a node since is a
+    different graph."""
+
+    def analyzer(graph):
+        return len(graph.nodes)
+
+    g = pygraph()
+    mm = g.matmul(torch.randn(2, 3), torch.randn(3, 2))
+    assert g._facts_for(analyzer) == 1
+    g.relu(mm)
+    assert g._facts_for(analyzer) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -959,11 +1076,11 @@ def test_engine_id_in_the_in_tree_region_is_rejected():
     id, so it would receive an in-tree engine's plans."""
     from cudnn.engines.manifest import MANIFEST
 
-    row = next(r for r in MANIFEST if r.name == "frost_gemm")
+    family = next(f for f in MANIFEST if f.name == "frost_gemm")
 
     class Squatter(BaseEngine):
         name = "squatter"
-        engine_id = row.engine_id
+        engine_id = family.engine_id
 
     with pytest.raises(ValueError, match="reserves for 'frost_gemm'"):
         pygraph().register_backend(Squatter())
@@ -975,8 +1092,8 @@ def test_the_in_tree_owner_of_a_block_may_register_itself():
     claiming that block is a collision."""
     from cudnn.engines import manifest
 
-    row = next(r for r in manifest.MANIFEST if r.name == "gdn_frost")
-    engines = manifest.instantiate(row)
+    family = next(f for f in manifest.MANIFEST if f.name == "gdn_frost")
+    engines = manifest.instantiate(family)
     if not engines:
         pytest.skip("gdn_frost is unavailable in this environment")
     pygraph().register_backend(engines[0])  # must not raise
@@ -985,7 +1102,7 @@ def test_the_in_tree_owner_of_a_block_may_register_itself():
 def test_a_registered_in_tree_engine_is_not_offered_twice(monkeypatch):
     """...and the manifest must not then offer its own copy: two owners for one
     id makes dispatch ambiguous. The manifest is forced to offer a same-id
-    instance here — without that, an empty graph matches no row and the test
+    instance here — without that, an empty graph matches no family and the test
     would pass even with the de-duplication removed."""
     from cudnn.engines import manifest
 
@@ -1000,7 +1117,7 @@ def test_a_registered_in_tree_engine_is_not_offered_twice(monkeypatch):
 
 
 def test_the_arch_probe_survives_a_missing_cuda_python():
-    """An arch-gated row is only filtered when the arch is KNOWN. A missing
+    """An arch-gated family is only filtered when the arch is KNOWN. A missing
     cuda-python in the image must not read as 'wrong architecture' — that cost
     every arch-gated engine its place in the plan list once already."""
     import builtins
@@ -1048,7 +1165,7 @@ def test_a_lying_owns_id_cannot_capture_another_engines_plans():
     from cudnn.engines.base import PlanConfig
     from cudnn.engines.manifest import MANIFEST
 
-    row = next(r for r in MANIFEST if r.name == "frost_gemm")
+    family = next(f for f in MANIFEST if f.name == "frost_gemm")
 
     class Liar(BaseEngine):
         name = "liar"
@@ -1059,7 +1176,7 @@ def test_a_lying_owns_id_cannot_capture_another_engines_plans():
 
     g = pygraph().register_backend(Liar())
     with pytest.raises(KeyError, match="no python engine declares"):
-        g._engine_for(PlanConfig(row.engine_id, None))
+        g._engine_for(PlanConfig(family.engine_id, None))
 
 
 def test_replayed_backend_entry_addresses_the_plan_it_replayed():

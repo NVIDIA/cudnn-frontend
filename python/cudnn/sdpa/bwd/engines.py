@@ -207,7 +207,9 @@ def analyze_for(spec: EngineSpec, graph, knobs: Optional[SdpaBwdKnobs] = None):
     and ``engine.FrostSdpaBwdEngine.check_support``. ``knobs`` is the plan's
     tuning request (``PlanConfig.knobs``), ``None`` for no preference.
     """
-    facts = ga.analyze(graph)
+    # The record validate() attached, not a fresh parse: one per graph, shared
+    # with whatever ranked these plans before this engine was imported.
+    facts = graph._facts_for(ga.analyze)
     if facts is None:
         return None, "graph is not a single sdpa_backward() node"
     return facts, mismatch(spec.capabilities, facts, knobs)

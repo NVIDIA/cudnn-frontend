@@ -121,6 +121,7 @@ class Capabilities:
     # dummy from lower_dsl_prefill when the graph has no Stats output.
     lse_optional: bool = False
     thd: bool = False
+    cu_seq_len: bool = False  # cu_seq_len_q / cu_seq_len_kv prefix sums (no row serves these yet)
     # True = the kernel anchors the THD bottom-right diagonal at each sequence's
     # own (seq_len_q[b], seq_len_kv[b]). Rows that keep False (the SM100 flavors)
     # compute it from the GLOBAL S_q — the THD variant of the
@@ -255,6 +256,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         (facts.has_sink, capabilities.sink, "sink token"),
         (facts.wants_stats, capabilities.stats, "stats output"),
         (facts.thd, capabilities.thd, "THD / ragged"),
+        (facts.has_cu_seq_len, capabilities.cu_seq_len, "cu_seq_len_q / cu_seq_len_kv"),
     ):
         if fact and not cap:
             return f"graph uses {label}, which this engine does not support"
@@ -457,7 +459,9 @@ def analyze_for(spec: EngineSpec, graph, knobs: Optional[SdpaFwdKnobs] = None):
     and ``engine.FrostSdpaFwdEngine.check_support``. ``knobs`` is the plan's
     tuning request (``PlanConfig.knobs``), ``None`` for no preference.
     """
-    facts = ga.analyze(graph)
+    # The record validate() attached, not a fresh parse: one per graph, shared
+    # with whatever ranked these plans before this engine was imported.
+    facts = graph._facts_for(ga.analyze)
     if facts is None:
         return None, "graph is not a single sdpa() forward node"
     return facts, mismatch(spec.capabilities, facts, knobs)
