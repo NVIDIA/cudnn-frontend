@@ -161,8 +161,7 @@ class MoeEp:
     output storage with the correct public representation (the original
     API-stub behavior).  ``CUDNN_MOE_EP_BACKEND=megamoe|auto|none`` selects
     the policy; the megamoe package (with its CuTe DSL kernels) ships
-    vendored in ``moe_ep/_megamoe_backend`` and ``CUDNN_MEGAMOE_ROOT`` can
-    point at an external checkout instead.
+    inside cuDNN under ``moe_ep/_megamoe_backend``.
     """
 
     def __init__(

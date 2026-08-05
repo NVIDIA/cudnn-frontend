@@ -1,10 +1,8 @@
 #!/bin/bash
-# PR validation for the self-sufficient (vendored) MegaMoE backend.
-# Runs inside the flashinfer-ep container on a GB200 node.  Deliberately
-# does NOT set CUDNN_MEGAMOE_ROOT: everything must come from the vendored
-# python/cudnn/moe_ep/_megamoe_backend tree.
+# PR validation for the MegaMoE backend bundled inside cuDNN
+# (python/cudnn/moe_ep/_megamoe_backend).  Runs inside the flashinfer-ep
+# container on a GB200 node.
 set -x
-unset CUDNN_MEGAMOE_ROOT MEGAMOE_REPO
 export CLONE=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)
 
 echo "=== 1. PR pytest suite (reference/API tests) ==="

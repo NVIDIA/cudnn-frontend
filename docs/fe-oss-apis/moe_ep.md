@@ -493,6 +493,8 @@ more surface area:
 - no implicit top-k normalization;
 - no capacity factor or implicit route drop;
 - backward semantics are fixed by `MoeEpReference.backward` (consuming the
-  `generate_c=True` stash); a fused device backward kernel and the
-  `torch.autograd` wrapper are not part of this first version;
+  `generate_c=True` stash); the bundled device backward (bprop) implementation
+  (`python/cudnn/moe_ep/_megamoe_backend/megamoe/bwd_kernel`) comes from the
+  Flashinfer team, not the FastKernel team; the `torch.autograd` wrapper is
+  not part of this first version;
 - logical scales at the Python boundary, backend swizzle internally.

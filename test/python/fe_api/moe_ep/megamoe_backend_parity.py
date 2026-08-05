@@ -4,9 +4,8 @@
 """Parity driver: cudnn.MoeEp on the MegaMoE backend vs MoeEpReference.
 
 Runs at kernel-supported shapes (H, I multiples of 128) on SM100 using the
-megamoe package vendored in python/cudnn/moe_ep/_megamoe_backend (or an
-external checkout via CUDNN_MEGAMOE_ROOT).  Not a pytest module: the first
-call compiles the CuTe DSL kernels (minutes).
+megamoe package bundled in python/cudnn/moe_ep/_megamoe_backend.  Not a
+pytest module: the first call compiles the CuTe DSL kernels (minutes).
 
 Single rank:
     CUDNN_MOE_EP_BACKEND=megamoe MEGA_NO_DIST=1 python megamoe_backend_parity.py
@@ -69,8 +68,7 @@ def main():
         import importlib
 
         _shim = importlib.import_module("cudnn_moe_ep._megamoe")
-        root = os.environ.get("CUDNN_MEGAMOE_ROOT") or _shim.bundled_root()
-        sys.path.insert(0, root)
+        sys.path.insert(0, _shim.bundled_root())
         import megamoe.repo_path  # noqa: F401
         from src.bootstrap import init_dist_and_nvshmem
 
