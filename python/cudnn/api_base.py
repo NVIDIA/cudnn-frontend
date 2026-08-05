@@ -526,8 +526,9 @@ class APIBase(ABC):
         """Get default CUDA stream if none provided.
 
         This is a convenience helper to handle optional stream parameters.
-        If a stream is provided, it is returned as-is. If None, the default
-        CUDA stream is returned.
+        If a stream is provided, it is returned as-is. If None, the caller's
+        current PyTorch stream is returned, so kernels stay ordered with
+        surrounding torch ops under ``with torch.cuda.stream(s):``.
 
         :param stream: CUDA stream or None
         :type stream: cuda.CUstream or None
@@ -540,8 +541,8 @@ class APIBase(ABC):
             ...     # Now current_stream is guaranteed to be a valid stream
         """
         if stream is None:
-            self._logger.debug(f"{self.__class__.__name__}: No CUDA stream provided, using default stream")
-            return cutlass.cuda.default_stream()
+            self._logger.debug(f"{self.__class__.__name__}: No CUDA stream provided, using torch current stream")
+            return cuda.CUstream(torch.cuda.current_stream().cuda_stream)
         return stream
 
     def _pad_tensor_to_ndim(
