@@ -1,23 +1,6 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
+ * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #pragma once
@@ -47,12 +30,15 @@ namespace experimental {
 
 /// @brief Look up the SM100 kernel specification for a given head dimension.
 /// @param d Head dimension (d_qk). Currently supports 64 and 128.
-/// @param sm_version SM version from cudaDeviceProp (e.g. 100, 101).
+/// @param sm_version SM version from cudaDeviceProp (e.g. 100).
 /// @return Pointer to static KernelSpec, or nullptr if unsupported.
 inline const KernelSpec*
 lookup_sm100_kernel_spec(int d, int sm_version) {
-    // SM100 family: sm_version 100..109
-    if (sm_version / 10 != 10) return nullptr;
+    // SM100 only: the kernels below are compiled with --gpu-architecture=sm_100a,
+    // an architecture-specific binary that does not load on other SM10x parts
+    // (sm_101, sm_103, ...). Admitting them here makes check_support() pass and
+    // build() fail later with "OSS SDPA engine not built".
+    if (sm_version != 100) return nullptr;
 
     static const KernelSpec spec_d128 = {
         generated::sm100_d128_fprop_source,

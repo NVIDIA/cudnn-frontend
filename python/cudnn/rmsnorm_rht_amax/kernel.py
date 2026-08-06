@@ -1,5 +1,5 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
 """CUTE DSL kernel for fused RMSNorm + RHT + per-CTA amax."""
 
@@ -42,23 +42,6 @@ def fmax_f32(a, b, *, loc=None, ip=None):
         [a_ir, b_ir],
         "max.f32 $0, $1, $2;",
         "=f,f,f",
-        has_side_effects=False,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-    return Float32(result)
-
-
-@dsl_user_op
-def redux_sync_max_f32(val, *, loc=None, ip=None):
-    val_ir = val.ir_value(loc=loc, ip=ip)
-    result = llvm.inline_asm(
-        T.f32(),
-        [val_ir],
-        "redux.sync.max.f32 $0, $1, 0xffffffff;",
-        "=f,f",
         has_side_effects=False,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -191,7 +174,7 @@ class RMSNormRHTAmaxKernel:
             w = t_xr_w.load().to(Float32)
             y = x * rstd * w
 
-            for elem_idx in cutlass.range_constexpr(cfg.ept):
+            for elem_idx in cutlass.range(cfg.ept, unroll_full=True):
                 reg[elem_idx] = y[elem_idx]
 
             for block_idx in cutlass.range_constexpr(cfg.num_vec_blocks):
@@ -208,14 +191,14 @@ class RMSNormRHTAmaxKernel:
             for cross_stage in cutlass.range_constexpr(cfg.num_cross_stages):
                 xor_mask = cutlass.Int32(1 << cross_stage)
                 is_lower = (tid & xor_mask) == cutlass.Int32(0)
-                for elem_idx in cutlass.range_constexpr(cfg.ept):
+                for elem_idx in cutlass.range(cfg.ept, unroll_full=True):
                     partner = shuffle_sync_bfly(reg[elem_idx], offset=xor_mask)
                     if is_lower:
                         reg[elem_idx] = reg[elem_idx] + partner
                     else:
                         reg[elem_idx] = partner - reg[elem_idx]
 
-            for elem_idx in cutlass.range_constexpr(cfg.ept):
+            for elem_idx in cutlass.range(cfg.ept, unroll_full=True):
                 scaled = reg[elem_idx] * inv_sqrt_had
                 abs_val = fabs_f32(scaled)
                 running_max = fmax_f32(running_max, abs_val)
@@ -228,7 +211,7 @@ class RMSNormRHTAmaxKernel:
             if row_idx < cfg.rows_per_cta - 1:
                 cute.arch.cp_async_wait_group(0)
 
-        warp_max = redux_sync_max_f32(running_max)
+        warp_max = cute.arch.warp_redux_sync(running_max, "fmax")
         if lane_id == 0:
             amax_buffer[0, warp_id] = warp_max
         cute.arch.barrier()
@@ -236,7 +219,7 @@ class RMSNormRHTAmaxKernel:
         amax_val = cutlass.Float32(0.0)
         if lane_id < cfg.warps_per_row:
             amax_val = amax_buffer[0, lane_id]
-        cta_max = redux_sync_max_f32(amax_val)
+        cta_max = cute.arch.warp_redux_sync(amax_val, "fmax")
         if tid == cutlass.Int32(0):
             m_amax[bid] = cta_max
 

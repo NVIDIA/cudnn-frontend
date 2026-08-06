@@ -1,10 +1,22 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Common CuTe tensor conversion helpers."""
+
+from __future__ import annotations
+
+import torch
 
 from cutlass.cute.runtime import from_dlpack
 
 
+def get_broadcast_dims(tensor: torch.Tensor) -> tuple[bool, ...]:
+    """Return dimensions broadcast via stride 0."""
+    return tuple(stride == 0 for stride in tensor.stride())
+
+
 def to_cute_tensor(
-    t,
+    t: torch.Tensor,
     assumed_align: int = 16,
     leading_dim: int = -1,
     fully_dynamic: bool = False,

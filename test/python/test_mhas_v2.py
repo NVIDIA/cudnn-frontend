@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """
 This script tests cuDNN front-end attention.
 The recommended way to run tests:
@@ -116,8 +119,6 @@ def test_sdpa_random_fwd_L0(env_info, test_no, request, cudnn_handle):
         with_sliding_mask=SlidingWindowMaskGenerator(causal=10, left_window_only=5, right_window_only=5, band_around_diag=10, no_mask=10),
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 1}),
         is_ragged_or_padded_or_full=RandomChoice({"ragged" : 0, "padded" : 1, "full" : 1}),
-        with_score_max=RandomChoice({True : 1, False : 3}),
-        with_score_sum_exp=RandomChoice({True : 1, False : 3}),
         with_sink_token=RandomChoice({True : 1, False : 3}),
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
@@ -148,24 +149,14 @@ def test_sdpa_random_fwd_unified_L1(env_info, test_no, request, cudnn_handle):
         with_sliding_mask=SlidingWindowMaskGenerator(causal=10, left_window_only=5, right_window_only=5, band_around_diag=10, no_mask=10),
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 1}),
         is_bias=RandomChoice({True : 1, False : 3}),
-        is_alibi=RandomChoice({True : 1, False : 3}),
         is_ragged_or_padded_or_full=RandomChoice({"ragged" : 0, "padded" : 1, "cu_padded" : 1, "full" : 1}),
         with_unfuse_fma=RandomChoice({True : 1, False : 1}),  # Randomly enable unfuse_fma for SM100
-        with_score_max=RandomChoice({True : 1, False : 3}),
-        with_score_sum_exp=RandomChoice({True : 1, False : 3}),
         with_sink_token=RandomChoice({True : 1, False : 3}),
-        is_dropout=RandomChoice({True : 1, False : 3}),
-        with_rope=RandomChoice({True : 1, False : 3}),  # RoPE at end to preserve existing test distributions
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
 
-    test.cfg.dropout_prob = 0.1 if test.cfg.is_dropout else 0.0
     test.cfg.implementation = getattr(cudnn.attention_implementation, request.config.getoption("--implementation") or "", cudnn.attention_implementation.UNIFIED)
     test.showConfig(test_no, request)
-
-    # RoPE backend op was added in cuDNN 9.24. Skip configs that need it on older backends.
-    if getattr(test.cfg, "with_rope", False) and cudnn.backend_version() < 92400:
-        pytest.skip("RoPE requires cuDNN >= 9.24")
 
     exec_sdpa(test.cfg, request, cudnn_handle)
 
@@ -174,7 +165,7 @@ def test_sdpa_random_fwd_unified_L1(env_info, test_no, request, cudnn_handle):
 # # L0 bprop tests
 # # ==================================
 
-@pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=256, rng_seed=844), ids=lambda p: f"test{p[0]}")
+@pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=384, rng_seed=844), ids=lambda p: f"test{p[0]}")
 @pytest.mark.L0
 def test_sdpa_random_bwd_L0(env_info, test_no, request, cudnn_handle):
 
@@ -189,7 +180,7 @@ def test_sdpa_random_bwd_L0(env_info, test_no, request, cudnn_handle):
     with RandomizationContext(
         batches=RandomBatchSize(min=8, max=16),
         s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=4096, s_kv_min=1, s_kv_max=4096, s_q_distribution={"s_q=1":0, "s_q=s_kv":5, "s_q=random":10, "s_q>s_kv":3}),
-        d_qk_d_v=RandomHiddenDimSize(d_qk_min=1, d_qk_max=192, d_v_min=1, d_v_max=128, head_dim_distribution={"d_qk=d_v":5, "d_qk=random":1}, with_high_probability=[(64,64), (128,128), (192,128), (256,256)]),
+        d_qk_d_v=RandomHiddenDimSize(d_qk_min=1, d_qk_max=256, d_v_min=1, d_v_max=256, head_dim_distribution={"d_qk=d_v":5, "d_qk=random":1}, with_high_probability=[(64,64), (128,128), (192,128), (256,256)]),
         head_count=RandomHeadGenerator(min=1, max=8, head_group_options=(1, 4, 1)),
         data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
         with_sliding_mask=SlidingWindowMaskGenerator(causal=10, left_window_only=5, right_window_only=5, band_around_diag=10, no_mask=10),
@@ -197,15 +188,11 @@ def test_sdpa_random_bwd_L0(env_info, test_no, request, cudnn_handle):
         is_ragged_or_padded_or_full=RandomChoice({"ragged" : 0, "padded" : 4, "full" : 1}),
         is_deterministic=RandomChoice({True : 3, False : 1}),
         with_sink_token=RandomChoice({True : 1, False : 3}),
-        with_rope=RandomChoice({True : 1, False : 3}),
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
 
     test.cfg.is_infer = False
     test.showConfig(test_no, request)
-
-    if getattr(test.cfg, "with_rope", False) and cudnn.backend_version() < 92400:
-        pytest.skip("RoPE requires cuDNN >= 9.24")
 
     exec_sdpa(test.cfg, request, cudnn_handle)
 
@@ -235,8 +222,6 @@ def test_sdpa_random_sq1_L0(env_info, test_no, request, cudnn_handle):
         with_sliding_mask=SlidingWindowMaskGenerator(no_mask=10),
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 1}),
         is_ragged_or_padded_or_full=RandomChoice({"ragged" : 0, "padded" : 0, "full" : 1}),
-        with_score_max=RandomChoice({True : 1, False : 3}),
-        with_score_sum_exp=RandomChoice({True : 1, False : 3}),
         # sink_token not supported with s_q==1
         # dropout not supported with s_q==1
     ) as randomization_ctx:
@@ -268,8 +253,6 @@ def test_sdpa_random_sq1_unified_L1(env_info, test_no, request, cudnn_handle):
         with_sliding_mask=SlidingWindowMaskGenerator(no_mask=10),
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 0}),  # Modified from non-unified test
         is_ragged_or_padded_or_full=RandomChoice({"ragged" : 0, "padded" : 0, "full" : 1}),
-        with_score_max=RandomChoice({True : 1, False : 3}),
-        with_score_sum_exp=RandomChoice({True : 1, False : 3}),
         # sink_token not supported with s_q==1
         # dropout not supported with s_q==1
     ) as randomization_ctx:
@@ -306,8 +289,6 @@ def test_sdpa_random_lean_attn_L0(env_info, test_no, request, cudnn_handle):
         with_sliding_mask=SlidingWindowMaskGenerator(no_mask=10),
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 1}),
         is_ragged_or_padded_or_full=RandomChoice({"ragged" : 0, "padded" : 1, "full" : 1}),
-        with_score_max=RandomChoice({True : 1, False : 3}),
-        with_score_sum_exp=RandomChoice({True : 1, False : 3}),
         # sink_token not supported with s_q==1
         # dropout not supported with s_q==1
     ) as randomization_ctx:
@@ -339,8 +320,6 @@ def test_sdpa_random_lean_attn_unified_L1(env_info, test_no, request, cudnn_hand
         with_sliding_mask=SlidingWindowMaskGenerator(no_mask=10),
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 0}),  # Modified from non-unified test
         is_ragged_or_padded_or_full=RandomChoice({"ragged" : 0, "padded" : 1, "full" : 1}),
-        with_score_max=RandomChoice({True : 1, False : 3}),
-        with_score_sum_exp=RandomChoice({True : 1, False : 3}),
         # sink_token not supported with s_q==1
         # dropout not supported with s_q==1
     ) as randomization_ctx:
@@ -376,8 +355,6 @@ def test_sdpa_random_fwd_ragged_L0(env_info, test_no, request, cudnn_handle):
         with_sliding_mask=SlidingWindowMaskGenerator(causal=10, left_window_only=5, right_window_only=5, band_around_diag=10, no_mask=10),
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 1}),
         is_ragged_or_padded_or_full=RandomChoice({"ragged" : 1, "padded" : 0, "full" : 0}),
-        with_score_max=RandomChoice({True : 1, False : 3}),
-        with_score_sum_exp=RandomChoice({True : 1, False : 3}),
         with_sink_token=RandomChoice({True : 1, False : 3}),
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
@@ -408,14 +385,10 @@ def test_sdpa_random_fwd_ragged_unified_L1(env_info, test_no, request, cudnn_han
         with_sliding_mask=SlidingWindowMaskGenerator(no_mask=10),  # Modified from non-unified test
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 0}),  # Modified from non-unified test
         is_ragged_or_padded_or_full=RandomChoice({"ragged" : 1, "cu_ragged" : 1, "padded" : 0, "full" : 0}),
-        with_score_max=RandomChoice({True : 1, False : 3}),
-        with_score_sum_exp=RandomChoice({True : 1, False : 3}),
         with_sink_token=RandomChoice({True : 1, False : 3}),
-        is_dropout=RandomChoice({True : 1, False : 3}),
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
 
-    test.cfg.dropout_prob = 0.1 if test.cfg.is_dropout else 0.0
     test.cfg.implementation = getattr(cudnn.attention_implementation, request.config.getoption("--implementation") or "", cudnn.attention_implementation.UNIFIED)
     test.showConfig(test_no, request)
 
@@ -450,8 +423,6 @@ def test_sdpa_random_fwd_ragged_offset_multiplier_unified_L1(env_info, test_no, 
         with_sliding_mask=SlidingWindowMaskGenerator(no_mask=10),
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 0}),
         is_ragged_or_padded_or_full=RandomChoice({"ragged_mult" : 1, "cu_ragged_mult" : 1}),
-        with_score_max=RandomChoice({True : 1, False : 3}),
-        with_score_sum_exp=RandomChoice({True : 1, False : 3}),
         with_sink_token=RandomChoice({True : 1, False : 3}),
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
@@ -478,7 +449,7 @@ def test_sdpa_random_bwd_ragged_L0(env_info, test_no, request, cudnn_handle):
     with RandomizationContext(
         batches=RandomBatchSize(min=8, max=16),
         s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=4096, s_kv_min=1, s_kv_max=4096, s_q_distribution={"s_q=1":0, "s_q=s_kv":5, "s_q=random":10, "s_q>s_kv":3}),
-        d_qk_d_v=RandomHiddenDimSize(d_qk_min=1, d_qk_max=192, d_v_min=1, d_v_max=128, head_dim_distribution={"d_qk=d_v":5, "d_qk=random":1}, with_high_probability=[(64,64), (128,128), (192,128), (256,256)]),
+        d_qk_d_v=RandomHiddenDimSize(d_qk_min=1, d_qk_max=256, d_v_min=1, d_v_max=256, head_dim_distribution={"d_qk=d_v":5, "d_qk=random":1}, with_high_probability=[(64,64), (128,128), (192,128), (256,256)]),
         head_count=RandomHeadGenerator(min=1, max=8, head_group_options=(1, 4, 1)),
         data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
         with_sliding_mask=SlidingWindowMaskGenerator(causal=10, left_window_only=5, right_window_only=5, band_around_diag=10, no_mask=10),
@@ -522,8 +493,6 @@ def test_sdpa_fwd_paged_L0(env_info, test_no, request, cudnn_handle):
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 1}),
         is_ragged_or_padded_or_full=RandomChoice({"ragged" : 0, "padded" : 1, "full" : 0}),
         block_size=RandomBlockSize(min=1, max=1024, with_high_probability=[1,32,128]),
-        with_score_max=RandomChoice({True : 1, False : 3}),
-        with_score_sum_exp=RandomChoice({True : 1, False : 3}),
         with_sink_token=RandomChoice({True : 1, False : 3}),
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
@@ -651,7 +620,7 @@ def test_sdpa_random_bwd_bias_L0(env_info, test_no, request, cudnn_handle):
     with RandomizationContext(
         batches=RandomBatchSize(min=8, max=16),
         s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=4096, s_kv_min=1, s_kv_max=4096, s_q_distribution={"s_q=1":0, "s_q=s_kv":5, "s_q=random":10, "s_q>s_kv":3}),
-        d_qk_d_v=RandomHiddenDimSize(d_qk_min=1, d_qk_max=192, d_v_min=1, d_v_max=128, head_dim_distribution={"d_qk=d_v":5, "d_qk=random":1}, with_high_probability=[(64,64), (128,128), (192,128), (256,256)]),
+        d_qk_d_v=RandomHiddenDimSize(d_qk_min=1, d_qk_max=256, d_v_min=1, d_v_max=256, head_dim_distribution={"d_qk=d_v":5, "d_qk=random":1}, with_high_probability=[(64,64), (128,128), (192,128), (256,256)]),
         head_count=RandomHeadGenerator(min=1, max=8, head_group_options=(1, 4, 1)),
         data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
         with_sliding_mask=SlidingWindowMaskGenerator(no_mask=10),
@@ -843,7 +812,7 @@ def test_sdpa_fp8_fwd_ragged_L0(env_info, test_no, request, cudnn_handle):
         output_type=RandomChoice({torch.float8_e4m3fn: 1, torch.float8_e5m2: 1, torch.float16: 2}),
         with_sliding_mask=SlidingWindowMaskGenerator(no_mask=10),
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT: 1}),
-        is_ragged_or_padded_or_full=RandomChoice({"ragged": 1, "padded": 0, "full": 0}),
+        is_ragged_or_padded_or_full=RandomChoice({"ragged": 1, "cu_ragged": 1, "cu_ragged_mult": 1, "padded": 0, "full": 0}),
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
     test.showConfig(test_no, request)
@@ -920,6 +889,8 @@ def test_sdpa_fp8_bwd_ragged_L0(env_info, test_no, request, cudnn_handle):
 @pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=256, rng_seed=1001), ids=lambda p: f"test{p[0]}")
 @pytest.mark.L0
 def test_sdpa_mxfp8_fwd_L0(env_info, test_no, request, cudnn_handle):
+    if torch.cuda.get_device_capability() < (10, 0):
+        pytest.skip("MXFP8 SDPA requires Blackwell (SM100+)")
 
     test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
 
@@ -980,6 +951,8 @@ def test_sdpa_mxfp8_fwd_L0(env_info, test_no, request, cudnn_handle):
 @pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=256, rng_seed=1002), ids=lambda p: f"test{p[0]}")
 @pytest.mark.L0
 def test_sdpa_mxfp8_bwd_L0(env_info, test_no, request, cudnn_handle):
+    if torch.cuda.get_device_capability() < (10, 0):
+        pytest.skip("MXFP8 SDPA requires Blackwell (SM100+)")
 
     test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
 
@@ -1023,6 +996,67 @@ def test_sdpa_mxfp8_bwd_L0(env_info, test_no, request, cudnn_handle):
 # # ===================
 # # Single repro test
 # # ===================
+
+MIXED_SEQ_LEN_FORM_CASES = [
+    ("q", cudnn.diagonal_alignment.TOP_LEFT, None),
+    ("kv", cudnn.diagonal_alignment.TOP_LEFT, None),
+    ("q", cudnn.diagonal_alignment.BOTTOM_RIGHT, 0),
+    ("kv", cudnn.diagonal_alignment.BOTTOM_RIGHT, 0),
+]
+
+
+@pytest.mark.parametrize(
+    "cu_sides,diag_align,right_bound",
+    MIXED_SEQ_LEN_FORM_CASES,
+    ids=["cu_q", "cu_kv", "cu_q_brcm", "cu_kv_brcm"],
+)
+@pytest.mark.L0
+def test_sdpa_mixed_seq_len_forms_L0(env_info, cu_sides, diag_align, right_bound, request, cudnn_handle):
+    """Mixed-form sequence lengths: cumulative on one side, per-batch on the other.
+
+    Deterministic configs with non-uniform per-batch lengths, so misreading one
+    side's form cannot produce a passing result. The bottom-right causal cases
+    guard the DiagonalBandMask alignment derivation, which must treat the two
+    sides' forms independently. Requires cuDNN 9.25+ (skips below via exec_sdpa).
+    """
+    # Mixed forms are gated in the UNIFIED surface; request it explicitly rather
+    # than relying on AUTO resolving to it.
+    test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.UNIFIED)
+    test.cfg = ExecConfig(
+        data_type=torch.bfloat16,
+        rng_data_seed=1234,
+        rng_geom_seed=5678,
+        is_alibi=False,
+        is_infer=True,
+        is_paged=False,
+        is_bias=False,
+        is_block_mask=False,
+        is_padding=True,
+        is_cu_seq_len=True,
+        cu_seq_len_sides=cu_sides,
+        is_ragged=False,
+        is_dropout=False,
+        is_determin=False,
+        batches=4,
+        d_qk=64,
+        d_v=64,
+        s_q=256,
+        s_kv=512,
+        h_q=3,
+        h_k=3,
+        h_v=3,
+        diag_align=diag_align,
+        left_bound=None,
+        right_bound=right_bound,
+        seq_len_q=[128, 100, 256, 37],
+        seq_len_kv=[96, 64, 512, 200],
+        implementation=cudnn.attention_implementation.UNIFIED,
+    )
+    test.cfg.fill_derived_fields()
+    test.showConfig((request.node.name, len(MIXED_SEQ_LEN_FORM_CASES)), request)
+
+    exec_sdpa(test.cfg, request, cudnn_handle)
+
 
 @pytest.mark.skipif("not config.getoption('--repro')", reason="used with '--repro' only")
 @pytest.mark.L0

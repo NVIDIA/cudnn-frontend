@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """APIBase wrappers for sparse and dense indexer backward.
 
 Combines backend-specific CuTe-DSL kernels:
@@ -12,7 +15,7 @@ pipeline (kernel 3).
 
 from __future__ import annotations
 
-from typing import Optional, Union
+from typing import Optional
 
 import torch
 import cuda.bindings.driver as cuda
@@ -29,10 +32,12 @@ from .indexer_backward_sm100 import indexer_backward_sm100
 from .indexer_backward_sm90 import indexer_backward_sm90
 
 
-def _as_grad_loss_tensor(grad_loss: Union[float, torch.Tensor], device: torch.device) -> torch.Tensor:
-    if torch.is_tensor(grad_loss):
-        return grad_loss.detach().to(device=device, dtype=torch.float32, copy=False).reshape(1)
-    return torch.tensor([float(grad_loss)], dtype=torch.float32, device=device)
+def _validate_grad_loss_tensor(grad_loss: torch.Tensor, device: torch.device) -> torch.Tensor:
+    if not torch.is_tensor(grad_loss):
+        raise TypeError("grad_loss must be a torch.Tensor")
+    if grad_loss.numel() != 1 or grad_loss.dtype != torch.float32 or grad_loss.device != device:
+        raise ValueError(f"grad_loss must be a single-element float32 tensor on {device}")
+    return grad_loss.detach().view(1)
 
 
 def _contiguous_input(tensor: torch.Tensor) -> torch.Tensor:
@@ -223,8 +228,8 @@ class IndexerBackward(APIBase):
         attn_score: torch.Tensor,
         index_score: torch.Tensor,
         topk_indices: torch.Tensor,
+        grad_loss: torch.Tensor,
         loss_coeff: float = 1.0,
-        grad_loss: Union[float, torch.Tensor] = 1.0,
         current_stream: Optional[cuda.CUstream] = None,
     ) -> None:
         self._logger.debug("Entering execute")
@@ -232,7 +237,7 @@ class IndexerBackward(APIBase):
         # compiled kernel is reused when loss_coeff changes for the same
         # cached tensor shape.
         grad_scale = float(loss_coeff) / (int(self.batch) * int(self.seqlen))
-        grad_loss_tensor = _as_grad_loss_tensor(grad_loss, index_q.device)
+        grad_loss_tensor = _validate_grad_loss_tensor(grad_loss, index_q.device)
         self._compiled_kernel(
             index_q,
             weights,
@@ -371,8 +376,8 @@ class DenseIndexerBackward(APIBase):
         attn_l1norm: torch.Tensor,
         index_score: torch.Tensor,
         index_lse: torch.Tensor,
+        grad_loss: torch.Tensor,
         loss_coeff: float = 1.0,
-        grad_loss: Union[float, torch.Tensor] = 1.0,
         cu_seqlens_q: Optional[torch.Tensor] = None,
         cu_seqlens_k: Optional[torch.Tensor] = None,
         q_causal_offsets: Optional[torch.Tensor] = None,
@@ -380,8 +385,8 @@ class DenseIndexerBackward(APIBase):
     ) -> None:
         backend_stream = None if self._uses_current_stream_pipeline else current_stream
         with _torch_stream_context(backend_stream):
-            grad_loss_value = float(_as_grad_loss_tensor(grad_loss, index_q.device).item())
-            grad_scale = float(loss_coeff) * grad_loss_value / max(int(self.normalization_tokens), 1)
+            grad_loss_tensor = _validate_grad_loss_tensor(grad_loss, index_q.device)
+            grad_scale = float(loss_coeff) / max(int(self.normalization_tokens), 1)
 
             # Dense backward's dK path uses atomic/bulk reductions into fp32.
             d_index_k_target = d_index_k
@@ -402,6 +407,7 @@ class DenseIndexerBackward(APIBase):
             attn_l1norm,
             index_score,
             index_lse,
+            grad_loss_tensor,
             grad_scale,
             cu_seqlens_q,
             cu_seqlens_k,
@@ -424,9 +430,9 @@ def indexer_backward_wrapper(
     attn_score: torch.Tensor,
     index_score: torch.Tensor,
     topk_indices: torch.Tensor,
+    grad_loss: torch.Tensor,
     sm_scale: float = 1.0,
     loss_coeff: float = 1.0,
-    grad_loss: Union[float, torch.Tensor] = 1.0,
     block_I: int = 128,
     topk_indices_global: bool = False,
     d_index_q: Optional[torch.Tensor] = None,
@@ -436,9 +442,11 @@ def indexer_backward_wrapper(
 ) -> TupleDict:
     """High-level wrapper. Returns ``{'d_index_q', 'd_weights', 'd_index_k'}``.
 
-    ``attn_score`` and ``index_score`` are consumed in-place: the kernel
-    overwrites ``attn_score`` with ``grad_signal`` and ``index_score`` with
-    ``sum_grad`` during the score-grad precompute stage.
+    ``index_score`` contains the predict softmax aligned slot-for-slot with
+    ``topk_indices``; the fused softmax returned by compressed indexer forward
+    can be passed directly. ``attn_score`` and ``index_score`` are consumed
+    in-place: the kernel overwrites ``attn_score`` with ``grad_signal`` and
+    ``index_score`` with ``sum_grad`` during the score-grad precompute stage.
 
     Args:
         topk_indices_global: whether ``topk_indices`` already contains global
@@ -449,9 +457,13 @@ def indexer_backward_wrapper(
             weights-scaling trick.
         loss_coeff: coefficient scaling the KL-divergence loss in the
             forward (``indexer_loss = loss_coeff * kl.mean()``).
-        grad_loss: scalar gradient of the outer loss w.r.t. the KL term;
-            typically ``1.0`` when the KL loss is summed into the total
-            training loss with unit weight. Accepts a 0-D tensor or float.
+        index_score: FP32 predict probabilities over the selected indexer
+            logits. The caller must use the same valid-slot mask when
+            constructing ``attn_score`` so target and predict describe
+            identical slots. This buffer is overwritten in-place.
+        grad_loss: single-element float32 tensor on the same CUDA device as
+            ``index_q``. The kernel reads its value at runtime, including on
+            CUDA Graph replay.
     """
     with _torch_stream_context(stream):
         if d_index_q is None:
@@ -532,9 +544,9 @@ def dense_indexer_backward_wrapper(
     attn_l1norm: torch.Tensor,
     index_score: torch.Tensor,
     index_lse: torch.Tensor,
+    grad_loss: torch.Tensor,
     sm_scale: float = 1.0,
     loss_coeff: float = 1.0,
-    grad_loss: Union[float, torch.Tensor] = 1.0,
     block_I: int = 128,
     ratio: int = 1,
     cu_seqlens_q: Optional[torch.Tensor] = None,
@@ -553,6 +565,10 @@ def dense_indexer_backward_wrapper(
     ``dense_attn_score_recompute_wrapper`` and
     ``dense_indexer_score_recompute_wrapper`` respectively. They are consumed
     in-place by the score-gradient precompute stage.
+
+    ``grad_loss`` must be a single-element float32 tensor on the same CUDA
+    device as ``index_q``. The kernel reads its value at runtime, including on
+    CUDA Graph replay.
     """
     major, _ = torch.cuda.get_device_capability()
     backend_stream = None if major == 9 else stream

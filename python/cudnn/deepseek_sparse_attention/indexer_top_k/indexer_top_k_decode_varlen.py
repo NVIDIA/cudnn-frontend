@@ -1,4 +1,5 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -21,12 +22,10 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils
 import torch
-from cutlass.utils.distributed import atomicAdd
-
 from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
 
 from .block_scan import block_prefix_sum_kernel
-from .indexer_top_k_varlen_util import IndexerTopKKernelVarlen
+from .indexer_top_k_varlen_util import IndexerTopKKernelVarlen, atomicAdd
 
 
 class ComputeDynamicCTAOffsets:

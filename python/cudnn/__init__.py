@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import ctypes
 import glob
 import os
@@ -33,7 +36,6 @@ symbols_to_import = [
     "data_type",
     "tensor_reordering",
     "heur_mode",
-    "pygraph",
     "tensor",
     "knob",
     "cudnnGraphNotSupportedError",
@@ -47,13 +49,20 @@ symbols_to_import = [
 for symbol_name in symbols_to_import:
     globals()[symbol_name] = getattr(_pybind_module, symbol_name)
 
-for _optional_symbol in ["causal_conv1d_forward", "causal_conv1d_backward"]:
+for _optional_symbol in [
+    "causal_conv1d_forward",
+    "causal_conv1d_backward",
+    "causal_conv1d_nwh_forward",
+    "causal_conv1d_nwh_backward",
+    "b2b_causal_conv1d_forward",
+    "b2b_causal_conv1d_backward",
+]:
     if hasattr(_pybind_module, _optional_symbol):
         globals()[_optional_symbol] = getattr(_pybind_module, _optional_symbol)
 
 from .datatypes import _library_type, _is_torch_tensor
 
-__version__ = "1.26.0"
+__version__ = "1.27.0"
 
 
 def _tensor(
@@ -108,7 +117,7 @@ def _set_data_type(
 
 
 _pybind_module.tensor.set_data_type = _set_data_type
-pygraph.tensor = _tensor
+_pybind_module.backend_graph.tensor = _tensor
 
 
 def _library_device_pointer(input_tensor):
@@ -194,8 +203,8 @@ def _execute_plan_at_index(
     )
 
 
-pygraph.execute = _execute
-pygraph.execute_plan_at_index = _execute_plan_at_index
+_pybind_module.backend_graph.execute = _execute
+_pybind_module.backend_graph.execute_plan_at_index = _execute_plan_at_index
 
 
 def load_cudnn():
@@ -255,10 +264,44 @@ if is_windows():
 else:
     _dlopen_cudnn()
 
+# The graph API: a Python-native IR with pluggable execution backends. The
+# public ``cudnn.pygraph`` IS the Python class; the C++ graph builder stays
+# internal at ``cudnn._pybind_module.backend_graph`` and is reached only through
+# lowering (a graph is pure-Python or pure-C++, never mixed). Imported before
+# .graph/.wrapper, which reference cudnn.pygraph at module load.
+from .graph_types import NodeType, Tensor
+from ._pygraph import pygraph, GraphContext
+from .nodes import Node
+
 from .graph import graph, jit, graph_cache
-from .wrapper import Graph
 
 from typing import Any
+
+_EAGER_PUBLIC_NAMES = (
+    *symbols_to_import,
+    *(
+        symbol
+        for symbol in (
+            "causal_conv1d_forward",
+            "causal_conv1d_backward",
+            "causal_conv1d_nwh_forward",
+            "causal_conv1d_nwh_backward",
+            "b2b_causal_conv1d_forward",
+            "b2b_causal_conv1d_backward",
+        )
+        if symbol in globals()
+    ),
+    "__version__",
+    "NodeType",
+    "Tensor",
+    "pygraph",
+    "GraphContext",
+    "Node",
+    "graph",
+    "jit",
+    "graph_cache",
+)
+__all__ = [*_EAGER_PUBLIC_NAMES, "Graph", "wrapper"]
 
 _OPTIONAL_DEPENDENCY_INSTALL_HINT = "Install with 'pip install nvidia-cudnn-frontend[cutedsl]'"
 
@@ -267,45 +310,55 @@ _LAZY_OPTIONAL_IMPORTS = {
     "block_sparse_attention_forward": (".block_sparse_attention", "block_sparse_attention_forward"),
     "block_sparse_attention_backward": (".block_sparse_attention", "block_sparse_attention_backward"),
     "DSA": (".deepseek_sparse_attention", "DSA"),
+    "CSA": (".csa", "CSA"),
+    "CSACompressorForward": (".csa", "CSACompressorForward"),
+    "CSACompressorBackward": (".csa", "CSACompressorBackward"),
+    "csa_compressor_forward_wrapper": (".csa", "csa_compressor_forward_wrapper"),
+    "csa_compressor_backward_wrapper": (".csa", "csa_compressor_backward_wrapper"),
     "NSA": (".native_sparse_attention", "NSA"),
-    "GemmSwigluSm100": (".gemm_swiglu", "GemmSwigluSm100"),
-    "gemm_swiglu_wrapper_sm100": (".gemm_swiglu", "gemm_swiglu_wrapper_sm100"),
-    "GemmSreluSm100": (".gemm_srelu", "GemmSreluSm100"),
-    "gemm_srelu_wrapper_sm100": (".gemm_srelu", "gemm_srelu_wrapper_sm100"),
-    "GemmDsreluSm100": (".gemm_dsrelu", "GemmDsreluSm100"),
-    "gemm_dsrelu_wrapper_sm100": (".gemm_dsrelu", "gemm_dsrelu_wrapper_sm100"),
-    "GemmAmaxSm100": (".gemm_amax", "GemmAmaxSm100"),
-    "gemm_amax_wrapper_sm100": (".gemm_amax", "gemm_amax_wrapper_sm100"),
+    "GemmSwigluSm100": (".gemm.cutedsl.dense.swiglu", "GemmSwigluSm100"),
+    "gemm_swiglu_wrapper_sm100": (".gemm.cutedsl.dense.swiglu", "gemm_swiglu_wrapper_sm100"),
+    "GemmSreluSm100": (".gemm.cutedsl.dense.srelu", "GemmSreluSm100"),
+    "gemm_srelu_wrapper_sm100": (".gemm.cutedsl.dense.srelu", "gemm_srelu_wrapper_sm100"),
+    "GemmDsreluSm100": (".gemm.cutedsl.dense.dsrelu", "GemmDsreluSm100"),
+    "gemm_dsrelu_wrapper_sm100": (".gemm.cutedsl.dense.dsrelu", "gemm_dsrelu_wrapper_sm100"),
+    "GemmAmaxSm100": (".gemm.cutedsl.dense.amax", "GemmAmaxSm100"),
+    "gemm_amax_wrapper_sm100": (".gemm.cutedsl.dense.amax", "gemm_amax_wrapper_sm100"),
+    "GemmProjRopeMxfp8Bf16InSm100": (".gemm.cutedsl.dense.proj_rope_mxfp8", "GemmProjRopeMxfp8Bf16InSm100"),
+    "GemmProjRopeMxfp8Mxfp8InSm100": (".gemm.cutedsl.dense.proj_rope_mxfp8", "GemmProjRopeMxfp8Mxfp8InSm100"),
+    "gemm_proj_rope_mxfp8_wrapper_sm100": (".gemm.cutedsl.dense.proj_rope_mxfp8", "gemm_proj_rope_mxfp8_wrapper_sm100"),
     "RmsNormRhtAmaxSm100": (".rmsnorm_rht_amax", "RmsNormRhtAmaxSm100"),
     "rmsnorm_rht_amax_wrapper_sm100": (".rmsnorm_rht_amax", "rmsnorm_rht_amax_wrapper_sm100"),
-    "grouped_gemm": (".grouped_gemm", None),
-    "GroupedGemmSwigluSm100": (".grouped_gemm", "GroupedGemmSwigluSm100"),
-    "grouped_gemm_swiglu_wrapper_sm100": (".grouped_gemm", "grouped_gemm_swiglu_wrapper_sm100"),
-    "GroupedGemmDswigluSm100": (".grouped_gemm", "GroupedGemmDswigluSm100"),
-    "grouped_gemm_dswiglu_wrapper_sm100": (".grouped_gemm", "grouped_gemm_dswiglu_wrapper_sm100"),
-    "GroupedGemmSreluSm100": (".grouped_gemm", "GroupedGemmSreluSm100"),
-    "grouped_gemm_srelu_wrapper_sm100": (".grouped_gemm", "grouped_gemm_srelu_wrapper_sm100"),
-    "GroupedGemmDsreluSm100": (".grouped_gemm", "GroupedGemmDsreluSm100"),
-    "grouped_gemm_dsrelu_wrapper_sm100": (".grouped_gemm", "grouped_gemm_dsrelu_wrapper_sm100"),
+    "grouped_gemm": (".gemm.cutedsl.grouped", None),
+    "GroupedGemmSm100": (".gemm.cutedsl.grouped", "GroupedGemmSm100"),
+    "grouped_gemm_wrapper_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_wrapper_sm100"),
+    "GroupedGemmSwigluSm100": (".gemm.cutedsl.grouped", "GroupedGemmSwigluSm100"),
+    "grouped_gemm_swiglu_wrapper_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_swiglu_wrapper_sm100"),
+    "GroupedGemmDswigluSm100": (".gemm.cutedsl.grouped", "GroupedGemmDswigluSm100"),
+    "grouped_gemm_dswiglu_wrapper_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_dswiglu_wrapper_sm100"),
+    "GroupedGemmSreluSm100": (".gemm.cutedsl.grouped", "GroupedGemmSreluSm100"),
+    "grouped_gemm_srelu_wrapper_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_srelu_wrapper_sm100"),
+    "GroupedGemmDsreluSm100": (".gemm.cutedsl.grouped", "GroupedGemmDsreluSm100"),
+    "grouped_gemm_dsrelu_wrapper_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_dsrelu_wrapper_sm100"),
     "SdpafwdSm100D256": (".sdpa", "SdpafwdSm100D256"),
     "sdpa_fwd_wrapper_sm100_d256": (".sdpa", "sdpa_fwd_wrapper_sm100_d256"),
     "SdpabwdSm100D256": (".sdpa", "SdpabwdSm100D256"),
     "sdpa_bwd_wrapper_sm100_d256": (".sdpa", "sdpa_bwd_wrapper_sm100_d256"),
-    "GroupedGemmQuantSm100": (".grouped_gemm", "GroupedGemmQuantSm100"),
-    "grouped_gemm_quant_wrapper_sm100": (".grouped_gemm", "grouped_gemm_quant_wrapper_sm100"),
-    "GroupedGemmGluSm100": (".grouped_gemm", "GroupedGemmGluSm100"),
-    "grouped_gemm_glu_wrapper_sm100": (".grouped_gemm", "grouped_gemm_glu_wrapper_sm100"),
-    "GroupedGemmGluHadamardSm100": (".grouped_gemm", "GroupedGemmGluHadamardSm100"),
-    "grouped_gemm_glu_hadamard_wrapper_sm100": (".grouped_gemm", "grouped_gemm_glu_hadamard_wrapper_sm100"),
-    "GroupedGemmDgluSm100": (".grouped_gemm", "GroupedGemmDgluSm100"),
-    "grouped_gemm_dglu_wrapper_sm100": (".grouped_gemm", "grouped_gemm_dglu_wrapper_sm100"),
-    "GroupedGemmWgradSm100": (".grouped_gemm", "GroupedGemmWgradSm100"),
-    "grouped_gemm_wgrad_wrapper_sm100": (".grouped_gemm", "grouped_gemm_wgrad_wrapper_sm100"),
-    "discrete_grouped_gemm": (".discrete_grouped_gemm", None),
-    "DiscreteGroupedGemmSwigluSm100": (".discrete_grouped_gemm", "DiscreteGroupedGemmSwigluSm100"),
-    "discrete_grouped_gemm_swiglu_wrapper_sm100": (".discrete_grouped_gemm", "discrete_grouped_gemm_swiglu_wrapper_sm100"),
-    "DiscreteGroupedGemmDswigluSm100": (".discrete_grouped_gemm", "DiscreteGroupedGemmDswigluSm100"),
-    "discrete_grouped_gemm_dswiglu_wrapper_sm100": (".discrete_grouped_gemm", "discrete_grouped_gemm_dswiglu_wrapper_sm100"),
+    "GroupedGemmQuantSm100": (".gemm.cutedsl.grouped", "GroupedGemmQuantSm100"),
+    "grouped_gemm_quant_wrapper_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_quant_wrapper_sm100"),
+    "GroupedGemmGluSm100": (".gemm.cutedsl.grouped", "GroupedGemmGluSm100"),
+    "grouped_gemm_glu_wrapper_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_glu_wrapper_sm100"),
+    "GroupedGemmGluHadamardSm100": (".gemm.cutedsl.grouped", "GroupedGemmGluHadamardSm100"),
+    "grouped_gemm_glu_hadamard_wrapper_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_glu_hadamard_wrapper_sm100"),
+    "GroupedGemmDgluSm100": (".gemm.cutedsl.grouped", "GroupedGemmDgluSm100"),
+    "grouped_gemm_dglu_wrapper_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_dglu_wrapper_sm100"),
+    "GroupedGemmWgradSm100": (".gemm.cutedsl.grouped", "GroupedGemmWgradSm100"),
+    "grouped_gemm_wgrad_wrapper_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_wgrad_wrapper_sm100"),
+    "discrete_grouped_gemm": (".gemm.cutedsl.discrete_grouped", None),
+    "DiscreteGroupedGemmSwigluSm100": (".gemm.cutedsl.discrete_grouped", "DiscreteGroupedGemmSwigluSm100"),
+    "discrete_grouped_gemm_swiglu_wrapper_sm100": (".gemm.cutedsl.discrete_grouped", "discrete_grouped_gemm_swiglu_wrapper_sm100"),
+    "DiscreteGroupedGemmDswigluSm100": (".gemm.cutedsl.discrete_grouped", "DiscreteGroupedGemmDswigluSm100"),
+    "discrete_grouped_gemm_dswiglu_wrapper_sm100": (".gemm.cutedsl.discrete_grouped", "discrete_grouped_gemm_dswiglu_wrapper_sm100"),
 }
 
 
@@ -322,6 +375,12 @@ def _load_optional_symbol(name: str) -> Any:
 
 
 def __getattr__(name: str) -> Any:
+    if name in ("Graph", "wrapper"):
+        _wrapper = importlib.import_module(".wrapper", __name__)
+        globals()["wrapper"] = _wrapper
+        globals()["Graph"] = _wrapper.Graph
+        return globals()[name]
+
     if name == "ops":
         # Use importlib rather than "from . import ops" to avoid infinite
         # recursion. The cycle:
@@ -344,3 +403,7 @@ def __getattr__(name: str) -> Any:
         return _load_optional_symbol(name)
 
     raise AttributeError(name)
+
+
+def __dir__():
+    return sorted(set(globals()) | set(__all__))

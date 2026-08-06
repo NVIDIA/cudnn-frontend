@@ -18,20 +18,44 @@ python/cudnn/
 ├── wrapper.py                      # High-level Graph wrapper class
 ├── datatypes.py                    # Data type conversions and helpers
 ├── api_base.py                     # Abstract API base class for frontend-only APIs
-├── {frontend-only-api-name}/
+├── gemm/                           # GEMM operation family (operation-first layout)
+│   ├── ops/                        # Backend-independent contracts (torch custom ops)
+│   ├── frost/                      # FROST GEMM engine (graph analysis, codegen, JIT)
+│   ├── reference/                  # Pure-PyTorch correctness engine
+│   └── cutedsl/                    # Direct CuTe DSL kernels
+│       ├── dense/{operation}/      # __init__.py + api.py + {kernel_name}.py
+│       ├── grouped/{operation}/
+│       └── discrete_grouped/{operation}/
+├── {frontend-only-api-name}/       # Families not yet migrated (attention etc.)
 │   ├── __init__.py                 # Frontend-only API class
 │   └── api.py                      # High-level API implementation
 │   └── {kernel_name}.py            # Kernel implementation, i.e CuteDSL
+├── gemm/                           # The GEMM operation family (see below)
 test/python/                        # Test files
 └── fe_api/                         # Test files for frontend-only APIs
 ```
+
+All GEMM fusions live under `gemm/`, grouped by operand layout:
+
+```
+python/cudnn/gemm/
+├── cutedsl/
+│   ├── dense/{amax,dsrelu,proj_rope_mxfp8,srelu,swiglu}/
+│   ├── grouped/{dglu,dsrelu,dswiglu,glu,glu_hadamard,quant,srelu,swiglu,unfused,wgrad}/
+│   └── discrete_grouped/{dswiglu,swiglu}/        # per-expert discrete weight pointers
+├── ops/                                          # backend-independent torch custom-op contracts
+└── reference/                                    # pure-PyTorch correctness engine
+```
+
+Every public GEMM symbol is re-exported at the top level (`cudnn.<symbol>`), which
+is the supported entry point — the directory layout is an implementation detail.
 
 ## 
 
 ## Adding new frontend-only APIs
 
 To add a new frontend-only API, follow these steps:
-1. Create a new directory in the `python/cudnn` directory with the name of the API.
+1. Choose the operation family first. GEMM-family kernels go under `python/cudnn/gemm/cutedsl/{dense,grouped,discrete_grouped}/{api-name}/`; only non-GEMM families still use a top-level directory.
 2. Add your kernel implementation and implement the high level API implementation in `api.py`, extending the `APIBase` class in `api_base.py`.
 3. Expose the API import in `python/cudnn/__init__.py` and register the folder in `pyproject.toml`. Register any optional dependences if required.
 4. Add a sample usage/test file in `test/python/fe_api/`.

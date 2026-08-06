@@ -1,0 +1,36 @@
+name: Feature request
+description: Propose a scoped improvement or new capability.
+title: "[Feature]: "
+labels:
+  - cat-feature
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Search existing issues first. Concrete use cases and a small initial scope are easiest to evaluate.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and did not find a duplicate.
+
+  - type: textarea
+    id: request
+    attributes:
+      label: Feature request
+      value: |
+        ### Problem or use case
+
+        <!-- What are you trying to do, and what is difficult or impossible today? -->
+
+        ### Proposed solution
+
+        <!-- Describe the API, behavior, or workflow you want. -->
+
+        ### Why is this important?
+
+        <!-- Who benefits, and what outcome does this unlock? -->
+    validations:
+      required: true

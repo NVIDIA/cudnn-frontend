@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import random
 import math
 import torch
@@ -88,6 +91,10 @@ class ExecConfig:
     # (cumulative sequence-length tensors of shape (b+1, 1, 1, 1)) instead of
     # the regular per-batch seq_len_q/seq_len_kv tensors. Implies is_padding=True.
     is_cu_seq_len: bool = None
+    # Which sides use the cumulative form when is_cu_seq_len is True: "both"
+    # (default), "q" (cu_seq_len_q with seq_len_kv), or "kv" (seq_len_q with
+    # cu_seq_len_kv). The mixed forms require cuDNN 9.25+.
+    cu_seq_len_sides: str = "both"
     is_ragged: bool = None
     is_dropout: bool = None
     is_determin: bool = None
@@ -143,6 +150,12 @@ class ExecConfig:
     @property
     def is_train(self):
         return not self.is_infer
+
+    def is_cu_seq_len_q(self):
+        return bool(self.is_cu_seq_len) and self.cu_seq_len_sides in ("both", "q")
+
+    def is_cu_seq_len_kv(self):
+        return bool(self.is_cu_seq_len) and self.cu_seq_len_sides in ("both", "kv")
 
     def fill_derived_fields(self):
         """
@@ -496,8 +509,13 @@ class RandomSequenceLength:
         s_kv_max: int,
         s_q_distribution: dict[Any, int],
     ):
-        # Cap sequence lengths at 1024 on SM80 (Ampere) to avoid OOMs for CI/CD.
-        if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 8:
+        # Cap sequence lengths at 1024 on SM80 (Ampere) and on small-memory GPUs
+        # to avoid OOMs for CI/CD. A 4k bwd config holds >12 GiB, which starves
+        # sibling pytest-xdist workers on e.g. the 16 GiB RTX 5080 sm120 runner;
+        # the cap keys on device memory, not arch, so big Blackwells stay at 4k.
+        if torch.cuda.is_available() and (
+            torch.cuda.get_device_capability()[0] == 8 or torch.cuda.get_device_properties(0).total_memory < 20 * 2**30
+        ):
             s_q_max = min(s_q_max, 1024)
             s_kv_max = min(s_kv_max, 1024)
             s_q_min = min(s_q_min, s_q_max)

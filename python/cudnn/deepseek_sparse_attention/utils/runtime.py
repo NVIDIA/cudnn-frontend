@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Runtime helpers shared by DSA Python wrappers."""
 
 from contextlib import contextmanager
@@ -21,6 +24,10 @@ def maybe_contiguous(
         return x
     with torch_stream_context(stream):
         return x.contiguous()
+
+
+def ceil_div(a: int, b: int) -> int:
+    return (a + b - 1) // b
 
 
 def validate_q_causal_offsets(
@@ -56,5 +63,5 @@ def torch_stream_context(current_stream: Optional[cuda.CUstream] = None) -> Iter
     if current_stream is None:
         yield
         return
-    with torch.cuda.stream(torch.cuda.ExternalStream(int(current_stream))):
+    with torch.cuda.stream(torch.cuda.get_stream_from_external(int(current_stream))):
         yield

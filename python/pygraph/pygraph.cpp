@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 #include <optional>
 #include <utility>
 #include <unordered_map>
@@ -829,7 +834,7 @@ default_vector(void) {
 
 void
 init_pygraph_submodule(py::module_& m) {
-    py::class_<PyGraph> pygraph_(m, "pygraph");
+    py::class_<PyGraph> pygraph_(m, "backend_graph");
     pygraph_
         .def(py::init<std::string const&,
                       cudnn_frontend::DataType_t,

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # Supported features:
 # - BF16 & FP16 dtype
 # - noncausal attention
@@ -1506,16 +1509,6 @@ class BlockSparseAttnForwardSm100Blk128:
         tidx = cute.arch.thread_idx()[0] % (cute.arch.WARP_SIZE * len(self.correction_warp_ids))
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
 
-        tScS = thr_mma_qk.partition_C(cute.make_identity_tensor(self.mma_tiler_qk[:2]))
-        tStScale_layout = cute.composition(tStS.layout, cute.make_layout((self.m_block_size, 1)))
-        tStScales = tuple(cute.make_tensor(tStS.iterator + self.tmem_vec_offset[stage], tStScale_layout) for stage in range(self.s_stage))
-        tScScale = cute.composition(tScS, cute.make_layout((self.m_block_size, 1)))
-        tmem_load_v_atom = cute.make_copy_atom(tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(1)), self.qk_acc_dtype)
-        thr_tmem_load_vec = tcgen05.make_tmem_copy(tmem_load_v_atom, tStScales[0]).get_slice(tidx)
-
-        tStScales_t2r = [thr_tmem_load_vec.partition_S(tStScales[stage]) for stage in range(self.s_stage)]
-        tSrScale_t2r_shape = thr_tmem_load_vec.partition_D(tScScale).shape
-
         # First iter: no correction is required
         # Notify mma warp that O has been rescaled
         for stage in cutlass.range(self.s_stage):
@@ -1546,7 +1539,6 @@ class BlockSparseAttnForwardSm100Blk128:
                 sm_stats_barrier.arrive_and_wait_w_index(index=1 * 4 + warp_idx)
                 sm_stats_consumer_phase ^= 1
 
-                tSrScale_t2r = cute.make_rmem_tensor(tSrScale_t2r_shape, Float32)
                 # q_stage=1 correction loop
                 if const_expr(mBlockNums is not None):
                     block_iter_count = (mBlockNums[batch_idx, head_idx, m_block] + 1) & ~1
@@ -1715,7 +1707,6 @@ class BlockSparseAttnForwardSm100Blk128:
         tOtO_r2t = thr_tmem_store.partition_D(tOtO_i)
 
         frg_count = self.head_dim_v_padded // corr_tile_size
-        tOrO_frg = cute.make_rmem_tensor((tOrO_t2r_shape, frg_count), self.pv_acc_dtype)
         for i in cutlass.range_constexpr(frg_count):
             tOrO_frg = cute.make_rmem_tensor(tOrO_t2r_shape, self.pv_acc_dtype)
             tOtO_t2r_i = cute.make_tensor(tOtO_t2r.iterator + i * corr_tile_size, tOtO_t2r.layout)
@@ -2325,27 +2316,27 @@ sm100_utils = _make_local_namespace(
 # =============================================================================
 # Mask Helpers
 # =============================================================================
-MASK_R2P_CHUNK_SIZE: int = 32
+PREDICATE_MASK_CHUNK_SIZE: int = 32
 
 MaskGenFn: TypeAlias = Callable[[int], Uint32]
 
 
 @cute.jit
-def r2p_bitmask_below(limit: Int32, s: int) -> Uint32:
-    """32-bit R2P bitmask keeping positions < limit (exclusive upper bound)."""
-    m = max((s + 1) * MASK_R2P_CHUNK_SIZE - limit, 0)
+def predicate_bitmask_below(limit: Int32, s: int) -> Uint32:
+    """32-bit register-to-predicate bitmask keeping positions < limit."""
+    m = max((s + 1) * PREDICATE_MASK_CHUNK_SIZE - limit, 0)
     return utils.shr_u32(Uint32(0xFFFFFFFF), Uint32(m))
 
 
 @cute.jit
-def mask_r2p_lambda(
+def apply_predicate_mask(
     X: cute.Tensor,
     mask_gen_fn: cutlass.Constexpr[MaskGenFn],
     rank1: bool = False,
 ) -> None:
-    """Apply R2P masking with a custom bitmask generator."""
+    """Apply register-to-predicate masking with a custom bitmask generator."""
     ncol = const_expr(cute.size(X.shape[cute.rank(X) - 1]) if not rank1 else cute.size(X.shape))
-    CHUNK_SIZE = MASK_R2P_CHUNK_SIZE
+    CHUNK_SIZE = PREDICATE_MASK_CHUNK_SIZE
     for s in cutlass.range_constexpr(cute.ceil_div(ncol, CHUNK_SIZE)):
         mask = mask_gen_fn(s)
         for i in cutlass.range_constexpr(min(CHUNK_SIZE, ncol - s * CHUNK_SIZE)):
@@ -2364,10 +2355,10 @@ def apply_block_size_mask(
     block_size: Int32,
     n_block_size: cutlass.Constexpr[int] = 128,
 ) -> None:
-    """Apply R2P bitmask masking positions >= block_size within a tile."""
+    """Mask positions >= block_size within a tile using predicate bits."""
     if block_size < n_block_size:
-        mask_r2p_lambda(
+        apply_predicate_mask(
             acc_S,
-            lambda s: r2p_bitmask_below(block_size, s),
+            lambda s: predicate_bitmask_below(block_size, s),
             rank1=True,
         )

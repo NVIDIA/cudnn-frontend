@@ -1,0 +1,86 @@
+name: Bug report
+description: Report incorrect behavior, a regression, crash, or performance problem.
+title: "[Bug]: "
+labels:
+  - cat-bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Search existing issues first. A minimal reproducer and complete environment make investigation much faster.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and did not find a duplicate.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected area
+      options:
+        - C++ frontend API or graph construction
+        - Python API or bindings
+        - FE OSS kernels or CuTeDSL
+        - Build, packaging, or installation
+        - CI or test infrastructure
+        - Documentation or samples
+        - Benchmarks or performance
+        - Not sure
+  - type: textarea
+    id: report
+    attributes:
+      label: Bug report
+      value: |
+        ### Description
+
+        <!-- Clearly describe the problem and its impact. -->
+
+        ### Steps to reproduce
+
+        ### Expected behavior
+
+        <!-- What did you expect to happen? -->
+
+        ### Actual behavior
+
+        <!-- Include the exact error or incorrect result. -->
+
+        ### Environment (where applicable)
+
+        <!-- Python users: run `python -m cudnn.collect_env` and paste its output
+             here instead of filling the fields below. If `import cudnn` fails,
+             download and run the script standalone with any Python:
+             https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/python/cudnn/collect_env.py -->
+
+        cuDNN Frontend Version: 1.27.0
+        cuDNN Backend Version: 9.24.0
+        CUDA Toolkit/Runtime Version: 13.4
+        GPU: B200 (SM100)
+        CUDA driver: 590.XX
+        OS: Ubuntu 24.04
+        Compiler: GCC 13.3
+        Python: 3.12
+        Framework: PyTorch 2.X
+
+        ### Last known working version
+
+        <!-- For regressions, provide the last release or commit where this worked. -->
+
+        ### Relevant logs
+
+        <!-- Paste the smallest relevant excerpt and attach full logs if needed. Redact secrets. -->
+
+        ```shell
+        # Frontend
+        export CUDNN_FRONTEND_LOG_FILE=fe.log
+        export CUDNN_FRONTEND_LOG_INFO=1
+
+        # Backend
+        export CUDNN_LOGLEVEL_DBG=3
+        export CUDNN_LOGDEST_DBG=be.log
+        ```
+    validations:
+      required: true

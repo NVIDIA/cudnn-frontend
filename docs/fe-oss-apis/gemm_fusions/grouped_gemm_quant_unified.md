@@ -239,9 +239,13 @@ Returns `TupleDict`: `d_tensor`, `d_col_tensor` (optional; `None` for `bfloat16`
 - Expert count `<= 1024`; M aligned to 256
 - SM100+ compute capability required
 - `prob_tensor` is unconditionally required
+- `use_single_group_runtime_offsets=True` requires exactly one expert. The
+  kernel derives `padded_offsets[0]` from runtime `A.shape[0]` and does not load
+  its value from device memory; the argument must still be an int32 tensor with
+  shape `(1,)`.
 
 ---
 
 ## Usage Examples
 
-For usage examples, see `test/python/fe_api/test_grouped_gemm_quant.py` + `test/python/fe_api/test_grouped_gemm_quant_utils.py` (dense and discrete unified API coverage)
+For usage examples, see `test/python/fe_api/grouped_gemm/test_grouped_gemm_quant.py` + `test/python/fe_api/grouped_gemm/test_grouped_gemm_quant_utils.py` (dense and discrete unified API coverage)

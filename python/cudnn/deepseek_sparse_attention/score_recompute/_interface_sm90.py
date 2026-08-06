@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Score Recompute Interface (SM90 Cute-DSL wrapper).
 
@@ -383,7 +386,7 @@ def _dense_score_recompute(
         out_cute = to_cute_tensor(out)
         weights_cute = to_cute_tensor(weights_or_lse)
         denom_cute = to_cute_tensor(denom_out)
-        q_offsets_cute = to_cute_tensor(q_causal_offsets, leading_dim=0) if q_causal_offsets is not None else None
+        q_offsets_cute = to_cute_tensor(q_causal_offsets, assumed_align=4, leading_dim=0) if q_causal_offsets is not None else None
 
         kernel_obj = DenseScoreRecomputeSm90(
             dtype,

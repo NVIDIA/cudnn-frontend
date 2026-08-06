@@ -1,4 +1,5 @@
 # Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
+# SPDX-License-Identifier: MIT
 #
 # Adapted from quack-kernels 0.4.1 (Apache-2.0) and kept local so the
 # block-sparse kernels use the same self-contained helper style as the other

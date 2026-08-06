@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """CuTe DSL row-wise compactify for top-K index tensors.
 
 This module provides one index utility: compactify(idxs) packs valid entries

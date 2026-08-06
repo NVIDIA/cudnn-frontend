@@ -1,4 +1,5 @@
 # Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
+# SPDX-License-Identifier: MIT
 # A reimplementation of https://github.com/Dao-AILab/flash-attention/blob/main/hopper/flash_bwd_postprocess_kernel.h
 # from Cutlass C++ to Cute-DSL.
 import math
@@ -241,7 +242,7 @@ class BlockSparseAttnBackwardPostprocess:
                 mdQaccum_cur = cute.domain_offset((padded_offset_q * self.tile_hdim,), mdQaccum[head_idx, None])
                 head_dim = mdQ.shape[2]
 
-                # HACK: Compiler doesn't seem to recognize that padding
+                # NOTE: Compiler doesn't seem to recognize that padding
                 # by padded_offset_q * self.tile_hdim keeps alignment
                 # since statically divisible by 4
 

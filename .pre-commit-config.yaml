@@ -1,3 +1,6 @@
+# Vendored third-party sources are kept byte-for-byte as upstream ships them.
+exclude: '^include/cudnn_frontend/thirdparty/'
+
 repos:
 -   repo: https://github.com/pre-commit/mirrors-clang-format
     rev: v21.1.6
@@ -15,7 +18,7 @@ repos:
         minimum_pre_commit_version: 2.9.2
         require_serial: true
         types_or: [python, pyi]
-        args: ["--line-length", "160"]
+        args: ["--line-length", "160", "--fast"]
     -   id: black-jupyter
         name: black-jupyter
         description:

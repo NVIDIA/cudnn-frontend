@@ -1,0 +1,475 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+
+from typing import NamedTuple
+
+import cutlass
+import cutlass.cute as cute
+from cutlass._mlir.dialects import arith
+
+from cudnn.frost.tile_dsl.scheduler import SCHED_NATURAL
+from cudnn.frost.tile_dsl.mask import MASK_CAUSAL, MASK_PADDED, MASK_SWA
+from cudnn.frost.tile_dsl.barrier import MBarrier, Producer, Scope
+
+
+class Bars(NamedTuple):
+    mb_q_full: object
+    mb_q_empty: object
+    mb_k_full: object
+    mb_k_empty: object
+    mb_v_full: object
+    mb_v_empty: object
+
+    mb_bmm1_done: object
+    mb_bmm2_done: object
+    mb_bmm2_ready: object
+
+    mb_stat_full: object
+    mb_stat_empty: object
+
+    # Per-sub-tile "final stats consumed" gate (correction -> MMA, cross-CTA
+    # to the leader under cga2).  The per-tile (total_max, total_sum) publish
+    # rides the HEAD of the S_acc slot (LAYOUT.STATS_OFF + qs*STATS_STRIDE),
+    # so the NEXT tile's prologue BMM1 — gated only on q_full/k_full —
+    # overwrites it.  The mb_stat_full/mb_stat_empty handshake only orders
+    # softmax vs correction; nothing ordered MMA's next-tile BMM1 after
+    # correction's epilogue stats read (or after softmax's final stats
+    # write).  One arrive per tile per sub-tile from the correction epilogue;
+    # the leader MMA waits it before the prologue BMM1 into that S slot.
+    mb_stats_read: object
+
+    mb_o_full: object
+    mb_o_empty: object
+
+    mb_tmem_dealloc: object
+    mb_empty_mainloop: object
+
+    mb_q_o_alias: object
+
+
+class D256Bars(NamedTuple):
+    mb_q_full: object
+    mb_q_o_alias: object
+    mb_tmastg_go: object
+
+    mb_k_full: object
+    mb_k_empty: object
+    mb_v_full: object
+    mb_v_empty: object
+
+    mb_bmm1_done: object
+    mb_bmm2_done: object
+    mb_bmm2_ready: object
+
+    mb_stat_full: object
+    mb_stat_empty: object
+
+    mb_o_full: object
+    mb_o_empty: object
+
+    mb_empty_mainloop: object
+    mb_tmem_dealloc: object
+
+
+def make_d256_bars(CFG, *, N_O_CHUNKS: int) -> D256Bars:
+    SOFTMAX_LANES_TOTAL = CFG.SOFTMAX_LANES * CFG.CTA_MMA
+    CORR_LANES_TOTAL = CFG.CORR_LANES * CFG.CTA_MMA
+    SOFTMAX_PLUS_CORR_TOTAL = SOFTMAX_LANES_TOTAL + CORR_LANES_TOTAL
+    KV_EMPTY_ARRIVERS = (CFG.CGA_M // CFG.CTA_MMA) + CFG.CGA_N - 1
+    N_BMM2_CHUNKS = CFG.N_BMM2_CHUNKS
+
+    def _alloc(n):
+        return cutlass.Array(cutlass.Int64, n, alignment=16, space=cutlass.AddressSpace.smem)
+
+    return D256Bars(
+        mb_q_full=MBarrier(_alloc(1), stages=1, init_count=CFG.ONE_LANE, producer=Producer.TMA_LOAD),
+        mb_q_o_alias=MBarrier(_alloc(1), stages=1, init_count=CFG.ONE_LANE, producer=Producer.THREAD),
+        mb_tmastg_go=MBarrier(_alloc(1), stages=1, init_count=CFG.ONE_LANE, producer=Producer.THREAD),
+        mb_k_full=MBarrier(_alloc(CFG.STAGES_KV), stages=CFG.STAGES_KV, init_count=CFG.ONE_LANE, producer=Producer.TMA_LOAD),
+        mb_k_empty=MBarrier(_alloc(CFG.STAGES_KV), stages=CFG.STAGES_KV, init_count=KV_EMPTY_ARRIVERS, producer=Producer.MMA_COMMIT),
+        mb_v_full=MBarrier(_alloc(CFG.STAGES_KV), stages=CFG.STAGES_KV, init_count=CFG.ONE_LANE, producer=Producer.TMA_LOAD),
+        mb_v_empty=MBarrier(_alloc(CFG.STAGES_KV), stages=CFG.STAGES_KV, init_count=KV_EMPTY_ARRIVERS, producer=Producer.MMA_COMMIT),
+        mb_bmm1_done=MBarrier(_alloc(2), stages=2, init_count=CFG.ONE_LANE, producer=Producer.MMA_COMMIT),
+        mb_bmm2_done=MBarrier(_alloc(2), stages=2, init_count=CFG.ONE_LANE, producer=Producer.MMA_COMMIT),
+        mb_bmm2_ready=MBarrier(
+            _alloc(2 * N_BMM2_CHUNKS),
+            stages=2 * N_BMM2_CHUNKS,
+            init_count=tuple(SOFTMAX_PLUS_CORR_TOTAL if (s % N_BMM2_CHUNKS) == 0 else SOFTMAX_LANES_TOTAL for s in range(2 * N_BMM2_CHUNKS)),
+            producer=Producer.LEADER,
+            scope=Scope.LEADER,
+        ),
+        mb_stat_full=MBarrier(_alloc(1), stages=1, init_count=CFG.SOFTMAX_LANES, producer=Producer.THREAD),
+        mb_stat_empty=MBarrier(_alloc(1), stages=1, init_count=CFG.CORR_LANES, producer=Producer.THREAD),
+        mb_o_full=MBarrier(_alloc(N_O_CHUNKS), stages=N_O_CHUNKS, init_count=CFG.CORR_LANES, producer=Producer.THREAD),
+        mb_o_empty=MBarrier(_alloc(1), stages=1, init_count=CFG.ONE_WARP, producer=Producer.THREAD),
+        mb_empty_mainloop=MBarrier(_alloc(1), stages=1, init_count=CORR_LANES_TOTAL, producer=Producer.LEADER, scope=Scope.LEADER),
+        mb_tmem_dealloc=MBarrier(_alloc(1), stages=1, init_count=CORR_LANES_TOTAL, producer=Producer.THREAD),
+    )
+
+
+def make_classic_bars(CFG) -> Bars:
+    SOFTMAX_PLUS_CORR_TOTAL = CFG.SOFTMAX_LANES * 2 * CFG.CTA_MMA
+    SOFTMAX_LANES_TOTAL = CFG.SOFTMAX_LANES * CFG.CTA_MMA
+    CORR_LANES_TOTAL = CFG.CORR_LANES * CFG.CTA_MMA
+    KV_EMPTY_ARRIVERS = (CFG.CGA_M // CFG.CTA_MMA) + CFG.CGA_N - 1
+    N_BMM2_CHUNKS = CFG.N_BMM2_CHUNKS
+
+    def _alloc(n):
+        return cutlass.Array(cutlass.Int64, n, alignment=16, space=cutlass.AddressSpace.smem)
+
+    return Bars(
+        mb_q_full=MBarrier(_alloc(CFG.TILES_Q), stages=CFG.TILES_Q, init_count=CFG.ONE_LANE, producer=Producer.TMA_LOAD),
+        mb_k_full=MBarrier(_alloc(CFG.STAGES_KV), stages=CFG.STAGES_KV, init_count=CFG.ONE_LANE, producer=Producer.TMA_LOAD),
+        mb_v_full=MBarrier(_alloc(CFG.STAGES_KV), stages=CFG.STAGES_KV, init_count=CFG.ONE_LANE, producer=Producer.TMA_LOAD),
+        mb_q_empty=MBarrier(_alloc(CFG.TILES_Q), stages=CFG.TILES_Q, init_count=CFG.ONE_LANE, producer=Producer.MMA_COMMIT),
+        mb_k_empty=MBarrier(_alloc(CFG.STAGES_KV), stages=CFG.STAGES_KV, init_count=KV_EMPTY_ARRIVERS, producer=Producer.MMA_COMMIT),
+        mb_v_empty=MBarrier(_alloc(CFG.STAGES_KV), stages=CFG.STAGES_KV, init_count=KV_EMPTY_ARRIVERS, producer=Producer.MMA_COMMIT),
+        mb_bmm1_done=MBarrier(_alloc(CFG.TILES_Q), stages=CFG.TILES_Q, init_count=CFG.ONE_LANE, producer=Producer.MMA_COMMIT),
+        mb_bmm2_done=MBarrier(_alloc(CFG.TILES_Q), stages=CFG.TILES_Q, init_count=CFG.ONE_LANE, producer=Producer.MMA_COMMIT),
+        mb_bmm2_ready=MBarrier(
+            _alloc(CFG.TILES_Q * N_BMM2_CHUNKS),
+            stages=CFG.TILES_Q * N_BMM2_CHUNKS,
+            init_count=tuple(SOFTMAX_PLUS_CORR_TOTAL if (s % N_BMM2_CHUNKS) == 0 else SOFTMAX_LANES_TOTAL for s in range(CFG.TILES_Q * N_BMM2_CHUNKS)),
+            producer=Producer.LEADER,
+            scope=Scope.LEADER,
+        ),
+        mb_stat_full=MBarrier(_alloc(CFG.TILES_Q), stages=CFG.TILES_Q, init_count=CFG.SOFTMAX_LANES, producer=Producer.THREAD),
+        mb_stat_empty=MBarrier(_alloc(CFG.TILES_Q), stages=CFG.TILES_Q, init_count=CFG.CORR_LANES, producer=Producer.THREAD),
+        mb_stats_read=MBarrier(_alloc(CFG.TILES_Q), stages=CFG.TILES_Q, init_count=CORR_LANES_TOTAL, producer=Producer.LEADER, scope=Scope.LEADER),
+        mb_o_full=MBarrier(_alloc(CFG.TILES_Q), stages=CFG.TILES_Q, init_count=CFG.CORR_LANES, producer=Producer.THREAD),
+        mb_o_empty=MBarrier(_alloc(CFG.TILES_Q), stages=CFG.TILES_Q, init_count=CFG.ONE_WARP, producer=Producer.THREAD),
+        mb_tmem_dealloc=MBarrier(_alloc(1), stages=1, init_count=CORR_LANES_TOTAL, producer=Producer.THREAD),
+        mb_empty_mainloop=MBarrier(_alloc(1), stages=1, init_count=CORR_LANES_TOTAL, producer=Producer.LEADER, scope=Scope.LEADER),
+        mb_q_o_alias=MBarrier(_alloc(CFG.TILES_Q), stages=CFG.TILES_Q, init_count=CFG.ONE_WARP, producer=Producer.THREAD),
+    )
+
+
+class KvLoopBounds(NamedTuple):
+    left: object
+    unmasked_lo: object
+    unmasked_hi: object
+    right: object
+
+
+def _div_up(a, b):
+    return (a + cutlass.Int32(b - 1)) // cutlass.Int32(b)
+
+
+def row_max_for_exp2(total_max):
+    """Canonical masked-softmax row-max guard (FlashAttention / cuDNN form).
+
+    The f16 prefill kernels mask scores with true ``-inf``
+    (``apply_mask_chunk(..., mask_value=float("-inf"))``) and start the running
+    ``total_max`` at ``-inf``, so for a row that has not yet seen a live column
+    the (scaled) row max is still exactly ``-inf``. Using it directly would
+    make every masked exp2 argument ``-inf - (-inf) == NaN`` (or, with the old
+    finite sentinel, ``0`` and hence a bogus P == 1 per masked column). The
+    canonical fix — FlashAttention's ``max == -INFINITY ? 0.f : max * scale``
+    and cuDNN's ``(total_max == NEG_INFINITY) ? 0.0f : total_max`` — is a
+    single compare + select substituting 0 AT THE POINT OF USE:
+
+      * masked scores become ``exp2(-inf - 0) == 0``, so a fully-masked
+        iteration ships P == 0 to BMM2 and contributes nothing;
+      * a fully-masked row naturally ends the tile with ``total_sum == 0``,
+        which the epilogue turns into O := 0 / LSE := -inf;
+      * substituted into BOTH alpha operands, any iteration that does not move
+        the max (fully-masked ones included, since ``-inf`` can never clear
+        the RESCALE_THRESHOLD update) yields alpha == exp2(0 - 0) == 1
+        exactly, so the all_alpha_one ballot keeps firing.
+
+    Callers clamp the alpha exponent with ``min(prev_safe - new_safe, 0)`` so
+    the one transition that can lower the safe max (dead -> alive, 0 ->
+    real*scale < 0) cannot overflow exp2; total_sum is still exactly 0 there,
+    so any finite alpha is exact.
+    """
+    still_dead = total_max == cutlass.Float32(float("-inf"))
+    return cutlass.Float32(
+        arith.select(
+            still_dead.ir_value(),
+            cutlass.Float32(0.0).ir_value(),
+            total_max.ir_value(),
+        )
+    )
+
+
+def assert_tile_n_supported(CFG):
+    """Import-time gate: kernels on the ``reg_S_a``/``reg_S_b`` softmax body
+    require N_BMM2_CHUNKS == 2 (TILE_N == 128)."""
+    if CFG.N_BMM2_CHUNKS != 2:
+        raise NotImplementedError(f"this kernel currently requires TILE_N=128 (got TILE_N={CFG.TILE_N})")
+
+
+def compute_kv_loop_bounds(
+    q_row_coord,
+    seqlen_q,
+    seq_kv_len,
+    swa_window: int,
+    mask_flags: int,
+    tile_n: int,
+    cga_tile_m: int,
+    causal_bottom_right: bool = False,
+) -> KvLoopBounds:
+    left = cutlass.Int32(0)
+    right = _div_up(seq_kv_len, tile_n)
+
+    if cutlass.const_expr(causal_bottom_right):
+        causal_diag = seq_kv_len - seqlen_q
+    else:
+        causal_diag = cutlass.Int32(0)
+
+    if cutlass.const_expr(mask_flags & MASK_CAUSAL):
+        kv_hi_caus = _div_up(q_row_coord + cutlass.Int32(cga_tile_m) + causal_diag, tile_n)
+        right = cute.math.min(right, kv_hi_caus)
+
+    if cutlass.const_expr(mask_flags & MASK_SWA):
+        cond = q_row_coord > cutlass.Int32(swa_window)
+        delta = q_row_coord - cutlass.Int32(swa_window)
+        kv_lo_swa = cutlass.Int32(
+            arith.select(
+                cond.ir_value(),
+                (delta // cutlass.Int32(tile_n)).ir_value(),
+                cutlass.Int32(0).ir_value(),
+            )
+        )
+        left = cute.math.max(left, kv_lo_swa)
+
+    unmasked_hi = right
+    if cutlass.const_expr(mask_flags & MASK_PADDED):
+        unaligned = (seq_kv_len % cutlass.Int32(tile_n)) != cutlass.Int32(0)
+        lo_pad = cutlass.Int32(
+            arith.select(
+                unaligned.ir_value(),
+                (right - cutlass.Int32(1)).ir_value(),
+                right.ir_value(),
+            )
+        )
+        unmasked_hi = cute.math.min(unmasked_hi, lo_pad)
+    if cutlass.const_expr(mask_flags & MASK_CAUSAL):
+        lo_caus = (q_row_coord + causal_diag) // cutlass.Int32(tile_n)
+        unmasked_hi = cute.math.min(unmasked_hi, lo_caus)
+    unmasked_hi = cute.math.max(unmasked_hi, left)
+
+    unmasked_lo = left
+    if cutlass.const_expr(mask_flags & MASK_SWA):
+        anchor = q_row_coord + cutlass.Int32(cga_tile_m - 1 - swa_window)
+        swa_unmasked_lo = _div_up(anchor, tile_n)
+        cond = anchor > cutlass.Int32(0)
+        swa_unmasked_lo = cutlass.Int32(
+            arith.select(
+                cond.ir_value(),
+                swa_unmasked_lo.ir_value(),
+                cutlass.Int32(0).ir_value(),
+            )
+        )
+        unmasked_lo = cute.math.max(unmasked_lo, swa_unmasked_lo)
+
+    unmasked_lo = cute.math.min(unmasked_lo, unmasked_hi)
+
+    return KvLoopBounds(
+        left=left,
+        unmasked_lo=unmasked_lo,
+        unmasked_hi=unmasked_hi,
+        right=right,
+    )
+
+
+@cute.jit
+def decode_linear_tile_lpt(linear, q_h, batch, q_tiles):
+    hb = q_h * batch
+    row_rank = linear // hb
+    within = linear % hb
+    row = (q_tiles - cutlass.Int32(1)) - row_rank
+    head = within % q_h
+    batch_idx = within // q_h
+    return row, head, batch_idx
+
+
+class SdpaHelpers(NamedTuple):
+    decode_initial: object
+    decode_payload: object
+    bounds_for_tile: object
+    bounds_for_tile_qtrim: object
+    resolve_seqlen_kv: object
+    thd_decode: object
+    dispatch_decode_initial: object
+    dispatch_decode_payload: object
+    thd_tma_offsets: object
+    thd_sf_tile_bases: object
+
+
+def make_sdpa_helpers(CFG, lpt_q_tiles_in_cga_units: bool = False) -> SdpaHelpers:
+    cga_tile_m = CFG.TILES_Q * CFG.TILE_M * CFG.CTA_MMA
+
+    if CFG.SCHEDULER_POLICY == SCHED_NATURAL:
+        if CFG.SPLIT_PIPELINE == 1:
+
+            @cute.jit
+            def _decode_initial(bidx, bidy, bidz, cta_in_pair, n_q_supers, n_qh, n_batch):
+                blocked_row = (bidx // cutlass.Int32(CFG.CGA_M)) * cutlass.Int32(CFG.CTA_MMA) + cta_in_pair
+                return blocked_row, bidy, bidz
+
+            @cute.jit
+            def _decode_payload(t0, t1, cta_in_pair, n_q_supers, n_qh, n_batch):
+                blocked_row = (t0 // cutlass.Int32(CFG.CGA_M)) * cutlass.Int32(CFG.CTA_MMA) + cta_in_pair
+                head = t1 & cutlass.Int32(0xFFFF)
+                batch = (t1 >> cutlass.Int32(16)) & cutlass.Int32(0xFFFF)
+                return blocked_row, head, batch
+
+        else:
+
+            @cute.jit
+            def _decode_initial(bidx, bidy, bidz, cta_in_pair, n_q_supers, n_qh, n_batch):
+                return bidx, bidy, bidz
+
+            @cute.jit
+            def _decode_payload(t0, t1, cta_in_pair, n_q_supers, n_qh, n_batch):
+                head = t1 & cutlass.Int32(0xFFFF)
+                batch = (t1 >> cutlass.Int32(16)) & cutlass.Int32(0xFFFF)
+                return t0 + cta_in_pair, head, batch
+
+    else:
+
+        @cute.jit
+        def _decode_initial(bidx, bidy, bidz, cta_in_pair, n_q_supers, n_qh, n_batch):
+            linear = bidx // cutlass.Int32(CFG.CGA_M)
+            q_tiles = n_q_supers // cutlass.Int32(CFG.CTA_MMA) if lpt_q_tiles_in_cga_units else n_q_supers
+            row, head, batch = decode_linear_tile_lpt(linear, n_qh, n_batch, q_tiles)
+            return row * cutlass.Int32(CFG.CTA_MMA) + cta_in_pair, head, batch
+
+        @cute.jit
+        def _decode_payload(t0, t1, cta_in_pair, n_q_supers, n_qh, n_batch):
+            linear = t0 // cutlass.Int32(CFG.CGA_M)
+            q_tiles = n_q_supers // cutlass.Int32(CFG.CTA_MMA) if lpt_q_tiles_in_cga_units else n_q_supers
+            row, head, batch = decode_linear_tile_lpt(linear, n_qh, n_batch, q_tiles)
+            return row * cutlass.Int32(CFG.CTA_MMA) + cta_in_pair, head, batch
+
+    @cute.jit
+    def _bounds_for_tile(q_super_idx, seqlen_q, seqlen_kv, cta_in_pair):
+        cga_base_super = q_super_idx - cta_in_pair
+        q_row_coord = cga_base_super * cutlass.Int32(CFG.TILES_Q * CFG.TILE_M)
+        return compute_kv_loop_bounds(
+            q_row_coord,
+            seqlen_q,
+            seqlen_kv,
+            CFG.SWA_WINDOW,
+            CFG.MASK_FLAGS,
+            CFG.TILE_N,
+            cga_tile_m,
+            causal_bottom_right=bool(CFG.CAUSAL_BOTTOM_RIGHT),
+        )
+
+    @cute.jit
+    def _bounds_for_tile_qtrim(q_super_idx, seqlen_q, seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx):
+        """bounds_for_tile + cuDNN-style dead-Q-tile KV-loop collapse.
+
+        Mirrors cuDNN fort (mma_pipeline_op_native_sdpa_prefill_sm100_nonfp8
+        .cpp:916-921): when the CGA tile's base Q row is at/past this batch's
+        actual Q length (SEQ_Q_LENS_PRESENT dense padded-Q trim; q lens are
+        the SEPARATE (B,)-int32 ``seq_q_lens_tensor`` kernel parameter — cuDNN
+        SEQLEN_Q / FA seqused_q style — ``None`` unless the flag is set, so
+        the read below folds out with the branch), collapse the KV loop to
+        empty (right := left, matching the SWA empty-tile machinery) — the
+        grid stays padded-sized and a dead tile costs prologue+epilogue only.
+        q_len_b == 0 (whole batch dead) collapses every tile since the base
+        row coord is always >= 0.  The row coord is the SAME cga-base value
+        _bounds_for_tile uses, and q lens are per-batch constants, so every
+        warp group calling this helper sees identical (collapsed) bounds and
+        the barrier handshakes stay in lockstep.  The epilogue's
+        SEQ_Q_LENS_PRESENT trim (applied after the sink fold) already forces
+        O := 0 / LSE := -inf for every row of a collapsed tile.
+        """
+        b = _bounds_for_tile(q_super_idx, seqlen_q, seqlen_kv, cta_in_pair)
+        if cutlass.const_expr(int(getattr(CFG, "SEQ_Q_LENS_PRESENT", 0)) == 1):
+            cga_base_super = q_super_idx - cta_in_pair
+            q_row_coord = cga_base_super * cutlass.Int32(CFG.TILES_Q * CFG.TILE_M)
+            arr = cutlass.make_array_view(seq_q_lens_tensor)
+            q_len_b = cutlass.Int32(arr[batch_idx])
+            tile_dead = q_row_coord >= q_len_b
+            dead_lo = cutlass.Int32(arith.select(tile_dead.ir_value(), b.left.ir_value(), b.unmasked_lo.ir_value()))
+            dead_hi = cutlass.Int32(arith.select(tile_dead.ir_value(), b.left.ir_value(), b.unmasked_hi.ir_value()))
+            dead_right = cutlass.Int32(arith.select(tile_dead.ir_value(), b.left.ir_value(), b.right.ir_value()))
+            return KvLoopBounds(left=b.left, unmasked_lo=dead_lo, unmasked_hi=dead_hi, right=dead_right)
+        return b
+
+    @cute.jit
+    def _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, scalar_seqlen_kv):
+        if cutlass.const_expr(CFG.SEQ_KV_LENS_PRESENT == 1):
+            arr = cutlass.make_array_view(seq_kv_lens_tensor)
+            return cutlass.Int32(arr[batch_idx])
+        return scalar_seqlen_kv
+
+    _thd_on = int(getattr(CFG, "THD_VARLEN", 0))
+
+    @cute.jit
+    def _thd_decode(linear_cta, seq_kv_lens_t, n_batch, n_qh, cta_in_pair):
+        u = linear_cta // cutlass.Int32(CFG.CGA_M)
+        cu = cutlass.make_array_view(seq_kv_lens_t)
+        cuq0 = n_batch
+        acc = cutlass.Int32(0)
+        f_batch = cutlass.Int32(0)
+        f_head = cutlass.Int32(0)
+        f_qc = cutlass.Int32(0)
+        done = cutlass.Int32(0)
+        for b in cutlass.range(0, n_batch, 1, unroll=1):
+            s_i = cutlass.Int32(cu[cuq0 + b + cutlass.Int32(1)]) - cutlass.Int32(cu[cuq0 + b])
+            cb = (s_i + cutlass.Int32(cga_tile_m - 1)) // cutlass.Int32(cga_tile_m)
+            units_b = cb * n_qh
+            in_rng = (done == cutlass.Int32(0)) & (u < acc + units_b)
+            local = u - acc
+            f_batch = cutlass.Int32(arith.select(in_rng.ir_value(), b.ir_value(), f_batch.ir_value()))
+            f_head = cutlass.Int32(arith.select(in_rng.ir_value(), (local // cb).ir_value(), f_head.ir_value()))
+            f_qc = cutlass.Int32(arith.select(in_rng.ir_value(), (local % cb).ir_value(), f_qc.ir_value()))
+            done = cutlass.Int32(arith.select(in_rng.ir_value(), cutlass.Int32(1).ir_value(), done.ir_value()))
+            acc = acc + units_b
+        q_super = f_qc * cutlass.Int32(CFG.CTA_MMA) + cta_in_pair
+        return q_super, f_head, f_batch
+
+    @cute.jit
+    def _dispatch_decode_initial(bidx, bidy, bidz, cta_in_pair, n_q_supers, n_qh, n_batch, seq_kv_lens_t):
+        if cutlass.const_expr(_thd_on):
+            return _thd_decode(bidx, seq_kv_lens_t, n_batch, n_qh, cta_in_pair)
+        return _decode_initial(bidx, bidy, bidz, cta_in_pair, n_q_supers, n_qh, n_batch)
+
+    @cute.jit
+    def _dispatch_decode_payload(t0, t1, cta_in_pair, n_q_supers, n_qh, n_batch, seq_kv_lens_t):
+        if cutlass.const_expr(_thd_on):
+            return _thd_decode(t0, seq_kv_lens_t, n_batch, n_qh, cta_in_pair)
+        return _decode_payload(t0, t1, cta_in_pair, n_q_supers, n_qh, n_batch)
+
+    @cute.jit
+    def _thd_tma_offsets(seq_kv_lens_t, batch_idx, n_batch):
+        if cutlass.const_expr(_thd_on):
+            cu = cutlass.make_array_view(seq_kv_lens_t)
+            q_off = cutlass.Int32(cu[n_batch + batch_idx])
+            kv_off = cutlass.Int32(cu[cutlass.Int32(2) * n_batch + cutlass.Int32(1) + batch_idx])
+            return q_off, kv_off, cutlass.Int32(0)
+        return cutlass.Int32(0), cutlass.Int32(0), batch_idx
+
+    @cute.jit
+    def _thd_sf_tile_bases(seq_kv_lens_t, batch_idx, n_batch):
+        if cutlass.const_expr(_thd_on):
+            cu = cutlass.make_array_view(seq_kv_lens_t)
+            q0 = n_batch
+            k0 = cutlass.Int32(2) * n_batch + cutlass.Int32(1)
+            sfq = cutlass.Int32(0)
+            sfk = cutlass.Int32(0)
+            for b in cutlass.range(0, batch_idx, 1, unroll=1):
+                s_q = cutlass.Int32(cu[q0 + b + cutlass.Int32(1)]) - cutlass.Int32(cu[q0 + b])
+                s_kv = cutlass.Int32(cu[k0 + b + cutlass.Int32(1)]) - cutlass.Int32(cu[k0 + b])
+                sfq = sfq + (s_q + cutlass.Int32(CFG.TILE_M - 1)) // cutlass.Int32(CFG.TILE_M)
+                sfk = sfk + (s_kv + cutlass.Int32(CFG.TILE_N - 1)) // cutlass.Int32(CFG.TILE_N)
+            return cute.arch.make_warp_uniform(sfq), cute.arch.make_warp_uniform(sfk)
+        return cutlass.Int32(0), cutlass.Int32(0)
+
+    return SdpaHelpers(
+        decode_initial=_decode_initial,
+        decode_payload=_decode_payload,
+        bounds_for_tile=_bounds_for_tile,
+        bounds_for_tile_qtrim=_bounds_for_tile_qtrim,
+        resolve_seqlen_kv=_resolve_seqlen_kv,
+        thd_decode=_thd_decode,
+        dispatch_decode_initial=_dispatch_decode_initial,
+        dispatch_decode_payload=_dispatch_decode_payload,
+        thd_tma_offsets=_thd_tma_offsets,
+        thd_sf_tile_bases=_thd_sf_tile_bases,
+    )

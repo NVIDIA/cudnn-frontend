@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+
 # target sources
 add_executable(
     samples
@@ -74,6 +77,8 @@ add_executable(
     membound/boolean_fusion.cpp
 
     causal_conv1d/causal_conv1d.cpp
+    causal_conv1d/causal_conv1d_nwh.cpp
+    causal_conv1d/b2b_causal_conv1d.cpp
 )
 
 # target flags

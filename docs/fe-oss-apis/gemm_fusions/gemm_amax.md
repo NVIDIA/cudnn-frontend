@@ -204,4 +204,4 @@ Tuple unpacking order is: `(c_tensor, amax_tensor)`.
 
 ## Usage examples
 
-For usage examples, see test cases in `test/python/fe_api/test_gemm_amax.py`
+For usage examples, see test cases in `test/python/fe_api/gemm/test_gemm_amax.py`

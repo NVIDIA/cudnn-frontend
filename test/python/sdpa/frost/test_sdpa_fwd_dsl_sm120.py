@@ -1,0 +1,844 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+
+"""End-to-end tests for the FROST SM120 DSL SDPA-forward engine against a torch reference."""
+
+from __future__ import annotations
+
+import math
+
+import pytest
+import torch
+
+from test_utils import torch_fork_set_rng
+
+
+def _is_sm120() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    major, minor = torch.cuda.get_device_capability(torch.cuda.current_device())
+    return (major, minor) in {(12, 0), (12, 1)}
+
+
+def _dsl_deps_available() -> bool:
+    try:
+        import cutlass  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+pytestmark = pytest.mark.skipif(
+    not _is_sm120(),
+    reason="SM120 DSL SDPA engine requires an SM120 or SM121 device.",
+)
+
+
+def _require_dsl() -> None:
+    try:
+        import cudnn  # noqa: F401
+        import cudnn.sdpa  # noqa: F401
+    except ImportError as exc:
+        pytest.skip(f"SM120 DSL engine not available: {exc}")
+    if not _dsl_deps_available():
+        pytest.skip("cutlass/dsl not installed")
+
+
+def _select_engine(graph, name):
+    """Pin the ranked entry named ``name`` (graph.plans holds the backend's
+    plans and the python engines' in one list). A pin is strict: check_support /
+    build_plans raise if that engine declines the graph."""
+    names = [graph.get_plan_name_at_index(i) for i in range(len(graph.plans))]
+    assert name in names, f"engine {name!r} did not claim this graph; plans={names}"
+    graph.select_plan(names.index(name))
+    return graph
+
+
+def _bhsd(
+    batch: int,
+    heads: int,
+    sequence: int,
+    head_dim: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Return logical BHSD backed by compact BSHD physical storage."""
+
+    return torch.randn(
+        batch,
+        sequence,
+        heads,
+        head_dim,
+        dtype=dtype,
+        device="cuda",
+    ).transpose(1, 2)
+
+
+def _padded_bhsd(
+    batch: int,
+    heads: int,
+    sequence: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    *,
+    head_padding: int,
+    sequence_padding: int,
+    batch_padding: int,
+    storage_offset: int = 0,
+) -> torch.Tensor:
+    """Return logical BHSD with independent padding between storage axes."""
+
+    head_stride = head_dim + head_padding
+    sequence_stride = heads * head_stride + sequence_padding
+    batch_stride = sequence * sequence_stride + batch_padding
+    shape = (batch, heads, sequence, head_dim)
+    stride = (batch_stride, head_stride, sequence_stride, 1)
+    storage_size = 1 + sum((size - 1) * axis_stride for size, axis_stride in zip(shape, stride))
+    storage = torch.empty(storage_size + storage_offset, dtype=dtype, device="cuda")
+    tensor = storage.as_strided(shape, stride, storage_offset=storage_offset)
+    tensor.normal_()
+    return tensor
+
+
+def _ref_sdpa_full(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    scale: float,
+    is_causal: bool = False,
+    causal_bottom_right: bool = False,
+    window_size_left: int | None = None,
+    seq_q_lens: torch.Tensor | None = None,
+    seq_kv_lens: torch.Tensor | None = None,
+    sinks: torch.Tensor | None = None,
+    return_stats: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """fp32 reference matching the SM120 DSL kernel's mask semantics.
+    q/k/v are BHSD; GQA (h_q > h_kv) is handled by expanding K/V. ``sinks``
+    is one logit per Q head, joining the softmax as a virtual column with no
+    V row.
+    """
+
+    b, h_q, s_q, _ = q.shape
+    _, h_kv, s_kv, _ = v.shape
+    dev = q.device
+    g = h_q // h_kv
+    k_ref = k.repeat_interleave(g, dim=1).float()
+    v_ref = v.repeat_interleave(g, dim=1).float()
+    scores = torch.matmul(q.float(), k_ref.transpose(-1, -2)) * scale
+
+    q_lens = seq_q_lens.flatten().to(torch.int64) if seq_q_lens is not None else torch.full((b,), s_q, dtype=torch.int64, device=dev)
+    kv_lens = seq_kv_lens.flatten().to(torch.int64) if seq_kv_lens is not None else torch.full((b,), s_kv, dtype=torch.int64, device=dev)
+    i = torch.arange(s_q, device=dev).view(1, 1, s_q, 1)
+    j = torch.arange(s_kv, device=dev).view(1, 1, 1, s_kv)
+    lim = i + (kv_lens - q_lens).view(b, 1, 1, 1) if causal_bottom_right else i
+    masked = (i >= q_lens.view(b, 1, 1, 1)) | (j >= kv_lens.view(b, 1, 1, 1))
+    if is_causal:
+        masked = masked | (j > lim)
+    if window_size_left is not None:
+        masked = masked | (j < lim - window_size_left)
+    scores = scores.masked_fill(masked, float("-inf"))
+
+    if sinks is not None:
+        sink_col = sinks.flatten().float().view(1, h_q, 1, 1).expand(b, h_q, s_q, 1)
+        scores = torch.cat([scores, sink_col], dim=-1)
+    probs = torch.softmax(scores, dim=-1).nan_to_num(0.0)[..., :s_kv]  # sink mass has no V row
+    o = torch.matmul(probs, v_ref)
+    if not return_stats:
+        return o
+    lse = torch.logsumexp(scores, dim=-1)  # fully-masked rows -> -inf (sink-less)
+    # Rows at/past seq_len_q[b] trim to -inf even with a sink.
+    lse = lse.masked_fill((i >= q_lens.view(b, 1, 1, 1)).squeeze(-1), float("-inf"))
+    return o, lse
+
+
+def _run_case(
+    *,
+    batch: int = 1,
+    h_q: int = 4,
+    h_kv: int = 4,
+    s_q: int = 128,
+    s_kv: int = 128,
+    head_dim: int = 128,
+    dtype: torch.dtype = torch.float16,
+    q_tile: int | None = None,
+    kv_tile: int | None = None,
+    is_causal: bool = False,
+    causal_bottom_right: bool = False,
+    window_size_left: int | None = None,
+    seq_q_lens: torch.Tensor | None = None,
+    seq_kv_lens: torch.Tensor | None = None,
+    scale: float | None = None,
+    with_sink: bool = False,
+    check_stats: bool = False,
+) -> None:
+    q = _bhsd(batch, h_q, s_q, head_dim, dtype)
+    k = _bhsd(batch, h_kv, s_kv, head_dim, dtype)
+    v = _bhsd(batch, h_kv, s_kv, head_dim, dtype)
+    scale = 1.0 / math.sqrt(head_dim) if scale is None else scale
+    sinks = torch.randn(1, h_q, 1, 1, dtype=torch.float32, device="cuda") if with_sink else None
+    mask_kwargs = dict(
+        is_causal=is_causal,
+        causal_bottom_right=causal_bottom_right,
+        window_size_left=window_size_left,
+        seq_q_lens=seq_q_lens,
+        seq_kv_lens=seq_kv_lens,
+        sinks=sinks,
+    )
+    result = _run_dsl_graph(
+        q,
+        k,
+        v,
+        q_tile=q_tile,
+        kv_tile=kv_tile,
+        scale=scale,
+        return_stats=check_stats,
+        **mask_kwargs,
+    )
+    if check_stats:
+        output, stats = result
+        expected, expected_lse = _ref_sdpa_full(q, k, v, scale=scale, return_stats=True, **mask_kwargs)
+        torch.testing.assert_close(stats.squeeze(-1), expected_lse, atol=2e-2, rtol=2e-2)
+    else:
+        output = result
+        expected = _ref_sdpa_full(q, k, v, scale=scale, **mask_kwargs)
+    torch.testing.assert_close(output.float(), expected, atol=0.1, rtol=5e-2)
+
+
+def _run_dsl_graph(
+    q_gpu: torch.Tensor,
+    k_gpu: torch.Tensor,
+    v_gpu: torch.Tensor,
+    *,
+    scale: float,
+    o_gpu: torch.Tensor | None = None,
+    is_causal: bool = False,
+    causal_bottom_right: bool = False,
+    window_size_left: int | None = None,
+    seq_q_lens: torch.Tensor | None = None,
+    seq_kv_lens: torch.Tensor | None = None,
+    sinks: torch.Tensor | None = None,
+    q_tile: int | None = None,
+    kv_tile: int | None = None,
+    return_stats: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Build, select, and execute the SM120 FROST graph engine.
+
+    Returns O, or ``(O, stats)`` with a ``(B, H, Sq, 1)`` fp32 stats tensor
+    when ``return_stats`` is set. ``sinks`` is a ``(1, H, 1, 1)`` fp32
+    per-Q-head sink-logit tensor.
+    """
+
+    _require_dsl()
+    import cudnn
+
+    from cudnn.sdpa.fwd.engines import engine_name
+
+    dtype = q_gpu.dtype
+    io_dtype = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
+    if o_gpu is None:
+        batch, heads, sequence, head_dim = q_gpu.shape
+        o_gpu = torch.empty(batch, sequence, heads, head_dim, dtype=dtype, device="cuda").transpose(1, 2)
+
+    graph = cudnn.pygraph(
+        io_data_type=io_dtype,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+    )
+    q = graph.tensor_like(q_gpu, name="q")
+    k = graph.tensor_like(k_gpu, name="k")
+    v = graph.tensor_like(v_gpu, name="v")
+    sdpa_kwargs = {
+        "name": "sdpa",
+        "q": q,
+        "k": k,
+        "v": v,
+        "generate_stats": return_stats,
+        "attn_scale": scale,
+    }
+    variant_pack = {q: q_gpu, k: k_gpu, v: v_gpu}
+
+    if causal_bottom_right:
+        sdpa_kwargs["use_causal_mask_bottom_right"] = True
+    elif is_causal:
+        sdpa_kwargs["use_causal_mask"] = True
+    if window_size_left is not None:
+        sdpa_kwargs["sliding_window_length"] = window_size_left + 1
+    if seq_q_lens is not None or seq_kv_lens is not None:
+        assert seq_q_lens is not None and seq_kv_lens is not None
+        seq_q = graph.tensor_like(seq_q_lens, name="seq_q")
+        seq_kv = graph.tensor_like(seq_kv_lens, name="seq_kv")
+        sdpa_kwargs.update(
+            use_padding_mask=True,
+            seq_len_q=seq_q,
+            seq_len_kv=seq_kv,
+        )
+        variant_pack.update({seq_q: seq_q_lens, seq_kv: seq_kv_lens})
+    if sinks is not None:
+        sink_t = graph.tensor_like(sinks, name="sink")
+        sdpa_kwargs["sink_token"] = sink_t
+        variant_pack[sink_t] = sinks
+
+    o, stats = graph.sdpa(**sdpa_kwargs)
+    o.set_output(True).set_dim(o_gpu.shape).set_stride(o_gpu.stride())
+    batch, heads, sequence, _ = q_gpu.shape
+    stats_gpu = None
+    if return_stats:
+        assert stats is not None
+        stats_gpu = torch.empty(batch, heads, sequence, 1, dtype=torch.float32, device="cuda")
+        stats.set_output(True).set_dim(stats_gpu.shape).set_stride(stats_gpu.stride())
+        stats.set_data_type(cudnn.data_type.FLOAT)
+        variant_pack[stats] = stats_gpu
+    if q_tile is not None or kv_tile is not None:
+        pytest.skip(
+            "graph.set_engine_knobs() was removed with the monkey-patch dispatch layer and has no replacement in "
+            "this MR: knobs now ride on the plan (engines.base.PlanConfig.knobs), one ranked entry per knob set, "
+            "picked with select_plan(). Re-enable once the SDPA fwd family proposes its tile domain as plans."
+        )
+
+    graph.validate()
+    graph.build_operation_graph()
+    graph.create_execution_plans([cudnn.heur_mode.A])
+    _select_engine(graph, engine_name(arch="sm120"))
+    graph.check_support()
+    graph.build_plans()
+    lse_bytes = batch * heads * sequence * 4
+    expected_workspace = 0 if return_stats else (lse_bytes + 127) // 128 * 128
+    assert graph.get_workspace_size() == expected_workspace
+
+    variant_pack[o] = o_gpu
+    graph.execute(
+        variant_pack,
+        torch.empty(max(expected_workspace, 1), dtype=torch.uint8, device="cuda"),
+    )
+    torch.cuda.synchronize()
+    if return_stats:
+        return o_gpu, stats_gpu
+    return o_gpu
+
+
+def _pack_thd(seqs: list[torch.Tensor], s_max: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pack per-sequence ``(1, H, L_i, D)`` tensors into THD storage.
+
+    Returns ``(dense_view, storage, ragged_offset)``: the ``(B, H, S_max, D)``
+    packed-stride view over dense-sized storage whose first ``T*H*D`` elements
+    hold the packed tokens, the raw storage, and the ``(B+1, 1, 1, 1)`` int64
+    element-unit offsets (``cu_tokens * H * D``).
+    """
+
+    b, h, d = len(seqs), seqs[0].shape[1], seqs[0].shape[3]
+    cu = [0]
+    for s in seqs:
+        cu.append(cu[-1] + s.shape[2])
+    storage = torch.zeros(b * s_max * h * d, dtype=seqs[0].dtype, device="cuda")
+    packed = storage[: cu[-1] * h * d].view(max(cu[-1], 1), h, d)
+    for i, s in enumerate(seqs):
+        packed[cu[i] : cu[i + 1]].copy_(s[0].permute(1, 0, 2))
+    view = storage.as_strided((b, h, s_max, d), (s_max * h * d, d, h * d, 1))
+    ro = (torch.tensor(cu, dtype=torch.int64, device="cuda") * h * d).view(b + 1, 1, 1, 1)
+    return view, storage, ro
+
+
+def _run_thd_case(
+    *,
+    seq_q_lens: list[int],
+    seq_kv_lens: list[int],
+    h_q: int = 8,
+    h_kv: int = 8,
+    head_dim: int = 64,
+    dtype: torch.dtype = torch.float16,
+    is_causal: bool = False,
+    causal_bottom_right: bool = False,
+    window_size_left: int | None = None,
+    with_sink: bool = False,
+) -> None:
+    """Run a THD (ragged) graph on the SM120 engine vs per-sequence references."""
+
+    _require_dsl()
+    import cudnn
+
+    from cudnn.sdpa.fwd.engines import engine_name
+
+    batch = len(seq_q_lens)
+    s_q_max = max(max(seq_q_lens), 1)
+    s_kv_max = max(max(seq_kv_lens), 1)
+    scale = 1.0 / math.sqrt(head_dim)
+    q_seqs = [_bhsd(1, h_q, max(n, 1), head_dim, dtype)[:, :, :n] for n in seq_q_lens]
+    k_seqs = [_bhsd(1, h_kv, max(n, 1), head_dim, dtype)[:, :, :n] for n in seq_kv_lens]
+    v_seqs = [_bhsd(1, h_kv, max(n, 1), head_dim, dtype)[:, :, :n] for n in seq_kv_lens]
+    q_view, _, q_ro = _pack_thd([s.contiguous() for s in q_seqs], s_q_max)
+    k_view, _, k_ro = _pack_thd([s.contiguous() for s in k_seqs], s_kv_max)
+    v_view, _, v_ro = _pack_thd([s.contiguous() for s in v_seqs], s_kv_max)
+    o_view, o_storage, o_ro = _pack_thd([torch.zeros(1, h_q, max(n, 1), head_dim, dtype=dtype, device="cuda")[:, :, :n] for n in seq_q_lens], s_q_max)
+    sq_t = torch.tensor(seq_q_lens, dtype=torch.int32, device="cuda").view(batch, 1, 1, 1)
+    skv_t = torch.tensor(seq_kv_lens, dtype=torch.int32, device="cuda").view(batch, 1, 1, 1)
+    sinks = torch.randn(1, h_q, 1, 1, dtype=torch.float32, device="cuda") if with_sink else None
+
+    io_dtype = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
+    graph = cudnn.pygraph(io_data_type=io_dtype, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    tq = graph.tensor_like(q_view, name="q")
+    tk = graph.tensor_like(k_view, name="k")
+    tv = graph.tensor_like(v_view, name="v")
+    rq = graph.tensor_like(q_ro, name="q_ro")
+    rk = graph.tensor_like(k_ro, name="k_ro")
+    rv = graph.tensor_like(v_ro, name="v_ro")
+    ro = graph.tensor_like(o_ro, name="o_ro")
+    tq.set_ragged_offset(rq)
+    tk.set_ragged_offset(rk)
+    tv.set_ragged_offset(rv)
+    sq = graph.tensor_like(sq_t, name="seq_q")
+    skv = graph.tensor_like(skv_t, name="seq_kv")
+    sdpa_kwargs = dict(
+        name="sdpa",
+        q=tq,
+        k=tk,
+        v=tv,
+        generate_stats=False,
+        attn_scale=scale,
+        use_padding_mask=True,
+        seq_len_q=sq,
+        seq_len_kv=skv,
+    )
+    if causal_bottom_right:
+        sdpa_kwargs["use_causal_mask_bottom_right"] = True
+    elif is_causal:
+        sdpa_kwargs["use_causal_mask"] = True
+    if window_size_left is not None:
+        sdpa_kwargs["sliding_window_length"] = window_size_left + 1
+    variant_pack = {tq: q_view, tk: k_view, tv: v_view, rq: q_ro, rk: k_ro, rv: v_ro, ro: o_ro, sq: sq_t, skv: skv_t}
+    if sinks is not None:
+        st = graph.tensor_like(sinks, name="sink")
+        sdpa_kwargs["sink_token"] = st
+        variant_pack[st] = sinks
+    o, _ = graph.sdpa(**sdpa_kwargs)
+    o.set_output(True).set_dim(list(o_view.shape)).set_stride(list(o_view.stride()))
+    o.set_ragged_offset(ro)
+    variant_pack[o] = o_view
+
+    graph.validate()
+    graph.build_operation_graph()
+    graph.create_execution_plans([cudnn.heur_mode.A])
+    graph.select_engines([engine_name(arch="sm120")])
+    graph.check_support()
+    graph.build_plans()
+    workspace = torch.empty(max(1, graph.get_workspace_size()), dtype=torch.uint8, device="cuda")
+    graph.execute(variant_pack, workspace)
+    torch.cuda.synchronize()
+
+    cu = [0]
+    for n in seq_q_lens:
+        cu.append(cu[-1] + n)
+    packed_o = o_storage[: cu[-1] * h_q * head_dim].view(max(cu[-1], 1), h_q, head_dim)
+    for i, (nq, nkv) in enumerate(zip(seq_q_lens, seq_kv_lens)):
+        if nq == 0:
+            continue
+        got = packed_o[cu[i] : cu[i + 1]].permute(1, 0, 2).unsqueeze(0).float()
+        expected = _ref_sdpa_full(
+            q_seqs[i],
+            k_seqs[i],
+            v_seqs[i],
+            scale=scale,
+            is_causal=is_causal,
+            causal_bottom_right=causal_bottom_right,
+            window_size_left=window_size_left,
+            sinks=sinks,
+        )
+        torch.testing.assert_close(got, expected, atol=0.1, rtol=5e-2)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.parametrize("is_causal", [False, True], ids=["dense", "causal"])
+@torch_fork_set_rng(seed=0)
+def test_sdpa_fwd_dsl_sm120_graph_api(dtype: torch.dtype, is_causal: bool):
+    """Execute the SM100-overlap workload through the selected SM120 engine."""
+
+    batch, heads, sequence, head_dim = 2, 8, 256, 256
+    scale = 1.0 / math.sqrt(head_dim)
+    q = _bhsd(batch, heads, sequence, head_dim, dtype)
+    k = _bhsd(batch, heads, sequence, head_dim, dtype)
+    v = _bhsd(batch, heads, sequence, head_dim, dtype)
+
+    output = _run_dsl_graph(q, k, v, scale=scale, is_causal=is_causal, kv_tile=64)
+    expected = _ref_sdpa_full(q, k, v, scale=scale, is_causal=is_causal)
+    torch.testing.assert_close(output.float(), expected, atol=0.1, rtol=5e-2)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=1)
+def test_dsl_sm120_graph_api_padded_gqa():
+    """Execute a padded GQA graph through the same Unified SDPA path as SM100."""
+
+    batch, h_q, h_kv, s_q, s_kv, head_dim = 2, 8, 1, 96, 144, 64
+    scale = 1.0 / math.sqrt(head_dim)
+    q = _padded_bhsd(
+        batch,
+        h_q,
+        s_q,
+        head_dim,
+        torch.float16,
+        head_padding=8,
+        sequence_padding=16,
+        batch_padding=24,
+    )
+    k = _padded_bhsd(
+        batch,
+        h_kv,
+        s_kv,
+        head_dim,
+        torch.float16,
+        head_padding=16,
+        sequence_padding=24,
+        batch_padding=32,
+    )
+    v = _padded_bhsd(
+        batch,
+        h_kv,
+        s_kv,
+        head_dim,
+        torch.float16,
+        head_padding=24,
+        sequence_padding=32,
+        batch_padding=40,
+    )
+    output = _padded_bhsd(
+        batch,
+        h_q,
+        s_q,
+        head_dim,
+        torch.float16,
+        head_padding=32,
+        sequence_padding=40,
+        batch_padding=48,
+    )
+    seq_q_lens = torch.tensor([93, 51], dtype=torch.int32, device="cuda").view(batch, 1, 1, 1)
+    seq_kv_lens = torch.tensor([137, 79], dtype=torch.int32, device="cuda").view(batch, 1, 1, 1)
+
+    result = _run_dsl_graph(
+        q,
+        k,
+        v,
+        scale=scale,
+        o_gpu=output,
+        is_causal=True,
+        causal_bottom_right=True,
+        window_size_left=47,
+        seq_q_lens=seq_q_lens,
+        seq_kv_lens=seq_kv_lens,
+    )
+    expected = _ref_sdpa_full(
+        q,
+        k,
+        v,
+        scale=scale,
+        is_causal=True,
+        causal_bottom_right=True,
+        window_size_left=47,
+        seq_q_lens=seq_q_lens,
+        seq_kv_lens=seq_kv_lens,
+    )
+    torch.testing.assert_close(result.float(), expected, atol=0.1, rtol=5e-2)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=10)
+def test_dsl_sm120_long_sequence_multi_wave():
+    """Launch far beyond one wave: ceil(4096/128) * B * H = 512 CTAs against
+    ~170 SMs, causal so per-CTA work varies across the grid."""
+
+    _run_case(batch=2, h_q=8, h_kv=8, s_q=4096, s_kv=4096, head_dim=128, is_causal=True)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=11)
+def test_dsl_sm120_fully_masked_rows():
+    """Rows with no visible keys must write O := 0, never NaN.
+
+    A zero-length KV batch is the one graph-reachable fully-masked shape:
+    native graph validation rejects the mask-geometry routes (bottom-right
+    causal or SWA with S_q > S_kv) before any engine runs. The kernel side
+    still covers the interesting edge — zero KV iterations for the whole
+    batch, with the epilogue required to write zeros.
+    """
+
+    seq_q_lens = torch.tensor([128, 128], dtype=torch.int32, device="cuda")
+    seq_kv_lens = torch.tensor([0, 96], dtype=torch.int32, device="cuda")
+    _run_case(batch=2, s_q=128, s_kv=128, head_dim=64, seq_q_lens=seq_q_lens, seq_kv_lens=seq_kv_lens)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "mask_kwargs",
+    [
+        {},
+        {"is_causal": True},
+        {"is_causal": True, "causal_bottom_right": True},
+        {"is_causal": True, "window_size_left": 31},
+    ],
+    ids=["dense", "causal", "causal_br", "causal_swa"],
+)
+@torch_fork_set_rng(seed=13)
+def test_dsl_sm120_stats(mask_kwargs):
+    """generate_stats=True: the Stats output matches the natural-log LSE."""
+
+    _run_case(batch=2, h_q=4, h_kv=2, s_q=256, s_kv=256, head_dim=128, check_stats=True, **mask_kwargs)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=14)
+def test_dsl_sm120_stats_padded_trim():
+    """Rows past seq_len_q[b] and rows with no visible key produce LSE = -inf.
+
+    Batch 0 pairs a short Q length with a zero-length KV segment, so its
+    valid rows are -inf via the dead-row path and its tail rows via the
+    per-batch trim; batch 1 keeps finite LSE up to its Q length.
+    """
+
+    seq_q_lens = torch.tensor([96, 128], dtype=torch.int32, device="cuda")
+    seq_kv_lens = torch.tensor([0, 64], dtype=torch.int32, device="cuda")
+    _run_case(
+        batch=2,
+        s_q=128,
+        s_kv=128,
+        head_dim=64,
+        seq_q_lens=seq_q_lens,
+        seq_kv_lens=seq_kv_lens,
+        check_stats=True,
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=18)
+def test_dsl_sm120_sink():
+    """Causal + attention sink: per-Q-head logit in the softmax denominator."""
+
+    _run_case(batch=2, h_q=8, h_kv=2, s_q=256, s_kv=256, head_dim=64, is_causal=True, with_sink=True)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=19)
+def test_dsl_sm120_sink_stats():
+    """The sink enters the LSE: Stats must match the sink-extended logsumexp."""
+
+    _run_case(batch=2, h_q=4, h_kv=4, s_q=256, s_kv=256, head_dim=128, is_causal=True, with_sink=True, check_stats=True)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=20)
+def test_dsl_sm120_sink_dead_rows():
+    """With a sink, rows with no visible key keep a finite LSE (the sink
+    alone) and O := 0; rows past seq_len_q[b] still trim to -inf."""
+
+    seq_q_lens = torch.tensor([96, 128], dtype=torch.int32, device="cuda")
+    seq_kv_lens = torch.tensor([0, 64], dtype=torch.int32, device="cuda")
+    _run_case(
+        batch=2,
+        s_q=128,
+        s_kv=128,
+        head_dim=64,
+        seq_q_lens=seq_q_lens,
+        seq_kv_lens=seq_kv_lens,
+        with_sink=True,
+        check_stats=True,
+    )
+
+
+@pytest.mark.L1
+@torch_fork_set_rng(seed=21)
+def test_dsl_sm120_sink_variants():
+    """Sink across bf16 + MQA, 64-wide tiles, and the direct wrapper."""
+
+    _run_case(h_q=8, h_kv=1, s_q=256, s_kv=256, head_dim=128, dtype=torch.bfloat16, is_causal=True, with_sink=True)
+    _run_case(q_tile=64, kv_tile=64, s_q=128, s_kv=128, head_dim=64, with_sink=True, check_stats=True)
+
+    _require_dsl()
+    from cudnn.sdpa.fwd import sdpa_fwd_wrapper_dsl_sm120
+
+    q = _bhsd(2, 4, 128, 128, torch.float16)
+    k = _bhsd(2, 4, 128, 128, torch.float16)
+    v = _bhsd(2, 4, 128, 128, torch.float16)
+    sinks = torch.randn(1, 4, 1, 1, dtype=torch.float32, device="cuda")
+    scale = 1.0 / math.sqrt(128)
+    o_tensor, lse_tensor = sdpa_fwd_wrapper_dsl_sm120(q, k, v, is_causal=True, sinks=sinks)
+    expected_o, expected_lse = _ref_sdpa_full(q, k, v, scale=scale, is_causal=True, sinks=sinks, return_stats=True)
+    torch.testing.assert_close(o_tensor.float(), expected_o, atol=0.1, rtol=5e-2)
+    torch.testing.assert_close(lse_tensor, expected_lse, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.L1
+@torch_fork_set_rng(seed=15)
+def test_dsl_sm120_stats_variants():
+    """LSE across bf16 + GQA, 64-wide tiles, large D, and multi-wave grids."""
+
+    _run_case(h_q=8, h_kv=1, s_q=256, s_kv=256, head_dim=128, dtype=torch.bfloat16, is_causal=True, check_stats=True)
+    _run_case(q_tile=64, kv_tile=64, s_q=128, s_kv=128, head_dim=64, check_stats=True)
+    _run_case(head_dim=256, s_q=128, s_kv=128, check_stats=True)  # auto kv_tile=64
+    _run_case(batch=2, h_q=8, s_q=4096, s_kv=4096, head_dim=128, is_causal=True, check_stats=True)
+
+
+@pytest.mark.L1
+@torch_fork_set_rng(seed=16)
+def test_dsl_sm120_wrapper_lse():
+    """The direct wrapper returns the (B, H, Sq) natural-log LSE."""
+
+    _require_dsl()
+    from cudnn.sdpa.fwd import sdpa_fwd_wrapper_dsl_sm120
+
+    q = _bhsd(2, 4, 128, 128, torch.float16)
+    k = _bhsd(2, 4, 128, 128, torch.float16)
+    v = _bhsd(2, 4, 128, 128, torch.float16)
+    scale = 1.0 / math.sqrt(128)
+    o_tensor, lse_tensor = sdpa_fwd_wrapper_dsl_sm120(q, k, v, is_causal=True)
+    expected_o, expected_lse = _ref_sdpa_full(q, k, v, scale=scale, is_causal=True, return_stats=True)
+    torch.testing.assert_close(o_tensor.float(), expected_o, atol=0.1, rtol=5e-2)
+    torch.testing.assert_close(lse_tensor, expected_lse, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=22)
+def test_dsl_sm120_thd():
+    """THD self-attention: packed ragged batch vs per-sequence references."""
+
+    _run_thd_case(seq_q_lens=[200, 150], seq_kv_lens=[200, 150], is_causal=True)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=23)
+def test_dsl_sm120_thd_cross():
+    """THD cross-attention: unequal packed Q and KV token totals."""
+
+    _run_thd_case(seq_q_lens=[200, 150], seq_kv_lens=[180, 120], is_causal=True, head_dim=128)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=24)
+def test_dsl_sm120_thd_bottom_right():
+    """THD + bottom-right causal: per-sequence diagonals"""
+
+    _run_thd_case(seq_q_lens=[100, 60], seq_kv_lens=[180, 120], is_causal=True, causal_bottom_right=True)
+
+
+@pytest.mark.L1
+@torch_fork_set_rng(seed=25)
+def test_dsl_sm120_thd_gqa_sink():
+    """THD + GQA + attention sink through the packed epilogue fold."""
+
+    _run_thd_case(seq_q_lens=[130, 70], seq_kv_lens=[130, 70], h_q=8, h_kv=2, is_causal=True, with_sink=True)
+
+
+@pytest.mark.L1
+@torch_fork_set_rng(seed=26)
+def test_dsl_sm120_thd_zero_length_sequence():
+    """A zero-length sequence contributes no tokens and must not perturb its
+    packed neighbors."""
+
+    _run_thd_case(seq_q_lens=[128, 0, 64], seq_kv_lens=[100, 0, 50], is_causal=True)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=9)
+def test_dsl_sm120_dense_flex_bhsd_contiguous():
+    """BHSD-contiguous Q/K/V/O (dense_flex): served via compact-BSHD normalization."""
+
+    batch, h_q, h_kv, s, head_dim = 2, 8, 2, 256, 64
+    scale = 1.0 / math.sqrt(head_dim)
+    q = torch.randn(batch, h_q, s, head_dim, device="cuda", dtype=torch.float16)
+    k = torch.randn(batch, h_kv, s, head_dim, device="cuda", dtype=torch.float16)
+    v = torch.randn(batch, h_kv, s, head_dim, device="cuda", dtype=torch.float16)
+    output = torch.empty_like(q)
+
+    result = _run_dsl_graph(q, k, v, scale=scale, o_gpu=output, is_causal=True)
+    expected = _ref_sdpa_full(q, k, v, scale=scale, is_causal=True)
+    torch.testing.assert_close(result.float(), expected, atol=0.1, rtol=5e-2)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    ("head_dim", "kv_tile"),
+    [
+        (16, None),
+        (112, None),
+        (160, None),
+        (192, None),
+        (208, None),
+        (224, None),
+        (240, None),
+        (256, None),
+        (256, 64),
+    ],
+)
+@torch_fork_set_rng(seed=2)
+def test_dsl_sm120_representative_head_dimensions(head_dim: int, kv_tile: int | None):
+    _run_case(head_dim=head_dim, kv_tile=kv_tile)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(("h_q", "h_kv"), [(4, 4), (8, 2), (8, 1)], ids=["mha", "gqa", "mqa"])
+@torch_fork_set_rng(seed=3)
+def test_dsl_sm120_grouped_query_attention(h_q: int, h_kv: int):
+    _run_case(batch=2, h_q=h_q, h_kv=h_kv, s_q=256, s_kv=256, head_dim=64)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=4)
+def test_dsl_sm120_causal_swa():
+    """Causal sliding-window attention: keep q-W <= kv <= q."""
+
+    _run_case(
+        h_q=8,
+        h_kv=2,
+        s_q=384,
+        s_kv=384,
+        head_dim=64,
+        is_causal=True,
+        window_size_left=200,
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=5)
+def test_dsl_sm120_causal_bottom_right():
+    """Bottom-right causal attention with S_q != S_kv."""
+
+    _run_case(
+        h_q=8,
+        h_kv=2,
+        s_q=128,
+        s_kv=256,
+        head_dim=64,
+        is_causal=True,
+        causal_bottom_right=True,
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=6)
+def test_dsl_sm120_padded():
+    """Per-batch Q and KV lengths, both genuinely shorter than the padded
+    shapes so the Q-row trim (O := 0) and the KV column mask are exercised."""
+
+    seq_q_lens = torch.tensor([230, 120], dtype=torch.int32, device="cuda")
+    seq_kv_lens = torch.tensor([180, 240], dtype=torch.int32, device="cuda")
+    _run_case(
+        batch=2,
+        h_q=8,
+        h_kv=8,
+        s_q=256,
+        s_kv=256,
+        head_dim=64,
+        seq_q_lens=seq_q_lens,
+        seq_kv_lens=seq_kv_lens,
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=7)
+def test_dsl_sm120_bfloat16_and_tile_variants():
+    _run_case(
+        head_dim=128,
+        dtype=torch.bfloat16,
+        q_tile=64,
+        kv_tile=64,
+        is_causal=True,
+        scale=0.5,
+    )

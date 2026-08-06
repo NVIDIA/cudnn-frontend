@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import pytest
 import torch
 
@@ -91,8 +94,8 @@ def test_DSA_indexer_backward_wrapper(
     b_cfg = cfg["b"]
     s_q_cfg = cfg["s_q"]
     loss_coeff = float(b_cfg * s_q_cfg)
-    grad_loss = 1.0
-    grad_scale_expected = (loss_coeff / (b_cfg * s_q_cfg)) * grad_loss  # = 1.0
+    grad_loss = torch.ones((), dtype=torch.float32, device="cuda")
+    grad_scale_expected = loss_coeff / (b_cfg * s_q_cfg)  # = 1.0
 
     (
         index_q,

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from .selection import SelectionAttention, selection_attention_wrapper
 from .compression import CompressionAttention, compression_attention_wrapper
 from .sliding_window_attention import (

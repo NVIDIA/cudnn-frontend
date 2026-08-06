@@ -1,5 +1,6 @@
 # Copyright (c) 2025, Tri Dao.
 # Copyright (c) 2026, Jerry Chen
+# SPDX-License-Identifier: MIT
 """SM90 WGMMA and shared-memory layout helpers."""
 
 from typing import Type, Union, Optional

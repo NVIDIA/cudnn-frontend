@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from importlib import import_module
 
 _SYMBOLS = {
@@ -5,6 +8,9 @@ _SYMBOLS = {
     "sparse_attention_backward_wrapper": (".sparse_attention_backward", "sparse_attention_backward_wrapper"),
     "IndexerForward": (".indexer_forward", "IndexerForward"),
     "indexer_forward_wrapper": (".indexer_forward", "indexer_forward_wrapper"),
+    "indexer_forward_top_k_wrapper": (".indexer_forward", "indexer_forward_top_k_wrapper"),
+    "compress_topk_cand_buffer_size": (".indexer_forward", "compress_topk_cand_buffer_size"),
+    "compress_topk_cand_buffer_size_thd": (".indexer_forward", "compress_topk_cand_buffer_size_thd"),
     "IndexerTopK": (".indexer_top_k", "IndexerTopK"),
     "indexer_top_k_wrapper": (".indexer_top_k", "indexer_top_k_wrapper"),
     "local_to_global_wrapper": (".indexer_top_k", "local_to_global_wrapper"),

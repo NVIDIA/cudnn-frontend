@@ -372,4 +372,4 @@ Returns a `TupleDict` - a dictionary-like object that also supports tuple unpack
 
 ## Usage Examples
 
-For usage examples, see test cases in `test/python/fe_api/test_grouped_gemm_quant.py` + `test/python/fe_api/test_grouped_gemm_quant_utils.py`
+For usage examples, see test cases in `test/python/fe_api/grouped_gemm/test_grouped_gemm_quant.py` + `test/python/fe_api/grouped_gemm/test_grouped_gemm_quant_utils.py`

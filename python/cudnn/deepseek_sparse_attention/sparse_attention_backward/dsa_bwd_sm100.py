@@ -1,10 +1,13 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import cuda.bindings.driver as cuda
 import math
 from typing import Tuple, Type, Optional
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.typing import Float32, Int32, BFloat16, Int64
+from cutlass.cute.typing import Float32, Int32, Int64
 import cutlass.pipeline as pipeline
 from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils
@@ -17,6 +20,7 @@ class FlashAttentionDSABackwardSm100:
 
     def __init__(
         self,
+        element_dtype: Type[cutlass.Numeric],
         head_dim: int,
         head_dim_v: int,
         block_tile: int,
@@ -40,9 +44,11 @@ class FlashAttentionDSABackwardSm100:
         self.QdS_cta_tiler = (head_dim_main, block_tile, block_tile)
         self.cluster_shape_mn = (1, 1)
 
-        self.element_dtype = BFloat16
-        # User constraint: dKV accumulation must stay FP32. BFloat16 is only
-        # used for element/output storage.
+        if element_dtype not in [cutlass.Float16, cutlass.BFloat16]:
+            raise ValueError(f"Unsupported element dtype: {element_dtype}")
+        self.element_dtype = element_dtype
+        # dKV accumulation stays FP32; element_dtype controls element/output
+        # storage.
         self.acc_dtype = Float32
 
         # =============== Sum OdO ================
@@ -103,6 +109,24 @@ class FlashAttentionDSABackwardSm100:
         )
         self.t2r_dKV4_done_barrier = pipeline.NamedBarrier(
             barrier_id=8,
+            num_threads=(self.num_reduce_warps + 1) * self.threads_per_warp,
+        )
+        # TMEM dealloc (compute warp 0) must be ordered after the reduce
+        # warps have drained their final dKV T2R reads (the reads that feed
+        # store_dKV); deallocating the TMEM columns while those T2R loads
+        # are still in flight would race them within the CTA. This is a
+        # within-CTA read-before-dealloc ordering. Participants:
+        # num_reduce_warps (arrive) + compute warp 0 (arrive_and_wait).
+        self.tmem_dealloc_barrier = pipeline.NamedBarrier(
+            barrier_id=9,
+            num_threads=(self.num_reduce_warps + 1) * self.threads_per_warp,
+        )
+        # Orders the reduce warps dKV2/dKV3 T2R reads before the MMA warp
+        # overwrites those TMEM columns with the next iteration dKV0/dKV1
+        # (dKV2 aliases dKV0, dKV3 aliases dKV1). barrier_id 9 is taken by
+        # tmem_dealloc_barrier above, so this uses the next free slot.
+        self.t2r_dKV23_done_barrier = pipeline.NamedBarrier(
+            barrier_id=10,
             num_threads=(self.num_reduce_warps + 1) * self.threads_per_warp,
         )
 
@@ -343,7 +367,7 @@ class FlashAttentionDSABackwardSm100:
         dOT_smem_layout_staged = sm100_utils.make_smem_layout_a(dOP_tiled_mma, self.dOP_cta_tiler, self.element_dtype, self.load_mma_QdO_stage)
         P_smem_layout_staged = sm100_utils.make_smem_layout_b(dOP_tiled_mma, self.dOP_mma_tiler, self.element_dtype, self.compute_mma_P_stage)
         P_smem_layout_store_staged = sm100_utils.make_smem_layout_epi(
-            self.element_dtype, utils.LayoutEnum.COL_MAJOR, self.QK_mma_tiler[:2], self.load_mma_K_stage
+            self.element_dtype, utils.LayoutEnum.COL_MAJOR, self.QK_mma_tiler[:2], self.compute_mma_P_stage
         )
         K_smem_layout_staged_2 = sm100_utils.make_smem_layout_a(KdS_tiled_mma, self.KdS_cta_tiler, self.element_dtype, self.load_mma_K_stage)
         if cutlass.const_expr(not self.same_hdim_kv):
@@ -364,7 +388,7 @@ class FlashAttentionDSABackwardSm100:
             QT_tail_smem_layout_staged = None
         dS_smem_layout_staged = sm100_utils.make_smem_layout_b(QdS_tiled_mma, self.QdS_mma_tiler, self.element_dtype, self.compute_mma_dS_stage)
         dS_smem_layout_store_staged = sm100_utils.make_smem_layout_epi(
-            self.element_dtype, utils.LayoutEnum.COL_MAJOR, self.dOV_mma_tiler[:2], self.load_mma_K_stage
+            self.element_dtype, utils.LayoutEnum.COL_MAJOR, self.dOV_mma_tiler[:2], self.compute_mma_dS_stage
         )
 
         dQ_smem_layout_staged = sm100_utils.make_smem_layout_epi(
@@ -563,25 +587,24 @@ class FlashAttentionDSABackwardSm100:
             stream=stream,
         )
 
-        if cutlass.const_expr(self.same_hdim_kv):
-            dSink_grid = (
-                cute.ceil_div(problem_shape[0], self.dSink_block_q),
-                problem_shape[3][0],
-                problem_shape[3][1],
-            )
-            self.sum_dSink(
-                sum_OdO,
-                scaled_LSE,
-                mAttnSink,
-                mdSink,
-                problem_shape,
-            ).launch(
-                grid=dSink_grid,
-                block=[self.dSink_num_threads, 1, 1],
-                cluster=[1, 1, 1],
-                stream=stream,
-                min_blocks_per_mp=1,
-            )
+        dSink_grid = (
+            cute.ceil_div(problem_shape[0], self.dSink_block_q),
+            problem_shape[3][0],
+            problem_shape[3][1],
+        )
+        self.sum_dSink(
+            sum_OdO,
+            scaled_LSE,
+            mAttnSink,
+            mdSink,
+            problem_shape,
+        ).launch(
+            grid=dSink_grid,
+            block=[self.dSink_num_threads, 1, 1],
+            cluster=[1, 1, 1],
+            stream=stream,
+            min_blocks_per_mp=1,
+        )
 
     @cute.kernel
     def convert(
@@ -665,21 +688,20 @@ class FlashAttentionDSABackwardSm100:
                     lse_bhq = lse[bidy, (idx_q + offset, bidz)]
                     sum_OdO_bhq = sum_OdO_scale * acc
 
-                    if cutlass.const_expr(self.same_hdim_kv):
-                        attn_sink_bh = attn_sink[bidy, (0, bidz)]
+                    # FlashMLA LSE excludes the sink for every head-dim
+                    # specialization, so always fold it into the denominator.
+                    attn_sink_bh = attn_sink[bidy, (0, bidz)]
 
-                        log2_e = -lse_scale
-                        lse_log2 = lse_bhq * log2_e
-                        sink_log2 = attn_sink_bh * log2_e
-                        lse_max_log2 = cute.arch.fmax(lse_log2, sink_log2)
-                        sum_exp2 = Float32(cute.math.exp2(lse_log2 - lse_max_log2) + cute.math.exp2(sink_log2 - lse_max_log2))
-                        lse_with_sink_log2 = lse_max_log2 + cute.math.log2(sum_exp2)
-                        scaled_lse_bhq = -lse_with_sink_log2
+                    log2_e = -lse_scale
+                    lse_log2 = lse_bhq * log2_e
+                    sink_log2 = attn_sink_bh * log2_e
+                    lse_max_log2 = cute.arch.fmax(lse_log2, sink_log2)
+                    sum_exp2 = Float32(cute.math.exp2(lse_log2 - lse_max_log2) + cute.math.exp2(sink_log2 - lse_max_log2))
+                    lse_with_sink_log2 = lse_max_log2 + cute.math.log2(sum_exp2)
+                    scaled_lse_bhq = -lse_with_sink_log2
 
-                        if lse_bhq == Float32(float("inf")):
-                            scaled_lse_bhq = Float32(float("-inf"))
-                    else:
-                        scaled_lse_bhq = lse_scale * lse_bhq
+                    if lse_bhq == Float32(float("inf")):
+                        scaled_lse_bhq = Float32(float("-inf"))
 
                     sum_OdO[bidy, (idx_q + offset, bidz)] = sum_OdO_bhq
                     scaled_lse[bidy, (idx_q + offset, bidz)] = scaled_lse_bhq
@@ -769,6 +791,25 @@ class FlashAttentionDSABackwardSm100:
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
         max_seqlen_q, max_seqlen_kv, head_dim, (num_heads, batch_size) = problem_shape
+
+        if cutlass.const_expr(mTopkLength is not None):
+            topk = mTopkLength[token_idx]
+        else:
+            topk = mTopkIdxs.shape[0]
+
+        # topk is CTA-uniform (one value per query token). Handle an empty
+        # sparse row before initializing any async pipeline or allocating
+        # TMEM: the row contributes nothing to dKV and its dQ tile is zero.
+        # Treat malformed negative lengths as empty as well so they cannot
+        # enter the same zero-tile pipeline path.
+        if topk <= 0:
+            for linear_idx in cutlass.range(tidx, self.head_dim * self.block_tile, self.threads_per_cta):
+                head_offset = linear_idx // self.head_dim
+                dim_idx = linear_idx % self.head_dim
+                head_idx = head_block_idx * self.block_tile + head_offset
+                if head_idx < num_heads:
+                    mdQ[dim_idx, head_idx, (token_idx, batch_idx)] = mdQ.element_type(0.0)
+            cute.arch.nvvm.exit()
 
         if warp_idx == self.load_warp_id:
             cpasync.prefetch_descriptor(tma_atom_Q)
@@ -863,11 +904,6 @@ class FlashAttentionDSABackwardSm100:
 
         pipeline.pipeline_init_wait()
 
-        if cutlass.const_expr(mTopkLength is not None):
-            topk = mTopkLength[token_idx]
-        else:
-            topk = mTopkIdxs.shape[0]
-
         tile_count = cute.ceil_div(topk, self.block_tile)
 
         if warp_idx == self.load_warp_id:
@@ -904,7 +940,7 @@ class FlashAttentionDSABackwardSm100:
 
             tdKVrQT = QdS_tiled_mma.make_fragment_A(sQT)
             tdKVrdS = QdS_tiled_mma.make_fragment_B(sdS)
-            # Ugly, but I don't know how to handle the correct modes for cute.gemm
+            # Inelegant, but I don't know how to handle the correct modes for cute.gemm
             tdKVrQT_shape = (tdKVrQT.shape[0], 1, tdKVrQT.shape[1], tdKVrQT.shape[2], tdKVrQT.shape[3])
             tdKVrQT_stride = (tdKVrQT.stride[0], 0, tdKVrQT.stride[1], tdKVrQT.stride[2], tdKVrQT.stride[3])
             tdKVrQT = cute.make_tensor(tdKVrQT.iterator, cute.make_layout(tdKVrQT_shape, stride=tdKVrQT_stride))
@@ -1028,6 +1064,10 @@ class FlashAttentionDSABackwardSm100:
             )
 
             if warp_idx == self.compute_warp_id[0]:
+                # Wait until every reduce warp has finished (and fenced) its
+                # final dKV T2R read before freeing the TMEM columns, so the
+                # dealloc cannot race those in-flight reads within the CTA.
+                self.tmem_dealloc_barrier.arrive_and_wait()
                 cute.arch.dealloc_tmem(tmem_ptr_base, self.num_tmem_alloc_cols)
 
         elif warp_idx in self.reduce_warp_id:
@@ -1048,6 +1088,11 @@ class FlashAttentionDSABackwardSm100:
                 topk,
                 mma_reduce_dKV_pipeline,
             )
+            # All T2R reads issued by this warp are complete here (each
+            # store_dKV / T2R block fences before its pipeline release);
+            # signal compute warp 0 that TMEM dealloc is now safe.
+            # arrive() only -- the reduce warps need not stall.
+            self.tmem_dealloc_barrier.arrive()
 
         elif warp_idx in self.load_KV_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_load_KV)
@@ -1487,6 +1532,18 @@ class FlashAttentionDSABackwardSm100:
             mma_reduce_dKV_pipeline.producer_acquire(mma_reduce_dKV_producer_state)
 
             # dKV0
+            # Wait for the reduce warps to finish the T2R of dKV2/dKV3 from
+            # the previous iteration before overwriting their TMEM columns:
+            # dKV0 aliases dKV2 and dKV1 aliases dKV3, and the producer_acquire
+            # above only orders against the consumer_release from two
+            # generations back (the dKV4 generation), not against the dKV2/dKV3
+            # reads of the previous generation.
+            if cutlass.const_expr(not self.same_hdim_kv):
+                if not is_first_mma:
+                    self.t2r_dKV23_done_barrier.arrive_and_wait()
+            if cutlass.const_expr(self.same_hdim_kv):
+                if not is_first_mma:
+                    self.t2r_dKV4_done_barrier.arrive_and_wait()
             dOP_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
             for k_block in cutlass.range(0, cute.size(tdKVrP, mode=[2]), unroll=2):
                 cute.gemm(
@@ -1499,9 +1556,6 @@ class FlashAttentionDSABackwardSm100:
                 dOP_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
 
             # dKV1
-            if cutlass.const_expr(self.same_hdim_kv):
-                if not is_first_mma:
-                    self.t2r_dKV4_done_barrier.arrive_and_wait()
             dOP_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
             for k_block in cutlass.range(0, cute.size(tdKVrP, mode=[2]), unroll=2):
                 cute.gemm(
@@ -1630,10 +1684,12 @@ class FlashAttentionDSABackwardSm100:
             load_mma_K_consumer_state.advance()
 
             # Gemm dKV = dO @ P part2
-            # Wait for reduce warps to finish T2R of dKV4 from TMEM,
-            # since dKV2 shares the same TMEM offset as dKV4/dKV0.
+            # Wait for reduce warps to finish T2R of the TMEM columns that
+            # dKV2/dKV3 overwrite: dKV4 (not same_hdim) or dKV0/dKV1 (same_hdim).
             if cutlass.const_expr(not self.same_hdim_kv):
                 self.t2r_dKV4_done_barrier.arrive_and_wait()
+            else:
+                self.t2r_dKV01_done_barrier.arrive_and_wait()
             mma_reduce_dKV_pipeline.producer_acquire(mma_reduce_dKV_producer_state)
             # dKV2
             dOP_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
@@ -1648,8 +1704,6 @@ class FlashAttentionDSABackwardSm100:
                 dOP_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
 
             # dKV3
-            if cutlass.const_expr(self.same_hdim_kv):
-                self.t2r_dKV01_done_barrier.arrive_and_wait()
             dOP_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
             for k_block in cutlass.range(0, cute.size(tdKVrP, mode=[2]), unroll=2):
                 cute.gemm(
@@ -1697,6 +1751,10 @@ class FlashAttentionDSABackwardSm100:
 
         if cutlass.const_expr(self.same_hdim_kv):
             self.t2r_dKV4_done_barrier.arrive_and_wait()
+        else:
+            # Balance the reduce warps' final t2r_dKV23_done arrive (the
+            # in-loop wait is skipped on the first iteration).
+            self.t2r_dKV23_done_barrier.arrive_and_wait()
 
         mma_compute_dQ_pipeline.producer_commit(mma_compute_dQ_producer_state)
         mma_compute_dQ_producer_state.advance()
@@ -1776,13 +1834,13 @@ class FlashAttentionDSABackwardSm100:
         thr_t2r_dP = tiled_t2r_dP.get_slice(tidx % 128)
 
         tTR_cS = thr_t2r_S.partition_D(cS)
-        tTR_sS = thr_t2r_S.partition_D(sP_store[None, None, compute_mma_P_producer_state.index])
+        tTR_sS = thr_t2r_S.partition_D(sP_store[None, None, 0])
         tTR_rS = cute.make_rmem_tensor(tTR_sS.shape, self.acc_dtype)
 
         tTR_tS = thr_t2r_S.partition_S(tStS)
 
         tTR_cdP = thr_t2r_dP.partition_D(cdP)
-        tTR_sdP = thr_t2r_dP.partition_D(sdS_store[None, None, compute_mma_dS_producer_state.index])
+        tTR_sdP = thr_t2r_dP.partition_D(sdS_store[None, None, 0])
         tTR_rdP = cute.make_rmem_tensor(tTR_sdP.shape, self.acc_dtype)
 
         tTR_tdP = thr_t2r_dP.partition_S(tdPtdP)
@@ -1799,15 +1857,15 @@ class FlashAttentionDSABackwardSm100:
         )
         smem_store_p = cute.make_tiled_copy_D(smem_store_atom, tiled_t2r_S)
         thr_smem_store_p = smem_store_p.get_slice(tidx % 128)
-        sP_store_slice = sP_store[None, None, compute_mma_P_producer_state.index]
-        tRS_sP = thr_smem_store_p.partition_D(sP_store_slice)
-        tRS_rP = cute.make_rmem_tensor(tRS_sP.shape, self.element_dtype)
+        # Keep the stage mode: the store slot must follow the producer state
+        # when compute_mma_P_stage > 1 (slot selection happens at the copy).
+        tRS_sP = thr_smem_store_p.partition_D(sP_store)
+        tRS_rP = cute.make_rmem_tensor(tRS_sP[None, None, None, 0].shape, self.element_dtype)
 
         smem_store_ds = cute.make_tiled_copy_D(smem_store_atom, tiled_t2r_dP)
         thr_smem_store_ds = smem_store_ds.get_slice(tidx % 128)
-        sdS_store_slice = sdS_store[None, None, compute_mma_dS_producer_state.index]
-        tRS_sdS = thr_smem_store_ds.partition_D(sdS_store_slice)
-        tRS_rdS = cute.make_rmem_tensor(tRS_sdS.shape, self.element_dtype)
+        tRS_sdS = thr_smem_store_ds.partition_D(sdS_store)
+        tRS_rdS = cute.make_rmem_tensor(tRS_sdS[None, None, None, 0].shape, self.element_dtype)
 
         tile_index = tile_count - 1
         while tile_index >= 0:
@@ -1838,7 +1896,10 @@ class FlashAttentionDSABackwardSm100:
 
             # ======= stsm ============
             tRS_rP.store(smem_store_p.retile(tTR_rS_f16).load())
-            cute.copy(smem_store_p, tRS_rP, tRS_sP)
+            if cutlass.const_expr(self.compute_mma_P_stage == 1):
+                cute.copy(smem_store_p, tRS_rP, tRS_sP[None, None, None, 0])
+            else:
+                cute.copy(smem_store_p, tRS_rP, tRS_sP[None, None, None, compute_mma_P_producer_state.index])
 
             # Fence for shared memory
             cute.arch.fence_proxy(
@@ -1883,7 +1944,10 @@ class FlashAttentionDSABackwardSm100:
             mma_compute_dP_consumer_state.advance()
 
             tRS_rdS.store(smem_store_ds.retile(tTR_rdP_f16).load())
-            cute.copy(smem_store_ds, tRS_rdS, tRS_sdS)
+            if cutlass.const_expr(self.compute_mma_dS_stage == 1):
+                cute.copy(smem_store_ds, tRS_rdS, tRS_sdS[None, None, None, 0])
+            else:
+                cute.copy(smem_store_ds, tRS_rdS, tRS_sdS[None, None, None, compute_mma_dS_producer_state.index])
 
             # self.compute_sync_barrier.arrive_and_wait()
 
@@ -2158,21 +2222,15 @@ class FlashAttentionDSABackwardSm100:
 
             mma_reduce_dKV_pipeline.consumer_wait(mma_reduce_dKV_consumer_state)
 
-            if cutlass.const_expr(not self.same_hdim_kv):
-                # Split T2R and atomic_add: load dKV0/dKV1 from TMEM to registers,
-                # then signal MMA warp that TMEM is free for dKV4 overlap.
-                rdKV0 = self.t2r_dKV(tdKVtdKV0)
-                rdKV1 = self.t2r_dKV(tdKVtdKV1)
-                cute.arch.fence_view_async_tmem_load()
-                self.t2r_dKV01_done_barrier.arrive_and_wait()
-                self.reduce_dKV_from_reg(mdKV_acc, rdKV0, rTopkIdx, 0)
-                self.reduce_dKV_from_reg(mdKV_acc, rdKV1, rTopkIdx, 1)
-            else:
-                rdKV1 = self.t2r_dKV(tdKVtdKV1)
-                cute.arch.fence_view_async_tmem_load()
-                self.t2r_dKV01_done_barrier.arrive_and_wait()
-                self.store_dKV(mdKV_acc, tdKVtdKV0, rTopkIdx, 0)
-                self.reduce_dKV_from_reg(mdKV_acc, rdKV1, rTopkIdx, 1)
+            # Split T2R and atomic_add: load dKV0/dKV1 from TMEM to registers,
+            # then signal MMA warp that TMEM is free to overwrite
+            # (dKV4 if not same_hdim_kv, dKV2/dKV3 if same_hdim_kv).
+            rdKV0 = self.t2r_dKV(tdKVtdKV0)
+            rdKV1 = self.t2r_dKV(tdKVtdKV1)
+            cute.arch.fence_view_async_tmem_load()
+            self.t2r_dKV01_done_barrier.arrive_and_wait()
+            self.reduce_dKV_from_reg(mdKV_acc, rdKV0, rTopkIdx, 0)
+            self.reduce_dKV_from_reg(mdKV_acc, rdKV1, rTopkIdx, 1)
 
             mma_reduce_dKV_pipeline.consumer_release(mma_reduce_dKV_consumer_state)
             mma_reduce_dKV_consumer_state.advance()
@@ -2194,14 +2252,27 @@ class FlashAttentionDSABackwardSm100:
             mma_reduce_dKV_pipeline.consumer_wait(mma_reduce_dKV_consumer_state)
 
             if cutlass.const_expr(self.same_hdim_kv):
+                # Split T2R and atomic_add: load dKV2/dKV3 from TMEM to registers,
+                # then signal MMA warp that TMEM is free for next tile's dKV0/dKV1.
+                rdKV2 = self.t2r_dKV(tdKVtdKV2)
                 rdKV3 = self.t2r_dKV(tdKVtdKV3)
                 cute.arch.fence_view_async_tmem_load()
                 self.t2r_dKV4_done_barrier.arrive_and_wait()
-                self.store_dKV(mdKV_acc, tdKVtdKV2, rTopkIdx, 2)
+                self.reduce_dKV_from_reg(mdKV_acc, rdKV2, rTopkIdx, 2)
                 self.reduce_dKV_from_reg(mdKV_acc, rdKV3, rTopkIdx, 3)
             else:
-                self.store_dKV(mdKV_acc, tdKVtdKV2, rTopkIdx, 2)
-                self.store_dKV(mdKV_acc, tdKVtdKV3, rTopkIdx, 3)
+                # T2R dKV2/dKV3 into registers, then signal the MMA warp that
+                # the TMEM columns are free for the next iteration's dKV0/dKV1
+                # before doing the (slow) global atomic reduction. Reading
+                # them from TMEM inside store_dKV after this point would race
+                # the next iteration's dKV0/dKV1 overwrites, which nothing
+                # else orders against these reads.
+                rdKV2 = self.t2r_dKV(tdKVtdKV2)
+                rdKV3 = self.t2r_dKV(tdKVtdKV3)
+                cute.arch.fence_view_async_tmem_load()
+                self.t2r_dKV23_done_barrier.arrive_and_wait()
+                self.reduce_dKV_from_reg(mdKV_acc, rdKV2, rTopkIdx, 2)
+                self.reduce_dKV_from_reg(mdKV_acc, rdKV3, rTopkIdx, 3)
 
             mma_reduce_dKV_pipeline.consumer_release(mma_reduce_dKV_consumer_state)
             mma_reduce_dKV_consumer_state.advance()

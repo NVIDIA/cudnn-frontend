@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """This script downloads the Llama 3.1 8B model weights from Hugging Face and saves them in a PyTorch .pt file.
 The weights are saved in a PyTorch .pt file named "llama3.1_8b_weights.bf16.pt".
 """

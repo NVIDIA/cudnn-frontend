@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # port from https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/utils/fmha_helpers.py
 
 import enum

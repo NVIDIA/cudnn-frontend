@@ -1,5 +1,5 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
 """
 Base classes for cuDNN API wrappers.
@@ -31,6 +31,16 @@ def ceil_div(a: int, b: int) -> int:
 def is_power_of_2(n: int) -> bool:
     """Check if n is a power of 2."""
     return n > 0 and (n & (n - 1)) == 0
+
+
+def is_sm107_device() -> bool:
+    """Return True when the current CUDA device is Rubin (SM107)."""
+    return torch.cuda.is_available() and torch.cuda.get_device_capability(torch.cuda.current_device()) == (10, 7)
+
+
+def get_device_type() -> str:
+    """Return the architecture family used by SM100 grouped GEMM wrappers."""
+    return "rubin" if is_sm107_device() else "blackwell"
 
 
 _experimental_api_warnings_emitted = set()
@@ -379,12 +389,16 @@ class APIBase(ABC):
         - self._is_supported: Flag indicating if configuration is validated
         - self._kernel: Kernel instance
         - self._compiled_kernel: Cache for compiled kernel
+        - self._device_type: Architecture family used for dispatch/cache keys
+        - self._is_rubin_kernel: True when running on Rubin (SM107)
         - self._logger: Logger instance for this class
         """
         self._is_supported = False
         self._kernel = None
         self._compiled_kernel = None
         self._interpret_uint8_as_fp4x2 = False
+        self._device_type = get_device_type()
+        self._is_rubin_kernel = self._device_type == "rubin"
         self._logger = logging.getLogger(self.__class__.__name__)
 
     def _warn_experimental_api(self) -> None:
@@ -512,8 +526,9 @@ class APIBase(ABC):
         """Get default CUDA stream if none provided.
 
         This is a convenience helper to handle optional stream parameters.
-        If a stream is provided, it is returned as-is. If None, the default
-        CUDA stream is returned.
+        If a stream is provided, it is returned as-is. If None, the caller's
+        current PyTorch stream is returned, so kernels stay ordered with
+        surrounding torch ops under ``with torch.cuda.stream(s):``.
 
         :param stream: CUDA stream or None
         :type stream: cuda.CUstream or None
@@ -526,8 +541,8 @@ class APIBase(ABC):
             ...     # Now current_stream is guaranteed to be a valid stream
         """
         if stream is None:
-            self._logger.debug(f"{self.__class__.__name__}: No CUDA stream provided, using default stream")
-            return cutlass.cuda.default_stream()
+            self._logger.debug(f"{self.__class__.__name__}: No CUDA stream provided, using torch current stream")
+            return cuda.CUstream(torch.cuda.current_stream().cuda_stream)
         return stream
 
     def _pad_tensor_to_ndim(

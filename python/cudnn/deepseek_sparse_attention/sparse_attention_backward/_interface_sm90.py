@@ -1,5 +1,6 @@
 # Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
 # Copyright (c) 2026, Jerry Chen
+# SPDX-License-Identifier: MIT
 import math
 from typing import Optional, Tuple
 
@@ -238,6 +239,8 @@ def flash_attn_bwd_sm90(
         dtype,
         head_dim,
         head_dim_v,
+        # The kernel specializes its query-head tile and masks unused MMA rows.
+        # Keep this explicit even though tensor shapes also differ by head count.
         qhead_per_kvhead,
         m_block_size,
         n_block_size,

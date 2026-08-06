@@ -424,5 +424,5 @@ Returns a `TupleDict` - a dictionary-like object that also supports tuple unpack
 ## Usage Examples
 
 For runnable examples and validation, see:
-- `test/python/fe_api/test_discrete_grouped_gemm_swiglu.py`
-- `test/python/fe_api/test_discrete_grouped_gemm_swiglu_utils.py`
+- `test/python/fe_api/grouped_gemm/test_discrete_grouped_gemm_swiglu.py`
+- `test/python/fe_api/grouped_gemm/test_discrete_grouped_gemm_swiglu_utils.py`

@@ -1,23 +1,6 @@
 /*
- * Copyright (c) 2020, NVIDIA CORPORATION. All rights reserved.
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
+ * SPDX-FileCopyrightText: Copyright (c) 2020 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #include "norm_samples.h"
@@ -43,8 +26,9 @@ run_batch_norm_forward(cudnnHandle_t &handle_,
 
 {
     std::cout << "================ Running Batch Norm Forward ======================= " << std::endl;
-    // Create the cudnn handle
-    checkCudnnErr(cudnnCreate(&handle_));
+    // The returned plan is executed by execute_batch_norm_forward(), which takes ownership of this handle.
+    auto handle_ptr = create_cudnn_handle();
+    handle_         = *handle_ptr;
 
     // Creates the necessary tensor descriptors
     int64_t tensor_stride[4];
@@ -182,6 +166,8 @@ run_batch_norm_forward(cudnnHandle_t &handle_,
     auto plan = plan_builder();
     std::cout << "Plan tag: " << plan.getTag() << std::endl;
 
+    // Transfer the cuDNN handle to the caller without leaking the pointer storage owned by handle_ptr.
+    delete handle_ptr.release();
     return plan;
 }
 
@@ -203,6 +189,9 @@ execute_batch_norm_forward(cudnnHandle_t &handle_,
 
                            double epsilon_val,
                            double exponential_decay_factor) {
+    // This function completes the ownership transfer started by run_batch_norm_forward().
+    auto handle_ptr =
+        std::unique_ptr<cudnnHandle_t, CudnnHandleDeleter>(new cudnnHandle_t(handle_), CudnnHandleDeleter());
     try {
         auto workspace_size = plan.getWorkspaceSize();
         std::cout << plan.describe() << std::endl;
@@ -275,7 +264,6 @@ run_batch_norm_backward(int64_t *tensorDims,
                         cudnnDataType_t data_type)
 
 {
-    cudnnHandle_t handle_;
     std::cout << "================ Running Batch Norm Backward =======================" << std::endl;
     (void)xDevPtr;
     (void)dyDevPtr;
@@ -290,8 +278,9 @@ run_batch_norm_backward(int64_t *tensorDims,
 
     (void)epsilon_val;
     try {
-        // Create the cudnn handle
-        checkCudnnErr(cudnnCreate(&handle_));
+        // The handle is automatically destroyed when leaving this scope.
+        auto handle_ptr = create_cudnn_handle();
+        auto handle_    = *handle_ptr;
 
         // Creates the necessary tensor descriptors
         int64_t tensor_stride[4];

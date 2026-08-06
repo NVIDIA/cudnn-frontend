@@ -214,7 +214,7 @@ The current public surface consists of allocating function wrappers under
 lifecycle for BSA.
 
 Correctness tests and FP32 references are under
-`test/python/fe_api/block_sparse_attention`.
+`test/python/fe_api/bsa`.
 
 ## Source provenance
 

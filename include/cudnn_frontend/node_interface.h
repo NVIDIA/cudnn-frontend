@@ -1,8 +1,14 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: MIT
+ */
+
 #pragma once
 
 #include <memory>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 #include <variant>
 #include <limits>
 
@@ -38,6 +44,7 @@ class CompositeSoftmaxNode;
 class UnifiedSoftmaxNode;
 class MoeGroupedMatmulNode;
 class UnifiedDiagonalBandMaskNode;
+
 class TransposeNode;
 class SliceNode;
 
@@ -101,10 +108,13 @@ class INode {
     };
 
     virtual error_t
+    collect_tensor_attributes_node(std::vector<std::shared_ptr<Tensor_attributes>>&) const {
+        return {error_code_t::OK, ""};
+    };
+
+    virtual error_t
     create_cudnn_tensors_node(
-        std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& uid_to_backend_tensors,
-        int64_t& potential_uid,
-        std::unordered_set<int64_t> const& used_uids) const = 0;
+        std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& uid_to_backend_tensors) const = 0;
 
     virtual error_t
     collect_tensors_in_workspace_node(
@@ -299,16 +309,22 @@ class INode {
         return {error_code_t::OK, ""};
     }
 
+    error_t
+    collect_tensor_attributes_subtree(std::vector<std::shared_ptr<Tensor_attributes>>& tensors) const {
+        CHECK_CUDNN_FRONTEND_ERROR(collect_tensor_attributes_node(tensors));
+        for (auto const& sub_node : sub_nodes) {
+            CHECK_CUDNN_FRONTEND_ERROR(sub_node->collect_tensor_attributes_subtree(tensors));
+        }
+        return {error_code_t::OK, ""};
+    }
+
     // Creates cudnn tensors for each node (and its sub nodes)
     error_t
     create_cudnn_tensors_subtree(
-        std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& uid_to_backend_tensors,
-        int64_t& potential_uid,
-        std::unordered_set<int64_t> const& used_uids) const {
-        CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensors_node(uid_to_backend_tensors, potential_uid, used_uids));
+        std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& uid_to_backend_tensors) const {
+        CHECK_CUDNN_FRONTEND_ERROR(create_cudnn_tensors_node(uid_to_backend_tensors));
         for (auto const& sub_node : sub_nodes) {
-            CHECK_CUDNN_FRONTEND_ERROR(
-                sub_node->create_cudnn_tensors_subtree(uid_to_backend_tensors, potential_uid, used_uids));
+            CHECK_CUDNN_FRONTEND_ERROR(sub_node->create_cudnn_tensors_subtree(uid_to_backend_tensors));
         }
         return {error_code_t::OK, ""};
     }
@@ -390,6 +406,14 @@ class INode {
    public:
     virtual Type
     getType() = 0;
+
+    // Returns this node's SDPA attributes if it is an SDPA node, nullptr otherwise.
+    // Provides an RTTI-free alternative to dynamic_cast for SDPA node discovery so that
+    // these headers compile under -fno-rtti (GCC/Clang) and /GR- (MSVC).
+    virtual SDPA_attributes const*
+    get_sdpa_attributes() const {
+        return nullptr;
+    }
 
     virtual std::pair<int64_t, std::unordered_map<KnobType_t, int64_t>>
     override_heuristics_query() const {
@@ -482,40 +506,21 @@ class NodeCRTP : public INode {
     }
 
     error_t
-    create_cudnn_tensors_node(std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors,
-                              int64_t& potential_uid,
-                              std::unordered_set<int64_t> const& used_uids) const override {
+    collect_tensor_attributes_node(std::vector<std::shared_ptr<Tensor_attributes>>& tensors) const override {
+        self().attributes.fill_tensors(tensors);
+        return {error_code_t::OK, ""};
+    }
+
+    error_t
+    create_cudnn_tensors_node(
+        std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors) const override {
         CUDNN_FE_LOG_LABEL_ENDL("INFO: Creating cudnn tensors for node named '" << self().attributes.name << "':");
+        std::vector<std::shared_ptr<Tensor_attributes>> node_tensors;
+        self().attributes.fill_tensors(node_tensors);
 
-        if constexpr (std::is_same_v<DerivedT, ConcatenateNode>) {
-            for (auto const& tensor : self().attributes.inputs) {
-                if (tensor) {
-                    CHECK_CUDNN_FRONTEND_ERROR(detail::create_cudnn_tensor(tensor, tensors, potential_uid, used_uids));
-                }
-            }
-        } else {
-            for (auto const& [name, tensor] : self().attributes.inputs) {
-                (void)name;
-                if (tensor) {
-                    CHECK_CUDNN_FRONTEND_ERROR(detail::create_cudnn_tensor(tensor, tensors, potential_uid, used_uids));
-                }
-            }
-        }
-
-        for (auto const& [name, tensor] : self().attributes.outputs) {
-            (void)name;
+        for (auto const& tensor : node_tensors) {
             if (tensor) {
-                CHECK_CUDNN_FRONTEND_ERROR(detail::create_cudnn_tensor(tensor, tensors, potential_uid, used_uids));
-            }
-        }
-
-        // Handle special case of BN where peer_stats is also an input
-        if constexpr (std::is_same_v<DerivedT, DBNNode> || std::is_same_v<DerivedT, BatchNormNode>) {
-            // Special case in BN where peer stats is also an input but is not present in inputs map
-            for (auto const& tensor : self().attributes.peer_stats) {
-                if (tensor) {
-                    CHECK_CUDNN_FRONTEND_ERROR(detail::create_cudnn_tensor(tensor, tensors, potential_uid, used_uids));
-                }
+                CHECK_CUDNN_FRONTEND_ERROR(detail::create_cudnn_tensor(tensor, tensors));
             }
         }
 

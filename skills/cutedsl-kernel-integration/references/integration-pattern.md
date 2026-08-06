@@ -4,37 +4,41 @@ This reference captures the local cuDNN Frontend pattern for integrating a CuTeD
 
 ## Package Layout
 
-Create or update an operation package under `python/cudnn/`.
-
-Typical layout:
+Create or update an operation package under the operation-first layout
+(`python/cudnn/<operation-family>/<implementation>/`). GEMM-family CuTe DSL
+kernels live under `python/cudnn/gemm/cutedsl/`:
 
 ```text
-python/cudnn/<operation>/
+python/cudnn/gemm/cutedsl/<dense|grouped|discrete_grouped>/<operation>/
 |-- __init__.py
 |-- api.py
 `-- <cutedsl_kernel_module>.py
 ```
 
-Nested API families are also valid when matching existing structure, for example:
+Other families keep their existing structure, for example:
 
-- `python/cudnn/grouped_gemm/<operation>/`
-- `python/cudnn/discrete_grouped_gemm/<operation>/`
+- `python/cudnn/gemm/cutedsl/dense/<operation>/`
+- `python/cudnn/gemm/cutedsl/grouped/<operation>/`
+- `python/cudnn/gemm/cutedsl/discrete_grouped/<operation>/`
 - `python/cudnn/sdpa/fwd/` or `python/cudnn/sdpa/bwd/`
 - `python/cudnn/native_sparse_attention/<component>/`
 
-Choose the closest existing family before creating a new top-level package.
+Choose the closest existing family; do not create a new top-level package under
+`python/cudnn/` for a GEMM kernel.
+
+When an existing SM100 kernel needs a Rubin-specific CuTeDSL implementation, keep the public API unchanged and add an internal architecture dispatch layer. See [Architecture-Specific Kernel Variants](#architecture-specific-kernel-variants-rubin--sm107) below.
 
 Use this routing table before choosing the package namespace:
 
 | Kernel shape | Preferred family |
 | --- | --- |
-| Plain dense GEMM or alpha/beta GEMM | Dense frontend-only package under `python/cudnn/<operation>/` |
-| Dense GEMM with a fused pointwise epilogue, scale, amax, or auxiliary output | GEMM-fusion package under `python/cudnn/<operation>/` |
+| Plain dense GEMM or alpha/beta GEMM | Dense GEMM package under `python/cudnn/gemm/cutedsl/dense/<operation>/` |
+| Dense GEMM with a fused pointwise epilogue, scale, amax, or auxiliary output | GEMM-fusion package under `python/cudnn/gemm/cutedsl/dense/<operation>/` |
 | Dense GEMM with distributed all-reduce | Dense package only after documenting distributed runtime requirements |
-| Grouped GEMM with packed or contiguous grouped inputs | `python/cudnn/grouped_gemm/<operation>/` |
-| Grouped GEMM with `padded_offsets`, `expert_cnt`, or scheduler workspace | `python/cudnn/grouped_gemm/<operation>/`, regardless of "dense" wording in source comments |
-| Grouped GEMM with `group_count`, `problem_shape_mnkl`, `strides_abc`, or `tensor_address_*` arrays | `python/cudnn/grouped_gemm/<operation>/` with per-group metadata |
-| Grouped GEMM with per-expert discrete weight pointers | `python/cudnn/discrete_grouped_gemm/<operation>/` |
+| Grouped GEMM with packed or contiguous grouped inputs | `python/cudnn/gemm/cutedsl/grouped/<operation>/` |
+| Grouped GEMM with `padded_offsets`, `expert_cnt`, or scheduler workspace | `python/cudnn/gemm/cutedsl/grouped/<operation>/`, regardless of "dense" wording in source comments |
+| Grouped GEMM with `group_count`, `problem_shape_mnkl`, `strides_abc`, or `tensor_address_*` arrays | `python/cudnn/gemm/cutedsl/grouped/<operation>/` with per-group metadata |
+| Grouped GEMM with per-expert discrete weight pointers | `python/cudnn/gemm/cutedsl/discrete_grouped/<operation>/` |
 | SDPA/FMHA-style attention kernel | `python/cudnn/sdpa/<direction>/` |
 | SDPA/FMHA two-kernel backward with DQ plus DK/DV subkernels | `python/cudnn/sdpa/bwd/`, preserving orchestrator and helper modules |
 | Multi-component sparse attention API | `python/cudnn/native_sparse_attention/<component>/` |
@@ -71,6 +75,68 @@ Follow the closest template instead of inventing a new lifecycle.
 
 Use existing helpers from `api_base.py`, `datatypes.py`, and family utility modules before adding new helpers.
 
+## Architecture-Specific Kernel Variants (Rubin / SM107)
+
+Use this pattern when the public API stays the same but Rubin (`sm107`, compute capability `(10, 7)`) needs a different CuTeDSL kernel module than the default SM100 implementation.
+
+Current examples:
+
+- `python/cudnn/gemm/cutedsl/grouped/quant/`
+- `python/cudnn/gemm/cutedsl/grouped/glu/`
+- `python/cudnn/gemm/cutedsl/grouped/dglu/`
+
+### File layout
+
+Keep the default kernel module unchanged and add a Rubin sibling:
+
+```text
+python/cudnn/gemm/cutedsl/grouped/<operation>/
+|-- api.py
+|-- <default_kernel_module>.py
+`-- <default_kernel_module_basename>_rubin.py
+```
+
+Examples:
+
+- `moe_blockscaled_grouped_gemm_quant.py` + `moe_blockscaled_grouped_gemm_quant_rubin.py`
+- `moe_blockscaled_grouped_gemm_glu_rubin.py`
+- `moe_blockscaled_grouped_gemm_dglu_rubin.py`
+
+Rubin kernel modules are internal implementation details. Do not add new public exports or lazy imports for them.
+
+### Rubin kernel module conventions
+
+- Import `cutlass.utils.rubin_helpers as sm107_utils` for MMA/tile setup that differs from SM100.
+- Keep the kernel class name aligned with the upstream CuTeDSL source when possible so `api.py` can alias it cleanly.
+- Preserve MoE helper/scheduler topology from the default kernel unless the Rubin source explicitly changes it.
+
+### `api.py` dispatch conventions
+
+Device gating lives in `cudnn.api_base`: `is_sm107_device()` and `self._is_rubin_kernel` (set in `APIBase.__init__`).
+
+Add a lazy Rubin kernel loader near the top of `api.py`:
+
+```python
+def _get_rubin_kernel():
+    from .<rubin_module> import <RubinKernelClass> as RubinKernelAlias
+    return RubinKernelAlias
+```
+
+In `__init__` (after `super().__init__()`):
+
+```python
+self._kernel = _get_rubin_kernel() if self._is_rubin_kernel else DefaultKernelClass
+```
+
+Then:
+
+- Replace hard-coded references like `DefaultKernelClass.FIX_PAD_SIZE` with `self._kernel.FIX_PAD_SIZE`.
+- Include `get_device_type()` (`"blackwell"` or `"rubin"`) in wrapper cache keys whenever the wrapper can dispatch to architecture-specific kernels.
+- Lazy-import the Rubin module inside `_get_rubin_kernel()` so non-Rubin environments do not pay import cost up front.
+- Branch in `compile()` / `execute()` only when the Rubin kernel signature or epilogue contract differs from the default kernel. `grouped_gemm_glu` and `grouped_gemm_dglu` only swap the kernel class; `grouped_gemm_quant` additionally adapts compile/execute kwargs for Rubin's optional `c` materialization path and omits `row_scale` on Rubin while keeping it on non-Rubin architectures.
+
+Do not expose `_is_rubin_kernel`, `_get_rubin_kernel()`, or Rubin module paths in public docs unless the user-visible contract changes.
+
 ## Public Exports
 
 Add lazy top-level exports in `python/cudnn/__init__.py` for public APIs intended to be imported as `from cudnn import ...`.
@@ -92,7 +158,7 @@ The loader already formats optional dependency failures as:
 raise ImportError(f"{name} requires optional dependencies. {_OPTIONAL_DEPENDENCY_INSTALL_HINT}: {e}") from e
 ```
 
-For family modules such as `grouped_gemm`, `discrete_grouped_gemm`, or `sdpa`, also update the family `__init__.py` if the class or wrapper should be available from that namespace.
+For family modules such as `gemm.cutedsl.grouped`, `gemm.cutedsl.discrete_grouped`, or `sdpa`, also update the family `__init__.py` (and the lazy-export table in `python/cudnn/__init__.py`) if the class or wrapper should be available from that namespace.
 
 ## Dependencies
 
@@ -136,9 +202,9 @@ Add focused pytest coverage under `test/python/fe_api/`.
 
 Typical files:
 
-- `test/python/fe_api/test_<operation>.py`
-- `test/python/fe_api/test_<operation>_utils.py` for reusable test helpers or shape/reference utilities.
-- A family subdirectory when matching existing structure, such as `test/python/fe_api/nsa/`.
+- `test/python/fe_api/<feature>/test_<operation>.py`
+- `test/python/fe_api/<feature>/test_<operation>_utils.py` for reusable test helpers or shape/reference utilities.
+- A nested family subdirectory when matching existing structure, such as `test/python/fe_api/nsa/`.
 
 Coverage should include:
 

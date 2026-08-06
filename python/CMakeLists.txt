@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+
 cmake_minimum_required(VERSION 3.18)
 
 Include(FetchContent)
@@ -71,6 +74,14 @@ python_add_library(
 target_link_libraries(_compiled_module PRIVATE pybind11::headers)
 
 target_compile_features(_compiled_module PRIVATE cxx_std_20)
+
+# pybind11's type registry is typeid-based, so this module requires RTTI even when
+# CUDNN_FRONTEND_ENABLE_RTTI is off for the rest of the build.
+if(MSVC)
+    target_compile_options(_compiled_module PRIVATE /GR)
+else()
+    target_compile_options(_compiled_module PRIVATE -frtti)
+endif()
 
 target_include_directories(
     _compiled_module

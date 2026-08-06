@@ -298,5 +298,5 @@ Tuple unpacking order is: `(c_tensor, d_tensor, d_col_tensor, amax_tensor, sfd_r
 
 For end-to-end usage and regression coverage, see:
 
-- `test/python/fe_api/test_grouped_gemm_srelu.py`
-- `test/python/fe_api/test_grouped_gemm_srelu_utils.py`
+- `test/python/fe_api/grouped_gemm/test_grouped_gemm_srelu.py`
+- `test/python/fe_api/grouped_gemm/test_grouped_gemm_srelu_utils.py`

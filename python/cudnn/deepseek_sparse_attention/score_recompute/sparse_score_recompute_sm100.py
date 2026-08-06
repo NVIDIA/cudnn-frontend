@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Sparse Backward Score Kernel — SM100 Cute-DSL Implementation.
 
@@ -249,7 +252,8 @@ class SparseScoreRecomputeSm100:
 
         tiled_mma_qk = _make_trivial_tiled_mma(
             self.q_dtype,
-            tcgen05.OperandMajorMode.K,
+            self.q_dtype,
+            cute.nvgpu.OperandMajorMode.K,
             self.q_major_mode,
             self.qk_acc_dtype,
             cta_group,
@@ -407,7 +411,7 @@ class SparseScoreRecomputeSm100:
         S_mbar_ptr = storage.S_mbar_ptr.data_ptr()
         reduce_sync_mbar_ptr = storage.reduce_sync_mbar_ptr.data_ptr()
         tmem_dealloc_mbar_ptr = storage.tmem_dealloc_mbar_ptr.data_ptr()
-        tmem_holding_buf = storage.tmem_holding_buf
+        tmem_holding_buf = storage.tmem_holding_buf.ptr
         clc_mbar_ptr = storage.clc_mbar_ptr.data_ptr()
         clc_response_ptr = storage.clc_response.data_ptr()
         sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)

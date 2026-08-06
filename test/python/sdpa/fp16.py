@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import cudnn
 import pytest
 import torch
@@ -18,6 +21,7 @@ from .helpers import (
     time_execution_cupti,
     profile_execution,
     print_tensor_stats,
+    note_frost_routing,
 )
 
 # fmt: off
@@ -81,6 +85,7 @@ def validate_config(cfg):
     if cfg.is_cu_seq_len:
         assert cfg.is_padding == True, "is_cu_seq_len=True requires is_padding=True"
         assert cfg.is_train == False, "is_cu_seq_len=True is forward-only (cu_seq_len is not plumbed for backward)"
+        assert cfg.cu_seq_len_sides in ("both", "q", "kv"), f"invalid cu_seq_len_sides={cfg.cu_seq_len_sides}"
 
     assert isinstance(cfg.seq_len_q, (list, tuple)), "input 'seq_len_q' must be list or tuple"
     if cfg.is_padding:
@@ -118,6 +123,10 @@ def validate_config(cfg):
     if cudnn_version < "9.24.0" and cfg.is_cu_seq_len:
         print("@@@@ Overall result: WAIVED, cu_seq_len_q/cu_seq_len_kv require cuDNN 9.24.0 or higher.")
         pytest.skip("cu_seq_len_q/cu_seq_len_kv require cuDNN 9.24.0 or higher")
+
+    if cudnn_version < "9.25.0" and cfg.is_cu_seq_len and cfg.cu_seq_len_sides != "both":
+        print("@@@@ Overall result: WAIVED, mixed-form sequence lengths require cuDNN 9.25.0 or higher.")
+        pytest.skip("mixed-form sequence lengths (cumulative on one side only) require cuDNN 9.25.0 or higher")
 
 
 def allocate_tensors(cfg, rng_data_gen, perf=False):
@@ -159,14 +168,17 @@ def allocate_tensors(cfg, rng_data_gen, perf=False):
     seq_len_q_gpu = torch.tensor(cfg.seq_len_q, dtype=torch.int32, device="cuda").view(-1) if len(cfg.seq_len_q) > 0 else None
     seq_len_kv_gpu = torch.tensor(cfg.seq_len_kv, dtype=torch.int32, device="cuda").view(-1) if len(cfg.seq_len_kv) > 0 else None
 
-    if cfg.is_cu_seq_len:
-        # When using cu_seq_len, the seq_len_q/seq_len_kv tensors are not part of the
-        # graph; instead, supply 1-D (b+1,) int32 prefix-sums of the per-batch seq_lens
-        # (the frontend promotes these to the 4-D form the backend requires).
+    # A side using the cumulative form gets a 1-D (b+1,) int32 prefix-sum of its
+    # per-batch seq_lens (the frontend promotes these to the 4-D form the backend
+    # requires) instead of the regular per-batch tensor. The two sides choose
+    # independently (cu_seq_len_sides), so mixed forms are exercised too.
+    if cfg.is_cu_seq_len_q():
         allocs[TensorUid.cu_seq_len_q] = (prefix_sum(seq_len_q_gpu).to(torch.int32).view(-1), None, None)
-        allocs[TensorUid.cu_seq_len_kv] = (prefix_sum(seq_len_kv_gpu).to(torch.int32).view(-1), None, None)
     else:
         allocs[TensorUid.seq_len_q] = (seq_len_q_gpu, None, None)
+    if cfg.is_cu_seq_len_kv():
+        allocs[TensorUid.cu_seq_len_kv] = (prefix_sum(seq_len_kv_gpu).to(torch.int32).view(-1), None, None)
+    else:
         allocs[TensorUid.seq_len_kv] = (seq_len_kv_gpu, None, None)
 
     if cfg.is_ragged:
@@ -267,11 +279,11 @@ def create_forward_graph(cfg, tensors, cudnn_handle):
     block_mask_dim = (cfg.batches, cfg.h_q, (cfg.s_q + TILE_M - 1) // TILE_M, ((cfg.s_kv + TILE_N - 1) // TILE_N + 7) // 8)
     block_mask = graph.tensor(uid=int(TensorUid.block_mask), dim=block_mask_dim, stride=(block_mask_dim[1]*block_mask_dim[2]*block_mask_dim[3], block_mask_dim[2]*block_mask_dim[3], block_mask_dim[3], 1), data_type=cudnn.data_type.UINT8) if cfg.is_block_mask else None
 
-    seq_len_q = graph.tensor(uid=int(TensorUid.seq_len_q), dim=(cfg.batches,), stride=(1,), data_type=cudnn.data_type.INT32) if (cfg.is_padding and not cfg.is_cu_seq_len) else None
-    seq_len_kv = graph.tensor(uid=int(TensorUid.seq_len_kv), dim=(cfg.batches,), stride=(1,), data_type=cudnn.data_type.INT32) if (cfg.is_padding and not cfg.is_cu_seq_len) else None
+    seq_len_q = graph.tensor(uid=int(TensorUid.seq_len_q), dim=(cfg.batches,), stride=(1,), data_type=cudnn.data_type.INT32) if (cfg.is_padding and not cfg.is_cu_seq_len_q()) else None
+    seq_len_kv = graph.tensor(uid=int(TensorUid.seq_len_kv), dim=(cfg.batches,), stride=(1,), data_type=cudnn.data_type.INT32) if (cfg.is_padding and not cfg.is_cu_seq_len_kv()) else None
 
-    cu_seq_len_q = graph.tensor(uid=int(TensorUid.cu_seq_len_q), dim=(cfg.batches + 1,), stride=(1,), data_type=cudnn.data_type.INT32) if cfg.is_cu_seq_len else None
-    cu_seq_len_kv = graph.tensor(uid=int(TensorUid.cu_seq_len_kv), dim=(cfg.batches + 1,), stride=(1,), data_type=cudnn.data_type.INT32) if cfg.is_cu_seq_len else None
+    cu_seq_len_q = graph.tensor(uid=int(TensorUid.cu_seq_len_q), dim=(cfg.batches + 1,), stride=(1,), data_type=cudnn.data_type.INT32) if cfg.is_cu_seq_len_q() else None
+    cu_seq_len_kv = graph.tensor(uid=int(TensorUid.cu_seq_len_kv), dim=(cfg.batches + 1,), stride=(1,), data_type=cudnn.data_type.INT32) if cfg.is_cu_seq_len_kv() else None
 
     seed = offset = dropout_tuple = rng_dump = None
     if cfg.is_dropout:
@@ -371,6 +383,9 @@ def create_forward_graph(cfg, tensors, cudnn_handle):
         graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
         graph.check_support()
         graph.build_plans()
+        # FROST auto-selection resolved at build_plans (first eligible engine,
+        # native fallback on build failure); tally the outcome.
+        note_frost_routing(graph, label="fp16-fwd")
     except cudnn.cudnnGraphNotSupportedError as e:
         print(f"@@@@ Overall result: WAIVED, not supported forward graph. {e}")
         pytest.skip("not supported forward graph")
@@ -519,6 +534,7 @@ def create_backward_graph(cfg, tensors, cudnn_handle, max_t_q, max_t_kv):
         graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
         graph.check_support()
         graph.build_plans()
+        note_frost_routing(graph, label="fp16-bwd")
     except cudnn.cudnnGraphNotSupportedError as e:
         print(f"@@@@ Overall result: WAIVED, not supported backward graph. {e}")
         pytest.skip("not supported backward graph")
@@ -850,7 +866,7 @@ def cleanup_tensors(allocs):
     torch.cuda.empty_cache()
 
 
-def exec_sdpa(cfg, request, cudnn_handle):
+def exec_sdpa(cfg, request, cudnn_handle, tensor_initializer=None, tensor_checker=None):
     if request.config.option.dryrun:
         pytest.skip("dry run mode")
 
@@ -859,6 +875,8 @@ def exec_sdpa(cfg, request, cudnn_handle):
     perf = request.config.getoption("--perf")
     rng_data_gen = torch.Generator(device="cuda").manual_seed(cfg.rng_data_seed)
     allocs, tensors, max_t_q, max_t_kv = allocate_tensors(cfg, rng_data_gen, perf=perf)
+    if tensor_initializer is not None:
+        tensor_initializer(tensors, rng_data_gen)
 
     fwd_graph, fwd_pack = create_forward_graph(cfg, tensors, cudnn_handle)
     bwd_graph, bwd_pack = create_backward_graph(cfg, tensors, cudnn_handle, max_t_q, max_t_kv) if cfg.is_train else (None, None)
@@ -868,6 +886,9 @@ def exec_sdpa(cfg, request, cudnn_handle):
     if cfg.is_train:
         execute_graph(bwd_graph, bwd_pack, allocs, tensors, cudnn_handle, request, label="Backward")
         check_deterministic(cfg, tensors, allocs, bwd_graph, bwd_pack, cudnn_handle, request)
+
+    if tensor_checker is not None:
+        tensor_checker(tensors)
 
     if not perf:
         compute_and_compare_reference(cfg, allocs, tensors, request.config.getoption("--diffs"))
