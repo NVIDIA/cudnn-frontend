@@ -36,6 +36,7 @@ from typing import Type
 
 import cuda.bindings.driver as cuda_driver
 import cutlass
+import cutlass.utils
 import cutlass.experimental.cuda as cuda
 import cutlass.cute as cute
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
@@ -344,7 +345,7 @@ class SM120FusedMultiHeadAttentionFP16Backward:
         self.off_sP = self.off_sV + M * N
         self.smem_elems = self.off_sV + max(N * d, 2 * M * N)
         smem_bytes = self.smem_elems * in_dtype.bytes
-        cap = cutlass.memory.get_smem_capacity_in_bytes("sm_120")
+        cap = cutlass.utils.get_smem_capacity_in_bytes("sm_120")
         if smem_bytes > cap:
             raise ValueError(f"smem {smem_bytes} B exceeds sm_120 cap {cap}")
 
