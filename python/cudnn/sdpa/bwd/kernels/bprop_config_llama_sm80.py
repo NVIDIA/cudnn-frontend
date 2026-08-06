@@ -4,7 +4,7 @@
 """SM80 (Ampere/A100) BPROP config — Llama d_qk=d_v=128, FP16/BF16.
 
 Single source of truth for the SM80 SDPA backward kernel
-(`bprop_sdpa_f16_sm80.py`).  Mirrors the forward adapter's llama knob defaults
+(`bprop_f16_sm80.py`).  Mirrors the forward adapter's llama knob defaults
 convention (frozen dataclass + module singleton `CFG`), but the knobs
 describe the *backward* pipeline shape:
 

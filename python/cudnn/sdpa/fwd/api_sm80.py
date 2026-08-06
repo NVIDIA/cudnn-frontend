@@ -312,7 +312,7 @@ class SdpafwdSm80(APIBase):
         )
 
         # ---- head-dim envelope -------------------------------------------
-        # The flavor envelope tops out at dsv3 (D_QK=192, D_V=128).  Reject
+        # The flavor envelope tops out at qwen (D_QK=256, D_V=256).  Reject
         # larger heads with a clear message instead of waiting for the
         # flavor picker to raise.
         max_d_qk = max(fdqk for fdqk, _ in _FLAVOR_DIMS.values())
@@ -385,22 +385,25 @@ class SdpafwdSm80(APIBase):
             self.mask_token = "causal" if swa_left < 0 else "causal_swa"
             self.swa_window_runtime = max(0, swa_left) if swa_left >= 0 else 0
             self.right_bound = max(0, swa_right)
-        elif swa_left >= 0 or swa_right >= 0:
+        elif swa_left >= 0:
+            # A left window alone selects SWA; window_size_right is only
+            # meaningful with is_causal=True.
             self._not_implemented_error_if(
                 swa_right > 0,
                 "SM80 SDPA: non-causal SWA with window_size_right > 0 is not supported " "(window_size_right is only meaningful with is_causal=True)",
             )
             self.mask_token = "swa"
-            self.swa_window_runtime = max(0, swa_left)
+            self.swa_window_runtime = swa_left
         else:
+            # window_size=(-1, r) without is_causal: a bare right bound has no
+            # diagonal to anchor to — reject rather than silently pick a mask
+            # (the THD path resolves the same input to "none").
+            self._not_implemented_error_if(
+                swa_right >= 0,
+                "SM80 SDPA: window_size_right without a left window or is_causal=True has no effect; pass is_causal=True or a left window",
+            )
             self.mask_token = "none"
             self.swa_window_runtime = 0
-
-        if self.mask_token == "swa":
-            self._value_error_if(
-                self.swa_window_runtime < 0,
-                f"SWA window must be >= 0 tokens; got {self.swa_window_runtime}",
-            )
 
         # ---- scheduler -----------------------------------------------
         # Surface unsupported tokens up front (otherwise _resolve_scheduler
@@ -615,6 +618,11 @@ def _thd_forward(
     flavor = _pick_flavor(d_qk, d_v)
     fdqk, fdv = _FLAVOR_DIMS[flavor]
     tile_m, num_warps, tile_n = _FLAVOR_KNOBS[flavor]
+    # Resolve the default scale from the USER's head dim before padding: the
+    # kernel would otherwise derive 1/sqrt(D) from the padded flavor width
+    # (e.g. 1/sqrt(128) for a d=96 llama-flavor call) — silently wrong.
+    if scale_softmax is None or scale_softmax == 0.0:
+        scale_softmax = 1.0 / math.sqrt(d_qk)
     if d_qk < fdqk:
         q = _pad_last_dim(q, fdqk)
         k = _pad_last_dim(k, fdqk)
@@ -705,6 +713,19 @@ def sdpa_fwd_wrapper_sm80(
     if cum_seqlen_q_tensor is not None:
         if max_s_q is None:
             raise ValueError("THD path requires max_s_q (host int) for the grid")
+        # Reject dense-only features up front: _thd_forward does not plumb
+        # them, and silently computing without a requested feature is worse
+        # than an error.
+        for label, present in (
+            ("rope_freqs", rope_freqs is not None),
+            ("block_mask", block_mask is not None),
+            ("seq_kv_lens", seq_kv_lens is not None),
+            ("seq_len_q", seq_len_q is not None),
+            ("scale_output != 1.0", scale_output not in (None, 1.0)),
+            ('scheduler != "auto"', scheduler not in (None, "auto")),
+        ):
+            if present:
+                raise NotImplementedError(f"SM80 SDPA THD (cum_seqlen_*) path does not support {label}; the dense path serves it")
         with _stream_ctx(current_stream):
             return _thd_forward(
                 q_tensor,

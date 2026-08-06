@@ -1035,14 +1035,15 @@ def _sdpa_kernel(
         )
         cp_async_commit()  # group: V[i-1]
 
-        # ---- Step 2: wait for prev iter's K + V prefetches --------------
+        # ---- Step 2: wait for the oldest pending prefetch ---------------
         # Pending groups (oldest first): prev iter's K[i] prefetch, prev
         # iter's V[i] prefetch, this iter's K[i-1] prefetch, this iter's
-        # V[i-1] prefetch.  wait(2) drains the 2 oldest = prev's K + V,
-        # leaving the new K[i-1] + V[i-1] prefetches streaming through
-        # QK + softmax + SV.  On iter 0 only 2 groups are in flight (no
-        # prev iter) so wait(2) is a no-op — sK_cur/sV_cur are already
-        # populated by the prologue.
+        # V[i-1] prefetch.  wait(3) drains exactly the oldest (prev's K[i]);
+        # the mid-iteration wait(2) below drains prev's V[i] just before the
+        # SV mma needs it, leaving the new K[i-1] + V[i-1] prefetches
+        # streaming through QK + softmax + SV (see the module docstring's
+        # pipeline sketch).  On iter 0 fewer groups are in flight and the
+        # prologue has already populated sK_cur/sV_cur.
         cp_async_wait(3)
         nvvm.barrier_cta_sync()
 

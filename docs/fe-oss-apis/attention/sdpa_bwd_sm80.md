@@ -25,8 +25,8 @@ perf variant that is not yet routed.  Provenance:
 
 ## Requirements
 
-Same as the forward: the `cutedsl` optional dependency plus the `ctm` DSL
-package (internal distribution; not on PyPI), and
+Same as the forward: the `cutedsl` optional dependency
+(`nvidia-cutlass-dsl` + `apache-tvm-ffi`) and an SM80 (A100) device.
 
 ## API Usage
 
@@ -52,7 +52,10 @@ dq, dk, dv = grads["dq_tensor"], grads["dk_tensor"], grads["dv_tensor"]
 ```
 
 Packed THD / varlen: pass `[1, T, H, D]`-packed tensors, packed `[1, H, T_q]`
-LSE, and `cum_seqlen_q_tensor` / `cum_seqlen_k_tensor`.
+LSE, and `cum_seqlen_q_tensor` / `cum_seqlen_k_tensor`.  The THD path serves
+causal / SWA / bottom-right masks plus ALiBi, sinks, and deterministic dQ;
+dense-only features (bias, RoPE, block masks, `seq_kv_lens` / `seq_len_q`)
+are rejected with `NotImplementedError` rather than silently dropped.
 
 ## Determinism
 

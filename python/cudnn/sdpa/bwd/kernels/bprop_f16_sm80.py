@@ -1735,6 +1735,7 @@ def backward(
     B, SQ, H, D = Q.shape
     _, SKV, Hk, D_K = K.shape
     _, _, Hv, _ = V.shape
+    assert D_K == D, f"K head dim ({D_K}) must match Q head dim ({D}); every K offset is computed from Q's"
     d_qk, d_v = D, V.shape[3]
     # GQA / MQA: H query heads share Hk KV heads (H % Hk == 0).  Each query head
     # is processed by its own CTA; dK/dV are written per-query-head then summed
@@ -1848,6 +1849,11 @@ def backward(
             has_bias or has_rope or has_block_mask or has_sink or has_seq_kv_lens or has_seq_len_q
         ), "THD/varlen bprop: bias/rope/block_mask/sink/seq_kv_lens/seq_len_q not supported yet"
         sched_policy = SCHED_DEFAULT
+    # RoPE staging reuses the sDQ SMEM buffer, which the d_qk > 128 configs
+    # drop (dq_smem_coalesce) to stay under the 164 KiB dynamic-SMEM cap —
+    # re-enabling it via has_rope would exceed the budget at launch
+    # (~48-64 KiB over at d=192/256).
+    assert not (has_rope and d_qk > 128), "RoPE bprop requires d_qk <= 128 (the sDQ SMEM staging exceeds the A100 budget beyond that)"
     # seq_len_q [B] int32 — per-batch live Q length (dense PADDED).  Dummy 1-elem
     # when unused (kernel never reads it at has_seq_len_q=False).
     if has_seq_len_q:

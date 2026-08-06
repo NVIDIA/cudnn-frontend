@@ -126,7 +126,10 @@ def test_sdpa_fwd_sm80_padded_row_lse_trim(d, s_q):
     trim, leaving finite LSE on padded rows — caught by
     test_mhas_v2::test_sdpa_random_bwd_L0 once a random config combined a
     tile-aligned S_q with bottom-right padding."""
-    from cudnn.sdpa import sdpa_fwd_wrapper_sm80
+    try:
+        from cudnn.sdpa import sdpa_fwd_wrapper_sm80
+    except ImportError as e:
+        pytest.skip(f"SM80 SDPA API not available: {e}")
 
     b, h = 4, 2
     torch.manual_seed(0)

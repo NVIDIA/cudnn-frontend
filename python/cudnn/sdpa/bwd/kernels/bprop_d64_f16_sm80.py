@@ -38,7 +38,7 @@ MHA (no GQA), dense (no mask).  Asserts ``S_q % 64 == 0`` and ``S_kv % 128 == 0`
 
 ABI: ``backward(Q,K,V,dO,O,lse,*,scale=None,do_dot=None) -> (dQ,dK,dV)`` — BSHD
 in/out; ``lse`` natural-log ``[B,H,S_q]``.  The do_dot (rowsum O∘dO) preprocessing
-reuses the shared ``bprop_sdpa_f16_sm80`` device kernel.
+reuses the shared ``bprop_f16_sm80`` device kernel.
 
 Validation: f16 rel ~3.8e-4, bf16 ~3.4e-3 (dQ/dK/dV) at S=512; multi-tile
 (S_q=768) also validated.

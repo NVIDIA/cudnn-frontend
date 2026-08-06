@@ -48,11 +48,14 @@ def _ref_grads(q, k, v, do, *, is_causal, window_left, scale):
     v_exp = v_ref.repeat_interleave(g, dim=1)
     scores = torch.matmul(q_ref, k_exp.transpose(-1, -2)) * scale
     if is_causal:
+        # Top-left diagonal, matching the wrapper's default mask (the tests
+        # never pass causal_bottom_right); with a bottom-right-anchored
+        # reference the two would agree only while s_q == s_kv.
         i = torch.arange(s_q, device=q.device).view(s_q, 1)
         j = torch.arange(s_kv, device=q.device).view(1, s_kv)
-        keep = j <= (i + (s_kv - s_q))
+        keep = j <= i
         if window_left >= 0:
-            keep &= ((i + (s_kv - s_q)) - j) <= window_left
+            keep &= (i - j) <= window_left
         scores = scores.masked_fill(~keep, float("-inf"))
     probs = torch.softmax(scores, dim=-1)
     o = torch.matmul(probs, v_exp)

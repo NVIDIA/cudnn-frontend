@@ -5,7 +5,8 @@
 
 Companion to ``fwd/api_sm80.py``.  The kernels live at
 ``kernels/bprop_f16_sm80.py`` (generic, fully parameterized on d_qk/d_v)
-and ``kernels/bprop_d64_f16_sm80.py`` (d=64 perf variant, not yet routed) —
+and ``kernels/bprop_d64_f16_sm80.py`` (d=64 perf variant the adapter
+routes to when the call qualifies) —
 vendored from the upstream tile repo (provenance: ``kernels/__init__.py``).
 
 This adapter:
@@ -517,7 +518,6 @@ def sdpa_bwd_wrapper_sm80(
     block_mask: Optional[torch.Tensor] = None,
     cum_seqlen_q_tensor: Optional[torch.Tensor] = None,
     cum_seqlen_k_tensor: Optional[torch.Tensor] = None,
-    max_s_q: Optional[int] = None,
     deterministic: bool = False,
 ) -> TupleDict:
     """SM80 (A100) SDPA backward.
@@ -529,6 +529,18 @@ def sdpa_bwd_wrapper_sm80(
     # lse is packed [1, H, T_q].  Dedicated path that skips the dense BHSD
     # transpose + dense grad alloc (mirrors fwd/api.py's THD branch).
     if cum_seqlen_q_tensor is not None:
+        # Reject dense-only features up front: _thd_backward accepts only
+        # alibi/sinks/deterministic, and silently computing gradients without
+        # a requested feature is worse than an error.
+        for label, present in (
+            ("bias_tensor", bias_tensor is not None),
+            ("rope_freqs", rope_freqs is not None),
+            ("block_mask", block_mask is not None),
+            ("seq_kv_lens", seq_kv_lens is not None),
+            ("seq_len_q", seq_len_q is not None),
+        ):
+            if present:
+                raise NotImplementedError(f"SM80 SDPA THD (cum_seqlen_*) backward does not support {label}; the dense path serves it")
         with _stream_ctx(current_stream):
             return _thd_backward(
                 q_tensor,

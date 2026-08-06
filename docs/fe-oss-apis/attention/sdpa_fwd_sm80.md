@@ -18,13 +18,15 @@ Two integration surfaces are provided:
 The kernels live under `python/cudnn/sdpa/fwd/kernels/`
 (`prefill_f16_sm80.py` generic, `prefill_d256_f16_sm80.py` d=256), building
 on the shared FROST tile library at `python/cudnn/frost/tile_dsl/`
-(provenance: `python/cudnn/sdpa/bwd/kernels/__init__.py`).
+(provenance: `python/cudnn/sdpa/fwd/kernels/__init__.py`).
 
 ## Requirements
 
-In addition to the `cutedsl` optional dependency (`pip install
-nvidia-cudnn-frontend[cutedsl]`), the SM80 kernels require the `ctm` DSL
-package (internal distribution; not on PyPI) and run with
+The `cutedsl` optional dependency (`pip install
+nvidia-cudnn-frontend[cutedsl]`, i.e. `nvidia-cutlass-dsl` +
+`apache-tvm-ffi`) and an SM80 (A100) device. There is no other kernel
+dependency; the CuTe-DSL JIT runs on the first execute and the compiled
+kernels are cached per shape.
 
 ## API Usage
 

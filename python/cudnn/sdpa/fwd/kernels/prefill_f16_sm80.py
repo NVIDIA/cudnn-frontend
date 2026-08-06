@@ -15,8 +15,9 @@ Pipeline shape (Llama-class, d_qk = d_v = 128; DSv3 = d_qk=192, d_v=128):
 
   ┌─────────────────────────────────────────────────────────────────┐
   │  1 CTA = 1 (batch, head, q_tile) work item.  No persistent loop.│
-  │  4 warps × 32 threads = 128 threads/CTA, no warp specialization.│
-  │  TILE_M = 64  (Q rows / CTA — each warp owns 16)                │
+  │  8 warps × 32 threads = 256 threads/CTA (default; flavor-tuned),│
+  │  no warp specialization.                                        │
+  │  TILE_M = 128 (Q rows / CTA — each warp owns 16)                │
   │  TILE_N = 64  (KV rows / iter)                                  │
   │  D_QK   = 128 (head_dim, also Q→reg storage dim)                │
   │  D_V    = 128 (V head_dim, = D_QK on Llama)                     │
@@ -67,8 +68,9 @@ only — no mbarriers, no clusters (clusters are SM90+).  Standard Ampere
 ldgsts idiom.
 
 Layout choices:
-- SMEM K / V row-major [N_kv_row][d_col] with no XOR swizzle (Phase 2
-  baseline — adds bank conflicts at ldmatrix, addressed in Phase 3).
+- SMEM K / V row-major [N_kv_row][d_col] with the 128B XOR swizzle
+  (``load_tile_2d(..., swizzle=True)`` + ``swizzle_xor_128b`` at ldmatrix)
+  to keep the ldmatrix reads bank-conflict-free.
 - ldmatrix.x4 .row for A operands (Q at QK time; P at SV time is built
   directly from QK D-frag regs — no ldmatrix at all).
 - ldmatrix.x2 layout for B operands depends on which SMEM axis aligns
@@ -1017,20 +1019,13 @@ def _sdpa_kernel(
         )
         cp_async_commit()  # group: V[i]
 
-        # ---- Step 4.5: prefetch K[i+1] (unconditional via cp_size pred) -
-        # Always issue K[i+1] cp.async — on the last iter we'd otherwise
-        # read OOB GMEM, so set ``cp_size_bytes=0`` to predicate the load:
-        # PTX cp.async with source-bytes < dst-bytes zero-fills the
-        # remainder (here ALL bytes), making the instruction a benign
-        # SMEM zero-store with NO GMEM dereference.  Issued AFTER softmax
-        # so K[i+1]'s drain covers V-wait + SV mma + next-iter K-wait.
-        #
-        # Runtime predication: with runtime ``n_kv_tiles`` we cannot
-        # const-fold ``is_last_iter``.  Build cp_size as a runtime Int32:
-        # ``cp_size = 16 * (kv_iter + 1 < n_kv_tiles)`` — the comparison
-        # is cast to ``Int32`` (0/1) and multiplied by the full 16-byte
-        # copy size.  load_tile_2d always passes this through to
-        # cp.async.shared.global's ``cp-size`` register operand.
+        # ---- Step 1.5: prefetch K[i-1] (predicated via cp_size) ----------
+        # Always issue the prefetch cp.async and predicate it via
+        # ``cp_size_bytes``: PTX cp.async with source-bytes < dst-bytes
+        # zero-fills the remainder (here ALL bytes), making the predicated
+        # instruction a benign SMEM zero-store with NO GMEM dereference.
+        # Issued before this iter's K-wait so its drain is covered by the
+        # whole QK + softmax + SV pipeline of this iteration.
         bytes_per_copy_full = ELEMS_PER_LD * ELEM_BYTES  # 16
         # Reverse iter: prefetch K[i-1] (the PREDECESSOR, not successor).
         # On the LAST iter (kv_iter == kv_left), K[kv_left-1] would go OOB
@@ -1061,9 +1056,10 @@ def _sdpa_kernel(
         cp_async_commit()  # group: K[i-1] (no-op on first kv_iter == kv_left)
 
         # ---- Step 2: wait for K[i] ---------------------------------------
-        # Pending groups (oldest first): K[i] (from prev iter's Step 5.5,
-        # or prologue), V[i] (Step 1).  wait_group(1) drains K[i] (oldest);
-        # V[i] keeps streaming through QK + softmax.
+        # Pending groups (oldest first): K[i] (from the prev iter's prefetch
+        # or the prologue), V[i] (Step 1), K[i-1] (the prefetch just issued).
+        # wait_group(2) drains exactly K[i]; V[i] and K[i-1] keep streaming
+        # through QK + softmax.
         cp_async_wait(2)
         nvvm.barrier_cta_sync()
 
