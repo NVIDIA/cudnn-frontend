@@ -80,27 +80,16 @@ def _ref_bwd(
     is_causal: bool = False,
     causal_bottom_right: bool = False,
 ):
-    """FP32 autograd reference: returns (o, stats, dq, dk, dv).
+    """Reference via the canonical refs (sdpa/fp16_ref.py)."""
 
-    ``stats`` is the natural-log LSE reshaped to the graph's (B, H, S_q, 1)
-    layout — exactly what the forward pass would have produced.
-    """
+    import cudnn
+    from sdpa.fp16_ref import compute_ref, compute_ref_backward
 
-    s_q, s_kv = q.shape[2], k.shape[2]
-    q32 = q.detach().float().requires_grad_()
-    k32 = k.detach().float().requires_grad_()
-    v32 = v.detach().float().requires_grad_()
-    scores = torch.matmul(q32, k32.transpose(-1, -2)) * scale
-    if is_causal:
-        diagonal = s_kv - s_q if causal_bottom_right else 0
-        mask = torch.ones(s_q, s_kv, device="cuda", dtype=torch.bool).tril(diagonal=diagonal)
-        scores = scores.masked_fill(~mask, float("-inf"))
-    stats = torch.logsumexp(scores, dim=-1, keepdim=True).contiguous()  # (B, H, S_q, 1)
-    p32 = torch.softmax(scores, dim=-1)
-    o32 = torch.matmul(p32, v32)
-    o32.backward(do.float())
-    o = o32.detach().to(q.dtype)
-    return o, stats, q32.grad.to(q.dtype), k32.grad.to(q.dtype), v32.grad.to(q.dtype)
+    diag_align = cudnn.diagonal_alignment.BOTTOM_RIGHT if causal_bottom_right else cudnn.diagonal_alignment.TOP_LEFT
+    right_bound = 0 if is_causal else None
+    o_ref, stats_ref, _, _ = compute_ref(q, k, v, attn_scale=scale, diag_align=diag_align, right_bound=right_bound, torch_type=q.dtype)
+    dq, dk, dv, _, _ = compute_ref_backward(q, k, v, o_ref, do, attn_scale=scale, diag_align=diag_align, right_bound=right_bound, torch_type=q.dtype)
+    return o_ref.to(q.dtype), stats_ref.contiguous(), dq.to(q.dtype), dk.to(q.dtype), dv.to(q.dtype)
 
 
 def _expected_workspace_bytes(batch: int, heads: int, s_q: int, head_dim: int) -> int:
@@ -288,17 +277,64 @@ def test_sdpa_bwd_dsl_sm120_cross_seqlen_causal_br():
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("is_causal", [False, True], ids=["dense", "causal_br"])
+@pytest.mark.parametrize(("s_q", "s_kv"), [(1024, 384), (193, 64)], ids=["sq_gt_skv", "sq_gt_skv_tails"])
+@torch_fork_set_rng(seed=6)
+def test_sdpa_bwd_dsl_sm120_causal_br_sq_gt_skv(s_q: int, s_kv: int):
+    """Bottom-right causal with S_q > S_kv"""
+
+    _require_dsl()
+    import cudnn
+
+    # Bottom right causal mask does not support max_s_q > max_s_kv in graph api.
+    try:
+        _run_case(s_q=s_q, s_kv=s_kv, head_dim=64, is_causal=True, causal_bottom_right=True)
+        return
+    except cudnn.cudnnGraphNotSupportedError as exc:
+        assert "max_s_q > max_s_kv" in str(exc), f"unexpected graph rejection: {exc}"
+
+    from cudnn.sdpa.bwd.api_dsl import sdpa_bwd_wrapper_dsl_sm120
+
+    batch, heads, head_dim, dtype = 2, 4, 64, torch.float16
+    scale = 1.0 / math.sqrt(head_dim)
+    q = _bhsd(batch, heads, s_q, head_dim, dtype)
+    k = _bhsd(batch, heads, s_kv, head_dim, dtype)
+    v = _bhsd(batch, heads, s_kv, head_dim, dtype)
+    do = _bhsd(batch, heads, s_q, head_dim, dtype)
+    o, stats, dq_ref, dk_ref, dv_ref = _ref_bwd(q, k, v, do, scale=scale, is_causal=True, causal_bottom_right=True)
+    o = _bhsd(batch, heads, s_q, head_dim, dtype, empty=True).copy_(o)
+    out = sdpa_bwd_wrapper_dsl_sm120(q, k, v, o, do, stats, is_causal=True, causal_bottom_right=True, scale_softmax=scale)
+    tol = _tolerances(dtype)
+    torch.testing.assert_close(out["dq_tensor"].float(), dq_ref.float(), **tol)
+    torch.testing.assert_close(out["dk_tensor"].float(), dk_ref.float(), **tol)
+    torch.testing.assert_close(out["dv_tensor"].float(), dv_ref.float(), **tol)
+    assert out["dq_tensor"][:, :, : s_q - s_kv, :].abs().max().item() == 0.0, "fully-masked rows must have exactly zero dQ"
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    ("s_q", "s_kv"),
+    [(384, 1024), (1024, 384), (64, 512)],
+    ids=["sq_lt_skv", "sq_gt_skv", "empty_kv_tiles"],
+)
+@torch_fork_set_rng(seed=3)
+def test_sdpa_bwd_dsl_sm120_cross_seqlen_causal_top_left(s_q: int, s_kv: int):
+    """Top-left causal with S_q != S_kv."""
+
+    _run_case(s_q=s_q, s_kv=s_kv, head_dim=64, is_causal=True)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("mask", ["dense", "causal_br", "causal_tl"])
 @torch_fork_set_rng(seed=4)
-def test_sdpa_bwd_dsl_sm120_sequence_tails(is_causal: bool):
+def test_sdpa_bwd_dsl_sm120_sequence_tails(mask: str):
     """Non-tile-multiple sequence tails exercise the partial-Q/KV predicates."""
 
     _run_case(
         s_q=193,
         s_kv=257,
         head_dim=128,
-        is_causal=is_causal,
-        causal_bottom_right=is_causal,
+        is_causal=mask != "dense",
+        causal_bottom_right=mask == "causal_br",
     )
 
 

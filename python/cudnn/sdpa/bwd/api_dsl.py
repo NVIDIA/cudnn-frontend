@@ -236,20 +236,6 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
             self.causal_bottom_right and not self.is_causal,
             "causal_bottom_right requires is_causal=True",
         )
-        # The kernel's diagonal is bottom-right (FA2). Top-left causal is
-        # identical when S_q == S_kv, which is what the engine gates on.
-        self._value_error_if(
-            self.is_causal and not self.causal_bottom_right and s_q != s_kv,
-            "top-left causal with S_q != S_kv is not supported (the kernel diagonal is bottom-right)",
-        )
-        # Bottom-right causal with S_q > S_kv produces fully-masked query
-        # rows whose forward stats are -inf; the backward exp2 replay is not
-        # specified for those rows. Conservatively rejected (engine gates on
-        # this too).
-        self._value_error_if(
-            self.is_causal and s_q > s_kv,
-            "causal with S_q > S_kv is not supported (fully-masked query rows)",
-        )
 
         self._runtime_error_if(not torch.cuda.is_available(), "CUDA is not available")
         self.compute_capability = torch.cuda.get_device_capability(self.q_desc.device)
@@ -284,6 +270,7 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
         params = Sm120TemplateParams(
             dtype_qkv=_SM120_DTYPE_QKV_CODE[self.dtype],
             is_causal=self.is_causal,
+            causal_top_left=self.is_causal and not self.causal_bottom_right,
             q_tile=self.q_tile,
             kv_tile=self.kv_tile,
         )

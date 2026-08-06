@@ -157,19 +157,8 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
 
     if facts.bottom_right and not facts.causal:
         return "bottom-right alignment requires a causal upper bound"
-    if facts.causal:
-        # The kernel's diagonal is bottom-right-aligned (FA2 convention:
-        # masked iff k > q + S_kv - S_q). Top-left causal is identical when
-        # S_q == S_kv.
-        if facts.bottom_right and not capabilities.bottom_right:
-            return "graph uses bottom-right causal, which this engine does not support"
-        if not facts.bottom_right and facts.s_q != facts.s_kv:
-            return "top-left causal with S_q != S_kv is not supported (the kernel diagonal is bottom-right)"
-        # Bottom-right causal with S_q > S_kv produces fully-masked query
-        # rows whose forward stats are -inf; the backward exp2 replay is not
-        # specified for those rows. Conservatively rejected.
-        if facts.s_q > facts.s_kv:
-            return "causal with S_q > S_kv is not supported (fully-masked query rows)"
+    if facts.causal and facts.bottom_right and not capabilities.bottom_right:
+        return "graph uses bottom-right causal, which this engine does not support"
 
     # The kernel consumes the forward stats as a contiguous natural-log LSE
     # (fp32 (B, H_q, S_q, 1)); a strided stats view has no zero-copy reshape.

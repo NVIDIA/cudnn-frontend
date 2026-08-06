@@ -846,10 +846,9 @@ def test_bwd_probe_rejects_unsupported_head_dim(monkeypatch):
 
 def test_bwd_probe_causal_notches(monkeypatch):
     monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
-    # Top-left causal requires S_q == S_kv (the kernel diagonal is bottom-right).
-    assert not _bwd_eligible(_mk_bwd_graph(s_q=S // 2, use_causal_mask=True))
-    # Causal with S_q > S_kv has fully-masked query rows (stats = -inf).
-    assert not _bwd_eligible(_mk_bwd_graph(s_q=2 * S, use_causal_mask_bottom_right=True))
+    assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(s_q=S // 2, use_causal_mask=True))
+    assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(s_q=2 * S, use_causal_mask=True))
+    assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(s_q=2 * S, use_causal_mask_bottom_right=True))
     # Sliding window is not supported.
     assert not _bwd_eligible(_mk_bwd_graph(use_causal_mask=True, sliding_window_length=64))
 
@@ -904,8 +903,8 @@ def test_bwd_mismatch_reason_strings(monkeypatch):
     assert reason is not None and "GQA" in reason
     reason = bwd_engines.mismatch(caps, _facts(_mk_bwd_graph(d=96)))
     assert reason is not None and "96" in reason
-    reason = bwd_engines.mismatch(caps, _facts(_mk_bwd_graph(s_q=S // 2, use_causal_mask=True)))
-    assert reason is not None and "top-left" in reason
+    reason = bwd_engines.mismatch(caps, _facts(_mk_bwd_graph(use_causal_mask=True, sliding_window_length=64)))
+    assert reason is not None and "sliding window" in reason
     reason = bwd_engines.mismatch(caps, _facts(_mk_bwd_graph(use_deterministic_algorithm=True)))
     assert reason is not None and "deterministic" in reason
     reason = bwd_engines.mismatch(caps, _facts(_mk_bwd_graph()), engines.SdpaFwdKnobs(tile_m=64))
