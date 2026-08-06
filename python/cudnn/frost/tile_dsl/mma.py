@@ -13,6 +13,36 @@ from .swizzle import swizzle_xor_128b, swizzle_lin_128b
 
 
 @cute.jit
+def ptx_mma_m16n8k16_f32(
+    a0: cutlass.Int32,
+    a1: cutlass.Int32,
+    a2: cutlass.Int32,
+    a3: cutlass.Int32,
+    b0: cutlass.Int32,
+    b1: cutlass.Int32,
+    c0: cutlass.Float32,
+    c1: cutlass.Float32,
+    c2: cutlass.Float32,
+    c3: cutlass.Float32,
+    ab_dtype: cutlass.Constexpr[Type[cutlass.Numeric]],
+) -> tuple[cutlass.Float32, cutlass.Float32, cutlass.Float32, cutlass.Float32]:
+    """``mma.sync.aligned.m16n8k16.row.col.f32.{f16|bf16}.{f16|bf16}.f32``."""
+    if cutlass.const_expr(ab_dtype != cutlass.Float16 and ab_dtype != cutlass.BFloat16):
+        raise TypeError(f"Invalid A/B dtype: {ab_dtype}")
+    ab_tag = "f16" if cutlass.const_expr(ab_dtype == cutlass.Float16) else "bf16"
+    return cute.arch.inline_ptx(
+        f"mma.sync.aligned.m16n8k16.row.col.f32.{ab_tag}.{ab_tag}.f32 {{$0,$1,$2,$3}}, {{$4,$5,$6,$7}}, {{$8,$9}}, {{$10,$11,$12,$13}};",
+        write_only_types=[
+            cutlass.Float32,
+            cutlass.Float32,
+            cutlass.Float32,
+            cutlass.Float32,
+        ],
+        read_only_args=[a0, a1, a2, a3, b0, b1, c0, c1, c2, c3],
+    )
+
+
+@cute.jit
 def mma_ss(desc, desc_a_base, desc_b_base, tmem_c, tmem_sf_a=None, tmem_sf_b=None, accumulate: bool = False, k_start: int = 0, k_count=None):
     if cutlass.const_expr(desc.cta_group == 1):
         cta_group_kind = nvvm.CTAGroup.CTA_1

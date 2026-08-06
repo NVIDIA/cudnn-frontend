@@ -184,6 +184,8 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
     """
     if facts.invalid:
         return facts.invalid
+    if facts.is_backward:
+        return "this engine serves sdpa() forward graphs only"
     if knobs is not None:
         if not isinstance(knobs, SdpaFwdKnobs):
             return f"knob request is a {type(knobs).__name__}, not SdpaFwdKnobs — wrong operation's vocabulary"

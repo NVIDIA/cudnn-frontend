@@ -43,7 +43,7 @@ import os
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
-from .engine_ids import FROST_GEMM_ID_BASE, FROST_SDPA_FWD_ID_BASE, LINEAR_ATTENTION_ID_BASE
+from .engine_ids import FROST_GEMM_ID_BASE, FROST_SDPA_BWD_ID_BASE, FROST_SDPA_FWD_ID_BASE, LINEAR_ATTENTION_ID_BASE
 
 _LOG = logging.getLogger("cudnn.engines.manifest")
 
@@ -101,6 +101,7 @@ class EngineRow:
 _GEMM_ANCHOR = frozenset({"MATMUL", "MATMUL_FP8", "MOE_GROUPED_MATMUL"})
 _GEMM_CLOSURE = _GEMM_ANCHOR | frozenset({"POINTWISE", "REDUCTION", "RESHAPE", "BLOCK_SCALE_QUANTIZE", "BLOCK_SCALE_DEQUANTIZE"})
 _SDPA_FWD = frozenset({"SDPA", "SDPA_FP8", "SDPA_MXFP8"})
+_SDPA_BWD = frozenset({"SDPA_BWD"})
 _GDN = frozenset({"GDN", "GDN_BWD"})
 _GDN2 = frozenset({"GDN2", "GDN2_BWD"})
 _KDA = frozenset({"KDA", "KDA_BWD"})
@@ -174,6 +175,18 @@ MANIFEST: Tuple[EngineRow, ...] = (
         _SDPA_FWD,
         id_hi=FROST_SDPA_FWD_ID_BASE + 100,
         sm_lo=100,
+        opt_in=True,
+    ),
+    EngineRow(
+        FROST_SDPA_BWD_ID_BASE + 0,
+        "frost_sdpa_bwd",
+        "cudnn.sdpa.bwd.engine",
+        "FrostSdpaBwdEngines",
+        _SDPA_BWD,
+        id_hi=FROST_SDPA_BWD_ID_BASE + 100,
+        # TODO: widen when an SM100/SM80 spec lands
+        sm_lo=120,
+        sm_hi=121,
         opt_in=True,
     ),
 )

@@ -49,6 +49,8 @@ import cutlass.cute as cute
 
 from cutlass.experimental import primitives as prims
 from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_FP16
+from cudnn.frost.tile_dsl.mma import ptx_mma_m16n8k16_f32
+from cudnn.frost.tile_dsl.swizzle import swizzle_xor
 from cudnn.sdpa.fwd.config_sm120 import (
     SEQ_KV_TILES as _SEQ_KV_TILES,
     SEQ_Q_TILES as _SEQ_Q_TILES,
@@ -113,69 +115,6 @@ def nvvm_threadquad_reduction_sum(val: cutlass.Float32) -> cutlass.Float32:
         kind=prims.Shfl.BFLY,
     )
     return val
-
-
-@cute.jit
-def ptx_mma_m16n8k16_f32(
-    a0: cutlass.Int32,
-    a1: cutlass.Int32,
-    a2: cutlass.Int32,
-    a3: cutlass.Int32,
-    b0: cutlass.Int32,
-    b1: cutlass.Int32,
-    c0: cutlass.Float32,
-    c1: cutlass.Float32,
-    c2: cutlass.Float32,
-    c3: cutlass.Float32,
-    ab_dtype: cutlass.Constexpr[Type[cutlass.Numeric]],
-) -> tuple[cutlass.Float32, cutlass.Float32, cutlass.Float32, cutlass.Float32]:
-    """``mma.sync.aligned.m16n8k16.row.col.f32.{f16|bf16}.{f16|bf16}.f32``."""
-    if cutlass.const_expr(ab_dtype != cutlass.Float16 and ab_dtype != cutlass.BFloat16):
-        raise TypeError(f"Invalid A/B dtype: {ab_dtype}")
-    ab_tag = "f16" if cutlass.const_expr(ab_dtype == cutlass.Float16) else "bf16"
-    return cute.arch.inline_ptx(
-        f"mma.sync.aligned.m16n8k16.row.col.f32.{ab_tag}.{ab_tag}.f32 {{$0,$1,$2,$3}}, {{$4,$5,$6,$7}}, {{$8,$9}}, {{$10,$11,$12,$13}};",
-        write_only_types=[
-            cutlass.Float32,
-            cutlass.Float32,
-            cutlass.Float32,
-            cutlass.Float32,
-        ],
-        read_only_args=[a0, a1, a2, a3, b0, b1, c0, c1, c2, c3],
-    )
-
-
-@cute.jit
-def get_swizzled_col(
-    row: cutlass.Int32,
-    col: cutlass.Int32,
-    row_stride: cutlass.Constexpr[int],
-    elem_bytes: cutlass.Constexpr[int],
-) -> cutlass.Int32:
-    """Return the physical SMEM column for an XOR-swizzled row-major tile.
-
-    The XOR is applied at the 16-byte boundary for all element widths.
-    ``elem_bytes`` selects the element-domain shift and swizzle chunk size.
-    """
-    row_stride_bytes = row_stride * elem_bytes
-    chunk_bytes = 32
-    sw_bits = 1
-    row_shift = 2
-    if row_stride_bytes % 128 == 0:
-        chunk_bytes = 128
-        sw_bits = 3
-        row_shift = 0
-    elif row_stride_bytes % 64 == 0:
-        chunk_bytes = 64
-        sw_bits = 2
-        row_shift = 1
-    chunk_size = chunk_bytes // elem_bytes
-    elems_per_16b = 16 // elem_bytes
-    sw_base = elems_per_16b.bit_length() - 1
-    chunk = col // chunk_size
-    col_in_chunk = col % chunk_size
-    bit_msk = (1 << sw_bits) - 1
-    return chunk * chunk_size + (col_in_chunk ^ (((row >> row_shift) & bit_msk) << sw_base))
 
 
 @cute.jit
@@ -457,7 +396,7 @@ class SM120FusedMultiHeadAttentionForward:
             k_smem_ptr = (
                 mma_params.sK.data_ptr()
                 + k_physical_row * self.tma_swizzle_chunk_elems
-                + get_swizzled_col(
+                + swizzle_xor(
                     k_physical_row,
                     k_col_in_chunk,
                     self.tma_swizzle_chunk_elems,
@@ -671,7 +610,7 @@ class SM120FusedMultiHeadAttentionForward:
             sV_ptr = (
                 mma_params.sV.data_ptr()
                 + v_physical_row * self.tma_swizzle_chunk_elems
-                + get_swizzled_col(
+                + swizzle_xor(
                     v_physical_row,
                     v_col_in_chunk,
                     self.tma_swizzle_chunk_elems,

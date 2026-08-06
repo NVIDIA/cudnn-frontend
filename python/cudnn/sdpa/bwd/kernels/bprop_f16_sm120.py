@@ -1,0 +1,1263 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+
+"""FROST SM120 SDPA backward kernel template (fp16 / bf16).
+
+A fused multi-head attention (FMHA) backward for the NVIDIA Blackwell
+GeForce SM120 family (SM120 and SM121) using TMA loads and a
+warp-specialized producer/consumer schedule.
+
+The backward follows the FlashAttention-2 algorithm (Dao, 2023;
+https://github.com/Dao-AILab/flash-attention, BSD-3-Clause): a
+KV-stationary, seq-KV-parallel single pass in which each CTA owns one KV
+tile and walks the query tiles in descending order, computing the five
+chained GEMMs (S = Q*K^T, dP = dO*V^T, dV += P^T*dO, dQ = dS*K,
+dK += dS^T*Q) with the softmax VJP fused in registers. dK/dV accumulate
+in registers across the whole pass (no atomics); dQ is reduced through an
+fp32 workspace and finalized by a small convert kernel.
+
+Constraints:
+* Supported input dtypes: Float16 and BFloat16 (output dtype matches)
+* Head dimension must be one of 32, 64, or 128
+* Equal Q/KV head counts (no GQA); no dropout/alibi/local/softcap
+* Q/K/V/O/dO/dQ/dK/dV use compact BSHD storage
+* LSE input is the natural-log forward stats, fp32 (B, H, SQ) contiguous
+* dQ accumulation uses fp32 atomics (not bitwise deterministic)
+
+One backward call is three kernel launches through the per-shape
+``compile()`` cache at the bottom of this module: ``dot`` (delta =
+rowsum(dO*O), also zeroes the dq_accum workspace), ``main`` (the fused
+five-GEMM pass writing dK/dV), and ``cvt`` (dq_accum fp32 -> dQ io dtype).
+"""
+
+from functools import lru_cache
+from types import SimpleNamespace
+from typing import Type
+
+import cuda.bindings.driver as cuda_driver
+import cutlass
+import cutlass.utils
+import cutlass.experimental.cuda as cuda
+import cutlass.cute as cute
+from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
+from cutlass.experimental import primitives as prims
+from cutlass._mlir.dialects import arith
+
+from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_FP16
+from cudnn.frost.tile_dsl.mma import ptx_mma_m16n8k16_f32
+from cudnn.frost.tile_dsl.swizzle import swizzle_xor
+from cudnn.sdpa.bwd.config_sm120 import TemplateParams, validate_params
+
+# The FROST loader injects one immutable specialization before executing this
+# module. A direct import uses the dense FP16 defaults.
+PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
+validate_params(PARAMS)
+
+STORAGE_DTYPE = {DTYPE_FP16: cutlass.Float16, DTYPE_BF16: cutlass.BFloat16}[PARAMS.dtype_qkv]
+
+_LOG2E = 1.4426950408889634
+_COPY_ELEMS = 8  # 16-byte gmem<->smem chunk (8 fp16/bf16)
+
+
+def ceil_div(a: int, b: int) -> int:
+    return (a + b - 1) // b
+
+
+def largest_warp_partition(m_dim: int, n_dim: int) -> int:
+    """Largest valid 2-D warp-partition factor A for one GEMM's (M, N) pair.
+
+    The warp grid is (A, 8 // A): the A warps split m_dim into 16-row MMA
+    (m16n8k16) blocks, so m_dim must be a multiple of 16 * A, and the
+    per-warp N slice (n_dim * A / 8) must be a multiple of 16 (ldmatrix.x4
+    pairs). Used when a macro-tile override deviates from the per-head-dim
+    CONFIG default, whose hand-tuned partitions only validate for the
+    default tiles; "largest valid" is a heuristic, not a sweep winner.
+    """
+
+    for a in (8, 4, 2, 1):
+        if m_dim % (16 * a) == 0 and (n_dim * a // 8) % 16 == 0:
+            return a
+    raise ValueError(f"no valid warp partition for M{m_dim} N{n_dim}")
+
+
+@cute.jit
+def tile_ptr(
+    sbuf,
+    row: cutlass.Int32,
+    col: cutlass.Int32,
+    *,
+    page: cutlass.Constexpr[int],
+    rows: cutlass.Constexpr[int],
+):
+    """Element pointer into a paged+swizzled smem tile."""
+    pg = col // page
+    in_col = col % page
+    off = pg * (rows * page) + row * page + swizzle_xor(row, in_col, page, 2)
+    return sbuf.subview(off).data_ptr()
+
+
+@cute.jit
+def pack_half2(lo, hi, dtype: cutlass.Constexpr[Type[cutlass.Numeric]]):
+    """Pack two fp32 into a 2-element io-dtype vector (one 4 B store)."""
+    return cutlass.Vector.from_elements((lo.to(dtype), hi.to(dtype)), dtype)
+
+
+@cute.jit
+def _red_add_f32x2(ptr, v0: cutlass.Float32, v1: cutlass.Float32) -> None:
+    """One red.global.add.v2.f32 covering a thread's adjacent (c0,c1) pair."""
+    prims.inline_ptx(
+        "red.global.add.v2.f32 [$0], {$1, $2};",
+        read_only_args=[ptr, v0, v1],
+    )
+
+
+@cute.jit
+def load_a_frag(
+    sbuf,
+    kc: cutlass.Constexpr[int],
+    row0,
+    lane,
+    *,
+    rows: cutlass.Constexpr[int],
+    page: cutlass.Constexpr[int],
+):
+    """ldmatrix.x4 one (16 x 16) row-major A fragment."""
+    row = row0 + lane % 16
+    col = kc * 16 + (lane // 16) * 8
+    return prims.ldmatrix(tile_ptr(sbuf, row, col, page=page, rows=rows), 4, prims.MMALayout.ROW)
+
+
+@cute.jit
+def load_a_frag_transposed(
+    sbuf,
+    kc: cutlass.Constexpr[int],
+    col0,
+    lane,
+    *,
+    rows: cutlass.Constexpr[int],
+    page: cutlass.Constexpr[int],
+):
+    """ldmatrix.trans.x4: A[M, K] from a tile stored physically [K, M]."""
+    row = kc * 16 + lane % 16
+    col = col0 + (lane // 16) * 8
+    return prims.ldmatrix(tile_ptr(sbuf, row, col, page=page, rows=rows), 4, prims.MMALayout.COL)
+
+
+@cute.jit
+def copy16_smem_to_gmem(sptr, gptr):
+    """One 16-byte smem->gmem chunk."""
+    v = sptr.load(count=8)
+    gptr.store(v, alignment=16)
+
+
+@cute.jit
+def mma_bstream(
+    acc,
+    a_frag,
+    sB,
+    *,
+    b_k_step: cutlass.Constexpr[int],
+    M: cutlass.Constexpr[int],
+    N: cutlass.Constexpr[int],
+    b_trans: cutlass.Constexpr[bool],
+    b_rows: cutlass.Constexpr[int],
+    b_page: cutlass.Constexpr[int],
+    lane,
+    ab_dtype: cutlass.Constexpr[Type[cutlass.Numeric]],
+    col_base=0,
+    row_base=0,
+):
+    """One k=16 step of an (M x N) MMA, B streamed from smem via
+    ldmatrix.x4 (2 adjacent 8-column n-frags per fetch).
+
+    acc:    ``(M//16) * (N//8) * 4`` fp32, m-rep major then n-frag.
+    a_frag: ``(M//16) * 4`` Int32 (one 16x16 A fragment per m-rep).
+    """
+    M_BLOCKS = M // 16
+    N_FRAGS = N // 8
+    PAIRS = N_FRAGS // 2
+    a_stride = len(a_frag) // M_BLOCKS
+
+    if cutlass.const_expr(b_trans):
+        b_row = lane % 16
+        n_offset = lane // 16
+        layout_flag = prims.MMALayout.COL
+    else:
+        b_row = lane % 8
+        b_col_subchunk = (lane // 8) % 2
+        n_offset = lane // 16
+        layout_flag = prims.MMALayout.ROW
+
+    for pair in cutlass.range_constexpr(PAIRS):
+        n_frag = pair * 2
+        if cutlass.const_expr(b_trans):
+            row = b_k_step * 16 + b_row
+            col = (n_frag + n_offset) * 8 + col_base
+        else:
+            row = row_base + (n_frag + n_offset) * 8 + b_row
+            col = b_k_step * 16 + b_col_subchunk * 8 + col_base
+        b_ptr = tile_ptr(sB, row, col, page=b_page, rows=b_rows)
+        b_v = prims.ldmatrix(b_ptr, 4, layout_flag)
+        for m_block in cutlass.range_constexpr(M_BLOCKS):
+            a_off = m_block * a_stride
+            for half in cutlass.range_constexpr(2):
+                s = (m_block * N_FRAGS + n_frag + half) * 4
+                c0, c1, c2, c3 = ptx_mma_m16n8k16_f32(
+                    a_frag[a_off + 0],
+                    a_frag[a_off + 1],
+                    a_frag[a_off + 2],
+                    a_frag[a_off + 3],
+                    b_v[half * 2 + 0],
+                    b_v[half * 2 + 1],
+                    acc[s + 0],
+                    acc[s + 1],
+                    acc[s + 2],
+                    acc[s + 3],
+                    ab_dtype,
+                )
+                acc[s + 0] = c0
+                acc[s + 1] = c1
+                acc[s + 2] = c2
+                acc[s + 3] = c3
+
+
+@cute.jit
+def mma_abregs(
+    acc,
+    a_frag,
+    b_frag,
+    *,
+    b_k_step: cutlass.Constexpr[int],
+    M: cutlass.Constexpr[int],
+    N: cutlass.Constexpr[int],
+    ab_dtype: cutlass.Constexpr[Type[cutlass.Numeric]],
+):
+    """One k=16 MMA step with both operands resident in registers."""
+    M_BLOCKS = M // 16
+    N_FRAGS = N // 8
+    PAIRS = N_FRAGS // 2
+    a_stride = len(a_frag) // M_BLOCKS
+    b_k_stride = PAIRS * 4
+
+    for pair in cutlass.range_constexpr(PAIRS):
+        n_frag = pair * 2
+        b_off = b_k_step * b_k_stride + pair * 4
+        for m_block in cutlass.range_constexpr(M_BLOCKS):
+            a_off = m_block * a_stride
+            for half in cutlass.range_constexpr(2):
+                s = (m_block * N_FRAGS + n_frag + half) * 4
+                c0, c1, c2, c3 = ptx_mma_m16n8k16_f32(
+                    a_frag[a_off + 0],
+                    a_frag[a_off + 1],
+                    a_frag[a_off + 2],
+                    a_frag[a_off + 3],
+                    b_frag[b_off + half * 2 + 0],
+                    b_frag[b_off + half * 2 + 1],
+                    acc[s + 0],
+                    acc[s + 1],
+                    acc[s + 2],
+                    acc[s + 3],
+                    ab_dtype,
+                )
+                acc[s + 0] = c0
+                acc[s + 1] = c1
+                acc[s + 2] = c2
+                acc[s + 3] = c3
+
+
+# ---------------------------------------------------------------------------
+# Main kernel.
+# ---------------------------------------------------------------------------
+
+
+class SM120FusedMultiHeadAttentionFP16Backward:
+    """Configure and launch the SM120 FMHA backward kernel chain."""
+
+    DEFAULT_TILES = {
+        32: (128, 64),
+        64: (64, 128),
+        128: (64, 64),
+    }
+    # (d, q_tile, kv_tile) -> (warps_m_sdp, warps_m_dkv, warps_m_dq): for each
+    # GEMM the 8 compute warps form an (A, 8 // A) grid; the value is A, the
+    # warp count along that GEMM's own M (row) axis.
+    CONFIG = {
+        (32, 128, 64): (4, 4, 8),  # default for d32
+        (32, 128, 128): (4, 8, 4),  # for very long S
+        (64, 64, 128): (4, 8, 4),  # default for d64
+        (64, 128, 64): (8, 2, 4),  # For underfilled grids, kv64 can double CTA counts
+        (128, 64, 64): (2, 1, 4),  # default for d128
+    }
+
+    def __init__(
+        self,
+        in_dtype: Type[cutlass.Numeric] = cutlass.Float16,
+        is_causal: bool = False,
+        head_dim: int = 128,
+        use_pdl: bool = True,
+        q_tile: int = 0,
+        kv_tile: int = 0,
+    ):
+        self.in_dtype = in_dtype
+        self.is_causal = is_causal
+        self.d = head_dim
+        self.use_pdl = bool(use_pdl)
+        self.q_tile, self.kv_tile = self.DEFAULT_TILES[head_dim]
+        if q_tile:
+            self.q_tile = int(q_tile)
+        if kv_tile:
+            self.kv_tile = int(kv_tile)
+        if 128 % self.q_tile:
+            # dq_accum is scrambled in 128-row blocks (SQ_R is rounded to 128
+            # and the convert kernel unscrambles per block).
+            raise ValueError(f"q_tile must divide 128; got {self.q_tile}")
+        # Warp layouts: the sweep-tuned triple for this exact tile choice
+        # when we have one, else the largest-valid derivation
+        tuned = self.CONFIG.get((head_dim, self.q_tile, self.kv_tile))
+        if tuned is not None:
+            self.warps_m_sdp, self.warps_m_dkv, self.warps_m_dq = tuned
+        else:
+            self.warps_m_sdp = largest_warp_partition(self.q_tile, self.kv_tile)
+            self.warps_m_dkv = largest_warp_partition(self.kv_tile, head_dim)
+            self.warps_m_dq = largest_warp_partition(self.q_tile, head_dim)
+        M_, N_, d_ = self.q_tile, self.kv_tile, head_dim
+        for a_, m_dim, n_dim, tag in (
+            (self.warps_m_sdp, M_, N_, "warps_m_sdp"),
+            (self.warps_m_dkv, N_, d_, "warps_m_dkv"),
+            (self.warps_m_dq, M_, d_, "warps_m_dq"),
+        ):
+            if 8 % a_ or m_dim % (16 * a_) or (n_dim * a_ // 8) % 16:
+                raise ValueError(f"invalid {tag}={a_} for M{M_} N{N_} d{d_}")
+        self.page = 64 if head_dim % 64 == 0 else 32
+        self.threads = 384
+        self.num_consumer_warps = 8
+        self.load_warp_id = self.num_consumer_warps
+        self.tma_copy_iters = head_dim // self.page
+        self.tma_swizzle = cuda.TensorMapSwizzle.s128b if self.page == 64 else cuda.TensorMapSwizzle.s64b
+
+        M, N, d = self.q_tile, self.kv_tile, self.d
+        # smem element offsets
+        self.off_sQ = 0  # 2 buffers
+        self.off_sdO = 2 * M * d
+        self.off_sK = 3 * M * d
+        self.off_sV = self.off_sK + N * d
+        self.off_sdS = self.off_sV  # aliases sV (V is in regs)
+        self.off_sP = self.off_sV + M * N
+        self.smem_elems = self.off_sV + max(N * d, 2 * M * N)
+        smem_bytes = self.smem_elems * in_dtype.bytes
+        cap = cutlass.utils.get_smem_capacity_in_bytes("sm_120")
+        if smem_bytes > cap:
+            raise ValueError(f"smem {smem_bytes} B exceeds sm_120 cap {cap}")
+
+    @cute.jit
+    def load_tma_tile(self, s_dst, tma_desc, mbar, batch, head, seq, rows: cutlass.Constexpr[int]):
+        """Load one paged/swizzled `(rows, d)` tile with TMA."""
+        elems_per_page = rows * self.page
+        for pg in cutlass.range_constexpr(self.tma_copy_iters):
+            if prims.elect_sync():
+                prims.cp_async_bulk_tensor_shared_cta_global(
+                    s_dst.subview(pg * elems_per_page),
+                    tma_desc.get_ptr(),
+                    (pg * self.page, head, seq, batch),
+                    mbar,
+                )
+
+    @cute.kernel
+    def kernel(
+        self,
+        q: cute.Tensor,  # [B, SQ,  H, D] io dtype (BSHD)
+        k: cute.Tensor,  # [B, SKV, H, D]
+        v: cute.Tensor,  # [B, SKV, H, D]
+        do: cute.Tensor,  # [B, SQ,  H, D]
+        lse: cute.Tensor,  # [B, H, SQ] fp32 (natural-log LSE)
+        delta: cute.Tensor,  # [B, H, SQ_r128] fp32 (dot_do_o output)
+        dq_accum: cute.Tensor,  # [B*SQ_r128*H*D] fp32 (scrambled, zeroed)
+        dk: cute.Tensor,  # [B, SKV, H, D] output
+        dv: cute.Tensor,  # [B, SKV, H, D] output
+        tma_q_desc: cutlass.GridConstant[cuda.TensorMap],
+        tma_k_desc: cutlass.GridConstant[cuda.TensorMap],
+        tma_v_desc: cutlass.GridConstant[cuda.TensorMap],
+        tma_do_desc: cutlass.GridConstant[cuda.TensorMap],
+        softmax_scale_log2: cutlass.Float32,  # scale * log2(e)
+        attn_scale: cutlass.Float32,  # linear scale (dq/dk output)
+    ) -> None:
+        io_dtype = self.in_dtype
+        d = self.d
+        M = self.q_tile
+        N = self.kv_tile
+        PAGE = self.page
+        PDS = 64 if self.kv_tile >= 64 else self.kv_tile
+        WM_SDP = self.warps_m_sdp  # S/dP warp grid (WM_SDP, 8//WM_SDP), WM_SDP along q rows
+        WM_DKV = self.warps_m_dkv  # dK/dV warp grid (WM_DKV, 8//WM_DKV), WM_DKV along kv rows
+        WM_DQ = self.warps_m_dq  # dQ warp grid (WM_DQ, 8//WM_DQ), WM_DQ along q rows
+
+        # SdP: warp (wm, wn); wm steps over SDP_REPS 16-row MMA blocks
+        # interleaved by 16*WM_SDP; wn covers SDP_NPER contiguous kv columns.
+        SDP_REPS = M // (16 * WM_SDP)
+        SDP_NPER = N * WM_SDP // 8
+        SDP_NF = SDP_NPER // 8
+        # dKV: warp (wn2, wd); DKV_REPS 16-row MMA blocks interleaved by 16*WM_DKV.
+        DKV_REPS = N // (16 * WM_DKV)
+        DKV_PER = d * WM_DKV // 8
+        DKV_NF = DKV_PER // 8
+        # dQ: warp (wq, wdq).
+        DQ_REPS = M // (16 * WM_DQ)
+        DQ_PER = d * WM_DQ // 8
+        DQ_NF = DQ_PER // 8
+
+        D_CHUNKS = d // 16  # SdP k-reduce
+        Q_CHUNKS = M // 16  # dK/dV k-reduce
+        KV_CHUNKS = N // 16  # dQ k-reduce
+        VREG_PAIRS = SDP_NPER // 16  # V-in-regs frag pairs / chunk
+
+        tidx, _, _ = cute.arch.thread_idx()
+        n_block, head, batch = cute.arch.block_idx()
+        lane = tidx % 32
+        warp = cute.arch.warp_idx()
+        g_lane = lane // 4
+        p_lane = lane % 4
+
+        SQ = q.shape[1]
+        SKV = k.shape[1]
+        H = q.shape[2]
+        SQ_R = ((SQ + 127) // 128) * 128
+        kv_base = n_block * N
+        row_stride = H * d  # BSHD gmem row stride
+
+        lse_ptr = lse.iterator.raw_ptr()
+        dd_ptr = delta.iterator.raw_ptr()
+        dqa_ptr = dq_accum.iterator.raw_ptr()
+        dk_ptr = dk.iterator.raw_ptr()
+        dv_ptr = dv.iterator.raw_ptr()
+
+        PARTIAL_Q = (SQ % M) != 0
+        PARTIAL_KV = (SKV % N) != 0
+
+        m_block_max = (SQ + M - 1) // M
+        if cutlass.const_expr(self.is_causal):
+            m_block_min = cute.math.max(kv_base + SQ - SKV, cutlass.Int32(0)) // M
+        else:
+            m_block_min = cutlass.Int32(0)
+        n_iters = m_block_max - m_block_min
+
+        smem = cutlass.Array(io_dtype, self.smem_elems, space=cutlass.AddressSpace.smem, alignment=128)
+        sQ = smem  # 2 * M * d (double buffer)
+        sdO = smem.subview(self.off_sdO)  # M * d
+        sK = smem.subview(self.off_sK)  # N * d
+        sV = smem.subview(self.off_sV)  # N * d
+        sdS = smem.subview(self.off_sdS)  # M * N (aliases sV)
+        sP = smem.subview(self.off_sP)  # M * N
+        tma_mbar = cutlass.Array(cutlass.Int64, 5, space=cutlass.AddressSpace.smem, alignment=8)
+        k_mbar = tma_mbar
+        v_mbar = tma_mbar.subview(1)
+        q_full = tma_mbar.subview(2)
+        do_full = tma_mbar.subview(4)
+
+        if warp == self.load_warp_id:
+            if prims.elect_sync():
+                prims.prefetch_tensormap(tma_k_desc.get_ptr())
+                prims.prefetch_tensormap(tma_v_desc.get_ptr())
+                prims.prefetch_tensormap(tma_q_desc.get_ptr())
+                prims.prefetch_tensormap(tma_do_desc.get_ptr())
+                prims.mbarrier_init(k_mbar, 1)
+                prims.mbarrier_init(v_mbar, 1)
+                prims.mbarrier_init(q_full, 1)
+                prims.mbarrier_init(q_full.subview(1), 1)
+                prims.mbarrier_init(do_full, 1)
+        prims.fence_mbarrier_init()
+        prims.barrier_cta_sync(0)
+
+        # gmem tile bases for this (batch, head, n_block / m_block).
+        qhd_base = (batch * SQ) * row_stride + head * d
+        khd_base = (batch * SKV + kv_base) * row_stride + head * d
+        lse_base = (batch * H + head) * SQ
+        dd_base = (batch * H + head) * SQ_R
+
+        if warp == self.load_warp_id:
+            prims.setmaxregister(24, prims.SetMaxRegisterAction.DECREASE)
+            if prims.elect_sync():
+                prims.mbarrier_arrive_expect_tx(v_mbar, N * d * io_dtype.bytes)
+                prims.mbarrier_arrive_expect_tx(k_mbar, N * d * io_dtype.bytes)
+            self.load_tma_tile(sV, tma_v_desc, v_mbar, batch, head, kv_base, rows=N)
+            self.load_tma_tile(sK, tma_k_desc, k_mbar, batch, head, kv_base, rows=N)
+
+            if n_iters > 0:
+                if prims.elect_sync():
+                    prims.mbarrier_arrive_expect_tx(q_full, M * d * io_dtype.bytes)
+                self.load_tma_tile(sQ, tma_q_desc, q_full, batch, head, (m_block_max - 1) * M, rows=M)
+                if prims.elect_sync():
+                    prims.mbarrier_arrive_expect_tx(do_full, M * d * io_dtype.bytes)
+                self.load_tma_tile(
+                    sdO,
+                    tma_do_desc,
+                    do_full,
+                    batch,
+                    head,
+                    (m_block_max - 1) * M,
+                    rows=M,
+                )
+            while not prims.mbarrier_try_wait_parity(v_mbar, cutlass.Int32(0)):
+                pass
+            while not prims.mbarrier_try_wait_parity(k_mbar, cutlass.Int32(0)):
+                pass
+            for load_j in cutlass.range(n_iters, unroll=1):
+                load_stage = load_j & cutlass.Int32(1)
+                q_phase_p = (load_j // 2) & cutlass.Int32(1)
+                while not prims.mbarrier_try_wait_parity(q_full.subview(load_stage), q_phase_p):
+                    pass
+                do_phase_p = load_j & cutlass.Int32(1)
+                while not prims.mbarrier_try_wait_parity(do_full, do_phase_p):
+                    pass
+                # Loop-top: stage load_j ready AND load_j-1 consumed.
+                cute.arch.barrier(barrier_id=3, number_of_threads=288)
+                next_m = m_block_max - 2 - load_j
+                if load_j + 1 < n_iters:
+                    next_stage = (load_j + 1) & cutlass.Int32(1)
+                    next_q_full = q_full.subview(next_stage)
+                    if prims.elect_sync():
+                        prims.mbarrier_arrive_expect_tx(next_q_full, M * d * io_dtype.bytes)
+                    self.load_tma_tile(
+                        sQ.subview(next_stage * M * d),
+                        tma_q_desc,
+                        next_q_full,
+                        batch,
+                        head,
+                        next_m * M,
+                        rows=M,
+                    )
+                # Post-GEMM3: every consumer is done with sdO.
+                cute.arch.barrier(barrier_id=4, number_of_threads=288)
+                if load_j + 1 < n_iters:
+                    if prims.elect_sync():
+                        prims.mbarrier_arrive_expect_tx(do_full, M * d * io_dtype.bytes)
+                    self.load_tma_tile(sdO, tma_do_desc, do_full, batch, head, next_m * M, rows=M)
+
+        elif warp < self.load_warp_id:
+            prims.setmaxregister(240, prims.SetMaxRegisterAction.INCREASE)
+            # LSE for the first (highest) m-block: per-thread direct loads at
+            # this thread's C-fragment rows
+            math_warp = warp
+            math_tidx = tidx
+            m_block = m_block_max - 1
+            wm_s = math_warp % WM_SDP
+            wn_s = math_warp // WM_SDP
+            lse_r = cutlass.Array(cutlass.Float32, 2 * SDP_REPS)
+            dd_r = cutlass.Array(cutlass.Float32, 2 * SDP_REPS)
+            for rep in cutlass.range_constexpr(SDP_REPS):
+                for hf in cutlass.range_constexpr(2):
+                    r_loc = wm_s * 16 + rep * 16 * WM_SDP + g_lane + hf * 8
+                    r_abs = m_block * M + r_loc
+                    if cutlass.const_expr(PARTIAL_Q):
+                        r_cl = cute.math.min(r_abs, SQ - 1)
+                        val = (lse_ptr + lse_base + r_cl).load()
+                        inf = cutlass.Float32(float("inf"))
+                        # branchless (r_abs < SQ) ? 1 : 0 via arith.select
+                        ok32 = cutlass.Int32(
+                            arith.select(
+                                (r_abs < SQ).ir_value(),
+                                cutlass.Int32(1).ir_value(),
+                                cutlass.Int32(0).ir_value(),
+                            )
+                        )
+                        if ok32 == 0:
+                            val = inf
+                        lse_r[rep * 2 + hf] = val * cutlass.Float32(_LOG2E)
+                    else:
+                        val = (lse_ptr + lse_base + r_abs).load()
+                        lse_r[rep * 2 + hf] = val * cutlass.Float32(_LOG2E)
+
+            while not prims.mbarrier_try_wait_parity(v_mbar, cutlass.Int32(0)):
+                pass
+            while not prims.mbarrier_try_wait_parity(k_mbar, cutlass.Int32(0)):
+                pass
+
+            # V -> registers.
+            v_persist = cutlass.Array(cutlass.Int32, D_CHUNKS * VREG_PAIRS * 4, alignment=16)
+            for kc in cutlass.range_constexpr(D_CHUNKS):
+                for pair in cutlass.range_constexpr(VREG_PAIRS):
+                    n_frag = pair * 2
+                    row = wn_s * SDP_NPER + (n_frag + lane // 16) * 8 + lane % 8
+                    col = kc * 16 + ((lane // 8) % 2) * 8
+                    vf = prims.ldmatrix(
+                        tile_ptr(sV, row, col, page=PAGE, rows=N),
+                        4,
+                        prims.MMALayout.ROW,
+                    )
+                    v_off = (kc * VREG_PAIRS + pair) * 4
+                    v_persist[v_off + 0] = vf[0]
+                    v_persist[v_off + 1] = vf[1]
+                    v_persist[v_off + 2] = vf[2]
+                    v_persist[v_off + 3] = vf[3]
+            cute.arch.barrier(barrier_id=1, number_of_threads=256)
+
+            # dK/dV accumulators.
+            wn_k = math_warp % WM_DKV
+            wd_k = math_warp // WM_DKV
+            acc_dk = cutlass.Array(cutlass.Float32, DKV_REPS * DKV_NF * 4, alignment=16)
+            acc_dv = cutlass.Array(cutlass.Float32, DKV_REPS * DKV_NF * 4, alignment=16)
+            for i in cutlass.range_constexpr(DKV_REPS * DKV_NF * 4):
+                acc_dk[i] = cutlass.Float32(0.0)
+                acc_dv[i] = cutlass.Float32(0.0)
+
+            wq = math_warp % WM_DQ
+            wd_q = math_warp // WM_DQ
+
+            acc_s = cutlass.Array(cutlass.Float32, SDP_REPS * SDP_NF * 4, alignment=16)
+            acc_dp = cutlass.Array(cutlass.Float32, SDP_REPS * SDP_NF * 4, alignment=16)
+            acc_dq = cutlass.Array(cutlass.Float32, DQ_REPS * DQ_NF * 4, alignment=16)
+
+            if cutlass.const_expr(self.use_pdl):
+                cute.arch.griddepcontrol_wait()
+
+            # ---- main loop: m_block descending --------------------------------
+            j = cutlass.Int32(0)
+            while j < n_iters:
+                m_block = m_block_max - 1 - j
+                stage = j & cutlass.Int32(1)
+                sQ_st = sQ.subview(stage * M * d)
+                q_row0 = m_block * M
+
+                cute.arch.barrier(barrier_id=3, number_of_threads=288)
+
+                # dP_sum per-thread loads (delta buffer is 128-rounded).
+                for rep in cutlass.range_constexpr(SDP_REPS):
+                    for hf in cutlass.range_constexpr(2):
+                        r_loc = wm_s * 16 + rep * 16 * WM_SDP + g_lane + hf * 8
+                        dd_r[rep * 2 + hf] = (dd_ptr + dd_base + q_row0 + r_loc).load()
+
+                # GEMM 1: acc_s = Q @ K^T.
+                for i in cutlass.range_constexpr(SDP_REPS * SDP_NF * 4):
+                    acc_s[i] = cutlass.Float32(0.0)
+                for kc in cutlass.range_constexpr(D_CHUNKS):
+                    af = []
+                    for rep in cutlass.range_constexpr(SDP_REPS):
+                        qf = load_a_frag(
+                            sQ_st,
+                            kc,
+                            wm_s * 16 + rep * 16 * WM_SDP,
+                            lane,
+                            rows=M,
+                            page=PAGE,
+                        )
+                        af = af + [qf[0], qf[1], qf[2], qf[3]]
+                    mma_bstream(
+                        acc_s,
+                        af,
+                        sK,
+                        b_k_step=kc,
+                        M=16 * SDP_REPS,
+                        N=SDP_NPER,
+                        b_trans=False,
+                        b_rows=N,
+                        b_page=PAGE,
+                        lane=lane,
+                        ab_dtype=io_dtype,
+                        row_base=wn_s * SDP_NPER,
+                    )
+
+                # Mask + softmax (scores -> P, unscaled by attn_scale) and the
+                # P store to smem.
+                do_mask_causal = (m_block * M) < (kv_base + N + SQ - SKV)
+                neg_inf = cutlass.Float32(float("-inf"))
+                for rep in cutlass.range_constexpr(SDP_REPS):
+                    for nf in cutlass.range_constexpr(SDP_NF):
+                        off = (rep * SDP_NF + nf) * 4
+                        kv_c0 = wn_s * SDP_NPER + nf * 8 + 2 * p_lane
+                        kv_a0 = kv_base + kv_c0
+                        kv_a1 = kv_a0 + 1
+                        r0 = q_row0 + wm_s * 16 + rep * 16 * WM_SDP + g_lane
+                        r8 = r0 + 8
+                        s0 = acc_s[off + 0]
+                        s1 = acc_s[off + 1]
+                        s2 = acc_s[off + 2]
+                        s3 = acc_s[off + 3]
+                        if cutlass.const_expr(self.is_causal):
+                            if do_mask_causal:
+                                if kv_a0 > r0 + SKV - SQ:
+                                    s0 = neg_inf
+                                if kv_a1 > r0 + SKV - SQ:
+                                    s1 = neg_inf
+                                if kv_a0 > r8 + SKV - SQ:
+                                    s2 = neg_inf
+                                if kv_a1 > r8 + SKV - SQ:
+                                    s3 = neg_inf
+                        if cutlass.const_expr(PARTIAL_KV):
+                            if kv_a0 >= SKV:
+                                s0 = neg_inf
+                                s2 = neg_inf
+                            if kv_a1 >= SKV:
+                                s1 = neg_inf
+                                s3 = neg_inf
+                        lse0 = lse_r[rep * 2 + 0]
+                        lse8 = lse_r[rep * 2 + 1]
+                        p0 = cute.math.exp2(s0 * softmax_scale_log2 - lse0, fastmath=True)
+                        p1 = cute.math.exp2(s1 * softmax_scale_log2 - lse0, fastmath=True)
+                        p2 = cute.math.exp2(s2 * softmax_scale_log2 - lse8, fastmath=True)
+                        p3 = cute.math.exp2(s3 * softmax_scale_log2 - lse8, fastmath=True)
+                        acc_s[off + 0] = p0
+                        acc_s[off + 1] = p1
+                        acc_s[off + 2] = p2
+                        acc_s[off + 3] = p3
+                        # sP store: each (2p, 2p+1) pair packed into one 4 B
+                        # store to the swizzled tile
+                        pr0 = wm_s * 16 + rep * 16 * WM_SDP + g_lane
+                        pr8 = pr0 + 8
+                        sw0 = tile_ptr(sP, pr0, kv_c0, page=PDS, rows=M)
+                        sw8 = tile_ptr(sP, pr8, kv_c0, page=PDS, rows=M)
+                        sw0.store(pack_half2(p0, p1, io_dtype), alignment=4)
+                        sw8.store(pack_half2(p2, p3, io_dtype), alignment=4)
+
+                # GEMM 2: acc_dp = dO @ V^T (V in registers).
+                for i in cutlass.range_constexpr(SDP_REPS * SDP_NF * 4):
+                    acc_dp[i] = cutlass.Float32(0.0)
+                for kc in cutlass.range_constexpr(D_CHUNKS):
+                    af = []
+                    for rep in cutlass.range_constexpr(SDP_REPS):
+                        dof = load_a_frag(
+                            sdO,
+                            kc,
+                            wm_s * 16 + rep * 16 * WM_SDP,
+                            lane,
+                            rows=M,
+                            page=PAGE,
+                        )
+                        af = af + [dof[0], dof[1], dof[2], dof[3]]
+                    mma_abregs(
+                        acc_dp,
+                        af,
+                        v_persist,
+                        b_k_step=kc,
+                        M=16 * SDP_REPS,
+                        N=SDP_NPER,
+                        ab_dtype=io_dtype,
+                    )
+
+                # dS = P * (dP - dP_sum)
+                for rep in cutlass.range_constexpr(SDP_REPS):
+                    for nf in cutlass.range_constexpr(SDP_NF):
+                        off = (rep * SDP_NF + nf) * 4
+                        dd0 = dd_r[rep * 2 + 0]
+                        dd8 = dd_r[rep * 2 + 1]
+                        acc_dp[off + 0] = acc_s[off + 0] * (acc_dp[off + 0] - dd0)
+                        acc_dp[off + 1] = acc_s[off + 1] * (acc_dp[off + 1] - dd0)
+                        acc_dp[off + 2] = acc_s[off + 2] * (acc_dp[off + 2] - dd8)
+                        acc_dp[off + 3] = acc_s[off + 3] * (acc_dp[off + 3] - dd8)
+
+                # dS -> fp16 -> sdS.
+                for rep in cutlass.range_constexpr(SDP_REPS):
+                    for nf in cutlass.range_constexpr(SDP_NF):
+                        off = (rep * SDP_NF + nf) * 4
+                        kv_c0 = wn_s * SDP_NPER + nf * 8 + 2 * p_lane
+                        pr0 = wm_s * 16 + rep * 16 * WM_SDP + g_lane
+                        pr8 = pr0 + 8
+                        sw0 = tile_ptr(sdS, pr0, kv_c0, page=PDS, rows=M)
+                        sw8 = tile_ptr(sdS, pr8, kv_c0, page=PDS, rows=M)
+                        sw0.store(
+                            pack_half2(acc_dp[off + 0], acc_dp[off + 1], io_dtype),
+                            alignment=4,
+                        )
+                        sw8.store(
+                            pack_half2(acc_dp[off + 2], acc_dp[off + 3], io_dtype),
+                            alignment=4,
+                        )
+                cute.arch.barrier(barrier_id=1, number_of_threads=256)
+
+                # GEMM 3: acc_dv += P^T @ dO.
+                for kc in cutlass.range_constexpr(Q_CHUNKS):
+                    af = []
+                    for rep in cutlass.range_constexpr(DKV_REPS):
+                        pf = load_a_frag_transposed(
+                            sP,
+                            kc,
+                            wn_k * 16 + rep * 16 * WM_DKV,
+                            lane,
+                            rows=M,
+                            page=PDS,
+                        )
+                        af = af + [pf[0], pf[2], pf[1], pf[3]]
+                    mma_bstream(
+                        acc_dv,
+                        af,
+                        sdO,
+                        b_k_step=kc,
+                        M=16 * DKV_REPS,
+                        N=DKV_PER,
+                        b_trans=True,
+                        b_rows=M,
+                        b_page=PAGE,
+                        lane=lane,
+                        ab_dtype=io_dtype,
+                        col_base=wd_k * DKV_PER,
+                    )
+
+                # GEMM3 is the final dO consumer; this rendezvous lets
+                # the producer refill the single dO buffer.
+                cute.arch.barrier(barrier_id=4, number_of_threads=288)
+
+                # GEMM 4: acc_dq = dS @ K^T.
+                for i in cutlass.range_constexpr(DQ_REPS * DQ_NF * 4):
+                    acc_dq[i] = cutlass.Float32(0.0)
+                for kc in cutlass.range_constexpr(KV_CHUNKS):
+                    af = []
+                    for rep in cutlass.range_constexpr(DQ_REPS):
+                        sf = load_a_frag(sdS, kc, wq * 16 + rep * 16 * WM_DQ, lane, rows=M, page=PDS)
+                        af = af + [sf[0], sf[1], sf[2], sf[3]]
+                    mma_bstream(
+                        acc_dq,
+                        af,
+                        sK,
+                        b_k_step=kc,
+                        M=16 * DQ_REPS,
+                        N=DQ_PER,
+                        b_trans=True,
+                        b_rows=N,
+                        b_page=PAGE,
+                        lane=lane,
+                        ab_dtype=io_dtype,
+                        col_base=wd_q * DQ_PER,
+                    )
+
+                # Reload LSE for the next (lower) m-block.
+                if j + 1 < n_iters:
+                    nq0 = (m_block - 1) * M
+                    for rep in cutlass.range_constexpr(SDP_REPS):
+                        for hf in cutlass.range_constexpr(2):
+                            r_loc = wm_s * 16 + rep * 16 * WM_SDP + g_lane + hf * 8
+                            lse_r[rep * 2 + hf] = (lse_ptr + lse_base + nq0 + r_loc).load() * cutlass.Float32(_LOG2E)
+
+                # dQ accumulate into the scrambled dq_accum.
+                t_r = math_tidx // 32
+                t_c = math_tidx % 32
+                dqa_base = ((batch * SQ_R + q_row0) * H + head) * d
+                for rep in cutlass.range_constexpr(DQ_REPS):
+                    for nf in cutlass.range_constexpr(DQ_NF):
+                        for hv in cutlass.range_constexpr(2):
+                            i_pair = hv + rep * 2 + nf * 2 * DQ_REPS
+                            if cutlass.const_expr(d >= 64):
+                                jm = i_pair % (M // 8)
+                                jn = i_pair // (M // 8)
+                                addr = dqa_base + (t_r + jm * 8) * (H * d) + t_c * 2 + jn * 64
+                            else:
+                                addr = dqa_base + (t_r + (t_c // 16) * 8 + i_pair * 16) * (H * d) + (t_c % 16) * 2
+                            poff = (rep * DQ_NF + nf) * 4 + hv * 2
+                            _red_add_f32x2(dqa_ptr + addr, acc_dq[poff + 0], acc_dq[poff + 1])
+
+                # GEMM 5: acc_dk += dS^T @ Q.
+                for kc in cutlass.range_constexpr(Q_CHUNKS):
+                    af = []
+                    for rep in cutlass.range_constexpr(DKV_REPS):
+                        sf = load_a_frag_transposed(
+                            sdS,
+                            kc,
+                            wn_k * 16 + rep * 16 * WM_DKV,
+                            lane,
+                            rows=M,
+                            page=PDS,
+                        )
+                        af = af + [sf[0], sf[2], sf[1], sf[3]]
+                    mma_bstream(
+                        acc_dk,
+                        af,
+                        sQ_st,
+                        b_k_step=kc,
+                        M=16 * DKV_REPS,
+                        N=DKV_PER,
+                        b_trans=True,
+                        b_rows=M,
+                        b_page=PAGE,
+                        lane=lane,
+                        ab_dtype=io_dtype,
+                        col_base=wd_k * DKV_PER,
+                    )
+
+                j += 1
+
+            if cutlass.const_expr(self.use_pdl):
+                cute.arch.griddepcontrol_launch_dependents()
+
+            # ---- epilogue: dK/dV through smem (sdK aliases sK, sdV aliases sV) --------
+            cute.arch.barrier(barrier_id=2, number_of_threads=256)
+            sdK = sK
+            sdV = sV
+            for rep in cutlass.range_constexpr(DKV_REPS):
+                for nf in cutlass.range_constexpr(DKV_NF):
+                    off = (rep * DKV_NF + nf) * 4
+                    r0 = wn_k * 16 + rep * 16 * WM_DKV + g_lane
+                    r8 = r0 + 8
+                    c0 = wd_k * DKV_PER + nf * 8 + 2 * p_lane
+                    dk0 = acc_dk[off + 0] * attn_scale
+                    dk1 = acc_dk[off + 1] * attn_scale
+                    dk2 = acc_dk[off + 2] * attn_scale
+                    dk3 = acc_dk[off + 3] * attn_scale
+                    tile_ptr(sdK, r0, c0, page=PAGE, rows=N).store(pack_half2(dk0, dk1, io_dtype), alignment=4)
+                    tile_ptr(sdK, r8, c0, page=PAGE, rows=N).store(pack_half2(dk2, dk3, io_dtype), alignment=4)
+                    tile_ptr(sdV, r0, c0, page=PAGE, rows=N).store(
+                        pack_half2(acc_dv[off + 0], acc_dv[off + 1], io_dtype),
+                        alignment=4,
+                    )
+                    tile_ptr(sdV, r8, c0, page=PAGE, rows=N).store(
+                        pack_half2(acc_dv[off + 2], acc_dv[off + 3], io_dtype),
+                        alignment=4,
+                    )
+            cute.arch.barrier(barrier_id=2, number_of_threads=256)
+
+            # smem -> gmem
+            chunks_per_row = d // _COPY_ELEMS
+            total = N * chunks_per_row
+            for i in cutlass.range_constexpr(total // 256):
+                chunk = i * 256 + math_tidx
+                row = chunk // chunks_per_row
+                col = (chunk % chunks_per_row) * _COPY_ELEMS
+                if (not cutlass.const_expr(PARTIAL_KV)) or (kv_base + row < SKV):
+                    g_off = khd_base + row * row_stride + col
+                    copy16_smem_to_gmem(tile_ptr(sdK, row, col, page=PAGE, rows=N), dk_ptr + g_off)
+                    copy16_smem_to_gmem(tile_ptr(sdV, row, col, page=PAGE, rows=N), dv_ptr + g_off)
+
+        else:
+            prims.setmaxregister(24, prims.SetMaxRegisterAction.DECREASE)
+
+    @cute.jit
+    def __call__(
+        self,
+        q: cute.Tensor,
+        k: cute.Tensor,
+        v: cute.Tensor,
+        do: cute.Tensor,
+        lse: cute.Tensor,
+        delta: cute.Tensor,
+        dq_accum: cute.Tensor,
+        dk: cute.Tensor,
+        dv: cute.Tensor,
+        softmax_scale_log2: cutlass.Float32,
+        attn_scale: cutlass.Float32,
+        stream: cuda_driver.CUstream,
+    ) -> None:
+        box_kv = (1, self.kv_tile, 1, self.page)
+        box_q = (1, self.q_tile, 1, self.page)
+        tma_q_desc = cuda.create_tensor_map_tiled_from_view(q, box_dims=box_q, stride_order=(3, 2, 1, 0), swizzle=self.tma_swizzle)
+        tma_k_desc = cuda.create_tensor_map_tiled_from_view(k, box_dims=box_kv, stride_order=(3, 2, 1, 0), swizzle=self.tma_swizzle)
+        tma_v_desc = cuda.create_tensor_map_tiled_from_view(v, box_dims=box_kv, stride_order=(3, 2, 1, 0), swizzle=self.tma_swizzle)
+        tma_do_desc = cuda.create_tensor_map_tiled_from_view(do, box_dims=box_q, stride_order=(3, 2, 1, 0), swizzle=self.tma_swizzle)
+        n_blocks = cute.ceil_div(k.shape[1], self.kv_tile)
+        self.kernel(
+            q,
+            k,
+            v,
+            do,
+            lse,
+            delta,
+            dq_accum,
+            dk,
+            dv,
+            tma_q_desc,
+            tma_k_desc,
+            tma_v_desc,
+            tma_do_desc,
+            softmax_scale_log2,
+            attn_scale,
+        ).launch(
+            grid=(n_blocks, q.shape[2], q.shape[0]),
+            block=(self.threads, 1, 1),
+            stream=stream,
+            min_blocks_per_mp=1,
+            use_pdl=self.use_pdl,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Preprocess kernel: delta = rowsum(dO * O) + dq_accum zeroing
+# ---------------------------------------------------------------------------
+
+
+@cute.kernel
+def _dot_do_o_kernel(
+    o: cute.Tensor,  # [B, SQ, H, D]
+    do: cute.Tensor,  # [B, SQ, H, D]
+    delta: cute.Tensor,  # [B, H, SQ_r128] fp32 out
+    dq_accum: cute.Tensor,  # [B*SQ_r128*H*D] fp32 (zeroed here)
+    q_tile: cutlass.Constexpr[int],
+    d: cutlass.Constexpr[int],
+    page: cutlass.Constexpr[int],
+    use_pdl: cutlass.Constexpr[bool],
+):
+    if cutlass.const_expr(use_pdl):
+        cute.arch.griddepcontrol_launch_dependents()
+    m_block, head, batch = cute.arch.block_idx()
+    tidx, _, _ = cute.arch.thread_idx()
+    SQ = o.shape[1]
+    H = o.shape[2]
+    SQ_R = ((SQ + 127) // 128) * 128
+    row_stride = H * d
+    M = q_tile
+
+    o_ptr = o.iterator.raw_ptr()
+    do_ptr = do.iterator.raw_ptr()
+    dd_ptr = delta.iterator.raw_ptr()
+    dqa_ptr = dq_accum.iterator.raw_ptr()
+
+    base = ((batch * SQ + m_block * M) * H + head) * d
+    dd_base = (batch * H + head) * SQ_R + m_block * M
+    q_left = SQ - m_block * M
+
+    tpr = page // _COPY_ELEMS
+    rows_per_pass = 256 // tpr
+    col0 = (tidx % tpr) * _COPY_ELEMS
+    row0 = tidx // tpr
+    n_pages = d // page
+    for rp in cutlass.range_constexpr(M // rows_per_pass):
+        row = row0 + rp * rows_per_pass
+        acc = cutlass.Float32(0.0)
+        if row < q_left:
+            g_off = base + row * row_stride + col0
+            for pg in cutlass.range_constexpr(n_pages):
+                ov = (o_ptr + g_off + pg * page).load(count=_COPY_ELEMS)
+                dov = (do_ptr + g_off + pg * page).load(count=_COPY_ELEMS)
+                for kk in cutlass.range_constexpr(_COPY_ELEMS):
+                    acc = acc + ov[kk].to(cutlass.Float32) * dov[kk].to(cutlass.Float32)
+        # Allreduce over the tpr threads sharing the row (lane-contiguous).
+        n_sh = 3 if cutlass.const_expr(tpr == 8) else 2
+        for sh in cutlass.range_constexpr(n_sh):
+            acc = acc + prims.shfl_sync(
+                thread_mask=0xFFFFFFFF,
+                val=acc,
+                offset=1 << (n_sh - 1 - sh),
+                mask_and_clamp=0x1F,
+                kind=prims.Shfl.BFLY,
+            )
+        if tidx % tpr == 0:
+            (dd_ptr + dd_base + row).store(acc)
+
+    if cutlass.const_expr(use_pdl):
+        cute.arch.griddepcontrol_wait()
+
+    zrows = 32 if cutlass.const_expr(page == 32) else 16
+    ztpr = 256 // zrows
+    zr0 = tidx // ztpr
+    zc0 = (tidx % ztpr) * 4
+    zero4 = cutlass.Vector.from_elements(
+        (
+            cutlass.Float32(0.0),
+            cutlass.Float32(0.0),
+            cutlass.Float32(0.0),
+            cutlass.Float32(0.0),
+        ),
+        cutlass.Float32,
+    )
+    dqa_base = ((batch * SQ_R + m_block * M) * H + head) * d
+    for im in cutlass.range_constexpr(M // zrows):
+        for jn in cutlass.range_constexpr(d // (ztpr * 4)):
+            addr = dqa_base + (zr0 + im * zrows) * (H * d) + zc0 + jn * ztpr * 4
+            (dqa_ptr + addr).store(zero4, alignment=16)
+
+
+@cute.jit
+def _dot_do_o_host(
+    o: cute.Tensor,
+    do: cute.Tensor,
+    delta: cute.Tensor,
+    dq_accum: cute.Tensor,
+    q_tile: cutlass.Constexpr[int],
+    d: cutlass.Constexpr[int],
+    page: cutlass.Constexpr[int],
+    use_pdl: cutlass.Constexpr[bool],
+    stream: cuda_driver.CUstream,
+):
+    m_blocks = cute.ceil_div(o.shape[1], q_tile)
+    _dot_do_o_kernel(o, do, delta, dq_accum, q_tile, d, page, use_pdl).launch(
+        grid=(m_blocks, o.shape[2], o.shape[0]),
+        block=(256, 1, 1),
+        stream=stream,
+        use_pdl=use_pdl,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Convert kernel: scrambled dq_accum (fp32) -> dQ (io dtype)
+# ---------------------------------------------------------------------------
+
+
+@cute.kernel
+def _convert_dq_kernel(
+    dq_accum: cute.Tensor,  # [B*SQ_r128*H*D] fp32
+    dq: cute.Tensor,  # [B, SQ, H, D] io dtype out
+    q_tile: cutlass.Constexpr[int],
+    d: cutlass.Constexpr[int],
+    page: cutlass.Constexpr[int],
+    warps_m_dq: cutlass.Constexpr[int],
+    attn_scale: cutlass.Float32,
+    io_dtype: cutlass.Constexpr[Type[cutlass.Numeric]],
+    use_pdl: cutlass.Constexpr[bool],
+):
+    if cutlass.const_expr(use_pdl):
+        cute.arch.griddepcontrol_wait()
+        cute.arch.griddepcontrol_launch_dependents()
+    m_block, head, batch = cute.arch.block_idx()
+    tidx, _, _ = cute.arch.thread_idx()
+    lane = tidx % 32
+    warp = cute.arch.warp_idx()
+    g_lane = lane // 4
+    p_lane = lane % 4
+    SQ = dq.shape[1]
+    H = dq.shape[2]
+    SQ_R = ((SQ + 127) // 128) * 128
+    M = q_tile
+    WM_DQ = warps_m_dq
+    DQ_REPS = M // (16 * WM_DQ)
+    DQ_PER = d * WM_DQ // 8
+    DQ_NF = DQ_PER // 8
+    wq = warp % WM_DQ
+    wd_q = warp // WM_DQ
+
+    dqa_ptr = dq_accum.iterator.raw_ptr()
+    dq_ptr = dq.iterator.raw_ptr()
+
+    sdQ = cutlass.Array(io_dtype, M * d, space=cutlass.AddressSpace.smem, alignment=128)
+
+    t_r = tidx // 32
+    t_c = tidx % 32
+    dqa_base = ((batch * SQ_R + m_block * M) * H + head) * d
+    for rep in cutlass.range_constexpr(DQ_REPS):
+        for nf in cutlass.range_constexpr(DQ_NF):
+            frag = cutlass.Array(cutlass.Float32, 4)
+            for hv in cutlass.range_constexpr(2):
+                i_pair = hv + rep * 2 + nf * 2 * DQ_REPS
+                if cutlass.const_expr(d >= 64):
+                    jm = i_pair % (M // 8)
+                    jn = i_pair // (M // 8)
+                    addr = dqa_base + (t_r + jm * 8) * (H * d) + t_c * 2 + jn * 64
+                else:
+                    addr = dqa_base + (t_r + (t_c // 16) * 8 + i_pair * 16) * (H * d) + (t_c % 16) * 2
+                pv = (dqa_ptr + addr).load(count=2)
+                frag[hv * 2 + 0] = pv[0] * attn_scale
+                frag[hv * 2 + 1] = pv[1] * attn_scale
+            r0 = wq * 16 + rep * 16 * WM_DQ + g_lane
+            r8 = r0 + 8
+            c0 = wd_q * DQ_PER + nf * 8 + 2 * p_lane
+            tile_ptr(sdQ, r0, c0, page=page, rows=M).store(pack_half2(frag[0], frag[1], io_dtype), alignment=4)
+            tile_ptr(sdQ, r8, c0, page=page, rows=M).store(pack_half2(frag[2], frag[3], io_dtype), alignment=4)
+    prims.barrier_cta_sync(0)
+
+    q_left = SQ - m_block * M
+    row_stride = H * d
+    g_base = ((batch * SQ + m_block * M) * H + head) * d
+    chunks_per_row = d // _COPY_ELEMS
+    for i in cutlass.range_constexpr(M * chunks_per_row // 256):
+        chunk = i * 256 + tidx
+        row = chunk // chunks_per_row
+        col = (chunk % chunks_per_row) * _COPY_ELEMS
+        if row < q_left:
+            copy16_smem_to_gmem(
+                tile_ptr(sdQ, row, col, page=page, rows=M),
+                dq_ptr + g_base + row * row_stride + col,
+            )
+
+
+@cute.jit
+def _convert_dq_host(
+    dq_accum: cute.Tensor,
+    dq: cute.Tensor,
+    q_tile: cutlass.Constexpr[int],
+    d: cutlass.Constexpr[int],
+    page: cutlass.Constexpr[int],
+    warps_m_dq: cutlass.Constexpr[int],
+    attn_scale: cutlass.Float32,
+    io_dtype: cutlass.Constexpr[Type[cutlass.Numeric]],
+    use_pdl: cutlass.Constexpr[bool],
+    stream: cuda_driver.CUstream,
+):
+    m_blocks = cute.ceil_div(dq.shape[1], q_tile)
+    _convert_dq_kernel(dq_accum, dq, q_tile, d, page, warps_m_dq, attn_scale, io_dtype, use_pdl).launch(
+        grid=(m_blocks, dq.shape[2], dq.shape[0]),
+        block=(256, 1, 1),
+        stream=stream,
+        use_pdl=use_pdl,
+    )
+
+
+@lru_cache(maxsize=None)
+def compile(  # noqa: A001
+    compute_capability: tuple[int, int],
+    b: int = 1,
+    qh: int = 1,
+    sq: int = 128,
+    skv: int = 128,
+    d: int = 128,
+) -> SimpleNamespace:
+    """Compile and cache the three-kernel backward chain for one compact BSHD shape."""
+
+    bwd = SM120FusedMultiHeadAttentionFP16Backward(
+        in_dtype=STORAGE_DTYPE,
+        is_causal=PARAMS.is_causal,
+        head_dim=d,
+        use_pdl=PARAMS.use_pdl,
+        q_tile=PARAMS.q_tile,
+        kv_tile=PARAMS.kv_tile,
+    )
+    sq_r = ceil_div(sq, 128) * 128
+
+    def _fake(dtype, shape):
+        return make_fake_compact_tensor(
+            dtype,
+            shape,
+            stride_order=tuple(range(len(shape) - 1, -1, -1)),
+            assumed_align=16,
+        )
+
+    fake_q = _fake(STORAGE_DTYPE, (b, sq, qh, d))
+    fake_k = _fake(STORAGE_DTYPE, (b, skv, qh, d))
+    fake_v = _fake(STORAGE_DTYPE, (b, skv, qh, d))
+    fake_o = _fake(STORAGE_DTYPE, (b, sq, qh, d))
+    fake_do = _fake(STORAGE_DTYPE, (b, sq, qh, d))
+    fake_dq = _fake(STORAGE_DTYPE, (b, sq, qh, d))
+    fake_dk = _fake(STORAGE_DTYPE, (b, skv, qh, d))
+    fake_dv = _fake(STORAGE_DTYPE, (b, skv, qh, d))
+    fake_lse = _fake(cutlass.Float32, (b, qh, sq))
+    fake_delta = _fake(cutlass.Float32, (b, qh, sq_r))
+    fake_dq_accum = _fake(cutlass.Float32, (b * sq_r * qh * d,))
+    fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
+    options = "--enable-tvm-ffi"
+
+    compiled_dot = cute.compile(
+        _dot_do_o_host,
+        fake_o,
+        fake_do,
+        fake_delta,
+        fake_dq_accum,
+        bwd.q_tile,
+        d,
+        bwd.page,
+        bwd.use_pdl,
+        fake_stream,
+        options=options,
+    )
+    compiled_main = cute.compile(
+        bwd,
+        fake_q,
+        fake_k,
+        fake_v,
+        fake_do,
+        fake_lse,
+        fake_delta,
+        fake_dq_accum,
+        fake_dk,
+        fake_dv,
+        cutlass.Float32(1.0),
+        cutlass.Float32(1.0),
+        fake_stream,
+        options=options,
+    )
+    compiled_cvt = cute.compile(
+        _convert_dq_host,
+        fake_dq_accum,
+        fake_dq,
+        bwd.q_tile,
+        d,
+        bwd.page,
+        bwd.warps_m_dq,
+        cutlass.Float32(1.0),
+        STORAGE_DTYPE,
+        bwd.use_pdl,
+        fake_stream,
+        options=options,
+    )
+    return SimpleNamespace(dot=compiled_dot, main=compiled_main, cvt=compiled_cvt)

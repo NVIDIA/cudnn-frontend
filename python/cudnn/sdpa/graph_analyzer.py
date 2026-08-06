@@ -156,6 +156,11 @@ class SdpaGraphFacts:
     has_unfuse_fma: bool = False
     has_block_mask: bool = False
     has_rng_dump: bool = False
+    is_backward: bool = False  # sdpa_backward() node (NodeType.SDPA_BWD)
+    right_bound: Optional[int] = None  # raw resolved right band (0 == causal)
+    deterministic: bool = False  # sdpa_backward(use_deterministic_algorithm=True)
+    has_dbias: bool = False  # dBias output requested (backward)
+    has_dsink: bool = False  # dSink_token output requested (backward)
     has_score_max: bool = False  # per-row/tile score-max side output requested
     has_score_sum_exp: bool = False  # per-row/tile sum-of-exp side output requested
     dynamic_scale: bool = False  # attn_scale passed as a tensor
@@ -179,6 +184,13 @@ class SdpaGraphFacts:
     sink_t: Any = None
     seq_kv_t: Any = None
     seq_q_t: Any = None
+    # backward-only refs
+    do_t: Any = None
+    dq_t: Any = None
+    dk_t: Any = None
+    dv_t: Any = None
+    dbias_t: Any = None
+    dsink_t: Any = None
     # MXFP8 block-scale (descale) tensors + Amax_O output.
     sf_q_t: Any = None
     sf_k_t: Any = None
@@ -193,7 +205,8 @@ class SdpaGraphFacts:
 
 
 def _single_sdpa_node(graph: "cudnn.pygraph") -> Optional[Any]:
-    """The graph's sole SDPA-forward node, or None if the graph is anything else."""
+    """The graph's sole SDPA node (forward, backward, or an FP8/MXFP8 flavor),
+    or None if the graph is anything else."""
     try:
         nodes = graph.nodes
     except Exception:  # noqa: BLE001 — non-IR graph objects
@@ -201,7 +214,7 @@ def _single_sdpa_node(graph: "cudnn.pygraph") -> Optional[Any]:
     if len(nodes) != 1:
         return None
     node = nodes[0]
-    if node.node_type not in (cudnn.NodeType.SDPA, cudnn.NodeType.SDPA_MXFP8, cudnn.NodeType.SDPA_FP8):
+    if node.node_type not in (cudnn.NodeType.SDPA, cudnn.NodeType.SDPA_BWD, cudnn.NodeType.SDPA_MXFP8, cudnn.NodeType.SDPA_FP8):
         return None
     return node
 
@@ -216,8 +229,18 @@ def _record_from_node(node: Any) -> dict:
     rec: dict = dict(node.params)
     for port, t in node.inputs.items():
         rec.setdefault(port, t)
-    rec["o"] = node.outputs.get("O")
-    rec["stats"] = node.outputs.get("Stats")
+    # Forward: O / Stats are node outputs. Backward: o / stats are INPUT
+    # ports (already folded above) — don't clobber them with the absent
+    # forward output ports.
+    if node.outputs.get("O") is not None:
+        rec["o"] = node.outputs.get("O")
+    if node.outputs.get("Stats") is not None:
+        rec["stats"] = node.outputs.get("Stats")
+    rec["_is_backward"] = node.node_type == cudnn.NodeType.SDPA_BWD
+    if rec["_is_backward"]:
+        for port in ("dQ", "dK", "dV", "dBias", "dSink_token"):
+            if rec.get(port) is None:
+                rec[port] = node.outputs.get(port)
     # Output-style kwargs (passed as sdpa() arguments but recorded in
     # node.outputs): fold each one in so engines see every requested output.
     # Missing one here lets an engine that never writes it pass the probe and
@@ -250,18 +273,55 @@ def _first_not_none(*vals):
 
 
 def _extract_facts(rec: dict) -> SdpaGraphFacts:
+    is_backward = bool(rec.get("_is_backward"))
     q, k, v, o = rec.get("q"), rec.get("k"), rec.get("v"), rec.get("o")
     if q is None or k is None or v is None or o is None:
-        return _invalid("missing q/k/v/o on the sdpa() node")
+        return _invalid("missing q/k/v/o on the sdpa node")
 
-    q_dim, q_stride = tuple(q.get_dim()), tuple(q.get_stride())
-    k_dim, k_stride = tuple(k.get_dim()), tuple(k.get_stride())
-    v_dim, v_stride = tuple(v.get_dim()), tuple(v.get_stride())
-    o_dim, o_stride = tuple(o.get_dim()), tuple(o.get_stride())
-    if len({len(q_dim), len(k_dim), len(v_dim), len(o_dim), 4}) != 1:
-        return _invalid("Q/K/V/O must all be rank-4 (B, H, S, D)")
+    rank4_ports = [("q", q), ("k", k), ("v", v), ("o", o)]
+    if is_backward:
+        for name in ("dO", "dQ", "dK", "dV"):
+            t = rec.get(name)
+            if t is None:
+                return _invalid(f"missing {name} on the sdpa_backward node")
+            rank4_ports.append((name, t))
+
+    dims = {}
+    strides = {}
+    for name, t in rank4_ports:
+        d = tuple(t.get_dim())
+        if len(d) != 4:
+            return _invalid(f"{name} must be rank-4 (B, H, S, D); got rank {len(d)}")
+        dims[name] = d
+        strides[name] = tuple(t.get_stride())
+    q_dim, q_stride = dims["q"], strides["q"]
+    k_dim, k_stride = dims["k"], strides["k"]
+    v_dim, v_stride = dims["v"], strides["v"]
+    o_dim, o_stride = dims["o"], strides["o"]
 
     b, h_q, s_q, d_qk = q_dim
+
+    # ``build_operation_graph`` rewrites the BACKWARD node's K / V ports to
+    # transposed (B, H, D, S) views (the K^T / V^T the lowering consumes);
+    # the underlying buffer keeps the user's (B, H, S, D) shape.  Canonicalize
+    # so probing works both before and after the native build.
+    if is_backward:
+
+        def _square_transposed(dim: tuple, stride: tuple) -> bool:
+            """Square (S == D) rewritten views are extent-ambiguous; the stride
+            order disambiguates: the transposed view keeps the buffer's unit
+            stride, which lands on axis 2 instead of axis 3."""
+            return dim[2] == dim[3] != 1 and stride[2] == 1 and stride[3] != 1
+
+        if (k_dim[3] != d_qk and k_dim[2] == d_qk) or _square_transposed(k_dim, k_stride):
+            k_dim = (k_dim[0], k_dim[1], k_dim[3], k_dim[2])
+            k_stride = (k_stride[0], k_stride[1], k_stride[3], k_stride[2])
+        _, h_kv, s_kv, _ = k_dim
+        if (v_dim[2] != s_kv and v_dim[3] == s_kv) or _square_transposed(v_dim, v_stride):
+            v_dim = (v_dim[0], v_dim[1], v_dim[3], v_dim[2])
+            v_stride = (v_stride[0], v_stride[1], v_stride[3], v_stride[2])
+        dims["k"], dims["v"] = k_dim, v_dim
+        strides["k"], strides["v"] = k_stride, v_stride
     _, h_kv, s_kv, _ = k_dim
     d_v = v_dim[-1]
     if k_dim != (b, h_kv, s_kv, d_qk):
@@ -270,6 +330,11 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         return _invalid(f"V shape mismatch (k_dim={k_dim}, v_dim={v_dim})")
     if o_dim != (b, h_q, s_q, d_v):
         return _invalid(f"O shape mismatch (q_dim={q_dim}, o_dim={o_dim})")
+    if is_backward:
+        if dims["dO"] != (b, h_q, s_q, d_v):
+            return _invalid("dO shape mismatch")
+        if dims["dQ"] != dims["q"] or dims["dK"] != dims["k"] or dims["dV"] != dims["v"]:
+            return _invalid("dQ/dK/dV must match Q/K/V shapes")
     if any(x <= 0 for x in (b, h_q, h_kv, s_q, s_kv, d_qk, d_v)):
         return _invalid("B/H/S/D must all be > 0")
     if h_q % h_kv != 0:
@@ -284,9 +349,13 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         # FP8 in: O dtype is independent of the input; only K/V must match Q.
         uniform = all(_DTYPE_FROM_CUDNN.get(t.get_data_type()) == q_dtype for t in (k, v))
     else:
-        uniform = all(_DTYPE_FROM_CUDNN.get(t.get_data_type()) == q_dtype for t in (k, v, o))
-    bshd = all(bshd_layout_ok(d, s) for d, s in ((q_dim, q_stride), (k_dim, k_stride), (v_dim, v_stride), (o_dim, o_stride)))
-    dense_layout = all(dense_layout_ok(d, s) for d, s in ((q_dim, q_stride), (k_dim, k_stride), (v_dim, v_stride), (o_dim, o_stride)))
+        _uniform_ports = [k, v, o] + ([rec["dO"], rec["dQ"], rec["dK"], rec["dV"]] if is_backward else [])
+        uniform = all(_DTYPE_FROM_CUDNN.get(t.get_data_type()) == q_dtype for t in _uniform_ports)
+    _layout_ports = [(q_dim, q_stride), (k_dim, k_stride), (v_dim, v_stride), (o_dim, o_stride)]
+    if is_backward:
+        _layout_ports += [(dims[name], strides[name]) for name in ("dO", "dQ", "dK", "dV")]
+    bshd = all(bshd_layout_ok(d, s) for d, s in _layout_ports)
+    dense_layout = all(dense_layout_ok(d, s) for d, s in _layout_ports)
 
     # descale_q/k/v are the block-scale SF tensors for MXFP8, or scalar per-tensor
     # descales for FP8. Both arrive on the same-named node.inputs ports.
@@ -371,17 +440,22 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         if sink_dtype != torch.float32:
             return _invalid(f"sink_token must be float32; got {sink_dtype}")
 
-    generate_stats = rec.get("generate_stats")
-    is_inference = rec.get("is_inference")
-    if generate_stats is not None:
-        wants_stats = bool(generate_stats)
-    elif is_inference is not None:
-        wants_stats = not bool(is_inference)
-    else:
-        wants_stats = False
     stats = rec.get("stats")
-    if wants_stats and stats is None:
-        return _invalid("generate_stats=True but no Stats tensor was returned")
+    if is_backward:
+        wants_stats = False
+        if stats is None:
+            return _invalid("sdpa_backward requires the forward stats tensor")
+    else:
+        generate_stats = rec.get("generate_stats")
+        is_inference = rec.get("is_inference")
+        if generate_stats is not None:
+            wants_stats = bool(generate_stats)
+        elif is_inference is not None:
+            wants_stats = not bool(is_inference)
+        else:
+            wants_stats = False
+        if wants_stats and stats is None:
+            return _invalid("generate_stats=True but no Stats tensor was returned")
 
     attn_scale = rec.get("attn_scale")
     dynamic_scale = attn_scale is not None and not isinstance(attn_scale, (int, float))
@@ -406,6 +480,11 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         bottom_right=bool(align_is_br),
         window_left=window_left,
         right_band_widening=right_widening,
+        is_backward=is_backward,
+        right_bound=resolved_right,
+        deterministic=bool(rec.get("use_deterministic_algorithm", False)),
+        has_dbias=rec.get("dBias") is not None,
+        has_dsink=rec.get("dSink_token") is not None,
         has_bias=rec.get("bias") is not None,
         has_dropout=rec.get("dropout") is not None,
         has_score_mod=rec.get("fn") is not None,
@@ -429,7 +508,13 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         k_t=k,
         v_t=v,
         o_t=o,
-        stats_t=(stats if wants_stats else None),
+        stats_t=(stats if (wants_stats or is_backward) else None),
+        do_t=rec.get("dO"),
+        dq_t=rec.get("dQ"),
+        dk_t=rec.get("dK"),
+        dv_t=rec.get("dV"),
+        dbias_t=rec.get("dBias"),
+        dsink_t=rec.get("dSink_token"),
         sink_t=sink_token,
         seq_kv_t=seq_len_kv,
         seq_q_t=seq_len_q,
@@ -498,6 +583,17 @@ class SdpaBinding:
     descale_v: Any = None
     scale_o: Any = None
     amax_s: Any = None
+    # SM80 feature operands + backward ports.
+    bias: Any = None
+    block_mask: Any = None
+    score_max: Any = None
+    score_sum_exp: Any = None
+    do: Any = None
+    dq: Any = None
+    dk: Any = None
+    dv: Any = None
+    dbias: Any = None
+    dsink: Any = None
 
     def bound_tensors(self) -> list:
         return [
@@ -520,6 +616,16 @@ class SdpaBinding:
                 self.descale_v,
                 self.scale_o,
                 self.amax_s,
+                self.bias,
+                self.block_mask,
+                self.score_max,
+                self.score_sum_exp,
+                self.do,
+                self.dq,
+                self.dk,
+                self.dv,
+                self.dbias,
+                self.dsink,
             )
             if t is not None
         ]

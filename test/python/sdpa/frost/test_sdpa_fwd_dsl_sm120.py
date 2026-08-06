@@ -419,7 +419,7 @@ def _run_thd_case(
     graph.validate()
     graph.build_operation_graph()
     graph.create_execution_plans([cudnn.heur_mode.A])
-    graph.select_engines([engine_name(arch="sm120")])
+    _select_engine(graph, engine_name(arch="sm120"))
     graph.check_support()
     graph.build_plans()
     workspace = torch.empty(max(1, graph.get_workspace_size()), dtype=torch.uint8, device="cuda")

@@ -10,6 +10,7 @@ import pytest
 import torch
 
 from cudnn.sdpa import graph_analyzer as ga
+from cudnn.sdpa.bwd import engines as bwd_engines
 from cudnn.sdpa.fwd import engines
 
 
@@ -714,3 +715,201 @@ def test_sm120_knob_domains(monkeypatch):
     assert _SM120 in _eligible(g, engines.SdpaFwdKnobs(tile_m=64, tile_n=64, cga=1))
     assert not _eligible(g, engines.SdpaFwdKnobs(cga=2))
     assert not _eligible(g, engines.SdpaFwdKnobs(sched_policy=1))
+
+
+# ---------------------------------------------------------------------------
+# SDPA_BWD: facts extraction + sdpa_bwd_sm120 probe gating. Executable
+# coverage lives in test_sdpa_bwd_dsl_sm120.py.
+# ---------------------------------------------------------------------------
+
+_BWD_ENGINE = "sdpa_bwd_sm120"
+_BWD_D = 64
+
+
+def _bwd_eligible(graph, knobs=None):
+    """Names of the FROST SDPA-backward engines whose caps match this graph."""
+    return {s.name for s in bwd_engines.ENGINE_SPECS if bwd_engines.probe(s, graph, knobs)}
+
+
+def _bshd_strides(h: int, s: int, d: int) -> tuple[int, int, int, int]:
+    return (s * h * d, d, h * d, 1)
+
+
+def _mk_bwd_graph(
+    d: int = _BWD_D,
+    h_kv: int = H,
+    s_q: int = S,
+    s_kv: int = S,
+    kv_transposed_view: bool = False,
+    stats_stride: tuple | None = None,
+    grad_strides: tuple | None = None,
+    bias: bool = False,
+    dbias: bool = False,
+    **bwd_kwargs,
+):
+    g = _mk_graph()
+    q_dims, q_strides = (B, H, s_q, d), _bshd_strides(H, s_q, d)
+    kv_dims, kv_strides = (B, h_kv, s_kv, d), _bshd_strides(h_kv, s_kv, d)
+    if kv_transposed_view:
+        # Mimic the post-build_operation_graph state: the backward node's K/V
+        # ports are rewritten to transposed (B, H, D, S) views of the same
+        # canonical BSHD buffer.
+        kv_dims = (B, h_kv, d, s_kv)
+        kv_strides = (s_kv * h_kv * d, d, 1, h_kv * d)
+    q = g.tensor(dim=q_dims, stride=q_strides, data_type=DTYPE, name="q")
+    k = g.tensor(dim=kv_dims, stride=kv_strides, data_type=DTYPE, name="k")
+    v = g.tensor(dim=kv_dims, stride=kv_strides, data_type=DTYPE, name="v")
+    o = g.tensor(dim=q_dims, stride=_bshd_strides(H, s_q, d), data_type=DTYPE, name="o")
+    do = g.tensor(dim=q_dims, stride=_bshd_strides(H, s_q, d), data_type=DTYPE, name="dO")
+    stats = g.tensor(
+        dim=(B, H, s_q, 1),
+        stride=stats_stride or (H * s_q, s_q, 1, 1),
+        data_type=cudnn.data_type.FLOAT,
+        name="stats",
+    )
+    if bias:
+        bias_t = g.tensor(dim=(1, H, s_q, s_kv), stride=(H * s_q * s_kv, s_q * s_kv, s_kv, 1), data_type=DTYPE, name="bias")
+        bwd_kwargs.update(bias=bias_t)
+    if dbias:
+        dbias_t = g.tensor(dim=(1, H, s_q, s_kv), stride=(H * s_q * s_kv, s_q * s_kv, s_kv, 1), data_type=DTYPE, name="dBias")
+        bwd_kwargs.update(dBias=dbias_t)
+    dq, dk, dv = g.sdpa_backward(name="sb", q=q, k=k, v=v, o=o, dO=do, stats=stats, attn_scale=0.125, **bwd_kwargs)
+    _finish_output(dq, q_dims, grad_strides or _bshd_strides(H, s_q, d))
+    _finish_output(dk, (B, h_kv, s_kv, d), grad_strides or _bshd_strides(h_kv, s_kv, d))
+    _finish_output(dv, (B, h_kv, s_kv, d), grad_strides or _bshd_strides(h_kv, s_kv, d))
+    return g
+
+
+def test_bwd_engines_registered():
+    from cudnn.engines import MANIFEST, is_python_engine
+
+    (row,) = [r for r in MANIFEST if r.factory == "FrostSdpaBwdEngines"]
+    assert is_python_engine(row.engine_id)
+    assert row.id_end - row.engine_id >= len(bwd_engines.ENGINE_SPECS)
+    assert bwd_engines.engine_name() == _BWD_ENGINE
+
+
+def test_bwd_facts_extracted():
+    g = _mk_bwd_graph(use_causal_mask=True)
+    facts = _facts(g)
+    assert facts.is_backward
+    assert facts.causal and not facts.bottom_right
+    assert facts.right_bound == 0
+    assert not facts.deterministic and not facts.has_dbias and not facts.has_dsink
+    assert (facts.b, facts.h_q, facts.h_kv, facts.s_q, facts.s_kv, facts.d_qk, facts.d_v) == (B, H, H, S, S, _BWD_D, _BWD_D)
+    assert facts.dtype == torch.float16 and facts.uniform_dtype
+    assert facts.bshd_layout
+    for ref in (facts.do_t, facts.dq_t, facts.dk_t, facts.dv_t, facts.stats_t):
+        assert ref is not None
+    assert facts.scale == 0.125
+
+
+def test_bwd_facts_kv_transposed_view_canonicalized():
+    # After build_operation_graph the bwd node's K/V ports describe transposed
+    # (B, H, D, S) views; the analyzer canonicalizes dims AND strides back so
+    # geometry and the BSHD layout gate hold before and after the native build.
+    facts = _facts(_mk_bwd_graph(kv_transposed_view=True))
+    assert (facts.s_kv, facts.d_qk) == (S, _BWD_D)
+    assert facts.bshd_layout
+
+
+def test_bwd_probe_accepts(monkeypatch):
+    monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
+    assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph())
+    assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(use_causal_mask=True))
+    assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(s_q=S // 2, use_causal_mask_bottom_right=True))
+    for d in (32, 128):
+        assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(d=d))
+
+
+def test_bwd_probe_rejects_forward_graph(monkeypatch):
+    monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
+    g = _mk_graph()
+    q, k, v, dims, strides = _mk_qkv(g, d=_BWD_D)
+    o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True)
+    _finish_output(o, dims, strides)
+    assert not _bwd_eligible(g)
+    # ... and symmetrically, the forward engines decline a backward graph.
+    assert not _eligible(_mk_bwd_graph())
+
+
+def test_bwd_probe_rejects_gqa(monkeypatch):
+    monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
+    assert not _bwd_eligible(_mk_bwd_graph(h_kv=H // 2))
+
+
+def test_bwd_probe_rejects_unsupported_head_dim(monkeypatch):
+    monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
+    assert not _bwd_eligible(_mk_bwd_graph(d=96))
+    assert not _bwd_eligible(_mk_bwd_graph(d=256))
+
+
+def test_bwd_probe_causal_notches(monkeypatch):
+    monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
+    # Top-left causal requires S_q == S_kv (the kernel diagonal is bottom-right).
+    assert not _bwd_eligible(_mk_bwd_graph(s_q=S // 2, use_causal_mask=True))
+    # Causal with S_q > S_kv has fully-masked query rows (stats = -inf).
+    assert not _bwd_eligible(_mk_bwd_graph(s_q=2 * S, use_causal_mask_bottom_right=True))
+    # Sliding window is not supported.
+    assert not _bwd_eligible(_mk_bwd_graph(use_causal_mask=True, sliding_window_length=64))
+
+
+def test_bwd_probe_rejects_deterministic(monkeypatch):
+    monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
+    assert not _bwd_eligible(_mk_bwd_graph(use_deterministic_algorithm=True))
+
+
+def test_bwd_probe_rejects_bias(monkeypatch):
+    monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
+    assert not _bwd_eligible(_mk_bwd_graph(bias=True))
+
+
+def test_bwd_probe_rejects_dbias(monkeypatch):
+    monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
+    assert not _bwd_eligible(_mk_bwd_graph(dbias=True))
+
+
+def test_bwd_probe_rejects_non_bshd_layout(monkeypatch):
+    monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
+    # BHSD-contiguous gradients are outside the strict-BSHD envelope (no
+    # normalization copy on the backward path, unlike the forward dense_flex).
+    bhsd_contig = (H * S * _BWD_D, S * _BWD_D, _BWD_D, 1)
+    assert not _bwd_eligible(_mk_bwd_graph(grad_strides=bhsd_contig))
+
+
+def test_bwd_probe_rejects_strided_stats(monkeypatch):
+    monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
+    # A padded stats stride has no zero-copy (B, H, S) reshape.
+    assert not _bwd_eligible(_mk_bwd_graph(stats_stride=(2 * H * S, 2 * S, 2, 1)))
+
+
+def test_bwd_knob_domains(monkeypatch):
+    monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
+    g = _mk_bwd_graph()
+    # In-domain requests are eligible (final per-head-dim feasibility is the
+    # kernel constructor's, at build).
+    assert _BWD_ENGINE in _bwd_eligible(g, bwd_engines.SdpaBwdKnobs(tile_m=64, tile_n=128))
+    assert _BWD_ENGINE in _bwd_eligible(g, bwd_engines.SdpaBwdKnobs())  # all-None = no preference
+    # Out-of-domain values are rejected.
+    assert not _bwd_eligible(g, bwd_engines.SdpaBwdKnobs(tile_m=48))
+    assert not _bwd_eligible(g, bwd_engines.SdpaBwdKnobs(tile_n=32))
+    # Another operation's vocabulary is rejected wholesale.
+    assert not _bwd_eligible(g, engines.SdpaFwdKnobs(tile_m=64))
+
+
+def test_bwd_mismatch_reason_strings(monkeypatch):
+    monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
+    caps = bwd_engines.ENGINE_SPECS[0].capabilities
+    reason = bwd_engines.mismatch(caps, _facts(_mk_bwd_graph(h_kv=H // 2)))
+    assert reason is not None and "GQA" in reason
+    reason = bwd_engines.mismatch(caps, _facts(_mk_bwd_graph(d=96)))
+    assert reason is not None and "96" in reason
+    reason = bwd_engines.mismatch(caps, _facts(_mk_bwd_graph(s_q=S // 2, use_causal_mask=True)))
+    assert reason is not None and "top-left" in reason
+    reason = bwd_engines.mismatch(caps, _facts(_mk_bwd_graph(use_deterministic_algorithm=True)))
+    assert reason is not None and "deterministic" in reason
+    reason = bwd_engines.mismatch(caps, _facts(_mk_bwd_graph()), engines.SdpaFwdKnobs(tile_m=64))
+    assert reason is not None and "knob" in reason
+    reason = bwd_engines.mismatch(caps, _facts(_mk_bwd_graph()), bwd_engines.SdpaBwdKnobs(tile_m=48))
+    assert reason is not None and "tile_m=48" in reason
+    assert bwd_engines.mismatch(caps, _facts(_mk_bwd_graph()), bwd_engines.SdpaBwdKnobs(tile_m=64, tile_n=128)) is None
