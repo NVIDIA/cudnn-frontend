@@ -3,14 +3,14 @@
 
 """SM80 (Ampere / A100) SDPA prefill at d_qk = d_v = 256, FP16 (qwen).
 
-Sibling of ``prefill_sdpa_f16_sm80.py`` — same online flash-attention
+Sibling of ``prefill_f16_sm80.py`` — same online flash-attention
 recipe (rowwise max / sum, exp2 softmax with scale folded into the
 exponent, threadquad butterflies, RESCALE_THRESHOLD=8.0, mask pre-pass
 on boundary iters, LPT / LPT_L2 schedulers, swizzled STG.128 epilogue),
 but with a symmetric K + V prefetch pipeline that's a small perf gain
 at d=256 but a regression at d ≤ 192 (Llama / DSv3 / GPT-OSS) — those
 flavors stay on the simpler K-only-prefetch pipeline in
-``prefill_sdpa_f16_sm80.py``.
+``prefill_f16_sm80.py``.
 
 Pipeline shape (qwen, d_qk = d_v = 256):
 

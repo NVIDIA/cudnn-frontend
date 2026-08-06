@@ -3,7 +3,7 @@
 
 """SM80 (Ampere / A100) SDPA BACKWARD — Llama d_qk=d_v=128 / GPT-OSS d_qk=d_v=64, FP16/BF16.
 
-Companion to the forward ``prefill_sdpa_f16_sm80.py``.  Computes dQ / dK / dV
+Companion to the forward ``prefill_f16_sm80.py``.  Computes dQ / dK / dV
 for non-causal MHA (KH = VH = QH) from saved ``LSE`` (forward log-sum-exp) and
 ``do_dot[q] = sum_d O[q,d]*dO[q,d]`` (the bprop "delta", fed in — see
 ``bprop_do_dot`` follow-up).  No mbarriers / clusters (Ampere) — pure

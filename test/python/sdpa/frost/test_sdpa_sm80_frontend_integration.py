@@ -79,10 +79,11 @@ def test_sm80_engines_registered():
 
     fwd_row = next(r for r in MANIFEST if r.factory == "FrostSdpaFwdEngines")
     bwd_row = next(r for r in MANIFEST if r.factory == "FrostSdpaBwdEngines")
-    assert fwd_row.sm_lo <= 80 <= fwd_row.sm_hi
-    assert bwd_row.sm_lo <= 80 <= bwd_row.sm_hi
-    fwd = {e.name: e for e in FrostSdpaFwdEngines()}
-    bwd = {e.name: e for e in FrostSdpaBwdEngines()}
+    fwd_ids = fwd_row.offered_ids()
+    bwd_ids = bwd_row.offered_ids()
+    assert _FWD in fwd_ids and _BWD in bwd_ids  # opt-in fixture enables them
+    fwd = {e.name: e for e in FrostSdpaFwdEngines(fwd_ids)}
+    bwd = {e.name: e for e in FrostSdpaBwdEngines(bwd_ids)}
     assert _FWD in fwd and fwd_row.owns(fwd[_FWD].engine_id)
     assert _BWD in bwd and bwd_row.owns(bwd[_BWD].engine_id)
     assert is_python_engine(fwd[_FWD].engine_id) and is_python_engine(bwd[_BWD].engine_id)

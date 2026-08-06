@@ -4,7 +4,7 @@
 """Tests for the SM80 (A100) SDPA forward API.
 
 Skipped automatically on non-SM80 devices or when the optional CuTe-DSL
-dependencies (``cutlass`` / ``ctm``) are missing.  Compares the kernel's
+dependency (``nvidia-cutlass-dsl``) is missing.  Compares the kernel's
 output against a fp32 torch reference at a per-element fp16 tolerance.
 """
 

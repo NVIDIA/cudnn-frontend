@@ -4,8 +4,8 @@
 """cuDNN-frontend wrapper around the SM80 (A100) SDPA prefill kernels.
 
 The kernels live at ``kernels/prefill_f16_sm80.py`` (generic) and
-``kernels/prefill_d256_f16_sm80.py`` (d=256) — vendored from the upstream
-tile repo (provenance: ``../bwd/kernels/__init__.py``), building on the
+``kernels/prefill_d256_f16_sm80.py`` (d=256) — vendored from a since-retired
+internal tile repo (provenance: ``kernels/__init__.py``), building on the
 shared FROST tile library ``cudnn/frost/tile_dsl/``.  This file is the
 thin adapter that:
 
@@ -52,10 +52,10 @@ from cudnn.api_base import APIBase, TupleDict
 # ---------------------------------------------------------------------------
 # Lazy import of the kernel.
 # ---------------------------------------------------------------------------
-# ``cute.compile`` pulls in ctm / cutlass and traces a kernel on first
+# ``cute.compile`` pulls in cutlass and traces a kernel on first
 # invocation — ~1.5 s.  Defer the kernel module import until the user
 # actually calls ``compile()`` / ``execute()`` so ``import cudnn`` stays
-# fast and we don't hard-require ``ctm`` for users on SM100+ devices.
+# fast and the CuTe DSL is not hard-required just to import the package.
 _KERNEL_MOD = {}
 
 
@@ -78,8 +78,8 @@ _D256_FLAVORS = ("qwen",)
 
 def _load_kernel_module(flavor: str = ""):
     """Lazily import + cache the SM80 kernel module for ``flavor``.  qwen (d=256)
-    routes to ``prefill_sdpa_d256_f16_sm80`` (symmetric K+V prefetch); the rest
-    use ``prefill_sdpa_f16_sm80``."""
+    routes to ``prefill_d256_f16_sm80`` (symmetric K+V prefetch); the rest
+    use ``prefill_f16_sm80``."""
     key = "d256" if flavor in _D256_FLAVORS else "f16"
     if key not in _KERNEL_MOD:
         if key == "d256":
@@ -92,7 +92,7 @@ def _load_kernel_module(flavor: str = ""):
 
 # ---------------------------------------------------------------------------
 # Flavor tables — sourced from the per-flavor config modules (the single
-# source of truth, like config_sm100 / config_sm12x for the DSL engines).
+# source of truth, like config_sm100 / config_sm120 for the DSL engines).
 # ---------------------------------------------------------------------------
 from .kernels import sdpa_config_dsv3, sdpa_config_gptoss, sdpa_config_llama, sdpa_config_qwen
 
@@ -443,7 +443,7 @@ class SdpafwdSm80(APIBase):
         """Eager-warm the kernel's internal ``@lru_cache``.
 
         The kernel module owns its own per-shape ``cute.compile`` cache
-        (see ``prefill_sdpa_f16_sm80._compile_cached``).  We don't need
+        (see ``prefill_f16_sm80._compile_cached``).  We don't need
         to plumb a second cache here — calling ``forward()`` once with
         the sample shapes warms the binary so the first ``execute()``
         call is fast.  We deliberately skip the real launch by issuing

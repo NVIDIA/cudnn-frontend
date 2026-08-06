@@ -4,7 +4,7 @@
 """Tests for the SM80 (A100) SDPA backward API.
 
 Skipped automatically on non-SM80 devices or when the optional CuTe-DSL
-dependencies (``cutlass`` / ``ctm``) are missing.  Runs the SM80 forward to
+dependency (``nvidia-cutlass-dsl``) is missing.  Runs the SM80 forward to
 produce O/LSE, then compares dQ/dK/dV against a fp32 torch autograd
 reference.
 """

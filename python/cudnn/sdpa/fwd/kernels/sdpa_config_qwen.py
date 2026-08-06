@@ -4,7 +4,7 @@
 """Qwen SDPA flavor config for SM80 — d_qk = d_v = 256, FP16.
 
 Qwen ships d=256 per head.  Same kernel skeleton as llama / dsv3 / gptoss
-(``prefill_sdpa_f16_sm80.py``) — the shared Q-in-regs + double-buffered
+(``prefill_f16_sm80.py``) — the shared Q-in-regs + double-buffered
 K + V-aliased-with-Q pipeline handles d=256 cleanly once m_blocks stays
 at 1 (tile_m = num_warps * 16).
 
