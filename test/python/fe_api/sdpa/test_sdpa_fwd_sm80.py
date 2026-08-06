@@ -37,9 +37,9 @@ def _bshd_randn(b, h, s, d, **kw):
 def _ref_sdpa(q, k, v, *, is_causal, window_size, scale):
     """Reference SDPA in fp32 with the same masking semantics the kernel
     promises (causal / SWA window described by (left, right))."""
-    b, h_q, s_q, d_qk = q.shape
+    _b, h_q, s_q, _d_qk = q.shape
     _, h_kv, s_kv, _ = k.shape
-    _, _, _, d_v = v.shape
+    _, _, _, _d_v = v.shape
     g = h_q // h_kv
     # Expand K/V across GQA groups for ref.
     k_ref = k.repeat_interleave(g, dim=1).to(torch.float32)
@@ -68,13 +68,21 @@ def _ref_sdpa(q, k, v, *, is_causal, window_size, scale):
 
 
 @pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_sdpa_fwd_sm80_smoke():
+    """One representative case at L0 (llama flavor, fp16, causal, MHA);
+    the full flavor x mask x GQA x dtype sweep runs at L2."""
+    test_sdpa_fwd_sm80_wrapper(torch.float16, 128, 128, "causal", (8, 8))
+
+
+@pytest.mark.L2
 @pytest.mark.parametrize("d_qk,d_v", [(64, 64), (128, 128), (192, 128), (256, 256)], ids=["gptoss", "llama", "dsv3", "qwen"])
 @pytest.mark.parametrize("mask", ["none", "causal", "swa"])
 @pytest.mark.parametrize("gqa", [(8, 8), (16, 4)], ids=["mha", "gqa4x"])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
 @torch_fork_set_rng(seed=0)
 def test_sdpa_fwd_sm80_wrapper(dtype, d_qk, d_v, mask, gqa):
-    """End-to-end check against torch reference SDPA."""
+    """End-to-end check against torch reference SDPA (full sweep, L2)."""
     try:
         from cudnn.sdpa import sdpa_fwd_wrapper_sm80
     except ImportError as e:

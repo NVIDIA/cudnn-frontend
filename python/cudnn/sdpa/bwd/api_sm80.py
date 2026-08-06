@@ -270,11 +270,20 @@ class SdpabwdSm80(APIBase):
             self.mask_token = "causal" if swa_left < 0 else "causal_swa"
             self.swa_window_runtime = max(0, swa_left) if swa_left >= 0 else 0
             self.right_bound = max(0, swa_right)
-        elif swa_left >= 0 or swa_right >= 0:
+        elif swa_left >= 0:
+            # A left window alone selects SWA; window_size_right is only
+            # meaningful with is_causal=True.
             self._not_implemented_error_if(swa_right > 0, "SM80 BPROP: non-causal SWA with window_size_right > 0 unsupported")
             self.mask_token = "swa"
-            self.swa_window_runtime = max(0, swa_left)
+            self.swa_window_runtime = swa_left
         else:
+            # window_size=(-1, r) without is_causal: a bare right bound has no
+            # diagonal to anchor to — reject rather than silently pick a mask
+            # (mirrors the forward adapter and the THD path).
+            self._not_implemented_error_if(
+                swa_right >= 0,
+                "SM80 BPROP: window_size_right without a left window or is_causal=True has no effect; pass is_causal=True or a left window",
+            )
             self.mask_token = "none"
             self.swa_window_runtime = 0
 
@@ -435,6 +444,12 @@ def _thd_backward(q, k, v, o, do, lse, *, cu_q, cu_k, scale_softmax, is_causal, 
     h_q = q.shape[2]
     flavor = _pick_flavor(d_qk, d_v)
     fdqk, fdv = _FLAVOR_DIMS[flavor]
+    # Resolve the default scale from the USER's head dim before padding: the
+    # kernel would otherwise derive 1/sqrt(D) from the padded flavor width
+    # (e.g. 1/sqrt(128) for a d=96 llama-flavor call) — silently wrong
+    # gradients.  Mirrors the forward THD path.
+    if scale_softmax is None or scale_softmax == 0.0:
+        scale_softmax = 1.0 / math.sqrt(d_qk)
     pad_qk = d_qk < fdqk
     pad_v = d_v < fdv
     if pad_qk:

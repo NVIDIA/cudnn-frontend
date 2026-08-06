@@ -64,6 +64,14 @@ def _ref_grads(q, k, v, do, *, is_causal, window_left, scale):
 
 
 @pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_sdpa_bwd_sm80_smoke():
+    """One representative case at L0 (llama flavor, fp16, causal, MHA);
+    the full flavor x mask x GQA x dtype sweep runs at L2."""
+    test_sdpa_bwd_sm80_wrapper(torch.float16, 128, 128, "causal", (8, 8))
+
+
+@pytest.mark.L2
 @pytest.mark.parametrize("d_qk,d_v", [(64, 64), (128, 128), (192, 128), (256, 256)], ids=["gptoss", "llama", "dsv3", "qwen"])
 @pytest.mark.parametrize("mask", ["none", "causal", "causal_swa"])
 @pytest.mark.parametrize("gqa", [(8, 8), (16, 4)], ids=["mha", "gqa4x"])
