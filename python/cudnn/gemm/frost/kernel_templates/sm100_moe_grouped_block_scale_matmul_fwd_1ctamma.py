@@ -154,6 +154,7 @@ def _kernel(
 
     warp_idx = cute.arch.warp_idx()
     warp_idx = cute.arch.make_warp_uniform(warp_idx)
+    elect_one = nvvm.elect_sync()
 
     tidx = cute.arch.thread_idx()[0]
     bidx = cute.arch.block_idx()[0]
@@ -268,7 +269,7 @@ def _kernel(
     ab_empty_count = cluster_m + cluster_n - 1
     sched_empty_count = 1 + 1 + num_epilogue_warps
     if warp_idx == 0:
-        if nvvm.elect_sync():
+        if elect_one:
             for i in range(ab_stages):
                 nvvm.mbarrier_init(ab_full_mbar_ptr.subview(i), 1)
                 nvvm.mbarrier_init(ab_empty_mbar_ptr.subview(i), ab_empty_count)
@@ -524,14 +525,13 @@ def _kernel(
     if warp_idx == tma_warp_id:
         nvvm.setmaxregister(prod_reg_count, nvvm.SetMaxRegisterAction.DECREASE)
         if cutlass.const_expr(USE_PDL):
-            if nvvm.elect_sync():
+            if elect_one:
                 nvvm.griddepcontrol("wait")
         ab_empty_phase_bit = cutlass.Int32(1)
         ab_iter = cutlass.Int32(0)
         sched_stage = cutlass.Int32(0)
         sched_full_phase = cutlass.Int32(0)
         is_valid = cutlass.Int32(1)
-        elect_one = nvvm.elect_sync()
 
         lane = tidx % 32
         block_linear = bidx + bidy * gridx
@@ -607,13 +607,13 @@ def _kernel(
 
                     coord_k = k_tile_idx * cta_tile_mnk[2]
                     coord_sf_k = k_tile_idx * sf_tma_box_k
-                    if nvvm.elect_sync():
+                    if elect_one:
                         nvvm.mbarrier_arrive_expect_tx(ab_full_mbar_ptr.subview(stage), num_tma_copy_bytes)
                     a_issue = (not multicast_a) or (n_rank == 0)
                     b_issue = (not multicast_b) or (m_rank == 0)
                     if a_issue:
                         for _ai in cutlass.range_constexpr(num_a_operands):
-                            if nvvm.elect_sync():
+                            if elect_one:
                                 nvvm.cp_async_bulk_tensor_shared_cluster_global(
                                     smem_a_list[_ai].subview(sA_elems * stage),
                                     a_desc_tma_ptr_list[_ai],
@@ -624,7 +624,7 @@ def _kernel(
                                     group=nvvm.CTAGroup.CTA_1,
                                 )
                         for _ai in cutlass.range_constexpr(num_a_operands):
-                            if nvvm.elect_sync():
+                            if elect_one:
                                 nvvm.cp_async_bulk_tensor_shared_cluster_global(
                                     smem_sfa_list[_ai].subview(sfa_smem_bytes * stage),
                                     tma_sfa_descs[_ai].get_ptr(),
@@ -637,7 +637,7 @@ def _kernel(
                     if b_issue:
                         for _bj in cutlass.range_constexpr(num_b_operands):
                             sB_stage = smem_b_list[_bj].subview(sB_elems * stage)
-                            if nvvm.elect_sync():
+                            if elect_one:
                                 if cutlass.const_expr(b_is_n_major):
                                     for n_group in cutlass.range_constexpr(cta_tile_mnk[1] // b_tma_group_elems):
                                         nvvm.cp_async_bulk_tensor_shared_cluster_global(
@@ -664,7 +664,7 @@ def _kernel(
                                         group=nvvm.CTAGroup.CTA_1,
                                     )
                         for _bj in cutlass.range_constexpr(num_b_operands):
-                            if nvvm.elect_sync():
+                            if elect_one:
                                 nvvm.cp_async_bulk_tensor_shared_cluster_global(
                                     smem_sfb_list[_bj].subview(sfb_smem_bytes * stage),
                                     tma_sfb_descs[_bj].get_ptr(),
@@ -685,7 +685,7 @@ def _kernel(
             if tail_stage == ab_stages:
                 tail_stage = cutlass.Int32(0)
                 tail_phase = tail_phase ^ 1
-        if nvvm.elect_sync():
+        if elect_one:
             while not nvvm.mbarrier_try_wait_parity(ab_empty_mbar_ptr.subview(tail_stage), tail_phase, time_limit=10_000_000):
                 pass
 
@@ -740,7 +740,7 @@ def _kernel(
             ):
                 pass
             is_valid = (sched_storage.subview(sched_stage * SCHED_SLOT_WORDS).subview(3)).load()
-            if nvvm.elect_sync():
+            if elect_one:
                 nvvm.mbarrier_arrive(sched_empty_mbar_ptr.subview(sched_stage))
             sched_stage += 1
             if sched_stage == SCHED_STAGES:
@@ -824,7 +824,7 @@ def _kernel(
                     for atom_r in cutlass.range_constexpr(num_sf_atoms):
                         for _ai in cutlass.range_constexpr(num_a_operands):
                             for _m in cutlass.range_constexpr(num_blocks_m):
-                                if nvvm.elect_sync():
+                                if elect_one:
                                     nvvm.tcgen05_cp(
                                         s2t_shape,
                                         sfa_dst_ptrs[_ai][_m],
@@ -834,7 +834,7 @@ def _kernel(
                                     )
                         for _bj in cutlass.range_constexpr(num_b_operands):
                             for _m in cutlass.range_constexpr(num_blocks_n):
-                                if nvvm.elect_sync():
+                                if elect_one:
                                     nvvm.tcgen05_cp(
                                         s2t_shape,
                                         sfb_dst_ptrs[_bj][_m],
@@ -850,7 +850,7 @@ def _kernel(
                                 _bj = gemm_b_idx[g]
                                 desc_a = desc_a_bases[_ai].advance_start_address(a_smem_k_step_bytes * k_block_idx)
                                 desc_b = desc_b_bases[_bj].advance_start_address(b_smem_k_step_bytes * k_block_idx)
-                                if nvvm.elect_sync():
+                                if elect_one:
                                     nvvm.tcgen05_mma_block_scale(
                                         mma_block_scale_kind,
                                         nvvm.CTAGroup.CTA_1,
@@ -865,7 +865,7 @@ def _kernel(
                                     )
                             scale_d = cutlass.Boolean(True)
 
-                    if nvvm.elect_sync():
+                    if elect_one:
                         nvvm.tcgen05_commit(
                             ab_empty_mbar_ptr.subview(stage),
                             multicast_mask=ab_empty_arrive_mask,
@@ -873,7 +873,7 @@ def _kernel(
                         )
                     ab_iter += 1
 
-                if nvvm.elect_sync():
+                if elect_one:
                     nvvm.tcgen05_commit(
                         acc_full_mbar_ptr.subview(acc_stage),
                         group=nvvm.CTAGroup.CTA_1,
@@ -881,14 +881,14 @@ def _kernel(
                 tile_iter += 1
 
         if cutlass.const_expr(USE_PDL):
-            if nvvm.elect_sync():
+            if elect_one:
                 nvvm.griddepcontrol("launch_dependents")
 
         nvvm.tcgen05_relinquish_alloc_permit(group=nvvm.CTAGroup.CTA_1)
         if tile_iter != 0:
             tail_stage = acc_stage
             tail_phase = acc_empty_phase_bit
-            if nvvm.elect_sync():
+            if elect_one:
                 for _ in range(acc_stages):
                     tail_stage = tail_stage + 1
                     if tail_stage == acc_stages:
@@ -948,7 +948,7 @@ def _kernel(
             group_begin = (_slot.subview(4)).load()
             group_end = (_slot.subview(5)).load()
             group_idx = (_slot.subview(7)).load()
-            if nvvm.elect_sync():
+            if elect_one:
                 nvvm.mbarrier_arrive(sched_empty_mbar_ptr.subview(sched_stage))
             sched_stage += 1
             if sched_stage == SCHED_STAGES:
@@ -1005,7 +1005,7 @@ def _kernel(
 
                     if cutlass.const_expr(use_acc_overlap and subtile_idx == acc_overlap_subtiles - 1):
                         nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
-                        if nvvm.elect_sync():
+                        if elect_one:
                             nvvm.mbarrier_arrive(acc_empty_mbar_ptr.subview(acc_stage))
 
                     col = coord_n + subtile_col_offset
@@ -1024,13 +1024,13 @@ def _kernel(
 
                 if cutlass.const_expr(not use_acc_overlap):
                     nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
-                    if nvvm.elect_sync():
+                    if elect_one:
                         nvvm.mbarrier_arrive(acc_empty_mbar_ptr.subview(acc_stage))
                 tile_iter += 1
 
         if cutlass.const_expr(use_acc_overlap):
             nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
-            if nvvm.elect_sync():
+            if elect_one:
                 nvvm.mbarrier_arrive(tmem_dealloc_mbar_ptr)
 
     if warp_idx == unused_warp_id:
