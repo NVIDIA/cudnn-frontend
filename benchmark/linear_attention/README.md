@@ -57,6 +57,13 @@ python benchmark_single_linear_attention.py \
     --la_backend fla --variant gdn --data_type bfloat16 \
     --skip_ref --fwd_bwd
 
+# FlashQLA (TileLang) comparison point (gdn variant only)
+python benchmark_single_linear_attention.py \
+    --batch_size 1 --seqlen 8192 \
+    --num_q_heads 8 --num_kv_heads 64 --head_dim 128 \
+    --la_backend flash_qla --variant gdn --data_type bfloat16 \
+    --skip_ref --fwd_bwd
+
 # Recurrent state ports: seed with an initial state and request the final
 # state (its gradient feeds the backward pass)
 python benchmark_single_linear_attention.py \
@@ -76,6 +83,7 @@ Dropping `--skip_ref` validates the forward output against FLA (the same way the
 |---------|-------------|
 | `cudnn` | cuDNN (native, via the cuDNN Frontend torch custom ops) |
 | `fla`   | FLA (flash-linear-attention, Triton) |
+| `flash_qla` | FlashQLA (TileLang fused GDN kernels, `gdn` variant only) |
 
 The cuDNN backend routes through the pygraph engines: FROST (Cutlass DSL) on SM100-class devices, the cuTile engines elsewhere. Both passes run through autograd, exactly like a training step.
 
@@ -89,9 +97,11 @@ The cuDNN backend routes through the pygraph engines: FROST (Cutlass DSL) on SM1
 
 The benchmark runs `kda` and `gdn2` with the in-kernel q/k L2 normalization off (`use_qk_l2norm_in_kernel=False`) on every backend, for an apples-to-apples comparison.
 
+Recent `fla` releases dispatch `chunk_gated_delta_rule` to FlashQLA whenever `flash_qla` is importable; the benchmark sets `FLA_DISABLE_BACKEND_DISPATCH=1` (unless already set) so the `fla` backend always measures FLA's own Triton kernels and the two backends stay distinct.
+
 ## Notes
 
-- Head convention: `--num_q_heads` counts the query/key heads and `--num_kv_heads` counts the value heads; the gates, output, and recurrent state live at `max(num_q_heads, num_kv_heads)` heads. Both grouping directions are supported for `gdn`: grouped-value attention (`num_kv_heads > num_q_heads`, v-heads grouped over q-heads) and GQA (`num_q_heads > num_kv_heads`, q-heads grouped over v-heads, e.g. `--num_q_heads 64 --num_kv_heads 8`). The two counts must be equal or one a multiple of the other; `kda` and `gdn2` support the GVA direction only.
+- Head convention: `--num_q_heads` counts the query/key heads and `--num_kv_heads` counts the value heads; the gates, output, and recurrent state live at `max(num_q_heads, num_kv_heads)` heads. Both grouping directions are supported for `gdn`: grouped-value attention (`num_kv_heads > num_q_heads`, v-heads grouped over q-heads) and GQA (`num_q_heads > num_kv_heads`, q-heads grouped over v-heads, e.g. `--num_q_heads 64 --num_kv_heads 8`). The two counts must be equal or one a multiple of the other; `kda` and `gdn2` support the GVA direction only, and so does the `flash_qla` backend.
 - The cuDNN ops use the THD (token-packed) layout internally; the benchmark expresses the dense batch as `cu_seqlens = [0, T, 2T, ...]`.
 - `--initial_state` provides a per-sequence fp32 recurrent state (its gradient is produced in the backward pass); `--store_on` requests the per-sequence final state from the forward pass and feeds its gradient in the backward pass. Both are once-per-kernel I/O ports (one `[head_dim_qk, head_dim_vo]` tile per sequence per state head).
 - Performance is measured with the torch profiler (device time of the matched kernels), with a 256 MB L2 flush before each timed iteration and the median reported. TFLOPS use the chunked-BMM FLOPs model documented in the script's `flops()`.
