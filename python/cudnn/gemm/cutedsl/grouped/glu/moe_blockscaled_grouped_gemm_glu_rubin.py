@@ -84,7 +84,17 @@ class BlockScaledMoEGroupedGemmGluKernel:
     :note: Supported combinations of A/B data types, SF data typs and SF vector size:
         - MXF8: A/B: Float8E5M2/Float8E4M3FN + SF: Float8E8M0FNU + sf_vec_size: 32
         - MXF4: A/B: Float4E2M1FN + SF: Float8E8M0FNU + sf_vec_size: 32
-        - NVF4: A/B: Float4E2M1FN + SF: Float8E8M0FNU/Float8E4M3FN + sf_vec_size: 16
+        - NVF4: A/B: Float4E2M1FN + SF: Float8E8M0FNU/Float8E4M3FN/FloatNV8E5M3FNU + sf_vec_size: 16
+
+    :note: FloatNV8E5M3FNU scale factors are Rubin-only and reachable solely through
+        the FP4xFP4 atom (SM107MmaMXF4NVF4Op); the FP8 atom accepts Float8E8M0FNU only.
+        torch has no e5m3 dtype, so the frontend passes such scale factors as
+        torch.float8_e4m3fn storage and overrides the CuTe element type at compile
+        time -- see ``sf_fp8_dtype_override`` in ``_blockscaled_api.py``.
+        ``can_implement`` below does not model this: it reports E5M3 as unsupported
+        because its shared validator is arch-agnostic and other callers are SM100,
+        where E5M3 scales really are invalid. The block-scaled API validates the
+        combination itself and never calls ``can_implement``.
 
     :note: Supported accumulator data types:
         - Float32
@@ -212,6 +222,7 @@ class BlockScaledMoEGroupedGemmGluKernel:
         act_func: str = "swiglu",
         enable_bias: bool = False,
         generate_c: bool = True,
+        sf_fp8_dtype_override: Optional[str] = None,
         use_single_group_runtime_offsets: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled grouped GEMM GLU kernel.
@@ -244,6 +255,16 @@ class BlockScaledMoEGroupedGemmGluKernel:
         :type cluster_shape_mn: Tuple[int, int]
         :param expert_cnt: Number of experts (compile-time constant).
         :type expert_cnt: int
+        :param sf_fp8_dtype_override: Pass ``"e5m3"`` to read the scale factors as
+            ``FloatNV8E5M3FNU`` instead of the element type carried by the ``sfa``
+            argument. That type has no torch dtype and TVM-FFI cannot marshal it, so
+            such scales arrive as ``Float8E4M3FN`` storage of the same width. Nothing
+            reads the element type off the incoming scale tensors -- the MMA atom,
+            smem layouts and S2T copy are all built from ``sf_dtype``, and the SF TMA
+            atoms use an explicit ``internal_type`` -- so setting this is sufficient.
+            ``None`` keeps the incoming element type. The caller is responsible for
+            having encoded the scale bytes as E5M3; this reinterprets, never converts.
+        :type sf_fp8_dtype_override: Optional[str]
 
         :raises ValueError: If FIX_PAD_SIZE is not divisible by mma_tiler_mn[0].
         """
@@ -273,6 +294,7 @@ class BlockScaledMoEGroupedGemmGluKernel:
 
         self.sf_vec_size = sf_vec_size
         self.expert_cnt = expert_cnt
+        self.sf_dtype_override: Optional[Type[cutlass.Numeric]] = cutlass.FloatNV8E5M3FNU if sf_fp8_dtype_override == "e5m3" else None
         self.use_single_group_runtime_offsets = use_single_group_runtime_offsets
         self.acc_dtype: Type[cutlass.Numeric] = acc_dtype
         self.use_2cta_instrs = use_2cta_instrs
@@ -735,7 +757,10 @@ class BlockScaledMoEGroupedGemmGluKernel:
         self.b_dtype: Type[cutlass.Numeric] = a.element_type
         self.c_dtype: Type[cutlass.Numeric] = c.element_type
         self.d_dtype: Type[cutlass.Numeric] = d.element_type
-        self.sf_dtype: Type[cutlass.Numeric] = sfa.element_type
+        if cutlass.const_expr(self.sf_dtype_override is not None):
+            self.sf_dtype: Type[cutlass.Numeric] = self.sf_dtype_override
+        else:
+            self.sf_dtype: Type[cutlass.Numeric] = sfa.element_type
         self.bias_dtype = bias.element_type if cutlass.const_expr(self.enable_bias) else cutlass.BFloat16
         self.a_major_mode = utils.LayoutEnum.from_tensor(a).mma_major_mode()
         self.c_layout = utils.LayoutEnum.from_tensor(c)

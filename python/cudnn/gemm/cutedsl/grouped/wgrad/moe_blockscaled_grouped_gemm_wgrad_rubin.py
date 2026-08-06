@@ -98,7 +98,20 @@ class BlockScaledMoEGroupedGemmWgradRubinKernel(BlockScaledMoEGroupedGemmWgradKe
         valid_quantization = (
             self.a_dtype is cutlass.Float4E2M1FN
             and self.b_dtype is cutlass.Float4E2M1FN
-            and ((self.sf_dtype is cutlass.Float8E4M3FN and self.sf_vec_size == 16) or (self.sf_dtype is cutlass.Float8E8M0FNU and self.sf_vec_size == 32))
+            and (
+                (
+                    self.sf_dtype is cutlass.Float8E4M3FN
+                    and self.sf_vec_size == 16
+                )
+                or (
+                    self.sf_dtype is cutlass.Float8E8M0FNU
+                    and self.sf_vec_size == 32
+                )
+                or (
+                    self.sf_dtype is cutlass.FloatNV8E5M3FNU
+                    and self.sf_vec_size == 16
+                )
+            )
         ) or (
             self.a_dtype in (cutlass.Float8E4M3FN, cutlass.Float8E5M2)
             and self.b_dtype is self.a_dtype
@@ -106,7 +119,10 @@ class BlockScaledMoEGroupedGemmWgradRubinKernel(BlockScaledMoEGroupedGemmWgradKe
             and self.sf_vec_size == 32
         )
         if not valid_quantization:
-            raise ValueError("Rubin wgrad supports NVFP4, MXFP4, MXFP8-E4M3, " "or MXFP8-E5M2 block scaling.")
+            raise ValueError(
+                "Rubin wgrad supports NVFP4 (E4M3 or E5M3 scales), MXFP4, "
+                "MXFP8-E4M3, or MXFP8-E5M2 block scaling."
+            )
         if self.acc_dtype is not cutlass.Float32:
             raise ValueError("Rubin wgrad requires Float32 accumulators.")
         if self.a_dtype.width == 4 and (self.a_major_mode != OperandMajorMode.K or self.b_major_mode != OperandMajorMode.K):
