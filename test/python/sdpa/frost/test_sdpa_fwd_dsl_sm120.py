@@ -302,8 +302,9 @@ def _run_dsl_graph(
     _select_engine(graph, engine_name(arch="sm120"))
     graph.check_support()
     graph.build_plans()
-    lse_bytes = batch * heads * sequence * 4
-    expected_workspace = 0 if return_stats else (lse_bytes + 127) // 128 * 128
+    # Honest workspace: the SM120 kernel None-specializes the LSE store, so a
+    # stats-less graph needs no dummy-LSE chunk — dense workspace is always 0.
+    expected_workspace = 0
     assert graph.get_workspace_size() == expected_workspace
 
     variant_pack[o] = o_gpu
@@ -692,6 +693,69 @@ def test_dsl_sm120_wrapper_lse():
     expected_o, expected_lse = _ref_sdpa_full(q, k, v, scale=scale, is_causal=True, return_stats=True)
     torch.testing.assert_close(o_tensor.float(), expected_o, atol=0.1, rtol=5e-2)
     torch.testing.assert_close(lse_tensor, expected_lse, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=17)
+def test_dsl_sm120_execute_contract_mismatches():
+    """execute() rejects lse/sinks that contradict the compiled specialization.
+
+    The kernel specializes on sink and LSE presence at compile time, so a
+    mismatch at execute is a hard error: substituting a zeros sink would
+    silently change the softmax denominator, and a provided-but-uncompiled
+    LSE would be silently left unwritten.
+    """
+
+    _require_dsl()
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm120
+
+    q = _bhsd(1, 4, 128, 128, torch.float16)
+    k = _bhsd(1, 4, 128, 128, torch.float16)
+    v = _bhsd(1, 4, 128, 128, torch.float16)
+    o = torch.empty_like(q)
+    lse = torch.empty(1, 4, 128, dtype=torch.float32, device="cuda")
+    sinks = torch.randn(1, 4, 1, 1, dtype=torch.float32, device="cuda")
+
+    # Compiled WITH sink + LSE: both must be provided at execute.
+    api = SdpaFwdDslSm120(sample_q=q, sample_k=k, sample_v=v, sample_o=o, sample_lse=lse, has_sink=True)
+    assert api.check_support()
+    api.compile()
+    with pytest.raises(ValueError, match="sinks is required"):
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=lse)
+    with pytest.raises(ValueError, match="lse_tensor is required"):
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, sinks=sinks)
+    # Sinks are consumed as fp32 directly — no implicit cast (which would
+    # allocate and launch a kernel on the execute hot path).
+    with pytest.raises(ValueError, match="sinks must be float32"):
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=lse, sinks=sinks.to(torch.bfloat16))
+
+    # Compiled WITHOUT sink or LSE: providing either is rejected, and the
+    # matching call runs with no LSE buffer anywhere (store compiled out).
+    api = SdpaFwdDslSm120(sample_q=q, sample_k=k, sample_v=v, sample_o=o)
+    assert api.check_support()
+    api.compile()
+    with pytest.raises(ValueError, match="without sink support"):
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, sinks=sinks)
+    with pytest.raises(ValueError, match="without an LSE output"):
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=lse)
+    # Same contract for per-batch lengths: a specialization compiled without
+    # them must not silently ignore a provided tensor (nor, the other way,
+    # substitute a zeros dummy that would mask every row).
+    seq_kv = torch.full((1,), 128, dtype=torch.int32, device="cuda")
+    with pytest.raises(ValueError, match="without per-batch KV lengths"):
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_kv_lens=seq_kv)
+    with pytest.raises(ValueError, match="without per-batch Q lengths"):
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=seq_kv)
+    api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o)
+    torch.cuda.synchronize()
+    expected = _ref_sdpa_full(q, k, v, scale=1.0 / math.sqrt(128))
+    torch.testing.assert_close(o.float(), expected, atol=0.1, rtol=5e-2)
+
+    # THD LSE output is not plumbed (packed (1, H, T) layout != cuDNN's ragged
+    # Stats contract): requesting it is rejected up front instead of being
+    # silently ignored.
+    with pytest.raises(NotImplementedError, match="THD stats/LSE"):
+        SdpaFwdDslSm120(sample_q=q, sample_k=k, sample_v=v, sample_o=o, sample_lse=lse, thd=True).check_support()
 
 
 @pytest.mark.L0

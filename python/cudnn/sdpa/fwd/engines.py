@@ -115,6 +115,11 @@ class Capabilities:
     padded: bool = False
     sink: bool = False
     stats: bool = False
+    # The adapter accepts lse_tensor=None (its kernel None-specializes the LSE
+    # store), so a stats-less graph needs no dummy-LSE workspace chunk. Rows
+    # that keep False (the SM100 flavors) always write an LSE and get a carved
+    # dummy from lower_dsl_prefill when the graph has no Stats output.
+    lse_optional: bool = False
     thd: bool = False
     # True = the kernel anchors the THD bottom-right diagonal at each sequence's
     # own (seq_len_q[b], seq_len_kv[b]). Rows that keep False (the SM100 flavors)
@@ -428,6 +433,7 @@ def _sm120_spec() -> EngineSpec:
             padded=True,
             sink=True,
             stats=True,
+            lse_optional=True,
             padded_stats=True,
             thd=True,
             thd_bottom_right=True,
@@ -497,6 +503,13 @@ def lower_dsl_prefill(
 
     seq_q_t = facts.seq_q_t if facts.padded else None
     seq_kv_t = facts.seq_kv_t if facts.padded else None
+    # Mirrors the seq_q_lens_present constructor argument below. Execute
+    # forwards seq_q only when the compiled specialization consumes it (or THD,
+    # which sources cu_seqlens from it) — the adapter rejects mismatches, so a
+    # buffer the FP8/MXFP8 kernels can't honor (dense padded-Q trim is not
+    # plumbed there — known gap) is dropped here rather than erroring at
+    # execute.
+    seq_q_lens_present = facts.padded and not facts.thd and facts.seq_q_t is not None and not (facts.is_mxfp8 or facts.is_fp8)
     api = api_type(
         sample_q=ga.tensor_desc_from_ir(facts.q_t, name="q"),
         sample_k=ga.tensor_desc_from_ir(facts.k_t, name="k"),
@@ -512,7 +525,7 @@ def lower_dsl_prefill(
         # enabled whenever a dense padded graph carries per-batch Q lengths.
         # THD carries Q lengths via cu_seqlens; the FP8/MXFP8 kernels are not
         # plumbed (their specs also keep padded_stats=False).
-        seq_q_lens_present=(facts.padded and not facts.thd and facts.seq_q_t is not None and not (facts.is_mxfp8 or facts.is_fp8)),
+        seq_q_lens_present=seq_q_lens_present,
         has_sink=facts.has_sink,
         thd=facts.thd,
         dtype_o=facts.dtype_o if (facts.is_mxfp8 or facts.is_fp8) else None,
@@ -529,14 +542,20 @@ def lower_dsl_prefill(
     # buffer is carved from the CALLER's workspace, so its size is fixed here at
     # build time and recorded on the executor as ``workspace_bytes`` — that
     # number is what the plan's CompiledPlan.get_workspace_size() reports.
-    #   - dummy LSE (dense, stats absent): the kernel always writes an LSE;
-    #     without a Stats output it lands in b*h_q*s_q fp32 scratch.
-    #     (THD needs no engine-level LSE chunk — the packed THD LSE is part
-    #     of the api-level scratch below.)
+    #   - dummy LSE (dense, stats absent, non-lse_optional adapters): the
+    #     SM100 kernels always write an LSE; without a Stats output it lands
+    #     in b*h_q*s_q fp32 scratch. lse_optional adapters (SM120) compile the
+    #     LSE store out instead and bind no buffer. (THD needs no engine-level
+    #     LSE chunk — the packed THD LSE is part of the api-level scratch
+    #     below.)
     #   - synthesized seq_len_kv (skv_tail_via_padding rows): b int32.
     #   - api-level scratch (api.scratch_workspace_bytes()): the dense padded
     #     [seq_kv|seq_q] combine and the THD metadata/LSE buffers.
-    dummy_lse_bytes = 0 if (not spec.capabilities.stats or facts.stats_t is not None or facts.thd) else ws_align(facts.b * facts.h_q * facts.s_q * 4)
+    dummy_lse_bytes = (
+        0
+        if (not spec.capabilities.stats or spec.capabilities.lse_optional or facts.stats_t is not None or facts.thd)
+        else ws_align(facts.b * facts.h_q * facts.s_q * 4)
+    )
     synth_kv_bytes = ws_align(facts.b * 4) if synth_kv_padding else 0
     api_scratch_bytes = api.scratch_workspace_bytes()
     total_workspace_bytes = dummy_lse_bytes + synth_kv_bytes + api_scratch_bytes
@@ -595,9 +614,10 @@ def lower_dsl_prefill(
         # re-validates so a direct call cannot silently corrupt memory.
         carver = WorkspaceCarver(workspace, total_workspace_bytes, spec.name) if total_workspace_bytes else None
         lse_buf = resolved.get(id(binding.stats)) if binding.stats is not None else None
-        if lse_buf is None and spec.capabilities.stats and not facts.thd:
+        if lse_buf is None and spec.capabilities.stats and not spec.capabilities.lse_optional and not facts.thd:
             # Dummy LSE for stats-less dense graphs — carved, not allocated
-            # (uninitialized is fine: the kernel writes every row).
+            # (uninitialized is fine: the kernel writes every row). lse_optional
+            # adapters take lse_tensor=None instead.
             lse_buf = carver.take(facts.b * facts.h_q * facts.s_q, torch.float32)
         sinks_buf = resolved.get(id(binding.sink_token)) if binding.sink_token is not None else None
         seq_kv_buf = resolved.get(id(binding.seq_len_kv)) if binding.seq_len_kv is not None else None
@@ -625,7 +645,7 @@ def lower_dsl_prefill(
             scale_softmax=facts.scale,
             sinks=sinks_buf,
             seq_kv_lens=seq_kv_buf,
-            seq_q_lens=seq_q_buf,
+            seq_q_lens=seq_q_buf if (seq_q_lens_present or facts.thd) else None,
             # Stream from the execute-time handle (raw CUstream int, the
             # ExecutionContext's stream); None keeps the default stream.
             current_stream=_cuda_driver.CUstream(stream) if stream is not None else None,

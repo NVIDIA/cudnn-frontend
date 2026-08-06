@@ -307,6 +307,67 @@ def test_dsl_sm100_sink(dtype, d):
 
 
 @pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_dsl_sm100_execute_sink_lse_contract():
+    """execute() rejects sinks inconsistent with the compiled specialization.
+
+    has_sink is a compile-time specialization: substituting a zeros dummy for
+    missing sinks would silently change the softmax denominator (a zero sink
+    logit still contributes exp(0) mass), and sinks passed to a sink-less
+    kernel would be silently dropped. lse_tensor stays accepted when no
+    sample_lse was given (the SM100 kernels always write an LSE; the FROST
+    dispatch hands in workspace scratch), but a requested LSE must be bound.
+    """
+    _require_dsl()
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    b, h, s, d = 1, 4, 256, 128
+    q, k, v = (_bhsd(b, h, s, d, torch.float16) for _ in range(3))
+    o = torch.empty_like(q)
+    lse = torch.empty(b, h, s, dtype=torch.float32, device="cuda")
+    sink = torch.randn(1, h, 1, 1, dtype=torch.float32, device="cuda")
+    scale = 1.0 / math.sqrt(d)
+
+    api = SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, sample_lse=lse, is_causal=True, has_sink=True)
+    assert api.check_support()
+    api.compile()
+    with pytest.raises(ValueError, match="sinks is required"):
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=lse)
+    with pytest.raises(ValueError, match="lse_tensor is required"):
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, sinks=sink)
+    # Sinks are consumed as fp32 directly — no implicit cast (which would
+    # allocate and launch a kernel on the execute hot path).
+    with pytest.raises(ValueError, match="sinks must be float32"):
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=lse, sinks=sink.to(torch.bfloat16))
+
+    api = SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, is_causal=True)
+    assert api.check_support()
+    api.compile()
+    with pytest.raises(ValueError, match="without sink support"):
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, sinks=sink)
+    # Same contract for per-batch lengths: a specialization compiled without
+    # them must not silently ignore a provided tensor (nor, the other way,
+    # substitute a zeros dummy that would mask every row).
+    seq_kv = torch.full((b,), s, dtype=torch.int32, device="cuda")
+    with pytest.raises(ValueError, match="without per-batch KV lengths"):
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_kv_lens=seq_kv)
+    with pytest.raises(ValueError, match="without per-batch Q lengths"):
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=seq_kv)
+    # No sample_lse and no lse_tensor: the kernel's mandatory LSE write lands
+    # in a cached dummy — no per-execute allocation, output still correct.
+    api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o)
+    torch.cuda.synchronize()
+    o_ref = _ref_sdpa_full(q, k, v, scale=scale, is_causal=True)
+    torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
+
+    # THD LSE output is not plumbed (packed (1, H, T) layout != cuDNN's ragged
+    # Stats contract): requesting it is rejected up front instead of being
+    # silently ignored.
+    with pytest.raises(NotImplementedError, match="THD stats/LSE"):
+        SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, sample_lse=lse, thd=True).check_support()
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("d", _FLAVORS, ids=_FLAVOR_IDS)
 @pytest.mark.parametrize("dtype", _DTYPES, ids=_DTYPE_IDS)
 @torch_fork_set_rng(seed=0)

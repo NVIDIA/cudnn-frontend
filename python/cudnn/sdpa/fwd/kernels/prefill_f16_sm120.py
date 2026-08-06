@@ -40,7 +40,7 @@ Constraints:
 
 from functools import lru_cache, partial
 from types import SimpleNamespace
-from typing import Callable, Type
+from typing import Callable, Optional, Type
 
 import cuda.bindings.driver as cuda_driver
 import cutlass
@@ -772,8 +772,8 @@ class SM120FusedMultiHeadAttentionForward:
         k: cute.Tensor,
         v: cute.Tensor,
         o: cute.Tensor,
-        lse: cute.Tensor,
-        sinks: cute.Tensor,
+        lse: Optional[cute.Tensor],
+        sinks: Optional[cute.Tensor],
         seq_q_lens: cute.Tensor,
         seq_kv_lens: cute.Tensor,
         tma_k_desc: cutlass.GridConstant[cuda.TensorMap],
@@ -786,9 +786,10 @@ class SM120FusedMultiHeadAttentionForward:
         :param k: Key tensor.
         :param v: Value tensor.
         :param o: Output tensor.
-        :param lse: ``(B, H, Sq)`` fp32 log-sum-exp output.
-        :param sinks: ``(H,)`` fp32 per-Q-head sink logits, or an unused
-            dummy tensor when the kernel is configured without ``has_sink``.
+        :param lse: ``(B, H, Sq)`` fp32 log-sum-exp output, or ``None`` to
+            compile the LSE store out (the DSL specializes on ``None``).
+        :param sinks: ``(H,)`` fp32 per-Q-head sink logits; ``None`` iff the
+            kernel is configured without ``has_sink``.
         :param seq_q_lens: Per-batch query lengths, or an unused dummy tensor.
         :param seq_kv_lens: Per-batch key/value lengths, or an unused dummy tensor.
         :param tma_k_desc: Tensor map descriptor for K.
@@ -1140,25 +1141,26 @@ class SM120FusedMultiHeadAttentionForward:
                         lse_val = -cutlass.Float32.inf
                     row_lse[row_half] = lse_val
 
-            if lane % 4 == 0:
-                lse_arr = cutlass.make_array_view(lse)
-                for row_half in cutlass.range_constexpr(2):
-                    lse_q_idx = q_seq_idx + q_warp_row0 + (lane // 4) + row_half * 8
-                    lse_out = cutlass.Float32(row_lse[row_half])
-                    if cutlass.const_expr(self.thd_varlen):
-                        # Packed (1, H, T) LSE: rows past this sequence's Q
-                        # length belong to the NEXT sequence — never written,
-                        # and there is no padded region to trim.
-                        if lse_q_idx < seqlen_q:
-                            lse_row = lse_arr[0, head_idx, :]
-                            lse_row[q_row_base + lse_q_idx] = lse_out
-                    else:
-                        # Rows at/past this batch's Q length trim to -inf.
-                        if lse_q_idx >= seqlen_q:
-                            lse_out = -cutlass.Float32.inf
-                        if lse_q_idx < q.shape[1]:
-                            lse_row = lse_arr[batch_idx, head_idx, :]
-                            lse_row[lse_q_idx] = lse_out
+            if cutlass.const_expr(lse is not None):
+                if lane % 4 == 0:
+                    lse_arr = cutlass.make_array_view(lse)
+                    for row_half in cutlass.range_constexpr(2):
+                        lse_q_idx = q_seq_idx + q_warp_row0 + (lane // 4) + row_half * 8
+                        lse_out = cutlass.Float32(row_lse[row_half])
+                        if cutlass.const_expr(self.thd_varlen):
+                            # Packed (1, H, T) LSE: rows past this sequence's Q
+                            # length belong to the NEXT sequence — never written,
+                            # and there is no padded region to trim.
+                            if lse_q_idx < seqlen_q:
+                                lse_row = lse_arr[0, head_idx, :]
+                                lse_row[q_row_base + lse_q_idx] = lse_out
+                        else:
+                            # Rows at/past this batch's Q length trim to -inf.
+                            if lse_q_idx >= seqlen_q:
+                                lse_out = -cutlass.Float32.inf
+                            if lse_q_idx < q.shape[1]:
+                                lse_row = lse_arr[batch_idx, head_idx, :]
+                                lse_row[lse_q_idx] = lse_out
 
             prims.barrier_cta_sync(self.bar_compute_sync, thread_count=self.threads_compute)
 
@@ -1237,8 +1239,8 @@ class SM120FusedMultiHeadAttentionForward:
         k: cute.Tensor,
         v: cute.Tensor,
         o: cute.Tensor,
-        lse: cute.Tensor,
-        sinks: cute.Tensor,
+        lse: Optional[cute.Tensor],
+        sinks: Optional[cute.Tensor],
         seq_q_lens: cute.Tensor,
         seq_kv_lens: cute.Tensor,
         softmax_scale_log2: cutlass.Float32,
@@ -1250,9 +1252,10 @@ class SM120FusedMultiHeadAttentionForward:
         :param k: Key tensor with shape ``(B, Sk, H, D)``.
         :param v: Value tensor with shape ``(B, Sk, H, D)``.
         :param o: Output tensor with shape ``(B, Sq, H, D)``.
-        :param lse: ``(B, H, Sq)`` fp32 log-sum-exp output.
-        :param sinks: ``(H,)`` fp32 per-Q-head sink logits, or an unused
-            dummy tensor when the kernel is configured without ``has_sink``.
+        :param lse: ``(B, H, Sq)`` fp32 log-sum-exp output, or ``None`` to
+            compile the LSE store out entirely (no dummy buffer needed).
+        :param sinks: ``(H,)`` fp32 per-Q-head sink logits; must be ``None``
+            exactly when the kernel is configured without ``has_sink``.
         :param seq_q_lens: Per-batch query lengths, or an unused dummy tensor.
         :param seq_kv_lens: Per-batch key/value lengths, or an unused dummy tensor.
         :param softmax_scale_log2: ``softmax_scale * log2(e)``.
@@ -1273,11 +1276,14 @@ class SM120FusedMultiHeadAttentionForward:
         for name, tensor in (("Q", q), ("K", k), ("V", v), ("O", o)):
             if cutlass.const_expr(not self.is_layout_supported(tensor.shape, tensor.stride)):
                 raise ValueError(f"{name} must use compact BSHD storage")
-        if cutlass.const_expr(lse.shape != (q.shape[0], q.shape[2], q.shape[1])):
-            raise ValueError("LSE must have shape (B, H, Sq)")
-        if cutlass.const_expr(lse.stride != (q.shape[2] * q.shape[1], q.shape[1], 1)):
-            raise ValueError("LSE must be compact row-major")
-        if cutlass.const_expr(self.has_sink and sinks.shape != (q.shape[2],)):
+        if cutlass.const_expr(lse is not None):
+            if cutlass.const_expr(lse.shape != (q.shape[0], q.shape[2], q.shape[1])):
+                raise ValueError("LSE must have shape (B, H, Sq)")
+            if cutlass.const_expr(lse.stride != (q.shape[2] * q.shape[1], q.shape[1], 1)):
+                raise ValueError("LSE must be compact row-major")
+        if cutlass.const_expr(self.has_sink != (sinks is not None)):
+            raise ValueError("sinks must be provided exactly when the kernel is configured with has_sink")
+        if cutlass.const_expr(sinks is not None and sinks.shape != (q.shape[2],)):
             raise ValueError("sinks must have shape (H,)")
         if cutlass.const_expr(self.thd_varlen):
             if cutlass.const_expr(q.shape[0] != 1):
@@ -1360,12 +1366,17 @@ def compile(  # noqa: A001
     skv: int = 128,
     d: int = 128,
     max_sq: int = 0,
+    has_lse: bool = True,
 ) -> Callable:
     """Compile and cache one architecture-specific compact BSHD shape.
 
     THD specializations pack the batch: ``b`` is the real sequence count,
     ``sq``/``skv`` are the packed token totals, and ``max_sq`` (the longest
     sequence's Q length) sizes the per-sequence grid.
+
+    ``has_lse=False`` compiles the LSE store out (the kernel specializes on a
+    ``None`` LSE argument) — callers that don't want stats pass no LSE buffer
+    at all instead of a dummy.
     """
 
     kernel = SM120FusedMultiHeadAttentionForward(
@@ -1409,17 +1420,25 @@ def compile(  # noqa: A001
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
     )
-    fake_lse = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float32,
-        (fake_batch, qh, sq),
-        stride_order=(2, 1, 0),
-        assumed_align=4,
+    fake_lse = (
+        cute.runtime.make_fake_compact_tensor(
+            cutlass.Float32,
+            (fake_batch, qh, sq),
+            stride_order=(2, 1, 0),
+            assumed_align=4,
+        )
+        if has_lse
+        else None
     )
-    fake_sinks = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float32,
-        (qh,),
-        stride_order=(0,),
-        assumed_align=4,
+    fake_sinks = (
+        cute.runtime.make_fake_compact_tensor(
+            cutlass.Float32,
+            (qh,),
+            stride_order=(0,),
+            assumed_align=4,
+        )
+        if PARAMS.has_sink
+        else None
     )
     fake_seq_q_lens = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,

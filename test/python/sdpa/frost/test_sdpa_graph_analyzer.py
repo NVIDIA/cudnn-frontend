@@ -230,6 +230,26 @@ def test_probe_accepts_seq_len_q_with_padding_mask():
     assert engines.engine_name(512) in _eligible(g)
 
 
+def test_probe_rejects_non_int32_seq_len():
+    """The kernels consume per-batch lengths as int32 directly — no implicit
+    cast anywhere on the execute path — so an int64 seq_len is ineligible."""
+    g = _mk_graph()
+    q, k, v, dims, strides = _mk_qkv(g)
+    seq_kv = g.tensor(dim=(B, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT64, name="seq_kv64")
+    o, _ = g.sdpa(
+        name="s",
+        q=q,
+        k=k,
+        v=v,
+        attn_scale=0.1,
+        is_inference=True,
+        use_padding_mask=True,
+        seq_len_kv=seq_kv,
+    )
+    _finish_output(o, dims, strides)
+    assert not _eligible(g)
+
+
 def test_probe_rejects_bottom_right_with_padded_seq_len_q():
     # Kernel gap (pre-existing): the BR diagonal is anchored at the global S_q,
     # so dense padding with per-batch seq_len_q would shift it wrongly.
@@ -315,6 +335,20 @@ def test_probe_rejects_bad_sink_shape():
     g = _mk_graph()
     q, k, v, dims, strides = _mk_qkv(g)
     bad_sink = g.tensor(dim=(1, H, 2, 1), stride=(2 * H, 2, 1, 1), data_type=cudnn.data_type.FLOAT, name="badsink")
+    try:
+        o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True, sink_token=bad_sink)
+    except TypeError:
+        pytest.skip("this cuDNN wheel's sdpa() binding predates sink_token")
+    _finish_output(o, dims, strides)
+    assert not _eligible(g)
+
+
+def test_probe_rejects_non_fp32_sink():
+    """The kernels consume fp32 sink logits directly — no implicit cast anywhere
+    on the execute path — so a non-fp32 sink token is ineligible up front."""
+    g = _mk_graph()
+    q, k, v, dims, strides = _mk_qkv(g)
+    bad_sink = g.tensor(dim=(1, H, 1, 1), stride=(H, 1, 1, 1), data_type=cudnn.data_type.BFLOAT16, name="bf16sink")
     try:
         o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True, sink_token=bad_sink)
     except TypeError:

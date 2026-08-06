@@ -100,8 +100,10 @@ Reading that sequence line by line:
   still forwarded to the lowered C++ graph.
 - **`get_workspace_size()` is honest.** For a python plan it returns
   `CompiledPlan.get_workspace_size()`, the executor's real requirement (for
-  the graph above: the dummy-LSE scratch `b*h*s*4 = 16384` bytes, because an
-  inference graph has no Stats output). `execute()` forwards the caller's
+  the graph above on an SM100 engine: the dummy-LSE scratch `b*h*s*4 = 16384`
+  bytes, because an inference graph has no Stats output and the SM100 kernels
+  always write an LSE; `lse_optional` adapters like SM120 compile the LSE
+  store out instead and report 0). `execute()` forwards the caller's
   buffer through `ExecutionContext.workspace` and the executor carves its
   scratch out of it in 128-byte-aligned chunks, never touching bytes at or
   beyond the reported size -- no hidden per-execute allocation, stable
