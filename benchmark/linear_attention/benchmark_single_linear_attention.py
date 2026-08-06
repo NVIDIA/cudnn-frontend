@@ -197,6 +197,7 @@ def parse_args():
         help="Linear attention backend to use",
         choices=[
             "fla",
+            "flash_qla",
             "cudnn",
         ],
     )
@@ -249,7 +250,7 @@ def run_benchmark(
         head_dim_qk: Head dimension for Q/K (optional, for asymmetric)
         head_dim_vo: Head dimension for V/O (optional, for asymmetric)
         data_type: Data type ("bfloat16", "float16")
-        backend: Backend name ("cudnn", "fla")
+        backend: Backend name ("cudnn", "fla", "flash_qla")
         variant: Linear attention variant ("gdn", "kda", "gdn2")
         profile_pass: Which pass to profile ("fwd", "bwd", "both")
         num_iterations: Number of benchmark iterations
@@ -436,6 +437,11 @@ else:
         raise ValueError("gdn2 is forward only (the backward kernel is a stub); use --profile_pass fwd")
     if args.variant == "gdn2" and args.la_backend == "fla":
         raise ValueError("gdn2 is only supported with the 'cudnn' backend")
+    if args.la_backend == "flash_qla":
+        if args.variant != "gdn":
+            raise ValueError("flash_qla only supports the 'gdn' variant")
+        if num_q_heads > num_kv_heads:
+            raise ValueError("flash_qla does not support GQA (num_q_heads > num_kv_heads)")
 
     l2_flush_size_mb = 256
     l2_flush_size = l2_flush_size_mb * 1024 * 1024
@@ -507,8 +513,32 @@ else:
                     use_qk_l2norm_in_kernel=False,
                 )
 
+    if args.la_backend == "flash_qla":
+        attn_scale = head_dim_qk ** (-0.5)
+
+        from flash_qla import chunk_gated_delta_rule as fqla_chunk_gated_delta_rule
+
+        if args.verbose:
+            import flash_qla
+
+            print(f"[INFO] FlashQLA Version: {getattr(flash_qla, '__version__', 'unknown')}")
+
+        def flash_qla_linear_attention(query, key, value, gate, beta, write_gate, s0):
+            return fqla_chunk_gated_delta_rule(
+                query,
+                key,
+                value,
+                gate,
+                beta,
+                scale=attn_scale,
+                initial_state=s0,
+                output_final_state=args.store_on,
+            )
+
     if args.la_backend == "fla" or (not args.skip_ref):
         attn_scale = head_dim_qk ** (-0.5)
+
+        os.environ.setdefault("FLA_DISABLE_BACKEND_DISPATCH", "1")
 
         if args.variant == "gdn":
             from fla.ops.gated_delta_rule import chunk_gated_delta_rule
@@ -549,13 +579,15 @@ else:
     def get_linear_attention_function(backend):
         if backend == "fla":
             return fla_linear_attention
+        elif backend == "flash_qla":
+            return flash_qla_linear_attention
         elif backend == "cudnn":
             return cudnn_linear_attention
         else:
             raise ValueError(f"Invalid backend: {backend}")
 
     # Util function for addressing different qkv formats for each backend
-    # (cudnn is THD [B*T, H, D]; fla is dense [B, T, H, D])
+    # (cudnn is THD [B*T, H, D]; fla and flash_qla are dense [B, T, H, D])
     def preprocess_qkv(query, key, value, backend):
         if backend == "cudnn":
             return (
@@ -563,7 +595,7 @@ else:
                 key.reshape(batch_size * seqlen, *key.shape[2:]),
                 value.reshape(batch_size * seqlen, *value.shape[2:]),
             )
-        elif backend == "fla":
+        elif backend in ("fla", "flash_qla"):
             return query, key, value
         else:
             raise ValueError(f"Invalid backend: {backend}")
@@ -575,7 +607,7 @@ else:
                 beta.reshape(batch_size * seqlen, *beta.shape[2:]),
                 write_gate.reshape(batch_size * seqlen, *write_gate.shape[2:]) if write_gate is not None else None,
             )
-        elif backend == "fla":
+        elif backend in ("fla", "flash_qla"):
             return gate, beta, write_gate
         else:
             raise ValueError(f"Invalid backend: {backend}")
@@ -584,7 +616,7 @@ else:
     def postprocess_o(output, backend):
         if backend == "cudnn":
             return output.reshape(batch_size, seqlen, num_o_heads, head_dim_vo)
-        elif backend == "fla":
+        elif backend in ("fla", "flash_qla"):
             return output
         else:
             raise ValueError(f"Invalid backend: {backend}")
@@ -800,8 +832,12 @@ else:
                 query_ref = query.detach().reshape(batch_size, seqlen, num_q_heads, head_dim_qk)
                 key_ref = key.detach().reshape(batch_size, seqlen, num_q_heads, head_dim_qk)
                 value_ref = value.detach().reshape(batch_size, seqlen, num_kv_heads, head_dim_vo)
-                gate_ref = gate.detach().reshape(batch_size, seqlen, *gate.shape[1:])
-                beta_ref = beta.detach().reshape(batch_size, seqlen, *beta.shape[1:])
+                if args.la_backend == "cudnn":
+                    gate_ref = gate.detach().reshape(batch_size, seqlen, *gate.shape[1:])
+                    beta_ref = beta.detach().reshape(batch_size, seqlen, *beta.shape[1:])
+                else:
+                    gate_ref = gate.detach()
+                    beta_ref = beta.detach()
                 s0_ref = s0.detach() if s0 is not None else None
                 output_ref, _ = fla_linear_attention(query_ref, key_ref, value_ref, gate_ref, beta_ref, None, s0_ref)
 
