@@ -100,7 +100,7 @@ def generate_charts(df: pd.DataFrame, output_dir: Path, gpu_name: str = "", cudn
         head_dim = sub["head_dim"].iloc[0]
         gpu_info = f" ({gpu_name})" if gpu_name else ""
         fig.suptitle(
-            f"GDN Linear Attention (BF16) — Batch = {batch_size}, Heads = {heads}, d = {head_dim}{gpu_info}",
+            f"{variant.upper()} Linear Attention (BF16) — Batch = {batch_size}, Heads = {heads}, d = {head_dim}{gpu_info}",
             fontsize=TITLE_FONT_SIZE,
         )
 
