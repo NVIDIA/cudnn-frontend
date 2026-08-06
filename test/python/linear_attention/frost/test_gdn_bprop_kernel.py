@@ -363,6 +363,7 @@ def test_bprop_kernel_zero_length_sequence(num_q_heads, num_k_heads, num_v_heads
 # ---------------------------------------------------------------------------
 
 
+@requires_runtime
 def test_frost_gdn_bwd_engine_no_h(seq_lens=(128, 256), H=2, D=128):
     """GDN_BWD without the h input: the engine reruns the forward with H
     dumping and must match the explicit-h path bit for bit."""

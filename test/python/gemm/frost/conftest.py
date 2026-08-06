@@ -33,3 +33,20 @@ def _frost_opt_in(monkeypatch):
     the same pytest process, quietly turning a default-path run into an opt-in
     one."""
     monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
+
+
+@pytest.fixture
+def _pretend_sm100(monkeypatch):
+    """Supply the SM100 target profile used while rendering or compiling."""
+    from cudnn.gemm.frost import compiler
+
+    monkeypatch.setattr(compiler, "_current_arch", lambda: 100)
+
+
+@pytest.fixture
+def _pretend_sm103(monkeypatch):
+    """Supply the SM103 target profile used while rendering or compiling."""
+    from cudnn.gemm.frost import compiler, tile_config
+
+    monkeypatch.setattr(compiler, "_current_arch", lambda: 103)
+    monkeypatch.setattr(tile_config, "_sm_smem_budget_bytes", lambda device=None: 227 * 1024)

@@ -738,7 +738,7 @@ def test_e2e_nonpacked_tensors(combo, config_name, cta_group, mode) -> None:
 
 
 @pytest.mark.parametrize("S,N", [(64, 4096), (4096, 64), (4096, 4096)])
-def test_auto_config_is_accepted_by_the_registry(S, N):
+def test_auto_config_is_accepted_by_the_registry(_pretend_sm100, S, N):
     """Same invariant as the dense block-scale case: the grouped path shares the
     BlockScaleSpec machinery, so its 128-multiple tile constraint applies too and
     ``select_config`` must not pick a geometry the registry rejects."""

@@ -24,6 +24,8 @@ from cudnn.gemm.frost.tile_config import CATALOG, DEFAULT_CONFIG, by_name
 
 pytestmark = pytest.mark.L0
 
+_GPU = requires_sm100
+
 
 def _graph(io=cudnn.data_type.BFLOAT16):
     return cudnn.pygraph(
@@ -174,6 +176,7 @@ _N256_C2_CFG = next(
 )
 
 
+@_GPU
 def test_multi_gemm_2ctamma_compiles() -> None:
     """The 2-CTA-MMA CLC template (cluster2x1) compiles a dual-GEMM graph."""
     M, N, K = 256, 256, 128
@@ -207,8 +210,6 @@ def test_multi_gemm_mainloop_template_rejected() -> None:
 
 
 # --- End-to-end correctness (GPU) ---
-
-_GPU = requires_sm100
 
 
 def _rand(M, N, K, scale=1.0):

@@ -1213,7 +1213,7 @@ def test_mxfp8_m_major_a_n_major_b(config_name, M, N, K):
     torch.testing.assert_close(c[0], ref, atol=2e-1, rtol=2e-2)
 
 
-def test_fp4_rejects_non_k_major():
+def test_fp4_rejects_non_k_major(_pretend_sm100):
     """FP4 must be K-major — sub-byte packing mis-strides an M/N-major
     descriptor, so the compiler rejects it at JIT time."""
     M = N = K = 256
@@ -1249,11 +1249,6 @@ requires_sm103 = pytest.mark.skipif(
 
 def _sm103_kw(config_name, cta_group=1):
     return dict(config=by_name(config_name), cta_group=cta_group, scheduler="clc")
-
-
-@pytest.fixture
-def _pretend_sm103(monkeypatch):
-    monkeypatch.setattr(C, "_current_arch", lambda: 103)
 
 
 # Config catalog / geometry guards
@@ -1409,7 +1404,7 @@ def _const(src, name):
     return eval(line.split(" = ", 1)[1])
 
 
-def test_render_nvfp4_k_walk_tables():
+def test_render_nvfp4_k_walk_tables(_pretend_sm103):
     src = _render("nvfp4", _CFG_128)
     compile(src, "generated_kernel.py", "exec")
     assert "cudnn_frost_sm103_block_scale_matmul_1ctamma_128x128x384_128x128x48_cluster1x1" in src
@@ -1438,7 +1433,7 @@ def test_render_nvfp4_k_walk_tables():
     assert _const(src, "sf_k") == 48
 
 
-def test_render_mxfp4_k_walk_tables():
+def test_render_mxfp4_k_walk_tables(_pretend_sm103):
     src = _render("mxfp4", _CFG_128)
     compile(src, "generated_kernel.py", "exec")
     # mxfp4: 3 SF bytes per MMA — the sf_id cycles all four byte offsets.
@@ -1451,7 +1446,7 @@ def test_render_mxfp4_k_walk_tables():
     assert _const(src, "sf_atoms_per_group") == 3
 
 
-def test_render_n256_interleaves_sfb_blocks():
+def test_render_n256_interleaves_sfb_blocks(_pretend_sm103):
     src = _render("nvfp4", _CFG_256)
     compile(src, "generated_kernel.py", "exec")
     # Two 128-col SFB blocks interleave at word granularity: the MMA walk
@@ -1641,7 +1636,7 @@ def test_sm103_block_scale_matmul_clusters(cluster, M, N):
 
 
 @pytest.mark.parametrize("M,N", [(64, 4096), (4096, 64), (128, 128), (4096, 4096)])
-def test_auto_config_is_accepted_by_the_registry(M, N):
+def test_auto_config_is_accepted_by_the_registry(_pretend_sm100, M, N):
     """``select_config`` is a second decision path that does not consult the
     registry funnel, so its pick can be one the funnel rejects — the graph then
     fails to build and falls back to native cuDNN with only an INFO log. Block
