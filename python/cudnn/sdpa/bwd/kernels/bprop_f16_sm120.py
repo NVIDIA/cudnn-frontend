@@ -293,6 +293,7 @@ class SM120FusedMultiHeadAttentionFP16Backward:
         self,
         in_dtype: Type[cutlass.Numeric] = cutlass.Float16,
         is_causal: bool = False,
+        causal_top_left: bool = False,
         head_dim: int = 128,
         use_pdl: bool = True,
         q_tile: int = 0,
@@ -300,6 +301,7 @@ class SM120FusedMultiHeadAttentionFP16Backward:
     ):
         self.in_dtype = in_dtype
         self.is_causal = is_causal
+        self.causal_top_left = bool(causal_top_left)
         self.d = head_dim
         self.use_pdl = bool(use_pdl)
         self.q_tile, self.kv_tile = self.DEFAULT_TILES[head_dim]
@@ -435,10 +437,14 @@ class SM120FusedMultiHeadAttentionFP16Backward:
 
         m_block_max = (SQ + M - 1) // M
         if cutlass.const_expr(self.is_causal):
-            m_block_min = cute.math.max(kv_base + SQ - SKV, cutlass.Int32(0)) // M
+            if cutlass.const_expr(self.causal_top_left):
+                diag_off = cutlass.Int32(0)
+            else:
+                diag_off = SKV - SQ
+            m_block_min = cute.math.max(kv_base - diag_off, cutlass.Int32(0)) // M
         else:
             m_block_min = cutlass.Int32(0)
-        n_iters = m_block_max - m_block_min
+        n_iters = cute.math.max(m_block_max - m_block_min, cutlass.Int32(0))
 
         smem = cutlass.Array(io_dtype, self.smem_elems, space=cutlass.AddressSpace.smem, alignment=128)
         sQ = smem  # 2 * M * d (double buffer)
@@ -561,10 +567,14 @@ class SM120FusedMultiHeadAttentionFP16Backward:
                         )
                         if ok32 == 0:
                             val = inf
-                        lse_r[rep * 2 + hf] = val * cutlass.Float32(_LOG2E)
                     else:
                         val = (lse_ptr + lse_base + r_abs).load()
-                        lse_r[rep * 2 + hf] = val * cutlass.Float32(_LOG2E)
+                    if cutlass.const_expr(self.is_causal and not self.causal_top_left):
+                        # Fully-masked row (bottom-right, S_q > S_kv) has stats = -inf;
+                        # +inf zeroes the row's P / grads and avoids NaN propagation.
+                        if val == cutlass.Float32(float("-inf")):
+                            val = cutlass.Float32(float("inf"))
+                    lse_r[rep * 2 + hf] = val * cutlass.Float32(_LOG2E)
 
             while not prims.mbarrier_try_wait_parity(v_mbar, cutlass.Int32(0)):
                 pass
@@ -657,7 +667,8 @@ class SM120FusedMultiHeadAttentionFP16Backward:
 
                 # Mask + softmax (scores -> P, unscaled by attn_scale) and the
                 # P store to smem.
-                do_mask_causal = (m_block * M) < (kv_base + N + SQ - SKV)
+                if cutlass.const_expr(self.is_causal):
+                    do_mask_causal = (m_block * M) < (kv_base + N - diag_off)
                 neg_inf = cutlass.Float32(float("-inf"))
                 for rep in cutlass.range_constexpr(SDP_REPS):
                     for nf in cutlass.range_constexpr(SDP_NF):
@@ -673,13 +684,13 @@ class SM120FusedMultiHeadAttentionFP16Backward:
                         s3 = acc_s[off + 3]
                         if cutlass.const_expr(self.is_causal):
                             if do_mask_causal:
-                                if kv_a0 > r0 + SKV - SQ:
+                                if kv_a0 > r0 + diag_off:
                                     s0 = neg_inf
-                                if kv_a1 > r0 + SKV - SQ:
+                                if kv_a1 > r0 + diag_off:
                                     s1 = neg_inf
-                                if kv_a0 > r8 + SKV - SQ:
+                                if kv_a0 > r8 + diag_off:
                                     s2 = neg_inf
-                                if kv_a1 > r8 + SKV - SQ:
+                                if kv_a1 > r8 + diag_off:
                                     s3 = neg_inf
                         if cutlass.const_expr(PARTIAL_KV):
                             if kv_a0 >= SKV:
@@ -823,7 +834,13 @@ class SM120FusedMultiHeadAttentionFP16Backward:
                     for rep in cutlass.range_constexpr(SDP_REPS):
                         for hf in cutlass.range_constexpr(2):
                             r_loc = wm_s * 16 + rep * 16 * WM_SDP + g_lane + hf * 8
-                            lse_r[rep * 2 + hf] = (lse_ptr + lse_base + nq0 + r_loc).load() * cutlass.Float32(_LOG2E)
+                            val = (lse_ptr + lse_base + nq0 + r_loc).load()
+                            if cutlass.const_expr(self.is_causal and not self.causal_top_left):
+                                # Fully-masked row (bottom-right, S_q > S_kv) has stats = -inf;
+                                # +inf zeroes the row's P / grads and avoids NaN propagation.
+                                if val == cutlass.Float32(float("-inf")):
+                                    val = cutlass.Float32(float("inf"))
+                            lse_r[rep * 2 + hf] = val * cutlass.Float32(_LOG2E)
 
                 # dQ accumulate into the scrambled dq_accum.
                 t_r = math_tidx // 32
@@ -1188,6 +1205,7 @@ def compile(  # noqa: A001
     bwd = SM120FusedMultiHeadAttentionFP16Backward(
         in_dtype=STORAGE_DTYPE,
         is_causal=PARAMS.is_causal,
+        causal_top_left=PARAMS.causal_top_left,
         head_dim=d,
         use_pdl=PARAMS.use_pdl,
         q_tile=PARAMS.q_tile,
