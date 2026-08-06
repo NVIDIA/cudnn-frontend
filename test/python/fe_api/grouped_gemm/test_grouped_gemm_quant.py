@@ -301,6 +301,33 @@ def test_grouped_gemm_quant_discrete_wrapper_cache_dynamic_m_smoke(request, monk
 
 
 @pytest.mark.L0
+@torch_fork_set_rng(seed=8)
+def test_grouped_gemm_quant_discrete_wrapper_cache_dynamic_m_row_scale(request, monkeypatch):
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("Requires SM100+ for grouped GEMM quant kernel.")
+    if torch.cuda.get_device_capability() == (10, 7):
+        pytest.skip("Row-scale fusion is not supported on SM107.")
+
+    compile_count, cache_entries = _test_grouped_gemm_quant_discrete_wrapper_dynamic_m_cache_behavior(
+        request=request,
+        monkeypatch=monkeypatch,
+        d_dtype=torch.float32,
+        sf_dtype=torch.float8_e4m3fn,
+        row_scale=True,
+        use_dynamic_sched=True,
+        cfg_overrides={"n": 256, "k": 64, "l": 4},
+        group_m_lists=[
+            [0, 512, 512, 512],
+            [0, 1024, 1024, 1024],
+        ],
+        skip_unsupported=False,
+    )
+
+    assert compile_count == 1
+    assert cache_entries == 1
+
+
+@pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 @with_scheduler_modes
 def test_grouped_gemm_quant_discrete_compile_execute_fp4(use_dynamic_sched, request):
@@ -515,6 +542,42 @@ def test_grouped_gemm_quant_discrete_wrapper_fp4_row_scale(request):
         discrete_col_sfd=False,
         request=request,
         row_scale=True,
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=7)
+@pytest.mark.parametrize("d_dtype", [torch.bfloat16, torch.float32], ids=["bf16", "fp32"])
+@pytest.mark.parametrize("enable_bias", [False, True], ids=["no_bias", "bias"])
+def test_grouped_gemm_quant_discrete_wrapper_fp4_row_scale_small_k(d_dtype, enable_bias, request):
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("Requires SM100+ for grouped GEMM quant kernel.")
+    if torch.cuda.get_device_capability() == (10, 7):
+        pytest.skip("Row-scale fusion is not supported on SM107.")
+
+    _test_grouped_gemm_quant_discrete_wrapper(
+        ab_dtype=torch.float4_e2m1fn_x2,
+        c_dtype=torch.bfloat16,
+        d_dtype=d_dtype,
+        b_major="k",
+        cd_major="n",
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=16,
+        sf_dtype=torch.float8_e4m3fn,
+        vector_f32=False,
+        discrete_col_sfd=False,
+        request=request,
+        use_dynamic_sched=True,
+        row_scale=True,
+        cfg_overrides={
+            "n": 256,
+            "k": 64,
+            "group_m_list": [0, 512, 512, 512],
+        },
+        enable_bias=enable_bias,
+        skip_unsupported=False,
     )
 
 
@@ -899,6 +962,13 @@ def _test_grouped_gemm_quant_wrapper_dynamic_nk_cache_behavior(
 def _test_grouped_gemm_quant_discrete_wrapper_dynamic_m_cache_behavior(
     request,
     monkeypatch,
+    d_dtype=torch.bfloat16,
+    sf_dtype=torch.float8_e8m0fnu,
+    row_scale=False,
+    use_dynamic_sched=False,
+    cfg_overrides=None,
+    group_m_lists=None,
+    skip_unsupported=True,
 ):
     try:
         from cudnn import grouped_gemm_quant_wrapper_sm100
@@ -923,33 +993,38 @@ def _test_grouped_gemm_quant_discrete_wrapper_dynamic_m_cache_behavior(
         request=request,
         ab_dtype=torch.float4_e2m1fn_x2,
         c_dtype=torch.bfloat16,
-        d_dtype=torch.bfloat16,
+        d_dtype=d_dtype,
         cd_major="n",
         acc_dtype=torch.float32,
         mma_tiler_mn=(256, 256),
         cluster_shape_mn=(2, 1),
         sf_vec_size=16,
-        sf_dtype=torch.float8_e8m0fnu,
+        sf_dtype=sf_dtype,
         vector_f32=False,
         discrete_col_sfd=False,
         b_major="k",
     )
+    cfg = _apply_grouped_gemm_cfg_overrides(cfg, cfg_overrides)
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if group_m_lists is None:
+        group_m_lists = [[group_m] * cfg["l"] for group_m in DYNAMIC_SHAPES_M_VALUES]
 
     try:
-        for group_m in DYNAMIC_SHAPES_M_VALUES:
+        for group_m_list in group_m_lists:
             inputs = allocate_discrete_input_tensors(
                 n=cfg["n"],
                 k=cfg["k"],
                 num_experts=cfg["l"],
-                group_m_list=[group_m] * cfg["l"],
+                group_m_list=group_m_list,
                 ab_dtype=cfg["ab_dtype"],
                 sf_dtype=cfg["sf_dtype"],
                 sf_vec_size=cfg["sf_vec_size"],
                 m_aligned=cfg["m_aligned"],
                 b_major=cfg["b_major"],
             )
+            if row_scale:
+                _add_row_scale(inputs)
 
             grouped_gemm_quant_wrapper_sm100(
                 a_tensor=inputs["a_tensor"],
@@ -963,6 +1038,7 @@ def _test_grouped_gemm_quant_discrete_wrapper_dynamic_m_cache_behavior(
                 b_major=cfg["b_major"],
                 norm_const_tensor=inputs.get("norm_const_tensor"),
                 prob_tensor=inputs["prob_tensor"],
+                row_scale_tensor=inputs.get("row_scale_tensor"),
                 acc_dtype=cfg["acc_dtype"],
                 d_dtype=cfg["d_dtype"],
                 cd_major=cfg["cd_major"],
@@ -972,11 +1048,14 @@ def _test_grouped_gemm_quant_discrete_wrapper_dynamic_m_cache_behavior(
                 vector_f32=cfg["vector_f32"],
                 m_aligned=cfg["m_aligned"],
                 discrete_col_sfd=cfg["discrete_col_sfd"],
+                use_dynamic_sched=use_dynamic_sched,
                 current_stream=stream,
             )
             torch.cuda.synchronize()
     except (ValueError, NotImplementedError) as e:
-        pytest.skip(f"Unsupported testcase: {e}")
+        if skip_unsupported:
+            pytest.skip(f"Unsupported testcase: {e}")
+        raise
     finally:
         cache_entries = len(grouped_gemm_quant_api._cache_of_GroupedGemmQuantSm100Objects)
         grouped_gemm_quant_api._cache_of_GroupedGemmQuantSm100Objects.clear()
@@ -1392,6 +1471,9 @@ def _test_grouped_gemm_quant_discrete_wrapper(
     request,
     use_dynamic_sched=False,
     row_scale=False,
+    cfg_overrides=None,
+    enable_bias=False,
+    skip_unsupported=True,
 ):
     try:
         from cudnn import grouped_gemm_quant_wrapper_sm100
@@ -1414,6 +1496,7 @@ def _test_grouped_gemm_quant_discrete_wrapper(
         discrete_col_sfd,
         b_major,
     )
+    cfg = _apply_grouped_gemm_cfg_overrides(cfg, cfg_overrides)
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
@@ -1427,9 +1510,12 @@ def _test_grouped_gemm_quant_discrete_wrapper(
         sf_vec_size=cfg["sf_vec_size"],
         m_aligned=cfg["m_aligned"],
         b_major=cfg["b_major"],
+        enable_bias=enable_bias,
     )
     if row_scale:
         _add_row_scale(inputs)
+    if enable_bias:
+        inputs["bias_ref"] = inputs["bias_tensor"]
 
     try:
         for _ in range(2):
@@ -1440,6 +1526,7 @@ def _test_grouped_gemm_quant_discrete_wrapper(
                 alpha_tensor=inputs["alpha_tensor"],
                 b_ptrs=inputs["b_ptrs_tensor"],
                 sfb_ptrs=inputs["sfb_ptrs_tensor"],
+                bias_tensor=inputs["bias_tensor"],
                 n=cfg["n"],
                 b_dtype=cfg["ab_dtype"],
                 b_major=cfg["b_major"],
@@ -1459,7 +1546,9 @@ def _test_grouped_gemm_quant_discrete_wrapper(
                 current_stream=stream,
             )
     except (ValueError, NotImplementedError) as e:
-        pytest.skip(f"Unsupported testcase: {e}")
+        if skip_unsupported:
+            pytest.skip(f"Unsupported testcase: {e}")
+        raise
 
     _check_ref_grouped_gemm_quant_discrete(
         inputs,

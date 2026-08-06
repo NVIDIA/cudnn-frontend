@@ -340,7 +340,6 @@ Returns a `TupleDict` - a dictionary-like object that also supports tuple unpack
 - `acc_dtype` must be `float32`
 - `sf_dtype=float8_e4m3fn` is incompatible with `sf_vec_size=32`
 - FP8 `ab_dtype` is incompatible with `sf_vec_size=16`
-- FP4 `ab_dtype` with `sf_vec_size=16` and `d_dtype=float32` is not supported
 
 ### Scale Factor Output Requirements
 
