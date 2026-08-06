@@ -25,3 +25,6 @@ RUN pip install nvidia-cutlass-dsl[cu13]==4.7.0 apache-tvm-ffi flash-linear-atte
 # Install FlashQLA from source.
 RUN git clone https://github.com/QwenLM/FlashQLA.git
 RUN pip install -v /workspace/FlashQLA
+
+# Install the chart dependencies for plot_results.py
+RUN pip install pandas matplotlib seaborn
