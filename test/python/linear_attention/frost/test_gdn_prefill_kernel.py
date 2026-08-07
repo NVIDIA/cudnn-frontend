@@ -66,11 +66,9 @@ def _gen_thd(seq_lens, num_q_heads, num_k_heads, num_v_heads, head_size, dtype):
 def _build_gdn_graph(
     total, HQ, HV, head_size, num_seqs, scale, io_dt, *, output_final_state, s0_shape=None, s0_dt=None, fs_dt=None, checkpoint_every_n_tokens=0
 ):
-    from cudnn.linear_attention.frost.gdn_engine import GdnFrostEngine
 
     HO = max(HQ, HV)
     g = cudnn.pygraph()
-    g.register_backend(GdnFrostEngine())
     t = dict(
         q=g.tensor([total, HQ, head_size], data_type=io_dt, name="q"),
         k=g.tensor([total, HQ, head_size], data_type=io_dt, name="k"),
@@ -478,10 +476,8 @@ def test_fwd_h_matches_reference(seq_lens, every_n):
 
 @requires_runtime
 def test_fwd_h_cutile_declines():
-    from cudnn.linear_attention.cutile.gdn_engine import GdnCuTileEngine
 
     g = cudnn.pygraph()
-    g.register_backend(GdnCuTileEngine())
     q_t = g.tensor([256, 2, 128], data_type=cudnn.data_type.BFLOAT16, name="q")
     k_t = g.tensor([256, 2, 128], data_type=cudnn.data_type.BFLOAT16, name="k")
     v_t = g.tensor([256, 2, 128], data_type=cudnn.data_type.BFLOAT16, name="v")

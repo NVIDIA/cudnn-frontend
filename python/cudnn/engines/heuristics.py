@@ -25,7 +25,17 @@ def heuristics_sort(graph: "pygraph", python_plans: List[PlanConfig], backend_pl
     """Rank the two sides into one list. Either side may be empty.
 
     Which python engines are in the list at all is the manifest's decision
-    (``EngineRow.matches``, where ``CUDNN_FRONTEND_ENABLE_FROST_ENGINES`` is
+    (``EngineFamily.offered``, where ``CUDNN_FRONTEND_ENABLE_FROST_ENGINES`` is
     read); a plan that reaches here has already been admitted.
+
+    Placeholder ranking, deliberately. The facts plumbing this reads FROM is
+    already in place and unused: ``graph._facts_for(analyzer)`` holds the record
+    the family's analyzer produced (planning attached it before this ran), and
+    ``manifest.family_for(graph)`` names the family whose vocabulary it is
+    in. A real policy has two layers — order the family's own engines using
+    those facts, then merge that against the backend's entries on a common
+    currency (predicted time), which is the only comparison that has to work
+    across families. Neither is written yet; the seam is here so that writing
+    them does not mean re-plumbing the graph.
     """
     return python_plans + backend_plans

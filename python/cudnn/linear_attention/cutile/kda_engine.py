@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING, Any, Dict
 
 from cudnn import behavior_note
 from cudnn.engines.base import BaseEngine, CompiledPlan, resolve_node_buffers
-from cudnn.engines.engine_ids import LINEAR_ATTENTION_ID_BASE
 from cudnn.graph_types import NodeType
 from cudnn.frost import buffers
 from cudnn.frost.workspace import Workspace
@@ -126,7 +125,6 @@ class KdaCuTileEngine(BaseEngine):
     """cuTile chunked-kernel backend for single-node KDA graphs (THD layout)."""
 
     name = "kda_cutile"
-    engine_id = LINEAR_ATTENTION_ID_BASE + 4  # stable id (see engine_ids.py); ranked after KdaFrostEngine
     behavior_notes = (behavior_note.RUNTIME_COMPILATION,)  # JIT-compiled at build_plans()
 
     def check_support(self, graph: "pygraph") -> None:

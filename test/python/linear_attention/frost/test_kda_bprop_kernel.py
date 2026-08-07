@@ -18,11 +18,9 @@ pytestmark = pytest.mark.L0
 
 
 def test_kda_bwd_frost_engine_declines():
-    from cudnn.linear_attention.frost.kda_engine import KdaFrostEngine
 
     total, H, D = 256, 2, 128
     g = cudnn.pygraph()
-    g.register_backend(KdaFrostEngine())
     q_t = g.tensor([total, H, D], data_type=cudnn.data_type.BFLOAT16, name="q")
     k_t = g.tensor([total, H, D], data_type=cudnn.data_type.BFLOAT16, name="k")
     v_t = g.tensor([total, H, D], data_type=cudnn.data_type.BFLOAT16, name="v")

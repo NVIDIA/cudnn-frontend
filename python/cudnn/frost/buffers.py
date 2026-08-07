@@ -274,6 +274,96 @@ def memset_zero_async(ptr: int, nbytes: int, stream) -> None:
         raise RuntimeError(f"cudaMemsetAsync failed: {err}")
 
 
+# The CuTe primitives these engines lower through landed in 4.7.0; older DSLs
+# fail during codegen with errors that name a missing attribute rather than the
+# version, so the check belongs where an engine can still decline.
+CUTEDSL_MIN_VERSION = (4, 7, 0)
+
+_DSL_STATE = None
+
+
+def cutedsl_state():
+    """``(installed, version)`` for the CuTe DSL, without importing it.
+
+    Support checks must be able to say "my optional dependency is absent" at
+    CHECK time, not discover it when lowering imports the adapter -- a decline
+    there is honest but late, and the plan was already in the ranked list.
+    ``find_spec`` resolves without executing (7 ms vs ~1 s for the real import)
+    and the version comes from package metadata (5 ms).
+
+    ``version`` is ``(distribution, version)`` or None: the public wheel is
+    nvidia-cutlass-dsl, internal RCs ship as nvidia-cutlass-dsl-internal, and
+    the two number themselves differently. Presence is what gates; the pair only
+    refines the message and feeds :func:`cutedsl_too_old`.
+    """
+    global _DSL_STATE
+    if _DSL_STATE is None:
+        import importlib.metadata
+        import importlib.util
+
+        try:
+            installed = importlib.util.find_spec("cutlass") is not None
+        except (ImportError, ValueError):
+            installed = False
+        version = None
+        for dist in ("nvidia-cutlass-dsl", "nvidia-cutlass-dsl-internal"):
+            try:
+                version = (dist, importlib.metadata.version(dist))
+                break
+            except importlib.metadata.PackageNotFoundError:
+                pass
+        _DSL_STATE = (installed, version)
+    return _DSL_STATE
+
+
+def cutedsl_too_old(version):
+    """``(distribution, version)`` is the public wheel, below the floor.
+
+    Absent, unparsable, or an internal RC counts as NOT too old: internal builds
+    carry their own numbering ("0.3.0+2026...") that the public floor cannot
+    judge, and refusing on a string we failed to read would decline on a machine
+    that works.
+    """
+    if not version:
+        return False
+    dist, ver = version
+    if dist != "nvidia-cutlass-dsl":
+        return False
+    try:
+        parts = tuple(int(x) for x in ver.split("+", 1)[0].split(".")[:3])
+    except ValueError:
+        return False
+    return len(parts) == 3 and parts < CUTEDSL_MIN_VERSION
+
+
+def current_device_id():
+    """Active CUDA device id, or None when there is no device.
+
+    Same two-probe shape as current_sm() below: a missing ``cuda-python`` must
+    not look like a missing GPU.
+    """
+    try:
+        from cuda.bindings import runtime as _rt
+
+        err, dev = _rt.cudaGetDevice()
+        if int(err) == 0:
+            return int(dev)
+    except Exception:  # noqa: BLE001 — fall through to the driver
+        pass
+    try:
+        import ctypes
+
+        lib = ctypes.CDLL("libcuda.so.1")
+        if lib.cuInit(0) != 0:
+            return None
+        dev = ctypes.c_int()
+        if lib.cuCtxGetDevice(ctypes.byref(dev)) == 0 or lib.cuDeviceGet(ctypes.byref(dev), 0) == 0:
+            return int(dev.value)
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
 def _sm_via_cuda_bindings():
     from cuda.bindings import runtime as _rt
 

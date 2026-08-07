@@ -12,7 +12,6 @@ from typing import Any
 
 from cudnn import behavior_note
 from cudnn.engines.base import BaseEngine, CompiledPlan
-from cudnn.engines.engine_ids import LINEAR_ATTENTION_ID_BASE
 
 from cudnn.frost import buffers
 from cudnn.frost.workspace import Workspace, WorkspaceLayout
@@ -106,7 +105,6 @@ class GdnFrostEngine(BaseEngine):
     elsewhere so the router falls back to ``GdnCuTileEngine``."""
 
     name = "gdn_frost"
-    engine_id = LINEAR_ATTENTION_ID_BASE + 1  # stable id (see engine_ids.py)
     behavior_notes = (behavior_note.RUNTIME_COMPILATION,)  # JIT-compiled at build_plans()
 
     def check_support(self, graph) -> None:

@@ -737,6 +737,7 @@ def test_e2e_nonpacked_tensors(combo, config_name, cta_group, mode) -> None:
     _run_nonpacked_e2e(combo, config_name, cta_group, mode)
 
 
+@requires_sm100
 @pytest.mark.parametrize("S,N", [(64, 4096), (4096, 64), (4096, 4096)])
 def test_auto_config_is_accepted_by_the_registry(S, N):
     """Same invariant as the dense block-scale case: the grouped path shares the

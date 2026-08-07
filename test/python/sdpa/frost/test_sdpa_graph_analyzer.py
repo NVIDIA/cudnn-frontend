@@ -640,7 +640,10 @@ def test_cu_seq_len_is_declined(side):
     """cu_seq_len_* (cuDNN 9.24+) are prefix sums — a different contract from
     seq_len_* and from ragged_offset, and these kernels implement neither.
     Reading such a graph as plain padded silently produced wrong output: 14.9%
-    of O on test_sdpa_mixed_seq_len_forms_L0[cu_q_brcm]."""
+    of O on test_sdpa_mixed_seq_len_forms_L0[cu_q_brcm].
+
+    A FACT, not a verdict: ``invalid`` means malformed-for-everyone, so putting
+    this there would also bar the engine that eventually implements it."""
     g = _mk_graph()
     q, k, v, dims, strides = _mk_qkv(g, d=128)
     seq_kv = g.tensor(dim=(B, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT32, name="seq_kv")
@@ -660,7 +663,8 @@ def test_cu_seq_len_is_declined(side):
     )
     _finish_output(o, dims, strides)
     facts = ga.analyze(g)
-    assert facts.invalid is not None and side in facts.invalid, facts.invalid
+    assert facts.invalid is None, facts.invalid
+    assert facts.has_cu_seq_len
     assert not _eligible(g), "no engine may claim a graph carrying cu_seq_len"
 
 
@@ -797,7 +801,7 @@ def test_bwd_facts_extracted():
     assert facts.right_bound == 0
     assert not facts.deterministic and not facts.has_dbias and not facts.has_dsink
     assert (facts.b, facts.h_q, facts.h_kv, facts.s_q, facts.s_kv, facts.d_qk, facts.d_v) == (B, H, H, S, S, _BWD_D, _BWD_D)
-    assert facts.dtype == torch.float16 and facts.uniform_dtype
+    assert facts.dtype == cudnn.data_type.HALF and facts.uniform_dtype  # facts speak cudnn.data_type, not torch
     assert facts.bshd_layout
     for ref in (facts.do_t, facts.dq_t, facts.dk_t, facts.dv_t, facts.stats_t):
         assert ref is not None

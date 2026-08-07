@@ -23,11 +23,24 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 import cudnn
-import torch
-from cuda.bindings import driver as _cuda_driver
-
+from cudnn.frost.buffers import CUTEDSL_MIN_VERSION, cutedsl_state, cutedsl_too_old
 from cudnn.sdpa import graph_analyzer as ga
-from cudnn.sdpa.bwd.api_dsl import SdpaBwdDslSm120
+
+
+# Lowering dependencies, resolved at build time — see the note in fwd/engines.py:
+# importing them here would drag the CuTe DSL into every support check.
+def _adapter_sm120():
+    from cudnn.sdpa.bwd.api_dsl import SdpaBwdDslSm120
+
+    return SdpaBwdDslSm120
+
+
+def _cuda_driver():
+    from cuda.bindings import driver
+
+    return driver
+
+
 from cudnn.sdpa.bwd.config_sm120 import (
     SEQ_KV_TILES as _SM120_KV_TILES,
     SEQ_Q_TILES as _SM120_Q_TILES,
@@ -36,7 +49,11 @@ from cudnn.sdpa.bwd.config_sm120 import (
 
 _LOG = logging.getLogger(__name__)
 
-_BLACKWELL_GEFORCE_ARCHES = frozenset[tuple[int, int]]({(12, 0), (12, 1)})
+# Arch range this spec serves, inclusive, major*10 + minor as in
+# engines/manifest.py. A range, not the exact device families that exist today:
+# an sm120 kernel runs on the sm120 line, and enumerating members silently
+# declines whatever ships next.
+_BLACKWELL_GEFORCE = (120, 129)
 
 
 @dataclass(frozen=True)
@@ -60,9 +77,15 @@ class Capabilities:
     lowering can honor. Compared field-by-field against SdpaGraphFacts in the
     probe."""
 
-    arches: frozenset[tuple[int, int]]
+    # Arch RANGE, inclusive, encoded major*10 + minor as in engines/manifest.py.
+    # A range and not a set of exact device families: an sm100 kernel runs on
+    # everything in the sm100 line, so enumerating the parts that exist today
+    # silently declines the ones that ship tomorrow. Rubin (sm107) and Thor
+    # (sm110) are meant to reuse these kernels and an exact set excluded both.
+    sm_lo: int
+    sm_hi: int
     d: frozenset[int]  # supported head dims (d_qk == d_v required)
-    dtypes: frozenset[torch.dtype] = frozenset({torch.float16, torch.bfloat16})
+    dtypes: frozenset = frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16})  # cudnn.data_type, see graph_analyzer
 
     # optional features a backward graph may request
     gqa: bool = False  # h_q != h_kv
@@ -88,6 +111,7 @@ class Capabilities:
     padded: bool = False
     sink: bool = False
     thd: bool = False
+    cu_seq_len: bool = False  # cu_seq_len_q / cu_seq_len_kv prefix sums (no row serves these yet)
 
     # Tuning-knob domains this engine's lowering honors (see SdpaBwdKnobs).
     tile_ms: frozenset[int] = frozenset()
@@ -111,9 +135,18 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
         ):
             if value is not None and value not in domain:
                 return f"requested {label}={value} is outside this engine's domain {sorted(domain)}"
-    if facts.device_cc not in capabilities.arches:
-        required = " or ".join(f"SM{major}{minor}" for major, minor in sorted(capabilities.arches))
-        return f"requires {required}; current device is {facts.device_cc}"
+    cc = facts.device_cc
+    sm = None if cc is None else cc[0] * 10 + cc[1]
+    if sm is None or not (capabilities.sm_lo <= sm <= capabilities.sm_hi):
+        return f"requires SM{capabilities.sm_lo}-{capabilities.sm_hi}; current device is {cc}"
+    installed, version = cutedsl_state()
+    if not installed:
+        # Said HERE, not when lowering imports the adapter: a decline at build
+        # is honest but late -- the plan is already in the ranked list.
+        return "requires the cutedsl extra (nvidia-cutlass-dsl), which is not installed"
+    if cutedsl_too_old(version):
+        want = ".".join(str(v) for v in CUTEDSL_MIN_VERSION)
+        return f"requires nvidia-cutlass-dsl >= {want}; found {version[1]}"
     if facts.is_mxfp8 or facts.is_fp8:
         return "this engine serves only half (fp16/bf16) sdpa_backward graphs"
     if facts.d_qk != facts.d_v:
@@ -150,6 +183,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
         (facts.padded, capabilities.padded, "padding mask"),
         (facts.has_sink, capabilities.sink, "sink token"),
         (facts.thd, capabilities.thd, "THD / ragged"),
+        (facts.has_cu_seq_len, capabilities.cu_seq_len, "cu_seq_len_q / cu_seq_len_kv"),
         (facts.causal, capabilities.causal, "causal mask"),
     ):
         if fact and not cap:
@@ -187,9 +221,10 @@ def _sm120_spec() -> EngineSpec:
     return EngineSpec(
         name="sdpa_bwd_sm120",
         capabilities=Capabilities(
-            arches=_BLACKWELL_GEFORCE_ARCHES,
+            sm_lo=_BLACKWELL_GEFORCE[0],
+            sm_hi=_BLACKWELL_GEFORCE[1],
             d=frozenset(_SM120_HEAD_DIMS),
-            dtypes=frozenset({torch.float16, torch.bfloat16}),
+            dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
             causal=True,
             bottom_right=True,
             swa=True,
@@ -208,7 +243,9 @@ def analyze_for(spec: EngineSpec, graph, knobs: Optional[SdpaBwdKnobs] = None):
     and ``engine.FrostSdpaBwdEngine.check_support``. ``knobs`` is the plan's
     tuning request (``PlanConfig.knobs``), ``None`` for no preference.
     """
-    facts = ga.analyze(graph)
+    # The record validate() attached, not a fresh parse: one per graph, shared
+    # with whatever ranked these plans before this engine was imported.
+    facts = graph._facts_for(ga.analyze)
     if facts is None:
         return None, "graph is not a single sdpa_backward() node"
     return facts, mismatch(spec.capabilities, facts, knobs)
@@ -252,7 +289,12 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
     kv_geom = _bshd_geometry(facts.b, facts.h_kv, facts.s_kv, facts.d_qk)
     stats_geom = ((facts.b, facts.h_q, facts.s_q, 1), (facts.h_q * facts.s_q, facts.s_q, 1, 1))
 
-    def _desc(geom, dtype: torch.dtype, name: str) -> "Any":
+    import torch
+
+    def _desc(geom, dtype, name: str) -> "Any":
+        # facts carry cudnn.data_type; torch appears only here, where a real
+        # torch tensor is being described.
+        dtype = ga.to_torch_dtype(dtype) if dtype in ga._KNOWN_DTYPES else dtype
         from cudnn.api_base import TensorDesc
 
         dim, stride = geom
@@ -265,7 +307,7 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
             name=name,
         )
 
-    api = SdpaBwdDslSm120(
+    api = _adapter_sm120()(
         sample_q=_desc(q_geom, facts.dtype, "q"),
         sample_k=_desc(kv_geom, facts.dtype, "k"),
         sample_v=_desc(kv_geom, facts.dtype, "v"),
@@ -303,7 +345,7 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
         dv=facts.dv_t,
     )
 
-    def _canonical_view(buf: torch.Tensor, geom) -> torch.Tensor:
+    def _canonical_view(buf, geom):
         """Reinterpret a variant-pack buffer through the canonical geometry.
 
         cuDNN's execute contract treats variant-pack entries as raw storage
@@ -338,7 +380,7 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
             # Stream from the execute-time context (raw CUstream int,
             # engine plan passes ctx.stream); None keeps the adapter's
             # torch-current-stream fallback.
-            current_stream=_cuda_driver.CUstream(stream) if stream is not None else None,
+            current_stream=_cuda_driver().CUstream(stream) if stream is not None else None,
         )
         return None
 

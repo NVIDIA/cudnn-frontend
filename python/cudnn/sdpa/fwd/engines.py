@@ -30,20 +30,44 @@ from dataclasses import dataclass
 from functools import partial
 from typing import Any, Callable, Optional
 
-import torch
-from cuda.bindings import driver as _cuda_driver
+import cudnn
 
 from cudnn.frost.tile_dsl.constants import SCHED_NATURAL
+from cudnn.frost.buffers import CUTEDSL_MIN_VERSION, cutedsl_state, cutedsl_too_old
 from cudnn.sdpa import graph_analyzer as ga
-from cudnn.sdpa.fwd.api_dsl import SdpaFwdDsl, SdpaFwdDslSm100, SdpaFwdDslSm120
+
+# The DSL adapters (api_dsl) and cuda.bindings are LOWERING dependencies, not
+# support-check ones: importing them here would drag the CuTe DSL (~1.0 s, 357
+# modules) into every process that merely asks whether an engine could serve a
+# graph. ENGINE_SPECS therefore names its adapter, and _adapter() resolves it
+# at build time. Capabilities/mismatch below stay import-free.
+_SM100 = "SdpaFwdDslSm100"
+_SM120 = "SdpaFwdDslSm120"
+
+
+def _adapter(name: str):
+    from cudnn.sdpa.fwd import api_dsl
+
+    return getattr(api_dsl, name)
+
+
+def _cuda_driver():
+    from cuda.bindings import driver
+
+    return driver
+
 
 _LOG = logging.getLogger(__name__)
 
-# Device families the spec rows below serve (Capabilities.arches values).
-# cc10.3 additionally enables the fused LDTM.STAT row-max for MXFP8 — handled
-# in the lowering, from the device capability.
-_BLACKWELL_ARCHES = frozenset[tuple[int, int]]({(10, 0), (10, 3)})
-_BLACKWELL_GEFORCE_ARCHES = frozenset[tuple[int, int]]({(12, 0), (12, 1)})
+# Arch ranges the spec rows below serve, inclusive, encoded major*10 + minor as
+# in engines/manifest.py. RANGES, not the exact device families that exist
+# today: an sm100 kernel runs on the whole sm100 line, so enumerating members
+# silently declines the parts that ship later -- Rubin (sm107) and Thor (sm110)
+# are meant to reuse these kernels and an exact {(10,0), (10,3)} excluded both.
+# Within the range, cc10.3+ additionally enables the fused LDTM.STAT row-max for
+# MXFP8 — handled in the lowering, from the device capability.
+_BLACKWELL = (100, 119)
+_BLACKWELL_GEFORCE = (120, 129)
 
 
 @dataclass(frozen=True)
@@ -70,7 +94,13 @@ class Capabilities:
     declares the union its lowering can actually deliver. Compared
     field-by-field against SdpaGraphFacts in the probe."""
 
-    arches: frozenset[tuple[int, int]]
+    # Arch RANGE, inclusive, encoded major*10 + minor as in engines/manifest.py.
+    # A range and not a set of exact device families: an sm100 kernel runs on
+    # everything in the sm100 line, so enumerating the parts that exist today
+    # silently declines the ones that ship tomorrow. Rubin (sm107) and Thor
+    # (sm110) are meant to reuse these kernels and an exact set excluded both.
+    sm_lo: int
+    sm_hi: int
     phase: str
     d_qk: frozenset[int]
     d_v: frozenset[int]
@@ -82,7 +112,7 @@ class Capabilities:
     # OOB-clipped. False = only the native dims above are eligible (FP8/MXFP8;
     # SM120, whose lowering has no zero-padding path wired yet).
     d_envelope: bool = False
-    dtypes: frozenset[torch.dtype] = frozenset({torch.float16, torch.bfloat16})
+    dtypes: frozenset = frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16})  # cudnn.data_type, see graph_analyzer
     is_mxfp8: bool = False  # block-scale MXFP8 engine (FP8 in + per-32-block E8M0 SF)
     is_fp8: bool = False  # per-tensor FP8 engine (FP8 in + scalar descales)
 
@@ -121,6 +151,7 @@ class Capabilities:
     # dummy from lower_dsl_prefill when the graph has no Stats output.
     lse_optional: bool = False
     thd: bool = False
+    cu_seq_len: bool = False  # cu_seq_len_q / cu_seq_len_kv prefix sums (no row serves these yet)
     # True = the kernel anchors the THD bottom-right diagonal at each sequence's
     # own (seq_len_q[b], seq_len_kv[b]). Rows that keep False (the SM100 flavors)
     # compute it from the GLOBAL S_q — the THD variant of the
@@ -197,9 +228,18 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         ):
             if value is not None and value not in domain:
                 return f"requested {label}={value} is outside this engine's domain {sorted(domain)}"
-    if facts.device_cc not in capabilities.arches:
-        required = " or ".join(f"SM{major}{minor}" for major, minor in sorted(capabilities.arches))
-        return f"requires {required}; current device is {facts.device_cc}"
+    cc = facts.device_cc
+    sm = None if cc is None else cc[0] * 10 + cc[1]
+    if sm is None or not (capabilities.sm_lo <= sm <= capabilities.sm_hi):
+        return f"requires SM{capabilities.sm_lo}-{capabilities.sm_hi}; current device is {cc}"
+    installed, version = cutedsl_state()
+    if not installed:
+        # Said HERE, not when lowering imports the adapter: a decline at build
+        # is honest but late -- the plan is already in the ranked list.
+        return "requires the cutedsl extra (nvidia-cutlass-dsl), which is not installed"
+    if cutedsl_too_old(version):
+        want = ".".join(str(v) for v in CUTEDSL_MIN_VERSION)
+        return f"requires nvidia-cutlass-dsl >= {want}; found {version[1]}"
     if capabilities.d_envelope:
         # Envelope row: native caps are upper bounds (TMA zero-padding semantics
         # — see Capabilities.d_envelope). Alignment: TMA global strides must be
@@ -255,6 +295,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         (facts.has_sink, capabilities.sink, "sink token"),
         (facts.wants_stats, capabilities.stats, "stats output"),
         (facts.thd, capabilities.thd, "THD / ragged"),
+        (facts.has_cu_seq_len, capabilities.cu_seq_len, "cu_seq_len_q / cu_seq_len_kv"),
     ):
         if fact and not cap:
             return f"graph uses {label}, which this engine does not support"
@@ -313,12 +354,13 @@ def _sm100_spec(d: int, d_v: Optional[int] = None) -> EngineSpec:
     return EngineSpec(
         name=f"sdpa_fwd_prefill_sm100_{suffix}",
         capabilities=Capabilities(
-            arches=_BLACKWELL_ARCHES,
+            sm_lo=_BLACKWELL[0],
+            sm_hi=_BLACKWELL[1],
             phase="prefill",
             d_qk=frozenset({d}),
             d_v=frozenset({d_v}),
             d_envelope=True,  # native tile box d; smaller dims via TMA zero-padding
-            dtypes=frozenset({torch.float16, torch.bfloat16}),
+            dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
             causal=True,
             bottom_right=True,
             swa=True,
@@ -337,7 +379,7 @@ def _sm100_spec(d: int, d_v: Optional[int] = None) -> EngineSpec:
             tile_ns=frozenset({128}),
             cgas=frozenset({2}),
         ),
-        lower=partial(lower_dsl_prefill, api_type=SdpaFwdDslSm100),
+        lower=partial(lower_dsl_prefill, api_type=_SM100),
     )
 
 
@@ -351,11 +393,12 @@ def _sm100_mxfp8_spec(d: int) -> EngineSpec:
     return EngineSpec(
         name=f"sdpa_fwd_prefill_sm100_d{d}_mxfp8",
         capabilities=Capabilities(
-            arches=_BLACKWELL_ARCHES,
+            sm_lo=_BLACKWELL[0],
+            sm_hi=_BLACKWELL[1],
             phase="prefill",
             d_qk=frozenset({d}),
             d_v=frozenset({d}),
-            dtypes=frozenset({torch.float8_e4m3fn, torch.float8_e5m2}),
+            dtypes=frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
             is_mxfp8=True,
             causal=True,
             bottom_right=True,
@@ -368,7 +411,7 @@ def _sm100_mxfp8_spec(d: int) -> EngineSpec:
             tile_ns=frozenset({128}),
             cgas=frozenset({2}),
         ),
-        lower=partial(lower_dsl_prefill, api_type=SdpaFwdDslSm100),
+        lower=partial(lower_dsl_prefill, api_type=_SM100),
     )
 
 
@@ -385,11 +428,12 @@ def _sm100_fp8_spec(d: int) -> EngineSpec:
     return EngineSpec(
         name=f"sdpa_fwd_prefill_sm100_d{d}_fp8",
         capabilities=Capabilities(
-            arches=_BLACKWELL_ARCHES,
+            sm_lo=_BLACKWELL[0],
+            sm_hi=_BLACKWELL[1],
             phase="prefill",
             d_qk=frozenset({d}),
             d_v=frozenset({d}),
-            dtypes=frozenset({torch.float8_e4m3fn, torch.float8_e5m2}),
+            dtypes=frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
             is_fp8=True,
             causal=True,
             bottom_right=True,
@@ -414,7 +458,7 @@ def _sm100_fp8_spec(d: int) -> EngineSpec:
             tile_ns=frozenset({128}),
             cgas=frozenset({2}),
         ),
-        lower=partial(lower_dsl_prefill, api_type=SdpaFwdDslSm100),
+        lower=partial(lower_dsl_prefill, api_type=_SM100),
     )
 
 
@@ -422,11 +466,12 @@ def _sm120_spec() -> EngineSpec:
     return EngineSpec(
         name="sdpa_fwd_prefill_sm120",
         capabilities=Capabilities(
-            arches=_BLACKWELL_GEFORCE_ARCHES,
+            sm_lo=_BLACKWELL_GEFORCE[0],
+            sm_hi=_BLACKWELL_GEFORCE[1],
             phase="prefill",
             d_qk=frozenset(range(16, 257, 16)),
             d_v=frozenset(range(16, 257, 16)),
-            dtypes=frozenset({torch.float16, torch.bfloat16}),
+            dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
             causal=True,
             bottom_right=True,
             bottom_right_with_swa=True,
@@ -445,7 +490,7 @@ def _sm120_spec() -> EngineSpec:
             tile_ns=frozenset({64, 128}),
             cgas=frozenset({1}),
         ),
-        lower=partial(lower_dsl_prefill, api_type=SdpaFwdDslSm120),
+        lower=partial(lower_dsl_prefill, api_type=_SM120),
     )
 
 
@@ -457,7 +502,9 @@ def analyze_for(spec: EngineSpec, graph, knobs: Optional[SdpaFwdKnobs] = None):
     and ``engine.FrostSdpaFwdEngine.check_support``. ``knobs`` is the plan's
     tuning request (``PlanConfig.knobs``), ``None`` for no preference.
     """
-    facts = ga.analyze(graph)
+    # The record validate() attached, not a fresh parse: one per graph, shared
+    # with whatever ranked these plans before this engine was imported.
+    facts = graph._facts_for(ga.analyze)
     if facts is None:
         return None, "graph is not a single sdpa() forward node"
     return facts, mismatch(spec.capabilities, facts, knobs)
@@ -484,7 +531,7 @@ def lower_dsl_prefill(
     spec: EngineSpec,
     facts: "ga.SdpaGraphFacts",
     knobs: Optional[SdpaFwdKnobs] = None,
-    api_type: type[SdpaFwdDsl] = SdpaFwdDslSm100,
+    api_type: str = _SM100,
 ):
     """Lower one selected SDPA prefill engine through its DSL adapter.
 
@@ -512,7 +559,7 @@ def lower_dsl_prefill(
     # plumbed there — known gap) is dropped here rather than erroring at
     # execute.
     seq_q_lens_present = facts.padded and not facts.thd and facts.seq_q_t is not None and not (facts.is_mxfp8 or facts.is_fp8)
-    api = api_type(
+    api = _adapter(api_type)(
         sample_q=ga.tensor_desc_from_ir(facts.q_t, name="q"),
         sample_k=ga.tensor_desc_from_ir(facts.k_t, name="k"),
         sample_v=ga.tensor_desc_from_ir(facts.v_t, name="v"),
@@ -614,6 +661,8 @@ def lower_dsl_prefill(
         # Scratch comes from the CALLER's workspace (never allocated here): the
         # CompiledPlan sized/validated it against workspace_bytes; the carver
         # re-validates so a direct call cannot silently corrupt memory.
+        import torch  # execute path: a real tensor is about to be carved
+
         carver = WorkspaceCarver(workspace, total_workspace_bytes, spec.name) if total_workspace_bytes else None
         lse_buf = resolved.get(id(binding.stats)) if binding.stats is not None else None
         if lse_buf is None and spec.capabilities.stats and not spec.capabilities.lse_optional and not facts.thd:
@@ -650,7 +699,7 @@ def lower_dsl_prefill(
             seq_q_lens=seq_q_buf if (seq_q_lens_present or facts.thd) else None,
             # Stream from the execute-time handle (raw CUstream int, the
             # ExecutionContext's stream); None keeps the default stream.
-            current_stream=_cuda_driver.CUstream(stream) if stream is not None else None,
+            current_stream=_cuda_driver().CUstream(stream) if stream is not None else None,
         )
         if facts.is_mxfp8 or facts.is_fp8:
             execute_kwargs.update(

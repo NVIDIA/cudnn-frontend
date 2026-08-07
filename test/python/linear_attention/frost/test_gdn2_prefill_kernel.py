@@ -81,13 +81,11 @@ def _build_gdn2_engine_graph(
     use_beta_w_sigmoid=False,
     bwd=False,
 ):
-    from cudnn.linear_attention.frost.gdn2_engine import Gdn2FrostEngine
 
     io_dt = io_dt or cudnn.data_type.BFLOAT16
     HV = HV or H
     HO = max(H, HV)
     g = cudnn.pygraph()
-    g.register_backend(Gdn2FrostEngine())
     q_t = g.tensor([total, H, D], data_type=io_dt, name="q")
     k_t = g.tensor([total, H, D], data_type=io_dt, name="k")
     v_t = g.tensor([total, HV, D], data_type=io_dt, name="v")
@@ -422,7 +420,6 @@ def _gdn2_engine_inputs(seq_lens, H, D):
 @requires_runtime
 @pytest.mark.parametrize("seq_lens", [[256], [512, 512], [64, 128, 512]])
 def test_gdn2_frost_engine_matches_reference(seq_lens, H=2, D=128):
-    from cudnn.linear_attention.frost.gdn2_engine import Gdn2FrostEngine
 
     _seed()
     (q, k, v, gate, beta, w), cu = _gdn2_engine_inputs(seq_lens, H, D)
@@ -461,7 +458,6 @@ def test_gdn2_frost_engine_matches_reference(seq_lens, H=2, D=128):
 def test_gdn2_frost_engine_no_l2norm_matches_reference(seq_lens=(256,), H=2, D=128):
     """use_qk_l2norm=False passes q/k through as given, so the test feeds
     pre-normalized rows (the kernel's io-dtype arithmetic needs them)."""
-    from cudnn.linear_attention.frost.gdn2_engine import Gdn2FrostEngine
 
     _seed()
     (q, k, v, gate, beta, w), cu = _gdn2_engine_inputs(list(seq_lens), H, D)
@@ -498,7 +494,6 @@ def test_gdn2_frost_engine_no_l2norm_matches_reference(seq_lens=(256,), H=2, D=1
 
 @requires_runtime
 def test_gdn2_frost_engine_initial_state(seq_lens=(128, 256), H=2, D=128):
-    from cudnn.linear_attention.frost.gdn2_engine import Gdn2FrostEngine
 
     _seed()
     (q, k, v, gate, beta, w), cu = _gdn2_engine_inputs(seq_lens, H, D)

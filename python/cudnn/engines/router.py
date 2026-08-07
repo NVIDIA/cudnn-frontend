@@ -39,10 +39,15 @@ _LOG = logging.getLogger("cudnn.engines.router")
 
 
 def decline_types():
-    """The exception types that mean "this engine does not serve this graph"."""
+    """The exception types that mean "this engine does not serve this graph".
+
+    ImportError counts: an engine whose optional dependency is absent cannot
+    serve the graph, and since lowering imports are deferred past check_support
+    that only becomes visible at build time.
+    """
     import cudnn
 
-    return (NotImplementedError, cudnn.cudnnGraphNotSupportedError)
+    return (NotImplementedError, cudnn.cudnnGraphNotSupportedError, ImportError)
 
 
 class Router:

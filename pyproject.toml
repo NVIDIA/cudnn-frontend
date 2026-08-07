@@ -56,6 +56,12 @@ classifiers = [
 
 [project.optional-dependencies]
 cutedsl = [
+    # NOT pinned to the floor the FROST engines need (4.7.0): pinning it here
+    # would make this package incompatible with anything holding the DSL at an
+    # older version -- quack-kernels pins ==4.6.0, and vLLM and friends carry
+    # their own constraints. The engines check the version at support time and
+    # decline when it is too old, so an older DSL costs those engines and
+    # nothing else. See CUTEDSL_MIN_VERSION in cudnn/frost/buffers.py.
     "nvidia-cutlass-dsl[cu13]>=4.5.0",
     "cuda-python",
     "torch",

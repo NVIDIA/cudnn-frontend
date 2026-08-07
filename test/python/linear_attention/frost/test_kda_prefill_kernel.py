@@ -84,13 +84,11 @@ def _build_kda_engine_graph(
     gate_lower_bound=None,
     bwd=False,
 ):
-    from cudnn.linear_attention.frost.kda_engine import KdaFrostEngine
 
     io_dt = io_dt or cudnn.data_type.BFLOAT16
     HV = HV or H
     HO = max(H, HV)
     g = cudnn.pygraph()
-    g.register_backend(KdaFrostEngine())
     q_t = g.tensor([total, H, D], data_type=io_dt, name="q")
     k_t = g.tensor([total, H, D], data_type=io_dt, name="k")
     v_t = g.tensor([total, HV, D], data_type=io_dt, name="v")
@@ -456,7 +454,6 @@ def _kda_engine_inputs(seq_lens, H, D):
 @requires_runtime
 @pytest.mark.parametrize("seq_lens", [[256], [512, 512], [64, 128, 512]])
 def test_kda_frost_engine_matches_reference(seq_lens, H=2, D=128):
-    from cudnn.linear_attention.frost.kda_engine import KdaFrostEngine
 
     _seed()
     (q, k, v, gate, beta), cu = _kda_engine_inputs(seq_lens, H, D)
@@ -492,7 +489,6 @@ def test_kda_frost_engine_matches_reference(seq_lens, H=2, D=128):
 
 @requires_runtime
 def test_kda_frost_engine_initial_state(seq_lens=(128, 256), H=2, D=128):
-    from cudnn.linear_attention.frost.kda_engine import KdaFrostEngine
 
     _seed()
     (q, k, v, gate, beta), cu = _kda_engine_inputs(seq_lens, H, D)
@@ -530,7 +526,6 @@ def test_kda_frost_engine_initial_state(seq_lens=(128, 256), H=2, D=128):
 def test_kda_frost_engine_no_l2norm_matches_reference(seq_lens=(256,), H=2, D=128):
     """use_qk_l2norm=False passes q/k through as given, so the test feeds
     pre-normalized rows (the kernel's io-dtype arithmetic needs them)."""
-    from cudnn.linear_attention.frost.kda_engine import KdaFrostEngine
 
     _seed()
     (q, k, v, gate, beta), cu = _kda_engine_inputs(list(seq_lens), H, D)

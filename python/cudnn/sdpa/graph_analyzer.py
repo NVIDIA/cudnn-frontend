@@ -7,8 +7,11 @@
 directly, exposed via ``graph.nodes`` — no construction-time hooks are needed.
 This module extracts *facts* (what the graph asks for) without judging
 supportedness; each registered engine matches the facts against its own
-capability declaration (see ``cudnn.sdpa.fwd.engines``). The parse runs once
-per graph and is cached.
+capability declaration (see ``cudnn.sdpa.fwd.engines``). :func:`analyze` is the
+callable the SDPA family names in ``engines/manifest.py``; PLANNING runs it once
+per graph -- after the backend's layout inference has landed and the graph is
+frozen -- and attaches the record, so the ranking and the engine share it rather
+than each parsing the graph.
 
 Also hosts the graph-side runtime helpers shared by every SDPA engine:
 variant-pack resolution and TensorDesc construction.
@@ -17,41 +20,99 @@ variant-pack resolution and TensorDesc construction.
 from __future__ import annotations
 
 import logging
-import weakref
 from dataclasses import dataclass
 from typing import Any, Optional
 
 import cudnn
-import torch
 
 _LOG = logging.getLogger(__name__)
 
 
-_DTYPE_FROM_CUDNN = {
-    cudnn.data_type.HALF: torch.float16,
-    cudnn.data_type.BFLOAT16: torch.bfloat16,
-    cudnn.data_type.FP8_E4M3: torch.float8_e4m3fn,
-    cudnn.data_type.FP8_E5M2: torch.float8_e5m2,
-    cudnn.data_type.FLOAT: torch.float32,
-    cudnn.data_type.INT32: torch.int32,
+# The facts vocabulary is cudnn.data_type, not torch.dtype. Facts are what every
+# engine of a family reads, so expressing them in one framework's types would
+# make the whole dispatch path require that framework; lowering converts at its
+# own boundary, where a torch tensor is actually being allocated.
+_TORCH_FROM_CUDNN = {
+    cudnn.data_type.HALF: "float16",
+    cudnn.data_type.BFLOAT16: "bfloat16",
+    cudnn.data_type.FP8_E4M3: "float8_e4m3fn",
+    cudnn.data_type.FP8_E5M2: "float8_e5m2",
+    cudnn.data_type.FLOAT: "float32",
+    cudnn.data_type.INT32: "int32",
 }
+_KNOWN_DTYPES = frozenset(_TORCH_FROM_CUDNN)
+
+
+def _torch_cuda_device():
+    """The lowering boundary's torch device — imported here, not at module level."""
+    import torch
+
+    return torch.device("cuda", torch.cuda.current_device())
+
+
+def to_torch_dtype(dt):
+    """cudnn.data_type -> torch.dtype, for the lowering boundary only.
+
+    Declines rather than raising KeyError on a type this family has no mapping
+    for: only Q's dtype is capability-checked, so O / Stats / a side output can
+    still carry one, and tensor_desc_from_ir() runs on every bound tensor.
+    """
+    import torch
+
+    if dt not in _TORCH_FROM_CUDNN:
+        raise NotImplementedError(f"cudnn.sdpa: no lowering for data type {dt}")
+    return getattr(torch, _TORCH_FROM_CUDNN[dt])
+
 
 # BHSD logical / BSHD physical, size-1 dims wildcarded.
 _REQ_STRIDE_ORDER = (3, 1, 2, 0)
 
 
+def _device_props():
+    """The current device as cuDNN describes it, or None without a device.
+
+    cudnn.create_device_properties() is the backend's OWN device descriptor —
+    the same object the C++ deviceless-AoT path serializes and replays. Reading
+    it here instead of torch.cuda keeps the facts path framework-neutral, and
+    is the step that makes a deviceless python engine possible at all: facts
+    computed from a serialized descriptor need no live device.
+
+    Cached per device id: the descriptor costs a backend call and the device
+    does not change under a process.
+    """
+    import json
+
+    from cudnn.frost.buffers import current_device_id
+
+    dev = current_device_id()
+    if dev is None:
+        return None
+    cached = _DEVICE_PROPS_CACHE.get(dev)
+    if cached is None:
+        try:
+            cached = json.loads(cudnn.create_device_properties(dev).serialize())
+        except Exception:  # noqa: BLE001 — no device / older backend: facts stay device-less
+            cached = {}
+        _DEVICE_PROPS_CACHE[dev] = cached
+    return cached or None
+
+
+_DEVICE_PROPS_CACHE: dict = {}
+
+
 def _device_cc() -> Optional[tuple]:
     """Compute capability of the current CUDA device, or None without CUDA."""
-    if not torch.cuda.is_available():
+    props = _device_props()
+    if not props or "deviceVer" not in props:
         return None
-    return torch.cuda.get_device_capability(torch.cuda.current_device())
+    ver = int(props["deviceVer"])  # 1000 == SM 10.0
+    return (ver // 100, (ver % 100) // 10)
 
 
 def _device_sm_count() -> Optional[int]:
     """SM count of the current CUDA device, or None without CUDA."""
-    if not torch.cuda.is_available():
-        return None
-    return torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    props = _device_props()
+    return int(props["multiProcessorCount"]) if props and "multiProcessorCount" in props else None
 
 
 def _stride_order(dim: tuple, stride: tuple) -> tuple:
@@ -129,7 +190,7 @@ class SdpaGraphFacts:
     d_v: int = 0
 
     # dtypes / layout
-    dtype: Optional[torch.dtype] = None  # Q dtype (None if outside the dtype map)
+    dtype: Optional[Any] = None  # Q dtype as cudnn.data_type (None if unrecognized)
     uniform_dtype: bool = True  # K/V (and O, for half) dtypes equal Q's
     bshd_layout: bool = True  # all of Q/K/V/O in BSHD-physical order
     # Relaxed dense-layout soundness: every one of Q/K/V/O has the head dim
@@ -139,7 +200,7 @@ class SdpaGraphFacts:
     dense_layout: bool = True
     is_mxfp8: bool = False  # block-scale MXFP8 (FP8 Q/K/V + per-32-block E8M0 SF)
     is_fp8: bool = False  # per-tensor FP8 (FP8 Q/K/V + scalar descales)
-    dtype_o: Optional[torch.dtype] = None  # O dtype (== Q for half; independent for FP8/MXFP8)
+    dtype_o: Optional[Any] = None  # O dtype as cudnn.data_type
 
     # masks (resolved cuDNN semantics)
     causal: bool = False  # effective causal upper bound (right band == 0)
@@ -168,6 +229,11 @@ class SdpaGraphFacts:
 
     padded: bool = False  # per-batch KV lengths present (padding mask or THD)
     thd: bool = False  # ragged (THD) Q/K/V
+    # cu_seq_len_q / cu_seq_len_kv (cuDNN 9.24+): prefix sums, a contract of
+    # their own — neither seq_len_* nor ragged_offset. A fact, not a verdict:
+    # no engine here implements it yet, but reading the graph as plain padded
+    # gave wrong output (14.9% of O on test_sdpa_mixed_seq_len_forms_L0[cu_q_brcm]).
+    has_cu_seq_len: bool = False
     has_sink: bool = False
     wants_stats: bool = False
 
@@ -343,14 +409,14 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
     is_mxfp8 = bool(rec.get("_is_mxfp8"))
     is_fp8 = bool(rec.get("_is_fp8"))
     _fp8_family = is_mxfp8 or is_fp8
-    q_dtype = _DTYPE_FROM_CUDNN.get(q.get_data_type())
-    o_dtype = _DTYPE_FROM_CUDNN.get(o.get_data_type())
+    q_dtype = q.get_data_type() if q.get_data_type() in _KNOWN_DTYPES else None
+    o_dtype = o.get_data_type() if o.get_data_type() in _KNOWN_DTYPES else None
     if _fp8_family:
         # FP8 in: O dtype is independent of the input; only K/V must match Q.
-        uniform = all(_DTYPE_FROM_CUDNN.get(t.get_data_type()) == q_dtype for t in (k, v))
+        uniform = all(t.get_data_type() == q_dtype for t in (k, v))
     else:
         _uniform_ports = [k, v, o] + ([rec["dO"], rec["dQ"], rec["dK"], rec["dV"]] if is_backward else [])
-        uniform = all(_DTYPE_FROM_CUDNN.get(t.get_data_type()) == q_dtype for t in _uniform_ports)
+        uniform = all(t.get_data_type() == q_dtype for t in _uniform_ports)
     _layout_ports = [(q_dim, q_stride), (k_dim, k_stride), (v_dim, v_stride), (o_dim, o_stride)]
     if is_backward:
         _layout_ports += [(dims[name], strides[name]) for name in ("dO", "dQ", "dK", "dV")]
@@ -393,13 +459,7 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         return _invalid(f"sliding-window length must be >= 1; got {left_bound}")
     window_left = (left_bound - 1) if left_bound is not None else None
 
-    # cu_seq_len_q / cu_seq_len_kv (cuDNN 9.24+) are prefix-sum tensors, a
-    # different contract from seq_len_* and from ragged_offset: the kernels here
-    # implement neither, and reading the graph as plain padded silently produced
-    # wrong output (14.9% of O on test_sdpa_mixed_seq_len_forms_L0[cu_q_brcm]).
-    for name in ("cu_seq_len_q", "cu_seq_len_kv"):
-        if rec.get(name) is not None:
-            return _invalid(f"{name} is not supported")
+    has_cu_seq_len = any(rec.get(name) is not None for name in ("cu_seq_len_q", "cu_seq_len_kv"))
 
     # Padding / THD.
     thd = getattr(q, "ragged_offset", None) is not None
@@ -424,9 +484,8 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
     # launch a cast kernel).
     for name, t in (("seq_len_q", seq_len_q), ("seq_len_kv", seq_len_kv)):
         if t is not None:
-            t_dtype = _DTYPE_FROM_CUDNN.get(t.get_data_type())
-            if t_dtype != torch.int32:
-                return _invalid(f"{name} must be int32; got {t_dtype}")
+            if t.get_data_type() != cudnn.data_type.INT32:
+                return _invalid(f"{name} must be int32; got {t.get_data_type()}")
 
     sink_token = rec.get("sink_token")
     if sink_token is not None:
@@ -436,9 +495,8 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         # The kernels consume fp32 sink logits directly; there is no implicit
         # conversion anywhere on the execute path (it would allocate and
         # launch a cast kernel).
-        sink_dtype = _DTYPE_FROM_CUDNN.get(sink_token.get_data_type())
-        if sink_dtype != torch.float32:
-            return _invalid(f"sink_token must be float32; got {sink_dtype}")
+        if sink_token.get_data_type() != cudnn.data_type.FLOAT:
+            return _invalid(f"sink_token must be float32; got {sink_token.get_data_type()}")
 
     stats = rec.get("stats")
     if is_backward:
@@ -499,6 +557,7 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         seq_q_trim=seq_q_trim,
         padded=padded,
         thd=thd,
+        has_cu_seq_len=has_cu_seq_len,
         has_sink=sink_token is not None,
         wants_stats=wants_stats,
         scale=scale,
@@ -530,31 +589,18 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
     )
 
 
-# Parse cache: one facts extraction per graph, because N registered engines
-# each probe the same graph (create_execution_plans, then again at build) and
-# the graph walk is the expensive part — capability matching is cheap field
-# comparisons. Keyed weakly so graphs can be GC'd; invalidated if the node
-# count changes (a graph mutated after probing gets re-parsed).
-_FACTS_CACHE: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
-
-
 def analyze(graph: "cudnn.pygraph") -> Optional[SdpaGraphFacts]:
-    """Facts for a single-SDPA graph, or None if the graph is anything else."""
+    """Facts for a single-SDPA graph, or None if the graph is anything else.
+
+    Pure: attaching and caching is the graph's job (validate() ->
+    _attach_facts), so the ranking and the engine share one record instead of
+    each holding a private one. This is the callable the manifest names in the
+    SDPA family's ``analyzer``.
+    """
     node = _single_sdpa_node(graph)
     if node is None:
         return None
-    try:
-        cached = _FACTS_CACHE.get(graph)
-    except TypeError:  # non-weakrefable graph objects
-        cached = None
-    if cached is not None and cached[0] == len(graph.nodes):
-        return cached[1]
-    facts = _extract_facts(_record_from_node(node))
-    try:
-        _FACTS_CACHE[graph] = (len(graph.nodes), facts)
-    except TypeError:
-        pass
-    return facts
+    return _extract_facts(_record_from_node(node))
 
 
 # ---------------------------------------------------------------------------
@@ -694,12 +740,12 @@ def tensor_desc_from_ir(t: Any, name: str = "") -> "TensorDesc":
 
     shape = tuple(t.get_dim())
     stride = tuple(t.get_stride())
-    dtype = _DTYPE_FROM_CUDNN[t.get_data_type()]
+    dtype = to_torch_dtype(t.get_data_type())
     return TensorDesc(
         dtype=dtype,
         shape=shape,
         stride=stride,
         stride_order=_stride_order(shape, stride),
-        device=torch.device("cuda", torch.cuda.current_device()),
+        device=_torch_cuda_device(),
         name=name,
     )

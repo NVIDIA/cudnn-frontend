@@ -148,6 +148,7 @@ class pygraph:
         self._reserved_uids: set = set()  # user-specified uids _alloc_uid must skip
         self._ambiguous_names: set = set()  # duplicate labels: excluded from the name index
         self._candidates: Optional[List["BaseEngine"]] = None  # manifest matches + registered
+        self._facts: Dict[Any, Any] = {}  # analyzer callable -> its record; see _facts_for()
         self._backend_declined: Optional[Exception] = None  # why the backend has no entries
         self._backend_entries: Optional[List[Any]] = None  # backend_plan_entries(), once
         self._barred_names: set = set()  # deselect_engines()
@@ -182,18 +183,12 @@ class pygraph:
         if not isinstance(eid, int):
             raise ValueError(f"engine {engine!r} must declare a stable integer engine_id (got {eid!r})")
         lo, hi = engine.owned_id_range
-        for row in MANIFEST:  # blocks are intervals, so disjointness is decidable
-            if lo < row.id_end and row.engine_id < hi:
-                # Registering the in-tree engine that OWNS the block is normal
-                # (a test or a caller pinning one specific engine); it is the
-                # same implementation the manifest would have instantiated.
-                # Anything else claiming that range would receive its plans.
-                if type(engine).__module__ == row.module and row.engine_id <= lo and hi <= row.id_end:
-                    break
+        for family in MANIFEST:  # blocks are intervals, so disjointness is decidable
+            if lo < family.id_end and family.engine_id < hi:
                 raise ValueError(
                     f"engine {engine.name!r} ({type(engine).__module__}) claims ids [{lo}, {hi}), which overlaps the "
-                    f"block [{row.engine_id}, {row.id_end}) the in-tree manifest reserves for {row.name!r} "
-                    f"({row.module}); an engine from outside the library uses ids >= {OUT_OF_TREE_ID_BASE}"
+                    f"block [{family.engine_id}, {family.id_end}) the in-tree manifest reserves for {family.name!r} "
+                    f"({family.module}); an engine from outside the library uses ids >= {OUT_OF_TREE_ID_BASE}"
                 )
         else:
             if lo < OUT_OF_TREE_ID_BASE:
@@ -919,6 +914,19 @@ class pygraph:
                 "create_execution_plans() was already called on this graph; planning is one-shot — build a new graph to re-plan, or use select_plan() to switch plans"
             )
         self._backend_heuristics = heuristics  # read by backend_plan_entries()
+
+        # Finalize -> freeze -> analyze, in that order, BEFORE any ranking runs.
+        # build_operation_graph() is where the backend's own layout inference
+        # lands (a no-op for a graph that was never lowered), and it writes
+        # through object.__setattr__ precisely to bypass the freeze — so the
+        # snapshot has to come after it, not merely after validate(). Doing it
+        # here rather than inside Router keeps the epoch boundary out of
+        # overridable policy: every engine probe and the ranking then read one
+        # set of facts describing a graph that can no longer change.
+        self._finalize_backend_layout()
+        self._freeze()
+        self._attach_facts()
+
         router = self._router or default_router
         plans = list(router.plan(self, self._candidate_engines()))
         # Validate the FINAL router output: every entry must name an engine this
@@ -936,28 +944,85 @@ class pygraph:
             raise cudnn_graph_not_supported(f"no engine — python or backend — proposed a plan for this graph{why}")
         self._plans = plans
         self._planning_done = True
-        self._freeze()  # plans reference the graph as-is: no mutation from here
         self._plan_index = 0
 
     def _candidate_engines(self) -> List["BaseEngine"]:
         """The python engines this graph may dispatch to: anything
-        ``register_backend()`` added, then the in-tree manifest rows whose
+        ``register_backend()`` added, then the in-tree manifest families whose
         coarse key matches. Registered engines lead because bringing your own
         engine is an explicit act; the library's own table is the default.
         (Candidate ORDER is not rank — ``heuristics_sort`` ranks.) Cached: the
         graph is frozen at planning time anyway."""
         if self._candidates is None:
             from .engines import manifest
-            from .frost.buffers import current_sm
 
             # Registering an in-tree engine pins THAT instance: the manifest
             # must not also offer its own copy, or the id has two owners.
             claimed = [e.owned_id_range for e in self._backends]
-            from_manifest = [
-                e for e in manifest.engines_for(self, current_sm()) if not any(lo < e.owned_id_range[1] and e.owned_id_range[0] < hi for lo, hi in claimed)
-            ]
+            from_manifest = [e for e in manifest.engines_for(self) if not any(lo < e.owned_id_range[1] and e.owned_id_range[0] < hi for lo, hi in claimed)]
             self._candidates = list(self._backends) + from_manifest
         return self._candidates
+
+    def _finalize_backend_layout(self) -> None:
+        """Let the backend's layout inference land before the graph is frozen.
+
+        Lowering and reflecting strides back is how the GRAPH learns what it
+        will execute with, so it runs the same way whether or not an
+        out-of-tree engine was registered -- splitting those paths is what left
+        the snapshot unenforceable, since _sync_ir_shapes_from_backend writes
+        through object.__setattr__ to bypass the freeze.
+
+        A failure here is the backend DECLINING (a python engine may still
+        serve the graph), recorded as backend_plan_entries() records one. Not
+        routed through that, which also runs the ~178 ms C++ plan query a
+        Router may never ask for.
+        """
+        import cudnn
+
+        if not self._backend_lowerable():  # no backend lowering for this op at all
+            return
+        try:
+            self._lower_backend_graph()
+        except (cudnn.cudnnGraphNotSupportedError, RuntimeError, ImportError, AttributeError) as exc:
+            _LOG.warning("backend could not build this graph, treating as a decline: %s", exc)
+            self._backend_declined = exc
+            self._lowered_graph = None
+            self._cpp_tensors.clear()
+            self._cpp_bog_done = False
+            self._cpp_plans_created = False
+            self._backend_entries = []
+
+    def _attach_facts(self) -> None:
+        """Describe this frozen graph in its family's vocabulary.
+
+        Part of planning, not a call anyone makes. Runs AFTER _freeze(): a
+        snapshot of a graph that can still change means chasing every mutation
+        point, and missing one leaves facts describing a graph that is gone.
+        A graph no family claims carries no payload.
+        """
+        from .engines import manifest
+
+        family = manifest.family_for(self)
+        if family is not None and family.offered_ids():
+            analyzer = manifest.resolve_analyzer(family)
+            if analyzer is not None:
+                self._facts_for(analyzer)
+
+    def _facts_for(self, analyzer):
+        """The record ``analyzer`` produced for this graph, computing it once.
+
+        Keyed by the analyzer itself so the ranking and the engine reach ONE
+        record with no name to keep in sync -- two extractions of a graph is
+        how a feature vector drifts from what the kernel does.
+        """
+        if not self._frozen:
+            # Still mutable (a direct engine probe before planning): answer, but
+            # do not remember. Memoizing a graph that can still change is what
+            # made facts go stale across two validate() calls.
+            return analyzer(self)
+        if analyzer not in self._facts:
+            self._facts[analyzer] = analyzer(self)
+        return self._facts[analyzer]
 
     def _unlowerable_node(self) -> Optional[Node]:
         """The first node with no C++ lowering, or None when the whole graph has one.
