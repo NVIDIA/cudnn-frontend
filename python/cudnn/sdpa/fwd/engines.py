@@ -495,6 +495,49 @@ def _sm120_spec() -> EngineSpec:
     )
 
 
+def _sm120_fp8_spec() -> EngineSpec:
+    """SM120 per-tensor FP8 engine (E4M3 in + scalar descales, FP16 out).
+
+    Same mma.sync architecture as the f16 SM120 cell with the MMA lowered to
+    m16n8k32 e4m3; ``descale_q*descale_k`` folds into the softmax scale and
+    ``descale_v*scale_o`` into an epilogue scalar, so the kernel adds only the
+    Amax_S/Amax_O atomics over the f16 sibling. E4M3 only (no E5M2 tag in the
+    kernel yet), FP16 O only, exact d128 (no zero-padding envelope on the
+    8-bit fragment path), no sink (Amax_S semantics with a sink column are
+    undefined here), and THD deferred like the SM100 fp8 v1.
+    """
+
+    return EngineSpec(
+        name="sdpa_fwd_prefill_sm120_fp8",
+        capabilities=Capabilities(
+            sm_lo=_BLACKWELL_GEFORCE[0],
+            sm_hi=_BLACKWELL_GEFORCE[1],
+            phase="prefill",
+            d_qk=frozenset({128}),
+            d_v=frozenset({128}),
+            dtypes=frozenset({cudnn.data_type.FP8_E4M3}),
+            is_fp8=True,
+            causal=True,
+            bottom_right=True,
+            bottom_right_with_swa=True,
+            bottom_right_padded_seq_q=True,
+            swa=True,
+            padded=True,
+            stats=True,
+            lse_optional=True,
+            # Same caveat as the SM100 fp8 row: no SEQ_Q_LENS epilogue trim,
+            # but fp8 graphs cannot carry seq_len_q here (lower_dsl_prefill
+            # forces seq_q_lens_present=False for the fp8 family).
+            padded_stats=True,
+            sched_policies=frozenset({SCHED_NATURAL}),
+            tile_ms=frozenset({64, 128}),
+            tile_ns=frozenset({64, 128}),
+            cgas=frozenset({1}),
+        ),
+        lower=partial(lower_dsl_prefill, api_type=_SM120),
+    )
+
+
 def analyze_for(spec: EngineSpec, graph, knobs: Optional[SdpaFwdKnobs] = None):
     """``(facts, reason)``: the parsed graph and the first reason ``spec``
     cannot serve it under ``knobs`` (``None`` when it can).
@@ -767,6 +810,7 @@ ENGINE_SPECS = (
     _sm100_mxfp8_spec(128),
     _sm100_fp8_spec(128),
     _sm120_spec(),
+    _sm120_fp8_spec(),
 )
 
 __all__ = ["Capabilities", "EngineSpec", "ENGINE_SPECS", "SdpaFwdKnobs", "analyze_for", "build", "engine_name", "mismatch", "probe"]

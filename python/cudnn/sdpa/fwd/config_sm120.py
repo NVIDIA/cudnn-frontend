@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_FP16
+from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3, DTYPE_FP16  # noqa: F401  (DTYPE_E4M3 re-exported for the FP8 template)
 
 SEQ_Q_TILES = (128, 64)
 SEQ_KV_TILES = (128, 64)
@@ -36,16 +36,17 @@ class TemplateParams:
     kv_tile: int = SEQ_KV_TILES[0]
 
 
-def validate_params(params: TemplateParams) -> None:
+def validate_params(params: TemplateParams, allowed_dtypes: tuple[int, ...] = (DTYPE_BF16, DTYPE_FP16)) -> None:
     """Validate the SM120 template specialization.
 
     Reachable failures should already have been rejected by the engine
     capabilities or adapter support checks; this validation is a backstop for
-    direct template use.
+    direct template use. ``allowed_dtypes`` defaults to the FP16/BF16 template's
+    set; the FP8 template passes its own.
     """
 
-    if params.dtype_qkv not in (DTYPE_BF16, DTYPE_FP16):
-        raise ValueError(f"SM120 SDPA: dtype_qkv must be DTYPE_BF16 ({DTYPE_BF16}) or DTYPE_FP16 ({DTYPE_FP16}); got {params.dtype_qkv}")
+    if params.dtype_qkv not in allowed_dtypes:
+        raise ValueError(f"SM120 SDPA: dtype_qkv must be one of {allowed_dtypes}; got {params.dtype_qkv}")
     if params.causal_bottom_right and not params.is_causal:
         raise ValueError("SM120 SDPA: causal_bottom_right requires is_causal=True")
     if params.window_size_left is not None and params.window_size_left < 0:
