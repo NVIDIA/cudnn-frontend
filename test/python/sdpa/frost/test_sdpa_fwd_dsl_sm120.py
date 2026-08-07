@@ -462,7 +462,7 @@ def _run_thd_case(
         packed_stats = stats_storage[: cu[-1] * h_q].view(max(cu[-1], 1), h_q)  # (T, H)
     else:
         packed_stats = None
-    for i, (nq, nkv) in enumerate(zip(seq_q_lens, seq_kv_lens)):
+    for i, (nq, _nkv) in enumerate(zip(seq_q_lens, seq_kv_lens)):
         if nq == 0:
             continue
         got = packed_o[cu[i] : cu[i + 1]].permute(1, 0, 2).unsqueeze(0).float()
