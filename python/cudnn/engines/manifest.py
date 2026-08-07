@@ -13,7 +13,7 @@ exists.
 
 Dispatch is two stages:
 
-1. CLASSIFY (this file, microseconds). ``_FAMILY_OF_NODE`` maps a node type to
+1. CLASSIFY (this file, microseconds). ``_ANCHOR_NODE_TO_FAMILY`` maps a node type to
    the one family that serves that kind of graph, so a graph has 0 or 1
    families and engines across families never compete. Arch range and per-engine
    maturity then say which of that family's engines are on offer.
@@ -120,11 +120,17 @@ class EngineFamily:
 
 
 # --- classification: which FAMILY does a graph belong to ---------------------
-# A partition, not N competing claims: one node type names exactly one family,
-# so "two families claimed this graph" is not a case that can arise and is not
-# an invariant anyone has to test. Names, not enum members, so this file still
-# imports no engine code.
-_FAMILY_OF_NODE = {
+# ANCHOR nodes only: these are the node types that NAME a family, not a list of
+# what a family can serve. Everything else -- POINTWISE, REDUCTION, a block-scale
+# quantize, a node type added tomorrow -- is absent on purpose and ignored when
+# classifying, so `matmul + pointwise` is a gemm graph. Whether the family can
+# serve the whole graph is its analyzer's judgment; a coarser copy of that
+# judgment here is what closed_under was, and it lied about RESHAPE.
+#
+# One anchor names exactly one family, and family_for() is a function, so "two
+# families claimed this graph" is not a case that can arise. Names, not enum
+# members, so this file still imports no engine code.
+_ANCHOR_NODE_TO_FAMILY = {
     "MATMUL": "frost_gemm",
     "MATMUL_FP8": "frost_gemm",
     "MOE_GROUPED_MATMUL": "frost_gemm",
@@ -220,23 +226,31 @@ def graph_node_types(graph) -> frozenset:
     return frozenset(node.node_type.name for node in graph.nodes)
 
 
-def family_for(graph, sm: Optional[int]) -> Optional[EngineFamily]:
+def family_for(graph) -> Optional[EngineFamily]:
     """The one family this graph belongs to, or None.
 
-    Classification is a lookup, so "which family" has exactly one answer by
-    construction. A graph whose node types name two different families (a matmul
-    and an sdpa in one graph) belongs to neither: no in-tree family serves that
-    shape, and the backend is the only candidate.
+    A PURE property of the graph. No ``sm``, no environment: what kind of graph
+    this is cannot depend on which machine is asking or on which engines happen
+    to be built. Whether that family has an engine to offer here is a separate
+    question — ``EngineFamily.offered_ids(sm)`` — and conflating the two made
+    "not that kind of graph" indistinguishable from "no engine for it here".
 
-    Returns None equally when the family exists but has no engine on offer here
-    (all gated, wrong arch) — the caller's next move is the same either way.
+    Classification is single-valued by construction: this is a function, so
+    "two families claimed this graph" is not a case that can arise. A graph
+    whose node types name two different families (a matmul and an sdpa in one
+    graph) belongs to neither, and the backend is the only candidate.
+
+    Note what this does NOT decide: a node type absent from the table is
+    ignored, so ``matmul -> reshape`` still classifies as gemm. Whether a family
+    can serve the WHOLE graph is its analyzer's judgment, deliberately — a
+    coarser copy of that judgment here is what ``closed_under`` was, and it
+    lied about RESHAPE.
     """
-    named = {_FAMILY_OF_NODE[n] for n in graph_node_types(graph) if n in _FAMILY_OF_NODE}
+    named = {_ANCHOR_NODE_TO_FAMILY[n] for n in graph_node_types(graph) if n in _ANCHOR_NODE_TO_FAMILY}
     if len(named) != 1:
         return None
     name = named.pop()  # once: a generator would re-pop on every iteration
-    family = next(f for f in MANIFEST if f.name == name)
-    return family if family.offered_ids(sm) else None
+    return next(f for f in MANIFEST if f.name == name)
 
 
 def resolve_analyzer(family: EngineFamily):
@@ -303,5 +317,8 @@ def instantiate(family: EngineFamily, ids: Dict[str, int]):
 
 def engines_for(graph, sm: Optional[int]):
     """Every in-tree engine of the graph's family, in candidate order."""
-    family = family_for(graph, sm)
-    return list(instantiate(family, family.offered_ids(sm))) if family is not None else []
+    family = family_for(graph)
+    if family is None:
+        return []
+    ids = family.offered_ids(sm)  # availability is a separate question from kind
+    return list(instantiate(family, ids)) if ids else []

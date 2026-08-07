@@ -801,10 +801,10 @@ def test_classification_is_a_partition():
     """Every node type names exactly ONE family, so "two families claimed this
     graph" is not a case that can arise — it is a lookup, not N competing
     claims that have to be proven disjoint."""
-    from cudnn.engines.manifest import MANIFEST, _FAMILY_OF_NODE
+    from cudnn.engines.manifest import MANIFEST, _ANCHOR_NODE_TO_FAMILY
 
     known = {f.name for f in MANIFEST}
-    for node_type, family in _FAMILY_OF_NODE.items():
+    for node_type, family in _ANCHOR_NODE_TO_FAMILY.items():
         assert family in known, f"{node_type} names {family!r}, which is not a family"
 
 
@@ -820,10 +820,32 @@ def test_a_graph_spanning_two_families_belongs_to_neither(monkeypatch):
         def __init__(self, names):
             self.nodes = [type("N", (), {"node_type": type("T", (), {"name": n})})() for n in names]
 
-    assert manifest.family_for(Fake(["MATMUL"]), 100).name == "frost_gemm"
-    assert manifest.family_for(Fake(["MATMUL", "POINTWISE"]), 100).name == "frost_gemm"
-    assert manifest.family_for(Fake(["MATMUL", "SDPA"]), 100) is None
-    assert manifest.family_for(Fake(["POINTWISE"]), 100) is None
+    assert manifest.family_for(Fake(["MATMUL"])).name == "frost_gemm"
+    assert manifest.family_for(Fake(["MATMUL", "POINTWISE"])).name == "frost_gemm"
+    assert manifest.family_for(Fake(["MATMUL", "SDPA"])) is None
+    assert manifest.family_for(Fake(["POINTWISE"])) is None
+
+
+def test_classification_does_not_depend_on_the_machine(monkeypatch):
+    """What kind of graph this is cannot depend on which machine is asking.
+
+    Availability — arch range, maturity gate — is a separate question
+    (offered_ids). Conflating them made "not that kind of graph"
+    indistinguishable from "no engine for it here"."""
+    from cudnn.engines import manifest
+
+    class Fake:
+        nodes = [type("N", (), {"node_type": type("T", (), {"name": "MATMUL"})})()]
+
+    monkeypatch.delenv(manifest._ENABLE_ENV, raising=False)
+    gated = manifest.family_for(Fake())
+    monkeypatch.setenv(manifest._ENABLE_ENV, "1")
+    assert manifest.family_for(Fake()) is gated, "the opt-in flag must not change the classification"
+
+    family = _family("frost_gemm")
+    assert family.offered_ids(family.sm_lo), "offered here"
+    assert family.offered_ids(family.sm_hi + 1) == {}, "not offered on another arch"
+    assert manifest.family_for(Fake()) is family, "...but it is still a gemm graph"
 
 
 def test_family_id_blocks_are_disjoint():
@@ -910,7 +932,7 @@ def test_planning_attaches_facts_without_anyone_asking(monkeypatch):
         _OOT + 900, "probe_family", __name__, "unused_factory", slots={"probe": manifest.EngineSlot(0)}, analyzer=(__name__, "_probe_analyzer")
     )
     monkeypatch.setattr(manifest, "MANIFEST", (family,))
-    monkeypatch.setattr(manifest, "_FAMILY_OF_NODE", {"MATMUL": "probe_family"})
+    monkeypatch.setattr(manifest, "_ANCHOR_NODE_TO_FAMILY", {"MATMUL": "probe_family"})
 
     g = pygraph(backends=[TorchMatmulEngine()])
     g.matmul(torch.randn(2, 3), torch.randn(3, 2))
@@ -955,7 +977,7 @@ def test_ranking_and_engine_read_the_same_record(monkeypatch):
         _OOT + 900, "probe_family", __name__, "unused_factory", slots={"probe": manifest.EngineSlot(0)}, analyzer=(__name__, "_probe_analyzer")
     )
     monkeypatch.setattr(manifest, "MANIFEST", (family,))
-    monkeypatch.setattr(manifest, "_FAMILY_OF_NODE", {"MATMUL": "probe_family"})
+    monkeypatch.setattr(manifest, "_ANCHOR_NODE_TO_FAMILY", {"MATMUL": "probe_family"})
 
     g = pygraph(router=Recording(), backends=[Reader()])
     g.matmul(torch.randn(2, 3), torch.randn(3, 2))

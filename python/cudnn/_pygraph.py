@@ -1021,8 +1021,8 @@ class pygraph:
         from .engines import manifest
         from .frost.buffers import current_sm
 
-        family = manifest.family_for(self, current_sm())
-        if family is not None:
+        family = manifest.family_for(self)
+        if family is not None and family.offered_ids(current_sm()):
             analyzer = manifest.resolve_analyzer(family)
             if analyzer is not None:
                 self._facts_for(analyzer)
