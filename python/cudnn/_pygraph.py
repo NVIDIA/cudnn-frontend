@@ -148,7 +148,7 @@ class pygraph:
         self._reserved_uids: set = set()  # user-specified uids _alloc_uid must skip
         self._ambiguous_names: set = set()  # duplicate labels: excluded from the name index
         self._candidates: Optional[List["BaseEngine"]] = None  # manifest matches + registered
-        self._facts: Dict[str, Any] = {}  # analyzer key -> (node count, facts); see facts()
+        self._facts: Dict[Any, Any] = {}  # analyzer callable -> its record; see _facts_for()
         self._backend_declined: Optional[Exception] = None  # why the backend has no entries
         self._backend_entries: Optional[List[Any]] = None  # backend_plan_entries(), once
         self._barred_names: set = set()  # deselect_engines()
@@ -1050,10 +1050,9 @@ class pygraph:
             # do not remember. Memoizing a graph that can still change is what
             # made facts go stale across two validate() calls.
             return analyzer(self)
-        key = f"{analyzer.__module__}.{analyzer.__qualname__}"
-        if key not in self._facts:
-            self._facts[key] = analyzer(self)
-        return self._facts[key]
+        if analyzer not in self._facts:
+            self._facts[analyzer] = analyzer(self)
+        return self._facts[analyzer]
 
     def _unlowerable_node(self) -> Optional[Node]:
         """The first node with no C++ lowering, or None when the whole graph has one.

@@ -34,4 +34,6 @@ def __getattr__(name: str) -> Any:
 
 
 def __dir__():
-    return sorted(__all__)
+    # Union, not just __all__: returning only the lazy names hid every normal
+    # module attribute, __name__ included.
+    return sorted(set(globals()) | set(__all__))

@@ -23,7 +23,6 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 import cudnn
-import torch
 
 _LOG = logging.getLogger(__name__)
 
@@ -43,6 +42,13 @@ _TORCH_FROM_CUDNN = {
 _KNOWN_DTYPES = frozenset(_TORCH_FROM_CUDNN)
 
 
+def _torch_cuda_device():
+    """The lowering boundary's torch device — imported here, not at module level."""
+    import torch
+
+    return torch.device("cuda", torch.cuda.current_device())
+
+
 def to_torch_dtype(dt):
     """cudnn.data_type -> torch.dtype, for the lowering boundary only."""
     import torch
@@ -54,18 +60,51 @@ def to_torch_dtype(dt):
 _REQ_STRIDE_ORDER = (3, 1, 2, 0)
 
 
+def _device_props():
+    """The current device as cuDNN describes it, or None without a device.
+
+    cudnn.create_device_properties() is the backend's OWN device descriptor —
+    the same object the C++ deviceless-AoT path serializes and replays. Reading
+    it here instead of torch.cuda keeps the facts path framework-neutral, and
+    is the step that makes a deviceless python engine possible at all: facts
+    computed from a serialized descriptor need no live device.
+
+    Cached per device id: the descriptor costs a backend call and the device
+    does not change under a process.
+    """
+    import json
+
+    from cudnn.frost.buffers import current_device_id
+
+    dev = current_device_id()
+    if dev is None:
+        return None
+    cached = _DEVICE_PROPS_CACHE.get(dev)
+    if cached is None:
+        try:
+            cached = json.loads(cudnn.create_device_properties(dev).serialize())
+        except Exception:  # noqa: BLE001 — no device / older backend: facts stay device-less
+            cached = {}
+        _DEVICE_PROPS_CACHE[dev] = cached
+    return cached or None
+
+
+_DEVICE_PROPS_CACHE: dict = {}
+
+
 def _device_cc() -> Optional[tuple]:
     """Compute capability of the current CUDA device, or None without CUDA."""
-    if not torch.cuda.is_available():
+    props = _device_props()
+    if not props or "deviceVer" not in props:
         return None
-    return torch.cuda.get_device_capability(torch.cuda.current_device())
+    ver = int(props["deviceVer"])  # 1000 == SM 10.0
+    return (ver // 100, (ver % 100) // 10)
 
 
 def _device_sm_count() -> Optional[int]:
     """SM count of the current CUDA device, or None without CUDA."""
-    if not torch.cuda.is_available():
-        return None
-    return torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    props = _device_props()
+    return int(props["multiProcessorCount"]) if props and "multiProcessorCount" in props else None
 
 
 def _stride_order(dim: tuple, stride: tuple) -> tuple:
@@ -699,6 +738,6 @@ def tensor_desc_from_ir(t: Any, name: str = "") -> "TensorDesc":
         shape=shape,
         stride=stride,
         stride_order=_stride_order(shape, stride),
-        device=torch.device("cuda", torch.cuda.current_device()),
+        device=_torch_cuda_device(),
         name=name,
     )

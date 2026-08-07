@@ -85,9 +85,9 @@ Reading that sequence line by line:
   ranking gave it. `graph.selected_engine` is the `BaseEngine` object behind
   the selected entry, or `None` when a backend plan is selected.
 - **`select_plan(i)` is optional and strict.** Without it, the walk starts at
-  index 0; today's placeholder heuristics rank the backend's plans first, so
-  the default selection is the backend, exactly as before this mechanism
-  existed. With it, `build_plans()` starts at `i` and a decline there raises
+  index 0; today's placeholder heuristics rank the claiming PYTHON engines
+  first, so a graph a python engine claims goes to it by default and the
+  backend's entries follow as the fallback. With it, `build_plans()` starts at `i` and a decline there raises
   instead of quietly running something else.
 - **`build_plans()` walks the list.** It tries the selected entry, and on a
   decline (`NotImplementedError` / `cudnn.cudnnGraphNotSupportedError`, logged
@@ -552,14 +552,14 @@ The engine-to-kernel mapping is many-to-many by design:
 
 ```python
 def heuristics_sort(graph, python_plans, backend_plans) -> List[PlanConfig]:
-    return backend_plans + python_plans
+    return python_plans + backend_plans
 ```
 
-That placeholder is deliberate and honest: backend-first means the dispatch
-mechanism lands without changing which engine serves any graph, because no
-cost model exists yet that can compare a CuTe tile config against a cuDNN
-engine. Nothing else in the stack encodes preference -- `manifest.py` is a
-filter, `Router` collects, `build_plans()` walks. Replacing the body of this
+That placeholder is deliberate and honest: no cost model exists yet that can
+compare a CuTe tile config against a cuDNN engine, so the order is a policy
+(a claiming python engine wins) rather than a prediction. Nothing else in the
+stack encodes preference -- `manifest.py` classifies and admits, `Router`
+collects, `build_plans()` walks. Replacing the body of this
 one function is the whole change.
 
 Real heuristics (the analogue of the C++ per-op heur files such as

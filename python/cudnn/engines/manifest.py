@@ -128,14 +128,6 @@ _FAMILY_OF_NODE = {
     "GDN2_BWD": "gdn2",
 }
 
-# Node types that are not an op family of their own -- they attach to whatever
-# family the graph's anchor node named. Listing them here is only a cheap way to
-# skip an import the family would decline anyway; the engine's check_support()
-# is what actually decides, so a type missing from this set costs one wasted
-# import, never a wrong answer.
-_ATTACHABLE = frozenset({"POINTWISE", "REDUCTION", "BLOCK_SCALE_QUANTIZE", "BLOCK_SCALE_DEQUANTIZE"})
-
-
 # ---------------------------------------------------------------------------
 # The manifest, one entry per family. Ids are pre-release (engine_ids.py), so
 # blocks may still be re-cut; once shipped, a slot is fixed forever because an

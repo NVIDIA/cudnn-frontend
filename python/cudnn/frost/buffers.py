@@ -274,6 +274,34 @@ def memset_zero_async(ptr: int, nbytes: int, stream) -> None:
         raise RuntimeError(f"cudaMemsetAsync failed: {err}")
 
 
+def current_device_id():
+    """Active CUDA device id, or None when there is no device.
+
+    Same two-probe shape as current_sm() below: a missing ``cuda-python`` must
+    not look like a missing GPU.
+    """
+    try:
+        from cuda.bindings import runtime as _rt
+
+        err, dev = _rt.cudaGetDevice()
+        if int(err) == 0:
+            return int(dev)
+    except Exception:  # noqa: BLE001 — fall through to the driver
+        pass
+    try:
+        import ctypes
+
+        lib = ctypes.CDLL("libcuda.so.1")
+        if lib.cuInit(0) != 0:
+            return None
+        dev = ctypes.c_int()
+        if lib.cuCtxGetDevice(ctypes.byref(dev)) == 0 or lib.cuDeviceGet(ctypes.byref(dev), 0) == 0:
+            return int(dev.value)
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
 def _sm_via_cuda_bindings():
     from cuda.bindings import runtime as _rt
 
