@@ -23,9 +23,21 @@ def _is_sm80() -> bool:
     return (major, minor) == (8, 0)
 
 
+def _dsl_available() -> bool:
+    # The kernels need the CuTe DSL *with* cutlass.experimental (cutlass-dsl
+    # >= 4.7). The package imports lazily (PEP 562), so a missing/old DSL
+    # only surfaces at kernel-load time — probe it here so the suite SKIPS
+    # instead of erroring mid-test.
+    try:
+        import cutlass.experimental  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
 pytestmark = pytest.mark.skipif(
-    not _is_sm80(),
-    reason="SM80 SDPA API requires an SM80 (A100) device.",
+    not (_is_sm80() and _dsl_available()),
+    reason="SM80 SDPA API requires an SM80 (A100) device and nvidia-cutlass-dsl >= 4.7.",
 )
 
 
