@@ -661,14 +661,14 @@ def lower_dsl_prefill(
         # Scratch comes from the CALLER's workspace (never allocated here): the
         # CompiledPlan sized/validated it against workspace_bytes; the carver
         # re-validates so a direct call cannot silently corrupt memory.
+        import torch  # execute path: a real tensor is about to be carved
+
         carver = WorkspaceCarver(workspace, total_workspace_bytes, spec.name) if total_workspace_bytes else None
         lse_buf = resolved.get(id(binding.stats)) if binding.stats is not None else None
         if lse_buf is None and spec.capabilities.stats and not spec.capabilities.lse_optional and not facts.thd:
             # Dummy LSE for stats-less dense graphs — carved, not allocated
             # (uninitialized is fine: the kernel writes every row). lse_optional
             # adapters take lse_tensor=None instead.
-            import torch
-
             lse_buf = carver.take(facts.b * facts.h_q * facts.s_q, torch.float32)
         sinks_buf = resolved.get(id(binding.sink_token)) if binding.sink_token is not None else None
         seq_kv_buf = resolved.get(id(binding.seq_len_kv)) if binding.seq_len_kv is not None else None
