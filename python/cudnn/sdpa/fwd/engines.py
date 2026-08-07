@@ -35,6 +35,7 @@ import cudnn
 from cudnn.frost.tile_dsl.constants import SCHED_NATURAL
 from cudnn.frost.buffers import CUTEDSL_MIN_VERSION, cutedsl_state, cutedsl_too_old
 from cudnn.sdpa import graph_analyzer as ga
+from cudnn.sdpa.fwd.config_sm120 import fp8_tile_choice
 
 # The DSL adapters (api_dsl) and cuda.bindings are LOWERING dependencies, not
 # support-check ones: importing them here would drag the CuTe DSL (~1.0 s, 357
@@ -346,6 +347,9 @@ class EngineSpec:
     # kernels (e.g. decode vs prefill by S_q) or chain several launches under
     # one name.
     lower: "Callable[[EngineSpec, ga.SdpaGraphFacts, Optional[SdpaFwdKnobs]], Any]"
+    # Orders this cell's knob domain for propose_plans. None keeps the
+    # domain's natural order; a cell with measurements supplies its own.
+    knob_order: "Optional[Callable[[ga.SdpaGraphFacts, list], list]]" = None
 
 
 def _sm100_spec(d: int, d_v: Optional[int] = None) -> EngineSpec:
@@ -495,6 +499,18 @@ def _sm120_spec() -> EngineSpec:
     )
 
 
+def _sm120_fp8_knob_order(facts, named):
+    """Order the fp8 cell's tile domain: the shape's own choice first.
+
+    ``heuristics_sort`` concatenates rather than ranks today, so whatever this
+    puts first is what runs. Same rule as the adapter's delegation path
+    (:func:`config_sm120.fp8_tile_choice`) -- named here so pinning entry 1
+    reproduces entry 0.
+    """
+    want = fp8_tile_choice(facts.s_q, facts.h_q, facts.b, facts.device_sm_count or 0, facts.causal)
+    return sorted(named, key=lambda k: ((k.tile_m, k.tile_n) != want, k.tile_n != 64, -(k.tile_m or 0)))
+
+
 def _sm120_fp8_spec() -> EngineSpec:
     """SM120 per-tensor FP8 engine (E4M3 in + scalar descales, FP16 out).
 
@@ -535,7 +551,38 @@ def _sm120_fp8_spec() -> EngineSpec:
             cgas=frozenset({1}),
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM120),
+        knob_order=_sm120_fp8_knob_order,
     )
+
+
+def knob_candidates(spec: EngineSpec, graph) -> List[Optional[SdpaFwdKnobs]]:
+    """``None`` (delegate to the adapter) followed by every admissible point of
+    this engine's declared knob domain, best first.
+
+    The domain is read off the capability row -- there is no second table to
+    drift from it -- so a cell declaring one value per axis proposes exactly
+    one named entry. Feasibility that depends on device resources (shared
+    memory) stays in the adapter: a point that survives ``mismatch`` may still
+    decline at build, and the walk moves on.
+    """
+    caps = spec.capabilities
+    try:
+        facts, reason = analyze_for(spec, graph, None)
+    except ValueError:
+        return [None]
+    if reason is not None:
+        return [None]
+    named = [
+        SdpaFwdKnobs(sched_policy=s, tile_m=m, tile_n=n, cga=c)
+        for s in sorted(caps.sched_policies)
+        for m in sorted(caps.tile_ms)
+        for n in sorted(caps.tile_ns)
+        for c in sorted(caps.cgas)
+    ]
+    named = [k for k in named if mismatch(caps, facts, k) is None]
+    if spec.knob_order is not None:
+        named = spec.knob_order(facts, named)
+    return [None] + named
 
 
 def analyze_for(spec: EngineSpec, graph, knobs: Optional[SdpaFwdKnobs] = None):
@@ -813,4 +860,4 @@ ENGINE_SPECS = (
     _sm120_fp8_spec(),
 )
 
-__all__ = ["Capabilities", "EngineSpec", "ENGINE_SPECS", "SdpaFwdKnobs", "analyze_for", "build", "engine_name", "mismatch", "probe"]
+__all__ = ["Capabilities", "EngineSpec", "ENGINE_SPECS", "SdpaFwdKnobs", "analyze_for", "build", "engine_name", "knob_candidates", "mismatch", "probe"]

@@ -34,6 +34,7 @@ from cudnn.sdpa.fwd.config_sm100 import TemplateParams as Sm100TemplateParams
 from cudnn.sdpa.fwd.config_sm120 import (
     SEQ_KV_TILES as _SM120_KV_TILES,
     SEQ_Q_TILES as _SM120_Q_TILES,
+    fp8_tile_choice as _sm120_fp8_tile_choice,
     SUPPORTED_HEAD_TILES as _SM120_SUPPORTED_HEAD_TILES,
     TemplateParams as Sm120TemplateParams,
 )
@@ -1648,7 +1649,15 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                 base += (self.q_tile // 16) * 16 * kv_tile
             return base + 16
 
-        if self.tile_n is None:
+        chose_by_shape = False
+        if self._fp8 and self.tile_m is None and self.tile_n is None:
+            # No knob request: the fp8 cell picks by shape and machine width
+            # rather than by what fits (see fp8_tile_choice). Both tiles come
+            # from one decision, so a half-specified request opts out entirely.
+            sms = torch.cuda.get_device_properties(self.q_desc.device).multi_processor_count
+            self.q_tile, self.kv_tile = _sm120_fp8_tile_choice(int(s_q), int(h_q), int(b), int(sms), bool(self.is_causal))
+            chose_by_shape = _smem_bytes(self.kv_tile) <= smem_capacity_bytes
+        if self.tile_n is None and not chose_by_shape:
             # Pick the largest KV tile that fits this device.
             self.kv_tile = next((t for t in _SM120_KV_TILES if _smem_bytes(t) <= smem_capacity_bytes), self.kv_tile)
         self._not_implemented_error_if(

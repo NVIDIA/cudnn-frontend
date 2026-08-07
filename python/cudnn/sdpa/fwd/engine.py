@@ -104,12 +104,15 @@ class FrostSdpaFwdEngine(BaseEngine):
             raise NotImplementedError(f"{self.name}: {reason}")
 
     def propose_plans(self, graph: "pygraph") -> List[PlanConfig]:
-        # One plan, no knobs: nothing proposes a tuning request today, so the
-        # engines run at their capability row's default tile/schedule. A knob
-        # search (SdpaFwdKnobs over Capabilities.tile_ms/tile_ns/cgas) becomes
-        # several entries here; each one's knobs reach build_plan verbatim.
+        # Entry 0 delegates (knobs=None -> the adapter's own shape-driven
+        # choice); the rest name one point of the capability row's knob domain
+        # each. Not duplicates: a delegation may pick differently as the
+        # library learns, a named knob set must be honored verbatim or the
+        # engine declines.
+        from .engines import knob_candidates
+
         self.check_support(graph)
-        return [PlanConfig(self.engine_id, self.default_knobs)]
+        return [PlanConfig(self.engine_id, k) for k in knob_candidates(self._spec, graph)]
 
     def build_plan(self, graph: "pygraph", plan: PlanConfig, ctx: ExecutionContext = None) -> CompiledPlan:
         from .engines import build
