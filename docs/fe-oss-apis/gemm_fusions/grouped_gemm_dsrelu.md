@@ -272,6 +272,10 @@ op.execute(
   - Only `"n"` (n-major layout) is supported
 - `discrete_col_sfd: bool`
   - Enables the discrete column-scale-factor path used by grouped FP8
+- `deterministic: bool | None`
+  - Makes `dprob` bit-exact run to run — see [Deterministic dprob](#deterministic-dprob)
+  - Wrapper: `None` (default) reads `CUDNN_FE_GROUPED_GEMM_DSRELU_DETERMINISTIC`, off unless set
+  - Class API: plain `bool`, default `False`
 - CUDA stream (`current_stream` in class API, `current_stream` in wrapper)
 
 ### Wrapper return values
@@ -313,6 +317,48 @@ Tuple unpacking order is: `(d_row_tensor, d_col_tensor, dprob_tensor, dbias_tens
 
 - `m_aligned` must be `256`
 - Requires CUDA with SM100+ compute capability
+
+---
+
+## Deterministic dprob
+
+`dprob` is the only output of this kernel that is not reproducible run to run by default.
+Every other output writes each element exactly once; `dprob` is a float reduction, and it is
+non-deterministic at two levels:
+
+1. **Within a CTA.** The N-subtile loop is traversed forward or reversed depending on the
+   accumulator pipeline phase, which varies between runs. A running fp32 sum over a flipping
+   order is not reproducible, because float addition is not associative.
+2. **Across CTAs.** Every N-tile atomically accumulates into the same `dprob[token]`, so the
+   summation order follows tile scheduling.
+
+`deterministic=True` fixes both. **Neither fix is sufficient on its own** — fixing only the
+cross-CTA atomic still leaves a divergent result.
+
+1. Each subtile's partial goes into a slot indexed by the actual subtile, then the slots are
+   summed in canonical order after the loop.
+2. `dprob` is given one slot per N-tile, so each `(token, tile_n)` pair has exactly one
+   writer, and those slots are reduced with `torch.sum` in fixed order.
+
+This flag is the only control over the behaviour: the reduction happens inside the kernel, so
+no process-level determinism setting affects it.
+
+```python
+# Explicit, per call site:
+result = cudnn.grouped_gemm_dsrelu_wrapper_sm100(..., deterministic=True)
+
+# Or process-wide, when the call site is not yours to edit:
+#   export CUDNN_FE_GROUPED_GEMM_DSRELU_DETERMINISTIC=1
+```
+
+`dprob_tensor` keeps its `(valid_m, 1, 1)` shape either way — the per-N-tile workspace and
+the reduction into it are internal to the wrapper. The class API is lower level: pass
+`sample_dprob` / `dprob_tensor` shaped `(valid_m, ceil_div(n, mma_tiler_mn[1]), 1)` and reduce
+over dim 1 yourself.
+
+**Cost.** `grid_n ×` the `dprob` workspace (`grid_n = ceil_div(n, mma_tiler_mn[1])`), one
+reduction kernel, and `subtile_cnt` extra registers per epilogue thread. Deterministic and
+non-deterministic configurations compile and cache separately.
 
 ---
 

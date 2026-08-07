@@ -116,6 +116,28 @@ class BlockScaledMoEGroupedGemmQuantBwdKernel:
     :param use_dynamic_sched: Enable dynamic tile scheduling.
     :param epilogue_type: Epilogue type (``EpilogueType.NONE`` or ``EpilogueType.DSRELU``).
     :param use_dsrelu_reuse: Reuse relu(C)^2 between d_srelu and dprob.
+    :param deterministic: Compute ``dprob`` run-to-run bit-exactly. ``dprob`` must then be
+        shaped ``(M, grid_n, 1)`` with ``grid_n = ceil_div(n, mma_tiler_mn[1])``; the caller
+        reduces over dim 1 afterwards. See below.
+
+    **Deterministic dprob.** Only ``dprob`` is non-deterministic by default -- every other
+    output is a single write per element -- and it is so at two levels:
+
+    1. Within a CTA, the N-subtile loop runs forward or reversed depending on
+       ``reverse_subtile``, which follows the accumulator pipeline phase and so varies run to
+       run. A running fp32 sum over a flipping order is not reproducible.
+    2. Across CTAs, every N-tile atomically accumulates into the same ``dprob[token]``, so the
+       summation order follows tile scheduling.
+
+    ``deterministic=True`` fixes both, and neither fix is sufficient alone:
+
+    1. Each subtile's partial is parked in a slot indexed by the *actual* subtile, then summed
+       in canonical ``0..subtile_cnt-1`` order after the loop.
+    2. ``dprob`` carries an extra N-tile dimension so each ``(token, tile_n)`` slot has exactly
+       one writer. The caller reduces over that dimension in fixed order.
+
+    Cost is ``grid_n x`` the dprob workspace plus one reduction, and ``subtile_cnt`` registers
+    per epilogue thread.
     """
 
     FIX_PAD_SIZE = 256
@@ -176,6 +198,7 @@ class BlockScaledMoEGroupedGemmQuantBwdKernel:
         generate_dbias: bool = False,
         generate_d_srelu: bool = False,
         use_dsrelu_reuse: bool = False,
+        deterministic: bool = False,
     ):
         mma_tile_m = mma_tiler_mn[0]
         if self.FIX_PAD_SIZE % mma_tile_m != 0:
@@ -245,6 +268,7 @@ class BlockScaledMoEGroupedGemmQuantBwdKernel:
         self.generate_dbias = generate_dbias
         self.generate_d_srelu = generate_d_srelu
         self.use_dsrelu_reuse = use_dsrelu_reuse
+        self.deterministic = deterministic
         self.dbias_cross_warp_reduce = generate_dbias
 
         self.weight_mode = weight_mode
@@ -617,7 +641,7 @@ class BlockScaledMoEGroupedGemmQuantBwdKernel:
         padded_offsets: cute.Tensor,
         alpha: cute.Tensor,
         prob: cute.Tensor,
-        dprob: Optional[cute.Tensor],  # OUTPUT: dL/d(prob), shape (M,1,1), Float32
+        dprob: Optional[cute.Tensor],  # OUTPUT: dL/d(prob), shape (M,1,1) -- (M,grid_n,1) if deterministic, Float32
         dbias_tensor: Optional[cute.Tensor],  # OUTPUT: dL/d(bias), shape (L,N), BF16 (accumulated via atomic)
         d_srelu: Optional[cute.Tensor],  # OUTPUT: recomputed SReLU activation, shape (M,N,1)
         sfd_col_d_srelu_tensor: Optional[cute.Tensor],  # OUTPUT: column SF for d_srelu when FP8-quantized
@@ -1332,7 +1356,7 @@ class BlockScaledMoEGroupedGemmQuantBwdKernel:
         padded_offsets: cute.Tensor,
         alpha: cute.Tensor,
         prob: cute.Tensor,
-        dprob: Optional[cute.Tensor],  # dL/d(prob) output, shape (M,1,1), Float32
+        dprob: Optional[cute.Tensor],  # dL/d(prob) output, shape (M,1,1) -- (M,grid_n,1) if deterministic, Float32
         mDbias_tensor: Optional[cute.Tensor],  # dL/d(bias) output, shape (L,N), BF16
         workspace_ptr,
         cluster_layout_vmnk: cute.Layout,
@@ -2118,6 +2142,13 @@ class BlockScaledMoEGroupedGemmQuantBwdKernel:
 
                 subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
 
+                # Deterministic dprob, level 1: one slot per subtile instead of a running sum
+                # over the pipeline-flipped traversal order. Summed canonically after the loop.
+                if cutlass.const_expr(self.deterministic and dprob is not None):
+                    dProbParts = cute.make_rmem_tensor(cute.make_layout((subtile_cnt,)), cutlass.Float32)
+                    for part_idx in cutlass.range_constexpr(subtile_cnt):
+                        dProbParts[part_idx] = cutlass.Float32(0.0)
+
                 for subtile_idx in cutlass.range(0, subtile_cnt, 1, unroll=1):
                     real_subtile_idx = subtile_idx
                     if cutlass.const_expr(self.overlapping_accum):
@@ -2177,11 +2208,15 @@ class BlockScaledMoEGroupedGemmQuantBwdKernel:
                         if cutlass.const_expr(self.use_dsrelu_reuse):
                             tRelu2 = self.compute_relu2(tTR_rAcc, tRelu)
                             if cutlass.const_expr(dprob is not None):
-                                dProbVal = dProbVal + self.compute_dprob_from_relu2(
+                                dprob_partial = self.compute_dprob_from_relu2(
                                     tTR_rAcc,
                                     acc_vec,
                                     tRelu2,
                                 )
+                                if cutlass.const_expr(self.deterministic):
+                                    dProbParts[real_subtile_idx] = dprob_partial
+                                else:
+                                    dProbVal = dProbVal + dprob_partial
                             if cutlass.const_expr(self.generate_d_srelu):
                                 tComputeSrelu = self.scale_srelu_from_relu2(
                                     tTR_rAcc,
@@ -2230,7 +2265,11 @@ class BlockScaledMoEGroupedGemmQuantBwdKernel:
                             else:
                                 for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
                                     tDprob[i] = tRelu[i] * tRelu[i] * acc_vec[i]
-                            dProbVal = dProbVal + tDprob.load().reduce(cute.ReductionOp.ADD, cutlass.Float32(0.0), 0)
+                            dprob_partial = tDprob.load().reduce(cute.ReductionOp.ADD, cutlass.Float32(0.0), 0)
+                            if cutlass.const_expr(self.deterministic):
+                                dProbParts[real_subtile_idx] = dprob_partial
+                            else:
+                                dProbVal = dProbVal + dprob_partial
                     else:
                         # NONE epilogue: dA = acc * prob (identity, no SReLU gate)
                         if cutlass.const_expr(self.vectorized_f32):
@@ -2356,8 +2395,20 @@ class BlockScaledMoEGroupedGemmQuantBwdKernel:
                 if cutlass.const_expr(self.epilogue_type == EpilogueType.DSRELU.value):
                     if cutlass.const_expr(dprob is not None):
                         real_dprob, _ = epi_ext.get_gmem_tensor("dprob", dprob, padded_offsets, epi_work_tile_info)
+                        if cutlass.const_expr(self.deterministic):
+                            # Level 1: canonical fixed-order sum over the per-subtile slots.
+                            dProbVal = cutlass.Float32(0.0)
+                            for part_idx in cutlass.range_constexpr(subtile_cnt):
+                                dProbVal = dProbVal + dProbParts[part_idx]
+                            # Level 2: this tile owns the (token, tile_n) slot outright -- one CTA
+                            # per (tile_m, tile_n), one thread per token within it -- so no other
+                            # N-tile's partial lands here. The add is therefore uncontended; the
+                            # atomic is redundant but kept so both modes share one store path.
+                            dprob_slot = real_dprob[(mPosition, epi_work_tile_info.tile_n_idx, None)]
+                        else:
+                            dprob_slot = real_dprob[(mPosition, None, None)]
                         _ = atomic_add_float32(
-                            ptr=real_dprob[(mPosition, None, None)].iterator.llvm_ptr,
+                            ptr=dprob_slot.iterator.llvm_ptr,
                             value=dProbVal,
                         )
 

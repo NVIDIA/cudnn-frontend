@@ -388,6 +388,163 @@ def test_grouped_gemm_dsrelu_wrapper_uint8_raw_fp4_smoke(request):
     assert torch.count_nonzero(outputs["d_row_tensor"]).item() > 0
 
 
+def _run_dsrelu_deterministic_case(case, **wrapper_kwargs):
+    """Run the wrapper once over an already-built case, so repeats share identical inputs.
+
+    ``dprob_tensor`` is deliberately not passed: the wrapper then allocates and zeroes a
+    fresh one per call, which is what lets two runs be compared against each other.
+    """
+    from cudnn import grouped_gemm_dsrelu_wrapper_sm100
+    from cuda.bindings import driver as cuda
+
+    inputs, cfg = case
+    return grouped_gemm_dsrelu_wrapper_sm100(
+        a_tensor=inputs["a_tensor"],
+        b_tensor=inputs["b_tensor"],
+        c_tensor=inputs["c_tensor"],
+        sfa_tensor=inputs["sfa_tensor"],
+        sfb_tensor=inputs["sfb_tensor"],
+        padded_offsets=inputs["padded_offsets_tensor"],
+        alpha_tensor=inputs["alpha_tensor"],
+        prob_tensor=inputs["prob_tensor"],
+        acc_dtype=cfg["acc_dtype"],
+        d_dtype=cfg["d_dtype"],
+        cd_major=cfg["cd_major"],
+        mma_tiler_mn=cfg["mma_tiler_mn"],
+        cluster_shape_mn=cfg["cluster_shape_mn"],
+        sf_vec_size=cfg["sf_vec_size"],
+        vector_f32=cfg["vector_f32"],
+        m_aligned=cfg["m_aligned"],
+        discrete_col_sfd=cfg["discrete_col_sfd"],
+        current_stream=cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+        **wrapper_kwargs,
+    )
+
+
+def _build_dsrelu_deterministic_case(request, ab_dtype, c_dtype, d_dtype, sf_vec_size, sf_dtype, vector_f32, discrete_col_sfd):
+    cfg = grouped_gemm_dsrelu_init(
+        request=request,
+        ab_dtype=ab_dtype,
+        c_dtype=c_dtype,
+        d_dtype=d_dtype,
+        cd_major="n",
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=sf_vec_size,
+        sf_dtype=sf_dtype,
+        vector_f32=vector_f32,
+        discrete_col_sfd=discrete_col_sfd,
+        b_major="k",
+    )
+    inputs = allocate_grouped_gemm_input_tensors(
+        n=cfg["n"],
+        k=cfg["k"],
+        l=cfg["l"],
+        group_m_list=cfg["group_m_list"],
+        ab_dtype=cfg["ab_dtype"],
+        b_major=cfg["b_major"],
+        sf_dtype=cfg["sf_dtype"],
+        sf_vec_size=cfg["sf_vec_size"],
+        m_aligned=cfg["m_aligned"],
+    )
+    inputs, _ = allocate_grouped_gemm_dsrelu_tensors(
+        tensor_m=inputs["tensor_m"],
+        n=cfg["n"],
+        l=cfg["l"],
+        ab_dtype=cfg["ab_dtype"],
+        c_dtype=cfg["c_dtype"],
+        d_dtype=cfg["d_dtype"],
+        cd_major=cfg["cd_major"],
+        sf_dtype=cfg["sf_dtype"],
+        sf_vec_size=cfg["sf_vec_size"],
+        input_tensors=inputs,
+    )
+    return inputs, cfg
+
+
+# n defaults to 512 against an mma_tiler_mn[1] of 256, so grid_n is 2 and the cross-N-tile
+# reduction -- level 2 of the fix -- is actually exercised. A config with n <= 256 would
+# only cover level 1.
+GROUPED_GEMM_DSRELU_DETERMINISTIC_CONFIGS = [
+    pytest.param(torch.uint8, torch.bfloat16, torch.bfloat16, 16, torch.float8_e8m0fnu, True, False, id="fp4"),
+    pytest.param(torch.float8_e4m3fn, torch.bfloat16, torch.float8_e4m3fn, 32, torch.float8_e8m0fnu, False, True, id="fp8"),
+]
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=17)
+@pytest.mark.parametrize(
+    "ab_dtype,c_dtype,d_dtype,sf_vec_size,sf_dtype,vector_f32,discrete_col_sfd",
+    GROUPED_GEMM_DSRELU_DETERMINISTIC_CONFIGS,
+)
+def test_grouped_gemm_dsrelu_deterministic_dprob(request, ab_dtype, c_dtype, d_dtype, sf_vec_size, sf_dtype, vector_f32, discrete_col_sfd):
+    """deterministic=True makes dprob bit-exact without changing what it computes."""
+    try:
+        import cudnn  # noqa: F401
+        from cuda.bindings import driver as cuda  # noqa: F401
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn optional dependencies not installed")
+
+    case = _build_dsrelu_deterministic_case(request, ab_dtype, c_dtype, d_dtype, sf_vec_size, sf_dtype, vector_f32, discrete_col_sfd)
+
+    try:
+        baseline = _run_dsrelu_deterministic_case(case, deterministic=False)
+        first = _run_dsrelu_deterministic_case(case, deterministic=True)
+        second = _run_dsrelu_deterministic_case(case, deterministic=True)
+    except (ValueError, NotImplementedError) as e:
+        pytest.skip(f"Unsupported testcase: {e}")
+    torch.cuda.synchronize()
+
+    # The caller-visible shape is unchanged -- the per-N-tile workspace is internal.
+    assert first["dprob_tensor"].shape == baseline["dprob_tensor"].shape
+    assert torch.isfinite(first["dprob_tensor"]).all()
+    assert torch.count_nonzero(first["dprob_tensor"]).item() > 0
+
+    # The property under test. Two runs of the same kernel on the same inputs must agree
+    # to the last bit, not merely to a tolerance.
+    assert torch.equal(first["dprob_tensor"], second["dprob_tensor"])
+
+    # Reordering a float sum must not change what is being summed: a partial dropped by a
+    # gap in the per-subtile slots, or double-counted by a second writer to an N-tile slot,
+    # would show up here and nowhere else.
+    scale = baseline["dprob_tensor"].abs().max().item()
+    torch.testing.assert_close(
+        first["dprob_tensor"],
+        baseline["dprob_tensor"],
+        rtol=1e-4,
+        atol=1e-4 * max(scale, 1.0),
+    )
+
+    # dprob is the only output the flag touches; dA and friends are single-write per
+    # element and must come back untouched.
+    for key in ("d_row_tensor", "d_col_tensor", "d_srelu_tensor"):
+        assert torch.equal(first[key], baseline[key]), f"{key} changed under deterministic=True"
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=19)
+def test_grouped_gemm_dsrelu_deterministic_dprob_env_var(request, monkeypatch):
+    """The env var is the opt-in when the call site is not the caller's to edit."""
+    try:
+        import cudnn  # noqa: F401
+        from cuda.bindings import driver as cuda  # noqa: F401
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn optional dependencies not installed")
+
+    case = _build_dsrelu_deterministic_case(request, torch.uint8, torch.bfloat16, torch.bfloat16, 16, torch.float8_e8m0fnu, True, False)
+
+    try:
+        explicit = _run_dsrelu_deterministic_case(case, deterministic=True)
+        monkeypatch.setenv("CUDNN_FE_GROUPED_GEMM_DSRELU_DETERMINISTIC", "1")
+        from_env = _run_dsrelu_deterministic_case(case)
+    except (ValueError, NotImplementedError) as e:
+        pytest.skip(f"Unsupported testcase: {e}")
+    torch.cuda.synchronize()
+
+    assert torch.equal(explicit["dprob_tensor"], from_env["dprob_tensor"])
+
+
 @pytest.mark.L0
 @torch_fork_set_rng(seed=13)
 @pytest.mark.parametrize("ab_dtype,c_dtype,d_dtype,b_major", DISCRETE_GROUPED_GEMM_DSRELU_SUPPORTED_CONFIGS)
