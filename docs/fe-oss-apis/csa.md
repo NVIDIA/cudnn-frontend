@@ -347,14 +347,21 @@ stays bitwise run-to-run: fixed chunk boundaries and merge orders, no atomics in
 forward/`dKV`/`dScore`.
 
 Both kernels are register-flat in the window length (ptxas sm_100a: forward 32-51
-registers, backward 48-128 registers, 0 spill / 0 stack across every shipped
+registers, backward 64-128 registers, 0 spill / 0 stack across every shipped
 (config, schedule) kernel — 16 kernels total; reproduce the per-kernel table with
 `benchmark/csa/reg_probe_csa_compressor_r128.py`) and JIT in ~0.4-1.0 s per
 configuration.
 The backward picks its `rows_per_cta` at launch time (a runtime argument — no
 recompile) so the grid fits one resident wave; the static row capacity fixes it under
 CUDA-graph capture. Small packs (`nb_total <= 192`, d=128) switch the backward to a
-vec=1 schedule bucket (also precompiled) for grid-fill.
+vec=1 schedule bucket (also precompiled) for grid-fill. Every backward bucket except
+the c1d128 default additionally loads `grad_out` once per row and keeps the register
+vec live across the phase barriers (the `goreuse` schedule field): adopted per bucket
+on measured pure-kernel wins — up to ~26% on the vec=1 small buckets, whose small
+grids underfill the machine, so the +16/+1 register cost is not the binding
+constraint — while the c1d128 default measured ~1.3% slower with it at 131k tokens
+and keeps the phase-4 reload. `dKV`/`dScore` are bitwise-identical with and without
+the field (the same read-only values move into registers).
 
 Measured on 1x B200 (CC 10.0, driver 590.48.01), torch 2.13.0 / CUDA 13.3 /
 `nvidia-cutlass-dsl` 4.6.1; eager baseline = the fp32-intermediate reference region of
@@ -371,9 +378,9 @@ forward at long context):
 
 | config | tokens | eager fwd | fused fwd | fwd | eager bwd | fused bwd | bwd | fused fwd+bwd total |
 |---|---|---|---|---|---|---|---|---|
-| coff 1, d 128 | 8192 | 84.7 us | 5.7 us | **15.0x** | 127.3 us | 8.4 us | **15.2x** | 15.1 us |
+| coff 1, d 128 | 8192 | 84.7 us | 5.7 us | **15.0x** | 127.3 us | 6.3 us | **20.2x** | 13.0 us |
 | coff 1, d 128 | 131072 | 451.8 us | 14.9 us | **30.2x** | 471.9 us | 63.7 us | **7.4x** | 82.5 us |
-| coff 2, d 128 | 8192 | 187.1 us | 6.4 us | **29.1x** | 246.2 us | 11.2 us | **21.9x** | 18.9 us |
+| coff 2, d 128 | 8192 | 187.1 us | 6.4 us | **29.1x** | 246.2 us | 10.5 us | **23.4x** | 18.1 us |
 | coff 2, d 128 | 65536 | 726.3 us | 16.4 us | **44.4x** | 960.0 us | 61.2 us | **15.7x** | 76.7 us |
 | coff 1, d 512 | 65536 | 641.1 us | 48.4 us | **13.2x** | 795.0 us | 104.2 us | **7.6x** | 150.0 us |
 | coff 2, d 512 | 65536 | 2315.2 us | 78.8 us | **29.4x** | 3261.9 us | 205.8 us | **15.9x** | 287.7 us |
@@ -386,9 +393,9 @@ kernels):
 
 | config | tokens | fused fwd | fused bwd |
 |---|---|---|---|
-| coff 1, d 128 | 8192 | 14.1 us | 24.3 us |
+| coff 1, d 128 | 8192 | 14.1 us | 20.8 us |
 | coff 1, d 128 | 131072 | 24.4 us | 82.1 us |
-| coff 2, d 128 | 8192 | 15.2 us | 26.3 us |
+| coff 2, d 128 | 8192 | 15.2 us | 25.3 us |
 | coff 2, d 128 | 65536 | 25.5 us | 75.6 us |
 | coff 1, d 512 | 65536 | 56.3 us | 118.9 us |
 | coff 2, d 512 | 65536 | 88.1 us | 220.8 us |

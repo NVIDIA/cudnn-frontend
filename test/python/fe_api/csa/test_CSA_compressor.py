@@ -356,7 +356,7 @@ def _r128_module():
 # Expected shipped schedules per (coff, d, nb_total) bucket — hardcoded on purpose: an
 # edit that silently changes any shipped launch geometry or bucket boundary must fail
 # here. Forward tuples are (vec, tchunks, threads_x, twophase, fastexp); backward
-# tuples are (vec, tchunks, threads_x, fastexp).
+# tuples are (vec, tchunks, threads_x, fastexp, goreuse).
 _FWD_BUCKETS = [
     (1, 128, 64, (2, 8, 32, False, False)),  # small
     (1, 128, 256, (2, 4, 32, False, False)),  # default
@@ -370,13 +370,13 @@ _FWD_BUCKETS = [
     (2, 512, 1024, (4, 4, 32, False, True)),  # large
 ]
 _BWD_BUCKETS = [
-    (1, 128, 64, (1, 8, 32, False)),  # small pack: vec=1, exact exp
-    (1, 128, 256, (2, 8, 32, True)),  # default (fast exp)
-    (2, 128, 64, (1, 8, 32, False)),  # small
-    (2, 128, 256, (2, 8, 32, True)),  # default
-    (1, 512, 256, (2, 4, 32, True)),  # default (tchunks=4 at coff=1, d>=512)
-    (2, 512, 64, (2, 8, 32, True)),  # no bwd small entry at d=512 -> default
-    (2, 512, 256, (2, 8, 32, True)),  # default
+    (1, 128, 64, (1, 8, 32, False, True)),  # small pack: vec=1, exact exp, grad_out reuse
+    (1, 128, 256, (2, 8, 32, True, False)),  # default (fast exp; goreuse measured slower here)
+    (2, 128, 64, (1, 8, 32, False, True)),  # small
+    (2, 128, 256, (2, 8, 32, True, True)),  # default
+    (1, 512, 256, (2, 4, 32, True, True)),  # default (tchunks=4 at coff=1, d>=512)
+    (2, 512, 64, (2, 8, 32, True, True)),  # no bwd small entry at d=512 -> default
+    (2, 512, 256, (2, 8, 32, True, True)),  # default
 ]
 
 
