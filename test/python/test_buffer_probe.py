@@ -24,13 +24,20 @@ from cudnn.frost import buffers
 pytestmark = pytest.mark.L0
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+# bfloat16 needs SM80+. Reported per dtype so float16/float32 still run on older
+# cards -- they take the CAI path, which is the control for the DLPack one.
+_BF16_OK = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8
 
 # float16/float32 resolve through __cuda_array_interface__; bfloat16 has no
 # numpy typestr (torch reports raw "<V2"), so it is the dtype that reaches the
 # DLPack path -- the one that has to stay capture-safe. fp8 is absent because
 # probe() does not map it at all ("unsupported buffer dtype (code=10, bits=8)"),
 # which is a separate gap and not this fix's business.
-_DTYPES = [torch.float16, torch.float32, torch.bfloat16]
+_DTYPES = [
+    torch.float16,
+    torch.float32,
+    pytest.param(torch.bfloat16, marks=pytest.mark.skipif(not _BF16_OK, reason="bfloat16 needs SM80+")),
+]
 
 
 @requires_cuda
@@ -57,6 +64,7 @@ def test_probe_is_capture_safe(dtype):
     """
     t = torch.zeros(64, dtype=dtype, device="cuda")
     side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())  # order the zeros before the write
     with torch.cuda.stream(side):  # warm up allocation off the capture stream
         t.add_(1)
     torch.cuda.synchronize()
