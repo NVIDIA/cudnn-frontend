@@ -1470,6 +1470,8 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         self.compute_capability: Optional[tuple[int, int]] = None
         self.head_dim_qk: Optional[int] = None
         self.head_dim_v: Optional[int] = None
+        self.thd_stats_head_major = False
+        self.thd_stats_head_stride = 0
         self._k_mod = None
 
     def check_support(self) -> bool:
@@ -1526,10 +1528,16 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             self._check_dtype(self.lse_desc, torch.float32, name="LSE")
             self._check_tensor_shape(self.lse_desc, (b, h_q, s_q), name="LSE")
             if self.thd:
+                stride_h, stride_s = tuple(self.lse_desc.stride[1:])
+                token_major = (stride_h, stride_s) == (1, h_q)
+                head_major = not token_major and stride_s == 1 and stride_h >= 1
                 self._value_error_if(
-                    tuple(self.lse_desc.stride[1:]) != (1, h_q),
-                    f"THD LSE must be token-major packed (stride_h == 1, stride_s == H); got stride {self.lse_desc.stride}",
+                    not token_major and not head_major,
+                    f"THD LSE must be packed token-major (stride_h == 1, stride_s == H) "
+                    f"or head-major (stride_s == 1, stride_h == head_stride); got stride {self.lse_desc.stride}",
                 )
+                self.thd_stats_head_major = head_major
+                self.thd_stats_head_stride = int(stride_h) if head_major else 0
             else:
                 self._value_error_if(not self.lse_desc.is_contiguous(), "LSE must be contiguous on SM120 DSL")
 
@@ -1790,8 +1798,9 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         ``.tolist()`` D2H syncs are inherent — the packed totals and the
         longest sequence's Q length are runtime values that size the
         per-execute compile and grid. ``lse_tensor``, when given, is the
-        caller's ragged Stats buffer: token-major packed ``(T, H)`` in its
-        first ``T*H`` elements.
+        caller's ragged Stats buffer, in its declared layout: token-major
+        packed ``(T, H)`` in the first ``T*H`` elements, or head-major
+        ``(H, head_stride)`` with tokens contiguous within each head row.
         """
 
         b, qh, kh = self.batch_size, self.h_q, self.h_kv
@@ -1828,17 +1837,32 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
 
         if t_q == 0:
             return
-        lse = lse_tensor.as_strided((t_q, qh), (qh, 1), lse_tensor.storage_offset()) if lse_tensor is not None else None
+        lse = None
+        lse_valid = None  # the valid-region view (first t_q tokens) the t_kv == 0 fill writes
+        if lse_tensor is not None:
+            if self.thd_stats_head_major:
+                head_stride = self.thd_stats_head_stride
+                self._value_error_if(
+                    head_stride < t_q,
+                    f"head-major THD LSE head_stride ({head_stride}) must cover the packed Q token total ({t_q})",
+                )
+                lse = lse_tensor.as_strided((qh, head_stride), (head_stride, 1), lse_tensor.storage_offset())
+                lse_valid = lse_tensor.as_strided((qh, t_q), (head_stride, 1), lse_tensor.storage_offset())
+            else:
+                lse = lse_tensor.as_strided((t_q, qh), (qh, 1), lse_tensor.storage_offset())
+                lse_valid = lse
         if t_kv == 0:
             # Every row is dead: O := 0, LSE := -inf (or the sink alone —
             # its column keeps the denominator alive). A zero-token K/V view
             # cannot back a TMA descriptor, so short-cut both.
             o_buf.as_strided((t_q * qh * d_v,), (1,), o_buf.storage_offset()).zero_()
-            if lse is not None:
+            if lse_valid is not None:
                 if sinks is not None:
-                    lse.copy_(self._checked_sinks_1d(sinks).reshape(1, qh).expand(t_q, qh))
+                    sinks_v = self._checked_sinks_1d(sinks)
+                    sinks_v = sinks_v.reshape(qh, 1).expand(qh, t_q) if self.thd_stats_head_major else sinks_v.reshape(1, qh).expand(t_q, qh)
+                    lse_valid.copy_(sinks_v)
                 else:
-                    lse.fill_(float("-inf"))
+                    lse_valid.fill_(float("-inf"))
             return
 
         # Sinks are None-specialized like the LSE when the graph has no sink
@@ -1871,6 +1895,8 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             d_v=d_v,
             max_sq=max_sq,
             has_lse=self.lse_desc is not None,
+            lse_head_major=self.thd_stats_head_major,
+            lse_head_stride=self.thd_stats_head_stride,
         )
         fn(
             _packed(q_buf, t_q),
@@ -1889,9 +1915,10 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         if self.thd:
             # [slq32 | slk32 | meta(seq_kv, cu_q, cu_k)].
             # No packed-LSE chunk: with a Stats output the kernel writes the
-            # caller's ragged Stats buffer directly (token-major (T, H));
-            # without one it compiles with has_lse=False and no LSE buffer
-            # exists at all. No sinks-dummy chunk either: the kernel
+            # caller's ragged Stats buffer directly (token-major (T, H) or
+            # head-major (H, head_stride)); without one it compiles with
+            # has_lse=False and no LSE buffer exists at all. No sinks-dummy
+            # chunk either: the kernel
             # None-specializes on sinks. No O-descriptor chunk: SM120 stores O
             # with plain guarded GMEM stores, so THD needs no per-sequence
             # tensor maps.
