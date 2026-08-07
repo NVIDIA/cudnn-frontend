@@ -490,7 +490,6 @@ def _render_tile_constants(cfg: TileConfig, chain: FusionChain, cta_group: int, 
         f"multicast_b = {cfg.multicast_b(cta_group)}",
         f"ab_smem_swizzle = cutlass.experimental.primitives.Tcgen05SmemSwizzle.{smem_swizzle_name}",
         f"ab_smem_swizzle_bytes = {smem_swizzle_bytes}",
-        f"ab_smem_desc_stride_byte_offset = {smem_desc_stride_byte_offset}",
         f"a_smem_desc_leading_byte_offset = {a_lbo}",
         f"a_smem_desc_stride_byte_offset = {a_sbo}",
         f"a_smem_k_step_bytes = {a_k_step}",
@@ -534,15 +533,16 @@ def _render_tile_constants(cfg: TileConfig, chain: FusionChain, cta_group: int, 
     total_tmem = _tmem_cols_for_arch()
     lines.append(f"num_tmem_alloc_cols = {total_tmem}")
     if chain.is_multi_gemm:
-        region = chain.num_gemms * cfg.cta_tile_n
+        cols_per_acc = cfg.cta_tile_n // 2 if (cta_group == 2 and cfg.cta_tile_m == 64) else cfg.cta_tile_n
+        region = chain.num_gemms * cols_per_acc
         if region > total_tmem:
             raise NotImplementedError(
-                f"multi-GEMM: {chain.num_gemms} GEMMs × cta_tile_n={cfg.cta_tile_n} "
-                f"= {region} acc cols exceed {total_tmem} TMEM (single stage). "
+                f"multi-GEMM: {chain.num_gemms} GEMMs × {cols_per_acc} acc cols "
+                f"= {region} exceed {total_tmem} TMEM (single stage). "
                 f"Pick a smaller cta_tile_n or fewer GEMMs."
             )
         acc_stages_mg = 2 if 2 * region <= total_tmem else 1
-        lines.append(f"acc_stages = {acc_stages_mg}  # multi-GEMM: {chain.num_gemms}×{cfg.cta_tile_n} cols/stage")
+        lines.append(f"acc_stages = {acc_stages_mg}  # multi-GEMM: {chain.num_gemms}×{cols_per_acc} cols/stage")
         # ab_stages: one SMEM buffer per DISTINCT operand (num_a A + num_b B per
         # stage), not the single A+B that smem_max_ab_stages assumes.
         from .tile_config import _sm_smem_ab_budget_bytes, _AB_STAGES_CAP
@@ -797,7 +797,7 @@ def _render_block_scale_tile_constants(
     _REGISTERS_PER_ATOM = 4  # cols per 128×4 utccp atom
     scales_per_inst = mma_inst_k_elems // bs.block_size
     word_scales = max(_REGISTERS_PER_ATOM, scales_per_inst)  # cols per block-word
-    word_atoms = word_scales // _REGISTERS_PER_ATOM  # atoms copied per word
+    word_atoms = -(-word_scales // _REGISTERS_PER_ATOM)  # atoms copied per word (ceil: a partial atom still costs one)
     insts_per_word = max(_REGISTERS_PER_ATOM // scales_per_inst, 1)
     num_sf_words = max(num_kblocks // insts_per_word, 1)  # utccp refreshes / k-tile
     _REGISTERS_PER_BLOCK = word_scales  # SF word width per block
@@ -888,6 +888,34 @@ def _render_block_scale_tile_constants(
         raise NotImplementedError(
             f"block-scale {cfg.name!r}: the accumulator + SF regions need {used_cols} TMEM columns but only {num_tmem_alloc_cols} are allocated"
         )
+
+    mma_m = cta_m * cta_group
+    half_m = cta_group == 2 and mma_m == 128  # unreachable while block-scale pins cta_m=128
+    omma_k = mma_inst_k_elems if is_fp4 else 0
+    sf_ids = [scales_per_inst * j % 4 for j in range(num_kblocks)]
+    sfb_extra = 4 if cta_n <= 128 else 8
+    sfa_off = [scales_per_inst * j // 4 * 4 * nb_m for j in range(num_kblocks)]
+    sfb_off = [scales_per_inst * j // 4 * 4 * nb_n for j in range(num_kblocks)]
+    if omma_k in (96, 128):
+        # 96 -> 3X (block 32) / 6X (block 16); 128 -> 4X (block 32) / 8X (block 16).
+        wide_vec = bs.block_size == 16  # the 6X / 8X arm
+        if omma_k == 128:  # extra-enhanced: the extra term is 8X-only
+            extra = [sfb_extra if wide_vec else 0] * num_kblocks
+        else:  # enhanced: 6X, or 3X with sfb_id >= 2
+            extra = [sfb_extra if (wide_vec or sf_ids[j] >= 2) else 0 for j in range(num_kblocks)]
+        sfa_spans = [(sfa_off[j], 4 if (not wide_vec and omma_k == 96 and sf_ids[j] < 2) else 8) for j in range(num_kblocks)]
+        sfb_spans = [(sfb_off[j], 2 * ((cta_n + 63) // 64) + extra[j]) for j in range(num_kblocks)]
+    else:
+        sfa_spans = [(0, 2 if half_m else 4)]
+        sfb_spans = [(0, 2 * ((cta_n + 127) // 128) if half_m else 2 * ((cta_n + 63) // 64))]
+    for _label, _bases, _spans in (("SFA", sfa_col_bases, sfa_spans), ("SFB", sfb_col_bases, sfb_spans)):
+        _end = max(b + off + cols for b in _bases for off, cols in _spans)
+        if _end > num_tmem_alloc_cols:
+            raise NotImplementedError(
+                f"block-scale {cfg.name!r}: the hardware {_label} TMEM span reaches "
+                f"column {_end} but only {num_tmem_alloc_cols} are allocated "
+                f"(ISA 'Load {_label[-1]} scale factors'" + ("; SM Errata 160 means the hardware will NOT report OOR_ADDR here)" if _label == "SFB" else ")")
+            )
 
     # --- AB SMEM pipeline depth ----------------------------------------------
     # Per-stage SMEM = (packed data + SF) per DISTINCT operand + 2 mbar.
@@ -2140,6 +2168,40 @@ def _check_cta_group_geometry(config: TileConfig, cta_group: int) -> None:
         )
 
 
+def _check_mma_n_dim(chain: FusionChain, config: TileConfig, cta_group: int) -> None:
+    """MMA n_dim rules that depend on the dtype / operand layout, not just geometry.
+
+    Both come from ISA table2 + the SPA model and are invisible in the geometry
+    guards; ``config.mma_inst_n`` and ``cta_tile_n`` are checked because 1ctamma
+    encodes the latter and 2ctamma the former (equal for every catalog entry).
+    """
+    ns = (("mma_inst_n", config.mma_inst_n), ("cta_tile_n", config.cta_tile_n))
+
+    # UTCIMMA is narrower than the other kinds above N=32.
+    if DTYPE_TO_MMA_KIND.get(_mma_a_dtype(chain)) == "nvvm.Tcgen05MMAKind.INT8":
+        for label, n in ns:
+            if n >= 40 and (n // 8) % 2 != 0:
+                raise NotImplementedError(
+                    f"int8 MMA (UTCIMMA) needs N ≤ 32 or a multiple of 16; "
+                    f'config {config.name!r} has {label}={n} (ISA: "UTCIMMA only '
+                    f'supports 16 step increments for N > 32 for non-.WS mode")'
+                )
+
+    # table2's "8bit-transpose B" rows tighten N for every non-HMMA kind:
+    # 1CTA 16..256 step 16, 2CTA 32..256 step 32. B is transposed iff N-major.
+    bs = chain.block_scale
+    b_dt = bs.b_dtype if bs is not None else chain.matmul.b_dtype
+    if _dtype_bits(b_dt) == 8 and chain.matmul.b_major == "n":
+        step = 32 if cta_group == 2 else 16
+        for label, n in ns:
+            if n < step or n % step != 0:
+                raise NotImplementedError(
+                    f"8-bit transposed (N-major) B needs N ≥ {step} and a multiple "
+                    f"of {step} under cta_group={cta_group}; config {config.name!r} "
+                    f"has {label}={n} (ISA table2, the '8bit-transpose B = Yes' rows)"
+                )
+
+
 def _check_dtype_config_compat(chain: FusionChain, config: TileConfig, cta_group: int) -> None:
     """Reject (chain, config) where the config K_BYTES isn't a multiple of the
     MMA dtype's element width. ``cta_group`` sets per-CTA SMEM N for the
@@ -2567,6 +2629,7 @@ def jit_from_cudnn_graph(
     """
     chain, binding = analyze_with_binding(graph)
     _check_cta_group_geometry(config, cta_group)
+    _check_mma_n_dim(chain, config, cta_group)
     # MoE grouped block-scale = both matches at once (dequant + moe_grouped);
     # check BEFORE the single-feature gates.
     if chain.has_moe and chain.has_block_scale:

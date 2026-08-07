@@ -296,14 +296,20 @@ def _kernel(
     if warp_idx == 0:
         if elect_one:
             nvvm.mbarrier_init(tmem_dealloc_mbar_ptr, 32)
-            for i in range(ab_stages):
+        for i in range(ab_stages):
+            if elect_one:
                 nvvm.mbarrier_init(ab_full_mbar_ptr.subview(i), 1)
+            if elect_one:
                 nvvm.mbarrier_init(ab_empty_mbar_ptr.subview(i), ab_empty_count)
-            for i in range(acc_stages):
+        for i in range(acc_stages):
+            if elect_one:
                 nvvm.mbarrier_init(acc_full_mbar_ptr.subview(i), 1)
+            if elect_one:
                 nvvm.mbarrier_init(acc_empty_mbar_ptr.subview(i), acc_empty_count)
-            for i in range(SCHED_STAGES):
+        for i in range(SCHED_STAGES):
+            if elect_one:
                 nvvm.mbarrier_init(sched_full_mbar_ptr.subview(i), 1)
+            if elect_one:
                 nvvm.mbarrier_init(sched_empty_mbar_ptr.subview(i), sched_empty_count)
     nvvm.fence_mbarrier_init()
     nvvm.barrier_cluster_arrive_relaxed()
@@ -560,9 +566,9 @@ def _kernel(
                     if b_issue:
                         for _bj in cutlass.range_constexpr(num_b_operands):
                             sB_stage = smem_b_list[_bj].subview(sB_elems * stage)
-                            if elect_one:
-                                if cutlass.const_expr(b_is_n_major):
-                                    for n_group in cutlass.range_constexpr(cta_tile_mnk[1] // b_tma_group_elems):
+                            if cutlass.const_expr(b_is_n_major):
+                                for n_group in cutlass.range_constexpr(cta_tile_mnk[1] // b_tma_group_elems):
+                                    if elect_one:
                                         nvvm.cp_async_bulk_tensor_shared_cluster_global(
                                             sB_stage.subview(n_group * b_tma_group_elems * cgrp_tile_mnk[2]),
                                             tma_b_descs[_bj].get_ptr(),
@@ -576,7 +582,8 @@ def _kernel(
                                             multicast_mask=tma_mcast_mask_b,
                                             group=nvvm.CTAGroup.CTA_2,
                                         )
-                                else:
+                            else:
+                                if elect_one:
                                     nvvm.cp_async_bulk_tensor_shared_cluster_global(
                                         sB_stage,
                                         tma_b_descs[_bj].get_ptr(),
@@ -867,6 +874,7 @@ def _kernel(
                     c_rmem_vec = c_rmem_vecs[0]
 
                     if subtile_idx == subtile_cnt - 1:
+                        nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
                         nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
                         if elect_one:
                             nvvm.mbarrier_arrive(

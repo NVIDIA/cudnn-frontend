@@ -269,17 +269,23 @@ def _kernel(
     ab_empty_count = cluster_m + cluster_n - 1
     sched_empty_count = 1 + 1 + num_epilogue_warps
     if warp_idx == 0:
-        if elect_one:
-            for i in range(ab_stages):
+        for i in range(ab_stages):
+            if elect_one:
                 nvvm.mbarrier_init(ab_full_mbar_ptr.subview(i), 1)
+            if elect_one:
                 nvvm.mbarrier_init(ab_empty_mbar_ptr.subview(i), ab_empty_count)
-            for i in range(acc_stages):
+        for i in range(acc_stages):
+            if elect_one:
                 nvvm.mbarrier_init(acc_full_mbar_ptr.subview(i), 1)
+            if elect_one:
                 nvvm.mbarrier_init(acc_empty_mbar_ptr.subview(i), num_epilogue_warps)
-            if cutlass.const_expr(use_acc_overlap):
+        if cutlass.const_expr(use_acc_overlap):
+            if elect_one:
                 nvvm.mbarrier_init(tmem_dealloc_mbar_ptr, num_epilogue_warps)
-            for i in range(SCHED_STAGES):
+        for i in range(SCHED_STAGES):
+            if elect_one:
                 nvvm.mbarrier_init(sched_full_mbar_ptr.subview(i), 1)
+            if elect_one:
                 nvvm.mbarrier_init(sched_empty_mbar_ptr.subview(i), sched_empty_count)
     nvvm.fence_mbarrier_init()
 
@@ -637,9 +643,9 @@ def _kernel(
                     if b_issue:
                         for _bj in cutlass.range_constexpr(num_b_operands):
                             sB_stage = smem_b_list[_bj].subview(sB_elems * stage)
-                            if elect_one:
-                                if cutlass.const_expr(b_is_n_major):
-                                    for n_group in cutlass.range_constexpr(cta_tile_mnk[1] // b_tma_group_elems):
+                            if cutlass.const_expr(b_is_n_major):
+                                for n_group in cutlass.range_constexpr(cta_tile_mnk[1] // b_tma_group_elems):
+                                    if elect_one:
                                         nvvm.cp_async_bulk_tensor_shared_cluster_global(
                                             sB_stage.subview(n_group * b_tma_group_elems * cta_tile_mnk[2]),
                                             tma_b_descs[_bj].get_ptr(),
@@ -653,7 +659,8 @@ def _kernel(
                                             multicast_mask=tma_mcast_mask_b,
                                             group=nvvm.CTAGroup.CTA_1,
                                         )
-                                else:
+                            else:
+                                if elect_one:
                                     nvvm.cp_async_bulk_tensor_shared_cluster_global(
                                         sB_stage,
                                         tma_b_descs[_bj].get_ptr(),
@@ -931,7 +938,12 @@ def _kernel(
 
         subtile_cnt = cute.ceil_div(cta_tile_mnk[1], 32)
         t2r_inst_repx = epi_tile_mn[1]
-        shape = nvvm.Tcgen05LdStShape.SHAPE_32X32B
+        if cutlass.const_expr(cta_tile_mnk[0] == 64):
+            shape = nvvm.Tcgen05LdStShape.SHAPE_16X32BX2
+            ld_half_off = 0
+        else:
+            shape = nvvm.Tcgen05LdStShape.SHAPE_32X32B
+            ld_half_off = None
         lane = tidx % 32
 
         while is_valid != 0:
@@ -1000,10 +1012,11 @@ def _kernel(
                             6,
                             cutlass.Float32,
                         )
-                        c_rmem_vecs.append(nvvm.tcgen05_ld(shape, tmem, num=t2r_inst_repx))
+                        c_rmem_vecs.append(nvvm.tcgen05_ld(shape, tmem, num=t2r_inst_repx, offset=ld_half_off))
                     c_rmem_vec = c_rmem_vecs[0]
 
                     if cutlass.const_expr(use_acc_overlap and subtile_idx == acc_overlap_subtiles - 1):
+                        nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
                         nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
                         if elect_one:
                             nvvm.mbarrier_arrive(acc_empty_mbar_ptr.subview(acc_stage))
@@ -1023,12 +1036,14 @@ def _kernel(
                     # @@STG_ONLY:END@@
 
                 if cutlass.const_expr(not use_acc_overlap):
+                    nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
                     nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
                     if elect_one:
                         nvvm.mbarrier_arrive(acc_empty_mbar_ptr.subview(acc_stage))
                 tile_iter += 1
 
         if cutlass.const_expr(use_acc_overlap):
+            nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
             nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
             if elect_one:
                 nvvm.mbarrier_arrive(tmem_dealloc_mbar_ptr)

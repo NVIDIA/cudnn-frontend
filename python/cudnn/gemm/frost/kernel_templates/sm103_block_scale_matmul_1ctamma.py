@@ -319,20 +319,28 @@ def _kernel(
     num_consumer_warps_per_cta = 8
     clc_empty_count = num_consumer_warps_per_cta * cluster_size
     if warp_idx == 0:
-        if elect_one:
-            for i in range(ab_stages):
+        for i in range(ab_stages):
+            if elect_one:
                 nvvm.mbarrier_init(ab_full_mbar_ptr.subview(i), 1)
+            if elect_one:
                 nvvm.mbarrier_init(ab_empty_mbar_ptr.subview(i), ab_empty_count)
-            for i in range(sf_stages):
+        for i in range(sf_stages):
+            if elect_one:
                 nvvm.mbarrier_init(sf_full_mbar_ptr.subview(i), 1)
+            if elect_one:
                 nvvm.mbarrier_init(sf_empty_mbar_ptr.subview(i), ab_empty_count)
-            for i in range(acc_stages):
+        for i in range(acc_stages):
+            if elect_one:
                 nvvm.mbarrier_init(acc_full_mbar_ptr.subview(i), 1)
+            if elect_one:
                 nvvm.mbarrier_init(acc_empty_mbar_ptr.subview(i), num_epilogue_warps)
-            if cutlass.const_expr(use_acc_overlap):
+        if cutlass.const_expr(use_acc_overlap):
+            if elect_one:
                 nvvm.mbarrier_init(tmem_dealloc_mbar_ptr, num_epilogue_warps)
-            for i in range(CLC_SCHED_STAGES):
+        for i in range(CLC_SCHED_STAGES):
+            if elect_one:
                 nvvm.mbarrier_init(clc_full_mbar_ptr.subview(i), 1)
+            if elect_one:
                 nvvm.mbarrier_init(clc_empty_mbar_ptr.subview(i), clc_empty_count)
     nvvm.fence_mbarrier_init()
     if cutlass.const_expr(cluster_shape_mnk[0] * cluster_shape_mnk[1] > 1):
@@ -1014,7 +1022,12 @@ def _kernel(
 
         subtile_cnt = cute.ceil_div(cta_tile_mnk[1], 32)
         t2r_inst_repx = epi_tile_mn[1]
-        shape = nvvm.Tcgen05LdStShape.SHAPE_32X32B
+        if cutlass.const_expr(cta_tile_mnk[0] == 64):
+            shape = nvvm.Tcgen05LdStShape.SHAPE_16X32BX2
+            ld_half_off = 0
+        else:
+            shape = nvvm.Tcgen05LdStShape.SHAPE_32X32B
+            ld_half_off = None
         lane = tidx % 32
 
         # @@TMA_STORE_ONLY:BEGIN@@
@@ -1063,10 +1076,11 @@ def _kernel(
                             6,
                             cutlass.Float32,
                         )
-                        c_rmem_vecs.append(nvvm.tcgen05_ld(shape, tmem, num=t2r_inst_repx))
+                        c_rmem_vecs.append(nvvm.tcgen05_ld(shape, tmem, num=t2r_inst_repx, offset=ld_half_off))
                     c_rmem_vec = c_rmem_vecs[0]
 
                 if use_acc_overlap and (not cd_out_is_m_major) and subtile_idx == acc_overlap_subtiles - 1:
+                    nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
                     nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
                     if elect_one:
                         nvvm.mbarrier_arrive(acc_empty_mbar_ptr.subview(acc_stage))
@@ -1124,20 +1138,22 @@ def _kernel(
                 )
 
                 if warp_idx == 0:
-                    if elect_one:
-                        if cutlass.const_expr(cd_out_is_m_major):
-                            for _mb in cutlass.range_constexpr(cta_tile_mnk[0] // cd_mmajor_atom_m):
+                    if cutlass.const_expr(cd_out_is_m_major):
+                        for _mb in cutlass.range_constexpr(cta_tile_mnk[0] // cd_mmajor_atom_m):
+                            if elect_one:
                                 nvvm.cp_async_bulk_tensor_global_shared_cta(
                                     tma_c_desc.get_ptr(),
                                     smem_subtile_ptr.subview(_mb * (cd_mmajor_atom_m * epi_tile_mn[1])),
                                     (coord_m + _mb * cd_mmajor_atom_m, col, tile_l),
                                 )
-                        else:
+                    else:
+                        if elect_one:
                             nvvm.cp_async_bulk_tensor_global_shared_cta(
                                 tma_c_desc.get_ptr(),
                                 smem_subtile_ptr,
                                 (col, coord_m, tile_l),
                             )
+                    if elect_one:
                         nvvm.cp_async_bulk_commit_group()
                     nvvm.cp_async_bulk_wait_group(EPI_SMEM_STAGES - 1, read=True)
 
@@ -1160,6 +1176,7 @@ def _kernel(
                 # @@STG_ONLY:END@@
 
             if cutlass.const_expr((not use_acc_overlap) or cd_out_is_m_major):
+                nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
                 nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
                 if elect_one:
                     nvvm.mbarrier_arrive(acc_empty_mbar_ptr.subview(acc_stage))
@@ -1192,6 +1209,7 @@ def _kernel(
             tile_iter += 1
 
         if cutlass.const_expr(use_acc_overlap):
+            nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
             nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
             if elect_one:
                 nvvm.mbarrier_arrive(tmem_dealloc_mbar_ptr)
