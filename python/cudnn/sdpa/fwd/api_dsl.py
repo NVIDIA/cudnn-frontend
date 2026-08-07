@@ -1468,7 +1468,8 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         self.q_tile = _SM120_Q_TILES[0] if self.tile_m is None else self.tile_m
         self.kv_tile = _SM120_KV_TILES[0] if self.tile_n is None else self.tile_n
         self.compute_capability: Optional[tuple[int, int]] = None
-        self.head_dim: Optional[int] = None
+        self.head_dim_qk: Optional[int] = None
+        self.head_dim_v: Optional[int] = None
         self._k_mod = None
 
     def check_support(self) -> bool:
@@ -1517,9 +1518,10 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
 
         b, h_q, s_q, d_q = self.q_desc.shape
         _, h_kv, s_kv, _ = self.k_desc.shape
+        d_v = self.v_desc.shape[3]
         self._check_tensor_shape(self.k_desc, (b, h_kv, s_kv, d_q), name="K")
-        self._check_tensor_shape(self.v_desc, (b, h_kv, s_kv, d_q), name="V")
-        self._check_tensor_shape(self.o_desc, (b, h_q, s_q, d_q), name="O")
+        self._check_tensor_shape(self.v_desc, (b, h_kv, s_kv, d_v), name="V")
+        self._check_tensor_shape(self.o_desc, (b, h_q, s_q, d_v), name="O")
         if self.lse_desc is not None:
             # THD stats are not plumbed (the kernel's packed (1, H, T) LSE does
             # not match cuDNN's ragged Stats contract) — reject the request
@@ -1535,7 +1537,8 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             ("H_kv", h_kv),
             ("S_q", s_q),
             ("S_kv", s_kv),
-            ("D", d_q),
+            ("D_QK", d_q),
+            ("D_V", d_v),
         ):
             self._value_error_if(int(val) <= 0, f"{label} must be > 0; got {val}")
         self._value_error_if(
@@ -1544,7 +1547,11 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         )
         self._value_error_if(
             d_q not in _SM120_SUPPORTED_HEAD_TILES,
-            f"D ({d_q}) must be one of {_SM120_SUPPORTED_HEAD_TILES}",
+            f"D_QK ({d_q}) must be one of {_SM120_SUPPORTED_HEAD_TILES}",
+        )
+        self._value_error_if(
+            d_v not in _SM120_SUPPORTED_HEAD_TILES,
+            f"D_V ({d_v}) must be one of {_SM120_SUPPORTED_HEAD_TILES}",
         )
 
         self.dtype = self._check_dtype(self.q_desc, [torch.float16, torch.bfloat16], name="Q")
@@ -1598,8 +1605,9 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         smem_capacity_bytes = cutlass.utils.get_smem_capacity_in_bytes(arch)
 
         def _smem_bytes(kv_tile: int) -> int:
-            # K/V double buffer, aliased with the q_tile x D output staging tile.
-            return max(2 * kv_tile * d_q * self.dtype.itemsize, self.q_tile * d_q * self.dtype.itemsize) + 16
+            # One K tile (D_QK wide) + one V tile (D_V wide), aliased with the
+            # q_tile x D_V output staging tile.
+            return max(kv_tile * (d_q + d_v) * self.dtype.itemsize, self.q_tile * d_v * self.dtype.itemsize) + 16
 
         if self.tile_n is None:
             # Pick the largest KV tile that fits this device.
@@ -1621,8 +1629,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         self.h_q = int(h_q)
         self.h_kv = int(h_kv)
         self.head_dim_qk = int(d_q)
-        self.head_dim_v = int(d_q)
-        self.head_dim = int(d_q)
+        self.head_dim_v = int(d_v)
         self._is_supported = True
 
         self._logger.debug("check_support completed successfully")
@@ -1662,7 +1669,8 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             kh=self.h_kv,
             sq=self.s_q_max,
             skv=self.s_k_max,
-            d=self.head_dim,
+            d_qk=self.head_dim_qk,
+            d_v=self.head_dim_v,
             # No sample_lse -> the LSE store is compiled out; execute() then
             # binds no LSE buffer at all (no dummy, no allocation).
             has_lse=self.lse_desc is not None,
@@ -1780,7 +1788,8 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         per-execute compile and grid.
         """
 
-        b, qh, kh, d = self.batch_size, self.h_q, self.h_kv, self.head_dim
+        b, qh, kh = self.batch_size, self.h_q, self.h_kv
+        d_qk, d_v = self.head_dim_qk, self.head_dim_v
         dev = q_buf.device
         carver = WorkspaceCarver(workspace, self.scratch_workspace_bytes(), "SdpaFwdDslSm120 (THD)") if workspace is not None else None
 
@@ -1816,7 +1825,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         if t_kv == 0:
             # Every row is dead: O := 0 (THD stats are not plumbed). A
             # zero-token K/V view cannot back a TMA descriptor, so short-cut.
-            o_buf.as_strided((t_q * qh * d,), (1,), o_buf.storage_offset()).zero_()
+            o_buf.as_strided((t_q * qh * d_v,), (1,), o_buf.storage_offset()).zero_()
             return
 
         # THD stats are not plumbed: the kernel compiles with has_lse=False, so
@@ -1831,6 +1840,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
 
         def _packed(buf, tokens):
             heads = qh if buf is q_buf or buf is o_buf else kh
+            d = d_qk if buf is q_buf or buf is k_buf else d_v
             return buf.as_strided((1, tokens, heads, d), (tokens * heads * d, heads * d, d, 1), buf.storage_offset())
 
         if current_stream is None:
@@ -1845,7 +1855,8 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             kh=kh,
             sq=t_q,
             skv=t_kv,
-            d=d,
+            d_qk=d_qk,
+            d_v=d_v,
             max_sq=max_sq,
             has_lse=False,
         )
@@ -1900,12 +1911,13 @@ def sdpa_fwd_wrapper_dsl_sm120(
         )
     if q_tensor.ndim != 4 or k_tensor.ndim != 4 or v_tensor.ndim != 4:
         raise ValueError(f"Q, K, and V must be rank-4 BHSD; got Q={q_tensor.ndim}D K={k_tensor.ndim}D V={v_tensor.ndim}D")
-    o_tensor = torch.empty_strided(
-        q_tensor.shape,
-        q_tensor.stride(),
+    b, h_q, s_q, _ = q_tensor.shape
+    d_v = v_tensor.shape[-1]
+    o_tensor = torch.empty(
+        (b, s_q, h_q, d_v),
         dtype=q_tensor.dtype,
         device=q_tensor.device,
-    )
+    ).transpose(1, 2)
     lse_tensor = _allocate_lse_tensor(q_tensor)
     cache_key = _make_cache_key(
         SdpaFwdDslSm120,

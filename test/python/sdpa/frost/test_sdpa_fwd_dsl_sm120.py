@@ -153,6 +153,7 @@ def _run_case(
     s_q: int = 128,
     s_kv: int = 128,
     head_dim: int = 128,
+    head_dim_v: int | None = None,
     dtype: torch.dtype = torch.float16,
     q_tile: int | None = None,
     kv_tile: int | None = None,
@@ -167,7 +168,7 @@ def _run_case(
 ) -> None:
     q = _bhsd(batch, h_q, s_q, head_dim, dtype)
     k = _bhsd(batch, h_kv, s_kv, head_dim, dtype)
-    v = _bhsd(batch, h_kv, s_kv, head_dim, dtype)
+    v = _bhsd(batch, h_kv, s_kv, head_dim if head_dim_v is None else head_dim_v, dtype)
     scale = 1.0 / math.sqrt(head_dim) if scale is None else scale
     sinks = torch.randn(1, h_q, 1, 1, dtype=torch.float32, device="cuda") if with_sink else None
     mask_kwargs = dict(
@@ -230,8 +231,9 @@ def _run_dsl_graph(
     dtype = q_gpu.dtype
     io_dtype = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
     if o_gpu is None:
-        batch, heads, sequence, head_dim = q_gpu.shape
-        o_gpu = torch.empty(batch, sequence, heads, head_dim, dtype=dtype, device="cuda").transpose(1, 2)
+        batch, heads, sequence, _ = q_gpu.shape
+        head_dim_v = v_gpu.shape[3]
+        o_gpu = torch.empty(batch, sequence, heads, head_dim_v, dtype=dtype, device="cuda").transpose(1, 2)
 
     graph = cudnn.pygraph(
         io_data_type=io_dtype,
@@ -340,6 +342,7 @@ def _run_thd_case(
     h_q: int = 8,
     h_kv: int = 8,
     head_dim: int = 64,
+    head_dim_v: int | None = None,
     dtype: torch.dtype = torch.float16,
     is_causal: bool = False,
     causal_bottom_right: bool = False,
@@ -356,14 +359,15 @@ def _run_thd_case(
     batch = len(seq_q_lens)
     s_q_max = max(max(seq_q_lens), 1)
     s_kv_max = max(max(seq_kv_lens), 1)
+    d_v = head_dim if head_dim_v is None else head_dim_v
     scale = 1.0 / math.sqrt(head_dim)
     q_seqs = [_bhsd(1, h_q, max(n, 1), head_dim, dtype)[:, :, :n] for n in seq_q_lens]
     k_seqs = [_bhsd(1, h_kv, max(n, 1), head_dim, dtype)[:, :, :n] for n in seq_kv_lens]
-    v_seqs = [_bhsd(1, h_kv, max(n, 1), head_dim, dtype)[:, :, :n] for n in seq_kv_lens]
+    v_seqs = [_bhsd(1, h_kv, max(n, 1), d_v, dtype)[:, :, :n] for n in seq_kv_lens]
     q_view, _, q_ro = _pack_thd([s.contiguous() for s in q_seqs], s_q_max)
     k_view, _, k_ro = _pack_thd([s.contiguous() for s in k_seqs], s_kv_max)
     v_view, _, v_ro = _pack_thd([s.contiguous() for s in v_seqs], s_kv_max)
-    o_view, o_storage, o_ro = _pack_thd([torch.zeros(1, h_q, max(n, 1), head_dim, dtype=dtype, device="cuda")[:, :, :n] for n in seq_q_lens], s_q_max)
+    o_view, o_storage, o_ro = _pack_thd([torch.zeros(1, h_q, max(n, 1), d_v, dtype=dtype, device="cuda")[:, :, :n] for n in seq_q_lens], s_q_max)
     sq_t = torch.tensor(seq_q_lens, dtype=torch.int32, device="cuda").view(batch, 1, 1, 1)
     skv_t = torch.tensor(seq_kv_lens, dtype=torch.int32, device="cuda").view(batch, 1, 1, 1)
     sinks = torch.randn(1, h_q, 1, 1, dtype=torch.float32, device="cuda") if with_sink else None
@@ -422,7 +426,7 @@ def _run_thd_case(
     cu = [0]
     for n in seq_q_lens:
         cu.append(cu[-1] + n)
-    packed_o = o_storage[: cu[-1] * h_q * head_dim].view(max(cu[-1], 1), h_q, head_dim)
+    packed_o = o_storage[: cu[-1] * h_q * d_v].view(max(cu[-1], 1), h_q, d_v)
     for i, (nq, nkv) in enumerate(zip(seq_q_lens, seq_kv_lens)):
         if nq == 0:
             continue
@@ -827,6 +831,129 @@ def test_dsl_sm120_dense_flex_bhsd_contiguous():
 @torch_fork_set_rng(seed=2)
 def test_dsl_sm120_representative_head_dimensions(head_dim: int, kv_tile: int | None):
     _run_case(head_dim=head_dim, kv_tile=kv_tile)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    ("head_dim", "head_dim_v"),
+    [(192, 128), (128, 192), (96, 32), (128, 48)],
+    ids=["mla192x128", "v_wider", "small_mixed", "cross_swizzle"],
+)
+@torch_fork_set_rng(seed=23)
+def test_dsl_sm120_mixed_head_dims(head_dim: int, head_dim_v: int):
+    """D_QK != D_V: independent QK^T contraction and P@V output widths.
+
+    (192, 128) is the MLA-style shape; the K and V SMEM tiles and TMA swizzle
+    configurations differ, so a reversed pair and a small mixed pair guard the
+    per-tensor address math in both directions, and (128, 48) pins K and V on
+    DIFFERENT swizzle modes (s128b vs s32b)."""
+    _run_case(batch=2, h_q=4, h_kv=4, s_q=256, s_kv=384, head_dim=head_dim, head_dim_v=head_dim_v)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=24)
+def test_dsl_sm120_mixed_head_dims_causal_gqa_stats():
+    """MLA shape under bottom-right causal + GQA, with the LSE checked (the
+    stats path depends only on D_QK; this pins that it survives the split)."""
+    _run_case(
+        batch=2,
+        h_q=8,
+        h_kv=2,
+        s_q=192,
+        s_kv=320,
+        head_dim=192,
+        head_dim_v=128,
+        is_causal=True,
+        causal_bottom_right=True,
+        check_stats=True,
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=25)
+def test_dsl_sm120_thd_mixed_head_dims():
+    """THD packed views carry per-tensor head dims (Q/K at 192, V/O at 128)."""
+    _run_thd_case(
+        seq_q_lens=[33, 128, 7],
+        seq_kv_lens=[65, 128, 190],
+        h_q=4,
+        h_kv=2,
+        head_dim=192,
+        head_dim_v=128,
+        is_causal=True,
+        causal_bottom_right=True,
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=26)
+def test_dsl_sm120_mixed_head_dims_masks():
+    """MLA shape under the remaining mask family: top-left causal, and causal
+    with a left sliding window (the mask math lives on the QK^T side, so this
+    pins that it stays anchored to D_QK after the split)."""
+    _run_case(batch=2, h_q=4, h_kv=4, s_q=256, s_kv=256, head_dim=192, head_dim_v=128, is_causal=True)
+    _run_case(batch=2, h_q=4, h_kv=4, s_q=256, s_kv=256, head_dim=192, head_dim_v=128, is_causal=True, window_size_left=96)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=27)
+def test_dsl_sm120_mixed_head_dims_padded_stats():
+    """MLA shape + per-batch Q/KV lengths with the LSE checked: rows past
+    seq_len_q[b] zero-fill O through the epilogue's D_V-guarded store and trim
+    the LSE to -inf, so the changed store guard and the stats trim are
+    exercised together."""
+    seq_q_lens = torch.tensor([230, 120], dtype=torch.int32, device="cuda")
+    seq_kv_lens = torch.tensor([180, 240], dtype=torch.int32, device="cuda")
+    _run_case(
+        batch=2,
+        h_q=4,
+        h_kv=4,
+        s_q=256,
+        s_kv=256,
+        head_dim=192,
+        head_dim_v=128,
+        seq_q_lens=seq_q_lens,
+        seq_kv_lens=seq_kv_lens,
+        check_stats=True,
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=28)
+def test_dsl_sm120_mixed_head_dims_sink_bf16():
+    """MLA shape + attention sink with the LSE checked (the sink logit rides
+    the softmax denominator, which depends only on D_QK), on bf16 to cover the
+    second dtype."""
+    _run_case(
+        batch=2,
+        h_q=8,
+        h_kv=2,
+        s_q=256,
+        s_kv=256,
+        head_dim=192,
+        head_dim_v=128,
+        dtype=torch.bfloat16,
+        is_causal=True,
+        with_sink=True,
+        check_stats=True,
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=29)
+def test_dsl_sm120_thd_mixed_head_dims_sink():
+    """THD + mixed head dims + sink: the packed per-tensor D views and the
+    sink denominator together, without a mask (the THD mixed-dim causal case
+    is covered above)."""
+    _run_thd_case(
+        seq_q_lens=[130, 70, 9],
+        seq_kv_lens=[130, 70, 190],
+        h_q=8,
+        h_kv=2,
+        head_dim=192,
+        head_dim_v=128,
+        with_sink=True,
+    )
 
 
 @pytest.mark.L0
