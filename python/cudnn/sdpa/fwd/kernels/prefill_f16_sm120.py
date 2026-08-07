@@ -729,7 +729,8 @@ class SM120FusedMultiHeadAttentionForward:
         :param k: Key tensor.
         :param v: Value tensor.
         :param o: Output tensor.
-        :param lse: ``(B, H, Sq)`` fp32 log-sum-exp output, or ``None`` to
+        :param lse: fp32 log-sum-exp output — ``(B, H, Sq)`` dense, or
+            token-major packed ``(T, H)`` under ``thd_varlen``, or ``None`` to
             compile the LSE store out (the DSL specializes on ``None``).
         :param sinks: ``(H,)`` fp32 per-Q-head sink logits; ``None`` iff the
             kernel is configured without ``has_sink``.
@@ -1093,12 +1094,14 @@ class SM120FusedMultiHeadAttentionForward:
                         lse_q_idx = q_seq_idx + q_warp_row0 + (lane // 4) + row_half * 8
                         lse_out = cutlass.Float32(row_lse[row_half])
                         if cutlass.const_expr(self.thd_varlen):
-                            # Packed (1, H, T) LSE: rows past this sequence's Q
-                            # length belong to the NEXT sequence — never written,
-                            # and there is no padded region to trim.
+                            # Token-major packed (T, H) LSE — cuDNN's ragged
+                            # Stats layout, written directly (no transpose).
+                            # Rows past this sequence's Q length belong to the
+                            # NEXT sequence — never written, and there is no
+                            # padded region to trim.
                             if lse_q_idx < seqlen_q:
-                                lse_row = lse_arr[0, head_idx, :]
-                                lse_row[q_row_base + lse_q_idx] = lse_out
+                                lse_row = lse_arr[q_row_base + lse_q_idx, :]
+                                lse_row[head_idx] = lse_out
                         else:
                             # Rows at/past this batch's Q length trim to -inf.
                             if lse_q_idx >= seqlen_q:
@@ -1197,7 +1200,8 @@ class SM120FusedMultiHeadAttentionForward:
         :param k: Key tensor with shape ``(B, Sk, H, D)``.
         :param v: Value tensor with shape ``(B, Sk, H, D)``.
         :param o: Output tensor with shape ``(B, Sq, H, D)``.
-        :param lse: ``(B, H, Sq)`` fp32 log-sum-exp output, or ``None`` to
+        :param lse: fp32 log-sum-exp output — ``(B, H, Sq)`` dense, or
+            token-major packed ``(T, H)`` under ``thd_varlen``, or ``None`` to
             compile the LSE store out entirely (no dummy buffer needed).
         :param sinks: ``(H,)`` fp32 per-Q-head sink logits; must be ``None``
             exactly when the kernel is configured without ``has_sink``.
@@ -1225,10 +1229,16 @@ class SM120FusedMultiHeadAttentionForward:
             if cutlass.const_expr(not self.is_layout_supported(tensor.shape, tensor.stride)):
                 raise ValueError(f"{name} must use compact BSHD storage")
         if cutlass.const_expr(lse is not None):
-            if cutlass.const_expr(lse.shape != (q.shape[0], q.shape[2], q.shape[1])):
-                raise ValueError("LSE must have shape (B, H, Sq)")
-            if cutlass.const_expr(lse.stride != (q.shape[2] * q.shape[1], q.shape[1], 1)):
-                raise ValueError("LSE must be compact row-major")
+            if cutlass.const_expr(self.thd_varlen):
+                if cutlass.const_expr(lse.shape != (q.shape[1], q.shape[2])):
+                    raise ValueError("THD LSE must have shape (T, H)")
+                if cutlass.const_expr(lse.stride != (q.shape[2], 1)):
+                    raise ValueError("THD LSE must be compact token-major")
+            else:
+                if cutlass.const_expr(lse.shape != (q.shape[0], q.shape[2], q.shape[1])):
+                    raise ValueError("LSE must have shape (B, H, Sq)")
+                if cutlass.const_expr(lse.stride != (q.shape[2] * q.shape[1], q.shape[1], 1)):
+                    raise ValueError("LSE must be compact row-major")
         if cutlass.const_expr(self.has_sink != (sinks is not None)):
             raise ValueError("sinks must be provided exactly when the kernel is configured with has_sink")
         if cutlass.const_expr(sinks is not None and sinks.shape != (q.shape[2],)):
@@ -1399,8 +1409,8 @@ def compile(  # noqa: A001
     fake_lse = (
         cute.runtime.make_fake_compact_tensor(
             cutlass.Float32,
-            (fake_batch, qh, sq),
-            stride_order=(2, 1, 0),
+            (sq, qh) if PARAMS.thd_varlen else (fake_batch, qh, sq),
+            stride_order=(1, 0) if PARAMS.thd_varlen else (2, 1, 0),
             assumed_align=4,
         )
         if has_lse
