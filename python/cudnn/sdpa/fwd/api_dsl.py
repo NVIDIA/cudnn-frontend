@@ -1015,25 +1015,20 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         qh, kh = self.h_q, self.h_kv
         d_qk, d_v = self.head_dim_qk, self.head_dim_v
 
-        # Degenerate totals (a CuTe layout mode must be > 0, so the kernel cannot
-        # be launched over an empty packing; these are runtime values, invisible
-        # to the plan-time probe):
-        #   * t_q == 0 — no query token exists anywhere, so the packed O/LSE have
-        #     zero rows: nothing to compute or write.
-        #   * t_kv == 0 — every query row is fully masked; cuDNN semantics for a
-        #     dead row are O := 0, LSE := -inf (or the sink alone — its column
-        #     keeps the softmax denominator alive).
+        # Degenerate total (runtime value, invisible to the plan-time probe):
+        # t_q == 0 means no query token exists anywhere, so the packed O/LSE
+        # have zero rows — nothing to compute or write. (t_kv == 0 launches
+        # normally through the kernel's dead-row path; see the K/V binding
+        # below.)
         if t_q == 0:
             self._logger.debug("execute (THD): t_q == 0, nothing to do")
             return
         lse = None
-        lse_valid = None  # the valid-region view (first t_q tokens) the t_kv == 0 fill writes
         if lse_tensor is not None:
             if self.thd_stats_token_major:
                 # Natural packed rank-2 (T, H) view — the kernel's epilogue
                 # dispatches on this static rank.
                 lse = lse_tensor.as_strided((t_q, qh), (qh, 1), lse_tensor.storage_offset())
-                lse_valid = lse
             else:
                 head_stride = self.thd_stats_head_stride
                 self._value_error_if(
@@ -1041,18 +1036,6 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                     f"head-major THD LSE head_stride ({head_stride}) must cover the packed Q token total ({t_q})",
                 )
                 lse = lse_tensor.as_strided((1, qh, head_stride), (qh * head_stride, head_stride, 1), lse_tensor.storage_offset())
-                lse_valid = lse_tensor.as_strided((qh, t_q), (head_stride, 1), lse_tensor.storage_offset())
-        if t_kv == 0:
-            self._logger.debug("execute (THD): t_kv == 0, zeroing packed O")
-            o_buf.as_strided((t_q * qh * d_v,), (1,), o_buf.storage_offset()).zero_()
-            if lse_valid is not None:
-                if sinks is not None:
-                    sinks_v = self._checked_sinks_1d(sinks)
-                    sinks_v = sinks_v.reshape(1, qh).expand(t_q, qh) if self.thd_stats_token_major else sinks_v.reshape(qh, 1).expand(qh, t_q)
-                    lse_valid.copy_(sinks_v)
-                else:
-                    lse_valid.fill_(float("-inf"))
-            return
 
         # Per-sequence O TMA descriptors, filled by the kernel's builder pass.
         o_desc = carver.take(b * 16 + 16, torch.int64) if carver is not None else torch.zeros(b * 16 + 16, dtype=torch.int64, device=dev)
@@ -1066,9 +1049,25 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             return buf.as_strided((1, t, h, d), (t * h * d, h * d, d, 1), buf.storage_offset())
 
         Q = _packed(q_buf, t_q, qh, d_qk)
-        K = _packed(k_buf, t_kv, kh, d_qk)
-        V = _packed(v_buf, t_kv, kh, d_v)
         O = _packed(o_buf, t_q, qh, d_v)
+        if t_kv == 0:
+            # Every query row is dead (all-zero seq_kv_lens): served by the
+            # KERNEL's own dead-row path (total_sum <= 0 -> O := 0 and
+            # LSE := -inf, or the sink alone — its column keeps the softmax
+            # denominator alive), exactly like a live launch's zero-KV
+            # sequences — no adapter-side fills on the execute hot path
+            # (AGENTS.md Rule 1). A zero-token packed K/V view cannot back a
+            # CuTe layout / TMA descriptor, so clamp the packed KV extent to
+            # ONE never-dereferenced token (every tile sees kv_left ==
+            # kv_right == 0, so no K/V load is ever issued) bound over
+            # storage guaranteed large enough: Q backs K (kh*d_qk <=
+            # t_q*qh*d_qk) and O backs V (kh*d_v <= t_q*qh*d_v).
+            t_kv = 1
+            K = q_buf.as_strided((1, 1, kh, d_qk), (kh * d_qk, kh * d_qk, d_qk, 1), q_buf.storage_offset())
+            V = o_buf.as_strided((1, 1, kh, d_v), (kh * d_v, kh * d_v, d_v, 1), o_buf.storage_offset())
+        else:
+            K = _packed(k_buf, t_kv, kh, d_qk)
+            V = _packed(v_buf, t_kv, kh, d_v)
         # LSE binding: the caller's ragged Stats buffer in its declared layout
         # when a Stats output exists; None otherwise — the kernel compiles the
         # LSE store out (has_lse=False), so no dummy buffer exists at all.
@@ -1891,7 +1890,6 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         if t_q == 0:
             return
         lse = None
-        lse_valid = None  # the valid-region view (first t_q tokens) the t_kv == 0 fill writes
         if lse_tensor is not None:
             if self.thd_stats_head_major:
                 head_stride = self.thd_stats_head_stride
@@ -1900,23 +1898,8 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                     f"head-major THD LSE head_stride ({head_stride}) must cover the packed Q token total ({t_q})",
                 )
                 lse = lse_tensor.as_strided((qh, head_stride), (head_stride, 1), lse_tensor.storage_offset())
-                lse_valid = lse_tensor.as_strided((qh, t_q), (head_stride, 1), lse_tensor.storage_offset())
             else:
                 lse = lse_tensor.as_strided((t_q, qh), (qh, 1), lse_tensor.storage_offset())
-                lse_valid = lse
-        if t_kv == 0:
-            # Every row is dead: O := 0, LSE := -inf (or the sink alone —
-            # its column keeps the denominator alive). A zero-token K/V view
-            # cannot back a TMA descriptor, so short-cut both.
-            o_buf.as_strided((t_q * qh * d_v,), (1,), o_buf.storage_offset()).zero_()
-            if lse_valid is not None:
-                if sinks is not None:
-                    sinks_v = self._checked_sinks_1d(sinks)
-                    sinks_v = sinks_v.reshape(qh, 1).expand(qh, t_q) if self.thd_stats_head_major else sinks_v.reshape(1, qh).expand(t_q, qh)
-                    lse_valid.copy_(sinks_v)
-                else:
-                    lse_valid.fill_(float("-inf"))
-            return
 
         # Sinks are None-specialized like the LSE when the graph has no sink
         # token.
@@ -1931,6 +1914,25 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             heads = qh if buf is q_buf or buf is o_buf else kh
             d = d_qk if buf is q_buf or buf is k_buf else d_v
             return buf.as_strided((1, tokens, heads, d), (tokens * heads * d, heads * d, d, 1), buf.storage_offset())
+
+        if t_kv == 0:
+            # Every query row is dead (all-zero seq_kv_lens): served by the
+            # KERNEL's own dead-row path (row_sum <= 0 -> O := 0 and
+            # LSE := -inf, or the sink alone — its column keeps the softmax
+            # denominator alive), exactly like a live launch's zero-KV
+            # sequences — no adapter-side fills on the execute hot path
+            # (AGENTS.md Rule 1). A zero-token packed K/V view cannot back a
+            # CuTe layout, so clamp the packed KV extent to ONE
+            # never-dereferenced token (every sequence's KV tile range is
+            # empty, so no K/V load is ever issued) bound over storage
+            # guaranteed large enough: Q backs K (kh*d_qk <= t_q*qh*d_qk) and
+            # O backs V (kh*d_v <= t_q*qh*d_v).
+            t_kv = 1
+            K = q_buf.as_strided((1, 1, kh, d_qk), (kh * d_qk, kh * d_qk, d_qk, 1), q_buf.storage_offset())
+            V = o_buf.as_strided((1, 1, kh, d_v), (kh * d_v, kh * d_v, d_v, 1), o_buf.storage_offset())
+        else:
+            K = _packed(k_buf, t_kv)
+            V = _packed(v_buf, t_kv)
 
         if current_stream is None:
             current_stream = cuda.CUstream(torch.cuda.current_stream(dev).cuda_stream)
@@ -1953,8 +1955,8 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         )
         fn(
             _packed(q_buf, t_q),
-            _packed(k_buf, t_kv),
-            _packed(v_buf, t_kv),
+            K,
+            V,
             _packed(o_buf, t_q),
             lse,
             sinks_t,

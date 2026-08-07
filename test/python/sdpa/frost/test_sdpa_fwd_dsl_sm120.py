@@ -886,10 +886,11 @@ def test_dsl_sm120_thd_zero_length_sequence():
 @pytest.mark.parametrize("with_sink", [False, True], ids=["no_sink", "sink"])
 @torch_fork_set_rng(seed=31)
 def test_dsl_sm120_thd_all_kv_zero_stats(with_sink: bool, stats_layout: str):
-    """Every KV length zero: a zero-token K/V view cannot back a TMA
-    descriptor, so the adapter short-cut fills O := 0 and the ragged Stats
-    adapter-side — -inf, or the sink value alone (the sink column keeps the
-    softmax denominator alive) — in either declared layout."""
+    """Every KV length zero: the launch goes through the KERNEL's dead-row
+    path (O := 0, LSE := -inf, or the sink value alone — the sink column
+    keeps the softmax denominator alive) with the packed KV extent clamped
+    to one never-dereferenced token (a zero-token K/V view cannot back a
+    CuTe layout) — no adapter-side fills, in either declared layout."""
 
     _run_thd_case(seq_q_lens=[64, 32], seq_kv_lens=[0, 0], with_sink=with_sink, check_stats=True, stats_layout=stats_layout)
 
