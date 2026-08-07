@@ -889,6 +889,28 @@ def _render_block_scale_tile_constants(
             f"block-scale {cfg.name!r}: the accumulator + SF regions need {used_cols} TMEM columns but only {num_tmem_alloc_cols} are allocated"
         )
 
+    mma_m = cta_m * cta_group
+    half_m = cta_group == 2 and mma_m == 128  # unreachable while block-scale pins cta_m=128
+    if is_sm103:  # enhanced OMMA: nvfp4 (block 16) -> 6X, mxfp4 (block 32) -> 3X
+        vec_6x = bs.block_size == 16
+        sf_ids = [scales_per_inst * j % 4 for j in range(num_kblocks)]
+        sfb_extra = 4 if cta_n <= 128 else 8
+        sfa_spans = [(scales_per_inst * j // 4 * 4 * nb_m, 4 if (not vec_6x and sf_ids[j] < 2) else 8) for j in range(num_kblocks)]
+        sfb_spans = [
+            (scales_per_inst * j // 4 * 4 * nb_n, 2 * ((cta_n + 63) // 64) + (sfb_extra if (vec_6x or sf_ids[j] >= 2) else 0)) for j in range(num_kblocks)
+        ]
+    else:
+        sfa_spans = [(0, 2 if half_m else 4)]
+        sfb_spans = [(0, 2 * ((cta_n + 127) // 128) if half_m else 2 * ((cta_n + 63) // 64))]
+    for _label, _bases, _spans in (("SFA", sfa_col_bases, sfa_spans), ("SFB", sfb_col_bases, sfb_spans)):
+        _end = max(b + off + cols for b in _bases for off, cols in _spans)
+        if _end > num_tmem_alloc_cols:
+            raise NotImplementedError(
+                f"block-scale {cfg.name!r}: the hardware {_label} TMEM span reaches "
+                f"column {_end} but only {num_tmem_alloc_cols} are allocated "
+                f"(ISA 'Load {_label[-1]} scale factors'" + ("; SM Errata 160 means the hardware will NOT report OOR_ADDR here)" if _label == "SFB" else ")")
+            )
+
     # --- AB SMEM pipeline depth ----------------------------------------------
     # Per-stage SMEM = (packed data + SF) per DISTINCT operand + 2 mbar.
     per_stage = na * (sA_packed_elems + sfa_smem_bytes) + nb * (sB_packed_elems + sfb_smem_bytes) + 2 * 8
@@ -2141,16 +2163,37 @@ def _check_cta_group_geometry(config: TileConfig, cta_group: int) -> None:
 
 
 def _check_mma_n_dim(chain: FusionChain, config: TileConfig, cta_group: int) -> None:
-    """MMA n_dim rules that depend on the MMA kind, not just geometry (int8/UTCIMMA)."""
-    if DTYPE_TO_MMA_KIND.get(_mma_a_dtype(chain)) != "nvvm.Tcgen05MMAKind.INT8":
-        return
-    for label, n in (("mma_inst_n", config.mma_inst_n), ("cta_tile_n", config.cta_tile_n)):
-        if n >= 40 and (n // 8) % 2 != 0:
-            raise NotImplementedError(
-                f"int8 MMA (UTCIMMA) needs N ≤ 32 or a multiple of 16; "
-                f'config {config.name!r} has {label}={n} (ISA: "UTCIMMA only '
-                f'supports 16 step increments for N > 32 for non-.WS mode")'
-            )
+    """MMA n_dim rules that depend on the dtype / operand layout, not just geometry.
+
+    Both come from ISA table2 + the SPA model and are invisible in the geometry
+    guards; ``config.mma_inst_n`` and ``cta_tile_n`` are checked because 1ctamma
+    encodes the latter and 2ctamma the former (equal for every catalog entry).
+    """
+    ns = (("mma_inst_n", config.mma_inst_n), ("cta_tile_n", config.cta_tile_n))
+
+    # UTCIMMA is narrower than the other kinds above N=32.
+    if DTYPE_TO_MMA_KIND.get(_mma_a_dtype(chain)) == "nvvm.Tcgen05MMAKind.INT8":
+        for label, n in ns:
+            if n >= 40 and (n // 8) % 2 != 0:
+                raise NotImplementedError(
+                    f"int8 MMA (UTCIMMA) needs N ≤ 32 or a multiple of 16; "
+                    f'config {config.name!r} has {label}={n} (ISA: "UTCIMMA only '
+                    f'supports 16 step increments for N > 32 for non-.WS mode")'
+                )
+
+    # table2's "8bit-transpose B" rows tighten N for every non-HMMA kind:
+    # 1CTA 16..256 step 16, 2CTA 32..256 step 32. B is transposed iff N-major.
+    bs = chain.block_scale
+    b_dt = bs.b_dtype if bs is not None else chain.matmul.b_dtype
+    if _dtype_bits(b_dt) == 8 and chain.matmul.b_major == "n":
+        step = 32 if cta_group == 2 else 16
+        for label, n in ns:
+            if n < step or n % step != 0:
+                raise NotImplementedError(
+                    f"8-bit transposed (N-major) B needs N ≥ {step} and a multiple "
+                    f"of {step} under cta_group={cta_group}; config {config.name!r} "
+                    f"has {label}={n} (ISA table2, the '8bit-transpose B = Yes' rows)"
+                )
 
 
 def _check_dtype_config_compat(chain: FusionChain, config: TileConfig, cta_group: int) -> None:
