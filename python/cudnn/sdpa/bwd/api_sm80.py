@@ -47,12 +47,24 @@ _KERNEL_MOD = {}
 def _stream_ctx(current_stream):
     """Context manager dispatching onto ``current_stream`` (a ``cuda.CUstream``
     or raw stream int); the kernels launch on torch's current stream, so an
-    ExternalStream context routes them.  None keeps the current stream."""
+    ExternalStream context routes them.  ``None`` keeps the current stream, and
+    a raw handle equal to torch's current/default stream reuses that torch
+    stream object rather than wrapping it: ``ExternalStream(0)`` breaks
+    re-execution on some torch builds (NGC), where every launch after the
+    compile run silently no-ops (all-zero outputs; caught by test_mhas_v2's
+    determinism re-run).  Mirrors gemm/cutedsl/grouped/backend_utils.py."""
     import contextlib
 
     if current_stream is None:
         return contextlib.nullcontext()
-    return torch.cuda.stream(torch.cuda.ExternalStream(int(current_stream)))
+    handle = int(current_stream)
+    torch_current = torch.cuda.current_stream()
+    if handle in (0, 1, 2) or handle == torch_current.cuda_stream:
+        return contextlib.nullcontext()
+    torch_default = torch.cuda.default_stream()
+    if handle == torch_default.cuda_stream:
+        return torch.cuda.stream(torch_default)
+    return torch.cuda.stream(torch.cuda.ExternalStream(handle))
 
 
 # The generic kernel now supports d_qk != d_v (split sub-groups) and d up to
