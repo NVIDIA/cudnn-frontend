@@ -30,12 +30,32 @@ from dataclasses import dataclass
 from functools import partial
 from typing import Any, Callable, Optional
 
+import cudnn
 import torch
-from cuda.bindings import driver as _cuda_driver
 
 from cudnn.frost.tile_dsl.constants import SCHED_NATURAL
 from cudnn.sdpa import graph_analyzer as ga
-from cudnn.sdpa.fwd.api_dsl import SdpaFwdDsl, SdpaFwdDslSm100, SdpaFwdDslSm120
+
+# The DSL adapters (api_dsl) and cuda.bindings are LOWERING dependencies, not
+# support-check ones: importing them here would drag the CuTe DSL (~1.0 s, 357
+# modules) into every process that merely asks whether an engine could serve a
+# graph. ENGINE_SPECS therefore names its adapter, and _adapter() resolves it
+# at build time. Capabilities/mismatch below stay import-free.
+_SM100 = "SdpaFwdDslSm100"
+_SM120 = "SdpaFwdDslSm120"
+
+
+def _adapter(name: str):
+    from cudnn.sdpa.fwd import api_dsl
+
+    return getattr(api_dsl, name)
+
+
+def _cuda_driver():
+    from cuda.bindings import driver
+
+    return driver
+
 
 _LOG = logging.getLogger(__name__)
 
@@ -82,7 +102,7 @@ class Capabilities:
     # OOB-clipped. False = only the native dims above are eligible (FP8/MXFP8;
     # SM120, whose lowering has no zero-padding path wired yet).
     d_envelope: bool = False
-    dtypes: frozenset[torch.dtype] = frozenset({torch.float16, torch.bfloat16})
+    dtypes: frozenset = frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16})  # cudnn.data_type, see graph_analyzer
     is_mxfp8: bool = False  # block-scale MXFP8 engine (FP8 in + per-32-block E8M0 SF)
     is_fp8: bool = False  # per-tensor FP8 engine (FP8 in + scalar descales)
 
@@ -320,7 +340,7 @@ def _sm100_spec(d: int, d_v: Optional[int] = None) -> EngineSpec:
             d_qk=frozenset({d}),
             d_v=frozenset({d_v}),
             d_envelope=True,  # native tile box d; smaller dims via TMA zero-padding
-            dtypes=frozenset({torch.float16, torch.bfloat16}),
+            dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
             causal=True,
             bottom_right=True,
             swa=True,
@@ -339,7 +359,7 @@ def _sm100_spec(d: int, d_v: Optional[int] = None) -> EngineSpec:
             tile_ns=frozenset({128}),
             cgas=frozenset({2}),
         ),
-        lower=partial(lower_dsl_prefill, api_type=SdpaFwdDslSm100),
+        lower=partial(lower_dsl_prefill, api_type=_SM100),
     )
 
 
@@ -357,7 +377,7 @@ def _sm100_mxfp8_spec(d: int) -> EngineSpec:
             phase="prefill",
             d_qk=frozenset({d}),
             d_v=frozenset({d}),
-            dtypes=frozenset({torch.float8_e4m3fn, torch.float8_e5m2}),
+            dtypes=frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
             is_mxfp8=True,
             causal=True,
             bottom_right=True,
@@ -370,7 +390,7 @@ def _sm100_mxfp8_spec(d: int) -> EngineSpec:
             tile_ns=frozenset({128}),
             cgas=frozenset({2}),
         ),
-        lower=partial(lower_dsl_prefill, api_type=SdpaFwdDslSm100),
+        lower=partial(lower_dsl_prefill, api_type=_SM100),
     )
 
 
@@ -391,7 +411,7 @@ def _sm100_fp8_spec(d: int) -> EngineSpec:
             phase="prefill",
             d_qk=frozenset({d}),
             d_v=frozenset({d}),
-            dtypes=frozenset({torch.float8_e4m3fn, torch.float8_e5m2}),
+            dtypes=frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
             is_fp8=True,
             causal=True,
             bottom_right=True,
@@ -416,7 +436,7 @@ def _sm100_fp8_spec(d: int) -> EngineSpec:
             tile_ns=frozenset({128}),
             cgas=frozenset({2}),
         ),
-        lower=partial(lower_dsl_prefill, api_type=SdpaFwdDslSm100),
+        lower=partial(lower_dsl_prefill, api_type=_SM100),
     )
 
 
@@ -428,7 +448,7 @@ def _sm120_spec() -> EngineSpec:
             phase="prefill",
             d_qk=frozenset(range(16, 257, 16)),
             d_v=frozenset(range(16, 257, 16)),
-            dtypes=frozenset({torch.float16, torch.bfloat16}),
+            dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
             causal=True,
             bottom_right=True,
             bottom_right_with_swa=True,
@@ -447,7 +467,7 @@ def _sm120_spec() -> EngineSpec:
             tile_ns=frozenset({64, 128}),
             cgas=frozenset({1}),
         ),
-        lower=partial(lower_dsl_prefill, api_type=SdpaFwdDslSm120),
+        lower=partial(lower_dsl_prefill, api_type=_SM120),
     )
 
 
@@ -488,7 +508,7 @@ def lower_dsl_prefill(
     spec: EngineSpec,
     facts: "ga.SdpaGraphFacts",
     knobs: Optional[SdpaFwdKnobs] = None,
-    api_type: type[SdpaFwdDsl] = SdpaFwdDslSm100,
+    api_type: str = _SM100,
 ):
     """Lower one selected SDPA prefill engine through its DSL adapter.
 
@@ -516,7 +536,7 @@ def lower_dsl_prefill(
     # plumbed there — known gap) is dropped here rather than erroring at
     # execute.
     seq_q_lens_present = facts.padded and not facts.thd and facts.seq_q_t is not None and not (facts.is_mxfp8 or facts.is_fp8)
-    api = api_type(
+    api = _adapter(api_type)(
         sample_q=ga.tensor_desc_from_ir(facts.q_t, name="q"),
         sample_k=ga.tensor_desc_from_ir(facts.k_t, name="k"),
         sample_v=ga.tensor_desc_from_ir(facts.v_t, name="v"),
@@ -654,7 +674,7 @@ def lower_dsl_prefill(
             seq_q_lens=seq_q_buf if (seq_q_lens_present or facts.thd) else None,
             # Stream from the execute-time handle (raw CUstream int, the
             # ExecutionContext's stream); None keeps the default stream.
-            current_stream=_cuda_driver.CUstream(stream) if stream is not None else None,
+            current_stream=_cuda_driver().CUstream(stream) if stream is not None else None,
         )
         if facts.is_mxfp8 or facts.is_fp8:
             execute_kwargs.update(

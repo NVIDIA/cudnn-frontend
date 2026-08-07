@@ -28,14 +28,27 @@ import torch
 _LOG = logging.getLogger(__name__)
 
 
-_DTYPE_FROM_CUDNN = {
-    cudnn.data_type.HALF: torch.float16,
-    cudnn.data_type.BFLOAT16: torch.bfloat16,
-    cudnn.data_type.FP8_E4M3: torch.float8_e4m3fn,
-    cudnn.data_type.FP8_E5M2: torch.float8_e5m2,
-    cudnn.data_type.FLOAT: torch.float32,
-    cudnn.data_type.INT32: torch.int32,
+# The facts vocabulary is cudnn.data_type, not torch.dtype. Facts are what every
+# engine of a family reads, so expressing them in one framework's types would
+# make the whole dispatch path require that framework; lowering converts at its
+# own boundary, where a torch tensor is actually being allocated.
+_TORCH_FROM_CUDNN = {
+    cudnn.data_type.HALF: "float16",
+    cudnn.data_type.BFLOAT16: "bfloat16",
+    cudnn.data_type.FP8_E4M3: "float8_e4m3fn",
+    cudnn.data_type.FP8_E5M2: "float8_e5m2",
+    cudnn.data_type.FLOAT: "float32",
+    cudnn.data_type.INT32: "int32",
 }
+_KNOWN_DTYPES = frozenset(_TORCH_FROM_CUDNN)
+
+
+def to_torch_dtype(dt):
+    """cudnn.data_type -> torch.dtype, for the lowering boundary only."""
+    import torch
+
+    return getattr(torch, _TORCH_FROM_CUDNN[dt])
+
 
 # BHSD logical / BSHD physical, size-1 dims wildcarded.
 _REQ_STRIDE_ORDER = (3, 1, 2, 0)
@@ -130,7 +143,7 @@ class SdpaGraphFacts:
     d_v: int = 0
 
     # dtypes / layout
-    dtype: Optional[torch.dtype] = None  # Q dtype (None if outside the dtype map)
+    dtype: Optional[Any] = None  # Q dtype as cudnn.data_type (None if unrecognized)
     uniform_dtype: bool = True  # K/V (and O, for half) dtypes equal Q's
     bshd_layout: bool = True  # all of Q/K/V/O in BSHD-physical order
     # Relaxed dense-layout soundness: every one of Q/K/V/O has the head dim
@@ -140,7 +153,7 @@ class SdpaGraphFacts:
     dense_layout: bool = True
     is_mxfp8: bool = False  # block-scale MXFP8 (FP8 Q/K/V + per-32-block E8M0 SF)
     is_fp8: bool = False  # per-tensor FP8 (FP8 Q/K/V + scalar descales)
-    dtype_o: Optional[torch.dtype] = None  # O dtype (== Q for half; independent for FP8/MXFP8)
+    dtype_o: Optional[Any] = None  # O dtype as cudnn.data_type
 
     # masks (resolved cuDNN semantics)
     causal: bool = False  # effective causal upper bound (right band == 0)
@@ -349,14 +362,14 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
     is_mxfp8 = bool(rec.get("_is_mxfp8"))
     is_fp8 = bool(rec.get("_is_fp8"))
     _fp8_family = is_mxfp8 or is_fp8
-    q_dtype = _DTYPE_FROM_CUDNN.get(q.get_data_type())
-    o_dtype = _DTYPE_FROM_CUDNN.get(o.get_data_type())
+    q_dtype = q.get_data_type() if q.get_data_type() in _KNOWN_DTYPES else None
+    o_dtype = o.get_data_type() if o.get_data_type() in _KNOWN_DTYPES else None
     if _fp8_family:
         # FP8 in: O dtype is independent of the input; only K/V must match Q.
-        uniform = all(_DTYPE_FROM_CUDNN.get(t.get_data_type()) == q_dtype for t in (k, v))
+        uniform = all(t.get_data_type() == q_dtype for t in (k, v))
     else:
         _uniform_ports = [k, v, o] + ([rec["dO"], rec["dQ"], rec["dK"], rec["dV"]] if is_backward else [])
-        uniform = all(_DTYPE_FROM_CUDNN.get(t.get_data_type()) == q_dtype for t in _uniform_ports)
+        uniform = all(t.get_data_type() == q_dtype for t in _uniform_ports)
     _layout_ports = [(q_dim, q_stride), (k_dim, k_stride), (v_dim, v_stride), (o_dim, o_stride)]
     if is_backward:
         _layout_ports += [(dims[name], strides[name]) for name in ("dO", "dQ", "dK", "dV")]
@@ -424,9 +437,8 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
     # launch a cast kernel).
     for name, t in (("seq_len_q", seq_len_q), ("seq_len_kv", seq_len_kv)):
         if t is not None:
-            t_dtype = _DTYPE_FROM_CUDNN.get(t.get_data_type())
-            if t_dtype != torch.int32:
-                return _invalid(f"{name} must be int32; got {t_dtype}")
+            if t.get_data_type() != cudnn.data_type.INT32:
+                return _invalid(f"{name} must be int32; got {t.get_data_type()}")
 
     sink_token = rec.get("sink_token")
     if sink_token is not None:
@@ -436,9 +448,8 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         # The kernels consume fp32 sink logits directly; there is no implicit
         # conversion anywhere on the execute path (it would allocate and
         # launch a cast kernel).
-        sink_dtype = _DTYPE_FROM_CUDNN.get(sink_token.get_data_type())
-        if sink_dtype != torch.float32:
-            return _invalid(f"sink_token must be float32; got {sink_dtype}")
+        if sink_token.get_data_type() != cudnn.data_type.FLOAT:
+            return _invalid(f"sink_token must be float32; got {sink_token.get_data_type()}")
 
     stats = rec.get("stats")
     if is_backward:
@@ -682,7 +693,7 @@ def tensor_desc_from_ir(t: Any, name: str = "") -> "TensorDesc":
 
     shape = tuple(t.get_dim())
     stride = tuple(t.get_stride())
-    dtype = _DTYPE_FROM_CUDNN[t.get_data_type()]
+    dtype = to_torch_dtype(t.get_data_type())
     return TensorDesc(
         dtype=dtype,
         shape=shape,

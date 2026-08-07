@@ -43,7 +43,7 @@ import os
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
-from .engine_ids import FROST_GEMM_ID_BASE, FROST_SDPA_BWD_ID_BASE, FROST_SDPA_FWD_ID_BASE, LINEAR_ATTENTION_ID_BASE
+from .engine_ids import FAMILY_BLOCK, FROST_GEMM_ID_BASE, FROST_SDPA_BWD_ID_BASE, FROST_SDPA_FWD_ID_BASE, GDN2_ID_BASE, GDN_ID_BASE, KDA_ID_BASE
 
 _LOG = logging.getLogger("cudnn.engines.manifest")
 
@@ -61,146 +61,132 @@ def opt_in_engines_enabled() -> bool:
 class EngineFamily:
     """One family of in-tree engines, described without importing them.
 
-    A family is the unit everything else is scoped to: the node-type envelope
-    it serves, the id block its engines draw from, the arch range, the maturity
-    gate, and the facts vocabulary its graphs are described in. Splitting a
-    family (fp8 SDPA out of SDPA, say) is an implementation choice, not a new
-    concept — it costs one more entry here and nothing elsewhere.
+    A family is a KIND OF GRAPH (roughly what the backend calls an operation-graph
+    mode, at a granularity of our choosing), not a group of engines that happen to
+    ship together. Every graph belongs to exactly one family or to none, so the
+    engines within a family compete and engines across families never do.
+
+    The family owns: the id block its engines draw from, the arch range, the
+    maturity gate, and the vocabulary its graphs are described in. Two families
+    MAY share an analyzer (SDPA forward and backward do) — sharing a description
+    is their choice; what is fixed is that a graph is never claimed by two.
     """
 
-    engine_id: int  # first id of the block this family owns
+    engine_id: int  # first id of the FAMILY_BLOCK-wide block this family owns
     name: str
     module: str
     factory: str
-    anchors: frozenset  # graph must contain at least one of these node types
-    closed_under: Optional[frozenset] = None  # every node type must be in here; defaults to anchors
-    id_hi: Optional[int] = None  # exclusive end of the id block it owns
     sm_lo: int = 0  # 0 => architecture-independent
     sm_hi: int = 10_000
     opt_in: bool = False  # True => only offered with CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1
     # ("module", "callable") producing this family's facts from a graph, or None
-    # while a family still reads the graph inside its engines. Family-scoped on
-    # purpose: an SDPA fact means nothing to a GEMM engine, so there is no union
-    # type to widen and no shared record to keep two readers in sync with.
+    # while a family still reads the graph inside its engines.
     analyzer: Optional[Tuple[str, str]] = None
 
     @property
     def id_end(self) -> int:
-        return self.id_hi if self.id_hi is not None else self.engine_id + 1
+        return self.engine_id + FAMILY_BLOCK
 
     def owns(self, engine_id: int) -> bool:
         return self.engine_id <= engine_id < self.id_end
 
-    def matches(self, node_types: frozenset, sm: Optional[int]) -> bool:
+    def offered(self, sm: Optional[int]) -> bool:
+        """Whether this family is available at all — maturity gate and arch.
+
+        Classification already decided the family; this only says whether it is
+        on offer. ``sm is None`` means the probe could not answer (no cuda-python
+        in the image, no device yet), NOT "wrong arch": filtering on an unknown
+        would silently delete every arch-gated engine and leave ops that have no
+        backend lowering with nothing to run. The engine's own check_support()
+        re-checks the arch anyway.
+        """
         if self.opt_in and not opt_in_engines_enabled():
             return False
-        if not (node_types & self.anchors):
-            return False
-        if not (node_types <= (self.closed_under or self.anchors)):
-            return False
         if self.sm_lo == 0 or sm is None:
-            # sm is None means the probe could not answer (no cuda-python in the
-            # image, no device yet), NOT "this is the wrong arch". Filtering on
-            # an unknown would silently delete every arch-gated engine and leave
-            # ops that have no backend lowering with nothing to run — exactly
-            # the vanishing-engine failure this design exists to remove. The
-            # engine's own check_support() re-checks the arch anyway.
             return True
         return self.sm_lo <= sm <= self.sm_hi
 
 
-# --- node-type groups (names, so this file imports no enum) -----------------
-_GEMM_ANCHOR = frozenset({"MATMUL", "MATMUL_FP8", "MOE_GROUPED_MATMUL"})
-# The closure is a PROMISE that the family serves every node type in it. RESHAPE
-# is not in it because nothing in gemm/frost consumes a RESHAPE node: with it
-# here, matmul -> reshape matched, the analyzer compiled only the matmul, and
-# execute then asked for a buffer the caller never binds ('mm::C').
-_GEMM_CLOSURE = _GEMM_ANCHOR | frozenset({"POINTWISE", "REDUCTION", "BLOCK_SCALE_QUANTIZE", "BLOCK_SCALE_DEQUANTIZE"})
-_SDPA_FWD = frozenset({"SDPA", "SDPA_FP8", "SDPA_MXFP8"})
-_SDPA_BWD = frozenset({"SDPA_BWD"})
-_GDN = frozenset({"GDN", "GDN_BWD"})
-_GDN2 = frozenset({"GDN2", "GDN2_BWD"})
-_KDA = frozenset({"KDA", "KDA_BWD"})
+# --- classification: which FAMILY does a graph belong to ---------------------
+# A partition, not N competing claims: one node type names exactly one family,
+# so "two families claimed this graph" is not a case that can arise and is not
+# an invariant anyone has to test. Names, not enum members, so this file still
+# imports no engine code.
+_FAMILY_OF_NODE = {
+    "MATMUL": "frost_gemm",
+    "MATMUL_FP8": "frost_gemm",
+    "MOE_GROUPED_MATMUL": "frost_gemm",
+    "SDPA": "frost_sdpa_fwd",
+    "SDPA_FP8": "frost_sdpa_fwd",
+    "SDPA_MXFP8": "frost_sdpa_fwd",
+    "SDPA_BWD": "frost_sdpa_bwd",
+    "GDN": "gdn",
+    "GDN_BWD": "gdn",
+    "KDA": "kda",
+    "KDA_BWD": "kda",
+    "GDN2": "gdn2",
+    "GDN2_BWD": "gdn2",
+}
+
+# Node types that are not an op family of their own -- they attach to whatever
+# family the graph's anchor node named. Listing them here is only a cheap way to
+# skip an import the family would decline anyway; the engine's check_support()
+# is what actually decides, so a type missing from this set costs one wasted
+# import, never a wrong answer.
+_ATTACHABLE = frozenset({"POINTWISE", "REDUCTION", "BLOCK_SCALE_QUANTIZE", "BLOCK_SCALE_DEQUANTIZE"})
 
 
 # ---------------------------------------------------------------------------
-# The manifest. Append-only: a shipped engine_id is never renumbered (an
-# autotune result is (engine_id, knobs) and must replay across versions).
+# The manifest, one entry per family. Ids are pre-release (engine_ids.py), so
+# blocks may still be re-cut; once shipped, a slot is fixed forever because an
+# autotune result is (engine_id, knobs).
 # ---------------------------------------------------------------------------
 MANIFEST: Tuple[EngineFamily, ...] = (
     EngineFamily(
-        LINEAR_ATTENTION_ID_BASE + 1,
-        "gdn_frost",
-        "cudnn.linear_attention.frost.gdn_engine",
-        "GdnFrostEngine",
-        _GDN,
-        sm_lo=100,
-        sm_hi=103,
+        GDN_ID_BASE,
+        "gdn",
+        "cudnn.linear_attention",
+        "GdnEngines",
+        sm_lo=90,  # union over the family's engines; each re-checks in check_support()
     ),
     EngineFamily(
-        LINEAR_ATTENTION_ID_BASE + 2,
-        "gdn_cutile",
-        "cudnn.linear_attention.cutile.gdn_engine",
-        "GdnCuTileEngine",
-        _GDN,
+        KDA_ID_BASE,
+        "kda",
+        "cudnn.linear_attention",
+        "KdaEngines",
         sm_lo=90,
     ),
     EngineFamily(
-        LINEAR_ATTENTION_ID_BASE + 3,
-        "kda_frost",
-        "cudnn.linear_attention.frost.kda_engine",
-        "KdaFrostEngine",
-        _KDA,
+        GDN2_ID_BASE,
+        "gdn2",
+        "cudnn.linear_attention",
+        "Gdn2Engines",
         sm_lo=100,
         sm_hi=103,
     ),
     EngineFamily(
-        LINEAR_ATTENTION_ID_BASE + 4,
-        "kda_cutile",
-        "cudnn.linear_attention.cutile.kda_engine",
-        "KdaCuTileEngine",
-        _KDA,
-        sm_lo=90,
-    ),
-    EngineFamily(
-        LINEAR_ATTENTION_ID_BASE + 5,
-        "gdn2_frost",
-        "cudnn.linear_attention.frost.gdn2_engine",
-        "Gdn2FrostEngine",
-        _GDN2,
-        sm_lo=100,
-        sm_hi=103,
-    ),
-    EngineFamily(
-        FROST_GEMM_ID_BASE + 0,
+        FROST_GEMM_ID_BASE,
         "frost_gemm",
         "cudnn.gemm.frost.engine",
         "FrostGemmEngine",
-        _GEMM_ANCHOR,
-        _GEMM_CLOSURE,
-        id_hi=FROST_GEMM_ID_BASE + 100,
         sm_lo=100,
         sm_hi=103,
         opt_in=True,
     ),
     EngineFamily(
-        FROST_SDPA_FWD_ID_BASE + 0,
+        FROST_SDPA_FWD_ID_BASE,
         "frost_sdpa_fwd",
         "cudnn.sdpa.fwd.engine",
         "FrostSdpaFwdEngines",
-        _SDPA_FWD,
-        id_hi=FROST_SDPA_FWD_ID_BASE + 100,
         sm_lo=100,
         opt_in=True,
         analyzer=("cudnn.sdpa.graph_analyzer", "analyze"),
     ),
     EngineFamily(
-        FROST_SDPA_BWD_ID_BASE + 0,
+        FROST_SDPA_BWD_ID_BASE,
         "frost_sdpa_bwd",
         "cudnn.sdpa.bwd.engine",
         "FrostSdpaBwdEngines",
-        _SDPA_BWD,
-        id_hi=FROST_SDPA_BWD_ID_BASE + 100,
         # TODO: widen when an SM100/SM80 spec lands
         sm_lo=120,
         sm_hi=121,
@@ -214,13 +200,27 @@ _INSTANCES: Dict[int, Any] = {}
 
 
 def graph_node_types(graph) -> frozenset:
-    """The graph's node-type names — the coarse key. Pure python IR, no imports."""
+    """The graph's node-type names — the classification key. Pure python IR."""
     return frozenset(node.node_type.name for node in graph.nodes)
 
 
-def candidate_families(node_types: frozenset, sm: Optional[int]) -> Tuple[EngineFamily, ...]:
-    """Manifest families whose coarse key matches, in manifest order."""
-    return tuple(family for family in MANIFEST if family.matches(node_types, sm))
+def family_for(graph, sm: Optional[int]) -> Optional[EngineFamily]:
+    """The one family this graph belongs to, or None.
+
+    Classification is a lookup, so "which family" has exactly one answer by
+    construction. A graph whose node types name two different families (a matmul
+    and an sdpa in one graph) belongs to neither: no in-tree family serves that
+    shape, and the backend is the only candidate.
+
+    Returns None equally when the family exists but is not on offer here (opt-in
+    withheld, wrong arch) — the caller's next move is the same either way.
+    """
+    named = {_FAMILY_OF_NODE[n] for n in graph_node_types(graph) if n in _FAMILY_OF_NODE}
+    if len(named) != 1:
+        return None
+    name = named.pop()
+    family = next(f for f in MANIFEST if f.name == name)
+    return family if family.offered(sm) else None
 
 
 def resolve_analyzer(family: EngineFamily):
@@ -236,7 +236,16 @@ def resolve_analyzer(family: EngineFamily):
     import importlib
 
     module, attr = family.analyzer
-    return getattr(importlib.import_module(module), attr)
+    try:
+        return getattr(importlib.import_module(module), attr)
+    except ImportError as exc:
+        # Same contract as instantiate(): a missing optional dependency makes
+        # the family absent, not the graph unplannable. Importing an analyzer
+        # pulls in its package (cudnn.sdpa.__init__ -> cuda.bindings, cutlass),
+        # so without this a planning call raises instead of falling back to the
+        # backend.
+        _LOG.info("analyzer for %s is unavailable in this environment: %s", family.name, exc)
+        return None
 
 
 def instantiate(family: EngineFamily):
@@ -279,9 +288,6 @@ def instantiate(family: EngineFamily):
 
 
 def engines_for(graph, sm: Optional[int]):
-    """Every in-tree engine whose coarse key matches ``graph``, in manifest order."""
-    node_types = graph_node_types(graph)
-    out = []
-    for family in candidate_families(node_types, sm):
-        out.extend(instantiate(family))
-    return out
+    """Every in-tree engine of the graph's family, in candidate order."""
+    family = family_for(graph, sm)
+    return list(instantiate(family)) if family is not None else []

@@ -189,7 +189,10 @@ class pygraph:
                 # (a test or a caller pinning one specific engine); it is the
                 # same implementation the manifest would have instantiated.
                 # Anything else claiming that range would receive its plans.
-                if type(engine).__module__ == family.module and family.engine_id <= lo and hi <= family.id_end:
+                # A family names its package, its engines live in submodules of
+                # it, so ownership is namespace containment, not string equality.
+                mod = type(engine).__module__
+                if (mod == family.module or mod.startswith(family.module + ".")) and family.engine_id <= lo and hi <= family.id_end:
                     break
                 raise ValueError(
                     f"engine {engine.name!r} ({type(engine).__module__}) claims ids [{lo}, {hi}), which overlaps the "
@@ -834,7 +837,6 @@ class pygraph:
             if not t.is_pass_by_value:
                 t.validate()
         self._is_validated = True
-        self._attach_facts()  # dims/strides are settled above; facts read them
         # Classic parity: C++ validation happens HERE, so a config the backend
         # rejects raises from validate() where callers catch it to skip. Skipped
         # only for a graph the backend has no lowering for (GDN/KDA/...), or when
@@ -890,10 +892,6 @@ class pygraph:
                 object.__setattr__(ir, "dim", tuple(d))  # sealed (graph is frozen)
             if st and not ir.stride_assigned:
                 object.__setattr__(ir, "stride", tuple(st))
-        # Facts describe layout, and the layout just changed under them: the
-        # node count is unchanged, so nothing else would catch this.
-        self._facts.clear()
-        self._attach_facts()
 
     def create_execution_plans(self, heuristics: Optional[List] = None) -> None:
         """Build the ranked execution-plan list (the dispatch stage).
@@ -925,6 +923,19 @@ class pygraph:
                 "create_execution_plans() was already called on this graph; planning is one-shot — build a new graph to re-plan, or use select_plan() to switch plans"
             )
         self._backend_heuristics = heuristics  # read by backend_plan_entries()
+
+        # Finalize -> freeze -> analyze, in that order, BEFORE any ranking runs.
+        # build_operation_graph() is where the backend's own layout inference
+        # lands (a no-op for a graph that was never lowered), and it writes
+        # through object.__setattr__ precisely to bypass the freeze — so the
+        # snapshot has to come after it, not merely after validate(). Doing it
+        # here rather than inside Router keeps the epoch boundary out of
+        # overridable policy: every engine probe and the ranking then read one
+        # set of facts describing a graph that can no longer change.
+        self._finalize_backend_layout()
+        self._freeze()
+        self._attach_facts()
+
         router = self._router or default_router
         plans = list(router.plan(self, self._candidate_engines()))
         # Validate the FINAL router output: every entry must name an engine this
@@ -942,7 +953,6 @@ class pygraph:
             raise cudnn_graph_not_supported(f"no engine — python or backend — proposed a plan for this graph{why}")
         self._plans = plans
         self._planning_done = True
-        self._freeze()  # plans reference the graph as-is: no mutation from here
         self._plan_index = 0
 
     def _candidate_engines(self) -> List["BaseEngine"]:
@@ -965,12 +975,53 @@ class pygraph:
             self._candidates = list(self._backends) + from_manifest
         return self._candidates
 
-    def _attach_facts(self) -> None:
-        """Describe this graph in each matching family's own vocabulary.
+    def _finalize_backend_layout(self) -> None:
+        """Let the backend's layout inference land before the graph is frozen.
 
-        Part of validate(), not something a caller invokes: the graph finds its
+        Lowering to C++ and reflecting the result back is how the GRAPH learns
+        the strides it will really execute with (the IR's own are provisional
+        row-major) — a property of the graph, not of whichever engine ends up
+        serving it. So this runs the same way whether or not the caller
+        registered an out-of-tree engine; splitting those paths is what left
+        the frozen snapshot unenforceable, since the registered-engine path
+        lowered LATER, inside the Router, and _sync_ir_shapes_from_backend
+        writes through object.__setattr__ specifically to bypass the freeze.
+
+        A failure here means "the backend cannot represent this graph", which
+        is a decline — a python engine may still serve it — recorded the way
+        backend_plan_entries() records one so the two agree.
+
+        Not routed through backend_plan_entries() itself: that additionally runs
+        the C++ plan query (~178 ms for a 1024^3 bf16 matmul), which a Router is
+        entitled never to ask for.
+        """
+        import cudnn
+
+        if not self._backend_lowerable():  # no backend lowering for this op at all
+            return
+        try:
+            self._lower_backend_graph()
+        except (cudnn.cudnnGraphNotSupportedError, RuntimeError, ImportError, AttributeError) as exc:
+            _LOG.warning("backend could not build this graph, treating as a decline: %s", exc)
+            self._backend_declined = exc
+            self._lowered_graph = None
+            self._cpp_tensors.clear()
+            self._cpp_bog_done = False
+            self._cpp_plans_created = False
+            self._backend_entries = []
+
+    def _attach_facts(self) -> None:
+        """Describe this frozen graph in each matching family's vocabulary.
+
+        Part of planning, not something a caller invokes: the graph finds its
         own families through the manifest and hangs one record per family off
         itself, as an optional payload. A graph no family claims carries none.
+
+        Runs AFTER _freeze() on purpose. Analyzing a graph that can still
+        change means chasing every mutation point — the layout the backend
+        infers, a dtype set between two validate() calls, a node param written
+        in place — and missing one leaves facts describing a graph that is no
+        longer there. After the freeze there is no "later" to chase.
 
         Facts are family-scoped by construction — an SDPA fact means nothing to
         a GEMM engine — so this is a mapping, never a union record that every
@@ -979,7 +1030,8 @@ class pygraph:
         from .engines import manifest
         from .frost.buffers import current_sm
 
-        for family in manifest.candidate_families(manifest.graph_node_types(self), current_sm()):
+        family = manifest.family_for(self, current_sm())
+        if family is not None:
             analyzer = manifest.resolve_analyzer(family)
             if analyzer is not None:
                 self._facts_for(analyzer)
@@ -988,18 +1040,20 @@ class pygraph:
         """The record ``analyzer`` produced for this graph, computing it once.
 
         Keyed by the analyzer itself, so the ranking (which resolves it from
-        ``EngineFamily.analyzer`` before any engine is imported) and the engine
-        (which passes the callable it already imports) reach ONE record with no
-        family name to keep in sync. Two extractions of the same graph is how a
-        heuristics feature vector drifts from what the kernel actually does.
+        ``EngineFamily.analyzer``) and the engine (which passes the callable it
+        already imports) reach ONE record with no family name to keep in sync.
+        Two extractions of the same graph is how a heuristics feature vector
+        drifts from what the kernel actually does.
         """
+        if not self._frozen:
+            # Still mutable (a direct engine probe before planning): answer, but
+            # do not remember. Memoizing a graph that can still change is what
+            # made facts go stale across two validate() calls.
+            return analyzer(self)
         key = f"{analyzer.__module__}.{analyzer.__qualname__}"
-        n = len(self.nodes)
-        hit = self._facts.get(key)
-        if hit is None or hit[0] != n:  # node count guards against mid-build reads
-            hit = (n, analyzer(self))
-            self._facts[key] = hit
-        return hit[1]
+        if key not in self._facts:
+            self._facts[key] = analyzer(self)
+        return self._facts[key]
 
     def _unlowerable_node(self) -> Optional[Node]:
         """The first node with no C++ lowering, or None when the whole graph has one.

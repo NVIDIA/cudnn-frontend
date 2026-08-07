@@ -801,7 +801,7 @@ def test_bwd_facts_extracted():
     assert facts.right_bound == 0
     assert not facts.deterministic and not facts.has_dbias and not facts.has_dsink
     assert (facts.b, facts.h_q, facts.h_kv, facts.s_q, facts.s_kv, facts.d_qk, facts.d_v) == (B, H, H, S, S, _BWD_D, _BWD_D)
-    assert facts.dtype == torch.float16 and facts.uniform_dtype
+    assert facts.dtype == cudnn.data_type.HALF and facts.uniform_dtype  # facts speak cudnn.data_type, not torch
     assert facts.bshd_layout
     for ref in (facts.do_t, facts.dq_t, facts.dk_t, facts.dv_t, facts.stats_t):
         assert ref is not None

@@ -767,15 +767,13 @@ def test_opt_in_families_are_withheld_by_default(monkeypatch):
 
     family = _family("frost_gemm")
     assert family.opt_in, "frost_gemm is expected to still be maturing"
-    key, sm = frozenset({"MATMUL"}), family.sm_lo
+    sm = family.sm_lo
 
     monkeypatch.delenv(manifest._ENABLE_ENV, raising=False)
-    assert not family.matches(key, sm)
-    assert family not in manifest.candidate_families(key, sm)
+    assert not family.offered(sm)
 
     monkeypatch.setenv(manifest._ENABLE_ENV, "1")
-    assert family.matches(key, sm)
-    assert family in manifest.candidate_families(key, sm)
+    assert family.offered(sm)
 
 
 def test_sole_implementation_families_are_never_gated(monkeypatch):
@@ -785,7 +783,7 @@ def test_sole_implementation_families_are_never_gated(monkeypatch):
     from cudnn.engines import manifest
 
     monkeypatch.delenv(manifest._ENABLE_ENV, raising=False)
-    for name in ("gdn_frost", "gdn_cutile", "kda_frost", "kda_cutile", "gdn2_frost"):
+    for name in ("gdn", "kda", "gdn2"):
         family = _family(name)
         assert not family.opt_in, f"{name} is the only implementation of its op and must not be opt-in"
 
@@ -798,18 +796,33 @@ def test_opt_in_flag_spellings(monkeypatch, value, offered):
     assert manifest.opt_in_engines_enabled() is offered
 
 
-def test_a_closure_only_names_node_types_the_family_serves(monkeypatch):
-    """``closed_under`` is a promise, not a wish list.
+def test_classification_is_a_partition():
+    """Every node type names exactly ONE family, so "two families claimed this
+    graph" is not a case that can arise — it is a lookup, not N competing
+    claims that have to be proven disjoint."""
+    from cudnn.engines.manifest import MANIFEST, _FAMILY_OF_NODE
 
-    RESHAPE used to sit in the gemm closure with nothing in gemm/frost
-    consuming it, so ``matmul -> reshape`` matched, only the matmul was
-    compiled, and execute then demanded a buffer the caller never binds."""
+    known = {f.name for f in MANIFEST}
+    for node_type, family in _FAMILY_OF_NODE.items():
+        assert family in known, f"{node_type} names {family!r}, which is not a family"
+
+
+def test_a_graph_spanning_two_families_belongs_to_neither(monkeypatch):
+    """A matmul and an sdpa in one graph is not a gemm graph and not an sdpa
+    graph. No in-tree family serves that shape; the backend is the only
+    candidate, and saying so beats letting one family half-claim it."""
     from cudnn.engines import manifest
 
     monkeypatch.setenv(manifest._ENABLE_ENV, "1")
-    family = _family("frost_gemm")
-    assert family.matches(frozenset({"MATMUL"}), family.sm_lo)
-    assert not family.matches(frozenset({"MATMUL", "RESHAPE"}), family.sm_lo)
+
+    class Fake:
+        def __init__(self, names):
+            self.nodes = [type("N", (), {"node_type": type("T", (), {"name": n})})() for n in names]
+
+    assert manifest.family_for(Fake(["MATMUL"]), 100).name == "frost_gemm"
+    assert manifest.family_for(Fake(["MATMUL", "POINTWISE"]), 100).name == "frost_gemm"
+    assert manifest.family_for(Fake(["MATMUL", "SDPA"]), 100) is None
+    assert manifest.family_for(Fake(["POINTWISE"]), 100) is None
 
 
 def test_family_id_blocks_are_disjoint():
@@ -850,55 +863,70 @@ def _probe_analyzer(graph):
     return {"nodes": len(graph.nodes)}
 
 
-def test_validate_attaches_facts_without_anyone_asking(monkeypatch):
-    """Facts are not a call the user makes. validate() finds the graph's
-    families through the manifest, runs each declared analyzer once, and hangs
-    the records off the graph as an optional payload — a graph no family claims
-    carries none."""
+def test_planning_attaches_facts_without_anyone_asking(monkeypatch):
+    """Facts are not a call the user makes. Planning finds the graph's families
+    through the manifest, runs each declared analyzer once, and hangs the
+    records off the graph — a graph no family claims carries none.
+
+    After _freeze(), not at validate(): a snapshot of a graph that can still
+    change has to chase every mutation point, and missing one leaves facts
+    describing a graph that is no longer there."""
     from cudnn.engines import manifest
 
     _PROBE_CALLS.clear()
-    family = manifest.EngineFamily(
-        _OOT + 900,
-        "probe_family",
-        __name__,
-        "unused_factory",
-        frozenset({"MATMUL"}),
-        analyzer=(__name__, "_probe_analyzer"),
-    )
+    family = manifest.EngineFamily(_OOT + 900, "probe_family", __name__, "unused_factory", analyzer=(__name__, "_probe_analyzer"))
     monkeypatch.setattr(manifest, "MANIFEST", (family,))
+    monkeypatch.setattr(manifest, "_FAMILY_OF_NODE", {"MATMUL": "probe_family"})
 
-    g = pygraph()
+    g = pygraph(backends=[TorchMatmulEngine()])
     g.matmul(torch.randn(2, 3), torch.randn(3, 2))
     g.validate()
+    assert _PROBE_CALLS == [], "validate() must not snapshot a still-mutable graph"
 
-    assert len(_PROBE_CALLS) == 1, "validate() runs the family's analyzer itself"
+    g.create_execution_plans()
+    assert len(_PROBE_CALLS) == 1, "planning runs the family's analyzer itself"
     assert g._facts_for(_probe_analyzer) == {"nodes": 1}
     assert len(_PROBE_CALLS) == 1, "reading the payload must not re-parse"
 
-    unclaimed = pygraph()  # no MATMUL: no family, so no payload
+    unclaimed = pygraph(backends=[TorchMatmulEngine()])  # no MATMUL: no family, no payload
     unclaimed.relu(torch.randn(2, 2))
-    unclaimed.validate()
+    unclaimed.create_execution_plans()
     assert unclaimed._facts == {}
 
 
-def test_one_record_per_graph_shared_by_ranking_and_engine():
-    """The ranking resolves the analyzer from EngineFamily.analyzer before any
-    engine is imported; the engine passes the callable it already imports.
-    Keying on the analyzer itself is what makes those the SAME record — the
-    drift the backend's SDPA heuristics have, where the feature vector and the
-    engine's own view of the graph are extracted separately."""
+def test_ranking_and_engine_read_the_same_record(monkeypatch):
+    """The contract is that the ranking and the engine cannot disagree about
+    what the graph says — so exercise BOTH sides, not two calls to one
+    accessor. The ranking resolves the analyzer from EngineFamily.analyzer;
+    the engine passes the callable it already imports; keying on the analyzer
+    itself is what makes those the same object."""
     from cudnn.engines import manifest
 
-    sdpa = _family("frost_sdpa_fwd")
-    assert manifest.resolve_analyzer(sdpa) is manifest.resolve_analyzer(sdpa)
+    seen = {}
+
+    class Recording(Router):
+        def plan(self, graph, engines):
+            seen["ranking"] = graph._facts_for(_probe_analyzer)
+            return super().plan(graph, engines)
+
+    class Reader(TorchMatmulEngine):
+        name = "reader"
+        engine_id = _OOT + 901
+
+        def check_support(self, graph):
+            seen["engine"] = graph._facts_for(_probe_analyzer)
 
     _PROBE_CALLS.clear()
-    g = pygraph()
+    family = manifest.EngineFamily(_OOT + 900, "probe_family", __name__, "unused_factory", analyzer=(__name__, "_probe_analyzer"))
+    monkeypatch.setattr(manifest, "MANIFEST", (family,))
+    monkeypatch.setattr(manifest, "_FAMILY_OF_NODE", {"MATMUL": "probe_family"})
+
+    g = pygraph(router=Recording(), backends=[Reader()])
     g.matmul(torch.randn(2, 3), torch.randn(3, 2))
-    first = g._facts_for(_probe_analyzer)
-    assert g._facts_for(_probe_analyzer) is first
-    assert len(_PROBE_CALLS) == 1
+    g.create_execution_plans()
+
+    assert seen["ranking"] is seen["engine"], "ranking and engine saw different records"
+    assert len(_PROBE_CALLS) == 1, "one graph, one parse"
 
 
 def test_facts_are_recomputed_when_the_graph_grows():
@@ -1092,10 +1120,10 @@ def test_the_in_tree_owner_of_a_block_may_register_itself():
     claiming that block is a collision."""
     from cudnn.engines import manifest
 
-    family = next(f for f in manifest.MANIFEST if f.name == "gdn_frost")
+    family = next(f for f in manifest.MANIFEST if f.name == "gdn")
     engines = manifest.instantiate(family)
     if not engines:
-        pytest.skip("gdn_frost is unavailable in this environment")
+        pytest.skip("the gdn family is unavailable in this environment")
     pygraph().register_backend(engines[0])  # must not raise
 
 

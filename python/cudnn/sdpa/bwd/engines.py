@@ -24,10 +24,23 @@ from typing import Any, Callable, Optional
 
 import cudnn
 import torch
-from cuda.bindings import driver as _cuda_driver
-
 from cudnn.sdpa import graph_analyzer as ga
-from cudnn.sdpa.bwd.api_dsl import SdpaBwdDslSm120
+
+
+# Lowering dependencies, resolved at build time — see the note in fwd/engines.py:
+# importing them here would drag the CuTe DSL into every support check.
+def _adapter_sm120():
+    from cudnn.sdpa.bwd.api_dsl import SdpaBwdDslSm120
+
+    return SdpaBwdDslSm120
+
+
+def _cuda_driver():
+    from cuda.bindings import driver
+
+    return driver
+
+
 from cudnn.sdpa.bwd.config_sm120 import (
     SEQ_KV_TILES as _SM120_KV_TILES,
     SEQ_Q_TILES as _SM120_Q_TILES,
@@ -62,7 +75,7 @@ class Capabilities:
 
     arches: frozenset[tuple[int, int]]
     d: frozenset[int]  # supported head dims (d_qk == d_v required)
-    dtypes: frozenset[torch.dtype] = frozenset({torch.float16, torch.bfloat16})
+    dtypes: frozenset = frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16})  # cudnn.data_type, see graph_analyzer
 
     # optional features a backward graph may request
     gqa: bool = False  # h_q != h_kv
@@ -88,6 +101,7 @@ class Capabilities:
     padded: bool = False
     sink: bool = False
     thd: bool = False
+    cu_seq_len: bool = False  # cu_seq_len_q / cu_seq_len_kv prefix sums (no row serves these yet)
 
     # Tuning-knob domains this engine's lowering honors (see SdpaBwdKnobs).
     tile_ms: frozenset[int] = frozenset()
@@ -150,6 +164,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
         (facts.padded, capabilities.padded, "padding mask"),
         (facts.has_sink, capabilities.sink, "sink token"),
         (facts.thd, capabilities.thd, "THD / ragged"),
+        (facts.has_cu_seq_len, capabilities.cu_seq_len, "cu_seq_len_q / cu_seq_len_kv"),
         (facts.causal, capabilities.causal, "causal mask"),
     ):
         if fact and not cap:
@@ -189,7 +204,7 @@ def _sm120_spec() -> EngineSpec:
         capabilities=Capabilities(
             arches=_BLACKWELL_GEFORCE_ARCHES,
             d=frozenset(_SM120_HEAD_DIMS),
-            dtypes=frozenset({torch.float16, torch.bfloat16}),
+            dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
             causal=True,
             bottom_right=True,
             tile_ms=frozenset(_SM120_Q_TILES),
@@ -253,7 +268,10 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
     kv_geom = _bshd_geometry(facts.b, facts.h_kv, facts.s_kv, facts.d_qk)
     stats_geom = ((facts.b, facts.h_q, facts.s_q, 1), (facts.h_q * facts.s_q, facts.s_q, 1, 1))
 
-    def _desc(geom, dtype: torch.dtype, name: str) -> "Any":
+    def _desc(geom, dtype, name: str) -> "Any":
+        # facts carry cudnn.data_type; torch appears only here, where a real
+        # torch tensor is being described.
+        dtype = ga.to_torch_dtype(dtype) if dtype in ga._KNOWN_DTYPES else dtype
         from cudnn.api_base import TensorDesc
 
         dim, stride = geom
@@ -266,7 +284,7 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
             name=name,
         )
 
-    api = SdpaBwdDslSm120(
+    api = _adapter_sm120()(
         sample_q=_desc(q_geom, facts.dtype, "q"),
         sample_k=_desc(kv_geom, facts.dtype, "k"),
         sample_v=_desc(kv_geom, facts.dtype, "v"),
@@ -338,7 +356,7 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
             # Stream from the execute-time context (raw CUstream int,
             # engine plan passes ctx.stream); None keeps the adapter's
             # torch-current-stream fallback.
-            current_stream=_cuda_driver.CUstream(stream) if stream is not None else None,
+            current_stream=_cuda_driver().CUstream(stream) if stream is not None else None,
         )
         return None
 
