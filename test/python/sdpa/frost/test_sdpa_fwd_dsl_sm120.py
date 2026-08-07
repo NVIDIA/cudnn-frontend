@@ -845,8 +845,7 @@ def test_dsl_sm120_thd_bottom_right():
 @torch_fork_set_rng(seed=30)
 def test_dsl_sm120_thd_stats(stats_layout: str):
     """THD + generate_stats: the ragged Stats output is written in the
-    caller's declared layout — token-major [t, h] or head-major [h, t]
-    (the SM100 rows reject this combination — thd_stats gap)."""
+    caller's declared layout — token-major [t, h] or head-major [h, t]."""
 
     _run_thd_case(seq_q_lens=[200, 150], seq_kv_lens=[200, 150], is_causal=True, check_stats=True, stats_layout=stats_layout)
 

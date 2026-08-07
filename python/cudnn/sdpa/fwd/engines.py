@@ -157,7 +157,6 @@ class Capabilities:
     # compute it from the GLOBAL S_q — the THD variant of the
     # bottom_right_padded_seq_q gap above.
     thd_bottom_right: bool = False
-    thd_stats: bool = False  # ragged Stats output (packed token-major / head-major LSE)
     # Dense padded + stats needs the per-batch seq_len_q LSE trim (padded
     # q-rows write LSE=-inf / O=0, cuDNN >= 9.14). Plumbed for the half
     # kernels via SEQ_Q_LENS_PRESENT; the FP8/MXFP8 kernels lack the epilogue
@@ -314,8 +313,6 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                 "bottom-right causal with a dense padding mask carrying per-batch seq_len_q is not "
                 "supported (kernel anchors the BR diagonal at the global S_q, not seq_len_q[b])"
             )
-    if facts.thd and facts.wants_stats and not capabilities.thd_stats:
-        return "THD with generate_stats is not supported yet"
     if facts.padded and facts.wants_stats and not facts.thd and not capabilities.padded_stats:
         return "padding mask with generate_stats is not supported yet (per-batch seq_len_q LSE trim not plumbed)"
 
@@ -369,7 +366,6 @@ def _sm100_spec(d: int, d_v: Optional[int] = None) -> EngineSpec:
             stats=True,
             lse_optional=True,
             thd=True,
-            thd_stats=True,
             padded_stats=True,
             # The f16/bf16 lowering serves any dense B/H/S stride permutation
             # (padded strides included) with the head dim innermost; the
@@ -486,7 +482,6 @@ def _sm120_spec() -> EngineSpec:
             padded_stats=True,
             thd=True,
             thd_bottom_right=True,
-            thd_stats=True,
             layouts=frozenset({"bshd", "dense_flex"}),
             sched_policies=frozenset({SCHED_NATURAL}),
             tile_ms=frozenset({64, 128}),
