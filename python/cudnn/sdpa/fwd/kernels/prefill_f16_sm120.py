@@ -179,7 +179,8 @@ class SM120FusedMultiHeadAttentionForward:
         thd_varlen: bool = False,
         thd_batch: int = 1,
         thd_max_sq: int = 0,
-        head_tile: int = 128,
+        head_tile_qk: int = 128,
+        head_tile_v: int = 128,
         kv_tile: int = SEQ_KV_TILES[0],
         q_tile: int = SEQ_Q_TILES[0],
     ):
@@ -201,8 +202,10 @@ class SM120FusedMultiHeadAttentionForward:
             grid covers ``ceil(thd_max_sq / q_tile)`` tiles per sequence.
         :param thd_batch: THD only: the real sequence count B.
         :param thd_max_sq: THD only: the longest sequence's Q length.
-        :param head_tile: Head dimension tile. Must be a multiple of 16 between
-            16 and 256, inclusive.
+        :param head_tile_qk: Q/K head dimension (the QK^T contraction width).
+            Must be a multiple of 16 between 16 and 256, inclusive.
+        :param head_tile_v: V/O head dimension (the P@V output width). Same
+            constraint as ``head_tile_qk``.
         :param q_tile: Query sequence tile size.
         :param kv_tile: Key/value sequence tile size.
         """
@@ -223,7 +226,8 @@ class SM120FusedMultiHeadAttentionForward:
         self.thd_batch = thd_batch
         self.thd_max_sq = thd_max_sq
 
-        self.head_tile = head_tile
+        self.head_tile_qk = head_tile_qk
+        self.head_tile_v = head_tile_v
         self.q_tile = q_tile
         self.kv_tile = kv_tile
 
@@ -256,30 +260,30 @@ class SM120FusedMultiHeadAttentionForward:
         """Compute derived tile, MMA, and TMA constants from the configuration."""
 
         # Tiling
-        self.qo_tile_elems = self.q_tile * self.head_tile
-        self.kv_tile_elems = self.kv_tile * self.head_tile
+        self.k_tile_elems = self.kv_tile * self.head_tile_qk
+        self.v_tile_elems = self.kv_tile * self.head_tile_v
+        self.o_tile_elems = self.q_tile * self.head_tile_v
 
         # MMA
         self.qk_k_frags = self.kv_tile // self.MMA_TILER[1]
-        self.qk_d_frags = self.head_tile // self.MMA_TILER[2]
+        self.qk_d_frags = self.head_tile_qk // self.MMA_TILER[2]
         self.pv_v_frags = self.kv_tile // self.MMA_TILER[2]
-        self.pv_d_frags = self.head_tile // self.MMA_TILER[1]
+        self.pv_d_frags = self.head_tile_v // self.MMA_TILER[1]
 
         # TMA
-        tma_copy_head_bytes = self.head_tile * self.in_dtype.bytes
-        if tma_copy_head_bytes % 128 == 0:
-            self.tma_swizzle = cuda.TensorMapSwizzle.s128b
-            self.tma_swizzle_chunks = tma_copy_head_bytes // 128
-        elif tma_copy_head_bytes % 64 == 0:
-            self.tma_swizzle = cuda.TensorMapSwizzle.s64b
-            self.tma_swizzle_chunks = tma_copy_head_bytes // 64
-        elif tma_copy_head_bytes % 32 == 0:
-            self.tma_swizzle = cuda.TensorMapSwizzle.s32b
-            self.tma_swizzle_chunks = tma_copy_head_bytes // 32
-        else:
-            raise ValueError(f"Unsupported TMA inner dimension: {tma_copy_head_bytes} B")
+        def get_swizzle(head_tile: int):
+            head_bytes = head_tile * self.in_dtype.bytes
+            for swizzle, span in (
+                (cuda.TensorMapSwizzle.s128b, 128),
+                (cuda.TensorMapSwizzle.s64b, 64),
+                (cuda.TensorMapSwizzle.s32b, 32),
+            ):
+                if head_bytes % span == 0:
+                    return swizzle, head_bytes // span, head_tile // (head_bytes // span)
+            raise ValueError(f"Unsupported TMA inner dimension: {head_bytes} B")
 
-        self.tma_swizzle_chunk_elems = self.head_tile // self.tma_swizzle_chunks
+        self.k_tma_swizzle, self.k_tma_swizzle_chunks, self.k_swizzle_chunk_elems = get_swizzle(self.head_tile_qk)
+        self.v_tma_swizzle, self.v_tma_swizzle_chunks, self.v_swizzle_chunk_elems = get_swizzle(self.head_tile_v)
 
     @cute.jit
     def load_one_kv_tile(
@@ -349,7 +353,7 @@ class SM120FusedMultiHeadAttentionForward:
                 row_in_cta, col_in_cta = mma_offsets_in_cta[i]
                 cur_q_seq_idx = basic_params.q_seq_idx + row_in_cta
                 q_packed = cutlass.Int32(0)
-                if cur_q_seq_idx < basic_params.seqlen_q and col_in_cta < basic_params.head_dim:
+                if cur_q_seq_idx < basic_params.seqlen_q and col_in_cta < basic_params.head_dim_qk:
                     q_pair = (basic_params.q_ptr + basic_params.q_head_off + cur_q_seq_idx * basic_params.q_seq_stride + col_in_cta).load(count=2, alignment=4)
                     q_packed = q_pair.bitcast(cutlass.Int32)[0]
                 q_regs[q_regs_offset + i] = q_packed
@@ -390,16 +394,16 @@ class SM120FusedMultiHeadAttentionForward:
         def load_k_frag_pair(k_frag_pair: cutlass.Constexpr[int], d_frag: cutlass.Constexpr[int]):
             k_row_in_cta = k_frag_pair * 16 + k_row_in_frag_pair
             k_col_in_cta = d_frag * 16 + k_col_in_frag_pair
-            k_chunk = k_col_in_cta // self.tma_swizzle_chunk_elems
-            k_col_in_chunk = k_col_in_cta % self.tma_swizzle_chunk_elems
+            k_chunk = k_col_in_cta // self.k_swizzle_chunk_elems
+            k_col_in_chunk = k_col_in_cta % self.k_swizzle_chunk_elems
             k_physical_row = k_chunk * self.kv_tile + k_row_in_cta
             k_smem_ptr = (
                 mma_params.sK.data_ptr()
-                + k_physical_row * self.tma_swizzle_chunk_elems
+                + k_physical_row * self.k_swizzle_chunk_elems
                 + swizzle_xor(
                     k_physical_row,
                     k_col_in_chunk,
-                    self.tma_swizzle_chunk_elems,
+                    self.k_swizzle_chunk_elems,
                     self.in_dtype.bytes,
                 )
             )
@@ -604,16 +608,16 @@ class SM120FusedMultiHeadAttentionForward:
         def load_v_frag_pair(v_frag: cutlass.Constexpr[int], d_frag_pair: cutlass.Constexpr[int]):
             v_row_in_cta = v_frag * 16 + v_row_in_frag_pair
             v_col_in_cta = d_frag_pair * 16 + v_col_in_frag_pair
-            v_chunk = v_col_in_cta // self.tma_swizzle_chunk_elems
-            v_col_in_chunk = v_col_in_cta % self.tma_swizzle_chunk_elems
+            v_chunk = v_col_in_cta // self.v_swizzle_chunk_elems
+            v_col_in_chunk = v_col_in_cta % self.v_swizzle_chunk_elems
             v_physical_row = v_chunk * self.kv_tile + v_row_in_cta
             sV_ptr = (
                 mma_params.sV.data_ptr()
-                + v_physical_row * self.tma_swizzle_chunk_elems
+                + v_physical_row * self.v_swizzle_chunk_elems
                 + swizzle_xor(
                     v_physical_row,
                     v_col_in_chunk,
-                    self.tma_swizzle_chunk_elems,
+                    self.v_swizzle_chunk_elems,
                     self.in_dtype.bytes,
                 )
             )
@@ -775,7 +779,8 @@ class SM120FusedMultiHeadAttentionForward:
 
         num_heads_q = q.shape[2]
         num_heads_kv = k.shape[2]
-        head_dim = q.shape[3]
+        head_dim_qk = q.shape[3]
+        head_dim_v = v.shape[3]
         q_ptr = q.iterator.raw_ptr()
         o_ptr = o.iterator.raw_ptr()
 
@@ -818,18 +823,19 @@ class SM120FusedMultiHeadAttentionForward:
         has_kv_work = num_kv_tiles > 0 and (num_kv_tiles - 1) >= min_kv_tile
 
         # Shared-memory layout:
-        #   sK: one kv_tile x head_tile K tile
-        #   sV: one kv_tile x head_tile V tile
-        # The epilogue later aliases this storage as sO after compute warps
-        # finish consuming the final K/V tile.
+        #   sK: one kv_tile x head_tile_qk K tile
+        #   sV: one kv_tile x head_tile_v V tile
+        # The epilogue later aliases this storage as the q_tile x head_tile_v
+        # sO staging tile after compute warps finish consuming the final K/V
+        # tile.
         sKV = cutlass.Array(
             k.dtype,
-            max(self.kv_tile_elems * 2, self.qo_tile_elems),
+            max(self.k_tile_elems + self.v_tile_elems, self.o_tile_elems),
             space=cutlass.AddressSpace.smem,
             alignment=128,
         )
         sK = sKV
-        sV = sKV.subview(self.kv_tile_elems)
+        sV = sKV.subview(self.k_tile_elems)
         tma_mbar = cutlass.Array(cutlass.Int64, 2, space=cutlass.AddressSpace.smem, alignment=8)
         k_tma_mbar = tma_mbar
         v_tma_mbar = tma_mbar.subview(1)
@@ -941,7 +947,7 @@ class SM120FusedMultiHeadAttentionForward:
             basic_params = SimpleNamespace(
                 seqlen_q=seqlen_q,
                 seqlen_k=seqlen_k,
-                head_dim=head_dim,
+                head_dim_qk=head_dim_qk,
                 q_ptr=q_ptr,
                 batch_idx=batch_idx,
                 head_idx=head_idx,
@@ -1139,12 +1145,12 @@ class SM120FusedMultiHeadAttentionForward:
                     # Packed storage: rows past this sequence's Q length are
                     # the NEXT sequence's tokens — no store, and never the
                     # dense path's zero-fill.
-                    if store_q_seq_idx < seqlen_q and store_col_in_cta < head_dim:
+                    if store_q_seq_idx < seqlen_q and store_col_in_cta < head_dim_v:
                         gO_ptr = o_ptr + o_head_off + store_q_seq_idx * o_seq_stride + store_col_in_cta
                         sO_ptr = sO.data_ptr() + (compute_warp_idx * (self.pv_d_frags // 2) + d_frag_pair) * (16 * 16) + lane * 8
                         gO_ptr.store(sO_ptr.load(count=8, alignment=16), alignment=16)
                 else:
-                    if store_q_seq_idx < q.shape[1] and store_col_in_cta < head_dim:
+                    if store_q_seq_idx < q.shape[1] and store_col_in_cta < head_dim_v:
                         gO_ptr = o_ptr + o_head_off + store_q_seq_idx * o_seq_stride + store_col_in_cta
                         if store_q_seq_idx < seqlen_q:
                             sO_ptr = sO.data_ptr() + (compute_warp_idx * (self.pv_d_frags // 2) + d_frag_pair) * (16 * 16) + lane * 8
@@ -1200,12 +1206,15 @@ class SM120FusedMultiHeadAttentionForward:
         :param softmax_scale_log2: ``softmax_scale * log2(e)``.
         :param stream: CUDA stream used for the launch.
         """
-        head_dim = q.shape[3]
-        if cutlass.const_expr(head_dim != k.shape[3] or head_dim != v.shape[3] or head_dim != o.shape[3] or head_dim != self.head_tile):
-            raise ValueError("runtime tensor head dimensions must match the kernel head_tile")
+        head_dim_qk = q.shape[3]
+        head_dim_v = v.shape[3]
+        if cutlass.const_expr(head_dim_qk != k.shape[3] or head_dim_qk != self.head_tile_qk):
+            raise ValueError("runtime Q/K head dimensions must match the kernel head_tile_qk")
+        if cutlass.const_expr(head_dim_v != o.shape[3] or head_dim_v != self.head_tile_v):
+            raise ValueError("runtime V/O head dimensions must match the kernel head_tile_v")
         if cutlass.const_expr(
             q.shape[0] != k.shape[0]
-            or k.shape != v.shape
+            or k.shape[:3] != v.shape[:3]
             or q.shape[0] != o.shape[0]
             or q.shape[1] != o.shape[1]
             or q.shape[2] != o.shape[2]
@@ -1233,40 +1242,63 @@ class SM120FusedMultiHeadAttentionForward:
         # Split D into I contiguous C-element chunks while preserving the
         # compact (B, S, H, D) global-memory address calculation. TMA order
         # (C, S, I, H, B) linearizes the SMEM destination as [I][kv_tile][C].
-        kv_tma_layout = cute.make_layout(
+        k_tma_layout = cute.make_layout(
             (
                 k.shape[0],
                 k.shape[2],
-                self.tma_swizzle_chunks,
+                self.k_tma_swizzle_chunks,
                 k.shape[1],
-                self.tma_swizzle_chunk_elems,
+                self.k_swizzle_chunk_elems,
             ),
             stride=(
-                k.shape[1] * k.shape[2] * head_dim,
-                head_dim,
-                self.tma_swizzle_chunk_elems,
-                k.shape[2] * head_dim,
+                k.shape[1] * k.shape[2] * head_dim_qk,
+                head_dim_qk,
+                self.k_swizzle_chunk_elems,
+                k.shape[2] * head_dim_qk,
                 1,
             ),
         )
-        kv_tma_box = (
+        k_tma_box = (
             1,
             1,
-            self.tma_swizzle_chunks,
+            self.k_tma_swizzle_chunks,
             self.kv_tile,
-            self.tma_swizzle_chunk_elems,
+            self.k_swizzle_chunk_elems,
         )
         tma_k_desc = cuda.create_tensor_map_tiled_from_view(
-            cute.make_tensor(k.iterator, kv_tma_layout),
-            box_dims=kv_tma_box,
+            cute.make_tensor(k.iterator, k_tma_layout),
+            box_dims=k_tma_box,
             stride_order=(4, 3, 2, 1, 0),
-            swizzle=self.tma_swizzle,
+            swizzle=self.k_tma_swizzle,
+        )
+        v_tma_layout = cute.make_layout(
+            (
+                v.shape[0],
+                v.shape[2],
+                self.v_tma_swizzle_chunks,
+                v.shape[1],
+                self.v_swizzle_chunk_elems,
+            ),
+            stride=(
+                v.shape[1] * v.shape[2] * head_dim_v,
+                head_dim_v,
+                self.v_swizzle_chunk_elems,
+                v.shape[2] * head_dim_v,
+                1,
+            ),
+        )
+        v_tma_box = (
+            1,
+            1,
+            self.v_tma_swizzle_chunks,
+            self.kv_tile,
+            self.v_swizzle_chunk_elems,
         )
         tma_v_desc = cuda.create_tensor_map_tiled_from_view(
-            cute.make_tensor(v.iterator, kv_tma_layout),
-            box_dims=kv_tma_box,
+            cute.make_tensor(v.iterator, v_tma_layout),
+            box_dims=v_tma_box,
             stride_order=(4, 3, 2, 1, 0),
-            swizzle=self.tma_swizzle,
+            swizzle=self.v_tma_swizzle,
         )
         self.kernel(
             q,
@@ -1303,11 +1335,15 @@ def compile(  # noqa: A001
     kh: int = 1,
     sq: int = 128,
     skv: int = 128,
-    d: int = 128,
+    d_qk: int = 128,
+    d_v: int = 128,
     max_sq: int = 0,
     has_lse: bool = True,
 ) -> Callable:
     """Compile and cache one architecture-specific compact BSHD shape.
+
+    ``d_qk`` is the Q/K head dim (QK^T contraction width) and ``d_v`` the V/O
+    head dim (P@V output width); they are independent, e.g. (192, 128).
 
     THD specializations pack the batch: ``b`` is the real sequence count,
     ``sq``/``skv`` are the packed token totals, and ``max_sq`` (the longest
@@ -1330,32 +1366,33 @@ def compile(  # noqa: A001
         thd_varlen=PARAMS.thd_varlen,
         thd_batch=b,
         thd_max_sq=max_sq,
-        head_tile=d,
+        head_tile_qk=d_qk,
+        head_tile_v=d_v,
         q_tile=PARAMS.q_tile,
         kv_tile=PARAMS.kv_tile,
     )
     fake_batch = 1 if PARAMS.thd_varlen else b
     fake_q = cute.runtime.make_fake_compact_tensor(
         STORAGE_DTYPE,
-        (fake_batch, sq, qh, d),
+        (fake_batch, sq, qh, d_qk),
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
     )
     fake_k = cute.runtime.make_fake_compact_tensor(
         STORAGE_DTYPE,
-        (fake_batch, skv, kh, d),
+        (fake_batch, skv, kh, d_qk),
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
     )
     fake_v = cute.runtime.make_fake_compact_tensor(
         STORAGE_DTYPE,
-        (fake_batch, skv, kh, d),
+        (fake_batch, skv, kh, d_v),
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
     )
     fake_o = cute.runtime.make_fake_compact_tensor(
         STORAGE_DTYPE,
-        (fake_batch, sq, qh, d),
+        (fake_batch, sq, qh, d_v),
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
     )

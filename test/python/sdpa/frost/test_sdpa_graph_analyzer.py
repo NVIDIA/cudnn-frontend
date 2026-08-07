@@ -571,6 +571,18 @@ def test_sm120_probe_rejects_head_dim_not_multiple_of_16(monkeypatch):
     assert not _eligible(_mk_sm120_graph(d=136))  # multiple of 8, not of 16
 
 
+def test_sm120_probe_accepts_mixed_head_dims(monkeypatch):
+    monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
+    d_qk, d_v = 192, 128
+    g = _mk_graph()
+    q = g.tensor(dim=(B, H, S, d_qk), stride=(S * H * d_qk, d_qk, H * d_qk, 1), data_type=DTYPE, name="q")
+    k = g.tensor(dim=(B, H, S, d_qk), stride=(S * H * d_qk, d_qk, H * d_qk, 1), data_type=DTYPE, name="k")
+    v = g.tensor(dim=(B, H, S, d_v), stride=(S * H * d_v, d_v, H * d_v, 1), data_type=DTYPE, name="v")
+    o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True, use_causal_mask=True)
+    _finish_output(o, (B, H, S, d_v), (S * H * d_v, d_v, H * d_v, 1))
+    assert _SM120 in _eligible(g)
+
+
 def test_sm120_probe_accepts_stats_output(monkeypatch):
     monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
     g = _mk_graph()
