@@ -26,12 +26,21 @@ from cudnn.sdpa.fwd.engines import engine_name
 from frost_test_utils import requires_blackwell_geforce, requires_dsl
 
 
-def _select_engine(graph, name):
+def _select_engine(graph, name, tiles=None):
     """Pin the ranked entry named ``name``. A pin is strict: check_support /
-    build_plans raise if that engine declines the graph."""
+    build_plans raise if that engine declines the graph.
+
+    ``tiles`` pins one named knob entry instead of the delegation, so a test
+    can run a tile the shape-driven default would not choose."""
     names = [graph.get_plan_name_at_index(i) for i in range(len(graph.plans))]
-    assert name in names, f"engine {name!r} did not claim this graph; plans={names}"
-    graph.select_plan(names.index(name))
+    if tiles is None:
+        assert name in names, f"engine {name!r} did not claim this graph; plans={names}"
+        index = names.index(name)
+    else:
+        want = f"tile_m={tiles[0]}, tile_n={tiles[1]}"
+        index = next((i for i, n in enumerate(names) if n.startswith(name) and want in n), None)
+        assert index is not None, f"no plan for tiles {tiles}; plans={names}"
+    graph.select_plan(index)
     return graph
 
 
@@ -69,7 +78,7 @@ def _ref(qd, kd, vd, *, scale, is_causal=False, bottom_right=False, swa_window=N
     return torch.matmul(probs, v_e), probs.max().item()
 
 
-def _run(B, H_q, H_kv, S_q, S_kv, *, scale, sdpa_kwargs, seq_lens_kv=None):
+def _run(B, H_q, H_kv, S_q, S_kv, *, scale, sdpa_kwargs, seq_lens_kv=None, tiles=None):
     import cudnn
 
     dev = "cuda"
@@ -124,7 +133,7 @@ def _run(B, H_q, H_kv, S_q, S_kv, *, scale, sdpa_kwargs, seq_lens_kv=None):
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name(arch="sm120", fp8=True))
+    _select_engine(g, engine_name(arch="sm120", fp8=True), tiles=tiles)
     g.check_support()
     g.build_plans()
     vp.update({o: Ob, stats: lse, amx_s: amax_s, amx_o: amax_o})
@@ -248,3 +257,15 @@ def test_fp8_sm120_e5m2_not_offered():
         return
     names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
     assert engine_name(arch="sm120", fp8=True) not in names, f"E5M2 graph must not offer the sm120 fp8 engine; plans={names}"
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("tiles", [(64, 64), (64, 128), (128, 64), (128, 128)])
+@torch_fork_set_rng(seed=0)
+def test_fp8_sm120_every_enumerated_tile(tiles):
+    """propose_plans offers the whole tile domain, but a shape only ever runs
+    one point of it, so the rest would ship untested. S_q=256 keeps both q_tile
+    values meaningful (one full tile at 128, two at 64)."""
+    scale = 1.0 / math.sqrt(128)
+    O, O_ref, a_s, a_s_ref, a_o, a_o_ref = _run(2, 8, 8, 256, 256, scale=scale, sdpa_kwargs=dict(use_causal_mask=True), tiles=tiles)
+    _check(O, O_ref, a_s, a_s_ref, a_o, a_o_ref)
