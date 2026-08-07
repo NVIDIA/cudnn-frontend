@@ -490,7 +490,6 @@ def _render_tile_constants(cfg: TileConfig, chain: FusionChain, cta_group: int, 
         f"multicast_b = {cfg.multicast_b(cta_group)}",
         f"ab_smem_swizzle = cutlass.experimental.primitives.Tcgen05SmemSwizzle.{smem_swizzle_name}",
         f"ab_smem_swizzle_bytes = {smem_swizzle_bytes}",
-        f"ab_smem_desc_stride_byte_offset = {smem_desc_stride_byte_offset}",
         f"a_smem_desc_leading_byte_offset = {a_lbo}",
         f"a_smem_desc_stride_byte_offset = {a_sbo}",
         f"a_smem_k_step_bytes = {a_k_step}",
@@ -534,15 +533,16 @@ def _render_tile_constants(cfg: TileConfig, chain: FusionChain, cta_group: int, 
     total_tmem = _tmem_cols_for_arch()
     lines.append(f"num_tmem_alloc_cols = {total_tmem}")
     if chain.is_multi_gemm:
-        region = chain.num_gemms * cfg.cta_tile_n
+        cols_per_acc = cfg.cta_tile_n // 2 if (cta_group == 2 and cfg.cta_tile_m == 64) else cfg.cta_tile_n
+        region = chain.num_gemms * cols_per_acc
         if region > total_tmem:
             raise NotImplementedError(
-                f"multi-GEMM: {chain.num_gemms} GEMMs × cta_tile_n={cfg.cta_tile_n} "
-                f"= {region} acc cols exceed {total_tmem} TMEM (single stage). "
+                f"multi-GEMM: {chain.num_gemms} GEMMs × {cols_per_acc} acc cols "
+                f"= {region} exceed {total_tmem} TMEM (single stage). "
                 f"Pick a smaller cta_tile_n or fewer GEMMs."
             )
         acc_stages_mg = 2 if 2 * region <= total_tmem else 1
-        lines.append(f"acc_stages = {acc_stages_mg}  # multi-GEMM: {chain.num_gemms}×{cfg.cta_tile_n} cols/stage")
+        lines.append(f"acc_stages = {acc_stages_mg}  # multi-GEMM: {chain.num_gemms}×{cols_per_acc} cols/stage")
         # ab_stages: one SMEM buffer per DISTINCT operand (num_a A + num_b B per
         # stage), not the single A+B that smem_max_ab_stages assumes.
         from .tile_config import _sm_smem_ab_budget_bytes, _AB_STAGES_CAP
@@ -797,7 +797,7 @@ def _render_block_scale_tile_constants(
     _REGISTERS_PER_ATOM = 4  # cols per 128×4 utccp atom
     scales_per_inst = mma_inst_k_elems // bs.block_size
     word_scales = max(_REGISTERS_PER_ATOM, scales_per_inst)  # cols per block-word
-    word_atoms = word_scales // _REGISTERS_PER_ATOM  # atoms copied per word
+    word_atoms = -(-word_scales // _REGISTERS_PER_ATOM)  # atoms copied per word (ceil: a partial atom still costs one)
     insts_per_word = max(_REGISTERS_PER_ATOM // scales_per_inst, 1)
     num_sf_words = max(num_kblocks // insts_per_word, 1)  # utccp refreshes / k-tile
     _REGISTERS_PER_BLOCK = word_scales  # SF word width per block
@@ -891,14 +891,20 @@ def _render_block_scale_tile_constants(
 
     mma_m = cta_m * cta_group
     half_m = cta_group == 2 and mma_m == 128  # unreachable while block-scale pins cta_m=128
-    if is_sm103:  # enhanced OMMA: nvfp4 (block 16) -> 6X, mxfp4 (block 32) -> 3X
-        vec_6x = bs.block_size == 16
-        sf_ids = [scales_per_inst * j % 4 for j in range(num_kblocks)]
-        sfb_extra = 4 if cta_n <= 128 else 8
-        sfa_spans = [(scales_per_inst * j // 4 * 4 * nb_m, 4 if (not vec_6x and sf_ids[j] < 2) else 8) for j in range(num_kblocks)]
-        sfb_spans = [
-            (scales_per_inst * j // 4 * 4 * nb_n, 2 * ((cta_n + 63) // 64) + (sfb_extra if (vec_6x or sf_ids[j] >= 2) else 0)) for j in range(num_kblocks)
-        ]
+    omma_k = mma_inst_k_elems if is_fp4 else 0
+    sf_ids = [scales_per_inst * j % 4 for j in range(num_kblocks)]
+    sfb_extra = 4 if cta_n <= 128 else 8
+    sfa_off = [scales_per_inst * j // 4 * 4 * nb_m for j in range(num_kblocks)]
+    sfb_off = [scales_per_inst * j // 4 * 4 * nb_n for j in range(num_kblocks)]
+    if omma_k in (96, 128):
+        # 96 -> 3X (block 32) / 6X (block 16); 128 -> 4X (block 32) / 8X (block 16).
+        wide_vec = bs.block_size == 16  # the 6X / 8X arm
+        if omma_k == 128:  # extra-enhanced: the extra term is 8X-only
+            extra = [sfb_extra if wide_vec else 0] * num_kblocks
+        else:  # enhanced: 6X, or 3X with sfb_id >= 2
+            extra = [sfb_extra if (wide_vec or sf_ids[j] >= 2) else 0 for j in range(num_kblocks)]
+        sfa_spans = [(sfa_off[j], 4 if (not wide_vec and omma_k == 96 and sf_ids[j] < 2) else 8) for j in range(num_kblocks)]
+        sfb_spans = [(sfb_off[j], 2 * ((cta_n + 63) // 64) + extra[j]) for j in range(num_kblocks)]
     else:
         sfa_spans = [(0, 2 if half_m else 4)]
         sfb_spans = [(0, 2 * ((cta_n + 127) // 128) if half_m else 2 * ((cta_n + 63) // 64))]
