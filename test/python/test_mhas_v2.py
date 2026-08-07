@@ -357,6 +357,7 @@ def test_sdpa_random_fwd_ragged_L0(env_info, test_no, request, cudnn_handle):
         is_ragged_or_padded_or_full=RandomChoice({"ragged" : 1, "padded" : 0, "full" : 0}),
         with_sink_token=RandomChoice({True : 1, False : 3}),
         ragged_stats_layout=RandomChoice({"token_major" : 1, "head_major" : 1}),
+        with_ragged_token_gap=RandomChoice({True : 1, False : 3}),
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
 
@@ -458,6 +459,7 @@ def test_sdpa_random_bwd_ragged_L0(env_info, test_no, request, cudnn_handle):
         is_ragged_or_padded_or_full=RandomChoice({"ragged" : 1, "padded" : 0, "full" : 0}),
         is_deterministic=RandomChoice({True : 3, False : 1}),
         ragged_stats_layout=RandomChoice({"token_major" : 1, "head_major" : 1}),
+        with_ragged_token_gap=RandomChoice({True : 1, False : 3}),
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
 

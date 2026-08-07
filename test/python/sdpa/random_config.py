@@ -63,12 +63,20 @@ def compute_default_BHSD_strides(shape):
     return tuple(strides)
 
 
-def compute_packed_strides(shape):
-    """Compute packed (ragged) BSHD strides for BHSD shape: (s*h*d, d, h*d, 1)."""
+def compute_packed_strides(shape, token_gap=0):
+    """Compute packed (ragged) BSHD strides for BHSD shape: (s*h*d, d, h*d, 1).
+
+    ``token_gap`` widens the token stride to ``h*d + token_gap`` elements —
+    the layout of a tensor VIEW into a larger per-token record. With
+    ``token_gap == h*d`` this is exactly a K or V view of a kv-interleaved
+    ``[T, 2, H, D]`` buffer (token stride ``2*h*d``), the layout
+    ``torch.nn.attention.varlen`` users produce by slicing a fused KV
+    projection."""
     if shape is None:
         return None
     b, h, s, d = shape
-    return (s * h * d, d, h * d, 1)
+    token_stride = h * d + token_gap
+    return (s * token_stride, d, token_stride, 1)
 
 
 @dataclass
@@ -114,6 +122,15 @@ class ExecConfig:
     with_unfuse_fma: bool = False
     with_rope: bool = False
     with_ragged_offset_multiplier: bool = False
+    # Each ragged tensor (Q/K/V/O and gradients) independently draws a token
+    # stride h*d + gap, gap in {0, 8, 64, roundup8(h*d)} seeded from
+    # rng_geom_seed — so mixed combinations occur (e.g. gapped Q/K with packed
+    # V/O). gap≈h*d is a view of an interleaved [T, 2, H, D] buffer, the
+    # layout torch.nn.attention.varlen users produce by slicing a fused KV
+    # projection. Gaps are multiples of 8 elements so ragged base addresses
+    # keep the alignment class of the packed layout (the graph API requires
+    # 16-byte-aligned pointers; an odd gap would make every offset illegal).
+    with_ragged_token_gap: bool = False
     rescale_threshold: float = None
 
     diag_align: cudnn.diagonal_alignment = None
@@ -183,16 +200,36 @@ class ExecConfig:
         if self.shape_stats is None and all(x is not None for x in [self.batches, self.h_q, self.s_q]):
             self.shape_stats = (self.batches, self.h_q, self.s_q, 1)
 
-        # Compute strides if not provided (packed for ragged, default BHSD otherwise)
+        # Compute strides if not provided (packed for ragged, default BHSD otherwise).
+        # with_ragged_token_gap: per-tensor token-stride gaps, re-derived
+        # deterministically from rng_geom_seed (so serialize/deserialize repro
+        # reproduces the same strides).
+        if self.is_ragged and self.with_ragged_token_gap:
+            _gap_rng = random.Random((self.rng_geom_seed or 0) ^ 0xA80517)
+
+            def _gapped(shape):
+                if shape is None:
+                    return None
+                h, d = shape[1], shape[3]
+                hd8 = ((h * d + 7) // 8) * 8  # interleaved-buffer gap, alignment-preserving
+                return compute_packed_strides(shape, _gap_rng.choice([0, 8, 64, hd8]))
+
+            gap_fn = _gapped
+        elif self.is_ragged:
+            gap_fn = compute_packed_strides
+        else:
+            gap_fn = compute_default_BHSD_strides
         stride_fn = compute_packed_strides if self.is_ragged else compute_default_BHSD_strides
         if self.stride_q is None and self.shape_q is not None:
-            self.stride_q = stride_fn(self.shape_q)
+            self.stride_q = gap_fn(self.shape_q)
         if self.stride_k is None and self.shape_k is not None:
-            self.stride_k = stride_fn(self.shape_k)
+            self.stride_k = gap_fn(self.shape_k)
         if self.stride_v is None and self.shape_v is not None:
-            self.stride_v = stride_fn(self.shape_v)
+            self.stride_v = gap_fn(self.shape_v)
         if self.stride_o is None and self.shape_o is not None:
-            self.stride_o = stride_fn(self.shape_o)
+            self.stride_o = gap_fn(self.shape_o)
+        # stats keeps the packed default — its layout is fuzzed separately
+        # via ragged_stats_layout.
         if self.stride_stats is None and self.shape_stats is not None:
             self.stride_stats = stride_fn(self.shape_stats)
 
