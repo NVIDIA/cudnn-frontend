@@ -367,21 +367,46 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
     # Masks: resolve cuDNN's several spellings to (causal, bottom_right, window_left).
     use_causal = bool(rec.get("use_causal_mask", False))
     use_causal_br = bool(rec.get("use_causal_mask_bottom_right", False))
+    # FlashAttention-convention window_size=(left, right): per-side OFFSETS
+    # from the diagonal, -1/None = unbounded. Another spelling of the diagonal
+    # band (the pygraph binding enforces mutual exclusivity): the left OFFSET
+    # is the band left LENGTH - 1, the right OFFSET is the band right bound.
+    window_size = rec.get("window_size")
+    ws_left = ws_right = None
+    if window_size is not None:
+        others = _first_not_none(
+            rec.get("sliding_window_length"),
+            rec.get("diagonal_band_left_bound"),
+            rec.get("left_bound"),
+            rec.get("sliding_window"),
+            rec.get("diagonal_band_right_bound"),
+            rec.get("right_bound"),
+        )
+        if others is not None or use_causal or use_causal_br:
+            return _invalid("window_size cannot be combined with any other masking arg (it is an alias for the diagonal band)")
+        try:
+            ws_l, ws_r = window_size
+        except (TypeError, ValueError):
+            return _invalid(f"window_size must be a (left, right) pair; got {window_size!r}")
+        ws_left = (int(ws_l) + 1) if ws_l not in (None, -1) else None
+        ws_right = int(ws_r) if ws_r not in (None, -1) else None
     # Left window (== length; window offset is length-1). The op family uses several
-    # spellings for the same knob: sdpa → sliding_window_length; sdpa_mxfp8 →
-    # diagonal_band_left_bound; sdpa_fp8 → left_bound / sliding_window.
+    # spellings for the same knob: sdpa → sliding_window_length / window_size[0];
+    # sdpa_mxfp8 → diagonal_band_left_bound; sdpa_fp8 → left_bound / sliding_window.
     left_bound = _first_not_none(
         rec.get("sliding_window_length"),
         rec.get("diagonal_band_left_bound"),
         rec.get("left_bound"),
         rec.get("sliding_window"),
+        ws_left,
     )
     if use_causal or use_causal_br:
         resolved_right = 0
         align_is_br = use_causal_br
     else:
-        # Right band: diagonal_band_right_bound (sdpa/mxfp8) or right_bound (fp8).
-        resolved_right = _first_not_none(rec.get("diagonal_band_right_bound"), rec.get("right_bound"))
+        # Right band: diagonal_band_right_bound (sdpa/mxfp8), right_bound (fp8),
+        # or window_size[1].
+        resolved_right = _first_not_none(rec.get("diagonal_band_right_bound"), rec.get("right_bound"), ws_right)
         # Alignment is a property OF the diagonal band; with no band bound at all
         # there is no diagonal, so BOTTOM_RIGHT is inert — recording it as a fact
         # would make every engine reject an effectively-unmasked graph.

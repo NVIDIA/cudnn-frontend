@@ -300,6 +300,7 @@ graph.sdpa(
     diagonal_alignment=TOP_LEFT,          # Diagonal alignment: TOP_LEFT or BOTTOM_RIGHT
     diagonal_band_left_bound=None,        # Left bound for sliding window (None = no bound)
     diagonal_band_right_bound=None,       # Right bound for causal mask (0 = causal, None = no bound)
+    window_size=None,                     # FlashAttention-style (left, right) offset window (alias for the two bounds)
     dropout=None,                         # Dropout config: (prob, seed, offset) or (mask, scale)
     rng_dump=None,                        # Debug: output tensor for RNG dropout mask
     paged_attention_k_table=None,         # Page table for K container
@@ -328,6 +329,7 @@ graph.sdpa(
 - `cu_seq_len_kv` (Optional[cudnn_tensor]): Cumulative key/value sequence lengths; same shape, type, and constraints as `cu_seq_len_q`.
 - `diagonal_alignment` (Optional[cudnn.diagonal_alignment]): Alignment for diagonal masking. `TOP_LEFT` for standard causal, `BOTTOM_RIGHT` for prefix-LM style.
 - `diagonal_band_left_bound` (Optional[int]): Left bound for sliding window attention. Masks columns at or before `row_idx - left_bound`.
+- `window_size` (Optional[Tuple[int, int]]): FlashAttention-convention `(left, right)` attention window: per-side **offsets** from the (aligned) diagonal, with `-1` or `None` meaning unbounded on that side. `(-1, 0)` is plain causal, `(W, 0)` is causal with a sliding window of `W` past tokens, `(-1, R)` widens the causal bound by `R` future tokens. Equivalent to `diagonal_band_left_bound = left + 1` and `diagonal_band_right_bound = right`; anchoring still comes from `diagonal_alignment` (pass `BOTTOM_RIGHT` for FlashAttention parity). Mutually exclusive with `diagonal_band_left_bound`, `diagonal_band_right_bound`, `sliding_window_length`, `use_causal_mask`, and `use_causal_mask_bottom_right`.
 - `diagonal_band_right_bound` (Optional[int]): Right bound for causal masking. Set to 0 for causal mask. Masks columns beyond `row_idx + right_bound`.
 - `dropout` (Optional[tuple]): Dropout configuration. Either `(probability, seed, offset)` for Philox RNG or `(mask, scale)` for custom mask.
 - `rng_dump` (Optional[cudnn_tensor]): Debug tensor to capture the Philox RNG dropout mask.

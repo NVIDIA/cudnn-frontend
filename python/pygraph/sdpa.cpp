@@ -224,6 +224,60 @@ PyGraph::sdpa_internal(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
     }
 }
 
+// FlashAttention-convention attention window: a (left, right) pair of per-side
+// OFFSETS from the (aligned) diagonal, where -1 or None means "unbounded on
+// that side" — window_size=(-1, 0) is plain causal, (W, 0) adds a sliding
+// window of W past tokens, (-1, R) widens the causal bound by R future tokens.
+// Maps onto the cuDNN diagonal band: the left OFFSET W keeps k >= q - W, i.e.
+// diagonal_band_left_bound (a LENGTH) = W + 1; the right OFFSET R keeps
+// k <= q + R, i.e. diagonal_band_right_bound = R. Anchoring stays the
+// orthogonal diagonal_alignment argument (FlashAttention parity: BOTTOM_RIGHT).
+static std::pair<py::object, py::object>
+window_size_to_band_bounds(py::object const& window_size) {
+    if (!py::isinstance<py::tuple>(window_size) && !py::isinstance<py::list>(window_size)) {
+        throw std::runtime_error("window_size must be a (left, right) tuple or list of per-side offsets");
+    }
+    auto const seq = window_size.cast<py::sequence>();
+    if (seq.size() != 2) {
+        throw std::runtime_error("window_size must have exactly two entries: (left, right)");
+    }
+    auto side_to_bound = [](py::handle side, int64_t length_offset, char const* name) -> py::object {
+        if (side.is_none()) {
+            return py::none();
+        }
+        if (!py::isinstance<py::int_>(side)) {
+            throw std::runtime_error(std::string("window_size ") + name + " must be an int or None");
+        }
+        auto const offset = side.cast<int64_t>();
+        if (offset == -1) {
+            return py::none();  // -1 == unbounded, FlashAttention convention
+        }
+        if (offset < 0) {
+            throw std::runtime_error(std::string("window_size ") + name + " must be >= 0, or -1/None for unbounded");
+        }
+        return py::int_(offset + length_offset);
+    };
+    return {side_to_bound(seq[0], /*length_offset=*/1, "left"), side_to_bound(seq[1], /*length_offset=*/0, "right")};
+}
+
+static void
+throw_if_window_size_combined(bool use_causal_mask,
+                              bool use_causal_mask_bottom_right,
+                              py::object const& sliding_window,
+                              py::object const& left_bound,
+                              py::object const& right_bound) {
+    if (!sliding_window.is_none() || !left_bound.is_none() || !right_bound.is_none()) {
+        throw std::runtime_error(
+            "window_size is an alias for the diagonal band and cannot be combined with "
+            "sliding_window_length / diagonal_band_left_bound / diagonal_band_right_bound");
+    }
+    if (use_causal_mask || use_causal_mask_bottom_right) {
+        throw std::runtime_error(
+            "window_size cannot be combined with use_causal_mask / use_causal_mask_bottom_right — express causal "
+            "as window_size=(-1, 0) (with diagonal_alignment for the bottom-right variant)");
+    }
+}
+
 std::array<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>, 2>
 PyGraph::sdpa(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& k,
@@ -257,7 +311,8 @@ PyGraph::sdpa(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> sink_token,
               bool const unfuse_fma,
               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_q,
-              std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_kv) {
+              std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_kv,
+              py::object const& window_size) {
     cudnn_frontend::DataType_t mma_core_mode                            = cudnn_frontend::DataType_t::HALF;
     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> descale_q = nullptr;
     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> descale_k = nullptr;
@@ -313,6 +368,14 @@ PyGraph::sdpa(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
     if (use_causal_mask_bottom_right) {
         actual_diagonal_alignment = cudnn_frontend::DiagonalAlignment_t::BOTTOM_RIGHT;
         actual_right_bound        = py::int_(0);
+    }
+
+    // FlashAttention-convention (left, right) offset window (see
+    // window_size_to_band_bounds); exclusive with every other band spelling.
+    if (!window_size.is_none()) {
+        throw_if_window_size_combined(
+            use_causal_mask, use_causal_mask_bottom_right, sliding_window, left_bound, right_bound);
+        std::tie(actual_left_bound, actual_right_bound) = window_size_to_band_bounds(window_size);
     }
 
     auto internal_result = sdpa_internal(q,
@@ -386,7 +449,8 @@ PyGraph::sdpa_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
                        std::optional<PyCallback> fn,
                        std::optional<PyCallback> fn_bprop,
                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> sink_token,
-                       std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> dSink_token) {
+                       std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> dSink_token,
+                       py::object const& window_size) {
     auto attributes =
         cudnn_frontend::graph::SDPA_backward_attributes()
             .set_bias(bias)
@@ -445,6 +509,16 @@ PyGraph::sdpa_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
         attributes.set_max_total_seq_len_kv(max_total_seq_len_kv_value);
     }
 
+    // FlashAttention-convention (left, right) offset window (see
+    // window_size_to_band_bounds); exclusive with every other band spelling.
+    py::object actual_left_bound  = left_bound;
+    py::object actual_right_bound = right_bound;
+    if (!window_size.is_none()) {
+        throw_if_window_size_combined(
+            use_causal_mask, use_causal_mask_bottom_right, sliding_window, left_bound, right_bound);
+        std::tie(actual_left_bound, actual_right_bound) = window_size_to_band_bounds(window_size);
+    }
+
     if (!sliding_window.is_none()) {
         if (py::isinstance<py::int_>(sliding_window)) {
             int sliding_window_value = sliding_window.cast<int64_t>();
@@ -454,17 +528,17 @@ PyGraph::sdpa_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
         }
     }
 
-    if (!left_bound.is_none()) {
-        if (py::isinstance<py::int_>(left_bound)) {
-            attributes.set_diagonal_band_left_bound(left_bound.cast<int64_t>());
+    if (!actual_left_bound.is_none()) {
+        if (py::isinstance<py::int_>(actual_left_bound)) {
+            attributes.set_diagonal_band_left_bound(actual_left_bound.cast<int64_t>());
         } else {
             throw std::runtime_error("diagonal_band_left_bound must be an int (or None)");
         }
     }
 
-    if (!right_bound.is_none()) {
-        if (py::isinstance<py::int_>(right_bound)) {
-            attributes.set_diagonal_band_right_bound(right_bound.cast<int64_t>());
+    if (!actual_right_bound.is_none()) {
+        if (py::isinstance<py::int_>(actual_right_bound)) {
+            attributes.set_diagonal_band_right_bound(actual_right_bound.cast<int64_t>());
         } else {
             throw std::runtime_error("diagonal_band_right_bound must be an int (or None)");
         }
@@ -1117,6 +1191,7 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
           py::arg_v("unfuse_fma", false),
           py::arg_v("cu_seq_len_q", nullptr),
           py::arg_v("cu_seq_len_kv", nullptr),
+          py::arg_v("window_size", py::none()),
           R"pbdoc(
                 Perform scaled dot product attention.
 
@@ -1147,6 +1222,7 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
                     cu_seq_len_kv (Optional[cudnn_tensor]): Cumulative sequence length of the key, shape (b+1, 1, 1, 1) or 1-D (b+1,) (promoted automatically), int32 or int64. Mutually exclusive with seq_len_kv; pair with a Q-side tensor (seq_len_q or cu_seq_len_q) and set use_padding_mask=True. Requires cuDNN 9.24+ and UNIFIED (9.25+ if the two sides use different forms).
                 Preferred masking Args:
                     diagonal_alignment (Optional[cudnn.diagonal_alignment]): One of {"TOP_LEFT", "BOTTOM_RIGHT"}. E.g., causal masking can be performed by setting diagonal_alignment=TOP_LEFT, and diagonal_band_right_bound=0. Default is TOP_LEFT.
+                    window_size (Optional[Tuple[int, int]]): FlashAttention-convention (left, right) attention window: per-side OFFSETS from the diagonal, -1 or None = unbounded on that side. (-1, 0) is causal, (W, 0) causal + sliding window of W past tokens, (-1, R) causal widened by R future tokens. Maps to diagonal_band_left_bound = left + 1 / diagonal_band_right_bound = right; anchoring still comes from diagonal_alignment (FlashAttention parity: BOTTOM_RIGHT). Mutually exclusive with every other masking arg.
                     diagonal_band_left_bound (Optional[int]): An integer >= 1 specifying the offset to the left of the main diagonal to attend to. Default is None, implying +Inf.
                     diagonal_band_right_bound (Optional[int]): An integer >= 0 specifying the offset to the right of the main diagonal to attend to. Default is None, implying +Inf.
                 Deprecated masking Args (can cause undetermined behavior when combined with the Preferred masking args):
@@ -1194,6 +1270,7 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
           py::arg_v("score_mod_bprop", std::nullopt),
           py::arg_v("sink_token", nullptr),
           py::arg_v("dSink_token", nullptr),
+          py::arg_v("window_size", py::none()),
           R"pbdoc(
                 Compute the key, query, value gradients of scaled dot product attention.
 
@@ -1224,6 +1301,7 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
                     dSink_token (Optional[cudnn_tensor]): The sink attention token gradient tensor. Shape is (1, h_q, 1, 1), type is float32.
                 Preferred masking Args:
                     diagonal_alignment (Optional[cudnn.diagonal_alignment]): One of {"TOP_LEFT", "BOTTOM_RIGHT"}. E.g., causal masking can be performed by setting diagonal_alignment=TOP_LEFT, and diagonal_band_right_bound=0. Default is TOP_LEFT.
+                    window_size (Optional[Tuple[int, int]]): FlashAttention-convention (left, right) attention window: per-side OFFSETS from the diagonal, -1 or None = unbounded on that side. (-1, 0) is causal, (W, 0) causal + sliding window of W past tokens, (-1, R) causal widened by R future tokens. Maps to diagonal_band_left_bound = left + 1 / diagonal_band_right_bound = right; anchoring still comes from diagonal_alignment (FlashAttention parity: BOTTOM_RIGHT). Mutually exclusive with every other masking arg.
                     diagonal_band_left_bround (Optional[int]): An integer >= 1 specifying the offset to the left of the main diagonal to attend to. Default is None, implying +Inf.
                     diagonal_band_right_bound (Optional[int]): An integer >= 0 specifying the offset to the right of the main diagonal to attend to. Default is None, implying +Inf.
                 Deprecated masking Args (can cause undetermined behavior when combined with the Preferred masking args):

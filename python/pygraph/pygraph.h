@@ -57,7 +57,7 @@ class PyGraph {
     std::optional<PyCallback> callback_fn;
     std::optional<PyCallback> callback_fn_bprop;
 
-    PyGraph(Graph_t graph_) : graph(graph_) {};
+    PyGraph(Graph_t graph_) : graph(graph_){};
 
     PyGraph(std::string const&,
             cudnn_frontend::DataType_t io_data_type,
@@ -457,7 +457,8 @@ class PyGraph {
          std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> sink_token,
          bool const unfuse_fma,
          std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_q,
-         std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_kv);
+         std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_kv,
+         py::object const& window_size);
 
     // return [dQ, dK, dV]
     std::array<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>, 3>
@@ -490,7 +491,8 @@ class PyGraph {
                   std::optional<PyCallback> fn,
                   std::optional<PyCallback> fn_bprop,
                   std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> sink_token,
-                  std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> dSink_token);
+                  std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> dSink_token,
+                  py::object const& window_size);
 
     // return [o, stats, amax_s, amax_o]
     std::array<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>, 4>
