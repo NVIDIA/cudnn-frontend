@@ -157,7 +157,7 @@ class Capabilities:
     # compute it from the GLOBAL S_q — the THD variant of the
     # bottom_right_padded_seq_q gap above.
     thd_bottom_right: bool = False
-    thd_stats: bool = False  # packed LSE output plumbing is a follow-up
+    thd_stats: bool = False  # ragged Stats output (packed token-major / head-major LSE)
     # Dense padded + stats needs the per-batch seq_len_q LSE trim (padded
     # q-rows write LSE=-inf / O=0, cuDNN >= 9.14). Plumbed for the half
     # kernels via SEQ_Q_LENS_PRESENT; the FP8/MXFP8 kernels lack the epilogue
@@ -368,6 +368,7 @@ def _sm100_spec(d: int, d_v: Optional[int] = None) -> EngineSpec:
             sink=True,
             stats=True,
             thd=True,
+            thd_stats=True,
             padded_stats=True,
             # The f16/bf16 lowering serves any dense B/H/S stride permutation
             # (padded strides included) with the head dim innermost; the

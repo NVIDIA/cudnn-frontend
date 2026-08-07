@@ -1491,8 +1491,12 @@ def _correction_warp_group(
             _s_q_b = cutlass.Int32(_cu[n_batch + batch_idx + cutlass.Int32(1)]) - _cu_q_b
             if q_row_global < _s_q_b:
                 lse_arr = cutlass.make_array_view(lse_tensor)
-                lse_row = lse_arr[cutlass.Int32(0), head_idx, :]
-                lse_row[_cu_q_b + q_row_global] = lse_val
+                if cutlass.const_expr(CFG.THD_LSE_TOKEN_MAJOR):
+                    lse_row = lse_arr[cutlass.Int32(0), _cu_q_b + q_row_global, :]
+                    lse_row[head_idx] = lse_val
+                else:
+                    lse_row = lse_arr[cutlass.Int32(0), head_idx, :]
+                    lse_row[_cu_q_b + q_row_global] = lse_val
         else:
             if q_row_global < seqlen_q:
                 lse_arr = cutlass.make_array_view(lse_tensor)
@@ -1671,7 +1675,9 @@ def _host(
 
 
 @lru_cache(maxsize=None)
-def compile(b: int = 1, qh: int = 1, kh: int = 1, sq: int = 256, skv: int = 128, d_qk: int = CFG.TILE_K, d_v: int = CFG.TILE_O) -> Callable:  # noqa: A001
+def compile(
+    b: int = 1, qh: int = 1, kh: int = 1, sq: int = 256, skv: int = 128, d_qk: int = CFG.TILE_K, d_v: int = CFG.TILE_O, lse_stride: int = 0
+) -> Callable:  # noqa: A001
     """ENVELOPE: ``d_qk`` / ``d_v`` are the ACTUAL head dims (defaults = full
     TILE_K / TILE_O). TMA descriptors carry these extents while the tile box
     stays the compile-time TILE geometry: loads past d_qk / d_v zero-fill
@@ -1706,11 +1712,24 @@ def compile(b: int = 1, qh: int = 1, kh: int = 1, sq: int = 256, skv: int = 128,
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
     )
+    if CFG.THD_VARLEN:
+        # Packed ragged-Stats LSE in the caller's declared layout (align 4:
+        # the store is scalar f32 and the caller's Stats buffer only
+        # guarantees element alignment). Token-major [1, T, QH]; head-major
+        # [1, QH, head_stride] with head_stride >= T (compact when 0).
+        _lse_hs = lse_stride if lse_stride else sq
+        if _lse_hs < sq:
+            raise ValueError(f"THD head-major LSE head_stride ({_lse_hs}) must cover the packed Q token total ({sq})")
+        _fake_lse_shape = (1, sq, qh) if CFG.THD_LSE_TOKEN_MAJOR else (1, qh, _lse_hs)
+    else:
+        if lse_stride:
+            raise ValueError("lse_stride is THD-only (dense LSE is compact (B, H, Sq))")
+        _fake_lse_shape = (b, qh, sq)
     fake_lse = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32,
-        (_fake_batch, qh, sq),
+        _fake_lse_shape,
         stride_order=(2, 1, 0),
-        assumed_align=16,
+        assumed_align=4 if CFG.THD_VARLEN else 16,
     )
     fake_sinks = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32,

@@ -33,7 +33,9 @@ torch fp32 reference (atol 0.025) across single-tile, multi-tile GQA, and the
 
 THD / varlen (``CFG.THD_VARLEN=1``): packed ``[1,T,H,D]`` Q/K/V + ``cu_seqlens``
 coord offset (applied to BOTH Q slabs under TILES_Q=2), per-batch O
-TMA-descriptor array (shared ``thd_sm100.py``), packed ``[1,QH,T]`` LSE — via
+TMA-descriptor array (shared ``thd_sm100.py``), packed ragged-Stats LSE
+(head-major ``[1,QH,head_stride]`` or token-major ``[1,T,QH]`` per
+``CFG.THD_LSE_TOKEN_MAJOR``) — via
 the shared ``_common_sm100`` / ``thd_sm100`` mechanism (same as the SM100 qwen
 / dsv4 kernels).  The dense ``[B,S,H,D]`` path is byte-identical (folds out at
 ``THD_VARLEN=0``).
@@ -1812,15 +1814,22 @@ def _correction_warp_group(
                 lse_val = cutlass.Float32(arith.select(row_trim.ir_value(), neg_inf_trim.ir_value(), lse_val.ir_value()))
                 inv_sum = cutlass.Float32(arith.select(row_trim.ir_value(), cutlass.Float32(0.0).ir_value(), inv_sum.ir_value()))
             if cutlass.const_expr(CFG.THD_VARLEN):
-                # THD: q_row_global is sequence-local; LSE is packed [1,QH,T] →
-                # index [0, head, cu_q[b] + local], bound by per-sequence Q len S_q_b.
+                # THD: q_row_global is sequence-local; the packed ragged-Stats
+                # LSE is written in the caller's declared layout — head-major
+                # [1, QH, head_stride] (index [0, head, cu_q[b] + local]) or
+                # token-major [1, T, QH] (index [0, cu_q[b] + local, head]) —
+                # bound by per-sequence Q len S_q_b.
                 _cu = cutlass.make_array_view(seq_kv_lens_tensor)
                 _cu_q_b = cutlass.Int32(_cu[n_batch + batch_idx])
                 _s_q_b = cutlass.Int32(_cu[n_batch + batch_idx + cutlass.Int32(1)]) - _cu_q_b
                 if q_row_global < _s_q_b:
                     lse_arr = cutlass.make_array_view(lse_tensor)
-                    lse_row = lse_arr[cutlass.Int32(0), head_idx, :]
-                    lse_row[_cu_q_b + q_row_global] = lse_val
+                    if cutlass.const_expr(CFG.THD_LSE_TOKEN_MAJOR):
+                        lse_row = lse_arr[cutlass.Int32(0), _cu_q_b + q_row_global, :]
+                        lse_row[head_idx] = lse_val
+                    else:
+                        lse_row = lse_arr[cutlass.Int32(0), head_idx, :]
+                        lse_row[_cu_q_b + q_row_global] = lse_val
             else:
                 if q_row_global < seqlen_q:
                     lse_arr = cutlass.make_array_view(lse_tensor)
@@ -2014,11 +2023,16 @@ def _host(
 
 
 @lru_cache(maxsize=None)
-def compile(b: int = 1, qh: int = 1, kh: int = 1, sq: int = 256, skv: int = 128, d_qk: int = CFG.TILE_K, d_v: int = CFG.TILE_O) -> Callable:  # noqa: A001
+def compile(
+    b: int = 1, qh: int = 1, kh: int = 1, sq: int = 256, skv: int = 128, d_qk: int = CFG.TILE_K, d_v: int = CFG.TILE_O, lse_stride: int = 0
+) -> Callable:  # noqa: A001
     """Compile a kernel with ALL dims concrete to pin TMA descriptor strides at compile time.
 
     THD/varlen: q/k/v/o/lse are PACKED with batch dim 1 ([1,T,H,D]); ``b`` is the
     LOGICAL batch (sequence count) driving n_batch / metadata + O-desc sizes.
+    ``lse_stride`` (THD head-major LSE only) is the caller-declared head-row
+    stride of the packed [1, QH, head_stride] LSE (0 → compact, i.e. ``sq``);
+    it is a shape, so it is part of this cache key.
 
     ENVELOPE: ``d_qk`` / ``d_v`` are the ACTUAL head dims (defaults = the
     flavor's full TILE_K / TILE_O). The Q/K/V/O TMA descriptors are built from
@@ -2057,11 +2071,24 @@ def compile(b: int = 1, qh: int = 1, kh: int = 1, sq: int = 256, skv: int = 128,
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
     )
+    if CFG.THD_VARLEN:
+        # Packed ragged-Stats LSE in the caller's declared layout (align 4:
+        # the store is scalar f32 and the caller's Stats buffer only
+        # guarantees element alignment). Token-major [1, T, QH]; head-major
+        # [1, QH, head_stride] with head_stride >= T (compact when 0).
+        _lse_hs = lse_stride if lse_stride else sq
+        if _lse_hs < sq:
+            raise ValueError(f"THD head-major LSE head_stride ({_lse_hs}) must cover the packed Q token total ({sq})")
+        _fake_lse_shape = (1, sq, qh) if CFG.THD_LSE_TOKEN_MAJOR else (1, qh, _lse_hs)
+    else:
+        if lse_stride:
+            raise ValueError("lse_stride is THD-only (dense LSE is compact (B, H, Sq))")
+        _fake_lse_shape = (b, qh, sq)
     fake_lse = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32,
-        (_fake_batch, qh, sq),
+        _fake_lse_shape,
         stride_order=(2, 1, 0),
-        assumed_align=16,
+        assumed_align=4 if CFG.THD_VARLEN else 16,
     )
     # Sinks tensor always part of the ABI; read only when CFG.HAS_SINK == 1 (compile-time fold).
     fake_sinks = cute.runtime.make_fake_compact_tensor(

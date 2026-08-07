@@ -459,6 +459,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         self.flavor: Optional[tuple[int, int]] = None
         self.mask_flags = 0
         self.swa_window_runtime = 0
+        self.thd_stats_token_major = False
+        self.thd_stats_head_stride = 0
         self._k_mod = None
 
     def check_support(self) -> bool:
@@ -545,13 +547,21 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             )
             self.dtype_o = self.dtype
         if self.lse_desc is not None:
-            # THD stats are not plumbed (the kernel's packed (1, H, T) LSE does
-            # not match cuDNN's ragged Stats contract) — reject the request
-            # instead of silently never writing the user's LSE.
-            self._not_implemented_error_if(self.thd, "THD stats/LSE output is not plumbed yet; construct without sample_lse")
             self._check_dtype(self.lse_desc, torch.float32, name="LSE")
             self._check_tensor_shape(self.lse_desc, (b, h_qo, s_qo), name="LSE")
-            self._value_error_if(not self.lse_desc.is_contiguous(), "LSE must be contiguous on SM100 DSL")
+            if self.thd:
+                stride_h, stride_s = tuple(self.lse_desc.stride[1:])
+                token_major = (stride_h, stride_s) == (1, h_qo)
+                head_major = not token_major and stride_s == 1 and stride_h >= 1
+                self._value_error_if(
+                    not token_major and not head_major,
+                    f"THD LSE must be packed token-major (stride_h == 1, stride_s == H) "
+                    f"or head-major (stride_s == 1, stride_h == head_stride); got stride {self.lse_desc.stride}",
+                )
+                self.thd_stats_token_major = token_major
+                self.thd_stats_head_stride = int(stride_h) if head_major else 0
+            else:
+                self._value_error_if(not self.lse_desc.is_contiguous(), "LSE must be contiguous on SM100 DSL")
 
         self._value_error_if(not torch.cuda.is_available(), "CUDA must be available for SM100 DSL SDPA")
         device = self.q_desc.device
@@ -713,6 +723,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             seq_q_lens_present=self.seq_q_lens_present,
             sched_policy=sched_policy,
             thd_varlen=self.thd,
+            thd_lse_token_major=self.thd and self.thd_stats_token_major,
             fused_ldtm_stat=fused_ldtm_stat,
         )
         self._k_mod = _load_sm100_kernel_module(self.flavor, params, fp8=self._fp8, pertensor=self._pertensor)
@@ -760,15 +771,19 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         b, qh = self.batch_size, self.h_q
         if self.thd:
             # [slq32 | slk32 | meta(seq_kv, cu_q, cu_k) | o_desc | packed LSE | sinks dummy]
-            # The packed LSE is sized for the worst case t_q = B * S_q_max
-            # (per-execute t_q is a runtime value; every carve stays within
-            # this bound). o_desc: 16 int64 per sequence + 16 spare, the
-            # per-sequence O TMA descriptors the builder kernel fills.
+            # The packed-LSE scratch exists only when NO Stats output is
+            # declared (the kernel always writes an LSE; with a Stats output
+            # it writes the caller's ragged Stats buffer directly — token-major
+            # (T, H) or head-major (H, head_stride) — and no dummy is carved).
+            # It is sized for the worst case t_q = B * S_q_max (per-execute
+            # t_q is a runtime value; every carve stays within this bound).
+            # o_desc: 16 int64 per sequence + 16 spare, the per-sequence O TMA
+            # descriptors the builder kernel fills.
             return (
                 2 * ws_align(b * 4)
                 + ws_align((3 * b + 2) * 4)
                 + ws_align((b * 16 + 16) * 8)
-                + ws_align(qh * b * self.s_q_max * 4)
+                + (0 if self.lse_desc is not None else ws_align(qh * b * self.s_q_max * 4))
                 + (0 if self.has_sink else ws_align(qh * 4))
             )
         if self._fp8:
@@ -834,11 +849,15 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             "lse_tensor is required by this compiled specialization",
         )
         if self.thd:
-            # The kernel's packed-LSE scratch is api-level workspace; a
-            # user-facing THD LSE output is not plumbed, so reject rather than
-            # silently never writing the caller's buffer (check_support already
-            # rejects thd + sample_lse).
-            self._not_implemented_error_if(lse_tensor is not None, "THD stats/LSE output is not plumbed yet")
+            # A THD lse_tensor is bound in its DECLARED packed layout
+            # (token-major / head-major, recorded at check_support); without a
+            # sample_lse there is no layout to bind it under, so reject rather
+            # than guess. Dense keeps accepting an extra lse_tensor (the SM100
+            # kernels always write an LSE — see the else-branch dummy below).
+            self._value_error_if(
+                self.lse_desc is None and lse_tensor is not None,
+                "this specialization was compiled without an LSE output; construct the API with sample_lse",
+            )
         elif lse_tensor is not None:
             lse_tensor = self._checked_lse_view(lse_tensor)
         else:
@@ -900,7 +919,17 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
 
         if self.thd:
             self._execute_thd(
-                q_tensor, k_tensor, v_tensor, o_tensor, scale_softmax_log2, sinks, seq_kv_lens, seq_q_lens, workspace=workspace, current_stream=current_stream
+                q_tensor,
+                k_tensor,
+                v_tensor,
+                o_tensor,
+                scale_softmax_log2,
+                sinks,
+                seq_kv_lens,
+                seq_q_lens,
+                lse_tensor=lse_tensor,
+                workspace=workspace,
+                current_stream=current_stream,
             )
             return
 
@@ -950,16 +979,21 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             O_view.copy_(O_scratch)
         self._logger.debug("execute completed")
 
-    def _execute_thd(self, q_buf, k_buf, v_buf, o_buf, scale_softmax_log2, sinks, seq_len_kv, seq_q_lens, workspace=None, current_stream=None):
+    def _execute_thd(self, q_buf, k_buf, v_buf, o_buf, scale_softmax_log2, sinks, seq_len_kv, seq_q_lens, lse_tensor=None, workspace=None, current_stream=None):
         """THD / varlen execute: reconstruct the kernel's packed [1, T, H, D] views and metadata buffer from the cuDNN ragged buffers, then launch.
 
         With a ``workspace`` the metadata buffers (int32 length copies, the
         [seq_kv | cu_q | cu_k] buffer, the per-sequence O TMA descriptors, the
-        packed LSE, the sinks dummy) are carved from it — zero per-execute
-        allocations; without one they are torch-allocated (standalone use).
-        The host round-trip for the runtime totals (t_q / t_kv / unit count)
-        is inherent to the lowering — the packed extents are data-dependent —
-        and costs one D2H sync per length tensor, no device allocation."""
+        packed-LSE scratch (stats-less graphs only), the sinks dummy) are
+        carved from it — zero per-execute allocations; without one they are
+        torch-allocated (standalone use). ``lse_tensor``, when given, is the
+        caller's ragged Stats buffer, written by the kernel directly in its
+        declared layout: token-major packed ``(T, H)`` in the first ``T*H``
+        elements, or head-major ``(H, head_stride)`` with tokens contiguous
+        within each head row. The host round-trip for the runtime totals
+        (t_q / t_kv / unit count) is inherent to the lowering — the packed
+        extents are data-dependent — and costs one D2H sync per length
+        tensor, no device allocation."""
         import cutlass
 
         dev = q_buf.device
@@ -999,13 +1033,35 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         #   * t_q == 0 — no query token exists anywhere, so the packed O/LSE have
         #     zero rows: nothing to compute or write.
         #   * t_kv == 0 — every query row is fully masked; cuDNN semantics for a
-        #     dead row are O := 0 (LSE := -inf, but THD stats are not supported).
+        #     dead row are O := 0, LSE := -inf (or the sink alone — its column
+        #     keeps the softmax denominator alive).
         if t_q == 0:
             self._logger.debug("execute (THD): t_q == 0, nothing to do")
             return
+        lse = None
+        lse_valid = None  # the valid-region view (first t_q tokens) the t_kv == 0 fill writes
+        if lse_tensor is not None:
+            if self.thd_stats_token_major:
+                lse = lse_tensor.as_strided((1, t_q, qh), (t_q * qh, qh, 1), lse_tensor.storage_offset())
+                lse_valid = lse_tensor.as_strided((t_q, qh), (qh, 1), lse_tensor.storage_offset())
+            else:
+                head_stride = self.thd_stats_head_stride
+                self._value_error_if(
+                    head_stride < t_q,
+                    f"head-major THD LSE head_stride ({head_stride}) must cover the packed Q token total ({t_q})",
+                )
+                lse = lse_tensor.as_strided((1, qh, head_stride), (qh * head_stride, head_stride, 1), lse_tensor.storage_offset())
+                lse_valid = lse_tensor.as_strided((qh, t_q), (head_stride, 1), lse_tensor.storage_offset())
         if t_kv == 0:
             self._logger.debug("execute (THD): t_kv == 0, zeroing packed O")
             o_buf.as_strided((t_q * qh * d_v,), (1,), o_buf.storage_offset()).zero_()
+            if lse_valid is not None:
+                if sinks is not None:
+                    sinks_v = self._checked_sinks_1d(sinks)
+                    sinks_v = sinks_v.reshape(1, qh).expand(t_q, qh) if self.thd_stats_token_major else sinks_v.reshape(qh, 1).expand(qh, t_q)
+                    lse_valid.copy_(sinks_v)
+                else:
+                    lse_valid.fill_(float("-inf"))
             return
 
         # Per-sequence O TMA descriptors, filled by the kernel's builder pass.
@@ -1023,9 +1079,13 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         K = _packed(k_buf, t_kv, kh, d_qk)
         V = _packed(v_buf, t_kv, kh, d_v)
         O = _packed(o_buf, t_q, qh, d_v)
-        # Packed dummy LSE (THD stats are not plumbed): carved at the runtime
-        # t_q, always within the compile-time bound qh * B * S_q_max.
-        if carver is not None:
+        # LSE binding: the caller's ragged Stats buffer in its declared layout
+        # when a Stats output exists; otherwise a packed head-major scratch
+        # dummy carved at the runtime t_q (always within the compile-time
+        # bound qh * B * S_q_max) — the kernel always writes an LSE.
+        if lse is not None:
+            LSE = lse
+        elif carver is not None:
             LSE = carver.take(qh * t_q, torch.float32).reshape(1, qh, t_q)
             LSE.zero_()
         else:
@@ -1038,7 +1098,19 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         else:
             sinks_t = torch.zeros(qh, dtype=torch.float32, device=dev)
 
-        fn = self._k_mod.compile(b=b, qh=qh, kh=kh, sq=t_q, skv=t_kv, d_qk=d_qk, d_v=d_v)
+        fn = self._k_mod.compile(
+            b=b,
+            qh=qh,
+            kh=kh,
+            sq=t_q,
+            skv=t_kv,
+            d_qk=d_qk,
+            d_v=d_v,
+            # Head-major ragged Stats carry the caller-declared head-row
+            # stride (a shape, part of the compile cache key); token-major
+            # and the stats-less dummy are compact (0 -> sq).
+            lse_stride=(self.thd_stats_head_stride if (lse is not None and not self.thd_stats_token_major) else 0),
+        )
         fn(Q, K, V, O, LSE, sinks_t, meta, o_desc, (b, qh, kh, t_q, t_kv, 0), cutlass.Float32(scale_softmax_log2), cutlass.Int32(units), stream=current_stream)
         self._logger.debug("execute (THD) completed")
 
