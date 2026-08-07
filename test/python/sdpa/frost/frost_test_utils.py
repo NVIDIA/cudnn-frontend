@@ -34,12 +34,30 @@ requires_blackwell_geforce = pytest.mark.skipif(
 )
 
 
+def _dsl_usable():
+    """``(usable, why_not)`` for the DSL these engines lower through.
+
+    Version too, not just presence: the extra is deliberately NOT pinned to the
+    floor (that would make cudnn-frontend incompatible with anything holding the
+    DSL back -- quack-kernels pins ==4.6.0), so an environment can legitimately
+    have an older one. The engines decline it; these tests must skip rather than
+    fail, and for the same reason.
+    """
+    from cudnn.frost.buffers import CUTEDSL_MIN_VERSION, cutedsl_state, cutedsl_too_old
+
+    installed, version = cutedsl_state()
+    if not installed:
+        return False, "needs the cutedsl extra (nvidia-cutlass-dsl)"
+    if cutedsl_too_old(version):
+        want = ".".join(str(v) for v in CUTEDSL_MIN_VERSION)
+        return False, f"needs nvidia-cutlass-dsl >= {want}, have {version[1]}"
+    return True, ""
+
+
+_DSL_OK, _DSL_WHY = _dsl_usable()
+requires_dsl = pytest.mark.skipif(not _DSL_OK, reason=_DSL_WHY or "cutedsl available")
+
+
 def _dsl_installed() -> bool:
-    try:
-        import cutlass  # noqa: F401
-    except ImportError:
-        return False
-    return True
-
-
-requires_dsl = pytest.mark.skipif(not _dsl_installed(), reason="needs the cutedsl extra (nvidia-cutlass-dsl)")
+    """For the few call sites that gate inside a test body rather than on it."""
+    return _DSL_OK
