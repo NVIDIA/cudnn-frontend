@@ -227,12 +227,15 @@ def _kernel(
 
     ab_empty_count = cluster_m + cluster_n - 1
     if warp_idx == 0:
-        if elect_one:
-            for i in range(ab_stages):
+        for i in range(ab_stages):
+            if elect_one:
                 nvvm.mbarrier_init(ab_full_mbar_ptr.subview(i), 1)
+            if elect_one:
                 nvvm.mbarrier_init(ab_empty_mbar_ptr.subview(i), ab_empty_count)
-            for i in range(acc_stages):
+        for i in range(acc_stages):
+            if elect_one:
                 nvvm.mbarrier_init(acc_full_mbar_ptr.subview(i), 1)
+            if elect_one:
                 nvvm.mbarrier_init(acc_empty_mbar_ptr.subview(i), num_epilogue_warps)
     nvvm.fence_mbarrier_init()
 
@@ -316,9 +319,9 @@ def _kernel(
                     tma_a_desc = tma_a_descs[_ai]
                     if cutlass.const_expr(multicast_a):
                         if n_rank == 0:
-                            if elect_one:
-                                if cutlass.const_expr(a_is_m_major):
-                                    for m_group in cutlass.range_constexpr(cta_tile_mnk[0] // a_tma_group_elems):
+                            if cutlass.const_expr(a_is_m_major):
+                                for m_group in cutlass.range_constexpr(cta_tile_mnk[0] // a_tma_group_elems):
+                                    if elect_one:
                                         nvvm.cp_async_bulk_tensor_shared_cluster_global(
                                             sA_stage.subview(m_group * a_tma_group_elems * cta_tile_mnk[2]),
                                             tma_a_desc.get_ptr(),
@@ -332,7 +335,8 @@ def _kernel(
                                             multicast_mask=tma_mcast_mask_a,
                                             group=nvvm.CTAGroup.CTA_1,
                                         )
-                                else:
+                            else:
+                                if elect_one:
                                     nvvm.cp_async_bulk_tensor_shared_cluster_global(
                                         sA_stage,
                                         tma_a_desc.get_ptr(),
@@ -343,9 +347,9 @@ def _kernel(
                                         group=nvvm.CTAGroup.CTA_1,
                                     )
                     else:
-                        if elect_one:
-                            if cutlass.const_expr(a_is_m_major):
-                                for m_group in cutlass.range_constexpr(cta_tile_mnk[0] // a_tma_group_elems):
+                        if cutlass.const_expr(a_is_m_major):
+                            for m_group in cutlass.range_constexpr(cta_tile_mnk[0] // a_tma_group_elems):
+                                if elect_one:
                                     nvvm.cp_async_bulk_tensor_shared_cluster_global(
                                         sA_stage.subview(m_group * a_tma_group_elems * cta_tile_mnk[2]),
                                         tma_a_desc.get_ptr(),
@@ -359,7 +363,8 @@ def _kernel(
                                         multicast_mask=tma_mcast_mask_a,
                                         group=nvvm.CTAGroup.CTA_1,
                                     )
-                            else:
+                        else:
+                            if elect_one:
                                 nvvm.cp_async_bulk_tensor_shared_cluster_global(
                                     sA_stage,
                                     tma_a_desc.get_ptr(),
@@ -375,9 +380,9 @@ def _kernel(
                     tma_b_desc = tma_b_descs[_bj]
                     if cutlass.const_expr(multicast_b):
                         if m_rank == 0:
-                            if elect_one:
-                                if cutlass.const_expr(b_is_n_major):
-                                    for n_group in cutlass.range_constexpr(cta_tile_mnk[1] // b_tma_group_elems):
+                            if cutlass.const_expr(b_is_n_major):
+                                for n_group in cutlass.range_constexpr(cta_tile_mnk[1] // b_tma_group_elems):
+                                    if elect_one:
                                         nvvm.cp_async_bulk_tensor_shared_cluster_global(
                                             sB_stage.subview(n_group * b_tma_group_elems * cta_tile_mnk[2]),
                                             tma_b_desc.get_ptr(),
@@ -391,7 +396,8 @@ def _kernel(
                                             multicast_mask=tma_mcast_mask_b,
                                             group=nvvm.CTAGroup.CTA_1,
                                         )
-                                else:
+                            else:
+                                if elect_one:
                                     nvvm.cp_async_bulk_tensor_shared_cluster_global(
                                         sB_stage,
                                         tma_b_desc.get_ptr(),
@@ -402,9 +408,9 @@ def _kernel(
                                         group=nvvm.CTAGroup.CTA_1,
                                     )
                     else:
-                        if elect_one:
-                            if cutlass.const_expr(b_is_n_major):
-                                for n_group in cutlass.range_constexpr(cta_tile_mnk[1] // b_tma_group_elems):
+                        if cutlass.const_expr(b_is_n_major):
+                            for n_group in cutlass.range_constexpr(cta_tile_mnk[1] // b_tma_group_elems):
+                                if elect_one:
                                     nvvm.cp_async_bulk_tensor_shared_cluster_global(
                                         sB_stage.subview(n_group * b_tma_group_elems * cta_tile_mnk[2]),
                                         tma_b_desc.get_ptr(),
@@ -418,7 +424,8 @@ def _kernel(
                                         multicast_mask=tma_mcast_mask_b,
                                         group=nvvm.CTAGroup.CTA_1,
                                     )
-                            else:
+                        else:
+                            if elect_one:
                                 nvvm.cp_async_bulk_tensor_shared_cluster_global(
                                     sB_stage,
                                     tma_b_desc.get_ptr(),
@@ -690,20 +697,22 @@ def _kernel(
                 )
 
                 if warp_idx == 0:
-                    if elect_one:
-                        if cutlass.const_expr(cd_out_is_m_major):
-                            for _mb in cutlass.range_constexpr(cta_tile_mnk[0] // cd_mmajor_atom_m):
+                    if cutlass.const_expr(cd_out_is_m_major):
+                        for _mb in cutlass.range_constexpr(cta_tile_mnk[0] // cd_mmajor_atom_m):
+                            if elect_one:
                                 nvvm.cp_async_bulk_tensor_global_shared_cta(
                                     tma_c_desc.get_ptr(),
                                     smem_subtile_ptr.subview(_mb * (cd_mmajor_atom_m * epi_tile_mn[1])),
                                     (coord_m + _mb * cd_mmajor_atom_m, col, tile_l),
                                 )
-                        else:
+                    else:
+                        if elect_one:
                             nvvm.cp_async_bulk_tensor_global_shared_cta(
                                 tma_c_desc.get_ptr(),
                                 smem_subtile_ptr,
                                 (col, coord_m, tile_l),
                             )
+                    if elect_one:
                         nvvm.cp_async_bulk_commit_group()
                     nvvm.cp_async_bulk_wait_group(EPI_SMEM_STAGES - 1, read=True)
 
