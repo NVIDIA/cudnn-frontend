@@ -19,7 +19,6 @@ from typing import TYPE_CHECKING, Any, List, Optional
 
 from cudnn import behavior_note
 from cudnn.engines.base import BaseEngine, CompiledPlan, ExecutionContext, PlanConfig
-from cudnn.engines.engine_ids import FROST_SDPA_FWD_ID_BASE
 
 if TYPE_CHECKING:
     from cudnn._pygraph import pygraph
@@ -82,11 +81,11 @@ class FrostSdpaFwdEngine(BaseEngine):
 
     behavior_notes = (behavior_note.RUNTIME_COMPILATION,)  # JIT-compiled at build_plans()
 
-    def __init__(self, spec: "EngineSpec", offset: int):
+    def __init__(self, spec: "EngineSpec", engine_id: int):
         super().__init__()
         self._spec = spec
         self.name = spec.name
-        self.engine_id = FROST_SDPA_FWD_ID_BASE + offset
+        self.engine_id = engine_id
 
     def _decline_reason(self, graph: "pygraph", knobs) -> Optional[str]:
         from .engines import analyze_for
@@ -122,29 +121,18 @@ class FrostSdpaFwdEngine(BaseEngine):
             raise NotImplementedError(f"{self.name}: {exc}") from exc
 
 
-# engine_id = FROST_SDPA_FWD_ID_BASE + offset. An offset is FIXED FOREVER: an
-# autotune result is (engine_id, knobs) and must replay across versions.
-# Appending a spec takes the next free offset; offsets are never reordered or
-# reused. Keyed by the spec's shipped name rather than by its position in
-# ENGINE_SPECS, because that position is the PREFERENCE order and may change.
-_ID_OFFSETS = {
-    "sdpa_fwd_prefill_sm100_d128": 0,
-    "sdpa_fwd_prefill_sm100_d256": 1,
-    "sdpa_fwd_prefill_sm100_d512": 2,
-    "sdpa_fwd_prefill_sm100_d128_mxfp8": 3,
-    "sdpa_fwd_prefill_sm100_d128_fp8": 4,
-    "sdpa_fwd_prefill_sm120": 5,
-    "sdpa_fwd_prefill_sm100_d192_d128": 6,
-}
+def FrostSdpaFwdEngines(ids) -> List[FrostSdpaFwdEngine]:
+    """The SDPA-forward engines the manifest asked for, in ENGINE_SPECS order.
 
-
-def FrostSdpaFwdEngines() -> List[FrostSdpaFwdEngine]:
-    """The SDPA-forward engine family, in ENGINE_SPECS (= preference) order."""
+    ``ids`` is ``{name: engine_id}`` from engines/manifest.py — the single
+    source of engine ids. A spec absent from it is one the manifest is not
+    offering (still opt-in gated), so it is simply not built; a spec that has
+    no slot AT ALL is caught by test_engine_router, not at runtime.
+    """
     from .engines import ENGINE_SPECS
 
     engines = []
     for spec in ENGINE_SPECS:
-        if spec.name not in _ID_OFFSETS:
-            raise KeyError(f"engine spec {spec.name!r} has no engine-id offset; allocate the next free one in engine._ID_OFFSETS (never reuse)")
-        engines.append(FrostSdpaFwdEngine(spec, _ID_OFFSETS[spec.name]))
+        if spec.name in ids:
+            engines.append(FrostSdpaFwdEngine(spec, ids[spec.name]))
     return engines

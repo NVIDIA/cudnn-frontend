@@ -97,11 +97,9 @@ def _gen_case(seq_lens, HQ=2, HK=None, HV=None, head_size=128, dtype=torch.bfloa
 
 
 def _build_bwd_graph(total, HQ, HV, D, num_seqs, scale, io_dt, *, h_shape=None, s0=False, dht=False):
-    from cudnn.linear_attention.frost.gdn_engine import GdnFrostEngine
 
     HO = max(HQ, HV)
     g = cudnn.pygraph()
-    g.register_backend(GdnFrostEngine())
     t = dict(
         q=g.tensor([total, HQ, D], data_type=io_dt, name="q"),
         k=g.tensor([total, HQ, D], data_type=io_dt, name="k"),
@@ -142,7 +140,6 @@ def _build_bwd_graph(total, HQ, HV, D, num_seqs, scale, io_dt, *, h_shape=None, 
 
 def _fwd_h(q, k, v, alpha, beta, scale, cu, seq_lens, s0=None, every_n=64):
     """Forward through the engine with the per-chunk H output; returns h."""
-    from cudnn.linear_attention.frost.gdn_engine import GdnFrostEngine
 
     device = q.device
     total, HQ, HV, D = q.shape[0], q.shape[1], v.shape[1], q.shape[2]
@@ -150,7 +147,6 @@ def _fwd_h(q, k, v, alpha, beta, scale, cu, seq_lens, s0=None, every_n=64):
     num_seqs = cu.shape[0] - 1
     io_dt = cudnn.data_type.BFLOAT16 if q.dtype == torch.bfloat16 else cudnn.data_type.HALF
     g = cudnn.pygraph()
-    g.register_backend(GdnFrostEngine())
     q_t = g.tensor([total, HQ, D], data_type=io_dt, name="q")
     k_t = g.tensor([total, HQ, D], data_type=io_dt, name="k")
     v_t = g.tensor([total, HV, D], data_type=io_dt, name="v")
@@ -366,7 +362,6 @@ def test_bprop_kernel_zero_length_sequence(num_q_heads, num_k_heads, num_v_heads
 def test_frost_gdn_bwd_engine_no_h(seq_lens=(128, 256), H=2, D=128):
     """GDN_BWD without the h input: the engine reruns the forward with H
     dumping and must match the explicit-h path bit for bit."""
-    from cudnn.linear_attention.frost.gdn_engine import GdnFrostEngine
 
     _seed()
     seq_lens = list(seq_lens)
@@ -383,7 +378,6 @@ def test_frost_gdn_bwd_engine_no_h(seq_lens=(128, 256), H=2, D=128):
     results = {}
     for with_h in (True, False):
         g = cudnn.pygraph()
-        g.register_backend(GdnFrostEngine())
         q_t = g.tensor([total, H, D], data_type=cudnn.data_type.BFLOAT16, name="q")
         k_t = g.tensor([total, H, D], data_type=cudnn.data_type.BFLOAT16, name="k")
         v_t = g.tensor([total, H, D], data_type=cudnn.data_type.BFLOAT16, name="v")
@@ -566,7 +560,6 @@ def test_frost_gdn_bwd_engine_initial_state(seq_lens=(128, 256), H=2, D=128):
     """GDN_BWD through the pygraph engine path with initial_state: the engine
     extends h with the per-sequence S0 entries; the node's state ports are
     K-major [N, H, K, V] (the engine converts to the kernel orientation)."""
-    from cudnn.linear_attention.frost.gdn_engine import GdnFrostEngine
 
     _seed()
     seq_lens = list(seq_lens)
@@ -582,7 +575,6 @@ def test_frost_gdn_bwd_engine_initial_state(seq_lens=(128, 256), H=2, D=128):
     h = _fwd_h(q, k, v, alpha, beta, scale, cu, seq_lens, s0=s0)
 
     g = cudnn.pygraph()
-    g.register_backend(GdnFrostEngine())
     q_t = g.tensor([total, H, D], data_type=cudnn.data_type.BFLOAT16, name="q")
     k_t = g.tensor([total, H, D], data_type=cudnn.data_type.BFLOAT16, name="k")
     v_t = g.tensor([total, H, D], data_type=cudnn.data_type.BFLOAT16, name="v")
@@ -706,7 +698,6 @@ def test_bprop_kernel_gva_native_heads(num_q_heads, num_v_heads, seq_lens):
 def test_frost_gdn_bwd_engine_gva(num_q_heads, num_v_heads, seq_lens=(128, 256), D=128):
     """GDN_BWD through the FROST engine with grouped value heads: dQ/dK come
     back at the node's native q/k head counts via the head-group reduction."""
-    from cudnn.linear_attention.frost.gdn_engine import GdnFrostEngine
 
     _seed()
     seq_lens = list(seq_lens)
@@ -721,7 +712,6 @@ def test_frost_gdn_bwd_engine_gva(num_q_heads, num_v_heads, seq_lens=(128, 256),
     h = _fwd_h(q, k, v, alpha, beta, scale, cu, seq_lens)
 
     g = cudnn.pygraph()
-    g.register_backend(GdnFrostEngine())
     q_t = g.tensor([total, HQ, D], data_type=cudnn.data_type.BFLOAT16, name="q")
     k_t = g.tensor([total, HQ, D], data_type=cudnn.data_type.BFLOAT16, name="k")
     v_t = g.tensor([total, HV, D], data_type=cudnn.data_type.BFLOAT16, name="v")

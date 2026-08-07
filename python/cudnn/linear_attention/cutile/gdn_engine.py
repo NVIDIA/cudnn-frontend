@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING, Any, Dict
 
 from cudnn import behavior_note
 from cudnn.engines.base import BaseEngine, CompiledPlan, resolve_node_buffers
-from cudnn.engines.engine_ids import GDN_ID_BASE
 from cudnn.graph_types import NodeType
 from cudnn.frost import buffers
 from cudnn.frost.workspace import Workspace
@@ -114,7 +113,6 @@ class GdnCuTileEngine(BaseEngine):
     """cuTile chunked-kernel backend for single-node GDN graphs (THD layout)."""
 
     name = "gdn_cutile"
-    engine_id = GDN_ID_BASE + 1  # slot 1 of the gdn family's block
     behavior_notes = (behavior_note.RUNTIME_COMPILATION,)  # JIT-compiled at build_plans()
 
     def check_support(self, graph: "pygraph") -> None:

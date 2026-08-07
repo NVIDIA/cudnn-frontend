@@ -14,7 +14,6 @@ from typing import TYPE_CHECKING, List
 
 from cudnn import behavior_note
 from cudnn.engines.base import BaseEngine, CompiledPlan, ExecutionContext, PlanConfig
-from cudnn.engines.engine_ids import FROST_GEMM_ID_BASE
 
 if TYPE_CHECKING:
     from cudnn._pygraph import pygraph
@@ -65,7 +64,6 @@ class FrostGemmEngine(BaseEngine):
     """Fused matmul chains (dense, block-scaled, MoE grouped) on SM100/SM103."""
 
     name = "frost_gemm"
-    engine_id = FROST_GEMM_ID_BASE + 0
     behavior_notes = (behavior_note.RUNTIME_COMPILATION,)  # JIT-compiled at build_plans()
 
     def check_support(self, graph: "pygraph") -> None:
@@ -95,3 +93,18 @@ class FrostGemmEngine(BaseEngine):
             return _FrostGemmPlan(build_gemm_plan(graph))
         except (NotImplementedError, ValueError) as exc:
             raise NotImplementedError(f"frost_gemm: {exc}") from exc
+
+
+def FrostGemmEngines(ids):
+    """The gemm engines the manifest asked for, with the ids it assigned.
+
+    ``ids`` is ``{name: engine_id}`` from engines/manifest.py, the single source
+    of engine ids -- an engine does not carry one of its own.
+    """
+    out = []
+    for cls in (FrostGemmEngine,):
+        if cls.name in ids:
+            engine = cls()
+            engine.engine_id = ids[cls.name]
+            out.append(engine)
+    return out

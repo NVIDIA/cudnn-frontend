@@ -185,15 +185,6 @@ class pygraph:
         lo, hi = engine.owned_id_range
         for family in MANIFEST:  # blocks are intervals, so disjointness is decidable
             if lo < family.id_end and family.engine_id < hi:
-                # Registering the in-tree engine that OWNS the block is normal
-                # (a test or a caller pinning one specific engine); it is the
-                # same implementation the manifest would have instantiated.
-                # Anything else claiming that range would receive its plans.
-                # A family names its package, its engines live in submodules of
-                # it, so ownership is namespace containment, not string equality.
-                mod = type(engine).__module__
-                if (mod == family.module or mod.startswith(family.module + ".")) and family.engine_id <= lo and hi <= family.id_end:
-                    break
                 raise ValueError(
                     f"engine {engine.name!r} ({type(engine).__module__}) claims ids [{lo}, {hi}), which overlaps the "
                     f"block [{family.engine_id}, {family.id_end}) the in-tree manifest reserves for {family.name!r} "

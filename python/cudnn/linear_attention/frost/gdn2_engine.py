@@ -13,7 +13,6 @@ from typing import Any
 
 from cudnn import behavior_note
 from cudnn.engines.base import BaseEngine, CompiledPlan
-from cudnn.engines.engine_ids import GDN2_ID_BASE
 
 from cudnn.frost import buffers
 from cudnn.frost.workspace import Workspace, WorkspaceLayout
@@ -82,7 +81,6 @@ class Gdn2FrostEngine(BaseEngine):
     (the FROST backward kernel is a stub)."""
 
     name = "gdn2_frost"
-    engine_id = GDN2_ID_BASE + 0  # slot 0 of the gdn2 family's block
     behavior_notes = (behavior_note.RUNTIME_COMPILATION,)  # JIT-compiled at build_plans()
 
     def check_support(self, graph) -> None:

@@ -766,14 +766,14 @@ def test_opt_in_families_are_withheld_by_default(monkeypatch):
     from cudnn.engines import manifest
 
     family = _family("frost_gemm")
-    assert family.opt_in, "frost_gemm is expected to still be maturing"
+    assert all(s.opt_in for s in family.slots.values()), "frost_gemm is expected to still be maturing"
     sm = family.sm_lo
 
     monkeypatch.delenv(manifest._ENABLE_ENV, raising=False)
-    assert not family.offered(sm)
+    assert family.offered_ids(sm) == {}
 
     monkeypatch.setenv(manifest._ENABLE_ENV, "1")
-    assert family.offered(sm)
+    assert family.offered_ids(sm) == {"frost_gemm": family.engine_id}
 
 
 def test_sole_implementation_families_are_never_gated(monkeypatch):
@@ -785,7 +785,8 @@ def test_sole_implementation_families_are_never_gated(monkeypatch):
     monkeypatch.delenv(manifest._ENABLE_ENV, raising=False)
     for name in ("gdn", "kda", "gdn2"):
         family = _family(name)
-        assert not family.opt_in, f"{name} is the only implementation of its op and must not be opt-in"
+        assert not any(s.opt_in for s in family.slots.values()), f"{name} is the only implementation of its op and must not be gated"
+        assert family.offered_ids(family.sm_lo), f"{name} must be offered without the opt-in flag"
 
 
 @pytest.mark.parametrize("value,offered", [("1", True), ("true", True), ("on", True), ("0", False), ("", False), ("no", False)])
@@ -840,6 +841,37 @@ def test_family_id_blocks_are_disjoint():
 # ---------------------------------------------------------------------------
 
 
+def test_every_engine_spec_has_a_manifest_slot():
+    """The manifest assigns ids, so an engine added without a slot would simply
+    never be built -- silently. Catch that here rather than at runtime.
+
+    Only families whose engines are enumerable without a device are checked;
+    the point is that the two lists cannot drift apart unnoticed."""
+    from cudnn.engines import manifest
+
+    for family, spec_names in (
+        (_family("frost_sdpa_fwd"), _spec_names("cudnn.sdpa.fwd.engines")),
+        (_family("frost_sdpa_bwd"), _spec_names("cudnn.sdpa.bwd.engines")),
+    ):
+        missing = spec_names - set(family.slots)
+        assert not missing, f"{family.name}: specs with no manifest slot: {sorted(missing)}"
+        stale = set(family.slots) - spec_names
+        assert not stale, f"{family.name}: slots naming no spec: {sorted(stale)} (never reuse a slot; leave it retired)"
+
+    slots = [s.slot for f in manifest.MANIFEST for s in f.slots.values()]
+    for family in manifest.MANIFEST:
+        taken = [s.slot for s in family.slots.values()]
+        assert len(taken) == len(set(taken)), f"{family.name}: two engines share a slot"
+        assert all(0 <= s < manifest.FAMILY_BLOCK for s in taken), f"{family.name}: slot outside its block"
+    assert slots  # the table is not empty
+
+
+def _spec_names(module: str) -> set:
+    import importlib
+
+    return {s.name for s in importlib.import_module(module).ENGINE_SPECS}
+
+
 def test_declared_analyzers_are_importable():
     """``analyzer`` is a pair of strings so matching stays import-free — which
     means a typo in it survives until something tries to rank that family."""
@@ -874,7 +906,9 @@ def test_planning_attaches_facts_without_anyone_asking(monkeypatch):
     from cudnn.engines import manifest
 
     _PROBE_CALLS.clear()
-    family = manifest.EngineFamily(_OOT + 900, "probe_family", __name__, "unused_factory", analyzer=(__name__, "_probe_analyzer"))
+    family = manifest.EngineFamily(
+        _OOT + 900, "probe_family", __name__, "unused_factory", slots={"probe": manifest.EngineSlot(0)}, analyzer=(__name__, "_probe_analyzer")
+    )
     monkeypatch.setattr(manifest, "MANIFEST", (family,))
     monkeypatch.setattr(manifest, "_FAMILY_OF_NODE", {"MATMUL": "probe_family"})
 
@@ -911,13 +945,15 @@ def test_ranking_and_engine_read_the_same_record(monkeypatch):
 
     class Reader(TorchMatmulEngine):
         name = "reader"
-        engine_id = _OOT + 901
+        engine_id = _OOT + 800  # outside the fake family's block below
 
         def check_support(self, graph):
             seen["engine"] = graph._facts_for(_probe_analyzer)
 
     _PROBE_CALLS.clear()
-    family = manifest.EngineFamily(_OOT + 900, "probe_family", __name__, "unused_factory", analyzer=(__name__, "_probe_analyzer"))
+    family = manifest.EngineFamily(
+        _OOT + 900, "probe_family", __name__, "unused_factory", slots={"probe": manifest.EngineSlot(0)}, analyzer=(__name__, "_probe_analyzer")
+    )
     monkeypatch.setattr(manifest, "MANIFEST", (family,))
     monkeypatch.setattr(manifest, "_FAMILY_OF_NODE", {"MATMUL": "probe_family"})
 
@@ -1112,19 +1148,6 @@ def test_engine_id_in_the_in_tree_region_is_rejected():
 
     with pytest.raises(ValueError, match="reserves for 'frost_gemm'"):
         pygraph().register_backend(Squatter())
-
-
-def test_the_in_tree_owner_of_a_block_may_register_itself():
-    """Registering an in-tree engine is normal — a caller pinning one specific
-    engine, which the linear-attention tests do. Only a DIFFERENT engine
-    claiming that block is a collision."""
-    from cudnn.engines import manifest
-
-    family = next(f for f in manifest.MANIFEST if f.name == "gdn")
-    engines = manifest.instantiate(family)
-    if not engines:
-        pytest.skip("the gdn family is unavailable in this environment")
-    pygraph().register_backend(engines[0])  # must not raise
 
 
 def test_a_registered_in_tree_engine_is_not_offered_twice(monkeypatch):

@@ -31,7 +31,6 @@ from functools import partial
 from typing import Any, Callable, Optional
 
 import cudnn
-import torch
 
 from cudnn.frost.tile_dsl.constants import SCHED_NATURAL
 from cudnn.sdpa import graph_analyzer as ga
@@ -644,6 +643,8 @@ def lower_dsl_prefill(
             # Dummy LSE for stats-less dense graphs — carved, not allocated
             # (uninitialized is fine: the kernel writes every row). lse_optional
             # adapters take lse_tensor=None instead.
+            import torch
+
             lse_buf = carver.take(facts.b * facts.h_q * facts.s_q, torch.float32)
         sinks_buf = resolved.get(id(binding.sink_token)) if binding.sink_token is not None else None
         seq_kv_buf = resolved.get(id(binding.seq_len_kv)) if binding.seq_len_kv is not None else None

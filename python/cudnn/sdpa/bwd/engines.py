@@ -23,7 +23,6 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 import cudnn
-import torch
 from cudnn.sdpa import graph_analyzer as ga
 
 
@@ -268,6 +267,8 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
     kv_geom = _bshd_geometry(facts.b, facts.h_kv, facts.s_kv, facts.d_qk)
     stats_geom = ((facts.b, facts.h_q, facts.s_q, 1), (facts.h_q * facts.s_q, facts.s_q, 1, 1))
 
+    import torch
+
     def _desc(geom, dtype, name: str) -> "Any":
         # facts carry cudnn.data_type; torch appears only here, where a real
         # torch tensor is being described.
@@ -321,7 +322,7 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
         dv=facts.dv_t,
     )
 
-    def _canonical_view(buf: torch.Tensor, geom) -> torch.Tensor:
+    def _canonical_view(buf, geom):
         """Reinterpret a variant-pack buffer through the canonical geometry.
 
         cuDNN's execute contract treats variant-pack entries as raw storage

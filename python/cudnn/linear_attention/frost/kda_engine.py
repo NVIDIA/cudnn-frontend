@@ -12,7 +12,6 @@ from typing import Any
 
 from cudnn import behavior_note
 from cudnn.engines.base import BaseEngine, CompiledPlan
-from cudnn.engines.engine_ids import KDA_ID_BASE
 
 from cudnn.frost import buffers
 from cudnn.frost.workspace import Workspace, WorkspaceLayout
@@ -85,7 +84,6 @@ class KdaFrostEngine(BaseEngine):
     declines ``KDA_BWD`` so the router falls back to ``KdaCuTileEngine``."""
 
     name = "kda_frost"
-    engine_id = KDA_ID_BASE + 0  # slot 0 of the kda family's block
     behavior_notes = (behavior_note.RUNTIME_COMPILATION,)  # JIT-compiled at build_plans()
 
     def check_support(self, graph) -> None:
