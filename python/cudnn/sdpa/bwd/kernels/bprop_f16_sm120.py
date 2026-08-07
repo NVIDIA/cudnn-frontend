@@ -19,7 +19,8 @@ fp32 workspace and finalized by a small convert kernel.
 Constraints:
 * Supported input dtypes: Float16 and BFloat16 (output dtype matches)
 * Head dimension must be one of 32, 64, or 128
-* Equal Q/KV head counts (no GQA); no dropout/alibi/local/softcap
+* Equal Q/KV head counts (no GQA); no dropout/alibi/softcap
+* Optional causal (top-left or bottom-right) and sliding-window masks
 * Q/K/V/O/dO/dQ/dK/dV use compact BSHD storage
 * LSE input is the natural-log forward stats, fp32 (B, H, SQ) contiguous
 * dQ accumulation uses fp32 atomics (not bitwise deterministic)
@@ -294,6 +295,7 @@ class SM120FusedMultiHeadAttentionFP16Backward:
         in_dtype: Type[cutlass.Numeric] = cutlass.Float16,
         is_causal: bool = False,
         causal_top_left: bool = False,
+        window_size_left: int | None = None,
         head_dim: int = 128,
         use_pdl: bool = True,
         q_tile: int = 0,
@@ -302,6 +304,7 @@ class SM120FusedMultiHeadAttentionFP16Backward:
         self.in_dtype = in_dtype
         self.is_causal = is_causal
         self.causal_top_left = bool(causal_top_left)
+        self.window_size_left = window_size_left
         self.d = head_dim
         self.use_pdl = bool(use_pdl)
         self.q_tile, self.kv_tile = self.DEFAULT_TILES[head_dim]
@@ -436,14 +439,20 @@ class SM120FusedMultiHeadAttentionFP16Backward:
         PARTIAL_KV = (SKV % N) != 0
 
         m_block_max = (SQ + M - 1) // M
-        if cutlass.const_expr(self.is_causal):
-            if cutlass.const_expr(self.causal_top_left):
-                diag_off = cutlass.Int32(0)
-            else:
+        if cutlass.const_expr(self.is_causal or self.window_size_left is not None):
+            if cutlass.const_expr(self.is_causal and not self.causal_top_left):
                 diag_off = SKV - SQ
+            else:
+                diag_off = cutlass.Int32(0)
+        if cutlass.const_expr(self.is_causal):
             m_block_min = cute.math.max(kv_base - diag_off, cutlass.Int32(0)) // M
         else:
             m_block_min = cutlass.Int32(0)
+        if cutlass.const_expr(self.window_size_left is not None):
+            # q <= k - diag_off + W
+            last_q_row = kv_base + N - 1 - diag_off + self.window_size_left
+            rows_hi = cute.math.max(last_q_row + 1, cutlass.Int32(0))
+            m_block_max = cute.math.min(m_block_max, (rows_hi + M - 1) // M)
         n_iters = cute.math.max(m_block_max - m_block_min, cutlass.Int32(0))
 
         smem = cutlass.Array(io_dtype, self.smem_elems, space=cutlass.AddressSpace.smem, alignment=128)
@@ -545,6 +554,9 @@ class SM120FusedMultiHeadAttentionFP16Backward:
             math_warp = warp
             math_tidx = tidx
             m_block = m_block_max - 1
+            if cutlass.const_expr(self.window_size_left is not None):
+                # For bottom-right SWA, a KV tile might lie completely before every query's sliding window
+                m_block = cute.math.max(m_block, cutlass.Int32(0))
             wm_s = math_warp % WM_SDP
             wn_s = math_warp // WM_SDP
             lse_r = cutlass.Array(cutlass.Float32, 2 * SDP_REPS)
@@ -569,9 +581,9 @@ class SM120FusedMultiHeadAttentionFP16Backward:
                             val = inf
                     else:
                         val = (lse_ptr + lse_base + r_abs).load()
-                    if cutlass.const_expr(self.is_causal and not self.causal_top_left):
-                        # Fully-masked row (bottom-right, S_q > S_kv) has stats = -inf;
-                        # +inf zeroes the row's P / grads and avoids NaN propagation.
+                    if cutlass.const_expr((self.is_causal and not self.causal_top_left) or self.window_size_left is not None):
+                        # A fully masked row has LSE = -inf, which can produce
+                        # -inf - (-inf) = NaN.  Use +inf to reconstruct P = 0.
                         if val == cutlass.Float32(float("-inf")):
                             val = cutlass.Float32(float("inf"))
                     lse_r[rep * 2 + hf] = val * cutlass.Float32(_LOG2E)
@@ -669,6 +681,8 @@ class SM120FusedMultiHeadAttentionFP16Backward:
                 # P store to smem.
                 if cutlass.const_expr(self.is_causal):
                     do_mask_causal = (m_block * M) < (kv_base + N - diag_off)
+                if cutlass.const_expr(self.window_size_left is not None):
+                    do_mask_window = kv_base < (m_block * M + M - 1 + diag_off - self.window_size_left)
                 neg_inf = cutlass.Float32(float("-inf"))
                 for rep in cutlass.range_constexpr(SDP_REPS):
                     for nf in cutlass.range_constexpr(SDP_NF):
@@ -691,6 +705,18 @@ class SM120FusedMultiHeadAttentionFP16Backward:
                                 if kv_a0 > r8 + diag_off:
                                     s2 = neg_inf
                                 if kv_a1 > r8 + diag_off:
+                                    s3 = neg_inf
+                        if cutlass.const_expr(self.window_size_left is not None):
+                            if do_mask_window:
+                                lo0 = r0 + diag_off - self.window_size_left
+                                lo8 = r8 + diag_off - self.window_size_left
+                                if kv_a0 < lo0:
+                                    s0 = neg_inf
+                                if kv_a1 < lo0:
+                                    s1 = neg_inf
+                                if kv_a0 < lo8:
+                                    s2 = neg_inf
+                                if kv_a1 < lo8:
                                     s3 = neg_inf
                         if cutlass.const_expr(PARTIAL_KV):
                             if kv_a0 >= SKV:
@@ -835,9 +861,9 @@ class SM120FusedMultiHeadAttentionFP16Backward:
                         for hf in cutlass.range_constexpr(2):
                             r_loc = wm_s * 16 + rep * 16 * WM_SDP + g_lane + hf * 8
                             val = (lse_ptr + lse_base + nq0 + r_loc).load()
-                            if cutlass.const_expr(self.is_causal and not self.causal_top_left):
-                                # Fully-masked row (bottom-right, S_q > S_kv) has stats = -inf;
-                                # +inf zeroes the row's P / grads and avoids NaN propagation.
+                            if cutlass.const_expr((self.is_causal and not self.causal_top_left) or self.window_size_left is not None):
+                                # A fully masked row has LSE = -inf, which can produce
+                                # -inf - (-inf) = NaN.  Use +inf to reconstruct P = 0.
                                 if val == cutlass.Float32(float("-inf")):
                                     val = cutlass.Float32(float("inf"))
                             lse_r[rep * 2 + hf] = val * cutlass.Float32(_LOG2E)
@@ -1206,6 +1232,7 @@ def compile(  # noqa: A001
         in_dtype=STORAGE_DTYPE,
         is_causal=PARAMS.is_causal,
         causal_top_left=PARAMS.causal_top_left,
+        window_size_left=PARAMS.window_size_left,
         head_dim=d,
         use_pdl=PARAMS.use_pdl,
         q_tile=PARAMS.q_tile,

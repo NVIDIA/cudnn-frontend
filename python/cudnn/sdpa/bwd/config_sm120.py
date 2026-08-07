@@ -27,6 +27,7 @@ class TemplateParams:
     dtype_qkv: int = DTYPE_FP16
     is_causal: bool = False
     causal_top_left: bool = False
+    window_size_left: int | None = None
     use_pdl: bool = True
     q_tile: int = 0
     kv_tile: int = 0
@@ -44,6 +45,8 @@ def validate_params(params: TemplateParams) -> None:
         raise ValueError(f"SM120 SDPA bwd: dtype_qkv must be DTYPE_BF16 ({DTYPE_BF16}) or DTYPE_FP16 ({DTYPE_FP16}); got {params.dtype_qkv}")
     if params.causal_top_left and not params.is_causal:
         raise ValueError("SM120 SDPA bwd: causal_top_left requires is_causal=True")
+    if params.window_size_left is not None and params.window_size_left < 0:
+        raise ValueError(f"SM120 SDPA bwd: window_size_left must be non-negative; got {params.window_size_left}")
     if params.q_tile not in (0,) + SEQ_Q_TILES:
         raise ValueError(f"SM120 SDPA bwd: q_tile must be one of {(0,) + SEQ_Q_TILES} (0 = per-head-dim default); got {params.q_tile}")
     if params.kv_tile not in (0,) + SEQ_KV_TILES:

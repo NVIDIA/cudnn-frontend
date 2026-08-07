@@ -64,6 +64,7 @@ class SdpaBwdDsl(APIBase):
         sample_dv: torch.Tensor | TensorDesc,
         is_causal: bool = False,
         causal_bottom_right: bool = False,
+        window_size_left: Optional[int] = None,
         scale_softmax: Optional[float] = None,
         tile_m: Optional[int] = None,
         tile_n: Optional[int] = None,
@@ -84,6 +85,7 @@ class SdpaBwdDsl(APIBase):
 
         self.is_causal = bool(is_causal)
         self.causal_bottom_right = bool(causal_bottom_right)
+        self.window_size_left = None if window_size_left is None else int(window_size_left)
         self.scale_softmax = scale_softmax
         self.tile_m = None if tile_m is None else int(tile_m)
         self.tile_n = None if tile_n is None else int(tile_n)
@@ -236,6 +238,10 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
             self.causal_bottom_right and not self.is_causal,
             "causal_bottom_right requires is_causal=True",
         )
+        self._value_error_if(
+            self.window_size_left is not None and self.window_size_left < 0,
+            f"window_size_left must be non-negative, got {self.window_size_left}",
+        )
 
         self._runtime_error_if(not torch.cuda.is_available(), "CUDA is not available")
         self.compute_capability = torch.cuda.get_device_capability(self.q_desc.device)
@@ -271,6 +277,7 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
             dtype_qkv=_SM120_DTYPE_QKV_CODE[self.dtype],
             is_causal=self.is_causal,
             causal_top_left=self.is_causal and not self.causal_bottom_right,
+            window_size_left=self.window_size_left,
             q_tile=self.q_tile,
             kv_tile=self.kv_tile,
         )
@@ -375,6 +382,7 @@ def sdpa_bwd_wrapper_dsl_sm120(
     stats_tensor: torch.Tensor,
     is_causal: bool = False,
     causal_bottom_right: bool = False,
+    window_size_left: Optional[int] = None,
     scale_softmax: Optional[float] = None,
 ) -> TupleDict:
     """Run SM120 SDPA backward and return ``TupleDict(dq_tensor=..., dk_tensor=..., dv_tensor=...)``."""
@@ -395,6 +403,7 @@ def sdpa_bwd_wrapper_dsl_sm120(
         _tensor_signature(stats_tensor),
         bool(is_causal),
         bool(causal_bottom_right),
+        window_size_left,
         scale_softmax,
     )
     api = _wrapper_api_cache.get(cache_key)
@@ -411,6 +420,7 @@ def sdpa_bwd_wrapper_dsl_sm120(
             sample_dv=dv_tensor,
             is_causal=is_causal,
             causal_bottom_right=causal_bottom_right,
+            window_size_left=window_size_left,
             scale_softmax=scale_softmax,
         )
         api.check_support()
