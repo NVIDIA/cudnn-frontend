@@ -692,7 +692,7 @@ def lower_dsl_prefill(
             k_tensor=k_buf,
             v_tensor=v_buf,
             o_tensor=o_buf,
-            lse_tensor=(lse_buf if facts.thd else lse_buf.reshape(facts.b, facts.h_q, facts.s_q)) if lse_buf is not None else None,
+            lse_tensor=lse_buf,
             scale_softmax=facts.scale,
             sinks=sinks_buf,
             seq_kv_lens=seq_kv_buf,
