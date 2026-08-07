@@ -68,6 +68,13 @@ cutedsl = [
     "apache-tvm-ffi>=0.1.11",
     "torch-c-dlpack-ext",
 ]
+# Experimental (draft): call CuteDSL kernels from JAX as real primitives.
+# Keep the apache-tvm-ffi pin in sync with _bridge.py (header-only ABI dep).
+jax = [
+    "jax",
+    "jax-tvm-ffi",
+    "apache-tvm-ffi>=0.1.11,<0.2",
+]
 
 [dependency-groups]
 dev = [
