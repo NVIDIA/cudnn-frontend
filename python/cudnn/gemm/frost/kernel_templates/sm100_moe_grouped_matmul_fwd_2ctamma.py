@@ -867,6 +867,7 @@ def _kernel(
                     c_rmem_vec = c_rmem_vecs[0]
 
                     if subtile_idx == subtile_cnt - 1:
+                        nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
                         nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
                         if elect_one:
                             nvvm.mbarrier_arrive(

@@ -931,7 +931,12 @@ def _kernel(
 
         subtile_cnt = cute.ceil_div(cta_tile_mnk[1], 32)
         t2r_inst_repx = epi_tile_mn[1]
-        shape = nvvm.Tcgen05LdStShape.SHAPE_32X32B
+        if cutlass.const_expr(cta_tile_mnk[0] == 64):
+            shape = nvvm.Tcgen05LdStShape.SHAPE_16X32BX2
+            ld_half_off = 0
+        else:
+            shape = nvvm.Tcgen05LdStShape.SHAPE_32X32B
+            ld_half_off = None
         lane = tidx % 32
 
         while is_valid != 0:
@@ -1000,10 +1005,11 @@ def _kernel(
                             6,
                             cutlass.Float32,
                         )
-                        c_rmem_vecs.append(nvvm.tcgen05_ld(shape, tmem, num=t2r_inst_repx))
+                        c_rmem_vecs.append(nvvm.tcgen05_ld(shape, tmem, num=t2r_inst_repx, offset=ld_half_off))
                     c_rmem_vec = c_rmem_vecs[0]
 
                     if cutlass.const_expr(use_acc_overlap and subtile_idx == acc_overlap_subtiles - 1):
+                        nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
                         nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
                         if elect_one:
                             nvvm.mbarrier_arrive(acc_empty_mbar_ptr.subview(acc_stage))
@@ -1023,12 +1029,14 @@ def _kernel(
                     # @@STG_ONLY:END@@
 
                 if cutlass.const_expr(not use_acc_overlap):
+                    nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
                     nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
                     if elect_one:
                         nvvm.mbarrier_arrive(acc_empty_mbar_ptr.subview(acc_stage))
                 tile_iter += 1
 
         if cutlass.const_expr(use_acc_overlap):
+            nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
             nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
             if elect_one:
                 nvvm.mbarrier_arrive(tmem_dealloc_mbar_ptr)

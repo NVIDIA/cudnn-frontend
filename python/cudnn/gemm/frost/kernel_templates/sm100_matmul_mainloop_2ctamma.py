@@ -1102,6 +1102,7 @@ def _kernel(
                     c_rmem_vec = c_rmem_vecs[0]
 
                 if (not use_tma_store_epi) and subtile_idx == subtile_cnt - 1:
+                    nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
                     nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
                     if elect_one:
                         nvvm.mbarrier_arrive(
@@ -1202,6 +1203,7 @@ def _kernel(
                 # @@STG_ONLY:END@@
 
             if cutlass.const_expr(use_tma_store_epi):
+                nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
                 nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
                 if elect_one:
                     mbar_pair_ptr = nvvm.mapa(acc_empty_mbar_ptr.subview(acc_stage), pair_leader_rank)

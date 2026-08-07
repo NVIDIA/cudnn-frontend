@@ -2140,6 +2140,19 @@ def _check_cta_group_geometry(config: TileConfig, cta_group: int) -> None:
         )
 
 
+def _check_mma_n_dim(chain: FusionChain, config: TileConfig, cta_group: int) -> None:
+    """MMA n_dim rules that depend on the MMA kind, not just geometry (int8/UTCIMMA)."""
+    if DTYPE_TO_MMA_KIND.get(_mma_a_dtype(chain)) != "nvvm.Tcgen05MMAKind.INT8":
+        return
+    for label, n in (("mma_inst_n", config.mma_inst_n), ("cta_tile_n", config.cta_tile_n)):
+        if n >= 40 and (n // 8) % 2 != 0:
+            raise NotImplementedError(
+                f"int8 MMA (UTCIMMA) needs N ≤ 32 or a multiple of 16; "
+                f'config {config.name!r} has {label}={n} (ISA: "UTCIMMA only '
+                f'supports 16 step increments for N > 32 for non-.WS mode")'
+            )
+
+
 def _check_dtype_config_compat(chain: FusionChain, config: TileConfig, cta_group: int) -> None:
     """Reject (chain, config) where the config K_BYTES isn't a multiple of the
     MMA dtype's element width. ``cta_group`` sets per-CTA SMEM N for the
@@ -2567,6 +2580,7 @@ def jit_from_cudnn_graph(
     """
     chain, binding = analyze_with_binding(graph)
     _check_cta_group_geometry(config, cta_group)
+    _check_mma_n_dim(chain, config, cta_group)
     # MoE grouped block-scale = both matches at once (dequant + moe_grouped);
     # check BEFORE the single-feature gates.
     if chain.has_moe and chain.has_block_scale:

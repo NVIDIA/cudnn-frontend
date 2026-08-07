@@ -819,6 +819,7 @@ def _kernel(
                     c_rmem_vec = c_rmem_vecs[0]
 
                 if use_acc_overlap and (not cd_out_is_m_major) and subtile_idx == acc_overlap_subtiles - 1:
+                    nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
                     nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
                     if elect_one:
                         mbar_pair_ptr = nvvm.mapa(acc_empty_mbar_ptr.subview(acc_stage), pair_leader_rank)
@@ -913,6 +914,7 @@ def _kernel(
                 # @@STG_ONLY:END@@
 
             if cutlass.const_expr((not use_acc_overlap) or cd_out_is_m_major):
+                nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
                 nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
                 if elect_one:
                     mbar_pair_ptr = nvvm.mapa(acc_empty_mbar_ptr.subview(acc_stage), pair_leader_rank)
@@ -923,6 +925,7 @@ def _kernel(
             tile_iter += 1
 
         if cutlass.const_expr(use_acc_overlap):
+            nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
             nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
             if elect_one:
                 nvvm.mbarrier_arrive(tmem_dealloc_mbar_ptr)

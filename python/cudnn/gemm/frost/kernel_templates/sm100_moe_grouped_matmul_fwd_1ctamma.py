@@ -739,7 +739,12 @@ def _kernel(
 
         epi_spans = _epi_subtile_spans(cols_per_acc_stage)
         subtile_cnt = len(epi_spans)
-        shape = nvvm.Tcgen05LdStShape.SHAPE_32X32B
+        if cutlass.const_expr(cta_tile_mnk[0] == 64):
+            shape = nvvm.Tcgen05LdStShape.SHAPE_16X32BX2
+            ld_half_off = 0
+        else:
+            shape = nvvm.Tcgen05LdStShape.SHAPE_32X32B
+            ld_half_off = None
         lane = tidx % 32
 
         while not nvvm.mbarrier_try_wait_parity(sched_full_mbar_ptr.subview(sched_stage), sched_full_phase, time_limit=10_000_000):
@@ -787,7 +792,7 @@ def _kernel(
                 for g in cutlass.range_constexpr(num_gemms):
                     subtile_tmem_addr = tmem_col_addr_gemms[g] + subtile_col_offset
                     tmem = cutlass.inttoptr(subtile_tmem_addr, 6, mma_c_dtype)
-                    _cv = nvvm.tcgen05_ld(shape, tmem, num=subtile_w)
+                    _cv = nvvm.tcgen05_ld(shape, tmem, num=subtile_w, offset=ld_half_off)
                     if cutlass.const_expr(acc_widen_to_fp32):
                         _accf = _cv.to(cutlass.Float32)
                         _cv = _accf + cutlass.full_like(_accf, 0.0)
@@ -795,6 +800,7 @@ def _kernel(
                 c_rmem_vec = c_rmem_vecs[0]
 
                 if subtile_idx == subtile_cnt - 1:
+                    nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
                     nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
                     if elect_one:
                         nvvm.mbarrier_arrive(acc_empty_mbar_ptr.subview(acc_stage))

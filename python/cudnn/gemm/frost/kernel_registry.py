@@ -310,6 +310,7 @@ class KernelTemplate:
         # cta_group constraints (the template's, not the config's).
         try:
             C._check_cta_group_geometry(config, self.cta_group)
+            C._check_mma_n_dim(chain, config, self.cta_group)
         except NotImplementedError as e:
             return str(e)
         try:
