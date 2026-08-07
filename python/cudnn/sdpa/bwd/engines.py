@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 import cudnn
+from cudnn.frost.buffers import CUTEDSL_MIN_VERSION, cutedsl_state, cutedsl_too_old
 from cudnn.sdpa import graph_analyzer as ga
 
 
@@ -138,6 +139,14 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
     sm = None if cc is None else cc[0] * 10 + cc[1]
     if sm is None or not (capabilities.sm_lo <= sm <= capabilities.sm_hi):
         return f"requires SM{capabilities.sm_lo}-{capabilities.sm_hi}; current device is {cc}"
+    installed, version = cutedsl_state()
+    if not installed:
+        # Said HERE, not when lowering imports the adapter: a decline at build
+        # is honest but late -- the plan is already in the ranked list.
+        return "requires the cutedsl extra (nvidia-cutlass-dsl), which is not installed"
+    if cutedsl_too_old(version):
+        want = ".".join(str(v) for v in CUTEDSL_MIN_VERSION)
+        return f"requires nvidia-cutlass-dsl >= {want}; found {version[1]}"
     if facts.is_mxfp8 or facts.is_fp8:
         return "this engine serves only half (fp16/bf16) sdpa_backward graphs"
     if facts.d_qk != facts.d_v:

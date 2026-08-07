@@ -795,6 +795,33 @@ def test_opt_in_flag_spellings(monkeypatch, value, offered):
     assert manifest.opt_in_engines_enabled() is offered
 
 
+def test_a_missing_optional_dependency_declines_rather_than_raising():
+    """Lowering imports resolve at build time now, so a missing extra surfaces
+    from build_plan() rather than making the family vanish at import. The walk
+    must treat that as a decline and move on -- otherwise a host without the
+    cutedsl extra loses graphs the backend could have served."""
+
+    class NeedsMissingExtra(TorchMatmulEngine):
+        name = "needs_extra"
+        engine_id = _OOT + 60
+
+        def build_plan(self, graph, plan, ctx=None):
+            raise ImportError("No module named 'not_installed_extra'")
+
+    g = pygraph(backends=[NeedsMissingExtra(), TorchMatmulEngine()])
+    a, b = torch.randn(2, 3), torch.randn(3, 2)
+    C = g.matmul(a, b)
+    g.create_execution_plans()
+    assert "needs_extra" in _plan_names(g), "it claims the graph; only lowering fails"
+
+    g.build_plans()
+    assert g.selected_engine is not None and g.selected_engine.name == "torch_matmul"
+
+    c = torch.empty(2, 2)
+    g.execute({C: c})
+    torch.testing.assert_close(c, torch.matmul(a, b))
+
+
 def test_classification_is_a_partition():
     """Every node type names exactly ONE family, so "two families claimed this
     graph" is not a case that can arise — it is a lookup, not N competing

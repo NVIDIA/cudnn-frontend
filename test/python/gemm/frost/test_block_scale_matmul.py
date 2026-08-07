@@ -1213,6 +1213,7 @@ def test_mxfp8_m_major_a_n_major_b(config_name, M, N, K):
     torch.testing.assert_close(c[0], ref, atol=2e-1, rtol=2e-2)
 
 
+@requires_sm100
 def test_fp4_rejects_non_k_major():
     """FP4 must be K-major — sub-byte packing mis-strides an M/N-major
     descriptor, so the compiler rejects it at JIT time."""
@@ -1409,6 +1410,7 @@ def _const(src, name):
     return eval(line.split(" = ", 1)[1])
 
 
+@requires_sm100
 def test_render_nvfp4_k_walk_tables():
     src = _render("nvfp4", _CFG_128)
     compile(src, "generated_kernel.py", "exec")
@@ -1438,6 +1440,7 @@ def test_render_nvfp4_k_walk_tables():
     assert _const(src, "sf_k") == 48
 
 
+@requires_sm100
 def test_render_mxfp4_k_walk_tables():
     src = _render("mxfp4", _CFG_128)
     compile(src, "generated_kernel.py", "exec")
@@ -1451,6 +1454,7 @@ def test_render_mxfp4_k_walk_tables():
     assert _const(src, "sf_atoms_per_group") == 3
 
 
+@requires_sm100
 def test_render_n256_interleaves_sfb_blocks():
     src = _render("nvfp4", _CFG_256)
     compile(src, "generated_kernel.py", "exec")
@@ -1640,6 +1644,7 @@ def test_sm103_block_scale_matmul_clusters(cluster, M, N):
     _run_sm103_numeric("nvfp4", f"CONFIG_sm103_128x128x384_128x128x48_{cluster}", M, N, 1536)
 
 
+@requires_sm100
 @pytest.mark.parametrize("M,N", [(64, 4096), (4096, 64), (128, 128), (4096, 4096)])
 def test_auto_config_is_accepted_by_the_registry(M, N):
     """``select_config`` is a second decision path that does not consult the

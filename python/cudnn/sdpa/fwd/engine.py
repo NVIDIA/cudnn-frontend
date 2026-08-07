@@ -117,7 +117,11 @@ class FrostSdpaFwdEngine(BaseEngine):
         knobs = plan.knobs if plan is not None else None
         try:
             return _FrostSdpaFwdPlan(self.name, build(self._spec, graph, knobs))
-        except (NotImplementedError, ValueError) as exc:
+        except (NotImplementedError, ValueError, ImportError) as exc:
+            # ImportError: the DSL adapter resolves at build time now (support
+            # checks must not pay for it), so a missing cutedsl extra surfaces
+            # HERE rather than making the family vanish at import. It is a
+            # decline -- the walk moves on and the backend serves the graph.
             raise NotImplementedError(f"{self.name}: {exc}") from exc
 
 

@@ -33,6 +33,7 @@ from typing import Any, Callable, Optional
 import cudnn
 
 from cudnn.frost.tile_dsl.constants import SCHED_NATURAL
+from cudnn.frost.buffers import CUTEDSL_MIN_VERSION, cutedsl_state, cutedsl_too_old
 from cudnn.sdpa import graph_analyzer as ga
 
 # The DSL adapters (api_dsl) and cuda.bindings are LOWERING dependencies, not
@@ -231,6 +232,14 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
     sm = None if cc is None else cc[0] * 10 + cc[1]
     if sm is None or not (capabilities.sm_lo <= sm <= capabilities.sm_hi):
         return f"requires SM{capabilities.sm_lo}-{capabilities.sm_hi}; current device is {cc}"
+    installed, version = cutedsl_state()
+    if not installed:
+        # Said HERE, not when lowering imports the adapter: a decline at build
+        # is honest but late -- the plan is already in the ranked list.
+        return "requires the cutedsl extra (nvidia-cutlass-dsl), which is not installed"
+    if cutedsl_too_old(version):
+        want = ".".join(str(v) for v in CUTEDSL_MIN_VERSION)
+        return f"requires nvidia-cutlass-dsl >= {want}; found {version[1]}"
     if capabilities.d_envelope:
         # Envelope row: native caps are upper bounds (TMA zero-padding semantics
         # — see Capabilities.d_envelope). Alignment: TMA global strides must be

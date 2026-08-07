@@ -32,8 +32,10 @@ def _modules(code: str) -> set:
     probe = code + "\nimport json, sys; print('@@' + json.dumps(sorted(sys.modules)))"
     run = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True)
     if run.returncode != 0:
-        pytest.skip(f"probe interpreter could not run: {run.stderr.strip()[-200:]}")
-    line = next(l for l in run.stdout.splitlines() if l.startswith("@@"))
+        # Not skip: a probe that cannot `import cudnn` is the regression this
+        # file exists to catch, and skipping would report it as "not checked".
+        pytest.fail(f"probe code failed: {run.stderr.strip()[-200:]}")
+    line = next(ln for ln in run.stdout.splitlines() if ln.startswith("@@"))
     return set(json.loads(line[2:]))
 
 

@@ -174,6 +174,7 @@ _N256_C2_CFG = next(
 )
 
 
+@requires_sm100
 def test_multi_gemm_2ctamma_compiles() -> None:
     """The 2-CTA-MMA CLC template (cluster2x1) compiles a dual-GEMM graph."""
     M, N, K = 256, 256, 128
