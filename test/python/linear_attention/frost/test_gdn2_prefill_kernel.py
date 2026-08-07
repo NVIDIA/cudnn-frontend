@@ -15,6 +15,7 @@ import torch
 import torch.nn.functional as F
 
 import cudnn  # noqa: F401  (conftest extends cudnn.__path__ with the source tree)
+from cudnn.linear_attention.frost import Gdn2FrostEngine
 
 from linear_attention.common import assert_bitwise_runs, assert_concurrent_stream_runs, assert_engine_declines
 from linear_attention.conftest import multidist_randu
