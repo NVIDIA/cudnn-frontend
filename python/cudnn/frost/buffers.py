@@ -235,7 +235,14 @@ def probe(buf):
     dl = getattr(buf, "__dlpack__", None)
     if dl is None:
         raise TypeError(f"buffer of type {type(buf).__name__} exposes neither __cuda_array_interface__ nor __dlpack__")
-    capsule = dl()
+    # stream=-1 is DLPack's "the caller handles synchronisation; do no
+    # bookkeeping". probe() only reads metadata, so it never needed any --
+    # and the default makes torch call record_stream, which is illegal inside
+    # a CUDA graph capture.
+    try:
+        capsule = dl(stream=-1)
+    except TypeError:  # a producer whose __dlpack__ predates the stream kwarg
+        capsule = dl()
     raw = _PyCapsule_GetPointer(capsule, b"dltensor")
     mt = ctypes.cast(raw, ctypes.POINTER(_DLManagedTensor)).contents
     t = mt.dl_tensor
