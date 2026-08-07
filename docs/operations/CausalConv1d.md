@@ -62,7 +62,7 @@ Where:
 - $L$ is the sequence length
 - $K$ is the kernel size
 
-See the [NHW forward notebook](../../samples/python/60_causal_conv1d_forward.ipynb) and [NHW backward notebook](../../samples/python/61_causal_conv1d_backward.ipynb) for PyTorch references and numerical comparisons.
+See the [NHW forward notebook](https://github.com/NVIDIA/cudnn-frontend/blob/main/samples/python/60_causal_conv1d_forward.ipynb) and [NHW backward notebook](https://github.com/NVIDIA/cudnn-frontend/blob/main/samples/python/61_causal_conv1d_backward.ipynb) for PyTorch references and numerical comparisons.
 
 ### `cudnn.ops.causal_conv1d_nwh`
 
@@ -108,7 +108,7 @@ y = cudnn.ops.causal_conv1d_nwh(x, weight, bias=None, activation="identity")
 
 The API supports `torch.autograd` and `torch.compile` for forward and backward execution. Backward computes `dx` with shape $(B, L, D)$, `dweight` with shape $(K, D)$, and `dbias` with shape $(D,)$. The supported kernel-size range remains 2–128 for both directions.
 
-See the [NWH forward notebook](../../samples/python/62_causal_conv1d_nwh_forward.ipynb) and [NWH backward notebook](../../samples/python/63_causal_conv1d_nwh_backward.ipynb) for PyTorch references and numerical comparisons.
+See the [NWH forward notebook](https://github.com/NVIDIA/cudnn-frontend/blob/main/samples/python/62_causal_conv1d_nwh_forward.ipynb) and [NWH backward notebook](https://github.com/NVIDIA/cudnn-frontend/blob/main/samples/python/63_causal_conv1d_nwh_backward.ipynb) for PyTorch references and numerical comparisons.
 
 ### `cudnn.ops.b2b_causal_conv1d`
 
@@ -147,7 +147,7 @@ y_gated = cudnn.ops.b2b_causal_conv1d(x, weights_proj, weights_mixer, skip_bias)
 
 The API supports `torch.autograd` and `torch.compile` for forward and backward execution. Backward computes `dx` with shape $(B, 3D, L)$, `dweights_proj` with shape $(3D, K_{proj})$, `dweights_mixer` with shape $(D, K_{mixer})$, and `dskip_bias` with shape $(D,)$. The projection and mixer kernel-size ranges are unchanged for backward.
 
-See the [B2B forward notebook](../../samples/python/64_b2b_causal_conv1d_forward.ipynb) and [B2B backward notebook](../../samples/python/65_b2b_causal_conv1d_backward.ipynb) for decomposed PyTorch references and numerical comparisons.
+See the [B2B forward notebook](https://github.com/NVIDIA/cudnn-frontend/blob/main/samples/python/64_b2b_causal_conv1d_forward.ipynb) and [B2B backward notebook](https://github.com/NVIDIA/cudnn-frontend/blob/main/samples/python/65_b2b_causal_conv1d_backward.ipynb) for decomposed PyTorch references and numerical comparisons.
 
 ### Low-level bindings
 
