@@ -56,10 +56,12 @@ def _select_engine(graph, name):
     return graph
 
 
-def _bhsd(batch: int, heads: int, sequence: int, head_dim: int, dtype: torch.dtype, empty: bool = False) -> torch.Tensor:
-    """Return logical BHSD backed by compact BSHD physical storage."""
+def _bhsd(batch: int, heads: int, sequence: int, head_dim: int, dtype: torch.dtype, empty: bool = False, layout: str = "bshd") -> torch.Tensor:
+    """Logical BHSD over compact BSHD storage, or BHSD-contiguous for layout="bhsd"."""
 
     factory = torch.empty if empty else torch.randn
+    if layout == "bhsd":
+        return factory(batch, heads, sequence, head_dim, dtype=dtype, device="cuda")
     return factory(batch, sequence, heads, head_dim, dtype=dtype, device="cuda").transpose(1, 2)
 
 
@@ -90,11 +92,14 @@ def _ref_bwd(
     return o_ref.to(q.dtype), stats_ref.contiguous(), dq.to(q.dtype), dk.to(q.dtype), dv.to(q.dtype)
 
 
-def _expected_workspace_bytes(batch: int, heads: int, s_q: int, head_dim: int) -> int:
+def _expected_workspace_bytes(batch: int, heads: int, s_q: int, head_dim: int, staged: tuple[torch.Tensor, ...] = ()) -> int:
     from cudnn.sdpa.fwd.api_dsl import ws_align
 
     sq_r = -(-s_q // 128) * 128
-    return ws_align(batch * heads * sq_r * 4) + ws_align(batch * sq_r * heads * head_dim * 4)
+    base = ws_align(batch * heads * sq_r * 4) + ws_align(batch * sq_r * heads * head_dim * 4)
+    # One compact staging copy per operand that is not BSHD-compact.
+    staging = sum(ws_align(t.numel() * t.element_size()) for t in staged if not t.transpose(1, 2).is_contiguous())
+    return base + staging
 
 
 def _run_bwd_graph(
@@ -112,6 +117,7 @@ def _run_bwd_graph(
     select: bool = True,
     q_tile: int | None = None,
     kv_tile: int | None = None,
+    grad_layout: str = "bshd",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, str]:
     """Build and execute the SM120 FROST backward graph; returns (dq, dk, dv, plan_name)."""
 
@@ -122,9 +128,9 @@ def _run_bwd_graph(
     io_dtype = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
     batch, h_q, _, head_dim = q_gpu.shape
     _, h_kv, _, _ = k_gpu.shape
-    dq_gpu = _bhsd(batch, h_q, q_gpu.shape[2], head_dim, dtype, empty=True)
-    dk_gpu = _bhsd(batch, h_kv, k_gpu.shape[2], head_dim, dtype, empty=True)
-    dv_gpu = _bhsd(batch, h_kv, v_gpu.shape[2], head_dim, dtype, empty=True)
+    dq_gpu = _bhsd(batch, h_q, q_gpu.shape[2], head_dim, dtype, empty=True, layout=grad_layout)
+    dk_gpu = _bhsd(batch, h_kv, k_gpu.shape[2], head_dim, dtype, empty=True, layout=grad_layout)
+    dv_gpu = _bhsd(batch, h_kv, v_gpu.shape[2], head_dim, dtype, empty=True, layout=grad_layout)
 
     graph = cudnn.pygraph(
         io_data_type=io_dtype,
@@ -185,7 +191,8 @@ def _run_bwd_graph(
 
     workspace_size = graph.get_workspace_size()
     if plan_name == ENGINE:
-        assert workspace_size == _expected_workspace_bytes(batch, h_q, q_gpu.shape[2], head_dim)
+        staged = (q_gpu, k_gpu, v_gpu, o_gpu, do_gpu, dq_gpu, dk_gpu, dv_gpu)
+        assert workspace_size == _expected_workspace_bytes(batch, h_q, q_gpu.shape[2], head_dim, staged)
     workspace = torch.empty(max(workspace_size, 1), dtype=torch.uint8, device="cuda")
 
     variant_pack = {
@@ -222,16 +229,18 @@ def _run_case(
     select: bool = True,
     q_tile: int | None = None,
     kv_tile: int | None = None,
+    layout: str = "bshd",
+    grad_layout: str = "bshd",
 ) -> str:
     scale = 1.0 / math.sqrt(head_dim)
-    q = _bhsd(batch, heads, s_q, head_dim, dtype)
-    k = _bhsd(batch, heads, s_kv, head_dim, dtype)
-    v = _bhsd(batch, heads, s_kv, head_dim, dtype)
-    do = _bhsd(batch, heads, s_q, head_dim, dtype)
+    q = _bhsd(batch, heads, s_q, head_dim, dtype, layout=layout)
+    k = _bhsd(batch, heads, s_kv, head_dim, dtype, layout=layout)
+    v = _bhsd(batch, heads, s_kv, head_dim, dtype, layout=layout)
+    do = _bhsd(batch, heads, s_q, head_dim, dtype, layout=layout)
     o, stats, dq_ref, dk_ref, dv_ref = _ref_bwd(
         q, k, v, do, scale=scale, is_causal=is_causal, causal_bottom_right=causal_bottom_right, window_size_left=window_size_left
     )
-    o = _bhsd(batch, heads, s_q, head_dim, dtype, empty=True).copy_(o)
+    o = _bhsd(batch, heads, s_q, head_dim, dtype, empty=True, layout=layout).copy_(o)
     dq, dk, dv, plan_name = _run_bwd_graph(
         q,
         k,
@@ -246,6 +255,7 @@ def _run_case(
         select=select,
         q_tile=q_tile,
         kv_tile=kv_tile,
+        grad_layout=grad_layout,
     )
     tol = _tolerances(dtype)
     torch.testing.assert_close(dq.float(), dq_ref.float(), **tol)
@@ -382,6 +392,15 @@ def test_sdpa_bwd_dsl_sm120_auto_routing():
 
     plan_name = _run_case(head_dim=64, is_causal=True, select=False)
     assert plan_name == ENGINE
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=8)
+def test_sdpa_bwd_dsl_sm120_dense_flex_bhsd_contiguous():
+    """BHSD-contiguous operands (dense_flex): served via workspace-carved compact
+    staging copies — a gather for the inputs, a scatter-back for dQ/dK/dV."""
+
+    _run_case(head_dim=64, is_causal=True, layout="bhsd", grad_layout="bhsd")
 
 
 @pytest.mark.L0

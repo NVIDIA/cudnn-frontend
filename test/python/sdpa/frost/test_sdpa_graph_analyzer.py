@@ -865,6 +865,10 @@ def test_bwd_facts_kv_transposed_view_canonicalized():
     facts = _facts(_mk_bwd_graph(kv_transposed_view=True))
     assert (facts.s_kv, facts.d_qk) == (S, _BWD_D)
     assert facts.bshd_layout
+    # port_layouts (what bwd lowering consumes) has the rewrite undone too.
+    ports = {name: (dim, stride) for name, dim, stride in facts.port_layouts}
+    assert ports["k"] == ((B, H, S, _BWD_D), _bshd_strides(H, S, _BWD_D))
+    assert ports["v"] == ((B, H, S, _BWD_D), _bshd_strides(H, S, _BWD_D))
 
 
 def test_bwd_probe_accepts(monkeypatch):
@@ -923,12 +927,15 @@ def test_bwd_probe_rejects_dbias(monkeypatch):
     assert not _bwd_eligible(_mk_bwd_graph(dbias=True))
 
 
-def test_bwd_probe_rejects_non_bshd_layout(monkeypatch):
+def test_bwd_probe_accepts_dense_flex_layouts(monkeypatch):
+    # Same dense_flex envelope as the forward rows: any B/H/S order with the
+    # head dim innermost; the adapter stages to compact BSHD.
     monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
-    # BHSD-contiguous gradients are outside the strict-BSHD envelope (no
-    # normalization copy on the backward path, unlike the forward dense_flex).
     bhsd_contig = (H * S * _BWD_D, S * _BWD_D, _BWD_D, 1)
-    assert not _bwd_eligible(_mk_bwd_graph(grad_strides=bhsd_contig))
+    assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(grad_strides=bhsd_contig))
+    # Head dim NOT innermost (S innermost instead) is outside dense_flex.
+    s_innermost = (H * S * _BWD_D, S * _BWD_D, 1, S)
+    assert not _bwd_eligible(_mk_bwd_graph(grad_strides=s_innermost))
 
 
 def test_bwd_probe_rejects_strided_stats(monkeypatch):

@@ -23,7 +23,7 @@ from cudnn.sdpa.bwd.config_sm120 import (
     SUPPORTED_HEAD_DIMS as _SM120_SUPPORTED_HEAD_DIMS,
     TemplateParams as Sm120TemplateParams,
 )
-from cudnn.sdpa.fwd.api_dsl import WorkspaceCarver, ws_align
+from cudnn.sdpa.fwd.api_dsl import WorkspaceCarver, _torch_stream_context, ws_align
 
 _SM120_KERNEL_FILE = "bprop_f16_sm120.py"
 _SM120_DTYPE_QKV_CODE = {
@@ -104,24 +104,6 @@ class SdpaBwdDsl(APIBase):
     def _initialize_implementation(self) -> None:
         """Initialize state private to specific implementations."""
 
-    @staticmethod
-    def _to_bshd(tensor: torch.Tensor) -> torch.Tensor:
-        """Return the compact kernel-facing BSHD tensor for a logical-BHSD INPUT."""
-
-        view = tensor.transpose(1, 2)
-        return view if view.is_contiguous() else view.contiguous()
-
-    @staticmethod
-    def _out_bshd(tensor: torch.Tensor) -> torch.Tensor:
-        """The compact BSHD view of a logical-BHSD OUTPUT, or raise."""
-
-        view = tensor.transpose(1, 2)
-        if not view.is_contiguous():
-            raise ValueError(
-                "output tensor must be logical (B, H, S, D) over compact BSHD storage; " f"got stride {tuple(tensor.stride())} shape {tuple(tensor.shape)}"
-            )
-        return view
-
     @abstractmethod
     def scratch_workspace_bytes(self) -> int:
         """Return the per-execution scratch requirement for this implementation."""
@@ -155,6 +137,8 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
         self.compute_capability: Optional[tuple[int, int]] = None
         self._k_mod = None
         self._sq_rounded: Optional[int] = None
+        # name -> staging number-of-elements for each non-BSHD-compact port
+        self._staging_numels: dict[str, int] = {}
 
     @staticmethod
     def _bshd_physical_ok(desc: TensorDesc) -> bool:
@@ -166,17 +150,22 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
     def check_support(self) -> bool:
         self._logger.debug("Entering check_support")
 
+        from cudnn.sdpa.graph_analyzer import dense_layout_ok
+
+        self._staging_numels = {}
         for desc in (self.q_desc, self.k_desc, self.v_desc, self.o_desc, self.do_desc, self.dq_desc, self.dk_desc, self.dv_desc):
             self._value_error_if(
                 desc.ndim != 4,
                 f"{desc.name} must be rank-4 (B, H, S, D); got {desc.ndim}",
             )
             self._value_error_if(
-                not self._bshd_physical_ok(desc),
-                f"{desc.name} must be logical (B, H, S, D) over compact BSHD storage "
-                f"(the SM120 backward kernels hard-code the H*D row stride); got "
-                f"stride {desc.stride} shape {desc.shape}",
+                not dense_layout_ok(tuple(desc.shape), tuple(desc.stride)),
+                f"{desc.name} must have the head dim innermost-contiguous (stride 1) and "
+                f"non-broadcast, non-overlapping strides (any B/H/S order, padded "
+                f"strides allowed); got stride {desc.stride} shape {desc.shape}",
             )
+            if not self._bshd_physical_ok(desc):
+                self._staging_numels[desc.name] = math.prod(desc.shape)
 
         b, h_q, s_q, d_qk = self.q_desc.shape
         _, h_kv, s_kv, _ = self.k_desc.shape
@@ -293,12 +282,14 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
         self._logger.debug("compile completed")
 
     def scratch_workspace_bytes(self) -> int:
-        """delta (fp32 [B, H, SQ_r128]) + dq_accum (fp32 flat [B*SQ_r128*H*D])."""
+        """delta (fp32 [B, H, SQ_r128]) + dq_accum (fp32 flat [B*SQ_r128*H*D])
+        + one compact staging copy per non-BSHD-compact operand."""
 
         self._ensure_support_checked()
         delta_bytes = ws_align(self.batch_size * self.h_q * self._sq_rounded * 4)
         dq_accum_bytes = ws_align(self.batch_size * self._sq_rounded * self.h_q * self.head_dim * 4)
-        return delta_bytes + dq_accum_bytes
+        staging_bytes = sum(ws_align(numel * self.dtype.itemsize) for numel in self._staging_numels.values())
+        return delta_bytes + dq_accum_bytes + staging_bytes
 
     def execute(
         self,
@@ -335,34 +326,55 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
 
         import cutlass
 
-        q = self._to_bshd(q_tensor)
-        k = self._to_bshd(k_tensor)
-        v = self._to_bshd(v_tensor)
-        o = self._to_bshd(o_tensor)
-        do = self._to_bshd(do_tensor)
-        dq = self._out_bshd(dq_tensor)
-        dk = self._out_bshd(dk_tensor)
-        dv = self._out_bshd(dv_tensor)
-        lse = stats_tensor.reshape(self.batch_size, self.h_q, self.s_q_max)
+        # Layout normalization: non-compact operands are staged through
+        # workspace-carved compact copies
+        def _staged_bshd(tensor: torch.Tensor) -> torch.Tensor:
+            view = tensor.transpose(1, 2)
+            if view.is_contiguous():
+                return view
+            staged = carver.take(view.numel(), self.dtype).view(view.shape)
+            staged.copy_(view)
+            return staged
 
-        kernels = self._compiled_kernel
-        # Three-kernel chain
-        kernels.dot(o, do, delta, dq_accum, current_stream)
-        kernels.main(
-            q,
-            k,
-            v,
-            do,
-            lse,
-            delta,
-            dq_accum,
-            dk,
-            dv,
-            cutlass.Float32(scale_log2),
-            cutlass.Float32(scale_val),
-            current_stream,
-        )
-        kernels.cvt(dq_accum, dq, cutlass.Float32(scale_val), current_stream)
+        def _staged_out_bshd(tensor: torch.Tensor):
+            """(kernel-facing compact BSHD buffer, user view to scatter back into or None)."""
+            view = tensor.transpose(1, 2)
+            if view.is_contiguous():
+                return view, None
+            return carver.take(view.numel(), self.dtype).view(view.shape), view
+
+        with _torch_stream_context(current_stream, q_tensor.device):
+            q = _staged_bshd(q_tensor)
+            k = _staged_bshd(k_tensor)
+            v = _staged_bshd(v_tensor)
+            o = _staged_bshd(o_tensor)
+            do = _staged_bshd(do_tensor)
+            dq, dq_user = _staged_out_bshd(dq_tensor)
+            dk, dk_user = _staged_out_bshd(dk_tensor)
+            dv, dv_user = _staged_out_bshd(dv_tensor)
+            lse = stats_tensor.reshape(self.batch_size, self.h_q, self.s_q_max)
+
+            kernels = self._compiled_kernel
+            # Three-kernel chain
+            kernels.dot(o, do, delta, dq_accum, current_stream)
+            kernels.main(
+                q,
+                k,
+                v,
+                do,
+                lse,
+                delta,
+                dq_accum,
+                dk,
+                dv,
+                cutlass.Float32(scale_log2),
+                cutlass.Float32(scale_val),
+                current_stream,
+            )
+            kernels.cvt(dq_accum, dq, cutlass.Float32(scale_val), current_stream)
+            for user_view, staged in ((dq_user, dq), (dk_user, dk), (dv_user, dv)):
+                if user_view is not None:
+                    user_view.copy_(staged)
 
 
 def _tensor_signature(tensor: torch.Tensor) -> tuple:
