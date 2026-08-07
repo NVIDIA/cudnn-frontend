@@ -41,6 +41,11 @@ def get_strides_from_indices(shape, indices=[0, 1, 2, 3], gaps=[0, 0, 0, 0], rng
     return tuple(strides)
 
 
+def packed_token_capacity(seq_lens):
+    """Token capacity of a packed (ragged) buffer, rounded up to a multiple of 64."""
+    return max(64, ((sum(seq_lens) + 63) // 64) * 64)
+
+
 def get_strides_from_layout(shape, layout, gaps=[0, 0, 0, 0], rng_geom=None):
     """Compute strides for a given layout string (e.g. 'bshd', 'bhsd')."""
     assert "".join(sorted(layout)) == "bdhs", f"wrong layout '{layout}'"
@@ -96,6 +101,9 @@ class ExecConfig:
     # cu_seq_len_kv). The mixed forms require cuDNN 9.25+.
     cu_seq_len_sides: str = "both"
     is_ragged: bool = None
+    # "token_major" ([t, h, 1], sequence stride h_q) or "head_major" ([h, t], sequence stride 1).
+    # None when not ragged.
+    ragged_stats_layout: str = None
     is_dropout: bool = None
     is_determin: bool = None
     is_mxfp8: bool = False
@@ -318,8 +326,16 @@ class RandomizationContext:
         if randoms_.is_ragged:  # Ideally Q, O, and Stats are all ragged
             randoms_.stride_q = get_strides_from_layout(randoms_.shape_q, "bshd")
             randoms_.stride_o = get_strides_from_layout(randoms_.shape_o, "bshd")
-            randoms_.stride_stats = get_strides_from_layout(randoms_.shape_stats, "bshd")
+            if randoms_.ragged_stats_layout == "head_major":
+                # [h, t] stats: tokens contiguous within a head, heads strided by the whole packed
+                # buffer. This is FlashAttention's / PyTorch varlen's softmax_lse layout; unlike the
+                # token-major one its sequence stride is 1 instead of h_q.
+                t_q = packed_token_capacity(randoms_.seq_len_q)
+                randoms_.stride_stats = (randoms_.h_q * t_q, t_q, 1, 1)
+            else:
+                randoms_.stride_stats = get_strides_from_layout(randoms_.shape_stats, "bshd")
         else:
+            randoms_.ragged_stats_layout = None
             indices = [0, 1, 2]
             rng.shuffle(indices)
             indices.append(3)
@@ -604,6 +620,7 @@ def test_randomization_context(seed):
             }
         ),
         is_ragged_or_padded_or_full=RandomChoice({"ragged": 1, "padded": 1, "full": 1}),
+        ragged_stats_layout=RandomChoice({"token_major": 1, "head_major": 1}),
     ) as ctx:
         return ctx
 

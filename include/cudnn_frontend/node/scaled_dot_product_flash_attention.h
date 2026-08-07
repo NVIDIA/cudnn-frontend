@@ -1095,6 +1095,19 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
     std::shared_ptr<Tensor_attributes> alibi_slopes;
     int64_t alibi_slopes_size = 0;
 
+    // Byte span of a workspace tensor packed (ragged) over the token axis: the sequence axis is
+    // bounded by max_total_seq_len instead of dim[2], every other axis contributes its own extent.
+    // Sizing from stride[2] alone under-allocates any layout whose per-token footprint is not
+    // stride[2] -- e.g. head-major [h, t] stats, where stride[2] == 1.
+    static int64_t
+    ragged_workspace_size(int64_t max_total_seq_len,
+                          std::vector<int64_t> const& dim,
+                          std::vector<int64_t> const& stride,
+                          int64_t elem_size) {
+        return ((max_total_seq_len - 1) * stride[2] + (dim[1] - 1) * stride[1] + (dim[3] - 1) * stride[3] + 1) *
+               elem_size;
+    }
+
     mutable bool has_workaround_padding_mask         = false;  // Will be edited in pre_validate_node()
     mutable int32_t s_q_for_workaround_padding_mask  = 0;      // Will be edited in pre_validate_node()
     mutable int32_t s_kv_for_workaround_padding_mask = 0;      // Will be edited in pre_validate_node()
@@ -1715,8 +1728,10 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
             // sized TH1 softmax_sum
             softmax_sum->set_stride(attributes.inputs[input_names::Stats]->get_stride());
             softmax_sum->set_ragged_offset(attributes.inputs[input_names::Stats]->get_ragged_offset());
-            softmax_sum_size = attributes.max_total_seq_len_q.value() *
-                               (attributes.inputs[input_names::Stats]->get_stride())[2] * sizeof(float);
+            softmax_sum_size = ragged_workspace_size(attributes.max_total_seq_len_q.value(),
+                                                     softmax_sum->get_dim(),
+                                                     softmax_sum->get_stride(),
+                                                     sizeof(float));
         } else {
             // sized BHS1 softmax_sum
             softmax_sum->set_stride({h_q * s_q, s_q, 1, 1});
@@ -1925,7 +1940,8 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
                 dV_fullhead->set_ragged_offset(attributes.outputs[output_names::dV]->get_ragged_offset());
                 // non virtual dV full head
                 dV_fullhead->set_is_virtual(false);
-                dV_fullhead_size = attributes.max_total_seq_len_kv.value() * dV_fullhead_stride[2] * sizeof(float);
+                dV_fullhead_size = ragged_workspace_size(
+                    attributes.max_total_seq_len_kv.value(), dV_fullhead->get_dim(), dV_fullhead_stride, sizeof(float));
             } else {
                 // sized BHSD dQ_accum
                 dV_fullhead->set_stride({h_q * s_kv * d_v, s_kv * d_v, d_v, 1});
@@ -2037,7 +2053,8 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
                 dK_fullhead->set_ragged_offset(attributes.outputs[output_names::dK]->get_ragged_offset());
                 // non virtual dK full head
                 dK_fullhead->set_is_virtual(false);
-                dK_fullhead_size = attributes.max_total_seq_len_kv.value() * dK_fullhead_stride[2] * sizeof(float);
+                dK_fullhead_size = ragged_workspace_size(
+                    attributes.max_total_seq_len_kv.value(), dK_fullhead->get_dim(), dK_fullhead_stride, sizeof(float));
             } else {
                 // sized BHSD dQ_accum
                 dK_fullhead->set_stride({h_q * s_kv * d_qk, s_kv * d_qk, d_qk, 1});
@@ -2074,8 +2091,8 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
                 // sized THD dQ_accum
                 dQ_accum->set_stride(attributes.outputs[output_names::dQ]->get_stride());
                 dQ_accum->set_ragged_offset(attributes.outputs[output_names::dQ]->get_ragged_offset());
-                dQ_accum_size = attributes.max_total_seq_len_q.value() *
-                                (attributes.outputs[output_names::dQ]->get_stride())[2] * sizeof(float);
+                dQ_accum_size = ragged_workspace_size(
+                    attributes.max_total_seq_len_q.value(), dQ_accum->get_dim(), dQ_accum->get_stride(), sizeof(float));
             } else {
                 // sized BHSD dQ_accum
                 dQ_accum->set_stride({h_q * s_q * d_qk, s_q * d_qk, d_qk, 1});
