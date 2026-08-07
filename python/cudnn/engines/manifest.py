@@ -244,8 +244,8 @@ def resolve_analyzer(family: EngineFamily):
 
     Importing it is the caller's decision, not this module's: keeping
     ``analyzer`` a pair of strings is what lets the coarse key stay
-    import-free. validate() resolves it and attaches the record to the graph;
-    the family's engines then read that same record back.
+    import-free. Planning resolves it and attaches the record to the frozen
+    graph; the family's engines then read that same record back.
     """
     if family.analyzer is None:
         return None

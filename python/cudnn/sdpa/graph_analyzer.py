@@ -8,9 +8,10 @@ directly, exposed via ``graph.nodes`` — no construction-time hooks are needed.
 This module extracts *facts* (what the graph asks for) without judging
 supportedness; each registered engine matches the facts against its own
 capability declaration (see ``cudnn.sdpa.fwd.engines``). :func:`analyze` is the
-callable the SDPA family names in ``engines/manifest.py``; validate() runs it
-once per graph and attaches the record, so the ranking and the engine share it
-rather than each parsing the graph.
+callable the SDPA family names in ``engines/manifest.py``; PLANNING runs it once
+per graph -- after the backend's layout inference has landed and the graph is
+frozen -- and attaches the record, so the ranking and the engine share it rather
+than each parsing the graph.
 
 Also hosts the graph-side runtime helpers shared by every SDPA engine:
 variant-pack resolution and TensorDesc construction.
@@ -50,9 +51,16 @@ def _torch_cuda_device():
 
 
 def to_torch_dtype(dt):
-    """cudnn.data_type -> torch.dtype, for the lowering boundary only."""
+    """cudnn.data_type -> torch.dtype, for the lowering boundary only.
+
+    Declines rather than raising KeyError on a type this family has no mapping
+    for: only Q's dtype is capability-checked, so O / Stats / a side output can
+    still carry one, and tensor_desc_from_ir() runs on every bound tensor.
+    """
     import torch
 
+    if dt not in _TORCH_FROM_CUDNN:
+        raise NotImplementedError(f"cudnn.sdpa: no lowering for data type {dt}")
     return getattr(torch, _TORCH_FROM_CUDNN[dt])
 
 
