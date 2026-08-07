@@ -9,7 +9,7 @@ backend. The C++ graph builder is internal
 (`cudnn._pybind_module.backend_graph`) and is reached exclusively through
 lowering.
 
-```
+```text
 cudnn.pygraph (Python IR)  →  create_execution_plans()  →  Router  →  routed plan list
   nodes / tensors / params        (route here,               PlanConfig(engine_id, knobs):
   fully introspectable            lazy lowering)             python engines + one backend entry
