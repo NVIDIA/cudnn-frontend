@@ -145,8 +145,11 @@ def _mkdata(batch: int, M: int, N: int, K: int, combo: str):
         sfb_log = _rand_e8m0((batch, N, sf_k), dev)
 
     c = torch.empty(batch, M, N, dtype=torch.bfloat16, device=dev)
-    sfa = torch.cat([_to_blocked(sfa_log[i]) for i in range(batch)]).view(batch, M, sf_k)
-    sfb = torch.cat([_to_blocked(sfb_log[i]) for i in range(batch)]).view(batch, N, sf_k)
+    # The blocked blob carries the PADDED dims (whole 128-row x 4-SF-K atoms) —
+    # that is what the kernel reads. The graph keeps the logical [batch, M, sf_k].
+    sf_k_pad = _ceil_div(sf_k, 4) * 4
+    sfa = torch.cat([_to_blocked(sfa_log[i]) for i in range(batch)]).view(batch, _ceil_div(M, 128) * 128, sf_k_pad)
+    sfb = torch.cat([_to_blocked(sfb_log[i]) for i in range(batch)]).view(batch, _ceil_div(N, 128) * 128, sf_k_pad)
     return a, b, c, sfa, sfb
 
 
@@ -200,7 +203,7 @@ def _rotating(fn_of_set: Callable, pool: list) -> Callable:
     return lambda i: fn_of_set(pool[i % n])
 
 
-def _scaled_mm_ref(batch: int, M: int, N: int, K: int, combo: str):
+def _scaled_mm_ref(batch: int, M: int, N: int, K: int, combo: str, verbose: bool = True):
     """(label, call) for cuBLAS's OWN block-scaled GEMM of this combo, via
     torch.nn.functional.scaled_mm (cuBLASLt) — the apples-to-apples reference.
     Returns None if the env can't run it (some cuBLASLt builds return no
@@ -217,7 +220,6 @@ def _scaled_mm_ref(batch: int, M: int, N: int, K: int, combo: str):
     is_fp4, bs, _, _ = _COMBOS[combo]
     ru = lambda x, m: ((x + m - 1) // m) * m
     cd = lambda a, b: (a + b - 1) // b
-    sw = [SwizzleType.SWIZZLE_32_4_4]
 
     if is_fp4:
         a = torch.randint(0, 256, (M, K // 2), dtype=torch.uint8, device=dev).view(torch.float4_e2m1fn_x2)
@@ -235,11 +237,14 @@ def _scaled_mm_ref(batch: int, M: int, N: int, K: int, combo: str):
         gb = torch.ones(1, device=dev)
         recipe = [ScalingType.BlockWise1x16, ScalingType.TensorWise]
         scA, scB = [sa, ga], [sb, gb]
+        # scaled_mm wants one swizzle PER scale in the recipe.
+        sw = [SwizzleType.SWIZZLE_32_4_4, SwizzleType.NO_SWIZZLE]
     else:  # mxfp4 / mxfp8 — no global scale
         sa = torch.randn(na, device=dev).to(torch.float8_e8m0fnu)
         sb = torch.randn(nb, device=dev).to(torch.float8_e8m0fnu)
         recipe = [ScalingType.BlockWise1x32]
         scA, scB = [sa], [sb]
+        sw = [SwizzleType.SWIZZLE_32_4_4]
 
     # scaled_mm has no batched form, so a batched ref is B back-to-back single-GEMM
     # calls (same operands); FLOPS counts all B so throughput stays comparable.
@@ -252,7 +257,10 @@ def _scaled_mm_ref(batch: int, M: int, N: int, K: int, combo: str):
     try:
         call()
         torch.cuda.synchronize()
-    except Exception:
+    except Exception as e:
+        # Print it — an unrunnable env and an API-shape bug look identical otherwise.
+        if verbose:
+            print(f"  [scaled_mm '{combo}' reference unavailable: {type(e).__name__}: {e}]")
         return None
     suffix = f" ×{batch}" if batch > 1 else ""
     return f"cuBLAS {combo} scaled_mm{suffix}", call
@@ -265,15 +273,15 @@ def _make_reference(batch: int, M: int, N: int, K: int, combo: str, ref_mode: st
     / bf16 (dense BF16) / auto (scaled_mm, falling back to BF16)."""
     dev = "cuda"
     if ref_mode in ("auto", "scaled_mm"):
-        ref = _scaled_mm_ref(batch, M, N, K, combo)
+        ref = _scaled_mm_ref(batch, M, N, K, combo, verbose=verbose)
         if ref is not None:
             return ref
         if ref_mode == "scaled_mm":
             sys.exit(
                 f"--ref scaled_mm: cuBLAS block-scaled GEMM for '{combo}' is not "
-                f"runnable here — torch.nn.functional.scaled_mm raised at the "
-                f"cuBLASLt heuristic (no algorithm for this driver / cuBLASLt "
-                f"build). Use --ref bf16, or --ref auto to fall back automatically."
+                f"runnable here — torch.nn.functional.scaled_mm raised (see the "
+                f"message above). Use --ref bf16, or --ref auto to fall back "
+                f"automatically."
             )
         if verbose:
             print("  [note: scaled_mm reference unavailable in this env — " "falling back to dense BF16 cuBLAS]")

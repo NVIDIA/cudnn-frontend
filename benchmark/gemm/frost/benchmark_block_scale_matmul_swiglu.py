@@ -141,7 +141,8 @@ def _mkdata(B, M, N, K, bs=16):
 
     def _sf(rows):
         log = torch.randint(1, 4, (B, rows, sf_k), device=dev).to(torch.float8_e4m3fn)
-        blk = torch.stack([_to_blocked(log[b]) for b in range(B)]).view(B, rows, sf_k)
+        # _to_blocked pads to whole 128-row x 4-SF-K atoms — view the PADDED dims.
+        blk = torch.stack([_to_blocked(log[b]) for b in range(B)]).view(B, _ceil_div(rows, 128) * 128, _ceil_div(sf_k, 4) * 4)
         return log, blk
 
     sfa_log, sfa_b = _sf(M)

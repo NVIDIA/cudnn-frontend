@@ -180,6 +180,7 @@ def _kernel(
 
     warp_idx = cute.arch.warp_idx()
     warp_idx = cute.arch.make_warp_uniform(warp_idx)
+    elect_one = nvvm.elect_sync()
 
     tidx = cute.arch.thread_idx()[0]
     bidx = cute.arch.block_idx()[0]
@@ -318,7 +319,7 @@ def _kernel(
     num_consumer_warps_per_cta = 8
     clc_empty_count = num_consumer_warps_per_cta * cluster_size
     if warp_idx == 0:
-        if nvvm.elect_sync():
+        if elect_one:
             for i in range(ab_stages):
                 nvvm.mbarrier_init(ab_full_mbar_ptr.subview(i), 1)
                 nvvm.mbarrier_init(ab_empty_mbar_ptr.subview(i), ab_empty_count)
@@ -375,11 +376,11 @@ def _kernel(
                 while not nvvm.mbarrier_try_wait_parity(clc_empty_mbar_ptr.subview(stage), clc_empty_phase, time_limit=10_000_000):
                     pass
 
-            if nvvm.elect_sync():
+            if elect_one:
                 nvvm.mbarrier_arrive_expect_tx(clc_full_mbar_ptr.subview(stage), 16)
 
             if is_cluster_leader_cta:
-                if nvvm.elect_sync():
+                if elect_one:
                     cute_clc.issue_clc_query(
                         clc_full_mbar_cute_base + stage,
                         clc_response_ptr_base + stage,
@@ -394,7 +395,7 @@ def _kernel(
             is_valid_sched = vld
 
             nvvm.bar_warp_sync(0xFFFFFFFF)
-            if nvvm.elect_sync():
+            if elect_one:
                 empty_remote = nvvm.mapa(clc_empty_mbar_ptr.subview(stage), 0)
                 nvvm.mbarrier_arrive(empty_remote, scope=nvvm.MemScope.CLUSTER, relaxed=True)
 
@@ -417,7 +418,7 @@ def _kernel(
     if warp_idx == tma_warp_id:
         nvvm.setmaxregister(prod_reg_count, nvvm.SetMaxRegisterAction.DECREASE)
         if cutlass.const_expr(USE_PDL):
-            if nvvm.elect_sync():
+            if elect_one:
                 nvvm.griddepcontrol("wait")
         ab_empty_phase_bit = cutlass.Int32(1)
         ab_stage_cur = cutlass.Int32(0)  # incremental ring walk — no div in the loop
@@ -447,7 +448,7 @@ def _kernel(
                         pass
 
                     coord_k = k_tile_idx * cta_tile_mnk[2] + _kc * ab_tma_box_k_elems
-                    if nvvm.elect_sync():
+                    if elect_one:
                         nvvm.mbarrier_arrive_expect_tx(ab_full_mbar_ptr.subview(stage), num_tma_ab_chunk_bytes)
 
                     for _ai in cutlass.range_constexpr(num_a_operands):
@@ -455,7 +456,7 @@ def _kernel(
                         tma_a_desc = tma_a_descs[_ai]
                         if cutlass.const_expr(multicast_a):
                             if n_rank == 0:
-                                if nvvm.elect_sync():
+                                if elect_one:
                                     nvvm.cp_async_bulk_tensor_shared_cluster_global(
                                         sA_stage,
                                         tma_a_desc.get_ptr(),
@@ -466,7 +467,7 @@ def _kernel(
                                         group=nvvm.CTAGroup.CTA_1,
                                     )
                         else:
-                            if nvvm.elect_sync():
+                            if elect_one:
                                 nvvm.cp_async_bulk_tensor_shared_cluster_global(
                                     sA_stage,
                                     tma_a_desc.get_ptr(),
@@ -482,7 +483,7 @@ def _kernel(
                         tma_b_desc = tma_b_descs[_bj]
                         if cutlass.const_expr(multicast_b):
                             if m_rank == 0:
-                                if nvvm.elect_sync():
+                                if elect_one:
                                     nvvm.cp_async_bulk_tensor_shared_cluster_global(
                                         sB_stage,
                                         tma_b_desc.get_ptr(),
@@ -493,7 +494,7 @@ def _kernel(
                                         group=nvvm.CTAGroup.CTA_1,
                                     )
                         else:
-                            if nvvm.elect_sync():
+                            if elect_one:
                                 nvvm.cp_async_bulk_tensor_shared_cluster_global(
                                     sB_stage,
                                     tma_b_desc.get_ptr(),
@@ -529,7 +530,7 @@ def _kernel(
             )
             tile_l = l_idx
             nvvm.bar_warp_sync(0xFFFFFFFF)
-            if nvvm.elect_sync():
+            if elect_one:
                 empty_remote = nvvm.mapa(clc_empty_mbar_ptr.subview(consumer_stage), 0)
                 nvvm.mbarrier_arrive(empty_remote, scope=nvvm.MemScope.CLUSTER, relaxed=True)
             tile_iter += 1
@@ -543,14 +544,14 @@ def _kernel(
             if tail_stage == ab_stages:
                 tail_stage = cutlass.Int32(0)
                 tail_phase = tail_phase ^ 1
-        if nvvm.elect_sync():
+        if elect_one:
             while not nvvm.mbarrier_try_wait_parity(ab_empty_mbar_ptr.subview(tail_stage), tail_phase, time_limit=10_000_000):
                 pass
 
     if warp_idx == sf_warp_id:
         nvvm.setmaxregister(prod_reg_count, nvvm.SetMaxRegisterAction.DECREASE)
         if cutlass.const_expr(USE_PDL):
-            if nvvm.elect_sync():
+            if elect_one:
                 nvvm.griddepcontrol("wait")
         sf_empty_phase_bit = cutlass.Int32(1)
         sf_stage_cur = cutlass.Int32(0)  # incremental ring walk — no div in the loop
@@ -582,7 +583,7 @@ def _kernel(
                         pass
 
                     coord_sf_k = k_tile_idx * sf_tma_box_k + _grp * sf_atoms_per_group
-                    if nvvm.elect_sync():
+                    if elect_one:
                         nvvm.mbarrier_arrive_expect_tx(sf_full_mbar_ptr.subview(stage), num_tma_sf_group_bytes)
 
                     for _ai in cutlass.range_constexpr(num_a_operands):
@@ -590,7 +591,7 @@ def _kernel(
                         tma_sfa_desc = tma_sfa_descs[_ai]
                         if cutlass.const_expr(multicast_a):
                             if n_rank == 0:
-                                if nvvm.elect_sync():
+                                if elect_one:
                                     nvvm.cp_async_bulk_tensor_shared_cluster_global(
                                         sSFA_stage,
                                         tma_sfa_desc.get_ptr(),
@@ -601,7 +602,7 @@ def _kernel(
                                         group=nvvm.CTAGroup.CTA_1,
                                     )
                         else:
-                            if nvvm.elect_sync():
+                            if elect_one:
                                 nvvm.cp_async_bulk_tensor_shared_cluster_global(
                                     sSFA_stage,
                                     tma_sfa_desc.get_ptr(),
@@ -617,7 +618,7 @@ def _kernel(
                         tma_sfb_desc = tma_sfb_descs[_bj]
                         if cutlass.const_expr(multicast_b):
                             if m_rank == 0:
-                                if nvvm.elect_sync():
+                                if elect_one:
                                     nvvm.cp_async_bulk_tensor_shared_cluster_global(
                                         sSFB_stage,
                                         tma_sfb_desc.get_ptr(),
@@ -628,7 +629,7 @@ def _kernel(
                                         group=nvvm.CTAGroup.CTA_1,
                                     )
                         else:
-                            if nvvm.elect_sync():
+                            if elect_one:
                                 nvvm.cp_async_bulk_tensor_shared_cluster_global(
                                     sSFB_stage,
                                     tma_sfb_desc.get_ptr(),
@@ -664,7 +665,7 @@ def _kernel(
             )
             tile_l = l_idx
             nvvm.bar_warp_sync(0xFFFFFFFF)
-            if nvvm.elect_sync():
+            if elect_one:
                 empty_remote = nvvm.mapa(clc_empty_mbar_ptr.subview(consumer_stage), 0)
                 nvvm.mbarrier_arrive(empty_remote, scope=nvvm.MemScope.CLUSTER, relaxed=True)
             tile_iter += 1
@@ -676,7 +677,7 @@ def _kernel(
             if tail_stage == sf_stages:
                 tail_stage = cutlass.Int32(0)
                 tail_phase = tail_phase ^ 1
-        if nvvm.elect_sync():
+        if elect_one:
             while not nvvm.mbarrier_try_wait_parity(sf_empty_mbar_ptr.subview(tail_stage), tail_phase, time_limit=10_000_000):
                 pass
 
@@ -741,7 +742,7 @@ def _kernel(
             ):
                 pass
 
-            is_mma_leader = nvvm.elect_sync()
+            is_mma_leader = elect_one
             if cutlass.const_expr(use_acc_overlap):
                 acc_base_col = base_col_id_root + (tile_iter % 2) * acc_stage_stride
             else:
@@ -963,18 +964,18 @@ def _kernel(
             cute.arch.fence_proxy("async.shared", space="cta")
             is_valid = vld
             nvvm.bar_warp_sync(0xFFFFFFFF)
-            if nvvm.elect_sync():
+            if elect_one:
                 empty_remote = nvvm.mapa(clc_empty_mbar_ptr.subview(consumer_stage), 0)
                 nvvm.mbarrier_arrive(empty_remote, scope=nvvm.MemScope.CLUSTER, relaxed=True)
             tile_iter += 1
 
         if cutlass.const_expr(USE_PDL):
-            if nvvm.elect_sync():
+            if elect_one:
                 nvvm.griddepcontrol("launch_dependents")
         nvvm.tcgen05_relinquish_alloc_permit(group=nvvm.CTAGroup.CTA_1)
         tail_stage = acc_stage
         tail_phase = acc_empty_phase_bit
-        if nvvm.elect_sync():
+        if elect_one:
             for _ in range(acc_stages):
                 tail_stage = tail_stage + 1
                 if tail_stage == acc_stages:
@@ -1067,7 +1068,7 @@ def _kernel(
 
                 if use_acc_overlap and (not cd_out_is_m_major) and subtile_idx == acc_overlap_subtiles - 1:
                     nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
-                    if nvvm.elect_sync():
+                    if elect_one:
                         nvvm.mbarrier_arrive(acc_empty_mbar_ptr.subview(acc_stage))
 
                 col = coord_n + subtile_col_offset
@@ -1123,7 +1124,7 @@ def _kernel(
                 )
 
                 if warp_idx == 0:
-                    if nvvm.elect_sync():
+                    if elect_one:
                         if cutlass.const_expr(cd_out_is_m_major):
                             for _mb in cutlass.range_constexpr(cta_tile_mnk[0] // cd_mmajor_atom_m):
                                 nvvm.cp_async_bulk_tensor_global_shared_cta(
@@ -1160,7 +1161,7 @@ def _kernel(
 
             if cutlass.const_expr((not use_acc_overlap) or cd_out_is_m_major):
                 nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
-                if nvvm.elect_sync():
+                if elect_one:
                     nvvm.mbarrier_arrive(acc_empty_mbar_ptr.subview(acc_stage))
 
             consumer_stage = tile_iter % CLC_SCHED_STAGES
@@ -1184,7 +1185,7 @@ def _kernel(
             )
             tile_l = l_idx
             nvvm.bar_warp_sync(0xFFFFFFFF)
-            if nvvm.elect_sync():
+            if elect_one:
                 empty_remote = nvvm.mapa(clc_empty_mbar_ptr.subview(consumer_stage), 0)
                 nvvm.mbarrier_arrive(empty_remote, scope=nvvm.MemScope.CLUSTER, relaxed=True)
 
@@ -1192,7 +1193,7 @@ def _kernel(
 
         if cutlass.const_expr(use_acc_overlap):
             nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
-            if nvvm.elect_sync():
+            if elect_one:
                 nvvm.mbarrier_arrive(tmem_dealloc_mbar_ptr)
 
         # @@TMA_STORE_ONLY:BEGIN@@
