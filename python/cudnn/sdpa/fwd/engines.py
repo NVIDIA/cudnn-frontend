@@ -484,6 +484,7 @@ def _sm120_spec() -> EngineSpec:
             padded_stats=True,
             thd=True,
             thd_bottom_right=True,
+            thd_stats=True,
             layouts=frozenset({"bshd", "dense_flex"}),
             sched_policies=frozenset({SCHED_NATURAL}),
             tile_ms=frozenset({64, 128}),
@@ -691,8 +692,7 @@ def lower_dsl_prefill(
             k_tensor=k_buf,
             v_tensor=v_buf,
             o_tensor=o_buf,
-            # THD ignores lse_tensor (the packed LSE is api-level scratch).
-            lse_tensor=lse_buf.reshape(facts.b, facts.h_q, facts.s_q) if lse_buf is not None else None,
+            lse_tensor=lse_buf,
             scale_softmax=facts.scale,
             sinks=sinks_buf,
             seq_kv_lens=seq_kv_buf,

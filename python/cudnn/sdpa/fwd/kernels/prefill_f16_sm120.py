@@ -179,6 +179,7 @@ class SM120FusedMultiHeadAttentionForward:
         thd_varlen: bool = False,
         thd_batch: int = 1,
         thd_max_sq: int = 0,
+        thd_lse_head_major: bool = False,
         head_tile_qk: int = 128,
         head_tile_v: int = 128,
         kv_tile: int = SEQ_KV_TILES[0],
@@ -202,6 +203,10 @@ class SM120FusedMultiHeadAttentionForward:
             grid covers ``ceil(thd_max_sq / q_tile)`` tiles per sequence.
         :param thd_batch: THD only: the real sequence count B.
         :param thd_max_sq: THD only: the longest sequence's Q length.
+        :param thd_lse_head_major: THD only: the packed LSE is head-major
+            ``(H, head_stride)`` (FlashAttention's ``softmax_lse`` layout; tokens
+            contiguous within a head, ``head_stride >= T``) instead of the default
+            token-major ``(T, H)``.
         :param head_tile_qk: Q/K head dimension (the QK^T contraction width).
             Must be a multiple of 16 between 16 and 256, inclusive.
         :param head_tile_v: V/O head dimension (the P@V output width). Same
@@ -225,6 +230,7 @@ class SM120FusedMultiHeadAttentionForward:
         self.thd_varlen = thd_varlen
         self.thd_batch = thd_batch
         self.thd_max_sq = thd_max_sq
+        self.thd_lse_head_major = thd_lse_head_major
 
         self.head_tile_qk = head_tile_qk
         self.head_tile_v = head_tile_v
@@ -729,7 +735,9 @@ class SM120FusedMultiHeadAttentionForward:
         :param k: Key tensor.
         :param v: Value tensor.
         :param o: Output tensor.
-        :param lse: ``(B, H, Sq)`` fp32 log-sum-exp output, or ``None`` to
+        :param lse: fp32 log-sum-exp output — ``(B, H, Sq)`` dense; packed
+            token-major ``(T, H)`` or head-major ``(H, head_stride)`` (per
+            ``thd_lse_head_major``) under ``thd_varlen``; or ``None`` to
             compile the LSE store out (the DSL specializes on ``None``).
         :param sinks: ``(H,)`` fp32 per-Q-head sink logits; ``None`` iff the
             kernel is configured without ``has_sink``.
@@ -1093,12 +1101,19 @@ class SM120FusedMultiHeadAttentionForward:
                         lse_q_idx = q_seq_idx + q_warp_row0 + (lane // 4) + row_half * 8
                         lse_out = cutlass.Float32(row_lse[row_half])
                         if cutlass.const_expr(self.thd_varlen):
-                            # Packed (1, H, T) LSE: rows past this sequence's Q
-                            # length belong to the NEXT sequence — never written,
-                            # and there is no padded region to trim.
+                            # Packed ragged-Stats LSE, written directly in the
+                            # caller's declared layout: token-major (T, H) or
+                            # head-major (H, head_stride).
+                            # Rows past this sequence's Q length belong to the
+                            # NEXT sequence — never written, and there is no
+                            # padded region to trim.
                             if lse_q_idx < seqlen_q:
-                                lse_row = lse_arr[0, head_idx, :]
-                                lse_row[q_row_base + lse_q_idx] = lse_out
+                                if cutlass.const_expr(self.thd_lse_head_major):
+                                    lse_row = lse_arr[head_idx, :]
+                                    lse_row[q_row_base + lse_q_idx] = lse_out
+                                else:
+                                    lse_row = lse_arr[q_row_base + lse_q_idx, :]
+                                    lse_row[head_idx] = lse_out
                         else:
                             # Rows at/past this batch's Q length trim to -inf.
                             if lse_q_idx >= seqlen_q:
@@ -1197,7 +1212,9 @@ class SM120FusedMultiHeadAttentionForward:
         :param k: Key tensor with shape ``(B, Sk, H, D)``.
         :param v: Value tensor with shape ``(B, Sk, H, D)``.
         :param o: Output tensor with shape ``(B, Sq, H, D)``.
-        :param lse: ``(B, H, Sq)`` fp32 log-sum-exp output, or ``None`` to
+        :param lse: fp32 log-sum-exp output — ``(B, H, Sq)`` dense; packed
+            token-major ``(T, H)`` or head-major ``(H, head_stride)`` (per
+            ``thd_lse_head_major``) under ``thd_varlen``; or ``None`` to
             compile the LSE store out entirely (no dummy buffer needed).
         :param sinks: ``(H,)`` fp32 per-Q-head sink logits; must be ``None``
             exactly when the kernel is configured without ``has_sink``.
@@ -1225,10 +1242,22 @@ class SM120FusedMultiHeadAttentionForward:
             if cutlass.const_expr(not self.is_layout_supported(tensor.shape, tensor.stride)):
                 raise ValueError(f"{name} must use compact BSHD storage")
         if cutlass.const_expr(lse is not None):
-            if cutlass.const_expr(lse.shape != (q.shape[0], q.shape[2], q.shape[1])):
-                raise ValueError("LSE must have shape (B, H, Sq)")
-            if cutlass.const_expr(lse.stride != (q.shape[2] * q.shape[1], q.shape[1], 1)):
-                raise ValueError("LSE must be compact row-major")
+            if cutlass.const_expr(self.thd_varlen):
+                if cutlass.const_expr(self.thd_lse_head_major):
+                    if cutlass.const_expr(lse.shape[0] != q.shape[2] or lse.shape[1] < q.shape[1]):
+                        raise ValueError("head-major THD LSE must have shape (H, head_stride) with head_stride >= T")
+                    if cutlass.const_expr(lse.stride != (lse.shape[1], 1)):
+                        raise ValueError("head-major THD LSE must be compact row-major")
+                else:
+                    if cutlass.const_expr(lse.shape != (q.shape[1], q.shape[2])):
+                        raise ValueError("THD LSE must have shape (T, H)")
+                    if cutlass.const_expr(lse.stride != (q.shape[2], 1)):
+                        raise ValueError("THD LSE must be compact token-major")
+            else:
+                if cutlass.const_expr(lse.shape != (q.shape[0], q.shape[2], q.shape[1])):
+                    raise ValueError("LSE must have shape (B, H, Sq)")
+                if cutlass.const_expr(lse.stride != (q.shape[2] * q.shape[1], q.shape[1], 1)):
+                    raise ValueError("LSE must be compact row-major")
         if cutlass.const_expr(self.has_sink != (sinks is not None)):
             raise ValueError("sinks must be provided exactly when the kernel is configured with has_sink")
         if cutlass.const_expr(sinks is not None and sinks.shape != (q.shape[2],)):
@@ -1339,6 +1368,8 @@ def compile(  # noqa: A001
     d_v: int = 128,
     max_sq: int = 0,
     has_lse: bool = True,
+    lse_head_major: bool = False,
+    lse_head_stride: int = 0,
 ) -> Callable:
     """Compile and cache one architecture-specific compact BSHD shape.
 
@@ -1351,7 +1382,10 @@ def compile(  # noqa: A001
 
     ``has_lse=False`` compiles the LSE store out (the kernel specializes on a
     ``None`` LSE argument) — callers that don't want stats pass no LSE buffer
-    at all instead of a dummy.
+    at all instead of a dummy. THD LSE is token-major ``(T, H)`` by default;
+    ``lse_head_major=True`` switches to head-major ``(H, lse_head_stride)``
+    (FlashAttention's ``softmax_lse`` layout), where ``lse_head_stride`` is the
+    caller-declared head-row stride (``>= T``, a shape — part of the cache key).
     """
 
     kernel = SM120FusedMultiHeadAttentionForward(
@@ -1366,6 +1400,7 @@ def compile(  # noqa: A001
         thd_varlen=PARAMS.thd_varlen,
         thd_batch=b,
         thd_max_sq=max_sq,
+        thd_lse_head_major=lse_head_major,
         head_tile_qk=d_qk,
         head_tile_v=d_v,
         q_tile=PARAMS.q_tile,
@@ -1396,11 +1431,15 @@ def compile(  # noqa: A001
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
     )
+    if PARAMS.thd_varlen:
+        fake_lse_shape = (qh, lse_head_stride) if lse_head_major else (sq, qh)
+    else:
+        fake_lse_shape = (fake_batch, qh, sq)
     fake_lse = (
         cute.runtime.make_fake_compact_tensor(
             cutlass.Float32,
-            (fake_batch, qh, sq),
-            stride_order=(2, 1, 0),
+            fake_lse_shape,
+            stride_order=(1, 0) if PARAMS.thd_varlen else (2, 1, 0),
             assumed_align=4,
         )
         if has_lse

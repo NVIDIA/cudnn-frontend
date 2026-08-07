@@ -327,7 +327,7 @@ def _pack_thd(seqs: list[torch.Tensor], s_max: int) -> tuple[torch.Tensor, torch
     for s in seqs:
         cu.append(cu[-1] + s.shape[2])
     storage = torch.zeros(b * s_max * h * d, dtype=seqs[0].dtype, device="cuda")
-    packed = storage[: cu[-1] * h * d].view(max(cu[-1], 1), h, d)
+    packed = storage[: max(cu[-1], 1) * h * d].view(max(cu[-1], 1), h, d)
     for i, s in enumerate(seqs):
         packed[cu[i] : cu[i + 1]].copy_(s[0].permute(1, 0, 2))
     view = storage.as_strided((b, h, s_max, d), (s_max * h * d, d, h * d, 1))
@@ -348,8 +348,16 @@ def _run_thd_case(
     causal_bottom_right: bool = False,
     window_size_left: int | None = None,
     with_sink: bool = False,
+    check_stats: bool = False,
+    stats_layout: str = "token_major",
 ) -> None:
-    """Run a THD (ragged) graph on the SM120 engine vs per-sequence references."""
+    """Run a THD (ragged) graph on the SM120 engine vs per-sequence references.
+
+    ``stats_layout`` selects the ragged Stats declaration: ``token_major``
+    (``[t, h]``, sequence stride ``h_q``) or ``head_major`` (``[h, t]``,
+    sequence stride 1 with a padded token-capacity head stride — FlashAttention's
+    ``softmax_lse`` layout, mirroring PR #462's harness convention).
+    """
 
     _require_dsl()
     import cudnn
@@ -391,7 +399,7 @@ def _run_thd_case(
         q=tq,
         k=tk,
         v=tv,
-        generate_stats=False,
+        generate_stats=check_stats,
         attn_scale=scale,
         use_padding_mask=True,
         seq_len_q=sq,
@@ -408,10 +416,31 @@ def _run_thd_case(
         st = graph.tensor_like(sinks, name="sink")
         sdpa_kwargs["sink_token"] = st
         variant_pack[st] = sinks
-    o, _ = graph.sdpa(**sdpa_kwargs)
+    o, stats = graph.sdpa(**sdpa_kwargs)
     o.set_output(True).set_dim(list(o_view.shape)).set_stride(list(o_view.stride()))
     o.set_ragged_offset(ro)
     variant_pack[o] = o_view
+    stats_storage = None
+    t_cap = max(64, -(-sum(seq_q_lens) // 64) * 64)
+    if check_stats:
+        assert stats is not None
+        stats.set_output(True)
+        stats.set_data_type(cudnn.data_type.FLOAT)
+        if stats_layout == "head_major":
+            # [h, t]: tokens contiguous within a head, heads strided by the
+            # padded token capacity; offsets = cu_q * stride_s = cu_q.
+            stats_storage = torch.empty(h_q * t_cap, dtype=torch.float32, device="cuda")
+            stats.set_dim((batch, h_q, s_q_max, 1)).set_stride((h_q * t_cap, t_cap, 1, 1))
+            stats_ro_t = (q_ro.flatten() // (head_dim * h_q)).view(batch + 1, 1, 1, 1).contiguous()
+        else:
+            # [t, h]: heads contiguous within a token; offsets = cu_q * h_q.
+            stats_storage = torch.empty(batch * s_q_max * h_q, dtype=torch.float32, device="cuda")
+            stats.set_dim((batch, h_q, s_q_max, 1)).set_stride((s_q_max * h_q, 1, h_q, 1))
+            stats_ro_t = (q_ro.flatten() // head_dim).view(batch + 1, 1, 1, 1).contiguous()
+        stats_ro = graph.tensor_like(stats_ro_t, name="stats_ro")
+        stats.set_ragged_offset(stats_ro)
+        variant_pack[stats_ro] = stats_ro_t
+        variant_pack[stats] = stats_storage
 
     graph.validate()
     graph.build_operation_graph()
@@ -427,11 +456,17 @@ def _run_thd_case(
     for n in seq_q_lens:
         cu.append(cu[-1] + n)
     packed_o = o_storage[: cu[-1] * h_q * d_v].view(max(cu[-1], 1), h_q, d_v)
-    for i, (nq, nkv) in enumerate(zip(seq_q_lens, seq_kv_lens)):
+    if check_stats and stats_layout == "head_major":
+        packed_stats = stats_storage.view(h_q, t_cap)  # (H, head_stride); tokens at [:, cu[i]:cu[i+1]]
+    elif check_stats:
+        packed_stats = stats_storage[: cu[-1] * h_q].view(max(cu[-1], 1), h_q)  # (T, H)
+    else:
+        packed_stats = None
+    for i, (nq, _nkv) in enumerate(zip(seq_q_lens, seq_kv_lens)):
         if nq == 0:
             continue
         got = packed_o[cu[i] : cu[i + 1]].permute(1, 0, 2).unsqueeze(0).float()
-        expected = _ref_sdpa_full(
+        ref = _ref_sdpa_full(
             q_seqs[i],
             k_seqs[i],
             v_seqs[i],
@@ -440,8 +475,16 @@ def _run_thd_case(
             causal_bottom_right=causal_bottom_right,
             window_size_left=window_size_left,
             sinks=sinks,
+            return_stats=check_stats,
         )
+        expected, expected_lse = ref if check_stats else (ref, None)
         torch.testing.assert_close(got, expected, atol=0.1, rtol=5e-2)
+        if check_stats:
+            if stats_layout == "head_major":
+                got_lse = packed_stats[:, cu[i] : cu[i + 1]].unsqueeze(0)  # (H, T_i) -> (1, H, T_i)
+            else:
+                got_lse = packed_stats[cu[i] : cu[i + 1]].t().unsqueeze(0)  # (T_i, H) -> (1, H, T_i)
+            torch.testing.assert_close(got_lse, expected_lse, atol=2e-2, rtol=2e-2)
 
 
 @pytest.mark.L0
@@ -748,11 +791,29 @@ def test_dsl_sm120_execute_contract_mismatches():
     expected = _ref_sdpa_full(q, k, v, scale=1.0 / math.sqrt(128))
     torch.testing.assert_close(o.float(), expected, atol=0.1, rtol=5e-2)
 
-    # THD LSE output is not plumbed (packed (1, H, T) layout != cuDNN's ragged
-    # Stats contract): requesting it is rejected up front instead of being
-    # silently ignored.
-    with pytest.raises(NotImplementedError, match="THD stats/LSE"):
-        SdpaFwdDslSm120(sample_q=q, sample_k=k, sample_v=v, sample_o=o, sample_lse=lse, thd=True).check_support()
+    # THD LSE must be declared packed: token-major [t, h] or head-major
+    # [h, t]. A dense-contiguous declaration (stride (S*H, S, 1)) is valid
+    # head-major (head_stride S); a padded sequence stride matches NEITHER layout
+    # and is rejected up front instead of being silently mis-addressed.
+    lse_padded = torch.empty(4 * 128 * 2, dtype=torch.float32, device="cuda").as_strided((1, 4, 128), (4 * 128 * 2, 128 * 2, 2))
+    with pytest.raises(ValueError, match="token-major"):
+        SdpaFwdDslSm120(sample_q=q, sample_k=k, sample_v=v, sample_o=o, sample_lse=lse_padded, thd=True).check_support()
+    api = SdpaFwdDslSm120(sample_q=q, sample_k=k, sample_v=v, sample_o=o, sample_lse=lse, thd=True)
+    assert api.check_support() and api.thd_stats_head_major and api.thd_stats_head_stride == 128
+
+    # THD execute keeps the same presence contract as dense: the raise fires
+    # before any packing or launch, so plain dense buffers suffice here.
+    lse_thd = torch.empty(1 * 4 * 128, dtype=torch.float32, device="cuda").as_strided((1, 4, 128), (128 * 4, 1, 4))
+    api = SdpaFwdDslSm120(sample_q=q, sample_k=k, sample_v=v, sample_o=o, sample_lse=lse_thd, thd=True)
+    assert api.check_support()
+    api.compile()
+    with pytest.raises(ValueError, match="lse_tensor is required"):
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=seq_kv, seq_kv_lens=seq_kv)
+    api = SdpaFwdDslSm120(sample_q=q, sample_k=k, sample_v=v, sample_o=o, thd=True)
+    assert api.check_support()
+    api.compile()
+    with pytest.raises(ValueError, match="without an LSE output"):
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=seq_kv, seq_kv_lens=seq_kv, lse_tensor=lse_thd)
 
 
 @pytest.mark.L0
@@ -779,21 +840,59 @@ def test_dsl_sm120_thd_bottom_right():
     _run_thd_case(seq_q_lens=[100, 60], seq_kv_lens=[180, 120], is_causal=True, causal_bottom_right=True)
 
 
-@pytest.mark.L1
-@torch_fork_set_rng(seed=25)
-def test_dsl_sm120_thd_gqa_sink():
-    """THD + GQA + attention sink through the packed epilogue fold."""
+@pytest.mark.L0
+@pytest.mark.parametrize("stats_layout", ["token_major", "head_major"])
+@torch_fork_set_rng(seed=30)
+def test_dsl_sm120_thd_stats(stats_layout: str):
+    """THD + generate_stats: the ragged Stats output is written in the
+    caller's declared layout — token-major [t, h] or head-major [h, t]
+    (the SM100 rows reject this combination — thd_stats gap)."""
 
-    _run_thd_case(seq_q_lens=[130, 70], seq_kv_lens=[130, 70], h_q=8, h_kv=2, is_causal=True, with_sink=True)
+    _run_thd_case(seq_q_lens=[200, 150], seq_kv_lens=[200, 150], is_causal=True, check_stats=True, stats_layout=stats_layout)
+
+
+@pytest.mark.L1
+@torch_fork_set_rng(seed=32)
+def test_dsl_sm120_thd_swa_stats():
+    """THD + causal left sliding window + ragged Stats: the window trims the
+    per-sequence LSE denominator, and a distinct compiled specialization
+    (window_size_left is a template parameter) carries the token-major store."""
+
+    _run_thd_case(seq_q_lens=[150, 90], seq_kv_lens=[150, 90], is_causal=True, window_size_left=32, check_stats=True)
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("stats_layout", ["token_major", "head_major"])
+@torch_fork_set_rng(seed=25)
+def test_dsl_sm120_thd_gqa_sink(stats_layout: str):
+    """THD + GQA + attention sink through the packed epilogue fold, with the
+    sink entering the ragged Stats (both declared layouts)."""
+
+    _run_thd_case(seq_q_lens=[130, 70], seq_kv_lens=[130, 70], h_q=8, h_kv=2, is_causal=True, with_sink=True, check_stats=True, stats_layout=stats_layout)
 
 
 @pytest.mark.L1
 @torch_fork_set_rng(seed=26)
 def test_dsl_sm120_thd_zero_length_sequence():
     """A zero-length sequence contributes no tokens and must not perturb its
-    packed neighbors."""
+    packed neighbors (O and ragged Stats). The last sequence has Q tokens but
+    ZERO keys inside a live launch: its rows must come back O := 0 with
+    LSE := -inf through the kernel's row_sum <= 0 guard, not stale memory."""
 
-    _run_thd_case(seq_q_lens=[128, 0, 64], seq_kv_lens=[100, 0, 50], is_causal=True)
+    _run_thd_case(seq_q_lens=[128, 0, 64], seq_kv_lens=[100, 0, 0], is_causal=True, check_stats=True)
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("stats_layout", ["token_major", "head_major"])
+@pytest.mark.parametrize("with_sink", [False, True], ids=["no_sink", "sink"])
+@torch_fork_set_rng(seed=31)
+def test_dsl_sm120_thd_all_kv_zero_stats(with_sink: bool, stats_layout: str):
+    """Every KV length zero: a zero-token K/V view cannot back a TMA
+    descriptor, so the adapter short-cut fills O := 0 and the ragged Stats
+    adapter-side — -inf, or the sink value alone (the sink column keeps the
+    softmax denominator alive) — in either declared layout."""
+
+    _run_thd_case(seq_q_lens=[64, 32], seq_kv_lens=[0, 0], with_sink=with_sink, check_stats=True, stats_layout=stats_layout)
 
 
 @pytest.mark.L0
@@ -872,7 +971,8 @@ def test_dsl_sm120_mixed_head_dims_causal_gqa_stats():
 @pytest.mark.L0
 @torch_fork_set_rng(seed=25)
 def test_dsl_sm120_thd_mixed_head_dims():
-    """THD packed views carry per-tensor head dims (Q/K at 192, V/O at 128)."""
+    """THD packed views carry per-tensor head dims (Q/K at 192, V/O at 128),
+    with the ragged Stats checked under the bottom-right diagonal."""
     _run_thd_case(
         seq_q_lens=[33, 128, 7],
         seq_kv_lens=[65, 128, 190],
@@ -882,6 +982,7 @@ def test_dsl_sm120_thd_mixed_head_dims():
         head_dim_v=128,
         is_causal=True,
         causal_bottom_right=True,
+        check_stats=True,
     )
 
 
@@ -940,11 +1041,14 @@ def test_dsl_sm120_mixed_head_dims_sink_bf16():
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("stats_layout", ["token_major", "head_major"])
 @torch_fork_set_rng(seed=29)
-def test_dsl_sm120_thd_mixed_head_dims_sink():
-    """THD + mixed head dims + sink: the packed per-tensor D views and the
-    sink denominator together, without a mask (the THD mixed-dim causal case
-    is covered above)."""
+def test_dsl_sm120_thd_mixed_head_dims_sink(stats_layout: str):
+    """THD + mixed head dims + sink + ragged Stats: the packed per-tensor D
+    views and the sink denominator together, without a mask (the THD
+    mixed-dim causal case is covered above). The Stats ragged offsets derive
+    from Q's (d_qk-based) offsets, so both declared LSE layouts are pinned
+    under d_qk != d_v."""
     _run_thd_case(
         seq_q_lens=[130, 70, 9],
         seq_kv_lens=[130, 70, 190],
@@ -953,6 +1057,8 @@ def test_dsl_sm120_thd_mixed_head_dims_sink():
         head_dim=192,
         head_dim_v=128,
         with_sink=True,
+        check_stats=True,
+        stats_layout=stats_layout,
     )
 
 
