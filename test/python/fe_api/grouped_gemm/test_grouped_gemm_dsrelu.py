@@ -521,6 +521,12 @@ def test_grouped_gemm_dsrelu_deterministic_dprob(request, ab_dtype, c_dtype, d_d
     for key in ("d_row_tensor", "d_col_tensor", "d_srelu_tensor"):
         assert torch.equal(first[key], baseline[key]), f"{key} changed under deterministic=True"
 
+    # The deterministic path has to clear the same bar as the default one, not merely agree
+    # with it: this is the reference check the non-deterministic wrapper tests run, over the
+    # whole backward output set (dprob, dA row/col, d_srelu, amax, scale factors).
+    inputs, cfg = case
+    check_ref_grouped_gemm_dsrelu(inputs, first, cfg, skip_ref=cfg["skip_ref"])
+
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=19)
@@ -543,6 +549,105 @@ def test_grouped_gemm_dsrelu_deterministic_dprob_env_var(request, monkeypatch):
     torch.cuda.synchronize()
 
     assert torch.equal(explicit["dprob_tensor"], from_env["dprob_tensor"])
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=23)
+@pytest.mark.parametrize("ab_dtype,c_dtype,d_dtype,b_major", DISCRETE_GROUPED_GEMM_DSRELU_SUPPORTED_CONFIGS)
+def test_grouped_gemm_dsrelu_deterministic_dprob_discrete(request, ab_dtype, c_dtype, d_dtype, b_major):
+    """Same guarantee in discrete-weight mode, which builds its cache key on its own branch."""
+    try:
+        from cudnn import grouped_gemm_dsrelu_wrapper_sm100
+        from cuda.bindings import driver as cuda
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn optional dependencies not installed")
+
+    cfg = discrete_grouped_gemm_init(
+        request=request,
+        ab_dtype=ab_dtype,
+        c_dtype=c_dtype,
+        d_dtype=d_dtype,
+        cd_major="n",
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=32,
+        sf_dtype=torch.float8_e8m0fnu,
+        vector_f32=False,
+        discrete_col_sfd=False,
+        b_major=b_major,
+    )
+
+    inputs = _prepare_discrete_dsrelu_inputs(
+        allocate_discrete_input_tensors(
+            n=cfg["n"],
+            k=cfg["k"],
+            num_experts=cfg["l"],
+            group_m_list=cfg["group_m_list"],
+            ab_dtype=cfg["ab_dtype"],
+            sf_dtype=cfg["sf_dtype"],
+            sf_vec_size=cfg["sf_vec_size"],
+            m_aligned=cfg["m_aligned"],
+            b_major=cfg["b_major"],
+        )
+    )
+    inputs, _ = allocate_grouped_gemm_dsrelu_tensors(
+        tensor_m=inputs["tensor_m"],
+        n=cfg["n"],
+        l=cfg["l"],
+        ab_dtype=cfg["ab_dtype"],
+        c_dtype=cfg["c_dtype"],
+        d_dtype=cfg["d_dtype"],
+        cd_major=cfg["cd_major"],
+        sf_dtype=cfg["sf_dtype"],
+        sf_vec_size=cfg["sf_vec_size"],
+        input_tensors=inputs,
+    )
+
+    def run(**kwargs):
+        return grouped_gemm_dsrelu_wrapper_sm100(
+            a_tensor=inputs["a_tensor"],
+            c_tensor=inputs["c_tensor"],
+            sfa_tensor=inputs["sfa_tensor"],
+            padded_offsets=inputs["padded_offsets_tensor"],
+            alpha_tensor=inputs["alpha_tensor"],
+            prob_tensor=inputs["prob_tensor"],
+            b_ptrs=inputs["b_ptrs_tensor"],
+            sfb_ptrs=inputs["sfb_ptrs_tensor"],
+            n=cfg["n"],
+            b_dtype=inputs["b_list"][0].dtype,
+            b_major=cfg["b_major"],
+            norm_const_tensor=inputs.get("norm_const_tensor"),
+            acc_dtype=cfg["acc_dtype"],
+            d_dtype=cfg["d_dtype"],
+            cd_major=cfg["cd_major"],
+            mma_tiler_mn=cfg["mma_tiler_mn"],
+            cluster_shape_mn=cfg["cluster_shape_mn"],
+            sf_vec_size=cfg["sf_vec_size"],
+            vector_f32=cfg["vector_f32"],
+            m_aligned=cfg["m_aligned"],
+            discrete_col_sfd=cfg["discrete_col_sfd"],
+            current_stream=cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+            **kwargs,
+        )
+
+    baseline = run(deterministic=False)
+    first = run(deterministic=True)
+    second = run(deterministic=True)
+    torch.cuda.synchronize()
+
+    assert first["dprob_tensor"].shape == baseline["dprob_tensor"].shape
+    assert torch.equal(first["dprob_tensor"], second["dprob_tensor"])
+
+    scale = baseline["dprob_tensor"].abs().max().item()
+    torch.testing.assert_close(first["dprob_tensor"], baseline["dprob_tensor"], rtol=1e-4, atol=1e-4 * max(scale, 1.0))
+
+    check_ref_grouped_gemm_dsrelu(
+        _dense_ref_inputs_from_discrete(inputs),
+        first,
+        cfg,
+        skip_ref=cfg["skip_ref"],
+    )
 
 
 @pytest.mark.L0
