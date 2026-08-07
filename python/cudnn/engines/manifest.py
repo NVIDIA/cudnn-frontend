@@ -91,8 +91,6 @@ class EngineFamily:
     module: str
     factory: str
     slots: Mapping[str, EngineSlot] = field(default_factory=dict)
-    sm_lo: int = 0  # 0 => architecture-independent
-    sm_hi: int = 10_000
     # ("module", "callable") producing this family's facts from a graph, or None
     # while a family still reads the graph inside its engines.
     analyzer: Optional[Tuple[str, str]] = None
@@ -104,17 +102,22 @@ class EngineFamily:
     def owns(self, engine_id: int) -> bool:
         return self.engine_id <= engine_id < self.id_end
 
-    def offered_ids(self, sm: Optional[int]) -> Dict[str, int]:
-        """``{engine name: engine id}`` for the engines on offer here.
+    def offered_ids(self) -> Dict[str, int]:
+        """``{engine name: engine id}`` for the engines on offer.
 
-        ``sm is None`` means the probe could not answer (no cuda-python in the
-        image, no device yet), NOT "wrong arch": filtering on an unknown would
-        silently delete every arch-gated engine and leave ops that have no
-        backend lowering with nothing to run. The engine's own check_support()
-        re-checks the arch anyway.
+        Maturity only. There is deliberately no arch range here: the engine's
+        own check_support() decides that, and a coarser copy in this table was
+        a second thing to maintain and a place to lie -- it already lied, with
+        frost_gemm capped at SM103 while its templates declare [100, 120), and
+        frost_sdpa_bwd capped at SM121 while its Capabilities row says 120-129.
+        Both would have silently withheld the family on Rubin and Thor, which
+        are meant to reuse those kernels. Deciding an engine is wrong for a
+        device is now said once, by the engine.
+
+        The cost of dropping it is one module import before a decline, which
+        the laziness work made cheap: ~25 ms and 110 modules, no torch and no
+        CuTe DSL (test_import_boundaries.py holds that).
         """
-        if self.sm_lo and sm is not None and not (self.sm_lo <= sm <= self.sm_hi):
-            return {}
         enabled = opt_in_engines_enabled()
         return {name: self.engine_id + s.slot for name, s in self.slots.items() if enabled or not s.opt_in}
 
@@ -158,7 +161,6 @@ MANIFEST: Tuple[EngineFamily, ...] = (
         "cudnn.linear_attention",
         "GdnEngines",
         slots={"gdn_frost": EngineSlot(0), "gdn_cutile": EngineSlot(1)},
-        sm_lo=90,  # union over the family's engines; each re-checks in check_support()
     ),
     EngineFamily(
         KDA_ID_BASE,
@@ -166,7 +168,6 @@ MANIFEST: Tuple[EngineFamily, ...] = (
         "cudnn.linear_attention",
         "KdaEngines",
         slots={"kda_frost": EngineSlot(0), "kda_cutile": EngineSlot(1)},
-        sm_lo=90,
     ),
     EngineFamily(
         GDN2_ID_BASE,
@@ -174,8 +175,6 @@ MANIFEST: Tuple[EngineFamily, ...] = (
         "cudnn.linear_attention",
         "Gdn2Engines",
         slots={"gdn2_frost": EngineSlot(0)},
-        sm_lo=100,
-        sm_hi=103,
     ),
     EngineFamily(
         FROST_GEMM_ID_BASE,
@@ -183,8 +182,6 @@ MANIFEST: Tuple[EngineFamily, ...] = (
         "cudnn.gemm.frost.engine",
         "FrostGemmEngines",
         slots={"frost_gemm": EngineSlot(0, opt_in=True)},
-        sm_lo=100,
-        sm_hi=103,
     ),
     EngineFamily(
         FROST_SDPA_FWD_ID_BASE,
@@ -201,7 +198,6 @@ MANIFEST: Tuple[EngineFamily, ...] = (
             "sdpa_fwd_prefill_sm120": EngineSlot(5, opt_in=True),
             "sdpa_fwd_prefill_sm100_d192_d128": EngineSlot(6, opt_in=True),
         },
-        sm_lo=100,
         analyzer=("cudnn.sdpa.graph_analyzer", "analyze"),
     ),
     EngineFamily(
@@ -210,9 +206,6 @@ MANIFEST: Tuple[EngineFamily, ...] = (
         "cudnn.sdpa.bwd.engine",
         "FrostSdpaBwdEngines",
         slots={"sdpa_bwd_sm120": EngineSlot(0, opt_in=True)},
-        # TODO: widen when an SM100/SM80 spec lands
-        sm_lo=120,
-        sm_hi=121,
         analyzer=("cudnn.sdpa.graph_analyzer", "analyze"),
     ),
 )
@@ -232,7 +225,7 @@ def family_for(graph) -> Optional[EngineFamily]:
     A PURE property of the graph. No ``sm``, no environment: what kind of graph
     this is cannot depend on which machine is asking or on which engines happen
     to be built. Whether that family has an engine to offer here is a separate
-    question — ``EngineFamily.offered_ids(sm)`` — and conflating the two made
+    question — ``EngineFamily.offered_ids()`` — and conflating the two made
     "not that kind of graph" indistinguishable from "no engine for it here".
 
     Classification is single-valued by construction: this is a function, so
@@ -315,10 +308,10 @@ def instantiate(family: EngineFamily, ids: Dict[str, int]):
     return engines
 
 
-def engines_for(graph, sm: Optional[int]):
+def engines_for(graph):
     """Every in-tree engine of the graph's family, in candidate order."""
     family = family_for(graph)
     if family is None:
         return []
-    ids = family.offered_ids(sm)  # availability is a separate question from kind
+    ids = family.offered_ids()  # availability is a separate question from kind
     return list(instantiate(family, ids)) if ids else []

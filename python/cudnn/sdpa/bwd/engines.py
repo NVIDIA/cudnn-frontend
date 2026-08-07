@@ -48,7 +48,11 @@ from cudnn.sdpa.bwd.config_sm120 import (
 
 _LOG = logging.getLogger(__name__)
 
-_BLACKWELL_GEFORCE_ARCHES = frozenset[tuple[int, int]]({(12, 0), (12, 1)})
+# Arch range this spec serves, inclusive, major*10 + minor as in
+# engines/manifest.py. A range, not the exact device families that exist today:
+# an sm120 kernel runs on the sm120 line, and enumerating members silently
+# declines whatever ships next.
+_BLACKWELL_GEFORCE = (120, 129)
 
 
 @dataclass(frozen=True)
@@ -72,7 +76,13 @@ class Capabilities:
     lowering can honor. Compared field-by-field against SdpaGraphFacts in the
     probe."""
 
-    arches: frozenset[tuple[int, int]]
+    # Arch RANGE, inclusive, encoded major*10 + minor as in engines/manifest.py.
+    # A range and not a set of exact device families: an sm100 kernel runs on
+    # everything in the sm100 line, so enumerating the parts that exist today
+    # silently declines the ones that ship tomorrow. Rubin (sm107) and Thor
+    # (sm110) are meant to reuse these kernels and an exact set excluded both.
+    sm_lo: int
+    sm_hi: int
     d: frozenset[int]  # supported head dims (d_qk == d_v required)
     dtypes: frozenset = frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16})  # cudnn.data_type, see graph_analyzer
 
@@ -124,9 +134,10 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
         ):
             if value is not None and value not in domain:
                 return f"requested {label}={value} is outside this engine's domain {sorted(domain)}"
-    if facts.device_cc not in capabilities.arches:
-        required = " or ".join(f"SM{major}{minor}" for major, minor in sorted(capabilities.arches))
-        return f"requires {required}; current device is {facts.device_cc}"
+    cc = facts.device_cc
+    sm = None if cc is None else cc[0] * 10 + cc[1]
+    if sm is None or not (capabilities.sm_lo <= sm <= capabilities.sm_hi):
+        return f"requires SM{capabilities.sm_lo}-{capabilities.sm_hi}; current device is {cc}"
     if facts.is_mxfp8 or facts.is_fp8:
         return "this engine serves only half (fp16/bf16) sdpa_backward graphs"
     if facts.d_qk != facts.d_v:
@@ -201,7 +212,8 @@ def _sm120_spec() -> EngineSpec:
     return EngineSpec(
         name="sdpa_bwd_sm120",
         capabilities=Capabilities(
-            arches=_BLACKWELL_GEFORCE_ARCHES,
+            sm_lo=_BLACKWELL_GEFORCE[0],
+            sm_hi=_BLACKWELL_GEFORCE[1],
             d=frozenset(_SM120_HEAD_DIMS),
             dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
             causal=True,

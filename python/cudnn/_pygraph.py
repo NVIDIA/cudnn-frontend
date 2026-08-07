@@ -955,14 +955,11 @@ class pygraph:
         graph is frozen at planning time anyway."""
         if self._candidates is None:
             from .engines import manifest
-            from .frost.buffers import current_sm
 
             # Registering an in-tree engine pins THAT instance: the manifest
             # must not also offer its own copy, or the id has two owners.
             claimed = [e.owned_id_range for e in self._backends]
-            from_manifest = [
-                e for e in manifest.engines_for(self, current_sm()) if not any(lo < e.owned_id_range[1] and e.owned_id_range[0] < hi for lo, hi in claimed)
-            ]
+            from_manifest = [e for e in manifest.engines_for(self) if not any(lo < e.owned_id_range[1] and e.owned_id_range[0] < hi for lo, hi in claimed)]
             self._candidates = list(self._backends) + from_manifest
         return self._candidates
 
@@ -1019,10 +1016,9 @@ class pygraph:
         family would have to widen.
         """
         from .engines import manifest
-        from .frost.buffers import current_sm
 
         family = manifest.family_for(self)
-        if family is not None and family.offered_ids(current_sm()):
+        if family is not None and family.offered_ids():
             analyzer = manifest.resolve_analyzer(family)
             if analyzer is not None:
                 self._facts_for(analyzer)

@@ -767,13 +767,11 @@ def test_opt_in_families_are_withheld_by_default(monkeypatch):
 
     family = _family("frost_gemm")
     assert all(s.opt_in for s in family.slots.values()), "frost_gemm is expected to still be maturing"
-    sm = family.sm_lo
-
     monkeypatch.delenv(manifest._ENABLE_ENV, raising=False)
-    assert family.offered_ids(sm) == {}
+    assert family.offered_ids() == {}
 
     monkeypatch.setenv(manifest._ENABLE_ENV, "1")
-    assert family.offered_ids(sm) == {"frost_gemm": family.engine_id}
+    assert family.offered_ids() == {"frost_gemm": family.engine_id}
 
 
 def test_sole_implementation_families_are_never_gated(monkeypatch):
@@ -786,7 +784,7 @@ def test_sole_implementation_families_are_never_gated(monkeypatch):
     for name in ("gdn", "kda", "gdn2"):
         family = _family(name)
         assert not any(s.opt_in for s in family.slots.values()), f"{name} is the only implementation of its op and must not be gated"
-        assert family.offered_ids(family.sm_lo), f"{name} must be offered without the opt-in flag"
+        assert family.offered_ids(), f"{name} must be offered without the opt-in flag"
 
 
 @pytest.mark.parametrize("value,offered", [("1", True), ("true", True), ("on", True), ("0", False), ("", False), ("no", False)])
@@ -843,9 +841,7 @@ def test_classification_does_not_depend_on_the_machine(monkeypatch):
     assert manifest.family_for(Fake()) is gated, "the opt-in flag must not change the classification"
 
     family = _family("frost_gemm")
-    assert family.offered_ids(family.sm_lo), "offered here"
-    assert family.offered_ids(family.sm_hi + 1) == {}, "not offered on another arch"
-    assert manifest.family_for(Fake()) is family, "...but it is still a gemm graph"
+    assert manifest.family_for(Fake()) is family, "the opt-in state does not change what the graph IS"
 
 
 def test_family_id_blocks_are_disjoint():
@@ -1183,7 +1179,7 @@ def test_a_registered_in_tree_engine_is_not_offered_twice(monkeypatch):
         name = "twin"
         engine_id = OUT_OF_TREE_ID_BASE + 700
 
-    monkeypatch.setattr(manifest, "engines_for", lambda graph, sm: [Twin()])
+    monkeypatch.setattr(manifest, "engines_for", lambda graph: [Twin()])
     g = pygraph().register_backend(Twin())
     owners = g._owners_for_id(Twin.engine_id)
     assert [e.name for e in owners] == ["twin"], f"id {Twin.engine_id} has {len(owners)} owners"

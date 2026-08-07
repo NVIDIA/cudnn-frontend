@@ -58,11 +58,15 @@ def _cuda_driver():
 
 _LOG = logging.getLogger(__name__)
 
-# Device families the spec rows below serve (Capabilities.arches values).
-# cc10.3 additionally enables the fused LDTM.STAT row-max for MXFP8 — handled
-# in the lowering, from the device capability.
-_BLACKWELL_ARCHES = frozenset[tuple[int, int]]({(10, 0), (10, 3)})
-_BLACKWELL_GEFORCE_ARCHES = frozenset[tuple[int, int]]({(12, 0), (12, 1)})
+# Arch ranges the spec rows below serve, inclusive, encoded major*10 + minor as
+# in engines/manifest.py. RANGES, not the exact device families that exist
+# today: an sm100 kernel runs on the whole sm100 line, so enumerating members
+# silently declines the parts that ship later -- Rubin (sm107) and Thor (sm110)
+# are meant to reuse these kernels and an exact {(10,0), (10,3)} excluded both.
+# Within the range, cc10.3+ additionally enables the fused LDTM.STAT row-max for
+# MXFP8 — handled in the lowering, from the device capability.
+_BLACKWELL = (100, 119)
+_BLACKWELL_GEFORCE = (120, 129)
 
 
 @dataclass(frozen=True)
@@ -89,7 +93,13 @@ class Capabilities:
     declares the union its lowering can actually deliver. Compared
     field-by-field against SdpaGraphFacts in the probe."""
 
-    arches: frozenset[tuple[int, int]]
+    # Arch RANGE, inclusive, encoded major*10 + minor as in engines/manifest.py.
+    # A range and not a set of exact device families: an sm100 kernel runs on
+    # everything in the sm100 line, so enumerating the parts that exist today
+    # silently declines the ones that ship tomorrow. Rubin (sm107) and Thor
+    # (sm110) are meant to reuse these kernels and an exact set excluded both.
+    sm_lo: int
+    sm_hi: int
     phase: str
     d_qk: frozenset[int]
     d_v: frozenset[int]
@@ -217,9 +227,10 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         ):
             if value is not None and value not in domain:
                 return f"requested {label}={value} is outside this engine's domain {sorted(domain)}"
-    if facts.device_cc not in capabilities.arches:
-        required = " or ".join(f"SM{major}{minor}" for major, minor in sorted(capabilities.arches))
-        return f"requires {required}; current device is {facts.device_cc}"
+    cc = facts.device_cc
+    sm = None if cc is None else cc[0] * 10 + cc[1]
+    if sm is None or not (capabilities.sm_lo <= sm <= capabilities.sm_hi):
+        return f"requires SM{capabilities.sm_lo}-{capabilities.sm_hi}; current device is {cc}"
     if capabilities.d_envelope:
         # Envelope row: native caps are upper bounds (TMA zero-padding semantics
         # — see Capabilities.d_envelope). Alignment: TMA global strides must be
@@ -334,7 +345,8 @@ def _sm100_spec(d: int, d_v: Optional[int] = None) -> EngineSpec:
     return EngineSpec(
         name=f"sdpa_fwd_prefill_sm100_{suffix}",
         capabilities=Capabilities(
-            arches=_BLACKWELL_ARCHES,
+            sm_lo=_BLACKWELL[0],
+            sm_hi=_BLACKWELL[1],
             phase="prefill",
             d_qk=frozenset({d}),
             d_v=frozenset({d_v}),
@@ -372,7 +384,8 @@ def _sm100_mxfp8_spec(d: int) -> EngineSpec:
     return EngineSpec(
         name=f"sdpa_fwd_prefill_sm100_d{d}_mxfp8",
         capabilities=Capabilities(
-            arches=_BLACKWELL_ARCHES,
+            sm_lo=_BLACKWELL[0],
+            sm_hi=_BLACKWELL[1],
             phase="prefill",
             d_qk=frozenset({d}),
             d_v=frozenset({d}),
@@ -406,7 +419,8 @@ def _sm100_fp8_spec(d: int) -> EngineSpec:
     return EngineSpec(
         name=f"sdpa_fwd_prefill_sm100_d{d}_fp8",
         capabilities=Capabilities(
-            arches=_BLACKWELL_ARCHES,
+            sm_lo=_BLACKWELL[0],
+            sm_hi=_BLACKWELL[1],
             phase="prefill",
             d_qk=frozenset({d}),
             d_v=frozenset({d}),
@@ -443,7 +457,8 @@ def _sm120_spec() -> EngineSpec:
     return EngineSpec(
         name="sdpa_fwd_prefill_sm120",
         capabilities=Capabilities(
-            arches=_BLACKWELL_GEFORCE_ARCHES,
+            sm_lo=_BLACKWELL_GEFORCE[0],
+            sm_hi=_BLACKWELL_GEFORCE[1],
             phase="prefill",
             d_qk=frozenset(range(16, 257, 16)),
             d_v=frozenset(range(16, 257, 16)),
