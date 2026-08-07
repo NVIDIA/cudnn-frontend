@@ -79,6 +79,7 @@ def _ref_bwd(
     scale: float,
     is_causal: bool = False,
     causal_bottom_right: bool = False,
+    window_size_left: int | None = None,
 ):
     """Reference via the canonical refs (sdpa/fp16_ref.py)."""
 
@@ -87,8 +88,12 @@ def _ref_bwd(
 
     diag_align = cudnn.diagonal_alignment.BOTTOM_RIGHT if causal_bottom_right else cudnn.diagonal_alignment.TOP_LEFT
     right_bound = 0 if is_causal else None
-    o_ref, stats_ref, _, _ = compute_ref(q, k, v, attn_scale=scale, diag_align=diag_align, right_bound=right_bound, torch_type=q.dtype)
-    dq, dk, dv, _, _ = compute_ref_backward(q, k, v, o_ref, do, attn_scale=scale, diag_align=diag_align, right_bound=right_bound, torch_type=q.dtype)
+    # The refs take the cuDNN window LENGTH; window_size_left is the offset W = L - 1.
+    left_bound = None if window_size_left is None else window_size_left + 1
+    o_ref, stats_ref, _, _ = compute_ref(q, k, v, attn_scale=scale, diag_align=diag_align, right_bound=right_bound, left_bound=left_bound, torch_type=q.dtype)
+    dq, dk, dv, _, _ = compute_ref_backward(
+        q, k, v, o_ref, do, attn_scale=scale, diag_align=diag_align, right_bound=right_bound, left_bound=left_bound, torch_type=q.dtype
+    )
     return o_ref.to(q.dtype), stats_ref.contiguous(), dq.to(q.dtype), dk.to(q.dtype), dv.to(q.dtype)
 
 
@@ -110,6 +115,7 @@ def _run_bwd_graph(
     scale: float,
     is_causal: bool = False,
     causal_bottom_right: bool = False,
+    window_size_left: int | None = None,
     select: bool = True,
     q_tile: int | None = None,
     kv_tile: int | None = None,
@@ -153,6 +159,8 @@ def _run_bwd_graph(
         bwd_kwargs["use_causal_mask_bottom_right"] = True
     elif is_causal:
         bwd_kwargs["use_causal_mask"] = True
+    if window_size_left is not None:
+        bwd_kwargs["sliding_window_length"] = window_size_left + 1
 
     dq, dk, dv = graph.sdpa_backward(**bwd_kwargs)
     dq.set_output(True).set_dim(dq_gpu.shape).set_stride(dq_gpu.stride())
@@ -217,6 +225,7 @@ def _run_case(
     dtype: torch.dtype = torch.float16,
     is_causal: bool = False,
     causal_bottom_right: bool = False,
+    window_size_left: int | None = None,
     select: bool = True,
     q_tile: int | None = None,
     kv_tile: int | None = None,
@@ -226,7 +235,9 @@ def _run_case(
     k = _bhsd(batch, heads, s_kv, head_dim, dtype)
     v = _bhsd(batch, heads, s_kv, head_dim, dtype)
     do = _bhsd(batch, heads, s_q, head_dim, dtype)
-    o, stats, dq_ref, dk_ref, dv_ref = _ref_bwd(q, k, v, do, scale=scale, is_causal=is_causal, causal_bottom_right=causal_bottom_right)
+    o, stats, dq_ref, dk_ref, dv_ref = _ref_bwd(
+        q, k, v, do, scale=scale, is_causal=is_causal, causal_bottom_right=causal_bottom_right, window_size_left=window_size_left
+    )
     o = _bhsd(batch, heads, s_q, head_dim, dtype, empty=True).copy_(o)
     dq, dk, dv, plan_name = _run_bwd_graph(
         q,
@@ -238,6 +249,7 @@ def _run_case(
         scale=scale,
         is_causal=is_causal,
         causal_bottom_right=causal_bottom_right,
+        window_size_left=window_size_left,
         select=select,
         q_tile=q_tile,
         kv_tile=kv_tile,
@@ -336,6 +348,38 @@ def test_sdpa_bwd_dsl_sm120_sequence_tails(mask: str):
         is_causal=mask != "dense",
         causal_bottom_right=mask == "causal_br",
     )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=8)
+def test_sdpa_bwd_dsl_sm120_sliding_window_causal():
+    """Top-left causal + sliding window (the training SWA shape)."""
+
+    _run_case(s_q=1024, s_kv=1024, head_dim=64, is_causal=True, window_size_left=127)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=9)
+def test_sdpa_bwd_dsl_sm120_sliding_window_no_causal():
+    """A left window without a causal bit (band open to the right)."""
+
+    _run_case(head_dim=64, window_size_left=63)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=10)
+def test_sdpa_bwd_dsl_sm120_sliding_window_causal_br():
+    """Bottom-right causal + sliding window across unequal sequence lengths."""
+
+    _run_case(s_q=384, s_kv=1024, head_dim=64, is_causal=True, causal_bottom_right=True, window_size_left=127)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=11)
+def test_sdpa_bwd_dsl_sm120_sliding_window_tails():
+    """Sub-tile sliding window with non-tile-multiple sequence tails."""
+
+    _run_case(s_q=193, s_kv=257, head_dim=128, is_causal=True, window_size_left=16)
 
 
 @pytest.mark.L0
