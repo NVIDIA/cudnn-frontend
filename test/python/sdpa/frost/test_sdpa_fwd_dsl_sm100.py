@@ -111,6 +111,9 @@ _FLAVORS = [512, 256, 128]
 _FLAVOR_IDS = ["dsv4_d512", "qwen_d256", "llama_d128"]
 _DTYPES = [torch.float16, torch.bfloat16]
 _DTYPE_IDS = ["fp16", "bf16"]
+# Exact in fp16/bf16/fp32: pre-fills O/Stats storages in the THD harness so
+# no-op paths (t_q == 0) can assert the buffers came back untouched.
+_THD_SENTINEL = 2048.0
 
 
 def _ref_sdpa_full(q, k, v, *, scale, is_causal=False, bottom_right=False, swa_window=None, seq_kv_lens=None, sinks=None, return_stats=False):
@@ -636,9 +639,9 @@ def _run_dsl_thd_graph(
     dev = "cuda"
     B = len(seq_lens_q)
     T_q, T_kv = cu_q[-1], cu_k[-1]
-    # Clamp the declared KV extent: an all-zero seq_len_kv batch still needs a
+    # Clamp the declared extents: an all-zero seq_len batch still needs a
     # rank-legal (>0) graph dim; the padding mask carries the real lengths.
-    S_max_q, S_max_kv = max(seq_lens_q), max(max(seq_lens_kv), 1)
+    S_max_q, S_max_kv = max(max(seq_lens_q), 1), max(max(seq_lens_kv), 1)
 
     def _dense_buf(packed, s_max, t, H):
         stride = (s_max * H * d, d, H * d, 1)
@@ -649,7 +652,10 @@ def _run_dsl_thd_graph(
     _, q_gpu, stride_q = _dense_buf(q_pk, S_max_q, T_q, H_q)
     _, k_gpu, stride_kv = _dense_buf(k_pk, S_max_kv, T_kv, H_kv)
     _, v_gpu, _ = _dense_buf(v_pk, S_max_kv, T_kv, H_kv)
-    o_stor = torch.zeros(B * S_max_q * H_q * d, device=dev, dtype=dtype)
+    # Output/Stats storages carry a SENTINEL: the valid packed region is fully
+    # written by the kernel (compared against the reference), while everything
+    # else — the whole buffer when t_q == 0 — must come back untouched.
+    o_stor = torch.full((B * S_max_q * H_q * d,), _THD_SENTINEL, device=dev, dtype=dtype)
     o_gpu = o_stor.as_strided((B, H_q, S_max_q, d), stride_q)
 
     slq = torch.tensor(seq_lens_q, dtype=torch.int32, device=dev).view(B, 1, 1, 1)
@@ -690,12 +696,12 @@ def _run_dsl_thd_graph(
         if stats_layout == "head_major":
             # [h, t]: tokens contiguous within a head, heads strided by the
             # padded token capacity; offsets = cu_q * stride_s = cu_q.
-            stats_stor = torch.empty(H_q * t_cap, dtype=torch.float32, device=dev)
+            stats_stor = torch.full((H_q * t_cap,), _THD_SENTINEL, dtype=torch.float32, device=dev)
             stats.set_dim((B, H_q, S_max_q, 1)).set_stride((H_q * t_cap, t_cap, 1, 1))
             stats_ro_t = (ro_q.flatten() // (H_q * d)).view(B + 1, 1, 1, 1).contiguous()
         else:
             # [t, h]: heads contiguous within a token; offsets = cu_q * h_q.
-            stats_stor = torch.empty(B * S_max_q * H_q, dtype=torch.float32, device=dev)
+            stats_stor = torch.full((B * S_max_q * H_q,), _THD_SENTINEL, dtype=torch.float32, device=dev)
             stats.set_dim((B, H_q, S_max_q, 1)).set_stride((S_max_q * H_q, 1, H_q, 1))
             stats_ro_t = (ro_q.flatten() // d).view(B + 1, 1, 1, 1).contiguous()
         stats_ro = g.tensor_like(stats_ro_t, name="stats_ro")
@@ -813,6 +819,13 @@ def _run_thd_stats_case(*, seq_lens_q, seq_lens_kv, d=128, dtype=torch.float16, 
         stats_layout=stats_layout,
     )
 
+    if T_q == 0:
+        # No query token exists anywhere: execute must be a complete no-op —
+        # the sentinel-filled O and ragged Stats storages come back untouched.
+        assert (o_stor == _THD_SENTINEL).all(), "t_q == 0 wrote to O"
+        assert (stats_stor == _THD_SENTINEL).all(), "t_q == 0 wrote to the ragged Stats"
+        return
+
     if stats_layout == "head_major":
         packed_stats = stats_stor.view(H_q, t_cap)  # (H, head_stride); tokens at [:, cu[i]:cu[i+1]]
     else:
@@ -890,6 +903,19 @@ def test_dsl_sm100_thd_all_kv_zero_stats(with_sink, stats_layout):
     CuTe layout) — no adapter-side fills, in either declared layout."""
 
     _run_thd_stats_case(seq_lens_q=[64, 32], seq_lens_kv=[0, 0], mask="none", with_sink=with_sink, stats_layout=stats_layout)
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("stats_layout", ["token_major", "head_major"])
+@torch_fork_set_rng(seed=34)
+def test_dsl_sm100_thd_all_q_zero_stats(stats_layout):
+    """Every Q length zero (t_q == 0): no query token exists anywhere, so the
+    packed O/Stats have zero rows and execute must be a complete NO-OP — the
+    sentinel-filled buffers come back untouched, with live KV and with the
+    fully-degenerate all-zero KV as well."""
+
+    _run_thd_stats_case(seq_lens_q=[0, 0], seq_lens_kv=[50, 30], mask="none", stats_layout=stats_layout)
+    _run_thd_stats_case(seq_lens_q=[0, 0], seq_lens_kv=[0, 0], mask="none", stats_layout=stats_layout)
 
 
 _COMBO_MASKS = {
