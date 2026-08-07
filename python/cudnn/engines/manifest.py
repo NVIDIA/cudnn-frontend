@@ -51,15 +51,11 @@ def opt_in_engines_enabled() -> bool:
 class EngineSlot:
     """One engine's place in its family's id block.
 
-    The SLOT is fixed forever: an autotune result is (engine_id, knobs), so a
-    number that has shipped must keep meaning the same engine. Adding an engine
-    takes the next free slot; slots are never reordered or reused.
-
-    ``opt_in`` is per ENGINE, not per family: maturity is a property of one
-    implementation. A family's half-precision engines can graduate while its
-    fp8 engine is still maturing, which one flag per family made impossible.
-    It lives here rather than on the engine class because the whole point of
-    the gate is to know what to offer WITHOUT importing the engine.
+    A shipped slot is fixed forever (an autotune result is (engine_id, knobs)):
+    append the next free one, never reorder or reuse. ``opt_in`` is per engine
+    so one implementation can graduate while a sibling matures; it lives here
+    rather than on the engine class because the gate must answer without
+    importing the engine.
     """
 
     slot: int
@@ -70,20 +66,15 @@ class EngineSlot:
 class EngineFamily:
     """One family of in-tree engines, described without importing them.
 
-    A family is a KIND OF GRAPH (roughly what the backend calls an operation-graph
-    mode, at a granularity of our choosing), not a group of engines that happen to
-    ship together. Every graph belongs to exactly one family or to none, so the
-    engines within a family compete and engines across families never do.
+    A family is a KIND OF GRAPH (roughly the backend's operation-graph mode, at
+    a granularity of our choosing), not a group of engines that ship together.
+    Every graph belongs to exactly one or to none, so engines within a family
+    compete and engines across families never do. Two families may share an
+    analyzer (SDPA forward and backward do); what is fixed is that a graph is
+    never claimed by two.
 
-    The family owns: the id block its engines draw from, the arch range, and the
-    vocabulary its graphs are described in. Two families MAY share an analyzer
-    (SDPA forward and backward do) — sharing a description is their choice; what
-    is fixed is that a graph is never claimed by two.
-
-    ``slots`` is the SINGLE SOURCE of every python engine id. Engines do not
-    declare their own: ``instantiate()`` hands each factory the ids its engines
-    are to use, so an engine cannot claim a number it was not given, and the
-    whole id space is readable here rather than reconstructed from four files.
+    ``slots`` is the single source of every python engine id -- engines are
+    handed theirs by :func:`instantiate` and declare none of their own.
     """
 
     engine_id: int  # first id of the FAMILY_BLOCK-wide block this family owns
@@ -105,34 +96,18 @@ class EngineFamily:
     def offered_ids(self) -> Dict[str, int]:
         """``{engine name: engine id}`` for the engines on offer.
 
-        Maturity only. There is deliberately no arch range here: the engine's
-        own check_support() decides that, and a coarser copy in this table was
-        a second thing to maintain and a place to lie -- it already lied, with
-        frost_gemm capped at SM103 while its templates declare [100, 120), and
-        frost_sdpa_bwd capped at SM121 while its Capabilities row says 120-129.
-        Both would have silently withheld the family on Rubin and Thor, which
-        are meant to reuse those kernels. Deciding an engine is wrong for a
-        device is now said once, by the engine.
-
-        The cost of dropping it is one module import before a decline, which
-        the laziness work made cheap: ~25 ms and 110 modules, no torch and no
-        CuTe DSL (test_import_boundaries.py holds that).
+        Maturity only -- no arch range. Whether an engine suits a device is the
+        engine's own check_support(); a coarser copy here lied twice before it
+        was deleted.
         """
         enabled = opt_in_engines_enabled()
         return {name: self.engine_id + s.slot for name, s in self.slots.items() if enabled or not s.opt_in}
 
 
-# --- classification: which FAMILY does a graph belong to ---------------------
-# ANCHOR nodes only: these are the node types that NAME a family, not a list of
-# what a family can serve. Everything else -- POINTWISE, REDUCTION, a block-scale
-# quantize, a node type added tomorrow -- is absent on purpose and ignored when
-# classifying, so `matmul + pointwise` is a gemm graph. Whether the family can
-# serve the whole graph is its analyzer's judgment; a coarser copy of that
-# judgment here is what closed_under was, and it lied about RESHAPE.
-#
-# One anchor names exactly one family, and family_for() is a function, so "two
-# families claimed this graph" is not a case that can arise. Names, not enum
-# members, so this file still imports no engine code.
+# Node types that NAME a family -- not a list of what a family can serve.
+# POINTWISE, REDUCTION, anything added tomorrow are absent on purpose and
+# ignored when classifying, so `matmul + pointwise` is a gemm graph. Names, not
+# enum members, so this file imports no engine code.
 _ANCHOR_NODE_TO_FAMILY = {
     "MATMUL": "frost_gemm",
     "MATMUL_FP8": "frost_gemm",
@@ -222,22 +197,13 @@ def graph_node_types(graph) -> frozenset:
 def family_for(graph) -> Optional[EngineFamily]:
     """The one family this graph belongs to, or None.
 
-    A PURE property of the graph. No ``sm``, no environment: what kind of graph
-    this is cannot depend on which machine is asking or on which engines happen
-    to be built. Whether that family has an engine to offer here is a separate
-    question — ``EngineFamily.offered_ids()`` — and conflating the two made
-    "not that kind of graph" indistinguishable from "no engine for it here".
+    A pure property of the graph: no ``sm``, no environment. Availability is a
+    separate question (``EngineFamily.offered_ids``). Naming two families (a
+    matmul and an sdpa together) means neither, and the backend is the only
+    candidate.
 
-    Classification is single-valued by construction: this is a function, so
-    "two families claimed this graph" is not a case that can arise. A graph
-    whose node types name two different families (a matmul and an sdpa in one
-    graph) belongs to neither, and the backend is the only candidate.
-
-    Note what this does NOT decide: a node type absent from the table is
-    ignored, so ``matmul -> reshape`` still classifies as gemm. Whether a family
-    can serve the WHOLE graph is its analyzer's judgment, deliberately — a
-    coarser copy of that judgment here is what ``closed_under`` was, and it
-    lied about RESHAPE.
+    Does NOT decide coverage: an unlisted node type is ignored, so
+    ``matmul -> reshape`` still classifies as gemm and the analyzer declines it.
     """
     named = {_ANCHOR_NODE_TO_FAMILY[n] for n in graph_node_types(graph) if n in _ANCHOR_NODE_TO_FAMILY}
     if len(named) != 1:

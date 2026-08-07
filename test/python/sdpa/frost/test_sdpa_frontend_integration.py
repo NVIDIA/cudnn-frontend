@@ -15,28 +15,14 @@ import cudnn
 from cudnn.engines import MANIFEST, is_backend_engine, is_python_engine
 
 from cudnn.sdpa.fwd.engines import engine_name
+from frost_test_utils import requires_blackwell, requires_dsl, _dsl_installed
 
 _FROST = engine_name(512)  # matches the D=512 graphs below
 _GPU = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU")
 
 
-def _is_sm100() -> bool:
-    return torch.cuda.is_available() and torch.cuda.get_device_capability(torch.cuda.current_device()) == (10, 0)
-
-
-def _dsl_deps_available() -> bool:
-    try:
-        import cutlass  # noqa: F401
-    except ImportError:
-        return False
-    return True
-
-
-_SM100 = pytest.mark.skipif(not _is_sm100(), reason="needs an SM100 (Blackwell) GPU")
-_SM100_DSL = pytest.mark.skipif(
-    not (_is_sm100() and _dsl_deps_available()),
-    reason="needs an SM100 (Blackwell) GPU with cutlass installed",
-)
+_SM100 = requires_blackwell
+_SM100_DSL = pytest.mark.skipif(requires_blackwell.args[0] or requires_dsl.args[0], reason="needs an SM100-line GPU with the cutedsl extra")
 
 # The default pytest.ini addopts is `-m L0`; mark the whole module so it runs.
 pytestmark = pytest.mark.L0

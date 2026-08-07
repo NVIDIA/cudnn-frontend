@@ -12,21 +12,7 @@ import torch
 from test_utils import torch_fork_set_rng
 
 from cudnn.sdpa.fwd.engines import engine_name
-
-
-def _is_sm100() -> bool:
-    if not torch.cuda.is_available():
-        return False
-    major, minor = torch.cuda.get_device_capability(torch.cuda.current_device())
-    return (major, minor) == (10, 0)
-
-
-def _dsl_deps_available() -> bool:
-    try:
-        import cutlass  # noqa: F401
-    except ImportError:
-        return False
-    return True
+from frost_test_utils import requires_blackwell, requires_dsl, _dsl_installed
 
 
 def _select_engine(graph, name):
@@ -40,10 +26,7 @@ def _select_engine(graph, name):
     return graph
 
 
-pytestmark = pytest.mark.skipif(
-    not _is_sm100(),
-    reason="SM100 DSL SDPA engine requires an SM100 (Blackwell) device.",
-)
+pytestmark = requires_blackwell
 
 
 def _ref_sdpa(q, k, v, *, is_causal, scale):
@@ -71,7 +54,7 @@ def test_sdpa_fwd_dsl_sm100_graph_api(dtype, is_causal, d):
         import cudnn.sdpa  # noqa: F401 — registers the FROST DSL engines
     except ImportError as e:
         pytest.skip(f"SM100 DSL engine not available: {e}")
-    if not _dsl_deps_available():
+    if not _dsl_installed():
         pytest.skip("cutlass/dsl not installed")
 
     b, h, s = 2, 8, 256
@@ -169,7 +152,7 @@ def _require_dsl():
         import cudnn.sdpa  # noqa: F401 — registers the FROST DSL engines
     except ImportError as e:
         pytest.skip(f"SM100 DSL engine not available: {e}")
-    if not _dsl_deps_available():
+    if not _dsl_installed():
         pytest.skip("cutlass/dsl not installed")
 
 

@@ -27,22 +27,7 @@ import torch
 from test_utils import torch_fork_set_rng
 
 from cudnn.sdpa.fwd.engines import engine_name
-
-
-def _is_sm100() -> bool:
-    if not torch.cuda.is_available():
-        return False
-    # The MXFP8 prefill engine supports both Blackwell arches (cc10.0 and cc10.3);
-    # on cc10.3 the fused-LDTM statistics path (tcgen05.ld.red.f32.max) auto-engages.
-    return torch.cuda.get_device_capability(torch.cuda.current_device()) in ((10, 0), (10, 3))
-
-
-def _deps_available() -> bool:
-    try:
-        import cutlass  # noqa: F401
-    except ImportError:
-        return False
-    return True
+from frost_test_utils import requires_blackwell, requires_dsl
 
 
 def _select_engine(graph, name):
@@ -55,10 +40,7 @@ def _select_engine(graph, name):
     return graph
 
 
-pytestmark = pytest.mark.skipif(
-    not (_is_sm100() and _deps_available()),
-    reason="MXFP8 SDPA engine requires SM100 + cutlass-dsl.",
-)
+pytestmark = [requires_blackwell, requires_dsl]
 
 
 _FP8 = {"e4m3": torch.float8_e4m3fn, "e5m2": torch.float8_e5m2}

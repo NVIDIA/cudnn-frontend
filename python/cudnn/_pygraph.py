@@ -966,22 +966,16 @@ class pygraph:
     def _finalize_backend_layout(self) -> None:
         """Let the backend's layout inference land before the graph is frozen.
 
-        Lowering to C++ and reflecting the result back is how the GRAPH learns
-        the strides it will really execute with (the IR's own are provisional
-        row-major) — a property of the graph, not of whichever engine ends up
-        serving it. So this runs the same way whether or not the caller
-        registered an out-of-tree engine; splitting those paths is what left
-        the frozen snapshot unenforceable, since the registered-engine path
-        lowered LATER, inside the Router, and _sync_ir_shapes_from_backend
-        writes through object.__setattr__ specifically to bypass the freeze.
+        Lowering and reflecting strides back is how the GRAPH learns what it
+        will execute with, so it runs the same way whether or not an
+        out-of-tree engine was registered -- splitting those paths is what left
+        the snapshot unenforceable, since _sync_ir_shapes_from_backend writes
+        through object.__setattr__ to bypass the freeze.
 
-        A failure here means "the backend cannot represent this graph", which
-        is a decline — a python engine may still serve it — recorded the way
-        backend_plan_entries() records one so the two agree.
-
-        Not routed through backend_plan_entries() itself: that additionally runs
-        the C++ plan query (~178 ms for a 1024^3 bf16 matmul), which a Router is
-        entitled never to ask for.
+        A failure here is the backend DECLINING (a python engine may still
+        serve the graph), recorded as backend_plan_entries() records one. Not
+        routed through that, which also runs the ~178 ms C++ plan query a
+        Router may never ask for.
         """
         import cudnn
 
@@ -999,21 +993,12 @@ class pygraph:
             self._backend_entries = []
 
     def _attach_facts(self) -> None:
-        """Describe this frozen graph in each matching family's vocabulary.
+        """Describe this frozen graph in its family's vocabulary.
 
-        Part of planning, not something a caller invokes: the graph finds its
-        own families through the manifest and hangs one record per family off
-        itself, as an optional payload. A graph no family claims carries none.
-
-        Runs AFTER _freeze() on purpose. Analyzing a graph that can still
-        change means chasing every mutation point — the layout the backend
-        infers, a dtype set between two validate() calls, a node param written
-        in place — and missing one leaves facts describing a graph that is no
-        longer there. After the freeze there is no "later" to chase.
-
-        Facts are family-scoped by construction — an SDPA fact means nothing to
-        a GEMM engine — so this is a mapping, never a union record that every
-        family would have to widen.
+        Part of planning, not a call anyone makes. Runs AFTER _freeze(): a
+        snapshot of a graph that can still change means chasing every mutation
+        point, and missing one leaves facts describing a graph that is gone.
+        A graph no family claims carries no payload.
         """
         from .engines import manifest
 
@@ -1026,11 +1011,9 @@ class pygraph:
     def _facts_for(self, analyzer):
         """The record ``analyzer`` produced for this graph, computing it once.
 
-        Keyed by the analyzer itself, so the ranking (which resolves it from
-        ``EngineFamily.analyzer``) and the engine (which passes the callable it
-        already imports) reach ONE record with no family name to keep in sync.
-        Two extractions of the same graph is how a heuristics feature vector
-        drifts from what the kernel actually does.
+        Keyed by the analyzer itself so the ranking and the engine reach ONE
+        record with no name to keep in sync -- two extractions of a graph is
+        how a feature vector drifts from what the kernel does.
         """
         if not self._frozen:
             # Still mutable (a direct engine probe before planning): answer, but

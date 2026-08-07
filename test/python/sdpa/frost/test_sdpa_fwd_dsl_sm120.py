@@ -11,6 +11,7 @@ import pytest
 import torch
 
 from test_utils import torch_fork_set_rng
+from frost_test_utils import requires_blackwell_geforce, requires_dsl, _dsl_installed
 
 
 def _is_sm120() -> bool:
@@ -18,14 +19,6 @@ def _is_sm120() -> bool:
         return False
     major, minor = torch.cuda.get_device_capability(torch.cuda.current_device())
     return (major, minor) in {(12, 0), (12, 1)}
-
-
-def _dsl_deps_available() -> bool:
-    try:
-        import cutlass  # noqa: F401
-    except ImportError:
-        return False
-    return True
 
 
 pytestmark = pytest.mark.skipif(
@@ -40,7 +33,7 @@ def _require_dsl() -> None:
         import cudnn.sdpa  # noqa: F401
     except ImportError as exc:
         pytest.skip(f"SM120 DSL engine not available: {exc}")
-    if not _dsl_deps_available():
+    if not _dsl_installed():
         pytest.skip("cutlass/dsl not installed")
 
 
