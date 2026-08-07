@@ -1076,19 +1076,19 @@ def _softmax_warp_group(
                 raw_chunks = [
                     nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(s_addr_base + cutlass.Int32(c * CHUNK), cutlass.Float32), num=CHUNK) for c in range(N_CHUNKS)
                 ]
-                causal_diag = eff_seqlen_kv - eff_seqlen_q if cutlass.const_expr(CFG.CAUSAL_BOTTOM_RIGHT) else None
+                causal_diag = eff_seqlen_kv - eff_seqlen_q if cutlass.const_expr(CFG.BOTTOM_RIGHT) else None
                 chunks_S = [
                     apply_mask_chunk(
                         raw_chunks[c],
                         q_abs,
                         kv_col_base + cutlass.Int32(c * CHUNK),
                         eff_seqlen_kv,
-                        CFG.SWA_WINDOW,
+                        CFG.WINDOW_LEFT,
                         CFG.MASK_FLAGS,
                         N=CHUNK,
-                        causal_bottom_right=CFG.CAUSAL_BOTTOM_RIGHT,
+                        bottom_right=CFG.BOTTOM_RIGHT,
                         causal_diag=causal_diag,
-                        band_right=CFG.BAND_RIGHT,
+                        window_right=CFG.WINDOW_RIGHT,
                         mask_value=float("-inf"),
                     )
                     for c in range(N_CHUNKS)
@@ -1229,19 +1229,19 @@ def _softmax_warp_group(
                 raw_chunks = [
                     nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(s_addr_base + cutlass.Int32(c * CHUNK), cutlass.Float32), num=CHUNK) for c in range(N_CHUNKS)
                 ]
-                causal_diag = eff_seqlen_kv - eff_seqlen_q if cutlass.const_expr(CFG.CAUSAL_BOTTOM_RIGHT) else None
+                causal_diag = eff_seqlen_kv - eff_seqlen_q if cutlass.const_expr(CFG.BOTTOM_RIGHT) else None
                 chunks_S = [
                     apply_mask_chunk(
                         raw_chunks[c],
                         q_abs,
                         kv_col_base + cutlass.Int32(c * CHUNK),
                         eff_seqlen_kv,
-                        CFG.SWA_WINDOW,
+                        CFG.WINDOW_LEFT,
                         CFG.MASK_FLAGS,
                         N=CHUNK,
-                        causal_bottom_right=CFG.CAUSAL_BOTTOM_RIGHT,
+                        bottom_right=CFG.BOTTOM_RIGHT,
                         causal_diag=causal_diag,
-                        band_right=CFG.BAND_RIGHT,
+                        window_right=CFG.WINDOW_RIGHT,
                         mask_value=float("-inf"),
                     )
                     for c in range(N_CHUNKS)

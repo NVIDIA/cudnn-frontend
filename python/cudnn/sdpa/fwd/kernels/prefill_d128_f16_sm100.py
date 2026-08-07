@@ -1292,21 +1292,21 @@ def _softmax_kv_body(
             for c in range(N_CHUNKS)
         ]
         # Bottom-right causal: runtime SKV-SQ diagonal offset (folds out when
-        # CFG.CAUSAL_BOTTOM_RIGHT is 0 — top-left masking is unchanged).
-        causal_diag = eff_seqlen_kv - eff_seqlen_q if cutlass.const_expr(CFG.CAUSAL_BOTTOM_RIGHT) else None
+        # CFG.BOTTOM_RIGHT is 0 — top-left masking is unchanged).
+        causal_diag = eff_seqlen_kv - eff_seqlen_q if cutlass.const_expr(CFG.BOTTOM_RIGHT) else None
         chunks_S = [
             apply_mask_chunk(
                 raw_chunks[c],
                 q_abs,
                 kv_col_base + cutlass.Int32(c * CHUNK),
                 eff_seqlen_kv,
-                CFG.SWA_WINDOW,
+                CFG.WINDOW_LEFT,
                 CFG.MASK_FLAGS,
                 N=CHUNK,
-                causal_bottom_right=CFG.CAUSAL_BOTTOM_RIGHT,
+                bottom_right=CFG.BOTTOM_RIGHT,
                 causal_diag=causal_diag,
                 mask_value=float("-inf"),
-                band_right=CFG.BAND_RIGHT,
+                window_right=CFG.WINDOW_RIGHT,
             )
             for c in range(N_CHUNKS)
         ]

@@ -23,10 +23,6 @@ from cudnn.frost.tile_dsl.constants import (
     DTYPE_E4M3,
     DTYPE_E5M2,
     DTYPE_FP16,
-    MASK_CAUSAL,
-    MASK_NONE,
-    MASK_PADDED,
-    MASK_SWA,
     SCHED_LPT,
     SCHED_NATURAL,
 )
@@ -260,6 +256,13 @@ class SdpaFwdDsl(APIBase):
         # widened by R columns. None = no right band; requires is_causal (the
         # band is the causal diagonal, possibly widened).
         self.window_size_right = window_size_right
+        # The ONE canonical band every adapter lowers (same model as the
+        # analyzer facts / config TemplateParams): per-side offsets from the
+        # diagonal, None = unbounded. is_causal means "right bound 0";
+        # window_size_right widens it (check_support validates it requires
+        # is_causal). The padding mask stays orthogonal (seq_kv_lens_present).
+        self.window_left: Optional[int] = window_size_left
+        self.window_right: Optional[int] = (window_size_right or 0) if self.is_causal else None
         self.scale_softmax = scale_softmax
         self.seq_kv_lens_present = bool(seq_kv_lens_present)
         # Dense padded-Q trim (cuDNN >= 9.14): q rows >= seq_len_q[b] write
@@ -463,8 +466,6 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
 
     def _initialize_implementation(self) -> None:
         self.flavor: Optional[tuple[int, int]] = None
-        self.mask_flags = 0
-        self.swa_window_runtime = 0
         self.thd_stats_head_major = False
         self.thd_stats_head_stride = 0
         self._k_mod = None
@@ -626,9 +627,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             band_right is not None and not self.is_causal,
             "SM100 DSL SDPA: window_size_right widens the causal diagonal and requires is_causal=True",
         )
-        # The kernels' bottom-right diagonal path supports plain causal only:
-        # CAUSAL_BOTTOM_RIGHT requires MASK_CAUSAL and excludes MASK_SWA
-        # (see config._validate_knobs).
+        # The kernels' bottom-right diagonal path excludes a left bound:
+        # bottom_right requires a right bound and rejects window_left
+        # (see config_sm100._validate_params).
         self._value_error_if(
             self.causal_bottom_right and not self.is_causal,
             "SM100 DSL SDPA: causal_bottom_right requires is_causal=True",
@@ -646,19 +647,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             "supported (kernel anchors the BR diagonal at the global S_q, not "
             "seq_len_q[b])",
         )
-        if self.is_causal:
-            self.mask_flags = MASK_CAUSAL | (MASK_SWA if swa_left is not None else 0)
-            self.swa_window_runtime = swa_left if swa_left is not None else 0
-        elif swa_left is not None:
-            self.mask_flags = MASK_SWA
-            self.swa_window_runtime = swa_left
-        else:
-            self.mask_flags = MASK_NONE
-            self.swa_window_runtime = 0
         if self.thd:
             self.seq_kv_lens_present = True
-        if self.seq_kv_lens_present:
-            self.mask_flags |= MASK_PADDED
         # Dense padded-Q trim backstops (engines.lower_dsl_prefill never sets
         # these combinations; a direct caller could).
         self._value_error_if(
@@ -729,15 +719,14 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         mxfp8 = self._fp8 and not self._pertensor
         fused_ldtm_stat = mxfp8 and (self._device_cc == (10, 3))
         sched_policy = self.sched_policy
-        if mxfp8 and sched_policy == SCHED_NATURAL and (self.mask_flags & MASK_CAUSAL):
+        if mxfp8 and sched_policy == SCHED_NATURAL and self.window_right is not None:
             sched_policy = SCHED_LPT
         params = Sm100TemplateParams(
             dtype_qkv=_SM100_DTYPE_QKV_CODE[self.dtype],
             dtype_o=_SM100_DTYPE_QKV_CODE[self.dtype_o],
-            mask_flags=self.mask_flags,
-            swa_window=int(self.swa_window_runtime),
-            band_right=int(self.window_size_right or 0),
-            causal_bottom_right=self.causal_bottom_right,
+            window_left=self.window_left,
+            window_right=self.window_right,
+            bottom_right=self.causal_bottom_right,
             has_sink=self.has_sink,
             seq_kv_lens_present=self.seq_kv_lens_present,
             seq_q_lens_present=self.seq_q_lens_present,
@@ -1739,9 +1728,9 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
 
         params = Sm120TemplateParams(
             dtype_qkv=_SM120_DTYPE_QKV_CODE[self.dtype],
-            is_causal=self.is_causal,
-            causal_bottom_right=self.causal_bottom_right,
-            window_size_left=self.window_size_left,
+            window_left=self.window_left,
+            window_right=self.window_right,
+            bottom_right=self.causal_bottom_right,
             seq_q_lens_present=self.seq_q_lens_present,
             seq_kv_lens_present=self.seq_kv_lens_present,
             has_sink=self.has_sink,

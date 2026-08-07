@@ -192,7 +192,7 @@ def _bounds_for_tile(
 
 _resolve_seqlen_kv = _sdpa_h.resolve_seqlen_kv
 _resolve_seqlen_q = _sdpa_h.resolve_seqlen_q
-CAN_HAVE_EMPTY_KV = (CFG.MASK_FLAGS & (MASK_PADDED | MASK_SWA)) != 0 or CFG.CAUSAL_BOTTOM_RIGHT
+CAN_HAVE_EMPTY_KV = (CFG.MASK_FLAGS & (MASK_PADDED | MASK_SWA)) != 0 or CFG.BOTTOM_RIGHT
 
 # THD / varlen — flat-grid decode + tma-offset closures (CFG-bound) from the
 # factory; O-descriptor builder + TENSOR_MAP_QWORDS from the shared
@@ -212,10 +212,10 @@ _thd_tma_offsets = _sdpa_h.thd_tma_offsets
 def _apply_top_left_causal_mask_chunk(reg_S, q_abs, kv_col_base, N: int = 64):
     neg_inf = cutlass.Float32(float("-inf"))
     last_live = q_abs - kv_col_base
-    if cutlass.const_expr(CFG.BAND_RIGHT != 0):
+    if cutlass.const_expr(CFG.WINDOW_RIGHT != 0):
         # Right-band widening: the causal upper limit sits BAND_RIGHT columns
         # right of the diagonal (cuDNN diagonal_band_right_bound).
-        last_live = last_live + cutlass.Int32(CFG.BAND_RIGHT)
+        last_live = last_live + cutlass.Int32(CFG.WINDOW_RIGHT)
     elems = [
         cutlass.Float32(
             arith.select(
@@ -233,8 +233,8 @@ def _apply_top_left_causal_mask_chunk(reg_S, q_abs, kv_col_base, N: int = 64):
 def _apply_bottom_right_causal_mask_chunk(reg_S, q_abs, kv_col_base, causal_diag, N: int = 64):
     neg_inf = cutlass.Float32(float("-inf"))
     last_live = q_abs + causal_diag - kv_col_base
-    if cutlass.const_expr(CFG.BAND_RIGHT != 0):
-        last_live = last_live + cutlass.Int32(CFG.BAND_RIGHT)
+    if cutlass.const_expr(CFG.WINDOW_RIGHT != 0):
+        last_live = last_live + cutlass.Int32(CFG.WINDOW_RIGHT)
     elems = [
         cutlass.Float32(
             arith.select(
@@ -1327,8 +1327,8 @@ def _softmax_kv_body(
     if cutlass.const_expr(apply_mask):
         kv_col_base = kv_loop * cutlass.Int32(CFG.TILE_N)
         # Bottom-right causal: runtime SKV-SQ diagonal offset (folds out when
-        # CFG.CAUSAL_BOTTOM_RIGHT is 0 - top-left masking is unchanged).
-        causal_diag = eff_seqlen_kv - eff_seqlen_q if cutlass.const_expr(CFG.CAUSAL_BOTTOM_RIGHT) else None
+        # CFG.BOTTOM_RIGHT is 0 - top-left masking is unchanged).
+        causal_diag = eff_seqlen_kv - eff_seqlen_q if cutlass.const_expr(CFG.BOTTOM_RIGHT) else None
 
     _wait_mbarrier(bars.mb_bmm1_done[sub_tile_id], bmm1_phase)
     bmm1_phase = bmm1_phase ^ 1
@@ -1346,7 +1346,7 @@ def _softmax_kv_body(
             )
             for c in range(N_CHUNKS)
         ]
-        if cutlass.const_expr(CFG.MASK_FLAGS == MASK_CAUSAL and CFG.CAUSAL_BOTTOM_RIGHT == 0):
+        if cutlass.const_expr(CFG.MASK_FLAGS == MASK_CAUSAL and CFG.BOTTOM_RIGHT == 0):
             chunks_S = [
                 _apply_top_left_causal_mask_chunk(
                     raw_chunks[c],
@@ -1356,7 +1356,7 @@ def _softmax_kv_body(
                 )
                 for c in range(N_CHUNKS)
             ]
-        elif cutlass.const_expr(CFG.MASK_FLAGS == MASK_CAUSAL and CFG.CAUSAL_BOTTOM_RIGHT != 0):
+        elif cutlass.const_expr(CFG.MASK_FLAGS == MASK_CAUSAL and CFG.BOTTOM_RIGHT != 0):
             chunks_S = [
                 _apply_bottom_right_causal_mask_chunk(
                     raw_chunks[c],
@@ -1374,13 +1374,13 @@ def _softmax_kv_body(
                     q_abs,
                     kv_col_base + cutlass.Int32(c * CHUNK),
                     eff_seqlen_kv,
-                    CFG.SWA_WINDOW,
+                    CFG.WINDOW_LEFT,
                     CFG.MASK_FLAGS,
                     N=CHUNK,
-                    causal_bottom_right=CFG.CAUSAL_BOTTOM_RIGHT,
+                    bottom_right=CFG.BOTTOM_RIGHT,
                     causal_diag=causal_diag,
                     mask_value=float("-inf"),
-                    band_right=CFG.BAND_RIGHT,
+                    window_right=CFG.WINDOW_RIGHT,
                 )
                 for c in range(N_CHUNKS)
             ]
@@ -1892,7 +1892,7 @@ def _correction_warp_group(
                 # Dead row (no valid KV column at all): O := 0, LSE := -inf.
                 # Top-left causal and no-mask dense tiles always have at least
                 # one valid KV per live row, so fold this select out there.
-                if cutlass.const_expr((CFG.MASK_FLAGS & (MASK_PADDED | MASK_SWA)) != 0 or CFG.CAUSAL_BOTTOM_RIGHT):
+                if cutlass.const_expr((CFG.MASK_FLAGS & (MASK_PADDED | MASK_SWA)) != 0 or CFG.BOTTOM_RIGHT):
                     row_dead = total_sum <= cutlass.Float32(0.0)
                     neg_inf_lse = cutlass.Float32(float("-inf"))
                     lse_val = cutlass.Float32(arith.select(row_dead.ir_value(), neg_inf_lse.ir_value(), lse_val.ir_value()))

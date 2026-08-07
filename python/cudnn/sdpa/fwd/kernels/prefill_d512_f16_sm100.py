@@ -660,19 +660,19 @@ def _sg0_softmax_kv_iter(
             )
             for c in range(SOFTMAX_N_CHUNKS_LOAD)
         ]
-        causal_diag = eff_seqlen_kv - eff_seqlen_q if cutlass.const_expr(CFG.CAUSAL_BOTTOM_RIGHT) else None
+        causal_diag = eff_seqlen_kv - eff_seqlen_q if cutlass.const_expr(CFG.BOTTOM_RIGHT) else None
         chunks_S = [
             apply_mask_chunk(
                 raw_chunks[c],
                 q_abs,
                 kv_col_base + cutlass.Int32(c * SOFTMAX_CHUNK),
                 eff_seqlen_kv,
-                CFG.SWA_WINDOW,
+                CFG.WINDOW_LEFT,
                 CFG.MASK_FLAGS,
                 N=SOFTMAX_CHUNK,
-                causal_bottom_right=CFG.CAUSAL_BOTTOM_RIGHT,
+                bottom_right=CFG.BOTTOM_RIGHT,
                 causal_diag=causal_diag,
-                band_right=CFG.BAND_RIGHT,
+                window_right=CFG.WINDOW_RIGHT,
                 mask_value=float("-inf"),
             )
             for c in range(SOFTMAX_N_CHUNKS_LOAD)

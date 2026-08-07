@@ -1640,31 +1640,31 @@ def _softmax_kv_body(
         kv_col_base_a = kv_loop * cutlass.Int32(CFG.TILE_N)
         kv_col_base_b = kv_col_base_a + cutlass.Int32(CHUNK)
         # Bottom-right causal: runtime SKV-SQ diagonal offset (folds out when
-        # CFG.CAUSAL_BOTTOM_RIGHT is 0 — top-left masking is unchanged).
-        causal_diag = eff_seqlen_kv - eff_seqlen_q if cutlass.const_expr(CFG.CAUSAL_BOTTOM_RIGHT) else None
+        # CFG.BOTTOM_RIGHT is 0 — top-left masking is unchanged).
+        causal_diag = eff_seqlen_kv - eff_seqlen_q if cutlass.const_expr(CFG.BOTTOM_RIGHT) else None
         reg_S_a = apply_mask_chunk(
             reg_S_a,
             q_abs,
             kv_col_base_a,
             eff_seqlen_kv,
-            CFG.SWA_WINDOW,
+            CFG.WINDOW_LEFT,
             CFG.MASK_FLAGS,
             N=CHUNK,
-            causal_bottom_right=CFG.CAUSAL_BOTTOM_RIGHT,
+            bottom_right=CFG.BOTTOM_RIGHT,
             causal_diag=causal_diag,
-            band_right=CFG.BAND_RIGHT,
+            window_right=CFG.WINDOW_RIGHT,
         )
         reg_S_b = apply_mask_chunk(
             reg_S_b,
             q_abs,
             kv_col_base_b,
             eff_seqlen_kv,
-            CFG.SWA_WINDOW,
+            CFG.WINDOW_LEFT,
             CFG.MASK_FLAGS,
             N=CHUNK,
-            causal_bottom_right=CFG.CAUSAL_BOTTOM_RIGHT,
+            bottom_right=CFG.BOTTOM_RIGHT,
             causal_diag=causal_diag,
-            band_right=CFG.BAND_RIGHT,
+            window_right=CFG.WINDOW_RIGHT,
         )
 
         max_a = row_max_reduction_64(reg_S_a)

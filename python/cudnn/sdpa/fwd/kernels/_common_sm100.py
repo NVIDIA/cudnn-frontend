@@ -203,31 +203,31 @@ def compute_kv_loop_bounds(
     q_row_coord,
     seqlen_q,
     seq_kv_len,
-    swa_window: int,
+    window_left: int,
     mask_flags: int,
     tile_n: int,
     cga_tile_m: int,
-    causal_bottom_right: bool = False,
-    band_right: int = 0,
+    bottom_right: bool = False,
+    window_right: int = 0,
 ) -> KvLoopBounds:
-    # band_right: compile-time diagonal-band right bound (cuDNN
+    # window_right: compile-time diagonal-band right bound (cuDNN
     # diagonal_band_right_bound) — the causal upper limit is widened by
-    # band_right columns. 0 = plain causal; folds out entirely.
+    # window_right columns. 0 = plain causal; folds out entirely.
     left = cutlass.Int32(0)
     right = _div_up(seq_kv_len, tile_n)
 
-    if cutlass.const_expr(causal_bottom_right):
+    if cutlass.const_expr(bottom_right):
         causal_diag = seq_kv_len - seqlen_q
     else:
         causal_diag = cutlass.Int32(0)
 
     if cutlass.const_expr(mask_flags & MASK_CAUSAL):
-        kv_hi_caus = _div_up(q_row_coord + cutlass.Int32(cga_tile_m + band_right) + causal_diag, tile_n)
+        kv_hi_caus = _div_up(q_row_coord + cutlass.Int32(cga_tile_m + window_right) + causal_diag, tile_n)
         right = cute.math.min(right, kv_hi_caus)
 
     if cutlass.const_expr(mask_flags & MASK_SWA):
-        cond = q_row_coord > cutlass.Int32(swa_window)
-        delta = q_row_coord - cutlass.Int32(swa_window)
+        cond = q_row_coord > cutlass.Int32(window_left)
+        delta = q_row_coord - cutlass.Int32(window_left)
         kv_lo_swa = cutlass.Int32(
             arith.select(
                 cond.ir_value(),
@@ -249,13 +249,13 @@ def compute_kv_loop_bounds(
         )
         unmasked_hi = cute.math.min(unmasked_hi, lo_pad)
     if cutlass.const_expr(mask_flags & MASK_CAUSAL):
-        lo_caus = (q_row_coord + cutlass.Int32(band_right) + causal_diag) // cutlass.Int32(tile_n)
+        lo_caus = (q_row_coord + cutlass.Int32(window_right) + causal_diag) // cutlass.Int32(tile_n)
         unmasked_hi = cute.math.min(unmasked_hi, lo_caus)
     unmasked_hi = cute.math.max(unmasked_hi, left)
 
     unmasked_lo = left
     if cutlass.const_expr(mask_flags & MASK_SWA):
-        anchor = q_row_coord + cutlass.Int32(cga_tile_m - 1 - swa_window)
+        anchor = q_row_coord + cutlass.Int32(cga_tile_m - 1 - window_left)
         swa_unmasked_lo = _div_up(anchor, tile_n)
         cond = anchor > cutlass.Int32(0)
         swa_unmasked_lo = cutlass.Int32(
@@ -356,12 +356,12 @@ def make_sdpa_helpers(CFG, lpt_q_tiles_in_cga_units: bool = False) -> SdpaHelper
             q_row_coord,
             seqlen_q,
             seqlen_kv,
-            CFG.SWA_WINDOW,
+            CFG.WINDOW_LEFT,
             CFG.MASK_FLAGS,
             CFG.TILE_N,
             cga_tile_m,
-            causal_bottom_right=bool(CFG.CAUSAL_BOTTOM_RIGHT),
-            band_right=int(getattr(CFG, "BAND_RIGHT", 0)),
+            bottom_right=bool(CFG.BOTTOM_RIGHT),
+            window_right=int(CFG.WINDOW_RIGHT),
         )
 
     @cute.jit
@@ -415,7 +415,7 @@ def make_sdpa_helpers(CFG, lpt_q_tiles_in_cga_units: bool = False) -> SdpaHelper
         every non-BR mask, where seqlen_q only feeds the unused diagonal)
         keep the scalar S_q, so this folds out unless THD_VARLEN and
         CAUSAL_BOTTOM_RIGHT are both set."""
-        if cutlass.const_expr(int(getattr(CFG, "THD_VARLEN", 0)) == 1 and int(CFG.CAUSAL_BOTTOM_RIGHT) == 1):
+        if cutlass.const_expr(int(getattr(CFG, "THD_VARLEN", 0)) == 1 and int(CFG.BOTTOM_RIGHT) == 1):
             cu = cutlass.make_array_view(seq_kv_lens_tensor)
             q0 = n_batch
             return cutlass.Int32(cu[q0 + batch_idx + cutlass.Int32(1)]) - cutlass.Int32(cu[q0 + batch_idx])
