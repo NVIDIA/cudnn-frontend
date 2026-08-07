@@ -825,7 +825,7 @@ def resolve_feature_operands(facts: "SdpaGraphFacts", resolved: dict) -> Feature
     if facts.padded:
         ops.seq_kv_lens = _need(facts.seq_kv_t, "padding mask (seq_len_kv)")
         if facts.seq_q_t is not None:
-            ops.seq_len_q = resolved.get(id(facts.seq_q_t))
+            ops.seq_len_q = _need(facts.seq_q_t, "per-batch query lengths (seq_len_q)")
     if facts.has_bias:
         ops.bias = _need(facts.bias_t, "bias")
     if facts.has_sink:
@@ -862,7 +862,6 @@ def to_bshd_physical(t: "torch.Tensor") -> "torch.Tensor":
     tensor; zero-copy when the buffer already is.  Delivers the dense_flex
     layout relaxation for lowerings whose adapters require this order
     (mirrors the DSL executor's canonical-buffer gather)."""
-    b, h, s_, d = t.shape
     strides = t.stride()
     # already BSHD-physical (size-1 dims wildcarded): D innermost, then H, S, B
     order = sorted(range(4), key=lambda i: (strides[i], t.shape[i]))

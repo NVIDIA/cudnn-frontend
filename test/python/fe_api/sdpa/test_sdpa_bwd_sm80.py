@@ -49,7 +49,7 @@ def _bshd_randn(b, h, s, d, **kw):
 
 def _ref_grads(q, k, v, do, *, is_causal, window_left, scale):
     """fp32 autograd reference; returns (o, dq, dk, dv)."""
-    b, h_q, s_q, d_qk = q.shape
+    _, h_q, s_q, _ = q.shape
     _, h_kv, s_kv, _ = k.shape
     g = h_q // h_kv
     q_ref = q.detach().to(torch.float32).requires_grad_()

@@ -222,7 +222,9 @@ def test_bwd_engine_bhsd_contiguous_layout():
     # LSE from a matching fwd run (wrapper path; layout-independent).
     from cudnn.sdpa import sdpa_fwd_wrapper_sm80
 
-    phys = lambda t: t.permute(0, 2, 1, 3).contiguous().permute(0, 2, 1, 3)
+    def phys(t):
+        return t.permute(0, 2, 1, 3).contiguous().permute(0, 2, 1, 3)
+
     fwd = sdpa_fwd_wrapper_sm80(q_tensor=phys(bufs["q"]), k_tensor=phys(bufs["k"]), v_tensor=phys(bufs["v"]), is_causal=True, scale_softmax=_SCALE)
     o_buf = fwd["o_tensor"].contiguous()  # BHSD-contiguous view of O
     stats_buf = fwd["lse_tensor"].reshape(B, H, S, 1).contiguous()
