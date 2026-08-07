@@ -147,8 +147,8 @@ class Capabilities:
     stats: bool = False
     # The adapter accepts lse_tensor=None (its kernel None-specializes the LSE
     # store), so a stats-less graph needs no dummy-LSE workspace chunk. Rows
-    # that keep False (the SM100 flavors) always write an LSE and get a carved
-    # dummy from lower_dsl_prefill when the graph has no Stats output.
+    # that keep False (the SM100 FP8/MXFP8 flavors) always write an LSE and get
+    # a carved dummy from lower_dsl_prefill when the graph has no Stats output.
     lse_optional: bool = False
     thd: bool = False
     cu_seq_len: bool = False  # cu_seq_len_q / cu_seq_len_kv prefix sums (no row serves these yet)
@@ -367,6 +367,7 @@ def _sm100_spec(d: int, d_v: Optional[int] = None) -> EngineSpec:
             padded=True,
             sink=True,
             stats=True,
+            lse_optional=True,
             thd=True,
             thd_stats=True,
             padded_stats=True,
@@ -594,11 +595,10 @@ def lower_dsl_prefill(
     # build time and recorded on the executor as ``workspace_bytes`` — that
     # number is what the plan's CompiledPlan.get_workspace_size() reports.
     #   - dummy LSE (dense, stats absent, non-lse_optional adapters): the
-    #     SM100 kernels always write an LSE; without a Stats output it lands
-    #     in b*h_q*s_q fp32 scratch. lse_optional adapters (SM120) compile the
-    #     LSE store out instead and bind no buffer. (THD needs no engine-level
-    #     LSE chunk — the packed THD LSE is part of the api-level scratch
-    #     below.)
+    #     SM100 FP8/MXFP8 kernels always write an LSE; without a Stats output
+    #     it lands in b*h_q*s_q fp32 scratch. lse_optional adapters (the f16
+    #     flavors, SM120) compile the LSE store out instead and bind no
+    #     buffer. (THD needs no engine-level LSE chunk either way.)
     #   - synthesized seq_len_kv (skv_tail_via_padding rows): b int32.
     #   - api-level scratch (api.scratch_workspace_bytes()): the dense padded
     #     [seq_kv|seq_q] combine and the THD metadata/LSE buffers.

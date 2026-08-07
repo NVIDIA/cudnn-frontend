@@ -93,11 +93,11 @@ def test_sdpa_fwd_dsl_sm100_graph_api(dtype, is_causal, d):
     _select_engine(graph, engine_name(d))
     graph.check_support()
     graph.build_plans()
-    # Honest workspace: no Stats output, so the engine carves a dummy LSE
-    # (b*h*s fp32) from the caller's buffer.
-    assert graph.get_workspace_size() == b * h * s * 4
+    # Honest workspace: no Stats output, so the kernel compiles the LSE store
+    # out (has_lse=False) — no dummy buffer exists at any level.
+    assert graph.get_workspace_size() == 0
 
-    workspace = torch.empty(graph.get_workspace_size(), device=device, dtype=torch.uint8)
+    workspace = torch.empty(max(graph.get_workspace_size(), 1), device=device, dtype=torch.uint8)
     graph.execute({q: q_gpu, k: k_gpu, v: v_gpu, o: o_gpu}, workspace)
     torch.cuda.synchronize()
 
@@ -305,9 +305,9 @@ def test_dsl_sm100_execute_sink_lse_contract():
     has_sink is a compile-time specialization: substituting a zeros dummy for
     missing sinks would silently change the softmax denominator (a zero sink
     logit still contributes exp(0) mass), and sinks passed to a sink-less
-    kernel would be silently dropped. lse_tensor stays accepted when no
-    sample_lse was given (the SM100 kernels always write an LSE; the FROST
-    dispatch hands in workspace scratch), but a requested LSE must be bound.
+    kernel would be silently dropped. Same for the LSE: has_lse is keyed on
+    sample_lse (no Stats output -> the store is compiled out), so a requested
+    LSE must be bound and an unrequested one is rejected, both directions.
     """
     _require_dsl()
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
@@ -344,8 +344,11 @@ def test_dsl_sm100_execute_sink_lse_contract():
         api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_kv_lens=seq_kv)
     with pytest.raises(ValueError, match="without per-batch Q lengths"):
         api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=seq_kv)
-    # No sample_lse and no lse_tensor: the kernel's mandatory LSE write lands
-    # in a cached dummy — no per-execute allocation, output still correct.
+    # No sample_lse: the kernel compiles with has_lse=False (LSE store folded
+    # out, no dummy buffer anywhere) and the output is still correct — while
+    # an unrequested lse_tensor is rejected (there is no LSE slot to bind).
+    with pytest.raises(ValueError, match="without an LSE output"):
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=lse)
     api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o)
     torch.cuda.synchronize()
     o_ref = _ref_sdpa_full(q, k, v, scale=scale, is_causal=True)
@@ -364,8 +367,7 @@ def test_dsl_sm100_execute_sink_lse_contract():
     api = SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, sample_lse=lse_tm, thd=True)
     assert api.check_support() and api.thd_stats_token_major
 
-    # THD execute keeps a strict presence contract in BOTH directions (dense
-    # keeps accepting an extra lse_tensor — the kernels always write an LSE):
+    # THD execute keeps the same strict presence contract in both directions:
     # the raises fire before any packing or launch.
     api = SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, sample_lse=lse_tm, thd=True)
     assert api.check_support()

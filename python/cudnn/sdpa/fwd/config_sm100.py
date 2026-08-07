@@ -77,11 +77,6 @@ class TemplateParams:
     seq_q_lens_present: bool = False
     sched_policy: int = SCHED_NATURAL
     thd_varlen: bool = False
-    # THD ragged-Stats layout: the packed LSE is written directly in the
-    # graph's declared layout. False (default) = head-major ``(1, H, T)`` —
-    # the kernels' native packing, also serving the no-stats scratch dummy;
-    # True = token-major ``(T, H)`` (cuDNN's TH1 ragged Stats contract).
-    thd_lse_token_major: bool = False
     # cc10.3+ fuses the S_acc row-max into the LDTM (tcgen05.ld.red.f32.max); cc10.0
     # lacks it and uses the manual load + software reduction. Auto-set from the device
     # capability at compile time (MXFP8 only; the f16/fp8 kernels do not read it).
@@ -109,8 +104,6 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
             raise ValueError(f"{flavor}: THD/varlen implies per-sequence padded masking (MASK_PADDED)")
         if not k.seq_kv_lens_present:
             raise ValueError(f"{flavor}: THD/varlen requires SEQ_KV_LENS_PRESENT")
-    if k.thd_lse_token_major and not k.thd_varlen:
-        raise ValueError(f"{flavor}: THD_LSE_TOKEN_MAJOR only applies under THD_VARLEN (dense LSE is (B, H, S))")
     if k.seq_q_lens_present:
         if k.thd_varlen:
             raise ValueError(f"{flavor}: SEQ_Q_LENS_PRESENT is dense-only (THD carries per-sequence Q lengths via cu_seqlens)")
@@ -271,7 +264,6 @@ class CfgD256:
     SEQ_Q_LENS_PRESENT: int = 0
 
     THD_VARLEN: int = 0
-    THD_LSE_TOKEN_MAJOR: int = 0
 
 
 def _validate_cfg_d256(cfg: CfgD256) -> None:
@@ -317,7 +309,6 @@ def make_cfg_d256(params: TemplateParams) -> Tuple[CfgD256, TmaIters]:
         SEQ_KV_LENS_PRESENT=1 if (params.thd_varlen or params.seq_kv_lens_present) else 0,
         SEQ_Q_LENS_PRESENT=int(params.seq_q_lens_present),
         THD_VARLEN=int(params.thd_varlen),
-        THD_LSE_TOKEN_MAJOR=int(params.thd_lse_token_major),
     )
     _validate_cfg_d256(cfg)
     return cfg, _tma_iters(cfg)
@@ -410,7 +401,6 @@ class CfgD512:
     SEQ_Q_LENS_PRESENT: int = 0
 
     THD_VARLEN: int = 0
-    THD_LSE_TOKEN_MAJOR: int = 0
 
 
 def _validate_cfg_d512(cfg: CfgD512) -> None:
@@ -460,7 +450,6 @@ def make_cfg_d512(params: TemplateParams) -> Tuple[CfgD512, TmaIters]:
         SEQ_KV_LENS_PRESENT=1 if (params.thd_varlen or params.seq_kv_lens_present) else 0,
         SEQ_Q_LENS_PRESENT=int(params.seq_q_lens_present),
         THD_VARLEN=int(params.thd_varlen),
-        THD_LSE_TOKEN_MAJOR=int(params.thd_lse_token_major),
     )
     _validate_cfg_d512(cfg)
     return cfg, _tma_iters(cfg)
@@ -556,7 +545,6 @@ class CfgD128:
     SEQ_Q_LENS_PRESENT: int = 0
 
     THD_VARLEN: int = 0
-    THD_LSE_TOKEN_MAJOR: int = 0
 
 
 def _validate_cfg_d128(cfg: CfgD128) -> None:
@@ -620,7 +608,6 @@ def make_cfg_d128(params: TemplateParams) -> Tuple[CfgD128, TmaIters]:
         SEQ_KV_LENS_PRESENT=1 if (params.thd_varlen or params.seq_kv_lens_present) else 0,
         SEQ_Q_LENS_PRESENT=int(params.seq_q_lens_present),
         THD_VARLEN=int(params.thd_varlen),
-        THD_LSE_TOKEN_MAJOR=int(params.thd_lse_token_major),
     )
     _validate_cfg_d128(cfg)
     return cfg, _tma_iters(cfg)
@@ -691,7 +678,6 @@ def make_cfg_d192(params: TemplateParams) -> Tuple[CfgD192, TmaIters]:
         SEQ_KV_LENS_PRESENT=1 if (params.thd_varlen or params.seq_kv_lens_present) else 0,
         SEQ_Q_LENS_PRESENT=int(params.seq_q_lens_present),
         THD_VARLEN=int(params.thd_varlen),
-        THD_LSE_TOKEN_MAJOR=int(params.thd_lse_token_major),
     )
     _validate_cfg_d192(cfg)
     return cfg, _tma_iters(cfg)
