@@ -488,7 +488,10 @@ _lib.define(
 )
 
 _lib.define(
-    "sdpa_bwd(Tensor dO, Tensor q, Tensor k, Tensor v, Tensor o, Tensor stats, "
+    # Renamed from cudnn::sdpa_bwd: the canonical name now belongs to the
+    # consolidated op family in cudnn.sdpa.fwd.torch_op (this experimental
+    # module is slated to fold into it).
+    "sdpa_bwd_legacy(Tensor dO, Tensor q, Tensor k, Tensor v, Tensor o, Tensor stats, "
     "float attn_scale, bool is_causal=False, int diagonal_alignment=0, "
     "int left_bound=-1, int right_bound=-1, "
     "Tensor? seq_len_q=None, Tensor? seq_len_kv=None, "
@@ -625,7 +628,7 @@ def _sdpa_fake(
     return O, Stats
 
 
-def _sdpa_bwd_impl(
+def _sdpa_bwd_legacy_impl(
     dO: torch.Tensor,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -723,11 +726,11 @@ def _sdpa_bwd_impl(
     return dQ_gpu, dK_gpu, dV_gpu
 
 
-_lib.impl("sdpa_bwd", _sdpa_bwd_impl, "CUDA")
+_lib.impl("sdpa_bwd_legacy", _sdpa_bwd_legacy_impl, "CUDA")
 
 
-@torch.library.register_fake("cudnn::sdpa_bwd")
-def _sdpa_bwd_fake(
+@torch.library.register_fake("cudnn::sdpa_bwd_legacy")
+def _sdpa_bwd_legacy_fake(
     dO: torch.Tensor,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -800,7 +803,7 @@ def _sdpa_backward(ctx, dO, dStats):
         idx += 1
     cum_kv = saved[idx] if ctx.has_cum_kv else None
 
-    dQ, dK, dV = torch.ops.cudnn.sdpa_bwd(
+    dQ, dK, dV = torch.ops.cudnn.sdpa_bwd_legacy(
         dO,
         q,
         k,
