@@ -3,8 +3,8 @@
 
 """Backend (engine) contract for the Python graph: claim -> compile -> execute.
 
-A backend is one of the interchangeable implementations the Router dispatches
-to (Python DSLs, a naive reference, the cuDNN Graph backend, ...). The
+A backend is one of the interchangeable implementations the ranked plan list
+dispatches to (Python DSLs, a naive reference, the cuDNN Graph backend, ...). The
 lifecycle mirrors a real JIT/DSL engine:
 
   1. ``check_support(graph)`` -> accept, or decline the whole graph by raising
@@ -51,6 +51,18 @@ from .engine_ids import PYTHON_ENGINE_ID_BASE  # noqa: F401 — re-exported for 
 
 if TYPE_CHECKING:
     from ..pygraph import pygraph
+
+
+def decline_types():
+    """The exception types that mean "this engine does not serve this graph".
+
+    ImportError counts: an engine whose optional dependency is absent cannot
+    serve the graph, and since lowering imports are deferred past check_support
+    that only becomes visible at build time.
+    """
+    import cudnn
+
+    return (NotImplementedError, cudnn.cudnnGraphNotSupportedError, ImportError)
 
 
 @dataclass(frozen=True)

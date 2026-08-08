@@ -16,7 +16,7 @@ import torch
 from gemm_test_utils import requires_sm100
 
 import cudnn
-from cudnn.engines import MANIFEST, OUT_OF_TREE_ID_BASE, PlanConfig, Router, is_backend_engine, is_python_engine
+from cudnn.engines import MANIFEST, OUT_OF_TREE_ID_BASE, PlanConfig, heuristics, is_backend_engine, is_python_engine
 
 pytestmark = pytest.mark.L0
 
@@ -262,7 +262,7 @@ def test_ranked_list_routes_and_all_routes_agree(route):
 
 
 @_GPU
-def test_build_walk_falls_through_a_declining_plan(caplog):
+def test_build_walk_falls_through_a_declining_plan(caplog, monkeypatch):
     """A plan that declines at build time is logged and the walk moves to the
     next entry — here a python engine ranked ahead of the backend, so the graph
     still builds and executes natively with no exception reaching the user
@@ -283,13 +283,10 @@ def test_build_walk_falls_through_a_declining_plan(caplog):
 
     boom = Boom()
 
-    class BoomFirst(Router):
-        def plan(self, graph, engines):
-            return [PlanConfig(boom.engine_id)] + graph.backend_plan_entries()
-
     a, b, bias_t, ref = _operands()
     g, A, B, bias, Y = _build_matmul_bias_relu()
-    g.set_router(BoomFirst()).register_backend(boom)
+    monkeypatch.setattr(heuristics, "rank", lambda graph, engines, backend_plans, modes=None: [PlanConfig(boom.engine_id)] + list(backend_plans))
+    g.register_backend(boom)
     _plan(g)
     assert g.get_plan_name_at_index(0) == "frost_fake_always_fails"
     g.check_support()

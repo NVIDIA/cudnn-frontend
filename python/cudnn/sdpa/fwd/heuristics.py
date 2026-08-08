@@ -17,9 +17,13 @@ Per mode:
 - **FALLBACK** — configs that are expected to build wherever mode A might not,
   ordered cheapest-resource first. Nothing here is chosen for speed.
 
-Modes this family has nothing to say about (B, OPENSOURCE) contribute no python
-plans; the backend's entries for them still rank normally. B is treated as A:
-it asks for a wider search than A, and this family has no wider search to give.
+``heur_mode.OPENSOURCE`` asks for an open-source implementation, which is what
+these cells are, so it puts everything FROST can build ahead of the backend
+whatever the measurements say. Tests use it to measure FROST coverage: ask for
+it, and any graph that still lands on a backend plan is one FROST cannot serve.
+
+``heur_mode.B`` is treated as A -- it asks for a wider search than A, and this
+family has no wider search to give.
 """
 
 from __future__ import annotations
@@ -39,20 +43,14 @@ from cudnn.sdpa.fwd.engines import ENGINE_SPECS, Capabilities, SdpaFwdKnobs, mis
 # outlives its evidence.
 _TILE_RULE_CELLS = frozenset({"sdpa_fwd_prefill_sm120", "sdpa_fwd_prefill_sm120_fp8"})
 
-# Where a cell stands against the backend, from measurements only.
-#
-# MEASURED_AHEAD: timed against the backend's own kernel and faster, so its
-# plans lead. sm120 fp8 is 1.20-1.83x the backend's native fp8 fprop across 28
+# Cells timed against the backend's own kernel and found SLOWER: the backend's
+# mode-A entries lead and the cell is the second choice. sm120 fp8 is not here
+# because it measures 1.20-1.83x the backend's native fp8 fprop across 28
 # shapes (docs/fe-oss-apis/attention/sdpa-fp8-sm120.md).
 #
-# MEASURED_BEHIND: timed and slower -- the backend's mode-A entries lead and
-# this cell is the second choice.
-#
-# A cell in NEITHER set has not been timed against the backend. Those keep the
-# historical order (python ahead of the backend), which was a placeholder from
-# when heuristics_sort concatenated the two sides, never a measurement. Moving
-# one is a measurement, not an opinion: time it, then add it to a set.
-_MEASURED_AHEAD = frozenset({"sdpa_fwd_prefill_sm120_fp8"})
+# A cell absent from this set has either measured faster or not been timed at
+# all; both lead, which is deliberate. Coverage does not depend on it -- a
+# caller who wants FROST tried first asks for heur_mode.OPENSOURCE.
 _MEASURED_BEHIND: frozenset = frozenset()
 
 
@@ -124,24 +122,29 @@ def _mode_fallback(facts, offered: Dict[str, int]) -> List[PlanConfig]:
 
 
 def _leads(offered: Dict[str, int], plans: List[PlanConfig]) -> bool:
-    """Whether this family's mode-A plans outrank the backend's.
-
-    Only a cell measured SLOWER than the backend yields the lead; unmeasured
-    cells keep the historical order. See _MEASURED_AHEAD / _MEASURED_BEHIND.
-    """
+    """Whether this family's mode-A plans outrank the backend's. See _MEASURED_BEHIND."""
     behind = {offered[name] for name in _MEASURED_BEHIND if name in offered}
-    return not all(cfg.engine_id in behind for cfg in plans) if plans else False
+    return bool(plans) and not all(cfg.engine_id in behind for cfg in plans)
 
 
 def recommend(modes: List[Any], facts, offered: Dict[str, int], backend_plans: List[PlanConfig]) -> List[PlanConfig]:
     """The ranked plan list for this graph: FROST and backend entries interleaved."""
-    wanted = {m for m in modes}
-    a_modes = {cudnn.heur_mode.A, cudnn.heur_mode.B}
+    wanted = set(modes)
+    # OPENSOURCE wants these cells tried, so it asks for candidates like A does.
+    a_modes = {cudnn.heur_mode.A, cudnn.heur_mode.B, cudnn.heur_mode.OPENSOURCE}
     ours_a = _mode_a(facts, offered) if wanted & a_modes else []
     ours_fb = _mode_fallback(facts, offered) if cudnn.heur_mode.FALLBACK in wanted else []
 
     backend_a = [c for c in backend_plans if c.mode != cudnn.heur_mode.FALLBACK]
     backend_fb = [c for c in backend_plans if c.mode == cudnn.heur_mode.FALLBACK]
+
+    if cudnn.heur_mode.OPENSOURCE in wanted:
+        # The caller asked for an open-source implementation, which is what these
+        # cells are. Everything FROST can build goes first, regardless of which
+        # side measures faster -- that is the mode's whole meaning, and it is how
+        # a test measures FROST coverage: ask for OPENSOURCE, and whatever runs
+        # on a backend plan instead is a graph FROST does not cover yet.
+        return ours_a + ours_fb + backend_a + backend_fb
 
     # Fallbacks last on both sides: a fallback outranking any tuned candidate is
     # what makes a plan walk take a slow kernel while a fast one was available.

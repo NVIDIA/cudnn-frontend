@@ -328,7 +328,7 @@ def test_fp8_sm120_non_128_head_dim_not_offered(D):
 @pytest.mark.parametrize("tiles", [(64, 64), (64, 128), (128, 64), (128, 128)])
 @torch_fork_set_rng(seed=0)
 def test_fp8_sm120_every_enumerated_tile(tiles):
-    """propose_plans offers the whole tile domain, but a shape only ever runs
+    """The heuristics offer the whole tile domain, but a shape only ever runs
     one point of it, so the rest would ship untested. S_q=256 keeps both q_tile
     values meaningful (one full tile at 128, two at 64)."""
     scale = 1.0 / math.sqrt(128)

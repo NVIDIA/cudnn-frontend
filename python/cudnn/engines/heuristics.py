@@ -28,7 +28,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any, List, Optional
 
-from .base import BaseEngine, PlanConfig
+from .base import BaseEngine, PlanConfig, decline_types
 
 if TYPE_CHECKING:
     from .._pygraph import pygraph
@@ -45,8 +45,6 @@ def default_modes() -> List[Any]:
 
 def accepts(engine: BaseEngine, graph: "pygraph") -> bool:
     """Whether ``engine`` will serve ``graph``, declines being routing not error."""
-    from .router import decline_types
-
     try:
         engine.check_support(graph)
     except decline_types() as exc:

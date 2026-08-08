@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""CPU tests for the Router + BaseEngine contract of the unified dispatch.
+"""CPU tests for the ranking + BaseEngine contract of the unified dispatch.
 
-These run without a GPU: they exercise pygraph -> Router -> ONE ranked plan
+These run without a GPU: they exercise pygraph -> heuristics -> ONE ranked plan
 list -> engine-id dispatch, using throwaway engines defined in this file
 (``TorchMatmulEngine`` is the pure-torch matmul(+bias/relu) oracle the execute
 tests run against). This is the CI-safe proof that the unification contract
@@ -11,7 +11,7 @@ works end to end.
 
 There is ONE plan list: the python engines that claim the graph (registered
 here plus whatever ``engines/manifest.py`` matches) and the backend's own
-ranked entries, merged by ``engines.heuristics.heuristics_sort``. Which of
+ranked entries, ordered by ``engines.heuristics.rank``. Which of
 those participate depends on the machine, so every assertion below addresses a
 plan by NAME or engine id and pins it with ``select_plan()`` — never by a
 hard-coded absolute index.
@@ -22,7 +22,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from cudnn._pygraph import pygraph
-from cudnn.engines import BaseEngine, Router, OUT_OF_TREE_ID_BASE, is_backend_engine, is_python_engine
+from cudnn.engines import BaseEngine, OUT_OF_TREE_ID_BASE, is_backend_engine, is_python_engine
 from cudnn.engines.base import resolve_node_buffers
 from cudnn.engines.engine_ids import BACKEND_HEURISTIC_ENGINE_ID
 from cudnn.graph_types import NodeType
@@ -136,7 +136,9 @@ def test_router_plan_list_includes_supporting_engines_then_cudnn():
     g.matmul(a, b, name="mm")
     g.register_backend(Accepts()).register_backend(Declines())
 
-    plans = Router().plan(g, g.backends)
+    from cudnn.engines import heuristics
+
+    plans = heuristics.rank(g, g.backends, g.backend_plan_entries())
     ids = [p.engine_id for p in plans]
     assert _OOT + 10 in ids  # the supporting python engine
     assert _OOT + 50 not in ids  # the declining one never joins
@@ -283,16 +285,16 @@ def test_no_python_engine_plan_list_is_backend_only():
     b = g.tensor(dim=[8, 4], name="B")
     g.matmul(a, b, name="mm")
 
-    from cudnn.engines.router import default_router
+    from cudnn.engines import heuristics
 
-    plans = default_router.plan(g, [])
+    plans = heuristics.rank(g, [], g.backend_plan_entries())
     assert all(is_backend_engine(p.engine_id) for p in plans)
     g._plans = plans
     assert g.selected_engine is None  # backend path
 
 
-def test_compiled_plan_lifecycle_knobs_and_reuse():
-    """Review item 1 acceptance: multiple knob proposals from one engine; the
+def test_compiled_plan_lifecycle_knobs_and_reuse(monkeypatch):
+    """Review item 1 acceptance: several knob candidates for one engine; the
     selected plan's knobs reach build_plan; compilation runs once per plan and
     the artifact is reused; caller workspace + stream context reach execute."""
     from cudnn.engines import CompiledPlan, PlanConfig
@@ -314,15 +316,18 @@ def test_compiled_plan_lifecycle_knobs_and_reuse():
         name = "tunable"
         engine_id = _OOT + 40
 
-        def propose_plans(self, graph):
-            return [PlanConfig(self.engine_id, {"tile": 128}), PlanConfig(self.engine_id, {"tile": 256})]
-
         def build_plan(self, graph, plan, ctx=None):
             compiled_log.append(plan.knobs)
             return TunablePlan(plan.knobs)
 
+    tunable = Tunable()
+    _ranking(
+        monkeypatch,
+        lambda graph, engines, backend_plans, modes=None: [PlanConfig(tunable.engine_id, {"tile": 128}), PlanConfig(tunable.engine_id, {"tile": 256})],
+    )
+
     g = pygraph()
-    g.register_backend(Tunable())
+    g.register_backend(tunable)
     C = g.matmul(torch.randn(2, 2), torch.randn(2, 2))
     g.create_execution_plans()
     tuned = _python_indices(g)
@@ -342,12 +347,23 @@ def test_compiled_plan_lifecycle_knobs_and_reuse():
 
     # same engine instance on a second graph: no state collision
     g2 = pygraph()
-    g2.register_backend(Tunable())
+    g2.register_backend(tunable)
     C2 = g2.matmul(torch.randn(2, 2), torch.randn(2, 2))
     g2.create_execution_plans()
     g2.select_plan(_python_indices(g2)[0])
     g2.execute({C2: torch.empty(2, 2)})
     assert compiled_log == [{"tile": 256}, {"tile": 128}]  # g2 compiled its own plan
+
+
+def _ranking(monkeypatch, fn):
+    """Replace the ranking policy for one graph's planning.
+
+    What a Router subclass used to do. Ranking has one home now, so a test
+    that wants a specific order says so here rather than by subclassing.
+    """
+    from cudnn.engines import heuristics
+
+    monkeypatch.setattr(heuristics, "rank", fn)
 
 
 def _mk_engine(id_off, knobs=None, log=None):
@@ -363,10 +379,11 @@ def _mk_engine(id_off, knobs=None, log=None):
     class _E(BaseEngine):
         name = f"e{id_off}"
         engine_id = _OOT + id_off
-        default_knobs = knobs
 
         def build_plan(self, graph, plan, ctx=None):
-            return _Plan(plan.knobs)
+            # The ranking names the knobs now; this fake keeps its own marker
+            # for the entries a test did not give any.
+            return _Plan(plan.knobs if plan.knobs is not None else knobs)
 
         def execute(self, graph, tensor_data, ctx=None):
             pass
@@ -392,9 +409,10 @@ def test_planning_is_one_shot():
     assert log[-1] == "old"  # the planned artifact, unchanged
 
 
-def test_mixed_router_ordering_dispatch(monkeypatch):
-    """Follow-up item 2: dispatch honors arbitrary Router ordering (backend
-    entry in the middle), never a python-prefix assumption.
+def test_mixed_ranking_dispatch(monkeypatch):
+    """Follow-up item 2: dispatch honors arbitrary ranking (a backend entry in
+    the MIDDLE), never a python-prefix assumption. Not hypothetical any more --
+    the sdpa-fwd heuristics place backend entries between their own.
 
     The backend's own entries are stubbed so the ordering is the same with or
     without a cuDNN that accepts this toy graph; real execution THROUGH the
@@ -408,11 +426,11 @@ def test_mixed_router_ordering_dispatch(monkeypatch):
     stub = PlanConfig(0, {}, cpp_index=0)
     monkeypatch.setattr(pygraph, "backend_plan_entries", lambda self: [stub])
 
-    class Interleaved(Router):
-        def plan(self, graph, backends):
-            return [PlanConfig(ea.engine_id, "A")] + graph.backend_plan_entries() + [PlanConfig(eb.engine_id, "B")]
+    _ranking(
+        monkeypatch, lambda graph, engines, backend_plans, modes=None: [PlanConfig(ea.engine_id, "A")] + list(backend_plans) + [PlanConfig(eb.engine_id, "B")]
+    )
 
-    g = pygraph(router=Interleaved())
+    g = pygraph()
     g.register_backend(ea).register_backend(eb)
     C = g.matmul(torch.randn(2, 2), torch.randn(2, 2))
     g.create_execution_plans()
@@ -455,50 +473,35 @@ def test_pinned_plan_that_declines_raises():
         g.build_plans()
 
 
-def test_empty_router_output_rejected():
-    """A Router returning [] is an error — there is no legal empty planning
+def test_empty_ranking_output_rejected(monkeypatch):
+    """Ranking that returns [] is an error — there is no legal empty planning
     state (it would defeat the one-shot flag and every needs-planning check)."""
     import cudnn
 
-    class Empty(Router):
-        def plan(self, graph, backends):
-            return []
+    _ranking(monkeypatch, lambda graph, engines, backend_plans, modes=None: [])
 
-    g = pygraph(router=Empty())
+    g = pygraph()
     g.matmul(torch.randn(2, 2), torch.randn(2, 2))
     with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="no engine"):
         g.create_execution_plans()
-    # the failed call did NOT consume the one-shot: fixing the router by
+    # the failed call did NOT consume the one-shot: fixing the ranking by
     # rebuilding the graph is the documented path, but the graph must not be
     # left half-planned either
     assert not g._planning_done
 
 
-def test_set_router_frozen_after_planning():
-    """set_router() after planning raises (it could not affect the already
-    planned list; accepting it silently would lie)."""
-    g = pygraph()
-    g.register_backend(_mk_engine(70))
-    g.matmul(torch.randn(2, 2), torch.randn(2, 2))
-    g.create_execution_plans()
-    with pytest.raises(RuntimeError, match="one-shot"):
-        g.set_router(Router())
-
-
-def test_plan_count_is_the_whole_ranked_list():
+def test_plan_count_is_the_whole_ranked_list(monkeypatch):
     """get_execution_plan_count() counts ONE list — python engines and backend
     engines alike (``graph.plans``), so a python-only graph reports its python
     plans instead of raising."""
 
     eng = _mk_engine(71)
 
-    class PythonOnly(Router):
-        def plan(self, graph, backends):
-            from cudnn.engines import PlanConfig
+    from cudnn.engines import PlanConfig
 
-            return [PlanConfig(eng.engine_id)]  # ``backends`` also holds the in-tree candidates
+    _ranking(monkeypatch, lambda graph, engines, backend_plans, modes=None: [PlanConfig(eng.engine_id)])
 
-    g = pygraph(router=PythonOnly())
+    g = pygraph()
     g.register_backend(eng)
     C = g.matmul(torch.randn(2, 2), torch.randn(2, 2))
     g.create_execution_plans()
@@ -508,9 +511,9 @@ def test_plan_count_is_the_whole_ranked_list():
     g.execute({C: torch.empty(2, 2)})  # the routed python plan still runs
 
 
-def test_constructor_backends_validated_and_proposals_checked():
-    """Follow-up item 6: constructor path uses registration validation; foreign
-    engine ids in proposals are rejected."""
+def test_constructor_backends_validated_and_ranking_ids_checked(monkeypatch):
+    """Follow-up item 6: constructor path uses registration validation; a
+    ranking naming an id no engine owns is rejected."""
     from cudnn.engines import PlanConfig
 
     class NoId(BaseEngine):
@@ -520,19 +523,17 @@ def test_constructor_backends_validated_and_proposals_checked():
     with pytest.raises(ValueError, match="engine_id"):
         pygraph(backends=[NoId()])
 
-    class Impostor(BaseEngine):
-        name = "impostor"
+    class Ordinary(BaseEngine):
+        name = "ordinary"
         engine_id = _OOT + 63
-
-        def propose_plans(self, graph):
-            return [PlanConfig(_OOT + 99, None)]  # foreign id
 
         def execute(self, graph, tensor_data, ctx=None):
             pass
 
-    g = pygraph(backends=[Impostor()])
+    _ranking(monkeypatch, lambda graph, engines, backend_plans, modes=None: [PlanConfig(_OOT + 99, None)])
+    g = pygraph(backends=[Ordinary()])
     g.matmul(torch.randn(2, 2), torch.randn(2, 2))
-    with pytest.raises(ValueError, match="foreign engine_id"):
+    with pytest.raises(ValueError, match="unknown python engine_id"):
         g.create_execution_plans()
 
 
@@ -584,17 +585,6 @@ def _family(name):
     return next(f for f in MANIFEST if f.name == name)
 
 
-def test_a_claiming_engine_is_tried_before_the_backend():
-    """Ranking the python side second is how the frost job reported 0/3201
-    graphs on FROST while passing. The opt-in is not a ranking concept: it
-    decides which engines are offered, in manifest.EngineFamily.matches."""
-    from cudnn.engines import heuristics
-    from cudnn.engines.base import PlanConfig
-
-    py, be = [PlanConfig(_OOT + 0, None)], [PlanConfig(0, {}, cpp_index=0)]
-    assert heuristics.heuristics_sort(None, py, be) == py + be
-
-
 def test_note_filters_reach_python_plans(monkeypatch):
     """The four classic note filters used to fall through to C++, so they
     filtered backend plans and silently skipped every python one. A python
@@ -633,7 +623,7 @@ def test_note_filters_reach_python_plans(monkeypatch):
     assert idx not in g._barred_indices(), "engine declares no numerical notes"
 
 
-def test_a_barred_note_advances_the_walk():
+def test_a_barred_note_advances_the_walk(monkeypatch):
     """Barring by note must change which plan RUNS, not just _barred_indices()."""
     import cudnn
 
@@ -644,12 +634,10 @@ def test_a_barred_note_advances_the_walk():
         engine_id = _OOT + 81
         behavior_notes = (cudnn.behavior_note.RUNTIME_COMPILATION,)
 
-    class PythonFirst(Router):
-        def plan(self, graph, engines):
-            return self.python_plans(graph, engines) + [PlanConfig(0, {}, cpp_index=0)]
+    _ranking(monkeypatch, lambda graph, engines, backend_plans, modes=None: [PlanConfig(e.engine_id, None) for e in engines] + [PlanConfig(0, {}, cpp_index=0)])
 
     def _fresh():
-        g = pygraph(router=PythonFirst())
+        g = pygraph()
         g.register_backend(Jitted())
         C = g.matmul(torch.randn(2, 3), torch.randn(3, 2))
         g._lowered_graph = _FakeBackend()
@@ -719,16 +707,18 @@ def test_a_note_filter_set_before_planning_reaches_the_backend():
     g.deselect_behavior_notes([cudnn.behavior_note.RUNTIME_COMPILATION])
     assert fake.calls == [], "nothing to filter yet — the backend has no plans"
     g._create_backend_plans()
-    assert fake.calls == ["create_execution_plans", "deselect_behavior_notes"], fake.calls
+    # One create_execution_plans per heuristic mode (A, FALLBACK): that is how
+    # the backend's entries get tagged with the mode that produced them.
+    assert fake.calls == ["create_execution_plans", "create_execution_plans", "deselect_behavior_notes"], fake.calls
 
 
-def test_cuda_graph_capture_declines_a_python_plan():
+def test_cuda_graph_capture_declines_a_python_plan(monkeypatch):
     """populate/update_cuda_graph record the BACKEND's plan. On a python plan
     they used to reach __getattr__ and report "graph not lowered yet", which
     points at the wrong thing."""
     import cudnn
 
-    g, C = _backend_first()
+    g, C = _backend_first(monkeypatch)
     _pin(g, "torch_matmul")
     g.build_plans()
     for name in ("populate_cuda_graph", "update_cuda_graph"):
@@ -983,10 +973,13 @@ def test_ranking_and_engine_read_the_same_record(monkeypatch):
 
     seen = {}
 
-    class Recording(Router):
-        def plan(self, graph, engines):
-            seen["ranking"] = graph._facts_for(_probe_analyzer)
-            return super().plan(graph, engines)
+    from cudnn.engines import heuristics
+
+    real_rank = heuristics.rank
+
+    def recording_rank(graph, engines, backend_plans, modes=None):
+        seen["ranking"] = graph._facts_for(_probe_analyzer)
+        return real_rank(graph, engines, backend_plans, modes)
 
     class Reader(TorchMatmulEngine):
         name = "reader"
@@ -1002,7 +995,8 @@ def test_ranking_and_engine_read_the_same_record(monkeypatch):
     monkeypatch.setattr(manifest, "MANIFEST", (family,))
     monkeypatch.setattr(manifest, "_ANCHOR_NODE_TO_FAMILY", {"MATMUL": "probe_family"})
 
-    g = pygraph(router=Recording(), backends=[Reader()])
+    monkeypatch.setattr(heuristics, "rank", recording_rank)
+    g = pygraph(backends=[Reader()])
     g.matmul(torch.randn(2, 3), torch.randn(3, 2))
     g.create_execution_plans()
 
@@ -1010,7 +1004,7 @@ def test_ranking_and_engine_read_the_same_record(monkeypatch):
     assert len(_PROBE_CALLS) == 1, "one graph, one parse"
 
 
-def test_facts_are_recomputed_when_the_graph_grows():
+def test_facts_are_recomputed_when_the_graph_grows(monkeypatch):
     """Facts describe the graph AS READ; a graph that gained a node since is a
     different graph."""
 
@@ -1076,15 +1070,13 @@ class _FakeBackend:
         return self
 
 
-def _backend_first(*, check=None, build=None):
+def _backend_first(monkeypatch, *, check=None, build=None):
     """A graph whose ranked list is [backend, python], with a scripted backend."""
     from cudnn.engines.base import PlanConfig
 
-    class BackendFirst(Router):
-        def plan(self, graph, engines):
-            return [PlanConfig(0, {}, cpp_index=0)] + self.python_plans(graph, engines)
+    _ranking(monkeypatch, lambda graph, engines, backend_plans, modes=None: [PlanConfig(0, {}, cpp_index=0)] + [PlanConfig(e.engine_id, None) for e in engines])
 
-    g = pygraph(router=BackendFirst())
+    g = pygraph()
     g.register_backend(TorchMatmulEngine())
     C = g.matmul(torch.randn(2, 3), torch.randn(3, 2))
     g._lowered_graph = _FakeBackend(check=check, build=build)
@@ -1092,14 +1084,16 @@ def _backend_first(*, check=None, build=None):
     return g, C
 
 
-def test_backend_check_support_decline_does_not_abort_the_walk():
+def test_backend_check_support_decline_does_not_abort_the_walk(monkeypatch):
     """An aggregate backend check_support() answers for the BACKEND, not for one
     plan. Letting it raise from build() aborted the walk before it reached a
     python entry that can serve the graph."""
     import cudnn
 
     g, C = _backend_first(
-        check=cudnn.cudnnGraphNotSupportedError("backend cannot serve this graph"), build=cudnn.cudnnGraphNotSupportedError("backend cannot serve this graph")
+        monkeypatch,
+        check=cudnn.cudnnGraphNotSupportedError("backend cannot serve this graph"),
+        build=cudnn.cudnnGraphNotSupportedError("backend cannot serve this graph"),
     )
     g.build()
     assert g.selected_engine is not None and g.selected_engine.name == "torch_matmul"
@@ -1135,11 +1129,9 @@ def test_execute_time_handle_reaches_a_lazily_built_python_plan(monkeypatch):
 
     from cudnn.engines.base import PlanConfig
 
-    class BackendFirst(Router):
-        def plan(self, graph, engines):
-            return [PlanConfig(0, {}, cpp_index=0)] + self.python_plans(graph, engines)
+    _ranking(monkeypatch, lambda graph, engines, backend_plans, modes=None: [PlanConfig(0, {}, cpp_index=0)] + [PlanConfig(e.engine_id, None) for e in engines])
 
-    g = pygraph(router=BackendFirst())
+    g = pygraph()
     g.register_backend(Recording())
     C = g.matmul(torch.randn(2, 3), torch.randn(3, 2))
     g._lowered_graph = _FakeBackend(build=cudnn.cudnnGraphNotSupportedError("backend build declined"))
@@ -1168,10 +1160,10 @@ def test_backend_runtime_error_is_not_a_decline():
         g.backend_plan_entries()
 
 
-def test_pinned_plan_that_was_deselected_raises():
+def test_pinned_plan_that_was_deselected_raises(monkeypatch):
     """select_plan() and deselect_engines() contradicting each other is a caller
     error, not a licence to run a third plan."""
-    g, C = _backend_first()
+    g, C = _backend_first(monkeypatch)
     g.create_execution_plans()
     idx = _index_of(g, "torch_matmul")
     g.select_plan(idx)
@@ -1275,7 +1267,7 @@ def test_a_lying_owns_id_cannot_capture_another_engines_plans():
         g._engine_for(PlanConfig(family.engine_id, None))
 
 
-def test_replayed_backend_entry_addresses_the_plan_it_replayed():
+def test_replayed_backend_entry_addresses_the_plan_it_replayed(monkeypatch):
     """``create_execution_plan`` APPENDS in C++ and ``build_plans`` short-circuits
     once a candidate exists, so a replayed entry must be addressed by the index it
     landed at — the plain calls would run whichever plan the backend already had."""
@@ -1306,11 +1298,9 @@ def test_replayed_backend_entry_addresses_the_plan_it_replayed():
 
     from cudnn.engines.base import PlanConfig
 
-    class ReplayRouter(Router):
-        def plan(self, graph, engines):
-            return [PlanConfig(0, {}, cpp_index=0), PlanConfig(7, {})]  # the 2nd is a replay
+    _ranking(monkeypatch, lambda graph, engines, backend_plans, modes=None: [PlanConfig(0, {}, cpp_index=0), PlanConfig(7, {})])  # the 2nd is a replay
 
-    g = pygraph(router=ReplayRouter())
+    g = pygraph()
     g.matmul(torch.randn(2, 3), torch.randn(3, 2))
     be = FakeAppendingBackend()
     g._lowered_graph = be
@@ -1380,7 +1370,7 @@ def test_backend_lowering_decline_hands_the_graph_to_a_python_engine():
 
 
 def test_the_router_output_is_the_plan_list_position_for_position(monkeypatch):
-    """Nothing rewrites what a Router returned. The delegating entry that
+    """Nothing rewrites what the ranking returned. The delegating entry that
     backend_plan_entries() appends under heur_mode.OPENSOURCE used to share its
     id with a 'the backend goes here' placeholder the frontend expanded, so
     planning spliced the backend's whole list in a second time — wrong count,
@@ -1431,7 +1421,7 @@ def test_the_opensource_delegating_entry_outranks_the_concrete_plans(monkeypatch
 
 def test_backend_entries_are_queried_once_per_graph():
     """A second C++ create_execution_plans() APPENDS to the same plan list, so
-    asking the backend twice reports every plan twice. The Router and the marker
+    asking the backend twice reports every plan twice. The ranking and the marker
     expansion both ask."""
     g = pygraph()
     g.register_backend(TorchMatmulEngine())
@@ -1440,12 +1430,12 @@ def test_backend_entries_are_queried_once_per_graph():
     assert g.backend_plan_entries() is first
 
 
-def test_at_index_build_honours_the_exclusions():
+def test_at_index_build_honours_the_exclusions(monkeypatch):
     """deselect_engines() / deselect_workspace_greater_than() are properties of
     the plan, not of the walk: the list is never filtered (indices stay stable),
     so build_plan_at_index() has to apply them too or it compiles and selects a
     plan the caller excluded."""
-    g, C = _backend_first()
+    g, C = _backend_first(monkeypatch)
     g.create_execution_plans()
     idx = _index_of(g, "torch_matmul")
     g.deselect_engines(["torch_matmul"])
@@ -1475,10 +1465,10 @@ def test_at_index_build_honours_the_workspace_cap():
         g.build_plan_at_index(idx)
 
 
-def test_behaviour_notes_reject_a_negative_index():
+def test_behaviour_notes_reject_a_negative_index(monkeypatch):
     """Python indexing would quietly answer for the LAST plan; every other
     at-index API rejects it."""
-    g, C = _backend_first()
+    g, C = _backend_first(monkeypatch)
     g.create_execution_plans()
     with pytest.raises(IndexError, match="out of range"):
         g.get_behavior_notes_for_plan_at_index(-1)
@@ -1519,11 +1509,11 @@ def test_frost_opt_in_does_not_leak_out_of_the_frost_suites():
     assert not manifest.opt_in_engines_enabled(), "CUDNN_FRONTEND_ENABLE_FROST_ENGINES leaked into the default-path tests"
 
 
-def test_at_index_queries_answer_from_the_unified_list():
+def test_at_index_queries_answer_from_the_unified_list(monkeypatch):
     """get_engine_and_knobs_at_index() must describe the plan the caller just
     saw at that index — forwarding a unified index to C++ reported the backend's
     entry for a python plan's slot."""
-    g, C = _backend_first()
+    g, C = _backend_first(monkeypatch)
     g.create_execution_plans()
     idx = _index_of(g, "torch_matmul")
     eid, knobs = g.get_engine_and_knobs_at_index(idx)
@@ -1532,11 +1522,11 @@ def test_at_index_queries_answer_from_the_unified_list():
     assert g.get_behavior_notes_for_plan_at_index(idx) == []  # engine declares none
 
 
-def test_create_execution_plan_appends_a_python_plan():
+def test_create_execution_plan_appends_a_python_plan(monkeypatch):
     """The deterministic-replay idiom: record (engine_id, knobs), rebuild it
     later, address it with count-1. It has to work for a python engine id too,
     or 'one id space' is only true for the backend."""
-    g, C = _backend_first()
+    g, C = _backend_first(monkeypatch)
     g.create_execution_plans()
     before = g.get_execution_plan_count()
     g.create_execution_plan(TorchMatmulEngine.engine_id, None)

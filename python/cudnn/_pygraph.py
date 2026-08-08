@@ -5,11 +5,11 @@
 
 All graph structure and attributes are kept in Python. Graph construction is
 backend-agnostic; a backend is chosen at create_execution_plans() time by the
-Router, and the backend-specific representation (e.g. the C++ cuDNN graph) is
+heuristics, and the backend-specific representation (e.g. the C++ cuDNN graph) is
 generated lazily only then.
 
 Execution flow (unification proposal):
-    build ops -> create_execution_plans() -> Router -> selected backend
+    build ops -> create_execution_plans() -> heuristics -> selected backend
     (a registered native engine, or the cuDNN Graph backend by lazy lowering)
 
 Example with a native backend (pass torch tensors directly):
@@ -128,7 +128,7 @@ class pygraph:
         self._is_built: bool = False
         self._data_bindings: Dict[int, Any] = {}  # uid -> tensor data for auto-bound inputs
 
-        # Backend routing (see engines/router.py). Graph construction is
+        # Backend routing (see engines/heuristics.py). Graph construction is
         # backend-agnostic. At create_execution_plans() the heuristics build a
         # flat ranked plan list (python engines + cuDNN) in one shared engine-id
         # space; each plan is dispatched by its id (is_python_engine -> python
@@ -242,7 +242,7 @@ class pygraph:
     def _owners_for_id(self, engine_id: int) -> List["BaseEngine"]:
         """Candidate engines whose DECLARED range contains ``engine_id``.
 
-        The single owner lookup: dispatch, the Router's output validation and
+        The single owner lookup: dispatch, the ranking's output validation and
         replay all go through it, so "who runs this id" has one answer computed
         one way. Never a subclass predicate — registration can prove intervals
         disjoint, and cannot prove anything about an arbitrary ``owns_id``."""
@@ -830,7 +830,7 @@ class pygraph:
     def build_operation_graph(self) -> None:
         """Validate the graph; lower to C++ when no python engines are registered.
 
-        Backend selection is deferred to create_execution_plans() (the Router
+        Backend selection is deferred to create_execution_plans() (the heuristics
         stage). With python engines registered, nothing is lowered here (a graph
         routed to a python engine never touches C++). Without them — the classic
         sequencing — lowering happens now, so plan-configuration and query
@@ -891,7 +891,7 @@ class pygraph:
         if not self._is_validated:
             self.validate()
 
-        from .engines import router
+        from .engines.heuristics import rank
 
         # One-shot planning (classic conformance: the C++ graph never supported
         # re-planning — a second call there appends plans by accident, and no
@@ -910,14 +910,14 @@ class pygraph:
         # lands (a no-op for a graph that was never lowered), and it writes
         # through object.__setattr__ precisely to bypass the freeze — so the
         # snapshot has to come after it, not merely after validate(). Doing it
-        # here rather than inside Router keeps the epoch boundary out of
+        # here rather than inside the heuristics keeps the epoch boundary out of
         # overridable policy: every engine probe and the ranking then read one
         # set of facts describing a graph that can no longer change.
         self._finalize_backend_layout()
         self._freeze()
         self._attach_facts()
 
-        plans = list(router.plan(self, self._candidate_engines()))
+        plans = list(rank(self, self._candidate_engines(), self.backend_plan_entries(), self._backend_heuristics))
         # Validate the FINAL ranking: every entry must name an engine this graph
         # can actually dispatch to.
         from .engines.engine_ids import is_python_engine
@@ -964,7 +964,7 @@ class pygraph:
         A failure here is the backend DECLINING (a python engine may still
         serve the graph), recorded as backend_plan_entries() records one. Not
         routed through that, which also runs the ~178 ms C++ plan query a
-        Router may never ask for.
+        the heuristics may never ask for.
         """
         import cudnn
 
@@ -1057,7 +1057,7 @@ class pygraph:
 
         Answered ONCE per graph: a second C++ create_execution_plans() appends
         to the same plan list (``enqueue_engine_configs`` -> ``back_inserter``),
-        so re-querying would report every backend plan twice. A Router may
+        so re-querying would report every backend plan twice. The heuristics may
         therefore call it freely to place the entries where it wants.
         """
         import cudnn
@@ -1367,7 +1367,7 @@ class pygraph:
     def _materialize_backend_plan(self, index: int):
         """Ensure the backend entry at ``index`` has a real C++ plan index.
 
-        A replayed entry (``cpp_index=None``, from a custom Router or an
+        A replayed entry (``cpp_index=None``, from custom heuristics or an
         autotune result) does not exist in the backend's list until it is
         appended. Every entry point that needs a concrete plan — check_support,
         the build walk, workspace, behaviour notes, execute — goes through here,
@@ -1413,7 +1413,7 @@ class pygraph:
         what makes "backend first, python next" actually reachable; if nothing
         builds, the walk raises with every failure listed.
         """
-        from .engines.router import decline_types
+        from .engines.base import decline_types
 
         eng = self.selected_engine
         if eng is not None:
@@ -1449,7 +1449,7 @@ class pygraph:
         """
         import cudnn
 
-        from .engines.router import decline_types
+        from .engines.base import decline_types
 
         if not self._planning_done:
             self.create_execution_plans()

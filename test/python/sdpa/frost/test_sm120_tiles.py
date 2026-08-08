@@ -6,7 +6,7 @@
 One rule for both cells (fp8 and f16): the fp8 and bf16 sweeps disagree on how
 much each tile wins by, never on which one wins. The rule half needs no device
 -- it is arithmetic over shape and SM count. The correctness half does, because
-propose_plans exposes tiles the default never picks, and nothing else in the
+the heuristics expose tiles the best guess never picks, and nothing else in the
 suite runs a kernel at those.
 """
 
