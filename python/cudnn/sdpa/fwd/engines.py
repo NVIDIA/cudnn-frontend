@@ -157,6 +157,11 @@ class Capabilities:
     # that keep False (the SM100 FP8/MXFP8 flavors) always write an LSE and get
     # a carved dummy from lower_dsl_prefill when the graph has no Stats output.
     lse_optional: bool = False
+    # THD lowerings assume FULLY-PACKED storage: the packed addressing is
+    # re-derived as prefix(lens) x token stride, and the graph's bound
+    # ragged-offset values are never read. TE-style padded THD (offsets
+    # from cu_seqlens_padded != cu_seqlens, gaps between sequences) is NOT
+    # served — and being runtime data, cannot be declined at plan time.
     thd: bool = False
     # cu_seq_len_q / cu_seq_len_kv (B+1,) prefix sums (cuDNN 9.24+). Serving
     # rows consume the form on THD host-side (lens = adjacent differences of
