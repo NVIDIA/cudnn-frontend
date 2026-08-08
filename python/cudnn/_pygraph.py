@@ -1276,7 +1276,11 @@ class pygraph:
 
         if self._cpp_plans_created:
             return
-        modes = self._backend_heuristics or [cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK]
+        from .engines.heuristics import default_modes
+
+        # The SAME default the ranking assumes: two copies of it means querying
+        # the backend for modes no family will place.
+        modes = self._backend_heuristics or default_modes()
         at, failure = self._lowered_graph.get_execution_plan_count(), None
         for mode in modes:
             try:
