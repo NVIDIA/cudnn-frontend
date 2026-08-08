@@ -52,11 +52,21 @@ from cudnn.tensor_adapter import (
 )
 
 
+def _uses_2cta_instrs(mma_tiler_mn: Tuple[int, int]) -> bool:
+    """An M tile of 256 is the 2-CTA MMA shape -- tcgen05 pairs two CTAs to cover it.
+
+    check_support enforces the pairing: M must be 256 with 2-CTA instructions and 128
+    without, so the tile size and the instruction form carry the same information.
+    """
+    return mma_tiler_mn[0] == 256
+
+
 def _resolve_cluster_shape_mn(mma_tiler_mn: Tuple[int, int], cluster_shape_mn: Optional[Tuple[int, int]]) -> Tuple[int, int]:
     """The cluster shape the kernel will actually run with, defaults applied."""
     if cluster_shape_mn is not None:
         return cluster_shape_mn
-    return (2, 1) if mma_tiler_mn[0] == 256 else (1, 1)
+    # 2-CTA MMA needs both CTAs of the pair in the same cluster along M.
+    return (2, 1) if _uses_2cta_instrs(mma_tiler_mn) else (1, 1)
 
 
 def _dprob_n_slots(n_out: int, mma_tiler_mn: Tuple[int, int], cluster_shape_mn: Optional[Tuple[int, int]], deterministic: bool) -> int:
@@ -299,7 +309,7 @@ class GroupedGemmDsreluSm100(APIBase):
         # ---- Configuration ----
         self.acc_dtype = _convert_to_cutlass_data_type(acc_dtype)
         self.mma_tiler_mn = mma_tiler_mn
-        self.use_2cta_instrs = mma_tiler_mn[0] == 256
+        self.use_2cta_instrs = _uses_2cta_instrs(mma_tiler_mn)
         self.cluster_shape_mn = _resolve_cluster_shape_mn(mma_tiler_mn, cluster_shape_mn)
         self.sf_vec_size = sf_vec_size
         self.vector_f32 = vector_f32
