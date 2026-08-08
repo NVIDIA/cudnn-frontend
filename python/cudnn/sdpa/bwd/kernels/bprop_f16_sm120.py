@@ -18,7 +18,7 @@ fp32 workspace and finalized by a small convert kernel.
 
 Constraints:
 * Supported input dtypes: Float16 and BFloat16 (output dtype matches)
-* Head dimension must be one of 32, 64, or 128
+* Head dimension must be one of 32, 64, 128, 192, or 256
 * Equal Q/KV head counts (no GQA); no dropout/alibi/softcap
 * Optional causal (top-left or bottom-right) and sliding-window masks
 * Q/K/V/O/dO/dQ/dK/dV use compact BSHD storage
@@ -266,6 +266,127 @@ def mma_abregs(
                 acc[s + 3] = c3
 
 
+@cute.jit
+def _bwd_gemm4_dq(
+    acc_dq,
+    sdS,
+    sK,
+    wq,
+    wd_q,
+    lane,
+    *,
+    DQ_REPS: cutlass.Constexpr[int],
+    DQ_NF: cutlass.Constexpr[int],
+    KV_CHUNKS: cutlass.Constexpr[int],
+    WM_DQ: cutlass.Constexpr[int],
+    M: cutlass.Constexpr[int],
+    N: cutlass.Constexpr[int],
+    PDS: cutlass.Constexpr[int],
+    PAGE: cutlass.Constexpr[int],
+    DQ_PER: cutlass.Constexpr[int],
+    io_dtype: cutlass.Constexpr[Type[cutlass.Numeric]],
+):
+    """GEMM 4: acc_dq = dS @ K^T (reads only sdS/sK, never sQ)."""
+    for i in cutlass.range_constexpr(DQ_REPS * DQ_NF * 4):
+        acc_dq[i] = cutlass.Float32(0.0)
+    for kc in cutlass.range_constexpr(KV_CHUNKS):
+        af = []
+        for rep in cutlass.range_constexpr(DQ_REPS):
+            sf = load_a_frag(sdS, kc, wq * 16 + rep * 16 * WM_DQ, lane, rows=M, page=PDS)
+            af = af + [sf[0], sf[1], sf[2], sf[3]]
+        mma_bstream(
+            acc_dq,
+            af,
+            sK,
+            b_k_step=kc,
+            M=16 * DQ_REPS,
+            N=DQ_PER,
+            b_trans=True,
+            b_rows=N,
+            b_page=PAGE,
+            lane=lane,
+            ab_dtype=io_dtype,
+            col_base=wd_q * DQ_PER,
+        )
+
+
+@cute.jit
+def _bwd_dq_scatter(
+    acc_dq,
+    dqa_ptr,
+    dqa_base,
+    math_tidx,
+    H,
+    *,
+    DQ_REPS: cutlass.Constexpr[int],
+    DQ_NF: cutlass.Constexpr[int],
+    M: cutlass.Constexpr[int],
+    d: cutlass.Constexpr[int],
+):
+    """dQ accumulate into the scrambled dq_accum workspace."""
+    t_r = math_tidx // 32
+    t_c = math_tidx % 32
+    for rep in cutlass.range_constexpr(DQ_REPS):
+        for nf in cutlass.range_constexpr(DQ_NF):
+            for hv in cutlass.range_constexpr(2):
+                i_pair = hv + rep * 2 + nf * 2 * DQ_REPS
+                if cutlass.const_expr(d >= 64):
+                    jm = i_pair % (M // 8)
+                    jn = i_pair // (M // 8)
+                    addr = dqa_base + (t_r + jm * 8) * (H * d) + t_c * 2 + jn * 64
+                else:
+                    addr = dqa_base + (t_r + (t_c // 16) * 8 + i_pair * 16) * (H * d) + (t_c % 16) * 2
+                poff = (rep * DQ_NF + nf) * 4 + hv * 2
+                _red_add_f32x2(dqa_ptr + addr, acc_dq[poff + 0], acc_dq[poff + 1])
+
+
+@cute.jit
+def _bwd_gemm5_dk(
+    acc_dk,
+    sdS,
+    sQ_st,
+    wn_k,
+    wd_k,
+    lane,
+    *,
+    Q_CHUNKS: cutlass.Constexpr[int],
+    DKV_REPS: cutlass.Constexpr[int],
+    WM_DKV: cutlass.Constexpr[int],
+    M: cutlass.Constexpr[int],
+    PDS: cutlass.Constexpr[int],
+    PAGE: cutlass.Constexpr[int],
+    DKV_PER: cutlass.Constexpr[int],
+    io_dtype: cutlass.Constexpr[Type[cutlass.Numeric]],
+):
+    """GEMM 5: acc_dk += dS^T @ Q (the iteration's last sQ reader)."""
+    for kc in cutlass.range_constexpr(Q_CHUNKS):
+        af = []
+        for rep in cutlass.range_constexpr(DKV_REPS):
+            sf = load_a_frag_transposed(
+                sdS,
+                kc,
+                wn_k * 16 + rep * 16 * WM_DKV,
+                lane,
+                rows=M,
+                page=PDS,
+            )
+            af = af + [sf[0], sf[2], sf[1], sf[3]]
+        mma_bstream(
+            acc_dk,
+            af,
+            sQ_st,
+            b_k_step=kc,
+            M=16 * DKV_REPS,
+            N=DKV_PER,
+            b_trans=True,
+            b_rows=M,
+            b_page=PAGE,
+            lane=lane,
+            ab_dtype=io_dtype,
+            col_base=wd_k * DKV_PER,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Main kernel.
 # ---------------------------------------------------------------------------
@@ -278,6 +399,8 @@ class SM120FusedMultiHeadAttentionFP16Backward:
         32: (128, 64),
         64: (64, 128),
         128: (64, 64),
+        192: (32, 64),
+        256: (32, 64),
     }
     # (d, q_tile, kv_tile) -> (warps_m_sdp, warps_m_dkv, warps_m_dq): for each
     # GEMM the 8 compute warps form an (A, 8 // A) grid; the value is A, the
@@ -288,6 +411,8 @@ class SM120FusedMultiHeadAttentionFP16Backward:
         (64, 64, 128): (4, 8, 4),  # default for d64
         (64, 128, 64): (8, 2, 4),  # For underfilled grids, kv64 can double CTA counts
         (128, 64, 64): (2, 1, 4),  # default for d128
+        (192, 32, 64): (2, 4, 2),  # default for d192
+        (256, 32, 64): (2, 4, 2),  # default for d256
     }
 
     def __init__(
@@ -341,18 +466,24 @@ class SM120FusedMultiHeadAttentionFP16Backward:
         self.tma_swizzle = cuda.TensorMapSwizzle.s128b if self.page == 64 else cuda.TensorMapSwizzle.s64b
 
         M, N, d = self.q_tile, self.kv_tile, self.d
-        # smem element offsets
-        self.off_sQ = 0  # 2 buffers
-        self.off_sdO = 2 * M * d
-        self.off_sK = 3 * M * d
+        # Double-buffer Q when SMEM allows (prefetch hides the TMA latency);
+        # single-buffered Q pays an end-of-iteration rendezvous (d256's only fit).
+        cap = cutlass.utils.get_smem_capacity_in_bytes("sm_120")
+        for q_stages in (2, 1):
+            smem_elems = (q_stages + 1) * M * d + N * d + max(N * d, 2 * M * N)
+            if smem_elems * in_dtype.bytes <= cap:
+                break
+        else:
+            raise ValueError(f"smem {smem_elems * in_dtype.bytes} bytes exceeds the sm_120 cap of {cap} bytes even single-buffered")
+        # smem element offsets.
+        self.q_stages = q_stages
+        self.off_sQ = 0  # `q_stages` buffers
+        self.off_sdO = q_stages * M * d
+        self.off_sK = self.off_sdO + M * d
         self.off_sV = self.off_sK + N * d
         self.off_sdS = self.off_sV  # aliases sV (V is in regs)
         self.off_sP = self.off_sV + M * N
-        self.smem_elems = self.off_sV + max(N * d, 2 * M * N)
-        smem_bytes = self.smem_elems * in_dtype.bytes
-        cap = cutlass.utils.get_smem_capacity_in_bytes("sm_120")
-        if smem_bytes > cap:
-            raise ValueError(f"smem {smem_bytes} B exceeds sm_120 cap {cap}")
+        self.smem_elems = smem_elems
 
     @cute.jit
     def load_tma_tile(self, s_dst, tma_desc, mbar, batch, head, seq, rows: cutlass.Constexpr[int]):
@@ -391,6 +522,7 @@ class SM120FusedMultiHeadAttentionFP16Backward:
         M = self.q_tile
         N = self.kv_tile
         PAGE = self.page
+        Q_STAGES = self.q_stages
         PDS = 64 if self.kv_tile >= 64 else self.kv_tile
         WM_SDP = self.warps_m_sdp  # S/dP warp grid (WM_SDP, 8//WM_SDP), WM_SDP along q rows
         WM_DKV = self.warps_m_dkv  # dK/dV warp grid (WM_DKV, 8//WM_DKV), WM_DKV along kv rows
@@ -456,7 +588,7 @@ class SM120FusedMultiHeadAttentionFP16Backward:
         n_iters = cute.math.max(m_block_max - m_block_min, cutlass.Int32(0))
 
         smem = cutlass.Array(io_dtype, self.smem_elems, space=cutlass.AddressSpace.smem, alignment=128)
-        sQ = smem  # 2 * M * d (double buffer)
+        sQ = smem  # Q_STAGES * M * d
         sdO = smem.subview(self.off_sdO)  # M * d
         sK = smem.subview(self.off_sK)  # N * d
         sV = smem.subview(self.off_sV)  # N * d
@@ -516,8 +648,12 @@ class SM120FusedMultiHeadAttentionFP16Backward:
             while not prims.mbarrier_try_wait_parity(k_mbar, cutlass.Int32(0)):
                 pass
             for load_j in cutlass.range(n_iters, unroll=1):
-                load_stage = load_j & cutlass.Int32(1)
-                q_phase_p = (load_j // 2) & cutlass.Int32(1)
+                if cutlass.const_expr(Q_STAGES == 2):
+                    load_stage = load_j & cutlass.Int32(1)
+                    q_phase_p = (load_j // 2) & cutlass.Int32(1)
+                else:
+                    load_stage = cutlass.Int32(0)
+                    q_phase_p = load_j & cutlass.Int32(1)
                 while not prims.mbarrier_try_wait_parity(q_full.subview(load_stage), q_phase_p):
                     pass
                 do_phase_p = load_j & cutlass.Int32(1)
@@ -526,26 +662,35 @@ class SM120FusedMultiHeadAttentionFP16Backward:
                 # Loop-top: stage load_j ready AND load_j-1 consumed.
                 cute.arch.barrier(barrier_id=3, number_of_threads=288)
                 next_m = m_block_max - 2 - load_j
-                if load_j + 1 < n_iters:
-                    next_stage = (load_j + 1) & cutlass.Int32(1)
-                    next_q_full = q_full.subview(next_stage)
-                    if prims.elect_sync():
-                        prims.mbarrier_arrive_expect_tx(next_q_full, M * d * io_dtype.bytes)
-                    self.load_tma_tile(
-                        sQ.subview(next_stage * M * d),
-                        tma_q_desc,
-                        next_q_full,
-                        batch,
-                        head,
-                        next_m * M,
-                        rows=M,
-                    )
-                # Post-GEMM3: every consumer is done with sdO.
+                if cutlass.const_expr(Q_STAGES == 2):
+                    # when double-buffer for q, prefetch for the next iteration
+                    if load_j + 1 < n_iters:
+                        next_stage = (load_j + 1) & cutlass.Int32(1)
+                        next_q_full = q_full.subview(next_stage)
+                        if prims.elect_sync():
+                            prims.mbarrier_arrive_expect_tx(next_q_full, M * d * io_dtype.bytes)
+                        self.load_tma_tile(
+                            sQ.subview(next_stage * M * d),
+                            tma_q_desc,
+                            next_q_full,
+                            batch,
+                            head,
+                            next_m * M,
+                            rows=M,
+                        )
+                # Post-GEMM3 (dV += P^T*dO): every consumer is done with sdO.
                 cute.arch.barrier(barrier_id=4, number_of_threads=288)
                 if load_j + 1 < n_iters:
                     if prims.elect_sync():
                         prims.mbarrier_arrive_expect_tx(do_full, M * d * io_dtype.bytes)
                     self.load_tma_tile(sdO, tma_do_desc, do_full, batch, head, next_m * M, rows=M)
+                if cutlass.const_expr(Q_STAGES == 1):
+                    # Post-GEMM5 (dK += dS^T*Q): every consumer is done with sQ.
+                    cute.arch.barrier(barrier_id=5, number_of_threads=288)
+                    if load_j + 1 < n_iters:
+                        if prims.elect_sync():
+                            prims.mbarrier_arrive_expect_tx(q_full, M * d * io_dtype.bytes)
+                        self.load_tma_tile(sQ, tma_q_desc, q_full, batch, head, next_m * M, rows=M)
 
         elif warp < self.load_warp_id:
             prims.setmaxregister(240, prims.SetMaxRegisterAction.INCREASE)
@@ -635,7 +780,10 @@ class SM120FusedMultiHeadAttentionFP16Backward:
             j = cutlass.Int32(0)
             while j < n_iters:
                 m_block = m_block_max - 1 - j
-                stage = j & cutlass.Int32(1)
+                if cutlass.const_expr(Q_STAGES == 2):
+                    stage = j & cutlass.Int32(1)
+                else:
+                    stage = cutlass.Int32(0)
                 sQ_st = sQ.subview(stage * M * d)
                 q_row0 = m_block * M
 
@@ -831,86 +979,112 @@ class SM120FusedMultiHeadAttentionFP16Backward:
                 # the producer refill the single dO buffer.
                 cute.arch.barrier(barrier_id=4, number_of_threads=288)
 
-                # GEMM 4: acc_dq = dS @ K^T.
-                for i in cutlass.range_constexpr(DQ_REPS * DQ_NF * 4):
-                    acc_dq[i] = cutlass.Float32(0.0)
-                for kc in cutlass.range_constexpr(KV_CHUNKS):
-                    af = []
-                    for rep in cutlass.range_constexpr(DQ_REPS):
-                        sf = load_a_frag(sdS, kc, wq * 16 + rep * 16 * WM_DQ, lane, rows=M, page=PDS)
-                        af = af + [sf[0], sf[1], sf[2], sf[3]]
-                    mma_bstream(
-                        acc_dq,
-                        af,
-                        sK,
-                        b_k_step=kc,
-                        M=16 * DQ_REPS,
-                        N=DQ_PER,
-                        b_trans=True,
-                        b_rows=N,
-                        b_page=PAGE,
-                        lane=lane,
-                        ab_dtype=io_dtype,
-                        col_base=wd_q * DQ_PER,
-                    )
-
-                # Reload LSE for the next (lower) m-block.
-                if j + 1 < n_iters:
-                    nq0 = (m_block - 1) * M
-                    for rep in cutlass.range_constexpr(SDP_REPS):
-                        for hf in cutlass.range_constexpr(2):
-                            r_loc = wm_s * 16 + rep * 16 * WM_SDP + g_lane + hf * 8
-                            val = (lse_ptr + lse_base + nq0 + r_loc).load()
-                            if cutlass.const_expr((self.is_causal and not self.causal_top_left) or self.window_size_left is not None):
-                                # A fully masked row has LSE = -inf, which can produce
-                                # -inf - (-inf) = NaN.  Use +inf to reconstruct P = 0.
-                                if val == cutlass.Float32(float("-inf")):
-                                    val = cutlass.Float32(float("inf"))
-                            lse_r[rep * 2 + hf] = val * cutlass.Float32(_LOG2E)
-
-                # dQ accumulate into the scrambled dq_accum.
-                t_r = math_tidx // 32
-                t_c = math_tidx % 32
-                dqa_base = ((batch * SQ_R + q_row0) * H + head) * d
-                for rep in cutlass.range_constexpr(DQ_REPS):
-                    for nf in cutlass.range_constexpr(DQ_NF):
-                        for hv in cutlass.range_constexpr(2):
-                            i_pair = hv + rep * 2 + nf * 2 * DQ_REPS
-                            if cutlass.const_expr(d >= 64):
-                                jm = i_pair % (M // 8)
-                                jn = i_pair // (M // 8)
-                                addr = dqa_base + (t_r + jm * 8) * (H * d) + t_c * 2 + jn * 64
-                            else:
-                                addr = dqa_base + (t_r + (t_c // 16) * 8 + i_pair * 16) * (H * d) + (t_c % 16) * 2
-                            poff = (rep * DQ_NF + nf) * 4 + hv * 2
-                            _red_add_f32x2(dqa_ptr + addr, acc_dq[poff + 0], acc_dq[poff + 1])
-
-                # GEMM 5: acc_dk += dS^T @ Q.
-                for kc in cutlass.range_constexpr(Q_CHUNKS):
-                    af = []
-                    for rep in cutlass.range_constexpr(DKV_REPS):
-                        sf = load_a_frag_transposed(
-                            sdS,
-                            kc,
-                            wn_k * 16 + rep * 16 * WM_DKV,
-                            lane,
-                            rows=M,
-                            page=PDS,
-                        )
-                        af = af + [sf[0], sf[2], sf[1], sf[3]]
-                    mma_bstream(
+                if cutlass.const_expr(Q_STAGES == 1):
+                    # Single Q buffer: GEMM5 (sQ's last reader) first, so the
+                    # Q refill hides behind GEMM4 + the dQ scatter. (2-stage
+                    # keeps GEMM4-first: atomics drain during GEMM5 instead.)
+                    _bwd_gemm5_dk(
                         acc_dk,
-                        af,
+                        sdS,
                         sQ_st,
-                        b_k_step=kc,
-                        M=16 * DKV_REPS,
-                        N=DKV_PER,
-                        b_trans=True,
-                        b_rows=M,
-                        b_page=PAGE,
-                        lane=lane,
-                        ab_dtype=io_dtype,
-                        col_base=wd_k * DKV_PER,
+                        wn_k,
+                        wd_k,
+                        lane,
+                        Q_CHUNKS=Q_CHUNKS,
+                        DKV_REPS=DKV_REPS,
+                        WM_DKV=WM_DKV,
+                        M=M,
+                        PDS=PDS,
+                        PAGE=PAGE,
+                        DKV_PER=DKV_PER,
+                        io_dtype=io_dtype,
+                    )
+                    cute.arch.barrier(barrier_id=5, number_of_threads=288)
+                    _bwd_gemm4_dq(
+                        acc_dq,
+                        sdS,
+                        sK,
+                        wq,
+                        wd_q,
+                        lane,
+                        DQ_REPS=DQ_REPS,
+                        DQ_NF=DQ_NF,
+                        KV_CHUNKS=KV_CHUNKS,
+                        WM_DQ=WM_DQ,
+                        M=M,
+                        N=N,
+                        PDS=PDS,
+                        PAGE=PAGE,
+                        DQ_PER=DQ_PER,
+                        io_dtype=io_dtype,
+                    )
+                    # Reload LSE for the next (lower) m-block: overlaps the
+                    # in-flight Q refill issued at barrier 5.
+                    if j + 1 < n_iters:
+                        nq0 = (m_block - 1) * M
+                        for rep in cutlass.range_constexpr(SDP_REPS):
+                            for hf in cutlass.range_constexpr(2):
+                                r_loc = wm_s * 16 + rep * 16 * WM_SDP + g_lane + hf * 8
+                                val = (lse_ptr + lse_base + nq0 + r_loc).load()
+                                if cutlass.const_expr((self.is_causal and not self.causal_top_left) or self.window_size_left is not None):
+                                    # A fully masked row has LSE = -inf, which can produce
+                                    # -inf - (-inf) = NaN.  Use +inf to reconstruct P = 0.
+                                    if val == cutlass.Float32(float("-inf")):
+                                        val = cutlass.Float32(float("inf"))
+                                lse_r[rep * 2 + hf] = val * cutlass.Float32(_LOG2E)
+                    dqa_base = ((batch * SQ_R + q_row0) * H + head) * d
+                    _bwd_dq_scatter(acc_dq, dqa_ptr, dqa_base, math_tidx, H, DQ_REPS=DQ_REPS, DQ_NF=DQ_NF, M=M, d=d)
+                else:
+                    _bwd_gemm4_dq(
+                        acc_dq,
+                        sdS,
+                        sK,
+                        wq,
+                        wd_q,
+                        lane,
+                        DQ_REPS=DQ_REPS,
+                        DQ_NF=DQ_NF,
+                        KV_CHUNKS=KV_CHUNKS,
+                        WM_DQ=WM_DQ,
+                        M=M,
+                        N=N,
+                        PDS=PDS,
+                        PAGE=PAGE,
+                        DQ_PER=DQ_PER,
+                        io_dtype=io_dtype,
+                    )
+                    # Reload LSE for the next (lower) m-block (develop-exact
+                    # position: between GEMM4 and the scatter, hiding the
+                    # global-load latency behind the atomic drain + GEMM5).
+                    if j + 1 < n_iters:
+                        nq0 = (m_block - 1) * M
+                        for rep in cutlass.range_constexpr(SDP_REPS):
+                            for hf in cutlass.range_constexpr(2):
+                                r_loc = wm_s * 16 + rep * 16 * WM_SDP + g_lane + hf * 8
+                                val = (lse_ptr + lse_base + nq0 + r_loc).load()
+                                if cutlass.const_expr((self.is_causal and not self.causal_top_left) or self.window_size_left is not None):
+                                    # A fully masked row has LSE = -inf, which can produce
+                                    # -inf - (-inf) = NaN.  Use +inf to reconstruct P = 0.
+                                    if val == cutlass.Float32(float("-inf")):
+                                        val = cutlass.Float32(float("inf"))
+                                lse_r[rep * 2 + hf] = val * cutlass.Float32(_LOG2E)
+                    dqa_base = ((batch * SQ_R + q_row0) * H + head) * d
+                    _bwd_dq_scatter(acc_dq, dqa_ptr, dqa_base, math_tidx, H, DQ_REPS=DQ_REPS, DQ_NF=DQ_NF, M=M, d=d)
+                    _bwd_gemm5_dk(
+                        acc_dk,
+                        sdS,
+                        sQ_st,
+                        wn_k,
+                        wd_k,
+                        lane,
+                        Q_CHUNKS=Q_CHUNKS,
+                        DKV_REPS=DKV_REPS,
+                        WM_DKV=WM_DKV,
+                        M=M,
+                        PDS=PDS,
+                        PAGE=PAGE,
+                        DKV_PER=DKV_PER,
+                        io_dtype=io_dtype,
                     )
 
                 j += 1

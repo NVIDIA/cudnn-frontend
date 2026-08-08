@@ -9,9 +9,9 @@ from dataclasses import dataclass
 
 from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_FP16
 
-SEQ_Q_TILES = (64, 128)
+SEQ_Q_TILES = (32, 64, 128)
 SEQ_KV_TILES = (64, 128)
-SUPPORTED_HEAD_DIMS = (32, 64, 128)
+SUPPORTED_HEAD_DIMS = (32, 64, 128, 192, 256)
 
 
 @dataclass(frozen=True)

@@ -386,6 +386,43 @@ def test_sdpa_bwd_dsl_sm120_sliding_window_tails():
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("head_dim", [192, 256])
+@pytest.mark.parametrize("mask", ["dense", "causal_tl", "causal_br"])
+@torch_fork_set_rng(seed=12)
+def test_sdpa_bwd_dsl_sm120_large_d_wrapper(mask: str, head_dim: int):
+    """D>128: the graph API's hidden-dim surface stops at 128, so the graph
+    build must be rejected and the direct wrapper serves it (same fallback
+    pattern as the sq_gt_skv bottom-right case above)."""
+
+    _require_dsl()
+    import cudnn
+
+    is_causal = mask != "dense"
+    causal_bottom_right = mask == "causal_br"
+    try:
+        _run_case(head_dim=head_dim, is_causal=is_causal, causal_bottom_right=causal_bottom_right)
+        return
+    except cudnn.cudnnGraphNotSupportedError as exc:
+        assert "hidden_dim" in str(exc), f"unexpected graph rejection: {exc}"
+
+    from cudnn.sdpa.bwd.api_dsl import sdpa_bwd_wrapper_dsl_sm120
+
+    batch, heads, s_q, s_kv, dtype = 2, 4, 512, 512, torch.float16
+    scale = 1.0 / math.sqrt(head_dim)
+    q = _bhsd(batch, heads, s_q, head_dim, dtype)
+    k = _bhsd(batch, heads, s_kv, head_dim, dtype)
+    v = _bhsd(batch, heads, s_kv, head_dim, dtype)
+    do = _bhsd(batch, heads, s_q, head_dim, dtype)
+    o, stats, dq_ref, dk_ref, dv_ref = _ref_bwd(q, k, v, do, scale=scale, is_causal=is_causal, causal_bottom_right=causal_bottom_right)
+    o = _bhsd(batch, heads, s_q, head_dim, dtype, empty=True).copy_(o)
+    out = sdpa_bwd_wrapper_dsl_sm120(q, k, v, o, do, stats, is_causal=is_causal, causal_bottom_right=causal_bottom_right, scale_softmax=scale)
+    tol = _tolerances(dtype)
+    torch.testing.assert_close(out["dq_tensor"].float(), dq_ref.float(), **tol)
+    torch.testing.assert_close(out["dk_tensor"].float(), dk_ref.float(), **tol)
+    torch.testing.assert_close(out["dv_tensor"].float(), dv_ref.float(), **tol)
+
+
+@pytest.mark.L0
 @torch_fork_set_rng(seed=5)
 def test_sdpa_bwd_dsl_sm120_auto_routing():
     """Without an explicit select, the eligible graph auto-routes to the engine."""
