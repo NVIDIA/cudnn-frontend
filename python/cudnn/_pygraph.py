@@ -2039,7 +2039,7 @@ class pygraph:
                     raise cudnn.cudnnGraphNotSupportedError(
                         f"[cudnn_frontend] Error: No valid engine configs for {method.upper()}: "
                         f"{method} has no cuDNN backend lowering; register a python engine "
-                        f"(e.g. cudnn.engines.GdnCuTileEngine)"
+                        f"(e.g. cudnn.linear_attention.cutile.GdnCuTileEngine)"
                     )
                 kw = {"name": node.name}
                 if not spec.get("no_cdt") and node.compute_data_type is not None:

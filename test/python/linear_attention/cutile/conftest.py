@@ -12,7 +12,7 @@ import pytest
 
 @pytest.fixture(autouse=True, scope="package")
 def _pin_cutile_engines():
-    from cudnn.engines import GdnCuTileEngine, KdaCuTileEngine
+    from cudnn.linear_attention.cutile import GdnCuTileEngine, KdaCuTileEngine
     from cudnn.linear_attention.ops import gdn, kda
 
     saved = gdn._engines, kda._engines
