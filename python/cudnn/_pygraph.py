@@ -251,6 +251,16 @@ class pygraph:
             lo, hi = engine.owned_id_range
             if lo <= engine_id < hi:
                 out.append(engine)
+        if not out:
+            # Not a candidate for THIS graph, but the id may still name an
+            # in-tree engine: the manifest decodes it without anything being
+            # registered. That is what lets create_execution_plan() replay a
+            # recorded (engine_id, knobs) on a fresh graph.
+            from .engines import manifest
+
+            engine = manifest.engine_for_id(engine_id)
+            if engine is not None:
+                out.append(engine)
         return out
 
     def _barred_indices(self) -> set:

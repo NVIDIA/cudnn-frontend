@@ -298,3 +298,22 @@ def engines_for(graph):
         return []
     ids = family.offered_ids()  # availability is a separate question from kind
     return list(instantiate(family, ids)) if ids else []
+
+
+def engine_for_id(engine_id: int):
+    """The engine that owns ``engine_id``, or None.
+
+    An engine id is fully decodable from this table: the family owning the id
+    block, then the slot within it. Nothing has to be registered first, which is
+    what lets create_execution_plan() replay an autotune result on a fresh graph
+    -- including an engine that is not a candidate for THAT graph, where the
+    replay is a deliberate pin rather than a routing decision.
+    """
+    for family in MANIFEST:
+        if not family.owns(engine_id):
+            continue
+        ids = family.offered_ids()
+        if engine_id not in ids.values():
+            return None  # a real slot, but gated off in this process
+        return next((e for e in instantiate(family, ids) if e.engine_id == engine_id), None)
+    return None
