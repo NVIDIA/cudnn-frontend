@@ -1882,7 +1882,7 @@ def _host(
 
 
 @lru_cache(maxsize=None)
-def compile(
+def compile(  # noqa: A001
     b: int = 1,
     qh: int = 1,
     kh: int = 1,

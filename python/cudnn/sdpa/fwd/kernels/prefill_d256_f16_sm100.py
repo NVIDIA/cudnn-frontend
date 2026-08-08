@@ -1679,7 +1679,7 @@ def _host(
 
 
 @lru_cache(maxsize=None)
-def compile(
+def compile(  # noqa: A001
     b: int = 1,
     qh: int = 1,
     kh: int = 1,
@@ -1690,7 +1690,7 @@ def compile(
     has_lse: bool = True,
     lse_token_major: bool = False,
     lse_stride: int = 0,
-) -> Callable:  # noqa: A001
+) -> Callable:
     """ENVELOPE: ``d_qk`` / ``d_v`` are the ACTUAL head dims (defaults = full
     TILE_K / TILE_O). TMA descriptors carry these extents while the tile box
     stays the compile-time TILE geometry: loads past d_qk / d_v zero-fill

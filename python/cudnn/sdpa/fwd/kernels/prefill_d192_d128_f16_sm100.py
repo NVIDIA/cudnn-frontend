@@ -2116,7 +2116,7 @@ def _host(
 
 
 @lru_cache(maxsize=None)
-def compile(
+def compile(  # noqa: A001
     b: int = 1,
     qh: int = 1,
     kh: int = 1,
@@ -2127,7 +2127,7 @@ def compile(
     has_lse: bool = True,
     lse_token_major: bool = False,
     lse_stride: int = 0,
-) -> Callable:  # noqa: A001
+) -> Callable:
     """Compile a kernel with ALL dims concrete to pin TMA descriptor strides at compile time.
 
     THD/varlen: q/k/v/o/lse are PACKED with batch dim 1 ([1,T,H,D]); ``b`` is the
