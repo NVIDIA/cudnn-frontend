@@ -63,11 +63,16 @@ class PlanConfig:
     ``cpp_index`` is set only on backend entries: the position this plan holds
     in the lowered graph's own plan list, so building it is one
     ``build_plan_at_index`` instead of a rebuild from (engine_id, knobs).
+
+    ``mode`` is the heuristic mode that produced the entry. Ranking needs it:
+    "the backend's mode-A entries ahead of ours, its fallbacks behind" cannot
+    be said about a list whose entries do not remember where they came from.
     """
 
     engine_id: int
     knobs: Any = None
     cpp_index: Any = None
+    mode: Any = None
 
 
 @dataclass(frozen=True)
