@@ -2125,8 +2125,8 @@ def compile(  # noqa: A001
     d_qk: int = CFG.TILE_K,
     d_v: int = CFG.TILE_O,
     has_lse: bool = True,
-    lse_token_major: bool = False,
-    lse_stride: int = 0,
+    lse_head_major: bool = False,
+    lse_head_stride: int = 0,
 ) -> Callable:
     """Compile a kernel with ALL dims concrete to pin TMA descriptor strides at compile time.
 
@@ -2173,28 +2173,20 @@ def compile(  # noqa: A001
     if not has_lse:
         # No Stats output: the LSE argument is None-specialized and the store
         # is compiled out entirely — no dummy buffer exists at any level.
-        if lse_token_major or lse_stride:
-            raise ValueError("lse_token_major / lse_stride require has_lse=True")
+        if lse_head_major or lse_head_stride:
+            raise ValueError("lse_head_major / lse_head_stride require has_lse=True")
         fake_lse = None
     elif CFG.THD_VARLEN:
         # Packed ragged-Stats LSE in the caller's declared layout (align 4: the
         # store is scalar f32 and the caller's Stats buffer only guarantees
-        # element alignment). Token-major = its natural packed rank-2 (T, H)
-        # view; head-major = the kernels' native rank-3 (1, QH, head_stride)
-        # packing with head_stride >= T (compact when 0). The epilogue store
-        # branches on the STATIC rank, so the layout is fully encoded in this
-        # fake tensor — no template parameter.
-        if lse_token_major:
-            if lse_stride:
-                raise ValueError("lse_stride is head-major-only (token-major (T, H) is compact)")
-            fake_lse = cute.runtime.make_fake_compact_tensor(
-                cutlass.Float32,
-                (sq, qh),
-                stride_order=(1, 0),
-                assumed_align=4,
-            )
-        else:
-            _lse_hs = lse_stride if lse_stride else sq
+        # element alignment). Token-major (the default — cuDNN's TH1 ragged
+        # Stats recipe) = its natural packed rank-2 (T, H) view; head-major =
+        # the kernels' native rank-3 (1, QH, head_stride) packing with
+        # head_stride >= T (compact when 0). The epilogue store branches on
+        # the STATIC rank, so the layout is fully encoded in this fake tensor
+        # — no template parameter.
+        if lse_head_major:
+            _lse_hs = lse_head_stride if lse_head_stride else sq
             if _lse_hs < sq:
                 raise ValueError(f"THD head-major LSE head_stride ({_lse_hs}) must cover the packed Q token total ({sq})")
             fake_lse = cute.runtime.make_fake_compact_tensor(
@@ -2203,9 +2195,18 @@ def compile(  # noqa: A001
                 stride_order=(2, 1, 0),
                 assumed_align=4,
             )
+        else:
+            if lse_head_stride:
+                raise ValueError("lse_head_stride is head-major-only (token-major (T, H) is compact)")
+            fake_lse = cute.runtime.make_fake_compact_tensor(
+                cutlass.Float32,
+                (sq, qh),
+                stride_order=(1, 0),
+                assumed_align=4,
+            )
     else:
-        if lse_token_major or lse_stride:
-            raise ValueError("lse_token_major / lse_stride are THD-only (dense LSE is compact (B, H, Sq))")
+        if lse_head_major or lse_head_stride:
+            raise ValueError("lse_head_major / lse_head_stride are THD-only (dense LSE is compact (B, H, Sq))")
         fake_lse = cute.runtime.make_fake_compact_tensor(
             cutlass.Float32,
             (b, qh, sq),

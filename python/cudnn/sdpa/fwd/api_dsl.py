@@ -459,7 +459,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         self.flavor: Optional[tuple[int, int]] = None
         self.mask_flags = 0
         self.swa_window_runtime = 0
-        self.thd_stats_token_major = False
+        self.thd_stats_head_major = False
         self.thd_stats_head_stride = 0
         self._k_mod = None
 
@@ -558,7 +558,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                     f"THD LSE must be packed token-major (stride_h == 1, stride_s == H) "
                     f"or head-major (stride_s == 1, stride_h == head_stride); got stride {self.lse_desc.stride}",
                 )
-                self.thd_stats_token_major = token_major
+                self.thd_stats_head_major = head_major
                 self.thd_stats_head_stride = int(stride_h) if head_major else 0
             else:
                 self._value_error_if(not self.lse_desc.is_contiguous(), "LSE must be contiguous on SM100 DSL")
@@ -1025,17 +1025,17 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             return
         lse = None
         if lse_tensor is not None:
-            if self.thd_stats_token_major:
-                # Natural packed rank-2 (T, H) view — the kernel's epilogue
-                # dispatches on this static rank.
-                lse = lse_tensor.as_strided((t_q, qh), (qh, 1), lse_tensor.storage_offset())
-            else:
+            if self.thd_stats_head_major:
                 head_stride = self.thd_stats_head_stride
                 self._value_error_if(
                     head_stride < t_q,
                     f"head-major THD LSE head_stride ({head_stride}) must cover the packed Q token total ({t_q})",
                 )
                 lse = lse_tensor.as_strided((1, qh, head_stride), (qh * head_stride, head_stride, 1), lse_tensor.storage_offset())
+            else:
+                # Token-major (TH1, the default): natural packed rank-2 (T, H)
+                # view — the kernel's epilogue dispatches on this static rank.
+                lse = lse_tensor.as_strided((t_q, qh), (qh, 1), lse_tensor.storage_offset())
 
         # Per-sequence O TMA descriptors, filled by the kernel's builder pass.
         o_desc = carver.take(b * 16 + 16, torch.int64) if carver is not None else torch.zeros(b * 16 + 16, dtype=torch.int64, device=dev)
@@ -1093,8 +1093,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # packed rank-2 (T, H) view; head-major carries the caller-declared
             # head-row stride (0 -> compact sq).
             has_lse=lse is not None,
-            lse_token_major=lse is not None and self.thd_stats_token_major,
-            lse_stride=(self.thd_stats_head_stride if (lse is not None and not self.thd_stats_token_major) else 0),
+            lse_head_major=lse is not None and self.thd_stats_head_major,
+            lse_head_stride=(self.thd_stats_head_stride if (lse is not None and self.thd_stats_head_major) else 0),
         )
         fn(Q, K, V, O, LSE, sinks_t, meta, o_desc, (b, qh, kh, t_q, t_kv, 0), cutlass.Float32(scale_softmax_log2), cutlass.Int32(units), stream=current_stream)
         self._logger.debug("execute (THD) completed")

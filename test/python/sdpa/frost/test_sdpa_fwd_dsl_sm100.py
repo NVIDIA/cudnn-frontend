@@ -365,10 +365,10 @@ def test_dsl_sm100_execute_sink_lse_contract():
     with pytest.raises(ValueError, match="token-major"):
         SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, sample_lse=lse_padded, thd=True).check_support()
     api = SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, sample_lse=lse, thd=True)
-    assert api.check_support() and not api.thd_stats_token_major and api.thd_stats_head_stride == s
+    assert api.check_support() and api.thd_stats_head_major and api.thd_stats_head_stride == s
     lse_tm = torch.empty(s * h, dtype=torch.float32, device="cuda").as_strided((b, h, s), (s * h, 1, h))
     api = SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, sample_lse=lse_tm, thd=True)
-    assert api.check_support() and api.thd_stats_token_major
+    assert api.check_support() and not api.thd_stats_head_major
 
     # THD execute keeps the same strict presence contract in both directions:
     # the raises fire before any packing or launch.

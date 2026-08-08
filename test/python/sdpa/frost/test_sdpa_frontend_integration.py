@@ -333,7 +333,7 @@ def test_workspace_carve_no_per_execute_allocs_and_guards():
     assert g.selected_engine.name == _FROST
 
     ws_size = g.get_workspace_size()
-    assert ws_size > 0  # THD metadata: [slq32 | slk32 | meta | o_desc | sinks dummy]
+    assert ws_size > 0  # THD metadata: [meta(seq_kv, cu_q, cu_k) | o_desc | sinks dummy]
 
     vp = {q: q_gpu, k: k_gpu, v: v_gpu, o: o_gpu, sq: sl, skv: sl, qro: ro_t, kro: ro_t, vro: ro_t, oro: ro_t}
     # Undersized / absent workspace: loud failure, no silent allocation.
