@@ -20,9 +20,18 @@ comparator, kernel time via CUPTI (min of 3 trials × 20 iters; host excluded):
 | b2 h24 s8192 non-causal | 14832 µs | 8266 µs | **1.79x** |
 | b1 h32 s4096 causal | 1364 µs | 804 µs | **1.70x** |
 
-RTX PRO 6000 Blackwell (SM120, more SMs / bandwidth): **pending** — numbers to
-be added from the workstation run; the kernel is arch-identical so ratios are
-expected to transfer, absolute times to scale with SM count and clocks.
+RTX PRO 6000 Blackwell Server Edition (188 SMs, SM120, cuDNN 9.25.0.15),
+against the **backend's own fp8 fprop** — the path these graphs take today —
+at the tiles the shape rule picks, over 22 shapes it was not fitted on:
+**1.15x–1.93x, ahead on all of them**, widest at small grids. Against the
+sibling DKG SM120 fp8 kernel at matched tiles, best-vs-best: **1.05x–1.08x
+behind** (it was 1.21x–1.34x before P moved out of SMEM).
+
+Two caveats on reading any of these. The two paths overlap less than "fp8
+sibling" suggests: this engine emits FP16 O and the backend's fp8 fprop
+declines FP16 O, so most fp8 graphs cannot move either way. And the 1.74–1.79x
+above is against the **bf16 kernel** — it answers "what does fp8 buy", not
+"is this faster than what already runs".
 
 Numerics (vs fp32 reference on dequantized inputs, scale-folded descales):
 O max abs err 3e-4..3e-3 at std `1/sqrt(d)` inputs, ~1e-2 at full-scale (std
@@ -30,13 +39,11 @@ O max abs err 3e-4..3e-3 at std `1/sqrt(d)` inputs, ~1e-2 at full-scale (std
 ~1e-6 (the softmax path is fp32 end to end). Amax_S matches the fp32
 reference to float precision; Amax_O to P-quantization tolerance.
 
-SASS profile (d=128, both mask instances): 384× `QMMA.16832.F32.E4M3.E4M3`
-(exactly half the f16 kernel's 768× HMMA — the k-depth doubled), 196×
-`MUFU.EX2` (unchanged fp32 softmax), 96× `LDSM.8.MT1616.2` (hardware 8-bit
-transposed V loads), 108× `LDSM.16.M88.4` (K + P-reload), 96× `STS.U16` +
-96× `F2FP.SATFINITE.E4M3.F32.PACK` (P restage), 168 registers, zero spills.
-The amax atomics compile to one warp `REDUX.MAX` + one global `RED` per warp —
-negligible.
+The mainloop is `QMMA.16832.F32.E4M3.E4M3` (half the f16 kernel's HMMA count
+— the k-depth doubled), `MUFU.EX2` for the unchanged fp32 softmax,
+`LDSM.8.MT1616` for the hardware 8-bit transposed V loads, and `LDSM.16.M88.4`
+for K. P never reaches SMEM (see below). The amax atomics compile to one warp
+`REDUX.MAX` + one global `RED` per warp — negligible.
 
 ## Design decisions and their tradeoffs
 
@@ -60,71 +67,70 @@ hardware 8-bit transpose added for exactly this MMA family. One issue covers a
 transposed smem layout (second TMA descriptor bank conflicts) or in-register
 `prmt` transposes — this instruction is why the port is clean.
 
-**P restage through SMEM (the main open perf item).** The QK C-fragment owns
-columns `2*(t%4)+{0,1}` but the PV A-fragment wants 4 *consecutive* bytes
-`4*(t%4)..+3`, so the f16 kernel's in-register P repack cannot work at k32.
-v1 does correctness-first: `cvt.rn.satfinite.e4m3x2` → per-warp 16×kv_tile
-smem tile at C coordinates → `bar_warp_sync` → `ldmatrix.m8n8.x4.b16` back as
-A fragments. Cost per warp per KV tile: 32 `STS.U16` + 4 `LDSM.x4` + 2 warp
-barriers + addressing — roughly 8–15% of dynamic instruction issue.
+**P reaches the PV MMA through shfl, not SMEM.** The QK C-fragment owns columns
+`2*(t%4)+{0,1}` while the k32 A-fragment wants 4 consecutive bytes, so the f16
+kernel's in-register repack does not apply. The two layouts differ only by an
+exchange inside each thread quad, so `pack_f8x2_pairs` + two `shfl.sync.idx` +
+one `prmt.b32` produce each A register directly from the `cvt.rn.satfinite.e4m3x2`
+results left in registers by the softmax.
 
-*Option: shfl-permute restage.* The C→A ownership mismatch is exchangeable
-within each thread-quad: each A register needs two 16-bit P pairs from two
-statically-known quad lanes → 2 `shfl.sync` + 1 `prmt` per A register, ~48
-warp-uniform ops per tile replacing the ~36 memory ops + 2 barriers + address
-math. Expected gain **~4–8% kernel time (1.04–1.08x)** — instruction-count
-bound, plus an unquantified ILP benefit from removing both warp barriers
-between softmax and PV. Worth doing; not a step change.
+v1 of this kernel staged P through a per-warp `16 × kv_tile` SMEM tile instead
+(32 `STS.U16` + 4 `LDSM.x4` + 2 warp barriers per warp per KV tile). Replacing
+it measured **1.07–1.43x** across 24 shape × tile combinations on an RTX PRO
+6000 Blackwell, largest at `kv_tile=128` where the restage traffic was largest.
+Two things about that are worth recording, because the v1 notes predicted
+neither:
 
-*Option: double-buffered sP.* Removes one of the two `bar_warp_sync`s
-without touching the fragment math; ~half the barrier cost for 16KB more smem
-(still fits). Subsumed by the shfl option.
+- The kernel was **L1-bound, not issue-bound**. ncu put L1/TEX throughput at
+  72–77% against the backend fp8 kernel's 45–51%, with DRAM at 5–13% on both.
+  An estimate that counted instructions put the shfl route at 1.04–1.08x; the
+  binding resource was the L1 port, and the measured gain was several times
+  that.
+- It freed 16 KB of SMEM (49 → 33 KB at 128×128), which **moved the tile
+  optimum** — see below.
 
-**Amax outputs always on.** Amax_S/Amax_O are computed unconditionally
-(dummy buffers when the graph doesn't request them) instead of specializing
-the template on amax presence. Tradeoff: one warp-REDUX + one global RED per
-warp of pure overhead in the no-amax case — measured noise — versus 2× fewer
-template specializations.
-
-**FP16 O only.** An fp8 O needs a `scale_o`-quantizing epilogue store
-(`F2FP.SATFINITE` pack + byte stmatrix path). Straightforward follow-up; cut
-from v1 to keep the epilogue identical to the proven f16 one. Note the fp16
-epilogue already does the `o_scale_fused` multiply, so adding fp8-O is a store
--path change only.
-
-**E4M3 only.** The MMA tag is compile-time; an e5m2 variant is one more
-template axis (the fragment math is identical). Deferred until a consumer
-exists — e5m2 Q/K/V for *forward* is rare.
-
-**Exact d128.** The f16 kernel's zero-padding envelope (d_qk/d_v up to the
-tile) is not wired for the 8-bit fragment path (TMA zero-fill interacts with
-the byte-level A/B fragment addressing untested). d ∈ {16..256, mult of 16}
-generalizes the fragment loops the same way as f16; only d128 is validated,
-so the engine gates exact-match.
-
-**No sink, no THD, no seq_len_q (v1).** Sink: Amax_S (= max 1/row_sum) is
-ill-defined with a virtual sink column — needs a semantics decision, not code.
-THD: the packed-LSE plumbing is untested with the fp8 epilogue. seq_len_q:
-mirrors the SM100 fp8 row (no epilogue trim); `lower_dsl_prefill` already
-forces it off for the fp8 family.
+*Rejected: prefetching K or V fragments one step ahead, and loading Q coalesced
+with a shfl transpose.* All three are in the sibling DKG kernel. Measured here
+against the shfl-P baseline, K and V prefetch land inside ±0.5% (the run-to-run
+floor at s≥2048 is ~1%), and the coalesced Q load is **reproducibly 0.5–2.3%
+slower at s=512**, the shape it was supposed to help most — Q is small enough
+to sit in L2, so the eight shuffles per d-fragment cost more than the saved
+transactions. Absent the SMEM restage there is little ldmatrix latency left to
+hide.
 
 ## Tile options
 
-The capability row advertises `tile_ms/tile_ns ∈ {64,128}` (same knob domain
-as f16). f16 measurements showed the (128,128) default is optimal at s≥4k but
-loses ~11% at s=1k to (64,64); the fp8 kernel inherits the same geometry, so
-the same seqlen-dependent tile choice applies once a heuristic or autotune
-proposes multiple plans. Not re-measured for fp8 yet.
+The capability row advertises `tile_ms/tile_ns ∈ {64,128}` and
+`propose_plans` offers every point, so a caller can pin one with
+`create_execution_plan(engine_id, SdpaFwdKnobs(tile_m=..., tile_n=...))`.
+Entry 0 carries no knobs and lets `config_sm120.fp8_tile_choice` decide.
+
+`kv_tile=128` in all 28 shapes measured. **This reversed when P moved out of
+SMEM**: the restage tile was `(q_tile/16) x 16 x kv_tile`, so its traffic grew
+with the KV tile and made 64 the better choice, by 11–25% at every size. The
+f16 measurements this file used to extrapolate from said 128 was optimal only
+at s>=4k; neither that nor the fp8 v1 rule survives a change to how P is
+carried. A tile rule is a property of the kernel it was measured on.
+
+`q_tile=64` while the grid cannot fill the machine *and* the sequence is long
+enough to amortize the extra Q-tile loop — `grid*2 <= SMs`, or
+`grid*2 <= 3*SMs` with at least 12 KV tiles. Held-out regret against the best
+of the enumerated domain is 1.009x mean, 1.089x worst over 22 shapes; the
+misses are causal, where the triangular mask changes the per-CTA balance in a
+way grid alone does not capture.
+
+The 1.5x-SM bound was moved in after a held-out shape at 320 CTAs missed by
+1.19x while 240 CTAs was correct, so that pair is no longer independent
+evidence — `test_the_grid_bound_sits_between_240_and_320_ctas` pins both
+points, and a genuine re-validation needs fresh shapes.
 
 ## Bigger levers beyond this kernel
 
-- **K-load batching**: issue `ldmatrix` x4 across two k32 steps (halve issue
-  count) — small.
-- **Software pipelining / multi-stage KV**: 1-byte KV halves smem per stage;
-  a 2-stage sK/sV pipeline fits where f16 could not (32KB vs 64KB per stage
-  pair). Hides TMA latency behind compute; the single-buffered design shows
-  up at short seqlen where tiles don't amortize. Likely the largest remaining
-  item after the shfl restage.
+- **Multi-stage KV**: 1-byte KV halves smem per stage, and the 16 KB the P
+  restage used to hold is now free, so a 2-stage sK/sV pipeline fits at
+  128x128 (33 KB single-buffered today). This hides TMA latency behind
+  compute, which is a different thing from the *register*-level prefetch of K
+  and V fragments measured and rejected above. Largest remaining item.
 - **NVFP4 / mixed-precision PV**: `MmaMXF8F6F4Op` supports mixed
   (e4m3, e2m1) operand pairs on SM120, and `LDSM.U4` (incl. the transposed
   form) hardware-unpacks fp4 from smem — a P=e4m3 × V=e2m1 PV MMA halves V

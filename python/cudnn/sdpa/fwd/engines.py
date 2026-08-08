@@ -114,6 +114,10 @@ class Capabilities:
     # SM120, whose lowering has no zero-padding path wired yet).
     d_envelope: bool = False
     dtypes: frozenset = frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16})  # cudnn.data_type, see graph_analyzer
+    # O dtype domain. Only the quantized rows declare it: elsewhere O must
+    # equal Q, which facts.uniform_dtype already enforces. A quantized row
+    # that leaves it empty serves nothing, which is the loud failure.
+    out_dtypes: frozenset = frozenset()
     is_mxfp8: bool = False  # block-scale MXFP8 engine (FP8 in + per-32-block E8M0 SF)
     is_fp8: bool = False  # per-tensor FP8 engine (FP8 in + scalar descales)
 
@@ -257,6 +261,8 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         return f"serves D_QK in {sorted(capabilities.d_qk)}/D_V in {sorted(capabilities.d_v)}; graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
     if facts.dtype not in capabilities.dtypes:
         return f"dtype {facts.dtype} not in {sorted(str(d) for d in capabilities.dtypes)}"
+    if (capabilities.is_fp8 or capabilities.is_mxfp8) and facts.dtype_o not in capabilities.out_dtypes:
+        return f"O dtype {facts.dtype_o} not in {sorted(str(d) for d in capabilities.out_dtypes)}"
     if (facts.is_mxfp8, facts.is_fp8) != (capabilities.is_mxfp8, capabilities.is_fp8):
         quant = "block-scale MXFP8 (sdpa_mxfp8)" if capabilities.is_mxfp8 else "per-tensor FP8 (sdpa_fp8)" if capabilities.is_fp8 else "half (sdpa)"
         return f"this engine serves only {quant} graphs"
@@ -403,6 +409,7 @@ def _sm100_mxfp8_spec(d: int) -> EngineSpec:
             d_qk=frozenset({d}),
             d_v=frozenset({d}),
             dtypes=frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
+            out_dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
             is_mxfp8=True,
             causal=True,
             bottom_right=True,
@@ -438,6 +445,7 @@ def _sm100_fp8_spec(d: int) -> EngineSpec:
             d_qk=frozenset({d}),
             d_v=frozenset({d}),
             dtypes=frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
+            out_dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
             is_fp8=True,
             causal=True,
             bottom_right=True,
@@ -507,7 +515,7 @@ def _sm120_fp8_knob_order(facts, named):
     (:func:`config_sm120.fp8_tile_choice`) -- named here so pinning entry 1
     reproduces entry 0.
     """
-    want = fp8_tile_choice(facts.s_q, facts.h_q, facts.b, facts.device_sm_count or 0, facts.causal)
+    want = fp8_tile_choice(facts.s_q, facts.s_kv, facts.h_q, facts.b, facts.device_sm_count or 0)
     return sorted(named, key=lambda k: ((k.tile_m, k.tile_n) != want, k.tile_n != 64, -(k.tile_m or 0)))
 
 
@@ -532,6 +540,7 @@ def _sm120_fp8_spec() -> EngineSpec:
             d_qk=frozenset({128}),
             d_v=frozenset({128}),
             dtypes=frozenset({cudnn.data_type.FP8_E4M3}),
+            out_dtypes=frozenset({cudnn.data_type.HALF}),
             is_fp8=True,
             causal=True,
             bottom_right=True,

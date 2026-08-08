@@ -22,41 +22,48 @@ class TestTileChoice:
     """No device: shape and SM count in, (q_tile, kv_tile) out."""
 
     @pytest.mark.parametrize("s_q,h_q,b", [(512, 16, 1), (4096, 16, 1), (1024, 16, 1), (16384, 16, 1), (2048, 32, 4)])
-    @pytest.mark.parametrize("causal", [False, True])
-    def test_kv_tile_is_always_64(self, s_q, h_q, b, causal):
-        """Measured faster in 47 of 48 shapes; the exception by 0.15%. A change
-        here is a claim that the P restage stopped dominating."""
-        assert fp8_tile_choice(s_q, h_q, b, SMS, causal)[1] == 64
+    def test_kv_tile_is_always_128(self, s_q, h_q, b):
+        """Fastest in all 28 shapes measured. It was 64 while P was staged
+        through SMEM, because that traffic scaled with the KV tile -- a change
+        here is a claim about the kernel, not about the hardware."""
+        assert fp8_tile_choice(s_q, s_q, h_q, b, SMS)[1] == 128
 
-    def test_small_grid_takes_the_finer_q_tile(self):
-        # grid = ceil(512/128) * 16 = 64, so 64 CTAs of 188: doubling them
-        # still costs no extra pass over the machine.
-        assert fp8_tile_choice(512, 16, 1, SMS, False)[0] == 64
+    def test_grid_too_small_to_fill_the_machine_takes_the_finer_q_tile(self):
+        # grid = ceil(512/128) * 16 = 64 CTAs of 188: doubling them still fits,
+        # and it is worth 1.5x.
+        assert fp8_tile_choice(512, 512, 16, 1, SMS)[0] == 64
 
-    def test_causal_widens_the_window(self):
-        # grid 96: under a causal mask the last Q tile does several times the
-        # work of the first, so the finer tile still pays. Without it, it does
-        # not -- both directions are measured (1.47x and 1.00x regret).
-        assert fp8_tile_choice(768, 16, 1, SMS, True)[0] == 64
-        assert fp8_tile_choice(768, 16, 1, SMS, False)[0] == 128
+    def test_a_short_sequence_does_not_amortize_the_finer_q_tile(self):
+        # Same underfilled machine, but 8 KV tiles cannot absorb the extra
+        # Q-tile loop, so the coarse tile wins by 1.22x.
+        assert fp8_tile_choice(1024, 1024, 16, 1, SMS)[0] == 128
 
-    @pytest.mark.parametrize("s_q", [3072, 4096, 8192, 16384])
-    @pytest.mark.parametrize("causal", [False, True])
-    def test_large_grid_takes_the_coarser_q_tile(self, s_q, causal):
-        assert fp8_tile_choice(s_q, 16, 1, SMS, causal)[0] == 128
+    def test_underfilled_and_long_takes_the_finer_q_tile(self):
+        # grid 256 with 16 KV tiles: both conditions hold, worth 1.06-1.11x.
+        assert fp8_tile_choice(2048, 2048, 16, 1, SMS)[0] == 64
+        assert fp8_tile_choice(2048, 2048, 8, 2, SMS)[0] == 64
+
+    @pytest.mark.parametrize("s_q", [4096, 8192, 16384])
+    def test_a_full_machine_takes_the_coarser_q_tile(self, s_q):
+        assert fp8_tile_choice(s_q, s_q, 16, 1, SMS)[0] == 128
+
+    def test_the_grid_bound_sits_between_240_and_320_ctas(self):
+        """Where the two tiles stop trading evenly on a 188-SM part: 240 CTAs
+        still want the finer tile, 320 want the coarser one by 1.19x."""
+        assert fp8_tile_choice(2560, 2560, 12, 1, SMS)[0] == 64  # grid 240
+        assert fp8_tile_choice(2560, 2560, 16, 1, SMS)[0] == 128  # grid 320
 
     def test_batch_and_heads_count_toward_the_grid(self):
-        """The rule is grid, not sequence length: the same s_q flips once the
-        batch supplies enough CTAs on its own."""
-        assert fp8_tile_choice(512, 16, 1, SMS, False)[0] == 64
-        assert fp8_tile_choice(512, 16, 16, SMS, False)[0] == 128
+        """The rule reads grid, not sequence length: the same s_q flips once
+        the batch supplies enough CTAs on its own."""
+        assert fp8_tile_choice(2048, 2048, 16, 1, SMS)[0] == 64
+        assert fp8_tile_choice(2048, 2048, 16, 4, SMS)[0] == 128
 
     def test_choice_is_always_in_the_domain(self):
         for s_q in (128, 512, 1024, 4096, 32768):
             for b in (1, 8):
-                for causal in (False, True):
-                    q, kv = fp8_tile_choice(s_q, 16, b, SMS, causal)
-                    assert q in SEQ_Q_TILES and kv in SEQ_KV_TILES
+                q, kv = fp8_tile_choice(s_q, s_q, 16, b, SMS)
+                assert q in SEQ_Q_TILES and kv in SEQ_KV_TILES
 
     def test_unknown_sm_count_falls_back_without_dividing_by_zero(self):
-        assert fp8_tile_choice(4096, 16, 1, 0, False) == (SEQ_Q_TILES[0], 64)
+        assert fp8_tile_choice(4096, 4096, 16, 1, 0) == (128, 128)

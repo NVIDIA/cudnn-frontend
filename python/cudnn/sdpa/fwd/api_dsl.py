@@ -1641,12 +1641,9 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         def _smem_bytes(kv_tile: int) -> int:
             # One K tile (D_QK wide) + one V tile (D_V wide), aliased with the
             # q_tile x D_V output staging tile. FP8: KV elements are 1 byte
-            # but O staging is FP16 (2 bytes), plus the per-compute-warp
-            # 16 x kv_tile P restage tiles.
+            # but O staging is FP16 (2 bytes).
             o_item = 2 if self._fp8 else self.dtype.itemsize
             base = max(kv_tile * (d_q + d_v) * self.dtype.itemsize, self.q_tile * d_v * o_item)
-            if self._fp8:
-                base += (self.q_tile // 16) * 16 * kv_tile
             return base + 16
 
         chose_by_shape = False
@@ -1655,7 +1652,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             # rather than by what fits (see fp8_tile_choice). Both tiles come
             # from one decision, so a half-specified request opts out entirely.
             sms = torch.cuda.get_device_properties(self.q_desc.device).multi_processor_count
-            self.q_tile, self.kv_tile = _sm120_fp8_tile_choice(int(s_q), int(h_q), int(b), int(sms), bool(self.is_causal))
+            self.q_tile, self.kv_tile = _sm120_fp8_tile_choice(int(s_q), int(s_kv), int(h_q), int(b), int(sms))
             chose_by_shape = _smem_bytes(self.kv_tile) <= smem_capacity_bytes
         if self.tile_n is None and not chose_by_shape:
             # Pick the largest KV tile that fits this device.
@@ -1940,10 +1937,13 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             cutlass.Float32(o_scale_fused),
             current_stream,
         )
-        if o_needs_copy_back:
-            o_view.copy_(o_scratch)
-        if amax_o is not None:
-            amax_o_buf.div_(max(so, 1e-30))
+        # Both of these consume what the kernel just wrote, so they belong on
+        # the launch stream for the same reason the resets above do.
+        with _torch_stream_context(current_stream, device):
+            if o_needs_copy_back:
+                o_view.copy_(o_scratch)
+            if amax_o is not None:
+                amax_o_buf.div_(max(so, 1e-30))
         self._logger.debug("execute (SM120 FP8 per-tensor) completed")
 
     def _execute_thd(

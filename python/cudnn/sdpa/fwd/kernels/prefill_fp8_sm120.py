@@ -54,7 +54,7 @@ import cutlass.cute as cute
 
 from cutlass.experimental import primitives as prims
 from cudnn.frost.tile_dsl.constants import DTYPE_E4M3
-from cudnn.frost.tile_dsl.mma import ptx_cvt_e4m3x2, ptx_mma_m16n8k32_e4m3_f32
+from cudnn.frost.tile_dsl.mma import pack_f8x2_pairs, ptx_cvt_e4m3x2, ptx_mma_m16n8k32_e4m3_f32
 from cudnn.frost.tile_dsl.swizzle import swizzle_xor
 from cudnn.sdpa.fwd.config_sm120 import (
     SEQ_KV_TILES as _SEQ_KV_TILES,
@@ -481,17 +481,14 @@ class SM120FusedMultiHeadAttentionForward:
         :param in_mask_steps: Whether this iteration needs causal or tail predicates.
         :param is_first_kv_tile: Whether this is the first processed K/V tile
             for the current Q tile.
-        :return: ``s_regs`` with packed P fragments staged in consumed score slots.
+        :return: packed e4m3 P fragments, indexed ``[k_frag * 2 + row_half]``.
         """
         lane = basic_params.lane
         o_regs = mma_params.o_regs
         row_max = softmax_params.row_max
         row_sum = softmax_params.row_sum
         softmax_scale_log2 = softmax_params.softmax_scale_log2
-
-        # The warp-private sP tile is re-written every KV iteration; this sync
-        # orders the stores after the PREVIOUS tile's mma_pv ldmatrix reads.
-        prims.bar_warp_sync(0xFFFFFFFF)
+        p_regs = cutlass.Array(cutlass.Uint16, self.qk_k_frags * 2)
 
         # Each lane owns four S registers split across two Q rows after Q@K^T.
         for row_half in cutlass.range_constexpr(2):
@@ -580,14 +577,10 @@ class SM120FusedMultiHeadAttentionForward:
                 p0 = cute.math.exp2(in0, fastmath=True)
                 p1 = cute.math.exp2(in1, fastmath=True)
                 tile_sum = tile_sum + (p0 + p1)
-                # e4m3 P goes through the warp-private SMEM tile at the C-frag
-                # coordinates; the k32 A layout wants 4 CONSECUTIVE bytes per
-                # lane, so the f16 in-register restage cannot apply. row_sum
-                # above uses the fp32 P, keeping the denominator full precision.
-                p01 = ptx_cvt_e4m3x2(p1, p0)
-                p_byte_off = ((lane // 4) + row_half * 8) * self.kv_tile + k_frag * 8 + 2 * (lane % 4)
-                mma_params.sP_warp[p_byte_off] = cutlass.Uint8(p01 & 0xFF)
-                mma_params.sP_warp[p_byte_off + 1] = cutlass.Uint8((p01 >> 8) & 0xFF)
+                # P stays in registers at the C-fragment coordinates; mma_pv
+                # redistributes it to the k32 A layout with shfl. row_sum above
+                # uses the fp32 P, keeping the denominator full precision.
+                p_regs[k_frag * 2 + row_half] = ptx_cvt_e4m3x2(p1, p0)
 
             # Reduce tile_sum across the four lanes that own one Q row.
             tile_sum = nvvm_threadquad_reduction_sum(tile_sum)
@@ -605,9 +598,7 @@ class SM120FusedMultiHeadAttentionForward:
                         (old_scale, old_scale),
                     )
 
-        # Make this tile's sP stores visible to the warp's mma_pv ldmatrix.
-        prims.bar_warp_sync(0xFFFFFFFF)
-        return s_regs
+        return p_regs
 
     @cute.jit
     def mma_pv(
@@ -628,15 +619,23 @@ class SM120FusedMultiHeadAttentionForward:
         o_regs = mma_params.o_regs
         lane = basic_params.lane
 
-        # P A-fragments come back from the warp-private SMEM tile with a
-        # byte-preserving ldmatrix.m8n8.x4.b16: lane pointers walk 16 rows x
-        # two 16-byte k-halves of one 16 x 32 P block.
-        p_row = basic_params.lane_mod8 + 8 * (basic_params.lane_div8 % 2)
-        p_coloff = 16 * basic_params.lane_div16
+        # The QK C-fragment gives each lane columns 2*(t%4)+{0,1} while the k32
+        # A-fragment wants 4 consecutive bytes; the two differ only by an
+        # exchange inside each thread quad, so two shfl and one prmt replace
+        # the SMEM round trip (and the 16 KB it needed).
+        lane_mod4 = lane % 4
+        src0 = (lane // 4) * 4 + (lane_mod4 % 2) * 2
+        selector = cutlass.Int32(0x5410) if lane_mod4 < 2 else cutlass.Int32(0x7632)
 
-        def load_p_frags(v_frag: cutlass.Constexpr[int]):
-            p_ptr = mma_params.sP_warp.data_ptr() + p_row * self.kv_tile + v_frag * self.MMA_TILER[2] + p_coloff
-            return prims.ldmatrix(p_ptr, 4, prims.MMALayout.ROW)
+        def pack_p_cols(k_frag0: cutlass.Constexpr[int], row_half: cutlass.Constexpr[int]) -> cutlass.Int32:
+            pairs = pack_f8x2_pairs(p_regs[k_frag0 * 2 + row_half], p_regs[(k_frag0 + 1) * 2 + row_half])
+            lo = prims.shfl_sync(thread_mask=0xFFFFFFFF, val=pairs, offset=src0, mask_and_clamp=0x1F, kind=prims.Shfl.IDX)
+            hi = prims.shfl_sync(thread_mask=0xFFFFFFFF, val=pairs, offset=src0 + 1, mask_and_clamp=0x1F, kind=prims.Shfl.IDX)
+            return cute.arch.inline_ptx(
+                "prmt.b32 $0, $1, $2, $3;",
+                write_only_types=[cutlass.Int32],
+                read_only_args=[lo, hi, selector],
+            )
 
         # V B-fragments use the hardware 8-bit transposed load
         # ``ldmatrix.m16n16.x2.trans.b8`` (SASS LDSM.8.MT1616): every lane
@@ -667,8 +666,18 @@ class SM120FusedMultiHeadAttentionForward:
                 src_format=prims.LoadSrcFormat.B8,
             )
 
+        # An ldmatrix is always in flight behind the tensor cores: the next
+        # v_frag's fragments are issued before this one's MMAs run. The index
+        # wraps so the prefetch is unconditional -- the last iteration reloads
+        # v_frag 0 and drops it, which is cheaper than a branch in the loop.
         for v_frag in cutlass.range_constexpr(self.pv_v_frags):
-            p_vec = load_p_frags(v_frag)
+            # One k32 PV step consumes four QK k-fragments, paired (0,1) and (2,3).
+            p_vec = (
+                pack_p_cols(v_frag * 4 + 0, 0),
+                pack_p_cols(v_frag * 4 + 0, 1),
+                pack_p_cols(v_frag * 4 + 2, 0),
+                pack_p_cols(v_frag * 4 + 2, 1),
+            )
             for d_frag_pair in cutlass.range_constexpr(self.pv_d_frags // 2):
                 v_vec = load_v_frags(v_frag, d_frag_pair)
                 o_off = (d_frag_pair * 2) * 4
@@ -875,7 +884,6 @@ class SM120FusedMultiHeadAttentionForward:
         # sO alias):
         #   sK: one kv_tile x head_tile_qk K tile (e4m3 bytes)
         #   sV: one kv_tile x head_tile_v V tile (e4m3 bytes)
-        #   sP: per-compute-warp 16 x kv_tile e4m3 P restage tiles
         # The epilogue later aliases sKV as the q_tile x head_tile_v sO
         # staging tile after compute warps finish consuming the final K/V tile.
         k_tile_bytes = self.k_tile_elems * self.in_dtype.bytes
@@ -889,12 +897,6 @@ class SM120FusedMultiHeadAttentionForward:
         )
         sK = sKV
         sV = sKV.subview(k_tile_bytes)
-        sP = cutlass.Array(
-            cutlass.Uint8,
-            self.num_compute_warps * self.MMA_TILER[0] * self.kv_tile,
-            space=cutlass.AddressSpace.smem,
-            alignment=128,
-        )
         tma_mbar = cutlass.Array(cutlass.Int64, 2, space=cutlass.AddressSpace.smem, alignment=8)
         k_tma_mbar = tma_mbar
         v_tma_mbar = tma_mbar.subview(1)
@@ -1026,7 +1028,6 @@ class SM120FusedMultiHeadAttentionForward:
             mma_params = SimpleNamespace(
                 sK=sK,
                 sV=sV,
-                sP_warp=sP.subview(compute_warp_idx * self.MMA_TILER[0] * self.kv_tile),
                 o_regs=o_regs,
             )
             softmax_params = SimpleNamespace(

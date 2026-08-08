@@ -89,17 +89,30 @@ def ptx_mma_m16n8k32_e4m3_f32(
 
 
 @cute.jit
-def ptx_cvt_e4m3x2(hi: cutlass.Float32, lo: cutlass.Float32) -> cutlass.Int32:
+def ptx_cvt_e4m3x2(hi: cutlass.Float32, lo: cutlass.Float32) -> cutlass.Uint16:
     """Pack two fp32 into e4m3 bytes: low byte = e4m3(lo), byte 1 = e4m3(hi).
 
     ``cvt.rn.satfinite.e4m3x2.f32`` matches torch's ``.to(float8_e4m3fn)``
     bit-exactly. Operands ride as Int32 bit patterns for the same
     constant-operand ``inline_ptx`` reason as :func:`ptx_mma_m16n8k32_e4m3_f32`.
+
+    Stays 16-bit so two results pair into one MMA operand register with
+    :func:`pack_f8x2_pairs`.
     """
     return cute.arch.inline_ptx(
-        "{ .reg .f32 fa, fb; .reg .b16 t; " "mov.b32 fa, {$r0}; mov.b32 fb, {$r1}; " "cvt.rn.satfinite.e4m3x2.f32 t, fa, fb; cvt.u32.u16 {$w0}, t; }",
-        write_only_types=[cutlass.Int32],
+        "{ .reg .f32 fa, fb; " "mov.b32 fa, {$r0}; mov.b32 fb, {$r1}; " "cvt.rn.satfinite.e4m3x2.f32 {$w0}, fa, fb; }",
+        write_only_types=[cutlass.Uint16],
         read_only_args=[hi.bitcast(cutlass.Int32), lo.bitcast(cutlass.Int32)],
+    )
+
+
+@cute.jit
+def pack_f8x2_pairs(pair0: cutlass.Uint16, pair1: cutlass.Uint16) -> cutlass.Int32:
+    """Two e4m3x2 halves into one 32-bit MMA A/B operand (pair0 = low half)."""
+    return cute.arch.inline_ptx(
+        "mov.b32 $0, {$1, $2};",
+        write_only_types=[cutlass.Int32],
+        read_only_args=[pair0, pair1],
     )
 
 

@@ -10,7 +10,7 @@ atomicMax over the pre-cast fp32 values); both are checked.
 
 SM120 v1 envelope (see engines._sm120_fp8_spec): E4M3 in / FP16 out only, exact
 d128, causal / bottom-right / SWA / KV-padding masks; no sink (Amax_S semantics),
-no THD. E5M2 and fp8 outputs are covered by negative tests.
+no THD. E5M2 inputs, FP8 outputs and non-128 head dims are covered by negative tests.
 
 Requires: SM120/SM121 (consumer Blackwell), cutlass-dsl. Skips otherwise.
 """
@@ -158,8 +158,8 @@ def _ref_kwargs(sdpa_kwargs):
     return out
 
 
-def _check(O, O_ref, amax_s, amax_s_ref, amax_o, amax_o_ref):
-    diff = (O.float() - O_ref).abs().max().item()
+def _check(out, o_ref, amax_s, amax_s_ref, amax_o, amax_o_ref):
+    diff = (out.float() - o_ref).abs().max().item()
     assert diff <= 5e-2, f"max|O-ref|={diff:.4f} > 0.05"
     assert abs(amax_s - amax_s_ref) <= 0.03, f"amax_s {amax_s:.4f} vs ref {amax_s_ref:.4f}"
     assert abs(amax_o - amax_o_ref) <= 0.03, f"amax_o {amax_o:.4f} vs ref {amax_o_ref:.4f}"
@@ -178,24 +178,24 @@ _MASKS = {
 @torch_fork_set_rng(seed=0)
 def test_fp8_sm120_masks(mask):
     scale = 1.0 / math.sqrt(128)
-    O, O_ref, a_s, a_s_ref, a_o, a_o_ref = _run(2, 8, 8, 256, 256, scale=scale, sdpa_kwargs=_MASKS[mask])
-    _check(O, O_ref, a_s, a_s_ref, a_o, a_o_ref)
+    out, o_ref, a_s, a_s_ref, a_o, a_o_ref = _run(2, 8, 8, 256, 256, scale=scale, sdpa_kwargs=_MASKS[mask])
+    _check(out, o_ref, a_s, a_s_ref, a_o, a_o_ref)
 
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_fp8_sm120_gqa():
     scale = 1.0 / math.sqrt(128)
-    O, O_ref, a_s, a_s_ref, a_o, a_o_ref = _run(2, 8, 2, 256, 256, scale=scale, sdpa_kwargs=dict(use_causal_mask=True))
-    _check(O, O_ref, a_s, a_s_ref, a_o, a_o_ref)
+    out, o_ref, a_s, a_s_ref, a_o, a_o_ref = _run(2, 8, 2, 256, 256, scale=scale, sdpa_kwargs=dict(use_causal_mask=True))
+    _check(out, o_ref, a_s, a_s_ref, a_o, a_o_ref)
 
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_fp8_sm120_bottom_right_rectangular():
     scale = 1.0 / math.sqrt(128)
-    O, O_ref, a_s, a_s_ref, a_o, a_o_ref = _run(2, 8, 8, 128, 256, scale=scale, sdpa_kwargs=dict(use_causal_mask_bottom_right=True))
-    _check(O, O_ref, a_s, a_s_ref, a_o, a_o_ref)
+    out, o_ref, a_s, a_s_ref, a_o, a_o_ref = _run(2, 8, 8, 128, 256, scale=scale, sdpa_kwargs=dict(use_causal_mask_bottom_right=True))
+    _check(out, o_ref, a_s, a_s_ref, a_o, a_o_ref)
 
 
 @pytest.mark.L1
@@ -203,8 +203,8 @@ def test_fp8_sm120_bottom_right_rectangular():
 def test_fp8_sm120_multi_tile_long_seq():
     # 1k x 1k exercises the multi-KV-tile online-softmax rescale path.
     scale = 1.0 / math.sqrt(128)
-    O, O_ref, a_s, a_s_ref, a_o, a_o_ref = _run(1, 4, 4, 1024, 1024, scale=scale, sdpa_kwargs=dict(use_causal_mask=True))
-    _check(O, O_ref, a_s, a_s_ref, a_o, a_o_ref)
+    out, o_ref, a_s, a_s_ref, a_o, a_o_ref = _run(1, 4, 4, 1024, 1024, scale=scale, sdpa_kwargs=dict(use_causal_mask=True))
+    _check(out, o_ref, a_s, a_s_ref, a_o, a_o_ref)
 
 
 @pytest.mark.L0
@@ -214,8 +214,8 @@ def test_fp8_sm120_padding(causal):
     # KV padding: batch 0 uses all 256 KV cols, batch 1 only 192 (partial tile).
     scale = 1.0 / math.sqrt(128)
     sk = dict(use_causal_mask=True) if causal else {}
-    O, O_ref, a_s, a_s_ref, a_o, a_o_ref = _run(2, 8, 8, 256, 256, scale=scale, sdpa_kwargs=sk, seq_lens_kv=[256, 192])
-    _check(O, O_ref, a_s, a_s_ref, a_o, a_o_ref)
+    out, o_ref, a_s, a_s_ref, a_o, a_o_ref = _run(2, 8, 8, 256, 256, scale=scale, sdpa_kwargs=sk, seq_lens_kv=[256, 192])
+    _check(out, o_ref, a_s, a_s_ref, a_o, a_o_ref)
 
 
 @pytest.mark.L0
@@ -259,6 +259,71 @@ def test_fp8_sm120_e5m2_not_offered():
     assert engine_name(arch="sm120", fp8=True) not in names, f"E5M2 graph must not offer the sm120 fp8 engine; plans={names}"
 
 
+def _fp8_graph_offers_sm120(io_dtype, o_dtype, D=128, sink=False):
+    """Build one sdpa_fp8 graph and report whether the sm120 fp8 cell claims it.
+
+    A capability rejection is the point, so nothing is executed; a graph that
+    no engine at all serves counts as declined too.
+    """
+    import cudnn
+
+    dev = "cuda"
+    B, H, S = 1, 4, 256
+    torch_in = torch.float8_e5m2 if io_dtype == cudnn.data_type.FP8_E5M2 else torch.float8_e4m3fn
+    X = torch.randn(B, S, H, D, device=dev).to(torch_in).transpose(1, 2)
+    g = cudnn.pygraph(io_data_type=io_dtype, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    q, k, v = g.tensor_like(X), g.tensor_like(X), g.tensor_like(X)
+    scalars = [g.tensor(dim=[1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.FLOAT) for _ in range(6)]
+    kw = dict(
+        q=q,
+        k=k,
+        v=v,
+        descale_q=scalars[0],
+        descale_k=scalars[1],
+        descale_v=scalars[2],
+        descale_s=scalars[3],
+        scale_s=scalars[4],
+        scale_o=scalars[5],
+        attn_scale=1.0 / math.sqrt(D),
+        generate_stats=True,
+    )
+    if sink:
+        kw["sink_token"] = g.tensor(dim=[1, H, 1, 1], stride=[H, 1, 1, 1], data_type=cudnn.data_type.FLOAT)
+    o, stats, amx_s, amx_o = g.sdpa_fp8(**kw)
+    o.set_output(True).set_dim([B, H, S, D]).set_stride([S * H * D, D, H * D, 1]).set_data_type(o_dtype)
+    stats.set_output(True).set_dim([B, H, S, 1]).set_stride([H * S, S, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
+    for t in (amx_s, amx_o):
+        t.set_output(True).set_dim([1, 1, 1, 1]).set_stride([1, 1, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
+    try:
+        g.validate()
+        g.build_operation_graph()
+        g.create_execution_plans([cudnn.heur_mode.A])
+    except (cudnn.cudnnGraphNotSupportedError, RuntimeError, ValueError):
+        # The op itself may refuse the shape before any engine is consulted;
+        # for "this cell must not claim it" that is the same answer.
+        return False
+    return engine_name(arch="sm120", fp8=True) in [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_fp8_sm120_fp8_output_not_offered():
+    """The epilogue stores FP16; an fp8 O would need a quantizing store."""
+    import cudnn
+
+    assert not _fp8_graph_offers_sm120(cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E4M3)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("D", [64, 256])
+@torch_fork_set_rng(seed=0)
+def test_fp8_sm120_non_128_head_dim_not_offered(D):
+    """The 8-bit fragment path has no zero-padding envelope, so d is exact."""
+    import cudnn
+
+    assert not _fp8_graph_offers_sm120(cudnn.data_type.FP8_E4M3, cudnn.data_type.HALF, D=D)
+
+
 @pytest.mark.L0
 @pytest.mark.parametrize("tiles", [(64, 64), (64, 128), (128, 64), (128, 128)])
 @torch_fork_set_rng(seed=0)
@@ -267,5 +332,5 @@ def test_fp8_sm120_every_enumerated_tile(tiles):
     one point of it, so the rest would ship untested. S_q=256 keeps both q_tile
     values meaningful (one full tile at 128, two at 64)."""
     scale = 1.0 / math.sqrt(128)
-    O, O_ref, a_s, a_s_ref, a_o, a_o_ref = _run(2, 8, 8, 256, 256, scale=scale, sdpa_kwargs=dict(use_causal_mask=True), tiles=tiles)
-    _check(O, O_ref, a_s, a_s_ref, a_o, a_o_ref)
+    out, o_ref, a_s, a_s_ref, a_o, a_o_ref = _run(2, 8, 8, 256, 256, scale=scale, sdpa_kwargs=dict(use_causal_mask=True), tiles=tiles)
+    _check(out, o_ref, a_s, a_s_ref, a_o, a_o_ref)

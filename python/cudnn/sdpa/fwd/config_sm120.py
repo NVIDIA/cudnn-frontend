@@ -14,28 +14,31 @@ SEQ_KV_TILES = (128, 64)
 SUPPORTED_HEAD_TILES = tuple(range(16, 257, 16))
 
 
-def fp8_tile_choice(s_q: int, h_q: int, batch: int, sm_count: int, is_causal: bool = False) -> tuple[int, int]:
+def fp8_tile_choice(s_q: int, s_kv: int, h_q: int, batch: int, sm_count: int) -> tuple[int, int]:
     """(q_tile, kv_tile) for the SM120 per-tensor FP8 cell.
 
-    FP8 only: the f16 cell wants ``kv_tile=128`` at long sequences, so the two
-    must not share a default.
+    FP8 only: this is read off the fp8 kernel's own measurements and the f16
+    cell's optimum differs, so the two must not share a default.
 
-    ``kv_tile=64`` unconditionally. The kernel is L1-bound (the P restage moves
-    every P tile through SMEM), and halving the KV tile halves that traffic per
-    tile; measured faster in 27 of 28 shapes on sm120, the exception by 0.15%.
+    ``kv_tile=128`` unconditionally -- fastest in all 28 shapes measured. An
+    earlier revision of this kernel staged P through SMEM, and that traffic
+    grew with the KV tile, which made 64 the better choice; the shfl path
+    removed it and the optimum moved. A tile rule is a property of the kernel
+    it was measured on, not of the hardware.
 
-    ``q_tile=64`` when the grid is too small to fill the machine, since halving
-    the Q tile halves each CTA's work and only costs another pass once the CTA
-    count outgrows the SMs. Causal doubles the window it pays over: with a
-    triangular mask the last Q tile does several times the work of the first,
-    so finer tiles even out the tail. Worth 1.45x at 64 CTAs and 1.47x at
-    96 CTAs causal; misses elsewhere in the 48 shapes measured are all <= 4%.
+    ``q_tile=64`` when the grid cannot fill the machine AND each CTA has enough
+    KV tiles for the extra Q-tile loop to amortize: halving the Q tile doubles
+    the CTA count, which only pays while SMs sit idle, and adds loop overhead
+    that only long sequences absorb. Worth 1.5x at 64 CTAs. The 1.5x SM-count
+    bound is where the two stop trading evenly: 240 CTAs still want the finer
+    tile on this part, 320 want the coarser one by 1.19x.
     """
     if sm_count <= 0:
-        return SEQ_Q_TILES[0], 64
+        return 128, 128
     grid = -(-s_q // 128) * h_q * batch
-    small = grid * 2 <= sm_count or (is_causal and grid <= sm_count)
-    return (64 if small else 128), 64
+    kv_tiles = -(-s_kv // 128)
+    fine = grid * 2 <= sm_count or (grid * 2 <= 3 * sm_count and kv_tiles >= 12)
+    return (64 if fine else 128), 128
 
 
 @dataclass(frozen=True)
