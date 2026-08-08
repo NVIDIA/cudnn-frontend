@@ -53,10 +53,17 @@ from cudnn.tensor_adapter import (
 
 
 def _uses_2cta_instrs(mma_tiler_mn: Tuple[int, int]) -> bool:
-    """An M tile of 256 is the 2-CTA MMA shape -- tcgen05 pairs two CTAs to cover it.
+    """Whether this M tile selects the 2-SM tcgen05 MMA atom.
 
-    check_support enforces the pairing: M must be 256 with 2-CTA instructions and 128
-    without, so the tile size and the instruction form carry the same information.
+    Not a tuning choice: tcgen05 offers exactly two MMA forms, 1-SM (``CtaGroup.ONE``,
+    M=128) and 2-SM (``CtaGroup.TWO``, M=256, where two CTAs of a cluster cooperate on one
+    MMA), so the M tile and the CTA group are the same fact -- see the kernel's
+    ``self.cta_group``. check_support asserts the pairing in both directions, and requires
+    an even ``cluster_shape_mn[0]`` so the CTA pair lands in one cluster.
+
+    The other 128s and 256s nearby are unrelated constants that happen to collide: the N
+    tile, the scale-factor layout atom, FIX_PAD_SIZE, and byte alignments are all free to
+    move independently of this one.
     """
     return mma_tiler_mn[0] == 256
 
