@@ -17,13 +17,14 @@ Per mode:
 - **FALLBACK** — configs that are expected to build wherever mode A might not,
   ordered cheapest-resource first. Nothing here is chosen for speed.
 
-``heur_mode.OPENSOURCE`` asks for an open-source implementation, which is what
-these cells are, so it puts everything FROST can build ahead of the backend
-whatever the measurements say. Tests use it to measure FROST coverage: ask for
-it, and any graph that still lands on a backend plan is one FROST cannot serve.
+``heur_mode.OPENSOURCE`` is mode A without the backend's recommendation: these
+cells ARE the open-source implementation, and the backend's engines are not.
+Combine it to measure coverage -- ``[OPENSOURCE, A, FALLBACK]`` tries every
+FROST config first and still has the backend behind it, so a graph that runs on
+a backend plan is one FROST does not cover.
 
-``heur_mode.B`` is treated as A -- it asks for a wider search than A, and this
-family has no wider search to give.
+``heur_mode.B`` is answered as A: it asks for a wider search than A, and this
+family has none to give.
 """
 
 from __future__ import annotations
@@ -128,26 +129,38 @@ def _leads(offered: Dict[str, int], plans: List[PlanConfig]) -> bool:
 
 
 def recommend(modes: List[Any], facts, offered: Dict[str, int], backend_plans: List[PlanConfig]) -> List[PlanConfig]:
-    """The ranked plan list for this graph: FROST and backend entries interleaved."""
-    wanted = set(modes)
-    # OPENSOURCE wants these cells tried, so it asks for candidates like A does.
-    a_modes = {cudnn.heur_mode.A, cudnn.heur_mode.B, cudnn.heur_mode.OPENSOURCE}
-    ours_a = _mode_a(facts, offered) if wanted & a_modes else []
-    ours_fb = _mode_fallback(facts, offered) if cudnn.heur_mode.FALLBACK in wanted else []
+    """The ranked plan list for this graph, mode by mode in the caller's order.
 
-    backend_a = [c for c in backend_plans if c.mode != cudnn.heur_mode.FALLBACK]
-    backend_fb = [c for c in backend_plans if c.mode == cudnn.heur_mode.FALLBACK]
+    Each mode contributes a block and the blocks concatenate, so asking for
+    [A, FALLBACK] puts every tuned candidate — both sides' — ahead of every
+    fallback. A plan repeated across modes keeps its first position: building
+    the same config twice only costs the caller a JIT compile.
+    """
+    a_modes = (cudnn.heur_mode.A, cudnn.heur_mode.B)
+    # An untagged backend entry is the delegating one: candidates C++ holds but
+    # never exposes as plans, which Graph::build_plans tries BEFORE its own
+    # engine_configs. It belongs to no mode and must keep the lead, or an
+    # OPENSOURCE caller gets a native kernel instead of the OSS one.
+    out: List[PlanConfig] = [c for c in backend_plans if c.mode is None]
+    for mode in modes:
+        if mode == cudnn.heur_mode.OPENSOURCE:
+            # Mode A without the backend's recommendation: the caller asked for
+            # an open-source implementation and the backend's engines are not
+            # one. Nothing to place, so the measurements do not come into it.
+            out += _mode_a(facts, offered)
+        elif mode in a_modes:
+            # B asks for a wider search than A and this family has none to give,
+            # so it answers as A does. The backend answered B on its own terms.
+            ours = _mode_a(facts, offered)
+            theirs = [c for c in backend_plans if c.mode == mode]
+            out += (ours + theirs) if _leads(offered, ours) else (theirs + ours)
+        elif mode == cudnn.heur_mode.FALLBACK:
+            out += _mode_fallback(facts, offered) + [c for c in backend_plans if c.mode == mode]
 
-    if cudnn.heur_mode.OPENSOURCE in wanted:
-        # The caller asked for an open-source implementation, which is what these
-        # cells are. Everything FROST can build goes first, regardless of which
-        # side measures faster -- that is the mode's whole meaning, and it is how
-        # a test measures FROST coverage: ask for OPENSOURCE, and whatever runs
-        # on a backend plan instead is a graph FROST does not cover yet.
-        return ours_a + ours_fb + backend_a + backend_fb
-
-    # Fallbacks last on both sides: a fallback outranking any tuned candidate is
-    # what makes a plan walk take a slow kernel while a fast one was available.
-    if _leads(offered, ours_a):
-        return ours_a + backend_a + ours_fb + backend_fb
-    return backend_a + ours_a + ours_fb + backend_fb
+    seen, ranked = set(), []
+    for cfg in out:
+        key = (cfg.engine_id, repr(cfg.knobs), cfg.cpp_index)
+        if key not in seen:
+            seen.add(key)
+            ranked.append(cfg)
+    return ranked

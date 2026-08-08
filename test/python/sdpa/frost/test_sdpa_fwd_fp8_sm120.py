@@ -26,23 +26,7 @@ from cudnn.sdpa.fwd.engines import engine_name
 from frost_test_utils import requires_blackwell_geforce, requires_dsl
 
 
-def _select_engine(graph, name, tiles=None):
-    """Pin the ranked entry named ``name``. A pin is strict: check_support /
-    build_plans raise if that engine declines the graph.
-
-    ``tiles`` pins one named knob entry instead of the delegation, so a test
-    can run a tile the shape-driven default would not choose."""
-    names = [graph.get_plan_name_at_index(i) for i in range(len(graph.plans))]
-    if tiles is None:
-        assert name in names, f"engine {name!r} did not claim this graph; plans={names}"
-        index = names.index(name)
-    else:
-        want = f"tile_m={tiles[0]}, tile_n={tiles[1]}"
-        index = next((i for i, n in enumerate(names) if n.startswith(name) and want in n), None)
-        assert index is not None, f"no plan for tiles {tiles}; plans={names}"
-    graph.select_plan(index)
-    return graph
-
+from frost_test_utils import select_engine as _select_engine  # noqa: F401
 
 pytestmark = [requires_blackwell_geforce, requires_dsl]
 
