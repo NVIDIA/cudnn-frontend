@@ -240,7 +240,8 @@ def _sm120_spec() -> EngineSpec:
         capabilities=Capabilities(
             sm_lo=_BLACKWELL_GEFORCE[0],
             sm_hi=_BLACKWELL_GEFORCE[1],
-            d=frozenset(_SM120_HEAD_DIMS),
+            # Any head size multipled of 8
+            d=frozenset(range(8, max(_SM120_HEAD_DIMS) + 1, 8)),
             dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
             causal=True,
             bottom_right=True,

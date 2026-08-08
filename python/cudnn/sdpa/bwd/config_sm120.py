@@ -14,6 +14,12 @@ SEQ_KV_TILES = (64, 128)
 SUPPORTED_HEAD_DIMS = (32, 64, 128, 192, 256)
 
 
+def padded_head_dim(d: int) -> "int | None":
+    """Smallest native bin >= ``d``, or ``None`` when ``d`` exceeds every bin."""
+
+    return min((b for b in SUPPORTED_HEAD_DIMS if b >= d), default=None)
+
+
 @dataclass(frozen=True)
 class TemplateParams:
     """Per-graph parameters that change the traced SM120 backward kernel.

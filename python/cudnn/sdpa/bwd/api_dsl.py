@@ -22,6 +22,7 @@ from cudnn.sdpa.bwd.config_sm120 import (
     SEQ_Q_TILES as _SM120_Q_TILES,
     SUPPORTED_HEAD_DIMS as _SM120_SUPPORTED_HEAD_DIMS,
     TemplateParams as Sm120TemplateParams,
+    padded_head_dim as _sm120_padded_head_dim,
 )
 from cudnn.sdpa.fwd.api_dsl import WorkspaceCarver, _torch_stream_context, ws_align
 
@@ -137,6 +138,8 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
         self.compute_capability: Optional[tuple[int, int]] = None
         self._k_mod = None
         self._sq_rounded: Optional[int] = None
+        # Kernel-facing head dim. When it differs from D, operands stage through zero-padded compact copies
+        self.head_dim_padded: Optional[int] = None
         # name -> staging number-of-elements for each non-BSHD-compact port
         self._staging_numels: dict[str, int] = {}
 
@@ -164,8 +167,6 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
                 f"non-broadcast, non-overlapping strides (any B/H/S order, padded "
                 f"strides allowed); got stride {desc.stride} shape {desc.shape}",
             )
-            if not self._bshd_physical_ok(desc):
-                self._staging_numels[desc.name] = math.prod(desc.shape)
 
         b, h_q, s_q, d_qk = self.q_desc.shape
         _, h_kv, s_kv, _ = self.k_desc.shape
@@ -183,10 +184,15 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
             h_q != h_kv,
             f"SM120 DSL SDPA backward does not implement GQA / MQA; got H_q={h_q}, H_kv={h_kv}",
         )
+        self.head_dim_padded = _sm120_padded_head_dim(int(d_qk)) if d_qk % 8 == 0 else None
         self._value_error_if(
-            d_qk not in _SM120_SUPPORTED_HEAD_DIMS,
-            f"D ({d_qk}) must be one of {_SM120_SUPPORTED_HEAD_DIMS}",
+            self.head_dim_padded is None,
+            f"D ({d_qk}) must be a multiple of 8 and <= {max(_SM120_SUPPORTED_HEAD_DIMS)}",
         )
+        # All operands stage when D pads; otherwise only non-BSHD-compact ones.
+        for desc in (self.q_desc, self.k_desc, self.v_desc, self.o_desc, self.do_desc, self.dq_desc, self.dk_desc, self.dv_desc):
+            if self.head_dim_padded != d_qk or not self._bshd_physical_ok(desc):
+                self._staging_numels[desc.name] = math.prod(desc.shape[:-1]) * self.head_dim_padded
 
         self._value_error_if(
             self.stats_desc.ndim != 4 or tuple(self.stats_desc.shape) != (b, h_q, s_q, 1),
@@ -277,7 +283,7 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
             qh=self.h_q,
             sq=self.s_q_max,
             skv=self.s_k_max,
-            d=self.head_dim,
+            d=self.head_dim_padded,
         )
         self._logger.debug("compile completed")
 
@@ -287,7 +293,7 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
 
         self._ensure_support_checked()
         delta_bytes = ws_align(self.batch_size * self.h_q * self._sq_rounded * 4)
-        dq_accum_bytes = ws_align(self.batch_size * self._sq_rounded * self.h_q * self.head_dim * 4)
+        dq_accum_bytes = ws_align(self.batch_size * self._sq_rounded * self.h_q * self.head_dim_padded * 4)
         staging_bytes = sum(ws_align(numel * self.dtype.itemsize) for numel in self._staging_numels.values())
         return delta_bytes + dq_accum_bytes + staging_bytes
 
@@ -316,7 +322,7 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
 
         carver = WorkspaceCarver(workspace, self.scratch_workspace_bytes(), "sdpa_bwd_sm120")
         delta = carver.take(self.batch_size * self.h_q * self._sq_rounded, torch.float32).reshape(self.batch_size, self.h_q, self._sq_rounded)
-        dq_accum = carver.take(self.batch_size * self._sq_rounded * self.h_q * self.head_dim, torch.float32)
+        dq_accum = carver.take(self.batch_size * self._sq_rounded * self.h_q * self.head_dim_padded, torch.float32)
 
         if current_stream is None:
             # Direct call (no dispatch-forwarded stream): fall back to torch's
@@ -326,22 +332,29 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
 
         import cutlass
 
-        # Layout normalization: non-compact operands are staged through
-        # workspace-carved compact copies
+        # Non-compact operands (all operands when D pads) stage through
+        # workspace-carved compact copies with zero-filled pad columns.
+        d_pad = self.head_dim_padded
+        pads = d_pad != self.head_dim
+
         def _staged_bshd(tensor: torch.Tensor) -> torch.Tensor:
             view = tensor.transpose(1, 2)
-            if view.is_contiguous():
+            if not pads and view.is_contiguous():
                 return view
-            staged = carver.take(view.numel(), self.dtype).view(view.shape)
-            staged.copy_(view)
+            b, s, h, _ = view.shape
+            staged = carver.take(b * s * h * d_pad, self.dtype).view(b, s, h, d_pad)
+            if pads:
+                staged[..., self.head_dim :].zero_()
+            staged[..., : self.head_dim].copy_(view)
             return staged
 
         def _staged_out_bshd(tensor: torch.Tensor):
             """(kernel-facing compact BSHD buffer, user view to scatter back into or None)."""
             view = tensor.transpose(1, 2)
-            if view.is_contiguous():
+            if not pads and view.is_contiguous():
                 return view, None
-            return carver.take(view.numel(), self.dtype).view(view.shape), view
+            b, s, h, _ = view.shape
+            return carver.take(b * s * h * d_pad, self.dtype).view(b, s, h, d_pad), view
 
         with _torch_stream_context(current_stream, q_tensor.device):
             q = _staged_bshd(q_tensor)
@@ -374,7 +387,7 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
             kernels.cvt(dq_accum, dq, cutlass.Float32(scale_val), current_stream)
             for user_view, staged in ((dq_user, dq), (dk_user, dk), (dv_user, dv)):
                 if user_view is not None:
-                    user_view.copy_(staged)
+                    user_view.copy_(staged[..., : self.head_dim])
 
 
 def _tensor_signature(tensor: torch.Tensor) -> tuple:

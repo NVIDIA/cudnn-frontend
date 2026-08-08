@@ -93,12 +93,14 @@ def _ref_bwd(
 
 
 def _expected_workspace_bytes(batch: int, heads: int, s_q: int, head_dim: int, staged: tuple[torch.Tensor, ...] = ()) -> int:
+    from cudnn.sdpa.bwd.config_sm120 import padded_head_dim
     from cudnn.sdpa.fwd.api_dsl import ws_align
 
+    d_pad = padded_head_dim(head_dim)
     sq_r = -(-s_q // 128) * 128
-    base = ws_align(batch * heads * sq_r * 4) + ws_align(batch * sq_r * heads * head_dim * 4)
-    # One compact staging copy per operand that is not BSHD-compact.
-    staging = sum(ws_align(t.numel() * t.element_size()) for t in staged if not t.transpose(1, 2).is_contiguous())
+    base = ws_align(batch * heads * sq_r * 4) + ws_align(batch * sq_r * heads * d_pad * 4)
+    # Padded-width staging copy per non-BSHD-compact operand (all when D pads).
+    staging = sum(ws_align(t.numel() // head_dim * d_pad * t.element_size()) for t in staged if d_pad != head_dim or not t.transpose(1, 2).is_contiguous())
     return base + staging
 
 
@@ -416,6 +418,49 @@ def test_sdpa_bwd_dsl_sm120_large_d_wrapper(mask: str, head_dim: int):
     o, stats, dq_ref, dk_ref, dv_ref = _ref_bwd(q, k, v, do, scale=scale, is_causal=is_causal, causal_bottom_right=causal_bottom_right)
     o = _bhsd(batch, heads, s_q, head_dim, dtype, empty=True).copy_(o)
     out = sdpa_bwd_wrapper_dsl_sm120(q, k, v, o, do, stats, is_causal=is_causal, causal_bottom_right=causal_bottom_right, scale_softmax=scale)
+    tol = _tolerances(dtype)
+    torch.testing.assert_close(out["dq_tensor"].float(), dq_ref.float(), **tol)
+    torch.testing.assert_close(out["dk_tensor"].float(), dk_ref.float(), **tol)
+    torch.testing.assert_close(out["dv_tensor"].float(), dv_ref.float(), **tol)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("head_dim", [40, 72, 120])
+@pytest.mark.parametrize("is_causal", [False, True], ids=["dense", "causal"])
+@torch_fork_set_rng(seed=13)
+def test_sdpa_bwd_dsl_sm120_padded_head_dim(head_dim: int, is_causal: bool):
+    """Non-bin head dims run zero-padded in the next bin via the graph path."""
+
+    _run_case(head_dim=head_dim, is_causal=is_causal)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("head_dim", [136, 200])
+@torch_fork_set_rng(seed=14)
+def test_sdpa_bwd_dsl_sm120_padded_head_dim_wrapper(head_dim: int):
+    """Non-bin head dims above the graph API's 128 cap: graph build is
+    rejected, the direct wrapper serves them zero-padded."""
+
+    _require_dsl()
+    import cudnn
+
+    try:
+        _run_case(head_dim=head_dim, is_causal=True)
+        return
+    except cudnn.cudnnGraphNotSupportedError as exc:
+        assert "hidden_dim" in str(exc), f"unexpected graph rejection: {exc}"
+
+    from cudnn.sdpa.bwd.api_dsl import sdpa_bwd_wrapper_dsl_sm120
+
+    batch, heads, s_q, s_kv, dtype = 2, 4, 512, 512, torch.float16
+    scale = 1.0 / math.sqrt(head_dim)
+    q = _bhsd(batch, heads, s_q, head_dim, dtype)
+    k = _bhsd(batch, heads, s_kv, head_dim, dtype)
+    v = _bhsd(batch, heads, s_kv, head_dim, dtype)
+    do = _bhsd(batch, heads, s_q, head_dim, dtype)
+    o, stats, dq_ref, dk_ref, dv_ref = _ref_bwd(q, k, v, do, scale=scale, is_causal=True)
+    o = _bhsd(batch, heads, s_q, head_dim, dtype, empty=True).copy_(o)
+    out = sdpa_bwd_wrapper_dsl_sm120(q, k, v, o, do, stats, is_causal=True, scale_softmax=scale)
     tol = _tolerances(dtype)
     torch.testing.assert_close(out["dq_tensor"].float(), dq_ref.float(), **tol)
     torch.testing.assert_close(out["dk_tensor"].float(), dk_ref.float(), **tol)
