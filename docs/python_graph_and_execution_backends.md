@@ -10,9 +10,9 @@ backend. The C++ graph builder is internal
 lowering.
 
 ```text
-cudnn.pygraph (Python IR)  →  create_execution_plans()  →  Router  →  routed plan list
-  nodes / tensors / params        (route here,               PlanConfig(engine_id, knobs):
-  fully introspectable            lazy lowering)             python engines + one backend entry
+cudnn.pygraph (Python IR)  →  create_execution_plans()  →  heuristics  →  ranked plan list
+  nodes / tensors / params        (route here,                PlanConfig(engine_id, knobs):
+  fully introspectable            lazy lowering)              python engines + backend entries
 ```
 
 Why: python-DSL engines (CuTe-DSL / cuTile style GEMM and attention fusions)
@@ -38,8 +38,8 @@ is natively introspectable and an engine is one file implementing
 
 ### Backend contract (`engines/`)
 
-- `BaseEngine`: `propose_plans(graph) → [PlanConfig]` (several knob configs
-  per engine), `build_plan(graph, plan, ctx) → CompiledPlan` (the expensive
+- `BaseEngine`: `check_support(graph)` (accept, or decline by raising),
+  `build_plan(graph, plan, ctx) → CompiledPlan` (the expensive
   JIT step, once per graph/plan, cached on the graph),
   `CompiledPlan.execute(graph, uid_to_data, ExecutionContext)` with explicit
   handle/stream/workspace/overrides. `uid_to_data` is the caller's variant
@@ -50,6 +50,11 @@ is natively introspectable and an engine is one file implementing
   refuse `requires_grad` export) — into per-node `NodeBuffers`
   (`{port_name: caller buffer}`). Simple eager engines implement
   `execute()` only.
+- **An engine does not propose its own plans.** Which configs to try, in what
+  order, and where the backend's entries belong is one comparison across every
+  candidate, and no engine can make it from the inside — it sees neither its
+  siblings nor the backend. That decision lives in `engines/heuristics.py` and
+  the per-family hook it dispatches to (see *Ranking and the one plan list*).
 - Every engine has a stable `engine_id` in one flat id space
   (`engines/engine_ids.py`: backend `[0, 10_000)`, C++ OSS `[10_000, 20_000)`,
   python `[20_000, …)` with a `FAMILY_BLOCK`-wide block per family, out-of-tree
@@ -147,8 +152,15 @@ without being imported. Everything else is the engine's own `check_support()`.
   `CUDNN_FRONTEND_ENABLE_FROST_ENGINES`), so one implementation can graduate
   while a sibling matures. It lives in the manifest rather than on the engine
   class because the gate must answer without importing the engine.
-- **`register_backend()` is the out-of-tree escape hatch and nothing else.**
-  In-tree engines are discovered; ids below `OUT_OF_TREE_ID_BASE` are rejected.
+- **A family may name a `heuristics` hook** — like `analyzer`, a
+  `("module", "callable")` pair kept as strings so the coarse key stays
+  import-free. It is handed the facts, the family's offered ids and the
+  backend's entries, and what it returns IS the plan list.
+- **`register_backend()` installs an engine INSTANCE on one graph** — the
+  hatch tests use to inject a fake. It does not make an engine rankable: an
+  out-of-tree engine declares no `Capabilities`, so nothing can enumerate its
+  configs or place it against the backend. In-tree engines are discovered; ids
+  below `OUT_OF_TREE_ID_BASE` are rejected.
 
 ### Facts: one description per graph, shared
 
@@ -212,14 +224,26 @@ only to decline is why `closed_under` existed.
 - `test/python/test_import_boundaries.py` holds all of this, in a fresh
   interpreter, measuring the delta against an empty one.
 
-### Router and the one plan list
+### Ranking and the one plan list
 
-- `create_execution_plans()` collects both sides and ranks them into ONE list:
-  the python engines of the graph's family that claim it (from
-  `engines/manifest.py`; `register_backend()` adds out-of-tree ones) and the
-  backend's own ranked
-  `(engine_id, knobs)` recommendation from `backend_plan_entries()`.
-  `engines/heuristics.py::heuristics_sort` decides the order.
+- `create_execution_plans()` gathers the inputs — the parsed facts, the family's
+  offered ids, and the backend's own `(engine_id, knobs)` recommendation from
+  `backend_plan_entries()` — and hands all of it to the graph's family in ONE
+  call (`engines/heuristics.py::rank` → the family's `recommend`). What comes
+  back IS the plan list, position for position. There is no second merge step:
+  splitting the decision is what forced the previous design to concatenate the
+  two sides and call it ranking.
+- **The backend's entries arrive tagged with the mode that produced them.**
+  `_create_backend_plans()` asks C++ one heuristic mode at a time and records
+  `get_execution_plan_count()` after each, so a family can say "the backend's
+  mode-A entries ahead of ours, its fallbacks behind". C++ appends each query
+  to the same plan list, which is exactly what makes the boundaries readable —
+  no C++ change was needed.
+- **`heur_mode.OPENSOURCE` is mode A without the backend's recommendation**:
+  the python engines ARE the open-source implementation. Combine it to measure
+  coverage — `[OPENSOURCE, A, FALLBACK]` tries every python config first and
+  still has the backend behind it, so a graph that runs on a backend plan is
+  one no python engine covers.
 - The list IS `graph.plans`, and the classic at-index APIs
   (`get_execution_plan_count()`, `get_plan_name_at_index()`,
   `build_plan_at_index()`, `execute_plan_at_index()`,
@@ -231,18 +255,20 @@ only to decline is why `closed_under` existed.
   time, and `backend_plan_entries()` returns `[]` when the backend declines the
   graph or is not installed — the backend participates in the ranking, it is
   not a hard dependency.
-- A Router places the backend's entries by calling `backend_plan_entries()`
-  (answered once per graph) and putting the result where it wants; nothing
-  rewrites the list it returns, so a routed index means what the Router said.
-  `BACKEND_HEURISTIC_ENGINE_ID` names one thing only: the delegating entry that
-  method appends under `heur_mode.OPENSOURCE`, where the backend picks among
-  candidates it never exposes as plans.
+- The family places the backend's entries wherever it wants; nothing rewrites
+  the list it returns, so a ranked index means what the heuristics said.
+  `BACKEND_HEURISTIC_ENGINE_ID` names one thing only: the delegating entry
+  `backend_plan_entries()` appends under `heur_mode.OPENSOURCE`, where the
+  backend picks among candidates it never exposes as plans. That entry belongs
+  to no mode and keeps the lead, since `Graph::build_plans` tries it before its
+  own engine configs.
 - `build_plans()` walks the list from the selected index and takes the first
   entry that builds; a decline advances to the next. `select_plan(i)` pins,
   and a pinned decline raises instead of running something else.
-- Ranking policy is pluggable at three levels: subclass `Router`, per-graph
-  `router=`, process-wide `default_router` — plus `heuristics_sort` itself,
-  which is the seam a real cost model replaces.
+- Ranking policy has ONE home: the family's `heuristics` hook, replaceable per
+  family. Which side leads is meant to be a measurement — a cell timed slower
+  than the backend follows it — not a default. Any cell that has not been timed
+  keeps the historical order, and the code says so where it is written.
 
 ## Key invariants
 
@@ -297,7 +323,12 @@ not asserted (kernel names are backend-internal and version-dependent).
 
 ## Follow-ups (separate MRs)
 
-- Heuristics/ranking: pluggable Router policy + typed plan representation.
+- Per-family tuning rules on top of the ranking frame, each with the
+  measurements behind it; a cost model that can compare a python config against
+  a cuDNN engine on a common currency (predicted time).
+- Remove the out-of-tree engine concept: an engine id is decodable from the
+  manifest alone, so `_owners_for_id` need not be limited to registered
+  instances, and `register_backend` / `OUT_OF_TREE_ID_BASE` can go.
 - DSL engine integration (the cuTile matmul engine lives in this track).
 - Structural cleanup: lifecycle state objects, a `CudnnBackendAdapter` to
   remove `selected_engine is None` branching, lowering extracted to its own
