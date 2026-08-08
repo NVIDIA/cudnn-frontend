@@ -407,6 +407,9 @@ def _run_dsrelu_deterministic_case(case, **wrapper_kwargs):
         padded_offsets=inputs["padded_offsets_tensor"],
         alpha_tensor=inputs["alpha_tensor"],
         prob_tensor=inputs["prob_tensor"],
+        # Required whenever the fp8 path allocates sfd_row/sfd_col: the API rejects a
+        # descriptor set where these three are not all-None or all-present.
+        norm_const_tensor=inputs.get("norm_const_tensor"),
         acc_dtype=cfg["acc_dtype"],
         d_dtype=cfg["d_dtype"],
         cd_major=cfg["cd_major"],
@@ -538,7 +541,9 @@ def test_grouped_gemm_dsrelu_deterministic_dprob_env_var(request, monkeypatch):
     except ImportError:
         pytest.skip("Environment not supported: cudnn optional dependencies not installed")
 
-    case = _build_dsrelu_deterministic_case(request, torch.uint8, torch.bfloat16, torch.bfloat16, 16, torch.float8_e8m0fnu, True, False)
+    # fp8 rather than the uint8 raw-FP4 config: the latter needs a CUTLASS the shared
+    # allocators cannot always provide, and a test that skips is a test that guards nothing.
+    case = _build_dsrelu_deterministic_case(request, torch.float8_e4m3fn, torch.bfloat16, torch.float8_e4m3fn, 32, torch.float8_e8m0fnu, False, True)
 
     try:
         explicit = _run_dsrelu_deterministic_case(case, deterministic=True)
