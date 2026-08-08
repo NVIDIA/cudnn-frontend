@@ -151,6 +151,7 @@ class pygraph:
         self._facts: Dict[Any, Any] = {}  # analyzer callable -> its record; see _facts_for()
         self._backend_declined: Optional[Exception] = None  # why the backend has no entries
         self._backend_entries: Optional[List[Any]] = None  # backend_plan_entries(), once
+        self._backend_mode_spans: List[Any] = []  # (mode, lo, hi) over the C++ plan list
         self._barred_names: set = set()  # deselect_engines()
         self._workspace_limit: Optional[int] = None  # deselect_workspace_greater_than()
         self._note_filters: List[Any] = []  # (kind, note, keep) from the classic note filters
@@ -990,6 +991,7 @@ class pygraph:
             self._cpp_tensors.clear()
             self._cpp_bog_done = False
             self._cpp_plans_created = False
+            self._backend_mode_spans.clear()
             self._backend_entries = []
 
     def _attach_facts(self) -> None:
@@ -1108,6 +1110,7 @@ class pygraph:
             self._cpp_tensors.clear()
             self._cpp_bog_done = False
             self._cpp_plans_created = False
+            self._backend_mode_spans.clear()
             self._backend_entries = []
             return self._backend_entries
         try:
@@ -1129,7 +1132,7 @@ class pygraph:
         entries = []
         for i in range(self._lowered_graph.get_execution_plan_count()):
             engine_id, knobs = self._lowered_graph.get_engine_and_knobs_at_index(i)
-            entries.append(PlanConfig(engine_id, knobs, cpp_index=i))
+            entries.append(PlanConfig(engine_id, knobs, cpp_index=i, mode=self._mode_of_backend_plan(i)))
         import cudnn
 
         asked_oss = any(h == cudnn.heur_mode.OPENSOURCE for h in (self._backend_heuristics or []))
@@ -1319,14 +1322,47 @@ class pygraph:
             self._sync_ir_shapes_from_backend()
 
     def _create_backend_plans(self) -> None:
-        """Run the backend's heuristics for the lowered graph (once)."""
+        """Run the backend's heuristics for the lowered graph (once), ONE MODE AT A TIME.
+
+        A call per mode rather than one call listing them all. C++ appends each
+        query to the same plan list, so asking separately and reading
+        get_execution_plan_count() after each is what says which entries came
+        from which mode — and ranking needs that, since "the backend's mode-A
+        entries ahead of ours, its fallbacks behind" is not expressible against
+        one opaque list.
+
+        A mode with no configs raises; that is not a decline, since another mode
+        may still have entries (an OPENSOURCE-only query legitimately leaves the
+        cuDNN modes empty). Only every mode failing means the backend has
+        nothing, and the last error is re-raised so the caller reports why.
+        """
         import cudnn
 
-        if not self._cpp_plans_created:
-            heur = self._backend_heuristics or [cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK]
-            self._lowered_graph.create_execution_plans(heur)
-            self._cpp_plans_created = True
-            self._forward_note_filters()  # deferred from _filter_notes(): the plans exist now
+        if self._cpp_plans_created:
+            return
+        modes = self._backend_heuristics or [cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK]
+        at, failure = self._lowered_graph.get_execution_plan_count(), None
+        for mode in modes:
+            try:
+                self._lowered_graph.create_execution_plans([mode])
+            except cudnn.cudnnGraphNotSupportedError as exc:
+                failure = exc
+                continue
+            now = self._lowered_graph.get_execution_plan_count()
+            if now > at:
+                self._backend_mode_spans.append((mode, at, now))
+                at = now
+        if not self._backend_mode_spans and failure is not None:
+            raise failure
+        self._cpp_plans_created = True
+        self._forward_note_filters()  # deferred from _filter_notes(): the plans exist now
+
+    def _mode_of_backend_plan(self, cpp_index: int):
+        """The heuristic mode whose query produced the backend plan at ``cpp_index``."""
+        for mode, lo, hi in self._backend_mode_spans:
+            if lo <= cpp_index < hi:
+                return mode
+        return None
 
     def _lower_backend_plan(self) -> None:
         """Lower to C++ (if not already) and create the backend plans (once)."""
