@@ -1,15 +1,18 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Backend (engine) contract for the Python graph: plan -> compile -> execute.
+"""Backend (engine) contract for the Python graph: claim -> compile -> execute.
 
-A backend is one of the interchangeable implementations the Router dispatches
-to (Python DSLs, a naive reference, the cuDNN Graph backend, ...). The
+A backend is one of the interchangeable implementations the ranked plan list
+dispatches to (Python DSLs, a naive reference, the cuDNN Graph backend, ...). The
 lifecycle mirrors a real JIT/DSL engine:
 
-  1. ``propose_plans(graph)``  -> candidate ``PlanConfig`` entries (one per
-     configuration the engine wants ranked; decline the whole graph by raising
-     ``NotImplementedError`` / ``cudnn.cudnnGraphNotSupportedError``).
+  1. ``check_support(graph)`` -> accept, or decline the whole graph by raising
+     ``NotImplementedError`` / ``cudnn.cudnnGraphNotSupportedError``. An engine
+     does NOT propose its own plans: which configs to try, in what order, and
+     where the backend's own entries belong is one comparison across every
+     candidate, which no engine can make from the inside. That lives in
+     ``engines/heuristics.py`` and the family hook it dispatches to.
   2. ``build_plan(graph, plan)`` -> a ``CompiledPlan`` — the expensive JIT step,
      run ONCE per (graph, selected plan) at ``graph.build_plans()`` time; the
      compiled artifact lives on the graph, so one engine instance is safely
@@ -48,6 +51,18 @@ from .engine_ids import PYTHON_ENGINE_ID_BASE  # noqa: F401 — re-exported for 
 
 if TYPE_CHECKING:
     from ..pygraph import pygraph
+
+
+def decline_types():
+    """The exception types that mean "this engine does not serve this graph".
+
+    ImportError counts: an engine whose optional dependency is absent cannot
+    serve the graph, and since lowering imports are deferred past check_support
+    that only becomes visible at build time.
+    """
+    import cudnn
+
+    return (NotImplementedError, cudnn.cudnnGraphNotSupportedError, ImportError)
 
 
 @dataclass(frozen=True)
@@ -166,7 +181,6 @@ class BaseEngine(ABC):
         engine_id: Stable id in the shared flat engine-id space, in the reserved
             Python region (>= PYTHON_ENGINE_ID_BASE). Subclasses MUST declare it;
             the base default (None) is rejected at register_backend().
-        default_knobs: Optional default tuning knobs for this engine's plan.
         behavior_notes / numerical_notes: what this engine's plans are, in the
             same vocabulary the backend's plans answer in, so
             deselect_behavior_notes(...) and friends mean one thing across the
@@ -179,7 +193,6 @@ class BaseEngine(ABC):
     # base intentionally has none so a forgotten override fails at registration
     # instead of silently colliding with another engine.
     engine_id: Any = None
-    default_knobs: Any = None
     behavior_notes: tuple = ()
     numerical_notes: tuple = ()
 
@@ -219,16 +232,6 @@ class BaseEngine(ABC):
         Default: accept everything (subclasses should narrow this).
         """
         _ = graph
-
-    def propose_plans(self, graph: "pygraph") -> List[PlanConfig]:
-        """Candidate plans for ``graph``, in this engine's preference order.
-
-        Default: one plan with ``default_knobs`` when ``check_support`` accepts.
-        Engines with several viable configurations override this to expose them
-        to ranking/autotune (each entry's knobs reach ``build_plan`` verbatim).
-        """
-        self.check_support(graph)
-        return [PlanConfig(self.engine_id, self.default_knobs)]
 
     def build_plan(self, graph: "pygraph", plan: PlanConfig, ctx: "ExecutionContext" = None) -> CompiledPlan:
         """Compile ``graph`` for ``plan`` (the expensive step; run once per

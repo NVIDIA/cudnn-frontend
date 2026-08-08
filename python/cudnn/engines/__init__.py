@@ -4,7 +4,7 @@
 """Execution engines for pygraph.
 
 Pluggable engines in one flat engine-id space with the cuDNN backend. At
-``create_execution_plans()`` the Router ranks the engines that claim the graph
+``create_execution_plans()`` the heuristics rank the engines that claim the graph
 against the backend's own recommendation into ONE list (``graph.plans``);
 ``build_plans()`` walks it. Graph construction stays engine-agnostic.
 
@@ -14,7 +14,7 @@ before any engine module is imported. ``graph.register_backend()`` remains as
 the out-of-tree escape hatch.
 """
 
-from .base import BaseEngine, CompiledPlan, ExecutionContext, PlanConfig
+from .base import BaseEngine, decline_types, CompiledPlan, ExecutionContext, PlanConfig
 from .engine_ids import (
     BACKEND_ENGINE_ID_BASE,
     BACKEND_HEURISTIC_ENGINE_ID,
@@ -24,9 +24,7 @@ from .engine_ids import (
     is_backend_engine,
     is_python_engine,
 )
-from .heuristics import heuristics_sort
 from .manifest import MANIFEST, EngineFamily
-from .router import Router, decline_types, default_router
 
 
 def __getattr__(name: str):
@@ -49,10 +47,7 @@ __all__ = [
     "CompiledPlan",
     "ExecutionContext",
     "PlanConfig",
-    "Router",
-    "default_router",
     "decline_types",
-    "heuristics_sort",
     "MANIFEST",
     "EngineFamily",
     "BACKEND_ENGINE_ID_BASE",
