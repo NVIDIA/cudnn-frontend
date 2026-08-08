@@ -17,7 +17,6 @@ from frost_test_utils import requires_blackwell, requires_dsl, _dsl_installed
 
 from frost_test_utils import select_engine as _select_engine  # noqa: F401
 
-
 pytestmark = requires_blackwell
 
 
@@ -323,7 +322,7 @@ def test_dsl_sm100_band_right_uncovered_tail_rejected():
     o.set_data_type(cudnn.data_type.BFLOAT16)
     facts = ga.analyze(g)
     assert facts is not None and facts.invalid is None
-    assert not any(fwd_engines.probe(spec, g) for spec in fwd_engines.ENGINE_SPECS)
+    assert all(fwd_engines.analyze_for(spec, g)[1] is not None for spec in fwd_engines.ENGINE_SPECS)
 
 
 @pytest.mark.L0

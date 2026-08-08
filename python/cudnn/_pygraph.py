@@ -1065,9 +1065,20 @@ class pygraph:
             return self._backend_entries
         from .engines.engine_ids import BACKEND_HEURISTIC_ENGINE_ID
 
-        entries = []
+        # One entry per DISTINCT (engine, knobs). A node may override the
+        # heuristics query outright (Graph::create_execution_plans checks
+        # override_heuristics_query first and returns before it reads the mode
+        # at all -- deterministic SDPA backward and FP8 backward do this), so
+        # every per-mode call appends the SAME config and the list comes back
+        # holding it once per mode. The first index wins: it is the one whose
+        # mode span is real.
+        entries, seen = [], set()
         for i in range(self._lowered_graph.get_execution_plan_count()):
             engine_id, knobs = self._lowered_graph.get_engine_and_knobs_at_index(i)
+            key = (engine_id, repr(knobs))
+            if key in seen:
+                continue
+            seen.add(key)
             entries.append(PlanConfig(engine_id, knobs, cpp_index=i, mode=self._mode_of_backend_plan(i)))
         import cudnn
 
