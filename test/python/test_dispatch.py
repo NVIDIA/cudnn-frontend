@@ -425,7 +425,7 @@ def test_mixed_ranking_dispatch(monkeypatch):
     The backend's own entries are stubbed so the ordering is the same with or
     without a cuDNN that accepts this toy graph; real execution THROUGH the
     backend slot of a mixed router is the GPU test
-    test_mixed_router_backend_slot_executes in test_native_backend_lowering.py.
+    test_mixed_ranking_backend_slot_executes in test_native_backend_lowering.py.
     """
     from cudnn.engines import PlanConfig
 
@@ -958,8 +958,6 @@ def test_ranking_and_engine_read_the_same_record(monkeypatch):
     accessor. The ranking resolves the analyzer from EngineFamily.analyzer;
     the engine passes the callable it already imports; keying on the analyzer
     itself is what makes those the same object."""
-    from cudnn.engines import manifest
-
     seen = {}
 
     from cudnn.engines import heuristics
@@ -967,29 +965,33 @@ def test_ranking_and_engine_read_the_same_record(monkeypatch):
     real_rank = heuristics.rank
 
     def recording_rank(graph, engines, backend_plans, modes=None):
+        # BEFORE reading it: planning must already have run the analyzer the
+        # FAMILY declares. Without this the test passes even when the family
+        # carries no analyzer at all, since the line below would resolve it.
+        seen["parses_before_ranking"] = len(_PROBE_CALLS)
         seen["ranking"] = graph._facts_for(_probe_analyzer)
         return real_rank(graph, engines, backend_plans, modes)
 
     class Reader(StubEngine):
         name = "reader"
-        engine_id = _FAKE + 800  # outside the fake family's block below
+        engine_id = _FAKE + 0
 
         def check_support(self, graph):
             seen["engine"] = graph._facts_for(_probe_analyzer)
 
     _PROBE_CALLS.clear()
-    family = manifest.EngineFamily(
-        _FAKE + 900, "probe_family", __name__, "unused_factory", slots={"probe": manifest.EngineSlot(0)}, analyzer=(__name__, "_probe_analyzer")
-    )
-    monkeypatch.setattr(manifest, "MANIFEST", (family,))
-    monkeypatch.setattr(manifest, "_ANCHOR_NODE_TO_FAMILY", {"MATMUL": "probe_family"})
-
     monkeypatch.setattr(heuristics, "rank", recording_rank)
-    _offer(monkeypatch, Reader())
+    # The analyzer has to reach the graph through EngineFamily.analyzer, which
+    # is the path under test -- declaring a family by hand and then calling
+    # _offer() would leave _offer's family the one that survives, with no
+    # analyzer, and the assertions below would still pass because both sides
+    # call _facts_for(_probe_analyzer) directly.
+    _offer(monkeypatch, Reader(), analyzer=(__name__, "_probe_analyzer"), name="probe_family")
     g = pygraph()
     g.matmul(torch.randn(2, 3), torch.randn(3, 2))
     g.create_execution_plans()
 
+    assert seen["parses_before_ranking"] == 1, "planning did not resolve the analyzer from EngineFamily.analyzer"
     assert seen["ranking"] is seen["engine"], "ranking and engine saw different records"
     assert len(_PROBE_CALLS) == 1, "one graph, one parse"
 

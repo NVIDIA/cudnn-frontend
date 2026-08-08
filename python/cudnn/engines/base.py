@@ -199,20 +199,11 @@ class BaseEngine(ABC):
     def __init__(self):
         pass
 
-    # Exclusive end of the id block this engine owns; the default block is the
-    # single id. DECLARE a range rather than override a predicate: registration
-    # has to prove two engines' blocks are disjoint, and an arbitrary predicate
-    # cannot be intersected — two engines could each answer True for some third
-    # id and both be accepted, leaving _engine_for() with two owners.
-    id_end: Any = None
-
-    @property
-    def owned_id_range(self) -> "tuple[int, int]":
-        """``[start, end)`` of the ids this engine answers for."""
-        end = self.id_end if self.id_end is not None else self.engine_id + 1
-        if end <= self.engine_id:
-            raise ValueError(f"engine {self.name!r} declares id_end={self.id_end} at or below its engine_id={self.engine_id}")
-        return (self.engine_id, end)
+    # An engine answers for exactly ONE id -- the one its manifest slot handed
+    # it. The id-RANGE this class used to declare (id_end / owned_id_range)
+    # existed so a registered engine could claim a block and registration could
+    # prove two blocks disjoint; nothing registers now, and no shipped engine
+    # ever set id_end, so every range was [engine_id, engine_id + 1).
 
     def check_support(self, graph: "pygraph") -> None:
         """Raise to decline ``graph``.

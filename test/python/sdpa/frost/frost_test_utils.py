@@ -83,8 +83,14 @@ def select_engine(graph, name, tiles=None):
         index = next((i for i, n in enumerate(names) if _is_plan_for(n, name)), None)
         assert index is not None, f"engine {name!r} did not claim this graph; plans={names}"
     else:
-        want = f"tile_m={tiles[0]}, tile_n={tiles[1]}"
-        index = next((i for i, n in enumerate(names) if n.startswith(name + "[") and want in n), None)
+        # Against the STRUCTURED knobs, not the rendered plan name: substring
+        # matching a name would let a request for tile_n=128 select a tile_n=1280
+        # plan, and the test would pass having run something else.
+        def _wanted(i):
+            knobs = graph.plans[i].knobs
+            return _is_plan_for(names[i], name) and (getattr(knobs, "tile_m", None), getattr(knobs, "tile_n", None)) == tuple(tiles)
+
+        index = next((i for i in range(len(names)) if _wanted(i)), None)
         assert index is not None, f"no plan for tiles {tiles}; plans={names}"
     graph.select_plan(index)
     return graph

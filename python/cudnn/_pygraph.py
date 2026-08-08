@@ -183,17 +183,14 @@ class pygraph:
         return owners[0]
 
     def _owners_for_id(self, engine_id: int) -> List["BaseEngine"]:
-        """Candidate engines whose DECLARED range contains ``engine_id``.
+        """The candidate engine answering for ``engine_id``, if any.
 
         The single owner lookup: dispatch, the ranking's output validation and
         replay all go through it, so "who runs this id" has one answer computed
-        one way. Never a subclass predicate — registration can prove intervals
-        disjoint, and cannot prove anything about an arbitrary ``owns_id``."""
-        out = []
-        for engine in self._candidate_engines():
-            lo, hi = engine.owned_id_range
-            if lo <= engine_id < hi:
-                out.append(engine)
+        one way. An id names exactly one engine — the manifest hands each slot
+        a single id — so this is an equality test, and it has to stay the same
+        test the manifest fallback below makes."""
+        out = [engine for engine in self._candidate_engines() if engine.engine_id == engine_id]
         if not out:
             # Not a candidate for THIS graph, but the id may still name an
             # in-tree engine: the manifest decodes it without anything being
