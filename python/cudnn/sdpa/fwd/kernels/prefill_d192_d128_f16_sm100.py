@@ -191,7 +191,8 @@ def _bounds_for_tile(
 
 
 _resolve_seqlen_kv = _sdpa_h.resolve_seqlen_kv
-CAN_HAVE_EMPTY_KV = (CFG.MASK_FLAGS & (MASK_PADDED | MASK_SWA)) != 0 or CFG.CAUSAL_BOTTOM_RIGHT
+_resolve_seqlen_q = _sdpa_h.resolve_seqlen_q
+CAN_HAVE_EMPTY_KV = (CFG.MASK_FLAGS & (MASK_PADDED | MASK_SWA)) != 0 or CFG.BOTTOM_RIGHT
 
 # THD / varlen — flat-grid decode + tma-offset closures (CFG-bound) from the
 # factory; O-descriptor builder + TENSOR_MAP_QWORDS from the shared
@@ -211,6 +212,10 @@ _thd_tma_offsets = _sdpa_h.thd_tma_offsets
 def _apply_top_left_causal_mask_chunk(reg_S, q_abs, kv_col_base, N: int = 64):
     neg_inf = cutlass.Float32(float("-inf"))
     last_live = q_abs - kv_col_base
+    if cutlass.const_expr(CFG.WINDOW_RIGHT != 0):
+        # Right-band widening: the causal upper limit sits BAND_RIGHT columns
+        # right of the diagonal (cuDNN diagonal_band_right_bound).
+        last_live = last_live + cutlass.Int32(CFG.WINDOW_RIGHT)
     elems = [
         cutlass.Float32(
             arith.select(
@@ -228,6 +233,8 @@ def _apply_top_left_causal_mask_chunk(reg_S, q_abs, kv_col_base, N: int = 64):
 def _apply_bottom_right_causal_mask_chunk(reg_S, q_abs, kv_col_base, causal_diag, N: int = 64):
     neg_inf = cutlass.Float32(float("-inf"))
     last_live = q_abs + causal_diag - kv_col_base
+    if cutlass.const_expr(CFG.WINDOW_RIGHT != 0):
+        last_live = last_live + cutlass.Int32(CFG.WINDOW_RIGHT)
     elems = [
         cutlass.Float32(
             arith.select(
@@ -673,7 +680,8 @@ def _tmaldg_warp_group(
         kv_right = seqlen_kv // cutlass.Int32(CFG.TILE_N)
     else:
         eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
-        bounds_init = _bounds_for_tile(q_super_idx, seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx)
+        eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch)
+        bounds_init = _bounds_for_tile(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx)
         kv_left = bounds_init.left
         kv_right = bounds_init.right
 
@@ -816,7 +824,8 @@ def _tmaldg_warp_group(
         sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
         if cutlass.const_expr(CFG.MASK_FLAGS != 0):
             eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
-            bounds_next = _bounds_for_tile(q_super_idx, seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx)
+            eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch)
+            bounds_next = _bounds_for_tile(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx)
             kv_left = bounds_next.left
             kv_right = bounds_next.right
 
@@ -1062,7 +1071,8 @@ def _mma_warp_group(
             seq_kv_lens_tensor,
         )
         eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
-        bounds_init = _bounds_for_tile(q_super_idx, seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx)
+        eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch)
+        bounds_init = _bounds_for_tile(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx)
         kv_left = bounds_init.left
         kv_right = bounds_init.right
 
@@ -1263,7 +1273,8 @@ def _mma_warp_group(
             )
             is_valid_tile = nxt_v & cutlass.Int32(1)
             eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
-            bounds_next = _bounds_for_tile(q_super_idx, seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx)
+            eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch)
+            bounds_next = _bounds_for_tile(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx)
             kv_left = bounds_next.left
             kv_right = bounds_next.right
 
@@ -1284,7 +1295,7 @@ def _softmax_kv_body(
     bars,
     q_abs,
     eff_seqlen_kv,
-    seqlen_q,
+    eff_seqlen_q,
     scale_log2,
     total_max,
     total_max_safe,
@@ -1316,8 +1327,8 @@ def _softmax_kv_body(
     if cutlass.const_expr(apply_mask):
         kv_col_base = kv_loop * cutlass.Int32(CFG.TILE_N)
         # Bottom-right causal: runtime SKV-SQ diagonal offset (folds out when
-        # CFG.CAUSAL_BOTTOM_RIGHT is 0 - top-left masking is unchanged).
-        causal_diag = eff_seqlen_kv - seqlen_q if cutlass.const_expr(CFG.CAUSAL_BOTTOM_RIGHT) else None
+        # CFG.BOTTOM_RIGHT is 0 - top-left masking is unchanged).
+        causal_diag = eff_seqlen_kv - eff_seqlen_q if cutlass.const_expr(CFG.BOTTOM_RIGHT) else None
 
     _wait_mbarrier(bars.mb_bmm1_done[sub_tile_id], bmm1_phase)
     bmm1_phase = bmm1_phase ^ 1
@@ -1335,7 +1346,7 @@ def _softmax_kv_body(
             )
             for c in range(N_CHUNKS)
         ]
-        if cutlass.const_expr(CFG.MASK_FLAGS == MASK_CAUSAL and CFG.CAUSAL_BOTTOM_RIGHT == 0):
+        if cutlass.const_expr(CFG.MASK_FLAGS == MASK_CAUSAL and CFG.BOTTOM_RIGHT == 0):
             chunks_S = [
                 _apply_top_left_causal_mask_chunk(
                     raw_chunks[c],
@@ -1345,7 +1356,7 @@ def _softmax_kv_body(
                 )
                 for c in range(N_CHUNKS)
             ]
-        elif cutlass.const_expr(CFG.MASK_FLAGS == MASK_CAUSAL and CFG.CAUSAL_BOTTOM_RIGHT != 0):
+        elif cutlass.const_expr(CFG.MASK_FLAGS == MASK_CAUSAL and CFG.BOTTOM_RIGHT != 0):
             chunks_S = [
                 _apply_bottom_right_causal_mask_chunk(
                     raw_chunks[c],
@@ -1363,12 +1374,13 @@ def _softmax_kv_body(
                     q_abs,
                     kv_col_base + cutlass.Int32(c * CHUNK),
                     eff_seqlen_kv,
-                    CFG.SWA_WINDOW,
+                    CFG.WINDOW_LEFT,
                     CFG.MASK_FLAGS,
                     N=CHUNK,
-                    causal_bottom_right=CFG.CAUSAL_BOTTOM_RIGHT,
+                    bottom_right=CFG.BOTTOM_RIGHT,
                     causal_diag=causal_diag,
                     mask_value=float("-inf"),
+                    window_right=CFG.WINDOW_RIGHT,
                 )
                 for c in range(N_CHUNKS)
             ]
@@ -1564,7 +1576,9 @@ def _softmax_warp_group(
     sched_state = PipelineState.start()
 
     eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
-    bounds = _bounds_for_tile(q_super_idx, seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx)
+
+    eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch)
+    bounds = _bounds_for_tile(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx)
 
     softmax_wg_base_const = CFG.SOFTMAX_WG0_BASE if sub_tile_id == 0 else CFG.SOFTMAX_WG1_BASE
     tid_in_wg = cute.arch.thread_idx()[0] - cutlass.Int32(softmax_wg_base_const * 32)
@@ -1598,7 +1612,7 @@ def _softmax_warp_group(
                     bars,
                     q_abs,
                     eff_seqlen_kv,
-                    seqlen_q,
+                    eff_seqlen_q,
                     scale_log2,
                     total_max,
                     total_max_safe,
@@ -1619,7 +1633,7 @@ def _softmax_warp_group(
                     bars,
                     q_abs,
                     eff_seqlen_kv,
-                    seqlen_q,
+                    eff_seqlen_q,
                     scale_log2,
                     total_max,
                     total_max_safe,
@@ -1639,7 +1653,7 @@ def _softmax_warp_group(
                     bars,
                     q_abs,
                     eff_seqlen_kv,
-                    seqlen_q,
+                    eff_seqlen_q,
                     scale_log2,
                     total_max,
                     total_max_safe,
@@ -1659,7 +1673,7 @@ def _softmax_warp_group(
                     bars,
                     q_abs,
                     eff_seqlen_kv,
-                    seqlen_q,
+                    eff_seqlen_q,
                     scale_log2,
                     total_max,
                     total_max_safe,
@@ -1696,7 +1710,8 @@ def _softmax_warp_group(
         is_valid_tile = nxt_v & cutlass.Int32(1)
         sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
         eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
-        bounds = _bounds_for_tile(q_super_idx, seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx)
+        eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch)
+        bounds = _bounds_for_tile(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx)
 
 
 @cute.jit
@@ -1763,7 +1778,9 @@ def _correction_warp_group(
     sched_state = PipelineState.start()
 
     eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
-    bounds = _bounds_for_tile(q_super_idx, seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx)
+
+    eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch)
+    bounds = _bounds_for_tile(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx)
 
     while is_valid_tile > cutlass.Int32(0):
         read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
@@ -1875,7 +1892,7 @@ def _correction_warp_group(
                 # Dead row (no valid KV column at all): O := 0, LSE := -inf.
                 # Top-left causal and no-mask dense tiles always have at least
                 # one valid KV per live row, so fold this select out there.
-                if cutlass.const_expr((CFG.MASK_FLAGS & (MASK_PADDED | MASK_SWA)) != 0 or CFG.CAUSAL_BOTTOM_RIGHT):
+                if cutlass.const_expr((CFG.MASK_FLAGS & (MASK_PADDED | MASK_SWA)) != 0 or CFG.BOTTOM_RIGHT):
                     row_dead = total_sum <= cutlass.Float32(0.0)
                     neg_inf_lse = cutlass.Float32(float("-inf"))
                     lse_val = cutlass.Float32(arith.select(row_dead.ir_value(), neg_inf_lse.ir_value(), lse_val.ir_value()))
@@ -1983,7 +2000,8 @@ def _correction_warp_group(
         is_valid_tile = nxt_v & cutlass.Int32(1)
         sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
         eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
-        bounds = _bounds_for_tile(q_super_idx, seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx)
+        eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch)
+        bounds = _bounds_for_tile(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx)
 
     # End-of-warp tmem_dealloc: under cga2 each corr lane ALSO DSMEM-arrives
     # on the peer so the peer's local mbar accumulates the full CGA-total count.

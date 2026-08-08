@@ -25,9 +25,14 @@ class TemplateParams:
     """
 
     dtype_qkv: int = DTYPE_FP16
-    is_causal: bool = False
-    causal_bottom_right: bool = False
-    window_size_left: int | None = None
+    # The mask is ONE diagonal band (same model as config_sm100 / the analyzer
+    # facts): per-side offsets from the diagonal, None = unbounded on that
+    # side. This kernel serves window_right in {None, 0} only (plain causal;
+    # right-band widening is not plumbed here). bottom_right anchors the
+    # band's diagonal at the bottom-right corner.
+    window_left: int | None = None
+    window_right: int | None = None
+    bottom_right: bool = False
     seq_q_lens_present: bool = False
     seq_kv_lens_present: bool = False
     has_sink: bool = False
@@ -46,10 +51,12 @@ def validate_params(params: TemplateParams) -> None:
 
     if params.dtype_qkv not in (DTYPE_BF16, DTYPE_FP16):
         raise ValueError(f"SM120 SDPA: dtype_qkv must be DTYPE_BF16 ({DTYPE_BF16}) or DTYPE_FP16 ({DTYPE_FP16}); got {params.dtype_qkv}")
-    if params.causal_bottom_right and not params.is_causal:
-        raise ValueError("SM120 SDPA: causal_bottom_right requires is_causal=True")
-    if params.window_size_left is not None and params.window_size_left < 0:
-        raise ValueError(f"SM120 SDPA: window_size_left must be non-negative; got {params.window_size_left}")
+    if params.window_right not in (None, 0):
+        raise ValueError(f"SM120 SDPA: window_right must be None (unbounded) or 0 (causal) — right-band widening is not plumbed; got {params.window_right}")
+    if params.bottom_right and params.window_right is None:
+        raise ValueError("SM120 SDPA: bottom_right anchors the band's diagonal and requires a right bound (window_right)")
+    if params.window_left is not None and params.window_left < 0:
+        raise ValueError(f"SM120 SDPA: window_left must be non-negative; got {params.window_left}")
     if params.q_tile not in SEQ_Q_TILES:
         raise ValueError(f"SM120 SDPA: q_tile must be one of {SEQ_Q_TILES}; got {params.q_tile}")
     if params.kv_tile not in SEQ_KV_TILES:

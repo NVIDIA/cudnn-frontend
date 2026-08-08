@@ -453,6 +453,8 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         # would make every engine reject an effectively-unmasked graph.
         has_band = resolved_right is not None or left_bound is not None
         align_is_br = has_band and rec.get("diagonal_alignment") == cudnn.diagonal_alignment.BOTTOM_RIGHT
+    if resolved_right is not None and resolved_right < 0:
+        return _invalid(f"diagonal-band right bound must be >= 0; got {resolved_right}")
     right_widening = resolved_right not in (0, None)
     causal = (resolved_right is not None) and not right_widening
     if left_bound is not None and left_bound < 1:

@@ -304,6 +304,7 @@ _sdpa_h = make_sdpa_helpers(CFG, lpt_q_tiles_in_cga_units=True)
 # per-batch actual Q length (SEQ_Q_LENS_PRESENT; folds to plain bounds otherwise).
 _bounds_for_tile = _sdpa_h.bounds_for_tile_qtrim
 _resolve_seqlen_kv = _sdpa_h.resolve_seqlen_kv
+_resolve_seqlen_q = _sdpa_h.resolve_seqlen_q
 
 
 _decode_initial = _sdpa_h.decode_initial
@@ -634,7 +635,7 @@ def _sg0_softmax_kv_iter(
     sAlpha_xfer_raw,
     q_abs,
     eff_seqlen_kv,
-    seqlen_q,
+    eff_seqlen_q,
     scale_log2,
     tid_in_wg,
     is_lead_warp,
@@ -659,18 +660,19 @@ def _sg0_softmax_kv_iter(
             )
             for c in range(SOFTMAX_N_CHUNKS_LOAD)
         ]
-        causal_diag = eff_seqlen_kv - seqlen_q if cutlass.const_expr(CFG.CAUSAL_BOTTOM_RIGHT) else None
+        causal_diag = eff_seqlen_kv - eff_seqlen_q if cutlass.const_expr(CFG.BOTTOM_RIGHT) else None
         chunks_S = [
             apply_mask_chunk(
                 raw_chunks[c],
                 q_abs,
                 kv_col_base + cutlass.Int32(c * SOFTMAX_CHUNK),
                 eff_seqlen_kv,
-                CFG.SWA_WINDOW,
+                CFG.WINDOW_LEFT,
                 CFG.MASK_FLAGS,
                 N=SOFTMAX_CHUNK,
-                causal_bottom_right=CFG.CAUSAL_BOTTOM_RIGHT,
+                bottom_right=CFG.BOTTOM_RIGHT,
                 causal_diag=causal_diag,
+                window_right=CFG.WINDOW_RIGHT,
                 mask_value=float("-inf"),
             )
             for c in range(SOFTMAX_N_CHUNKS_LOAD)
@@ -817,7 +819,8 @@ def _compute_warp_group(
         eff_seqlen_kv = seqlen_kv
     else:
         eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
-        bounds_init = _bounds_for_tile(q_super_idx, seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx)
+        eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch)
+        bounds_init = _bounds_for_tile(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx)
         kv_left = bounds_init.left
         kv_unmasked_lo = bounds_init.unmasked_lo
         kv_unmasked_hi = bounds_init.unmasked_hi
@@ -880,7 +883,7 @@ def _compute_warp_group(
                             sAlpha_xfer_raw,
                             q_abs,
                             eff_seqlen_kv,
-                            seqlen_q,
+                            eff_seqlen_q,
                             scale_log2,
                             tid_in_wg,
                             is_lead_warp,
@@ -903,7 +906,7 @@ def _compute_warp_group(
                             sAlpha_xfer_raw,
                             q_abs,
                             eff_seqlen_kv,
-                            seqlen_q,
+                            eff_seqlen_q,
                             scale_log2,
                             tid_in_wg,
                             is_lead_warp,
@@ -925,7 +928,7 @@ def _compute_warp_group(
                             sAlpha_xfer_raw,
                             q_abs,
                             eff_seqlen_kv,
-                            seqlen_q,
+                            eff_seqlen_q,
                             scale_log2,
                             tid_in_wg,
                             is_lead_warp,
@@ -947,7 +950,7 @@ def _compute_warp_group(
                             sAlpha_xfer_raw,
                             q_abs,
                             eff_seqlen_kv,
-                            seqlen_q,
+                            eff_seqlen_q,
                             scale_log2,
                             tid_in_wg,
                             is_lead_warp,
@@ -1184,7 +1187,8 @@ def _compute_warp_group(
         sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
         if cutlass.const_expr(CFG.MASK_FLAGS != 0):
             eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
-            bounds_next = _bounds_for_tile(q_super_idx, seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx)
+            eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch)
+            bounds_next = _bounds_for_tile(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx)
             kv_left = bounds_next.left
             kv_unmasked_lo = bounds_next.unmasked_lo
             kv_unmasked_hi = bounds_next.unmasked_hi
@@ -1293,7 +1297,8 @@ def _mma_warp_group(
         kv_right = seqlen_kv // cutlass.Int32(CFG.TILE_N)
     else:
         eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
-        bounds_init = _bounds_for_tile(q_super_idx, seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx)
+        eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch)
+        bounds_init = _bounds_for_tile(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx)
         kv_left = bounds_init.left
         kv_right = bounds_init.right
 
@@ -1439,7 +1444,8 @@ def _mma_warp_group(
         sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
         if cutlass.const_expr(CFG.MASK_FLAGS != 0):
             eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
-            bounds_next = _bounds_for_tile(q_super_idx, seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx)
+            eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch)
+            bounds_next = _bounds_for_tile(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx)
             kv_left = bounds_next.left
             kv_right = bounds_next.right
 
@@ -1496,7 +1502,8 @@ def _mma_warp_non_leader(
             kv_right = seqlen_kv // cutlass.Int32(CFG.TILE_N)
         else:
             eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
-            bounds_init = _bounds_for_tile(q_super_idx, seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx)
+            eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch)
+            bounds_init = _bounds_for_tile(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx)
             kv_left = bounds_init.left
             kv_right = bounds_init.right
 
@@ -1535,7 +1542,8 @@ def _mma_warp_non_leader(
             sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
             if cutlass.const_expr(CFG.MASK_FLAGS != 0):
                 eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
-                bounds_next = _bounds_for_tile(q_super_idx, seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx)
+                eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch)
+                bounds_next = _bounds_for_tile(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx)
                 kv_left = bounds_next.left
                 kv_right = bounds_next.right
     bars.mb_tmem_dealloc.wait(cutlass.Int32(0))
@@ -1594,7 +1602,8 @@ def _tmaldg_warp_group(
         kv_right = seqlen_kv // cutlass.Int32(CFG.TILE_N)
     else:
         eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
-        bounds_init = _bounds_for_tile(q_super_idx, seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx)
+        eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch)
+        bounds_init = _bounds_for_tile(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx)
         kv_left = bounds_init.left
         kv_right = bounds_init.right
 
@@ -1687,7 +1696,8 @@ def _tmaldg_warp_group(
         sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
         if cutlass.const_expr(CFG.MASK_FLAGS != 0):
             eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
-            bounds_next = _bounds_for_tile(q_super_idx, seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx)
+            eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch)
+            bounds_next = _bounds_for_tile(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx)
             kv_left = bounds_next.left
             kv_right = bounds_next.right
 

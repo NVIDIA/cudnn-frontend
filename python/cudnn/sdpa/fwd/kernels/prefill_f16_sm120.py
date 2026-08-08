@@ -171,7 +171,7 @@ class SM120FusedMultiHeadAttentionForward:
         in_dtype: Type[cutlass.Numeric] = cutlass.Float16,
         out_dtype: Type[cutlass.Numeric] = cutlass.Float16,
         is_causal: bool = False,
-        causal_bottom_right: bool = False,
+        bottom_right: bool = False,
         window_size_left: int | None = None,
         seq_q_lens_present: bool = False,
         seq_kv_lens_present: bool = False,
@@ -190,7 +190,7 @@ class SM120FusedMultiHeadAttentionForward:
         :param in_dtype: Q/K/V element type (Float16 or BFloat16).
         :param out_dtype: O element type. Must match ``in_dtype``.
         :param is_causal: Apply an upper causal bound to QK.
-        :param causal_bottom_right: Shift the causal diagonal by ``Skv - Sq``.
+        :param bottom_right: Shift the causal diagonal by ``Skv - Sq``.
         :param window_size_left: Inclusive left-window offset, or ``None``.
         :param seq_q_lens_present: Read per-batch query lengths at runtime.
         :param seq_kv_lens_present: Read per-batch key/value lengths at runtime.
@@ -222,7 +222,7 @@ class SM120FusedMultiHeadAttentionForward:
         self.in_dtype = in_dtype
         self.out_dtype = in_dtype
         self.is_causal = is_causal
-        self.causal_bottom_right = causal_bottom_right
+        self.bottom_right = bottom_right
         self.window_size_left = window_size_left
         self.seq_q_lens_present = seq_q_lens_present
         self.seq_kv_lens_present = seq_kv_lens_present
@@ -489,7 +489,7 @@ class SM120FusedMultiHeadAttentionForward:
             # exclusive upper bound; ``first_valid_col`` is inclusive.
             q_position = basic_params.q_seq_idx + q_row_in_cta
             diagonal_offset = cutlass.Int32(0)
-            if cutlass.const_expr(self.causal_bottom_right):
+            if cutlass.const_expr(self.bottom_right):
                 diagonal_offset = basic_params.seqlen_k - basic_params.seqlen_q
             diagonal_position = q_position + diagonal_offset
 
@@ -815,7 +815,7 @@ class SM120FusedMultiHeadAttentionForward:
                 num_kv_tiles = cutlass.Int32(0)
         if cutlass.const_expr(self.is_causal):
             causal_k_end = q_seq_idx + self.q_tile
-            if cutlass.const_expr(self.causal_bottom_right):
+            if cutlass.const_expr(self.bottom_right):
                 causal_k_end += seqlen_k - seqlen_q
             causal_k_end = cute.math.max(cutlass.Int32(0), cute.math.min(causal_k_end, seqlen_k))
             num_kv_tiles_causal = ceil_div(causal_k_end, self.kv_tile)
@@ -824,7 +824,7 @@ class SM120FusedMultiHeadAttentionForward:
         min_kv_tile = cutlass.Int32(0)
         if cutlass.const_expr(self.window_size_left is not None):
             first_q_position = q_seq_idx
-            if cutlass.const_expr(self.causal_bottom_right):
+            if cutlass.const_expr(self.bottom_right):
                 first_q_position += seqlen_k - seqlen_q
             first_valid_col = cute.math.max(cutlass.Int32(0), first_q_position - self.window_size_left)
             min_kv_tile = first_valid_col // self.kv_tile
@@ -990,7 +990,7 @@ class SM120FusedMultiHeadAttentionForward:
             mask_steps = 1
             if cutlass.const_expr(self.is_causal):
                 mask_steps = ceil_div(self.q_tile, self.kv_tile)
-                if cutlass.const_expr(self.causal_bottom_right):
+                if cutlass.const_expr(self.bottom_right):
                     # The shifted diagonal can straddle one additional KV tile.
                     mask_steps = ceil_div(self.q_tile + self.kv_tile - 1, self.kv_tile)
             left_mask_steps = 1
@@ -1391,9 +1391,9 @@ def compile(  # noqa: A001
     kernel = SM120FusedMultiHeadAttentionForward(
         in_dtype=STORAGE_DTYPE,
         out_dtype=STORAGE_DTYPE,
-        is_causal=PARAMS.is_causal,
-        causal_bottom_right=PARAMS.causal_bottom_right,
-        window_size_left=PARAMS.window_size_left,
+        is_causal=PARAMS.window_right is not None,
+        bottom_right=PARAMS.bottom_right,
+        window_size_left=PARAMS.window_left,
         seq_q_lens_present=PARAMS.seq_q_lens_present,
         seq_kv_lens_present=PARAMS.seq_kv_lens_present,
         has_sink=PARAMS.has_sink,
