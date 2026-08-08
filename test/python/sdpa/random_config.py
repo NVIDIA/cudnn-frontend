@@ -123,13 +123,17 @@ class ExecConfig:
     with_rope: bool = False
     with_ragged_offset_multiplier: bool = False
     # Each ragged tensor (Q/K/V/O and gradients) independently draws a token
-    # stride h*d + gap, gap in {0, 8, 64, roundup8(h*d)} seeded from
-    # rng_geom_seed — so mixed combinations occur (e.g. gapped Q/K with packed
-    # V/O). gap≈h*d is a view of an interleaved [T, 2, H, D] buffer, the
-    # layout torch.nn.attention.varlen users produce by slicing a fused KV
-    # projection. Gaps are multiples of 8 elements so ragged base addresses
-    # keep the alignment class of the packed layout (the graph API requires
-    # 16-byte-aligned pointers; an odd gap would make every offset illegal).
+    # stride of 1-4 whole tokens (gap = n*h*d, n in 0..3, seeded from
+    # rng_geom_seed): n=0 is the plain packed case, n=1 is exactly a view of
+    # an interleaved [T, 2, H, D] buffer (the layout
+    # torch.nn.attention.varlen users produce by slicing a fused KV
+    # projection), n=2 a [T, 3, H, D] QKV-interleave, and so on. Whole-token
+    # gaps keep every ragged base address in the packed layout's alignment
+    # class by construction (sub-token gaps can violate the graph API's
+    # 16-byte pointer-alignment contract — an odd-element gap is illegal for
+    # every engine). Default False: fixed configs and the fp8/mxfp8
+    # harnesses allocate assuming packed strides; the fp16 ragged sweeps
+    # enable this unconditionally.
     with_ragged_token_gap: bool = False
     rescale_threshold: float = None
 
@@ -211,8 +215,7 @@ class ExecConfig:
                 if shape is None:
                     return None
                 h, d = shape[1], shape[3]
-                hd8 = ((h * d + 7) // 8) * 8  # interleaved-buffer gap, alignment-preserving
-                return compute_packed_strides(shape, _gap_rng.choice([0, 8, 64, hd8]))
+                return compute_packed_strides(shape, _gap_rng.randint(0, 3) * h * d)
 
             gap_fn = _gapped
         elif self.is_ragged:
