@@ -1271,6 +1271,11 @@ class pygraph:
         may still have entries (an OPENSOURCE-only query legitimately leaves the
         cuDNN modes empty). Only every mode failing means the backend has
         nothing, and the last error is re-raised so the caller reports why.
+
+        "Succeeded" is tracked per call, NOT read off the spans: an OPENSOURCE
+        query registers a C++ OSS candidate without adding a plan, so it adds no
+        span. Judging by spans would rethrow a later mode's failure and discard
+        the OSS delegate the successful query earned.
         """
         import cudnn
 
@@ -1281,18 +1286,19 @@ class pygraph:
         # The SAME default the ranking assumes: two copies of it means querying
         # the backend for modes no family will place.
         modes = self._backend_heuristics or default_modes()
-        at, failure = self._lowered_graph.get_execution_plan_count(), None
+        at, failure, any_ok = self._lowered_graph.get_execution_plan_count(), None, False
         for mode in modes:
             try:
                 self._lowered_graph.create_execution_plans([mode])
             except cudnn.cudnnGraphNotSupportedError as exc:
                 failure = exc
                 continue
+            any_ok = True
             now = self._lowered_graph.get_execution_plan_count()
             if now > at:
                 self._backend_mode_spans.append((mode, at, now))
                 at = now
-        if not self._backend_mode_spans and failure is not None:
+        if not any_ok and failure is not None:
             raise failure
         self._cpp_plans_created = True
         self._forward_note_filters()  # deferred from _filter_notes(): the plans exist now

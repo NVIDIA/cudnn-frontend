@@ -179,24 +179,34 @@ def recommend(modes: List[Any], facts, offered: Dict[str, int], backend_plans: L
     fallback. A plan repeated across modes keeps its first position: building
     the same config twice only costs the caller a JIT compile.
     """
-    # An untagged backend entry is the delegating one: candidates C++ holds but
-    # never exposes as plans, which Graph::build_plans tries BEFORE its own
-    # engine_configs. It belongs to no mode and must keep the lead, or an
-    # OPENSOURCE caller gets a native kernel instead of the OSS one.
-    out: List[PlanConfig] = [c for c in backend_plans if c.mode is None]
+    # An untagged backend entry is the delegating one: OSS candidates C++ holds
+    # but never exposes as plans, so it cannot be enumerated. It belongs to no
+    # mode, and it is NOT a pure OSS entry -- Graph::build_plans tries the OSS
+    # engine and, if that one declines, falls through to the native
+    # engine_configs already enqueued. So it leads the BACKEND's entries but not
+    # ours: ahead of our OPENSOURCE block it would answer an OSS-coverage
+    # question with a native kernel.
+    delegating = [c for c in backend_plans if c.mode is None]
+    out: List[PlanConfig] = []
     for mode in modes:
         if mode == cudnn.heur_mode.OPENSOURCE:
-            out += _mode_a(facts, offered, cudnn.heur_mode.A)
+            out += _mode_a(facts, offered, cudnn.heur_mode.A) + delegating
         elif mode in (cudnn.heur_mode.A, cudnn.heur_mode.B):
             ours = _mode_a(facts, offered, mode)
-            theirs = [c for c in backend_plans if c.mode == mode]
+            theirs = delegating + [c for c in backend_plans if c.mode == mode]
             out += (ours + theirs) if _leads(offered, ours) else (theirs + ours)
         elif mode == cudnn.heur_mode.FALLBACK:
-            out += _mode_fallback(facts, offered) + [c for c in backend_plans if c.mode == mode]
+            out += _mode_fallback(facts, offered) + delegating + [c for c in backend_plans if c.mode == mode]
+    # A delegate with no mode asked for it (the backend has engines but exposed
+    # no plans) would otherwise be dropped.
+    out += delegating
 
+    # Identity is (engine, knobs). cpp_index is only WHERE one backend query put
+    # a plan, so keying on it would let [A, A], or one config both modes return,
+    # through as two entries -- and an autotuner would build and time it twice.
     seen, ranked = set(), []
     for cfg in out:
-        key = (cfg.engine_id, repr(cfg.knobs), cfg.cpp_index)
+        key = (cfg.engine_id, repr(cfg.knobs))
         if key not in seen:
             seen.add(key)
             ranked.append(cfg)
