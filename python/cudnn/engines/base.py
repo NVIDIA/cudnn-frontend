@@ -180,7 +180,7 @@ class BaseEngine(ABC):
         name: Human-readable identifier.
         engine_id: Stable id in the shared flat engine-id space, in the reserved
             Python region (>= PYTHON_ENGINE_ID_BASE). Subclasses MUST declare it;
-            the base default (None) is rejected at register_backend().
+            the base default (None) is rejected when the manifest builds it.
         behavior_notes / numerical_notes: what this engine's plans are, in the
             same vocabulary the backend's plans answer in, so
             deselect_behavior_notes(...) and friends mean one thing across the
@@ -213,15 +213,6 @@ class BaseEngine(ABC):
         if end <= self.engine_id:
             raise ValueError(f"engine {self.name!r} declares id_end={self.id_end} at or below its engine_id={self.engine_id}")
         return (self.engine_id, end)
-
-    def owns_id(self, engine_id: int) -> bool:
-        """Whether ``engine_id`` falls in this engine's declared block.
-
-        Convenience only — dispatch and registration read ``owned_id_range``
-        directly, so overriding this cannot make an engine answer for an id it
-        did not declare."""
-        lo, hi = self.owned_id_range
-        return lo <= engine_id < hi
 
     def check_support(self, graph: "pygraph") -> None:
         """Raise to decline ``graph``.

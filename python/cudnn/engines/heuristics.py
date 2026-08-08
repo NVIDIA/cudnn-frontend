@@ -18,9 +18,10 @@ design to concatenate and call it ranking.
 An engine answers two questions only: can I serve this graph
 (``check_support``) and compile me this config (``build_plan``).
 
-A family that declares no ``heuristics`` hook, and any engine outside a family
-(``register_backend()``), falls back to one default plan per accepting engine,
-ahead of the backend's entries.
+A family that declares no ``heuristics`` hook falls back to one default plan
+per accepting engine, ahead of the backend's entries. Every python engine
+belongs to a family — the manifest is the only way one exists — so a graph has
+a family's opinion or only the backend's.
 """
 
 from __future__ import annotations
@@ -53,8 +54,8 @@ def accepts(engine: BaseEngine, graph: "pygraph") -> bool:
     return True
 
 
-def _without_a_family(graph: "pygraph", engines: List[BaseEngine], backend_plans: List[PlanConfig]) -> List[PlanConfig]:
-    """The ranking for a graph no family speaks for: accepting engines, then the backend."""
+def _unranked(graph: "pygraph", engines: List[BaseEngine], backend_plans: List[PlanConfig]) -> List[PlanConfig]:
+    """The ranking for a family with no heuristics hook: accepting engines, then the backend."""
     return [PlanConfig(e.engine_id, None) for e in engines if accepts(e, graph)] + list(backend_plans)
 
 
@@ -70,7 +71,7 @@ def rank(graph: "pygraph", engines: List[BaseEngine], backend_plans: List[PlanCo
     family = manifest.family_for(graph)
     recommend = manifest.resolve_heuristics(family) if family is not None else None
     if recommend is None:
-        return _without_a_family(graph, engines, backend_plans)
+        return _unranked(graph, engines, backend_plans)
 
     analyzer = manifest.resolve_analyzer(family)
     facts = graph._facts_for(analyzer) if analyzer is not None else None
@@ -79,7 +80,7 @@ def rank(graph: "pygraph", engines: List[BaseEngine], backend_plans: List[PlanCo
         # express it. Nothing to rank its engines on; the backend serves it.
         return list(backend_plans)
 
-    offered = {e.name: e.engine_id for e in engines if family.owns(e.engine_id)}
+    offered = {e.name: e.engine_id for e in engines}
     plans = list(recommend(modes, facts, offered, list(backend_plans)))
     own = set(offered.values())
     for cfg in plans:
@@ -87,6 +88,4 @@ def rank(graph: "pygraph", engines: List[BaseEngine], backend_plans: List[PlanCo
 
         if is_python_engine(cfg.engine_id) and cfg.engine_id not in own:
             raise ValueError(f"heuristics for {family.name} returned python engine_id {cfg.engine_id}, which the family does not own or offer")
-    # register_backend() engines sit outside every family, so no family
-    # heuristic speaks for them; they go last, ahead of nothing.
-    return plans + [PlanConfig(e.engine_id, None) for e in engines if not family.owns(e.engine_id) and accepts(e, graph)]
+    return plans

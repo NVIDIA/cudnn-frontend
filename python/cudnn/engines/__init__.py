@@ -10,8 +10,9 @@ against the backend's own recommendation into ONE list (``graph.plans``);
 
 Which engines exist is the library's own business: ``manifest.py`` is the static
 table this version ships, matched against a graph by a cheap node-type key
-before any engine module is imported. ``graph.register_backend()`` remains as
-the out-of-tree escape hatch.
+before any engine module is imported. It is the ONLY way a python engine
+exists -- there is no registration call, so an engine id always decodes back to
+a family and a slot.
 """
 
 from .base import BaseEngine, decline_types, CompiledPlan, ExecutionContext, PlanConfig
@@ -19,7 +20,6 @@ from .engine_ids import (
     BACKEND_ENGINE_ID_BASE,
     BACKEND_HEURISTIC_ENGINE_ID,
     CPP_OSS_ENGINE_ID_BASE,
-    OUT_OF_TREE_ID_BASE,
     PYTHON_ENGINE_ID_BASE,
     is_backend_engine,
     is_python_engine,
@@ -53,7 +53,6 @@ __all__ = [
     "BACKEND_ENGINE_ID_BASE",
     "CPP_OSS_ENGINE_ID_BASE",
     "PYTHON_ENGINE_ID_BASE",
-    "OUT_OF_TREE_ID_BASE",
     "BACKEND_HEURISTIC_ENGINE_ID",
     "is_python_engine",
     "is_backend_engine",

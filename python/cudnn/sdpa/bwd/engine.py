@@ -120,7 +120,7 @@ def FrostSdpaBwdEngines(ids) -> List[FrostSdpaBwdEngine]:
     ``ids`` is ``{name: engine_id}`` from engines/manifest.py — the single
     source of engine ids. A spec absent from it is one the manifest is not
     offering (still opt-in gated), so it is simply not built; a spec that has
-    no slot AT ALL is caught by test_engine_router, not at runtime.
+    no slot AT ALL is caught by test_dispatch, not at runtime.
     """
     from .engines import ENGINE_SPECS
 

@@ -16,7 +16,8 @@ import torch
 from gemm_test_utils import requires_sm100
 
 import cudnn
-from cudnn.engines import MANIFEST, OUT_OF_TREE_ID_BASE, PlanConfig, heuristics, is_backend_engine, is_python_engine
+from cudnn.engines import MANIFEST, PlanConfig, heuristics, is_backend_engine, is_python_engine
+from test_dispatch import _FAKE, _offer
 
 pytestmark = pytest.mark.L0
 
@@ -273,7 +274,7 @@ def test_build_walk_falls_through_a_declining_plan(caplog, monkeypatch):
 
     class Boom(BaseEngine):
         name = "frost_fake_always_fails"
-        engine_id = OUT_OF_TREE_ID_BASE + 1
+        engine_id = _FAKE + 1
 
         def build_plan(self, graph, plan, ctx=None):
             raise NotImplementedError("frost build boom")
@@ -282,11 +283,11 @@ def test_build_walk_falls_through_a_declining_plan(caplog, monkeypatch):
             raise AssertionError("should never run")
 
     boom = Boom()
+    _offer(monkeypatch, boom)
 
     a, b, bias_t, ref = _operands()
     g, A, B, bias, Y = _build_matmul_bias_relu()
     monkeypatch.setattr(heuristics, "rank", lambda graph, engines, backend_plans, modes=None: [PlanConfig(boom.engine_id)] + list(backend_plans))
-    g.register_backend(boom)
     _plan(g)
     assert g.get_plan_name_at_index(0) == "frost_fake_always_fails"
     g.check_support()

@@ -10,13 +10,13 @@ generated lazily only then.
 
 Execution flow (unification proposal):
     build ops -> create_execution_plans() -> heuristics -> selected backend
-    (a registered native engine, or the cuDNN Graph backend by lazy lowering)
+    (a python engine of the graph's family, or the cuDNN Graph backend by lazy
+    lowering)
 
-Example with a native backend (pass torch tensors directly):
+Example (pass torch tensors directly):
     >>> graph = pygraph()
-    >>> graph.register_backend(MyDslEngine())  # any BaseEngine
     >>> C = graph.matmul(a_tensor, b_tensor)  # auto-creates descriptors
-    >>> graph.execute({C: c_tensor})  # routes to a supporting backend, else cuDNN
+    >>> graph.execute({C: c_tensor})  # routes to a supporting engine, else cuDNN
 """
 
 from dataclasses import dataclass
@@ -91,9 +91,6 @@ class pygraph:
         device_property: Any = None,
         is_dynamic_shape_enabled: bool = False,
         is_override_shape_enabled: bool = False,
-        *,
-        # ---- new (keyword-only: never shifts the classic positional order) --
-        backends: Optional[List["BaseEngine"]] = None,
         **kwargs,
     ):
         self._context = GraphContext(
@@ -133,7 +130,6 @@ class pygraph:
         # ranked plan list (python engines + cuDNN) in one shared engine-id
         # space; each plan is dispatched by its id (is_python_engine -> python
         # registry, else lower to cuDNN). ``_plan_index`` selects the plan to run.
-        self._backends: List["BaseEngine"] = []
         self._plans: List[Any] = []  # list[PlanConfig], populated by create_execution_plans()
         self._planning_done: bool = False  # create_execution_plans() ran (one-shot)
         self._frozen: bool = False  # whole-surface freeze (set by _freeze())
@@ -154,63 +150,10 @@ class pygraph:
         self._workspace_limit: Optional[int] = None  # deselect_workspace_greater_than()
         self._note_filters: List[Any] = []  # (kind, note, keep) from the classic note filters
         self._plan_pinned: bool = False  # select_plan() => the walk is strict
-        for _e in backends or ():  # constructor path uses the SAME validation
-            self.register_backend(_e)
 
     # =========================================================================
-    # Backend registration & routing
+    # Routing
     # =========================================================================
-
-    def register_backend(self, engine: "BaseEngine") -> "pygraph":
-        """Add a candidate python execution engine. It joins the plan list at
-        create_execution_plans() time when its check_support() accepts the graph.
-
-        Validated at registration (not at failure time): the engine must declare
-        a stable engine_id in the reserved python region, that id must not fall
-        in a block the in-tree manifest reserves nor overlap another registered
-        engine's block, and registration after planning is rejected (planning is
-        one-shot — build a new graph).
-
-        The id checks are what make ``_engine_for()`` a lookup rather than a
-        guess: two engines owning the same id would let one of them execute the
-        other's plan. Blocks are declared as intervals precisely so that
-        disjointness can be PROVEN here instead of hoped for."""
-        from .engines.engine_ids import OUT_OF_TREE_ID_BASE
-        from .engines.manifest import MANIFEST
-
-        eid = getattr(engine, "engine_id", None)
-        if not isinstance(eid, int):
-            raise ValueError(f"engine {engine!r} must declare a stable integer engine_id (got {eid!r})")
-        lo, hi = engine.owned_id_range
-        for family in MANIFEST:  # blocks are intervals, so disjointness is decidable
-            if lo < family.id_end and family.engine_id < hi:
-                raise ValueError(
-                    f"engine {engine.name!r} ({type(engine).__module__}) claims ids [{lo}, {hi}), which overlaps the "
-                    f"block [{family.engine_id}, {family.id_end}) the in-tree manifest reserves for {family.name!r} "
-                    f"({family.module}); an engine from outside the library uses ids >= {OUT_OF_TREE_ID_BASE}"
-                )
-        else:
-            if lo < OUT_OF_TREE_ID_BASE:
-                raise ValueError(
-                    f"engine {engine.name!r} claims ids [{lo}, {hi}); ids below {OUT_OF_TREE_ID_BASE} are the in-tree "
-                    f"region (cudnn/engines/engine_ids.py) — an engine registered from outside the library uses the "
-                    f"out-of-tree range"
-                )
-        for other in self._backends:
-            o_lo, o_hi = other.owned_id_range
-            if lo < o_hi and o_lo < hi:
-                raise ValueError(f"engine {engine.name!r} claims ids [{lo}, {hi}), which overlaps [{o_lo}, {o_hi}) already registered by {other.name!r}")
-        if self._planning_done:
-            raise RuntimeError("cannot register a backend after create_execution_plans(); planning is one-shot — build a new graph")
-        self._backends.append(engine)
-        return self
-
-    @property
-    def backends(self) -> List["BaseEngine"]:
-        """Engines added with ``register_backend()`` (the out-of-tree hatch).
-        The full candidate set for a graph — these plus the matching manifest
-        rows — is ``_candidate_engines()``."""
-        return list(self._backends)
 
     @property
     def plans(self) -> List[Any]:
@@ -832,7 +775,7 @@ class pygraph:
         # rejects raises from validate() where callers catch it to skip. Skipped
         # only for a graph the backend has no lowering for (GDN/KDA/...), or when
         # the caller registered its own engine — the pre-existing exemption.
-        if not self._backends and self._backend_lowerable() and self._lowered_graph is None:
+        if self._backend_lowerable() and self._lowered_graph is None:
             self._lowered_graph = self._lower_to_cpp()
             self._lowered_graph.validate()
             self._verify_uid_ownership()
@@ -946,30 +889,25 @@ class pygraph:
         self._plan_index = 0
 
     def _candidate_engines(self) -> List["BaseEngine"]:
-        """The python engines this graph may dispatch to: anything
-        ``register_backend()`` added, then the in-tree manifest families whose
-        coarse key matches. Registered engines lead because bringing your own
-        engine is an explicit act; the library's own table is the default.
+        """The python engines this graph may dispatch to: the in-tree manifest
+        family whose coarse key matches, and nothing else — an engine is known
+        because the library ships it, not because someone handed it over.
         (Candidate ORDER is not rank — ``heuristics.rank`` ranks.) Cached: the
         graph is frozen at planning time anyway."""
         if self._candidates is None:
             from .engines import manifest
 
-            # Registering an in-tree engine pins THAT instance: the manifest
-            # must not also offer its own copy, or the id has two owners.
-            claimed = [e.owned_id_range for e in self._backends]
-            from_manifest = [e for e in manifest.engines_for(self) if not any(lo < e.owned_id_range[1] and e.owned_id_range[0] < hi for lo, hi in claimed)]
-            self._candidates = list(self._backends) + from_manifest
+            self._candidates = list(manifest.engines_for(self))
         return self._candidates
 
     def _finalize_backend_layout(self) -> None:
         """Let the backend's layout inference land before the graph is frozen.
 
         Lowering and reflecting strides back is how the GRAPH learns what it
-        will execute with, so it runs the same way whether or not an
-        out-of-tree engine was registered -- splitting those paths is what left
-        the snapshot unenforceable, since _sync_ir_shapes_from_backend writes
-        through object.__setattr__ to bypass the freeze.
+        will execute with, so it runs for every backend-lowerable graph -- a
+        path that skipped it for graphs a python engine might claim is what
+        left the snapshot unenforceable, since _sync_ir_shapes_from_backend
+        writes through object.__setattr__ to bypass the freeze.
 
         A failure here is the backend DECLINING (a python engine may still
         serve the graph), recorded as backend_plan_entries() records one. Not

@@ -4,8 +4,10 @@
 """The engines this version ships — the library's own static table.
 
 No registration call: the library knows which engines it was built with, so
-discovery is the library's job. ``register_backend()`` is the out-of-tree
-escape hatch and nothing else uses it.
+discovery is the library's job, and this table is the ONLY way a python engine
+exists. An engine id decodes to a family and a slot here
+(:func:`engine_for_id`), so nothing has to be registered for one to be named,
+built, or replayed.
 
 This module has ZERO imports of engine code (families are strings and ints), so
 ``import cudnn`` never pays an engine's import cost just to know the engine

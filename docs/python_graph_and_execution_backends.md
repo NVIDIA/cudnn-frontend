@@ -57,21 +57,25 @@ is natively introspectable and an engine is one file implementing
   the per-family hook it dispatches to (see *Ranking and the one plan list*).
 - Every engine has a stable `engine_id` in one flat id space
   (`engines/engine_ids.py`: backend `[0, 10_000)`, C++ OSS `[10_000, 20_000)`,
-  python `[20_000, …)` with a `FAMILY_BLOCK`-wide block per family, out-of-tree
-  `30_000+`) — reproducible pinning/autotune. Engines do not DECLARE their id:
-  the manifest holds every slot and `instantiate()` hands each factory the ids
-  its engines are to use, so an engine cannot claim a number it was not given
-  and the whole space is readable in one file.
+  python `[20_000, …)` with a `FAMILY_BLOCK`-wide block per family) —
+  reproducible pinning/autotune. Engines do not DECLARE their id: the manifest
+  holds every slot and `instantiate()` hands each factory the ids its engines
+  are to use, so an engine cannot claim a number it was not given, the whole
+  space is readable in one file, and any id decodes back to a family and a slot
+  (`manifest.engine_for_id`) with nothing registered first — which is what lets
+  `create_execution_plan(engine_id, knobs)` replay an autotune result.
 - An engine declines a graph ONLY via `NotImplementedError`,
   `cudnn.cudnnGraphNotSupportedError`, or `ImportError`; anything else is an
   engine bug and propagates. `ImportError` counts because lowering imports are
   deferred past `check_support()` (see *Import boundaries*), so a missing
   optional dependency can only surface at build time — without it, a host
   lacking the `cutedsl` extra would lose graphs the backend could have served.
-- The contract oracle is `TorchMatmulEngine` in
-  `test/python/test_engine_router.py` (pure PyTorch, CPU): the dispatch
-  contract is proven end to end without a GPU, and no oracle ships in the
-  package.
+- The contract is proven end to end without a GPU in
+  `test/python/test_dispatch.py`, with stand-in engines injected through the
+  manifest — the same path production uses. Those engines do no arithmetic:
+  what dispatch is responsible for is reaching the engine and resolving the
+  caller's buffers, and checking a result against `torch.matmul` would put a
+  torch reference implementation of matmul inside a dispatch test.
 - `GdnCuTileEngine` executes the single-node `gdn` and `gdn_bwd` ops (Gated
   DeltaNet linear attention) via the cuTile chunked kernels. Both ops are
   THD-only: token-packed `[total_T, heads, dim]` tensors with a required
@@ -156,11 +160,13 @@ without being imported. Everything else is the engine's own `check_support()`.
   `("module", "callable")` pair kept as strings so the coarse key stays
   import-free. It is handed the facts, the family's offered ids and the
   backend's entries, and what it returns IS the plan list.
-- **`register_backend()` installs an engine INSTANCE on one graph** — the
-  hatch tests use to inject a fake. It does not make an engine rankable: an
-  out-of-tree engine declares no `Capabilities`, so nothing can enumerate its
-  configs or place it against the backend. In-tree engines are discovered; ids
-  below `OUT_OF_TREE_ID_BASE` are rejected.
+- **There is no registration call.** The manifest is the only way a python
+  engine exists, and `_candidate_engines()` is the graph's family and nothing
+  else. An engine handed over at runtime could never be ranked anyway: it
+  declares no `Capabilities`, so nothing can enumerate its configs or place it
+  against the backend — it was an entry point into the plan list, not into the
+  decision. Tests inject their fakes as a manifest family, so they reach
+  dispatch the way real engines do.
 
 ### Facts: one description per graph, shared
 
@@ -326,9 +332,6 @@ not asserted (kernel names are backend-internal and version-dependent).
 - Per-family tuning rules on top of the ranking frame, each with the
   measurements behind it; a cost model that can compare a python config against
   a cuDNN engine on a common currency (predicted time).
-- Remove the out-of-tree engine concept: an engine id is decodable from the
-  manifest alone, so `_owners_for_id` need not be limited to registered
-  instances, and `register_backend` / `OUT_OF_TREE_ID_BASE` can go.
 - DSL engine integration (the cuTile matmul engine lives in this track).
 - Structural cleanup: lifecycle state objects, a `CudnnBackendAdapter` to
   remove `selected_engine is None` branching, lowering extracted to its own
