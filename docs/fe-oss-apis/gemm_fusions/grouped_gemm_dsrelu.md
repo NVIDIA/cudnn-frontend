@@ -238,7 +238,11 @@ op.execute(
   - Layout: must match `D_row`
   - Dtype: must match `D_row`
 - Output tensor **dprob**: `result["dprob_tensor"]` (wrapper) or `sample_dprob` / `dprob_tensor` (class)
-  - Shape: `(valid_m, 1, 1)`
+  - Shape (wrapper): `(valid_m, 1, 1)`, whether or not `deterministic` is set — the per-N-tile
+    workspace and the reduction into it are internal
+  - Shape (class API): `(valid_m, 1, 1)` normally, but `(valid_m, grid_n, 1)` under
+    `deterministic=True`, and the caller reduces over dim 1 after `execute()`.
+    See [Deterministic dprob](#deterministic-dprob) for `grid_n`
   - Dtype: `float32`
 - Output tensors **SFD_row** / **SFD_col**
   - Dtypes: must match `SFA`
@@ -322,9 +326,8 @@ Tuple unpacking order is: `(d_row_tensor, d_col_tensor, dprob_tensor, dbias_tens
 
 ## Deterministic dprob
 
-`dprob` is the only output of this kernel that is not reproducible run to run by default.
-Every other output writes each element exactly once; `dprob` is a float reduction, and it is
-non-deterministic at two levels:
+`dprob` is a float reduction rather than a single write per element, and by default it is not
+reproducible run to run. It is non-deterministic at two levels:
 
 1. **Within a CTA.** The N-subtile loop is traversed forward or reversed depending on the
    accumulator pipeline phase, which varies between runs. A running fp32 sum over a flipping
@@ -362,6 +365,11 @@ non-deterministic configurations compile and cache separately.
 `grid_n` is the number of N-tiles the scheduler can emit, `ceil_div(n, TILE_N × cluster_n) ×
 cluster_n` — which is *not* `ceil_div(n, TILE_N)` unless `cluster_n` is 1, because the
 scheduler counts whole clusters and then expands to CTAs.
+
+**The flag covers `dprob` only.** With `generate_dbias=True` the kernel also accumulates
+`dbias` across CTA tiles with atomics, so that output remains scheduling-dependent. Every
+other output — `d_row`, `d_col`, `d_srelu`, the scale factors — is a single write per element
+and is reproducible either way. A run needing bit-exact `dbias` cannot get it here yet.
 
 ---
 

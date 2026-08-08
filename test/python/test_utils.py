@@ -24,6 +24,9 @@ def assert_bitwise_runs(launch, repeats=DETERMINISM_REPEATS, label=""):
     ``repeats`` times back to back (single sync at the end) and require every
     run to match run 0 bit for bit (barrier/fence races are timing-dependent;
     any mismatching bit is a failure, there is no tolerance)."""
+    # DETERMINISM_REPEATS is settable, and below 2 there is nothing to compare run 0
+    # against -- the loop below would be empty and the assertion would pass vacuously.
+    assert repeats >= 2, f"{label}: assert_bitwise_runs needs repeats >= 2, got {repeats}"
     runs = [launch() for _ in range(repeats)]
     torch.cuda.synchronize()
     for out in runs[0]:

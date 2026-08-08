@@ -400,6 +400,7 @@ def _run_dsrelu_case(case, **wrapper_kwargs):
     from cuda.bindings import driver as cuda
 
     inputs, cfg = case
+    wrapper_kwargs.setdefault("current_stream", cuda.CUstream(torch.cuda.current_stream().cuda_stream))
     return grouped_gemm_dsrelu_wrapper_sm100(
         a_tensor=inputs["a_tensor"],
         b_tensor=inputs["b_tensor"],
@@ -421,12 +422,11 @@ def _run_dsrelu_case(case, **wrapper_kwargs):
         vector_f32=cfg["vector_f32"],
         m_aligned=cfg["m_aligned"],
         discrete_col_sfd=cfg["discrete_col_sfd"],
-        current_stream=cuda.CUstream(torch.cuda.current_stream().cuda_stream),
         **wrapper_kwargs,
     )
 
 
-def _build_dsrelu_case(request, ab_dtype, c_dtype, d_dtype, sf_vec_size, sf_dtype, vector_f32, discrete_col_sfd):
+def _build_dsrelu_case(request, ab_dtype, c_dtype, d_dtype, sf_vec_size, sf_dtype, vector_f32, discrete_col_sfd, n_override=None):
     cfg = grouped_gemm_dsrelu_init(
         request=request,
         ab_dtype=ab_dtype,
@@ -442,6 +442,10 @@ def _build_dsrelu_case(request, ab_dtype, c_dtype, d_dtype, sf_vec_size, sf_dtyp
         discrete_col_sfd=discrete_col_sfd,
         b_major="k",
     )
+    if n_override is not None:
+        # Everything downstream reads cfg["n"], so overriding it here keeps the allocators,
+        # the wrapper call and the reference in agreement.
+        cfg["n"] = n_override
     inputs = allocate_grouped_gemm_input_tensors(
         n=cfg["n"],
         k=cfg["k"],
@@ -470,13 +474,18 @@ def _build_dsrelu_case(request, ab_dtype, c_dtype, d_dtype, sf_vec_size, sf_dtyp
 
 @contextlib.contextmanager
 def _torch_deterministic_algorithms():
-    """Scope torch's global determinism flag, restoring whatever the session had."""
+    """Scope torch's global determinism flag, restoring whatever the session had.
+
+    warn_only is captured and restored too: hardcoding it on the way out would downgrade a
+    session running under strict determinism into warning-only for every later test.
+    """
     previous = torch.are_deterministic_algorithms_enabled()
+    previous_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
     torch.use_deterministic_algorithms(True, warn_only=True)
     try:
         yield
     finally:
-        torch.use_deterministic_algorithms(previous, warn_only=True)
+        torch.use_deterministic_algorithms(previous, warn_only=previous_warn_only)
 
 
 def _assert_dprob_deterministic(case, baseline, deterministic, relaunch, ref_inputs=None):
@@ -556,11 +565,14 @@ def test_grouped_gemm_dsrelu_deterministic_dprob(request, ab_dtype, c_dtype, d_d
 
     case = _build_dsrelu_case(request, ab_dtype, c_dtype, d_dtype, sf_vec_size, sf_dtype, vector_f32, discrete_col_sfd)
 
+    # Only the baseline probe may skip. Once it has run, the config is supported, so a
+    # failure from the deterministic run is a real failure -- catching it here would turn
+    # exactly the regression this test exists to find into a green skip.
     try:
         baseline = _run_dsrelu_case(case, deterministic=False)
-        deterministic = _run_dsrelu_case(case, deterministic=True)
     except (ValueError, NotImplementedError) as e:
         pytest.skip(f"Unsupported testcase: {e}")
+    deterministic = _run_dsrelu_case(case, deterministic=True)
     _assert_dprob_deterministic(case, baseline, deterministic, lambda: _run_dsrelu_case(case, deterministic=True))
 
     # Unset, the flag follows torch -- the path most callers will actually take.
@@ -573,6 +585,65 @@ def test_grouped_gemm_dsrelu_deterministic_dprob(request, ab_dtype, c_dtype, d_d
 # b_major does not reach the dprob path, so the n-major config would only re-prove what
 # fp8-k-major already does; the two dtypes are kept because they compile different kernels.
 DISCRETE_DETERMINISTIC_CONFIGS = [c for c in DISCRETE_GROUPED_GEMM_DSRELU_SUPPORTED_CONFIGS if c.id != "fp8-n-major"]
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=29)
+def test_grouped_gemm_dsrelu_deterministic_dprob_side_stream(request):
+    """The slot reduction must be ordered against the kernel on the caller's stream.
+
+    Issued on torch's current stream instead, it would read dprob before the kernel that
+    writes it had finished. The race is timing-dependent, so a green run here is not proof
+    of correct ordering -- but it does exercise the non-current-stream path, which every
+    other test misses by passing torch's own stream.
+    """
+    try:
+        import cudnn  # noqa: F401
+        from cuda.bindings import driver as cuda
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn optional dependencies not installed")
+
+    case = _build_dsrelu_case(request, torch.float8_e4m3fn, torch.bfloat16, torch.float8_e4m3fn, 32, torch.float8_e8m0fnu, False, True)
+    inputs, cfg = case
+
+    # Deliberately NOT entering torch.cuda.stream(side): the divergence between the wrapper's
+    # stream and torch's current stream is the whole point. Inside that context the two would
+    # be the same stream and the ordering bug could not appear.
+    side = torch.cuda.Stream()
+    try:
+        on_side = _run_dsrelu_case(case, deterministic=True, current_stream=cuda.CUstream(side.cuda_stream))
+    except (ValueError, NotImplementedError) as e:
+        pytest.skip(f"Unsupported testcase: {e}")
+    torch.cuda.synchronize()
+
+    check_ref_grouped_gemm_dsrelu(inputs, on_side, cfg, skip_ref=cfg["skip_ref"])
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=31)
+def test_grouped_gemm_dsrelu_deterministic_dprob_slot_count_cache(request):
+    """Two N values with different slot counts must not share a compiled kernel.
+
+    Under CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL the cache key drops tensor shapes, but the
+    dprob slot extent is static in the compiled descriptor. n=512 and n=768 give 2 and 3
+    slots; if the second reuses the first's kernel, its dprob comes back wrong.
+    """
+    try:
+        import cudnn  # noqa: F401
+        from cuda.bindings import driver as cuda  # noqa: F401
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn optional dependencies not installed")
+
+    args = (torch.float8_e4m3fn, torch.bfloat16, torch.float8_e4m3fn, 32, torch.float8_e8m0fnu, False, True)
+    for n in (512, 768):
+        case = _build_dsrelu_case(request, *args, n_override=n)
+        inputs, cfg = case
+        try:
+            outputs = _run_dsrelu_case(case, deterministic=True)
+        except (ValueError, NotImplementedError) as e:
+            pytest.skip(f"Unsupported testcase: {e}")
+        torch.cuda.synchronize()
+        check_ref_grouped_gemm_dsrelu(inputs, outputs, cfg, skip_ref=cfg["skip_ref"])
 
 
 @pytest.mark.L0

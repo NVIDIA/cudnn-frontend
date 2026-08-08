@@ -25,9 +25,10 @@ from .moe_blockscaled_grouped_gemm_dsrelu_quant import (
 )
 from ..moe_utils import MoEWeightMode
 from cuda.bindings import driver as cuda
+from contextlib import contextmanager
 import logging
 import os
-from typing import Tuple, Optional
+from typing import Iterator, Tuple, Optional
 
 import cutlass
 import cutlass.cute as cute
@@ -98,18 +99,46 @@ def _dprob_n_slots(n_out: int, mma_tiler_mn: Tuple[int, int], cluster_shape_mn: 
     return ceil_div(n_out, mma_tiler_mn[1] * cluster_n) * cluster_n
 
 
-def _reduce_dprob_slots(dprob_tensor: torch.Tensor, caller_dprob_tensor: Optional[torch.Tensor], deterministic: bool) -> torch.Tensor:
+@contextmanager
+def _torch_stream_context(current_stream: Optional[cuda.CUstream]) -> Iterator[None]:
+    """Run torch work on ``current_stream`` when the caller supplied one.
+
+    Same shape as the helpers in csa/compressor and deepseek_sparse_attention/utils; kept
+    local rather than imported so a GEMM kernel does not depend on an attention module.
+    """
+    if current_stream is None:
+        yield
+        return
+    import torch
+
+    with torch.cuda.stream(torch.cuda.get_stream_from_external(int(current_stream))):
+        yield
+
+
+def _reduce_dprob_slots(
+    dprob_tensor: torch.Tensor,
+    caller_dprob_tensor: Optional[torch.Tensor],
+    deterministic: bool,
+    current_stream: Optional[cuda.CUstream],
+) -> torch.Tensor:
     """Collapse the per-N-tile dprob slots back to the caller's ``(valid_m, 1, 1)`` shape.
 
     A no-op unless deterministic, where the sum is what makes the result reproducible: it
     runs in a fixed order, unlike the kernel's cross-CTA atomics. Accumulates onto a
     caller-supplied buffer, matching what the atomic does on the non-deterministic path;
     when we allocated the buffer ourselves there is nothing to add onto.
+
+    Issued on ``current_stream``, the same stream execute() ran the kernel on. On torch's
+    current stream instead, a caller who passes a different stream would have the reduction
+    read dprob_tensor before the kernel finished writing it.
     """
     if not deterministic:
         return dprob_tensor
-    reduced = torch.sum(dprob_tensor, dim=1, keepdim=True)
-    return reduced if caller_dprob_tensor is None else caller_dprob_tensor.add_(reduced)
+    import torch
+
+    with _torch_stream_context(current_stream):
+        reduced = torch.sum(dprob_tensor, dim=1, keepdim=True)
+        return reduced if caller_dprob_tensor is None else caller_dprob_tensor.add_(reduced)
 
 
 def _reinterpret_raw_grouped_fp4_tensor(tensor: torch.Tensor) -> torch.Tensor:
@@ -1696,7 +1725,7 @@ def grouped_gemm_dsrelu_wrapper_sm100(
             d_srelu_tensor=d_srelu_tensor,
             # Reduced here too, so a zero-token call returns the documented (valid_m, 1, 1)
             # shape rather than leaking the slot dimension.
-            dprob_tensor=_reduce_dprob_slots(dprob_tensor, caller_dprob_tensor, deterministic),
+            dprob_tensor=_reduce_dprob_slots(dprob_tensor, caller_dprob_tensor, deterministic, current_stream),
             dbias_tensor=dbias_tensor,
             amax_tensor=amax_tensor,
             sfd_row_tensor=sfd_row_tensor,
@@ -1776,6 +1805,12 @@ def grouped_gemm_dsrelu_wrapper_sm100(
             *tensor_signature(alpha_tensor),
             *(dynamic_m_tensor_signature(prob_tensor, (1, 1)) if not use_full_dynamic else dynamic_tensor_signature(prob_tensor)),
             *(dynamic_m_tensor_signature(dprob_tensor, tuple(dprob_tensor.shape[1:])) if not use_full_dynamic else dynamic_tensor_signature(dprob_tensor)),
+            # Explicit, because the signature above does not carry it under use_full_dynamic:
+            # that path drops the shape entirely, yet the slot count is baked into the
+            # compiled descriptor. n_out=512 and n_out=513 give 2 and 3 slots with identical
+            # stride order, so without this the second call would reuse a kernel built for
+            # the wrong dprob extent.
+            dprob_n_slots,
             *(dynamic_tensor_signature(dbias_tensor) if use_full_dynamic else tensor_signature(dbias_tensor)),
             *(dynamic_m_tensor_signature(d_srelu_tensor, (n_out, 1)) if not use_full_dynamic else dynamic_tensor_signature(d_srelu_tensor)),
             *(dynamic_tensor_signature(sfb_tensor) if use_full_dynamic else tensor_signature(sfb_tensor)),
@@ -1959,7 +1994,7 @@ def grouped_gemm_dsrelu_wrapper_sm100(
         d_row_tensor=d_row_tensor,
         d_col_tensor=d_col_tensor,
         d_srelu_tensor=d_srelu_tensor,
-        dprob_tensor=_reduce_dprob_slots(dprob_tensor, caller_dprob_tensor, deterministic),
+        dprob_tensor=_reduce_dprob_slots(dprob_tensor, caller_dprob_tensor, deterministic, current_stream),
         dbias_tensor=dbias_tensor,
         amax_tensor=amax_tensor,
         sfd_row_tensor=sfd_row_tensor,
