@@ -34,7 +34,6 @@ from cudnn.sdpa.fwd.config_sm100 import TemplateParams as Sm100TemplateParams
 from cudnn.sdpa.fwd.config_sm120 import (
     SEQ_KV_TILES as _SM120_KV_TILES,
     SEQ_Q_TILES as _SM120_Q_TILES,
-    tile_choice as _sm120_tile_choice,
     SUPPORTED_HEAD_TILES as _SM120_SUPPORTED_HEAD_TILES,
     TemplateParams as Sm120TemplateParams,
 )
@@ -1646,17 +1645,12 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             base = max(kv_tile * (d_q + d_v) * self.dtype.itemsize, self.q_tile * d_v * o_item)
             return base + 16
 
-        chose_by_shape = False
-        if self.tile_m is None and self.tile_n is None:
-            # No knob request: pick by shape and machine width rather than by
-            # what fits. Each cell has its own rule -- they share a knob domain
-            # but not an optimum. Both tiles come from one decision, so a
-            # half-specified request opts out entirely.
-            sms = torch.cuda.get_device_properties(self.q_desc.device).multi_processor_count
-            self.q_tile, self.kv_tile = _sm120_tile_choice(int(s_q), int(s_kv), int(h_q), int(b), int(sms), bool(self.is_causal))
-            chose_by_shape = _smem_bytes(self.kv_tile) <= smem_capacity_bytes
-        if self.tile_n is None and not chose_by_shape:
-            # Pick the largest KV tile that fits this device.
+        if self.tile_n is None:
+            # Largest KV tile this device fits. RESOURCE feasibility, not a
+            # performance choice: which tile is fastest is a measurement, and it
+            # is made once, in sdpa/fwd/heuristics.py. A graph reaching here
+            # already carries the tiles that decided on; only a direct caller of
+            # this adapter leaves them unset.
             self.kv_tile = next((t for t in _SM120_KV_TILES if _smem_bytes(t) <= smem_capacity_bytes), self.kv_tile)
         self._not_implemented_error_if(
             _smem_bytes(self.kv_tile) > smem_capacity_bytes,

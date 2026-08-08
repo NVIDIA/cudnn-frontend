@@ -108,16 +108,6 @@ class FrostSdpaFwdEngine(BaseEngine):
     def check_support(self, graph: "pygraph") -> None:
         self._facts_or_decline(graph)
 
-    def propose_plans(self, graph: "pygraph") -> List[PlanConfig]:
-        # Entry 0 delegates (knobs=None -> the adapter's own shape-driven
-        # choice); the rest name one point of the capability row's knob domain
-        # each. Not duplicates: a delegation may pick differently as the
-        # library learns, a named knob set must be honored verbatim or the
-        # engine declines.
-        from .engines import knob_candidates
-
-        return [PlanConfig(self.engine_id, k) for k in knob_candidates(self._spec, self._facts_or_decline(graph))]
-
     def build_plan(self, graph: "pygraph", plan: PlanConfig, ctx: ExecutionContext = None) -> CompiledPlan:
         from .engines import build
 

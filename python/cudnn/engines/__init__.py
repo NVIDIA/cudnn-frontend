@@ -24,9 +24,8 @@ from .engine_ids import (
     is_backend_engine,
     is_python_engine,
 )
-from .heuristics import heuristics_sort
 from .manifest import MANIFEST, EngineFamily
-from .router import Router, decline_types, default_router
+from .router import decline_types
 
 
 def __getattr__(name: str):
@@ -49,10 +48,7 @@ __all__ = [
     "CompiledPlan",
     "ExecutionContext",
     "PlanConfig",
-    "Router",
-    "default_router",
     "decline_types",
-    "heuristics_sort",
     "MANIFEST",
     "EngineFamily",
     "BACKEND_ENGINE_ID_BASE",

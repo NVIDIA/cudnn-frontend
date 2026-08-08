@@ -94,7 +94,6 @@ class pygraph:
         *,
         # ---- new (keyword-only: never shifts the classic positional order) --
         backends: Optional[List["BaseEngine"]] = None,
-        router: Any = None,
         **kwargs,
     ):
         self._context = GraphContext(
@@ -130,12 +129,11 @@ class pygraph:
         self._data_bindings: Dict[int, Any] = {}  # uid -> tensor data for auto-bound inputs
 
         # Backend routing (see engines/router.py). Graph construction is
-        # backend-agnostic. At create_execution_plans() the Router builds a flat
-        # ranked plan list (python engines + cuDNN) in one shared engine-id
+        # backend-agnostic. At create_execution_plans() the heuristics build a
+        # flat ranked plan list (python engines + cuDNN) in one shared engine-id
         # space; each plan is dispatched by its id (is_python_engine -> python
         # registry, else lower to cuDNN). ``_plan_index`` selects the plan to run.
         self._backends: List["BaseEngine"] = []
-        self._router = router  # None => engines.router.default_router at route time
         self._plans: List[Any] = []  # list[PlanConfig], populated by create_execution_plans()
         self._planning_done: bool = False  # create_execution_plans() ran (one-shot)
         self._frozen: bool = False  # whole-surface freeze (set by _freeze())
@@ -205,15 +203,6 @@ class pygraph:
         if self._planning_done:
             raise RuntimeError("cannot register a backend after create_execution_plans(); planning is one-shot — build a new graph")
         self._backends.append(engine)
-        return self
-
-    def set_router(self, router: Any) -> "pygraph":
-        """Override the plan-list / ranking policy for this graph. Must be set
-        before create_execution_plans() (a later router cannot affect the
-        already-planned list)."""
-        if self._planning_done:
-            raise RuntimeError("cannot set a router after create_execution_plans(); planning is one-shot — build a new graph")
-        self._router = router
         return self
 
     @property
@@ -893,8 +882,8 @@ class pygraph:
         graph (discovered from ``engines.manifest`` — no registration call, no
         environment variable) and the backend's own ranked recommendation
         (``backend_plan_entries()``, [] when the backend declined the graph or
-        is not installed). ``engines.heuristics.heuristics_sort`` decides the
-        order; ``build_plans()`` walks it.
+        is not installed). ``engines.heuristics.rank`` decides the order;
+        ``build_plans()`` walks it.
 
         Args:
             heuristics: cuDNN heuristic modes for the backend's recommendation.
@@ -902,7 +891,7 @@ class pygraph:
         if not self._is_validated:
             self.validate()
 
-        from .engines.router import default_router
+        from .engines import router
 
         # One-shot planning (classic conformance: the C++ graph never supported
         # re-planning — a second call there appends plans by accident, and no
@@ -928,16 +917,15 @@ class pygraph:
         self._freeze()
         self._attach_facts()
 
-        router = self._router or default_router
         plans = list(router.plan(self, self._candidate_engines()))
-        # Validate the FINAL router output: every entry must name an engine this
-        # graph can actually dispatch to.
+        # Validate the FINAL ranking: every entry must name an engine this graph
+        # can actually dispatch to.
         from .engines.engine_ids import is_python_engine
 
         known = {e.engine_id for e in self._candidate_engines()}
         for cfg in plans:
             if is_python_engine(cfg.engine_id) and not self._owners_for_id(cfg.engine_id):
-                raise ValueError(f"router produced a plan for unknown python engine_id {cfg.engine_id} (known: {sorted(known)})")
+                raise ValueError(f"heuristics produced a plan for unknown python engine_id {cfg.engine_id} (known: {sorted(known)})")
         if not plans:
             # Say WHY, or the user is left guessing which side had nothing: the
             # backend's own rejection is the usual answer.
@@ -952,7 +940,7 @@ class pygraph:
         ``register_backend()`` added, then the in-tree manifest families whose
         coarse key matches. Registered engines lead because bringing your own
         engine is an explicit act; the library's own table is the default.
-        (Candidate ORDER is not rank — ``heuristics_sort`` ranks.) Cached: the
+        (Candidate ORDER is not rank — ``heuristics.rank`` ranks.) Cached: the
         graph is frozen at planning time anyway."""
         if self._candidates is None:
             from .engines import manifest
@@ -1854,12 +1842,6 @@ class pygraph:
 
         return json.dumps(self.inspect(), default=str, indent=2)
 
-    @property
-    def engine(self) -> Optional["BaseEngine"]:
-        """The python engine for the selected plan, or None for the backend path.
-        Populated after create_execution_plans()."""
-        return self.selected_engine
-
     def serialize(self):
         """Serialize the graph (classic passthrough).
 
@@ -1889,37 +1871,6 @@ class pygraph:
                 self._lowered_graph = cudnn._pybind_module.backend_graph()
         self._lowered_graph.deserialize(*args, **kwargs)
         self._is_built = True
-
-    @classmethod
-    def from_serialized(cls, data, handle: Optional[int] = None, **kwargs) -> "pygraph":
-        """Create a pygraph from serialized data.
-
-        This is a convenience method that creates a minimal graph and deserializes into it.
-
-        Args:
-            data: Serialized graph data (from serialize()).
-            handle: Optional cuDNN handle for AoT compilation.
-            **kwargs: Additional arguments passed to the constructor.
-
-        Returns:
-            pygraph: Deserialized graph ready for execution.
-        """
-        import cudnn
-
-        # Create a new graph with a fresh C++ graph
-        graph = cls(**kwargs)
-        graph._lowered_graph = cudnn._pybind_module.backend_graph(
-            io_data_type=graph._context.io_data_type,
-            intermediate_data_type=graph._context.intermediate_data_type,
-            compute_data_type=graph._context.compute_data_type,
-        )
-
-        if handle is not None:
-            graph._lowered_graph.deserialize(handle, data)
-        else:
-            graph._lowered_graph.deserialize(data)
-        graph._is_built = True
-        return graph
 
     def _lower_to_cpp(self) -> Any:
         """Lower Python graph to C++ (the internal ``_pybind_module.backend_graph``)."""

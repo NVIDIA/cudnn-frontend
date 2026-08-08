@@ -85,6 +85,11 @@ class EngineFamily:
     # ("module", "callable") producing this family's facts from a graph, or None
     # while a family still reads the graph inside its engines.
     analyzer: Optional[Tuple[str, str]] = None
+    # ("module", "callable") recommending (engine_id, knobs) for one heuristic
+    # mode, given this family's facts. The family is the smallest scope that can
+    # rank -- an engine cannot see its siblings. None falls back to one
+    # default-knob plan per eligible engine.
+    heuristics: Optional[Tuple[str, str]] = None
 
     @property
     def id_end(self) -> int:
@@ -175,6 +180,7 @@ MANIFEST: Tuple[EngineFamily, ...] = (
             "sdpa_fwd_prefill_sm120_fp8": EngineSlot(7, opt_in=True),
         },
         analyzer=("cudnn.sdpa.graph_analyzer", "analyze"),
+        heuristics=("cudnn.sdpa.fwd.heuristics", "recommend"),
     ),
     EngineFamily(
         FROST_SDPA_BWD_ID_BASE,
@@ -213,29 +219,40 @@ def family_for(graph) -> Optional[EngineFamily]:
     return next(f for f in MANIFEST if f.name == name)
 
 
-def resolve_analyzer(family: EngineFamily):
-    """The family's facts callable, or None when it declares no analyzer.
+def _resolve(family: EngineFamily, ref: Optional[Tuple[str, str]], what: str):
+    """Import a ("module", "callable") declaration, or None when absent.
 
-    Importing it is the caller's decision, not this module's: keeping
-    ``analyzer`` a pair of strings is what lets the coarse key stay
-    import-free. Planning resolves it and attaches the record to the frozen
-    graph; the family's engines then read that same record back.
+    Importing is the caller's decision, not this module's: keeping these
+    declarations pairs of strings is what lets the coarse key stay import-free.
+    A missing optional dependency makes the hook absent, not the graph
+    unplannable -- importing one pulls in its package (cudnn.sdpa.__init__ ->
+    cuda.bindings, cutlass), so without this a planning call raises instead of
+    falling back to the backend.
     """
-    if family.analyzer is None:
+    if ref is None:
         return None
     import importlib
 
-    module, attr = family.analyzer
+    module, attr = ref
     try:
         return getattr(importlib.import_module(module), attr)
     except ImportError as exc:
-        # Same contract as instantiate(): a missing optional dependency makes
-        # the family absent, not the graph unplannable. Importing an analyzer
-        # pulls in its package (cudnn.sdpa.__init__ -> cuda.bindings, cutlass),
-        # so without this a planning call raises instead of falling back to the
-        # backend.
-        _LOG.info("analyzer for %s is unavailable in this environment: %s", family.name, exc)
+        _LOG.info("%s for %s is unavailable in this environment: %s", what, family.name, exc)
         return None
+
+
+def resolve_analyzer(family: EngineFamily):
+    """The family's facts callable, or None when it declares no analyzer.
+
+    Planning resolves it and attaches the record to the frozen graph; the
+    family's heuristics and engines then read that same record back.
+    """
+    return _resolve(family, family.analyzer, "analyzer")
+
+
+def resolve_heuristics(family: EngineFamily):
+    """The family's plan-recommending callable, or None when it declares none."""
+    return _resolve(family, family.heuristics, "heuristics")
 
 
 def instantiate(family: EngineFamily, ids: Dict[str, int]):
