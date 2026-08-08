@@ -85,10 +85,10 @@ class EngineFamily:
     # ("module", "callable") producing this family's facts from a graph, or None
     # while a family still reads the graph inside its engines.
     analyzer: Optional[Tuple[str, str]] = None
-    # ("module", "callable") recommending (engine_id, knobs) for one heuristic
-    # mode, given this family's facts. The family is the smallest scope that can
-    # rank -- an engine cannot see its siblings. None falls back to one
-    # default-knob plan per eligible engine.
+    # ("module", "callable") ranking (engine_id, knobs) for this family, given
+    # its facts and the backend's entries. The family is the smallest scope that
+    # can rank -- an engine cannot see its siblings. None falls back to one
+    # default plan per accepting engine, ahead of the backend's.
     heuristics: Optional[Tuple[str, str]] = None
 
     @property
@@ -177,7 +177,6 @@ MANIFEST: Tuple[EngineFamily, ...] = (
             "sdpa_fwd_prefill_sm100_d128_fp8": EngineSlot(4, opt_in=True),
             "sdpa_fwd_prefill_sm120": EngineSlot(5, opt_in=True),
             "sdpa_fwd_prefill_sm100_d192_d128": EngineSlot(6, opt_in=True),
-            "sdpa_fwd_prefill_sm120_fp8": EngineSlot(7, opt_in=True),
         },
         analyzer=("cudnn.sdpa.graph_analyzer", "analyze"),
         heuristics=("cudnn.sdpa.fwd.heuristics", "recommend"),
@@ -241,6 +240,11 @@ def _resolve(family: EngineFamily, ref: Optional[Tuple[str, str]], what: str):
         return None
 
 
+def resolve_heuristics(family: EngineFamily):
+    """The family's plan-ranking callable, or None when it declares none."""
+    return _resolve(family, family.heuristics, "heuristics")
+
+
 def resolve_analyzer(family: EngineFamily):
     """The family's facts callable, or None when it declares no analyzer.
 
@@ -248,11 +252,6 @@ def resolve_analyzer(family: EngineFamily):
     family's heuristics and engines then read that same record back.
     """
     return _resolve(family, family.analyzer, "analyzer")
-
-
-def resolve_heuristics(family: EngineFamily):
-    """The family's plan-recommending callable, or None when it declares none."""
-    return _resolve(family, family.heuristics, "heuristics")
 
 
 def instantiate(family: EngineFamily, ids: Dict[str, int]):

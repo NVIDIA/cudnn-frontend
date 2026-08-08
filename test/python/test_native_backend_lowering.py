@@ -421,12 +421,12 @@ def test_native_rmsnorm_lowers_to_backend():
     torch.testing.assert_close(ivb, ivref, atol=5e-3, rtol=5e-3)
 
 
-def test_mixed_router_backend_slot_executes():
-    """Review round 4: the backend entry of a MIXED router is selectable and
+def test_mixed_ranking_backend_slot_executes(monkeypatch):
+    """Review round 4: the backend entry of a MIXED ranking is selectable and
     actually executes through the backend (lowering triggered), with routed
     indices stable across that lowering; the pinned python plan still runs
     afterwards with its own knobs."""
-    from cudnn.engines import BaseEngine, PlanConfig, Router, is_backend_engine
+    from cudnn.engines import BaseEngine, PlanConfig, heuristics, is_backend_engine
     from cudnn.engines.engine_ids import OUT_OF_TREE_ID_BASE
 
     ran = []
@@ -448,11 +448,9 @@ def test_mixed_router_backend_slot_executes():
 
     py_engine = PyMatmul()
 
-    class CudnnFirst(Router):
-        def plan(self, graph, backends):
-            # ``backends`` also carries the in-tree manifest candidates, so name
-            # the engine this test means instead of taking the first one.
-            return graph.backend_plan_entries() + [PlanConfig(py_engine.engine_id)]
+    # ``engines`` also carries the in-tree manifest candidates, so name the
+    # engine this test means instead of taking the first one.
+    monkeypatch.setattr(heuristics, "rank", lambda graph, engines, backend_plans, modes=None: list(backend_plans) + [PlanConfig(py_engine.engine_id)])
 
     h = _handle()
     a = torch.randn(1, M, K, device="cuda", dtype=torch.float16)
@@ -460,9 +458,7 @@ def test_mixed_router_backend_slot_executes():
     c = torch.empty(1, M, N, device="cuda", dtype=torch.float16)
     ref = (a.float() @ b.float()).half()
 
-    g = pygraph(
-        handle=h, io_data_type=cudnn.data_type.HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT, router=CudnnFirst()
-    )
+    g = pygraph(handle=h, io_data_type=cudnn.data_type.HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
     g.register_backend(py_engine)
     A = g.tensor(dim=[1, M, K], stride=[M * K, K, 1])
     B = g.tensor(dim=[1, K, N], stride=[K * N, N, 1])
