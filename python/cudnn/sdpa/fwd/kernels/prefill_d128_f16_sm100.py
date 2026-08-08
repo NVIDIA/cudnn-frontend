@@ -33,7 +33,9 @@ torch fp32 reference (atol 0.025) across single-tile, multi-tile GQA, and the
 
 THD / varlen (``CFG.THD_VARLEN=1``): packed ``[1,T,H,D]`` Q/K/V + ``cu_seqlens``
 coord offset (applied to BOTH Q slabs under TILES_Q=2), per-batch O
-TMA-descriptor array (shared ``thd_sm100.py``), packed ``[1,QH,T]`` LSE — via
+TMA-descriptor array (shared ``thd_sm100.py``), packed ragged-Stats LSE
+(head-major ``[1,QH,head_stride]`` or token-major ``[T,QH]`` — the epilogue
+branches on the LSE tensor's static rank) — via
 the shared ``_common_sm100`` / ``thd_sm100`` mechanism (same as the SM100 qwen
 / dsv4 kernels).  The dense ``[B,S,H,D]`` path is byte-identical (folds out at
 ``THD_VARLEN=0``).
@@ -248,7 +250,7 @@ def _kernel(
     tma_k_desc: cutlass.GridConstant[tmap.TensorMap],
     tma_v_desc: cutlass.GridConstant[tmap.TensorMap],
     tma_o_desc: cutlass.GridConstant[tmap.TensorMap],
-    lse_tensor: cute.Tensor,
+    lse_tensor: Optional[cute.Tensor],
     sinks_tensor: cute.Tensor,
     seq_kv_lens_tensor: cute.Tensor,
     o_desc_words: cute.Tensor,
@@ -1627,7 +1629,7 @@ def _correction_warp_group(
     tidx,
     bars,
     sched,
-    lse_tensor: cute.Tensor,
+    lse_tensor: Optional[cute.Tensor],
     sinks_tensor: cute.Tensor,
     seq_kv_lens_tensor,
     seq_q_lens_tensor,
@@ -1811,16 +1813,27 @@ def _correction_warp_group(
                 neg_inf_trim = cutlass.Float32(float("-inf"))
                 lse_val = cutlass.Float32(arith.select(row_trim.ir_value(), neg_inf_trim.ir_value(), lse_val.ir_value()))
                 inv_sum = cutlass.Float32(arith.select(row_trim.ir_value(), cutlass.Float32(0.0).ir_value(), inv_sum.ir_value()))
-            if cutlass.const_expr(CFG.THD_VARLEN):
-                # THD: q_row_global is sequence-local; LSE is packed [1,QH,T] →
-                # index [0, head, cu_q[b] + local], bound by per-sequence Q len S_q_b.
+            if cutlass.const_expr(lse_tensor is None):
+                pass  # has_lse=False: the Stats store is compiled out
+            elif cutlass.const_expr(CFG.THD_VARLEN):
+                # THD: q_row_global is sequence-local; the packed ragged-Stats
+                # LSE is written in the caller's declared layout — head-major
+                # rank-3 [1, QH, head_stride] (index [0, head, cu_q[b] + local])
+                # or token-major rank-2 [T, QH] (index [cu_q[b] + local, head])
+                # — bound by per-sequence Q len S_q_b.
                 _cu = cutlass.make_array_view(seq_kv_lens_tensor)
                 _cu_q_b = cutlass.Int32(_cu[n_batch + batch_idx])
                 _s_q_b = cutlass.Int32(_cu[n_batch + batch_idx + cutlass.Int32(1)]) - _cu_q_b
                 if q_row_global < _s_q_b:
                     lse_arr = cutlass.make_array_view(lse_tensor)
-                    lse_row = lse_arr[cutlass.Int32(0), head_idx, :]
-                    lse_row[_cu_q_b + q_row_global] = lse_val
+                    if cutlass.const_expr(len(lse_tensor.shape) == 2):
+                        # token-major packed (T, H)
+                        lse_row = lse_arr[_cu_q_b + q_row_global, :]
+                        lse_row[head_idx] = lse_val
+                    else:
+                        # head-major packed (1, QH, head_stride)
+                        lse_row = lse_arr[cutlass.Int32(0), head_idx, :]
+                        lse_row[_cu_q_b + q_row_global] = lse_val
             else:
                 if q_row_global < seqlen_q:
                     lse_arr = cutlass.make_array_view(lse_tensor)
@@ -1900,7 +1913,7 @@ def _host(
     k_tensor: cute.Tensor,
     v_tensor: cute.Tensor,
     o_tensor: cute.Tensor,
-    lse_tensor: cute.Tensor,
+    lse_tensor: Optional[cute.Tensor],
     sinks_tensor: cute.Tensor,
     seq_kv_lens_tensor: cute.Tensor,
     o_desc_words: cute.Tensor,
@@ -2014,11 +2027,30 @@ def _host(
 
 
 @lru_cache(maxsize=None)
-def compile(b: int = 1, qh: int = 1, kh: int = 1, sq: int = 256, skv: int = 128, d_qk: int = CFG.TILE_K, d_v: int = CFG.TILE_O) -> Callable:  # noqa: A001
+def compile(  # noqa: A001
+    b: int = 1,
+    qh: int = 1,
+    kh: int = 1,
+    sq: int = 256,
+    skv: int = 128,
+    d_qk: int = CFG.TILE_K,
+    d_v: int = CFG.TILE_O,
+    has_lse: bool = True,
+    lse_head_major: bool = False,
+    lse_head_stride: int = 0,
+) -> Callable:
     """Compile a kernel with ALL dims concrete to pin TMA descriptor strides at compile time.
 
     THD/varlen: q/k/v/o/lse are PACKED with batch dim 1 ([1,T,H,D]); ``b`` is the
     LOGICAL batch (sequence count) driving n_batch / metadata + O-desc sizes.
+    ``has_lse=False`` compiles the LSE store out (the kernel specializes on a
+    ``None`` LSE argument) — callers without a Stats output pass no LSE buffer
+    at all. THD Stats layouts: token-major packed rank-2 (T, H) by default
+    (cuDNN's TH1 ragged Stats recipe); ``lse_head_major=True`` = rank-3
+    [1, QH, head_stride], where ``lse_head_stride`` is the caller-declared
+    head-row stride (0 → compact, i.e. ``sq``). All three are
+    shapes/specializations of the traced code, so they are part of this
+    cache key.
 
     ENVELOPE: ``d_qk`` / ``d_v`` are the ACTUAL head dims (defaults = the
     flavor's full TILE_K / TILE_O). The Q/K/V/O TMA descriptors are built from
@@ -2057,12 +2089,49 @@ def compile(b: int = 1, qh: int = 1, kh: int = 1, sq: int = 256, skv: int = 128,
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
     )
-    fake_lse = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float32,
-        (_fake_batch, qh, sq),
-        stride_order=(2, 1, 0),
-        assumed_align=16,
-    )
+    if not has_lse:
+        # No Stats output: the LSE argument is None-specialized and the store
+        # is compiled out entirely — no dummy buffer exists at any level.
+        if lse_head_major or lse_head_stride:
+            raise ValueError("lse_head_major / lse_head_stride require has_lse=True")
+        fake_lse = None
+    elif CFG.THD_VARLEN:
+        # Packed ragged-Stats LSE in the caller's declared layout (align 4: the
+        # store is scalar f32 and the caller's Stats buffer only guarantees
+        # element alignment). Token-major (the default — cuDNN's TH1 ragged
+        # Stats recipe) = its natural packed rank-2 (T, H) view; head-major =
+        # the kernels' native rank-3 (1, QH, head_stride) packing with
+        # head_stride >= T (compact when 0). The epilogue store branches on
+        # the STATIC rank, so the layout is fully encoded in this fake tensor
+        # — no template parameter.
+        if lse_head_major:
+            _lse_hs = lse_head_stride if lse_head_stride else sq
+            if _lse_hs < sq:
+                raise ValueError(f"THD head-major LSE head_stride ({_lse_hs}) must cover the packed Q token total ({sq})")
+            fake_lse = cute.runtime.make_fake_compact_tensor(
+                cutlass.Float32,
+                (1, qh, _lse_hs),
+                stride_order=(2, 1, 0),
+                assumed_align=4,
+            )
+        else:
+            if lse_head_stride:
+                raise ValueError("lse_head_stride is head-major-only (token-major (T, H) is compact)")
+            fake_lse = cute.runtime.make_fake_compact_tensor(
+                cutlass.Float32,
+                (sq, qh),
+                stride_order=(1, 0),
+                assumed_align=4,
+            )
+    else:
+        if lse_head_major or lse_head_stride:
+            raise ValueError("lse_head_major / lse_head_stride are THD-only (dense LSE is compact (B, H, Sq))")
+        fake_lse = cute.runtime.make_fake_compact_tensor(
+            cutlass.Float32,
+            (b, qh, sq),
+            stride_order=(2, 1, 0),
+            assumed_align=16,
+        )
     # Sinks tensor always part of the ABI; read only when CFG.HAS_SINK == 1 (compile-time fold).
     fake_sinks = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32,

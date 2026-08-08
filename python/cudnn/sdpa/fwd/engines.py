@@ -147,8 +147,8 @@ class Capabilities:
     stats: bool = False
     # The adapter accepts lse_tensor=None (its kernel None-specializes the LSE
     # store), so a stats-less graph needs no dummy-LSE workspace chunk. Rows
-    # that keep False (the SM100 flavors) always write an LSE and get a carved
-    # dummy from lower_dsl_prefill when the graph has no Stats output.
+    # that keep False (the SM100 FP8/MXFP8 flavors) always write an LSE and get
+    # a carved dummy from lower_dsl_prefill when the graph has no Stats output.
     lse_optional: bool = False
     thd: bool = False
     cu_seq_len: bool = False  # cu_seq_len_q / cu_seq_len_kv prefix sums (no row serves these yet)
@@ -157,7 +157,6 @@ class Capabilities:
     # compute it from the GLOBAL S_q — the THD variant of the
     # bottom_right_padded_seq_q gap above.
     thd_bottom_right: bool = False
-    thd_stats: bool = False  # packed LSE output plumbing is a follow-up
     # Dense padded + stats needs the per-batch seq_len_q LSE trim (padded
     # q-rows write LSE=-inf / O=0, cuDNN >= 9.14). Plumbed for the half
     # kernels via SEQ_Q_LENS_PRESENT; the FP8/MXFP8 kernels lack the epilogue
@@ -314,8 +313,6 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                 "bottom-right causal with a dense padding mask carrying per-batch seq_len_q is not "
                 "supported (kernel anchors the BR diagonal at the global S_q, not seq_len_q[b])"
             )
-    if facts.thd and facts.wants_stats and not capabilities.thd_stats:
-        return "THD with generate_stats is not supported yet"
     if facts.padded and facts.wants_stats and not facts.thd and not capabilities.padded_stats:
         return "padding mask with generate_stats is not supported yet (per-batch seq_len_q LSE trim not plumbed)"
 
@@ -367,6 +364,7 @@ def _sm100_spec(d: int, d_v: Optional[int] = None) -> EngineSpec:
             padded=True,
             sink=True,
             stats=True,
+            lse_optional=True,
             thd=True,
             padded_stats=True,
             # The f16/bf16 lowering serves any dense B/H/S stride permutation
@@ -484,7 +482,6 @@ def _sm120_spec() -> EngineSpec:
             padded_stats=True,
             thd=True,
             thd_bottom_right=True,
-            thd_stats=True,
             layouts=frozenset({"bshd", "dense_flex"}),
             sched_policies=frozenset({SCHED_NATURAL}),
             tile_ms=frozenset({64, 128}),
@@ -593,11 +590,10 @@ def lower_dsl_prefill(
     # build time and recorded on the executor as ``workspace_bytes`` — that
     # number is what the plan's CompiledPlan.get_workspace_size() reports.
     #   - dummy LSE (dense, stats absent, non-lse_optional adapters): the
-    #     SM100 kernels always write an LSE; without a Stats output it lands
-    #     in b*h_q*s_q fp32 scratch. lse_optional adapters (SM120) compile the
-    #     LSE store out instead and bind no buffer. (THD needs no engine-level
-    #     LSE chunk — the packed THD LSE is part of the api-level scratch
-    #     below.)
+    #     SM100 FP8/MXFP8 kernels always write an LSE; without a Stats output
+    #     it lands in b*h_q*s_q fp32 scratch. lse_optional adapters (the f16
+    #     flavors, SM120) compile the LSE store out instead and bind no
+    #     buffer. (THD needs no engine-level LSE chunk either way.)
     #   - synthesized seq_len_kv (skv_tail_via_padding rows): b int32.
     #   - api-level scratch (api.scratch_workspace_bytes()): the dense padded
     #     [seq_kv|seq_q] combine and the THD metadata/LSE buffers.

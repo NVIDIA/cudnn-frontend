@@ -324,6 +324,43 @@ def test_probe_rejects_thd_bottom_right():
     assert not _eligible(g)
 
 
+def test_probe_accepts_thd_stats():
+    """The SM100 epilogue writes cuDNN's ragged Stats directly (token-major
+    or head-major packed LSE), so THD + generate_stats is eligible."""
+    g = _mk_graph()
+    dims = (B, H, S, D)
+    strides = (S * H * D, D, H * D, 1)
+    q = g.tensor(dim=dims, stride=strides, data_type=DTYPE, name="q")
+    k = g.tensor(dim=dims, stride=strides, data_type=DTYPE, name="k")
+    v = g.tensor(dim=dims, stride=strides, data_type=DTYPE, name="v")
+    ro = g.tensor(dim=(B + 1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT64, name="ro")
+    q.set_ragged_offset(ro)
+    k.set_ragged_offset(ro)
+    v.set_ragged_offset(ro)
+    seq_q = g.tensor(dim=(B, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT32, name="sq")
+    seq_kv = g.tensor(dim=(B, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT32, name="skv")
+    o, stats = g.sdpa(
+        name="s",
+        q=q,
+        k=k,
+        v=v,
+        attn_scale=0.1,
+        generate_stats=True,
+        use_causal_mask=True,
+        use_padding_mask=True,
+        seq_len_q=seq_q,
+        seq_len_kv=seq_kv,
+    )
+    _finish_output(o, dims, strides)
+    o.set_ragged_offset(ro)
+    assert stats is not None
+    stats.set_output(True).set_dim((B, H, S, 1)).set_stride((S * H, 1, H, 1))
+    stats.set_data_type(cudnn.data_type.FLOAT)
+    stats_ro = g.tensor(dim=(B + 1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT64, name="stats_ro")
+    stats.set_ragged_offset(stats_ro)
+    assert engines.engine_name(512) in _eligible(g)
+
+
 def test_probe_rejects_right_band_widening():
     g = _mk_graph()
     q, k, v, dims, strides = _mk_qkv(g)

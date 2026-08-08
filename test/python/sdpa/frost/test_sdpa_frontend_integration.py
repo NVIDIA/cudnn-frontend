@@ -126,11 +126,12 @@ def test_select_dsl_engine_runs_and_matches_torch():
     g.check_support()
     g.build_plans()
     # Honest workspace: this graph is inference (no Stats output), so the
-    # engine carves a dummy LSE (B*H*S fp32) from the caller's buffer.
+    # kernel compiles the LSE store out (has_lse=False) — no dummy buffer,
+    # no workspace at all.
     ws_size = g.get_workspace_size()
-    assert ws_size >= B * H * S * 4
+    assert ws_size == 0
 
-    ws = torch.empty(ws_size, device="cuda", dtype=torch.uint8)
+    ws = torch.empty(max(ws_size, 1), device="cuda", dtype=torch.uint8)
     g.execute({q: q_gpu, k: k_gpu, v: v_gpu, o: o_gpu}, ws)
     torch.cuda.synchronize()
 
@@ -282,16 +283,49 @@ def test_plan_name_contract():
 
 @_SM100_DSL
 def test_workspace_carve_no_per_execute_allocs_and_guards():
-    """The dummy-LSE (inference) path carves scratch from the caller's
-    workspace: steady-state executes make ZERO torch CUDA allocations, an
-    undersized buffer raises instead of corrupting, and get_workspace_size
-    reports the real requirement (not 0)."""
-    q_gpu = torch.randn(B, S, H, D, device="cuda", dtype=torch.float16).transpose(1, 2)
-    k_gpu = torch.randn(B, S, H, D, device="cuda", dtype=torch.float16).transpose(1, 2)
-    v_gpu = torch.randn(B, S, H, D, device="cuda", dtype=torch.float16).transpose(1, 2)
-    o_gpu = torch.empty(B, S, H, D, device="cuda", dtype=torch.float16).transpose(1, 2)
+    """The THD metadata path carves scratch from the caller's workspace:
+    steady-state executes make ZERO torch CUDA allocations, an undersized
+    buffer raises instead of corrupting, and get_workspace_size reports the
+    real requirement (not 0). Dense f16 no longer needs a workspace at all —
+    has_lse=False compiles the stats-less LSE store out — so the carve
+    mechanics live on the THD lowering."""
+    seq_lens = [200, 150]
+    t = sum(seq_lens)
+    s_max = max(seq_lens)
+    dims = (B, H, s_max, D)
+    strides = (s_max * H * D, D, H * D, 1)
+    stor = [torch.zeros(B * s_max * H * D, device="cuda", dtype=torch.float16) for _ in range(4)]
+    for buf in stor[:3]:
+        buf[: t * H * D].normal_()
+    q_gpu, k_gpu, v_gpu, o_gpu = (buf.as_strided(dims, strides) for buf in stor)
+    sl = torch.tensor(seq_lens, dtype=torch.int32, device="cuda").view(B, 1, 1, 1)
+    cu = torch.tensor([0, seq_lens[0], t], dtype=torch.int64, device="cuda")
+    ro_t = (cu * H * D).view(B + 1, 1, 1, 1)
 
-    g, q, k, v, o = _build_causal_sdpa()
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    q = g.tensor(dim=dims, stride=strides, data_type=cudnn.data_type.HALF, name="q")
+    k = g.tensor(dim=dims, stride=strides, data_type=cudnn.data_type.HALF, name="k")
+    v = g.tensor(dim=dims, stride=strides, data_type=cudnn.data_type.HALF, name="v")
+    sq = g.tensor_like(sl)
+    skv = g.tensor_like(sl)
+    qro, kro, vro, oro = (g.tensor_like(ro_t) for _ in range(4))
+    q.set_ragged_offset(qro)
+    k.set_ragged_offset(kro)
+    v.set_ragged_offset(vro)
+    o, _ = g.sdpa(
+        name="sdpa",
+        q=q,
+        k=k,
+        v=v,
+        attn_scale=1.0 / (D**0.5),
+        is_inference=True,
+        use_causal_mask=True,
+        use_padding_mask=True,
+        seq_len_q=sq,
+        seq_len_kv=skv,
+    )
+    o.set_output(True).set_dim(dims).set_stride(strides)
+    o.set_ragged_offset(oro)
     _plan(g)
     _pin(g, _FROST)
     g.check_support()
@@ -299,24 +333,30 @@ def test_workspace_carve_no_per_execute_allocs_and_guards():
     assert g.selected_engine.name == _FROST
 
     ws_size = g.get_workspace_size()
-    assert ws_size >= B * H * S * 4  # dummy LSE: b*h_q*s_q fp32
+    assert ws_size > 0  # THD metadata: [meta(seq_kv, cu_q, cu_k) | o_desc | sinks dummy]
 
+    vp = {q: q_gpu, k: k_gpu, v: v_gpu, o: o_gpu, sq: sl, skv: sl, qro: ro_t, kro: ro_t, vro: ro_t, oro: ro_t}
     # Undersized / absent workspace: loud failure, no silent allocation.
     with pytest.raises(ValueError, match="workspace"):
-        g.execute({q: q_gpu, k: k_gpu, v: v_gpu, o: o_gpu}, torch.empty(1, device="cuda", dtype=torch.uint8))
+        g.execute(vp, torch.empty(1, device="cuda", dtype=torch.uint8))
     with pytest.raises((ValueError, TypeError), match="workspace"):
-        g.execute({q: q_gpu, k: k_gpu, v: v_gpu, o: o_gpu}, None)
+        g.execute(vp, None)
 
     ws = torch.empty(ws_size, device="cuda", dtype=torch.uint8)
-    g.execute({q: q_gpu, k: k_gpu, v: v_gpu, o: o_gpu}, ws)  # warm-up: one-time dummy caches fill
+    g.execute(vp, ws)  # warm-up: per-shape kernel compile + one-time caches
     torch.cuda.synchronize()
 
     stats_key = "allocation.all.allocated"
     before = torch.cuda.memory_stats().get(stats_key, 0)
-    g.execute({q: q_gpu, k: k_gpu, v: v_gpu, o: o_gpu}, ws)
+    g.execute(vp, ws)
     torch.cuda.synchronize()
     after = torch.cuda.memory_stats().get(stats_key, 0)
-    assert after == before, f"LSE path made {after - before} per-execute CUDA allocation(s); scratch must be carved from the workspace"
+    assert after == before, f"THD path made {after - before} per-execute CUDA allocation(s); scratch must be carved from the workspace"
 
-    ref = torch.nn.functional.scaled_dot_product_attention(q_gpu, k_gpu, v_gpu, is_causal=True, scale=1.0 / (D**0.5))
-    torch.testing.assert_close(o_gpu, ref, atol=5e-2, rtol=3e-2)
+    packed_o = stor[3][: t * H * D].view(t, H, D)
+    for lo, hi in ((0, seq_lens[0]), (seq_lens[0], t)):
+        qb = stor[0][lo * H * D : hi * H * D].view(hi - lo, H, D).permute(1, 0, 2)
+        kb = stor[1][lo * H * D : hi * H * D].view(hi - lo, H, D).permute(1, 0, 2)
+        vb = stor[2][lo * H * D : hi * H * D].view(hi - lo, H, D).permute(1, 0, 2)
+        ref = torch.nn.functional.scaled_dot_product_attention(qb, kb, vb, is_causal=True, scale=1.0 / (D**0.5))
+        torch.testing.assert_close(packed_o[lo:hi].permute(1, 0, 2), ref, atol=5e-2, rtol=3e-2)

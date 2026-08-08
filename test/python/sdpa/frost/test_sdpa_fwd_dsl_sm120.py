@@ -47,6 +47,11 @@ def _select_engine(graph, name):
     return graph
 
 
+# Exact in fp16/bf16/fp32: pre-fills O/Stats storages in the THD harness so
+# no-op paths (t_q == 0) can assert the buffers came back untouched.
+_THD_SENTINEL = 2048.0
+
+
 def _bhsd(
     batch: int,
     heads: int,
@@ -376,6 +381,10 @@ def _run_thd_case(
     k_view, _, k_ro = _pack_thd([s.contiguous() for s in k_seqs], s_kv_max)
     v_view, _, v_ro = _pack_thd([s.contiguous() for s in v_seqs], s_kv_max)
     o_view, o_storage, o_ro = _pack_thd([torch.zeros(1, h_q, max(n, 1), d_v, dtype=dtype, device="cuda")[:, :, :n] for n in seq_q_lens], s_q_max)
+    # SENTINEL fill: the kernel writes every valid packed O token (compared
+    # against the reference below); everything else — the whole buffer when
+    # t_q == 0 — must come back untouched.
+    o_storage.fill_(_THD_SENTINEL)
     sq_t = torch.tensor(seq_q_lens, dtype=torch.int32, device="cuda").view(batch, 1, 1, 1)
     skv_t = torch.tensor(seq_kv_lens, dtype=torch.int32, device="cuda").view(batch, 1, 1, 1)
     sinks = torch.randn(1, h_q, 1, 1, dtype=torch.float32, device="cuda") if with_sink else None
@@ -429,12 +438,12 @@ def _run_thd_case(
         if stats_layout == "head_major":
             # [h, t]: tokens contiguous within a head, heads strided by the
             # padded token capacity; offsets = cu_q * stride_s = cu_q.
-            stats_storage = torch.empty(h_q * t_cap, dtype=torch.float32, device="cuda")
+            stats_storage = torch.full((h_q * t_cap,), _THD_SENTINEL, dtype=torch.float32, device="cuda")
             stats.set_dim((batch, h_q, s_q_max, 1)).set_stride((h_q * t_cap, t_cap, 1, 1))
             stats_ro_t = (q_ro.flatten() // (head_dim * h_q)).view(batch + 1, 1, 1, 1).contiguous()
         else:
             # [t, h]: heads contiguous within a token; offsets = cu_q * h_q.
-            stats_storage = torch.empty(batch * s_q_max * h_q, dtype=torch.float32, device="cuda")
+            stats_storage = torch.full((batch * s_q_max * h_q,), _THD_SENTINEL, dtype=torch.float32, device="cuda")
             stats.set_dim((batch, h_q, s_q_max, 1)).set_stride((s_q_max * h_q, 1, h_q, 1))
             stats_ro_t = (q_ro.flatten() // head_dim).view(batch + 1, 1, 1, 1).contiguous()
         stats_ro = graph.tensor_like(stats_ro_t, name="stats_ro")
@@ -455,6 +464,14 @@ def _run_thd_case(
     cu = [0]
     for n in seq_q_lens:
         cu.append(cu[-1] + n)
+    if cu[-1] == 0:
+        # No query token exists anywhere (t_q == 0): execute must be a
+        # complete no-op — the sentinel-filled O and ragged Stats storages
+        # come back untouched.
+        assert (o_storage == _THD_SENTINEL).all(), "t_q == 0 wrote to O"
+        if check_stats:
+            assert (stats_storage == _THD_SENTINEL).all(), "t_q == 0 wrote to the ragged Stats"
+        return
     packed_o = o_storage[: cu[-1] * h_q * d_v].view(max(cu[-1], 1), h_q, d_v)
     if check_stats and stats_layout == "head_major":
         packed_stats = stats_storage.view(h_q, t_cap)  # (H, head_stride); tokens at [:, cu[i]:cu[i+1]]
@@ -845,8 +862,7 @@ def test_dsl_sm120_thd_bottom_right():
 @torch_fork_set_rng(seed=30)
 def test_dsl_sm120_thd_stats(stats_layout: str):
     """THD + generate_stats: the ragged Stats output is written in the
-    caller's declared layout — token-major [t, h] or head-major [h, t]
-    (the SM100 rows reject this combination — thd_stats gap)."""
+    caller's declared layout — token-major [t, h] or head-major [h, t]."""
 
     _run_thd_case(seq_q_lens=[200, 150], seq_kv_lens=[200, 150], is_causal=True, check_stats=True, stats_layout=stats_layout)
 
@@ -887,12 +903,26 @@ def test_dsl_sm120_thd_zero_length_sequence():
 @pytest.mark.parametrize("with_sink", [False, True], ids=["no_sink", "sink"])
 @torch_fork_set_rng(seed=31)
 def test_dsl_sm120_thd_all_kv_zero_stats(with_sink: bool, stats_layout: str):
-    """Every KV length zero: a zero-token K/V view cannot back a TMA
-    descriptor, so the adapter short-cut fills O := 0 and the ragged Stats
-    adapter-side — -inf, or the sink value alone (the sink column keeps the
-    softmax denominator alive) — in either declared layout."""
+    """Every KV length zero: the launch goes through the KERNEL's dead-row
+    path (O := 0, LSE := -inf, or the sink value alone — the sink column
+    keeps the softmax denominator alive) with the packed KV extent clamped
+    to one never-dereferenced token (a zero-token K/V view cannot back a
+    CuTe layout) — no adapter-side fills, in either declared layout."""
 
     _run_thd_case(seq_q_lens=[64, 32], seq_kv_lens=[0, 0], with_sink=with_sink, check_stats=True, stats_layout=stats_layout)
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("stats_layout", ["token_major", "head_major"])
+@torch_fork_set_rng(seed=34)
+def test_dsl_sm120_thd_all_q_zero_stats(stats_layout: str):
+    """Every Q length zero (t_q == 0): no query token exists anywhere, so the
+    packed O/Stats have zero rows and execute must be a complete NO-OP — the
+    sentinel-filled buffers come back untouched, with live KV and with the
+    fully-degenerate all-zero KV as well."""
+
+    _run_thd_case(seq_q_lens=[0, 0], seq_kv_lens=[50, 30], check_stats=True, stats_layout=stats_layout)
+    _run_thd_case(seq_q_lens=[0, 0], seq_kv_lens=[0, 0], check_stats=True, stats_layout=stats_layout)
 
 
 @pytest.mark.L0
