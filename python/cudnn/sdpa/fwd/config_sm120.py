@@ -13,6 +13,23 @@ SEQ_Q_TILES = (128, 64)
 SEQ_KV_TILES = (128, 64)
 SUPPORTED_HEAD_TILES = tuple(range(16, 257, 16))
 
+# SMEM the SM120 parts expose to a kernel. The adapter asks cutlass for the
+# authoritative number at build time; this constant lets the ranking answer
+# "would this tile even fit" without importing the DSL.
+SMEM_CAPACITY_BYTES = 101376
+
+
+def smem_bytes(d_qk: int, d_v: int, q_tile: int, kv_tile: int, itemsize: int = 2) -> int:
+    """SMEM the SM120 prefill kernel needs for one specialization.
+
+    One K tile (D_QK wide) plus one V tile (D_V wide), aliased with the
+    q_tile x D_V output staging tile. Lives here rather than in the adapter
+    because the ranking must not propose a tile the kernel cannot fit, and the
+    two answering that question differently is how a plan list fills up with
+    entries that decline at build.
+    """
+    return max(kv_tile * (d_qk + d_v), q_tile * d_v) * itemsize + 16
+
 
 @dataclass(frozen=True)
 class TemplateParams:

@@ -275,6 +275,15 @@ only to decline is why `closed_under` existed.
   family. Which side leads is meant to be a measurement — a cell timed slower
   than the backend follows it — not a default. Any cell that has not been timed
   keeps the historical order, and the code says so where it is written.
+- **A recommendation always names a concrete config.** A knob field is `None`
+  only where the capability row declares no domain for that axis. `None` never
+  means "engine, pick for me" — that reading is what let the same choice be
+  made in two places, once in the ranking and once in the DSL adapter, and
+  drift. `sdpa/fwd/heuristics.py::_sm120_tiles` is the worked example of a
+  rule: it reads facts only, names its choice first, and puts the rest of the
+  domain behind it for a caller that autotunes. To add one — write the
+  function, list the cell in `_TILE_RULE_CELLS`, and put the measurement in the
+  commit.
 
 ## Key invariants
 
@@ -296,7 +305,9 @@ only to decline is why `closed_under` existed.
   path raises — op builders and fluent setters, direct attribute writes on
   `Tensor`/`Node`/`GraphContext`, dict writes on node ports/params
   (MappingProxy), in-place dim/stride edits (sealed to tuples). Inspection
-  stays fully readable. A mutation in the mutable window after `validate()`
+  stays fully readable. `validate()` lowers and freezes any graph the backend
+  CAN lower (classic error timing), so the mutable-after-validate window is
+  exactly the ops with no backend node (GDN/KDA/…); a mutation in it
   invalidates the validation. Planning freezes BEFORE it analyses, so facts
   never describe a graph that can still change.
 - **Output layout contract**: only USER-assigned output dim/stride are pushed

@@ -38,6 +38,7 @@ from typing import Any, Dict, List, Tuple
 import cudnn
 
 from cudnn.engines.base import PlanConfig
+from cudnn.sdpa.fwd.config_sm120 import SMEM_CAPACITY_BYTES, smem_bytes
 from cudnn.sdpa.fwd.engines import ENGINE_SPECS, Capabilities, SdpaFwdKnobs, mismatch
 
 # Cells timed against the backend's own kernel and found SLOWER: the backend's
@@ -54,11 +55,16 @@ _MEASURED_BEHIND: frozenset = frozenset()
 _TILE_RULE_CELLS = frozenset({"sdpa_fwd_prefill_sm120"})
 
 
-def _sm120_tiles(facts) -> Tuple[int, int]:
+def _sm120_tiles(caps: Capabilities, facts) -> Tuple[int, int]:
     """(tile_m, tile_n) for the SM120 SDPA-forward prefill cell.
 
-    ``tile_n=128`` unconditionally -- fastest across the f16 sweep, by 2-4%
-    rather than a uniform margin.
+    ``tile_n`` is the LARGEST the kernel can fit in SMEM: 128 wins across the
+    f16 sweep, by 2-4% rather than a uniform margin, but a wide head does not
+    leave room for it (D=208 needs 106 KB against the part's 99). Fit is a
+    kernel property, so the arithmetic lives with the template
+    (``config_sm120.smem_bytes``) and the adapter's own check calls the same
+    function -- two answers to "does this tile fit" is how a plan list fills up
+    with entries that decline at build.
 
     ``tile_m=64`` when the grid cannot fill the machine AND each CTA has enough
     KV tiles for the extra Q-tile loop to amortize: halving the Q tile doubles
@@ -78,14 +84,14 @@ def _sm120_tiles(facts) -> Tuple[int, int]:
     optimum moved.
     """
     sm_count = facts.device_sm_count or 0
-    if sm_count <= 0:
-        return 128, 128
     grid = -(-facts.s_q // 128) * facts.h_q * facts.b
     if facts.causal:
         grid //= 2
     kv_tiles = -(-facts.s_kv // 128)
-    fine = grid * 2 <= sm_count or (grid * 2 <= 3 * sm_count and kv_tiles >= 12)
-    return (64 if fine else 128), 128
+    fine = sm_count > 0 and (grid * 2 <= sm_count or (grid * 2 <= 3 * sm_count and kv_tiles >= 12))
+    tile_m = 64 if fine else 128
+    fits = [n for n in sorted(caps.tile_ns, reverse=True) if smem_bytes(facts.d_qk, facts.d_v, tile_m, n) <= SMEM_CAPACITY_BYTES]
+    return tile_m, (fits[0] if fits else min(caps.tile_ns))
 
 
 def _sole(values):
@@ -128,14 +134,13 @@ def _mode_a(facts, offered: Dict[str, int], mode) -> List[PlanConfig]:
             if _admissible(caps, facts, knobs):
                 out.append(PlanConfig(engine_id, knobs, mode=mode))
             continue
-        best = _sm120_tiles(facts)
+        best = _sm120_tiles(caps, facts)
         # The guess first, then the rest of the domain as autotune candidates:
         # the rule's regret is small but not zero, so the runners-up are worth
-        # offering to a caller who measures.
-        ordered = sorted(
-            ((m, n) for m in caps.tile_ms for n in caps.tile_ns),
-            key=lambda mn: (mn != best, mn[1] != best[1], -mn[0]),
-        )
+        # offering to a caller who measures. Configs the kernel cannot fit are
+        # not runners-up -- they would sit in the list only to decline at build.
+        domain = [(m, n) for m in caps.tile_ms for n in caps.tile_ns if smem_bytes(facts.d_qk, facts.d_v, m, n) <= SMEM_CAPACITY_BYTES]
+        ordered = sorted(domain or [best], key=lambda mn: (mn != best, mn[1] != best[1], -mn[0]))
         for tile_m, tile_n in ordered:
             knobs = _knobs(caps, tile_m, tile_n)
             if _admissible(caps, facts, knobs):
