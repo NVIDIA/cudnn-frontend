@@ -52,17 +52,47 @@ from cudnn.tensor_adapter import (
 )
 
 
-def _dprob_n_slots(n_out: int, mma_tiler_mn: Tuple[int, int], deterministic: bool) -> int:
+def _resolve_cluster_shape_mn(mma_tiler_mn: Tuple[int, int], cluster_shape_mn: Optional[Tuple[int, int]]) -> Tuple[int, int]:
+    """The cluster shape the kernel will actually run with, defaults applied."""
+    if cluster_shape_mn is not None:
+        return cluster_shape_mn
+    return (2, 1) if mma_tiler_mn[0] == 256 else (1, 1)
+
+
+def _dprob_n_slots(n_out: int, mma_tiler_mn: Tuple[int, int], cluster_shape_mn: Optional[Tuple[int, int]], deterministic: bool) -> int:
     """Extent of dprob's dim 1.
 
     Non-deterministic (default): 1 -- every N-tile atomically accumulates into the same
     ``dprob[token]``, so the fp32 summation order follows tile scheduling.
 
     Deterministic: one slot per N-tile, so each ``(token, tile_n)`` pair has exactly one
-    writer and the caller can reduce over dim 1 in a fixed order. ``tile_n_idx`` counts in
-    units of ``mma_tiler_mn[1]``.
+    writer and the caller can reduce over dim 1 in a fixed order.
+
+    The extent must cover every ``tile_n_idx`` the scheduler can emit, which is *not*
+    ``ceil_div(n_out, tile_n)``: MoEPersistentTileScheduler counts whole clusters and then
+    expands to CTAs (``cta_tile_n_idx = cluster_tile_n_idx * cluster_n + cta_id_in_cluster``,
+    over ``ceil_div(n_out, tile_n * cluster_n)`` clusters), so the bound rounds up to a
+    multiple of ``cluster_n``. The two agree only at ``cluster_n == 1``; using the narrower
+    form would index past the end of the workspace for any wider cluster.
     """
-    return ceil_div(n_out, mma_tiler_mn[1]) if deterministic else 1
+    if not deterministic:
+        return 1
+    cluster_n = _resolve_cluster_shape_mn(mma_tiler_mn, cluster_shape_mn)[1]
+    return ceil_div(n_out, mma_tiler_mn[1] * cluster_n) * cluster_n
+
+
+def _reduce_dprob_slots(dprob_tensor: torch.Tensor, caller_dprob_tensor: Optional[torch.Tensor], deterministic: bool) -> torch.Tensor:
+    """Collapse the per-N-tile dprob slots back to the caller's ``(valid_m, 1, 1)`` shape.
+
+    A no-op unless deterministic, where the sum is what makes the result reproducible: it
+    runs in a fixed order, unlike the kernel's cross-CTA atomics. Accumulates onto a
+    caller-supplied buffer, matching what the atomic does on the non-deterministic path;
+    when we allocated the buffer ourselves there is nothing to add onto.
+    """
+    if not deterministic:
+        return dprob_tensor
+    reduced = torch.sum(dprob_tensor, dim=1, keepdim=True)
+    return reduced if caller_dprob_tensor is None else caller_dprob_tensor.add_(reduced)
 
 
 def _reinterpret_raw_grouped_fp4_tensor(tensor: torch.Tensor) -> torch.Tensor:
@@ -183,8 +213,8 @@ class GroupedGemmDsreluSm100(APIBase):
         :param b_major: Major dimension for B tensor, one of "k" or "n"
         :param use_dynamic_sched: Enable dynamic tile scheduling for load balancing
         :param use_dsrelu_reuse: Reuse relu(C)^2 between d_srelu and dprob
-        :param deterministic: Compute dprob run-to-run bit-exactly. sample_dprob must then be
-            shaped (valid_m, ceil_div(n, mma_tiler_mn[1]), 1) and the caller must reduce over
+        :param deterministic: Compute dprob run-to-run bit-exactly. sample_dprob must then
+            carry one slot per N-tile (see _dprob_n_slots) and the caller must reduce over
             dim 1 after execute(); grouped_gemm_dsrelu_wrapper_sm100 does both for you
         """
         framework = detect_framework(sample_a)
@@ -270,10 +300,7 @@ class GroupedGemmDsreluSm100(APIBase):
         self.acc_dtype = _convert_to_cutlass_data_type(acc_dtype)
         self.mma_tiler_mn = mma_tiler_mn
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
-        if cluster_shape_mn is None:
-            self.cluster_shape_mn = (2, 1) if self.use_2cta_instrs else (1, 1)
-        else:
-            self.cluster_shape_mn = cluster_shape_mn
+        self.cluster_shape_mn = _resolve_cluster_shape_mn(mma_tiler_mn, cluster_shape_mn)
         self.sf_vec_size = sf_vec_size
         self.vector_f32 = vector_f32
         self.m_aligned = m_aligned
@@ -400,9 +427,8 @@ class GroupedGemmDsreluSm100(APIBase):
 
         self._check_tensor_shape(self.alpha_desc, (self.expert_cnt,), "alpha")
         self._check_tensor_shape(self.prob_desc, (tensor_m, 1, 1), "prob")
-        # Under deterministic=True, dprob carries one slot per N-tile so that each
-        # (token, tile_n) pair has a single writer; the caller reduces over that dimension.
-        self._check_tensor_shape(self.dprob_desc, (tensor_m, _dprob_n_slots(n_out, self.mma_tiler_mn, self.deterministic), 1), "dprob")
+        dprob_slots = _dprob_n_slots(n_out, self.mma_tiler_mn, self.cluster_shape_mn, self.deterministic)
+        self._check_tensor_shape(self.dprob_desc, (tensor_m, dprob_slots, 1), "dprob")
         self._check_tensor_shape(self.dbias_desc, (self.expert_cnt, n_out, 1), "dbias")
         self._check_tensor_shape(self.amax_desc, (self.expert_cnt, 1), "amax")
         self._check_tensor_shape(self.norm_const_desc, (1,), "norm_const")
@@ -1499,9 +1525,9 @@ def grouped_gemm_dsrelu_wrapper_sm100(
         use_dsrelu_reuse: Reuse relu(C)^2 between d_srelu and dprob
         deterministic: Make dprob bit-exact run to run. ``dprob_tensor`` keeps its
             ``(valid_m, 1, 1)`` shape either way -- the extra per-N-tile workspace and the
-            fixed-order reduction into it are internal. ``None`` (default) reads
-            ``CUDNN_FE_GROUPED_GEMM_DSRELU_DETERMINISTIC``, which is off unless set, so
-            callers that cannot pass the argument can still opt in from the environment.
+            fixed-order reduction into it are internal. ``None`` (default) follows
+            ``torch.use_deterministic_algorithms``. See docs/fe-oss-apis/gemm_fusions/
+            grouped_gemm_dsrelu.md#deterministic-dprob.
         current_stream: CUDA stream
 
     Returns:
@@ -1590,11 +1616,22 @@ def grouped_gemm_dsrelu_wrapper_sm100(
     amax_tensor = None
     dbias_tensor = None
 
-    if dprob_tensor is None:
+    # Deterministic mode gives dprob one slot per N-tile so each (token, tile_n) pair has a
+    # single writer; the reduction back to (valid_m, 1, 1) happens after execute(). Resolved
+    # here, with the other arguments, so `deterministic` is a plain bool from this point on.
+    if deterministic is None:
+        # Follows torch's process-wide flag. jax has no equivalent global, so there the opt-in
+        # has to be explicit rather than inherited -- and `torch` is not even bound on that path.
+        deterministic = framework == "torch" and torch.are_deterministic_algorithms_enabled()
+    dprob_n_slots = _dprob_n_slots(n_out, mma_tiler_mn, cluster_shape_mn, deterministic)
+    # None when we allocate it ourselves, in which case the reduction can write the result
+    # straight out instead of adding it onto a buffer we just zeroed.
+    caller_dprob_tensor = dprob_tensor
+    if dprob_tensor is None or deterministic:
         if framework == "torch":
-            dprob_tensor = torch.zeros((valid_m, 1, 1), dtype=torch.float32, device=a_tensor.device)
+            dprob_tensor = torch.zeros((valid_m, dprob_n_slots, 1), dtype=torch.float32, device=a_tensor.device)
         else:
-            dprob_tensor = _jax_alloc(lambda: jnp.zeros((valid_m, 1, 1), dtype=jnp.float32, device=a_tensor.device))
+            dprob_tensor = _jax_alloc(lambda: jnp.zeros((valid_m, dprob_n_slots, 1), dtype=jnp.float32, device=a_tensor.device))
 
     if _convert_to_cutlass_data_type(a_tensor.dtype) in (
         cutlass.Float8E4M3FN,
@@ -1640,24 +1677,15 @@ def grouped_gemm_dsrelu_wrapper_sm100(
             d_row_tensor=d_row_tensor,
             d_col_tensor=d_col_tensor,
             d_srelu_tensor=d_srelu_tensor,
-            dprob_tensor=dprob_tensor,
+            # Reduced here too, so a zero-token call returns the documented (valid_m, 1, 1)
+            # shape rather than leaking the slot dimension.
+            dprob_tensor=_reduce_dprob_slots(dprob_tensor, caller_dprob_tensor, deterministic),
             dbias_tensor=dbias_tensor,
             amax_tensor=amax_tensor,
             sfd_row_tensor=sfd_row_tensor,
             sfd_col_tensor=sfd_col_tensor,
             sfd_col_d_srelu_tensor=sfd_col_d_srelu_tensor,
         )
-
-    # ---- Deterministic dprob ----
-    # Give the kernel one dprob slot per N-tile so each (token, tile_n) pair has a single
-    # writer, then reduce over the tile dimension below in a fixed order. Keeping the
-    # workspace internal means dprob_tensor's shape and contract are unchanged for callers.
-    if deterministic is None:
-        deterministic = os.environ.get("CUDNN_FE_GROUPED_GEMM_DSRELU_DETERMINISTIC", "0") != "0"
-    caller_dprob_tensor = dprob_tensor
-    dprob_n_slots = _dprob_n_slots(n_out, mma_tiler_mn, deterministic)
-    if deterministic:
-        dprob_tensor = torch.zeros((valid_m, dprob_n_slots, 1), dtype=torch.float32, device=a_tensor.device)
 
     # ---- Build cache key ----
     def stride_order(tensor: torch.Tensor) -> Tuple[int, ...]:
@@ -1730,7 +1758,7 @@ def grouped_gemm_dsrelu_wrapper_sm100(
             ),
             *tensor_signature(alpha_tensor),
             *(dynamic_m_tensor_signature(prob_tensor, (1, 1)) if not use_full_dynamic else dynamic_tensor_signature(prob_tensor)),
-            *(dynamic_m_tensor_signature(dprob_tensor, (dprob_n_slots, 1)) if not use_full_dynamic else dynamic_tensor_signature(dprob_tensor)),
+            *(dynamic_m_tensor_signature(dprob_tensor, tuple(dprob_tensor.shape[1:])) if not use_full_dynamic else dynamic_tensor_signature(dprob_tensor)),
             *(dynamic_tensor_signature(dbias_tensor) if use_full_dynamic else tensor_signature(dbias_tensor)),
             *(dynamic_m_tensor_signature(d_srelu_tensor, (n_out, 1)) if not use_full_dynamic else dynamic_tensor_signature(d_srelu_tensor)),
             *(dynamic_tensor_signature(sfb_tensor) if use_full_dynamic else tensor_signature(sfb_tensor)),
@@ -1764,7 +1792,7 @@ def grouped_gemm_dsrelu_wrapper_sm100(
             *dynamic_m_sf_signature(sfa_tensor),
             *tensor_signature(alpha_tensor),
             *dynamic_m_tensor_signature(prob_tensor, (1, 1)),
-            *dynamic_m_tensor_signature(dprob_tensor, (dprob_n_slots, 1)),
+            *dynamic_m_tensor_signature(dprob_tensor, tuple(dprob_tensor.shape[1:])),
             *tensor_signature(dbias_tensor),
             *dynamic_m_tensor_signature(d_srelu_tensor, (n_out, 1), dynamic_stride_dims=(2,)),
             *dynamic_sfd_col_tensor_signature(sfd_col_d_srelu_tensor),
@@ -1910,19 +1938,11 @@ def grouped_gemm_dsrelu_wrapper_sm100(
             current_stream=current_stream,
         )
 
-    if deterministic:
-        # Fixed-order reduction of the per-N-tile partials into the caller's (M, 1, 1) dprob.
-        # Accumulate rather than assign: the kernel's atomic adds into whatever dprob_tensor
-        # already held, so this path has to as well or the two modes would disagree for a
-        # caller that passes a non-zeroed buffer.
-        caller_dprob_tensor += torch.sum(dprob_tensor, dim=1, keepdim=True)
-        dprob_tensor = caller_dprob_tensor
-
     return TupleDict(
         d_row_tensor=d_row_tensor,
         d_col_tensor=d_col_tensor,
         d_srelu_tensor=d_srelu_tensor,
-        dprob_tensor=dprob_tensor,
+        dprob_tensor=_reduce_dprob_slots(dprob_tensor, caller_dprob_tensor, deterministic),
         dbias_tensor=dbias_tensor,
         amax_tensor=amax_tensor,
         sfd_row_tensor=sfd_row_tensor,

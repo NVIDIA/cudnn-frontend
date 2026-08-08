@@ -274,7 +274,7 @@ op.execute(
   - Enables the discrete column-scale-factor path used by grouped FP8
 - `deterministic: bool | None`
   - Makes `dprob` bit-exact run to run — see [Deterministic dprob](#deterministic-dprob)
-  - Wrapper: `None` (default) reads `CUDNN_FE_GROUPED_GEMM_DSRELU_DETERMINISTIC`, off unless set
+  - Wrapper: `None` (default) follows `torch.use_deterministic_algorithms`
   - Class API: plain `bool`, default `False`
 - CUDA stream (`current_stream` in class API, `current_stream` in wrapper)
 
@@ -340,25 +340,28 @@ cross-CTA atomic still leaves a divergent result.
 2. `dprob` is given one slot per N-tile, so each `(token, tile_n)` pair has exactly one
    writer, and those slots are reduced with `torch.sum` in fixed order.
 
-This flag is the only control over the behaviour: the reduction happens inside the kernel, so
-no process-level determinism setting affects it.
+Left unset, the flag follows torch:
 
 ```python
-# Explicit, per call site:
-result = cudnn.grouped_gemm_dsrelu_wrapper_sm100(..., deterministic=True)
+# Process-wide, along with every other deterministic algorithm:
+torch.use_deterministic_algorithms(True)
 
-# Or process-wide, when the call site is not yours to edit:
-#   export CUDNN_FE_GROUPED_GEMM_DSRELU_DETERMINISTIC=1
+# Or explicitly, per call site, independent of the torch setting:
+result = cudnn.grouped_gemm_dsrelu_wrapper_sm100(..., deterministic=True)
 ```
 
 `dprob_tensor` keeps its `(valid_m, 1, 1)` shape either way — the per-N-tile workspace and
 the reduction into it are internal to the wrapper. The class API is lower level: pass
-`sample_dprob` / `dprob_tensor` shaped `(valid_m, ceil_div(n, mma_tiler_mn[1]), 1)` and reduce
-over dim 1 yourself.
+`sample_dprob` / `dprob_tensor` carrying one slot per N-tile and reduce over dim 1 yourself.
 
-**Cost.** `grid_n ×` the `dprob` workspace (`grid_n = ceil_div(n, mma_tiler_mn[1])`), one
-reduction kernel, and `subtile_cnt` extra registers per epilogue thread. Deterministic and
+**Cost.** `grid_n ×` the `dprob` workspace, one reduction kernel, and `subtile_cnt` extra
+registers per epilogue thread — and the last of those only for tile shapes that overlap the
+accumulator, since that is what reverses the subtile loop. Deterministic and
 non-deterministic configurations compile and cache separately.
+
+`grid_n` is the number of N-tiles the scheduler can emit, `ceil_div(n, TILE_N × cluster_n) ×
+cluster_n` — which is *not* `ceil_div(n, TILE_N)` unless `cluster_n` is 1, because the
+scheduler counts whole clusters and then expands to CTAs.
 
 ---
 

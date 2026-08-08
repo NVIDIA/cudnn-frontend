@@ -8,9 +8,11 @@ This module tests the contiguous grouped block-scaled GEMM backward pass
 with dSReLU activation gradient for MoE (Mixture of Experts) workloads.
 """
 
+import contextlib
+
 import torch
 import pytest
-from test_utils import torch_fork_set_rng
+from test_utils import torch_fork_set_rng, assert_bitwise_runs, bitwise_bits
 from fe_api.grouped_gemm.test_grouped_gemm_dsrelu_utils import (
     with_grouped_gemm_dsrelu_params_fp4,
     with_grouped_gemm_dsrelu_params_fp8,
@@ -388,7 +390,7 @@ def test_grouped_gemm_dsrelu_wrapper_uint8_raw_fp4_smoke(request):
     assert torch.count_nonzero(outputs["d_row_tensor"]).item() > 0
 
 
-def _run_dsrelu_deterministic_case(case, **wrapper_kwargs):
+def _run_dsrelu_case(case, **wrapper_kwargs):
     """Run the wrapper once over an already-built case, so repeats share identical inputs.
 
     ``dprob_tensor`` is deliberately not passed: the wrapper then allocates and zeroes a
@@ -424,7 +426,7 @@ def _run_dsrelu_deterministic_case(case, **wrapper_kwargs):
     )
 
 
-def _build_dsrelu_deterministic_case(request, ab_dtype, c_dtype, d_dtype, sf_vec_size, sf_dtype, vector_f32, discrete_col_sfd):
+def _build_dsrelu_case(request, ab_dtype, c_dtype, d_dtype, sf_vec_size, sf_dtype, vector_f32, discrete_col_sfd):
     cfg = grouped_gemm_dsrelu_init(
         request=request,
         ab_dtype=ab_dtype,
@@ -466,6 +468,57 @@ def _build_dsrelu_deterministic_case(request, ab_dtype, c_dtype, d_dtype, sf_vec
     return inputs, cfg
 
 
+@contextlib.contextmanager
+def _torch_deterministic_algorithms():
+    """Scope torch's global determinism flag, restoring whatever the session had."""
+    previous = torch.are_deterministic_algorithms_enabled()
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    try:
+        yield
+    finally:
+        torch.use_deterministic_algorithms(previous, warn_only=True)
+
+
+def _assert_dprob_deterministic(case, baseline, deterministic, relaunch, ref_inputs=None):
+    """The three properties deterministic=True has to hold, shared by dense and discrete.
+
+    ``relaunch`` produces another deterministic run; it is called repeatedly, because a
+    reduction-order race is timing-dependent and one repeat proves little.
+    """
+    torch.cuda.synchronize()
+    inputs, cfg = case
+
+    # The caller-visible shape is unchanged -- the per-N-tile workspace is internal.
+    assert deterministic["dprob_tensor"].shape == baseline["dprob_tensor"].shape
+    assert torch.count_nonzero(deterministic["dprob_tensor"]).item() > 0
+
+    # 1. Repeated runs agree to the last bit, not merely to a tolerance.
+    assert_bitwise_runs(lambda: (relaunch()["dprob_tensor"],), label="dprob")
+
+    # 2. Reordering a float sum must not change what is being summed: a partial dropped by a
+    # gap in the per-subtile slots, or double-counted by a second writer to an N-tile slot,
+    # would show up here and nowhere else.
+    scale = baseline["dprob_tensor"].abs().max().item()
+    torch.testing.assert_close(deterministic["dprob_tensor"], baseline["dprob_tensor"], rtol=1e-4, atol=1e-4 * max(scale, 1.0))
+
+    # dprob is the only output the flag touches; dA and friends are single-write per element
+    # and must come back untouched. d_col only joins that list when the fp8 scale-factor path
+    # is active -- otherwise the kernel leaves it at whatever its torch.empty_strided
+    # allocation happened to contain, which differs between two independent calls for reasons
+    # that have nothing to do with determinism. (The reference check skips it for the same
+    # reason: run_grouped_gemm_dsrelu_ref only builds d_col_ref under generate_sfd.)
+    unchanged = ["d_row_tensor", "d_srelu_tensor"]
+    if deterministic.get("sfd_col_tensor") is not None:
+        unchanged.append("d_col_tensor")
+    for key in unchanged:
+        assert torch.equal(deterministic[key], baseline[key]), f"{key} changed under deterministic=True"
+
+    # 3. The deterministic path clears the same bar as the default one, not merely agrees
+    # with it: the reference the non-deterministic wrapper tests run, over the whole backward
+    # output set (dprob, dA row/col, d_srelu, amax, scale factors).
+    check_ref_grouped_gemm_dsrelu(inputs if ref_inputs is None else ref_inputs, deterministic, cfg, skip_ref=cfg["skip_ref"])
+
+
 # n defaults to 512 against an mma_tiler_mn[1] of 256, so grid_n is 2 and the cross-N-tile
 # reduction -- level 2 of the fix -- is actually exercised. A config with n <= 256 would
 # only cover level 1.
@@ -489,76 +542,30 @@ def test_grouped_gemm_dsrelu_deterministic_dprob(request, ab_dtype, c_dtype, d_d
     except ImportError:
         pytest.skip("Environment not supported: cudnn optional dependencies not installed")
 
-    case = _build_dsrelu_deterministic_case(request, ab_dtype, c_dtype, d_dtype, sf_vec_size, sf_dtype, vector_f32, discrete_col_sfd)
+    case = _build_dsrelu_case(request, ab_dtype, c_dtype, d_dtype, sf_vec_size, sf_dtype, vector_f32, discrete_col_sfd)
 
     try:
-        baseline = _run_dsrelu_deterministic_case(case, deterministic=False)
-        first = _run_dsrelu_deterministic_case(case, deterministic=True)
-        second = _run_dsrelu_deterministic_case(case, deterministic=True)
+        baseline = _run_dsrelu_case(case, deterministic=False)
+        deterministic = _run_dsrelu_case(case, deterministic=True)
     except (ValueError, NotImplementedError) as e:
         pytest.skip(f"Unsupported testcase: {e}")
+    _assert_dprob_deterministic(case, baseline, deterministic, lambda: _run_dsrelu_case(case, deterministic=True))
+
+    # Unset, the flag follows torch -- the path most callers will actually take.
+    with _torch_deterministic_algorithms():
+        from_torch = _run_dsrelu_case(case)
     torch.cuda.synchronize()
-
-    # The caller-visible shape is unchanged -- the per-N-tile workspace is internal.
-    assert first["dprob_tensor"].shape == baseline["dprob_tensor"].shape
-    assert torch.isfinite(first["dprob_tensor"]).all()
-    assert torch.count_nonzero(first["dprob_tensor"]).item() > 0
-
-    # The property under test. Two runs of the same kernel on the same inputs must agree
-    # to the last bit, not merely to a tolerance.
-    assert torch.equal(first["dprob_tensor"], second["dprob_tensor"])
-
-    # Reordering a float sum must not change what is being summed: a partial dropped by a
-    # gap in the per-subtile slots, or double-counted by a second writer to an N-tile slot,
-    # would show up here and nowhere else.
-    scale = baseline["dprob_tensor"].abs().max().item()
-    torch.testing.assert_close(
-        first["dprob_tensor"],
-        baseline["dprob_tensor"],
-        rtol=1e-4,
-        atol=1e-4 * max(scale, 1.0),
-    )
-
-    # dprob is the only output the flag touches; dA and friends are single-write per
-    # element and must come back untouched.
-    for key in ("d_row_tensor", "d_col_tensor", "d_srelu_tensor"):
-        assert torch.equal(first[key], baseline[key]), f"{key} changed under deterministic=True"
-
-    # The deterministic path has to clear the same bar as the default one, not merely agree
-    # with it: this is the reference check the non-deterministic wrapper tests run, over the
-    # whole backward output set (dprob, dA row/col, d_srelu, amax, scale factors).
-    inputs, cfg = case
-    check_ref_grouped_gemm_dsrelu(inputs, first, cfg, skip_ref=cfg["skip_ref"])
+    assert torch.equal(bitwise_bits(from_torch["dprob_tensor"]), bitwise_bits(deterministic["dprob_tensor"]))
 
 
-@pytest.mark.L0
-@torch_fork_set_rng(seed=19)
-def test_grouped_gemm_dsrelu_deterministic_dprob_env_var(request, monkeypatch):
-    """The env var is the opt-in when the call site is not the caller's to edit."""
-    try:
-        import cudnn  # noqa: F401
-        from cuda.bindings import driver as cuda  # noqa: F401
-    except ImportError:
-        pytest.skip("Environment not supported: cudnn optional dependencies not installed")
-
-    # fp8 rather than the uint8 raw-FP4 config: the latter needs a CUTLASS the shared
-    # allocators cannot always provide, and a test that skips is a test that guards nothing.
-    case = _build_dsrelu_deterministic_case(request, torch.float8_e4m3fn, torch.bfloat16, torch.float8_e4m3fn, 32, torch.float8_e8m0fnu, False, True)
-
-    try:
-        explicit = _run_dsrelu_deterministic_case(case, deterministic=True)
-        monkeypatch.setenv("CUDNN_FE_GROUPED_GEMM_DSRELU_DETERMINISTIC", "1")
-        from_env = _run_dsrelu_deterministic_case(case)
-    except (ValueError, NotImplementedError) as e:
-        pytest.skip(f"Unsupported testcase: {e}")
-    torch.cuda.synchronize()
-
-    assert torch.equal(explicit["dprob_tensor"], from_env["dprob_tensor"])
+# b_major does not reach the dprob path, so the n-major config would only re-prove what
+# fp8-k-major already does; the two dtypes are kept because they compile different kernels.
+DISCRETE_DETERMINISTIC_CONFIGS = [c for c in DISCRETE_GROUPED_GEMM_DSRELU_SUPPORTED_CONFIGS if c.id != "fp8-n-major"]
 
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=23)
-@pytest.mark.parametrize("ab_dtype,c_dtype,d_dtype,b_major", DISCRETE_GROUPED_GEMM_DSRELU_SUPPORTED_CONFIGS)
+@pytest.mark.parametrize("ab_dtype,c_dtype,d_dtype,b_major", DISCRETE_DETERMINISTIC_CONFIGS)
 def test_grouped_gemm_dsrelu_deterministic_dprob_discrete(request, ab_dtype, c_dtype, d_dtype, b_major):
     """Same guarantee in discrete-weight mode, which builds its cache key on its own branch."""
     try:
@@ -637,21 +644,13 @@ def test_grouped_gemm_dsrelu_deterministic_dprob_discrete(request, ab_dtype, c_d
         )
 
     baseline = run(deterministic=False)
-    first = run(deterministic=True)
-    second = run(deterministic=True)
-    torch.cuda.synchronize()
-
-    assert first["dprob_tensor"].shape == baseline["dprob_tensor"].shape
-    assert torch.equal(first["dprob_tensor"], second["dprob_tensor"])
-
-    scale = baseline["dprob_tensor"].abs().max().item()
-    torch.testing.assert_close(first["dprob_tensor"], baseline["dprob_tensor"], rtol=1e-4, atol=1e-4 * max(scale, 1.0))
-
-    check_ref_grouped_gemm_dsrelu(
-        _dense_ref_inputs_from_discrete(inputs),
-        first,
-        cfg,
-        skip_ref=cfg["skip_ref"],
+    deterministic = run(deterministic=True)
+    _assert_dprob_deterministic(
+        (inputs, cfg),
+        baseline,
+        deterministic,
+        lambda: run(deterministic=True),
+        ref_inputs=_dense_ref_inputs_from_discrete(inputs),
     )
 
 
