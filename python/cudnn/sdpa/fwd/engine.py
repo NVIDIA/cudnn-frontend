@@ -15,7 +15,7 @@ The capability table, the probe and the lowering are unchanged and stay in
 only the engine contract around them.
 """
 
-from typing import TYPE_CHECKING, Any, List, Optional
+from typing import TYPE_CHECKING, Any, List
 
 from cudnn import behavior_note
 from cudnn.engines.base import BaseEngine, CompiledPlan, ExecutionContext, PlanConfig
@@ -87,21 +87,26 @@ class FrostSdpaFwdEngine(BaseEngine):
         self.name = spec.name
         self.engine_id = engine_id
 
-    def _decline_reason(self, graph: "pygraph", knobs) -> Optional[str]:
+    def _facts_or_decline(self, graph: "pygraph"):
+        """The parsed graph, or NotImplementedError naming why this cell declines.
+
+        The one eligibility question this engine asks, so callers that also need
+        the facts do not ask it twice.
+        """
         from .engines import analyze_for
 
         try:
-            _, reason = analyze_for(self._spec, graph, knobs)
+            facts, reason = analyze_for(self._spec, graph, None)
         except ValueError as exc:
             # ValueError is the analyzer's internal "cannot express this graph";
             # at the engine boundary that is a decline, not a user error.
-            return str(exc)
-        return reason
-
-    def check_support(self, graph: "pygraph") -> None:
-        reason = self._decline_reason(graph, None)
+            facts, reason = None, str(exc)
         if reason is not None:
             raise NotImplementedError(f"{self.name}: {reason}")
+        return facts
+
+    def check_support(self, graph: "pygraph") -> None:
+        self._facts_or_decline(graph)
 
     def propose_plans(self, graph: "pygraph") -> List[PlanConfig]:
         # Entry 0 delegates (knobs=None -> the adapter's own shape-driven
@@ -111,8 +116,7 @@ class FrostSdpaFwdEngine(BaseEngine):
         # engine declines.
         from .engines import knob_candidates
 
-        self.check_support(graph)
-        return [PlanConfig(self.engine_id, k) for k in knob_candidates(self._spec, graph)]
+        return [PlanConfig(self.engine_id, k) for k in knob_candidates(self._spec, self._facts_or_decline(graph))]
 
     def build_plan(self, graph: "pygraph", plan: PlanConfig, ctx: ExecutionContext = None) -> CompiledPlan:
         from .engines import build

@@ -565,9 +565,13 @@ def _sm120_fp8_spec() -> EngineSpec:
     )
 
 
-def knob_candidates(spec: EngineSpec, graph) -> List[Optional[SdpaFwdKnobs]]:
+def knob_candidates(spec: EngineSpec, facts: "ga.SdpaGraphFacts") -> List[Optional[SdpaFwdKnobs]]:
     """``None`` (delegate to the adapter) followed by every admissible point of
     this engine's declared knob domain, best first.
+
+    Takes the facts the caller already established eligibility with, so the
+    knob-free ``mismatch`` is answered once per engine rather than here and in
+    ``check_support``.
 
     The domain is read off the capability row -- there is no second table to
     drift from it -- so a cell declaring one value per axis proposes exactly
@@ -576,12 +580,6 @@ def knob_candidates(spec: EngineSpec, graph) -> List[Optional[SdpaFwdKnobs]]:
     decline at build, and the walk moves on.
     """
     caps = spec.capabilities
-    try:
-        facts, reason = analyze_for(spec, graph, None)
-    except ValueError:
-        return [None]
-    if reason is not None:
-        return [None]
     named = [
         SdpaFwdKnobs(sched_policy=s, tile_m=m, tile_n=n, cga=c)
         for s in sorted(caps.sched_policies)
@@ -600,7 +598,7 @@ def analyze_for(spec: EngineSpec, graph, knobs: Optional[SdpaFwdKnobs] = None):
     cannot serve it under ``knobs`` (``None`` when it can).
 
     The single eligibility entry point, shared by :func:`probe`, :func:`build`
-    and ``engine.FrostSdpaFwdEngine.check_support``. ``knobs`` is the plan's
+    and ``engine.FrostSdpaFwdEngine._facts_or_decline``. ``knobs`` is the plan's
     tuning request (``PlanConfig.knobs``), ``None`` for no preference.
     """
     # The record validate() attached, not a fresh parse: one per graph, shared
