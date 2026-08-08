@@ -779,6 +779,43 @@ def test_sm120_probe_accepts_thd_stats(monkeypatch):
     assert engines.engine_name(arch="sm120") in _eligible(g)
 
 
+def _mk_thd_cu_graph(*, extra_seq_len=False):
+    """Ragged (THD) graph carrying the cu_seq_len_q/kv (B+1,) prefix-sum form."""
+    g = _mk_graph()
+    dims = (B, H, S, D)
+    strides = (S * H * D, D, H * D, 1)
+    q = g.tensor(dim=dims, stride=strides, data_type=DTYPE, name="q")
+    k = g.tensor(dim=dims, stride=strides, data_type=DTYPE, name="k")
+    v = g.tensor(dim=dims, stride=strides, data_type=DTYPE, name="v")
+    ro = g.tensor(dim=(B + 1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT64, name="ro")
+    q.set_ragged_offset(ro)
+    k.set_ragged_offset(ro)
+    v.set_ragged_offset(ro)
+    cu_q = g.tensor(dim=(B + 1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT32, name="cu_q")
+    cu_kv = g.tensor(dim=(B + 1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT32, name="cu_kv")
+    kw = dict(cu_seq_len_q=cu_q, cu_seq_len_kv=cu_kv)
+    if extra_seq_len:
+        skv = g.tensor(dim=(B, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT32, name="skv")
+        kw["seq_len_kv"] = skv
+    o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True, use_causal_mask=True, use_padding_mask=True, **kw)
+    _finish_output(o, dims, strides)
+    o.set_ragged_offset(ro)
+    return g
+
+
+def test_probe_accepts_thd_cu_seq_len():
+    """THD with the (B+1,) cu_seq_len prefix-sum form (cuDNN 9.24+) is served:
+    the lowering derives per-batch lengths host-side from its inherent tolist
+    round-trip."""
+    assert engines.engine_name(512) in _eligible(_mk_thd_cu_graph())
+
+
+def test_probe_rejects_thd_cu_plus_seq_len():
+    """Both forms on one side is ambiguous (the backend has its own
+    precedence, which the python engines do not replicate) — declined."""
+    assert not _eligible(_mk_thd_cu_graph(extra_seq_len=True))
+
+
 @pytest.mark.parametrize("side", ["cu_seq_len_q", "cu_seq_len_kv"])
 def test_cu_seq_len_is_declined(side):
     """cu_seq_len_* (cuDNN 9.24+) are prefix sums — a different contract from

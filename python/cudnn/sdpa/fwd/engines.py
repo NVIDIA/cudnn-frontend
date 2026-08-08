@@ -158,7 +158,11 @@ class Capabilities:
     # a carved dummy from lower_dsl_prefill when the graph has no Stats output.
     lse_optional: bool = False
     thd: bool = False
-    cu_seq_len: bool = False  # cu_seq_len_q / cu_seq_len_kv prefix sums (no row serves these yet)
+    # cu_seq_len_q / cu_seq_len_kv (B+1,) prefix sums (cuDNN 9.24+). Serving
+    # rows consume the form on THD host-side (lens = adjacent differences of
+    # the inherent tolist); dense cu graphs stay declined until the kernels
+    # grow a CU read mode (len = cu[b+1] - cu[b]) — see mismatch().
+    cu_seq_len: bool = False
     # Dense padded + stats needs the per-batch seq_len_q LSE trim (padded
     # q-rows write LSE=-inf / O=0, cuDNN >= 9.14). Plumbed for the half
     # kernels via SEQ_Q_LENS_PRESENT; the FP8/MXFP8 kernels lack the epilogue
@@ -317,13 +321,25 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         (facts.has_sink, capabilities.sink, "sink token"),
         (facts.wants_stats, capabilities.stats, "stats output"),
         (facts.thd, capabilities.thd, "THD / ragged"),
-        (facts.has_cu_seq_len, capabilities.cu_seq_len, "cu_seq_len_q / cu_seq_len_kv"),
     ):
         if fact and not cap:
             return f"graph uses {label}, which this engine does not support"
 
     if facts.right_band_widening and facts.right_bound is not None and facts.right_bound < 0:
         return f"negative diagonal_band_right_bound ({facts.right_bound}) is not supported"
+
+    if facts.has_cu_seq_len:
+        # cu_seq_len_* ((B+1,) prefix sums, cuDNN 9.24+). The THD lowering
+        # consumes either length form host-side; the dense kernels' CU read
+        # mode (len = cu[b+1] - cu[b]) is not plumbed yet, so dense cu graphs
+        # stay declined even on serving rows.
+        if not capabilities.cu_seq_len:
+            return "graph uses cu_seq_len_q / cu_seq_len_kv, which this engine does not support"
+        if not facts.thd:
+            return "cu_seq_len_* on dense graphs is not supported yet (kernel CU read mode not plumbed)"
+        if (facts.seq_q_t is not None and facts.cu_seq_q_t is not None) or (facts.seq_kv_t is not None and facts.cu_seq_kv_t is not None):
+            return "seq_len_* and cu_seq_len_* on the same side is ambiguous (backend precedence is not replicated here)"
+
     if facts.bottom_right:
         if not (facts.causal or facts.right_band_widening):
             return "bottom-right alignment requires a causal upper bound (plain or right-widened)"
@@ -389,6 +405,7 @@ def _sm100_spec(d: int, d_v: Optional[int] = None) -> EngineSpec:
             stats=True,
             lse_optional=True,
             thd=True,
+            cu_seq_len=True,
             padded_stats=True,
             # The f16/bf16 lowering serves any dense B/H/S stride permutation
             # (padded strides included) with the head dim innermost; the
@@ -626,6 +643,7 @@ def _sm120_spec() -> EngineSpec:
             # of mask flags. Ragged S_kv is served natively with no synthesized
             # padding and no padded-path cost.
             skv_tile=0,
+            cu_seq_len=True,
             layouts=frozenset({"bshd", "dense_flex"}),
             sched_policies=frozenset({SCHED_NATURAL}),
             tile_ms=frozenset({64, 128}),
@@ -713,6 +731,10 @@ def lower_dsl_prefill(
         # THD carries Q lengths via cu_seqlens; the FP8/MXFP8 kernels are not
         # plumbed (their specs also keep padded_stats=False).
         seq_q_lens_present=seq_q_lens_present,
+        # cu_seq_len form (THD-only; the probe declined dense cu graphs): the
+        # adapter's seq-lens execute arguments carry (B+1,) prefix sums.
+        cu_seq_q_lens=facts.cu_seq_q_t is not None,
+        cu_seq_kv_lens=facts.cu_seq_kv_t is not None,
         has_sink=facts.has_sink,
         thd=facts.thd,
         dtype_o=facts.dtype_o if (facts.is_mxfp8 or facts.is_fp8) else None,
@@ -755,6 +777,8 @@ def lower_dsl_prefill(
         sink_token=facts.sink_t,
         seq_len_kv=seq_kv_t,
         seq_len_q=seq_q_t,
+        cu_seq_len_q=facts.cu_seq_q_t,
+        cu_seq_len_kv=facts.cu_seq_kv_t,
         sf_q=facts.sf_q_t,
         sf_k=facts.sf_k_t,
         sf_v=facts.sf_v_t,
@@ -819,6 +843,13 @@ def lower_dsl_prefill(
             # makes the kernel's padded path cover the ragged KV tail.
             seq_kv_buf = carver.take(facts.b, torch.int32).fill_(facts.s_kv)
         seq_q_buf = feature_ops.seq_len_q
+        # cu_seq_len form (THD-only): the (B+1,) prefix-sum buffer travels
+        # through the SAME seq-lens execute argument — the adapter was
+        # constructed with cu_seq_*_lens=True and consumes the form directly.
+        if seq_q_buf is None and binding.cu_seq_len_q is not None:
+            seq_q_buf = resolved.get(id(binding.cu_seq_len_q))
+        if seq_kv_buf is None and binding.cu_seq_len_kv is not None:
+            seq_kv_buf = resolved.get(id(binding.cu_seq_len_kv))
         sf_q_buf = resolved.get(id(binding.sf_q)) if binding.sf_q is not None else None
         sf_k_buf = resolved.get(id(binding.sf_k)) if binding.sf_k is not None else None
         sf_v_buf = resolved.get(id(binding.sf_v)) if binding.sf_v is not None else None
