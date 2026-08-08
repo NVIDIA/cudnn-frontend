@@ -14,17 +14,15 @@ SEQ_KV_TILES = (128, 64)
 SUPPORTED_HEAD_TILES = tuple(range(16, 257, 16))
 
 
-def fp8_tile_choice(s_q: int, s_kv: int, h_q: int, batch: int, sm_count: int) -> tuple[int, int]:
-    """(q_tile, kv_tile) for the SM120 per-tensor FP8 cell.
+def tile_choice(s_q: int, s_kv: int, h_q: int, batch: int, sm_count: int, is_causal: bool) -> tuple[int, int]:
+    """(q_tile, kv_tile) for the SM120 SDPA-forward cells, fp8 and f16 alike.
 
-    FP8 only: this is read off the fp8 kernel's own measurements and the f16
-    cell's optimum differs, so the two must not share a default.
-
-    ``kv_tile=128`` unconditionally -- fastest in all 28 shapes measured. An
-    earlier revision of this kernel staged P through SMEM, and that traffic
-    grew with the KV tile, which made 64 the better choice; the shfl path
-    removed it and the optimum moved. A tile rule is a property of the kernel
-    it was measured on, not of the hardware.
+    ``kv_tile=128`` unconditionally -- fastest in all 28 fp8 shapes measured,
+    and in the f16 sweep too (by 2-4% rather than a uniform margin). An earlier
+    revision of the fp8 kernel staged P through SMEM, and that traffic grew
+    with the KV tile, which made 64 the better choice; the shfl path removed it
+    and the optimum moved. A tile rule is a property of the kernel it was
+    measured on, not of the hardware.
 
     ``q_tile=64`` when the grid cannot fill the machine AND each CTA has enough
     KV tiles for the extra Q-tile loop to amortize: halving the Q tile doubles
@@ -32,10 +30,17 @@ def fp8_tile_choice(s_q: int, s_kv: int, h_q: int, batch: int, sm_count: int) ->
     that only long sequences absorb. Worth 1.5x at 64 CTAs. The 1.5x SM-count
     bound is where the two stop trading evenly: 240 CTAs still want the finer
     tile on this part, 320 want the coarser one by 1.19x.
+
+    A causal mask halves the work per CTA, so the machine empties sooner and
+    the finer Q tile keeps paying further out -- folded in as a halved
+    effective grid. Both cells want that term; see the doc for the four
+    datasets it was measured against.
     """
     if sm_count <= 0:
         return 128, 128
     grid = -(-s_q // 128) * h_q * batch
+    if is_causal:
+        grid //= 2
     kv_tiles = -(-s_kv // 128)
     fine = grid * 2 <= sm_count or (grid * 2 <= 3 * sm_count and kv_tiles >= 12)
     return (64 if fine else 128), 128

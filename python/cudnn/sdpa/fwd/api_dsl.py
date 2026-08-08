@@ -34,7 +34,7 @@ from cudnn.sdpa.fwd.config_sm100 import TemplateParams as Sm100TemplateParams
 from cudnn.sdpa.fwd.config_sm120 import (
     SEQ_KV_TILES as _SM120_KV_TILES,
     SEQ_Q_TILES as _SM120_Q_TILES,
-    fp8_tile_choice as _sm120_fp8_tile_choice,
+    tile_choice as _sm120_tile_choice,
     SUPPORTED_HEAD_TILES as _SM120_SUPPORTED_HEAD_TILES,
     TemplateParams as Sm120TemplateParams,
 )
@@ -1647,12 +1647,13 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             return base + 16
 
         chose_by_shape = False
-        if self._fp8 and self.tile_m is None and self.tile_n is None:
-            # No knob request: the fp8 cell picks by shape and machine width
-            # rather than by what fits (see fp8_tile_choice). Both tiles come
-            # from one decision, so a half-specified request opts out entirely.
+        if self.tile_m is None and self.tile_n is None:
+            # No knob request: pick by shape and machine width rather than by
+            # what fits. Each cell has its own rule -- they share a knob domain
+            # but not an optimum. Both tiles come from one decision, so a
+            # half-specified request opts out entirely.
             sms = torch.cuda.get_device_properties(self.q_desc.device).multi_processor_count
-            self.q_tile, self.kv_tile = _sm120_fp8_tile_choice(int(s_q), int(s_kv), int(h_q), int(b), int(sms))
+            self.q_tile, self.kv_tile = _sm120_tile_choice(int(s_q), int(s_kv), int(h_q), int(b), int(sms), bool(self.is_causal))
             chose_by_shape = _smem_bytes(self.kv_tile) <= smem_capacity_bytes
         if self.tile_n is None and not chose_by_shape:
             # Pick the largest KV tile that fits this device.

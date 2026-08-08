@@ -103,7 +103,7 @@ hide.
 The capability row advertises `tile_ms/tile_ns ∈ {64,128}` and
 `propose_plans` offers every point, so a caller can pin one with
 `create_execution_plan(engine_id, SdpaFwdKnobs(tile_m=..., tile_n=...))`.
-Entry 0 carries no knobs and lets `config_sm120.fp8_tile_choice` decide.
+Entry 0 carries no knobs and lets `config_sm120.tile_choice` decide.
 
 `kv_tile=128` in all 28 shapes measured. **This reversed when P moved out of
 SMEM**: the restage tile was `(q_tile/16) x 16 x kv_tile`, so its traffic grew
@@ -114,15 +114,42 @@ carried. A tile rule is a property of the kernel it was measured on.
 
 `q_tile=64` while the grid cannot fill the machine *and* the sequence is long
 enough to amortize the extra Q-tile loop — `grid*2 <= SMs`, or
-`grid*2 <= 3*SMs` with at least 12 KV tiles. Held-out regret against the best
-of the enumerated domain is 1.009x mean, 1.089x worst over 22 shapes; the
-misses are causal, where the triangular mask changes the per-CTA balance in a
-way grid alone does not capture.
+`grid*2 <= 3*SMs` with at least 12 KV tiles. A causal mask halves the work per
+CTA, so the machine empties sooner and the finer Q tile keeps paying further
+out; that enters as a halved effective grid.
 
 The 1.5x-SM bound was moved in after a held-out shape at 320 CTAs missed by
 1.19x while 240 CTAs was correct, so that pair is no longer independent
 evidence — `test_the_grid_bound_sits_between_240_and_320_ctas` pins both
 points, and a genuine re-validation needs fresh shapes.
+
+### One rule, both cells
+
+The f16/bf16 cell used the same knob domain but took whatever fit, which on
+this part meant 128x128 everywhere. Measuring it produced the same rule, so
+there is one `tile_choice` rather than one per cell.
+
+The two sweeps disagree on how much each tile wins by — `kv_tile=128` leads by
+2–4% in bf16 against a uniform margin in fp8, since bf16 KV is two bytes and
+there is no P quantization — but never on which tile wins. The causal term was
+found on the f16 sweep and then measured on the fp8 cell, where it also helps:
+
+| dataset | rule without the causal term | with it |
+|---|---|---|
+| RTX PRO 6000, 24 bf16 cells | 1.023x mean regret, 1.175x worst | **1.009x, 1.054x** |
+| RTX PRO 6000, 28 fp8 cells | 1.0078x, 1.107x | 1.0066x, 1.107x (2 fixed, 2 broken) |
+| RTX 5090 (170 SMs), 14 fp8 cells | 1.0082x, 1.062x | **1.0007x, 1.006x** |
+| 22 held-out fp8 shapes | 1.009x, 1.089x | flips the 3 worst cells to optimal |
+
+Regret is against the best of the enumerated `{64,128}²` domain, so 1.00x means
+the rule picked the tile an exhaustive sweep would have. On the training part
+the term is a wash in the mean and leaves the worst case untouched; the case
+for it is that it is a clear win on the second part and on the held-out set,
+where it fixes exactly the causal cells that were the previous rule's misses.
+
+Evidence scope: the fp8 side is validated on 22 held-out shapes and on a second
+part. **The bf16 side has been measured on one part only**, and contributes no
+held-out set.
 
 ## Bigger levers beyond this kernel
 

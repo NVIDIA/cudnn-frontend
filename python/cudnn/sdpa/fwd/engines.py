@@ -35,7 +35,7 @@ import cudnn
 from cudnn.frost.tile_dsl.constants import SCHED_NATURAL
 from cudnn.frost.buffers import CUTEDSL_MIN_VERSION, cutedsl_state, cutedsl_too_old
 from cudnn.sdpa import graph_analyzer as ga
-from cudnn.sdpa.fwd.config_sm120 import fp8_tile_choice
+from cudnn.sdpa.fwd.config_sm120 import tile_choice
 
 # The DSL adapters (api_dsl) and cuda.bindings are LOWERING dependencies, not
 # support-check ones: importing them here would drag the CuTe DSL (~1.0 s, 357
@@ -474,6 +474,18 @@ def _sm100_fp8_spec(d: int) -> EngineSpec:
     )
 
 
+def _sm120_knob_order(facts, named):
+    """Order an SM120 cell's tile domain: the shape's own choice first.
+
+    ``heuristics_sort`` concatenates rather than ranks today, so whatever this
+    puts first is what runs. Same rule as the adapter's delegation path
+    (:func:`config_sm120.tile_choice`) -- named here so pinning entry 1
+    reproduces entry 0.
+    """
+    want = tile_choice(facts.s_q, facts.s_kv, facts.h_q, facts.b, facts.device_sm_count or 0, facts.causal)
+    return sorted(named, key=lambda k: ((k.tile_m, k.tile_n) != want, k.tile_n != 128, -(k.tile_m or 0)))
+
+
 def _sm120_spec() -> EngineSpec:
     return EngineSpec(
         name="sdpa_fwd_prefill_sm120",
@@ -504,19 +516,8 @@ def _sm120_spec() -> EngineSpec:
             cgas=frozenset({1}),
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM120),
+        knob_order=_sm120_knob_order,
     )
-
-
-def _sm120_fp8_knob_order(facts, named):
-    """Order the fp8 cell's tile domain: the shape's own choice first.
-
-    ``heuristics_sort`` concatenates rather than ranks today, so whatever this
-    puts first is what runs. Same rule as the adapter's delegation path
-    (:func:`config_sm120.fp8_tile_choice`) -- named here so pinning entry 1
-    reproduces entry 0.
-    """
-    want = fp8_tile_choice(facts.s_q, facts.s_kv, facts.h_q, facts.b, facts.device_sm_count or 0)
-    return sorted(named, key=lambda k: ((k.tile_m, k.tile_n) != want, k.tile_n != 64, -(k.tile_m or 0)))
 
 
 def _sm120_fp8_spec() -> EngineSpec:
@@ -560,7 +561,7 @@ def _sm120_fp8_spec() -> EngineSpec:
             cgas=frozenset({1}),
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM120),
-        knob_order=_sm120_fp8_knob_order,
+        knob_order=_sm120_knob_order,
     )
 
 
