@@ -36,6 +36,22 @@ from cudnn.sdpa.fwd.config_sm120 import (
     smem_bytes as _sm120_smem_bytes,
 )
 
+
+def _require_unit_s_scales(descale_s: float, scale_s: float) -> None:
+    """The operands cuDNN calls Scale_S/Descale_S quantize P — the SOFTMAX
+    OUTPUT, not the scores: the graph applies Scale_S after softmax (and after
+    Amax_S) and hands Descale_S to bmm2. Both FP8 kernels here convert P to e4m3
+    for the PV MMA UNSCALED, so neither reaches the math.
+
+    A reciprocal pair is not equivalent to unity — it asks for a different
+    quantization range, so rounding and underflow differ. (Where an engine keeps
+    P in higher precision the two multiplies cancel and folding them away is
+    correct; that is not this kernel.) Decline anything but the exact unit pair
+    rather than ignoring it."""
+    if descale_s != 1.0 or scale_s != 1.0:
+        raise NotImplementedError(f"per-tensor FP8: S quantization is not implemented; descale_s and scale_s must both be 1.0, got {descale_s} and {scale_s}")
+
+
 _SM100_FLAVORS = (
     (128, 128),
     (192, 128),
@@ -67,6 +83,9 @@ _SM100_FP8_KERNEL_FILE = "prefill_d128_fp8_sm100.py"
 _SM100_TILE_N = 128
 
 _SM120_KERNEL_FILE = "prefill_f16_sm120.py"
+# Per-tensor FP8 sibling (E4M3 in as Uint8 storage, FP16 out, mma.sync
+# m16n8k32); selected by the graph op (sdpa_fp8) via check_support's dtype.
+_SM120_FP8_KERNEL_FILE = "prefill_fp8_sm120.py"
 _SM120_DTYPE_QKV_CODE = {
     torch.bfloat16: DTYPE_BF16,
     torch.float16: DTYPE_FP16,
@@ -202,7 +221,9 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
     return _load_kernel_template(filename, params, tag)
 
 
-def _load_sm120_kernel_module(params: Sm120TemplateParams):
+def _load_sm120_kernel_module(params: Sm120TemplateParams, fp8: bool = False):
+    if fp8:
+        return _load_kernel_template(_SM120_FP8_KERNEL_FILE, params, tag="sdpa_fwd_sm120_fp8")
     return _load_kernel_template(_SM120_KERNEL_FILE, params, tag="sdpa_fwd_sm120")
 
 
@@ -322,6 +343,26 @@ class SdpaFwdDsl(APIBase):
             return view, False, None
         scratch = torch.empty_like(view, memory_format=torch.contiguous_format)
         return view, True, scratch
+
+    def _amax_slot(self, tensor, name: str, device: torch.device) -> torch.Tensor:
+        """The caller's 1-element amax storage, or a cached dummy.
+
+        view(), not reshape(): the kernel atomicMax'es into whatever this
+        returns, and reshape() silently hands back a COPY when the input is not
+        contiguous -- the kernel would write the copy and the caller would read
+        back the zeros it was reset to.
+        """
+        if tensor is None:
+            return self._dummy(name, device, lambda: torch.zeros(1, dtype=torch.float32, device=device))
+        # Both callers re-view the slot as Int32 for the kernel ABI, so a wider
+        # element would yield two int32s and the kernel would write only the low
+        # word -- the caller then reads a corrupted value.
+        if tensor.dtype is not torch.float32:
+            raise ValueError(f"{name} must be float32; got {tensor.dtype}")
+        try:
+            return tensor.view(-1)[:1]
+        except RuntimeError as exc:
+            raise ValueError(f"{name} must be contiguous — the kernel writes it in place; got strides {tuple(tensor.stride())}") from exc
 
     def _dummy(self, key: str, device: torch.device, factory: Callable[[], torch.Tensor]) -> torch.Tensor:
         """Return a cached device-local dummy tensor."""
@@ -819,6 +860,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         descale_v: Optional[torch.Tensor] = None,
         scale_o: Optional[torch.Tensor] = None,
         amax_s: Optional[torch.Tensor] = None,
+        descale_s: Optional[torch.Tensor] = None,
+        scale_s: Optional[torch.Tensor] = None,
         workspace: Optional[torch.Tensor] = None,
     ) -> None:
         """Launch the compiled kernel.
@@ -897,6 +940,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 scale_o,
                 amax_s,
                 amax_o,
+                descale_s,
+                scale_s,
                 current_stream,
             )
             return
@@ -1239,6 +1284,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         scale_o,
         amax_s,
         amax_o,
+        descale_s=None,
+        scale_s=None,
         current_stream=None,
     ):
         """Per-tensor FP8 execute (dense): scalar descales fold into scale_softmax_log2
@@ -1257,6 +1304,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             return float(t.reshape(-1)[0].item()) if t is not None else default
 
         dq, dk, dv, so = _scalar(descale_q), _scalar(descale_k), _scalar(descale_v), _scalar(scale_o)
+        _require_unit_s_scales(_scalar(descale_s), _scalar(scale_s))
         scale_softmax_log2 = scale_val * dq * dk * math.log2(math.e)
         o_scale_fused = dv * so
 
@@ -1284,8 +1332,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # amax_s / amax_o: the kernel atomicMax'es into these buffers, so they MUST
         # start at 0. amax_o accumulates max|o_scaled| (pre-cast, exact even for FP8 O);
         # dividing by scale_o below yields the pre-quant output amax.
-        amax_s_buf = amax_s.reshape(-1)[:1] if amax_s is not None else self._dummy("amax_s", device, lambda: torch.zeros(1, dtype=torch.float32, device=device))
-        amax_o_buf = amax_o.reshape(-1)[:1] if amax_o is not None else self._dummy("amax_o", device, lambda: torch.zeros(1, dtype=torch.float32, device=device))
+        amax_s_buf = self._amax_slot(amax_s, "amax_s", device)
+        amax_o_buf = self._amax_slot(amax_o, "amax_o", device)
         # Same-stream ordering as MXFP8: the resets must precede the kernel's
         # atomicMax on the launch stream, not on torch's current stream.
         with _torch_stream_context(current_stream, device):
@@ -1636,17 +1684,35 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             f"D_V ({d_v}) must be a multiple of 8 (TMA 16-byte global-stride rule at 2 B/elem) and <= {_SM120_HEAD_TILE_MAX}",
         )
 
-        self.dtype = self._check_dtype(self.q_desc, [torch.float16, torch.bfloat16], name="Q")
+        self.dtype = self._check_dtype(self.q_desc, [torch.float16, torch.bfloat16, torch.float8_e4m3fn], name="Q")
+        self._fp8 = self.dtype == torch.float8_e4m3fn
         for desc in (self.k_desc, self.v_desc, self.o_desc):
-            self._check_dtype(
-                desc,
-                self.dtype,
-                name=desc.name,
-                extra_error_msg=f"{desc.name} must match Q",
-            )
+            if self._fp8 and desc is self.o_desc:
+                # The fp8 kernel's epilogue emits FP16 only (see the kernel
+                # docstring); fp8 O would need a scale_o quantizing store.
+                self._check_dtype(desc, torch.float16, name="O", extra_error_msg="SM120 fp8 emits FP16 O only")
+            else:
+                self._check_dtype(
+                    desc,
+                    self.dtype,
+                    name=desc.name,
+                    extra_error_msg=f"{desc.name} must match Q",
+                )
             self._value_error_if(
                 desc.device != self.q_desc.device,
                 f"{desc.name} must be on device {self.q_desc.device}, got {desc.device}",
+            )
+        if self._fp8:
+            self._value_error_if(
+                not self._pertensor,
+                "SM120 fp8 serves the per-tensor SDPA_FP8 op only (no MXFP8 cell)",
+            )
+            self._not_implemented_error_if(self.thd, "SM120 fp8: THD/varlen is not wired yet (dense only)")
+            self._value_error_if(self.has_sink, "SM120 fp8 does not support attention sinks (Amax_S semantics)")
+            self._value_error_if(self.seq_q_lens_present, "SM120 fp8 does not support per-batch seq_len_q")
+            self._value_error_if(
+                (d_q, d_v) != (128, 128),
+                f"SM120 fp8 requires D_QK=D_V=128 (no zero-padding envelope on the 8-bit fragment path); got ({d_q}, {d_v})",
             )
 
         self._value_error_if(
@@ -1701,7 +1767,10 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         d_vp = -(-d_v // _SM120_HEAD_TILE_GRANULE) * _SM120_HEAD_TILE_GRANULE
 
         def _smem_bytes(kv_tile: int) -> int:
-            return _sm120_smem_bytes(d_qp, d_vp, self.q_tile, kv_tile, self.dtype.itemsize)
+            # FP8 stages a byte per KV element but still writes O in half.
+            # (The FP8 row requires exact d128, so its padded dims are the
+            # actual ones; the envelope padding is the f16 cell's.)
+            return _sm120_smem_bytes(d_qp, d_vp, self.q_tile, kv_tile, self.dtype.itemsize, 2 if self._fp8 else self.dtype.itemsize)
 
         if self.tile_n is None:
             # Pick the largest KV tile that fits this device.
@@ -1738,7 +1807,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             return
 
         params = Sm120TemplateParams(
-            dtype_qkv=_SM120_DTYPE_QKV_CODE[self.dtype],
+            dtype_qkv=DTYPE_E4M3 if self._fp8 else _SM120_DTYPE_QKV_CODE[self.dtype],
             window_left=self.window_left,
             window_right=self.window_right,
             bottom_right=self.causal_bottom_right,
@@ -1749,7 +1818,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             q_tile=self.q_tile,
             kv_tile=self.kv_tile,
         )
-        self._k_mod = _load_sm120_kernel_module(params)
+        self._k_mod = _load_sm120_kernel_module(params, fp8=self._fp8)
         if self.thd:
             # The packed token totals (and max sequence length) are runtime
             # values, so the per-shape compile is deferred to execute().
@@ -1784,6 +1853,17 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         scale_softmax: Optional[float] = None,
         workspace: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
+        descale_q: Optional[torch.Tensor] = None,
+        descale_k: Optional[torch.Tensor] = None,
+        descale_v: Optional[torch.Tensor] = None,
+        scale_o: Optional[torch.Tensor] = None,
+        amax_s: Optional[torch.Tensor] = None,
+        descale_s: Optional[torch.Tensor] = None,
+        scale_s: Optional[torch.Tensor] = None,
+        amax_o: Optional[torch.Tensor] = None,
+        sf_q: Optional[torch.Tensor] = None,
+        sf_k: Optional[torch.Tensor] = None,
+        sf_v: Optional[torch.Tensor] = None,
     ) -> None:
         """Execute tensors matching the compiled specialization."""
 
@@ -1807,6 +1887,30 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             "this specialization was compiled without an LSE output; construct the API with sample_lse",
         )
         scale_val = self.scale_softmax if scale_softmax is None or scale_softmax == 0.0 else float(scale_softmax)
+        if self._fp8:
+            self._value_error_if(
+                any(t is not None for t in (sf_q, sf_k, sf_v)),
+                "SM120 fp8 is per-tensor (scalar descales); block-scale SF tensors are MXFP8-only",
+            )
+            self._execute_fp8(
+                q_tensor,
+                k_tensor,
+                v_tensor,
+                o_tensor,
+                lse_tensor,
+                scale_val,
+                seq_kv_lens,
+                descale_q,
+                descale_k,
+                descale_v,
+                scale_o,
+                amax_s,
+                amax_o,
+                descale_s,
+                scale_s,
+                current_stream=current_stream,
+            )
+            return
         scale_softmax_log2 = scale_val * math.log2(math.e)
         if self.thd:
             self._execute_thd(
@@ -1870,6 +1974,106 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         )
         if o_needs_copy_back:
             o_view.copy_(o_scratch)
+
+    def _execute_fp8(
+        self,
+        q_tensor,
+        k_tensor,
+        v_tensor,
+        o_tensor,
+        lse_tensor,
+        scale_val,
+        seq_kv_lens,
+        descale_q,
+        descale_k,
+        descale_v,
+        scale_o,
+        amax_s,
+        amax_o,
+        descale_s=None,
+        scale_s=None,
+        current_stream=None,
+    ):
+        """Per-tensor FP8 execute (dense): SM100 convention on the SM120 kernel.
+
+        ``descale_q*descale_k`` folds into ``scale_softmax_log2`` and
+        ``descale_s*descale_v*scale_o`` into the kernel's ``o_scale_fused``
+        scalar; ``scale_s`` goes in separately because it multiplies P before
+        the e4m3 cast rather than the output (the FORT ordering: amax on the
+        unscaled softmax result, then scale, then cast).
+        ``Amax_S`` is produced in-kernel (bitcast-int32 atomicMax of the
+        per-row ``1/row_sum``) into the caller's pre-zeroed buffer; ``Amax_O``
+        is ``max|o_scaled|/scale_o`` post-kernel (exact for the FP16 output).
+        E4M3 tensors travel as ``uint8`` views — the kernel consumes bit
+        patterns (see the kernel docstring).
+        """
+        import cutlass
+
+        def _scalar(t, default=1.0):
+            return float(t.reshape(-1)[0].item()) if t is not None else default
+
+        dq, dk, dv, so = _scalar(descale_q), _scalar(descale_k), _scalar(descale_v), _scalar(scale_o)
+        ds, ss = _scalar(descale_s), _scalar(scale_s)
+        scale_softmax_log2 = scale_val * dq * dk * math.log2(math.e)
+        o_scale_fused = ds * dv * so
+        device = q_tensor.device
+
+        self._value_error_if(
+            self.lse_desc is not None and lse_tensor is None,
+            "lse_tensor is required by this compiled specialization",
+        )
+        self._value_error_if(
+            self.lse_desc is None and lse_tensor is not None,
+            "this specialization was compiled without an LSE output; construct the API with sample_lse",
+        )
+        lse = self._checked_lse_view(lse_tensor) if lse_tensor is not None else None
+        seq_kv_t = (
+            self._checked_seq_lens(seq_kv_lens, "seq_kv_lens")
+            if seq_kv_lens is not None
+            else self._dummy("seq_kv_lens", device, lambda: torch.zeros(self.batch_size, dtype=torch.int32, device=device))
+        )
+        seq_q_dummy = self._dummy("seq_q_lens", device, lambda: torch.zeros(self.batch_size, dtype=torch.int32, device=device))
+        if current_stream is None:
+            current_stream = cuda.CUstream(torch.cuda.current_stream(device).cuda_stream)
+
+        q = self._to_bshd(q_tensor).view(torch.uint8)
+        k = self._to_bshd(k_tensor).view(torch.uint8)
+        v = self._to_bshd(v_tensor).view(torch.uint8)
+        o_view, o_needs_copy_back, o_scratch = self._to_bshd_writable(o_tensor)
+        o = o_scratch if o_needs_copy_back else o_view
+
+        # amax_s / amax_o: the kernel atomicMax'es into these buffers, so they
+        # MUST start at 0, reset on the LAUNCH stream (ordering vs the kernel).
+        amax_s_buf = self._amax_slot(amax_s, "amax_s", device)
+        amax_o_buf = self._amax_slot(amax_o, "amax_o", device)
+        with _torch_stream_context(current_stream, device):
+            amax_s_buf.zero_()
+            amax_o_buf.zero_()
+
+        self._compiled_kernel(
+            q,
+            k,
+            v,
+            o,
+            lse,
+            None,  # sinks: fp8 cell rejects has_sink
+            seq_q_dummy,
+            seq_kv_t,
+            amax_s_buf.view(torch.int32),
+            amax_o_buf.view(torch.int32),
+            cutlass.Float32(scale_softmax_log2),
+            cutlass.Float32(o_scale_fused),
+            cutlass.Float32(ss),
+            current_stream,
+        )
+        # Both of these consume what the kernel just wrote, so they belong on
+        # the launch stream for the same reason the resets above do.
+        with _torch_stream_context(current_stream, device):
+            if o_needs_copy_back:
+                o_view.copy_(o_scratch)
+            if amax_o is not None:
+                amax_o_buf.div_(max(so, 1e-30))
+        self._logger.debug("execute (SM120 FP8 per-tensor) completed")
 
     def _execute_thd(
         self, q_buf, k_buf, v_buf, o_buf, scale_softmax_log2, sinks, seq_kv_lens, seq_q_lens, lse_tensor=None, workspace=None, current_stream=None

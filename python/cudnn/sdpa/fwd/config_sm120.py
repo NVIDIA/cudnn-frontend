@@ -6,8 +6,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional
 
-from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_FP16
+from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3, DTYPE_FP16  # noqa: F401  (DTYPE_E4M3 re-exported for the FP8 template)
 
 SEQ_Q_TILES = (128, 64)
 SEQ_KV_TILES = (128, 64)
@@ -22,16 +23,19 @@ SUPPORTED_HEAD_TILES = tuple(range(SUPPORTED_HEAD_TILE_MIN, SUPPORTED_HEAD_TILE_
 SMEM_CAPACITY_BYTES = 101376
 
 
-def smem_bytes(d_qk: int, d_v: int, q_tile: int, kv_tile: int, itemsize: int = 2) -> int:
+def smem_bytes(d_qk: int, d_v: int, q_tile: int, kv_tile: int, itemsize: int = 2, out_itemsize: Optional[int] = None) -> int:
     """SMEM the SM120 prefill kernel needs for one specialization.
 
     One K tile (D_QK wide) plus one V tile (D_V wide), aliased with the
-    q_tile x D_V output staging tile. Lives here rather than in the adapter
-    because the ranking must not propose a tile the kernel cannot fit, and the
-    two answering that question differently is how a plan list fills up with
-    entries that decline at build.
+    q_tile x D_V output staging tile. The two terms size INDEPENDENTLY:
+    ``itemsize`` is the QKV element, ``out_itemsize`` the staged output's, and
+    FP8 differs on exactly that (1-byte KV, half-precision O).
+
+    Lives here rather than in the adapter because the ranking must not propose
+    a tile the kernel cannot fit, and two answers to that question is how a plan
+    list fills with entries that decline at build.
     """
-    return max(kv_tile * (d_qk + d_v), q_tile * d_v) * itemsize + 16
+    return max(kv_tile * (d_qk + d_v) * itemsize, q_tile * d_v * (itemsize if out_itemsize is None else out_itemsize)) + 16
 
 
 @dataclass(frozen=True)
@@ -61,18 +65,26 @@ class TemplateParams:
     kv_tile: int = SEQ_KV_TILES[0]
 
 
-def validate_params(params: TemplateParams) -> None:
+def validate_params(
+    params: TemplateParams,
+    allowed_dtypes: tuple[int, ...] = (DTYPE_BF16, DTYPE_FP16),
+    allow_right_band: bool = True,
+) -> None:
     """Validate the SM120 template specialization.
 
     Reachable failures should already have been rejected by the engine
     capabilities or adapter support checks; this validation is a backstop for
-    direct template use.
+    direct template use. ``allowed_dtypes`` defaults to the FP16/BF16 template's
+    set; the FP8 template passes its own. ``allow_right_band=False`` also
+    rejects a widened right band, which the FP8 template does not plumb.
     """
 
-    if params.dtype_qkv not in (DTYPE_BF16, DTYPE_FP16):
-        raise ValueError(f"SM120 SDPA: dtype_qkv must be DTYPE_BF16 ({DTYPE_BF16}) or DTYPE_FP16 ({DTYPE_FP16}); got {params.dtype_qkv}")
+    if params.dtype_qkv not in allowed_dtypes:
+        raise ValueError(f"SM120 SDPA: dtype_qkv must be one of {allowed_dtypes}; got {params.dtype_qkv}")
     if params.window_right is not None and params.window_right < 0:
         raise ValueError(f"SM120 SDPA: window_right must be None (unbounded) or >= 0 (0 = plain causal); got {params.window_right}")
+    if not allow_right_band and params.window_right not in (None, 0):
+        raise ValueError(f"SM120 SDPA: right-band widening is not plumbed for this template; window_right must be None or 0, got {params.window_right}")
     if params.bottom_right and params.window_right is None:
         raise ValueError("SM120 SDPA: bottom_right anchors the band's diagonal and requires a right bound (window_right)")
     if params.window_left is not None and params.window_left < 0:
