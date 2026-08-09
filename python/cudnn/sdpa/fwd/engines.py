@@ -796,17 +796,12 @@ def engine_name(
 def _sm120_fp8_spec() -> EngineSpec:
     """SM120 per-tensor FP8 engine (E4M3 in + scalar descales, FP16 out).
 
-    LIMITATION -- P quantization is not implemented. cuDNN's Scale_S/Descale_S
-    scale the SOFTMAX OUTPUT (the graph applies Scale_S after softmax and hands
-    Descale_S to bmm2); this kernel converts P to e4m3 for the PV MMA UNSCALED,
-    so neither reaches the math.
-    Execute declines a non-unit pair rather than ignoring it, but the standard
-    SDPA_FP8 contract DOES supply non-unit S scales (see
-    test/python/sdpa/fp8.py), and a decline at execute has no plan fallback --
-    so such a graph fails rather than falling back to the backend. This row is
-    opt_in for that reason. Closing it means scaling P before the cvt (keeping
-    the row_sum denominator on unscaled P) and folding Descale_S into
-    o_scale_fused -- the backend's FORT engine does exactly that.
+    P quantization follows the backend's FORT ordering: Amax_S on the unscaled
+    softmax result, then Scale_S, then the e4m3 cast, with Descale_S folded into
+    o_scale_fused. (cuDNN's Scale_S/Descale_S scale the softmax OUTPUT, not the
+    scores.) The SM100 FP8 row does NOT yet do this -- it converts P unscaled,
+    which is still correct for the reciprocal pairs that are the normal case,
+    and declines anything else; wiring it there is a follow-up.
 
     Same mma.sync architecture as the f16 SM120 cell with the MMA lowered to
     m16n8k32 e4m3; ``descale_q*descale_k`` folds into the softmax scale and

@@ -72,7 +72,7 @@ def _ref(qd, kd, vd, *, scale, is_causal=False, bottom_right=False, swa_window=N
     return torch.matmul(probs, v_e), probs.max().item()
 
 
-def _run(B, H_q, H_kv, S_q, S_kv, in_key, out_dt, *, scale, sdpa_kwargs, sink=None, seq_lens_kv=None):
+def _run(B, H_q, H_kv, S_q, S_kv, in_key, out_dt, *, scale, sdpa_kwargs, sink=None, seq_lens_kv=None, s_scale=1.0, s_descale_gain=1.0):
     import cudnn
 
     dev = "cuda"
@@ -96,7 +96,9 @@ def _run(B, H_q, H_kv, S_q, S_kv, in_key, out_dt, *, scale, sdpa_kwargs, sink=No
     def sc(val):
         return torch.tensor([[[[val]]]], dtype=torch.float32, device=dev)
 
-    dqt, dkt, dvt, dst, sst, sot = sc(dq), sc(dk), sc(dv), sc(1.0), sc(1.0), sc(1.0)
+    # Reciprocal S scales: this kernel casts P unscaled, which is exact for any
+    # reciprocal pair. s_descale_gain breaks the reciprocity to test the guard.
+    dqt, dkt, dvt, dst, sst, sot = sc(dq), sc(dk), sc(dv), sc(s_descale_gain / s_scale), sc(s_scale), sc(1.0)
 
     g = cudnn.pygraph(
         io_data_type=getattr(cudnn.data_type, _CUDNN_ITYPE[in_key]), intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT
@@ -245,3 +247,31 @@ def test_fp8_padding(in_key, causal):
     sk = dict(use_causal_mask=True) if causal else {}
     O, O_ref, a_s, a_s_ref, a_o, a_o_ref = _run(2, 8, 8, 256, 256, in_key, torch.float16, scale=scale, sdpa_kwargs=sk, seq_lens_kv=[256, 192])
     _check(O, O_ref, torch.float16, in_key, a_s, a_s_ref, a_o, a_o_ref)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("gain", [2.0, 0.5])
+@torch_fork_set_rng(seed=0)
+def test_fp8_sm100_declines_non_reciprocal_s_scales(gain):
+    """A reciprocal Scale_S/Descale_S pair is exact on a kernel that casts P
+    unscaled, so it is served. A non-reciprocal pair asks for an O this kernel
+    will not produce -- it must decline, not answer wrongly.
+    """
+    scale = 1.0 / math.sqrt(128)
+    with pytest.raises(NotImplementedError, match="reciprocal"):
+        _run(2, 8, 8, 256, 256, "e4m3", torch.float16, scale=scale, sdpa_kwargs=dict(use_causal_mask=True), s_descale_gain=gain)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("s_scale", [8.0, 448.0])
+@torch_fork_set_rng(seed=0)
+def test_fp8_sm100_accepts_reciprocal_s_scales(s_scale):
+    """Any reciprocal pair is accepted and gives the same O as unit scales --
+    the scales cancel, and the kernel applies neither.
+    """
+    scale = 1.0 / math.sqrt(128)
+    torch.manual_seed(2024)
+    unit = _run(2, 8, 8, 256, 256, "e4m3", torch.float16, scale=scale, sdpa_kwargs=dict(use_causal_mask=True))
+    torch.manual_seed(2024)
+    scaled = _run(2, 8, 8, 256, 256, "e4m3", torch.float16, scale=scale, sdpa_kwargs=dict(use_causal_mask=True), s_scale=s_scale)
+    assert torch.equal(unit[0], scaled[0]), "reciprocal S scales must not change O"

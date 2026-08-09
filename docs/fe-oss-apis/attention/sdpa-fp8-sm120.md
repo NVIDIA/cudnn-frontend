@@ -92,20 +92,34 @@ neither:
 **Scale_S applied before the e4m3 cast.** cuDNN's `Scale_S`/`Descale_S` quantize
 P — the softmax OUTPUT, not the scores: the graph applies `Scale_S` after
 softmax (and after `Amax_S`) and hands `Descale_S` to bmm2. v1 of this kernel
-converted P unscaled, so both reached no math and any graph supplying real S
-scales — which the standard contract does, see `test/python/sdpa/fp8.py` — got a
-wrong answer silently. The kernel now multiplies P by `scale_s` before the cast
-and folds `descale_s` into `o_scale_fused`, matching the backend's FORT ordering
-(amax on the unscaled softmax result, then scale, then cast). `tile_sum` keeps
-consuming the UNSCALED P so the denominator, and hence `Amax_S`, are unaffected.
+converted P unscaled, so neither reached the math. That is exact for the
+reciprocal pairs the standard contract supplies (see `test/python/sdpa/fp8.py`)
+— nothing was applied, so nothing is owed back — but it silently ignored a
+non-reciprocal pair, which asks for a different O. The kernel now multiplies P
+by `scale_s` before the cast and folds `descale_s` into `o_scale_fused`,
+matching the backend's FORT ordering (amax on the unscaled softmax result, then
+scale, then cast). `tile_sum` keeps consuming the UNSCALED P so the denominator,
+and hence `Amax_S`, are unaffected.
 
 Cost: **~0.7–0.9%** at large shapes (six of six 8192 cells positive in a
 0.65–0.92% band; the 30-cell geomean of 1.0089 is at the run-to-run floor and
-not separately informative). It buys correctness, and it should also *reduce*
-quantization error, since P now spans e4m3's range instead of sitting in (0,1]
-using a sliver of it — unmeasured. A free version exists: fold `log2(scale_s)`
+not separately informative). It buys the non-reciprocal case and nothing else —
+the predicted accuracy gain does **not** materialise. Measured on SM100 across
+scale_s 1 → 64, `max|O-ref|` is flat to the digit (swa .0239 throughout),
+because e4m3 is floating point, so relative precision does not move with scale,
+and subtracting the row max already places P per ROW, which dominates any
+per-tensor scale. A free version of the multiply exists: fold `log2(scale_s)`
 into the exp2 addend, which is already an `fma2` operand, and compensate
 `row_sum`/`Amax_S`/LSE once per row instead of per element.
+
+**Why SM100 declines instead.** The d=128 SM100 FP8 kernel skips the running-max
+refresh until a tile exceeds it by `RESCALE_THRESHOLD=8`, so its P is bounded by
+2^8 = 256 rather than 1. e4m3 tops out at 448, so the headroom above 1.0 is
+already spent on that skip, and only `scale_s <= 448/256 = 1.75` is provably
+safe — empirically it survives to ~64, then swa degrades .0239 → .0807 at 448.
+Since scaling buys no accuracy anyway, that row honours a reciprocal pair
+analytically and declines a non-reciprocal one. This kernel has no lazy rescale,
+so P <= 1 and the full range is available.
 
 *Rejected: prefetching K or V fragments one step ahead, and loading Q coalesced
 with a shfl transpose.* All three are in the sibling DKG kernel. Measured here

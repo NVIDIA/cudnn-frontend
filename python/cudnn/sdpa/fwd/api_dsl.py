@@ -37,19 +37,34 @@ from cudnn.sdpa.fwd.config_sm120 import (
 )
 
 
-def _require_unit_s_scales(descale_s: float, scale_s: float) -> None:
-    """The operands cuDNN calls Scale_S/Descale_S quantize P — the SOFTMAX
-    OUTPUT, not the scores: the graph applies Scale_S after softmax (and after
-    Amax_S) and hands Descale_S to bmm2. Both FP8 kernels here convert P to e4m3
-    for the PV MMA UNSCALED, so neither reaches the math.
+def _require_reciprocal_s_scales(descale_s: float, scale_s: float) -> None:
+    """Guard for a kernel that converts P to e4m3 UNSCALED (the SM100 FP8 row).
 
-    A reciprocal pair is not equivalent to unity — it asks for a different
-    quantization range, so rounding and underflow differ. (Where an engine keeps
-    P in higher precision the two multiplies cancel and folding them away is
-    correct; that is not this kernel.) Decline anything but the exact unit pair
-    rather than ignoring it."""
-    if descale_s != 1.0 or scale_s != 1.0:
-        raise NotImplementedError(f"per-tensor FP8: S quantization is not implemented; descale_s and scale_s must both be 1.0, got {descale_s} and {scale_s}")
+    cuDNN's Scale_S/Descale_S quantize P — the softmax OUTPUT, not the scores.
+    Applying neither still returns the RIGHT O whenever the pair is reciprocal:
+    no scale was applied, so none is owed back. A non-reciprocal pair is a
+    different request — O scaled by descale_s*scale_s — so decline that.
+
+    This row cannot apply Scale_S, and would gain nothing if it could:
+
+    - No headroom. The lazy-rescale skip (RESCALE_THRESHOLD=8) refreshes the
+      running max only when a tile exceeds it by 2^8, so P is bounded by 256,
+      not 1. e4m3 tops out at 448, so any scale_s > 448/256 = 1.75 can saturate
+      a lazily-skipped tile. Measured on B2xH8xS256 e4m3: max|O-ref| is flat
+      from scale_s 1 to 64 and degrades at 448 (swa .0239 -> .0807).
+    - Nothing to gain. e4m3 is floating point, so relative precision does not
+      move with scale, and subtracting the row max already places P per ROW —
+      strictly better than a per-tensor scale. Hence the flat error above.
+
+    SM120 does implement it: that kernel has no lazy rescale, so P <= 1 there
+    and the full e4m3 range is available.
+    """
+    product = descale_s * scale_s
+    if abs(product - 1.0) > 1e-3:
+        raise NotImplementedError(
+            f"per-tensor FP8: this kernel converts P unscaled, so it can only serve a reciprocal "
+            f"descale_s*scale_s == 1; got {descale_s} * {scale_s} = {product}"
+        )
 
 
 _SM100_FLAVORS = (
@@ -1304,7 +1319,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             return float(t.reshape(-1)[0].item()) if t is not None else default
 
         dq, dk, dv, so = _scalar(descale_q), _scalar(descale_k), _scalar(descale_v), _scalar(scale_o)
-        _require_unit_s_scales(_scalar(descale_s), _scalar(scale_s))
+        _require_reciprocal_s_scales(_scalar(descale_s), _scalar(scale_s))
         scale_softmax_log2 = scale_val * dq * dk * math.log2(math.e)
         o_scale_fused = dv * so
 
