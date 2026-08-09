@@ -15,7 +15,7 @@ import cudnn
 from cudnn.engines import MANIFEST, is_backend_engine, is_python_engine
 
 from cudnn.sdpa.fwd.engines import engine_name
-from frost_test_utils import requires_blackwell, requires_dsl, _dsl_installed
+from frost_test_utils import requires_blackwell, requires_dsl, _dsl_installed, _is_plan_for
 
 _FROST = engine_name(512)  # matches the D=512 graphs below
 _GPU = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU")
@@ -55,8 +55,9 @@ def _plan_names(g):
 
 def _index_of(g, name):
     names = _plan_names(g)
-    assert name in names, f"no plan named {name!r} in {names}"
-    return names.index(name)
+    index = next((i for i, n in enumerate(names) if _is_plan_for(n, name)), None)
+    assert index is not None, f"no plan for engine {name!r} in {names}"
+    return index
 
 
 def _pin(g, name):
@@ -94,9 +95,9 @@ def test_eligible_graph_lists_matching_dsl_engine():
     g, q, k, v, o = _build_causal_sdpa()
     _plan(g)
     names = _plan_names(g)
-    assert _FROST in names
+    assert any(_is_plan_for(n, _FROST) for n in names)
     assert g.get_execution_plan_count() == len(names) == len(g.plans)
-    assert is_python_engine(g.plans[names.index(_FROST)].engine_id)
+    assert is_python_engine(g.plans[_index_of(g, _FROST)].engine_id)
 
 
 @_SM100
@@ -189,9 +190,9 @@ def test_envelope_lists_every_covering_flavor_smallest_first():
     _plan(g)
     names = _plan_names(g)
     for flavor in (128, 256, 512):
-        assert engine_name(flavor) in names  # every covering flavor
+        assert any(_is_plan_for(n, engine_name(flavor)) for n in names)  # every covering flavor
     python = [i for i, p in enumerate(g.plans) if is_python_engine(p.engine_id)]
-    assert names[python[0]] == engine_name(128)  # tightest flavor first
+    assert _is_plan_for(names[python[0]], engine_name(128))  # tightest flavor first
     g.select_plan(python[0])
     g.check_support()
     g.build_plans()
@@ -244,8 +245,9 @@ def test_no_magic_import_required():
         "o.set_output(True).set_dim(q_gpu.shape).set_stride(q_gpu.stride())\n"
         "g.validate(); g.build_operation_graph(); g.create_execution_plans([cudnn.heur_mode.A])\n"
         "names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]\n"
-        "assert 'sdpa_fwd_prefill_sm100_d512' in names, names\n"
-        "g.select_plan(names.index('sdpa_fwd_prefill_sm100_d512'))\n"
+        "i = next((i for i, n in enumerate(names) if n.split('[')[0] == 'sdpa_fwd_prefill_sm100_d512'), None)\n"
+        "assert i is not None, names\n"
+        "g.select_plan(i)\n"
         "g.check_support()\n"
         "print('ELIGIBLE-WITHOUT-IMPORT')\n"
     )
@@ -264,7 +266,7 @@ def test_plan_name_contract():
     count = g.get_execution_plan_count()
     names = _plan_names(g)
     assert count == len(names) == len(g.plans)
-    frost = names.index(_FROST)
+    frost = _index_of(g, _FROST)
     assert is_python_engine(g.plans[frost].engine_id)
     assert all(is_backend_engine(p.engine_id) or is_python_engine(p.engine_id) for p in g.plans)
     g.check_support()

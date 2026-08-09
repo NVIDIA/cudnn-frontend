@@ -63,3 +63,34 @@ def _check_contiguous(plan_name: str, **bufs) -> None:
         _ptr, shape, strides, _dtype, _dev = buffers.probe(b)
         if not buffers.is_contiguous(shape, strides):
             raise ValueError(f"{plan_name}: buffer for {name!r} must be contiguous (buffers pass straight to the kernel)")
+
+
+_pinned_engines = None  # e.g. ("gdn_cutile",) -- set by a suite, None => the manifest decides
+
+
+def pin_engines(names):
+    """Force planning onto the named engines for this process, or None to stop.
+
+    A suite that means to validate ONE implementation says which, by name. It
+    is not a way to add an engine: every engine is in the manifest, and this
+    only narrows which of them a plan may land on.
+    """
+    global _pinned_engines
+    previous = _pinned_engines
+    _pinned_engines = tuple(names) if names else None
+    return previous
+
+
+def apply_pin(graph):
+    """Select the pinned engine's plan, if a pin is in force.
+
+    Runs after create_execution_plans(), so it selects from the ranked list the
+    heuristics produced rather than replacing them.
+    """
+    if not _pinned_engines:
+        return
+    names = [graph.get_plan_name_at_index(i) for i in range(len(graph.plans))]
+    index = next((i for i, n in enumerate(names) if any(n == p or n.startswith(p + "[") for p in _pinned_engines)), None)
+    if index is None:
+        raise AssertionError(f"pinned engines {list(_pinned_engines)} produced no plan; plans={names}")
+    graph.select_plan(index)

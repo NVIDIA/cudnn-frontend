@@ -1,15 +1,18 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Backend (engine) contract for the Python graph: plan -> compile -> execute.
+"""Backend (engine) contract for the Python graph: claim -> compile -> execute.
 
-A backend is one of the interchangeable implementations the Router dispatches
-to (Python DSLs, a naive reference, the cuDNN Graph backend, ...). The
+A backend is one of the interchangeable implementations the ranked plan list
+dispatches to (Python DSLs, a naive reference, the cuDNN Graph backend, ...). The
 lifecycle mirrors a real JIT/DSL engine:
 
-  1. ``propose_plans(graph)``  -> candidate ``PlanConfig`` entries (one per
-     configuration the engine wants ranked; decline the whole graph by raising
-     ``NotImplementedError`` / ``cudnn.cudnnGraphNotSupportedError``).
+  1. ``check_support(graph)`` -> accept, or decline the whole graph by raising
+     ``NotImplementedError`` / ``cudnn.cudnnGraphNotSupportedError``. An engine
+     does NOT propose its own plans: which configs to try, in what order, and
+     where the backend's own entries belong is one comparison across every
+     candidate, which no engine can make from the inside. That lives in
+     ``engines/heuristics.py`` and the family hook it dispatches to.
   2. ``build_plan(graph, plan)`` -> a ``CompiledPlan`` — the expensive JIT step,
      run ONCE per (graph, selected plan) at ``graph.build_plans()`` time; the
      compiled artifact lives on the graph, so one engine instance is safely
@@ -50,6 +53,18 @@ if TYPE_CHECKING:
     from ..pygraph import pygraph
 
 
+def decline_types():
+    """The exception types that mean "this engine does not serve this graph".
+
+    ImportError counts: an engine whose optional dependency is absent cannot
+    serve the graph, and since lowering imports are deferred past check_support
+    that only becomes visible at build time.
+    """
+    import cudnn
+
+    return (NotImplementedError, cudnn.cudnnGraphNotSupportedError, ImportError)
+
+
 @dataclass(frozen=True)
 class PlanConfig:
     """One candidate execution plan: an engine id + its knobs.
@@ -63,11 +78,16 @@ class PlanConfig:
     ``cpp_index`` is set only on backend entries: the position this plan holds
     in the lowered graph's own plan list, so building it is one
     ``build_plan_at_index`` instead of a rebuild from (engine_id, knobs).
+
+    ``mode`` is the heuristic mode that produced the entry. Ranking needs it:
+    "the backend's mode-A entries ahead of ours, its fallbacks behind" cannot
+    be said about a list whose entries do not remember where they came from.
     """
 
     engine_id: int
     knobs: Any = None
     cpp_index: Any = None
+    mode: Any = None
 
 
 @dataclass(frozen=True)
@@ -160,8 +180,7 @@ class BaseEngine(ABC):
         name: Human-readable identifier.
         engine_id: Stable id in the shared flat engine-id space, in the reserved
             Python region (>= PYTHON_ENGINE_ID_BASE). Subclasses MUST declare it;
-            the base default (None) is rejected at register_backend().
-        default_knobs: Optional default tuning knobs for this engine's plan.
+            the base default (None) is rejected when the manifest builds it.
         behavior_notes / numerical_notes: what this engine's plans are, in the
             same vocabulary the backend's plans answer in, so
             deselect_behavior_notes(...) and friends mean one thing across the
@@ -174,36 +193,15 @@ class BaseEngine(ABC):
     # base intentionally has none so a forgotten override fails at registration
     # instead of silently colliding with another engine.
     engine_id: Any = None
-    default_knobs: Any = None
     behavior_notes: tuple = ()
     numerical_notes: tuple = ()
 
     def __init__(self):
         pass
 
-    # Exclusive end of the id block this engine owns; the default block is the
-    # single id. DECLARE a range rather than override a predicate: registration
-    # has to prove two engines' blocks are disjoint, and an arbitrary predicate
-    # cannot be intersected — two engines could each answer True for some third
-    # id and both be accepted, leaving _engine_for() with two owners.
-    id_end: Any = None
-
-    @property
-    def owned_id_range(self) -> "tuple[int, int]":
-        """``[start, end)`` of the ids this engine answers for."""
-        end = self.id_end if self.id_end is not None else self.engine_id + 1
-        if end <= self.engine_id:
-            raise ValueError(f"engine {self.name!r} declares id_end={self.id_end} at or below its engine_id={self.engine_id}")
-        return (self.engine_id, end)
-
-    def owns_id(self, engine_id: int) -> bool:
-        """Whether ``engine_id`` falls in this engine's declared block.
-
-        Convenience only — dispatch and registration read ``owned_id_range``
-        directly, so overriding this cannot make an engine answer for an id it
-        did not declare."""
-        lo, hi = self.owned_id_range
-        return lo <= engine_id < hi
+    # An engine answers for exactly ONE id: the one its manifest slot handed it.
+    # (The id_end / owned_id_range block this used to declare was for engines
+    # registered at runtime, which no longer exist.)
 
     def check_support(self, graph: "pygraph") -> None:
         """Raise to decline ``graph``.
@@ -214,16 +212,6 @@ class BaseEngine(ABC):
         Default: accept everything (subclasses should narrow this).
         """
         _ = graph
-
-    def propose_plans(self, graph: "pygraph") -> List[PlanConfig]:
-        """Candidate plans for ``graph``, in this engine's preference order.
-
-        Default: one plan with ``default_knobs`` when ``check_support`` accepts.
-        Engines with several viable configurations override this to expose them
-        to ranking/autotune (each entry's knobs reach ``build_plan`` verbatim).
-        """
-        self.check_support(graph)
-        return [PlanConfig(self.engine_id, self.default_knobs)]
 
     def build_plan(self, graph: "pygraph", plan: PlanConfig, ctx: "ExecutionContext" = None) -> CompiledPlan:
         """Compile ``graph`` for ``plan`` (the expensive step; run once per

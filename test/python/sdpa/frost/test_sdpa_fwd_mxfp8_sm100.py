@@ -30,15 +30,7 @@ from cudnn.sdpa.fwd.engines import engine_name
 from frost_test_utils import requires_blackwell, requires_dsl
 
 
-def _select_engine(graph, name):
-    """Pin the ranked entry named ``name`` (graph.plans holds the backend's
-    plans and the python engines' in one list). A pin is strict: check_support /
-    build_plans raise if that engine declines the graph."""
-    names = [graph.get_plan_name_at_index(i) for i in range(len(graph.plans))]
-    assert name in names, f"engine {name!r} did not claim this graph; plans={names}"
-    graph.select_plan(names.index(name))
-    return graph
-
+from frost_test_utils import select_engine as _select_engine  # noqa: F401
 
 pytestmark = [requires_blackwell, requires_dsl]
 

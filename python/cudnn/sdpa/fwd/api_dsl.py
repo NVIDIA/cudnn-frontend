@@ -32,6 +32,7 @@ from cudnn.sdpa.fwd.config_sm120 import (
     SEQ_Q_TILES as _SM120_Q_TILES,
     SUPPORTED_HEAD_TILES as _SM120_SUPPORTED_HEAD_TILES,
     TemplateParams as Sm120TemplateParams,
+    smem_bytes as _sm120_smem_bytes,
 )
 
 _SM100_FLAVORS = (
@@ -1688,9 +1689,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         smem_capacity_bytes = cutlass.utils.get_smem_capacity_in_bytes(arch)
 
         def _smem_bytes(kv_tile: int) -> int:
-            # One K tile (D_QK wide) + one V tile (D_V wide), aliased with the
-            # q_tile x D_V output staging tile.
-            return max(kv_tile * (d_q + d_v) * self.dtype.itemsize, self.q_tile * d_v * self.dtype.itemsize) + 16
+            return _sm120_smem_bytes(d_q, d_v, self.q_tile, kv_tile, self.dtype.itemsize)
 
         if self.tile_n is None:
             # Pick the largest KV tile that fits this device.

@@ -516,14 +516,6 @@ def analyze_for(spec: EngineSpec, graph, knobs: Optional[SdpaFwdKnobs] = None):
     return facts, mismatch(spec.capabilities, facts, knobs)
 
 
-def probe(spec: EngineSpec, graph, knobs: Optional[SdpaFwdKnobs] = None) -> bool:
-    _, reason = analyze_for(spec, graph, knobs)
-    if reason is not None:
-        _LOG.debug("cudnn.sdpa: %s ineligible: %s", spec.name, reason)
-        return False
-    return True
-
-
 def build(spec: EngineSpec, graph, knobs: Optional[SdpaFwdKnobs] = None):
     """Lower ``spec`` for ``graph``, or raise the bare ineligibility reason (the
     caller — the engine — names itself in the message)."""
@@ -777,4 +769,4 @@ ENGINE_SPECS = (
     _sm120_spec(),
 )
 
-__all__ = ["Capabilities", "EngineSpec", "ENGINE_SPECS", "SdpaFwdKnobs", "analyze_for", "build", "engine_name", "mismatch", "probe"]
+__all__ = ["Capabilities", "EngineSpec", "ENGINE_SPECS", "SdpaFwdKnobs", "analyze_for", "build", "engine_name", "mismatch"]

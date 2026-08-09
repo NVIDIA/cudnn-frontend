@@ -37,15 +37,7 @@ def _require_dsl() -> None:
         pytest.skip("cutlass/dsl not installed")
 
 
-def _select_engine(graph, name):
-    """Pin the ranked entry named ``name`` (graph.plans holds the backend's
-    plans and the python engines' in one list). A pin is strict: check_support /
-    build_plans raise if that engine declines the graph."""
-    names = [graph.get_plan_name_at_index(i) for i in range(len(graph.plans))]
-    assert name in names, f"engine {name!r} did not claim this graph; plans={names}"
-    graph.select_plan(names.index(name))
-    return graph
-
+from frost_test_utils import select_engine as _select_engine  # noqa: F401
 
 # Exact in fp16/bf16/fp32: pre-fills O/Stats storages in the THD harness so
 # no-op paths (t_q == 0) can assert the buffers came back untouched.

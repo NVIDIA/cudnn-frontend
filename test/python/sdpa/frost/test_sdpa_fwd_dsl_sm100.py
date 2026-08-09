@@ -15,16 +15,7 @@ from cudnn.sdpa.fwd.engines import engine_name
 from frost_test_utils import requires_blackwell, requires_dsl, _dsl_installed
 
 
-def _select_engine(graph, name):
-    """Pin the ranked entry named ``name`` (graph.plans holds the backend's
-    plans and the python engines' in one list). A pin is strict: check_support /
-    build_plans raise if that engine declines, so an ineligible config cannot
-    silently fall back to native cuDNN."""
-    names = [graph.get_plan_name_at_index(i) for i in range(len(graph.plans))]
-    assert name in names, f"engine {name!r} did not claim this graph; plans={names}"
-    graph.select_plan(names.index(name))
-    return graph
-
+from frost_test_utils import select_engine as _select_engine  # noqa: F401
 
 pytestmark = requires_blackwell
 
@@ -331,7 +322,7 @@ def test_dsl_sm100_band_right_uncovered_tail_rejected():
     o.set_data_type(cudnn.data_type.BFLOAT16)
     facts = ga.analyze(g)
     assert facts is not None and facts.invalid is None
-    assert not any(fwd_engines.probe(spec, g) for spec in fwd_engines.ENGINE_SPECS)
+    assert all(fwd_engines.analyze_for(spec, g)[1] is not None for spec in fwd_engines.ENGINE_SPECS)
 
 
 @pytest.mark.L0

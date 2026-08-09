@@ -34,6 +34,7 @@ from typing import Dict, Optional, Tuple
 import torch
 
 import cudnn
+from cudnn.linear_attention import engine_utils
 
 _OP_NAMESPACE = "cudnn"
 _OP_NAME = "gated_delta_net_v2"
@@ -57,6 +58,7 @@ def _graph_workspace(graph, device):
         # build() would lower GDN2 to the backend, which has no lowering)
         if not graph._planning_done:
             graph.create_execution_plans()
+            engine_utils.apply_pin(graph)
         if graph.selected_engine is None:
             graph.build()
         else:
@@ -85,19 +87,6 @@ def _graph_handle(device):
     return handle
 
 
-_engines = None
-
-
-def _gdn2_engines():
-    """Engines pinned for this process, or None to let the manifest decide.
-
-    The cuTile suite sets this to validate the cuTile engines specifically;
-    under manifest routing the FROST engines would serve the shapes they
-    claim. A registered engine also suppresses the manifest's own copy, so a
-    pin is exact."""
-    return _engines
-
-
 def _cudnn_dtype(dtype: Optional[torch.dtype]):
     return _TORCH_TO_CUDNN_DTYPE[dtype] if dtype is not None else None
 
@@ -109,8 +98,6 @@ def _check_dtype(name, t, want) -> None:
 
 def _build_fwd_graph(total, N, H, HV, K, V, io_dtype, g_dtype, gate_dtype, state_dtype, scale, output_final_state, use_qk_l2norm):
     graph = cudnn.pygraph()
-    for _engine in _gdn2_engines() or ():  # explicit pin (tests); None => the manifest decides
-        graph.register_backend(_engine)
     q_t = graph.tensor([total, H, K], data_type=io_dtype, name="q")
     k_t = graph.tensor([total, H, K], data_type=io_dtype, name="k")
     v_t = graph.tensor([total, HV, V], data_type=io_dtype, name="v")

@@ -39,7 +39,6 @@ GDN2_ID_BASE = PYTHON_ENGINE_ID_BASE + 300  # 20_300..20_399
 FROST_GEMM_ID_BASE = PYTHON_ENGINE_ID_BASE + 400  # 20_400..20_499
 FROST_SDPA_FWD_ID_BASE = PYTHON_ENGINE_ID_BASE + 500  # 20_500..20_599
 FROST_SDPA_BWD_ID_BASE = PYTHON_ENGINE_ID_BASE + 600  # 20_600..20_699
-OUT_OF_TREE_ID_BASE = PYTHON_ENGINE_ID_BASE + 10_000  # 30_000+, register_backend()
 
 # The delegating entry: the backend picks among candidates it holds but does not
 # expose as plans (heur_mode.OPENSOURCE). It has no C++ plan index and no

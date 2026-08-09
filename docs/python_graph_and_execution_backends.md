@@ -4,15 +4,15 @@
 
 `cudnn.pygraph` is a Python-native graph class: graph structure (nodes,
 tensors, op parameters) lives in Python with full introspection, and execution
-dispatches through pluggable backends — python DSL engines and the cuDNN C++
-backend. The C++ graph builder is internal
-(`cudnn._pybind_module.backend_graph`) and is reached exclusively through
-lowering.
+dispatches over python DSL engines and the cuDNN C++ backend alike. The C++
+graph builder is internal (`cudnn._pybind_module.backend_graph`) and is reached
+exclusively through lowering.
 
 ```text
-cudnn.pygraph (Python IR)  →  create_execution_plans()  →  Router  →  routed plan list
-  nodes / tensors / params        (route here,               PlanConfig(engine_id, knobs):
-  fully introspectable            lazy lowering)             python engines + one backend entry
+cudnn.pygraph (Python IR)  →  create_execution_plans()  →  rank  →  ONE ranked plan list
+  nodes / tensors / params        (freeze, analyze,         (the graph's    PlanConfig(engine_id,
+  fully introspectable            query the backend)         family)        knobs) — python engines
+                                                                            AND backend entries
 ```
 
 Why: python-DSL engines (CuTe-DSL / cuTile style GEMM and attention fusions)
@@ -20,6 +20,45 @@ need to *see* the graph to decide whether and how to run it. Previously that
 required monkey-patching the pybind class and recording calls; now the graph
 is natively introspectable and an engine is one file implementing
 `BaseEngine`.
+
+**"Pluggable" means the library ships a table, not that callers hand engines
+over at runtime.** There is no registration call: `engines/manifest.py` is the
+only way a python engine exists. An engine handed over at runtime could not be
+ranked anyway — it declares no `Capabilities`, so nothing could enumerate its
+configs or place it against the backend.
+
+### The dispatch tree
+
+```text
+create_execution_plans([heur_mode.A, ...])                    _pygraph.py
+│
+├─ validate()                    lowers + freezes any graph the backend CAN lower
+├─ _finalize_backend_layout()    backend layout inference lands, or records a decline
+├─ _freeze()                     whole public surface sealed
+├─ _attach_facts()               family_for → resolve_analyzer → ONE parse, hung on the graph
+│
+└─ heuristics.rank(graph, _candidate_engines(), backend_plan_entries(), modes)
+   │                 │                           │
+   │                 │                           └─ _create_backend_plans(): one C++
+   │                 │                              create_execution_plans PER MODE, spans
+   │                 │                              recorded → every entry carries its mode
+   │                 │                              (+ the untagged delegating entry)
+   │                 └─ manifest.engines_for(graph) — the family's offered slots, nothing else
+   │
+   ├─ family_for(graph) → resolve_heuristics(family)
+   │     declares none → _unranked: accepting engines, then the backend
+   │
+   └─ <family>.recommend(modes, facts, offered, backend_plans)
+      │                                    e.g. sdpa/fwd/heuristics.py
+      ├─ A  → per eligible cell: a measured rule (_sm120_tiles) names the config,
+      │       runners-up behind it; a cell with one point per axis contributes one
+      │       entry. Placed against the backend's A block by _MEASURED_BEHIND.
+      ├─ FALLBACK → the config expected to build, + the backend's FALLBACK block
+      ├─ OPENSOURCE → our candidates, then the delegating entry (see below)
+      └─ dedup by (engine_id, knobs), first position wins
+
+= graph.plans, position for position.  build_plans() walks it.
+```
 
 ## Architecture
 
@@ -38,8 +77,8 @@ is natively introspectable and an engine is one file implementing
 
 ### Backend contract (`engines/`)
 
-- `BaseEngine`: `propose_plans(graph) → [PlanConfig]` (several knob configs
-  per engine), `build_plan(graph, plan, ctx) → CompiledPlan` (the expensive
+- `BaseEngine`: `check_support(graph)` (accept, or decline by raising),
+  `build_plan(graph, plan, ctx) → CompiledPlan` (the expensive
   JIT step, once per graph/plan, cached on the graph),
   `CompiledPlan.execute(graph, uid_to_data, ExecutionContext)` with explicit
   handle/stream/workspace/overrides. `uid_to_data` is the caller's variant
@@ -50,23 +89,32 @@ is natively introspectable and an engine is one file implementing
   refuse `requires_grad` export) — into per-node `NodeBuffers`
   (`{port_name: caller buffer}`). Simple eager engines implement
   `execute()` only.
+- **An engine does not propose its own plans.** Which configs to try, in what
+  order, and where the backend's entries belong is one comparison across every
+  candidate, and no engine can make it from the inside — it sees neither its
+  siblings nor the backend. That decision lives in `engines/heuristics.py` and
+  the per-family hook it dispatches to (see *Ranking and the one plan list*).
 - Every engine has a stable `engine_id` in one flat id space
   (`engines/engine_ids.py`: backend `[0, 10_000)`, C++ OSS `[10_000, 20_000)`,
-  python `[20_000, …)` with a `FAMILY_BLOCK`-wide block per family, out-of-tree
-  `30_000+`) — reproducible pinning/autotune. Engines do not DECLARE their id:
-  the manifest holds every slot and `instantiate()` hands each factory the ids
-  its engines are to use, so an engine cannot claim a number it was not given
-  and the whole space is readable in one file.
+  python `[20_000, …)` with a `FAMILY_BLOCK`-wide block per family) —
+  reproducible pinning/autotune. Engines do not DECLARE their id: the manifest
+  holds every slot and `instantiate()` hands each factory the ids its engines
+  are to use, so an engine cannot claim a number it was not given, the whole
+  space is readable in one file, and any id decodes back to a family and a slot
+  (`manifest.engine_for_id`) with nothing registered first — which is what lets
+  `create_execution_plan(engine_id, knobs)` replay an autotune result.
 - An engine declines a graph ONLY via `NotImplementedError`,
   `cudnn.cudnnGraphNotSupportedError`, or `ImportError`; anything else is an
   engine bug and propagates. `ImportError` counts because lowering imports are
   deferred past `check_support()` (see *Import boundaries*), so a missing
   optional dependency can only surface at build time — without it, a host
   lacking the `cutedsl` extra would lose graphs the backend could have served.
-- The contract oracle is `TorchMatmulEngine` in
-  `test/python/test_engine_router.py` (pure PyTorch, CPU): the dispatch
-  contract is proven end to end without a GPU, and no oracle ships in the
-  package.
+- The contract is proven end to end without a GPU in
+  `test/python/test_dispatch.py`, with stand-in engines injected through the
+  manifest — the same path production uses. Those engines do no arithmetic:
+  what dispatch is responsible for is reaching the engine and resolving the
+  caller's buffers, and checking a result against `torch.matmul` would put a
+  torch reference implementation of matmul inside a dispatch test.
 - `GdnCuTileEngine` executes the single-node `gdn` and `gdn_bwd` ops (Gated
   DeltaNet linear attention) via the cuTile chunked kernels. Both ops are
   THD-only: token-packed `[total_T, heads, dim]` tensors with a required
@@ -147,8 +195,17 @@ without being imported. Everything else is the engine's own `check_support()`.
   `CUDNN_FRONTEND_ENABLE_FROST_ENGINES`), so one implementation can graduate
   while a sibling matures. It lives in the manifest rather than on the engine
   class because the gate must answer without importing the engine.
-- **`register_backend()` is the out-of-tree escape hatch and nothing else.**
-  In-tree engines are discovered; ids below `OUT_OF_TREE_ID_BASE` are rejected.
+- **A family may name a `heuristics` hook** — like `analyzer`, a
+  `("module", "callable")` pair kept as strings so the coarse key stays
+  import-free. It is handed the facts, the family's offered ids and the
+  backend's entries, and what it returns IS the plan list.
+- **There is no registration call.** The manifest is the only way a python
+  engine exists, and `_candidate_engines()` is the graph's family and nothing
+  else. An engine handed over at runtime could never be ranked anyway: it
+  declares no `Capabilities`, so nothing can enumerate its configs or place it
+  against the backend — it was an entry point into the plan list, not into the
+  decision. Tests inject their fakes as a manifest family, so they reach
+  dispatch the way real engines do.
 
 ### Facts: one description per graph, shared
 
@@ -212,14 +269,26 @@ only to decline is why `closed_under` existed.
 - `test/python/test_import_boundaries.py` holds all of this, in a fresh
   interpreter, measuring the delta against an empty one.
 
-### Router and the one plan list
+### Ranking and the one plan list
 
-- `create_execution_plans()` collects both sides and ranks them into ONE list:
-  the python engines of the graph's family that claim it (from
-  `engines/manifest.py`; `register_backend()` adds out-of-tree ones) and the
-  backend's own ranked
-  `(engine_id, knobs)` recommendation from `backend_plan_entries()`.
-  `engines/heuristics.py::heuristics_sort` decides the order.
+- `create_execution_plans()` gathers the inputs — the parsed facts, the family's
+  offered ids, and the backend's own `(engine_id, knobs)` recommendation from
+  `backend_plan_entries()` — and hands all of it to the graph's family in ONE
+  call (`engines/heuristics.py::rank` → the family's `recommend`). What comes
+  back IS the plan list, position for position. There is no second merge step:
+  splitting the decision is what forced the previous design to concatenate the
+  two sides and call it ranking.
+- **The backend's entries arrive tagged with the mode that produced them.**
+  `_create_backend_plans()` asks C++ one heuristic mode at a time and records
+  `get_execution_plan_count()` after each, so a family can say "the backend's
+  mode-A entries ahead of ours, its fallbacks behind". C++ appends each query
+  to the same plan list, which is exactly what makes the boundaries readable —
+  no C++ change was needed.
+- **`heur_mode.OPENSOURCE` is mode A without the backend's recommendation**:
+  the python engines ARE the open-source implementation. Combine it to measure
+  coverage — `[OPENSOURCE, A, FALLBACK]` tries every python config first and
+  still has the backend behind it, so a graph that runs on a backend plan is
+  one no python engine covers.
 - The list IS `graph.plans`, and the classic at-index APIs
   (`get_execution_plan_count()`, `get_plan_name_at_index()`,
   `build_plan_at_index()`, `execute_plan_at_index()`,
@@ -231,18 +300,41 @@ only to decline is why `closed_under` existed.
   time, and `backend_plan_entries()` returns `[]` when the backend declines the
   graph or is not installed — the backend participates in the ranking, it is
   not a hard dependency.
-- A Router places the backend's entries by calling `backend_plan_entries()`
-  (answered once per graph) and putting the result where it wants; nothing
-  rewrites the list it returns, so a routed index means what the Router said.
-  `BACKEND_HEURISTIC_ENGINE_ID` names one thing only: the delegating entry that
-  method appends under `heur_mode.OPENSOURCE`, where the backend picks among
-  candidates it never exposes as plans.
+- **A plan's identity is `(engine_id, knobs)`, never its `cpp_index`.** The
+  index only says where one backend query happened to put it, so deduplicating
+  on it lets `[A, A]`, or one config both modes return, through twice — and an
+  autotuner would build and time the same config twice.
+- **Whether a mode SUCCEEDED is tracked per call, not read off the plan
+  spans.** An OPENSOURCE query registers a C++ OSS candidate without adding a
+  plan, so it contributes no span; judging by spans would rethrow a later
+  mode's failure and discard the delegate that successful query earned.
+- The family places the backend's entries wherever it wants; nothing rewrites
+  the list it returns, so a ranked index means what the heuristics said.
+  `BACKEND_HEURISTIC_ENGINE_ID` names one thing only: the delegating entry
+  `backend_plan_entries()` appends, where the backend picks among OSS
+  candidates it never exposes as plans and which therefore cannot be
+  enumerated. It carries no mode. It leads the BACKEND's entries, because
+  `Graph::build_plans` tries it before its own engine configs — but it does NOT
+  lead the family's, because it is not a pure OSS entry: if the C++ OSS engine
+  declines, that same call falls through to the native configs already
+  enqueued. Ahead of the family's OPENSOURCE block it would answer an
+  OSS-coverage question with a native kernel.
 - `build_plans()` walks the list from the selected index and takes the first
   entry that builds; a decline advances to the next. `select_plan(i)` pins,
   and a pinned decline raises instead of running something else.
-- Ranking policy is pluggable at three levels: subclass `Router`, per-graph
-  `router=`, process-wide `default_router` — plus `heuristics_sort` itself,
-  which is the seam a real cost model replaces.
+- Ranking policy has ONE home: the family's `heuristics` hook, replaceable per
+  family. Which side leads is meant to be a measurement — a cell timed slower
+  than the backend follows it — not a default. Any cell that has not been timed
+  keeps the historical order, and the code says so where it is written.
+- **A recommendation always names a concrete config.** A knob field is `None`
+  only where the capability row declares no domain for that axis. `None` never
+  means "engine, pick for me" — that reading is what let the same choice be
+  made in two places, once in the ranking and once in the DSL adapter, and
+  drift. `sdpa/fwd/heuristics.py::_sm120_tiles` is the worked example of a
+  rule: it reads facts only, names its choice first, and puts the rest of the
+  domain behind it for a caller that autotunes. To add one — write the
+  function, list the cell in `_TILE_RULE_CELLS`, and put the measurement in the
+  commit.
 
 ## Key invariants
 
@@ -264,7 +356,9 @@ only to decline is why `closed_under` existed.
   path raises — op builders and fluent setters, direct attribute writes on
   `Tensor`/`Node`/`GraphContext`, dict writes on node ports/params
   (MappingProxy), in-place dim/stride edits (sealed to tuples). Inspection
-  stays fully readable. A mutation in the mutable window after `validate()`
+  stays fully readable. `validate()` lowers and freezes any graph the backend
+  CAN lower (classic error timing), so the mutable-after-validate window is
+  exactly the ops with no backend node (GDN/KDA/…); a mutation in it
   invalidates the validation. Planning freezes BEFORE it analyses, so facts
   never describe a graph that can still change.
 - **Output layout contract**: only USER-assigned output dim/stride are pushed
@@ -295,9 +389,34 @@ present) prove the execution went through the cuDNN backend plan path rather
 than a python engine; kernel identity below the backend API is deliberately
 not asserted (kernel names are backend-internal and version-dependent).
 
+### What each machine actually covers
+
+A dispatch change needs three runs, because the suites SKIP rather than fail on
+the wrong arch — a green sweep on one box says nothing about the others:
+
+| target | covers |
+|---|---|
+| any GPU (CPU-only logic) | `test_dispatch.py`, `test_graph_native.py`, `test_import_boundaries.py` — the ranking contract, one-shot planning, the at-index APIs, manifest classification |
+| SM100 | every FROST SDPA-forward cell except sm120; the FROST GEMM family; `linear_attention` (GDN / KDA / GDN-2), which is where the cuTile-vs-FROST pin lives |
+| SM120 | `sdpa_fwd_prefill_sm120` and its tile rule; `test_mhas_v2` routing tallies |
+
+Enumerate the device with `torch.cuda.get_device_properties(i).major` and pin
+it with `CUDA_VISIBLE_DEVICES` — CUDA's device order is not `nvidia-smi`'s, and
+defaulting to device 0 is how an SM100 suite silently skips in full.
+
 ## Follow-ups (separate MRs)
 
-- Heuristics/ranking: pluggable Router policy + typed plan representation.
+- More per-family tuning rules on top of the ranking frame, each with the
+  measurements behind it. `sdpa/fwd/heuristics.py::_sm120_tiles` is the only
+  one today; every other cell falls back to its capability row's sole point per
+  axis, which is the honest answer while nobody has timed it.
+- FALLBACK is one config per cell today — the smallest tile the row admits, the
+  config that asks least of the device. Picking the handful that between them
+  cover the plane needs measurements; the TODO is in `_mode_fallback`.
+- `_MEASURED_BEHIND` is an empty set: which side leads is meant to be a
+  measurement, and an untimed cell keeps the order this dispatch has always
+  had. A cost model that can compare a python config against a cuDNN engine on
+  a common currency (predicted time) turns that set into a number.
 - DSL engine integration (the cuTile matmul engine lives in this track).
 - Structural cleanup: lifecycle state objects, a `CudnnBackendAdapter` to
   remove `selected_engine is None` branching, lowering extracted to its own

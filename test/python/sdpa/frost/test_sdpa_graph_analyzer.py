@@ -21,7 +21,7 @@ def _eligible(graph, knobs=None):
     removed with the monkey-patch dispatch layer, and a knob request is a
     property of a PLAN (engines.base.PlanConfig.knobs), not of the graph.
     """
-    return {s.name for s in engines.ENGINE_SPECS if engines.probe(s, graph, knobs)}
+    return {s.name for s in engines.ENGINE_SPECS if engines.analyze_for(s, graph, knobs)[1] is None}
 
 
 # The default pytest.ini addopts is `-m L0`; mark the whole module so it runs.
@@ -835,7 +835,7 @@ _BWD_D = 64
 
 def _bwd_eligible(graph, knobs=None):
     """Names of the FROST SDPA-backward engines whose caps match this graph."""
-    return {s.name for s in bwd_engines.ENGINE_SPECS if bwd_engines.probe(s, graph, knobs)}
+    return {s.name for s in bwd_engines.ENGINE_SPECS if bwd_engines.analyze_for(s, graph, knobs)[1] is None}
 
 
 def _bshd_strides(h: int, s: int, d: int) -> tuple[int, int, int, int]:
