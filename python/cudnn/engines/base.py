@@ -199,11 +199,9 @@ class BaseEngine(ABC):
     def __init__(self):
         pass
 
-    # An engine answers for exactly ONE id -- the one its manifest slot handed
-    # it. The id-RANGE this class used to declare (id_end / owned_id_range)
-    # existed so a registered engine could claim a block and registration could
-    # prove two blocks disjoint; nothing registers now, and no shipped engine
-    # ever set id_end, so every range was [engine_id, engine_id + 1).
+    # An engine answers for exactly ONE id: the one its manifest slot handed it.
+    # (The id_end / owned_id_range block this used to declare was for engines
+    # registered at runtime, which no longer exist.)
 
     def check_support(self, graph: "pygraph") -> None:
         """Raise to decline ``graph``.

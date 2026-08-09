@@ -5,30 +5,25 @@
 
 ``engines/heuristics.rank`` hands over the parsed facts, this family's engine
 ids, and the backend's entries tagged by mode; what :func:`recommend` returns is
-``graph.plans``, position for position. The whole comparison is here because
-that is the only place it can be made — a cell cannot see its siblings, and
-neither side of the FROST/backend split can place the other.
+``graph.plans``, position for position. The comparison is here because a cell
+cannot see its siblings and neither side of the FROST/backend split can place
+the other.
 
 Per mode:
 
-- **A** — candidates worth running, best guess first. A cell whose capability
-  row declares one point per axis contributes one entry; a cell with a real
-  knob domain names its choice first and the runners-up behind it, for a caller
-  that autotunes. :func:`_sm120_tiles` is the worked example of such a rule.
+- **A** — candidates worth running, best guess first, runners-up behind it for
+  a caller that autotunes.
 - **FALLBACK** — the config expected to build where mode A's choice may not.
   Nothing here is chosen for speed.
-- **OPENSOURCE** — mode A without the backend's recommendation: these cells ARE
-  the open-source implementation and the backend's engines are not. Combine it
-  to measure coverage — ``[OPENSOURCE, A, FALLBACK]`` tries every FROST config
-  first and still has the backend behind it, so a graph that runs on a backend
-  plan is one FROST does not cover.
-- **B** — answered as A: it asks for a wider search than A, and this family has
-  none to give.
+- **OPENSOURCE** — mode A without the backend's recommendation, since these
+  cells ARE the open-source implementation.
+- **B** — answered as A: it asks for a wider search this family has none to
+  give.
 
-To add a rule for a cell: write the function, list the cell in
-``_TILE_RULE_CELLS``, and put the measurement behind it in the commit. A cell
-absent from that set falls back to its capability row's sole point per axis,
-which is the honest answer when nobody has timed it.
+To add a rule for a cell: write the function (:func:`_sm120_tiles` is the worked
+example), list the cell in ``_TILE_RULE_CELLS``, put the measurement in the
+commit. A cell absent from that set runs its row's sole point per axis, which is
+the honest answer while nobody has timed it.
 """
 
 from __future__ import annotations
@@ -41,14 +36,10 @@ from cudnn.engines.base import PlanConfig
 from cudnn.sdpa.fwd.config_sm120 import SMEM_CAPACITY_BYTES, smem_bytes
 from cudnn.sdpa.fwd.engines import ENGINE_SPECS, Capabilities, SdpaFwdKnobs, mismatch
 
-# Cells timed against the backend's own kernel and found SLOWER: the backend's
-# mode-A entries lead and the cell is the second choice.
-#
-# A cell absent from this set has either measured faster or not been timed at
-# all, and both lead. That is deliberate but it is NOT a measurement -- it is
-# the order this dispatch has always had. Moving a cell in here is an
-# experiment, not an edit. Coverage does not depend on it: a caller who wants
-# FROST tried first asks for heur_mode.OPENSOURCE.
+# Cells timed against the backend's kernel and found SLOWER, so the backend's
+# mode-A entries lead them. Empty: absent means faster OR never timed, and both
+# keep the order this dispatch has always had. Moving a cell in needs a
+# measurement.
 _MEASURED_BEHIND: frozenset = frozenset()
 
 # Cells whose (tile_m, tile_n) choice _sm120_tiles makes.
@@ -58,30 +49,16 @@ _TILE_RULE_CELLS = frozenset({"sdpa_fwd_prefill_sm120"})
 def _sm120_tiles(caps: Capabilities, facts) -> Tuple[int, int]:
     """(tile_m, tile_n) for the SM120 SDPA-forward prefill cell.
 
-    ``tile_n`` is the LARGEST the kernel can fit in SMEM: 128 wins across the
-    f16 sweep, by 2-4% rather than a uniform margin, but a wide head does not
-    leave room for it (D=208 needs 106 KB against the part's 99). Fit is a
-    kernel property, so the arithmetic lives with the template
-    (``config_sm120.smem_bytes``) and the adapter's own check calls the same
-    function -- two answers to "does this tile fit" is how a plan list fills up
-    with entries that decline at build.
-
     ``tile_m=64`` when the grid cannot fill the machine AND each CTA has enough
-    KV tiles for the extra Q-tile loop to amortize: halving the Q tile doubles
-    the CTA count, which only pays while SMs sit idle, and adds loop overhead
-    that only long sequences absorb. Worth 1.5x at 64 CTAs. The 1.5x SM-count
-    bound is where the two stop trading evenly: 240 CTAs still want the finer
-    tile on this part, 320 want the coarser one by 1.19x.
+    KV tiles to amortize the extra Q-tile loop; a causal mask counts as a
+    halved grid because it halves the work per CTA. ``tile_n`` is the largest
+    that fits SMEM: 128 is fastest, but a wide head (D>=208) has no room for it.
 
-    A causal mask halves the work per CTA, so the machine empties sooner and
-    the finer Q tile keeps paying further out -- folded in as a halved
-    effective grid.
-
-    Regret against the best of the enumerated domain: 1.009 geomean, 1.054
-    worst case. A tile rule is a property of the KERNEL it was measured on, not
-    of the hardware: an earlier revision of this template staged P through SMEM
-    and wanted ``tile_n=64``; the shfl path removed that traffic and the
-    optimum moved.
+    Fit is a KERNEL property, so ``config_sm120.smem_bytes`` is the one
+    implementation and the adapter's check calls it too. So is the tuning: an
+    earlier revision of this template staged P through SMEM and wanted
+    ``tile_n=64``. Re-measure when the kernel changes -- the sweep behind these
+    thresholds (regret 1.009 geomean, 1.054 worst) is in PR #528.
     """
     sm_count = facts.device_sm_count or 0
     grid = -(-facts.s_q // 128) * facts.h_q * facts.b
@@ -100,13 +77,9 @@ def _sole(values):
 
 
 def _knobs(caps: Capabilities, tile_m, tile_n) -> SdpaFwdKnobs:
-    """A knob request for one point.
-
-    A field stays None only on an axis whose capability row declares no domain
-    — the engine then has no say to honour. It never means "engine, pick for
-    me": that reading is what let the same choice be made twice, once here and
-    once inside the adapter.
-    """
+    """A knob request for one point. A field is None ONLY where the capability
+    row declares no domain for that axis — never "engine, pick for me", which
+    is how the same choice ended up being made here and again in the adapter."""
     return SdpaFwdKnobs(sched_policy=_sole(caps.sched_policies), tile_m=tile_m, tile_n=tile_n, cga=_sole(caps.cgas))
 
 

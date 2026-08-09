@@ -186,10 +186,9 @@ class pygraph:
         """The candidate engine answering for ``engine_id``, if any.
 
         The single owner lookup: dispatch, the ranking's output validation and
-        replay all go through it, so "who runs this id" has one answer computed
-        one way. An id names exactly one engine — the manifest hands each slot
-        a single id — so this is an equality test, and it has to stay the same
-        test the manifest fallback below makes."""
+        replay all go through it. An id names exactly one engine (the manifest
+        hands each slot one), so this is an equality test — and it must stay the
+        same test the manifest fallback below makes."""
         out = [engine for engine in self._candidate_engines() if engine.engine_id == engine_id]
         if not out:
             # Not a candidate for THIS graph, but the id may still name an
@@ -1062,13 +1061,11 @@ class pygraph:
             return self._backend_entries
         from .engines.engine_ids import BACKEND_HEURISTIC_ENGINE_ID
 
-        # One entry per DISTINCT (engine, knobs). A node may override the
-        # heuristics query outright (Graph::create_execution_plans checks
-        # override_heuristics_query first and returns before it reads the mode
-        # at all -- deterministic SDPA backward and FP8 backward do this), so
-        # every per-mode call appends the SAME config and the list comes back
-        # holding it once per mode. The first index wins: it is the one whose
-        # mode span is real.
+        # One entry per DISTINCT (engine, knobs). Graph::create_execution_plans
+        # checks override_heuristics_query() and returns before reading the mode
+        # -- deterministic SDPA backward and FP8 backward override -- so every
+        # per-mode call appends the same config. First index wins; it is the one
+        # whose mode span is real.
         entries, seen = [], set()
         for i in range(self._lowered_graph.get_execution_plan_count()):
             engine_id, knobs = self._lowered_graph.get_engine_and_knobs_at_index(i)
@@ -1280,10 +1277,9 @@ class pygraph:
         cuDNN modes empty). Only every mode failing means the backend has
         nothing, and the last error is re-raised so the caller reports why.
 
-        "Succeeded" is tracked per call, NOT read off the spans: an OPENSOURCE
-        query registers a C++ OSS candidate without adding a plan, so it adds no
-        span. Judging by spans would rethrow a later mode's failure and discard
-        the OSS delegate the successful query earned.
+        "Succeeded" is tracked per call, not read off the spans: an OPENSOURCE
+        query registers a C++ OSS candidate without adding a plan, so it leaves
+        no span, and judging by spans would discard the delegate it earned.
         """
         import cudnn
 
@@ -1291,8 +1287,8 @@ class pygraph:
             return
         from .engines.heuristics import default_modes
 
-        # The SAME default the ranking assumes: two copies of it means querying
-        # the backend for modes no family will place.
+        # The SAME default the ranking assumes, or the backend gets queried for
+        # modes no family will place.
         modes = self._backend_heuristics or default_modes()
         at, failure, any_ok = self._lowered_graph.get_execution_plan_count(), None, False
         for mode in modes:
