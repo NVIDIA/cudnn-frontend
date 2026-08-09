@@ -318,6 +318,7 @@ _LAZY_OPTIONAL_IMPORTS = {
     "NSA": (".native_sparse_attention", "NSA"),
     "GemmSwigluSm100": (".gemm.cutedsl.dense.swiglu", "GemmSwigluSm100"),
     "gemm_swiglu_wrapper_sm100": (".gemm.cutedsl.dense.swiglu", "gemm_swiglu_wrapper_sm100"),
+    "gemm_swiglu_jax_sm100": (".gemm.cutedsl.dense.swiglu", "gemm_swiglu_jax_sm100"),
     "GemmSreluSm100": (".gemm.cutedsl.dense.srelu", "GemmSreluSm100"),
     "gemm_srelu_wrapper_sm100": (".gemm.cutedsl.dense.srelu", "gemm_srelu_wrapper_sm100"),
     "GemmDsreluSm100": (".gemm.cutedsl.dense.dsrelu", "GemmDsreluSm100"),

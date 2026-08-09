@@ -12,13 +12,14 @@ weight pointers -- avoiding the need to copy/reshape weights from independent
 parameter allocations.
 """
 
+from __future__ import annotations
+
 from .discrete_B_blockscaled_grouped_gemm_glu_bias import (
     BlockScaledDiscreteWeightGroupedGemmBiasKernel,
 )
 from cuda.bindings import driver as cuda
 import logging
 import os
-import torch
 from typing import Tuple, Optional
 
 import cutlass
@@ -73,7 +74,7 @@ class DiscreteGroupedGemmSwigluSm100(APIBase):
         sample_amax: Optional[torch.Tensor] = None,
         sample_norm_const: Optional[torch.Tensor] = None,
         sample_prob: Optional[torch.Tensor] = None,
-        acc_dtype: torch.dtype = torch.float32,
+        acc_dtype: Optional[torch.dtype] = None,
         mma_tiler_mn: Tuple[int, int] = (256, 256),
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         sf_vec_size: int = 16,
@@ -102,7 +103,7 @@ class DiscreteGroupedGemmSwigluSm100(APIBase):
         :param sample_amax: Optional amax tensor for quantization
         :param sample_norm_const: Optional normalization constant
         :param sample_prob: Optional probability tensor for gating
-        :param acc_dtype: Accumulator data type
+        :param acc_dtype: Accumulator data type (default: torch.float32)
         :param mma_tiler_mn: MMA tiler shape (M, N)
         :param cluster_shape_mn: Cluster shape (M, N)
         :param sf_vec_size: Scale factor vector size
@@ -113,6 +114,16 @@ class DiscreteGroupedGemmSwigluSm100(APIBase):
         :param b_major: Major dimension for B tensor, one of "k" or "n"
         :param use_dynamic_sched: Enable dynamic tile scheduling for load balancing
         """
+        from cudnn.tensor_adapter import is_torch_tensor
+
+        if sample_a is not None and not is_torch_tensor(sample_a):
+            raise ValueError("DiscreteGroupedGemmSwigluSm100 currently supports torch tensors only; JAX support is not yet implemented for this API")
+
+        import torch
+
+        if acc_dtype is None:
+            acc_dtype = torch.float32
+
         super().__init__()
 
         self._warn_experimental_api()
@@ -179,6 +190,8 @@ class DiscreteGroupedGemmSwigluSm100(APIBase):
 
         :return: True if supported, raises exception otherwise
         """
+        import torch
+
         self._logger.debug("Entering check_support")
 
         all_none = all(x is None for x in [self.sfd_row_desc, self.sfd_col_desc, self.norm_const_desc])
@@ -462,6 +475,8 @@ class DiscreteGroupedGemmSwigluSm100(APIBase):
 
     def compile(self) -> None:
         """Compile the kernel from tensor descriptors captured in __init__."""
+        import torch
+
         self._logger.debug("Entering compile")
         self._ensure_support_checked()
         if self._compiled_kernel is not None:
@@ -810,9 +825,9 @@ def discrete_grouped_gemm_swiglu_wrapper_sm100(
     bias_tensor: Optional[torch.Tensor] = None,
     norm_const_tensor: Optional[torch.Tensor] = None,
     prob_tensor: Optional[torch.Tensor] = None,
-    acc_dtype: torch.dtype = torch.float32,
-    c_dtype: torch.dtype = torch.bfloat16,
-    d_dtype: torch.dtype = torch.bfloat16,
+    acc_dtype: Optional[torch.dtype] = None,
+    c_dtype: Optional[torch.dtype] = None,
+    d_dtype: Optional[torch.dtype] = None,
     cd_major: str = "n",
     mma_tiler_mn: Tuple[int, int] = (256, 256),
     cluster_shape_mn: Optional[Tuple[int, int]] = None,
@@ -847,9 +862,9 @@ def discrete_grouped_gemm_swiglu_wrapper_sm100(
         bias_tensor: Optional bias tensor with shape (n, expert_cnt) and stride (1, n)
         norm_const_tensor: Optional normalization constant
         prob_tensor: Optional probability tensor for gating
-        acc_dtype: Accumulator data type
-        c_dtype: Intermediate C tensor data type
-        d_dtype: Output D tensor data type
+        acc_dtype: Accumulator data type (default: torch.float32)
+        c_dtype: Intermediate C tensor data type (default: torch.bfloat16)
+        d_dtype: Output D tensor data type (default: torch.bfloat16)
         cd_major: CD major dimension (only "n" supported)
         mma_tiler_mn: MMA tiler shape
         cluster_shape_mn: Cluster shape
@@ -882,6 +897,20 @@ def discrete_grouped_gemm_swiglu_wrapper_sm100(
         TupleDict with keys: c_tensor, d_tensor, d_col_tensor, amax_tensor,
             sfd_row_tensor, sfd_col_tensor
     """
+    from cudnn.tensor_adapter import is_torch_tensor
+
+    if a_tensor is not None and not is_torch_tensor(a_tensor):
+        raise ValueError("discrete_grouped_gemm_swiglu_wrapper_sm100 currently supports torch tensors only; JAX support is not yet implemented for this API")
+
+    import torch
+
+    if acc_dtype is None:
+        acc_dtype = torch.float32
+    if c_dtype is None:
+        c_dtype = torch.bfloat16
+    if d_dtype is None:
+        d_dtype = torch.bfloat16
+
     # Resolve linear_offset default: None means "use the activation-derived legacy
     # default" (1.0 for geglu, 0.0 for swiglu) for backwards compatibility.
     if linear_offset is None:

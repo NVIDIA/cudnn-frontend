@@ -2,6 +2,8 @@
 
 **FE-OSS APIs are experimental and subject to change.**
 
+The GEMM CuTeDSL APIs are type-erased and torch-lazy: torch is imported only when torch tensors are passed. The dense GEMM fusions (amax, swiglu, srelu, dsrelu) additionally accept JAX arrays (see `gemm_amax.md` "Using JAX arrays" for the JAX contract), with `jax.jit`-compatible XLA custom-call entry points for amax and swiglu; the grouped / discrete-grouped / proj_rope APIs currently support torch tensors only and reject other frameworks with a clear error.
+
 This folder documents the Python FE APIs implemented under `python/cudnn`. For details on currently implemented operations, see:
 - [GEMM + Amax](gemm_fusions/gemm_amax.md)
 - [GEMM + RoPE + MXFP8 Projection](gemm_fusions/gemm_proj_rope_mxfp8.md)

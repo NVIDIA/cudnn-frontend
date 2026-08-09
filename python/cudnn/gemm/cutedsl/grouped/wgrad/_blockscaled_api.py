@@ -3,9 +3,10 @@
 
 """Unified FE API for grouped GEMM wgrad on SM100+."""
 
+from __future__ import annotations
+
 from typing import Optional, Tuple, Union
 
-import torch
 import cutlass
 import cutlass.cute as cute
 from cuda.bindings import driver as cuda
@@ -28,6 +29,8 @@ def _get_rubin_kernel():
 
 
 def _is_supported_rubin_quantization(ab_dtype: torch.dtype, sf_dtype: torch.dtype, sf_vec_size: int) -> bool:
+    import torch
+
     is_fp4 = ab_dtype in (torch.float4_e2m1fn_x2, torch.uint8)
     if is_fp4:
         return (sf_dtype == torch.float8_e4m3fn and sf_vec_size == 16) or (sf_dtype == torch.float8_e8m0fnu and sf_vec_size == 32)
@@ -55,13 +58,17 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
         wgrad_dtype: Optional[torch.dtype] = None,
         sample_global_scale_a: Optional[torch.Tensor] = None,
         sample_global_scale_b: Optional[torch.Tensor] = None,
-        acc_dtype: torch.dtype = torch.float32,
+        acc_dtype: Optional[torch.dtype] = None,
         mma_tiler_mn: Tuple[int, int] = (256, 256),
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         sf_vec_size: int = 16,
         accumulate_on_output: bool = False,
         input_order: Union[WGradInputOrder, str] = WGradInputOrder.Tensor2D,
     ):
+        import torch
+
+        if acc_dtype is None:
+            acc_dtype = torch.float32
         super().__init__()
         self._warn_experimental_api()
         self.input_order = WGradInputOrder(input_order)
@@ -159,6 +166,8 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
         return offset_values
 
     def _check_rubin_quantization_support(self) -> None:
+        import torch
+
         if not self._is_rubin_kernel:
             return
 
@@ -179,6 +188,8 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
             )
 
     def check_support(self) -> bool:
+        import torch
+
         m, tokens_sum = self._tensor_shape(self.a_desc, name="sample_a")
         _, n = self._tensor_shape(self.b_desc, name="sample_b")
 
@@ -266,6 +277,8 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
         return True
 
     def compile(self) -> None:
+        import torch
+
         self._ensure_support_checked()
         if self._compiled_kernel is not None:
             return
@@ -399,6 +412,8 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
         self._compiled_kernel = tensor_api
 
     def _compile_discrete(self, kernel, max_active_clusters, fake_stream) -> None:
+        import torch
+
         a_fake = (
             from_dlpack(self.sample_a_tensor, assumed_align=16, enable_tvm_ffi=True).mark_compact_shape_dynamic(
                 mode=1,
@@ -530,6 +545,8 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
         global_scale_b: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
     ) -> None:
+        import torch
+
         current_stream = self._get_default_stream(current_stream)
         self._runtime_error_if(self._compiled_kernel is None, "Kernel not compiled; call compile() first")
 

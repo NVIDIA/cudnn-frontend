@@ -17,6 +17,8 @@ Discrete mode
     at execution time.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass, replace
 
 from ..backend_utils import (
@@ -29,20 +31,28 @@ from ..moe_utils import MoEWeightMode
 from cuda.bindings import driver as cuda
 import logging
 import os
-import torch
 from typing import Any, Tuple, Optional, overload
 
 from cudnn.api_base import APIBase, TupleDict, ceil_div, get_device_type
 
-_BLOCK_SCALED_DTYPE_PAIRS = {
-    (dtype, dtype)
-    for dtype in (
-        torch.float4_e2m1fn_x2,
-        torch.uint8,
-        torch.float8_e5m2,
-        torch.float8_e4m3fn,
-    )
-}
+_BLOCK_SCALED_DTYPE_PAIRS = None
+
+
+def _block_scaled_dtype_pairs():
+    global _BLOCK_SCALED_DTYPE_PAIRS
+    if _BLOCK_SCALED_DTYPE_PAIRS is None:
+        import torch
+
+        _BLOCK_SCALED_DTYPE_PAIRS = {
+            (dtype, dtype)
+            for dtype in (
+                torch.float4_e2m1fn_x2,
+                torch.uint8,
+                torch.float8_e5m2,
+                torch.float8_e4m3fn,
+            )
+        }
+    return _BLOCK_SCALED_DTYPE_PAIRS
 
 
 from ._bf16_api import GroupedGemmDgluBf16API
@@ -73,8 +83,8 @@ class DgluCall:
     b_dtype: Optional[torch.dtype] = None
     b_major: str = "k"
     norm_const_tensor: Optional[torch.Tensor] = None
-    acc_dtype: torch.dtype = torch.float32
-    d_dtype: torch.dtype = torch.bfloat16
+    acc_dtype: Optional[torch.dtype] = None
+    d_dtype: Optional[torch.dtype] = None
     cd_major: str = "n"
     mma_tiler_mn: Tuple[int, int] = (256, 256)
     cluster_shape_mn: Optional[Tuple[int, int]] = None
@@ -157,7 +167,7 @@ class GroupedGemmDgluSm100(APIBase):
         sample_sfd_col: Optional[torch.Tensor] = None,
         sample_amax: Optional[torch.Tensor] = None,
         sample_norm_const: Optional[torch.Tensor] = None,
-        acc_dtype: torch.dtype = torch.float32,
+        acc_dtype: Optional[torch.dtype] = None,
         mma_tiler_mn: Tuple[int, int] = (256, 256),
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         sf_vec_size: int = 16,
@@ -178,6 +188,14 @@ class GroupedGemmDgluSm100(APIBase):
         self._pending_init_kwargs = dict(locals())
         self._pending_init_kwargs.pop("self")
         self._pending_init_kwargs.pop("__class__", None)
+        from cudnn.tensor_adapter import is_torch_tensor
+
+        if sample_a is not None and not is_torch_tensor(sample_a):
+            raise ValueError("GroupedGemmDgluSm100 currently supports torch tensors only; JAX support is not yet implemented for this API")
+        if acc_dtype is None:
+            import torch
+
+            self._pending_init_kwargs["acc_dtype"] = torch.float32
         self._implementation = None
 
     def check_support(self) -> bool:
@@ -203,7 +221,7 @@ class GroupedGemmDgluSm100(APIBase):
                     ("glu_clamp_min", kwargs["glu_clamp_min"] if kwargs["glu_clamp_min"] != -7.0 else None),
                     ("epilogue_op", kwargs["epilogue_op"] if kwargs["epilogue_op"] not in (None, "none", "identity") else None),
                 ),
-                block_scaled_dtype_pairs=_BLOCK_SCALED_DTYPE_PAIRS,
+                block_scaled_dtype_pairs=_block_scaled_dtype_pairs(),
             )
             self.backend = backend
             self.linear_offset = kwargs["linear_offset"]
@@ -456,6 +474,8 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall) -> TupleDict:
         TupleDict with keys: d_row_tensor, d_col_tensor, dprob_tensor,
             dbias_tensor, amax_tensor, sfd_row_tensor, sfd_col_tensor
     """
+    import torch
+
     from cudnn.gemm.cutedsl.discrete_grouped.discrete_kernel_utils import _require_pointer_tensor
 
     a_tensor = call.a_tensor
@@ -844,7 +864,16 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall) -> TupleDict:
 def _normalize_dglu_call(
     call: DgluCall,
 ) -> tuple[DgluCall, GroupedGemmBackend]:
+    import torch
+
     from cudnn.gemm.cutedsl.discrete_grouped.discrete_kernel_utils import _require_pointer_tensor
+
+    if call.acc_dtype is None or call.d_dtype is None:
+        call = replace(
+            call,
+            acc_dtype=call.acc_dtype if call.acc_dtype is not None else torch.float32,
+            d_dtype=call.d_dtype if call.d_dtype is not None else torch.bfloat16,
+        )
 
     is_dense = call.b_tensor is not None
     is_discrete = call.b_ptrs is not None
@@ -905,7 +934,7 @@ def _normalize_dglu_call(
                 call.epilogue_op if call.epilogue_op not in (None, "none", "identity") else None,
             ),
         ),
-        block_scaled_dtype_pairs=_BLOCK_SCALED_DTYPE_PAIRS,
+        block_scaled_dtype_pairs=_block_scaled_dtype_pairs(),
     )
     linear_offset = call.linear_offset
     if linear_offset is None:
@@ -991,6 +1020,8 @@ def _dglu_tensor_signature(tensor: Optional[torch.Tensor], *, dynamic_m: bool = 
 
 
 def _grouped_gemm_dglu_bf16_call(call: DgluCall) -> TupleDict:
+    import torch
+
     valid_m = call.a_tensor.shape[0]
     n_weight = call.b_tensor.shape[0] if call.b_tensor is not None else call.n
     two_n = 2 * n_weight
@@ -1141,8 +1172,8 @@ def grouped_gemm_dglu_wrapper_sm100(
     b_dtype: Optional[torch.dtype] = None,
     b_major: str = "k",
     norm_const_tensor: Optional[torch.Tensor] = None,
-    acc_dtype: torch.dtype = torch.float32,
-    d_dtype: torch.dtype = torch.bfloat16,
+    acc_dtype: Optional[torch.dtype] = None,
+    d_dtype: Optional[torch.dtype] = None,
     cd_major: str = "n",
     mma_tiler_mn: Tuple[int, int] = (256, 256),
     cluster_shape_mn: Optional[Tuple[int, int]] = None,
@@ -1161,6 +1192,16 @@ def grouped_gemm_dglu_wrapper_sm100(
     current_stream: Optional[cuda.CUstream] = None,
 ) -> TupleDict:
     """Dispatch grouped GEMM dGLU once from an immutable normalized call."""
+    from cudnn.tensor_adapter import is_torch_tensor
+
+    if a_tensor is not None and not is_torch_tensor(a_tensor):
+        raise ValueError("grouped_gemm_dglu_wrapper_sm100 currently supports torch tensors only; JAX support is not yet implemented for this API")
+    import torch
+
+    if acc_dtype is None:
+        acc_dtype = torch.float32
+    if d_dtype is None:
+        d_dtype = torch.bfloat16
     call = DgluCall(
         a_tensor=a_tensor,
         c_tensor=c_tensor,

@@ -17,43 +17,17 @@ from typing import Any, Tuple
 
 import jax
 import jax.numpy as jnp
-import jax_tvm_ffi
 
 import cutlass
 
-from cudnn.api_base import TensorDesc
 from cudnn.datatypes import _convert_to_cutlass_data_type
-from cudnn.tensor_adapter import Device, framework_dtype
+from cudnn.tensor_adapter import framework_dtype
+from cudnn.gemm.cutedsl._jax_ffi import get_or_register_env_stream_target, make_row_major_desc as _make_desc
 from .api import GemmAmaxSm100
 
 # cache_key -> (registered XLA target name, GemmAmaxSm100, compiled tvm-ffi callable).
 # The object references keep the compiled kernel alive alongside the global registration.
 _registered_targets = {}
-
-
-def _c_contiguous_strides(shape: Tuple[int, ...]) -> Tuple[int, ...]:
-    strides, acc = [1] * len(shape), 1
-    for i in range(len(shape) - 1, -1, -1):
-        strides[i] = acc
-        acc *= shape[i]
-    return tuple(strides)
-
-
-def _make_desc(shape: Tuple[int, ...], dtype: Any, name: str) -> TensorDesc:
-    """Descriptor for a C-contiguous (row-major) JAX buffer, from shape/dtype only.
-
-    Built directly from aval metadata so this works for jax.jit tracers as well as
-    concrete arrays (tracers expose .shape/.dtype but no device or DLPack).
-    """
-    stride = _c_contiguous_strides(shape)
-    return TensorDesc(
-        dtype=_convert_to_cutlass_data_type(dtype),
-        shape=shape,
-        stride=stride,
-        stride_order=TensorDesc._compute_stride_order(shape, stride),
-        device=Device("cuda", 0),
-        name=name,
-    )
 
 
 def gemm_amax_jax_sm100(
@@ -101,9 +75,8 @@ def gemm_amax_jax_sm100(
         sf_vec_size,
     )
 
-    entry = _registered_targets.get(cache_key)
-    if entry is None:
-        gemm = GemmAmaxSm100(
+    def make_gemm():
+        return GemmAmaxSm100(
             sample_a=_make_desc(tuple(a_tensor.shape), a_tensor.dtype, "sample_a"),
             sample_b=_make_desc(tuple(b_tensor.shape), b_tensor.dtype, "sample_b"),
             sample_sfa=_make_desc(tuple(sfa_tensor.shape), sfa_tensor.dtype, "sample_sfa"),
@@ -115,16 +88,11 @@ def gemm_amax_jax_sm100(
             cluster_shape_mn=cluster_shape_mn,
             sf_vec_size=sf_vec_size,
         )
-        assert gemm.check_support()
-        compiled = gemm._compile_kernel(use_tvm_ffi_env_stream=True)
-        target = f"cudnn.gemm_amax_sm100.{len(_registered_targets)}"
-        # arg_spec=["args"]: only the operands are passed to the kernel; the result
-        # buffers arrive as the two donated trailing operands (input_output_aliases below),
-        # matching the kernel's destination-passing signature (a, b, sfa, sfb, c, amax).
-        jax_tvm_ffi.register_ffi_target(target, compiled, arg_spec=["args"], platform="gpu", allow_cuda_graph=True)
-        entry = (target, gemm, compiled)
-        _registered_targets[cache_key] = entry
-    target = entry[0]
+
+    # arg_spec=["args"]: only the operands are passed to the kernel; the result
+    # buffers arrive as the two donated trailing operands (input_output_aliases below),
+    # matching the kernel's destination-passing signature (a, b, sfa, sfb, c, amax).
+    target = get_or_register_env_stream_target(_registered_targets, cache_key, make_gemm, "cudnn.gemm_amax_sm100")
 
     c_jax_dtype = framework_dtype(c_dtype, "jax")
     c_buf = jnp.zeros((m, n, l), dtype=c_jax_dtype)
