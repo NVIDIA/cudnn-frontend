@@ -65,13 +65,24 @@ def is_torch_available():
 
 
 def is_cutlass_available():
-    global cutlass_available, _torch_to_cutlass_data_type_dict
+    global cutlass_available
     if cutlass_available is None:
+        try:
+            import cutlass
+
+            cutlass_available = True
+        except ImportError:
+            cutlass_available = False
+    return cutlass_available
+
+
+def _is_torch_to_cutlass_available():
+    global _torch_to_cutlass_data_type_dict
+    if _torch_to_cutlass_data_type_dict is None:
         try:
             import torch
             import cutlass
 
-            cutlass_available = True
             mapping = {
                 torch.half: getattr(cutlass, "Float16", None),
                 getattr(torch, "float16", torch.half): getattr(cutlass, "Float16", None),
@@ -92,9 +103,60 @@ def is_cutlass_available():
             }
             _torch_to_cutlass_data_type_dict = {t: c for t, c in mapping.items() if t is not None and c is not None}
         except ImportError:
-            cutlass_available = False
             _torch_to_cutlass_data_type_dict = {}
-    return cutlass_available
+    return bool(_torch_to_cutlass_data_type_dict)
+
+
+# Framework-neutral dtype-name -> cutlass mapping. Keyed on np.dtype(x).name so
+# numpy, ml_dtypes, and string dtypes all resolve without importing torch or ml_dtypes.
+_dtype_name_to_cutlass_data_type_dict = None
+
+
+def _get_dtype_name_to_cutlass_dict():
+    global _dtype_name_to_cutlass_data_type_dict
+    if _dtype_name_to_cutlass_data_type_dict is None:
+        import cutlass
+
+        names = {
+            "float16": "Float16",
+            "bfloat16": "BFloat16",
+            "float32": "Float32",
+            "float64": "Float64",
+            "uint8": "Uint8",
+            "int8": "Int8",
+            "int32": "Int32",
+            "int64": "Int64",
+            "bool": "Boolean",
+            "float8_e4m3fn": "Float8E4M3FN",
+            "float8_e5m2": "Float8E5M2",
+            "float8_e8m0fnu": "Float8E8M0FNU",
+            "float4_e2m1fn": "Float4E2M1FN",
+        }
+        _dtype_name_to_cutlass_data_type_dict = {name: getattr(cutlass, attr) for name, attr in names.items() if getattr(cutlass, attr, None) is not None}
+    return _dtype_name_to_cutlass_data_type_dict
+
+
+def _dtype_name_to_cutlass_data_type(data_type, interpret_uint8_as_fp4x2: bool = False):
+    """Map a numpy/ml_dtypes dtype (or dtype name string) to a cutlass type, or None."""
+    try:
+        import numpy as np
+
+        name = np.dtype(data_type).name
+    except Exception:
+        try:
+            # dtype names like "bfloat16"/"float8_e4m3fn" only resolve once
+            # ml_dtypes has registered its numpy extension types.
+            import ml_dtypes
+            import numpy as np
+
+            name = np.dtype(data_type).name
+        except Exception:
+            return None
+    if interpret_uint8_as_fp4x2 and name == "uint8":
+        import cutlass
+
+        return getattr(cutlass, "Float4E2M1FN", None)
+    return _get_dtype_name_to_cutlass_dict().get(name, None)
 
 
 # Returns None in case mapping is not available
@@ -106,9 +168,12 @@ def _torch_to_cudnn_data_type(torch_data_type) -> cudnn_data_type:
 
 
 def _torch_to_cutlass_data_type(data_type, interpret_uint8_as_fp4x2: bool = False):
-    if is_cutlass_available() and is_torch_available():
-        import torch
-
+    # A torch dtype can only be passed in if torch is already imported, so probing
+    # sys.modules avoids importing torch on behalf of other frameworks' dtypes.
+    torch = sys.modules.get("torch")
+    if torch is None or not isinstance(data_type, torch.dtype):
+        return None
+    if is_cutlass_available() and _is_torch_to_cutlass_available():
         if interpret_uint8_as_fp4x2 and data_type == torch.uint8:
             import cutlass
 
@@ -123,15 +188,29 @@ def _convert_to_cutlass_data_type(data_type, interpret_uint8_as_fp4x2: bool = Fa
         import cutlass
 
         if isinstance(data_type, type) and issubclass(data_type, cutlass.Numeric):
+            if interpret_uint8_as_fp4x2 and data_type is cutlass.Uint8:
+                return cutlass.Float4E2M1FN
             return data_type
         elif data_type is not None:
             cutlass_data_type = _torch_to_cutlass_data_type(data_type, interpret_uint8_as_fp4x2=interpret_uint8_as_fp4x2)
+            if cutlass_data_type is None:
+                cutlass_data_type = _dtype_name_to_cutlass_data_type(data_type, interpret_uint8_as_fp4x2=interpret_uint8_as_fp4x2)
             if cutlass_data_type is None:
                 raise ValueError("Unsupported tensor data type.")
             return cutlass_data_type
         else:
             raise ValueError("None is not a valid tensor data type.")
     return None
+
+
+def _convert_to_cutlass_data_type_or_none(data_type, interpret_uint8_as_fp4x2: bool = False):
+    """Like _convert_to_cutlass_data_type but returns None for unmappable dtypes instead of raising."""
+    if data_type is None or not is_cutlass_available():
+        return None
+    try:
+        return _convert_to_cutlass_data_type(data_type, interpret_uint8_as_fp4x2=interpret_uint8_as_fp4x2)
+    except ValueError:
+        return None
 
 
 def _cudnn_to_torch_data_type(cudnn_data_type):
@@ -177,3 +256,12 @@ def _is_torch_tensor(input_tensor) -> bool:
 
         return isinstance(input_tensor, torch.Tensor)
     return False
+
+
+def _is_jax_array(input_tensor) -> bool:
+    # A jax array can only exist if jax is already imported, so probing
+    # sys.modules never triggers a jax import.
+    jax = sys.modules.get("jax")
+    if jax is not None and isinstance(input_tensor, getattr(jax, "Array", ())):
+        return True
+    return type(input_tensor).__module__.startswith(("jax", "jaxlib"))

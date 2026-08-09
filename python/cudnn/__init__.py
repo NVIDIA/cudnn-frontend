@@ -324,6 +324,7 @@ _LAZY_OPTIONAL_IMPORTS = {
     "gemm_dsrelu_wrapper_sm100": (".gemm.cutedsl.dense.dsrelu", "gemm_dsrelu_wrapper_sm100"),
     "GemmAmaxSm100": (".gemm.cutedsl.dense.amax", "GemmAmaxSm100"),
     "gemm_amax_wrapper_sm100": (".gemm.cutedsl.dense.amax", "gemm_amax_wrapper_sm100"),
+    "gemm_amax_jax_sm100": (".gemm.cutedsl.dense.amax", "gemm_amax_jax_sm100"),
     "GemmProjRopeMxfp8Bf16InSm100": (".gemm.cutedsl.dense.proj_rope_mxfp8", "GemmProjRopeMxfp8Bf16InSm100"),
     "GemmProjRopeMxfp8Mxfp8InSm100": (".gemm.cutedsl.dense.proj_rope_mxfp8", "GemmProjRopeMxfp8Mxfp8InSm100"),
     "gemm_proj_rope_mxfp8_wrapper_sm100": (".gemm.cutedsl.dense.proj_rope_mxfp8", "gemm_proj_rope_mxfp8_wrapper_sm100"),
