@@ -1330,7 +1330,11 @@ class SM120FusedMultiHeadAttentionForward:
             raise ValueError("runtime Q/K/V/O batch, sequence, or head geometry mismatch")
         for name, tensor in (("Q", q), ("K", k), ("V", v), ("O", o)):
             if cutlass.const_expr(not self.is_layout_supported(tensor.shape, tensor.stride)):
-                raise ValueError(f"{name} must use compact BSHD storage")
+                raise ValueError(
+                    f"{name} layout is not supported: BSHD with the head dim innermost-contiguous "
+                    f"and non-overlapping seq/head strides that are multiples of 8 elements "
+                    f"(compact or padded); got shape {tuple(tensor.shape)} stride {tuple(tensor.stride)}"
+                )
         if cutlass.const_expr(lse is not None):
             if cutlass.const_expr(self.thd_varlen):
                 if cutlass.const_expr(self.thd_lse_head_major):

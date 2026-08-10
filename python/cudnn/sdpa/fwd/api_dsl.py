@@ -384,13 +384,19 @@ class SdpaFwdDsl(APIBase):
         dim must be innermost-contiguous (elem stride 1) and the token/head
         strides multiples of 8 elements (which also keeps every per-sequence
         ragged base 16-byte aligned). Whole-token gaps always qualify for
-        supported head dims; sub-token gaps only in multiples of 8 elements."""
+        supported head dims; sub-token gaps only in multiples of 8 elements.
+        The strides must also COVER the tensor (head >= d, token >= h*head):
+        an overlapping declaration would alias distinct O rows onto the same
+        storage (a write race) and is outside the kernels' addressing
+        contract."""
         for desc in (self.q_desc, self.k_desc, self.v_desc, self.o_desc):
             (ts, hs, es), _ = self._thd_declared(desc)
+            h, d = desc.shape[1], desc.shape[3]
             self._not_implemented_error_if(
-                es != 1 or ts % 8 != 0 or hs % 8 != 0,
+                es != 1 or ts % 8 != 0 or hs % 8 != 0 or hs < d or ts < h * hs,
                 f"{desc.name} THD strides {tuple(desc.stride)} are not TMA-expressible "
-                f"(head dim must be innermost-contiguous and token/head strides 16-byte multiples)",
+                f"(head dim must be innermost-contiguous, token/head strides 16-byte "
+                f"multiples, and non-overlapping: head stride >= {d}, token stride >= heads * head stride)",
             )
 
     def _thd_check_strides_packed(self) -> None:
@@ -405,9 +411,25 @@ class SdpaFwdDsl(APIBase):
             )
 
     def _thd_view(self, buf: torch.Tensor, desc: TensorDesc, tokens: int) -> torch.Tensor:
-        """The declared-stride ``(1, T, H, D)`` view over a THD buffer's storage."""
+        """The declared-stride ``(1, T, H, D)`` view over a THD buffer's storage.
+
+        Validates the RUNTIME buffer against the declaration before
+        reinterpreting its storage: the dtype/device must match what was
+        declared, and the base address must be 16-byte aligned — the kernels
+        are compiled with ``assumed_align=16`` and TMA requires it of the
+        descriptor's global address, so a misaligned slice would fault (or
+        worse) instead of erroring here. ``as_strided`` itself rejects views
+        that extend past the underlying storage."""
         h, d = desc.shape[1], desc.shape[3]
         (ts, hs, es), _ = self._thd_declared(desc)
+        self._value_error_if(
+            buf.dtype != desc.dtype or buf.device != desc.device,
+            f"{desc.name}: runtime buffer ({buf.dtype}, {buf.device}) does not match its declaration ({desc.dtype}, {desc.device})",
+        )
+        self._value_error_if(
+            buf.data_ptr() % 16 != 0,
+            f"{desc.name}: runtime buffer base address must be 16-byte aligned (TMA global-address rule); got data_ptr() % 16 == {buf.data_ptr() % 16}",
+        )
         return buf.as_strided((1, tokens, h, d), (max(tokens, 1) * ts, ts, hs, es), buf.storage_offset())
 
     def _amax_slot(self, tensor, name: str, device: torch.device) -> torch.Tensor:
