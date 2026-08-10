@@ -21,7 +21,7 @@ def build_o_descs_kernel(
     seq_kv_lens_t: cute.Tensor,
     n_qh: cutlass.Int32,
     n_batch: cutlass.Int32,
-    d_v: cutlass.Int32,
+    o_row_stride: cutlass.Int32,
 ) -> None:
     if nvvm.elect_sync():
         o_ptr = o_tensor.iterator.raw_ptr()
@@ -29,7 +29,10 @@ def build_o_descs_kernel(
         src_words = Pointer(base_o_desc.get_ptr(), dtype=cutlass.Int64)
         cu = cutlass.make_array_view(seq_kv_lens_t)
         cuq0 = n_batch
-        row_elems = n_qh * d_v
+        # The DECLARED per-token element stride of packed O (n_qh * d_v when
+        # compact; wider for e.g. an interleaved-buffer view) — the per-batch
+        # descriptor bases must step in real rows.
+        row_elems = o_row_stride
         for b in cutlass.range(0, n_batch, 1, unroll=1):
             dptr = desc_base + b * cutlass.Int32(TENSOR_MAP_QWORDS)
             for i in cutlass.range_constexpr(TENSOR_MAP_QWORDS):

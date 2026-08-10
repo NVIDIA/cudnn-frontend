@@ -360,6 +360,56 @@ class SdpaFwdDsl(APIBase):
         scratch = torch.empty_like(view, memory_format=torch.contiguous_format)
         return view, True, scratch
 
+    # -- THD declared-stride binding ------------------------------------------
+    # A THD tensor may DECLARE a wider token stride than the packed h*d — e.g.
+    # a K/V view of a kv-interleaved [T, 2, H, D] buffer (token stride 2*h*d),
+    # the layout torch.nn.attention.varlen users produce by slicing a fused KV
+    # projection. The f16 kernels address declared strides NATIVELY
+    # (layout-driven offset math + TMA-encoded strides); declarations the
+    # hardware cannot express are REJECTED in check_support — no
+    # normalization-copy fallback (AGENTS.md Hard Rule 2) — so the router
+    # picks an engine that honors them instead.
+
+    @staticmethod
+    def _thd_declared(desc: TensorDesc):
+        """(token, head, elem) strides a THD tensor declares, and whether they
+        are the packed contract (h*d, d, 1)."""
+        h, d = desc.shape[1], desc.shape[3]
+        st = (int(desc.stride[2]), int(desc.stride[1]), int(desc.stride[3]))
+        return st, st == (h * d, d, 1)
+
+    def _thd_check_strides_native(self) -> None:
+        """Reject THD stride declarations the f16 kernels cannot address
+        natively: TMA's 16-byte global-stride rule at 2 bytes/elem — the head
+        dim must be innermost-contiguous (elem stride 1) and the token/head
+        strides multiples of 8 elements (which also keeps every per-sequence
+        ragged base 16-byte aligned). Whole-token gaps always qualify for
+        supported head dims; sub-token gaps only in multiples of 8 elements."""
+        for desc in (self.q_desc, self.k_desc, self.v_desc, self.o_desc):
+            (ts, hs, es), _ = self._thd_declared(desc)
+            self._not_implemented_error_if(
+                es != 1 or ts % 8 != 0 or hs % 8 != 0,
+                f"{desc.name} THD strides {tuple(desc.stride)} are not TMA-expressible "
+                f"(head dim must be innermost-contiguous and token/head strides 16-byte multiples)",
+            )
+
+    def _thd_check_strides_packed(self) -> None:
+        """FP8 THD serves only the packed contract for now (its kernel and
+        harness are not audited for declared strides) — decline anything else
+        rather than adapt (AGENTS.md Hard Rule 2)."""
+        for desc in (self.q_desc, self.k_desc, self.v_desc, self.o_desc):
+            _, packed = self._thd_declared(desc)
+            self._not_implemented_error_if(
+                not packed,
+                f"{desc.name}: non-packed THD strides {tuple(desc.stride)} are not supported by the FP8 path yet",
+            )
+
+    def _thd_view(self, buf: torch.Tensor, desc: TensorDesc, tokens: int) -> torch.Tensor:
+        """The declared-stride ``(1, T, H, D)`` view over a THD buffer's storage."""
+        h, d = desc.shape[1], desc.shape[3]
+        (ts, hs, es), _ = self._thd_declared(desc)
+        return buf.as_strided((1, tokens, h, d), (max(tokens, 1) * ts, ts, hs, es), buf.storage_offset())
+
     def _amax_slot(self, tensor, name: str, device: torch.device) -> torch.Tensor:
         """The caller's 1-element amax storage, or a cached dummy.
 
@@ -569,6 +619,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                     f"non-broadcast, non-overlapping strides (any B/H/S order, padded "
                     f"strides allowed); got stride {_stride} shape {_shape}",
                 )
+
+        if self.thd:
+            self._thd_check_strides_native()
 
         b, h_qo, s_qo, d_qk = self.q_desc.shape
         _, h_kv, s_kv, _ = self.k_desc.shape
@@ -1117,11 +1170,12 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         cga_tile_m = int(self._k_mod.CGA_TILE_M)
         units = qh * sum((l + cga_tile_m - 1) // cga_tile_m for l in slq_host)
 
-        def _packed(buf, t, h, d):
-            return buf.as_strided((1, t, h, d), (t * h * d, h * d, d, 1), buf.storage_offset())
-
-        Q = _packed(q_buf, t_q, qh, d_qk)
-        O = _packed(o_buf, t_q, qh, d_v)
+        # Declared-stride (1, T, H, D) views, addressed NATIVELY by the kernel
+        # (the Q/K/V/O TMA descriptors are built from the tensor views, and
+        # the THD O-descriptor builder steps by O's declared seq stride);
+        # check_support rejected any declaration TMA cannot express.
+        Q = self._thd_view(q_buf, self.q_desc, t_q)
+        O = self._thd_view(o_buf, self.o_desc, t_q)
         if t_kv == 0:
             # Every query row is dead (all-zero seq_kv_lens): served by the
             # KERNEL's own dead-row path (total_sum <= 0 -> O := 0 and
@@ -1138,8 +1192,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             K = q_buf.as_strided((1, 1, kh, d_qk), (kh * d_qk, kh * d_qk, d_qk, 1), q_buf.storage_offset())
             V = o_buf.as_strided((1, 1, kh, d_v), (kh * d_v, kh * d_v, d_v, 1), o_buf.storage_offset())
         else:
-            K = _packed(k_buf, t_kv, kh, d_qk)
-            V = _packed(v_buf, t_kv, kh, d_v)
+            K = self._thd_view(k_buf, self.k_desc, t_kv)
+            V = self._thd_view(v_buf, self.v_desc, t_kv)
         # LSE binding: the caller's ragged Stats buffer in its declared layout
         # when a Stats output exists; None otherwise — the kernel compiles the
         # LSE store out (has_lse=False), so no dummy buffer exists at all.
@@ -1167,6 +1221,13 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             has_lse=lse is not None,
             lse_head_major=lse is not None and self.thd_stats_head_major,
             lse_head_stride=(self.thd_stats_head_stride if (lse is not None and self.thd_stats_head_major) else 0),
+            # Declared strides of the bound views (cache-key): compact views
+            # reproduce the packed specialization; native non-packed views
+            # compile their strides into the kernel's addressing.
+            q_stride=tuple(Q.stride()),
+            k_stride=tuple(K.stride()),
+            v_stride=tuple(V.stride()),
+            o_stride=tuple(O.stride()),
         )
         fn(Q, K, V, O, LSE, sinks_t, meta, o_desc, (b, qh, kh, t_q, t_kv, 0), cutlass.Float32(scale_softmax_log2), cutlass.Int32(units), stream=current_stream)
         self._logger.debug("execute (THD) completed")
@@ -1653,6 +1714,11 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                     f"non-broadcast, non-overlapping strides (any B/H/S order, padded "
                     f"strides allowed); got stride {desc.stride} shape {desc.shape}",
                 )
+        if self.thd:
+            if self._pertensor:
+                self._thd_check_strides_packed()
+            else:
+                self._thd_check_strides_native()
 
         b, h_q, s_q, d_q = self.q_desc.shape
         _, h_kv, s_kv, _ = self.k_desc.shape
@@ -2138,7 +2204,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                 amax_o_buf.div_(max(so, 1e-30))
         self._logger.debug("execute (SM120 FP8 per-tensor) completed")
 
-    def _thd_pack(self, q_buf, k_buf, v_buf, o_buf, seq_q_lens, seq_kv_lens, workspace, label):
+    def _thd_pack(self, q_buf, k_buf, v_buf, o_buf, seq_q_lens, seq_kv_lens, workspace, label, declared_views=False):
         """Shared THD (ragged) packing: cu_seqlens metadata + ``(1, T, H, D)`` views.
 
         Serves the same fully-packed contract as the SM100 THD path
@@ -2183,6 +2249,13 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         def _packed(buf, tokens, heads, d):
             return buf.as_strided((1, tokens, heads, d), (tokens * heads * d, heads * d, d, 1), buf.storage_offset())
 
+        def _view(buf, desc, tokens, heads, d):
+            # declared_views: the f16 kernel addresses declared strides
+            # natively (check_support rejected inexpressible ones); the FP8
+            # path keeps the packed contract (check_support declined
+            # anything else).
+            return self._thd_view(buf, desc, tokens) if declared_views else _packed(buf, tokens, heads, d)
+
         if t_kv == 0:
             # Every query row is dead (all-zero seq_kv_lens): served by the
             # KERNEL's own dead-row path (row_sum <= 0 -> O := 0 and
@@ -2199,18 +2272,18 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             K = q_buf.as_strided((1, 1, kh, d_qk), (kh * d_qk, kh * d_qk, d_qk, 1), q_buf.storage_offset())
             V = o_buf.as_strided((1, 1, kh, d_v), (kh * d_v, kh * d_v, d_v, 1), o_buf.storage_offset())
         else:
-            K = _packed(k_buf, t_kv, kh, d_qk)
-            V = _packed(v_buf, t_kv, kh, d_v)
+            K = _view(k_buf, self.k_desc, t_kv, kh, d_qk)
+            V = _view(v_buf, self.v_desc, t_kv, kh, d_v)
 
         return SimpleNamespace(
             meta=meta,
             t_q=t_q,
             t_kv=t_kv,
             max_sq=max_sq,
-            Q=_packed(q_buf, t_q, qh, d_qk),
+            Q=_view(q_buf, self.q_desc, t_q, qh, d_qk),
             K=K,
             V=V,
-            O=_packed(o_buf, t_q, qh, d_v),
+            O=_view(o_buf, self.o_desc, t_q, qh, d_v),
             seq_q_dummy=self._dummy("seq_q_lens", dev, lambda: torch.zeros(b, dtype=torch.int32, device=dev)),
         )
 
@@ -2225,7 +2298,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         within each head row.
         """
 
-        pack = self._thd_pack(q_buf, k_buf, v_buf, o_buf, seq_q_lens, seq_kv_lens, workspace, "SdpaFwdDslSm120 (THD)")
+        pack = self._thd_pack(q_buf, k_buf, v_buf, o_buf, seq_q_lens, seq_kv_lens, workspace, "SdpaFwdDslSm120 (THD)", declared_views=True)
         if pack is None:
             return
 
@@ -2263,6 +2336,14 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             has_lse=self.lse_desc is not None,
             lse_head_major=self.thd_stats_head_major,
             lse_head_stride=self.thd_stats_head_stride,
+            # Declared strides of the bound views (cache-key): compact views
+            # reproduce the packed specialization; native non-packed views
+            # compile their strides into the Q/O offset math and K/V TMA
+            # descriptors.
+            q_stride=tuple(pack.Q.stride()),
+            k_stride=tuple(pack.K.stride()),
+            v_stride=tuple(pack.V.stride()),
+            o_stride=tuple(pack.O.stride()),
         )
         fn(
             pack.Q,
