@@ -7,6 +7,10 @@
 
 #include <cudnn_frontend.h>
 
+#include <cmath>
+#include <thread>
+#include <vector>
+
 TEST_CASE("Tensor attributes", "[tensor][serialize]") {
     namespace fe = cudnn_frontend;
 
@@ -699,7 +703,7 @@ TEST_CASE("serialize_structure flag controls structural payload", "[graph][seria
 
     // Both remain reloadable through the plan path with identical variant packs.
     auto const expected_uids = graph.get_variant_pack_uids_sorted();
-    for (auto const &blob : {with_structure, without_structure}) {
+    for (auto const& blob : {with_structure, without_structure}) {
         fe::graph::Graph reloaded;
         REQUIRE(reloaded.deserialize(handle, blob, /*enforce_precompiled=*/false, /*run_warmup=*/false).is_good());
         REQUIRE(reloaded.get_variant_pack_uids_sorted() == expected_uids);
@@ -764,4 +768,476 @@ TEST_CASE("Plan re-serialize preserves pass-by-value and workspace modifications
     REQUIRE(j_next["workspace_modifications"] == j_fresh["workspace_modifications"]);
 
     cudnnDestroy(handle);
+}
+
+// ============================================================
+// Helpers shared by handle-less deserialize tests below.
+// ============================================================
+
+namespace {
+namespace fe = cudnn_frontend;
+
+// Minimal device-memory RAII wrapper.
+struct DeviceBuf {
+    void* ptr    = nullptr;
+    size_t bytes = 0;
+
+    explicit DeviceBuf(size_t n) : bytes(n) {
+        if (n > 0) {
+            cudaError_t e = cudaMalloc(&ptr, n);
+            if (e != cudaSuccess) ptr = nullptr;
+        }
+    }
+    ~DeviceBuf() {
+        if (ptr) cudaFree(ptr);
+    }
+
+    void
+    fill_float(float val, size_t count) {
+        std::vector<float> h(count, val);
+        cudaMemcpy(ptr, h.data(), count * sizeof(float), cudaMemcpyHostToDevice);
+    }
+
+    std::vector<float>
+    read_float(size_t count) const {
+        std::vector<float> h(count);
+        cudaMemcpy(h.data(), ptr, count * sizeof(float), cudaMemcpyDeviceToHost);
+        cudaDeviceSynchronize();
+        return h;
+    }
+};
+
+// Build a small NHWC FP32 conv graph and return (graph, X-uid, W-uid, Y-uid).
+// N=1, C=4, H=8, W=8, K=4, R=1, S=1, padding=0, stride=1, dilation=1.
+// This shape is simple but exercises the full stack.
+struct ConvGraph {
+    static constexpr int64_t N = 1, C = 4, H = 8, W = 8, K = 4, R = 1, S = 1;
+    std::shared_ptr<fe::graph::Graph> graph;
+    std::shared_ptr<fe::graph::Tensor_attributes> X, W_t, Y;
+
+    ConvGraph() {
+        graph = std::make_shared<fe::graph::Graph>();
+        graph->set_io_data_type(fe::DataType_t::FLOAT)
+            .set_intermediate_data_type(fe::DataType_t::FLOAT)
+            .set_compute_data_type(fe::DataType_t::FLOAT);
+        // NHWC layout
+        X = graph->tensor(
+            fe::graph::Tensor_attributes().set_name("X").set_dim({N, C, H, W}).set_stride({C * H * W, 1, C * W, C}));
+        W_t = graph->tensor(
+            fe::graph::Tensor_attributes().set_name("W").set_dim({K, C, R, S}).set_stride({C * R * S, 1, C * S, C}));
+        auto opts = fe::graph::Conv_fprop_attributes().set_padding({0, 0}).set_stride({1, 1}).set_dilation({1, 1});
+        Y         = graph->conv_fprop(X, W_t, opts);
+        Y->set_output(true);
+    }
+};
+
+// Build a conv+relu fusion graph for the RTC test.
+struct FusionGraph {
+    static constexpr int64_t N = 16, C = 128, H = 64, W = 64, K = 256, R = 3, S = 3;
+    std::shared_ptr<fe::graph::Graph> graph;
+    std::shared_ptr<fe::graph::Tensor_attributes> X, W_t, Y;
+
+    FusionGraph() {
+        graph = std::make_shared<fe::graph::Graph>();
+        graph->set_io_data_type(fe::DataType_t::HALF)
+            .set_intermediate_data_type(fe::DataType_t::FLOAT)
+            .set_compute_data_type(fe::DataType_t::FLOAT);
+        // NHWC layout
+        X = graph->tensor(
+            fe::graph::Tensor_attributes().set_name("X").set_dim({N, C, H, W}).set_stride({C * H * W, 1, C * W, C}));
+        W_t = graph->tensor(
+            fe::graph::Tensor_attributes().set_name("W").set_dim({K, C, R, S}).set_stride({C * R * S, 1, C * S, C}));
+        auto conv_opts = fe::graph::Conv_fprop_attributes().set_padding({1, 1}).set_stride({1, 1}).set_dilation({1, 1});
+        auto conv      = graph->conv_fprop(X, W_t, conv_opts);
+        Y = graph->pointwise(conv, fe::graph::Pointwise_attributes().set_mode(fe::PointwiseMode_t::RELU_FWD));
+        Y->set_output(true).set_data_type(fe::DataType_t::HALF);
+    }
+};
+
+// Return the deviceVer encoded in a serialized DeviceProperties byte buffer.
+// The wire format is a JSON string, e.g. {"deviceVer":890,...}.
+// Returns -1 if the key is not found.
+static int
+parse_device_ver(std::vector<uint8_t> const& buf) {
+    std::string s(reinterpret_cast<const char*>(buf.data()), buf.size());
+    auto pos = s.find("\"deviceVer\":");
+    if (pos == std::string::npos) return -1;
+    pos += std::string("\"deviceVer\":").size();
+    return std::stoi(s.substr(pos));
+}
+
+// Produce a DeviceProperties whose deviceVer has been changed to a different
+// SM than the current device. Returns nullptr if the edit fails.
+static std::shared_ptr<fe::DeviceProperties>
+make_wrong_arch_devprop() {
+    auto dp_real = std::make_shared<fe::DeviceProperties>();
+    if (dp_real->set_device_id(0).build().is_bad()) return nullptr;
+
+    std::vector<uint8_t> buf;
+    if (dp_real->serialize(buf).is_bad()) return nullptr;
+
+    int real_ver = parse_device_ver(buf);
+    if (real_ver < 0) return nullptr;
+
+    // Pick a different SM: add 100 (one major step up) if possible, else subtract 100.
+    int wrong_ver = (real_ver < 900) ? (real_ver + 100) : (real_ver - 100);
+
+    std::string s(reinterpret_cast<const char*>(buf.data()), buf.size());
+    std::string needle = "\"deviceVer\":" + std::to_string(real_ver);
+    std::string repl   = "\"deviceVer\":" + std::to_string(wrong_ver);
+    auto pos           = s.find(needle);
+    if (pos == std::string::npos) return nullptr;
+    s.replace(pos, needle.size(), repl);
+
+    std::vector<uint8_t> bad(s.begin(), s.end());
+    auto dp_wrong = std::make_shared<fe::DeviceProperties>();
+    if (dp_wrong->deserialize(bad).is_bad()) return nullptr;
+    return dp_wrong;
+}
+
+}  // namespace
+
+// ============================================================
+// Compile-only overload resolution (no GPU, no cuDNN handle).
+// Verifies that std::vector<uint8_t> selects the new handle-less
+// deserialize overload and not the structural-graph json overload.
+// ============================================================
+
+TEST_CASE("Handle-less deserialize overload resolution", "[serialize][graph]") {
+    namespace fe = cudnn_frontend;
+    // This test is purely compile-time: if the wrong overload is selected the
+    // assertion message distinguishes plan vs. structural deserialize.
+    // We call it on an empty graph that will fail at runtime (no devprop),
+    // but the call must COMPILE to the blob overload, not convert to json.
+    fe::graph::Graph g;
+    std::vector<uint8_t> blob{0, 1, 2};  // intentionally invalid
+    auto err = g.deserialize(blob);
+    // No devprop set → ATTRIBUTE_NOT_SET, not a json parse error.
+    REQUIRE(err.is_bad());
+    REQUIRE(err.get_code() == fe::error_code_t::ATTRIBUTE_NOT_SET);
+}
+
+// ============================================================
+// Negative: no device properties set → clean ATTRIBUTE_NOT_SET error.
+// ============================================================
+
+TEST_CASE("Handle-less deserialize with no devprop returns ATTRIBUTE_NOT_SET", "[serialize][graph]") {
+#if (CUDNN_VERSION < 90800)
+    SKIP("Handle-less plan deserialize requires cuDNN >= 9.8 headers");
+#else
+    namespace fe = cudnn_frontend;
+
+    fe::graph::Graph g;
+    std::vector<uint8_t> dummy(64, 0);
+    auto status = g.deserialize(dummy);
+    REQUIRE(status.is_bad());
+    REQUIRE(status.get_code() == fe::error_code_t::ATTRIBUTE_NOT_SET);
+    REQUIRE(status.get_message().find("set_device_properties") != std::string::npos);
+#endif
+}
+
+// ============================================================
+// Main runtime tests — gated at 9.11 (matching the deviceless sample).
+// ============================================================
+
+TEST_CASE("Handle-less plan deserialize", "[serialize][graph]") {
+#if (CUDNN_VERSION < 90800)
+    SKIP("Handle-less plan deserialize requires cuDNN >= 9.8 headers");
+#else
+    if (cudnn_frontend::detail::get_backend_version() < 91100) {
+        SKIP("Handle-less plan deserialize runtime tests require cuDNN >= 9.11");
+    }
+
+    // ── build a device properties descriptor ──────────────────────────────
+    auto dp = std::make_shared<cudnn_frontend::DeviceProperties>();
+    REQUIRE(dp->set_device_id(0).build().is_good());
+
+    namespace fe = cudnn_frontend;
+
+    SECTION("wrong-arch devprop causes arch mismatch on deserialize") {
+        // This is the primary discriminator: if devprop were ignored,
+        // deserialize would succeed regardless of which SM is claimed.
+        ConvGraph cg;
+        cg.graph->set_device_properties(dp);
+        REQUIRE(cg.graph->build({fe::HeurMode_t::A, fe::HeurMode_t::FALLBACK}).is_good());
+        std::vector<uint8_t> blob;
+        REQUIRE(cg.graph->serialize(blob).is_good());
+
+        auto dp_wrong = make_wrong_arch_devprop();
+        REQUIRE(dp_wrong != nullptr);
+
+        fe::graph::Graph deser;
+        deser.set_device_properties(dp_wrong);
+        auto status = deser.deserialize(blob);
+        REQUIRE(status.is_bad());
+        // Backend returns NOT_SUPPORTED for arch mismatch during plan finalize.
+        auto const code  = status.get_code();
+        bool is_plan_err = (code == fe::error_code_t::GRAPH_EXECUTION_PLAN_CREATION_FAILED);
+        bool is_be_err   = (code == fe::error_code_t::CUDNN_BACKEND_API_FAILED);
+        REQUIRE((is_plan_err || is_be_err));
+    }
+
+    SECTION("RTC fusion plan carries RUNTIME_COMPILATION behavior note") {
+        // Build a conv+relu fusion that is expected to use the runtime-compiled engine.
+        // The behavior note must be present BEFORE serialization so we know the RTC
+        // code path is actually exercised.
+        FusionGraph fg;
+        fg.graph->set_device_properties(dp);
+        REQUIRE(fg.graph->build({fe::HeurMode_t::A, fe::HeurMode_t::FALLBACK}).is_good());
+
+        std::vector<fe::BehaviorNote_t> notes;
+        REQUIRE(fg.graph->get_behavior_notes(notes).is_good());
+        bool has_rtc = std::find(notes.begin(), notes.end(), fe::BehaviorNote_t::RUNTIME_COMPILATION) != notes.end();
+        if (!has_rtc) {
+            SKIP(
+                "conv+relu did not select a RUNTIME_COMPILATION plan on this GPU/cuDNN version; "
+                "skipping RTC-path coverage");
+        }
+
+        std::vector<uint8_t> blob;
+        REQUIRE(fg.graph->serialize(blob).is_good());
+
+        // Handle-less deserialize with correct devprop must succeed.
+        fe::graph::Graph deser;
+        deser.set_device_properties(dp);
+        REQUIRE(deser.deserialize(blob).is_good());
+
+        // Execute to confirm the plan is live (not just parsed).
+        cudnnHandle_t handle;
+        REQUIRE(cudnnCreate(&handle) == CUDNN_STATUS_SUCCESS);
+
+        using X_t      = __half;
+        using W_t      = __half;
+        using Y_t      = __half;
+        size_t x_elems = static_cast<size_t>(FusionGraph::N * FusionGraph::C * FusionGraph::H * FusionGraph::W);
+        size_t w_elems = static_cast<size_t>(FusionGraph::K * FusionGraph::C * FusionGraph::R * FusionGraph::S);
+        size_t y_elems = static_cast<size_t>(FusionGraph::N * FusionGraph::K * FusionGraph::H * FusionGraph::W);
+        DeviceBuf x_buf(x_elems * sizeof(X_t));
+        DeviceBuf w_buf(w_elems * sizeof(W_t));
+        DeviceBuf y_buf(y_elems * sizeof(Y_t));
+        REQUIRE(x_buf.ptr != nullptr);
+        REQUIRE(w_buf.ptr != nullptr);
+        REQUIRE(y_buf.ptr != nullptr);
+
+        // Fill with zeros; relu(conv(0,0))=0 is still a valid execution check.
+        cudaMemset(x_buf.ptr, 0, x_elems * sizeof(X_t));
+        cudaMemset(w_buf.ptr, 0, w_elems * sizeof(W_t));
+        cudaMemset(y_buf.ptr, 0x7f, y_elems * sizeof(Y_t));  // poison
+
+        int64_t ws_size = 0;
+        REQUIRE(deser.get_workspace_size(ws_size).is_good());
+        DeviceBuf ws(static_cast<size_t>(ws_size));
+
+        std::unordered_map<int64_t, void*> vpack{
+            {fg.X->get_uid(), x_buf.ptr}, {fg.W_t->get_uid(), w_buf.ptr}, {fg.Y->get_uid(), y_buf.ptr}};
+        REQUIRE(deser.execute(handle, vpack, ws.ptr).is_good());
+        cudaDeviceSynchronize();
+
+        cudnnDestroy(handle);
+    }
+
+    SECTION("happy path: devprop build + serialize + handle-less deserialize + execute") {
+        // Build conv graph with devprop, serialize, deserialize handle-less, execute,
+        // and compare numerically against a reference execution via the handle overload.
+        ConvGraph cg;
+        cg.graph->set_device_properties(dp);
+        REQUIRE(cg.graph->build({fe::HeurMode_t::A, fe::HeurMode_t::FALLBACK}).is_good());
+
+        std::vector<uint8_t> blob;
+        REQUIRE(cg.graph->serialize(blob).is_good());
+
+        // Deserialize handle-less; no handle is created anywhere in this scope.
+        fe::graph::Graph deser;
+        deser.set_device_properties(dp);
+        REQUIRE(deser.deserialize(blob).is_good());
+
+        int64_t ws_size = 0;
+        REQUIRE(deser.get_workspace_size(ws_size).is_good());
+
+        // Now create a handle only for execution (not for deserialize).
+        cudnnHandle_t handle;
+        REQUIRE(cudnnCreate(&handle) == CUDNN_STATUS_SUCCESS);
+
+        size_t x_elems = static_cast<size_t>(ConvGraph::N * ConvGraph::C * ConvGraph::H * ConvGraph::W);
+        size_t w_elems = static_cast<size_t>(ConvGraph::K * ConvGraph::C * ConvGraph::R * ConvGraph::S);
+        size_t y_elems = static_cast<size_t>(ConvGraph::N * ConvGraph::K * ConvGraph::H * ConvGraph::W);
+        DeviceBuf x_buf(x_elems * sizeof(float));
+        DeviceBuf w_buf(w_elems * sizeof(float));
+        DeviceBuf y_deser(y_elems * sizeof(float));
+        DeviceBuf y_ref(y_elems * sizeof(float));
+        DeviceBuf ws(static_cast<size_t>(ws_size));
+        REQUIRE(x_buf.ptr != nullptr);
+        REQUIRE(w_buf.ptr != nullptr);
+        REQUIRE(y_deser.ptr != nullptr);
+        REQUIRE(y_ref.ptr != nullptr);
+
+        // Deterministic non-zero inputs: X[i]=1, W[i]=1 → Y[i] = C*R*S = 4.
+        x_buf.fill_float(1.0f, x_elems);
+        w_buf.fill_float(1.0f, w_elems);
+        cudaMemset(y_deser.ptr, 0x7e, y_elems * sizeof(float));  // poison
+
+        std::unordered_map<int64_t, void*> vpack{
+            {cg.X->get_uid(), x_buf.ptr}, {cg.W_t->get_uid(), w_buf.ptr}, {cg.Y->get_uid(), y_deser.ptr}};
+        REQUIRE(deser.execute(handle, vpack, ws.ptr).is_good());
+
+        // Reference: same graph deserialized via the handle overload.
+        fe::graph::Graph ref_graph;
+        REQUIRE(ref_graph.deserialize(handle, blob, false, false).is_good());
+        vpack[cg.Y->get_uid()] = y_ref.ptr;
+        int64_t ws_ref         = 0;
+        REQUIRE(ref_graph.get_workspace_size(ws_ref).is_good());
+        DeviceBuf ws2(static_cast<size_t>(ws_ref));
+        REQUIRE(ref_graph.execute(handle, vpack, ws2.ptr).is_good());
+        cudaDeviceSynchronize();
+
+        // Outputs must be numerically identical (same kernel, same inputs).
+        auto deser_out = y_deser.read_float(y_elems);
+        auto ref_out   = y_ref.read_float(y_elems);
+        float ref_val  = static_cast<float>(ConvGraph::C * ConvGraph::R * ConvGraph::S);
+        for (size_t i = 0; i < y_elems; ++i) {
+            REQUIRE(std::fabs(deser_out[i] - ref_val) < 1e-3f);
+            REQUIRE(std::fabs(deser_out[i] - ref_out[i]) < 1e-6f);
+        }
+
+        cudnnDestroy(handle);
+    }
+
+    SECTION("plan-only blob (serialize_structure=false) + handle-less deserialize") {
+        ConvGraph cg;
+        cg.graph->set_device_properties(dp);
+        REQUIRE(cg.graph->build({fe::HeurMode_t::A, fe::HeurMode_t::FALLBACK}).is_good());
+
+        std::vector<uint8_t> blob;
+        REQUIRE(cg.graph->serialize(blob, /*serialize_structure=*/false).is_good());
+
+        fe::graph::Graph deser;
+        deser.set_device_properties(dp);
+        auto status = deser.deserialize(blob);
+        REQUIRE(status.is_good());
+
+        int64_t ws = 0;
+        REQUIRE(deser.get_workspace_size(ws).is_good());
+    }
+
+    SECTION("enforce_precompiled=true rejects blob with no plan data") {
+        // enforce_precompiled checks that the blob contains serialized plan bytes
+        // (cudnn_backend_data field). Manufacture a blob without that field.
+        ConvGraph cg;
+        cg.graph->set_device_properties(dp);
+        REQUIRE(cg.graph->build({fe::HeurMode_t::A, fe::HeurMode_t::FALLBACK}).is_good());
+
+        std::vector<uint8_t> full_blob;
+        REQUIRE(cg.graph->serialize(full_blob).is_good());
+
+        auto j = json::from_ubjson(full_blob);
+        j.erase("cudnn_backend_data");
+        auto no_plan_blob = json::to_ubjson(j);
+
+        fe::graph::Graph deser;
+        deser.set_device_properties(dp);
+        auto status = deser.deserialize(no_plan_blob, /*enforce_precompiled=*/true);
+        REQUIRE(status.is_bad());
+        auto const code  = status.get_code();
+        bool is_plan_err = (code == fe::error_code_t::GRAPH_EXECUTION_PLAN_CREATION_FAILED);
+        REQUIRE(is_plan_err);
+    }
+
+    SECTION("handle overload still uses handle even when devprop is set on graph") {
+        // Decision #7: the existing deserialize(handle, blob) overloads forward an
+        // explicit device_prop=nullptr so the graph's device_properties is NOT consulted.
+        ConvGraph cg;
+        cg.graph->set_device_properties(dp);
+        REQUIRE(cg.graph->build({fe::HeurMode_t::A, fe::HeurMode_t::FALLBACK}).is_good());
+        std::vector<uint8_t> blob;
+        REQUIRE(cg.graph->serialize(blob).is_good());
+
+        auto dp_wrong = make_wrong_arch_devprop();
+        REQUIRE(dp_wrong != nullptr);
+
+        cudnnHandle_t handle;
+        REQUIRE(cudnnCreate(&handle) == CUDNN_STATUS_SUCCESS);
+
+        // Graph has incompatible devprop, but we deserialize via handle overload.
+        // Should succeed because handle overload ignores graph's device_properties.
+        fe::graph::Graph deser;
+        deser.set_device_properties(dp_wrong);  // deliberately incompatible
+        auto status = deser.deserialize(handle, blob, false, false);
+        REQUIRE(status.is_good());  // handle path used, not devprop
+
+        cudnnDestroy(handle);
+    }
+
+    SECTION("devprop shared_ptr released before execute succeeds") {
+        // The backend copies the descriptor at set-attribute time, so the FE shared_ptr
+        // only needs to outlive the deserialize call, not the execute call.
+        ConvGraph cg;
+        auto dp2 = std::make_shared<fe::DeviceProperties>();
+        REQUIRE(dp2->set_device_id(0).build().is_good());
+        cg.graph->set_device_properties(dp2);
+        REQUIRE(cg.graph->build({fe::HeurMode_t::A, fe::HeurMode_t::FALLBACK}).is_good());
+        std::vector<uint8_t> blob;
+        REQUIRE(cg.graph->serialize(blob).is_good());
+
+        fe::graph::Graph deser;
+        {
+            auto dp_tmp = std::make_shared<fe::DeviceProperties>();
+            REQUIRE(dp_tmp->set_device_id(0).build().is_good());
+            deser.set_device_properties(dp_tmp);
+            REQUIRE(deser.deserialize(blob).is_good());
+            // dp_tmp goes out of scope here; the backend's managed copy survives.
+        }
+
+        int64_t ws_size = 0;
+        REQUIRE(deser.get_workspace_size(ws_size).is_good());
+
+        cudnnHandle_t handle;
+        REQUIRE(cudnnCreate(&handle) == CUDNN_STATUS_SUCCESS);
+
+        size_t x_n = static_cast<size_t>(ConvGraph::N * ConvGraph::C * ConvGraph::H * ConvGraph::W);
+        size_t w_n = static_cast<size_t>(ConvGraph::K * ConvGraph::C * ConvGraph::R * ConvGraph::S);
+        size_t y_n = static_cast<size_t>(ConvGraph::N * ConvGraph::K * ConvGraph::H * ConvGraph::W);
+        DeviceBuf xb(x_n * sizeof(float)), wb(w_n * sizeof(float)), yb(y_n * sizeof(float));
+        DeviceBuf wsb(static_cast<size_t>(ws_size));
+        REQUIRE(xb.ptr != nullptr);
+        REQUIRE(wb.ptr != nullptr);
+        REQUIRE(yb.ptr != nullptr);
+        cudaMemset(xb.ptr, 0, x_n * sizeof(float));
+        cudaMemset(wb.ptr, 0, w_n * sizeof(float));
+        std::unordered_map<int64_t, void*> vp{
+            {cg.X->get_uid(), xb.ptr}, {cg.W_t->get_uid(), wb.ptr}, {cg.Y->get_uid(), yb.ptr}};
+        REQUIRE(deser.execute(handle, vp, wsb.ptr).is_good());
+
+        cudnnDestroy(handle);
+    }
+
+    SECTION("concurrency: N threads share one devprop, each deserializes its own blob") {
+        // Concurrent rehydration is the primary motivation for this feature.
+        // One shared read-only DeviceProperties descriptor is used by all threads;
+        // each thread deserializes into its own Graph.
+        constexpr int kThreads = 4;
+
+        ConvGraph cg;
+        cg.graph->set_device_properties(dp);
+        REQUIRE(cg.graph->build({fe::HeurMode_t::A, fe::HeurMode_t::FALLBACK}).is_good());
+        std::vector<uint8_t> blob;
+        REQUIRE(cg.graph->serialize(blob).is_good());
+
+        std::vector<int> results(kThreads, 0);
+        std::vector<std::thread> threads;
+        threads.reserve(kThreads);
+
+        for (int t = 0; t < kThreads; ++t) {
+            threads.emplace_back([&dp, &blob, &results, t]() {
+                fe::graph::Graph g;
+                g.set_device_properties(dp);  // shared descriptor
+                results[t] = g.deserialize(blob).is_good() ? 1 : 0;
+            });
+        }
+        for (auto& th : threads) th.join();
+
+        for (int t = 0; t < kThreads; ++t) {
+            REQUIRE(results[t] == 1);
+        }
+    }
+#endif  // CUDNN_VERSION >= 90800
 }

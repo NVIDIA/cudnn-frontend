@@ -57,14 +57,24 @@ TEST_CASE("Deviceless compilation", "[conv][graph][serialization]") {
     REQUIRE(graph->serialize(data_graph).is_good());
 
     //////////////////////////////////////////////////////////////
-    // 3. deserialize and execute the plan
+    // 3. Handle-less deserialize: use the device properties instead of a handle.
+    //    This is the primary new capability — no cuDNN handle is created until
+    //    execution. One shared read-only DeviceProperties descriptor can serve
+    //    many concurrent deserializes on a thread pool.
+    //
+    //    Note: plan deserialization avoids creating a cuDNN handle;
+    //    RTC rehydration may still require a compatible GPU / CUDA environment;
+    //    execution requires both a device and a cuDNN handle.
     //////////////////////////////////////////////////////////////
-    // Create a unique_ptr for the cuDNN handle
+    auto graph_handleless = std::make_shared<fe::graph::Graph>();
+    graph_handleless->set_device_properties(device_prop_deserialized);
+    REQUIRE(graph_handleless->deserialize(data_graph).is_good());
+
+    //////////////////////////////////////////////////////////////
+    // 4. Handle created here, only for execution.
+    //////////////////////////////////////////////////////////////
     auto handle_ptr = create_cudnn_handle();
     auto handle     = *handle_ptr;
-
-    auto graph_deserialized = std::make_shared<fe::graph::Graph>();
-    REQUIRE(graph_deserialized->deserialize(handle, data_graph).is_good());
 
     Surface<half> x_tensor(n * c * h * w);
     Surface<half> w_tensor(k * c * r * s);
@@ -74,10 +84,23 @@ TEST_CASE("Deviceless compilation", "[conv][graph][serialization]") {
         {X->get_uid(), x_tensor.devPtr}, {W->get_uid(), w_tensor.devPtr}, {Y->get_uid(), y_tensor.devPtr}};
 
     int64_t workspace_size = 0;
-    REQUIRE(graph_deserialized->get_workspace_size(workspace_size).is_good());
+    REQUIRE(graph_handleless->get_workspace_size(workspace_size).is_good());
     Surface<int8_t> workspace(workspace_size);
 
-    std::cout << *graph_deserialized << std::endl;
+    std::cout << *graph_handleless << std::endl;
 
-    REQUIRE(graph_deserialized->execute(handle, variant_pack, workspace.devPtr).is_good());
+    REQUIRE(graph_handleless->execute(handle, variant_pack, workspace.devPtr).is_good());
+
+    //////////////////////////////////////////////////////////////
+    // 5. (Regression) Handle-based deserialize still works unchanged.
+    //////////////////////////////////////////////////////////////
+    auto graph_handle_based = std::make_shared<fe::graph::Graph>();
+    REQUIRE(graph_handle_based->deserialize(handle, data_graph).is_good());
+
+    Surface<half> y_tensor2(n * k * h * w);
+    variant_pack[Y->get_uid()] = y_tensor2.devPtr;
+    int64_t ws2                = 0;
+    REQUIRE(graph_handle_based->get_workspace_size(ws2).is_good());
+    Surface<int8_t> workspace2(ws2);
+    REQUIRE(graph_handle_based->execute(handle, variant_pack, workspace2.devPtr).is_good());
 }
