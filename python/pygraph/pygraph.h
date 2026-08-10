@@ -76,13 +76,16 @@ class PyGraph {
             .set_intermediate_data_type(intermediate_data_type)
             .set_io_data_type(io_data_type);
 
-        // If device_properties is set, use it (consider it is an AoT compilation test).
         if (device_properties != nullptr) {
             this->device_properties = device_properties;
             graph->set_device_properties(device_properties);
-        } else if (handle_.has_value()) {
+        }
+        // Store explicit handle independently of device_properties so that a caller
+        // who supplies both (devprop for deserialization, handle for execution) does
+        // not silently lose the handle.
+        if (handle_.has_value()) {
             handle = static_cast<cudnnHandle_t>((void*)(handle_.value()));
-        } else {
+        } else if (device_properties == nullptr) {
             detail::create_handle(&handle);
             is_handle_owner = true;
         }

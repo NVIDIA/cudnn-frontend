@@ -641,6 +641,9 @@ class Execution_plan_list {
 
     error_t
     build_plans(std::shared_ptr<const DeviceProperties> device_properties, std::string const& json) {
+        RETURN_CUDNN_FRONTEND_ERROR_IF(device_properties == nullptr,
+                                       error_code_t::ATTRIBUTE_NOT_SET,
+                                       "build_plans: device_properties must not be null");
         execution_plans.resize(1);
         auto const& fe_status =
             detail::create_cudnn_execution_plan(execution_plans[0], json, std::move(device_properties));
