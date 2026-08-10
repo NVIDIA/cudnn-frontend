@@ -4,6 +4,10 @@
 
 **Legacy contiguous-only API note:** This page documents the older contiguous-only SwiGLU API. For new integrations, prefer the unified [Grouped GEMM + GLU](grouped_gemm_glu.md) API, which covers dense and discrete weight layouts.
 
+## JAX support
+
+JAX arrays are **not supported**: this kernel consumes its scale-factor tensors as MMA-permuted strided cute tensor arguments in every configuration, a layout with no row-major (JAX) equivalent. JAX inputs raise a clear `ValueError` at the entry points. The API is otherwise type-erased and torch-lazy.
+
 ## Overview
 
 **Grouped GEMM + SwiGLU fusion**: A contiguous grouped block-scaled GEMM fused with a SwiGLU epilogue on NVIDIA Blackwell GPUs (SM100+), designed for MoE (Mixture of Experts) workloads. Implemented with CUTLASS/CUTE.

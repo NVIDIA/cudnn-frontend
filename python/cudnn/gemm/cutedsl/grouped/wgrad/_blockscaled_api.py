@@ -14,7 +14,8 @@ from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
 from cudnn.api_base import APIBase, TensorDesc, ceil_div, is_power_of_2
 from cudnn.datatypes import _convert_to_cutlass_data_type
-from cudnn.gemm.cutedsl.discrete_grouped.discrete_kernel_utils import _require_pointer_tensor
+from cudnn.gemm.cutedsl.grouped.unfused._bf16_api import _validate_pointer_tensor
+from cudnn.tensor_adapter import is_torch_tensor
 
 from .moe_blockscaled_grouped_gemm_wgrad import BlockScaledMoEGroupedGemmWgradKernel
 from ..moe_utils import MoEWeightMode, WGradInputOrder
@@ -65,10 +66,20 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
         accumulate_on_output: bool = False,
         input_order: Union[WGradInputOrder, str] = WGradInputOrder.Tensor2D,
     ):
+        if sample_a is not None and not is_torch_tensor(sample_a):
+            raise ValueError(
+                "The block-scaled wgrad backend supports torch tensors only: its B operand "
+                "(and fp4-packed A/B operands) require K-major (token-innermost) layouts that "
+                "are not expressible as row-major JAX arrays"
+            )
         import torch
 
-        if acc_dtype is None:
-            acc_dtype = torch.float32
+        from cudnn.tensor_adapter import framework_dtype
+
+        # This backend is torch-internal: normalize loose dtype parameters (which the
+        # type-erased wrapper/facade may pass as cutlass or numpy dtypes) to torch dtypes.
+        acc_dtype = framework_dtype(acc_dtype, "torch") if acc_dtype is not None else torch.float32
+        wgrad_dtype = framework_dtype(wgrad_dtype, "torch") if wgrad_dtype is not None else None
         super().__init__()
         self._warn_experimental_api()
         self.input_order = WGradInputOrder(input_order)
@@ -575,7 +586,7 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
                 expert_stride_bytes = wgrad_tensor.stride(0) * wgrad_tensor.element_size()
                 ptrs = [wgrad_tensor.data_ptr() + i * expert_stride_bytes for i in range(wgrad_tensor.shape[0])]
                 wgrad_ptrs = torch.tensor(ptrs, dtype=torch.int64, device=wgrad_tensor.device)
-        _require_pointer_tensor(wgrad_ptrs, "wgrad_ptrs", self.expert_cnt)
+        _validate_pointer_tensor(wgrad_ptrs, "wgrad_ptrs", self.expert_cnt)
         self._compiled_kernel(
             a_tensor,
             b_tensor,

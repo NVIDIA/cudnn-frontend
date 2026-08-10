@@ -17,7 +17,11 @@ class GroupedGemmBackend(str, Enum):
 
 @contextmanager
 def _torch_stream_context(current_stream: Optional[cuda.CUstream], device: torch.device) -> Iterator[None]:
-    """Run PyTorch work on the CUDA stream used for the kernel launch."""
+    """Run PyTorch work on the CUDA stream used for the kernel launch.
+
+    torch-only: callers must guard this context so non-torch (e.g. JAX) code paths
+    never enter it -- it imports torch and interprets ``device`` as a torch device.
+    """
     import torch
 
     if current_stream is None:
@@ -44,9 +48,15 @@ def select_grouped_gemm_backend(
     scale_controls,
     block_scaled_dtype_pairs,
 ):
-    import torch
+    # Compare in canonical (cutlass) dtype space so torch/jax/numpy/str dtypes all
+    # resolve; dtypes with no cutlass mapping fall through to the unsupported-pair error.
+    import cutlass
 
-    bf16_operands = (a_dtype == torch.bfloat16, b_dtype == torch.bfloat16)
+    from cudnn.datatypes import _convert_to_cutlass_data_type_or_none
+
+    a_dtype_canonical = _convert_to_cutlass_data_type_or_none(a_dtype)
+    b_dtype_canonical = _convert_to_cutlass_data_type_or_none(b_dtype)
+    bf16_operands = (a_dtype_canonical is cutlass.BFloat16, b_dtype_canonical is cutlass.BFloat16)
     if any(bf16_operands):
         if not all(bf16_operands):
             raise ValueError(f"{operation}: mixed dtype families: a_dtype={a_dtype}, " f"b_dtype={b_dtype}")
@@ -54,7 +64,10 @@ def select_grouped_gemm_backend(
         if forbidden:
             raise ValueError(f"{operation}: BF16 forbids scale control {forbidden[0]}")
         return GroupedGemmBackend.BF16
-    if (a_dtype, b_dtype) in block_scaled_dtype_pairs:
+    canonical_pairs = {
+        (_convert_to_cutlass_data_type_or_none(pair_a), _convert_to_cutlass_data_type_or_none(pair_b)) for pair_a, pair_b in block_scaled_dtype_pairs
+    }
+    if (a_dtype_canonical, b_dtype_canonical) in canonical_pairs:
         return GroupedGemmBackend.BLOCK_SCALED
     raise ValueError(f"{operation}: unsupported dtype pair a_dtype={a_dtype}, " f"b_dtype={b_dtype}")
 

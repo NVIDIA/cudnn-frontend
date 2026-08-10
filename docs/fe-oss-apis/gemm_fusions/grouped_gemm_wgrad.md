@@ -11,6 +11,10 @@ Install the optional CuTe DSL dependencies before importing either API:
 pip install nvidia-cudnn-frontend[cutedsl]
 ```
 
+## JAX support
+
+Supports **JAX arrays** on the BF16 backend: A k-major and B n-major C-contiguous arrays, dense `(experts, m, n)` C-contiguous output or discrete output pointers (packed uint8 / int64 with jax x64 mode). The block-scaled backend's layouts are not expressible as JAX arrays and raise a clear error. Eager only, on the CUDA legacy default stream: `block_until_ready` inputs, synchronize before reading outputs.
+
 ## Operation
 
 For expert `e`, let `begin = 0` for the first expert and

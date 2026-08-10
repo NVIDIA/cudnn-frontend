@@ -2,6 +2,10 @@
 
 **This is an experimental API and subject to change.**
 
+## JAX support
+
+Supports **JAX arrays** on the BF16 backend in discrete weight mode (dswiglu and dgeglu), including `generate_dbias=True` and caller-provided zero-initialized `dprob`. Dense `b_tensor` and the block-scaled backend (MMA-interleaved scale-factor layouts) are not expressible as JAX arrays and raise clear errors. Eager only, on the CUDA legacy default stream: `block_until_ready` inputs, synchronize before reading outputs; keep weight arrays alive until the kernel completes.
+
 ## Overview
 
 **Unified Grouped GEMM + dGLU fusion**: one public class and wrapper select a

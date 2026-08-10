@@ -2,6 +2,12 @@
 
 **This is an experimental API and subject to change.**
 
+## JAX support
+
+Supports **JAX arrays** on both input paths (BF16 and MXFP8) with `w_out_in=True` (the `[in, out]` weight layout reaches the kernel through a transposed strided view, which has no row-major JAX equivalent and raises a clear error). The E8M0 scale inputs stay `uint8` as with torch. Outputs are allocated as C-contiguous `jnp` arrays. Eager only, on the CUDA legacy default stream: `block_until_ready` inputs, synchronize before reading outputs.
+
+The API is compiled with `--enable-tvm-ffi`: raw framework tensors go straight to the compiled kernel (no per-call `from_dlpack` conversion), cutting per-launch CPU overhead roughly in half for torch callers as well.
+
 ## Overview
 
 **Fused projection GEMM + per-head YARN RoPE + dual-direction MXFP8 quantize**: a persistent dense GEMM on NVIDIA Blackwell GPUs (SM100+) that projects activations, applies the Megatron MLA-YARN rotary embedding to each attention head's trailing rotary features, and MXFP8 (E4M3, block=32) quantizes the result in **both** the rowwise (D-direction) and columnwise (S-direction) layouts. Implemented with CUTLASS/CUTE.

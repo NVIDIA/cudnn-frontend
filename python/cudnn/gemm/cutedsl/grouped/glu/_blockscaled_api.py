@@ -20,7 +20,7 @@ Discrete mode
 from __future__ import annotations
 
 from .moe_blockscaled_grouped_gemm_glu_bias import BlockScaledMoEGroupedGemmGluBiasKernel
-from ..backend_utils import _torch_stream_context, rubin_single_group_offsets_kwarg
+from ..backend_utils import rubin_single_group_offsets_kwarg
 from ..moe_utils import MoEWeightMode
 from cuda.bindings import driver as cuda
 import os
@@ -162,6 +162,13 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
         :param b_major: Major dimension for B tensor, one of "k" or "n"
         :param use_dynamic_sched: Enable dynamic tile scheduling for load balancing
         """
+        from cudnn.tensor_adapter import detect_framework
+
+        if sample_a is not None and detect_framework(sample_a) != "torch":
+            raise ValueError(
+                "GroupedGemmGluBlockScaledAPI supports torch tensors only: the block-scaled "
+                "scale-factor tensors use an MMA-interleaved layout that is not expressible as JAX arrays"
+            )
         import torch
 
         if acc_dtype is None:

@@ -2,6 +2,10 @@
 
 **This is an experimental API and subject to change.**
 
+## JAX support
+
+Supports **JAX arrays** on the BF16 backend in discrete weight mode (swiglu and geglu): `b_ptrs` as a packed little-endian uint8 pointer array (8 bytes per pointer; int64 accepted with jax x64 mode), outputs allocated as n-major C-contiguous `jnp` arrays. Dense `b_tensor` (expert-outermost strides), column-major `bias_tensor`, and the block-scaled backend (MMA-interleaved scale-factor layouts) are not expressible as JAX arrays and raise clear errors. Eager only, on the CUDA legacy default stream: `block_until_ready` inputs, synchronize before reading outputs; keep weight arrays alive until the kernel completes.
+
 ## Overview
 
 **Unified Grouped GEMM + GLU fusion**: one public class and wrapper select a

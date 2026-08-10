@@ -2,6 +2,10 @@
 
 **This is an experimental API and subject to change.**
 
+## JAX support
+
+Supports **JAX arrays** in the discrete (b_ptrs) FP8 configurations: pointer arrays as int64 (jax x64 mode) or packed uint8 (8 bytes per pointer), scale-factor tensors in the physical C-contiguous atom shape `(L, MN', K', 32, 4, 4)` (the kernel rebuilds SF layouts from the GEMM shapes and reads only the base pointer), outputs allocated as C-contiguous `jnp` arrays. Dense weight mode and packed-fp4 A/B are not expressible as JAX arrays and raise clear errors. Eager only, on the CUDA legacy default stream: `block_until_ready` inputs, synchronize before reading outputs; keep weight arrays alive until the kernel completes.
+
 ## Overview
 
 **Grouped GEMM + dsReLU backward fusion**: A grouped block-scaled GEMM fused with a probability-gradient backward epilogue on NVIDIA Blackwell GPUs (SM100+), designed for MoE-style workloads. The API supports dense contiguous weights and discrete per-expert weight allocations. Groups are contiguous in the `M` dimension and described by `padded_offsets`.
