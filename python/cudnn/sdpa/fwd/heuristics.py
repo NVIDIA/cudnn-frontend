@@ -43,7 +43,7 @@ from cudnn.sdpa.fwd.engines import ENGINE_SPECS, Capabilities, SdpaFwdKnobs, mis
 _MEASURED_BEHIND: frozenset = frozenset()
 
 # Cells whose (tile_m, tile_n) choice _sm120_tiles makes.
-_TILE_RULE_CELLS = frozenset({"sdpa_fwd_prefill_sm120"})
+_TILE_RULE_CELLS = frozenset({"sdpa_fwd_prefill_sm120", "sdpa_fwd_prefill_sm120_fp8"})
 
 
 def _sm120_tiles(caps: Capabilities, facts) -> Tuple[int, int]:
@@ -52,13 +52,22 @@ def _sm120_tiles(caps: Capabilities, facts) -> Tuple[int, int]:
     ``tile_m=64`` when the grid cannot fill the machine AND each CTA has enough
     KV tiles to amortize the extra Q-tile loop; a causal mask counts as a
     halved grid because it halves the work per CTA. ``tile_n`` is the largest
-    that fits SMEM: 128 is fastest, but a wide head (D>=208) has no room for it.
+    that fits SMEM: 128 is fastest, but a wide head has no room for it (D>=208
+    in half, further out in FP8 -- its KV tile is a byte per element).
 
     Fit is a KERNEL property, so ``config_sm120.smem_bytes`` is the one
     implementation and the adapter's check calls it too. So is the tuning: an
     earlier revision of this template staged P through SMEM and wanted
-    ``tile_n=64``. Re-measure when the kernel changes -- the sweep behind these
-    thresholds (regret 1.009 geomean, 1.054 worst) is in PR #528.
+    ``tile_n=64``. Re-measure when a kernel changes -- the sweeps are in PR #528
+    (f16: regret 1.009 geomean, 1.054 worst) and PR #509 (fp8: 1.0046 geomean,
+    1.039 worst over 30 seeded cells).
+
+    Read those worst cases with care. Most cells here are within the ~1%
+    run-to-run floor of each other, so a single sweep's worst cell is often
+    noise: an unseeded run of the SAME code reported 1.155 at B1xH16xS2048
+    causal, which the seeded repeat shows as a tie. What survives repetition is
+    that the misses cluster on CAUSAL shapes, where the triangular mask shifts
+    the per-CTA balance in a way `grid` alone does not capture.
     """
     sm_count = facts.device_sm_count or 0
     grid = -(-facts.s_q // 128) * facts.h_q * facts.b
@@ -67,7 +76,10 @@ def _sm120_tiles(caps: Capabilities, facts) -> Tuple[int, int]:
     kv_tiles = -(-facts.s_kv // 128)
     fine = sm_count > 0 and (grid * 2 <= sm_count or (grid * 2 <= 3 * sm_count and kv_tiles >= 12))
     tile_m = 64 if fine else 128
-    fits = [n for n in sorted(caps.tile_ns, reverse=True) if smem_bytes(facts.d_qk, facts.d_v, tile_m, n) <= SMEM_CAPACITY_BYTES]
+    # FP8 stages a byte per KV element but still writes O in half, so the two
+    # SMEM terms size differently -- see config_sm120.smem_bytes.
+    qkv_item, o_item = (1, 2) if facts.is_fp8 else (2, 2)
+    fits = [n for n in sorted(caps.tile_ns, reverse=True) if smem_bytes(facts.d_qk, facts.d_v, tile_m, n, qkv_item, o_item) <= SMEM_CAPACITY_BYTES]
     return tile_m, (fits[0] if fits else min(caps.tile_ns))
 
 

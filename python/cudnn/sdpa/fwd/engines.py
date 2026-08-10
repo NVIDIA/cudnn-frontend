@@ -115,6 +115,9 @@ class Capabilities:
     dtypes: frozenset = frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16})  # cudnn.data_type, see graph_analyzer
     is_mxfp8: bool = False  # block-scale MXFP8 engine (FP8 in + per-32-block E8M0 SF)
     is_fp8: bool = False  # per-tensor FP8 engine (FP8 in + scalar descales)
+    # O dtype domain, declared only by the quantized rows: elsewhere O must
+    # equal Q, which facts.uniform_dtype already enforces.
+    out_dtypes: frozenset = frozenset()
 
     # optional features a graph may request
     bias: bool = False
@@ -264,6 +267,8 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         return f"serves D_QK in {sorted(capabilities.d_qk)}/D_V in {sorted(capabilities.d_v)}; graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
     if facts.dtype not in capabilities.dtypes:
         return f"dtype {facts.dtype} not in {sorted(str(d) for d in capabilities.dtypes)}"
+    if (capabilities.is_fp8 or capabilities.is_mxfp8) and facts.dtype_o not in capabilities.out_dtypes:
+        return f"O dtype {facts.dtype_o} not in {sorted(str(d) for d in capabilities.out_dtypes)}"
     if (facts.is_mxfp8, facts.is_fp8) != (capabilities.is_mxfp8, capabilities.is_fp8):
         quant = "block-scale MXFP8 (sdpa_mxfp8)" if capabilities.is_mxfp8 else "per-tensor FP8 (sdpa_fp8)" if capabilities.is_fp8 else "half (sdpa)"
         return f"this engine serves only {quant} graphs"
@@ -406,6 +411,7 @@ def _sm100_mxfp8_spec(d: int) -> EngineSpec:
             d_qk=frozenset({d}),
             d_v=frozenset({d}),
             dtypes=frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
+            out_dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
             is_mxfp8=True,
             causal=True,
             bottom_right=True,
@@ -442,6 +448,7 @@ def _sm100_fp8_spec(d: int) -> EngineSpec:
             d_qk=frozenset({d}),
             d_v=frozenset({d}),
             dtypes=frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
+            out_dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
             is_fp8=True,
             causal=True,
             bottom_right=True,
@@ -640,6 +647,8 @@ def lower_dsl_prefill(
         descale_v=facts.descale_v_t,
         scale_o=facts.scale_o_t,
         amax_s=facts.amax_s_t,
+        descale_s=facts.descale_s_t,
+        scale_s=facts.scale_s_t,
     )
 
     def _ir_view(buf, ir_t):
@@ -699,6 +708,20 @@ def lower_dsl_prefill(
         dv_buf = resolved.get(id(binding.descale_v)) if binding.descale_v is not None else None
         so_buf = resolved.get(id(binding.scale_o)) if binding.scale_o is not None else None
         amax_s_buf = resolved.get(id(binding.amax_s)) if binding.amax_s is not None else None
+        ds_buf = resolved.get(id(binding.descale_s)) if binding.descale_s is not None else None
+        ss_buf = resolved.get(id(binding.scale_s)) if binding.scale_s is not None else None
+        # The quantized DENSE lowerings drop the per-batch Q trim, which is
+        # harmless only while every seq_len_q equals S_q -- a shorter one writes
+        # O and a finite LSE past the valid length. Checked here because the
+        # lengths are device values; this path already reads the descale
+        # scalars back. THD is exempt: ragged lengths ARE shorter than S_q by
+        # construction, and the packed layout gives each sequence its own
+        # extent, so nothing is written past a valid length.
+        if (facts.is_mxfp8 or facts.is_fp8) and not facts.thd and seq_q_buf is not None and not seq_q_lens_present:
+            if int(seq_q_buf.min().item()) < int(facts.s_q):
+                raise NotImplementedError(
+                    f"per-tensor FP8/MXFP8: per-batch seq_len_q shorter than S_q={facts.s_q} is not plumbed; got min {int(seq_q_buf.min().item())}"
+                )
         execute_kwargs = dict(
             q_tensor=q_buf,
             k_tensor=k_buf,
@@ -724,6 +747,8 @@ def lower_dsl_prefill(
                 descale_v=dv_buf,
                 scale_o=so_buf,
                 amax_s=amax_s_buf,
+                descale_s=ds_buf,
+                scale_s=ss_buf,
             )
         if api_scratch_bytes:
             execute_kwargs["workspace"] = carver.remaining()
@@ -771,6 +796,60 @@ def engine_name(
 # flavor A/B testing), only the ranking prefers the tightest.
 # Engine IDS do NOT follow this order — they are pinned per name in
 # engine._ID_OFFSETS and never move.
+def _sm120_fp8_spec() -> EngineSpec:
+    """SM120 per-tensor FP8 engine (E4M3 in + scalar descales, FP16 out).
+
+    P quantization follows the backend's FORT ordering: Amax_S on the unscaled
+    softmax result, then Scale_S, then the e4m3 cast, with Descale_S folded into
+    o_scale_fused. (cuDNN's Scale_S/Descale_S scale the softmax OUTPUT, not the
+    scores.) The SM100 FP8 row deliberately does NOT do this: its lazy-rescale
+    skip leaves P bounded by 2^RESCALE_THRESHOLD rather than 1, so e4m3's range
+    above 1.0 is already spent and a caller Scale_S would saturate it. It
+    honours a reciprocal pair analytically instead and declines anything else.
+
+    Same mma.sync architecture as the f16 SM120 cell with the MMA lowered to
+    m16n8k32 e4m3; ``descale_q*descale_k`` folds into the softmax scale and
+    ``descale_v*scale_o`` into an epilogue scalar, so the kernel adds only the
+    Amax_S/Amax_O atomics over the f16 sibling. E4M3 only (no E5M2 tag in the
+    kernel yet), FP16 O only, exact d128 (no zero-padding envelope on the
+    8-bit fragment path), and no sink (Amax_S semantics with a sink column are
+    undefined here). THD (ragged) is served with token-major Stats; head-major
+    ragged Stats stays f16-only (the fp8 kernel carries no such specialization).
+    """
+
+    return EngineSpec(
+        name="sdpa_fwd_prefill_sm120_fp8",
+        capabilities=Capabilities(
+            sm_lo=_BLACKWELL_GEFORCE[0],
+            sm_hi=_BLACKWELL_GEFORCE[1],
+            phase="prefill",
+            d_qk=frozenset({128}),
+            d_v=frozenset({128}),
+            dtypes=frozenset({cudnn.data_type.FP8_E4M3}),
+            out_dtypes=frozenset({cudnn.data_type.HALF}),
+            is_fp8=True,
+            causal=True,
+            bottom_right=True,
+            bottom_right_with_swa=True,
+            bottom_right_padded_seq_q=True,
+            swa=True,
+            padded=True,
+            stats=True,
+            lse_optional=True,
+            thd=True,
+            # Same caveat as the SM100 fp8 row: no SEQ_Q_LENS epilogue trim,
+            # but fp8 graphs cannot carry seq_len_q here (lower_dsl_prefill
+            # forces seq_q_lens_present=False for the fp8 family).
+            padded_stats=True,
+            sched_policies=frozenset({SCHED_NATURAL}),
+            tile_ms=frozenset({64, 128}),
+            tile_ns=frozenset({64, 128}),
+            cgas=frozenset({1}),
+        ),
+        lower=partial(lower_dsl_prefill, api_type=_SM120),
+    )
+
+
 ENGINE_SPECS = (
     _sm100_spec(128),
     _sm100_spec(192, d_v=128),
@@ -779,6 +858,7 @@ ENGINE_SPECS = (
     _sm100_mxfp8_spec(128),
     _sm100_fp8_spec(128),
     _sm120_spec(),
+    _sm120_fp8_spec(),
 )
 
 __all__ = ["Capabilities", "EngineSpec", "ENGINE_SPECS", "SdpaFwdKnobs", "analyze_for", "build", "engine_name", "mismatch"]

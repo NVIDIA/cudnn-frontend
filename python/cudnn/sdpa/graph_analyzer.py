@@ -267,6 +267,11 @@ class SdpaGraphFacts:
     descale_k_t: Any = None
     descale_v_t: Any = None
     scale_o_t: Any = None
+    # cuDNN's Scale_S/Descale_S: they quantize P, the softmax OUTPUT. SM120
+    # applies them; SM100 converts P unscaled (exact for a reciprocal pair) and
+    # declines a non-reciprocal one (api_dsl._require_reciprocal_s_scales).
+    descale_s_t: Any = None
+    scale_s_t: Any = None
     amax_s_t: Any = None
 
 
@@ -587,6 +592,8 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         descale_k_t=(dsc_k if is_fp8 else None),
         descale_v_t=(dsc_v if is_fp8 else None),
         scale_o_t=(rec.get("scale_o") if is_fp8 else None),
+        descale_s_t=(rec.get("descale_s") if is_fp8 else None),
+        scale_s_t=(rec.get("scale_s") if is_fp8 else None),
         amax_s_t=(rec.get("amax_s") if is_fp8 else None),
     )
 
@@ -630,6 +637,8 @@ class SdpaBinding:
     descale_k: Any = None
     descale_v: Any = None
     scale_o: Any = None
+    descale_s: Any = None
+    scale_s: Any = None
     amax_s: Any = None
     # SM80 feature operands + backward ports.
     bias: Any = None
@@ -664,6 +673,8 @@ class SdpaBinding:
                 self.descale_v,
                 self.scale_o,
                 self.amax_s,
+                self.descale_s,
+                self.scale_s,
                 self.bias,
                 self.block_mask,
                 self.score_max,
