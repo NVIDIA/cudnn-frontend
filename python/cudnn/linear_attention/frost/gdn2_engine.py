@@ -95,7 +95,7 @@ class Gdn2FrostEngine(BaseEngine):
         try:
             import cutlass.experimental.primitives  # noqa: F401 — availability probe: ImportError = decline
         except ImportError as exc:
-            raise NotImplementedError(f"Gdn2FrostEngine requires the Cutlass DSL with cutlass.experimental.primitives: {exc}") from exc
+            raise NotImplementedError(f"Gdn2FrostEngine: 'import cutlass.experimental.primitives' failed ({exc})") from exc
         for port in ("q", "k", "v", "g", "beta", "w", "cu_seqlens"):
             if port not in node.inputs:
                 raise NotImplementedError(f"Gdn2FrostEngine: GDN2 node '{node.name}' is missing input '{port}'")

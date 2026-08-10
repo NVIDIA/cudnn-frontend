@@ -1794,9 +1794,10 @@ class CompiledFusedGemm:
     # clamped); drives the runtime output/aux alignment requirements. None →
     # fall back to the chain-derived width.
     vec_bytes_epi: "int | None" = None
-    # Opt in to stream-aware dispatch: frost/dispatch.py resolves the stream
-    # from the execute-time cuDNN handle and forwards it as `stream=`. Engines
-    # that do not carry the param stay on the default stream (see dispatch).
+    # Opt in to stream-aware dispatch: the engine resolves the stream from the
+    # execute-time cuDNN handle into ExecutionContext.stream (cudnn/engines/base.py)
+    # and forwards it as `stream=`. Engines that do not carry the param stay on
+    # the default stream.
     accepts_stream: ClassVar[bool] = True
 
     def __call__(self, variant_pack, stream=None):

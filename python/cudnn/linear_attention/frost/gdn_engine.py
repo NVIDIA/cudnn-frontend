@@ -117,7 +117,7 @@ class GdnFrostEngine(BaseEngine):
         try:
             import cutlass.experimental.primitives  # noqa: F401 — availability probe: ImportError = decline
         except ImportError as exc:
-            raise NotImplementedError(f"GdnFrostEngine requires the Cutlass DSL with cutlass.experimental.primitives: {exc}") from exc
+            raise NotImplementedError(f"GdnFrostEngine: 'import cutlass.experimental.primitives' failed ({exc})") from exc
         if node.params.get("use_qk_l2norm", False):
             raise NotImplementedError("GdnFrostEngine: use_qk_l2norm is not supported (the kernel takes q/k as given)")
         ports = ("q", "k", "v", "g", "beta", "cu_seqlens")

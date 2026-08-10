@@ -98,7 +98,7 @@ class KdaFrostEngine(BaseEngine):
         try:
             import cutlass.experimental.primitives  # noqa: F401 — availability probe: ImportError = decline
         except ImportError as exc:
-            raise NotImplementedError(f"KdaFrostEngine requires the Cutlass DSL with cutlass.experimental.primitives: {exc}") from exc
+            raise NotImplementedError(f"KdaFrostEngine: 'import cutlass.experimental.primitives' failed ({exc})") from exc
         for port in ("q", "k", "v", "g", "beta", "cu_seqlens"):
             if port not in node.inputs:
                 raise NotImplementedError(f"KdaFrostEngine: KDA node '{node.name}' is missing input '{port}'")

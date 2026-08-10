@@ -4,7 +4,7 @@
 """Per-execute scratch carved out of the CALLER's workspace — shared by every
 FROST engine.
 
-The workspace contract (see ``cudnn/frost/dispatch.py``) is that an executor
+The workspace contract (see ``cudnn/engines/base.py``) is that an executor
 never allocates: it reports the scratch it needs as ``workspace_bytes`` and
 carves that scratch out of the buffer ``execute()`` hands it, so the pointers
 are caller-owned and stable across executes — which is what makes a plan safe
