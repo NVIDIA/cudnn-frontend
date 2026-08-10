@@ -162,9 +162,10 @@ def _medium_bwd_primitive(grad_out: Tensor, x: Tensor, weight: Tensor) -> List[T
     x = x.contiguous()
     weight = weight.contiguous()
     grad_out = grad_out.contiguous()
+    # The cuDNN medium FFT backward kernel fully overwrites both output
+    # buffers; dweight accumulation happens in kernel-local state.
     grad_x = torch.empty_like(x)
-    # The medium cuhyena kernel accumulates channel/batch contributions into dw.
-    grad_weight = torch.zeros_like(weight)
+    grad_weight = torch.empty_like(weight)
 
     import cudnn
 
@@ -264,6 +265,7 @@ def _long_bwd_primitive(grad_out: Tensor, x: Tensor, weight: Tensor, reserve_spa
 
     grad_out = grad_out.contiguous()
     reserve_space = reserve_space.contiguous()
+    # The cuDNN long FFT backward stages fully overwrite both output buffers.
     grad_x = torch.empty_like(x)
     grad_weight = torch.empty_like(weight)
 
