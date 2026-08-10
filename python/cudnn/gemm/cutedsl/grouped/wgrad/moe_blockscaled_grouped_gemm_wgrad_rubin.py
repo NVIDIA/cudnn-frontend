@@ -141,10 +141,21 @@ class BlockScaledMoEGroupedGemmWgradRubinKernel(BlockScaledMoEGroupedGemmWgradKe
         self.mma_tiler = (*self.mma_inst_shape_mn, mma_tiler_k)
         self.mma_tiler_sfb = (*self.mma_inst_shape_mn_sfb, mma_tiler_k)
 
-        use_sf_window = self.sf_vec_size == 16 and self.sf_dtype is cutlass.Float8E4M3FN and self.mma_tiler[1] == 256 and self.mma_tiler[2] == 512
-        self.sf_window_k = self.instruction_k * 2 if use_sf_window else self.mma_tiler[2]
-        self.num_mma_instructions_per_sf_window = self.sf_window_k // self.instruction_k
-        self.num_sf_windows_per_ab_stage = self.mma_tiler[2] // self.sf_window_k
+        use_sf_window = (
+            self.sf_vec_size == 16
+            and self.sf_dtype in (cutlass.Float8E4M3FN, cutlass.FloatNV8E5M3FNU)
+            and self.mma_tiler[1] == 256
+            and self.mma_tiler[2] == 512
+        )
+        self.sf_window_k = (
+            self.instruction_k * 2 if use_sf_window else self.mma_tiler[2]
+        )
+        self.num_mma_instructions_per_sf_window = (
+            self.sf_window_k // self.instruction_k
+        )
+        self.num_sf_windows_per_ab_stage = (
+            self.mma_tiler[2] // self.sf_window_k
+        )
 
         tiled_mma = self._create_tiled_mma()
         tiled_mma_sfb = self._create_tiled_mma_sfb()
