@@ -12,7 +12,7 @@ schedule. Consumes the forward activations (`Q/K/V/O`), the loss gradient
 
 Two integration surfaces are provided:
 
-* a standalone wrapper (documented below), `cudnn.sdpa.bwd.sdpa_bwd_wrapper_dsl_sm120`, and
+* a standalone wrapper (documented below), `cudnn.sdpa_bwd_wrapper_dsl_sm120`, and
 * a FROST engine (`sdpa_bwd_sm120`, see `cudnn.sdpa.bwd.engines`) that serves
   single-node `sdpa_backward()` graphs built with `cudnn.pygraph` when
   selected from the ranked plan list (`graph.plans` /
@@ -30,7 +30,7 @@ and an SM120 or SM121 device.
 ## API Usage
 
 ```python
-from cudnn.sdpa.bwd import sdpa_bwd_wrapper_dsl_sm120
+from cudnn.sdpa import sdpa_bwd_wrapper_dsl_sm120
 
 grads = sdpa_bwd_wrapper_dsl_sm120(
     q_tensor=q, k_tensor=k, v_tensor=v,
