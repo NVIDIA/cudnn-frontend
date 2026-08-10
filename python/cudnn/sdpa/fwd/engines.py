@@ -109,8 +109,8 @@ class Capabilities:
     # global-stride rule at 2 bytes/elem) via TMA zero-padding — the kernel's
     # descriptors carry the ACTUAL extents, so padded contraction columns load
     # as exact zeros (S/softmax unchanged) and O stores past d_v are
-    # OOB-clipped. False = only the native dims above are eligible (FP8/MXFP8;
-    # SM120, whose lowering has no zero-padding path wired yet).
+    # OOB-clipped. False = only the native dims above are eligible (FP8/MXFP8,
+    # whose SF plumbing is not audited for zero-padding).
     d_envelope: bool = False
     dtypes: frozenset = frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16})  # cudnn.data_type, see graph_analyzer
     is_mxfp8: bool = False  # block-scale MXFP8 engine (FP8 in + per-32-block E8M0 SF)
@@ -308,6 +308,8 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         if fact and not cap:
             return f"graph uses {label}, which this engine does not support"
 
+    if facts.right_band_widening and facts.right_bound is not None and facts.right_bound < 0:
+        return f"negative diagonal_band_right_bound ({facts.right_bound}) is not supported"
     if facts.bottom_right:
         if not (facts.causal or facts.right_band_widening):
             return "bottom-right alignment requires a causal upper bound (plain or right-widened)"
@@ -470,26 +472,36 @@ def _sm100_fp8_spec(d: int) -> EngineSpec:
 
 
 def _sm120_spec() -> EngineSpec:
+    from cudnn.sdpa.fwd.config_sm120 import SUPPORTED_HEAD_TILES
+
     return EngineSpec(
         name="sdpa_fwd_prefill_sm120",
         capabilities=Capabilities(
             sm_lo=_BLACKWELL_GEFORCE[0],
             sm_hi=_BLACKWELL_GEFORCE[1],
             phase="prefill",
-            d_qk=frozenset(range(16, 257, 16)),
-            d_v=frozenset(range(16, 257, 16)),
+            d_qk=frozenset(SUPPORTED_HEAD_TILES),
+            d_v=frozenset(SUPPORTED_HEAD_TILES),
+            d_envelope=True,
             dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
             causal=True,
             bottom_right=True,
             bottom_right_with_swa=True,
             bottom_right_padded_seq_q=True,
             swa=True,
+            right_band_widening=True,
             padded=True,
             sink=True,
             stats=True,
             lse_optional=True,
             padded_stats=True,
             thd=True,
+            # No KV-tail rule: the kernel walks KV tiles right-to-left and its
+            # first (masked) step always covers the rightmost — and therefore
+            # any partial — tile, comparing columns against seqlen_k regardless
+            # of mask flags. Ragged S_kv is served natively with no synthesized
+            # padding and no padded-path cost.
+            skv_tile=0,
             layouts=frozenset({"bshd", "dense_flex"}),
             sched_policies=frozenset({SCHED_NATURAL}),
             tile_ms=frozenset({64, 128}),

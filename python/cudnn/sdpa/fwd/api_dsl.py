@@ -28,9 +28,10 @@ from cudnn.frost.tile_dsl.constants import (
 )
 from cudnn.sdpa.fwd.config_sm100 import TemplateParams as Sm100TemplateParams
 from cudnn.sdpa.fwd.config_sm120 import (
+    HEAD_TILE_GRANULE as _SM120_HEAD_TILE_GRANULE,
     SEQ_KV_TILES as _SM120_KV_TILES,
     SEQ_Q_TILES as _SM120_Q_TILES,
-    SUPPORTED_HEAD_TILES as _SM120_SUPPORTED_HEAD_TILES,
+    SUPPORTED_HEAD_TILE_MAX as _SM120_HEAD_TILE_MAX,
     TemplateParams as Sm120TemplateParams,
     smem_bytes as _sm120_smem_bytes,
 )
@@ -1523,8 +1524,9 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
     ``execute()`` normalizes to the kernel's compact-BSHD storage via
     ``_to_bshd`` / ``_to_bshd_writable`` — zero-copy when the tensor already
     is BSHD-compact, one gather / scatter copy otherwise. The kernel supports
-    FP16/BF16 MHA, GQA, and MQA; head dimensions from 16 through 256 in
-    increments of 16; top-left or bottom-right causal masks; left sliding
+    FP16/BF16 MHA, GQA, and MQA; head dimensions in multiples of 8 through
+    256 (ENVELOPE: the kernel compiles at tiles rounded up to 16 and TMA
+    zero-fills the pad columns); top-left or bottom-right causal masks; left sliding
     windows; optional per-batch query and key/value lengths; optional
     per-Q-head attention-sink logits; and THD (ragged / fully packed
     variable-length) batches, whose per-shape compile is deferred to
@@ -1550,10 +1552,6 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         if self.thd:
             self._value_error_if(self.seq_q_lens_present, "seq_q_lens_present is dense-only (THD carries per-sequence Q lengths via cu_seqlens)")
             self.seq_kv_lens_present = True
-        self._value_error_if(
-            self.window_size_right is not None,
-            "SM120 DSL SDPA: window_size_right (causal right-band widening) is not plumbed for this kernel",
-        )
         self._value_error_if(
             self.sched_policy is not None and self.sched_policy != SCHED_NATURAL,
             f"SM120 DSL SDPA only supports sched_policy={SCHED_NATURAL}",
@@ -1630,12 +1628,12 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             f"H_q ({h_q}) must be divisible by H_kv ({h_kv}) for GQA / MQA",
         )
         self._value_error_if(
-            d_q not in _SM120_SUPPORTED_HEAD_TILES,
-            f"D_QK ({d_q}) must be one of {_SM120_SUPPORTED_HEAD_TILES}",
+            d_q % 8 != 0 or not 0 < d_q <= _SM120_HEAD_TILE_MAX,
+            f"D_QK ({d_q}) must be a multiple of 8 (TMA 16-byte global-stride rule at 2 B/elem) and <= {_SM120_HEAD_TILE_MAX}",
         )
         self._value_error_if(
-            d_v not in _SM120_SUPPORTED_HEAD_TILES,
-            f"D_V ({d_v}) must be one of {_SM120_SUPPORTED_HEAD_TILES}",
+            d_v % 8 != 0 or not 0 < d_v <= _SM120_HEAD_TILE_MAX,
+            f"D_V ({d_v}) must be a multiple of 8 (TMA 16-byte global-stride rule at 2 B/elem) and <= {_SM120_HEAD_TILE_MAX}",
         )
 
         self.dtype = self._check_dtype(self.q_desc, [torch.float16, torch.bfloat16], name="Q")
@@ -1665,11 +1663,19 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         )
         self._value_error_if(
             self.causal_bottom_right and not self.is_causal,
-            "causal_bottom_right requires is_causal=True",
+            "causal_bottom_right requires is_causal=True (a band graph arrives as is_causal with its right bound)",
         )
         self._value_error_if(
             self.window_size_left is not None and self.window_size_left < 0,
             f"window_size_left must be non-negative, got {self.window_size_left}",
+        )
+        self._value_error_if(
+            self.window_size_right is not None and self.window_size_right < 0,
+            f"window_size_right must be >= 0; got {self.window_size_right}",
+        )
+        self._value_error_if(
+            self.window_size_right is not None and not self.is_causal,
+            "window_size_right widens the causal diagonal and requires is_causal=True",
         )
         self._value_error_if(
             self.seq_q_lens_present and not self.seq_kv_lens_present,
@@ -1688,8 +1694,14 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         arch = f"sm_{self.compute_capability[0]}{self.compute_capability[1]}"
         smem_capacity_bytes = cutlass.utils.get_smem_capacity_in_bytes(arch)
 
+        # SMEM tiles are sized at the ENVELOPE-padded head tiles (rounded up
+        # to the head-tile granule), not the actual dims — the kernel stages
+        # full tiles and the TMA zero-fills the pad columns.
+        d_qp = -(-d_q // _SM120_HEAD_TILE_GRANULE) * _SM120_HEAD_TILE_GRANULE
+        d_vp = -(-d_v // _SM120_HEAD_TILE_GRANULE) * _SM120_HEAD_TILE_GRANULE
+
         def _smem_bytes(kv_tile: int) -> int:
-            return _sm120_smem_bytes(d_q, d_v, self.q_tile, kv_tile, self.dtype.itemsize)
+            return _sm120_smem_bytes(d_qp, d_vp, self.q_tile, kv_tile, self.dtype.itemsize)
 
         if self.tile_n is None:
             # Pick the largest KV tile that fits this device.

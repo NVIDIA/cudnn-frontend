@@ -30,7 +30,9 @@ The kernel implements key optimizations including:
 
 Constraints:
 * Supported input dtypes: Float16 and BFloat16, output dtype must match input dtype
-* Head dimension must be a multiple of 16 between 16 and 256, inclusive
+* Runtime head dimensions must be multiples of 8 up to 256 (TMA 16-byte
+  global-stride rule); the kernel compiles at head TILES rounded up to 16 and
+  TMA zero-fills the pad columns (the head-dim ENVELOPE)
 * Q heads must be divisible by the number of K/V heads
 * Q/K/V/O use compact BSHD storage
 * Supported CTA Q/KV tiles are 128 or 64
@@ -52,6 +54,7 @@ from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_FP16
 from cudnn.frost.tile_dsl.mma import ptx_mma_m16n8k16_f32
 from cudnn.frost.tile_dsl.swizzle import swizzle_xor
 from cudnn.sdpa.fwd.config_sm120 import (
+    HEAD_TILE_GRANULE,
     SEQ_KV_TILES as _SEQ_KV_TILES,
     SEQ_Q_TILES as _SEQ_Q_TILES,
     SUPPORTED_HEAD_TILES as _SUPPORTED_HEAD_TILES,
@@ -132,6 +135,11 @@ def ceil_div(a: int, b: int) -> int:
     return (a + b - 1) // b
 
 
+def round_up_head_tile(d: int) -> int:
+    """Round a head dim up to the head-tile granule — the ENVELOPE head tile."""
+    return ceil_div(d, HEAD_TILE_GRANULE) * HEAD_TILE_GRANULE
+
+
 fmul2 = partial(prims.mul_packed_f32x2, ftz=False, rnd=prims.FPRoundingMode.RN)
 fma2 = partial(prims.fma_packed_f32x2, ftz=False, rnd=prims.FPRoundingMode.RN)
 
@@ -173,6 +181,7 @@ class SM120FusedMultiHeadAttentionForward:
         is_causal: bool = False,
         bottom_right: bool = False,
         window_size_left: int | None = None,
+        window_size_right: int | None = None,
         seq_q_lens_present: bool = False,
         seq_kv_lens_present: bool = False,
         has_sink: bool = False,
@@ -192,6 +201,11 @@ class SM120FusedMultiHeadAttentionForward:
         :param is_causal: Apply an upper causal bound to QK.
         :param bottom_right: Shift the causal diagonal by ``Skv - Sq``.
         :param window_size_left: Inclusive left-window offset, or ``None``.
+        :param window_size_right: Widen the causal diagonal to the right by
+            this many columns (inclusive; 0 = plain causal). Only meaningful
+            with ``is_causal`` — ``compile()`` maps the band model's
+            ``window_right`` to ``is_causal=(window_right is not None)`` plus
+            this offset.
         :param seq_q_lens_present: Read per-batch query lengths at runtime.
         :param seq_kv_lens_present: Read per-batch key/value lengths at runtime.
         :param has_sink: Fold the per-Q-head sink logit from the ``sinks``
@@ -207,9 +221,12 @@ class SM120FusedMultiHeadAttentionForward:
             ``(H, head_stride)`` (FlashAttention's ``softmax_lse`` layout; tokens
             contiguous within a head, ``head_stride >= T``) instead of the default
             token-major ``(T, H)``.
-        :param head_tile_qk: Q/K head dimension (the QK^T contraction width).
-            Must be a multiple of 16 between 16 and 256, inclusive.
-        :param head_tile_v: V/O head dimension (the P@V output width). Same
+        :param head_tile_qk: Q/K head TILE (the QK^T contraction width). Must
+            be a multiple of 16 between 16 and 256, inclusive. Runtime head
+            dims may be any multiple of 8 that rounds up to this tile — the
+            TMA descriptors keep the actual extents and zero-fill the pad
+            columns (the head-dim ENVELOPE).
+        :param head_tile_v: V/O head TILE (the P@V output width). Same
             constraint as ``head_tile_qk``.
         :param q_tile: Query sequence tile size.
         :param kv_tile: Key/value sequence tile size.
@@ -224,6 +241,14 @@ class SM120FusedMultiHeadAttentionForward:
         self.is_causal = is_causal
         self.bottom_right = bottom_right
         self.window_size_left = window_size_left
+        self.window_size_right = window_size_right
+        # Band model: a right bound implies the causal upper limit (compile()
+        # maps window_right -> is_causal), so the masking sites key off
+        # is_causal and add the (compile-time) widening.
+        self.right_slack = window_size_right if window_size_right is not None else 0
+        # A translated diagonal (bottom-right anchoring or a right band) can
+        # straddle one more KV tile than the tile-aligned top-left one.
+        self.diag_shifted = bottom_right or self.right_slack > 0
         self.seq_q_lens_present = seq_q_lens_present
         self.seq_kv_lens_present = seq_kv_lens_present
         self.has_sink = has_sink
@@ -300,29 +325,62 @@ class SM120FusedMultiHeadAttentionForward:
         batch_idx: cutlass.Int32,
         head_idx: cutlass.Int32,
         seq_coord: cutlass.Int32,
+        is_v: cutlass.Constexpr[bool],
+        envelope: cutlass.Constexpr[bool],
     ) -> None:
-        """Launch one TMA load for a complete K/V tile into swizzled SMEM.
+        """Launch the TMA load(s) for a complete K/V tile into swizzled SMEM.
 
-        The tensor map exposes compact ``(B, S, H, D)`` storage through a
-        logical ``(B, H, I, S, C)`` view, where ``D = I * C``. Its TMA-order
-        dimensions are ``(C, S, I, H, B)``, so one rank-5 copy covers every
-        head chunk and uses coordinates ``(c, seq, i, head, batch)``.
+        Exact head dims (``envelope=False``, the common case) issue ONE rank-5
+        copy whose descriptor pre-splits the head dim into swizzle-span chunks
+        — the head boundary coincides with the tile so no zero-fill is needed.
+
+        Envelope head dims (``envelope=True``, actual d < compile-time tile)
+        issue ``chunks`` copies over a rank-4 descriptor that keeps the ACTUAL
+        head extent as the innermost dimension, stepping the head coordinate
+        by ``chunk_elems``. Head columns at or past the actual extent are
+        outside that dimension, so the hardware zero-fills them (zero K columns
+        add exact zero terms to every Q@K^T; zero V columns produce O columns
+        the store guard clips). A single copy cannot serve this case: TMA
+        bounds-checks each coordinate against its OWN dimension, so a
+        chunk-dimension descriptor would fetch the next head's data instead of
+        zeros past d.
 
         :param s_dst: Swizzled SMEM destination tile.
-        :param tma_desc: K or V tensor map descriptor.
+        :param tma_desc: K or V tensor map descriptor (rank matches
+            ``envelope``).
         :param mbar: TMA completion mbarrier for this stream.
         :param batch_idx: Batch index.
         :param head_idx: Attention head index.
         :param seq_coord: Starting sequence row for the K/V tile.
+        :param is_v: Selects the V-side chunk geometry over the K-side one
+            (the two carry independent head tiles and swizzle spans).
+        :param envelope: Actual head dim < compile-time tile (zero-padded).
         """
+        chunks = self.v_tma_swizzle_chunks if is_v else self.k_tma_swizzle_chunks
+        chunk_elems = self.v_swizzle_chunk_elems if is_v else self.k_swizzle_chunk_elems
         if prims.elect_sync():
-            prims.mbarrier_arrive_expect_tx(mbar, tma_desc.global_tx_bytes())
-            prims.cp_async_bulk_tensor_shared_cta_global(
-                s_dst,
-                tma_desc.get_ptr(),
-                (0, seq_coord, 0, head_idx, batch_idx),
-                mbar,
-            )
+            if cutlass.const_expr(envelope):
+                # Every copy completes with its full box (OOB regions arrive as
+                # zeros but still count), so the expected transaction total is
+                # simply chunks x the per-copy box bytes.
+                prims.mbarrier_arrive_expect_tx(mbar, chunks * tma_desc.global_tx_bytes())
+                for i in cutlass.range_constexpr(chunks):
+                    prims.cp_async_bulk_tensor_shared_cta_global(
+                        s_dst.subview(i * self.kv_tile * chunk_elems),
+                        tma_desc.get_ptr(),
+                        (i * chunk_elems, seq_coord, head_idx, batch_idx),
+                        mbar,
+                    )
+            else:
+                # Rank-5 coordinates (c, seq, i, head, batch): one copy covers
+                # every head chunk of the tile.
+                prims.mbarrier_arrive_expect_tx(mbar, tma_desc.global_tx_bytes())
+                prims.cp_async_bulk_tensor_shared_cta_global(
+                    s_dst,
+                    tma_desc.get_ptr(),
+                    (0, seq_coord, 0, head_idx, batch_idx),
+                    mbar,
+                )
 
     @cute.jit
     def load_q_tile(
@@ -495,9 +553,11 @@ class SM120FusedMultiHeadAttentionForward:
 
             valid_cols = basic_params.seqlen_k
             if cutlass.const_expr(self.is_causal):
+                # Causal upper bound, widened right by the (compile-time) band
+                # slack — 0 for plain causal, R for diagonal_band_right_bound.
                 valid_cols = cute.math.max(
                     cutlass.Int32(0),
-                    cute.math.min(diagonal_position + 1, basic_params.seqlen_k),
+                    cute.math.min(diagonal_position + 1 + self.right_slack, basic_params.seqlen_k),
                 )
 
             first_valid_col = cutlass.Int32(0)
@@ -750,8 +810,9 @@ class SM120FusedMultiHeadAttentionForward:
         tidx, _, _ = cute.arch.thread_idx()
         q_tile_idx, batch_idx, head_idx = cute.arch.block_idx()
         if cutlass.const_expr(self.is_causal):
-            # Causal work grows with the Q tile. Launch long tiles first to
-            # avoid leaving a few expensive CTAs in the final scheduler waves.
+            # Diagonal-bounded work grows with the Q tile. Launch long tiles
+            # first to avoid leaving a few expensive CTAs in the final
+            # scheduler waves (right-band graphs share the causal shape).
             grid_q, _, _ = cute.arch.grid_dim()
             q_tile_idx = grid_q - q_tile_idx - 1
         q_seq_idx = q_tile_idx * self.q_tile
@@ -789,6 +850,10 @@ class SM120FusedMultiHeadAttentionForward:
         num_heads_kv = k.shape[2]
         head_dim_qk = q.shape[3]
         head_dim_v = v.shape[3]
+        # ENVELOPE flags (static shapes): actual dim < compile-time tile means
+        # the TMA loads must zero-fill the pad columns via per-chunk copies.
+        k_envelope = head_dim_qk != self.head_tile_qk
+        v_envelope = head_dim_v != self.head_tile_v
         q_ptr = q.iterator.raw_ptr()
         o_ptr = o.iterator.raw_ptr()
 
@@ -814,7 +879,7 @@ class SM120FusedMultiHeadAttentionForward:
             if q_seq_idx >= seqlen_q:
                 num_kv_tiles = cutlass.Int32(0)
         if cutlass.const_expr(self.is_causal):
-            causal_k_end = q_seq_idx + self.q_tile
+            causal_k_end = q_seq_idx + self.q_tile + self.right_slack
             if cutlass.const_expr(self.bottom_right):
                 causal_k_end += seqlen_k - seqlen_q
             causal_k_end = cute.math.max(cutlass.Int32(0), cute.math.min(causal_k_end, seqlen_k))
@@ -884,6 +949,8 @@ class SM120FusedMultiHeadAttentionForward:
                     tma_batch_idx,
                     kv_head_idx,
                     kv_row_base + kv_seq_idx,
+                    is_v=False,
+                    envelope=k_envelope,
                 )
                 self.load_one_kv_tile(
                     sV,
@@ -892,6 +959,8 @@ class SM120FusedMultiHeadAttentionForward:
                     tma_batch_idx,
                     kv_head_idx,
                     kv_row_base + kv_seq_idx,
+                    is_v=True,
+                    envelope=v_envelope,
                 )
 
                 kv_seq_idx -= self.kv_tile
@@ -907,6 +976,8 @@ class SM120FusedMultiHeadAttentionForward:
                         tma_batch_idx,
                         kv_head_idx,
                         kv_row_base + kv_seq_idx,
+                        is_v=False,
+                        envelope=k_envelope,
                     )
 
                     prims.barrier_cta_sync(
@@ -920,6 +991,8 @@ class SM120FusedMultiHeadAttentionForward:
                         tma_batch_idx,
                         kv_head_idx,
                         kv_row_base + kv_seq_idx,
+                        is_v=True,
+                        envelope=v_envelope,
                     )
                     kv_seq_idx -= self.kv_tile
         # /////////////////////////////////////////////////////////////////////////////
@@ -990,8 +1063,11 @@ class SM120FusedMultiHeadAttentionForward:
             mask_steps = 1
             if cutlass.const_expr(self.is_causal):
                 mask_steps = ceil_div(self.q_tile, self.kv_tile)
-                if cutlass.const_expr(self.bottom_right):
-                    # The shifted diagonal can straddle one additional KV tile.
+                if cutlass.const_expr(self.diag_shifted):
+                    # A translated diagonal (bottom-right anchoring or a right
+                    # band) can straddle one additional KV tile; the frontier
+                    # width itself is R-independent — the band only translates
+                    # the diagonal.
                     mask_steps = ceil_div(self.q_tile + self.kv_tile - 1, self.kv_tile)
             left_mask_steps = 1
             if cutlass.const_expr(self.window_size_left is not None):
@@ -1225,10 +1301,12 @@ class SM120FusedMultiHeadAttentionForward:
         """
         head_dim_qk = q.shape[3]
         head_dim_v = v.shape[3]
-        if cutlass.const_expr(head_dim_qk != k.shape[3] or head_dim_qk != self.head_tile_qk):
-            raise ValueError("runtime Q/K head dimensions must match the kernel head_tile_qk")
-        if cutlass.const_expr(head_dim_v != o.shape[3] or head_dim_v != self.head_tile_v):
-            raise ValueError("runtime V/O head dimensions must match the kernel head_tile_v")
+        if cutlass.const_expr(head_dim_qk != k.shape[3] or round_up_head_tile(head_dim_qk) != self.head_tile_qk):
+            raise ValueError("runtime Q/K head dimensions must round up (by the head-tile granule) to the kernel head_tile_qk")
+        if cutlass.const_expr(head_dim_v != o.shape[3] or round_up_head_tile(head_dim_v) != self.head_tile_v):
+            raise ValueError("runtime V/O head dimensions must round up (by the head-tile granule) to the kernel head_tile_v")
+        if cutlass.const_expr(head_dim_qk % 8 != 0 or head_dim_v % 8 != 0):
+            raise ValueError("head dimensions must be multiples of 8 (TMA 16-byte global-stride rule at 2 B/elem)")
         if cutlass.const_expr(
             q.shape[0] != k.shape[0]
             or k.shape[:3] != v.shape[:3]
@@ -1269,66 +1347,42 @@ class SM120FusedMultiHeadAttentionForward:
                 raise ValueError("THD seq_kv_lens must be the (3*B+2,) metadata tensor")
 
         # Split D into I contiguous C-element chunks while preserving the
-        # compact (B, S, H, D) global-memory address calculation. TMA order
-        # (C, S, I, H, B) linearizes the SMEM destination as [I][kv_tile][C].
-        k_tma_layout = cute.make_layout(
-            (
-                k.shape[0],
-                k.shape[2],
-                self.k_tma_swizzle_chunks,
-                k.shape[1],
-                self.k_swizzle_chunk_elems,
-            ),
-            stride=(
-                k.shape[1] * k.shape[2] * head_dim_qk,
-                head_dim_qk,
-                self.k_swizzle_chunk_elems,
-                k.shape[2] * head_dim_qk,
-                1,
-            ),
-        )
-        k_tma_box = (
-            1,
-            1,
-            self.k_tma_swizzle_chunks,
-            self.kv_tile,
-            self.k_swizzle_chunk_elems,
-        )
-        tma_k_desc = cuda.create_tensor_map_tiled_from_view(
-            cute.make_tensor(k.iterator, k_tma_layout),
-            box_dims=k_tma_box,
-            stride_order=(4, 3, 2, 1, 0),
-            swizzle=self.k_tma_swizzle,
-        )
-        v_tma_layout = cute.make_layout(
-            (
-                v.shape[0],
-                v.shape[2],
-                self.v_tma_swizzle_chunks,
-                v.shape[1],
-                self.v_swizzle_chunk_elems,
-            ),
-            stride=(
-                v.shape[1] * v.shape[2] * head_dim_v,
-                head_dim_v,
-                self.v_swizzle_chunk_elems,
-                v.shape[2] * head_dim_v,
-                1,
-            ),
-        )
-        v_tma_box = (
-            1,
-            1,
-            self.v_tma_swizzle_chunks,
-            self.kv_tile,
-            self.v_swizzle_chunk_elems,
-        )
-        tma_v_desc = cuda.create_tensor_map_tiled_from_view(
-            cute.make_tensor(v.iterator, v_tma_layout),
-            box_dims=v_tma_box,
-            stride_order=(4, 3, 2, 1, 0),
-            swizzle=self.v_tma_swizzle,
-        )
+        # per-tensor TMA descriptor over the compact (B, S, H, D) storage.
+        #
+        # Exact head dim (the common case): a rank-5 view pre-splits D into
+        # swizzle-span chunks as a descriptor dimension — dims (B, H, I, S, C)
+        # with D = I * C, TMA order (C, S, I, H, B) — so ONE copy covers the
+        # whole tile (the fast path; ~1-2% speedup upon exact-dim workloads).
+        #
+        # Envelope head dim (actual d < compile-time tile): the head boundary
+        # must be a single descriptor dimension for TMA's per-dimension bounds
+        # check to zero-fill past it, so a rank-4 view keeps the ACTUAL extent
+        # innermost — TMA order (D, S, H, B) — and load_one_kv_tile steps the
+        # head coordinate per swizzle-span chunk.
+        def kv_tma_desc(t, head_dim, head_tile, swizzle, swizzle_chunks, swizzle_chunk_elems):
+            if cutlass.const_expr(head_dim == head_tile):
+                layout = cute.make_layout(
+                    (t.shape[0], t.shape[2], swizzle_chunks, t.shape[1], swizzle_chunk_elems),
+                    stride=(t.shape[1] * t.shape[2] * head_dim, head_dim, swizzle_chunk_elems, t.shape[2] * head_dim, 1),
+                )
+                box = (1, 1, swizzle_chunks, self.kv_tile, swizzle_chunk_elems)
+                stride_order = (4, 3, 2, 1, 0)
+            else:
+                layout = cute.make_layout(
+                    (t.shape[0], t.shape[2], t.shape[1], head_dim),
+                    stride=(t.shape[1] * t.shape[2] * head_dim, head_dim, t.shape[2] * head_dim, 1),
+                )
+                box = (1, 1, self.kv_tile, swizzle_chunk_elems)
+                stride_order = (3, 2, 1, 0)
+            return cuda.create_tensor_map_tiled_from_view(
+                cute.make_tensor(t.iterator, layout),
+                box_dims=box,
+                stride_order=stride_order,
+                swizzle=swizzle,
+            )
+
+        tma_k_desc = kv_tma_desc(k, head_dim_qk, self.head_tile_qk, self.k_tma_swizzle, self.k_tma_swizzle_chunks, self.k_swizzle_chunk_elems)
+        tma_v_desc = kv_tma_desc(v, head_dim_v, self.head_tile_v, self.v_tma_swizzle, self.v_tma_swizzle_chunks, self.v_swizzle_chunk_elems)
         self.kernel(
             q,
             k,
@@ -1394,6 +1448,7 @@ def compile(  # noqa: A001
         is_causal=PARAMS.window_right is not None,
         bottom_right=PARAMS.bottom_right,
         window_size_left=PARAMS.window_left,
+        window_size_right=PARAMS.window_right,
         seq_q_lens_present=PARAMS.seq_q_lens_present,
         seq_kv_lens_present=PARAMS.seq_kv_lens_present,
         has_sink=PARAMS.has_sink,
@@ -1401,8 +1456,8 @@ def compile(  # noqa: A001
         thd_batch=b,
         thd_max_sq=max_sq,
         thd_lse_head_major=lse_head_major,
-        head_tile_qk=d_qk,
-        head_tile_v=d_v,
+        head_tile_qk=round_up_head_tile(d_qk),
+        head_tile_v=round_up_head_tile(d_v),
         q_tile=PARAMS.q_tile,
         kv_tile=PARAMS.kv_tile,
     )
