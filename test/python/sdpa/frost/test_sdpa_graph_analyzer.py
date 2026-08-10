@@ -21,7 +21,7 @@ def _eligible(graph, knobs=None):
     removed with the monkey-patch dispatch layer, and a knob request is a
     property of a PLAN (engines.base.PlanConfig.knobs), not of the graph.
     """
-    return {s.name for s in engines.ENGINE_SPECS if engines.probe(s, graph, knobs)}
+    return {s.name for s in engines.ENGINE_SPECS if engines.analyze_for(s, graph, knobs)[1] is None}
 
 
 # The default pytest.ini addopts is `-m L0`; mark the whole module so it runs.
@@ -317,17 +317,70 @@ def test_probe_accepts_thd_top_left_causal():
     assert engines.engine_name(512) in _eligible(g)
 
 
-def test_probe_rejects_thd_bottom_right():
-    # THD + bottom-right causal is a kernel gap (BR diagonal needs global, not per-sequence, Q length).
+def test_probe_accepts_thd_bottom_right():
+    # The SM100 kernels anchor the THD bottom-right diagonal at each sequence's
+    # own (seq_len_q[b], seq_len_kv[b]) via the cu_seqlen metadata.
     g = _mk_graph()
     _mk_thd_qkvo(g, mask_kwargs=dict(use_causal_mask_bottom_right=True))
-    assert not _eligible(g)
+    assert engines.engine_name(512) in _eligible(g)
 
 
-def test_probe_rejects_right_band_widening():
+def test_probe_accepts_thd_stats():
+    """The SM100 epilogue writes cuDNN's ragged Stats directly (token-major
+    or head-major packed LSE), so THD + generate_stats is eligible."""
+    g = _mk_graph()
+    dims = (B, H, S, D)
+    strides = (S * H * D, D, H * D, 1)
+    q = g.tensor(dim=dims, stride=strides, data_type=DTYPE, name="q")
+    k = g.tensor(dim=dims, stride=strides, data_type=DTYPE, name="k")
+    v = g.tensor(dim=dims, stride=strides, data_type=DTYPE, name="v")
+    ro = g.tensor(dim=(B + 1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT64, name="ro")
+    q.set_ragged_offset(ro)
+    k.set_ragged_offset(ro)
+    v.set_ragged_offset(ro)
+    seq_q = g.tensor(dim=(B, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT32, name="sq")
+    seq_kv = g.tensor(dim=(B, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT32, name="skv")
+    o, stats = g.sdpa(
+        name="s",
+        q=q,
+        k=k,
+        v=v,
+        attn_scale=0.1,
+        generate_stats=True,
+        use_causal_mask=True,
+        use_padding_mask=True,
+        seq_len_q=seq_q,
+        seq_len_kv=seq_kv,
+    )
+    _finish_output(o, dims, strides)
+    o.set_ragged_offset(ro)
+    assert stats is not None
+    stats.set_output(True).set_dim((B, H, S, 1)).set_stride((S * H, 1, H, 1))
+    stats.set_data_type(cudnn.data_type.FLOAT)
+    stats_ro = g.tensor(dim=(B + 1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT64, name="stats_ro")
+    stats.set_ragged_offset(stats_ro)
+    assert engines.engine_name(512) in _eligible(g)
+
+
+def test_probe_accepts_right_band_widening():
+    # diagonal_band_right_bound > 0 lowers as MASK_CAUSAL with a compile-time
+    # BAND_RIGHT diagonal offset.
     g = _mk_graph()
     q, k, v, dims, strides = _mk_qkv(g)
     o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True, diagonal_band_right_bound=16)
+    _finish_output(o, dims, strides)
+    assert engines.engine_name(512) in _eligible(g)
+    facts = ga.analyze(g)
+    assert facts.right_band_widening and facts.right_bound == 16 and not facts.causal
+
+
+def test_probe_rejects_negative_right_band():
+    g = _mk_graph()
+    q, k, v, dims, strides = _mk_qkv(g)
+    try:
+        o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True, diagonal_band_right_bound=-4)
+    except (RuntimeError, ValueError):
+        return  # the pygraph binding may reject it before the probe ever runs
     _finish_output(o, dims, strides)
     assert not _eligible(g)
 
@@ -782,7 +835,7 @@ _BWD_D = 64
 
 def _bwd_eligible(graph, knobs=None):
     """Names of the FROST SDPA-backward engines whose caps match this graph."""
-    return {s.name for s in bwd_engines.ENGINE_SPECS if bwd_engines.probe(s, graph, knobs)}
+    return {s.name for s in bwd_engines.ENGINE_SPECS if bwd_engines.analyze_for(s, graph, knobs)[1] is None}
 
 
 def _bshd_strides(h: int, s: int, d: int) -> tuple[int, int, int, int]:

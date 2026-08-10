@@ -4,8 +4,10 @@
 """The engines this version ships — the library's own static table.
 
 No registration call: the library knows which engines it was built with, so
-discovery is the library's job. ``register_backend()`` is the out-of-tree
-escape hatch and nothing else uses it.
+discovery is the library's job, and this table is the ONLY way a python engine
+exists. An engine id decodes to a family and a slot here
+(:func:`engine_for_id`), so nothing has to be registered for one to be named,
+built, or replayed.
 
 This module has ZERO imports of engine code (families are strings and ints), so
 ``import cudnn`` never pays an engine's import cost just to know the engine
@@ -85,6 +87,11 @@ class EngineFamily:
     # ("module", "callable") producing this family's facts from a graph, or None
     # while a family still reads the graph inside its engines.
     analyzer: Optional[Tuple[str, str]] = None
+    # ("module", "callable") ranking (engine_id, knobs) for this family, given
+    # its facts and the backend's entries. The family is the smallest scope that
+    # can rank -- an engine cannot see its siblings. None falls back to one
+    # default plan per accepting engine, ahead of the backend's.
+    heuristics: Optional[Tuple[str, str]] = None
 
     @property
     def id_end(self) -> int:
@@ -174,6 +181,7 @@ MANIFEST: Tuple[EngineFamily, ...] = (
             "sdpa_fwd_prefill_sm100_d192_d128": EngineSlot(6, opt_in=True),
         },
         analyzer=("cudnn.sdpa.graph_analyzer", "analyze"),
+        heuristics=("cudnn.sdpa.fwd.heuristics", "recommend"),
     ),
     EngineFamily(
         FROST_SDPA_BWD_ID_BASE,
@@ -212,29 +220,40 @@ def family_for(graph) -> Optional[EngineFamily]:
     return next(f for f in MANIFEST if f.name == name)
 
 
-def resolve_analyzer(family: EngineFamily):
-    """The family's facts callable, or None when it declares no analyzer.
+def _resolve(family: EngineFamily, ref: Optional[Tuple[str, str]], what: str):
+    """Import a ("module", "callable") declaration, or None when absent.
 
-    Importing it is the caller's decision, not this module's: keeping
-    ``analyzer`` a pair of strings is what lets the coarse key stay
-    import-free. Planning resolves it and attaches the record to the frozen
-    graph; the family's engines then read that same record back.
+    Importing is the caller's decision, not this module's: keeping these
+    declarations pairs of strings is what lets the coarse key stay import-free.
+    A missing optional dependency makes the hook absent, not the graph
+    unplannable -- importing one pulls in its package (cudnn.sdpa.__init__ ->
+    cuda.bindings, cutlass), so without this a planning call raises instead of
+    falling back to the backend.
     """
-    if family.analyzer is None:
+    if ref is None:
         return None
     import importlib
 
-    module, attr = family.analyzer
+    module, attr = ref
     try:
         return getattr(importlib.import_module(module), attr)
     except ImportError as exc:
-        # Same contract as instantiate(): a missing optional dependency makes
-        # the family absent, not the graph unplannable. Importing an analyzer
-        # pulls in its package (cudnn.sdpa.__init__ -> cuda.bindings, cutlass),
-        # so without this a planning call raises instead of falling back to the
-        # backend.
-        _LOG.info("analyzer for %s is unavailable in this environment: %s", family.name, exc)
+        _LOG.info("%s for %s is unavailable in this environment: %s", what, family.name, exc)
         return None
+
+
+def resolve_heuristics(family: EngineFamily):
+    """The family's plan-ranking callable, or None when it declares none."""
+    return _resolve(family, family.heuristics, "heuristics")
+
+
+def resolve_analyzer(family: EngineFamily):
+    """The family's facts callable, or None when it declares no analyzer.
+
+    Planning resolves it and attaches the record to the frozen graph; the
+    family's heuristics and engines then read that same record back.
+    """
+    return _resolve(family, family.analyzer, "analyzer")
 
 
 def instantiate(family: EngineFamily, ids: Dict[str, int]):
@@ -281,3 +300,22 @@ def engines_for(graph):
         return []
     ids = family.offered_ids()  # availability is a separate question from kind
     return list(instantiate(family, ids)) if ids else []
+
+
+def engine_for_id(engine_id: int):
+    """The engine that owns ``engine_id``, or None.
+
+    An engine id is fully decodable from this table: the family owning the id
+    block, then the slot within it. Nothing has to be registered first, which is
+    what lets create_execution_plan() replay an autotune result on a fresh graph
+    -- including an engine that is not a candidate for THAT graph, where the
+    replay is a deliberate pin rather than a routing decision.
+    """
+    for family in MANIFEST:
+        if not family.owns(engine_id):
+            continue
+        ids = family.offered_ids()
+        if engine_id not in ids.values():
+            return None  # a real slot, but gated off in this process
+        return next((e for e in instantiate(family, ids) if e.engine_id == engine_id), None)
+    return None

@@ -21,7 +21,7 @@ those support checks have a gap.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Optional, Tuple
 
 from cudnn.frost.tile_dsl.constants import (
     DTYPE_BF16,
@@ -63,9 +63,19 @@ class TemplateParams:
 
     dtype_qkv: int = DTYPE_FP16  # E4M3/E5M2 (0/1, d128 MXFP8 only) or BF16/FP16 (2/3)
     dtype_o: int = -1  # output dtype (0..3); -1 = inherit dtype_qkv. MXFP8 writes BF16/FP16.
-    mask_flags: int = MASK_NONE
-    swa_window: int = 0  # runtime left-window offset W (keep kv in [q-W, q])
-    causal_bottom_right: bool = False
+    # The mask is ONE diagonal band (the model FlashAttention / CUTLASS FMHA /
+    # the analyzer facts all share): per-side OFFSETS from the diagonal, None =
+    # unbounded on that side. Row q attends kv in [q - window_left, q +
+    # window_right] (shifted by S_kv - S_q when bottom_right):
+    #   window_right = None -> no upper bound;  0 -> plain causal;  R > 0 ->
+    #   causal widened by R future tokens (diagonal_band_right_bound).
+    #   window_left  = None -> no lower bound;  W -> sliding window of W past
+    #   tokens (cuDNN diagonal_band_left_bound - 1).
+    #   bottom_right anchors the band's diagonal at the bottom-right corner.
+    # make_cfg_* derives the kernels' MASK_FLAGS bits from these.
+    window_left: Optional[int] = None
+    window_right: Optional[int] = None
+    bottom_right: bool = False
     has_sink: bool = False
     seq_kv_lens_present: bool = False
     # Dense padded-Q trim: per-batch seq_len_q is a SEPARATE (B,)-int32
@@ -94,16 +104,17 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
         raise ValueError(f"{flavor}: DTYPE_O must be 0..3; got {dtype_o}")
     if not fp8 and dtype_o != k.dtype_qkv:
         raise ValueError(f"{flavor}: half input (BF16/FP16) requires DTYPE_O == DTYPE_QKV; got dtype_o={dtype_o}")
-    if k.causal_bottom_right:
-        if not (k.mask_flags & MASK_CAUSAL):
-            raise ValueError(f"{flavor}: CAUSAL_BOTTOM_RIGHT requires MASK_CAUSAL (bit 1)")
-        if k.mask_flags & MASK_SWA:
-            raise ValueError(f"{flavor}: CAUSAL_BOTTOM_RIGHT + SWA is not supported")
-    if k.thd_varlen:
-        if not (k.mask_flags & MASK_PADDED):
-            raise ValueError(f"{flavor}: THD/varlen implies per-sequence padded masking (MASK_PADDED)")
-        if not k.seq_kv_lens_present:
-            raise ValueError(f"{flavor}: THD/varlen requires SEQ_KV_LENS_PRESENT")
+    if k.window_left is not None and k.window_left < 0:
+        raise ValueError(f"{flavor}: window_left must be >= 0 (or None for unbounded); got {k.window_left}")
+    if k.window_right is not None and k.window_right < 0:
+        raise ValueError(f"{flavor}: window_right must be >= 0 (or None for unbounded); got {k.window_right}")
+    if k.bottom_right:
+        if k.window_right is None:
+            raise ValueError(f"{flavor}: bottom_right anchors the band's diagonal and requires a right bound (window_right)")
+        if k.window_left is not None:
+            raise ValueError(f"{flavor}: bottom_right + window_left (SWA) is not supported")
+    if k.thd_varlen and not k.seq_kv_lens_present:
+        raise ValueError(f"{flavor}: THD/varlen requires SEQ_KV_LENS_PRESENT (per-sequence padded masking)")
     if k.seq_q_lens_present:
         if k.thd_varlen:
             raise ValueError(f"{flavor}: SEQ_Q_LENS_PRESENT is dense-only (THD carries per-sequence Q lengths via cu_seqlens)")
@@ -111,6 +122,20 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
             raise ValueError(f"{flavor}: SEQ_Q_LENS_PRESENT requires SEQ_KV_LENS_PRESENT (padding mask)")
     if k.sched_policy not in (SCHED_NATURAL, SCHED_LPT):
         raise ValueError(f"{flavor}: only SCHED_NATURAL (0) / SCHED_LPT (1) are wired up; got {k.sched_policy}")
+
+
+def _mask_flags_from(params: TemplateParams) -> int:
+    """Kernel-facing MASK bits, derived from the band + padding: the kernels
+    fold trace-time branches on these bits; the band VALUES ride the CFG's
+    WINDOW_LEFT / WINDOW_RIGHT fields (0 when the corresponding bit is unset)."""
+    flags = MASK_NONE
+    if params.window_right is not None:
+        flags |= MASK_CAUSAL
+    if params.window_left is not None:
+        flags |= MASK_SWA
+    if params.thd_varlen or params.seq_kv_lens_present:
+        flags |= MASK_PADDED
+    return flags
 
 
 # ---------------------------------------------------------------------------
@@ -229,10 +254,11 @@ class CfgD256:
 
     RESCALE_THRESHOLD: float = 8.0
 
-    MASK_FLAGS: int = MASK_NONE
-    SWA_WINDOW: int = 0
+    MASK_FLAGS: int = MASK_NONE  # derived from the band by make_cfg (see _mask_flags_from)
+    WINDOW_LEFT: int = 0  # band left offset W (valid when MASK_SWA is set)
+    WINDOW_RIGHT: int = 0  # band right offset R (valid when MASK_CAUSAL is set; 0 = plain causal)
     HAS_SINK: int = 0
-    CAUSAL_BOTTOM_RIGHT: int = 0
+    BOTTOM_RIGHT: int = 0  # band diagonal anchored bottom-right
 
     L2_SIZE_MIB: int = 60
     SCHEDULER_POLICY: int = SCHED_NATURAL
@@ -301,10 +327,11 @@ def make_cfg_d256(params: TemplateParams) -> Tuple[CfgD256, TmaIters]:
         RESCALE_THRESHOLD=rescale_threshold(params.dtype_qkv),
         TILE_K_HW_BMM1=tile_k_hw(params.dtype_qkv),
         TILE_K_HW_BMM2=tile_k_hw(params.dtype_qkv),
-        MASK_FLAGS=params.mask_flags,
-        SWA_WINDOW=params.swa_window,
+        MASK_FLAGS=_mask_flags_from(params),
+        WINDOW_LEFT=params.window_left or 0,
+        WINDOW_RIGHT=params.window_right or 0,
         HAS_SINK=int(params.has_sink),
-        CAUSAL_BOTTOM_RIGHT=int(params.causal_bottom_right),
+        BOTTOM_RIGHT=int(params.bottom_right),
         SCHEDULER_POLICY=params.sched_policy,
         SEQ_KV_LENS_PRESENT=1 if (params.thd_varlen or params.seq_kv_lens_present) else 0,
         SEQ_Q_LENS_PRESENT=int(params.seq_q_lens_present),
@@ -363,10 +390,11 @@ class CfgD512:
 
     RESCALE_THRESHOLD: float = 8.0
 
-    MASK_FLAGS: int = MASK_NONE
-    SWA_WINDOW: int = 0
+    MASK_FLAGS: int = MASK_NONE  # derived from the band by make_cfg (see _mask_flags_from)
+    WINDOW_LEFT: int = 0  # band left offset W (valid when MASK_SWA is set)
+    WINDOW_RIGHT: int = 0  # band right offset R (valid when MASK_CAUSAL is set; 0 = plain causal)
     HAS_SINK: int = 0
-    CAUSAL_BOTTOM_RIGHT: int = 0
+    BOTTOM_RIGHT: int = 0  # band diagonal anchored bottom-right
 
     L2_SIZE_MIB: int = 60
     SCHEDULER_POLICY: int = SCHED_NATURAL
@@ -442,10 +470,11 @@ def make_cfg_d512(params: TemplateParams) -> Tuple[CfgD512, TmaIters]:
         RESCALE_THRESHOLD=rescale_threshold(params.dtype_qkv),
         TILE_K_HW_BMM1=tile_k_hw(params.dtype_qkv),
         TILE_K_HW_BMM2=tile_k_hw(params.dtype_qkv),
-        MASK_FLAGS=params.mask_flags,
-        SWA_WINDOW=params.swa_window,
+        MASK_FLAGS=_mask_flags_from(params),
+        WINDOW_LEFT=params.window_left or 0,
+        WINDOW_RIGHT=params.window_right or 0,
         HAS_SINK=int(params.has_sink),
-        CAUSAL_BOTTOM_RIGHT=int(params.causal_bottom_right),
+        BOTTOM_RIGHT=int(params.bottom_right),
         SCHEDULER_POLICY=params.sched_policy,
         SEQ_KV_LENS_PRESENT=1 if (params.thd_varlen or params.seq_kv_lens_present) else 0,
         SEQ_Q_LENS_PRESENT=int(params.seq_q_lens_present),
@@ -506,10 +535,11 @@ class CfgD128:
 
     RESCALE_THRESHOLD: float = 8.0
 
-    MASK_FLAGS: int = MASK_NONE
-    SWA_WINDOW: int = 0
+    MASK_FLAGS: int = MASK_NONE  # derived from the band by make_cfg (see _mask_flags_from)
+    WINDOW_LEFT: int = 0  # band left offset W (valid when MASK_SWA is set)
+    WINDOW_RIGHT: int = 0  # band right offset R (valid when MASK_CAUSAL is set; 0 = plain causal)
     HAS_SINK: int = 0
-    CAUSAL_BOTTOM_RIGHT: int = 0
+    BOTTOM_RIGHT: int = 0  # band diagonal anchored bottom-right
 
     L2_SIZE_MIB: int = 60
     SCHEDULER_POLICY: int = SCHED_NATURAL
@@ -600,10 +630,11 @@ def make_cfg_d128(params: TemplateParams) -> Tuple[CfgD128, TmaIters]:
         TILE_K_HW_BMM1=tile_k_hw_fp8,
         TILE_K_HW_BMM2=tile_k_hw_fp8,
         STAGES_KV=4 if fp8 else 2,
-        MASK_FLAGS=params.mask_flags,
-        SWA_WINDOW=params.swa_window,
+        MASK_FLAGS=_mask_flags_from(params),
+        WINDOW_LEFT=params.window_left or 0,
+        WINDOW_RIGHT=params.window_right or 0,
         HAS_SINK=int(params.has_sink),
-        CAUSAL_BOTTOM_RIGHT=int(params.causal_bottom_right),
+        BOTTOM_RIGHT=int(params.bottom_right),
         SCHEDULER_POLICY=params.sched_policy,
         SEQ_KV_LENS_PRESENT=1 if (params.thd_varlen or params.seq_kv_lens_present) else 0,
         SEQ_Q_LENS_PRESENT=int(params.seq_q_lens_present),
@@ -668,13 +699,14 @@ def make_cfg_d192(params: TemplateParams) -> Tuple[CfgD192, TmaIters]:
         RESCALE_THRESHOLD=rescale_threshold(params.dtype_qkv),
         TILE_K_HW_BMM1=tile_k_hw(params.dtype_qkv),
         TILE_K_HW_BMM2=tile_k_hw(params.dtype_qkv),
-        MASK_FLAGS=params.mask_flags,
-        SWA_WINDOW=params.swa_window,
+        MASK_FLAGS=_mask_flags_from(params),
+        WINDOW_LEFT=params.window_left or 0,
+        WINDOW_RIGHT=params.window_right or 0,
         HAS_SINK=int(params.has_sink),
-        CAUSAL_BOTTOM_RIGHT=int(params.causal_bottom_right),
+        BOTTOM_RIGHT=int(params.bottom_right),
         SCHEDULER_POLICY=1,
-        SOFTMAX_REGS=216 if params.mask_flags == MASK_NONE else 192,
-        CORRECTION_REGS=40 if params.mask_flags == MASK_NONE else 88,
+        SOFTMAX_REGS=216 if _mask_flags_from(params) == MASK_NONE else 192,
+        CORRECTION_REGS=40 if _mask_flags_from(params) == MASK_NONE else 88,
         SEQ_KV_LENS_PRESENT=1 if (params.thd_varlen or params.seq_kv_lens_present) else 0,
         SEQ_Q_LENS_PRESENT=int(params.seq_q_lens_present),
         THD_VARLEN=int(params.thd_varlen),

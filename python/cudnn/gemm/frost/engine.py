@@ -79,13 +79,6 @@ class FrostGemmEngine(BaseEngine):
             # at the engine boundary that is a decline, not a user error.
             raise NotImplementedError(f"frost_gemm: {exc}") from exc
 
-    def propose_plans(self, graph: "pygraph") -> List[PlanConfig]:
-        # One plan today: tile selection happens inside build. Exposing
-        # kernel_registry.candidates() as several knob-bearing plans is what
-        # makes routed autotune work over FROST configs — a follow-up.
-        self.check_support(graph)
-        return [PlanConfig(self.engine_id, None)]
-
     def build_plan(self, graph: "pygraph", plan: PlanConfig, ctx: ExecutionContext = None) -> CompiledPlan:
         from .graph_analyzer import build_gemm_plan
 

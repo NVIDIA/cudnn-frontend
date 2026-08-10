@@ -134,7 +134,7 @@ class Capabilities:
     causal: bool = False
     bottom_right: bool = False
     bottom_right_with_swa: bool = False  # kernel gap: BR diagonal excludes SWA
-    # Kernel gap (pre-existing, sibling of thd_bottom_right): the BR diagonal is
+    # Kernel gap (pre-existing): for a DENSE padded graph the BR diagonal is
     # computed as seq_len_kv[b] - GLOBAL S_q, but cuDNN semantics for a dense
     # padded graph carrying per-batch seq_len_q anchor it at
     # (seq_len_q[b], seq_len_kv[b]) — any batch with seq_len_q[b] < S_q gets a
@@ -147,17 +147,11 @@ class Capabilities:
     stats: bool = False
     # The adapter accepts lse_tensor=None (its kernel None-specializes the LSE
     # store), so a stats-less graph needs no dummy-LSE workspace chunk. Rows
-    # that keep False (the SM100 flavors) always write an LSE and get a carved
-    # dummy from lower_dsl_prefill when the graph has no Stats output.
+    # that keep False (the SM100 FP8/MXFP8 flavors) always write an LSE and get
+    # a carved dummy from lower_dsl_prefill when the graph has no Stats output.
     lse_optional: bool = False
     thd: bool = False
     cu_seq_len: bool = False  # cu_seq_len_q / cu_seq_len_kv prefix sums (no row serves these yet)
-    # True = the kernel anchors the THD bottom-right diagonal at each sequence's
-    # own (seq_len_q[b], seq_len_kv[b]). Rows that keep False (the SM100 flavors)
-    # compute it from the GLOBAL S_q — the THD variant of the
-    # bottom_right_padded_seq_q gap above.
-    thd_bottom_right: bool = False
-    thd_stats: bool = False  # packed LSE output plumbing is a follow-up
     # Dense padded + stats needs the per-batch seq_len_q LSE trim (padded
     # q-rows write LSE=-inf / O=0, cuDNN >= 9.14). Plumbed for the half
     # kernels via SEQ_Q_LENS_PRESENT; the FP8/MXFP8 kernels lack the epilogue
@@ -200,6 +194,20 @@ class Capabilities:
     tile_ms: frozenset[int] = frozenset()
     tile_ns: frozenset[int] = frozenset()
     cgas: frozenset[int] = frozenset()
+
+
+def _band_covers_kv_tail(facts: "ga.SdpaGraphFacts") -> bool:
+    """True when the causal band (plain or right-widened) provably masks every
+    KV column >= S_kv, so a ragged KV tail cannot leak into the softmax.
+
+    The last unmasked column is (S_q - 1) + R top-left or (S_kv - 1) + R
+    bottom-right (R = the right-band bound, 0 for plain causal)."""
+    if not (facts.causal or facts.right_band_widening):
+        return False
+    r = facts.right_bound or 0
+    if facts.bottom_right:
+        return r == 0
+    return facts.s_q + r <= facts.s_kv
 
 
 def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Optional[SdpaFwdKnobs] = None) -> Optional[str]:
@@ -301,21 +309,17 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             return f"graph uses {label}, which this engine does not support"
 
     if facts.bottom_right:
-        if not facts.causal:
-            return "bottom-right alignment requires a causal upper bound"
+        if not (facts.causal or facts.right_band_widening):
+            return "bottom-right alignment requires a causal upper bound (plain or right-widened)"
         if not capabilities.bottom_right:
             return "graph uses bottom-right causal, which this kernel does not support"
         if facts.window_left is not None and not capabilities.bottom_right_with_swa:
             return "bottom-right causal combined with a sliding window is not supported"
-        if facts.thd and not capabilities.thd_bottom_right:
-            return "THD with bottom-right causal is not supported (per-sequence diagonal gap)"
         if facts.padded and not facts.thd and facts.seq_q_t is not None and not capabilities.bottom_right_padded_seq_q:
             return (
                 "bottom-right causal with a dense padding mask carrying per-batch seq_len_q is not "
                 "supported (kernel anchors the BR diagonal at the global S_q, not seq_len_q[b])"
             )
-    if facts.thd and facts.wants_stats and not capabilities.thd_stats:
-        return "THD with generate_stats is not supported yet"
     if facts.padded and facts.wants_stats and not facts.thd and not capabilities.padded_stats:
         return "padding mask with generate_stats is not supported yet (per-batch seq_len_q LSE trim not plumbed)"
 
@@ -332,8 +336,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             )
 
     if capabilities.skv_tile and facts.s_kv % capabilities.skv_tile != 0 and not capabilities.skv_tail_via_padding:
-        causal_covers_tail = facts.causal and (facts.bottom_right or facts.s_q <= facts.s_kv)
-        if not (facts.padded or causal_covers_tail):
+        if not (facts.padded or _band_covers_kv_tail(facts)):
             return f"S_kv ({facts.s_kv}) must be a multiple of {capabilities.skv_tile} unless a padding mask is given or the causal mask covers the KV tail"
     return None
 
@@ -363,10 +366,12 @@ def _sm100_spec(d: int, d_v: Optional[int] = None) -> EngineSpec:
             dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
             causal=True,
             bottom_right=True,
+            right_band_widening=True,
             swa=True,
             padded=True,
             sink=True,
             stats=True,
+            lse_optional=True,
             thd=True,
             padded_stats=True,
             # The f16/bf16 lowering serves any dense B/H/S stride permutation
@@ -402,6 +407,7 @@ def _sm100_mxfp8_spec(d: int) -> EngineSpec:
             is_mxfp8=True,
             causal=True,
             bottom_right=True,
+            right_band_widening=True,
             swa=True,
             padded=True,
             sink=True,
@@ -437,6 +443,7 @@ def _sm100_fp8_spec(d: int) -> EngineSpec:
             is_fp8=True,
             causal=True,
             bottom_right=True,
+            right_band_widening=True,
             swa=True,
             padded=True,
             sink=True,
@@ -483,8 +490,6 @@ def _sm120_spec() -> EngineSpec:
             lse_optional=True,
             padded_stats=True,
             thd=True,
-            thd_bottom_right=True,
-            thd_stats=True,
             layouts=frozenset({"bshd", "dense_flex"}),
             sched_policies=frozenset({SCHED_NATURAL}),
             tile_ms=frozenset({64, 128}),
@@ -509,14 +514,6 @@ def analyze_for(spec: EngineSpec, graph, knobs: Optional[SdpaFwdKnobs] = None):
     if facts is None:
         return None, "graph is not a single sdpa() forward node"
     return facts, mismatch(spec.capabilities, facts, knobs)
-
-
-def probe(spec: EngineSpec, graph, knobs: Optional[SdpaFwdKnobs] = None) -> bool:
-    _, reason = analyze_for(spec, graph, knobs)
-    if reason is not None:
-        _LOG.debug("cudnn.sdpa: %s ineligible: %s", spec.name, reason)
-        return False
-    return True
 
 
 def build(spec: EngineSpec, graph, knobs: Optional[SdpaFwdKnobs] = None):
@@ -548,8 +545,9 @@ def lower_dsl_prefill(
     # a ragged S_kv with no mask covering the tail is served through the
     # kernel's padded path with per-batch lengths pinned to the full S_kv.
     skv_tile = spec.capabilities.skv_tile or 128
-    causal_covers_tail = facts.causal and (facts.bottom_right or facts.s_q <= facts.s_kv)
-    synth_kv_padding = spec.capabilities.skv_tail_via_padding and not facts.padded and not facts.thd and facts.s_kv % skv_tile != 0 and not causal_covers_tail
+    synth_kv_padding = (
+        spec.capabilities.skv_tail_via_padding and not facts.padded and not facts.thd and facts.s_kv % skv_tile != 0 and not _band_covers_kv_tail(facts)
+    )
 
     seq_q_t = facts.seq_q_t if facts.padded else None
     seq_kv_t = facts.seq_kv_t if facts.padded else None
@@ -566,9 +564,12 @@ def lower_dsl_prefill(
         sample_v=ga.tensor_desc_from_ir(facts.v_t, name="v"),
         sample_o=ga.tensor_desc_from_ir(facts.o_t, name="o"),
         sample_lse=ga.tensor_desc_from_ir(facts.stats_t, "lse") if facts.stats_t is not None else None,
-        is_causal=facts.causal,
+        # A right-widened band lowers as the causal mask with a BAND_RIGHT
+        # diagonal offset (facts.causal is False when right_bound > 0).
+        is_causal=facts.causal or facts.right_band_widening,
         causal_bottom_right=facts.bottom_right,
         window_size_left=facts.window_left,
+        window_size_right=(facts.right_bound if facts.right_band_widening else None),
         scale_softmax=facts.scale,
         seq_kv_lens_present=facts.padded or synth_kv_padding,
         # Dense padded-Q trim (q rows >= seq_len_q[b] -> O := 0, LSE := -inf):
@@ -593,11 +594,10 @@ def lower_dsl_prefill(
     # build time and recorded on the executor as ``workspace_bytes`` — that
     # number is what the plan's CompiledPlan.get_workspace_size() reports.
     #   - dummy LSE (dense, stats absent, non-lse_optional adapters): the
-    #     SM100 kernels always write an LSE; without a Stats output it lands
-    #     in b*h_q*s_q fp32 scratch. lse_optional adapters (SM120) compile the
-    #     LSE store out instead and bind no buffer. (THD needs no engine-level
-    #     LSE chunk — the packed THD LSE is part of the api-level scratch
-    #     below.)
+    #     SM100 FP8/MXFP8 kernels always write an LSE; without a Stats output
+    #     it lands in b*h_q*s_q fp32 scratch. lse_optional adapters (the f16
+    #     flavors, SM120) compile the LSE store out instead and bind no
+    #     buffer. (THD needs no engine-level LSE chunk either way.)
     #   - synthesized seq_len_kv (skv_tail_via_padding rows): b int32.
     #   - api-level scratch (api.scratch_workspace_bytes()): the dense padded
     #     [seq_kv|seq_q] combine and the THD metadata/LSE buffers.
@@ -769,4 +769,4 @@ ENGINE_SPECS = (
     _sm120_spec(),
 )
 
-__all__ = ["Capabilities", "EngineSpec", "ENGINE_SPECS", "SdpaFwdKnobs", "analyze_for", "build", "engine_name", "mismatch", "probe"]
+__all__ = ["Capabilities", "EngineSpec", "ENGINE_SPECS", "SdpaFwdKnobs", "analyze_for", "build", "engine_name", "mismatch"]

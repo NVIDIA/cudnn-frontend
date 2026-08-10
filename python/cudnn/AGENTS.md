@@ -32,6 +32,12 @@ Numbered so reviews can cite them; the list grows — append, never renumber.
   raise, never fall back to a zeros dummy (zeros sinks change the softmax
   denominator; zeros seq lens mask every row — silently wrong output). A
   provided-but-uncompiled tensor must also raise, never be silently ignored.
+- **No degenerate-path fixups.** Runtime-degenerate inputs (e.g. all-zero
+  THD ``seq_kv_lens``) go through the kernel's own dead-row path — never
+  re-implemented adapter-side with `fill_`/`copy_` writes (surprise kernel
+  launches, and a second copy of the semantics that can drift). If a packed
+  extent would be zero, bind a never-dereferenced dummy view over storage
+  the contract already guarantees.
 
 ## Frontend-only kernel package layout
 

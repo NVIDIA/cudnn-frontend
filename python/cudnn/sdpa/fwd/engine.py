@@ -103,14 +103,6 @@ class FrostSdpaFwdEngine(BaseEngine):
         if reason is not None:
             raise NotImplementedError(f"{self.name}: {reason}")
 
-    def propose_plans(self, graph: "pygraph") -> List[PlanConfig]:
-        # One plan, no knobs: nothing proposes a tuning request today, so the
-        # engines run at their capability row's default tile/schedule. A knob
-        # search (SdpaFwdKnobs over Capabilities.tile_ms/tile_ns/cgas) becomes
-        # several entries here; each one's knobs reach build_plan verbatim.
-        self.check_support(graph)
-        return [PlanConfig(self.engine_id, self.default_knobs)]
-
     def build_plan(self, graph: "pygraph", plan: PlanConfig, ctx: ExecutionContext = None) -> CompiledPlan:
         from .engines import build
 
@@ -131,7 +123,7 @@ def FrostSdpaFwdEngines(ids) -> List[FrostSdpaFwdEngine]:
     ``ids`` is ``{name: engine_id}`` from engines/manifest.py — the single
     source of engine ids. A spec absent from it is one the manifest is not
     offering (still opt-in gated), so it is simply not built; a spec that has
-    no slot AT ALL is caught by test_engine_router, not at runtime.
+    no slot AT ALL is caught by test_dispatch, not at runtime.
     """
     from .engines import ENGINE_SPECS
 

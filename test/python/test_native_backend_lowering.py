@@ -421,19 +421,20 @@ def test_native_rmsnorm_lowers_to_backend():
     torch.testing.assert_close(ivb, ivref, atol=5e-3, rtol=5e-3)
 
 
-def test_mixed_router_backend_slot_executes():
-    """Review round 4: the backend entry of a MIXED router is selectable and
+def test_mixed_ranking_backend_slot_executes(monkeypatch):
+    """Review round 4: the backend entry of a MIXED ranking is selectable and
     actually executes through the backend (lowering triggered), with routed
     indices stable across that lowering; the pinned python plan still runs
     afterwards with its own knobs."""
-    from cudnn.engines import BaseEngine, PlanConfig, Router, is_backend_engine
-    from cudnn.engines.engine_ids import OUT_OF_TREE_ID_BASE
+    from cudnn.engines import BaseEngine, PlanConfig, heuristics, is_backend_engine
+
+    from test_dispatch import _FAKE, _offer
 
     ran = []
 
     class PyMatmul(BaseEngine):
         name = "py_matmul"
-        engine_id = OUT_OF_TREE_ID_BASE + 90
+        engine_id = _FAKE + 90
 
         def execute(self, graph, uid_to_data, ctx=None):
             from cudnn.engines.base import resolve_node_buffers
@@ -447,12 +448,8 @@ def test_mixed_router_backend_slot_executes():
             ran.append("python")
 
     py_engine = PyMatmul()
-
-    class CudnnFirst(Router):
-        def plan(self, graph, backends):
-            # ``backends`` also carries the in-tree manifest candidates, so name
-            # the engine this test means instead of taking the first one.
-            return graph.backend_plan_entries() + [PlanConfig(py_engine.engine_id)]
+    _offer(monkeypatch, py_engine)
+    monkeypatch.setattr(heuristics, "rank", lambda graph, engines, backend_plans, modes=None: list(backend_plans) + [PlanConfig(py_engine.engine_id)])
 
     h = _handle()
     a = torch.randn(1, M, K, device="cuda", dtype=torch.float16)
@@ -460,23 +457,20 @@ def test_mixed_router_backend_slot_executes():
     c = torch.empty(1, M, N, device="cuda", dtype=torch.float16)
     ref = (a.float() @ b.float()).half()
 
-    g = pygraph(
-        handle=h, io_data_type=cudnn.data_type.HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT, router=CudnnFirst()
-    )
-    g.register_backend(py_engine)
+    g = pygraph(handle=h, io_data_type=cudnn.data_type.HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
     A = g.tensor(dim=[1, M, K], stride=[M * K, K, 1])
     B = g.tensor(dim=[1, K, N], stride=[K * N, N, 1])
     C = g.matmul(A, B)
     C.set_output(True).set_data_type(cudnn.data_type.HALF)
 
     g.create_execution_plans()
-    # the router's backend MARKER is expanded in place into the backend's own
-    # ranked entries before the list is observable, so the python plan sits
-    # after them — never at the marker's index.
+    # backend_plan_entries() hands back the backend's own ranked entries, one
+    # per heuristic mode -- never a single 'the backend goes here' marker the
+    # frontend expands afterwards -- so the python plan sits behind all of them.
     routed = [p.engine_id for p in g.plans]
     python_slot = len(routed) - 1
     assert all(is_backend_engine(i) for i in routed[:python_slot])
-    assert routed[python_slot] == OUT_OF_TREE_ID_BASE + 90
+    assert routed[python_slot] == _FAKE + 90
 
     # slot 0 = cuDNN: this build/execute lowers and runs the real backend
     assert g.selected_engine is None

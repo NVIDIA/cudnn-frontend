@@ -61,3 +61,41 @@ requires_dsl = pytest.mark.skipif(not _DSL_OK, reason=_DSL_WHY or "cutedsl avail
 def _dsl_installed() -> bool:
     """For the few call sites that gate inside a test body rather than on it."""
     return _DSL_OK
+
+
+def _is_plan_for(plan_name, engine) -> bool:
+    """A plan reads ``<engine>[<knobs>]``: the heuristics name a concrete config
+    for every entry, so match on the engine, not on the whole plan name."""
+    return plan_name == engine or plan_name.startswith(engine + "[")
+
+
+def select_engine(graph, name, tiles=None):
+    """Pin the ranked entry for engine ``name`` (graph.plans holds the backend's
+    plans and the python engines' in one list). A pin is strict: check_support /
+    build_plans raise if that engine declines the graph.
+
+    The FIRST entry for that engine is the heuristics' own best guess for this
+    shape. ``tiles`` pins a different one, so a test can run a tile the best
+    guess would not choose.
+    """
+    names = [graph.get_plan_name_at_index(i) for i in range(len(graph.plans))]
+    if tiles is None:
+        index = next((i for i, n in enumerate(names) if _is_plan_for(n, name)), None)
+        assert index is not None, f"engine {name!r} did not claim this graph; plans={names}"
+    else:
+        # Against the STRUCTURED knobs, not the rendered plan name: substring
+        # matching a name would let a request for tile_n=128 select a tile_n=1280
+        # plan, and the test would pass having run something else.
+        def _wanted(i):
+            knobs = graph.plans[i].knobs
+            return _is_plan_for(names[i], name) and (getattr(knobs, "tile_m", None), getattr(knobs, "tile_n", None)) == tuple(tiles)
+
+        index = next((i for i in range(len(names)) if _wanted(i)), None)
+        assert index is not None, f"no plan for tiles {tiles}; plans={names}"
+    graph.select_plan(index)
+    return graph
+
+
+def offers_engine(graph, name) -> bool:
+    """Whether any ranked entry is a plan for engine ``name``."""
+    return any(_is_plan_for(graph.get_plan_name_at_index(i), name) for i in range(len(graph.plans)))
