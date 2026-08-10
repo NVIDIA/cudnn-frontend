@@ -34,6 +34,9 @@ _SM120_DTYPE_QKV_CODE = {
 # delta / dq_accum rows are padded to multiples of 128 (the kernel's
 # dq_accum layout contract: tile_q must divide 128).
 _SM120_ROW_ROUND = 128
+# dq_sem is sized for the smallest legal q-tile so one formula covers every
+# tile choice; must match the template's fake_dq_sem sizing.
+_SM120_MIN_Q_TILE = 32
 
 _logger = logging.getLogger(__name__)
 
@@ -66,6 +69,7 @@ class SdpaBwdDsl(APIBase):
         is_causal: bool = False,
         causal_bottom_right: bool = False,
         window_size_left: Optional[int] = None,
+        deterministic: bool = False,
         scale_softmax: Optional[float] = None,
         tile_m: Optional[int] = None,
         tile_n: Optional[int] = None,
@@ -87,6 +91,7 @@ class SdpaBwdDsl(APIBase):
         self.is_causal = bool(is_causal)
         self.causal_bottom_right = bool(causal_bottom_right)
         self.window_size_left = None if window_size_left is None else int(window_size_left)
+        self.deterministic = bool(deterministic)
         self.scale_softmax = scale_softmax
         self.tile_m = None if tile_m is None else int(tile_m)
         self.tile_n = None if tile_n is None else int(tile_n)
@@ -273,6 +278,7 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
             is_causal=self.is_causal,
             causal_top_left=self.is_causal and not self.causal_bottom_right,
             window_size_left=self.window_size_left,
+            deterministic=self.deterministic,
             q_tile=self.q_tile,
             kv_tile=self.kv_tile,
         )
@@ -287,15 +293,22 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
         )
         self._logger.debug("compile completed")
 
+    def _dq_sem_len(self) -> int:
+        """Element count of the dq_sem relay-counter buffer (int32)."""
+
+        return self.batch_size * self.h_q * _round_up(self.s_q_max, _SM120_MIN_Q_TILE) // _SM120_MIN_Q_TILE
+
     def scratch_workspace_bytes(self) -> int:
         """delta (fp32 [B, H, SQ_r128]) + dq_accum (fp32 flat [B*SQ_r128*H*D])
+        + dq_sem (int32 flat [B*H*ceil(SQ/32)], deterministic relay counters)
         + one compact staging copy per non-BSHD-compact operand."""
 
         self._ensure_support_checked()
         delta_bytes = ws_align(self.batch_size * self.h_q * self._sq_rounded * 4)
         dq_accum_bytes = ws_align(self.batch_size * self._sq_rounded * self.h_q * self.head_dim_padded * 4)
+        dq_sem_bytes = ws_align(self._dq_sem_len() * 4)
         staging_bytes = sum(ws_align(numel * self.dtype.itemsize) for numel in self._staging_numels.values())
-        return delta_bytes + dq_accum_bytes + staging_bytes
+        return delta_bytes + dq_accum_bytes + dq_sem_bytes + staging_bytes
 
     def execute(
         self,
@@ -323,6 +336,7 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
         carver = WorkspaceCarver(workspace, self.scratch_workspace_bytes(), "sdpa_bwd_sm120")
         delta = carver.take(self.batch_size * self.h_q * self._sq_rounded, torch.float32).reshape(self.batch_size, self.h_q, self._sq_rounded)
         dq_accum = carver.take(self.batch_size * self._sq_rounded * self.h_q * self.head_dim_padded, torch.float32)
+        dq_sem = carver.take(self._dq_sem_len(), torch.int32)
 
         if current_stream is None:
             # Direct call (no dispatch-forwarded stream): fall back to torch's
@@ -369,7 +383,7 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
 
             kernels = self._compiled_kernel
             # Three-kernel chain
-            kernels.dot(o, do, delta, dq_accum, current_stream)
+            kernels.dot(o, do, delta, dq_accum, dq_sem, current_stream)
             kernels.main(
                 q,
                 k,
@@ -378,6 +392,7 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
                 lse,
                 delta,
                 dq_accum,
+                dq_sem,
                 dk,
                 dv,
                 cutlass.Float32(scale_log2),
@@ -408,6 +423,7 @@ def sdpa_bwd_wrapper_dsl_sm120(
     is_causal: bool = False,
     causal_bottom_right: bool = False,
     window_size_left: Optional[int] = None,
+    deterministic: bool = False,
     scale_softmax: Optional[float] = None,
 ) -> TupleDict:
     """Run SM120 SDPA backward and return ``TupleDict(dq_tensor=..., dk_tensor=..., dv_tensor=...)``."""
@@ -429,6 +445,7 @@ def sdpa_bwd_wrapper_dsl_sm120(
         bool(is_causal),
         bool(causal_bottom_right),
         window_size_left,
+        bool(deterministic),
         scale_softmax,
     )
     api = _wrapper_api_cache.get(cache_key)
@@ -446,6 +463,7 @@ def sdpa_bwd_wrapper_dsl_sm120(
             is_causal=is_causal,
             causal_bottom_right=causal_bottom_right,
             window_size_left=window_size_left,
+            deterministic=deterministic,
             scale_softmax=scale_softmax,
         )
         api.check_support()

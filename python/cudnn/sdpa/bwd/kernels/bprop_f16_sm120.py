@@ -18,12 +18,11 @@ fp32 workspace and finalized by a small convert kernel.
 
 Constraints:
 * Supported input dtypes: Float16 and BFloat16 (output dtype matches)
-* Head dimension must be one of 32, 64, 128, 192, or 256
+* Head dimension must be one of 32, 64, 128, 192, or 256; the adapter
+  serves any other multiple of 8 up to 256 by zero-padding D.
 * Equal Q/KV head counts (no GQA); no dropout/alibi/softcap
 * Optional causal (top-left or bottom-right) and sliding-window masks
-* Q/K/V/O/dO/dQ/dK/dV use compact BSHD storage
 * LSE input is the natural-log forward stats, fp32 (B, H, SQ) contiguous
-* dQ accumulation uses fp32 atomics (not bitwise deterministic)
 
 One backward call is three kernel launches through the per-shape
 ``compile()`` cache at the bottom of this module: ``dot`` (delta =
@@ -387,6 +386,48 @@ def _bwd_gemm5_dk(
         )
 
 
+@cute.jit
+def _bwd_det_wait(det_sem, m_block, det_turn, warp):
+    """Deterministic-relay entry: block the 8 compute warps until it is this
+    CTA's turn for q-tile ``m_block`` (FA3 / cuDNN-SM90 STAGES=4 scheme).
+
+    One elected lane of warp 0 spins on an acquire load of the turn counter;
+    barrier 6 (compute warps only — never the producer's 288-thread
+    barriers) releases the other warps into the dQ scatter."""
+    if warp == 0:
+        if prims.elect_sync():
+            while (
+                prims.load_ext(
+                    det_sem + m_block,
+                    order=prims.MemOrder.ACQUIRE,
+                    scope=prims.MemScope.GPU,
+                )
+                != det_turn
+            ):
+                pass
+    cute.arch.barrier(barrier_id=6, number_of_threads=256)
+
+
+@cute.jit
+def _bwd_det_release(det_sem, m_block, det_turn, warp):
+    """Deterministic-relay exit: pass the turn for ``m_block`` to the next
+    kv tile once every compute warp has issued its dQ reds.
+
+    The release store alone orders the relaxed reds before the handoff: the
+    barrier sequences the other warps' reds against this thread (CTA scope)
+    and st.release makes them cumulatively visible at GPU scope (its own
+    membar; an extra fence here doubled the per-handoff drain cost)."""
+    cute.arch.barrier(barrier_id=6, number_of_threads=256)
+    if warp == 0:
+        if prims.elect_sync():
+            prims.store_ext(
+                (det_turn + 1).ir_value(),
+                det_sem + m_block,
+                order=prims.MemOrder.RELEASE,
+                scope=prims.MemScope.GPU,
+            )
+
+
 # ---------------------------------------------------------------------------
 # Main kernel.
 # ---------------------------------------------------------------------------
@@ -421,6 +462,7 @@ class SM120FusedMultiHeadAttentionFP16Backward:
         is_causal: bool = False,
         causal_top_left: bool = False,
         window_size_left: int | None = None,
+        deterministic: bool = False,
         head_dim: int = 128,
         use_pdl: bool = True,
         q_tile: int = 0,
@@ -430,6 +472,7 @@ class SM120FusedMultiHeadAttentionFP16Backward:
         self.is_causal = is_causal
         self.causal_top_left = bool(causal_top_left)
         self.window_size_left = window_size_left
+        self.deterministic = bool(deterministic)
         self.d = head_dim
         self.use_pdl = bool(use_pdl)
         self.q_tile, self.kv_tile = self.DEFAULT_TILES[head_dim]
@@ -508,6 +551,7 @@ class SM120FusedMultiHeadAttentionFP16Backward:
         lse: cute.Tensor,  # [B, H, SQ] fp32 (natural-log LSE)
         delta: cute.Tensor,  # [B, H, SQ_r128] fp32 (dot_do_o output)
         dq_accum: cute.Tensor,  # [B*SQ_r128*H*D] fp32 (scrambled, zeroed)
+        dq_sem: cute.Tensor,  # [B*H*num_q_tiles] int32 relay turn counters, one per (batch, head, q-tile); zeroed by dot (deterministic only)
         dk: cute.Tensor,  # [B, SKV, H, D] output
         dv: cute.Tensor,  # [B, SKV, H, D] output
         tma_q_desc: cutlass.GridConstant[cuda.TensorMap],
@@ -566,6 +610,8 @@ class SM120FusedMultiHeadAttentionFP16Backward:
         dqa_ptr = dq_accum.iterator.raw_ptr()
         dk_ptr = dk.iterator.raw_ptr()
         dv_ptr = dv.iterator.raw_ptr()
+        if cutlass.const_expr(self.deterministic):
+            dqsem_ptr = dq_sem.iterator.raw_ptr()
 
         PARTIAL_Q = (SQ % M) != 0
         PARTIAL_KV = (SKV % N) != 0
@@ -619,6 +665,8 @@ class SM120FusedMultiHeadAttentionFP16Backward:
         khd_base = (batch * SKV + kv_base) * row_stride + head * d
         lse_base = (batch * H + head) * SQ
         dd_base = (batch * H + head) * SQ_R
+        if cutlass.const_expr(self.deterministic):
+            det_sem = dqsem_ptr + (batch * H + head) * ((SQ + M - 1) // M)
 
         if warp == self.load_warp_id:
             prims.setmaxregister(24, prims.SetMaxRegisterAction.DECREASE)
@@ -979,6 +1027,20 @@ class SM120FusedMultiHeadAttentionFP16Backward:
                 # the producer refill the single dO buffer.
                 cute.arch.barrier(barrier_id=4, number_of_threads=288)
 
+                # Deterministic relay turn for this q-tile: the dQ adds of a
+                # (batch, head, q-tile) happen in ascending kv-tile order.
+                if cutlass.const_expr(self.deterministic):
+                    if cutlass.const_expr(self.window_size_left is not None):
+                        # SWA clamps m_block_max, so a q-tile's visitors start
+                        # at kv tile n_lo = max((m_block*M + diag_off - W) // N, 0)
+                        # (inverts the clamp); count turns from there.
+                        det_turn = n_block - cute.math.max(
+                            (m_block * M + diag_off - self.window_size_left) // N,
+                            cutlass.Int32(0),
+                        )
+                    else:
+                        det_turn = n_block
+
                 if cutlass.const_expr(Q_STAGES == 1):
                     # Single Q buffer: GEMM5 (sQ's last reader) first, so the
                     # Q refill hides behind GEMM4 + the dQ scatter. (2-stage
@@ -1033,7 +1095,11 @@ class SM120FusedMultiHeadAttentionFP16Backward:
                                         val = cutlass.Float32(float("inf"))
                                 lse_r[rep * 2 + hf] = val * cutlass.Float32(_LOG2E)
                     dqa_base = ((batch * SQ_R + q_row0) * H + head) * d
+                    if cutlass.const_expr(self.deterministic):
+                        _bwd_det_wait(det_sem, m_block, det_turn, warp)
                     _bwd_dq_scatter(acc_dq, dqa_ptr, dqa_base, math_tidx, H, DQ_REPS=DQ_REPS, DQ_NF=DQ_NF, M=M, d=d)
+                    if cutlass.const_expr(self.deterministic):
+                        _bwd_det_release(det_sem, m_block, det_turn, warp)
                 else:
                     _bwd_gemm4_dq(
                         acc_dq,
@@ -1069,7 +1135,11 @@ class SM120FusedMultiHeadAttentionFP16Backward:
                                         val = cutlass.Float32(float("inf"))
                                 lse_r[rep * 2 + hf] = val * cutlass.Float32(_LOG2E)
                     dqa_base = ((batch * SQ_R + q_row0) * H + head) * d
+                    if cutlass.const_expr(self.deterministic):
+                        _bwd_det_wait(det_sem, m_block, det_turn, warp)
                     _bwd_dq_scatter(acc_dq, dqa_ptr, dqa_base, math_tidx, H, DQ_REPS=DQ_REPS, DQ_NF=DQ_NF, M=M, d=d)
+                    if cutlass.const_expr(self.deterministic):
+                        _bwd_det_release(det_sem, m_block, det_turn, warp)
                     _bwd_gemm5_dk(
                         acc_dk,
                         sdS,
@@ -1143,6 +1213,7 @@ class SM120FusedMultiHeadAttentionFP16Backward:
         lse: cute.Tensor,
         delta: cute.Tensor,
         dq_accum: cute.Tensor,
+        dq_sem: cute.Tensor,
         dk: cute.Tensor,
         dv: cute.Tensor,
         softmax_scale_log2: cutlass.Float32,
@@ -1164,6 +1235,7 @@ class SM120FusedMultiHeadAttentionFP16Backward:
             lse,
             delta,
             dq_accum,
+            dq_sem,
             dk,
             dv,
             tma_q_desc,
@@ -1182,7 +1254,7 @@ class SM120FusedMultiHeadAttentionFP16Backward:
 
 
 # ---------------------------------------------------------------------------
-# Preprocess kernel: delta = rowsum(dO * O) + dq_accum zeroing
+# Preprocess kernel: delta = rowsum(dO * O) + dq_accum / dq_sem zeroing
 # ---------------------------------------------------------------------------
 
 
@@ -1192,10 +1264,12 @@ def _dot_do_o_kernel(
     do: cute.Tensor,  # [B, SQ, H, D]
     delta: cute.Tensor,  # [B, H, SQ_r128] fp32 out
     dq_accum: cute.Tensor,  # [B*SQ_r128*H*D] fp32 (zeroed here)
+    dq_sem: cute.Tensor,  # [B*H*num_q_tiles] int32 relay turn counters (zeroed here when deterministic)
     q_tile: cutlass.Constexpr[int],
     d: cutlass.Constexpr[int],
     page: cutlass.Constexpr[int],
     use_pdl: cutlass.Constexpr[bool],
+    deterministic: cutlass.Constexpr[bool],
 ):
     if cutlass.const_expr(use_pdl):
         cute.arch.griddepcontrol_launch_dependents()
@@ -1266,6 +1340,14 @@ def _dot_do_o_kernel(
             addr = dqa_base + (zr0 + im * zrows) * (H * d) + zc0 + jn * ztpr * 4
             (dqa_ptr + addr).store(zero4, alignment=16)
 
+    if cutlass.const_expr(deterministic):
+        # Reset this q-tile's relay turn counter (PDL-ordered before the main
+        # kernel's first acquire, like the dq_accum zeroing above).
+        if tidx == 0:
+            num_q_tiles = (SQ + M - 1) // M
+            sem_ptr = dq_sem.iterator.raw_ptr()
+            (sem_ptr + (batch * H + head) * num_q_tiles + m_block).store(cutlass.Int32(0))
+
 
 @cute.jit
 def _dot_do_o_host(
@@ -1273,14 +1355,16 @@ def _dot_do_o_host(
     do: cute.Tensor,
     delta: cute.Tensor,
     dq_accum: cute.Tensor,
+    dq_sem: cute.Tensor,
     q_tile: cutlass.Constexpr[int],
     d: cutlass.Constexpr[int],
     page: cutlass.Constexpr[int],
     use_pdl: cutlass.Constexpr[bool],
+    deterministic: cutlass.Constexpr[bool],
     stream: cuda_driver.CUstream,
 ):
     m_blocks = cute.ceil_div(o.shape[1], q_tile)
-    _dot_do_o_kernel(o, do, delta, dq_accum, q_tile, d, page, use_pdl).launch(
+    _dot_do_o_kernel(o, do, delta, dq_accum, dq_sem, q_tile, d, page, use_pdl, deterministic).launch(
         grid=(m_blocks, o.shape[2], o.shape[0]),
         block=(256, 1, 1),
         stream=stream,
@@ -1407,6 +1491,7 @@ def compile(  # noqa: A001
         is_causal=PARAMS.is_causal,
         causal_top_left=PARAMS.causal_top_left,
         window_size_left=PARAMS.window_size_left,
+        deterministic=PARAMS.deterministic,
         head_dim=d,
         use_pdl=PARAMS.use_pdl,
         q_tile=PARAMS.q_tile,
@@ -1433,6 +1518,9 @@ def compile(  # noqa: A001
     fake_lse = _fake(cutlass.Float32, (b, qh, sq))
     fake_delta = _fake(cutlass.Float32, (b, qh, sq_r))
     fake_dq_accum = _fake(cutlass.Float32, (b * sq_r * qh * d,))
+    # Sized for the smallest legal q-tile (32) so one formula covers every
+    # tile choice; must match the adapter's carve (scratch_workspace_bytes).
+    fake_dq_sem = _fake(cutlass.Int32, (b * qh * ceil_div(sq, 32),))
     fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
     options = "--enable-tvm-ffi"
 
@@ -1442,10 +1530,12 @@ def compile(  # noqa: A001
         fake_do,
         fake_delta,
         fake_dq_accum,
+        fake_dq_sem,
         bwd.q_tile,
         d,
         bwd.page,
         bwd.use_pdl,
+        bwd.deterministic,
         fake_stream,
         options=options,
     )
@@ -1458,6 +1548,7 @@ def compile(  # noqa: A001
         fake_lse,
         fake_delta,
         fake_dq_accum,
+        fake_dq_sem,
         fake_dk,
         fake_dv,
         cutlass.Float32(1.0),

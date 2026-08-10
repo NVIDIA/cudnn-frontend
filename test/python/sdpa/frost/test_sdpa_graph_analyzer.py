@@ -897,9 +897,10 @@ def test_bwd_probe_rejects_gqa(monkeypatch):
 
 
 def test_bwd_probe_rejects_unsupported_head_dim(monkeypatch):
+    # Envelope: any multiple of 8 up to 256 (adapter pads); reject the rest.
     monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
-    assert not _bwd_eligible(_mk_bwd_graph(d=96))
-    assert not _bwd_eligible(_mk_bwd_graph(d=256))
+    assert not _bwd_eligible(_mk_bwd_graph(d=100))
+    assert not _bwd_eligible(_mk_bwd_graph(d=264))
 
 
 def test_bwd_probe_causal_notches(monkeypatch):
@@ -912,9 +913,10 @@ def test_bwd_probe_causal_notches(monkeypatch):
     assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(s_q=S // 2, use_causal_mask_bottom_right=True, sliding_window_length=64))
 
 
-def test_bwd_probe_rejects_deterministic(monkeypatch):
+def test_bwd_probe_accepts_deterministic(monkeypatch):
+    # use_deterministic_algorithm is served by the ordered-relay dQ path.
     monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
-    assert not _bwd_eligible(_mk_bwd_graph(use_deterministic_algorithm=True))
+    assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(use_deterministic_algorithm=True))
 
 
 def test_bwd_probe_rejects_bias(monkeypatch):
@@ -963,12 +965,10 @@ def test_bwd_mismatch_reason_strings(monkeypatch):
     caps = bwd_engines.ENGINE_SPECS[0].capabilities
     reason = bwd_engines.mismatch(caps, _facts(_mk_bwd_graph(h_kv=H // 2)))
     assert reason is not None and "GQA" in reason
-    reason = bwd_engines.mismatch(caps, _facts(_mk_bwd_graph(d=96)))
-    assert reason is not None and "96" in reason
+    reason = bwd_engines.mismatch(caps, _facts(_mk_bwd_graph(d=100)))
+    assert reason is not None and "100" in reason
     reason = bwd_engines.mismatch(caps, _facts(_mk_bwd_graph(use_causal_mask=True, use_alibi_mask=True)))
     assert reason is not None and "ALiBi" in reason
-    reason = bwd_engines.mismatch(caps, _facts(_mk_bwd_graph(use_deterministic_algorithm=True)))
-    assert reason is not None and "deterministic" in reason
     reason = bwd_engines.mismatch(caps, _facts(_mk_bwd_graph()), engines.SdpaFwdKnobs(tile_m=64))
     assert reason is not None and "knob" in reason
     reason = bwd_engines.mismatch(caps, _facts(_mk_bwd_graph()), bwd_engines.SdpaBwdKnobs(tile_m=48))
