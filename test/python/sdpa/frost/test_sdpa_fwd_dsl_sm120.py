@@ -98,6 +98,7 @@ def _ref_sdpa_full(
     is_causal: bool = False,
     causal_bottom_right: bool = False,
     window_size_left: int | None = None,
+    window_size_right: int | None = None,
     seq_q_lens: torch.Tensor | None = None,
     seq_kv_lens: torch.Tensor | None = None,
     sinks: torch.Tensor | None = None,
@@ -106,7 +107,9 @@ def _ref_sdpa_full(
     """fp32 reference matching the SM120 DSL kernel's mask semantics.
     q/k/v are BHSD; GQA (h_q > h_kv) is handled by expanding K/V. ``sinks``
     is one logit per Q head, joining the softmax as a virtual column with no
-    V row.
+    V row. ``window_size_right`` widens the diagonal to the right by R
+    columns (inclusive; keep ``j <= lim + R``) — cuDNN's
+    diagonal_band_right_bound, exclusive with ``is_causal``.
     """
 
     b, h_q, s_q, _ = q.shape
@@ -125,6 +128,8 @@ def _ref_sdpa_full(
     masked = (i >= q_lens.view(b, 1, 1, 1)) | (j >= kv_lens.view(b, 1, 1, 1))
     if is_causal:
         masked = masked | (j > lim)
+    if window_size_right is not None:
+        masked = masked | (j > lim + window_size_right)
     if window_size_left is not None:
         masked = masked | (j < lim - window_size_left)
     scores = scores.masked_fill(masked, float("-inf"))
@@ -157,6 +162,7 @@ def _run_case(
     is_causal: bool = False,
     causal_bottom_right: bool = False,
     window_size_left: int | None = None,
+    window_size_right: int | None = None,
     seq_q_lens: torch.Tensor | None = None,
     seq_kv_lens: torch.Tensor | None = None,
     scale: float | None = None,
@@ -172,6 +178,7 @@ def _run_case(
         is_causal=is_causal,
         causal_bottom_right=causal_bottom_right,
         window_size_left=window_size_left,
+        window_size_right=window_size_right,
         seq_q_lens=seq_q_lens,
         seq_kv_lens=seq_kv_lens,
         sinks=sinks,
@@ -196,6 +203,27 @@ def _run_case(
     torch.testing.assert_close(output.float(), expected, atol=0.1, rtol=5e-2)
 
 
+def _apply_mask_kwargs(sdpa_kwargs, cudnn, *, is_causal, causal_bottom_right, window_size_left, window_size_right):
+    """Translate the reference mask vocabulary into graph sdpa kwargs.
+
+    A right bound makes the mask a diagonal BAND (with the requested
+    alignment; a left bound rides along, cuDNN length L = offset W + 1);
+    otherwise the causal / sliding-window flags apply.
+    """
+    if window_size_right is not None:
+        sdpa_kwargs["diagonal_band_right_bound"] = window_size_right
+        sdpa_kwargs["diagonal_alignment"] = cudnn.diagonal_alignment.BOTTOM_RIGHT if causal_bottom_right else cudnn.diagonal_alignment.TOP_LEFT
+        if window_size_left is not None:
+            sdpa_kwargs["diagonal_band_left_bound"] = window_size_left + 1
+    else:
+        if causal_bottom_right:
+            sdpa_kwargs["use_causal_mask_bottom_right"] = True
+        elif is_causal:
+            sdpa_kwargs["use_causal_mask"] = True
+        if window_size_left is not None:
+            sdpa_kwargs["sliding_window_length"] = window_size_left + 1
+
+
 def _run_dsl_graph(
     q_gpu: torch.Tensor,
     k_gpu: torch.Tensor,
@@ -206,6 +234,7 @@ def _run_dsl_graph(
     is_causal: bool = False,
     causal_bottom_right: bool = False,
     window_size_left: int | None = None,
+    window_size_right: int | None = None,
     seq_q_lens: torch.Tensor | None = None,
     seq_kv_lens: torch.Tensor | None = None,
     sinks: torch.Tensor | None = None,
@@ -250,12 +279,14 @@ def _run_dsl_graph(
     }
     variant_pack = {q: q_gpu, k: k_gpu, v: v_gpu}
 
-    if causal_bottom_right:
-        sdpa_kwargs["use_causal_mask_bottom_right"] = True
-    elif is_causal:
-        sdpa_kwargs["use_causal_mask"] = True
-    if window_size_left is not None:
-        sdpa_kwargs["sliding_window_length"] = window_size_left + 1
+    _apply_mask_kwargs(
+        sdpa_kwargs,
+        cudnn,
+        is_causal=is_causal,
+        causal_bottom_right=causal_bottom_right,
+        window_size_left=window_size_left,
+        window_size_right=window_size_right,
+    )
     if seq_q_lens is not None or seq_kv_lens is not None:
         assert seq_q_lens is not None and seq_kv_lens is not None
         seq_q = graph.tensor_like(seq_q_lens, name="seq_q")
@@ -344,6 +375,7 @@ def _run_thd_case(
     is_causal: bool = False,
     causal_bottom_right: bool = False,
     window_size_left: int | None = None,
+    window_size_right: int | None = None,
     with_sink: bool = False,
     check_stats: bool = False,
     stats_layout: str = "token_major",
@@ -406,12 +438,14 @@ def _run_thd_case(
         seq_len_q=sq,
         seq_len_kv=skv,
     )
-    if causal_bottom_right:
-        sdpa_kwargs["use_causal_mask_bottom_right"] = True
-    elif is_causal:
-        sdpa_kwargs["use_causal_mask"] = True
-    if window_size_left is not None:
-        sdpa_kwargs["sliding_window_length"] = window_size_left + 1
+    _apply_mask_kwargs(
+        sdpa_kwargs,
+        cudnn,
+        is_causal=is_causal,
+        causal_bottom_right=causal_bottom_right,
+        window_size_left=window_size_left,
+        window_size_right=window_size_right,
+    )
     variant_pack = {tq: q_view, tk: k_view, tv: v_view, rq: q_ro, rk: k_ro, rv: v_ro, ro: o_ro, sq: sq_t, skv: skv_t}
     if sinks is not None:
         st = graph.tensor_like(sinks, name="sink")
@@ -483,6 +517,7 @@ def _run_thd_case(
             is_causal=is_causal,
             causal_bottom_right=causal_bottom_right,
             window_size_left=window_size_left,
+            window_size_right=window_size_right,
             sinks=sinks,
             return_stats=check_stats,
         )
@@ -824,6 +859,14 @@ def test_dsl_sm120_execute_contract_mismatches():
     with pytest.raises(ValueError, match="without an LSE output"):
         api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=seq_kv, seq_kv_lens=seq_kv, lse_tensor=lse_thd)
 
+    # Right-band contract (band model): window_size_right is the causal
+    # diagonal's right bound (0 = plain causal) and therefore requires
+    # is_causal; negative bounds are rejected.
+    with pytest.raises(ValueError, match="requires is_causal"):
+        SdpaFwdDslSm120(sample_q=q, sample_k=k, sample_v=v, sample_o=o, window_size_right=8).check_support()
+    with pytest.raises(ValueError, match="window_size_right must be >= 0"):
+        SdpaFwdDslSm120(sample_q=q, sample_k=k, sample_v=v, sample_o=o, is_causal=True, window_size_right=-1).check_support()
+
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=22)
@@ -1121,6 +1164,126 @@ def test_dsl_sm120_causal_bottom_right():
         is_causal=True,
         causal_bottom_right=True,
     )
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    ("head_dim", "head_dim_v"),
+    [(72, 72), (104, 72), (8, 8), (200, 136)],
+    ids=["d72", "mixed104x72", "d8_min", "d200x136"],
+)
+@torch_fork_set_rng(seed=34)
+def test_dsl_sm120_head_dim_envelope(head_dim: int, head_dim_v: int):
+    """Head dims that are multiples of 8 but not 16: the kernel compiles at
+    tiles rounded up to 16 and the per-chunk TMA copies zero-fill columns
+    past the actual extents — S, softmax, and P@V are bit-identical to the
+    unpadded problem, and O stores clip at the actual D_V."""
+    _run_case(batch=2, h_q=4, h_kv=4, s_q=192, s_kv=256, head_dim=head_dim, head_dim_v=head_dim_v, is_causal=True)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=35)
+def test_dsl_sm120_head_dim_envelope_features():
+    """The envelope composed with the feature family: padded + stats (LSE
+    trim with pad columns), sink, and a THD ragged batch — plus a d=248 case
+    that forces the auto kv_tile=64 pick (per-chunk XOR phase at the smaller
+    tile)."""
+    seq_q_lens = torch.tensor([150, 96], dtype=torch.int32, device="cuda")
+    seq_kv_lens = torch.tensor([200, 128], dtype=torch.int32, device="cuda")
+    _run_case(
+        batch=2,
+        h_q=4,
+        h_kv=2,
+        s_q=192,
+        s_kv=256,
+        head_dim=104,
+        head_dim_v=72,
+        seq_q_lens=seq_q_lens,
+        seq_kv_lens=seq_kv_lens,
+        check_stats=True,
+    )
+    _run_case(batch=2, h_q=4, h_kv=4, s_q=128, s_kv=128, head_dim=88, dtype=torch.bfloat16, with_sink=True, check_stats=True)
+    # Envelope pad columns and a ragged S_kv tail in the SAME rightmost
+    # tile: both zero-fill mechanisms at once, with the LSE checked.
+    _run_case(batch=2, h_q=4, h_kv=4, s_q=192, s_kv=300, head_dim=104, head_dim_v=72, check_stats=True)
+    _run_case(head_dim=248, head_dim_v=248, s_q=128, s_kv=128)  # auto kv_tile=64
+    _run_thd_case(
+        seq_q_lens=[130, 70],
+        seq_kv_lens=[130, 70],
+        h_q=4,
+        h_kv=2,
+        head_dim=104,
+        head_dim_v=72,
+        is_causal=True,
+        check_stats=True,
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=36)
+def test_dsl_sm120_right_band():
+    """diagonal_band_right_bound > 0: the causal machinery with the diagonal
+    widened right by a compile-time constant R (keep j <= diag + R,
+    inclusive). Cases: TOP_LEFT band; BOTTOM_RIGHT band (a band graph is
+    NON-causal in cuDNN's vocabulary — no causal flag involved); a full band
+    (left + right bounds); R + stats; R across a ragged S_kv tail."""
+
+    _run_case(batch=2, h_q=4, h_kv=4, s_q=256, s_kv=256, window_size_right=32)
+    _run_case(batch=2, h_q=4, h_kv=4, s_q=192, s_kv=320, causal_bottom_right=True, window_size_right=48)
+    _run_case(batch=2, h_q=4, h_kv=4, s_q=256, s_kv=256, window_size_left=64, window_size_right=32)
+    _run_case(batch=2, h_q=8, h_kv=2, s_q=256, s_kv=256, window_size_right=100, check_stats=True)
+    _run_case(batch=2, h_q=4, h_kv=4, s_q=256, s_kv=300, window_size_right=32)
+    # BR band + SWA + per-batch lengths: the runtime per-batch diagonal
+    # offset, the R-shifted right edge, and the UNSHIFTED left anchor in
+    # one launch.
+    seq_q_lens = torch.tensor([230, 120], dtype=torch.int32, device="cuda")
+    seq_kv_lens = torch.tensor([180, 240], dtype=torch.int32, device="cuda")
+    _run_case(
+        batch=2,
+        h_q=4,
+        h_kv=4,
+        s_q=256,
+        s_kv=256,
+        causal_bottom_right=True,
+        window_size_right=48,
+        window_size_left=96,
+        seq_q_lens=seq_q_lens,
+        seq_kv_lens=seq_kv_lens,
+    )
+    # kv_tile=64 (auto-picked at d=248) with R a multiple of the tile: the
+    # 3-step masked frontier at the smaller tile.
+    _run_case(head_dim=248, head_dim_v=248, s_q=128, s_kv=128, window_size_right=64)
+    # Degenerate R >= S_kv: the widened bound clamps to full visibility.
+    _run_case(batch=2, h_q=4, h_kv=4, s_q=128, s_kv=128, window_size_right=200)
+
+
+@pytest.mark.L1
+@torch_fork_set_rng(seed=37)
+def test_dsl_sm120_thd_right_band():
+    """THD + TOP_LEFT right band: per-sequence diagonals each widened by R,
+    with the ragged Stats checked."""
+
+    _run_thd_case(seq_q_lens=[130, 70], seq_kv_lens=[130, 70], window_size_right=24, check_stats=True)
+    # BOTTOM_RIGHT band under THD: each sequence's own diagonal, widened.
+    _run_thd_case(seq_q_lens=[100, 60], seq_kv_lens=[180, 120], causal_bottom_right=True, window_size_right=24, check_stats=True)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=33)
+def test_dsl_sm120_ragged_skv_tail():
+    """S_kv not a multiple of the KV tile, served natively (skv_tile=0): the
+    kernel's first masked step covers the partial rightmost tile in every
+    configuration — no padding mask, no synthesized lengths.
+
+    Cases: dense unmasked; top-left causal with S_q > S_kv (the corner causal_covers_tail
+    excludes); causal + sliding window across a ragged tail; ragged tail with
+    the LSE checked."""
+
+    _run_case(batch=2, h_q=4, h_kv=4, s_q=256, s_kv=300, head_dim=128)
+    _run_case(batch=2, h_q=4, h_kv=4, s_q=384, s_kv=200, head_dim=128, is_causal=True)
+    _run_case(batch=2, h_q=4, h_kv=4, s_q=256, s_kv=300, head_dim=128, is_causal=True, window_size_left=96)
+    _run_case(batch=2, h_q=8, h_kv=2, s_q=192, s_kv=333, head_dim=64, check_stats=True)
+    _run_case(batch=2, h_q=4, h_kv=4, s_q=128, s_kv=40, head_dim=128)  # num_kv_tiles == 1, tail-only tile
 
 
 @pytest.mark.L0

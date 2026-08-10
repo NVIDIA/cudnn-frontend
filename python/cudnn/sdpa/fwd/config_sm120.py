@@ -11,7 +11,10 @@ from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_FP16
 
 SEQ_Q_TILES = (128, 64)
 SEQ_KV_TILES = (128, 64)
-SUPPORTED_HEAD_TILES = tuple(range(16, 257, 16))
+HEAD_TILE_GRANULE = 16
+SUPPORTED_HEAD_TILE_MIN = 16
+SUPPORTED_HEAD_TILE_MAX = 256
+SUPPORTED_HEAD_TILES = tuple(range(SUPPORTED_HEAD_TILE_MIN, SUPPORTED_HEAD_TILE_MAX + 1, HEAD_TILE_GRANULE))
 
 # SMEM the SM120 parts expose to a kernel. The adapter asks cutlass for the
 # authoritative number at build time; this constant lets the ranking answer
@@ -44,9 +47,9 @@ class TemplateParams:
     dtype_qkv: int = DTYPE_FP16
     # The mask is ONE diagonal band (same model as config_sm100 / the analyzer
     # facts): per-side offsets from the diagonal, None = unbounded on that
-    # side. This kernel serves window_right in {None, 0} only (plain causal;
-    # right-band widening is not plumbed here). bottom_right anchors the
-    # band's diagonal at the bottom-right corner.
+    # side. window_right = 0 is plain causal; window_right > 0 widens the
+    # diagonal right by R columns (cuDNN's diagonal_band_right_bound).
+    # bottom_right anchors the band's diagonal at the bottom-right corner.
     window_left: int | None = None
     window_right: int | None = None
     bottom_right: bool = False
@@ -68,8 +71,8 @@ def validate_params(params: TemplateParams) -> None:
 
     if params.dtype_qkv not in (DTYPE_BF16, DTYPE_FP16):
         raise ValueError(f"SM120 SDPA: dtype_qkv must be DTYPE_BF16 ({DTYPE_BF16}) or DTYPE_FP16 ({DTYPE_FP16}); got {params.dtype_qkv}")
-    if params.window_right not in (None, 0):
-        raise ValueError(f"SM120 SDPA: window_right must be None (unbounded) or 0 (causal) — right-band widening is not plumbed; got {params.window_right}")
+    if params.window_right is not None and params.window_right < 0:
+        raise ValueError(f"SM120 SDPA: window_right must be None (unbounded) or >= 0 (0 = plain causal); got {params.window_right}")
     if params.bottom_right and params.window_right is None:
         raise ValueError("SM120 SDPA: bottom_right anchors the band's diagonal and requires a right bound (window_right)")
     if params.window_left is not None and params.window_left < 0:
