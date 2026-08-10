@@ -17,6 +17,7 @@ import torch
 import cudnn
 import cudnn.sdpa  # noqa: F401 — the SM80 capability tables live here
 from cudnn.engines import MANIFEST, is_python_engine
+from frost_test_utils import select_engine
 
 from cudnn.sdpa import graph_analyzer as ga
 from cudnn.sdpa.bwd import engines as engines_bwd_sm80
@@ -66,9 +67,7 @@ def _native_then_pin(g, engine):
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
-    assert engine in names, f"no plan named {engine!r} in {names}"
-    g.select_plan(names.index(engine))
+    select_engine(g, engine)
     g.check_support()
     g.build_plans()
 
