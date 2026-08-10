@@ -39,6 +39,34 @@ Numbered so reviews can cite them; the list grows — append, never renumber.
   extent would be zero, bind a never-dereferenced dummy view over storage
   the contract already guarantees.
 
+**Rule 2 — `execute()` launches exactly the kernels the plan promised:
+serve the declared layout natively, or decline — never adapt.**
+
+Rule 1 bans implicit conversions and allocations; this rule bans the loophole
+that survives its letter: "helpful" adapter-side work that makes an
+unsupported input runnable.
+
+- **No hidden kernel launches.** A gather/scatter "normalization" copy, a
+  `.contiguous()`, a layout repack, a scatter-back after the launch — each is
+  an extra kernel that silently changes the measured perf profile per
+  configuration. **Carving the copy's scratch from the caller's workspace
+  does NOT make it acceptable**: Rule 1's workspace-carve exemption covers
+  metadata buffers and dead-slot dummies, never data-tensor copies.
+- **Can't address the declared layout natively? Decline in
+  `check_support()`** (`NotImplementedError` naming the offending tensor and
+  its strides) so the Router picks an engine that honors the declaration.
+  Silent wrong results are the worst failure mode; a silent slow path is the
+  second worst — both hide behind a green test. See
+  `_thd_check_strides_native` in `sdpa/fwd/api_dsl.py`.
+- **Precedent is not a license.** The SM100 dense path's compact-BSHD
+  normalization (`dense_layout_ok`: "one gather/scatter copy otherwise")
+  predates this rule and is grandfathered — do not cite it to justify a new
+  copy path, and treat migrating it to serve-or-decline as open cleanup.
+- The flip side of declining: whatever `check_support()` ACCEPTS, the kernel
+  must address natively (layout-driven offset math, strides encoded in TMA
+  descriptors) — acceptance is a promise about the execute path, not about
+  what the adapter can patch up.
+
 ## Frontend-only kernel package layout
 
 ```
