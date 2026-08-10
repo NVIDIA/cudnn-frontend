@@ -1221,11 +1221,15 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # ONE H2D copy: a device-side cumsum would allocate its scan-temp
         # storage and launch kernels on the execute hot path. Either length
         # form feeds it — per-batch (B,) lengths or the (B+1,) cu_seq_len
-        # prefix sums — at identical cost.
-        meta = carver.take(3 * b + 2, torch.int32) if carver is not None else torch.empty(3 * b + 2, dtype=torch.int32, device=dev)
-        slq_host, cu_q_host = self._thd_host_lens(seq_q_lens, "cu_seq_len_q" if self.cu_seq_q_lens else "seq_q_lens", self.cu_seq_q_lens)
-        slk_host, cu_k_host = self._thd_host_lens(seq_len_kv, "cu_seq_len_kv" if self.cu_seq_kv_lens else "seq_kv_lens", self.cu_seq_kv_lens)
-        meta.copy_(torch.tensor(slk_host + cu_q_host + cu_k_host, dtype=torch.int32))
+        # prefix sums — at identical cost. The torch work (allocation, D2H
+        # length reads, the H2D upload) runs on the LAUNCH stream so it is
+        # ordered against the kernel that consumes it — the execute-time
+        # handle may carry a stream that is not torch's current.
+        with _torch_stream_context(current_stream, dev):
+            meta = carver.take(3 * b + 2, torch.int32) if carver is not None else torch.empty(3 * b + 2, dtype=torch.int32, device=dev)
+            slq_host, cu_q_host = self._thd_host_lens(seq_q_lens, "cu_seq_len_q" if self.cu_seq_q_lens else "seq_q_lens", self.cu_seq_q_lens)
+            slk_host, cu_k_host = self._thd_host_lens(seq_len_kv, "cu_seq_len_kv" if self.cu_seq_kv_lens else "seq_kv_lens", self.cu_seq_kv_lens)
+            meta.copy_(torch.tensor(slk_host + cu_q_host + cu_k_host, dtype=torch.int32))
         t_q = cu_q_host[-1]
         t_kv = cu_k_host[-1]
 
@@ -1255,9 +1259,12 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 lse = lse_tensor.as_strided((t_q, qh), (qh, 1), lse_tensor.storage_offset())
 
         # Per-sequence O TMA descriptors, filled by the kernel's builder pass.
-        o_desc = carver.take(b * 16 + 16, torch.int64) if carver is not None else torch.zeros(b * 16 + 16, dtype=torch.int64, device=dev)
-        if carver is not None:
-            o_desc.zero_()
+        # Allocated on the launch stream (allocator stream-tagging + ordering
+        # vs the builder pass).
+        with _torch_stream_context(current_stream, dev):
+            o_desc = carver.take(b * 16 + 16, torch.int64) if carver is not None else torch.zeros(b * 16 + 16, dtype=torch.int64, device=dev)
+            if carver is not None:
+                o_desc.zero_()
         # One THD unit per CGA-height slice of each sequence's Q rows.
         cga_tile_m = int(self._k_mod.CGA_TILE_M)
         units = qh * sum((l + cga_tile_m - 1) // cga_tile_m for l in slq_host)
@@ -1292,11 +1299,14 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         LSE = lse
         if sinks is not None:
             sinks_t = self._checked_sinks_1d(sinks)
-        elif carver is not None:
-            sinks_t = carver.take(qh, torch.float32)
-            sinks_t.zero_()
         else:
-            sinks_t = torch.zeros(qh, dtype=torch.float32, device=dev)
+            # Dummy sinks bound on the launch stream (ordering vs the kernel).
+            with _torch_stream_context(current_stream, dev):
+                if carver is not None:
+                    sinks_t = carver.take(qh, torch.float32)
+                    sinks_t.zero_()
+                else:
+                    sinks_t = torch.zeros(qh, dtype=torch.float32, device=dev)
 
         fn = self._k_mod.compile(
             b=b,
@@ -2229,7 +2239,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         # scalars, the amax protocol) is identical.
         pack = None
         if self.thd:
-            pack = self._thd_pack(q, k, v, o, seq_q_lens, seq_kv_lens, workspace, "SdpaFwdDslSm120 (FP8 THD)")
+            pack = self._thd_pack(q, k, v, o, seq_q_lens, seq_kv_lens, workspace, "SdpaFwdDslSm120 (FP8 THD)", current_stream=current_stream)
             if pack is None:
                 return
             # This kernel's ragged LSE store is head-major (H, head_stride):
@@ -2291,7 +2301,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                 amax_o_buf.div_(max(so, 1e-30))
         self._logger.debug("execute (SM120 FP8 per-tensor) completed")
 
-    def _thd_pack(self, q_buf, k_buf, v_buf, o_buf, seq_q_lens, seq_kv_lens, workspace, label, declared_views=False):
+    def _thd_pack(self, q_buf, k_buf, v_buf, o_buf, seq_q_lens, seq_kv_lens, workspace, label, declared_views=False, current_stream=None):
         """Shared THD (ragged) packing: cu_seqlens metadata + ``(1, T, H, D)`` views.
 
         Serves the same fully-packed contract as the SM100 THD path
@@ -2299,7 +2309,9 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         the offsets are re-derived from ``seq_len_q``/``seq_len_kv``. The two
         ``.tolist()`` D2H syncs are inherent — the packed totals and the
         longest sequence's Q length are runtime values that size the
-        per-execute compile and grid.
+        per-execute compile and grid. The torch work (allocation, length
+        reads, the H2D upload) runs on ``current_stream`` — the LAUNCH
+        stream — so it is ordered against the kernel that consumes it.
 
         Returns ``None`` when the packed Q total is zero (nothing to launch).
         """
@@ -2316,10 +2328,11 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         # storage and launch kernels on the execute hot path. Either length
         # form feeds it — per-batch (B,) lengths or the (B+1,) cu_seq_len
         # prefix sums — at identical cost.
-        meta = carver.take(3 * b + 2, torch.int32) if carver is not None else torch.empty(3 * b + 2, dtype=torch.int32, device=dev)
-        slq_host, cu_q_host = self._thd_host_lens(seq_q_lens, "cu_seq_len_q" if self.cu_seq_q_lens else "seq_q_lens", self.cu_seq_q_lens)
-        slk_host, cu_k_host = self._thd_host_lens(seq_kv_lens, "cu_seq_len_kv" if self.cu_seq_kv_lens else "seq_kv_lens", self.cu_seq_kv_lens)
-        meta.copy_(torch.tensor(slk_host + cu_q_host + cu_k_host, dtype=torch.int32))
+        with _torch_stream_context(current_stream, dev):
+            meta = carver.take(3 * b + 2, torch.int32) if carver is not None else torch.empty(3 * b + 2, dtype=torch.int32, device=dev)
+            slq_host, cu_q_host = self._thd_host_lens(seq_q_lens, "cu_seq_len_q" if self.cu_seq_q_lens else "seq_q_lens", self.cu_seq_q_lens)
+            slk_host, cu_k_host = self._thd_host_lens(seq_kv_lens, "cu_seq_len_kv" if self.cu_seq_kv_lens else "seq_kv_lens", self.cu_seq_kv_lens)
+            meta.copy_(torch.tensor(slk_host + cu_q_host + cu_k_host, dtype=torch.int32))
         t_q = cu_q_host[-1]
         t_kv = cu_k_host[-1]
         max_sq = max(slq_host) if slq_host else 0
@@ -2356,6 +2369,10 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             K = _view(k_buf, self.k_desc, t_kv, kh, d_qk)
             V = _view(v_buf, self.v_desc, t_kv, kh, d_v)
 
+        # The cached seq_q dummy is allocated/zeroed once, on the launch
+        # stream (first-use ordering vs the kernel that reads it).
+        with _torch_stream_context(current_stream, dev):
+            seq_q_dummy = self._dummy("seq_q_lens", dev, lambda: torch.zeros(b, dtype=torch.int32, device=dev))
         return SimpleNamespace(
             meta=meta,
             t_q=t_q,
@@ -2365,7 +2382,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             K=K,
             V=V,
             O=_view(o_buf, self.o_desc, t_q, qh, d_v),
-            seq_q_dummy=self._dummy("seq_q_lens", dev, lambda: torch.zeros(b, dtype=torch.int32, device=dev)),
+            seq_q_dummy=seq_q_dummy,
         )
 
     def _execute_thd(
@@ -2379,7 +2396,14 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         within each head row.
         """
 
-        pack = self._thd_pack(q_buf, k_buf, v_buf, o_buf, seq_q_lens, seq_kv_lens, workspace, "SdpaFwdDslSm120 (THD)", declared_views=True)
+        # Resolve the launch stream BEFORE packing: the metadata upload inside
+        # _thd_pack must be ordered against the kernel launch below.
+        if current_stream is None:
+            current_stream = cuda.CUstream(torch.cuda.current_stream(q_buf.device).cuda_stream)
+
+        pack = self._thd_pack(
+            q_buf, k_buf, v_buf, o_buf, seq_q_lens, seq_kv_lens, workspace, "SdpaFwdDslSm120 (THD)", declared_views=True, current_stream=current_stream
+        )
         if pack is None:
             return
 
@@ -2398,9 +2422,6 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         # Sinks are None-specialized like the LSE when the graph has no sink
         # token.
         sinks_t = self._checked_sinks_1d(sinks) if sinks is not None else None
-
-        if current_stream is None:
-            current_stream = cuda.CUstream(torch.cuda.current_stream(q_buf.device).cuda_stream)
 
         import cutlass
 
