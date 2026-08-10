@@ -764,6 +764,159 @@ b2b_causal_conv1d_backward(cudaStream_t stream,
 }
 #endif
 
+#if CUDNN_VERSION >= 92600
+inline cudnnStatus_t
+fft_causal_conv1d_forward(cudaStream_t stream,
+                          const void *x,
+                          const void *weight,
+                          void *y,
+                          int batch,
+                          int dim,
+                          int seq_len,
+                          int kernel_size,
+                          cudnnDataType_t data_type) {
+    auto effective_cudnn_ver = std::min(detail::get_compiled_version(), detail::get_backend_version());
+    if (effective_cudnn_ver < 92600) {
+        return CUDNN_STATUS_NOT_SUPPORTED;
+    }
+    NV_FE_CALL_TO_BACKEND(fft_causal_conv1d_forward,
+                          cudnnFFTCausalConv1dForward,
+                          stream,
+                          x,
+                          weight,
+                          y,
+                          batch,
+                          dim,
+                          seq_len,
+                          kernel_size,
+                          data_type);
+}
+
+inline cudnnStatus_t
+fft_causal_conv1d_backward(cudaStream_t stream,
+                           const void *x,
+                           const void *weight,
+                           const void *dy,
+                           void *dx,
+                           void *dweight,
+                           int batch,
+                           int dim,
+                           int seq_len,
+                           int kernel_size,
+                           cudnnDataType_t data_type) {
+    auto effective_cudnn_ver = std::min(detail::get_compiled_version(), detail::get_backend_version());
+    if (effective_cudnn_ver < 92600) {
+        return CUDNN_STATUS_NOT_SUPPORTED;
+    }
+    NV_FE_CALL_TO_BACKEND(fft_causal_conv1d_backward,
+                          cudnnFFTCausalConv1dBackward,
+                          stream,
+                          x,
+                          weight,
+                          dy,
+                          dx,
+                          dweight,
+                          batch,
+                          dim,
+                          seq_len,
+                          kernel_size,
+                          data_type);
+}
+
+inline cudnnStatus_t
+long_fft_causal_conv1d_get_buffer_sizes(int batch,
+                                        int dim,
+                                        int seq_len,
+                                        int kernel_size,
+                                        cudnnDataType_t data_type,
+                                        size_t *workspace_size_in_bytes,
+                                        size_t *reserve_space_size_in_bytes) {
+    auto effective_cudnn_ver = std::min(detail::get_compiled_version(), detail::get_backend_version());
+    if (effective_cudnn_ver < 92600) {
+        return CUDNN_STATUS_NOT_SUPPORTED;
+    }
+    NV_FE_CALL_TO_BACKEND(long_fft_causal_conv1d_get_buffer_sizes,
+                          cudnnLongFFTCausalConv1dGetBufferSizes,
+                          batch,
+                          dim,
+                          seq_len,
+                          kernel_size,
+                          data_type,
+                          workspace_size_in_bytes,
+                          reserve_space_size_in_bytes);
+}
+
+inline cudnnStatus_t
+long_fft_causal_conv1d_forward(cudaStream_t stream,
+                               const void *x,
+                               const void *weight,
+                               void *y,
+                               int batch,
+                               int dim,
+                               int seq_len,
+                               int kernel_size,
+                               cudnnDataType_t data_type,
+                               void *workspace,
+                               size_t workspace_size_in_bytes,
+                               void *reserve_space,
+                               size_t reserve_space_size_in_bytes) {
+    auto effective_cudnn_ver = std::min(detail::get_compiled_version(), detail::get_backend_version());
+    if (effective_cudnn_ver < 92600) {
+        return CUDNN_STATUS_NOT_SUPPORTED;
+    }
+    NV_FE_CALL_TO_BACKEND(long_fft_causal_conv1d_forward,
+                          cudnnLongFFTCausalConv1dForward,
+                          stream,
+                          x,
+                          weight,
+                          y,
+                          batch,
+                          dim,
+                          seq_len,
+                          kernel_size,
+                          data_type,
+                          workspace,
+                          workspace_size_in_bytes,
+                          reserve_space,
+                          reserve_space_size_in_bytes);
+}
+
+inline cudnnStatus_t
+long_fft_causal_conv1d_backward(cudaStream_t stream,
+                                const void *dy,
+                                void *dx,
+                                void *dweight,
+                                int batch,
+                                int dim,
+                                int seq_len,
+                                int kernel_size,
+                                cudnnDataType_t data_type,
+                                void *workspace,
+                                size_t workspace_size_in_bytes,
+                                void *reserve_space,
+                                size_t reserve_space_size_in_bytes) {
+    auto effective_cudnn_ver = std::min(detail::get_compiled_version(), detail::get_backend_version());
+    if (effective_cudnn_ver < 92600) {
+        return CUDNN_STATUS_NOT_SUPPORTED;
+    }
+    NV_FE_CALL_TO_BACKEND(long_fft_causal_conv1d_backward,
+                          cudnnLongFFTCausalConv1dBackward,
+                          stream,
+                          dy,
+                          dx,
+                          dweight,
+                          batch,
+                          dim,
+                          seq_len,
+                          kernel_size,
+                          data_type,
+                          workspace,
+                          workspace_size_in_bytes,
+                          reserve_space,
+                          reserve_space_size_in_bytes);
+}
+#endif
+
 inline std::string
 convert_version_to_str(size_t const version) {
     // The multiplier for major version pre-v9 and post-v9 are different.

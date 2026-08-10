@@ -79,6 +79,7 @@ add_executable(
     causal_conv1d/causal_conv1d.cpp
     causal_conv1d/causal_conv1d_nwh.cpp
     causal_conv1d/b2b_causal_conv1d.cpp
+    causal_conv1d/fft_causal_conv1d.cpp
 )
 
 # target flags
