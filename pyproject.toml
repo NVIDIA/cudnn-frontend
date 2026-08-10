@@ -62,11 +62,11 @@ cutedsl = [
     # their own constraints. The engines check the version at support time and
     # decline when it is too old, so an older DSL costs those engines and
     # nothing else. See CUTEDSL_MIN_VERSION in cudnn/frost/buffers.py.
+    # Framework-neutral core only: the CuTeDSL APIs are type-erased, so torch (like
+    # jax) is opt-in via the [dependency-groups] below (`pip install --group torch`).
     "nvidia-cutlass-dsl[cu13]>=4.5.0",
     "cuda-python",
-    "torch",
     "apache-tvm-ffi>=0.1.11",
-    "torch-c-dlpack-ext",
 ]
 
 [dependency-groups]

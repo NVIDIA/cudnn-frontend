@@ -43,6 +43,13 @@ All Frontend OSS APIs come installed with the `nvidia-cudnn-frontend` package. H
 pip install nvidia-cudnn-frontend[cutedsl]
 ```
 
+The `cutedsl` extra is framework-neutral (nvidia-cutlass-dsl, cuda-python, apache-tvm-ffi). Install your tensor framework separately — from a checkout, the PEP 735 dependency groups pin the right companion packages:
+```bash
+pip install --group torch   # torch + torch-c-dlpack-ext
+pip install --group jax     # jax + jax-tvm-ffi (Python >= 3.11)
+```
+(For the published wheel, `pip install torch torch-c-dlpack-ext` or `pip install jax jax-tvm-ffi` directly.)
+
 After installation, you can import the APIs directly from the `cudnn` package, i.e. `from cudnn import {your_operation}`
 
 ## API Usage
