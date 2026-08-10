@@ -49,7 +49,7 @@ def _device_handle(device: int):
     """``CUdevice`` for an ordinal. Needs only cuInit — creates no context."""
     drv = _driver()
     if drv is None:
-        raise RuntimeError("cudnn.frost: no CUDA device visible")
+        raise NotImplementedError("cudnn.frost: no CUDA device visible")
     count = int(_ck(*drv.cuDeviceGetCount()))
     if not 0 <= device < count:
         raise ValueError(f"cudnn.frost: cuda:{device} does not exist ({count} device(s) visible)")
@@ -65,7 +65,7 @@ def current_device() -> int:
     slot, so that is the second rung."""
     drv = _driver()
     if drv is None:
-        raise RuntimeError("cudnn.frost: no CUDA device visible")
+        raise NotImplementedError("cudnn.frost: no CUDA device visible")
     if int(_ck(*drv.cuCtxGetCurrent())) != 0:
         return int(_ck(*drv.cuCtxGetDevice()))
     import cuda.bindings.runtime as rt
@@ -174,7 +174,7 @@ class device_context:
     def __enter__(self):
         self._drv = _driver()
         if self._drv is None:
-            raise RuntimeError("cudnn.frost: no CUDA device visible")
+            raise NotImplementedError("cudnn.frost: no CUDA device visible")
         self._handle = _device_handle(self._device)
         self._previous = _ck(*self._drv.cuCtxGetCurrent())
         _ck(*self._drv.cuCtxSetCurrent(_ck(*self._drv.cuDevicePrimaryCtxRetain(self._handle))))
