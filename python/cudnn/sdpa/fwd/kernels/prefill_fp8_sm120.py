@@ -22,10 +22,11 @@ lowered to ``mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32``:
   (SASS ``LDSM.8.MT1616``) — one issue covers a 32(kv) x 16(d-bytes) tile and
   feeds two MMAs, register map (0, 2, 1, 3).
 - P: fp32 softmax output packed to e4m3 with ``cvt.rn.satfinite.e4m3x2.f32``
-  and staged through a per-warp SMEM tile (the k32 C->A fragment-column
-  mismatch defeats the f16 kernel's in-register restage), reloaded as A
-  fragments with ``ldmatrix.m8n8.x4.b16``. P scale is fixed 1.0 (values below
-  2^-9 flush to zero). The softmax denominator uses the fp32 P.
+  and kept in REGISTERS — the k32 C->A fragment-column mismatch is an exchange
+  inside each thread quad, so two ``shfl.sync`` and one ``prmt`` in ``mma_pv``
+  replace the SMEM round trip (and the 16 KB it needed). ``Scale_S`` multiplies
+  P immediately before the cast (FORT ordering); the softmax denominator, and
+  therefore ``Amax_S``, read the UNSCALED fp32 P.
 - O is Float16; the epilogue and the sKV/sO SMEM alias are sized in BYTES
   because KV (1B) and O (2B) element sizes differ.
 - ``Amax_S`` (max over valid rows of ``1/row_sum``) and ``Amax_O``
@@ -37,10 +38,13 @@ Constraints:
 * Input dtype: e4m3 only (as Uint8 storage); output dtype Float16
 * Head dimensions must be multiples of 16 between 16 and 256, inclusive
 * Q heads must be divisible by the number of K/V heads
-* Q/K/V/O use compact BSHD storage
+* Q/K/V/O use compact BSHD storage (THD packs them to ``(1, T, H, D)``)
 * Supported CTA Q/KV tiles are 128 or 64
 * ``has_sink`` is not supported (Amax_S semantics with a sink column are
-  undefined in this cell; the adapter declines such graphs)
+  undefined in this cell; the adapter declines such graphs). No sink math
+  exists here — the ``sinks`` argument is always ``None``.
+* THD (ragged) is supported with token-major Stats; the head-major ragged
+  Stats layout the f16 cell carries has no specialization here
 """
 
 from functools import lru_cache, partial
@@ -672,10 +676,10 @@ class SM120FusedMultiHeadAttentionForward:
                 src_format=prims.LoadSrcFormat.B8,
             )
 
-        # An ldmatrix is always in flight behind the tensor cores: the next
-        # v_frag's fragments are issued before this one's MMAs run. The index
-        # wraps so the prefetch is unconditional -- the last iteration reloads
-        # v_frag 0 and drops it, which is cheaper than a branch in the loop.
+        # V fragments load in-loop, immediately before the MMAs consuming them.
+        # Issuing them one step ahead was measured at within +/-0.5% (noise
+        # floor ~1%): keeping P in registers leaves little ldmatrix latency to
+        # hide, so the prefetch buys nothing.
         for v_frag in cutlass.range_constexpr(self.pv_v_frags):
             # One k32 PV step consumes four QK k-fragments, paired (0,1) and (2,3).
             p_vec = (
@@ -786,7 +790,8 @@ class SM120FusedMultiHeadAttentionForward:
         :param k: Key tensor (e4m3 as Uint8 storage).
         :param v: Value tensor (e4m3 as Uint8 storage).
         :param o: Output tensor (Float16).
-        :param lse: ``(B, H, Sq)`` fp32 log-sum-exp output, or ``None`` to
+        :param lse: fp32 log-sum-exp output — ``(B, H, Sq)`` dense, or packed
+            head-major ``(H, head_stride)`` under ``thd_varlen``; or ``None`` to
             compile the LSE store out (the DSL specializes on ``None``).
         :param sinks: Unused; must be ``None`` (fp8 cell rejects has_sink).
         :param seq_q_lens: Per-batch query lengths, or an unused dummy tensor.
@@ -1184,11 +1189,13 @@ class SM120FusedMultiHeadAttentionForward:
                         lse_q_idx = q_seq_idx + q_warp_row0 + (lane // 4) + row_half * 8
                         lse_out = cutlass.Float32(row_lse[row_half])
                         if cutlass.const_expr(self.thd_varlen):
-                            # Packed (1, H, T) LSE: rows past this sequence's Q
-                            # length belong to the NEXT sequence — never written,
-                            # and there is no padded region to trim.
+                            # Packed head-major (H, head_stride) LSE: tokens are
+                            # contiguous within a head row, heads strided by the
+                            # caller's token capacity. Rows past this sequence's
+                            # Q length belong to the NEXT sequence — never
+                            # written, and there is no padded region to trim.
                             if lse_q_idx < seqlen_q:
-                                lse_row = lse_arr[0, head_idx, :]
+                                lse_row = lse_arr[head_idx, :]
                                 lse_row[q_row_base + lse_q_idx] = lse_out
                         else:
                             # Rows at/past this batch's Q length trim to -inf.
@@ -1343,10 +1350,21 @@ class SM120FusedMultiHeadAttentionForward:
             if cutlass.const_expr(not self.is_layout_supported(tensor.shape, tensor.stride)):
                 raise ValueError(f"{name} must use compact BSHD storage")
         if cutlass.const_expr(lse is not None):
-            if cutlass.const_expr(lse.shape != (q.shape[0], q.shape[2], q.shape[1])):
-                raise ValueError("LSE must have shape (B, H, Sq)")
-            if cutlass.const_expr(lse.stride != (q.shape[2] * q.shape[1], q.shape[1], 1)):
-                raise ValueError("LSE must be compact row-major")
+            if cutlass.const_expr(self.thd_varlen):
+                # Packed head-major (H, head_stride): the head stride is the
+                # caller's token capacity and may exceed the packed total, so
+                # only the head extent is pinned.
+                if cutlass.const_expr(len(lse.shape) != 2 or lse.shape[0] != q.shape[2]):
+                    raise ValueError("THD LSE must have shape (H, head_stride)")
+                if cutlass.const_expr(lse.shape[1] < q.shape[1]):
+                    raise ValueError("THD LSE head_stride must cover the packed Q token total")
+                if cutlass.const_expr(lse.stride != (lse.shape[1], 1)):
+                    raise ValueError("THD LSE must be head-major with unit token stride")
+            else:
+                if cutlass.const_expr(lse.shape != (q.shape[0], q.shape[2], q.shape[1])):
+                    raise ValueError("LSE must have shape (B, H, Sq)")
+                if cutlass.const_expr(lse.stride != (q.shape[2] * q.shape[1], q.shape[1], 1)):
+                    raise ValueError("LSE must be compact row-major")
         if cutlass.const_expr(self.has_sink != (sinks is not None)):
             raise ValueError("sinks must be provided exactly when the kernel is configured with has_sink")
         if cutlass.const_expr(sinks is not None and sinks.shape != (q.shape[2],)):
@@ -1461,6 +1479,7 @@ def compile(  # noqa: A001
     d_v: int = 128,
     max_sq: int = 0,
     has_lse: bool = True,
+    lse_head_stride: int = 0,
 ) -> Callable:
     """Compile and cache one architecture-specific compact BSHD shape.
 
@@ -1474,6 +1493,10 @@ def compile(  # noqa: A001
     ``has_lse=False`` compiles the LSE store out (the kernel specializes on a
     ``None`` LSE argument) — callers that don't want stats pass no LSE buffer
     at all instead of a dummy.
+
+    Under THD the LSE is packed head-major ``(H, lse_head_stride)``: tokens
+    contiguous within a head row, heads strided by the caller's token capacity
+    (which may exceed the packed total, so it cannot be derived from ``sq``).
     """
 
     kernel = SM120FusedMultiHeadAttentionForward(
@@ -1521,8 +1544,8 @@ def compile(  # noqa: A001
     fake_lse = (
         cute.runtime.make_fake_compact_tensor(
             cutlass.Float32,
-            (fake_batch, qh, sq),
-            stride_order=(2, 1, 0),
+            (qh, lse_head_stride) if PARAMS.thd_varlen else (fake_batch, qh, sq),
+            stride_order=(1, 0) if PARAMS.thd_varlen else (2, 1, 0),
             assumed_align=4,
         )
         if has_lse

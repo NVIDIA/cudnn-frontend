@@ -11,6 +11,7 @@ import os
 from abc import abstractmethod
 from contextlib import contextmanager
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Callable, Hashable, Iterator, Optional
 
 import torch
@@ -1722,9 +1723,16 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                 not self._pertensor,
                 "SM120 fp8 serves the per-tensor SDPA_FP8 op only (no MXFP8 cell)",
             )
-            self._not_implemented_error_if(self.thd, "SM120 fp8: THD/varlen is not wired yet (dense only)")
+            # THD is served; token-major ragged Stats is not. This kernel's
+            # ragged LSE store is unconditionally head-major (it writes
+            # lse[0, head, q_row_base + row]) — the f16 cell is the one that
+            # specializes on both layouts.
+            self._not_implemented_error_if(
+                self.thd and self.lse_desc is not None and not self.thd_stats_head_major,
+                "SM120 fp8 THD serves head-major ragged Stats only (token-major is f16-only)",
+            )
             self._value_error_if(self.has_sink, "SM120 fp8 does not support attention sinks (Amax_S semantics)")
-            self._value_error_if(self.seq_q_lens_present, "SM120 fp8 does not support per-batch seq_len_q")
+            self._value_error_if(self.seq_q_lens_present and not self.thd, "SM120 fp8 does not support per-batch seq_len_q")
             self._value_error_if(
                 (d_q, d_v) != (128, 128),
                 f"SM120 fp8 requires D_QK=D_V=128 (no zero-padding envelope on the 8-bit fragment path); got ({d_q}, {d_v})",
@@ -1923,6 +1931,8 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                 amax_o,
                 descale_s,
                 scale_s,
+                seq_q_lens=seq_q_lens,
+                workspace=workspace,
                 current_stream=current_stream,
             )
             return
@@ -2007,9 +2017,11 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         amax_o,
         descale_s=None,
         scale_s=None,
+        seq_q_lens=None,
+        workspace=None,
         current_stream=None,
     ):
-        """Per-tensor FP8 execute (dense): SM100 convention on the SM120 kernel.
+        """Per-tensor FP8 execute: SM100 convention on the SM120 kernel.
 
         ``descale_q*descale_k`` folds into ``scale_softmax_log2`` and
         ``descale_s*descale_v*scale_o`` into the kernel's ``o_scale_fused``
@@ -2041,7 +2053,6 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             self.lse_desc is None and lse_tensor is not None,
             "this specialization was compiled without an LSE output; construct the API with sample_lse",
         )
-        lse = self._checked_lse_view(lse_tensor) if lse_tensor is not None else None
         seq_kv_t = (
             self._checked_seq_lens(seq_kv_lens, "seq_kv_lens")
             if seq_kv_lens is not None
@@ -2057,6 +2068,28 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         o_view, o_needs_copy_back, o_scratch = self._to_bshd_writable(o_tensor)
         o = o_scratch if o_needs_copy_back else o_view
 
+        # THD packs the batch away, so the ragged views and the per-execute
+        # compile replace the dense buffers; everything else (the folded
+        # scalars, the amax protocol) is identical.
+        pack = None
+        if self.thd:
+            pack = self._thd_pack(q, k, v, o, seq_q_lens, seq_kv_lens, workspace, "SdpaFwdDslSm120 (FP8 THD)")
+            if pack is None:
+                return
+            # This kernel's ragged LSE store is head-major (H, head_stride):
+            # tokens contiguous within a head row. (The f16 cell specializes on
+            # either layout; check_support declines token-major here.)
+            lse = None
+            if lse_tensor is not None:
+                head_stride = self.thd_stats_head_stride
+                self._value_error_if(
+                    head_stride < pack.t_q,
+                    f"head-major THD LSE head_stride ({head_stride}) must cover the packed Q token total ({pack.t_q})",
+                )
+                lse = lse_tensor.as_strided((self.h_q, head_stride), (head_stride, 1), lse_tensor.storage_offset())
+        else:
+            lse = self._checked_lse_view(lse_tensor) if lse_tensor is not None else None
+
         # amax_s / amax_o: the kernel atomicMax'es into these buffers, so they
         # MUST start at 0, reset on the LAUNCH stream (ordering vs the kernel).
         amax_s_buf = self._amax_slot(amax_s, "amax_s", device)
@@ -2065,15 +2098,30 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             amax_s_buf.zero_()
             amax_o_buf.zero_()
 
-        self._compiled_kernel(
-            q,
-            k,
-            v,
-            o,
+        fn = self._compiled_kernel
+        if pack is not None:
+            fn = self._k_mod.compile(
+                compute_capability=self.compute_capability,
+                b=self.batch_size,
+                qh=self.h_q,
+                kh=self.h_kv,
+                sq=pack.t_q,
+                skv=pack.t_kv,
+                d_qk=self.head_dim_qk,
+                d_v=self.head_dim_v,
+                max_sq=pack.max_sq,
+                has_lse=self.lse_desc is not None,
+                lse_head_stride=self.thd_stats_head_stride,
+            )
+        fn(
+            pack.Q if pack is not None else q,
+            pack.K if pack is not None else k,
+            pack.V if pack is not None else v,
+            pack.O if pack is not None else o,
             lse,
             None,  # sinks: fp8 cell rejects has_sink
-            seq_q_dummy,
-            seq_kv_t,
+            pack.seq_q_dummy if pack is not None else seq_q_dummy,
+            pack.meta if pack is not None else seq_kv_t,
             amax_s_buf.view(torch.int32),
             amax_o_buf.view(torch.int32),
             cutlass.Float32(scale_softmax_log2),
@@ -2090,26 +2138,22 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                 amax_o_buf.div_(max(so, 1e-30))
         self._logger.debug("execute (SM120 FP8 per-tensor) completed")
 
-    def _execute_thd(
-        self, q_buf, k_buf, v_buf, o_buf, scale_softmax_log2, sinks, seq_kv_lens, seq_q_lens, lse_tensor=None, workspace=None, current_stream=None
-    ):
-        """THD (ragged) execute: packed ``(1, T, H, D)`` views + cu_seqlens.
+    def _thd_pack(self, q_buf, k_buf, v_buf, o_buf, seq_q_lens, seq_kv_lens, workspace, label):
+        """Shared THD (ragged) packing: cu_seqlens metadata + ``(1, T, H, D)`` views.
 
         Serves the same fully-packed contract as the SM100 THD path
         (``ragged_offset == cumsum(seq_len) * H * D`` from 0, multiplier 1);
         the offsets are re-derived from ``seq_len_q``/``seq_len_kv``. The two
         ``.tolist()`` D2H syncs are inherent — the packed totals and the
         longest sequence's Q length are runtime values that size the
-        per-execute compile and grid. ``lse_tensor``, when given, is the
-        caller's ragged Stats buffer, in its declared layout: token-major
-        packed ``(T, H)`` in the first ``T*H`` elements, or head-major
-        ``(H, head_stride)`` with tokens contiguous within each head row.
-        """
+        per-execute compile and grid.
 
+        Returns ``None`` when the packed Q total is zero (nothing to launch).
+        """
         b, qh, kh = self.batch_size, self.h_q, self.h_kv
         d_qk, d_v = self.head_dim_qk, self.head_dim_v
         dev = q_buf.device
-        carver = WorkspaceCarver(workspace, self.scratch_workspace_bytes(), "SdpaFwdDslSm120 (THD)") if workspace is not None else None
+        carver = WorkspaceCarver(workspace, self.scratch_workspace_bytes(), label) if workspace is not None else None
 
         slq_v = self._checked_seq_lens(seq_q_lens, "seq_q_lens")
         slk_v = self._checked_seq_lens(seq_kv_lens, "seq_kv_lens")
@@ -2134,31 +2178,9 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         max_sq = max(slq_host) if slq_host else 0
 
         if t_q == 0:
-            return
-        lse = None
-        if lse_tensor is not None:
-            if self.thd_stats_head_major:
-                head_stride = self.thd_stats_head_stride
-                self._value_error_if(
-                    head_stride < t_q,
-                    f"head-major THD LSE head_stride ({head_stride}) must cover the packed Q token total ({t_q})",
-                )
-                lse = lse_tensor.as_strided((qh, head_stride), (head_stride, 1), lse_tensor.storage_offset())
-            else:
-                lse = lse_tensor.as_strided((t_q, qh), (qh, 1), lse_tensor.storage_offset())
+            return None
 
-        # Sinks are None-specialized like the LSE when the graph has no sink
-        # token.
-        sinks_t = self._checked_sinks_1d(sinks) if sinks is not None else None
-        seq_q_dummy = self._dummy(
-            "seq_q_lens",
-            dev,
-            lambda: torch.zeros(b, dtype=torch.int32, device=dev),
-        )
-
-        def _packed(buf, tokens):
-            heads = qh if buf is q_buf or buf is o_buf else kh
-            d = d_qk if buf is q_buf or buf is k_buf else d_v
+        def _packed(buf, tokens, heads, d):
             return buf.as_strided((1, tokens, heads, d), (tokens * heads * d, heads * d, d, 1), buf.storage_offset())
 
         if t_kv == 0:
@@ -2177,37 +2199,80 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             K = q_buf.as_strided((1, 1, kh, d_qk), (kh * d_qk, kh * d_qk, d_qk, 1), q_buf.storage_offset())
             V = o_buf.as_strided((1, 1, kh, d_v), (kh * d_v, kh * d_v, d_v, 1), o_buf.storage_offset())
         else:
-            K = _packed(k_buf, t_kv)
-            V = _packed(v_buf, t_kv)
+            K = _packed(k_buf, t_kv, kh, d_qk)
+            V = _packed(v_buf, t_kv, kh, d_v)
+
+        return SimpleNamespace(
+            meta=meta,
+            t_q=t_q,
+            t_kv=t_kv,
+            max_sq=max_sq,
+            Q=_packed(q_buf, t_q, qh, d_qk),
+            K=K,
+            V=V,
+            O=_packed(o_buf, t_q, qh, d_v),
+            seq_q_dummy=self._dummy("seq_q_lens", dev, lambda: torch.zeros(b, dtype=torch.int32, device=dev)),
+        )
+
+    def _execute_thd(
+        self, q_buf, k_buf, v_buf, o_buf, scale_softmax_log2, sinks, seq_kv_lens, seq_q_lens, lse_tensor=None, workspace=None, current_stream=None
+    ):
+        """THD (ragged) execute: packed ``(1, T, H, D)`` views + cu_seqlens.
+
+        ``lse_tensor``, when given, is the caller's ragged Stats buffer, in its
+        declared layout: token-major packed ``(T, H)`` in the first ``T*H``
+        elements, or head-major ``(H, head_stride)`` with tokens contiguous
+        within each head row.
+        """
+
+        pack = self._thd_pack(q_buf, k_buf, v_buf, o_buf, seq_q_lens, seq_kv_lens, workspace, "SdpaFwdDslSm120 (THD)")
+        if pack is None:
+            return
+
+        lse = None
+        if lse_tensor is not None:
+            if self.thd_stats_head_major:
+                head_stride = self.thd_stats_head_stride
+                self._value_error_if(
+                    head_stride < pack.t_q,
+                    f"head-major THD LSE head_stride ({head_stride}) must cover the packed Q token total ({pack.t_q})",
+                )
+                lse = lse_tensor.as_strided((self.h_q, head_stride), (head_stride, 1), lse_tensor.storage_offset())
+            else:
+                lse = lse_tensor.as_strided((pack.t_q, self.h_q), (self.h_q, 1), lse_tensor.storage_offset())
+
+        # Sinks are None-specialized like the LSE when the graph has no sink
+        # token.
+        sinks_t = self._checked_sinks_1d(sinks) if sinks is not None else None
 
         if current_stream is None:
-            current_stream = cuda.CUstream(torch.cuda.current_stream(dev).cuda_stream)
+            current_stream = cuda.CUstream(torch.cuda.current_stream(q_buf.device).cuda_stream)
 
         import cutlass
 
         fn = self._k_mod.compile(
             compute_capability=self.compute_capability,
-            b=b,
-            qh=qh,
-            kh=kh,
-            sq=t_q,
-            skv=t_kv,
-            d_qk=d_qk,
-            d_v=d_v,
-            max_sq=max_sq,
+            b=self.batch_size,
+            qh=self.h_q,
+            kh=self.h_kv,
+            sq=pack.t_q,
+            skv=pack.t_kv,
+            d_qk=self.head_dim_qk,
+            d_v=self.head_dim_v,
+            max_sq=pack.max_sq,
             has_lse=self.lse_desc is not None,
             lse_head_major=self.thd_stats_head_major,
             lse_head_stride=self.thd_stats_head_stride,
         )
         fn(
-            _packed(q_buf, t_q),
-            K,
-            V,
-            _packed(o_buf, t_q),
+            pack.Q,
+            pack.K,
+            pack.V,
+            pack.O,
             lse,
             sinks_t,
-            seq_q_dummy,
-            meta,
+            pack.seq_q_dummy,
+            pack.meta,
             cutlass.Float32(scale_softmax_log2),
             current_stream,
         )

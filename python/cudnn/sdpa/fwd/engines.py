@@ -710,11 +710,14 @@ def lower_dsl_prefill(
         amax_s_buf = resolved.get(id(binding.amax_s)) if binding.amax_s is not None else None
         ds_buf = resolved.get(id(binding.descale_s)) if binding.descale_s is not None else None
         ss_buf = resolved.get(id(binding.scale_s)) if binding.scale_s is not None else None
-        # The quantized lowerings drop the per-batch Q trim, which is harmless
-        # only while every seq_len_q equals S_q -- a shorter one writes O and a
-        # finite LSE past the valid length. Checked here because the lengths are
-        # device values; this path already reads the descale scalars back.
-        if (facts.is_mxfp8 or facts.is_fp8) and seq_q_buf is not None and not seq_q_lens_present:
+        # The quantized DENSE lowerings drop the per-batch Q trim, which is
+        # harmless only while every seq_len_q equals S_q -- a shorter one writes
+        # O and a finite LSE past the valid length. Checked here because the
+        # lengths are device values; this path already reads the descale
+        # scalars back. THD is exempt: ragged lengths ARE shorter than S_q by
+        # construction, and the packed layout gives each sequence its own
+        # extent, so nothing is written past a valid length.
+        if (facts.is_mxfp8 or facts.is_fp8) and not facts.thd and seq_q_buf is not None and not seq_q_lens_present:
             if int(seq_q_buf.min().item()) < int(facts.s_q):
                 raise NotImplementedError(
                     f"per-tensor FP8/MXFP8: per-batch seq_len_q shorter than S_q={facts.s_q} is not plumbed; got min {int(seq_q_buf.min().item())}"
@@ -799,17 +802,19 @@ def _sm120_fp8_spec() -> EngineSpec:
     P quantization follows the backend's FORT ordering: Amax_S on the unscaled
     softmax result, then Scale_S, then the e4m3 cast, with Descale_S folded into
     o_scale_fused. (cuDNN's Scale_S/Descale_S scale the softmax OUTPUT, not the
-    scores.) The SM100 FP8 row does NOT yet do this -- it converts P unscaled,
-    which is still correct for the reciprocal pairs that are the normal case,
-    and declines anything else; wiring it there is a follow-up.
+    scores.) The SM100 FP8 row deliberately does NOT do this: its lazy-rescale
+    skip leaves P bounded by 2^RESCALE_THRESHOLD rather than 1, so e4m3's range
+    above 1.0 is already spent and a caller Scale_S would saturate it. It
+    honours a reciprocal pair analytically instead and declines anything else.
 
     Same mma.sync architecture as the f16 SM120 cell with the MMA lowered to
     m16n8k32 e4m3; ``descale_q*descale_k`` folds into the softmax scale and
     ``descale_v*scale_o`` into an epilogue scalar, so the kernel adds only the
     Amax_S/Amax_O atomics over the f16 sibling. E4M3 only (no E5M2 tag in the
     kernel yet), FP16 O only, exact d128 (no zero-padding envelope on the
-    8-bit fragment path), no sink (Amax_S semantics with a sink column are
-    undefined here), and THD deferred like the SM100 fp8 v1.
+    8-bit fragment path), and no sink (Amax_S semantics with a sink column are
+    undefined here). THD (ragged) is served with token-major Stats; head-major
+    ragged Stats stays f16-only (the fp8 kernel carries no such specialization).
     """
 
     return EngineSpec(
@@ -831,6 +836,7 @@ def _sm120_fp8_spec() -> EngineSpec:
             padded=True,
             stats=True,
             lse_optional=True,
+            thd=True,
             # Same caveat as the SM100 fp8 row: no SEQ_Q_LENS epilogue trim,
             # but fp8 graphs cannot carry seq_len_q here (lower_dsl_prefill
             # forces seq_q_lens_present=False for the fp8 family).
