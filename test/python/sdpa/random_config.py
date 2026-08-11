@@ -131,10 +131,12 @@ class ExecConfig:
     # gaps keep every ragged base address in the packed layout's alignment
     # class by construction (sub-token gaps can violate the graph API's
     # 16-byte pointer-alignment contract — an odd-element gap is illegal for
-    # every engine). Default False: fixed configs and the fp8/mxfp8
-    # harnesses allocate assuming packed strides; the fp16 ragged sweeps
-    # enable this unconditionally.
-    with_ragged_token_gap: bool = False
+    # every engine). Default True: every ragged config fuzzes its layouts.
+    # fill_derived_fields auto-falls-back to packed where a gap is not yet
+    # expressible or handled: cu / offset-multiplier forms (#538) and the
+    # fp8/mxfp8 harnesses (#537). Configs with explicit strides are
+    # unaffected (the gap only fills strides left None).
+    with_ragged_token_gap: bool = True
     rescale_threshold: float = None
 
     diag_align: cudnn.diagonal_alignment = None
@@ -205,10 +207,22 @@ class ExecConfig:
             self.shape_stats = (self.batches, self.h_q, self.s_q, 1)
 
         # Compute strides if not provided (packed for ragged, default BHSD otherwise).
-        # with_ragged_token_gap: per-tensor token-stride gaps, re-derived
-        # deterministically from rng_geom_seed (so serialize/deserialize repro
-        # reproduces the same strides).
-        if self.is_ragged and self.with_ragged_token_gap:
+        # with_ragged_token_gap (default True): per-tensor token-stride gaps,
+        # re-derived deterministically from rng_geom_seed (so
+        # serialize/deserialize repro reproduces the same strides). Auto-packed
+        # where a gap is not yet expressible or handled:
+        #  - cu / offset-multiplier forms bind offsets as cu (x multiplier)
+        #    and cannot declare a token gap (#538);
+        #  - the fp8/mxfp8 harnesses (1-byte data_type) allocate assuming
+        #    packed strides (#537).
+        _gap_applicable = (
+            self.is_ragged
+            and self.with_ragged_token_gap
+            and not self.is_cu_seq_len
+            and not self.with_ragged_offset_multiplier
+            and not (self.data_type is not None and self.data_type.itemsize == 1)
+        )
+        if _gap_applicable:
             _gap_rng = random.Random((self.rng_geom_seed or 0) ^ 0xA80517)
             # Draw ALL FOUR gaps up front, in fixed Q/K/V/O order: an
             # explicitly provided stride must not shift the gaps the
