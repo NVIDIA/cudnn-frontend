@@ -104,9 +104,12 @@ def test_gemm_swiglu_jax_wrapper_quant_fp8():
 
 
 @pytest.mark.L0
-def test_gemm_swiglu_jax_ffi_sm100():
+def test_gemm_swiglu_jax_jit_sm100():
     """XLA custom-call entry point: jitted, repeated (donation safety), and alpha attr."""
-    pytest.importorskip("jax_tvm_ffi")
+    import cutlass.jax
+
+    if not cutlass.jax.is_available():
+        pytest.skip("CuTeDSL JAX extensions unavailable (jax >= 0.5 required)")
     skip_unless_sm100()
     from cudnn import gemm_swiglu_jax_sm100
 
@@ -127,15 +130,24 @@ def test_gemm_swiglu_jax_ffi_sm100():
         np.testing.assert_allclose(np.asarray(ab12)[:, :, 0], ab12_ref, atol=0.02, rtol=0.02)
         np.testing.assert_allclose(np.asarray(c).astype(np.float32)[:, :, 0], c_ref, atol=0.05, rtol=0.05)
 
-    # The quantized (blockscaled) config is eager-wrapper-only for now
+    # Quantized (blockscaled MXFP8) config through the same entry point, under jit
     sf_vec_size = 32
-    a2_np, _ = make_ab_fp8(m, k, ml_dtypes.float8_e4m3fn, rng)
-    b2_np, _ = make_ab_fp8(n, k, ml_dtypes.float8_e4m3fn, rng)
-    sfa_np, _ = make_sf_physical(m, k, sf_vec_size, ml_dtypes.float8_e8m0fnu, rng)
-    sfb_np, _ = make_sf_physical(n, k, sf_vec_size, ml_dtypes.float8_e8m0fnu, rng)
+    a2_np, a2_ref = make_ab_fp8(m, k, ml_dtypes.float8_e4m3fn, rng)
+    b2_np, b2_ref = make_ab_fp8(n, k, ml_dtypes.float8_e4m3fn, rng)
+    sfa_np, sfa_expanded = make_sf_physical(m, k, sf_vec_size, ml_dtypes.float8_e8m0fnu, rng)
+    sfb_np, sfb_expanded = make_sf_physical(n, k, sf_vec_size, ml_dtypes.float8_e8m0fnu, rng)
     a2, b2, sfa, sfb = (jax.device_put(x) for x in (a2_np, b2_np, sfa_np, sfb_np))
-    with pytest.raises(NotImplementedError, match="non-quantized kernel only"):
-        gemm_swiglu_jax_sm100(a2, b2, sfa_tensor=sfa, sfb_tensor=sfb, sf_vec_size=sf_vec_size)
+
+    quant = jax.jit(
+        lambda a, b, sfa, sfb: gemm_swiglu_jax_sm100(
+            a, b, ab12_dtype=jnp.bfloat16, c_dtype=jnp.bfloat16, sfa_tensor=sfa, sfb_tensor=sfb, sf_vec_size=sf_vec_size
+        )
+    )
+    ab12q, cq = quant(a2, b2, sfa, sfb)
+    jax.block_until_ready((ab12q, cq))
+    ab12q_ref = (a2_ref * sfa_expanded) @ (b2_ref * sfb_expanded).T
+    np.testing.assert_allclose(np.asarray(ab12q).astype(np.float32)[:, :, 0], ab12q_ref, atol=0.5, rtol=0.05)
+    np.testing.assert_allclose(np.asarray(cq).astype(np.float32)[:, :, 0], swiglu_block_ref(ab12q_ref, n), atol=1.0, rtol=0.05)
 
 
 @pytest.mark.L0

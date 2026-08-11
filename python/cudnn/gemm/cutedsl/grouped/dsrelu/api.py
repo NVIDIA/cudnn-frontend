@@ -39,6 +39,7 @@ from cudnn.api_base import APIBase, TupleDict, ceil_div, is_power_of_2
 from cudnn.gemm.cutedsl.grouped.unfused._bf16_api import _validate_pointer_tensor
 from cudnn.tensor_adapter import (
     allocate_byte_workspace,
+    canonicalize_unit_dim_strides,
     cuda_is_available,
     default_stream,
     detect_framework,
@@ -295,19 +296,37 @@ class GroupedGemmDsreluSm100(APIBase):
         return not (len(shape) == 6 and shape[0] == 32 and shape[1] == 4 and shape[3] == 4)
 
     def _check_sf_shape(self, sf_desc, mn128: int, rest: int, l: int, name: str) -> None:
-        """Validate an SF tensor shape, accepting the permuted atom view or (in discrete
-        weight mode) the physical C-contiguous form -- see ``_sf_desc_is_physical``."""
+        """Validate an SF tensor shape and strides, accepting the permuted atom view or (in
+        discrete weight mode) the physical C-contiguous form -- see ``_sf_desc_is_physical``.
+
+        The kernel consumes only the SF base pointer and rebuilds the layout from the GEMM
+        shapes, so both forms must be exactly the C-contiguous physical allocation in memory:
+        strides are validated too (a shape-matching but differently-strided tensor would
+        silently produce wrong results).
+        """
         if sf_desc is None:
             return
         self._value_error_if(len(sf_desc.shape) != 6, f"{name} tensor must be 6-D, got shape {sf_desc.shape}")
         if not self._sf_desc_is_physical(sf_desc):
             self._check_tensor_shape(sf_desc, (32, 4, mn128, 4, rest, l), name)
+            _ = self._check_tensor_stride(
+                sf_desc,
+                stride=[canonicalize_unit_dim_strides((32, 4, mn128, 4, rest, l), (16, 4, rest * 512, 1, 512, mn128 * rest * 512))],
+                name=name,
+                extra_error_msg=f"{name} atom view must be the (3, 4, 1, 5, 2, 0) permutation of a C-contiguous (L, MN', K', 32, 4, 4) allocation",
+            )
             return
         self._value_error_if(
             self.weight_mode != MoEWeightMode.DISCRETE,
             f"{name} physical (L, MN', K', 32, 4, 4) form is only supported in discrete weight mode; " "provide the permuted (32, 4, MN', 4, K', L) atom view",
         )
         self._check_tensor_shape(sf_desc, (l, mn128, rest, 32, 4, 4), name)
+        _ = self._check_tensor_stride(
+            sf_desc,
+            stride=[canonicalize_unit_dim_strides((l, mn128, rest, 32, 4, 4), (mn128 * rest * 512, rest * 512, 512, 16, 4, 1))],
+            name=name,
+            extra_error_msg=f"{name} in the physical (L, MN', K', 32, 4, 4) form must be C-contiguous",
+        )
 
     def check_support(self) -> bool:
         """Check if the kernel configuration is supported.

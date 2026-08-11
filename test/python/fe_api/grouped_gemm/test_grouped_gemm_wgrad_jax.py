@@ -152,6 +152,71 @@ def test_grouped_gemm_wgrad_jax_discrete_matches_torch():
 
 
 @pytest.mark.L0
+def test_grouped_gemm_wgrad_jax_jit_matches_eager():
+    """XLA custom-call entry point (cudnn.jax.call): bit-identical to the eager JAX wrapper.
+
+    The jit entry is discrete-mode only: the per-expert outputs are caller-owned
+    external buffers reached through the wgrad_ptrs input array (not XLA outputs), so
+    each run gets fresh zero-filled buffers and the comparison reads them after
+    blocking on the returned token plus a device sync.
+    """
+    import cutlass.jax
+
+    if not cutlass.jax.is_available():
+        pytest.skip("CuTeDSL JAX extensions unavailable (jax >= 0.5 required)")
+    skip_unless_sm100()
+    from cudnn import grouped_gemm_wgrad_jax_sm100, grouped_gemm_wgrad_wrapper_sm100
+
+    a_np, b_np, offsets_np = make_problem()
+    m, n, experts = a_np.shape[0], b_np.shape[1], len(offsets_np)
+
+    a_j, b_j, offsets_j = (jnp.asarray(x) for x in (a_np, b_np, offsets_np))
+    jax.block_until_ready((a_j, b_j, offsets_j))
+
+    # Eager JAX wrapper baseline (dense output) on the same bytes and kernel config.
+    result_eager = grouped_gemm_wgrad_wrapper_sm100(
+        a_tensor=a_j,
+        b_tensor=b_j,
+        sfa_tensor=None,
+        sfb_tensor=None,
+        offsets_tensor=offsets_j,
+        output_mode="dense",
+        mma_tiler_mn=(128, 128),
+        cluster_shape_mn=(1, 1),
+    )
+    device_sync()  # eager JAX path runs on the CUDA legacy default stream
+    expected = np.asarray(result_eager["wgrad_tensor"]).view(np.uint8)  # (experts, m, 2n) bytes
+
+    def run_and_check(fn, label):
+        # Fresh zero-filled external buffers per run so each check observes that
+        # run's writes (the kernel fully overwrites; buffers are immutable JAX
+        # arrays mutated behind XLA's back through their raw addresses).
+        expert_outputs = [jax.block_until_ready(jnp.zeros((m, n), dtype=ml_dtypes.bfloat16)) for _ in range(experts)]
+        ptr_values = np.array([buf.unsafe_buffer_pointer() for buf in expert_outputs], dtype=np.int64)
+        wgrad_ptrs_j = jax.block_until_ready(jnp.asarray(ptr_values.view(np.uint8)))
+        token = fn(wgrad_ptrs_j)
+        assert token.shape == (m, n)
+        jax.block_until_ready(token)
+        device_sync()  # external-buffer writes are outside XLA's dataflow
+        for expert in range(experts):
+            np.testing.assert_array_equal(
+                np.asarray(expert_outputs[expert]).view(np.uint8),
+                expected[expert],
+                err_msg=f"wgrad jit expert {expert} ({label}): output differs from eager wrapper output on identical input bytes",
+            )
+
+    kwargs = dict(mma_tiler_mn=(128, 128), cluster_shape_mn=(1, 1))
+
+    # Eager custom call
+    run_and_check(lambda ptrs: grouped_gemm_wgrad_jax_sm100(a_j, b_j, offsets_j, ptrs, **kwargs), "eager custom call")
+
+    # Under jax.jit, twice (compiled-kernel / registration cache).
+    jitted = jax.jit(lambda a, b, offsets, ptrs: grouped_gemm_wgrad_jax_sm100(a, b, offsets, ptrs, **kwargs))
+    run_and_check(lambda ptrs: jitted(a_j, b_j, offsets_j, ptrs), "jit call 1")
+    run_and_check(lambda ptrs: jitted(a_j, b_j, offsets_j, ptrs), "jit call 2")
+
+
+@pytest.mark.L0
 def test_grouped_gemm_wgrad_jax_block_scaled_rejected():
     skip_unless_sm100()
     import cudnn

@@ -215,6 +215,17 @@ class DiscreteGroupedGemmDswigluSm100(APIBase):
             (1, mn_div_128, rest, 32, 4, 4) if is_physical else (32, 4, mn_div_128, 4, rest, 1),
             name,
         )
+        # The kernel consumes only the SF base pointer and rebuilds the layout from the
+        # GEMM shapes, so both forms must be exactly the C-contiguous physical allocation
+        # in memory: validate strides too (a shape-matching but differently-strided tensor
+        # would silently produce wrong results).
+        if is_physical:
+            expected = canonicalize_unit_dim_strides((1, mn_div_128, rest, 32, 4, 4), (mn_div_128 * rest * 512, rest * 512, 512, 16, 4, 1))
+            extra = f"{name} in the physical (1, MN', K', 32, 4, 4) form must be C-contiguous"
+        else:
+            expected = canonicalize_unit_dim_strides((32, 4, mn_div_128, 4, rest, 1), (16, 4, rest * 512, 1, 512, mn_div_128 * rest * 512))
+            extra = f"{name} atom view must be the (3, 4, 1, 5, 2, 0) permutation of a C-contiguous (1, MN', K', 32, 4, 4) allocation"
+        _ = self._check_tensor_stride(desc, stride=[expected], name=name, extra_error_msg=extra)
         return is_physical
 
     def check_support(self) -> bool:

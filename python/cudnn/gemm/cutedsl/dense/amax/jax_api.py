@@ -3,14 +3,9 @@
 
 """JAX-native (XLA custom call) entry point for the blockscaled GEMM + amax kernel.
 
-Unlike the eager path (``gemm_amax_wrapper_sm100`` with JAX arrays), this entry point
-integrates with XLA via jax-tvm-ffi: the kernel is compiled with the TVM-FFI environment
-stream (so it runs on XLA's compute stream, correctly ordered with surrounding ops), the
-output buffers are managed by XLA through donation, and the call is ``jax.jit``-compatible.
-No manual synchronization or block_until_ready is needed around it.
-
-This module imports jax/jax_tvm_ffi at import time; it is only loaded when the
-``gemm_amax_jax_sm100`` symbol is requested.
+Built on :func:`cudnn.jax.call` (CuTeDSL's native JAX bridge): the kernel runs on
+XLA's compute stream, outputs are XLA-managed, and the call composes with ``jax.jit``
+and CUDA graph capture. No manual synchronization is needed.
 """
 
 from typing import Any, Tuple
@@ -19,15 +14,26 @@ import jax
 import jax.numpy as jnp
 
 import cutlass
+import cutlass.cute as cute
+import cutlass.utils
 
 from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.tensor_adapter import framework_dtype
-from cudnn.gemm.cutedsl._jax_ffi import get_or_register_env_stream_target, make_row_major_desc as _make_desc
+from cudnn.jax import call, gemm_operand_spec, row_major_desc as _make_desc, sf_atom_spec, zeros_init
 from .api import GemmAmaxSm100
 
-# cache_key -> (registered XLA target name, GemmAmaxSm100, compiled tvm-ffi callable).
-# The object references keep the compiled kernel alive alongside the global registration.
-_registered_targets = {}
+# config_key -> (kernel instance, max_active_clusters). The instance does not vary
+# with problem shapes, so the key holds only kernel-construction config — a shared
+# instance keeps cutlass_call's compile cache warm (its FunctionSpec keys on the
+# constexpr kwargs). Shape/dtype validation is cached separately per full signature.
+_kernel_cache: dict = {}
+_validated_configs: set = set()
+
+
+@cute.jit
+def _amax_adapter(stream, a, b, sfa, sfb, c, amax, *, kernel, mac):
+    # Destination-passing kernel signature; amax arrives pre-initialized (donated input).
+    kernel(a, b, sfa, sfb, c, amax, mac, stream)
 
 
 def gemm_amax_jax_sm100(
@@ -45,11 +51,7 @@ def gemm_amax_jax_sm100(
 
     Arguments are JAX arrays (or tracers): A (M, K, 1) and B (N, K, 1) k-major
     C-contiguous, SFA/SFB in the physical atom shape (1, MN', K', 32, 4, 4).
-    Returns a plain ``(c_tensor, amax_tensor)`` tuple of fresh JAX arrays (a plain
-    tuple, not a TupleDict, so the result is a valid JAX pytree under jit); C is n-major.
-
-    Note: calling this eagerly re-traces the ffi_call each time -- prefer calling it
-    from inside a jitted function in hot loops.
+    Returns a plain ``(c_tensor, amax_tensor)`` tuple of fresh JAX arrays; C is n-major.
     """
     c_dtype = _convert_to_cutlass_data_type(c_dtype)
     acc_dtype = _convert_to_cutlass_data_type(acc_dtype)
@@ -59,7 +61,14 @@ def gemm_amax_jax_sm100(
     if l != 1:
         raise ValueError("JAX inputs must have batch dim L == 1; batch-outermost (L-major) layouts are not expressible as JAX arrays")
 
-    cache_key = (
+    config_key = (
+        c_dtype,
+        acc_dtype,
+        mma_tiler_mn,
+        cluster_shape_mn,
+        sf_vec_size,
+    )
+    validation_key = (
         tuple(a_tensor.shape),
         tuple(b_tensor.shape),
         tuple(sfa_tensor.shape),
@@ -68,15 +77,13 @@ def gemm_amax_jax_sm100(
         _convert_to_cutlass_data_type(b_tensor.dtype),
         _convert_to_cutlass_data_type(sfa_tensor.dtype),
         _convert_to_cutlass_data_type(sfb_tensor.dtype),
-        c_dtype,
-        acc_dtype,
-        mma_tiler_mn,
-        cluster_shape_mn,
-        sf_vec_size,
+        config_key,
     )
 
-    def make_gemm():
-        return GemmAmaxSm100(
+    if validation_key not in _validated_configs:
+        # Validation reuses the class API's check_support on metadata-only descriptors
+        # (works for jax.jit tracers, which expose only .shape/.dtype).
+        gemm = GemmAmaxSm100(
             sample_a=_make_desc(tuple(a_tensor.shape), a_tensor.dtype, "sample_a"),
             sample_b=_make_desc(tuple(b_tensor.shape), b_tensor.dtype, "sample_b"),
             sample_sfa=_make_desc(tuple(sfa_tensor.shape), sfa_tensor.dtype, "sample_sfa"),
@@ -88,25 +95,35 @@ def gemm_amax_jax_sm100(
             cluster_shape_mn=cluster_shape_mn,
             sf_vec_size=sf_vec_size,
         )
+        assert gemm.check_support()
+        if config_key not in _kernel_cache:
+            kernel = gemm._kernel(
+                sf_vec_size=sf_vec_size,
+                mma_tiler_mn=mma_tiler_mn,
+                cluster_shape_mn=cluster_shape_mn,
+            )
+            mac = cutlass.utils.HardwareInfo().get_max_active_clusters(cluster_shape_mn[0] * cluster_shape_mn[1]) - gemm.num_cluster_overlap_margin
+            _kernel_cache[config_key] = (kernel, mac)
+        _validated_configs.add(validation_key)
+    kernel, mac = _kernel_cache[config_key]
 
-    # arg_spec=["args"]: only the operands are passed to the kernel; the result
-    # buffers arrive as the two donated trailing operands (input_output_aliases below),
-    # matching the kernel's destination-passing signature (a, b, sfa, sfb, c, amax).
-    target = get_or_register_env_stream_target(_registered_targets, cache_key, make_gemm, "cudnn.gemm_amax_sm100")
-
-    c_jax_dtype = framework_dtype(c_dtype, "jax")
-    c_buf = jnp.zeros((m, n, l), dtype=c_jax_dtype)
-    # Zero-init is a valid amax identity: the kernel accumulates max(|c|) >= 0 via a
-    # signed-integer atomic max of non-negative float bit patterns.
-    amax_buf = jnp.zeros((1, 1, 1), dtype=jnp.float32)
-
-    c_tensor, amax_tensor = jax.ffi.ffi_call(
-        target,
-        (
-            jax.ShapeDtypeStruct((m, n, l), c_jax_dtype),
+    operand = gemm_operand_spec()
+    sf = sf_atom_spec()
+    c_tensor, amax_tensor = call(
+        _amax_adapter,
+        output_shape_dtype=(
+            jax.ShapeDtypeStruct((m, n, l), framework_dtype(c_dtype, "jax")),
             jax.ShapeDtypeStruct((1, 1, 1), jnp.float32),
         ),
-        input_output_aliases={4: 0, 5: 1},
-    )(a_tensor, b_tensor, sfa_tensor, sfb_tensor, c_buf, amax_buf)
+        input_spec=(operand, operand, sf, sf),
+        output_spec=(operand, None),
+        # Both outputs are donated pre-initialized inputs: amax needs the zero identity
+        # (signed-int atomic max of non-negative values), and routing c through the
+        # donated-input path gives it the explicit (1, 0, 2) layout spec -- the bridge's
+        # leading-dim inference rejects trailing-unit-dim buffers on pure results.
+        initialized_outputs={0: zeros_init, 1: zeros_init},
+        kernel=kernel,
+        mac=mac,
+    )(a_tensor, b_tensor, sfa_tensor, sfb_tensor)
 
     return c_tensor, amax_tensor

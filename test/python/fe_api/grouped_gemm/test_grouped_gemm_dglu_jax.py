@@ -113,6 +113,75 @@ def test_grouped_gemm_dglu_jax_discrete_matches_torch():
 
 
 @pytest.mark.L0
+def test_grouped_gemm_dglu_jax_jit_matches_eager():
+    """XLA custom-call entry point (cudnn.jax.call): bit-identical to the eager JAX wrapper."""
+    import cutlass.jax
+
+    if not cutlass.jax.is_available():
+        pytest.skip("CuTeDSL JAX extensions unavailable (jax >= 0.5 required)")
+    skip_unless_sm100()
+    from cudnn import grouped_gemm_dglu_jax_sm100, grouped_gemm_dglu_wrapper_sm100
+
+    m, n_weight, k, experts = 512, 128, 128, 2
+    a_np, c_np, b_storage_np, offsets_np, alpha_np, beta_np, prob_np = make_problem(m, n_weight, k, experts)
+
+    a_j = jnp.asarray(a_np)
+    c_j = jnp.asarray(c_np)
+    b_experts_j = [jnp.asarray(b_storage_np[i]) for i in range(experts)]  # per-expert (n_weight, k) k-major
+    offsets_j, alpha_j, beta_j, prob_j = (jnp.asarray(x) for x in (offsets_np, alpha_np, beta_np, prob_np))
+    # Eager path only: kernel-written output buffer, zero-initialized and materialized
+    # before its pointer is used (the jit entry allocates dprob as a donated output).
+    dprob_j = jax.block_until_ready(jnp.zeros((m, 1, 1), dtype=jnp.float32))
+    jax.block_until_ready((a_j, c_j, offsets_j, alpha_j, beta_j, prob_j, *b_experts_j))
+    b_ptrs_j = _packed_jax_ptrs(b_experts_j)
+
+    # Eager wrapper baseline on the same bytes; the last padded offset covers every
+    # row, so full-buffer bitwise comparison against the jit path is well-defined.
+    result_eager = grouped_gemm_dglu_wrapper_sm100(
+        a_tensor=a_j,
+        c_tensor=c_j,
+        sfa_tensor=None,
+        padded_offsets=offsets_j,
+        alpha_tensor=alpha_j,
+        beta_tensor=beta_j,
+        prob_tensor=prob_j,
+        dprob_tensor=dprob_j,
+        b_ptrs=b_ptrs_j,
+        n=n_weight,
+        b_dtype="bfloat16",
+        generate_dbias=True,
+    )
+    device_sync()  # eager JAX path runs on the CUDA legacy default stream
+    expected = {key: np.asarray(result_eager[key]).view(np.uint8) for key in ("d_row_tensor", "dprob_tensor", "dbias_tensor")}
+
+    def check(d_row_tensor, dprob_tensor, dbias_tensor):
+        jax.block_until_ready((d_row_tensor, dprob_tensor, dbias_tensor))
+        for got, key in ((d_row_tensor, "d_row_tensor"), (dprob_tensor, "dprob_tensor"), (dbias_tensor, "dbias_tensor")):
+            np.testing.assert_array_equal(
+                np.asarray(got).view(np.uint8),
+                expected[key],
+                err_msg=f"grouped dGLU {key}: jit output differs from eager wrapper output on identical input bytes",
+            )
+
+    # Eager custom call
+    check(*grouped_gemm_dglu_jax_sm100(a_j, c_j, offsets_j, alpha_j, beta_j, b_ptrs_j, n_weight, prob_j, generate_dbias=True))
+
+    # Under jax.jit, twice (compiled-kernel / registration cache). n stays static.
+    jitted = jax.jit(
+        lambda a, c, offsets, alpha, beta, ptrs, prob: grouped_gemm_dglu_jax_sm100(a, c, offsets, alpha, beta, ptrs, n_weight, prob, generate_dbias=True),
+    )
+    check(*jitted(a_j, c_j, offsets_j, alpha_j, beta_j, b_ptrs_j, prob_j))
+    check(*jitted(a_j, c_j, offsets_j, alpha_j, beta_j, b_ptrs_j, prob_j))
+
+    # generate_dbias=False returns (d_row, dprob, None)
+    d_row_only, dprob_only, dbias_none = grouped_gemm_dglu_jax_sm100(a_j, c_j, offsets_j, alpha_j, beta_j, b_ptrs_j, n_weight, prob_j)
+    jax.block_until_ready((d_row_only, dprob_only))
+    assert dbias_none is None
+    np.testing.assert_array_equal(np.asarray(d_row_only).view(np.uint8), expected["d_row_tensor"])
+    np.testing.assert_array_equal(np.asarray(dprob_only).view(np.uint8), expected["dprob_tensor"])
+
+
+@pytest.mark.L0
 def test_grouped_gemm_dglu_jax_errors():
     skip_unless_sm100()
     from cudnn import grouped_gemm_dglu_wrapper_sm100

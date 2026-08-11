@@ -104,6 +104,67 @@ def test_grouped_gemm_glu_jax_discrete_matches_torch(act_func):
 
 
 @pytest.mark.L0
+def test_grouped_gemm_glu_jax_jit_matches_eager():
+    """XLA custom-call entry point (cudnn.jax.call): bit-identical to the eager JAX wrapper."""
+    import cutlass.jax
+
+    if not cutlass.jax.is_available():
+        pytest.skip("CuTeDSL JAX extensions unavailable (jax >= 0.5 required)")
+    skip_unless_sm100()
+    from cudnn import grouped_gemm_glu_jax_sm100, grouped_gemm_glu_wrapper_sm100
+
+    m, n_full, k, experts = 512, 256, 128, 2
+    a_np, b_storage_np, offsets_np, alpha_np, prob_np = make_problem(m, n_full, k, experts)
+
+    a_j = jnp.asarray(a_np)
+    b_experts_j = [jnp.asarray(b_storage_np[i]) for i in range(experts)]  # per-expert (n_full, k) k-major
+    offsets_j, alpha_j, prob_j = (jnp.asarray(x) for x in (offsets_np, alpha_np, prob_np))
+    jax.block_until_ready((a_j, offsets_j, alpha_j, prob_j, *b_experts_j))
+    b_ptrs_j = _packed_jax_ptrs(b_experts_j)
+
+    # Eager wrapper baseline on the same bytes; the last padded offset covers every
+    # row, so full-buffer bitwise comparison against the jit path is well-defined.
+    result_eager = grouped_gemm_glu_wrapper_sm100(
+        a_tensor=a_j,
+        sfa_tensor=None,
+        padded_offsets=offsets_j,
+        alpha_tensor=alpha_j,
+        prob_tensor=prob_j,
+        b_ptrs=b_ptrs_j,
+        n=n_full,
+        b_dtype="bfloat16",
+        generate_c=True,
+    )
+    device_sync()  # eager JAX path runs on the CUDA legacy default stream
+    expected = {key: np.asarray(result_eager[key]).view(np.uint8) for key in ("d_tensor", "c_tensor")}
+
+    def check(d_tensor, c_tensor):
+        jax.block_until_ready((d_tensor, c_tensor))
+        for got, key in ((d_tensor, "d_tensor"), (c_tensor, "c_tensor")):
+            np.testing.assert_array_equal(
+                np.asarray(got).view(np.uint8),
+                expected[key],
+                err_msg=f"grouped GLU {key}: jit output differs from eager wrapper output on identical input bytes",
+            )
+
+    # Eager custom call
+    check(*grouped_gemm_glu_jax_sm100(a_j, offsets_j, alpha_j, b_ptrs_j, n_full, prob_j, generate_c=True))
+
+    # Under jax.jit, twice (compiled-kernel / registration cache). n stays static.
+    jitted = jax.jit(
+        lambda a, offsets, alpha, ptrs, prob: grouped_gemm_glu_jax_sm100(a, offsets, alpha, ptrs, n_full, prob, generate_c=True),
+    )
+    check(*jitted(a_j, offsets_j, alpha_j, b_ptrs_j, prob_j))
+    check(*jitted(a_j, offsets_j, alpha_j, b_ptrs_j, prob_j))
+
+    # generate_c=False returns (d, None)
+    d_only, c_none = grouped_gemm_glu_jax_sm100(a_j, offsets_j, alpha_j, b_ptrs_j, n_full, prob_j)
+    jax.block_until_ready(d_only)
+    assert c_none is None
+    np.testing.assert_array_equal(np.asarray(d_only).view(np.uint8), expected["d_tensor"])
+
+
+@pytest.mark.L0
 def test_grouped_gemm_glu_jax_errors():
     skip_unless_sm100()
     from cudnn import grouped_gemm_glu_wrapper_sm100

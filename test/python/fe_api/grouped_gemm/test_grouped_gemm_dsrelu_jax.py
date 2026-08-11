@@ -169,6 +169,113 @@ def test_grouped_gemm_dsrelu_jax_discrete_fp8_matches_torch():
 
 
 @pytest.mark.L0
+def test_grouped_gemm_dsrelu_jax_jit_matches_eager():
+    """XLA custom-call entry point (cudnn.jax.call): bit-identical to the eager JAX wrapper."""
+    import cutlass.jax
+
+    if not cutlass.jax.is_available():
+        pytest.skip("CuTeDSL JAX extensions unavailable (jax >= 0.5 required)")
+    skip_unless_sm100()
+    from cudnn import grouped_gemm_dsrelu_jax_sm100, grouped_gemm_dsrelu_wrapper_sm100
+
+    m, n, k, experts, sf_vec_size = 512, 256, 256, 2, 32
+    a_np, b_np, c_np, sfa_np, sfb_np, offsets_np, alpha_np, prob_np, norm_const_np = make_problem(m, n, k, experts, sf_vec_size)
+
+    a_j = jnp.asarray(a_np)
+    c_j = jnp.asarray(c_np)
+    sfa_j = jnp.asarray(sfa_np)
+    b_experts_j = [jnp.asarray(b_np[i]) for i in range(experts)]  # per-expert (n, k) k-major
+    sfb_experts_j = [jnp.asarray(sfb_np[i]) for i in range(experts)]
+    offsets_j, alpha_j, prob_j, norm_const_j = (jnp.asarray(x) for x in (offsets_np, alpha_np, prob_np, norm_const_np))
+    jax.block_until_ready((a_j, c_j, sfa_j, offsets_j, alpha_j, prob_j, norm_const_j, *b_experts_j, *sfb_experts_j))
+    b_ptr_values = np.array([w.unsafe_buffer_pointer() for w in b_experts_j], dtype=np.int64)
+    sfb_ptr_values = np.array([w.unsafe_buffer_pointer() for w in sfb_experts_j], dtype=np.int64)
+    b_ptrs_j = jax.block_until_ready(jnp.asarray(b_ptr_values.view(np.uint8)))
+    sfb_ptrs_j = jax.block_until_ready(jnp.asarray(sfb_ptr_values.view(np.uint8)))
+
+    # Eager wrapper baseline on the same bytes; the last padded offset covers every
+    # row, so full-buffer bitwise comparison against the jit path is well-defined.
+    result_eager = grouped_gemm_dsrelu_wrapper_sm100(
+        a_tensor=a_j,
+        c_tensor=c_j,
+        sfa_tensor=sfa_j,
+        padded_offsets=offsets_j,
+        alpha_tensor=alpha_j,
+        prob_tensor=prob_j,
+        b_ptrs=b_ptrs_j,
+        sfb_ptrs=sfb_ptrs_j,
+        n=n,
+        b_dtype="float8_e4m3fn",
+        b_major="k",
+        norm_const_tensor=norm_const_j,
+        d_dtype="float8_e4m3fn",
+        sf_vec_size=sf_vec_size,
+    )
+    device_sync()  # eager JAX path runs on the CUDA legacy default stream
+
+    exact_keys = ("d_row_tensor", "d_col_tensor", "d_srelu_tensor", "sfd_row_tensor", "sfd_col_tensor", "sfd_col_d_srelu_tensor")
+    assert np.count_nonzero(_u8(result_eager["d_row_tensor"])) > 0
+    expected = {key: _u8(result_eager[key]) for key in exact_keys}
+    expected_dprob = np.asarray(result_eager["dprob_tensor"])
+
+    def check(results):
+        # jit entry returns the eager wrapper's key order as a tuple.
+        d_row, d_col, d_srelu, dprob, dbias, amax, sfd_row, sfd_col, sfd_col_d_srelu = results
+        jax.block_until_ready((d_row, d_col, d_srelu, dprob, sfd_row, sfd_col, sfd_col_d_srelu))
+        assert dbias is None and amax is None
+        got = {
+            "d_row_tensor": d_row,
+            "d_col_tensor": d_col,
+            "d_srelu_tensor": d_srelu,
+            "sfd_row_tensor": sfd_row,
+            "sfd_col_tensor": sfd_col,
+            "sfd_col_d_srelu_tensor": sfd_col_d_srelu,
+        }
+        for key in exact_keys:
+            np.testing.assert_array_equal(
+                _u8(got[key]),
+                expected[key],
+                err_msg=f"dsrelu jit {key}: output differs from eager wrapper output on identical input bytes",
+            )
+        # dprob is accumulated with atomic float adds; ordering is nondeterministic.
+        np.testing.assert_allclose(
+            np.asarray(dprob),
+            expected_dprob,
+            rtol=1e-4,
+            atol=1e-4,
+            err_msg="dsrelu jit dprob: output differs from eager wrapper output beyond atomic-add tolerance",
+        )
+
+    def run(a, c, sfa, offsets, alpha, prob, b_ptrs, sfb_ptrs, norm_const):
+        return grouped_gemm_dsrelu_jax_sm100(
+            a_tensor=a,
+            c_tensor=c,
+            sfa_tensor=sfa,
+            padded_offsets=offsets,
+            alpha_tensor=alpha,
+            prob_tensor=prob,
+            b_ptrs=b_ptrs,
+            sfb_ptrs=sfb_ptrs,
+            n=n,
+            norm_const_tensor=norm_const,
+            b_dtype="float8_e4m3fn",
+            b_major="k",
+            d_dtype="float8_e4m3fn",
+            sf_vec_size=sf_vec_size,
+        )
+
+    args = (a_j, c_j, sfa_j, offsets_j, alpha_j, prob_j, b_ptrs_j, sfb_ptrs_j, norm_const_j)
+
+    # Eager custom call
+    check(run(*args))
+
+    # Under jax.jit, twice (compiled-kernel / registration cache). n stays static.
+    jitted = jax.jit(run)
+    check(jitted(*args))
+    check(jitted(*args))
+
+
+@pytest.mark.L0
 def test_grouped_gemm_dsrelu_jax_errors():
     skip_unless_sm100()
     from cudnn import grouped_gemm_dsrelu_wrapper_sm100

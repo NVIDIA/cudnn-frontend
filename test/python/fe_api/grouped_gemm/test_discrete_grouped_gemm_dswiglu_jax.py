@@ -156,6 +156,107 @@ def test_discrete_grouped_gemm_dswiglu_jax_fp8_matches_torch():
 
 
 @pytest.mark.L0
+def test_discrete_grouped_gemm_dswiglu_jax_jit_matches_eager():
+    """XLA custom-call entry point (cudnn.jax.call): bit-identical to the eager JAX wrapper.
+
+    d_row/d_col are deterministic per-tile kernel outputs and are compared bitwise;
+    dprob accumulates through floating-point atomics whose ordering is not
+    deterministic across runs, so it is compared with the same tight tolerance the
+    torch-parity test uses.
+    """
+    import cutlass.jax
+
+    if not cutlass.jax.is_available():
+        pytest.skip("CuTeDSL JAX extensions unavailable (jax >= 0.5 required)")
+    skip_unless_sm100()
+    from cudnn import discrete_grouped_gemm_dswiglu_jax_sm100, discrete_grouped_gemm_dswiglu_wrapper_sm100
+
+    a_np, b_np, c_np, sfa_u8, sfb_u8, offsets_np, alpha_np, beta_np, prob_np, norm_const_np = make_problem()
+
+    a_j = jnp.asarray(a_np)
+    b_j = [jnp.asarray(b) for b in b_np]
+    c_j = jnp.asarray(c_np)
+    sfa_j = jnp.asarray(sfa_u8.view(ml_dtypes.float8_e8m0fnu))  # physical atom shape
+    sfb_j = [jnp.asarray(sfb.view(ml_dtypes.float8_e8m0fnu)) for sfb in sfb_u8]
+    offsets_j, alpha_j, beta_j, prob_j, norm_const_j = (jnp.asarray(x) for x in (offsets_np, alpha_np, beta_np, prob_np, norm_const_np))
+    dprob_j = jnp.zeros((M, 1, 1), dtype=jnp.float32)  # eager wrapper takes dprob as a zeroed input buffer
+    jax.block_until_ready((a_j, c_j, sfa_j, offsets_j, alpha_j, beta_j, prob_j, norm_const_j, dprob_j, *b_j, *sfb_j))
+    b_ptrs_j = packed_ptrs(b_j)
+    sfb_ptrs_j = packed_ptrs(sfb_j)
+
+    # Eager wrapper baseline on the same bytes; the last padded offset covers every
+    # row and d_row/d_col are fully overwritten per-row kernel outputs, so
+    # full-buffer bitwise comparison against the jit path is well-defined.
+    result_eager = discrete_grouped_gemm_dswiglu_wrapper_sm100(
+        a_tensor=a_j,
+        b_ptrs=b_ptrs_j,
+        c_tensor=c_j,
+        sfa_tensor=sfa_j,
+        sfb_ptrs=sfb_ptrs_j,
+        padded_offsets=offsets_j,
+        alpha_tensor=alpha_j,
+        beta_tensor=beta_j,
+        prob_tensor=prob_j,
+        dprob_tensor=dprob_j,
+        norm_const_tensor=norm_const_j,
+        n=N,
+        b_dtype="float8_e4m3fn",
+        d_dtype="float8_e4m3fn",
+        sf_vec_size=SF_VEC_SIZE,
+        act_func="dswiglu",
+    )
+    device_sync()  # eager JAX path runs on the CUDA legacy default stream
+    expected = {key: np.asarray(result_eager[key]).view(np.uint8) for key in ("d_row_tensor", "d_col_tensor")}
+    dprob_expected = np.asarray(result_eager["dprob_tensor"])
+
+    def run_jit_entry(a, c, sfa, offsets, alpha, beta, prob, norm_const, b_ptrs, sfb_ptrs):
+        # dprob is a donated zero-initialized output of the custom call (the jit
+        # entry has no caller-provided dprob buffer, unlike the eager wrapper).
+        return discrete_grouped_gemm_dswiglu_jax_sm100(
+            a_tensor=a,
+            b_ptrs=b_ptrs,
+            c_tensor=c,
+            sfa_tensor=sfa,
+            sfb_ptrs=sfb_ptrs,
+            padded_offsets=offsets,
+            alpha_tensor=alpha,
+            beta_tensor=beta,
+            prob_tensor=prob,
+            norm_const_tensor=norm_const,
+            n=N,
+            d_dtype="float8_e4m3fn",
+            sf_vec_size=SF_VEC_SIZE,
+            act_func="dswiglu",
+        )
+
+    def check(result):
+        jax.block_until_ready(tuple(value for value in result.values() if value is not None))
+        for key in ("d_row_tensor", "d_col_tensor"):
+            np.testing.assert_array_equal(
+                np.asarray(result[key]).view(np.uint8),
+                expected[key],
+                err_msg=f"dswiglu {key}: jit output differs from eager wrapper output on identical input bytes",
+            )
+        np.testing.assert_allclose(
+            np.asarray(result["dprob_tensor"]),
+            dprob_expected,
+            rtol=2e-5,
+            atol=1e-4,
+            err_msg="dswiglu dprob_tensor: jit output differs from eager wrapper output beyond atomic-ordering tolerance",
+        )
+        assert result["amax_tensor"] is None  # fp8 d_dtype: no amax, matching the eager wrapper
+        assert result["dbias_tensor"] is None  # generate_dbias not requested
+
+    # Eager custom call
+    check(run_jit_entry(a_j, c_j, sfa_j, offsets_j, alpha_j, beta_j, prob_j, norm_const_j, b_ptrs_j, sfb_ptrs_j))
+
+    # Under jax.jit, twice (compiled-kernel / registration cache). n stays static.
+    jitted = jax.jit(run_jit_entry)
+    check(jitted(a_j, c_j, sfa_j, offsets_j, alpha_j, beta_j, prob_j, norm_const_j, b_ptrs_j, sfb_ptrs_j))
+    check(jitted(a_j, c_j, sfa_j, offsets_j, alpha_j, beta_j, prob_j, norm_const_j, b_ptrs_j, sfb_ptrs_j))
+
+
+@pytest.mark.L0
 def test_discrete_grouped_gemm_dswiglu_jax_errors():
     skip_unless_sm100()
     from cudnn import discrete_grouped_gemm_dswiglu_wrapper_sm100

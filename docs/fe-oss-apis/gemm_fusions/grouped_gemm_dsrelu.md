@@ -4,7 +4,9 @@
 
 ## JAX support
 
-Supports **JAX arrays** in the discrete (b_ptrs) FP8 configurations: pointer arrays as int64 (jax x64 mode) or packed uint8 (8 bytes per pointer), scale-factor tensors in the physical C-contiguous atom shape `(L, MN', K', 32, 4, 4)` (the kernel rebuilds SF layouts from the GEMM shapes and reads only the base pointer), outputs allocated as C-contiguous `jnp` arrays. Dense weight mode and packed-fp4 A/B are not expressible as JAX arrays and raise clear errors. Eager only, on the CUDA legacy default stream: `block_until_ready` inputs, synchronize before reading outputs; keep weight arrays alive until the kernel completes.
+Supports **JAX arrays** in the discrete (b_ptrs) FP8 configurations: pointer arrays as int64 (jax x64 mode) or packed uint8 (8 bytes per pointer), scale-factor tensors in the physical C-contiguous atom shape `(L, MN', K', 32, 4, 4)` (the kernel rebuilds SF layouts from the GEMM shapes and reads only the base pointer), outputs allocated as C-contiguous `jnp` arrays. Dense weight mode and packed-fp4 A/B are not expressible as JAX arrays and raise clear errors. The wrapper is eager, on the CUDA legacy default stream: `block_until_ready` inputs, synchronize before reading outputs; keep weight arrays alive until the kernel completes.
+
+For jitted JAX programs use the `jax.jit`-compatible XLA custom-call entry point `grouped_gemm_dsrelu_jax_sm100` (built on `cudnn.jax.call`; discrete FP8 mode, `sf_vec_size=32`): all outputs (d/SFD tensors, `dprob`, and with `generate_dbias=True` `dbias`) are XLA-managed donated zero-initialized buffers — no manual synchronization. Under tracing the `padded_offsets` *values* cannot be host-validated, and the weight/scale buffers behind the pointer arrays must stay alive and unmoved across every execution of the traced computation.
 
 ## Overview
 
