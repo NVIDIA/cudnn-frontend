@@ -20,7 +20,8 @@ Two integration surfaces are provided:
 
 The kernel lives at `python/cudnn/sdpa/bwd/kernels/bprop_f16_sm120.py`
 (one fused five-GEMM main kernel, plus a `dot` preprocess and a `cvt`
-dQ-finalize kernel per call).
+dQ-finalize kernel per call; GQA/MQA adds a fourth `reduce` kernel that sums
+the per-q-head dK/dV partials).
 
 ## Requirements
 
@@ -47,7 +48,8 @@ dq, dk, dv = grads["dq_tensor"], grads["dk_tensor"], grads["dv_tensor"]
 Tensors are logical `(B, H, S, D)`; any dense layout with the head dim
 innermost-contiguous is accepted (`dense_flex`) — non-BSHD-compact operands
 are staged through workspace copies. `stats` is the natural-log forward LSE,
-fp32 `(B, H, S_q, 1)` contiguous.
+fp32 `(B, H, S_q, 1)` contiguous. GQA/MQA is expressed through the head
+counts: `H_kv` may be any divisor of `H_q` (K/V and dK/dV carry `H_kv` heads).
 
 Through the graph API, per-plan sequence-tile-width knobs can be requested via
 `SdpaBwdKnobs`: `tile_m` controls the Q tile (`q_tile`), and `tile_n` controls
@@ -60,28 +62,32 @@ can be bitwise non-deterministic when a q-tile receives contributions from
 multiple KV-tile CTAs. `deterministic=True` serializes the per-`(batch, head,
 q_tile)` additions in ascending KV-tile order through a GMEM turn-counter
 array (the FlashAttention-style ordered-reduction relay). dK/dV are
-deterministic in both modes. This maps to the graph API's
+deterministic in both modes — including under GQA, where the group reduction
+runs in a fixed q-head order. This maps to the graph API's
 `use_deterministic_algorithm` and costs a shape-dependent slowdown of the main
 kernel while keeping the workspace linear in sequence length.
 
 ## Kernel design and optimizations
 
-### The three-kernel chain
+### The kernel chain
 
-One backward call is three launches, overlapped with programmatic dependent
-launch (PDL) so each kernel's prologue runs under its predecessor's tail:
+One backward call is three launches (four under GQA), overlapped with
+programmatic dependent launch (PDL) so each kernel's prologue runs under its
+predecessor's tail:
 
 ```
-dot   delta = rowsum(O ∘ dO); zeroes dq_accum (and, when deterministic, the relay counters)
-main  the fused five-GEMM pass; writes dK/dV, accumulates dQ into dq_accum
-cvt   dq_accum (fp32, scrambled) -> dQ (io dtype), applying attn_scale
+dot     delta = rowsum(O ∘ dO); zeroes dq_accum (and, when deterministic, the relay counters)
+main    the fused five-GEMM pass; writes dK/dV into dk_ws/dv_ws (aliased to the dk/dv
+        outputs for MHA, per-q-head partial buffers for GQA); accumulates dQ into dq_accum
+reduce  GQA only: dK/dV = fixed-order sum of each KV head's group of q-head partials
+cvt     dq_accum (fp32, scrambled) -> dQ (io dtype), applying attn_scale
 ```
 
 ### Main-kernel pipeline: KV-stationary, five chained GEMMs
 
-Grid is `(num_kv_tiles, H, B)` — one CTA owns one KV tile, loads K/V **once**,
-and walks every q-tile of its (batch, head) in descending order. Per q-tile
-iteration:
+Grid is `(num_kv_tiles, H_q, B)` — one CTA owns one KV tile of one **query**
+head (its KV head is `q_head // group`), loads K/V **once**, and walks every
+q-tile of its (batch, head) in descending order. Per q-tile iteration:
 
 ```
 GEMM1  S  = Q · Kᵀ            (K streamed from SMEM)
@@ -152,6 +158,22 @@ reduces dQ atomic traffic, and the `cvt` kernel un-scrambles it while converting
 to the I/O dtype. `dot` pre-zeroes the workspace (fused with the delta
 reduction; PDL orders it before `main`'s first add).
 
+### GQA/MQA group reduction
+
+Under GQA the chain rule sums each KV head's gradient over its group of
+`group = H_q / H_kv` query heads: `dK[kv_head] = Σ dK-contribution[q_head]`
+(same for dV); dQ is unaffected. The grid stays per query head — shrinking it
+by `group` would starve the GPU at small `B·H_kv`, and the kernel is
+compute-bound, so K/V-load reuse from walking the group in one CTA is not
+worth that trade. Instead each CTA writes its q head's dK/dV epilogue tiles to
+`dk_ws`/`dv_ws`, io-dtype buffers with an `H_q`-sized head axis (one slot per
+query head, so the group's partials coexist), and a lightweight `reduce`
+kernel then produces dK/dV: one thread per 16-byte output vector, accumulating
+the group's slices in fp32 in fixed q-head order — bandwidth-bound and bitwise
+deterministic by construction. For MHA (`H_q == H_kv`) the buffers alias the
+`dk`/`dv` outputs themselves — the same epilogue writes the results directly,
+nothing extra is carved, and no `reduce` kernel is launched.
+
 ### Causal and sliding-window masks
 
 Masking is applied twice, cheaply:
@@ -193,8 +215,9 @@ only the unused relay operand remains in the kernel ABI.
   served by zero-padding D to the next supported size (`d_qk == d_v`)
 - Masks: none, causal (top-left or bottom-right), sliding window
   (left-window offset, with or without causal)
-- Equal Q/KV head counts (no GQA/MQA); no dropout / bias / ALiBi / sinks /
-  softcap / THD
+- GQA/MQA: any `H_kv` dividing `H_q` (including `H_kv == 1`)
+- No dropout / bias / ALiBi / sinks / softcap / THD
 - Workspace (carved from the caller's buffer): fp32 `delta` and `dq_accum`
-  scratch plus int32 relay-counter storage (reserved in both modes); padded-D
-  and non-compact layouts add staging copies
+  scratch plus int32 relay-counter storage (reserved in both modes); GQA adds
+  the io-dtype `dk_ws`/`dv_ws` partials buffers (`B·S_kv·H_q·D` elements
+  each); padded-D and non-compact layouts add staging copies

@@ -185,9 +185,9 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
 
         for label, val in (("B", b), ("H_q", h_q), ("H_kv", h_kv), ("S_q", s_q), ("S_kv", s_kv), ("D", d_qk)):
             self._value_error_if(int(val) <= 0, f"{label} must be > 0; got {val}")
-        self._not_implemented_error_if(
-            h_q != h_kv,
-            f"SM120 DSL SDPA backward does not implement GQA / MQA; got H_q={h_q}, H_kv={h_kv}",
+        self._value_error_if(
+            h_q % h_kv != 0,
+            f"SM120 DSL SDPA backward requires H_q to be a multiple of H_kv (GQA / MQA); got H_q={h_q}, H_kv={h_kv}",
         )
         self.head_dim_padded = _sm120_padded_head_dim(int(d_qk)) if d_qk % 8 == 0 else None
         self._value_error_if(
@@ -290,6 +290,7 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
             sq=self.s_q_max,
             skv=self.s_k_max,
             d=self.head_dim_padded,
+            kvh=self.h_kv,
         )
         self._logger.debug("compile completed")
 
@@ -298,17 +299,27 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
 
         return self.batch_size * self.h_q * _round_up(self.s_q_max, _SM120_MIN_Q_TILE) // _SM120_MIN_Q_TILE
 
+    def _dkv_ws_elems(self) -> int:
+        """io-dtype elements of each GQA partials buffer (dk_ws / dv_ws);
+        0 for MHA, where they alias the dk/dv outputs."""
+
+        if self.h_q == self.h_kv:
+            return 0
+        return self.batch_size * self.s_k_max * self.h_q * self.head_dim_padded
+
     def scratch_workspace_bytes(self) -> int:
         """delta (fp32 [B, H, SQ_r128]) + dq_accum (fp32 flat [B*SQ_r128*H*D])
         + dq_sem (int32 flat [B*H*ceil(SQ/32)], deterministic relay counters)
+        + dk_ws/dv_ws (io [B, SKV, H_q, D] each, per-q-head partials, GQA only)
         + one compact staging copy per non-BSHD-compact operand."""
 
         self._ensure_support_checked()
         delta_bytes = ws_align(self.batch_size * self.h_q * self._sq_rounded * 4)
         dq_accum_bytes = ws_align(self.batch_size * self._sq_rounded * self.h_q * self.head_dim_padded * 4)
         dq_sem_bytes = ws_align(self._dq_sem_len() * 4)
+        dkv_ws_bytes = 2 * ws_align(self._dkv_ws_elems() * self.dtype.itemsize)
         staging_bytes = sum(ws_align(numel * self.dtype.itemsize) for numel in self._staging_numels.values())
-        return delta_bytes + dq_accum_bytes + dq_sem_bytes + staging_bytes
+        return delta_bytes + dq_accum_bytes + dq_sem_bytes + dkv_ws_bytes + staging_bytes
 
     def execute(
         self,
@@ -382,7 +393,16 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
             lse = stats_tensor.reshape(self.batch_size, self.h_q, self.s_q_max)
 
             kernels = self._compiled_kernel
-            # Three-kernel chain
+            # dK/dV destinations for the main kernel: MHA writes the (staged)
+            # outputs directly; GQA stages per-q-head partials for the reduce.
+            if self.h_q == self.h_kv:
+                dk_ws, dv_ws = dk, dv
+            else:
+                ws_shape = (self.batch_size, self.s_k_max, self.h_q, self.head_dim_padded)
+                dk_ws = carver.take(self._dkv_ws_elems(), self.dtype).view(ws_shape)
+                dv_ws = carver.take(self._dkv_ws_elems(), self.dtype).view(ws_shape)
+
+            # Kernel chain (dot -> main -> [reduce] -> cvt)
             kernels.dot(o, do, delta, dq_accum, dq_sem, current_stream)
             kernels.main(
                 q,
@@ -393,12 +413,15 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
                 delta,
                 dq_accum,
                 dq_sem,
-                dk,
-                dv,
+                dk_ws,
+                dv_ws,
                 cutlass.Float32(scale_log2),
                 cutlass.Float32(scale_val),
                 current_stream,
             )
+            # GQA only
+            if kernels.reduce is not None:
+                kernels.reduce(dk_ws, dv_ws, dk, dv, current_stream)
             kernels.cvt(dq_accum, dq, cutlass.Float32(scale_val), current_stream)
             for user_view, staged in ((dq_user, dq), (dk_user, dk), (dv_user, dv)):
                 if user_view is not None:

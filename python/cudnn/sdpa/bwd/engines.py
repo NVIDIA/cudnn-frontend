@@ -243,6 +243,7 @@ def _sm120_spec() -> EngineSpec:
             # Any head size multipled of 8
             d=frozenset(range(8, max(_SM120_HEAD_DIMS) + 1, 8)),
             dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
+            gqa=True,
             causal=True,
             bottom_right=True,
             swa=True,

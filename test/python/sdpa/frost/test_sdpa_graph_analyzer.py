@@ -985,9 +985,13 @@ def test_bwd_probe_rejects_forward_graph(monkeypatch):
     assert not _eligible(_mk_bwd_graph())
 
 
-def test_bwd_probe_rejects_gqa(monkeypatch):
+def test_bwd_probe_gqa(monkeypatch):
     monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
-    assert not _bwd_eligible(_mk_bwd_graph(h_kv=H // 2))
+    assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(h_kv=H // 2))
+    assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(h_kv=1))
+    assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(h_kv=H // 2, use_deterministic_algorithm=True))
+    # H_q must be a multiple of H_kv
+    assert not _bwd_eligible(_mk_bwd_graph(h_kv=3))
 
 
 def test_bwd_probe_rejects_unsupported_head_dim(monkeypatch):
@@ -1057,8 +1061,6 @@ def test_bwd_knob_domains(monkeypatch):
 def test_bwd_mismatch_reason_strings(monkeypatch):
     monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
     caps = bwd_engines.ENGINE_SPECS[0].capabilities
-    reason = bwd_engines.mismatch(caps, _facts(_mk_bwd_graph(h_kv=H // 2)))
-    assert reason is not None and "GQA" in reason
     reason = bwd_engines.mismatch(caps, _facts(_mk_bwd_graph(d=100)))
     assert reason is not None and "100" in reason
     reason = bwd_engines.mismatch(caps, _facts(_mk_bwd_graph(use_causal_mask=True, use_alibi_mask=True)))

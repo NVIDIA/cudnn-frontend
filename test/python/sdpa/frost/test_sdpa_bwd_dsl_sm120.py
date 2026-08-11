@@ -85,14 +85,27 @@ def _ref_bwd(
     return o_ref.to(q.dtype), stats_ref.contiguous(), dq.to(q.dtype), dk.to(q.dtype), dv.to(q.dtype)
 
 
-def _expected_workspace_bytes(batch: int, heads: int, s_q: int, head_dim: int, staged: tuple[torch.Tensor, ...] = ()) -> int:
+def _expected_workspace_bytes(
+    batch: int,
+    h_q: int,
+    s_q: int,
+    head_dim: int,
+    staged: tuple[torch.Tensor, ...] = (),
+    h_kv: int | None = None,
+    s_kv: int | None = None,
+    io_itemsize: int = 2,
+) -> int:
     from cudnn.sdpa.bwd.config_sm120 import padded_head_dim
     from cudnn.sdpa.fwd.api_dsl import ws_align
 
     d_pad = padded_head_dim(head_dim)
     sq_r = -(-s_q // 128) * 128
-    dq_sem = batch * heads * (-(-s_q // 32))  # int32 relay counters (min q-tile 32)
-    base = ws_align(batch * heads * sq_r * 4) + ws_align(batch * sq_r * heads * d_pad * 4) + ws_align(dq_sem * 4)
+    h_kv = h_q if h_kv is None else h_kv
+    s_kv_eff = s_kv if s_kv is not None else s_q
+    dq_sem = batch * h_q * (-(-s_q // 32))  # int32 relay counters (min q-tile 32)
+    # dk_ws/dv_ws GQA partials buffers in the io dtype (none carved for MHA, where the main kernel writes dk/dv directly)
+    dkv_ws_half = 0 if h_kv == h_q else batch * s_kv_eff * h_q * d_pad * io_itemsize
+    base = ws_align(batch * h_q * sq_r * 4) + ws_align(batch * sq_r * h_q * d_pad * 4) + ws_align(dq_sem * 4) + 2 * ws_align(dkv_ws_half)
     # Padded-width staging copy per non-BSHD-compact operand (all when D pads).
     staging = sum(ws_align(t.numel() // head_dim * d_pad * t.element_size()) for t in staged if d_pad != head_dim or not t.transpose(1, 2).is_contiguous())
     return base + staging
@@ -191,7 +204,9 @@ def _run_bwd_graph(
     workspace_size = graph.get_workspace_size()
     if plan_name == ENGINE:
         staged = (q_gpu, k_gpu, v_gpu, o_gpu, do_gpu, dq_gpu, dk_gpu, dv_gpu)
-        assert workspace_size == _expected_workspace_bytes(batch, h_q, q_gpu.shape[2], head_dim, staged)
+        assert workspace_size == _expected_workspace_bytes(
+            batch, h_q, q_gpu.shape[2], head_dim, staged, h_kv=h_kv, s_kv=k_gpu.shape[2], io_itemsize=q_gpu.element_size()
+        )
     workspace = torch.empty(max(workspace_size, 1), dtype=torch.uint8, device="cuda")
 
     variant_pack = {
@@ -217,7 +232,8 @@ def _tolerances(dtype: torch.dtype) -> dict:
 def _run_case(
     *,
     batch: int = 2,
-    heads: int = 4,
+    h_q: int = 4,
+    h_kv: int | None = None,
     s_q: int = 512,
     s_kv: int = 512,
     head_dim: int = 64,
@@ -232,15 +248,16 @@ def _run_case(
     layout: str = "bshd",
     grad_layout: str = "bshd",
 ) -> str:
+    h_kv = h_q if h_kv is None else h_kv
     scale = 1.0 / math.sqrt(head_dim)
-    q = _bhsd(batch, heads, s_q, head_dim, dtype, layout=layout)
-    k = _bhsd(batch, heads, s_kv, head_dim, dtype, layout=layout)
-    v = _bhsd(batch, heads, s_kv, head_dim, dtype, layout=layout)
-    do = _bhsd(batch, heads, s_q, head_dim, dtype, layout=layout)
+    q = _bhsd(batch, h_q, s_q, head_dim, dtype, layout=layout)
+    k = _bhsd(batch, h_kv, s_kv, head_dim, dtype, layout=layout)
+    v = _bhsd(batch, h_kv, s_kv, head_dim, dtype, layout=layout)
+    do = _bhsd(batch, h_q, s_q, head_dim, dtype, layout=layout)
     o, stats, dq_ref, dk_ref, dv_ref = _ref_bwd(
         q, k, v, do, scale=scale, is_causal=is_causal, causal_bottom_right=causal_bottom_right, window_size_left=window_size_left
     )
-    o = _bhsd(batch, heads, s_q, head_dim, dtype, empty=True, layout=layout).copy_(o)
+    o = _bhsd(batch, h_q, s_q, head_dim, dtype, empty=True, layout=layout).copy_(o)
     dq, dk, dv, plan_name = _run_bwd_graph(
         q,
         k,
@@ -467,6 +484,55 @@ def test_sdpa_bwd_dsl_sm120_padded_head_dim_wrapper(head_dim: int):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize(
+    ("h_q", "h_kv", "is_causal"),
+    [(8, 2, True), (8, 1, False)],
+    ids=["gqa_8_2_causal", "mqa_8_1_dense"],
+)
+@torch_fork_set_rng(seed=17)
+def test_sdpa_bwd_dsl_sm120_gqa(h_q: int, h_kv: int, is_causal: bool):
+    """GQA / MQA head groups: the grid keeps one CTA per query head; each
+    head's dK/dV partial stages through dk_ws/dv_ws and the reduce kernel
+    sums the group per KV head."""
+
+    _run_case(h_q=h_q, h_kv=h_kv, s_q=1024, s_kv=1024, head_dim=64, is_causal=is_causal)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=18)
+def test_sdpa_bwd_dsl_sm120_gqa_swa_bf16():
+    """GQA composed with causal + sliding window, bf16, d=128."""
+
+    _run_case(h_q=8, h_kv=2, s_q=1024, s_kv=1024, head_dim=128, dtype=torch.bfloat16, is_causal=True, window_size_left=255)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=19)
+def test_sdpa_bwd_dsl_sm120_gqa_causal_br_tails():
+    """GQA with bottom-right causal, unequal seq lens, and a partial Q tile."""
+
+    _run_case(h_q=4, h_kv=2, s_q=193, s_kv=257, head_dim=128, is_causal=True, causal_bottom_right=True)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=20)
+def test_sdpa_bwd_dsl_sm120_gqa_padded_head_dim():
+    """GQA through the head-dim envelope (D=96 zero-pads to 128)."""
+
+    _run_case(h_q=8, h_kv=2, s_q=512, s_kv=512, head_dim=96, is_causal=True)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=21)
+def test_sdpa_bwd_dsl_sm120_gqa_deterministic_numeric():
+    """deterministic + GQA composes: dQ uses the relay, while dK/dV come
+    from the fixed-order group reduce (deterministic in both modes); the
+    graph routes to the engine with parity."""
+
+    _run_case(h_q=8, h_kv=2, s_q=512, s_kv=512, head_dim=64, is_causal=True, deterministic=True)
+
+
+@pytest.mark.L0
 @torch_fork_set_rng(seed=5)
 def test_sdpa_bwd_dsl_sm120_auto_routing():
     """Without an explicit select, the eligible graph auto-routes to the engine."""
@@ -509,10 +575,11 @@ def _run_bitwise_case(n_runs: int = 3, **case_kwargs) -> None:
     s_q = case_kwargs.pop("s_q", 1024)
     s_kv = case_kwargs.pop("s_kv", 1024)
     head_dim = case_kwargs.pop("head_dim", 64)
+    h_kv = case_kwargs.pop("h_kv", heads)
     scale = 1.0 / math.sqrt(head_dim)
     q = _bhsd(batch, heads, s_q, head_dim, dtype)
-    k = _bhsd(batch, heads, s_kv, head_dim, dtype)
-    v = _bhsd(batch, heads, s_kv, head_dim, dtype)
+    k = _bhsd(batch, h_kv, s_kv, head_dim, dtype)
+    v = _bhsd(batch, h_kv, s_kv, head_dim, dtype)
     do = _bhsd(batch, heads, s_q, head_dim, dtype)
     o, stats, _, _, _ = _ref_bwd(
         q,
@@ -553,6 +620,21 @@ def test_sdpa_bwd_dsl_sm120_deterministic_bitwise_tails_knobs():
     """Bitwise reproducibility with partial tails and a non-default tile knob."""
 
     _run_bitwise_case(s_q=1000, s_kv=999, head_dim=64, is_causal=True, q_tile=128, kv_tile=64)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(("mask", "h_kv"), [("dense", 2), ("causal", 1)], ids=["dense_gqa2", "causal_mqa"])
+@torch_fork_set_rng(seed=22)
+def test_sdpa_bwd_dsl_sm120_gqa_deterministic_bitwise(mask: str, h_kv: int):
+    """Repeated deterministic GQA/MQA runs are bitwise identical: the relay
+    fixes dQ's fp32 add order and the reduce kernel sums the group's dK/dV
+    partials in fixed q-head order."""
+
+    _run_bitwise_case(
+        h_kv=h_kv,
+        head_dim=64,
+        is_causal=mask != "dense",
+    )
 
 
 def _run_wrapper_det_case(head_dim: int, *, s_q: int, s_kv: int, is_causal: bool, window_size_left: int | None, n_runs: int = 1):
