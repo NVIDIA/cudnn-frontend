@@ -167,6 +167,27 @@ def _torch_to_cudnn_data_type(torch_data_type) -> cudnn_data_type:
         return None
 
 
+def _cudnn_to_frost_dtype_name(data_type):
+    """Name for a cuDNN dtype in the vocabulary ``frost.buffers.DTYPES`` uses,
+    or None when the type has no DLPack-expressible name (the sub-byte and
+    block-scaled ones — a caller must pass those as a typed buffer, not as a
+    bare address).
+
+    Lives here so the mapping has one home; frost imports it rather than
+    keeping a second table."""
+    return {
+        cudnn_data_type.FLOAT: "float32",
+        cudnn_data_type.HALF: "float16",
+        cudnn_data_type.BFLOAT16: "bfloat16",
+        cudnn_data_type.DOUBLE: "float64",
+        cudnn_data_type.INT64: "int64",
+        cudnn_data_type.INT32: "int32",
+        cudnn_data_type.INT8: "int8",
+        cudnn_data_type.UINT8: "uint8",
+        cudnn_data_type.BOOLEAN: "bool",
+    }.get(data_type)
+
+
 def _torch_to_cutlass_data_type(data_type, interpret_uint8_as_fp4x2: bool = False):
     # A torch dtype can only be passed in if torch is already imported, so probing
     # sys.modules avoids importing torch on behalf of other frameworks' dtypes.
