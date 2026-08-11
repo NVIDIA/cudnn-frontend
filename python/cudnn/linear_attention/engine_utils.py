@@ -67,34 +67,40 @@ class _FrostPlan(CompiledPlan):
         ports = self._ports
         if ports is None:
             ports = self._ports = bind_ports(graph, variant_pack)
+        _check_contiguous(variant_pack, ports)
         node_buffers = {}
         for node, slots in ports.items():
-            _check_contiguous(node.name, variant_pack, slots)
-            node_buffers[node] = NodeBuffers(
-                {port: variant_pack.view(slot) for port, slot in slots.inputs.items()},
-                {port: variant_pack.view(slot) for port, slot in slots.outputs.items()},
-            )
+            names = list(slots.inputs) + list(slots.outputs)
+            views = variant_pack.views(list(slots.inputs.values()) + list(slots.outputs.values()))
+            split = len(slots.inputs)
+            node_buffers[node] = NodeBuffers(dict(zip(names[:split], views[:split])), dict(zip(names[split:], views[split:])))
         required = self._compiled.workspace_bytes()
         workspace = Workspace.over(variant_pack, required, self._name) if required else None
         self._compiled(node_buffers, workspace=workspace, stream=ctx.stream)
 
 
-def _check_contiguous(node_name: str, variant_pack, slots) -> None:
-    """Contiguity gate over every port this node binds, read off the pack.
+def _check_contiguous(variant_pack, ports) -> None:
+    """Contiguity gate over the whole pack, decided from the strides it holds.
 
     The dim and stride were taken from the caller's object once, at
     normalization; probing each buffer again cost 8.6 us apiece — nine per GDN
-    forward — to learn what the pack already knows.
+    forward — to learn what the pack already knows. The scan itself is in the
+    native pack, 0.24 us for eight operands, so only naming the offender costs
+    anything and that happens once, on the way to raising.
 
     One gate for every kernel rather than a call per compiled callable naming
     its own ports: the rule was the same list every time, and a port added to a
-    node but forgotten here would have gone unchecked.
+    node but forgotten there would have gone unchecked.
     """
-    for direction in (slots.inputs, slots.outputs):
-        for port, slot in direction.items():
-            tensor = variant_pack.tensors[slot]
-            if not buffers.is_contiguous(tensor.dim, tensor.stride):
-                raise ValueError(f"cudnn.frost {node_name!r}: buffer for {port!r} must be contiguous (buffers pass straight to the kernel)")
+    ok, offender = variant_pack.all_contiguous()
+    if ok:
+        return
+    for node, slots in ports.items():
+        for direction in (slots.inputs, slots.outputs):
+            for port, slot in direction.items():
+                if slot == offender:
+                    raise ValueError(f"cudnn.frost {node.name!r}: buffer for {port!r} must be contiguous (buffers pass straight to the kernel)")
+    raise ValueError(f"cudnn.frost: the buffer at variant-pack slot {offender} must be contiguous")
 
 
 _pinned_engines = None  # e.g. ("gdn_cutile",) -- set by a suite, None => the manifest decides

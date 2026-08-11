@@ -127,13 +127,22 @@ class Workspace:
     def nbytes(self) -> int:
         return self._nbytes
 
-    def view(self, offset: int, dtype: str, shape) -> buffers.DeviceView:
-        """The region a :class:`WorkspaceLayout` reserved at ``offset``."""
+    def view(self, offset: int, dtype: str, shape):
+        """The region a :class:`WorkspaceLayout` reserved at ``offset``.
+
+        A carve is the same kind of buffer a caller operand is, so it is the
+        same type: a kernel reads both through the DLPack C exchange vtable
+        rather than a capsule built per call (0.30 us against 1.86), and a
+        graph hands its kernels one buffer type rather than two.
+        """
+        import cudnn
+
         count = 1
         for extent in shape:
             count *= int(extent)
         self._check_span(offset, count * buffers.DTYPE_ITEMSIZE[dtype])
-        return buffers.DeviceView(self._ptr + offset, shape, dtype, self._device)
+        code, bits = buffers.DTYPES[dtype]
+        return cudnn._pybind_module.make_slot(self._ptr + offset, list(shape), code, bits, self._device)
 
     def take(self, numel: int, dtype: str) -> buffers.DeviceView:
         """The next region dealt sequentially: a 1-D ``numel``-element view."""

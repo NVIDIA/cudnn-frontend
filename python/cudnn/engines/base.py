@@ -43,7 +43,6 @@ Example:
             ...  # write results into caller-provided output buffers
 """
 
-import ctypes
 from abc import ABC
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List
@@ -121,35 +120,72 @@ class VariantPack:
     and nothing else, so neither can behave differently on account of what the
     caller happened to hold.
 
-    ``uids`` is ASCENDING, matching the backend's own operand order
-    (``get_variant_pack_uids_sorted()``), so ``ctypes.addressof(ptrs)`` goes
-    straight to ``_execute_with_raw_ptrs`` with no copy and no per-operand
-    hash lookup.
+    The operands live in ``native``, a C container holding one ``DLTensor``
+    each: reading a buffer through its type's ``__dlpack_c_exchange_api__``
+    vtable is 0.08 us against 1.5 to ask a python object the same four
+    questions, and the slots it hands a kernel are read back through the same
+    vtable — 0.30 us, cheaper than the caller's torch tensor at 0.35, so
+    refusing to pass the caller's object through costs nothing.
 
-    ``tensors[i]`` is a ``graph_types.Tensor`` — the same class ``graph.tensor()``
-    returns — describing what the caller ACTUALLY passed for ``uids[i]``: its
-    ``dim`` / ``stride`` / ``data_type`` are the buffer's, which is not
-    necessarily what the graph declared. An engine reads whichever it means —
-    the IR port for the shape the plan was built for, this one for the shape
-    about to run. frost_gemm takes its M/N/K from here; the backend takes only
-    the pointer.
+    ``uids`` is ASCENDING, matching the backend's own operand order
+    (``get_variant_pack_uids_sorted()``), so ``address`` goes straight to
+    ``_execute_with_raw_ptrs`` with no copy and no per-operand hash lookup.
+
+    What the caller ACTUALLY passed is what is recorded, which need not be what
+    the graph declared: an engine reads the IR port for the shape the plan was
+    built for and this pack for the shape about to run. frost_gemm takes its
+    M/N/K from here; the backend takes only the pointer.
 
     Allocated per call. Two threads may execute one graph concurrently with
-    different buffers, and a shared array would hand each thread the other's
+    different buffers, and a shared pack would hand each thread the other's
     pointers — silently, because every pointer in it is individually valid.
     """
 
-    __slots__ = ("uids", "tensors", "ptrs", "address", "_slot_of", "workspace", "workspace_bytes", "_device")
+    __slots__ = ("uids", "native", "_tensors", "_slot_of", "workspace", "workspace_bytes", "_device")
 
-    def __init__(self, uids, tensors, ptrs, workspace_ptr: int, workspace_bytes: int = 0):
+    def __init__(self, uids, native, workspace_ptr: int = 0, workspace_bytes: int = 0):
         self.uids = uids
-        self.tensors = tensors
-        self.ptrs = ptrs
-        self.address = ctypes.addressof(ptrs)
+        self.native = native
         self.workspace = workspace_ptr
         self.workspace_bytes = workspace_bytes
+        self._tensors = None  # built on demand: the hot paths read the native slots
         self._slot_of = None  # built on first lookup: the backend never does one
         self._device = None
+
+    @property
+    def address(self) -> int:
+        """The ``void*[]`` in slot order, for ``_execute_with_raw_ptrs``."""
+        return self.native.address
+
+    @property
+    def tensors(self):
+        """One ``Tensor`` per operand, materialized on first access.
+
+        The paths that run every execute — contiguity, the views a kernel gets,
+        the pointer array — read the native slots and never come here. This
+        exists for an engine that wants the geometry as python objects, and
+        costs 0.29 us per operand to build when it does.
+        """
+        if self._tensors is None:
+            from ..graph_types import describing_tensor
+            from ..datatypes import _FROST_DTYPE_CODE_TO_CUDNN
+
+            native = self.native
+            self._tensors = tuple(
+                (
+                    describing_tensor(uid, tuple(native.shape(i)), tuple(native.stride(i)), _FROST_DTYPE_CODE_TO_CUDNN.get(native.dtype(i)))
+                    if native.is_filled(i)
+                    else describing_tensor(uid, (), (), None)
+                )
+                for i, uid in enumerate(self.uids)
+            )
+        return self._tensors
+
+    def all_contiguous(self):
+        """``(ok, slot)`` over every filled operand, decided from the strides
+        the native pack already holds."""
+        ok, offender = self.native.all_contiguous()
+        return ok, (int(offender) if offender else -1)
 
     @property
     def slot_of(self):
@@ -179,7 +215,11 @@ class VariantPack:
         return self.slot_of[uid]
 
     def ptr(self, tensor_or_uid) -> int:
-        return self.ptrs[self.slot(tensor_or_uid)] or 0
+        return self.native.pointer(self.slot(tensor_or_uid))
+
+    def views(self, slots):
+        """The DLPack producers for ``slots``, in one crossing."""
+        return self.native.views(list(slots), self.device)
 
     def view(self, slot: int):
         """A DLPack producer over one operand, for a kernel that needs an
@@ -193,11 +233,7 @@ class VariantPack:
         which is an argument for making the producer a C type, not for keeping
         the caller's object.
         """
-        tensor = self.tensors[slot]
-        name = _CUDNN_TO_FROST_DTYPE_NAME.get(tensor.data_type)
-        if name is None:
-            raise ValueError(f"operand uid {self.uids[slot]} has no DLPack-expressible dtype ({tensor.data_type})")
-        return DeviceView(self.ptrs[slot] or 0, tensor.dim, name, self.device)
+        return self.native.view(slot, self.device)
 
     def __len__(self) -> int:
         return len(self.uids)

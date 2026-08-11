@@ -328,3 +328,29 @@ def _is_jax_array(input_tensor) -> bool:
     if jax is not None and isinstance(input_tensor, getattr(jax, "Array", ())):
         return True
     return type(input_tensor).__module__.startswith(("jax", "jaxlib"))
+
+
+# The DLPack (code, bits) a cuDNN dtype travels as, and back. The native
+# variant pack speaks DLPack, so this is the one translation between it and the
+# graph's vocabulary.
+_CUDNN_TO_DLPACK_CODE_BITS = {}
+_FROST_DTYPE_CODE_TO_CUDNN = {}
+
+
+def _init_dlpack_dtype_tables():
+    from .frost.buffers import DTYPES
+
+    for enum, name in _CUDNN_TO_FROST_DTYPE_NAME.items():
+        code_bits = DTYPES.get(name)
+        if code_bits is None:
+            continue
+        _CUDNN_TO_DLPACK_CODE_BITS[enum] = code_bits
+        _FROST_DTYPE_CODE_TO_CUDNN[code_bits] = enum
+
+
+def _dlpack_code_bits(data_type):
+    """``(code, bits)`` for a cuDNN dtype, or ``(0, 0)`` when it has no DLPack
+    spelling — a slot with no dtype still carries its pointer and shape."""
+    if not _CUDNN_TO_DLPACK_CODE_BITS:
+        _init_dlpack_dtype_tables()
+    return _CUDNN_TO_DLPACK_CODE_BITS.get(data_type, (0, 0))

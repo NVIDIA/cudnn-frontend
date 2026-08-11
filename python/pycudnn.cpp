@@ -143,6 +143,10 @@ create_kernel_cache_submodule(py::module_ &);
 void
 init_properties(py::module_ &);
 
+// pybinds for the native variant pack
+void
+init_variant_pack(py::module_ &);
+
 void
 set_dlhandle_cudnn(std::intptr_t dlhandle) {
 #ifdef _WIN32
@@ -158,6 +162,7 @@ PYBIND11_MODULE(_compiled_module, m) {
 
     init_properties(m);
     init_pygraph_submodule(m);
+    init_variant_pack(m);
 
     m.def("_set_dlhandle_cudnn", &set_dlhandle_cudnn);
 

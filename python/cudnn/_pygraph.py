@@ -25,7 +25,7 @@ import logging
 import weakref
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
-from .datatypes import _buffer_dtype_to_cudnn, _torch_to_cudnn_data_type
+from .datatypes import _buffer_dtype_to_cudnn, _dlpack_code_bits, _torch_to_cudnn_data_type
 from .engines.base import ExecutionContext, VariantPack
 from .engines.engine_ids import is_python_engine
 from .graph_types import NodeType, Tensor, byte_size as _byte_size, describing_tensor
@@ -1754,12 +1754,12 @@ class pygraph:
             # an engine will not look at is pure cost, and the ones that have
             # not migrated still take the caller's objects.
             if plan.takes_variant_pack and not overriding:
-                plan.execute(self, self._normalize(uid_to_data, workspace, describe=True), ctx)
+                plan.execute(self, self._normalize(uid_to_data, workspace), ctx)
             else:
                 plan.execute(self, uid_to_data, ctx)
             return
 
-        variant_pack = None if overriding else self._normalize(uid_to_data, workspace, describe=False)
+        variant_pack = None if overriding else self._normalize(uid_to_data, workspace)
 
         # Backend path. Address the plan the WALK built, not the backend's own
         # selection: they differ once the walk has skipped an entry.
@@ -1828,7 +1828,7 @@ class pygraph:
         self._sorted_uids = order
         return order
 
-    def _normalize(self, uid_to_data: Dict[int, Any], workspace: Any, describe: bool):
+    def _normalize(self, uid_to_data: Dict[int, Any], workspace: Any):
         """Turn the caller's variant pack into :class:`VariantPack`, once.
 
         This is the ONLY place a caller's object is inspected. Everything below
@@ -1841,45 +1841,47 @@ class pygraph:
         if order is None:
             return None
         n = len(order)
-        ptrs = (ctypes.c_void_p * n)()
-        tensors = [None] * n if describe else None
+        import cudnn
+
+        native = cudnn._pybind_module.VariantPackNative(n)
+        # One crossing for the whole pack: the reader is a C function table on
+        # the buffer's type (__dlpack_c_exchange_api__), so an operand costs
+        # 0.08 us there against 1.5 to ask a python object the same four
+        # questions and build a Tensor to hold the answers. What comes back is
+        # the slots whose producer does not implement it — described here, at
+        # the price they always cost, without taking the rest down with them.
+        unread = native.read_all([uid_to_data.get(uid) for uid in order])
         # The backend's layout is exactly the slots it REQUIRES, so a hole there
         # is the caller's mistake and is named. A python-only graph's layout is
         # every wired port, which includes the optional ones (gdn's final_state,
         # H); a hole is simply "not requested", and the engine reads it back as
         # a missing port.
         strict = self._lowered_graph is not None
-        for i, uid in enumerate(order):
+        for i in unread:
+            uid = order[i]
             data = uid_to_data.get(uid)
             if data is None:
                 if strict:
                     declared = self._tensor_by_uid.get(uid)
                     name = f" ({declared.name!r})" if declared is not None and declared.name else ""
                     raise ValueError(f"the variant pack is missing a buffer for tensor uid {uid}{name}")
-                continue  # leaves ptrs[i] NULL and tensors[i] None
-            if describe:
-                ptrs[i], tensors[i] = self._describe(data, uid)
-            else:
-                # The backend reads geometry from its own descriptors; building
-                # a Tensor it will not look at is pure cost.
-                ptrs[i] = self._device_pointer(data)
+                continue  # an optional port the caller did not request
+            ptr, tensor = self._describe(data, uid)
+            native.set_slot(i, ptr, tuple(tensor.dim), tuple(tensor.stride), *_dlpack_code_bits(tensor.data_type))
+        if strict:
+            for i, uid in enumerate(order):
+                if not native.is_filled(i):
+                    declared = self._tensor_by_uid.get(uid)
+                    name = f" ({declared.name!r})" if declared is not None and declared.name else ""
+                    raise ValueError(f"the variant pack is missing a buffer for tensor uid {uid}{name}")
         # The workspace has no uid, so it is not an operand — but an engine has
         # to bounds-check its carves, and reading its size here is the same read
         # every other buffer gets rather than a second probe further down.
         workspace_ptr, workspace_bytes = 0, 0
         if workspace is not None:
-            if describe:
-                workspace_ptr, workspace_tensor = self._describe(workspace, -1)
-                workspace_bytes = _byte_size(workspace_tensor)
-            else:
-                workspace_ptr = self._device_pointer(workspace)
-        return VariantPack(
-            tuple(order),
-            tuple(tensors) if describe else None,
-            ptrs,
-            workspace_ptr,
-            workspace_bytes,
-        )
+            workspace_ptr, workspace_tensor = self._describe(workspace, -1)
+            workspace_bytes = _byte_size(workspace_tensor)
+        return VariantPack(tuple(order), native, workspace_ptr, workspace_bytes)
 
     def _describe(self, data: Any, uid: int):
         """``(pointer, Tensor)`` for one caller buffer.
