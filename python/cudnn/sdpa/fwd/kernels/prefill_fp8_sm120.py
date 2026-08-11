@@ -36,7 +36,7 @@ lowered to ``mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32``:
 
 Constraints:
 * Input dtype: e4m3 only (as Uint8 storage); output dtype Float16
-* Head dimensions must be multiples of 16 between 16 and 256, inclusive
+* Head dimensions must be multiples of 32 between 32 and 256, inclusive
 * Q heads must be divisible by the number of K/V heads
 * Q/K/V/O use compact BSHD storage (THD packs them to ``(1, T, H, D)``)
 * Supported CTA Q/KV tiles are 128 or 64
@@ -217,7 +217,7 @@ class SM120FusedMultiHeadAttentionForward:
         :param thd_batch: THD only: the real sequence count B.
         :param thd_max_sq: THD only: the longest sequence's Q length.
         :param head_tile_qk: Q/K head dimension (the QK^T contraction width).
-            Must be a multiple of 16 between 16 and 256, inclusive.
+            Must be a multiple of 32 between 32 and 256, inclusive.
         :param head_tile_v: V/O head dimension (the P@V output width). Same
             constraint as ``head_tile_qk``.
         :param q_tile: Query sequence tile size.
@@ -1131,38 +1131,23 @@ class SM120FusedMultiHeadAttentionForward:
             # the four lanes that share a Q row, so every lane finalizes the two
             # rows it owns without further exchange. row_max holds the raw (unscaled)
             # score max; the scale is applied in log2 domain and converted with ln(2).
-            # With has_sink, the per-head sink logit joins the softmax denominator
-            # as a virtual column with no V row: it rescales O, enters the LSE,
-            # and gives a row with no visible key a finite LSE (the sink alone).
             LN2 = cutlass.Float32(0.6931471805599453)
             row_sum_inv = cutlass.Array(cutlass.Float32, 2, alignment=8)
             row_lse = cutlass.Array(cutlass.Float32, 2, alignment=8)
             for row_half in cutlass.range_constexpr(2):
                 row_max_nat = row_max[row_half] * softmax_scale_log2 * LN2
-                if cutlass.const_expr(self.has_sink):
-                    sinks_arr = cutlass.make_array_view(sinks)
-                    sink_logit = cutlass.Float32(sinks_arr[head_idx])
-                    new_max = cute.arch.fmax(row_max_nat, sink_logit)
-                    # alpha re-normalizes the loop's accumulator and sum from
-                    # row_max_nat to the sink-extended max; it is 0 for a row
-                    # with no visible key, so O := 0 falls out.
-                    alpha = cute.math.exp(row_max_nat - new_max, fastmath=True)
-                    new_sum = row_sum[row_half] * alpha + cute.math.exp(sink_logit - new_max, fastmath=True)
-                    row_sum_inv[row_half] = alpha / new_sum
-                    row_lse[row_half] = new_max + cute.math.log(new_sum, fastmath=True)
-                else:
-                    inv = cutlass.Float32(0.0)
-                    if row_sum[row_half] > 0.0:
-                        inv = cute.math.rcp(row_sum[row_half], approx=True, ftz=True)
-                    row_sum_inv[row_half] = inv
-                    lse_val = row_max_nat + cute.math.log(
-                        cute.math.max(row_sum[row_half], cutlass.Float32(1e-30)),
-                        fastmath=True,
-                    )
-                    # Rows with no visible key write -inf / O := 0.
-                    if row_sum[row_half] <= 0.0:
-                        lse_val = -cutlass.Float32.inf
-                    row_lse[row_half] = lse_val
+                inv = cutlass.Float32(0.0)
+                if row_sum[row_half] > 0.0:
+                    inv = cute.math.rcp(row_sum[row_half], approx=True, ftz=True)
+                row_sum_inv[row_half] = inv
+                lse_val = row_max_nat + cute.math.log(
+                    cute.math.max(row_sum[row_half], cutlass.Float32(1e-30)),
+                    fastmath=True,
+                )
+                # Rows with no visible key write -inf / O := 0.
+                if row_sum[row_half] <= 0.0:
+                    lse_val = -cutlass.Float32.inf
+                row_lse[row_half] = lse_val
 
             # Amax_S = max over valid rows of the raw 1/row_sum (cuDNN
             # convention: the softmax-probability amax proxy), captured BEFORE
@@ -1328,7 +1313,7 @@ class SM120FusedMultiHeadAttentionForward:
         :param amax_s: 1-element Int32 amax buffer (pre-zeroed; dummy ok).
         :param amax_o: 1-element Int32 amax buffer (pre-zeroed; dummy ok).
         :param softmax_scale_log2: ``softmax_scale * descale_q * descale_k * log2(e)``.
-        :param o_scale_fused: ``descale_v * scale_o``.
+        :param o_scale_fused: ``descale_s * descale_v * scale_o``.
         :param stream: CUDA stream used for the launch.
         """
         head_dim_qk = q.shape[3]
@@ -1365,10 +1350,8 @@ class SM120FusedMultiHeadAttentionForward:
                     raise ValueError("LSE must have shape (B, H, Sq)")
                 if cutlass.const_expr(lse.stride != (q.shape[2] * q.shape[1], q.shape[1], 1)):
                     raise ValueError("LSE must be compact row-major")
-        if cutlass.const_expr(self.has_sink != (sinks is not None)):
-            raise ValueError("sinks must be provided exactly when the kernel is configured with has_sink")
-        if cutlass.const_expr(sinks is not None and sinks.shape != (q.shape[2],)):
-            raise ValueError("sinks must have shape (H,)")
+        if cutlass.const_expr(sinks is not None):
+            raise ValueError("sinks must be None (the fp8 cell rejects has_sink)")
         if cutlass.const_expr(self.thd_varlen):
             if cutlass.const_expr(q.shape[0] != 1):
                 raise ValueError("THD Q/K/V/O must be packed batch-1 views")

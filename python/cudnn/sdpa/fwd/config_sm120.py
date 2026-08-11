@@ -16,6 +16,8 @@ HEAD_TILE_GRANULE = 16
 SUPPORTED_HEAD_TILE_MIN = 16
 SUPPORTED_HEAD_TILE_MAX = 256
 SUPPORTED_HEAD_TILES = tuple(range(SUPPORTED_HEAD_TILE_MIN, SUPPORTED_HEAD_TILE_MAX + 1, HEAD_TILE_GRANULE))
+FP8_HEAD_TILE_GRANULE = 32
+SUPPORTED_HEAD_TILES_FP8 = tuple(range(FP8_HEAD_TILE_GRANULE, SUPPORTED_HEAD_TILE_MAX + 1, FP8_HEAD_TILE_GRANULE))
 
 # SMEM the SM120 parts expose to a kernel. The adapter asks cutlass for the
 # authoritative number at build time; this constant lets the ranking answer
