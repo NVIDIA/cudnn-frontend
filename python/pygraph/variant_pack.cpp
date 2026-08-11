@@ -3,27 +3,16 @@
 //
 // The variant pack, held as DLTensors rather than python objects.
 //
-// execute() reads the caller's operands once and everything below works from
-// the result. Doing that in python cost 1.5 us per operand -- 0.6 to ask the
-// buffer for its facts one method call at a time, 0.9 to build the Tensor that
-// carries them -- and each operand then had to be turned back into a DLPack
-// producer for the kernel, which python cannot do quickly: tvm-ffi reads a
-// torch tensor through a C function table and any python producer through a
-// freshly built capsule, 0.32 us against 1.91.
+// `__dlpack_c_exchange_api__` is a vtable on the buffer's TYPE whose
+// dltensor_from_py_object_no_sync fills a caller-provided DLTensor in place --
+// no capsule, no allocation. This file consumes it to read the caller's
+// operands and implements it so the slots it hands a kernel are read the same
+// way, which is why nothing is given up by refusing to pass the caller's
+// object through.
 //
-// Both halves are the same protocol. `__dlpack_c_exchange_api__` is a vtable
-// on the TYPE whose dltensor_from_py_object_no_sync fills a caller-provided
-// DLTensor in place, with no capsule and no allocation. This file consumes it
-// to read the caller's buffers and implements it so the slots it hands out are
-// read the same way. Measured on SM100, eight operands: reading 0.64 us
-// against 10.4, contiguity 0.13 against 4.2, and a slot converts in 0.27 --
-// slightly cheaper than the torch tensor it replaces, so nothing is given up
-// by refusing to pass the caller's object through.
-//
-// A producer without the vtable is not an error: `read_slot` returns false and
-// python fills that slot from its own reader. The degradation is per operand,
-// so a pack mixing torch with something else is exactly as fast as its parts.
-
+// A producer without the vtable is not an error: read_slot returns false and
+// python fills that slot from its own reader, so a mixed pack costs the sum of
+// its parts.
 #include "variant_pack.h"
 
 #include <cstdlib>
@@ -216,8 +205,7 @@ class VariantPackSlot {
         return dense;
     }
 
-    // One axis of it, the way a caller written against a framework tensor asks
-    // (``stride(-1)`` for the innermost).
+    // One axis of it, the way a framework tensor is asked (stride(-1)).
     int64_t
     stride_at(int64_t dim) const {
         int64_t axis = dim < 0 ? dim + slot_.ndim : dim;
@@ -295,9 +283,7 @@ class VariantPackSlot {
         return new VariantPackSlot(out, tensor_.device.device_id);
     }
 
-    // The same memory with its axes reordered. A kernel layer written against
-    // framework tensors reaches for this, and unlike reshape it is exact for a
-    // strided slot too -- it only relabels axes.
+    // The same memory with its axes relabelled; exact for a strided slot too.
     VariantPackSlot *
     permute(const std::vector<int64_t> &axes) const {
         if (axes.size() != static_cast<size_t>(slot_.ndim))
@@ -475,14 +461,9 @@ class VariantPackNative {
     // for python to describe and report back through set_slot -- crossing the
     // binding once per pack rather than once per operand is 2.53 us against
     // 1.0 for eight. A None entry is a slot the caller did not fill.
-    // The whole pack from the caller's uid map, in one crossing: look each uid
-    // up, read what publishes the vtable, and report the rest. Same result as
-    // building the ordered buffer list in python and handing it to read_all,
-    // without the list, the comprehension, or the frame around them.
-    //
-    // A uid the map does not carry is left unfilled rather than refused here:
-    // whether that is the caller's mistake or an optional port depends on the
-    // graph, which python knows and this does not.
+    // A uid the map does not carry is left unfilled rather than refused: whether
+    // that is the caller's mistake or an optional port depends on the graph,
+    // which python knows and this does not.
     std::vector<size_t>
     read_from(const py::dict &uid_to_data, const std::vector<int64_t> &uids) {
         std::vector<size_t> unread;
@@ -498,29 +479,13 @@ class VariantPackNative {
         return unread;
     }
 
-    // The first slot no one filled, or -1. The strict check asks this once
-    // instead of calling is_filled per operand.
+    // The first slot no one filled, or -1.
     int64_t
     first_unfilled() const {
         for (size_t i = 0; i < slots_.size(); i++) {
             if (!slots_[i].filled) return static_cast<int64_t>(i);
         }
         return -1;
-    }
-
-    std::vector<size_t>
-    read_all(py::sequence buffers) {
-        std::vector<size_t> unread;
-        const size_t n = py::len(buffers);
-        for (size_t i = 0; i < n && i < slots_.size(); i++) {
-            py::handle buffer = buffers[i];
-            if (buffer.is_none()) {
-                skip_slot(i);
-            } else if (!read_slot(i, buffer)) {
-                unread.push_back(i);
-            }
-        }
-        return unread;
     }
 
     // The fallback: python read the buffer its own way and reports the result.
@@ -541,23 +506,18 @@ class VariantPackNative {
         pointers_[index] = slot.data;
     }
 
-    // A slot the caller did not fill: an optional port it did not request.
-    // Re-describe a slot at the shape this execute is actually running, keeping
-    // the buffer it was read from. This is what override_shapes means: the
-    // caller allocated once at a cache shape and names the live shape per call.
-    // Applying it here rather than in an engine is what keeps the two paths
-    // answering the same question -- an engine that reads the pack gets the
-    // override without knowing the concept exists.
+    // Re-describe a slot at the shape this execute runs, keeping its buffer.
+    // Applying override_shapes here rather than in an engine is what keeps the
+    // two paths answering the same question: an engine that reads the pack
+    // honours the override without knowing the concept exists.
     void
     override_slot(size_t index, std::vector<int64_t> shape, std::vector<int64_t> stride) {
         Slot &slot = slots_.at(index);
         if (!slot.filled) {
             throw py::value_error("variant-pack slot " + std::to_string(index) + " has no buffer to re-describe");
         }
-        // ndim comes from the shape and the DLTensor's stride array is read
-        // ndim deep, so a shorter stride would be read past its end by any
-        // consumer -- and this is the one place a shape and a stride arrive
-        // from two different lists.
+        // ndim comes from the shape and the stride array is read ndim deep, and
+        // this is the one place the two arrive from different lists.
         if (shape.size() != stride.size()) {
             throw py::value_error("override shape and stride must have the same rank; got " +
                                   std::to_string(shape.size()) + " and " + std::to_string(stride.size()) +
@@ -682,21 +642,17 @@ make_slot(int64_t ptr, std::vector<int64_t> shape, int dtype_code, int dtype_bit
     return new VariantPackSlot(std::move(slot), device_id);
 }
 
-// ``(pointer, bytes)`` for a buffer that publishes the vtable, else None.
-//
-// The workspace is not an operand -- it has no uid and no slot -- but an engine
-// still has to bounds-check its carves against it, and asking python for the
-// size cost as much as reading all eight operands here.
+// (pointer, bytes) for a buffer that publishes the vtable, else None. The
+// workspace has no uid and no slot, but an engine still bounds-checks its
+// carves against it.
 py::object
 read_buffer_extent(py::handle buffer) {
     DLPackExchangeAPI *api = exchange_api_for(buffer.ptr());
     if (api == nullptr || api->dltensor_from_py_object_no_sync == nullptr) return py::none();
     DLTensor t{};
     if (api->dltensor_from_py_object_no_sync(buffer.ptr(), &t) != 0) throw py::error_already_set();
-    // A byte count is only a byte RANGE for a dense buffer; a strided or
-    // broadcast one covers more (or, at stride 0, far less) than its element
-    // count says, and a carve bounds-checked against that would write outside
-    // the allocation. Hand it back to python to describe and refuse.
+    // A byte count is only a byte RANGE when the buffer is dense; a carve
+    // bounds-checked against a strided one would write outside the allocation.
     if (!is_dense(t)) return py::none();
     int64_t numel = 1;
     for (int d = 0; d < t.ndim; d++) numel *= t.shape[d];
@@ -704,10 +660,8 @@ read_buffer_extent(py::handle buffer) {
     return py::make_tuple(reinterpret_cast<int64_t>(static_cast<char *>(t.data) + t.byte_offset), numel * itemsize);
 }
 
-// A workspace carve, planned once. Which regions a plan cuts, at what offsets,
-// with what dtypes and shapes, is fixed when the engine builds; only the
-// caller's base pointer arrives per execute. Describing them here rather than
-// at each view() turns one crossing per region into one crossing per execute.
+// A workspace carve, planned once: the regions are fixed when the engine
+// builds and only the base pointer arrives per execute.
 class WorkspaceCarve {
    public:
     WorkspaceCarve(std::string owner, const std::vector<py::tuple> &regions) : owner_(std::move(owner)) {
@@ -861,7 +815,6 @@ its parts.
 )")
         .def(py::init<size_t>())
         .def("read_slot", &VariantPackNative::read_slot)
-        .def("read_all", &VariantPackNative::read_all)
         .def("read_from", &VariantPackNative::read_from)
         .def("first_unfilled", &VariantPackNative::first_unfilled)
         .def("set_slot", &VariantPackNative::set_slot)

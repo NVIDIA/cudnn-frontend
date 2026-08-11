@@ -71,10 +71,8 @@ class WorkspaceLayout:
 def carve_plan(owner: str, regions) -> "_pybind_module.WorkspaceCarve":
     """Compile a build-time carve: ``[(offset, dtype, shape), ...]``.
 
-    An engine's regions are fixed once :class:`WorkspaceLayout` has run; only
-    the caller's base pointer arrives per execute. Describing them here instead
-    of at each :meth:`Workspace.view` is what lets one execute cross into C
-    once rather than once per region (5.5 us against 0.8 for six).
+    The regions are fixed once :class:`WorkspaceLayout` has run; only the base
+    pointer arrives per execute, so one crossing serves them all.
     """
     spec = []
     for offset, dtype, shape in regions:
@@ -119,12 +117,7 @@ class Workspace:
 
     @classmethod
     def over(cls, variant_pack, required_bytes: int, owner: str, *, align: int = DEFAULT_ALIGN) -> "Workspace":
-        """The same validated carver, over a workspace the pack already read.
-
-        ``execute()`` measures the caller's workspace with the same reader it
-        gives every other buffer, so re-probing it here cost 3.5 us to learn
-        what the pack is holding.
-        """
+        """The same validated carver, over a workspace the pack already read."""
         required_bytes = int(required_bytes)
         ptr, nbytes = variant_pack.workspace, variant_pack.workspace_bytes
         if not ptr:
@@ -147,10 +140,8 @@ class Workspace:
     def view(self, offset: int, dtype: str, shape):
         """The region a :class:`WorkspaceLayout` reserved at ``offset``.
 
-        A carve is the same kind of buffer a caller operand is, so it is the
-        same type: a kernel reads both through the DLPack C exchange vtable
-        rather than a capsule built per call (0.30 us against 1.86), and a
-        graph hands its kernels one buffer type rather than two.
+        A carve is the same kind of buffer a caller operand is, so a graph
+        hands its kernels one buffer type rather than two.
         """
         count = 1
         for extent in shape:

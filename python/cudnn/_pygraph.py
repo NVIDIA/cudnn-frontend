@@ -37,7 +37,7 @@ _LOG = logging.getLogger("cudnn.pygraph")
 
 
 def _is_dense(dim, stride) -> bool:
-    """Row-major compact, the way `frost.buffers.is_contiguous` reads it."""
+    """Row-major compact."""
     expect = 1
     for extent, step in zip(reversed(tuple(dim)), reversed(tuple(stride))):
         if extent != 1 and step != expect:
@@ -49,16 +49,11 @@ def _is_dense(dim, stride) -> bool:
 def _in_axis_order_of(shape, stride, reference_stride):
     """``(shape, stride)`` re-expressed in the axis order ``reference_stride`` uses.
 
-    A tensor and its transpose describe the same memory, and the two sides of
-    an override speak different ones: ``override_shapes`` is in the order the
-    GRAPH declared (a matmul's B is ``[batch, K, N]``), while the slot holds
-    the order the caller's buffer reports (B is allocated ``(batch, N, K)``).
-    Applying the override verbatim would leave the pack describing the same
-    bytes in a second language, and an engine indexing an extent by position
-    would read the wrong one.
-
-    Both orders rank their axes the same way by stride — that is what makes
-    them the same memory — so matching the two rankings gives the permutation.
+    ``override_shapes`` speaks the GRAPH's declaration (a matmul's B is
+    ``[batch, K, N]``); the slot holds what the caller's buffer reports (B is
+    allocated ``(batch, N, K)``). Same memory, two orders — so an engine
+    indexing an extent by position would read the wrong one. Both orders rank
+    their axes the same way by stride, which gives the permutation.
     """
     if len(shape) != len(stride) or len(stride) != len(reference_stride):
         return tuple(shape), tuple(stride)
@@ -1779,11 +1774,9 @@ class pygraph:
                 self._compiled_plans[self._plan_index] = eng.build_plan(self, self._selected_plan_config, ctx)
                 self._is_built = True
             plan = self._compiled_plans[self._plan_index]
-            # Normalize for a plan that reads the result; the ones that have not
-            # migrated still take the caller's objects. Overrides go INTO the
-            # pack rather than around it: they are part of describing what this
-            # execute runs, and an engine reading the pack then agrees with the
-            # backend without knowing they exist.
+            # Overrides go INTO the pack rather than around it: they describe
+            # what this execute runs, so an engine reading the pack agrees with
+            # the backend without knowing they exist.
             if plan.takes_variant_pack:
                 pack = self._normalize(uid_to_data, workspace, override_uids, override_shapes, override_strides)
                 plan.execute(self, pack, ctx)
@@ -1881,20 +1874,13 @@ class pygraph:
         if order is None:
             return None
         native = _pybind_module.VariantPackNative(len(order))
-        # One crossing for the whole pack: the reader is a C function table on
-        # the buffer's type (__dlpack_c_exchange_api__), so an operand costs
-        # 0.08 us there against 1.5 to ask a python object the same four
-        # questions and build a Tensor to hold the answers. The uid lookups go
-        # with it — pairing the map with the layout in python cost more than
-        # the reads did. What comes back is the slots whose producer does not
-        # implement the protocol; those are described here, at the price they
-        # always cost, without taking the rest down with them.
+        # One crossing for the whole pack, uid lookups included. What comes back
+        # is the slots whose producer publishes no exchange vtable; those are
+        # described here without taking the rest down with them.
         unread = native.read_from(uid_to_data, order)
-        # The backend's layout is exactly the slots it REQUIRES, so a hole there
-        # is the caller's mistake and is named. A python-only graph's layout is
-        # every wired port, which includes the optional ones (gdn's final_state,
-        # H); a hole is simply "not requested", and the engine reads it back as
-        # a missing port.
+        # The backend's layout is exactly the slots it REQUIRES, so a hole is the
+        # caller's mistake. A python-only graph's layout is every wired port,
+        # including optional ones, where a hole means "not requested".
         strict = self._lowered_graph is not None
         for i in unread:
             data = uid_to_data.get(order[i])
@@ -1910,9 +1896,8 @@ class pygraph:
                 name = f" ({declared.name!r})" if declared is not None and declared.name else ""
                 raise ValueError(f"the variant pack is missing a buffer for tensor uid {uid}{name}")
         if override_uids:
-            # The backend refuses a partial override, so a short list must not
-            # quietly mean "keep what you had for the rest" here: that is the
-            # same call answering two ways depending on which plan ran.
+            # The backend refuses a partial override; a short list must not
+            # quietly mean "keep the rest" here.
             if len(override_shapes or ()) != len(override_uids) or len(override_strides or ()) != len(override_uids):
                 raise ValueError(
                     f"override_uids, override_shapes and override_strides must name the same tensors: got "

@@ -118,11 +118,8 @@ class VariantPack:
     caller happened to hold.
 
     The operands live in ``native``, a C container holding one ``DLTensor``
-    each: reading a buffer through its type's ``__dlpack_c_exchange_api__``
-    vtable is 0.08 us against 1.5 to ask a python object the same four
-    questions, and the slots it hands a kernel are read back through the same
-    vtable — 0.30 us, cheaper than the caller's torch tensor at 0.35, so
-    refusing to pass the caller's object through costs nothing.
+    each, read through the producer's ``__dlpack_c_exchange_api__`` vtable and
+    handed to kernels through the same one.
 
     ``uids`` is ASCENDING, matching the backend's own operand order
     (``get_variant_pack_uids_sorted()``), so ``address`` goes straight to
@@ -138,14 +135,13 @@ class VariantPack:
     pointers — silently, because every pointer in it is individually valid.
     """
 
-    __slots__ = ("uids", "native", "_tensors", "_slot_of", "workspace", "workspace_bytes", "_device")
+    __slots__ = ("uids", "native", "_slot_of", "workspace", "workspace_bytes", "_device")
 
     def __init__(self, uids, native, workspace_ptr: int = 0, workspace_bytes: int = 0):
         self.uids = uids
         self.native = native
         self.workspace = workspace_ptr
         self.workspace_bytes = workspace_bytes
-        self._tensors = None  # built on demand: the hot paths read the native slots
         self._slot_of = None  # built on first lookup: the backend never does one
         self._device = None
 
@@ -153,30 +149,6 @@ class VariantPack:
     def address(self) -> int:
         """The ``void*[]`` in slot order, for ``_execute_with_raw_ptrs``."""
         return self.native.address
-
-    @property
-    def tensors(self):
-        """One ``Tensor`` per operand, materialized on first access.
-
-        The paths that run every execute — contiguity, the views a kernel gets,
-        the pointer array — read the native slots and never come here. This
-        exists for an engine that wants the geometry as python objects, and
-        costs 0.29 us per operand to build when it does.
-        """
-        if self._tensors is None:
-            from ..graph_types import describing_tensor
-            from ..datatypes import _cudnn_dtype_for_dlpack
-
-            native = self.native
-            self._tensors = tuple(
-                (
-                    describing_tensor(uid, tuple(native.shape(i)), tuple(native.stride(i)), _cudnn_dtype_for_dlpack(native.dtype(i)))
-                    if native.is_filled(i)
-                    else describing_tensor(uid, (), (), None)
-                )
-                for i, uid in enumerate(self.uids)
-            )
-        return self._tensors
 
     def all_contiguous(self):
         """``(ok, slot)`` over every filled operand, decided from the strides
@@ -194,10 +166,8 @@ class VariantPack:
     def device(self) -> int:
         """The GPU this execute is going to, for the views handed to kernels.
 
-        One per pack, not one per operand: an execute launches on the current
-        device and cuDNN's own variant pack carries no device at all
-        (``create_variant_pack`` sets pointers, uids and the workspace). Read
-        on demand — 0.74 us, and the backend path never asks.
+        One per pack, not one per operand: cuDNN's own variant pack carries no
+        device at all. Read on demand; the backend path never asks.
         """
         if self._device is None:
             from ..frost.device import current_device

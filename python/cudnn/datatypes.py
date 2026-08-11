@@ -330,11 +330,10 @@ def _is_jax_array(input_tensor) -> bool:
     return type(input_tensor).__module__.startswith(("jax", "jaxlib"))
 
 
-# The DLPack (code, bits) a cuDNN dtype travels as, and back. The native
-# variant pack speaks DLPack, so this is the one translation between it and the
-# graph's vocabulary.
+# The DLPack (code, bits) a cuDNN dtype travels as. The native variant pack
+# speaks DLPack, so this is the one translation between it and the graph's
+# vocabulary.
 _CUDNN_TO_DLPACK_CODE_BITS = {}
-_FROST_DTYPE_CODE_TO_CUDNN = {}
 
 
 def _init_dlpack_dtype_tables():
@@ -345,7 +344,6 @@ def _init_dlpack_dtype_tables():
         if code_bits is None:
             continue
         _CUDNN_TO_DLPACK_CODE_BITS[enum] = code_bits
-        _FROST_DTYPE_CODE_TO_CUDNN[code_bits] = enum
 
 
 def _dlpack_code_bits(data_type):
@@ -354,16 +352,3 @@ def _dlpack_code_bits(data_type):
     if not _CUDNN_TO_DLPACK_CODE_BITS:
         _init_dlpack_dtype_tables()
     return _CUDNN_TO_DLPACK_CODE_BITS.get(data_type, (0, 0))
-
-
-def _cudnn_dtype_for_dlpack(code_bits):
-    """The cuDNN dtype a DLPack ``(code, bits)`` names, or None.
-
-    Both directions initialize the pair, because either can be the first one
-    asked: an operand read through the exchange vtable never takes the python
-    fallback, so nothing would have populated the tables before something came
-    looking for the reverse mapping — and every dtype would have read back None.
-    """
-    if not _FROST_DTYPE_CODE_TO_CUDNN:
-        _init_dlpack_dtype_tables()
-    return _FROST_DTYPE_CODE_TO_CUDNN.get(code_bits)

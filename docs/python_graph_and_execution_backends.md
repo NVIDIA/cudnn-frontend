@@ -110,10 +110,7 @@ Each operand's OWN dim/stride/data_type is what the pack holds, deliberately
 not the graph's declaration: the two may differ and one engine relies on it —
 `frost_gemm` takes its M/N/K from the buffers, so a plan built for one problem
 size runs another bit-exactly. **Read the IR port for the shape the plan was
-built for; read the pack for the shape about to run.** `pack.tensors`
-materializes those as `Tensor` records on demand — 17 us for eight operands, so
-an engine that only needs pointers and extents should ask the pack directly and
-never touch it.
+built for; read the pack for the shape about to run.**
 
 Two rules that are easy to break by accident:
 

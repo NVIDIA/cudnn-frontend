@@ -44,21 +44,17 @@ class _FrostGemmPlan(CompiledPlan):
             except KeyError as exc:
                 raise ValueError(f"frost_gemm: tensor uid {exc} is bound by the kernel but is not an operand of this graph") from exc
         # The kernel reads its M/N/K off these, so they must be the pack's --
-        # which carry the shape this execute runs, override_shapes included --
-        # and not the caller's own objects, which would also tie the engine to
-        # whatever framework produced them.
+        # which carry the shape this execute runs, override_shapes included.
         views = variant_pack.views(slots)
         required = self.get_workspace_size()
-        # A FROST executor carves its scratch out of the CALLER's workspace: no
-        # hidden per-execute allocation, stable pointers, CUDA-graph friendly.
-        # Workspace.over validates it against what the pack already read.
+        # Scratch is carved from the CALLER's workspace: stable pointers, so a
+        # plan stays safe to capture in a CUDA graph.
         extra = (Workspace.over(variant_pack, required, "frost_gemm"),) if required else ()
         run_resolved = getattr(self._compiled, "run_resolved", None)
         if run_resolved is not None:
-            # Which bound tensor holds which operand was settled at build; going
-            # back through a dict keyed by tensor object only to have the
-            # compiled plan rebuild its by-object / by-uid / by-name tables is
-            # work with no answer in it.
+            # Which bound tensor holds which operand was settled at build, so
+            # resolve_variant_pack's by-object / by-uid / by-name tables have
+            # no question left to answer.
             run_resolved({id(t): v for t, v in zip(self._tensors, views)}, *extra, stream=ctx.stream)
         else:
             self._compiled(dict(zip(self._tensors, views)), *extra, stream=ctx.stream)
