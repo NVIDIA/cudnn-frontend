@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import functools
+
 import torch
 import pytest
 from test_low_precision_matmul import (
@@ -115,6 +117,63 @@ def create_sf_layout_tensor(l, mn, nk, sf_vec_size):
     cute_f32_torch_tensor_cpu = torch.zeros(mma_shape, dtype=torch.float32).permute(mma_permute_order)
 
     return cute_f32_torch_tensor_cpu, sf_k
+
+
+_UE5M3_BIAS = 15
+_UE5M3_NAN_BYTE = 0xFF
+
+
+def ue5m3_decode_byte(byte: int) -> float:
+    """Decode a single UE5M3 byte to float."""
+    if byte == _UE5M3_NAN_BYTE:
+        return float("nan")
+    exp = (byte >> 3) & 0x1F
+    mant = byte & 0x07
+    if exp == 0:
+        return (2.0 ** (1 - _UE5M3_BIAS)) * (mant / 8.0)
+    return (2.0 ** (exp - _UE5M3_BIAS)) * (1.0 + mant / 8.0)
+
+
+@functools.lru_cache(maxsize=None)
+def _ue5m3_lut(device) -> torch.Tensor:
+    """All finite UE5M3 values, indexed by byte (0x00..0xFE).
+
+    Memoized per device: building it is a 255-iteration Python loop plus a
+    host-to-device copy, which otherwise dominates the encode for tensors of
+    scale-factor size. Callers share one tensor, so treat it as read-only --
+    never mutate it or apply an in-place op to it.
+    """
+    return torch.tensor(
+        [ue5m3_decode_byte(b) for b in range(_UE5M3_NAN_BYTE)],
+        dtype=torch.float32,
+        device=device,
+    )
+
+
+def f32_to_ue5m3_bytes(values: torch.Tensor) -> torch.Tensor:
+    """Round-to-nearest-even encode a float tensor to UE5M3, returned as uint8.
+
+    Vectorized against the 255-entry finite value table rather than the
+    scalar search loop used by the CUTLASS examples, which is far too slow
+    for scale-factor tensors.
+    """
+    lut = _ue5m3_lut(values.device)
+    flat = values.detach().to(torch.float32).reshape(-1, 1)
+    dist = (flat - lut.reshape(1, -1)).abs()
+    idx = dist.argmin(dim=1)
+
+    hi = (idx + 1).clamp(max=lut.numel() - 1)
+    tie = dist.gather(1, hi.unsqueeze(1)) == dist.gather(1, idx.unsqueeze(1))
+    idx = torch.where(tie.squeeze(1) & (idx % 2 == 1), hi, idx)
+    return idx.to(torch.uint8).reshape(values.shape)
+
+
+def reencode_sf_tensor_as_ue5m3(sf_tensor: torch.Tensor) -> torch.Tensor:
+    """Rewrite an e4m3-valued scale-factor tensor's bytes as UE5M3, in place."""
+    assert sf_tensor.dtype == torch.float8_e4m3fn, f"expected e4m3 storage, got {sf_tensor.dtype}"
+    encoded = f32_to_ue5m3_bytes(sf_tensor.to(torch.float32))
+    sf_tensor.view(torch.uint8).copy_(encoded)
+    return sf_tensor
 
 
 # Create scale factor tensor SFA/SFB

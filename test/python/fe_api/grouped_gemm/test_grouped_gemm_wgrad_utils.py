@@ -17,6 +17,7 @@ GROUPED_GEMM_WGRAD_PARAM_MARKS_FP4 = [
     pytest.mark.parametrize("cluster_shape_mn", [(1, 1), (2, 1)]),
     pytest.mark.parametrize("sf_vec_size", [16]),
     pytest.mark.parametrize("sf_dtype", [torch.float8_e4m3fn]),
+    pytest.mark.parametrize("sf_fp8_dtype_override", [None, "e5m3"], ids=["sf_e4m3", "sf_e5m3"]),
 ]
 
 GROUPED_GEMM_WGRAD_PARAM_MARKS_FP8 = [
