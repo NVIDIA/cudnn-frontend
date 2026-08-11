@@ -25,9 +25,10 @@ import logging
 import weakref
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
-from .datatypes import _torch_to_cudnn_data_type
-from .engines.base import VariantPack
-from .graph_types import NodeType, Tensor
+from .datatypes import _buffer_dtype_to_cudnn, _torch_to_cudnn_data_type
+from .engines.base import ExecutionContext, VariantPack
+from .engines.engine_ids import is_python_engine
+from .graph_types import NodeType, Tensor, byte_size as _byte_size, describing_tensor
 from .nodes import Node, _row_major_stride
 
 _LOG = logging.getLogger("cudnn.pygraph")
@@ -151,6 +152,7 @@ class pygraph:
         # Backend operand order + the reusable pointer array handed to execute.
         # Both are properties of the frozen graph, so they outlive any one call.
         self._sorted_uids: Optional[List[int]] = None
+        self._selected_engine_cache = None  # (plan config, engine); see selected_engine
 
     # =========================================================================
     # Routing
@@ -163,8 +165,6 @@ class pygraph:
 
     @property
     def _selected_plan_config(self) -> Optional[Any]:
-        from .engines.engine_ids import is_python_engine
-
         if not self._plans or not 0 <= self._plan_index < len(self._plans):
             return None
         cfg = self._plans[self._plan_index]
@@ -172,8 +172,6 @@ class pygraph:
 
     def _engine_for(self, cfg) -> Optional["BaseEngine"]:
         """The python engine that owns ``cfg``'s id, or None for a backend entry."""
-        from .engines.engine_ids import is_python_engine
-
         if cfg is None or not is_python_engine(cfg.engine_id):
             return None
         owners = self._owners_for_id(cfg.engine_id)
@@ -224,8 +222,21 @@ class pygraph:
     @property
     def selected_engine(self) -> Optional["BaseEngine"]:
         """The python engine for the currently selected plan entry, or None for
-        the backend path. Populated after create_execution_plans()."""
-        return self._engine_for(self._selected_plan_config)
+        the backend path. Populated after create_execution_plans().
+
+        Cached, because ``execute()`` asks on every call and answering means
+        walking every registered engine for the one declaring this id — 2.75 us
+        to re-derive something that only ``select_plan`` can change. Keyed on
+        the config OBJECT, so replanning invalidates it without needing a hook
+        on every writer of ``_plan_index``.
+        """
+        cfg = self._selected_plan_config
+        cached = self._selected_engine_cache
+        if cached is not None and cached[0] is cfg:
+            return cached[1]
+        engine = self._engine_for(cfg)
+        self._selected_engine_cache = (cfg, engine)
+        return engine
 
     # =========================================================================
     # Tensor Creation
@@ -1223,8 +1234,6 @@ class pygraph:
         return cudnn.get_stream(handle)
 
     def _build_context(self, handle: Any = None) -> Any:
-        from .engines.base import ExecutionContext
-
         h = handle if handle is not None else self._handle
         return ExecutionContext(handle=h, stream=self._resolve_stream(h))
 
@@ -1726,8 +1735,6 @@ class pygraph:
         eng = self.selected_engine
 
         if eng is not None:  # python engine (plan id in the reserved region)
-            from .engines.base import ExecutionContext
-
             h = handle if handle is not None else self._handle
             ctx = ExecutionContext(
                 handle=h,
@@ -1743,7 +1750,7 @@ class pygraph:
                 self._compiled_plans[self._plan_index] = eng.build_plan(self, self._selected_plan_config, ctx)
                 self._is_built = True
             plan = self._compiled_plans[self._plan_index]
-            # Normalize only for a plan that reads the result. Building records
+            # Normalize only for a plan that reads the result. Building Tensors
             # an engine will not look at is pure cost, and the ones that have
             # not migrated still take the caller's objects.
             if plan.takes_variant_pack and not overriding:
@@ -1825,7 +1832,7 @@ class pygraph:
         """Turn the caller's variant pack into :class:`VariantPack`, once.
 
         This is the ONLY place a caller's object is inspected. Everything below
-        — the backend and every python engine — reads pointers and the records
+        — the backend and every python engine — reads the pointers and Tensors
         built here, so the two paths cannot disagree about what the caller
         passed. Returns None when the operand layout is not known yet, which
         puts the caller back on the uid-map path.
@@ -1835,7 +1842,7 @@ class pygraph:
             return None
         n = len(order)
         ptrs = (ctypes.c_void_p * n)()
-        records = [None] * n if describe else None
+        tensors = [None] * n if describe else None
         # The backend's layout is exactly the slots it REQUIRES, so a hole there
         # is the caller's mistake and is named. A python-only graph's layout is
         # every wired port, which includes the optional ones (gdn's final_state,
@@ -1849,41 +1856,86 @@ class pygraph:
                     declared = self._tensor_by_uid.get(uid)
                     name = f" ({declared.name!r})" if declared is not None and declared.name else ""
                     raise ValueError(f"the variant pack is missing a buffer for tensor uid {uid}{name}")
-                continue  # leaves ptrs[i] NULL and records[i] None
+                continue  # leaves ptrs[i] NULL and tensors[i] None
             if describe:
-                ptrs[i], records[i] = self._describe(data, uid)
+                ptrs[i], tensors[i] = self._describe(data, uid)
             else:
                 # The backend reads geometry from its own descriptors; building
-                # a record it will not look at is pure cost.
+                # a Tensor it will not look at is pure cost.
                 ptrs[i] = self._device_pointer(data)
+        # The workspace has no uid, so it is not an operand — but an engine has
+        # to bounds-check its carves, and reading its size here is the same read
+        # every other buffer gets rather than a second probe further down.
+        workspace_ptr, workspace_bytes = 0, 0
+        if workspace is not None:
+            if describe:
+                workspace_ptr, workspace_tensor = self._describe(workspace, -1)
+                workspace_bytes = _byte_size(workspace_tensor)
+            else:
+                workspace_ptr = self._device_pointer(workspace)
         return VariantPack(
             tuple(order),
-            tuple(records) if describe else None,
+            tuple(tensors) if describe else None,
             ptrs,
-            self._device_pointer(workspace) if workspace is not None else 0,
+            workspace_ptr,
+            workspace_bytes,
         )
 
     def _describe(self, data: Any, uid: int):
         """``(pointer, Tensor)`` for one caller buffer.
 
-        The record carries the buffer's OWN dim/stride/data_type, which need
+        The Tensor carries the buffer's OWN dim/stride/data_type, which need
         not match what the graph declared — frost_gemm takes its problem size
-        from here. Reading these straight off a torch tensor costs ~0.5 us;
-        going through DLPack (``frost.buffers.probe``) costs 2-9 us, which is
-        why this does not.
+        from here.
 
-        A caller who passed a bare address gets a record with no geometry: a
+        Every framework publishes the same four facts under a different
+        spelling, so this asks for each spelling in turn. Two differences are
+        the only ones that matter, and both are handled below: strides are in
+        BYTES for the array-interface family and in ELEMENTS for torch/DLPack,
+        and an absent stride means dense row-major rather than unknown.
+
+        Ordered by what it costs to ask (measured, 4096x4x128): reading
+        attributes is 0.52 us for torch and 0.72 for cupy, while the DLPack
+        capsule round trip is 1.5-8.6. The expensive case is specifically torch
+        bfloat16, whose ``__cuda_array_interface__`` raises because the
+        protocol cannot spell bf16 — which is why the last branch is last and
+        not the only one.
+
+        A caller who passed a bare address gets a Tensor with no geometry: a
         pointer carries none, and the backend has always accepted that.
         """
         if type(data) is int:
-            return data, Tensor(uid=uid)
+            return data, Tensor(uid=uid)  # bare device address
         dim = getattr(data, "shape", None)
-        if dim is not None and hasattr(data, "stride") and hasattr(data, "data_ptr"):
-            return data.data_ptr(), Tensor(uid=uid, dim=tuple(dim), stride=tuple(data.stride()), data_type=_torch_to_cudnn_data_type(data.dtype))
-        ptr = self._device_pointer(data)
-        if dim is not None:
-            return ptr, Tensor(uid=uid, dim=tuple(dim))
-        return ptr, Tensor(uid=uid)
+
+        # torch: pointer from data_ptr(), strides from stride() in ELEMENTS
+        if dim is not None and hasattr(data, "data_ptr") and callable(getattr(data, "stride", None)):
+            return data.data_ptr(), describing_tensor(uid, tuple(dim), tuple(data.stride()), _buffer_dtype_to_cudnn(data.dtype))
+
+        # cupy / numba: pointer from .data.ptr, strides from .strides in BYTES
+        ptr = getattr(getattr(data, "data", None), "ptr", None)
+        if dim is not None and ptr is not None:
+            itemsize = data.dtype.itemsize
+            strides = getattr(data, "strides", None)
+            stride = tuple(s // itemsize for s in strides) if strides else _row_major_stride(dim)
+            return int(ptr), describing_tensor(uid, tuple(dim), stride, _buffer_dtype_to_cudnn(data.dtype))
+
+        # jax and bare DLPack producers: one capsule read, which is also the
+        # only reader that gets cupy's byte strides right without knowing it is
+        # cupy. It declines two different ways and they are NOT the same
+        # answer, so they are told apart: "no protocol" means a pointer is all
+        # this buffer will ever yield, while "dtype I cannot name" (fp8, fp4,
+        # anything sub-byte) still has a real dim and stride worth keeping —
+        # the torch branch above records those dtypes, and a buffer should not
+        # be described differently for having come from jax.
+        from .frost.buffers import _dlpack_geometry
+
+        geometry = _dlpack_geometry(data)
+        if geometry is None:  # neither __dlpack__ nor __cuda_array_interface__
+            return self._device_pointer(data), Tensor(uid=uid, dim=tuple(dim) if dim is not None else [])
+        ptr, dims, strides, name, _device = geometry
+        # data_type is None for a dtype with no cuDNN enum (fp4 and friends)
+        return ptr, describing_tensor(uid, tuple(dims), tuple(strides) if strides else _row_major_stride(dims), _buffer_dtype_to_cudnn(name))
 
     @staticmethod
     def _device_pointer(data: Any) -> int:

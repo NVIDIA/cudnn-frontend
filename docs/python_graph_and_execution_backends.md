@@ -88,7 +88,7 @@ create_execution_plans([heur_mode.A, ...])                    _pygraph.py
 
 `graph.execute()` converts whatever the caller passed — a torch tensor, a
 `DeviceView`, any `__dlpack__` / `__cuda_array_interface__` producer, or a bare
-device address — into `Operands` at the top, and everything below reads that.
+device address — into a `VariantPack` at the top, and everything below reads that.
 **Do not add a branch on what the caller's object is.** This exists because
 there used to be two such branches: the backend path accepted a bare address
 (`_native_var_pack`'s `if type(d) is int: return d`) while an engine got the
@@ -96,13 +96,14 @@ object untouched and `frost.buffers.probe` refused it. One public call, two
 answers, decided by which plan the heuristics happened to pick — which the
 caller does not control.
 
-`Operands` carries the caller-filled uids ascending, a ctypes pointer array
-(`address` goes straight to `_execute_with_raw_ptrs`), and a `Tensor` record per
-operand holding the buffer's OWN dim/stride/data_type. That record is
-deliberately not the graph's declaration: the two may differ and one engine
-relies on it — `frost_gemm` takes its M/N/K from the buffers, so a plan built
-for one problem size runs another bit-exactly. **Read the IR port for the shape
-the plan was built for; read the record for the shape about to run.**
+`VariantPack` carries the caller-filled uids ascending, a ctypes pointer array
+(`address` goes straight to `_execute_with_raw_ptrs`), and one `Tensor` per
+operand — the same class `graph.tensor()` returns — holding the buffer's OWN
+dim/stride/data_type. It is deliberately not the graph's declaration: the two
+may differ and one engine relies on it — `frost_gemm` takes its M/N/K from the
+buffers, so a plan built for one problem size runs another bit-exactly. **Read
+the IR port for the shape the plan was built for; read the variant pack's
+`Tensor` for the shape about to run.**
 
 Two rules that are easy to break by accident:
 
@@ -125,10 +126,10 @@ its own `O` virtual while the caller passes a buffer for it. So the layout there
 is every wired port, and an unfilled slot is an optional port the caller did not
 request.
 
-`CompiledPlan.takes_operands` is the migration flag. An engine that has not set
-it still receives the caller's `{uid: buffer}` map and reaches ports through
+`CompiledPlan.takes_variant_pack` is the migration flag. An engine that has not
+set it still receives the caller's `{uid: buffer}` map and reaches ports through
 `resolve_node_buffers`; the flag and that function both go once the last engine
-has moved. `execute()` builds the records only for a plan that sets the flag —
+has moved. `execute()` builds the `Tensor`s only for a plan that sets the flag —
 measured, normalizing for a plan that will not read the result costs more than
 it saves.
 - **An engine does not propose its own plans.** Which configs to try, in what

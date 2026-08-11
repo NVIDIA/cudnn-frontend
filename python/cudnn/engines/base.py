@@ -49,6 +49,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List
 
 from .engine_ids import PYTHON_ENGINE_ID_BASE  # noqa: F401 — re-exported for engine authors
+from ..datatypes import _CUDNN_TO_FROST_DTYPE_NAME
+from ..frost.buffers import DeviceView
 
 if TYPE_CHECKING:
     from ..pygraph import pygraph
@@ -124,10 +126,11 @@ class VariantPack:
     straight to ``_execute_with_raw_ptrs`` with no copy and no per-operand
     hash lookup.
 
-    ``tensors[i]`` describes what the caller ACTUALLY passed for ``uids[i]``:
-    its ``dim`` / ``stride`` / ``data_type`` are the buffer's, which is not
+    ``tensors[i]`` is a ``graph_types.Tensor`` — the same class ``graph.tensor()``
+    returns — describing what the caller ACTUALLY passed for ``uids[i]``: its
+    ``dim`` / ``stride`` / ``data_type`` are the buffer's, which is not
     necessarily what the graph declared. An engine reads whichever it means —
-    the IR port for the shape the plan was built for, this record for the shape
+    the IR port for the shape the plan was built for, this one for the shape
     about to run. frost_gemm takes its M/N/K from here; the backend takes only
     the pointer.
 
@@ -136,21 +139,38 @@ class VariantPack:
     pointers — silently, because every pointer in it is individually valid.
     """
 
-    __slots__ = ("uids", "tensors", "ptrs", "address", "_slot_of", "workspace")
+    __slots__ = ("uids", "tensors", "ptrs", "address", "_slot_of", "workspace", "workspace_bytes", "_device")
 
-    def __init__(self, uids, tensors, ptrs, workspace_ptr: int):
+    def __init__(self, uids, tensors, ptrs, workspace_ptr: int, workspace_bytes: int = 0):
         self.uids = uids
         self.tensors = tensors
         self.ptrs = ptrs
         self.address = ctypes.addressof(ptrs)
         self.workspace = workspace_ptr
+        self.workspace_bytes = workspace_bytes
         self._slot_of = None  # built on first lookup: the backend never does one
+        self._device = None
 
     @property
     def slot_of(self):
         if self._slot_of is None:
             self._slot_of = {u: i for i, u in enumerate(self.uids)}
         return self._slot_of
+
+    @property
+    def device(self) -> int:
+        """The GPU this execute is going to, for the views handed to kernels.
+
+        One per pack, not one per operand: an execute launches on the current
+        device and cuDNN's own variant pack carries no device at all
+        (``create_variant_pack`` sets pointers, uids and the workspace). Read
+        on demand — 0.74 us, and the backend path never asks.
+        """
+        if self._device is None:
+            from ..frost.device import current_device
+
+            self._device = current_device()
+        return self._device
 
     def slot(self, tensor_or_uid) -> int:
         """Index of a tensor's operand. KeyError when it is not caller-filled
@@ -160,6 +180,24 @@ class VariantPack:
 
     def ptr(self, tensor_or_uid) -> int:
         return self.ptrs[self.slot(tensor_or_uid)] or 0
+
+    def view(self, slot: int):
+        """A DLPack producer over one operand, for a kernel that needs an
+        object rather than an address.
+
+        This is the whole reason an engine never sees the caller's buffer: the
+        kernel gets ours, built from the pointer and the geometry recorded at
+        normalization. It costs more than handing the torch tensor straight
+        through (measured +1.6 us per operand, because tvm-ffi reads a torch
+        tensor through a C vtable and any python producer through a capsule) —
+        which is an argument for making the producer a C type, not for keeping
+        the caller's object.
+        """
+        tensor = self.tensors[slot]
+        name = _CUDNN_TO_FROST_DTYPE_NAME.get(tensor.data_type)
+        if name is None:
+            raise ValueError(f"operand uid {self.uids[slot]} has no DLPack-expressible dtype ({tensor.data_type})")
+        return DeviceView(self.ptrs[slot] or 0, tensor.dim, name, self.device)
 
     def __len__(self) -> int:
         return len(self.uids)

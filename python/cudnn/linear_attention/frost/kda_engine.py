@@ -15,7 +15,7 @@ from cudnn.engines.base import BaseEngine, CompiledPlan
 
 from cudnn.frost import buffers
 from cudnn.frost.workspace import Workspace, WorkspaceLayout
-from ..engine_utils import _FrostPlan, _check_contiguous, _require_dtype, _require_state_pair
+from ..engine_utils import _FrostPlan, _require_dtype, _require_state_pair
 
 
 def _the_kda_node(graph):
@@ -170,11 +170,10 @@ class CompiledKda:
         s0 = nb.inputs.get("initial_state")
         o = nb.outputs["O"]
         fs = nb.outputs["final_state"] if self._has_fs else None
-        _check_contiguous("KdaFrostEngine (KDA)", q=q, k=k, v=v, g=g, beta=beta, cu_seqlens=cu, initial_state=s0, O=o, final_state=fs)
 
         stream = stream if stream is not None else 0
 
-        ws = Workspace(workspace, self._ws_bytes, "KdaFrostEngine (KDA)")
+        ws = workspace
         sched_ctr = ws.view(self._off_sched, "int32", (2,))
         from .common.split_k import WORK_ITEM_FIELDS
 

@@ -75,6 +75,10 @@ _PyCapsule_SetName.restype = ctypes.c_int
 _PyCapsule_SetName.argtypes = [ctypes.py_object, ctypes.c_char_p]
 
 # name -> (DLPack type code, bits); typestr -> name for the CAI path
+# name -> (DLPack type code, bits). Names match how torch spells them, so one
+# table serves both a dtype read off a buffer and one named in a graph.
+# Sub-byte types are deliberately absent: DTYPE_ITEMSIZE below is bits // 8, so
+# fp4 would land on 0 and take every byte/element conversion with it.
 DTYPES = {
     "float32": (2, 32),
     "float16": (2, 16),
@@ -85,6 +89,9 @@ DTYPES = {
     "int8": (0, 8),
     "uint8": (1, 8),
     "bool": (6, 8),
+    "float8_e4m3fn": (10, 8),
+    "float8_e5m2": (12, 8),
+    "float8_e8m0fnu": (14, 8),
 }
 _TYPESTR = {"<f4": "float32", "<f2": "float16", "<f8": "float64", "<i8": "int64", "<i4": "int32", "|i1": "int8", "|u1": "uint8", "|b1": "bool"}
 _CODE_BITS = {v: k for k, v in DTYPES.items()}
@@ -269,7 +276,28 @@ class DeviceBuffer(DeviceView):
 def probe(buf):
     """(ptr, shape, strides_in_elements_or_None, dtype_name, device_id) of a
     device buffer, via ``__cuda_array_interface__`` when available (torch,
-    CuPy, numba) else the ``__dlpack__`` protocol."""
+    CuPy, numba) else the ``__dlpack__`` protocol.
+
+    Raises for a buffer it cannot read. Callers that would rather have the
+    geometry of a buffer whose DTYPE has no name here — fp8, fp4, anything
+    sub-byte — want :func:`_dlpack_geometry`, which separates the two
+    failures."""
+    geometry = _dlpack_geometry(buf)
+    if geometry is None:
+        raise TypeError(f"buffer of type {type(buf).__name__} exposes neither __cuda_array_interface__ nor __dlpack__")
+    if geometry[3] is None:
+        raise TypeError(f"unsupported buffer dtype for {type(buf).__name__}")
+    return geometry
+
+
+def _dlpack_geometry(buf):
+    """``probe``'s reading, with its two declines made distinguishable.
+
+    Returns None when the buffer exposes neither protocol — nothing but a
+    pointer will ever come out of it. Returns the 5-tuple with ``dtype_name``
+    set to None when the buffer IS readable but its dtype has no name in
+    ``DTYPES``; dim and stride are real in that case and worth keeping.
+    """
     try:
         # torch's property RAISES for dtypes CAI can't express (bf16) instead
         # of being absent — treat any failure as "no CAI" and use DLPack
@@ -291,11 +319,11 @@ def probe(buf):
 
     dl = getattr(buf, "__dlpack__", None)
     if dl is None:
-        raise TypeError(f"buffer of type {type(buf).__name__} exposes neither __cuda_array_interface__ nor __dlpack__")
+        return None
     # stream=-1 is DLPack's "the caller handles synchronisation; do no
-    # bookkeeping". probe() only reads metadata, so it never needed any --
-    # and the default makes torch call record_stream, which is illegal inside
-    # a CUDA graph capture.
+    # bookkeeping". This only reads metadata, so it never needed any -- and the
+    # default makes torch call record_stream, which is illegal inside a CUDA
+    # graph capture.
     try:
         capsule = dl(stream=-1)
     except TypeError:  # a producer whose __dlpack__ predates the stream kwarg
@@ -305,9 +333,7 @@ def probe(buf):
     t = mt.dl_tensor
     shape = tuple(t.shape[i] for i in range(t.ndim))
     strides = tuple(t.strides[i] for i in range(t.ndim)) if t.strides else None
-    dtype = _CODE_BITS.get((t.dtype.code, t.dtype.bits))
-    if dtype is None or t.dtype.lanes != 1:
-        raise TypeError(f"unsupported buffer dtype (code={t.dtype.code}, bits={t.dtype.bits}, lanes={t.dtype.lanes})")
+    dtype = _CODE_BITS.get((t.dtype.code, t.dtype.bits)) if t.dtype.lanes == 1 else None
     ptr = (t.data or 0) + t.byte_offset
     device_id = t.device.device_id
     # release: mark the capsule consumed and run its deleter

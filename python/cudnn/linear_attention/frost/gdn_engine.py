@@ -15,7 +15,7 @@ from cudnn.engines.base import BaseEngine, CompiledPlan
 
 from cudnn.frost import buffers
 from cudnn.frost.workspace import Workspace, WorkspaceLayout
-from ..engine_utils import _FrostPlan, _check_contiguous, _require_dtype, _require_state_pair
+from ..engine_utils import _FrostPlan, _require_dtype, _require_state_pair
 
 
 def _the_gdn_node(graph):
@@ -213,9 +213,8 @@ class CompiledGdn:
         o = nb.outputs["O"]
         fs = nb.outputs["final_state"] if self._has_fs else None
         h = nb.outputs["H"] if self._has_h else None
-        _check_contiguous("GdnFrostEngine (GDN)", q=q, k=k, v=v, g=g, beta=beta, cu_seqlens=cu, initial_state=s0, O=o, final_state=fs)
 
-        ws = Workspace(workspace, self._ws_bytes, "GdnFrostEngine (GDN)")
+        ws = workspace
         stream = stream if stream is not None else 0
         sched_ctr = ws.view(self._off_sched, "int32", (2,))
         work_items = work_count = None
@@ -354,27 +353,7 @@ class CompiledGdnBwd:
         dv = nb.outputs["dV"]
         dg = nb.outputs["dG"]
         dbeta = nb.outputs["dBeta"]
-        _check_contiguous(
-            "GdnFrostEngine (GDN_BWD)",
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            cu_seqlens=cu,
-            dO=do,
-            h=h_in,
-            initial_state=s0,
-            d_final_state=dht,
-            d_initial_state=ds0,
-            dQ=dq,
-            dK=dk,
-            dV=dv,
-            dG=dg,
-            dBeta=dbeta,
-        )
-
-        ws = Workspace(workspace, self._ws_bytes, "GdnFrostEngine (GDN_BWD)")
+        ws = workspace
         total, HQ, HV, HO, K, V, B = self._shapes
 
         stream = stream if stream is not None else 0

@@ -5251,14 +5251,6 @@ def compile(
     )
 
 
-def _stream_capturing(stream) -> bool:
-    """True when ``stream`` is inside CUDA-graph capture."""
-    from cuda.bindings import runtime as _rt
-
-    err, status = _rt.cudaStreamIsCapturing(int(stream))
-    return int(err) == 0 and int(status) != 0
-
-
 def chunk_gdn_bwd_sm100(
     q,
     k,
@@ -5421,71 +5413,46 @@ def chunk_gdn_bwd_sm100(
 
     compiled = cache["compiled"]
 
-    # desc key: cu object identity + _version so address reuse forces a rebuild
-    desc_key = (
-        _data_ptr(q),
-        _data_ptr(k),
-        _data_ptr(v),
-        _data_ptr(do),
-        _data_ptr(h),
-        _data_ptr(dq),
-        _data_ptr(dk),
-        _data_ptr(dv),
-        tuple(q.shape),
-        tuple(k.shape),
-        tuple(v.shape),
-        tuple(do.shape),
-        tuple(h.shape),
-        _data_ptr(initial_state) if initial_state is not None else None,
-        int(B),
-    )
-    cu_versions = (getattr(cu_seqlens, "_version", 0),)
-    if (
-        cache.get("desc_key") != desc_key
-        or cache.get("desc_cu") is not cu_seqlens
-        or cache.get("desc_cu_versions") != cu_versions
-        or cache.get("desc_workspace") is not workspace
-        or _stream_capturing(stream)
-    ):
-        if "build_descs" not in cache:
+    # The descriptors encode cu_seqlens' CONTENTS, which no key built from the
+    # buffers can track. The skip this replaces asked torch's _version counter,
+    # so it was sound for a torch caller and silently stale for every other
+    # producer. Rebuilding unconditionally measures free: 131 vs 135 us of host
+    # time, and 157 either way once the launches are waited on.
+    if "build_descs" not in cache:
 
-            def _tok3_bc(t):
-                c = from_dlpack(t, assumed_align=16)
-                c.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2), divisibility=1)
-                return c
+        def _tok3_bc(t):
+            c = from_dlpack(t, assumed_align=16)
+            c.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2), divisibility=1)
+            return c
 
-            h_bc = from_dlpack(h, assumed_align=16)
-            h_bc.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2, 3), divisibility=1)
-            cu_bc = from_dlpack(cu_seqlens, assumed_align=4).mark_layout_dynamic()
-            s0_bc = None
-            if initial_state is not None:
-                s0_bc = from_dlpack(initial_state, assumed_align=16)
-                s0_bc.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2, 3), divisibility=1)
+        h_bc = from_dlpack(h, assumed_align=16)
+        h_bc.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2, 3), divisibility=1)
+        cu_bc = from_dlpack(cu_seqlens, assumed_align=4).mark_layout_dynamic()
+        s0_bc = None
+        if initial_state is not None:
+            s0_bc = from_dlpack(initial_state, assumed_align=16)
+            s0_bc.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2, 3), divisibility=1)
 
-            ws_bc = from_dlpack(workspace, assumed_align=128).mark_layout_dynamic()
-            cache["build_descs"] = cute.compile(
-                _build_descs,
-                io_dtype,
-                CFG.B_T,
-                _tok3_bc(q),
-                _tok3_bc(k),
-                _tok3_bc(v),
-                _tok3_bc(do),
-                _tok3_bc(dq),
-                _tok3_bc(dk),
-                _tok3_bc(dv),
-                h_bc,
-                cu_bc,
-                s0_bc,
-                ws_bc,
-                cu_stream,
-                options="--enable-tvm-ffi",
-            )
-        cache["build_descs"](q, k, v, do, dq, dk, dv, h, cu_seqlens, initial_state, workspace, cu_stream)
-        cache["desc_key"] = desc_key
-        cache["desc_cu"] = cu_seqlens
-        cache["desc_cu_versions"] = cu_versions
-        cache["desc_workspace"] = workspace
+        ws_bc = from_dlpack(workspace, assumed_align=128).mark_layout_dynamic()
+        cache["build_descs"] = cute.compile(
+            _build_descs,
+            io_dtype,
+            CFG.B_T,
+            _tok3_bc(q),
+            _tok3_bc(k),
+            _tok3_bc(v),
+            _tok3_bc(do),
+            _tok3_bc(dq),
+            _tok3_bc(dk),
+            _tok3_bc(dv),
+            h_bc,
+            cu_bc,
+            s0_bc,
+            ws_bc,
+            cu_stream,
+            options="--enable-tvm-ffi",
+        )
+    cache["build_descs"](q, k, v, do, dq, dk, dv, h, cu_seqlens, initial_state, workspace, cu_stream)
 
     compiled(
         q,

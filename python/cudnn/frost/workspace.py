@@ -90,12 +90,38 @@ class Workspace:
             raise ValueError(f"{owner}: needs a {required_bytes}-byte workspace, got {nbytes} bytes " "(size it with graph.get_workspace_size())")
         if ptr % align != 0:
             raise ValueError(f"{owner}: the workspace buffer must be {align}-byte aligned; got 0x{ptr:x}")
+        self._init(ptr, nbytes, device, owner, align)
+
+    def _init(self, ptr, nbytes, device, owner, align):
         self._ptr = ptr
         self._device = device
         self._nbytes = nbytes
         self._owner = owner
         self._align = int(align)
         self._offset = 0
+
+    @classmethod
+    def over(cls, variant_pack, required_bytes: int, owner: str, *, align: int = DEFAULT_ALIGN) -> "Workspace":
+        """The same validated carver, over a workspace the pack already read.
+
+        ``execute()`` measures the caller's workspace with the same reader it
+        gives every other buffer, so re-probing it here cost 3.5 us to learn
+        what the pack is holding.
+        """
+        required_bytes = int(required_bytes)
+        ptr, nbytes = variant_pack.workspace, variant_pack.workspace_bytes
+        if not ptr:
+            raise ValueError(
+                f"{owner} requires a {required_bytes}-byte workspace but execute() received "
+                f"none; allocate graph.get_workspace_size() bytes and pass the buffer to execute()"
+            )
+        if nbytes < required_bytes:
+            raise ValueError(f"{owner}: needs a {required_bytes}-byte workspace, got {nbytes} bytes (size it with graph.get_workspace_size())")
+        if ptr % align != 0:
+            raise ValueError(f"{owner}: the workspace buffer must be {align}-byte aligned; got 0x{ptr:x}")
+        self = cls.__new__(cls)
+        self._init(ptr, nbytes, variant_pack.device, owner, align)
+        return self
 
     @property
     def nbytes(self) -> int:

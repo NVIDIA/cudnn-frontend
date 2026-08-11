@@ -6,9 +6,10 @@ dtype gates, the explicit-workspace carver, and the compiled-plan wrapper."""
 
 from __future__ import annotations
 
-from cudnn.engines.base import CompiledPlan, resolve_node_buffers
+from cudnn.engines.base import CompiledPlan, NodeBuffers, bind_ports
 
 from cudnn.frost import buffers
+from cudnn.frost.workspace import Workspace
 
 
 def _dtype_name(dt) -> str:
@@ -44,25 +45,56 @@ def _require_state_pair(engine: str, node) -> None:
 
 
 class _FrostPlan(CompiledPlan):
+    """A compiled linear-attention kernel, driven from the normalized pack.
+
+    The port-to-slot join is a property of the graph, so it happens once and is
+    kept; only the addresses change between executes. What the kernel receives
+    is built from the pack, never the caller's object — the geometry it is
+    checked against and the geometry it runs on are then the same reading.
+    """
+
+    takes_variant_pack = True
+
     def __init__(self, compiled):
         self._compiled = compiled
+        self._ports = None
+        self._name = type(compiled).__name__
 
     def get_workspace_size(self) -> int:
         return self._compiled.workspace_bytes()
 
-    def execute(self, graph, uid_to_data, ctx) -> None:
-        node_buffers = resolve_node_buffers(graph, uid_to_data)
-        self._compiled(node_buffers, workspace=getattr(ctx, "workspace", None), stream=getattr(ctx, "stream", None))
+    def execute(self, graph, variant_pack, ctx) -> None:
+        ports = self._ports
+        if ports is None:
+            ports = self._ports = bind_ports(graph, variant_pack)
+        node_buffers = {}
+        for node, slots in ports.items():
+            _check_contiguous(node.name, variant_pack, slots)
+            node_buffers[node] = NodeBuffers(
+                {port: variant_pack.view(slot) for port, slot in slots.inputs.items()},
+                {port: variant_pack.view(slot) for port, slot in slots.outputs.items()},
+            )
+        required = self._compiled.workspace_bytes()
+        workspace = Workspace.over(variant_pack, required, self._name) if required else None
+        self._compiled(node_buffers, workspace=workspace, stream=ctx.stream)
 
 
-def _check_contiguous(plan_name: str, **bufs) -> None:
-    """Contiguity gate over the caller's buffers (pass-through, no staging)."""
-    for name, b in bufs.items():
-        if b is None:
-            continue
-        _ptr, shape, strides, _dtype, _dev = buffers.probe(b)
-        if not buffers.is_contiguous(shape, strides):
-            raise ValueError(f"{plan_name}: buffer for {name!r} must be contiguous (buffers pass straight to the kernel)")
+def _check_contiguous(node_name: str, variant_pack, slots) -> None:
+    """Contiguity gate over every port this node binds, read off the pack.
+
+    The dim and stride were taken from the caller's object once, at
+    normalization; probing each buffer again cost 8.6 us apiece — nine per GDN
+    forward — to learn what the pack already knows.
+
+    One gate for every kernel rather than a call per compiled callable naming
+    its own ports: the rule was the same list every time, and a port added to a
+    node but forgotten here would have gone unchecked.
+    """
+    for direction in (slots.inputs, slots.outputs):
+        for port, slot in direction.items():
+            tensor = variant_pack.tensors[slot]
+            if not buffers.is_contiguous(tensor.dim, tensor.stride):
+                raise ValueError(f"cudnn.frost {node_name!r}: buffer for {port!r} must be contiguous (buffers pass straight to the kernel)")
 
 
 _pinned_engines = None  # e.g. ("gdn_cutile",) -- set by a suite, None => the manifest decides

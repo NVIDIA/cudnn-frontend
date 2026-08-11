@@ -120,3 +120,19 @@ def test_execute_is_reentrant():
     for t in threads:
         t.join()
     assert sum(wrong) == 0, f"crossed buffers between threads: {wrong}"
+
+
+@pytest.mark.L0
+def test_describing_tensor_matches_the_dataclass():
+    """``describing_tensor`` skips ``Tensor.__init__``, so every field it does
+    not set has to resolve to the same default the dataclass would have given
+    it. A new field with a ``default_factory`` gets no class attribute and
+    would raise here rather than reach an engine as a missing attribute."""
+    import dataclasses
+
+    from cudnn.graph_types import Tensor, describing_tensor
+
+    fast = describing_tensor(7, (4, 3), (6, 1), cudnn.data_type.FLOAT)
+    slow = Tensor(uid=7, dim=(4, 3), stride=(6, 1), data_type=cudnn.data_type.FLOAT)
+    for f in dataclasses.fields(Tensor):
+        assert getattr(fast, f.name) == getattr(slow, f.name), f.name

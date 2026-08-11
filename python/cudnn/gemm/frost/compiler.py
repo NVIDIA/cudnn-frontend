@@ -694,12 +694,27 @@ def _plan_device() -> int:
     return current_device()
 
 
-def _check_plan_device(variant_pack, plan_device: int) -> None:
+def _check_plan_device(plan_device: int) -> None:
     """A plan's SMEM depth / cluster count / target SM are baked for ONE GPU;
-    refuse buffers from another rather than launching a mismatched kernel."""
-    from cudnn.frost.device import check_buffer_device
+    refuse to launch it anywhere else.
 
-    check_buffer_device(variant_pack.values(), plan_device, what="FROST plan")
+    Asks where the launch is going, not where each operand lives. The operands
+    were never the question — a kernel built for one arch produces garbage on
+    another whoever owns the memory — and the backend does not look at operand
+    devices either: ``create_variant_pack`` sets only pointers, uids and the
+    workspace, and ``graph_interface.h`` takes its ordinal from
+    ``cuda_get_device``. Reading the current device once is 0.74 us against
+    1.45 per operand for the walk this replaces.
+    """
+    from cudnn.frost.device import current_device
+
+    device = current_device()
+    if device != plan_device:
+        raise ValueError(
+            f"cudnn.frost: this FROST plan was built for cuda:{plan_device} but cuda:{device} is "
+            f"current. The kernel's SMEM pipeline depth, cluster count and target SM are baked at "
+            f"build time, so a plan cannot move between GPUs — rebuild it with cuda:{device} current."
+        )
 
 
 def _grid_num_clusters(cfg: TileConfig, device=None) -> int:
@@ -1806,7 +1821,7 @@ class CompiledFusedGemm:
             raise TypeError(
                 "compiled kernels are called with a variant-pack dict " "{cuDNN tensor | uid | name: buffer}; got " f"{type(variant_pack).__name__}"
             )
-        _check_plan_device(variant_pack, self.device)
+        _check_plan_device(self.device)
         if self.binding is None:
             raise NotImplementedError("variant-pack call is not wired up for this graph type")
         b = self.binding
@@ -2856,7 +2871,7 @@ class CompiledMoeGemm:
             raise TypeError(
                 "compiled kernels are called with a variant-pack dict " "{cuDNN tensor | uid | name: buffer}; got " f"{type(variant_pack).__name__}"
             )
-        _check_plan_device(variant_pack, self.device)
+        _check_plan_device(self.device)
         return self._call_variant_pack(variant_pack, workspace, stream)
 
     def _launch_single(self, token, weight, first_token_offset, output, snke, workspace=None, stream=None):
@@ -3232,7 +3247,7 @@ class CompiledMoeBlockScaleGemm:
             raise TypeError(
                 "compiled kernels are called with a variant-pack dict " "{cuDNN tensor | uid | name: buffer}; got " f"{type(variant_pack).__name__}"
             )
-        _check_plan_device(variant_pack, self.device)
+        _check_plan_device(self.device)
         return self._call_variant_pack(variant_pack, workspace, stream)
 
     def _launch_single(self, token, weight, sfa, sfb, first_token_offset, output, snke, workspace=None, stream=None):

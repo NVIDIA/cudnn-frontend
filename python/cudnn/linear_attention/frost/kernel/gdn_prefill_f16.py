@@ -3199,14 +3199,6 @@ def compile(
     )
 
 
-def _stream_capturing(stream) -> bool:
-    """True when ``stream`` is inside CUDA-graph capture."""
-    from cuda.bindings import runtime as _rt
-
-    err, status = _rt.cudaStreamIsCapturing(int(stream))
-    return int(err) == 0 and int(status) != 0
-
-
 def chunk_gdn_sm100(
     q,
     k,
@@ -3404,77 +3396,54 @@ def chunk_gdn_sm100(
 
     compiled = cache["compiled"]
 
-    # desc key: cu object identity + _version so address reuse forces a rebuild
-    desc_key = (
-        _data_ptr(q),
-        _data_ptr(k),
-        _data_ptr(v),
-        _data_ptr(output) if enable_o else 0,
-        _data_ptr(output_h) if enable_h else 0,
-        tuple(q.shape),
-        tuple(k.shape),
-        tuple(v.shape),
-        tuple(output.shape) if enable_o else (),
-        tuple(output_h.shape) if enable_h else (),
-        int(B),
-        int(checkpoint_every_n_tokens) if enable_h else (),
-    )
-    cu_versions = (getattr(cu_seqlens, "_version", 0),)
-    if (
-        cache.get("desc_key") != desc_key
-        or cache.get("desc_cu") is not cu_seqlens
-        or cache.get("desc_cu_versions") != cu_versions
-        or cache.get("desc_workspace") is not workspace
-        or _stream_capturing(stream)
-    ):
-        if "build_descs" not in cache:
-            q_bc = from_dlpack(q, assumed_align=16)
-            q_bc.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2), divisibility=1)
-            k_bc = from_dlpack(k, assumed_align=16)
-            k_bc.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2), divisibility=1)
-            v_bc = from_dlpack(v, assumed_align=16)
-            v_bc.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2), divisibility=1)
-            o_bc = None
-            if enable_o:
-                o_bc = from_dlpack(output, assumed_align=16)
-                o_bc.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2), divisibility=1)
-            cu_bc = from_dlpack(cu_seqlens, assumed_align=4).mark_layout_dynamic()
-            s_bc = None
-            cu_ckpt_bc = None
-            if enable_h:
-                s_bc = from_dlpack(output_h, assumed_align=16)
-                s_bc.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2, 3), divisibility=1)
-            ws_bc = from_dlpack(workspace, assumed_align=128).mark_layout_dynamic()
-            cache["build_descs"] = cute.compile(
-                _build_descs,
-                io_dtype,
-                CFG.B_T,
-                q_bc,
-                k_bc,
-                v_bc,
-                o_bc,
-                cu_bc,
-                s_bc,
-                cutlass.Int32(checkpoint_every_n_tokens if enable_h else 1),
-                ws_bc,
-                cu_stream,
-                options="--enable-tvm-ffi",
-            )
-        cache["build_descs"](
-            q,
-            k,
-            v,
-            output,
-            cu_seqlens,
-            output_h,
-            checkpoint_every_n_tokens if enable_h else 1,
-            workspace,
+    # The descriptors encode cu_seqlens' CONTENTS, which no key built from the
+    # buffers can track. The skip this replaces asked torch's _version counter,
+    # so it was sound for torch callers and silently stale for every other
+    # producer. Rebuilding unconditionally measured free: 131 vs 135 us of host
+    # time, 157 either way once the launches are waited on.
+    if "build_descs" not in cache:
+        q_bc = from_dlpack(q, assumed_align=16)
+        q_bc.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2), divisibility=1)
+        k_bc = from_dlpack(k, assumed_align=16)
+        k_bc.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2), divisibility=1)
+        v_bc = from_dlpack(v, assumed_align=16)
+        v_bc.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2), divisibility=1)
+        o_bc = None
+        if enable_o:
+            o_bc = from_dlpack(output, assumed_align=16)
+            o_bc.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2), divisibility=1)
+        cu_bc = from_dlpack(cu_seqlens, assumed_align=4).mark_layout_dynamic()
+        s_bc = None
+        if enable_h:
+            s_bc = from_dlpack(output_h, assumed_align=16)
+            s_bc.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2, 3), divisibility=1)
+        ws_bc = from_dlpack(workspace, assumed_align=128).mark_layout_dynamic()
+        cache["build_descs"] = cute.compile(
+            _build_descs,
+            io_dtype,
+            CFG.B_T,
+            q_bc,
+            k_bc,
+            v_bc,
+            o_bc,
+            cu_bc,
+            s_bc,
+            cutlass.Int32(checkpoint_every_n_tokens if enable_h else 1),
+            ws_bc,
             cu_stream,
+            options="--enable-tvm-ffi",
         )
-        cache["desc_key"] = desc_key
-        cache["desc_cu"] = cu_seqlens
-        cache["desc_cu_versions"] = cu_versions
-        cache["desc_workspace"] = workspace
+    cache["build_descs"](
+        q,
+        k,
+        v,
+        output,
+        cu_seqlens,
+        output_h,
+        checkpoint_every_n_tokens if enable_h else 1,
+        workspace,
+        cu_stream,
+    )
 
     compiled(
         q,
