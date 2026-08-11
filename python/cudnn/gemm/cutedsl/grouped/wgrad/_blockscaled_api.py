@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from typing import Optional, Tuple, Union
+from typing import Literal, Optional, Tuple, Union
 
 import cutlass
 import cutlass.cute as cute
@@ -63,7 +63,7 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
         mma_tiler_mn: Tuple[int, int] = (256, 256),
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         sf_vec_size: int = 16,
-        sf_fp8_dtype_override: Optional[str] = None,
+        sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
         accumulate_on_output: bool = False,
         input_order: Union[WGradInputOrder, str] = WGradInputOrder.Tensor2D,
     ):

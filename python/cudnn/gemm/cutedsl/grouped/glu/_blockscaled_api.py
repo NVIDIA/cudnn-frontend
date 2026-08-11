@@ -24,7 +24,7 @@ from ..backend_utils import rubin_single_group_offsets_kwarg
 from ..moe_utils import MoEWeightMode
 from cuda.bindings import driver as cuda
 import os
-from typing import Tuple, Optional
+from typing import Literal, Tuple, Optional
 
 import cutlass
 import cutlass.cute as cute
@@ -122,7 +122,7 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
         mma_tiler_mn: Tuple[int, int] = (256, 256),
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         sf_vec_size: int = 16,
-        sf_fp8_dtype_override: Optional[str] = None,
+        sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
         vector_f32: bool = False,
         m_aligned: int = 256,
         discrete_col_sfd: bool = False,

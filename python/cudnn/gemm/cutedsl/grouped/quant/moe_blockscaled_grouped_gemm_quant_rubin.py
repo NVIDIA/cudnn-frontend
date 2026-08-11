@@ -15,7 +15,7 @@ This module contains only the kernel class.
 MoE scheduler components live in moe_persistent_scheduler.py / moe_sched_extension.py / moe_utils.py.
 """
 
-from typing import Type, Tuple, Union, Optional
+from typing import Literal, Type, Tuple, Union, Optional
 from enum import Enum
 
 import cuda.bindings.driver as cuda
@@ -85,15 +85,12 @@ class BlockScaledMoEGroupedGemmQuantKernel:
     :param generate_c: Generate C output tensor.
     :param enable_bias: Fuse bias addition.
     :param expert_cnt: Number of experts.
-    :param sf_fp8_dtype_override: Pass ``"e5m3"`` to read the scale factors as
-        ``FloatNV8E5M3FNU`` instead of the element type carried by the ``sfa``
-        argument. That type has no torch dtype and TVM-FFI cannot marshal it, so such
-        scales arrive as ``Float8E4M3FN`` storage of the same width. Nothing reads the
-        element type off the incoming scale tensors -- the MMA atom, smem layouts and
-        S2T copy are all built from ``sf_dtype``, and the SF TMA atoms use an explicit
-        ``internal_type`` -- so setting this is sufficient. ``None`` keeps the incoming
-        element type. The caller is responsible for having encoded the scale bytes as
-        E5M3; this reinterprets, never converts.
+    :param sf_fp8_dtype_override: Reinterpret the FP8-format block scale factors
+        as E5M3 instead of the E4M3 implied by their storage dtype. ``None``
+        (default) leaves the format inferred, as every caller did before this
+        knob existed. ``"e5m3"`` requires Rubin and the NVFP4 recipe, and the
+        scale tensors are still supplied as ``torch.float8_e4m3fn`` because
+        torch has no e5m3 dtype -- only the CuTe element type is overridden.
     :param weight_mode: ``MoEWeightMode.DENSE`` or ``MoEWeightMode.DISCRETE``.
     :param use_dynamic_sched: Enable dynamic tile scheduling.
     """
@@ -194,7 +191,7 @@ class BlockScaledMoEGroupedGemmQuantKernel:
         weight_mode: MoEWeightMode = MoEWeightMode.DENSE,
         use_dynamic_sched: bool = False,
         epilogue_type: int = EpilogueType.NONE.value,
-        sf_fp8_dtype_override: Optional[str] = None,
+        sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
         use_single_group_runtime_offsets: bool = False,
     ):
         # Hardware MMA instruction M: 2CTA → 256, 1CTA → 128

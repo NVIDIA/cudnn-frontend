@@ -14,7 +14,7 @@ This module contains only the kernel class.
 MoE scheduler components live in moe_persistent_scheduler.py / moe_sched_extension.py / moe_utils.py.
 """
 
-from typing import Type, Tuple, Union, Optional
+from typing import Literal, Type, Tuple, Union, Optional
 from functools import partial
 
 import cuda.bindings.driver as cuda
@@ -238,7 +238,7 @@ class BlockScaledMoEGroupedGemmDgluKernel:
         weight_mode: MoEWeightMode = MoEWeightMode.DISCRETE,
         use_dynamic_sched: bool = False,
         act_func: str = "dswiglu",
-        sf_fp8_dtype_override: Optional[str] = None,
+        sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
         use_single_group_runtime_offsets: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled grouped GEMM dGLU kernel.
@@ -271,16 +271,13 @@ class BlockScaledMoEGroupedGemmDgluKernel:
         :type cluster_shape_mn: Tuple[int, int]
         :param expert_cnt: Number of experts (compile-time constant).
         :type expert_cnt: int
-        :param sf_fp8_dtype_override: Pass ``"e5m3"`` to read the scale factors as
-            ``FloatNV8E5M3FNU`` instead of the element type carried by the ``sfa``
-            argument. That type has no torch dtype and TVM-FFI cannot marshal it, so
-            such scales arrive as ``Float8E4M3FN`` storage of the same width. Nothing
-            reads the element type off the incoming scale tensors -- the MMA atom,
-            smem layouts and S2T copy are all built from ``sf_dtype``, and the SF TMA
-            atoms use an explicit ``internal_type`` -- so setting this is sufficient.
-            ``None`` keeps the incoming element type. The caller is responsible for
-            having encoded the scale bytes as E5M3; this reinterprets, never converts.
-        :type sf_fp8_dtype_override: Optional[str]
+        :param sf_fp8_dtype_override: Reinterpret the FP8-format block scale factors
+            as E5M3 instead of the E4M3 implied by their storage dtype. ``None``
+            (default) leaves the format inferred, as every caller did before this
+            knob existed. ``"e5m3"`` requires Rubin and the NVFP4 recipe, and the
+            scale tensors are still supplied as ``torch.float8_e4m3fn`` because
+            torch has no e5m3 dtype -- only the CuTe element type is overridden.
+        :type sf_fp8_dtype_override: Optional[Literal["e5m3"]]
 
         :raises ValueError: If FIX_PAD_SIZE is not divisible by mma_tiler_mn[0].
         """

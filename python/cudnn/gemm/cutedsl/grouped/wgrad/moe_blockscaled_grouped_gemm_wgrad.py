@@ -23,7 +23,7 @@ Extension: moe_sched_extension.py (WgradDense / WgradDiscrete)
 """
 
 from importlib.metadata import PackageNotFoundError, version
-from typing import Type, Tuple, Optional
+from typing import Literal, Type, Tuple, Optional
 
 import cuda.bindings.driver as cuda
 
@@ -93,7 +93,7 @@ class BlockScaledMoEGroupedGemmWgradKernel:
         expert_cnt: int = 1,
         weight_mode: MoEWeightMode = MoEWeightMode.DENSE,
         input_order: WGradInputOrder = WGradInputOrder.Tensor2D,
-        sf_fp8_dtype_override: Optional[str] = None,
+        sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
     ):
         self.sf_vec_size = sf_vec_size
         self.sf_dtype_override: Optional[Type[cutlass.Numeric]] = cutlass.FloatNV8E5M3FNU if sf_fp8_dtype_override == "e5m3" else None
