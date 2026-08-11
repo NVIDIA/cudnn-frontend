@@ -110,7 +110,7 @@ from cudnn.frost.tile_dsl.mask import MASK_NONE, MASK_PADDED, MASK_CAUSAL, MASK_
 from cudnn.frost.tile_dsl.rope import rope_rotate_smem_tile  # noqa: E402
 
 # Pull the default geometry from the flavor config (single source of truth).
-from cudnn.sdpa.bwd.kernels.bprop_config_llama_sm80 import CFG as _LLAMA_CFG  # noqa: E402
+from cudnn.sdpa.bwd.config_sm80 import LLAMA_CFG as _LLAMA_CFG  # noqa: E402
 
 _LOG2E = 1.4426950408889634
 _ELEM_BYTES = 2

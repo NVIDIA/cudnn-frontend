@@ -719,16 +719,6 @@ Note: SDPA Forward D256 is also supported by the cudnn graph/backend API.
 This experimental FE OSS API provides a CUTE DSL implementation of the SDPA backward pass for head dimension `256` on NVIDIA Blackwell GPUs (`SM100+`). It computes `dQ`, `dK`, and `dV` from the forward tensors plus `dO` and `LSE`. Available through a standalone API (see [sdpa_bwd_d256.md](https://docs.nvidia.com/deeplearning/cudnn/frontend/latest/operations/Attention.html#sdpa-backward-fe-oss-sm100-d256) for details) or as part of the experimental [SDPA Pytorch custom operator](#scaled-dot-product-attention-pytorch-op).
 
 
-(sdpa-forward-fe-oss-sm80)=
-### SDPA Forward FE OSS API (SM80)
-
-This experimental FE OSS API provides a CUTE DSL implementation of the SDPA forward pass on NVIDIA Ampere A100 GPUs (`SM80`), covering head dimensions up to `(256, 256)` (including asymmetric `D_QK=192 / D_V=128`). It computes the attention output `O` plus `LSE` statistics, with support for causal / sliding-window / bottom-right / padding masks, bias, ALiBi, learned sinks, block masks, fused RoPE, score stats, GQA/MQA, and packed THD inputs. Available through a standalone API (see [sdpa_fwd_sm80.md](../fe-oss-apis/attention/sdpa_fwd_sm80.md) for details) and, experimentally, as the FROST engine `sdpa_fwd_prefill_sm80` serving `sdpa()` graphs.
-
-(sdpa-backward-fe-oss-sm80)=
-### SDPA Backward FE OSS API (SM80)
-
-This experimental FE OSS API provides a CUTE DSL implementation of the SDPA backward pass on NVIDIA Ampere A100 GPUs (`SM80`). It computes `dQ`, `dK`, and `dV` (plus `dBias` / `dSink` when present) from the forward tensors plus `dO` and `LSE`, with an optional deterministic dQ mode. Available through a standalone API (see [sdpa_bwd_sm80.md](../fe-oss-apis/attention/sdpa_bwd_sm80.md) for details) and, experimentally, as the FROST engine `sdpa_bwd_sm80` serving `sdpa_backward()` graphs.
-
 
 (scaled-dot-product-attention-pytorch-op)=
 ### SDPA PyTorch Custom Op (Experimental)

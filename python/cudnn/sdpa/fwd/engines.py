@@ -489,7 +489,7 @@ def _sm100_fp8_spec(d: int) -> EngineSpec:
 
 def _sm80_spec() -> EngineSpec:
     """SM80 (A100) prefill row: lowers onto the ``cudnn.sdpa`` SM80 APIBase
-    adapter (``fwd/api_sm80.py``), which owns kernel-flavor selection
+    adapter (``fwd/api.py``), which owns kernel-flavor selection
     (gptoss/llama/dsv3/qwen), host-side head-dim padding (hence
     ``d_pad_multiple=1``), BHSD<->BSHD normalization, and per-shape kernel
     caching — the CuTe-DSL JIT happens on the first execute.  THD graphs are
@@ -532,7 +532,7 @@ def _sm80_spec() -> EngineSpec:
 
 def lower_sm80_prefill(spec: EngineSpec, facts: "ga.SdpaGraphFacts", knobs: Optional[SdpaFwdKnobs] = None):
     """Lower the SM80 prefill row through the ``cudnn.sdpa`` SM80 adapter."""
-    from cudnn.sdpa.fwd.api_sm80 import sdpa_fwd_wrapper_sm80
+    from cudnn.sdpa.fwd.api import sdpa_fwd_wrapper_sm80
 
     binding = ga.SdpaBinding(
         q=facts.q_t,

@@ -127,7 +127,7 @@ from cudnn.frost.tile_dsl.mask import (  # noqa: E402
 # ``d_qk`` / ``d_v`` are now Constexpr params on the kernel (folded at trace
 # time); the flavor (Llama d=128, GPT-OSS d=64, …) is picked by the driver
 # by the adapter's per-flavor knob table
-# (``cudnn.sdpa.fwd.api_sm80._FLAVOR_KNOBS``).  Knob defaults
+# (``cudnn.sdpa.fwd.api._FLAVOR_KNOBS``).  Knob defaults
 # below match the Llama flavor — overridden per-flavor in
 # the adapter's knob table and threaded through ``forward()``.
 DEFAULT_TILE_M = 128

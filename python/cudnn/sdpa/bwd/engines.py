@@ -429,7 +429,7 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
 
 def _sm80_spec() -> EngineSpec:
     """SM80 (A100) backward row: lowers onto the ``cudnn.sdpa`` SM80 APIBase
-    adapter (``bwd/api_sm80.py``), which owns kernel-flavor selection
+    adapter (``bwd/api.py``), which owns kernel-flavor selection
     (head-dim envelopes up to (256, 256), incl. rectangular 192/128),
     host-side head-dim zero-padding, BHSD<->BSHD normalization, per-shape
     kernel caching, and the dedicated plain-dense d=64 fast path.  The
@@ -469,7 +469,7 @@ def _sm80_spec() -> EngineSpec:
 
 def lower_sm80_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any = None):
     """Lower the SM80 backward row through the ``cudnn.sdpa`` SM80 adapter."""
-    from .api_sm80 import sdpa_bwd_wrapper_sm80
+    from .api import sdpa_bwd_wrapper_sm80
 
     binding = ga.SdpaBinding(
         q=facts.q_t,

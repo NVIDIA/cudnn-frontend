@@ -19,8 +19,8 @@ _LAZY_EXPORTS = {
     "SdpaBwdDsl": (".api_dsl", "SdpaBwdDsl"),
     "SdpaBwdDslSm120": (".api_dsl", "SdpaBwdDslSm120"),
     "sdpa_bwd_wrapper_dsl_sm120": (".api_dsl", "sdpa_bwd_wrapper_dsl_sm120"),
-    "SdpabwdSm80": (".api_sm80", "SdpabwdSm80"),
-    "sdpa_bwd_wrapper_sm80": (".api_sm80", "sdpa_bwd_wrapper_sm80"),
+    "SdpabwdSm80": (".api", "SdpabwdSm80"),
+    "sdpa_bwd_wrapper_sm80": (".api", "sdpa_bwd_wrapper_sm80"),
 }
 
 __all__ = list(_LAZY_EXPORTS)

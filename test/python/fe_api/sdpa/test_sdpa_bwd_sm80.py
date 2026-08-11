@@ -184,7 +184,7 @@ def test_sdpa_bwd_sm80_d64_fast_path():
     """The dedicated d=64 kernel routes only for plain dense MHA and agrees
     with the generic kernel on the same inputs."""
     try:
-        from cudnn.sdpa.bwd import api_sm80
+        from cudnn.sdpa.bwd import api as api_sm80
         from cudnn.sdpa.bwd.kernels import bprop_d64_f16_sm80 as d64, bprop_f16_sm80 as gen
     except ImportError as e:
         pytest.skip(f"SM80 SDPA API not available: {e}")
