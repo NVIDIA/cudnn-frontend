@@ -49,10 +49,12 @@ def _require_dsl() -> None:
 from frost_test_utils import select_engine as _select_engine  # noqa: F401
 
 
-def _bhsd(batch: int, heads: int, sequence: int, head_dim: int, dtype: torch.dtype, empty: bool = False) -> torch.Tensor:
-    """Return logical BHSD backed by compact BSHD physical storage."""
+def _bhsd(batch: int, heads: int, sequence: int, head_dim: int, dtype: torch.dtype, empty: bool = False, layout: str = "bshd") -> torch.Tensor:
+    """Logical BHSD over compact BSHD storage, or BHSD-contiguous for layout="bhsd"."""
 
     factory = torch.empty if empty else torch.randn
+    if layout == "bhsd":
+        return factory(batch, heads, sequence, head_dim, dtype=dtype, device="cuda")
     return factory(batch, sequence, heads, head_dim, dtype=dtype, device="cuda").transpose(1, 2)
 
 
@@ -83,11 +85,17 @@ def _ref_bwd(
     return o_ref.to(q.dtype), stats_ref.contiguous(), dq.to(q.dtype), dk.to(q.dtype), dv.to(q.dtype)
 
 
-def _expected_workspace_bytes(batch: int, heads: int, s_q: int, head_dim: int) -> int:
+def _expected_workspace_bytes(batch: int, heads: int, s_q: int, head_dim: int, staged: tuple[torch.Tensor, ...] = ()) -> int:
+    from cudnn.sdpa.bwd.config_sm120 import padded_head_dim
     from cudnn.sdpa.fwd.api_dsl import ws_align
 
+    d_pad = padded_head_dim(head_dim)
     sq_r = -(-s_q // 128) * 128
-    return ws_align(batch * heads * sq_r * 4) + ws_align(batch * sq_r * heads * head_dim * 4)
+    dq_sem = batch * heads * (-(-s_q // 32))  # int32 relay counters (min q-tile 32)
+    base = ws_align(batch * heads * sq_r * 4) + ws_align(batch * sq_r * heads * d_pad * 4) + ws_align(dq_sem * 4)
+    # Padded-width staging copy per non-BSHD-compact operand (all when D pads).
+    staging = sum(ws_align(t.numel() // head_dim * d_pad * t.element_size()) for t in staged if d_pad != head_dim or not t.transpose(1, 2).is_contiguous())
+    return base + staging
 
 
 def _run_bwd_graph(
@@ -102,9 +110,11 @@ def _run_bwd_graph(
     is_causal: bool = False,
     causal_bottom_right: bool = False,
     window_size_left: int | None = None,
+    deterministic: bool = False,
     select: bool = True,
     q_tile: int | None = None,
     kv_tile: int | None = None,
+    grad_layout: str = "bshd",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, str]:
     """Build and execute the SM120 FROST backward graph; returns (dq, dk, dv, plan_name)."""
 
@@ -115,9 +125,9 @@ def _run_bwd_graph(
     io_dtype = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
     batch, h_q, _, head_dim = q_gpu.shape
     _, h_kv, _, _ = k_gpu.shape
-    dq_gpu = _bhsd(batch, h_q, q_gpu.shape[2], head_dim, dtype, empty=True)
-    dk_gpu = _bhsd(batch, h_kv, k_gpu.shape[2], head_dim, dtype, empty=True)
-    dv_gpu = _bhsd(batch, h_kv, v_gpu.shape[2], head_dim, dtype, empty=True)
+    dq_gpu = _bhsd(batch, h_q, q_gpu.shape[2], head_dim, dtype, empty=True, layout=grad_layout)
+    dk_gpu = _bhsd(batch, h_kv, k_gpu.shape[2], head_dim, dtype, empty=True, layout=grad_layout)
+    dv_gpu = _bhsd(batch, h_kv, v_gpu.shape[2], head_dim, dtype, empty=True, layout=grad_layout)
 
     graph = cudnn.pygraph(
         io_data_type=io_dtype,
@@ -147,6 +157,8 @@ def _run_bwd_graph(
         bwd_kwargs["use_causal_mask"] = True
     if window_size_left is not None:
         bwd_kwargs["sliding_window_length"] = window_size_left + 1
+    if deterministic:
+        bwd_kwargs["use_deterministic_algorithm"] = True
 
     dq, dk, dv = graph.sdpa_backward(**bwd_kwargs)
     dq.set_output(True).set_dim(dq_gpu.shape).set_stride(dq_gpu.stride())
@@ -178,7 +190,8 @@ def _run_bwd_graph(
 
     workspace_size = graph.get_workspace_size()
     if plan_name == ENGINE:
-        assert workspace_size == _expected_workspace_bytes(batch, h_q, q_gpu.shape[2], head_dim)
+        staged = (q_gpu, k_gpu, v_gpu, o_gpu, do_gpu, dq_gpu, dk_gpu, dv_gpu)
+        assert workspace_size == _expected_workspace_bytes(batch, h_q, q_gpu.shape[2], head_dim, staged)
     workspace = torch.empty(max(workspace_size, 1), dtype=torch.uint8, device="cuda")
 
     variant_pack = {
@@ -212,19 +225,22 @@ def _run_case(
     is_causal: bool = False,
     causal_bottom_right: bool = False,
     window_size_left: int | None = None,
+    deterministic: bool = False,
     select: bool = True,
     q_tile: int | None = None,
     kv_tile: int | None = None,
+    layout: str = "bshd",
+    grad_layout: str = "bshd",
 ) -> str:
     scale = 1.0 / math.sqrt(head_dim)
-    q = _bhsd(batch, heads, s_q, head_dim, dtype)
-    k = _bhsd(batch, heads, s_kv, head_dim, dtype)
-    v = _bhsd(batch, heads, s_kv, head_dim, dtype)
-    do = _bhsd(batch, heads, s_q, head_dim, dtype)
+    q = _bhsd(batch, heads, s_q, head_dim, dtype, layout=layout)
+    k = _bhsd(batch, heads, s_kv, head_dim, dtype, layout=layout)
+    v = _bhsd(batch, heads, s_kv, head_dim, dtype, layout=layout)
+    do = _bhsd(batch, heads, s_q, head_dim, dtype, layout=layout)
     o, stats, dq_ref, dk_ref, dv_ref = _ref_bwd(
         q, k, v, do, scale=scale, is_causal=is_causal, causal_bottom_right=causal_bottom_right, window_size_left=window_size_left
     )
-    o = _bhsd(batch, heads, s_q, head_dim, dtype, empty=True).copy_(o)
+    o = _bhsd(batch, heads, s_q, head_dim, dtype, empty=True, layout=layout).copy_(o)
     dq, dk, dv, plan_name = _run_bwd_graph(
         q,
         k,
@@ -236,9 +252,11 @@ def _run_case(
         is_causal=is_causal,
         causal_bottom_right=causal_bottom_right,
         window_size_left=window_size_left,
+        deterministic=deterministic,
         select=select,
         q_tile=q_tile,
         kv_tile=kv_tile,
+        grad_layout=grad_layout,
     )
     tol = _tolerances(dtype)
     torch.testing.assert_close(dq.float(), dq_ref.float(), **tol)
@@ -369,12 +387,232 @@ def test_sdpa_bwd_dsl_sm120_sliding_window_tails():
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("head_dim", [192, 256])
+@pytest.mark.parametrize("mask", ["dense", "causal_tl", "causal_br"])
+@torch_fork_set_rng(seed=12)
+def test_sdpa_bwd_dsl_sm120_large_d_wrapper(mask: str, head_dim: int):
+    """D>128: the graph API's hidden-dim surface stops at 128, so the graph
+    build must be rejected and the direct wrapper serves it (same fallback
+    pattern as the sq_gt_skv bottom-right case above)."""
+
+    _require_dsl()
+    import cudnn
+
+    is_causal = mask != "dense"
+    causal_bottom_right = mask == "causal_br"
+    try:
+        _run_case(head_dim=head_dim, is_causal=is_causal, causal_bottom_right=causal_bottom_right)
+        return
+    except cudnn.cudnnGraphNotSupportedError as exc:
+        assert "hidden_dim" in str(exc), f"unexpected graph rejection: {exc}"
+
+    from cudnn.sdpa.bwd.api_dsl import sdpa_bwd_wrapper_dsl_sm120
+
+    batch, heads, s_q, s_kv, dtype = 2, 4, 512, 512, torch.float16
+    scale = 1.0 / math.sqrt(head_dim)
+    q = _bhsd(batch, heads, s_q, head_dim, dtype)
+    k = _bhsd(batch, heads, s_kv, head_dim, dtype)
+    v = _bhsd(batch, heads, s_kv, head_dim, dtype)
+    do = _bhsd(batch, heads, s_q, head_dim, dtype)
+    o, stats, dq_ref, dk_ref, dv_ref = _ref_bwd(q, k, v, do, scale=scale, is_causal=is_causal, causal_bottom_right=causal_bottom_right)
+    o = _bhsd(batch, heads, s_q, head_dim, dtype, empty=True).copy_(o)
+    out = sdpa_bwd_wrapper_dsl_sm120(q, k, v, o, do, stats, is_causal=is_causal, causal_bottom_right=causal_bottom_right, scale_softmax=scale)
+    tol = _tolerances(dtype)
+    torch.testing.assert_close(out["dq_tensor"].float(), dq_ref.float(), **tol)
+    torch.testing.assert_close(out["dk_tensor"].float(), dk_ref.float(), **tol)
+    torch.testing.assert_close(out["dv_tensor"].float(), dv_ref.float(), **tol)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("head_dim", [40, 72, 120])
+@pytest.mark.parametrize("is_causal", [False, True], ids=["dense", "causal"])
+@torch_fork_set_rng(seed=13)
+def test_sdpa_bwd_dsl_sm120_padded_head_dim(head_dim: int, is_causal: bool):
+    """Non-bin head dims run zero-padded in the next bin via the graph path."""
+
+    _run_case(head_dim=head_dim, is_causal=is_causal)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("head_dim", [136, 200])
+@torch_fork_set_rng(seed=14)
+def test_sdpa_bwd_dsl_sm120_padded_head_dim_wrapper(head_dim: int):
+    """Non-bin head dims above the graph API's 128 cap: graph build is
+    rejected, the direct wrapper serves them zero-padded."""
+
+    _require_dsl()
+    import cudnn
+
+    try:
+        _run_case(head_dim=head_dim, is_causal=True)
+        return
+    except cudnn.cudnnGraphNotSupportedError as exc:
+        assert "hidden_dim" in str(exc), f"unexpected graph rejection: {exc}"
+
+    from cudnn.sdpa.bwd.api_dsl import sdpa_bwd_wrapper_dsl_sm120
+
+    batch, heads, s_q, s_kv, dtype = 2, 4, 512, 512, torch.float16
+    scale = 1.0 / math.sqrt(head_dim)
+    q = _bhsd(batch, heads, s_q, head_dim, dtype)
+    k = _bhsd(batch, heads, s_kv, head_dim, dtype)
+    v = _bhsd(batch, heads, s_kv, head_dim, dtype)
+    do = _bhsd(batch, heads, s_q, head_dim, dtype)
+    o, stats, dq_ref, dk_ref, dv_ref = _ref_bwd(q, k, v, do, scale=scale, is_causal=True)
+    o = _bhsd(batch, heads, s_q, head_dim, dtype, empty=True).copy_(o)
+    out = sdpa_bwd_wrapper_dsl_sm120(q, k, v, o, do, stats, is_causal=True, scale_softmax=scale)
+    tol = _tolerances(dtype)
+    torch.testing.assert_close(out["dq_tensor"].float(), dq_ref.float(), **tol)
+    torch.testing.assert_close(out["dk_tensor"].float(), dk_ref.float(), **tol)
+    torch.testing.assert_close(out["dv_tensor"].float(), dv_ref.float(), **tol)
+
+
+@pytest.mark.L0
 @torch_fork_set_rng(seed=5)
 def test_sdpa_bwd_dsl_sm120_auto_routing():
     """Without an explicit select, the eligible graph auto-routes to the engine."""
 
     plan_name = _run_case(head_dim=64, is_causal=True, select=False)
     assert plan_name == ENGINE
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=8)
+def test_sdpa_bwd_dsl_sm120_dense_flex_bhsd_contiguous():
+    """BHSD-contiguous operands (dense_flex): served via workspace-carved compact
+    staging copies — a gather for the inputs, a scatter-back for dQ/dK/dV."""
+
+    _run_case(head_dim=64, is_causal=True, layout="bhsd", grad_layout="bhsd")
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("mask", ["dense", "causal_tl", "causal_br", "swa"])
+@torch_fork_set_rng(seed=12)
+def test_sdpa_bwd_dsl_sm120_deterministic_numeric(mask: str):
+    """use_deterministic_algorithm=True routes to the engine and keeps parity
+    (default tolerances) for every mask family the kernel serves."""
+
+    _run_case(
+        s_q=384 if mask == "causal_br" else 512,
+        s_kv=1024 if mask == "causal_br" else 512,
+        head_dim=64,
+        is_causal=mask != "dense",
+        causal_bottom_right=mask == "causal_br",
+        window_size_left=127 if mask == "swa" else None,
+        deterministic=True,
+    )
+
+
+def _run_bitwise_case(n_runs: int = 3, **case_kwargs) -> None:
+    """Same inputs, ``n_runs`` independent graph runs: outputs must be bitwise equal."""
+
+    batch, heads, dtype = 2, 4, torch.float16
+    s_q = case_kwargs.pop("s_q", 1024)
+    s_kv = case_kwargs.pop("s_kv", 1024)
+    head_dim = case_kwargs.pop("head_dim", 64)
+    scale = 1.0 / math.sqrt(head_dim)
+    q = _bhsd(batch, heads, s_q, head_dim, dtype)
+    k = _bhsd(batch, heads, s_kv, head_dim, dtype)
+    v = _bhsd(batch, heads, s_kv, head_dim, dtype)
+    do = _bhsd(batch, heads, s_q, head_dim, dtype)
+    o, stats, _, _, _ = _ref_bwd(
+        q,
+        k,
+        v,
+        do,
+        scale=scale,
+        is_causal=case_kwargs.get("is_causal", False),
+        causal_bottom_right=case_kwargs.get("causal_bottom_right", False),
+        window_size_left=case_kwargs.get("window_size_left"),
+    )
+    o = _bhsd(batch, heads, s_q, head_dim, dtype, empty=True).copy_(o)
+    runs = [_run_bwd_graph(q, k, v, o, do, stats, scale=scale, deterministic=True, **case_kwargs) for _ in range(n_runs)]
+    dq0, dk0, dv0, _ = runs[0]
+    for run_i, (dq, dk, dv, _) in enumerate(runs[1:], start=1):
+        assert torch.equal(dq, dq0), f"run {run_i}: dQ is not bitwise reproducible"
+        assert torch.equal(dk, dk0), f"run {run_i}: dK is not bitwise reproducible"
+        assert torch.equal(dv, dv0), f"run {run_i}: dV is not bitwise reproducible"
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("mask", ["dense", "causal", "swa"])
+@torch_fork_set_rng(seed=13)
+def test_sdpa_bwd_dsl_sm120_deterministic_bitwise(head_dim: int, mask: str):
+    """Repeated deterministic runs are bitwise identical (dQ relay ordering)."""
+
+    _run_bitwise_case(
+        head_dim=head_dim,
+        is_causal=mask != "dense",
+        window_size_left=127 if mask == "swa" else None,
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=14)
+def test_sdpa_bwd_dsl_sm120_deterministic_bitwise_tails_knobs():
+    """Bitwise reproducibility with partial tails and a non-default tile knob."""
+
+    _run_bitwise_case(s_q=1000, s_kv=999, head_dim=64, is_causal=True, q_tile=128, kv_tile=64)
+
+
+def _run_wrapper_det_case(head_dim: int, *, s_q: int, s_kv: int, is_causal: bool, window_size_left: int | None, n_runs: int = 1):
+    """Deterministic run(s) through the direct wrapper (D>128 has no graph
+    surface); returns (outputs per run, references)."""
+
+    from cudnn.sdpa.bwd.api_dsl import sdpa_bwd_wrapper_dsl_sm120
+
+    batch, heads, dtype = 2, 4, torch.float16
+    scale = 1.0 / math.sqrt(head_dim)
+    q = _bhsd(batch, heads, s_q, head_dim, dtype)
+    k = _bhsd(batch, heads, s_kv, head_dim, dtype)
+    v = _bhsd(batch, heads, s_kv, head_dim, dtype)
+    do = _bhsd(batch, heads, s_q, head_dim, dtype)
+    o, stats, dq_ref, dk_ref, dv_ref = _ref_bwd(q, k, v, do, scale=scale, is_causal=is_causal, window_size_left=window_size_left)
+    o = _bhsd(batch, heads, s_q, head_dim, dtype, empty=True).copy_(o)
+    runs = [
+        sdpa_bwd_wrapper_dsl_sm120(q, k, v, o, do, stats, is_causal=is_causal, window_size_left=window_size_left, deterministic=True, scale_softmax=scale)
+        for _ in range(n_runs)
+    ]
+    return runs, (dq_ref, dk_ref, dv_ref)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=15)
+def test_sdpa_bwd_dsl_sm120_deterministic_large_d_numeric():
+    """Deterministic relay on the single-Q-buffer branch (D=256 -> q32,
+    Q_STAGES == 1): causal + sliding window + non-tile-multiple tails, vs ref."""
+
+    _require_dsl()
+    runs, (dq_ref, dk_ref, dv_ref) = _run_wrapper_det_case(256, s_q=1000, s_kv=1000, is_causal=True, window_size_left=127)
+    tol = _tolerances(torch.float16)
+    out = runs[0]
+    torch.testing.assert_close(out["dq_tensor"].float(), dq_ref.float(), **tol)
+    torch.testing.assert_close(out["dk_tensor"].float(), dk_ref.float(), **tol)
+    torch.testing.assert_close(out["dv_tensor"].float(), dv_ref.float(), **tol)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    ("head_dim", "mask"),
+    [(192, "causal"), (256, "causal"), (256, "swa")],
+)
+@torch_fork_set_rng(seed=16)
+def test_sdpa_bwd_dsl_sm120_deterministic_large_d_bitwise(head_dim: int, mask: str):
+    """Repeated deterministic runs are bitwise identical on the q32 large-D path."""
+
+    _require_dsl()
+    runs, _ = _run_wrapper_det_case(
+        head_dim,
+        s_q=1024,
+        s_kv=1024,
+        is_causal=mask != "dense",
+        window_size_left=127 if mask == "swa" else None,
+        n_runs=3,
+    )
+    first = runs[0]
+    for run_i, out in enumerate(runs[1:], start=1):
+        for grad in ("dq_tensor", "dk_tensor", "dv_tensor"):
+            assert torch.equal(out[grad], first[grad]), f"run {run_i}: {grad} is not bitwise reproducible (D={head_dim}, {mask})"
 
 
 @pytest.mark.L0

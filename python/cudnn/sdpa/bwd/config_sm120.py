@@ -9,9 +9,15 @@ from dataclasses import dataclass
 
 from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_FP16
 
-SEQ_Q_TILES = (64, 128)
+SEQ_Q_TILES = (32, 64, 128)
 SEQ_KV_TILES = (64, 128)
-SUPPORTED_HEAD_DIMS = (32, 64, 128)
+SUPPORTED_HEAD_DIMS = (32, 64, 128, 192, 256)
+
+
+def padded_head_dim(d: int) -> "int | None":
+    """Smallest native bin >= ``d``, or ``None`` when ``d`` exceeds every bin."""
+
+    return min((b for b in SUPPORTED_HEAD_DIMS if b >= d), default=None)
 
 
 @dataclass(frozen=True)
@@ -28,6 +34,7 @@ class TemplateParams:
     is_causal: bool = False
     causal_top_left: bool = False
     window_size_left: int | None = None
+    deterministic: bool = False
     use_pdl: bool = True
     q_tile: int = 0
     kv_tile: int = 0

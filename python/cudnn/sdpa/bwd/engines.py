@@ -113,6 +113,17 @@ class Capabilities:
     thd: bool = False
     cu_seq_len: bool = False  # cu_seq_len_q / cu_seq_len_kv prefix sums (no row serves these yet)
 
+    # Dense layout envelope this engine accepts:
+    #   "bshd"       — Q/K/V/O must be BSHD-physical (stride order 3,1,2,0).
+    #   "dense_flex" — any B/H/S stride permutation, padded (oversized)
+    #                  strides included, as long as the head dim is
+    #                  innermost-contiguous (stride 1) and the strides are
+    #                  non-broadcast / non-overlapping (facts.dense_layout;
+    #                  see graph_analyzer.dense_layout_ok). The DSL executor
+    #                  normalizes such tensors to the kernel's canonical
+    #                  BSHD-compact buffers (zero-copy when already BSHD).
+    layouts: frozenset[str] = frozenset({"bshd"})
+
     # Tuning-knob domains this engine's lowering honors (see SdpaBwdKnobs).
     tile_ms: frozenset[int] = frozenset()
     tile_ns: frozenset[int] = frozenset()
@@ -159,7 +170,13 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
         return "K/V/O/dO/dQ/dK/dV dtypes must match Q"
     if facts.h_q != facts.h_kv and not capabilities.gqa:
         return f"GQA / MQA is not supported (H_q={facts.h_q}, H_kv={facts.h_kv})"
-    if not facts.bshd_layout:
+    if "dense_flex" in capabilities.layouts:
+        if not facts.dense_layout:
+            return (
+                "Q/K/V/O/dO/dQ/dK/dV must have the head dim innermost-contiguous (stride 1) and "
+                "non-broadcast, non-overlapping strides (any B/H/S order, padded strides allowed)"
+            )
+    elif not facts.bshd_layout:
         return "Q/K/V/O/dO/dQ/dK/dV must be BSHD-physical (stride order 3,1,2,0)"
 
     for fact, cap, label in (
@@ -223,11 +240,14 @@ def _sm120_spec() -> EngineSpec:
         capabilities=Capabilities(
             sm_lo=_BLACKWELL_GEFORCE[0],
             sm_hi=_BLACKWELL_GEFORCE[1],
-            d=frozenset(_SM120_HEAD_DIMS),
+            # Any head size multipled of 8
+            d=frozenset(range(8, max(_SM120_HEAD_DIMS) + 1, 8)),
             dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
             causal=True,
             bottom_right=True,
             swa=True,
+            layouts=frozenset({"bshd", "dense_flex"}),
+            deterministic=True,
             tile_ms=frozenset(_SM120_Q_TILES),
             tile_ns=frozenset(_SM120_KV_TILES),
         ),
@@ -268,17 +288,13 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
     execute chain.
     """
 
-    # Canonical BSHD-physical geometry, fixed at build time from the facts.
-    # Deliberately NOT read back from the IR tensors at execute:
-    # ``build_operation_graph`` rewrites the backward node's K/V ports to
-    # transposed (B, H, D, S) views, so the live ``get_dim()`` after a native
-    # build would describe the transposed view while the underlying buffer
-    # keeps the user's canonical layout (which the bshd gate already proved).
-    def _bshd_geometry(b: int, h: int, s: int, d: int) -> tuple[tuple[int, ...], tuple[int, ...]]:
-        return (b, h, s, d), (s * h * d, d, h * d, 1)
-
-    q_geom = _bshd_geometry(facts.b, facts.h_q, facts.s_q, facts.d_qk)
-    kv_geom = _bshd_geometry(facts.b, facts.h_kv, facts.s_kv, facts.d_qk)
+    # Per-port geometry from facts.port_layouts, NOT the live IR tensors:
+    # build_operation_graph rewrites the backward node's K/V ports to
+    # transposed (B, H, D, S) views; the analyzer captured the geometry with
+    # that rewrite undone.
+    ports = {name: (tuple(dim), tuple(stride)) for name, dim, stride in facts.port_layouts}
+    q_geom, k_geom, v_geom, o_geom = ports["q"], ports["k"], ports["v"], ports["o"]
+    do_geom, dq_geom, dk_geom, dv_geom = ports["dO"], ports["dQ"], ports["dK"], ports["dV"]
     stats_geom = ((facts.b, facts.h_q, facts.s_q, 1), (facts.h_q * facts.s_q, facts.s_q, 1, 1))
 
     import torch
@@ -301,17 +317,18 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
 
     api = _adapter_sm120()(
         sample_q=_desc(q_geom, facts.dtype, "q"),
-        sample_k=_desc(kv_geom, facts.dtype, "k"),
-        sample_v=_desc(kv_geom, facts.dtype, "v"),
-        sample_o=_desc(q_geom, facts.dtype, "o"),
-        sample_do=_desc(q_geom, facts.dtype, "dO"),
+        sample_k=_desc(k_geom, facts.dtype, "k"),
+        sample_v=_desc(v_geom, facts.dtype, "v"),
+        sample_o=_desc(o_geom, facts.dtype, "o"),
+        sample_do=_desc(do_geom, facts.dtype, "dO"),
         sample_stats=_desc(stats_geom, torch.float32, "stats"),
-        sample_dq=_desc(q_geom, facts.dtype, "dQ"),
-        sample_dk=_desc(kv_geom, facts.dtype, "dK"),
-        sample_dv=_desc(kv_geom, facts.dtype, "dV"),
+        sample_dq=_desc(dq_geom, facts.dtype, "dQ"),
+        sample_dk=_desc(dk_geom, facts.dtype, "dK"),
+        sample_dv=_desc(dv_geom, facts.dtype, "dV"),
         is_causal=facts.causal,
         causal_bottom_right=facts.bottom_right,
         window_size_left=facts.window_left,
+        deterministic=facts.deterministic,
         scale_softmax=facts.scale,
         tile_m=requested.tile_m if requested is not None else None,
         tile_n=requested.tile_n if requested is not None else None,
@@ -338,12 +355,12 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
     )
 
     def _canonical_view(buf, geom):
-        """Reinterpret a variant-pack buffer through the canonical geometry.
+        """Reinterpret a variant-pack buffer through the port's geometry.
 
         cuDNN's execute contract treats variant-pack entries as raw storage
         laid out per the IR tensor descriptor — callers may hand in a torch
         tensor whose logical shape is anything with the right bytes. The DSL
-        executor consumes torch views, so rebuild the canonical view here.
+        executor consumes torch views, so rebuild the port-shaped view here.
         No-op when the caller already passed a matching view.
         """
         dim, stride = geom
@@ -355,14 +372,14 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
         resolved = ga.resolve_variant_pack(variant_pack, binding)
         api.execute(
             q_tensor=_canonical_view(resolved[id(binding.q)], q_geom),
-            k_tensor=_canonical_view(resolved[id(binding.k)], kv_geom),
-            v_tensor=_canonical_view(resolved[id(binding.v)], kv_geom),
-            o_tensor=_canonical_view(resolved[id(binding.o)], q_geom),
-            do_tensor=_canonical_view(resolved[id(binding.do)], q_geom),
+            k_tensor=_canonical_view(resolved[id(binding.k)], k_geom),
+            v_tensor=_canonical_view(resolved[id(binding.v)], v_geom),
+            o_tensor=_canonical_view(resolved[id(binding.o)], o_geom),
+            do_tensor=_canonical_view(resolved[id(binding.do)], do_geom),
             stats_tensor=_canonical_view(resolved[id(binding.stats)], stats_geom),
-            dq_tensor=_canonical_view(resolved[id(binding.dq)], q_geom),
-            dk_tensor=_canonical_view(resolved[id(binding.dk)], kv_geom),
-            dv_tensor=_canonical_view(resolved[id(binding.dv)], kv_geom),
+            dq_tensor=_canonical_view(resolved[id(binding.dq)], dq_geom),
+            dk_tensor=_canonical_view(resolved[id(binding.dk)], dk_geom),
+            dv_tensor=_canonical_view(resolved[id(binding.dv)], dv_geom),
             scale_softmax=facts.scale,
             # Scratch comes from the CALLER's workspace (never allocated
             # here): the dispatch sized/validated it against workspace_bytes;

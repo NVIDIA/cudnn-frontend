@@ -198,6 +198,9 @@ class SdpaGraphFacts:
     # strides — any B/H/S order, padded strides allowed (see dense_layout_ok).
     # The actual per-tensor stride tuples stay available via q_t/k_t/v_t/o_t.
     dense_layout: bool = True
+    # Backward only: (name, dim, stride) per rank-4 layout port, with the
+    # K/V transposed-port rewrite undone; () on forward graphs.
+    port_layouts: tuple = ()
     is_mxfp8: bool = False  # block-scale MXFP8 (FP8 Q/K/V + per-32-block E8M0 SF)
     is_fp8: bool = False  # per-tensor FP8 (FP8 Q/K/V + scalar descales)
     dtype_o: Optional[Any] = None  # O dtype as cudnn.data_type
@@ -538,6 +541,7 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         uniform_dtype=uniform,
         bshd_layout=bshd,
         dense_layout=dense_layout,
+        port_layouts=(tuple((name, dims[name], strides[name]) for name, _ in rank4_ports) if is_backward else ()),
         is_mxfp8=is_mxfp8,
         is_fp8=is_fp8,
         dtype_o=(o_dtype if _fp8_family else q_dtype),
