@@ -6,8 +6,8 @@ fp64 recurrent reference for GDN-2 (Gated DeltaNet v2) linear attention.
 
 GDN-2 generalizes GDN's scalar gates to three channel-wise gates: a per-key
 decay ``alpha_t = exp(g_t) in (0, 1]^K``, a per-key erase gate ``beta_t in
-R^K``, and a NEW per-value write gate ``w_t in R^V`` (``k``/``q`` already
-feature-mapped, ``q`` pre-scaled):
+R^K``, and a NEW per-value write gate ``w_t in R^V`` (``S_t`` is the
+recurrent state; ``k``/``q`` already feature-mapped, ``q`` pre-scaled):
 
     S_t = (I - k_t (beta_t . k_t)^T) Diag(alpha_t) S_{t-1} + k_t (w_t . v_t)^T
     o_t = q_t S_t
@@ -46,12 +46,12 @@ def rms_ratio(out: torch.Tensor, ref: torch.Tensor) -> float:
     return ((out - ref).pow(2).mean().sqrt() / ref.pow(2).mean().sqrt().clamp_min(1e-12)).item()
 
 
-def _recurrent_dense(q, k, v, alpha, beta, w, S0):
-    """Dense recurrence in [B, HV, T, *] layout, fp64. Returns (o, S_T).
+def _recurrent_dense(q, k, v, alpha, beta, w, state0):
+    """Dense recurrence in [B, HV, T, *] layout, fp64. Returns (o, final state).
 
     alpha, beta: per-key-channel [B, HV, T, K]; w: per-value-channel [B, HV, T, V]."""
     T = q.shape[2]
-    S = S0
+    state = state0
     outs = []
     for t in range(T):
         kt = k[:, :, t, :]  # [B, HV, K]
@@ -59,12 +59,12 @@ def _recurrent_dense(q, k, v, alpha, beta, w, S0):
         at = alpha[:, :, t, :]  # [B, HV, K]  (= exp(g_t))
         bt = beta[:, :, t, :]  # [B, HV, K]
         wt = w[:, :, t, :]  # [B, HV, V]
-        S = at[..., None] * S  # per-K-channel decay first
-        erase = ((bt * kt).unsqueeze(-2) @ S).squeeze(-2)  # (beta . k)^T S_dec: [B, HV, V]
+        state = at[..., None] * state  # per-K-channel decay first
+        erase = ((bt * kt).unsqueeze(-2) @ state).squeeze(-2)  # (beta . k)^T on the decayed state: [B, HV, V]
         v_new = wt * vt - erase
-        S = S + kt.unsqueeze(-1) @ v_new.unsqueeze(-2)  # k (x) v_new
-        outs.append((q[:, :, t, :].unsqueeze(-2) @ S).squeeze(-2))
-    return torch.stack(outs, dim=2), S
+        state = state + kt.unsqueeze(-1) @ v_new.unsqueeze(-2)  # k (x) v_new
+        outs.append((q[:, :, t, :].unsqueeze(-2) @ state).squeeze(-2))
+    return torch.stack(outs, dim=2), state
 
 
 def gdn2_reference(
@@ -126,11 +126,11 @@ def gdn2_reference(
     if cu_seqlens is None:
         B = q.shape[0]
         if initial_state is None:
-            S0 = torch.zeros(B, HV, K, V, dtype=torch.float64, device=q.device)
+            state0 = torch.zeros(B, HV, K, V, dtype=torch.float64, device=q.device)
         else:
-            S0 = initial_state.double()
-        o, S = _recurrent_dense(qf, kf, vf, alphaf, betaf, wf, S0)
-        return o.permute(0, 2, 1, 3), S
+            state0 = initial_state.double()
+        o, state = _recurrent_dense(qf, kf, vf, alphaf, betaf, wf, state0)
+        return o.permute(0, 2, 1, 3), state
 
     assert q.shape[0] == 1, "cu_seqlens requires packed batch B == 1"
     bounds = cu_seqlens.tolist()
@@ -138,15 +138,15 @@ def gdn2_reference(
     for n in range(len(bounds) - 1):
         s, e = bounds[n], bounds[n + 1]
         if initial_state is None:
-            S0 = torch.zeros(1, HV, K, V, dtype=torch.float64, device=q.device)
+            state0 = torch.zeros(1, HV, K, V, dtype=torch.float64, device=q.device)
         else:
-            S0 = initial_state[n : n + 1].double()
+            state0 = initial_state[n : n + 1].double()
         if e == s:
-            states.append(S0)
+            states.append(state0)
             continue
-        o_n, S_n = _recurrent_dense(qf[:, :, s:e], kf[:, :, s:e], vf[:, :, s:e], alphaf[:, :, s:e], betaf[:, :, s:e], wf[:, :, s:e], S0)
+        o_n, state_n = _recurrent_dense(qf[:, :, s:e], kf[:, :, s:e], vf[:, :, s:e], alphaf[:, :, s:e], betaf[:, :, s:e], wf[:, :, s:e], state0)
         outs.append(o_n)
-        states.append(S_n)
+        states.append(state_n)
     if outs:
         o = torch.cat(outs, dim=2).permute(0, 2, 1, 3)
     else:

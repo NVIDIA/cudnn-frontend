@@ -480,6 +480,55 @@ def mma_step(
 
 
 @cute.jit
+def mma_step_k8(
+    acc,
+    a_frag,
+    b_frag,
+    *,
+    k_step: cutlass.Constexpr[int],
+    M: cutlass.Constexpr[int],
+    N: cutlass.Constexpr[int],
+    ab_dtype: cutlass.Constexpr[Type[cutlass.Numeric]] = cutlass.Float16,
+):
+    if cutlass.const_expr(M % 16 != 0):
+        raise ValueError(f"mma_step_k8: M must be a multiple of 16, got M={M}")
+    if cutlass.const_expr(ab_dtype != cutlass.Float16 and ab_dtype != cutlass.BFloat16):
+        raise TypeError(f"mma_step_k8: ab_dtype must be Float16 or BFloat16, got {ab_dtype}")
+    M_BLOCKS = M // 16
+    N_FRAGS = N // 8
+    a_stride = len(a_frag) // M_BLOCKS
+
+    ab_tag = "f16" if cutlass.const_expr(ab_dtype == cutlass.Float16) else "bf16"
+    mma_ptx = f"mma.sync.aligned.m16n8k8.row.col.f32.{ab_tag}.{ab_tag}.f32" " {$0,$1,$2,$3}, {$4,$5}, {$6}, {$7,$8,$9,$10};"
+
+    for m_block in cutlass.range_constexpr(M_BLOCKS):
+        a_off = m_block * a_stride + k_step * 2
+        a0 = a_frag[a_off + 0]
+        a1 = a_frag[a_off + 1]
+        acc_base = m_block * N_FRAGS * 4
+        for n_frag in cutlass.range_constexpr(N_FRAGS):
+            b0 = b_frag[n_frag]
+            s_off = acc_base + n_frag * 4
+            c0, c1, c2, c3 = inline_ptx(
+                mma_ptx,
+                write_only_types=[cutlass.Float32, cutlass.Float32, cutlass.Float32, cutlass.Float32],
+                read_only_args=[
+                    a0,
+                    a1,
+                    b0,
+                    acc[s_off + 0],
+                    acc[s_off + 1],
+                    acc[s_off + 2],
+                    acc[s_off + 3],
+                ],
+            )
+            acc[s_off + 0] = c0
+            acc[s_off + 1] = c1
+            acc[s_off + 2] = c2
+            acc[s_off + 3] = c3
+
+
+@cute.jit
 def mma(
     acc,
     a_frag,

@@ -99,6 +99,14 @@ def dtype_name(buf) -> str:
     return str(buf.dtype).split(".")[-1]
 
 
+def data_ptr(buf) -> int:
+    """Device address of a tensor-like (``data_ptr()`` or the CUDA array interface)."""
+    fn = getattr(buf, "data_ptr", None)
+    if fn is not None:
+        return fn()
+    return buf.__cuda_array_interface__["data"][0]
+
+
 class DeviceView:
     """Zero-copy DLPack view over a raw CUDA pointer.
 
@@ -288,6 +296,23 @@ def is_contiguous(shape, strides) -> bool:
     return True
 
 
+def dense_layout_ok(shape, strides) -> bool:
+    """Relaxed layout soundness (rank-agnostic, size-1 dims wildcarded):
+    innermost dim stride-1, no zero stride on a size>1 dim, non-overlapping
+    strides (padded / permuted outer strides allowed)."""
+    if strides is None:
+        return True
+    if shape[-1] != 1 and strides[-1] != 1:
+        return False
+    active = sorted((int(st), int(sz)) for st, sz in zip(strides, shape) if sz != 1)
+    span = 1
+    for st, sz in active:
+        if st < span:
+            return False
+        span = st * sz
+    return True
+
+
 def memset_zero_async(ptr: int, nbytes: int, stream) -> None:
     """Stream-ordered zero-fill of a device range via ``cuda.bindings``."""
     from cuda.bindings import runtime as _rt
@@ -455,7 +480,10 @@ def cutedsl_state():
     ``version`` is ``(distribution, version)`` or None: the public wheel is
     nvidia-cutlass-dsl, internal RCs ship as nvidia-cutlass-dsl-internal, and
     the two number themselves differently. Presence is what gates; the pair only
-    refines the message and feeds :func:`cutedsl_too_old`.
+    refines the message and feeds :func:`cutedsl_too_old`. The internal dist is
+    checked first: when both are installed the RC's packages shadow the public
+    wheel on sys.path, and a stale public version string must not veto a
+    machine that works.
     """
     global _DSL_STATE
     if _DSL_STATE is None:
@@ -467,7 +495,7 @@ def cutedsl_state():
         except (ImportError, ValueError):
             installed = False
         version = None
-        for dist in ("nvidia-cutlass-dsl", "nvidia-cutlass-dsl-internal"):
+        for dist in ("nvidia-cutlass-dsl-internal", "nvidia-cutlass-dsl"):
             try:
                 version = (dist, importlib.metadata.version(dist))
                 break

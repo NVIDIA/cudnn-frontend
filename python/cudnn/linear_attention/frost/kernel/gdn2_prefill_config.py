@@ -57,7 +57,7 @@ class Cfg:
     SMEM_SCHED_STAGES: int = 8
     SMEM_O_STAGES: int = 2
     SMEM_DECAY_STAGES: int = 2
-    SMEM_PAIRWISE_STAGES: int = 2
+    SMEM_QK_STAGES: int = 2
     SMEM_STATE_SCALE_DIAG_STAGES: int = 3
     QK_SCALE_READY_STAGES: int = 3
     TMEM_Q_STATE_ACC_STAGES: int = 2

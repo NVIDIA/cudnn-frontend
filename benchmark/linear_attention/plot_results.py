@@ -30,6 +30,9 @@ BACKEND_CONFIG = {
     "cudnn": {"name": "cuDNN", "color": "#76b900", "order": 2},
 }
 
+# Backends dropped from every chart (rows may still exist in older CSVs).
+UNAVAILABLE_BACKENDS = ("flash_kda",)
+
 LABEL_FONT_SIZE = 10
 LEGEND_FONT_SIZE = 8
 TITLE_FONT_SIZE = 12
@@ -60,10 +63,13 @@ def get_backend_display_name(backend: str, cudnn_version: str = None) -> str:
     return base_name
 
 
-def generate_charts(df: pd.DataFrame, output_dir: Path, gpu_name: str = "", cudnn_version: str = None, variant: str = "gdn", batch_sizes: list = None) -> list:
+def generate_charts(
+    df: pd.DataFrame, output_dir: Path, gpu_name: str = "", cudnn_version: str = None, variant: str = "gdn", batch_sizes: list = None, x_axis: str = "seqlen"
+) -> list:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     df = df[df["variant"] == variant].copy()
+    df = df[~df["backend"].isin(UNAVAILABLE_BACKENDS)].copy()
     if batch_sizes:
         df = df[df["batch_size"].isin(batch_sizes)].copy()
     if df.empty:
@@ -76,10 +82,13 @@ def generate_charts(df: pd.DataFrame, output_dir: Path, gpu_name: str = "", cudn
     for _, row in df[["backend", "backend_display"]].drop_duplicates().iterrows():
         palette[row["backend_display"]] = BACKEND_CONFIG.get(row["backend"], {}).get("color", "gray")
 
+    x_col, group_col = ("seqlen", "batch_size") if x_axis == "seqlen" else ("batch_size", "seqlen")
+    x_label = "Sequence Length" if x_axis == "seqlen" else "Batch Size"
+
     saved_paths = []
-    for batch_size in sorted(df["batch_size"].unique()):
-        sub = df[df["batch_size"] == batch_size].copy()
-        sub.sort_values(["seqlen", "backend_order"], inplace=True)
+    for group_val in sorted(df[group_col].unique()):
+        sub = df[df[group_col] == group_val].copy()
+        sub.sort_values([x_col, "backend_order"], inplace=True)
         hue_order = list(sub.sort_values("backend_order")["backend_display"].drop_duplicates())
 
         fwd_df = sub[sub["fwd_tflops"] > 0]
@@ -99,8 +108,9 @@ def generate_charts(df: pd.DataFrame, output_dir: Path, gpu_name: str = "", cudn
         heads = sub["num_q_heads"].iloc[0]
         head_dim = sub["head_dim"].iloc[0]
         gpu_info = f" ({gpu_name})" if gpu_name else ""
+        group_label = f"Batch = {group_val}" if x_axis == "seqlen" else f"SeqLen = {group_val}"
         fig.suptitle(
-            f"{variant.upper()} Linear Attention (BF16) — Batch = {batch_size}, Heads = {heads}, d = {head_dim}{gpu_info}",
+            f"{variant.upper()} Linear Attention (BF16) — {group_label}, Heads = {heads}, d = {head_dim}{gpu_info}",
             fontsize=TITLE_FONT_SIZE,
         )
 
@@ -112,7 +122,7 @@ def generate_charts(df: pd.DataFrame, output_dir: Path, gpu_name: str = "", cudn
                 continue
             sns.barplot(
                 data=pass_df,
-                x="seqlen",
+                x=x_col,
                 y=y_col,
                 hue="backend_display",
                 hue_order=hue_order,
@@ -122,7 +132,7 @@ def generate_charts(df: pd.DataFrame, output_dir: Path, gpu_name: str = "", cudn
                 linewidth=0.5,
                 errorbar=None,
             )
-            ax.set_xlabel("Sequence Length", fontsize=LABEL_FONT_SIZE)
+            ax.set_xlabel(x_label, fontsize=LABEL_FONT_SIZE)
             ax.set_ylabel("TFLOPS", fontsize=LABEL_FONT_SIZE)
             ax.set_title(pass_name, fontsize=TITLE_FONT_SIZE)
             ax.legend(title="Backend", fontsize=LEGEND_FONT_SIZE)
@@ -131,7 +141,9 @@ def generate_charts(df: pd.DataFrame, output_dir: Path, gpu_name: str = "", cudn
                 ax.bar_label(container, fmt="%.0f", fontsize=BAR_LABEL_FONT_SIZE)
 
         plt.tight_layout()
-        output_path = output_dir / f"{variant}_b{batch_size}.png"
+        gv = int(group_val)
+        stem = f"{variant}_b{gv}" if x_axis == "seqlen" else f"{variant}_t{gv}_bsweep"
+        output_path = output_dir / f"{stem}.png"
         plt.savefig(output_path, dpi=150, bbox_inches="tight")
         plt.close()
         saved_paths.append(output_path)
@@ -148,6 +160,7 @@ def main():
     parser.add_argument("--cudnn-version", default=None, help="cuDNN backend version for the legend (e.g. 9.24.0)")
     parser.add_argument("--variant", default="gdn", help="Linear attention variant to plot")
     parser.add_argument("--batch-sizes", default=None, help="Comma-separated batch sizes to plot (default: all in the CSV)")
+    parser.add_argument("--x-axis", default="seqlen", choices=("seqlen", "batch"), help="Bar-group axis: seqlen (one chart per batch) or batch (one chart per seqlen)")
     args = parser.parse_args()
     batch_sizes = [int(b) for b in args.batch_sizes.split(",")] if args.batch_sizes else None
 
@@ -157,7 +170,7 @@ def main():
         raise ValueError(f"CSV is missing expected columns: {missing}")
 
     output_dir = args.output_dir if args.output_dir is not None else args.csv.parent
-    generate_charts(df, output_dir, gpu_name=args.gpu_name, cudnn_version=args.cudnn_version, variant=args.variant, batch_sizes=batch_sizes)
+    generate_charts(df, output_dir, gpu_name=args.gpu_name, cudnn_version=args.cudnn_version, variant=args.variant, batch_sizes=batch_sizes, x_axis=args.x_axis)
 
 
 if __name__ == "__main__":

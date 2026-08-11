@@ -23,14 +23,23 @@ class PipelineState(NamedTuple):
         return cls(idx=cutlass.Int32(0), phase=cutlass.Int32(phase))
 
 
-def advance(state, stages):
-    if stages < 1:
+@cute.jit
+def advance(state, stages, step: int = 1):
+    if cutlass.const_expr(stages < 1):
         raise ValueError(f"PipelineState.advance requires stages >= 1, got {stages}")
-    incr = state.idx + cutlass.Int32(1)
-    stages_i = cutlass.Int32(stages)
-    new_idx = incr % stages_i
-    flip = incr // stages_i
-    new_phase = state.phase ^ flip
+    incr = state.idx + cutlass.Int32(step)
+    if cutlass.const_expr(stages & (stages - 1) == 0 or step > stages):
+        # pow2 folds to mask+shift; >1-wrap steps need the divmod
+        stages_i = cutlass.Int32(stages)
+        new_idx = incr % stages_i
+        flip = (incr // stages_i) & cutlass.Int32(1)
+        new_phase = state.phase ^ flip
+    else:
+        # non-pow2, at most one wrap: compare-select beats the magic-multiply
+        wrapped = incr >= cutlass.Int32(stages)
+        new_idx = incr - cutlass.Int32(stages) if wrapped else incr
+        flip = cutlass.Int32(1) if wrapped else cutlass.Int32(0)
+        new_phase = state.phase ^ flip
     return PipelineState(idx=new_idx, phase=new_phase)
 
 
@@ -210,8 +219,14 @@ class MBarrier:
             arrive_expect_tx(self.smem_ptr, n_bytes, pred=pred)
 
         elif cutlass.const_expr(self.producer == int(Producer.MMA_COMMIT)):
+            # commit barriers take tcgen05 commits ONLY; mixing thread arrives
+            # onto a commit barrier is banned (split into a THREAD sibling)
             if cta_group is None:
-                raise TypeError("MBarrier(producer=MMA_COMMIT).arrive() requires " "cta_group= (Python compile-time int).")
+                raise TypeError(
+                    "MBarrier(producer=MMA_COMMIT) only accepts the commit form "
+                    "(.arrive(cta_group=...)). Thread arrivals must go to a "
+                    "separate MBarrier(producer=THREAD) sibling; waiters wait both."
+                )
             commit_mma(self.smem_ptr, mcast_mask, cta_group, pred=pred)
 
         else:

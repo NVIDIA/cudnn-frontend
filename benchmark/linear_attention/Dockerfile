@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-FROM nvcr.io/nvidia/pytorch:26.03-py3
+FROM nvcr.io/nvidia/pytorch:26.07-py3
 
 # Set working directory
 WORKDIR /workspace
@@ -25,6 +25,10 @@ RUN pip install nvidia-cutlass-dsl[cu13]==4.7.0 apache-tvm-ffi flash-linear-atte
 # Install FlashQLA from source.
 RUN git clone https://github.com/QwenLM/FlashQLA.git
 RUN pip install -v /workspace/FlashQLA
+
+# Install FlashKDA from source.
+RUN git clone https://github.com/MoonshotAI/FlashKDA.git
+RUN pip install -v /workspace/FlashKDA
 
 # Install the chart dependencies for plot_results.py
 RUN pip install pandas matplotlib seaborn

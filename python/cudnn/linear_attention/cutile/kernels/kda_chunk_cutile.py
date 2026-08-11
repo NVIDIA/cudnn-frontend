@@ -21,12 +21,10 @@ import os
 from types import SimpleNamespace
 
 import cuda.tile as ct
-
-from .common import add_inplace, head_group_sum, reshaped, sum_leading, zero_fill
-from cudnn.frost.buffers import dtype_name as _dtname
-
-_F32_DEFAULT = "float32-default"
 from cuda.tile.tune import exhaustive_search
+
+from .common import dev_id, dummy, head_group_sum, opt, reshaped, sum_leading, zero_fill
+from cudnn.frost.buffers import dtype_name as dtname
 
 logger = logging.getLogger(__name__)
 
@@ -35,22 +33,21 @@ ConstInt = ct.Constant[int]
 RCP_LN2 = 1.4426950216  # 1/ln(2)
 
 # chunk size (BT tile) of these kernels; the engine's carve layout imports it
-_BT = 64
+BT_CHUNK = 64
 
 
 # ---------------------------------------------------------------------------
-# Launch-hint autotune (mirrors the sibling GDN
-# cuTile kernels). Only the @ct.kernel launch hints
+# Launch-hint autotune. Only the @ct.kernel launch hints
 # (occupancy x num_worker_warps) are explored via kernel.replace_hints(...);
 # the grid / args / algorithm are kept UNCHANGED. The first config in every
 # grid equals the kernel default (occupancy=1, num_worker_warps=4) so any shape
 # that does not improve keeps the original behaviour (no regression).
 # ---------------------------------------------------------------------------
-_DISABLE_TUNE = os.environ.get("DISABLE_TUNE", "") not in ("", "0")
-_launch_hint_cache: dict = {}
+DISABLE_TUNE = os.environ.get("DISABLE_TUNE", "") not in ("", "0")
+launch_hint_cache: dict = {}
 
 
-def _launch_hint_configs(occ_choices, nww_choices=(4, 8)):
+def launch_hint_configs(occ_choices, nww_choices=(4, 8)):
     """occupancy x num_worker_warps grid; deduped, default (occ=1,nww=4) first."""
     seen = set()
     cfgs = []
@@ -64,7 +61,7 @@ def _launch_hint_configs(occ_choices, nww_choices=(4, 8)):
     return cfgs
 
 
-def _autotuned_launch(kernel, cache_key, grid, args, occ_choices=(1, 2, 3, 4), nww_choices=(4, 8), timeout=30, stream=None):
+def autotuned_launch(kernel, cache_key, grid, args, occ_choices=(1, 2, 3, 4), nww_choices=(4, 8), timeout=30, stream=None):
     """Launch ``kernel`` with the best launch hints for ``cache_key``.
 
     Tune-once/cache/launch over launch hints only (grid, args and signature are
@@ -73,14 +70,14 @@ def _autotuned_launch(kernel, cache_key, grid, args, occ_choices=(1, 2, 3, 4), n
     no-improvement shape keeps the base behaviour.
     """
     stream = 0 if stream is None else stream
-    if _DISABLE_TUNE:
+    if DISABLE_TUNE:
         ct.launch(stream, grid, kernel, args)
         return
 
-    if cache_key not in _launch_hint_cache:
+    if cache_key not in launch_hint_cache:
         tuned = None
         try:
-            configs = _launch_hint_configs(occ_choices, nww_choices)
+            configs = launch_hint_configs(occ_choices, nww_choices)
             with ct.compiler_timeout(timeout):
                 result = exhaustive_search(
                     configs,
@@ -94,16 +91,16 @@ def _autotuned_launch(kernel, cache_key, grid, args, occ_choices=(1, 2, 3, 4), n
             tuned = kernel.replace_hints(occupancy=best.occupancy, num_worker_warps=best.num_worker_warps)
         except Exception:
             tuned = None
-        _launch_hint_cache[cache_key] = tuned
+        launch_hint_cache[cache_key] = tuned
 
-    tuned = _launch_hint_cache[cache_key]
+    tuned = launch_hint_cache[cache_key]
     if tuned is None:
         ct.launch(stream, grid, kernel, args)
     else:
         ct.launch(stream, grid, tuned, args)
 
 
-def _autotuned_launch_bv(kernel, cache_key, bv_choices, grid_fn, args_fn, timeout=40, stream=None):
+def autotuned_launch_bv(kernel, cache_key, bv_choices, grid_fn, args_fn, timeout=40, stream=None):
     """Launch ``kernel`` autotuning over BV (the V-tile block width) only.
 
     BV is a kernel ConstInt that drives the grid V-fan-out and the V-tile shapes
@@ -114,30 +111,21 @@ def _autotuned_launch_bv(kernel, cache_key, bv_choices, grid_fn, args_fn, timeou
     BV is cached and the BV-specialized kernel re-launched on every subsequent
     call. ``bv_choices[0]`` is the safe fallback on DISABLE_TUNE / tuning failure.
 
-    Why BV is the dominant fwd_h lever and why the sweep is BV-ONLY: the state
-    scan is register-bound (255 reg/thread -> ~1 block/SM) with a serial per-CTA
-    NT inter-chunk loop, so the only parallelism lever is the V-tile CTA count
-    (grid = (cdiv(V, BV), N*HV)). ncu on the dashboard shapes shows the optimum
-    is NOT monotone in BV: at (T=2048,V=128,N*HV=64) BV=64 (grid 128, warps_active
-    14%) fwd_h=246us beats BV=32 (grid 256, 8%) 290us and BV=16 374us -- fewer,
-    fatter CTAs win once the grid already fills the SMs, because a smaller BV just
-    multiplies redundant k/w/g reloads; at (T=1024,V=64,N*HV=64) BV=32 (grid 128)
-    65us beats BV=64 (grid 64, under-filled) 123us and BV=8 123us. Crucially the
-    occupancy/num_worker_warps hint is nearly inert here (per-BV best occ/nww is
-    within ~0.3% of default), so we do NOT cross occ x nww into this search:
-    doing so inflated it to 16 configs and the larger exhaustive_search do_bench
-    mis-ranked BV (it picked BV=32 for the 2048 shape even though a direct
-    BV=64/occ-tuned run is 15% faster). A clean 4-config BV-only sweep -- mirroring
-    the kda_chunk_fwd helper's ``_tuned_launch_fwdh_bv`` -- ranks BV correctly
-    (picks 64 for the 2048 shape, 32 for the 1024 shape).
+    Why the sweep is BV-ONLY: the state scan is register-bound (255 reg/thread
+    -> ~1 block/SM) with a serial per-CTA NT inter-chunk loop, so the only
+    parallelism lever is the V-tile CTA count (grid = (cdiv(V, BV), N*HV)).
+    The optimum is NOT monotone in BV (a smaller BV multiplies redundant K/W/G
+    reloads once the grid already fills the SMs), and the occupancy x
+    num_worker_warps hint is nearly inert per BV -- do NOT cross occ x nww into
+    this search (the larger sweep mis-ranks BV).
     """
     stream = 0 if stream is None else stream
-    if _DISABLE_TUNE:
+    if DISABLE_TUNE:
         bv = bv_choices[0]
         ct.launch(stream, grid_fn(bv), kernel, args_fn(bv))
         return
 
-    if cache_key not in _launch_hint_cache:
+    if cache_key not in launch_hint_cache:
         chosen = None
         try:
             configs = [SimpleNamespace(BV=bv) for bv in bv_choices]
@@ -153,9 +141,9 @@ def _autotuned_launch_bv(kernel, cache_key, bv_choices, grid_fn, args_fn, timeou
             chosen = result.best.config.BV
         except Exception:
             chosen = None
-        _launch_hint_cache[cache_key] = chosen
+        launch_hint_cache[cache_key] = chosen
 
-    chosen = _launch_hint_cache[cache_key]
+    chosen = launch_hint_cache[cache_key]
     bv = bv_choices[0] if chosen is None else chosen
     ct.launch(stream, grid_fn(bv), kernel, args_fn(bv))
 
@@ -165,55 +153,20 @@ def _autotuned_launch_bv(kernel, cache_key, bv_choices, grid_fn, args_fn, timeou
 # ===========================================================================
 
 
-def _cdiv(a: int, b: int) -> int:
+def cdiv(a: int, b: int) -> int:
     return (a + b - 1) // b
 
 
-def _next_power_of_2(n: int) -> int:
+def next_power_of_2(n: int) -> int:
     return 1 << (n - 1).bit_length()
 
 
-def _dev_id(buf) -> int:
-    """Device ordinal of a DLPack/CAI buffer."""
-    from cudnn.frost.buffers import probe
-
-    return probe(buf)[4]
-
-
-def _dummy(dtype_name: str, bufs):
-    """Inert typed view over the workspace's 16-byte ``dummy`` carve, for
-    ABSENT optional kernel args (always paired with a flag==0, never
-    dereferenced). Dtype-bound so the compiled signature stays stable; the
-    library allocates nothing."""
-    from cudnn.frost.buffers import DTYPE_ITEMSIZE, DeviceView
-
-    d = bufs["dummy"]
-    return DeviceView(d.data_ptr(), (16 // DTYPE_ITEMSIZE[dtype_name],), dtype_name, d.__dlpack_device__()[1])
-
-
-def _i32(t):
-    if not str(t.dtype).endswith("int32"):
-        raise TypeError(f"index/boundary buffers must be int32 (callers convert), got {t.dtype}")
-    return t
-
-
-def _opt(t, bufs, dtype_name: str = "float32"):
-    """Resolve an optional tensor argument to a non-null cuTile launch arg:
-    the buffer if present (contiguous by the engine contract), else an inert
-    dummy (paired with a USE_*/HAS_* integer flag). cuTile never accepts None
-    in launch args, so this is the required dummy-tensor-plus-flag pattern."""
-    if t is None:
-        return _dummy(dtype_name, bufs)
-    return t
-
-
-def _i32_flat(t):
-    """Required index buffer: int32 guard + flat 1-D view. Kernels index these
+def i32_flat(t):
+    """Required index buffer as a flat 1-D view. Kernels index these
     via flat loads (e.g. chunk_indices[i_t*2]); chunk_indices is (NT, 2) and
     its row-major flat layout is [seg0, intra0, seg1, intra1, ...]."""
     from .common import reshaped
 
-    t = _i32(t)
     n = 1
     for s_ in t.shape:
         n *= int(s_)
@@ -225,7 +178,7 @@ def _i32_flat(t):
 # ``bufs`` and passes outputs via ``out=``; nothing here allocates.
 
 
-def _cast(bufs, name, src, ref, stream=None):
+def cast(bufs, name, src, ref, stream=None):
     """Dtype cast at the gradient boundary, through the ``bufs[name]`` carve."""
     if str(src.dtype).split(".")[-1] == str(ref.dtype).split(".")[-1]:
         return src
@@ -237,37 +190,6 @@ def _cast(bufs, name, src, ref, stream=None):
         n *= int(s_)
     cast_copy(reshaped(dst, (n,)), reshaped(src, (n,)), n, stream=0 if stream is None else stream)
     return dst
-
-
-def _i32(t):
-    if not str(t.dtype).endswith("int32"):
-        raise TypeError(f"index/boundary buffers must be int32 (callers convert), got {t.dtype}")
-    return t
-
-
-def _opt(t, device_id, dtype_name: str = "float32"):
-    """Resolve an optional tensor argument to a non-null cuTile launch arg:
-    the buffer if present (contiguous by the engine contract), else an inert
-    dummy (paired with a USE_*/HAS_* integer flag). cuTile never accepts None
-    in launch args, so this is the required dummy-tensor-plus-flag pattern."""
-    if t is None:
-        return _dummy(dtype_name, device_id)
-    return t
-
-
-def _opt_i32(t, device_id):
-    if t is None:
-        return _dummy("int32", device_id)
-    # Kernels index these via flat 1-D loads (e.g. chunk_indices[i_t*2]); flatten
-    # so the cuTile load index rank (1) matches. chunk_indices is (NT, 2) and its
-    # row-major flat layout is [seg0, intra0, seg1, intra1, ...] as expected.
-    from .common import reshaped
-
-    t = _i32(t)
-    n = 1
-    for s_ in t.shape:
-        n *= int(s_)
-    return reshaped(t, (n,))
 
 
 # ===========================================================================
@@ -288,33 +210,33 @@ def softplus(x):
     return ct.where(x <= 20.0, ct.log(1.0 + ct.exp(x)), x)
 
 
-def _tf32(a):
+def tf32(a):
     """ct.mma/ct.matmul do not auto-cast fp32 operands to tf32; cast
     explicitly (allow-tf32 matmul semantics)."""
     return ct.astype(a, ct.tfloat32) if a.dtype == ct.float32 else a
 
 
-def _mma_operands(a, b):
+def mma_operands(a, b):
     # ct.mma/ct.matmul require matching operand dtypes. Forward callers always
     # pass matched dtypes (left unchanged here); some backward callers mix bf16
-    # with fp32, so promote both to fp32 in that case. Then apply the tf32 guard.
+    # with fp32, so promote both to fp32 in that case.
     if a.dtype != b.dtype:
         a = ct.astype(a, ct.float32)
         b = ct.astype(b, ct.float32)
-    return _tf32(a), _tf32(b)
+    return tf32(a), tf32(b)
 
 
 def safe_matmul(a, b):
     # tf32 is only the multiply precision; ct.matmul returns a tf32 tile which
     # is a restricted dtype (no elementwise arithmetic). Cast the result back to
     # fp32 so downstream adds work (fp32 dot-accumulator semantics).
-    aa, bb = _mma_operands(a, b)
+    aa, bb = mma_operands(a, b)
     out = ct.matmul(aa, bb)
     return ct.astype(out, ct.float32) if out.dtype != ct.float32 else out
 
 
 def safe_mma(a, b, acc):
-    aa, bb = _mma_operands(a, b)
+    aa, bb = mma_operands(a, b)
     return ct.mma(aa, bb, acc)
 
 
@@ -322,9 +244,7 @@ def bf16_mma(a, b, acc):
     # Like safe_mma but stages the MMA operands as bf16 (2 bytes) instead of
     # tf32 (4 bytes). cuTile stages tiny MMA operands into static SMEM; tf32
     # staging doubles that footprint vs bf16, which on the SMEM-bound
-    # compute-pairs kernel pins it to 1 block/SM. The q/k inputs are bf16
-    # upstream, so bf16 operands keep the multiply precision the inputs already
-    # carry; the fp32 accumulator is preserved.
+    # compute-pairs kernel pins it to 1 block/SM.
     return ct.mma(ct.astype(a, ct.bfloat16), ct.astype(b, ct.bfloat16), acc)
 
 
@@ -334,10 +254,9 @@ def reg_matmul(a, b):
     # SMEM-staged HMMA path (~83KB static smem/block -> 1 block/SM, ~12% occ).
     # Keep these dots in registers instead, via a
     # broadcast-multiply-reduce over the contraction dim: out[i,j] =
-    # sum_k a[i,k]*b[k,j]. Inputs are rounded to tf32 first so the multiply
-    # precision matches the existing tf32-MMA path (preserves tolerance).
-    aa = _tf32(a)
-    bb = _tf32(b)
+    # sum_k a[i,k]*b[k,j]. Inputs are rounded to tf32 first.
+    aa = tf32(a)
+    bb = tf32(b)
     aa = ct.astype(aa, ct.float32)
     bb = ct.astype(bb, ct.float32)
     return ct.sum(aa[:, :, None] * bb[None, :, :], axis=1)
@@ -356,7 +275,7 @@ def ct_min(a, b):
 # GATHER RATIONALE (l2norm): each row is loaded once, reduced once, written
 # once (single-pass streaming, no cooperative reuse) -> ct.gather/ct.scatter
 # avoids the smem staging tax of ct.load. Column mask handles BD-power-of-2
-# padding; partial-row handling via masks (replaces boundary_check).
+# padding; partial-row handling via masks.
 
 
 @ct.kernel
@@ -439,7 +358,7 @@ def fused_beta_sigmoid_bwd_kernel(x, dy, dx, scale, n_elements, BLOCK_SIZE: Cons
 
 
 # ===========================================================================
-# vector chunk_local_cumsum (used for the vector gate g)
+# vector chunk_local_cumsum (used for the vector gate G)
 # ===========================================================================
 # GATHER RATIONALE: head-interleaved [T, H, S] sub-view; loaded once,
 # cumsum'd along T, written back. s/o passed flattened (1-D) by the wrapper.
@@ -494,7 +413,7 @@ def chunk_local_cumsum_vector_kernel(
 # ===========================================================================
 # kda_gate_chunk_cumsum_vector / kda_gate_bwd
 # ===========================================================================
-# Vector gate: g is [B, T, H, S]; A_log is [H]; dt_bias is [H*S].
+# Vector gate: G is [B, T, H, S]; A_log is [H]; dt_bias is [H*S].
 # GATHER RATIONALE: head-interleaved [B, T, H, S] sub-view streamed once.
 
 
@@ -577,7 +496,7 @@ def kda_gate_bwd_kernel(
     HAS_BIAS: ConstInt,
     USE_LOWER_BOUND: ConstInt,
 ):
-    # g/dyg/dg layout [T, H, D] -> view (T, D) stride (H*D, 1) at base i_h*D.
+    # G/dYg/dG layout [T, H, D] -> view (T, D) stride (H*D, 1) at base i_h*D.
     i_t = ct.bid(0)
     i_h = ct.bid(1)
 
@@ -623,11 +542,11 @@ def kda_gate_bwd_kernel(
 
 
 # ===========================================================================
-# chunk_gla_fwd_kernel_o -- output projection o = qg @ h + A @ v
+# chunk_gla_fwd_kernel_o -- output projection O = QG @ H + A @ V
 # ===========================================================================
-# GATHER RATIONALE: q/g/v are reused across the i_k loop (K split), but with
-# head-interleaved strides + a transposed STATE_V_FIRST h-view that TMA cannot
-# express here, so the faithful non-TMA element-offset gather path is used.
+# GATHER RATIONALE: Q/G/V are reused across the i_k loop (K split), but with
+# head-interleaved strides + a transposed STATE_V_FIRST H-view that TMA cannot
+# express here, so the non-TMA element-offset gather path is used.
 
 
 @ct.kernel
@@ -655,8 +574,8 @@ def chunk_gla_fwd_kernel_o(
     i_hv = ct.bid(2)
     i_h = i_hv // (HV // H)
 
-    # grid dim-1 is the GLOBAL chunk index; h is laid out per global chunk
-    # (h-state kernel writes slot chunk_offsets[i_n] + local). Capture it
+    # grid dim-1 is the GLOBAL chunk index; H is laid out per global chunk
+    # (H-state kernel writes slot chunk_offsets[i_n] + local). Capture it
     # before i_t is reassigned to the per-sequence (local) chunk index.
     i_tg = i_t
     i_n = ct.load(chunk_indices, (i_t * 2,), shape=()).item()
@@ -731,10 +650,9 @@ def chunk_gla_fwd_kernel_o(
 
 
 # ===========================================================================
-# chunk_delta_h  (state-h fwd + dhu bwd) -- SHARED with GDN
+# chunk_delta_h  (state-H fwd + dhu bwd)
 # ===========================================================================
-# These two kernels are byte-for-byte identical (in math) to the GDN
-# chunk_delta_h kernels. For KDA the gate carried is the per-key vector gate
+# For KDA the gate carried is the per-key vector gate
 # `gk` (USE_GK=1, USE_G=0); the per-time scalar gate `g` path is inert here.
 
 
@@ -766,12 +684,11 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     STATE_V_FIRST: ConstInt,
 ):
     # The KV state is carried as a SINGLE full-width tile ((BV, BK) when
-    # STATE_V_FIRST else (BK, BV), BK=next_pow2(K)) instead of a 4-way 64-wide
-    # sub-block unroll, so the kernel is general for ANY K (no K<=256 cap). Every
-    # K-axis load zero-pads cols [K:BK] and every K-axis store masks them off, so
-    # the tail is 0 on load, contributes 0 to every MMA, and stays 0 in the
-    # state; a padded gk tail loads as 0 so exp2(0)=1 leaves those zero cols
-    # unchanged.
+    # STATE_V_FIRST else (BK, BV), BK=next_pow2(K)), so the kernel is general
+    # for ANY K (no K<=256 cap). Every K-axis load zero-pads cols [K:BK] and
+    # every K-axis store masks them off, so the tail is 0 on load, contributes
+    # 0 to every MMA, and stays 0 in the state; a padded Gk tail loads as 0 so
+    # exp2(0)=1 leaves those zero cols unchanged.
     i_v = ct.bid(0)
     i_nh = ct.bid(1)
     i_n = i_nh // HV
@@ -801,8 +718,8 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
 
     # K-tile / V-tile validity masks. The kernel carries a single BK-wide K tile
     # (BK=next_pow2(K)) and BV-wide V tiles; when K or V is not a multiple of the
-    # tile width the extra lanes alias the neighbouring head's h slot. The matmul
-    # state rows are zeroed via K-masked k/gk loads, but the raw h/h0/ht
+    # tile width the extra lanes alias the neighbouring head's H slot. The matmul
+    # state rows are zeroed via K-masked K/Gk loads, but the raw H/H0/Ht
     # gather/scatter are also masked here -> no cross-head corruption when
     # K % BK != 0 (i.e. K < BK) or V % BV != 0.
     mkh = o_bk < K
@@ -942,7 +859,7 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
     w,
     g,
     gk,
-    dht,
+    dstate_in,
     dh0,
     do,
     dh,
@@ -964,14 +881,12 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
     USE_FINAL_STATE_GRADIENT: ConstInt,
     STATE_V_FIRST: ConstInt,
 ):
-    #
-    # dh state is a SINGLE full-width tile ((BV, BK) when STATE_V_FIRST else
-    # (BK, BV), BK=next_pow2(K)) instead of a 4-way 64-wide sub-block unroll, so
-    # the kernel is general for ANY K (no K<=256 cap). Every flat gather/scatter
-    # over the K axis uses oK=arange(BK) with a `(oK < K)` mask, so rows/cols
-    # [K:BK] are zero on load, contribute 0 to every MMA, and are masked out on
-    # store; a gk padding tail loads as 0 so exp2(0)=1 leaves those zero state
-    # cols unchanged.
+    # dH state is a SINGLE full-width tile ((BV, BK) when STATE_V_FIRST else
+    # (BK, BV), BK=next_pow2(K)), so the kernel is general for ANY K (no K<=256
+    # cap). Every flat gather/scatter over the K axis uses oK=arange(BK) with a
+    # `(oK < K)` mask, so rows/cols [K:BK] are zero on load, contribute 0 to
+    # every MMA, and are masked out on store; a Gk padding tail loads as 0 so
+    # exp2(0)=1 leaves those zero state cols unchanged.
     i_v = ct.bid(0)
     i_nh = ct.bid(1)
     i_n = i_nh // HV
@@ -1001,18 +916,18 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
     o_bt = ct.arange(BT, dtype=ct.int32)
     o_bv = ct.arange(BV, dtype=ct.int32)
 
-    # V-boundary mask for the state-gradient (dh/dh0) scatters: a partial
+    # V-boundary mask for the state-gradient (dH/dH0) scatters: a partial
     # trailing V tile (V not a multiple of BV) must not write rows/cols >= V,
     # else the store spills into the neighbouring chunk/head's state-gradient
     # (boundary-checked store semantics).
     m_v = (i_v * BV + o_bv) < V
 
-    # --- Load final state gradient dht -> b_dh (single full-width tile; [K:BK] loads 0) ---
+    # --- Load final state gradient dHt -> b_dh (single full-width tile; [K:BK] loads 0) ---
     if USE_FINAL_STATE_GRADIENT:
         if STATE_V_FIRST:
             row = (i_v * BV + o_bv)[:, None]
             b_dh = b_dh + ct.gather(
-                dht,
+                dstate_in,
                 dht_base + row * K + o_bk[None, :],
                 mask=(o_bk < K)[None, :],
                 check_bounds=True,
@@ -1021,7 +936,7 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
         else:
             col = (i_v * BV + o_bv)[None, :]
             b_dh = b_dh + ct.gather(
-                dht,
+                dstate_in,
                 dht_base + o_bk[:, None] * V + col,
                 mask=(o_bk < K)[:, None],
                 check_bounds=True,
@@ -1029,12 +944,12 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
             )
 
     # cuTile range() requires a positive step; iterate forward and reverse the
-    # index to preserve the original backward (NT-1 .. 0) chunk traversal.
+    # index to preserve the backward (NT-1 .. 0) chunk traversal.
     for _i_t in range(NT):
         i_t = NT - 1 - _i_t
         dh_chunk = dh_base + i_t * HV * K * V
 
-        # Store current b_dh to dh[i_t] (single full-width tile; [K:BK] masked out)
+        # Store current b_dh to dH[i_t] (single full-width tile; [K:BK] masked out)
         if STATE_V_FIRST:
             row = (i_v * BV + o_bv)[:, None]
             ct.scatter(
@@ -1067,7 +982,7 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
             bg_last_exp = ct.astype(0.0, ct.float32)
             b_g_exp = ct.zeros((BT,), dtype=ct.float32)
 
-        # do, dv, dv2 tiles
+        # dO, dV, dV2 tiles
         v_col = (i_v * BV + o_bv)[None, :]
         vmask_c = (i_v * BV + o_bv) < V
         v_full = (m_t[:, None]) & (vmask_c[None, :])
@@ -1086,7 +1001,7 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
         )
         bk = ct.where(m_t[:, None], bk, ct.zeros((BT, BK), dtype=bk.dtype))
         if USE_GK:
-            # gk offset: base (bos*HV+i_h)*K ; then + last_idx*HV*K + o_k.
+            # Gk offset: base (bos*HV+i_h)*K ; then + last_idx*HV*K + o_k.
             # Padded tail [K:BK] loads as 0 -> exp2(0)=1 leaves those zero cols unchanged.
             gkl = (bos * HV + i_h) * K + last_idx * HV * K
             b_gk_last = ct.astype(ct.gather(gk, gkl + o_bk, mask=o_bk < K, check_bounds=True, padding_value=0.0), ct.float32)
@@ -1097,7 +1012,7 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
             decay = ct.where(m_t, exp2(bg_last - b_g), ct.zeros((BT,), dtype=ct.float32))
             b_dv = b_dv * decay[:, None]
 
-        # b_dv += dv ; store to dv2
+        # b_dv += dV ; store to dV2
         dv_off = dv_base + (i_t * BT + o_bt)[:, None] * (HV * V) + v_col
         b_dv_load = ct.gather(dv, dv_off, check_bounds=True, padding_value=0.0)
         b_dv_load = ct.where(v_full, b_dv_load, ct.zeros((BT, BV), dtype=b_dv_load.dtype))
@@ -1157,7 +1072,7 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
 # wy_fast (recompute_w_u_fwd)
 # ===========================================================================
 # 2D structured gather/scatter on reshaped flat views; head-interleaved
-# strides folded into the (row, col) tuple indices. gk is the per-key gate.
+# strides folded into the (row, col) tuple indices. Gk is the per-key gate.
 
 
 @ct.kernel
@@ -1365,7 +1280,7 @@ def chunk_kda_fwd_kernel_intra_token_parallel(
     BH: ConstInt,
     BK: ConstInt,
 ):
-    # used (numerically identical). BK = next_power_of_2(K) is passed by host
+    # BK = next_power_of_2(K) is passed by host
     # (cuTile tile shapes must be compile-time constants).
     i_tg = ct.bid(0)
     i_hg = ct.bid(1)
@@ -1406,7 +1321,7 @@ def chunk_kda_fwd_kernel_intra_token_parallel(
 
     # cuTile gather/scatter require the index tuple rank to match the array rank
     # (no raw pointer arithmetic). Arrays arrive pre-flattened from the
-    # host: q/k -> (B*T*H, K), g -> (B*T*HV, K), beta/Aqk/Akk -> 1-D.
+    # host: Q/K -> (B*T*H, K), G -> (B*T*HV, K), Beta/Aqk/Akk -> 1-D.
     o_hv = i_hg * BH + ct.arange(BH, dtype=ct.int32)
     o_h = o_hv // G
     o_k = ct.arange(BK, dtype=ct.int32)
@@ -1416,12 +1331,12 @@ def chunk_kda_fwd_kernel_intra_token_parallel(
 
     col = ct.broadcast_to(o_k[None, :], (BH, BK))
 
-    # q/k: row = (bos + token) * H + head; col = key
+    # Q/K: row = (bos + token) * H + head; col = key
     qk_row = ct.broadcast_to(((bos + i_t) * H + o_h)[:, None], (BH, BK))
     b_q = ct.astype(ct.gather(q, (qk_row, col), mask=m_hk, check_bounds=False, padding_value=0.0), ct.float32)
     b_k = ct.astype(ct.gather(k, (qk_row, col), mask=m_hk, check_bounds=False, padding_value=0.0), ct.float32)
 
-    # g: row = (bos + token) * HV + head; beta: idx = (bos + token) * HV + head
+    # G: row = (bos + token) * HV + head; Beta: idx = (bos + token) * HV + head
     g_row = ct.broadcast_to(((bos + i_t) * HV + o_hv)[:, None], (BH, BK))
     b_g = ct.astype(ct.gather(g, (g_row, col), mask=m_hk, check_bounds=False, padding_value=0.0), ct.float32)
     b_beta = ct.astype(ct.gather(beta, beta_base + i_t * HV + o_hv, mask=m_hv, check_bounds=False, padding_value=0.0), ct.float32)
@@ -1430,8 +1345,7 @@ def chunk_kda_fwd_kernel_intra_token_parallel(
     # Counted loop over the (static) BC-wide sub-chunk window. A runtime-bounded
     # `for j in range(i_ts, j_hi)` lowers to per-iteration branches that tileiras
     # cannot unroll/predicate; a counted `for jj in range(BC)` with a runtime
-    # guard derives `j` from `jj` and stays fully unrolled (numerically identical:
-    # inactive iterations are masked out). See MEMORY counted-loop note.
+    # guard derives `j` from `jj` and stays fully unrolled.
     for jj in range(BC):
         j = i_ts + jj
         if j < i_t + 1 and j < T_eff and j < i_ts + BC:
@@ -1465,7 +1379,7 @@ def chunk_kda_fwd_kernel_intra_token_parallel(
 # ===========================================================================
 # One BC sub-chunk per block: compute the diagonal Aqk/Akk blocks then do an
 # in-place forward-substitution triangular solve. GATHER RATIONALE: head-
-# interleaved q/k/g sub-views + a transposed b_kgt; faithful gather path.
+# interleaved Q/K/G sub-views + a transposed b_kgt.
 
 
 @ct.kernel
@@ -1560,30 +1474,16 @@ def chunk_kda_fwd_kernel_inter_diag_compute_solve(
     m_aqk = m_c[:, None] & ((i_i * BC + o_bc) < BT)[None, :]
     ct.scatter(Aqk, aqk_off, ct.astype(b_Aqk, Aqk.dtype), mask=m_aqk, check_bounds=False)
 
-    # forward substitution on the diagonal Akk -> inverse, written to Akk(diag buf).
+    # diagonal Akk -> inverse via Neumann series by squaring, written to Akk(diag buf).
     #
-    # Akk here is strictly-lower-triangular and nilpotent (Akk^BC = 0), and the
-    # inverse we want is (I + Akk)^-1 = I - Akk + Akk^2 - ... (the serial sweep
-    # inits b_Ai = -Akk, so with N := -Akk this is (I - N)^-1 = I + N + N^2 +
-    # ... + N^(BC-1)). A per-row serial forward-substitution sweep
-    # (`for i in range(2, min(BC, ...))`) lowers to a chain of BC-1
-    # serial SIMT rank-1 updates -- the dominant compute cost of this
-    # compute-bound kernel (ncu: 51% SM, HMMA only from the two upfront dots).
+    # Akk is strictly-lower-triangular and nilpotent (Akk^BC = 0); with
+    # N := -Akk, (I + Akk)^-1 = (I - N)^-1 = sum_{k=0}^{BC-1} N^k
+    # = prod_{j=0}^{log2(BC)-1} (I + N^(2^j)) -- log2(BC) block matmuls, no
+    # serial row dependency. Rows beyond T_eff have N = 0 (b_gq/b_gk were
+    # zeroed by m_c) and converge to the identity.
     #
-    # We replace the serial sweep with a Neumann-series-by-squaring block
-    # matmul:  (I - N)^-1 = prod_{j=0}^{log2(BC)-1} (I + N^(2^j)).  This is
-    # algebraically identical (telescopes to sum_{k=0}^{BC-1} N^k since
-    # N^BC = 0) and turns the BC-1 serial steps into log2(BC) block matmuls
-    # (the whole tile updates in parallel, no serial row dependency). Rows
-    # beyond T_eff already have N = 0 (b_gq/b_gk were zeroed by m_c), so those
-    # rows converge to the identity exactly as the guarded serial loop did.
-    #
-    # Precision: the squarings run at tf32 (SOLVE_TRIL_DOT_PRECISION on tf32-
-    # capable arch) via safe_matmul, giving real HMMA tensor-core ops at M = BC
-    # (>=16; fp32 operands would fall back to SIMT even at M=32). This matches
-    # the tolerance across the full fwd matrix (incl. raw non-L2-normed k in the
-    # dispatch suite, RMS ratio well under 2e-2) once the series is anchored on
-    # the correct sign (N = -Akk).
+    # Precision: the squarings run at tf32 via safe_matmul (fp32 operands
+    # would fall back to SIMT even at M=32).
     b_N = -b_Akk  # N := -Akk, so (I + Akk)^-1 = (I - N)^-1 = sum_k N^k
     b_Ai = ct.astype(m_I, ct.float32) + b_N  # (I + N)
     # Squaring stages: `range(2, BC)` traces as a compile-time-bounded loop with
@@ -1607,7 +1507,7 @@ def chunk_kda_fwd_kernel_inter_diag_compute_solve(
 # ---------------------------------------------------------------------------
 # chunk_kda_fwd_kernel_inter_solve_fused -- off-diagonal Akk + merged solve
 # ---------------------------------------------------------------------------
-def _load_bc_bk(arr, base, row0, col0, stride_row, BC: ConstInt, BK: ConstInt, T_eff, K: ConstInt):
+def load_bc_bk(arr, base, row0, col0, stride_row, BC: ConstInt, BK: ConstInt, T_eff, K: ConstInt):
     # Boundary-checked (BC,BK) block load at (row0,col0) of the (T,K) view
     # (row stride stride_row), cast to fp32, on the flattened 1-D view.
     o_r = ct.arange(BC, dtype=ct.int32)
@@ -1619,44 +1519,13 @@ def _load_bc_bk(arr, base, row0, col0, stride_row, BC: ConstInt, BK: ConstInt, T
     return ct.astype(ct.gather(arr, off, mask=mask, check_bounds=False, padding_value=0.0), ct.float32)
 
 
-def _store_bc_bc(arr, base, row0, col0, stride_row, blk, BC: ConstInt, BT_or_BC: ConstInt, T_eff):
+def store_bc_bc(arr, base, row0, col0, stride_row, blk, BC: ConstInt, BT_or_BC: ConstInt, T_eff):
     o_r = ct.arange(BC, dtype=ct.int32)
     o_c = ct.arange(BC, dtype=ct.int32)
     rows = row0 + o_r
     cols = col0 + o_c
     off = base + rows[:, None] * stride_row + cols[None, :]
     mask = (rows < T_eff)[:, None] & (cols < BT_or_BC)[None, :]
-    ct.scatter(arr, off, ct.astype(blk, arr.dtype), mask=mask, check_bounds=False)
-
-
-def _cat_pow2(pieces, axis):
-    """Concatenate a power-of-two-length tuple of equal-shaped 16x16 leaf tiles
-    via a balanced binary tree (fully unrolled, no recursion). ct.cat takes at
-    most 2 operands and requires every intermediate shape to be a power of two,
-    so a balanced tree (16 -> 32 -> 64) is required (a left-fold would produce
-    illegal sizes like 48). Mirrors the proven helper in the sibling GDN
-    chunk kernels."""
-    n = len(pieces)
-    if n == 1:
-        return pieces[0]
-    if n == 2:
-        return ct.cat((pieces[0], pieces[1]), axis)
-    # n == 4
-    return ct.cat(
-        (ct.cat((pieces[0], pieces[1]), axis), ct.cat((pieces[2], pieces[3]), axis)),
-        axis,
-    )
-
-
-def _store_bt_bt(arr, base, row0, stride_row, blk, BT: ConstInt, T_eff):
-    # Single masked scatter of a full [BT, BT] tile to a head-interleaved flat
-    # view (row stride `stride_row` = HV*BT). Replaces the up-to-12 per-sub-block
-    # `_store_bc_bc` scatters, which serialise writes to the same Akk output.
-    o_r = ct.arange(BT, dtype=ct.int32)
-    o_c = ct.arange(BT, dtype=ct.int32)
-    rows = row0 + o_r
-    off = base + rows[:, None] * stride_row + o_c[None, :]
-    mask = ct.broadcast_to((rows < T_eff)[:, None], (BT, BT))
     ct.scatter(arr, off, ct.astype(blk, arr.dtype), mask=mask, check_bounds=False)
 
 
@@ -1727,18 +1596,18 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
     b_Aqk32 = z
     b_Akk32 = z
 
-    # ---- off-diagonal blocks ----
+    # ---- off-diagonal blocks -----------------------------------------------------
     num_k = (K + BK - 1) // BK
     for i_k in range(num_k):
         kk = i_k * BK + o_k
         m_k = kk < K
-        b_k0 = _load_bc_bk(k, k_base, i_tc0, i_k * BK, H * K, BC, BK, T_eff, K)
-        b_g0 = _load_bc_bk(g, g_base, i_tc0, i_k * BK, HV * K, BC, BK, T_eff, K)
+        b_k0 = load_bc_bk(k, k_base, i_tc0, i_k * BK, H * K, BC, BK, T_eff, K)
+        b_g0 = load_bc_bk(g, g_base, i_tc0, i_k * BK, HV * K, BC, BK, T_eff, K)
 
         if i_tc1 < T_eff:
-            b_q1 = _load_bc_bk(q, q_base, i_tc1, i_k * BK, H * K, BC, BK, T_eff, K)
-            b_k1 = _load_bc_bk(k, k_base, i_tc1, i_k * BK, H * K, BC, BK, T_eff, K)
-            b_g1 = _load_bc_bk(g, g_base, i_tc1, i_k * BK, HV * K, BC, BK, T_eff, K)
+            b_q1 = load_bc_bk(q, q_base, i_tc1, i_k * BK, H * K, BC, BK, T_eff, K)
+            b_k1 = load_bc_bk(k, k_base, i_tc1, i_k * BK, H * K, BC, BK, T_eff, K)
+            b_g1 = load_bc_bk(g, g_base, i_tc1, i_k * BK, HV * K, BC, BK, T_eff, K)
             b_gn1 = ct.astype(
                 ct.gather(g, g_base + i_tc1 * (HV * K) + kk, mask=m_k, check_bounds=False, padding_value=0.0),
                 ct.float32,
@@ -1749,9 +1618,9 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
             b_Akk10 = safe_mma(b_k1 * b_gqn, b_kgt, b_Akk10)
 
             if NC >= 3 and i_tc2 < T_eff:
-                b_q2 = _load_bc_bk(q, q_base, i_tc2, i_k * BK, H * K, BC, BK, T_eff, K)
-                b_k2 = _load_bc_bk(k, k_base, i_tc2, i_k * BK, H * K, BC, BK, T_eff, K)
-                b_g2 = _load_bc_bk(g, g_base, i_tc2, i_k * BK, HV * K, BC, BK, T_eff, K)
+                b_q2 = load_bc_bk(q, q_base, i_tc2, i_k * BK, H * K, BC, BK, T_eff, K)
+                b_k2 = load_bc_bk(k, k_base, i_tc2, i_k * BK, H * K, BC, BK, T_eff, K)
+                b_g2 = load_bc_bk(g, g_base, i_tc2, i_k * BK, HV * K, BC, BK, T_eff, K)
                 b_gn2 = ct.astype(
                     ct.gather(g, g_base + i_tc2 * (HV * K) + kk, mask=m_k, check_bounds=False, padding_value=0.0),
                     ct.float32,
@@ -1767,9 +1636,9 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
                 b_Akk21 = safe_mma(b_kg2, b_kgt, b_Akk21)
 
                 if NC >= 4 and i_tc3 < T_eff:
-                    b_q3 = _load_bc_bk(q, q_base, i_tc3, i_k * BK, H * K, BC, BK, T_eff, K)
-                    b_k3 = _load_bc_bk(k, k_base, i_tc3, i_k * BK, H * K, BC, BK, T_eff, K)
-                    b_g3 = _load_bc_bk(g, g_base, i_tc3, i_k * BK, HV * K, BC, BK, T_eff, K)
+                    b_q3 = load_bc_bk(q, q_base, i_tc3, i_k * BK, H * K, BC, BK, T_eff, K)
+                    b_k3 = load_bc_bk(k, k_base, i_tc3, i_k * BK, H * K, BC, BK, T_eff, K)
+                    b_g3 = load_bc_bk(g, g_base, i_tc3, i_k * BK, HV * K, BC, BK, T_eff, K)
                     b_gn3 = ct.astype(
                         ct.gather(g, g_base + i_tc3 * (HV * K) + kk, mask=m_k, check_bounds=False, padding_value=0.0),
                         ct.float32,
@@ -1787,17 +1656,17 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
                     b_Aqk32 = safe_mma(b_qg3, b_kgt, b_Aqk32)
                     b_Akk32 = safe_mma(b_kg3, b_kgt, b_Akk32)
 
-    # ---- save off-diagonal Aqk blocks, scale Akk by beta ----
+    # ---- save off-diagonal Aqk blocks, scale Akk by Beta -------------------------
     if i_tc1 < T_eff:
-        _store_bc_bc(Aqk, Aqk_base, i_tc1, 0, HV * BT, b_Aqk10 * scale, BC, BT, T_eff)
+        store_bc_bc(Aqk, Aqk_base, i_tc1, 0, HV * BT, b_Aqk10 * scale, BC, BT, T_eff)
         b_b1 = ct.astype(
             ct.gather(beta, beta_base + (i_tc1 + o_i) * HV, mask=m_tc1, check_bounds=False, padding_value=0.0),
             ct.float32,
         )
         b_Akk10 = b_Akk10 * b_b1[:, None]
     if NC >= 3 and i_tc2 < T_eff:
-        _store_bc_bc(Aqk, Aqk_base, i_tc2, 0, HV * BT, b_Aqk20 * scale, BC, BT, T_eff)
-        _store_bc_bc(Aqk, Aqk_base, i_tc2, BC, HV * BT, b_Aqk21 * scale, BC, BT, T_eff)
+        store_bc_bc(Aqk, Aqk_base, i_tc2, 0, HV * BT, b_Aqk20 * scale, BC, BT, T_eff)
+        store_bc_bc(Aqk, Aqk_base, i_tc2, BC, HV * BT, b_Aqk21 * scale, BC, BT, T_eff)
         b_b2 = ct.astype(
             ct.gather(beta, beta_base + (i_tc2 + o_i) * HV, mask=m_tc2, check_bounds=False, padding_value=0.0),
             ct.float32,
@@ -1805,9 +1674,9 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
         b_Akk20 = b_Akk20 * b_b2[:, None]
         b_Akk21 = b_Akk21 * b_b2[:, None]
     if NC >= 4 and i_tc3 < T_eff:
-        _store_bc_bc(Aqk, Aqk_base, i_tc3, 0, HV * BT, b_Aqk30 * scale, BC, BT, T_eff)
-        _store_bc_bc(Aqk, Aqk_base, i_tc3, BC, HV * BT, b_Aqk31 * scale, BC, BT, T_eff)
-        _store_bc_bc(Aqk, Aqk_base, i_tc3, 2 * BC, HV * BT, b_Aqk32 * scale, BC, BT, T_eff)
+        store_bc_bc(Aqk, Aqk_base, i_tc3, 0, HV * BT, b_Aqk30 * scale, BC, BT, T_eff)
+        store_bc_bc(Aqk, Aqk_base, i_tc3, BC, HV * BT, b_Aqk31 * scale, BC, BT, T_eff)
+        store_bc_bc(Aqk, Aqk_base, i_tc3, 2 * BC, HV * BT, b_Aqk32 * scale, BC, BT, T_eff)
         b_b3 = ct.astype(
             ct.gather(beta, beta_base + (i_tc3 + o_i) * HV, mask=m_tc3, check_bounds=False, padding_value=0.0),
             ct.float32,
@@ -1816,13 +1685,13 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
         b_Akk31 = b_Akk31 * b_b3[:, None]
         b_Akk32 = b_Akk32 * b_b3[:, None]
 
-    # ---- load diagonal inverse blocks from Akkd (fp32) ----
-    b_Ai00 = _load_bc_bk(Akkd, Akkd_base, i_tc0, 0, HV * BC, BC, BC, T_eff, BC)
-    b_Ai11 = _load_bc_bk(Akkd, Akkd_base, i_tc1, 0, HV * BC, BC, BC, T_eff, BC)
-    b_Ai22 = _load_bc_bk(Akkd, Akkd_base, i_tc2, 0, HV * BC, BC, BC, T_eff, BC) if NC >= 3 else z
-    b_Ai33 = _load_bc_bk(Akkd, Akkd_base, i_tc3, 0, HV * BC, BC, BC, T_eff, BC) if NC >= 4 else z
+    # ---- load diagonal inverse blocks from Akkd (fp32) ---------------------------
+    b_Ai00 = load_bc_bk(Akkd, Akkd_base, i_tc0, 0, HV * BC, BC, BC, T_eff, BC)
+    b_Ai11 = load_bc_bk(Akkd, Akkd_base, i_tc1, 0, HV * BC, BC, BC, T_eff, BC)
+    b_Ai22 = load_bc_bk(Akkd, Akkd_base, i_tc2, 0, HV * BC, BC, BC, T_eff, BC) if NC >= 3 else z
+    b_Ai33 = load_bc_bk(Akkd, Akkd_base, i_tc3, 0, HV * BC, BC, BC, T_eff, BC) if NC >= 4 else z
 
-    # ---- forward substitution on diagonals (only when gate not pre-solved) ----
+    # ---- forward substitution on diagonals (only when gate not pre-solved) -------
     if not USE_SAFE_GATE:
         m_A = o_i[:, None] > o_i[None, :]
         m_I = o_i[:, None] == o_i[None, :]
@@ -1836,9 +1705,7 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
         # Counted loops over the static [BC] forward-substitution window with a
         # runtime guard (i < T_eff - i_tc0). A runtime upper bound (ct_min(...,
         # T_eff - i_tc0)) lowers to per-iteration branches tileiras can't
-        # unroll/predicate; the counted form stays fully unrolled and is
-        # numerically identical (inactive rows are skipped by the guard). See
-        # MEMORY counted-loop note.
+        # unroll/predicate; the counted form stays fully unrolled.
         for i in range(2, BC):
             if i < T_eff - i_tc0:
                 b_a00 = -ct.astype(
@@ -1885,7 +1752,7 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
         if NC >= 4:
             b_Ai33 = b_Ai33 + ct.astype(m_I, ct.float32)
 
-    # ---- merged inverse using off-diagonals (tf32) ----
+    # ---- merged inverse using off-diagonals (tf32) -------------------------------
     b_Ai10 = -safe_matmul(safe_matmul(b_Ai11, b_Akk10), b_Ai00)
     b_Ai20 = z
     b_Ai21 = z
@@ -1900,23 +1767,23 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
         b_Ai31 = -safe_matmul(b_Ai33, safe_matmul(b_Akk31, b_Ai11) + safe_matmul(b_Akk32, b_Ai21))
         b_Ai30 = -safe_matmul(b_Ai33, safe_matmul(b_Akk30, b_Ai00) + safe_matmul(b_Akk31, b_Ai10) + safe_matmul(b_Akk32, b_Ai20))
 
-    # ---- store full Akk_inv to Akk ----
-    _store_bc_bc(Akk, Akk_base, i_tc0, 0, HV * BT, b_Ai00, BC, BT, T_eff)
-    _store_bc_bc(Akk, Akk_base, i_tc1, 0, HV * BT, b_Ai10, BC, BT, T_eff)
-    _store_bc_bc(Akk, Akk_base, i_tc1, BC, HV * BT, b_Ai11, BC, BT, T_eff)
+    # ---- store full Akk_inv to Akk -----------------------------------------------
+    store_bc_bc(Akk, Akk_base, i_tc0, 0, HV * BT, b_Ai00, BC, BT, T_eff)
+    store_bc_bc(Akk, Akk_base, i_tc1, 0, HV * BT, b_Ai10, BC, BT, T_eff)
+    store_bc_bc(Akk, Akk_base, i_tc1, BC, HV * BT, b_Ai11, BC, BT, T_eff)
     if NC >= 3:
-        _store_bc_bc(Akk, Akk_base, i_tc2, 0, HV * BT, b_Ai20, BC, BT, T_eff)
-        _store_bc_bc(Akk, Akk_base, i_tc2, BC, HV * BT, b_Ai21, BC, BT, T_eff)
-        _store_bc_bc(Akk, Akk_base, i_tc2, 2 * BC, HV * BT, b_Ai22, BC, BT, T_eff)
+        store_bc_bc(Akk, Akk_base, i_tc2, 0, HV * BT, b_Ai20, BC, BT, T_eff)
+        store_bc_bc(Akk, Akk_base, i_tc2, BC, HV * BT, b_Ai21, BC, BT, T_eff)
+        store_bc_bc(Akk, Akk_base, i_tc2, 2 * BC, HV * BT, b_Ai22, BC, BT, T_eff)
     if NC >= 4:
-        _store_bc_bc(Akk, Akk_base, i_tc3, 0, HV * BT, b_Ai30, BC, BT, T_eff)
-        _store_bc_bc(Akk, Akk_base, i_tc3, BC, HV * BT, b_Ai31, BC, BT, T_eff)
-        _store_bc_bc(Akk, Akk_base, i_tc3, 2 * BC, HV * BT, b_Ai32, BC, BT, T_eff)
-        _store_bc_bc(Akk, Akk_base, i_tc3, 3 * BC, HV * BT, b_Ai33, BC, BT, T_eff)
+        store_bc_bc(Akk, Akk_base, i_tc3, 0, HV * BT, b_Ai30, BC, BT, T_eff)
+        store_bc_bc(Akk, Akk_base, i_tc3, BC, HV * BT, b_Ai31, BC, BT, T_eff)
+        store_bc_bc(Akk, Akk_base, i_tc3, 2 * BC, HV * BT, b_Ai32, BC, BT, T_eff)
+        store_bc_bc(Akk, Akk_base, i_tc3, 3 * BC, HV * BT, b_Ai33, BC, BT, T_eff)
 
 
 # ===========================================================================
-# chunk_bwd (dAv) -- dAqk = do @ v.T ; dv = A @ do
+# chunk_bwd (dAv) -- dAqk = dO @ V^T ; dV = A @ dO
 # ===========================================================================
 
 
@@ -2032,7 +1899,7 @@ def chunk_kda_bwd_kernel_wy_dqkg_fused(
     i_hv = ct.bid(1)
     i_h = i_hv // (HV // H)
 
-    # grid dim-0 is the GLOBAL chunk index; h/dh are laid out per global
+    # grid dim-0 is the GLOBAL chunk index; H/dH are laid out per global
     # chunk (written with chunk_offsets+local). Capture it before i_t is
     # reassigned to the per-sequence (local) chunk index.
     i_tg = i_t
@@ -2068,7 +1935,7 @@ def chunk_kda_bwd_kernel_wy_dqkg_fused(
 
     b_beta = ct.gather(beta, beta_base + o_t * HV, mask=m_t, check_bounds=False, padding_value=0.0)
 
-    # p_A transposed: view (BT, T) stride (1, HV*BT), block (BT, BT) at (0, off_t)
+    # A transposed: view (BT, T) stride (1, HV*BT), block (BT, BT) at (0, off_t)
     A_row = o_bt[:, None]
     A_time = (off_t + o_bt)[None, :]
     A_m = ct.broadcast_to((o_bt < BT)[:, None], (BT, BT)) & ((off_t + o_bt)[None, :] < T)
@@ -2112,13 +1979,13 @@ def chunk_kda_bwd_kernel_wy_dqkg_fused(
             off_v = i_v * BV
             v_cols = (off_v + o_bv)[None, :]
             if STATE_V_FIRST:
-                # h/dh: view (V, K) stride (K, 1), block (BV, BK) at (off_v, off_k)
+                # H/dH: view (V, K) stride (K, 1), block (BV, BK) at (off_v, off_k)
                 h_rows = (off_v + o_bv)[:, None]
                 h_m = ct.broadcast_to((off_v + o_bv)[:, None] < V, (BV, BK)) & ct.broadcast_to(m_k[None, :], (BV, BK))
                 b_h = ct.gather(h, h_base + h_rows * K + o_k[None, :], mask=h_m, check_bounds=False, padding_value=0.0)
                 b_dh = ct.gather(dh, dh_base + h_rows * K + o_k[None, :], mask=h_m, check_bounds=False, padding_value=0.0)
             else:
-                # h/dh transposed: view (V, K) stride (1, V), block (BV, BK) at (off_v, off_k)
+                # H/dH transposed: view (V, K) stride (1, V), block (BV, BK) at (off_v, off_k)
                 h_row = (off_v + o_bv)[:, None]
                 h_col = o_k[None, :]
                 h_m = ct.broadcast_to((off_v + o_bv)[:, None] < V, (BV, BK)) & ct.broadcast_to(m_k[None, :], (BV, BK))
@@ -2152,9 +2019,7 @@ def chunk_kda_bwd_kernel_wy_dqkg_fused(
             b_dq = safe_mma(b_do, ct.astype(b_h, b_do.dtype), b_dq)
             b_dk = safe_mma(b_v_new, ct.astype(b_dh, b_v_new.dtype), b_dk)
             b_dw = safe_mma(ct.astype(b_dv, b_v_new.dtype), ct.astype(b_h, b_v_new.dtype), b_dw)
-            # TODO(cutile): an explicit debug-barrier here was
-            # dropped -- no cuTile equivalent; the b_v reuse below relies on
-            # program order within the block.
+            # the b_v reuse below relies on program order within the block.
             if i_k == 0:
                 b_v = ct.gather(
                     v,
@@ -2236,7 +2101,7 @@ def chunk_kda_bwd_kernel_wy_dqkg_fused(
 
 
 # ===========================================================================
-# chunk_bwd (intra) -- dq/dk/dg/db from dAqk/dAkk
+# chunk_bwd (intra) -- dQ/dK/dG/dBeta from dAqk/dAkk
 # ===========================================================================
 
 
@@ -2340,7 +2205,7 @@ def chunk_kda_bwd_kernel_intra(
         b_dk2 = b_dk2 * b_gqn
 
     o_i = o_bc
-    # current block q, k
+    # current block Q, K
     b_q = ct.gather(q, q_base + cur_rows * (H * K) + cur_cols, mask=m_cur, check_bounds=False, padding_value=0.0)
     b_k = ct.gather(k, k_base + cur_rows * (H * K) + cur_cols, mask=m_cur, check_bounds=False, padding_value=0.0)
 
@@ -2405,7 +2270,7 @@ def chunk_kda_bwd_kernel_intra(
 
     b_dg2 = ct.astype(b_q, ct.float32) * b_dq2
 
-    # dq2 = b_dq2 + dq
+    # dQ2 = b_dq2 + dQ
     dq_off = dq_base + cur_rows * (HV * K) + cur_cols
     b_dq_prev = ct.astype(ct.gather(dq, dq_off, mask=m_cur, check_bounds=False, padding_value=0.0), ct.float32)
     b_dq2_out = b_dq2 + b_dq_prev
@@ -2488,8 +2353,7 @@ def chunk_kda_bwd_kernel_intra(
             # A maskless gather still emits a default `other` (padding_value=0)
             # operand; without a matching `mask` the tileiras LDGSTS lowering
             # asserts (llOthers non-empty, llMasks empty). Supply an explicit
-            # row-validity mask. Values where the mask is false are zeroed but
-            # never used (m_i = o_i <= j gates the contribution below).
+            # row-validity mask.
             m_row = (i_ti + o_bc) < T_eff
             b_dAqk = ct.gather(dAqk, dAqk_base + base_o + j * (HV * BT), mask=m_row, check_bounds=False, padding_value=0.0)
             b_dAkk = ct.gather(dAkk, dAkk_base + base_o + j * (HV * BT), mask=m_row, check_bounds=False, padding_value=0.0)
@@ -2673,28 +2537,21 @@ def l2norm_fwd(
     stream=None,
 ):
     stream = 0 if stream is None else stream
-    if out is None or rstd_out is None:
-        raise ValueError("l2norm_fwd requires pre-allocated out= and rstd_out= buffers")
     x_shape_og = x.shape
-    x = x.reshape(-1, x.shape[-1]).contiguous()
+    x = reshaped(x, (-1, x.shape[-1]))
     y = reshaped(out, tuple(x.shape))
     T, D = x.shape[0], x.shape[-1]
     MAX_FUSED_SIZE = 65536 // x.element_size()
-    BD = min(MAX_FUSED_SIZE, _next_power_of_2(D))
-    if D > BD:
-        raise RuntimeError("This layer doesn't support feature dim >= 64KB.")
+    BD = min(MAX_FUSED_SIZE, next_power_of_2(D))
     rstd = reshaped(rstd_out, (T,))
     if D <= 512:
         BT = 32
-        grid = (_cdiv(T, BT),)
+        grid = (cdiv(T, BT),)
         # l2norm_fwd is a MEMORY-bound row reduction (each row loaded once,
-        # reduced, written once). Fixed occ=1/nww=4 ran ~4x slower than
-        # tuned. Sweep occupancy x num_worker_warps (launch hints only, single
-        # kernel unchanged); the default (occ=1,nww=4) is tried first so a
-        # non-improving shape keeps the base behaviour. Memory-bound => native/
-        # higher occupancy hides DRAM latency (do NOT force occ=1 here).
-        _l2_key = ("l2norm_fwd_kernel", int(D), int(BD), int(BT), str(x.dtype), _dev_id(x))
-        _autotuned_launch(l2norm_fwd_kernel, _l2_key, grid, (x, y, rstd, float(eps), T, D, BD, BT), occ_choices=(1, 2, 4, 8), nww_choices=(4,), stream=stream)
+        # reduced, written once); higher occupancy hides DRAM latency (do NOT
+        # force occ=1 here).
+        _l2_key = ("l2norm_fwd_kernel", int(D), int(BD), int(BT), str(x.dtype), dev_id(x))
+        autotuned_launch(l2norm_fwd_kernel, _l2_key, grid, (x, y, rstd, float(eps), T, D, BD, BT), occ_choices=(1, 2, 4, 8), nww_choices=(4,), stream=stream)
     else:
         ct.launch(stream, (T,), l2norm_fwd_kernel1, (x, y, rstd, float(eps), D, BD))
     return y.view(x_shape_og), rstd.view(x_shape_og[:-1])
@@ -2703,20 +2560,16 @@ def l2norm_fwd(
 def l2norm_bwd(y, rstd, dy, eps: float = 1e-6, out=None, stream=None):
     stream = 0 if stream is None else stream
     y_shape_og = y.shape
-    y = y.reshape(-1, dy.shape[-1]).contiguous()
-    dy = dy.reshape(-1, dy.shape[-1]).contiguous()
-    if out is None:
-        raise ValueError("l2norm_bwd requires a pre-allocated out= buffer")
+    y = y.reshape(-1, dy.shape[-1])
+    dy = dy.reshape(-1, dy.shape[-1])
     dx = reshaped(out, tuple(y.shape))
     T, D = y.shape[0], y.shape[-1]
     MAX_FUSED_SIZE = 65536 // y.element_size()
-    BD = min(MAX_FUSED_SIZE, _next_power_of_2(D))
-    if D > BD:
-        raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
-    rstd_flat = rstd.reshape(-1).contiguous()
+    BD = min(MAX_FUSED_SIZE, next_power_of_2(D))
+    rstd_flat = rstd.reshape(-1)
     if D <= 512:
         BT = 32
-        grid = (_cdiv(T, BT),)
+        grid = (cdiv(T, BT),)
         ct.launch(stream, grid, l2norm_bwd_kernel, (y, rstd_flat, dy, dx, float(eps), T, D, BD, BT))
     else:
         ct.launch(stream, (T,), l2norm_bwd_kernel1, (y, rstd_flat, dy, dx, float(eps), D, BD))
@@ -2726,37 +2579,33 @@ def l2norm_bwd(y, rstd, dy, eps: float = 1e-6, out=None, stream=None):
 # ---------------------------------------------------------------------------
 # fused_beta_sigmoid
 # ---------------------------------------------------------------------------
-_BETA_SIGMOID_BLOCK_SIZE = 2048
+BETA_SIGMOID_BLOCK_SIZE = 2048
 
 
 def fused_beta_sigmoid_fwd(x, scale: float = 1.0, out=None, stream=None):
     stream = 0 if stream is None else stream
-    if out is None:
-        raise ValueError("fused_beta_sigmoid_fwd requires a pre-allocated out= buffer (fp32, x-shaped)")
     y = reshaped(out, tuple(x.shape))
     n = x.numel()
-    grid = (_cdiv(n, _BETA_SIGMOID_BLOCK_SIZE),)
+    grid = (cdiv(n, BETA_SIGMOID_BLOCK_SIZE),)
     ct.launch(
         stream,
         grid,
         fused_beta_sigmoid_fwd_kernel,
-        (x.reshape(-1), y.reshape(-1), float(scale), n, _BETA_SIGMOID_BLOCK_SIZE),
+        (reshaped(x, (-1,)), y.reshape(-1), float(scale), n, BETA_SIGMOID_BLOCK_SIZE),
     )
     return y
 
 
 def fused_beta_sigmoid_bwd(x, dy, scale: float = 1.0, out=None, stream=None):
     stream = 0 if stream is None else stream
-    if out is None:
-        raise ValueError("fused_beta_sigmoid_bwd requires a pre-allocated out= buffer (x-shaped)")
     dx = reshaped(out, tuple(x.shape))
     n = x.numel()
-    grid = (_cdiv(n, _BETA_SIGMOID_BLOCK_SIZE),)
+    grid = (cdiv(n, BETA_SIGMOID_BLOCK_SIZE),)
     ct.launch(
         stream,
         grid,
         fused_beta_sigmoid_bwd_kernel,
-        (x.reshape(-1), dy.reshape(-1), dx.reshape(-1), float(scale), n, _BETA_SIGMOID_BLOCK_SIZE),
+        (reshaped(x, (-1,)), dy.reshape(-1), dx.reshape(-1), float(scale), n, BETA_SIGMOID_BLOCK_SIZE),
     )
     return dx
 
@@ -2770,7 +2619,7 @@ def fused_beta_sigmoid(x, scale: float = 1.0, out=None, stream=None):
 # ---------------------------------------------------------------------------
 # chunk_local_cumsum (vector gate) / kda_gate_chunk_cumsum / kda_gate_bwd
 # ---------------------------------------------------------------------------
-_BS_LIST_DEFAULT = 32
+BS_LIST_DEFAULT = 32
 
 
 def chunk_local_cumsum_vector(
@@ -2786,26 +2635,22 @@ def chunk_local_cumsum_vector(
     stream = 0 if stream is None else stream
     T, H, S = g.shape
     BT = chunk_size
-    if cu_seqlens is None or chunk_indices is None:
-        raise ValueError("cu_seqlens and chunk_indices are required (THD layout; callers build the (seq, intra) table)")
-    if out is None:
-        raise ValueError("chunk_local_cumsum requires a pre-allocated out= buffer (g-shaped)")
     NT = len(chunk_indices)
     assert chunk_size == 2 ** (chunk_size.bit_length() - 1), "chunk_size must be a power of 2"
-    BS = min(_BS_LIST_DEFAULT, _next_power_of_2(S))
+    BS = min(BS_LIST_DEFAULT, next_power_of_2(S))
     g_org = g
     g_out = reshaped(out, (T, H, S))
     scale_val = float(scale) if scale is not None else 0.0
     has_scale = int(scale is not None)
-    cu_arg = _i32_flat(cu_seqlens)
-    ci_arg = _i32_flat(chunk_indices)
-    grid = (_cdiv(S, BS), NT, H)
+    cu_arg = i32_flat(cu_seqlens)
+    ci_arg = i32_flat(chunk_indices)
+    grid = (cdiv(S, BS), NT, H)
     ct.launch(
         stream,
         grid,
         chunk_local_cumsum_vector_kernel,
         (
-            g_org.reshape(-1),
+            reshaped(g_org, (-1,)),
             g_out.reshape(-1),
             scale_val,
             cu_arg,
@@ -2832,7 +2677,6 @@ def chunk_local_cumsum(
     stream=None,
 ):
     stream = 0 if stream is None else stream
-    assert len(g.shape) == 3, f"KDA chunk_local_cumsum expects a (T, HV, K) vector gate, got shape {tuple(g.shape)}"
     return chunk_local_cumsum_vector(
         g=g,
         chunk_size=chunk_size,
@@ -2861,27 +2705,23 @@ def kda_gate_chunk_cumsum(
     stream = 0 if stream is None else stream
     T, H, S = g.shape
     BT = chunk_size
-    if cu_seqlens is None or chunk_indices is None:
-        raise ValueError("cu_seqlens and chunk_indices are required (THD layout; callers build the (seq, intra) table)")
-    if out is None:
-        raise ValueError("kda_gate_chunk_cumsum requires a pre-allocated out= buffer (fp32, g-shaped)")
     NT = len(chunk_indices)
     assert chunk_size == 2 ** (chunk_size.bit_length() - 1), "chunk_size must be a power of 2"
-    BS = min(_BS_LIST_DEFAULT, _next_power_of_2(S))
+    BS = min(BS_LIST_DEFAULT, next_power_of_2(S))
     g_out = reshaped(out, (T, H, S))
-    dt_arg = _opt(dt_bias, bufs, _dtname(A_log)).reshape(-1)
+    dt_arg = reshaped(opt(dt_bias, bufs, dtname(A_log)), (-1,))
     scale_val = float(scale) if scale is not None else 0.0
     lb_val = float(lower_bound) if lower_bound is not None else 0.0
-    cu_arg = _i32_flat(cu_seqlens)
-    ci_arg = _i32_flat(chunk_indices)
-    grid = (_cdiv(S, BS), NT, H)
+    cu_arg = i32_flat(cu_seqlens)
+    ci_arg = i32_flat(chunk_indices)
+    grid = (cdiv(S, BS), NT, H)
     ct.launch(
         stream,
         grid,
         kda_gate_chunk_cumsum_vector_kernel,
         (
-            g.reshape(-1),
-            A_log.reshape(-1),
+            reshaped(g, (-1,)),
+            reshaped(A_log, (-1,)),
             dt_arg,
             g_out.reshape(-1),
             scale_val,
@@ -2909,15 +2749,13 @@ def kda_gate_bwd(g, A_log, dt_bias=None, dyg=None, lower_bound=None, dg_out=None
     H, K = g.shape[-2:]
     T = g.numel() // (H * K)
     BT = 32
-    NT = _cdiv(T, BT)
-    BD = _next_power_of_2(K)
-    if dg_out is None or dA_out is None or (dt_bias is not None and dbias_out is None):
-        raise ValueError("kda_gate_bwd requires pre-allocated dg_out=, dA_out= (and dbias_out= with dt_bias)")
+    NT = cdiv(T, BT)
+    BD = next_power_of_2(K)
     dg = reshaped(dg_out, tuple(g.shape))
     dA_nt = reshaped(bufs["dA_gate"], (NT, H))
     db_nt = reshaped(bufs["db_gate"], (NT, H * K)) if dt_bias is not None else None
-    dt_arg = _opt(dt_bias, bufs, _dtname(A_log)).reshape(-1)
-    db_arg = db_nt.reshape(-1) if db_nt is not None else _dummy("float32", bufs)
+    dt_arg = reshaped(opt(dt_bias, bufs, dtname(A_log)), (-1,))
+    db_arg = db_nt.reshape(-1) if db_nt is not None else dummy("float32", bufs)
     lb_val = float(lower_bound) if lower_bound is not None else 0.0
     grid = (NT, H)
     ct.launch(
@@ -2925,10 +2763,10 @@ def kda_gate_bwd(g, A_log, dt_bias=None, dyg=None, lower_bound=None, dg_out=None
         grid,
         kda_gate_bwd_kernel,
         (
-            g.reshape(-1),
-            A_log.reshape(-1),
+            reshaped(g, (-1,)),
+            reshaped(A_log, (-1,)),
             dt_arg,
-            dyg.reshape(-1),
+            reshaped(dyg, (-1,)),
             dg.reshape(-1),
             dA_nt.reshape(-1),
             db_arg,
@@ -2955,28 +2793,26 @@ def chunk_gla_fwd_o_gk(q, v, g, A, h, scale, state_v_first=False, cu_seqlens=Non
     stream = 0 if stream is None else stream
     T, H, K, HV, V = *q.shape, v.shape[1], v.shape[-1]
     BT = chunk_size
-    if cu_seqlens is None or chunk_indices is None:
-        raise ValueError("cu_seqlens and chunk_indices are required (THD layout; callers build the (seq, intra) table)")
     NT = len(chunk_indices)
     o = bufs["o"]
     zero_fill(o, stream=stream)
-    BK = min(max(_next_power_of_2(K), 16), 64)
+    BK = min(max(next_power_of_2(K), 16), 64)
     # BV=128 when V<=128 removes the V grid-split
     # (grid dim0 -> 1), doubling work/block but halving launched blocks.
     BV = 128 if V <= 128 else 64
-    dev = _dev_id(q)
-    cu_arg = _i32_flat(cu_seqlens)
-    ci_arg = _i32_flat(chunk_indices)
+    dev = dev_id(q)
+    cu_arg = i32_flat(cu_seqlens)
+    ci_arg = i32_flat(chunk_indices)
 
-    grid = (_cdiv(V, BV), NT, HV)
+    grid = (cdiv(V, BV), NT, HV)
 
     # Kernel uses flat element-offset gather/scatter; pass 1-D views so the
     # cuTile index-tuple rank (1) matches the array rank.
-    _q_arg = q.reshape(-1)
+    _q_arg = reshaped(q, (-1,))
     _v_arg = v.reshape(-1)
     _g_arg = g.reshape(-1)
     _h_arg = h.reshape(-1)
-    _o_arg = o.reshape(-1)
+    _o_arg = reshaped(o, (-1,))
     _A_arg = A.reshape(-1)
     _o_args = (
         _q_arg,
@@ -2998,8 +2834,7 @@ def chunk_gla_fwd_o_gk(q, v, g, A, h, scale, state_v_first=False, cu_seqlens=Non
         int(state_v_first),
     )
     # Launch-hint autotune (occupancy x num_worker_warps) on this
-    # output-projection kernel. Default config
-    # is tried first so non-improving shapes are unchanged.
+    # output-projection kernel.
     _o_key = (
         "chunk_gla_fwd_kernel_o",
         int(H),
@@ -3013,7 +2848,7 @@ def chunk_gla_fwd_o_gk(q, v, g, A, h, scale, state_v_first=False, cu_seqlens=Non
         str(q.dtype),
         str(dev),
     )
-    _autotuned_launch(chunk_gla_fwd_kernel_o, _o_key, grid, _o_args, occ_choices=(1, 2, 4), nww_choices=(4,), stream=stream)
+    autotuned_launch(chunk_gla_fwd_kernel_o, _o_key, grid, _o_args, occ_choices=(1, 2, 4), nww_choices=(4,), stream=stream)
     return o
 
 
@@ -3040,30 +2875,28 @@ def chunk_gated_delta_rule_fwd_h(
     stream = 0 if stream is None else stream
     T, H, K, V, HV = *k.shape, u.shape[-1], u.shape[1]
     BT = chunk_size
-    if cu_seqlens is None or chunk_indices is None:
-        raise ValueError("cu_seqlens and chunk_indices are required (THD layout; callers build the (seq, intra) table)")
     N, NT = len(cu_seqlens) - 1, len(chunk_indices)
     chunk_offsets = bufs["chunk_offsets"]
     # Full-width state/K tile: BK = next_pow2(K). The blockdim64 kernel carries the
     # KV state as a single (BV, BK)/(BK, BV) tile (no K<=256 cap); K-axis loads
     # zero-pad [K:BK] and stores drop it, so any K is supported.
-    BK = _next_power_of_2(K)
+    BK = next_power_of_2(K)
 
     state_shape = (N, HV, V, K) if state_v_first else (N, HV, K, V)
-    h = reshaped(bufs["h"], (NT, HV) + state_shape[2:])
-    final_state = reshaped(bufs["fs"], state_shape) if output_final_state else None
+    h = reshaped(bufs["state_checkpoints"], (NT, HV) + state_shape[2:])
+    final_state = reshaped(bufs["final_state"], state_shape) if output_final_state else None
     if final_state is not None:
         zero_fill(final_state, stream=stream)
     v_new = reshaped(bufs["v_new"], (T, HV, V)) if save_new_value else None
 
-    dev = _dev_id(k)
-    vnew_arg = v_new if v_new is not None else _dummy(_dtname(u), bufs)
-    g_arg = _opt(g, bufs)
-    gk_arg = _opt(gk, bufs)
-    h0_arg = initial_state if initial_state is not None else _dummy("float32", bufs)
-    ht_arg = final_state if final_state is not None else _dummy("float32", bufs)
-    cu_arg = _i32_flat(cu_seqlens)
-    co_arg = _i32_flat(chunk_offsets)
+    dev = dev_id(k)
+    vnew_arg = v_new if v_new is not None else dummy(dtname(u), bufs)
+    g_arg = opt(g, bufs)
+    gk_arg = opt(gk, bufs)
+    h0_arg = initial_state if initial_state is not None else dummy("float32", bufs)
+    ht_arg = final_state if final_state is not None else dummy("float32", bufs)
+    cu_arg = i32_flat(cu_seqlens)
+    co_arg = i32_flat(chunk_offsets)
 
     # Kernel uses flat element-offset gather/scatter; pass 1-D views so the
     # cuTile index-tuple rank (1) matches the array rank.
@@ -3072,22 +2905,17 @@ def chunk_gated_delta_rule_fwd_h(
     _w_arg = w.reshape(-1)
     _vnew_arg = vnew_arg.reshape(-1)
     _h_arg = h.reshape(-1)
-    _h01d = h0_arg.reshape(-1)
-    _ht1d = ht_arg.reshape(-1)
+    _h01d = reshaped(h0_arg, (-1,))
+    _ht1d = reshaped(ht_arg, (-1,))
     _g1d = g_arg.reshape(-1)
     _gk1d = gk_arg.reshape(-1)
 
     # BV is a V-tiling block width (drives the grid V-fan-out and the V-tile
     # shapes only; the K axis is always split into fixed 64-wide blocks, so BV
-    # never changes the numerics). ncu shows this latency-bound state scan is
-    # grid-under-filled at the previous hard-coded BV=32 (only cdiv(V,32)*N*HV
-    # CTAs, 1 block/SM) -- shrinking BV multiplies the CTA count and was the
-    # dominant fwd_h speedup (BV 32->8: 8192/K128 492->260us).
-    # Sweep BV over {16, 8, 32} (16 first => safe, beats baseline everywhere);
-    # the tuner picks the per-shape grid fill that best hides the inter-chunk
-    # latency.
+    # never changes the numerics). The tuner picks the per-shape grid fill that
+    # best hides the inter-chunk latency.
     def _grid_fn(bv):
-        return (_cdiv(V, bv), N * HV)
+        return (cdiv(V, bv), N * HV)
 
     def _args_fn(bv):
         return (
@@ -3137,19 +2965,13 @@ def chunk_gated_delta_rule_fwd_h(
     # capped at <= V so a single tile is never larger than V. The grid-fill
     # tradeoff is shape-dependent, not monotone: shrinking BV multiplies the
     # V-tile CTA count but each CTA is register-bound (255 reg -> ~1 block/SM)
-    # and redundantly reloads k/w/g, so past the point where the grid already
+    # and redundantly reloads K/W/G, so past the point where the grid already
     # fills the SMs a *larger* BV wins (fewer, fatter CTAs, higher warp
-    # occupancy). ncu on the dashboard shapes: at (T=2048,V=128,N*HV=64) BV=64
-    # (grid 128, warps_active 14%) is 246us vs BV=32 (grid 256, 8%) 289us vs
-    # BV=16 374us -- so 64 must be a candidate; at (T=1024,V=64,N*HV=64) BV=32
-    # (grid 128) 65us beats BV=64 (grid 64) 123us and BV=8 123us. The tuner
-    # benchmarks every candidate and picks the per-shape winner, so we offer the
-    # full {16, 8, 32, 64} sweep (mirrors the fwd-helper); 16 stays first as the
-    # safe DISABLE_TUNE/failure fallback.
+    # occupancy); 16 stays first as the safe DISABLE_TUNE/failure fallback.
     _bv_choices = tuple(bv for bv in (16, 8, 32, 64) if bv <= max(V, 8))
     if not _bv_choices:
         _bv_choices = (min(32, V),)
-    _autotuned_launch_bv(chunk_gated_delta_rule_fwd_kernel_h_blockdim64, _h_key, _bv_choices, _grid_fn, _args_fn, stream=stream)
+    autotuned_launch_bv(chunk_gated_delta_rule_fwd_kernel_h_blockdim64, _h_key, _bv_choices, _grid_fn, _args_fn, stream=stream)
     return h, v_new, final_state
 
 
@@ -3162,7 +2984,7 @@ def chunk_gated_delta_rule_bwd_dhu(
     g=None,
     gk=None,
     h0=None,
-    dht=None,
+    dstate_in=None,
     scale: float | None = None,
     state_v_first: bool = False,
     cu_seqlens=None,
@@ -3175,21 +2997,19 @@ def chunk_gated_delta_rule_bwd_dhu(
     T, H, K, V, HV = *q.shape, do.shape[-1], do.shape[1]
     BT = chunk_size
     # Full-width state/K tile: BK = next_pow2(K). The blockdim64 dhu kernel carries
-    # the dh state as a single (BV, BK)/(BK, BV) tile (no K<=256 cap); K-axis loads
-    # zero-pad/mask [K:BK] and stores drop it, so any K is supported. dh/dh0
+    # the dH state as a single (BV, BK)/(BK, BV) tile (no K<=256 cap); K-axis loads
+    # zero-pad/mask [K:BK] and stores drop it, so any K is supported. dH/dH0
     # carves stay K-wide.
-    BK = _next_power_of_2(K)
-    if cu_seqlens is None or chunk_indices is None:
-        raise ValueError("cu_seqlens and chunk_indices are required (THD layout; callers build the (seq, intra) table)")
+    BK = next_power_of_2(K)
     N, NT = len(cu_seqlens) - 1, len(chunk_indices)
     chunk_offsets = bufs["chunk_offsets"]
 
-    dh = reshaped(bufs["dh"], (NT, HV, V, K) if state_v_first else (NT, HV, K, V))
-    dh0 = reshaped(bufs["dh0"], tuple(h0.shape)) if h0 is not None else None
-    dv2 = reshaped(bufs["dv_dhu"], (T, HV, V))
+    dh = reshaped(bufs["dstate"], (NT, HV, V, K) if state_v_first else (NT, HV, K, V))
+    dh0 = reshaped(bufs["dstate0"], tuple(h0.shape)) if h0 is not None else None
+    dv2 = reshaped(bufs["dv_dstate_u"], (T, HV, V))
 
     BV = 64
-    grid = (_cdiv(V, BV), N * HV)
+    grid = (cdiv(V, BV), N * HV)
 
     ct.launch(
         stream,
@@ -3199,16 +3019,16 @@ def chunk_gated_delta_rule_bwd_dhu(
             q.reshape(-1),
             k.reshape(-1),
             w.reshape(-1),
-            _opt(g, bufs).reshape(-1),
-            _opt(gk, bufs).reshape(-1),
-            _opt(dht, bufs).reshape(-1),
-            (dh0 if dh0 is not None else _dummy("float32", bufs)).reshape(-1),
-            do.reshape(-1),
+            opt(g, bufs).reshape(-1),
+            opt(gk, bufs).reshape(-1),
+            reshaped(opt(dstate_in, bufs), (-1,)),
+            reshaped(dh0 if dh0 is not None else dummy("float32", bufs), (-1,)),
+            reshaped(do, (-1,)),
             dh.reshape(-1),
             dv.reshape(-1),
             dv2.reshape(-1),
-            _i32_flat(cu_seqlens),
-            _i32_flat(chunk_offsets),
+            i32_flat(cu_seqlens),
+            i32_flat(chunk_offsets),
             float(scale),
             H,
             HV,
@@ -3220,7 +3040,7 @@ def chunk_gated_delta_rule_bwd_dhu(
             int(g is not None),
             int(gk is not None),
             int(h0 is not None),
-            int(dht is not None),
+            int(dstate_in is not None),
             int(state_v_first),
         ),
     )
@@ -3237,31 +3057,29 @@ def recompute_w_u_fwd(k, v, beta, A, gk, q=None, cu_seqlens=None, chunk_indices=
     BT = A.shape[-1]
     BK = 32
     BV = 32
-    if cu_seqlens is None or chunk_indices is None:
-        raise ValueError("cu_seqlens and chunk_indices are required (THD layout; callers build the (seq, intra) table)")
     NT = len(chunk_indices)
-    dev = _dev_id(k)
+    dev = dev_id(k)
 
     w = reshaped(bufs["w"], (T, HV, K))
     u = reshaped(bufs["u"], (T, HV, V))
     qg = reshaped(bufs["qg"], (T, HV, K)) if q is not None else None
     kg = reshaped(bufs["kg"], (T, HV, K))
 
-    cu_arg = _i32_flat(cu_seqlens)
-    ci_arg = _i32_flat(chunk_indices)
-    q_arg = _opt(q, bufs, _dtname(k))
-    qg_arg = qg if qg is not None else _dummy(_dtname(k), bufs)
+    cu_arg = i32_flat(cu_seqlens)
+    ci_arg = i32_flat(chunk_indices)
+    q_arg = opt(q, bufs, dtname(k))
+    qg_arg = qg if qg is not None else dummy(dtname(k), bufs)
     # Kernel uses flat element-offset gather/scatter; pass 1-D views so the
     # cuTile index-tuple rank (1) matches the array rank. reshape(-1) on these
-    # contiguous tensors yields storage-aliasing views (outputs w/u/qg/kg too).
+    # contiguous tensors yields storage-aliasing views (outputs W/U/QG/KG too).
     _wu_grid = (NT, HV)
     _wu_args = (
-        q_arg.reshape(-1),
-        k.reshape(-1),
+        reshaped(q_arg, (-1,)),
+        reshaped(k, (-1,)),
         qg_arg.reshape(-1),
         kg.reshape(-1),
-        v.reshape(-1),
-        beta.reshape(-1),
+        reshaped(v, (-1,)),
+        reshaped(beta, (-1,)),
         w.reshape(-1),
         u.reshape(-1),
         A.reshape(-1),
@@ -3281,7 +3099,6 @@ def recompute_w_u_fwd(k, v, beta, A, gk, q=None, cu_seqlens=None, chunk_indices=
     )
     # Launch-hint autotune (occupancy x num_worker_warps) on this wy_fast
     # recompute kernel.
-    # The default config is tried first so non-improving shapes are unchanged.
     _wu_key = (
         "recompute_w_u_fwd_kda_kernel",
         int(H),
@@ -3296,7 +3113,7 @@ def recompute_w_u_fwd(k, v, beta, A, gk, q=None, cu_seqlens=None, chunk_indices=
         str(k.dtype),
         str(dev),
     )
-    _autotuned_launch(recompute_w_u_fwd_kda_kernel, _wu_key, _wu_grid, _wu_args, occ_choices=(1, 2, 4, 8), nww_choices=(4,), stream=stream)
+    autotuned_launch(recompute_w_u_fwd_kda_kernel, _wu_key, _wu_grid, _wu_args, occ_choices=(1, 2, 4, 8), nww_choices=(4,), stream=stream)
     return w, u, qg, kg
 
 
@@ -3313,21 +3130,21 @@ def chunk_kda_fwd_intra_token_parallel(q, k, gk, beta, Aqk, Akk, scale, cu_seqle
     # BC-wide j-loop (gathers reused across heads share the same row indexing).
     # BH in {1,2,4,8}; HV must be divisible for the grid split.
     BH = 4 if (HV % 4 == 0) else (2 if (HV % 2 == 0) else 1)
-    BK = _next_power_of_2(K)
-    cu_arg = _i32_flat(cu_seqlens)
-    grid = (T, _cdiv(HV, BH))
+    BK = next_power_of_2(K)
+    cu_arg = i32_flat(cu_seqlens)
+    grid = (T, cdiv(HV, BH))
     # cuTile gather/scatter index-tuple rank must match the array rank, so pass
-    # pre-flattened views: q/k -> (T*H, K), gk -> (T*HV, K), beta/Aqk/Akk -> 1-D.
+    # pre-flattened views: Q/K -> (T*H, K), Gk -> (T*HV, K), Beta/Aqk/Akk -> 1-D.
     # Aqk/Akk are contiguous, so reshape(-1) is a view aliasing the original storage.
     ct.launch(
         stream,
         grid,
         chunk_kda_fwd_kernel_intra_token_parallel,
         (
-            q.reshape(-1, K),
-            k.reshape(-1, K),
+            reshaped(q, (-1, K)),
+            reshaped(k, (-1, K)),
             gk.reshape(-1, K),
-            beta.reshape(-1),
+            reshaped(beta, (-1,)),
             Aqk.reshape(-1),
             Akk.reshape(-1),
             float(scale),
@@ -3369,40 +3186,38 @@ def chunk_kda_fwd_intra(
     # BC=32 (NC=2) for BT=64,K>=64. With NC=2 there
     # is exactly ONE off-diagonal pair -> only 2 live [32,32] accumulators (vs 12
     # [16,16] at NC=4), and its merged-inverse [32,32]@[32,32] ct.matmul lowers
-    # to HMMA (M=32) instead of SIMT scalar FADD/FMUL (M=16). See KDA fwd IR/SASS.
+    # to HMMA (M=32) instead of SIMT scalar FADD/FMUL (M=16).
     # K<64 falls back to BC=16/NC=4.
     BC = 32 if BT == 64 and K >= 64 else 16
-    if cu_seqlens is None or chunk_indices is None:
-        raise ValueError("cu_seqlens and chunk_indices are required (THD layout; callers build the (seq, intra) table)")
     NT = len(chunk_indices)
-    NC = _cdiv(BT, BC)
+    NC = cdiv(BT, BC)
     # use_split_diag_compute_solve: pre-solve diagonals in
     # inter_diag_compute_solve so inter_solve_fused can SKIP forward-substitution.
     use_split_diag_compute_solve = (not safe_gate) and BT == 64 and K >= 64
     use_solved_diagonal = safe_gate or use_split_diag_compute_solve
-    dev = _dev_id(k)
+    dev = dev_id(k)
 
     Aqk = reshaped(bufs["Aqk"], (T, HV, BT))
     Akk = reshaped(bufs["Akk"], (T, HV, BT))
     zero_fill(Akk, stream=stream)
     Akkd = reshaped(bufs["Akkd"], (T, HV, BC))
 
-    cu_arg = _i32_flat(cu_seqlens)
-    ci_arg = _i32_flat(chunk_indices)
+    cu_arg = i32_flat(cu_seqlens)
+    ci_arg = i32_flat(chunk_indices)
 
     # Step 1: diagonal blocks into Akkd (fp32). When use_solved_diagonal is set
     # (safe_gate OR the split path) the diagonals are PRE-SOLVED
     # here so the inter-solve kernel can skip forward-substitution.
     if use_solved_diagonal:
-        BK = _next_power_of_2(K)
+        BK = next_power_of_2(K)
         # Kernel uses flat element-offset gather/scatter; pass 1-D views so the
         # cuTile index-tuple rank (1) matches the array rank.
         _diag_grid = (NT, NC, HV)
         _diag_args = (
-            q.reshape(-1),
-            k.reshape(-1),
+            reshaped(q, (-1,)),
+            reshaped(k, (-1,)),
             gk.reshape(-1),
-            beta.reshape(-1),
+            reshaped(beta, (-1,)),
             Aqk.reshape(-1),
             Akkd.reshape(-1),
             float(scale),
@@ -3416,8 +3231,7 @@ def chunk_kda_fwd_intra(
             BK,
         )
         # Launch-hint autotune (occupancy x num_worker_warps) on this aux
-        # kernel; fixed default hints (occ=1, nww=4) ran ~2.9x slower. The
-        # default config is tried first so non-improving shapes are unchanged.
+        # kernel.
         _diag_key = (
             "chunk_kda_fwd_kernel_inter_diag_compute_solve",
             int(H),
@@ -3430,7 +3244,7 @@ def chunk_kda_fwd_intra(
             str(k.dtype),
             str(dev),
         )
-        _autotuned_launch(chunk_kda_fwd_kernel_inter_diag_compute_solve, _diag_key, _diag_grid, _diag_args, stream=stream)
+        autotuned_launch(chunk_kda_fwd_kernel_inter_diag_compute_solve, _diag_key, _diag_grid, _diag_args, stream=stream)
     else:
         Aqk, Akkd = chunk_kda_fwd_intra_token_parallel(
             q=q, k=k, gk=gk, beta=beta, Aqk=Aqk, Akk=Akkd, scale=scale, cu_seqlens=cu_seqlens, chunk_size=BT, sub_chunk_size=BC, stream=stream
@@ -3441,16 +3255,15 @@ def chunk_kda_fwd_intra(
     # kernel. The fused kernel handles NC>=3/NC>=4 internally (block-triangular
     # forward-substitution over all sub-chunk pairs). With use_solved_diagonal
     # the forward-substitution is skipped.
-    BKf = _next_power_of_2(K)
+    BKf = next_power_of_2(K)
     # Launch-hint autotune (occupancy x num_worker_warps) on this fused
-    # solve kernel. The
-    # default config is tried first so non-improving shapes are unchanged.
+    # solve kernel.
     _isf_grid = (NT, HV)
     _isf_args = (
-        q.reshape(-1),
-        k.reshape(-1),
+        reshaped(q, (-1,)),
+        reshaped(k, (-1,)),
         gk.reshape(-1),
-        beta.reshape(-1),
+        reshaped(beta, (-1,)),
         Aqk.reshape(-1),
         Akkd.reshape(-1),
         Akk.reshape(-1),
@@ -3479,7 +3292,7 @@ def chunk_kda_fwd_intra(
         str(k.dtype),
         str(dev),
     )
-    _autotuned_launch(chunk_kda_fwd_kernel_inter_solve_fused, _isf_key, _isf_grid, _isf_args, occ_choices=(1, 2, 4), nww_choices=(4,), stream=stream)
+    autotuned_launch(chunk_kda_fwd_kernel_inter_solve_fused, _isf_key, _isf_grid, _isf_args, occ_choices=(1, 2, 4), nww_choices=(4,), stream=stream)
     w, u, qg, kg = recompute_w_u_fwd(
         k=k, v=v, beta=beta, A=Akk, q=q if disable_recompute else None, gk=gk, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices, bufs=bufs, stream=stream
     )
@@ -3493,25 +3306,22 @@ def chunk_kda_bwd_intra(q, k, g, beta, dAqk, dAkk, dq, dk, db, dg, cu_seqlens=No
     # Fast path: for BT >= 64 use larger
     # BC=32 / BK=64 sub-tiles and route through the SAFE_GATE matmul branch
     # instead of the BC-iteration scalar `for j` loops. The scalar path is the
-    # bwd bottleneck; the matmul branch is numerically
-    # equivalent (it is the same code reached when the user sets safe_gate=True).
+    # bwd bottleneck.
     use_fast_path = BT >= 64
     BC = 32 if use_fast_path else min(16, BT)
-    BK = min(64 if use_fast_path else 32, _next_power_of_2(K))
+    BK = min(64 if use_fast_path else 32, next_power_of_2(K))
     safe_gate = safe_gate or use_fast_path
-    if cu_seqlens is None or chunk_indices is None:
-        raise ValueError("cu_seqlens and chunk_indices are required (THD layout; callers build the (seq, intra) table)")
     NT = len(chunk_indices)
-    NC = _cdiv(BT, BC)
-    NK = _cdiv(K, BK)
+    NC = cdiv(BT, BC)
+    NK = cdiv(K, BK)
 
     dq2 = reshaped(bufs["dq2"], (T, HV, K))
     dk2 = reshaped(bufs["dk2"], (T, HV, K))
     db2 = reshaped(bufs["db2"], (NK, T, HV))
     dg2 = reshaped(bufs["dg2"], (T, HV, K))
 
-    cu_arg = _i32_flat(cu_seqlens)
-    ci_arg = _i32_flat(chunk_indices)
+    cu_arg = i32_flat(cu_seqlens)
+    ci_arg = i32_flat(chunk_indices)
     grid = (NK * NC, NT, HV)
     # Kernel uses flat element-offset gather/scatter; pass 1-D views.
     ct.launch(
@@ -3519,10 +3329,10 @@ def chunk_kda_bwd_intra(q, k, g, beta, dAqk, dAkk, dq, dk, db, dg, cu_seqlens=No
         grid,
         chunk_kda_bwd_kernel_intra,
         (
-            q.reshape(-1),
-            k.reshape(-1),
+            reshaped(q, (-1,)),
+            reshaped(k, (-1,)),
             g.reshape(-1),
-            beta.reshape(-1),
+            reshaped(beta, (-1,)),
             dAqk.reshape(-1),
             dAkk.reshape(-1),
             dq.reshape(-1),
@@ -3547,7 +3357,7 @@ def chunk_kda_bwd_intra(q, k, g, beta, dAqk, dAkk, dq, dk, db, dg, cu_seqlens=No
     )
     dq = dq2
     dk = dk2
-    # db += sum_nk db2 (fp32 acc); the fan-in NK is a compile-time constant
+    # dBeta += sum_nk dBeta2 (fp32 acc); the fan-in NK is a compile-time constant
     sum_leading(reshaped(db, (T * HV,)), reshaped(db2, (NK, T * HV)), NK, T * HV, stream=stream, accumulate=True)
     dg = dg2
     return dq, dk, db, dg
@@ -3560,28 +3370,26 @@ def chunk_kda_bwd_dAv(q, k, v, do, A=None, scale=None, cu_seqlens=None, chunk_si
     stream = 0 if stream is None else stream
     T, H, K, HV, V = *k.shape, do.shape[1], do.shape[-1]
     BT = chunk_size
-    if cu_seqlens is None or chunk_indices is None:
-        raise ValueError("cu_seqlens and chunk_indices are required (THD layout; callers build the (seq, intra) table)")
     CONST_TILING = 64
-    BK = min(max(_next_power_of_2(K), 16), CONST_TILING)
-    BV = min(max(_next_power_of_2(V), 16), CONST_TILING)
+    BK = min(max(next_power_of_2(K), 16), CONST_TILING)
+    BV = min(max(next_power_of_2(V), 16), CONST_TILING)
     NT = len(chunk_indices)
 
     dA = reshaped(bufs["dAqk"], (T, HV, BT))
     dv = reshaped(bufs["dv_dAv"], (T, HV, V))
-    cu_arg = _i32_flat(cu_seqlens)
-    ci_arg = _i32_flat(chunk_indices)
+    cu_arg = i32_flat(cu_seqlens)
+    ci_arg = i32_flat(chunk_indices)
     # Kernel uses flat element-offset gather/scatter; pass 1-D views.
     ct.launch(
         stream,
         (NT, HV),
         chunk_kda_bwd_kernel_dAv,
         (
-            q.reshape(-1),
-            k.reshape(-1),
+            reshaped(q, (-1,)),
+            reshaped(k, (-1,)),
             v.reshape(-1),
             A.reshape(-1),
-            do.reshape(-1),
+            reshaped(do, (-1,)),
             dv.reshape(-1),
             dA.reshape(-1),
             cu_arg,
@@ -3622,12 +3430,10 @@ def chunk_kda_bwd_wy_dqkg_fused(
     stream = 0 if stream is None else stream
     T, H, K, HV, V = *k.shape, v.shape[1], v.shape[-1]
     BT = chunk_size
-    if cu_seqlens is None or chunk_indices is None:
-        raise ValueError("cu_seqlens and chunk_indices are required (THD layout; callers build the (seq, intra) table)")
     NT = len(chunk_indices)
     CONST_TILING = 64
-    BK = min(max(_next_power_of_2(K), 16), CONST_TILING)
-    BV = min(max(_next_power_of_2(V), 16), CONST_TILING)
+    BK = min(max(next_power_of_2(K), 16), CONST_TILING)
+    BV = min(max(next_power_of_2(V), 16), CONST_TILING)
 
     dq = reshaped(bufs["dq"], (T, HV, K))
     dk = reshaped(bufs["dk"], (T, HV, K))
@@ -3643,15 +3449,15 @@ def chunk_kda_bwd_wy_dqkg_fused(
         grid,
         chunk_kda_bwd_kernel_wy_dqkg_fused,
         (
-            q.reshape(-1),
-            k.reshape(-1),
-            v.reshape(-1),
+            reshaped(q, (-1,)),
+            reshaped(k, (-1,)),
+            reshaped(v, (-1,)),
             v_new.reshape(-1),
             g.reshape(-1),
-            beta.reshape(-1),
+            reshaped(beta, (-1,)),
             A.reshape(-1),
             h.reshape(-1),
-            do.reshape(-1),
+            reshaped(do, (-1,)),
             dh.reshape(-1),
             dq.reshape(-1),
             dk.reshape(-1),
@@ -3660,8 +3466,8 @@ def chunk_kda_bwd_wy_dqkg_fused(
             dg.reshape(-1),
             db.reshape(-1),
             dA.reshape(-1),
-            _i32_flat(cu_seqlens),
-            _i32_flat(chunk_indices),
+            i32_flat(cu_seqlens),
+            i32_flat(chunk_indices),
             float(scale),
             H,
             HV,
@@ -3703,12 +3509,12 @@ def chunk_kda_fwd(
     dt_bias=None,
     disable_recompute=False,
     return_intermediate_states=False,
+    compute_o=True,
     cp_context=None,
     bufs=None,
     stream=None,
 ):
     stream = 0 if stream is None else stream
-    assert cp_context is None, "context-parallel path is not supported in this self-contained port"
     g_org = None
     if use_gate_in_kernel:
         g_org = g
@@ -3768,20 +3574,22 @@ def chunk_kda_fwd(
         stream=stream,
     )
 
-    o = chunk_gla_fwd_o_gk(
-        q=q,
-        v=v_new,
-        g=g,
-        A=Aqk,
-        h=h,
-        scale=scale,
-        cu_seqlens=cu_seqlens,
-        chunk_size=chunk_size,
-        chunk_indices=chunk_indices,
-        state_v_first=state_v_first,
-        bufs=bufs,
-        stream=stream,
-    )
+    o = None
+    if compute_o:
+        o = chunk_gla_fwd_o_gk(
+            q=q,
+            v=v_new,
+            g=g,
+            A=Aqk,
+            h=h,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            chunk_size=chunk_size,
+            chunk_indices=chunk_indices,
+            state_v_first=state_v_first,
+            bufs=bufs,
+            stream=stream,
+        )
     if disable_recompute is False:
         w, u, qg, kg, v_new = None, None, None, None, None
         if not return_intermediate_states:
@@ -3801,7 +3609,7 @@ def chunk_kda_bwd(
     scale,
     initial_state,
     do,
-    dht,
+    dstate_in,
     g=None,
     g_org=None,
     state_v_first=False,
@@ -3820,7 +3628,6 @@ def chunk_kda_bwd(
     **kwargs,
 ):
     stream = 0 if stream is None else stream
-    assert cp_context is None, "context-parallel path is not supported in this self-contained port"
     H, HV = q.shape[1], v.shape[1]
     G = HV // H
 
@@ -3867,7 +3674,7 @@ def chunk_kda_bwd(
         w=w,
         gk=g,
         h0=initial_state,
-        dht=dht,
+        dstate_in=dstate_in,
         do=do,
         dv=dv,
         scale=scale,
@@ -3919,7 +3726,7 @@ def chunk_kda_bwd(
         stream=stream,
     )
 
-    # For GVA, reduce dq and dk from [T, HV, K] back to [T, H, K]
+    # For GVA, reduce dQ and dK from [T, HV, K] back to [T, H, K]
     if HV > H:
         T_, K_ = dq.shape[0], dq.shape[-1]
         dq_r = reshaped(bufs["dq_hred"], (T_, H, K_))
@@ -3959,7 +3766,7 @@ def chunk_kda_grad(
     g,
     beta,
     do,
-    dht=None,
+    dstate_in=None,
     scale=None,
     initial_state=None,
     use_qk_l2norm_in_kernel=False,
@@ -3983,7 +3790,7 @@ def chunk_kda_grad(
     ``q``/``k``/``v``/``do`` are ``[total_T, H, D]``, ``g`` is
     ``[total_T, HV, K]``, ``beta`` is ``[total_T, HV]``; ``cu_seqlens`` and
     ``chunk_indices`` are required. Recomputes the forward's prep
-    (L2-normalized q/k + rstd, cumulative gate, WY factors, per-chunk
+    (L2-normalized Q/K + rstd, cumulative gate, WY factors, per-chunk
     states) from the inputs, then runs the backward kernels; intermediates
     live in the ``bufs`` carves when provided.
 
@@ -3992,8 +3799,6 @@ def chunk_kda_grad(
     present).
     """
     stream = 0 if stream is None else stream
-    if cu_seqlens is None:
-        raise ValueError("cu_seqlens is required (THD layout)")
     if scale is None:
         scale = q.shape[-1] ** -0.5
     q_rstd, k_rstd = None, None
@@ -4004,8 +3809,6 @@ def chunk_kda_grad(
     beta_raw = beta
     if use_beta_sigmoid_in_kernel:
         beta = fused_beta_sigmoid(beta_raw, scale=2.0 if allow_neg_eigval else 1.0, out=bufs["beta_sig"], stream=stream)
-    if cu_seqlens is not None and chunk_indices is None:
-        raise ValueError("varlen (cu_seqlens) requires chunk_indices — callers build the (seq, intra) table")
     _o, _fs, g_cumsum, Aqk, Akk, w, u, qg, kg, v_new, h, initial_state = chunk_kda_fwd(
         q=q_in,
         k=k_in,
@@ -4025,6 +3828,8 @@ def chunk_kda_grad(
         dt_bias=dt_bias,
         chunk_size=chunk_size,
         state_v_first=state_v_first,
+        disable_recompute=True,
+        compute_o=False,
         bufs=bufs,
         stream=stream,
     )
@@ -4038,7 +3843,7 @@ def chunk_kda_grad(
         scale=scale,
         initial_state=initial_state,
         do=do,
-        dht=dht,
+        dstate_in=dstate_in,
         g=g_cumsum,
         g_org=g if use_gate_in_kernel else None,
         state_v_first=state_v_first,
@@ -4050,6 +3855,7 @@ def chunk_kda_grad(
         use_gate_in_kernel=use_gate_in_kernel,
         A_log=A_log,
         dt_bias=dt_bias,
+        disable_recompute=True,
         bufs=bufs,
         w=w,
         u=u,
@@ -4065,11 +3871,11 @@ def chunk_kda_grad(
     if use_beta_sigmoid_in_kernel:
         db = fused_beta_sigmoid_bwd(beta_raw, db, scale=2.0 if allow_neg_eigval else 1.0, out=db, stream=stream)
     return (
-        _cast(bufs, "dq_cast", dq, q),
-        _cast(bufs, "dk_cast", dk, k),
-        _cast(bufs, "dv_cast", dv, v),
-        _cast(bufs, "dg_cast", dg, g),
-        _cast(bufs, "db_cast", db, beta_raw),
+        cast(bufs, "dq_cast", dq, q),
+        cast(bufs, "dk_cast", dk, k),
+        cast(bufs, "dv_cast", dv, v),
+        cast(bufs, "dg_cast", dg, g),
+        cast(bufs, "db_cast", db, beta_raw),
         dh0,
         dA,
         dbias,
@@ -4110,48 +3916,19 @@ def chunk_kda(
     THD layout, written into ``bufs['o']`` / ``bufs['fs']``."""
     stream = 0 if stream is None else stream
     if "transpose_state_layout" in kwargs:
-        if state_v_first:
-            raise ValueError("Cannot pass both `state_v_first` and the deprecated `transpose_state_layout`.")
         state_v_first = kwargs.pop("transpose_state_layout")
-
-    assert cp_context is None, "context-parallel path is not supported in this self-contained port"
-
-    if cu_seqlens is None:
-        raise ValueError("cu_seqlens is required (THD layout)")
-    if initial_state is not None and initial_state.shape[0] != len(cu_seqlens) - 1:
-        raise ValueError(
-            f"The number of initial states is expected to equal the number of input sequences, "
-            f"i.e., {len(cu_seqlens) - 1} rather than {initial_state.shape[0]}.",
-        )
-    if initial_state is not None:
-        assert str(initial_state.dtype).endswith("float32"), "initial_state must be in float32."
 
     A_log, dt_bias = None, None
     if use_gate_in_kernel:
-        assert "A_log" in kwargs, "A_log must be provided when use_gate_in_kernel=True."
         A_log, dt_bias = kwargs["A_log"], kwargs.get("dt_bias")
 
     chunk_size = kwargs.pop("chunk_size", 64)
-    if chunk_size not in (32, 64):
-        raise ValueError(f"`chunk_size` must be either 32 or 64 for KDA, got {chunk_size}.")
 
     if safe_gate and use_gate_in_kernel:
-        if lower_bound is None:
-            raise ValueError("`lower_bound` must be specified when `safe_gate=True` and `use_gate_in_kernel=True`.")
         if not (-5 <= lower_bound < 0):
             raise ValueError(f"`lower_bound` must be in the safe range [-5, 0), got {lower_bound}.")
 
-    if allow_neg_eigval and not use_beta_sigmoid_in_kernel:
-        raise ValueError("`allow_neg_eigval=True` requires `use_beta_sigmoid_in_kernel=True`.")
-
     T, H, K, HV = *q.shape, v.shape[1]
-    if k.shape[1] != H:
-        raise ValueError(f"q and k must have the same number of heads, got q.shape[1]={H} and k.shape[1]={k.shape[1]}")
-    if HV % H != 0:
-        raise ValueError(f"For GVA, HV ({HV}) must be divisible by H ({H}), got HV % H = {HV % H}")
-    assert q.shape == k.shape, f"q and k must have the same shape, got q={q.shape} vs k={k.shape}"
-    assert tuple(g.shape) == (T, HV, K), f"g must have shape [T, HV, K]={[T, HV, K]}, got {list(g.shape)}"
-    assert tuple(beta.shape) == (T, HV), f"beta must have shape [T, HV]={[T, HV]}, got {list(beta.shape)}"
 
     if scale is None:
         scale = K**-0.5
@@ -4162,8 +3939,6 @@ def chunk_kda(
         k_in, _k_rstd = l2norm_fwd(k, out=bufs["k_norm"], rstd_out=bufs["k_rstd"], stream=stream)
     if use_beta_sigmoid_in_kernel:
         beta = fused_beta_sigmoid(beta, scale=2.0 if allow_neg_eigval else 1.0, out=bufs["beta_sig"], stream=stream)
-    if cu_seqlens is not None and chunk_indices is None:
-        raise ValueError("varlen (cu_seqlens) requires chunk_indices — callers build the (seq, intra) table")
     o, final_state, _gc, _Aqk, _Akk, _w, _u, _qg, _kg, _vn, h, _s0 = chunk_kda_fwd(
         q=q_in,
         k=k_in,
