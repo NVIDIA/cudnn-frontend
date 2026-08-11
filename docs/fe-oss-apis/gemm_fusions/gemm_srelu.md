@@ -66,6 +66,8 @@ A (MxKxL), SFA                   B (NxKxL), SFB
 
 ## API Usage
 
+The tensor parameters are type-erased: torch tensors and JAX arrays are both accepted (torch is only imported when torch tensors/dtypes are passed, jax only when JAX arrays are passed). Dtype parameters accept torch dtypes, numpy/ml_dtypes dtypes, dtype name strings, or `cutlass` types. The JAX contract matches gemm_amax (see `gemm_amax.md` "Using JAX arrays"): A/B k-major `(M, K, 1)`/`(N, K, 1)`, outputs n-major only, batch `L == 1`, scale-factor tensors accepted in the physical C-contiguous atom shape `(L, MN', K', 32, 4, 4)`; the eager entry points run on the CUDA legacy default stream (synchronize before reading outputs). A `jax.jit`-compatible XLA custom-call entry point is not yet available for this kernel (its signature carries optional None-typed parameters that the jax-tvm-ffi bridge cannot supply).
+
 ### High-level wrapper
 
 ```python

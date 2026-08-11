@@ -8,7 +8,6 @@ from __future__ import annotations
 import os
 from typing import Optional, Tuple
 
-import torch
 from cuda.bindings import driver as cuda
 
 from cudnn.api_base import APIBase, TupleDict
@@ -37,7 +36,7 @@ class GroupedGemmSm100(APIBase):
         num_experts: Optional[int] = None,
         b_shape: Optional[Tuple[int, ...]] = None,
         b_dtype: Optional[torch.dtype] = None,
-        acc_dtype: torch.dtype = torch.float32,
+        acc_dtype: Optional[torch.dtype] = None,
         mma_tiler_mn: Tuple[int, int] = (256, 256),
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         vector_f32: bool = False,
@@ -50,6 +49,14 @@ class GroupedGemmSm100(APIBase):
         self._pending_init_kwargs = dict(locals())
         self._pending_init_kwargs.pop("self")
         self._pending_init_kwargs.pop("__class__", None)
+        from cudnn.tensor_adapter import is_torch_tensor
+
+        if sample_a is not None and not is_torch_tensor(sample_a):
+            raise ValueError("GroupedGemmSm100 currently supports torch tensors only; JAX support is not yet implemented for this API")
+        if acc_dtype is None:
+            import torch
+
+            self._pending_init_kwargs["acc_dtype"] = torch.float32
         self._implementation = None
 
     def check_support(self) -> bool:
@@ -157,6 +164,8 @@ def _normalize_call(
     cd_major: str,
     m_aligned: int,
 ) -> tuple[bool, int, int, int]:
+    import torch
+
     is_dense = b_tensor is not None
     is_discrete = b_ptrs is not None
     if is_dense and is_discrete:
@@ -234,9 +243,9 @@ def grouped_gemm_wrapper_sm100(
     b_dtype: Optional[torch.dtype] = None,
     b_major: str = "k",
     prob_tensor: Optional[torch.Tensor] = None,
-    acc_dtype: torch.dtype = torch.float32,
-    c_dtype: torch.dtype = torch.bfloat16,
-    d_dtype: torch.dtype = torch.bfloat16,
+    acc_dtype: Optional[torch.dtype] = None,
+    c_dtype: Optional[torch.dtype] = None,
+    d_dtype: Optional[torch.dtype] = None,
     c_tensor: Optional[torch.Tensor] = None,
     d_tensor: Optional[torch.Tensor] = None,
     cd_major: str = "n",
@@ -248,6 +257,18 @@ def grouped_gemm_wrapper_sm100(
     use_dynamic_sched: bool = False,
     current_stream: Optional[cuda.CUstream] = None,
 ) -> TupleDict:
+    from cudnn.tensor_adapter import is_torch_tensor
+
+    if a_tensor is not None and not is_torch_tensor(a_tensor):
+        raise ValueError("grouped_gemm_wrapper_sm100 currently supports torch tensors only; JAX support is not yet implemented for this API")
+    import torch
+
+    if acc_dtype is None:
+        acc_dtype = torch.float32
+    if c_dtype is None:
+        c_dtype = torch.bfloat16
+    if d_dtype is None:
+        d_dtype = torch.bfloat16
     is_dense, tensor_m, n_out, expert_cnt = _normalize_call(
         a_tensor,
         padded_offsets,

@@ -2,8 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Fused projection GEMM + per-head YARN RoPE + dual-direction MXFP8 quantize (Blackwell / SM100)."""
 
-import torch
-
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils

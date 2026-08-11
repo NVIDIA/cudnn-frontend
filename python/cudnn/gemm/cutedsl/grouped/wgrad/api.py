@@ -8,7 +8,6 @@ from __future__ import annotations
 from typing import Any, Optional, Tuple, overload
 import os
 
-import torch
 from cuda.bindings import driver as cuda
 
 from cudnn.api_base import APIBase, TupleDict, get_device_type
@@ -22,15 +21,25 @@ from ..backend_utils import (
 )
 from ..moe_utils import WGradInputOrder
 
-_BLOCK_SCALED_DTYPE_PAIRS = {
-    (dtype, dtype)
-    for dtype in (
-        torch.float4_e2m1fn_x2,
-        torch.uint8,
-        torch.float8_e5m2,
-        torch.float8_e4m3fn,
-    )
-}
+_BLOCK_SCALED_DTYPE_PAIRS = None
+
+
+def _block_scaled_dtype_pairs():
+    global _BLOCK_SCALED_DTYPE_PAIRS
+    if _BLOCK_SCALED_DTYPE_PAIRS is None:
+        import torch
+
+        _BLOCK_SCALED_DTYPE_PAIRS = {
+            (dtype, dtype)
+            for dtype in (
+                torch.float4_e2m1fn_x2,
+                torch.uint8,
+                torch.float8_e5m2,
+                torch.float8_e4m3fn,
+            )
+        }
+    return _BLOCK_SCALED_DTYPE_PAIRS
+
 
 _cache_of_GroupedGemmWgradSm100Objects = {}
 
@@ -86,7 +95,7 @@ class GroupedGemmWgradSm100(APIBase):
         wgrad_dtype: Optional[torch.dtype] = None,
         sample_global_scale_a: Optional[torch.Tensor] = None,
         sample_global_scale_b: Optional[torch.Tensor] = None,
-        acc_dtype: torch.dtype = torch.float32,
+        acc_dtype: Optional[torch.dtype] = None,
         mma_tiler_mn: Tuple[int, int] = (256, 256),
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         sf_vec_size: int = 16,
@@ -97,6 +106,14 @@ class GroupedGemmWgradSm100(APIBase):
         self._pending_init_kwargs = dict(locals())
         self._pending_init_kwargs.pop("self")
         self._pending_init_kwargs.pop("__class__", None)
+        from cudnn.tensor_adapter import is_torch_tensor
+
+        if sample_a is not None and not is_torch_tensor(sample_a):
+            raise ValueError("GroupedGemmWgradSm100 currently supports torch tensors only; JAX support is not yet implemented for this API")
+        if acc_dtype is None:
+            import torch
+
+            self._pending_init_kwargs["acc_dtype"] = torch.float32
         self._implementation = None
 
     def check_support(self) -> bool:
@@ -113,7 +130,7 @@ class GroupedGemmWgradSm100(APIBase):
                     ("sample_global_scale_b", kwargs["sample_global_scale_b"]),
                     ("sf_vec_size", kwargs["sf_vec_size"] if kwargs["sf_vec_size"] != 16 else None),
                 ),
-                block_scaled_dtype_pairs=_BLOCK_SCALED_DTYPE_PAIRS,
+                block_scaled_dtype_pairs=_block_scaled_dtype_pairs(),
             )
             self.backend = backend
             if backend is GroupedGemmBackend.BF16:
@@ -218,8 +235,8 @@ def grouped_gemm_wgrad_wrapper_sm100(
     wgrad_ptrs: Optional[torch.Tensor] = None,
     global_scale_a: Optional[torch.Tensor] = None,
     global_scale_b: Optional[torch.Tensor] = None,
-    acc_dtype: torch.dtype = torch.float32,
-    wgrad_dtype: torch.dtype = torch.bfloat16,
+    acc_dtype: Optional[torch.dtype] = None,
+    wgrad_dtype: Optional[torch.dtype] = None,
     mma_tiler_mn: Tuple[int, int] = (256, 256),
     cluster_shape_mn: Optional[Tuple[int, int]] = None,
     sf_vec_size: int = 16,
@@ -228,6 +245,16 @@ def grouped_gemm_wgrad_wrapper_sm100(
     current_stream: Optional[cuda.CUstream] = None,
 ) -> TupleDict:
     """Compile and execute grouped GEMM wgrad through the selected backend API."""
+    from cudnn.tensor_adapter import is_torch_tensor
+
+    if a_tensor is not None and not is_torch_tensor(a_tensor):
+        raise ValueError("grouped_gemm_wgrad_wrapper_sm100 currently supports torch tensors only; JAX support is not yet implemented for this API")
+    import torch
+
+    if acc_dtype is None:
+        acc_dtype = torch.float32
+    if wgrad_dtype is None:
+        wgrad_dtype = torch.bfloat16
     if output_mode not in ("dense", "discrete"):
         raise ValueError(f'output_mode must be "dense" or "discrete", got {output_mode}')
     if a_tensor.ndim != 2 or b_tensor.ndim != 2:
@@ -255,7 +282,7 @@ def grouped_gemm_wgrad_wrapper_sm100(
             ("global_scale_b", global_scale_b),
             ("sf_vec_size", sf_vec_size if sf_vec_size != 16 else None),
         ),
-        block_scaled_dtype_pairs=_BLOCK_SCALED_DTYPE_PAIRS,
+        block_scaled_dtype_pairs=_block_scaled_dtype_pairs(),
     )
     if wgrad_tensor is None and wgrad_ptrs is None:
         allocator = torch.zeros if accumulate_on_output else torch.empty

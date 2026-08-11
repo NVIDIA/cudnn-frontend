@@ -80,6 +80,20 @@ dev = [
     "black==26.3.1",
     "clang-format==21.1.6",
 ]
+# Per-framework groups for the type-erased CuTeDSL GEMM APIs (JAX is supported
+# by the dense fusions: amax, swiglu, srelu, dsrelu): install with
+# `pip install --group torch` / `pip install --group jax`. GPU wheels
+# (torch cuXX, jax[cuda12]/[cuda13]) are left to the user.
+torch = [
+    "torch",
+    "torch-c-dlpack-ext",
+]
+# jax-tvm-ffi provides the jax.jit-compatible XLA custom-call entry points
+# (e.g. gemm_amax_jax_sm100) and requires Python >= 3.11.
+jax = [
+    "jax>=0.4.35",
+    "jax-tvm-ffi>=0.1.3",
+]
 
 [build-system]
 requires = ["setuptools>=64", "cmake>=3.18", "ninja==1.11.1.1", "pybind11[global]>=2.13,<3"]

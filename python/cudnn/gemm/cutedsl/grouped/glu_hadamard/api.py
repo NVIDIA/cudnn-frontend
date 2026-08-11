@@ -3,6 +3,8 @@
 
 """FE API for grouped GEMM GLU + Hadamard forward fusion."""
 
+from __future__ import annotations
+
 import logging
 import os
 from typing import Optional, Tuple
@@ -10,7 +12,6 @@ from typing import Optional, Tuple
 from cuda.bindings import driver as cuda
 import cutlass
 import cutlass.cute as cute
-import torch
 from cutlass.cute.nvgpu import OperandMajorMode
 from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
@@ -23,6 +24,8 @@ from .moe_blockscaled_grouped_gemm_glu_hadamard import BlockScaledMoEGroupedGemm
 
 
 def _reinterpret_raw_grouped_fp4_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    import torch
+
     if tensor.dtype == torch.uint8:
         cute_tensor = from_dlpack(tensor, assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=1)
         cute_tensor.element_type = cutlass.Float4E2M1FN
@@ -52,7 +55,7 @@ class GroupedGemmGluHadamardSm100(APIBase):
         sample_post_rht_amax: Optional[torch.Tensor] = None,
         sample_bias: Optional[torch.Tensor] = None,
         sample_hadamard: Optional[torch.Tensor] = None,
-        acc_dtype: torch.dtype = torch.float32,
+        acc_dtype: Optional[torch.dtype] = None,
         mma_tiler_mn: Tuple[int, int] = (256, 256),
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         sf_vec_size: int = 16,
@@ -62,6 +65,14 @@ class GroupedGemmGluHadamardSm100(APIBase):
         use_dynamic_sched: bool = False,
         use_tmem_post_rht_amax: bool = False,
     ):
+        from cudnn.tensor_adapter import is_torch_tensor
+
+        if sample_a is not None and not is_torch_tensor(sample_a):
+            raise ValueError("GroupedGemmGluHadamardSm100 currently supports torch tensors only; JAX support is not yet implemented for this API")
+        import torch
+
+        if acc_dtype is None:
+            acc_dtype = torch.float32
         super().__init__()
 
         self._warn_experimental_api()
@@ -137,6 +148,8 @@ class GroupedGemmGluHadamardSm100(APIBase):
 
     @staticmethod
     def _make_hadamard_tensor(device: torch.device) -> torch.Tensor:
+        import torch
+
         return hadamard_matrix(HADAMARD_SIZE, dtype=torch.bfloat16, device=device).t().contiguous()
 
     @classmethod
@@ -147,6 +160,8 @@ class GroupedGemmGluHadamardSm100(APIBase):
         device: torch.device,
         name: str,
     ) -> torch.Tensor:
+        import torch
+
         expected_shape = (HADAMARD_SIZE, HADAMARD_SIZE)
         if tuple(hadamard_tensor.shape) != expected_shape:
             raise ValueError(f"{name} tensor shape mismatch: expected {expected_shape}, got {tuple(hadamard_tensor.shape)}")
@@ -157,6 +172,8 @@ class GroupedGemmGluHadamardSm100(APIBase):
         return hadamard_tensor
 
     def check_support(self) -> bool:
+        import torch
+
         tensor_m, k, _ = self._tensor_shape(self.a_desc, name="sample_a")
         if self.weight_mode == MoEWeightMode.DENSE:
             n, _, l = self._tensor_shape(self.b_desc, name="sample_b")
@@ -280,6 +297,8 @@ class GroupedGemmGluHadamardSm100(APIBase):
         return True
 
     def compile(self) -> None:
+        import torch
+
         self._ensure_support_checked()
         if self._compiled_kernel is not None:
             return
@@ -514,6 +533,8 @@ class GroupedGemmGluHadamardSm100(APIBase):
         bias_tensor: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
     ) -> None:
+        import torch
+
         self._ensure_support_checked()
         if self._compiled_kernel is None:
             raise RuntimeError("Kernel has not been compiled")
@@ -588,9 +609,9 @@ def grouped_gemm_glu_hadamard_wrapper_sm100(
     b_dtype: Optional[torch.dtype] = None,
     b_major: str = "k",
     bias_tensor: Optional[torch.Tensor] = None,
-    acc_dtype: torch.dtype = torch.float32,
-    c_dtype: torch.dtype = torch.bfloat16,
-    d_dtype: torch.dtype = torch.bfloat16,
+    acc_dtype: Optional[torch.dtype] = None,
+    c_dtype: Optional[torch.dtype] = None,
+    d_dtype: Optional[torch.dtype] = None,
     cd_major: str = "n",
     mma_tiler_mn: Tuple[int, int] = (256, 256),
     cluster_shape_mn: Optional[Tuple[int, int]] = None,
@@ -604,6 +625,18 @@ def grouped_gemm_glu_hadamard_wrapper_sm100(
 ) -> TupleDict:
     """High-level wrapper for grouped GEMM GLU + Hadamard forward fusion."""
     from cudnn.gemm.cutedsl.discrete_grouped.discrete_kernel_utils import _require_pointer_tensor
+    from cudnn.tensor_adapter import is_torch_tensor
+
+    if a_tensor is not None and not is_torch_tensor(a_tensor):
+        raise ValueError("grouped_gemm_glu_hadamard_wrapper_sm100 currently supports torch tensors only; JAX support is not yet implemented for this API")
+    import torch
+
+    if acc_dtype is None:
+        acc_dtype = torch.float32
+    if c_dtype is None:
+        c_dtype = torch.bfloat16
+    if d_dtype is None:
+        d_dtype = torch.bfloat16
 
     valid_m = a_tensor.shape[0]
     is_dense = b_tensor is not None

@@ -12,9 +12,9 @@ This module contains:
 - Kernel helper functions that don't depend on kernel instance state
 """
 
-from typing import Type, Tuple, Union
+from __future__ import annotations
 
-import torch
+from typing import Type, Tuple, Union
 
 import cutlass
 import cutlass.cute as cute
@@ -401,6 +401,8 @@ def silu_f32_geglu_scaled(a: Union[float, Float32], fastmath: bool = False) -> U
 
 def sigmoid(x):
     """PyTorch reference sigmoid using exp2 for numerical consistency."""
+    import torch
+
     LOG2_E = 1.4426950408889634
     exp_x = torch.exp2(x * (-LOG2_E))
     ret = 1.0 / (exp_x + 1.0)
@@ -417,6 +419,8 @@ def compute_reference_amax(output_tensor: torch.Tensor) -> float:
     Returns:
         float: reference amax value
     """
+    import torch
+
     if output_tensor.dtype != torch.float32:
         output_fp32 = output_tensor.float()
     else:
@@ -446,6 +450,8 @@ def compare_and_report_mismatches(
         rtol: Relative tolerance
         max_mismatches: Maximum number of mismatches to report
     """
+    import torch
+
     if gpu_tensor.is_cuda:
         gpu_data = gpu_tensor.cpu()
     else:

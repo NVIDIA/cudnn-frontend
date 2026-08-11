@@ -17,12 +17,13 @@ Discrete mode
     at execution time.
 """
 
+from __future__ import annotations
+
 from .moe_blockscaled_grouped_gemm_dglu_dbias import BlockScaledMoEGroupedGemmDgluDbiasKernel
 from ..moe_utils import MoEWeightMode
 from ..backend_utils import rubin_single_group_offsets_kwarg
 from cuda.bindings import driver as cuda
 import os
-import torch
 from typing import Tuple, Optional
 
 import cutlass
@@ -123,7 +124,7 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
         sample_amax: Optional[torch.Tensor] = None,
         sample_norm_const: Optional[torch.Tensor] = None,
         # Configuration
-        acc_dtype: torch.dtype = torch.float32,
+        acc_dtype: Optional[torch.dtype] = None,
         mma_tiler_mn: Tuple[int, int] = (256, 256),
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         sf_vec_size: int = 16,
@@ -183,6 +184,10 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
         :param glu_clamp_min: Compile-time dGeGLU lower clamp. Ignored when
             ``act_func == "dswiglu"``.
         """
+        import torch
+
+        if acc_dtype is None:
+            acc_dtype = torch.float32
         super().__init__()
 
         self._warn_experimental_api()
@@ -297,6 +302,8 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
 
     @staticmethod
     def _record_pointer_stream(pointers: torch.Tensor, current_stream: cuda.CUstream) -> None:
+        import torch
+
         handle = int(current_stream)
         torch_current = torch.cuda.current_stream(pointers.device)
         torch_default = torch.cuda.default_stream(pointers.device)
@@ -317,6 +324,8 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
 
         :return: True if supported, raises exception otherwise
         """
+        import torch
+
         self._logger.debug("Entering check_support")
 
         # ---- SFD group validation ----
@@ -670,6 +679,8 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
 
     def compile(self) -> None:
         """Compile the kernel."""
+        import torch
+
         self._logger.debug("Entering compile")
         self._ensure_support_checked()
         if self._compiled_kernel is not None:
@@ -1003,6 +1014,8 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
 
     def _compile_discrete(self, gemm_dglu, max_active_clusters, fake_stream) -> None:
         """Compile for discrete (per-expert pointer) weight mode."""
+        import torch
+
         if len(self.b_shape) == 2:
             n, k = self.b_shape
         else:

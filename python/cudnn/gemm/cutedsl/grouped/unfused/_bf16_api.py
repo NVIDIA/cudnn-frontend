@@ -3,11 +3,12 @@
 
 """Private APIBase API for the source-close unfused BF16 MoE kernel."""
 
+from __future__ import annotations
+
 import os
 import weakref
 from typing import Optional, Tuple
 
-import torch
 import cutlass
 import cutlass.cute as cute
 from cuda.bindings import driver as cuda
@@ -21,7 +22,16 @@ from cudnn.gemm.cutedsl.discrete_grouped.discrete_kernel_utils import _require_p
 from ..moe_utils import MoEWeightMode
 from .moe_grouped_gemm import MoEGroupedGemmBf16Kernel
 
-_OUTPUT_DTYPES = [torch.bfloat16, torch.float16, torch.float32]
+_OUTPUT_DTYPES = None
+
+
+def _output_dtypes():
+    global _OUTPUT_DTYPES
+    if _OUTPUT_DTYPES is None:
+        import torch
+
+        _OUTPUT_DTYPES = [torch.bfloat16, torch.float16, torch.float32]
+    return _OUTPUT_DTYPES
 
 
 class GroupedGemmBf16API(APIBase):
@@ -40,7 +50,7 @@ class GroupedGemmBf16API(APIBase):
         num_experts: Optional[int] = None,
         b_shape: Optional[Tuple[int, ...]] = None,
         b_dtype: Optional[torch.dtype] = None,
-        acc_dtype: torch.dtype = torch.float32,
+        acc_dtype: Optional[torch.dtype] = None,
         mma_tiler_mn: Tuple[int, int] = (256, 256),
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         vector_f32: bool = False,
@@ -49,6 +59,10 @@ class GroupedGemmBf16API(APIBase):
         b_major: str = "k",
         use_dynamic_sched: bool = False,
     ) -> None:
+        import torch
+
+        if acc_dtype is None:
+            acc_dtype = torch.float32
         super().__init__()
         self._warn_experimental_api()
 
@@ -186,6 +200,8 @@ class GroupedGemmBf16API(APIBase):
 
     @staticmethod
     def _record_pointer_stream(b_ptrs: torch.Tensor, current_stream: cuda.CUstream) -> None:
+        import torch
+
         handle = int(current_stream)
         torch_current = torch.cuda.current_stream(b_ptrs.device)
         torch_default = torch.cuda.default_stream(b_ptrs.device)
@@ -198,6 +214,8 @@ class GroupedGemmBf16API(APIBase):
         b_ptrs.record_stream(launch_stream)
 
     def check_support(self) -> bool:
+        import torch
+
         if self.a_desc.ndim != 3:
             raise ValueError(f"sample_a must be rank-3, got {self.a_desc.shape}")
         tensor_m, k, one = self.a_desc.shape
@@ -241,8 +259,8 @@ class GroupedGemmBf16API(APIBase):
         if self.weight_mode == MoEWeightMode.DENSE:
             self._check_dtype(self.b_desc, torch.bfloat16, "sample_b")
         self._check_dtype(self.b_dtype, torch.bfloat16, "b_dtype")
-        self._check_dtype(self.c_desc, _OUTPUT_DTYPES, "sample_c")
-        self._check_dtype(self.d_desc, _OUTPUT_DTYPES, "sample_d")
+        self._check_dtype(self.c_desc, _output_dtypes(), "sample_c")
+        self._check_dtype(self.d_desc, _output_dtypes(), "sample_d")
         self._check_dtype(self.padded_offsets_desc, torch.int32, "sample_padded_offsets")
         self._check_dtype(self.alpha_desc, torch.float32, "sample_alpha")
         self._check_dtype(self.prob_desc, torch.float32, "sample_prob")
@@ -262,7 +280,7 @@ class GroupedGemmBf16API(APIBase):
         if self.bias_desc is not None:
             self._expect_shape(self.bias_desc, (n, self.expert_cnt), "sample_bias")
             self._expect_stride(self.bias_desc, (1, n), "sample_bias")
-            self._check_dtype(self.bias_desc, _OUTPUT_DTYPES, "sample_bias")
+            self._check_dtype(self.bias_desc, _output_dtypes(), "sample_bias")
             self._expect_device(self.bias_desc, device, "sample_bias")
 
         for name, data_ptr in self._sample_data_ptrs.items():
@@ -325,6 +343,8 @@ class GroupedGemmBf16API(APIBase):
         return True
 
     def compile(self) -> None:
+        import torch
+
         self._ensure_support_checked()
         if self._compiled_kernel is not None:
             return

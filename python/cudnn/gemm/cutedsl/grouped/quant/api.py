@@ -8,12 +8,13 @@ and discrete weight modes for grouped block-scaled GEMM with output
 quantization in MoE (Mixture of Experts) workloads.
 """
 
+from __future__ import annotations
+
 import os
 from typing import Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
-import torch
 from cuda.bindings import driver as cuda
 from cutlass.cute.runtime import make_fake_stream
 
@@ -75,7 +76,7 @@ class GroupedGemmQuantSm100(APIBase):
         sample_prob: Optional[torch.Tensor] = None,
         sample_row_scale: Optional[torch.Tensor] = None,
         # Configuration
-        acc_dtype: torch.dtype = torch.float32,
+        acc_dtype: Optional[torch.dtype] = None,
         mma_tiler_mn: Tuple[int, int] = (256, 256),
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         sf_vec_size: int = 16,
@@ -119,6 +120,14 @@ class GroupedGemmQuantSm100(APIBase):
         :param b_major: Major dimension for B tensor, one of "k" or "n"
         :param use_dynamic_sched: Enable dynamic tile scheduling for load balancing
         """
+        from cudnn.tensor_adapter import is_torch_tensor
+
+        if sample_a is not None and not is_torch_tensor(sample_a):
+            raise ValueError("GroupedGemmQuantSm100 currently supports torch tensors only; JAX support is not yet implemented for this API")
+        if acc_dtype is None:
+            import torch
+
+            acc_dtype = torch.float32
         super().__init__()
 
         self._warn_experimental_api()
@@ -219,6 +228,8 @@ class GroupedGemmQuantSm100(APIBase):
 
         :return: True if supported, raises exception otherwise
         """
+        import torch
+
         self._logger.debug("Entering check_support")
 
         all_none = all(x is None for x in [self.sfd_row_desc, self.sfd_col_desc, self.norm_const_desc])
@@ -535,6 +546,8 @@ class GroupedGemmQuantSm100(APIBase):
 
     def compile(self) -> None:
         """Compile the kernel."""
+        import torch
+
         self._logger.debug("Entering compile")
         self._ensure_support_checked()
         if self._compiled_kernel is not None:
@@ -873,6 +886,8 @@ class GroupedGemmQuantSm100(APIBase):
 
     def _compile_discrete(self, gemm_quant, max_active_clusters, fake_stream) -> None:
         """Compile for discrete (per-expert pointer) weight mode."""
+        import torch
+
         if len(self.b_shape) == 2:
             n, k = self.b_shape
         else:
@@ -1227,8 +1242,8 @@ def grouped_gemm_quant_wrapper_sm100(
     norm_const_tensor: Optional[torch.Tensor] = None,
     prob_tensor: Optional[torch.Tensor] = None,
     row_scale_tensor: Optional[torch.Tensor] = None,
-    acc_dtype: torch.dtype = torch.float32,
-    d_dtype: torch.dtype = torch.bfloat16,
+    acc_dtype: Optional[torch.dtype] = None,
+    d_dtype: Optional[torch.dtype] = None,
     d_tensor: Optional[torch.Tensor] = None,
     cd_major: str = "n",
     mma_tiler_mn: Tuple[int, int] = (256, 256),
@@ -1306,6 +1321,16 @@ def grouped_gemm_quant_wrapper_sm100(
                 d = result[0]  # d_tensor
     """
     from cudnn.gemm.cutedsl.discrete_grouped.discrete_kernel_utils import _require_pointer_tensor
+    from cudnn.tensor_adapter import is_torch_tensor
+
+    if a_tensor is not None and not is_torch_tensor(a_tensor):
+        raise ValueError("grouped_gemm_quant_wrapper_sm100 currently supports torch tensors only; JAX support is not yet implemented for this API")
+    import torch
+
+    if acc_dtype is None:
+        acc_dtype = torch.float32
+    if d_dtype is None:
+        d_dtype = torch.bfloat16
 
     is_dense = b_tensor is not None
     is_discrete = b_ptrs is not None

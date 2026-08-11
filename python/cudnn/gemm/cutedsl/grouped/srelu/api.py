@@ -8,12 +8,13 @@ and discrete weight modes for grouped block-scaled GEMM with output
 SReLU output quantization in MoE (Mixture of Experts) workloads.
 """
 
+from __future__ import annotations
+
 import os
 from typing import Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
-import torch
 from cuda.bindings import driver as cuda
 from cutlass.cute.runtime import make_fake_stream
 
@@ -30,6 +31,8 @@ from cutlass.cute.runtime import from_dlpack
 
 
 def _reinterpret_raw_grouped_fp4_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    import torch
+
     if tensor.dtype == torch.uint8:
         cute_tensor = from_dlpack(tensor, assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=1)
         cute_tensor.element_type = cutlass.Float4E2M1FN
@@ -75,7 +78,7 @@ class GroupedGemmSreluSm100(APIBase):
         sample_norm_const: Optional[torch.Tensor] = None,
         sample_prob: Optional[torch.Tensor] = None,
         # Configuration
-        acc_dtype: torch.dtype = torch.float32,
+        acc_dtype: Optional[torch.dtype] = None,
         mma_tiler_mn: Tuple[int, int] = (256, 256),
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         sf_vec_size: int = 16,
@@ -116,6 +119,14 @@ class GroupedGemmSreluSm100(APIBase):
         :param b_major: Major dimension for B tensor, one of "k" or "n"
         :param use_dynamic_sched: Enable dynamic tile scheduling for load balancing
         """
+        from cudnn.tensor_adapter import is_torch_tensor
+
+        if sample_a is not None and not is_torch_tensor(sample_a):
+            raise ValueError("GroupedGemmSreluSm100 currently supports torch tensors only; JAX support is not yet implemented for this API")
+        if acc_dtype is None:
+            import torch
+
+            acc_dtype = torch.float32
         super().__init__()
 
         self._warn_experimental_api()
@@ -210,6 +221,8 @@ class GroupedGemmSreluSm100(APIBase):
 
         :return: True if supported, raises exception otherwise
         """
+        import torch
+
         self._logger.debug("Entering check_support")
 
         all_none = all(x is None for x in [self.sfd_row_desc, self.sfd_col_desc, self.norm_const_desc])
@@ -528,6 +541,8 @@ class GroupedGemmSreluSm100(APIBase):
 
     def compile(self) -> None:
         """Compile the kernel."""
+        import torch
+
         self._logger.debug("Entering compile")
         self._ensure_support_checked()
         if self._compiled_kernel is not None:
@@ -577,6 +592,8 @@ class GroupedGemmSreluSm100(APIBase):
 
     def _compile_dense(self, gemm_srelu, max_active_clusters, fake_stream) -> None:
         """Compile for dense (contiguous) weight mode."""
+        import torch
+
         fake_workspace_ptr = cute.runtime.nullptr(
             dtype=cutlass.Uint8,
             assumed_align=128,
@@ -831,6 +848,8 @@ class GroupedGemmSreluSm100(APIBase):
 
     def _compile_discrete(self, gemm_srelu, max_active_clusters, fake_stream) -> None:
         """Compile for discrete (per-expert pointer) weight mode."""
+        import torch
+
         if len(self.b_shape) == 2:
             n, k = self.b_shape
         else:
@@ -1138,9 +1157,9 @@ def grouped_gemm_srelu_wrapper_sm100(
     b_major: str = "k",
     norm_const_tensor: Optional[torch.Tensor] = None,
     prob_tensor: Optional[torch.Tensor] = None,
-    acc_dtype: torch.dtype = torch.float32,
-    c_dtype: torch.dtype = torch.bfloat16,
-    d_dtype: torch.dtype = torch.bfloat16,
+    acc_dtype: Optional[torch.dtype] = None,
+    c_dtype: Optional[torch.dtype] = None,
+    d_dtype: Optional[torch.dtype] = None,
     cd_major: str = "n",
     mma_tiler_mn: Tuple[int, int] = (256, 256),
     cluster_shape_mn: Optional[Tuple[int, int]] = None,
@@ -1212,6 +1231,18 @@ def grouped_gemm_srelu_wrapper_sm100(
                 d = result[1]  # d_tensor
     """
     from cudnn.gemm.cutedsl.discrete_grouped.discrete_kernel_utils import _require_pointer_tensor
+    from cudnn.tensor_adapter import is_torch_tensor
+
+    if a_tensor is not None and not is_torch_tensor(a_tensor):
+        raise ValueError("grouped_gemm_srelu_wrapper_sm100 currently supports torch tensors only; JAX support is not yet implemented for this API")
+    import torch
+
+    if acc_dtype is None:
+        acc_dtype = torch.float32
+    if c_dtype is None:
+        c_dtype = torch.bfloat16
+    if d_dtype is None:
+        d_dtype = torch.bfloat16
 
     is_dense = b_tensor is not None
     is_discrete = b_ptrs is not None

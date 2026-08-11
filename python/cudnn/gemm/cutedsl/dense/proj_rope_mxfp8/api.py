@@ -13,6 +13,8 @@ kernels that differ only in the GEMM *input* precision, exposed as sibling APIBa
 match), allocates outputs, drives the class lifecycle, and returns a ``TupleDict``.
 """
 
+from __future__ import annotations
+
 from .gemm_proj_rope_mxfp8_bf16in import (
     gemm_proj_rope_mxfp8_host as _bf16in_host,
     HEAD_DIM,
@@ -27,7 +29,6 @@ from .gemm_proj_rope_mxfp8_mxfp8in import (
 
 from cuda.bindings import driver as cuda
 import logging
-import torch
 from typing import Optional
 
 import cutlass.utils
@@ -55,6 +56,10 @@ class GemmProjRopeMxfp8Bf16InSm100(APIBase):
         sample_out_scales_col: torch.Tensor,
         w_out_in: bool = False,
     ):
+        from cudnn.tensor_adapter import is_torch_tensor
+
+        if sample_x is not None and not is_torch_tensor(sample_x):
+            raise ValueError("GemmProjRopeMxfp8Bf16InSm100 currently supports torch tensors only; JAX support is not yet implemented for this API")
         super().__init__()
         self._warn_experimental_api()
         self._logger.debug("Entering __init__")
@@ -86,6 +91,8 @@ class GemmProjRopeMxfp8Bf16InSm100(APIBase):
         self._logger.debug(f"__init__ completed: x {self.x_desc.shape}, w {self.w_desc.shape}, w_out_in {self.w_out_in}")
 
     def check_support(self) -> bool:
+        import torch
+
         self._logger.debug("Entering check_support")
 
         self._check_dtype(self.x_desc, dtype=torch.bfloat16, name="x")
@@ -179,6 +186,8 @@ class GemmProjRopeMxfp8Bf16InSm100(APIBase):
         return mA, mB, mCos, mSin, mQrow, mSrow, mQcol, mScol
 
     def compile(self) -> None:
+        import torch
+
         self._logger.debug("Entering compile")
         self._ensure_support_checked()
         if self._compiled_kernel is not None:
@@ -245,6 +254,10 @@ class GemmProjRopeMxfp8Mxfp8InSm100(APIBase):
         sample_out_fp8_col: torch.Tensor,
         sample_out_scales_col: torch.Tensor,
     ):
+        from cudnn.tensor_adapter import is_torch_tensor
+
+        if sample_x_code is not None and not is_torch_tensor(sample_x_code):
+            raise ValueError("GemmProjRopeMxfp8Mxfp8InSm100 currently supports torch tensors only; JAX support is not yet implemented for this API")
         super().__init__()
         self._warn_experimental_api()
         self._logger.debug("Entering __init__")
@@ -280,6 +293,8 @@ class GemmProjRopeMxfp8Mxfp8InSm100(APIBase):
         self._logger.debug(f"__init__ completed: x_code {self.x_code_desc.shape}, w_code {self.w_code_desc.shape}")
 
     def check_support(self) -> bool:
+        import torch
+
         self._logger.debug("Entering check_support")
 
         self._check_dtype(self.x_code_desc, dtype=torch.float8_e4m3fn, name="x_code")
@@ -399,6 +414,8 @@ class GemmProjRopeMxfp8Mxfp8InSm100(APIBase):
         return mA, mSFA, mB, mSFB, mCos, mSin, mQrow, mSrow, mQcol, mScol
 
     def compile(self) -> None:
+        import torch
+
         self._logger.debug("Entering compile")
         self._ensure_support_checked()
         if self._compiled_kernel is not None:
@@ -479,6 +496,8 @@ def _check_contiguous(api, **named_descs):
 
 
 def _check_sm100(api):
+    import torch
+
     api._runtime_error_if(not torch.cuda.is_available(), "CUDA is not available")
     device = torch.cuda.current_device()
     major, minor = torch.cuda.get_device_capability(device)
@@ -522,6 +541,12 @@ def gemm_proj_rope_mxfp8_wrapper_sm100(
     Returns:
         ``TupleDict(out_fp8_row, out_scales_row, out_fp8_col, out_scales_col)``.
     """
+    from cudnn.tensor_adapter import is_torch_tensor
+
+    if x is not None and not is_torch_tensor(x):
+        raise ValueError("gemm_proj_rope_mxfp8_wrapper_sm100 currently supports torch tensors only; JAX support is not yet implemented for this API")
+    import torch
+
     assert x.dtype == w.dtype, f"x and w must share a dtype (both bfloat16 or both float8_e4m3fn); got x {x.dtype}, w {w.dtype}"
 
     tokens = x.shape[0]

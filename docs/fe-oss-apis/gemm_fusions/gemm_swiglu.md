@@ -66,6 +66,19 @@ Notes:
 
 ## API Usage
 
+The tensor parameters are type-erased: torch tensors and JAX arrays are both accepted (torch is only imported when torch tensors/dtypes are passed, jax only when JAX arrays are passed). Dtype parameters accept torch dtypes, numpy/ml_dtypes dtypes, dtype name strings, or `cutlass` types. The JAX contract matches gemm_amax (see `gemm_amax.md` "Using JAX arrays"): A/B k-major `(M, K, 1)`/`(N, K, 1)`, outputs n-major only, batch `L == 1`, SF tensors accepted in the physical C-contiguous atom shape `(L, MN', K', 32, 4, 4)`; the eager entry points run on the CUDA legacy default stream (synchronize before reading outputs).
+
+For jitted JAX programs, use **`gemm_swiglu_jax_sm100`** — an XLA custom call (via jax-tvm-ffi, `jax` dependency group) that runs on XLA's compute stream, returns fresh `(ab12, c)` arrays, and composes with `jax.jit`. It currently supports the standard (non-quantized) kernel only; use the eager wrapper for blockscaled MXFP8 inputs from JAX. `alpha` is a static (trace-time) parameter.
+
+```python
+from cudnn import gemm_swiglu_jax_sm100
+
+@jax.jit
+def swiglu_mlp(a, b):
+    ab12, c = gemm_swiglu_jax_sm100(a, b, alpha=1.0, ab12_dtype=jnp.float32, c_dtype=jnp.bfloat16)
+    return c
+```
+
 ### High-level wrapper (Standard Mode)
 
 ```python
