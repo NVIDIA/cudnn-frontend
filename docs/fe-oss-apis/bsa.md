@@ -2,6 +2,25 @@
 
 **This is an experimental API and subject to change.**
 
+## JAX support
+
+The tensor parameters are type-erased: torch tensors and JAX arrays are both
+accepted (torch is imported only when torch tensors are passed, jax only when
+JAX arrays are passed). JAX arrays are supported on the **SM100/SM110 blk128
+forward and backward paths** in both `bhsd` and `bshd` layouts; the SM90/SM120
+and blk64 backends (and their `kv_splits`/`use_clc` options) reject JAX inputs
+with clear errors.
+
+- Outputs (`o`/`lse`, `dq`/`dk`/`dv`) are allocated as C-contiguous `jnp`
+  arrays in the caller's layout; pre-allocated JAX output buffers are also
+  accepted.
+- The backward's internal transposed tensor views travel as zero-copy permuted
+  DLPack wrappers (JAX has no strided views; see
+  `cudnn.tensor_adapter.permuted_view`) — no extra copies relative to torch.
+- Eager only, on the **CUDA legacy default stream** (XLA does not track it):
+  `jax.block_until_ready(...)` your inputs before calling, and synchronize the
+  device before reading outputs.
+
 ## Overview
 
 Block Sparse Attention computes non-causal scaled dot-product attention over a

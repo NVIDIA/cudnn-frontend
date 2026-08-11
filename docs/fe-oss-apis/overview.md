@@ -7,6 +7,7 @@ The GEMM CuTeDSL APIs are type-erased and torch-lazy: torch is imported only whe
 - **Dense fusions** (amax, swiglu, srelu, dsrelu): full JAX eager support, plus `jax.jit`-compatible XLA custom-call entry points for all four (built on `cudnn.jax.call` / CuTeDSL's native `cutlass.jax` bridge; see `gemm_amax.md` "Using JAX arrays").
 - **Grouped / discrete-grouped**: JAX eager support in discrete (pointer-array) weight modes — unfused grouped GEMM, glu/dglu (BF16), dsrelu (FP8), wgrad (BF16), and discrete-grouped swiglu/dswiglu (FP8) — plus a `jax.jit`-compatible `*_jax_sm100` entry point for each of those same families (built on `cudnn.jax.call`; each API page documents its exact jit contract). Dense weight mode, column-major bias layouts, and kernels whose scale factors are MMA-permuted tensor arguments (grouped swiglu/srelu/quant/dswiglu, glu_hadamard, block-scaled glu/dglu/wgrad backends) reject JAX with clear errors.
 - **proj_rope_mxfp8**: JAX eager support on both input paths with `w_out_in=True` (the transposed [in, out] weight view is torch-only), plus the `jax.jit`-compatible `gemm_proj_rope_mxfp8_jax_sm100` entry point.
+- **Block Sparse Attention (BSA)**: JAX eager support on the SM100/SM110 blk128 forward and backward paths, both layouts (see `bsa.md` "JAX support"); the SM90/SM120 and blk64 backends reject JAX with clear errors.
 
 This folder documents the Python FE APIs implemented under `python/cudnn`. For details on currently implemented operations, see:
 - [GEMM + Amax](gemm_fusions/gemm_amax.md)

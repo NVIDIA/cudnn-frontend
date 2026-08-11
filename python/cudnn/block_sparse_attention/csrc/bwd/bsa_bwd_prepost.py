@@ -5,7 +5,12 @@ import os
 import re
 from functools import lru_cache
 
-import torch
+try:
+    # torch is optional: only the torch tensor paths need it. JAX callers must
+    # be able to import this module without it.
+    import torch
+except ImportError:  # pragma: no cover - exercised by torch-free JAX installs
+    torch = None
 
 import cutlass.cute as cute
 from cutlass import Float32, Int32
@@ -29,13 +34,19 @@ def _parse_arch_str(arch_str: str) -> int:
 def _get_device_arch_for_device(device_index: int, arch_override: str | None):
     if arch_override is not None:
         return _parse_arch_str(arch_override)
-    major, minor = torch.cuda.get_device_capability(device_index)
+    if torch is not None and torch.cuda.is_available():
+        major, minor = torch.cuda.get_device_capability(device_index)
+    else:
+        from cudnn.tensor_adapter import get_compute_capability
+
+        major, minor = get_compute_capability()
     return major * 10 + int(minor)
 
 
 def _get_device_arch():
+    device_index = torch.cuda.current_device() if torch is not None and torch.cuda.is_available() else 0
     return _get_device_arch_for_device(
-        torch.cuda.current_device(),
+        device_index,
         os.environ.get("CUDNN_BSA_ARCH", None),
     )
 

@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from __future__ import annotations
+
 from typing import Optional, Tuple
 
 import cutlass
@@ -8,7 +10,11 @@ import cutlass.cute as cute
 from cutlass import Int32, const_expr
 from cutlass.cute.runtime import from_dlpack
 import cuda.bindings.driver as cuda
-import torch
+
+from cudnn.datatypes import _convert_to_cutlass_data_type
+from cudnn.tensor_adapter import allocate_tensor, default_stream, detect_framework, get_shape, is_torch_tensor
+
+_INT32_MAX = 2**31 - 1
 
 
 class BucketedK2QCsrUniversal:
@@ -242,74 +248,75 @@ def _bucketed_k2q_csr_compile_key(
     )
 
 
-def _to_cute_tensor(tensor: torch.Tensor) -> cute.Tensor:
+def _maybe_detach(t):
+    detach = getattr(t, "detach", None)
+    return detach() if callable(detach) else t
+
+
+def _to_cute_tensor(tensor) -> cute.Tensor:
     return from_dlpack(
-        tensor.detach(),
+        _maybe_detach(tensor),
         assumed_align=4,
         enable_tvm_ffi=True,
     ).mark_layout_dynamic(leading_dim=tensor.ndim - 1)
 
 
 def build_bucketed_k2q_csr_cutedsl(
-    q2k_block_index: torch.Tensor,
+    q2k_block_index,
     block_sparse_num: int,
     num_kv_blocks: int,
     *,
     bucket_size_blocks: int,
-    q2k_block_nums: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, int, int]:
+    q2k_block_nums=None,
+) -> Tuple:
     """Build bucketed K-to-Q CSR metadata with CuTe DSL kernels."""
-    assert q2k_block_index.dtype == torch.int32
-    assert q2k_block_index.is_cuda
+    framework = detect_framework(q2k_block_index)
+    is_torch = framework == "torch"
+    assert _convert_to_cutlass_data_type(q2k_block_index.dtype) == cutlass.Int32
+    assert not is_torch or q2k_block_index.is_cuda
     assert q2k_block_index.ndim == 4
     assert bucket_size_blocks > 0
     assert num_kv_blocks > 0
 
     batch_size, num_heads, num_q_blocks, max_kv_blocks = q2k_block_index.shape
     assert num_q_blocks > 0
-    q2k_block_index = q2k_block_index.contiguous()
+    if is_torch:
+        q2k_block_index = q2k_block_index.contiguous()
     has_variable_block_nums = q2k_block_nums is not None
     if has_variable_block_nums:
         assert q2k_block_nums is not None
-        assert q2k_block_nums.dtype == torch.int32
-        assert q2k_block_nums.shape == (batch_size, num_heads, num_q_blocks)
-        assert q2k_block_nums.is_cuda
-        assert q2k_block_nums.device == q2k_block_index.device
-        q2k_block_nums = q2k_block_nums.contiguous()
+        assert _convert_to_cutlass_data_type(q2k_block_nums.dtype) == cutlass.Int32
+        assert get_shape(q2k_block_nums) == (batch_size, num_heads, num_q_blocks)
+        assert not is_torch or (q2k_block_nums.is_cuda and q2k_block_nums.device == q2k_block_index.device)
+        if is_torch:
+            q2k_block_nums = q2k_block_nums.contiguous()
         max_edges = num_q_blocks * max_kv_blocks
     else:
         assert 0 <= block_sparse_num <= max_kv_blocks
         q2k_block_nums = q2k_block_index
         max_edges = num_q_blocks * int(block_sparse_num)
 
-    assert max_edges <= torch.iinfo(torch.int32).max
+    assert max_edges <= _INT32_MAX
     max_edges = max(1, max_edges)
     num_q_groups = (num_q_blocks + bucket_size_blocks - 1) // bucket_size_blocks
     device = q2k_block_index.device
-    counts = torch.zeros(
-        (batch_size, num_heads, num_q_groups, num_kv_blocks),
-        dtype=torch.int32,
-        device=device,
-    )
-    local_offsets = torch.empty(
-        (batch_size, num_heads, num_q_groups, num_kv_blocks + 1),
-        dtype=torch.int32,
-        device=device,
-    )
-    group_totals = torch.empty(
-        (batch_size, num_heads, num_q_groups),
-        dtype=torch.int32,
-        device=device,
-    )
-    bucketed_k2q_offsets = torch.empty_like(local_offsets)
-    cursors = torch.empty_like(counts)
-    bucketed_k2q_indices = torch.empty(
-        (batch_size, num_heads, max_edges),
-        dtype=torch.int32,
-        device=device,
-    )
+    counts = allocate_tensor(framework, (batch_size, num_heads, num_q_groups, num_kv_blocks), cutlass.Int32, device, zero=True)
+    local_offsets = allocate_tensor(framework, (batch_size, num_heads, num_q_groups, num_kv_blocks + 1), cutlass.Int32, device)
+    group_totals = allocate_tensor(framework, (batch_size, num_heads, num_q_groups), cutlass.Int32, device)
+    bucketed_k2q_offsets = allocate_tensor(framework, (batch_size, num_heads, num_q_groups, num_kv_blocks + 1), cutlass.Int32, device)
+    cursors = allocate_tensor(framework, (batch_size, num_heads, num_q_groups, num_kv_blocks), cutlass.Int32, device)
+    bucketed_k2q_indices = allocate_tensor(framework, (batch_size, num_heads, max_edges), cutlass.Int32, device)
 
-    current_stream = cuda.CUstream(torch.cuda.current_stream(q2k_block_index.device).cuda_stream)
+    if is_torch:
+        import torch
+
+        current_stream = cuda.CUstream(torch.cuda.current_stream(q2k_block_index.device).cuda_stream)
+        device_capability = torch.cuda.get_device_capability(q2k_block_index.device)
+    else:
+        from cudnn.tensor_adapter import get_compute_capability
+
+        current_stream = default_stream(framework)
+        device_capability = get_compute_capability()
     tensors = (
         counts,
         local_offsets,
@@ -320,7 +327,6 @@ def build_bucketed_k2q_csr_cutedsl(
         q2k_block_index,
         q2k_block_nums,
     )
-    device_capability = torch.cuda.get_device_capability(q2k_block_index.device)
     compile_key = _bucketed_k2q_csr_compile_key(
         device_capability,
         block_sparse_num,

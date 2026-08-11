@@ -1,12 +1,19 @@
 # Copyright (c) 2025, Ted Zadouri, Markus Hoehnerbach, Jay Shah, Tri Dao.
 # SPDX-License-Identifier: MIT
+from __future__ import annotations
+
 import math
 from typing import Callable, NamedTuple, Optional, Tuple
 from functools import partial
 
 import cuda.bindings.driver as cuda
 
-import torch
+try:
+    # torch is optional: only the torch tensor paths need it. JAX callers must
+    # be able to import this module without it.
+    import torch
+except ImportError:  # pragma: no cover - exercised by torch-free JAX installs
+    torch = None
 
 import cutlass
 import cutlass.cute as cute
@@ -22,7 +29,6 @@ from cudnn.block_sparse_attention.csrc.utils.cute_dsl_utils import (
     assume_tensor_aligned,
     get_broadcast_dims,
     to_cute_tensor,
-    torch2cute_dtype_map,
 )
 from cudnn.block_sparse_attention.csrc.utils import copy_utils
 from cudnn.block_sparse_attention.csrc.utils import pipeline
@@ -2194,12 +2200,16 @@ def bsa_sm100_blk128_bwd_bucketed_k2q_csr(
     dv: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """SM100/SM110 blk128 bwd entry receiving BSA bucketed k2q CSR."""
-    assert q.dtype == torch.bfloat16, "SM100 blk128 bwd only supports bfloat16"
-    assert q.dtype == k.dtype == v.dtype == out.dtype == dout.dtype
-    assert lse.dtype == torch.float32
+    from cudnn.datatypes import _convert_to_cutlass_data_type
+    from cudnn.tensor_adapter import allocate_tensor, detect_framework, get_shape, permuted_view
+
+    framework = detect_framework(q) if not hasattr(q, "_array") else detect_framework(q._array)
+    assert _convert_to_cutlass_data_type(q.dtype) == cutlass.BFloat16, "SM100 blk128 bwd only supports bfloat16"
+    assert all(_convert_to_cutlass_data_type(t.dtype) == cutlass.BFloat16 for t in (k, v, out, dout))
+    assert _convert_to_cutlass_data_type(lse.dtype) == cutlass.Float32
     assert _get_device_arch() // 10 in [10, 11]
-    assert bucketed_k2q_offsets.dtype == torch.int32
-    assert bucketed_k2q_indices.dtype == torch.int32
+    assert _convert_to_cutlass_data_type(bucketed_k2q_offsets.dtype) == cutlass.Int32
+    assert _convert_to_cutlass_data_type(bucketed_k2q_indices.dtype) == cutlass.Int32
 
     batch_size, num_heads, seqlen_q, head_dim = q.shape
     seqlen_k = k.shape[2]
@@ -2220,60 +2230,43 @@ def bsa_sm100_blk128_bwd_bucketed_k2q_csr(
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
 
-    if dq is None:
-        dq = torch.empty_like(q)
-    if dk is None:
-        dk = torch.empty_like(k)
-    if dv is None:
-        dv = torch.empty_like(v)
+    if framework == "torch":
+        # empty_like preserves the (possibly permuted-view) stride pattern so the
+        # returned gradients match the caller's memory layout.
+        dq = torch.empty_like(q) if dq is None else dq
+        dk = torch.empty_like(k) if dk is None else dk
+        dv = torch.empty_like(v) if dv is None else dv
+    else:
+        # JAX gradients in the kernel-logical (bhsd) layout; the bshd caller
+        # layout pre-allocates in _interface before permuting.
+        dq = allocate_tensor(framework, get_shape(q), q.dtype, q.device) if dq is None else dq
+        dk = allocate_tensor(framework, get_shape(k), k.dtype, q.device) if dk is None else dk
+        dv = allocate_tensor(framework, get_shape(v), v.dtype, q.device) if dv is None else dv
 
-    q_bshd = q.transpose(1, 2)
-    k_bshd = k.transpose(1, 2)
-    v_bshd = v.transpose(1, 2)
-    out_bshd = out.transpose(1, 2)
-    dout_bshd = dout.transpose(1, 2)
-    dq_bshd = dq.transpose(1, 2)
-    dk_bshd = dk.transpose(1, 2)
-    dv_bshd = dv.transpose(1, 2)
+    bshd = (0, 2, 1, 3)
+    q_bshd = permuted_view(q, bshd)
+    k_bshd = permuted_view(k, bshd)
+    v_bshd = permuted_view(v, bshd)
+    out_bshd = permuted_view(out, bshd)
+    dout_bshd = permuted_view(dout, bshd)
+    dq_bshd = permuted_view(dq, bshd)
+    dk_bshd = permuted_view(dk, bshd)
+    dv_bshd = permuted_view(dv, bshd)
 
     seqlen_q_rounded = num_q_blocks * SM100_BLK128_BWD_SPARSE_BLOCK_SIZE
     seqlen_k_rounded = num_kv_blocks * SM100_BLK128_BWD_SPARSE_BLOCK_SIZE
     head_dim_rounded = _ceil_div(head_dim, 32) * 32
-    dq_accum = torch.empty(
-        batch_size,
-        num_heads,
-        seqlen_q_rounded * head_dim_rounded,
-        dtype=torch.float32,
-        device=q.device,
-    )
-    dpsum = torch.empty(
-        batch_size,
-        num_heads,
-        seqlen_q_rounded,
-        dtype=torch.float32,
-        device=q.device,
-    )
-    lse_log2 = torch.empty_like(dpsum)
+    dq_accum = allocate_tensor(framework, (batch_size, num_heads, seqlen_q_rounded * head_dim_rounded), cutlass.Float32, q.device)
+    dpsum = allocate_tensor(framework, (batch_size, num_heads, seqlen_q_rounded), cutlass.Float32, q.device)
+    lse_log2 = allocate_tensor(framework, (batch_size, num_heads, seqlen_q_rounded), cutlass.Float32, q.device)
     if use_dkv_postprocess:
-        dk_accum = torch.zeros(
-            batch_size,
-            num_heads,
-            seqlen_k_rounded * head_dim_rounded,
-            dtype=torch.float32,
-            device=q.device,
-        )
-        dv_accum = torch.zeros(
-            batch_size,
-            num_heads,
-            seqlen_k_rounded * head_dim_rounded,
-            dtype=torch.float32,
-            device=q.device,
-        )
+        dk_accum = allocate_tensor(framework, (batch_size, num_heads, seqlen_k_rounded * head_dim_rounded), cutlass.Float32, q.device, zero=True)
+        dv_accum = allocate_tensor(framework, (batch_size, num_heads, seqlen_k_rounded * head_dim_rounded), cutlass.Float32, q.device, zero=True)
     else:
         dk_accum = None
         dv_accum = None
 
-    dtype = torch2cute_dtype_map[q.dtype]
+    dtype = _convert_to_cutlass_data_type(q.dtype)
     _bwd_preprocess(
         out_bshd,
         dout_bshd,

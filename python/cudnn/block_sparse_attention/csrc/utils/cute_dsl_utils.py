@@ -10,7 +10,12 @@ from dataclasses import dataclass, fields
 from functools import partial
 from typing import Tuple, get_origin
 
-import torch
+try:
+    # torch is optional: only the torch tensor paths need it. JAX callers must
+    # be able to import this module without it.
+    import torch
+except ImportError:  # pragma: no cover - exercised by torch-free JAX installs
+    torch = None
 
 import cutlass
 import cutlass.cute as cute
@@ -52,13 +57,17 @@ def _install_constexpr_tvm_ffi_converter() -> None:
 
 _install_constexpr_tvm_ffi_converter()
 
-torch2cute_dtype_map = {
-    torch.float16: cutlass.Float16,
-    torch.bfloat16: cutlass.BFloat16,
-    torch.float32: cutlass.Float32,
-    torch.float8_e4m3fn: cutlass.Float8E4M3FN,
-    torch.float8_e5m2: cutlass.Float8E5M2,
-}
+torch2cute_dtype_map = (
+    {
+        torch.float16: cutlass.Float16,
+        torch.bfloat16: cutlass.BFloat16,
+        torch.float32: cutlass.Float32,
+        torch.float8_e4m3fn: cutlass.Float8E4M3FN,
+        torch.float8_e5m2: cutlass.Float8E5M2,
+    }
+    if torch is not None
+    else {}
+)
 
 
 def _partition_param_fields(obj):
@@ -138,12 +147,18 @@ def assume_tensor_aligned(t):
     return cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=assume_strides_aligned(t)))
 
 
+def _maybe_detach(t):
+    """Detach torch autograd-tracked tensors before DLPack export; no-op otherwise."""
+    detach = getattr(t, "detach", None)
+    return detach() if callable(detach) else t
+
+
 def to_cute_tensor(t, assumed_align=16, leading_dim=-1, fully_dynamic=False, enable_tvm_ffi=True):
-    """Convert torch tensor to cute tensor for TVM FFI. leading_dim=-1 defaults to t.ndim-1."""
+    """Convert a framework tensor to a cute tensor for TVM FFI. leading_dim=-1 defaults to t.ndim-1."""
     # NOTE: torch 2.9.1 doesn't support fp8 via DLPack but 2.11.0 nightly does
     # currently export raw bytes as uint8 and tell cutlass correct type
     # can directly export as fp8 when torch supports it
-    if t.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+    if torch is not None and isinstance(t, torch.Tensor) and t.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
         tensor = from_dlpack(
             t.view(torch.uint8).detach(),
             assumed_align=assumed_align,
@@ -151,7 +166,7 @@ def to_cute_tensor(t, assumed_align=16, leading_dim=-1, fully_dynamic=False, ena
         )
         tensor.element_type = cutlass.Float8E4M3FN if t.dtype == torch.float8_e4m3fn else cutlass.Float8E5M2
     else:
-        tensor = from_dlpack(t.detach(), assumed_align=assumed_align, enable_tvm_ffi=enable_tvm_ffi)
+        tensor = from_dlpack(_maybe_detach(t), assumed_align=assumed_align, enable_tvm_ffi=enable_tvm_ffi)
     if fully_dynamic:
         return tensor.mark_layout_dynamic()
     if leading_dim == -1:
@@ -159,11 +174,13 @@ def to_cute_tensor(t, assumed_align=16, leading_dim=-1, fully_dynamic=False, ena
     return tensor.mark_layout_dynamic(leading_dim=leading_dim)
 
 
-def get_broadcast_dims(tensor: torch.Tensor) -> Tuple[bool, ...]:
+def get_broadcast_dims(tensor) -> Tuple[bool, ...]:
     """Return tuple of bools indicating which dims have stride=0 (broadcast).
 
     This is useful for compile keys since CuTe's mark_layout_dynamic() keeps
     stride=0 as static, meaning kernels compiled with different broadcast
     patterns are not interchangeable.
     """
-    return tuple(s == 0 for s in tensor.stride())
+    from cudnn.tensor_adapter import get_strides
+
+    return tuple(s == 0 for s in get_strides(tensor))

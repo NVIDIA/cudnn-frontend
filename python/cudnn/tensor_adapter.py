@@ -216,6 +216,139 @@ def allocate_byte_workspace(framework: str, nbytes: int, device: Any) -> Any:
     raise ValueError(f"Cannot allocate a workspace for framework '{framework}'")
 
 
+def allocate_tensor(framework: str, shape: Tuple[int, ...], dtype: Any, device: Any, zero: bool = False) -> Any:
+    """Allocate an output/scratch tensor in the caller's framework allocator.
+
+    ``dtype`` accepts anything :func:`framework_dtype` does (cutlass/torch/numpy/str).
+    For JAX the buffer is materialized (``block_until_ready``) before returning so
+    kernels may immediately write into it on the launch stream; JAX buffers are
+    always zero-filled (``jnp.empty`` is an alias of ``zeros`` and uninitialized
+    memory is not observable anyway through XLA's functional model).
+    """
+    fw_dtype = framework_dtype(dtype, framework)
+    if framework == "torch":
+        import torch
+
+        factory = torch.zeros if zero else torch.empty
+        return factory(shape, dtype=fw_dtype, device=device)
+    if framework == "jax":
+        import jax
+        import jax.numpy as jnp
+
+        return jax.block_until_ready(jnp.zeros(shape, dtype=fw_dtype, device=device))
+    raise ValueError(f"Cannot allocate a tensor for framework '{framework}'")
+
+
+class _JaxPermutedDLPackView:
+    """Zero-copy permuted (transposed) view of a JAX array for DLPack consumers.
+
+    JAX cannot express strided views, but the CuTeDSL/TVM-FFI kernel ABI only
+    consumes DLPack metadata. ``tvm_ffi.from_dlpack`` materializes explicit
+    strides even for compact arrays, so this wrapper re-exports the underlying
+    array through a fresh tvm-ffi capsule whose shape/strides arrays are
+    permuted in place — the data pointer is untouched. Each ``__dlpack__`` call
+    builds a fresh capsule, so a view can be consumed multiple times.
+    """
+
+    def __init__(self, array: Any, perm: Tuple[int, ...]):
+        base_shape = get_shape(array)
+        if sorted(perm) != list(range(len(base_shape))):
+            raise ValueError(f"perm {perm} is not a permutation of {len(base_shape)} dims")
+        self._array = array
+        self._perm = tuple(int(p) for p in perm)
+        self.shape = tuple(base_shape[p] for p in self._perm)
+        base_strides = get_strides(array)
+        self.strides = tuple(base_strides[p] for p in self._perm)
+        self.ndim = len(self.shape)
+        self.dtype = array.dtype
+        self.device = array.device
+
+    def detach(self):
+        return self
+
+    def stride(self, dim: Optional[int] = None):
+        return self.strides if dim is None else self.strides[dim]
+
+    def dim_order(self) -> Tuple[int, ...]:
+        order = sorted(range(self.ndim), key=lambda i: (self.strides[i], self.shape[i]))
+        return tuple(reversed(order))
+
+    def __dlpack_device__(self):
+        return self._array.__dlpack_device__()
+
+    def __dlpack__(self, **kwargs):
+        import ctypes
+
+        import tvm_ffi
+
+        # A fresh tvm-ffi export per call: its capsule owns freshly materialized
+        # shape/strides arrays, so the in-place permutation below can never
+        # double-apply or corrupt another consumer's view.
+        capsule = tvm_ffi.from_dlpack(self._array).__dlpack__(**kwargs)
+
+        get_name = ctypes.pythonapi.PyCapsule_GetName
+        get_name.restype = ctypes.c_char_p
+        get_name.argtypes = [ctypes.py_object]
+        get_pointer = ctypes.pythonapi.PyCapsule_GetPointer
+        get_pointer.restype = ctypes.c_void_p
+        get_pointer.argtypes = [ctypes.py_object, ctypes.c_char_p]
+
+        class _DLDevice(ctypes.Structure):
+            _fields_ = [("device_type", ctypes.c_int32), ("device_id", ctypes.c_int32)]
+
+        class _DLDataType(ctypes.Structure):
+            _fields_ = [("code", ctypes.c_uint8), ("bits", ctypes.c_uint8), ("lanes", ctypes.c_uint16)]
+
+        class _DLTensor(ctypes.Structure):
+            _fields_ = [
+                ("data", ctypes.c_void_p),
+                ("device", _DLDevice),
+                ("ndim", ctypes.c_int32),
+                ("dtype", _DLDataType),
+                ("shape", ctypes.POINTER(ctypes.c_int64)),
+                ("strides", ctypes.POINTER(ctypes.c_int64)),
+                ("byte_offset", ctypes.c_uint64),
+            ]
+
+        name = get_name(capsule)
+        pointer = get_pointer(capsule, name)
+        if name == b"dltensor_versioned":
+            # DLManagedTensorVersioned: version (2x uint32), manager_ctx, deleter, flags, dl_tensor
+            offset = ctypes.sizeof(ctypes.c_uint32) * 2 + ctypes.sizeof(ctypes.c_void_p) * 2 + ctypes.sizeof(ctypes.c_uint64)
+        elif name == b"dltensor":
+            # DLManagedTensor: dl_tensor first
+            offset = 0
+        else:
+            raise RuntimeError(f"Unrecognized DLPack capsule {name!r}")
+        dl_tensor = ctypes.cast(pointer + offset, ctypes.POINTER(_DLTensor)).contents
+        if dl_tensor.ndim != self.ndim:
+            raise RuntimeError(f"DLPack rank mismatch: capsule has {dl_tensor.ndim}, view expects {self.ndim}")
+        if not dl_tensor.strides:
+            raise RuntimeError("DLPack capsule has no explicit strides; cannot permute in place")
+        shape = [dl_tensor.shape[i] for i in range(dl_tensor.ndim)]
+        strides = [dl_tensor.strides[i] for i in range(dl_tensor.ndim)]
+        for i, p in enumerate(self._perm):
+            dl_tensor.shape[i] = shape[p]
+            dl_tensor.strides[i] = strides[p]
+        return capsule
+
+
+def permuted_view(tensor: Any, perm: Tuple[int, ...]) -> Any:
+    """Zero-copy dimension-permuted view of a tensor, for any supported framework.
+
+    torch returns a regular strided view; JAX (which has no strided views)
+    returns a DLPack-exporting wrapper accepted by the TVM-FFI kernel ABI and
+    ``cute.runtime.from_dlpack``. Applying it to an existing view composes the
+    permutations on the original array.
+    """
+    if is_torch_tensor(tensor):
+        return tensor.permute(*perm)
+    if isinstance(tensor, _JaxPermutedDLPackView):
+        composed = tuple(tensor._perm[p] for p in perm)
+        return _JaxPermutedDLPackView(tensor._array, composed)
+    return _JaxPermutedDLPackView(tensor, perm)
+
+
 def pad_to_ndim(tensor: Any, ndim: int) -> Any:
     """Append size-1 dims up to ndim; works for any framework tensor exposing reshape."""
     shape = get_shape(tensor)

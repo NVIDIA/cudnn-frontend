@@ -2,11 +2,18 @@
 # SPDX-License-Identifier: MIT
 # BSA attention interface for SM90/SM100 block-sparse kernels.
 
+from __future__ import annotations
+
 import math
 from functools import lru_cache
 from typing import Optional, Tuple
 
-import torch
+try:
+    # torch is optional: only the torch tensor paths need it. JAX callers (the
+    # SM100/SM110 blk128 paths) must be able to import this module without it.
+    import torch
+except ImportError:  # pragma: no cover - exercised by torch-free JAX installs
+    torch = None
 
 import cuda.bindings.driver as cuda
 
@@ -14,6 +21,18 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Float32
 from cutlass.cute.runtime import from_dlpack
+
+from cudnn.datatypes import _convert_to_cutlass_data_type
+from cudnn.tensor_adapter import (
+    allocate_tensor,
+    default_stream,
+    detect_framework,
+    get_compute_capability,
+    get_shape,
+    get_strides,
+    is_torch_tensor,
+    permuted_view,
+)
 
 from cudnn.block_sparse_attention.csrc.fwd.sm100_blk128.bsa_fwd_sm100 import (
     BlockSparseAttnForwardSm100Blk128,
@@ -77,27 +96,57 @@ from cudnn.block_sparse_attention.csrc.bwd.bucketed_k2q_csr import build_buckete
 
 @lru_cache(maxsize=None)
 def _get_device_arch_for_device(device_index: int):
-    major, minor = torch.cuda.get_device_capability(device_index)
+    if torch is not None and torch.cuda.is_available():
+        major, minor = torch.cuda.get_device_capability(device_index)
+    else:
+        major, minor = get_compute_capability()
     return major * 10 + int(minor)
 
 
 def _get_device_arch():
-    return _get_device_arch_for_device(torch.cuda.current_device())
+    device_index = torch.cuda.current_device() if torch is not None and torch.cuda.is_available() else 0
+    return _get_device_arch_for_device(device_index)
+
+
+def _maybe_detach(t):
+    """Detach torch autograd-tracked tensors before DLPack export; no-op otherwise."""
+    detach = getattr(t, "detach", None)
+    return detach() if callable(detach) else t
+
+
+def _nvtx_range(is_torch: bool, name: str):
+    if is_torch:
+        return torch.cuda.nvtx.range(name)
+    import contextlib
+
+    return contextlib.nullcontext()
+
+
+def _dim_order(t) -> tuple[int, ...]:
+    """torch.Tensor.dim_order() semantics for any framework tensor (outermost first)."""
+    dim_order = getattr(t, "dim_order", None)
+    if callable(dim_order):
+        return tuple(dim_order())
+    shape, strides = get_shape(t), get_strides(t)
+    return tuple(reversed(sorted(range(len(shape)), key=lambda i: (strides[i], shape[i]))))
 
 
 def maybe_contiguous(x):
-    return x.contiguous() if x is not None and x.stride(-1) != 1 else x
+    if x is None or not is_torch_tensor(x):
+        # JAX arrays are always compact in their axis order; nothing to do.
+        return x
+    return x.contiguous() if x.stride(-1) != 1 else x
 
 
 def _to_cute_tensor(
-    t: torch.Tensor,
+    t,
     assumed_align: Optional[int] = 16,
     leading_dim: int = -1,
     fully_dynamic: bool = False,
     enable_tvm_ffi: bool = True,
 ) -> cute.Tensor:
     tensor = from_dlpack(
-        t.detach(),
+        _maybe_detach(t),
         assumed_align=assumed_align,
         enable_tvm_ffi=enable_tvm_ffi,
     )
@@ -109,7 +158,7 @@ def _to_cute_tensor(
 
 
 def _to_cute_tensor_dynamic_compact_shape(
-    t: torch.Tensor,
+    t,
     mode: int | tuple[int, ...],
     assumed_align: int = 16,
     leading_dim: int = -1,
@@ -119,7 +168,7 @@ def _to_cute_tensor_dynamic_compact_shape(
     tensor = _to_cute_tensor(t, assumed_align=assumed_align, leading_dim=leading_dim)
     if isinstance(mode, int):
         mode = (mode,)
-    stride_order = t.dim_order() if stride_order is None else stride_order
+    stride_order = _dim_order(t) if stride_order is None else stride_order
     for mode_i in mode:
         tensor = tensor.mark_compact_shape_dynamic(
             mode=mode_i,
@@ -137,13 +186,7 @@ def _to_sm90_bwd_cute_tensor(t: torch.Tensor, assumed_align: int = 16, enable_tv
     )
 
 
-torch2cute_dtype_map = {
-    torch.float16: cutlass.Float16,
-    torch.bfloat16: cutlass.BFloat16,
-    torch.float32: cutlass.Float32,
-}
-
-_SM100_BLK64_INT32_MAX = torch.iinfo(torch.int32).max
+_SM100_BLK64_INT32_MAX = 2**31 - 1
 
 
 def _sm100_blk64_require_int32(name: str, value: int) -> int:
@@ -225,32 +268,33 @@ def _sm100_blk64_requires_int64_kv_strides(
     return False
 
 
-def _tensor_layout_compile_key(t: torch.Tensor):
-    return (tuple(t.dim_order()), tuple(s == 0 for s in t.stride()))
+def _tensor_layout_compile_key(t):
+    return (_dim_order(t), tuple(s == 0 for s in get_strides(t)))
 
 
-def _tensor_static_compile_key(t: torch.Tensor):
+def _tensor_static_compile_key(t):
     """Capture the static tensor type used by unmarked CuTe DLPack tensors."""
-    return (t.dtype, tuple(t.shape), tuple(t.stride()))
+    return (_convert_to_cutlass_data_type(t.dtype), get_shape(t), get_strides(t))
 
 
-def _tensor_dynamic_layout_compile_key(t: torch.Tensor, leading_dim: int = -1):
+def _tensor_dynamic_layout_compile_key(t, leading_dim: int = -1):
     """Match the static rank/dtype/broadcast parts of mark_layout_dynamic()."""
+    strides = get_strides(t)
     if leading_dim == -1:
-        leading_dim = t.ndim - 1
+        leading_dim = len(strides) - 1
     return (
-        t.dtype,
-        t.ndim,
+        _convert_to_cutlass_data_type(t.dtype),
+        len(strides),
         int(leading_dim),
-        int(t.stride(leading_dim)),
-        tuple(s == 0 for s in t.stride()),
+        int(strides[leading_dim]),
+        tuple(s == 0 for s in strides),
     )
 
 
 def _dynamic_tensors_compile_key(
     namespace: str,
     config: tuple,
-    tensors: tuple[Optional[torch.Tensor], ...],
+    tensors: tuple,
     leading_dims: Optional[tuple[int, ...]] = None,
 ):
     if leading_dims is None:
@@ -672,7 +716,7 @@ def _bsa_attn_fwd_sm90_blk64(
         value_dim=v.shape[-1],
         blocksparse_blocksize_q=SM90_FWD_BLOCK_SIZE,
         blocksparse_blocksize_k=SM90_FWD_BLOCK_SIZE,
-        dtype=torch2cute_dtype_map[q.dtype],
+        dtype=_convert_to_cutlass_data_type(q.dtype),
         acc_dtype=cutlass.Float32,
         has_block_sizes=has_block_sizes,
         num_splits=kv_splits,
@@ -826,7 +870,7 @@ def _bsa_attn_fwd_sm120_blk64(
         value_dim=v.shape[-1],
         blocksparse_blocksize_q=SM120_FWD_BLOCK_SIZE,
         blocksparse_blocksize_k=SM120_FWD_BLOCK_SIZE,
-        dtype=torch2cute_dtype_map[q.dtype],
+        dtype=_convert_to_cutlass_data_type(q.dtype),
         acc_dtype=cutlass.Float32,
         has_block_sizes=has_block_sizes,
         has_block_nums=has_block_nums,
@@ -926,7 +970,7 @@ def _combine_blk64_kv_bucketed_partials(
         dtype=torch.float32,
         device=q.device,
     )
-    dtype = torch2cute_dtype_map[q.dtype]
+    dtype = _convert_to_cutlass_data_type(q.dtype)
     log_max_splits = _ceil_log2_int(kv_splits)
     # Baseline combine geometry; a single configuration is easier to maintain.
     combine_tile_m = 16
@@ -1073,6 +1117,8 @@ def bsa_attn_fwd_blk64_cutedsl(
     kv_splits: int | str = 1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """BSA forward attention through an independent blk64 CuTeDSL kernel class."""
+    if not is_torch_tensor(q):
+        raise ValueError("JAX arrays are supported only on the SM100/SM110 blk128 forward path; the blk64 path requires torch tensors")
     assert q.dtype == torch.bfloat16, "blk64 CuTeDSL requires bf16"
     assert q.is_cuda and k.is_cuda and v.is_cuda
     assert q.dim() == 4 and k.dim() == 4 and v.dim() == 4
@@ -1145,7 +1191,7 @@ def bsa_attn_fwd_blk64_cutedsl(
     if softmax_scale is None:
         softmax_scale = head_dim**-0.5
 
-    dtype = torch2cute_dtype_map[q_bhsd.dtype]
+    dtype = _convert_to_cutlass_data_type(q_bhsd.dtype)
     arch = _get_device_arch()
     allow_empty_block_nums = has_variable_block_nums and allow_empty_block_nums
     sparse_block_size = 64
@@ -1374,6 +1420,8 @@ def bsa_attn_fwd(
         layout: "bhsd" (default) or "bshd". Output follows the same layout as input.
     """
     assert layout in ("bhsd", "bshd"), f"layout must be 'bhsd' or 'bshd', got {layout!r}"
+    framework = detect_framework(q)
+    is_torch = framework == "torch"
     q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
     if layout == "bhsd":
         batch_size, num_head, seqlen_q, head_dim = q.shape
@@ -1387,25 +1435,29 @@ def bsa_attn_fwd(
     assert batch_k == batch_size and batch_v == batch_size
     assert seqlen_k_v == seqlen_k and num_head_kv_v == num_head_kv
     assert head_dim_k == head_dim
-    assert q.dtype in [torch.float16, torch.bfloat16], "inputs must be float16 or bfloat16"
-    assert q.dtype == k.dtype == v.dtype, "inputs must have the same dtype"
+    q_cutlass_dtype = _convert_to_cutlass_data_type(q.dtype)
+    assert q_cutlass_dtype in (cutlass.Float16, cutlass.BFloat16), "inputs must be float16 or bfloat16"
+    assert q_cutlass_dtype == _convert_to_cutlass_data_type(k.dtype) == _convert_to_cutlass_data_type(v.dtype), "inputs must have the same dtype"
 
-    assert all(t.is_cuda for t in (q, k, v)), "inputs must be on CUDA device"
+    if is_torch:
+        assert all(t.is_cuda for t in (q, k, v)), "inputs must be on CUDA device"
 
     arch = _get_device_arch()
     assert arch // 10 in [9, 10, 11, 12], "BSA only supports SM90/SM100/SM110/SM120"
     assert num_head % num_head_kv == 0
+    if not is_torch and arch // 10 not in (10, 11):
+        raise ValueError("JAX arrays are supported only on the SM100/SM110 blk128 forward path; pass torch tensors for the other backends")
 
     # Block-sparse parameter validation
-    assert q2k_block_index.dtype == torch.int32, "q2k_block_index must be int32"
+    assert _convert_to_cutlass_data_type(q2k_block_index.dtype) == cutlass.Int32, "q2k_block_index must be int32"
     q2k_block_index = maybe_contiguous(q2k_block_index)
     has_block_sizes = block_sizes is not None
     if has_block_sizes:
-        assert block_sizes.dtype == torch.int32, "block_sizes must be int32"
+        assert _convert_to_cutlass_data_type(block_sizes.dtype) == cutlass.Int32, "block_sizes must be int32"
         block_sizes = maybe_contiguous(block_sizes)
     if q2k_block_nums is not None:
         q2k_block_nums = maybe_contiguous(q2k_block_nums)
-        assert q2k_block_nums.dtype == torch.int32, "q2k_block_nums must be int32"
+        assert _convert_to_cutlass_data_type(q2k_block_nums.dtype) == cutlass.Int32, "q2k_block_nums must be int32"
         assert q2k_block_nums.ndim == 3, f"q2k_block_nums must be 3D (batch, num_heads, num_q_blocks), got {q2k_block_nums.ndim}D"
     else:
         if arch // 10 in (9, 12):
@@ -1527,34 +1579,37 @@ def bsa_attn_fwd(
 
     qhead_per_kvhead = num_head // num_head_kv
 
-    out_torch_dtype = q.dtype
     device = q.device
     lse_shape = (batch_size, num_head, seqlen_q)
-    requires_grad = q.requires_grad or k.requires_grad or v.requires_grad
+    requires_grad = is_torch and (q.requires_grad or k.requires_grad or v.requires_grad)
 
     if out is None:
         out_shape = (batch_size, num_head, seqlen_q, head_dim_v) if layout == "bhsd" else (batch_size, seqlen_q, num_head, head_dim_v)
-        out = torch.empty(out_shape, dtype=out_torch_dtype, device=device)
+        out = allocate_tensor(framework, out_shape, q.dtype, device)
     else:
         expected_out_shape = (batch_size, num_head, seqlen_q, head_dim_v) if layout == "bhsd" else (batch_size, seqlen_q, num_head, head_dim_v)
         assert out.shape == expected_out_shape
 
     if lse is None:
-        lse = torch.empty(lse_shape, dtype=torch.float32, device=device) if requires_grad or return_lse else None
+        lse = allocate_tensor(framework, lse_shape, cutlass.Float32, device) if requires_grad or return_lse else None
 
-    dtype = torch2cute_dtype_map[q.dtype]
+    dtype = _convert_to_cutlass_data_type(q.dtype)
 
-    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if is_torch:
+        current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    else:
+        # JAX arrays carry no stream; launch on the CUDA legacy default stream.
+        current_stream = default_stream(framework)
 
     has_variable_block_nums = q2k_block_nums is not None
     if layout == "bhsd":
         q_kernel, k_kernel, v_kernel, out_kernel = q, k, v, out
     else:
         q_kernel, k_kernel, v_kernel, out_kernel = (
-            q.transpose(1, 2),
-            k.transpose(1, 2),
-            v.transpose(1, 2),
-            out.transpose(1, 2),
+            permuted_view(q, (0, 2, 1, 3)),
+            permuted_view(k, (0, 2, 1, 3)),
+            permuted_view(v, (0, 2, 1, 3)),
+            permuted_view(out, (0, 2, 1, 3)),
         )
     bsa_fwd_kernel = BlockSparseAttnForwardSm100Blk128(
         head_dim,
@@ -1632,18 +1687,18 @@ def bsa_attn_fwd(
             options="--enable-tvm-ffi",
         )
 
-    with torch.cuda.nvtx.range("bsa_attn_fwd_kernel"):
+    with _nvtx_range(is_torch, "bsa_attn_fwd_kernel"):
         bsa_attn_fwd.compile_cache[compile_key](
-            q_kernel.detach(),
-            k_kernel.detach(),
-            v_kernel.detach(),
-            out_kernel.detach(),
+            _maybe_detach(q_kernel),
+            _maybe_detach(k_kernel),
+            _maybe_detach(v_kernel),
+            _maybe_detach(out_kernel),
             lse,
             softmax_scale,
-            q2k_block_index.detach(),
-            block_sizes.detach() if has_block_sizes else None,
+            _maybe_detach(q2k_block_index),
+            _maybe_detach(block_sizes) if has_block_sizes else None,
             block_sparse_num,
-            q2k_block_nums.detach() if has_variable_block_nums else None,
+            _maybe_detach(q2k_block_nums) if has_variable_block_nums else None,
             current_stream,
         )
 
@@ -1713,13 +1768,16 @@ def bsa_attn_bwd(
           to FA4's SM100 128x128 backward kernel with BSA block-sparse metadata.
     """
     assert layout in ("bhsd", "bshd"), f"layout must be 'bhsd' or 'bshd', got {layout!r}"
+    framework = detect_framework(q)
+    is_torch = framework == "torch"
     q, k, v, out, dout = [maybe_contiguous(t) for t in (q, k, v, out, dout)]
     lse = maybe_contiguous(lse)
 
-    assert q.dtype == torch.bfloat16, "bwd only supports bfloat16"
-    assert q.dtype == k.dtype == v.dtype == out.dtype == dout.dtype
-    assert lse.dtype == torch.float32
-    assert all(t.is_cuda for t in (q, k, v, out, dout, lse))
+    assert _convert_to_cutlass_data_type(q.dtype) == cutlass.BFloat16, "bwd only supports bfloat16"
+    assert all(_convert_to_cutlass_data_type(t.dtype) == cutlass.BFloat16 for t in (k, v, out, dout))
+    assert _convert_to_cutlass_data_type(lse.dtype) == cutlass.Float32
+    if is_torch:
+        assert all(t.is_cuda for t in (q, k, v, out, dout, lse))
 
     if layout == "bhsd":
         batch_size, num_heads, seqlen_q, head_dim = q.shape
@@ -1731,19 +1789,28 @@ def bsa_attn_bwd(
         batch_size, seqlen_q, num_heads, head_dim = q.shape
         batch_k, seqlen_k, num_heads_kv, head_dim_k = k.shape
         batch_v, seqlen_v, num_heads_v, head_dim_v = v.shape
+        if not is_torch:
+            # JAX has no strided views; allocate the gradients in the caller's
+            # layout up front so the kernel writes through permuted views of the
+            # arrays that are returned (the views below are DLPack wrappers).
+            dq = allocate_tensor(framework, q.shape, q.dtype, q.device) if dq is None else dq
+            dk = allocate_tensor(framework, k.shape, k.dtype, q.device) if dk is None else dk
+            dv = allocate_tensor(framework, v.shape, v.dtype, q.device) if dv is None else dv
         q_bwd, k_bwd, v_bwd, out_bwd, dout_bwd = (
-            q.transpose(1, 2),
-            k.transpose(1, 2),
-            v.transpose(1, 2),
-            out.transpose(1, 2),
-            dout.transpose(1, 2),
+            permuted_view(q, (0, 2, 1, 3)),
+            permuted_view(k, (0, 2, 1, 3)),
+            permuted_view(v, (0, 2, 1, 3)),
+            permuted_view(out, (0, 2, 1, 3)),
+            permuted_view(dout, (0, 2, 1, 3)),
         )
-        dq_bwd = dq.transpose(1, 2) if dq is not None else None
-        dk_bwd = dk.transpose(1, 2) if dk is not None else None
-        dv_bwd = dv.transpose(1, 2) if dv is not None else None
+        dq_bwd = permuted_view(dq, (0, 2, 1, 3)) if dq is not None else None
+        dk_bwd = permuted_view(dk, (0, 2, 1, 3)) if dk is not None else None
+        dv_bwd = permuted_view(dv, (0, 2, 1, 3)) if dv is not None else None
 
     arch = _get_device_arch()
     assert arch // 10 in [9, 10, 11], "BSA bwd only supports SM90/SM100/SM110"
+    if not is_torch and arch // 10 not in (10, 11):
+        raise ValueError("JAX arrays are supported only on the SM100/SM110 blk128 backward path; pass torch tensors for the other backends")
     if arch // 10 == 9:
         bwd_head_dim = SM90_BWD_HEAD_DIM
         if sparse_block_size is None:
@@ -1784,25 +1851,25 @@ def bsa_attn_bwd(
     assert q.shape == out.shape == dout.shape == expected_q_shape
     assert k.shape == v.shape == expected_kv_shape
     if dq is not None:
-        assert dq.shape == expected_q_shape and dq.dtype == q.dtype
-        assert dq.is_cuda
+        assert tuple(dq.shape) == expected_q_shape and _convert_to_cutlass_data_type(dq.dtype) == _convert_to_cutlass_data_type(q.dtype)
+        assert not is_torch or dq.is_cuda
     if dk is not None:
-        assert dk.shape == expected_kv_shape and dk.dtype == k.dtype
-        assert dk.is_cuda
+        assert tuple(dk.shape) == expected_kv_shape and _convert_to_cutlass_data_type(dk.dtype) == _convert_to_cutlass_data_type(k.dtype)
+        assert not is_torch or dk.is_cuda
     if dv is not None:
-        assert dv.shape == expected_kv_shape and dv.dtype == v.dtype
-        assert dv.is_cuda
+        assert tuple(dv.shape) == expected_kv_shape and _convert_to_cutlass_data_type(dv.dtype) == _convert_to_cutlass_data_type(v.dtype)
+        assert not is_torch or dv.is_cuda
     assert lse.shape == (batch_size, num_heads, seqlen_q)
 
     num_q_blocks = (seqlen_q + sparse_block_size - 1) // sparse_block_size
     num_kv_blocks = (seqlen_k + sparse_block_size - 1) // sparse_block_size
 
-    assert q2k_block_index.dtype == torch.int32
+    assert _convert_to_cutlass_data_type(q2k_block_index.dtype) == cutlass.Int32
     assert q2k_block_index.shape[:3] == (batch_size, num_heads, num_q_blocks), (
         f"q2k_block_index has shape {tuple(q2k_block_index.shape)}, expected " f"(b={batch_size}, h={num_heads}, num_q_blocks={num_q_blocks}, max_kv_blocks)"
     )
     if q2k_block_nums is not None:
-        assert q2k_block_nums.dtype == torch.int32
+        assert _convert_to_cutlass_data_type(q2k_block_nums.dtype) == cutlass.Int32
         assert q2k_block_nums.shape == (batch_size, num_heads, num_q_blocks)
     else:
         assert q2k_block_index.shape[-1] >= block_sparse_num, (
@@ -1840,12 +1907,19 @@ def bsa_attn_bwd(
             dv=dv_bwd,
         )
         if layout == "bshd":
+            if not is_torch:
+                # The kernel wrote through permuted DLPack views of the caller-layout
+                # arrays pre-allocated above; return the real arrays.
+                return dq, dk, dv
             return (
                 dq_out.transpose(1, 2),
                 dk_out.transpose(1, 2),
                 dv_out.transpose(1, 2),
             )
         return dq_out, dk_out, dv_out
+
+    if not is_torch:
+        raise ValueError("JAX arrays are supported only on the SM100/SM110 blk128 backward path; pass torch tensors for the blk64 backends")
 
     if bucket_size_blocks is None:
         bucket_size_blocks = sm90_bwd_auto_bucketed_k2q_size_blocks(num_q_blocks) if arch // 10 == 9 else sm100_bwd_auto_bucketed_k2q_size_blocks(num_q_blocks)
@@ -1996,7 +2070,7 @@ def _bsa_attn_bwd_bucketed_k2q_csr(
 
         block_sizes_sm90 = variable_block_sizes if has_block_sizes else None
 
-        dtype = torch2cute_dtype_map[q.dtype]
+        dtype = _convert_to_cutlass_data_type(q.dtype)
         workspace = _empty_bwd_workspace_with_zeroed_accum(
             batch_size=batch_size,
             num_heads=num_heads,
