@@ -96,14 +96,19 @@ exchange_api_for(PyObject *obj) {
         Py_DECREF(capsule);
         if (api == nullptr) PyErr_Clear();
     }
-    if (cache.count < kTypeCacheSlots) {
-        // Keyed on the type's ADDRESS, so the entry must own a reference: a
-        // heap type that got collected could be replaced by a different type
-        // allocated at the same address, and this would hand out its vtable.
-        // The cache never evicts, so this pins at most kTypeCacheSlots types.
+    // Only a hit is cached. A type can acquire the vtable AFTER we first look:
+    // on torch builds without it natively, tvm-ffi installs one when it is
+    // imported, and a graph normalized before that import would otherwise be
+    // pinned to the python fallback for the life of the process.
+    //
+    // Keyed on the type's ADDRESS, so the entry must own a reference: a heap
+    // type that got collected could be replaced by a different type allocated
+    // at the same address, and this would hand out its vtable. The cache never
+    // evicts, so this pins at most kTypeCacheSlots types.
+    if (api != nullptr && cache.count < kTypeCacheSlots) {
         Py_INCREF(type);
         cache.types[cache.count] = type;
-        cache.apis[cache.count]  = api;  // a null answer is worth caching too
+        cache.apis[cache.count]  = api;
         cache.count++;
     }
     return api;
@@ -372,18 +377,27 @@ slot_dltensor_from_py_object(void *py_object, DLTensor *out) {
 
 int
 slot_managed_from_py_object(void *py_object, DLManagedTensorVersioned **out) {
-    auto *slot    = py::cast<VariantPackSlot *>(py::handle(static_cast<PyObject *>(py_object)));
-    auto *managed = static_cast<DLManagedTensorVersioned *>(std::calloc(1, sizeof(DLManagedTensorVersioned)));
-    if (managed == nullptr) {
-        PyErr_NoMemory();
-        return -1;
-    }
-    managed->version.major = DLPACK_MAJOR_VERSION;
-    managed->version.minor = DLPACK_MINOR_VERSION;
-    managed->dl_tensor     = slot->tensor();
-    managed->manager_ctx   = nullptr;
-    managed->deleter       = [](DLManagedTensorVersioned *self) { std::free(self); };
-    *out                   = managed;
+    auto *slot = py::cast<VariantPackSlot *>(py::handle(static_cast<PyObject *>(py_object)));
+    // A managed tensor is the form a consumer is allowed to OUTLIVE the
+    // producer with, so it cannot point at the slot's vectors: the shape and
+    // stride are copied and owned here, and the deleter frees them.
+    struct Managed {
+        DLManagedTensorVersioned versioned;
+        std::vector<int64_t> shape;
+        std::vector<int64_t> stride;
+    };
+    auto *owned =
+        new Managed{{}, slot->shape(), slot->tensor().strides == nullptr ? std::vector<int64_t>() : slot->stride()};
+    auto &tensor = owned->versioned.dl_tensor;
+    tensor       = slot->tensor();
+    tensor.shape = owned->shape.empty() ? nullptr : owned->shape.data();
+    // a slot with no stride array is dense, and DLPack spells that as null
+    tensor.strides                 = owned->stride.empty() ? nullptr : owned->stride.data();
+    owned->versioned.version.major = DLPACK_MAJOR_VERSION;
+    owned->versioned.version.minor = DLPACK_MINOR_VERSION;
+    owned->versioned.manager_ctx   = owned;
+    owned->versioned.deleter = [](DLManagedTensorVersioned *self) { delete static_cast<Managed *>(self->manager_ctx); };
+    *out                     = &owned->versioned;
     return 0;
 }
 
@@ -540,6 +554,15 @@ class VariantPackNative {
         if (!slot.filled) {
             throw py::value_error("variant-pack slot " + std::to_string(index) + " has no buffer to re-describe");
         }
+        // ndim comes from the shape and the DLTensor's stride array is read
+        // ndim deep, so a shorter stride would be read past its end by any
+        // consumer -- and this is the one place a shape and a stride arrive
+        // from two different lists.
+        if (shape.size() != stride.size()) {
+            throw py::value_error("override shape and stride must have the same rank; got " +
+                                  std::to_string(shape.size()) + " and " + std::to_string(stride.size()) +
+                                  " for slot " + std::to_string(index));
+        }
         slot.ndim   = static_cast<int32_t>(shape.size());
         slot.shape  = std::move(shape);
         slot.stride = std::move(stride);
@@ -670,6 +693,11 @@ read_buffer_extent(py::handle buffer) {
     if (api == nullptr || api->dltensor_from_py_object_no_sync == nullptr) return py::none();
     DLTensor t{};
     if (api->dltensor_from_py_object_no_sync(buffer.ptr(), &t) != 0) throw py::error_already_set();
+    // A byte count is only a byte RANGE for a dense buffer; a strided or
+    // broadcast one covers more (or, at stride 0, far less) than its element
+    // count says, and a carve bounds-checked against that would write outside
+    // the allocation. Hand it back to python to describe and refuse.
+    if (!is_dense(t)) return py::none();
     int64_t numel = 1;
     for (int d = 0; d < t.ndim; d++) numel *= t.shape[d];
     const int64_t itemsize = (static_cast<int64_t>(t.dtype.bits) * t.dtype.lanes + 7) / 8;

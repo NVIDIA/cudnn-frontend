@@ -70,6 +70,10 @@ _TEMPLATE_DIR = Path(__file__).parent / "kernel_templates"
 _TVM_FFI_OK = importlib.util.find_spec("tvm_ffi") is not None
 _FROST_COMPILE_OPTIONS = "--enable-tvm-ffi" if _TVM_FFI_OK else ""
 
+# prototype: evaluate the per-execute gate from a table built once at compile
+# time instead of rebuilding five lists and walking them four times.
+_GATE_TABLE = os.environ.get("CUDNN_FRONTEND_FROST_GEMM_GATE_TABLE") == "1"
+
 
 # ---------------------------------------------------------------------------
 # Symbolic-shape helpers for aux fake tensors
@@ -1841,6 +1845,9 @@ class CompiledFusedGemm:
                 raise KeyError(f"variant pack is missing a buffer for {role}")
             return resolved[id(t)]
 
+        if _GATE_TABLE:
+            return self._run_gated(resolved, pull, stream)
+
         a_bufs = [pull(t, "A operand") for t in b.a_operands]
         b_bufs = [pull(t, "B operand") for t in b.b_operands]
         out_bufs = [pull(t, "output") for t in b.outputs]
@@ -1916,6 +1923,128 @@ class CompiledFusedGemm:
             _finalize_reductions(self.chain, out_bufs)
             return r
         r = self._call_positional(a_bufs[0], b_bufs[0], c_arg, mnk, *aux_bufs, stream=stream)
+        _finalize_reductions(self.chain, out_bufs)
+        return r
+
+    # ---- prototype: one gate table, built once, walked once --------------
+    #
+    # The gate above rebuilds five lists and walks them four times, and
+    # recomputes two alignment tables that only depend on facts the kernel
+    # baked. Which operand needs what alignment, what major, and how its
+    # extents follow M/N/K are all settled when the plan compiles; only the
+    # extents and the pointers arrive per call. This builds that table on the
+    # first execute and evaluates it in one pass.
+    #
+    # Guarded by CUDNN_FRONTEND_FROST_GEMM_GATE_TABLE=1 while it is measured
+    # against the path it replaces.
+
+    def _gate_table(self):
+        table = getattr(self, "_gate_cache", None)
+        if table is not None:
+            return table
+        b = self.binding
+        mm = self.chain.matmul
+        out_reqs = _output_align_reqs(self.chain, self.use_tma_store, vec_bytes=self.vec_bytes_epi)
+        aux_reqs = _aux_align_reqs(self.chain, vec_bytes=self.vec_bytes_epi)
+        a_pack = 2 if mm.a_dtype == "fp4_e2m1" else 1
+        b_pack = 2 if mm.b_dtype == "fp4_e2m1" else 1
+
+        # (role, tensor, extent_is_n, kpack, want_contiguous_dim, major)
+        # extent_is_n picks M or N for dim 1.
+        operands = []
+        for i, t in enumerate(b.a_operands):
+            operands.append((f"A operand[{i}]", t, False, a_pack, _MAJOR_CONTIGUOUS_DIM[mm.a_major], mm.a_major))
+        for j, t in enumerate(b.b_operands):
+            operands.append((f"B operand[{j}]", t, True, b_pack, _MAJOR_CONTIGUOUS_DIM[mm.b_major], mm.b_major))
+        # every buffer whose alignment _alignment_reject checks, in one table --
+        # including the A/B operands, so their rejection message stays that
+        # function's rather than a second one written here
+        extras = []
+        for i, t in enumerate(b.a_operands):
+            extras.append(("A operand", t, 16, "ptr"))
+        for j, t in enumerate(b.b_operands):
+            extras.append(("B operand", t, 16, "ptr"))
+        for k, t in enumerate(b.outputs):
+            extras.append((f"output[{k}]", t, out_reqs[k], "full"))
+        for k, t in enumerate(b.aux):
+            extras.append((f"aux {self.aux_names[k]!r}", t, aux_reqs[self.aux_names[k]], "full"))
+        if self.block_scale:
+            for t in b.sfa_operands:
+                extras.append(("SFA", t, 16, "ptr"))
+            for t in b.sfb_operands:
+                extras.append(("SFB", t, 16, "ptr"))
+        table = self._gate_cache = (operands, extras, mm, a_pack)
+        return table
+
+    def _run_gated(self, resolved, pull, stream):
+        operands, extras, mm, a_pack = self._gate_table()
+        b = self.binding
+        a_bufs = [pull(t, "A operand") for t in b.a_operands]
+        b_bufs = [pull(t, "B operand") for t in b.b_operands]
+        out_bufs = [pull(t, "output") for t in b.outputs]
+        aux_bufs = [pull(t, f"aux {self.aux_names[i]!r}") for i, t in enumerate(b.aux)]
+
+        M = a_bufs[0].shape[1]
+        K = a_bufs[0].shape[2] * a_pack
+        N = b_bufs[0].shape[1]
+
+        reason = _tma_alignment_reject(mm.a_dtype, mm.b_dtype, mm.a_major, mm.b_major, M, N, K)
+        if reason is not None:
+            raise ValueError(reason)
+
+        # one pass: shape agreement and layout together
+        shape_bad, layout_bad = [], []
+        for role, tensor, extent_is_n, kpack, want_dim, major in operands:
+            buf = resolved[id(tensor)]
+            shape = tuple(buf.shape)
+            if len(shape) != 3:
+                shape_bad.append(f"{role}: expected a rank-3 buffer, got shape {shape}")
+                continue
+            want = ((N if extent_is_n else M), K // kpack)
+            if (shape[1], shape[2]) != want:
+                shape_bad.append(f"{role}: expected (batch, {want[0]}, {want[1]}), got {shape}")
+            strides = tuple(buf.stride())
+            unit = [i for i, s in enumerate(strides) if s == 1 and shape[i] > 1]
+            got = unit[0] if len(unit) == 1 else None
+            if got is not None and got != want_dim:
+                names = {0: "batch", 1: "M/N", 2: "K"}
+                layout_bad.append(
+                    f"{role}: graph declares {major}-major (dim {want_dim} contiguous) but the buffer has dim {got} ({names[got]}) contiguous, stride={strides}"
+                )
+        if shape_bad:
+            raise ValueError(f"runtime operand shapes disagree with the inferred problem size (M={M}, N={N}, K={K}): " + "; ".join(shape_bad))
+        if layout_bad:
+            raise ValueError("runtime operand layout does not match the layout the kernel was compiled for: " + "; ".join(layout_bad))
+
+        reason = _alignment_reject([(role, resolved[id(t)], req, mode) for role, t, req, mode in extras])
+        if reason is not None:
+            raise ValueError(reason)
+
+        if self.block_scale:
+            sf_k4 = ((K // self.chain.block_scale.block_size) + 3) // 4
+            reason = _sf_blob_reject(
+                [(f"SFA[{i}]", pull(t, "SFA"), 512 * sf_k4 * ((M + 127) // 128) * int(a_bufs[i].shape[0])) for i, t in enumerate(b.sfa_operands)]
+                + [(f"SFB[{j}]", pull(t, "SFB"), 512 * sf_k4 * ((N + 127) // 128) * int(b_bufs[j].shape[0])) for j, t in enumerate(b.sfb_operands)]
+            )
+            if reason is not None:
+                raise ValueError(reason)
+
+        mnk = (M, N, K)
+        c_arg = out_bufs if len(out_bufs) > 1 else out_bufs[0]
+        if self.chain.is_multi_gemm:
+            if self.block_scale:
+                sfa = [pull(t, "SFA") for t in b.sfa_operands]
+                sfb = [pull(t, "SFB") for t in b.sfb_operands]
+                pairs = [((a_bufs[ai], sfa[ai]), (b_bufs[bi], sfb[bi])) for ai, bi in self.chain.gemm_operands]
+            else:
+                pairs = [(a_bufs[ai], b_bufs[bi]) for ai, bi in self.chain.gemm_operands]
+            r = self._call_positional(pairs, c_arg, mnk, *aux_bufs, stream=stream)
+        elif self.block_scale:
+            r = self._call_positional(
+                a_bufs[0], b_bufs[0], c_arg, mnk, pull(b.sfa_operands[0], "SFA"), pull(b.sfb_operands[0], "SFB"), *aux_bufs, stream=stream
+            )
+        else:
+            r = self._call_positional(a_bufs[0], b_bufs[0], c_arg, mnk, *aux_bufs, stream=stream)
         _finalize_reductions(self.chain, out_bufs)
         return r
 

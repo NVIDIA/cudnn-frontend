@@ -36,6 +36,16 @@ from .nodes import Node, _row_major_stride
 _LOG = logging.getLogger("cudnn.pygraph")
 
 
+def _is_dense(dim, stride) -> bool:
+    """Row-major compact, the way `frost.buffers.is_contiguous` reads it."""
+    expect = 1
+    for extent, step in zip(reversed(tuple(dim)), reversed(tuple(stride))):
+        if extent != 1 and step != expect:
+            return False
+        expect *= extent
+    return True
+
+
 def _in_axis_order_of(shape, stride, reference_stride):
     """``(shape, stride)`` re-expressed in the axis order ``reference_stride`` uses.
 
@@ -1900,24 +1910,32 @@ class pygraph:
                 name = f" ({declared.name!r})" if declared is not None and declared.name else ""
                 raise ValueError(f"the variant pack is missing a buffer for tensor uid {uid}{name}")
         if override_uids:
+            # The backend refuses a partial override, so a short list must not
+            # quietly mean "keep what you had for the rest" here: that is the
+            # same call answering two ways depending on which plan ran.
+            if len(override_shapes or ()) != len(override_uids) or len(override_strides or ()) != len(override_uids):
+                raise ValueError(
+                    f"override_uids, override_shapes and override_strides must name the same tensors: got "
+                    f"{len(override_uids)}, {len(override_shapes or ())} and {len(override_strides or ())} entries"
+                )
             slot_of = {uid: i for i, uid in enumerate(order)}
-            shapes = override_shapes or ()
-            strides = override_strides or ()
             for j, uid in enumerate(override_uids):
                 i = slot_of.get(uid)
                 if i is None:
                     raise ValueError(f"override_uids names tensor uid {uid}, which is not an operand of this graph")
-                shape = tuple(shapes[j]) if j < len(shapes) else tuple(native.shape(i))
-                stride = tuple(strides[j]) if j < len(strides) else tuple(native.stride(i))
-                native.override_slot(i, *_in_axis_order_of(shape, stride, native.stride(i)))
+                native.override_slot(i, *_in_axis_order_of(tuple(override_shapes[j]), tuple(override_strides[j]), native.stride(i)))
         # The workspace has no uid, so it is not an operand — but an engine has
         # to bounds-check its carves, and reading its size here is the same read
         # every other buffer gets rather than a second probe further down.
         workspace_ptr, workspace_bytes = 0, 0
         if workspace is not None:
             extent = _pybind_module.read_buffer_extent(workspace)
-            if extent is None:  # a bare address, or a producer without the vtable
+            if extent is None:  # a bare address, a non-dense buffer, or no vtable
                 workspace_ptr, workspace_tensor = self._describe(workspace, -1)
+                # An engine carves the workspace by byte offset, so a byte
+                # COUNT is only a byte RANGE when the buffer is dense.
+                if not _is_dense(workspace_tensor.dim, workspace_tensor.stride):
+                    raise ValueError(f"the workspace buffer must be contiguous; got dim {tuple(workspace_tensor.dim)} stride {tuple(workspace_tensor.stride)}")
                 workspace_bytes = _byte_size(workspace_tensor)
             else:
                 workspace_ptr, workspace_bytes = extent
@@ -1943,11 +1961,16 @@ class pygraph:
         protocol cannot spell bf16 — which is why the last branch is last and
         not the only one.
 
-        A caller who passed a bare address gets a Tensor with no geometry: a
-        pointer carries none, and the backend has always accepted that.
+        A bare address carries no geometry, so it borrows the graph's: the
+        backend has always accepted a raw pointer, and an engine that reads the
+        pack for its extents would otherwise fail on an operand form the
+        backend takes -- one call, two answers, decided by plan selection.
         """
-        if type(data) is int:
-            return data, Tensor(uid=uid)  # bare device address
+        if type(data) is int:  # bare device address
+            declared = self._tensor_by_uid.get(uid)
+            if declared is None or not declared.dim:
+                return data, Tensor(uid=uid)
+            return data, describing_tensor(uid, tuple(declared.dim), tuple(declared.stride), declared.data_type)
         dim = getattr(data, "shape", None)
 
         # torch: pointer from data_ptr(), strides from stride() in ELEMENTS
