@@ -948,26 +948,24 @@ TEST_CASE("Handle-less plan deserialize", "[serialize][graph]") {
     }
 
     SECTION("RTC fusion plan carries RUNTIME_COMPILATION behavior note") {
-        // Build a conv+relu fusion that is expected to use the runtime-compiled engine.
-        // The behavior note must be present BEFORE serialization so we know the RTC
-        // code path is actually exercised.
         FusionGraph fg;
         fg.graph->set_device_properties(dp);
-        REQUIRE(fg.graph->build({fe::HeurMode_t::A, fe::HeurMode_t::FALLBACK}).is_good());
+        REQUIRE(fg.graph->build_operation_graph().is_good());
+        REQUIRE(fg.graph->create_execution_plans({fe::HeurMode_t::A, fe::HeurMode_t::FALLBACK}).is_good());
+        fg.graph->select_behavior_notes({fe::BehaviorNote_t::RUNTIME_COMPILATION});
+        if (fg.graph->check_support().is_bad()) {
+            SKIP("No RUNTIME_COMPILATION engine available for this graph on this GPU/cuDNN");
+        }
+        REQUIRE(fg.graph->build_plans(fe::BuildPlanPolicy_t::HEURISTICS_CHOICE).is_good());
 
         std::vector<fe::BehaviorNote_t> notes;
         REQUIRE(fg.graph->get_behavior_notes(notes).is_good());
         bool has_rtc = std::find(notes.begin(), notes.end(), fe::BehaviorNote_t::RUNTIME_COMPILATION) != notes.end();
-        if (!has_rtc) {
-            SKIP(
-                "conv+relu did not select a RUNTIME_COMPILATION plan on this GPU/cuDNN version; "
-                "skipping RTC-path coverage");
-        }
+        REQUIRE(has_rtc);
 
         std::vector<uint8_t> blob;
         REQUIRE(fg.graph->serialize(blob).is_good());
 
-        // Handle-less deserialize with correct devprop must succeed.
         fe::graph::Graph deser;
         deser.set_device_properties(dp);
         REQUIRE(deser.deserialize(blob).is_good());
