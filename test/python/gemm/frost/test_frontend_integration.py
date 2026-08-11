@@ -509,3 +509,57 @@ def test_wrapper_graph_path():
     g({A: a, B: b, bias: bias_t, Y: y})
     torch.cuda.synchronize()
     torch.testing.assert_close(y, ref, atol=1e-1, rtol=1e-2)
+
+
+@_GPU
+def test_override_shape_inside_a_max_allocation_matches_the_backend():
+    """The case override shape is FOR: allocate once at a cache shape, name the
+    live shape per call.
+
+    A caller does not pick the plan, so the two paths have to answer the same
+    question. FROST reads its M/N/K off the operands, so this only works if
+    ``execute`` applies the overrides to what it hands the engine -- and in the
+    axis order the operand already uses, since ``override_shapes`` speaks the
+    graph's declaration (B is ``[batch, K, N]``) while the buffer is allocated
+    ``(batch, N, K)``. Getting that wrong reads N as K and the kernel rejects
+    the launch, or worse runs the whole allocation.
+    """
+    mb, nb, kb = 256, 256, 128
+    m, n, k = 128, 192, 64
+    a = torch.empty(1, mb, kb, dtype=torch.int32).random_(-2, 2).to(torch.bfloat16).cuda()
+    b = torch.empty(1, nb, kb, dtype=torch.int32).random_(-2, 2).to(torch.bfloat16).cuda()
+    ref = torch.einsum("bmk,bnk->bmn", a[:, :m, :k].float(), b[:, :n, :k].float()).to(torch.bfloat16)
+
+    uids = [1, 2, 3]
+    shapes = [[1, m, k], [1, k, n], [1, m, n]]
+    strides = [[mb * kb, kb, 1], [nb * kb, 1, kb], [mb * nb, nb, 1]]
+
+    results = {}
+    for want_frost in (False, True):
+        g = cudnn.pygraph(
+            io_data_type=cudnn.data_type.BFLOAT16,
+            intermediate_data_type=cudnn.data_type.FLOAT,
+            compute_data_type=cudnn.data_type.FLOAT,
+            is_dynamic_shape_enabled=True,
+            is_override_shape_enabled=True,
+        )
+        A = g.tensor(name="A", uid=1, dim=[1, mb, kb], stride=[mb * kb, kb, 1], data_type=cudnn.data_type.BFLOAT16)
+        B = g.tensor(name="B", uid=2, dim=[1, kb, nb], stride=[kb * nb, 1, kb], data_type=cudnn.data_type.BFLOAT16)
+        C = g.matmul(A=A, B=B, name="mm")
+        C.set_output(True).set_data_type(cudnn.data_type.BFLOAT16).set_uid(3)
+        _plan(g)
+        index = _index_of(g, _FROST) if want_frost else _first_backend_index(g)
+        g.select_plan(index)
+        g.check_support()
+        g.build_plans()
+
+        h = cudnn.create_handle()
+        wsz = g.get_workspace_size_plan_at_index(index, h, uids, shapes, strides)
+        ws = torch.empty(max(wsz, 1), device="cuda", dtype=torch.uint8)
+        c = torch.zeros(1, mb, nb, dtype=torch.bfloat16, device="cuda")
+        g.execute({1: a, 2: b, 3: c}, ws, handle=h, override_uids=uids, override_shapes=shapes, override_strides=strides)
+        torch.cuda.synchronize()
+        results[g.get_plan_name_at_index(index)] = c[:, :m, :n].clone()
+
+    for name, got in results.items():
+        torch.testing.assert_close(got, ref, atol=0, rtol=0, msg=lambda s, name=name: f"{name} ran the wrong shape\n{s}")

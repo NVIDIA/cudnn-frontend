@@ -1821,11 +1821,20 @@ class CompiledFusedGemm:
             raise TypeError(
                 "compiled kernels are called with a variant-pack dict " "{cuDNN tensor | uid | name: buffer}; got " f"{type(variant_pack).__name__}"
             )
-        _check_plan_device(self.device)
         if self.binding is None:
             raise NotImplementedError("variant-pack call is not wired up for this graph type")
+        return self.run_resolved(resolve_variant_pack(variant_pack, self.binding), stream=stream)
+
+    def run_resolved(self, resolved, stream=None):
+        """Launch over ``{id(bound_tensor): buffer}``, already resolved.
+
+        Which bound tensor holds which operand is fixed when the plan compiles,
+        so a caller that knows it -- the engine, which binds the graph's slots
+        once -- has no reason to rebuild the by-object / by-uid / by-name tables
+        resolve_variant_pack needs on every execute.
+        """
+        _check_plan_device(self.device)
         b = self.binding
-        resolved = resolve_variant_pack(variant_pack, b)
 
         def pull(t, role):
             if t is None or id(t) not in resolved:
@@ -2816,7 +2825,9 @@ def _moe_carve_workspace(caller, n_slots: int, plan: str):
     executor converts through the one-time adapter registered above."""
     _register_legacy_device_view_adapter()
     need = n_slots * _MOE_DESC_SLOT_BYTES
-    ws = Workspace(caller, need, plan, align=_MOE_DESC_SLOT_BYTES)
+    # already carved when the engine handed one down; a raw buffer only when
+    # the plan allocated its own (the direct jit_from_cudnn_graph path)
+    ws = caller if isinstance(caller, Workspace) else Workspace(caller, need, plan, align=_MOE_DESC_SLOT_BYTES)
     return ws.view(0, "int64", (need // 8,))
 
 

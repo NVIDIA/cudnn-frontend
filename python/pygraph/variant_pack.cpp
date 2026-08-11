@@ -211,6 +211,17 @@ class VariantPackSlot {
         return dense;
     }
 
+    // One axis of it, the way a caller written against a framework tensor asks
+    // (``stride(-1)`` for the innermost).
+    int64_t
+    stride_at(int64_t dim) const {
+        int64_t axis = dim < 0 ? dim + slot_.ndim : dim;
+        if (axis < 0 || axis >= slot_.ndim)
+            throw py::index_error("stride(): dimension " + std::to_string(dim) + " is out of range for a " +
+                                  std::to_string(slot_.ndim) + "-D slot");
+        return stride()[axis];
+    }
+
     // The bare dtype NAME, which is what a kernel means when it asks a buffer
     // for its dtype: they all reach it through str(x.dtype).split(".")[-1], so
     // a torch tensor's "torch.bfloat16" and this "bfloat16" answer the same.
@@ -277,6 +288,34 @@ class VariantPackSlot {
         out.ndim  = static_cast<int32_t>(out.shape.size());
         out.stride.clear();  // dense by construction, as the reshape required
         return new VariantPackSlot(out, tensor_.device.device_id);
+    }
+
+    // The same memory with its axes reordered. A kernel layer written against
+    // framework tensors reaches for this, and unlike reshape it is exact for a
+    // strided slot too -- it only relabels axes.
+    VariantPackSlot *
+    permute(const std::vector<int64_t> &axes) const {
+        if (axes.size() != static_cast<size_t>(slot_.ndim))
+            throw py::value_error("permute needs one axis per dimension: this slot is " + std::to_string(slot_.ndim) +
+                                  "-D");
+        std::vector<bool> seen(axes.size(), false);
+        Slot out = slot_;
+        out.stride.assign(slot_.ndim, 1);
+        if (slot_.stride.empty()) {
+            for (int d = slot_.ndim - 2; d >= 0; d--) out.stride[d] = out.stride[d + 1] * slot_.shape[d + 1];
+        } else {
+            out.stride = slot_.stride;
+        }
+        const std::vector<int64_t> from_stride = out.stride;
+        for (size_t d = 0; d < axes.size(); d++) {
+            int64_t axis = axes[d] < 0 ? axes[d] + slot_.ndim : axes[d];
+            if (axis < 0 || axis >= slot_.ndim || seen[axis])
+                throw py::value_error("permute axes must be a permutation of the slot's dimensions");
+            seen[axis]    = true;
+            out.shape[d]  = slot_.shape[axis];
+            out.stride[d] = from_stride[axis];
+        }
+        return new VariantPackSlot(std::move(out), tensor_.device.device_id);
     }
 
     // Row-major contiguous by construction, so this is the identity a caller
@@ -422,6 +461,39 @@ class VariantPackNative {
     // for python to describe and report back through set_slot -- crossing the
     // binding once per pack rather than once per operand is 2.53 us against
     // 1.0 for eight. A None entry is a slot the caller did not fill.
+    // The whole pack from the caller's uid map, in one crossing: look each uid
+    // up, read what publishes the vtable, and report the rest. Same result as
+    // building the ordered buffer list in python and handing it to read_all,
+    // without the list, the comprehension, or the frame around them.
+    //
+    // A uid the map does not carry is left unfilled rather than refused here:
+    // whether that is the caller's mistake or an optional port depends on the
+    // graph, which python knows and this does not.
+    std::vector<size_t>
+    read_from(const py::dict &uid_to_data, const std::vector<int64_t> &uids) {
+        std::vector<size_t> unread;
+        const size_t n = uids.size();
+        for (size_t i = 0; i < n && i < slots_.size(); i++) {
+            PyObject *buffer = PyDict_GetItem(uid_to_data.ptr(), py::int_(uids[i]).ptr());
+            if (buffer == nullptr || buffer == Py_None) {
+                skip_slot(i);
+            } else if (!read_slot(i, py::handle(buffer))) {
+                unread.push_back(i);
+            }
+        }
+        return unread;
+    }
+
+    // The first slot no one filled, or -1. The strict check asks this once
+    // instead of calling is_filled per operand.
+    int64_t
+    first_unfilled() const {
+        for (size_t i = 0; i < slots_.size(); i++) {
+            if (!slots_[i].filled) return static_cast<int64_t>(i);
+        }
+        return -1;
+    }
+
     std::vector<size_t>
     read_all(py::sequence buffers) {
         std::vector<size_t> unread;
@@ -456,6 +528,23 @@ class VariantPackNative {
     }
 
     // A slot the caller did not fill: an optional port it did not request.
+    // Re-describe a slot at the shape this execute is actually running, keeping
+    // the buffer it was read from. This is what override_shapes means: the
+    // caller allocated once at a cache shape and names the live shape per call.
+    // Applying it here rather than in an engine is what keeps the two paths
+    // answering the same question -- an engine that reads the pack gets the
+    // override without knowing the concept exists.
+    void
+    override_slot(size_t index, std::vector<int64_t> shape, std::vector<int64_t> stride) {
+        Slot &slot = slots_.at(index);
+        if (!slot.filled) {
+            throw py::value_error("variant-pack slot " + std::to_string(index) + " has no buffer to re-describe");
+        }
+        slot.ndim   = static_cast<int32_t>(shape.size());
+        slot.shape  = std::move(shape);
+        slot.stride = std::move(stride);
+    }
+
     void
     skip_slot(size_t index) {
         slots_.at(index).filled = false;
@@ -570,6 +659,23 @@ make_slot(int64_t ptr, std::vector<int64_t> shape, int dtype_code, int dtype_bit
     return new VariantPackSlot(std::move(slot), device_id);
 }
 
+// ``(pointer, bytes)`` for a buffer that publishes the vtable, else None.
+//
+// The workspace is not an operand -- it has no uid and no slot -- but an engine
+// still has to bounds-check its carves against it, and asking python for the
+// size cost as much as reading all eight operands here.
+py::object
+read_buffer_extent(py::handle buffer) {
+    DLPackExchangeAPI *api = exchange_api_for(buffer.ptr());
+    if (api == nullptr || api->dltensor_from_py_object_no_sync == nullptr) return py::none();
+    DLTensor t{};
+    if (api->dltensor_from_py_object_no_sync(buffer.ptr(), &t) != 0) throw py::error_already_set();
+    int64_t numel = 1;
+    for (int d = 0; d < t.ndim; d++) numel *= t.shape[d];
+    const int64_t itemsize = (static_cast<int64_t>(t.dtype.bits) * t.dtype.lanes + 7) / 8;
+    return py::make_tuple(reinterpret_cast<int64_t>(static_cast<char *>(t.data) + t.byte_offset), numel * itemsize);
+}
+
 // A workspace carve, planned once. Which regions a plan cuts, at what offsets,
 // with what dtypes and shapes, is fixed when the engine builds; only the
 // caller's base pointer arrives per execute. Describing them here rather than
@@ -640,7 +746,13 @@ capsule built in python.
                           .def_property_readonly("shape", &VariantPackSlot::shape)
                           .def_property_readonly("dtype", &VariantPackSlot::dtype)
                           .def_property_readonly("nbytes", &VariantPackSlot::nbytes)
-                          .def("stride", &VariantPackSlot::stride)
+                          .def(
+                              "stride",
+                              [](const VariantPackSlot &self, py::object dim) -> py::object {
+                                  if (dim.is_none()) return py::cast(self.stride());
+                                  return py::cast(self.stride_at(dim.cast<int64_t>()));
+                              },
+                              py::arg("dim") = py::none())
                           .def("element_size", &VariantPackSlot::element_size)
                           .def("numel", &VariantPackSlot::numel)
                           .def("__len__", &VariantPackSlot::length)
@@ -654,6 +766,17 @@ capsule built in python.
                                        for (auto d : dims) shape.push_back(d.cast<int64_t>());
                                    }
                                    return self.reshape(std::move(shape));
+                               })
+                          .def("permute",
+                               [](const VariantPackSlot &self, py::args axes) {
+                                   std::vector<int64_t> order;
+                                   if (axes.size() == 1 && py::isinstance<py::sequence>(axes[0]) &&
+                                       !py::isinstance<py::int_>(axes[0])) {
+                                       order = axes[0].cast<std::vector<int64_t>>();
+                                   } else {
+                                       for (auto a : axes) order.push_back(a.cast<int64_t>());
+                                   }
+                                   return self.permute(order);
                                })
                           .def("contiguous", [](py::object self) { return self; })
                           .def("__dlpack_device__", &VariantPackSlot::dlpack_device)
@@ -682,6 +805,11 @@ capsule built in python.
           py::arg("device_id"),
           "A DLPack producer over memory the caller did not supply -- a workspace carve.");
 
+    m.def("read_buffer_extent",
+          &read_buffer_extent,
+          py::arg("buffer"),
+          "(pointer, bytes) through the exchange vtable, or None when the type does not publish one.");
+
     py::class_<WorkspaceCarve>(m, "WorkspaceCarve", R"(
 A workspace carve compiled once, at build.
 
@@ -706,7 +834,10 @@ its parts.
         .def(py::init<size_t>())
         .def("read_slot", &VariantPackNative::read_slot)
         .def("read_all", &VariantPackNative::read_all)
+        .def("read_from", &VariantPackNative::read_from)
+        .def("first_unfilled", &VariantPackNative::first_unfilled)
         .def("set_slot", &VariantPackNative::set_slot)
+        .def("override_slot", &VariantPackNative::override_slot)
         .def("skip_slot", &VariantPackNative::skip_slot)
         .def("slot_contiguous", &VariantPackNative::slot_contiguous)
         .def("is_filled", &VariantPackNative::is_filled)

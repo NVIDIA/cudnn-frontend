@@ -25,6 +25,8 @@ import logging
 import weakref
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
+from cudnn import _pybind_module
+
 from .datatypes import _buffer_dtype_to_cudnn, _dlpack_code_bits, _torch_to_cudnn_data_type
 from .engines.base import ExecutionContext, VariantPack
 from .engines.engine_ids import is_python_engine
@@ -32,6 +34,30 @@ from .graph_types import NodeType, Tensor, byte_size as _byte_size, describing_t
 from .nodes import Node, _row_major_stride
 
 _LOG = logging.getLogger("cudnn.pygraph")
+
+
+def _in_axis_order_of(shape, stride, reference_stride):
+    """``(shape, stride)`` re-expressed in the axis order ``reference_stride`` uses.
+
+    A tensor and its transpose describe the same memory, and the two sides of
+    an override speak different ones: ``override_shapes`` is in the order the
+    GRAPH declared (a matmul's B is ``[batch, K, N]``), while the slot holds
+    the order the caller's buffer reports (B is allocated ``(batch, N, K)``).
+    Applying the override verbatim would leave the pack describing the same
+    bytes in a second language, and an engine indexing an extent by position
+    would read the wrong one.
+
+    Both orders rank their axes the same way by stride — that is what makes
+    them the same memory — so matching the two rankings gives the permutation.
+    """
+    if len(shape) != len(stride) or len(stride) != len(reference_stride):
+        return tuple(shape), tuple(stride)
+    by_stride = sorted(range(len(stride)), key=lambda i: -stride[i])
+    reference = sorted(range(len(reference_stride)), key=lambda i: -reference_stride[i])
+    permutation = [0] * len(stride)
+    for rank, axis in enumerate(by_stride):
+        permutation[reference[rank]] = axis
+    return tuple(shape[a] for a in permutation), tuple(stride[a] for a in permutation)
 
 
 def cudnn_graph_not_supported(message: str) -> Exception:
@@ -1744,17 +1770,13 @@ class pygraph:
                 self._is_built = True
             plan = self._compiled_plans[self._plan_index]
             # Normalize for a plan that reads the result; the ones that have not
-            # migrated still take the caller's objects.
-            #
-            # Overrides do not change this. They exist so the BACKEND can
-            # re-describe a tensor it lowered at another shape; a python engine
-            # reads the shape off the buffer, which is what the pack already
-            # carries -- frost_gemm compiles M/N/K symbolically and runs the
-            # new size from the operands alone. So they are accepted for API
-            # parity and change nothing here. Branching on them was worse than
-            # useless: it sent a migrated plan the raw uid map.
+            # migrated still take the caller's objects. Overrides go INTO the
+            # pack rather than around it: they are part of describing what this
+            # execute runs, and an engine reading the pack then agrees with the
+            # backend without knowing they exist.
             if plan.takes_variant_pack:
-                plan.execute(self, self._normalize(uid_to_data, workspace), ctx)
+                pack = self._normalize(uid_to_data, workspace, override_uids, override_shapes, override_strides)
+                plan.execute(self, pack, ctx)
             else:
                 plan.execute(self, uid_to_data, ctx)
             return
@@ -1828,7 +1850,7 @@ class pygraph:
         self._sorted_uids = order
         return order
 
-    def _normalize(self, uid_to_data: Dict[int, Any], workspace: Any):
+    def _normalize(self, uid_to_data: Dict[int, Any], workspace: Any, override_uids=None, override_shapes=None, override_strides=None):
         """Turn the caller's variant pack into :class:`VariantPack`, once.
 
         This is the ONLY place a caller's object is inspected. Everything below
@@ -1836,21 +1858,28 @@ class pygraph:
         built here, so the two paths cannot disagree about what the caller
         passed. Returns None when the operand layout is not known yet, which
         puts the caller back on the uid-map path.
+
+        Overrides are applied here, to the slot, because they are part of the
+        same answer: ``override_shapes`` says the caller allocated at a cache
+        shape and is running a smaller one this call, so the pack must describe
+        the shape about to run rather than the allocation. An engine that reads
+        the pack then honours them without knowing the concept exists — which
+        is the difference between one answer and two, since the backend
+        re-describes the tensor from the overrides either way.
         """
         order = self._variant_pack_uids()
         if order is None:
             return None
-        n = len(order)
-        import cudnn
-
-        native = cudnn._pybind_module.VariantPackNative(n)
+        native = _pybind_module.VariantPackNative(len(order))
         # One crossing for the whole pack: the reader is a C function table on
         # the buffer's type (__dlpack_c_exchange_api__), so an operand costs
         # 0.08 us there against 1.5 to ask a python object the same four
-        # questions and build a Tensor to hold the answers. What comes back is
-        # the slots whose producer does not implement it — described here, at
-        # the price they always cost, without taking the rest down with them.
-        unread = native.read_all([uid_to_data.get(uid) for uid in order])
+        # questions and build a Tensor to hold the answers. The uid lookups go
+        # with it — pairing the map with the layout in python cost more than
+        # the reads did. What comes back is the slots whose producer does not
+        # implement the protocol; those are described here, at the price they
+        # always cost, without taking the rest down with them.
+        unread = native.read_from(uid_to_data, order)
         # The backend's layout is exactly the slots it REQUIRES, so a hole there
         # is the caller's mistake and is named. A python-only graph's layout is
         # every wired port, which includes the optional ones (gdn's final_state,
@@ -1858,29 +1887,40 @@ class pygraph:
         # a missing port.
         strict = self._lowered_graph is not None
         for i in unread:
-            uid = order[i]
-            data = uid_to_data.get(uid)
+            data = uid_to_data.get(order[i])
             if data is None:
-                if strict:
-                    declared = self._tensor_by_uid.get(uid)
-                    name = f" ({declared.name!r})" if declared is not None and declared.name else ""
-                    raise ValueError(f"the variant pack is missing a buffer for tensor uid {uid}{name}")
-                continue  # an optional port the caller did not request
-            ptr, tensor = self._describe(data, uid)
+                continue  # named below if this graph requires it
+            ptr, tensor = self._describe(data, order[i])
             native.set_slot(i, ptr, tuple(tensor.dim), tuple(tensor.stride), *_dlpack_code_bits(tensor.data_type))
         if strict:
-            for i, uid in enumerate(order):
-                if not native.is_filled(i):
-                    declared = self._tensor_by_uid.get(uid)
-                    name = f" ({declared.name!r})" if declared is not None and declared.name else ""
-                    raise ValueError(f"the variant pack is missing a buffer for tensor uid {uid}{name}")
+            hole = native.first_unfilled()
+            if hole >= 0:
+                uid = order[hole]
+                declared = self._tensor_by_uid.get(uid)
+                name = f" ({declared.name!r})" if declared is not None and declared.name else ""
+                raise ValueError(f"the variant pack is missing a buffer for tensor uid {uid}{name}")
+        if override_uids:
+            slot_of = {uid: i for i, uid in enumerate(order)}
+            shapes = override_shapes or ()
+            strides = override_strides or ()
+            for j, uid in enumerate(override_uids):
+                i = slot_of.get(uid)
+                if i is None:
+                    raise ValueError(f"override_uids names tensor uid {uid}, which is not an operand of this graph")
+                shape = tuple(shapes[j]) if j < len(shapes) else tuple(native.shape(i))
+                stride = tuple(strides[j]) if j < len(strides) else tuple(native.stride(i))
+                native.override_slot(i, *_in_axis_order_of(shape, stride, native.stride(i)))
         # The workspace has no uid, so it is not an operand — but an engine has
         # to bounds-check its carves, and reading its size here is the same read
         # every other buffer gets rather than a second probe further down.
         workspace_ptr, workspace_bytes = 0, 0
         if workspace is not None:
-            workspace_ptr, workspace_tensor = self._describe(workspace, -1)
-            workspace_bytes = _byte_size(workspace_tensor)
+            extent = _pybind_module.read_buffer_extent(workspace)
+            if extent is None:  # a bare address, or a producer without the vtable
+                workspace_ptr, workspace_tensor = self._describe(workspace, -1)
+                workspace_bytes = _byte_size(workspace_tensor)
+            else:
+                workspace_ptr, workspace_bytes = extent
         return VariantPack(tuple(order), native, workspace_ptr, workspace_bytes)
 
     def _describe(self, data: Any, uid: int):
