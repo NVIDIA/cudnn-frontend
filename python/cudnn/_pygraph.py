@@ -2453,8 +2453,7 @@ def _linear_attention_state_checkpoints_dims(node):
     cu = node.inputs["cu_seqlens"].dim if node.inputs.get("cu_seqlens") is not None else None
     if not n or not q or not v or not cu:
         return None
-    b = int(cu[0]) - 1
-    return [max((v[0] - b) // n, 1), max(q[1], v[1]), q[2], v[2]]
+    return [max(v[0] // n, 1), max(q[1], v[1]), q[2], v[2]]
 
 
 def _linear_attention_o_dims(node):

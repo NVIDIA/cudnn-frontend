@@ -73,6 +73,8 @@ def downcast_state(initial_state, out, *, stream):
     n_seq, ho, k, v = (int(s_) for s_ in out.shape)
     if v % 8 != 0:
         raise ValueError(f"state V dim must be a multiple of 8 (8-element staging chunks); got {v}")
+    if v > 1024:
+        raise ValueError(f"state V dim must be <= 1024 (one 128-thread block stages a full row); got {v}")
     threads_per_row = v // 8
     rows_per_cta = max(128 // threads_per_row, 1)
     n_blocks = (k + rows_per_cta - 1) // rows_per_cta

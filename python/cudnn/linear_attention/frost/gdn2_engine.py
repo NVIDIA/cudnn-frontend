@@ -279,7 +279,7 @@ class CompiledGdn2Bwd:
         # chunk-0 entering state, io dtype (downcast initial_state or zeros)
         self.off_state0_io = layout.add(B * HO * K * V * 2) if self.has_state0 else None
         if not self.has_state_checkpoints:
-            self.state_checkpoints_rows = max(total // self.b_t, 1)
+            self.state_checkpoints_rows = max(total // self.b_t + B, 1)
             self.off_state_checkpoints = layout.add(self.state_checkpoints_rows * HO * K * V * 2)
             self.regen_tm_bytes = tensormap_workspace_bytes(regen_mod, B)
             self.off_regen_tensormaps = layout.add(self.regen_tm_bytes, align=128)

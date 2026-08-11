@@ -171,7 +171,7 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
     else:
         h_q = h_k = h_v = d_qk = d_v = 0
     h_o = max(h_q, h_v)
-    gates_at_ho = all(t is None or not t.dim or int(t.dim[1]) == h_o for t in (ins["g"], ins["beta"], ins.get("w")))
+    gates_at_ho = all(t is None or not t.dim or (len(t.dim) > 1 and int(t.dim[1]) == h_o) for t in (ins["g"], ins["beta"], ins.get("w")))
     io_dtypes = {in_dt["q"], in_dt["k"], in_dt["v"]} - {None}
     state_dtypes = {in_dt.get("initial_state"), out_dt.get("final_state")} - {None}
     scale = params.get("scale")

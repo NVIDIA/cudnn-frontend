@@ -15,6 +15,7 @@ the SDPA training benchmark charts.
 
 import argparse
 from pathlib import Path
+from typing import List, Optional
 
 import pandas as pd
 import matplotlib
@@ -27,11 +28,12 @@ import seaborn as sns
 BACKEND_CONFIG = {
     "fla": {"name": "FLA (Triton)", "color": "#FF8C00", "order": 0},
     "flash_qla": {"name": "FlashQLA (TileLang)", "color": "#6495ED", "order": 1},
-    "cudnn": {"name": "cuDNN", "color": "#76b900", "order": 2},
+    "flash_kda": {"name": "FlashKDA", "color": "#9370DB", "order": 2},
+    "cudnn": {"name": "cuDNN", "color": "#76b900", "order": 3},
 }
 
 # Backends dropped from every chart (rows may still exist in older CSVs).
-UNAVAILABLE_BACKENDS = ("flash_kda",)
+UNAVAILABLE_BACKENDS = ()
 
 LABEL_FONT_SIZE = 10
 LEGEND_FONT_SIZE = 8
@@ -56,7 +58,7 @@ CSV_COLUMNS = [
 ]
 
 
-def get_backend_display_name(backend: str, cudnn_version: str = None) -> str:
+def get_backend_display_name(backend: str, cudnn_version: Optional[str] = None) -> str:
     base_name = BACKEND_CONFIG.get(backend, {}).get("name", backend)
     if backend == "cudnn" and cudnn_version:
         base_name = f"{base_name} {cudnn_version}"
@@ -64,7 +66,13 @@ def get_backend_display_name(backend: str, cudnn_version: str = None) -> str:
 
 
 def generate_charts(
-    df: pd.DataFrame, output_dir: Path, gpu_name: str = "", cudnn_version: str = None, variant: str = "gdn", batch_sizes: list = None, x_axis: str = "seqlen"
+    df: pd.DataFrame,
+    output_dir: Path,
+    gpu_name: str = "",
+    cudnn_version: Optional[str] = None,
+    variant: str = "gdn",
+    batch_sizes: Optional[List[int]] = None,
+    x_axis: str = "seqlen",
 ) -> list:
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -89,7 +97,6 @@ def generate_charts(
     for group_val in sorted(df[group_col].unique()):
         sub = df[df[group_col] == group_val].copy()
         sub.sort_values([x_col, "backend_order"], inplace=True)
-        hue_order = list(sub.sort_values("backend_order")["backend_display"].drop_duplicates())
 
         fwd_df = sub[sub["fwd_tflops"] > 0]
         bwd_df = sub[sub["bwd_tflops"] > 0]
@@ -120,6 +127,7 @@ def generate_charts(
         ):
             if ax is None or pass_df.empty:
                 continue
+            hue_order = list(pass_df.sort_values("backend_order")["backend_display"].drop_duplicates())
             sns.barplot(
                 data=pass_df,
                 x=x_col,
@@ -160,7 +168,9 @@ def main():
     parser.add_argument("--cudnn-version", default=None, help="cuDNN backend version for the legend (e.g. 9.24.0)")
     parser.add_argument("--variant", default="gdn", help="Linear attention variant to plot")
     parser.add_argument("--batch-sizes", default=None, help="Comma-separated batch sizes to plot (default: all in the CSV)")
-    parser.add_argument("--x-axis", default="seqlen", choices=("seqlen", "batch"), help="Bar-group axis: seqlen (one chart per batch) or batch (one chart per seqlen)")
+    parser.add_argument(
+        "--x-axis", default="seqlen", choices=("seqlen", "batch"), help="Bar-group axis: seqlen (one chart per batch) or batch (one chart per seqlen)"
+    )
     args = parser.parse_args()
     batch_sizes = [int(b) for b in args.batch_sizes.split(",")] if args.batch_sizes else None
 

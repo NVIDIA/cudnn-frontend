@@ -265,9 +265,10 @@ class KdaCuTileEngine(BaseEngine):
         ):
             if got not in (f32, None):
                 raise NotImplementedError(f"KdaCuTileEngine: '{port}' must be fp32 (callers convert), got {got}")
-        glb = graph.nodes and list(graph.nodes)[0].params.get("gate_lower_bound")
-        if glb is not None and glb is not False and float(glb) >= 0:
-            raise NotImplementedError(f"KdaCuTileEngine: gate_lower_bound must be negative (log-gate floor), got {glb}")
+        node = next(iter(graph.nodes), None)
+        glb = node.params.get("gate_lower_bound") if node is not None else None
+        if glb is not None and glb is not False and not (-5.0 <= float(glb) < 0):
+            raise NotImplementedError(f"KdaCuTileEngine: gate_lower_bound must be in [-5, 0) (chunk_kda log-gate floor), got {glb}")
         if not facts.uniform_io:
             raise NotImplementedError("KdaCuTileEngine: q/k/v dtypes must match")
         if facts.io_dtype not in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, None):

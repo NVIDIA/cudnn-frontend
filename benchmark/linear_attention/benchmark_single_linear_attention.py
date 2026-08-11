@@ -624,12 +624,12 @@ else:
             try:
                 from fla.ops.kda import chunk_kda
             except ImportError as e:
-                raise RuntimeError(f"The installed fla does not provide KDA (fla.ops.kda): {e}")
+                raise RuntimeError(f"The installed fla does not provide KDA (fla.ops.kda): {e}") from e
         else:  # gdn2
             try:
                 from fla.ops.gdn2 import chunk_gdn2
             except ImportError as e:
-                raise RuntimeError(f"The installed fla does not provide GDN2 (fla.ops.gdn2): {e}")
+                raise RuntimeError(f"The installed fla does not provide GDN2 (fla.ops.gdn2): {e}") from e
 
         ## FLA takes dense (B, T, H, D) tensors; g is the log-space decay
         ## (raw safe-gate logits in forward-only kda runs). --store_on adds

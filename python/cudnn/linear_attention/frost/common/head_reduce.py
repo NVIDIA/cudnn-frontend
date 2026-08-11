@@ -138,6 +138,8 @@ def head_group_reduce(src, dst, *, stream) -> None:
         dst_strides = tuple(reversed(dst_strides))
     if not is_fp32 and any(st % 2 != 0 for st, sz in zip(dst_strides[:-1], dst.shape[:-1]) if sz != 1):
         raise ValueError(f"head_group_reduce: f16/bf16 dst outer strides must be even (word-pair stores), got {dst_strides}")
+    if dst.shape[-1] != 1 and dst_strides[-1] != 1:
+        raise ValueError(f"head_group_reduce: dst innermost dim must be stride-1, got strides {dst_strides}")
     out_row_words = dst_strides[0] if is_fp32 else dst_strides[0] // 2
     out_head_words = (dst_strides[1] if is_fp32 else dst_strides[1] // 2) if len(dst.shape) == 3 else 1
 

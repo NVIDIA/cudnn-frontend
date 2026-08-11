@@ -276,7 +276,7 @@ def _gdn2_fwd(
     N = cu_seqlens.shape[0] - 1
     device = q.device
     if cu_seqlens.dtype not in (torch.int32, torch.int64):
-        raise ValueError(f"gated_delta_net_2: cu_seqlens must be int32 or int64; got {cu_seqlens.dtype}")
+        raise ValueError(f"gated_delta_net_v2: cu_seqlens must be int32 or int64; got {cu_seqlens.dtype}")
     cu = cu_seqlens
     _check_dtype("g", g, torch.float32)
     _check_dtype("beta", beta, q.dtype)
@@ -307,7 +307,7 @@ def _gdn2_fwd(
         ("dt_bias", dt_bias),
     ):
         if _t is not None and _t.device != device:
-            raise ValueError(f"gated_delta_net_2: {_name} must be on q's device ({device}); got {_t.device}")
+            raise ValueError(f"gated_delta_net_v2: {_name} must be on q's device ({device}); got {_t.device}")
     state0 = initial_state if initial_state is not None else None
     ckpt = int(checkpoint_every_n_tokens)
 
@@ -379,8 +379,7 @@ def _gdn2_fwd(
         variant_pack[t["fs"]] = final_state
     state_checkpoints = torch.empty(0, dtype=q.dtype, device=device)
     if ckpt > 0:
-        # shape-derived upper bound; exact count is data-dependent (cu contents)
-        total_checkpoints = max((total - N) // ckpt, 1)
+        total_checkpoints = max(total // ckpt, 1)
         state_checkpoints = torch.empty(total_checkpoints, HO, K, V, dtype=q.dtype, device=device)
         variant_pack[t["state_checkpoints"]] = state_checkpoints
     graph.execute(variant_pack, workspace=_graph_workspace(graph, device), handle=_get_handle(device))
@@ -407,13 +406,16 @@ def _gdn2_fwd_fake(
     checkpoint_every_n_tokens=0,
 ):
     total, H, K = q.shape
+    HK = k.shape[1]
     HV, V = v.shape[1], v.shape[2]
+    if HK not in (H, HV):
+        raise ValueError(f"k head count ({HK}) must match q's ({H}) or v's ({HV}); canonical GQA shares grouped k/v heads")
     HO = max(H, HV)
     N = cu_seqlens.shape[0] - 1
     o = q.new_empty(total, HO, V)
     final = q.new_empty((N, HO, K, V) if output_final_state else (0,), dtype=torch.float32)
     if checkpoint_every_n_tokens > 0:
-        total_checkpoints = max((total - N) // int(checkpoint_every_n_tokens), 1)
+        total_checkpoints = max(total // int(checkpoint_every_n_tokens), 1)
         state_checkpoints = q.new_empty(total_checkpoints, HO, K, V)
     else:
         state_checkpoints = q.new_empty(0)
@@ -519,7 +521,7 @@ def _gdn2_bwd(
     N = cu_seqlens.shape[0] - 1
     device = q.device
     if cu_seqlens.dtype not in (torch.int32, torch.int64):
-        raise ValueError(f"gated_delta_net_2: cu_seqlens must be int32 or int64; got {cu_seqlens.dtype}")
+        raise ValueError(f"gated_delta_net_v2: cu_seqlens must be int32 or int64; got {cu_seqlens.dtype}")
     cu = cu_seqlens
     _check_dtype("g", g, torch.float32)
     _check_dtype("beta", beta, q.dtype)
@@ -532,7 +534,7 @@ def _gdn2_bwd(
         _check_dtype("d_final_state", d_final_state, torch.float32)
     for _name, _t in (("k", k), ("v", v), ("g", g), ("beta", beta), ("w", w), ("cu_seqlens", cu_seqlens), ("dO", dO), ("d_final_state", d_final_state)):
         if _t is not None and _t.device != device:
-            raise ValueError(f"gated_delta_net_2: {_name} must be on q's device ({device}); got {_t.device}")
+            raise ValueError(f"gated_delta_net_v2: {_name} must be on q's device ({device}); got {_t.device}")
     state0 = initial_state if initial_state is not None else None
     dstate_in = d_final_state if d_final_state is not None else None
 

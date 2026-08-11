@@ -4581,7 +4581,6 @@ def chunk_gdn_bwd_sm100(
     )
 
     if "compiled" not in cache:
-
         cu_seqlens_cute = from_dlpack(cu_seqlens, assumed_align=4).mark_layout_dynamic()
         workspace_cute = from_dlpack(workspace, assumed_align=128).mark_layout_dynamic()
 

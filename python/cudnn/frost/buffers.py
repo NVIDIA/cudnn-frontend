@@ -480,10 +480,7 @@ def cutedsl_state():
     ``version`` is ``(distribution, version)`` or None: the public wheel is
     nvidia-cutlass-dsl, internal RCs ship as nvidia-cutlass-dsl-internal, and
     the two number themselves differently. Presence is what gates; the pair only
-    refines the message and feeds :func:`cutedsl_too_old`. The internal dist is
-    checked first: when both are installed the RC's packages shadow the public
-    wheel on sys.path, and a stale public version string must not veto a
-    machine that works.
+    refines the message and feeds :func:`cutedsl_too_old`.
     """
     global _DSL_STATE
     if _DSL_STATE is None:
@@ -495,7 +492,7 @@ def cutedsl_state():
         except (ImportError, ValueError):
             installed = False
         version = None
-        for dist in ("nvidia-cutlass-dsl-internal", "nvidia-cutlass-dsl"):
+        for dist in ("nvidia-cutlass-dsl", "nvidia-cutlass-dsl-internal"):
             try:
                 version = (dist, importlib.metadata.version(dist))
                 break

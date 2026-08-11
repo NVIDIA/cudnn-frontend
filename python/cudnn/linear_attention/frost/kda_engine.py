@@ -235,10 +235,10 @@ class CompiledKda:
 
 class CompiledKdaBwd:
     """Compiled FROST KDA backward plan.  When the graph carries no ``state_checkpoints``
-    input, the workspace holds a regenerated per-chunk checkpoint series (entry-0
-    initial-state slots seeded on device, then the recompute kernel re-run
-    with shifted checkpoint bounds).  GVA/GQA gradients land in HO-head
-    scratch and are reduced back to the native head counts."""
+    input, one recompute pass over the forward inputs regenerates the per-chunk
+    checkpoint series into workspace (checkpoint stride ``b_t``).  GVA/GQA
+    gradients land in HO-head scratch and are reduced back to the native head
+    counts."""
 
     def __init__(self, node, bwd_mod, regen_mod):
         from .common.split_k import WORK_ITEM_FIELDS, chunk_scratch_rows, compute_ideal_chunks, max_work_items
@@ -282,7 +282,7 @@ class CompiledKdaBwd:
         # chunk-0 entering state, io dtype (downcast initial_state; absent = in-kernel zeros)
         self.off_state0_io = layout.add(B * HO * K * V * 2) if self.has_state0 else None
         if not self.has_state_checkpoints:
-            self.state_checkpoints_rows = max(total // self.b_t, 1)
+            self.state_checkpoints_rows = max(total // self.b_t + B, 1)
             self.off_state_checkpoints = layout.add(self.state_checkpoints_rows * HO * K * V * 2)
             self.regen_tm_bytes = tensormap_workspace_bytes(regen_mod, B)
             self.off_regen_tensormaps = layout.add(self.regen_tm_bytes, align=128)

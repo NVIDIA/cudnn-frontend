@@ -421,8 +421,7 @@ def _kda_fwd(
         variant_pack[t["fs"]] = final_state
     state_checkpoints = torch.empty(0, dtype=q.dtype, device=device)
     if ckpt > 0:
-        # shape-derived upper bound; exact count is data-dependent (cu contents)
-        total_checkpoints = max((total - N) // ckpt, 1)
+        total_checkpoints = max(total // ckpt, 1)
         state_checkpoints = torch.empty(total_checkpoints, HO, K, V, dtype=q.dtype, device=device)
         variant_pack[t["state_checkpoints"]] = state_checkpoints
     graph.execute(variant_pack, workspace=_graph_workspace(graph, device), handle=_get_handle(device))
@@ -449,13 +448,16 @@ def _kda_fwd_fake(
     checkpoint_every_n_tokens=0,
 ):
     total, H, K = q.shape
+    HK = k.shape[1]
     HV, V = v.shape[1], v.shape[2]
+    if HK not in (H, HV):
+        raise ValueError(f"k head count ({HK}) must match q's ({H}) or v's ({HV}); canonical GQA shares grouped k/v heads")
     HO = max(H, HV)
     N = cu_seqlens.shape[0] - 1
     o = q.new_empty(total, HO, V)
     final = q.new_empty((N, HO, K, V) if output_final_state else (0,), dtype=torch.float32)
     if checkpoint_every_n_tokens > 0:
-        total_checkpoints = max((total - N) // int(checkpoint_every_n_tokens), 1)
+        total_checkpoints = max(total // int(checkpoint_every_n_tokens), 1)
         state_checkpoints = q.new_empty(total_checkpoints, HO, K, V)
     else:
         state_checkpoints = q.new_empty(0)

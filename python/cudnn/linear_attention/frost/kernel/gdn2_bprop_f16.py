@@ -2564,10 +2564,10 @@ def compute2_warp_group(
 
             # ---- dGlast hdot: sum_v sdH[v, c] * S0[c, v] -------------------------
             dgl_val = cutlass.Float32(0.0)
+            bars.mb_state_inp_ready[gc % 2].wait((gc // 2) % 2)
             if has_dstate:
                 bars.mb_dstate_smem_ready.wait(dgl_dstate_smem_index.phase)
                 dgl_dstate_smem_index = advance(dgl_dstate_smem_index, 1)
-                bars.mb_state_inp_ready[gc % 2].wait((gc // 2) % 2)
                 for pl in cutlass.range_constexpr(2):
                     for row_half in cutlass.range_constexpr(2):
                         state_words = nvvm.tcgen05_ld(

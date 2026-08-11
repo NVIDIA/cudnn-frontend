@@ -701,7 +701,7 @@ def test_safe_gate_forward_parity(backend, variant):
     eff_case = SimpleNamespace(**{**vars(case), "gates": dict(case.gates, g=lb * torch.sigmoid(graw), beta=eff_beta)})
     o_raw, fs_raw = _run_fwd(backend, raw_case, **raw_kw)
     o_eff, fs_eff = _run_fwd(backend, eff_case, **kw)
-    torch.testing.assert_close(o_raw.float(), o_eff.float(), atol=2.5e-2, rtol=2.5e-2)
+    _check("o", o_raw, o_eff.double(), 2e-2)
     assert rms_ratio(fs_raw, fs_eff) < 2e-2
 
 
@@ -736,7 +736,7 @@ def test_beta_sigmoid_in_kernel(backend):
     eff_case = SimpleNamespace(**{**vars(case), "gates": dict(case.gates, beta=braw.float().sigmoid())})
     o_raw, fs_raw = _run_fwd(backend, raw_case, output_final_state=True, use_beta_sigmoid_in_kernel=True)
     o_eff, fs_eff = _run_fwd(backend, eff_case, output_final_state=True)
-    torch.testing.assert_close(o_raw.float(), o_eff.float(), atol=2.5e-2, rtol=2.5e-2)
+    _check("o", o_raw, o_eff.double(), 2e-2)
     assert rms_ratio(fs_raw, fs_eff) < 2e-2
 
 
@@ -901,6 +901,12 @@ def test_cuda_graph_replay_fwd(backend, variant):
 
     with _waive_unsupported(backend, variant):
         eager = launch()
+        warmup = torch.cuda.Stream()
+        warmup.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(warmup):
+            for _ in range(3):
+                launch()
+        torch.cuda.current_stream().wait_stream(warmup)
         torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):

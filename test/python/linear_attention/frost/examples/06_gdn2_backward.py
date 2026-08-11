@@ -59,7 +59,7 @@ def main(seq_lens=(192, 320), H: int = 2, D: int = 128) -> None:
     k = torch.nn.functional.normalize(torch.randn(total, H, D, device=device), dim=-1).bfloat16()
     v = torch.randn(total, H, D, device=device).bfloat16()
     gate = torch.empty(total, H, D, device=device).uniform_(0.5, 1.0).log().contiguous()
-    beta = torch.rand(total, H, D, device=device).sigmoid().bfloat16().contiguous()
+    beta = (torch.rand(total, H, D, device=device).sigmoid() * 2.0).bfloat16().contiguous()
     w = torch.rand(total, H, D, device=device).sigmoid().bfloat16().contiguous()
     do = torch.randn(total, H, D, device=device).bfloat16()
     cu = torch.tensor([0, *torch.tensor(seq_lens).cumsum(0).tolist()], dtype=torch.int32, device=device)

@@ -109,7 +109,8 @@ def main(seq_lens=(192, 320), H: int = 2, D: int = 128) -> None:
     torch.cuda.synchronize()
 
     o_ref, fs_ref = _reference(q, k, v, gate, beta, w, cu, scale)
-    torch.testing.assert_close(o.float(), o_ref.float(), atol=1e-1, rtol=1e-1)
+    r_o = _rms_ratio(o, o_ref)
+    assert r_o < 5e-2, f"o rms ratio {r_o:.4g}"
     r_s = _rms_ratio(fs, fs_ref)
     assert r_s < 5e-2, f"final_state rms ratio {r_s:.4g}"
     print(f"[05] PASS  gdn2 prefill                seq_lens={list(seq_lens)} H={H} D={D} (fs rms {r_s:.2e})")
