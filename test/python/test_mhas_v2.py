@@ -366,6 +366,29 @@ def test_sdpa_random_fwd_ragged_L0(env_info, test_no, request, cudnn_handle):
     exec_sdpa(test.cfg, request, cudnn_handle)
 
 
+@pytest.mark.L0
+def test_ragged_token_gap_stable_under_stride_overrides():
+    """Regression: the seeded per-tensor token gaps must not depend on which
+    strides were explicitly provided — pinning stride_q must leave the gaps
+    K/V/O derive from the same rng_geom_seed unchanged (the gap RNG draws all
+    four values up front, not lazily per missing stride)."""
+    from sdpa.random_config import ExecConfig
+
+    base = dict(
+        batches=2, h_q=8, h_k=8, h_v=8, s_q=64, s_kv=64, d_qk=128, d_v=128,
+        is_ragged=True, with_ragged_token_gap=True, rng_geom_seed=7,
+    )
+    plain = ExecConfig(**base)
+    plain.fill_derived_fields()
+
+    pinned_q = (64 * 8 * 128, 128, 8 * 128, 1)  # explicit packed Q, no gap
+    pinned = ExecConfig(**base, stride_q=pinned_q)
+    pinned.fill_derived_fields()
+
+    assert pinned.stride_q == pinned_q
+    assert (pinned.stride_k, pinned.stride_v, pinned.stride_o) == (plain.stride_k, plain.stride_v, plain.stride_o)
+
+
 @pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=128, rng_seed=888), ids=lambda p: f"test{p[0]}")
 @pytest.mark.L1
 def test_sdpa_random_fwd_ragged_unified_L1(env_info, test_no, request, cudnn_handle):

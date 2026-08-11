@@ -74,7 +74,7 @@ def compute_packed_strides(shape, token_gap=0):
     projection."""
     if shape is None:
         return None
-    b, h, s, d = shape
+    _, h, s, d = shape
     token_stride = h * d + token_gap
     return (s * token_stride, d, token_stride, 1)
 
@@ -210,27 +210,35 @@ class ExecConfig:
         # reproduces the same strides).
         if self.is_ragged and self.with_ragged_token_gap:
             _gap_rng = random.Random((self.rng_geom_seed or 0) ^ 0xA80517)
+            # Draw ALL FOUR gaps up front, in fixed Q/K/V/O order: an
+            # explicitly provided stride must not shift the gaps the
+            # remaining tensors get (same rng_geom_seed -> same per-tensor
+            # layouts regardless of which strides were overridden).
+            _gaps = {name: _gap_rng.randint(0, 3) for name in ("q", "k", "v", "o")}
 
-            def _gapped(shape):
-                if shape is None:
-                    return None
-                h, d = shape[1], shape[3]
-                return compute_packed_strides(shape, _gap_rng.randint(0, 3) * h * d)
+            def _make_gap_fn(gap_tokens):
+                def _gapped(shape):
+                    if shape is None:
+                        return None
+                    h, d = shape[1], shape[3]
+                    return compute_packed_strides(shape, gap_tokens * h * d)
 
-            gap_fn = _gapped
+                return _gapped
+
+            gap_q, gap_k, gap_v, gap_o = (_make_gap_fn(_gaps[n]) for n in ("q", "k", "v", "o"))
         elif self.is_ragged:
-            gap_fn = compute_packed_strides
+            gap_q = gap_k = gap_v = gap_o = compute_packed_strides
         else:
-            gap_fn = compute_default_BHSD_strides
+            gap_q = gap_k = gap_v = gap_o = compute_default_BHSD_strides
         stride_fn = compute_packed_strides if self.is_ragged else compute_default_BHSD_strides
         if self.stride_q is None and self.shape_q is not None:
-            self.stride_q = gap_fn(self.shape_q)
+            self.stride_q = gap_q(self.shape_q)
         if self.stride_k is None and self.shape_k is not None:
-            self.stride_k = gap_fn(self.shape_k)
+            self.stride_k = gap_k(self.shape_k)
         if self.stride_v is None and self.shape_v is not None:
-            self.stride_v = gap_fn(self.shape_v)
+            self.stride_v = gap_v(self.shape_v)
         if self.stride_o is None and self.shape_o is not None:
-            self.stride_o = gap_fn(self.shape_o)
+            self.stride_o = gap_o(self.shape_o)
         # stats keeps the packed default — its layout is fuzzed separately
         # via ragged_stats_layout.
         if self.stride_stats is None and self.shape_stats is not None:
