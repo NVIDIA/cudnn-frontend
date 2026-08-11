@@ -354,3 +354,16 @@ def _dlpack_code_bits(data_type):
     if not _CUDNN_TO_DLPACK_CODE_BITS:
         _init_dlpack_dtype_tables()
     return _CUDNN_TO_DLPACK_CODE_BITS.get(data_type, (0, 0))
+
+
+def _cudnn_dtype_for_dlpack(code_bits):
+    """The cuDNN dtype a DLPack ``(code, bits)`` names, or None.
+
+    Both directions initialize the pair, because either can be the first one
+    asked: an operand read through the exchange vtable never takes the python
+    fallback, so nothing would have populated the tables before something came
+    looking for the reverse mapping — and every dtype would have read back None.
+    """
+    if not _FROST_DTYPE_CODE_TO_CUDNN:
+        _init_dlpack_dtype_tables()
+    return _FROST_DTYPE_CODE_TO_CUDNN.get(code_bits)

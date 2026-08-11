@@ -168,12 +168,12 @@ class VariantPack:
         """
         if self._tensors is None:
             from ..graph_types import describing_tensor
-            from ..datatypes import _FROST_DTYPE_CODE_TO_CUDNN
+            from ..datatypes import _cudnn_dtype_for_dlpack
 
             native = self.native
             self._tensors = tuple(
                 (
-                    describing_tensor(uid, tuple(native.shape(i)), tuple(native.stride(i)), _FROST_DTYPE_CODE_TO_CUDNN.get(native.dtype(i)))
+                    describing_tensor(uid, tuple(native.shape(i)), tuple(native.stride(i)), _cudnn_dtype_for_dlpack(native.dtype(i)))
                     if native.is_filled(i)
                     else describing_tensor(uid, (), (), None)
                 )
