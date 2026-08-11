@@ -365,6 +365,43 @@ def test_sdpa_random_fwd_ragged_L0(env_info, test_no, request, cudnn_handle):
     exec_sdpa(test.cfg, request, cudnn_handle)
 
 
+@pytest.mark.L0
+def test_ragged_token_gap_stable_under_stride_overrides():
+    """Regression: the seeded per-tensor token gaps must not depend on which
+    strides were explicitly provided — pinning stride_q must leave the gaps
+    K/V/O derive from the same rng_geom_seed unchanged (the gap RNG draws all
+    four values up front, not lazily per missing stride). Also locks in the
+    default-on semantics: gaps apply to plain ragged configs by default, and
+    auto-fall-back to packed for the forms that cannot express or handle
+    them yet (cu / offset-multiplier: #538; fp8 harness: #537)."""
+    from sdpa.random_config import ExecConfig, compute_packed_strides
+
+    base = dict(
+        batches=2, h_q=8, h_k=8, h_v=8, s_q=64, s_kv=64, d_qk=128, d_v=128,
+        is_ragged=True, rng_geom_seed=7,
+    )
+    plain = ExecConfig(**base)
+    plain.fill_derived_fields()
+
+    pinned_q = (64 * 8 * 128, 128, 8 * 128, 1)  # explicit packed Q, no gap
+    pinned = ExecConfig(**base, stride_q=pinned_q)
+    pinned.fill_derived_fields()
+
+    assert pinned.stride_q == pinned_q
+    assert (pinned.stride_k, pinned.stride_v, pinned.stride_o) == (plain.stride_k, plain.stride_v, plain.stride_o)
+
+    # Default-on: seed 7 draws at least one non-packed layout for plain ragged.
+    packed = {n: compute_packed_strides(getattr(plain, f"shape_{n}")) for n in ("q", "k", "v", "o")}
+    assert any(getattr(plain, f"stride_{n}") != packed[n] for n in ("q", "k", "v", "o"))
+
+    # Auto-packed fallbacks: cu / multiplier offset forms (#538) and 1-byte
+    # (fp8) data types (#537) derive packed strides regardless of the default.
+    for override in (dict(is_cu_seq_len=True), dict(with_ragged_offset_multiplier=True), dict(data_type=torch.float8_e4m3fn)):
+        cfg = ExecConfig(**base, **override)
+        cfg.fill_derived_fields()
+        assert all(getattr(cfg, f"stride_{n}") == packed[n] for n in ("q", "k", "v", "o")), override
+
+
 @pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=128, rng_seed=888), ids=lambda p: f"test{p[0]}")
 @pytest.mark.L1
 def test_sdpa_random_fwd_ragged_unified_L1(env_info, test_no, request, cudnn_handle):
