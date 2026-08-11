@@ -2095,7 +2095,8 @@ def test_grouped_gemm_glu_e5m3_is_not_cached_as_e4m3(request):
 )
 def test_grouped_gemm_glu_rejects_unsupported_sf_fp8_dtype(request, sf_fp8_dtype_override, overrides, expected):
     """e5m3 is only reachable through the Rubin FP4xFP4 atom with e4m3-carried scales."""
-    _skip_unless_e5m3_supported()
+    if sf_fp8_dtype_override == "e5m3":
+        _skip_unless_e5m3_supported()
     cfg, inputs = _make_glu_inputs(request, **overrides)
     with pytest.raises(ValueError, match=expected):
         _run_glu_wrapper(cfg, inputs, sf_fp8_dtype_override)
@@ -2105,7 +2106,6 @@ def test_grouped_gemm_glu_rejects_unsupported_sf_fp8_dtype(request, sf_fp8_dtype
 @torch_fork_set_rng(seed=0)
 def test_grouped_gemm_glu_mxfp4_ignores_sf_fp8_dtype_override_default(request):
     """Leaving the override at None must keep inferring E8M0 for MXFP4."""
-    _skip_unless_e5m3_supported()
     _test_grouped_gemm_glu_dense_wrapper(
         request=request,
         sf_fp8_dtype_override=None,

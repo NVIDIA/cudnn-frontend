@@ -891,7 +891,8 @@ def _run_wgrad_wrapper(cfg, inputs, sf_fp8_dtype_override):
 )
 def test_grouped_gemm_wgrad_rejects_unsupported_sf_fp8_dtype(sf_fp8_dtype_override, overrides, expected):
     """e5m3 is only reachable through the Rubin FP4xFP4 atom with e4m3-carried scales."""
-    _skip_unless_e5m3_supported()
+    if sf_fp8_dtype_override == "e5m3":
+        _skip_unless_e5m3_supported()
     cfg, inputs = _wgrad_nvfp4_inputs(**overrides)
     with pytest.raises(ValueError, match=expected):
         _run_wgrad_wrapper(cfg, inputs, sf_fp8_dtype_override)
