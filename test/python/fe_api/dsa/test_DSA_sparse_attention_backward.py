@@ -3,9 +3,7 @@
 
 """Tests for SparseAttentionBackward.
 
-The forward pass is a PyTorch reference (see dsa_reference.ref_sparse_attention_forward);
-the production forward is FlashMLA (C++, out of scope). Gradients are generated
-via autograd on the reference forward.
+Gradients are generated via autograd on the gather-based forward reference.
 """
 
 import math
@@ -90,7 +88,7 @@ def test_DSA_sparse_attention_backward_wrapper(
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     softmax_scale = 1.0 / math.sqrt(head_dim)
 
-    # Run reference forward to get out + FlashMLA-style KV-only lse for backward.
+    # Run reference forward to get out and the KV-only lse for backward.
     out, lse = ref_sparse_attention_forward(
         q,
         kv,
@@ -272,7 +270,7 @@ def test_DSA_sparse_attention_backward_sm100_zero_topk_length(head_dim, num_head
             softmax_scale=softmax_scale,
         )
         assert torch.equal(out[empty_rows], torch.zeros_like(out[empty_rows]))
-        assert torch.isneginf(lse[empty_rows]).all()
+        assert torch.isposinf(lse[empty_rows]).all()
         dout = torch.randn_like(out)
 
         # In particular, the empty-row fast path must overwrite caller-owned
