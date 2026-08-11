@@ -162,17 +162,29 @@ class SM120FusedMultiHeadAttentionForward:
         shape: tuple[int, ...],
         stride: tuple[int, ...],
     ) -> bool:
-        """Return whether a BSHD tensor uses compact storage."""
+        """Return whether a BSHD tensor uses storage the kernel can address.
+
+        The head dim must be innermost-contiguous, and the head/seq strides
+        must be 16-byte multiples (x8 elements at 2 bytes/elem — the TMA
+        interior-stride and vectorized-access granularity) covering the dims
+        below them (compact or padded; sub-dense would alias). The compact
+        layout is the special case with equality everywhere; a padded seq
+        stride is e.g. a THD K/V view of a kv-interleaved [T, 2, H, D]
+        buffer (token stride 2*h*d).
+        """
 
         if len(shape) != 4 or len(stride) != 4:
             return False
-        _, sequence, heads, head_dim = shape
-        return stride == (
-            sequence * heads * head_dim,
-            heads * head_dim,
-            head_dim,
-            1,
-        )
+        batch, sequence, heads, head_dim = shape
+        if stride[3] != 1:
+            return False
+        if stride[2] % 8 != 0 or stride[2] < head_dim:
+            return False
+        if stride[1] % 8 != 0 or stride[1] < heads * stride[2]:
+            return False
+        if batch != 1 and stride[0] < sequence * stride[1]:
+            return False
+        return True
 
     def __init__(
         self,
@@ -1318,7 +1330,11 @@ class SM120FusedMultiHeadAttentionForward:
             raise ValueError("runtime Q/K/V/O batch, sequence, or head geometry mismatch")
         for name, tensor in (("Q", q), ("K", k), ("V", v), ("O", o)):
             if cutlass.const_expr(not self.is_layout_supported(tensor.shape, tensor.stride)):
-                raise ValueError(f"{name} must use compact BSHD storage")
+                raise ValueError(
+                    f"{name} layout is not supported: BSHD with the head dim innermost-contiguous "
+                    f"and non-overlapping seq/head strides that are multiples of 8 elements "
+                    f"(compact or padded); got shape {tuple(tensor.shape)} stride {tuple(tensor.stride)}"
+                )
         if cutlass.const_expr(lse is not None):
             if cutlass.const_expr(self.thd_varlen):
                 if cutlass.const_expr(self.thd_lse_head_major):
@@ -1359,18 +1375,23 @@ class SM120FusedMultiHeadAttentionForward:
         # check to zero-fill past it, so a rank-4 view keeps the ACTUAL extent
         # innermost — TMA order (D, S, H, B) — and load_one_kv_tile steps the
         # head coordinate per swizzle-span chunk.
+        # K/V TMA layouts read the TENSORS' strides (batch/seq/head), not
+        # packed recomputations: a THD view may declare a wider token stride
+        # (e.g. a K/V slice of a kv-interleaved [T, 2, H, D] buffer), and TMA
+        # encodes it directly (interior strides must be 16-byte multiples;
+        # check_support declines declarations TMA cannot express).
         def kv_tma_desc(t, head_dim, head_tile, swizzle, swizzle_chunks, swizzle_chunk_elems):
             if cutlass.const_expr(head_dim == head_tile):
                 layout = cute.make_layout(
                     (t.shape[0], t.shape[2], swizzle_chunks, t.shape[1], swizzle_chunk_elems),
-                    stride=(t.shape[1] * t.shape[2] * head_dim, head_dim, swizzle_chunk_elems, t.shape[2] * head_dim, 1),
+                    stride=(t.stride[0], t.stride[2], swizzle_chunk_elems, t.stride[1], 1),
                 )
                 box = (1, 1, swizzle_chunks, self.kv_tile, swizzle_chunk_elems)
                 stride_order = (4, 3, 2, 1, 0)
             else:
                 layout = cute.make_layout(
                     (t.shape[0], t.shape[2], t.shape[1], head_dim),
-                    stride=(t.shape[1] * t.shape[2] * head_dim, head_dim, t.shape[2] * head_dim, 1),
+                    stride=(t.stride[0], t.stride[2], t.stride[1], 1),
                 )
                 box = (1, 1, self.kv_tile, swizzle_chunk_elems)
                 stride_order = (3, 2, 1, 0)
@@ -1424,6 +1445,10 @@ def compile(  # noqa: A001
     has_lse: bool = True,
     lse_head_major: bool = False,
     lse_head_stride: int = 0,
+    q_stride: Optional[tuple[int, int, int, int]] = None,
+    k_stride: Optional[tuple[int, int, int, int]] = None,
+    v_stride: Optional[tuple[int, int, int, int]] = None,
+    o_stride: Optional[tuple[int, int, int, int]] = None,
 ) -> Callable:
     """Compile and cache one architecture-specific compact BSHD shape.
 
@@ -1462,30 +1487,16 @@ def compile(  # noqa: A001
         kv_tile=PARAMS.kv_tile,
     )
     fake_batch = 1 if PARAMS.thd_varlen else b
-    fake_q = cute.runtime.make_fake_compact_tensor(
-        STORAGE_DTYPE,
-        (fake_batch, sq, qh, d_qk),
-        stride_order=(3, 2, 1, 0),
-        assumed_align=16,
-    )
-    fake_k = cute.runtime.make_fake_compact_tensor(
-        STORAGE_DTYPE,
-        (fake_batch, skv, kh, d_qk),
-        stride_order=(3, 2, 1, 0),
-        assumed_align=16,
-    )
-    fake_v = cute.runtime.make_fake_compact_tensor(
-        STORAGE_DTYPE,
-        (fake_batch, skv, kh, d_v),
-        stride_order=(3, 2, 1, 0),
-        assumed_align=16,
-    )
-    fake_o = cute.runtime.make_fake_compact_tensor(
-        STORAGE_DTYPE,
-        (fake_batch, sq, qh, d_v),
-        stride_order=(3, 2, 1, 0),
-        assumed_align=16,
-    )
+
+    def _fake_bshd(shape, stride):
+        if stride is None:
+            return cute.runtime.make_fake_compact_tensor(STORAGE_DTYPE, shape, stride_order=(3, 2, 1, 0), assumed_align=16)
+        return cute.runtime.make_fake_tensor(STORAGE_DTYPE, shape, tuple(stride), assumed_align=16)
+
+    fake_q = _fake_bshd((fake_batch, sq, qh, d_qk), q_stride)
+    fake_k = _fake_bshd((fake_batch, skv, kh, d_qk), k_stride)
+    fake_v = _fake_bshd((fake_batch, skv, kh, d_v), v_stride)
+    fake_o = _fake_bshd((fake_batch, sq, qh, d_v), o_stride)
     if PARAMS.thd_varlen:
         fake_lse_shape = (qh, lse_head_stride) if lse_head_major else (sq, qh)
     else:
