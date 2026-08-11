@@ -1735,17 +1735,6 @@ class pygraph:
         eng = self.selected_engine
 
         if eng is not None:  # python engine (plan id in the reserved region)
-            if overriding:
-                # A python plan is compiled against the shapes the graph
-                # declared -- the frost engines read them in their __init__ --
-                # so it cannot honour a shape it is told at execute. Refusing
-                # is the only honest answer: silently running the compiled
-                # shapes would return numbers for the wrong problem.
-                raise ValueError(
-                    f"dynamic-shape overrides are a backend-path feature, and this graph selected "
-                    f"the python engine {eng.name!r}, whose plan is compiled for the shapes the "
-                    f"graph declared; rebuild the graph at the shapes you want to run"
-                )
             h = handle if handle is not None else self._handle
             ctx = ExecutionContext(handle=h, stream=self._resolve_stream(h), workspace=workspace)
             if self._plan_index not in self._compiled_plans:
@@ -1754,10 +1743,17 @@ class pygraph:
                 self._compiled_plans[self._plan_index] = eng.build_plan(self, self._selected_plan_config, ctx)
                 self._is_built = True
             plan = self._compiled_plans[self._plan_index]
-            # Normalize only for a plan that reads the result. Building Tensors
-            # an engine will not look at is pure cost, and the ones that have
-            # not migrated still take the caller's objects.
-            if plan.takes_variant_pack and not overriding:
+            # Normalize for a plan that reads the result; the ones that have not
+            # migrated still take the caller's objects.
+            #
+            # Overrides do not change this. They exist so the BACKEND can
+            # re-describe a tensor it lowered at another shape; a python engine
+            # reads the shape off the buffer, which is what the pack already
+            # carries -- frost_gemm compiles M/N/K symbolically and runs the
+            # new size from the operands alone. So they are accepted for API
+            # parity and change nothing here. Branching on them was worse than
+            # useless: it sent a migrated plan the raw uid map.
+            if plan.takes_variant_pack:
                 plan.execute(self, self._normalize(uid_to_data, workspace), ctx)
             else:
                 plan.execute(self, uid_to_data, ctx)

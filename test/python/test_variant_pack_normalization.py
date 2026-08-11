@@ -143,13 +143,13 @@ def test_describing_tensor_matches_the_dataclass():
 
 
 @pytest.mark.L0
-def test_shape_overrides_are_refused_by_a_python_engine():
-    """A python plan is compiled for the shapes the graph declared.
+def test_shape_overrides_reach_a_migrated_plan_as_a_pack():
+    """Overrides do not change what a python plan is handed.
 
-    The overrides re-describe a tensor at execute, which only the backend can
-    act on: a frost engine reads its extents in __init__ and bakes them into
-    the kernel it compiles. Running the compiled shapes anyway would answer a
-    different problem than the caller asked, so execute refuses.
+    They exist so the backend can re-describe a tensor it lowered at another
+    shape. A python engine reads the shape off the buffer, which is what the
+    pack already carries. Branching on them used to send a migrated plan the
+    raw uid map, which it cannot read.
     """
     total, h, d, nseq = 256, 4, 128, 2
     dt = cudnn.data_type.BFLOAT16
@@ -166,6 +166,8 @@ def test_shape_overrides_are_refused_by_a_python_engine():
         g.build()
     except Exception as exc:  # no python engine on this arch -- nothing to assert
         pytest.skip(f"no GDN engine here: {exc}")
+    if not g._compiled_plans[g._plan_index].takes_variant_pack:
+        pytest.skip("the selected plan has not migrated to the variant pack")
 
     per = total // nseq
     data = {
@@ -178,5 +180,11 @@ def test_shape_overrides_are_refused_by_a_python_engine():
         out: torch.empty(total, h, d, dtype=torch.bfloat16, device="cuda"),
     }
     ws = torch.empty(max(g.get_workspace_size(), 1), dtype=torch.uint8, device="cuda")
-    with pytest.raises(ValueError, match="dynamic-shape overrides"):
-        g.execute(data, ws, override_uids=[q.get_uid()], override_shapes=[[total, h, d]])
+    g.execute(data, ws)
+    torch.cuda.synchronize()
+    plain = data[out].clone()
+
+    data[out].zero_()
+    g.execute(data, ws, override_uids=[q.get_uid()], override_shapes=[[total, h, d]], override_strides=[[h * d, d, 1]])
+    torch.cuda.synchronize()
+    torch.testing.assert_close(data[out], plain)
