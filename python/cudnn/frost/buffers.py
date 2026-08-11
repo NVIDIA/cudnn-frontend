@@ -98,18 +98,80 @@ def dtype_name(buf) -> str:
     return str(buf.dtype).split(".")[-1]
 
 
+class _DLPackProto:
+    """A filled-in ``DLManagedTensor`` for one (shape, dtype, device), minus the
+    address.
+
+    Every field but ``data`` is a property of the layout, so building them once
+    and copying the struct beats assigning nine ctypes fields per call: measured
+    1.68 us to fill vs 0.45 us to memmove the 72 bytes. Cached per (shape,
+    dtype, device) — a graph reuses a handful of layouts across its whole run.
+
+    This is the degenerate case of what the backend already does for kernel
+    arguments (``src/common/include/runtimeKernel.h``): a prefilled blob plus,
+    per mutable field, an (offset, uid, UpdateMethod) telling execute what to
+    write where. Here there is exactly one mutable field, ``data``, at a fixed
+    offset, and its update method is always POINTER — so the bookkeeping
+    collapses to a memmove and one assignment.
+    """
+
+    __slots__ = ("_template", "_shape_arr", "_nbytes")
+
+    def __init__(self, shape, dtype: str, device_id: int):
+        ndim = len(shape)
+        self._shape_arr = (ctypes.c_int64 * max(ndim, 1))(*shape)
+        code, bits = DTYPES[dtype]
+        mt = _DLManagedTensor()
+        mt.dl_tensor.device = _DLDevice(_KDL_CUDA, device_id)
+        mt.dl_tensor.ndim = ndim
+        mt.dl_tensor.dtype = _DLDataType(code, bits, 1)
+        mt.dl_tensor.shape = self._shape_arr
+        mt.dl_tensor.strides = None  # None = compact row-major
+        mt.dl_tensor.byte_offset = 0
+        mt.manager_ctx = None
+        mt.deleter = _noop_deleter
+        self._template = mt
+        self._nbytes = ctypes.sizeof(_DLManagedTensor)
+
+    def instantiate(self, ptr: int):
+        """A fresh struct at ``ptr``. Fresh, not shared: a capsule handed to
+        CuTe ALIASES the struct rather than copying it, and two threads
+        executing one graph must not be writing the same one."""
+        mt = _DLManagedTensor()
+        ctypes.memmove(ctypes.byref(mt), ctypes.byref(self._template), self._nbytes)
+        mt.dl_tensor.data = ctypes.c_void_p(ptr)
+        return mt
+
+
+_PROTO_CACHE = {}
+
+
+def dlpack_proto(shape, dtype: str, device_id: int) -> _DLPackProto:
+    key = (tuple(shape), dtype, device_id)
+    proto = _PROTO_CACHE.get(key)
+    if proto is None:
+        proto = _PROTO_CACHE[key] = _DLPackProto(key[0], dtype, device_id)
+    return proto
+
+
 class DeviceView:
     """Zero-copy DLPack view over a raw CUDA pointer.
 
     The view owns no memory — the underlying allocation (workspace or caller
-    buffer) must outlive it. Row-major contiguous."""
+    buffer) must outlive it. Row-major contiguous.
+
+    Not a concept an engine has to learn: it is what a variant-pack slot or a
+    workspace region turns into on the way to a kernel, because CuTe needs an
+    object exposing ``__dlpack__`` and neither a pointer nor a Tensor record
+    is one."""
 
     def __init__(self, ptr: int, shape, dtype: str, device_id: int):
         self._ptr = int(ptr)
         self.shape = tuple(int(s) for s in shape)
         self.dtype = dtype
         self._device_id = int(device_id)
-        self._keepalive = []
+        self._proto = None
+        self._live = []
 
     def data_ptr(self) -> int:
         return self._ptr
@@ -166,22 +228,17 @@ class DeviceView:
         return (_KDL_CUDA, self._device_id)
 
     def __dlpack__(self, *, stream=None, **_kwargs):
-        # a fresh managed struct per call; shape array + struct stay alive on
-        # the view (the no-op deleter frees nothing)
-        ndim = len(self.shape)
-        shape_arr = (ctypes.c_int64 * max(ndim, 1))(*self.shape)
-        code, bits = DTYPES[self.dtype]
-        mt = _DLManagedTensor()
-        mt.dl_tensor.data = ctypes.c_void_p(self._ptr)
-        mt.dl_tensor.device = _DLDevice(_KDL_CUDA, self._device_id)
-        mt.dl_tensor.ndim = ndim
-        mt.dl_tensor.dtype = _DLDataType(code, bits, 1)
-        mt.dl_tensor.shape = shape_arr
-        mt.dl_tensor.strides = None  # None = compact row-major
-        mt.dl_tensor.byte_offset = 0
-        mt.manager_ctx = None
-        mt.deleter = _noop_deleter
-        self._keepalive.append((mt, shape_arr))
+        # A fresh struct per call, copied from the layout's prototype and
+        # re-pointed. Fresh because the consumer ALIASES it — cute's
+        # from_dlpack keeps the pointer rather than copying the DLTensor — so a
+        # struct shared between two capsules, or between two threads executing
+        # one graph, would be read after someone else rewrote it.
+        if self._proto is None:
+            self._proto = dlpack_proto(self.shape, self.dtype, self._device_id)
+        mt = self._proto.instantiate(self._ptr)
+        # The struct and the prototype's shape array must outlive the capsule:
+        # the deleter is a no-op, so nothing else keeps them alive.
+        self._live.append(mt)
         return _PyCapsule_New(ctypes.addressof(mt), b"dltensor", None)
 
 

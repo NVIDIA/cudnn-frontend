@@ -84,7 +84,7 @@ def test_operand_order_is_the_backend_order():
     destinations, workspace modifications) must be excluded.
     """
     g, _, _ = _matmul_graph()
-    order = g._operand_uids()
+    order = g._variant_pack_uids()
     assert order == sorted(order), f"not ascending: {order}"
     assert order == list(g._lowered_graph._get_variant_pack_uids_sorted())
 
@@ -100,7 +100,7 @@ def test_execute_is_reentrant():
     g, _, _ = _matmul_graph()
     handle = cudnn.create_handle()
     ws = torch.empty(max(g.get_workspace_size(), 1), dtype=torch.uint8, device="cuda")
-    uids = g._operand_uids()
+    uids = g._variant_pack_uids()
     wrong = [0] * 8
 
     def worker(i):

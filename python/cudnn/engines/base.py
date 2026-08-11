@@ -109,7 +109,7 @@ class ExecutionContext:
     override_strides: Any = None
 
 
-class Operands:
+class VariantPack:
     """The caller's variant pack, normalized ONCE at the top of execute().
 
     Whatever the caller passed — a torch tensor, a DeviceView, any
@@ -175,7 +175,7 @@ class PortSlots:
     outputs: Dict[str, int]
 
 
-def bind_ports(graph: "pygraph", operands: Operands) -> Dict[Any, PortSlots]:
+def bind_ports(graph: "pygraph", variant_pack: VariantPack) -> Dict[Any, PortSlots]:
     """Join each node's wired ports with the operand layout. Strict: every
     non-virtual port must have an operand."""
 
@@ -184,7 +184,7 @@ def bind_ports(graph: "pygraph", operands: Operands) -> Dict[Any, PortSlots]:
         for port, t in ports.items():
             if t is None:
                 continue
-            slot = operands.slot_of.get(t.uid)
+            slot = variant_pack.slot_of.get(t.uid)
             if slot is None:
                 if t.is_virtual:
                     continue  # engine-internal intermediate
@@ -217,7 +217,7 @@ def _view_over_address(address: int, tensor, node, port: str):
 
 @dataclass(frozen=True)
 class NodeBuffers:
-    """DEPRECATED, kept until every engine takes ``Operands``.
+    """DEPRECATED, kept until every engine takes ``VariantPack``.
 
     Per-node ``{port_name: caller buffer}`` maps, the result of
     ``resolve_node_buffers``."""
@@ -260,16 +260,16 @@ def resolve_node_buffers(graph: "pygraph", uid_to_data: Dict[int, Any]) -> Dict[
 class CompiledPlan:
     """A compiled (graph, plan) artifact. Subclass for real JIT engines."""
 
-    # Set True once execute() takes Operands. Until then execute() is handed the
+    # Set True once execute() takes VariantPack. Until then execute() is handed the
     # caller's raw {uid: buffer} map, as before. Migration flag; it goes away
     # with the last engine that does not set it.
-    takes_operands: bool = False
+    takes_variant_pack: bool = False
 
     def get_workspace_size(self) -> int:
         """Workspace bytes this plan needs at execute time (default 0)."""
         return 0
 
-    def execute(self, graph: "pygraph", operands: "Operands", ctx: ExecutionContext) -> None:
+    def execute(self, graph: "pygraph", variant_pack: "VariantPack", ctx: ExecutionContext) -> None:
         raise NotImplementedError
 
 

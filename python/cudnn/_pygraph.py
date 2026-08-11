@@ -26,7 +26,7 @@ import weakref
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 from .datatypes import _torch_to_cudnn_data_type
-from .engines.base import Operands
+from .engines.base import VariantPack
 from .graph_types import NodeType, Tensor
 from .nodes import Node, _row_major_stride
 
@@ -1746,13 +1746,13 @@ class pygraph:
             # Normalize only for a plan that reads the result. Building records
             # an engine will not look at is pure cost, and the ones that have
             # not migrated still take the caller's objects.
-            if plan.takes_operands and not overriding:
+            if plan.takes_variant_pack and not overriding:
                 plan.execute(self, self._normalize(uid_to_data, workspace, describe=True), ctx)
             else:
                 plan.execute(self, uid_to_data, ctx)
             return
 
-        operands = None if overriding else self._normalize(uid_to_data, workspace, describe=False)
+        variant_pack = None if overriding else self._normalize(uid_to_data, workspace, describe=False)
 
         # Backend path. Address the plan the WALK built, not the backend's own
         # selection: they differ once the walk has skipped an entry.
@@ -1764,11 +1764,11 @@ class pygraph:
         # implementation"), so handing it the sorted array directly skips one
         # dict build here, one map copy in pybind, and one hash lookup per
         # operand there.
-        if operands is not None:
+        if variant_pack is not None:
             self._lowered_graph._execute_with_raw_ptrs(
-                operands.address,
-                len(operands),
-                operands.workspace,
+                variant_pack.address,
+                len(variant_pack),
+                variant_pack.workspace,
                 handle or 0,
                 -1 if cpp_index is None else cpp_index,
             )
@@ -1780,8 +1780,8 @@ class pygraph:
             return
         self._lowered_graph._execute(var_pack, ws_ptr, handle, override_uids, override_shapes, override_strides)
 
-    def _operand_uids(self) -> Optional[List[int]]:
-        """The graph's caller-filled operands, ASCENDING by uid.
+    def _variant_pack_uids(self) -> Optional[List[int]]:
+        """The graph's caller-filled variant_pack, ASCENDING by uid.
 
         Taken from the lowered graph whenever there is one: C++ is the only
         side that can see every user slot, including the ones a walk over node
@@ -1791,7 +1791,7 @@ class pygraph:
         destinations, cached workspace modifications).
 
         A python-only graph — gdn / kda / gdn2, which cannot lower by
-        construction — has no C++ side, so its operands come from the IR. The
+        construction — has no C++ side, so its variant_pack come from the IR. The
         two never have to agree: each side indexes the layout it was given.
         """
         order = self._sorted_uids
@@ -1822,7 +1822,7 @@ class pygraph:
         return order
 
     def _normalize(self, uid_to_data: Dict[int, Any], workspace: Any, describe: bool):
-        """Turn the caller's variant pack into :class:`Operands`, once.
+        """Turn the caller's variant pack into :class:`VariantPack`, once.
 
         This is the ONLY place a caller's object is inspected. Everything below
         — the backend and every python engine — reads pointers and the records
@@ -1830,7 +1830,7 @@ class pygraph:
         passed. Returns None when the operand layout is not known yet, which
         puts the caller back on the uid-map path.
         """
-        order = self._operand_uids()
+        order = self._variant_pack_uids()
         if order is None:
             return None
         n = len(order)
@@ -1856,7 +1856,12 @@ class pygraph:
                 # The backend reads geometry from its own descriptors; building
                 # a record it will not look at is pure cost.
                 ptrs[i] = self._device_pointer(data)
-        return Operands(tuple(order), tuple(records) if describe else None, ptrs, self._device_pointer(workspace) if workspace is not None else 0)
+        return VariantPack(
+            tuple(order),
+            tuple(records) if describe else None,
+            ptrs,
+            self._device_pointer(workspace) if workspace is not None else 0,
+        )
 
     def _describe(self, data: Any, uid: int):
         """``(pointer, Tensor)`` for one caller buffer.
@@ -1974,7 +1979,7 @@ class pygraph:
                 self._lowered_graph = cudnn._pybind_module.backend_graph()
         self._lowered_graph.deserialize(*args, **kwargs)
         self._is_built = True
-        # The loaded graph carries its own operands, so an order cached while
+        # The loaded graph carries its own variant_pack, so an order cached while
         # this container held a different graph no longer describes it.
         self._sorted_uids = None
 

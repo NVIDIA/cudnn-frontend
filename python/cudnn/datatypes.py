@@ -167,6 +167,22 @@ def _torch_to_cudnn_data_type(torch_data_type) -> cudnn_data_type:
         return None
 
 
+# cuDNN enum -> the dtype NAME frost.buffers speaks (its DTYPES table is keyed
+# by name because a DLPack view needs no tensor library). Built once: this is
+# read per operand per execute.
+_CUDNN_TO_FROST_DTYPE_NAME = {
+    cudnn_data_type.FLOAT: "float32",
+    cudnn_data_type.HALF: "float16",
+    cudnn_data_type.BFLOAT16: "bfloat16",
+    cudnn_data_type.DOUBLE: "float64",
+    cudnn_data_type.INT64: "int64",
+    cudnn_data_type.INT32: "int32",
+    cudnn_data_type.INT8: "int8",
+    cudnn_data_type.UINT8: "uint8",
+    cudnn_data_type.BOOLEAN: "bool",
+}
+
+
 def _cudnn_to_frost_dtype_name(data_type):
     """Name for a cuDNN dtype in the vocabulary ``frost.buffers.DTYPES`` uses,
     or None when the type has no DLPack-expressible name (the sub-byte and
@@ -175,17 +191,7 @@ def _cudnn_to_frost_dtype_name(data_type):
 
     Lives here so the mapping has one home; frost imports it rather than
     keeping a second table."""
-    return {
-        cudnn_data_type.FLOAT: "float32",
-        cudnn_data_type.HALF: "float16",
-        cudnn_data_type.BFLOAT16: "bfloat16",
-        cudnn_data_type.DOUBLE: "float64",
-        cudnn_data_type.INT64: "int64",
-        cudnn_data_type.INT32: "int32",
-        cudnn_data_type.INT8: "int8",
-        cudnn_data_type.UINT8: "uint8",
-        cudnn_data_type.BOOLEAN: "bool",
-    }.get(data_type)
+    return _CUDNN_TO_FROST_DTYPE_NAME.get(data_type)
 
 
 def _torch_to_cutlass_data_type(data_type, interpret_uint8_as_fp4x2: bool = False):
