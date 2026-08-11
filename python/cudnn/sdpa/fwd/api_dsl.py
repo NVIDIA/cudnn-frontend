@@ -954,8 +954,13 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         )
         self._k_mod = _load_sm100_kernel_module(self.flavor, params, fp8=self._fp8, pertensor=self._pertensor, rubin=(self._device_cc == (10, 7)))
         if self.thd:
-            # T (total tokens) is a runtime value, so the per-shape compile is deferred to execute().
-            self._compiled_kernel = "thd-deferred"
+            # The THD compile key is PLAN-TIME-ONLY (the packed token totals
+            # compile as dynamic extents — issue #552), so compile HERE like
+            # every dense specialization; execute()'s lru-cached call re-binds
+            # this artifact. (The all-KV-zero clamp swaps the K/V strides and
+            # mints its own entry on first hit.) FP8 THD is not wired
+            # (_execute_thd is f16-only); keep the deferred sentinel there.
+            self._compiled_kernel = "thd-deferred" if self._fp8 else self._k_mod.compile(**self._thd_compile_kwargs())
         elif self._fp8:
             # FP8/MXFP8 kernels are exact-match d128 (gated in check_support);
             # their compile() has no envelope head-dim parameters. has_lse=False
@@ -1196,6 +1201,41 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             O_view.copy_(O_scratch)
         self._logger.debug("execute completed")
 
+    def _thd_compile_kwargs(self) -> dict:
+        """The THD compile key — PLAN-TIME-ONLY by contract (issue #552).
+
+        The packed token totals are runtime values and compile as DYNAMIC
+        extents; everything here (logical batch, heads, head dims, the Stats
+        specialization, the declared strides with the batch stride zeroed —
+        ``_thd_view``'s batch stride is ``t * token_stride``, a runtime value
+        that never steps at batch extent 1) is known when the graph is built,
+        so ``compile()`` compiles eagerly and ``_execute_thd``'s lru-cached
+        call re-binds the same artifact for every packed total."""
+
+        def _key(desc):
+            (ts, hs, es), _ = self._thd_declared(desc)
+            return (0, ts, hs, es)
+
+        has_lse = self.lse_desc is not None
+        return dict(
+            b=self.batch_size,
+            qh=self.h_q,
+            kh=self.h_kv,
+            d_qk=self.head_dim_qk,
+            d_v=self.head_dim_v,
+            # The Stats layout is a per-shape specialization (like d_qk/d_v):
+            # has_lse=False compiles the store out; token-major binds the
+            # packed rank-2 (T, H) view; head-major carries the caller-declared
+            # head-row stride (0 -> compact t_q).
+            has_lse=has_lse,
+            lse_head_major=has_lse and self.thd_stats_head_major,
+            lse_head_stride=(self.thd_stats_head_stride if (has_lse and self.thd_stats_head_major) else 0),
+            q_stride=_key(self.q_desc),
+            k_stride=_key(self.k_desc),
+            v_stride=_key(self.v_desc),
+            o_stride=_key(self.o_desc),
+        )
+
     def _execute_thd(self, q_buf, k_buf, v_buf, o_buf, scale_softmax_log2, sinks, seq_len_kv, seq_q_lens, lse_tensor=None, workspace=None, current_stream=None):
         """THD / varlen execute: reconstruct the kernel's packed [1, T, H, D] views and metadata buffer from the cuDNN ragged buffers, then launch.
 
@@ -1209,8 +1249,12 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         with tokens contiguous within each head row; when ``None`` the kernel
         compiles the LSE store out (has_lse=False) and no scratch exists.
         The host round-trip for the runtime totals (t_q / t_kv / unit count)
-        is inherent to the lowering — the packed extents are data-dependent —
-        and costs one D2H sync per length tensor, no device allocation."""
+        feeds the metadata upload, the ragged views' extents and the exact
+        launch grid, and costs one D2H sync per length tensor, no device
+        allocation. It no longer keys any compile: the kernels compile with
+        DYNAMIC token extents (issue #552), so a new packed total re-binds
+        the same artifact; removing the sync itself needs the plan-time-max
+        grid redesign tracked there."""
         import cutlass
 
         dev = q_buf.device
@@ -1310,29 +1354,16 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 else:
                     sinks_t = torch.zeros(qh, dtype=torch.float32, device=dev)
 
-        fn = self._k_mod.compile(
-            b=b,
-            qh=qh,
-            kh=kh,
-            sq=t_q,
-            skv=t_kv,
-            d_qk=d_qk,
-            d_v=d_v,
-            # The Stats layout is a per-shape specialization (like d_qk/d_v):
-            # has_lse=False compiles the store out; token-major binds the
-            # packed rank-2 (T, H) view; head-major carries the caller-declared
-            # head-row stride (0 -> compact sq).
-            has_lse=lse is not None,
-            lse_head_major=lse is not None and self.thd_stats_head_major,
-            lse_head_stride=(self.thd_stats_head_stride if (lse is not None and self.thd_stats_head_major) else 0),
-            # Declared strides of the bound views (cache-key): compact views
-            # reproduce the packed specialization; native non-packed views
-            # compile their strides into the kernel's addressing.
-            q_stride=tuple(Q.stride()),
-            k_stride=tuple(K.stride()),
-            v_stride=tuple(V.stride()),
-            o_stride=tuple(O.stride()),
-        )
+        # PLAN-TIME-ONLY compile key (issue #552: keying on the packed totals
+        # degenerated into a per-step recompile under continuous batching):
+        # this lru-cached call re-binds the artifact compile() already built.
+        # The K/V strides are taken from the BOUND views because the
+        # all-KV-zero clamp above swaps in packed batch-1 views (that rare
+        # shape mints its own cache entry); the batch stride is zeroed out of
+        # the key (a runtime value the kernel rebuilds symbolically).
+        kwargs = self._thd_compile_kwargs()
+        kwargs.update(k_stride=(0, *K.stride()[1:]), v_stride=(0, *V.stride()[1:]))
+        fn = self._k_mod.compile(**kwargs)
         fn(Q, K, V, O, LSE, sinks_t, meta, o_desc, (b, qh, kh, t_q, t_kv, 0), cutlass.Float32(scale_softmax_log2), cutlass.Int32(units), stream=current_stream)
         self._logger.debug("execute (THD) completed")
 
@@ -2014,10 +2045,14 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         )
         self._k_mod = _load_sm120_kernel_module(params, fp8=self._fp8)
         if self.thd:
-            # The packed token totals (and max sequence length) are runtime
-            # values, so the per-shape compile is deferred to execute().
-            self._compiled_kernel = "thd-deferred"
-            self._logger.debug("compile completed (THD per-shape compile deferred)")
+            # The THD compile key is PLAN-TIME-ONLY (the packed token totals
+            # compile as dynamic extents and max_sq is a runtime launch
+            # argument — issue #552), so compile HERE like every dense
+            # specialization; execute()'s lru-cached call re-binds this
+            # artifact. (The all-KV-zero clamp swaps the K/V strides and
+            # mints its own entry on first hit.)
+            self._compiled_kernel = self._k_mod.compile(**self._thd_compile_kwargs())
+            self._logger.debug("compile completed (THD, dynamic token extents)")
             return
         self._compiled_kernel = self._k_mod.compile(
             compute_capability=self.compute_capability,
@@ -2164,6 +2199,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             seq_q_lens,
             seq_kv_lens,
             cutlass.Float32(scale_softmax_log2),
+            cutlass.Int32(0),  # thd_max_sq: THD-only runtime grid extent
             current_stream,
         )
         if o_needs_copy_back:
@@ -2266,19 +2302,10 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
 
         fn = self._compiled_kernel
         if pack is not None:
-            fn = self._k_mod.compile(
-                compute_capability=self.compute_capability,
-                b=self.batch_size,
-                qh=self.h_q,
-                kh=self.h_kv,
-                sq=pack.t_q,
-                skv=pack.t_kv,
-                d_qk=self.head_dim_qk,
-                d_v=self.head_dim_v,
-                max_sq=pack.max_sq,
-                has_lse=self.lse_desc is not None,
-                lse_head_stride=self.thd_stats_head_stride,
-            )
+            # PLAN-TIME-ONLY compile key (issue #552): this lru-cached call
+            # re-binds the artifact compile() already built — the packed
+            # totals are dynamic extents and max_sq is a launch argument.
+            fn = self._k_mod.compile(**self._thd_compile_kwargs())
         fn(
             pack.Q if pack is not None else q,
             pack.K if pack is not None else k,
@@ -2292,6 +2319,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             cutlass.Float32(scale_softmax_log2),
             cutlass.Float32(o_scale_fused),
             cutlass.Float32(ss),
+            cutlass.Int32(pack.max_sq if pack is not None else 0),
             current_stream,
         )
         # Both of these consume what the kernel just wrote, so they belong on
@@ -2303,15 +2331,53 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                 amax_o_buf.div_(max(so, 1e-30))
         self._logger.debug("execute (SM120 FP8 per-tensor) completed")
 
+    def _thd_compile_kwargs(self) -> dict:
+        """The THD compile key — PLAN-TIME-ONLY by contract (issue #552).
+
+        The packed token totals compile as DYNAMIC extents and ``max_sq`` is
+        a runtime launch argument, so everything here is known when the graph
+        is built: ``compile()`` compiles eagerly and the execute paths'
+        lru-cached calls re-bind the same artifact for every packed total."""
+        has_lse = self.lse_desc is not None
+        kwargs = dict(
+            compute_capability=self.compute_capability,
+            b=self.batch_size,
+            qh=self.h_q,
+            kh=self.h_kv,
+            d_qk=self.head_dim_qk,
+            d_v=self.head_dim_v,
+            has_lse=has_lse,
+            lse_head_stride=self.thd_stats_head_stride,
+        )
+        if self._fp8:
+            # The FP8 cell serves only the packed contract (no stride keys)
+            # and its ragged LSE store is head-major-only.
+            return kwargs
+
+        def _key(desc):
+            (ts, hs, es), _ = self._thd_declared(desc)
+            return (0, ts, hs, es)
+
+        kwargs.update(
+            lse_head_major=self.thd_stats_head_major,
+            q_stride=_key(self.q_desc),
+            k_stride=_key(self.k_desc),
+            v_stride=_key(self.v_desc),
+            o_stride=_key(self.o_desc),
+        )
+        return kwargs
+
     def _thd_pack(self, q_buf, k_buf, v_buf, o_buf, seq_q_lens, seq_kv_lens, workspace, label, declared_views=False, current_stream=None):
         """Shared THD (ragged) packing: cu_seqlens metadata + ``(1, T, H, D)`` views.
 
         Serves the same fully-packed contract as the SM100 THD path
         (``ragged_offset == cumsum(seq_len) * H * D`` from 0, multiplier 1);
         the offsets are re-derived from ``seq_len_q``/``seq_len_kv``. The two
-        ``.tolist()`` D2H syncs are inherent — the packed totals and the
-        longest sequence's Q length are runtime values that size the
-        per-execute compile and grid. The torch work (allocation, length
+        ``.tolist()`` D2H syncs feed the metadata upload, the ragged views'
+        extents and the launch grid (they no longer key any compile — the
+        kernels compile with DYNAMIC token extents, issue #552; removing the
+        sync itself needs the plan-time-max grid redesign tracked there).
+        The torch work (allocation, length
         reads, the H2D upload) runs on ``current_stream`` — the LAUNCH
         stream — so it is ordered against the kernel that consumes it.
 
@@ -2427,28 +2493,15 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
 
         import cutlass
 
-        fn = self._k_mod.compile(
-            compute_capability=self.compute_capability,
-            b=self.batch_size,
-            qh=self.h_q,
-            kh=self.h_kv,
-            sq=pack.t_q,
-            skv=pack.t_kv,
-            d_qk=self.head_dim_qk,
-            d_v=self.head_dim_v,
-            max_sq=pack.max_sq,
-            has_lse=self.lse_desc is not None,
-            lse_head_major=self.thd_stats_head_major,
-            lse_head_stride=self.thd_stats_head_stride,
-            # Declared strides of the bound views (cache-key): compact views
-            # reproduce the packed specialization; native non-packed views
-            # compile their strides into the Q/O offset math and K/V TMA
-            # descriptors.
-            q_stride=tuple(pack.Q.stride()),
-            k_stride=tuple(pack.K.stride()),
-            v_stride=tuple(pack.V.stride()),
-            o_stride=tuple(pack.O.stride()),
-        )
+        # PLAN-TIME-ONLY compile key (issue #552): this lru-cached call
+        # re-binds the artifact compile() already built. The K/V strides are
+        # taken from the BOUND views because the all-KV-zero clamp swaps in
+        # packed batch-1 views (that rare shape mints its own cache entry);
+        # the batch stride is zeroed out of the key (a runtime value the
+        # kernel rebuilds symbolically).
+        kwargs = self._thd_compile_kwargs()
+        kwargs.update(k_stride=(0, *pack.K.stride()[1:]), v_stride=(0, *pack.V.stride()[1:]))
+        fn = self._k_mod.compile(**kwargs)
         fn(
             pack.Q,
             pack.K,
@@ -2459,6 +2512,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             pack.seq_q_dummy,
             pack.meta,
             cutlass.Float32(scale_softmax_log2),
+            cutlass.Int32(pack.max_sq),
             current_stream,
         )
 

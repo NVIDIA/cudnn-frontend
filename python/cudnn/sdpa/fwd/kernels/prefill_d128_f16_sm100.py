@@ -1938,6 +1938,11 @@ def _host(
     stream: _cuda_driver.CUstream = None,
 ) -> None:
     B, QH, KH, SQ, SKV, _ = problem_size
+    if cutlass.const_expr(CFG.THD_VARLEN):
+        # Packed token totals are runtime values (dynamic extents); the
+        # problem_size slots are 0 by contract.
+        SQ = q_tensor.shape[1]
+        SKV = k_tensor.shape[1]
 
     # Tensors are [B, S, H, D] with stride_order=(3, 2, 1, 0); D is fastest.
     # K is split along seq under cga2 — box rows are per-CTA.  V is split along d_v
@@ -2059,6 +2064,13 @@ def compile(  # noqa: A001
 
     THD/varlen: q/k/v/o/lse are PACKED with batch dim 1 ([1,T,H,D]); ``b`` is the
     LOGICAL batch (sequence count) driving n_batch / metadata + O-desc sizes.
+    ``sq``/``skv`` are IGNORED under THD — the packed token totals are runtime
+    values (they change every step under continuous batching), so the token
+    extents compile DYNAMIC (``cute.sym_int``) and the cache key stays
+    plan-time-only; callers must not pass them (a stray value would only mint
+    a redundant cache entry). THD ``q_stride``/... carry a ZERO batch stride
+    (the real view's batch stride is ``t_q * token_stride``, a runtime value;
+    the fake rebuilds it symbolically — batch extent is 1, it never steps).
     ``has_lse=False`` compiles the LSE store out (the kernel specializes on a
     ``None`` LSE argument) — callers without a Stats output pass no LSE buffer
     at all. THD Stats layouts: token-major packed rank-2 (T, H) by default
@@ -2081,6 +2093,12 @@ def compile(  # noqa: A001
     if (d_qk * CFG.BPE) % 16 != 0 or (d_v * CFG.BPE_O) % 16 != 0:
         raise ValueError(f"d128 envelope: d_qk*BPE and d_v*BPE must be 16-byte multiples (TMA global-stride rule); got ({d_qk}, {d_v}) at BPE={CFG.BPE}")
     _fake_batch = 1 if CFG.THD_VARLEN else b
+    if CFG.THD_VARLEN:
+        # Dynamic packed token totals: one symbol per ragged group (Q/O and
+        # the LSE share t_q; K/V share t_kv), so a new total re-binds the same
+        # compiled artifact instead of minting a new one (issue #552).
+        sq = cute.sym_int(divisibility=1)
+        skv = cute.sym_int(divisibility=1)
 
     def _fake_bshd(shape, stride, dtype=STORAGE_DTYPE, bpe=CFG.BPE):
         if stride is None:
@@ -2090,6 +2108,10 @@ def compile(  # noqa: A001
         for axis in (1, 2):  # seq/head global strides feed TMA: 16-byte rule
             if (stride[axis] * bpe) % 16 != 0:
                 raise ValueError(f"declared stride {stride} axis {axis} must be a 16-byte multiple at BPE={bpe} (TMA global-stride rule)")
+        if CFG.THD_VARLEN:
+            # Batch stride = tokens * token_stride (`_thd_view`'s envelope),
+            # a runtime value: rebuild it from the dynamic token extent.
+            return cute.runtime.make_fake_tensor(dtype, shape, (shape[1] * stride[1], stride[1], stride[2], stride[3]), assumed_align=16)
         return cute.runtime.make_fake_tensor(dtype, shape, tuple(stride), assumed_align=16)
 
     fake_q = _fake_bshd((_fake_batch, sq, qh, d_qk), q_stride)
@@ -2112,9 +2134,9 @@ def compile(  # noqa: A001
         # the STATIC rank, so the layout is fully encoded in this fake tensor
         # — no template parameter.
         if lse_head_major:
+            # head_stride covering t_q is validated at execute (t_q is a
+            # runtime value); 0 = compact = the dynamic token total itself.
             _lse_hs = lse_head_stride if lse_head_stride else sq
-            if _lse_hs < sq:
-                raise ValueError(f"THD head-major LSE head_stride ({_lse_hs}) must cover the packed Q token total ({sq})")
             fake_lse = cute.runtime.make_fake_compact_tensor(
                 cutlass.Float32,
                 (1, qh, _lse_hs),
@@ -2189,7 +2211,9 @@ def compile(  # noqa: A001
         fake_sinks,
         fake_seq_kv_lens,
         fake_o_desc,
-        (b, qh, kh, sq, skv, 0),
+        # THD: the packed totals are runtime values carried by the (dynamic)
+        # tensor extents — _host reads them from the views' shapes.
+        (b, qh, kh, 0, 0, 0) if CFG.THD_VARLEN else (b, qh, kh, sq, skv, 0),
         cutlass.Float32(0.0),
         cutlass.Int32(0),
         fake_seq_q_lens,
