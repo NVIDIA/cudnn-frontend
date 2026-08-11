@@ -20,9 +20,9 @@ lifecycle mirrors a real JIT/DSL engine:
   3. ``CompiledPlan.execute(graph, uid_to_data, ctx)`` — hot path.
      ``uid_to_data`` is the caller's variant pack (tensor uid -> device
      buffer, exactly as the classic backend receives it); the
-     ``ExecutionContext`` carries the caller's handle / stream / workspace /
-     dynamic-shape overrides explicitly; engines must not hard-code a stream
-     or silently allocate hidden workspace. Engines that address buffers by
+     ``ExecutionContext`` carries the caller's handle / stream / workspace
+     explicitly; engines must not hard-code a stream or silently allocate
+     hidden workspace. Engines that address buffers by
      port name call ``resolve_node_buffers(graph, uid_to_data)`` (see below).
 
 Simple eager engines only implement ``execute()`` — the default ``build_plan``
@@ -105,9 +105,6 @@ class ExecutionContext:
     handle: Any = None
     stream: Any = None
     workspace: Any = None
-    override_uids: Any = None
-    override_shapes: Any = None
-    override_strides: Any = None
 
 
 class VariantPack:

@@ -19,6 +19,8 @@ import torch
 
 import cudnn
 
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="execute() needs a device to run a plan on")
+
 M = N = K = 64
 
 
@@ -99,7 +101,6 @@ def test_execute_is_reentrant():
     """
     g, _, _ = _matmul_graph()
     handle = cudnn.create_handle()
-    ws = torch.empty(max(g.get_workspace_size(), 1), dtype=torch.uint8, device="cuda")
     uids = g._variant_pack_uids()
     wrong = [0] * 8
 
@@ -107,6 +108,9 @@ def test_execute_is_reentrant():
         a = torch.full((1, M, K), float(i + 1), dtype=torch.bfloat16, device="cuda")
         b = torch.eye(K, N, dtype=torch.bfloat16, device="cuda").unsqueeze(0)
         c = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
+        # one workspace per thread: it is scratch the plan writes, so sharing
+        # it would be the very crossing this test is looking for
+        ws = torch.empty(max(g.get_workspace_size(), 1), dtype=torch.uint8, device="cuda")
         want = float(i + 1)
         for _ in range(200):
             g.execute({uids[0]: a, uids[1]: b, uids[2]: c}, ws, handle=handle)
@@ -136,3 +140,43 @@ def test_describing_tensor_matches_the_dataclass():
     slow = Tensor(uid=7, dim=(4, 3), stride=(6, 1), data_type=cudnn.data_type.FLOAT)
     for f in dataclasses.fields(Tensor):
         assert getattr(fast, f.name) == getattr(slow, f.name), f.name
+
+
+@pytest.mark.L0
+def test_shape_overrides_are_refused_by_a_python_engine():
+    """A python plan is compiled for the shapes the graph declared.
+
+    The overrides re-describe a tensor at execute, which only the backend can
+    act on: a frost engine reads its extents in __init__ and bakes them into
+    the kernel it compiles. Running the compiled shapes anyway would answer a
+    different problem than the caller asked, so execute refuses.
+    """
+    total, h, d, nseq = 256, 4, 128, 2
+    dt = cudnn.data_type.BFLOAT16
+    g = cudnn.pygraph()
+    q = g.tensor([total, h, d], data_type=dt, name="q")
+    k = g.tensor([total, h, d], data_type=dt, name="k")
+    v = g.tensor([total, h, d], data_type=dt, name="v")
+    gate = g.tensor([total, h], data_type=cudnn.data_type.FLOAT, name="g")
+    beta = g.tensor([total, h], data_type=cudnn.data_type.FLOAT, name="beta")
+    cu = g.tensor([nseq + 1], data_type=cudnn.data_type.INT32, name="cu_seqlens")
+    out, _fs, _h = g.gdn(q=q, k=k, v=v, g=gate, beta=beta, cu_seqlens=cu, scale=1.0 / d**0.5, name="gdn")
+    out.set_output(True).set_data_type(dt)
+    try:
+        g.build()
+    except Exception as exc:  # no python engine on this arch -- nothing to assert
+        pytest.skip(f"no GDN engine here: {exc}")
+
+    per = total // nseq
+    data = {
+        q: torch.randn(total, h, d, dtype=torch.bfloat16, device="cuda"),
+        k: torch.randn(total, h, d, dtype=torch.bfloat16, device="cuda"),
+        v: torch.randn(total, h, d, dtype=torch.bfloat16, device="cuda"),
+        gate: torch.rand(total, h, device="cuda").log(),
+        beta: torch.rand(total, h, device="cuda"),
+        cu: torch.tensor([0, per, 2 * per], dtype=torch.int32, device="cuda"),
+        out: torch.empty(total, h, d, dtype=torch.bfloat16, device="cuda"),
+    }
+    ws = torch.empty(max(g.get_workspace_size(), 1), dtype=torch.uint8, device="cuda")
+    with pytest.raises(ValueError, match="dynamic-shape overrides"):
+        g.execute(data, ws, override_uids=[q.get_uid()], override_shapes=[[total, h, d]])

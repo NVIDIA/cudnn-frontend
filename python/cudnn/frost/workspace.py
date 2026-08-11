@@ -26,6 +26,8 @@ tensor library.
 
 from __future__ import annotations
 
+from cudnn import _pybind_module
+
 from . import buffers
 
 # TMA tensormap patches need their 128-byte slot alignment; every other consumer
@@ -64,6 +66,21 @@ class WorkspaceLayout:
         """Alignment the caller's buffer must satisfy for every reserved region
         to land on its own alignment."""
         return self._base_align
+
+
+def carve_plan(owner: str, regions) -> "_pybind_module.WorkspaceCarve":
+    """Compile a build-time carve: ``[(offset, dtype, shape), ...]``.
+
+    An engine's regions are fixed once :class:`WorkspaceLayout` has run; only
+    the caller's base pointer arrives per execute. Describing them here instead
+    of at each :meth:`Workspace.view` is what lets one execute cross into C
+    once rather than once per region (5.5 us against 0.8 for six).
+    """
+    spec = []
+    for offset, dtype, shape in regions:
+        code, bits = buffers.DTYPES[dtype]
+        spec.append((int(offset), code, bits, [int(extent) for extent in shape]))
+    return _pybind_module.WorkspaceCarve(owner, spec)
 
 
 class Workspace:
@@ -135,14 +152,16 @@ class Workspace:
         rather than a capsule built per call (0.30 us against 1.86), and a
         graph hands its kernels one buffer type rather than two.
         """
-        import cudnn
-
         count = 1
         for extent in shape:
             count *= int(extent)
         self._check_span(offset, count * buffers.DTYPE_ITEMSIZE[dtype])
         code, bits = buffers.DTYPES[dtype]
-        return cudnn._pybind_module.make_slot(self._ptr + offset, list(shape), code, bits, self._device)
+        return _pybind_module.make_slot(self._ptr + offset, list(shape), code, bits, self._device)
+
+    def carve(self, plan):
+        """Every region a :func:`carve_plan` describes, in one crossing."""
+        return plan.carve(self._ptr, self._nbytes, self._device)
 
     def take(self, numel: int, dtype: str) -> buffers.DeviceView:
         """The next region dealt sequentially: a 1-D ``numel``-element view."""

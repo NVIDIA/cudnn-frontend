@@ -14,7 +14,7 @@ from cudnn import behavior_note
 from cudnn.engines.base import BaseEngine, CompiledPlan
 
 from cudnn.frost import buffers
-from cudnn.frost.workspace import Workspace, WorkspaceLayout
+from cudnn.frost.workspace import Workspace, WorkspaceLayout, carve_plan
 from ..engine_utils import _FrostPlan, _require_dtype, _require_state_pair
 
 
@@ -156,6 +156,18 @@ class CompiledKda:
         self._off_tensormaps = layout.add(self._tensormap_bytes, align=128)
         self._ws_bytes = layout.size
 
+        self._carve = carve_plan(
+            "kda",
+            [
+                (self._off_sched, "int32", (2,)),
+                (self._off_work_items, "int32", (self._work_item_rows, WORK_ITEM_FIELDS)),
+                (self._off_item_scratch, "int32", (self._work_item_rows, WORK_ITEM_FIELDS)),
+                (self._off_work_count, "int32", (1,)),
+                (self._off_chunk_scratch, "float32", (self._chunk_scratch_rows, HO)),
+                (self._off_tensormaps, "int64", (self._tensormap_bytes // 8,)),
+            ],
+        )
+
     def workspace_bytes(self) -> int:
         return self._ws_bytes
 
@@ -174,13 +186,7 @@ class CompiledKda:
         stream = stream if stream is not None else 0
 
         ws = workspace
-        sched_ctr = ws.view(self._off_sched, "int32", (2,))
-        from .common.split_k import WORK_ITEM_FIELDS
-
-        work_items = ws.view(self._off_work_items, "int32", (self._work_item_rows, WORK_ITEM_FIELDS))
-        item_scratch = ws.view(self._off_item_scratch, "int32", (self._work_item_rows, WORK_ITEM_FIELDS))
-        work_count = ws.view(self._off_work_count, "int32", (1,))
-        chunk_scratch = ws.view(self._off_chunk_scratch, "float32", (self._chunk_scratch_rows, self._n_heads_out))
+        sched_ctr, work_items, item_scratch, work_count, chunk_scratch, tensormaps = ws.carve(self._carve)
         from .common.split_k import build_split_table
 
         build_split_table(
@@ -223,7 +229,7 @@ class CompiledKda:
             work_items=work_items,
             work_count=work_count,
             sched_ctr=sched_ctr,
-            tensormap_workspace=ws.view(self._off_tensormaps, "int64", (self._tensormap_bytes // 8,)),
+            tensormap_workspace=tensormaps,
             stream=stream,
         )
         return None

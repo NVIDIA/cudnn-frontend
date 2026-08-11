@@ -1735,15 +1735,19 @@ class pygraph:
         eng = self.selected_engine
 
         if eng is not None:  # python engine (plan id in the reserved region)
+            if overriding:
+                # A python plan is compiled against the shapes the graph
+                # declared -- the frost engines read them in their __init__ --
+                # so it cannot honour a shape it is told at execute. Refusing
+                # is the only honest answer: silently running the compiled
+                # shapes would return numbers for the wrong problem.
+                raise ValueError(
+                    f"dynamic-shape overrides are a backend-path feature, and this graph selected "
+                    f"the python engine {eng.name!r}, whose plan is compiled for the shapes the "
+                    f"graph declared; rebuild the graph at the shapes you want to run"
+                )
             h = handle if handle is not None else self._handle
-            ctx = ExecutionContext(
-                handle=h,
-                stream=self._resolve_stream(h),
-                workspace=workspace,
-                override_uids=override_uids,
-                override_shapes=override_shapes,
-                override_strides=override_strides,
-            )
+            ctx = ExecutionContext(handle=h, stream=self._resolve_stream(h), workspace=workspace)
             if self._plan_index not in self._compiled_plans:
                 # compile with the CALLER's context (execute-supplied handle
                 # and its stream reach the JIT build)

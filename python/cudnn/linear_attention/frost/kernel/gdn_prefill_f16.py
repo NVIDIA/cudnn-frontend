@@ -2181,9 +2181,10 @@ def _build_descs(
     stream: cuda.CUstream,
 ):
     """Build the 5 per-(b,h) TMA-descriptor arrays (Q, K, V, O, S) into
-    ``tensormap_workspace``.  Compiled + launched separately from the main
-    kernel and cached by input identity in the host bridge, so the builder
-    launches do not recur in steady-state replay.
+    ``tensormap_workspace``.  Compiled and launched separately from the main
+    kernel, and launched on every execute: the descriptors fold ``cu_seqlens``
+    contents into GLOBAL_ADDRESS and GLOBAL_DIM, which the host cannot read
+    without a D2H sync that CUDA-graph capture forbids.
 
     The H descriptor is 3-D ``(dv, dk, h)`` over the packed
     ``[total_h, HO, DK, DV]`` H tensor; ``build_h_descs_kernel`` derives the

@@ -97,6 +97,11 @@ exchange_api_for(PyObject *obj) {
         if (api == nullptr) PyErr_Clear();
     }
     if (cache.count < kTypeCacheSlots) {
+        // Keyed on the type's ADDRESS, so the entry must own a reference: a
+        // heap type that got collected could be replaced by a different type
+        // allocated at the same address, and this would hand out its vtable.
+        // The cache never evicts, so this pins at most kTypeCacheSlots types.
+        Py_INCREF(type);
         cache.types[cache.count] = type;
         cache.apis[cache.count]  = api;  // a null answer is worth caching too
         cache.count++;
@@ -163,7 +168,7 @@ struct Slot {
 // has it for this too.
 class VariantPackSlot {
    public:
-    VariantPackSlot(const Slot &slot, int32_t device_id) : slot_(slot) {
+    VariantPackSlot(Slot slot, int32_t device_id) : slot_(std::move(slot)) {
         tensor_.data        = slot_.data;
         tensor_.device      = DLDevice{kDLCUDA, device_id};
         tensor_.ndim        = slot_.ndim;
@@ -172,6 +177,16 @@ class VariantPackSlot {
         tensor_.strides     = slot_.stride.empty() ? nullptr : slot_.stride.data();
         tensor_.byte_offset = 0;
     }
+
+    // tensor_ points into slot_'s vectors, so a copy would leave the new
+    // object's DLTensor describing the old one's storage. Slots are always
+    // heap-allocated and handed out by pointer, so nothing needs to copy one.
+    VariantPackSlot(const VariantPackSlot &) = delete;
+    VariantPackSlot &
+    operator=(const VariantPackSlot &)  = delete;
+    VariantPackSlot(VariantPackSlot &&) = delete;
+    VariantPackSlot &
+    operator=(VariantPackSlot &&) = delete;
 
     const DLTensor &
     tensor() const {
@@ -552,8 +567,65 @@ make_slot(int64_t ptr, std::vector<int64_t> shape, int dtype_code, int dtype_bit
     slot.dtype  = DLDataType{static_cast<uint8_t>(dtype_code), static_cast<uint8_t>(dtype_bits), 1};
     slot.shape  = std::move(shape);
     slot.filled = true;  // stride left empty: a carve is dense by construction
-    return new VariantPackSlot(slot, device_id);
+    return new VariantPackSlot(std::move(slot), device_id);
 }
+
+// A workspace carve, planned once. Which regions a plan cuts, at what offsets,
+// with what dtypes and shapes, is fixed when the engine builds; only the
+// caller's base pointer arrives per execute. Describing them here rather than
+// at each view() turns one crossing per region into one crossing per execute.
+class WorkspaceCarve {
+   public:
+    WorkspaceCarve(std::string owner, const std::vector<py::tuple> &regions) : owner_(std::move(owner)) {
+        protos_.reserve(regions.size());
+        offsets_.reserve(regions.size());
+        ends_.reserve(regions.size());
+        for (const py::tuple &region : regions) {
+            if (region.size() != 4) {
+                throw py::value_error("a carve region is (offset, dtype_code, dtype_bits, shape)");
+            }
+            int64_t offset = region[0].cast<int64_t>();
+            Slot proto;
+            proto.dtype   = DLDataType{region[1].cast<uint8_t>(), region[2].cast<uint8_t>(), 1};
+            proto.shape   = region[3].cast<std::vector<int64_t>>();
+            proto.ndim    = static_cast<int32_t>(proto.shape.size());
+            proto.filled  = true;  // stride left empty: a carve is dense by construction
+            int64_t numel = 1;
+            for (int64_t extent : proto.shape) numel *= extent;
+            offsets_.push_back(offset);
+            ends_.push_back(offset + numel * ((proto.dtype.bits + 7) / 8));
+            protos_.push_back(std::move(proto));
+        }
+    }
+
+    std::vector<VariantPackSlot *>
+    carve(int64_t base, int64_t nbytes, int32_t device_id) const {
+        std::vector<VariantPackSlot *> out;
+        out.reserve(protos_.size());
+        for (size_t i = 0; i < protos_.size(); i++) {
+            if (ends_[i] > nbytes) {
+                throw py::value_error(owner_ + ": workspace overrun -- region [" + std::to_string(offsets_[i]) + ", " +
+                                      std::to_string(ends_[i]) + ") exceeds the " + std::to_string(nbytes) +
+                                      "-byte buffer (sizing bug)");
+            }
+            Slot slot = protos_[i];
+            slot.data = reinterpret_cast<void *>(base + offsets_[i]);
+            out.push_back(new VariantPackSlot(std::move(slot), device_id));
+        }
+        return out;
+    }
+
+    size_t
+    size() const {
+        return protos_.size();
+    }
+
+   private:
+    std::string owner_;
+    std::vector<Slot> protos_;
+    std::vector<int64_t> offsets_;
+    std::vector<int64_t> ends_;
+};
 
 void
 init_variant_pack(py::module_ &m) {
@@ -609,6 +681,17 @@ capsule built in python.
           py::arg("dtype_bits"),
           py::arg("device_id"),
           "A DLPack producer over memory the caller did not supply -- a workspace carve.");
+
+    py::class_<WorkspaceCarve>(m, "WorkspaceCarve", R"(
+A workspace carve compiled once, at build.
+
+Regions are ``(offset, dtype_code, dtype_bits, shape)``. Only the base pointer
+arrives per execute, so ``carve`` hands back every region in one crossing
+instead of one per region.
+)")
+        .def(py::init<std::string, std::vector<py::tuple>>(), py::arg("owner"), py::arg("regions"))
+        .def("carve", &WorkspaceCarve::carve, py::arg("base"), py::arg("nbytes"), py::arg("device_id"))
+        .def("__len__", &WorkspaceCarve::size);
 
     slot_class.attr("view") = slot_class.attr("reshape");
 

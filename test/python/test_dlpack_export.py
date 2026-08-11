@@ -1,27 +1,31 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""A DeviceView's DLPack struct is copied from a per-layout prototype.
+"""A DeviceView exports DLPack through a slot, which owns the struct it hands out.
 
-Everything in a ``DLManagedTensor`` except ``data`` is a property of the layout,
-so the struct is filled once per (shape, dtype, device) and memmove'd per call:
-measured 1.68 us to assign nine ctypes fields against 0.45 us to copy the 72
-bytes. Same shape as the backend's kernel-argument handling
-(``src/common/include/runtimeKernel.h``), where a prefilled blob carries an
-(offset, uid, UpdateMethod) per mutable field; here there is exactly one
-mutable field.
-
-The struct must be FRESH per capsule even so: cute's ``from_dlpack`` aliases it
-rather than copying, so a struct shared between two capsules is read after
-someone else re-pointed it.
+The view itself has nowhere to put a ``DLManagedTensor`` that must outlive the
+capsule: cute's ``from_dlpack`` aliases the struct rather than copying it, and
+the view cannot know when the consumer is done. Holding the struct on the view
+behind a no-op deleter — which is what this did — reads freed memory as soon as
+a consumer outlives the view.
 """
 
 import ctypes
+import gc
 
 import pytest
 import torch
 
 from cudnn.frost import buffers
+
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="DLPack export is over device pointers")
+
+
+def _capsule_address(capsule):
+    fn = ctypes.pythonapi.PyCapsule_GetPointer
+    fn.restype = ctypes.c_void_p
+    fn.argtypes = [ctypes.py_object, ctypes.c_char_p]
+    return fn(capsule, b"dltensor")
 
 
 @pytest.mark.L0
@@ -38,22 +42,22 @@ def test_two_capsules_from_one_view_do_not_share_a_struct():
     t = torch.zeros(8, dtype=torch.float32, device="cuda")
     view = buffers.DeviceView(t.data_ptr(), (8,), "float32", t.device.index or 0)
     a, b = view.__dlpack__(), view.__dlpack__()
-    addr = ctypes.pythonapi.PyCapsule_GetPointer
-    addr.restype = ctypes.c_void_p
-    addr.argtypes = [ctypes.py_object, ctypes.c_char_p]
-    assert addr(a, b"dltensor") != addr(b, b"dltensor")
+    assert _capsule_address(a) != _capsule_address(b)
 
 
 @pytest.mark.L0
-def test_prototypes_are_shared_across_views_of_one_layout():
-    """The prototype is the cache; the struct is not."""
-    t = torch.zeros(4, 5, dtype=torch.bfloat16, device="cuda")
-    dev = t.device.index or 0
-    v1 = buffers.DeviceView(t.data_ptr(), (4, 5), "bfloat16", dev)
-    v2 = buffers.DeviceView(t.data_ptr() + 64, (4, 5), "bfloat16", dev)
-    v1.__dlpack__()
-    v2.__dlpack__()
-    assert v1._proto is v2._proto
+def test_capsule_outlives_the_view_it_came_from():
+    """The regression: the struct belongs to the capsule, not to the view.
+
+    An unconsumed capsule used to point at a struct the view held in a list,
+    so dropping the view left the consumer decoding freed memory.
+    """
+    t = torch.arange(16, dtype=torch.float32, device="cuda")
+    view = buffers.DeviceView(t.data_ptr(), (16,), "float32", t.device.index or 0)
+    capsule = view.__dlpack__()
+    del view
+    gc.collect()
+    torch.testing.assert_close(torch.from_dlpack(capsule), t)
 
 
 @pytest.mark.L0

@@ -14,7 +14,7 @@ from cudnn import behavior_note
 from cudnn.engines.base import BaseEngine, CompiledPlan
 
 from cudnn.frost import buffers
-from cudnn.frost.workspace import Workspace, WorkspaceLayout
+from cudnn.frost.workspace import Workspace, WorkspaceLayout, carve_plan
 from ..engine_utils import _FrostPlan, _require_dtype, _require_state_pair
 
 
@@ -198,6 +198,19 @@ class CompiledGdn:
             self._off_chunk_scratch = layout.add(self._chunk_scratch_rows * HO * 4)
         self._ws_bytes = layout.size
 
+        regions = [
+            (self._off_tensormaps, "int64", (self._tensormap_words,)),
+            (self._off_sched, "int32", (2,)),
+        ]
+        if self._split:
+            regions += [
+                (self._off_work_items, "int32", (self._work_item_rows, WORK_ITEM_FIELDS)),
+                (self._off_item_scratch, "int32", (self._work_item_rows, WORK_ITEM_FIELDS)),
+                (self._off_work_count, "int32", (1,)),
+                (self._off_chunk_scratch, "float32", (self._chunk_scratch_rows, HO)),
+            ]
+        self._carve = carve_plan("gdn", regions)
+
     def workspace_bytes(self) -> int:
         return self._ws_bytes
 
@@ -216,15 +229,9 @@ class CompiledGdn:
 
         ws = workspace
         stream = stream if stream is not None else 0
-        sched_ctr = ws.view(self._off_sched, "int32", (2,))
         work_items = work_count = None
         if self._split:
-            from .common.split_k import WORK_ITEM_FIELDS
-
-            work_items = ws.view(self._off_work_items, "int32", (self._work_item_rows, WORK_ITEM_FIELDS))
-            item_scratch = ws.view(self._off_item_scratch, "int32", (self._work_item_rows, WORK_ITEM_FIELDS))
-            work_count = ws.view(self._off_work_count, "int32", (1,))
-            chunk_scratch = ws.view(self._off_chunk_scratch, "float32", (self._chunk_scratch_rows, self._n_heads_out))
+            tensormaps, sched_ctr, work_items, item_scratch, work_count, chunk_scratch = ws.carve(self._carve)
             _splits_for(
                 g,
                 cu,
@@ -241,6 +248,7 @@ class CompiledGdn:
                 sched_ctr=sched_ctr,
             )
         else:
+            tensormaps, sched_ctr = ws.carve(self._carve)
             buffers.memset_zero_async(sched_ctr.data_ptr(), sched_ctr.nbytes, stream)
 
         self._kernel.chunk_gdn_sm100(
@@ -260,7 +268,7 @@ class CompiledGdn:
             checkpoint_every_n_tokens=self._ckpt,
             output_h=h,
             log_gate=True,
-            workspace=ws.view(self._off_tensormaps, "int64", (self._tensormap_words,)),
+            workspace=tensormaps,
             stream=stream,
         )
         return None
@@ -332,6 +340,26 @@ class CompiledGdnBwd:
         self._shapes = (total, HQ, HV, HO, K, V, B)
         self._ws_bytes = layout.size
 
+        # The regions every backward carves. The rest (io state, regenerated H,
+        # head-group scratch) hang off build-time branches that are usually
+        # off, and stay on view() rather than turning this into index
+        # bookkeeping. The three scheduler views overlap on purpose: one ring
+        # each for the regen and bwd kernels, and both at once for the split
+        # pipeline that zeroes them.
+        self._carve = carve_plan(
+            "gdn_bwd",
+            [
+                (self._off_sched, "int32", (2,)),
+                (self._off_sched + 8, "int32", (2,)),
+                (self._off_sched, "int32", (4,)),
+                (self._off_work_items, "int32", (self._work_item_rows, WORK_ITEM_FIELDS)),
+                (self._off_item_scratch, "int32", (self._work_item_rows, WORK_ITEM_FIELDS)),
+                (self._off_work_count, "int32", (1,)),
+                (self._off_chunk_scratch, "float32", (self._chunk_scratch_rows, HO)),
+                (self._off_tensormaps, "int64", (self._tensormap_words,)),
+            ],
+        )
+
     def workspace_bytes(self) -> int:
         return self._ws_bytes
 
@@ -357,14 +385,7 @@ class CompiledGdnBwd:
         total, HQ, HV, HO, K, V, B = self._shapes
 
         stream = stream if stream is not None else 0
-        sched_fwd = ws.view(self._off_sched, "int32", (2,))
-        sched_bwd = ws.view(self._off_sched + 8, "int32", (2,))
-        from .common.split_k import WORK_ITEM_FIELDS
-
-        work_items = ws.view(self._off_work_items, "int32", (self._work_item_rows, WORK_ITEM_FIELDS))
-        item_scratch = ws.view(self._off_item_scratch, "int32", (self._work_item_rows, WORK_ITEM_FIELDS))
-        work_count = ws.view(self._off_work_count, "int32", (1,))
-        chunk_scratch = ws.view(self._off_chunk_scratch, "float32", (self._chunk_scratch_rows, HO))
+        sched_fwd, sched_bwd, sched_all, work_items, item_scratch, work_count, chunk_scratch, tensormaps = ws.carve(self._carve)
         _splits_for(
             g,
             cu,
@@ -378,7 +399,7 @@ class CompiledGdnBwd:
             self._b_t,
             stream,
             log_gate=True,
-            sched_ctr=ws.view(self._off_sched, "int32", (4,)),
+            sched_ctr=sched_all,
         )
 
         s0_io = None
@@ -438,7 +459,7 @@ class CompiledGdnBwd:
             work_count=work_count,
             sched_ctr=sched_bwd if self._bwd_dyn_sched else None,
             log_gate=True,
-            workspace=ws.view(self._off_tensormaps, "int64", (self._tensormap_words,)),
+            workspace=tensormaps,
             stream=stream,
         )
         if self._is_gva:

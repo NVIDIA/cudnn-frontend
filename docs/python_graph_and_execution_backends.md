@@ -81,8 +81,10 @@ create_execution_plans([heur_mode.A, ...])                    _pygraph.py
   `build_plan(graph, plan, ctx) → CompiledPlan` (the expensive
   JIT step, once per graph/plan, cached on the graph),
   `CompiledPlan.execute(graph, operands, ExecutionContext)` with explicit
-  handle/stream/workspace/overrides. Simple eager engines implement
-  `execute()` only.
+  handle/stream/workspace. Dynamic-shape overrides are a backend-path feature:
+  a python plan is compiled for the shapes the graph declared, so `execute()`
+  refuses them rather than silently running a different problem. Simple eager
+  engines implement `execute()` only.
 
 #### The variant pack is normalized once
 
@@ -96,14 +98,22 @@ object untouched and `frost.buffers.probe` refused it. One public call, two
 answers, decided by which plan the heuristics happened to pick — which the
 caller does not control.
 
-`VariantPack` carries the caller-filled uids ascending, a ctypes pointer array
-(`address` goes straight to `_execute_with_raw_ptrs`), and one `Tensor` per
-operand — the same class `graph.tensor()` returns — holding the buffer's OWN
-dim/stride/data_type. It is deliberately not the graph's declaration: the two
-may differ and one engine relies on it — `frost_gemm` takes its M/N/K from the
-buffers, so a plan built for one problem size runs another bit-exactly. **Read
-the IR port for the shape the plan was built for; read the variant pack's
-`Tensor` for the shape about to run.**
+`VariantPack` carries the caller-filled uids ascending and the operands
+themselves, held in a C type (`pygraph/variant_pack.cpp`) as one `DLTensor`
+each. That type both consumes `__dlpack_c_exchange_api__` — the C function
+table a producer publishes on its type, which is how one crossing reads the
+whole pack — and implements it, so a kernel reads a slot through the same fast
+path it has for a framework tensor. `address` is the pointer array
+`_execute_with_raw_ptrs` takes.
+
+Each operand's OWN dim/stride/data_type is what the pack holds, deliberately
+not the graph's declaration: the two may differ and one engine relies on it —
+`frost_gemm` takes its M/N/K from the buffers, so a plan built for one problem
+size runs another bit-exactly. **Read the IR port for the shape the plan was
+built for; read the pack for the shape about to run.** `pack.tensors`
+materializes those as `Tensor` records on demand — 17 us for eight operands, so
+an engine that only needs pointers and extents should ask the pack directly and
+never touch it.
 
 Two rules that are easy to break by accident:
 
