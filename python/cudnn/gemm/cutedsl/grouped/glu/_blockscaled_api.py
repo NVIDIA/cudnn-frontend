@@ -17,12 +17,13 @@ Discrete mode
     at execution time.
 """
 
+from __future__ import annotations
+
 from .moe_blockscaled_grouped_gemm_glu_bias import BlockScaledMoEGroupedGemmGluBiasKernel
 from ..backend_utils import _torch_stream_context, rubin_single_group_offsets_kwarg
 from ..moe_utils import MoEWeightMode
 from cuda.bindings import driver as cuda
 import os
-import torch
 from typing import Tuple, Optional
 
 import cutlass
@@ -117,7 +118,7 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
         sample_norm_const: Optional[torch.Tensor] = None,
         sample_prob: Optional[torch.Tensor] = None,
         # Configuration
-        acc_dtype: torch.dtype = torch.float32,
+        acc_dtype: Optional[torch.dtype] = None,
         mma_tiler_mn: Tuple[int, int] = (256, 256),
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         sf_vec_size: int = 16,
@@ -161,6 +162,10 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
         :param b_major: Major dimension for B tensor, one of "k" or "n"
         :param use_dynamic_sched: Enable dynamic tile scheduling for load balancing
         """
+        import torch
+
+        if acc_dtype is None:
+            acc_dtype = torch.float32
         super().__init__()
 
         self._warn_experimental_api()
@@ -257,6 +262,8 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
 
         :return: True if supported, raises exception otherwise
         """
+        import torch
+
         self._logger.debug("Entering check_support")
 
         # ---- SFD group validation ----
@@ -601,6 +608,8 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
 
     def compile(self) -> None:
         """Compile the kernel."""
+        import torch
+
         self._logger.debug("Entering compile")
         self._ensure_support_checked()
         if self._compiled_kernel is not None:
@@ -931,6 +940,8 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
 
     def _compile_discrete(self, gemm_glu, max_active_clusters, fake_stream) -> None:
         """Compile for discrete (per-expert pointer) weight mode."""
+        import torch
+
         if len(self.b_shape) == 2:
             n, k = self.b_shape
         else:

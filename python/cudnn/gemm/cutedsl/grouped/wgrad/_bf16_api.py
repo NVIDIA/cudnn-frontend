@@ -3,6 +3,8 @@
 
 """Private descriptor-first BF16 API for SM100 grouped GEMM wgrad."""
 
+from __future__ import annotations
+
 import os
 import weakref
 from typing import Optional, Tuple, Union
@@ -11,7 +13,6 @@ import cutlass
 import cutlass.cute as cute
 from cuda.bindings import driver as cuda
 from cutlass.cute.runtime import from_dlpack, make_fake_stream
-import torch
 
 from cudnn.api_base import APIBase, TensorDesc
 from cudnn.datatypes import _convert_to_cutlass_data_type
@@ -21,7 +22,16 @@ from ..backend_utils import _torch_stream_context
 from ..moe_utils import MoEWeightMode, WGradInputOrder
 from .moe_grouped_gemm_wgrad import MoEGroupedGemmWgradBF16Kernel
 
-_OUTPUT_DTYPES = [torch.bfloat16, torch.float16, torch.float32]
+_OUTPUT_DTYPES = None
+
+
+def _output_dtypes():
+    global _OUTPUT_DTYPES
+    if _OUTPUT_DTYPES is None:
+        import torch
+
+        _OUTPUT_DTYPES = [torch.bfloat16, torch.float16, torch.float32]
+    return _OUTPUT_DTYPES
 
 
 class GroupedGemmWgradBf16API(APIBase):
@@ -41,13 +51,17 @@ class GroupedGemmWgradBf16API(APIBase):
         wgrad_dtype: Optional[torch.dtype] = None,
         sample_global_scale_a: Optional[torch.Tensor] = None,
         sample_global_scale_b: Optional[torch.Tensor] = None,
-        acc_dtype: torch.dtype = torch.float32,
+        acc_dtype: Optional[torch.dtype] = None,
         mma_tiler_mn: Tuple[int, int] = (256, 256),
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         sf_vec_size: int = 16,
         accumulate_on_output: bool = False,
         input_order: Union[WGradInputOrder, str] = WGradInputOrder.Tensor2D,
     ) -> None:
+        import torch
+
+        if acc_dtype is None:
+            acc_dtype = torch.float32
         super().__init__()
         self._warn_experimental_api()
         self.input_order = WGradInputOrder(input_order)
@@ -178,6 +192,8 @@ class GroupedGemmWgradBf16API(APIBase):
 
     @staticmethod
     def _record_pointer_stream(pointers: torch.Tensor, current_stream: cuda.CUstream) -> None:
+        import torch
+
         handle = int(current_stream)
         torch_current = torch.cuda.current_stream(pointers.device)
         torch_default = torch.cuda.default_stream(pointers.device)
@@ -213,6 +229,8 @@ class GroupedGemmWgradBf16API(APIBase):
             raise ValueError(f"{name} must be on {device}, got {desc.device}")
 
     def check_support(self) -> bool:
+        import torch
+
         if self.a_desc.ndim != 2:
             raise ValueError(f"sample_a must be rank-2, got {self.a_desc.shape}")
         if self.b_desc.ndim != 2:
@@ -226,7 +244,7 @@ class GroupedGemmWgradBf16API(APIBase):
         self._check_dtype(self.a_desc, torch.bfloat16, "sample_a")
         self._check_dtype(self.b_desc, torch.bfloat16, "sample_b")
         self._check_dtype(self.offsets_desc, torch.int32, "sample_offsets")
-        self._check_dtype(self.wgrad_dtype, _OUTPUT_DTYPES, "wgrad_dtype")
+        self._check_dtype(self.wgrad_dtype, _output_dtypes(), "wgrad_dtype")
         if self.acc_dtype != torch.float32:
             raise ValueError(f"acc_dtype must be torch.float32, got {self.acc_dtype}")
         if any(control is not None for control in self._scale_controls):
@@ -311,6 +329,8 @@ class GroupedGemmWgradBf16API(APIBase):
         return True
 
     def compile(self) -> None:
+        import torch
+
         self._ensure_support_checked()
         if self._compiled_kernel is not None:
             return
@@ -455,6 +475,8 @@ class GroupedGemmWgradBf16API(APIBase):
         global_scale_b: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
     ) -> None:
+        import torch
+
         current_stream = self._get_default_stream(current_stream)
         if self._compiled_kernel is None:
             raise RuntimeError("Kernel not compiled; call compile() first")

@@ -162,10 +162,6 @@ SDPA_attributes::validate_sdpa_support_surface(const detail::Context& context,
     if (mma_core_mode == DataType_t::FP8_E4M3 || mma_core_mode == DataType_t::FP8_E5M2) {
         // FP8 specific validation
 
-        RETURN_CUDNN_FRONTEND_ERROR_IF((prop_major == 12) && is_ragged,
-                                       error_code_t::GRAPH_NOT_SUPPORTED,
-                                       "sdpa fp8 with THD not supported for sm120 yet.");
-
         // version specific validation
         RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 90100,
                                        error_code_t::GRAPH_NOT_SUPPORTED,

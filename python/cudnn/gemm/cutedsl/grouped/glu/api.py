@@ -17,6 +17,8 @@ Discrete mode
     at execution time.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass, replace
 
 from ..backend_utils import (
@@ -28,20 +30,28 @@ from ..moe_utils import MoEWeightMode
 from cuda.bindings import driver as cuda
 import logging
 import os
-import torch
 from typing import Any, Tuple, Optional, overload
 
 from cudnn.api_base import APIBase, TupleDict, ceil_div, get_device_type
 
-_BLOCK_SCALED_DTYPE_PAIRS = {
-    (dtype, dtype)
-    for dtype in (
-        torch.float4_e2m1fn_x2,
-        torch.uint8,
-        torch.float8_e5m2,
-        torch.float8_e4m3fn,
-    )
-}
+_BLOCK_SCALED_DTYPE_PAIRS = None
+
+
+def _block_scaled_dtype_pairs():
+    global _BLOCK_SCALED_DTYPE_PAIRS
+    if _BLOCK_SCALED_DTYPE_PAIRS is None:
+        import torch
+
+        _BLOCK_SCALED_DTYPE_PAIRS = {
+            (dtype, dtype)
+            for dtype in (
+                torch.float4_e2m1fn_x2,
+                torch.uint8,
+                torch.float8_e5m2,
+                torch.float8_e4m3fn,
+            )
+        }
+    return _BLOCK_SCALED_DTYPE_PAIRS
 
 
 from ._bf16_api import GroupedGemmGluBf16API
@@ -69,9 +79,9 @@ class GluCall:
     b_major: str = "k"
     norm_const_tensor: Optional[torch.Tensor] = None
     prob_tensor: Optional[torch.Tensor] = None
-    acc_dtype: torch.dtype = torch.float32
-    c_dtype: torch.dtype = torch.bfloat16
-    d_dtype: torch.dtype = torch.bfloat16
+    acc_dtype: Optional[torch.dtype] = None
+    c_dtype: Optional[torch.dtype] = None
+    d_dtype: Optional[torch.dtype] = None
     cd_major: str = "n"
     mma_tiler_mn: Tuple[int, int] = (256, 256)
     cluster_shape_mn: Optional[Tuple[int, int]] = None
@@ -146,7 +156,7 @@ class GroupedGemmGluSm100(APIBase):
         sample_amax: Optional[torch.Tensor] = None,
         sample_norm_const: Optional[torch.Tensor] = None,
         sample_prob: Optional[torch.Tensor] = None,
-        acc_dtype: torch.dtype = torch.float32,
+        acc_dtype: Optional[torch.dtype] = None,
         mma_tiler_mn: Tuple[int, int] = (256, 256),
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         sf_vec_size: int = 16,
@@ -163,6 +173,14 @@ class GroupedGemmGluSm100(APIBase):
         self._pending_init_kwargs = dict(locals())
         self._pending_init_kwargs.pop("self")
         self._pending_init_kwargs.pop("__class__", None)
+        from cudnn.tensor_adapter import is_torch_tensor
+
+        if sample_a is not None and not is_torch_tensor(sample_a):
+            raise ValueError("GroupedGemmGluSm100 currently supports torch tensors only; JAX support is not yet implemented for this API")
+        if acc_dtype is None:
+            import torch
+
+            self._pending_init_kwargs["acc_dtype"] = torch.float32
         self._implementation = None
 
     def check_support(self) -> bool:
@@ -184,7 +202,7 @@ class GroupedGemmGluSm100(APIBase):
                     ("sf_vec_size", kwargs["sf_vec_size"] if kwargs["sf_vec_size"] != 16 else None),
                     ("discrete_col_sfd", kwargs["discrete_col_sfd"] if kwargs["discrete_col_sfd"] else None),
                 ),
-                block_scaled_dtype_pairs=_BLOCK_SCALED_DTYPE_PAIRS,
+                block_scaled_dtype_pairs=_block_scaled_dtype_pairs(),
             )
             self.backend = backend
             if backend is GroupedGemmBackend.BF16:
@@ -446,6 +464,8 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall) -> TupleDict:
         TupleDict with keys: c_tensor, d_tensor, d_col_tensor, amax_tensor,
             sfd_row_tensor, sfd_col_tensor
     """
+    import torch
+
     from cudnn.gemm.cutedsl.discrete_grouped.discrete_kernel_utils import _require_pointer_tensor
 
     a_tensor = call.a_tensor
@@ -807,7 +827,17 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall) -> TupleDict:
 
 
 def _normalize_glu_call(call: GluCall) -> tuple[GluCall, GroupedGemmBackend]:
+    import torch
+
     from cudnn.gemm.cutedsl.discrete_grouped.discrete_kernel_utils import _require_pointer_tensor
+
+    if call.acc_dtype is None or call.c_dtype is None or call.d_dtype is None:
+        call = replace(
+            call,
+            acc_dtype=call.acc_dtype if call.acc_dtype is not None else torch.float32,
+            c_dtype=call.c_dtype if call.c_dtype is not None else torch.bfloat16,
+            d_dtype=call.d_dtype if call.d_dtype is not None else torch.bfloat16,
+        )
 
     is_dense = call.b_tensor is not None
     is_discrete = call.b_ptrs is not None
@@ -867,7 +897,7 @@ def _normalize_glu_call(call: GluCall) -> tuple[GluCall, GroupedGemmBackend]:
                 call.glu_clamp_min if call.glu_clamp_min != -7.0 else None,
             ),
         ),
-        block_scaled_dtype_pairs=_BLOCK_SCALED_DTYPE_PAIRS,
+        block_scaled_dtype_pairs=_block_scaled_dtype_pairs(),
     )
 
     linear_offset = call.linear_offset
@@ -946,6 +976,8 @@ def _glu_tensor_signature(tensor: Optional[torch.Tensor], *, dynamic_m: bool = F
 
 
 def _grouped_gemm_glu_bf16_call(call: GluCall) -> TupleDict:
+    import torch
+
     valid_m, k, _ = call.a_tensor.shape
     if call.weight_mode == MoEWeightMode.DENSE:
         n_full = call.b_tensor.shape[0]
@@ -1095,9 +1127,9 @@ def grouped_gemm_glu_wrapper_sm100(
     b_major: str = "k",
     norm_const_tensor: Optional[torch.Tensor] = None,
     prob_tensor: Optional[torch.Tensor] = None,
-    acc_dtype: torch.dtype = torch.float32,
-    c_dtype: torch.dtype = torch.bfloat16,
-    d_dtype: torch.dtype = torch.bfloat16,
+    acc_dtype: Optional[torch.dtype] = None,
+    c_dtype: Optional[torch.dtype] = None,
+    d_dtype: Optional[torch.dtype] = None,
     cd_major: str = "n",
     mma_tiler_mn: Tuple[int, int] = (256, 256),
     cluster_shape_mn: Optional[Tuple[int, int]] = None,
@@ -1116,6 +1148,18 @@ def grouped_gemm_glu_wrapper_sm100(
     generate_c: bool = False,
 ) -> TupleDict:
     """Dispatch grouped GEMM GLU once from an immutable normalized call."""
+    from cudnn.tensor_adapter import is_torch_tensor
+
+    if a_tensor is not None and not is_torch_tensor(a_tensor):
+        raise ValueError("grouped_gemm_glu_wrapper_sm100 currently supports torch tensors only; JAX support is not yet implemented for this API")
+    import torch
+
+    if acc_dtype is None:
+        acc_dtype = torch.float32
+    if c_dtype is None:
+        c_dtype = torch.bfloat16
+    if d_dtype is None:
+        d_dtype = torch.bfloat16
     _reject_unsupported_rubin_glu_tune_params(
         get_device_type() == "rubin",
         geglu_alpha,

@@ -618,10 +618,51 @@ def test_sm120_probe_rejects_on_sm100_family():
     assert _SM120 not in _eligible(_mk_sm120_graph())
 
 
-def test_sm120_probe_rejects_head_dim_not_multiple_of_16(monkeypatch):
+def test_sm120_probe_head_dim_envelope(monkeypatch):
+    # d_envelope: any multiple of 8 up to the 256 cap is served via TMA
+    # zero-padding; only sub-8 alignment (TMA 16-byte global-stride rule)
+    # stays ineligible.
     monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
     assert _SM120 in _eligible(_mk_sm120_graph(d=192))
-    assert not _eligible(_mk_sm120_graph(d=136))  # multiple of 8, not of 16
+    assert _SM120 in _eligible(_mk_sm120_graph(d=136))  # multiple of 8, not of 16
+    assert not _eligible(_mk_sm120_graph(d=132))  # multiple of 4, not of 8
+
+
+def test_sm120_probe_accepts_right_band_widening(monkeypatch):
+    # diagonal_band_right_bound > 0 is served by the SM120 row (the causal
+    # machinery with a widened diagonal); the SM100 rows keep rejecting it.
+    monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
+    for align in (cudnn.diagonal_alignment.TOP_LEFT, cudnn.diagonal_alignment.BOTTOM_RIGHT):
+        g = _mk_graph()
+        q, k, v, dims, strides = _mk_qkv(g, d=128)
+        o, _ = g.sdpa(
+            name="s",
+            q=q,
+            k=k,
+            v=v,
+            attn_scale=0.1,
+            is_inference=True,
+            diagonal_band_right_bound=16,
+            diagonal_alignment=align,
+        )
+        _finish_output(o, dims, strides)
+        assert _SM120 in _eligible(g), align
+
+
+def test_sm120_probe_accepts_ragged_skv_without_padding_or_causal(monkeypatch):
+    # No KV-tail rule on the SM120 row (skv_tile=0): the kernel's first
+    # (masked) step always covers the rightmost — and therefore any partial —
+    # KV tile, so a dense unmasked graph with S_kv % 128 != 0 is served
+    # natively. The SM100 f16 row keeps rejecting this shape.
+    monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
+    g = _mk_graph()
+    s_kv, d = 300, 128
+    q = g.tensor(dim=(B, H, S, d), stride=(S * H * d, d, H * d, 1), data_type=DTYPE, name="q")
+    k = g.tensor(dim=(B, H, s_kv, d), stride=(s_kv * H * d, d, H * d, 1), data_type=DTYPE, name="k")
+    v = g.tensor(dim=(B, H, s_kv, d), stride=(s_kv * H * d, d, H * d, 1), data_type=DTYPE, name="v")
+    o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True)
+    _finish_output(o, (B, H, S, d), (S * H * d, d, H * d, 1))
+    assert _SM120 in _eligible(g)
 
 
 def test_sm120_probe_accepts_mixed_head_dims(monkeypatch):
