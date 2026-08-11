@@ -13,6 +13,7 @@ import pytest
 import cudnn
 from test_utils import torch_fork_set_rng
 from fe_api.test_fe_api_utils import DYNAMIC_SHAPES_M_VALUES, reencode_sf_tensor_as_ue5m3
+from fe_api.grouped_gemm.test_grouped_gemm_wgrad_utils import _skip_unless_e5m3_supported
 from fe_api.grouped_gemm.test_grouped_gemm_swiglu_utils import (
     GROUPED_GEMM_SWIGLU_COMMON_MARKS,
     GROUPED_GEMM_SWIGLU_FP4_TYPE_MARKS,
@@ -1998,20 +1999,6 @@ _NVFP4_E5M3_CFG = dict(
     vector_f32=False,
     discrete_col_sfd=False,
 )
-
-
-def _skip_unless_e5m3_supported():
-    """E5M3 scales need Rubin plus an internal cutlass-dsl build."""
-    try:
-        import cutlass
-
-        from cudnn.api_base import get_device_type
-    except ImportError:
-        pytest.skip("cudnn optional dependencies not installed")
-    if get_device_type() != "rubin":
-        pytest.skip("e5m3 scale factors require Rubin (SM107)")
-    if not hasattr(cutlass, "FloatNV8E5M3FNU"):
-        pytest.skip("cutlass-dsl build does not provide FloatNV8E5M3FNU")
 
 
 def _make_glu_inputs(request, **overrides):

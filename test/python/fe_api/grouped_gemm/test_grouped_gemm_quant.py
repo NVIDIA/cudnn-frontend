@@ -20,6 +20,7 @@ from fe_api.grouped_gemm.test_discrete_grouped_gemm_swiglu_utils import (
     allocate_discrete_input_tensors,
 )
 from fe_api.test_fe_api_utils import reencode_sf_tensor_as_ue5m3
+from fe_api.grouped_gemm.test_grouped_gemm_wgrad_utils import _skip_unless_e5m3_supported
 from fe_api.grouped_gemm.test_grouped_gemm_quant_utils import (
     grouped_gemm_quant_init,
     with_grouped_gemm_quant_params_fp4,
@@ -1580,19 +1581,6 @@ def _test_grouped_gemm_quant_discrete_wrapper(
     return inputs, outputs, cfg
 
 
-def _skip_unless_quant_e5m3_supported():
-    try:
-        import cutlass
-
-        from cudnn.api_base import get_device_type
-    except ImportError:
-        pytest.skip("cudnn optional dependencies not installed")
-    if get_device_type() != "rubin":
-        pytest.skip("e5m3 scale factors require Rubin (SM107)")
-    if not hasattr(cutlass, "FloatNV8E5M3FNU"):
-        pytest.skip("cutlass-dsl build does not provide FloatNV8E5M3FNU")
-
-
 def _quant_nvfp4_inputs(request, sf_vec_size=16, sf_dtype=torch.float8_e4m3fn, ab_dtype=torch.float4_e2m1fn_x2):
     cfg = grouped_gemm_quant_init(
         request,
@@ -1664,7 +1652,7 @@ def _run_quant_wrapper(cfg, inputs, sf_fp8_dtype_override):
 )
 def test_grouped_gemm_quant_rejects_unsupported_sf_fp8_dtype(request, sf_fp8_dtype_override, overrides, expected):
     """e5m3 is only reachable through the Rubin FP4xFP4 atom with e4m3-carried scales."""
-    _skip_unless_quant_e5m3_supported()
+    _skip_unless_e5m3_supported()
     cfg, inputs = _quant_nvfp4_inputs(request, **overrides)
     with pytest.raises(ValueError, match=expected):
         _run_quant_wrapper(cfg, inputs, sf_fp8_dtype_override)
@@ -1679,7 +1667,7 @@ def test_grouped_gemm_quant_e5m3_is_not_cached_as_e4m3(request):
     the override were missing from the key the second call would reuse the first
     kernel and silently return E4M3 results.
     """
-    _skip_unless_quant_e5m3_supported()
+    _skip_unless_e5m3_supported()
     cfg, inputs = _quant_nvfp4_inputs(request)
     d_e4m3 = _run_quant_wrapper(cfg, inputs, None)["d_tensor"].float().clone()
     d_e5m3 = _run_quant_wrapper(cfg, inputs, "e5m3")["d_tensor"].float().clone()

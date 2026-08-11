@@ -10,6 +10,7 @@ import cudnn
 from test_utils import torch_fork_set_rng
 from fe_api.test_fe_api_utils import reencode_sf_tensor_as_ue5m3
 from fe_api.grouped_gemm.test_grouped_gemm_wgrad_utils import (
+    _skip_unless_e5m3_supported,
     grouped_gemm_wgrad_init,
     with_grouped_gemm_wgrad_params_fp4,
     with_grouped_gemm_wgrad_params_fp8,
@@ -839,19 +840,6 @@ def test_grouped_gemm_wgrad_dense_wrapper_tensor_ragged_fp4():
     check_ref_grouped_gemm_wgrad(result["wgrad_tensor"], inputs["ref_result"], cfg["tolerance"])
 
 
-def _skip_unless_wgrad_e5m3_supported():
-    try:
-        import cutlass
-
-        from cudnn.api_base import get_device_type
-    except ImportError:
-        pytest.skip("cudnn optional dependencies not installed")
-    if get_device_type() != "rubin":
-        pytest.skip("e5m3 scale factors require Rubin (SM107)")
-    if not hasattr(cutlass, "FloatNV8E5M3FNU"):
-        pytest.skip("cutlass-dsl build does not provide FloatNV8E5M3FNU")
-
-
 def _wgrad_nvfp4_inputs(sf_vec_size=16, sf_dtype=torch.float8_e4m3fn, ab_dtype=torch.float4_e2m1fn_x2):
     cfg = grouped_gemm_wgrad_init(
         ab_dtype=ab_dtype,
@@ -903,7 +891,7 @@ def _run_wgrad_wrapper(cfg, inputs, sf_fp8_dtype_override):
 )
 def test_grouped_gemm_wgrad_rejects_unsupported_sf_fp8_dtype(sf_fp8_dtype_override, overrides, expected):
     """e5m3 is only reachable through the Rubin FP4xFP4 atom with e4m3-carried scales."""
-    _skip_unless_wgrad_e5m3_supported()
+    _skip_unless_e5m3_supported()
     cfg, inputs = _wgrad_nvfp4_inputs(**overrides)
     with pytest.raises(ValueError, match=expected):
         _run_wgrad_wrapper(cfg, inputs, sf_fp8_dtype_override)
@@ -918,7 +906,7 @@ def test_grouped_gemm_wgrad_e5m3_is_not_cached_as_e4m3():
     the override were missing from the key the second call would reuse the first
     kernel and silently return E4M3 results.
     """
-    _skip_unless_wgrad_e5m3_supported()
+    _skip_unless_e5m3_supported()
     cfg, inputs = _wgrad_nvfp4_inputs()
     w_e4m3 = _run_wgrad_wrapper(cfg, inputs, None)["wgrad_tensor"].float().clone()
     w_e5m3 = _run_wgrad_wrapper(cfg, inputs, "e5m3")["wgrad_tensor"].float().clone()
