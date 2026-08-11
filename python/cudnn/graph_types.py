@@ -106,13 +106,6 @@ class Tensor:
     # (set_name / set_uid) delegate to the graph so its indexes stay coherent.
     owner: Any = field(default=None, repr=False)
 
-    def __setattr__(self, name, value):
-        # direct attribute writes freeze with the owning graph (the fluent
-        # setters are guarded separately and give a richer error)
-        if getattr(self, "_frozen", False) and name != "_frozen":
-            raise RuntimeError(f"cannot set Tensor.{name}: the owning graph is frozen after lowering/planning")
-        object.__setattr__(self, name, value)
-
     def _guard(self, what: str = "mutate a tensor attribute") -> None:
         g = self.owner() if self.owner is not None else None
         if g is not None:

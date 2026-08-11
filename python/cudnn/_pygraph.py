@@ -50,11 +50,6 @@ class GraphContext:
     intermediate_data_type: Any = None
     compute_data_type: Any = None
 
-    def __setattr__(self, name, value):
-        if getattr(self, "_frozen", False) and name != "_frozen":
-            raise RuntimeError("the graph is frozen after lowering/planning — build a new graph to change its configuration")
-        object.__setattr__(self, name, value)
-
 
 class pygraph:
     """Pure Python graph representation.
@@ -360,14 +355,17 @@ class pygraph:
         self._is_validated = False
 
     def _freeze(self) -> None:
-        """Freeze the ENTIRE public graph surface (not just the fluent API).
+        """Freeze the ENTIRE public graph surface.
 
-        Called at lowering and at planning, whichever happens first. After
-        this, every mutation path raises: fluent setters and op builders (via
-        _check_mutable), attribute writes on Tensor/Node/GraphContext (their
-        __setattr__ guards), dict writes on node.inputs/outputs/params
-        (MappingProxy), and in-place list mutation of dim/stride (tuples).
-        The inspection surface stays fully readable for engines."""
+        Called at lowering and at planning, whichever happens first.
+
+        Frozen-ness is ONE flag, on the graph. Every mutation route the public
+        API offers goes through _check_mutable (the chained setters via
+        Tensor._guard / Node._guard, and the op builders), so the flag alone is
+        the guard. What the caller could otherwise change behind the API's back
+        is made immutable in its own right rather than watched:
+        node.inputs/outputs/params become MappingProxy views and dim/stride
+        become tuples. The inspection surface stays fully readable for engines."""
         if self._frozen:
             return
         from types import MappingProxyType
@@ -376,12 +374,9 @@ class pygraph:
             node.inputs = MappingProxyType(dict(node.inputs))
             node.outputs = MappingProxyType(dict(node.outputs))
             node.params = MappingProxyType(dict(node.params))
-            node._frozen = True
         for t in self._tensor_by_uid.values():
             t.dim = tuple(t.dim) if t.dim else t.dim
             t.stride = tuple(t.stride) if t.stride else t.stride
-            t._frozen = True
-        self._context._frozen = True
         self._frozen = True
 
     def _rename_tensor(self, t: Tensor, name: str) -> None:
