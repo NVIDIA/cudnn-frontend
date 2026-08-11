@@ -9,4 +9,15 @@ from .api import (
 __all__ = [
     "DiscreteGroupedGemmDswigluSm100",
     "discrete_grouped_gemm_dswiglu_wrapper_sm100",
+    "discrete_grouped_gemm_dswiglu_jax_sm100",
 ]
+
+
+def __getattr__(name):
+    # Lazy: the jax entry point imports jax/cutlass.jax, which must not be pulled in
+    # for torch-only users.
+    if name == "discrete_grouped_gemm_dswiglu_jax_sm100":
+        from .jax_api import discrete_grouped_gemm_dswiglu_jax_sm100
+
+        return discrete_grouped_gemm_dswiglu_jax_sm100
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -319,6 +319,8 @@ _LAZY_OPTIONAL_IMPORTS = {
     "GemmSwigluSm100": (".gemm.cutedsl.dense.swiglu", "GemmSwigluSm100"),
     "gemm_swiglu_wrapper_sm100": (".gemm.cutedsl.dense.swiglu", "gemm_swiglu_wrapper_sm100"),
     "gemm_swiglu_jax_sm100": (".gemm.cutedsl.dense.swiglu", "gemm_swiglu_jax_sm100"),
+    "gemm_srelu_jax_sm100": (".gemm.cutedsl.dense.srelu", "gemm_srelu_jax_sm100"),
+    "gemm_dsrelu_jax_sm100": (".gemm.cutedsl.dense.dsrelu", "gemm_dsrelu_jax_sm100"),
     "GemmSreluSm100": (".gemm.cutedsl.dense.srelu", "GemmSreluSm100"),
     "gemm_srelu_wrapper_sm100": (".gemm.cutedsl.dense.srelu", "gemm_srelu_wrapper_sm100"),
     "GemmDsreluSm100": (".gemm.cutedsl.dense.dsrelu", "GemmDsreluSm100"),
@@ -329,11 +331,19 @@ _LAZY_OPTIONAL_IMPORTS = {
     "GemmProjRopeMxfp8Bf16InSm100": (".gemm.cutedsl.dense.proj_rope_mxfp8", "GemmProjRopeMxfp8Bf16InSm100"),
     "GemmProjRopeMxfp8Mxfp8InSm100": (".gemm.cutedsl.dense.proj_rope_mxfp8", "GemmProjRopeMxfp8Mxfp8InSm100"),
     "gemm_proj_rope_mxfp8_wrapper_sm100": (".gemm.cutedsl.dense.proj_rope_mxfp8", "gemm_proj_rope_mxfp8_wrapper_sm100"),
+    "gemm_proj_rope_mxfp8_jax_sm100": (".gemm.cutedsl.dense.proj_rope_mxfp8", "gemm_proj_rope_mxfp8_jax_sm100"),
     "RmsNormRhtAmaxSm100": (".rmsnorm_rht_amax", "RmsNormRhtAmaxSm100"),
     "rmsnorm_rht_amax_wrapper_sm100": (".rmsnorm_rht_amax", "rmsnorm_rht_amax_wrapper_sm100"),
     "grouped_gemm": (".gemm.cutedsl.grouped", None),
     "GroupedGemmSm100": (".gemm.cutedsl.grouped", "GroupedGemmSm100"),
     "grouped_gemm_wrapper_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_wrapper_sm100"),
+    "grouped_gemm_jax_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_jax_sm100"),
+    "grouped_gemm_glu_jax_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_glu_jax_sm100"),
+    "grouped_gemm_dglu_jax_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_dglu_jax_sm100"),
+    "grouped_gemm_dsrelu_jax_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_dsrelu_jax_sm100"),
+    "grouped_gemm_wgrad_jax_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_wgrad_jax_sm100"),
+    "discrete_grouped_gemm_swiglu_jax_sm100": (".gemm.cutedsl.discrete_grouped", "discrete_grouped_gemm_swiglu_jax_sm100"),
+    "discrete_grouped_gemm_dswiglu_jax_sm100": (".gemm.cutedsl.discrete_grouped", "discrete_grouped_gemm_dswiglu_jax_sm100"),
     "GroupedGemmSwigluSm100": (".gemm.cutedsl.grouped", "GroupedGemmSwigluSm100"),
     "grouped_gemm_swiglu_wrapper_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_swiglu_wrapper_sm100"),
     "GroupedGemmDswigluSm100": (".gemm.cutedsl.grouped", "GroupedGemmDswigluSm100"),
@@ -401,10 +411,18 @@ def __getattr__(name: str) -> Any:
         globals()["experimental"] = _experimental
         return _experimental
 
+    if name == "jax":
+        # `import cudnn; cudnn.jax.call` works like `import cudnn.jax`.
+        # Deferred so torch-only users never pay the jax import (the submodule
+        # itself raises a descriptive ImportError when jax >= 0.5 is missing).
+        _jax = importlib.import_module(".jax", __name__)
+        globals()["jax"] = _jax
+        return _jax
+
     if name in _LAZY_OPTIONAL_IMPORTS:
         return _load_optional_symbol(name)
 
-    raise AttributeError(name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def __dir__():

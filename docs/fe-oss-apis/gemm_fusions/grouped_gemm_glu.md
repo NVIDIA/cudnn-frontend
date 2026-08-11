@@ -2,6 +2,12 @@
 
 **This is an experimental API and subject to change.**
 
+## JAX support
+
+Supports **JAX arrays** on the BF16 backend in discrete weight mode (swiglu and geglu): `b_ptrs` as a packed little-endian uint8 pointer array (8 bytes per pointer; int64 accepted with jax x64 mode), outputs allocated as n-major C-contiguous `jnp` arrays. Dense `b_tensor` (expert-outermost strides), column-major `bias_tensor`, and the block-scaled backend (MMA-interleaved scale-factor layouts) are not expressible as JAX arrays and raise clear errors. The wrapper is eager, on the CUDA legacy default stream: `block_until_ready` inputs, synchronize before reading outputs; keep weight arrays alive until the kernel completes.
+
+For jitted JAX programs use the `jax.jit`-compatible XLA custom-call entry point `grouped_gemm_glu_jax_sm100` (built on `cudnn.jax.call`; discrete mode, no bias, `b_major="k"`): outputs are fresh XLA-managed arrays with rows at/past `padded_offsets[-1]` zero-filled, no manual synchronization needed. `linear_offset` is a compile-time constant (each distinct value compiles a new specialization). Under tracing the `padded_offsets` *values* cannot be host-validated, and the per-expert weight buffers behind `b_ptrs` must stay alive and unmoved across every execution of the traced computation.
+
 ## Overview
 
 **Unified Grouped GEMM + GLU fusion**: one public class and wrapper select a

@@ -2,7 +2,11 @@
 
 **FE-OSS APIs are experimental and subject to change.**
 
-The GEMM CuTeDSL APIs are type-erased and torch-lazy: torch is imported only when torch tensors are passed. The dense GEMM fusions (amax, swiglu, srelu, dsrelu) additionally accept JAX arrays (see `gemm_amax.md` "Using JAX arrays" for the JAX contract), with `jax.jit`-compatible XLA custom-call entry points for amax and swiglu; the grouped / discrete-grouped / proj_rope APIs currently support torch tensors only and reject other frameworks with a clear error.
+The GEMM CuTeDSL APIs are type-erased and torch-lazy: torch is imported only when torch tensors are passed. JAX arrays are additionally accepted wherever the kernel's tensor layouts are expressible as row-major arrays (each API's page has a "JAX support" section with its exact contract):
+
+- **Dense fusions** (amax, swiglu, srelu, dsrelu): full JAX eager support, plus `jax.jit`-compatible XLA custom-call entry points for all four (built on `cudnn.jax.call` / CuTeDSL's native `cutlass.jax` bridge; see `gemm_amax.md` "Using JAX arrays").
+- **Grouped / discrete-grouped**: JAX eager support in discrete (pointer-array) weight modes — unfused grouped GEMM, glu/dglu (BF16), dsrelu (FP8), wgrad (BF16), and discrete-grouped swiglu/dswiglu (FP8) — plus a `jax.jit`-compatible `*_jax_sm100` entry point for each of those same families (built on `cudnn.jax.call`; each API page documents its exact jit contract). Dense weight mode, column-major bias layouts, and kernels whose scale factors are MMA-permuted tensor arguments (grouped swiglu/srelu/quant/dswiglu, glu_hadamard, block-scaled glu/dglu/wgrad backends) reject JAX with clear errors.
+- **proj_rope_mxfp8**: JAX eager support on both input paths with `w_out_in=True` (the transposed [in, out] weight view is torch-only), plus the `jax.jit`-compatible `gemm_proj_rope_mxfp8_jax_sm100` entry point.
 
 This folder documents the Python FE APIs implemented under `python/cudnn`. For details on currently implemented operations, see:
 - [GEMM + Amax](gemm_fusions/gemm_amax.md)
@@ -38,6 +42,13 @@ All Frontend OSS APIs come installed with the `nvidia-cudnn-frontend` package. H
 ```bash
 pip install nvidia-cudnn-frontend[cutedsl]
 ```
+
+The `cutedsl` extra is framework-neutral (nvidia-cutlass-dsl, cuda-python, apache-tvm-ffi). Install your tensor framework separately — from a checkout, the PEP 735 dependency groups pin the right companion packages:
+```bash
+pip install --group torch   # torch + torch-c-dlpack-ext
+pip install --group jax     # jax >= 0.5 (XLA entry points via cutlass.jax, shipped with nvidia-cutlass-dsl)
+```
+(For the published wheel, `pip install torch torch-c-dlpack-ext` or `pip install "jax>=0.5"` directly.)
 
 After installation, you can import the APIs directly from the `cudnn` package, i.e. `from cudnn import {your_operation}`
 

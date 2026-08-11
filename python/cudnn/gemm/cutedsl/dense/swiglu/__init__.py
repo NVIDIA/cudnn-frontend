@@ -14,7 +14,7 @@ __all__ = [
 
 
 def __getattr__(name):
-    # Lazy: the jax entry point imports jax/jax_tvm_ffi, which must not be pulled in
+    # Lazy: the jax entry point imports jax/cutlass.jax, which must not be pulled in
     # for torch-only users.
     if name == "gemm_swiglu_jax_sm100":
         from .jax_api import gemm_swiglu_jax_sm100

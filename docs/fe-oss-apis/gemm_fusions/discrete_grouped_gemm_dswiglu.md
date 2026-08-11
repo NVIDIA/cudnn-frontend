@@ -2,6 +2,12 @@
 
 **This is an experimental API and subject to change.**
 
+## JAX support
+
+Supports **JAX arrays** in FP8 configurations: b_ptrs/sfb_ptrs as packed-uint8 (or x64 int64) pointer arrays, SFA in the physical C-contiguous atom shape, SFD outputs allocated the same way (the kernel rebuilds all SF layouts from the GEMM shapes and reads only base pointers). Packed-fp4 inputs are not expressible as JAX arrays and raise clear errors. The wrapper is eager, on the CUDA legacy default stream: `block_until_ready` inputs, synchronize before reading outputs; keep weight arrays alive until the kernel completes.
+
+For jitted JAX programs use the `jax.jit`-compatible XLA custom-call entry point `discrete_grouped_gemm_dswiglu_jax_sm100` (built on `cudnn.jax.call`; k-major weights only): all outputs (d_row/d_col, SFD tensors, amax, `dprob` as a bridge-managed zero-initialized accumulator, optional `dbias`) are XLA-managed donated buffers — no manual synchronization. Under tracing the offsets *values* cannot be host-validated, and the weight/scale buffers behind the pointer arrays must stay alive and unmoved across every execution of the traced computation.
+
 ## Overview
 
 **Discrete Grouped GEMM + dGLU backward fusion**: A block-scaled grouped GEMM fused with a dSwiGLU/dGeGLU backward epilogue on NVIDIA Blackwell GPUs (SM100+), designed for MoE workloads where each expert weight/scale lives in a separate allocation.

@@ -137,3 +137,47 @@ def test_gemm_srelu_dsrelu_jax_errors():
 
     with pytest.raises(ValueError, match="Unsupported tensor framework"):
         cudnn.gemm_srelu_wrapper_sm100(a_np, b_np, sfa_np, sfb_np, prob_np, sf_vec_size=32)
+
+
+@pytest.mark.L0
+def test_gemm_srelu_dsrelu_jax_jit_matches_eager():
+    """The XLA custom-call entry points must agree bit-for-bit with the eager wrappers."""
+    skip_unless_sm100()
+    import cudnn
+    from cudnn import gemm_dsrelu_jax_sm100, gemm_srelu_jax_sm100
+
+    m, n, k, l = 256, 256, 512, 1
+    sf_vec_size = 32
+    rng = np.random.default_rng(3)
+    a_np, b_np, sfa_np, sfb_np, prob_np = make_inputs(m, n, k, l, sf_vec_size, rng)
+
+    a_j, b_j, sfa_j, sfb_j, prob_j = (jnp.asarray(x) for x in (a_np, b_np, sfa_np, sfb_np, prob_np))
+    jax.block_until_ready((a_j, b_j, sfa_j, sfb_j, prob_j))
+
+    eager = cudnn.gemm_srelu_wrapper_sm100(
+        a_tensor=a_j, b_tensor=b_j, sfa_tensor=sfa_j, sfb_tensor=sfb_j, prob_tensor=prob_j, c_dtype="bfloat16", d_dtype="bfloat16", sf_vec_size=sf_vec_size
+    )
+    device_sync()
+
+    jitted = jax.jit(lambda a, b, sfa, sfb, prob: gemm_srelu_jax_sm100(a, b, sfa, sfb, prob, c_dtype="bfloat16", d_dtype="bfloat16", sf_vec_size=sf_vec_size))
+    for _ in range(2):  # repeat: donation safety
+        c_jit, d_jit = jitted(a_j, b_j, sfa_j, sfb_j, prob_j)
+        jax.block_until_ready((c_jit, d_jit))  # XLA-stream ordered; no manual sync needed
+        np.testing.assert_array_equal(np.asarray(c_jit).view(np.uint8), np.asarray(eager["c_tensor"]).view(np.uint8))
+        np.testing.assert_array_equal(np.asarray(d_jit).view(np.uint8), np.asarray(eager["d_tensor"]).view(np.uint8))
+
+    # backward
+    c_in_np = rng.standard_normal((m, n, l), dtype=np.float32).astype(ml_dtypes.bfloat16)
+    c_in_j = jnp.asarray(c_in_np)
+    jax.block_until_ready(c_in_j)
+    eager_b = cudnn.gemm_dsrelu_wrapper_sm100(
+        a_tensor=a_j, b_tensor=b_j, c_tensor=c_in_j, sfa_tensor=sfa_j, sfb_tensor=sfb_j, prob_tensor=prob_j, d_dtype="bfloat16", sf_vec_size=sf_vec_size
+    )
+    device_sync()
+
+    jitted_b = jax.jit(lambda a, b, c, sfa, sfb, prob: gemm_dsrelu_jax_sm100(a, b, c, sfa, sfb, prob, d_dtype="bfloat16", sf_vec_size=sf_vec_size))
+    d_jit, dprob_jit = jitted_b(a_j, b_j, c_in_j, sfa_j, sfb_j, prob_j)
+    jax.block_until_ready((d_jit, dprob_jit))
+    np.testing.assert_array_equal(np.asarray(d_jit).view(np.uint8), np.asarray(eager_b["d_tensor"]).view(np.uint8))
+    # dprob accumulates via FP32 atomic adds (ordering-nondeterministic): tight tolerance
+    np.testing.assert_allclose(np.asarray(dprob_jit), np.asarray(eager_b["dprob_tensor"]), rtol=1e-5, atol=1e-5)

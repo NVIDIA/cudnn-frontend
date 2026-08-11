@@ -62,11 +62,11 @@ cutedsl = [
     # their own constraints. The engines check the version at support time and
     # decline when it is too old, so an older DSL costs those engines and
     # nothing else. See CUTEDSL_MIN_VERSION in cudnn/frost/buffers.py.
+    # Framework-neutral core only: the CuTeDSL APIs are type-erased, so torch (like
+    # jax) is opt-in via the [dependency-groups] below (`pip install --group torch`).
     "nvidia-cutlass-dsl[cu13]>=4.5.0",
     "cuda-python",
-    "torch",
     "apache-tvm-ffi>=0.1.11",
-    "torch-c-dlpack-ext",
 ]
 
 [dependency-groups]
@@ -88,11 +88,11 @@ torch = [
     "torch",
     "torch-c-dlpack-ext",
 ]
-# jax-tvm-ffi provides the jax.jit-compatible XLA custom-call entry points
-# (e.g. gemm_amax_jax_sm100) and requires Python >= 3.11.
+# The jax.jit-compatible XLA custom-call entry points (cudnn.jax, e.g.
+# gemm_amax_jax_sm100) build on the CuTeDSL JAX extensions (cutlass.jax,
+# shipped with nvidia-cutlass-dsl), which require jax >= 0.5.
 jax = [
-    "jax>=0.4.35",
-    "jax-tvm-ffi>=0.1.3",
+    "jax>=0.5",
 ]
 
 [build-system]

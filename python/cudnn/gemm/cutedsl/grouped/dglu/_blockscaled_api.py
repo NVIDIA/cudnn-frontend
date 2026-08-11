@@ -184,6 +184,13 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
         :param glu_clamp_min: Compile-time dGeGLU lower clamp. Ignored when
             ``act_func == "dswiglu"``.
         """
+        from cudnn.tensor_adapter import detect_framework
+
+        if sample_a is not None and detect_framework(sample_a) != "torch":
+            raise ValueError(
+                "GroupedGemmDgluBlockScaledAPI supports torch tensors only: the block-scaled "
+                "scale-factor tensors use an MMA-interleaved layout that is not expressible as JAX arrays"
+            )
         import torch
 
         if acc_dtype is None:
