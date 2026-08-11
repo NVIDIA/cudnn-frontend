@@ -163,7 +163,7 @@ def test_deviceless_deserialize():
         compute_data_type=cudnn.data_type.FLOAT,
         device_property=dp_wrong,
     )
-    with pytest.raises(Exception):
+    with pytest.raises((cudnn.cudnnGraphNotSupportedError, RuntimeError)):
         graph_wrong.deserialize(blob)
 
     # ── sub-test 2: correct devprop → deserialize + execute ─────────────────

@@ -331,8 +331,8 @@ class ExecutionPlanBuilder_v8 {
      *
      * When device properties are set and a handle is not, loadFromJson() will use
      * CUDNN_ATTR_EXECUTION_PLAN_DEVICEPROP instead of CUDNN_ATTR_EXECUTION_PLAN_HANDLE.
-     * Device properties take precedence when both are set; the handle-only path is
-     * byte-identical otherwise. Requires cuDNN >= 9.8 at both compile and runtime.
+     * Device properties are used only when a handle is not set. Requires cuDNN >= 9.8
+     * at both compile and runtime.
      */
     auto
     setDeviceProperties(std::shared_ptr<const DeviceProperties> device_properties_) -> ExecutionPlanBuilder_v8 & {
@@ -500,7 +500,7 @@ class ExecutionPlanBuilder_v8 {
         }
 
 #if (CUDNN_VERSION >= 90800)
-        if (device_properties != nullptr) {
+        if (device_properties != nullptr && m_execution_plan.handle == nullptr) {
             if (detail::get_backend_version() < 90800) {
                 set_error_and_throw_exception(
                     &m_execution_plan,

@@ -29,8 +29,9 @@ REQUIRE(graph_deser->deserialize(data_graph).is_good());
 
 // 2. Create a handle only when executing.
 cudnnHandle_t handle;
-cudnnCreate(&handle);
+REQUIRE(cudnnCreate(&handle) == CUDNN_STATUS_SUCCESS);
 REQUIRE(graph_deser->execute(handle, variant_pack, workspace).is_good());
+cudnnDestroy(handle);
 ```
 
 The `deserialize(blob)` overload (no handle) is available since cuDNN 9.8 at the API level.
