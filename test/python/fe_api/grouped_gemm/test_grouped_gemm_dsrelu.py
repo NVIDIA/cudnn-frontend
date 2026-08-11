@@ -506,21 +506,10 @@ def _assert_dprob_deterministic(case, baseline, deterministic, relaunch, ref_inp
 
     # 2. Reordering a float sum must not change what is being summed: a partial dropped by a
     # gap in the per-subtile slots, or double-counted by a second writer to an N-tile slot,
-    # would show up here and nowhere else.
-    #
-    # The two modes sum the same n terms in a different order, so the gap between them is
-    # reordering error and nothing else. Summing n floats in a different order moves the
-    # result by at most (n-1) * u, u = 2**-24 being the fp32 unit roundoff; take 4x that as
-    # the bound so the test is not tuned to the exact schedule. Derived from n rather than
-    # hardcoded because n is settable (--grouped-gemm-nkl), and a fixed tolerance would
-    # false-fail on a wider problem.
-    #
-    # atol is separate because rtol alone is meaningless for an entry that cancelled to near
-    # zero: its absolute error is bounded by the size of the summands, not of the result. So
-    # scale atol by the largest dprob, with a floor of 1 for an all-tiny tensor.
-    reorder_rtol = 4 * (cfg["n"] - 1) * 2**-24
-    scale = baseline["dprob_tensor"].abs().max().item()
-    torch.testing.assert_close(deterministic["dprob_tensor"], baseline["dprob_tensor"], rtol=reorder_rtol, atol=reorder_rtol * max(scale, 1.0))
+    # would show up here and nowhere else. The tolerance is not delicate -- both modes sum
+    # the same terms, so the honest difference is fp32 reordering (~1e-5 here), while a
+    # dropped or duplicated partial moves dprob by tens of percent.
+    torch.testing.assert_close(deterministic["dprob_tensor"], baseline["dprob_tensor"], rtol=1e-4, atol=1e-4)
 
     # dprob is the only output the flag touches; dA and friends are single-write per element
     # and must come back untouched. d_col only joins that list when the fp8 scale-factor path
