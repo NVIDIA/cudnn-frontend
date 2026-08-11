@@ -379,24 +379,28 @@ class SdpaFwdDsl(APIBase):
         return st, st == (h * d, d, 1)
 
     def _thd_check_strides_native(self) -> None:
-        """Reject THD stride declarations the f16 kernels cannot address
-        natively: TMA's 16-byte global-stride rule at 2 bytes/elem — the head
-        dim must be innermost-contiguous (elem stride 1) and the token/head
-        strides multiples of 8 elements (which also keeps every per-sequence
-        ragged base 16-byte aligned). Whole-token gaps always qualify for
-        supported head dims; sub-token gaps only in multiples of 8 elements.
-        The strides must also COVER the tensor (head >= d, token >= h*head):
-        an overlapping declaration would alias distinct O rows onto the same
-        storage (a write race) and is outside the kernels' addressing
-        contract."""
+        """Reject THD stride declarations the kernels cannot address
+        natively: TMA's 16-byte global-stride rule — the head dim must be
+        innermost-contiguous (elem stride 1) and the token/head strides
+        multiples of ``16 // itemsize`` elements (which also keeps every
+        per-sequence ragged base 16-byte aligned). Whole-token gaps always
+        qualify for supported head dims; sub-token gaps only in 16-byte
+        multiples. The strides must also COVER the tensor (head >= d,
+        token >= h*head): an overlapping declaration would alias distinct O
+        rows onto the same storage (a write race) and is outside the
+        kernels' addressing contract."""
         for desc in (self.q_desc, self.k_desc, self.v_desc, self.o_desc):
             (ts, hs, es), _ = self._thd_declared(desc)
             h, d = desc.shape[1], desc.shape[3]
+            # The 16-byte TMA rule in this tensor's OWN element units: 8 at
+            # 2 B/elem (f16/bf16), 16 at 1 B/elem (fp8), 4 at 4 B/elem.
+            quantum = 16 // desc.dtype.itemsize
             self._not_implemented_error_if(
-                es != 1 or ts % 8 != 0 or hs % 8 != 0 or hs < d or ts < h * hs,
+                es != 1 or ts % quantum != 0 or hs % quantum != 0 or hs < d or ts < h * hs,
                 f"{desc.name} THD strides {tuple(desc.stride)} are not TMA-expressible "
-                f"(head dim must be innermost-contiguous, token/head strides 16-byte "
-                f"multiples, and non-overlapping: head stride >= {d}, token stride >= heads * head stride)",
+                f"(head dim must be innermost-contiguous, token/head strides 16-byte — "
+                f"{quantum}-element — multiples, and non-overlapping: head stride >= {d}, "
+                f"token stride >= heads * head stride)",
             )
 
     def _thd_check_strides_packed(self) -> None:
