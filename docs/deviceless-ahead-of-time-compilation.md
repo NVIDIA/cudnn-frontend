@@ -5,8 +5,8 @@ Since cuDNN 9.8, customers are allowed to create and finalize an execution plan 
 
 Typical workflow:
 - Create a device property descriptor from the device, serialize it out. This requires the device.
-- Deserialize the device property, create an execution plan from it as well as the computation graph, serialize the plan out. This doesn't require a cuDNN handle.
-- Deserialize and execute the execution plan on devices with the same properties. Execution requires a cuDNN handle (and a compatible GPU). See the notes below on what "deviceless" means in each phase.
+- Deserialize the device property, create an execution plan from it as well as the computation graph, serialize the plan out. This doesn't require the device.
+- Deserialize and execute the execution plan on devices with the same properties. This requires the device.
 
 Refer to the corresponding C++ sample in [samples/cpp/misc/deviceless_aot_compilation.cpp](https://github.com/NVIDIA/cudnn-frontend/tree/main/samples/cpp/misc/deviceless_aot_compilation.cpp).
 
@@ -15,10 +15,9 @@ Refer to the corresponding C++ sample in [samples/cpp/misc/deviceless_aot_compil
 | Phase | What is needed |
 |---|---|
 | Plan deserialization (`Graph::deserialize(blob)`) | A `DeviceProperties` descriptor — no cuDNN handle required. |
-| RTC rehydration (plans carrying a runtime-compiled cubin) | A compatible GPU / CUDA environment (the cubin must be loaded into device memory). No handle needed, but the device must be present. |
 | Execution (`Graph::execute(handle, ...)`) | A cuDNN handle and a compatible device. |
 
-One shared, read-only `DeviceProperties` descriptor can be passed concurrently to `deserialize` from multiple threads, enabling efficient parallel rehydration of cached plans without creating per-thread cuDNN handles. (Each `deserialize` produces an independent `Graph` object; they do not share mutable state.)
+One shared, read-only `DeviceProperties` descriptor can be passed concurrently to `deserialize` from multiple threads, enabling efficient parallel deserialization of cached plans without creating per-thread cuDNN handles. (Each `deserialize` produces an independent `Graph` object; they do not share mutable state.)
 
 ### C++ API
 
@@ -36,10 +35,6 @@ REQUIRE(graph_deser->execute(handle, variant_pack, workspace).is_good());
 
 The `deserialize(blob)` overload (no handle) is available since cuDNN 9.8 at the API level.
 Runtime test coverage follows the existing deviceless sample policy and gates at 9.11.
-
-Note: the overload accepts `std::vector<uint8_t>` specifically. Passing `std::vector<char>`,
-`std::string`, or a string literal converts via nlohmann's implicit constructor and enters the
-structural-graph `deserialize(json)` overload instead.
 
 ### Python API
 
@@ -63,7 +58,7 @@ graph_deser.execute({X: x_gpu, W: w_gpu, Y: y_gpu}, workspace, handle=handle)
 ```
 
 ## cuDNN Device Properties
-cuDNN device property descriptor describes the properties of a GPU device, is serializable and can be used to query cuDNN heuristics / create an execution plan directly without a cuDNN handle being available.
+cuDNN device property descriptor describes the properties of a GPU device, is serializable and can be used to query cuDNN heuristics / create an execution plan directly without the device to be available.
 
 The API to create a device property descriptor is:
 ```cpp
@@ -77,7 +72,7 @@ set_device_id(int32_t device_id);  // initialize from a specific device
 deserialize(const std::vector<uint8_t>& serialized_buf);  // deserialize from json
 ```
 
-The API to set a device property descriptor on a graph is:
+The API to set a device property descriptor is:
 ```cpp
 graph.set_device_properties(device_prop)
 ```

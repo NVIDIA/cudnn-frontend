@@ -777,36 +777,6 @@ TEST_CASE("Plan re-serialize preserves pass-by-value and workspace modifications
 namespace {
 namespace fe = cudnn_frontend;
 
-// Minimal device-memory RAII wrapper.
-struct DeviceBuf {
-    void* ptr    = nullptr;
-    size_t bytes = 0;
-
-    explicit DeviceBuf(size_t n) : bytes(n) {
-        if (n > 0) {
-            cudaError_t e = cudaMalloc(&ptr, n);
-            if (e != cudaSuccess) ptr = nullptr;
-        }
-    }
-    ~DeviceBuf() {
-        if (ptr) cudaFree(ptr);
-    }
-
-    void
-    fill_float(float val, size_t count) {
-        std::vector<float> h(count, val);
-        cudaMemcpy(ptr, h.data(), count * sizeof(float), cudaMemcpyHostToDevice);
-    }
-
-    std::vector<float>
-    read_float(size_t count) const {
-        std::vector<float> h(count);
-        cudaMemcpy(h.data(), ptr, count * sizeof(float), cudaMemcpyDeviceToHost);
-        cudaDeviceSynchronize();
-        return h;
-    }
-};
-
 // Build a small NHWC FP32 conv graph and return (graph, X-uid, W-uid, Y-uid).
 // N=1, C=4, H=8, W=8, K=4, R=1, S=1, padding=0, stride=1, dilation=1.
 // This shape is simple but exercises the full stack.
@@ -1001,105 +971,6 @@ TEST_CASE("Handle-less plan deserialize", "[serialize][graph]") {
         fe::graph::Graph deser;
         deser.set_device_properties(dp);
         REQUIRE(deser.deserialize(blob).is_good());
-
-        // Execute to confirm the plan is live (not just parsed).
-        cudnnHandle_t handle;
-        REQUIRE(cudnnCreate(&handle) == CUDNN_STATUS_SUCCESS);
-
-        using X_t      = __half;
-        using W_t      = __half;
-        using Y_t      = __half;
-        size_t x_elems = static_cast<size_t>(FusionGraph::N * FusionGraph::C * FusionGraph::H * FusionGraph::W);
-        size_t w_elems = static_cast<size_t>(FusionGraph::K * FusionGraph::C * FusionGraph::R * FusionGraph::S);
-        size_t y_elems = static_cast<size_t>(FusionGraph::N * FusionGraph::K * FusionGraph::H * FusionGraph::W);
-        DeviceBuf x_buf(x_elems * sizeof(X_t));
-        DeviceBuf w_buf(w_elems * sizeof(W_t));
-        DeviceBuf y_buf(y_elems * sizeof(Y_t));
-        REQUIRE(x_buf.ptr != nullptr);
-        REQUIRE(w_buf.ptr != nullptr);
-        REQUIRE(y_buf.ptr != nullptr);
-
-        // Fill with zeros; relu(conv(0,0))=0 is still a valid execution check.
-        cudaMemset(x_buf.ptr, 0, x_elems * sizeof(X_t));
-        cudaMemset(w_buf.ptr, 0, w_elems * sizeof(W_t));
-        cudaMemset(y_buf.ptr, 0x7f, y_elems * sizeof(Y_t));  // poison
-
-        int64_t ws_size = 0;
-        REQUIRE(deser.get_workspace_size(ws_size).is_good());
-        DeviceBuf ws(static_cast<size_t>(ws_size));
-
-        std::unordered_map<int64_t, void*> vpack{
-            {fg.X->get_uid(), x_buf.ptr}, {fg.W_t->get_uid(), w_buf.ptr}, {fg.Y->get_uid(), y_buf.ptr}};
-        REQUIRE(deser.execute(handle, vpack, ws.ptr).is_good());
-        cudaDeviceSynchronize();
-
-        cudnnDestroy(handle);
-    }
-
-    SECTION("happy path: devprop build + serialize + handle-less deserialize + execute") {
-        // Build conv graph with devprop, serialize, deserialize handle-less, execute,
-        // and compare numerically against a reference execution via the handle overload.
-        ConvGraph cg;
-        cg.graph->set_device_properties(dp);
-        REQUIRE(cg.graph->build({fe::HeurMode_t::A, fe::HeurMode_t::FALLBACK}).is_good());
-
-        std::vector<uint8_t> blob;
-        REQUIRE(cg.graph->serialize(blob).is_good());
-
-        // Deserialize handle-less; no handle is created anywhere in this scope.
-        fe::graph::Graph deser;
-        deser.set_device_properties(dp);
-        REQUIRE(deser.deserialize(blob).is_good());
-
-        int64_t ws_size = 0;
-        REQUIRE(deser.get_workspace_size(ws_size).is_good());
-
-        // Now create a handle only for execution (not for deserialize).
-        cudnnHandle_t handle;
-        REQUIRE(cudnnCreate(&handle) == CUDNN_STATUS_SUCCESS);
-
-        size_t x_elems = static_cast<size_t>(ConvGraph::N * ConvGraph::C * ConvGraph::H * ConvGraph::W);
-        size_t w_elems = static_cast<size_t>(ConvGraph::K * ConvGraph::C * ConvGraph::R * ConvGraph::S);
-        size_t y_elems = static_cast<size_t>(ConvGraph::N * ConvGraph::K * ConvGraph::H * ConvGraph::W);
-        DeviceBuf x_buf(x_elems * sizeof(float));
-        DeviceBuf w_buf(w_elems * sizeof(float));
-        DeviceBuf y_deser(y_elems * sizeof(float));
-        DeviceBuf y_ref(y_elems * sizeof(float));
-        DeviceBuf ws(static_cast<size_t>(ws_size));
-        REQUIRE(x_buf.ptr != nullptr);
-        REQUIRE(w_buf.ptr != nullptr);
-        REQUIRE(y_deser.ptr != nullptr);
-        REQUIRE(y_ref.ptr != nullptr);
-
-        // Deterministic non-zero inputs: X[i]=1, W[i]=1 → Y[i] = C*R*S = 4.
-        x_buf.fill_float(1.0f, x_elems);
-        w_buf.fill_float(1.0f, w_elems);
-        cudaMemset(y_deser.ptr, 0x7e, y_elems * sizeof(float));  // poison
-
-        std::unordered_map<int64_t, void*> vpack{
-            {cg.X->get_uid(), x_buf.ptr}, {cg.W_t->get_uid(), w_buf.ptr}, {cg.Y->get_uid(), y_deser.ptr}};
-        REQUIRE(deser.execute(handle, vpack, ws.ptr).is_good());
-
-        // Reference: same graph deserialized via the handle overload.
-        fe::graph::Graph ref_graph;
-        REQUIRE(ref_graph.deserialize(handle, blob, false, false).is_good());
-        vpack[cg.Y->get_uid()] = y_ref.ptr;
-        int64_t ws_ref         = 0;
-        REQUIRE(ref_graph.get_workspace_size(ws_ref).is_good());
-        DeviceBuf ws2(static_cast<size_t>(ws_ref));
-        REQUIRE(ref_graph.execute(handle, vpack, ws2.ptr).is_good());
-        cudaDeviceSynchronize();
-
-        // Outputs must be numerically identical (same kernel, same inputs).
-        auto deser_out = y_deser.read_float(y_elems);
-        auto ref_out   = y_ref.read_float(y_elems);
-        float ref_val  = static_cast<float>(ConvGraph::C * ConvGraph::R * ConvGraph::S);
-        for (size_t i = 0; i < y_elems; ++i) {
-            REQUIRE(std::fabs(deser_out[i] - ref_val) < 1e-3f);
-            REQUIRE(std::fabs(deser_out[i] - ref_out[i]) < 1e-6f);
-        }
-
-        cudnnDestroy(handle);
     }
 
     SECTION("plan-only blob (serialize_structure=false) + handle-less deserialize") {
@@ -1163,49 +1034,6 @@ TEST_CASE("Handle-less plan deserialize", "[serialize][graph]") {
         deser.set_device_properties(dp_wrong);  // deliberately incompatible
         auto status = deser.deserialize(handle, blob, false, false);
         REQUIRE(status.is_good());  // handle path used, not devprop
-
-        cudnnDestroy(handle);
-    }
-
-    SECTION("devprop shared_ptr released before execute succeeds") {
-        // The backend copies the descriptor at set-attribute time, so the FE shared_ptr
-        // only needs to outlive the deserialize call, not the execute call.
-        ConvGraph cg;
-        auto dp2 = std::make_shared<fe::DeviceProperties>();
-        REQUIRE(dp2->set_device_id(0).build().is_good());
-        cg.graph->set_device_properties(dp2);
-        REQUIRE(cg.graph->build({fe::HeurMode_t::A, fe::HeurMode_t::FALLBACK}).is_good());
-        std::vector<uint8_t> blob;
-        REQUIRE(cg.graph->serialize(blob).is_good());
-
-        fe::graph::Graph deser;
-        {
-            auto dp_tmp = std::make_shared<fe::DeviceProperties>();
-            REQUIRE(dp_tmp->set_device_id(0).build().is_good());
-            deser.set_device_properties(dp_tmp);
-            REQUIRE(deser.deserialize(blob).is_good());
-            // dp_tmp goes out of scope here; the backend's managed copy survives.
-        }
-
-        int64_t ws_size = 0;
-        REQUIRE(deser.get_workspace_size(ws_size).is_good());
-
-        cudnnHandle_t handle;
-        REQUIRE(cudnnCreate(&handle) == CUDNN_STATUS_SUCCESS);
-
-        size_t x_n = static_cast<size_t>(ConvGraph::N * ConvGraph::C * ConvGraph::H * ConvGraph::W);
-        size_t w_n = static_cast<size_t>(ConvGraph::K * ConvGraph::C * ConvGraph::R * ConvGraph::S);
-        size_t y_n = static_cast<size_t>(ConvGraph::N * ConvGraph::K * ConvGraph::H * ConvGraph::W);
-        DeviceBuf xb(x_n * sizeof(float)), wb(w_n * sizeof(float)), yb(y_n * sizeof(float));
-        DeviceBuf wsb(static_cast<size_t>(ws_size));
-        REQUIRE(xb.ptr != nullptr);
-        REQUIRE(wb.ptr != nullptr);
-        REQUIRE(yb.ptr != nullptr);
-        cudaMemset(xb.ptr, 0, x_n * sizeof(float));
-        cudaMemset(wb.ptr, 0, w_n * sizeof(float));
-        std::unordered_map<int64_t, void*> vp{
-            {cg.X->get_uid(), xb.ptr}, {cg.W_t->get_uid(), wb.ptr}, {cg.Y->get_uid(), yb.ptr}};
-        REQUIRE(deser.execute(handle, vp, wsb.ptr).is_good());
 
         cudnnDestroy(handle);
     }

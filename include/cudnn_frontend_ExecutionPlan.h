@@ -509,12 +509,14 @@ class ExecutionPlanBuilder_v8 {
                     "requires cuDNN runtime >= 9.8");
                 return std::move(m_execution_plan);
             }
-            cudnnBackendDescriptor_t local = device_properties->get_ptr();
-            status                         = detail::set_attribute(m_execution_plan.pointer->get_backend_descriptor(),
-                                           CUDNN_ATTR_EXECUTION_PLAN_DEVICEPROP,
-                                           CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                           1,
-                                           &local);
+            {
+                cudnnBackendDescriptor_t local = device_properties->get_ptr();
+                status = detail::set_attribute(m_execution_plan.pointer->get_backend_descriptor(),
+                                               CUDNN_ATTR_EXECUTION_PLAN_DEVICEPROP,
+                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                               1,
+                                               &local);
+            }
             if (status != CUDNN_STATUS_SUCCESS) {
                 set_error_and_throw_exception(&m_execution_plan,
                                               status,

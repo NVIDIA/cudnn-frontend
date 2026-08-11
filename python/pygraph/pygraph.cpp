@@ -641,7 +641,7 @@ PyGraph::deserialize(std::optional<std::intptr_t> handle_, py::object const& pyo
             auto status = graph->deserialize(data, enforce_precompiled);
             throw_if(status.is_bad(), status.get_code(), status.get_message());
         } else {
-            // If handle is provided, use it (AoT compilation).
+            // Uses explicit handle if provided, otherwise falls back to the construction-time handle.
             cudnnHandle_t handle =
                 handle_.has_value() ? static_cast<cudnnHandle_t>((void*)(handle_.value())) : this->handle;
             auto status = graph->deserialize(handle, data, enforce_precompiled);
