@@ -527,6 +527,30 @@ def test_e2e_nvfp4_groups(offsets_list) -> None:
     _run_e2e(E=2, S=1024, N=256, K=512, offsets_list=offsets_list)
 
 
+@pytest.mark.parametrize(
+    "cfg_name,cta_group",
+    [
+        ("CONFIG_sm100_256x128x128_128x128x32_cluster1x1", 1),
+        ("CONFIG_sm100_256x128x128_128x128x32_cluster2x1", 2),
+    ],
+)
+@requires_sm100
+def test_e2e_split_m_tile(cfg_name, cta_group) -> None:
+    """CTA tile spanning two MMA instructions along M. The SF words are one per
+    128-row block, so M block mi reads SF word block mi; the per-routed-group A
+    descriptor patch and the `row < group_end` guard are untouched."""
+    _run_e2e(
+        E=2,
+        S=1024,
+        N=256,
+        K=512,
+        offsets_list=[0, 256, 384, 512],
+        combo="nvfp4",
+        config_name=cfg_name,
+        cta_group=cta_group,
+    )
+
+
 @pytest.mark.parametrize("combo", ["mxfp4", "mxfp8"])
 @requires_sm100
 def test_e2e_mx_combos(combo) -> None:

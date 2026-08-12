@@ -544,6 +544,44 @@ def _run_bs_nonpacked_numeric(combo, config_name, M, N, K, mode):
             128,
             256,
         ),  # acc_stages=2
+        # CTA tile split across two MMA instructions along M (num_mma_m=2). The SF
+        # words are one per 128-row block, so an M sub-block is exactly one block.
+        (
+            "nvfp4",
+            "CONFIG_sm100_256x128x128_128x128x32_cluster1x1_1ctamma",
+            256,
+            256,
+            512,
+        ),
+        (
+            "nvfp4",
+            "CONFIG_sm100_256x128x128_128x128x32_cluster1x1_1ctamma_static",
+            256,
+            256,
+            512,
+        ),
+        (
+            "mxfp4",
+            "CONFIG_sm100_256x128x128_128x128x32_cluster1x1_1ctamma",
+            256,
+            256,
+            512,
+        ),
+        # ... and on the pair, where each CTA drains its own half of every M block.
+        (
+            "nvfp4",
+            "CONFIG_sm100_256x128x128_128x128x32_cluster2x1_2ctamma",
+            256,
+            256,
+            512,
+        ),
+        (
+            "nvfp4",
+            "CONFIG_sm100_256x128x128_128x128x32_cluster2x1_2ctamma_static",
+            256,
+            256,
+            512,
+        ),
         # mxfp4 (fp4 + e8m0 scale, block32).
         (
             "mxfp4",
@@ -1260,6 +1298,19 @@ def _pretend_sm103(monkeypatch):
 # Config catalog / geometry guards
 
 
+@requires_sm100
+def test_block_scale_sf_rule_is_on_the_instruction_tile() -> None:
+    """The SF 128x4 swizzle rule is "each MMA instruction covers whole SF blocks",
+    so it reads off mma_inst_m/n. The old cta_tile form let mma_inst_m=64 through."""
+    from cudnn.gemm.frost.tile_config import validate_block_scale_config
+
+    validate_block_scale_config(by_name("CONFIG_sm100_256x128x128_128x128x32_cluster1x1"), 16, 256)
+    with pytest.raises(NotImplementedError) as e:
+        # cta_tile_m % 128 == 0 but each instruction covers only half an SF block
+        validate_block_scale_config(by_name("CONFIG_sm100_128x128x128_64x128x32_cluster1x1"), 16, 256)
+    assert "mma_inst_m % 128" in str(e.value)
+
+
 def test_catalog_has_sm103_geometries():
     sm103 = [c for c in CATALOG if c.pipeline == "sm103"]
     # 2 cta_n × the shared 15-cluster enumeration.
@@ -1494,6 +1545,11 @@ def test_render_rejects_mxfp8(_pretend_sm103):
         ("nvfp4", "CONFIG_sm103_128x128x384_128x128x48_cluster8x1", 1),
         ("nvfp4", "CONFIG_sm103_128x128x384_128x128x48_cluster4x2", 2),
         ("nvfp4", "CONFIG_sm103_128x128x384_128x128x48_cluster16x1", 2),
+        # CTA tile split across two MMA instructions along M. Not in the sm103
+        # catalog (cta_m=128 only) — reachable by `by_name` synthesis. RENDER
+        # ONLY: no SM 10.3 part is available to check numerics.
+        ("nvfp4", "CONFIG_sm103_256x128x384_128x128x48_cluster1x1", 1),
+        ("nvfp4", "CONFIG_sm103_256x128x384_128x128x48_cluster2x1", 2),
     ],
 )
 def test_sm103_compile_smoke(_pretend_sm103, combo, config_name, cta_group):

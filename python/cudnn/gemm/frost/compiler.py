@@ -364,11 +364,16 @@ def _reduction_stride_compile_symbols(chain: FusionChain) -> str:
 
 
 def _epi_tile_cols(config: TileConfig, cta_group: int) -> int:
-    """Per-CTA epilogue drain width in accumulator columns. Mirrors the
-    templates' ``cols_per_acc_stage``: the 2-CTA-MMA cta_tile_m=64 pair splits
-    the N range across the two 64-lane halves, so each CTA drains N/2."""
+    """Per-CTA epilogue drain width in accumulator columns, for ONE MMA-M block
+    (the templates' ``epi_cols_per_mma_m``; with ``num_mma_m > 1`` the per-GEMM
+    ``cols_per_acc_stage`` is ``num_mma_m`` times this).
+
+    Under 2-CTA MMA a per-CTA ``mma_inst_m`` of 64 means cluster-MMA m=128, whose
+    2x2-DP drain splits the N range across the two 64-lane halves — so each CTA
+    drains N/2. Like the LDTM shape (foot-gun #18) this keys on the MMA
+    INSTRUCTION's M, not the CTA tile's: they agree only at num_mma_m == 1."""
     cols = config.cta_tile_n
-    if cta_group == 2 and config.cta_tile_m == 64:
+    if cta_group == 2 and config.mma_inst_m == 64:
         cols //= 2
     return cols
 
@@ -401,7 +406,12 @@ def _l2_swizzle_budget_bytes() -> int:
     return l2_swizzle_budget_bytes()
 
 
-def _render_tile_constants(cfg: TileConfig, chain: FusionChain, cta_group: int, use_tma: bool = True) -> str:
+def _render_tile_constants(
+    cfg: TileConfig,
+    chain: FusionChain,
+    cta_group: int,
+    use_tma: bool = True,
+) -> str:
     """Emit module-level tile + dtype constants for the config/chain, appended
     below the template's defaults (last assignment wins). TileConfig geometry is
     dtype-agnostic (K in bytes); resolved to element counts via the chain's A
@@ -427,16 +437,6 @@ def _render_tile_constants(cfg: TileConfig, chain: FusionChain, cta_group: int, 
     }
     if cfg.cta_tile_k_bytes not in _SWIZZLE_TABLE:
         raise ValueError(f"TileConfig {cfg.name!r}: unsupported cta_tile_k_bytes=" f"{cfg.cta_tile_k_bytes} (supported: {sorted(_SWIZZLE_TABLE)})")
-    if cfg.mma_inst_m != cfg.cta_tile_m or cfg.mma_inst_n != cfg.cta_tile_n:
-        # The templates issue ONE MMA per K-block spanning the whole CTA tile
-        # (no M/N sub-tiling loop), so a smaller MMA-inst M/N would silently
-        # compute only part of the tile.
-        raise NotImplementedError(
-            f"TileConfig {cfg.name!r}: mma_inst tile "
-            f"{cfg.mma_inst_m}x{cfg.mma_inst_n} != cta tile "
-            f"{cfg.cta_tile_m}x{cfg.cta_tile_n} — MMA-inst-smaller-than-CTA-tile "
-            f"configs are not implemented by the sm100 matmul templates"
-        )
     smem_swizzle_name, tma_swizzle_name = _SWIZZLE_TABLE[cfg.cta_tile_k_bytes]
     smem_swizzle_bytes = cfg.cta_tile_k_bytes
     smem_desc_stride_byte_offset = 8 * cfg.cta_tile_k_bytes
@@ -448,13 +448,18 @@ def _render_tile_constants(cfg: TileConfig, chain: FusionChain, cta_group: int, 
         is_mn_major: bool,
         mn_extent: int,
         operand_name: str,
+        num_mma: int = 1,
     ) -> tuple[int, int, int, int]:
         if not is_mn_major:
             return 16, smem_desc_stride_byte_offset, mma_inst_k_bytes, 1
-        if mn_extent < mn_group_elems or mn_extent % mn_group_elems != 0:
+        # Each MMA instruction's operand descriptor starts at its own MN
+        # sub-block, so an MN-major operand needs the SLICE (not just the whole
+        # SMEM extent) to be a whole number of swizzle groups.
+        mn_slice = mn_extent // num_mma
+        if mn_slice < mn_group_elems or mn_slice % mn_group_elems != 0:
             raise ValueError(
                 f"TileConfig {cfg.name!r} cannot use {operand_name}-major input: "
-                f"SMEM extent {mn_extent} is not a multiple of the "
+                f"per-MMA SMEM extent {mn_slice} is not a multiple of the "
                 f"{mn_group_elems}-element swizzle group"
             )
         group_elems = mn_group_elems
@@ -465,8 +470,13 @@ def _render_tile_constants(cfg: TileConfig, chain: FusionChain, cta_group: int, 
             group_elems,
         )
 
-    a_lbo, a_sbo, a_k_step, a_tma_group_elems = _smem_desc_params(chain.matmul.a_major == "m", cta_smem_m, "M")
+    a_lbo, a_sbo, a_k_step, a_tma_group_elems = _smem_desc_params(chain.matmul.a_major == "m", cta_smem_m, "M", cfg.num_mma_m)
     b_lbo, b_sbo, b_k_step, b_tma_group_elems = _smem_desc_params(chain.matmul.b_major == "n", cta_smem_n, "N")
+    # Byte step from one MMA sub-block to the next inside the SMEM tile. Same
+    # formula for both majors: a K-major tile is (MN x K) rows of
+    # cta_tile_k_bytes, and an MN-major tile is MN/group_elems groups of
+    # group_elems * cta_tile_k_bytes — both give cta_tile_k_bytes per MN element.
+    a_smem_m_step_bytes = (cta_smem_m // cfg.num_mma_m) * cfg.cta_tile_k_bytes
 
     lines = [
         f"# Tile config: {cfg.name}",
@@ -493,11 +503,15 @@ def _render_tile_constants(cfg: TileConfig, chain: FusionChain, cta_group: int, 
         f"a_smem_desc_leading_byte_offset = {a_lbo}",
         f"a_smem_desc_stride_byte_offset = {a_sbo}",
         f"a_smem_k_step_bytes = {a_k_step}",
+        f"a_smem_m_step_bytes = {a_smem_m_step_bytes}",
         f"a_tma_group_elems = {a_tma_group_elems}",
         f"b_smem_desc_leading_byte_offset = {b_lbo}",
         f"b_smem_desc_stride_byte_offset = {b_sbo}",
         f"b_smem_k_step_bytes = {b_k_step}",
         f"b_tma_group_elems = {b_tma_group_elems}",
+        # MMA instructions the CTA tile spans along M: the MMA warp issues that
+        # many per K-block, and the epilogue drains one M block per pass.
+        f"num_mma_m = {cfg.num_mma_m}",
         f"ab_tma_swizzle = _tma.TensorMapSwizzle.{tma_swizzle_name}",
         "",
         f"# Dtype family: A={a_dt}->MMA{mma_a_dt}, B={b_dt}->MMA{mma_b_dt}, out={out_dt} (K_BYTES={cfg.cta_tile_k_bytes})",
@@ -519,7 +533,7 @@ def _render_tile_constants(cfg: TileConfig, chain: FusionChain, cta_group: int, 
         f"cd_mmajor_atom_m = {128 // DTYPE_BYTES[out_dt]}",
     ]
     # Persistent kernel always: double-TMEM + L2 N-super-block swizzle.
-    lines.append(f"acc_stages = {cfg.acc_stages}")
+    # (acc_stages is emitted below, once the TMEM budget is known.)
     lines.append(f"tile_swizzle_n = {cfg.tile_swizzle_n}")
     lines.append(f"swizzle_l2_budget_bytes = {_l2_swizzle_budget_bytes()}")
     # Multi-GEMM (parallel matmuls sharing the epilogue). Always emitted;
@@ -532,17 +546,25 @@ def _render_tile_constants(cfg: TileConfig, chain: FusionChain, cta_group: int, 
     lines.append(f"gemm_b_idx = {tuple(b for _, b in chain.gemm_operands)}")
     total_tmem = _tmem_cols_for_arch()
     lines.append(f"num_tmem_alloc_cols = {total_tmem}")
-    if chain.is_multi_gemm:
-        cols_per_acc = cfg.cta_tile_n // 2 if (cta_group == 2 and cfg.cta_tile_m == 64) else cfg.cta_tile_n
-        region = chain.num_gemms * cols_per_acc
-        if region > total_tmem:
+    # TMEM accumulator budget. One acc stage holds, per GEMM, one region of
+    # `num_mma_m` MMA-M blocks each `_epi_tile_cols` columns wide (the N-direction
+    # MMAs subdivide that width, they do not add to it). `total_tmem == 0` means
+    # no GPU is visible (render-only / CI) — keep the config's own depth then.
+    cols_per_mma_m = _epi_tile_cols(cfg, cta_group)
+    acc_region_cols = chain.num_gemms * cfg.num_mma_m * cols_per_mma_m
+    acc_stages = cfg.acc_stages
+    if total_tmem:
+        if acc_region_cols > total_tmem:
             raise NotImplementedError(
-                f"multi-GEMM: {chain.num_gemms} GEMMs × {cols_per_acc} acc cols "
-                f"= {region} exceed {total_tmem} TMEM (single stage). "
-                f"Pick a smaller cta_tile_n or fewer GEMMs."
+                f"accumulators need {acc_region_cols} TMEM columns "
+                f"({chain.num_gemms} GEMM(s) × {cfg.num_mma_m} MMA-M block(s) × "
+                f"{cols_per_mma_m} cols) but only {total_tmem} exist even at a "
+                f"single acc stage. Pick a smaller cta_tile_n / num_mma_m or "
+                f"fewer GEMMs."
             )
-        acc_stages_mg = 2 if 2 * region <= total_tmem else 1
-        lines.append(f"acc_stages = {acc_stages_mg}  # multi-GEMM: {chain.num_gemms}×{cols_per_acc} cols/stage")
+        acc_stages = min(cfg.acc_stages, 2 if 2 * acc_region_cols <= total_tmem else 1)
+    lines.append(f"acc_stages = {acc_stages}  # {acc_region_cols} acc cols/stage")
+    if chain.is_multi_gemm:
         # ab_stages: one SMEM buffer per DISTINCT operand (num_a A + num_b B per
         # stage), not the single A+B that smem_max_ab_stages assumes.
         from .tile_config import _sm_smem_ab_budget_bytes, _AB_STAGES_CAP
@@ -550,7 +572,7 @@ def _render_tile_constants(cfg: TileConfig, chain: FusionChain, cta_group: int, 
         # Per-CTA SMEM B-tile N is halved under 2-CTA MMA (the pair splits B's N).
         smem_n = cfg.cta_tile_n // cta_group
         per_stage = (chain.num_a_operands * cfg.cta_tile_m + chain.num_b_operands * smem_n) * cfg.cta_tile_k_bytes + 2 * 8
-        fixed = 2 * acc_stages_mg * 8 + 8
+        fixed = 2 * acc_stages * 8 + 8
         avail = _sm_smem_ab_budget_bytes(cfg.pipeline) - fixed
         ab_stages_mg = min(avail // per_stage, _AB_STAGES_CAP)
         if ab_stages_mg < 1:
@@ -816,7 +838,11 @@ def _render_block_scale_tile_constants(
     insts_per_word = max(_REGISTERS_PER_ATOM // scales_per_inst, 1)
     num_sf_words = max(num_kblocks // insts_per_word, 1)  # utccp refreshes / k-tile
     _REGISTERS_PER_BLOCK = word_scales  # SF word width per block
-    sfa_tmem_cols = nb_m * _REGISTERS_PER_BLOCK  # fixed SF word width (SFA)
+    # One SF word per 128-row / 128-column block, packed back to back. SFB must
+    # stay contiguous (one instruction's SFB read extent grows with n_dim, so a
+    # single scale_b reads every N block as one span); SFA blocks each get their
+    # own scale_a at the same stride.
+    sfa_tmem_cols = nb_m * _REGISTERS_PER_BLOCK
     sfb_tmem_cols = nb_n * _REGISTERS_PER_BLOCK  # fixed SF word width (SFB)
     if is_sm103:
         num_sf_words = sf_k4
@@ -860,35 +886,42 @@ def _render_block_scale_tile_constants(
     # GEMM g occupies [g*acc_gemm_stride, (g+1)*acc_gemm_stride); stage s at
     # +s*acc_stage_stride. Single-GEMM collapses to legacy behaviour.
     num_gemms = chain.num_gemms
+    num_mma_m = cfg.num_mma_m
+    # Same per-M-block drain width the plain path uses (block-scale pins
+    # mma_inst_m to a multiple of 128, so the 2x2-DP halving never fires here).
+    epi_cols_per_mma_m = _epi_tile_cols(cfg, cta_group)
+    acc_cols_per_stage = num_mma_m * epi_cols_per_mma_m
     na, nb = chain.num_a_operands, chain.num_b_operands
     sf_total_cols = na * sfa_tmem_cols + nb * sfb_tmem_cols
     per_gemm = (total_tmem - sf_total_cols) // num_gemms
-    if per_gemm < cta_n:
+    if per_gemm < acc_cols_per_stage:
         raise NotImplementedError(
             f"block-scale {cfg.name!r}: per-GEMM TMEM budget {per_gemm} < one acc "
-            f"({cta_n}) for {num_gemms} GEMMs + SF({sf_total_cols}). "
+            f"({acc_cols_per_stage}) for {num_gemms} GEMMs + SF({sf_total_cols}). "
             f"Smaller cta_n / fewer GEMMs."
         )
     acc_overlap_cols = 0
-    if 2 * cta_n <= per_gemm:
+    if 2 * acc_cols_per_stage <= per_gemm:
         acc_stages = 2  # full per-GEMM double-buffer
     else:
         acc_stages = 1
-        gran = 32  # epilogue TMEM-load drain unit (cols)
-        ov = ((2 * cta_n - per_gemm + gran - 1) // gran) * gran
-        if ov < cta_n:  # else no room → plain 1-stage
-            acc_overlap_cols = ov
+        # the overlap drain order assumes one contiguous M block per stage
+        if num_mma_m == 1:
+            gran = 32  # epilogue TMEM-load drain unit (cols)
+            ov = ((2 * acc_cols_per_stage - per_gemm + gran - 1) // gran) * gran
+            if ov < acc_cols_per_stage:  # else no room → plain 1-stage
+                acc_overlap_cols = ov
     use_acc_overlap = acc_overlap_cols > 0
     # within-GEMM per-stage stride + per-GEMM region size:
-    acc_stage_stride = (cta_n - acc_overlap_cols) if use_acc_overlap else cta_n
+    acc_stage_stride = (acc_cols_per_stage - acc_overlap_cols) if use_acc_overlap else acc_cols_per_stage
     if acc_stages == 2:
-        acc_gemm_stride = 2 * cta_n
+        acc_gemm_stride = 2 * acc_cols_per_stage
     elif use_acc_overlap:
-        acc_gemm_stride = 2 * cta_n - acc_overlap_cols
+        acc_gemm_stride = 2 * acc_cols_per_stage - acc_overlap_cols
     else:
-        acc_gemm_stride = cta_n
+        acc_gemm_stride = acc_cols_per_stage
     acc_overlap_subtiles = acc_overlap_cols // 32
-    acc_region_cols = cta_n  # per-stage stride WITHIN a GEMM
+    acc_region_cols = acc_cols_per_stage  # per-stage stride WITHIN a GEMM
 
     sf_region_base = _align16(num_gemms * acc_gemm_stride)
     # Per-distinct-operand SF word col bases (single-GEMM → length-1 lists).
@@ -904,7 +937,7 @@ def _render_block_scale_tile_constants(
             f"block-scale {cfg.name!r}: the accumulator + SF regions need {used_cols} TMEM columns but only {num_tmem_alloc_cols} are allocated"
         )
 
-    mma_m = cta_m * cta_group
+    mma_m = cfg.mma_inst_m * cta_group
     half_m = cta_group == 2 and mma_m == 128  # unreachable while block-scale pins cta_m=128
     omma_k = mma_inst_k_elems if is_fp4 else 0
     sf_ids = [scales_per_inst * j % 4 for j in range(num_kblocks)]
@@ -928,8 +961,8 @@ def _render_block_scale_tile_constants(
         if _end > num_tmem_alloc_cols:
             raise NotImplementedError(
                 f"block-scale {cfg.name!r}: the hardware {_label} TMEM span reaches "
-                f"column {_end} but only {num_tmem_alloc_cols} are allocated "
-                f"(ISA 'Load {_label[-1]} scale factors'" + ("; SM Errata 160 means the hardware will NOT report OOR_ADDR here)" if _label == "SFB" else ")")
+                f"column {_end} but only {num_tmem_alloc_cols} are allocated"
+                + ("; an SFB overrun is NOT reported by the hardware, so this check is the only guard" if _label == "SFB" else "")
             )
 
     # --- AB SMEM pipeline depth ----------------------------------------------
@@ -984,8 +1017,10 @@ def _render_block_scale_tile_constants(
         f"cta_tile_n = {cta_n}",
         f"cta_tile_k_elems = {cta_k_elems}",
         f"cta_tile_mnk = ({cta_m}, {cta_n // cta_group}, {cta_k_elems})",
-        # MMA instruction M = cta_m × cta_group (256 for the 2-CTA pair).
-        f"mma_inst_shape_mnk = ({cta_m * cta_group}, {cta_n}, {mma_inst_k_elems})",
+        # MMA instruction M = mma_inst_m × cta_group (256 for the 2-CTA pair).
+        f"mma_inst_shape_mnk = ({cfg.mma_inst_m * cta_group}, {cfg.mma_inst_n}, {mma_inst_k_elems})",
+        # MMA instructions the CTA tile spans along M.
+        f"num_mma_m = {cfg.num_mma_m}",
         f"cgrp_tile_mnk = ({cta_m * cfg.cgrp_size_m}, {cta_n * cfg.cgrp_size_n}, {cta_k_elems})",
         f"cgrp_tile_m = {cta_m * cfg.cgrp_size_m}",
         f"cgrp_tile_n = {cta_n * cfg.cgrp_size_n}",
@@ -1070,8 +1105,11 @@ def _render_block_scale_tile_constants(
         f"idesc_a_dtype = {idesc_a}",
         f"idesc_b_dtype = {idesc_b}",
         f"sf_scale_format = {bs.sf_scale_format}",
-        f"mma_m_dim = {cta_m * cta_group}",
-        f"mma_n_dim = {cta_n}",
+        # The idesc M/N are the INSTRUCTION's, not the CTA tile's. They agreed while
+        # one instruction covered the tile; with num_mma_m > 1 a CTA-tile M of 256 would
+        # encode the M=256 enum on a 1-CTA MMA, which does not exist -> illegal instruction.
+        f"mma_m_dim = {cfg.mma_inst_m * cta_group}",
+        f"mma_n_dim = {cfg.mma_inst_n}",
         "",
         f"# scale factors",
         f"block_size = {bs.block_size}",
@@ -1084,6 +1122,11 @@ def _render_block_scale_tile_constants(
         f"num_blocks_m = {nb_m}",
         f"num_blocks_n = {nb_n}",
         f"registers_per_block = {_REGISTERS_PER_BLOCK}",
+        f"epi_cols_per_mma_m = {epi_cols_per_mma_m}",
+        # Byte step from one MMA M sub-block to the next inside the SMEM tile.
+        # sm103 stages ONE 128-B K chunk per AB stage, not the whole K-tile, so
+        # its per-M-row width is the chunk's, not cta_tile_k_bytes.
+        f"a_smem_m_step_bytes = {(cta_m // num_mma_m) * (128 if is_sm103 else cfg.cta_tile_k_bytes)}",
         f"registers_per_atom = {_REGISTERS_PER_ATOM}",
         f"sf_atom_desc_stride = {sf_atom_desc_stride}",
         f"sf_block_desc_stride = {sf_block_desc_stride}",
@@ -2195,24 +2238,21 @@ def _check_cta_group_geometry(config: TileConfig, cta_group: int) -> None:
 def _check_mma_n_dim(chain: FusionChain, config: TileConfig, cta_group: int) -> None:
     """MMA n_dim rules that depend on the dtype / operand layout, not just geometry.
 
-    Both come from ISA table2 + the SPA model and are invisible in the geometry
-    guards; ``config.mma_inst_n`` and ``cta_tile_n`` are checked because 1ctamma
-    encodes the latter and 2ctamma the former (equal for every catalog entry).
+    Neither is visible to the geometry guards. The rule is on the MMA
+    instruction's n_dim (``mma_inst_n``); ``cta_tile_n`` is checked too because
+    it equals it (N is never split across instructions) — cheap belt-and-braces,
+    not a second rule.
     """
     ns = (("mma_inst_n", config.mma_inst_n), ("cta_tile_n", config.cta_tile_n))
 
-    # UTCIMMA is narrower than the other kinds above N=32.
+    # The int8 MMA kind is narrower than the others above N=32.
     if DTYPE_TO_MMA_KIND.get(_mma_a_dtype(chain)) == "nvvm.Tcgen05MMAKind.INT8":
         for label, n in ns:
             if n >= 40 and (n // 8) % 2 != 0:
-                raise NotImplementedError(
-                    f"int8 MMA (UTCIMMA) needs N ≤ 32 or a multiple of 16; "
-                    f'config {config.name!r} has {label}={n} (ISA: "UTCIMMA only '
-                    f'supports 16 step increments for N > 32 for non-.WS mode")'
-                )
+                raise NotImplementedError(f"int8 MMA needs N ≤ 32 or a multiple of 16; " f"config {config.name!r} has {label}={n}")
 
-    # table2's "8bit-transpose B" rows tighten N for every non-HMMA kind:
-    # 1CTA 16..256 step 16, 2CTA 32..256 step 32. B is transposed iff N-major.
+    # An 8-bit TRANSPOSED (N-major) B tightens N for every non-fp16/bf16 kind:
+    # 1CTA 16..256 step 16, 2CTA 32..256 step 32.
     bs = chain.block_scale
     b_dt = bs.b_dtype if bs is not None else chain.matmul.b_dtype
     if _dtype_bits(b_dt) == 8 and chain.matmul.b_major == "n":
@@ -2222,8 +2262,12 @@ def _check_mma_n_dim(chain: FusionChain, config: TileConfig, cta_group: int) -> 
                 raise NotImplementedError(
                     f"8-bit transposed (N-major) B needs N ≥ {step} and a multiple "
                     f"of {step} under cta_group={cta_group}; config {config.name!r} "
-                    f"has {label}={n} (ISA table2, the '8bit-transpose B = Yes' rows)"
+                    f"has {label}={n}"
                 )
+
+
+# cuTensorMapEncodeTiled caps each boxDim at 256 elements.
+_TMA_BOX_DIM_MAX = 256
 
 
 def _check_dtype_config_compat(chain: FusionChain, config: TileConfig, cta_group: int) -> None:
@@ -2240,29 +2284,41 @@ def _check_dtype_config_compat(chain: FusionChain, config: TileConfig, cta_group
             f"{config.cta_tile_k_bytes} which is not divisible by "
             f"elem_bytes={elem_bytes} for dtype {chain.matmul.a_dtype!r}."
         )
+    # The whole CTA tile is TMA-loaded in one box per operand, and
+    # cuTensorMapEncodeTiled caps every boxDim at 256. Without this the launch
+    # dies at descriptor creation with a bare cudaErrorInvalidValue.
+    smem_m, smem_n, _ = config.cta_smem_tile_mnk(elem_bytes, cta_group)
+    for label, extent in (("cta_tile_m", smem_m), ("per-CTA SMEM N", smem_n)):
+        if extent > _TMA_BOX_DIM_MAX:
+            raise NotImplementedError(
+                f"TileConfig {config.name!r}: {label}={extent} exceeds the TMA "
+                f"box_dim ceiling of {_TMA_BOX_DIM_MAX}; the CTA tile is loaded "
+                f"in one box per operand"
+            )
     mn_group_elems = config.cta_tile_k_bytes // elem_bytes
+    # Each MMA instruction's operand descriptor starts at its own MN sub-block,
+    # so the check is on the PER-MMA slice (== the whole extent at num_mma == 1).
     if chain.matmul.a_major == "m":
-        if config.cta_tile_m < mn_group_elems:
+        slice_m = config.cta_tile_m // config.num_mma_m
+        if slice_m < mn_group_elems:
             raise ValueError(
                 f"TileConfig {config.name!r} cannot use M-major A for "
-                f"dtype={chain.matmul.a_dtype!r}: cta_tile_m={config.cta_tile_m} "
+                f"dtype={chain.matmul.a_dtype!r}: per-MMA M={slice_m} "
                 f"is smaller than the {mn_group_elems}-element swizzle group"
             )
-        if config.cta_tile_m % mn_group_elems != 0:
-            raise ValueError(
-                f"TileConfig {config.name!r} cannot use M-major A: " f"cta_tile_m={config.cta_tile_m} is not divisible by " f"swizzle group {mn_group_elems}"
-            )
+        if slice_m % mn_group_elems != 0:
+            raise ValueError(f"TileConfig {config.name!r} cannot use M-major A: " f"per-MMA M={slice_m} is not divisible by " f"swizzle group {mn_group_elems}")
     if chain.matmul.b_major == "n":
-        smem_n = config.cta_smem_tile_mnk(elem_bytes, cta_group)[1]
-        if smem_n < mn_group_elems:
+        slice_n = config.cta_smem_tile_mnk(elem_bytes, cta_group)[1]
+        if slice_n < mn_group_elems:
             raise ValueError(
                 f"TileConfig {config.name!r} cannot use N-major B for "
-                f"dtype={chain.matmul.b_dtype!r}: per-CTA SMEM N={smem_n} "
+                f"dtype={chain.matmul.b_dtype!r}: per-MMA per-CTA SMEM N={slice_n} "
                 f"is smaller than the {mn_group_elems}-element swizzle group"
             )
-        if smem_n % mn_group_elems != 0:
+        if slice_n % mn_group_elems != 0:
             raise ValueError(
-                f"TileConfig {config.name!r} cannot use N-major B: " f"per-CTA SMEM N={smem_n} is not divisible by " f"swizzle group {mn_group_elems}"
+                f"TileConfig {config.name!r} cannot use N-major B: " f"per-MMA per-CTA SMEM N={slice_n} is not divisible by " f"swizzle group {mn_group_elems}"
             )
 
 
@@ -2437,9 +2493,10 @@ _EPI_SMEM_STAGES = 2
 
 def _smem_d_bytes(cfg, chain) -> int:
     """SMEM-D buffer bytes for the TMA-store epilogue: `_EPI_SMEM_STAGES` slots
-    of `cta_tile_m × epi_tile_mn[1]` elements + a 16-byte alignment pad."""
+    of one epilogue subtile (`epi_tile_mn` = one MMA-M block × 32) + a 16-byte
+    alignment pad. With num_mma_m > 1 the M blocks reuse the same slots."""
     elem_bytes = DTYPE_BYTES[chain.output_dtype]
-    return _EPI_SMEM_STAGES * cfg.cta_tile_m * cfg.epi_tile_mn[1] * elem_bytes + 16
+    return _EPI_SMEM_STAGES * cfg.epi_tile_mn[0] * cfg.epi_tile_mn[1] * elem_bytes + 16
 
 
 def _use_tma_store_epi(chain, cfg, vec_bytes_epi: int, cta_group: int) -> bool:
@@ -2448,7 +2505,8 @@ def _use_tma_store_epi(chain, cfg, vec_bytes_epi: int, cta_group: int) -> bool:
       with the full t2r_inst_repx vector the TMA path stages to SMEM.
     - N-major output row stride ≥ 16 bytes: cp.async.bulk.tensor needs the
       SMEM source aligned to the descriptor swizzle (else undeclarable).
-    - cta_tile_m == 128: only the 128-rows/CTA thread→row layout is wired.
+    - mma_inst_m == 128: only the 128-rows-per-MMA-block thread→row layout is
+      wired (an M=64 MMA block drains through the packed lane<16 layout).
     - out dtype ∈ {bf16, fp16}: matches the hard-coded s64b 32-col swizzle.
     - M-major output: 16B-aligned M (16x256b TMEM-load + stmatrix.trans + tma_store).
     """
@@ -2477,7 +2535,7 @@ def _use_tma_store_epi(chain, cfg, vec_bytes_epi: int, cta_group: int) -> bool:
         return False
     if chain.out_major == "n" and vec_bytes_epi < 16:
         return False
-    if cfg.cta_tile_m != 128:
+    if cfg.mma_inst_m != 128:
         return False
     if chain.output_dtype not in ("bf16", "fp16"):
         return False
@@ -2560,9 +2618,9 @@ def _check_block_quant_supported(
                     f"reduction-uniform row guard; got M={chain.matmul.M}, "
                     f"block_size={q.block_size}"
                 )
-            if config.cta_tile_m == 64 and cta_group == 1 and q.block_size != 16:
+            if config.mma_inst_m == 64 and cta_group == 1 and q.block_size != 16:
                 raise NotImplementedError(
-                    "col block_scale_quantize on the cta_tile_m=64 1-CTA-MMA epilogue " "(lane<16 packed layout, 16 rows per warp) supports only block_size 16"
+                    "col block_scale_quantize on the mma_inst_m=64 1-CTA-MMA epilogue " "(lane<16 packed layout, 16 rows per warp) supports only block_size 16"
                 )
             if q.scale_reorder == "F8_128x4":
                 expected_scale_dim = (

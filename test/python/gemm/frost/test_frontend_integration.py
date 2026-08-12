@@ -511,6 +511,13 @@ def test_wrapper_graph_path():
     torch.testing.assert_close(y, ref, atol=1e-1, rtol=1e-2)
 
 
+# Override shape is a BACKEND feature: `is_override_shape_enabled=True` is rejected
+# by build_operation_graph(), before create_execution_plans() ever probes an engine.
+# So this gate is on the backend regardless of which plan ends up serving the graph.
+@pytest.mark.skipif(
+    cudnn.backend_version() < 92100,
+    reason="override shape requires cuDNN backend 9.21.0+",
+)
 @_GPU
 def test_override_shape_inside_a_max_allocation_matches_the_backend():
     """The case override shape is FOR: allocate once at a cache shape, name the
