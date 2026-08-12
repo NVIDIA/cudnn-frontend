@@ -122,20 +122,13 @@ class Capabilities:
     # s_q == 1 (decode-shaped) graphs; rows whose kernels are prefill-only gate
     # them off.
     decode: bool = True
-    # Dense layout envelope (mirrors fwd/engines.py):
-    #   "bshd"       — every rank-4 port must be BSHD-physical.
-    #   "dense_flex" — any dense layout with the head dim innermost-contiguous
-    #                  and non-broadcast, non-overlapping strides; the lowering
-    #                  normalizes.
-    layouts: frozenset = frozenset({"bshd"})
-
-    # Dense layout envelope this engine accepts:
+    # Dense layout envelope this engine accepts (mirrors fwd/engines.py):
     #   "bshd"       — Q/K/V/O must be BSHD-physical (stride order 3,1,2,0).
     #   "dense_flex" — any B/H/S stride permutation, padded (oversized)
     #                  strides included, as long as the head dim is
     #                  innermost-contiguous (stride 1) and the strides are
     #                  non-broadcast / non-overlapping (facts.dense_layout;
-    #                  see graph_analyzer.dense_layout_ok). The DSL executor
+    #                  see graph_analyzer.dense_layout_ok). The lowering
     #                  normalizes such tensors to the kernel's canonical
     #                  BSHD-compact buffers (zero-copy when already BSHD).
     layouts: frozenset[str] = frozenset({"bshd"})
