@@ -60,7 +60,6 @@ from .recipe import (
     AX_MN,
     CONST,
     FROM_M,
-    FROM_N,
     KERNEL_AXES,
     REDUCTION_INIT_VALUE,
     _output_rule,
@@ -1889,61 +1888,63 @@ class CompiledFusedGemm:
         return (self.lowered or self.launch)(operands, stream=stream)
 
     def _lower(self):
-        """The recipe as one straight line, or None for a shape it does not emit.
+        """The recipe as one loop over flat tuples, or None for a graph it does not serve.
 
         Every branch the general path takes -- multi-GEMM or not, block scale or
         not, how many outputs, which are reductions, which axis of each operand
-        carries M/N/K -- was settled when the kernel compiled. Taking them again
-        per call is what stands between this path and its floor: the
-        load-bearing validation measures 1.1 us against 21 for the walk that
-        rebuilds it.
+        carries M/N/K, what order the kernel's parameters come in -- was settled
+        when the kernel compiled. Taking them again per call is most of what a
+        python execute path costs: 44 us for the walk that rebuilt them, 35
+        reading a recipe through its objects, 20 here.
+
+        What is left per call is the same loop for every flavor, over tuples
+        flat enough that the body does no attribute lookup and calls nothing it
+        does not have to. Measured against a hand-unrolled straight line for the
+        plain flavor, the loop gives back 12% (19.7 us against 17.5) and costs
+        one body instead of one per shape; source codegen off this same table is
+        how to get that 12% back for every flavor at once.
 
         The emitted body never raises. Anything it is not sure of it hands to
         ``launch``, which serves every flavor and owns every rejection
         message -- so this can only ever accept a subset of what the general
         path accepts, and there is no second set of error strings to drift.
-
-        Emitting another flavor means widening the recipe, not copying this
-        body: a second body is the drift the recipe exists to prevent.
         """
         r = self.recipe
-        if r is None or not _TVM_FFI_OK or r.multi_gemm or r.block_size or r.aux or r.workspace_bytes:
+        if r is None or not _TVM_FFI_OK or r.workspace_bytes:
             return None
-        if len(r.inputs) != 2 or len(r.outputs) != 1:
+        # norm2 takes a square root through the caller's buffer after the kernel;
+        # that is a device operation the engine does not own yet, and neither is
+        # seeding a strided reduction output (checked per call, below).
+        if any(o.sqrt for o in r.outputs):
             return None
-        out = r.outputs[0]
-        # A raw output is a reduction or a quant scale: both want a pre-kernel
-        # seed and one wants a post-kernel sqrt, which are device operations the
-        # engine does not own yet (see _initialize_reduction_outputs).
-        if out.raw or out.init is not None or out.sqrt:
+        # Scale factors come with a block size to size their blob against, and a
+        # multi-GEMM's batch with a dense output to read it off.
+        if bool(r.sf) != bool(r.block_size) or (r.multi_gemm and not r.has_output_specs):
             return None
-        rule = out.rule
-        if tuple(s for s, _ in rule) != (CONST, FROM_M, FROM_N):
-            return None
-
-        a, b = r.a, r.b
         # A buffer reporting the declaration is read in the graph's axis order,
         # which this body does not serve. The stride guard below tells that
         # apart -- unless the declaration itself would satisfy the guard, which
         # only a unit extent can arrange, and which is settled here not per call.
-        for op in (a, b):
+        for op in r.inputs:
             declared_stride = op.declared_layout[1]
             if op.dc != op.kc and declared_stride and declared_stride[op.kc] == 1:
                 return None
-        ai, bi, ci = a.index, b.index, out.index
-        # kc is both the axis whose stride must be 1 and the axis whose extent
-        # enters the TMA rule -- they are the same axis by definition of major.
-        a_kc, b_kc = a.kc, b.kc
-        a_mod, b_mod = a.modulus, b.modulus
-        a_batch, b_batch = a.batch, b.batch
-        a_kpack, b_kpack = a.kpack, b.kpack
-        out_batch, out_ndiv, out_align = rule[0][1], rule[2][1], out.align
-        # Every batch extent the launch could read is pinned by a check above
-        # it, so the kernel's batch is settled here rather than re-read.
-        batch = out_batch if r.has_output_specs else max(a_batch, b_batch)
-        device = self.device
-        launchable = self._launchable
-        general = self.launch
+
+        # The recipe flattened into the loop headers: everything the body reads
+        # is unpacked by the `for`, so it costs no attribute lookup. `kc` is both
+        # the axis whose stride must be 1 and the axis whose extent enters the
+        # TMA rule -- the same axis, by the definition of major.
+        stride_ins = r.stride_ins
+        ins = tuple((op.index, op.kc, op.modulus, op.batch, op.kpack, op.is_b, i in stride_ins) for i, op in enumerate(r.inputs))
+        outs = tuple((o.index, *(x for axis in o.rule for x in axis), o.align) for o in r.outputs)
+        auxs = tuple((x.index, x.align) for x in r.aux)
+        sfs = tuple((s.index, s.is_a, r.inputs[s.operand_at].batch) for s in r.sf)
+        args = r.arg_plan
+        shared, seeds = r.shared_layout, r.seeds
+        ai, bi, a_kpack = r.a.index, r.b.index, r.a.kpack
+        block_size, batch = r.block_size, r.batch
+        device, launchable, general = r.device, self._launchable, self.launch
+        fill_word, is_contiguous = buffers.fill_word_async, buffers.is_contiguous
 
         def lowered(operands, graph_order=None, stream=None):
             _check_plan_device(device)
@@ -1951,48 +1952,77 @@ class CompiledFusedGemm:
                 # An operand described from the graph is in the graph's axis
                 # order; this body reads the caller's.
                 return general(operands, graph_order, stream=stream)
-            av, bv, cv = operands[ai], operands[bi], operands[ci]
-            a_sh, b_sh, c_sh = av.shape, bv.shape, cv.shape
-            if len(a_sh) != 3 or len(b_sh) != 3 or len(c_sh) != 3:
-                return general(operands, stream=stream)
-            a_st, b_st, c_st = av.stride(), bv.stride(), cv.stride()
+            a_sh, b_sh = operands[ai].shape, operands[bi].shape
+            if len(a_sh) != 3 or len(b_sh) != 3:
+                return general(operands, None, stream=stream)
             m, n, k = a_sh[1], b_sh[1], a_sh[2] * a_kpack
-            if (
-                a_st[a_kc] != 1
-                or b_st[b_kc] != 1
-                or a_sh[a_kc] % a_mod
-                or b_sh[b_kc] % b_mod
-                or a_sh[0] != a_batch
-                or b_sh[0] != b_batch
-                or b_sh[2] * b_kpack != k
-                or c_sh[0] != out_batch
-                or c_sh[1] != m
-                or c_sh[2] != n // out_ndiv
-                or _pow2_floor(av.data_ptr()) < 16
-                or _pow2_floor(bv.data_ptr()) < 16
-                or tensor_alignment(tuple(c_sh), tuple(c_st), cv.element_size(), ptr=cv.data_ptr()) < out_align
-            ):
-                return general(operands, stream=stream)
-            problem_size = (
-                m,
-                n,
-                k,
-                batch,
-                # permute(1, 2, 0) relabels axes, so the kernel's strides are
-                # that permutation of the ones just read -- no second read.
-                a_st[1],
-                a_st[2],
-                a_st[0],
-                b_st[1],
-                b_st[2],
-                b_st[0],
-                c_st[1],
-                c_st[2],
-                c_st[0],
+            # permute(1, 2, 0) relabels axes, so the strides the kernel wants are
+            # that rotation of the ones each check already read -- no second read.
+            problem = [m, n, k, batch]
+            for idx, kc, mod, ebatch, kpack, is_b, takes_stride in ins:
+                v = operands[idx]
+                sh, st = v.shape, v.stride()
+                if (
+                    len(sh) != 3
+                    or st[kc] != 1
+                    or sh[kc] % mod
+                    or sh[0] != ebatch
+                    or sh[1] != (n if is_b else m)
+                    or sh[2] * kpack != k
+                    or _pow2_floor(v.data_ptr()) < 16
+                ):
+                    return general(operands, None, stream=stream)
+                if takes_stride:
+                    problem += (st[1], st[2], st[0])
+            # Each output axis is a constant, M, or N over a divisor (fp4 packs
+            # two along N) -- the rule the build recorded, read back per axis.
+            for idx, k0, v0, k1, v1, k2, v2, align in outs:
+                v = operands[idx]
+                sh, st = v.shape, v.stride()
+                if (
+                    len(sh) != 3
+                    or sh[0] != (v0 if k0 == CONST else m if k0 == FROM_M else n // v0)
+                    or sh[1] != (v1 if k1 == CONST else m if k1 == FROM_M else n // v1)
+                    or sh[2] != (v2 if k2 == CONST else m if k2 == FROM_M else n // v2)
+                    or tensor_alignment(tuple(sh), tuple(st), v.element_size(), ptr=v.data_ptr()) < align
+                ):
+                    return general(operands, None, stream=stream)
+                problem += (st[1], st[2], st[0])
+            for idx, align in auxs:
+                v = operands[idx]
+                if tensor_alignment(tuple(v.shape), tuple(v.stride()), v.element_size(), ptr=v.data_ptr()) < align:
+                    return general(operands, None, stream=stream)
+            if sfs:
+                k4 = ((k // block_size) + 3) // 4
+                for idx, is_a, sf_batch in sfs:
+                    v = operands[idx]
+                    count = int(v.numel())
+                    if (
+                        _pow2_floor(v.data_ptr()) < 16
+                        or count != 1 + sum((int(s) - 1) * int(st) for s, st in zip(v.shape, v.stride()))
+                        or count * v.element_size() < 512 * k4 * (((m if is_a else n) + 127) // 128) * sf_batch
+                    ):
+                        return general(operands, None, stream=stream)
+            for lead, followers in shared:
+                st = tuple(operands[lead].stride())
+                for j in followers:
+                    if tuple(operands[j].stride()) != st:
+                        return general(operands, None, stream=stream)
+            if seeds:
+                # Seeding is a write, so nothing above may still reject: check
+                # every reduction output first, then fill.
+                for idx, _word in seeds:
+                    v = operands[idx]
+                    if not is_contiguous(tuple(v.shape), tuple(v.stride())):
+                        return general(operands, None, stream=stream)
+                for idx, word in seeds:
+                    v = operands[idx]
+                    fill_word(v.data_ptr(), int(v.numel()), word, stream)
+            return launchable(
+                tuple(problem),
+                *(operands[i].permute(1, 2, 0) if ref is None else _reshape_aux_to_fake(operands[i], ref) for i, ref in args),
+                stream=_as_custream(stream),
             )
-            # One output and no aux: the TMA-store and plain argument orders
-            # coincide, and a shape where they do not is not emitted here.
-            return launchable(problem_size, av.permute(1, 2, 0), bv.permute(1, 2, 0), cv.permute(1, 2, 0), stream=_as_custream(stream))
 
         return lowered
 
@@ -2007,8 +2037,8 @@ class CompiledFusedGemm:
         ``graph_order`` is the pack's per-view "this operand's layout is the
         graph's, not the caller's", or None when they are all the caller's.
         """
-        _check_plan_device(self.device)
         recipe = self.recipe
+        _check_plan_device(recipe.device)
         mnk, axes = recipe.problem(operands, graph_order)
         check_shapes(recipe, operands, mnk, axes)
         check_alignment(recipe, operands, axes)

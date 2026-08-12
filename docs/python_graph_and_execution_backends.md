@@ -152,7 +152,7 @@ An engine owns its internals, and this section does not change that. It exists
 because the default outcome is expensive: an engine that re-derives its per-call
 facts lands around **40 µs of host time per execute**, and for a single-kernel
 op that is most of what the caller pays. The same kernel with those facts read
-once is **17.5**. Both numbers are `frost_gemm` at 256×256×128 bf16, host
+once is **20**. Both numbers are `frost_gemm` at 256×256×128 bf16, host
 enqueue, min over 25 reps of a 64-call burst from a drained queue.
 
 The budget it has to fit in, all measured on SM100:
@@ -173,9 +173,10 @@ all fixed when the kernel compiled. M/N/K, strides and pointers arrive per call.
 Read the first set into a table at build (`gemm/frost/recipe.py` is the worked
 example) and let the call read the table. That alone is 44 → 35.
 
-**Then lower the table for the shape you actually run.** Emitting one closure
-per plan, with the table's constants inlined, is 35 → 17.5. Two rules make that
-safe:
+**Then lower the table into one closure per plan**, with its constants captured
+and the operand structure flattened into the loop headers, so the call does no
+attribute lookup and takes no branch the build already settled. That is 35 → 20.
+Two rules make it safe:
 
 - **The lowered path never raises.** Anything it is not certain of it hands to
   the interpreting path, which serves every flavor and owns every rejection
@@ -185,6 +186,16 @@ safe:
   divergence, but never a misconception they share — so the table is where a
   fact lives exactly once, and the tests that matter are against intended
   semantics, at the shapes where two encodings coincide.
+
+**A loop over a flat table gets almost all of it, so do not hand-unroll per
+flavor.** Measured three ways on the same plan and buffers: interpreting the
+table 35.8, looping over it flattened 19.7, a hand-written straight line with the
+structure unrolled 17.5. The loop is worth 45%; unrolling adds 12% and costs one
+closure body per operand shape — six flavors, six bodies to keep in agreement.
+One loop over `arg_plan` (the launch argument order as data) serves aux, extra
+outputs, multi-GEMM and block scale at 22 µs each, down from 39–50. Source
+codegen off the same table is how to buy the last 12% back later, for every
+flavor at once rather than for the one that was worth hand-writing.
 
 This is a pattern to copy, not a framework to import. Sharing the code across
 engines would couple their kernels' ABIs, which is the thing engine autonomy

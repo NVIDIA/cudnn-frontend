@@ -1,27 +1,29 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The build-time recipe, and the straight line lowered from it.
+"""The build-time recipe, and the closure lowered from it.
 
-``_lower`` emits a call path with the recipe's constants inlined; ``launch``
-interprets the same recipe. That is a compiler beside its interpreter, and the
-two can drift -- an earlier hand-written version of the emitted path lost the
-operand batch check and pinned an fp4 output at N instead of N/2, both of which
-made it accept or reject calls the general path did not.
+``_lower`` captures the recipe into a call path that loops over it flat;
+``launch`` interprets the same recipe by walking the operand structure. That is
+a compiler beside its interpreter, and the two can drift -- an earlier
+hand-written version of the emitted path lost the operand batch check and pinned
+an fp4 output at N instead of N/2, both of which made it accept or reject calls
+the general path did not.
 
-So the differential below is the point of this file: every case runs through
-BOTH entry points and the two must return the same verdict and the same numbers.
-The rest asserts that the fast path is the one a public ``execute()`` actually
-takes, and that the flavors it declines are declined on purpose.
+So the differentials below are the point of this file: every case and every
+flavor runs through BOTH entry points, and the two must return the same verdict
+and the same numbers. The rest asserts that the fast path is the one a public
+``execute()`` actually takes, and that what it declines is declined on purpose.
 """
 
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 import torch
-from gemm_test_utils import requires_sm100, vp
+from gemm_test_utils import requires_sm100
 
 import cudnn
 import cudnn.gemm.frost  # noqa: F401 — installs the cudnn.pygraph recorder hook
@@ -106,30 +108,80 @@ def _aux_graph():
     return g
 
 
-@requires_sm100
-@pytest.mark.parametrize(
-    "build,lowered",
-    (
-        (_plain_graph, True),
-        (_reduction_graph, False),
-        (_aux_graph, False),
-    ),
-    ids=("plain", "reduction", "aux"),
-)
-def test_which_flavors_lower(build, lowered):
-    """A declined flavor is declined by a named recipe field, not by accident.
+def _epilogue_graph():
+    g = _plain_graph()
+    mm = [t for t in g._nodes[-1].outputs.values()][0]
+    mm.set_output(False)
+    g.relu(input=mm, name="relu").set_output(True).set_data_type(BF16)
+    return g
 
-    Reductions want a pre-kernel seed and aux wants a fake-shape reshape; both
-    are work the emitted line does not carry yet, so it hands them over rather
-    than growing a branch per flavor.
+
+def _two_output_graph():
+    g = _plain_graph()
+    mm = [t for t in g._nodes[-1].outputs.values()][0]
+    g.relu(input=mm, name="relu").set_output(True).set_data_type(BF16)
+    return g
+
+
+def _multi_gemm_graph():
+    g = cudnn.pygraph(io_data_type=BF16, intermediate_data_type=F32, compute_data_type=F32)
+    A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+    B0 = g.tensor(name="B0", dim=[1, K, N], stride=[K * N, 1, K])
+    B1 = g.tensor(name="B1", dim=[1, K, N], stride=[K * N, 1, K])
+    Y = g.add(a=g.matmul(A=A, B=B0, name="mm0"), b=g.matmul(A=A, B=B1, name="mm1"), name="sum")
+    Y.set_output(True).set_data_type(BF16)
+    return g
+
+
+# Each entry is (build, how many distinct B operands, how many outputs, how many aux).
+_FLAVORS = (
+    (_plain_graph, 1, 1, 0),
+    (_epilogue_graph, 1, 1, 0),
+    (_aux_graph, 1, 1, 1),
+    (_two_output_graph, 1, 2, 0),
+    (_reduction_graph, 1, 2, 0),
+    (_multi_gemm_graph, 2, 1, 0),
+)
+_FLAVOR_IDS = ("plain", "epilogue", "aux", "two_outputs", "reduction", "multi_gemm")
+
+
+@requires_sm100
+@pytest.mark.parametrize("build,n_b,n_out,n_aux", _FLAVORS, ids=_FLAVOR_IDS)
+def test_which_flavors_lower(build, n_b, n_out, n_aux):
+    """Every flavor lowers, because what differs between them is a table entry.
+
+    Aux, extra outputs, a reduction's seed and a multi-GEMM's operand list all
+    used to be branches in a launcher, so the emitted path served only the one
+    shape with none of them. They are ``arg_plan`` and ``seeds`` now, which the
+    same loop reads -- so the list below is a list of table shapes, not of code
+    paths, and adding to it is data.
     """
     compiled = jit_from_cudnn_graph(build())
-    assert (compiled.lowered is not None) is lowered
+    assert compiled.lowered is not None
+    r = compiled.recipe
+    assert (len(r.inputs) - 1, len(r.outputs), len(r.aux)) == (n_b, n_out, n_aux)
+    # One launch argument per bound operand: nothing dropped, nothing passed twice.
+    assert len(r.arg_plan) == len(r.inputs) + len(r.outputs) + len(r.aux) + len(r.sf)
+
+
+@requires_sm100
+def test_a_post_kernel_finalize_is_declined():
+    """``norm2`` takes a square root through the caller's buffer after the kernel.
+
+    The backend refuses that reduction while the graph is being lowered, so it
+    never reaches a plan -- but the recipe records ``sqrt`` and the lowered path
+    declines on it, because the alternative is a device operation the engine
+    does not own and would have to borrow off whatever the caller passed.
+    """
+    compiled = jit_from_cudnn_graph(_plain_graph())
+    assert compiled.lowered is not None
+    compiled.recipe = replace(compiled.recipe, outputs=(replace(compiled.recipe.outputs[0], sqrt=True),))
+    assert compiled._lower() is None
 
 
 @requires_sm100
 def test_public_execute_takes_the_lowered_path():
-    """The straight line is what a user's ``execute()`` runs, not a side door."""
+    """The lowered path is what a user's ``execute()`` runs, not a side door."""
     g = _plain_graph()
     g.validate()
     g.build_operation_graph()
@@ -146,9 +198,74 @@ def test_public_execute_takes_the_lowered_path():
 # --- the differential -------------------------------------------------------
 
 
+def _bind(compiled, a_bufs, b_bufs, out_bufs, aux_bufs=()):
+    """The operand list in bound-tensor order, which is what both paths take."""
+    bd = compiled.binding
+    pack = {}
+    for role, bufs in ((bd.a_operands, a_bufs), (bd.b_operands, b_bufs), (bd.outputs, out_bufs), (bd.aux, aux_bufs)):
+        pack.update(zip(role, bufs))
+    resolved = resolve_variant_pack(pack, bd)
+    return [resolved[id(t)] for t in bd.bound_tensors()]
+
+
 def _bound_buffers(compiled, a, b, c):
-    resolved = resolve_variant_pack(vp(compiled, a, b, c), compiled.binding)
-    return [resolved[id(t)] for t in compiled.binding.bound_tensors()]
+    return _bind(compiled, [a], [b], [c])
+
+
+def _buffers_for(compiled):
+    """One buffer per bound tensor, sized from the graph's own declaration.
+
+    Every flavor's operands follow from the recipe, so the differential below
+    does not need a hand-written variant pack per flavor -- which is the same
+    reason the launch path does not need a launcher per flavor.
+    """
+    r = compiled.recipe
+    bufs = [None] * len(compiled.binding.bound_tensors())
+    for op in r.inputs:
+        rows = N if op.is_b else M
+        bufs[op.index] = torch.randn(op.batch, rows, K // op.kpack, dtype=torch.bfloat16, device="cuda")
+    for out in r.outputs:
+        dtype = torch.float32 if out.raw else torch.bfloat16
+        bufs[out.index] = torch.zeros(expected_shape(out.rule, M, N), dtype=dtype, device="cuda")
+    for x in r.aux:
+        bufs[x.index] = torch.randn(tuple(int(d) for d in x.ref.dim), dtype=torch.float32, device="cuda")
+    assert all(b is not None for b in bufs)
+    return bufs
+
+
+@requires_sm100
+@pytest.mark.parametrize("build,n_b,n_out,n_aux", _FLAVORS, ids=_FLAVOR_IDS)
+def test_every_flavor_agrees_with_the_interpreter(build, n_b, n_out, n_aux):
+    """One loop serves six flavors, so one of them drifting is the failure mode.
+
+    The interpreter is the reference: it reads the same recipe but assembles the
+    launch by walking the operand structure, which is the thing the lowered path
+    replaced with a table. Bit-exact is the bar -- the two issue the same kernel
+    with the same arguments or they do not agree.
+
+    Except for a reduction output, which is not bit-reproducible against ITSELF:
+    the taps land through cross-CTA float atomics, so the order varies with
+    scheduling. Measured on this shape, the same path run six times spreads
+    0.0049 while the two paths differ by 0.00024 -- twenty times smaller than
+    the noise, so the tolerance below is the noise floor and not a slackened bar.
+    """
+    compiled = jit_from_cudnn_graph(build())
+    if compiled.lowered is None:
+        pytest.skip("this build does not lower (no tvm-ffi front door)")
+    operands = _buffers_for(compiled)
+    outs = compiled.recipe.outputs
+
+    runs = []
+    for run in (compiled.lowered, compiled.launch):
+        for o in outs:
+            operands[o.index].zero_()
+        run(operands, stream=None)
+        torch.cuda.synchronize()
+        runs.append([operands[o.index].clone() for o in outs])
+    for o, fast, slow in zip(outs, *runs):
+        exact = o.init is None
+        torch.testing.assert_close(fast, slow, atol=0 if exact else 1e-2, rtol=0 if exact else 1e-5)
+    assert runs[0][0].abs().sum() > 0  # a path that wrote nothing would also "agree"
 
 
 def _verdict(run, operands, c):

@@ -98,6 +98,65 @@ def test_epilogue_fusion():
 
 
 @_GPU
+def test_aux_tensor():
+    """An aux operand reaches the kernel reshaped to its fake's rank, not permuted."""
+    g = cudnn.pygraph(io_data_type=BF16, intermediate_data_type=F32, compute_data_type=F32)
+    A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+    B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+    bias = g.tensor(name="bias", dim=[1, 1, N], stride=[N, N, 1], data_type=F32)
+    Y = g.add(a=g.matmul(A=A, B=B, name="mm"), b=bias, name="bias_add")
+    Y.set_output(True).set_data_type(BF16)
+    _pin_frost(g)
+
+    a, b, ref = _operands()
+    bias_buf = torch.randn(1, 1, N, dtype=torch.float32, device="cuda")
+    y = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
+    _run(g, {A: a, B: b, bias: bias_buf, Y: y})
+    torch.testing.assert_close(y, (ref + bias_buf).to(torch.bfloat16), atol=1e-1, rtol=1e-2)
+
+
+@_GPU
+def test_two_dense_outputs():
+    """Two stored outputs: each contributes its own stride triple, in order."""
+    g = cudnn.pygraph(io_data_type=BF16, intermediate_data_type=F32, compute_data_type=F32)
+    A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+    B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+    C = g.matmul(A=A, B=B, name="mm")
+    C.set_output(True).set_data_type(BF16)
+    Y = g.relu(input=C, name="relu")
+    Y.set_output(True).set_data_type(BF16)
+    _pin_frost(g)
+
+    a, b, ref = _operands()
+    c = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
+    y = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
+    _run(g, {A: a, B: b, C: c, Y: y})
+    torch.testing.assert_close(c, ref.to(torch.bfloat16), atol=1e-1, rtol=1e-2)
+    torch.testing.assert_close(y, torch.relu(ref).to(torch.bfloat16), atol=1e-1, rtol=1e-2)
+
+
+@_GPU
+def test_multi_gemm():
+    """Two matmuls sharing A and an epilogue: the operands the kernel takes are
+    the DISTINCT ones, which is what the pack binds."""
+    g = cudnn.pygraph(io_data_type=BF16, intermediate_data_type=F32, compute_data_type=F32)
+    A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+    B0 = g.tensor(name="B0", dim=[1, K, N], stride=[K * N, 1, K])
+    B1 = g.tensor(name="B1", dim=[1, K, N], stride=[K * N, 1, K])
+    Y = g.add(a=g.matmul(A=A, B=B0, name="mm0"), b=g.matmul(A=A, B=B1, name="mm1"), name="sum")
+    Y.set_output(True).set_data_type(BF16)
+    _pin_frost(g)
+
+    a = torch.randn(1, M, K, dtype=torch.bfloat16, device="cuda")
+    b0 = torch.randn(1, N, K, dtype=torch.bfloat16, device="cuda")
+    b1 = torch.randn(1, N, K, dtype=torch.bfloat16, device="cuda")
+    y = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
+    _run(g, {A: a, B0: b0, B1: b1, Y: y})
+    ref = torch.einsum("bmk,bnk->bmn", a.float(), b0.float()) + torch.einsum("bmk,bnk->bmn", a.float(), b1.float())
+    torch.testing.assert_close(y, ref.to(torch.bfloat16), atol=2e-1, rtol=2e-2)
+
+
+@_GPU
 @pytest.mark.parametrize(
     "mode,reference",
     (

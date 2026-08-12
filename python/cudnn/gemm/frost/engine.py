@@ -34,8 +34,8 @@ class _FrostGemmPlan(CompiledPlan):
         self._operand_indices = None
         # Which call path this plan uses is a property of the compiled kernel,
         # so it is chosen here and not re-asked per execute. ``lowered`` is the
-        # straight line the recipe lowers to when the kernel is a shape it
-        # emits; ``launch`` serves everything else.
+        # closure the recipe is captured into when the kernel is a graph it
+        # serves; ``launch`` interprets the same recipe for everything else.
         self._lowered = getattr(compiled, "lowered", None)
         self._launch = self._lowered or getattr(compiled, "launch", None)
 

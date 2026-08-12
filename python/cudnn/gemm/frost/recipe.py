@@ -4,25 +4,31 @@
 """What one compiled gemm needs per call, settled when it compiles.
 
 Operand roles, majors, packing factors, alignment requirements, output shape
-rules and which outputs are reductions are all fixed by the time cute hands back
-a launchable. A call carries M, N, K, the strides and the pointers, and nothing
-else. This module writes the first set down, so that neither the interpreted
-path nor the straight line lowered from it re-derives them per call.
+rules, which outputs are reductions and what order the kernel takes its
+parameters in are all fixed by the time cute hands back a launchable. A call
+carries M, N, K, the strides and the pointers, and nothing else. This module
+writes the first set down, so that neither of the two call paths re-derives them.
 
-The two consumers read the same recipe but do not share a body:
-``CompiledFusedGemm.launch`` interprets it (through :func:`check_shapes` and
-:func:`check_alignment`), and ``CompiledFusedGemm.lowered`` is the straight line
-``_lower`` emits with the constants inlined. That is a compiler beside its
-interpreter, kept honest the way those always are -- ``test_execute_recipe.py``
-runs both over the same accepts and rejects and requires the same answer. What
-it CANNOT catch is a misconception they share, which is how the axis-order bug
-survived it.
+They read the same recipe but do not share a body: ``CompiledFusedGemm.launch``
+interprets it (through :func:`check_shapes` and :func:`check_alignment`) by
+walking the operand structure, and ``CompiledFusedGemm.lowered`` is the closure
+``_lower`` captures it into, where the same walk is a loop over tuples flat
+enough to need no attribute lookup. That is a compiler beside its interpreter,
+kept honest the way those always are -- ``test_execute_recipe.py`` runs both
+over the same accepts and rejects and requires the same answer. What it CANNOT
+catch is a misconception they share, which is how the axis-order bug survived it.
+
+The field that makes one loop serve six flavors is :attr:`GemmRecipe.arg_plan`:
+what differs between plain, aux, multi-output, multi-GEMM and block scale is
+only which buffers the launch passes and in what order, so that is data.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
+
+from cudnn.frost.buffers import init_word
 
 from .dtypes import DTYPE_BYTES, _aux_align_reqs, _output_align_reqs, _pow2_floor, tensor_alignment
 from .fusion_ir import FusionChain
@@ -186,6 +192,21 @@ class GemmRecipe:
     block_size: "int | None"
     workspace_bytes: int
     multi_gemm: bool
+    device: int  # the GPU whose SMEM depth / cluster count / SM the kernel is baked for
+    batch: int  # the kernel's batch extent, pinned by the checks above the launch
+    # The launch call as data. ``arg_plan`` is one entry per positional argument
+    # after ``problem_size``: an operand index, plus the aux TensorRef whose fake
+    # shape it reshapes to (None -- every other role -- means permute(1, 2, 0)).
+    # ``stride_ins`` gives the positions in ``inputs`` whose permuted strides ride
+    # in ``problem_size``, ahead of every output's. This is the one field that says
+    # how the six flavors differ, which is why they differ in a table and not in
+    # six launchers.
+    arg_plan: tuple
+    stride_ins: tuple
+    # ``(leader, followers)`` groups whose strides the launch collapses to one.
+    shared_layout: tuple
+    # ``(output index, identity as a dtype-packed word)`` per reduction output.
+    seeds: tuple
 
     @property
     def a(self) -> Operand:
@@ -404,13 +425,14 @@ def build(compiled) -> GemmRecipe:
 
     out_reqs = _output_align_reqs(chain, compiled.use_tma_store, vec_bytes=compiled.vec_bytes_epi)
     aux_reqs = _aux_align_reqs(chain, vec_bytes=compiled.vec_bytes_epi)
-    outputs = []
+    outputs, seeds = [], []
     for i, (spec, t) in enumerate(zip(chain.outputs, binding.outputs)):
         init, sqrt = None, False
         if spec.is_reduction:
             red = chain.reductions[int(spec.source.rsplit("_", 1)[1])]
             init = REDUCTION_INIT_VALUE[red.compute_dtype][red.mode]
             sqrt = red.mode == "norm2"
+            seeds.append((order[id(t)], init_word(red.compute_dtype, init)))
         outputs.append(
             Output(
                 index=order[id(t)],
@@ -437,6 +459,24 @@ def build(compiled) -> GemmRecipe:
     for item in (*inputs, *outputs, *aux, *sf):
         roles[item.index] = item.role
 
+    # The kernel's signature, in the order the launchers pass it: every distinct
+    # A, every distinct B, their scale factors, then the outputs and the aux --
+    # except under a TMA-store epilogue, where the single dense output binds the
+    # template's trailing TMA-only parameter and so goes last.
+    heads = [(op.index, None) for op in inputs] + [(s.index, None) for s in sf]
+    outs = [(o.index, None) for o in outputs]
+    auxs = [(x.index, x.ref) for x in aux]
+    tma = bool(compiled.use_tma_store) and not chain.is_multi_gemm
+    arg_plan = tuple(heads + (auxs + outs[:1] if tma else outs + auxs))
+
+    # Block-scale multi-GEMM sends ONE A and ONE B stride triple and requires the
+    # rest to match it; every other flavor sends each operand's own.
+    grouped = bool(chain.is_multi_gemm and compiled.block_scale)
+    stride_ins = (0, na) if grouped else tuple(range(len(inputs)))
+    shared_layout = ()
+    if grouped:
+        shared_layout = tuple((group[0].index, tuple(op.index for op in group[1:])) for group in (inputs[:na], inputs[na:]) if len(group) > 1)
+
     return GemmRecipe(
         inputs=tuple(inputs),
         outputs=tuple(outputs),
@@ -449,4 +489,10 @@ def build(compiled) -> GemmRecipe:
         block_size=chain.block_scale.block_size if compiled.block_scale else None,
         workspace_bytes=int(getattr(compiled, "workspace_bytes", 0) or 0),
         multi_gemm=bool(chain.is_multi_gemm),
+        device=int(compiled.device),
+        batch=int(outputs[0].rule[0][1] if chain.output_specs else max(mm.a_batch, mm.b_batch)),
+        arg_plan=arg_plan,
+        stride_ins=stride_ins,
+        shared_layout=shared_layout,
+        seeds=tuple(seeds),
     )
