@@ -526,7 +526,7 @@ class ExecutionPlanBuilder_v8 {
             }
         } else {
 #else
-        if (device_properties != nullptr) {
+        if (device_properties != nullptr && m_execution_plan.handle == nullptr) {
             set_error_and_throw_exception(
                 &m_execution_plan,
                 CUDNN_STATUS_NOT_SUPPORTED,

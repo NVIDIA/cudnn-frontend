@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json as _json
-import re
 
 import cudnn
 import pytest
@@ -163,7 +162,7 @@ def test_deviceless_deserialize():
         compute_data_type=cudnn.data_type.FLOAT,
         device_property=dp_wrong,
     )
-    with pytest.raises((cudnn.cudnnGraphNotSupportedError, RuntimeError)):
+    with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="NOT_SUPPORTED"):
         graph_wrong.deserialize(blob)
 
     # ── sub-test 2: correct devprop → deserialize + execute ─────────────────
