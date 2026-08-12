@@ -879,8 +879,8 @@ class DenseScoreRecomputeSm100:
         seqlen_q,
         seqlen_k,
         q_causal_offset,
-        q_batch_offset,
-        mQCausalOffsets,
+        q_batch_offset=None,
+        mQCausalOffsets=None,
     ):
         """Return dense K blocks that can contain at least one valid KV column."""
         ratio = Int32(self.ratio)

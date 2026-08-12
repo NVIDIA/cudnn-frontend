@@ -122,13 +122,13 @@ class IndexerScoreUnifiedSm100(DenseScoreRecomputeSm100):
             col_limits.fill(Int32(0))
             col_limit_min = seqlen_k
             for qi in cutlass.range_constexpr(q_tokens_per_tile):
-                q_token_idx = q_token_idxs[qi]
-                if q_token_idx < seqlen_q:
-                    col_limit = (q_causal_offsets[q_batch_offset + q_token_idx] + q_token_idx + Int32(1)) // ratio
-                    col_limit = col_limit if col_limit > Int32(0) else Int32(0)
-                    col_limit = col_limit if col_limit < seqlen_k else seqlen_k
-                    col_limits[qi] = col_limit
-                    col_limit_min = col_limit if col_limit < col_limit_min else col_limit_min
+                q_token_idx_for_limit = q_token_idxs[qi]
+                if q_token_idx_for_limit < seqlen_q:
+                    q_col_limit = (q_causal_offsets[q_batch_offset + q_token_idx_for_limit] + q_token_idx_for_limit + Int32(1)) // ratio
+                    q_col_limit = q_col_limit if q_col_limit > Int32(0) else Int32(0)
+                    q_col_limit = q_col_limit if q_col_limit < seqlen_k else seqlen_k
+                    col_limits[qi] = q_col_limit
+                    col_limit_min = q_col_limit if q_col_limit < col_limit_min else col_limit_min
             first_masked_n_block = col_limit_min // Int32(self.n_block_size)
         else:
             col_limits = [(q_causal_offset + q_token_idxs[qi] + Int32(1)) // ratio for qi in range(q_tokens_per_tile)]
