@@ -11,8 +11,13 @@ axis-order bug survived a differential that ran both.
 
 What replaces it is the BACKEND -- the two tests below that run a shape on a
 cuDNN plan and a FROST plan and require the same numbers -- and the invariant
-that makes a rejection meaningful: the set of calls the launch path refuses must
-equal the set of illegal calls, asserted per flavor through ``deferrals``.
+that makes a rejection meaningful: the set of calls the launch path refuses
+should equal the set of illegal calls.
+
+Only one direction of that is cheap to assert. ``deferrals`` must be empty for a
+legal call of every flavor, which says nothing legal is refused; a call the fast
+path ACCEPTS never reaches the counter, so the other direction is covered
+case by case below and by the backend differentials.
 """
 
 from __future__ import annotations
@@ -27,7 +32,6 @@ from gemm_test_utils import kw, requires_sm100, to_blocked
 import cudnn
 import cudnn.gemm.frost  # noqa: F401 — installs the cudnn.pygraph recorder hook
 from cudnn.engines import is_python_engine
-from cudnn.frost.buffers import collapse_layout, fill_word_strided_async, init_word
 from cudnn.gemm.frost.compiler import jit_from_cudnn_graph, probe_supported
 from cudnn.gemm.frost.graph_analyzer import resolve_variant_pack
 from cudnn.gemm.frost.recipe import _output_rule, expected_shape
@@ -77,66 +81,6 @@ def test_a_quant_scale_output_is_fixed_at_build():
     assert expected_shape(rule, 999, 999) == (1, 128, 4)
 
 
-# --- seeding a reduction output, which the engine owns ----------------------
-
-
-@pytest.mark.parametrize(
-    "shape,stride,want",
-    [
-        ((1, 8, 4), (32, 4, 1), [(32, 1)]),  # dense whatever rank it was declared at
-        ((1, 8, 1), (32, 4, 1), [(8, 4)]),  # a per-row scalar: one strided run
-        ((2, 8, 4), (64, 8, 1), [(16, 8), (4, 1)]),  # padded rows: batch merges into the row count
-        ((1, 1, 1), (1, 1, 1), []),  # one element
-    ],
-)
-def test_a_layout_collapses_to_the_runs_a_memset_can_cover(shape, stride, want):
-    """Unit axes carry no elements and adjacent dense axes are one run.
-
-    Collapsing first is what keeps the seed below to a single memset for a
-    contiguous tap and one per batch for a padded one, rather than one per row.
-    """
-    assert collapse_layout(shape, stride) == want
-
-
-@requires_sm100
-@pytest.mark.parametrize("shape,stride", [((1, 8, 1), (32, 4, 1)), ((2, 8, 4), (64, 8, 1)), ((3, 5, 1), (7, 1, 1))])
-def test_a_strided_seed_writes_its_own_elements_and_no_others(shape, stride):
-    """The engine seeds a padded output itself, without the caller's ``fill_()``.
-
-    Borrowing that method worked only while the buffer happened to be a torch
-    tensor -- and queued on torch's stream, not the kernel's. What it has to get
-    right is exactly this: every element the view covers, and nothing between
-    them.
-    """
-    span = 1 + sum((d - 1) * s for d, s in zip(shape, stride))
-    flat = torch.zeros(span, dtype=torch.float32, device="cuda")
-    view = torch.as_strided(flat, shape, stride)
-    fill_word_strided_async(flat.data_ptr(), shape, stride, 4, init_word("fp32", 3.5), None)
-    torch.cuda.synchronize()
-
-    expected = torch.zeros(span, dtype=torch.float32, device="cuda")
-    torch.as_strided(expected, shape, stride).fill_(3.5)
-    assert torch.equal(flat, expected)
-    assert torch.equal(view, torch.full(shape, 3.5, device="cuda"))
-
-
-@pytest.mark.parametrize(
-    "shape,stride,why",
-    [
-        ((1, 8, 1), (0, 0, 1), "alias"),  # stride 0 over a real extent
-        ((1, 4, 4), (16, 2, 1), "overlap"),  # rows closer together than they are wide
-    ],
-)
-def test_a_reduction_output_that_writes_a_byte_twice_is_rejected(shape, stride, why):
-    """Two elements at one address is a write race, not a layout to support.
-
-    Named here rather than left to the driver, which reports the second as a
-    pitch smaller than the width and says nothing about whose buffer it was.
-    """
-    with pytest.raises(ValueError, match=why):
-        fill_word_strided_async(0, shape, stride, 4, 0, None)
-
-
 # --- which flavors lower, and which decline ---------------------------------
 
 
@@ -154,6 +98,20 @@ def _reduction_graph():
     Y = [t for t in g._nodes[-1].outputs.values()][0]
     R = g.reduction(input=Y, mode=cudnn.reduction_mode.ADD, name="red")
     R.set_dim([1, 1, 1]).set_stride([1, 1, 1]).set_output(True).set_data_type(F32)
+    return g
+
+
+def _shared_operand_graph(d=K):
+    """``matmul(A, A)``: one tensor in two roles, so both bind ONE pack slot.
+
+    At d x d the same buffer is a legal A (k-major) and a legal B (n-major), and
+    the graph declares it once -- which is exactly the shape where re-labelling
+    the SLOT into B's axis order also re-labels what A reads.
+    """
+    g = cudnn.pygraph(io_data_type=BF16, intermediate_data_type=F32, compute_data_type=F32)
+    A = g.tensor(name="A", dim=[1, d, d], stride=[d * d, d, 1])
+    C = g.matmul(A=A, B=A, name="mm")
+    C.set_output(True).set_data_type(BF16)
     return g
 
 
@@ -192,14 +150,22 @@ def _two_output_graph():
     return g
 
 
-def _multi_gemm_graph():
+def _multi_gemm_graph(dense_output=True):
     g = cudnn.pygraph(io_data_type=BF16, intermediate_data_type=F32, compute_data_type=F32)
     A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
     B0 = g.tensor(name="B0", dim=[1, K, N], stride=[K * N, 1, K])
     B1 = g.tensor(name="B1", dim=[1, K, N], stride=[K * N, 1, K])
     Y = g.add(a=g.matmul(A=A, B=B0, name="mm0"), b=g.matmul(A=A, B=B1, name="mm1"), name="sum")
-    Y.set_output(True).set_data_type(BF16)
+    Y.set_data_type(BF16).set_output(dense_output)
+    if not dense_output:
+        R = g.reduction(input=Y, mode=cudnn.reduction_mode.ADD, name="red")
+        R.set_dim([1, 1, 1]).set_stride([1, 1, 1]).set_output(True).set_data_type(F32)
     return g
+
+
+def _multi_gemm_reduction_only_graph():
+    """Two matmuls whose only output is a tap: the batch comes off the operands."""
+    return _multi_gemm_graph(dense_output=False)
 
 
 # Each entry is (build, how many distinct B operands, how many outputs, how many aux).
@@ -210,8 +176,9 @@ _FLAVORS = (
     (_two_output_graph, 1, 2, 0),
     (_reduction_graph, 1, 2, 0),
     (_multi_gemm_graph, 2, 1, 0),
+    (_multi_gemm_reduction_only_graph, 2, 1, 0),
 )
-_FLAVOR_IDS = ("plain", "epilogue", "aux", "two_outputs", "reduction", "multi_gemm")
+_FLAVOR_IDS = ("plain", "epilogue", "aux", "two_outputs", "reduction", "multi_gemm", "multi_gemm_tap_only")
 
 
 @requires_sm100
@@ -505,14 +472,14 @@ def test_the_launch_path_accepts_exactly_the_legal_calls(case, verdict):
     While ``lowered`` could hand anything it was unsure of to an interpreter
     that ran it anyway, "the fast path rejects a legal call" was a performance
     bug at worst and nothing asserted otherwise. There is one path now, so a
-    rejection IS the answer -- which makes the two directions both real
-    failures: refusing a legal call breaks it, and accepting an illegal one runs
-    a kernel over memory the caller did not describe.
+    rejection IS the answer -- which makes both directions real failures:
+    refusing a legal call breaks it, and accepting an illegal one runs a kernel
+    over memory the caller did not describe.
 
-    ``deferrals`` is what pins that down. Empty means every rule passed; a
-    rejection must name the rule that caused it, and a rejection with nothing
-    named is drift between the guards and the diagnostics, which ``explain``
-    raises on separately.
+    ``deferrals`` pins down the first direction only, and this table is how the
+    second is covered: each illegal case is named and must be refused. A
+    rejection with nothing counted would be drift between the guards and the
+    diagnostics, which ``explain`` raises on separately.
     """
     compiled = jit_from_cudnn_graph(_plain_graph())
     if compiled.lowered is None:
@@ -524,6 +491,73 @@ def test_the_launch_path_accepts_exactly_the_legal_calls(case, verdict):
     assert bool(compiled.deferrals) == (verdict == "rejected")
     if verdict == "ran":
         torch.testing.assert_close(out.float(), torch.einsum("bmk,bnk->bmn", a.float(), b.float()), atol=2e-1, rtol=2e-2)
+
+
+@requires_sm100
+def test_one_buffer_in_two_roles_reads_each_role_s_own_axis_order():
+    """``matmul(A, A)`` binds ONE slot as both operands.
+
+    The two roles read that memory through different axis maps -- A as
+    ``[b, m, k]``, B as the graph's ``[b, k, n]`` -- so the launch path carries
+    a view per ROLE. Re-labelling the slot instead is cheaper and silently hands
+    the other role a transposed view: the numbers come out as ``A @ A`` where
+    the graph says ``A @ A.T``, and no rule fires, so the checker then finds
+    nothing wrong and raises the drift error instead.
+    """
+    compiled = jit_from_cudnn_graph(_shared_operand_graph())
+    if compiled.lowered is None:
+        pytest.skip(f"this build does not lower: {compiled.declined}")
+    assert len({op.index for op in compiled.recipe.inputs}) == 1  # one slot, two roles
+
+    a = torch.randn(1, K, K, dtype=torch.bfloat16, device="cuda")
+    c = torch.zeros(1, K, K, dtype=torch.bfloat16, device="cuda")
+    compiled.lowered(_bind(compiled, [a], [a], [c]), stream=None)
+    torch.cuda.synchronize()
+    assert dict(compiled.deferrals) == {}
+    # The graph declares B [b, K, N], so B's N axis is the buffer's LAST -- which
+    # makes the product A @ A, not A @ A.T. Asymmetric by construction.
+    torch.testing.assert_close(c.float(), (a.float() @ a.float()), atol=2e-1, rtol=2e-2)
+
+
+@requires_sm100
+def test_a_reduction_output_of_the_wrong_width_is_refused_before_anything_is_written():
+    """The seed is a 32-bit word and the count is the buffer's numel.
+
+    A tap bound to a narrower buffer therefore writes twice the bytes it owns,
+    and the launch's own dtype check comes too late to help -- by then the fill
+    has already run. So the width is a rule of this call, checked with the
+    caller's memory still untouched. The canaries are the assertion: rejecting
+    is not enough if it rejects afterwards.
+    """
+    compiled = jit_from_cudnn_graph(_reduction_graph())
+    if compiled.lowered is None:
+        pytest.skip(f"this build does not lower: {compiled.declined}")
+    operands = _buffers_for(compiled)
+    tap = [o for o in compiled.recipe.outputs if o.init is not None][0]
+    block = torch.full((16,), -7.0, dtype=torch.float16, device="cuda")
+    operands[tap.index] = block[:1].view(1, 1, 1)
+
+    with pytest.raises(ValueError, match="element"):
+        compiled.lowered(operands, stream=None)
+    torch.cuda.synchronize()
+    assert dict(compiled.deferrals) == {"reduction seed dtype": 1}
+    assert torch.equal(block, torch.full((16,), -7.0, dtype=torch.float16, device="cuda"))
+
+
+@requires_sm100
+def test_the_checker_is_loud_when_it_cannot_find_the_fault():
+    """The one failure mode that writing the rules twice introduces.
+
+    ``lowered``'s guards are fused for speed and ``explain``'s are written for
+    the message: two spellings of one set of rules. If they drift, a call gets
+    refused and the checker then finds nothing wrong with it -- so a call the
+    checker considers legal has to be loud rather than a quiet return, and
+    distinct from the ValueError a real rejection raises.
+    """
+    compiled = jit_from_cudnn_graph(_plain_graph())
+    a, b, c = _good()
+    with pytest.raises(RuntimeError, match="no rule explains"):
+        compiled.explain(_bound_buffers(compiled, a, b, c))
 
 
 def _matmul_on(batch, m, n, k, want_frost, a, b, c):

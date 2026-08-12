@@ -1919,10 +1919,17 @@ class CompiledFusedGemm:
         how to get that 12% back for every flavor at once.
 
         The body never raises. What it refuses it hands to ``explain``, which
-        owns every rejection message and does not run anything -- so the set of
-        calls this refuses must EQUAL the set of illegal calls, and a legal one
-        it will not serve is a bug rather than a slower route. ``deferrals``
-        counts each refusal under its rule, which is what makes that testable.
+        owns every rejection message and does not run anything -- so the goal is
+        that the set of calls this refuses EQUALS the set of illegal calls, and
+        a legal one it will not serve is a bug rather than a slower route.
+
+        ``deferrals`` gets one direction of that, and only one: a legal call of
+        every flavor must leave it empty, so nothing legal is refused. It says
+        nothing about the other direction, because a call this ACCEPTS never
+        reaches the counter -- an illegal call slipping through is caught, if at
+        all, by the per-case rejection tests and by the backend differentials.
+        Closing it properly means generating both the fused guards and the
+        readable diagnostics from one ordered list of checks.
 
         None means this object has no call path at all, which the engine's
         support gate already refused; ``declined`` says why.
@@ -1952,9 +1959,12 @@ class CompiledFusedGemm:
         # declares [b, K, N] where the kernel reads (b, N, K). Re-labelling one
         # into kernel order is a permute, so the checks below read one order and
         # the second axis map costs nothing on a call that does not use it.
+        # Keyed by POSITION in `inputs`, never by operand index: matmul(A, A)
+        # binds ONE slot as both operands, and re-labelling the slot would hand
+        # the other role a transposed view of the same memory.
         renorm = tuple(
-            (op.index, tuple(op.declared), op.declared_layout[0] if len(op.declared_layout[0]) == 3 else None, op.declared_layout[1])
-            for op in r.inputs
+            (j, tuple(op.declared), op.declared_layout[0] if len(op.declared_layout[0]) == 3 else None, op.declared_layout[1])
+            for j, op in enumerate(r.inputs)
             if op.declared != KERNEL_AXES
         )
 
@@ -1963,45 +1973,50 @@ class CompiledFusedGemm:
         # the axis whose stride must be 1 and the axis whose extent enters the
         # TMA rule -- the same axis, by the definition of major.
         stride_ins = r.stride_ins
-        ins = tuple((op.index, op.kc, op.modulus, op.batch, op.kpack, op.is_b, i in stride_ins) for i, op in enumerate(r.inputs))
+        in_slots = tuple(op.index for op in r.inputs)
+        ins = tuple((op.kc, op.modulus, op.batch, op.kpack, op.is_b, i in stride_ins) for i, op in enumerate(r.inputs))
         outs = tuple((o.index, *(x for axis in o.rule for x in axis), o.align) for o in r.outputs)
         auxs = tuple((x.index, x.align) for x in r.aux)
         sfs = tuple((s.index, s.is_a, r.inputs[s.operand_at].batch) for s in r.sf)
-        args = r.arg_plan
+        # Every input is one of the FIRST arguments, in order, so the plan only
+        # has to carry the ones after them.
+        tail = r.arg_plan[len(r.inputs) :]
         shared, seeds = r.shared_layout, r.seeds
-        ai, bi, a_kpack = r.a.index, r.b.index, r.a.kpack
+        a_pos, b_pos, a_kpack = r.a_at, r.b_at, r.a.kpack
         block_size, batch = r.block_size, r.batch
         device, launchable, refuse = r.device, self._launchable, self.explain
-        fill_word, fill_strided, is_contiguous = buffers.fill_word_async, buffers.fill_word_strided_async, buffers.is_contiguous
+        fill_word, fill_plan, apply_fill = buffers.fill_word_async, buffers.strided_fill_plan, buffers.apply_fill_plan
+        is_contiguous = buffers.is_contiguous
         # Named so a test can assert which rule refused a call, and that a legal
         # call trips none. Incremented only on the path that is already raising.
         gave_up = self.deferrals
 
         def lowered(operands, graph_order=None, stream=None):
             _check_plan_device(device)
-            # Which axis order an operand arrived in, by the backend's own rule:
+            # Which axis order each input arrived in, by the backend's own rule:
             # the descriptor defines the tensor and the pack supplies a pointer,
             # so a slot the pack described FROM the graph, or a buffer reporting
             # exactly the declared (dim, stride), is the declaration. Everything
-            # else is the caller's own labelling. Settled here, once, so the
-            # checks below all read the kernel's order.
-            ops = operands
-            for idx, perm, dsh, dst in renorm:
-                v = operands[idx]
+            # else is the caller's own labelling.
+            #
+            # One view per ROLE. Re-labelling the SLOT would be cheaper and
+            # wrong: matmul(A, A) binds a single buffer as both operands, and
+            # the two roles read it through different axis maps.
+            vs = [operands[i] for i in in_slots]
+            for j, perm, dsh, dst in renorm:
+                v = vs[j]
                 sh = v.shape
                 if len(sh) != 3:
                     continue  # no axis map fits it; the loop below is what refuses it
-                declared = bool(graph_order) and graph_order[idx]
+                declared = bool(graph_order) and graph_order[in_slots[j]]
                 if not declared and dsh is not None:
                     declared = sh[0] == dsh[0] and sh[1] == dsh[1] and sh[2] == dsh[2]
                     if declared:
                         st = v.stride()
                         declared = st[0] == dst[0] and st[1] == dst[1] and st[2] == dst[2]
                 if declared:
-                    if ops is operands:
-                        ops = list(operands)
-                    ops[idx] = v.permute(*perm)
-            a_sh, b_sh = ops[ai].shape, ops[bi].shape
+                    vs[j] = v.permute(*perm)
+            a_sh, b_sh = vs[a_pos].shape, vs[b_pos].shape
             if len(a_sh) != 3 or len(b_sh) != 3:
                 gave_up["A or B is not rank 3"] += 1
                 return refuse(operands, graph_order)
@@ -2009,8 +2024,7 @@ class CompiledFusedGemm:
             # permute(1, 2, 0) relabels axes, so the strides the kernel wants are
             # that rotation of the ones each check already read -- no second read.
             problem = [m, n, k, batch]
-            for idx, kc, mod, ebatch, kpack, is_b, takes_stride in ins:
-                v = ops[idx]
+            for (kc, mod, ebatch, kpack, is_b, takes_stride), v in zip(ins, vs):
                 sh, st = v.shape, v.stride()
                 if (
                     len(sh) != 3
@@ -2028,7 +2042,7 @@ class CompiledFusedGemm:
             # Each output axis is a constant, M, or N over a divisor (fp4 packs
             # two along N) -- the rule the build recorded, read back per axis.
             for idx, k0, v0, k1, v1, k2, v2, align in outs:
-                v = ops[idx]
+                v = operands[idx]
                 sh, st = v.shape, v.stride()
                 if (
                     len(sh) != 3
@@ -2041,14 +2055,14 @@ class CompiledFusedGemm:
                     return refuse(operands, graph_order)
                 problem += (st[1], st[2], st[0])
             for idx, align in auxs:
-                v = ops[idx]
+                v = operands[idx]
                 if tensor_alignment(tuple(v.shape), tuple(v.stride()), v.element_size(), ptr=v.data_ptr()) < align:
                     gave_up["aux alignment"] += 1
                     return refuse(operands, graph_order)
             if sfs:
                 k4 = ((k // block_size) + 3) // 4
                 for idx, is_a, sf_batch in sfs:
-                    v = ops[idx]
+                    v = operands[idx]
                     count = int(v.numel())
                     if (
                         _pow2_floor(v.data_ptr()) < 16
@@ -2058,24 +2072,41 @@ class CompiledFusedGemm:
                         gave_up["scale-factor blob"] += 1
                         return refuse(operands, graph_order)
             for lead, followers in shared:
-                st = tuple(ops[lead].stride())
+                st = tuple(vs[lead].stride())
                 for j in followers:
-                    if tuple(ops[j].stride()) != st:
+                    if tuple(vs[j].stride()) != st:
                         gave_up["operands do not share a layout"] += 1
                         return refuse(operands, graph_order)
-            # Seeding is a write, so it goes last: every rule above has had its
-            # say. A padded tap costs one 2D memset per batch instead of one
-            # dense one, which is a price and not a reason to leave.
-            for idx, word in seeds:
-                v = ops[idx]
-                sh, st = v.shape, v.stride()
-                if is_contiguous(sh, st):
-                    fill_word(v.data_ptr(), int(v.numel()), word, stream)
-                else:
-                    fill_strided(v.data_ptr(), sh, st, v.element_size(), word, stream)
+            # Seeding is the one thing here that WRITES, so it is planned in full
+            # before any of it is issued: a second reduction output that turns
+            # out to be unseedable must not find the first already filled, and a
+            # 32-bit word into a narrower element would run off the end of the
+            # caller's allocation before the launch could reject the dtype.
+            if seeds:
+                fills = []
+                for idx, word, elem_bytes in seeds:
+                    v = operands[idx]
+                    if v.element_size() != elem_bytes:
+                        gave_up["reduction seed dtype"] += 1
+                        return refuse(operands, graph_order)
+                    sh, st = v.shape, v.stride()
+                    if is_contiguous(sh, st):
+                        fills.append((v.data_ptr(), None, int(v.numel()), word))
+                        continue
+                    plan = fill_plan(sh, st)
+                    if plan is None:
+                        gave_up["reduction output writes an element twice"] += 1
+                        return refuse(operands, graph_order)
+                    fills.append((v.data_ptr(), plan, 0, word))
+                for ptr, plan, count, word in fills:
+                    if plan is None:
+                        fill_word(ptr, count, word, stream)
+                    else:
+                        apply_fill(ptr, plan, word, stream)
             return launchable(
                 tuple(problem),
-                *(ops[i].permute(1, 2, 0) if ref is None else _reshape_aux_to_fake(ops[i], ref) for i, ref in args),
+                *(v.permute(1, 2, 0) for v in vs),
+                *(operands[i].permute(1, 2, 0) if ref is None else _reshape_aux_to_fake(operands[i], ref) for i, ref in tail),
                 stream=_as_custream(stream),
             )
 
@@ -2527,11 +2558,12 @@ def _check_executable(chain: FusionChain) -> None:
     if chain.has_moe:
         return
     if not _TVM_FFI_OK:
+        # Not a narrowing of the install surface: apache-tvm-ffi ships in the
+        # same `cutedsl` extra as the DSL these kernels are written in, so a
+        # build without it has no DSL either and was already declining.
         raise NotImplementedError("the tvm-ffi front door is not installed, and the launch path this engine has needs it (pip install apache-tvm-ffi)")
     if any(red.mode == "norm2" for red in chain.reductions):
         raise NotImplementedError("a norm2 reduction takes a square root after the kernel, which is a device operation this engine does not own")
-    if chain.is_multi_gemm and not chain.output_specs:
-        raise NotImplementedError("a multi-GEMM with no dense output has no tensor to read the batch extent off")
 
 
 def probe_supported(

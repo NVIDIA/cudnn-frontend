@@ -33,7 +33,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from cudnn.frost.buffers import init_word
+from cudnn.frost.buffers import init_word, is_contiguous, strided_fill_plan
 
 from .dtypes import DTYPE_BYTES, _aux_align_reqs, _output_align_reqs, _pow2_floor, tensor_alignment
 from .fusion_ir import FusionChain
@@ -207,9 +207,15 @@ class GemmRecipe:
     # six launchers.
     arg_plan: tuple
     stride_ins: tuple
-    # ``(leader, followers)`` groups whose strides the launch collapses to one.
+    # ``(leader, followers)`` groups whose strides the launch collapses to one,
+    # as POSITIONS in ``inputs``. Positions and not operand indices, because one
+    # buffer can occupy two roles -- ``matmul(A, A)`` binds a single slot as both
+    # operands -- and a role is what carries an axis order.
     shared_layout: tuple
-    # ``(output index, identity as a dtype-packed word)`` per reduction output.
+    # ``(output index, identity as a dtype-packed word, the dtype's byte width)``
+    # per reduction output. The width is checked before the seed is written: the
+    # word is 32 bits and the count is the buffer's numel, so a narrower element
+    # would put the fill past the end of the caller's allocation.
     seeds: tuple
 
     @property
@@ -230,8 +236,16 @@ class GemmRecipe:
         it was, or None when every operand is the caller's own.
         """
         axes, bad = [], []
+        rank = []
         for op in self.inputs:
             v = operands[op.index]
+            if len(v.shape) != 3:
+                # Everything below indexes three named axes, so a buffer with a
+                # different rank has to be answered here and not by an
+                # IndexError three frames down.
+                rank.append(f"{op.role}: expected a rank-3 buffer, got shape={tuple(v.shape)}")
+                axes.append(KERNEL_AXES)
+                continue
             borrowed = bool(graph_order and graph_order[op.index])
             ax = op.axes(v.shape, v.stride(), borrowed)
             if ax is None:
@@ -241,6 +255,8 @@ class GemmRecipe:
                 )
                 ax = KERNEL_AXES
             axes.append(ax)
+        if rank:
+            raise ValueError("the kernel reads three axes off every operand: " + "; ".join(rank))
         if bad:
             raise ValueError("runtime operand layout does not match the layout the kernel was compiled for: " + "; ".join(bad))
         a, b = self.a, self.b
@@ -346,6 +362,41 @@ def _sf_blob_reject(recipe: GemmRecipe, operands, axes, mnk) -> "str | None":
     return None
 
 
+def _shared_layout_reject(recipe: GemmRecipe, operands) -> "str | None":
+    """Block-scale multi-GEMM sends ONE A stride triple for every A operand, so
+    operands that share it must actually be laid out alike."""
+    bad = []
+    for lead, followers in recipe.shared_layout:
+        want = tuple(operands[recipe.inputs[lead].index].stride())
+        for j in followers:
+            got = tuple(operands[recipe.inputs[j].index].stride())
+            if got != want:
+                bad.append(f"{recipe.inputs[j].role} has stride {got} where {recipe.inputs[lead].role} has {want}")
+    if bad:
+        return "this kernel sends one stride triple per operand pool, so the operands in a pool must share a layout: " + "; ".join(bad)
+    return None
+
+
+def _seed_reject(recipe: GemmRecipe, operands) -> "str | None":
+    """A reduction output is seeded with its identity before the kernel runs, so
+    the seed's own preconditions are the call's -- and they are checked before
+    the first byte is written, because a seed that fails halfway has already
+    scribbled on a caller's buffer."""
+    bad = []
+    for index, _word, elem_bytes in recipe.seeds:
+        v = operands[index]
+        got = v.element_size()
+        if got != elem_bytes:
+            bad.append(f"{recipe.roles[index]}: the reduction accumulates in {elem_bytes}-byte elements but this buffer stores {got}-byte ones")
+            continue
+        shape, stride = tuple(v.shape), tuple(v.stride())
+        if not is_contiguous(shape, stride) and strided_fill_plan(shape, stride) is None:
+            bad.append(f"{recipe.roles[index]}: shape {shape} stride {stride} writes some element twice")
+    if bad:
+        return "a reduction output must be seedable: " + "; ".join(bad)
+    return None
+
+
 def _raise_first(reasons) -> None:
     for reason in reasons:
         if reason is not None:
@@ -361,7 +412,12 @@ def check_shapes(recipe: GemmRecipe, operands, mnk, axes) -> None:
     the build recorded, and a block-scale blob against the size the template
     re-synthesizes.
     """
-    reasons = [_shape_reject(recipe, operands, axes, mnk), _output_shape_reject(recipe, operands, mnk)]
+    reasons = [
+        _shape_reject(recipe, operands, axes, mnk),
+        _output_shape_reject(recipe, operands, mnk),
+        _shared_layout_reject(recipe, operands),
+        _seed_reject(recipe, operands),
+    ]
     if recipe.block_size:
         reasons.append(_sf_blob_reject(recipe, operands, axes, mnk))
     _raise_first(reasons)
@@ -435,7 +491,7 @@ def build(compiled) -> GemmRecipe:
         if spec.is_reduction:
             red = chain.reductions[int(spec.source.rsplit("_", 1)[1])]
             init = REDUCTION_INIT_VALUE[red.compute_dtype][red.mode]
-            seeds.append((order[id(t)], init_word(red.compute_dtype, init)))
+            seeds.append((order[id(t)], init_word(red.compute_dtype, init), DTYPE_BYTES[red.compute_dtype]))
         outputs.append(
             Output(
                 index=order[id(t)],
@@ -477,7 +533,8 @@ def build(compiled) -> GemmRecipe:
     stride_ins = (0, na) if grouped else tuple(range(len(inputs)))
     shared_layout = ()
     if grouped:
-        shared_layout = tuple((group[0].index, tuple(op.index for op in group[1:])) for group in (inputs[:na], inputs[na:]) if len(group) > 1)
+        pools = (tuple(range(na)), tuple(range(na, len(inputs))))
+        shared_layout = tuple((pool[0], pool[1:]) for pool in pools if len(pool) > 1)
 
     return GemmRecipe(
         inputs=tuple(inputs),
