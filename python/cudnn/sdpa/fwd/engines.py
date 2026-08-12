@@ -815,10 +815,6 @@ def _sm120_fp8_spec() -> EngineSpec:
     8-bit fragment path), and no sink (Amax_S semantics with a sink column are
     undefined here). THD (ragged) is served with token-major Stats; head-major
     ragged Stats stays f16-only (the fp8 kernel carries no such specialization).
-
-    The row declares the kernel's true head-dim domain; what is reachable
-    through graphs is further gated by the C++ ``sdpa_fp8`` node, which today
-    admits d_qk <= 128 x d_v <= 128 plus the (192, 128) MLA pair.
     """
     from cudnn.sdpa.fwd.config_sm120 import SUPPORTED_HEAD_TILES_FP8
 

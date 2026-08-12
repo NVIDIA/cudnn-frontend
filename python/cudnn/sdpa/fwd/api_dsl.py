@@ -1901,9 +1901,6 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
 
         def _smem_bytes(kv_tile: int) -> int:
             # FP8 stages a byte per KV element but still writes O in half.
-            # (FP8 dims are exact multiples of 32, so the 16-granule padding
-            # is an identity for them; the envelope padding is the f16
-            # cell's.)
             return _sm120_smem_bytes(d_qp, d_vp, self.q_tile, kv_tile, self.dtype.itemsize, 2 if self._fp8 else self.dtype.itemsize)
 
         if self.tile_n is None:

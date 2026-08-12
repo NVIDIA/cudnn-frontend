@@ -13,12 +13,9 @@ dims any multiple of 32 up to 256 with the QK^T and P@V sides independent
 (what graphs can reach is further gated by the C++ sdpa_fp8 node:
 d_qk <= 128 x d_v <= 128 plus the (192, 128) MLA pair), causal /
 bottom-right / SWA / KV-padding masks, THD (ragged) with token-major Stats;
-no sink (Amax_S semantics), no head-major ragged Stats. Everything outside
-that envelope is a capability-row decline, checked by the *_not_offered
-tests below; the front-door-unreachable >128 tail is exercised at the
-template level (test_fp8_sm120_head_dim_tail_direct).
+no sink (Amax_S semantics), no head-major ragged Stats.
 
-Requires: SM120/SM121 (consumer Blackwell), cutlass-dsl. Skips otherwise.
+Requires: SM120/SM121 (Blackwell GeForce), cutlass-dsl. Skips otherwise.
 """
 
 import math
