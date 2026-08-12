@@ -112,6 +112,15 @@ _QUICK_CONFIGS: tuple[str, ...] = (
     "CONFIG_sm100_64x24x128_64x24x32_cluster1x1_1ctamma",  # cta_m=64, 16+8 spans
     "CONFIG_sm100_128x144x128_128x144x32_cluster2x1_2ctamma",  # cta2 (N%16), 16-col tail
     "CONFIG_sm100_128x48x128_128x48x32_cluster2x1_2ctamma_static",  # static cta2, 16-col tail
+    # CTA tiles split across num_mma_m x num_mma_n MMA instructions. 1ctamma
+    # only so far — the other templates cap num_mma at 1 (see test_num_mma.py).
+    "CONFIG_sm100_128x256x128_128x128x32_cluster1x1_1ctamma",  # num_mma_n=2
+    "CONFIG_sm100_256x128x128_128x128x32_cluster1x1_1ctamma",  # num_mma_m=2
+    "CONFIG_sm100_256x256x128_128x128x32_cluster2x1_1ctamma",  # 2x2 (acc_stages drops to 1)
+    "CONFIG_sm100_128x128x128_64x64x32_cluster1x1_1ctamma",  # 2x2 at mma_inst_m=64 (packed drain)
+    "CONFIG_sm100_256x128x128_128x128x32_cluster1x1_1ctamma_static",  # 2x1, static scheduler
+    "CONFIG_sm100_256x256x128_128x256x32_cluster2x1_2ctamma",  # 2x1 on the pair (cuBLAS geometry)
+    "CONFIG_sm100_128x128x128_64x128x32_cluster2x1_2ctamma_static",  # 2x1 at mma_inst_m=64 (2x2 DP drain)
 )
 
 _BATCHED_CONFIGS: tuple[str, ...] = (
@@ -254,10 +263,14 @@ def _compatible(
         )
     cta_smem_m, cta_smem_n, _ = cfg.cta_smem_tile_mnk(in_eb, cta_group)
     mn_group_elems = cfg.cta_tile_k_bytes // in_eb
-    if a_major == "m" and (cta_smem_m < mn_group_elems or cta_smem_m % mn_group_elems != 0):
-        return False, (f"A M-major per-CTA SMEM M={cta_smem_m} is not compatible with " f"the {mn_group_elems}-element swizzle group")
-    if b_major == "n" and (cta_smem_n < mn_group_elems or cta_smem_n % mn_group_elems != 0):
-        return False, (f"B N-major per-CTA SMEM N={cta_smem_n} is not compatible with " f"the {mn_group_elems}-element swizzle group")
+    # Each MMA instruction reads its own MN sub-block of the SMEM tile, so the
+    # swizzle-group rule applies per MMA (== the whole extent at num_mma == 1).
+    mma_smem_m = cta_smem_m // cfg.num_mma_m
+    mma_smem_n = cta_smem_n // cfg.num_mma_n
+    if a_major == "m" and (mma_smem_m < mn_group_elems or mma_smem_m % mn_group_elems != 0):
+        return False, (f"A M-major per-MMA SMEM M={mma_smem_m} is not compatible with " f"the {mn_group_elems}-element swizzle group")
+    if b_major == "n" and (mma_smem_n < mn_group_elems or mma_smem_n % mn_group_elems != 0):
+        return False, (f"B N-major per-MMA SMEM N={mma_smem_n} is not compatible with " f"the {mn_group_elems}-element swizzle group")
     out_contig_name, out_contig_extent = ("N", N) if out_major == "n" else ("M", M)
     if (out_contig_extent * out_eb) % 32 != 0:
         return False, (

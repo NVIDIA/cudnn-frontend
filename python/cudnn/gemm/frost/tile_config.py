@@ -80,6 +80,8 @@ _CTA_TILE_K_BYTES_MAX_BY_PIPELINE = {"sm100": 128, "sm103": 384}
 # MMA-inst K in bytes
 _MMA_INST_K_BYTES = 32
 
+_NUM_MMA_MAX = 2
+
 _AB_STAGES_CAP = 8  # cap even if SMEM permits more
 
 
@@ -116,6 +118,11 @@ class TileConfig:
     NOT here (template strategy, not geometry): cta_group, static_sched,
     ab_stages — those, plus K-in-elements, the SMEM tile, and the hardware MMA
     shape, are derived per (dtype, cta_group) at render time.
+
+    The CTA tile may span SEVERAL MMA instructions: ``num_mma_m`` × ``num_mma_n``
+    = ``cta_tile_m / mma_inst_m`` × ``cta_tile_n / mma_inst_n``. The whole CTA
+    tile is still TMA-loaded in one go; the MMA warp issues one instruction per
+    (m, n) sub-block into its own TMEM accumulator region.
     """
 
     cta_tile_m: int
@@ -141,12 +148,6 @@ class TileConfig:
         m, n, kb = self.cta_tile_m, self.cta_tile_n, self.cta_tile_k_bytes
         cm, cn = self.cgrp_size_m, self.cgrp_size_n
 
-        # Per-CTA tile hardware bounds. M is pinned to the two TMEM row layouts
-        # the templates implement (128 = full lanes, 64 = packed half-lanes).
-        if m not in (64, 128):
-            raise NotImplementedError(f"TileConfig {self.name!r}: cta_tile_m={m} — supported values " f"are 64 and 128")
-        if n < 8 or n > _CTA_TILE_N_MAX or n % 8 != 0:
-            raise NotImplementedError(f"TileConfig {self.name!r}: cta_tile_n={n} — supported range " f"is 8 ≤ N ≤ {_CTA_TILE_N_MAX}, multiple of 8")
         kb_max = _CTA_TILE_K_BYTES_MAX_BY_PIPELINE.get(self.pipeline, _CTA_TILE_K_BYTES_MAX)
         if kb <= 0 or kb > kb_max or kb % _MMA_INST_K_BYTES != 0:
             raise NotImplementedError(
@@ -181,6 +182,29 @@ class TileConfig:
             raise NotImplementedError(f"TileConfig {self.name!r}: mma_inst_n={mn} must be positive " f"and divide cta_tile_n={n}")
         if mkb <= 0 or kb % mkb != 0:
             raise NotImplementedError(f"TileConfig {self.name!r}: mma_inst_k_bytes={mkb} must be " f"positive and divide cta_tile_k_bytes={kb}")
+        # The M/N hardware bounds. These have always been the MMA INSTRUCTION's;
+        # they read as the CTA tile's only while one instruction covered it.
+        # M = the two TMEM row layouts (128 full lanes / 64 packed half-lanes);
+        # N = the idesc n_dim, encoded with its 3 LSBs dropped.
+        if mm not in (64, _CTA_TILE_M_MAX):
+            raise NotImplementedError(
+                f"TileConfig {self.name!r}: mma_inst_m={mm} (= cta_tile_m {m} / " f"num_mma_m {self.num_mma_m}) — supported values are 64 and {_CTA_TILE_M_MAX}"
+            )
+        if mn < 8 or mn > _CTA_TILE_N_MAX or mn % 8 != 0:
+            raise NotImplementedError(
+                f"TileConfig {self.name!r}: mma_inst_n={mn} (= cta_tile_n {n} / "
+                f"num_mma_n {self.num_mma_n}) — supported range is "
+                f"8 ≤ N ≤ {_CTA_TILE_N_MAX}, multiple of 8"
+            )
+        # The one NEW axis: how many instructions the CTA tile spans. K is not an
+        # instruction-count axis (the mainloop already walks cta_tile_k / mma_inst_k).
+        for axis, cnt in (("m", self.num_mma_m), ("n", self.num_mma_n)):
+            if cnt > _NUM_MMA_MAX:
+                raise NotImplementedError(f"TileConfig {self.name!r}: num_mma_{axis}={cnt} — at most " f"{_NUM_MMA_MAX} MMA instructions per CTA tile per axis")
+        # The epilogue drains one MMA-M block at a time, so its subtile height
+        # is the instruction's M, not the CTA tile's.
+        if self.epi_tile_mn[0] != mm:
+            raise NotImplementedError(f"TileConfig {self.name!r}: epi_tile_mn[0]={self.epi_tile_mn[0]} " f"must equal mma_inst_m={mm}")
 
     @property
     def geometry_name(self) -> str:
@@ -201,6 +225,16 @@ class TileConfig:
     def cta_tile_mn(self) -> tuple[int, int]:
         """Per-CTA logical output tile (M, N) in elements."""
         return (self.cta_tile_m, self.cta_tile_n)
+
+    @property
+    def num_mma_m(self) -> int:
+        """MMA instructions the CTA tile spans along M."""
+        return self.cta_tile_m // self.mma_inst_m
+
+    @property
+    def num_mma_n(self) -> int:
+        """MMA instructions the CTA tile spans along N."""
+        return self.cta_tile_n // self.mma_inst_n
 
     @property
     def cgrp_size_mn(self) -> tuple[int, int]:
@@ -333,7 +367,10 @@ def config_class_for_pipeline(pipeline: str) -> type[TileConfig]:
 # Axes: cta_m ∈ {128,64}, cta_n ∈ {8..256 step 8}, K_bytes ∈ {128,64}, cluster ∈
 # _CLUSTERS. N < 8 / N % 8 rejected by __post_init__ (tcgen05 idesc n_dim is a
 # multiple of 8). 2-CTA templates accept only cgrp_size_m % 2 == 0 (registry
-# predicate).
+# predicate). Every catalog entry has num_mma_m == num_mma_n == 1 (mma_inst tile
+# == cta tile); geometries that split the tile across several MMA instructions
+# are reached by `by_name` synthesis, so they stay out of the funnel's candidate
+# set and out of the benchmark / full-sweep enumerations.
 # ---------------------------------------------------------------------------
 
 _CLUSTERS: tuple[tuple[int, int], ...] = (
@@ -432,17 +469,19 @@ def _synthesize_config(name: str) -> TileConfig:
     pipeline = m.group("pipeline")
     cls = config_class_for_pipeline(pipeline)  # KeyError for unknown pipelines
     cta_m = int(m.group("cta_m"))
+    mma_m = int(m.group("mma_m"))
     cfg = cls(
         cta_tile_m=cta_m,
         cta_tile_n=int(m.group("cta_n")),
         cta_tile_k_bytes=int(m.group("k_bytes")),
         cgrp_size_m=int(m.group("cgrp_m")),
         cgrp_size_n=int(m.group("cgrp_n")),
-        epi_tile_mn=(cta_m, 32),
+        # The epilogue drains one MMA-M block per pass.
+        epi_tile_mn=(mma_m, 32),
         threads_per_cta=256,
         pipeline=pipeline,
         acc_stages=2,
-        mma_inst_m=int(m.group("mma_m")),
+        mma_inst_m=mma_m,
         mma_inst_n=int(m.group("mma_n")),
         mma_inst_k_bytes=int(m.group("mma_k_bytes")),
     )
