@@ -26,6 +26,101 @@ TEST_CASE("Tensor attributes", "[tensor][serialize]") {
     REQUIRE(tensor_attributes_deserialized == tensor_attributes);
 }
 
+TEST_CASE("Tensor attributes alignment", "[tensor][serialize]") {
+    namespace fe = cudnn_frontend;
+
+    auto make_tensor = []() -> fe::graph::Tensor_attributes {
+        return fe::graph::Tensor_attributes()
+            .set_name("image")
+            .set_dim({4, 32, 16, 16})
+            .set_stride({32 * 16 * 16, 1, 32 * 16, 32})
+            .set_uid(12312)
+            .set_data_type(fe::DataType_t::HALF);
+    };
+
+    SECTION("a non-default alignment survives the round trip") {
+        auto tensor_attributes = make_tensor().set_alignment(4);
+
+        json j = tensor_attributes;
+        REQUIRE(j.contains("alignment"));
+        REQUIRE(j["alignment"].get<int64_t>() == 4);
+
+        auto deserialized = j.get<fe::graph::Tensor_attributes>();
+        REQUIRE(deserialized.get_alignment() == 4);
+    }
+
+    SECTION("the default alignment is not emitted") {
+        auto tensor_attributes = make_tensor();
+        REQUIRE(tensor_attributes.get_alignment() == fe::graph::Tensor_attributes::default_alignment);
+
+        json j = tensor_attributes;
+        REQUIRE_FALSE(j.contains("alignment"));
+
+        auto deserialized = j.get<fe::graph::Tensor_attributes>();
+        REQUIRE(deserialized.get_alignment() == fe::graph::Tensor_attributes::default_alignment);
+    }
+
+    SECTION("a payload with no alignment key deserializes to the default") {
+        json j = make_tensor().set_alignment(4);
+        REQUIRE(j.erase("alignment") == 1);
+
+        fe::graph::Tensor_attributes deserialized;
+        REQUIRE_NOTHROW(deserialized = j.get<fe::graph::Tensor_attributes>());
+        REQUIRE(deserialized.get_alignment() == fe::graph::Tensor_attributes::default_alignment);
+    }
+}
+
+TEST_CASE("conv graph serialization preserves alignment", "[graph][serialize]") {
+    namespace fe = cudnn_frontend;
+
+    fe::graph::Graph graph;
+
+    auto x = graph.tensor(fe::graph::Tensor_attributes());
+    x->set_name("image")
+        .set_dim({4, 32, 16, 16})
+        .set_stride({32 * 16 * 16, 1, 32 * 16, 32})
+        .set_data_type(fe::DataType_t::HALF)
+        .set_alignment(4);
+
+    auto w = graph.tensor(fe::graph::Tensor_attributes());
+    w->set_name("weight")
+        .set_dim({64, 32, 3, 3})
+        .set_stride({32 * 3 * 3, 1, 32 * 3, 32})
+        .set_data_type(fe::DataType_t::HALF);
+
+    auto conv_fprop_attributes = fe::graph::Conv_fprop_attributes()
+                                     .set_name("conv_fprop")
+                                     .set_padding({1, 1})
+                                     .set_stride({1, 1})
+                                     .set_dilation({1, 1})
+                                     .set_compute_data_type(fe::DataType_t::FLOAT);
+
+    auto y = graph.conv_fprop(x, w, conv_fprop_attributes);
+    y->set_name("output").set_output(true).set_data_type(fe::DataType_t::HALF);
+
+    auto alignment_of = [](json const& serialized, std::string const& name) -> int64_t {
+        for (auto const& tensor : serialized["tensors"]) {
+            if (tensor.contains("name") && tensor["name"].get<std::string>() == name) {
+                return tensor.value("alignment", fe::graph::Tensor_attributes::default_alignment);
+            }
+        }
+        return -1;
+    };
+
+    json j = graph;
+
+    REQUIRE(alignment_of(j, "image") == 4);
+    REQUIRE(alignment_of(j, "weight") == fe::graph::Tensor_attributes::default_alignment);
+
+    fe::graph::Graph graph_deserialized;
+    REQUIRE(graph_deserialized.deserialize(j).is_good());
+
+    json j2 = graph_deserialized;
+
+    REQUIRE(alignment_of(j2, "image") == 4);
+    REQUIRE(j == j2);
+}
+
 TEST_CASE("Context serialization", "[context][serialize]") {
     namespace fe = cudnn_frontend;
 
