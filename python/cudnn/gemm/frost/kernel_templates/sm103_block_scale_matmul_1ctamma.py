@@ -1042,7 +1042,7 @@ def _kernel(
         # One M block's accumulator columns are contiguous.
         subtile_cnt = cute.ceil_div(epi_cols_per_mma_m, 32)
         t2r_inst_repx = epi_tile_mn[1]
-        if cutlass.const_expr(cta_tile_mnk[0] == 64):
+        if cutlass.const_expr(mma_inst_shape_mnk[0] == 64):
             shape = nvvm.Tcgen05LdStShape.SHAPE_16X32BX2
             ld_half_off = 0
         else:

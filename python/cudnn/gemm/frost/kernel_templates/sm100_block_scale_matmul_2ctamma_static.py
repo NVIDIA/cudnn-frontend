@@ -913,7 +913,7 @@ def _kernel(
 
                     if warp_idx == 0:
                         if cutlass.const_expr(cd_out_is_m_major):
-                            for _mb in cutlass.range_constexpr(cta_tile_mnk[0] // cd_mmajor_atom_m):
+                            for _mb in cutlass.range_constexpr(epi_tile_mn[0] // cd_mmajor_atom_m):
                                 if elect_one:
                                     nvvm.cp_async_bulk_tensor_global_shared_cta(
                                         tma_c_desc.get_ptr(),

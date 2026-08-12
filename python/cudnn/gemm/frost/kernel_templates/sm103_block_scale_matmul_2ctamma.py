@@ -1127,7 +1127,7 @@ def _kernel(
         while is_valid != 0:
             coord_m_tile = tile_m * cgrp_tile_mnk[0] + m_rank * cta_tile_mnk[0]
             coord_n_c = tile_n * cgrp_tile_mnk[1] + n_rank * pair_n_size
-            if cutlass.const_expr(cta_tile_mnk[0] == 64):
+            if cutlass.const_expr(epi_rows_per_mma_m == 64):
                 coord_n_c = coord_n_c + (warp_idx // 2) * cols_per_acc_stage
 
             acc_stage = tile_iter % acc_stages

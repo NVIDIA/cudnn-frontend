@@ -2308,7 +2308,10 @@ def test_illegal_mma_decomposition_rejected(name: str, reason: str) -> None:
 
 def test_split_tiles_are_by_name_only() -> None:
     """Split geometries are reachable only through `by_name` synthesis, so they
-    stay out of the funnel's candidate set, the full sweep and the benchmarks."""
+    stay out of the funnel's candidate set, the CUDNN_GEMM_TEST_FULL sweep and the
+    benchmarks' default config set (which is built from the funnel). They are still
+    measurable by name: `benchmark_matmul.py --configs` resolves an unknown label
+    through `by_name`."""
     from cudnn.gemm.frost.graph_analyzer import analyze
     from cudnn.gemm.frost.kernel_registry import candidates
 

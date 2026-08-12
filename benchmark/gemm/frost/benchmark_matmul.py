@@ -65,7 +65,7 @@ def _spec_for(name):
     """(geometry cfg, cta_group, scheduler) for a --configs label, or None.
 
     The sweep set comes from the registry funnel over CATALOG; a label naming a
-    geometry outside it (e.g. a num_mma_m/n > 1 tile, which `by_name` synthesizes) is
+    geometry outside it (e.g. a num_mma_m > 1 tile, which `by_name` synthesizes) is
     still runnable, so parse it rather than reporting UNKNOWN_CONFIG."""
     spec = _SPEC_MAP.get(name)
     if spec is not None:
