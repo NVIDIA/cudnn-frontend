@@ -15,8 +15,8 @@ from cudnn import behavior_note
 from cudnn.engines.base import BaseEngine, CompiledPlan
 
 from cudnn.frost import buffers
-from cudnn.frost.workspace import Workspace, WorkspaceLayout
-from ..engine_utils import _FrostPlan, _check_contiguous, _require_dtype, _require_state_pair
+from cudnn.frost.workspace import Workspace, WorkspaceLayout, carve_plan
+from ..engine_utils import _FrostPlan, _require_dtype, _require_state_pair
 
 
 def _the_gdn2_node(graph):
@@ -144,6 +144,18 @@ class CompiledGdn2:
         self._off_tensormaps = layout.add(self._tensormap_bytes, align=128)
         self._ws_bytes = layout.size
 
+        self._carve = carve_plan(
+            "gdn2",
+            [
+                (self._off_sched, "int32", (2,)),
+                (self._off_work_items, "int32", (self._work_item_rows, WORK_ITEM_FIELDS)),
+                (self._off_item_scratch, "int32", (self._work_item_rows, WORK_ITEM_FIELDS)),
+                (self._off_work_count, "int32", (1,)),
+                (self._off_chunk_scratch, "float32", (self._chunk_scratch_rows, HO)),
+                (self._off_tensormaps, "int64", (self._tensormap_bytes // 8,)),
+            ],
+        )
+
     def workspace_bytes(self) -> int:
         return self._ws_bytes
 
@@ -159,18 +171,11 @@ class CompiledGdn2:
         s0 = nb.inputs.get("initial_state")
         o = nb.outputs["O"]
         fs = nb.outputs["final_state"] if self._has_fs else None
-        _check_contiguous("Gdn2FrostEngine (GDN2)", q=q, k=k, v=v, g=g, beta=beta, w=w, cu_seqlens=cu, initial_state=s0, O=o, final_state=fs)
 
         stream = stream if stream is not None else 0
 
-        ws = Workspace(workspace, self._ws_bytes, "Gdn2FrostEngine (GDN2)")
-        sched_ctr = ws.view(self._off_sched, "int32", (2,))
-        from .common.split_k import WORK_ITEM_FIELDS
-
-        work_items = ws.view(self._off_work_items, "int32", (self._work_item_rows, WORK_ITEM_FIELDS))
-        item_scratch = ws.view(self._off_item_scratch, "int32", (self._work_item_rows, WORK_ITEM_FIELDS))
-        work_count = ws.view(self._off_work_count, "int32", (1,))
-        chunk_scratch = ws.view(self._off_chunk_scratch, "float32", (self._chunk_scratch_rows, self._n_heads_out))
+        ws = workspace
+        sched_ctr, work_items, item_scratch, work_count, chunk_scratch, tensormaps = ws.carve(self._carve)
         from .common.split_k import build_split_table
 
         build_split_table(
@@ -206,7 +211,7 @@ class CompiledGdn2:
             work_items=work_items,
             work_count=work_count,
             sched_ctr=sched_ctr,
-            tensormap_workspace=ws.view(self._off_tensormaps, "int64", (self._tensormap_bytes // 8,)),
+            tensormap_workspace=tensormaps,
             stream=stream,
         )
         return None

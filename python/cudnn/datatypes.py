@@ -167,6 +167,69 @@ def _torch_to_cudnn_data_type(torch_data_type) -> cudnn_data_type:
         return None
 
 
+# cuDNN enum -> the dtype NAME frost.buffers speaks (its DTYPES table is keyed
+# by name because a DLPack view needs no tensor library). Built once: this is
+# read per operand per execute.
+_CUDNN_TO_FROST_DTYPE_NAME = {
+    cudnn_data_type.FLOAT: "float32",
+    cudnn_data_type.HALF: "float16",
+    cudnn_data_type.BFLOAT16: "bfloat16",
+    cudnn_data_type.DOUBLE: "float64",
+    cudnn_data_type.INT64: "int64",
+    cudnn_data_type.INT32: "int32",
+    cudnn_data_type.INT8: "int8",
+    cudnn_data_type.UINT8: "uint8",
+    cudnn_data_type.BOOLEAN: "bool",
+    cudnn_data_type.FP8_E4M3: "float8_e4m3fn",
+    cudnn_data_type.FP8_E5M2: "float8_e5m2",
+    cudnn_data_type.FP8_E8M0: "float8_e8m0fnu",
+}
+
+
+def _cudnn_to_frost_dtype_name(data_type):
+    """Name for a cuDNN dtype in the vocabulary ``frost.buffers.DTYPES`` uses,
+    or None when the type has no DLPack-expressible name (the sub-byte ones —
+    fp4 has a DLPack code but an itemsize of 0 bytes, so a caller must pass it
+    as a typed buffer rather than as a bare address).
+
+    Lives here so the mapping has one home; frost imports it rather than
+    keeping a second table."""
+    return _CUDNN_TO_FROST_DTYPE_NAME.get(data_type)
+
+
+_buffer_dtype_to_cudnn_dict = None
+
+
+def _buffer_dtype_to_cudnn(dtype) -> cudnn_data_type:
+    """cuDNN enum for however a caller's buffer spells its dtype, or None.
+
+    ONE table for every framework rather than one per framework: a torch dtype,
+    a numpy/cupy dtype and a bare name string are all hashable and mutually
+    unequal, so they coexist as keys and the caller needs no branch. numpy has
+    no bfloat16, which is why the name keys exist at all — that is the dtype a
+    DLPack read hands back for the case torch's ``__cuda_array_interface__``
+    cannot express.
+    """
+    global _buffer_dtype_to_cudnn_dict
+    if _buffer_dtype_to_cudnn_dict is None:
+        table = {name: enum for enum, name in _CUDNN_TO_FROST_DTYPE_NAME.items()}
+        if is_torch_available():
+            table.update(_torch_to_cudnn_data_type_dict)
+        try:
+            import numpy
+        except ImportError:
+            pass
+        else:
+            for name, enum in list(table.items()):
+                if isinstance(name, str):
+                    try:
+                        table[numpy.dtype(name)] = enum
+                    except TypeError:
+                        pass  # no numpy spelling (bfloat16); the name key serves it
+        _buffer_dtype_to_cudnn_dict = table
+    return _buffer_dtype_to_cudnn_dict.get(dtype)
+
+
 def _torch_to_cutlass_data_type(data_type, interpret_uint8_as_fp4x2: bool = False):
     # A torch dtype can only be passed in if torch is already imported, so probing
     # sys.modules avoids importing torch on behalf of other frameworks' dtypes.
@@ -265,3 +328,27 @@ def _is_jax_array(input_tensor) -> bool:
     if jax is not None and isinstance(input_tensor, getattr(jax, "Array", ())):
         return True
     return type(input_tensor).__module__.startswith(("jax", "jaxlib"))
+
+
+# The DLPack (code, bits) a cuDNN dtype travels as. The native variant pack
+# speaks DLPack, so this is the one translation between it and the graph's
+# vocabulary.
+_CUDNN_TO_DLPACK_CODE_BITS = {}
+
+
+def _init_dlpack_dtype_tables():
+    from .frost.buffers import DTYPES
+
+    for enum, name in _CUDNN_TO_FROST_DTYPE_NAME.items():
+        code_bits = DTYPES.get(name)
+        if code_bits is None:
+            continue
+        _CUDNN_TO_DLPACK_CODE_BITS[enum] = code_bits
+
+
+def _dlpack_code_bits(data_type):
+    """``(code, bits)`` for a cuDNN dtype, or ``(0, 0)`` when it has no DLPack
+    spelling — a slot with no dtype still carries its pointer and shape."""
+    if not _CUDNN_TO_DLPACK_CODE_BITS:
+        _init_dlpack_dtype_tables()
+    return _CUDNN_TO_DLPACK_CODE_BITS.get(data_type, (0, 0))

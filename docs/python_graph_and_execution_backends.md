@@ -80,15 +80,65 @@ create_execution_plans([heur_mode.A, ...])                    _pygraph.py
 - `BaseEngine`: `check_support(graph)` (accept, or decline by raising),
   `build_plan(graph, plan, ctx) → CompiledPlan` (the expensive
   JIT step, once per graph/plan, cached on the graph),
-  `CompiledPlan.execute(graph, uid_to_data, ExecutionContext)` with explicit
-  handle/stream/workspace/overrides. `uid_to_data` is the caller's variant
-  pack, exactly as the classic backend receives it; engines that address
-  buffers by port name call `resolve_node_buffers(graph, uid_to_data)`
-  (`engines/base.py`), which joins the pack with each node's wired ports —
-  strict missing-buffer validation, torch tensors detached once (DLPack/CAI
-  refuse `requires_grad` export) — into per-node `NodeBuffers`
-  (`{port_name: caller buffer}`). Simple eager engines implement
-  `execute()` only.
+  `CompiledPlan.execute(graph, operands, ExecutionContext)` with explicit
+  handle/stream/workspace. Dynamic-shape overrides are a backend-path feature:
+  a python plan is compiled for the shapes the graph declared, so `execute()`
+  refuses them rather than silently running a different problem. Simple eager
+  engines implement `execute()` only.
+
+#### The variant pack is normalized once
+
+`graph.execute()` converts whatever the caller passed — a torch tensor, a
+`DeviceView`, any `__dlpack__` / `__cuda_array_interface__` producer, or a bare
+device address — into a `VariantPack` at the top, and everything below reads that.
+**Do not add a branch on what the caller's object is.** This exists because
+there used to be two such branches: the backend path accepted a bare address
+(`_native_var_pack`'s `if type(d) is int: return d`) while an engine got the
+object untouched and `frost.buffers.probe` refused it. One public call, two
+answers, decided by which plan the heuristics happened to pick — which the
+caller does not control.
+
+`VariantPack` carries the caller-filled uids ascending and the operands
+themselves, held in a C type (`pygraph/variant_pack.cpp`) as one `DLTensor`
+each. That type both consumes `__dlpack_c_exchange_api__` — the C function
+table a producer publishes on its type, which is how one crossing reads the
+whole pack — and implements it, so a kernel reads a slot through the same fast
+path it has for a framework tensor. `address` is the pointer array
+`_execute_with_raw_ptrs` takes.
+
+Each operand's OWN dim/stride/data_type is what the pack holds, deliberately
+not the graph's declaration: the two may differ and one engine relies on it —
+`frost_gemm` takes its M/N/K from the buffers, so a plan built for one problem
+size runs another bit-exactly. **Read the IR port for the shape the plan was
+built for; read the pack for the shape about to run.**
+
+Two rules that are easy to break by accident:
+
+- **The pointer array is per call.** Two threads may execute one graph
+  concurrently with different buffers. A shared array hands each thread the
+  other's pointers, and each pointer in it is individually valid, so the failure
+  is a wrong number rather than a raise.
+- **The operand order has exactly one source, never a union.** The lowered
+  graph's variant-pack template when the graph has one — only C++ sees every
+  user slot, since a tensor's `ragged_offset` is an operand but hangs off the
+  `Tensor` rather than off a node port, and the slots the graph fills itself
+  (pass-by-value scalars, slice replacement destinations, workspace
+  modifications) must be excluded. The python IR only for the python-only ops
+  that never lower. The two sides do not have to agree: each indexes the layout
+  it was handed.
+
+`is_virtual` on a python-only graph does not mean "the caller supplies
+nothing" — it is a statement about the backend's lowering, and a gdn graph marks
+its own `O` virtual while the caller passes a buffer for it. So the layout there
+is every wired port, and an unfilled slot is an optional port the caller did not
+request.
+
+`CompiledPlan.takes_variant_pack` is the migration flag. An engine that has not
+set it still receives the caller's `{uid: buffer}` map and reaches ports through
+`resolve_node_buffers`; the flag and that function both go once the last engine
+has moved. `execute()` builds the `Tensor`s only for a plan that sets the flag —
+measured, normalizing for a plan that will not read the result costs more than
+it saves.
 - **An engine does not propose its own plans.** Which configs to try, in what
   order, and where the backend's entries belong is one comparison across every
   candidate, and no engine can make it from the inside — it sees neither its

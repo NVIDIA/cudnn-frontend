@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, List
 
 from cudnn import behavior_note
 from cudnn.engines.base import BaseEngine, CompiledPlan, ExecutionContext, PlanConfig
+from cudnn.frost.workspace import Workspace
 
 if TYPE_CHECKING:
     from cudnn._pygraph import pygraph
@@ -22,42 +23,41 @@ if TYPE_CHECKING:
 class _FrostGemmPlan(CompiledPlan):
     """A compiled fused-GEMM kernel plus the graph binding it was compiled for."""
 
+    takes_variant_pack = True
+
     def __init__(self, compiled):
         self._compiled = compiled
         # Keyed by tensor OBJECT, not uid: one tensor can occupy two operand
         # roles (matmul(A, A)), and resolve_variant_pack treats a repeated uid
         # as ambiguous.
         self._tensors = list(compiled.binding.bound_tensors())
+        self._slots = None
 
     def get_workspace_size(self) -> int:
         return int(getattr(self._compiled, "workspace_bytes", 0) or 0)
 
-    def execute(self, graph, uid_to_data, ctx: ExecutionContext) -> None:
-        pack, missing = {}, []
-        for t in self._tensors:
-            buf = uid_to_data.get(t.get_uid())
-            if buf is None:
-                missing.append(t.get_name() or t.get_uid())
-            else:
-                pack[t] = buf
-        if missing:
-            raise ValueError(f"frost_gemm: the variant pack is missing buffers for {missing}")
+    def execute(self, graph, variant_pack, ctx: ExecutionContext) -> None:
+        slots = self._slots
+        if slots is None:
+            try:
+                slots = self._slots = [variant_pack.slot(t.get_uid()) for t in self._tensors]
+            except KeyError as exc:
+                raise ValueError(f"frost_gemm: tensor uid {exc} is bound by the kernel but is not an operand of this graph") from exc
+        # The kernel reads its M/N/K off these, so they must be the pack's --
+        # which carry the shape this execute runs, override_shapes included.
+        views = variant_pack.views(slots)
         required = self.get_workspace_size()
-        if required:
-            _check_workspace(ctx.workspace, required)
-            self._compiled(pack, ctx.workspace, stream=ctx.stream)
+        # Scratch is carved from the CALLER's workspace: stable pointers, so a
+        # plan stays safe to capture in a CUDA graph.
+        extra = (Workspace.over(variant_pack, required, "frost_gemm"),) if required else ()
+        run_resolved = getattr(self._compiled, "run_resolved", None)
+        if run_resolved is not None:
+            # Which bound tensor holds which operand was settled at build, so
+            # resolve_variant_pack's by-object / by-uid / by-name tables have
+            # no question left to answer.
+            run_resolved({id(t): v for t, v in zip(self._tensors, views)}, *extra, stream=ctx.stream)
         else:
-            self._compiled(pack, stream=ctx.stream)
-
-
-def _check_workspace(workspace, required: int) -> None:
-    """A FROST executor carves its scratch out of the CALLER's workspace: no
-    hidden per-execute allocation, stable pointers, CUDA-graph friendly."""
-    if workspace is None:
-        raise ValueError(f"frost_gemm needs a {required}-byte workspace; execute() got none — allocate graph.get_workspace_size() bytes and pass it")
-    available = workspace.numel() * workspace.element_size() if hasattr(workspace, "numel") else len(workspace)
-    if available < required:
-        raise ValueError(f"frost_gemm needs a {required}-byte workspace; the buffer provides {available}")
+            self._compiled(dict(zip(self._tensors, views)), *extra, stream=ctx.stream)
 
 
 class FrostGemmEngine(BaseEngine):

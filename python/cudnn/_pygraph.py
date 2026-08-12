@@ -19,15 +19,50 @@ Example (pass torch tensors directly):
     >>> graph.execute({C: c_tensor})  # routes to a supporting engine, else cuDNN
 """
 
+import ctypes
 from dataclasses import dataclass
 import logging
 import weakref
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
-from .graph_types import NodeType, Tensor
+from cudnn import _pybind_module
+
+from .datatypes import _buffer_dtype_to_cudnn, _dlpack_code_bits, _torch_to_cudnn_data_type
+from .engines.base import ExecutionContext, VariantPack
+from .engines.engine_ids import is_python_engine
+from .graph_types import NodeType, Tensor, byte_size as _byte_size, describing_tensor
 from .nodes import Node, _row_major_stride
 
 _LOG = logging.getLogger("cudnn.pygraph")
+
+
+def _is_dense(dim, stride) -> bool:
+    """Row-major compact."""
+    expect = 1
+    for extent, step in zip(reversed(tuple(dim)), reversed(tuple(stride))):
+        if extent != 1 and step != expect:
+            return False
+        expect *= extent
+    return True
+
+
+def _in_axis_order_of(shape, stride, reference_stride):
+    """``(shape, stride)`` re-expressed in the axis order ``reference_stride`` uses.
+
+    ``override_shapes`` speaks the GRAPH's declaration (a matmul's B is
+    ``[batch, K, N]``); the slot holds what the caller's buffer reports (B is
+    allocated ``(batch, N, K)``). Same memory, two orders — so an engine
+    indexing an extent by position would read the wrong one. Both orders rank
+    their axes the same way by stride, which gives the permutation.
+    """
+    if len(shape) != len(stride) or len(stride) != len(reference_stride):
+        return tuple(shape), tuple(stride)
+    by_stride = sorted(range(len(stride)), key=lambda i: -stride[i])
+    reference = sorted(range(len(reference_stride)), key=lambda i: -reference_stride[i])
+    permutation = [0] * len(stride)
+    for rank, axis in enumerate(by_stride):
+        permutation[reference[rank]] = axis
+    return tuple(shape[a] for a in permutation), tuple(stride[a] for a in permutation)
 
 
 def cudnn_graph_not_supported(message: str) -> Exception:
@@ -49,11 +84,6 @@ class GraphContext:
     io_data_type: Any = None
     intermediate_data_type: Any = None
     compute_data_type: Any = None
-
-    def __setattr__(self, name, value):
-        if getattr(self, "_frozen", False) and name != "_frozen":
-            raise RuntimeError("the graph is frozen after lowering/planning — build a new graph to change its configuration")
-        object.__setattr__(self, name, value)
 
 
 class pygraph:
@@ -150,6 +180,10 @@ class pygraph:
         self._workspace_limit: Optional[int] = None  # deselect_workspace_greater_than()
         self._note_filters: List[Any] = []  # (kind, note, keep) from the classic note filters
         self._plan_pinned: bool = False  # select_plan() => the walk is strict
+        # Backend operand order + the reusable pointer array handed to execute.
+        # Both are properties of the frozen graph, so they outlive any one call.
+        self._sorted_uids: Optional[List[int]] = None
+        self._selected_engine_cache = None  # (plan config, engine); see selected_engine
 
     # =========================================================================
     # Routing
@@ -162,8 +196,6 @@ class pygraph:
 
     @property
     def _selected_plan_config(self) -> Optional[Any]:
-        from .engines.engine_ids import is_python_engine
-
         if not self._plans or not 0 <= self._plan_index < len(self._plans):
             return None
         cfg = self._plans[self._plan_index]
@@ -171,8 +203,6 @@ class pygraph:
 
     def _engine_for(self, cfg) -> Optional["BaseEngine"]:
         """The python engine that owns ``cfg``'s id, or None for a backend entry."""
-        from .engines.engine_ids import is_python_engine
-
         if cfg is None or not is_python_engine(cfg.engine_id):
             return None
         owners = self._owners_for_id(cfg.engine_id)
@@ -223,8 +253,21 @@ class pygraph:
     @property
     def selected_engine(self) -> Optional["BaseEngine"]:
         """The python engine for the currently selected plan entry, or None for
-        the backend path. Populated after create_execution_plans()."""
-        return self._engine_for(self._selected_plan_config)
+        the backend path. Populated after create_execution_plans().
+
+        Cached, because ``execute()`` asks on every call and answering means
+        walking every registered engine for the one declaring this id — 2.75 us
+        to re-derive something that only ``select_plan`` can change. Keyed on
+        the config OBJECT, so replanning invalidates it without needing a hook
+        on every writer of ``_plan_index``.
+        """
+        cfg = self._selected_plan_config
+        cached = self._selected_engine_cache
+        if cached is not None and cached[0] is cfg:
+            return cached[1]
+        engine = self._engine_for(cfg)
+        self._selected_engine_cache = (cfg, engine)
+        return engine
 
     # =========================================================================
     # Tensor Creation
@@ -360,14 +403,17 @@ class pygraph:
         self._is_validated = False
 
     def _freeze(self) -> None:
-        """Freeze the ENTIRE public graph surface (not just the fluent API).
+        """Freeze the ENTIRE public graph surface.
 
-        Called at lowering and at planning, whichever happens first. After
-        this, every mutation path raises: fluent setters and op builders (via
-        _check_mutable), attribute writes on Tensor/Node/GraphContext (their
-        __setattr__ guards), dict writes on node.inputs/outputs/params
-        (MappingProxy), and in-place list mutation of dim/stride (tuples).
-        The inspection surface stays fully readable for engines."""
+        Called at lowering and at planning, whichever happens first.
+
+        Frozen-ness is ONE flag, on the graph. Every mutation route the public
+        API offers goes through _check_mutable (the chained setters via
+        Tensor._guard / Node._guard, and the op builders), so the flag alone is
+        the guard. The structures the caller could otherwise mutate behind the
+        API's back are made immutable in their own right rather than watched:
+        node.inputs/outputs/params become MappingProxy views and dim/stride
+        become tuples. The inspection surface stays fully readable for engines."""
         if self._frozen:
             return
         from types import MappingProxyType
@@ -376,12 +422,9 @@ class pygraph:
             node.inputs = MappingProxyType(dict(node.inputs))
             node.outputs = MappingProxyType(dict(node.outputs))
             node.params = MappingProxyType(dict(node.params))
-            node._frozen = True
         for t in self._tensor_by_uid.values():
             t.dim = tuple(t.dim) if t.dim else t.dim
             t.stride = tuple(t.stride) if t.stride else t.stride
-            t._frozen = True
-        self._context._frozen = True
         self._frozen = True
 
     def _rename_tensor(self, t: Tensor, name: str) -> None:
@@ -1222,8 +1265,6 @@ class pygraph:
         return cudnn.get_stream(handle)
 
     def _build_context(self, handle: Any = None) -> Any:
-        from .engines.base import ExecutionContext
-
         h = handle if handle is not None else self._handle
         return ExecutionContext(handle=h, stream=self._resolve_stream(h))
 
@@ -1718,36 +1759,243 @@ class pygraph:
             self.build(ctx=caller_ctx)
 
         uid_to_data = self._uid_to_data(tensor_dict)
+        # The dynamic-shape overrides live only on the backend's uid-map
+        # overload, so a call carrying them takes that path and normalizes
+        # nothing.
+        overriding = override_uids is not None or override_shapes is not None or override_strides is not None
         eng = self.selected_engine
-        if eng is not None:  # python engine (plan id in the reserved region)
-            from .engines.base import ExecutionContext
 
+        if eng is not None:  # python engine (plan id in the reserved region)
             h = handle if handle is not None else self._handle
-            ctx = ExecutionContext(
-                handle=h,
-                stream=self._resolve_stream(h),
-                workspace=workspace,
-                override_uids=override_uids,
-                override_shapes=override_shapes,
-                override_strides=override_strides,
-            )
+            ctx = ExecutionContext(handle=h, stream=self._resolve_stream(h), workspace=workspace)
             if self._plan_index not in self._compiled_plans:
                 # compile with the CALLER's context (execute-supplied handle
                 # and its stream reach the JIT build)
                 self._compiled_plans[self._plan_index] = eng.build_plan(self, self._selected_plan_config, ctx)
                 self._is_built = True
-            self._compiled_plans[self._plan_index].execute(self, uid_to_data, ctx)
+            plan = self._compiled_plans[self._plan_index]
+            # Overrides go INTO the pack rather than around it: they describe
+            # what this execute runs, so an engine reading the pack agrees with
+            # the backend without knowing they exist.
+            if plan.takes_variant_pack:
+                pack = self._normalize(uid_to_data, workspace, override_uids, override_shapes, override_strides)
+                plan.execute(self, pack, ctx)
+            else:
+                plan.execute(self, uid_to_data, ctx)
             return
 
-        # Backend path. Variant-pack keys are IR uids == the C++ uids by
-        # construction. Address the plan the WALK built, not the backend's own
+        variant_pack = None if overriding else self._normalize(uid_to_data, workspace)
+
+        # Backend path. Address the plan the WALK built, not the backend's own
         # selection: they differ once the walk has skipped an entry.
-        var_pack, ws_ptr = self._native_var_pack(uid_to_data, workspace)
         cfg = self._materialize_backend_plan(self._plan_index) if self._plans else None
-        if cfg is not None and cfg.cpp_index is not None:
-            self._lowered_graph._execute_plan_at_index(var_pack, ws_ptr, cfg.cpp_index, handle, override_uids, override_shapes, override_strides)
+        cpp_index = cfg.cpp_index if cfg is not None else None
+
+        # C++ turns a uid map into sorted pointers anyway (graph_interface.h,
+        # "uid map -> extract sorted ptrs, delegate to the sorted_ptrs
+        # implementation"), so handing it the sorted array directly skips one
+        # dict build here, one map copy in pybind, and one hash lookup per
+        # operand there.
+        if variant_pack is not None:
+            self._lowered_graph._execute_with_raw_ptrs(
+                variant_pack.address,
+                len(variant_pack),
+                variant_pack.workspace,
+                handle or 0,
+                -1 if cpp_index is None else cpp_index,
+            )
+            return
+
+        var_pack, ws_ptr = self._native_var_pack(uid_to_data, workspace)
+        if cpp_index is not None:
+            self._lowered_graph._execute_plan_at_index(var_pack, ws_ptr, cpp_index, handle, override_uids, override_shapes, override_strides)
             return
         self._lowered_graph._execute(var_pack, ws_ptr, handle, override_uids, override_shapes, override_strides)
+
+    def _variant_pack_uids(self) -> Optional[List[int]]:
+        """The graph's caller-filled variant_pack, ASCENDING by uid.
+
+        Taken from the lowered graph whenever there is one: C++ is the only
+        side that can see every user slot, including the ones a walk over node
+        ports cannot name (a tensor's ragged_offset hangs off the Tensor, not
+        off a port) and correctly excluding the slots the graph fills itself
+        (pass-by-value scalars it already knows, slice replacement
+        destinations, cached workspace modifications).
+
+        A python-only graph — gdn / kda / gdn2, which cannot lower by
+        construction — has no C++ side, so its variant_pack come from the IR. The
+        two never have to agree: each side indexes the layout it was given.
+        """
+        order = self._sorted_uids
+        if order is not None:
+            return order
+        lowered = self._lowered_graph
+        if lowered is not None:
+            try:
+                # The order lives in the variant-pack template, which C++ builds
+                # lazily inside execute; the query itself does not trigger it, so
+                # ask explicitly or it answers with an empty list.
+                lowered._prepare_variant_pack_template()
+                order = list(lowered._get_variant_pack_uids_sorted())
+            except Exception:  # noqa: BLE001 — no template available yet
+                order = []
+        else:
+            # Every tensor wired to a port, virtual or not. is_virtual is a
+            # statement about the BACKEND's lowering — an intermediate it fuses
+            # away — and a python-only op never lowers, so it does not mean
+            # "the caller supplies nothing": a gdn graph marks its own O virtual
+            # and the caller passes a buffer for it regardless. A slot nobody
+            # fills stays empty; which ports are optional is the engine's own
+            # business, and it already reads them with .get().
+            order = sorted({t.uid for node in self._nodes for t in list(node.inputs.values()) + list(node.outputs.values()) if t is not None})
+        if not order:
+            return None
+        self._sorted_uids = order
+        return order
+
+    def _normalize(self, uid_to_data: Dict[int, Any], workspace: Any, override_uids=None, override_shapes=None, override_strides=None):
+        """Turn the caller's variant pack into :class:`VariantPack`, once.
+
+        This is the ONLY place a caller's object is inspected. Everything below
+        — the backend and every python engine — reads the pointers and Tensors
+        built here, so the two paths cannot disagree about what the caller
+        passed. Returns None when the operand layout is not known yet, which
+        puts the caller back on the uid-map path.
+
+        Overrides are applied here, to the slot, because they are part of the
+        same answer: ``override_shapes`` says the caller allocated at a cache
+        shape and is running a smaller one this call, so the pack must describe
+        the shape about to run rather than the allocation. An engine that reads
+        the pack then honours them without knowing the concept exists — which
+        is the difference between one answer and two, since the backend
+        re-describes the tensor from the overrides either way.
+        """
+        order = self._variant_pack_uids()
+        if order is None:
+            return None
+        native = _pybind_module.VariantPackNative(len(order))
+        # One crossing for the whole pack, uid lookups included. What comes back
+        # is the slots whose producer publishes no exchange vtable; those are
+        # described here without taking the rest down with them.
+        unread = native.read_from(uid_to_data, order)
+        # The backend's layout is exactly the slots it REQUIRES, so a hole is the
+        # caller's mistake. A python-only graph's layout is every wired port,
+        # including optional ones, where a hole means "not requested".
+        strict = self._lowered_graph is not None
+        for i in unread:
+            data = uid_to_data.get(order[i])
+            if data is None:
+                continue  # named below if this graph requires it
+            ptr, tensor = self._describe(data, order[i])
+            native.set_slot(i, ptr, tuple(tensor.dim), tuple(tensor.stride), *_dlpack_code_bits(tensor.data_type))
+        if strict:
+            hole = native.first_unfilled()
+            if hole >= 0:
+                uid = order[hole]
+                declared = self._tensor_by_uid.get(uid)
+                name = f" ({declared.name!r})" if declared is not None and declared.name else ""
+                raise ValueError(f"the variant pack is missing a buffer for tensor uid {uid}{name}")
+        if override_uids:
+            # The backend refuses a partial override; a short list must not
+            # quietly mean "keep the rest" here.
+            if len(override_shapes or ()) != len(override_uids) or len(override_strides or ()) != len(override_uids):
+                raise ValueError(
+                    f"override_uids, override_shapes and override_strides must name the same tensors: got "
+                    f"{len(override_uids)}, {len(override_shapes or ())} and {len(override_strides or ())} entries"
+                )
+            slot_of = {uid: i for i, uid in enumerate(order)}
+            for j, uid in enumerate(override_uids):
+                i = slot_of.get(uid)
+                if i is None:
+                    raise ValueError(f"override_uids names tensor uid {uid}, which is not an operand of this graph")
+                native.override_slot(i, *_in_axis_order_of(tuple(override_shapes[j]), tuple(override_strides[j]), native.stride(i)))
+        # The workspace has no uid, so it is not an operand — but an engine has
+        # to bounds-check its carves, and reading its size here is the same read
+        # every other buffer gets rather than a second probe further down.
+        workspace_ptr, workspace_bytes = 0, 0
+        if workspace is not None:
+            extent = _pybind_module.read_buffer_extent(workspace)
+            if extent is None:  # a bare address, a non-dense buffer, or no vtable
+                workspace_ptr, workspace_tensor = self._describe(workspace, -1)
+                # An engine carves the workspace by byte offset, so a byte
+                # COUNT is only a byte RANGE when the buffer is dense.
+                if not _is_dense(workspace_tensor.dim, workspace_tensor.stride):
+                    raise ValueError(f"the workspace buffer must be contiguous; got dim {tuple(workspace_tensor.dim)} stride {tuple(workspace_tensor.stride)}")
+                workspace_bytes = _byte_size(workspace_tensor)
+            else:
+                workspace_ptr, workspace_bytes = extent
+        return VariantPack(tuple(order), native, workspace_ptr, workspace_bytes)
+
+    def _describe(self, data: Any, uid: int):
+        """``(pointer, Tensor)`` for one caller buffer.
+
+        The Tensor carries the buffer's OWN dim/stride/data_type, which need
+        not match what the graph declared — frost_gemm takes its problem size
+        from here.
+
+        Every framework publishes the same four facts under a different
+        spelling, so this asks for each spelling in turn. Two differences are
+        the only ones that matter, and both are handled below: strides are in
+        BYTES for the array-interface family and in ELEMENTS for torch/DLPack,
+        and an absent stride means dense row-major rather than unknown.
+
+        Ordered by what it costs to ask (measured, 4096x4x128): reading
+        attributes is 0.52 us for torch and 0.72 for cupy, while the DLPack
+        capsule round trip is 1.5-8.6. The expensive case is specifically torch
+        bfloat16, whose ``__cuda_array_interface__`` raises because the
+        protocol cannot spell bf16 — which is why the last branch is last and
+        not the only one.
+
+        A bare address carries no geometry, so it borrows the graph's: the
+        backend has always accepted a raw pointer, and an engine that reads the
+        pack for its extents would otherwise fail on an operand form the
+        backend takes -- one call, two answers, decided by plan selection.
+        """
+        if type(data) is int:  # bare device address
+            declared = self._tensor_by_uid.get(uid)
+            if declared is None or not declared.dim:
+                return data, Tensor(uid=uid)
+            return data, describing_tensor(uid, tuple(declared.dim), tuple(declared.stride), declared.data_type)
+        dim = getattr(data, "shape", None)
+
+        # torch: pointer from data_ptr(), strides from stride() in ELEMENTS
+        if dim is not None and hasattr(data, "data_ptr") and callable(getattr(data, "stride", None)):
+            return data.data_ptr(), describing_tensor(uid, tuple(dim), tuple(data.stride()), _buffer_dtype_to_cudnn(data.dtype))
+
+        # cupy / numba: pointer from .data.ptr, strides from .strides in BYTES
+        ptr = getattr(getattr(data, "data", None), "ptr", None)
+        if dim is not None and ptr is not None:
+            itemsize = data.dtype.itemsize
+            strides = getattr(data, "strides", None)
+            stride = tuple(s // itemsize for s in strides) if strides else _row_major_stride(dim)
+            return int(ptr), describing_tensor(uid, tuple(dim), stride, _buffer_dtype_to_cudnn(data.dtype))
+
+        # jax and bare DLPack producers: one capsule read, which is also the
+        # only reader that gets cupy's byte strides right without knowing it is
+        # cupy. It declines two different ways and they are NOT the same
+        # answer, so they are told apart: "no protocol" means a pointer is all
+        # this buffer will ever yield, while "dtype I cannot name" (fp8, fp4,
+        # anything sub-byte) still has a real dim and stride worth keeping —
+        # the torch branch above records those dtypes, and a buffer should not
+        # be described differently for having come from jax.
+        from .frost.buffers import _dlpack_geometry
+
+        geometry = _dlpack_geometry(data)
+        if geometry is None:  # neither __dlpack__ nor __cuda_array_interface__
+            return self._device_pointer(data), Tensor(uid=uid, dim=tuple(dim) if dim is not None else [])
+        ptr, dims, strides, name, _device = geometry
+        # data_type is None for a dtype with no cuDNN enum (fp4 and friends)
+        return ptr, describing_tensor(uid, tuple(dims), tuple(strides) if strides else _row_major_stride(dims), _buffer_dtype_to_cudnn(name))
+
+    @staticmethod
+    def _device_pointer(data: Any) -> int:
+        if type(data) is int:
+            return data
+        if hasattr(data, "data_ptr"):
+            return data.data_ptr()
+        import cudnn
+
+        return cudnn._pybind_module._get_data_ptr(data)  # dlpack fallback
 
     def _uid_to_data(self, tensor_dict) -> Dict[int, Any]:
         """Normalize a variant pack keyed by Tensor / name / uid to uid -> data,
@@ -1833,6 +2081,9 @@ class pygraph:
                 self._lowered_graph = cudnn._pybind_module.backend_graph()
         self._lowered_graph.deserialize(*args, **kwargs)
         self._is_built = True
+        # The loaded graph carries its own variant_pack, so an order cached while
+        # this container held a different graph no longer describes it.
+        self._sorted_uids = None
 
     def _lower_to_cpp(self) -> Any:
         """Lower Python graph to C++ (the internal ``_pybind_module.backend_graph``)."""

@@ -730,15 +730,16 @@ class PyGraph {
         return graph->get_variant_pack_uids_sorted();
     }
 
-    void
-    execute_with_ptrs(std::vector<std::intptr_t> const& user_ptrs, std::intptr_t workspace, std::intptr_t exec_handle);
-
-    // Raw pointer version: takes a pointer to an array of device pointers (no pybind11 copy)
+    // Takes a pointer to a contiguous array of device pointers, ordered as
+    // get_variant_pack_uids_sorted() reports — no pybind11 container copy and no
+    // per-operand uid->pointer hash lookup. ``plan_index`` selects the plan;
+    // -1 means the graph's own candidate.
     void
     execute_with_raw_ptrs(std::intptr_t user_ptrs_array,
                           int64_t n_user,
                           std::intptr_t workspace,
-                          std::intptr_t exec_handle);
+                          std::intptr_t exec_handle,
+                          int64_t plan_index);
 
     std::vector<BehaviorNote_t>
     get_behavior_notes();

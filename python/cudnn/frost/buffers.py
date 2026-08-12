@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import ctypes
 
+from cudnn import _pybind_module
+
 # ---------------------------------------------------------------------------
 # DLPack ABI (dlpack.h v0.8 layout; the unversioned "dltensor" capsule)
 # ---------------------------------------------------------------------------
@@ -58,15 +60,6 @@ _DLManagedTensor._fields_ = [
 ]
 
 
-@_DELETER_T
-def _noop_deleter(_ptr):
-    # views own no memory: the workspace (or caller buffer) outlives them
-    pass
-
-
-_PyCapsule_New = ctypes.pythonapi.PyCapsule_New
-_PyCapsule_New.restype = ctypes.py_object
-_PyCapsule_New.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
 _PyCapsule_GetPointer = ctypes.pythonapi.PyCapsule_GetPointer
 _PyCapsule_GetPointer.restype = ctypes.c_void_p
 _PyCapsule_GetPointer.argtypes = [ctypes.py_object, ctypes.c_char_p]
@@ -75,6 +68,10 @@ _PyCapsule_SetName.restype = ctypes.c_int
 _PyCapsule_SetName.argtypes = [ctypes.py_object, ctypes.c_char_p]
 
 # name -> (DLPack type code, bits); typestr -> name for the CAI path
+# name -> (DLPack type code, bits). Names match how torch spells them, so one
+# table serves both a dtype read off a buffer and one named in a graph.
+# Sub-byte types are deliberately absent: DTYPE_ITEMSIZE below is bits // 8, so
+# fp4 would land on 0 and take every byte/element conversion with it.
 DTYPES = {
     "float32": (2, 32),
     "float16": (2, 16),
@@ -85,6 +82,9 @@ DTYPES = {
     "int8": (0, 8),
     "uint8": (1, 8),
     "bool": (6, 8),
+    "float8_e4m3fn": (10, 8),
+    "float8_e5m2": (12, 8),
+    "float8_e8m0fnu": (14, 8),
 }
 _TYPESTR = {"<f4": "float32", "<f2": "float16", "<f8": "float64", "<i8": "int64", "<i4": "int32", "|i1": "int8", "|u1": "uint8", "|b1": "bool"}
 _CODE_BITS = {v: k for k, v in DTYPES.items()}
@@ -102,14 +102,18 @@ class DeviceView:
     """Zero-copy DLPack view over a raw CUDA pointer.
 
     The view owns no memory — the underlying allocation (workspace or caller
-    buffer) must outlive it. Row-major contiguous."""
+    buffer) must outlive it. Row-major contiguous.
+
+    Not a concept an engine has to learn: it is what a variant-pack slot or a
+    workspace region turns into on the way to a kernel, because CuTe needs an
+    object exposing ``__dlpack__`` and neither a pointer nor a Tensor record
+    is one."""
 
     def __init__(self, ptr: int, shape, dtype: str, device_id: int):
         self._ptr = int(ptr)
         self.shape = tuple(int(s) for s in shape)
         self.dtype = dtype
         self._device_id = int(device_id)
-        self._keepalive = []
 
     def data_ptr(self) -> int:
         return self._ptr
@@ -166,23 +170,16 @@ class DeviceView:
         return (_KDL_CUDA, self._device_id)
 
     def __dlpack__(self, *, stream=None, **_kwargs):
-        # a fresh managed struct per call; shape array + struct stay alive on
-        # the view (the no-op deleter frees nothing)
-        ndim = len(self.shape)
-        shape_arr = (ctypes.c_int64 * max(ndim, 1))(*self.shape)
+        """Delegate to a slot, which owns the struct it hands out.
+
+        A view has nowhere to put a struct that must outlive the capsule: it
+        cannot know when the consumer is done with it, and cute's from_dlpack
+        keeps the pointer rather than copying the DLTensor. Holding the struct
+        on the view and shipping a no-op deleter -- which is what this did --
+        is a use-after-free the moment a consumer outlives the view.
+        """
         code, bits = DTYPES[self.dtype]
-        mt = _DLManagedTensor()
-        mt.dl_tensor.data = ctypes.c_void_p(self._ptr)
-        mt.dl_tensor.device = _DLDevice(_KDL_CUDA, self._device_id)
-        mt.dl_tensor.ndim = ndim
-        mt.dl_tensor.dtype = _DLDataType(code, bits, 1)
-        mt.dl_tensor.shape = shape_arr
-        mt.dl_tensor.strides = None  # None = compact row-major
-        mt.dl_tensor.byte_offset = 0
-        mt.manager_ctx = None
-        mt.deleter = _noop_deleter
-        self._keepalive.append((mt, shape_arr))
-        return _PyCapsule_New(ctypes.addressof(mt), b"dltensor", None)
+        return _pybind_module.make_slot(self._ptr, list(self.shape), code, bits, self._device_id).__dlpack__()
 
 
 class DeviceBuffer(DeviceView):
@@ -212,7 +209,28 @@ class DeviceBuffer(DeviceView):
 def probe(buf):
     """(ptr, shape, strides_in_elements_or_None, dtype_name, device_id) of a
     device buffer, via ``__cuda_array_interface__`` when available (torch,
-    CuPy, numba) else the ``__dlpack__`` protocol."""
+    CuPy, numba) else the ``__dlpack__`` protocol.
+
+    Raises for a buffer it cannot read. Callers that would rather have the
+    geometry of a buffer whose DTYPE has no name here — fp8, fp4, anything
+    sub-byte — want :func:`_dlpack_geometry`, which separates the two
+    failures."""
+    geometry = _dlpack_geometry(buf)
+    if geometry is None:
+        raise TypeError(f"buffer of type {type(buf).__name__} exposes neither __cuda_array_interface__ nor __dlpack__")
+    if geometry[3] is None:
+        raise TypeError(f"unsupported buffer dtype for {type(buf).__name__}")
+    return geometry
+
+
+def _dlpack_geometry(buf):
+    """``probe``'s reading, with its two declines made distinguishable.
+
+    Returns None when the buffer exposes neither protocol — nothing but a
+    pointer will ever come out of it. Returns the 5-tuple with ``dtype_name``
+    set to None when the buffer IS readable but its dtype has no name in
+    ``DTYPES``; dim and stride are real in that case and worth keeping.
+    """
     try:
         # torch's property RAISES for dtypes CAI can't express (bf16) instead
         # of being absent — treat any failure as "no CAI" and use DLPack
@@ -234,11 +252,11 @@ def probe(buf):
 
     dl = getattr(buf, "__dlpack__", None)
     if dl is None:
-        raise TypeError(f"buffer of type {type(buf).__name__} exposes neither __cuda_array_interface__ nor __dlpack__")
+        return None
     # stream=-1 is DLPack's "the caller handles synchronisation; do no
-    # bookkeeping". probe() only reads metadata, so it never needed any --
-    # and the default makes torch call record_stream, which is illegal inside
-    # a CUDA graph capture.
+    # bookkeeping". This only reads metadata, so it never needed any -- and the
+    # default makes torch call record_stream, which is illegal inside a CUDA
+    # graph capture.
     try:
         capsule = dl(stream=-1)
     except TypeError:  # a producer whose __dlpack__ predates the stream kwarg
@@ -248,9 +266,7 @@ def probe(buf):
     t = mt.dl_tensor
     shape = tuple(t.shape[i] for i in range(t.ndim))
     strides = tuple(t.strides[i] for i in range(t.ndim)) if t.strides else None
-    dtype = _CODE_BITS.get((t.dtype.code, t.dtype.bits))
-    if dtype is None or t.dtype.lanes != 1:
-        raise TypeError(f"unsupported buffer dtype (code={t.dtype.code}, bits={t.dtype.bits}, lanes={t.dtype.lanes})")
+    dtype = _CODE_BITS.get((t.dtype.code, t.dtype.bits)) if t.dtype.lanes == 1 else None
     ptr = (t.data or 0) + t.byte_offset
     device_id = t.device.device_id
     # release: mark the capsule consumed and run its deleter

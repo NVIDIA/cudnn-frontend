@@ -2732,14 +2732,6 @@ def _data_ptr(t) -> int:
     return t.__cuda_array_interface__["data"][0]
 
 
-def _stream_capturing(stream) -> bool:
-    """True when ``stream`` is inside CUDA-graph capture."""
-    from cuda.bindings import runtime as _rt
-
-    err, status = _rt.cudaStreamIsCapturing(int(stream))
-    return int(err) == 0 and int(status) != 0
-
-
 def _cutlass_io_dtype(dtype):
     name = str(dtype)
     if "bfloat16" in name:
@@ -3081,89 +3073,62 @@ def chunk_gdn2_sm100(
 
     compiled = cache["compiled"]
 
-    # desc key: buffer identity + cu _version so address reuse forces a rebuild
+    # The descriptors encode cu_seqlens' CONTENTS, which no key built from the
+    # buffers can track. The skip this replaces asked torch's _version counter,
+    # so it was sound for a torch caller and silently stale for every other
+    # producer. Rebuilding unconditionally measures free: 131 vs 135 us of host
+    # time, and 157 either way once the launches are waited on.
     h_for_descs = output_checkpoints if enable_checkpoints else None
-    desc_key = (
-        _data_ptr(q),
-        _data_ptr(k),
-        _data_ptr(v),
-        _data_ptr(gate),
-        _data_ptr(beta),
-        _data_ptr(w),
-        _data_ptr(output),
-        _data_ptr(h_for_descs) if h_for_descs is not None else 0,
-        checkpoint_every_n_tokens,
-        tuple(h_for_descs.shape) if h_for_descs is not None else (),
-        tuple(q.shape),
-        tuple(k.shape),
-        tuple(v.shape),
-        tuple(gate.shape),
-        tuple(beta.shape),
-        tuple(w.shape),
-        tuple(output.shape),
-    )
-    cu_versions = (getattr(cu_seqlens, "_version", 0),)
-    if (
-        cache.get("desc_key") != desc_key
-        or cache.get("desc_cu") is not cu_seqlens
-        or cache.get("desc_cu_versions") != cu_versions
-        or cache.get("desc_workspace_ptr") != _data_ptr(tensormap_workspace)
-        or _stream_capturing(stream)
-    ):
-        if cache.get("build_descs_has_h") != (h_for_descs is not None):
-            cache.pop("build_descs", None)
-            cache["build_descs_has_h"] = h_for_descs is not None
-        if "build_descs" not in cache:
-            io_dtype = _cutlass_io_dtype(q.dtype)
+    if cache.get("build_descs_has_h") != (h_for_descs is not None):
+        cache.pop("build_descs", None)
+        cache["build_descs_has_h"] = h_for_descs is not None
+    if "build_descs" not in cache:
+        io_dtype = _cutlass_io_dtype(q.dtype)
 
-            def _bd3(t):
-                c = from_dlpack(t, assumed_align=16)
-                c.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2), divisibility=1)
-                return c
+        def _bd3(t):
+            c = from_dlpack(t, assumed_align=16)
+            c.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2), divisibility=1)
+            return c
 
-            def _bd4(t):
-                c = from_dlpack(t, assumed_align=16)
-                c.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2, 3), divisibility=1)
-                return c
+        def _bd4(t):
+            c = from_dlpack(t, assumed_align=16)
+            c.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2, 3), divisibility=1)
+            return c
 
-            cu_bd = from_dlpack(cu_seqlens, assumed_align=8).mark_layout_dynamic()
-            ws_bd = from_dlpack(tensormap_workspace, assumed_align=128).mark_layout_dynamic()
-            cache["build_descs"] = cute.compile(
-                _build_descs,
-                io_dtype,
-                CFG.B_T,
-                _bd3(q),
-                _bd3(k),
-                _bd3(v),
-                _bd3(gate),
-                _bd3(beta),
-                _bd3(w),
-                _bd3(output),
-                None if h_for_descs is None else _bd4(h_for_descs),
-                cu_bd,
-                ws_bd,
-                cutlass.Int32(checkpoint_every_n_tokens),
-                cu_stream,
-                options="--enable-tvm-ffi",
-            )
-        cache["build_descs"](
-            q,
-            k,
-            v,
-            gate,
-            beta,
-            w,
-            output,
-            h_for_descs,
-            cu_seqlens,
-            tensormap_workspace,
-            checkpoint_every_n_tokens,
+        cu_bd = from_dlpack(cu_seqlens, assumed_align=8).mark_layout_dynamic()
+        ws_bd = from_dlpack(tensormap_workspace, assumed_align=128).mark_layout_dynamic()
+        cache["build_descs"] = cute.compile(
+            _build_descs,
+            io_dtype,
+            CFG.B_T,
+            _bd3(q),
+            _bd3(k),
+            _bd3(v),
+            _bd3(gate),
+            _bd3(beta),
+            _bd3(w),
+            _bd3(output),
+            None if h_for_descs is None else _bd4(h_for_descs),
+            cu_bd,
+            ws_bd,
+            cutlass.Int32(checkpoint_every_n_tokens),
             cu_stream,
+            options="--enable-tvm-ffi",
         )
-        cache["desc_key"] = desc_key
-        cache["desc_cu"] = cu_seqlens
-        cache["desc_cu_versions"] = cu_versions
-        cache["desc_workspace_ptr"] = _data_ptr(tensormap_workspace)
+    cache["build_descs"](
+        q,
+        k,
+        v,
+        gate,
+        beta,
+        w,
+        output,
+        h_for_descs,
+        cu_seqlens,
+        tensormap_workspace,
+        checkpoint_every_n_tokens,
+        cu_stream,
+    )
 
     compiled(
         q,

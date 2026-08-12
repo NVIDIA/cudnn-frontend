@@ -20,9 +20,9 @@ lifecycle mirrors a real JIT/DSL engine:
   3. ``CompiledPlan.execute(graph, uid_to_data, ctx)`` — hot path.
      ``uid_to_data`` is the caller's variant pack (tensor uid -> device
      buffer, exactly as the classic backend receives it); the
-     ``ExecutionContext`` carries the caller's handle / stream / workspace /
-     dynamic-shape overrides explicitly; engines must not hard-code a stream
-     or silently allocate hidden workspace. Engines that address buffers by
+     ``ExecutionContext`` carries the caller's handle / stream / workspace
+     explicitly; engines must not hard-code a stream or silently allocate
+     hidden workspace. Engines that address buffers by
      port name call ``resolve_node_buffers(graph, uid_to_data)`` (see below).
 
 Simple eager engines only implement ``execute()`` — the default ``build_plan``
@@ -48,6 +48,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List
 
 from .engine_ids import PYTHON_ENGINE_ID_BASE  # noqa: F401 — re-exported for engine authors
+from ..datatypes import _CUDNN_TO_FROST_DTYPE_NAME
+from ..frost.buffers import DeviceView
 
 if TYPE_CHECKING:
     from ..pygraph import pygraph
@@ -103,22 +105,163 @@ class ExecutionContext:
     handle: Any = None
     stream: Any = None
     workspace: Any = None
-    override_uids: Any = None
-    override_shapes: Any = None
-    override_strides: Any = None
+
+
+class VariantPack:
+    """The caller's variant pack, normalized ONCE at the top of execute().
+
+    Whatever the caller passed — a torch tensor, a DeviceView, any
+    ``__dlpack__`` / ``__cuda_array_interface__`` producer, or a bare device
+    address — is converted here and then dropped. Below this point the cuDNN
+    backend and every python engine see the same two index-aligned sequences
+    and nothing else, so neither can behave differently on account of what the
+    caller happened to hold.
+
+    The operands live in ``native``, a C container holding one ``DLTensor``
+    each, read through the producer's ``__dlpack_c_exchange_api__`` vtable and
+    handed to kernels through the same one.
+
+    ``uids`` is ASCENDING, matching the backend's own operand order
+    (``get_variant_pack_uids_sorted()``), so ``address`` goes straight to
+    ``_execute_with_raw_ptrs`` with no copy and no per-operand hash lookup.
+
+    What the caller ACTUALLY passed is what is recorded, which need not be what
+    the graph declared: an engine reads the IR port for the shape the plan was
+    built for and this pack for the shape about to run. frost_gemm takes its
+    M/N/K from here; the backend takes only the pointer.
+
+    Allocated per call. Two threads may execute one graph concurrently with
+    different buffers, and a shared pack would hand each thread the other's
+    pointers — silently, because every pointer in it is individually valid.
+    """
+
+    __slots__ = ("uids", "native", "_slot_of", "workspace", "workspace_bytes", "_device")
+
+    def __init__(self, uids, native, workspace_ptr: int = 0, workspace_bytes: int = 0):
+        self.uids = uids
+        self.native = native
+        self.workspace = workspace_ptr
+        self.workspace_bytes = workspace_bytes
+        self._slot_of = None  # built on first lookup: the backend never does one
+        self._device = None
+
+    @property
+    def address(self) -> int:
+        """The ``void*[]`` in slot order, for ``_execute_with_raw_ptrs``."""
+        return self.native.address
+
+    def all_contiguous(self):
+        """``(ok, slot)`` over every filled operand, decided from the strides
+        the native pack already holds."""
+        ok, offender = self.native.all_contiguous()
+        return ok, (int(offender) if offender else -1)
+
+    @property
+    def slot_of(self):
+        if self._slot_of is None:
+            self._slot_of = {u: i for i, u in enumerate(self.uids)}
+        return self._slot_of
+
+    @property
+    def device(self) -> int:
+        """The GPU this execute is going to, for the views handed to kernels.
+
+        One per pack, not one per operand: cuDNN's own variant pack carries no
+        device at all. Read on demand; the backend path never asks.
+        """
+        if self._device is None:
+            from ..frost.device import current_device
+
+            self._device = current_device()
+        return self._device
+
+    def slot(self, tensor_or_uid) -> int:
+        """Index of a tensor's operand. KeyError when it is not caller-filled
+        (a virtual intermediate, or a value the graph itself supplies)."""
+        uid = tensor_or_uid if isinstance(tensor_or_uid, int) else tensor_or_uid.uid
+        return self.slot_of[uid]
+
+    def ptr(self, tensor_or_uid) -> int:
+        return self.native.pointer(self.slot(tensor_or_uid))
+
+    def views(self, slots):
+        """The DLPack producers for ``slots``, in one crossing."""
+        return self.native.views(list(slots), self.device)
+
+    def view(self, slot: int):
+        """A DLPack producer over one operand, for a kernel that needs an
+        object rather than an address.
+
+        This is the whole reason an engine never sees the caller's buffer: the
+        kernel gets ours, built from the pointer and the geometry recorded at
+        normalization. It costs more than handing the torch tensor straight
+        through (measured +1.6 us per operand, because tvm-ffi reads a torch
+        tensor through a C vtable and any python producer through a capsule) —
+        which is an argument for making the producer a C type, not for keeping
+        the caller's object.
+        """
+        return self.native.view(slot, self.device)
+
+    def __len__(self) -> int:
+        return len(self.uids)
+
+
+@dataclass(frozen=True)
+class PortSlots:
+    """Per-node ``{port_name: slot}``. A port with no caller operand — a
+    virtual intermediate — is ABSENT, so ``.get(port) is None`` keeps meaning
+    what it meant when these were buffers."""
+
+    inputs: Dict[str, int]
+    outputs: Dict[str, int]
+
+
+def bind_ports(graph: "pygraph", variant_pack: VariantPack) -> Dict[Any, PortSlots]:
+    """Join each node's wired ports with the operand layout. Strict: every
+    non-virtual port must have an operand."""
+
+    def resolve(node, ports, direction):
+        slots = {}
+        for port, t in ports.items():
+            if t is None:
+                continue
+            slot = variant_pack.slot_of.get(t.uid)
+            if slot is None:
+                if t.is_virtual:
+                    continue  # engine-internal intermediate
+                raise ValueError(f"node {node.name!r}: no buffer for {direction} port {port!r} (tensor {t.name!r})")
+            slots[port] = slot
+        return slots
+
+    return {node: PortSlots(resolve(node, node.inputs, "input"), resolve(node, node.outputs, "output")) for node in graph.nodes}
+
+
+def _view_over_address(address: int, tensor, node, port: str):
+    """A DLPack view over a caller-supplied bare address, shaped by the IR.
+
+    Only reachable when the caller passed an int for this port. Requires the
+    graph to declare a dim and a dtype for it — an address carries neither, so
+    if the graph does not say, nobody can.
+    """
+    from ..datatypes import _cudnn_to_frost_dtype_name
+    from ..frost import buffers
+
+    dtype = _cudnn_to_frost_dtype_name(tensor.data_type)
+    if not tensor.dim or dtype is None:
+        raise ValueError(
+            f"node {node.name!r}: port {port!r} was given a bare device address, "
+            f"but the graph declares no {'dim' if not tensor.dim else 'data_type'} for tensor "
+            f"{tensor.name!r} — pass a buffer that carries its own shape and dtype, or declare them"
+        )
+    return buffers.DeviceView(address, tuple(tensor.dim), dtype, buffers.current_device_id())
 
 
 @dataclass(frozen=True)
 class NodeBuffers:
-    """Per-node ``{port_name: caller buffer}`` maps, the result of
-    ``resolve_node_buffers``. Only WIRED, NON-VIRTUAL ports
-    appear, and every one is guaranteed a buffer (a missing buffer raises at
-    resolution). Torch tensors arrive detached — both DLPack and
-    ``__cuda_array_interface__`` refuse to export ``requires_grad`` tensors,
-    and graph-level gradients are the backward nodes' contract, never
-    autograd tracing through an engine. Virtual intermediates carry no
-    caller buffers; engines that chain them across nodes key their own
-    scratch by ``node.inputs[port].uid``."""
+    """DEPRECATED, kept until every engine takes ``VariantPack``.
+
+    Per-node ``{port_name: caller buffer}`` maps, the result of
+    ``resolve_node_buffers``."""
 
     inputs: Dict[str, Any]
     outputs: Dict[str, Any]
@@ -142,6 +285,13 @@ def resolve_node_buffers(graph: "pygraph", uid_to_data: Dict[int, Any]) -> Dict[
                 if t.is_virtual:
                     continue  # engine-internal intermediate
                 raise ValueError(f"node {node.name!r}: no buffer for {direction} port {port!r} (tensor {t.name!r})")
+            if type(b) is int:
+                # A bare device address. The backend has always taken one
+                # (_pygraph._describe), so a python engine must too, or the
+                # same graph.execute() call succeeds or fails depending on
+                # which plan the heuristics happened to pick. The geometry is
+                # the one the graph declares for this port.
+                b = _view_over_address(b, t, node, port)
             bufs[port] = b.detach() if hasattr(b, "detach") else b
         return bufs
 
@@ -151,11 +301,16 @@ def resolve_node_buffers(graph: "pygraph", uid_to_data: Dict[int, Any]) -> Dict[
 class CompiledPlan:
     """A compiled (graph, plan) artifact. Subclass for real JIT engines."""
 
+    # Set True once execute() takes VariantPack. Until then execute() is handed the
+    # caller's raw {uid: buffer} map, as before. Migration flag; it goes away
+    # with the last engine that does not set it.
+    takes_variant_pack: bool = False
+
     def get_workspace_size(self) -> int:
         """Workspace bytes this plan needs at execute time (default 0)."""
         return 0
 
-    def execute(self, graph: "pygraph", uid_to_data: Dict[int, Any], ctx: ExecutionContext) -> None:
+    def execute(self, graph: "pygraph", variant_pack: "VariantPack", ctx: ExecutionContext) -> None:
         raise NotImplementedError
 
 

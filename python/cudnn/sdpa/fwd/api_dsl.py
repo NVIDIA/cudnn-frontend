@@ -38,6 +38,19 @@ from cudnn.sdpa.fwd.config_sm120 import (
 )
 
 
+def dtype_name(buffer) -> str:
+    """The buffer's dtype as a bare name, whoever produced it.
+
+    A caller buffer reaches these checks as whatever the graph normalized it
+    into, which is a variant-pack slot rather than a torch tensor. Comparing
+    ``buffer.dtype is torch.float32`` therefore rejects a perfectly good fp32
+    buffer with "must be float32; got float32". Names are the one spelling
+    every producer agrees on -- torch prints ``torch.float32``, numpy and the
+    slot print ``float32``.
+    """
+    return str(buffer.dtype).rsplit(".", 1)[-1]
+
+
 def _require_reciprocal_s_scales(descale_s: float, scale_s: float) -> None:
     """Guard for a kernel that converts P to e4m3 UNSCALED (the SM100 FP8 row).
 
@@ -449,7 +462,7 @@ class SdpaFwdDsl(APIBase):
         # Both callers re-view the slot as Int32 for the kernel ABI, so a wider
         # element would yield two int32s and the kernel would write only the low
         # word -- the caller then reads a corrupted value.
-        if tensor.dtype is not torch.float32:
+        if dtype_name(tensor) != "float32":
             raise ValueError(f"{name} must be float32; got {tensor.dtype}")
         try:
             return tensor.view(-1)[:1]
@@ -474,7 +487,7 @@ class SdpaFwdDsl(APIBase):
         receive the output and be dropped, leaving the caller's LSE unwritten.
         """
         self._value_error_if(
-            lse_tensor.dtype != torch.float32,
+            dtype_name(lse_tensor) != "float32",
             f"lse_tensor must be float32; got {lse_tensor.dtype}",
         )
         expected = self.batch_size * self.h_q * self.s_q_max
@@ -496,7 +509,7 @@ class SdpaFwdDsl(APIBase):
         on the execute hot path (and break CUDA-graph pointer stability).
         """
         self._value_error_if(
-            sinks.dtype != torch.float32,
+            dtype_name(sinks) != "float32",
             f"sinks must be float32; got {sinks.dtype}",
         )
         self._value_error_if(
@@ -517,7 +530,7 @@ class SdpaFwdDsl(APIBase):
         pointer stability).
         """
         self._value_error_if(
-            seq_lens.dtype != torch.int32,
+            dtype_name(seq_lens) != "int32",
             f"{name} must be int32; got {seq_lens.dtype}",
         )
         self._value_error_if(
