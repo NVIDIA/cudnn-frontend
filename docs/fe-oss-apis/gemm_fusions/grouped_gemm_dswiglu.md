@@ -4,6 +4,10 @@
 
 **Legacy contiguous-only API note:** This page documents the older contiguous-only dSwiGLU API. For new integrations, prefer the unified [Grouped GEMM + dGLU](grouped_gemm_dglu.md) API, which covers dense and discrete weight layouts.
 
+## JAX support
+
+JAX arrays are **not supported**: this API is dense-weight-mode only, and the expert-outermost strided B layout has no row-major (JAX) equivalent. JAX inputs raise a clear `ValueError` at the entry points. The API is otherwise type-erased and torch-lazy.
+
 ## Overview
 
 **Grouped GEMM + dSwiGLU fusion**: A contiguous grouped block-scaled GEMM fused with a dSwiGLU backward epilogue on NVIDIA Blackwell GPUs (SM100+), designed for MoE (Mixture of Experts) workloads. Implemented with CUTLASS/CUTE.

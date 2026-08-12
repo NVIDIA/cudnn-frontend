@@ -140,10 +140,17 @@ def allocate_tensors(cfg, rng_data_gen, perf=False):
     si = not perf
 
     if cfg.is_ragged:
-        allocs[TensorUid.q] = alloc_tensor((max_t_q, cfg.h_q, cfg.d_qk), cfg.data_type, rng=rng_data_gen, mean=-0.5, std=1.0, sparse_int=si)
-        allocs[TensorUid.k] = alloc_tensor((max_t_kv, cfg.h_k, cfg.d_qk), cfg.data_type, rng=rng_data_gen, mean=-0.5, std=1.0, sparse_int=si)
-        allocs[TensorUid.v] = alloc_tensor((max_t_kv, cfg.h_v, cfg.d_v), cfg.data_type, rng=rng_data_gen, mean=-0.5, std=1.0, sparse_int=si)
-        allocs[TensorUid.o] = alloc_tensor((max_t_q, cfg.h_q, cfg.d_v), cfg.data_type)
+        # 3-D (token, head, elem) strides come from the 4-D configs, so
+        # per-tensor token-stride gaps (with_ragged_token_gap) reach the
+        # actual buffers.
+        q_strides = (cfg.stride_q[2], cfg.stride_q[1], cfg.stride_q[3])
+        k_strides = (cfg.stride_k[2], cfg.stride_k[1], cfg.stride_k[3])
+        v_strides = (cfg.stride_v[2], cfg.stride_v[1], cfg.stride_v[3])
+        o_strides = (cfg.stride_o[2], cfg.stride_o[1], cfg.stride_o[3])
+        allocs[TensorUid.q] = alloc_tensor((max_t_q, cfg.h_q, cfg.d_qk), cfg.data_type, strides=q_strides, rng=rng_data_gen, mean=-0.5, std=1.0, sparse_int=si)
+        allocs[TensorUid.k] = alloc_tensor((max_t_kv, cfg.h_k, cfg.d_qk), cfg.data_type, strides=k_strides, rng=rng_data_gen, mean=-0.5, std=1.0, sparse_int=si)
+        allocs[TensorUid.v] = alloc_tensor((max_t_kv, cfg.h_v, cfg.d_v), cfg.data_type, strides=v_strides, rng=rng_data_gen, mean=-0.5, std=1.0, sparse_int=si)
+        allocs[TensorUid.o] = alloc_tensor((max_t_q, cfg.h_q, cfg.d_v), cfg.data_type, strides=o_strides)
         # cfg.stride_stats is 4-D (b, h, s, 1); its [1] and [2] entries are the head and token
         # strides of the packed buffer, which is exactly the (h, s) part of the 3-D alloc below.
         stats_strides = (cfg.stride_stats[2], cfg.stride_stats[1], 1)
@@ -151,10 +158,10 @@ def allocate_tensors(cfg, rng_data_gen, perf=False):
         allocs[TensorUid.score_max] = alloc_tensor((max_t_q, cfg.h_q, 1), torch.float32, strides=stats_strides) if cfg.with_score_max else (None, None, None)
         allocs[TensorUid.score_sum_exp] = alloc_tensor((max_t_q, cfg.h_q, 1), torch.float32, strides=stats_strides) if cfg.with_score_sum_exp else (None, None, None)
         if cfg.is_train:
-            allocs[TensorUid.dQ] = alloc_tensor((max_t_q, cfg.h_q, cfg.d_qk), cfg.data_type)
-            allocs[TensorUid.dK] = alloc_tensor((max_t_kv, cfg.h_k, cfg.d_qk), cfg.data_type)
-            allocs[TensorUid.dV] = alloc_tensor((max_t_kv, cfg.h_v, cfg.d_v), cfg.data_type)
-            allocs[TensorUid.dO] = alloc_tensor((max_t_q, cfg.h_q, cfg.d_v), cfg.data_type, rng=rng_data_gen, mean=0.0, std=0.1, sparse_int=si)
+            allocs[TensorUid.dQ] = alloc_tensor((max_t_q, cfg.h_q, cfg.d_qk), cfg.data_type, strides=q_strides)
+            allocs[TensorUid.dK] = alloc_tensor((max_t_kv, cfg.h_k, cfg.d_qk), cfg.data_type, strides=k_strides)
+            allocs[TensorUid.dV] = alloc_tensor((max_t_kv, cfg.h_v, cfg.d_v), cfg.data_type, strides=v_strides)
+            allocs[TensorUid.dO] = alloc_tensor((max_t_q, cfg.h_q, cfg.d_v), cfg.data_type, strides=o_strides, rng=rng_data_gen, mean=0.0, std=0.1, sparse_int=si)
     else:
         allocs[TensorUid.q] = alloc_tensor(cfg.shape_q, cfg.data_type, strides=cfg.stride_q, rng=rng_data_gen, mean=-0.5, std=1.0, sparse_int=si)
         allocs[TensorUid.k] = alloc_tensor(cfg.shape_k, cfg.data_type, strides=cfg.stride_k, rng=rng_data_gen, mean=-0.5, std=1.0, sparse_int=si)
@@ -194,10 +201,12 @@ def allocate_tensors(cfg, rng_data_gen, perf=False):
         k_off_mult = cfg.d_qk if cfg.with_ragged_offset_multiplier else 1
         v_off_mult = cfg.d_v if cfg.with_ragged_offset_multiplier else 1
         o_off_mult = cfg.d_v if cfg.with_ragged_offset_multiplier else 1
-        allocs[TensorUid.q_ragged_offset] = ((prefix_sum(seq_len_q_gpu) * cfg.h_q * cfg.d_qk // q_off_mult).to(torch.int64), None, None)
-        allocs[TensorUid.k_ragged_offset] = ((prefix_sum(seq_len_kv_gpu) * cfg.h_k * cfg.d_qk // k_off_mult).to(torch.int64), None, None)
-        allocs[TensorUid.v_ragged_offset] = ((prefix_sum(seq_len_kv_gpu) * cfg.h_v * cfg.d_v // v_off_mult).to(torch.int64), None, None)
-        allocs[TensorUid.o_ragged_offset] = ((prefix_sum(seq_len_q_gpu) * cfg.h_q * cfg.d_v // o_off_mult).to(torch.int64), None, None)
+        # Offsets scale by each tensor's ACTUAL token stride (stride[2]), not an
+        # assumed-packed h*d — K/V may carry a token-stride gap (kv-interleaved).
+        allocs[TensorUid.q_ragged_offset] = ((prefix_sum(seq_len_q_gpu) * cfg.stride_q[2] // q_off_mult).to(torch.int64), None, None)
+        allocs[TensorUid.k_ragged_offset] = ((prefix_sum(seq_len_kv_gpu) * cfg.stride_k[2] // k_off_mult).to(torch.int64), None, None)
+        allocs[TensorUid.v_ragged_offset] = ((prefix_sum(seq_len_kv_gpu) * cfg.stride_v[2] // v_off_mult).to(torch.int64), None, None)
+        allocs[TensorUid.o_ragged_offset] = ((prefix_sum(seq_len_q_gpu) * cfg.stride_o[2] // o_off_mult).to(torch.int64), None, None)
         # Stats offsets are in elements and scale by its token stride: h_q for token-major stats,
         # 1 for head-major.
         allocs[TensorUid.stats_ragged_offset] = ((prefix_sum(seq_len_q_gpu) * cfg.stride_stats[2]).to(torch.int64), None, None)

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 from cuda.bindings import driver as cuda
 import cutlass
@@ -21,6 +21,25 @@ from cudnn.datatypes import _convert_to_cutlass_data_type
 from ..moe_utils import MoEWeightMode
 from .hadamard_utils import HADAMARD_SIZE, hadamard_matrix
 from .moe_blockscaled_grouped_gemm_glu_hadamard import BlockScaledMoEGroupedGemmGluHadamardKernel
+
+# The GLU + Hadamard fusion is block-scaled only: its mandatory scale-factor inputs
+# (sfa/sfb) use an MMA-interleaved 6-D layout with no row-major equivalent, so they
+# are not expressible as JAX arrays and the API stays torch-only.
+_JAX_ERROR = (
+    "grouped GEMM GLU hadamard is not supported for JAX arrays: the block-scaled "
+    "scale-factor tensors (sfa/sfb) use an MMA-interleaved layout that is not expressible as JAX arrays; "
+    "pass torch tensors"
+)
+
+
+def _require_torch_inputs(sample: Any, api_name: str) -> None:
+    from cudnn.tensor_adapter import detect_framework
+
+    framework = detect_framework(sample)
+    if framework == "jax":
+        raise ValueError(_JAX_ERROR)
+    if framework != "torch":
+        raise ValueError(f"Unsupported tensor framework '{framework}' for {api_name}; pass torch tensors")
 
 
 def _reinterpret_raw_grouped_fp4_tensor(tensor: torch.Tensor) -> torch.Tensor:
@@ -65,10 +84,8 @@ class GroupedGemmGluHadamardSm100(APIBase):
         use_dynamic_sched: bool = False,
         use_tmem_post_rht_amax: bool = False,
     ):
-        from cudnn.tensor_adapter import is_torch_tensor
-
-        if sample_a is not None and not is_torch_tensor(sample_a):
-            raise ValueError("GroupedGemmGluHadamardSm100 currently supports torch tensors only; JAX support is not yet implemented for this API")
+        if sample_a is not None:
+            _require_torch_inputs(sample_a, "GroupedGemmGluHadamardSm100")
         import torch
 
         if acc_dtype is None:
@@ -625,10 +642,9 @@ def grouped_gemm_glu_hadamard_wrapper_sm100(
 ) -> TupleDict:
     """High-level wrapper for grouped GEMM GLU + Hadamard forward fusion."""
     from cudnn.gemm.cutedsl.discrete_grouped.discrete_kernel_utils import _require_pointer_tensor
-    from cudnn.tensor_adapter import is_torch_tensor
 
-    if a_tensor is not None and not is_torch_tensor(a_tensor):
-        raise ValueError("grouped_gemm_glu_hadamard_wrapper_sm100 currently supports torch tensors only; JAX support is not yet implemented for this API")
+    if a_tensor is not None:
+        _require_torch_inputs(a_tensor, "grouped_gemm_glu_hadamard_wrapper_sm100")
     import torch
 
     if acc_dtype is None:

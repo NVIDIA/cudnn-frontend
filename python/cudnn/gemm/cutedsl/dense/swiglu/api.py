@@ -381,13 +381,8 @@ class GemmSwigluSm100(APIBase):
         self._logger.debug("check_support completed successfully")
         return True
 
-    def _compile_kernel(self, use_tvm_ffi_env_stream: bool = False):
-        """Compile the kernel and return the raw TVM-FFI callable.
-
-        With ``use_tvm_ffi_env_stream=True`` the stream argument is bound to the
-        TVM-FFI environment stream and dropped from the callable's signature --
-        the variant used for XLA custom-call (jax.ffi) integration.
-        """
+    def _compile_kernel(self):
+        """Compile the kernel and return the raw TVM-FFI callable."""
         self._ensure_support_checked()
 
         if self._kernel is PersistentDenseGemmKernel:
@@ -416,7 +411,7 @@ class GemmSwigluSm100(APIBase):
             "max_active_clusters must be > 0 after applying overlap margin; reduce CUDNNFE_CLUSTER_OVERLAP_MARGIN",
         )
 
-        fake_stream = make_fake_stream(use_tvm_ffi_env_stream=use_tvm_ffi_env_stream)
+        fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
 
         if self._kernel is PersistentDenseGemmKernel:
             self._logger.debug("Compiling gemm_swiglu")
@@ -456,7 +451,7 @@ class GemmSwigluSm100(APIBase):
             self._logger.debug("Kernel already compiled; skipping recompilation")
             return
 
-        _compiled_kernel = self._compile_kernel(use_tvm_ffi_env_stream=False)
+        _compiled_kernel = self._compile_kernel()
 
         if self._kernel is PersistentDenseGemmKernel:
 

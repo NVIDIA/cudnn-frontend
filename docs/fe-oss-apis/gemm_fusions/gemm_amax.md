@@ -109,7 +109,7 @@ op.execute(a, b, sfa, sfb, c, amax, current_stream=None)
 
 Two integration levels are available:
 
-1. **`gemm_amax_jax_sm100`** (recommended for jitted programs) — an XLA custom call via [jax-tvm-ffi]. The kernel runs on XLA's compute stream (correctly ordered with surrounding ops), outputs are XLA-managed fresh arrays, and the call composes with `jax.jit`. No manual synchronization is needed. Requires the `jax` dependency group (`pip install --group jax`, which brings `jax-tvm-ffi`; Python >= 3.11).
+1. **`gemm_amax_jax_sm100`** (recommended for jitted programs) — an XLA custom call built on `cudnn.jax.call` (CuTeDSL's native `cutlass.jax` bridge). The kernel runs on XLA's compute stream (correctly ordered with surrounding ops), outputs are XLA-managed fresh arrays, and the call composes with `jax.jit`. No manual synchronization is needed. Requires the `jax` dependency group (`pip install --group jax`; jax >= 0.5).
 
 ```python
 from cudnn import gemm_amax_jax_sm100
@@ -120,7 +120,7 @@ def quantized_matmul(a, b, sfa, sfb):
     return c, amax
 ```
 
-Calling it eagerly works but re-traces the `ffi_call` on every invocation; call it from inside a jitted function in hot loops.
+Calling it eagerly works but re-traces the custom call on every invocation; call it from inside a jitted function in hot loops.
 
 2. **The eager entry points below** (`gemm_amax_wrapper_sm100`, `GemmAmaxSm100`) also accept JAX arrays via DLPack. In hot loops prefer the **class API with pre-allocated output buffers** (~15 µs CPU per launch) over the wrapper — per-call `jnp` output allocation in the wrapper costs hundreds of µs of XLA dispatch.
 
@@ -254,7 +254,7 @@ Tuple unpacking order is: `(c_tensor, amax_tensor)`.
 
 - `L == 1`; `A`/`B` k-major; `C` n-major only
 - `SFA`/`SFB` in the physical atom shape `(L, MN', K', 32, 4, 4)` (see "Using JAX arrays")
-- Eager use only (no `jax.jit` over these entry points); synchronize before reading outputs
+- The wrapper/class entry points are eager-only (use `gemm_amax_jax_sm100` under `jax.jit`); synchronize before reading outputs
 
 ---
 

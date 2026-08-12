@@ -2,6 +2,12 @@
 
 **This is an experimental API and subject to change.**
 
+## JAX support
+
+Supports **JAX arrays** on the BF16 backend in discrete weight mode (dswiglu and dgeglu), including `generate_dbias=True` and caller-provided zero-initialized `dprob`. Dense `b_tensor` and the block-scaled backend (MMA-interleaved scale-factor layouts) are not expressible as JAX arrays and raise clear errors. The wrapper is eager, on the CUDA legacy default stream: `block_until_ready` inputs, synchronize before reading outputs; keep weight arrays alive until the kernel completes.
+
+For jitted JAX programs use the `jax.jit`-compatible XLA custom-call entry point `grouped_gemm_dglu_jax_sm100` (built on `cudnn.jax.call`; discrete mode): `dprob` and (with `generate_dbias=True`) `dbias` come back as bridge-managed zero-initialized accumulator outputs — no caller-zeroed buffers, no manual synchronization. Under tracing the `padded_offsets` *values* cannot be host-validated, and the per-expert weight buffers behind `b_ptrs` must stay alive and unmoved across every execution of the traced computation.
+
 ## Overview
 
 **Unified Grouped GEMM + dGLU fusion**: one public class and wrapper select a

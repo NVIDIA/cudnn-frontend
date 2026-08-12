@@ -242,11 +242,19 @@ def test_gemm_amax_jax_wrapper_errors():
 
 
 @pytest.mark.L0
-def test_gemm_amax_jax_ffi_sm100():
-    """XLA custom-call entry point (jax-tvm-ffi): eager, jitted, cached, and composed."""
-    pytest.importorskip("jax_tvm_ffi")
+def test_gemm_amax_jax_jit_sm100():
+    """XLA custom-call entry point (cudnn.jax.call): eager, jitted, cached, and composed."""
+    import cutlass.jax
+
+    if not cutlass.jax.is_available():
+        pytest.skip("CuTeDSL JAX extensions unavailable (jax >= 0.5 required)")
     skip_unless_sm100()
     from cudnn import gemm_amax_jax_sm100
+
+    # cudnn.jax is reachable from a bare `import cudnn` (lazy submodule export)
+    import cudnn
+
+    assert cudnn.jax.TensorSpec is cutlass.jax.TensorSpec
 
     m, n, k = 512, 256, 256
     sf_vec_size = 32

@@ -89,23 +89,43 @@ class GemmAmaxSm100(APIBase):
           for frameworks such as JAX that cannot express the permuted (strided) view.
 
         The kernel rebuilds the SF layout from the A/B shapes and consumes only the SF base
-        pointer, so only the element count and memory order matter.
+        pointer, so the memory must be exactly the C-contiguous physical allocation in both
+        forms: strides are validated too (a shape-matching but differently-strided tensor
+        would silently produce wrong results).
         """
         shape = sf_desc.shape
         self._value_error_if(len(shape) != 6, f"{name} tensor must be 6-D, got shape {shape}")
-        if shape[0] == self.atom_m[0] and shape[1] == self.atom_m[1] and shape[3] == self.atom_k:
+        atom_m0, atom_m1, atom_k = self.atom_m[0], self.atom_m[1], self.atom_k
+        atom_elems = atom_m0 * atom_m1 * atom_k
+        if shape[0] == atom_m0 and shape[1] == atom_m1 and shape[3] == atom_k:
             mn_div_atom_m0_m1, sf_k_div_atom_k = shape[2], shape[4]
-            self._check_tensor_shape(
+            atom_shape = (atom_m0, atom_m1, mn_div_atom_m0_m1, atom_k, sf_k_div_atom_k, l)
+            self._check_tensor_shape(sf_desc, atom_shape, name)
+            _ = self._check_tensor_stride(
                 sf_desc,
-                (self.atom_m[0], self.atom_m[1], mn_div_atom_m0_m1, self.atom_k, sf_k_div_atom_k, l),
-                name,
+                stride=[
+                    canonicalize_unit_dim_strides(
+                        atom_shape,
+                        (atom_m1 * atom_k, atom_k, sf_k_div_atom_k * atom_elems, 1, atom_elems, mn_div_atom_m0_m1 * sf_k_div_atom_k * atom_elems),
+                    )
+                ],
+                name=name,
+                extra_error_msg=f"{name} atom view must be the (3, 4, 1, 5, 2, 0) permutation of a C-contiguous physical allocation",
             )
         else:
             mn_div_atom_m0_m1, sf_k_div_atom_k = shape[1], shape[2]
-            self._check_tensor_shape(
+            physical_shape = (l, mn_div_atom_m0_m1, sf_k_div_atom_k, atom_m0, atom_m1, atom_k)
+            self._check_tensor_shape(sf_desc, physical_shape, name)
+            _ = self._check_tensor_stride(
                 sf_desc,
-                (l, mn_div_atom_m0_m1, sf_k_div_atom_k, self.atom_m[0], self.atom_m[1], self.atom_k),
-                name,
+                stride=[
+                    canonicalize_unit_dim_strides(
+                        physical_shape,
+                        (mn_div_atom_m0_m1 * sf_k_div_atom_k * atom_elems, sf_k_div_atom_k * atom_elems, atom_elems, atom_m1 * atom_k, atom_k, 1),
+                    )
+                ],
+                name=name,
+                extra_error_msg=f"{name} in the physical (L, MN', K', Atom_M0, Atom_M1, Atom_K) form must be C-contiguous",
             )
         return mn_div_atom_m0_m1, sf_k_div_atom_k
 
@@ -309,13 +329,8 @@ class GemmAmaxSm100(APIBase):
         self._logger.debug("check_support completed successfully")
         return True
 
-    def _compile_kernel(self, use_tvm_ffi_env_stream: bool = False):
-        """Compile the kernel and return the raw TVM-FFI callable.
-
-        With ``use_tvm_ffi_env_stream=True`` the stream argument is bound to the
-        TVM-FFI environment stream and dropped from the callable's signature --
-        the variant used for XLA custom-call (jax.ffi) integration.
-        """
+    def _compile_kernel(self):
+        """Compile the kernel and return the raw TVM-FFI callable."""
         self._ensure_support_checked()
 
         gemm_amax = self._kernel(
@@ -338,7 +353,7 @@ class GemmAmaxSm100(APIBase):
         sfb_cute = self._make_fake_cute_tensor_from_desc(self.sfb_desc, assumed_align=16)
         c_cute = self._make_fake_cute_tensor_from_desc(self.c_desc, assumed_align=16)
         amax_cute = self._make_fake_cute_tensor_from_desc(self.amax_desc, assumed_align=16)
-        fake_stream = make_fake_stream(use_tvm_ffi_env_stream=use_tvm_ffi_env_stream)
+        fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
 
         return cute.compile(
             gemm_amax,
@@ -360,7 +375,7 @@ class GemmAmaxSm100(APIBase):
             self._logger.debug("Kernel already compiled; skipping recompilation")
             return
 
-        _compiled_kernel = self._compile_kernel(use_tvm_ffi_env_stream=False)
+        _compiled_kernel = self._compile_kernel()
 
         def tensor_api(
             a_tensor: Any,

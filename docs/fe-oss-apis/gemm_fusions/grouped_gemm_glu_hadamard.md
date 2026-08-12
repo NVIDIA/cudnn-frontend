@@ -2,6 +2,10 @@
 
 **This is an experimental API and subject to change.**
 
+## JAX support
+
+JAX arrays are **not supported**: this fusion is block-scaled-only and its mandatory scale-factor inputs use an MMA-interleaved layout with no row-major (JAX) equivalent. JAX inputs raise a clear `ValueError` at the entry points. The API is otherwise type-erased and torch-lazy.
+
 ## Overview
 
 **Grouped GEMM + GLU + Hadamard fusion**: A contiguous grouped block-scaled GEMM fused with a GLU epilogue, a 16-wide Hadamard transform, and per-expert `amax` reduction on NVIDIA Blackwell GPUs (SM100+), designed for MoE-style workloads. Groups are contiguous in the `M` dimension and described by `padded_offsets`.
