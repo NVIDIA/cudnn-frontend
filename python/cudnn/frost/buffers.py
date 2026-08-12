@@ -299,13 +299,17 @@ def memset_zero_async(ptr: int, nbytes: int, stream) -> None:
 
 
 def fill_f32_async(ptr: int, count: int, value: float, stream) -> None:
-    """Stream-ordered fill of ``count`` fp32 elements with ``value``.
+    """Stream-ordered fill of ``count`` CONTIGUOUS fp32 elements with ``value``.
 
-    An engine that needs to seed a caller's buffer owns that operation itself:
-    reaching for ``tensor.fill_()`` works only while the buffer happens to be a
-    torch tensor, which is the coupling the variant pack exists to remove.
-    Every seed value a reduction uses (0, 1, +-inf) is a 32-bit pattern, so the
-    driver's D32 memset covers them without a kernel.
+    An engine that seeds a caller's buffer owns that operation itself: reaching
+    for ``tensor.fill_()`` works only while the buffer happens to be a torch
+    tensor, and queues on torch's current stream rather than the one the kernel
+    will run on. Every seed a reduction uses (0, 1, +-inf) is a 32-bit pattern,
+    so the driver's D32 memset covers them without a kernel.
+
+    Contiguous only, and the caller checks: a strided buffer needs one memset
+    per run, which for a per-row scalar output is one per row -- measured at
+    572 us against 3.5 for the single kernel torch would have launched.
     """
     from cuda.bindings import driver as _drv
 

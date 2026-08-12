@@ -184,3 +184,71 @@ def test_bare_address_operands():
     c = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
     _run(g, {1: a.data_ptr(), 2: b.data_ptr(), 3: c.data_ptr()})
     torch.testing.assert_close(c, ref.to(torch.bfloat16), atol=1e-1, rtol=1e-2)
+
+
+@_GPU
+def test_bare_address_workspace():
+    """A workspace passed as a raw address has no measurable size.
+
+    Zero means "the pack could not measure it", not "empty" -- the backend
+    takes a raw workspace pointer without checking either, so an engine that
+    needs scratch must not refuse one. This drives the unknown-capacity path
+    through both `Workspace.over` and the C carve's bounds check.
+    """
+    g = cudnn.pygraph(io_data_type=BF16, intermediate_data_type=F32, compute_data_type=F32)
+    A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+    B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+    C = g.matmul(A=A, B=B, name="mm")
+    C.set_output(True).set_data_type(BF16)
+    _pin_frost(g)
+
+    a, b, ref = _operands()
+    c = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
+    ws = torch.empty(max(g.get_workspace_size(), 1), dtype=torch.uint8, device="cuda")
+    g.execute({A: a, B: b, C: c}, ws.data_ptr())
+    torch.cuda.synchronize()
+    torch.testing.assert_close(c, ref.to(torch.bfloat16), atol=1e-1, rtol=1e-2)
+
+
+@_GPU
+def test_undersized_workspace_still_rejected():
+    """A workspace whose size IS known is still bounds-checked."""
+    from cudnn.engines.base import VariantPack
+    from cudnn.frost.workspace import Workspace
+
+    tiny = torch.empty(16, dtype=torch.uint8, device="cuda")
+    g = cudnn.pygraph(io_data_type=BF16, intermediate_data_type=F32, compute_data_type=F32)
+    A = g.tensor(name="A", uid=1, dim=[1, M, K], stride=[M * K, K, 1])
+    B = g.tensor(name="B", uid=2, dim=[1, K, N], stride=[K * N, 1, K])
+    C = g.matmul(A=A, B=B, name="mm")
+    C.set_output(True).set_data_type(BF16).set_uid(3)
+    _pin_frost(g)
+
+    a, b, _ = _operands()
+    c = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
+    pack = g._normalize(g._uid_to_data({1: a, 2: b, 3: c}), tiny)
+    assert pack.workspace_bytes == 16
+    with pytest.raises(ValueError, match="needs a .*-byte workspace"):
+        Workspace.over(pack, 4096, "probe")
+
+
+@_GPU
+def test_unknown_size_workspace_refuses_to_measure_its_tail():
+    """``remaining()`` cannot answer for a workspace whose size is unknown."""
+    from cudnn.frost.workspace import Workspace
+
+    ws = torch.empty(4096, dtype=torch.uint8, device="cuda")
+    g = cudnn.pygraph(io_data_type=BF16, intermediate_data_type=F32, compute_data_type=F32)
+    A = g.tensor(name="A", uid=1, dim=[1, M, K], stride=[M * K, K, 1])
+    B = g.tensor(name="B", uid=2, dim=[1, K, N], stride=[K * N, 1, K])
+    C = g.matmul(A=A, B=B, name="mm")
+    C.set_output(True).set_data_type(BF16).set_uid(3)
+    _pin_frost(g)
+
+    a, b, _ = _operands()
+    c = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
+    pack = g._normalize(g._uid_to_data({1: a, 2: b, 3: c}), ws.data_ptr())
+    assert pack.workspace_bytes == 0
+    carver = Workspace.over(pack, 1024, "probe")
+    with pytest.raises(ValueError, match="size is unknown"):
+        carver.remaining()

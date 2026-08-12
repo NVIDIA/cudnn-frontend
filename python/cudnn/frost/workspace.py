@@ -168,6 +168,11 @@ class Workspace:
 
     def remaining(self) -> buffers.DeviceView:
         """The tail no :meth:`take` has claimed, as uint8 — for a nested carver."""
+        if not self._nbytes:
+            raise ValueError(
+                f"{self._owner}: the workspace was passed as a bare address, so its size is unknown "
+                "and the unclaimed tail cannot be measured; pass a sized buffer to execute()"
+            )
         return buffers.DeviceView(self._ptr + self._offset, (self._nbytes - self._offset,), "uint8", self._device)
 
     def _check_span(self, offset: int, span: int) -> None:
