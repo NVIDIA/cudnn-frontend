@@ -6,7 +6,7 @@
 Single-CTA MMA — every CTA runs its own MMA on its own SMEM/TMEM (no
 leader-follower pair). Compiler picks this when TileConfig.cta_group == 1.
 
-The CTA tile may span several MMA instructions (``num_mma_m x num_mma_n``, each
+The CTA tile may span several MMA instructions along M (``num_mma_m``, each
 ``mma_inst_shape_mnk``): the TMA still loads the whole tile in one go, the MMA
 warp issues one instruction per (M, N) sub-block into its own TMEM column
 region, and the epilogue drains one MMA-M block per pass.
@@ -275,7 +275,7 @@ def _kernel(
     num_tma_copy_bytes = num_a_operands * sA_bytes + num_b_operands * sB_bytes
 
     # One descriptor for every MMA instruction of the tile — the CTA tile spans
-    # num_mma_m x num_mma_n of them, all the same shape.
+    # num_mma_m of them, all the same shape.
     idesc = cutlass.experimental.primitives.Tcgen05InstrDesc.build(
         a_dtype=mma_a_dtype,
         b_dtype=mma_b_dtype,
@@ -592,18 +592,15 @@ def _kernel(
                 pass
 
             acc_base_col = base_col_id_root + acc_stage * acc_region_cols
-            # One accumulator per (gemm, M block, N block). Column arithmetic
-            # stays on the encoded (row << 16) | col integer.
+            # One accumulator per (gemm, M block). Column arithmetic stays on the
+            # encoded (row << 16) | col integer.
             tmem_addr_mmas = [
                 [
-                    [
-                        cutlass.inttoptr(
-                            (base_row_id << 16) | (acc_base_col + g * cols_per_acc_stage + mi * epi_cols_per_mma_m + ni * mma_inst_shape_mnk[1]),
-                            6,
-                            cutlass.Int32,
-                        )
-                        for ni in range(num_mma_n)
-                    ]
+                    cutlass.inttoptr(
+                        (base_row_id << 16) | (acc_base_col + g * cols_per_acc_stage + mi * epi_cols_per_mma_m),
+                        6,
+                        cutlass.Int32,
+                    )
                     for mi in range(num_mma_m)
                 ]
                 for g in range(num_gemms)
@@ -622,35 +619,34 @@ def _kernel(
                     for g in cutlass.range_constexpr(num_gemms):
                         sA_stage = smem_a_list[gemm_a_idx[g]].subview(sA_elems * stage)
                         sB_stage = smem_b_list[gemm_b_idx[g]].subview(sB_elems * stage)
+                        desc_b = cutlass.experimental.primitives.Tcgen05SmemDesc.build(
+                            start_address=sB_stage,
+                            leading_byte_offset=b_smem_desc_leading_byte_offset,
+                            stride_byte_offset=b_smem_desc_stride_byte_offset,
+                            layout=ab_smem_swizzle,
+                        ).advance_start_address(b_smem_k_step_bytes * k_block_idx)
                         for mi in cutlass.range_constexpr(num_mma_m):
-                            # M/N sub-block offsets are whole SMEM swizzle atoms
-                            # (mma_inst extent x cta_tile_k_bytes), so the
-                            # descriptor's swizzle phase is preserved.
+                            # The M sub-block offset is a whole SMEM swizzle atom
+                            # (mma_inst_m x cta_tile_k_bytes), so the descriptor's
+                            # swizzle phase is preserved.
                             desc_a = cutlass.experimental.primitives.Tcgen05SmemDesc.build(
                                 start_address=sA_stage,
                                 leading_byte_offset=a_smem_desc_leading_byte_offset,
                                 stride_byte_offset=a_smem_desc_stride_byte_offset,
                                 layout=ab_smem_swizzle,
                             ).advance_start_address(a_smem_m_step_bytes * mi + a_smem_k_step_bytes * k_block_idx)
-                            for ni in cutlass.range_constexpr(num_mma_n):
-                                desc_b = cutlass.experimental.primitives.Tcgen05SmemDesc.build(
-                                    start_address=sB_stage,
-                                    leading_byte_offset=b_smem_desc_leading_byte_offset,
-                                    stride_byte_offset=b_smem_desc_stride_byte_offset,
-                                    layout=ab_smem_swizzle,
-                                ).advance_start_address(b_smem_n_step_bytes * ni + b_smem_k_step_bytes * k_block_idx)
-                                if elect_one:
-                                    nvvm.tcgen05_mma(
-                                        mma_kind,
-                                        nvvm.CTAGroup.CTA_1,
-                                        tmem_addr_mmas[g][mi][ni],
-                                        desc_a,
-                                        desc_b,
-                                        idesc,
-                                        scale_d,
-                                    )
+                            if elect_one:
+                                nvvm.tcgen05_mma(
+                                    mma_kind,
+                                    nvvm.CTAGroup.CTA_1,
+                                    tmem_addr_mmas[g][mi],
+                                    desc_a,
+                                    desc_b,
+                                    idesc,
+                                    scale_d,
+                                )
                     # Every accumulator sees scale_d=False on exactly the first
-                    # k_block of the tile, so the flip stays outside mi/ni.
+                    # k_block of the tile, so the flip stays outside mi.
                     scale_d = cutlass.Boolean(True)
 
                 if elect_one:

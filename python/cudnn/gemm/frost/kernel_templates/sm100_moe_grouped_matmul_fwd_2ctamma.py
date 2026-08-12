@@ -336,7 +336,7 @@ def _kernel(
         epi_cols_per_mma_m = pair_n_size // 2
     else:
         epi_cols_per_mma_m = pair_n_size
-    # N is NOT a sub-block axis on the pair (num_mma_n is 1 there).
+    # N is NOT a sub-block axis (the CTA tile is never split along N).
     cols_per_acc_stage = num_mma_m * epi_cols_per_mma_m
     acc_region_cols = num_gemms * cols_per_acc_stage
     tmem_alloc_bar_count = (num_epilogue_warps + 1) * 32

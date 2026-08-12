@@ -544,6 +544,15 @@ def _run_bs_nonpacked_numeric(combo, config_name, M, N, K, mode):
             128,
             256,
         ),  # acc_stages=2
+        # CTA tile split across two MMA instructions along M (num_mma_m=2). The SF
+        # words are one per 128-row block, so an M sub-block is exactly one block.
+        (
+            "nvfp4",
+            "CONFIG_sm100_256x128x128_128x128x32_cluster1x1_1ctamma",
+            256,
+            256,
+            512,
+        ),
         # mxfp4 (fp4 + e8m0 scale, block32).
         (
             "mxfp4",

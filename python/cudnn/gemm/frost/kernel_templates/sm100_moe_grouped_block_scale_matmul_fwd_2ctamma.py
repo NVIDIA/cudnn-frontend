@@ -85,9 +85,9 @@ def _fence_tensormap_acquire(desc_ptr) -> None:
 
 # This template issues ONE MMA per K-block covering the whole CTA tile; it does
 # not sub-tile the tile across MMA instructions yet. Drop this once it loops
-# over num_mma_m x num_mma_n sub-blocks like sm100_matmul_1ctamma.py does.
-if num_mma_m != 1 or num_mma_n != 1:
-    raise NotImplementedError(f"{__name__}: num_mma_m={num_mma_m}, num_mma_n={num_mma_n} — this template renders one MMA instruction per CTA tile")
+# over the num_mma_m sub-blocks like sm100_matmul_1ctamma.py does.
+if num_mma_m != 1:
+    raise NotImplementedError(f"{__name__}: num_mma_m={num_mma_m} — this template renders one MMA instruction per CTA tile")
 
 
 SCHED_STAGES = 2

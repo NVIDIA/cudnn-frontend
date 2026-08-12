@@ -80,6 +80,11 @@ _CTA_TILE_K_BYTES_MAX_BY_PIPELINE = {"sm100": 128, "sm103": 384}
 # MMA-inst K in bytes
 _MMA_INST_K_BYTES = 32
 
+# MMA instructions the CTA tile spans along M. N is deliberately NOT an axis:
+# it measured within noise of a single instruction (0.96x vs 0.97x cuBLAS at
+# 4096^3), cuBLAS does not split N either, and neither the 2-CTA nor the
+# block-scale pipeline can express it (the pair already splits B's N; the SF
+# words are indexed per 128-column block).
 _NUM_MMA_MAX = 2
 
 _AB_STAGES_CAP = 8  # cap even if SMEM permits more
@@ -119,10 +124,11 @@ class TileConfig:
     ab_stages — those, plus K-in-elements, the SMEM tile, and the hardware MMA
     shape, are derived per (dtype, cta_group) at render time.
 
-    The CTA tile may span SEVERAL MMA instructions: ``num_mma_m`` × ``num_mma_n``
-    = ``cta_tile_m / mma_inst_m`` × ``cta_tile_n / mma_inst_n``. The whole CTA
-    tile is still TMA-loaded in one go; the MMA warp issues one instruction per
-    (m, n) sub-block into its own TMEM accumulator region.
+    The CTA tile may span SEVERAL MMA instructions along M:
+    ``num_mma_m = cta_tile_m / mma_inst_m``. The whole CTA tile is still
+    TMA-loaded in one go; the MMA warp issues one instruction per M sub-block
+    into its own TMEM accumulator region. N is never split
+    (``mma_inst_n == cta_tile_n``).
     """
 
     cta_tile_m: int
@@ -191,16 +197,16 @@ class TileConfig:
                 f"TileConfig {self.name!r}: mma_inst_m={mm} (= cta_tile_m {m} / " f"num_mma_m {self.num_mma_m}) — supported values are 64 and {_CTA_TILE_M_MAX}"
             )
         if mn < 8 or mn > _CTA_TILE_N_MAX or mn % 8 != 0:
+            raise NotImplementedError(f"TileConfig {self.name!r}: mma_inst_n={mn} — supported range is " f"8 ≤ N ≤ {_CTA_TILE_N_MAX}, multiple of 8")
+        # The one NEW axis: how many instructions the CTA tile spans along M. K is
+        # not an instruction-count axis (the mainloop already walks
+        # cta_tile_k / mma_inst_k), and N is not one at all.
+        if self.num_mma_m > _NUM_MMA_MAX:
             raise NotImplementedError(
-                f"TileConfig {self.name!r}: mma_inst_n={mn} (= cta_tile_n {n} / "
-                f"num_mma_n {self.num_mma_n}) — supported range is "
-                f"8 ≤ N ≤ {_CTA_TILE_N_MAX}, multiple of 8"
+                f"TileConfig {self.name!r}: num_mma_m={self.num_mma_m} — at most " f"{_NUM_MMA_MAX} MMA instructions per CTA tile along M"
             )
-        # The one NEW axis: how many instructions the CTA tile spans. K is not an
-        # instruction-count axis (the mainloop already walks cta_tile_k / mma_inst_k).
-        for axis, cnt in (("m", self.num_mma_m), ("n", self.num_mma_n)):
-            if cnt > _NUM_MMA_MAX:
-                raise NotImplementedError(f"TileConfig {self.name!r}: num_mma_{axis}={cnt} — at most " f"{_NUM_MMA_MAX} MMA instructions per CTA tile per axis")
+        if mn != n:
+            raise NotImplementedError(f"TileConfig {self.name!r}: N is not split across MMA instructions — " f"mma_inst_n must equal cta_tile_n={n}; got {mn}")
         # The epilogue drains one MMA-M block at a time, so its subtile height
         # is the instruction's M, not the CTA tile's.
         if self.epi_tile_mn[0] != mm:
@@ -230,11 +236,6 @@ class TileConfig:
     def num_mma_m(self) -> int:
         """MMA instructions the CTA tile spans along M."""
         return self.cta_tile_m // self.mma_inst_m
-
-    @property
-    def num_mma_n(self) -> int:
-        """MMA instructions the CTA tile spans along N."""
-        return self.cta_tile_n // self.mma_inst_n
 
     @property
     def cgrp_size_mn(self) -> tuple[int, int]:
@@ -367,10 +368,10 @@ def config_class_for_pipeline(pipeline: str) -> type[TileConfig]:
 # Axes: cta_m ∈ {128,64}, cta_n ∈ {8..256 step 8}, K_bytes ∈ {128,64}, cluster ∈
 # _CLUSTERS. N < 8 / N % 8 rejected by __post_init__ (tcgen05 idesc n_dim is a
 # multiple of 8). 2-CTA templates accept only cgrp_size_m % 2 == 0 (registry
-# predicate). Every catalog entry has num_mma_m == num_mma_n == 1 (mma_inst tile
-# == cta tile); geometries that split the tile across several MMA instructions
-# are reached by `by_name` synthesis, so they stay out of the funnel's candidate
-# set and out of the benchmark / full-sweep enumerations.
+# predicate). Every catalog entry has num_mma_m == 1 (mma_inst tile == cta tile);
+# geometries that split the tile across several MMA instructions along M are
+# reached by `by_name` synthesis, so they stay out of the funnel's candidate set
+# and out of the benchmark / full-sweep enumerations.
 # ---------------------------------------------------------------------------
 
 _CLUSTERS: tuple[tuple[int, int], ...] = (
@@ -671,13 +672,21 @@ def validate_block_scale_config(cfg: TileConfig, block_size: int, cta_tile_k_ele
     """Raise if ``cfg``'s GEOMETRY cannot run a block-scaled matmul.
     ``cta_tile_k_elems`` is the K-tile in *elements* (FP4: 256 on sm100 / 768
     on sm103; FP8: 128)."""
-    if cfg.cta_tile_m % 128 != 0:
+    # The SF 128x4 swizzle gives one scale-factor word per 128-row / 128-column
+    # block, and the rule is that EACH MMA INSTRUCTION must land on whole blocks —
+    # so it applies to the instruction tile, not the CTA tile. They coincide at
+    # num_mma == 1, which is why this used to read cta_tile_m/n.
+    if cfg.mma_inst_m % 128 != 0:
         raise NotImplementedError(
-            f"block-scaled matmul requires cta_tile_m % 128 == 0 (SF 128x4 " f"swizzle); config {cfg.name!r} has cta_tile_m={cfg.cta_tile_m}"
+            f"block-scaled matmul requires mma_inst_m % 128 == 0 (SF 128x4 swizzle: "
+            f"each MMA instruction must cover whole SF blocks); config {cfg.name!r} "
+            f"has cta_tile_m={cfg.cta_tile_m} / num_mma_m={cfg.num_mma_m} = {cfg.mma_inst_m}"
         )
-    if cfg.cta_tile_n % 128 != 0:
+    if cfg.mma_inst_n % 128 != 0:
         raise NotImplementedError(
-            f"block-scaled matmul requires cta_tile_n % 128 == 0 (SF 128x4 " f"swizzle); config {cfg.name!r} has cta_tile_n={cfg.cta_tile_n}"
+            f"block-scaled matmul requires mma_inst_n % 128 == 0 (SF 128x4 swizzle: "
+            f"each MMA instruction must cover whole SF blocks); config {cfg.name!r} "
+            f"has mma_inst_n={cfg.mma_inst_n}"
         )
     # K-tile bytes: sm100 = one 128-B swizzled SMEM row; sm103 = 384 B
     kb_want = 384 if cfg.pipeline == "sm103" else 128

@@ -296,7 +296,7 @@ def _kernel(
     # M block mi owns columns [mi*epi_cols_per_mma_m, +epi_cols_per_mma_m) of its
     # GEMM's region, all at TMEM lane base 0. N is NOT split across instructions
     # here: the pair already splits B's N, so an N sub-block would not be
-    # contiguous in output N (num_mma_n is 1 on the 2-CTA templates).
+    # contiguous in output N (the CTA tile is never split along N).
     cols_per_acc_stage = num_mma_m * epi_cols_per_mma_m
     acc_region_cols = num_gemms * cols_per_acc_stage
     tmem_alloc_bar_count = (num_epilogue_warps + 1) * 32

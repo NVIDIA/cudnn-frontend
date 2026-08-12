@@ -607,17 +607,14 @@ def _kernel(
                 pass
 
             acc_col_id = base_col_id_root + acc_stage * cols_per_acc_stage
-            # One accumulator per (M block, N block). Column arithmetic stays on
-            # the encoded (row << 16) | col integer.
+            # One accumulator per M block. Column arithmetic stays on the encoded
+            # (row << 16) | col integer.
             tmem_addr_mmas = [
-                [
-                    cutlass.inttoptr(
-                        (base_row_id << 16) | (acc_col_id + mi * epi_cols_per_mma_m + ni * mma_inst_shape_mnk[1]),
-                        6,
-                        cutlass.Int32,
-                    )
-                    for ni in range(num_mma_n)
-                ]
+                cutlass.inttoptr(
+                    (base_row_id << 16) | (acc_col_id + mi * epi_cols_per_mma_m),
+                    6,
+                    cutlass.Int32,
+                )
                 for mi in range(num_mma_m)
             ]
 
@@ -659,24 +656,23 @@ def _kernel(
                 )
 
                 for k_block_idx in cutlass.range(num_k_blocks, unroll_full=True):
+                    desc_b = desc_b_base.advance_start_address(b_smem_k_step_bytes * k_block_idx)
                     for mi in cutlass.range_constexpr(num_mma_m):
-                        # M/N sub-block offsets are whole SMEM swizzle atoms, so the
+                        # The M sub-block offset is a whole SMEM swizzle atom, so the
                         # descriptor's swizzle phase is preserved.
                         desc_a = desc_a_base.advance_start_address(a_smem_m_step_bytes * mi + a_smem_k_step_bytes * k_block_idx)
-                        for ni in cutlass.range_constexpr(num_mma_n):
-                            desc_b = desc_b_base.advance_start_address(b_smem_n_step_bytes * ni + b_smem_k_step_bytes * k_block_idx)
-                            if elect_one:
-                                nvvm.tcgen05_mma(
-                                    mma_kind,
-                                    nvvm.CTAGroup.CTA_1,
-                                    tmem_addr_mmas[mi][ni],
-                                    desc_a,
-                                    desc_b,
-                                    idesc,
-                                    scale_d,
-                                )
+                        if elect_one:
+                            nvvm.tcgen05_mma(
+                                mma_kind,
+                                nvvm.CTAGroup.CTA_1,
+                                tmem_addr_mmas[mi],
+                                desc_a,
+                                desc_b,
+                                idesc,
+                                scale_d,
+                            )
                     # Every accumulator sees scale_d=False on exactly the first
-                    # k_block of the tile, so the flip stays outside mi/ni.
+                    # k_block of the tile, so the flip stays outside mi.
                     scale_d = cutlass.Boolean(True)
 
                 if elect_one:
