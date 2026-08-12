@@ -1,146 +1,181 @@
-# cudnn.norm — FROST norm backend (CUTLASS CuTe-DSL)
+# cudnn.norm — sm_100 norm backend (CUTLASS primitives)
 
-JIT normalization kernels written directly in CUTLASS **CuTe DSL** primitives,
-mirroring the structure of `cudnn.gemm.frost`. Supports **fprop** and **bprop**
-for five variants — **LayerNorm, RMSNorm, GroupNorm, BatchNorm, InstanceNorm** —
-with **bf16 / fp16 / fp32** I/O (statistics and parameter grads are fp32). Lower
-precisions (fp8/fp4/mx) are intentionally deferred.
+JIT normalization kernels for **Blackwell (sm_100)**, written on **CUTLASS
+primitives** (`cutlass.primitives` / `nvvm` cp.async staging, `SmemAllocator`
+reductions) and the shared `cudnn.frost.tile_dsl` library — mirroring the
+structure of `cudnn.sdpa` and `cudnn.gemm.frost`. Supports **fprop** and
+**bprop** for five variants — **LayerNorm, RMSNorm, GroupNorm, InstanceNorm,
+BatchNorm** — with **bf16 / fp16 / fp32** I/O (statistics and parameter grads are
+fp32). Lower precisions (fp8/fp4/mx) are deferred.
+
+This replaces the previous plain-cute-dsl A100/sm_80 implementation (scalar / vec
+/ cp.async / TMA `impl=` variants). That code used only `cute.arch` intrinsics
+and warp shuffles; this backend uses CUTLASS primitives as the FROST kernels do.
 
 ## Layout
 
 ```
 norm/
-  frost/                     shared framework
-    api.py                   norm_forward / norm_backward (torch-tensor dispatch)
-    config.py                NormVariant enum + RowwiseSpec/BatchNormSpec derivation
-    dtypes.py                bf16/fp16/fp32 <-> cutlass/torch tables
-    reductions.py            block_reduce_sum / block_reduce_sum2 (warp-shuffle + smem)
-    engine.py                optional cuDNN-graph engine registration (frost_norm_eng0)
+  config_sm100.py      NormVariant + shape derivation (RowwiseSpec/BatchNormSpec)
+                       + TemplateParams (frozen/hashable cache key) + Cfg/make_cfg
+  dtypes.py            bf16/fp16/fp32 <-> cutlass/torch tables
+  utils.py             DLPack -> cute.Tensor helpers
+  _common_sm100.py     device helpers: cp.async stage_row + block_reduce_sum2
+  graph_analyzer.py    NormGraphFacts + analyze(graph) + variant-pack resolution
   fprop/
-    frost/
-      rowwise.py             forward: LayerNorm/RMSNorm/InstanceNorm/GroupNorm (shared kernel)
-      batchnorm.py           forward: BatchNorm
+    api.py             norm_fprop (torch-tensor dispatch by NormVariant)
+    engines.py         cuDNN-graph engines (Capabilities/mismatch/probe/build/lower)
+    kernels/
+      layernorm_sm100.py  rmsnorm_sm100.py  groupnorm_sm100.py
+      instancenorm_sm100.py  batchnorm_sm100.py
   bprop/
-    frost/
-      rowwise.py             backward: LayerNorm/RMSNorm/InstanceNorm/GroupNorm
-      batchnorm.py           backward: BatchNorm
+    api.py             norm_bprop
+    engines.py         cuDNN-graph engines (backward)
+    kernels/           layernorm / rmsnorm / groupnorm / instancenorm / batchnorm
   tests/
-    test_norms.py            correctness vs PyTorch (fprop + bprop, all dtypes)
+    test_norms.py      correctness vs PyTorch autograd (fprop + bprop, all dtypes)
+    test_engines.py    graph-analyzer facts + engine probe accept/reject
+    bench_norms.py     LayerNorm bandwidth vs torch
 ```
 
-## Public API
+Each flavor has its own kernel entry module. LayerNorm/RMSNorm share the
+reduce-last-dim kernel (they differ only in centering); InstanceNorm reuses the
+GroupNorm kernel (InstanceNorm = GroupNorm with `num_groups = C`); BatchNorm is a
+distinct across-batch kernel (one CTA per channel, no atomics). The shared
+cp.async staging and block reduction live in `_common_sm100.py`.
+
+## Public API (direct, non-graph)
 
 ```python
-from cudnn.norm.frost import NormVariant, norm_forward, norm_backward
+from cudnn.norm import NormVariant, norm_fprop, norm_bprop
 
 # LayerNorm over the last dim
-y, mean, rstd = norm_forward(NormVariant.LAYER_NORM, x, gamma, beta,
-                             normalized_shape=[D], eps=1e-5)
-dx, dgamma, dbeta = norm_backward(NormVariant.LAYER_NORM, dy, x, gamma, mean, rstd,
-                                  normalized_shape=[D])
+y, mean, rstd = norm_fprop(NormVariant.LAYER_NORM, x, gamma, beta,
+                           normalized_shape=[D], eps=1e-5)
+dx, dgamma, dbeta = norm_bprop(NormVariant.LAYER_NORM, dy, x, gamma, mean, rstd,
+                               normalized_shape=[D])
 
 # GroupNorm / InstanceNorm on [N, C, *spatial]
-y, mean, rstd = norm_forward(NormVariant.GROUP_NORM, x, gamma, beta, num_groups=G)
-y, mean, rstd = norm_forward(NormVariant.INSTANCE_NORM, x, gamma, beta)
+y, mean, rstd = norm_fprop(NormVariant.GROUP_NORM, x, gamma, beta, num_groups=G)
+y, mean, rstd = norm_fprop(NormVariant.INSTANCE_NORM, x, gamma, beta)
 
 # RMSNorm (no centering; beta optional)
-y, _, rstd = norm_forward(NormVariant.RMS_NORM, x, gamma, normalized_shape=[D])
+y, _, rstd = norm_fprop(NormVariant.RMS_NORM, x, gamma, normalized_shape=[D])
 
 # BatchNorm (training updates running stats in place if provided)
-y, sm, sr = norm_forward(NormVariant.BATCH_NORM, x, gamma, beta,
-                         training=True, momentum=0.1,
-                         running_mean=rm, running_var=rv)
+y, sm, sr = norm_fprop(NormVariant.BATCH_NORM, x, gamma, beta, training=True,
+                       momentum=0.1, running_mean=rm, running_var=rv)
 ```
 
-## Kernel variants (`impl=`)
+## How the kernels use CUTLASS primitives
 
-`norm_forward`/`norm_backward` take an `impl` selector for the per-sample norms:
+Norms are memory-bound (no tensor cores), so the primitives that matter are
+staging and reductions, not MMA. The row-wise kernels (LN/RMS/GN/IN) take two
+compile-time knobs, resolved per shape by `make_cfg`:
 
-| `impl`      | what it does                                                        | status |
-|-------------|--------------------------------------------------------------------|--------|
-| `"scalar"`  | one element per thread, two-pass (baseline)                        | tested |
-| `"vec"`     | 128-bit vectorized load/store via register fragments (`autovec_copy`) | tested |
-| `"cpasync"` | stages each row into shared memory once with `cp.async` (reads X once, not twice); forward only, backward falls back to scalar | tested (sm_80) |
-| `"tma"`     | TMA bulk-tensor staging (`cp.async.bulk.tensor` + mbarrier)        | sm_90+ only; written, **not runtime-validated** (see below) |
-| `"auto"`    | vectorized when the shape allows, else scalar (default)           | tested |
+**`stage_mode`** — how the row reaches shared memory (X read once, not twice):
+- `STAGE_BULK` (**default** when the row is 128-bit aligned and fits 48 KB smem):
+  one **`cp.async.bulk`** (`nvvm.cp_async_bulk_shared_cluster_global`, TMA-family)
+  stages the whole row, completion signaled by an **mbarrier**. Single
+  instruction, no `M % (bt·V)` constraint.
+- `STAGE_CPASYNC`: per-thread `cp.async` (`tile_dsl.tma.load_tile` →
+  `nvvm.cp_async_shared_global`); needs `M % (bt·V) == 0`. Kept available.
+- `STAGE_NONE`: row too big for smem → read X from global directly.
+
+**`vec`** — 128-bit register-fragment load/store (`autovec_copy`) in the compute
+loops. Correct and available (all `stage_mode × vec` paths are tested), but **OFF
+by default**: measured *slower* than scalar stores for this one-CTA-per-row
+pattern (the fragment round-trip through smem adds bank conflicts; scalar global
+stores are already coalesced).
+
+Shared primitives: **`SmemAllocator`** (`cutlass.memory`) for staging + reduction
+scratch and the mbarrier; **`block_reduce_sum2`** (warp-shuffle + smem combine)
+for the two partials (`sum(x)`,`sum(x²)` fwd; `sum(dxhat)`,`sum(dxhat·xhat)` bwd);
+`import cutlass.primitives as nvvm` is the internal NVVM layer
+(`cutlass.primitives` aliases `cutlass.experimental.primitives`). BatchNorm reads
+global directly (strided cross-batch access — no contiguous row to stage).
+
+## cuDNN graph engines
+
+`fprop/engines.py` and `bprop/engines.py` register **two** engines total —
+`norm_fprop_sm100` and `norm_bprop_sm100` — with the shared `cudnn.frost` engine
+framework (listed in `cudnn.frost.dispatch._OPSET_MODULES`). The variants are not
+distinct kernel geometries (unlike SDPA's d256/d512), so one engine per phase
+serves *all* variants: its `Capabilities.variants` advertises the set and its
+`lower` dispatches to the right per-flavor kernel by `facts.variant` (the
+`gemm.frost` single-engine model, not SDPA's engine-per-geometry). The shared
+`graph_analyzer.analyze` parses a single `LAYERNORM`/`RMSNORM`/`INSTANCENORM`/
+`BATCHNORM` (`_BWD`) node into `NormGraphFacts`; `Capabilities`/`mismatch` does
+the judging (facts never judge — same contract as `cudnn.sdpa`). Enable and pin:
 
 ```python
-y, mean, rstd = norm_forward(NormVariant.LAYER_NORM, x, g, b, normalized_shape=[D], impl="cpasync")
+import cudnn  # engines self-register lazily when FROST is enabled
+# NV_CUDNN_FE_ENABLE_FROST_ENGINES=1
+g.select_engines(["norm_fprop_sm100"])   # serves whichever norm variant the graph has
 ```
 
-`cpasync`/`tma` require the row to fit in static shared memory (<=48 KB on sm_80),
-`M % V == 0`, and `(M // V) % 32 == 0`; otherwise the dispatcher falls back.
-
-**Perf note (A100, forward):** all variants are memory-bound; on this A100 they
-currently reach ~40-90% of `torch.nn.functional`'s tuned kernels (see
-`tests/bench_norms.py`). `cp.async` staging helps at mid sizes by cutting global
-X traffic from 2x to 1x. Beating torch needs more tuning (warp-per-row for small
-D, multi-row CTAs, register-resident X, block-size autotune) — tracked in TODO.
-
-**TMA status:** `impl="tma"` (`fprop/frost/rowwise_tma.py`) is written against the
-public CuTe-DSL TMA API (`make_tiled_tma_atom`, `tma_partition`, mbarrier,
-`cute.copy(..., tma_bar_ptr=)`) and guarded to raise on pre-sm_90 GPUs. It cannot
-run on this A100 (no TMA); a compile for `CUTE_DSL_ARCH=sm_90a` still trips a
-CuTe-DSL region-isolation check at the tile-selection step. Finish + validate on
-Hopper/Blackwell. Use `cpasync` on sm_80.
-
-## Design
-
-The four **per-sample** norms share one kernel. Viewing the (contiguous) input
-as `[R, M]` (R = number of normalization groups, M = reduction length), the
-affine parameter index for element `(r, j)` is
-`(r % groups_per_sample) * channels_per_group + (j // gamma_inner_span)`, which
-specializes to each variant (see `config.py`). One CTA owns one group and does a
-two-pass reduce → normalize. **BatchNorm** reduces across the batch per channel
-and has its own kernel (one CTA per channel, so `dgamma`/`dbeta` need no
-atomics; the per-sample backward uses fp32 atomics for the cross-group `dgamma`
-/`dbeta` reduction).
-
-Kernels are compiled with `cute.compile` and cached per
-`(dtype, structural flags, block_threads)` via `functools.lru_cache`; shapes
-(`R`, `M`, group sizes, `eps`) are dynamic kernel arguments, so a shape change
-does not force a recompile.
+**Status of the graph path:** the analyzer/engine logic is unit-tested
+(`tests/test_engines.py`) against synthetic nodes matching the real
+`cudnn._pygraph` norm schema. End-to-end graph execution (`select_engines` →
+`execute`) needs a *built* cuDNN frontend; validate there. Two follow-ups for the
+graph path: (1) if `epsilon`/`momentum` arrive as runtime scalar tensors rather
+than node params, read them from the variant pack in `lower_*`; (2) cuDNN has no
+native GroupNorm node, so the GroupNorm engine is reachable only via the direct
+API (the kernel is still used for InstanceNorm graphs).
 
 ## Environment
 
-The kernels require the CUTLASS CuTe DSL. On the current dev box (A100 / sm_80,
-CUDA driver 12.4) use a **cu12** DSL flavor — the `nvidia-cutlass-dsl-internal`
-package ships cu13 only, which needs a newer driver. A working venv:
+Blackwell (sm_100), cu13-capable driver. Uses the **internal** CUTLASS DSL (only
+it ships `cutlass.experimental.primitives`):
 
 ```bash
-python3 -m venv norm_venv12 && source norm_venv12/bin/activate
-pip install nvidia-cutlass-dsl                 # cu12 default (public)
-pip install "cuda-python>=12.8,<13"            # pin bindings to 12.x for the 12.4 driver
-pip install torch --index-url https://download.pytorch.org/whl/cu124
+python3 -m venv norm_venv && source norm_venv/bin/activate
+pip install nvidia-cutlass-dsl-internal \
+    --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/nv-shared-pypi-local/simple
+pip install torch --index-url https://download.pytorch.org/whl/cu128   # Blackwell
 ```
-
-On a Blackwell (sm_100) box with a cu13-capable driver, install
-`nvidia-cutlass-dsl-internal` instead (matches `cudnn.gemm.frost`).
 
 ## Tests
 
 ```bash
-python cudnn/norm/tests/test_norms.py
+PYTHONPATH=python python cudnn/norm/tests/test_norms.py     # correctness vs PyTorch
+PYTHONPATH=python python cudnn/norm/tests/test_engines.py   # engine facts/probe logic
+PYTHONPATH=python python cudnn/norm/tests/bench_norms.py    # LayerNorm bandwidth
 ```
 
-Validates every variant's fprop + bprop against PyTorch (`F.layer_norm`,
-`F.rms_norm`, `F.group_norm`, `F.instance_norm`, `F.batch_norm`) and autograd,
-for fp32/fp16/bf16. The test registers a lightweight stub `cudnn` package so the
-pure-Python `cudnn.norm` subtree imports without the compiled cuDNN extension.
+Both correctness suites register a stub `cudnn` package (with a dummy `pygraph`
+so the `cudnn.frost` lifecycle patch installs) so the pure-Python `cudnn.norm`
+subtree and `cudnn.frost.tile_dsl` import without the compiled cuDNN frontend.
+
+## Performance (LayerNorm forward, sm_100)
+
+One CTA per row, TMA bulk-async staged + scalar stores. Beats
+`torch.nn.functional` at large rows, trails at small D where a single CTA
+underfills the row:
+
+| N×D | fp32 | fp16 | bf16 |
+|-----|------|------|------|
+| 16384×8192 | 1.42× | 1.53× | 1.55× |
+| 8192×4096  | 0.90× | 0.64× | 0.61× |
+| 4096×1024  | 0.16× | 0.15× | 0.15× |
+
+(ratio vs torch; >1 = faster.) Small-D is the main tuning target (warp-per-row).
+
+Measured trade-offs on this GPU (16384×8192): TMA **bulk** vs per-thread
+**cp.async** staging is ~a wash (bulk wins fp32, cp.async wins fp16 by ~15%),
+both with scalar stores; **vectorized** stores are ~2× *slower* than scalar here,
+so `vec` is off by default. TMA-bulk’s real advantage is single-instruction issue
++ no `M % (bt·V)` constraint, not raw bandwidth — as expected, tensor-map TMA
+shines for tiled/tensor-core loads, less so for flat reduction rows.
 
 ## Status / TODO
 
-- [x] fprop + bprop kernels for all 5 variants, bf16/fp16/fp32, validated vs PyTorch.
-- [ ] cuDNN-graph engine wiring (`engine.py` is a scaffold): a `graph_analyzer`
-      that reads `graph.nodes` for `NORM_FWD`/`NORM_BWD` and a `probe`/`build`
-      registered via `cudnn.frost.register_engine`, mirroring `cudnn.gemm.frost`.
-- [x] Vectorized (128-bit) load/store kernels (`impl="vec"`).
-- [x] cp.async smem-staged forward (`impl="cpasync"`, reads X once).
-- [~] TMA staged forward (`impl="tma"`) — written, needs sm_90+ to finish/validate.
-- [ ] cp.async/TMA **backward** (currently backward falls back to scalar).
-- [ ] Perf tuning to beat torch: warp-per-row for small D, multi-row CTAs,
-      register-resident X reuse, block-size autotune, gamma-in-smem.
-- [ ] Welford (numerically stable) reduction for very large M.
-- [ ] BatchNorm vectorized/cp.async variants (currently scalar only).
-- [ ] Blackwell (sm_100) path using the internal DSL + TMA, matching gemm/frost.
+- [x] fprop + bprop kernels for all 5 variants, bf16/fp16/fp32, validated vs PyTorch autograd.
+- [x] Staging on CUTLASS primitives: TMA **bulk-async** (default) + per-thread **cp.async**, fwd + bwd (reads X once).
+- [x] Vectorized 128-bit load/store paths (all `stage_mode × vec` combos tested) — kept but off by default (slower here).
+- [x] cuDNN-graph engine layer: 2 engines (`norm_fprop_sm100` / `norm_bprop_sm100`, variant-dispatched) + probe/facts tests.
+- [ ] Graph-path e2e validation on a built cuDNN frontend; runtime epsilon/momentum plumbing.
+- [ ] Perf: warp-per-row / multi-row CTAs for small D (main gap); block-size autotune.
+- [ ] BatchNorm staging/vectorization (currently scalar global, strided cross-batch).
+- [ ] Welford (numerically stable) reduction for very large M; lower precisions (fp8/fp4/mx).
 ```
