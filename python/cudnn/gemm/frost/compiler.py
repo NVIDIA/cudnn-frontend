@@ -1819,8 +1819,9 @@ def _initialize_reduction_outputs(chain: FusionChain, outputs, stream=None) -> N
         if buffers.is_contiguous(shape, strides):
             # The driver, on the stream the kernel will run on. tensor.fill_()
             # would queue on torch's current stream instead, which is the same
-            # stream only by luck.
-            buffers.fill_f32_async(tensor.data_ptr(), int(tensor.numel()), value, stream)
+            # stream only by luck. The pattern is packed as the OUTPUT's dtype,
+            # not as float: int32's identities are the ends of its range.
+            buffers.fill_word_async(tensor.data_ptr(), int(tensor.numel()), buffers.init_word(red.compute_dtype, value), stream)
             continue
         # A padded output needs one memset per run -- for a per-row scalar that
         # is one per row, measured at 572 us against 3.5 for a single fill
@@ -2989,7 +2990,7 @@ class CompiledMoeGemm:
                 raise ValueError(
                     f"MoE output {spec.source!r} must have shape " f"{_expected_output_shape(spec, self.chain, (S, N, K))}; " f"got {tuple(t.shape)}"
                 )
-        _initialize_reduction_outputs(self.chain, outputs)
+        _initialize_reduction_outputs(self.chain, outputs, stream)
         # num_experts = weight batch (E); num_groups = first_token_offset len
         # (BxE, may exceed E; group g uses expert g % E). From runtime tensors.
         num_experts = int(weight.shape[0])
@@ -3115,7 +3116,7 @@ class CompiledMoeGemm:
                 raise ValueError(
                     f"multi-GEMM MoE output {spec.source!r} must have shape " f"{_expected_output_shape(spec, chain, (S, N, K))}; got {tuple(ci.shape)}"
                 )
-        _initialize_reduction_outputs(chain, outs)
+        _initialize_reduction_outputs(chain, outs, stream)
         num_experts = int(b_slots[0].shape[0])
         num_groups = int(first_token_offset.shape[0])
         a_stride_perms = [t.permute(1, 2, 0) for t in a_slots]
@@ -3371,7 +3372,7 @@ class CompiledMoeBlockScaleGemm:
                     f"{_expected_output_shape(spec, self.chain, (S, N, K))}; "
                     f"got {tuple(t.shape)}"
                 )
-        _initialize_reduction_outputs(self.chain, outputs)
+        _initialize_reduction_outputs(self.chain, outputs, stream)
         # num_experts = weight batch (E); num_groups = first_token_offset len
         # (BxE, may exceed E; group g uses expert g % E). From runtime tensors.
         num_experts = int(weight.shape[0])
@@ -3507,7 +3508,7 @@ class CompiledMoeBlockScaleGemm:
                     f"multi-GEMM MoE block-scale output {spec.source!r} must have shape "
                     f"{_expected_output_shape(spec, chain, (S, N, K))}; got {tuple(ci.shape)}"
                 )
-        _initialize_reduction_outputs(chain, outs)
+        _initialize_reduction_outputs(chain, outs, stream)
         num_experts = int(b_slots[0][0].shape[0])
         num_groups = int(first_token_offset.shape[0])
         a0, b0 = a_slots[0][0], b_slots[0][0]

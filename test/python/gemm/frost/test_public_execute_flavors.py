@@ -138,6 +138,35 @@ def test_reduction_output(mode, reference):
 
 
 @_GPU
+def test_int32_reduction_seed_is_packed_as_int32():
+    """A memset moves bits, so the identity has to be packed as the dtype.
+
+    int32's identities are the ends of its range, which is exactly where the
+    difference shows: -2**31 packed as float is 0xcf000000, and a MAX reduction
+    seeded with that returns -822083584 for any input below it.
+    """
+    I32 = cudnn.data_type.INT32
+    g = cudnn.pygraph(io_data_type=BF16, intermediate_data_type=F32, compute_data_type=F32)
+    A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+    B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+    bias = g.tensor(name="bias", dim=[1, 1, N], stride=[N, N, 1], data_type=I32)
+    C = g.matmul(A=A, B=B, name="mm")
+    Y = g.add(a=C, b=bias, name="add_i32", compute_data_type=I32)
+    Y.set_output(True).set_data_type(I32)
+    R = g.reduction(input=Y, mode=cudnn.reduction_mode.MAX, name="red", compute_data_type=I32)
+    R.set_dim([1, 1, 1]).set_stride([1, 1, 1]).set_output(True).set_data_type(I32)
+    _pin_frost(g)
+
+    floor = -2_000_000_000  # below the float-packed seed, above int32's minimum
+    a = torch.zeros(1, M, K, dtype=torch.bfloat16, device="cuda")
+    b = torch.zeros(1, N, K, dtype=torch.bfloat16, device="cuda")
+    y = torch.empty(1, M, N, dtype=torch.int32, device="cuda")
+    r = torch.empty(1, 1, 1, dtype=torch.int32, device="cuda")
+    _run(g, {A: a, B: b, bias: torch.full((1, 1, N), floor, dtype=torch.int32, device="cuda"), Y: y, R: r})
+    assert int(r.item()) == floor
+
+
+@_GPU
 def test_norm2_reduction_is_refused_at_build():
     """``norm2`` is the one reduction mode with a post-kernel finalize.
 

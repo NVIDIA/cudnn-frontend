@@ -298,14 +298,32 @@ def memset_zero_async(ptr: int, nbytes: int, stream) -> None:
         raise RuntimeError(f"cudaMemsetAsync failed: {err}")
 
 
-def fill_f32_async(ptr: int, count: int, value: float, stream) -> None:
-    """Stream-ordered fill of ``count`` CONTIGUOUS fp32 elements with ``value``.
+_WORD_FORMAT = {"fp32": "<f", "int32": "<i"}
+
+
+def init_word(dtype: str, value) -> int:
+    """The 32-bit pattern that writes ``value`` to a buffer of ``dtype``.
+
+    A memset moves bits, not numbers, so the value has to be packed as the dtype
+    the kernel will read it back as. int32's reduction identities are the ends
+    of its range and are exactly where that bites: -2**31 packed as float is
+    0xcf000000 where the kernel wants 0x80000000.
+    """
+    fmt = _WORD_FORMAT.get(dtype)
+    if fmt is None:
+        raise NotImplementedError(f"no 32-bit fill pattern for dtype {dtype!r}")
+    return int.from_bytes(struct.pack(fmt, value), "little")
+
+
+def fill_word_async(ptr: int, count: int, word: int, stream) -> None:
+    """Stream-ordered fill of ``count`` CONTIGUOUS 32-bit words with ``word``.
 
     An engine that seeds a caller's buffer owns that operation itself: reaching
     for ``tensor.fill_()`` works only while the buffer happens to be a torch
     tensor, and queues on torch's current stream rather than the one the kernel
-    will run on. Every seed a reduction uses (0, 1, +-inf) is a 32-bit pattern,
-    so the driver's D32 memset covers them without a kernel.
+    will run on. Every seed a reduction uses is a 32-bit pattern, so the
+    driver's D32 memset covers them without a kernel -- see ``init_word`` for
+    turning a value into one.
 
     Contiguous only, and the caller checks: a strided buffer needs one memset
     per run, which for a per-row scalar output is one per row -- measured at
@@ -313,8 +331,7 @@ def fill_f32_async(ptr: int, count: int, value: float, stream) -> None:
     """
     from cuda.bindings import driver as _drv
 
-    pattern = int.from_bytes(struct.pack("<f", float(value)), "little")
-    res = _drv.cuMemsetD32Async(int(ptr), pattern, int(count), int(stream) if stream is not None else 0)
+    res = _drv.cuMemsetD32Async(int(ptr), int(word), int(count), int(stream) if stream is not None else 0)
     err = res[0] if isinstance(res, tuple) else res
     if int(err) != 0:
         raise RuntimeError(f"cuMemsetD32Async failed: {err}")
