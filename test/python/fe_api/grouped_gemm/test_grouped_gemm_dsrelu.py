@@ -609,6 +609,149 @@ def test_grouped_gemm_dsrelu_deterministic_dprob_side_stream(request):
 
 
 @pytest.mark.L0
+@torch_fork_set_rng(seed=37)
+def test_grouped_gemm_dsrelu_deterministic_dprob_side_stream_unordered_init(request):
+    """The dprob workspace must be zeroed on the caller's stream, not on torch's.
+
+    The kernel *accumulates* into dprob, so the zeroing has to be visible to it. Allocating
+    with torch.zeros puts that memset on torch's current stream, which is unordered against a
+    caller-supplied one -- the kernel is then free to atomic-add onto whatever the allocator
+    handed back, and deterministic=True silently stops being deterministic.
+
+    Where the plain side-stream test above is only opportunistic, this one forces the failure:
+    a same-sized block is poisoned and freed so torch's allocator hands those exact bytes to
+    the wrapper, and torch's stream is occupied so a memset queued there lands well after the
+    kernel has run. Against the buggy ordering dprob comes back carrying the poison; against
+    the fixed ordering it is bit-identical to the same case run on torch's own stream.
+    """
+    try:
+        import cudnn  # noqa: F401
+        from cuda.bindings import driver as cuda
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn optional dependencies not installed")
+
+    # White-box on purpose: the poison block only gets reused if it matches the workspace byte
+    # for byte, and the slot count is exactly what this test must not hardcode.
+    from cudnn.gemm.cutedsl.grouped.dsrelu.api import _dprob_n_slots
+
+    case = _build_dsrelu_case(request, torch.float8_e4m3fn, torch.bfloat16, torch.float8_e4m3fn, 32, torch.float8_e8m0fnu, False, True)
+    inputs, cfg = case
+
+    try:
+        expected = _run_dsrelu_case(case, deterministic=True)
+    except (ValueError, NotImplementedError) as e:
+        pytest.skip(f"Unsupported testcase: {e}")
+    torch.cuda.synchronize()
+
+    valid_m = inputs["a_tensor"].shape[0]
+    slots = _dprob_n_slots(cfg["n"], cfg["mma_tiler_mn"], cfg["cluster_shape_mn"], True)
+    assert slots > 1, "config must have more than one N-tile for this to exercise the slot workspace"
+
+    side = torch.cuda.Stream()
+    # Freed, not held: the bytes stay in the allocator's pool for torch's current stream, so
+    # the wrapper's next same-shaped allocation gets them back still carrying the poison.
+    poison = torch.full((valid_m, slots, 1), 1e30, dtype=torch.float32, device=inputs["a_tensor"].device)
+    del poison
+    # ~100 ms of occupancy on torch's stream. A memset mistakenly queued there cannot reach the
+    # buffer until after the kernel on `side` has already accumulated into it.
+    torch.cuda._sleep(200_000_000)
+
+    on_side = _run_dsrelu_case(case, deterministic=True, current_stream=cuda.CUstream(side.cuda_stream))
+    torch.cuda.synchronize()
+
+    assert torch.isfinite(on_side["dprob_tensor"]).all(), "dprob picked up the poisoned block -- workspace zeroed on the wrong stream"
+    assert torch.equal(
+        bitwise_bits(on_side["dprob_tensor"]), bitwise_bits(expected["dprob_tensor"])
+    ), "deterministic dprob differs between torch's stream and a caller-supplied stream"
+    check_ref_grouped_gemm_dsrelu(inputs, on_side, cfg, skip_ref=cfg["skip_ref"])
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=41)
+def test_grouped_gemm_dsrelu_deterministic_dbias(request):
+    """deterministic=True makes dbias bit-exact without changing what it computes.
+
+    dbias contends across M-tiles, not N-tiles like dprob, so it gets its own fp32 workspace
+    indexed by absolute M-block plus a per-expert segment sum. The three properties are the
+    same ones dprob has to hold: repeatable to the bit, agreeing with the default path, and
+    with the flag's other outputs untouched.
+    """
+    try:
+        import cudnn  # noqa: F401
+        from cuda.bindings import driver as cuda  # noqa: F401
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn optional dependencies not installed")
+
+    case = _build_dsrelu_case(request, torch.float8_e4m3fn, torch.bfloat16, torch.float8_e4m3fn, 32, torch.float8_e8m0fnu, False, True)
+    inputs, cfg = case
+
+    try:
+        baseline = _run_dsrelu_case(case, deterministic=False, generate_dbias=True)
+    except (ValueError, NotImplementedError) as e:
+        pytest.skip(f"Unsupported testcase: {e}")
+    torch.cuda.synchronize()
+
+    deterministic = _run_dsrelu_case(case, deterministic=True, generate_dbias=True)
+    torch.cuda.synchronize()
+
+    # The caller-visible dbias keeps its (expert, n, 1) bf16 shape -- the fp32 M-block
+    # workspace and the segment sum are internal to the wrapper.
+    assert deterministic["dbias_tensor"].shape == baseline["dbias_tensor"].shape
+    assert deterministic["dbias_tensor"].dtype == torch.bfloat16
+    assert torch.count_nonzero(deterministic["dbias_tensor"]).item() > 0
+
+    def _relaunch():
+        out = _run_dsrelu_case(case, deterministic=True, generate_dbias=True)
+        # dprob rides along rather than getting its own run: both reductions are issued on the
+        # same stream, and only checking them together catches an ordering regression there.
+        return out["dbias_tensor"], out["dprob_tensor"]
+
+    assert_bitwise_runs(_relaunch, label="dbias+dprob")
+
+    # Both paths sum the same terms, so the honest gap is reordering plus the fact that the
+    # deterministic path keeps fp32 partials where the default rounds to bf16 on every M-tile
+    # -- which makes it the *more* accurate of the two. A dropped or double-counted M-block
+    # would move dbias far beyond this.
+    torch.testing.assert_close(deterministic["dbias_tensor"].float(), baseline["dbias_tensor"].float(), rtol=2e-2, atol=2e-2)
+
+    check_ref_grouped_gemm_dsrelu(inputs, deterministic, cfg, skip_ref=cfg["skip_ref"])
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=43)
+@pytest.mark.parametrize("n", [512, 768])
+def test_grouped_gemm_dsrelu_deterministic_dbias_segments(request, n):
+    """The per-expert segment sum must follow the real expert boundaries.
+
+    A one-hot built off the wrong offsets still produces plausible finite numbers, so agreeing
+    with the non-deterministic path is not enough. Two n values, because the block count per
+    expert differs between them.
+    """
+    try:
+        import cudnn  # noqa: F401
+        from cuda.bindings import driver as cuda  # noqa: F401
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn optional dependencies not installed")
+
+    case = _build_dsrelu_case(request, torch.float8_e4m3fn, torch.bfloat16, torch.float8_e4m3fn, 32, torch.float8_e8m0fnu, False, True, n_override=n)
+    inputs, cfg = case
+    try:
+        outputs = _run_dsrelu_case(case, deterministic=True, generate_dbias=True)
+    except (ValueError, NotImplementedError) as e:
+        pytest.skip(f"Unsupported testcase: {e}")
+    torch.cuda.synchronize()
+
+    # dbias[e] is the column sum of dA over exactly the rows of expert e. Taken from the kernel's
+    # own d_row rather than a second reference implementation, so a failure points at the segment
+    # mapping and not at the GEMM. Stacked into one comparison to keep this to a single sync.
+    offsets = inputs["padded_offsets_tensor"].tolist()
+    d_row = outputs["d_row_tensor"].float()
+    bounds = list(zip([0] + offsets[:-1], offsets))
+    expected = torch.stack([d_row[start:end].sum(dim=0).reshape(-1) for start, end in bounds])
+    torch.testing.assert_close(outputs["dbias_tensor"].float().reshape(len(offsets), -1), expected, rtol=5e-2, atol=5e-2)
+
+
+@pytest.mark.L0
 @torch_fork_set_rng(seed=31)
 def test_grouped_gemm_dsrelu_deterministic_dprob_slot_count_cache(request):
     """Two N values with different slot counts must not share a compiled kernel.

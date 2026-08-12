@@ -366,10 +366,44 @@ non-deterministic configurations compile and cache separately.
 cluster_n` — which is *not* `ceil_div(n, TILE_N)` unless `cluster_n` is 1, because the
 scheduler counts whole clusters and then expands to CTAs.
 
-**The flag covers `dprob` only.** With `generate_dbias=True` the kernel also accumulates
-`dbias` across CTA tiles with atomics, so that output remains scheduling-dependent. Every
-other output — `d_row`, `d_col`, `d_srelu`, the scale factors — is a single write per element
-and is reproducible either way. A run needing bit-exact `dbias` cannot get it here yet.
+**`dbias` is covered too, by a different mechanism.** By default the kernel accumulates it
+across *M*-tiles with bf16 atomics (`red.global.add.noftz.bf16x2`) in an order set by tile
+scheduling — a separate contention axis from `dprob`'s, since every N column is owned outright
+by one `(tile_n, subtile)` pair.
+
+Under `deterministic=True` the kernel instead writes one **fp32** slot per
+`(absolute M-block, n)`, which has exactly one writer, and the wrapper reduces those per
+expert. Groups are padded to a multiple of `m_aligned`, so no M-block straddles two experts and
+each expert owns a contiguous block range `[padded_offsets[e-1] / cta_tile_m,
+padded_offsets[e] / cta_tile_m)`. The workspace is `ceil_div(valid_m, cta_tile_m) × n_out` fp32
+— 4 MiB at `valid_m=64k`, `n=2048`, the same order as `dprob`'s.
+
+The segment sum is a one-hot matmul rather than `index_add_`/`scatter_add_`, which are
+themselves non-deterministic on CUDA, and rather than a per-expert slice, which would need
+`padded_offsets` on the host — a sync in the training loop. Keeping fp32 partials and narrowing
+to bf16 once at the end also makes this path **more accurate** than the default, which rounds
+on every M-tile.
+
+`dbias_tensor` keeps its `(expert_cnt, n_out, 1)` bf16 shape either way. The class API is lower
+level: under `deterministic=True`, `sample_dbias` / `dbias_tensor` must be the
+`(ceil_div(valid_m, cta_tile_m), n_out, 1)` **float32** workspace, and the caller does the
+per-expert reduction itself.
+
+`check_support()` rejects `deterministic=True` with `m_aligned % (cta_tile_m × cluster_m) != 0`:
+the slot index is only single-writer if the scheduler emits no M-tile past an expert's range,
+which needs that division to be exact. Every supported shape satisfies it — `m_aligned` is
+pinned to 256 and `cta_tile_m × cluster_m` is 128 or 256 — but a wider cluster would alias one
+expert's phantom tiles onto the next expert's slots.
+
+Every other output — `d_row`, `d_col`, `d_srelu`, the scale factors — is a single write per
+element and is reproducible either way.
+
+**Streams.** `dprob`, `dbias` and `amax` are accumulated into, so the wrapper initialises them
+on `current_stream` rather than on torch's current stream; otherwise the memset is unordered
+against the kernel and the guarantee is void whenever the caller runs on its own stream. The
+buffers themselves are allocated on torch's stream and `record_stream`-ed onto
+`current_stream`, which keeps all outputs in one allocator pool. A caller driving the class
+API directly owns both of these itself.
 
 ---
 
