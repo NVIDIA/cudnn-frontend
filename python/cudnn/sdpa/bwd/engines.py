@@ -206,9 +206,9 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
         if fact and not cap:
             return f"graph uses {label}, which this engine does not support"
 
-    if facts.bottom_right and not facts.causal:
-        return "bottom-right alignment requires a causal upper bound"
-    if facts.causal and facts.bottom_right and not capabilities.bottom_right:
+    if facts.bottom_right and not (facts.causal or facts.right_band_widening):
+        return "bottom-right alignment requires a causal upper bound (plain or right-widened)"
+    if facts.bottom_right and not capabilities.bottom_right:
         return "graph uses bottom-right causal, which this engine does not support"
 
     # The kernel consumes the forward stats as a contiguous natural-log LSE
@@ -246,6 +246,7 @@ def _sm120_spec() -> EngineSpec:
             gqa=True,
             causal=True,
             bottom_right=True,
+            right_band_widening=True,
             swa=True,
             padded=True,
             layouts=frozenset({"bshd", "dense_flex"}),
@@ -330,9 +331,10 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
         sample_dq=_desc(dq_geom, facts.dtype, "dQ"),
         sample_dk=_desc(dk_geom, facts.dtype, "dK"),
         sample_dv=_desc(dv_geom, facts.dtype, "dV"),
-        is_causal=facts.causal,
+        is_causal=facts.causal or facts.right_band_widening,
         causal_bottom_right=facts.bottom_right,
         window_size_left=facts.window_left,
+        window_size_right=(facts.right_bound if facts.right_band_widening else None),
         deterministic=facts.deterministic,
         scale_softmax=facts.scale,
         tile_m=requested.tile_m if requested is not None else None,

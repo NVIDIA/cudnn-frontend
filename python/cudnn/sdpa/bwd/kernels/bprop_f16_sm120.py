@@ -22,7 +22,8 @@ Constraints:
   serves any other multiple of 8 up to 256 by zero-padding D.
 * GQA/MQA: H_q must be a multiple of H_kv
 * No dropout/alibi/softcap
-* Optional causal (top-left or bottom-right), sliding-window masks and padding masks.
+* Optional causal (top-left or bottom-right), right-band-widened causal
+  (window_size_right), sliding-window masks and padding masks.
 * LSE input is the natural-log forward stats, fp32 (B, H, SQ) contiguous
 
 One backward call is three kernel launches through the per-shape
@@ -463,6 +464,7 @@ class SM120FusedMultiHeadAttentionFP16Backward:
         is_causal: bool = False,
         causal_top_left: bool = False,
         window_size_left: int | None = None,
+        window_size_right: int | None = None,
         deterministic: bool = False,
         head_dim: int = 128,
         use_pdl: bool = True,
@@ -475,6 +477,8 @@ class SM120FusedMultiHeadAttentionFP16Backward:
         self.is_causal = is_causal
         self.causal_top_left = bool(causal_top_left)
         self.window_size_left = window_size_left
+        self.window_size_right = window_size_right
+        self.right_slack = window_size_right if window_size_right is not None else 0
         self.deterministic = bool(deterministic)
         self.seq_kv_lens_present = bool(seq_kv_lens_present)
         self.seq_q_lens_present = bool(seq_q_lens_present)
@@ -647,7 +651,8 @@ class SM120FusedMultiHeadAttentionFP16Backward:
             else:
                 diag_off = cutlass.Int32(0)
         if cutlass.const_expr(self.is_causal):
-            m_block_min = cute.math.max(kv_base - diag_off, cutlass.Int32(0)) // M
+            # kv is visible to q when kv <= q + diag_off + right_slack
+            m_block_min = cute.math.max(kv_base - diag_off - self.right_slack, cutlass.Int32(0)) // M
         else:
             m_block_min = cutlass.Int32(0)
         if cutlass.const_expr(self.window_size_left is not None):
@@ -902,7 +907,7 @@ class SM120FusedMultiHeadAttentionFP16Backward:
                 # Mask + softmax (scores -> P, unscaled by attn_scale) and the
                 # P store to smem.
                 if cutlass.const_expr(self.is_causal):
-                    do_mask_causal = (m_block * M) < (kv_base + N - diag_off)
+                    do_mask_causal = (m_block * M) < (kv_base + N - diag_off - self.right_slack)
                 if cutlass.const_expr(self.window_size_left is not None):
                     do_mask_window = kv_base < (m_block * M + M - 1 + diag_off - self.window_size_left)
                 if cutlass.const_expr(self.seq_kv_lens_present):
@@ -922,13 +927,15 @@ class SM120FusedMultiHeadAttentionFP16Backward:
                         s3 = acc_s[off + 3]
                         if cutlass.const_expr(self.is_causal):
                             if do_mask_causal:
-                                if kv_a0 > r0 + diag_off:
+                                hi0 = r0 + diag_off + self.right_slack
+                                hi8 = r8 + diag_off + self.right_slack
+                                if kv_a0 > hi0:
                                     s0 = neg_inf
-                                if kv_a1 > r0 + diag_off:
+                                if kv_a1 > hi0:
                                     s1 = neg_inf
-                                if kv_a0 > r8 + diag_off:
+                                if kv_a0 > hi8:
                                     s2 = neg_inf
-                                if kv_a1 > r8 + diag_off:
+                                if kv_a1 > hi8:
                                     s3 = neg_inf
                         if cutlass.const_expr(self.window_size_left is not None):
                             if do_mask_window:
@@ -1621,6 +1628,7 @@ def compile(  # noqa: A001
         is_causal=PARAMS.is_causal,
         causal_top_left=PARAMS.causal_top_left,
         window_size_left=PARAMS.window_size_left,
+        window_size_right=PARAMS.window_size_right,
         deterministic=PARAMS.deterministic,
         head_dim=d,
         use_pdl=PARAMS.use_pdl,

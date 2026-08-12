@@ -69,6 +69,7 @@ class SdpaBwdDsl(APIBase):
         is_causal: bool = False,
         causal_bottom_right: bool = False,
         window_size_left: Optional[int] = None,
+        window_size_right: Optional[int] = None,
         deterministic: bool = False,
         scale_softmax: Optional[float] = None,
         tile_m: Optional[int] = None,
@@ -93,6 +94,7 @@ class SdpaBwdDsl(APIBase):
         self.is_causal = bool(is_causal)
         self.causal_bottom_right = bool(causal_bottom_right)
         self.window_size_left = None if window_size_left is None else int(window_size_left)
+        self.window_size_right = None if window_size_right is None else int(window_size_right)
         self.deterministic = bool(deterministic)
         self.scale_softmax = scale_softmax
         self.tile_m = None if tile_m is None else int(tile_m)
@@ -252,6 +254,14 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
             self.window_size_left is not None and self.window_size_left < 0,
             f"window_size_left must be non-negative, got {self.window_size_left}",
         )
+        self._value_error_if(
+            self.window_size_right is not None and self.window_size_right < 0,
+            f"window_size_right must be non-negative, got {self.window_size_right}",
+        )
+        self._value_error_if(
+            self.window_size_right is not None and not self.is_causal,
+            "window_size_right widens the causal diagonal and requires is_causal=True",
+        )
 
         self._runtime_error_if(not torch.cuda.is_available(), "CUDA is not available")
         self.compute_capability = torch.cuda.get_device_capability(self.q_desc.device)
@@ -288,6 +298,7 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
             is_causal=self.is_causal,
             causal_top_left=self.is_causal and not self.causal_bottom_right,
             window_size_left=self.window_size_left,
+            window_size_right=self.window_size_right,
             deterministic=self.deterministic,
             q_tile=self.q_tile,
             kv_tile=self.kv_tile,
@@ -502,6 +513,7 @@ def sdpa_bwd_wrapper_dsl_sm120(
     is_causal: bool = False,
     causal_bottom_right: bool = False,
     window_size_left: Optional[int] = None,
+    window_size_right: Optional[int] = None,
     deterministic: bool = False,
     scale_softmax: Optional[float] = None,
     seq_q_lens: Optional[torch.Tensor] = None,
@@ -526,6 +538,7 @@ def sdpa_bwd_wrapper_dsl_sm120(
         bool(is_causal),
         bool(causal_bottom_right),
         window_size_left,
+        window_size_right,
         bool(deterministic),
         scale_softmax,
         seq_q_lens is not None,
@@ -546,6 +559,7 @@ def sdpa_bwd_wrapper_dsl_sm120(
             is_causal=is_causal,
             causal_bottom_right=causal_bottom_right,
             window_size_left=window_size_left,
+            window_size_right=window_size_right,
             deterministic=deterministic,
             scale_softmax=scale_softmax,
             seq_kv_lens_present=seq_kv_lens is not None,

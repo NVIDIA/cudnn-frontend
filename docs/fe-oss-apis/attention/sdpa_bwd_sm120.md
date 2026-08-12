@@ -39,6 +39,8 @@ grads = sdpa_bwd_wrapper_dsl_sm120(
     is_causal=True,
     causal_bottom_right=False,
     window_size_left=None,   # W: keys with k < q + diag - W are masked
+    window_size_right=None,  # R: widen the causal diagonal right by R keys
+                             # (keep k <= q + diag + R
     deterministic=False,     # ordered dQ KV-tile reduction (bitwise-reproducible)
     scale_softmax=None,      # None -> 1/sqrt(D)
     seq_q_lens=None,         # (B,) int32 per-batch Q lengths (padding mask)
@@ -181,9 +183,11 @@ nothing extra is carved, and no `reduce` kernel is launched.
 Masking is applied twice, cheaply:
 
 * **Loop bounds** do the heavy lifting: causal clamps the first q-tile
-  (`q_block_min`, bottom-right via `diag_off = S_kv − S_q`), a left window
-  clamps the last (`q_block_max`) — fully-masked tiles are never visited, so
-  square causal attention runs roughly half as many tile iterations.
+  (`q_block_min`, bottom-right via `diag_off = S_kv − S_q`, a right band via
+  the compile-time widening `q_block_min = (kv_base − diag_off − R) / tile_q`),
+  a left window clamps the last (`q_block_max`) — fully-masked tiles are never
+  visited, so square causal attention runs roughly half as many tile
+  iterations.
 * **In-register score masking** runs only on tiles that straddle a mask edge
   (`do_mask_causal` / `do_mask_window` / `do_mask_pad` gates); interior tiles
   skip it.
@@ -229,9 +233,11 @@ only the unused relay operand remains in the kernel ABI.
 - Dtypes: FP16 / BF16 (LSE fp32)
 - Head dims: 32/64/128/192/256 natively; any other multiple of 8 up to 256 is
   served by zero-padding D to the next supported size (`d_qk == d_v`)
-- Masks: none, causal (top-left or bottom-right), sliding window
-  (left-window offset, with or without causal), padding (per-batch
-  `seq_kv_len` required, `seq_q_len` optional; composes with the other masks)
+- Masks: none, causal (top-left or bottom-right), right-band-widened causal
+  (`diagonal_band_right_bound` > 0, the causal diagonal shifted right by a
+  compile-time R), sliding window (left-window offset, with or without
+  causal), padding (per-batch `seq_kv_len` required, `seq_q_len` optional;
+  composes with the other masks)
 - GQA/MQA: any `H_kv` dividing `H_q` (including `H_kv == 1`)
 - No dropout / bias / ALiBi / sinks / softcap / THD
 - Workspace (carved from the caller's buffer): fp32 `delta` and `dq_accum`

@@ -1018,6 +1018,15 @@ def test_bwd_probe_causal_notches(monkeypatch):
     assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(s_q=S // 2, use_causal_mask_bottom_right=True, sliding_window_length=64))
 
 
+def test_bwd_probe_accepts_right_band_widening(monkeypatch):
+    # diagonal_band_right_bound > 0 lowers as causal with a right offset.
+    monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
+    import cudnn
+
+    assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(diagonal_band_right_bound=16))
+    assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(s_q=S // 2, diagonal_band_right_bound=16, diagonal_alignment=cudnn.diagonal_alignment.BOTTOM_RIGHT))
+
+
 def test_bwd_probe_accepts_deterministic(monkeypatch):
     # use_deterministic_algorithm is served by the ordered-relay dQ path.
     monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))

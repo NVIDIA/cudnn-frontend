@@ -68,6 +68,7 @@ def _ref_bwd(
     is_causal: bool = False,
     causal_bottom_right: bool = False,
     window_size_left: int | None = None,
+    window_size_right: int | None = None,
     padding: tuple[list[int], list[int]] | None = None,
 ):
     """Reference via the canonical refs (sdpa/fp16_ref.py)."""
@@ -76,7 +77,7 @@ def _ref_bwd(
     from sdpa.fp16_ref import compute_ref, compute_ref_backward
 
     diag_align = cudnn.diagonal_alignment.BOTTOM_RIGHT if causal_bottom_right else cudnn.diagonal_alignment.TOP_LEFT
-    right_bound = 0 if is_causal else None
+    right_bound = window_size_right if window_size_right is not None else (0 if is_causal else None)
     # The refs take the cuDNN window LENGTH; window_size_left is the offset W = L - 1.
     left_bound = None if window_size_left is None else window_size_left + 1
     o_ref, stats_ref, _, _ = compute_ref(
@@ -126,6 +127,7 @@ def _run_bwd_graph(
     is_causal: bool = False,
     causal_bottom_right: bool = False,
     window_size_left: int | None = None,
+    window_size_right: int | None = None,
     deterministic: bool = False,
     select: bool = True,
     q_tile: int | None = None,
@@ -169,12 +171,18 @@ def _run_bwd_graph(
         "stats": stats,
         "attn_scale": scale,
     }
-    if causal_bottom_right:
-        bwd_kwargs["use_causal_mask_bottom_right"] = True
-    elif is_causal:
-        bwd_kwargs["use_causal_mask"] = True
-    if window_size_left is not None:
-        bwd_kwargs["sliding_window_length"] = window_size_left + 1
+    if window_size_right is not None:
+        bwd_kwargs["diagonal_band_right_bound"] = window_size_right
+        bwd_kwargs["diagonal_alignment"] = cudnn.diagonal_alignment.BOTTOM_RIGHT if causal_bottom_right else cudnn.diagonal_alignment.TOP_LEFT
+        if window_size_left is not None:
+            bwd_kwargs["diagonal_band_left_bound"] = window_size_left + 1
+    else:
+        if causal_bottom_right:
+            bwd_kwargs["use_causal_mask_bottom_right"] = True
+        elif is_causal:
+            bwd_kwargs["use_causal_mask"] = True
+        if window_size_left is not None:
+            bwd_kwargs["sliding_window_length"] = window_size_left + 1
     if deterministic:
         bwd_kwargs["use_deterministic_algorithm"] = True
     seq_q_t = seq_kv_t = None
@@ -254,6 +262,7 @@ def _run_case(
     is_causal: bool = False,
     causal_bottom_right: bool = False,
     window_size_left: int | None = None,
+    window_size_right: int | None = None,
     deterministic: bool = False,
     select: bool = True,
     q_tile: int | None = None,
@@ -269,7 +278,16 @@ def _run_case(
     v = _bhsd(batch, h_kv, s_kv, head_dim, dtype, layout=layout)
     do = _bhsd(batch, h_q, s_q, head_dim, dtype, layout=layout)
     o, stats, dq_ref, dk_ref, dv_ref = _ref_bwd(
-        q, k, v, do, scale=scale, is_causal=is_causal, causal_bottom_right=causal_bottom_right, window_size_left=window_size_left, padding=padding
+        q,
+        k,
+        v,
+        do,
+        scale=scale,
+        is_causal=is_causal,
+        causal_bottom_right=causal_bottom_right,
+        window_size_left=window_size_left,
+        window_size_right=window_size_right,
+        padding=padding,
     )
     o = _bhsd(batch, h_q, s_q, head_dim, dtype, empty=True, layout=layout).copy_(o)
     seq_q_lens = seq_kv_lens = None
@@ -287,6 +305,7 @@ def _run_case(
         is_causal=is_causal,
         causal_bottom_right=causal_bottom_right,
         window_size_left=window_size_left,
+        window_size_right=window_size_right,
         deterministic=deterministic,
         select=select,
         q_tile=q_tile,
@@ -428,6 +447,29 @@ def test_sdpa_bwd_dsl_sm120_sliding_window_tails():
     """Sub-tile sliding window with non-tile-multiple sequence tails."""
 
     _run_case(s_q=193, s_kv=257, head_dim=128, is_causal=True, window_size_left=16)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=46)
+def test_sdpa_bwd_dsl_sm120_right_band():
+    """diagonal_band_right_bound > 0: the causal diagonal widened right by a
+    compile-time R (keep kv <= q + diag + R)."""
+
+    _run_case(s_q=256, s_kv=256, head_dim=64, window_size_right=32)  # top-left band
+    _run_case(s_q=192, s_kv=320, head_dim=64, causal_bottom_right=True, window_size_right=48)  # bottom-right anchor
+    _run_case(s_q=256, s_kv=256, head_dim=64, window_size_left=64, window_size_right=32)  # full band
+    _run_case(s_q=193, s_kv=257, head_dim=128, window_size_right=24)  # ragged tails
+    _run_case(s_q=128, s_kv=128, head_dim=64, window_size_right=300)  # R >= S_kv clamps to dense
+    _run_case(s_q=256, s_kv=256, head_dim=64, window_size_right=32, deterministic=True)  # relay turns unaffected by R
+    _run_case(
+        s_q=256,
+        s_kv=256,
+        head_dim=64,
+        causal_bottom_right=True,
+        window_size_right=48,
+        window_size_left=96,
+        padding=([230, 120], [180, 240]),
+    )  # per-batch diagonal + R
 
 
 @pytest.mark.L0
