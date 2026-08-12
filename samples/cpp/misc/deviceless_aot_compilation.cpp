@@ -59,7 +59,6 @@ TEST_CASE("Deviceless compilation", "[conv][graph][serialization]") {
     //////////////////////////////////////////////////////////////
     // 3. deserialize and execute the plan
     //////////////////////////////////////////////////////////////
-    // Create a unique_ptr for the cuDNN handle
     auto handle_ptr = create_cudnn_handle();
     auto handle     = *handle_ptr;
 
@@ -80,4 +79,19 @@ TEST_CASE("Deviceless compilation", "[conv][graph][serialization]") {
     std::cout << *graph_deserialized << std::endl;
 
     REQUIRE(graph_deserialized->execute(handle, variant_pack, workspace.devPtr).is_good());
+
+    //////////////////////////////////////////////////////////////
+    // 4. Handle-less deserialize: use device properties instead of a handle.
+    //    No cuDNN handle is needed until execution time.
+    //////////////////////////////////////////////////////////////
+    auto graph_handleless = std::make_shared<fe::graph::Graph>();
+    graph_handleless->set_device_properties(device_prop_deserialized);
+    REQUIRE(graph_handleless->deserialize(data_graph).is_good());
+
+    Surface<half> y_tensor2(n * k * h * w);
+    variant_pack[Y->get_uid()] = y_tensor2.devPtr;
+    int64_t workspace_size2    = 0;
+    REQUIRE(graph_handleless->get_workspace_size(workspace_size2).is_good());
+    Surface<int8_t> workspace2(workspace_size2);
+    REQUIRE(graph_handleless->execute(handle, variant_pack, workspace2.devPtr).is_good());
 }

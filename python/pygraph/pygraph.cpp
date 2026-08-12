@@ -634,14 +634,19 @@ PyGraph::deserialize(std::optional<std::intptr_t> handle_, py::object const& pyo
         throw_if(status.is_bad(), status.get_code(), status.get_message());
 
     } else {
-        // If handle is provided, use it (AoT compilation).
-        cudnnHandle_t handle =
-            handle_.has_value() ? static_cast<cudnnHandle_t>((void*)(handle_.value())) : this->handle;
-
         std::vector<uint8_t> data = pyobj.cast<std::vector<uint8_t>>();
-        auto status               = graph->deserialize(handle, data, enforce_precompiled);
 
-        throw_if(status.is_bad(), status.get_code(), status.get_message());
+        if (!handle_.has_value() && this->handle == nullptr && this->device_properties != nullptr) {
+            // Handle-less path: use the device properties set at construction.
+            auto status = graph->deserialize(data, enforce_precompiled);
+            throw_if(status.is_bad(), status.get_code(), status.get_message());
+        } else {
+            // Uses explicit handle if provided, otherwise falls back to the construction-time handle.
+            cudnnHandle_t handle =
+                handle_.has_value() ? static_cast<cudnnHandle_t>((void*)(handle_.value())) : this->handle;
+            auto status = graph->deserialize(handle, data, enforce_precompiled);
+            throw_if(status.is_bad(), status.get_code(), status.get_message());
+        }
     }
 }
 

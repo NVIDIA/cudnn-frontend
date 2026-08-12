@@ -185,12 +185,17 @@ query_cudnn_heuristics_impl(std::shared_ptr<OperationGraph_v8> const& operation_
 }
 
 inline error_t
-create_cudnn_execution_plan(std::shared_ptr<ExecutionPlan>& plan,
-                            std::string const& serialized_data,
-                            cudnnHandle_t handle) {
+create_cudnn_execution_plan_impl(std::shared_ptr<ExecutionPlan>& plan,
+                                 std::string const& serialized_data,
+                                 cudnnHandle_t handle,
+                                 std::shared_ptr<const DeviceProperties> device_properties) {
     auto&& plan_builder = cudnn_frontend::ExecutionPlanBuilder();
 
-    plan_builder.setHandle(handle);
+    if (device_properties != nullptr) {
+        plan_builder.setDeviceProperties(device_properties);
+    } else {
+        plan_builder.setHandle(handle);
+    }
 
 #ifdef NV_CUDNN_DISABLE_EXCEPTION
     // disable exception macro is defined. Calling build will not throw.
@@ -219,6 +224,20 @@ create_cudnn_execution_plan(std::shared_ptr<ExecutionPlan>& plan,
 #endif
 
     return {error_code_t::OK, ""};
+}
+
+inline error_t
+create_cudnn_execution_plan(std::shared_ptr<ExecutionPlan>& plan,
+                            std::string const& serialized_data,
+                            cudnnHandle_t handle) {
+    return create_cudnn_execution_plan_impl(plan, serialized_data, handle, nullptr);
+}
+
+inline error_t
+create_cudnn_execution_plan(std::shared_ptr<ExecutionPlan>& plan,
+                            std::string const& serialized_data,
+                            std::shared_ptr<const DeviceProperties> device_properties) {
+    return create_cudnn_execution_plan_impl(plan, serialized_data, nullptr, std::move(device_properties));
 }
 
 inline error_t
@@ -612,6 +631,22 @@ class Execution_plan_list {
     build_plans(cudnnHandle_t handle, std::string const& json) {
         execution_plans.resize(1);
         auto const& fe_status = detail::create_cudnn_execution_plan(execution_plans[0], json, handle);
+
+        if (fe_status.is_good()) {
+            candidate = 0;
+        }
+
+        return fe_status;
+    }
+
+    error_t
+    build_plans(std::shared_ptr<const DeviceProperties> device_properties, std::string const& json) {
+        RETURN_CUDNN_FRONTEND_ERROR_IF(device_properties == nullptr,
+                                       error_code_t::ATTRIBUTE_NOT_SET,
+                                       "build_plans: device_properties must not be null");
+        execution_plans.resize(1);
+        auto const& fe_status =
+            detail::create_cudnn_execution_plan(execution_plans[0], json, std::move(device_properties));
 
         if (fe_status.is_good()) {
             candidate = 0;

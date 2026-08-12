@@ -51,8 +51,9 @@ class PyGraph {
     // This Graph class is the sole structure which implicitly makes PyGraph own all tensors, nodes, and cudnn
     // descriptors.
     Graph_t graph;
-    cudnnHandle_t handle = nullptr;
-    bool is_handle_owner = false;
+    cudnnHandle_t handle                                                = nullptr;
+    bool is_handle_owner                                                = false;
+    std::shared_ptr<cudnn_frontend::DeviceProperties> device_properties = nullptr;
 
     std::optional<PyCallback> callback_fn;
     std::optional<PyCallback> callback_fn_bprop;
@@ -75,12 +76,16 @@ class PyGraph {
             .set_intermediate_data_type(intermediate_data_type)
             .set_io_data_type(io_data_type);
 
-        // If device_properties is set, use it (consider it is an AoT compilation test).
         if (device_properties != nullptr) {
+            this->device_properties = device_properties;
             graph->set_device_properties(device_properties);
-        } else if (handle_.has_value()) {
+        }
+        // Store explicit handle independently of device_properties so that a caller
+        // who supplies both (devprop for deserialization, handle for execution) does
+        // not silently lose the handle.
+        if (handle_.has_value()) {
             handle = static_cast<cudnnHandle_t>((void*)(handle_.value()));
-        } else {
+        } else if (device_properties == nullptr) {
             detail::create_handle(&handle);
             is_handle_owner = true;
         }

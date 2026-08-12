@@ -2077,8 +2077,18 @@ class pygraph:
             if self._nodes:  # deserializing into a built-up graph: lower it
                 self.validate()
                 self._lowered_graph = self._lower_to_cpp()
-            else:  # fresh container (classic usage): empty C++ graph
-                self._lowered_graph = cudnn._pybind_module.backend_graph()
+            else:
+                # Fresh container: forward only the fields that should survive
+                # container replacement. Datatypes are deliberately NOT forwarded —
+                # a deserialized plan carries its own context; forcing FLOAT here
+                # would change existing one-argument deserialize(blob) callers.
+                deser_kwargs = {}
+                for _k in ("name", "kernel_cache", "device_property"):
+                    if _k in self._cpp_graph_kwargs:
+                        deser_kwargs[_k] = self._cpp_graph_kwargs[_k]
+                if self._handle is not None:
+                    deser_kwargs["handle"] = self._handle
+                self._lowered_graph = cudnn._pybind_module.backend_graph(**deser_kwargs)
         self._lowered_graph.deserialize(*args, **kwargs)
         self._is_built = True
         # The loaded graph carries its own variant_pack, so an order cached while
