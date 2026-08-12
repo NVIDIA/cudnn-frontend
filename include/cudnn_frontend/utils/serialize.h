@@ -649,8 +649,7 @@ from_json(const nlohmann::json& j, Tensor_attributes& ta) {
     if (j.contains("ragged_offset_multiplier")) {
         ta.ragged_offset_multiplier = j.at("ragged_offset_multiplier").get<int64_t>();
     }
-    // Read tolerantly: payloads produced before alignment was serialized carry no such key,
-    // and they must keep deserializing to the default rather than throwing.
+    // Optional read, for backward compatibility with payloads that predate this key.
     ta.alignment = j.value("alignment", Tensor_attributes::default_alignment);
 }
 
