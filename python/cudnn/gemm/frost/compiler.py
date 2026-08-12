@@ -1803,13 +1803,23 @@ def _expected_output_shape(spec, chain: FusionChain, mnk) -> tuple[int, int, int
     return tuple(1 if spec.dim[i] == 1 else full[i] for i in range(3))
 
 
-def _initialize_reduction_outputs(chain: FusionChain, outputs) -> None:
+def _initialize_reduction_outputs(chain: FusionChain, outputs, stream=None) -> None:
+    """Seed each reduction output with its identity, before the kernel runs.
+
+    Through the driver rather than the buffer: an engine that reaches for
+    ``tensor.fill_()`` works only while the caller happened to pass a torch
+    tensor, and the variant pack exists so that it does not have to.
+    """
     for spec, tensor in zip(chain.outputs, outputs):
         if not spec.is_reduction:
             continue
-        red_idx = int(spec.source.rsplit("_", 1)[1])
-        red = chain.reductions[red_idx]
-        tensor.fill_(_REDUCTION_INIT_VALUE[red.compute_dtype][red.mode])
+        red = chain.reductions[int(spec.source.rsplit("_", 1)[1])]
+        value = _REDUCTION_INIT_VALUE[red.compute_dtype][red.mode]
+        fill = getattr(tensor, "fill_", None)
+        if fill is not None:  # a torch tensor from the direct-call entry
+            fill(value)
+        else:
+            buffers.fill_f32_async(tensor.data_ptr(), int(tensor.numel()), value, stream)
 
 
 def _finalize_reductions(chain, out_bufs) -> None:
@@ -1999,7 +2009,7 @@ class CompiledFusedGemm:
                 f"got A={tuple(a.shape)}, B={tuple(b.shape)}, "
                 f"C={[tuple(ci.shape) for ci in cs]}"
             )
-        _initialize_reduction_outputs(self.chain, cs)
+        _initialize_reduction_outputs(self.chain, cs, stream)
 
         if self.chain.output_specs:
             base_problem = (mnk[0], mnk[1], mnk[2], cs[0].shape[0])
@@ -2086,7 +2096,7 @@ class CompiledFusedGemm:
             for t in slots:
                 if len(t.shape) != 3:
                     raise ValueError(f"multi-GEMM {role} operand must be rank-3; got {tuple(t.shape)}")
-        _initialize_reduction_outputs(chain, cs)
+        _initialize_reduction_outputs(chain, cs, stream)
 
         base_problem = (mnk[0], mnk[1], mnk[2], cs[0].shape[0])
         a_permuted = [t.permute(1, 2, 0) for t in a_slots]
@@ -2158,7 +2168,7 @@ class CompiledFusedGemm:
                 raise ValueError(
                     f"block-scale multi-GEMM output {spec.source!r} must have " f"shape {_expected_output_shape(spec, chain, mnk)}; " f"got {tuple(ci.shape)}"
                 )
-        _initialize_reduction_outputs(chain, cs)
+        _initialize_reduction_outputs(chain, cs, stream)
         base_problem = (mnk[0], mnk[1], mnk[2], cs[0].shape[0])
         # Grouped by kind (all A, all B, all SFA, all SFB); single-GEMM → a,b,sfa,sfb.
         a_permuted = [d.permute(1, 2, 0) for d, _ in a_slots]

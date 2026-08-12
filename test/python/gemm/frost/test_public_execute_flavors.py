@@ -1,0 +1,186 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Every gemm flavor, driven through the PUBLIC ``graph.execute()``.
+
+The rest of this directory calls the compiled object directly with torch
+tensors. That skips the whole engine wrapper -- operand binding, the variant
+pack, and the buffer conversion ``execute()`` performs -- so a break that only
+appears when the engine hands the kernel what the pack holds is invisible to
+it. A reduction output shipped in exactly that state: the epilogue initializes
+it with ``fill_`` and finalizes ``norm2`` with ``sqrt_``, both of which the
+compiled object used to receive as torch tensors and now does not.
+
+So this file exists to exercise the same flavors the direct-call tests cover,
+but through the entry point a user actually has.
+"""
+
+import pytest
+import torch
+
+import cudnn
+from cudnn.engines import is_python_engine
+
+pytestmark = pytest.mark.L0
+
+_GPU = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
+    reason="the FROST gemm engine claims SM100",
+)
+
+BF16 = cudnn.data_type.BFLOAT16
+F32 = cudnn.data_type.FLOAT
+M = N = 128
+K = 64
+
+
+@pytest.fixture(autouse=True)
+def _frost_opt_in(monkeypatch):
+    monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
+
+
+def _pin_frost(g):
+    """Select the FROST plan, or skip when it does not claim this graph."""
+    g.validate()
+    g.build_operation_graph()
+    g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    frost = [i for i, p in enumerate(g.plans) if is_python_engine(p.engine_id)]
+    if not frost:
+        pytest.skip("no FROST plan for this graph")
+    g.select_plan(frost[0])
+    g.check_support()
+    g.build_plans()
+    return g
+
+
+def _operands():
+    a = torch.randn(1, M, K, dtype=torch.bfloat16, device="cuda")
+    b = torch.randn(1, N, K, dtype=torch.bfloat16, device="cuda")
+    return a, b, torch.einsum("bmk,bnk->bmn", a.float(), b.float())
+
+
+def _run(g, data):
+    ws = torch.empty(max(g.get_workspace_size(), 1), dtype=torch.uint8, device="cuda")
+    g.execute(data, ws)
+    torch.cuda.synchronize()
+
+
+@_GPU
+def test_plain_matmul():
+    """The control: if this fails the harness is wrong, not the flavor."""
+    g = cudnn.pygraph(io_data_type=BF16, intermediate_data_type=F32, compute_data_type=F32)
+    A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+    B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+    C = g.matmul(A=A, B=B, name="mm")
+    C.set_output(True).set_data_type(BF16)
+    _pin_frost(g)
+
+    a, b, ref = _operands()
+    c = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
+    _run(g, {A: a, B: b, C: c})
+    torch.testing.assert_close(c, ref.to(torch.bfloat16), atol=1e-1, rtol=1e-2)
+
+
+@_GPU
+def test_epilogue_fusion():
+    g = cudnn.pygraph(io_data_type=BF16, intermediate_data_type=F32, compute_data_type=F32)
+    A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+    B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+    C = g.matmul(A=A, B=B, name="mm")
+    Y = g.relu(input=C, name="relu")
+    Y.set_output(True).set_data_type(BF16)
+    _pin_frost(g)
+
+    a, b, ref = _operands()
+    y = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
+    _run(g, {A: a, B: b, Y: y})
+    torch.testing.assert_close(y, torch.relu(ref).to(torch.bfloat16), atol=1e-1, rtol=1e-2)
+
+
+@_GPU
+@pytest.mark.parametrize(
+    "mode,reference",
+    (
+        (cudnn.reduction_mode.ADD, lambda t: t.sum().reshape(1, 1, 1)),
+        (cudnn.reduction_mode.AMAX, lambda t: t.abs().max().reshape(1, 1, 1)),
+        (cudnn.reduction_mode.MAX, lambda t: t.max().reshape(1, 1, 1)),
+        (cudnn.reduction_mode.MIN, lambda t: t.min().reshape(1, 1, 1)),
+    ),
+    ids=("add", "amax", "max", "min"),
+)
+def test_reduction_output(mode, reference):
+    """A reduction tap alongside the epilogue output.
+
+    The epilogue writes the tap's initial value before the kernel runs and, for
+    ``norm2``, takes a square root after it. Both are device operations on a
+    caller buffer, which is where a buffer that is only a description rather
+    than a tensor shows up.
+    """
+    g = cudnn.pygraph(io_data_type=BF16, intermediate_data_type=F32, compute_data_type=F32)
+    A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+    B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+    C = g.matmul(A=A, B=B, name="mm")
+    Y = g.relu(input=C, name="relu")
+    Y.set_output(True).set_data_type(BF16)
+    R = g.reduction(input=Y, mode=mode, name="red")
+    R.set_dim([1, 1, 1]).set_stride([1, 1, 1])
+    R.set_output(True).set_data_type(F32)
+    _pin_frost(g)
+
+    a, b, ref = _operands()
+    y = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
+    r = torch.empty(1, 1, 1, dtype=torch.float32, device="cuda")
+    _run(g, {A: a, B: b, Y: y, R: r})
+
+    relu = torch.relu(ref)
+    torch.testing.assert_close(y, relu.to(torch.bfloat16), atol=1e-1, rtol=1e-2)
+    torch.testing.assert_close(r, reference(relu), atol=1e-1, rtol=1e-2)
+
+
+@_GPU
+def test_norm2_reduction_is_refused_at_build():
+    """``norm2`` is the one reduction mode with a post-kernel finalize.
+
+    It never reaches one: the backend refuses the reduction descriptor while
+    the graph is being lowered, so no plan exists and ``execute()`` is never
+    called. Recorded because the finalize would otherwise look like a live path
+    that needs a device-side square root.
+    """
+    g = cudnn.pygraph(io_data_type=BF16, intermediate_data_type=F32, compute_data_type=F32)
+    A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+    B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+    C = g.matmul(A=A, B=B, name="mm")
+    Y = g.relu(input=C, name="relu")
+    Y.set_output(True).set_data_type(BF16)
+    R = g.reduction(input=Y, mode=cudnn.reduction_mode.NORM2, name="red")
+    R.set_dim([1, 1, 1]).set_stride([1, 1, 1])
+    R.set_output(True).set_data_type(F32)
+    g.validate()
+    with pytest.raises(RuntimeError, match="NOT_SUPPORTED"):
+        g.build_operation_graph()
+
+
+@_GPU
+@pytest.mark.xfail(
+    reason=(
+        "the operand a bare address describes is the GRAPH's declaration, and frost reads its "
+        "extents by axis position from the layout a caller's buffer would report -- for a matmul "
+        "B those are [batch, K, N] and (batch, N, K). Broken before this branch too (the "
+        "geometry-less Tensor made it an IndexError); the fix is the engine recording which axis "
+        "is M/N/K at build, which belongs with the executor rewrite."
+    ),
+    strict=True,
+)
+def test_bare_address_operands():
+    """The backend has always taken a raw device address; so must a python plan."""
+    g = cudnn.pygraph(io_data_type=BF16, intermediate_data_type=F32, compute_data_type=F32)
+    A = g.tensor(name="A", uid=1, dim=[1, M, K], stride=[M * K, K, 1])
+    B = g.tensor(name="B", uid=2, dim=[1, K, N], stride=[K * N, 1, K])
+    C = g.matmul(A=A, B=B, name="mm")
+    C.set_output(True).set_data_type(BF16).set_uid(3)
+    _pin_frost(g)
+
+    a, b, ref = _operands()
+    c = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
+    _run(g, {1: a.data_ptr(), 2: b.data_ptr(), 3: c.data_ptr()})
+    torch.testing.assert_close(c, ref.to(torch.bfloat16), atol=1e-1, rtol=1e-2)

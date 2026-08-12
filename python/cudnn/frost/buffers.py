@@ -18,6 +18,7 @@ no tensor-library dependency on the execute path.
 from __future__ import annotations
 
 import ctypes
+import struct
 
 from cudnn import _pybind_module
 
@@ -295,6 +296,24 @@ def memset_zero_async(ptr: int, nbytes: int, stream) -> None:
     err = res[0] if isinstance(res, tuple) else res
     if int(err) != 0:
         raise RuntimeError(f"cudaMemsetAsync failed: {err}")
+
+
+def fill_f32_async(ptr: int, count: int, value: float, stream) -> None:
+    """Stream-ordered fill of ``count`` fp32 elements with ``value``.
+
+    An engine that needs to seed a caller's buffer owns that operation itself:
+    reaching for ``tensor.fill_()`` works only while the buffer happens to be a
+    torch tensor, which is the coupling the variant pack exists to remove.
+    Every seed value a reduction uses (0, 1, +-inf) is a 32-bit pattern, so the
+    driver's D32 memset covers them without a kernel.
+    """
+    from cuda.bindings import driver as _drv
+
+    pattern = int.from_bytes(struct.pack("<f", float(value)), "little")
+    res = _drv.cuMemsetD32Async(int(ptr), pattern, int(count), int(stream) if stream is not None else 0)
+    err = res[0] if isinstance(res, tuple) else res
+    if int(err) != 0:
+        raise RuntimeError(f"cuMemsetD32Async failed: {err}")
 
 
 # The CuTe primitives these engines lower through landed in 4.7.0; older DSLs
