@@ -366,11 +366,14 @@ def _reduction_stride_compile_symbols(chain: FusionChain) -> str:
 def _epi_tile_cols(config: TileConfig, cta_group: int) -> int:
     """Per-CTA epilogue drain width in accumulator columns, for ONE MMA-M block
     (the templates' ``epi_cols_per_mma_m``; with ``num_mma_m > 1`` the per-GEMM
-    ``cols_per_acc_stage`` is ``num_mma_m`` times this). The 2-CTA-MMA
-    cta_tile_m=64 pair splits the N range across the two 64-lane halves, so each
-    CTA drains N/2. N-direction MMAs subdivide this width, they do not add to it."""
+    ``cols_per_acc_stage`` is ``num_mma_m`` times this).
+
+    Under 2-CTA MMA a per-CTA ``mma_inst_m`` of 64 means cluster-MMA m=128, whose
+    2x2-DP drain splits the N range across the two 64-lane halves — so each CTA
+    drains N/2. Like the LDTM shape (foot-gun #18) this keys on the MMA
+    INSTRUCTION's M, not the CTA tile's: they agree only at num_mma_m == 1."""
     cols = config.cta_tile_n
-    if cta_group == 2 and config.cta_tile_m == 64:
+    if cta_group == 2 and config.mma_inst_m == 64:
         cols //= 2
     return cols
 
@@ -884,7 +887,9 @@ def _render_block_scale_tile_constants(
     # +s*acc_stage_stride. Single-GEMM collapses to legacy behaviour.
     num_gemms = chain.num_gemms
     num_mma_m = cfg.num_mma_m
-    epi_cols_per_mma_m = cta_n
+    # Same per-M-block drain width the plain path uses (block-scale pins
+    # mma_inst_m to a multiple of 128, so the 2x2-DP halving never fires here).
+    epi_cols_per_mma_m = _epi_tile_cols(cfg, cta_group)
     acc_cols_per_stage = num_mma_m * epi_cols_per_mma_m
     na, nb = chain.num_a_operands, chain.num_b_operands
     sf_total_cols = na * sfa_tmem_cols + nb * sfb_tmem_cols
@@ -1118,7 +1123,10 @@ def _render_block_scale_tile_constants(
         f"num_blocks_n = {nb_n}",
         f"registers_per_block = {_REGISTERS_PER_BLOCK}",
         f"epi_cols_per_mma_m = {epi_cols_per_mma_m}",
-        f"a_smem_m_step_bytes = {(cta_m // num_mma_m) * cfg.cta_tile_k_bytes}",
+        # Byte step from one MMA M sub-block to the next inside the SMEM tile.
+        # sm103 stages ONE 128-B K chunk per AB stage, not the whole K-tile, so
+        # its per-M-row width is the chunk's, not cta_tile_k_bytes.
+        f"a_smem_m_step_bytes = {(cta_m // num_mma_m) * (128 if is_sm103 else cfg.cta_tile_k_bytes)}",
         f"registers_per_atom = {_REGISTERS_PER_ATOM}",
         f"sf_atom_desc_stride = {sf_atom_desc_stride}",
         f"sf_block_desc_stride = {sf_block_desc_stride}",

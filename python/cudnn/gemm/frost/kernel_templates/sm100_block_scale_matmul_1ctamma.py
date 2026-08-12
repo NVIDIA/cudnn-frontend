@@ -240,7 +240,7 @@ def _kernel(
     ]
 
     # @@TMA_STORE_ONLY:BEGIN@@
-    epi_subtile_elems = cta_tile_mnk[0] * epi_tile_mn[1]
+    epi_subtile_elems = epi_tile_mn[0] * epi_tile_mn[1]
     smem_d_ptr = cutlass.Array(
         cd_dtype,
         epi_subtile_elems * EPI_SMEM_STAGES,
@@ -841,7 +841,7 @@ def _kernel(
         is_valid = cutlass.Int32(1)
         clc_full_phase_epi = cutlass.Int32(0)
 
-        if cutlass.const_expr(cta_tile_mnk[0] == 64):
+        if cutlass.const_expr(mma_inst_shape_mnk[0] == 64):
             row_id_with_warp_offset = base_row_id
         else:
             row_id_with_warp_offset = base_row_id + warp_idx * 32
@@ -924,7 +924,7 @@ def _kernel(
                     smem_thr_ptr = smem_subtile_ptr.subview(tidx * t2r_inst_repx)
 
                     if cutlass.const_expr(cd_out_is_m_major):
-                        ld_col = acc_base_col + subtile_col_offset
+                        ld_col = mi_col_base + subtile_col_offset
                         for _h in cutlass.range(2, unroll_full=True):
                             ld_row = base_row_id + warp_idx * 32 + _h * 16
                             ld_addr = (ld_row << 16) | ld_col
@@ -972,7 +972,7 @@ def _kernel(
 
                     if warp_idx == 0:
                         if cutlass.const_expr(cd_out_is_m_major):
-                            for _mb in cutlass.range_constexpr(cta_tile_mnk[0] // cd_mmajor_atom_m):
+                            for _mb in cutlass.range_constexpr(epi_tile_mn[0] // cd_mmajor_atom_m):
                                 if elect_one:
                                     nvvm.cp_async_bulk_tensor_global_shared_cta(
                                         tma_c_desc.get_ptr(),
@@ -1225,7 +1225,7 @@ def _host(
                 out_stride_m_0 * cd_dtype.width // 128,
                 out_stride_l_0 * cd_dtype.width // 128,
             ],
-            box_dims=[epi_tile_mn[1], cta_tile_mnk[0], 1],
+            box_dims=[epi_tile_mn[1], epi_tile_mn[0], 1],
             swizzle=(_tma.TensorMapSwizzle.s64b if cutlass.const_expr(use_tma_store_epi) else _tma.TensorMapSwizzle.none),
         )
     tma_c_desc_list = [tma_c_desc]
