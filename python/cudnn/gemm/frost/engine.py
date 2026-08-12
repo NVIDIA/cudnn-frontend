@@ -32,6 +32,12 @@ class _FrostGemmPlan(CompiledPlan):
         # as ambiguous.
         self._tensors = list(compiled.binding.bound_tensors())
         self._slots = None
+        # Which call path this plan uses is a property of the compiled kernel,
+        # so it is chosen here and not re-asked per execute. ``launch`` is the
+        # straight line the recipe lowers to when the kernel is a shape it
+        # emits; ``run_views`` serves everything else.
+        self._lowered = getattr(compiled, "launch", None)
+        self._run_views = self._lowered or getattr(compiled, "run_views", None)
 
     def get_workspace_size(self) -> int:
         return int(getattr(self._compiled, "workspace_bytes", 0) or 0)
@@ -47,17 +53,19 @@ class _FrostGemmPlan(CompiledPlan):
         # which carry the shape this execute runs, override_shapes included.
         views = variant_pack.views(slots)
         required = self.get_workspace_size()
-        # Scratch is carved from the CALLER's workspace: stable pointers, so a
-        # plan stays safe to capture in a CUDA graph.
-        extra = (Workspace.over(variant_pack, required, "frost_gemm"),) if required else ()
-        run_resolved = getattr(self._compiled, "run_resolved", None)
-        if run_resolved is not None:
+        if required:
+            # Scratch is carved from the CALLER's workspace: stable pointers, so
+            # a plan stays safe to capture in a CUDA graph. Only the MoE
+            # launchers need it, and they take the variant-pack dict.
+            self._compiled(dict(zip(self._tensors, views)), Workspace.over(variant_pack, required, "frost_gemm"), stream=ctx.stream)
+            return
+        run_views = self._run_views
+        if run_views is not None:
             # Which bound tensor holds which operand was settled at build, so
-            # resolve_variant_pack's by-object / by-uid / by-name tables have
-            # no question left to answer.
-            run_resolved({id(t): v for t, v in zip(self._tensors, views)}, *extra, stream=ctx.stream)
+            # the buffers arrive in that order and the launcher indexes them.
+            run_views(views, stream=ctx.stream)
         else:
-            self._compiled(dict(zip(self._tensors, views)), *extra, stream=ctx.stream)
+            self._compiled(dict(zip(self._tensors, views)), stream=ctx.stream)
 
 
 class FrostGemmEngine(BaseEngine):

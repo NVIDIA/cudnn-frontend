@@ -7,6 +7,7 @@ Shared dtype conversion tables for the GEMM engine (single source of truth).
 
 from __future__ import annotations
 
+import functools
 from typing import Any
 
 import cudnn
@@ -113,15 +114,25 @@ def tensor_alignment(shape, stride, elem_bytes: int, ptr: "int | None" = None, c
       one with ``stride==1 and shape!=1``; no such dim -> ``elem_bytes`` (nothing
       is contiguous, so only a single element can be moved at a time).
     """
-    a = cap
+    a = _layout_alignment(tuple(shape), tuple(stride), elem_bytes, cap)
     if ptr is not None:
         a = min(a, _pow2_floor(int(ptr), cap))
+    return a
 
+
+@functools.lru_cache(maxsize=256)
+def _layout_alignment(shape: tuple, stride: tuple, elem_bytes: int, cap: int) -> int:
+    """``min(A_stride, A_shape)`` -- the half the pointer does not enter.
+
+    Memoized because it is a function of values, not of objects: the same layout
+    recurs on every execute, and the set of shapes a caller cycles through under
+    dynamic shape is small. Only the pointer half is recomputed per call, and
+    that is one power-of-two floor.
+    """
     stride_align = cap
     for sh, st in zip(shape, stride):
         if sh != 1 and st != 1:
             stride_align = min(stride_align, _pow2_floor(int(st) * elem_bytes, cap))
-    a = min(a, stride_align)
 
     shape_align = None
     for sh, st in zip(shape, stride):
@@ -130,8 +141,7 @@ def tensor_alignment(shape, stride, elem_bytes: int, ptr: "int | None" = None, c
             break
     if shape_align is None:
         shape_align = min(elem_bytes, cap)
-    a = min(a, shape_align)
-    return a
+    return min(stride_align, shape_align)
 
 
 def allowed_store_vsize(dim, stride, dtype: str) -> int:

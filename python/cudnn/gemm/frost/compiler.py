@@ -19,11 +19,12 @@ import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, ClassVar
+from typing import Any, Callable, ClassVar
 
 import cudnn
 from cuda.bindings import driver as _cuda
 from cudnn.frost import buffers
+from cudnn.frost.device import current_device
 from cudnn.frost.workspace import Workspace
 
 _LOG = logging.getLogger(__name__)
@@ -53,6 +54,21 @@ from .dtypes import (
 )
 from .epilogue_codegen import EpilogueSnippets, generate
 from .fusion_ir import ZERO_PRESERVING_OPS, FusionChain, TensorRef
+from .recipe import (
+    AX_BATCH,
+    AX_K,
+    AX_MN,
+    CONST,
+    FROM_M,
+    FROM_N,
+    KERNEL_AXES,
+    REDUCTION_INIT_VALUE,
+    _output_rule,
+    build as build_recipe,
+    contiguous_modulus,
+    expected_shape,
+    gate as gate_recipe,
+)
 from .graph_analyzer import (
     GemmBinding,
     analyze_with_binding,
@@ -711,8 +727,6 @@ def _plan_device() -> int:
     """The GPU a plan compiled right now targets. Every device-derived constant
     baked into the kernel (ab_stages, grid_num_clusters, the target SM) is read
     for this device, so the plan records it and re-checks it at execute time."""
-    from cudnn.frost.device import current_device
-
     return current_device()
 
 
@@ -726,10 +740,9 @@ def _check_plan_device(plan_device: int) -> None:
     devices either: ``create_variant_pack`` sets only pointers, uids and the
     workspace, and ``graph_interface.h`` takes its ordinal from
     ``cuda_get_device``. Reading the current device once is 0.74 us against
-    1.45 per operand for the walk this replaces.
+    1.45 per operand for the walk this replaces -- and the import is at module
+    scope because doing it here costs 1.1 us of the 1.7 this function takes.
     """
-    from cudnn.frost.device import current_device
-
     device = current_device()
     if device != plan_device:
         raise ValueError(
@@ -1765,42 +1778,8 @@ def _reshape_aux_to_fake(t: object, ref: TensorRef) -> object:
     return t.reshape(shape)
 
 
-_REDUCTION_INIT_VALUE = {
-    "fp32": {
-        "add": 0.0,
-        "amax": 0.0,
-        "max": -float("inf"),
-        "min": float("inf"),
-        "avg": 0.0,
-        "norm1": 0.0,
-        "norm2": 0.0,
-        "mul": 1.0,
-        "mul_no_zeros": 1.0,
-    },
-    "int32": {
-        "add": 0,
-        "amax": 0,
-        "max": -(2**31),
-        "min": 2**31 - 1,
-        "norm1": 0,
-    },
-}
-
-
 def _expected_output_shape(spec, chain: FusionChain, mnk) -> tuple[int, int, int]:
-    full = (chain.matmul.batch, int(mnk[0]), int(mnk[1]))
-    if spec.is_quant_scale:
-        assert spec.dim is not None
-        return spec.dim
-    if not spec.is_reduction:
-        if spec.dtype == "fp4_e2m1":
-            return (full[0], full[1], full[2] // 2)
-        return full
-    assert spec.dim is not None
-    red_idx = int(spec.source.rsplit("_", 1)[1])
-    if chain.reductions[red_idx].grouped_by_moe:
-        return spec.dim
-    return tuple(1 if spec.dim[i] == 1 else full[i] for i in range(3))
+    return expected_shape(_output_rule(spec, chain), int(mnk[0]), int(mnk[1]))
 
 
 def _initialize_reduction_outputs(chain: FusionChain, outputs, stream=None) -> None:
@@ -1814,7 +1793,7 @@ def _initialize_reduction_outputs(chain: FusionChain, outputs, stream=None) -> N
         if not spec.is_reduction:
             continue
         red = chain.reductions[int(spec.source.rsplit("_", 1)[1])]
-        value = _REDUCTION_INIT_VALUE[red.compute_dtype][red.mode]
+        value = REDUCTION_INIT_VALUE[red.compute_dtype][red.mode]
         # The driver, on the stream the kernel will run on -- for a padded output
         # too. tensor.fill_() would queue on torch's current stream instead,
         # which is the same stream only by luck, and only exists at all while
@@ -1873,6 +1852,19 @@ class CompiledFusedGemm:
     # from the execute-time cuDNN handle and forwards it as `stream=`. Engines
     # that do not carry the param stay on the default stream (see dispatch).
     accepts_stream: ClassVar[bool] = True
+    # Everything the call path needs that a runtime value cannot change, read
+    # once here rather than rebuilt per execute. None when this object was
+    # constructed without a binding and so has no call path.
+    recipe: Any = field(default=None, init=False, repr=False, compare=False)
+    # The recipe as one straight line, when this graph is a shape it emits.
+    launch: Any = field(default=None, init=False, repr=False, compare=False)
+    bound: Any = field(default=(), init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if self.binding is not None:
+            self.bound = tuple(self.binding.bound_tensors())
+            self.recipe = build_recipe(self)
+            self.launch = self._lower()
 
     def __call__(self, variant_pack, stream=None):
         # The runtime call is a variant-pack dict keyed by cuDNN tensor object
@@ -1886,96 +1878,144 @@ class CompiledFusedGemm:
         return self.run_resolved(resolve_variant_pack(variant_pack, self.binding), stream=stream)
 
     def run_resolved(self, resolved, stream=None):
-        """Launch over ``{id(bound_tensor): buffer}``, already resolved.
+        """Launch over ``{id(bound_tensor): buffer}``, already resolved."""
+        views = []
+        for i, t in enumerate(self.bound):
+            buf = resolved.get(id(t))
+            if buf is None:
+                raise KeyError(f"variant pack is missing a buffer for {self.recipe.roles[i]}")
+            views.append(buf)
+        return (self.launch or self.run_views)(views, stream=stream)
+
+    def _lower(self):
+        """The recipe as one straight line, or None for a shape it does not emit.
+
+        Every branch the general path takes -- multi-GEMM or not, block scale or
+        not, how many outputs, which are reductions, which axis of each operand
+        carries M/N/K -- was settled when the kernel compiled. Taking them again
+        per call is what stands between this path and its floor: the
+        load-bearing validation measures 1.1 us against 21 for the walk that
+        rebuilds it.
+
+        The emitted body never raises. Anything it is not sure of it hands to
+        ``run_views``, which serves every flavor and owns every rejection
+        message -- so this can only ever accept a subset of what the general
+        path accepts, and there is no second set of error strings to drift.
+
+        Emitting another flavor means widening the recipe, not copying this
+        body: a second body is the drift the recipe exists to prevent.
+        """
+        r = self.recipe
+        if r is None or not _TVM_FFI_OK or r.multi_gemm or r.block_size or r.aux or r.workspace_bytes:
+            return None
+        if len(r.inputs) != 2 or len(r.outputs) != 1:
+            return None
+        out = r.outputs[0]
+        # A raw output is a reduction or a quant scale: both want a pre-kernel
+        # seed and one wants a post-kernel sqrt, which are device operations the
+        # engine does not own yet (see _initialize_reduction_outputs).
+        if out.raw or out.init is not None or out.sqrt:
+            return None
+        rule = out.rule
+        if tuple(s for s, _ in rule) != (CONST, FROM_M, FROM_N):
+            return None
+
+        a, b = r.a, r.b
+        ai, bi, ci = a.view, b.view, out.view
+        # kc is both the axis whose stride must be 1 and the axis whose extent
+        # enters the TMA rule -- they are the same axis by definition of major.
+        a_kc, b_kc = a.kc, b.kc
+        a_mod, b_mod = a.modulus, b.modulus
+        a_batch, b_batch = a.batch, b.batch
+        a_kpack, b_kpack = a.kpack, b.kpack
+        out_batch, out_ndiv, out_align = rule[0][1], rule[2][1], out.align
+        # Every batch extent the launch could read is pinned by a check above
+        # it, so the kernel's batch is settled here rather than re-read.
+        batch = out_batch if r.has_output_specs else max(a_batch, b_batch)
+        device = self.device
+        launchable = self._launchable
+        general = self.run_views
+
+        def launch(views, stream=None):
+            _check_plan_device(device)
+            av, bv, cv = views[ai], views[bi], views[ci]
+            a_sh, b_sh, c_sh = av.shape, bv.shape, cv.shape
+            if len(a_sh) != 3 or len(b_sh) != 3 or len(c_sh) != 3:
+                return general(views, stream=stream)
+            a_st, b_st, c_st = av.stride(), bv.stride(), cv.stride()
+            m, n, k = a_sh[1], b_sh[1], a_sh[2] * a_kpack
+            if (
+                a_st[a_kc] != 1
+                or b_st[b_kc] != 1
+                or a_sh[a_kc] % a_mod
+                or b_sh[b_kc] % b_mod
+                or a_sh[0] != a_batch
+                or b_sh[0] != b_batch
+                or b_sh[2] * b_kpack != k
+                or c_sh[0] != out_batch
+                or c_sh[1] != m
+                or c_sh[2] != n // out_ndiv
+                or _pow2_floor(av.data_ptr()) < 16
+                or _pow2_floor(bv.data_ptr()) < 16
+                or tensor_alignment(tuple(c_sh), tuple(c_st), cv.element_size(), ptr=cv.data_ptr()) < out_align
+            ):
+                return general(views, stream=stream)
+            problem_size = (
+                m,
+                n,
+                k,
+                batch,
+                # permute(1, 2, 0) relabels axes, so the kernel's strides are
+                # that permutation of the ones just read -- no second read.
+                a_st[1],
+                a_st[2],
+                a_st[0],
+                b_st[1],
+                b_st[2],
+                b_st[0],
+                c_st[1],
+                c_st[2],
+                c_st[0],
+            )
+            # One output and no aux: the TMA-store and plain argument orders
+            # coincide, and a shape where they do not is not emitted here.
+            return launchable(problem_size, av.permute(1, 2, 0), bv.permute(1, 2, 0), cv.permute(1, 2, 0), stream=_as_custream(stream))
+
+        return launch
+
+    def run_views(self, views, stream=None):
+        """Launch over the operand buffers, in bound-tensor order.
 
         Which bound tensor holds which operand is fixed when the plan compiles,
         so a caller that knows it -- the engine, which binds the graph's slots
-        once -- has no reason to rebuild the by-object / by-uid / by-name tables
-        resolve_variant_pack needs on every execute.
+        once -- indexes rather than resolves, and the gate below reads a table
+        built at that same moment instead of rebuilding one per call.
         """
         _check_plan_device(self.device)
-        b = self.binding
+        recipe = self.recipe
+        mnk, axes = recipe.problem(views)
+        gate_recipe(recipe, views, mnk, axes)
 
-        def pull(t, role):
-            if t is None or id(t) not in resolved:
-                raise KeyError(f"variant pack is missing a buffer for {role}")
-            return resolved[id(t)]
-
-        a_bufs = [pull(t, "A operand") for t in b.a_operands]
-        b_bufs = [pull(t, "B operand") for t in b.b_operands]
-        out_bufs = [pull(t, "output") for t in b.outputs]
-        aux_bufs = [pull(t, f"aux {self.aux_names[i]!r}") for i, t in enumerate(b.aux)]
-        # (M, N, K) from buffer shapes: A=(batch,M,K) (FP4-packed A stores K/2
-        # elem/byte → scale back up), N from the B operand.
-        k_factor = 2 if self.chain.matmul.a_dtype == "fp4_e2m1" else 1
-        M = a_bufs[0].shape[1]
-        K = a_bufs[0].shape[2] * k_factor
-        # N from B: a dense output may be FP4-packed (N/2 bytes).
-        N = b_bufs[0].shape[1]
-        mnk = (M, N, K)
+        out_bufs = [views[o.view] for o in recipe.outputs]
+        aux_bufs = [views[x.view] for x in recipe.aux]
         c_arg = out_bufs if len(out_bufs) > 1 else out_bufs[0]
+        # Everything below indexes an operand's axes by position, so an operand
+        # that arrived in the graph's order is re-expressed in the kernel's here
+        # rather than threaded through every launcher.
+        operands = [(views[op.view] if ax is KERNEL_AXES else views[op.view].permute(ax[AX_BATCH], ax[AX_MN], ax[AX_K])) for op, ax in zip(recipe.inputs, axes)]
+        a_bufs, b_bufs = operands[: recipe.b_at], operands[recipe.b_at :]
 
-        # The kernel is shape-agnostic, so the RUNTIME dims must satisfy the
-        # TMA 16-byte alignment rule — same check as the graph-time gate.
-        mm = self.chain.matmul
-        _align_reason = _tma_alignment_reject(mm.a_dtype, mm.b_dtype, mm.a_major, mm.b_major, M, N, K)
-        if _align_reason is not None:
-            raise ValueError(_align_reason)
-
-        # M/N/K came from the FIRST A and B buffer; every other operand must
-        # agree, and every operand's layout must match the compiled major.
-        _operands = [(f"A operand[{i}]", x, mm.a_major, M, 2 if mm.a_dtype == "fp4_e2m1" else 1) for i, x in enumerate(a_bufs)] + [
-            (f"B operand[{i}]", x, mm.b_major, N, 2 if mm.b_dtype == "fp4_e2m1" else 1) for i, x in enumerate(b_bufs)
-        ]
-        for _reject in (
-            _operand_shape_reject(_operands, M, N, K),
-            _operand_layout_reject([(role, x, major) for role, x, major, _d1, _kp in _operands]),
-        ):
-            if _reject is not None:
-                raise ValueError(_reject)
-
-        _out_reqs = _output_align_reqs(self.chain, self.use_tma_store, vec_bytes=self.vec_bytes_epi)
-        _aux_reqs = _aux_align_reqs(self.chain, vec_bytes=self.vec_bytes_epi)
-        _named = (
-            [("A operand", x, 16, "ptr") for x in a_bufs]
-            + [("B operand", x, 16, "ptr") for x in b_bufs]
-            + [(f"output[{i}]", x, _out_reqs[i], "full") for i, x in enumerate(out_bufs)]
-            + [(f"aux {self.aux_names[i]!r}", x, _aux_reqs[self.aux_names[i]], "full") for i, x in enumerate(aux_bufs)]
-        )
-        if self.block_scale:
-            _named += [("SFA", pull(t, "SFA"), 16, "ptr") for t in b.sfa_operands]
-            _named += [("SFB", pull(t, "SFB"), 16, "ptr") for t in b.sfb_operands]
-        _align_reason2 = _alignment_reject(_named)
-        if _align_reason2 is not None:
-            raise ValueError(_align_reason2)
-
-        if self.block_scale:
-            _sf_k4 = ((K // self.chain.block_scale.block_size) + 3) // 4
-            _sf_reason = _sf_blob_reject(
-                [(f"SFA[{i}]", pull(t, "SFA"), 512 * _sf_k4 * ((M + 127) // 128) * int(a_bufs[i].shape[0])) for i, t in enumerate(b.sfa_operands)]
-                + [(f"SFB[{j}]", pull(t, "SFB"), 512 * _sf_k4 * ((N + 127) // 128) * int(b_bufs[j].shape[0])) for j, t in enumerate(b.sfb_operands)]
-            )
-            if _sf_reason is not None:
-                raise ValueError(_sf_reason)
-
+        sf_bufs = [views[s.view] for s in recipe.sf]
         if self.chain.is_multi_gemm:
+            sfa, sfb = sf_bufs[: recipe.b_at], sf_bufs[recipe.b_at :]
             if self.block_scale:
-                sfa = [pull(t, "SFA") for t in b.sfa_operands]
-                sfb = [pull(t, "SFB") for t in b.sfb_operands]
                 pairs = [((a_bufs[ai], sfa[ai]), (b_bufs[bi], sfb[bi])) for ai, bi in self.chain.gemm_operands]
             else:
                 pairs = [(a_bufs[ai], b_bufs[bi]) for ai, bi in self.chain.gemm_operands]
-            r = self._call_positional(pairs, c_arg, mnk, *aux_bufs, stream=stream)
-            _finalize_reductions(self.chain, out_bufs)
-            return r
-
-        if self.block_scale:
-            sfa = pull(b.sfa_operands[0], "SFA")
-            sfb = pull(b.sfb_operands[0], "SFB")
-            r = self._call_positional(a_bufs[0], b_bufs[0], c_arg, mnk, sfa, sfb, *aux_bufs, stream=stream)
-            _finalize_reductions(self.chain, out_bufs)
-            return r
-        r = self._call_positional(a_bufs[0], b_bufs[0], c_arg, mnk, *aux_bufs, stream=stream)
+            args = (pairs, c_arg, mnk)
+        else:
+            args = (a_bufs[0], b_bufs[0], c_arg, mnk, *sf_bufs)
+        r = self._call_positional(*args, *aux_bufs, stream=stream)
         _finalize_reductions(self.chain, out_bufs)
         return r
 
@@ -2362,73 +2402,12 @@ def _tma_alignment_reject(
         ("A", a_dtype, a_major, K if a_major == "k" else M, "K" if a_major == "k" else "M"),
         ("B", b_dtype, b_major, K if b_major == "k" else N, "K" if b_major == "k" else "N"),
     ):
-        bits = _dtype_bits(dtype)
-        if (extent * bits) % 128 != 0:
-            bad.append(f"{name} ({major}-major, {dtype}) requires {dim} % {128 // bits} == 0, " f"got {dim}={extent}")
+        modulus, pack = contiguous_modulus(dtype, major == "k")
+        logical = modulus * pack
+        if extent % logical:
+            bad.append(f"{name} ({major}-major, {dtype}) requires {dim} % {logical} == 0, " f"got {dim}={extent}")
     if bad:
         return "TMA input contiguous dimensions must be 16-byte aligned: " + "; ".join(bad)
-    return None
-
-
-# A/B are rank-3 (batch, M|N, K); the graph's major names which dim is contiguous.
-_MAJOR_CONTIGUOUS_DIM = {"k": 2, "m": 1, "n": 1}
-
-
-def _contiguous_dim(buf) -> "int | None":
-    """Index of the unambiguously contiguous dim of a rank-3 buffer, else None.
-
-    A size-1 dim can carry stride 1 without meaning anything, so a layout is only
-    judged when exactly one dim of size > 1 is contiguous."""
-    shape = tuple(buf.shape)
-    strides = tuple(buf.stride())
-    unit = [i for i, s in enumerate(strides) if s == 1 and shape[i] > 1]
-    return unit[0] if len(unit) == 1 else None
-
-
-def _operand_layout_reject(named_operands) -> "str | None":
-    """Each operand's runtime layout must match the major baked into the kernel.
-
-    The major comes from the GRAPH's declared strides and is compiled into the
-    TMA descriptor and the MMA operand descriptor, while the launch reads the
-    RUNTIME buffer's strides — so a buffer whose contiguous dim disagrees with
-    the declaration computes silently wrong numbers rather than faulting.
-    Entries are ``(role, buffer, major)``. Returns a reason string, or ``None``."""
-    bad = []
-    for role, buf, major in named_operands:
-        if buf is None or len(tuple(buf.shape)) != 3:
-            continue
-        got = _contiguous_dim(buf)
-        want = _MAJOR_CONTIGUOUS_DIM[major]
-        if got is not None and got != want:
-            names = {0: "batch", 1: "M/N", 2: "K"}
-            bad.append(
-                f"{role}: graph declares {major}-major (dim {want} contiguous) but the buffer has dim {got} ({names[got]}) contiguous, stride={tuple(buf.stride())}"
-            )
-    if bad:
-        return "runtime operand layout does not match the layout the kernel was compiled for: " + "; ".join(bad)
-    return None
-
-
-def _operand_shape_reject(named_operands, M: int, N: int, K: int) -> "str | None":
-    """Every A operand must be (batch, M, K) and every B operand (batch, N, K),
-    for the SAME K — M/N/K are inferred from the first A and B buffer, so a
-    disagreeing operand would otherwise be read past its end (the kernel walks
-    the inferred K on every operand). Entries are ``(role, buffer, major, dim1,
-    k_pack)``; ``k_pack`` is 2 for FP4-packed data (two elements per byte-slot).
-    Returns a reason string, or ``None``."""
-    bad = []
-    for role, buf, _major, dim1, k_pack in named_operands:
-        if buf is None:
-            continue
-        shape = tuple(buf.shape)
-        if len(shape) != 3:
-            bad.append(f"{role}: expected a rank-3 buffer, got shape {shape}")
-            continue
-        want = (dim1, K // k_pack)
-        if (shape[1], shape[2]) != want:
-            bad.append(f"{role}: expected (batch, {want[0]}, {want[1]}), got {shape}")
-    if bad:
-        return f"runtime operand shapes disagree with the inferred problem size (M={M}, N={N}, K={K}): " + "; ".join(bad)
     return None
 
 

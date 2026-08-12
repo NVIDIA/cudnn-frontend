@@ -190,18 +190,14 @@ def test_norm2_reduction_is_refused_at_build():
 
 
 @_GPU
-@pytest.mark.xfail(
-    reason=(
-        "the operand a bare address describes is the GRAPH's declaration, and frost reads its "
-        "extents by axis position from the layout a caller's buffer would report -- for a matmul "
-        "B those are [batch, K, N] and (batch, N, K). Broken before this branch too (the "
-        "geometry-less Tensor made it an IndexError); the fix is the engine recording which axis "
-        "is M/N/K at build, which belongs with the executor rewrite."
-    ),
-    strict=True,
-)
 def test_bare_address_operands():
-    """The backend has always taken a raw device address; so must a python plan."""
+    """The backend has always taken a raw device address; so must a python plan.
+
+    The operand a bare address describes is the GRAPH's declaration, which
+    orders a matmul's B ``[batch, K, N]`` where a caller allocates it
+    ``(batch, N, K)``. Reading an extent by axis position answers one of those
+    and not the other, so the recipe records which axis carries M/N/K instead.
+    """
     g = cudnn.pygraph(io_data_type=BF16, intermediate_data_type=F32, compute_data_type=F32)
     A = g.tensor(name="A", uid=1, dim=[1, M, K], stride=[M * K, K, 1])
     B = g.tensor(name="B", uid=2, dim=[1, K, N], stride=[K * N, 1, K])

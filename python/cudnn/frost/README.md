@@ -235,6 +235,16 @@ CompiledPlan.execute(graph, uid_to_data, ctx)          (the hot path)
 - **`build_plan` runs once per (graph, plan)** at `build_plans()` time and the
   compiled artifact lives on the graph, so one engine instance is safely
   reusable across graphs.
+- **What a runtime value cannot change belongs in a build-time table.** An
+  operand's role and major, each output's shape rule and required alignment,
+  which outputs are reductions -- all settled when the kernel compiled, and
+  deciding them again per call is most of what a python execute path costs
+  (measured: 44 -> 18 us for one gemm). `gemm/frost/recipe.py` is the worked
+  example: one table, read by an interpreter that serves every flavor and by a
+  straight line lowered for the common one. Emitting a second call path per
+  flavor instead is how the two disagree, so the lowered one never raises --
+  anything it is unsure of it hands back to the interpreter, which owns every
+  rejection message.
 - **`ExecutionContext` carries handle, stream and workspace explicitly.** No
   engine may hard-code a stream, reach into private graph state, or allocate
   hidden workspace. `uid_to_data` is the caller's variant pack (tensor uid ->
