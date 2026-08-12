@@ -722,56 +722,61 @@ class WorkspaceCarve {
 
 void
 init_variant_pack(py::module_ &m) {
-    auto operand_class = py::class_<OperandBuffer>(m, "OperandBuffer", R"(
+    auto operand_class =
+        py::class_<OperandBuffer>(m, "OperandBuffer", R"(
 One operand of a variant pack, as a DLPack producer.
 
 Implements ``__dlpack_c_exchange_api__``, so a consumer reads it through the
 same C function table it uses for a framework tensor rather than through a
 capsule built in python.
 )")
-                             .def("data_ptr", &OperandBuffer::data_ptr)
-                             .def_property_readonly("shape", &OperandBuffer::shape)
-                             .def_property_readonly("dtype", &OperandBuffer::dtype)
-                             .def_property_readonly("nbytes", &OperandBuffer::nbytes)
-                             .def(
-                                 "stride",
-                                 [](const OperandBuffer &self, py::object dim) -> py::object {
-                                     if (dim.is_none()) return py::cast(self.stride());
-                                     return py::cast(self.stride_at(dim.cast<int64_t>()));
-                                 },
-                                 py::arg("dim") = py::none())
-                             .def("element_size", &OperandBuffer::element_size)
-                             .def("numel", &OperandBuffer::numel)
-                             .def("__len__", &OperandBuffer::length)
-                             .def("reshape",
-                                  [](const OperandBuffer &self, py::args dims) {
-                                      std::vector<int64_t> shape;
-                                      if (dims.size() == 1 && py::isinstance<py::sequence>(dims[0]) &&
-                                          !py::isinstance<py::int_>(dims[0])) {
-                                          shape = dims[0].cast<std::vector<int64_t>>();
-                                      } else {
-                                          for (auto d : dims) shape.push_back(d.cast<int64_t>());
-                                      }
-                                      return self.reshape(std::move(shape));
-                                  })
-                             .def("permute",
-                                  [](const OperandBuffer &self, py::args axes) {
-                                      std::vector<int64_t> order;
-                                      if (axes.size() == 1 && py::isinstance<py::sequence>(axes[0]) &&
-                                          !py::isinstance<py::int_>(axes[0])) {
-                                          order = axes[0].cast<std::vector<int64_t>>();
-                                      } else {
-                                          for (auto a : axes) order.push_back(a.cast<int64_t>());
-                                      }
-                                      return self.permute(order);
-                                  })
-                             .def("contiguous", [](py::object self) { return self; })
-                             .def("__dlpack_device__", &OperandBuffer::dlpack_device)
-                             .def("__dlpack__",
-                                  &OperandBuffer::dlpack,
-                                  py::kw_only(),
-                                  py::arg("stream")      = py::none(),
-                                  py::arg("max_version") = py::none());
+            .def("data_ptr", &OperandBuffer::data_ptr)
+            .def_property_readonly("shape", &OperandBuffer::shape)
+            // ndim, because `__len__` is the first EXTENT and a caller
+            // reaching for a rank through getattr(.., "ndim", default)
+            // silently gets the default instead.
+            .def_property_readonly("ndim", [](const OperandBuffer &self) { return self.shape().size(); })
+            .def_property_readonly("dtype", &OperandBuffer::dtype)
+            .def_property_readonly("nbytes", &OperandBuffer::nbytes)
+            .def(
+                "stride",
+                [](const OperandBuffer &self, py::object dim) -> py::object {
+                    if (dim.is_none()) return py::cast(self.stride());
+                    return py::cast(self.stride_at(dim.cast<int64_t>()));
+                },
+                py::arg("dim") = py::none())
+            .def("element_size", &OperandBuffer::element_size)
+            .def("numel", &OperandBuffer::numel)
+            .def("__len__", &OperandBuffer::length)
+            .def("reshape",
+                 [](const OperandBuffer &self, py::args dims) {
+                     std::vector<int64_t> shape;
+                     if (dims.size() == 1 && py::isinstance<py::sequence>(dims[0]) &&
+                         !py::isinstance<py::int_>(dims[0])) {
+                         shape = dims[0].cast<std::vector<int64_t>>();
+                     } else {
+                         for (auto d : dims) shape.push_back(d.cast<int64_t>());
+                     }
+                     return self.reshape(std::move(shape));
+                 })
+            .def("permute",
+                 [](const OperandBuffer &self, py::args axes) {
+                     std::vector<int64_t> order;
+                     if (axes.size() == 1 && py::isinstance<py::sequence>(axes[0]) &&
+                         !py::isinstance<py::int_>(axes[0])) {
+                         order = axes[0].cast<std::vector<int64_t>>();
+                     } else {
+                         for (auto a : axes) order.push_back(a.cast<int64_t>());
+                     }
+                     return self.permute(order);
+                 })
+            .def("contiguous", [](py::object self) { return self; })
+            .def("__dlpack_device__", &OperandBuffer::dlpack_device)
+            .def("__dlpack__",
+                 &OperandBuffer::dlpack,
+                 py::kw_only(),
+                 py::arg("stream")      = py::none(),
+                 py::arg("max_version") = py::none());
 
     // The protocol looks the attribute up on the TYPE, and a pybind11 class is
     // a heap type, so it takes a plain setattr.

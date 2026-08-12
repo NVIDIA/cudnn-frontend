@@ -1764,11 +1764,17 @@ def _reshape_aux_to_fake(t: object, ref: TensorRef) -> object:
     """View a broadcast-aux runtime tensor to the fake's rank/unit-dim layout so
     the tvm-ffi front door's ndim/shape check accepts it. Free view: the aux is
     consumed via raw pointer + injected strides, so only the wrapper rank/shape is
-    at stake. No-op off the front door, so the plain path stays bit-identical."""
+    at stake. No-op off the front door, so the plain path stays bit-identical.
+
+    The rank comes from ``len(t.shape)``, which every buffer answers. Reading it
+    off an ``ndim`` attribute with a default meant a buffer that does not carry
+    one -- the pack's, so every operand arriving through ``graph.execute()`` --
+    was taken to match already, and a bias declared ``[1, 1, N]`` but handed over
+    as ``[N]`` was refused where the backend accepts it."""
     if not _TVM_FFI_OK:
         return t
     real = _aux_fake_real_axes(ref)
-    if getattr(t, "ndim", len(real)) == len(real):
+    if len(t.shape) == len(real):
         return t
     extents = [int(e) for e in t.shape if int(e) != 1]
     if sum(real) != len(extents):

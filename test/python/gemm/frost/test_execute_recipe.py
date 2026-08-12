@@ -23,7 +23,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from gemm_test_utils import requires_sm100
+from gemm_test_utils import kw, requires_sm100, to_blocked
 
 import cudnn
 import cudnn.gemm.frost  # noqa: F401 — installs the cudnn.pygraph recorder hook
@@ -198,11 +198,18 @@ def test_public_execute_takes_the_lowered_path():
 # --- the differential -------------------------------------------------------
 
 
-def _bind(compiled, a_bufs, b_bufs, out_bufs, aux_bufs=()):
+def _bind(compiled, a_bufs, b_bufs, out_bufs, aux_bufs=(), sfa_bufs=(), sfb_bufs=()):
     """The operand list in bound-tensor order, which is what both paths take."""
     bd = compiled.binding
     pack = {}
-    for role, bufs in ((bd.a_operands, a_bufs), (bd.b_operands, b_bufs), (bd.outputs, out_bufs), (bd.aux, aux_bufs)):
+    for role, bufs in (
+        (bd.a_operands, a_bufs),
+        (bd.b_operands, b_bufs),
+        (bd.sfa_operands, sfa_bufs),
+        (bd.sfb_operands, sfb_bufs),
+        (bd.outputs, out_bufs),
+        (bd.aux, aux_bufs),
+    ):
         pack.update(zip(role, bufs))
     resolved = resolve_variant_pack(pack, bd)
     return [resolved[id(t)] for t in bd.bound_tensors()]
@@ -370,6 +377,75 @@ def _matmul_on(batch, m, n, k, want_frost, a, b, c):
     g.execute({A: a, B: b, C: c}, ws)
     torch.cuda.synchronize()
     return c
+
+
+BS_M = BS_N = 128
+BS_K = 256
+BS_BLOCK = 16
+
+
+def _nvfp4_graph(gemms=1):
+    """One or two nvfp4 block-scaled matmuls, sharing A when there are two."""
+    sf_k = BS_K // BS_BLOCK
+    fp4, fp8 = cudnn.data_type.FP4_E2M1, cudnn.data_type.FP8_E4M3
+    reorder = dict(reordering_type=cudnn.tensor_reordering.F8_128x4)
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.HALF, intermediate_data_type=F32, compute_data_type=F32)
+    A = g.tensor(name="A", dim=[1, BS_M, BS_K], stride=[BS_M * BS_K, BS_K, 1], data_type=fp4)
+    SFA = g.tensor(name="SFA", dim=[1, BS_M, sf_k], stride=[BS_M * sf_k, sf_k, 1], data_type=fp8, **reorder)
+    Ad = g.block_scale_dequantize(input=A, descale=SFA, block_size=[1, BS_BLOCK])
+    products = []
+    for i in range(gemms):
+        B = g.tensor(name=f"B{i}", dim=[1, BS_K, BS_N], stride=[BS_K * BS_N, 1, BS_K], data_type=fp4)
+        SFB = g.tensor(name=f"SFB{i}", dim=[1, sf_k, BS_N], stride=[sf_k * BS_N, 1, sf_k], data_type=fp8, **reorder)
+        Bd = g.block_scale_dequantize(input=B, descale=SFB, block_size=[BS_BLOCK, 1])
+        products.append(g.matmul(A=Ad, B=Bd, name=f"mm{i}"))
+    out = products[0] if gemms == 1 else g.add(a=products[0], b=products[1], name="sum")
+    out.set_output(True).set_data_type(cudnn.data_type.HALF)
+    return g
+
+
+def _nvfp4_buffers(compiled):
+    """Packed fp4 operands and their F8_128x4 scale blobs, in bound order."""
+    sf_k = BS_K // BS_BLOCK
+    n_b = len(compiled.binding.b_operands)
+    a = torch.randint(0, 256, (1, BS_M, BS_K // 2), dtype=torch.uint8, device="cuda").view(torch.float4_e2m1fn_x2)
+    sfa = to_blocked(torch.randint(1, 4, (BS_M, sf_k), device="cuda").to(torch.float8_e4m3fn)).view(1, BS_M, sf_k)
+    bs = [torch.randint(0, 256, (1, BS_N, BS_K // 2), dtype=torch.uint8, device="cuda").view(torch.float4_e2m1fn_x2) for _ in range(n_b)]
+    sfbs = [to_blocked(torch.randint(1, 4, (BS_N, sf_k), device="cuda").to(torch.float8_e4m3fn)).view(1, BS_N, sf_k) for _ in range(n_b)]
+    out = torch.zeros(1, BS_M, BS_N, dtype=torch.float16, device="cuda")
+    return _bind(compiled, [a], bs, [out], sfa_bufs=[sfa], sfb_bufs=sfbs), out
+
+
+@requires_sm100
+@pytest.mark.parametrize("gemms", (1, 2), ids=("single", "multi"))
+def test_block_scale_lowers_and_agrees_with_the_interpreter(gemms):
+    """Block scale is the flavor with the most per-call table in it.
+
+    Its scale factors ride in the launch argument list but NOT in
+    ``problem_size``, its blob size is re-synthesized from M/N/K rather than read
+    off the buffer, and the multi-GEMM form sends one A stride triple for every
+    operand instead of one each. Four recipe fields, so it is the one most worth
+    running against the interpreter.
+    """
+    # Two GEMMs do not fit the auto-selected cta_n=256 in TMEM, so pin a
+    # geometry that does; which config the engine picks for one GEMM is the
+    # public execute test's job, not this one's.
+    cfg = kw("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma") if gemms > 1 else {}
+    compiled = jit_from_cudnn_graph(_nvfp4_graph(gemms), **cfg)
+    assert compiled.block_scale
+    if compiled.lowered is None:
+        pytest.skip("this build does not lower (no tvm-ffi front door)")
+    assert bool(compiled.recipe.shared_layout) == (gemms > 1)
+
+    operands, out = _nvfp4_buffers(compiled)
+    runs = []
+    for run in (compiled.lowered, compiled.launch):
+        out.zero_()
+        run(operands, stream=None)
+        torch.cuda.synchronize()
+        runs.append(out.clone())
+    torch.testing.assert_close(runs[0], runs[1], atol=0, rtol=0)
+    assert runs[0].abs().sum() > 0
 
 
 @requires_sm100

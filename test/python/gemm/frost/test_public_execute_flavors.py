@@ -116,6 +116,46 @@ def test_aux_tensor():
 
 
 @_GPU
+@pytest.mark.parametrize("buffer_shape", ((1, 1, N), (1, N), (N,)), ids=("rank3", "rank2", "rank1"))
+def test_aux_buffer_rank_need_not_match_the_declaration(buffer_shape):
+    """A bias declared ``[1, 1, N]`` may be handed over as ``[N]``.
+
+    Same rule as an operand's axis order: the descriptor defines the tensor and
+    the pack supplies only a pointer, so the backend takes any rank here and a
+    python plan must reach the same answer. The reshape that makes the kernel's
+    wrapper agree read the rank off an ``ndim`` attribute with a default, and the
+    pack's buffers carry no ``ndim`` -- so every operand arriving through
+    ``execute()`` looked like it already matched, and these were refused.
+    """
+    out = {}
+    for want_frost in (False, True):
+        g = cudnn.pygraph(io_data_type=BF16, intermediate_data_type=F32, compute_data_type=F32)
+        A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+        B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+        bias = g.tensor(name="bias", dim=[1, 1, N], stride=[N, N, 1], data_type=F32)
+        Y = g.add(a=g.matmul(A=A, B=B, name="mm"), b=bias, name="bias_add")
+        Y.set_output(True).set_data_type(BF16)
+        g.validate()
+        g.build_operation_graph()
+        g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+        hits = [i for i, p in enumerate(g.plans) if is_python_engine(p.engine_id) == want_frost]
+        if not hits:
+            pytest.skip("no plan of the requested kind for this graph")
+        g.select_plan(hits[0])
+        g.check_support()
+        g.build_plans()
+
+        torch.manual_seed(0)
+        a = torch.randn(1, M, K, dtype=torch.bfloat16, device="cuda")
+        b = torch.randn(1, N, K, dtype=torch.bfloat16, device="cuda")
+        bias_buf = torch.randn(buffer_shape, dtype=torch.float32, device="cuda")
+        y = torch.zeros(1, M, N, dtype=torch.bfloat16, device="cuda")
+        _run(g, {A: a, B: b, bias: bias_buf, Y: y})
+        out[want_frost] = y
+    torch.testing.assert_close(out[True], out[False], atol=1e-1, rtol=1e-2)
+
+
+@_GPU
 def test_two_dense_outputs():
     """Two stored outputs: each contributes its own stride triple, in order."""
     g = cudnn.pygraph(io_data_type=BF16, intermediate_data_type=F32, compute_data_type=F32)
@@ -223,6 +263,59 @@ def test_int32_reduction_seed_is_packed_as_int32():
     r = torch.empty(1, 1, 1, dtype=torch.int32, device="cuda")
     _run(g, {A: a, B: b, bias: torch.full((1, 1, N), floor, dtype=torch.int32, device="cuda"), Y: y, R: r})
     assert int(r.item()) == floor
+
+
+@_GPU
+def test_block_scale_matmul():
+    """nvfp4 + F8_128x4 scale blobs, through the public entry point.
+
+    The scale factors are the operands the recipe treats least like the others:
+    they ride in the launch argument list but not in ``problem_size``, and their
+    size is re-synthesized from M/N/K rather than read off the buffer, so a blob
+    that is not one dense byte run is read out of bounds with no fault.
+    """
+    from gemm_test_utils import E2M1, to_blocked, unpack_fp4
+
+    bs_m = bs_n = 128
+    bs_k, block = 256, 16
+    sf_k = bs_k // block
+    fp4, fp8 = cudnn.data_type.FP4_E2M1, cudnn.data_type.FP8_E4M3
+    reorder = dict(reordering_type=cudnn.tensor_reordering.F8_128x4)
+
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.HALF, intermediate_data_type=F32, compute_data_type=F32)
+    A = g.tensor(name="A", dim=[1, bs_m, bs_k], stride=[bs_m * bs_k, bs_k, 1], data_type=fp4)
+    B = g.tensor(name="B", dim=[1, bs_k, bs_n], stride=[bs_k * bs_n, 1, bs_k], data_type=fp4)
+    SFA = g.tensor(name="SFA", dim=[1, bs_m, sf_k], stride=[bs_m * sf_k, sf_k, 1], data_type=fp8, **reorder)
+    SFB = g.tensor(name="SFB", dim=[1, sf_k, bs_n], stride=[sf_k * bs_n, 1, sf_k], data_type=fp8, **reorder)
+    C = g.matmul(
+        A=g.block_scale_dequantize(input=A, descale=SFA, block_size=[1, block]),
+        B=g.block_scale_dequantize(input=B, descale=SFB, block_size=[block, 1]),
+        name="mm",
+    )
+    C.set_output(True).set_data_type(cudnn.data_type.HALF)
+    _pin_frost(g)
+    assert g._compiled_plans[g._plan_index]._lowered is not None
+
+    torch.manual_seed(0)
+    lut = torch.tensor(E2M1, dtype=torch.float32, device="cuda")
+    a_u8 = torch.randint(0, 256, (1, bs_m, bs_k // 2), dtype=torch.uint8, device="cuda")
+    b_u8 = torch.randint(0, 256, (1, bs_n, bs_k // 2), dtype=torch.uint8, device="cuda")
+    sfa = torch.randint(1, 4, (bs_m, sf_k), device="cuda").to(torch.float8_e4m3fn)
+    sfb = torch.randint(1, 4, (bs_n, sf_k), device="cuda").to(torch.float8_e4m3fn)
+    c = torch.zeros(1, bs_m, bs_n, dtype=torch.float16, device="cuda")
+    _run(
+        g,
+        {
+            A: a_u8.view(torch.float4_e2m1fn_x2),
+            B: b_u8.view(torch.float4_e2m1fn_x2),
+            SFA: to_blocked(sfa).view(1, bs_m, sf_k),
+            SFB: to_blocked(sfb).view(1, bs_n, sf_k),
+            C: c,
+        },
+    )
+    a_s = unpack_fp4(a_u8, lut).view(bs_m, bs_k) * sfa.float().repeat_interleave(block, 1)
+    b_s = unpack_fp4(b_u8, lut).view(bs_n, bs_k) * sfb.float().repeat_interleave(block, 1)
+    torch.testing.assert_close(c.float(), (a_s @ b_s.t()).reshape(1, bs_m, bs_n), atol=2e-1, rtol=2e-2)
 
 
 @_GPU
