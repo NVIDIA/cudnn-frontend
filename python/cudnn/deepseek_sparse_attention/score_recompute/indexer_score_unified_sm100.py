@@ -18,7 +18,7 @@ import math
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int32, Int64
+from cutlass import Boolean, Float32, Int32, Int64
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
 
 from .dense_score_recompute_sm100 import (
@@ -46,6 +46,7 @@ class IndexerScoreUnifiedSm100(DenseScoreRecomputeSm100):
         # Dense FE entry points remain the default. The compressed forward path
         # opts in and writes only ratio-causal candidates into a compact buffer.
         self.is_compressed_logits = is_compressed_logits
+        assert self.q_causal_offset_mode != "token" or not self.is_compressed_logits
         # BSHD BF16 may expose that compact buffer as (batch, per_batch_floats)
         # so the hot epilogue carries an Int32 column offset instead of a flat
         # Int64 address. Varlen and non-uniform batches retain the flat path.
@@ -88,6 +89,8 @@ class IndexerScoreUnifiedSm100(DenseScoreRecomputeSm100):
         reduce_phase,
         softmax_scale,
         per_head_offset=None,
+        q_batch_offset=None,
+        q_causal_offsets=None,
         batch_idx=None,
         cand_batch_offsets=None,
     ):
@@ -114,7 +117,22 @@ class IndexerScoreUnifiedSm100(DenseScoreRecomputeSm100):
 
         q_token_base = m_block * q_tokens_per_tile
         q_token_idxs = [q_token_base + Int32(qi) for qi in range(q_tokens_per_tile)]
-        col_limits = [(q_causal_offset + q_token_idxs[qi] + Int32(1)) // ratio for qi in range(q_tokens_per_tile)]
+        if cutlass.const_expr(self.q_causal_offset_mode == "token"):
+            col_limits = cute.make_rmem_tensor((q_tokens_per_tile,), Int32)
+            col_limits.fill(Int32(0))
+            col_limit_min = seqlen_k
+            for qi in cutlass.range_constexpr(q_tokens_per_tile):
+                q_token_idx = q_token_idxs[qi]
+                if q_token_idx < seqlen_q:
+                    col_limit = (q_causal_offsets[q_batch_offset + q_token_idx] + q_token_idx + Int32(1)) // ratio
+                    col_limit = col_limit if col_limit > Int32(0) else Int32(0)
+                    col_limit = col_limit if col_limit < seqlen_k else seqlen_k
+                    col_limits[qi] = col_limit
+                    col_limit_min = col_limit if col_limit < col_limit_min else col_limit_min
+            first_masked_n_block = col_limit_min // Int32(self.n_block_size)
+        else:
+            col_limits = [(q_causal_offset + q_token_idxs[qi] + Int32(1)) // ratio for qi in range(q_tokens_per_tile)]
+            first_masked_n_block = Int32(0)
 
         if cutlass.const_expr(self.is_compressed_logits and self.cand_2d):
             q_global_start = Int64(q_causal_offset)
@@ -183,7 +201,11 @@ class IndexerScoreUnifiedSm100(DenseScoreRecomputeSm100):
             for qi in cutlass.range_constexpr(q_tokens_per_tile):
                 q_token_idx = q_token_idxs[qi]
                 col_limit = col_limits[qi]
-                if q_token_idx < seqlen_q and pos < col_limit and pos < seqlen_k:
+                if cutlass.const_expr(self.q_causal_offset_mode == "token"):
+                    is_visible = Boolean(True) if n_blk < first_masked_n_block else pos < col_limit
+                else:
+                    is_visible = pos < col_limit and pos < seqlen_k
+                if q_token_idx < seqlen_q and is_visible:
                     local_sum_0 = (Float32(0.0), Float32(0.0))
                     local_sum_1 = (Float32(0.0), Float32(0.0))
                     local_sum_2 = (Float32(0.0), Float32(0.0))

@@ -239,6 +239,84 @@ def check_ref_compressed_topk(
         )
 
 
+def ref_indexer_forward_thd(
+    q: torch.Tensor,  # (total_q, H_q, D)
+    k: torch.Tensor,  # (total_k, H_kv, D)
+    w: torch.Tensor,  # (total_q, H_q)
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_k: int,
+    ratio: int,
+    q_causal_offsets: torch.Tensor,  # (total_q,)
+) -> torch.Tensor:
+    """Independent PyTorch reference for THD per-token causal offsets."""
+    out = torch.full(
+        (q.shape[0], max_seqlen_k),
+        float("-inf"),
+        dtype=torch.float32,
+        device=q.device,
+    )
+    cu_q = cu_seqlens_q.cpu().tolist()
+    cu_k = cu_seqlens_k.cpu().tolist()
+    offsets = q_causal_offsets.to(dtype=torch.int64)
+
+    for batch in range(len(cu_q) - 1):
+        q0, q1 = cu_q[batch : batch + 2]
+        k0, k1 = cu_k[batch : batch + 2]
+        q_b = q[q0:q1].to(torch.float32)
+        k_b = k[k0:k1].to(torch.float32)
+        w_b = w[q0:q1].to(torch.float32)
+        qhpkv = q_b.shape[1] // k_b.shape[1]
+        k_b = k_b.repeat_interleave(qhpkv, dim=1)
+        scores = torch.einsum("qhd,khd->qhk", q_b, k_b).relu()
+        scores = (scores * w_b.unsqueeze(-1)).sum(dim=1)
+
+        q_local = torch.arange(q1 - q0, dtype=torch.int64, device=q.device)
+        visible_k = torch.div(
+            q_local + offsets[q0:q1] + 1,
+            ratio,
+            rounding_mode="floor",
+        ).clamp(0, k1 - k0)
+        k_local = torch.arange(k1 - k0, dtype=torch.int64, device=q.device)
+        valid = k_local.unsqueeze(0) < visible_k.unsqueeze(1)
+        out[q0:q1, : k1 - k0] = scores.masked_fill(~valid, float("-inf"))
+
+    return out
+
+
+def check_ref_indexer_forward_thd(
+    q,
+    k,
+    w,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_k,
+    out_actual,
+    ratio,
+    q_causal_offsets,
+    atol: float = 1e-4,
+    rtol: float = 1e-4,
+):
+    out_ref = ref_indexer_forward_thd(
+        q,
+        k,
+        w,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_k,
+        ratio,
+        q_causal_offsets,
+    )
+    finite = torch.isfinite(out_ref)
+    assert torch.equal(torch.isneginf(out_actual), torch.isneginf(out_ref))
+    torch.testing.assert_close(
+        out_actual[finite],
+        out_ref[finite],
+        atol=atol,
+        rtol=rtol,
+    )
+
+
 def ref_indexer_top_k(
     input_values: torch.Tensor,  # (n_rows, num_cols)
     seq_lens: torch.Tensor,  # (batch_size,)
