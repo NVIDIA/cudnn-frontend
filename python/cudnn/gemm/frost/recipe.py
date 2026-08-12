@@ -9,11 +9,14 @@ a launchable. A call carries M, N, K, the strides and the pointers, and nothing
 else. This module writes the first set down, so that neither the interpreted
 path nor the straight line lowered from it re-derives them per call.
 
-The two consumers read the same recipe but do not share a body: :func:`gate`
-interprets it, and ``CompiledFusedGemm._lower`` emits a straight line with the
-constants inlined. That is a compiler beside its interpreter, kept honest the
-way those always are -- ``test_execute_recipe.py`` runs both over the same
-accepts and rejects and requires the same answer.
+The two consumers read the same recipe but do not share a body:
+``CompiledFusedGemm.launch`` interprets it (through :func:`check_shapes` and
+:func:`check_alignment`), and ``CompiledFusedGemm.lowered`` is the straight line
+``_lower`` emits with the constants inlined. That is a compiler beside its
+interpreter, kept honest the way those always are -- ``test_execute_recipe.py``
+runs both over the same accepts and rejects and requires the same answer. What
+it CANNOT catch is a misconception they share, which is how the axis-order bug
+survived it.
 """
 
 from __future__ import annotations
@@ -114,7 +117,7 @@ def _output_rule(spec, chain: FusionChain) -> tuple:
 class Operand:
     """One A or B operand: what a call must satisfy, with the rest baked."""
 
-    view: int  # position in the view list the engine hands over
+    index: int  # position in the operand list the engine hands over
     role: str  # names this operand in a rejection message
     major: str
     kpack: int  # 2 when fp4 stores two elements per slot
@@ -145,7 +148,7 @@ class Operand:
 
 @dataclass(frozen=True)
 class Output:
-    view: int
+    index: int
     role: str
     rule: tuple
     align: int
@@ -156,7 +159,7 @@ class Output:
 
 @dataclass(frozen=True)
 class Aux:
-    view: int
+    index: int
     role: str
     align: int
     ref: Any  # TensorRef, for the fake-shape reshape
@@ -164,7 +167,7 @@ class Aux:
 
 @dataclass(frozen=True)
 class ScaleFactor:
-    view: int
+    index: int
     role: str
     is_a: bool
     operand_at: int  # the A or B operand this one scales, as an index into inputs
@@ -176,7 +179,7 @@ class GemmRecipe:
     outputs: tuple
     aux: tuple
     sf: tuple
-    roles: tuple  # what occupies each view position, for a missing-buffer message
+    roles: tuple  # what occupies each operand position, for a missing-buffer message
     a_at: int  # M and K are read off inputs[a_at]
     b_at: int  # N off inputs[b_at]
     has_output_specs: bool
@@ -192,19 +195,19 @@ class GemmRecipe:
     def b(self) -> Operand:
         return self.inputs[self.b_at]
 
-    def problem(self, views, graph_order=None) -> tuple:
+    def problem(self, operands, graph_order=None) -> tuple:
         """``((M, N, K), axes-per-input)``, located rather than assumed.
 
         Reading M off axis 1 assumes the caller laid the buffer out the way the
         kernel reads it, which a bare device address does not: the pack
         describes that one from the graph's declaration, which orders B the
-        other way round. ``graph_order`` is the pack's per-view answer to which
+        other way round. ``graph_order`` is the pack's per-operand answer to which
         it was, or None when every operand is the caller's own.
         """
         axes, bad = [], []
         for op in self.inputs:
-            v = views[op.view]
-            borrowed = bool(graph_order and graph_order[op.view])
+            v = operands[op.index]
+            borrowed = bool(graph_order and graph_order[op.index])
             ax = op.axes(v.shape, v.stride(), borrowed)
             if ax is None:
                 want = op.dc if borrowed else op.kc
@@ -217,17 +220,17 @@ class GemmRecipe:
             raise ValueError("runtime operand layout does not match the layout the kernel was compiled for: " + "; ".join(bad))
         a, b = self.a, self.b
         a_ax, b_ax = axes[self.a_at], axes[self.b_at]
-        a_shape, b_shape = views[a.view].shape, views[b.view].shape
+        a_shape, b_shape = operands[a.index].shape, operands[b.index].shape
         return (a_shape[a_ax[AX_MN]], b_shape[b_ax[AX_MN]], a_shape[a_ax[AX_K]] * a.kpack), tuple(axes)
 
 
-def _tma_reject(recipe: GemmRecipe, views, axes) -> "str | None":
+def _tma_reject(recipe: GemmRecipe, operands, axes) -> "str | None":
     """TMA encodes the contiguous dimension in 16-byte units; a misaligned
     extent silently mis-strides every row past the first."""
     bad = []
     for op, ax in zip(recipe.inputs, axes):
         role = op.contiguous_role
-        extent = views[op.view].shape[ax[role]]
+        extent = operands[op.index].shape[ax[role]]
         if extent % op.modulus:
             # Report the LOGICAL extent and modulus: fp4 stores two elements per
             # slot, so "K % 32" is the rule a user wrote their shape against.
@@ -238,13 +241,13 @@ def _tma_reject(recipe: GemmRecipe, views, axes) -> "str | None":
     return None
 
 
-def _shape_reject(recipe: GemmRecipe, views, axes, mnk) -> "str | None":
+def _shape_reject(recipe: GemmRecipe, operands, axes, mnk) -> "str | None":
     """Every operand must agree with the M/N/K read off the first A and B --
     the kernel walks the inferred K on all of them."""
     m, n, k = mnk
     bad = []
     for op, ax in zip(recipe.inputs, axes):
-        shape = views[op.view].shape
+        shape = operands[op.index].shape
         want = (op.batch, n if op.is_b else m, k // op.kpack)
         got = (shape[ax[AX_BATCH]], shape[ax[AX_MN]], shape[ax[AX_K]])
         if got != want:
@@ -254,11 +257,11 @@ def _shape_reject(recipe: GemmRecipe, views, axes, mnk) -> "str | None":
     return None
 
 
-def _output_shape_reject(recipe: GemmRecipe, views, mnk) -> "str | None":
+def _output_shape_reject(recipe: GemmRecipe, operands, mnk) -> "str | None":
     m, n, _ = mnk
     bad = []
     for out in recipe.outputs:
-        shape = tuple(views[out.view].shape)
+        shape = tuple(operands[out.index].shape)
         want = expected_shape(out.rule, m, n)
         if shape != want:
             bad.append(f"{out.role}: expected {want}, got {shape}")
@@ -267,7 +270,7 @@ def _output_shape_reject(recipe: GemmRecipe, views, mnk) -> "str | None":
     return None
 
 
-def _align_reject(recipe: GemmRecipe, views) -> "str | None":
+def _align_reject(recipe: GemmRecipe, operands) -> "str | None":
     """Every buffer's alignment must meet the width its role's access uses.
 
     Inputs and scale factors are TMA-loaded, so only the base pointer is at
@@ -276,12 +279,12 @@ def _align_reject(recipe: GemmRecipe, views) -> "str | None":
     """
     bad = []
     for item in recipe.inputs + recipe.sf:
-        ptr = int(views[item.view].data_ptr())
+        ptr = int(operands[item.index].data_ptr())
         align = _pow2_floor(ptr)
         if align < 16:
             bad.append(f"{item.role}: alignment {align}B < required 16B (ptr=0x{ptr:x})")
     for item in recipe.outputs + recipe.aux:
-        v = views[item.view]
+        v = operands[item.index]
         ptr = int(v.data_ptr())
         align = tensor_alignment(tuple(v.shape), tuple(v.stride()), v.element_size(), ptr=ptr)
         if align < item.align:
@@ -291,7 +294,7 @@ def _align_reject(recipe: GemmRecipe, views) -> "str | None":
     return None
 
 
-def _sf_blob_reject(recipe: GemmRecipe, views, axes, mnk) -> "str | None":
+def _sf_blob_reject(recipe: GemmRecipe, operands, axes, mnk) -> "str | None":
     """A block-scale SF reaches the kernel as a base pointer plus a layout the
     template re-synthesizes from M/N/K, so a blob that is not one dense byte run
     of at least the required size is read out of bounds with no fault."""
@@ -299,10 +302,10 @@ def _sf_blob_reject(recipe: GemmRecipe, views, axes, mnk) -> "str | None":
     k4 = ((k // recipe.block_size) + 3) // 4
     bad = []
     for sf in recipe.sf:
-        v = views[sf.view]
+        v = operands[sf.index]
         op = recipe.inputs[sf.operand_at]
         rows = m if sf.is_a else n
-        batch = views[op.view].shape[axes[sf.operand_at][AX_BATCH]]
+        batch = operands[op.index].shape[axes[sf.operand_at][AX_BATCH]]
         required = 512 * k4 * ((rows + 127) // 128) * int(batch)
         span = 1 + sum((int(s) - 1) * int(st) for s, st in zip(v.shape, v.stride()))
         if int(v.numel()) != span:
@@ -318,19 +321,37 @@ def _sf_blob_reject(recipe: GemmRecipe, views, axes, mnk) -> "str | None":
     return None
 
 
-def gate(recipe: GemmRecipe, views, mnk, axes) -> None:
-    """Raise on anything about this call the compiled kernel cannot serve."""
-    reasons = [
-        _tma_reject(recipe, views, axes),
-        _shape_reject(recipe, views, axes, mnk),
-        _output_shape_reject(recipe, views, mnk),
-        _align_reject(recipe, views),
-    ]
-    if recipe.block_size:
-        reasons.append(_sf_blob_reject(recipe, views, axes, mnk))
+def _raise_first(reasons) -> None:
     for reason in reasons:
         if reason is not None:
             raise ValueError(reason)
+
+
+def check_shapes(recipe: GemmRecipe, operands, mnk, axes) -> None:
+    """Do the extents agree with the problem size this call will run?
+
+    The kernel's M/N/K are symbolic, so one plan serves many problem sizes and
+    the call's own extents are what has to hold together: every operand against
+    the M/N/K read off the first A and B, every output against the shape rule
+    the build recorded, and a block-scale blob against the size the template
+    re-synthesizes.
+    """
+    reasons = [_shape_reject(recipe, operands, axes, mnk), _output_shape_reject(recipe, operands, mnk)]
+    if recipe.block_size:
+        reasons.append(_sf_blob_reject(recipe, operands, axes, mnk))
+    _raise_first(reasons)
+
+
+def check_alignment(recipe: GemmRecipe, operands, axes) -> None:
+    """Does every buffer meet the width its role's accesses were compiled for?
+
+    Two rules, both about 16 bytes and neither about shape: TMA encodes the
+    contiguous dimension in 16-byte units, so its extent has a modulus; and each
+    buffer's base (plus, for a stored output, its stride and contiguous extent)
+    bounds the widest vector the kernel can issue. Below either, the kernel does
+    not fault -- it mis-strides or reads past the end.
+    """
+    _raise_first([_tma_reject(recipe, operands, axes), _align_reject(recipe, operands)])
 
 
 def _declared_layout(tensor) -> tuple:
@@ -345,12 +366,12 @@ def _declared_layout(tensor) -> tuple:
         return (), ()
 
 
-def _operand(view: int, role: str, tensor, *, major: str, dtype: str, batch: int, is_b: bool) -> Operand:
+def _operand(index: int, role: str, tensor, *, major: str, dtype: str, batch: int, is_b: bool) -> Operand:
     declared = _DECLARED_AXES["b" if is_b else "a"]
     contiguous = AX_K if major == "k" else AX_MN
     modulus, pack = contiguous_modulus(dtype, contiguous == AX_K)
     return Operand(
-        view=view,
+        index=index,
         role=role,
         major=major,
         kpack=2 if dtype == "fp4_e2m1" else 1,
@@ -392,7 +413,7 @@ def build(compiled) -> GemmRecipe:
             sqrt = red.mode == "norm2"
         outputs.append(
             Output(
-                view=order[id(t)],
+                index=order[id(t)],
                 role=spec.source,
                 rule=_output_rule(spec, chain),
                 align=out_reqs[i],
@@ -403,18 +424,18 @@ def build(compiled) -> GemmRecipe:
         )
 
     aux = tuple(
-        Aux(view=order[id(t)], role=f"aux {compiled.aux_names[i]!r}", align=aux_reqs[compiled.aux_names[i]], ref=ref)
+        Aux(index=order[id(t)], role=f"aux {compiled.aux_names[i]!r}", align=aux_reqs[compiled.aux_names[i]], ref=ref)
         for i, (t, ref) in enumerate(zip(binding.aux, chain.aux_tensors))
     )
     na = len(binding.a_operands)
     sf = tuple(
-        [ScaleFactor(view=order[id(t)], role=f"SFA[{i}]", is_a=True, operand_at=i) for i, t in enumerate(binding.sfa_operands)]
-        + [ScaleFactor(view=order[id(t)], role=f"SFB[{j}]", is_a=False, operand_at=na + j) for j, t in enumerate(binding.sfb_operands)]
+        [ScaleFactor(index=order[id(t)], role=f"SFA[{i}]", is_a=True, operand_at=i) for i, t in enumerate(binding.sfa_operands)]
+        + [ScaleFactor(index=order[id(t)], role=f"SFB[{j}]", is_a=False, operand_at=na + j) for j, t in enumerate(binding.sfb_operands)]
     )
 
     roles = [f"bound tensor {i}" for i in range(len(binding.bound_tensors()))]
     for item in (*inputs, *outputs, *aux, *sf):
-        roles[item.view] = item.role
+        roles[item.index] = item.role
 
     return GemmRecipe(
         inputs=tuple(inputs),

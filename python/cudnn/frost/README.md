@@ -249,6 +249,12 @@ CompiledPlan.execute(graph, uid_to_data, ctx)          (the hot path)
   engine may hard-code a stream, reach into private graph state, or allocate
   hidden workspace. `uid_to_data` is the caller's variant pack (tensor uid ->
   device buffer), exactly as the classic backend receives it.
+- **The pack's vocabulary is `index` and `OperandBuffer`,** and the two are not
+  the same thing. `pack.index_of(tensor_or_uid)` gives an operand's POSITION in
+  the pack; `pack.operands(indices)` turns positions into `OperandBuffer`s --
+  one caller buffer described (pointer, shape, stride, dtype), non-owning, and
+  itself a DLPack producer. An engine resolves positions once at first execute
+  and asks for buffers per call.
 
 `python/cudnn/gemm/frost/engine.py` is the worked example, deliberately thin:
 `check_support` delegates to `probe_supported` and

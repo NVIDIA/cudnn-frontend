@@ -71,7 +71,7 @@ class _FrostPlan(CompiledPlan):
         node_buffers = {}
         for node, slots in ports.items():
             names = list(slots.inputs) + list(slots.outputs)
-            views = variant_pack.views(list(slots.inputs.values()) + list(slots.outputs.values()))
+            views = variant_pack.operands(list(slots.inputs.values()) + list(slots.outputs.values()))
             split = len(slots.inputs)
             node_buffers[node] = NodeBuffers(dict(zip(names[:split], views[:split])), dict(zip(names[split:], views[split:])))
         required = self._compiled.workspace_bytes()

@@ -65,9 +65,10 @@ from .recipe import (
     REDUCTION_INIT_VALUE,
     _output_rule,
     build as build_recipe,
+    check_alignment,
+    check_shapes,
     contiguous_modulus,
     expected_shape,
-    gate as gate_recipe,
 )
 from .graph_analyzer import (
     GemmBinding,
@@ -1857,14 +1858,14 @@ class CompiledFusedGemm:
     # constructed without a binding and so has no call path.
     recipe: Any = field(default=None, init=False, repr=False, compare=False)
     # The recipe as one straight line, when this graph is a shape it emits.
-    launch: Any = field(default=None, init=False, repr=False, compare=False)
+    lowered: Any = field(default=None, init=False, repr=False, compare=False)
     bound: Any = field(default=(), init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self.binding is not None:
             self.bound = tuple(self.binding.bound_tensors())
             self.recipe = build_recipe(self)
-            self.launch = self._lower()
+            self.lowered = self._lower()
 
     def __call__(self, variant_pack, stream=None):
         # The runtime call is a variant-pack dict keyed by cuDNN tensor object
@@ -1879,13 +1880,13 @@ class CompiledFusedGemm:
 
     def run_resolved(self, resolved, stream=None):
         """Launch over ``{id(bound_tensor): buffer}``, already resolved."""
-        views = []
+        operands = []
         for i, t in enumerate(self.bound):
             buf = resolved.get(id(t))
             if buf is None:
                 raise KeyError(f"variant pack is missing a buffer for {self.recipe.roles[i]}")
-            views.append(buf)
-        return (self.launch or self.run_views)(views, stream=stream)
+            operands.append(buf)
+        return (self.lowered or self.launch)(operands, stream=stream)
 
     def _lower(self):
         """The recipe as one straight line, or None for a shape it does not emit.
@@ -1898,7 +1899,7 @@ class CompiledFusedGemm:
         rebuilds it.
 
         The emitted body never raises. Anything it is not sure of it hands to
-        ``run_views``, which serves every flavor and owns every rejection
+        ``launch``, which serves every flavor and owns every rejection
         message -- so this can only ever accept a subset of what the general
         path accepts, and there is no second set of error strings to drift.
 
@@ -1929,7 +1930,7 @@ class CompiledFusedGemm:
             declared_stride = op.declared_layout[1]
             if op.dc != op.kc and declared_stride and declared_stride[op.kc] == 1:
                 return None
-        ai, bi, ci = a.view, b.view, out.view
+        ai, bi, ci = a.index, b.index, out.index
         # kc is both the axis whose stride must be 1 and the axis whose extent
         # enters the TMA rule -- they are the same axis by definition of major.
         a_kc, b_kc = a.kc, b.kc
@@ -1942,18 +1943,18 @@ class CompiledFusedGemm:
         batch = out_batch if r.has_output_specs else max(a_batch, b_batch)
         device = self.device
         launchable = self._launchable
-        general = self.run_views
+        general = self.launch
 
-        def launch(views, graph_order=None, stream=None):
+        def lowered(operands, graph_order=None, stream=None):
             _check_plan_device(device)
             if graph_order:
                 # An operand described from the graph is in the graph's axis
                 # order; this body reads the caller's.
-                return general(views, graph_order, stream=stream)
-            av, bv, cv = views[ai], views[bi], views[ci]
+                return general(operands, graph_order, stream=stream)
+            av, bv, cv = operands[ai], operands[bi], operands[ci]
             a_sh, b_sh, c_sh = av.shape, bv.shape, cv.shape
             if len(a_sh) != 3 or len(b_sh) != 3 or len(c_sh) != 3:
-                return general(views, stream=stream)
+                return general(operands, stream=stream)
             a_st, b_st, c_st = av.stride(), bv.stride(), cv.stride()
             m, n, k = a_sh[1], b_sh[1], a_sh[2] * a_kpack
             if (
@@ -1971,7 +1972,7 @@ class CompiledFusedGemm:
                 or _pow2_floor(bv.data_ptr()) < 16
                 or tensor_alignment(tuple(c_sh), tuple(c_st), cv.element_size(), ptr=cv.data_ptr()) < out_align
             ):
-                return general(views, stream=stream)
+                return general(operands, stream=stream)
             problem_size = (
                 m,
                 n,
@@ -1993,9 +1994,9 @@ class CompiledFusedGemm:
             # coincide, and a shape where they do not is not emitted here.
             return launchable(problem_size, av.permute(1, 2, 0), bv.permute(1, 2, 0), cv.permute(1, 2, 0), stream=_as_custream(stream))
 
-        return launch
+        return lowered
 
-    def run_views(self, views, graph_order=None, stream=None):
+    def launch(self, operands, graph_order=None, stream=None):
         """Launch over the operand buffers, in bound-tensor order.
 
         Which bound tensor holds which operand is fixed when the plan compiles,
@@ -2008,19 +2009,22 @@ class CompiledFusedGemm:
         """
         _check_plan_device(self.device)
         recipe = self.recipe
-        mnk, axes = recipe.problem(views, graph_order)
-        gate_recipe(recipe, views, mnk, axes)
+        mnk, axes = recipe.problem(operands, graph_order)
+        check_shapes(recipe, operands, mnk, axes)
+        check_alignment(recipe, operands, axes)
 
-        out_bufs = [views[o.view] for o in recipe.outputs]
-        aux_bufs = [views[x.view] for x in recipe.aux]
+        out_bufs = [operands[o.index] for o in recipe.outputs]
+        aux_bufs = [operands[x.index] for x in recipe.aux]
         c_arg = out_bufs if len(out_bufs) > 1 else out_bufs[0]
         # Everything below indexes an operand's axes by position, so an operand
         # that arrived in the graph's order is re-expressed in the kernel's here
         # rather than threaded through every launcher.
-        operands = [(views[op.view] if ax is KERNEL_AXES else views[op.view].permute(ax[AX_BATCH], ax[AX_MN], ax[AX_K])) for op, ax in zip(recipe.inputs, axes)]
-        a_bufs, b_bufs = operands[: recipe.b_at], operands[recipe.b_at :]
+        in_bufs = [
+            (operands[op.index] if ax is KERNEL_AXES else operands[op.index].permute(ax[AX_BATCH], ax[AX_MN], ax[AX_K])) for op, ax in zip(recipe.inputs, axes)
+        ]
+        a_bufs, b_bufs = in_bufs[: recipe.b_at], in_bufs[recipe.b_at :]
 
-        sf_bufs = [views[s.view] for s in recipe.sf]
+        sf_bufs = [operands[s.index] for s in recipe.sf]
         if self.chain.is_multi_gemm:
             sfa, sfb = sf_bufs[: recipe.b_at], sf_bufs[recipe.b_at :]
             if self.block_scale:

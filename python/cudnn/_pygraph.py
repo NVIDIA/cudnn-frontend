@@ -1896,7 +1896,7 @@ class pygraph:
                 # slot that borrowed one is named here.
                 from_graph.append(i)
             ptr, tensor = self._describe(data, order[i])
-            native.set_slot(i, ptr, tuple(tensor.dim), tuple(tensor.stride), *_dlpack_code_bits(tensor.data_type))
+            native.set_operand(i, ptr, tuple(tensor.dim), tuple(tensor.stride), *_dlpack_code_bits(tensor.data_type))
         if strict:
             hole = native.first_unfilled()
             if hole >= 0:
@@ -1917,7 +1917,7 @@ class pygraph:
                 i = slot_of.get(uid)
                 if i is None:
                     raise ValueError(f"override_uids names tensor uid {uid}, which is not an operand of this graph")
-                native.override_slot(i, *_in_axis_order_of(tuple(override_shapes[j]), tuple(override_strides[j]), native.stride(i)))
+                native.override_operand(i, *_in_axis_order_of(tuple(override_shapes[j]), tuple(override_strides[j]), native.stride(i)))
         # The workspace has no uid, so it is not an operand — but an engine has
         # to bounds-check its carves, and reading its size here is the same read
         # every other buffer gets rather than a second probe further down.

@@ -31,36 +31,36 @@ class _FrostGemmPlan(CompiledPlan):
         # roles (matmul(A, A)), and resolve_variant_pack treats a repeated uid
         # as ambiguous.
         self._tensors = list(compiled.binding.bound_tensors())
-        self._slots = None
+        self._operand_indices = None
         # Which call path this plan uses is a property of the compiled kernel,
-        # so it is chosen here and not re-asked per execute. ``launch`` is the
+        # so it is chosen here and not re-asked per execute. ``lowered`` is the
         # straight line the recipe lowers to when the kernel is a shape it
-        # emits; ``run_views`` serves everything else.
-        self._lowered = getattr(compiled, "launch", None)
-        self._run_views = self._lowered or getattr(compiled, "run_views", None)
+        # emits; ``launch`` serves everything else.
+        self._lowered = getattr(compiled, "lowered", None)
+        self._launch = self._lowered or getattr(compiled, "launch", None)
 
     def get_workspace_size(self) -> int:
         return int(getattr(self._compiled, "workspace_bytes", 0) or 0)
 
     def execute(self, graph, variant_pack, ctx: ExecutionContext) -> None:
-        slots = self._slots
-        if slots is None:
+        indices = self._operand_indices
+        if indices is None:
             try:
-                slots = self._slots = [variant_pack.slot(t.get_uid()) for t in self._tensors]
+                indices = self._operand_indices = [variant_pack.index_of(t.get_uid()) for t in self._tensors]
             except KeyError as exc:
                 raise ValueError(f"frost_gemm: tensor uid {exc} is bound by the kernel but is not an operand of this graph") from exc
         # The kernel reads its M/N/K off these, so they must be the pack's --
         # which carry the shape this execute runs, override_shapes included.
-        views = variant_pack.views(slots)
+        operands = variant_pack.operands(indices)
         required = self.get_workspace_size()
         if required:
             # Scratch is carved from the CALLER's workspace: stable pointers, so
             # a plan stays safe to capture in a CUDA graph. Only the MoE
             # launchers need it, and they take the variant-pack dict.
-            self._compiled(dict(zip(self._tensors, views)), Workspace.over(variant_pack, required, "frost_gemm"), stream=ctx.stream)
+            self._compiled(dict(zip(self._tensors, operands)), Workspace.over(variant_pack, required, "frost_gemm"), stream=ctx.stream)
             return
-        run_views = self._run_views
-        if run_views is not None:
+        launch = self._launch
+        if launch is not None:
             # Which bound tensor holds which operand was settled at build, so
             # the buffers arrive in that order and the launcher indexes them.
             # Which AXIS ORDER each one arrived in is a per-call fact only the
@@ -70,11 +70,11 @@ class _FrostGemmPlan(CompiledPlan):
             graph_order = None
             borrowed = variant_pack.graph_described
             if borrowed:
-                flags = tuple(s in borrowed for s in slots)
+                flags = tuple(i in borrowed for i in indices)
                 graph_order = flags if any(flags) else None
-            run_views(views, graph_order, stream=ctx.stream)
+            launch(operands, graph_order, stream=ctx.stream)
         else:
-            self._compiled(dict(zip(self._tensors, views)), stream=ctx.stream)
+            self._compiled(dict(zip(self._tensors, operands)), stream=ctx.stream)
 
 
 class FrostGemmEngine(BaseEngine):

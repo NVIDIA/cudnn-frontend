@@ -3,7 +3,7 @@
 
 """The build-time recipe, and the straight line lowered from it.
 
-``_lower`` emits a call path with the recipe's constants inlined; ``run_views``
+``_lower`` emits a call path with the recipe's constants inlined; ``launch``
 interprets the same recipe. That is a compiler beside its interpreter, and the
 two can drift -- an earlier hand-written version of the emitted path lost the
 operand batch check and pinned an fp4 output at N instead of N/2, both of which
@@ -124,7 +124,7 @@ def test_which_flavors_lower(build, lowered):
     than growing a branch per flavor.
     """
     compiled = jit_from_cudnn_graph(build())
-    assert (compiled.launch is not None) is lowered
+    assert (compiled.lowered is not None) is lowered
 
 
 @requires_sm100
@@ -146,15 +146,15 @@ def test_public_execute_takes_the_lowered_path():
 # --- the differential -------------------------------------------------------
 
 
-def _views(compiled, a, b, c):
+def _bound_buffers(compiled, a, b, c):
     resolved = resolve_variant_pack(vp(compiled, a, b, c), compiled.binding)
     return [resolved[id(t)] for t in compiled.binding.bound_tensors()]
 
 
-def _verdict(run, views, c):
+def _verdict(run, operands, c):
     c.zero_()
     try:
-        run(views, stream=None)
+        run(operands, stream=None)
     except ValueError:
         return "rejected", None
     torch.cuda.synchronize()
@@ -220,17 +220,76 @@ def test_lowered_and_interpreted_agree(case):
     read.
     """
     compiled = jit_from_cudnn_graph(_plain_graph())
-    if compiled.launch is None:
+    if compiled.lowered is None:
         pytest.skip("this build does not lower (no tvm-ffi front door)")
 
     a, b, c = case()
-    fast, fast_out = _verdict(compiled.launch, _views(compiled, a, b, c), c)
-    slow, slow_out = _verdict(compiled.run_views, _views(compiled, a, b, c), c)
+    fast, fast_out = _verdict(compiled.lowered, _bound_buffers(compiled, a, b, c), c)
+    slow, slow_out = _verdict(compiled.launch, _bound_buffers(compiled, a, b, c), c)
     assert fast == slow, f"lowered says {fast}, interpreted says {slow}"
     if fast == "ran":
         torch.testing.assert_close(fast_out, slow_out, atol=0, rtol=0)
         ref = torch.einsum("bmk,bnk->bmn", a.float(), b.float())
         torch.testing.assert_close(fast_out.float(), ref, atol=2e-1, rtol=2e-2)
+
+
+def _matmul_on(batch, m, n, k, want_frost, a, b, c):
+    """Build the plain graph, pin a backend or a FROST plan, run it."""
+    g = cudnn.pygraph(io_data_type=BF16, intermediate_data_type=F32, compute_data_type=F32)
+    A = g.tensor(name="A", dim=[batch, m, k], stride=[m * k, k, 1])
+    B = g.tensor(name="B", dim=[batch, k, n], stride=[k * n, 1, k])
+    C = g.matmul(A=A, B=B, name="mm")
+    C.set_output(True).set_data_type(BF16)
+    g.validate()
+    g.build_operation_graph()
+    g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    hits = [i for i, p in enumerate(g.plans) if is_python_engine(p.engine_id) == want_frost]
+    if not hits:
+        return None
+    g.select_plan(hits[0])
+    g.check_support()
+    g.build_plans()
+    ws = torch.empty(max(g.get_workspace_size(), 1), dtype=torch.uint8, device="cuda")
+    g.execute({A: a, B: b, C: c}, ws)
+    torch.cuda.synchronize()
+    return c
+
+
+@requires_sm100
+@pytest.mark.parametrize("batch", (1, 2), ids=("b1", "b2"))
+@pytest.mark.parametrize("m,n,k", [(m, n, k) for m in (1, 128) for n in (1, 128) for k in (1, 128)], ids=str)
+def test_a_degenerate_extent_is_refused_or_matches_the_backend(monkeypatch, batch, m, n, k):
+    """An extent of 1 leaves its axis's stride free, so two majors can look alike.
+
+    ``(batch, M, 1)`` k-major carries stride 1 on axis 1 AND axis 2, and nothing
+    in the description says which one the kernel should read as K. What keeps
+    that from mattering is the TMA rule: the contiguous extent must divide
+    ``128 // bits``, whose smallest value is 4, and 1 divides none of them -- so
+    a unit contiguous extent never reaches a launch. This asserts the property
+    that argument implies rather than the argument: every degenerate shape is
+    either refused or agrees with the backend.
+    """
+    monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
+    torch.manual_seed(0)
+    a = torch.randn(batch, m, k, dtype=torch.bfloat16, device="cuda")
+    b = torch.randn(batch, n, k, dtype=torch.bfloat16, device="cuda")
+
+    got = {}
+    for want_frost in (False, True):
+        c = torch.zeros(batch, m, n, dtype=torch.bfloat16, device="cuda")
+        try:
+            # None = no plan of that kind. For FROST that IS a refusal, and the
+            # one every K == 1 shape takes: the graph-time gate applies the same
+            # TMA rule, so the degenerate contiguous extent never gets a plan.
+            ran = _matmul_on(batch, m, n, k, want_frost, a, b, c)
+            got[want_frost] = "refused" if ran is None else ran
+        except (ValueError, NotImplementedError, cudnn.cudnnGraphNotSupportedError):
+            got[want_frost] = "refused"
+    if got[False] == "refused":
+        pytest.skip("the backend has nothing to compare against for this shape")
+    if got[True] == "refused":
+        return  # refusing is always allowed; computing something else is not
+    torch.testing.assert_close(got[True].float(), got[False].float(), atol=2e-1, rtol=2e-2)
 
 
 @requires_sm100
@@ -325,8 +384,8 @@ def test_operand_batch_is_checked():
     compiled = jit_from_cudnn_graph(_plain_graph(batch=2))
     a, b, c = _operands(batch=2)
     one_batch_b = b[:1].contiguous()
-    for run in (compiled.launch, compiled.run_views):
+    for run in (compiled.lowered, compiled.launch):
         if run is None:
             continue
         with pytest.raises(ValueError):
-            run(_views(compiled, a, one_batch_b, c), stream=None)
+            run(_bound_buffers(compiled, a, one_batch_b, c), stream=None)

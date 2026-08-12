@@ -152,7 +152,7 @@ class Workspace:
             count *= int(extent)
         self._check_span(offset, count * buffers.DTYPE_ITEMSIZE[dtype])
         code, bits = buffers.DTYPES[dtype]
-        return _pybind_module.make_slot(self._ptr + offset, list(shape), code, bits, self._device)
+        return _pybind_module.make_operand_buffer(self._ptr + offset, list(shape), code, bits, self._device)
 
     def carve(self, plan):
         """Every region a :func:`carve_plan` describes, in one crossing."""
