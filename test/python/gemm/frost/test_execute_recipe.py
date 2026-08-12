@@ -165,6 +165,48 @@ def test_which_flavors_lower(build, n_b, n_out, n_aux):
 
 
 @requires_sm100
+@pytest.mark.parametrize("build,n_b,n_out,n_aux", _FLAVORS, ids=_FLAVOR_IDS)
+def test_a_legal_call_defers_to_the_interpreter_for_nothing(build, n_b, n_out, n_aux):
+    """The interpreter is migration scaffolding, so that has to be measurable.
+
+    Every reason the fast path can hand a call over is counted, and a legal call
+    of every flavor must trigger none of them -- otherwise "the fallback only
+    catches what the fast path declines" is a claim with nothing behind it, and
+    the day it is deleted is the day the regression appears.
+    """
+    compiled = jit_from_cudnn_graph(build())
+    if compiled.lowered is None:
+        pytest.skip(f"this build does not lower: {compiled.declined}")
+    operands = _buffers_for(compiled)
+    compiled.lowered(operands, stream=None)
+    torch.cuda.synchronize()
+    assert dict(compiled.deferrals) == {}
+
+
+@requires_sm100
+def test_every_decline_names_its_reason():
+    """A plan without a fast path says which rule denied it, not just ``None``."""
+    compiled = jit_from_cudnn_graph(_plain_graph())
+    assert compiled.lowered is not None and compiled.declined is None
+    compiled.recipe = replace(compiled.recipe, workspace_bytes=4096)
+    assert compiled._lower() is None
+    assert compiled.declined == "needs workspace"
+
+
+@requires_sm100
+def test_a_deferral_is_counted_under_the_rule_that_caused_it():
+    """A bare address is the one deferral a legal call still takes."""
+    compiled = jit_from_cudnn_graph(_plain_graph())
+    if compiled.lowered is None:
+        pytest.skip("this build does not lower")
+    a, b, c = _operands()
+    operands = _bound_buffers(compiled, a, b, c)
+    compiled.lowered(operands, (True, False, False), stream=None)
+    torch.cuda.synchronize()
+    assert dict(compiled.deferrals) == {"graph-described operand": 1}
+
+
+@requires_sm100
 def test_a_post_kernel_finalize_is_declined():
     """``norm2`` takes a square root through the caller's buffer after the kernel.
 

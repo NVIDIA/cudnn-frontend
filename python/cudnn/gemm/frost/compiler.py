@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import functools
 import hashlib
+from collections import Counter
 import importlib.util
 import logging
 import os
@@ -1865,6 +1866,13 @@ class CompiledFusedGemm:
     # The recipe as one straight line, when this graph is a shape it emits.
     lowered: Any = field(default=None, init=False, repr=False, compare=False)
     bound: Any = field(default=(), init=False, repr=False, compare=False)
+    # Why this graph has no fast path, or None when it has one. Set at build.
+    declined: "str | None" = field(default=None, init=False, repr=False, compare=False)
+    # Reason -> count for calls the fast path handed to the interpreter. The
+    # interpreter is migration scaffolding, so "no production call needs it" has
+    # to be measurable rather than asserted; a test reads this per flavor.
+    # Counted only on the path already being given up, so the fast path is free.
+    deferrals: Any = field(default_factory=Counter, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self.binding is not None:
@@ -1915,18 +1923,31 @@ class CompiledFusedGemm:
         message -- so this can only ever accept a subset of what the general
         path accepts, and there is no second set of error strings to drift.
         """
-        r = self.recipe
-        if r is None or not _TVM_FFI_OK or r.workspace_bytes:
+
+        def decline(reason: str) -> None:
+            self.declined = reason
             return None
+
+        r = self.recipe
+        if r is None:
+            return decline("no binding")
+        if not _TVM_FFI_OK:
+            # An executor capability, not a property of this graph: without the
+            # front door the arguments need the legacy DLPack wrappers.
+            return decline("no tvm-ffi front door")
+        if r.workspace_bytes:
+            return decline("needs workspace")
         # norm2 takes a square root through the caller's buffer after the kernel;
         # that is a device operation the engine does not own yet, and neither is
         # seeding a strided reduction output (checked per call, below).
         if any(o.sqrt for o in r.outputs):
-            return None
+            return decline("post-kernel sqrt")
         # Scale factors come with a block size to size their blob against, and a
         # multi-GEMM's batch with a dense output to read it off.
-        if bool(r.sf) != bool(r.block_size) or (r.multi_gemm and not r.has_output_specs):
-            return None
+        if bool(r.sf) != bool(r.block_size):
+            return decline("scale factors without a block size")
+        if r.multi_gemm and not r.has_output_specs:
+            return decline("multi-GEMM without a dense output")
         # A buffer reporting the declaration is read in the graph's axis order,
         # which this body does not serve. The stride guard below tells that
         # apart -- unless the declaration itself would satisfy the guard, which
@@ -1934,7 +1955,7 @@ class CompiledFusedGemm:
         for op in r.inputs:
             declared_stride = op.declared_layout[1]
             if op.dc != op.kc and declared_stride and declared_stride[op.kc] == 1:
-                return None
+                return decline("declared layout is indistinguishable from the kernel's")
 
         # The recipe flattened into the loop headers: everything the body reads
         # is unpacked by the `for`, so it costs no attribute lookup. `kc` is both
@@ -1951,15 +1972,20 @@ class CompiledFusedGemm:
         block_size, batch = r.block_size, r.batch
         device, launchable, general = r.device, self._launchable, self.launch
         fill_word, is_contiguous = buffers.fill_word_async, buffers.is_contiguous
+        # Named so a test can assert which reason a call deferred for, and that a
+        # legal call defers for none. Incremented only on the giving-up path.
+        gave_up = self.deferrals
 
         def lowered(operands, graph_order=None, stream=None):
             _check_plan_device(device)
             if graph_order:
                 # An operand described from the graph is in the graph's axis
                 # order; this body reads the caller's.
+                gave_up["graph-described operand"] += 1
                 return general(operands, graph_order, stream=stream)
             a_sh, b_sh = operands[ai].shape, operands[bi].shape
             if len(a_sh) != 3 or len(b_sh) != 3:
+                gave_up["A or B is not rank 3"] += 1
                 return general(operands, None, stream=stream)
             m, n, k = a_sh[1], b_sh[1], a_sh[2] * a_kpack
             # permute(1, 2, 0) relabels axes, so the strides the kernel wants are
@@ -1977,6 +2003,7 @@ class CompiledFusedGemm:
                     or sh[2] * kpack != k
                     or _pow2_floor(v.data_ptr()) < 16
                 ):
+                    gave_up["input layout"] += 1
                     return general(operands, None, stream=stream)
                 if takes_stride:
                     problem += (st[1], st[2], st[0])
@@ -1992,11 +2019,13 @@ class CompiledFusedGemm:
                     or sh[2] != (v2 if k2 == CONST else m if k2 == FROM_M else n // v2)
                     or tensor_alignment(tuple(sh), tuple(st), v.element_size(), ptr=v.data_ptr()) < align
                 ):
+                    gave_up["output layout"] += 1
                     return general(operands, None, stream=stream)
                 problem += (st[1], st[2], st[0])
             for idx, align in auxs:
                 v = operands[idx]
                 if tensor_alignment(tuple(v.shape), tuple(v.stride()), v.element_size(), ptr=v.data_ptr()) < align:
+                    gave_up["aux alignment"] += 1
                     return general(operands, None, stream=stream)
             if sfs:
                 k4 = ((k // block_size) + 3) // 4
@@ -2008,11 +2037,13 @@ class CompiledFusedGemm:
                         or count != 1 + sum((int(s) - 1) * int(st) for s, st in zip(v.shape, v.stride()))
                         or count * v.element_size() < 512 * k4 * (((m if is_a else n) + 127) // 128) * sf_batch
                     ):
+                        gave_up["scale-factor blob"] += 1
                         return general(operands, None, stream=stream)
             for lead, followers in shared:
                 st = tuple(operands[lead].stride())
                 for j in followers:
                     if tuple(operands[j].stride()) != st:
+                        gave_up["operands do not share a layout"] += 1
                         return general(operands, None, stream=stream)
             if seeds:
                 # Seeding is a write, so nothing above may still reject: check
@@ -2020,6 +2051,7 @@ class CompiledFusedGemm:
                 for idx, _word in seeds:
                     v = operands[idx]
                     if not is_contiguous(tuple(v.shape), tuple(v.stride())):
+                        gave_up["strided reduction seed"] += 1
                         return general(operands, None, stream=stream)
                 for idx, word in seeds:
                     v = operands[idx]
