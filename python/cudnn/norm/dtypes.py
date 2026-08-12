@@ -1,8 +1,9 @@
-"""Shared dtype tables for the FROST norm engine (single source of truth).
+"""Shared dtype tables for the sm_100 norm kernels (single source of truth).
 
-Norm kernels currently support the three high/standard-precision floating
-types only: bfloat16, float16, float32. Lower precisions (fp8/fp4/mx) are
-intentionally excluded for now and will be added later.
+Norm kernels currently support the three high/standard-precision floating types
+only: bfloat16, float16, float32. Statistics (mean / inv_variance) and parameter
+gradients (dscale / dbias) are always fp32, matching cuDNN's norm backend. Lower
+precisions (fp8/fp4/mx) are intentionally deferred.
 """
 
 from __future__ import annotations
@@ -25,11 +26,9 @@ DTYPE_BYTES: dict[str, int] = {
     "fp32": 4,
 }
 
-# The set of I/O dtypes the norm kernels accept.
 SUPPORTED_IO_DTYPES = ("bf16", "fp16", "fp32")
 
-# Statistics (mean / inv_variance) and parameter gradients (dscale / dbias) are
-# always accumulated and stored in fp32, matching cuDNN's norm backend.
+# Statistics and parameter gradients are always accumulated/stored in fp32.
 STATS_DTYPE = "fp32"
 
 
@@ -46,15 +45,11 @@ def torch_dtype_to_str(dt: Any) -> str:
         return table[dt]
     except KeyError:
         raise ValueError(
-            f"norm/frost supports {SUPPORTED_IO_DTYPES} only; got torch dtype {dt}"
+            f"norm sm_100 kernels support {SUPPORTED_IO_DTYPES} only; got torch dtype {dt}"
         ) from None
 
 
 def str_to_torch_dtype(s: str) -> Any:
     import torch
 
-    return {
-        "bf16": torch.bfloat16,
-        "fp16": torch.float16,
-        "fp32": torch.float32,
-    }[s]
+    return {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[s]
