@@ -58,6 +58,20 @@ _cudnn_handles: Dict[int, int] = {}
 # ---------------------------------------------------------------------------
 
 
+def select_plan(graph, plan_name):
+    """Pin one execution plan by name on a freshly built graph (create the
+    plans, select by name, check support); ``None`` keeps default routing."""
+    if plan_name is None:
+        return
+    graph.create_execution_plans()
+    names = [graph.get_plan_name_at_index(i) for i in range(len(graph.plans))]
+    matches = [i for i, n in enumerate(names) if n == plan_name or n.startswith(plan_name + "[")]
+    if not matches:
+        raise cudnn.cudnnGraphNotSupportedError(f"no {plan_name} plan for this graph (offered: {names})")
+    graph.select_plan(matches[0])
+    graph.check_support()
+
+
 def _graph_workspace(graph, device):
     """Caller-side workspace for a compiled graph (grow-only, held on the
     graph object itself — same lifetime by construction, no id()-keyed
@@ -102,7 +116,26 @@ def _check_dtype(name, t, want) -> None:
 
 
 def _make_fprop_cache_key(
-    total, N, H, HK, HV, K, V, io_dtype, k_dtype, v_dtype, k_shape, v_shape, cu_dtype, scale, output_final_state, use_qk_l2norm, has_initial_state, ckpt, device
+    total,
+    N,
+    H,
+    HK,
+    HV,
+    K,
+    V,
+    io_dtype,
+    k_dtype,
+    v_dtype,
+    k_shape,
+    v_shape,
+    cu_dtype,
+    scale,
+    output_final_state,
+    use_qk_l2norm,
+    has_initial_state,
+    ckpt,
+    device,
+    plan_name,
 ):
     return (
         "fprop",
@@ -125,6 +158,7 @@ def _make_fprop_cache_key(
         bool(has_initial_state),
         ckpt,
         device,
+        plan_name,
     )
 
 
@@ -148,6 +182,7 @@ def _make_bprop_cache_key(
     scale,
     use_qk_l2norm,
     device,
+    plan_name,
 ):
     return (
         "bprop",
@@ -170,6 +205,7 @@ def _make_bprop_cache_key(
         float(scale),
         bool(use_qk_l2norm),
         device,
+        plan_name,
     )
 
 
@@ -225,6 +261,7 @@ def _gdn_fwd(
     output_final_state: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
     checkpoint_every_n_tokens: int = 0,
+    plan_name: Optional[str] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """GDN forward (internal): a cached single-node GDN pygraph, THD layout.
 
@@ -276,6 +313,7 @@ def _gdn_fwd(
         state0 is not None,
         ckpt,
         device,
+        plan_name,
     )
     if cache_key not in _fprop_cache:
         _fprop_cache[cache_key] = _build_fprop_graph(
@@ -296,6 +334,8 @@ def _gdn_fwd(
             bool(use_qk_l2norm_in_kernel),
             ckpt,
         )
+        select_plan(_fprop_cache[cache_key][0], plan_name)
+
     graph, t = _fprop_cache[cache_key]
 
     HO = max(H, HV)
@@ -326,7 +366,18 @@ def _gdn_fwd(
 
 @_gdn_fwd.register_fake
 def _gdn_fwd_fake(
-    q, k, v, g, beta, cu_seqlens, scale, initial_state=None, output_final_state=False, use_qk_l2norm_in_kernel=False, checkpoint_every_n_tokens=0
+    q,
+    k,
+    v,
+    g,
+    beta,
+    cu_seqlens,
+    scale,
+    initial_state=None,
+    output_final_state=False,
+    use_qk_l2norm_in_kernel=False,
+    checkpoint_every_n_tokens=0,
+    plan_name: Optional[str] = None,
 ):
     total, H, K = q.shape
     HK = k.shape[1]
@@ -417,6 +468,7 @@ def _gdn_bwd(
     initial_state: Optional[torch.Tensor] = None,
     d_final_state: Optional[torch.Tensor] = None,
     use_qk_l2norm_in_kernel: bool = False,
+    plan_name: Optional[str] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """GDN backward (internal): a cached single-node GDN_BWD pygraph, THD layout.
 
@@ -475,6 +527,7 @@ def _gdn_bwd(
         scale,
         use_qk_l2norm_in_kernel,
         device,
+        plan_name,
     )
     if cache_key not in _bprop_cache:
         _bprop_cache[cache_key] = _build_bprop_graph(
@@ -494,6 +547,8 @@ def _gdn_bwd(
             float(scale),
             bool(use_qk_l2norm_in_kernel),
         )
+        select_plan(_bprop_cache[cache_key][0], plan_name)
+
     graph, t = _bprop_cache[cache_key]
 
     HO = max(H, HV)
@@ -530,7 +585,7 @@ def _gdn_bwd(
 
 
 @_gdn_bwd.register_fake
-def _gdn_bwd_fake(dO, q, k, v, g, beta, cu_seqlens, scale, initial_state=None, d_final_state=None, use_qk_l2norm_in_kernel=False):
+def _gdn_bwd_fake(dO, q, k, v, g, beta, cu_seqlens, scale, initial_state=None, d_final_state=None, use_qk_l2norm_in_kernel=False, plan_name=None):
     dstate0 = torch.empty_like(initial_state) if initial_state is not None else q.new_empty(0, dtype=torch.float32)
     return (
         torch.empty_like(q),
@@ -548,12 +603,13 @@ def _gdn_bwd_fake(dO, q, k, v, g, beta, cu_seqlens, scale, initial_state=None, d
 
 
 def _gdn_setup_context(ctx, inputs, output):
-    q, k, v, g, beta, cu_seqlens, scale, initial_state, output_final_state, use_qk_l2norm_in_kernel, checkpoint_every_n_tokens = inputs
+    q, k, v, g, beta, cu_seqlens, scale, initial_state, output_final_state, use_qk_l2norm_in_kernel, checkpoint_every_n_tokens, plan_name = inputs
     # save_for_backward cannot hold None; keep initial_state as an attribute.
     ctx.save_for_backward(q, k, v, g, beta, cu_seqlens)
     ctx.initial_state = initial_state
     ctx.scale = scale
     ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
+    ctx.plan_name = plan_name
     ctx.mark_non_differentiable(output[2])
 
 
@@ -574,9 +630,10 @@ def _gdn_backward(ctx, dO, dFinal, _dstate_checkpoints):
         initial_state=initial_state,
         d_final_state=dstate_in,
         use_qk_l2norm_in_kernel=ctx.use_qk_l2norm_in_kernel,
+        plan_name=ctx.plan_name,
     )
     # q, k, v, g, beta, cu_seqlens, scale, initial_state, output_final_state,
-    # use_qk_l2norm_in_kernel, checkpoint_every_n_tokens
+    # use_qk_l2norm_in_kernel, checkpoint_every_n_tokens, plan_name
     return (
         dq,
         dk,
@@ -586,6 +643,7 @@ def _gdn_backward(ctx, dO, dFinal, _dstate_checkpoints):
         None,
         None,
         dstate0 if initial_state is not None else None,
+        None,
         None,
         None,
         None,
@@ -616,6 +674,7 @@ def gated_delta_net(
     output_final_state: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
     checkpoint_every_n_tokens: int = 0,
+    plan_name: Optional[str] = None,
 ):
     """Gated DeltaNet (GDN) linear attention.
 
@@ -650,6 +709,9 @@ def gated_delta_net(
             FROST engine requires the kernel chunk size, 64). The series is
             a non-differentiable dump.
 
+        plan_name: optionally pin one execution plan by name (the plan
+            API's ``get_plan_name_at_index`` names, e.g. ``gdn_frost``); a
+            graph offering no such plan raises ``cudnnGraphNotSupportedError``.
     Returns:
         ``(o, final_state)`` with ``o`` shaped like ``v``, or
         ``(o, final_state, state_checkpoints)`` when ``checkpoint_every_n_tokens > 0``.
@@ -671,6 +733,7 @@ def gated_delta_net(
         output_final_state=bool(output_final_state),
         use_qk_l2norm_in_kernel=bool(use_qk_l2norm_in_kernel),
         checkpoint_every_n_tokens=int(checkpoint_every_n_tokens),
+        plan_name=plan_name,
     )
     if checkpoint_every_n_tokens > 0:
         return o, final_state, state_checkpoints

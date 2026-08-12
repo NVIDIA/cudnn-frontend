@@ -33,7 +33,7 @@ def rms_ratio(out: torch.Tensor, ref: torch.Tensor) -> float:
     return ((out - ref).pow(2).mean().sqrt() / ref.pow(2).mean().sqrt().clamp_min(1e-12)).item()
 
 
-def _recurrent_dense(q, k, v, alpha, beta, state0):
+def recurrent_dense(q, k, v, alpha, beta, state0):
     """Dense recurrence in [B, HV, T, *] layout, fp64. Returns (o, final state)."""
     T = q.shape[2]
     state = state0
@@ -80,15 +80,22 @@ def gdn_reference(
 
     HO = max(q.shape[2], v.shape[2])
 
-    def expand(x):
-        r = HO // x.shape[2]
-        return x.repeat_interleave(r, dim=2) if r > 1 else x
-
-    qf = expand(q.double() * scale)
-    kf = expand(k.double())
-    vf = expand(v.double())
-    alphaf = expand(g.double().exp())
-    betaf = expand(beta.double())
+    qf = q.double() * scale
+    kf = k.double()
+    vf = v.double()
+    alphaf = g.double().exp()
+    betaf = beta.double()
+    # expand tensors for grouped heads (view, no copy), as in the sdpa references
+    if q.shape[2] != HO:
+        qf = qf.unsqueeze(3).expand(-1, -1, -1, HO // q.shape[2], -1).reshape(q.shape[0], q.shape[1], HO, -1)
+    if k.shape[2] != HO:
+        kf = kf.unsqueeze(3).expand(-1, -1, -1, HO // k.shape[2], -1).reshape(k.shape[0], k.shape[1], HO, -1)
+    if v.shape[2] != HO:
+        vf = vf.unsqueeze(3).expand(-1, -1, -1, HO // v.shape[2], -1).reshape(v.shape[0], v.shape[1], HO, -1)
+    if g.shape[2] != HO:
+        alphaf = alphaf.unsqueeze(3).expand(-1, -1, -1, HO // g.shape[2]).reshape(g.shape[0], g.shape[1], HO)
+    if beta.shape[2] != HO:
+        betaf = betaf.unsqueeze(3).expand(-1, -1, -1, HO // beta.shape[2]).reshape(beta.shape[0], beta.shape[1], HO)
     HV = HO
 
     # [B, T, HV, *] -> [B, HV, T, *]
@@ -106,7 +113,7 @@ def gdn_reference(
             state0 = torch.zeros(B, HV, K, V, dtype=torch.float64, device=q.device)
         else:
             state0 = initial_state.double()
-        o, state = _recurrent_dense(qf, kf, vf, alphaf, betaf, state0)
+        o, state = recurrent_dense(qf, kf, vf, alphaf, betaf, state0)
         return o.permute(0, 2, 1, 3), state
 
     assert q.shape[0] == 1, "cu_seqlens requires packed batch B == 1"
@@ -121,7 +128,7 @@ def gdn_reference(
         if e == s:
             states.append(state0)
             continue
-        o_n, state_n = _recurrent_dense(qf[:, :, s:e], kf[:, :, s:e], vf[:, :, s:e], alphaf[:, :, s:e], betaf[:, :, s:e], state0)
+        o_n, state_n = recurrent_dense(qf[:, :, s:e], kf[:, :, s:e], vf[:, :, s:e], alphaf[:, :, s:e], betaf[:, :, s:e], state0)
         outs.append(o_n)
         states.append(state_n)
     if outs:

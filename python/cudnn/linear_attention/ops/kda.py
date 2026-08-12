@@ -62,6 +62,20 @@ _cudnn_handles: Dict[int, int] = {}
 # ---------------------------------------------------------------------------
 
 
+def select_plan(graph, plan_name):
+    """Pin one execution plan by name on a freshly built graph (create the
+    plans, select by name, check support); ``None`` keeps default routing."""
+    if plan_name is None:
+        return
+    graph.create_execution_plans()
+    names = [graph.get_plan_name_at_index(i) for i in range(len(graph.plans))]
+    matches = [i for i, n in enumerate(names) if n == plan_name or n.startswith(plan_name + "[")]
+    if not matches:
+        raise cudnn.cudnnGraphNotSupportedError(f"no {plan_name} plan for this graph (offered: {names})")
+    graph.select_plan(matches[0])
+    graph.check_support()
+
+
 def _graph_workspace(graph, device):
     """Caller-side workspace for a compiled graph."""
     if not graph._is_built:
@@ -126,6 +140,7 @@ def _make_fprop_cache_key(
     has_initial_state,
     ckpt,
     device,
+    plan_name,
 ):
     return (
         "fprop",
@@ -151,6 +166,7 @@ def _make_fprop_cache_key(
         bool(has_initial_state),
         ckpt,
         device,
+        plan_name,
     )
 
 
@@ -176,6 +192,7 @@ def _make_bprop_cache_key(
     scale,
     use_qk_l2norm,
     device,
+    plan_name,
 ):
     return (
         "bprop",
@@ -200,6 +217,7 @@ def _make_bprop_cache_key(
         float(scale),
         bool(use_qk_l2norm),
         device,
+        plan_name,
     )
 
 
@@ -303,6 +321,7 @@ def _kda_fwd(
     a_log: Optional[torch.Tensor] = None,
     dt_bias: Optional[torch.Tensor] = None,
     checkpoint_every_n_tokens: int = 0,
+    plan_name: Optional[str] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """KDA forward (internal): a cached single-node KDA pygraph, THD layout.
 
@@ -375,6 +394,7 @@ def _kda_fwd(
         state0 is not None,
         ckpt,
         device,
+        plan_name,
     )
     if cache_key not in _fprop_cache:
         _fprop_cache[cache_key] = _build_fprop_graph(
@@ -398,6 +418,8 @@ def _kda_fwd(
             float(gate_lower_bound) if gate_lower_bound is not None else None,
             ckpt,
         )
+        select_plan(_fprop_cache[cache_key][0], plan_name)
+
     graph, t = _fprop_cache[cache_key]
 
     o = torch.empty(total, HO, V, dtype=q.dtype, device=device)
@@ -446,6 +468,7 @@ def _kda_fwd_fake(
     a_log=None,
     dt_bias=None,
     checkpoint_every_n_tokens=0,
+    plan_name: Optional[str] = None,
 ):
     total, H, K = q.shape
     HK = k.shape[1]
@@ -536,6 +559,7 @@ def _kda_bwd(
     initial_state: Optional[torch.Tensor] = None,
     d_final_state: Optional[torch.Tensor] = None,
     use_qk_l2norm_in_kernel: bool = False,
+    plan_name: Optional[str] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """KDA backward (internal): a cached single-node KDA_BWD pygraph, THD layout.
 
@@ -595,6 +619,7 @@ def _kda_bwd(
         scale,
         use_qk_l2norm_in_kernel,
         device,
+        plan_name,
     )
     if cache_key not in _bprop_cache:
         _bprop_cache[cache_key] = _build_bprop_graph(
@@ -614,6 +639,8 @@ def _kda_bwd(
             float(scale),
             bool(use_qk_l2norm_in_kernel),
         )
+        select_plan(_bprop_cache[cache_key][0], plan_name)
+
     graph, t = _bprop_cache[cache_key]
 
     dq = torch.empty(total, H, K, dtype=q.dtype, device=device)
@@ -649,7 +676,7 @@ def _kda_bwd(
 
 
 @_kda_bwd.register_fake
-def _kda_bwd_fake(dO, q, k, v, g, beta, cu_seqlens, scale, initial_state=None, d_final_state=None, use_qk_l2norm_in_kernel=False):
+def _kda_bwd_fake(dO, q, k, v, g, beta, cu_seqlens, scale, initial_state=None, d_final_state=None, use_qk_l2norm_in_kernel=False, plan_name=None):
     dstate0 = torch.empty_like(initial_state) if initial_state is not None else q.new_empty(0, dtype=torch.float32)
     return (
         torch.empty_like(q),
@@ -684,12 +711,14 @@ def _kda_setup_context(ctx, inputs, output):
         a_log,
         dt_bias,
         checkpoint_every_n_tokens,
+        plan_name,
     ) = inputs
     # save_for_backward cannot hold None; keep initial_state as an attribute.
     ctx.save_for_backward(q, k, v, g, beta, cu_seqlens)
     ctx.initial_state = initial_state
     ctx.scale = scale
     ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
+    ctx.plan_name = plan_name
     ctx.use_beta_sigmoid_in_kernel = bool(use_beta_sigmoid_in_kernel)
     ctx.safe_gate = bool(safe_gate)
     ctx.mark_non_differentiable(output[2])
@@ -714,10 +743,11 @@ def _kda_backward(ctx, dO, dFinal, _dstate_checkpoints):
         initial_state=initial_state,
         d_final_state=dstate_in,
         use_qk_l2norm_in_kernel=ctx.use_qk_l2norm_in_kernel,
+        plan_name=ctx.plan_name,
     )
     # q, k, v, g, beta, cu_seqlens, scale, initial_state, output_final_state,
     # use_qk_l2norm_in_kernel, use_beta_sigmoid_in_kernel, safe_gate,
-    # gate_lower_bound, a_log, dt_bias, checkpoint_every_n_tokens
+    # gate_lower_bound, a_log, dt_bias, checkpoint_every_n_tokens, plan_name
     return (
         dq,
         dk,
@@ -727,6 +757,7 @@ def _kda_backward(ctx, dO, dFinal, _dstate_checkpoints):
         None,
         None,
         dstate0 if initial_state is not None else None,
+        None,
         None,
         None,
         None,
@@ -767,6 +798,7 @@ def kimi_delta_attention(
     a_log: Optional[torch.Tensor] = None,
     dt_bias: Optional[torch.Tensor] = None,
     checkpoint_every_n_tokens: int = 0,
+    plan_name: Optional[str] = None,
 ):
     """Kimi Delta Attention (KDA) linear attention.
 
@@ -813,6 +845,9 @@ def kimi_delta_attention(
             FROST engine requires the kernel chunk size, 16). The series is
             a non-differentiable dump.
 
+        plan_name: optionally pin one execution plan by name (the plan
+            API's ``get_plan_name_at_index`` names, e.g. ``gdn_frost``); a
+            graph offering no such plan raises ``cudnnGraphNotSupportedError``.
     Returns:
         ``(o, final_state)`` with ``o`` shaped like ``v``, or
         ``(o, final_state, state_checkpoints)`` when ``checkpoint_every_n_tokens > 0``.
@@ -839,6 +874,7 @@ def kimi_delta_attention(
         a_log=a_log,
         dt_bias=dt_bias,
         checkpoint_every_n_tokens=int(checkpoint_every_n_tokens),
+        plan_name=plan_name,
     )
     if checkpoint_every_n_tokens > 0:
         return o, final_state, state_checkpoints
