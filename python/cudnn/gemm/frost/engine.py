@@ -32,12 +32,12 @@ class _FrostGemmPlan(CompiledPlan):
         # as ambiguous.
         self._tensors = list(compiled.binding.bound_tensors())
         self._operand_indices = None
-        # Which call path this plan uses is a property of the compiled kernel,
-        # so it is chosen here and not re-asked per execute. ``lowered`` is the
-        # closure the recipe is captured into when the kernel is a graph it
-        # serves; ``launch`` interprets the same recipe for everything else.
+        # The one launch path a dense or block-scale kernel has: the closure the
+        # recipe is captured into. A graph it cannot serve was declined at
+        # check_support, so there is nothing to fall back TO -- None here means
+        # MoE, which takes the variant-pack dict and its own workspace below.
         self._lowered = getattr(compiled, "lowered", None)
-        self._launch = self._lowered or getattr(compiled, "launch", None)
+        self._launch = self._lowered
 
     def get_workspace_size(self) -> int:
         return int(getattr(self._compiled, "workspace_bytes", 0) or 0)
@@ -65,8 +65,7 @@ class _FrostGemmPlan(CompiledPlan):
             # the buffers arrive in that order and the launcher indexes them.
             # Which AXIS ORDER each one arrived in is a per-call fact only the
             # pack knows, since a bare address wears the graph's layout. None
-            # means every operand here is the caller's own, which is what both
-            # launchers are written for.
+            # means every operand here is the caller's own.
             graph_order = None
             borrowed = variant_pack.graph_described
             if borrowed:

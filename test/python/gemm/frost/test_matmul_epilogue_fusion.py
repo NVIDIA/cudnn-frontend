@@ -2531,8 +2531,6 @@ _RED_CASES = {
     "avg_row": (cudnn.reduction_mode.AVG, (1, _PW_M, 1), lambda s: s.mean(dim=1, keepdim=True).view(1, _PW_M, 1), 0.0),
     "avg_col": (cudnn.reduction_mode.AVG, (1, 1, _PW_N), lambda s: s.mean(dim=0, keepdim=True).view(1, 1, _PW_N), 0.0),
     "norm1_row": (cudnn.reduction_mode.NORM1, (1, _PW_M, 1), lambda s: s.abs().sum(dim=1, keepdim=True).view(1, _PW_M, 1), 0.0),
-    "norm2_row": (cudnn.reduction_mode.NORM2, (1, _PW_M, 1), lambda s: s.pow(2).sum(dim=1, keepdim=True).sqrt().view(1, _PW_M, 1), 0.0),
-    "norm2_full": (cudnn.reduction_mode.NORM2, (1, 1, 1), lambda s: s.pow(2).sum().sqrt().view(1, 1, 1), 0.0),
     "mul_row": (cudnn.reduction_mode.MUL, (1, _PW_M, 1), lambda s: s.prod(dim=1, keepdim=True).view(1, _PW_M, 1), 1.0),
     "mul_no_zeros_row": (
         cudnn.reduction_mode.MUL_NO_ZEROS,
@@ -2585,3 +2583,31 @@ def test_reduction_mode_coverage(case):
     s = s.to(torch.bfloat16).float()
     ref = ref_fn(s.double()).float()
     torch.testing.assert_close(r, ref, atol=5e-2, rtol=2e-2)
+
+
+@requires_sm100
+def test_norm2_is_the_one_reduction_mode_this_engine_declines():
+    """It is the only mode that is not finished when the kernel is.
+
+    Its taps land through cross-CTA atomics, so the square root cannot go in the
+    epilogue -- it has to run after every CTA has contributed. That is a device
+    operation this engine does not own, and the version that borrowed the
+    caller's ``sqrt_()`` worked only while the caller passed a torch tensor.
+
+    Declining costs nothing reachable: the BACKEND refuses a norm2 reduction
+    descriptor while the graph is still being lowered, so no public
+    ``execute()`` ever gets a plan for one either (see
+    ``test_public_execute_flavors.py::test_norm2_reduction_is_refused_at_build``).
+    Recorded here because the mode is otherwise in every list of the reductions
+    the epilogue supports.
+    """
+    from cudnn.gemm.frost.compiler import probe_supported
+
+    g, C = _pw_matmul_graph()
+    src = g.swish(input=C, name="s")
+    src.set_data_type(cudnn.data_type.BFLOAT16).set_output(True)
+    red = g.reduction(input=src, mode=cudnn.reduction_mode.NORM2, name="red")
+    red.set_dim([1, _PW_M, 1]).set_stride([_PW_M, 1, 1])
+    red.set_output(True).set_data_type(cudnn.data_type.FLOAT)
+    with pytest.raises(NotImplementedError, match="square root"):
+        probe_supported(g)

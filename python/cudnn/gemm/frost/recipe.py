@@ -7,16 +7,21 @@ Operand roles, majors, packing factors, alignment requirements, output shape
 rules, which outputs are reductions and what order the kernel takes its
 parameters in are all fixed by the time cute hands back a launchable. A call
 carries M, N, K, the strides and the pointers, and nothing else. This module
-writes the first set down, so that neither of the two call paths re-derives them.
+writes the first set down, so that no call re-derives them.
 
-They read the same recipe but do not share a body: ``CompiledFusedGemm.launch``
-interprets it (through :func:`check_shapes` and :func:`check_alignment`) by
-walking the operand structure, and ``CompiledFusedGemm.lowered`` is the closure
-``_lower`` captures it into, where the same walk is a loop over tuples flat
-enough to need no attribute lookup. That is a compiler beside its interpreter,
-kept honest the way those always are -- ``test_execute_recipe.py`` runs both
-over the same accepts and rejects and requires the same answer. What it CANNOT
-catch is a misconception they share, which is how the axis-order bug survived it.
+One reading of it RUNS: ``CompiledFusedGemm.lowered``, the closure ``_lower``
+captures it into, where every check is a loop over tuples flat enough to need no
+attribute lookup. The other only EXPLAINS -- ``CompiledFusedGemm.explain``, which
+walks the operand structure through :func:`check_shapes` and
+:func:`check_alignment` to name what is wrong with a call the first one refused,
+and never launches anything. Two executors would have been two answers to what
+the graph computes, and a differential between them cannot catch a misconception
+they share, which is how the axis-order bug survived one.
+
+So the rules here are written twice and the launch is written once: the fast
+form pays per call and answers a bool, the readable form runs only on a call
+that has already failed. If they ever disagree, ``explain`` finds nothing and
+says so rather than returning quietly.
 
 The field that makes one loop serve six flavors is :attr:`GemmRecipe.arg_plan`:
 what differs between plain, aux, multi-output, multi-GEMM and block scale is
@@ -160,7 +165,6 @@ class Output:
     align: int
     raw: bool  # the kernel takes only its pointer
     init: Any = None  # reduction identity, seeded before the kernel runs
-    sqrt: bool = False  # norm2 takes a square root after
 
 
 @dataclass(frozen=True)
@@ -427,11 +431,10 @@ def build(compiled) -> GemmRecipe:
     aux_reqs = _aux_align_reqs(chain, vec_bytes=compiled.vec_bytes_epi)
     outputs, seeds = [], []
     for i, (spec, t) in enumerate(zip(chain.outputs, binding.outputs)):
-        init, sqrt = None, False
+        init = None
         if spec.is_reduction:
             red = chain.reductions[int(spec.source.rsplit("_", 1)[1])]
             init = REDUCTION_INIT_VALUE[red.compute_dtype][red.mode]
-            sqrt = red.mode == "norm2"
             seeds.append((order[id(t)], init_word(red.compute_dtype, init)))
         outputs.append(
             Output(
@@ -441,7 +444,6 @@ def build(compiled) -> GemmRecipe:
                 align=out_reqs[i],
                 raw=bool(spec.is_reduction or spec.is_quant_scale),
                 init=init,
-                sqrt=sqrt,
             )
         )
 

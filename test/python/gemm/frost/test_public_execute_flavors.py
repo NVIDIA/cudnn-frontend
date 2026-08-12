@@ -348,7 +348,9 @@ def test_bare_address_operands():
     The operand a bare address describes is the GRAPH's declaration, which
     orders a matmul's B ``[batch, K, N]`` where a caller allocates it
     ``(batch, N, K)``. Reading an extent by axis position answers one of those
-    and not the other, so the recipe records which axis carries M/N/K instead.
+    and not the other, so the recipe records which axis carries M/N/K instead --
+    and re-labelling one into the other is a permute, which is why this stays on
+    the fast path rather than costing an interpreted pass for being legal.
     """
     g = cudnn.pygraph(io_data_type=BF16, intermediate_data_type=F32, compute_data_type=F32)
     A = g.tensor(name="A", uid=1, dim=[1, M, K], stride=[M * K, K, 1])
@@ -361,6 +363,7 @@ def test_bare_address_operands():
     c = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
     _run(g, {1: a.data_ptr(), 2: b.data_ptr(), 3: c.data_ptr()})
     torch.testing.assert_close(c, ref.to(torch.bfloat16), atol=1e-1, rtol=1e-2)
+    assert dict(g._compiled_plans[g._plan_index]._compiled.deferrals) == {}
 
 
 @_GPU

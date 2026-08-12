@@ -1,19 +1,18 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The build-time recipe, and the closure lowered from it.
+"""The build-time recipe, and the one call path lowered from it.
 
-``_lower`` captures the recipe into a call path that loops over it flat;
-``launch`` interprets the same recipe by walking the operand structure. That is
-a compiler beside its interpreter, and the two can drift -- an earlier
-hand-written version of the emitted path lost the operand batch check and pinned
-an fp4 output at N instead of N/2, both of which made it accept or reject calls
-the general path did not.
+``_lower`` captures the recipe into the loop that launches; ``explain`` reads the
+same recipe to say what is wrong with a call that loop refused, and runs nothing.
+There is no second executor to differential against, and that is deliberate: two
+readings of one wrong plan agreeing proves nothing, which is exactly how the
+axis-order bug survived a differential that ran both.
 
-So the differentials below are the point of this file: every case and every
-flavor runs through BOTH entry points, and the two must return the same verdict
-and the same numbers. The rest asserts that the fast path is the one a public
-``execute()`` actually takes, and that what it declines is declined on purpose.
+What replaces it is the BACKEND -- the two tests below that run a shape on a
+cuDNN plan and a FROST plan and require the same numbers -- and the invariant
+that makes a rejection meaningful: the set of calls the launch path refuses must
+equal the set of illegal calls, asserted per flavor through ``deferrals``.
 """
 
 from __future__ import annotations
@@ -28,7 +27,8 @@ from gemm_test_utils import kw, requires_sm100, to_blocked
 import cudnn
 import cudnn.gemm.frost  # noqa: F401 — installs the cudnn.pygraph recorder hook
 from cudnn.engines import is_python_engine
-from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
+from cudnn.frost.buffers import collapse_layout, fill_word_strided_async, init_word
+from cudnn.gemm.frost.compiler import jit_from_cudnn_graph, probe_supported
 from cudnn.gemm.frost.graph_analyzer import resolve_variant_pack
 from cudnn.gemm.frost.recipe import _output_rule, expected_shape
 
@@ -77,6 +77,66 @@ def test_a_quant_scale_output_is_fixed_at_build():
     assert expected_shape(rule, 999, 999) == (1, 128, 4)
 
 
+# --- seeding a reduction output, which the engine owns ----------------------
+
+
+@pytest.mark.parametrize(
+    "shape,stride,want",
+    [
+        ((1, 8, 4), (32, 4, 1), [(32, 1)]),  # dense whatever rank it was declared at
+        ((1, 8, 1), (32, 4, 1), [(8, 4)]),  # a per-row scalar: one strided run
+        ((2, 8, 4), (64, 8, 1), [(16, 8), (4, 1)]),  # padded rows: batch merges into the row count
+        ((1, 1, 1), (1, 1, 1), []),  # one element
+    ],
+)
+def test_a_layout_collapses_to_the_runs_a_memset_can_cover(shape, stride, want):
+    """Unit axes carry no elements and adjacent dense axes are one run.
+
+    Collapsing first is what keeps the seed below to a single memset for a
+    contiguous tap and one per batch for a padded one, rather than one per row.
+    """
+    assert collapse_layout(shape, stride) == want
+
+
+@requires_sm100
+@pytest.mark.parametrize("shape,stride", [((1, 8, 1), (32, 4, 1)), ((2, 8, 4), (64, 8, 1)), ((3, 5, 1), (7, 1, 1))])
+def test_a_strided_seed_writes_its_own_elements_and_no_others(shape, stride):
+    """The engine seeds a padded output itself, without the caller's ``fill_()``.
+
+    Borrowing that method worked only while the buffer happened to be a torch
+    tensor -- and queued on torch's stream, not the kernel's. What it has to get
+    right is exactly this: every element the view covers, and nothing between
+    them.
+    """
+    span = 1 + sum((d - 1) * s for d, s in zip(shape, stride))
+    flat = torch.zeros(span, dtype=torch.float32, device="cuda")
+    view = torch.as_strided(flat, shape, stride)
+    fill_word_strided_async(flat.data_ptr(), shape, stride, 4, init_word("fp32", 3.5), None)
+    torch.cuda.synchronize()
+
+    expected = torch.zeros(span, dtype=torch.float32, device="cuda")
+    torch.as_strided(expected, shape, stride).fill_(3.5)
+    assert torch.equal(flat, expected)
+    assert torch.equal(view, torch.full(shape, 3.5, device="cuda"))
+
+
+@pytest.mark.parametrize(
+    "shape,stride,why",
+    [
+        ((1, 8, 1), (0, 0, 1), "alias"),  # stride 0 over a real extent
+        ((1, 4, 4), (16, 2, 1), "overlap"),  # rows closer together than they are wide
+    ],
+)
+def test_a_reduction_output_that_writes_a_byte_twice_is_rejected(shape, stride, why):
+    """Two elements at one address is a write race, not a layout to support.
+
+    Named here rather than left to the driver, which reports the second as a
+    pitch smaller than the width and says nothing about whose buffer it was.
+    """
+    with pytest.raises(ValueError, match=why):
+        fill_word_strided_async(0, shape, stride, 4, 0, None)
+
+
 # --- which flavors lower, and which decline ---------------------------------
 
 
@@ -94,6 +154,15 @@ def _reduction_graph():
     Y = [t for t in g._nodes[-1].outputs.values()][0]
     R = g.reduction(input=Y, mode=cudnn.reduction_mode.ADD, name="red")
     R.set_dim([1, 1, 1]).set_stride([1, 1, 1]).set_output(True).set_data_type(F32)
+    return g
+
+
+def _row_reduction_graph(pad=4):
+    """A per-row tap, declared into a padded buffer when ``pad`` > 1."""
+    g = _plain_graph()
+    Y = [t for t in g._nodes[-1].outputs.values()][0]
+    R = g.reduction(input=Y, mode=cudnn.reduction_mode.ADD, name="red")
+    R.set_dim([1, M, 1]).set_stride([M * pad, pad, 1]).set_output(True).set_data_type(F32)
     return g
 
 
@@ -166,21 +235,49 @@ def test_which_flavors_lower(build, n_b, n_out, n_aux):
 
 @requires_sm100
 @pytest.mark.parametrize("build,n_b,n_out,n_aux", _FLAVORS, ids=_FLAVOR_IDS)
-def test_a_legal_call_defers_to_the_interpreter_for_nothing(build, n_b, n_out, n_aux):
-    """The interpreter is migration scaffolding, so that has to be measurable.
+def test_a_legal_call_of_every_flavor_is_refused_for_nothing(build, n_b, n_out, n_aux):
+    """The invariant, per flavor: refusing a legal call is a bug, not a detour.
 
-    Every reason the fast path can hand a call over is counted, and a legal call
-    of every flavor must trigger none of them -- otherwise "the fallback only
-    catches what the fast path declines" is a claim with nothing behind it, and
-    the day it is deleted is the day the regression appears.
+    While there was an interpreter behind it, a fast path that gave up on a
+    legal call cost time and nothing else, so nothing asserted it did not. This
+    is what that assertion looks like: every reason the launch path can refuse
+    is counted, and a legal call of every flavor must trigger none of them.
     """
     compiled = jit_from_cudnn_graph(build())
     if compiled.lowered is None:
         pytest.skip(f"this build does not lower: {compiled.declined}")
     operands = _buffers_for(compiled)
+    for o in compiled.recipe.outputs:
+        operands[o.index].zero_()
+    compiled.lowered(operands, stream=None)
+    torch.cuda.synchronize()
+    assert operands[compiled.recipe.outputs[0].index].abs().sum() > 0
+    assert dict(compiled.deferrals) == {}
+
+
+@requires_sm100
+def test_a_padded_reduction_output_stays_on_the_fast_path():
+    """A tap declared into a padded buffer is a legal call, not a slow one.
+
+    The fast path could seed exactly one dense run, so it handed a padded tap
+    to the interpreter -- which seeded it by calling ``fill_()`` on whatever the
+    caller passed. Both are gone: the seed is the driver's 2D memset, and it
+    must touch every element the view covers and nothing between them.
+    """
+    compiled = jit_from_cudnn_graph(_row_reduction_graph())
+    if compiled.lowered is None:
+        pytest.skip(f"this build does not lower: {compiled.declined}")
+    operands = _buffers_for(compiled)
+    tap = [o for o in compiled.recipe.outputs if o.init is not None][0]
+    pad = torch.full((1, M, 4), -1.0, dtype=torch.float32, device="cuda")
+    operands[tap.index] = pad[:, :, :1]
+
     compiled.lowered(operands, stream=None)
     torch.cuda.synchronize()
     assert dict(compiled.deferrals) == {}
+    a, b = (operands[op.index] for op in compiled.recipe.inputs)
+    torch.testing.assert_close(pad[:, :, 0], torch.einsum("bmk,bnk->bm", a.float(), b.float()), atol=1.0, rtol=2e-2)
+    assert torch.equal(pad[:, :, 1:], torch.full((1, M, 3), -1.0, device="cuda"))
 
 
 @requires_sm100
@@ -195,30 +292,66 @@ def test_every_decline_names_its_reason():
 
 @requires_sm100
 def test_a_deferral_is_counted_under_the_rule_that_caused_it():
-    """A bare address is the one deferral a legal call still takes."""
+    """Only an ILLEGAL call leaves the fast path, and it says which rule sent it."""
     compiled = jit_from_cudnn_graph(_plain_graph())
     if compiled.lowered is None:
         pytest.skip("this build does not lower")
-    a, b, c = _operands()
+    a, b, c = _wrong_major()
     operands = _bound_buffers(compiled, a, b, c)
-    compiled.lowered(operands, (True, False, False), stream=None)
-    torch.cuda.synchronize()
-    assert dict(compiled.deferrals) == {"graph-described operand": 1}
+    with pytest.raises(ValueError):
+        compiled.lowered(operands, stream=None)
+    assert dict(compiled.deferrals) == {"input layout": 1}
 
 
 @requires_sm100
-def test_a_post_kernel_finalize_is_declined():
+@pytest.mark.parametrize("build,n_b,n_out,n_aux", _FLAVORS, ids=_FLAVOR_IDS)
+def test_an_operand_in_the_graph_s_axis_order_stays_on_the_fast_path(build, n_b, n_out, n_aux):
+    """A bare device address wears the graph's layout, and that is legal.
+
+    cuDNN declares a matmul's B ``[batch, K, N]`` where this kernel reads
+    ``(batch, N, K)``, so an operand the pack described FROM the graph -- a bare
+    address has no geometry of its own -- arrives with its axes the other way
+    round. Re-labelling one is a permute the recipe already knows the shape of,
+    so it is not a reason to leave the fast path; it used to be, and a legal
+    call paid a whole interpreted pass for it.
+    """
+    compiled = jit_from_cudnn_graph(build())
+    if compiled.lowered is None:
+        pytest.skip(f"this build does not lower: {compiled.declined}")
+    operands = _buffers_for(compiled)
+    outs = compiled.recipe.outputs
+    borrowed = tuple(True for _ in operands)
+
+    runs = []
+    for order in (None, borrowed):
+        for o in outs:
+            operands[o.index].zero_()
+        # Same buffers either way: what changes is which axis order they claim,
+        # and the graph's is the one the declaration already describes them in.
+        compiled.lowered(_as_declared(compiled, operands) if order else operands, order, stream=None)
+        torch.cuda.synchronize()
+        runs.append([operands[o.index].clone() for o in outs])
+    assert dict(compiled.deferrals) == {}
+    for o, own, graph in zip(outs, *runs):
+        exact = o.init is None
+        torch.testing.assert_close(own, graph, atol=0 if exact else 1e-2, rtol=0 if exact else 1e-5)
+
+
+@requires_sm100
+def test_a_post_kernel_finalize_is_refused_before_a_plan_exists():
     """``norm2`` takes a square root through the caller's buffer after the kernel.
 
-    The backend refuses that reduction while the graph is being lowered, so it
-    never reaches a plan -- but the recipe records ``sqrt`` and the lowered path
-    declines on it, because the alternative is a device operation the engine
-    does not own and would have to borrow off whatever the caller passed.
+    That is a device operation this engine does not own, and it has one call
+    path -- so the GRAPH is declined and goes to the backend, rather than being
+    compiled into a kernel only a second executor could run. Which executor a
+    graph needs is not a question this engine wants to be able to ask.
     """
-    compiled = jit_from_cudnn_graph(_plain_graph())
-    assert compiled.lowered is not None
-    compiled.recipe = replace(compiled.recipe, outputs=(replace(compiled.recipe.outputs[0], sqrt=True),))
-    assert compiled._lower() is None
+    g = _plain_graph()
+    Y = [t for t in g._nodes[-1].outputs.values()][0]
+    R = g.reduction(input=Y, mode=cudnn.reduction_mode.NORM2, name="red")
+    R.set_dim([1, 1, 1]).set_stride([1, 1, 1]).set_output(True).set_data_type(F32)
+    with pytest.raises(NotImplementedError, match="square root"):
+        probe_supported(g)
 
 
 @requires_sm100
@@ -282,39 +415,19 @@ def _buffers_for(compiled):
     return bufs
 
 
-@requires_sm100
-@pytest.mark.parametrize("build,n_b,n_out,n_aux", _FLAVORS, ids=_FLAVOR_IDS)
-def test_every_flavor_agrees_with_the_interpreter(build, n_b, n_out, n_aux):
-    """One loop serves six flavors, so one of them drifting is the failure mode.
+def _as_declared(compiled, operands):
+    """The same memory, each input re-labelled the way the graph declares it.
 
-    The interpreter is the reference: it reads the same recipe but assembles the
-    launch by walking the operand structure, which is the thing the lowered path
-    replaced with a table. Bit-exact is the bar -- the two issue the same kernel
-    with the same arguments or they do not agree.
-
-    Except for a reduction output, which is not bit-reproducible against ITSELF:
-    the taps land through cross-CTA float atomics, so the order varies with
-    scheduling. Measured on this shape, the same path run six times spreads
-    0.0049 while the two paths differ by 0.00024 -- twenty times smaller than
-    the noise, so the tolerance below is the noise floor and not a slackened bar.
+    What the pack hands over for a bare address: with no geometry of its own,
+    the declaration IS the description, so B arrives ``[batch, K, N]``.
     """
-    compiled = jit_from_cudnn_graph(build())
-    if compiled.lowered is None:
-        pytest.skip("this build does not lower (no tvm-ffi front door)")
-    operands = _buffers_for(compiled)
-    outs = compiled.recipe.outputs
-
-    runs = []
-    for run in (compiled.lowered, compiled.launch):
-        for o in outs:
-            operands[o.index].zero_()
-        run(operands, stream=None)
-        torch.cuda.synchronize()
-        runs.append([operands[o.index].clone() for o in outs])
-    for o, fast, slow in zip(outs, *runs):
-        exact = o.init is None
-        torch.testing.assert_close(fast, slow, atol=0 if exact else 1e-2, rtol=0 if exact else 1e-5)
-    assert runs[0][0].abs().sum() > 0  # a path that wrote nothing would also "agree"
+    out = list(operands)
+    for op in compiled.recipe.inputs:
+        inverse = [0, 0, 0]
+        for role, axis in enumerate(op.declared):
+            inverse[axis] = role
+        out[op.index] = operands[op.index].permute(*inverse)
+    return out
 
 
 def _verdict(run, operands, c):
@@ -374,29 +487,43 @@ def _padded_rows():
 
 @requires_sm100
 @pytest.mark.parametrize(
-    "case",
-    (_good, _short_k, _wrong_major, _wrong_output_shape, _misaligned_output, _misaligned_a, _padded_rows),
-    ids=lambda f: f.__name__.strip("_"),
+    "case,verdict",
+    (
+        (_good, "ran"),
+        (_padded_rows, "ran"),  # the outer stride is free
+        (_short_k, "rejected"),
+        (_wrong_major, "rejected"),
+        (_wrong_output_shape, "rejected"),
+        (_misaligned_output, "rejected"),
+        (_misaligned_a, "rejected"),
+    ),
+    ids=lambda x: x if isinstance(x, str) else x.__name__.strip("_"),
 )
-def test_lowered_and_interpreted_agree(case):
-    """Same operands, both entry points, one verdict.
+def test_the_launch_path_accepts_exactly_the_legal_calls(case, verdict):
+    """The invariant the second executor used to make untestable.
 
-    An unsound fast path shows up here as an accept where the general path
-    rejects -- which is exactly how the two regressions this replaced would have
-    read.
+    While ``lowered`` could hand anything it was unsure of to an interpreter
+    that ran it anyway, "the fast path rejects a legal call" was a performance
+    bug at worst and nothing asserted otherwise. There is one path now, so a
+    rejection IS the answer -- which makes the two directions both real
+    failures: refusing a legal call breaks it, and accepting an illegal one runs
+    a kernel over memory the caller did not describe.
+
+    ``deferrals`` is what pins that down. Empty means every rule passed; a
+    rejection must name the rule that caused it, and a rejection with nothing
+    named is drift between the guards and the diagnostics, which ``explain``
+    raises on separately.
     """
     compiled = jit_from_cudnn_graph(_plain_graph())
     if compiled.lowered is None:
-        pytest.skip("this build does not lower (no tvm-ffi front door)")
+        pytest.skip(f"this build does not lower: {compiled.declined}")
 
     a, b, c = case()
-    fast, fast_out = _verdict(compiled.lowered, _bound_buffers(compiled, a, b, c), c)
-    slow, slow_out = _verdict(compiled.launch, _bound_buffers(compiled, a, b, c), c)
-    assert fast == slow, f"lowered says {fast}, interpreted says {slow}"
-    if fast == "ran":
-        torch.testing.assert_close(fast_out, slow_out, atol=0, rtol=0)
-        ref = torch.einsum("bmk,bnk->bmn", a.float(), b.float())
-        torch.testing.assert_close(fast_out.float(), ref, atol=2e-1, rtol=2e-2)
+    got, out = _verdict(compiled.lowered, _bound_buffers(compiled, a, b, c), c)
+    assert got == verdict
+    assert bool(compiled.deferrals) == (verdict == "rejected")
+    if verdict == "ran":
+        torch.testing.assert_close(out.float(), torch.einsum("bmk,bnk->bmn", a.float(), b.float()), atol=2e-1, rtol=2e-2)
 
 
 def _matmul_on(batch, m, n, k, want_frost, a, b, c):
@@ -460,14 +587,16 @@ def _nvfp4_buffers(compiled):
 
 @requires_sm100
 @pytest.mark.parametrize("gemms", (1, 2), ids=("single", "multi"))
-def test_block_scale_lowers_and_agrees_with_the_interpreter(gemms):
+def test_block_scale_lowers_and_runs(gemms):
     """Block scale is the flavor with the most per-call table in it.
 
     Its scale factors ride in the launch argument list but NOT in
     ``problem_size``, its blob size is re-synthesized from M/N/K rather than read
     off the buffer, and the multi-GEMM form sends one A stride triple for every
-    operand instead of one each. Four recipe fields, so it is the one most worth
-    running against the interpreter.
+    operand instead of one each. Four recipe fields, so it is the flavor most
+    likely to reach the launch with an argument list that does not match the
+    kernel's signature -- which is what running it here catches. What the
+    numbers should BE is checked against torch through the public entry point.
     """
     # Two GEMMs do not fit the auto-selected cta_n=256 in TMEM, so pin a
     # geometry that does; which config the engine picks for one GEMM is the
@@ -480,14 +609,10 @@ def test_block_scale_lowers_and_agrees_with_the_interpreter(gemms):
     assert bool(compiled.recipe.shared_layout) == (gemms > 1)
 
     operands, out = _nvfp4_buffers(compiled)
-    runs = []
-    for run in (compiled.lowered, compiled.launch):
-        out.zero_()
-        run(operands, stream=None)
-        torch.cuda.synchronize()
-        runs.append(out.clone())
-    torch.testing.assert_close(runs[0], runs[1], atol=0, rtol=0)
-    assert runs[0].abs().sum() > 0
+    compiled.lowered(operands, stream=None)
+    torch.cuda.synchronize()
+    assert dict(compiled.deferrals) == {}
+    assert out.abs().sum() > 0
 
 
 @requires_sm100
@@ -617,10 +742,9 @@ def test_operand_batch_is_checked():
     """The graph pins each operand's batch, and a launch that ignored it read
     one batch of A against three of B."""
     compiled = jit_from_cudnn_graph(_plain_graph(batch=2))
+    if compiled.lowered is None:
+        pytest.skip(f"this build does not lower: {compiled.declined}")
     a, b, c = _operands(batch=2)
     one_batch_b = b[:1].contiguous()
-    for run in (compiled.lowered, compiled.launch):
-        if run is None:
-            continue
-        with pytest.raises(ValueError):
-            run(_bound_buffers(compiled, a, one_batch_b, c), stream=None)
+    with pytest.raises(ValueError):
+        compiled.lowered(_bound_buffers(compiled, a, one_batch_b, c), stream=None)
