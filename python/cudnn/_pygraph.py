@@ -1882,10 +1882,19 @@ class pygraph:
         # caller's mistake. A python-only graph's layout is every wired port,
         # including optional ones, where a hole means "not requested".
         strict = self._lowered_graph is not None
+        from_graph = []
         for i in unread:
             data = uid_to_data.get(order[i])
             if data is None:
                 continue  # named below if this graph requires it
+            if type(data) is int:
+                # A bare address has no geometry of its own, so _describe lends
+                # it the graph's -- including the graph's AXIS ORDER, which for
+                # a matmul's B is [batch, K, N] where a caller allocates
+                # (batch, N, K). Nothing in the resulting description says which
+                # of the two it is (at N == K the two are bit-identical), so the
+                # slot that borrowed one is named here.
+                from_graph.append(i)
             ptr, tensor = self._describe(data, order[i])
             native.set_slot(i, ptr, tuple(tensor.dim), tuple(tensor.stride), *_dlpack_code_bits(tensor.data_type))
         if strict:
@@ -1924,7 +1933,7 @@ class pygraph:
                 workspace_bytes = _byte_size(workspace_tensor)
             else:
                 workspace_ptr, workspace_bytes = extent
-        return VariantPack(tuple(order), native, workspace_ptr, workspace_bytes)
+        return VariantPack(tuple(order), native, workspace_ptr, workspace_bytes, tuple(from_graph))
 
     def _describe(self, data: Any, uid: int):
         """``(pointer, Tensor)`` for one caller buffer.

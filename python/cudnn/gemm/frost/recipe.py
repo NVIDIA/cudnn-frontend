@@ -27,12 +27,19 @@ from .fusion_ir import FusionChain
 # An operand's three axes, named by role rather than by position.
 AX_BATCH, AX_MN, AX_K = 0, 1, 2
 
-# cuDNN's matmul ABI declares A as [b, m, k] and B as [b, k, n], while a caller
-# allocates B the way the kernel reads it -- (b, n, k). Both describe the same
-# memory, so an operand arrives in one of exactly two axis orders and its
-# strides alone do not say which: a graph-order K-major B and a caller-order
-# N-major B carry stride 1 on the same axis. Its SHAPE does say, since only a
-# buffer described from the graph's own declaration carries the declared dims.
+# cuDNN's matmul ABI declares A as [b, m, k] and B as [b, k, n]; this engine's
+# own direct-call API takes B the way the kernel reads it, (b, n, k). Both
+# describe the same memory, so an operand arrives in one of two axis orders and
+# the description alone cannot always say which -- at N == K the two are
+# identical tuples.
+#
+# The tie-break is the backend's own rule: a graph's tensor descriptor DEFINES
+# the tensor and the variant pack supplies only a pointer. So a buffer whose
+# (shape, stride) is the declaration is read as the declaration, which is what
+# the backend computes from it (measured: a matmul whose B matches the declared
+# [b, K, N] agrees with the backend to bf16 tolerance, and differs from the
+# (b, N, K) reading by 65). Anything else is the caller's own labelling of the
+# same memory, which is the direct-call order.
 _DECLARED_AXES = {"a": (0, 1, 2), "b": (0, 2, 1)}
 KERNEL_AXES = (0, 1, 2)
 
@@ -117,17 +124,23 @@ class Operand:
     pack: int  # ... and multiplying by this recovers the logical extent
     contiguous_role: int  # AX_K for a k-major operand, else AX_MN
     declared: tuple  # (batch, mn, k) axis positions, graph order
-    declared_dim: tuple  # the extents that order comes with
+    declared_layout: tuple  # the (dim, stride) that order comes with
     dc: int  # where stride 1 lands in the graph's order
     kc: int  # ... and in the caller's
 
-    def axes(self, shape, stride) -> "tuple | None":
-        """Which axis holds which role, or None if neither order fits."""
-        if stride[self.kc] == 1:
-            return KERNEL_AXES
-        if stride[self.dc] == 1 and tuple(shape) == self.declared_dim:
-            return self.declared
-        return None
+    def axes(self, shape, stride, graph_order: bool) -> "tuple | None":
+        """Which axis holds which role, or None when the layout is not the major.
+
+        ``graph_order`` says the pack described this slot FROM the graph (a bare
+        address has no geometry of its own), so it is the declaration by
+        construction. A buffer that reports the declaration is read as the
+        declaration too -- that is what the backend computes from it, and a
+        caller must not get a different answer for having landed on a python
+        plan. Everything else is the caller's own labelling of the same memory.
+        """
+        if graph_order or (tuple(shape), tuple(stride)) == self.declared_layout:
+            return self.declared if stride[self.dc] == 1 else None
+        return KERNEL_AXES if stride[self.kc] == 1 else None
 
 
 @dataclass(frozen=True)
@@ -179,21 +192,24 @@ class GemmRecipe:
     def b(self) -> Operand:
         return self.inputs[self.b_at]
 
-    def problem(self, views) -> tuple:
+    def problem(self, views, graph_order=None) -> tuple:
         """``((M, N, K), axes-per-input)``, located rather than assumed.
 
         Reading M off axis 1 assumes the caller laid the buffer out the way the
         kernel reads it, which a bare device address does not: the pack
         describes that one from the graph's declaration, which orders B the
-        other way round.
+        other way round. ``graph_order`` is the pack's per-view answer to which
+        it was, or None when every operand is the caller's own.
         """
         axes, bad = [], []
         for op in self.inputs:
             v = views[op.view]
-            ax = op.axes(v.shape, v.stride())
+            borrowed = bool(graph_order and graph_order[op.view])
+            ax = op.axes(v.shape, v.stride(), borrowed)
             if ax is None:
+                want = op.dc if borrowed else op.kc
                 bad.append(
-                    f"{op.role}: graph declares {op.major}-major (dim {op.kc} contiguous) but the buffer has shape={tuple(v.shape)}, stride={tuple(v.stride())}"
+                    f"{op.role}: graph declares {op.major}-major (dim {want} contiguous) but the buffer has shape={tuple(v.shape)}, stride={tuple(v.stride())}"
                 )
                 ax = KERNEL_AXES
             axes.append(ax)
@@ -317,17 +333,16 @@ def gate(recipe: GemmRecipe, views, mnk, axes) -> None:
             raise ValueError(reason)
 
 
-def _declared_dim(tensor) -> tuple:
-    """The dims the graph declared, or ``()`` when the tensor cannot say.
+def _declared_layout(tensor) -> tuple:
+    """The ``(dim, stride)`` the graph declared, or ``((), ())`` when it cannot say.
 
-    An empty tuple never matches a runtime shape, so an operand that cannot
-    report its declaration is simply read in the caller's order -- which is
-    what every path did before this table existed.
+    An empty pair never equals a runtime description, so an operand whose
+    declaration is unreadable is simply read in the direct-call order.
     """
     try:
-        return tuple(int(d) for d in tensor.get_dim())
-    except Exception:  # noqa: BLE001 — an analyzer-synthesized ref has no dims
-        return ()
+        return tuple(int(d) for d in tensor.get_dim()), tuple(int(s) for s in tensor.get_stride())
+    except Exception:  # noqa: BLE001 -- an analyzer-synthesized ref has no dims
+        return (), ()
 
 
 def _operand(view: int, role: str, tensor, *, major: str, dtype: str, batch: int, is_b: bool) -> Operand:
@@ -344,8 +359,8 @@ def _operand(view: int, role: str, tensor, *, major: str, dtype: str, batch: int
         modulus=modulus,
         pack=pack,
         contiguous_role=contiguous,
+        declared_layout=_declared_layout(tensor),
         declared=declared,
-        declared_dim=_declared_dim(tensor),
         dc=declared[contiguous],
         kc=KERNEL_AXES[contiguous],
     )

@@ -234,17 +234,88 @@ def test_lowered_and_interpreted_agree(case):
 
 
 @requires_sm100
-def test_a_graph_order_operand_falls_back_and_still_runs():
-    """A bare device address is described from the graph, which orders B
-    ``[batch, K, N]``. The emitted line only serves the caller's order, so it
-    hands this one over rather than reading the wrong axis."""
-    compiled = jit_from_cudnn_graph(_plain_graph())
-    a, b, c = _operands()
-    graph_order_b = b.transpose(1, 2)  # (1, K, N) over the same memory
-    views = _views(compiled, a, graph_order_b, c)
-    compiled.run_views(views, stream=None)
+def test_an_operand_reporting_the_declaration_agrees_with_the_backend(monkeypatch):
+    """At N == K the two axis orders are the SAME shape and the SAME stride.
+
+    The graph declares B ``[batch, K, N]`` k-major, stride ``[K*N, 1, K]``; this
+    engine's direct-call API takes ``(batch, N, K)``, stride ``(K*N, 1, N)``.
+    Identical tuples when N == K, so the description cannot say which the caller
+    meant -- and the backend does not ask, it computes from the descriptor. A
+    python plan has to reach the same answer, because the caller does not choose
+    which plan the heuristics land on.
+    """
+    monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
+    torch.manual_seed(0)
+    d = 128
+    a = torch.randn(1, d, d, dtype=torch.bfloat16, device="cuda")
+    b = torch.randn(1, d, d, dtype=torch.bfloat16, device="cuda").transpose(1, 2)
+    assert (tuple(b.shape), tuple(b.stride())) == ((1, d, d), (d * d, 1, d))  # == the declaration
+
+    out = {}
+    for want_frost in (False, True):
+        g = cudnn.pygraph(io_data_type=BF16, intermediate_data_type=F32, compute_data_type=F32)
+        A = g.tensor(name="A", dim=[1, d, d], stride=[d * d, d, 1])
+        B = g.tensor(name="B", dim=[1, d, d], stride=[d * d, 1, d])
+        C = g.matmul(A=A, B=B, name="mm")
+        C.set_output(True).set_data_type(BF16)
+        g.validate()
+        g.build_operation_graph()
+        g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+        hits = [i for i, p in enumerate(g.plans) if is_python_engine(p.engine_id) == want_frost]
+        if not hits:
+            pytest.skip("no plan of the requested kind for this graph")
+        g.select_plan(hits[0])
+        g.check_support()
+        g.build_plans()
+        c = torch.zeros(1, d, d, dtype=torch.bfloat16, device="cuda")
+        ws = torch.empty(max(g.get_workspace_size(), 1), dtype=torch.uint8, device="cuda")
+        g.execute({A: a, B: b, C: c}, ws)
+        torch.cuda.synchronize()
+        out[want_frost] = c
+    torch.testing.assert_close(out[True].float(), out[False].float(), atol=2e-1, rtol=2e-2)
+
+
+@requires_sm100
+@pytest.mark.parametrize("n,k", ((256, 128), (128, 128)), ids=("n!=k", "n==k"))
+def test_bare_addresses_run_at_a_smaller_live_shape(n, k):
+    """A bare address wears the graph's layout AND the graph's allocation size.
+
+    ``override_shapes`` then says the call runs a smaller problem inside it, so
+    the live shape matches neither the declaration nor a caller's buffer. The
+    backend takes this; a python plan that inferred the axis order from the
+    shape refused it.
+    """
+    MB, NB, KB = 256, n, 128
+    m, live_k = 128, k // 2
+    g = cudnn.pygraph(io_data_type=BF16, intermediate_data_type=F32, compute_data_type=F32)
+    A = g.tensor(name="A", uid=1, dim=[1, MB, KB], stride=[MB * KB, KB, 1])
+    B = g.tensor(name="B", uid=2, dim=[1, KB, NB], stride=[KB * NB, 1, KB])
+    C = g.matmul(A=A, B=B, name="mm")
+    C.set_output(True).set_data_type(BF16).set_uid(3)
+    g.validate()
+    g.build_operation_graph()
+    g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    frost = [i for i, p in enumerate(g.plans) if is_python_engine(p.engine_id)]
+    if not frost:
+        pytest.skip("no FROST plan for this graph")
+    g.select_plan(frost[0])
+    g.check_support()
+    g.build_plans()
+
+    a = torch.randn(1, MB, KB, dtype=torch.bfloat16, device="cuda")
+    b = torch.randn(1, NB, KB, dtype=torch.bfloat16, device="cuda")
+    c = torch.zeros(1, MB, NB, dtype=torch.bfloat16, device="cuda")
+    ws = torch.empty(max(g.get_workspace_size(), 1), dtype=torch.uint8, device="cuda")
+    g.execute(
+        {1: a.data_ptr(), 2: b.data_ptr(), 3: c.data_ptr()},
+        ws,
+        override_uids=[1, 2, 3],
+        override_shapes=[[1, m, live_k], [1, live_k, NB], [1, m, NB]],
+        override_strides=[[MB * KB, KB, 1], [KB * NB, 1, KB], [MB * NB, NB, 1]],
+    )
     torch.cuda.synchronize()
-    torch.testing.assert_close(c.float(), torch.einsum("bmk,bnk->bmn", a.float(), b.float()), atol=2e-1, rtol=2e-2)
+    ref = torch.einsum("bmk,bnk->bmn", a[:, :m, :live_k].float(), b[:, :, :live_k].float())
+    torch.testing.assert_close(c[:, :m].float(), ref, atol=2e-1, rtol=2e-2)
 
 
 @requires_sm100

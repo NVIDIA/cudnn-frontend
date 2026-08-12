@@ -1921,6 +1921,14 @@ class CompiledFusedGemm:
             return None
 
         a, b = r.a, r.b
+        # A buffer reporting the declaration is read in the graph's axis order,
+        # which this body does not serve. The stride guard below tells that
+        # apart -- unless the declaration itself would satisfy the guard, which
+        # only a unit extent can arrange, and which is settled here not per call.
+        for op in (a, b):
+            declared_stride = op.declared_layout[1]
+            if op.dc != op.kc and declared_stride and declared_stride[op.kc] == 1:
+                return None
         ai, bi, ci = a.view, b.view, out.view
         # kc is both the axis whose stride must be 1 and the axis whose extent
         # enters the TMA rule -- they are the same axis by definition of major.
@@ -1936,8 +1944,12 @@ class CompiledFusedGemm:
         launchable = self._launchable
         general = self.run_views
 
-        def launch(views, stream=None):
+        def launch(views, graph_order=None, stream=None):
             _check_plan_device(device)
+            if graph_order:
+                # An operand described from the graph is in the graph's axis
+                # order; this body reads the caller's.
+                return general(views, graph_order, stream=stream)
             av, bv, cv = views[ai], views[bi], views[ci]
             a_sh, b_sh, c_sh = av.shape, bv.shape, cv.shape
             if len(a_sh) != 3 or len(b_sh) != 3 or len(c_sh) != 3:
@@ -1983,17 +1995,20 @@ class CompiledFusedGemm:
 
         return launch
 
-    def run_views(self, views, stream=None):
+    def run_views(self, views, graph_order=None, stream=None):
         """Launch over the operand buffers, in bound-tensor order.
 
         Which bound tensor holds which operand is fixed when the plan compiles,
         so a caller that knows it -- the engine, which binds the graph's slots
         once -- indexes rather than resolves, and the gate below reads a table
         built at that same moment instead of rebuilding one per call.
+
+        ``graph_order`` is the pack's per-view "this operand's layout is the
+        graph's, not the caller's", or None when they are all the caller's.
         """
         _check_plan_device(self.device)
         recipe = self.recipe
-        mnk, axes = recipe.problem(views)
+        mnk, axes = recipe.problem(views, graph_order)
         gate_recipe(recipe, views, mnk, axes)
 
         out_bufs = [views[o.view] for o in recipe.outputs]

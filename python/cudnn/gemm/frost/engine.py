@@ -63,7 +63,16 @@ class _FrostGemmPlan(CompiledPlan):
         if run_views is not None:
             # Which bound tensor holds which operand was settled at build, so
             # the buffers arrive in that order and the launcher indexes them.
-            run_views(views, stream=ctx.stream)
+            # Which AXIS ORDER each one arrived in is a per-call fact only the
+            # pack knows, since a bare address wears the graph's layout. None
+            # means every operand here is the caller's own, which is what both
+            # launchers are written for.
+            graph_order = None
+            borrowed = variant_pack.graph_described
+            if borrowed:
+                flags = tuple(s in borrowed for s in slots)
+                graph_order = flags if any(flags) else None
+            run_views(views, graph_order, stream=ctx.stream)
         else:
             self._compiled(dict(zip(self._tensors, views)), stream=ctx.stream)
 
