@@ -893,6 +893,7 @@ def _mk_bwd_graph(
     grad_strides: tuple | None = None,
     bias: bool = False,
     dbias: bool = False,
+    seq_lens: str | None = None,  # "kv" / "both" (padding mask) or "q_only"
     **bwd_kwargs,
 ):
     g = _mk_graph()
@@ -921,6 +922,12 @@ def _mk_bwd_graph(
     if dbias:
         dbias_t = g.tensor(dim=(1, H, s_q, s_kv), stride=(H * s_q * s_kv, s_q * s_kv, s_kv, 1), data_type=DTYPE, name="dBias")
         bwd_kwargs.update(dBias=dbias_t)
+    if seq_lens in ("kv", "both"):
+        seq_kv_t = g.tensor(dim=(B, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT32, name="seq_kv")
+        bwd_kwargs.update(use_padding_mask=True, seq_len_kv=seq_kv_t)
+    if seq_lens in ("both", "q_only"):
+        seq_q_t = g.tensor(dim=(B, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT32, name="seq_q")
+        bwd_kwargs.update(seq_len_q=seq_q_t)
     dq, dk, dv = g.sdpa_backward(name="sb", q=q, k=k, v=v, o=o, dO=do, stats=stats, attn_scale=0.125, **bwd_kwargs)
     _finish_output(dq, q_dims, grad_strides or _bshd_strides(H, s_q, d))
     _finish_output(dk, (B, h_kv, s_kv, d), grad_strides or _bshd_strides(h_kv, s_kv, d))
@@ -1015,6 +1022,21 @@ def test_bwd_probe_accepts_deterministic(monkeypatch):
     # use_deterministic_algorithm is served by the ordered-relay dQ path.
     monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
     assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(use_deterministic_algorithm=True))
+
+
+def test_bwd_probe_accepts_padding_mask(monkeypatch):
+    monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
+    assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(seq_lens="kv"))
+    assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(seq_lens="both"))
+    assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(seq_lens="both", use_causal_mask_bottom_right=True))
+    assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(seq_lens="both", use_causal_mask=True, sliding_window_length=64))
+    assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(seq_lens="both", use_deterministic_algorithm=True))
+
+
+def test_bwd_probe_rejects_seq_len_q_without_padding_mask(monkeypatch):
+    # Bare seq_len_q is per-batch Q trimming, which the kernel has no path for.
+    monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
+    assert not _bwd_eligible(_mk_bwd_graph(seq_lens="q_only"))
 
 
 def test_bwd_probe_rejects_bias(monkeypatch):

@@ -22,7 +22,7 @@ Constraints:
   serves any other multiple of 8 up to 256 by zero-padding D.
 * GQA/MQA: H_q must be a multiple of H_kv
 * No dropout/alibi/softcap
-* Optional causal (top-left or bottom-right) and sliding-window masks
+* Optional causal (top-left or bottom-right), sliding-window masks and padding masks.
 * LSE input is the natural-log forward stats, fp32 (B, H, SQ) contiguous
 
 One backward call is three kernel launches through the per-shape
@@ -33,7 +33,7 @@ five-GEMM pass writing dK/dV), and ``cvt`` (dq_accum fp32 -> dQ io dtype).
 
 from functools import lru_cache
 from types import SimpleNamespace
-from typing import Type
+from typing import Optional, Type
 
 import cuda.bindings.driver as cuda_driver
 import cutlass
@@ -468,12 +468,16 @@ class SM120FusedMultiHeadAttentionFP16Backward:
         use_pdl: bool = True,
         q_tile: int = 0,
         kv_tile: int = 0,
+        seq_kv_lens_present: bool = False,
+        seq_q_lens_present: bool = False,
     ):
         self.in_dtype = in_dtype
         self.is_causal = is_causal
         self.causal_top_left = bool(causal_top_left)
         self.window_size_left = window_size_left
         self.deterministic = bool(deterministic)
+        self.seq_kv_lens_present = bool(seq_kv_lens_present)
+        self.seq_q_lens_present = bool(seq_q_lens_present)
         self.d = head_dim
         self.use_pdl = bool(use_pdl)
         self.q_tile, self.kv_tile = self.DEFAULT_TILES[head_dim]
@@ -555,6 +559,8 @@ class SM120FusedMultiHeadAttentionFP16Backward:
         dq_sem: cute.Tensor,  # [B*HQ*num_q_tiles] int32 relay turn counters, one per (batch, head, q-tile); zeroed by dot (deterministic only)
         dk_ws: cute.Tensor,  # [B, SKV, HQ, D] dK destination: dk itself when MHA; per-q-head partials summed by _dkv_reduce_kernel when GQA
         dv_ws: cute.Tensor,  # [B, SKV, HQ, D] dV destination (same as dK)
+        seq_q_lens: Optional[cute.Tensor],  # [B] int32 per-batch Q lengths; None unless seq_q_lens_present
+        seq_kv_lens: Optional[cute.Tensor],  # [B] int32 per-batch KV lengths; None unless seq_kv_lens_present
         tma_q_desc: cutlass.GridConstant[cuda.TensorMap],
         tma_k_desc: cutlass.GridConstant[cuda.TensorMap],
         tma_v_desc: cutlass.GridConstant[cuda.TensorMap],
@@ -608,6 +614,14 @@ class SM120FusedMultiHeadAttentionFP16Backward:
         kv_base = n_block * N
         q_row_stride = HQ * d  # row stride of HQ-headed BSHD tensors (Q side; also dk_ws/dv_ws, whose head axis is HQ)
 
+        # Per-batch actual lengths (Padding mask)
+        seqlen_q = SQ
+        seqlen_kv = SKV
+        if cutlass.const_expr(self.seq_kv_lens_present):
+            seqlen_kv = cute.math.max(cutlass.Int32(0), cute.math.min(seq_kv_lens[batch], cutlass.Int32(SKV)))
+        if cutlass.const_expr(self.seq_q_lens_present):
+            seqlen_q = cute.math.max(cutlass.Int32(0), cute.math.min(seq_q_lens[batch], cutlass.Int32(SQ)))
+
         lse_ptr = lse.iterator.raw_ptr()
         dd_ptr = delta.iterator.raw_ptr()
         dqa_ptr = dq_accum.iterator.raw_ptr()
@@ -618,11 +632,18 @@ class SM120FusedMultiHeadAttentionFP16Backward:
 
         PARTIAL_Q = (SQ % M) != 0
         PARTIAL_KV = (SKV % N) != 0
+        # Skip the kv >= SKV check when padding already masks kv >= seqlen_kv (<= SKV).
+        MASK_KV_GLOBAL = PARTIAL_KV and not self.seq_kv_lens_present
+        # Fully-masked rows have LSE = -inf; flip to +inf so P = exp2(finite - inf) = 0, not NaN.
+        FLIP_MASKED_LSE = (
+            (self.is_causal and not self.causal_top_left) or self.window_size_left is not None or self.seq_kv_lens_present or self.seq_q_lens_present
+        )
 
-        m_block_max = (SQ + M - 1) // M
+        m_block_max = (seqlen_q + M - 1) // M
         if cutlass.const_expr(self.is_causal or self.window_size_left is not None):
             if cutlass.const_expr(self.is_causal and not self.causal_top_left):
-                diag_off = SKV - SQ
+                # The diagonal anchors at the actual lengths.
+                diag_off = seqlen_kv - seqlen_q
             else:
                 diag_off = cutlass.Int32(0)
         if cutlass.const_expr(self.is_causal):
@@ -635,6 +656,10 @@ class SM120FusedMultiHeadAttentionFP16Backward:
             rows_hi = cute.math.max(last_q_row + 1, cutlass.Int32(0))
             m_block_max = cute.math.min(m_block_max, (rows_hi + M - 1) // M)
         n_iters = cute.math.max(m_block_max - m_block_min, cutlass.Int32(0))
+        if cutlass.const_expr(self.seq_kv_lens_present):
+            # Fully-padded KV tile: skip the loop; the epilogue writes zero dK/dV.
+            if kv_base >= seqlen_kv:
+                n_iters = cutlass.Int32(0)
 
         smem = cutlass.Array(io_dtype, self.smem_elems, space=cutlass.AddressSpace.smem, alignment=128)
         sQ = smem  # Q_STAGES * M * d
@@ -748,8 +773,8 @@ class SM120FusedMultiHeadAttentionFP16Backward:
             math_warp = warp
             math_tidx = tidx
             m_block = m_block_max - 1
-            if cutlass.const_expr(self.window_size_left is not None):
-                # For bottom-right SWA, a KV tile might lie completely before every query's sliding window
+            if cutlass.const_expr(self.window_size_left is not None or self.seq_q_lens_present):
+                # m_block_max can be 0 in bottom-right SWA, or seq_len_q[b] == 0
                 m_block = cute.math.max(m_block, cutlass.Int32(0))
             wm_s = math_warp % WM_SDP
             wn_s = math_warp // WM_SDP
@@ -775,7 +800,7 @@ class SM120FusedMultiHeadAttentionFP16Backward:
                             val = inf
                     else:
                         val = (lse_ptr + lse_base + r_abs).load()
-                    if cutlass.const_expr((self.is_causal and not self.causal_top_left) or self.window_size_left is not None):
+                    if cutlass.const_expr(FLIP_MASKED_LSE):
                         # A fully masked row has LSE = -inf, which can produce
                         # -inf - (-inf) = NaN.  Use +inf to reconstruct P = 0.
                         if val == cutlass.Float32(float("-inf")):
@@ -880,6 +905,8 @@ class SM120FusedMultiHeadAttentionFP16Backward:
                     do_mask_causal = (m_block * M) < (kv_base + N - diag_off)
                 if cutlass.const_expr(self.window_size_left is not None):
                     do_mask_window = kv_base < (m_block * M + M - 1 + diag_off - self.window_size_left)
+                if cutlass.const_expr(self.seq_kv_lens_present):
+                    do_mask_pad = (kv_base + N) > seqlen_kv
                 neg_inf = cutlass.Float32(float("-inf"))
                 for rep in cutlass.range_constexpr(SDP_REPS):
                     for nf in cutlass.range_constexpr(SDP_NF):
@@ -915,7 +942,15 @@ class SM120FusedMultiHeadAttentionFP16Backward:
                                     s2 = neg_inf
                                 if kv_a1 < lo8:
                                     s3 = neg_inf
-                        if cutlass.const_expr(PARTIAL_KV):
+                        if cutlass.const_expr(self.seq_kv_lens_present):
+                            if do_mask_pad:
+                                if kv_a0 >= seqlen_kv:
+                                    s0 = neg_inf
+                                    s2 = neg_inf
+                                if kv_a1 >= seqlen_kv:
+                                    s1 = neg_inf
+                                    s3 = neg_inf
+                        if cutlass.const_expr(MASK_KV_GLOBAL):
                             if kv_a0 >= SKV:
                                 s0 = neg_inf
                                 s2 = neg_inf
@@ -1089,7 +1124,7 @@ class SM120FusedMultiHeadAttentionFP16Backward:
                             for hf in cutlass.range_constexpr(2):
                                 r_loc = wm_s * 16 + rep * 16 * WM_SDP + g_lane + hf * 8
                                 val = (lse_ptr + lse_base + nq0 + r_loc).load()
-                                if cutlass.const_expr((self.is_causal and not self.causal_top_left) or self.window_size_left is not None):
+                                if cutlass.const_expr(FLIP_MASKED_LSE):
                                     # A fully masked row has LSE = -inf, which can produce
                                     # -inf - (-inf) = NaN.  Use +inf to reconstruct P = 0.
                                     if val == cutlass.Float32(float("-inf")):
@@ -1129,7 +1164,7 @@ class SM120FusedMultiHeadAttentionFP16Backward:
                             for hf in cutlass.range_constexpr(2):
                                 r_loc = wm_s * 16 + rep * 16 * WM_SDP + g_lane + hf * 8
                                 val = (lse_ptr + lse_base + nq0 + r_loc).load()
-                                if cutlass.const_expr((self.is_causal and not self.causal_top_left) or self.window_size_left is not None):
+                                if cutlass.const_expr(FLIP_MASKED_LSE):
                                     # A fully masked row has LSE = -inf, which can produce
                                     # -inf - (-inf) = NaN.  Use +inf to reconstruct P = 0.
                                     if val == cutlass.Float32(float("-inf")):
@@ -1221,6 +1256,8 @@ class SM120FusedMultiHeadAttentionFP16Backward:
         dq_sem: cute.Tensor,
         dk_ws: cute.Tensor,
         dv_ws: cute.Tensor,
+        seq_q_lens: Optional[cute.Tensor],
+        seq_kv_lens: Optional[cute.Tensor],
         softmax_scale_log2: cutlass.Float32,
         attn_scale: cutlass.Float32,
         stream: cuda_driver.CUstream,
@@ -1243,6 +1280,8 @@ class SM120FusedMultiHeadAttentionFP16Backward:
             dq_sem,
             dk_ws,
             dv_ws,
+            seq_q_lens,
+            seq_kv_lens,
             tma_q_desc,
             tma_k_desc,
             tma_v_desc,
@@ -1587,6 +1626,8 @@ def compile(  # noqa: A001
         use_pdl=PARAMS.use_pdl,
         q_tile=PARAMS.q_tile,
         kv_tile=PARAMS.kv_tile,
+        seq_kv_lens_present=PARAMS.seq_kv_lens_present,
+        seq_q_lens_present=PARAMS.seq_q_lens_present,
     )
     sq_r = ceil_div(sq, 128) * 128
 
@@ -1617,6 +1658,8 @@ def compile(  # noqa: A001
     has_gqa = kvh != qh
     fake_dk_ws = _fake(STORAGE_DTYPE, (b, skv, qh, d))
     fake_dv_ws = _fake(STORAGE_DTYPE, (b, skv, qh, d))
+    fake_seq_q_lens = _fake(cutlass.Int32, (b,)) if PARAMS.seq_q_lens_present else None
+    fake_seq_kv_lens = _fake(cutlass.Int32, (b,)) if PARAMS.seq_kv_lens_present else None
     fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
     options = "--enable-tvm-ffi"
 
@@ -1647,6 +1690,8 @@ def compile(  # noqa: A001
         fake_dq_sem,
         fake_dk_ws,
         fake_dv_ws,
+        fake_seq_q_lens,
+        fake_seq_kv_lens,
         cutlass.Float32(1.0),
         cutlass.Float32(1.0),
         fake_stream,

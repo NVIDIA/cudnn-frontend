@@ -73,6 +73,8 @@ class SdpaBwdDsl(APIBase):
         scale_softmax: Optional[float] = None,
         tile_m: Optional[int] = None,
         tile_n: Optional[int] = None,
+        seq_kv_lens_present: bool = False,
+        seq_q_lens_present: bool = False,
     ) -> None:
         super().__init__()
         self._warn_experimental_api()
@@ -95,6 +97,8 @@ class SdpaBwdDsl(APIBase):
         self.scale_softmax = scale_softmax
         self.tile_m = None if tile_m is None else int(tile_m)
         self.tile_n = None if tile_n is None else int(tile_n)
+        self.seq_kv_lens_present = bool(seq_kv_lens_present)
+        self.seq_q_lens_present = bool(seq_q_lens_present)
 
         self.batch_size: Optional[int] = None
         self.s_q_max: Optional[int] = None
@@ -129,6 +133,8 @@ class SdpaBwdDsl(APIBase):
         scale_softmax: Optional[float] = None,
         workspace: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
+        seq_q_lens: Optional[torch.Tensor] = None,
+        seq_kv_lens: Optional[torch.Tensor] = None,
     ) -> None:
         """Execute the compiled kernel chain using the common operand set."""
 
@@ -239,6 +245,10 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
             "causal_bottom_right requires is_causal=True",
         )
         self._value_error_if(
+            self.seq_q_lens_present and not self.seq_kv_lens_present,
+            "seq_q_lens_present requires seq_kv_lens_present (per-batch Q lengths are only supported as part of the padding mask)",
+        )
+        self._value_error_if(
             self.window_size_left is not None and self.window_size_left < 0,
             f"window_size_left must be non-negative, got {self.window_size_left}",
         )
@@ -281,6 +291,8 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
             deterministic=self.deterministic,
             q_tile=self.q_tile,
             kv_tile=self.kv_tile,
+            seq_kv_lens_present=self.seq_kv_lens_present,
+            seq_q_lens_present=self.seq_q_lens_present,
         )
         self._k_mod = _load_sm120_kernel_module(params)
         self._compiled_kernel = self._k_mod.compile(
@@ -306,6 +318,22 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
         if self.h_q == self.h_kv:
             return 0
         return self.batch_size * self.s_k_max * self.h_q * self.head_dim_padded
+
+    def _checked_seq_lens(self, seq_lens: torch.Tensor, name: str) -> torch.Tensor:
+        """Validate per-batch lengths and return a (B,) int32 view (never a copy/cast)."""
+        self._value_error_if(
+            seq_lens.dtype != torch.int32,
+            f"{name} must be int32; got {seq_lens.dtype}",
+        )
+        self._value_error_if(
+            seq_lens.numel() != self.batch_size,
+            f"{name} must have B = {self.batch_size} elements; got {seq_lens.numel()}",
+        )
+        self._value_error_if(
+            not seq_lens.is_contiguous(),
+            f"{name} must be contiguous (bound to the kernel as a flat (B,) view)",
+        )
+        return seq_lens.reshape(-1)
 
     def scratch_workspace_bytes(self) -> int:
         """delta (fp32 [B, H, SQ_r128]) + dq_accum (fp32 flat [B*SQ_r128*H*D])
@@ -335,11 +363,30 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
         scale_softmax: Optional[float] = None,
         workspace: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
+        seq_q_lens: Optional[torch.Tensor] = None,
+        seq_kv_lens: Optional[torch.Tensor] = None,
     ) -> None:
         """Execute tensors matching the compiled specialization."""
 
         if self._compiled_kernel is None:
             raise RuntimeError("SdpaBwdDslSm120 kernel is not compiled")
+
+        self._value_error_if(
+            self.seq_kv_lens_present and seq_kv_lens is None,
+            "seq_kv_lens is required by this compiled specialization",
+        )
+        self._value_error_if(
+            not self.seq_kv_lens_present and seq_kv_lens is not None,
+            "this specialization was compiled without per-batch KV lengths; construct the API with seq_kv_lens_present=True",
+        )
+        self._value_error_if(
+            self.seq_q_lens_present and seq_q_lens is None,
+            "seq_q_lens is required by this compiled specialization",
+        )
+        self._value_error_if(
+            not self.seq_q_lens_present and seq_q_lens is not None,
+            "this specialization was compiled without per-batch Q lengths; construct the API with seq_q_lens_present=True",
+        )
 
         scale_val = self.scale_softmax if scale_softmax is None or scale_softmax == 0.0 else float(scale_softmax)
         scale_log2 = scale_val * math.log2(math.e)
@@ -381,6 +428,9 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
             b, s, h, _ = view.shape
             return carver.take(b * s * h * d_pad, self.dtype).view(b, s, h, d_pad), view
 
+        seq_q_t = self._checked_seq_lens(seq_q_lens, "seq_q_lens") if seq_q_lens is not None else None
+        seq_kv_t = self._checked_seq_lens(seq_kv_lens, "seq_kv_lens") if seq_kv_lens is not None else None
+
         with _torch_stream_context(current_stream, q_tensor.device):
             q = _staged_bshd(q_tensor)
             k = _staged_bshd(k_tensor)
@@ -415,6 +465,8 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
                 dq_sem,
                 dk_ws,
                 dv_ws,
+                seq_q_t,
+                seq_kv_t,
                 cutlass.Float32(scale_log2),
                 cutlass.Float32(scale_val),
                 current_stream,
@@ -448,6 +500,8 @@ def sdpa_bwd_wrapper_dsl_sm120(
     window_size_left: Optional[int] = None,
     deterministic: bool = False,
     scale_softmax: Optional[float] = None,
+    seq_q_lens: Optional[torch.Tensor] = None,
+    seq_kv_lens: Optional[torch.Tensor] = None,
 ) -> TupleDict:
     """Run SM120 SDPA backward and return ``TupleDict(dq_tensor=..., dk_tensor=..., dv_tensor=...)``."""
 
@@ -470,6 +524,8 @@ def sdpa_bwd_wrapper_dsl_sm120(
         window_size_left,
         bool(deterministic),
         scale_softmax,
+        seq_q_lens is not None,
+        seq_kv_lens is not None,
     )
     api = _wrapper_api_cache.get(cache_key)
     if api is None:
@@ -488,6 +544,8 @@ def sdpa_bwd_wrapper_dsl_sm120(
             window_size_left=window_size_left,
             deterministic=deterministic,
             scale_softmax=scale_softmax,
+            seq_kv_lens_present=seq_kv_lens is not None,
+            seq_q_lens_present=seq_q_lens is not None,
         )
         api.check_support()
         api.compile()
@@ -506,5 +564,7 @@ def sdpa_bwd_wrapper_dsl_sm120(
         dv_tensor=dv_tensor,
         scale_softmax=scale_softmax,
         workspace=workspace,
+        seq_q_lens=seq_q_lens,
+        seq_kv_lens=seq_kv_lens,
     )
     return TupleDict(dq_tensor=dq_tensor, dk_tensor=dk_tensor, dv_tensor=dv_tensor)

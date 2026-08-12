@@ -41,6 +41,8 @@ grads = sdpa_bwd_wrapper_dsl_sm120(
     window_size_left=None,   # W: keys with k < q + diag - W are masked
     deterministic=False,     # ordered dQ KV-tile reduction (bitwise-reproducible)
     scale_softmax=None,      # None -> 1/sqrt(D)
+    seq_q_lens=None,         # (B,) int32 per-batch Q lengths (padding mask)
+    seq_kv_lens=None,        # (B,) int32 per-batch KV lengths (padding mask)
 )
 dq, dk, dv = grads["dq_tensor"], grads["dk_tensor"], grads["dv_tensor"]
 ```
@@ -174,7 +176,7 @@ deterministic by construction. For MHA (`H_q == H_kv`) the buffers alias the
 `dk`/`dv` outputs themselves — the same epilogue writes the results directly,
 nothing extra is carved, and no `reduce` kernel is launched.
 
-### Causal and sliding-window masks
+### Causal, sliding-window, and padding masks
 
 Masking is applied twice, cheaply:
 
@@ -183,11 +185,25 @@ Masking is applied twice, cheaply:
   clamps the last (`q_block_max`) — fully-masked tiles are never visited, so
   square causal attention runs roughly half as many tile iterations.
 * **In-register score masking** runs only on tiles that straddle a mask edge
-  (`do_mask_causal` / `do_mask_window` gates); interior tiles skip it.
+  (`do_mask_causal` / `do_mask_window` / `do_mask_pad` gates); interior tiles
+  skip it.
 
 The softmax replay guards fully-masked rows (forward `LSE = −inf`) by
 substituting `+inf`, reconstructing `P = 0` instead of NaN. Non-tile-multiple
 sequence tails are handled with load clamps and store row-gates.
+
+**Padding mask** (per-batch `seq_kv_lens`, optionally `seq_q_lens`) reuses
+both layers: `q_block_max` trims to `ceil(seq_q_lens[b] / tile_q)` and a KV
+tile fully inside the pad drains without loads or compute, while boundary
+tiles mask scores at `seq_kv_lens[b]`. With bottom-right alignment the
+diagonal anchors at the **actual** lengths (`diag_off = seq_kv_lens[b] −
+seq_q_lens[b]`), matching the SM120 forward kernel and cuDNN padded-graph
+semantics. Q rows at or past `seq_q_lens[b]` ride on the forward's
+`LSE = −inf` convention (`P = 0`), so `dQ` rows past `seq_q_lens[b]` and
+`dK`/`dV` rows past `seq_kv_lens[b]` come out exactly zero. The length
+tensors are `None`-specialized kernel parameters: a specialization built
+without them carries neither the parameters nor any padding code, and
+needs no extra workspace either way.
 
 ### Deterministic vs. non-deterministic dQ
 
@@ -214,7 +230,8 @@ only the unused relay operand remains in the kernel ABI.
 - Head dims: 32/64/128/192/256 natively; any other multiple of 8 up to 256 is
   served by zero-padding D to the next supported size (`d_qk == d_v`)
 - Masks: none, causal (top-left or bottom-right), sliding window
-  (left-window offset, with or without causal)
+  (left-window offset, with or without causal), padding (per-batch
+  `seq_len_kv` required, `seq_len_q` optional; composes with the other masks)
 - GQA/MQA: any `H_kv` dividing `H_q` (including `H_kv == 1`)
 - No dropout / bias / ALiBi / sinks / softcap / THD
 - Workspace (carved from the caller's buffer): fp32 `delta` and `dq_accum`
