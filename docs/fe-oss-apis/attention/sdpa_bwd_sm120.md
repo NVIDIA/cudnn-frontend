@@ -77,7 +77,7 @@ One backward call is three launches (four under GQA), overlapped with
 programmatic dependent launch (PDL) so each kernel's prologue runs under its
 predecessor's tail:
 
-```
+```text
 dot     delta = rowsum(O ∘ dO); zeroes dq_accum (and, when deterministic, the relay counters)
 main    the fused five-GEMM pass; writes dK/dV into dk_ws/dv_ws (aliased to the dk/dv
         outputs for MHA, per-q-head partial buffers for GQA); accumulates dQ into dq_accum
@@ -91,7 +91,7 @@ Grid is `(num_kv_tiles, H_q, B)` — one CTA owns one KV tile of one **query**
 head (its KV head is `q_head // group`), loads K/V **once**, and walks every
 q-tile of its (batch, head) in descending order. Per q-tile iteration:
 
-```
+```text
 GEMM1  S  = Q · Kᵀ            (K streamed from SMEM)
        P  = exp2((scale·S − LSE) · log2(e))   replay from natural-log LSE
 GEMM2  dP = dO · Vᵀ           (V resident in registers after one ldmatrix pass)
@@ -231,10 +231,11 @@ only the unused relay operand remains in the kernel ABI.
   served by zero-padding D to the next supported size (`d_qk == d_v`)
 - Masks: none, causal (top-left or bottom-right), sliding window
   (left-window offset, with or without causal), padding (per-batch
-  `seq_len_kv` required, `seq_len_q` optional; composes with the other masks)
+  `seq_kv_len` required, `seq_q_len` optional; composes with the other masks)
 - GQA/MQA: any `H_kv` dividing `H_q` (including `H_kv == 1`)
 - No dropout / bias / ALiBi / sinks / softcap / THD
 - Workspace (carved from the caller's buffer): fp32 `delta` and `dq_accum`
   scratch plus int32 relay-counter storage (reserved in both modes); GQA adds
-  the io-dtype `dk_ws`/`dv_ws` partials buffers (`B·S_kv·H_q·D` elements
-  each); padded-D and non-compact layouts add staging copies
+  the io-dtype `dk_ws`/`dv_ws` partials buffers (`B·S_kv·H_q·D_padded`
+  elements each, where `D_padded` is the adapter's zero-padded head
+  dimension); use `scratch_workspace_bytes()` for the exact total

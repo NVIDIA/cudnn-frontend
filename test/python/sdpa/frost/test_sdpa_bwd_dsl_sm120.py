@@ -516,6 +516,26 @@ def test_sdpa_bwd_dsl_sm120_padding_gqa():
 
 
 @pytest.mark.L0
+@torch_fork_set_rng(seed=29)
+def test_sdpa_bwd_dsl_sm120_padding_rejects_cpu_seq_lens():
+    """A CPU length tensor must be rejected up front — the kernel would
+    otherwise receive a host pointer (illegal access or garbage lengths)."""
+
+    _require_dsl()
+    from cudnn.sdpa.bwd.api_dsl import sdpa_bwd_wrapper_dsl_sm120
+
+    batch, heads, s, head_dim, dtype = 2, 4, 256, 64, torch.float16
+    q = _bhsd(batch, heads, s, head_dim, dtype)
+    k = _bhsd(batch, heads, s, head_dim, dtype)
+    v = _bhsd(batch, heads, s, head_dim, dtype)
+    do = _bhsd(batch, heads, s, head_dim, dtype)
+    o = torch.zeros_like(q)  # never consumed: execute rejects before launching
+    stats = torch.zeros(batch, heads, s, 1, dtype=torch.float32, device="cuda")
+    with pytest.raises(ValueError, match="seq_kv_lens must be on"):
+        sdpa_bwd_wrapper_dsl_sm120(q, k, v, o, do, stats, seq_kv_lens=torch.tensor([s, s], dtype=torch.int32))
+
+
+@pytest.mark.L0
 @torch_fork_set_rng(seed=25)
 def test_sdpa_bwd_dsl_sm120_padding_kv_only_wrapper():
     """KV-only padding through the direct wrapper: seq_q_lens omitted means

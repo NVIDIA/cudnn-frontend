@@ -322,6 +322,10 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
     def _checked_seq_lens(self, seq_lens: torch.Tensor, name: str) -> torch.Tensor:
         """Validate per-batch lengths and return a (B,) int32 view (never a copy/cast)."""
         self._value_error_if(
+            seq_lens.device != self.q_desc.device,
+            f"{name} must be on {self.q_desc.device} (with Q); got {seq_lens.device}",
+        )
+        self._value_error_if(
             seq_lens.dtype != torch.int32,
             f"{name} must be int32; got {seq_lens.dtype}",
         )
