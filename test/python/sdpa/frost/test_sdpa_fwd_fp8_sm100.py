@@ -72,7 +72,7 @@ def _ref(qd, kd, vd, *, scale, is_causal=False, bottom_right=False, swa_window=N
     return torch.matmul(probs, v_e), probs.max().item()
 
 
-def _run(B, H_q, H_kv, S_q, S_kv, in_key, out_dt, *, scale, sdpa_kwargs, sink=None, seq_lens_kv=None, s_scale=1.0, s_descale_gain=1.0):
+def _run(B, H_q, H_kv, S_q, S_kv, in_key, out_dt, *, scale, sdpa_kwargs, sink=None, seq_lens_kv=None, s_scale=1.0, s_descale_gain=1.0, stats=True):
     import cudnn
 
     dev = "cuda"
@@ -111,7 +111,7 @@ def _run(B, H_q, H_kv, S_q, S_kv, in_key, out_dt, *, scale, sdpa_kwargs, sink=No
         return g.tensor(dim=[1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.FLOAT)
 
     dqn, dkn, dvn, dsn, ssn, son = (_stns() for _ in range(6))
-    kw = dict(q=q, k=k, v=v, descale_q=dqn, descale_k=dkn, descale_v=dvn, descale_s=dsn, scale_s=ssn, scale_o=son, attn_scale=scale, generate_stats=True)
+    kw = dict(q=q, k=k, v=v, descale_q=dqn, descale_k=dkn, descale_v=dvn, descale_s=dsn, scale_s=ssn, scale_o=son, attn_scale=scale, generate_stats=stats)
     vp = {q: Qb, k: Kb, v: Vb, dqn: dqt, dkn: dkt, dvn: dvt, dsn: dst, ssn: sst, son: sot}
     if sink is not None:
         st = g.tensor_like(sink)
@@ -127,9 +127,10 @@ def _run(B, H_q, H_kv, S_q, S_kv, in_key, out_dt, *, scale, sdpa_kwargs, sink=No
         vp[sq_h] = slq
         vp[skv_h] = slk
     kw.update(sdpa_kwargs)
-    o, stats, amx_s, amx_o = g.sdpa_fp8(**kw)
+    o, stats_t, amx_s, amx_o = g.sdpa_fp8(**kw)
     o.set_output(True).set_dim(list(Ob.shape)).set_stride(list(Ob.stride())).set_data_type(getattr(cudnn.data_type, _CUDNN_OTYPE[out_dt]))
-    stats.set_output(True).set_dim([B, H_q, S_q, 1]).set_stride([H_q * S_q, S_q, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
+    if stats:
+        stats_t.set_output(True).set_dim([B, H_q, S_q, 1]).set_stride([H_q * S_q, S_q, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
     amx_s.set_output(True).set_dim([1, 1, 1, 1]).set_stride([1, 1, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
     amx_o.set_output(True).set_dim([1, 1, 1, 1]).set_stride([1, 1, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
 
@@ -139,7 +140,13 @@ def _run(B, H_q, H_kv, S_q, S_kv, in_key, out_dt, *, scale, sdpa_kwargs, sink=No
     _select_engine(g, engine_name(128, fp8=True))
     g.check_support()
     g.build_plans()
-    vp.update({o: Ob, stats: lse, amx_s: amax_s, amx_o: amax_o})
+    if not stats:
+        # No Stats output: the kernel compiles the LSE store out (has_lse=False)
+        # — no dummy buffer exists at any level, so the dense workspace is 0.
+        assert g.get_workspace_size() == 0
+    vp.update({o: Ob, amx_s: amax_s, amx_o: amax_o})
+    if stats:
+        vp[stats_t] = lse
     g.execute(vp, torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8))
     torch.cuda.synchronize()
 
@@ -247,6 +254,58 @@ def test_fp8_padding(in_key, causal):
     sk = dict(use_causal_mask=True) if causal else {}
     O, O_ref, a_s, a_s_ref, a_o, a_o_ref = _run(2, 8, 8, 256, 256, in_key, torch.float16, scale=scale, sdpa_kwargs=sk, seq_lens_kv=[256, 192])
     _check(O, O_ref, torch.float16, in_key, a_s, a_s_ref, a_o, a_o_ref)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("in_key", _INS)
+@torch_fork_set_rng(seed=0)
+def test_fp8_stats_less_zero_workspace(in_key):
+    """No Stats output: the kernel compiles the LSE store out (has_lse=False),
+    no dummy buffer exists at any level, and the dense graph reports
+    ``get_workspace_size() == 0`` (asserted inside ``_run``). The Amax_S /
+    Amax_O atomicMax writes are independent of the LSE and still produced."""
+    scale = 1.0 / math.sqrt(128)
+    O, O_ref, a_s, a_s_ref, a_o, a_o_ref = _run(2, 8, 8, 256, 256, in_key, torch.float16, scale=scale, sdpa_kwargs=dict(use_causal_mask=True), stats=False)
+    _check(O, O_ref, torch.float16, in_key, a_s, a_s_ref, a_o, a_o_ref)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_fp8_sm100_execute_lse_contract():
+    """Strict lse_tensor execute contract, both directions (f16 parity):
+    has_lse is keyed on sample_lse at compile time, so a requested LSE must be
+    bound and an unrequested one is rejected (the store is compiled out —
+    there is no LSE slot, and no cached dummy fallback either)."""
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    b, h, s, d = 1, 4, 256, 128
+    dev = "cuda"
+    qf = torch.randn(b, h, s, d, device=dev) * 0.5
+    q8, dq = _quant(qf, "e4m3")
+    q = q8.permute(0, 2, 1, 3).contiguous().transpose(1, 2)
+    k, v = q.clone(), q.clone()
+    o = torch.empty(b, s, h, d, device=dev, dtype=torch.float16).transpose(1, 2)
+    lse = torch.empty(b, h, s, dtype=torch.float32, device=dev)
+    dsc = torch.tensor([dq], dtype=torch.float32, device=dev)
+
+    kw = dict(sample_q=q, sample_k=k, sample_v=v, sample_o=o, is_causal=True, pertensor_fp8=True, dtype_o=torch.float16)
+    ex = dict(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, descale_q=dsc, descale_k=dsc, descale_v=dsc)
+
+    api = SdpaFwdDslSm100(sample_lse=lse, **kw)
+    assert api.check_support()
+    api.compile()
+    with pytest.raises(ValueError, match="lse_tensor is required"):
+        api.execute(**ex)
+
+    api = SdpaFwdDslSm100(**kw)
+    assert api.check_support()
+    api.compile()
+    with pytest.raises(ValueError, match="without an LSE output"):
+        api.execute(lse_tensor=lse, **ex)
+    api.execute(**ex)
+    torch.cuda.synchronize()
+    o_ref, _ = _ref(q8.float() * dq, q8.float() * dq, q8.float() * dq, scale=api.scale_softmax, is_causal=True)
+    torch.testing.assert_close(o.float(), o_ref, atol=5e-2, rtol=3e-2)
 
 
 @pytest.mark.L0

@@ -24,7 +24,7 @@ plus the MXFP8 TMEM scale-factor (SF) relayout:
 import os
 import sys
 from functools import lru_cache
-from typing import Callable, Tuple
+from typing import Callable, Optional, Tuple
 
 from cutlass.experimental import primitives as nvvm
 from cutlass.experimental.primitives import vote_sync, VoteSync
@@ -331,7 +331,7 @@ def _kernel(
     tma_q_sf_desc: cutlass.GridConstant[tmap.TensorMap],
     tma_k_sf_desc: cutlass.GridConstant[tmap.TensorMap],
     tma_v_sf_desc: cutlass.GridConstant[tmap.TensorMap],
-    lse_tensor: cute.Tensor,
+    lse_tensor: Optional[cute.Tensor],
     amax_o_tensor: cute.Tensor,
     sinks_tensor: cute.Tensor,
     seq_kv_lens_tensor: cute.Tensor,
@@ -1979,7 +1979,7 @@ def _correction_warp_group(
     tidx,
     bars,
     sched,
-    lse_tensor: cute.Tensor,
+    lse_tensor: Optional[cute.Tensor],
     amax_o_tensor: cute.Tensor,
     sinks_tensor: cute.Tensor,
     seq_kv_lens_tensor,
@@ -2141,16 +2141,20 @@ def _correction_warp_group(
                 _cu_q_b = cutlass.Int32(_cu[n_batch + batch_idx])
                 _s_q_b = cutlass.Int32(_cu[n_batch + batch_idx + cutlass.Int32(1)]) - _cu_q_b
                 _row_valid = q_row_global < _s_q_b
-                if _row_valid:
-                    lse_arr = cutlass.make_array_view(lse_tensor)
-                    lse_row = lse_arr[cutlass.Int32(0), head_idx, :]
-                    lse_row[_cu_q_b + q_row_global] = lse_val
+                # has_lse=False: the Stats store is compiled out; the amax_o
+                # atomicMax below is independent of it and always live.
+                if cutlass.const_expr(lse_tensor is not None):
+                    if _row_valid:
+                        lse_arr = cutlass.make_array_view(lse_tensor)
+                        lse_row = lse_arr[cutlass.Int32(0), head_idx, :]
+                        lse_row[_cu_q_b + q_row_global] = lse_val
             else:
                 _row_valid = q_row_global < seqlen_q
-                if _row_valid:
-                    lse_arr = cutlass.make_array_view(lse_tensor)
-                    lse_row = lse_arr[batch_idx, head_idx, :]
-                    lse_row[q_row_global] = lse_val
+                if cutlass.const_expr(lse_tensor is not None):
+                    if _row_valid:
+                        lse_arr = cutlass.make_array_view(lse_tensor)
+                        lse_row = lse_arr[batch_idx, head_idx, :]
+                        lse_row[q_row_global] = lse_val
 
             sO_sub_base = sO[qs].base
 
@@ -2234,7 +2238,7 @@ def _host(
     sf_q_tensor: cute.Tensor,
     sf_k_tensor: cute.Tensor,
     sf_v_tensor: cute.Tensor,
-    lse_tensor: cute.Tensor,
+    lse_tensor: Optional[cute.Tensor],
     amax_o_tensor: cute.Tensor,
     sinks_tensor: cute.Tensor,
     seq_kv_lens_tensor: cute.Tensor,
@@ -2387,10 +2391,21 @@ def _host(
 
 
 @lru_cache(maxsize=None)
-def compile(
-    b: int = 1, qh: int = 1, kh: int = 1, sq: int = 256, skv: int = 128, total_q_sf_tiles: int = 0, total_kv_sf_tiles: int = 0  # noqa: A001
+def compile(  # noqa: A001
+    b: int = 1,
+    qh: int = 1,
+    kh: int = 1,
+    sq: int = 256,
+    skv: int = 128,
+    total_q_sf_tiles: int = 0,
+    total_kv_sf_tiles: int = 0,
+    has_lse: bool = True,
 ) -> Callable:
     """Compile a kernel with concrete dims; 3 SF tensors layout [B, H, num_seq_tiles, SF_SMEM_SIZE_*].
+
+    ``has_lse=False`` compiles the LSE store out (the kernel specializes on a
+    ``None`` LSE argument) — callers without a Stats output pass no LSE buffer
+    at all; the amax_o atomicMax write is independent and unchanged.
 
     THD/varlen: q/k/v/o/lse + SF tensors are PACKED with batch dim 1; ``b`` is the
     LOGICAL batch (sequence count).  The SF tensors are per-sequence-TILE-padded so
@@ -2455,12 +2470,17 @@ def compile(
         assumed_align=16,
     )
 
-    fake_lse = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float32,
-        (_fake_batch, qh, sq),
-        stride_order=(2, 1, 0),
-        assumed_align=16,
-    )
+    if not has_lse:
+        # No Stats output: the LSE argument is None-specialized and the store
+        # is compiled out entirely — no dummy buffer exists at any level.
+        fake_lse = None
+    else:
+        fake_lse = cute.runtime.make_fake_compact_tensor(
+            cutlass.Float32,
+            (_fake_batch, qh, sq),
+            stride_order=(2, 1, 0),
+            assumed_align=16,
+        )
     fake_amax_o = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32,
         (1,),
