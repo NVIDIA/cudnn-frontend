@@ -8,16 +8,25 @@ import cutlass.cute as cute
 
 
 @cute.jit
-def tmem_alloc(tmem_ptr_i32, num_cols: int, cta_group_kind):
-    # No is_exclusive: it only applies to >512-column allocations on sm_107/sm_109
-    # (cute.arch.tmem.is_tmem_allocation_exclusive), so it is a no-op on the
-    # <=512-column sm100/sm103 allocations here, and it is fenced out of the public
-    # cutlass-dsl tcgen05_alloc wrapper.
-    nvvm.tcgen05_alloc(
-        tmem_ptr_i32,
-        cutlass.Int32(num_cols),
-        group=cta_group_kind,
-    )
+def tmem_alloc(tmem_ptr_i32, num_cols: int, cta_group_kind, is_exclusive: cutlass.Constexpr[bool] = False):
+    # is_exclusive is the sm_107/sm_109 >512-column mechanism (GR100's 576-col
+    # TMEM; cute.arch.tmem.is_tmem_allocation_exclusive) — pass True only
+    # there.  It is fenced out of the PUBLIC cutlass-dsl tcgen05_alloc
+    # wrapper, so the kwarg is only emitted on the True branch
+    # (internal-wheel-only callers); <=512-column allocations never trace it.
+    if cutlass.const_expr(is_exclusive):
+        nvvm.tcgen05_alloc(
+            tmem_ptr_i32,
+            cutlass.Int32(num_cols),
+            is_exclusive=True,
+            group=cta_group_kind,
+        )
+    else:
+        nvvm.tcgen05_alloc(
+            tmem_ptr_i32,
+            cutlass.Int32(num_cols),
+            group=cta_group_kind,
+        )
     nvvm.tcgen05_relinquish_alloc_permit(group=cta_group_kind)
     nvvm.bar_warp_sync(cute.arch.FULL_MASK)
 
