@@ -85,6 +85,13 @@ class TemplateParams:
     # convention). Dense-only — THD carries per-sequence Q lengths via
     # cu_seqlens instead.
     seq_q_lens_present: bool = False
+    # cu_seq_len form (cuDNN 9.24+): the corresponding seq-lens kernel
+    # parameter is the (B+1,)-int32 PREFIX-SUM tensor instead of (B,)
+    # per-batch lengths; the kernels read len = cu[b+1] - cu[b] on device (the
+    # sync-free dense hot path stays sync-free). Dense-only — THD already
+    # carries prefix sums in its packed [kv_lens | cu_q | cu_kv] metadata.
+    seq_kv_lens_cu: bool = False
+    seq_q_lens_cu: bool = False
     sched_policy: int = SCHED_NATURAL
     thd_varlen: bool = False
     # cc10.3+ fuses the S_acc row-max into the LDTM (tcgen05.ld.red.f32.max); cc10.0
@@ -120,6 +127,13 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
             raise ValueError(f"{flavor}: SEQ_Q_LENS_PRESENT is dense-only (THD carries per-sequence Q lengths via cu_seqlens)")
         if not k.seq_kv_lens_present:
             raise ValueError(f"{flavor}: SEQ_Q_LENS_PRESENT requires SEQ_KV_LENS_PRESENT (padding mask)")
+    if k.seq_kv_lens_cu or k.seq_q_lens_cu:
+        if k.thd_varlen:
+            raise ValueError(f"{flavor}: seq_*_lens_cu is dense-only (the THD metadata buffer already carries cu_seqlens)")
+        if k.seq_kv_lens_cu and not k.seq_kv_lens_present:
+            raise ValueError(f"{flavor}: SEQ_KV_LENS_CU declares the FORM of the KV lengths and requires SEQ_KV_LENS_PRESENT")
+        if k.seq_q_lens_cu and not k.seq_q_lens_present:
+            raise ValueError(f"{flavor}: SEQ_Q_LENS_CU declares the FORM of the Q lengths and requires SEQ_Q_LENS_PRESENT")
     if k.sched_policy not in (SCHED_NATURAL, SCHED_LPT):
         raise ValueError(f"{flavor}: only SCHED_NATURAL (0) / SCHED_LPT (1) are wired up; got {k.sched_policy}")
 
@@ -288,6 +302,10 @@ class CfgD256:
 
     SEQ_KV_LENS_PRESENT: int = 0
     SEQ_Q_LENS_PRESENT: int = 0
+    # cu_seq_len form: the corresponding lens parameter is the (B+1,)
+    # prefix-sum tensor; per-batch length = cu[b+1] - cu[b]. Dense-only.
+    SEQ_KV_LENS_CU: int = 0
+    SEQ_Q_LENS_CU: int = 0
 
     THD_VARLEN: int = 0
 
@@ -335,6 +353,8 @@ def make_cfg_d256(params: TemplateParams) -> Tuple[CfgD256, TmaIters]:
         SCHEDULER_POLICY=params.sched_policy,
         SEQ_KV_LENS_PRESENT=1 if (params.thd_varlen or params.seq_kv_lens_present) else 0,
         SEQ_Q_LENS_PRESENT=int(params.seq_q_lens_present),
+        SEQ_KV_LENS_CU=int(params.seq_kv_lens_cu),
+        SEQ_Q_LENS_CU=int(params.seq_q_lens_cu),
         THD_VARLEN=int(params.thd_varlen),
     )
     _validate_cfg_d256(cfg)
@@ -427,6 +447,10 @@ class CfgD512:
 
     SEQ_KV_LENS_PRESENT: int = 0
     SEQ_Q_LENS_PRESENT: int = 0
+    # cu_seq_len form: the corresponding lens parameter is the (B+1,)
+    # prefix-sum tensor; per-batch length = cu[b+1] - cu[b]. Dense-only.
+    SEQ_KV_LENS_CU: int = 0
+    SEQ_Q_LENS_CU: int = 0
 
     THD_VARLEN: int = 0
 
@@ -478,6 +502,8 @@ def make_cfg_d512(params: TemplateParams) -> Tuple[CfgD512, TmaIters]:
         SCHEDULER_POLICY=params.sched_policy,
         SEQ_KV_LENS_PRESENT=1 if (params.thd_varlen or params.seq_kv_lens_present) else 0,
         SEQ_Q_LENS_PRESENT=int(params.seq_q_lens_present),
+        SEQ_KV_LENS_CU=int(params.seq_kv_lens_cu),
+        SEQ_Q_LENS_CU=int(params.seq_q_lens_cu),
         THD_VARLEN=int(params.thd_varlen),
     )
     _validate_cfg_d512(cfg)
@@ -573,6 +599,10 @@ class CfgD128:
 
     SEQ_KV_LENS_PRESENT: int = 0
     SEQ_Q_LENS_PRESENT: int = 0
+    # cu_seq_len form: the corresponding lens parameter is the (B+1,)
+    # prefix-sum tensor; per-batch length = cu[b+1] - cu[b]. Dense-only.
+    SEQ_KV_LENS_CU: int = 0
+    SEQ_Q_LENS_CU: int = 0
 
     THD_VARLEN: int = 0
 
@@ -638,6 +668,8 @@ def make_cfg_d128(params: TemplateParams) -> Tuple[CfgD128, TmaIters]:
         SCHEDULER_POLICY=params.sched_policy,
         SEQ_KV_LENS_PRESENT=1 if (params.thd_varlen or params.seq_kv_lens_present) else 0,
         SEQ_Q_LENS_PRESENT=int(params.seq_q_lens_present),
+        SEQ_KV_LENS_CU=int(params.seq_kv_lens_cu),
+        SEQ_Q_LENS_CU=int(params.seq_q_lens_cu),
         THD_VARLEN=int(params.thd_varlen),
     )
     _validate_cfg_d128(cfg)
@@ -709,6 +741,8 @@ def make_cfg_d192(params: TemplateParams) -> Tuple[CfgD192, TmaIters]:
         CORRECTION_REGS=40 if _mask_flags_from(params) == MASK_NONE else 88,
         SEQ_KV_LENS_PRESENT=1 if (params.thd_varlen or params.seq_kv_lens_present) else 0,
         SEQ_Q_LENS_PRESENT=int(params.seq_q_lens_present),
+        SEQ_KV_LENS_CU=int(params.seq_kv_lens_cu),
+        SEQ_Q_LENS_CU=int(params.seq_q_lens_cu),
         THD_VARLEN=int(params.thd_varlen),
     )
     _validate_cfg_d192(cfg)

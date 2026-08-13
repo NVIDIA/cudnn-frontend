@@ -341,6 +341,102 @@ def test_dsl_sm100_padded(dtype, d):
     torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
 
 
+def _run_dense_cu_graph(q, k, v, *, scale, dtype, cu_kv, cu_q=None, check_stats=False):
+    """Dense padded graph carrying the cu_seq_len ((B+1,) prefix-sum, cuDNN
+    9.24+) length form, executed through the matching FROST engine. The
+    kernels read len = cu[b+1] - cu[b] on device — no host round-trip, no
+    conversion kernel (the sync-free dense hot path stays sync-free)."""
+    import cudnn
+
+    b, h_q, s_q, _ = q.shape
+    d_v = v.shape[-1]
+    o_gpu = torch.empty(b, s_q, h_q, d_v, device="cuda", dtype=dtype).transpose(1, 2)
+    io = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
+    g = cudnn.pygraph(io_data_type=io, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    tq, tk, tv = g.tensor_like(q), g.tensor_like(k), g.tensor_like(v)
+    t_cu_kv = g.tensor_like(cu_kv)
+    kw = dict(name="sdpa", q=tq, k=tk, v=tv, generate_stats=check_stats, attn_scale=scale, use_padding_mask=True, cu_seq_len_kv=t_cu_kv)
+    vp = {tq: q, tk: k, tv: v, t_cu_kv: cu_kv}
+    if cu_q is not None:
+        t_cu_q = g.tensor_like(cu_q)
+        kw["cu_seq_len_q"] = t_cu_q
+        vp[t_cu_q] = cu_q
+    o, stats = g.sdpa(**kw)
+    o.set_output(True).set_dim(o_gpu.shape).set_stride(o_gpu.stride())
+    lse_gpu = None
+    if check_stats:
+        lse_gpu = torch.empty(b, h_q, s_q, 1, dtype=torch.float32, device="cuda")
+        stats.set_output(True).set_dim(lse_gpu.shape).set_stride(lse_gpu.stride())
+        stats.set_data_type(cudnn.data_type.FLOAT)
+        vp[stats] = lse_gpu
+    g.validate()
+    g.build_operation_graph()
+    g.create_execution_plans([cudnn.heur_mode.A])
+    _select_engine(g, engine_name(q.shape[-1], d_v=d_v))
+    g.check_support()
+    g.build_plans()
+    vp[o] = o_gpu
+    g.execute(vp, torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8))
+    torch.cuda.synchronize()
+    return o_gpu, lse_gpu
+
+
+_CU_FLAVORS = [(512, 512), (256, 256), (192, 128), (128, 128)]
+_CU_FLAVOR_IDS = ["dsv4_d512", "qwen_d256", "dsv3_d192_d128", "llama_d128"]
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d,d_v", _CU_FLAVORS, ids=_CU_FLAVOR_IDS)
+@pytest.mark.parametrize("dtype", _DTYPES, ids=_DTYPE_IDS)
+@torch_fork_set_rng(seed=0)
+def test_dsl_sm100_padded_cu_seq_len(dtype, d, d_v):
+    """Dense padded mask carried in the cu_seq_len ((B+1,) prefix-sum) form:
+    the kernel's CU read mode recovers seq_len_kv[b] = cu[b+1] - cu[b]. The
+    full-length cu_seq_len_q companion also exercises the CU form of the
+    padded-Q trim read (a no-op at full lengths)."""
+    _require_dsl()
+    b, h, s = 2, 8, 256
+    scale = 1.0 / math.sqrt(d)
+    q = _bhsd(b, h, s, d, dtype)
+    k = _bhsd(b, h, s, d, dtype)
+    v = _bhsd(b, h, s, d_v, dtype)
+    kv_lens = [180, 240]
+    cu_kv = torch.tensor([0, kv_lens[0], kv_lens[0] + kv_lens[1]], dtype=torch.int32, device="cuda").view(b + 1, 1, 1, 1)
+    cu_q = torch.tensor([0, s, 2 * s], dtype=torch.int32, device="cuda").view(b + 1, 1, 1, 1)
+    o, _ = _run_dense_cu_graph(q, k, v, scale=scale, dtype=dtype, cu_kv=cu_kv, cu_q=cu_q)
+    o_ref = _ref_sdpa_full(q, k, v, scale=scale, seq_kv_lens=torch.tensor(kv_lens, device="cuda"))
+    torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d,d_v", _CU_FLAVORS, ids=_CU_FLAVOR_IDS)
+@torch_fork_set_rng(seed=0)
+def test_dsl_sm100_padded_cu_q_trim_stats(d, d_v):
+    """Dense padded-Q trim with BOTH lengths in the cu form + Stats: q rows >=
+    cu_q[b+1] - cu_q[b] must come back O := 0 / LSE := -inf (cuDNN >= 9.14),
+    live rows must match the reference — per f16 kernel flavor (each has its
+    own epilogue trim read)."""
+    _require_dsl()
+    dtype = torch.float16
+    b, h, s = 2, 4, 256
+    scale = 1.0 / math.sqrt(d)
+    q = _bhsd(b, h, s, d, dtype)
+    k = _bhsd(b, h, s, d, dtype)
+    v = _bhsd(b, h, s, d_v, dtype)
+    q_lens = [130, 256]
+    kv_lens = [180, 240]
+    cu_q = torch.tensor([0, q_lens[0], q_lens[0] + q_lens[1]], dtype=torch.int32, device="cuda").view(b + 1, 1, 1, 1)
+    cu_kv = torch.tensor([0, kv_lens[0], kv_lens[0] + kv_lens[1]], dtype=torch.int32, device="cuda").view(b + 1, 1, 1, 1)
+    o, lse = _run_dense_cu_graph(q, k, v, scale=scale, dtype=dtype, cu_kv=cu_kv, cu_q=cu_q, check_stats=True)
+    o_ref, lse_ref = _ref_sdpa_full(q, k, v, scale=scale, seq_kv_lens=torch.tensor(kv_lens, device="cuda"), return_stats=True)
+    lse = lse.view(b, h, s)
+    for bi, q_len in enumerate(q_lens):
+        torch.testing.assert_close(o[bi, :, :q_len], o_ref[bi, :, :q_len], atol=5e-2, rtol=3e-2)
+        torch.testing.assert_close(lse[bi, :, :q_len], lse_ref[bi, :, :q_len], atol=5e-2, rtol=3e-2)
+        assert (o[bi, :, q_len:] == 0).all(), f"batch {bi}: trimmed O rows must be zero"
+        assert (lse[bi, :, q_len:] == float("-inf")).all(), f"batch {bi}: trimmed LSE rows must be -inf"
+
+
 @pytest.mark.L0
 @pytest.mark.parametrize("d", _FLAVORS, ids=_FLAVOR_IDS)
 @pytest.mark.parametrize("dtype", _DTYPES, ids=_DTYPE_IDS)

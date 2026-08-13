@@ -165,6 +165,7 @@ def _run_case(
     window_size_right: int | None = None,
     seq_q_lens: torch.Tensor | None = None,
     seq_kv_lens: torch.Tensor | None = None,
+    cu_lens: bool = False,
     scale: float | None = None,
     with_sink: bool = False,
     check_stats: bool = False,
@@ -191,6 +192,7 @@ def _run_case(
         kv_tile=kv_tile,
         scale=scale,
         return_stats=check_stats,
+        cu_lens=cu_lens,
         **mask_kwargs,
     )
     if check_stats:
@@ -237,6 +239,7 @@ def _run_dsl_graph(
     window_size_right: int | None = None,
     seq_q_lens: torch.Tensor | None = None,
     seq_kv_lens: torch.Tensor | None = None,
+    cu_lens: bool = False,
     sinks: torch.Tensor | None = None,
     q_tile: int | None = None,
     kv_tile: int | None = None,
@@ -289,14 +292,30 @@ def _run_dsl_graph(
     )
     if seq_q_lens is not None or seq_kv_lens is not None:
         assert seq_q_lens is not None and seq_kv_lens is not None
-        seq_q = graph.tensor_like(seq_q_lens, name="seq_q")
-        seq_kv = graph.tensor_like(seq_kv_lens, name="seq_kv")
-        sdpa_kwargs.update(
-            use_padding_mask=True,
-            seq_len_q=seq_q,
-            seq_len_kv=seq_kv,
-        )
-        variant_pack.update({seq_q: seq_q_lens, seq_kv: seq_kv_lens})
+        if cu_lens:
+            # Dense cu_seq_len form (cuDNN 9.24+): bind the (B+1,) prefix
+            # sums; the kernel reads len = cu[b+1] - cu[b] on device.
+            def _cu(lens):
+                return torch.cat([torch.zeros(1, dtype=torch.int32, device=lens.device), lens.reshape(-1).cumsum(0).to(torch.int32)]).view(-1, 1, 1, 1)
+
+            cuq_t, cukv_t = _cu(seq_q_lens), _cu(seq_kv_lens)
+            seq_q = graph.tensor_like(cuq_t, name="cu_seq_q")
+            seq_kv = graph.tensor_like(cukv_t, name="cu_seq_kv")
+            sdpa_kwargs.update(
+                use_padding_mask=True,
+                cu_seq_len_q=seq_q,
+                cu_seq_len_kv=seq_kv,
+            )
+            variant_pack.update({seq_q: cuq_t, seq_kv: cukv_t})
+        else:
+            seq_q = graph.tensor_like(seq_q_lens, name="seq_q")
+            seq_kv = graph.tensor_like(seq_kv_lens, name="seq_kv")
+            sdpa_kwargs.update(
+                use_padding_mask=True,
+                seq_len_q=seq_q,
+                seq_len_kv=seq_kv,
+            )
+            variant_pack.update({seq_q: seq_q_lens, seq_kv: seq_kv_lens})
     if sinks is not None:
         sink_t = graph.tensor_like(sinks, name="sink")
         sdpa_kwargs["sink_token"] = sink_t
@@ -711,6 +730,48 @@ def test_dsl_sm120_stats_padded_trim():
         head_dim=64,
         seq_q_lens=seq_q_lens,
         seq_kv_lens=seq_kv_lens,
+        check_stats=True,
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=14)
+def test_dsl_sm120_padded_cu_seq_len():
+    """Dense padded mask carried in the cu_seq_len ((B+1,) prefix-sum) form:
+    the kernel's CU read mode recovers len = cu[b+1] - cu[b] on device — no
+    host round-trip, no conversion kernel."""
+
+    seq_q_lens = torch.tensor([256, 256], dtype=torch.int32, device="cuda")
+    seq_kv_lens = torch.tensor([180, 240], dtype=torch.int32, device="cuda")
+    _run_case(
+        batch=2,
+        h_q=4,
+        h_kv=2,
+        s_q=256,
+        s_kv=256,
+        head_dim=128,
+        seq_q_lens=seq_q_lens,
+        seq_kv_lens=seq_kv_lens,
+        cu_lens=True,
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=14)
+def test_dsl_sm120_stats_padded_trim_cu_seq_len():
+    """The padded-Q trim (LSE = -inf past seq_len_q[b]) with BOTH lengths in
+    the cu form — the dense Q-length CU read feeds the same trim path."""
+
+    seq_q_lens = torch.tensor([96, 128], dtype=torch.int32, device="cuda")
+    seq_kv_lens = torch.tensor([0, 64], dtype=torch.int32, device="cuda")
+    _run_case(
+        batch=2,
+        s_q=128,
+        s_kv=128,
+        head_dim=64,
+        seq_q_lens=seq_q_lens,
+        seq_kv_lens=seq_kv_lens,
+        cu_lens=True,
         check_stats=True,
     )
 

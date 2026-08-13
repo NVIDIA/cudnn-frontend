@@ -331,9 +331,11 @@ class SdpaFwdDsl(APIBase):
         self.seq_q_lens_present = bool(seq_q_lens_present)
         # cu_seq_len form (cuDNN 9.24+): the corresponding seq-lens execute
         # argument arrives as a (B+1,)-int32 PREFIX-SUM tensor instead of
-        # (B,) per-batch lengths. THD-only today: the ragged lowering derives
-        # both forms host-side from its inherent tolist round-trip; the dense
-        # kernels have no CU read mode yet (check_support rejects).
+        # (B,) per-batch lengths. THD derives both forms host-side from its
+        # inherent tolist round-trip; dense graphs bind the (B+1,) tensor
+        # directly and the f16 kernels read len = cu[b+1] - cu[b] on device
+        # (the sync-free dense hot path stays sync-free). The FP8/MXFP8
+        # kernels are not plumbed (check_support rejects).
         self.cu_seq_q_lens = bool(cu_seq_q_lens)
         self.cu_seq_kv_lens = bool(cu_seq_kv_lens)
         self.has_sink = bool(has_sink)
@@ -856,10 +858,24 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         )
         if self.thd:
             self.seq_kv_lens_present = True
+        # cu_seq_len form: THD consumes either form host-side; dense graphs
+        # use the f16 kernels' CU read mode (len = cu[b+1] - cu[b]). The
+        # FP8/MXFP8 execute paths are not plumbed for the (B+1,) form.
         self._not_implemented_error_if(
-            (self.cu_seq_q_lens or self.cu_seq_kv_lens) and not self.thd,
-            "cu_seq_len_* is THD-only (the dense kernels have no CU read mode yet)",
+            (self.cu_seq_q_lens or self.cu_seq_kv_lens) and self._fp8 and not self.thd,
+            "dense cu_seq_len_* is not plumbed for the FP8/MXFP8 kernels",
         )
+        if not self.thd:
+            # The cu flags declare the FORM of the corresponding lengths
+            # argument; the *_present flags still declare its PRESENCE.
+            self._value_error_if(
+                self.cu_seq_kv_lens and not self.seq_kv_lens_present,
+                "cu_seq_kv_lens declares the form of the KV lengths and requires seq_kv_lens_present=True",
+            )
+            self._value_error_if(
+                self.cu_seq_q_lens and not self.seq_q_lens_present,
+                "cu_seq_q_lens declares the form of the Q lengths and requires seq_q_lens_present=True",
+            )
         # Dense padded-Q trim backstops (engines.lower_dsl_prefill never sets
         # these combinations; a direct caller could).
         self._value_error_if(
@@ -941,6 +957,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             has_sink=self.has_sink,
             seq_kv_lens_present=self.seq_kv_lens_present,
             seq_q_lens_present=self.seq_q_lens_present,
+            # Dense-only kernel CU read mode; the THD cu form is consumed
+            # host-side and compiles to the same THD specialization.
+            seq_kv_lens_cu=self.cu_seq_kv_lens and not self.thd,
+            seq_q_lens_cu=self.cu_seq_q_lens and not self.thd,
             sched_policy=sched_policy,
             thd_varlen=self.thd,
             fused_ldtm_stat=fused_ldtm_stat,
@@ -1163,17 +1183,22 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             else self._dummy("sinks", device, lambda: torch.zeros(self.h_q, dtype=torch.float32, device=device))
         )
         seq_kv_t = (
-            self._checked_seq_lens(seq_kv_lens, "seq_kv_lens")
+            (self._checked_cu_seq_lens(seq_kv_lens, "cu_seq_len_kv") if self.cu_seq_kv_lens else self._checked_seq_lens(seq_kv_lens, "seq_kv_lens"))
             if seq_kv_lens is not None
             else self._dummy("seq_kv", device, lambda: torch.zeros(self.batch_size, dtype=torch.int32, device=device))
         )
         # Dense padded-Q trim: per-batch Q lengths are their OWN kernel
         # parameter (compiled in only when seq_q_lens_present — the kernel
         # signature is specialized on `None`, so the flag-off ABI is
-        # unchanged). The caller's (B,)-int32 device tensor is bound directly
+        # unchanged). The caller's device tensor — (B,)-int32 lengths or the
+        # (B+1,)-int32 cu prefix sums under cu_seq_q_lens — is bound directly
         # as a validated view — zero allocations/copies on the execute hot
         # path, stable pointer (CUDA-graph-capture friendly).
-        seq_q_t = self._checked_seq_lens(seq_q_lens, "seq_q_lens") if self.seq_q_lens_present else None
+        seq_q_t = (
+            (self._checked_cu_seq_lens(seq_q_lens, "cu_seq_len_q") if self.cu_seq_q_lens else self._checked_seq_lens(seq_q_lens, "seq_q_lens"))
+            if self.seq_q_lens_present
+            else None
+        )
         o_desc_dummy = self._dummy("o_desc", device, lambda: torch.zeros(1, dtype=torch.int64, device=device))
 
         import cutlass
@@ -1770,10 +1795,19 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         if self.thd:
             self._value_error_if(self.seq_q_lens_present, "seq_q_lens_present is dense-only (THD carries per-sequence Q lengths via cu_seqlens)")
             self.seq_kv_lens_present = True
-        self._not_implemented_error_if(
-            (self.cu_seq_q_lens or self.cu_seq_kv_lens) and not self.thd,
-            "cu_seq_len_* is THD-only (the dense kernels have no CU read mode yet)",
-        )
+        # cu_seq_len form: THD consumes either form host-side; dense graphs
+        # use the f16 kernel's CU read mode (len = cu[b+1] - cu[b]). The cu
+        # flags declare the FORM of the corresponding lengths argument; the
+        # *_present flags still declare its PRESENCE.
+        if not self.thd:
+            self._value_error_if(
+                self.cu_seq_kv_lens and not self.seq_kv_lens_present,
+                "cu_seq_kv_lens declares the form of the KV lengths and requires seq_kv_lens_present=True",
+            )
+            self._value_error_if(
+                self.cu_seq_q_lens and not self.seq_q_lens_present,
+                "cu_seq_q_lens declares the form of the Q lengths and requires seq_q_lens_present=True",
+            )
         self._value_error_if(
             self.sched_policy is not None and self.sched_policy != SCHED_NATURAL,
             f"SM120 DSL SDPA only supports sched_policy={SCHED_NATURAL}",
@@ -1896,6 +1930,12 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             )
             self._value_error_if(self.has_sink, "SM120 fp8 does not support attention sinks (Amax_S semantics)")
             self._value_error_if(self.seq_q_lens_present and not self.thd, "SM120 fp8 does not support per-batch seq_len_q")
+            # The fp8 kernel has no dense CU read mode (its template rejects
+            # the cu flags); THD cu is consumed host-side and stays served.
+            self._not_implemented_error_if(
+                (self.cu_seq_q_lens or self.cu_seq_kv_lens) and not self.thd,
+                "cu_seq_len_* is not plumbed for the SM120 fp8 kernel",
+            )
             self._value_error_if(
                 any(d not in _SM120_FP8_HEAD_TILES for d in (d_q, d_v)),
                 f"SM120 fp8 requires D_QK and D_V to be multiples of 32 within 32..256 (k32 contraction and 1-byte "
@@ -1998,6 +2038,10 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             bottom_right=self.causal_bottom_right,
             seq_q_lens_present=self.seq_q_lens_present,
             seq_kv_lens_present=self.seq_kv_lens_present,
+            # Dense-only kernel CU read mode; the THD cu form is consumed
+            # host-side and compiles to the same THD specialization.
+            seq_q_lens_cu=self.cu_seq_q_lens and not self.thd,
+            seq_kv_lens_cu=self.cu_seq_kv_lens and not self.thd,
             has_sink=self.has_sink,
             thd_varlen=self.thd,
             q_tile=self.q_tile,
@@ -2117,7 +2161,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         lse = self._checked_lse_view(lse_tensor) if lse_tensor is not None else None
         sinks_t = self._checked_sinks_1d(sinks) if sinks is not None else None
         seq_q_lens = (
-            self._checked_seq_lens(seq_q_lens, "seq_q_lens")
+            (self._checked_cu_seq_lens(seq_q_lens, "cu_seq_len_q") if self.cu_seq_q_lens else self._checked_seq_lens(seq_q_lens, "seq_q_lens"))
             if seq_q_lens is not None
             else self._dummy(
                 "seq_q_lens",
@@ -2126,7 +2170,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             )
         )
         seq_kv_lens = (
-            self._checked_seq_lens(seq_kv_lens, "seq_kv_lens")
+            (self._checked_cu_seq_lens(seq_kv_lens, "cu_seq_len_kv") if self.cu_seq_kv_lens else self._checked_seq_lens(seq_kv_lens, "seq_kv_lens"))
             if seq_kv_lens is not None
             else self._dummy(
                 "seq_kv_lens",

@@ -389,7 +389,12 @@ def make_sdpa_helpers(CFG, lpt_q_tiles_in_cga_units: bool = False) -> SdpaHelper
             cga_base_super = q_super_idx - cta_in_pair
             q_row_coord = cga_base_super * cutlass.Int32(CFG.TILES_Q * CFG.TILE_M)
             arr = cutlass.make_array_view(seq_q_lens_tensor)
-            q_len_b = cutlass.Int32(arr[batch_idx])
+            if cutlass.const_expr(int(getattr(CFG, "SEQ_Q_LENS_CU", 0)) == 1):
+                # cu_seq_len form (cuDNN 9.24+): the parameter is the (B+1,)
+                # prefix-sum tensor; the length is the adjacent difference.
+                q_len_b = cutlass.Int32(arr[batch_idx + cutlass.Int32(1)]) - cutlass.Int32(arr[batch_idx])
+            else:
+                q_len_b = cutlass.Int32(arr[batch_idx])
             tile_dead = q_row_coord >= q_len_b
             dead_lo = cutlass.Int32(arith.select(tile_dead.ir_value(), b.left.ir_value(), b.unmasked_lo.ir_value()))
             dead_hi = cutlass.Int32(arith.select(tile_dead.ir_value(), b.left.ir_value(), b.unmasked_hi.ir_value()))
@@ -401,6 +406,12 @@ def make_sdpa_helpers(CFG, lpt_q_tiles_in_cga_units: bool = False) -> SdpaHelper
     def _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, scalar_seqlen_kv):
         if cutlass.const_expr(CFG.SEQ_KV_LENS_PRESENT == 1):
             arr = cutlass.make_array_view(seq_kv_lens_tensor)
+            if cutlass.const_expr(int(getattr(CFG, "SEQ_KV_LENS_CU", 0)) == 1):
+                # cu_seq_len form (cuDNN 9.24+, dense-only — THD reads its
+                # packed metadata's kv-lens region instead): the parameter is
+                # the (B+1,) prefix-sum tensor; the per-batch KV length is the
+                # adjacent difference, read sync-free on device.
+                return cutlass.Int32(arr[batch_idx + cutlass.Int32(1)]) - cutlass.Int32(arr[batch_idx])
             return cutlass.Int32(arr[batch_idx])
         return scalar_seqlen_kv
 
