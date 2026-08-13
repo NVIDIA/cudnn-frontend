@@ -951,13 +951,16 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             self._compiled_kernel = "thd-deferred"
         elif self._fp8:
             # FP8/MXFP8 kernels are exact-match d128 (gated in check_support);
-            # their compile() has no envelope head-dim parameters.
+            # their compile() has no envelope head-dim parameters. has_lse=False
+            # (no Stats output) compiles the LSE store out — no dummy buffer at
+            # any level (the amax_s/amax_o atomicMax writes are independent).
             self._compiled_kernel = self._k_mod.compile(
                 b=self.batch_size,
                 qh=self.h_q,
                 kh=self.h_kv,
                 sq=self.s_q_max,
                 skv=self.s_k_max,
+                has_lse=self.lse_desc is not None,
             )
         else:
             # ENVELOPE: hand the f16/bf16 kernel the ACTUAL head dims so its
@@ -983,7 +986,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         Fixed by the compiled geometry (call after ``check_support()``); 0 when
         the path allocates nothing per execute. This is the api-level share of
         a FROST executor's ``workspace_bytes`` (the engine lowering adds its
-        own chunks — dummy LSE, synthesized seq_len_kv — on top; see
+        own chunks — synthesized seq_len_kv — on top; see
         ``engines.lower_dsl_prefill``). When ``execute()`` is called WITHOUT a
         workspace (standalone API use), these buffers are torch-allocated per
         execute instead — the carve path is what the FROST dispatch uses.
@@ -1064,30 +1067,21 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             self.lse_desc is not None and lse_tensor is None,
             "lse_tensor is required by this compiled specialization",
         )
-        # Strict presence contract, both directions: the f16 kernels are
-        # compiled with has_lse keyed on sample_lse (no Stats output -> the
-        # LSE store is compiled out and there is no LSE slot to bind), and a
-        # THD lse_tensor is bound in its DECLARED packed layout (recorded at
-        # check_support) — so an lse_tensor without a sample_lse cannot be
-        # honored and is rejected rather than silently dropped. The FP8/MXFP8
-        # kernels (dense-only) still write an LSE unconditionally; their
-        # stats-less write lands in a cached write-only dummy (the FROST
-        # dispatch never reaches it: engines.lower_dsl_prefill carves the
-        # dummy from the caller's workspace instead).
+        # Strict presence contract, both directions: every SM100 kernel
+        # (f16/bf16, FP8, MXFP8) is compiled with has_lse keyed on sample_lse
+        # (no Stats output -> the LSE store is compiled out and there is no
+        # LSE slot to bind), and a THD lse_tensor is bound in its DECLARED
+        # packed layout (recorded at check_support) — so an lse_tensor without
+        # a sample_lse cannot be honored and is rejected rather than silently
+        # dropped.
         self._value_error_if(
-            self.lse_desc is None and lse_tensor is not None and not self._fp8,
+            self.lse_desc is None and lse_tensor is not None,
             "this specialization was compiled without an LSE output; construct the API with sample_lse",
         )
         if self.thd:
             pass  # bound in _execute_thd (declared packed layout)
         elif lse_tensor is not None:
             lse_tensor = self._checked_lse_view(lse_tensor)
-        elif self._fp8:
-            lse_tensor = self._dummy(
-                "lse",
-                q_tensor.device,
-                lambda: torch.empty((self.batch_size, self.h_q, self.s_q_max), dtype=torch.float32, device=q_tensor.device),
-            )
 
         if self._fp8 and self._pertensor:
             # Per-tensor FP8 (sdpa_fp8): scalar descales fold into the softmax scale
@@ -1395,7 +1389,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         sf_k_v = self._reshape_sf(sf_k, h_kv, n_kv_tiles, km.SF_SMEM_SIZE_K)
         sf_v_v = self._reshape_sf(sf_v, h_kv, n_kv_tiles, km.SF_SMEM_SIZE_V)
 
-        lse = lse_tensor.reshape(b, h_q, sq)
+        # has_lse=False (no Stats output): the store is compiled out; bind None.
+        lse = lse_tensor.reshape(b, h_q, sq) if lse_tensor is not None else None
         sinks_t = (
             self._checked_sinks_1d(sinks) if sinks is not None else self._dummy("sinks", device, lambda: torch.zeros(h_q, dtype=torch.float32, device=device))
         )
@@ -1488,7 +1483,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         O_view, o_needs_copy_back, O_scratch = self._to_bshd_writable(o_tensor)
         O = O_scratch if o_needs_copy_back else O_view
 
-        lse = lse_tensor.reshape(b, h_q, sq)
+        # has_lse=False (no Stats output): the store is compiled out; bind None.
+        lse = lse_tensor.reshape(b, h_q, sq) if lse_tensor is not None else None
         sinks_t = (
             self._checked_sinks_1d(sinks) if sinks is not None else self._dummy("sinks", device, lambda: torch.zeros(h_q, dtype=torch.float32, device=device))
         )

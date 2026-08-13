@@ -30,7 +30,7 @@ follow-up (needs a THD-aware quantizer); drive via the kernel / the DSL backend.
 import os
 import sys
 from functools import lru_cache
-from typing import Callable, Tuple
+from typing import Callable, Optional, Tuple
 
 
 from cutlass.base_dsl.typing import Pointer  # was the legacy DSL Pointer pre-DKG-bump
@@ -223,7 +223,7 @@ def _kernel(
     tma_k_desc: cutlass.GridConstant[tmap.TensorMap],
     tma_v_desc: cutlass.GridConstant[tmap.TensorMap],
     tma_o_desc: cutlass.GridConstant[tmap.TensorMap],
-    lse_tensor: cute.Tensor,
+    lse_tensor: Optional[cute.Tensor],
     sinks_tensor: cute.Tensor,
     seq_kv_lens_tensor: cute.Tensor,
     o_desc_words: cute.Tensor,
@@ -1522,7 +1522,7 @@ def _correction_warp_group(
     tidx,
     bars,
     sched,
-    lse_tensor: cute.Tensor,
+    lse_tensor: Optional[cute.Tensor],
     sinks_tensor: cute.Tensor,
     seq_kv_lens_tensor,
     n_q_supers,
@@ -1710,16 +1710,20 @@ def _correction_warp_group(
                 _s_q_b = cutlass.Int32(_cu[n_batch + batch_idx + cutlass.Int32(1)]) - _cu_q_b
                 _row_valid = q_row_global < _s_q_b
                 if _row_valid:
-                    lse_arr = cutlass.make_array_view(lse_tensor)
-                    lse_row = lse_arr[cutlass.Int32(0), head_idx, :]
-                    lse_row[_cu_q_b + q_row_global] = lse_val
+                    # has_lse=False: the Stats store is compiled out; the amax_s
+                    # atomicMax is independent of it and always live.
+                    if cutlass.const_expr(lse_tensor is not None):
+                        lse_arr = cutlass.make_array_view(lse_tensor)
+                        lse_row = lse_arr[cutlass.Int32(0), head_idx, :]
+                        lse_row[_cu_q_b + q_row_global] = lse_val
                     nvvm.atomicrmw(nvvm.AtomicOp.MAX, _amax_s_ptr, _beta_bits)
             else:
                 _row_valid = q_row_global < seqlen_q
                 if _row_valid:
-                    lse_arr = cutlass.make_array_view(lse_tensor)
-                    lse_row = lse_arr[batch_idx, head_idx, :]
-                    lse_row[q_row_global] = lse_val
+                    if cutlass.const_expr(lse_tensor is not None):
+                        lse_arr = cutlass.make_array_view(lse_tensor)
+                        lse_row = lse_arr[batch_idx, head_idx, :]
+                        lse_row[q_row_global] = lse_val
                     nvvm.atomicrmw(nvvm.AtomicOp.MAX, _amax_s_ptr, _beta_bits)
 
             # amax_o = max over valid rows of |o_scaled| (the fp32 pre-cast output). Divided
@@ -1859,7 +1863,7 @@ def _host(
     k_tensor: cute.Tensor,
     v_tensor: cute.Tensor,
     o_tensor: cute.Tensor,
-    lse_tensor: cute.Tensor,
+    lse_tensor: Optional[cute.Tensor],
     sinks_tensor: cute.Tensor,
     seq_kv_lens_tensor: cute.Tensor,
     o_desc_words: cute.Tensor,
@@ -1969,10 +1973,13 @@ def _host(
 
 
 @lru_cache(maxsize=None)
-def compile(b: int = 1, qh: int = 1, kh: int = 1, sq: int = 256, skv: int = 128) -> Callable:  # noqa: A001
+def compile(b: int = 1, qh: int = 1, kh: int = 1, sq: int = 256, skv: int = 128, has_lse: bool = True) -> Callable:  # noqa: A001
     """Compile with ALL dims concrete — pins TMA strides at compile time.
 
-    THD/varlen: q/k/v/o/lse PACKED with batch dim 1; ``b`` = logical batch."""
+    THD/varlen: q/k/v/o/lse PACKED with batch dim 1; ``b`` = logical batch.
+    ``has_lse=False`` compiles the LSE store out (the kernel specializes on a
+    ``None`` LSE argument) — callers without a Stats output pass no LSE buffer
+    at all; the amax_s/amax_o atomicMax writes are independent and unchanged."""
     _fake_batch = 1 if CFG.THD_VARLEN else b
     fake_q = cute.runtime.make_fake_compact_tensor(
         STORAGE_DTYPE,
@@ -1998,12 +2005,17 @@ def compile(b: int = 1, qh: int = 1, kh: int = 1, sq: int = 256, skv: int = 128)
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
     )
-    fake_lse = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float32,
-        (_fake_batch, qh, sq),
-        stride_order=(2, 1, 0),
-        assumed_align=16,
-    )
+    if not has_lse:
+        # No Stats output: the LSE argument is None-specialized and the store
+        # is compiled out entirely — no dummy buffer exists at any level.
+        fake_lse = None
+    else:
+        fake_lse = cute.runtime.make_fake_compact_tensor(
+            cutlass.Float32,
+            (_fake_batch, qh, sq),
+            stride_order=(2, 1, 0),
+            assumed_align=16,
+        )
     # Always part of the ABI; unread when CFG.HAS_SINK == 0 (compile-time fold).
     fake_sinks = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32,

@@ -89,7 +89,7 @@ def _ref(qd, kd, vd, *, scale, is_causal=False, bottom_right=False, swa_window=N
     return torch.matmul(torch.softmax(scores, dim=-1), v_e)
 
 
-def _run(B, H_q, H_kv, S, in_key, out_dt, *, scale, sdpa_kwargs, sink=None):
+def _run(B, H_q, H_kv, S, in_key, out_dt, *, scale, sdpa_kwargs, sink=None, stats=True):
     """Quantize, build the sdpa_mxfp8 graph, route to the frost engine, execute.
     Returns (O_frost [B,H,S,D] on device, O_ref fp32 [B,H,S,D])."""
     import cudnn
@@ -133,16 +133,17 @@ def _run(B, H_q, H_kv, S, in_key, out_dt, *, scale, sdpa_kwargs, sink=None):
     dq = _sf((B, H_q, sqp, dsc))
     dk = _sf((B, H_kv, skp, dsc))
     dv = _sf((B, H_kv, ssc, dvp))
-    kw = dict(q=q, k=k, v=v, descale_q=dq, descale_k=dk, descale_v=dv, attn_scale=scale, generate_stats=True)
+    kw = dict(q=q, k=k, v=v, descale_q=dq, descale_k=dk, descale_v=dv, attn_scale=scale, generate_stats=stats)
     vp = {q: Qb, k: Kb, v: Vb, dq: sfq_g, dk: sfk_g, dv: sfv_g}
     if sink is not None:
         st = g.tensor_like(sink)
         kw["sink_token"] = st
         vp[st] = sink
     kw.update(sdpa_kwargs)
-    o, stats, amax_o = g.sdpa_mxfp8(**kw)
+    o, stats_t, amax_o = g.sdpa_mxfp8(**kw)
     o.set_output(True).set_dim(list(Ob.shape)).set_stride(list(Ob.stride())).set_data_type(otype)
-    stats.set_output(True).set_dim([B, H_q, S, 1]).set_stride([H_q * S, S, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
+    if stats:
+        stats_t.set_output(True).set_dim([B, H_q, S, 1]).set_stride([H_q * S, S, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
     amax_o.set_output(True).set_dim([1, 1, 1, 1]).set_stride([1, 1, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
 
     g.validate()
@@ -151,7 +152,13 @@ def _run(B, H_q, H_kv, S, in_key, out_dt, *, scale, sdpa_kwargs, sink=None):
     _select_engine(g, engine_name(128, mxfp8=True))
     g.check_support()
     g.build_plans()
-    vp.update({o: Ob, stats: lse, amax_o: amax})
+    if not stats:
+        # No Stats output: the kernel compiles the LSE store out (has_lse=False)
+        # — no dummy buffer exists at any level, so the dense workspace is 0.
+        assert g.get_workspace_size() == 0
+    vp.update({o: Ob, amax_o: amax})
+    if stats:
+        vp[stats_t] = lse
     g.execute(vp, torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8))
     torch.cuda.synchronize()
 
@@ -199,6 +206,19 @@ _MASKS = {
     "causal_br": dict(use_causal_mask_bottom_right=True),
     "swa": dict(use_causal_mask=True, diagonal_band_left_bound=65),  # window = 64
 }
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("in_key", _INS)
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_stats_less_zero_workspace(in_key):
+    """No Stats output: the kernel compiles the LSE store out (has_lse=False),
+    no dummy buffer exists at any level, and the dense graph reports
+    ``get_workspace_size() == 0`` (asserted inside ``_run``). The Amax_O
+    atomicMax write is independent of the LSE and still produced."""
+    scale = 1.0 / math.sqrt(128)
+    O, O_ref, _ = _run(2, 8, 8, 256, in_key, torch.float16, scale=scale, sdpa_kwargs=dict(use_causal_mask=True), stats=False)
+    _check(O, O_ref, torch.float16, in_key)
 
 
 @pytest.mark.L0

@@ -153,9 +153,10 @@ class Capabilities:
     sink: bool = False
     stats: bool = False
     # The adapter accepts lse_tensor=None (its kernel None-specializes the LSE
-    # store), so a stats-less graph needs no dummy-LSE workspace chunk. Rows
-    # that keep False (the SM100 FP8/MXFP8 flavors) always write an LSE and get
-    # a carved dummy from lower_dsl_prefill when the graph has no Stats output.
+    # store), so a stats-less graph needs no dummy-LSE workspace chunk. Every
+    # lower_dsl_prefill row sets True (the SM100 FP8/MXFP8 flavors were the
+    # last holdouts); the SM80 row keeps the False default but lowers through
+    # its own adapter (lower_sm80_prefill), which never reads this flag.
     lse_optional: bool = False
     # THD lowerings assume FULLY-PACKED storage: the packed addressing is
     # re-derived as prefix(lens) x token stride, and the graph's bound
@@ -451,6 +452,7 @@ def _sm100_mxfp8_spec(d: int) -> EngineSpec:
             padded=True,
             sink=True,
             stats=True,
+            lse_optional=True,
             sched_policies=frozenset({SCHED_NATURAL}),
             tile_ms=frozenset({128}),
             tile_ns=frozenset({128}),
@@ -488,6 +490,7 @@ def _sm100_fp8_spec(d: int) -> EngineSpec:
             padded=True,
             sink=True,
             stats=True,
+            lse_optional=True,
             # The fp8 kernel lacks the SEQ_Q_LENS_PRESENT epilogue trim, but its
             # only reachable padded+stats population is KV-only padding with
             # full-length seq_len_q (the fp8 suite; test_mhas_v2 fp8 padding
@@ -756,22 +759,15 @@ def lower_dsl_prefill(
     # buffer is carved from the CALLER's workspace, so its size is fixed here at
     # build time and recorded on the executor as ``workspace_bytes`` — that
     # number is what the plan's CompiledPlan.get_workspace_size() reports.
-    #   - dummy LSE (dense, stats absent, non-lse_optional adapters): the
-    #     SM100 FP8/MXFP8 kernels always write an LSE; without a Stats output
-    #     it lands in b*h_q*s_q fp32 scratch. lse_optional adapters (the f16
-    #     flavors, SM120) compile the LSE store out instead and bind no
-    #     buffer. (THD needs no engine-level LSE chunk either way.)
     #   - synthesized seq_len_kv (skv_tail_via_padding rows): b int32.
     #   - api-level scratch (api.scratch_workspace_bytes()): the dense padded
     #     [seq_kv|seq_q] combine and the THD metadata/LSE buffers.
-    dummy_lse_bytes = (
-        0
-        if (not spec.capabilities.stats or spec.capabilities.lse_optional or facts.stats_t is not None or facts.thd)
-        else ws_align(facts.b * facts.h_q * facts.s_q * 4)
-    )
+    # No dummy-LSE chunk: every lower_dsl_prefill row is lse_optional (the
+    # kernels None-specialize the LSE argument and compile the store out), so
+    # a stats-less graph binds no LSE buffer at any level.
     synth_kv_bytes = ws_align(facts.b * 4) if synth_kv_padding else 0
     api_scratch_bytes = api.scratch_workspace_bytes()
-    total_workspace_bytes = dummy_lse_bytes + synth_kv_bytes + api_scratch_bytes
+    total_workspace_bytes = synth_kv_bytes + api_scratch_bytes
 
     binding = ga.SdpaBinding(
         q=facts.q_t,
@@ -832,12 +828,9 @@ def lower_dsl_prefill(
         import torch  # execute path: a real tensor is about to be carved
 
         carver = WorkspaceCarver(workspace, total_workspace_bytes, spec.name) if total_workspace_bytes else None
+        # Stats-less graphs bind lse_buf=None: every adapter here is
+        # lse_optional (the kernel compiles the LSE store out) — no dummy.
         lse_buf = resolved.get(id(binding.stats)) if binding.stats is not None else None
-        if lse_buf is None and spec.capabilities.stats and not spec.capabilities.lse_optional and not facts.thd:
-            # Dummy LSE for stats-less dense graphs — carved, not allocated
-            # (uninitialized is fine: the kernel writes every row). lse_optional
-            # adapters take lse_tensor=None instead.
-            lse_buf = carver.take(facts.b * facts.h_q * facts.s_q, torch.float32)
         # Shared presence-checked resolution (graph_analyzer.resolve_feature_operands);
         # bias/block_mask/alibi stay None for these rows (mismatch gates them).
         feature_ops = ga.resolve_feature_operands(facts, resolved)
