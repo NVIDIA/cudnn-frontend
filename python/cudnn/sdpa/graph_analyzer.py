@@ -666,10 +666,11 @@ class SdpaBinding:
     dsink: Any = None
 
     # Built once on first use and reused. A binding is constructed by the
-    # engine's lowering and never mutated afterwards, so which tensors it binds
-    # -- and their names and uids -- are build-time facts. Rebuilding them per
-    # execute cost ~1.3 us per bound operand: get_name/uid_assigned/get_uid are
-    # pybind round trips, and the old code made three passes.
+    # engine's lowering, after the graph is frozen, and never mutated
+    # afterwards -- and a frozen graph can no longer re-uid or rename a tensor,
+    # so the names and uids this indexes are build-time facts too. Rebuilding
+    # them per execute cost ~1.3 us per bound operand: three passes over the
+    # bound list and five dict constructions, not any one expensive getter.
     # init=False so a replace()d binding rebuilds rather than inheriting a
     # cache for the operands it no longer has; compare/repr excluded so the
     # cache cannot change how a binding prints or compares.

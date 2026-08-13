@@ -46,8 +46,8 @@ class _FrostSdpaFwdPlan(CompiledPlan):
         # graph API hands us covers every IO tensor of the graph, so key the
         # kernel's own operands out of it by uid (uids are eager and unique).
         self._tensors = list(compiled.binding.bound_tensors())
-        # get_uid() is a pybind round trip and a bound tensor's uid is fixed
-        # once the graph is frozen, so read them here rather than per execute.
+        # A bound tensor's uid is fixed once the graph is frozen, so read them
+        # here rather than re-walking the list on every execute.
         self._uids = [t.get_uid() for t in self._tensors]
         self._workspace_bytes = int(getattr(compiled, "workspace_bytes", 0) or 0)
 

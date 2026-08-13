@@ -72,10 +72,12 @@ unsupported input runnable.
 Rules 1 and 2 both cite CUDA-graph capture as the reason for what they ban, but
 neither names the thing that breaks it most directly: a device-to-host read.
 
-- **No `.item()` / `.tolist()` / `.cpu()` / `.numpy()` / `float(tensor)` /
-  `int(tensor)`**, and no branch or f-string that forces one, on an execute
-  argument or anything derived from one. A D2H read makes `execute()`
-  synchronous — the whole point of an async launch API is gone.
+- **No `.item()` / `.tolist()` / `.cpu()` / `.to("cpu")` / `.numpy()` /
+  `float(tensor)` / `int(tensor)` / `torch.is_nonzero`**, and no branch or
+  f-string that forces one, on an execute argument or anything derived from one.
+  A D2H read makes `execute()` synchronous — the whole point of an async launch
+  API is gone. **Nor may it block**: no `torch.cuda.synchronize()`, no
+  stream/event `synchronize()`. A sync reads nothing but costs the same.
 - **It is a functional gap, not a slow path.** A blocking D2H during stream
   capture is illegal, so a path that does one **cannot be CUDA-graph captured
   at all** — which is how every inference stack runs decode.
