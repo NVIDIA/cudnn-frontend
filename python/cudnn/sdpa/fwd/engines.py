@@ -848,13 +848,6 @@ def lower_dsl_prefill(
             # makes the kernel's padded path cover the ragged KV tail.
             seq_kv_buf = carver.take(facts.b, torch.int32).fill_(facts.s_kv)
         seq_q_buf = feature_ops.seq_len_q
-        # cu_seq_len form (THD-only): the (B+1,) prefix-sum buffer travels
-        # through the SAME seq-lens execute argument — the adapter was
-        # constructed with cu_seq_*_lens=True and consumes the form directly.
-        if seq_q_buf is None and binding.cu_seq_len_q is not None:
-            seq_q_buf = resolved.get(id(binding.cu_seq_len_q))
-        if seq_kv_buf is None and binding.cu_seq_len_kv is not None:
-            seq_kv_buf = resolved.get(id(binding.cu_seq_len_kv))
         sf_q_buf = resolved.get(id(binding.sf_q)) if binding.sf_q is not None else None
         sf_k_buf = resolved.get(id(binding.sf_k)) if binding.sf_k is not None else None
         sf_v_buf = resolved.get(id(binding.sf_v)) if binding.sf_v is not None else None

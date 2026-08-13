@@ -844,8 +844,17 @@ def resolve_feature_operands(facts: "SdpaGraphFacts", resolved: dict) -> Feature
 
     ops = FeatureOperands(alibi=facts.has_alibi)
     if facts.padded:
-        ops.seq_kv_lens = _need(facts.seq_kv_t, "padding mask (seq_len_kv)")
-        if facts.seq_q_t is not None:
+        # Either length form satisfies a side: per-batch seq_len_* or the
+        # (B+1,) cu_seq_len_* prefix sums (cuDNN 9.24+) — the cu buffer
+        # travels through the same operand slot (the adapter was constructed
+        # knowing the form).
+        if facts.cu_seq_kv_t is not None:
+            ops.seq_kv_lens = _need(facts.cu_seq_kv_t, "padding mask (cu_seq_len_kv)")
+        else:
+            ops.seq_kv_lens = _need(facts.seq_kv_t, "padding mask (seq_len_kv)")
+        if facts.cu_seq_q_t is not None:
+            ops.seq_len_q = _need(facts.cu_seq_q_t, "per-batch query lengths (cu_seq_len_q)")
+        elif facts.seq_q_t is not None:
             ops.seq_len_q = _need(facts.seq_q_t, "per-batch query lengths (seq_len_q)")
     if facts.has_bias:
         ops.bias = _need(facts.bias_t, "bias")
