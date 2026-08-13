@@ -413,6 +413,12 @@ def _sm100_spec(d: int, d_v: Optional[int] = None) -> EngineSpec:
             thd=True,
             cu_seq_len=True,
             padded_stats=True,
+            # Ragged S_kv with an uncovered tail is served through the padded
+            # path with synthesized full-length per-batch KV lengths (see
+            # lower_dsl_prefill's synth_kv_padding) — mathematically identical,
+            # costs only the padded-path overhead. Same mechanism the FP8 row
+            # has always used.
+            skv_tail_via_padding=True,
             # The f16/bf16 lowering serves any dense B/H/S stride permutation
             # (padded strides included) with the head dim innermost; the
             # FP8/MXFP8 rows stay on the strict BSHD gate until their padded /
