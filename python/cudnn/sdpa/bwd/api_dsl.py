@@ -276,6 +276,10 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
             if desc is None:
                 continue
             self._value_error_if(
+                desc.device != self.q_desc.device,
+                f"{desc.name} must be on {self.q_desc.device} (with Q); got {desc.device}",
+            )
+            self._value_error_if(
                 tuple(desc.shape) != (1, h_q, 1, 1),
                 f"{desc.name} must be (1, H_q, 1, 1) = (1, {h_q}, 1, 1); got {tuple(desc.shape)}",
             )
@@ -525,7 +529,7 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
                 kernels.reduce(dk_ws, dv_ws, dk, dv, current_stream)
             kernels.cvt(dq_accum, dq, cutlass.Float32(scale_val), current_stream)
             if kernels.dsink is not None:
-                kernels.dsink(lse, delta, sink_tensor.reshape(self.h_q), dsink_tensor.reshape(self.h_q), current_stream)
+                kernels.dsink(lse, delta, sink_tensor.reshape(self.h_q), dsink_tensor.reshape(self.h_q), seq_q_t, current_stream)
             for user_view, staged in ((dq_user, dq), (dk_user, dk), (dv_user, dv)):
                 if user_view is not None:
                     user_view.copy_(staged[..., : self.head_dim])
@@ -581,7 +585,7 @@ def sdpa_bwd_wrapper_dsl_sm120(
         scale_softmax,
         seq_q_lens is not None,
         seq_kv_lens is not None,
-        sink_token is not None,
+        _tensor_signature(sink_token) if sink_token is not None else None,
     )
     api = _wrapper_api_cache.get(cache_key)
     if api is None:

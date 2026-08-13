@@ -1626,6 +1626,7 @@ def _dsink_kernel(
     delta: cute.Tensor,  # [B, HQ, SQ_r128] fp32 (dot_do_o output)
     sink: cute.Tensor,  # [HQ] fp32 sink logits
     dsink: cute.Tensor,  # [HQ] fp32 out
+    seq_q_lens: Optional[cute.Tensor],  # [B] int32; None unless seq_q_lens_present
     use_pdl: cutlass.Constexpr[bool],
 ):
     """dsink[h] = -sum_{b,q} exp(sink[h] - lse[b,h,q]) * delta[b,h,q].
@@ -1650,10 +1651,13 @@ def _dsink_kernel(
     while batch < B:
         lse_base = (batch * HQ + head) * SQ
         delta_base = (batch * HQ + head) * SQ_R
+        q_bound = SQ
+        if cutlass.const_expr(seq_q_lens is not None):
+            q_bound = cute.math.max(cutlass.Int32(0), cute.math.min(seq_q_lens[batch], cutlass.Int32(SQ)))
         q = cutlass.Int32(tidx)
-        while q < SQ:
+        while q < q_bound:
             lv = (lse_ptr + lse_base + q).load()
-            # Skip padded / trimmed rows which carry LSE = -inf and delta = 0
+            # Padded / trimmed rows carry LSE = -inf: skip them, exp(sink + inf) * 0 = NaN
             if lv > -inf and lv < inf:
                 dd = (delta_ptr + delta_base + q).load()
                 acc = acc + cute.math.exp2((s_val - lv) * cutlass.Float32(_LOG2E), fastmath=True) * dd
@@ -1677,10 +1681,11 @@ def _dsink_host(
     delta: cute.Tensor,
     sink: cute.Tensor,
     dsink: cute.Tensor,
+    seq_q_lens: Optional[cute.Tensor],
     use_pdl: cutlass.Constexpr[bool],
     stream: cuda_driver.CUstream,
 ):
-    _dsink_kernel(lse, delta, sink, dsink, use_pdl).launch(
+    _dsink_kernel(lse, delta, sink, dsink, seq_q_lens, use_pdl).launch(
         grid=(lse.shape[1], 1, 1),
         block=(32, 1, 1),
         stream=stream,
@@ -1829,6 +1834,7 @@ def compile(  # noqa: A001
             fake_delta,
             fake_sink,
             fake_dsink,
+            fake_seq_q_lens,
             bwd.use_pdl,
             fake_stream,
             options=options,
