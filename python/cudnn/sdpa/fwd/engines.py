@@ -276,11 +276,11 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         return "s_q == 1 (decode) is out of scope for the SM80 prefill kernels"
     if facts.dtype not in capabilities.dtypes:
         return f"dtype {facts.dtype} not in {sorted(str(d) for d in capabilities.dtypes)}"
-    if (capabilities.is_fp8 or capabilities.is_mxfp8) and facts.dtype_o not in capabilities.out_dtypes:
-        return f"O dtype {facts.dtype_o} not in {sorted(str(d) for d in capabilities.out_dtypes)}"
     if (facts.is_mxfp8, facts.is_fp8) != (capabilities.is_mxfp8, capabilities.is_fp8):
         quant = "block-scale MXFP8 (sdpa_mxfp8)" if capabilities.is_mxfp8 else "per-tensor FP8 (sdpa_fp8)" if capabilities.is_fp8 else "half (sdpa)"
         return f"this engine serves only {quant} graphs"
+    if (capabilities.is_fp8 or capabilities.is_mxfp8) and facts.dtype_o not in capabilities.out_dtypes:
+        return f"O dtype {facts.dtype_o} not in {sorted(str(d) for d in capabilities.out_dtypes)}"
     if not facts.uniform_dtype:
         return "K/V dtypes must match Q" if (facts.is_mxfp8 or facts.is_fp8) else "K/V/O dtypes must match Q"
     if facts.thd:
@@ -838,10 +838,9 @@ def lower_dsl_prefill(
         # construction, and the packed layout gives each sequence its own
         # extent, so nothing is written past a valid length.
         if (facts.is_mxfp8 or facts.is_fp8) and not facts.thd and seq_q_buf is not None and not seq_q_lens_present:
-            if int(seq_q_buf.min().item()) < int(facts.s_q):
-                raise NotImplementedError(
-                    f"per-tensor FP8/MXFP8: per-batch seq_len_q shorter than S_q={facts.s_q} is not plumbed; got min {int(seq_q_buf.min().item())}"
-                )
+            min_seq_q = int(seq_q_buf.min().item())
+            if min_seq_q < int(facts.s_q):
+                raise NotImplementedError(f"per-tensor FP8/MXFP8: per-batch seq_len_q shorter than S_q={facts.s_q} is not plumbed; got min {min_seq_q}")
         execute_kwargs = dict(
             q_tensor=q_buf,
             k_tensor=k_buf,
@@ -931,11 +930,13 @@ def _sm120_fp8_spec() -> EngineSpec:
     m16n8k32 e4m3; ``descale_q*descale_k`` folds into the softmax scale and
     ``descale_v*scale_o`` into an epilogue scalar, so the kernel adds only the
     Amax_S/Amax_O atomics over the f16 sibling. E4M3 only (no E5M2 tag in the
-    kernel yet), FP16 O only, exact d128 (no zero-padding envelope on the
+    kernel yet), FP16 O only, head dims any multiple of 32 up to 256 with the
+    QK^T and P@V sides independent (exact — no zero-padding envelope on the
     8-bit fragment path), and no sink (Amax_S semantics with a sink column are
     undefined here). THD (ragged) is served with token-major Stats; head-major
     ragged Stats stays f16-only (the fp8 kernel carries no such specialization).
     """
+    from cudnn.sdpa.fwd.config_sm120 import SUPPORTED_HEAD_TILES_FP8
 
     return EngineSpec(
         name="sdpa_fwd_prefill_sm120_fp8",
@@ -943,8 +944,8 @@ def _sm120_fp8_spec() -> EngineSpec:
             sm_lo=_BLACKWELL_GEFORCE[0],
             sm_hi=_BLACKWELL_GEFORCE[1],
             phase="prefill",
-            d_qk=frozenset({128}),
-            d_v=frozenset({128}),
+            d_qk=frozenset(SUPPORTED_HEAD_TILES_FP8),
+            d_v=frozenset(SUPPORTED_HEAD_TILES_FP8),
             dtypes=frozenset({cudnn.data_type.FP8_E4M3}),
             out_dtypes=frozenset({cudnn.data_type.HALF}),
             is_fp8=True,
