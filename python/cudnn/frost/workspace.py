@@ -125,7 +125,11 @@ class Workspace:
                 f"{owner} requires a {required_bytes}-byte workspace but execute() received "
                 f"none; allocate graph.get_workspace_size() bytes and pass the buffer to execute()"
             )
-        if nbytes < required_bytes:
+        # 0 means the pack could not measure it, not that it is empty: a bare
+        # device address carries no size, and the backend takes one without
+        # checking either. Refusing here would make the same call depend on
+        # which plan ran.
+        if nbytes and nbytes < required_bytes:
             raise ValueError(f"{owner}: needs a {required_bytes}-byte workspace, got {nbytes} bytes (size it with graph.get_workspace_size())")
         if ptr % align != 0:
             raise ValueError(f"{owner}: the workspace buffer must be {align}-byte aligned; got 0x{ptr:x}")
@@ -164,9 +168,14 @@ class Workspace:
 
     def remaining(self) -> buffers.DeviceView:
         """The tail no :meth:`take` has claimed, as uint8 — for a nested carver."""
+        if not self._nbytes:
+            raise ValueError(
+                f"{self._owner}: the workspace was passed as a bare address, so its size is unknown "
+                "and the unclaimed tail cannot be measured; pass a sized buffer to execute()"
+            )
         return buffers.DeviceView(self._ptr + self._offset, (self._nbytes - self._offset,), "uint8", self._device)
 
     def _check_span(self, offset: int, span: int) -> None:
         end = int(offset) + int(span)
-        if end > self._nbytes:
+        if self._nbytes and end > self._nbytes:
             raise ValueError(f"{self._owner}: workspace overrun — region [{offset}, {end}) exceeds the " f"{self._nbytes}-byte buffer (sizing bug)")

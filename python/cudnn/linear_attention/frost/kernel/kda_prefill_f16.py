@@ -2541,9 +2541,8 @@ def _build_descs(
     stream: cuda_driver.CUstream,
 ):
     """Build the 6 per-(batch, head) TMA-descriptor arrays (q, k, v, gate,
-    o, h) into ``tensormap_workspace``.  Compiled + launched separately from
-    the main kernel and cached by input identity in the host bridge, so the
-    builder launches do not recur in steady-state replay.  Each descriptor
+    o, h) into ``tensormap_workspace``. Launched on every execute: the descriptors fold cu_seqlens contents into
+    GLOBAL_ADDRESS and GLOBAL_DIM, which the host cannot read without a D2H sync.  Each descriptor
     folds the sequence base + head offset into GLOBAL_ADDRESS (Int64) and
     caps the token GLOBAL_DIM to the sequence length, so the main kernel's
     coordinates are sequence-relative and tail chunks clip in hardware.  The

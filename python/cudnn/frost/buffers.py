@@ -18,6 +18,7 @@ no tensor-library dependency on the execute path.
 from __future__ import annotations
 
 import ctypes
+import struct
 
 from cudnn import _pybind_module
 
@@ -295,6 +296,143 @@ def memset_zero_async(ptr: int, nbytes: int, stream) -> None:
     err = res[0] if isinstance(res, tuple) else res
     if int(err) != 0:
         raise RuntimeError(f"cudaMemsetAsync failed: {err}")
+
+
+_WORD_FORMAT = {"fp32": "<f", "int32": "<i"}
+
+
+def init_word(dtype: str, value) -> int:
+    """The 32-bit pattern that writes ``value`` to a buffer of ``dtype``.
+
+    A memset moves bits, not numbers, so the value has to be packed as the dtype
+    the kernel will read it back as. int32's reduction identities are the ends
+    of its range and are exactly where that bites: -2**31 packed as float is
+    0xcf000000 where the kernel wants 0x80000000.
+    """
+    fmt = _WORD_FORMAT.get(dtype)
+    if fmt is None:
+        raise NotImplementedError(f"no 32-bit fill pattern for dtype {dtype!r}")
+    return int.from_bytes(struct.pack(fmt, value), "little")
+
+
+def fill_word_async(ptr: int, count: int, word: int, stream) -> None:
+    """Stream-ordered fill of ``count`` CONTIGUOUS 32-bit words with ``word``.
+
+    An engine that seeds a caller's buffer owns that operation itself: reaching
+    for ``tensor.fill_()`` works only while the buffer happens to be a torch
+    tensor, and queues on torch's current stream rather than the one the kernel
+    will run on. Every seed a reduction uses is a 32-bit pattern, so the
+    driver's D32 memset covers them without a kernel -- see ``init_word`` for
+    turning a value into one.
+
+    :func:`fill_word_strided_async` is the same fill for a buffer that is not
+    one dense run.
+    """
+    from cuda.bindings import driver as _drv
+
+    res = _drv.cuMemsetD32Async(int(ptr), int(word), int(count), int(stream) if stream is not None else 0)
+    err = res[0] if isinstance(res, tuple) else res
+    if int(err) != 0:
+        raise RuntimeError(f"cuMemsetD32Async failed: {err}")
+
+
+def _fill_word_2d_async(ptr: int, pitch_words: int, width: int, height: int, word: int, stream) -> None:
+    from cuda.bindings import driver as _drv
+
+    res = _drv.cuMemsetD2D32Async(int(ptr), int(pitch_words) * 4, int(word), int(width), int(height), int(stream) if stream is not None else 0)
+    err = res[0] if isinstance(res, tuple) else res
+    if int(err) != 0:
+        raise RuntimeError(f"cuMemsetD2D32Async failed: {err}")
+
+
+def collapse_layout(shape, strides) -> list:
+    """``(extent, stride)`` outermost first, with unit axes dropped and adjacent
+    axes merged where one exactly fills the other's gap.
+
+    A padded output is usually dense underneath its declared rank -- a rank-3
+    ``(1, M, 1)`` tap is one strided run, and a contiguous one is a single dense
+    run whatever rank it was declared at. Merging first is what keeps the fill
+    below down to one memset in both cases.
+    """
+    axes = sorted(((int(d), int(s)) for d, s in zip(shape, strides) if int(d) != 1), key=lambda ds: -ds[1])
+    out: list = []
+    for extent, stride in axes:
+        if out and out[-1][1] == extent * stride:
+            out[-1] = (out[-1][0] * extent, stride)
+        else:
+            out.append((extent, stride))
+    return out
+
+
+def strided_fill_plan(shape, strides) -> "list | None":
+    """The 2D memsets that cover a strided region exactly once, or None.
+
+    None means the region writes some element twice -- a stride of 0 over a real
+    extent, or an outer stride that does not clear the axis below it. That is a
+    write race whichever buffer it is, so it is refused rather than issued; the
+    caller decides how to say so.
+
+    Returned before anything is written, which is the point: the seed's
+    preconditions have to be settled while the caller's buffer is still
+    untouched, and a plan is what lets several outputs all be checked before the
+    first of them is filled.
+
+    Each entry is ``(offset, pitch, width, height)`` in ELEMENTS. The driver's
+    2D memset takes a pitch, so a per-row scalar tap is one entry rather than one
+    per row (the reading that made this look expensive: 572 us at one memset per
+    row); what remains is one entry per point of whatever axis is left outside
+    the 2D region, which for a rank-3 output is the batch and is usually 1.
+    """
+    if any(int(s) == 0 and int(d) != 1 for d, s in zip(shape, strides)):
+        return None
+    axes = collapse_layout(shape, strides)
+    # Non-overlapping iff each axis clears the whole span of the one below it.
+    # `pitch >= width` is this rule at the innermost pair and misses the rest:
+    # shape (2, 2) stride (2, 2) has width 1 and passes it, and lands both axes
+    # on the same element.
+    for (_outer_extent, outer_stride), (inner_extent, inner_stride) in zip(axes, axes[1:]):
+        if outer_stride < inner_extent * inner_stride:
+            return None
+    if not axes:
+        return [(0, 1, 1, 1)]
+    # The innermost run is the memset's width when it is dense; otherwise every
+    # element stands alone and the width is one.
+    width, rest = (axes[-1][0], axes[:-1]) if axes[-1][1] == 1 else (1, axes)
+    if not rest:
+        return [(0, width, width, 1)]
+    height, pitch = rest[-1]
+    offsets = [0]
+    for extent, stride in reversed(rest[:-1]):
+        offsets = [base + i * stride for base in offsets for i in range(extent)]
+    return [(base, pitch, width, height) for base in offsets]
+
+
+def apply_fill_plan(ptr: int, plan, word: int, stream) -> None:
+    """Issue a plan from :func:`strided_fill_plan`, stream-ordered."""
+    for offset, pitch, width, height in plan:
+        if height == 1:
+            fill_word_async(ptr + offset * 4, width, word, stream)
+        else:
+            _fill_word_2d_async(ptr + offset * 4, pitch, width, height, word, stream)
+
+
+def fill_word_strided_async(ptr: int, shape, strides, elem_bytes: int, word: int, stream) -> None:
+    """Plan and issue in one call, for a caller with a single region to seed.
+
+    The engine owns seeding a reduction output, and a padded one is the case
+    that used to send it back to the caller's ``fill_()`` -- the last place
+    anything here wrote through a buffer it does not own, and the reason a
+    perfectly legal call had to fall off the fast path. A caller with SEVERAL
+    regions wants :func:`strided_fill_plan` for all of them first: this one
+    cannot know whether the next region is refusable, so it would leave the
+    earlier ones filled.
+    """
+    if elem_bytes != 4:
+        raise NotImplementedError(f"frost: a reduction seed is a 32-bit pattern; this output stores {elem_bytes}-byte elements")
+    plan = strided_fill_plan(shape, strides)
+    if plan is None:
+        raise ValueError(f"frost: a reduction output cannot write an element twice (shape {tuple(shape)} stride {tuple(strides)})")
+    apply_fill_plan(ptr, plan, word, stream)
 
 
 # The CuTe primitives these engines lower through landed in 4.7.0; older DSLs

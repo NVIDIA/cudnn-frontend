@@ -48,8 +48,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List
 
 from .engine_ids import PYTHON_ENGINE_ID_BASE  # noqa: F401 — re-exported for engine authors
-from ..datatypes import _CUDNN_TO_FROST_DTYPE_NAME
-from ..frost.buffers import DeviceView
 
 if TYPE_CHECKING:
     from ..pygraph import pygraph

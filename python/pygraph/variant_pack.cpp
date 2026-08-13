@@ -324,6 +324,11 @@ class VariantPackSlot {
     // Ownership transfers with the capsule, per DLPack: the struct carries its
     // own copy of the shape and stride and a deleter that frees them, so it
     // outlives this slot rather than aliasing storage the slot owns.
+    //
+    // Unversioned only: max_version is ignored and the capsule is always
+    // "dltensor". The consumer this exists for is cute's compile-time
+    // from_dlpack; tvm-ffi reads a slot through the exchange vtable and never
+    // gets here.
     py::capsule
     dlpack(py::object /*stream*/, py::object /*max_version*/) const {
         struct Owned {
@@ -691,7 +696,7 @@ class WorkspaceCarve {
         std::vector<VariantPackSlot *> out;
         out.reserve(protos_.size());
         for (size_t i = 0; i < protos_.size(); i++) {
-            if (ends_[i] > nbytes) {
+            if (nbytes != 0 && ends_[i] > nbytes) {  // 0 = size unknown (bare address)
                 throw py::value_error(owner_ + ": workspace overrun -- region [" + std::to_string(offsets_[i]) + ", " +
                                       std::to_string(ends_[i]) + ") exceeds the " + std::to_string(nbytes) +
                                       "-byte buffer (sizing bug)");

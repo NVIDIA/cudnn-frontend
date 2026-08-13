@@ -3958,9 +3958,8 @@ def _build_descs(
 ):
     """Build the per-(b,h) TMA-descriptor arrays (Q, K, V, dO, H loads;
     dQ, dK, dV stores; the io-dtype S0 loads when ``s0`` is given) into
-    ``tensormap_workspace``.  Compiled + launched separately from the main
-    kernel and cached by input identity in the host bridge, so the builder
-    launches do not recur in steady-state replay.
+    ``tensormap_workspace``. Launched on every execute: the descriptors fold cu_seqlens contents into
+    GLOBAL_ADDRESS and GLOBAL_DIM, which the host cannot read without a D2H sync.
 
     The H descriptor is 3-D ``(dv, dk, h)`` over the packed
     ``[total_h, HO, DK, DV]`` H tensor; ``build_h_descs_kernel`` derives the
