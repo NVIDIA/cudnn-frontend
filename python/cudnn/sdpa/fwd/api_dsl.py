@@ -1258,13 +1258,15 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 # view — the kernel's epilogue dispatches on this static rank.
                 lse = lse_tensor.as_strided((t_q, qh), (qh, 1), lse_tensor.storage_offset())
 
-        # Per-sequence O TMA descriptors, filled by the kernel's builder pass.
+        # Per-sequence O TMA descriptors. No zero-init: the kernel's builder
+        # pass copies every qword of each sequence's slot from the base
+        # descriptor (then patches address/extent) before the fence and
+        # before any consumer read, so stale bytes never survive — a fill
+        # here is a wasted kernel launch on the execute hot path (Rule 1).
         # Allocated on the launch stream (allocator stream-tagging + ordering
         # vs the builder pass).
         with _torch_stream_context(current_stream, dev):
-            o_desc = carver.take(b * 16 + 16, torch.int64) if carver is not None else torch.zeros(b * 16 + 16, dtype=torch.int64, device=dev)
-            if carver is not None:
-                o_desc.zero_()
+            o_desc = carver.take(b * 16 + 16, torch.int64) if carver is not None else torch.empty(b * 16 + 16, dtype=torch.int64, device=dev)
         # One THD unit per CGA-height slice of each sequence's Q rows.
         cga_tile_m = int(self._k_mod.CGA_TILE_M)
         units = qh * sum((l + cga_tile_m - 1) // cga_tile_m for l in slq_host)
