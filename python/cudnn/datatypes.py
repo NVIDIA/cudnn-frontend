@@ -3,6 +3,7 @@
 
 import sys
 import importlib
+import functools
 
 
 def is_windows():
@@ -246,6 +247,9 @@ def _torch_to_cutlass_data_type(data_type, interpret_uint8_as_fp4x2: bool = Fals
     return None
 
 
+# Memoized: pure map from a (hashable) dtype to its cutlass type, called O(10x) per
+# CuTeDSL launch to build the per-shape cache key. Finite dtype key space.
+@functools.lru_cache(maxsize=None)
 def _convert_to_cutlass_data_type(data_type, interpret_uint8_as_fp4x2: bool = False):
     if is_cutlass_available():
         import cutlass
