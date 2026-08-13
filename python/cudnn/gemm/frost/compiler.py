@@ -2065,7 +2065,11 @@ class CompiledFusedGemm:
                     v = operands[idx]
                     count = int(v.numel())
                     if (
-                        _pow2_floor(v.data_ptr()) < 16
+                        # A scale factor rides the launch as a rank-3 permute
+                        # like every other head, so its rank is a rule here and
+                        # not something for the permute to discover.
+                        len(v.shape) != 3
+                        or _pow2_floor(v.data_ptr()) < 16
                         or count != 1 + sum((int(s) - 1) * int(st) for s, st in zip(v.shape, v.stride()))
                         or count * v.element_size() < 512 * k4 * (((m if is_a else n) + 127) // 128) * sf_batch
                     ):

@@ -344,6 +344,12 @@ def _sf_blob_reject(recipe: GemmRecipe, operands, axes, mnk) -> "str | None":
     bad = []
     for sf in recipe.sf:
         v = operands[sf.index]
+        if len(v.shape) != 3:
+            # It reaches the kernel through the same rank-3 relabelling as every
+            # other head, so a different rank is answered here rather than by
+            # the permute three frames down.
+            bad.append(f"{sf.role}: expected a rank-3 buffer, got shape={tuple(v.shape)}")
+            continue
         op = recipe.inputs[sf.operand_at]
         rows = m if sf.is_a else n
         batch = operands[op.index].shape[axes[sf.operand_at][AX_BATCH]]

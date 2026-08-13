@@ -3958,7 +3958,9 @@ def _build_descs(
 ):
     """Build the per-(b,h) TMA-descriptor arrays (Q, K, V, dO, H loads;
     dQ, dK, dV stores; the io-dtype S0 loads when ``s0`` is given) into
-    ``tensormap_workspace``. Launched on every execute: the descriptors fold cu_seqlens contents into
+    ``tensormap_workspace``.
+
+    Launched on every execute: the descriptors fold cu_seqlens contents into
     GLOBAL_ADDRESS and GLOBAL_DIM, which the host cannot read without a D2H sync.
 
     The H descriptor is 3-D ``(dv, dk, h)`` over the packed

@@ -178,14 +178,18 @@ and the operand structure flattened into the loop headers, so the call does no
 attribute lookup and takes no branch the build already settled. That is 35 → 20.
 Two rules make it safe:
 
-- **The lowered path never raises.** Anything it is not certain of it hands to
-  the interpreting path, which serves every flavor and owns every rejection
-  message. It can then only ever accept a subset, and there is no second set of
-  error strings to drift.
-- **Both read the same table.** A differential test between them catches
-  divergence, but never a misconception they share — so the table is where a
-  fact lives exactly once, and the tests that matter are against intended
-  semantics, at the shapes where two encodings coincide.
+- **The lowered path never raises, and it is the only path that runs.** What it
+  refuses it hands to a checker that reads the same table, names the rule and
+  raises — it launches nothing. A graph the closure cannot serve at all is
+  declined when the engine is asked to support it, so it goes to the backend
+  rather than to a second executor.
+- **So a refusal is the answer, not a slower route.** The set of calls the
+  closure refuses should equal the set of illegal calls; a legal call it will
+  not serve is a bug. Keeping a reference executor instead would buy a
+  differential that catches divergence but never a misconception the two share —
+  which is exactly how an axis-order bug survived one here. The tests that
+  matter are against intended semantics and against the BACKEND, at the shapes
+  where two encodings coincide.
 
 **A loop over a flat table gets almost all of it, so do not hand-unroll per
 flavor.** Measured three ways on the same plan and buffers: interpreting the

@@ -240,13 +240,16 @@ CompiledPlan.execute(graph, uid_to_data, ctx)          (the hot path)
   which outputs are reductions -- all settled when the kernel compiled, and
   deciding them again per call is most of what a python execute path costs
   (measured: 40-50 -> 20-22 us for one gemm, across six flavors).
-  `gemm/frost/recipe.py` is the worked example: one table, read by an
-  interpreter that walks the operand structure and by a closure that captures
-  the table and loops over it flat. Even what the kernel's parameter list looks
+  `gemm/frost/recipe.py` is the worked example: one table, captured into a
+  closure that loops over it flat. Even what the kernel's parameter list looks
   like is a table entry (`arg_plan`), which is why one loop serves every flavor
-  -- a call path per flavor is how two of them disagree. The lowered one never
-  raises: anything it is unsure of it hands back to the interpreter, which owns
-  every rejection message.
+  -- a call path per flavor is how two of them disagree. That closure never
+  raises and it is the ONLY thing that launches: what it refuses goes to a
+  checker that reads the same table, names the rule and raises without running
+  anything, and a graph it cannot serve at all is declined at `check_support`.
+  A second executor kept for diagnostics is still a second answer to what the
+  graph computes, and a differential between two readings of one plan cannot
+  catch a misconception they share.
 - **`ExecutionContext` carries handle, stream and workspace explicitly.** No
   engine may hard-code a stream, reach into private graph state, or allocate
   hidden workspace. `uid_to_data` is the caller's variant pack (tensor uid ->

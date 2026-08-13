@@ -650,6 +650,28 @@ def test_block_scale_lowers_and_runs(gemms):
 
 
 @requires_sm100
+def test_a_scale_factor_of_the_wrong_rank_is_refused_rather_than_crashing():
+    """A scale factor is relabelled like every other head, so its rank is a rule.
+
+    The blob checks -- alignment, one dense run, the size the template
+    re-synthesizes -- all pass for a flat rank-1 blob, and it then reached
+    ``permute(1, 2, 0)`` in the launch argument list and raised from INSIDE the
+    body that is not allowed to raise. Both the guard and the checker name it
+    now, so it is a rejection with a reason like any other.
+    """
+    compiled = jit_from_cudnn_graph(_nvfp4_graph(1))
+    if compiled.lowered is None:
+        pytest.skip(f"this build does not lower: {compiled.declined}")
+    operands, _out = _nvfp4_buffers(compiled)
+    sf = compiled.recipe.sf[0]
+    operands[sf.index] = operands[sf.index].reshape(-1)
+
+    with pytest.raises(ValueError, match="rank-3"):
+        compiled.lowered(operands, stream=None)
+    assert dict(compiled.deferrals) == {"scale-factor blob": 1}
+
+
+@requires_sm100
 @pytest.mark.parametrize("batch", (1, 2), ids=("b1", "b2"))
 @pytest.mark.parametrize("m,n,k", [(m, n, k) for m in (1, 128) for n in (1, 128) for k in (1, 128)], ids=str)
 def test_a_degenerate_extent_is_refused_or_matches_the_backend(monkeypatch, batch, m, n, k):
