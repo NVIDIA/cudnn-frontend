@@ -3130,9 +3130,10 @@ class CompiledMoeGemm:
         )
         a = _maybe_wrap_layout(a_perm, _LEADING_DIM_A)
         b = _maybe_wrap_layout(b_perm, _LEADING_DIM_B)
-        # A tap takes a bare address: the epilogue reads the pointer and gets its
-        # strides from problem_size, so no wrapper reaches the kernel.
-        cs = [ci.permute(1, 2, 0) for ci in c_perms]
+        cs = [
+            (_wrap_raw_tensor(ci) if (spec.is_reduction or spec.is_quant_scale) else _maybe_wrap_layout(ci, _LEADING_DIM_C))
+            for spec, ci in zip(outputs_spec, c_perms)
+        ]
         # A-descriptor workspace: one 128-byte tensormap slot per CTA.
         workspace = self._make_workspace(self._grid_ctas * self.chain.num_a_operands, workspace)
         return self._launchable(
@@ -3244,9 +3245,10 @@ class CompiledMoeGemm:
         )
         a_wrapped = [_maybe_wrap_layout(t.permute(1, 2, 0), _LEADING_DIM_A) for t in a_slots]
         b_wrapped = [_maybe_wrap_layout(t.permute(1, 2, 0), _LEADING_DIM_B) for t in b_slots]
-        # A tap takes a bare address: the epilogue reads the pointer and gets its
-        # strides from problem_size, so no wrapper reaches the kernel.
-        cs = [ci.permute(1, 2, 0) for ci in c_perms]
+        cs = [
+            (_wrap_raw_tensor(ci) if (spec.is_reduction or spec.is_quant_scale) else _maybe_wrap_layout(ci, _LEADING_DIM_C))
+            for spec, ci in zip(outputs_spec, c_perms)
+        ]
         for ref, t in zip(chain.aux_tensors, aux):
             if ref.grouped_by_moe and (len(t.shape) != 3 or int(t.shape[0]) != num_groups):
                 raise ValueError(
@@ -3511,9 +3513,10 @@ class CompiledMoeBlockScaleGemm:
         )
         a = _maybe_wrap_layout(a_perm, _LEADING_DIM_A)
         b = _maybe_wrap_layout(b_perm, _LEADING_DIM_B)
-        # A tap takes a bare address: the epilogue reads the pointer and gets its
-        # strides from problem_size, so no wrapper reaches the kernel.
-        cs = [ci.permute(1, 2, 0) for ci in c_perms]
+        cs = [
+            (_wrap_raw_tensor(ci) if (spec.is_reduction or spec.is_quant_scale) else _maybe_wrap_layout(ci, _LEADING_DIM_C))
+            for spec, ci in zip(outputs_spec, c_perms)
+        ]
         msfa = _maybe_wrap_layout(sfa.permute(1, 2, 0), _LEADING_DIM_AUX)
         msfb = _maybe_wrap_layout(sfb.permute(1, 2, 0), _LEADING_DIM_AUX)
         workspace = self._make_workspace(self._grid_ctas * self.chain.num_a_operands, workspace)
@@ -3641,9 +3644,10 @@ class CompiledMoeBlockScaleGemm:
         b_wrapped = [_maybe_wrap_layout(t.permute(1, 2, 0), _LEADING_DIM_B) for (t, _sf) in b_slots]
         sfa_wrapped = [_maybe_wrap_layout(sf.permute(1, 2, 0), _LEADING_DIM_AUX) for (_t, sf) in a_slots]
         sfb_wrapped = [_maybe_wrap_layout(sf.permute(1, 2, 0), _LEADING_DIM_AUX) for (_t, sf) in b_slots]
-        # A tap takes a bare address: the epilogue reads the pointer and gets its
-        # strides from problem_size, so no wrapper reaches the kernel.
-        cs = [ci.permute(1, 2, 0) for ci in c_perms]
+        cs = [
+            (_wrap_raw_tensor(ci) if (spec.is_reduction or spec.is_quant_scale) else _maybe_wrap_layout(ci, _LEADING_DIM_C))
+            for spec, ci in zip(outputs_spec, c_perms)
+        ]
         for ref, t in zip(chain.aux_tensors, aux):
             if ref.grouped_by_moe and (len(t.shape) != 3 or int(t.shape[0]) != num_groups):
                 raise ValueError(
