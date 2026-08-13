@@ -277,6 +277,8 @@ class SdpaFwdDsl(APIBase):
         scale_softmax: Optional[float] = None,
         seq_kv_lens_present: bool = False,
         seq_q_lens_present: bool = False,
+        cu_seq_q_lens: bool = False,
+        cu_seq_kv_lens: bool = False,
         has_sink: bool = False,
         thd: bool = False,
         dtype_o: Optional[torch.dtype] = None,
@@ -327,6 +329,13 @@ class SdpaFwdDsl(APIBase):
         # FA's seqused_q) bound directly at execute — no packing, no
         # per-execute copies. Dense-only.
         self.seq_q_lens_present = bool(seq_q_lens_present)
+        # cu_seq_len form (cuDNN 9.24+): the corresponding seq-lens execute
+        # argument arrives as a (B+1,)-int32 PREFIX-SUM tensor instead of
+        # (B,) per-batch lengths. THD-only today: the ragged lowering derives
+        # both forms host-side from its inherent tolist round-trip; the dense
+        # kernels have no CU read mode yet (check_support rejects).
+        self.cu_seq_q_lens = bool(cu_seq_q_lens)
+        self.cu_seq_kv_lens = bool(cu_seq_kv_lens)
         self.has_sink = bool(has_sink)
         self.thd = bool(thd)
         # MXFP8: FP8 (E4M3/E5M2) Q/K/V in, half (BF16/FP16) O out. dtype_o overrides
@@ -546,6 +555,49 @@ class SdpaFwdDsl(APIBase):
             f"{name} must be contiguous (bound to the kernel as a flat (B,) view)",
         )
         return seq_lens.reshape(-1)
+
+    def _checked_cu_seq_lens(self, cu_seq_lens: torch.Tensor, name: str) -> torch.Tensor:
+        """Validate a caller-provided (B+1,)-int32 prefix-sum tensor (cu_seq_len form).
+
+        Strictly a view, like :meth:`_checked_seq_lens`. The prefix-sum
+        INVARIANTS (starts at 0, non-decreasing) are runtime values — they are
+        validated host-side by the THD lowering's inherent tolist round-trip,
+        not here.
+        """
+        self._value_error_if(
+            cu_seq_lens.dtype != torch.int32,
+            f"{name} must be int32; got {cu_seq_lens.dtype}",
+        )
+        self._value_error_if(
+            cu_seq_lens.numel() != self.batch_size + 1,
+            f"{name} must have B + 1 = {self.batch_size + 1} elements (prefix sums); got {cu_seq_lens.numel()}",
+        )
+        self._value_error_if(
+            not cu_seq_lens.is_contiguous(),
+            f"{name} must be contiguous (read as a flat (B+1,) view)",
+        )
+        return cu_seq_lens.reshape(-1)
+
+    def _thd_host_lens(self, seq_lens, name: str, cu_form: bool) -> tuple[list, list]:
+        """One inherent D2H round-trip -> (per-batch lens, prefix sums) host lists.
+
+        Consumes EITHER length form: per-batch ``(B,)`` lengths (prefix sums
+        built by a Python scan) or the ``(B+1,)`` cu_seq_len prefix-sum form
+        (lengths are adjacent differences; the prefix-sum invariants are
+        validated here, where they are free to check).
+        """
+        if cu_form:
+            cu_host = [int(x) for x in self._checked_cu_seq_lens(seq_lens, name).tolist()]
+            self._value_error_if(
+                cu_host[0] != 0 or any(cu_host[i] > cu_host[i + 1] for i in range(len(cu_host) - 1)),
+                f"{name} must be a non-decreasing prefix sum starting at 0; got {cu_host}",
+            )
+            return [cu_host[i + 1] - cu_host[i] for i in range(len(cu_host) - 1)], cu_host
+        lens_host = [int(x) for x in self._checked_seq_lens(seq_lens, name).tolist()]
+        cu_host = [0]
+        for n in lens_host:
+            cu_host.append(cu_host[-1] + n)
+        return lens_host, cu_host
 
     def _check_seq_lens_contract(self, seq_q_lens, seq_kv_lens) -> None:
         """Reject seq-length tensors inconsistent with the compiled specialization.
@@ -804,6 +856,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         )
         if self.thd:
             self.seq_kv_lens_present = True
+        self._not_implemented_error_if(
+            (self.cu_seq_q_lens or self.cu_seq_kv_lens) and not self.thd,
+            "cu_seq_len_* is THD-only (the dense kernels have no CU read mode yet)",
+        )
         # Dense padded-Q trim backstops (engines.lower_dsl_prefill never sets
         # these combinations; a direct caller could).
         self._value_error_if(
@@ -1159,23 +1215,17 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         import cutlass
 
         dev = q_buf.device
-        slq_v = self._checked_seq_lens(seq_q_lens, "seq_q_lens")
-        slk_v = self._checked_seq_lens(seq_len_kv, "seq_kv_lens")
-        b = slq_v.numel()
+        b = self.batch_size
         carver = WorkspaceCarver(workspace, self.scratch_workspace_bytes(), "SdpaFwdDslSm100 (THD)") if workspace is not None else None
         # Metadata buffer: [ seq_kv_lens(B) | cu_seqlens_q(B+1) | cu_seqlens_k(B+1) ],
         # built HOST-side from the (inherent) tolist round-trip and uploaded in
         # ONE H2D copy: a device-side cumsum would allocate its scan-temp
-        # storage and launch kernels on the execute hot path.
+        # storage and launch kernels on the execute hot path. Either length
+        # form feeds it — per-batch (B,) lengths or the (B+1,) cu_seq_len
+        # prefix sums — at identical cost.
         meta = carver.take(3 * b + 2, torch.int32) if carver is not None else torch.empty(3 * b + 2, dtype=torch.int32, device=dev)
-        slq_host = slq_v.tolist()  # one D2H sync; t_q/t_kv/units are runtime values
-        slk_host = slk_v.tolist()
-        cu_q_host = [0]
-        for n in slq_host:
-            cu_q_host.append(cu_q_host[-1] + int(n))
-        cu_k_host = [0]
-        for n in slk_host:
-            cu_k_host.append(cu_k_host[-1] + int(n))
+        slq_host, cu_q_host = self._thd_host_lens(seq_q_lens, "cu_seq_len_q" if self.cu_seq_q_lens else "seq_q_lens", self.cu_seq_q_lens)
+        slk_host, cu_k_host = self._thd_host_lens(seq_len_kv, "cu_seq_len_kv" if self.cu_seq_kv_lens else "seq_kv_lens", self.cu_seq_kv_lens)
         meta.copy_(torch.tensor(slk_host + cu_q_host + cu_k_host, dtype=torch.int32))
         t_q = cu_q_host[-1]
         t_kv = cu_k_host[-1]
@@ -1720,6 +1770,10 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         if self.thd:
             self._value_error_if(self.seq_q_lens_present, "seq_q_lens_present is dense-only (THD carries per-sequence Q lengths via cu_seqlens)")
             self.seq_kv_lens_present = True
+        self._not_implemented_error_if(
+            (self.cu_seq_q_lens or self.cu_seq_kv_lens) and not self.thd,
+            "cu_seq_len_* is THD-only (the dense kernels have no CU read mode yet)",
+        )
         self._value_error_if(
             self.sched_policy is not None and self.sched_policy != SCHED_NATURAL,
             f"SM120 DSL SDPA only supports sched_policy={SCHED_NATURAL}",
@@ -2263,23 +2317,17 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         dev = q_buf.device
         carver = WorkspaceCarver(workspace, self.scratch_workspace_bytes(), label) if workspace is not None else None
 
-        slq_v = self._checked_seq_lens(seq_q_lens, "seq_q_lens")
-        slk_v = self._checked_seq_lens(seq_kv_lens, "seq_kv_lens")
         # [seq_kv(B) | cu_q(B+1) | cu_k(B+1)] — bound as the kernel's
         # seq_kv_lens tensor; the leading B words alias the per-sequence KV
         # lengths so the kernel's existing padded-mask read works unchanged.
         # Built HOST-side from the (inherent) tolist round-trip and uploaded
         # in ONE H2D copy: a device-side cumsum would allocate its scan-temp
-        # storage and launch kernels on the execute hot path.
+        # storage and launch kernels on the execute hot path. Either length
+        # form feeds it — per-batch (B,) lengths or the (B+1,) cu_seq_len
+        # prefix sums — at identical cost.
         meta = carver.take(3 * b + 2, torch.int32) if carver is not None else torch.empty(3 * b + 2, dtype=torch.int32, device=dev)
-        slq_host = slq_v.tolist()
-        slk_host = slk_v.tolist()
-        cu_q_host = [0]
-        for n in slq_host:
-            cu_q_host.append(cu_q_host[-1] + int(n))
-        cu_k_host = [0]
-        for n in slk_host:
-            cu_k_host.append(cu_k_host[-1] + int(n))
+        slq_host, cu_q_host = self._thd_host_lens(seq_q_lens, "cu_seq_len_q" if self.cu_seq_q_lens else "seq_q_lens", self.cu_seq_q_lens)
+        slk_host, cu_k_host = self._thd_host_lens(seq_kv_lens, "cu_seq_len_kv" if self.cu_seq_kv_lens else "seq_kv_lens", self.cu_seq_kv_lens)
         meta.copy_(torch.tensor(slk_host + cu_q_host + cu_k_host, dtype=torch.int32))
         t_q = cu_q_host[-1]
         t_kv = cu_k_host[-1]

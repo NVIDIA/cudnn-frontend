@@ -232,10 +232,11 @@ class SdpaGraphFacts:
 
     padded: bool = False  # per-batch KV lengths present (padding mask or THD)
     thd: bool = False  # ragged (THD) Q/K/V
-    # cu_seq_len_q / cu_seq_len_kv (cuDNN 9.24+): prefix sums, a contract of
-    # their own — neither seq_len_* nor ragged_offset. A fact, not a verdict:
-    # no engine here implements it yet, but reading the graph as plain padded
-    # gave wrong output (14.9% of O on test_sdpa_mixed_seq_len_forms_L0[cu_q_brcm]).
+    # cu_seq_len_q / cu_seq_len_kv (cuDNN 9.24+): (B+1,) prefix sums, a
+    # contract of their own — neither seq_len_* nor ragged_offset. A fact,
+    # not a verdict: engines that don't consume the form must decline (reading
+    # the graph as plain padded gave wrong output — 14.9% of O on
+    # test_sdpa_mixed_seq_len_forms_L0[cu_q_brcm]).
     has_cu_seq_len: bool = False
     has_sink: bool = False
     wants_stats: bool = False
@@ -253,6 +254,10 @@ class SdpaGraphFacts:
     sink_t: Any = None
     seq_kv_t: Any = None
     seq_q_t: Any = None
+    # (B+1,) prefix-sum IR refs (cuDNN 9.24+ cu_seq_len form); None when the
+    # graph carries the per-batch seq_len_* form on that side instead.
+    cu_seq_q_t: Any = None
+    cu_seq_kv_t: Any = None
     # Feature operands (bias / block-mask / score-stat outputs).
     bias_t: Any = None
     block_mask_t: Any = None
@@ -474,30 +479,39 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         return _invalid(f"sliding-window length must be >= 1; got {left_bound}")
     window_left = (left_bound - 1) if left_bound is not None else None
 
-    has_cu_seq_len = any(rec.get(name) is not None for name in ("cu_seq_len_q", "cu_seq_len_kv"))
+    cu_seq_q = rec.get("cu_seq_len_q")
+    cu_seq_kv = rec.get("cu_seq_len_kv")
+    has_cu_seq_len = cu_seq_q is not None or cu_seq_kv is not None
 
-    # Padding / THD.
+    # Padding / THD. Per-batch lengths arrive as seq_len_* ((B,) lengths) or
+    # cu_seq_len_* ((B+1,) prefix sums, cuDNN 9.24+) per side; either form
+    # satisfies the length requirement. Both-on-one-side is NOT flagged
+    # invalid here (invalid means malformed-for-everyone; the backend accepts
+    # it with its own precedence) — an engine that serves the cu form must
+    # decline the ambiguous combination itself.
     thd = getattr(q, "ragged_offset", None) is not None
     use_padding_mask = bool(rec.get("use_padding_mask", False))
     seq_len_kv = rec.get("seq_len_kv")
     seq_len_q = rec.get("seq_len_q")
+    q_lens_given = seq_len_q is not None or cu_seq_q is not None
+    kv_lens_given = seq_len_kv is not None or cu_seq_kv is not None
     seq_q_trim = False
     if thd:
         if getattr(k, "ragged_offset", None) is None or getattr(v, "ragged_offset", None) is None:
             return _invalid("THD (ragged) requires ragged Q, K, and V")
-        if seq_len_q is None or seq_len_kv is None:
-            return _invalid("THD (ragged) requires seq_len_q and seq_len_kv")
+        if not q_lens_given or not kv_lens_given:
+            return _invalid("THD (ragged) requires seq_len_q/cu_seq_len_q and seq_len_kv/cu_seq_len_kv")
         padded = True
     else:
-        if use_padding_mask and seq_len_kv is None:
-            return _invalid("use_padding_mask requires seq_len_kv")
-        seq_q_trim = seq_len_q is not None and not use_padding_mask
-        padded = use_padding_mask and seq_len_kv is not None
+        if use_padding_mask and not kv_lens_given:
+            return _invalid("use_padding_mask requires seq_len_kv or cu_seq_len_kv")
+        seq_q_trim = q_lens_given and not use_padding_mask
+        padded = use_padding_mask and kv_lens_given
 
-    # The kernels consume per-batch lengths as int32 directly; there is no
-    # implicit conversion anywhere on the execute path (it would allocate and
-    # launch a cast kernel).
-    for name, t in (("seq_len_q", seq_len_q), ("seq_len_kv", seq_len_kv)):
+    # The kernels consume per-batch lengths / prefix sums as int32 directly;
+    # there is no implicit conversion anywhere on the execute path (it would
+    # allocate and launch a cast kernel).
+    for name, t in (("seq_len_q", seq_len_q), ("seq_len_kv", seq_len_kv), ("cu_seq_len_q", cu_seq_q), ("cu_seq_len_kv", cu_seq_kv)):
         if t is not None:
             if t.get_data_type() != cudnn.data_type.INT32:
                 return _invalid(f"{name} must be int32; got {t.get_data_type()}")
@@ -597,6 +611,8 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         sink_t=sink_token,
         seq_kv_t=seq_len_kv,
         seq_q_t=seq_len_q,
+        cu_seq_q_t=cu_seq_q,
+        cu_seq_kv_t=cu_seq_kv,
         sf_q_t=(dsc_q if is_mxfp8 else None),
         sf_k_t=(dsc_k if is_mxfp8 else None),
         sf_v_t=(dsc_v if is_mxfp8 else None),
@@ -640,6 +656,9 @@ class SdpaBinding:
     sink_token: Any = None
     seq_len_kv: Any = None
     seq_len_q: Any = None
+    # (B+1,) prefix-sum form (cuDNN 9.24+); at most one form per side.
+    cu_seq_len_q: Any = None
+    cu_seq_len_kv: Any = None
     # MXFP8 block-scale (descale) tensors + Amax_O output.
     sf_q: Any = None
     sf_k: Any = None
@@ -677,6 +696,8 @@ class SdpaBinding:
                 self.sink_token,
                 self.seq_len_kv,
                 self.seq_len_q,
+                self.cu_seq_len_q,
+                self.cu_seq_len_kv,
                 self.sf_q,
                 self.sf_k,
                 self.sf_v,
@@ -823,8 +844,17 @@ def resolve_feature_operands(facts: "SdpaGraphFacts", resolved: dict) -> Feature
 
     ops = FeatureOperands(alibi=facts.has_alibi)
     if facts.padded:
-        ops.seq_kv_lens = _need(facts.seq_kv_t, "padding mask (seq_len_kv)")
-        if facts.seq_q_t is not None:
+        # Either length form satisfies a side: per-batch seq_len_* or the
+        # (B+1,) cu_seq_len_* prefix sums (cuDNN 9.24+) — the cu buffer
+        # travels through the same operand slot (the adapter was constructed
+        # knowing the form).
+        if facts.cu_seq_kv_t is not None:
+            ops.seq_kv_lens = _need(facts.cu_seq_kv_t, "padding mask (cu_seq_len_kv)")
+        else:
+            ops.seq_kv_lens = _need(facts.seq_kv_t, "padding mask (seq_len_kv)")
+        if facts.cu_seq_q_t is not None:
+            ops.seq_len_q = _need(facts.cu_seq_q_t, "per-batch query lengths (cu_seq_len_q)")
+        elif facts.seq_q_t is not None:
             ops.seq_len_q = _need(facts.seq_q_t, "per-batch query lengths (seq_len_q)")
     if facts.has_bias:
         ops.bias = _need(facts.bias_t, "bias")

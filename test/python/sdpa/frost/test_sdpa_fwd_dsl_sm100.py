@@ -691,6 +691,7 @@ def _run_dsl_thd_graph(
     mask="causal",
     check_stats=False,
     stats_layout="token_major",
+    cu_lens=False,
 ):
     """Build + execute a packed THD/varlen graph; returns the flat packed O
     storage buffer — plus, with ``check_stats``, the flat Stats storage and
@@ -726,6 +727,10 @@ def _run_dsl_thd_graph(
 
     slq = torch.tensor(seq_lens_q, dtype=torch.int32, device=dev).view(B, 1, 1, 1)
     slk = torch.tensor(seq_lens_kv, dtype=torch.int32, device=dev).view(B, 1, 1, 1)
+    # cu_lens: bind the (B+1,) prefix-sum form (cu_seq_len_q/kv, cuDNN 9.24+)
+    # instead of per-batch lengths.
+    cuq_t = torch.tensor(cu_q, dtype=torch.int32, device=dev).view(B + 1, 1, 1, 1)
+    cuk_t = torch.tensor(cu_k, dtype=torch.int32, device=dev).view(B + 1, 1, 1, 1)
     ro_q = (torch.tensor(cu_q, dtype=torch.int64, device=dev) * H_q * d).view(B + 1, 1, 1, 1)
     ro_k = (torch.tensor(cu_k, dtype=torch.int64, device=dev) * H_kv * d).view(B + 1, 1, 1, 1)
 
@@ -734,8 +739,8 @@ def _run_dsl_thd_graph(
     tq = g.tensor(dim=[B, H_q, S_max_q, d], stride=list(stride_q), data_type=io, name="q")
     tk = g.tensor(dim=[B, H_kv, S_max_kv, d], stride=list(stride_kv), data_type=io, name="k")
     tv = g.tensor(dim=[B, H_kv, S_max_kv, d], stride=list(stride_kv), data_type=io, name="v")
-    sq = g.tensor_like(slq)
-    skv = g.tensor_like(slk)
+    sq = g.tensor_like(cuq_t if cu_lens else slq)
+    skv = g.tensor_like(cuk_t if cu_lens else slk)
     qro = g.tensor_like(ro_q)
     kro = g.tensor_like(ro_k)
     vro = g.tensor_like(ro_k)
@@ -743,9 +748,13 @@ def _run_dsl_thd_graph(
     tq.set_ragged_offset(qro)
     tk.set_ragged_offset(kro)
     tv.set_ragged_offset(vro)
-    kw = dict(name="sdpa", q=tq, k=tk, v=tv, generate_stats=check_stats, attn_scale=scale, use_padding_mask=True, seq_len_q=sq, seq_len_kv=skv)
+    kw = dict(name="sdpa", q=tq, k=tk, v=tv, generate_stats=check_stats, attn_scale=scale, use_padding_mask=True)
+    if cu_lens:
+        kw.update(cu_seq_len_q=sq, cu_seq_len_kv=skv)
+    else:
+        kw.update(seq_len_q=sq, seq_len_kv=skv)
     kw.update(_mask_graph_kwargs(mask))
-    vp = {tq: q_gpu, tk: k_gpu, tv: v_gpu, sq: slq, skv: slk, qro: ro_q, kro: ro_k, vro: ro_k, oro: ro_q}
+    vp = {tq: q_gpu, tk: k_gpu, tv: v_gpu, sq: (cuq_t if cu_lens else slq), skv: (cuk_t if cu_lens else slk), qro: ro_q, kro: ro_k, vro: ro_k, oro: ro_q}
     if sink is not None:
         st = g.tensor_like(sink)
         kw["sink_token"] = st
@@ -849,7 +858,9 @@ def _combo_thd(d, dtype, H_q, H_kv, scale, sink_t, mask):
     torch.testing.assert_close(o_out, o_ref, atol=5e-2, rtol=3e-2)
 
 
-def _run_thd_stats_case(*, seq_lens_q, seq_lens_kv, d=128, dtype=torch.float16, H_q=8, H_kv=8, mask="causal", with_sink=False, stats_layout="token_major"):
+def _run_thd_stats_case(
+    *, seq_lens_q, seq_lens_kv, d=128, dtype=torch.float16, H_q=8, H_kv=8, mask="causal", with_sink=False, stats_layout="token_major", cu_lens=False
+):
     """Run a THD (ragged) graph with generate_stats and check O and the ragged
     Stats against per-sequence references, in the declared Stats layout."""
     _require_dsl()
@@ -888,6 +899,7 @@ def _run_thd_stats_case(*, seq_lens_q, seq_lens_kv, d=128, dtype=torch.float16, 
         mask=mask,
         check_stats=True,
         stats_layout=stats_layout,
+        cu_lens=cu_lens,
     )
 
     if T_q == 0:
@@ -987,6 +999,29 @@ def test_dsl_sm100_thd_all_q_zero_stats(stats_layout):
 
     _run_thd_stats_case(seq_lens_q=[0, 0], seq_lens_kv=[50, 30], mask="none", stats_layout=stats_layout)
     _run_thd_stats_case(seq_lens_q=[0, 0], seq_lens_kv=[0, 0], mask="none", stats_layout=stats_layout)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("stats_layout", ["token_major", "head_major"])
+@torch_fork_set_rng(seed=35)
+def test_dsl_sm100_thd_cu_seq_len_stats(stats_layout):
+    """THD with the cu_seq_len_q/kv length form ((B+1,) prefix sums, cuDNN
+    9.24+ — the form TE/PyT/vLLM natively hold): the lowering derives the
+    per-batch lengths host-side from the same inherent tolist round-trip, so
+    results are identical to the seq_len form, ragged Stats included."""
+
+    _run_thd_stats_case(seq_lens_q=[200, 150], seq_lens_kv=[200, 150], mask="causal", stats_layout=stats_layout, cu_lens=True)
+
+
+@pytest.mark.L1
+@torch_fork_set_rng(seed=36)
+def test_dsl_sm100_thd_cu_seq_len_zero_lens():
+    """cu_seq_len form with degenerate lengths: a zero-length sequence
+    (repeated prefix value) and an all-zero KV side keep the same dead-row /
+    no-op semantics as the seq_len form."""
+
+    _run_thd_stats_case(seq_lens_q=[128, 0, 64], seq_lens_kv=[100, 0, 0], mask="causal", cu_lens=True)
+    _run_thd_stats_case(seq_lens_q=[64, 32], seq_lens_kv=[0, 0], mask="none", cu_lens=True)
 
 
 _COMBO_MASKS = {
