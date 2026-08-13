@@ -112,6 +112,10 @@ class Capabilities:
     # OOB-clipped. False = only the native dims above are eligible (FP8/MXFP8,
     # whose SF plumbing is not audited for zero-padding).
     d_envelope: bool = False
+    # Alignment rule for envelope rows: graph head dims must be multiples of
+    # this. 8 = the TMA 16-byte global-stride rule at 2 bytes/elem (SM100 DSL
+    # rows). 1 = no constraint (the SM80 lowering pads host-side).
+    d_pad_multiple: int = 8
     dtypes: frozenset = frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16})  # cudnn.data_type, see graph_analyzer
     is_mxfp8: bool = False  # block-scale MXFP8 engine (FP8 in + per-32-block E8M0 SF)
     is_fp8: bool = False  # per-tensor FP8 engine (FP8 in + scalar descales)
@@ -160,6 +164,8 @@ class Capabilities:
     # kernels via SEQ_Q_LENS_PRESENT; the FP8/MXFP8 kernels lack the epilogue
     # trim, so their specs keep this False.
     padded_stats: bool = False
+    # s_q == 1 (decode-shaped) graphs; the SM80 prefill kernels are gated off.
+    decode: bool = True
 
     # Escape hatch for kernels whose persistent multi-wave rescheduling is
     # numerically broken: eligible only when the whole grid fits in one wave
@@ -258,13 +264,16 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         cap_qk, cap_v = max(capabilities.d_qk), max(capabilities.d_v)
         if facts.d_qk > cap_qk or facts.d_v > cap_v:
             return f"serves D_QK<={cap_qk}/D_V<={cap_v} (envelope); graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
-        if facts.d_qk % 8 != 0 or facts.d_v % 8 != 0:
+        m = capabilities.d_pad_multiple
+        if m > 1 and (facts.d_qk % m != 0 or facts.d_v % m != 0):
             return (
-                f"envelope zero-padding requires D_QK/D_V multiples of 8 (TMA 16-byte "
+                f"envelope zero-padding requires D_QK/D_V multiples of {m} (TMA 16-byte "
                 f"global-stride constraint at 2 bytes/elem); graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
             )
     elif facts.d_qk not in capabilities.d_qk or facts.d_v not in capabilities.d_v:
         return f"serves D_QK in {sorted(capabilities.d_qk)}/D_V in {sorted(capabilities.d_v)}; graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
+    if facts.s_q == 1 and not capabilities.decode:
+        return "s_q == 1 (decode) is out of scope for the SM80 prefill kernels"
     if facts.dtype not in capabilities.dtypes:
         return f"dtype {facts.dtype} not in {sorted(str(d) for d in capabilities.dtypes)}"
     if (capabilities.is_fp8 or capabilities.is_mxfp8) and facts.dtype_o not in capabilities.out_dtypes:
@@ -476,6 +485,114 @@ def _sm100_fp8_spec(d: int) -> EngineSpec:
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM100),
     )
+
+
+def _sm80_spec() -> EngineSpec:
+    """SM80 (A100) prefill row: lowers onto the ``cudnn.sdpa`` SM80 APIBase
+    adapter (``fwd/api.py``), which owns kernel-flavor selection
+    (gptoss/llama/dsv3/qwen), host-side head-dim padding (hence
+    ``d_pad_multiple=1``), BHSD<->BSHD normalization, and per-shape kernel
+    caching — the CuTe-DSL JIT happens on the first execute.  THD graphs are
+    gated off (the standalone wrappers serve THD); knob domains are empty
+    (no tunables wired)."""
+    return EngineSpec(
+        name="sdpa_fwd_prefill_sm80",
+        capabilities=Capabilities(
+            sm_lo=80,
+            sm_hi=80,  # A100 exactly: the kernels assume its 164 KiB opt-in SMEM
+            phase="prefill",
+            d_qk=frozenset({256}),
+            d_v=frozenset({256}),
+            d_envelope=True,  # flavor envelopes; host-side zero-padding
+            d_pad_multiple=1,
+            dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
+            bias=True,
+            alibi=True,
+            block_mask=True,
+            score_max=True,
+            score_sum_exp=True,
+            right_band_widening=True,
+            causal=True,
+            bottom_right=True,
+            bottom_right_with_swa=True,
+            bottom_right_padded_seq_q=True,
+            swa=True,
+            padded=True,
+            sink=True,
+            stats=True,
+            padded_stats=True,
+            decode=False,
+            layouts=frozenset({"bshd", "dense_flex"}),
+            skv_tile=0,  # the kernels' is_even_k path serves ragged S_kv
+            sched_policies=frozenset(),
+        ),
+        lower=lower_sm80_prefill,
+    )
+
+
+def lower_sm80_prefill(spec: EngineSpec, facts: "ga.SdpaGraphFacts", knobs: Optional[SdpaFwdKnobs] = None):
+    """Lower the SM80 prefill row through the ``cudnn.sdpa`` SM80 adapter."""
+    from cudnn.sdpa.fwd.api import sdpa_fwd_wrapper_sm80
+
+    binding = ga.SdpaBinding(
+        q=facts.q_t,
+        k=facts.k_t,
+        v=facts.v_t,
+        o=facts.o_t,
+        stats=facts.stats_t,
+        bias=facts.bias_t,
+        sink_token=facts.sink_t,
+        seq_len_kv=facts.seq_kv_t,
+        seq_len_q=facts.seq_q_t,
+        block_mask=facts.block_mask_t,
+        score_max=facts.score_max_t,
+        score_sum_exp=facts.score_sum_exp_t,
+    )
+    mask_args = ga.adapter_mask_args(facts)
+    wants_score_stats = facts.has_score_max or facts.has_score_sum_exp
+
+    def _execute(variant_pack, stream=None):
+        resolved = ga.resolve_variant_pack(variant_pack, binding)
+        # dense_flex delivery: the adapter requires BSHD-physical buffers, so
+        # normalize here (zero-copy when already BSHD; repeat_interleave's
+        # GQA expansion is BHSD-contiguous and always needs it).
+        q_buf = ga.to_bshd_physical(resolved[id(facts.q_t)])
+        k_buf = ga.to_bshd_physical(ga.expand_gqa_heads(resolved[id(facts.k_t)], facts.h_q))
+        v_buf = ga.to_bshd_physical(ga.expand_gqa_heads(resolved[id(facts.v_t)], facts.h_q))
+
+        out = sdpa_fwd_wrapper_sm80(
+            q_buf,
+            k_buf,
+            v_buf,
+            scale_softmax=facts.scale,
+            return_score_stats=wants_score_stats,
+            # Stream from the caller's handle (ExecutionContext.stream);
+            # None keeps the current stream.
+            current_stream=stream,
+            **mask_args,
+            **ga.adapter_feature_buffers(facts, resolved),
+        )
+
+        # copy_ casts in place; no .to() (which would allocate a staging
+        # tensor per execute). The kernel outputs are contiguous, so the
+        # reshapes are pure views.
+        resolved[id(facts.o_t)].copy_(out["o_tensor"])
+        if facts.wants_stats:
+            stats_buf = resolved.get(id(facts.stats_t))
+            if stats_buf is not None:
+                stats_buf.copy_(out["lse_tensor"].view(stats_buf.shape))
+        if wants_score_stats:
+            for t_ref, key in ((facts.score_max_t, "score_max"), (facts.score_sum_exp_t, "score_sum_exp")):
+                buf = resolved.get(id(t_ref)) if t_ref is not None else None
+                if buf is not None:
+                    buf.copy_(out[key].view(buf.shape))
+        return None
+
+    # Executor contract (engine._FrostSdpaFwdPlan): torch-native host code,
+    # no carved scratch — workspace_bytes 0 means _execute(variant_pack).
+    _execute.workspace_bytes = 0
+    _execute.binding = binding
+    return _execute
 
 
 def _sm120_spec() -> EngineSpec:
@@ -692,13 +809,16 @@ def lower_dsl_prefill(
             # (uninitialized is fine: the kernel writes every row). lse_optional
             # adapters take lse_tensor=None instead.
             lse_buf = carver.take(facts.b * facts.h_q * facts.s_q, torch.float32)
-        sinks_buf = resolved.get(id(binding.sink_token)) if binding.sink_token is not None else None
-        seq_kv_buf = resolved.get(id(binding.seq_len_kv)) if binding.seq_len_kv is not None else None
+        # Shared presence-checked resolution (graph_analyzer.resolve_feature_operands);
+        # bias/block_mask/alibi stay None for these rows (mismatch gates them).
+        feature_ops = ga.resolve_feature_operands(facts, resolved)
+        sinks_buf = feature_ops.sinks
+        seq_kv_buf = feature_ops.seq_kv_lens
         if synth_kv_padding and seq_kv_buf is None:
             # Full-length per-batch KV lengths: mathematically a no-op mask that
             # makes the kernel's padded path cover the ragged KV tail.
             seq_kv_buf = carver.take(facts.b, torch.int32).fill_(facts.s_kv)
-        seq_q_buf = resolved.get(id(binding.seq_len_q)) if binding.seq_len_q is not None else None
+        seq_q_buf = feature_ops.seq_len_q
         sf_q_buf = resolved.get(id(binding.sf_q)) if binding.sf_q is not None else None
         sf_k_buf = resolved.get(id(binding.sf_k)) if binding.sf_k is not None else None
         sf_v_buf = resolved.get(id(binding.sf_v)) if binding.sf_v is not None else None
@@ -859,6 +979,7 @@ ENGINE_SPECS = (
     _sm100_fp8_spec(128),
     _sm120_spec(),
     _sm120_fp8_spec(),
+    _sm80_spec(),
 )
 
 __all__ = ["Capabilities", "EngineSpec", "ENGINE_SPECS", "SdpaFwdKnobs", "analyze_for", "build", "engine_name", "mismatch"]

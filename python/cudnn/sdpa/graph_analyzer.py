@@ -253,7 +253,12 @@ class SdpaGraphFacts:
     sink_t: Any = None
     seq_kv_t: Any = None
     seq_q_t: Any = None
-    # backward-only refs
+    # Feature operands (bias / block-mask / score-stat outputs).
+    bias_t: Any = None
+    block_mask_t: Any = None
+    score_max_t: Any = None
+    score_sum_exp_t: Any = None
+    # Backward-only refs.
     do_t: Any = None
     dq_t: Any = None
     dk_t: Any = None
@@ -579,6 +584,10 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         v_t=v,
         o_t=o,
         stats_t=(stats if (wants_stats or is_backward) else None),
+        bias_t=rec.get("bias"),
+        block_mask_t=rec.get("block_mask"),
+        score_max_t=rec.get("score_max"),
+        score_sum_exp_t=rec.get("score_sum_exp"),
         do_t=rec.get("dO"),
         dq_t=rec.get("dQ"),
         dk_t=rec.get("dK"),
@@ -766,3 +775,111 @@ def tensor_desc_from_ir(t: Any, name: str = "") -> "TensorDesc":
         device=_torch_cuda_device(),
         name=name,
     )
+
+
+def adapter_mask_args(facts: "SdpaGraphFacts") -> dict:
+    """Map resolved graph mask facts onto the standalone adapters'
+    (is_causal, window_size, causal_bottom_right) vocabulary."""
+    is_causal = facts.right_bound is not None
+    win_left = facts.window_left if facts.window_left is not None else -1
+    win_right = facts.right_bound if (facts.right_bound is not None and facts.right_bound > 0) else -1
+    # A BOTTOM_RIGHT alignment only means something combined with a causal
+    # bound and/or a left window; bare BR on a dense graph is a no-op.
+    bottom_right = facts.bottom_right and (is_causal or facts.window_left is not None)
+    return dict(
+        is_causal=is_causal,
+        window_size=(win_left, win_right),
+        causal_bottom_right=bottom_right,
+    )
+
+
+@dataclass
+class FeatureOperands:
+    """The optional feature operands of one sdpa graph, resolved from a
+    variant pack.  Raw buffers exactly as the caller provided them; each
+    lowering applies its own normalization on top."""
+
+    bias: Any = None
+    sinks: Any = None
+    seq_kv_lens: Any = None
+    seq_len_q: Any = None
+    block_mask: Any = None
+    alibi: bool = False
+
+
+def resolve_feature_operands(facts: "SdpaGraphFacts", resolved: dict) -> FeatureOperands:
+    """Presence-checked resolution of the feature operands the facts demand.
+
+    A feature the graph requests whose buffer is absent from the variant pack
+    is an error here — every lowering would otherwise fail later and worse
+    (a silently-dense mask, a null-deref in the kernel host code).
+    """
+
+    def _need(t_ref, label):
+        buf = resolved.get(id(t_ref)) if t_ref is not None else None
+        if buf is None:
+            raise ValueError(f"cudnn.sdpa: {label} requested but no buffer was provided")
+        return buf
+
+    ops = FeatureOperands(alibi=facts.has_alibi)
+    if facts.padded:
+        ops.seq_kv_lens = _need(facts.seq_kv_t, "padding mask (seq_len_kv)")
+        if facts.seq_q_t is not None:
+            ops.seq_len_q = _need(facts.seq_q_t, "per-batch query lengths (seq_len_q)")
+    if facts.has_bias:
+        ops.bias = _need(facts.bias_t, "bias")
+    if facts.has_sink:
+        ops.sinks = _need(facts.sink_t, "sink_token")
+    if facts.has_block_mask:
+        ops.block_mask = _need(facts.block_mask_t, "block_mask")
+    return ops
+
+
+def adapter_feature_buffers(facts: "SdpaGraphFacts", resolved: dict) -> dict:
+    """:func:`resolve_feature_operands` mapped onto the standalone adapters'
+    kwarg vocabulary, with the flat-tensor normalization their kernels expect."""
+    ops = resolve_feature_operands(facts, resolved)
+    out: dict = {}
+    # Dtypes are facts-gated (seq lens int32, sinks fp32): pure views only —
+    # a .to() here would allocate and launch a cast kernel per execute.
+    if ops.seq_kv_lens is not None:
+        out["seq_kv_lens"] = ops.seq_kv_lens.reshape(-1)
+    if ops.seq_len_q is not None:
+        out["seq_len_q"] = ops.seq_len_q.reshape(-1)
+    if ops.bias is not None:
+        out["bias_tensor"] = ops.bias
+    if ops.sinks is not None:
+        out["sinks"] = ops.sinks.reshape(-1)
+    if ops.block_mask is not None:
+        out["block_mask"] = ops.block_mask
+    if ops.alibi:
+        out["alibi"] = True
+    return out
+
+
+def to_bshd_physical(t: "torch.Tensor") -> "torch.Tensor":
+    """BSHD-physical (stride order 3,1,2,0) copy of a rank-4 BHSD-logical
+    tensor; zero-copy when the buffer already is.  Delivers the dense_flex
+    layout relaxation for lowerings whose adapters require this order
+    (mirrors the DSL executor's canonical-buffer gather)."""
+    strides = t.stride()
+    # already BSHD-physical (size-1 dims wildcarded): D innermost, then H, S, B
+    order = sorted(range(4), key=lambda i: (strides[i], t.shape[i]))
+    act = tuple(ax for ax in order if t.shape[ax] != 1)
+    exp = tuple(ax for ax in (3, 1, 2, 0) if t.shape[ax] != 1)
+    if act == exp:
+        return t
+    return t.permute(0, 2, 1, 3).contiguous().permute(0, 2, 1, 3)
+
+
+def expand_gqa_heads(t: "torch.Tensor", h_q: int) -> "torch.Tensor":
+    """Expand K/V heads to H_q for a dense forward lowering (BHSD dim 1).
+
+    The forward kernels' native dense-GQA path is not exercised by the
+    upstream validation harness (which expands like this); keep the
+    validated shape until kernel-level dense GQA is qualified.
+    """
+    h = t.shape[1]
+    if h == h_q:
+        return t
+    return t.repeat_interleave(h_q // h, dim=1)

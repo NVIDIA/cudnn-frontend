@@ -1068,3 +1068,55 @@ def test_bwd_mismatch_reason_strings(monkeypatch):
     reason = bwd_engines.mismatch(caps, _facts(_mk_bwd_graph()), bwd_engines.SdpaBwdKnobs(tile_m=48))
     assert reason is not None and "tile_m=48" in reason
     assert bwd_engines.mismatch(caps, _facts(_mk_bwd_graph()), bwd_engines.SdpaBwdKnobs(tile_m=64, tile_n=128)) is None
+
+
+# ---------------------------------------------------------------------------
+# The SM80 backward row (sdpa_bwd_sm80): its envelope covers exactly the
+# features the SM120 row's kernel rejects.
+# ---------------------------------------------------------------------------
+
+_BWD_SM80 = "sdpa_bwd_sm80"
+
+
+def test_bwd_sm80_probe_accepts_the_sm120_rejections(monkeypatch):
+    monkeypatch.setattr(ga, "_device_cc", lambda: (8, 0))
+    assert _BWD_SM80 in _bwd_eligible(_mk_bwd_graph())
+    assert _BWD_SM80 in _bwd_eligible(_mk_bwd_graph(use_causal_mask=True))
+    assert _BWD_SM80 in _bwd_eligible(_mk_bwd_graph(h_kv=H // 2))  # GQA
+    assert _BWD_SM80 in _bwd_eligible(_mk_bwd_graph(use_deterministic_algorithm=True))
+    # Flavor envelope: any head dim <= 256 (no multiple-of-16 rule) and
+    # top-left causal with S_q != S_kv.
+    assert _BWD_SM80 in _bwd_eligible(_mk_bwd_graph(d=96))
+    assert _BWD_SM80 in _bwd_eligible(_mk_bwd_graph(use_causal_mask=True, s_q=S // 2))
+
+
+def test_bwd_sm80_probe_rejections(monkeypatch):
+    monkeypatch.setattr(ga, "_device_cc", lambda: (8, 0))
+    assert not _bwd_eligible(_mk_bwd_graph(s_q=1))  # decode-shaped: prefill kernels only
+    assert not _bwd_eligible(_mk_bwd_graph(d=257))  # beyond the qwen (256, 256) envelope
+
+
+def test_bwd_sm80_probe_rejects_off_arch(monkeypatch):
+    monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
+    assert _BWD_SM80 not in _bwd_eligible(_mk_bwd_graph())
+
+
+def test_bwd_dsink_fact():
+    d = 128
+    g = _mk_graph()
+    dims = (B, H, S, d)
+    strides = (S * H * d, d, H * d, 1)
+    q = g.tensor(dim=dims, stride=strides, data_type=DTYPE, name="q")
+    k = g.tensor(dim=dims, stride=strides, data_type=DTYPE, name="k")
+    v = g.tensor(dim=dims, stride=strides, data_type=DTYPE, name="v")
+    o = g.tensor(dim=dims, stride=strides, data_type=DTYPE, name="o")
+    do = g.tensor(dim=dims, stride=strides, data_type=DTYPE, name="dO")
+    stats = g.tensor(dim=(B, H, S, 1), stride=(H * S, S, 1, 1), data_type=cudnn.data_type.FLOAT, name="stats")
+    sink = g.tensor(dim=(1, H, 1, 1), stride=(H, 1, 1, 1), data_type=cudnn.data_type.FLOAT, name="sink")
+    dsink = g.tensor(dim=(1, H, 1, 1), stride=(H, 1, 1, 1), data_type=cudnn.data_type.FLOAT, name="dsink")
+    dq, dk, dv = g.sdpa_backward(q=q, k=k, v=v, o=o, dO=do, stats=stats, attn_scale=0.5, use_causal_mask=True, sink_token=sink, dSink_token=dsink)
+    for t in (dq, dk, dv):
+        _finish_output(t, dims, strides)
+    facts = _facts(g)
+    assert facts.has_sink and facts.has_dsink
+    assert facts.sink_t is not None and facts.dsink_t is not None
