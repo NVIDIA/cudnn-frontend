@@ -11,8 +11,9 @@ CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1 \
   python benchmark/gemm/frost/benchmark_bare_launch.py
 ```
 
-Requires SM100. Every step is checked bit-identical against `graph.execute()`, so a
-number without an `OK` next to it means the demo failed, not that it was fast.
+Requires SM100. Every result is checked bit-identical against `graph.execute()`, and the
+script exits non-zero at the first mismatch — so any timing it prints was preceded by a
+passing check, and a fast number that is also wrong cannot reach you.
 
 ## The measurement
 

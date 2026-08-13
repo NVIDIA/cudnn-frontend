@@ -468,7 +468,10 @@ def main():
     second[3].zero_()
     plan.execute([second[uid].data_ptr() for uid in plan.order])
     torch.cuda.synchronize()
-    print(f"rebound to a second buffer set    {'OK' if torch.equal(second[3], reference2) else 'MISMATCH'}")
+    if not torch.equal(second[3], reference2):
+        print(f"rebound to a second buffer set    MISMATCH: max|diff| = {(second[3].float() - reference2.float()).abs().max().item():.3e}")
+        return 1
+    print("rebound to a second buffer set    OK")
 
     print("\n=== host us/call (min over 25 bursts of 64) ===")
     rows = [
@@ -480,21 +483,24 @@ def main():
     for label, fn in rows:
         print(f"  {label:34s}{burst(fn):8.2f}")
 
-    if args.vary_m:
-        vary_m(graph, plan, mod, args.vary_m, n, k, workspace)
+    if args.vary_m and not vary_m(graph, plan, mod, args.vary_m, n, k):
+        return 1
     print("\nThe kernel runs asynchronously, so these are HOST times -- which is what a")
     print("launch-bound server pays. See docs/frost_bare_launch.md for the contract.")
     return 0
 
 
-def vary_m(graph, plan, mod, new_m, n, k, workspace):
+def vary_m(graph, plan, mod, new_m, n, k):
     """The next rung: serve a different token count from the same built block.
 
     Driven by `PATCH_GROUPS`, which says per caller-supplied quantity what it
     reaches -- the slots that hold it, the descriptors it was built into, and
-    the grid axis it sizes. Changing M re-encodes A only, because the table
-    knows B does not depend on it.
+    the grid axis it sizes. Only what actually moved is applied, so a token
+    count that leaves N and K alone never touches B's descriptor.
+
+    Returns whether the result is bit-identical to a plan built at `new_m`.
     """
+    del graph
     print(f"\n=== serving M={new_m} from the M={plan.problem[0]} block ===")
     reference_graph = build_graph(new_m, n, k)
     data = operands(new_m, n, k)
@@ -502,13 +508,10 @@ def vary_m(graph, plan, mod, new_m, n, k, workspace):
     reference_graph.execute(data, ws)
     torch.cuda.synchronize()
     expected = data[3].clone()
-    del workspace
 
     problem = problem_size(new_m, n, k, data)
     addrs = operand_addresses(plan.table, data)
 
-    # Only what actually moved. The table prunes the rest: N and K are the same,
-    # so B's descriptor is never touched.
     changed = [mod.PROBLEM_FIELDS[i] for i in range(len(problem)) if problem[i] != plan.problem[i]]
     remap, grid = set(), {"x": plan.cfg.gridDimX, "y": plan.cfg.gridDimY, "z": plan.cfg.gridDimZ}
     for var in changed:
@@ -534,10 +537,12 @@ def vary_m(graph, plan, mod, new_m, n, k, workspace):
     data[3].zero_()
     plan.execute(ptrs)
     torch.cuda.synchronize()
-    ok = torch.equal(data[3], expected)
-    print(f"  bit-identical to a plan built at M={new_m}    {'OK' if ok else 'MISMATCH'}")
-    if ok:
-        print(f"\n  {'bare plan.execute(ptrs) at the new M':34s}{burst(lambda: plan.execute(ptrs)):8.2f}")
+    if not torch.equal(data[3], expected):
+        print(f"  bit-identical to a plan built at M={new_m}    MISMATCH: max|diff| = {(data[3].float() - expected.float()).abs().max().item():.3e}")
+        return False
+    print(f"  bit-identical to a plan built at M={new_m}    OK")
+    print(f"\n  {'bare plan.execute(ptrs) at the new M':34s}{burst(lambda: plan.execute(ptrs)):8.2f}")
+    return True
 
 
 if __name__ == "__main__":
