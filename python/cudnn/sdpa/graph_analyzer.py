@@ -20,7 +20,7 @@ variant-pack resolution and TensorDesc construction.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import cudnn
@@ -684,8 +684,23 @@ class SdpaBinding:
     dbias: Any = None
     dsink: Any = None
 
-    def bound_tensors(self) -> list:
-        return [
+    # Built once on first use and reused. Rebuilding it per execute cost ~1.3 us
+    # per bound operand: three passes over the bound list and five dict
+    # constructions, not any one expensive getter.
+    #
+    # What makes the cache safe is the graph, not this class: a binding is
+    # constructed by the engine's lowering AFTER the graph is frozen, and a
+    # frozen graph can no longer re-uid or rename a tensor, so the names and
+    # uids indexed here cannot move. The binding itself is still an ordinary
+    # mutable dataclass -- reassigning a field after the first index() would go
+    # unnoticed. Nothing does; an ordered-slot binding would remove the question.
+    # init=False so a replace()d binding rebuilds rather than inheriting a
+    # cache for the operands it no longer has; compare/repr excluded so the
+    # cache cannot change how a binding prints or compares.
+    _index: Optional[tuple] = field(default=None, init=False, repr=False, compare=False)
+
+    def _build_index(self) -> tuple:
+        bound = [
             t
             for t in (
                 self.q,
@@ -722,6 +737,33 @@ class SdpaBinding:
             )
             if t is not None
         ]
+        name_counts: dict = {}
+        uid_counts: dict = {}
+        names, uids = [], []
+        for t in bound:
+            nm = _safe_name(t)
+            names.append(nm)
+            if nm is not None:
+                name_counts[nm] = name_counts.get(nm, 0) + 1
+            uid = _safe_uid(t)
+            uids.append(uid)
+            if uid is not None:
+                uid_counts[uid] = uid_counts.get(uid, 0) + 1
+        # A name or uid carried by two bound tensors identifies neither.
+        by_obj = {id(t): t for t in bound}
+        by_name = {nm: t for nm, t in zip(names, bound) if nm is not None and name_counts[nm] == 1}
+        by_uid = {uid: t for uid, t in zip(uids, bound) if uid is not None and uid_counts[uid] == 1}
+        self._index = (tuple(bound), by_obj, by_uid, by_name)
+        return self._index
+
+    def index(self) -> tuple:
+        """``(bound, by_obj, by_uid, by_name)`` — the resolution tables."""
+        return self._index or self._build_index()
+
+    def bound_tensors(self) -> tuple:
+        """The bound tensors, in slot order. A tuple: this is the binding's own
+        record, not a working list for a caller to edit."""
+        return self.index()[0]
 
 
 def _safe_name(t: Any) -> Optional[str]:
@@ -751,22 +793,7 @@ def resolve_variant_pack(variant_pack: dict, binding: SdpaBinding) -> dict:
         raise TypeError(
             f"cudnn.sdpa: compiled plans are called with a variant-pack dict {{cudnn_tensor | uid | name: buffer}}; got {type(variant_pack).__name__}"
         )
-    bound = binding.bound_tensors()
-    by_obj = {id(t): t for t in bound}
-
-    name_counts: dict = {}
-    uid_counts: dict = {}
-    for t in bound:
-        nm = _safe_name(t)
-        if nm is not None:
-            name_counts[nm] = name_counts.get(nm, 0) + 1
-        uid = _safe_uid(t)
-        if uid is not None:
-            uid_counts[uid] = uid_counts.get(uid, 0) + 1
-    by_name = {_safe_name(t): t for t in bound if name_counts.get(_safe_name(t)) == 1}
-    by_uid = {_safe_uid(t): t for t in bound if uid_counts.get(_safe_uid(t)) == 1}
-    by_name.pop(None, None)
-    by_uid.pop(None, None)
+    _bound, by_obj, by_uid, by_name = binding.index()
 
     resolved: dict = {}
     for key, buf in variant_pack.items():

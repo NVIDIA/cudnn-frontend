@@ -433,12 +433,16 @@ class pygraph:
         becomes ambiguous and leaves the unique-name index."""
         if name == t.name:
             return
-        # NOT freeze-guarded: names are labels (classic allows renaming after
-        # build — the lowered graph already carries the old label, and labels
-        # have no execution semantics).
+        # Freeze-guarded like every other setter. A name is a label, but it is
+        # also a variant-pack key: a compiled plan may be holding the name it
+        # was built with, and the lowered graph keeps the old one, so a rename
+        # after planning leaves two answers to "which tensor is 'q'" -- and
+        # swapping two names would silently rebind buffers. Nothing needs to
+        # rename a planned graph; build another one.
+        self._check_mutable("rename a tensor")
         if self._tensors.get(t.name) is t:
             del self._tensors[t.name]
-        object.__setattr__(t, "name", name)  # label write is exempt from the freeze
+        object.__setattr__(t, "name", name)
         if name in self._tensors or name in self._ambiguous_names:
             self._tensors.pop(name, None)
             self._ambiguous_names.add(name)

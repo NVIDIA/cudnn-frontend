@@ -67,6 +67,61 @@ unsupported input runnable.
   descriptors) — acceptance is a promise about the execute path, not about
   what the adapter can patch up.
 
+**Rule 3 — `execute()` never reads device memory to the host.**
+
+Rules 1 and 2 both cite CUDA-graph capture as the reason for what they ban, but
+neither names the thing that breaks it most directly: a device-to-host read.
+
+- **No `.item()` / `.tolist()` / `.cpu()` / `.to("cpu")` / `.numpy()` /
+  `float(tensor)` / `int(tensor)` / `torch.is_nonzero`**, and no branch or
+  f-string that forces one, on an execute argument or anything derived from one.
+  A D2H read makes `execute()` synchronous — the whole point of an async launch
+  API is gone. **Nor may it block**: no `torch.cuda.synchronize()`, no
+  stream/event `synchronize()`. A sync reads nothing but costs the same.
+- **It is a functional gap, not a slow path.** A blocking D2H during stream
+  capture is illegal, so a path that does one **cannot be CUDA-graph captured
+  at all** — which is how every inference stack runs decode.
+- **Its cost is the queue, not the transfer.** Measured on SM100: one
+  `.tolist()` costs 11 µs against a drained queue, 2.6 ms behind 16 queued
+  matmuls. Any figure you measure in a microbenchmark is the floor.
+- **If a device value must shape the launch**, pass its pointer and dereference
+  in-kernel, or compile on an envelope and let the kernel read the real extent
+  from device metadata (the f16 prefill kernels already do this for head dims).
+- **A validation that needs a device read is not a validation.** Decline the
+  declaration in `check_support()` — per Rule 2, the graph says what it will
+  hand you — or assert in-kernel. Reading lengths back to decide whether to
+  raise buys nothing: the Router had to choose an engine before any buffer
+  existed.
+
+Known violations, all pre-existing and each needing a kernel-side change, so
+none is precedent:
+
+- THD `cu_seqlens` host cumsum (`sdpa/fwd/api_dsl.py`, `_execute_thd` on both
+  SM100 and SM120). `t_q`/`t_kv` reach the host only because `T` is a
+  compile-time constant. Compile on the `b * s_q_max` envelope and pass `T` as a
+  runtime argument, as the f16 kernels already do for head dims;
+  `sdpa_fwd_wrapper_sm80` shows the other half — it requires `max_s_q` from the
+  caller rather than deriving it.
+- Per-tensor FP8 descale readback (`_scalar` in the same file): fold on device,
+  passing the pointers, as the backend FP8 sdpa does.
+- The FP8/MXFP8 `seq_len_q` guard in `sdpa/fwd/engines.py`. This one cannot be
+  lifted to `check_support()`: `use_padding_mask=True` requires a `seq_len_q`
+  tensor even when only KV is padded, so no static rule separates "declares
+  per-batch Q lengths" from "the lengths are actually short" — declining the
+  declaration would drop the KV-only-padding population these kernels serve
+  correctly. It goes away when the FP8 kernels get the epilogue trim; until
+  then the read is what keeps a short length from being silently ignored.
+- The ragged cache-key `max()` in `sdpa/{fwd,bwd}/api.py`.
+- `cu_seqlens_{q,k}.to(dtype=..., device="cpu")` in the SM80 packed-THD backward
+  (`sdpa/bwd/kernels/bprop_f16_sm80.py`). Reachable only through the standalone
+  wrapper: the registered `sdpa_bwd_sm80` spec declares `thd=False`, so
+  `graph.execute()` does not route here. Still a violation, and it is the one to
+  fix first if that spec ever gains THD.
+
+When auditing this list, grep for the ARGUMENT, not the call shape:
+`device="cpu"` finds `to(dtype=..., device="cpu")`, which `to(device="cpu")`
+misses.
+
 ## Frontend-only kernel package layout
 
 ```
