@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
 from dataclasses import dataclass
 from typing import Optional
 
@@ -67,6 +68,7 @@ class TemplateParams:
     seq_kv_lens_present: bool = False
     has_sink: bool = False
     thd_varlen: bool = False
+    sched_policy: int = SCHED_NATURAL
     q_tile: int = SEQ_Q_TILES[0]
     kv_tile: int = SEQ_KV_TILES[0]
 

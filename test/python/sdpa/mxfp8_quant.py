@@ -38,8 +38,7 @@ Semantics are replicated from the TE sources (verified against the checkout at
   (``swizzle_row_scaling_kernel`` / ``swizzle_col_scaling_kernel``, the target
   of ``tex.swizzle_scales_for_gemm_``), cross-checked against the consumer side
   in this repo (``python/cudnn/sdpa/fwd/api_dsl.py`` ``_reshape_sf`` +
-  ``kernels/prefill_d128_mxfp8_sm100.py`` SF_SMEM_SIZE_*) and VibeTile's
-  ``kernels/ctm/common/quant/mxfp8_quant.py`` SF store: the scale matrix
+  ``kernels/prefill_d128_mxfp8_sm100.py`` SF_SMEM_SIZE_*): the scale matrix
   ``[R, C]`` (R = rows of the GEMM operand as consumed, C = number of
   32-element blocks along the contraction dim) is tiled into 128x4 "atoms" of
   512 bytes, atoms ordered row-major, and inside an atom byte
