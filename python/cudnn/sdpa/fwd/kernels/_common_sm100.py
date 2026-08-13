@@ -28,6 +28,8 @@ class Bars(NamedTuple):
     mb_bmm1_done: object
     mb_bmm2_done: object
     mb_bmm2_ready: object
+    mb_s_empty: object
+    mb_s_consumed: object
 
     mb_stat_full: object
     mb_stat_empty: object
@@ -141,6 +143,18 @@ def make_classic_bars(CFG) -> Bars:
             init_count=tuple(SOFTMAX_PLUS_CORR_TOTAL if (s % N_BMM2_CHUNKS) == 0 else SOFTMAX_LANES_TOTAL for s in range(CFG.TILES_Q * N_BMM2_CHUNKS)),
             producer=Producer.LEADER,
             scope=Scope.LEADER,
+        ),
+        mb_s_consumed=MBarrier(
+            _alloc(CFG.TILES_Q),
+            stages=CFG.TILES_Q,
+            init_count=CFG.SOFTMAX_LANES,
+            producer=Producer.THREAD,
+        ),
+        mb_s_empty=MBarrier(
+            _alloc(CFG.TILES_Q),
+            stages=CFG.TILES_Q,
+            init_count=CFG.SOFTMAX_LANES,
+            producer=Producer.THREAD,
         ),
         mb_stat_full=MBarrier(_alloc(CFG.TILES_Q), stages=CFG.TILES_Q, init_count=CFG.SOFTMAX_LANES, producer=Producer.THREAD),
         mb_stat_empty=MBarrier(_alloc(CFG.TILES_Q), stages=CFG.TILES_Q, init_count=CFG.CORR_LANES, producer=Producer.THREAD),
@@ -500,6 +514,20 @@ def make_split_helpers(CFG, *, bounds_for_tile, dispatch_decode_initial, dispatc
     )
 
 
+@cute.jit
+def decode_linear_tile_lpt_grouped(linear, q_h, batch, q_tiles, lpt_head_group: cutlass.Constexpr[int]):
+    head_group = cutlass.Int32(lpt_head_group)
+    group_span = q_tiles * head_group
+    group_idx = linear // group_span
+    group_offset = linear % group_span
+    row_rank = group_offset // head_group
+    within = group_idx * head_group + group_offset % head_group
+    row = (q_tiles - cutlass.Int32(1)) - row_rank
+    head = within % q_h
+    batch_idx = within // q_h
+    return row, head, batch_idx
+
+
 class SdpaHelpers(NamedTuple):
     decode_initial: object
     decode_payload: object
@@ -514,7 +542,12 @@ class SdpaHelpers(NamedTuple):
     thd_sf_tile_bases: object
 
 
-def make_sdpa_helpers(CFG, lpt_q_tiles_in_cga_units: bool = False) -> SdpaHelpers:
+def make_sdpa_helpers(
+    CFG,
+    lpt_q_tiles_in_cga_units: bool = False,
+    lpt_head_group: int = 1,
+    lpt_q_tiles: int = 0,
+) -> SdpaHelpers:
     cga_tile_m = CFG.TILES_Q * CFG.TILE_M * CFG.CTA_MMA
 
     _cga_m = getattr(CFG, "CGA_M", 1)
@@ -582,20 +615,37 @@ def make_sdpa_helpers(CFG, lpt_q_tiles_in_cga_units: bool = False) -> SdpaHelper
             return _lpt_q_super(row, cta_in_pair), head, batch
 
     else:
+        if lpt_q_tiles > 0:
 
-        @cute.jit
-        def _decode_initial(bidx, bidy, bidz, cta_in_pair, n_q_supers, n_qh, n_batch, qh_per_kh=None, seqlen_kv=None):
-            linear = _lpt_linear(bidx)
-            q_tiles = n_q_supers // cutlass.Int32(_cta_mma) if lpt_q_tiles_in_cga_units else n_q_supers
-            row, head, batch = lpt_tile_coords(linear, n_qh, n_batch, q_tiles)
-            return _lpt_q_super(row, cta_in_pair), head, batch
+            @cute.jit
+            def _decode_initial(bidx, bidy, bidz, cta_in_pair, n_q_supers, n_qh, n_batch, qh_per_kh=None, seqlen_kv=None):
+                row, head, batch = decode_linear_tile_lpt_grouped(
+                    _lpt_linear(bidx), n_qh, n_batch, cutlass.Int32(lpt_q_tiles), lpt_head_group
+                )
+                return _lpt_q_super(row, cta_in_pair), head, batch
 
-        @cute.jit
-        def _decode_payload(t0, t1, cta_in_pair, n_q_supers, n_qh, n_batch, qh_per_kh=None, seqlen_kv=None):
-            linear = _lpt_linear(t0)
-            q_tiles = n_q_supers // cutlass.Int32(_cta_mma) if lpt_q_tiles_in_cga_units else n_q_supers
-            row, head, batch = lpt_tile_coords(linear, n_qh, n_batch, q_tiles)
-            return _lpt_q_super(row, cta_in_pair), head, batch
+            @cute.jit
+            def _decode_payload(t0, t1, cta_in_pair, n_q_supers, n_qh, n_batch, qh_per_kh=None, seqlen_kv=None):
+                row, head, batch = decode_linear_tile_lpt_grouped(
+                    _lpt_linear(t0), n_qh, n_batch, cutlass.Int32(lpt_q_tiles), lpt_head_group
+                )
+                return _lpt_q_super(row, cta_in_pair), head, batch
+
+        else:
+
+            @cute.jit
+            def _decode_initial(bidx, bidy, bidz, cta_in_pair, n_q_supers, n_qh, n_batch, qh_per_kh=None, seqlen_kv=None):
+                linear = _lpt_linear(bidx)
+                q_tiles = n_q_supers // cutlass.Int32(_cta_mma) if lpt_q_tiles_in_cga_units else n_q_supers
+                row, head, batch = lpt_tile_coords(linear, n_qh, n_batch, q_tiles)
+                return _lpt_q_super(row, cta_in_pair), head, batch
+
+            @cute.jit
+            def _decode_payload(t0, t1, cta_in_pair, n_q_supers, n_qh, n_batch, qh_per_kh=None, seqlen_kv=None):
+                linear = _lpt_linear(t0)
+                q_tiles = n_q_supers // cutlass.Int32(_cta_mma) if lpt_q_tiles_in_cga_units else n_q_supers
+                row, head, batch = lpt_tile_coords(linear, n_qh, n_batch, q_tiles)
+                return _lpt_q_super(row, cta_in_pair), head, batch
 
     @cute.jit
     def _bounds_for_tile(q_super_idx, seqlen_q, seqlen_kv, cta_in_pair):
@@ -638,7 +688,7 @@ def make_sdpa_helpers(CFG, lpt_q_tiles_in_cga_units: bool = False) -> SdpaHelper
             cga_base_super = q_super_idx - cta_in_pair
             q_row_coord = cga_base_super * cutlass.Int32(CFG.TILES_Q * CFG.TILE_M)
             arr = cutlass.make_array_view(seq_q_lens_tensor)
-            q_len_b = cutlass.Int32(arr[batch_idx])
+            q_len_b = cutlass.Int32(arr[cutlass.Int32(batch_idx)])
             tile_dead = q_row_coord >= q_len_b
             dead_lo = cutlass.Int32(arith.select(tile_dead.ir_value(), b.left.ir_value(), b.unmasked_lo.ir_value()))
             dead_hi = cutlass.Int32(arith.select(tile_dead.ir_value(), b.left.ir_value(), b.unmasked_hi.ir_value()))
@@ -650,7 +700,7 @@ def make_sdpa_helpers(CFG, lpt_q_tiles_in_cga_units: bool = False) -> SdpaHelper
     def _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, scalar_seqlen_kv):
         if cutlass.const_expr(CFG.SEQ_KV_LENS_PRESENT == 1):
             arr = cutlass.make_array_view(seq_kv_lens_tensor)
-            return cutlass.Int32(arr[batch_idx])
+            return cutlass.Int32(arr[cutlass.Int32(batch_idx)])
         return scalar_seqlen_kv
 
     @cute.jit

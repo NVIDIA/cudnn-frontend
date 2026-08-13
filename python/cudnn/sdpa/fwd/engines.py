@@ -481,8 +481,13 @@ def _sm100_mxfp8_spec(d: int) -> EngineSpec:
     )
 
 
-def _sm100_fp8_spec(d: int) -> EngineSpec:
-    """d128 per-tensor FP8 engine (E4M3/E5M2 in + scalar descales, half/FP8 out).
+def _sm100_fp8_spec(
+    d: int,
+    d_v: Optional[int] = None,
+    *,
+    dtypes: Optional[frozenset] = None,
+) -> EngineSpec:
+    """Exact-shape per-tensor FP8 engine with scalar descales.
 
     Padding mask (per-batch ``seq_len_kv`` → KV-side masking) is supported: KV-only
     padding leaves every query row real, so each row's total_sum > 0 and the
@@ -491,15 +496,19 @@ def _sm100_fp8_spec(d: int) -> EngineSpec:
     (dense execute only for v1), so thd=False.
     """
 
+    d_v = d if d_v is None else d_v
+    suffix = f"d{d}" if d_v == d else f"d{d}_d{d_v}"
+    if dtypes is None:
+        dtypes = frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2})
     return EngineSpec(
-        name=f"sdpa_fwd_prefill_sm100_d{d}_fp8",
+        name=f"sdpa_fwd_prefill_sm100_{suffix}_fp8",
         capabilities=Capabilities(
             sm_lo=_BLACKWELL[0],
             sm_hi=_BLACKWELL[1],
             phase="prefill",
             d_qk=frozenset({d}),
-            d_v=frozenset({d}),
-            dtypes=frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
+            d_v=frozenset({d_v}),
+            dtypes=dtypes,
             out_dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
             is_fp8=True,
             causal=True,
@@ -1026,6 +1035,11 @@ ENGINE_SPECS = (
     _sm100_spec(512),
     _sm100_mxfp8_spec(128),
     _sm100_fp8_spec(128),
+    _sm100_fp8_spec(
+        192,
+        d_v=128,
+        dtypes=frozenset({cudnn.data_type.FP8_E4M3}),
+    ),
     _sm120_spec(),
     _sm120_fp8_spec(),
     _sm80_spec(),
