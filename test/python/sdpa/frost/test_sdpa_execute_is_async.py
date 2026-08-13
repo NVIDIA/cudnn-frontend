@@ -7,9 +7,12 @@ A D2H read makes execute synchronous, so its cost becomes the depth of the queue
 rather than its own work, and the path stops being CUDA-graph capturable. Two
 angles here, because each catches what the other misses:
 
-* the cause -- every torch D2H accessor is made to raise for the duration of one
-  execute, so a regression names the accessor rather than surfacing later as a
-  capture failure. Needs no capture support.
+* the cause -- the KNOWN COMMON D2H and blocking entry points are made to raise
+  for the duration of one execute, so a regression names the offender rather
+  than surfacing later as a capture failure. Needs no capture support. This is a
+  blacklist and cannot be exhaustive: .to(some_cpu_tensor), a CPU-target copy_,
+  and driver-level synchronization all get through. It catches the shapes that
+  actually keep appearing, and the capture test below is the backstop.
 * the symptom, on the path that has no other coverage -- graph.execute() with NO
   handle leaves ExecutionContext.stream None and the adapter resolves the stream
   itself. test_sdpa_stream_respect.py captures the handle-carrying path; this
@@ -34,7 +37,7 @@ pytestmark = [pytest.mark.L0]
 _B, _H, _S = 2, 8, 256
 _HALF, _F32 = cudnn.data_type.HALF, cudnn.data_type.FLOAT
 
-# Tensor methods that copy device memory back to the host. `to` is here because
+# The Tensor methods that keep showing up. `to` is here because
 # .to("cpu") is a D2H read wearing a dtype-cast's clothes; the guard lets a
 # device-to-device .to() through and only trips on a host target.
 _D2H_METHODS = ("item", "tolist", "cpu", "numpy", "__float__", "__int__", "__bool__", "__index__", "to")

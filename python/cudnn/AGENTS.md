@@ -112,6 +112,15 @@ none is precedent:
   correctly. It goes away when the FP8 kernels get the epilogue trim; until
   then the read is what keeps a short length from being silently ignored.
 - The ragged cache-key `max()` in `sdpa/{fwd,bwd}/api.py`.
+- `cu_seqlens_{q,k}.to(dtype=..., device="cpu")` in the SM80 packed-THD backward
+  (`sdpa/bwd/kernels/bprop_f16_sm80.py`). Reachable only through the standalone
+  wrapper: the registered `sdpa_bwd_sm80` spec declares `thd=False`, so
+  `graph.execute()` does not route here. Still a violation, and it is the one to
+  fix first if that spec ever gains THD.
+
+When auditing this list, grep for the ARGUMENT, not the call shape:
+`device="cpu"` finds `to(dtype=..., device="cpu")`, which `to(device="cpu")`
+misses.
 
 ## Frontend-only kernel package layout
 

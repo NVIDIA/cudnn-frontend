@@ -665,12 +665,16 @@ class SdpaBinding:
     dbias: Any = None
     dsink: Any = None
 
-    # Built once on first use and reused. A binding is constructed by the
-    # engine's lowering, after the graph is frozen, and never mutated
-    # afterwards -- and a frozen graph can no longer re-uid or rename a tensor,
-    # so the names and uids this indexes are build-time facts too. Rebuilding
-    # them per execute cost ~1.3 us per bound operand: three passes over the
-    # bound list and five dict constructions, not any one expensive getter.
+    # Built once on first use and reused. Rebuilding it per execute cost ~1.3 us
+    # per bound operand: three passes over the bound list and five dict
+    # constructions, not any one expensive getter.
+    #
+    # What makes the cache safe is the graph, not this class: a binding is
+    # constructed by the engine's lowering AFTER the graph is frozen, and a
+    # frozen graph can no longer re-uid or rename a tensor, so the names and
+    # uids indexed here cannot move. The binding itself is still an ordinary
+    # mutable dataclass -- reassigning a field after the first index() would go
+    # unnoticed. Nothing does; an ordered-slot binding would remove the question.
     # init=False so a replace()d binding rebuilds rather than inheriting a
     # cache for the operands it no longer has; compare/repr excluded so the
     # cache cannot change how a binding prints or compares.
@@ -728,14 +732,16 @@ class SdpaBinding:
         by_obj = {id(t): t for t in bound}
         by_name = {nm: t for nm, t in zip(names, bound) if nm is not None and name_counts[nm] == 1}
         by_uid = {uid: t for uid, t in zip(uids, bound) if uid is not None and uid_counts[uid] == 1}
-        self._index = (bound, by_obj, by_uid, by_name)
+        self._index = (tuple(bound), by_obj, by_uid, by_name)
         return self._index
 
     def index(self) -> tuple:
         """``(bound, by_obj, by_uid, by_name)`` — the resolution tables."""
         return self._index or self._build_index()
 
-    def bound_tensors(self) -> list:
+    def bound_tensors(self) -> tuple:
+        """The bound tensors, in slot order. A tuple: this is the binding's own
+        record, not a working list for a caller to edit."""
         return self.index()[0]
 
 
