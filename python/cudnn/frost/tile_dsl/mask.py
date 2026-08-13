@@ -31,7 +31,13 @@ def apply_mask_chunk(
         return reg_S
 
     neg_inf = cutlass.Float32(mask_value)
-    q_minus_w = q_abs - cutlass.Int32(window_left) if (mask_flags & MASK_SWA) else None
+    # The whole band shifts with the diagonal: under BOTTOM_RIGHT the SWA
+    # lower limit is q + (S_kv - S_q) - W — the same causal_diag offset the
+    # upper (causal) limit uses below. Top-left keeps the plain q - W.
+    q_minus_w = None
+    if mask_flags & MASK_SWA:
+        swa_base = (q_abs + causal_diag) if bottom_right else q_abs
+        q_minus_w = swa_base - cutlass.Int32(window_left)
     # window_right is the compile-time diagonal-band right bound (cuDNN
     # diagonal_band_right_bound): kv columns up to q + window_right (plus the
     # bottom-right diagonal offset) stay unmasked. 0 = plain causal.

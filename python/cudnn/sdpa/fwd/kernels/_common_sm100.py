@@ -226,8 +226,12 @@ def compute_kv_loop_bounds(
         right = cute.math.min(right, kv_hi_caus)
 
     if cutlass.const_expr(mask_flags & MASK_SWA):
-        cond = q_row_coord > cutlass.Int32(window_left)
-        delta = q_row_coord - cutlass.Int32(window_left)
+        # The whole band shifts with the diagonal: under BOTTOM_RIGHT the SWA
+        # lower bound is q + (S_kv - S_q) - W, same anchor the causal upper
+        # bound uses (causal_diag folds to 0 for top-left).
+        swa_base = q_row_coord + causal_diag
+        cond = swa_base > cutlass.Int32(window_left)
+        delta = swa_base - cutlass.Int32(window_left)
         kv_lo_swa = cutlass.Int32(
             arith.select(
                 cond.ir_value(),
@@ -255,7 +259,7 @@ def compute_kv_loop_bounds(
 
     unmasked_lo = left
     if cutlass.const_expr(mask_flags & MASK_SWA):
-        anchor = q_row_coord + cutlass.Int32(cga_tile_m - 1 - window_left)
+        anchor = q_row_coord + causal_diag + cutlass.Int32(cga_tile_m - 1 - window_left)
         swa_unmasked_lo = _div_up(anchor, tile_n)
         cond = anchor > cutlass.Int32(0)
         swa_unmasked_lo = cutlass.Int32(

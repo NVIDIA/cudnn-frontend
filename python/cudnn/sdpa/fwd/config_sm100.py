@@ -111,8 +111,6 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
     if k.bottom_right:
         if k.window_right is None:
             raise ValueError(f"{flavor}: bottom_right anchors the band's diagonal and requires a right bound (window_right)")
-        if k.window_left is not None:
-            raise ValueError(f"{flavor}: bottom_right + window_left (SWA) is not supported")
     if k.thd_varlen and not k.seq_kv_lens_present:
         raise ValueError(f"{flavor}: THD/varlen requires SEQ_KV_LENS_PRESENT (per-sequence padded masking)")
     if k.seq_q_lens_present:
