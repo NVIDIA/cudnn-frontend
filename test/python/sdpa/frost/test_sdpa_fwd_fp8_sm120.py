@@ -8,13 +8,14 @@ the ``sdpa_fwd_prefill_sm120_fp8`` engine, and validates O against an fp32-dequa
 reference. ``Amax_S`` and ``Amax_O`` are both produced in-kernel (bitcast-int32
 atomicMax over the pre-cast fp32 values); both are checked.
 
-SM120 envelope (see engines._sm120_fp8_spec): E4M3 in / FP16 out only, exact
-d128, causal / bottom-right / SWA / KV-padding masks, THD (ragged) with
-token-major Stats; no sink (Amax_S semantics), no head-major ragged Stats.
-Everything outside that envelope is a capability-row decline, checked by the
-*_not_offered tests below.
+SM120 envelope (see engines._sm120_fp8_spec): E4M3 in / FP16 out only, head
+dims any multiple of 32 up to 256 with the QK^T and P@V sides independent
+(what graphs can reach is further gated by the C++ sdpa_fp8 node:
+d_qk <= 128 x d_v <= 128 plus the (192, 128) MLA pair), causal /
+bottom-right / SWA / KV-padding masks, THD (ragged) with token-major Stats;
+no sink (Amax_S semantics), no head-major ragged Stats.
 
-Requires: SM120/SM121 (consumer Blackwell), cutlass-dsl. Skips otherwise.
+Requires: SM120/SM121 (Blackwell GeForce), cutlass-dsl. Skips otherwise.
 """
 
 import math
@@ -25,7 +26,7 @@ import torch
 from test_utils import torch_fork_set_rng
 
 from cudnn.sdpa.fwd.engines import engine_name
-from frost_test_utils import requires_blackwell_geforce, requires_dsl, select_engine as _select_engine
+from frost_test_utils import requires_blackwell_geforce, requires_dsl, select_engine as _select_engine, offers_engine
 
 pytestmark = [requires_blackwell_geforce, requires_dsl]
 
@@ -62,14 +63,14 @@ def _ref(qd, kd, vd, *, scale, is_causal=False, bottom_right=False, swa_window=N
     return torch.matmul(probs, v_e), probs.max().item(), torch.logsumexp(scores, dim=-1)
 
 
-def _run(B, H_q, H_kv, S_q, S_kv, *, scale, sdpa_kwargs, seq_lens_kv=None, tiles=None, s_descale_gain=1.0):
+def _run(B, H_q, H_kv, S_q, S_kv, *, scale, sdpa_kwargs, seq_lens_kv=None, tiles=None, s_descale_gain=1.0, D=128, D_v=None):
     import cudnn
 
     dev = "cuda"
-    D = 128
+    D_v = D if D_v is None else D_v
     Qf = torch.randn(B, H_q, S_q, D, device=dev) * 0.5
     Kf = torch.randn(B, H_kv, S_kv, D, device=dev) * 0.5
-    Vf = torch.randn(B, H_kv, S_kv, D, device=dev) * 0.5
+    Vf = torch.randn(B, H_kv, S_kv, D_v, device=dev) * 0.5
     Q8, dq = _quant(Qf)
     K8, dk = _quant(Kf)
     V8, dv = _quant(Vf)
@@ -78,7 +79,7 @@ def _run(B, H_q, H_kv, S_q, S_kv, *, scale, sdpa_kwargs, seq_lens_kv=None, tiles
         return x8.permute(0, 2, 1, 3).contiguous().transpose(1, 2)
 
     Qb, Kb, Vb = bshd(Q8), bshd(K8), bshd(V8)
-    Ob = torch.empty(B, S_q, H_q, D, device=dev, dtype=torch.float16).transpose(1, 2)
+    Ob = torch.empty(B, S_q, H_q, D_v, device=dev, dtype=torch.float16).transpose(1, 2)
     lse = torch.empty(B, H_q, S_q, 1, device=dev, dtype=torch.float32)
     amax_s = torch.zeros(1, 1, 1, 1, device=dev, dtype=torch.float32)
     amax_o = torch.zeros(1, 1, 1, 1, device=dev, dtype=torch.float32)
@@ -215,6 +216,31 @@ def test_fp8_sm120_padding(causal):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("mask", ["none", "causal"])
+@pytest.mark.parametrize("s", [96, 97, 110], ids=lambda s: f"s{s}")
+@torch_fork_set_rng(seed=0)
+def test_fp8_sm120_single_kv_tile(mask, s):
+    """Single-KV-tile shapes (s_kv <= kv_tile), repeated."""
+    scale = 1.0 / math.sqrt(128)
+    seq_lens_kv = [s] if mask == "none" else None
+    for _ in range(3):
+        res = _run(1, 4, 4, s, s, scale=scale, sdpa_kwargs=_MASKS[mask], seq_lens_kv=seq_lens_kv)
+        _check(*res)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_fp8_sm120_single_kv_tile_padded():
+    """Padded lengths inside a single KV tile (the other collapse-exposed
+    population: min(seq_kv_lens[b], shape) also bounds the trip count, so the
+    same collapsed-pipeline layout is emitted here)."""
+    scale = 1.0 / math.sqrt(128)
+    for _ in range(3):
+        res = _run(2, 4, 4, 97, 97, scale=scale, sdpa_kwargs=dict(use_causal_mask=True), seq_lens_kv=[97, 60])
+        _check(*res)
+
+
+@pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_fp8_sm120_e5m2_not_offered():
     """The v1 kernel hardcodes the e4m3 MMA tag; E5M2 graphs must not route here."""
@@ -255,7 +281,7 @@ def test_fp8_sm120_e5m2_not_offered():
     assert engine_name(arch="sm120", fp8=True) not in names, f"E5M2 graph must not offer the sm120 fp8 engine; plans={names}"
 
 
-def _fp8_graph_offers_sm120(io_dtype, o_dtype, D=128, sink=False):
+def _fp8_graph_offers_sm120(io_dtype, o_dtype, D=128, D_v=None, sink=False):
     """Build one sdpa_fp8 graph and report whether the sm120 fp8 cell claims it.
 
     A capability rejection is the point, so nothing is executed; a graph that
@@ -265,10 +291,12 @@ def _fp8_graph_offers_sm120(io_dtype, o_dtype, D=128, sink=False):
 
     dev = "cuda"
     B, H, S = 1, 4, 256
+    D_v = D if D_v is None else D_v
     torch_in = torch.float8_e5m2 if io_dtype == cudnn.data_type.FP8_E5M2 else torch.float8_e4m3fn
     X = torch.randn(B, S, H, D, device=dev).to(torch_in).transpose(1, 2)
+    Xv = torch.randn(B, S, H, D_v, device=dev).to(torch_in).transpose(1, 2)
     g = cudnn.pygraph(io_data_type=io_dtype, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
-    q, k, v = g.tensor_like(X), g.tensor_like(X), g.tensor_like(X)
+    q, k, v = g.tensor_like(X), g.tensor_like(X), g.tensor_like(Xv)
     scalars = [g.tensor(dim=[1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.FLOAT) for _ in range(6)]
     kw = dict(
         q=q,
@@ -286,7 +314,7 @@ def _fp8_graph_offers_sm120(io_dtype, o_dtype, D=128, sink=False):
     if sink:
         kw["sink_token"] = g.tensor(dim=[1, H, 1, 1], stride=[H, 1, 1, 1], data_type=cudnn.data_type.FLOAT)
     o, stats, amx_s, amx_o = g.sdpa_fp8(**kw)
-    o.set_output(True).set_dim([B, H, S, D]).set_stride([S * H * D, D, H * D, 1]).set_data_type(o_dtype)
+    o.set_output(True).set_dim([B, H, S, D_v]).set_stride([S * H * D_v, D_v, H * D_v, 1]).set_data_type(o_dtype)
     stats.set_output(True).set_dim([B, H, S, 1]).set_stride([H * S, S, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
     for t in (amx_s, amx_o):
         t.set_output(True).set_dim([1, 1, 1, 1]).set_stride([1, 1, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
@@ -298,7 +326,7 @@ def _fp8_graph_offers_sm120(io_dtype, o_dtype, D=128, sink=False):
         # The op itself may refuse the shape before any engine is consulted;
         # for "this cell must not claim it" that is the same answer.
         return False
-    return engine_name(arch="sm120", fp8=True) in [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
+    return offers_engine(g, engine_name(arch="sm120", fp8=True))
 
 
 @pytest.mark.L0
@@ -321,13 +349,195 @@ def test_fp8_sm120_fp8_output_not_offered():
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("D", [64, 256])
+@pytest.mark.parametrize("D", [16, 48, 144, 288])
 @torch_fork_set_rng(seed=0)
-def test_fp8_sm120_non_128_head_dim_not_offered(D):
-    """The 8-bit fragment path has no zero-padding envelope, so d is exact."""
+def test_fp8_sm120_off_granule_head_dim_not_offered(D):
+    """No zero-padding envelope on the 8-bit fragment path: dims are exact
+    multiples of 32 (k32 contraction; 1-byte TMA swizzle span). 16-odd
+    multiples of 16 and out-of-range dims decline."""
     import cudnn
 
     assert not _fp8_graph_offers_sm120(cudnn.data_type.FP8_E4M3, cudnn.data_type.HALF, D=D)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_fp8_sm120_head_dim_domain_offered():
+    """Every graph the C++ front door admits is served: the d_qk <= 128 x
+    d_v <= 128 cross (multiples of 32) plus the (192, 128) MLA pair."""
+    import cudnn
+
+    for D in range(32, 129, 32):
+        for D_v in range(32, 129, 32):
+            assert _fp8_graph_offers_sm120(cudnn.data_type.FP8_E4M3, cudnn.data_type.HALF, D=D, D_v=D_v), f"({D}, {D_v}) not offered"
+    assert _fp8_graph_offers_sm120(cudnn.data_type.FP8_E4M3, cudnn.data_type.HALF, D=192, D_v=128), "(192, 128) MLA not offered"
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("D", [32, 64, 96], ids=lambda d: f"d{d}")
+@torch_fork_set_rng(seed=0)
+def test_fp8_sm120_head_dims(D):
+    """Correctness across the widened head-dim domain (exact, no padding).
+
+    The graph front door (the C++ sdpa_fp8 node) admits d_qk <= 128 x
+    d_v <= 128 plus the (192, 128) MLA pair, so >128 uniform dims cannot
+    reach any engine; the kernel itself serves multiples of 32 up to 256."""
+    scale = 1.0 / math.sqrt(D)
+    res = _run(2, 4, 4, 256, 256, scale=scale, sdpa_kwargs=dict(use_causal_mask=True), D=D)
+    _check(*res)
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("D", [32, 96], ids=lambda d: f"d{d}")
+@torch_fork_set_rng(seed=0)
+def test_fp8_sm120_head_dims_no_mask(D):
+    scale = 1.0 / math.sqrt(D)
+    res = _run(1, 4, 4, 256, 256, scale=scale, sdpa_kwargs={}, D=D)
+    _check(*res)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "D,D_v,mask",
+    [
+        (192, 128, "causal"),
+        (192, 128, "causal_br"),
+        (192, 128, "swa"),
+        (192, 128, "padded"),
+        (64, 128, "none"),
+        (128, 32, "causal"),
+    ],
+)
+@torch_fork_set_rng(seed=0)
+def test_fp8_sm120_mixed_head_dims(D, D_v, mask):
+    """The QK^T and P@V sides are independent in the kernel; the 192/128
+    shape is the MLA population the f16 cell already serves (the front
+    door's only >128 carve-out), so it is crossed with every mask family."""
+    scale = 1.0 / math.sqrt(D)
+    seq_lens_kv = [256, 192] if mask == "padded" else None
+    kw = {} if mask == "padded" else _MASKS[mask]
+    res = _run(2, 4, 4, 256, 256, scale=scale, sdpa_kwargs=kw, seq_lens_kv=seq_lens_kv, D=D, D_v=D_v)
+    _check(*res)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("mask", ["causal_br", "swa", "padded"])
+@pytest.mark.parametrize("D", [32, 96], ids=lambda d: f"d{d}")
+@torch_fork_set_rng(seed=0)
+def test_fp8_sm120_head_dim_mask_cross(D, mask):
+    """Non-d128 head dims crossed with the mask families (the base head-dims
+    test covers plain causal). Masking and the head-dim envelope are
+    independent axes in the kernel; a regression coupling them shows here."""
+    scale = 1.0 / math.sqrt(D)
+    seq_lens_kv = [256, 192] if mask == "padded" else None
+    kw = {} if mask == "padded" else _MASKS[mask]
+    res = _run(2, 4, 4, 256, 256, scale=scale, sdpa_kwargs=kw, seq_lens_kv=seq_lens_kv, D=D)
+    _check(*res)
+
+
+def _run_template_tail(D, D_v, *, mask, S=256):
+    """Compile and launch the fp8 kernel template directly (production loader
+    and adapter ABI) for head dims the graph front door cannot reach.
+
+    The engine row declares the kernel's full domain — multiples of 32 up to
+    256, QK^T/P@V sides independent — but the C++ sdpa_fp8 node admits only
+    d_qk <= 128 x d_v <= 128 plus (192, 128) today, so the >128 tail is
+    protected here at the template level.
+
+    scale_s is 1.0 (P is cast to e4m3 unscaled and the reference does not
+    model that cast), so the error floor is the bare P-quantization step
+    (~0.055 measured on SM120); 0.15 separates it cleanly from real
+    corruption (a dropped 32-column group or swizzle fault lands > 1).
+    """
+    import os
+
+    import cutlass
+    import cuda.bindings.driver as cuda_driver
+
+    from cudnn.frost.template_loader import load_template
+    from cudnn.frost.tile_dsl.constants import DTYPE_E4M3
+    from cudnn.sdpa.fwd import api_dsl
+    from cudnn.sdpa.fwd.config_sm120 import TemplateParams
+
+    B, H = (2, 2) if mask == "padded" else (1, 2)
+    kw = {"dtype_qkv": DTYPE_E4M3}
+    swa_window = None
+    seq_kv_lens = None
+    if mask in ("causal", "swa"):
+        kw["window_right"] = 0
+    if mask == "swa":
+        swa_window = 64  # kernel window_left=W keeps kv in [q-W, q]; same W as _ref's swa_window
+        kw["window_left"] = swa_window
+    if mask == "padded":
+        kw["seq_kv_lens_present"] = True
+        seq_kv_lens = [S, S - 73]  # batch 1 ends inside a KV tile at an odd offset
+    path = os.path.join(os.path.dirname(os.path.abspath(api_dsl.__file__)), "kernels", "prefill_fp8_sm120.py")
+    module = load_template(path, TemplateParams(**kw), tag=f"fp8_tail_d{D}_d{D_v}_{mask}")
+    fn = module.compile(compute_capability=torch.cuda.get_device_capability(), b=B, qh=H, kh=H, sq=S, skv=S, d_qk=D, d_v=D_v, has_lse=False)
+
+    dev = "cuda"
+
+    def mk(*shape):
+        return (torch.randn(*shape, device=dev) * 0.5).clamp(-_E4M3_MAX, _E4M3_MAX).to(torch.float8_e4m3fn)
+
+    q8, k8, v8 = mk(B, S, H, D), mk(B, S, H, D), mk(B, S, H, D_v)  # compact BSHD, the kernel contract
+    o = torch.zeros(B, S, H, D_v, device=dev, dtype=torch.float16)
+    seq_q = torch.full((B,), S, dtype=torch.int32, device=dev)
+    seq_kv = torch.tensor(seq_kv_lens, dtype=torch.int32, device=dev) if seq_kv_lens else seq_q
+    amax_s = torch.zeros(1, dtype=torch.float32, device=dev)
+    amax_o = torch.zeros(1, dtype=torch.float32, device=dev)
+    scale = 1.0 / math.sqrt(D)
+    fn(
+        q8.view(torch.uint8),  # the adapter's ABI: e4m3 as uint8 storage
+        k8.view(torch.uint8),
+        v8.view(torch.uint8),
+        o,
+        None,  # lse (has_lse=False)
+        None,  # sinks (unsupported; ABI slot)
+        seq_q,
+        seq_kv,
+        amax_s.view(torch.int32),  # bitcast-int32 atomicMax storage
+        amax_o.view(torch.int32),
+        cutlass.Float32(scale * math.log2(math.e)),  # softmax_scale_log2 (descale_q = descale_k = 1)
+        cutlass.Float32(1.0),  # o_scale_fused = descale_s * descale_v * scale_o, all 1.0 here
+        cutlass.Float32(1.0),  # scale_s
+        cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream),
+    )
+    torch.cuda.synchronize()
+
+    def bhsd(t):
+        return t.float().permute(0, 2, 1, 3)
+
+    o_ref, _, _ = _ref(bhsd(q8), bhsd(k8), bhsd(v8), scale=scale, is_causal=mask in ("causal", "swa"), swa_window=swa_window, seq_lens_kv=seq_kv_lens)
+    of = bhsd(o)
+    assert not torch.isnan(of).any(), "NaN in O"
+    diff = (of - o_ref).abs().max().item()
+    assert diff <= 0.15, f"max|O-ref|={diff:.4f} > 0.15 (P-quant floor ~0.055)"
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize(
+    "D,D_v,mask",
+    [
+        (160, 160, "causal"),
+        (160, 160, "swa"),
+        (160, 160, "none"),
+        (256, 256, "causal"),
+        (256, 256, "none"),
+        (256, 256, "swa"),
+        (256, 256, "padded"),
+        (256, 128, "causal"),
+        (128, 256, "causal"),
+        (224, 160, "causal"),
+    ],
+)
+@torch_fork_set_rng(seed=0)
+def test_fp8_sm120_head_dim_tail_direct(D, D_v, mask):
+    """Correctness of the front-door-unreachable >128 head-dim tail (see
+    _run_template_tail): uncommon uniform dims (160), the 256 domain max
+    crossed with every mask family, 256 on each side alone (the QK^T and
+    P@V swizzle/fragment paths size independently), and a mixed >128 pair."""
+    _run_template_tail(D, D_v, mask=mask)
 
 
 @pytest.mark.L0

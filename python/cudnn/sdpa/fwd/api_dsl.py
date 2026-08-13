@@ -33,9 +33,23 @@ from cudnn.sdpa.fwd.config_sm120 import (
     SEQ_KV_TILES as _SM120_KV_TILES,
     SEQ_Q_TILES as _SM120_Q_TILES,
     SUPPORTED_HEAD_TILE_MAX as _SM120_HEAD_TILE_MAX,
+    SUPPORTED_HEAD_TILES_FP8 as _SM120_FP8_HEAD_TILES,
     TemplateParams as Sm120TemplateParams,
     smem_bytes as _sm120_smem_bytes,
 )
+
+
+def dtype_name(buffer) -> str:
+    """The buffer's dtype as a bare name, whoever produced it.
+
+    A caller buffer reaches these checks as whatever the graph normalized it
+    into, which is a variant-pack slot rather than a torch tensor. Comparing
+    ``buffer.dtype is torch.float32`` therefore rejects a perfectly good fp32
+    buffer with "must be float32; got float32". Names are the one spelling
+    every producer agrees on -- torch prints ``torch.float32``, numpy and the
+    slot print ``float32``.
+    """
+    return str(buffer.dtype).rsplit(".", 1)[-1]
 
 
 def _require_reciprocal_s_scales(descale_s: float, scale_s: float) -> None:
@@ -48,11 +62,14 @@ def _require_reciprocal_s_scales(descale_s: float, scale_s: float) -> None:
 
     This row cannot apply Scale_S, and would gain nothing if it could:
 
-    - No headroom. The lazy-rescale skip (RESCALE_THRESHOLD=8) refreshes the
-      running max only when a tile exceeds it by 2^8, so P is bounded by 256,
-      not 1. e4m3 tops out at 448, so any scale_s > 448/256 = 1.75 can saturate
-      a lazily-skipped tile. Measured on B2xH8xS256 e4m3: max|O-ref| is flat
-      from scale_s 1 to 64 and degrades at 448 (swa .0239 -> .0807).
+    - No headroom. The lazy-rescale skip refreshes the running max only when
+      a tile exceeds it by RESCALE_THRESHOLD -- 4.0 for the fp8 dtypes
+      (config_sm100.rescale_threshold; 8.0 is the dataclass default the fp8
+      path overrides) -- so P is bounded by 2^4 = 16, not 1. e4m3 tops out at
+      448, so any scale_s > 448/16 = 28 can saturate a lazily-skipped tile.
+      Measured on B2xH8xS256 e4m3: max|O-ref| is flat from scale_s 1 to 64
+      (the analytical bound is conservative) and degrades at 448
+      (swa .0239 -> .0807).
     - Nothing to gain. e4m3 is floating point, so relative precision does not
       move with scale, and subtracting the row max already places P per ROW —
       strictly better than a per-tensor scale. Hence the flat error above.
@@ -449,7 +466,7 @@ class SdpaFwdDsl(APIBase):
         # Both callers re-view the slot as Int32 for the kernel ABI, so a wider
         # element would yield two int32s and the kernel would write only the low
         # word -- the caller then reads a corrupted value.
-        if tensor.dtype is not torch.float32:
+        if dtype_name(tensor) != "float32":
             raise ValueError(f"{name} must be float32; got {tensor.dtype}")
         try:
             return tensor.view(-1)[:1]
@@ -474,7 +491,7 @@ class SdpaFwdDsl(APIBase):
         receive the output and be dropped, leaving the caller's LSE unwritten.
         """
         self._value_error_if(
-            lse_tensor.dtype != torch.float32,
+            dtype_name(lse_tensor) != "float32",
             f"lse_tensor must be float32; got {lse_tensor.dtype}",
         )
         expected = self.batch_size * self.h_q * self.s_q_max
@@ -496,7 +513,7 @@ class SdpaFwdDsl(APIBase):
         on the execute hot path (and break CUDA-graph pointer stability).
         """
         self._value_error_if(
-            sinks.dtype != torch.float32,
+            dtype_name(sinks) != "float32",
             f"sinks must be float32; got {sinks.dtype}",
         )
         self._value_error_if(
@@ -517,7 +534,7 @@ class SdpaFwdDsl(APIBase):
         pointer stability).
         """
         self._value_error_if(
-            seq_lens.dtype != torch.int32,
+            dtype_name(seq_lens) != "int32",
             f"{name} must be int32; got {seq_lens.dtype}",
         )
         self._value_error_if(
@@ -1826,8 +1843,9 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             self._value_error_if(self.has_sink, "SM120 fp8 does not support attention sinks (Amax_S semantics)")
             self._value_error_if(self.seq_q_lens_present and not self.thd, "SM120 fp8 does not support per-batch seq_len_q")
             self._value_error_if(
-                (d_q, d_v) != (128, 128),
-                f"SM120 fp8 requires D_QK=D_V=128 (no zero-padding envelope on the 8-bit fragment path); got ({d_q}, {d_v})",
+                any(d not in _SM120_FP8_HEAD_TILES for d in (d_q, d_v)),
+                f"SM120 fp8 requires D_QK and D_V to be multiples of 32 within 32..256 (k32 contraction and 1-byte "
+                f"TMA swizzle span; no zero-padding envelope on the 8-bit fragment path); got ({d_q}, {d_v})",
             )
 
         self._value_error_if(
@@ -1883,8 +1901,6 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
 
         def _smem_bytes(kv_tile: int) -> int:
             # FP8 stages a byte per KV element but still writes O in half.
-            # (The FP8 row requires exact d128, so its padded dims are the
-            # actual ones; the envelope padding is the f16 cell's.)
             return _sm120_smem_bytes(d_qp, d_vp, self.q_tile, kv_tile, self.dtype.itemsize, 2 if self._fp8 else self.dtype.itemsize)
 
         if self.tile_n is None:

@@ -32,7 +32,7 @@ pytestmark = [pytest.mark.L0, requires_sm100]
 import cudnn
 import cudnn.gemm.frost  # noqa: F401  — installs the cudnn.pygraph recorder hook
 from cudnn.gemm.frost.compiler import _current_arch, _epi_vec_bytes
-from cudnn.gemm.frost.tile_config import CATALOG
+from cudnn.gemm.frost.tile_config import CATALOG, by_name
 
 # INT8 matmul runs only on SM 100 or SM 110 (disjoint range).
 _INT8_SM_RANGES = ((100, 101), (110, 111))
@@ -87,6 +87,7 @@ _CORE_DTYPE_PAIRS: tuple[tuple[str, str], ...] = (
 
 # Curated config subset — each entry covers a distinct template-architectural
 # corner. Full CATALOG sweep is opt-in via CUDNN_GEMM_TEST_FULL=1.
+_BF16 = cudnn.data_type.BFLOAT16
 _QUICK_CONFIGS: tuple[str, ...] = (
     "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma",  # baseline cta1 single-CTA
     "CONFIG_sm100_128x256x128_128x256x32_cluster1x1_1ctamma",  # large N
@@ -112,6 +113,21 @@ _QUICK_CONFIGS: tuple[str, ...] = (
     "CONFIG_sm100_64x24x128_64x24x32_cluster1x1_1ctamma",  # cta_m=64, 16+8 spans
     "CONFIG_sm100_128x144x128_128x144x32_cluster2x1_2ctamma",  # cta2 (N%16), 16-col tail
     "CONFIG_sm100_128x48x128_128x48x32_cluster2x1_2ctamma_static",  # static cta2, 16-col tail
+    # CTA tiles split across num_mma_m MMA instructions along M. Split is just
+    # another geometry axis, so it rides the same dtype x layout x shape matrix;
+    # the invariants it has to hold are pinned by the unit tests at the end.
+    "CONFIG_sm100_256x128x128_128x128x32_cluster1x1_1ctamma",  # num_mma_m=2
+    "CONFIG_sm100_256x256x128_128x256x32_cluster2x1_1ctamma",  # num_mma_m=2, acc_stages drops to 1
+    "CONFIG_sm100_128x128x128_64x128x32_cluster1x1_1ctamma",  # num_mma_m=2 at mma_inst_m=64 (packed drain)
+    "CONFIG_sm100_256x128x128_128x128x32_cluster1x1_1ctamma_static",  # static scheduler
+    "CONFIG_sm100_256x256x128_128x256x32_cluster2x1_2ctamma",  # on the pair (cuBLAS geometry)
+    "CONFIG_sm100_128x128x128_64x128x32_cluster2x1_2ctamma_static",  # at mma_inst_m=64 (2x2 DP drain)
+    "CONFIG_sm100_256x128x128_128x128x32_cluster2x2_1ctamma",  # split + both multicasts
+    "CONFIG_sm100_256x256x64_128x256x32_cluster2x1_1ctamma",  # split + K_BYTES=64
+    # Split at mma_inst_m=64 on the pair drains N/2 per M block, so an N whose
+    # half is not a power of two exercises the tile-clamped epilogue chunk.
+    "CONFIG_sm100_128x48x128_64x48x32_cluster2x1_2ctamma",  # 2x2 DP, 24-col per-M-block drain
+    "CONFIG_sm100_128x16x128_64x16x32_cluster2x1_2ctamma",  # 2x2 DP, 8-col per-M-block drain
 )
 
 _BATCHED_CONFIGS: tuple[str, ...] = (
@@ -254,10 +270,14 @@ def _compatible(
         )
     cta_smem_m, cta_smem_n, _ = cfg.cta_smem_tile_mnk(in_eb, cta_group)
     mn_group_elems = cfg.cta_tile_k_bytes // in_eb
-    if a_major == "m" and (cta_smem_m < mn_group_elems or cta_smem_m % mn_group_elems != 0):
-        return False, (f"A M-major per-CTA SMEM M={cta_smem_m} is not compatible with " f"the {mn_group_elems}-element swizzle group")
-    if b_major == "n" and (cta_smem_n < mn_group_elems or cta_smem_n % mn_group_elems != 0):
-        return False, (f"B N-major per-CTA SMEM N={cta_smem_n} is not compatible with " f"the {mn_group_elems}-element swizzle group")
+    # Each MMA instruction reads its own M sub-block of the SMEM tile, so the
+    # swizzle-group rule applies per MMA (== the whole extent at num_mma_m == 1).
+    mma_smem_m = cta_smem_m // cfg.num_mma_m
+    mma_smem_n = cta_smem_n
+    if a_major == "m" and (mma_smem_m < mn_group_elems or mma_smem_m % mn_group_elems != 0):
+        return False, (f"A M-major per-MMA SMEM M={mma_smem_m} is not compatible with " f"the {mn_group_elems}-element swizzle group")
+    if b_major == "n" and (mma_smem_n < mn_group_elems or mma_smem_n % mn_group_elems != 0):
+        return False, (f"B N-major per-MMA SMEM N={mma_smem_n} is not compatible with " f"the {mn_group_elems}-element swizzle group")
     out_contig_name, out_contig_extent = ("N", N) if out_major == "n" else ("M", M)
     if (out_contig_extent * out_eb) % 32 != 0:
         return False, (
@@ -2237,3 +2257,110 @@ def test_import_kernel_publishes_by_rename(tmp_path, monkeypatch):
         _usable_cache_dir.cache_clear()
     assert mod.MARKER == 4321
     assert any(name.endswith("generated_kernel.py") for name in renamed)
+
+
+# --- num_mma_m geometry invariants ------------------------------------------
+#
+# The CTA tile may span several `tcgen05.mma` along M (`num_mma_m = cta_tile_m /
+# mma_inst_m`). The e2e behaviour rides `_QUICK_CONFIGS` above; what needs its own
+# assertion is the geometry contract those configs rely on.
+
+
+@pytest.mark.parametrize(
+    "name,num_mma_m",
+    [
+        ("CONFIG_sm100_128x128x128_128x128x32_cluster1x1", 1),
+        ("CONFIG_sm100_256x128x128_128x128x32_cluster1x1", 2),
+        ("CONFIG_sm100_256x256x128_128x256x32_cluster1x1", 2),
+        ("CONFIG_sm100_128x128x128_64x128x32_cluster1x1", 2),
+    ],
+)
+def test_num_mma_m_is_derived_from_the_two_tiles(name: str, num_mma_m: int) -> None:
+    cfg = by_name(name)
+    assert cfg.num_mma_m == num_mma_m
+    assert cfg.cta_tile_m == cfg.num_mma_m * cfg.mma_inst_m
+    assert cfg.mma_inst_n == cfg.cta_tile_n  # N is never split
+    # The epilogue drains one MMA-M block per pass, so its subtile height is the
+    # instruction's M, not the CTA tile's.
+    assert cfg.epi_tile_mn[0] == cfg.mma_inst_m
+
+
+@pytest.mark.parametrize(
+    "name,reason",
+    [
+        # The pre-existing M/N bounds read off the MMA INSTRUCTION tile now that
+        # the CTA tile can be several instructions wide.
+        ("CONFIG_sm100_128x128x128_32x128x32_cluster1x1", "mma_inst_m=32"),
+        ("CONFIG_sm100_128x512x128_128x512x32_cluster1x1", "mma_inst_n=512"),
+        ("CONFIG_sm100_128x24x128_128x12x32_cluster1x1", "mma_inst_n=12"),
+        # At most 2 instructions along M this pass...
+        ("CONFIG_sm100_256x128x128_64x128x32_cluster1x1", "num_mma_m=4"),
+        ("CONFIG_sm100_512x128x128_128x128x32_cluster1x1", "num_mma_m=4"),
+        # ... and N is not an instruction-count axis at all.
+        ("CONFIG_sm100_128x256x128_128x128x32_cluster1x1", "N is not split"),
+    ],
+)
+def test_illegal_mma_decomposition_rejected(name: str, reason: str) -> None:
+    with pytest.raises(NotImplementedError) as e:
+        by_name(name)
+    assert reason in str(e.value)
+
+
+def test_split_tiles_are_by_name_only() -> None:
+    """Split geometries are reachable only through `by_name` synthesis, so they
+    stay out of the funnel's candidate set, the CUDNN_GEMM_TEST_FULL sweep and the
+    benchmarks' default config set (which is built from the funnel). They are still
+    measurable by name: `benchmark_matmul.py --configs` resolves an unknown label
+    through `by_name`."""
+    from cudnn.gemm.frost.graph_analyzer import analyze
+    from cudnn.gemm.frost.kernel_registry import candidates
+
+    assert all(c.num_mma_m == 1 for c in CATALOG)
+    g = cudnn.pygraph(io_data_type=_BF16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    A = g.tensor(name="A", dim=[1, 256, 128], stride=[256 * 128, 128, 1])
+    B = g.tensor(name="B", dim=[1, 128, 256], stride=[128 * 256, 1, 128])
+    g.matmul(A=A, B=B, name="mm").set_output(True)
+    assert all(cfg.num_mma_m == 1 for _t, cfg in candidates(analyze(g)))
+
+
+@pytest.mark.parametrize(
+    "name,cta_group,want",
+    [
+        ("CONFIG_sm100_128x128x128_128x128x32_cluster2x1", 2, 128),  # mma_inst_m=128 -> full N
+        ("CONFIG_sm100_64x128x128_64x128x32_cluster2x1", 2, 64),  # mma_inst_m=64, num_mma_m=1
+        ("CONFIG_sm100_128x128x128_64x128x32_cluster2x1", 2, 64),  # mma_inst_m=64, num_mma_m=2
+        ("CONFIG_sm100_128x256x128_64x256x32_cluster2x1", 2, 128),
+        ("CONFIG_sm100_128x128x128_64x128x32_cluster1x1", 1, 128),  # 1-CTA never halves
+    ],
+)
+def test_drain_width_keys_on_the_mma_block_height(name: str, cta_group: int, want: int) -> None:
+    """The 2-CTA 2x2-DP drain splits N across the two 64-lane halves. That is a
+    property of the per-CTA MMA block height (cluster-MMA m=128), NOT of the CTA
+    tile — they agree only at num_mma_m == 1. Keying it on cta_tile_m made the
+    compiler over-report the drain width, which both over-reserved TMEM (losing an
+    acc stage) and let the baked STG chunk exceed the real subtile: the 2-CTA
+    cta_tile_n=48 split entry of _QUICK_CONFIGS faulted with `misaligned address`."""
+    from cudnn.gemm.frost.compiler import _epi_tile_cols
+
+    assert _epi_tile_cols(by_name(name), cta_group) == want
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "CONFIG_sm100_256x128x128_128x128x32_cluster1x1",
+        "CONFIG_sm100_128x128x128_64x128x32_cluster1x1",
+    ],
+)
+def test_tma_store_gate_follows_the_mma_block_height(name: str) -> None:
+    """The TMA-store epilogue stages one MMA-M block of rows, so its gate is on
+    mma_inst_m — an M=64 MMA block drains through the packed lane<16 layout."""
+    from cudnn.gemm.frost.compiler import _use_tma_store_epi
+    from cudnn.gemm.frost.graph_analyzer import analyze
+
+    g = cudnn.pygraph(io_data_type=_BF16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    A = g.tensor(name="A", dim=[1, 256, 128], stride=[256 * 128, 128, 1])
+    B = g.tensor(name="B", dim=[1, 128, 256], stride=[128 * 256, 1, 128])
+    g.matmul(A=A, B=B, name="mm").set_output(True)
+    cfg = by_name(name)
+    assert _use_tma_store_epi(analyze(g), cfg, 16, 1) == (cfg.mma_inst_m == 128)

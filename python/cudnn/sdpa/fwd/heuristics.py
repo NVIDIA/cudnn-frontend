@@ -78,8 +78,8 @@ def _sm120_tiles(caps: Capabilities, facts) -> Tuple[int, int]:
     tile_m = 64 if fine else 128
     # FP8 stages a byte per KV element but still writes O in half, so the two
     # SMEM terms size differently -- see config_sm120.smem_bytes.
-    qkv_item, o_item = (1, 2) if facts.is_fp8 else (2, 2)
-    fits = [n for n in sorted(caps.tile_ns, reverse=True) if smem_bytes(facts.d_qk, facts.d_v, tile_m, n, qkv_item, o_item) <= SMEM_CAPACITY_BYTES]
+    qkv_itemsize, o_itemsize = (1, 2) if facts.is_fp8 else (2, 2)
+    fits = [n for n in sorted(caps.tile_ns, reverse=True) if smem_bytes(facts.d_qk, facts.d_v, tile_m, n, qkv_itemsize, o_itemsize) <= SMEM_CAPACITY_BYTES]
     return tile_m, (fits[0] if fits else min(caps.tile_ns))
 
 
@@ -124,7 +124,10 @@ def _mode_a(facts, offered: Dict[str, int], mode) -> List[PlanConfig]:
         # the rule's regret is small but not zero, so the runners-up are worth
         # offering to a caller who measures. Configs the kernel cannot fit are
         # not runners-up -- they would sit in the list only to decline at build.
-        domain = [(m, n) for m in caps.tile_ms for n in caps.tile_ns if smem_bytes(facts.d_qk, facts.d_v, m, n) <= SMEM_CAPACITY_BYTES]
+        qkv_itemsize, o_itemsize = (1, 2) if facts.is_fp8 else (2, 2)
+        domain = [
+            (m, n) for m in caps.tile_ms for n in caps.tile_ns if smem_bytes(facts.d_qk, facts.d_v, m, n, qkv_itemsize, o_itemsize) <= SMEM_CAPACITY_BYTES
+        ]
         ordered = sorted(domain or [best], key=lambda mn: (mn != best, mn[1] != best[1], -mn[0]))
         for tile_m, tile_n in ordered:
             knobs = _knobs(caps, tile_m, tile_n)

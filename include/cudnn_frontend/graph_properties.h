@@ -131,7 +131,7 @@ class Tensor_attributes {
 
     std::shared_ptr<Tensor_attributes> ragged_offset;
     int64_t ragged_offset_multiplier = 1;
-    int64_t alignment                = 16;  // Default to 16 bytes
+    int64_t alignment                = default_alignment;
     int64_t vector_count             = 1;   // Default to 1 (no vectorization)
     int64_t vector_dimension         = -1;  // Default to -1 (not set)
 
@@ -412,6 +412,9 @@ class Tensor_attributes {
         reordering_type = value;
         return *this;
     }
+
+    // Pointer alignment assumed by the backend when selecting engines, in bytes.
+    static constexpr int64_t default_alignment = 16;
 
     int64_t
     get_alignment() const {

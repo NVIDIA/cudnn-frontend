@@ -3,17 +3,18 @@
 
 """Which GPU a FROST plan is built for — shared by every FROST engine.
 
-The device is then recorded on the compiled plan and :func:`check_buffer_device`
-re-checks it at execute time, so running a plan against another GPU's buffers
-fails loudly instead of launching a kernel whose baked constants describe the
-wrong hardware.
+The device is recorded on the compiled plan and compared against
+:func:`current_device` at execute time, so a plan whose baked constants
+describe one GPU fails loudly instead of launching on another.
+
+That comparison is about the LAUNCH, not the buffers. cuDNN's own variant pack
+carries pointers, uids and a workspace and no device at all, so an operand's
+device is not something the front end has an opinion about.
 """
 
 from __future__ import annotations
 
 import functools
-
-_DLPACK_CUDA_KINDS = (2, 13)  # kDLCUDA, kDLCUDAManaged
 
 
 @functools.lru_cache(maxsize=1)
@@ -129,35 +130,6 @@ def l2_cache_bytes(device: int) -> int:
 def device_name(device: int) -> str:
     drv = _driver()
     return _ck(*drv.cuDeviceGetName(256, _device_handle(device))).split(b"\x00")[0].decode()
-
-
-def buffer_device(buf):
-    """CUDA ordinal a runtime buffer lives on, or ``None`` when it carries no
-    CUDA device (host array, raw pointer, int)."""
-    describe = getattr(buf, "__dlpack_device__", None)
-    if describe is None:
-        return None
-    try:
-        kind, index = describe()
-    except Exception:  # noqa: BLE001 — a buffer that cannot describe itself is not ours to check
-        return None
-    return int(index) if int(kind) in _DLPACK_CUDA_KINDS else None
-
-
-def check_buffer_device(buffers, plan_device: int, *, what: str = "plan") -> None:
-    """Raise if any runtime buffer lives on a GPU other than the one the plan was
-    built for — its baked SMEM / cluster / arch constants describe ``plan_device``
-    only. Non-tensor entries (raw pointers, ints) carry no device and are skipped."""
-    for buf in buffers:
-        index = buffer_device(buf)
-        if index is None or index == plan_device:
-            continue
-        raise ValueError(
-            f"cudnn.frost: this {what} was built for cuda:{plan_device} but a buffer is on "
-            f"cuda:{index}. The kernel's SMEM pipeline depth, cluster count and target SM are "
-            f"baked at build time, so a plan cannot move between GPUs — rebuild it with "
-            f"cuda:{index} current."
-        )
 
 
 class device_context:

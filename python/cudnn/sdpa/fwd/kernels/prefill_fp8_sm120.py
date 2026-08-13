@@ -36,7 +36,7 @@ lowered to ``mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32``:
 
 Constraints:
 * Input dtype: e4m3 only (as Uint8 storage); output dtype Float16
-* Head dimensions must be multiples of 16 between 16 and 256, inclusive
+* Head dimensions must be multiples of 32 between 32 and 256, inclusive
 * Q heads must be divisible by the number of K/V heads
 * Q/K/V/O use compact BSHD storage (THD packs them to ``(1, T, H, D)``)
 * Supported CTA Q/KV tiles are 128 or 64
@@ -217,7 +217,7 @@ class SM120FusedMultiHeadAttentionForward:
         :param thd_batch: THD only: the real sequence count B.
         :param thd_max_sq: THD only: the longest sequence's Q length.
         :param head_tile_qk: Q/K head dimension (the QK^T contraction width).
-            Must be a multiple of 16 between 16 and 256, inclusive.
+            Must be a multiple of 32 between 32 and 256, inclusive.
         :param head_tile_v: V/O head dimension (the P@V output width). Same
             constraint as ``head_tile_qk``.
         :param q_tile: Query sequence tile size.
@@ -494,7 +494,7 @@ class SM120FusedMultiHeadAttentionForward:
         row_max = softmax_params.row_max
         row_sum = softmax_params.row_sum
         softmax_scale_log2 = softmax_params.softmax_scale_log2
-        scale_s = softmax_params.scale_s
+        log2_scale_s = softmax_params.log2_scale_s
         p_regs = cutlass.Array(cutlass.Uint16, self.qk_k_frags * 2)
 
         # Each lane owns four S registers split across two Q rows after Q@K^T.
@@ -555,22 +555,42 @@ class SM120FusedMultiHeadAttentionForward:
             else:
                 row_max_prev = row_max[row_half]
                 new_max = cute.arch.fmax(row_max_prev, cur_max)
-                need_correct = True
-                if cutlass.const_expr(in_mask_steps):
-                    need_correct = new_max > -cutlass.Float32.inf
-                if need_correct:
-                    old_scale = cute.math.exp2(
-                        (row_max_prev - new_max) * softmax_scale_log2,
-                        fastmath=True,
-                    )
+                # Keep this as inline PTX so old_scale lowers to one predicated
+                # EX2 with 1.0 as the default value. The equivalent Python DSL
+                # branch currently materializes extra MOV instructions in this
+                # hot softmax loop and increases issue pressure on SM120.
+                old_scale = cute.arch.inline_ptx(
+                    (
+                        "{\n"
+                        "  .reg .pred p;\n"
+                        "  .reg .f32 delta;\n"
+                        "  sub.rn.f32 delta, $1, $2;\n"  # delta = row_max_prev - new_max
+                        "  mul.rn.f32 delta, delta, $3;\n"  # delta = delta * softmax_scale_log2
+                        "  setp.gt.f32 p, $2, $1;\n"  # p = new_max > row_max_prev
+                        "  mov.f32 $0, 0f3f800000;\n"  # res = 1.0
+                        "  @p ex2.approx.ftz.f32 $0, delta;\n"  # if p: res = exp2(delta)
+                        "}"
+                    ),
+                    write_only_types=[cutlass.Float32],
+                    read_only_args=[row_max_prev, new_max, softmax_scale_log2],
+                )
             row_max[row_half] = new_max
+
+            if cutlass.const_expr(not is_first_kv_tile):
+                for d_frag in cutlass.range_constexpr(self.pv_d_frags):
+                    o_off = d_frag * 4 + row_half * 2
+                    if new_max > row_max_prev:
+                        o_regs[o_off + 0], o_regs[o_off + 1] = fmul2(
+                            (o_regs[o_off + 0], o_regs[o_off + 1]),
+                            (old_scale, old_scale),
+                        )
 
             # Compute P, accumulate the per-lane partial sum, and stage P.
             exp_max = new_max
             if cutlass.const_expr(in_mask_steps):
                 if exp_max == -cutlass.Float32.inf:
                     exp_max = cutlass.Float32(0.0)
-            neg_exp_max_scaled = -(exp_max * softmax_scale_log2)
+            neg_exp_max_scaled = log2_scale_s - exp_max * softmax_scale_log2
             tile_sum = cutlass.Float32(0.0)
             for k_frag in cutlass.range_constexpr(self.qk_k_frags):
                 s_off = k_frag * 4
@@ -585,28 +605,20 @@ class SM120FusedMultiHeadAttentionForward:
                 p1 = cute.math.exp2(in1, fastmath=True)
                 tile_sum = tile_sum + (p0 + p1)
                 # P stays in registers at the C-fragment coordinates; mma_pv
-                # redistributes it to the k32 A layout with shfl. row_sum above
-                # uses the UNSCALED fp32 P -- the denominator, and so amax_s,
-                # must not see Scale_S. Scale_S applies only to the value that
-                # gets cast, and descale_s is folded into o_scale_fused.
-                ps0, ps1 = fmul2((p0, p1), (scale_s, scale_s))
-                p_regs[k_frag * 2 + row_half] = ptx_cvt_e4m3x2(ps1, ps0)
+                # redistributes it to the k32 A layout with shfl. p0/p1 carry
+                # Scale_S via the exp2 bias, so the cast input is the scaled
+                # value the contract asks for; descale_s stays folded into
+                # o_scale_fused.
+                p_regs[k_frag * 2 + row_half] = ptx_cvt_e4m3x2(p1, p0)
 
             # Reduce tile_sum across the four lanes that own one Q row.
             tile_sum = nvvm_threadquad_reduction_sum(tile_sum)
 
-            # Correct row_sum and rescale O when row_max changes.
+            # Correct row_sum (old_scale is exactly 1.0 when the max held).
             if cutlass.const_expr(is_first_kv_tile):
                 row_sum[row_half] = tile_sum
             else:
                 row_sum[row_half] = row_sum[row_half] * old_scale + tile_sum
-
-                for d_frag in cutlass.range_constexpr(self.pv_d_frags):
-                    o_off = d_frag * 4 + row_half * 2
-                    o_regs[o_off + 0], o_regs[o_off + 1] = fmul2(
-                        (o_regs[o_off + 0], o_regs[o_off + 1]),
-                        (old_scale, old_scale),
-                    )
 
         return p_regs
 
@@ -1046,11 +1058,13 @@ class SM120FusedMultiHeadAttentionForward:
                 sV=sV,
                 o_regs=o_regs,
             )
+            log2_scale_s = cute.math.log2(scale_s, fastmath=True)
+            inv_scale_s = cutlass.Float32(1.0) / scale_s
             softmax_params = SimpleNamespace(
                 row_max=row_max,
                 row_sum=row_sum,
                 softmax_scale_log2=softmax_scale_log2,
-                scale_s=scale_s,
+                log2_scale_s=log2_scale_s,
             )
 
             # Load Q into registers.
@@ -1063,6 +1077,8 @@ class SM120FusedMultiHeadAttentionForward:
                 if cutlass.const_expr(self.bottom_right):
                     # The shifted diagonal can straddle one additional KV tile.
                     mask_steps = ceil_div(self.q_tile + self.kv_tile - 1, self.kv_tile)
+            elif cutlass.const_expr(not self.seq_kv_lens_present and not self.thd_varlen and k.shape[1] % self.kv_tile == 0):
+                mask_steps = 0
             left_mask_steps = 1
             if cutlass.const_expr(self.window_size_left is not None):
                 left_mask_steps = ceil_div(self.q_tile + self.kv_tile - 1, self.kv_tile)
@@ -1131,38 +1147,24 @@ class SM120FusedMultiHeadAttentionForward:
             # the four lanes that share a Q row, so every lane finalizes the two
             # rows it owns without further exchange. row_max holds the raw (unscaled)
             # score max; the scale is applied in log2 domain and converted with ln(2).
-            # With has_sink, the per-head sink logit joins the softmax denominator
-            # as a virtual column with no V row: it rescales O, enters the LSE,
-            # and gives a row with no visible key a finite LSE (the sink alone).
             LN2 = cutlass.Float32(0.6931471805599453)
             row_sum_inv = cutlass.Array(cutlass.Float32, 2, alignment=8)
             row_lse = cutlass.Array(cutlass.Float32, 2, alignment=8)
             for row_half in cutlass.range_constexpr(2):
+                row_sum[row_half] = row_sum[row_half] * inv_scale_s
                 row_max_nat = row_max[row_half] * softmax_scale_log2 * LN2
-                if cutlass.const_expr(self.has_sink):
-                    sinks_arr = cutlass.make_array_view(sinks)
-                    sink_logit = cutlass.Float32(sinks_arr[head_idx])
-                    new_max = cute.arch.fmax(row_max_nat, sink_logit)
-                    # alpha re-normalizes the loop's accumulator and sum from
-                    # row_max_nat to the sink-extended max; it is 0 for a row
-                    # with no visible key, so O := 0 falls out.
-                    alpha = cute.math.exp(row_max_nat - new_max, fastmath=True)
-                    new_sum = row_sum[row_half] * alpha + cute.math.exp(sink_logit - new_max, fastmath=True)
-                    row_sum_inv[row_half] = alpha / new_sum
-                    row_lse[row_half] = new_max + cute.math.log(new_sum, fastmath=True)
-                else:
-                    inv = cutlass.Float32(0.0)
-                    if row_sum[row_half] > 0.0:
-                        inv = cute.math.rcp(row_sum[row_half], approx=True, ftz=True)
-                    row_sum_inv[row_half] = inv
-                    lse_val = row_max_nat + cute.math.log(
-                        cute.math.max(row_sum[row_half], cutlass.Float32(1e-30)),
-                        fastmath=True,
-                    )
-                    # Rows with no visible key write -inf / O := 0.
-                    if row_sum[row_half] <= 0.0:
-                        lse_val = -cutlass.Float32.inf
-                    row_lse[row_half] = lse_val
+                inv = cutlass.Float32(0.0)
+                if row_sum[row_half] > 0.0:
+                    inv = cute.math.rcp(row_sum[row_half], approx=True, ftz=True)
+                row_sum_inv[row_half] = inv
+                lse_val = row_max_nat + cute.math.log(
+                    cute.math.max(row_sum[row_half], cutlass.Float32(1e-30)),
+                    fastmath=True,
+                )
+                # Rows with no visible key write -inf / O := 0.
+                if row_sum[row_half] <= 0.0:
+                    lse_val = -cutlass.Float32.inf
+                row_lse[row_half] = lse_val
 
             # Amax_S = max over valid rows of the raw 1/row_sum (cuDNN
             # convention: the softmax-probability amax proxy), captured BEFORE
@@ -1233,14 +1235,17 @@ class SM120FusedMultiHeadAttentionForward:
             for row_half in cutlass.range_constexpr(2):
                 amax_q_idx = q_seq_idx + q_warp_row0 + (lane // 4) + row_half * 8
                 row_valid[row_half] = cutlass.Float32(1.0) if amax_q_idx < seqlen_q else cutlass.Float32(0.0)
-            lane_amax_o = cutlass.Float32(0.0)
+            lane_amax_half = cutlass.Array(cutlass.Float32, 4, alignment=16)
+            for i in cutlass.range_constexpr(4):
+                lane_amax_half[i] = 0.0
             for d_frag_pair in cutlass.range_constexpr(self.pv_d_frags // 2):
                 o_off = (d_frag_pair * 2) * 4
                 o_scaled = fmul2(o_regs[o_off:8], row_sum_inv_vec)
                 for i in cutlass.range_constexpr(8):
                     # row_sum_inv_vec order: halves alternate 0,0,1,1,0,0,1,1.
                     half = (i // 2) % 2
-                    lane_amax_o = cute.arch.fmax(lane_amax_o, cute.math.abs(o_scaled[i]) * row_valid[half])
+                    acc = half * 2 + (i % 2)
+                    lane_amax_half[acc] = cute.arch.fmax(lane_amax_half[acc], cute.math.abs(o_scaled[i]))
                 o_packed = o_scaled.to(self.out_dtype).bitcast(cutlass.Int32)
                 sO_ptr = sO.data_ptr() + (compute_warp_idx * (self.pv_d_frags // 2) + d_frag_pair) * o_block_bytes + lane * 16
                 prims.stmatrix(
@@ -1248,6 +1253,10 @@ class SM120FusedMultiHeadAttentionForward:
                     o_packed,
                     prims.MMALayout.ROW,
                 )
+            lane_amax_o = cute.arch.fmax(
+                cute.arch.fmax(lane_amax_half[0], lane_amax_half[1]) * row_valid[0],
+                cute.arch.fmax(lane_amax_half[2], lane_amax_half[3]) * row_valid[1],
+            )
             amax_o_arr = cutlass.make_array_view(amax_o)
             prims.atomicrmw(
                 prims.AtomicOp.MAX,
@@ -1328,7 +1337,7 @@ class SM120FusedMultiHeadAttentionForward:
         :param amax_s: 1-element Int32 amax buffer (pre-zeroed; dummy ok).
         :param amax_o: 1-element Int32 amax buffer (pre-zeroed; dummy ok).
         :param softmax_scale_log2: ``softmax_scale * descale_q * descale_k * log2(e)``.
-        :param o_scale_fused: ``descale_v * scale_o``.
+        :param o_scale_fused: ``descale_s * descale_v * scale_o``.
         :param stream: CUDA stream used for the launch.
         """
         head_dim_qk = q.shape[3]
@@ -1365,10 +1374,8 @@ class SM120FusedMultiHeadAttentionForward:
                     raise ValueError("LSE must have shape (B, H, Sq)")
                 if cutlass.const_expr(lse.stride != (q.shape[2] * q.shape[1], q.shape[1], 1)):
                     raise ValueError("LSE must be compact row-major")
-        if cutlass.const_expr(self.has_sink != (sinks is not None)):
-            raise ValueError("sinks must be provided exactly when the kernel is configured with has_sink")
-        if cutlass.const_expr(sinks is not None and sinks.shape != (q.shape[2],)):
-            raise ValueError("sinks must have shape (H,)")
+        if cutlass.const_expr(sinks is not None):
+            raise ValueError("sinks must be None (the fp8 cell rejects has_sink)")
         if cutlass.const_expr(self.thd_varlen):
             if cutlass.const_expr(q.shape[0] != 1):
                 raise ValueError("THD Q/K/V/O must be packed batch-1 views")

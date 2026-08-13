@@ -257,6 +257,10 @@ def _run_e2e(op, cfg_name, M, N, K, io_dtype, torch_dtype, out_major="n"):
         "CONFIG_sm100_64x256x128_64x256x32_cluster2x1_2ctamma",  # CTA_2, cluster MMA m=128
         "CONFIG_sm100_128x40x128_128x40x32_cluster1x1_1ctamma",  # N%32!=0: B-transform tail round
         "CONFIG_sm100_128x48x128_128x48x32_cluster2x1_2ctamma",  # CTA_2 N%16, B tile smaller than one round
+        # CTA tile split across two MMA instructions along M: the 12-warp mainloop
+        # transforms the whole tile in SMEM, the MMA warp then walks the M blocks.
+        "CONFIG_sm100_256x128x128_128x128x32_cluster1x1_1ctamma",  # num_mma_m=2
+        "CONFIG_sm100_128x128x128_64x128x32_cluster2x1_2ctamma",  # num_mma_m=2, 2x2 DP drain
     ],
 )
 @requires_sm100
