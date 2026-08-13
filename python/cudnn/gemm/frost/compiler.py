@@ -258,6 +258,11 @@ def _aux_tail_words(aux: TensorRef) -> "list[tuple] | None":
 #: templates: A and its scale factors span m/k, B and its scale factors n/k, the
 #: output m/n -- each over the whole stride triple, since which two of the three
 #: a descriptor reads depends on the operand's major axis.
+#:
+#: This names a triple per operand INDEX, which is right only where the host
+#: sends one. Block-scale sends a single shared A and B triple whatever na and nb
+#: are; the stride-base guard below is what keeps those chains from reaching
+#: here with na or nb above 1.
 _MAP_DEPS = {
     "a": lambda i: ["m", "k", "batch"] + [f"a_stride_{ax}_{i}" for ax in "mkl"],
     "sfa": lambda i: ["m", "k", "batch"] + [f"a_stride_{ax}_{i}" for ax in "mkl"],

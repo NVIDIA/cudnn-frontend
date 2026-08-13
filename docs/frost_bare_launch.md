@@ -17,24 +17,24 @@ passing check, and a fast number that is also wrong cannot reach you.
 
 ## The measurement
 
-Host time per call, minimum over 25 bursts of 64, `M=N=256 K=128` on one SM100 part.
-The kernel is asynchronous, so these are CPU times — which is exactly what a
-launch-bound serving loop pays.
+What this file prints, host time per call, minimum over 25 bursts of 64, `128x256x64` on
+one SM100 part. The kernel is asynchronous, so these are CPU times — which is exactly what
+a launch-bound serving loop pays.
 
 | | us |
 |---|--:|
-| `graph.execute(dict)` today | 19.5 |
-| ... with only the engine's launch closure replaced | 10.7 |
-| `plan.execute(ptrs)`, this demo | **2.3** |
-| `cuLaunchKernelEx` alone | 2.05 |
+| `graph.execute(dict)` today | 20.3 |
+| `plan.execute(ptrs)`, this demo | **2.4** |
+| `cuLaunchKernelEx` alone | 2.11 |
 
-The last two lines are the claim: once the caller hands over an array instead of a dict,
-essentially all remaining host time is the driver.
+That is the claim: once the caller hands over an array instead of a dict, essentially all
+remaining host time is the driver.
 
-The middle line is worth keeping separately. It is the same public entry point with the
-same per-call bookkeeping above the engine, and only the launcher underneath swapped —
-so it separates what the tables buy (**8.8 us**) from what the entry point's dict-to-pack
-conversion costs (**8.4 us**). They are independent; either can be done first.
+Measured separately, and **not reproducible from this file**: keeping `graph.execute` and
+its whole per-call bookkeeping but swapping only the engine's launch closure lands at
+**10.7 us**. That splits the 20 into two independent halves — what the tables buy (~8.8)
+and what the entry point's dict-to-pack conversion costs (~8.4). Either can be done first.
+The demo does not include that probe because it has to monkey-patch the engine.
 
 ## The contract
 
@@ -77,8 +77,10 @@ SLOT_TABLE = (
 )
 ```
 
-Enough to build the parameter block from scratch — the demo does, and diffs it against
-what a real launch passed, byte for byte.
+Enough to build the parameter block from scratch, which is what the demo does. It then
+checks that two ways: each slot's width against `cuFuncGetParamInfo` on the loaded cubin,
+and the kernel's output against `graph.execute()`. Neither compares the block's bytes to
+the ones a real launch passed — that diff exists, but as a separate probe, not here.
 
 A parameter codegen cannot classify is emitted as `kind == 'unknown'` with a null source,
 and a consumer must refuse the kernel. **A refusal is the correct outcome; a guess is
@@ -176,7 +178,7 @@ one more store into the launch configuration.
 
 Linear attention needs much less of this than gemm does. Its per-sequence boundaries live
 in a device array, so a ragged shape change never touches the parameter block; each
-operand carries its address plus one extent, and the TMA descriptors are built by device
-kernels into a workspace rather than encoded on the host. The per-call cost there scales
-with the number of launches, not with shape complexity. (Measured separately, on the GDN
-forward path; not reproducible from this file.)
+operand carries its address plus one extent; and while its base descriptors are still
+host-encoded, the per-(batch × head) descriptor arrays are built by device kernels into a
+workspace. The per-call cost there scales with the number of launches, not with shape
+complexity. (Measured separately on the GDN forward path; nothing in this file checks it.)
