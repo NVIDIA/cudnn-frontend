@@ -1925,6 +1925,10 @@ def _host(
         # THD: build the per-batch O descriptor array, then launch the exact
         # flat batch-outermost grid (n_thd_units host-computed); grid_x = units*CGA_M.
         # Works at cga1 (CGA_M=1) and cga2.
+        # Per-token element stride of packed O (QH * d_v) — NOT CFG.TILE_O,
+        # which is only coincidentally right at QH == 1 and otherwise lands
+        # every batch >= 1's descriptor base inside earlier batches' rows
+        # (the f16 kernel carries the same fix).
         _build_o_descs_kernel(
             o_tensor,
             tma_o_desc,
@@ -1932,7 +1936,7 @@ def _host(
             seq_kv_lens_tensor,
             cutlass.Int32(QH),
             cutlass.Int32(B),
-            cutlass.Int32(CFG.TILE_O),
+            cutlass.Int32(o_tensor.stride[1]),
         ).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
         grid_shape = (n_thd_units * cutlass.Int32(CFG.CGA_M), cutlass.Int32(1), cutlass.Int32(1))
     else:
