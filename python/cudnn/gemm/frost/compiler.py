@@ -324,7 +324,7 @@ def _patch_groups_src(entries: list, field: dict) -> str:
     )
 
 
-def _slot_table_src(src: str, chain: FusionChain, na: int, nb: int) -> str:
+def _slot_table_src(src: str, chain: FusionChain, na: int, nb: int, stride_base: int) -> str:
     """The kernel's parameter table, as data, read off the signature just rendered.
 
     A caller that marshals kernel parameters itself needs to know, per slot, how
@@ -337,7 +337,21 @@ def _slot_table_src(src: str, chain: FusionChain, na: int, nb: int) -> str:
     recognise is emitted as ``unknown`` with a null source -- the point of the
     table is that a consumer can refuse a kernel it cannot fill, and a guess
     would be worse than the refusal.
+
+    ``stride_base`` is where the RENDERED host starts reading stride triples, so
+    the caller passes what it actually gave that host rather than a formula
+    rederived here. MoE gets no table at all: its ``problem_size`` carries
+    num_experts and num_groups where a dense one carries batch, and its operands
+    are not classified, so there is nothing to describe truthfully.
     """
+    if chain.has_moe:
+        return ""
+    # The operand stride triples have to end exactly where the host starts
+    # reading output strides. They do not for a multi-GEMM block-scale chain,
+    # whose renderer hands the host a literal 10 while the operands occupy more
+    # than that -- so describe nothing rather than describe it wrongly.
+    if 4 + 3 * na + 3 * nb != stride_base:
+        return ""
     sig = re.search(r"@cute\.kernel\s*\ndef\s+\w+\(\n(.*?)\n\)\s*->", src, re.S)
     if sig is None:
         return ""
@@ -349,10 +363,8 @@ def _slot_table_src(src: str, chain: FusionChain, na: int, nb: int) -> str:
         name, _, ann = line.partition(":")
         params.append((name.strip(), ann.strip()))
 
-    # Where the host unpacks each scalar: `problem_size` is
-    # (m, n, k, batch) + 3 per A operand + 3 per B operand + 3 per output,
-    # reduction and quant-scale, in that order.
-    stride_base = 4 + 3 * na + 3 * nb
+    # `problem_size` is (m, n, k, batch), then 3 per A operand and 3 per B
+    # operand, then 3 per output, reduction and quant-scale in that order.
     at = {"m": 0, "n": 1, "k": 2}
     for i in range(len(chain.output_specs)):
         for j, axis in enumerate("mnl"):
@@ -1609,7 +1621,9 @@ def _render_template(
     tag = re.sub(r"[^A-Za-z0-9_]", "_", f"{tmpl.file.removesuffix('.py')}_{config.geometry_name}")
     src = re.sub(r"\b_kernel\(", f"cudnn_frost_{tag}(", src)
 
-    return src + _slot_table_src(src, chain, na, nb)
+    # The dense and mainloop templates set `_stride_idx = 4` and advance three
+    # per A and per B operand before the injected stride unpack.
+    return src + _slot_table_src(src, chain, na, nb, 4 + 3 * na + 3 * nb)
 
 
 def _render_block_scale_template(
@@ -1791,7 +1805,9 @@ def _render_block_scale_template(
 
     tag = re.sub(r"[^A-Za-z0-9_]", "_", f"{tmpl.file.removesuffix('.py')}_{config.geometry_name}")
     src = re.sub(r"\b_kernel\(", f"cudnn_frost_{tag}(", src)
-    return src + _slot_table_src(src, chain, na, nb)
+    # 10, because that is the literal this renderer hands the host above -- the
+    # table describes the kernel as generated, not as the layout implies.
+    return src + _slot_table_src(src, chain, na, nb, 10)
 
 
 # ---------------------------------------------------------------------------
