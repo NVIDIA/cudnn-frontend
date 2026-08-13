@@ -176,22 +176,79 @@ def encode_tma(dtype_name, addr, dims, strides_16b, box, swizzle_name):
     return ctypes.string_at(aligned, 128)
 
 
-def build_map(role, problem, addr, mod):
-    """One A or B descriptor, mirroring the generated host for the K-major case."""
-    m, n, k = problem[0], problem[1], problem[2]
-    width = mod.ab_dtype.width
-    swizzle = getattr(mod.ab_tma_swizzle, "name", None) or str(mod.ab_tma_swizzle).rsplit(".", 1)[-1]
-    if role == "a":
-        stride_m, _stride_k, stride_l = problem[4:7]
-        dims, strides = [k, m, 1], [stride_m * width // 128, stride_l * width // 128]
-        box = [mod.cgrp_tile_mnk[2], mod.cta_tile_mnk[0], 1]
-    elif role == "b":
-        stride_n, _stride_k, stride_l = problem[7:10]
-        dims, strides = [k, n, 1], [stride_n * width // 128, stride_l * width // 128]
-        box = [mod.cgrp_tile_mnk[2], mod.cta_tile_mnk[1], 1]
+def _swizzle_name(value):
+    return getattr(value, "name", None) or str(value).rsplit(".", 1)[-1]
+
+
+def build_map(role, index, problem, addr, mod):
+    """One descriptor, mirroring the generated host's `create_tensor_map_tiled`.
+
+    The major-axis branches matter: which two of an operand's three strides a
+    descriptor reads depends on them, so taking the wrong branch would encode a
+    valid-looking descriptor that reads the wrong memory.
+    """
+    at = mod.PROBLEM_FIELDS.index
+    m, n, k, batch = problem[0], problem[1], problem[2], problem[3]
+
+    def stride(prefix, axis):
+        return problem[at(f"{prefix}_stride_{axis}_{index}")]
+
+    if role in ("a", "b"):
+        width = mod.ab_dtype.width
+        dtype, swizzle = mod.ab_tma_dtype.__name__, _swizzle_name(mod.ab_tma_swizzle)
+        if role == "a":
+            operand_batch = 1 if mod.matmul_a_batch == 1 else batch
+            if mod.a_is_m_major:
+                dims = [m, k, operand_batch]
+                strides = [stride("a", "k") * width // 128, stride("a", "l") * width // 128]
+                box = [mod.a_tma_group_elems, mod.cgrp_tile_mnk[2], 1]
+            else:
+                dims = [k, m, operand_batch]
+                strides = [stride("a", "m") * width // 128, stride("a", "l") * width // 128]
+                box = [mod.cgrp_tile_mnk[2], mod.cta_tile_mnk[0], 1]
+        else:
+            operand_batch = 1 if mod.matmul_b_batch == 1 else batch
+            if mod.b_is_n_major:
+                dims = [n, k, operand_batch]
+                strides = [stride("b", "k") * width // 128, stride("b", "l") * width // 128]
+                box = [mod.b_tma_group_elems, mod.cgrp_tile_mnk[2], 1]
+            else:
+                dims = [k, n, operand_batch]
+                strides = [stride("b", "n") * width // 128, stride("b", "l") * width // 128]
+                box = [mod.cgrp_tile_mnk[2], mod.cta_tile_mnk[1], 1]
+    elif role == "c":
+        width = mod.cd_dtype.width
+        dtype = mod.cd_tma_dtype.__name__
+        if mod.cd_out_is_m_major:
+            dims = [m, n, batch]
+            strides = [stride("out", "n") * width // 128, stride("out", "l") * width // 128]
+            box = [mod.cd_mmajor_atom_m, mod.epi_tile_mn[1], 1]
+            swizzle = "s128b" if mod.use_tma_store_epi else "none"
+        else:
+            dims = [n, m, batch]
+            strides = [stride("out", "m") * width // 128, stride("out", "l") * width // 128]
+            box = [mod.epi_tile_mn[1], mod.epi_tile_mn[0], 1]
+            swizzle = "s64b" if mod.use_tma_store_epi else "none"
     else:
-        raise SystemExit(f"this demo builds A and B descriptors, not {role!r} -- see docs/frost_bare_launch.md")
-    return encode_tma(mod.ab_tma_dtype.__name__, addr, dims, strides, box, swizzle)
+        raise SystemExit(f"this demo does not build {role!r} descriptors (scale factors are block-scale only)")
+    return encode_tma(dtype, addr, dims, strides, box, swizzle)
+
+
+#: Which caller buffer each descriptor / pointer slot refers to. A and B are the
+#: matmul's operands; `c` and `tap` are the same output reached two ways -- a TMA
+#: store describes it with a descriptor, an STG epilogue takes its address.
+_ROLE_UID = {"a": 1, "b": 2, "c": 3, "tap": 3}
+
+
+def operand_addresses(table, data):
+    """Every address the parameter block needs, keyed the way SLOT_TABLE names it."""
+    addrs = {}
+    for _name, kind, _size, source in table:
+        if kind in ("tma", "ptr"):
+            if source[0] not in _ROLE_UID:
+                raise SystemExit(f"slot source {source} is outside this demo's narrow case")
+            addrs[source] = data[_ROLE_UID[source[0]]].data_ptr()
+    return addrs
 
 
 def build_param_block(table, problem, addrs, mod):
@@ -206,7 +263,7 @@ def build_param_block(table, problem, addrs, mod):
         elif kind == "ptr":
             blobs.append(ctypes.create_string_buffer(int(addrs[source]).to_bytes(8, "little"), 8))
         elif kind == "tma":
-            blobs.append(ctypes.create_string_buffer(build_map(source[0], problem, addrs[source], mod), 128))
+            blobs.append(ctypes.create_string_buffer(build_map(source[0], source[1], problem, addrs[source], mod), 128))
         else:
             raise SystemExit(f"slot kind {kind!r} is not part of this narrow demo")
     return blobs
@@ -329,8 +386,7 @@ def prepare(graph, m, n, k, data, stream):
 
     problem = problem_size(m, n, k, data)
     sorted_uids = sorted(data)
-    role_uid = {("a", 0): 1, ("b", 0): 2, ("tap", 0): 3}
-    addrs = {role: data[uid].data_ptr() for role, uid in role_uid.items()}
+    addrs = operand_addresses(mod.SLOT_TABLE, data)
     blobs = build_param_block(mod.SLOT_TABLE, problem, addrs, mod)
 
     widths = kernel_param_widths(func)
@@ -354,7 +410,7 @@ def prepare(graph, m, n, k, data, stream):
     binding = []
     for slot_index, (_name, kind, _size, source) in enumerate(mod.SLOT_TABLE):
         if kind in ("tma", "ptr"):
-            binding.append((ctypes.c_uint64.from_buffer(blobs[slot_index]), sorted_uids.index(role_uid[source])))
+            binding.append((ctypes.c_uint64.from_buffer(blobs[slot_index]), sorted_uids.index(_ROLE_UID[source[0]])))
     plan.slots = tuple(binding)
     plan._keep = (argv, attrs, cfg, cubin)
     return plan, mod, path, name, declared, widths
@@ -449,8 +505,7 @@ def vary_m(graph, plan, mod, new_m, n, k, workspace):
     del workspace
 
     problem = problem_size(new_m, n, k, data)
-    role_uid = {("a", 0): 1, ("b", 0): 2, ("tap", 0): 3}
-    addrs = {role: data[uid].data_ptr() for role, uid in role_uid.items()}
+    addrs = operand_addresses(plan.table, data)
 
     # Only what actually moved. The table prunes the rest: N and K are the same,
     # so B's descriptor is never touched.
@@ -468,7 +523,7 @@ def vary_m(graph, plan, mod, new_m, n, k, workspace):
             grid["y"] = ((value + mod.cgrp_tile_mnk[1] - 1) // mod.cgrp_tile_mnk[1]) * mod.cluster_shape_mnk[1]
     for slot in sorted(remap):
         source = plan.table[slot][3]
-        ctypes.memmove(ctypes.addressof(plan.blobs[slot]), build_map(source[0], problem, addrs[source], mod), 128)
+        ctypes.memmove(ctypes.addressof(plan.blobs[slot]), build_map(source[0], source[1], problem, addrs[source], mod), 128)
     plan.cfg.gridDimX, plan.cfg.gridDimY, plan.cfg.gridDimZ = grid["x"], grid["y"], grid["z"]
     plan.problem = problem
 
