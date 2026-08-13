@@ -220,17 +220,7 @@ def test_fp8_sm120_padding(causal):
 @pytest.mark.parametrize("s", [96, 97, 110], ids=lambda s: f"s{s}")
 @torch_fork_set_rng(seed=0)
 def test_fp8_sm120_single_kv_tile(mask, s):
-    """Single-KV-tile shapes (s_kv <= kv_tile), repeated.
-
-    Toolchain regression guard: with a compile-time-bounded seqlen_k the
-    cutlass-dsl backend proves the KV loop trips at most once and emits a
-    collapsed single-trip TMA pipeline. On the 4.7.0a0 prerelease line that
-    collapsed layout mis-executes with this kernel's fp8 content (NaN on
-    ~100% of launches at these shapes); public 4.7.0 emits the same layout
-    but runs it correctly. These shapes keep the suite red on any toolchain
-    (or backend regression) where the defect is live; the failure was
-    nondeterministic run-to-run, hence the repeats.
-    """
+    """Single-KV-tile shapes (s_kv <= kv_tile), repeated."""
     scale = 1.0 / math.sqrt(128)
     seq_lens_kv = [s] if mask == "none" else None
     for _ in range(3):
