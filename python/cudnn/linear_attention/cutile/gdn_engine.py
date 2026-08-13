@@ -125,7 +125,7 @@ class GdnCuTileEngine(BaseEngine):
             if int(err) != 0:
                 raise NotImplementedError(f"GdnCuTileEngine: cudaRuntimeGetVersion failed ({err})")
         except ImportError as e:
-            raise NotImplementedError(f"GdnCuTileEngine requires cuda.bindings: {e}")
+            raise NotImplementedError(f"GdnCuTileEngine: 'from cuda.bindings import runtime' failed ({e})")
         if _cudart_version < 13030:
             raise NotImplementedError(f"GdnCuTileEngine requires CUDA 13.3+ (found {_cudart_version})")
         try:

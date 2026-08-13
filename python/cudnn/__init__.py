@@ -306,23 +306,17 @@ def __getattr__(name: str) -> Any:
         globals()["Graph"] = _wrapper.Graph
         return globals()[name]
 
-    if name == "ops":
-        # Use importlib rather than "from . import ops" to avoid infinite
+    if name in ("ops", "experimental"):
+        # Use importlib rather than "from . import <name>" to avoid infinite
         # recursion. The cycle:
-        #   1. cudnn.ops accessed → __getattr__("ops") fires
-        #   2. "from . import ops" → _handle_fromlist(cudnn, ["ops"], ...)
-        #   3. _handle_fromlist calls hasattr(cudnn, "ops")
-        #   4. "ops" not in __dict__ yet → __getattr__("ops") again → goto 1
+        #   1. cudnn.<name> accessed → __getattr__("<name>") fires
+        #   2. "from . import <name>" → _handle_fromlist(cudnn, ["<name>"], ...)
+        #   3. _handle_fromlist calls hasattr(cudnn, "<name>")
+        #   4. not in __dict__ yet → __getattr__("<name>") again → goto 1
         # importlib.import_module bypasses _handle_fromlist entirely.
-        _ops = importlib.import_module(".ops", __name__)
-        globals()["ops"] = _ops
-        return _ops
-
-    if name == "experimental":
-        from . import experimental as _experimental
-
-        globals()["experimental"] = _experimental
-        return _experimental
+        module = importlib.import_module(f".{name}", __name__)
+        globals()[name] = module
+        return module
 
     if name == "jax":
         # `import cudnn; cudnn.jax.call` works like `import cudnn.jax`.

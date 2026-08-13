@@ -101,3 +101,22 @@ def test_support_check_pulls_no_framework(module):
     process that merely asks whether an engine applies.
     """
     _assert_absent(_imported_by(f"import cudnn\nimport {module}"), module)
+
+
+@pytest.mark.parametrize("name", ["ops", "experimental", "wrapper", "Graph"])
+def test_lazy_top_level_attribute_resolves(name):
+    """Every name cudnn.__getattr__ special-cases must actually resolve.
+
+    Regression: `experimental` was fetched with `from . import experimental`,
+    the one form the comment six lines above it documents as recursive —
+    _handle_fromlist calls hasattr(cudnn, "experimental"), which re-enters
+    __getattr__ because the name is not in __dict__ yet. `cudnn.experimental`
+    raised RecursionError, so the documented experimental namespace was
+    unreachable by attribute access.
+    """
+    out = subprocess.run(
+        [sys.executable, "-c", f"import cudnn; x = cudnn.{name}; print(type(x).__name__)"],
+        capture_output=True,
+        text=True,
+    )
+    assert out.returncode == 0, f"cudnn.{name} failed:\n{out.stderr[-1500:]}"
