@@ -1293,11 +1293,13 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         LSE = lse
         if sinks is not None:
             sinks_t = self._checked_sinks_1d(sinks)
-        elif carver is not None:
-            sinks_t = carver.take(qh, torch.float32)
-            sinks_t.zero_()
         else:
-            sinks_t = torch.zeros(qh, dtype=torch.float32, device=dev)
+            # ABI-only dummy: the sinks slot is always part of the kernel
+            # signature, but CFG.HAS_SINK is a compile-time fold — with the
+            # graph declaring no sink the kernel NEVER reads it, so no
+            # zero-fill (a wasted kernel launch on the execute hot path,
+            # Rule 1).
+            sinks_t = carver.take(qh, torch.float32) if carver is not None else torch.empty(qh, dtype=torch.float32, device=dev)
 
         fn = self._k_mod.compile(
             b=b,
