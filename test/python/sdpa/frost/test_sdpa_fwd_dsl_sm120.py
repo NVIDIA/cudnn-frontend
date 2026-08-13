@@ -379,6 +379,7 @@ def _run_thd_case(
     with_sink: bool = False,
     check_stats: bool = False,
     stats_layout: str = "token_major",
+    cu_lens: bool = False,
 ) -> None:
     """Run a THD (ragged) graph on the SM120 engine vs per-sequence references.
 
@@ -411,6 +412,16 @@ def _run_thd_case(
     o_storage.fill_(_THD_SENTINEL)
     sq_t = torch.tensor(seq_q_lens, dtype=torch.int32, device="cuda").view(batch, 1, 1, 1)
     skv_t = torch.tensor(seq_kv_lens, dtype=torch.int32, device="cuda").view(batch, 1, 1, 1)
+
+    # cu_lens: bind the (B+1,) prefix-sum form (cu_seq_len_q/kv, cuDNN 9.24+)
+    # instead of per-batch lengths.
+    def _prefix(lens):
+        cu = [0]
+        for n in lens:
+            cu.append(cu[-1] + n)
+        return torch.tensor(cu, dtype=torch.int32, device="cuda").view(batch + 1, 1, 1, 1)
+
+    cuq_t, cukv_t = (_prefix(seq_q_lens), _prefix(seq_kv_lens)) if cu_lens else (None, None)
     sinks = torch.randn(1, h_q, 1, 1, dtype=torch.float32, device="cuda") if with_sink else None
 
     io_dtype = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
@@ -425,8 +436,8 @@ def _run_thd_case(
     tq.set_ragged_offset(rq)
     tk.set_ragged_offset(rk)
     tv.set_ragged_offset(rv)
-    sq = graph.tensor_like(sq_t, name="seq_q")
-    skv = graph.tensor_like(skv_t, name="seq_kv")
+    sq = graph.tensor_like(cuq_t, name="cu_seq_q") if cu_lens else graph.tensor_like(sq_t, name="seq_q")
+    skv = graph.tensor_like(cukv_t, name="cu_seq_kv") if cu_lens else graph.tensor_like(skv_t, name="seq_kv")
     sdpa_kwargs = dict(
         name="sdpa",
         q=tq,
@@ -435,9 +446,11 @@ def _run_thd_case(
         generate_stats=check_stats,
         attn_scale=scale,
         use_padding_mask=True,
-        seq_len_q=sq,
-        seq_len_kv=skv,
     )
+    if cu_lens:
+        sdpa_kwargs.update(cu_seq_len_q=sq, cu_seq_len_kv=skv)
+    else:
+        sdpa_kwargs.update(seq_len_q=sq, seq_len_kv=skv)
     _apply_mask_kwargs(
         sdpa_kwargs,
         cudnn,
@@ -446,7 +459,17 @@ def _run_thd_case(
         window_size_left=window_size_left,
         window_size_right=window_size_right,
     )
-    variant_pack = {tq: q_view, tk: k_view, tv: v_view, rq: q_ro, rk: k_ro, rv: v_ro, ro: o_ro, sq: sq_t, skv: skv_t}
+    variant_pack = {
+        tq: q_view,
+        tk: k_view,
+        tv: v_view,
+        rq: q_ro,
+        rk: k_ro,
+        rv: v_ro,
+        ro: o_ro,
+        sq: (cuq_t if cu_lens else sq_t),
+        skv: (cukv_t if cu_lens else skv_t),
+    }
     if sinks is not None:
         st = graph.tensor_like(sinks, name="sink")
         sdpa_kwargs["sink_token"] = st
@@ -958,6 +981,30 @@ def test_dsl_sm120_thd_all_q_zero_stats(stats_layout: str):
 
     _run_thd_case(seq_q_lens=[0, 0], seq_kv_lens=[50, 30], check_stats=True, stats_layout=stats_layout)
     _run_thd_case(seq_q_lens=[0, 0], seq_kv_lens=[0, 0], check_stats=True, stats_layout=stats_layout)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("stats_layout", ["token_major", "head_major"])
+@torch_fork_set_rng(seed=35)
+def test_dsl_sm120_thd_cu_seq_len_stats(stats_layout: str):
+    """THD with the cu_seq_len_q/kv length form ((B+1,) prefix sums, cuDNN
+    9.24+ — the form TE/PyT/vLLM natively hold): the lowering derives the
+    per-batch lengths host-side from the same inherent tolist round-trip, so
+    results are identical to the seq_len form, ragged Stats included."""
+
+    _run_thd_case(seq_q_lens=[200, 150], seq_kv_lens=[200, 150], is_causal=True, check_stats=True, stats_layout=stats_layout, cu_lens=True)
+
+
+@pytest.mark.L1
+@torch_fork_set_rng(seed=36)
+def test_dsl_sm120_thd_cu_seq_len_zero_lens():
+    """cu_seq_len form with degenerate lengths: a zero-length sequence
+    (repeated prefix value), an all-zero KV side (kernel dead-row path), and
+    the all-zero Q no-op keep the same semantics as the seq_len form."""
+
+    _run_thd_case(seq_q_lens=[128, 0, 64], seq_kv_lens=[100, 0, 0], is_causal=True, check_stats=True, cu_lens=True)
+    _run_thd_case(seq_q_lens=[64, 32], seq_kv_lens=[0, 0], check_stats=True, cu_lens=True)
+    _run_thd_case(seq_q_lens=[0, 0], seq_kv_lens=[50, 30], check_stats=True, cu_lens=True)
 
 
 @pytest.mark.L0
