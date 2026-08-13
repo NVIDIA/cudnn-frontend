@@ -1759,6 +1759,9 @@ class SparseAttentionForwardSm100Head64:
             sPExchangeLinear[tidx] = half_max
             self.softmax_sync_barrier.arrive_and_wait()
             peer_half_max = Float32(sPExchangeLinear[tidx ^ Int32(64)])
+            # Drain every peer read before the next tile overwrites the aliased
+            # score-exchange surface.
+            self.softmax_sync_barrier.arrive_and_wait()
             tile_max = peer_half_max if peer_half_max > half_max else half_max
             new_real_max = old_real_max if old_real_max > tile_max else tile_max
             should_rescale = cute.arch.vote_any_sync(tile_max - old_mi > Float32(self.RESCALE_THRESHOLD_LOG2))

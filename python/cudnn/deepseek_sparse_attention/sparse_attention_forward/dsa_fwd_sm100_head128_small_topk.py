@@ -1065,6 +1065,9 @@ class SparseAttentionForwardSm100Head128SmallTopKPrefill:
                 # Reduce the two 32-token li partials after the last tile,
                 # exactly once per query.  Paired warps have identical mi and
                 # real_max, so only li (and optional indexer li) needs adding.
+                # Drain the final score-exchange reads before reusing their
+                # aliased surface as reduction scratch.
+                self.softmax_wg_barrier.arrive_and_wait()
                 sum_offset = Int32(self.WARPGROUP_SIZE)
                 indexer_sum_offset = Int32(2 * self.WARPGROUP_SIZE)
                 sPExchangeLinear[sum_offset + (thread_in_wg ^ Int32(64))] = softmax_li
