@@ -1882,12 +1882,21 @@ class pygraph:
         # caller's mistake. A python-only graph's layout is every wired port,
         # including optional ones, where a hole means "not requested".
         strict = self._lowered_graph is not None
+        from_graph = []
         for i in unread:
             data = uid_to_data.get(order[i])
             if data is None:
                 continue  # named below if this graph requires it
+            if type(data) is int:
+                # A bare address has no geometry of its own, so _describe lends
+                # it the graph's -- including the graph's AXIS ORDER, which for
+                # a matmul's B is [batch, K, N] where a caller allocates
+                # (batch, N, K). Nothing in the resulting description says which
+                # of the two it is (at N == K the two are bit-identical), so the
+                # slot that borrowed one is named here.
+                from_graph.append(i)
             ptr, tensor = self._describe(data, order[i])
-            native.set_slot(i, ptr, tuple(tensor.dim), tuple(tensor.stride), *_dlpack_code_bits(tensor.data_type))
+            native.set_operand(i, ptr, tuple(tensor.dim), tuple(tensor.stride), *_dlpack_code_bits(tensor.data_type))
         if strict:
             hole = native.first_unfilled()
             if hole >= 0:
@@ -1908,7 +1917,7 @@ class pygraph:
                 i = slot_of.get(uid)
                 if i is None:
                     raise ValueError(f"override_uids names tensor uid {uid}, which is not an operand of this graph")
-                native.override_slot(i, *_in_axis_order_of(tuple(override_shapes[j]), tuple(override_strides[j]), native.stride(i)))
+                native.override_operand(i, *_in_axis_order_of(tuple(override_shapes[j]), tuple(override_strides[j]), native.stride(i)))
         # The workspace has no uid, so it is not an operand — but an engine has
         # to bounds-check its carves, and reading its size here is the same read
         # every other buffer gets rather than a second probe further down.
@@ -1924,7 +1933,7 @@ class pygraph:
                 workspace_bytes = _byte_size(workspace_tensor)
             else:
                 workspace_ptr, workspace_bytes = extent
-        return VariantPack(tuple(order), native, workspace_ptr, workspace_bytes)
+        return VariantPack(tuple(order), native, workspace_ptr, workspace_bytes, tuple(from_graph))
 
     def _describe(self, data: Any, uid: int):
         """``(pointer, Tensor)`` for one caller buffer.

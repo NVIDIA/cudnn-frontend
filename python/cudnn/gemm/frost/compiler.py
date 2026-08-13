@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import functools
 import hashlib
+from collections import Counter
 import importlib.util
 import logging
 import os
@@ -19,11 +20,12 @@ import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, ClassVar
+from typing import Any, Callable, ClassVar
 
 import cudnn
 from cuda.bindings import driver as _cuda
 from cudnn.frost import buffers
+from cudnn.frost.device import current_device
 from cudnn.frost.workspace import Workspace
 
 _LOG = logging.getLogger(__name__)
@@ -53,6 +55,18 @@ from .dtypes import (
 )
 from .epilogue_codegen import EpilogueSnippets, generate
 from .fusion_ir import ZERO_PRESERVING_OPS, FusionChain, TensorRef
+from .recipe import (
+    CONST,
+    FROM_M,
+    KERNEL_AXES,
+    REDUCTION_INIT_VALUE,
+    _output_rule,
+    build as build_recipe,
+    check_alignment,
+    check_shapes,
+    contiguous_modulus,
+    expected_shape,
+)
 from .graph_analyzer import (
     GemmBinding,
     analyze_with_binding,
@@ -711,8 +725,6 @@ def _plan_device() -> int:
     """The GPU a plan compiled right now targets. Every device-derived constant
     baked into the kernel (ab_stages, grid_num_clusters, the target SM) is read
     for this device, so the plan records it and re-checks it at execute time."""
-    from cudnn.frost.device import current_device
-
     return current_device()
 
 
@@ -726,10 +738,9 @@ def _check_plan_device(plan_device: int) -> None:
     devices either: ``create_variant_pack`` sets only pointers, uids and the
     workspace, and ``graph_interface.h`` takes its ordinal from
     ``cuda_get_device``. Reading the current device once is 0.74 us against
-    1.45 per operand for the walk this replaces.
+    1.45 per operand for the walk this replaces -- and the import is at module
+    scope because doing it here costs 1.1 us of the 1.7 this function takes.
     """
-    from cudnn.frost.device import current_device
-
     device = current_device()
     if device != plan_device:
         raise ValueError(
@@ -1751,11 +1762,17 @@ def _reshape_aux_to_fake(t: object, ref: TensorRef) -> object:
     """View a broadcast-aux runtime tensor to the fake's rank/unit-dim layout so
     the tvm-ffi front door's ndim/shape check accepts it. Free view: the aux is
     consumed via raw pointer + injected strides, so only the wrapper rank/shape is
-    at stake. No-op off the front door, so the plain path stays bit-identical."""
+    at stake. No-op off the front door, so the plain path stays bit-identical.
+
+    The rank comes from ``len(t.shape)``, which every buffer answers. Reading it
+    off an ``ndim`` attribute with a default meant a buffer that does not carry
+    one -- the pack's, so every operand arriving through ``graph.execute()`` --
+    was taken to match already, and a bias declared ``[1, 1, N]`` but handed over
+    as ``[N]`` was refused where the backend accepts it."""
     if not _TVM_FFI_OK:
         return t
     real = _aux_fake_real_axes(ref)
-    if getattr(t, "ndim", len(real)) == len(real):
+    if len(t.shape) == len(real):
         return t
     extents = [int(e) for e in t.shape if int(e) != 1]
     if sum(real) != len(extents):
@@ -1765,42 +1782,8 @@ def _reshape_aux_to_fake(t: object, ref: TensorRef) -> object:
     return t.reshape(shape)
 
 
-_REDUCTION_INIT_VALUE = {
-    "fp32": {
-        "add": 0.0,
-        "amax": 0.0,
-        "max": -float("inf"),
-        "min": float("inf"),
-        "avg": 0.0,
-        "norm1": 0.0,
-        "norm2": 0.0,
-        "mul": 1.0,
-        "mul_no_zeros": 1.0,
-    },
-    "int32": {
-        "add": 0,
-        "amax": 0,
-        "max": -(2**31),
-        "min": 2**31 - 1,
-        "norm1": 0,
-    },
-}
-
-
 def _expected_output_shape(spec, chain: FusionChain, mnk) -> tuple[int, int, int]:
-    full = (chain.matmul.batch, int(mnk[0]), int(mnk[1]))
-    if spec.is_quant_scale:
-        assert spec.dim is not None
-        return spec.dim
-    if not spec.is_reduction:
-        if spec.dtype == "fp4_e2m1":
-            return (full[0], full[1], full[2] // 2)
-        return full
-    assert spec.dim is not None
-    red_idx = int(spec.source.rsplit("_", 1)[1])
-    if chain.reductions[red_idx].grouped_by_moe:
-        return spec.dim
-    return tuple(1 if spec.dim[i] == 1 else full[i] for i in range(3))
+    return expected_shape(_output_rule(spec, chain), int(mnk[0]), int(mnk[1]))
 
 
 def _initialize_reduction_outputs(chain: FusionChain, outputs, stream=None) -> None:
@@ -1814,7 +1797,7 @@ def _initialize_reduction_outputs(chain: FusionChain, outputs, stream=None) -> N
         if not spec.is_reduction:
             continue
         red = chain.reductions[int(spec.source.rsplit("_", 1)[1])]
-        value = _REDUCTION_INIT_VALUE[red.compute_dtype][red.mode]
+        value = REDUCTION_INIT_VALUE[red.compute_dtype][red.mode]
         # The driver, on the stream the kernel will run on -- for a padded output
         # too. tensor.fill_() would queue on torch's current stream instead,
         # which is the same stream only by luck, and only exists at all while
@@ -1846,8 +1829,9 @@ class CompiledFusedGemm:
     `col + vsize <= N`, the TMA-store path relies on HW dropping OOB coords.
 
     Construct via :func:`jit_from_cudnn_graph`, then call with a variant-pack
-    dict. See ``_maybe_wrap_layout`` for the leading-dim policy (A=-1, B=-2,
-    C=-1, aux=-1).
+    dict. ``lowered`` is the launch, and the only one: a graph it cannot serve
+    was declined by :func:`_check_executable` before a plan existed, and a call
+    it refuses goes to ``explain``, which raises rather than running anything.
 
     Do NOT set `oob_fill=nan_request_zero_fma` on sm100: the "NONE" enum name is
     misleading (bit 0 = zero-fill), and NaN-request is harmful because
@@ -1873,6 +1857,26 @@ class CompiledFusedGemm:
     # from the execute-time cuDNN handle and forwards it as `stream=`. Engines
     # that do not carry the param stay on the default stream (see dispatch).
     accepts_stream: ClassVar[bool] = True
+    # Everything the call path needs that a runtime value cannot change, read
+    # once here rather than rebuilt per execute. None when this object was
+    # constructed without a binding and so has no call path.
+    recipe: Any = field(default=None, init=False, repr=False, compare=False)
+    # The recipe as one loop: this kernel's launch path, and the only one.
+    lowered: Any = field(default=None, init=False, repr=False, compare=False)
+    bound: Any = field(default=(), init=False, repr=False, compare=False)
+    # Why this object has no launch path, or None when it has one. Set at build.
+    declined: "str | None" = field(default=None, init=False, repr=False, compare=False)
+    # Reason -> count for calls the launch path refused. Refusing is the answer
+    # now, not a slower route, so this is the invariant rather than observability:
+    # a legal call of any flavor must leave it empty. Counted only on the path
+    # that is already raising, so a served call pays nothing for it.
+    deferrals: Any = field(default_factory=Counter, init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if self.binding is not None:
+            self.bound = tuple(self.binding.bound_tensors())
+            self.recipe = build_recipe(self)
+            self.lowered = self._lower()
 
     def __call__(self, variant_pack, stream=None):
         # The runtime call is a variant-pack dict keyed by cuDNN tensor object
@@ -1886,324 +1890,258 @@ class CompiledFusedGemm:
         return self.run_resolved(resolve_variant_pack(variant_pack, self.binding), stream=stream)
 
     def run_resolved(self, resolved, stream=None):
-        """Launch over ``{id(bound_tensor): buffer}``, already resolved.
+        """Launch over ``{id(bound_tensor): buffer}``, already resolved."""
+        operands = []
+        for i, t in enumerate(self.bound):
+            buf = resolved.get(id(t))
+            if buf is None:
+                raise KeyError(f"variant pack is missing a buffer for {self.recipe.roles[i]}")
+            operands.append(buf)
+        if self.lowered is None:
+            raise NotImplementedError(f"cudnn.frost gemm: this kernel has no launch path -- {self.declined}")
+        return self.lowered(operands, stream=stream)
 
-        Which bound tensor holds which operand is fixed when the plan compiles,
-        so a caller that knows it -- the engine, which binds the graph's slots
-        once -- has no reason to rebuild the by-object / by-uid / by-name tables
-        resolve_variant_pack needs on every execute.
+    def _lower(self):
+        """The recipe as one loop over flat tuples: this kernel's only call path.
+
+        Every branch a per-call walk would take -- multi-GEMM or not, block
+        scale or not, how many outputs, which are reductions, which axis of each
+        operand carries M/N/K, what order the kernel's parameters come in -- was
+        settled when the kernel compiled. Taking them again per call is most of
+        what a python execute path costs: 44 us for the walk that rebuilt them,
+        35 reading a recipe through its objects, 20 here.
+
+        What is left per call is the same loop for every flavor, over tuples
+        flat enough that the body does no attribute lookup and calls nothing it
+        does not have to. Measured against a hand-unrolled straight line for the
+        plain flavor, the loop gives back 12% (19.7 us against 17.5) and costs
+        one body instead of one per shape; source codegen off this same table is
+        how to get that 12% back for every flavor at once.
+
+        The body never raises. What it refuses it hands to ``explain``, which
+        owns every rejection message and does not run anything -- so the goal is
+        that the set of calls this refuses EQUALS the set of illegal calls, and
+        a legal one it will not serve is a bug rather than a slower route.
+
+        ``deferrals`` gets one direction of that, and only one: a legal call of
+        every flavor must leave it empty, so nothing legal is refused. It says
+        nothing about the other direction, because a call this ACCEPTS never
+        reaches the counter -- an illegal call slipping through is caught, if at
+        all, by the per-case rejection tests and by the backend differentials.
+        Closing it properly means generating both the fused guards and the
+        readable diagnostics from one ordered list of checks.
+
+        None means this object has no call path at all, which the engine's
+        support gate already refused; ``declined`` says why.
         """
-        _check_plan_device(self.device)
-        b = self.binding
 
-        def pull(t, role):
-            if t is None or id(t) not in resolved:
-                raise KeyError(f"variant pack is missing a buffer for {role}")
-            return resolved[id(t)]
+        def decline(reason: str) -> None:
+            self.declined = reason
+            return None
 
-        a_bufs = [pull(t, "A operand") for t in b.a_operands]
-        b_bufs = [pull(t, "B operand") for t in b.b_operands]
-        out_bufs = [pull(t, "output") for t in b.outputs]
-        aux_bufs = [pull(t, f"aux {self.aux_names[i]!r}") for i, t in enumerate(b.aux)]
-        # (M, N, K) from buffer shapes: A=(batch,M,K) (FP4-packed A stores K/2
-        # elem/byte → scale back up), N from the B operand.
-        k_factor = 2 if self.chain.matmul.a_dtype == "fp4_e2m1" else 1
-        M = a_bufs[0].shape[1]
-        K = a_bufs[0].shape[2] * k_factor
-        # N from B: a dense output may be FP4-packed (N/2 bytes).
-        N = b_bufs[0].shape[1]
-        mnk = (M, N, K)
-        c_arg = out_bufs if len(out_bufs) > 1 else out_bufs[0]
+        r = self.recipe
+        if r is None:
+            return decline("no binding")
+        # The engine's support gate, read again rather than restated: a graph
+        # this cannot run was declined before a plan existed, so reaching here
+        # means a caller built the kernel directly.
+        try:
+            _check_executable(self.chain)
+        except NotImplementedError as exc:
+            return decline(str(exc))
+        if r.workspace_bytes:
+            return decline("needs workspace")
+        # Scale factors come with a block size to size their blob against.
+        if bool(r.sf) != bool(r.block_size):
+            return decline("scale factors without a block size")
 
-        # The kernel is shape-agnostic, so the RUNTIME dims must satisfy the
-        # TMA 16-byte alignment rule — same check as the graph-time gate.
-        mm = self.chain.matmul
-        _align_reason = _tma_alignment_reject(mm.a_dtype, mm.b_dtype, mm.a_major, mm.b_major, M, N, K)
-        if _align_reason is not None:
-            raise ValueError(_align_reason)
-
-        # M/N/K came from the FIRST A and B buffer; every other operand must
-        # agree, and every operand's layout must match the compiled major.
-        _operands = [(f"A operand[{i}]", x, mm.a_major, M, 2 if mm.a_dtype == "fp4_e2m1" else 1) for i, x in enumerate(a_bufs)] + [
-            (f"B operand[{i}]", x, mm.b_major, N, 2 if mm.b_dtype == "fp4_e2m1" else 1) for i, x in enumerate(b_bufs)
-        ]
-        for _reject in (
-            _operand_shape_reject(_operands, M, N, K),
-            _operand_layout_reject([(role, x, major) for role, x, major, _d1, _kp in _operands]),
-        ):
-            if _reject is not None:
-                raise ValueError(_reject)
-
-        _out_reqs = _output_align_reqs(self.chain, self.use_tma_store, vec_bytes=self.vec_bytes_epi)
-        _aux_reqs = _aux_align_reqs(self.chain, vec_bytes=self.vec_bytes_epi)
-        _named = (
-            [("A operand", x, 16, "ptr") for x in a_bufs]
-            + [("B operand", x, 16, "ptr") for x in b_bufs]
-            + [(f"output[{i}]", x, _out_reqs[i], "full") for i, x in enumerate(out_bufs)]
-            + [(f"aux {self.aux_names[i]!r}", x, _aux_reqs[self.aux_names[i]], "full") for i, x in enumerate(aux_bufs)]
+        # Operands whose graph axis order is not the kernel's -- B, which cuDNN
+        # declares [b, K, N] where the kernel reads (b, N, K). Re-labelling one
+        # into kernel order is a permute, so the checks below read one order and
+        # the second axis map costs nothing on a call that does not use it.
+        # Keyed by POSITION in `inputs`, never by operand index: matmul(A, A)
+        # binds ONE slot as both operands, and re-labelling the slot would hand
+        # the other role a transposed view of the same memory.
+        renorm = tuple(
+            (j, tuple(op.declared), op.declared_layout[0] if len(op.declared_layout[0]) == 3 else None, op.declared_layout[1])
+            for j, op in enumerate(r.inputs)
+            if op.declared != KERNEL_AXES
         )
-        if self.block_scale:
-            _named += [("SFA", pull(t, "SFA"), 16, "ptr") for t in b.sfa_operands]
-            _named += [("SFB", pull(t, "SFB"), 16, "ptr") for t in b.sfb_operands]
-        _align_reason2 = _alignment_reject(_named)
-        if _align_reason2 is not None:
-            raise ValueError(_align_reason2)
 
-        if self.block_scale:
-            _sf_k4 = ((K // self.chain.block_scale.block_size) + 3) // 4
-            _sf_reason = _sf_blob_reject(
-                [(f"SFA[{i}]", pull(t, "SFA"), 512 * _sf_k4 * ((M + 127) // 128) * int(a_bufs[i].shape[0])) for i, t in enumerate(b.sfa_operands)]
-                + [(f"SFB[{j}]", pull(t, "SFB"), 512 * _sf_k4 * ((N + 127) // 128) * int(b_bufs[j].shape[0])) for j, t in enumerate(b.sfb_operands)]
+        # The recipe flattened into the loop headers: everything the body reads
+        # is unpacked by the `for`, so it costs no attribute lookup. `kc` is both
+        # the axis whose stride must be 1 and the axis whose extent enters the
+        # TMA rule -- the same axis, by the definition of major.
+        stride_ins = r.stride_ins
+        in_slots = tuple(op.index for op in r.inputs)
+        ins = tuple((op.kc, op.modulus, op.batch, op.kpack, op.is_b, i in stride_ins) for i, op in enumerate(r.inputs))
+        outs = tuple((o.index, *(x for axis in o.rule for x in axis), o.align) for o in r.outputs)
+        auxs = tuple((x.index, x.align) for x in r.aux)
+        sfs = tuple((s.index, s.is_a, r.inputs[s.operand_at].batch) for s in r.sf)
+        # Every input is one of the FIRST arguments, in order, so the plan only
+        # has to carry the ones after them.
+        tail = r.arg_plan[len(r.inputs) :]
+        shared, seeds = r.shared_layout, r.seeds
+        a_pos, b_pos, a_kpack = r.a_at, r.b_at, r.a.kpack
+        block_size, batch = r.block_size, r.batch
+        device, launchable, refuse = r.device, self._launchable, self.explain
+        fill_word, fill_plan, apply_fill = buffers.fill_word_async, buffers.strided_fill_plan, buffers.apply_fill_plan
+        is_contiguous = buffers.is_contiguous
+        # Named so a test can assert which rule refused a call, and that a legal
+        # call trips none. Incremented only on the path that is already raising.
+        gave_up = self.deferrals
+
+        def lowered(operands, graph_order=None, stream=None):
+            _check_plan_device(device)
+            # Which axis order each input arrived in, by the backend's own rule:
+            # the descriptor defines the tensor and the pack supplies a pointer,
+            # so a slot the pack described FROM the graph, or a buffer reporting
+            # exactly the declared (dim, stride), is the declaration. Everything
+            # else is the caller's own labelling.
+            #
+            # One view per ROLE. Re-labelling the SLOT would be cheaper and
+            # wrong: matmul(A, A) binds a single buffer as both operands, and
+            # the two roles read it through different axis maps.
+            vs = [operands[i] for i in in_slots]
+            for j, perm, dsh, dst in renorm:
+                v = vs[j]
+                sh = v.shape
+                if len(sh) != 3:
+                    continue  # no axis map fits it; the loop below is what refuses it
+                declared = bool(graph_order) and graph_order[in_slots[j]]
+                if not declared and dsh is not None:
+                    declared = sh[0] == dsh[0] and sh[1] == dsh[1] and sh[2] == dsh[2]
+                    if declared:
+                        st = v.stride()
+                        declared = st[0] == dst[0] and st[1] == dst[1] and st[2] == dst[2]
+                if declared:
+                    vs[j] = v.permute(*perm)
+            a_sh, b_sh = vs[a_pos].shape, vs[b_pos].shape
+            if len(a_sh) != 3 or len(b_sh) != 3:
+                gave_up["A or B is not rank 3"] += 1
+                return refuse(operands, graph_order)
+            m, n, k = a_sh[1], b_sh[1], a_sh[2] * a_kpack
+            # permute(1, 2, 0) relabels axes, so the strides the kernel wants are
+            # that rotation of the ones each check already read -- no second read.
+            problem = [m, n, k, batch]
+            for (kc, mod, ebatch, kpack, is_b, takes_stride), v in zip(ins, vs):
+                sh, st = v.shape, v.stride()
+                if (
+                    len(sh) != 3
+                    or st[kc] != 1
+                    or sh[kc] % mod
+                    or sh[0] != ebatch
+                    or sh[1] != (n if is_b else m)
+                    or sh[2] * kpack != k
+                    or _pow2_floor(v.data_ptr()) < 16
+                ):
+                    gave_up["input layout"] += 1
+                    return refuse(operands, graph_order)
+                if takes_stride:
+                    problem += (st[1], st[2], st[0])
+            # Each output axis is a constant, M, or N over a divisor (fp4 packs
+            # two along N) -- the rule the build recorded, read back per axis.
+            for idx, k0, v0, k1, v1, k2, v2, align in outs:
+                v = operands[idx]
+                sh, st = v.shape, v.stride()
+                if (
+                    len(sh) != 3
+                    or sh[0] != (v0 if k0 == CONST else m if k0 == FROM_M else n // v0)
+                    or sh[1] != (v1 if k1 == CONST else m if k1 == FROM_M else n // v1)
+                    or sh[2] != (v2 if k2 == CONST else m if k2 == FROM_M else n // v2)
+                    or tensor_alignment(tuple(sh), tuple(st), v.element_size(), ptr=v.data_ptr()) < align
+                ):
+                    gave_up["output layout"] += 1
+                    return refuse(operands, graph_order)
+                problem += (st[1], st[2], st[0])
+            for idx, align in auxs:
+                v = operands[idx]
+                if tensor_alignment(tuple(v.shape), tuple(v.stride()), v.element_size(), ptr=v.data_ptr()) < align:
+                    gave_up["aux alignment"] += 1
+                    return refuse(operands, graph_order)
+            if sfs:
+                k4 = ((k // block_size) + 3) // 4
+                for idx, is_a, sf_batch in sfs:
+                    v = operands[idx]
+                    count = int(v.numel())
+                    if (
+                        # A scale factor rides the launch as a rank-3 permute
+                        # like every other head, so its rank is a rule here and
+                        # not something for the permute to discover.
+                        len(v.shape) != 3
+                        or _pow2_floor(v.data_ptr()) < 16
+                        or count != 1 + sum((int(s) - 1) * int(st) for s, st in zip(v.shape, v.stride()))
+                        or count * v.element_size() < 512 * k4 * (((m if is_a else n) + 127) // 128) * sf_batch
+                    ):
+                        gave_up["scale-factor blob"] += 1
+                        return refuse(operands, graph_order)
+            for lead, followers in shared:
+                st = tuple(vs[lead].stride())
+                for j in followers:
+                    if tuple(vs[j].stride()) != st:
+                        gave_up["operands do not share a layout"] += 1
+                        return refuse(operands, graph_order)
+            # Seeding is the one thing here that WRITES, so it is planned in full
+            # before any of it is issued: a second reduction output that turns
+            # out to be unseedable must not find the first already filled, and a
+            # 32-bit word into a narrower element would run off the end of the
+            # caller's allocation before the launch could reject the dtype.
+            if seeds:
+                fills = []
+                for idx, word, elem_bytes in seeds:
+                    v = operands[idx]
+                    if v.element_size() != elem_bytes:
+                        gave_up["reduction seed dtype"] += 1
+                        return refuse(operands, graph_order)
+                    sh, st = v.shape, v.stride()
+                    if is_contiguous(sh, st):
+                        fills.append((v.data_ptr(), None, int(v.numel()), word))
+                        continue
+                    plan = fill_plan(sh, st)
+                    if plan is None:
+                        gave_up["reduction output writes an element twice"] += 1
+                        return refuse(operands, graph_order)
+                    fills.append((v.data_ptr(), plan, 0, word))
+                for ptr, plan, count, word in fills:
+                    if plan is None:
+                        fill_word(ptr, count, word, stream)
+                    else:
+                        apply_fill(ptr, plan, word, stream)
+            return launchable(
+                tuple(problem),
+                *(v.permute(1, 2, 0) for v in vs),
+                *(operands[i].permute(1, 2, 0) if ref is None else _reshape_aux_to_fake(operands[i], ref) for i, ref in tail),
+                stream=_as_custream(stream),
             )
-            if _sf_reason is not None:
-                raise ValueError(_sf_reason)
 
-        if self.chain.is_multi_gemm:
-            if self.block_scale:
-                sfa = [pull(t, "SFA") for t in b.sfa_operands]
-                sfb = [pull(t, "SFB") for t in b.sfb_operands]
-                pairs = [((a_bufs[ai], sfa[ai]), (b_bufs[bi], sfb[bi])) for ai, bi in self.chain.gemm_operands]
-            else:
-                pairs = [(a_bufs[ai], b_bufs[bi]) for ai, bi in self.chain.gemm_operands]
-            r = self._call_positional(pairs, c_arg, mnk, *aux_bufs, stream=stream)
-            _finalize_reductions(self.chain, out_bufs)
-            return r
+        return lowered
 
-        if self.block_scale:
-            sfa = pull(b.sfa_operands[0], "SFA")
-            sfb = pull(b.sfb_operands[0], "SFB")
-            r = self._call_positional(a_bufs[0], b_bufs[0], c_arg, mnk, sfa, sfb, *aux_bufs, stream=stream)
-            _finalize_reductions(self.chain, out_bufs)
-            return r
-        r = self._call_positional(a_bufs[0], b_bufs[0], c_arg, mnk, *aux_bufs, stream=stream)
-        _finalize_reductions(self.chain, out_bufs)
-        return r
+    def explain(self, operands, graph_order=None):
+        """Say what is wrong with a call the launch path refused, and raise.
 
-    def _call_positional(self, *args, stream=None):
-        # Internal launcher (called by __call__ after variant-pack resolve).
-        # Single-GEMM: (a, b, c, (M,N,K), *aux). Multi-GEMM: first arg is a list
-        # of per-GEMM (a, b) pairs deduped into the JIT-fixed distinct slots.
-        if self.chain.is_multi_gemm:
-            if self.block_scale:
-                return self._call_block_scale_multi_gemm(*args, stream=stream)
-            return self._call_multi_gemm(*args, stream=stream)
-        a, b, c, mnk, *aux = args
-        # `c` is a single Tensor or a list/tuple in `self.chain.outputs` order
-        # (outputs bind in chain.outputs order).
-        outputs_spec = self.chain.outputs
-        if isinstance(c, (list, tuple)):
-            cs = list(c)
-        else:
-            cs = [c]
-        if len(cs) != len(outputs_spec):
-            raise ValueError(
-                f"this graph has {len(outputs_spec)} output(s) "
-                f"({[o.source for o in outputs_spec]}); got {len(cs)} runtime "
-                f"output tensor(s). Pass a list of tensors in slot order."
-            )
+        The rules are written twice on purpose: once fused into ``lowered``'s
+        guards, where the cost is per call and the answer is a bool, and once
+        here, where the cost is nothing -- this only ever runs on a call that
+        has already failed -- and the answer names the operand and both numbers.
 
-        expected_a_batch = self.chain.matmul.a_batch
-        expected_b_batch = self.chain.matmul.b_batch
-        bad_shapes = len(a.shape) != 3 or len(b.shape) != 3 or a.shape[0] != expected_a_batch or b.shape[0] != expected_b_batch
-        for spec, ci in zip(outputs_spec, cs):
-            if len(ci.shape) != 3 or tuple(ci.shape) != _expected_output_shape(spec, self.chain, mnk):
-                bad_shapes = True
-        if bad_shapes:
-            raise ValueError(
-                f"runtime tensors must be rank-3 with shapes matching the graph "
-                f"A batch={expected_a_batch}, B batch={expected_b_batch}, "
-                f"outputs={[ _expected_output_shape(o, self.chain, mnk) for o in outputs_spec ]}; "
-                f"got A={tuple(a.shape)}, B={tuple(b.shape)}, "
-                f"C={[tuple(ci.shape) for ci in cs]}"
-            )
-        _initialize_reduction_outputs(self.chain, cs, stream)
+        What this is NOT is a second way to run the kernel. Two executors are
+        two answers to what the graph computes, and the differential that
+        policed them could never catch a misconception they shared, which is
+        exactly how the axis-order bug survived one.
 
-        if self.chain.output_specs:
-            base_problem = (mnk[0], mnk[1], mnk[2], cs[0].shape[0])
-        else:
-            base_problem = (mnk[0], mnk[1], mnk[2], max(a.shape[0], b.shape[0]))
-        # Block-scale: first two aux are the SFA/SFB scale factors (128x4-blocked
-        # layout), placed right after a/b; the rest are epilogue-fusion tensors.
-        sf_args: tuple = ()
-        if self.block_scale:
-            if len(aux) < 2:
-                raise ValueError("block-scaled matmul call needs sfa, sfb after c: " "compiled(a, b, c, (M,N,K), sfa, sfb, *epilogue_aux)")
-            sfa, sfb = aux[0], aux[1]
-            aux = aux[2:]
-            sfa = _maybe_wrap_layout(sfa.permute(1, 2, 0), _LEADING_DIM_AUX)
-            sfb = _maybe_wrap_layout(sfb.permute(1, 2, 0), _LEADING_DIM_AUX)
-            sf_args = (sfa, sfb)
-        a = a.permute(1, 2, 0)
-        b = b.permute(1, 2, 0)
-        cs = [ci.permute(1, 2, 0) for ci in cs]
-        output_strides = tuple(stride for _spec, ci in zip(outputs_spec, cs) for stride in ci.stride())
-        problem_size = (
-            *base_problem,
-            *tuple(a.stride()),
-            *tuple(b.stride()),
-            *output_strides,
+        Falling off the end means the two readings have drifted apart, which is
+        the one failure mode splitting them introduces. Loud beats silent.
+        """
+        recipe = self.recipe
+        _check_plan_device(recipe.device)
+        mnk, axes = recipe.problem(operands, graph_order)
+        check_shapes(recipe, operands, mnk, axes)
+        check_alignment(recipe, operands, axes)
+        raise RuntimeError(
+            "cudnn.frost gemm: the launch path refused this call and no rule explains why -- its "
+            "per-call guards and the diagnostics here have drifted apart. Guards that fired: "
+            f"{dict(self.deferrals)}."
         )
-        a = _maybe_wrap_layout(a, _LEADING_DIM_A)
-        b = _maybe_wrap_layout(b, _LEADING_DIM_B)
-        cs = [
-            (_wrap_raw_tensor(ci) if (spec.is_reduction or spec.is_quant_scale) else _maybe_wrap_layout(ci, _LEADING_DIM_C))
-            for spec, ci in zip(outputs_spec, cs)
-        ]
-        aux = tuple(_maybe_wrap_layout(_reshape_aux_to_fake(t, ref), _LEADING_DIM_AUX) for ref, t in zip(self.chain.aux_tensors, aux))
-        # cute.compile fixes one param per output at JIT time, so pass them flat:
-        #   plain:       (a, b, *outputs, mnk, *aux)
-        #   block-scale: (a, b, sfa, sfb, *outputs, mnk, *aux)
-        if self.use_tma_store:
-            # TMA mode: the single dense output binds the trailing TMA-only c param.
-            return self._launchable(problem_size, a, b, *sf_args, *aux, cs[0], stream=_as_custream(stream))
-        return self._launchable(problem_size, a, b, *sf_args, *cs, *aux, stream=_as_custream(stream))
-
-    def _call_multi_gemm(self, gemm_pairs, c, mnk, *aux, stream=None):
-        """Multi-GEMM call: ``compiled([(A,B0),(A,B1),...], c, (M,N,K), *aux)``.
-
-        Dedup the (a, b) pairs by tensor identity into the JIT-fixed distinct A/B
-        slots, verify the sharing pattern matches the chain, then pass
-        ``(a_0.., b_0.., c, mnk4, *aux)`` in kernel-signature order."""
-        chain = self.chain
-        if not isinstance(gemm_pairs, (list, tuple)) or not all(isinstance(p, (list, tuple)) and len(p) == 2 for p in gemm_pairs):
-            raise ValueError("multi-GEMM call expects a list of (a, b) tensor pairs as the " f"first argument; got {type(gemm_pairs).__name__}")
-        if len(gemm_pairs) != chain.num_gemms:
-            raise ValueError(f"this graph has {chain.num_gemms} GEMM(s); got " f"{len(gemm_pairs)} (a, b) pair(s)")
-        na, nb = chain.num_a_operands, chain.num_b_operands
-        a_slots: list = [None] * na
-        b_slots: list = [None] * nb
-        for (A_g, B_g), (ai, bi) in zip(gemm_pairs, chain.gemm_operands):
-            for slots, idx, t, role in (
-                (a_slots, ai, A_g, "A"),
-                (b_slots, bi, B_g, "B"),
-            ):
-                if slots[idx] is None:
-                    slots[idx] = t
-                elif slots[idx].data_ptr() != t.data_ptr():
-                    raise ValueError(
-                        f"multi-GEMM operand sharing mismatch: distinct {role} slot "
-                        f"{idx} was given two different tensors. The runtime sharing "
-                        "pattern must match the graph the kernel was compiled from."
-                    )
-        if any(s is None for s in a_slots) or any(s is None for s in b_slots):
-            raise ValueError("multi-GEMM: not every distinct A/B operand slot was filled")
-
-        outputs_spec = chain.outputs
-        cs = list(c) if isinstance(c, (list, tuple)) else [c]
-        if len(cs) != len(outputs_spec):
-            raise ValueError(
-                f"this graph has {len(outputs_spec)} output(s) "
-                f"({[o.source for o in outputs_spec]}); got {len(cs)}. "
-                "Pass a list of output tensors in slot order."
-            )
-        for spec, ci in zip(outputs_spec, cs):
-            if len(ci.shape) != 3 or tuple(ci.shape) != _expected_output_shape(spec, chain, mnk):
-                raise ValueError(f"multi-GEMM output {spec.source!r} must have shape " f"{_expected_output_shape(spec, chain, mnk)}; " f"got {tuple(ci.shape)}")
-        for role, slots in (("A", a_slots), ("B", b_slots)):
-            for t in slots:
-                if len(t.shape) != 3:
-                    raise ValueError(f"multi-GEMM {role} operand must be rank-3; got {tuple(t.shape)}")
-        _initialize_reduction_outputs(chain, cs, stream)
-
-        base_problem = (mnk[0], mnk[1], mnk[2], cs[0].shape[0])
-        a_permuted = [t.permute(1, 2, 0) for t in a_slots]
-        b_permuted = [t.permute(1, 2, 0) for t in b_slots]
-        c_permuted = [ci.permute(1, 2, 0) for ci in cs]
-        output_strides = tuple(stride for _spec, ci in zip(outputs_spec, c_permuted) for stride in ci.stride())
-        if not self.block_scale:
-            problem_size = (
-                *base_problem,
-                *(x for t in a_permuted for x in t.stride()),
-                *(x for t in b_permuted for x in t.stride()),
-                *output_strides,
-            )
-        else:
-            problem_size = base_problem
-        a_wrapped = [_maybe_wrap_layout(t, _LEADING_DIM_A) for t in a_permuted]
-        b_wrapped = [_maybe_wrap_layout(t, _LEADING_DIM_B) for t in b_permuted]
-        cs_wrapped = [
-            (_wrap_raw_tensor(ci) if (spec.is_reduction or spec.is_quant_scale) else _maybe_wrap_layout(ci, _LEADING_DIM_C))
-            for spec, ci in zip(outputs_spec, c_permuted)
-        ]
-        aux = tuple(_maybe_wrap_layout(_reshape_aux_to_fake(t, ref), _LEADING_DIM_AUX) for ref, t in zip(chain.aux_tensors, aux))
-        return self._launchable(problem_size, *a_wrapped, *b_wrapped, *cs_wrapped, *aux, stream=_as_custream(stream))
-
-    def _call_block_scale_multi_gemm(self, gemm_pairs, c, mnk, *aux, stream=None):
-        """Block-scale multi-GEMM call:
-        ``compiled([((A,SFA),(B0,SFB0)), ((A,SFA),(B1,SFB1))], c, (M,N,K), *epi_aux)``.
-
-        Each operand is a (packed_data, SF) pair; dedup by packed-data identity
-        (SF travels with its data → a shared dequant collapses to one operand).
-        Grouped by kind in the kernel signature (a.., b.., sfa.., sfb..)."""
-        chain = self.chain
-        ok = (
-            isinstance(gemm_pairs, (list, tuple))
-            and gemm_pairs
-            and all(isinstance(p, (list, tuple)) and len(p) == 2 and all(isinstance(o, (list, tuple)) and len(o) == 2 for o in p) for p in gemm_pairs)
-        )
-        if not ok:
-            raise ValueError("block-scale multi-GEMM call expects a list of " "((a,sfa),(b,sfb)) pairs as the first argument")
-        if len(gemm_pairs) != chain.num_gemms:
-            raise ValueError(f"this graph has {chain.num_gemms} GEMM(s); got {len(gemm_pairs)} pair(s)")
-        na, nb = chain.num_a_operands, chain.num_b_operands
-        a_slots: list = [None] * na  # (packed_a, sfa)
-        b_slots: list = [None] * nb
-        for ((A_g, SFA_g), (B_g, SFB_g)), (ai, bi) in zip(gemm_pairs, chain.gemm_operands):
-            for slots, idx, data, sf, role in (
-                (a_slots, ai, A_g, SFA_g, "A"),
-                (b_slots, bi, B_g, SFB_g, "B"),
-            ):
-                if slots[idx] is None:
-                    slots[idx] = (data, sf)
-                elif slots[idx][0].data_ptr() != data.data_ptr():
-                    raise ValueError(f"block-scale multi-GEMM operand sharing mismatch: distinct " f"{role} slot {idx} got two different packed tensors.")
-        if any(s is None for s in a_slots) or any(s is None for s in b_slots):
-            raise ValueError("block-scale multi-GEMM: not every distinct operand slot was filled")
-
-        # chain.outputs order. No-epilogue
-        # → one output per GEMM in GEMM order; fused → one output.
-        outputs_spec = chain.outputs
-        cs = list(c) if isinstance(c, (list, tuple)) else [c]
-        if len(cs) != len(outputs_spec):
-            raise ValueError(
-                f"this graph has {len(outputs_spec)} output(s) "
-                f"({[o.source for o in outputs_spec]}); got {len(cs)}. "
-                f"Pass a list of output tensors in slot order."
-            )
-        for spec, ci in zip(outputs_spec, cs):
-            if len(ci.shape) != 3 or tuple(ci.shape) != _expected_output_shape(spec, chain, mnk):
-                raise ValueError(
-                    f"block-scale multi-GEMM output {spec.source!r} must have " f"shape {_expected_output_shape(spec, chain, mnk)}; " f"got {tuple(ci.shape)}"
-                )
-        _initialize_reduction_outputs(chain, cs, stream)
-        base_problem = (mnk[0], mnk[1], mnk[2], cs[0].shape[0])
-        # Grouped by kind (all A, all B, all SFA, all SFB); single-GEMM → a,b,sfa,sfb.
-        a_permuted = [d.permute(1, 2, 0) for d, _ in a_slots]
-        b_permuted = [d.permute(1, 2, 0) for d, _ in b_slots]
-        c_permuted = [ci.permute(1, 2, 0) for ci in cs]
-        a_stride = tuple(a_permuted[0].stride())
-        b_stride = tuple(b_permuted[0].stride())
-        if any(tuple(t.stride()) != a_stride for t in a_permuted[1:]):
-            raise ValueError("block-scale multi-GEMM requires all distinct A operands to share layout")
-        if any(tuple(t.stride()) != b_stride for t in b_permuted[1:]):
-            raise ValueError("block-scale multi-GEMM requires all distinct B operands to share layout")
-        output_strides = tuple(stride for _spec, ci in zip(outputs_spec, c_permuted) for stride in ci.stride())
-        problem_size = (
-            *base_problem,
-            *a_stride,
-            *b_stride,
-            *output_strides,
-        )
-        a_w = [_maybe_wrap_layout(t, _LEADING_DIM_A) for t in a_permuted]
-        b_w = [_maybe_wrap_layout(t, _LEADING_DIM_B) for t in b_permuted]
-        sfa_w = [_maybe_wrap_layout(s.permute(1, 2, 0), _LEADING_DIM_AUX) for _, s in a_slots]
-        sfb_w = [_maybe_wrap_layout(s.permute(1, 2, 0), _LEADING_DIM_AUX) for _, s in b_slots]
-        cs_w = [
-            (_wrap_raw_tensor(t) if (spec.is_reduction or spec.is_quant_scale) else _maybe_wrap_layout(t, _LEADING_DIM_C))
-            for spec, t in zip(outputs_spec, c_permuted)
-        ]
-        aux = tuple(_maybe_wrap_layout(_reshape_aux_to_fake(t, ref), _LEADING_DIM_AUX) for ref, t in zip(chain.aux_tensors, aux))
-        return self._launchable(problem_size, *a_w, *b_w, *sfa_w, *sfb_w, *cs_w, *aux, stream=_as_custream(stream))
 
 
 def _mma_a_dtype(chain: FusionChain) -> str:
@@ -2362,73 +2300,12 @@ def _tma_alignment_reject(
         ("A", a_dtype, a_major, K if a_major == "k" else M, "K" if a_major == "k" else "M"),
         ("B", b_dtype, b_major, K if b_major == "k" else N, "K" if b_major == "k" else "N"),
     ):
-        bits = _dtype_bits(dtype)
-        if (extent * bits) % 128 != 0:
-            bad.append(f"{name} ({major}-major, {dtype}) requires {dim} % {128 // bits} == 0, " f"got {dim}={extent}")
+        modulus, pack = contiguous_modulus(dtype, major == "k")
+        logical = modulus * pack
+        if extent % logical:
+            bad.append(f"{name} ({major}-major, {dtype}) requires {dim} % {logical} == 0, " f"got {dim}={extent}")
     if bad:
         return "TMA input contiguous dimensions must be 16-byte aligned: " + "; ".join(bad)
-    return None
-
-
-# A/B are rank-3 (batch, M|N, K); the graph's major names which dim is contiguous.
-_MAJOR_CONTIGUOUS_DIM = {"k": 2, "m": 1, "n": 1}
-
-
-def _contiguous_dim(buf) -> "int | None":
-    """Index of the unambiguously contiguous dim of a rank-3 buffer, else None.
-
-    A size-1 dim can carry stride 1 without meaning anything, so a layout is only
-    judged when exactly one dim of size > 1 is contiguous."""
-    shape = tuple(buf.shape)
-    strides = tuple(buf.stride())
-    unit = [i for i, s in enumerate(strides) if s == 1 and shape[i] > 1]
-    return unit[0] if len(unit) == 1 else None
-
-
-def _operand_layout_reject(named_operands) -> "str | None":
-    """Each operand's runtime layout must match the major baked into the kernel.
-
-    The major comes from the GRAPH's declared strides and is compiled into the
-    TMA descriptor and the MMA operand descriptor, while the launch reads the
-    RUNTIME buffer's strides — so a buffer whose contiguous dim disagrees with
-    the declaration computes silently wrong numbers rather than faulting.
-    Entries are ``(role, buffer, major)``. Returns a reason string, or ``None``."""
-    bad = []
-    for role, buf, major in named_operands:
-        if buf is None or len(tuple(buf.shape)) != 3:
-            continue
-        got = _contiguous_dim(buf)
-        want = _MAJOR_CONTIGUOUS_DIM[major]
-        if got is not None and got != want:
-            names = {0: "batch", 1: "M/N", 2: "K"}
-            bad.append(
-                f"{role}: graph declares {major}-major (dim {want} contiguous) but the buffer has dim {got} ({names[got]}) contiguous, stride={tuple(buf.stride())}"
-            )
-    if bad:
-        return "runtime operand layout does not match the layout the kernel was compiled for: " + "; ".join(bad)
-    return None
-
-
-def _operand_shape_reject(named_operands, M: int, N: int, K: int) -> "str | None":
-    """Every A operand must be (batch, M, K) and every B operand (batch, N, K),
-    for the SAME K — M/N/K are inferred from the first A and B buffer, so a
-    disagreeing operand would otherwise be read past its end (the kernel walks
-    the inferred K on every operand). Entries are ``(role, buffer, major, dim1,
-    k_pack)``; ``k_pack`` is 2 for FP4-packed data (two elements per byte-slot).
-    Returns a reason string, or ``None``."""
-    bad = []
-    for role, buf, _major, dim1, k_pack in named_operands:
-        if buf is None:
-            continue
-        shape = tuple(buf.shape)
-        if len(shape) != 3:
-            bad.append(f"{role}: expected a rank-3 buffer, got shape {shape}")
-            continue
-        want = (dim1, K // k_pack)
-        if (shape[1], shape[2]) != want:
-            bad.append(f"{role}: expected (batch, {want[0]}, {want[1]}), got {shape}")
-    if bad:
-        return f"runtime operand shapes disagree with the inferred problem size (M={M}, N={N}, K={K}): " + "; ".join(bad)
     return None
 
 
@@ -2670,6 +2547,29 @@ def _check_block_quant_supported(
 _FORCE_STG_EPI = False
 
 
+def _check_executable(chain: FusionChain) -> None:
+    """Can this engine RUN the graph, or only render a kernel for it?
+
+    A dense or block-scale chain has ONE call path -- the one lowered from the
+    recipe -- so what that path cannot serve is a graph this engine declines,
+    not a call that takes a slower route. Declining sends it to the backend,
+    which is where it would have gone had this engine never been asked; keeping
+    a second executor for it is how the two drift apart.
+
+    MoE is the exception and stays on its own launchers: it is >= 2 launches
+    with a workspace, and has no recipe to lower from.
+    """
+    if chain.has_moe:
+        return
+    if not _TVM_FFI_OK:
+        # Not a narrowing of the install surface: apache-tvm-ffi ships in the
+        # same `cutedsl` extra as the DSL these kernels are written in, so a
+        # build without it has no DSL either and was already declining.
+        raise NotImplementedError("the tvm-ffi front door is not installed, and the launch path this engine has needs it (pip install apache-tvm-ffi)")
+    if any(red.mode == "norm2" for red in chain.reductions):
+        raise NotImplementedError("a norm2 reduction takes a square root after the kernel, which is a device operation this engine does not own")
+
+
 def probe_supported(
     graph: cudnn.pygraph,
     config: TileConfig = DEFAULT_CONFIG,
@@ -2685,6 +2585,7 @@ def probe_supported(
     Block-scale / MoE gate inside their ``_jit_*`` compile paths; here a
     successful analysis is treated as eligible (full validation at compile)."""
     chain, _binding = analyze_with_binding(graph)
+    _check_executable(chain)
     if chain.has_moe or chain.has_block_scale:
         return  # specialized paths validate at compile
     if chain.is_multi_gemm:

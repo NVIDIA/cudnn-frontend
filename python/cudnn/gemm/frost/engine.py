@@ -31,33 +31,49 @@ class _FrostGemmPlan(CompiledPlan):
         # roles (matmul(A, A)), and resolve_variant_pack treats a repeated uid
         # as ambiguous.
         self._tensors = list(compiled.binding.bound_tensors())
-        self._slots = None
+        self._operand_indices = None
+        # The one launch path a dense or block-scale kernel has: the closure the
+        # recipe is captured into. A graph it cannot serve was declined at
+        # check_support, so there is nothing to fall back TO -- None here means
+        # MoE, which takes the variant-pack dict and its own workspace below.
+        self._lowered = getattr(compiled, "lowered", None)
+        self._launch = self._lowered
 
     def get_workspace_size(self) -> int:
         return int(getattr(self._compiled, "workspace_bytes", 0) or 0)
 
     def execute(self, graph, variant_pack, ctx: ExecutionContext) -> None:
-        slots = self._slots
-        if slots is None:
+        indices = self._operand_indices
+        if indices is None:
             try:
-                slots = self._slots = [variant_pack.slot(t.get_uid()) for t in self._tensors]
+                indices = self._operand_indices = [variant_pack.index_of(t.get_uid()) for t in self._tensors]
             except KeyError as exc:
                 raise ValueError(f"frost_gemm: tensor uid {exc} is bound by the kernel but is not an operand of this graph") from exc
         # The kernel reads its M/N/K off these, so they must be the pack's --
         # which carry the shape this execute runs, override_shapes included.
-        views = variant_pack.views(slots)
+        operands = variant_pack.operands(indices)
         required = self.get_workspace_size()
-        # Scratch is carved from the CALLER's workspace: stable pointers, so a
-        # plan stays safe to capture in a CUDA graph.
-        extra = (Workspace.over(variant_pack, required, "frost_gemm"),) if required else ()
-        run_resolved = getattr(self._compiled, "run_resolved", None)
-        if run_resolved is not None:
+        if required:
+            # Scratch is carved from the CALLER's workspace: stable pointers, so
+            # a plan stays safe to capture in a CUDA graph. Only the MoE
+            # launchers need it, and they take the variant-pack dict.
+            self._compiled(dict(zip(self._tensors, operands)), Workspace.over(variant_pack, required, "frost_gemm"), stream=ctx.stream)
+            return
+        launch = self._launch
+        if launch is not None:
             # Which bound tensor holds which operand was settled at build, so
-            # resolve_variant_pack's by-object / by-uid / by-name tables have
-            # no question left to answer.
-            run_resolved({id(t): v for t, v in zip(self._tensors, views)}, *extra, stream=ctx.stream)
+            # the buffers arrive in that order and the launcher indexes them.
+            # Which AXIS ORDER each one arrived in is a per-call fact only the
+            # pack knows, since a bare address wears the graph's layout. None
+            # means every operand here is the caller's own.
+            graph_order = None
+            borrowed = variant_pack.graph_described
+            if borrowed:
+                flags = tuple(i in borrowed for i in indices)
+                graph_order = flags if any(flags) else None
+            launch(operands, graph_order, stream=ctx.stream)
         else:
-            self._compiled(dict(zip(self._tensors, views)), *extra, stream=ctx.stream)
+            self._compiled(dict(zip(self._tensors, operands)), stream=ctx.stream)
 
 
 class FrostGemmEngine(BaseEngine):

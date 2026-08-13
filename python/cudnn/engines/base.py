@@ -133,32 +133,37 @@ class VariantPack:
     pointers — silently, because every pointer in it is individually valid.
     """
 
-    __slots__ = ("uids", "native", "_slot_of", "workspace", "workspace_bytes", "_device")
+    __slots__ = ("uids", "native", "_index_of", "workspace", "workspace_bytes", "_device", "graph_described")
 
-    def __init__(self, uids, native, workspace_ptr: int = 0, workspace_bytes: int = 0):
+    def __init__(self, uids, native, workspace_ptr: int = 0, workspace_bytes: int = 0, graph_described=()):
         self.uids = uids
         self.native = native
         self.workspace = workspace_ptr
         self.workspace_bytes = workspace_bytes
-        self._slot_of = None  # built on first lookup: the backend never does one
+        # Slots whose dim/stride were lent by the graph because the caller
+        # passed a bare address. Usually empty. An engine that reads extents by
+        # axis position needs this: the graph and the caller order a matmul's B
+        # differently, and the description does not say which one it is.
+        self.graph_described = graph_described
+        self._index_of = None  # built on first lookup: the backend never does one
         self._device = None
 
     @property
     def address(self) -> int:
-        """The ``void*[]`` in slot order, for ``_execute_with_raw_ptrs``."""
+        """The ``void*[]`` in operand order, for ``_execute_with_raw_ptrs``."""
         return self.native.address
 
     def all_contiguous(self):
-        """``(ok, slot)`` over every filled operand, decided from the strides
+        """``(ok, index)`` over every filled operand, decided from the strides
         the native pack already holds."""
         ok, offender = self.native.all_contiguous()
         return ok, (int(offender) if offender else -1)
 
     @property
-    def slot_of(self):
-        if self._slot_of is None:
-            self._slot_of = {u: i for i, u in enumerate(self.uids)}
-        return self._slot_of
+    def index_of_uid(self):
+        if self._index_of is None:
+            self._index_of = {u: i for i, u in enumerate(self.uids)}
+        return self._index_of
 
     @property
     def device(self) -> int:
@@ -173,20 +178,20 @@ class VariantPack:
             self._device = current_device()
         return self._device
 
-    def slot(self, tensor_or_uid) -> int:
+    def index_of(self, tensor_or_uid) -> int:
         """Index of a tensor's operand. KeyError when it is not caller-filled
         (a virtual intermediate, or a value the graph itself supplies)."""
         uid = tensor_or_uid if isinstance(tensor_or_uid, int) else tensor_or_uid.uid
-        return self.slot_of[uid]
+        return self.index_of_uid[uid]
 
     def ptr(self, tensor_or_uid) -> int:
-        return self.native.pointer(self.slot(tensor_or_uid))
+        return self.native.pointer(self.index_of(tensor_or_uid))
 
-    def views(self, slots):
-        """The DLPack producers for ``slots``, in one crossing."""
-        return self.native.views(list(slots), self.device)
+    def operands(self, indices):
+        """The buffers for ``indices``, in one crossing."""
+        return self.native.operands(list(indices), self.device)
 
-    def view(self, slot: int):
+    def operand(self, index: int):
         """A DLPack producer over one operand, for a kernel that needs an
         object rather than an address.
 
@@ -198,15 +203,15 @@ class VariantPack:
         which is an argument for making the producer a C type, not for keeping
         the caller's object.
         """
-        return self.native.view(slot, self.device)
+        return self.native.operand(index, self.device)
 
     def __len__(self) -> int:
         return len(self.uids)
 
 
 @dataclass(frozen=True)
-class PortSlots:
-    """Per-node ``{port_name: slot}``. A port with no caller operand — a
+class PortIndices:
+    """Per-node ``{port_name: operand index}``. A port with no caller operand — a
     virtual intermediate — is ABSENT, so ``.get(port) is None`` keeps meaning
     what it meant when these were buffers."""
 
@@ -214,24 +219,24 @@ class PortSlots:
     outputs: Dict[str, int]
 
 
-def bind_ports(graph: "pygraph", variant_pack: VariantPack) -> Dict[Any, PortSlots]:
+def bind_ports(graph: "pygraph", variant_pack: VariantPack) -> Dict[Any, PortIndices]:
     """Join each node's wired ports with the operand layout. Strict: every
     non-virtual port must have an operand."""
 
     def resolve(node, ports, direction):
-        slots = {}
+        indices = {}
         for port, t in ports.items():
             if t is None:
                 continue
-            slot = variant_pack.slot_of.get(t.uid)
-            if slot is None:
+            index = variant_pack.index_of_uid.get(t.uid)
+            if index is None:
                 if t.is_virtual:
                     continue  # engine-internal intermediate
                 raise ValueError(f"node {node.name!r}: no buffer for {direction} port {port!r} (tensor {t.name!r})")
-            slots[port] = slot
-        return slots
+            indices[port] = index
+        return indices
 
-    return {node: PortSlots(resolve(node, node.inputs, "input"), resolve(node, node.outputs, "output")) for node in graph.nodes}
+    return {node: PortIndices(resolve(node, node.inputs, "input"), resolve(node, node.outputs, "output")) for node in graph.nodes}
 
 
 def _view_over_address(address: int, tensor, node, port: str):

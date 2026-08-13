@@ -180,7 +180,7 @@ class DeviceView:
         is a use-after-free the moment a consumer outlives the view.
         """
         code, bits = DTYPES[self.dtype]
-        return _pybind_module.make_slot(self._ptr, list(self.shape), code, bits, self._device_id).__dlpack__()
+        return _pybind_module.make_operand_buffer(self._ptr, list(self.shape), code, bits, self._device_id).__dlpack__()
 
 
 class DeviceBuffer(DeviceView):
