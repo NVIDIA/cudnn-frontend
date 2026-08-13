@@ -45,6 +45,8 @@ grads = sdpa_bwd_wrapper_dsl_sm120(
     scale_softmax=None,      # None -> 1/sqrt(D)
     seq_q_lens=None,         # (B,) int32 per-batch Q lengths (padding mask)
     seq_kv_lens=None,        # (B,) int32 per-batch KV lengths (padding mask)
+    sink_token=None,         # fp32 (1, H_q, 1, 1) sink logits; adds dsink_tensor
+                             # to the result
 )
 dq, dk, dv = grads["dq_tensor"], grads["dk_tensor"], grads["dv_tensor"]
 ```
@@ -85,6 +87,8 @@ main    the fused five-GEMM pass; writes dK/dV into dk_ws/dv_ws (aliased to the 
         outputs for MHA, per-q-head partial buffers for GQA); accumulates dQ into dq_accum
 reduce  GQA only: dK/dV = fixed-order sum of each KV head's group of q-head partials
 cvt     dq_accum (fp32, scrambled) -> dQ (io dtype), applying attn_scale
+dsink   dSink_token graphs only, summing over every batch b and query row q:
+        dsink[h] = -sum_{b,q} exp(sink[h] - LSE[b,h,q]) * delta[b,h,q]
 ```
 
 ### Main-kernel pipeline: KV-stationary, five chained GEMMs
@@ -239,7 +243,12 @@ only the unused relay operand remains in the kernel ABI.
   causal), padding (per-batch `seq_kv_len` required, `seq_q_len` optional;
   composes with the other masks)
 - GQA/MQA: any `H_kv` dividing `H_q` (including `H_kv == 1`)
-- No dropout / bias / ALiBi / sinks / softcap / THD
+- Sink tokens: sink logits input and optional `dSink_token` output. dQ/dK/dV
+  need no sink code (the forward LSE already folds the sink into the softmax
+  denominator); the `dSink_token` output adds one tiny `dsink` reduce kernel
+  (`dsink[h] = -sum p_sink * delta`, fixed order — bitwise deterministic in
+  both modes)
+- No dropout / bias / ALiBi / softcap / THD
 - Workspace (carved from the caller's buffer): fp32 `delta` and `dq_accum`
   scratch plus int32 relay-counter storage (reserved in both modes); GQA adds
   the io-dtype `dk_ws`/`dv_ws` partials buffers (`B·S_kv·H_q·D_padded`

@@ -893,6 +893,8 @@ def _mk_bwd_graph(
     grad_strides: tuple | None = None,
     bias: bool = False,
     dbias: bool = False,
+    sink: bool = False,
+    dsink: bool = False,
     seq_lens: str | None = None,  # "kv" / "both" (padding mask) or "q_only"
     **bwd_kwargs,
 ):
@@ -922,6 +924,12 @@ def _mk_bwd_graph(
     if dbias:
         dbias_t = g.tensor(dim=(1, H, s_q, s_kv), stride=(H * s_q * s_kv, s_q * s_kv, s_kv, 1), data_type=DTYPE, name="dBias")
         bwd_kwargs.update(dBias=dbias_t)
+    if sink:
+        sink_t = g.tensor(dim=(1, H, 1, 1), stride=(H, 1, 1, 1), data_type=cudnn.data_type.FLOAT, name="sink")
+        bwd_kwargs.update(sink_token=sink_t)
+    if dsink:
+        dsink_t = g.tensor(dim=(1, H, 1, 1), stride=(H, 1, 1, 1), data_type=cudnn.data_type.FLOAT, name="dSink")
+        bwd_kwargs.update(dSink_token=dsink_t)
     if seq_lens in ("kv", "both"):
         seq_kv_t = g.tensor(dim=(B, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT32, name="seq_kv")
         bwd_kwargs.update(use_padding_mask=True, seq_len_kv=seq_kv_t)
@@ -1046,6 +1054,14 @@ def test_bwd_probe_rejects_seq_len_q_without_padding_mask(monkeypatch):
     # Bare seq_len_q is per-batch Q trimming, which the kernel has no path for.
     monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
     assert not _bwd_eligible(_mk_bwd_graph(seq_lens="q_only"))
+
+
+def test_bwd_probe_accepts_sink(monkeypatch):
+    # dSink without the sink input is rejected.
+    monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
+    assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(sink=True))
+    assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(sink=True, dsink=True, use_causal_mask=True))
+    assert not _bwd_eligible(_mk_bwd_graph(dsink=True))
 
 
 def test_bwd_probe_rejects_bias(monkeypatch):

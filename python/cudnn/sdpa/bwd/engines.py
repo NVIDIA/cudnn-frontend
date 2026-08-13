@@ -206,6 +206,8 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
         if fact and not cap:
             return f"graph uses {label}, which this engine does not support"
 
+    if facts.has_dsink and not facts.has_sink:
+        return "dSink_token output requires a sink_token input"
     if facts.bottom_right and not (facts.causal or facts.right_band_widening):
         return "bottom-right alignment requires a causal upper bound (plain or right-widened)"
     if facts.bottom_right and not capabilities.bottom_right:
@@ -249,6 +251,8 @@ def _sm120_spec() -> EngineSpec:
             right_band_widening=True,
             swa=True,
             padded=True,
+            sink=True,
+            dsink=True,
             layouts=frozenset({"bshd", "dense_flex"}),
             deterministic=True,
             tile_ms=frozenset(_SM120_Q_TILES),
@@ -320,6 +324,9 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
 
     seq_kv_t = facts.seq_kv_t if facts.padded else None
     seq_q_t = facts.seq_q_t if facts.padded else None
+    # Sink ports: geometry straight from the IR tensors (fp32 (1, H_q, 1, 1)).
+    sink_geom = (tuple(facts.sink_t.get_dim()), tuple(facts.sink_t.get_stride())) if facts.has_sink else None
+    dsink_geom = (tuple(facts.dsink_t.get_dim()), tuple(facts.dsink_t.get_stride())) if facts.has_dsink else None
 
     api = _adapter_sm120()(
         sample_q=_desc(q_geom, facts.dtype, "q"),
@@ -331,6 +338,8 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
         sample_dq=_desc(dq_geom, facts.dtype, "dQ"),
         sample_dk=_desc(dk_geom, facts.dtype, "dK"),
         sample_dv=_desc(dv_geom, facts.dtype, "dV"),
+        sample_sink=_desc(sink_geom, torch.float32, "sink") if sink_geom is not None else None,
+        sample_dsink=_desc(dsink_geom, torch.float32, "dSink") if dsink_geom is not None else None,
         is_causal=facts.causal or facts.right_band_widening,
         causal_bottom_right=facts.bottom_right,
         window_size_left=facts.window_left,
@@ -363,6 +372,8 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
         dv=facts.dv_t,
         seq_len_kv=seq_kv_t,
         seq_len_q=seq_q_t,
+        sink_token=facts.sink_t if facts.has_sink else None,
+        dsink=facts.dsink_t if facts.has_dsink else None,
     )
 
     def _canonical_view(buf, geom):
@@ -383,6 +394,8 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
         resolved = ga.resolve_variant_pack(variant_pack, binding)
         seq_kv_buf = resolved.get(id(binding.seq_len_kv)) if binding.seq_len_kv is not None else None
         seq_q_buf = resolved.get(id(binding.seq_len_q)) if binding.seq_len_q is not None else None
+        sink_buf = _canonical_view(resolved[id(binding.sink_token)], sink_geom) if binding.sink_token is not None else None
+        dsink_buf = _canonical_view(resolved[id(binding.dsink)], dsink_geom) if binding.dsink is not None else None
         api.execute(
             q_tensor=_canonical_view(resolved[id(binding.q)], q_geom),
             k_tensor=_canonical_view(resolved[id(binding.k)], k_geom),
@@ -395,6 +408,8 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
             dv_tensor=_canonical_view(resolved[id(binding.dv)], dv_geom),
             seq_q_lens=seq_q_buf,
             seq_kv_lens=seq_kv_buf,
+            sink_tensor=sink_buf,
+            dsink_tensor=dsink_buf,
             scale_softmax=facts.scale,
             # Scratch comes from the CALLER's workspace (never allocated
             # here): the dispatch sized/validated it against workspace_bytes;

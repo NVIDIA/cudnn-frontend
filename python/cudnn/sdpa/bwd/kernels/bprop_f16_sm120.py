@@ -29,7 +29,8 @@ Constraints:
 One backward call is three kernel launches through the per-shape
 ``compile()`` cache at the bottom of this module: ``dot`` (delta =
 rowsum(dO*O), also zeroes the dq_accum workspace), ``main`` (the fused
-five-GEMM pass writing dK/dV), and ``cvt`` (dq_accum fp32 -> dQ io dtype).
+five-GEMM pass writing dK/dV), and ``cvt`` (dq_accum fp32 -> dQ io dtype);
+GQA adds ``reduce`` and a dSink_token output adds ``dsink``.
 """
 
 from functools import lru_cache
@@ -472,6 +473,7 @@ class SM120FusedMultiHeadAttentionFP16Backward:
         kv_tile: int = 0,
         seq_kv_lens_present: bool = False,
         seq_q_lens_present: bool = False,
+        sink_present: bool = False,
     ):
         self.in_dtype = in_dtype
         self.is_causal = is_causal
@@ -482,6 +484,8 @@ class SM120FusedMultiHeadAttentionFP16Backward:
         self.deterministic = bool(deterministic)
         self.seq_kv_lens_present = bool(seq_kv_lens_present)
         self.seq_q_lens_present = bool(seq_q_lens_present)
+        # sink LSE is finite on padded rows; trim them explicitly (LSE := +inf, P = 0)
+        self.trim_q_rows = bool(sink_present) and self.seq_q_lens_present
         self.d = head_dim
         self.use_pdl = bool(use_pdl)
         self.q_tile, self.kv_tile = self.DEFAULT_TILES[head_dim]
@@ -810,6 +814,10 @@ class SM120FusedMultiHeadAttentionFP16Backward:
                         # -inf - (-inf) = NaN.  Use +inf to reconstruct P = 0.
                         if val == cutlass.Float32(float("-inf")):
                             val = cutlass.Float32(float("inf"))
+                    if cutlass.const_expr(self.trim_q_rows):
+                        # explicit padded-row trim (sink LSE is finite there)
+                        if r_abs >= seqlen_q:
+                            val = cutlass.Float32(float("inf"))
                     lse_r[rep * 2 + hf] = val * cutlass.Float32(_LOG2E)
 
             while not prims.mbarrier_try_wait_parity(v_mbar, cutlass.Int32(0)):
@@ -1136,6 +1144,10 @@ class SM120FusedMultiHeadAttentionFP16Backward:
                                     # -inf - (-inf) = NaN.  Use +inf to reconstruct P = 0.
                                     if val == cutlass.Float32(float("-inf")):
                                         val = cutlass.Float32(float("inf"))
+                                if cutlass.const_expr(self.trim_q_rows):
+                                    # explicit padded-row trim (sink LSE is finite there)
+                                    if nq0 + r_loc >= seqlen_q:
+                                        val = cutlass.Float32(float("inf"))
                                 lse_r[rep * 2 + hf] = val * cutlass.Float32(_LOG2E)
                     dqa_base = ((batch * SQ_R + q_row0) * HQ + q_head) * d
                     if cutlass.const_expr(self.deterministic):
@@ -1175,6 +1187,10 @@ class SM120FusedMultiHeadAttentionFP16Backward:
                                     # A fully masked row has LSE = -inf, which can produce
                                     # -inf - (-inf) = NaN.  Use +inf to reconstruct P = 0.
                                     if val == cutlass.Float32(float("-inf")):
+                                        val = cutlass.Float32(float("inf"))
+                                if cutlass.const_expr(self.trim_q_rows):
+                                    # explicit padded-row trim (sink LSE is finite there)
+                                    if nq0 + r_loc >= seqlen_q:
                                         val = cutlass.Float32(float("inf"))
                                 lse_r[rep * 2 + hf] = val * cutlass.Float32(_LOG2E)
                     dqa_base = ((batch * SQ_R + q_row0) * HQ + q_head) * d
@@ -1604,6 +1620,74 @@ def _dkv_reduce_host(
     )
 
 
+@cute.kernel
+def _dsink_kernel(
+    lse: cute.Tensor,  # [B, HQ, SQ] fp32 (natural-log, sink folded in by the fwd)
+    delta: cute.Tensor,  # [B, HQ, SQ_r128] fp32 (dot_do_o output)
+    sink: cute.Tensor,  # [HQ] fp32 sink logits
+    dsink: cute.Tensor,  # [HQ] fp32 out
+    use_pdl: cutlass.Constexpr[bool],
+):
+    """dsink[h] = -sum_{b,q} exp(sink[h] - lse[b,h,q]) * delta[b,h,q].
+
+    One warp per query head, fixed reduction order -> bitwise deterministic."""
+    if cutlass.const_expr(use_pdl):
+        cute.arch.griddepcontrol_launch_dependents()
+        cute.arch.griddepcontrol_wait()
+    head, _, _ = cute.arch.block_idx()
+    tidx, _, _ = cute.arch.thread_idx()
+    B = lse.shape[0]
+    HQ = lse.shape[1]
+    SQ = lse.shape[2]
+    SQ_R = delta.shape[2]
+    lse_ptr = lse.iterator.raw_ptr()
+    delta_ptr = delta.iterator.raw_ptr()
+    s_val = (sink.iterator.raw_ptr() + head).load()
+    inf = cutlass.Float32(float("inf"))
+    acc = cutlass.Float32(0.0)
+    batch = cutlass.Int32(0)
+    # batch loop
+    while batch < B:
+        lse_base = (batch * HQ + head) * SQ
+        delta_base = (batch * HQ + head) * SQ_R
+        q = cutlass.Int32(tidx)
+        while q < SQ:
+            lv = (lse_ptr + lse_base + q).load()
+            # Skip padded / trimmed rows which carry LSE = -inf and delta = 0
+            if lv > -inf and lv < inf:
+                dd = (delta_ptr + delta_base + q).load()
+                acc = acc + cute.math.exp2((s_val - lv) * cutlass.Float32(_LOG2E), fastmath=True) * dd
+            q = q + 32
+        batch = batch + 1
+    for sh in cutlass.range_constexpr(5):
+        acc = acc + prims.shfl_sync(
+            thread_mask=0xFFFFFFFF,
+            val=acc,
+            offset=1 << (4 - sh),
+            mask_and_clamp=0x1F,
+            kind=prims.Shfl.BFLY,
+        )
+    if tidx == 0:
+        (dsink.iterator.raw_ptr() + head).store(-acc)
+
+
+@cute.jit
+def _dsink_host(
+    lse: cute.Tensor,
+    delta: cute.Tensor,
+    sink: cute.Tensor,
+    dsink: cute.Tensor,
+    use_pdl: cutlass.Constexpr[bool],
+    stream: cuda_driver.CUstream,
+):
+    _dsink_kernel(lse, delta, sink, dsink, use_pdl).launch(
+        grid=(lse.shape[1], 1, 1),
+        block=(32, 1, 1),
+        stream=stream,
+        use_pdl=use_pdl,
+    )
+
+
 @lru_cache(maxsize=None)
 def compile(  # noqa: A001
     compute_capability: tuple[int, int],
@@ -1636,6 +1720,7 @@ def compile(  # noqa: A001
         kv_tile=PARAMS.kv_tile,
         seq_kv_lens_present=PARAMS.seq_kv_lens_present,
         seq_q_lens_present=PARAMS.seq_q_lens_present,
+        sink_present=PARAMS.sink_present,
     )
     sq_r = ceil_div(sq, 128) * 128
 
@@ -1734,4 +1819,18 @@ def compile(  # noqa: A001
             fake_stream,
             options=options,
         )
-    return SimpleNamespace(dot=compiled_dot, main=compiled_main, cvt=compiled_cvt, reduce=compiled_reduce)
+    compiled_dsink = None
+    if PARAMS.dsink_present:
+        fake_sink = _fake(cutlass.Float32, (qh,))
+        fake_dsink = _fake(cutlass.Float32, (qh,))
+        compiled_dsink = cute.compile(
+            _dsink_host,
+            fake_lse,
+            fake_delta,
+            fake_sink,
+            fake_dsink,
+            bwd.use_pdl,
+            fake_stream,
+            options=options,
+        )
+    return SimpleNamespace(dot=compiled_dot, main=compiled_main, cvt=compiled_cvt, reduce=compiled_reduce, dsink=compiled_dsink)
