@@ -228,6 +228,7 @@ class BlockScaledMoEGroupedGemmDgluKernel:
         weight_mode: MoEWeightMode = MoEWeightMode.DISCRETE,
         use_dynamic_sched: bool = False,
         act_func: str = "dswiglu",
+        use_single_group_runtime_offsets: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled grouped GEMM dGLU kernel.
 
@@ -282,6 +283,8 @@ class BlockScaledMoEGroupedGemmDgluKernel:
                 )
         if expert_cnt > 1024:
             raise ValueError("Expert count > 1024 is not supported.")
+        if use_single_group_runtime_offsets and expert_cnt != 1:
+            raise ValueError("use_single_group_runtime_offsets requires exactly one expert")
         if not isinstance(weight_mode, MoEWeightMode):
             raise TypeError(f"weight_mode must be a MoEWeightMode, got {type(weight_mode)}")
 
@@ -2120,6 +2123,10 @@ class BlockScaledMoEGroupedGemmDgluKernel:
         warp_idx = tidx // 32
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
 
+        if cutlass.const_expr(self.use_single_group_runtime_offsets):
+            runtime_padded_offsets = cute.make_rmem_tensor((1,), cutlass.Int32)
+            runtime_padded_offsets[0] = cutlass.Int32(cute.size(mA_mkl.shape[0]))
+            padded_offsets = runtime_padded_offsets
         total_tokens = padded_offsets[self.expert_cnt - 1]
 
         #
