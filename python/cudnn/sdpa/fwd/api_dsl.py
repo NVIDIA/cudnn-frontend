@@ -111,6 +111,7 @@ _SM100_FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 # sdpa_fp8); the f16/bf16 flavors use _SM100_KERNEL_FILES.
 _SM100_MXFP8_KERNEL_FILE = "prefill_d128_mxfp8_sm100.py"
 _SM100_FP8_KERNEL_FILE = "prefill_d128_fp8_sm100.py"
+_SM107_FP8_KERNEL_FILE = "prefill_d128_fp8_sm107.py"
 # Both flavors tile KV in TILE_N=128 columns; the KV tail is only masked when
 # the padded/causal mask paths are active (see check_support).
 _SM100_TILE_N = 128
@@ -241,11 +242,16 @@ def _load_kernel_template(filename: str, params: Hashable, tag: str):
     return load_template(path, params, tag=tag)
 
 
-def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplateParams, fp8: bool = False, pertensor: bool = False):
-    """Load one SM100 module for the selected flavor and quantization path."""
+def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplateParams, fp8: bool = False, pertensor: bool = False, rubin: bool = False):
+    """Load one SM100-family module for the selected flavor and quantization
+    path.  ``rubin`` routes per-tensor FP8 to the SM107 sibling kernel (the
+    dense K=64 FP8 path baked in — see prefill_d128_fp8_sm107.py)."""
 
     tag = _flavor_tag(flavor)
-    if fp8:
+    if fp8 and pertensor and rubin:
+        filename = _SM107_FP8_KERNEL_FILE
+        tag = f"sdpa_fwd_sm107_fp8_{tag}"
+    elif fp8:
         filename = _SM100_FP8_KERNEL_FILE if pertensor else _SM100_MXFP8_KERNEL_FILE
         tag = f"sdpa_fwd_sm100_{'fp8' if pertensor else 'mxfp8'}_{tag}"
     else:
@@ -783,9 +789,18 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # cc10.0 (SM100) and cc10.3 (Blackwell-class) both run these kernels; cc10.3
         # additionally has the fused LDTM.STAT row-max, auto-enabled for MXFP8 in compile().
         self._device_cc = (major, minor)
+        # cc10.7 (Rubin) is served by the per-tensor FP8 path only, through the
+        # SM107 sibling kernel (dense K=64 FP8; the f16 and MXFP8 kernels'
+        # K=32-QMMA / f16-QMMA geometry has not been ported).
+        if self._fp8 and self._pertensor:
+            _allowed_cc = ((10, 0), (10, 3), (10, 7))
+            _allowed_msg = "cc=10.0/10.3 (Blackwell) or 10.7 (Rubin, per-tensor FP8)"
+        else:
+            _allowed_cc = ((10, 0), (10, 3))
+            _allowed_msg = "cc=10.0 or 10.3 (Blackwell; Rubin cc10.7 serves only the per-tensor FP8 d128 path)"
         self._value_error_if(
-            self._device_cc not in ((10, 0), (10, 3)),
-            f"SdpaFwdDslSm100 requires cc=10.0 or 10.3 (Blackwell); found SM{major}{minor} on {device}",
+            self._device_cc not in _allowed_cc,
+            f"SdpaFwdDslSm100 requires {_allowed_msg}; found SM{major}{minor} on {device}",
         )
 
         # FP8/MXFP8: exact-match d128 only — the FP8 kernels' SF plumbing and
@@ -945,7 +960,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             thd_varlen=self.thd,
             fused_ldtm_stat=fused_ldtm_stat,
         )
-        self._k_mod = _load_sm100_kernel_module(self.flavor, params, fp8=self._fp8, pertensor=self._pertensor)
+        self._k_mod = _load_sm100_kernel_module(self.flavor, params, fp8=self._fp8, pertensor=self._pertensor, rubin=(self._device_cc == (10, 7)))
         if self.thd:
             # T (total tokens) is a runtime value, so the per-shape compile is deferred to execute().
             self._compiled_kernel = "thd-deferred"
