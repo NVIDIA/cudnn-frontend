@@ -212,6 +212,7 @@ class BlockScaledMoEGroupedGemmGluKernel:
         act_func: str = "swiglu",
         enable_bias: bool = False,
         generate_c: bool = True,
+        use_single_group_runtime_offsets: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled grouped GEMM GLU kernel.
 
@@ -265,11 +266,14 @@ class BlockScaledMoEGroupedGemmGluKernel:
                 )
         if expert_cnt > 1024:
             raise ValueError("Expert count > 1024 is not supported.")
+        if use_single_group_runtime_offsets and expert_cnt != 1:
+            raise ValueError("use_single_group_runtime_offsets requires exactly one expert")
         if not isinstance(weight_mode, MoEWeightMode):
             raise TypeError(f"weight_mode must be a MoEWeightMode, got {type(weight_mode)}")
 
         self.sf_vec_size = sf_vec_size
         self.expert_cnt = expert_cnt
+        self.use_single_group_runtime_offsets = use_single_group_runtime_offsets
         self.acc_dtype: Type[cutlass.Numeric] = acc_dtype
         self.use_2cta_instrs = use_2cta_instrs
         self.cluster_shape_mn = cluster_shape_mn
@@ -1632,6 +1636,10 @@ class BlockScaledMoEGroupedGemmGluKernel:
                 cpasync.prefetch_descriptor(tma_atom_d_col)
 
         use_2cta_instrs = cute.size(tiled_mma.thr_id.shape) == 2
+        if cutlass.const_expr(self.use_single_group_runtime_offsets):
+            runtime_padded_offsets = cute.make_rmem_tensor((1,), cutlass.Int32)
+            runtime_padded_offsets[0] = cutlass.Int32(cute.size(mA_mkl.shape[0]))
+            padded_offsets = runtime_padded_offsets
         total_token = padded_offsets[self.expert_cnt - 1]
 
         #
