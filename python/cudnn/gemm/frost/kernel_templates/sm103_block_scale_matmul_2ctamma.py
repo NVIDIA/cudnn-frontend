@@ -869,7 +869,10 @@ def _kernel(
                                 for mi in cutlass.range_constexpr(num_mma_m):
                                     # B and its SF are shared by every M block; A's SF word block
                                     # follows the M block (SF words are one per 128 rows, packed
-                                    # M-fastest, registers_per_block columns apart).
+                                    # M-fastest, one utccp 128x4 atom apart -- registers_per_ATOM,
+                                    # which is NOT registers_per_block once a K=96 MMA
+                                    # needs more than 4 scales (nvfp4: 6). The utccp
+                                    # destination uses the same name so they cannot drift.
                                     desc_a = _sm103_make_circular_mma_desc(desc_a_circ[_ai][mi][_kc], _ph, desc_a_next[_ai][mi][_kn])
                                     if is_mma_leader:
                                         nvvm.tcgen05_mma_block_scale(
@@ -881,7 +884,7 @@ def _kernel(
                                             idesc_k,
                                             enable_input_d=scale_d,
                                             scale_a=nvvm.make_tmem_ptr(
-                                                sfa_tmem_bases[_ai] + sfa_mma_col_off_by_j[_pj] + mi * registers_per_block, cutlass.Float32
+                                                sfa_tmem_bases[_ai] + sfa_mma_col_off_by_j[_pj] + mi * registers_per_atom, cutlass.Float32
                                             ),
                                             scale_b=nvvm.make_tmem_ptr(sfb_tmem_bases[_bj] + sfb_mma_col_off_by_j[_pj], cutlass.Float32),
                                             scale_vec_size=scale_vec_size,
@@ -926,7 +929,7 @@ def _kernel(
                                             nvvm.tcgen05_cp(
                                                 s2t_shape,
                                                 nvvm.make_tmem_ptr(
-                                                    sfa_tmem_bases[_ai] + (num_blocks_m * (_grp * sf_atoms_per_group + _at) + _mh) * 4,
+                                                    sfa_tmem_bases[_ai] + (num_blocks_m * (_grp * sf_atoms_per_group + _at) + _mh) * registers_per_atom,
                                                     cutlass.Float32,
                                                 ),
                                                 desc_sfa_bases[_ai] + (sf_atom_desc_stride * _at + sf_group_block_desc_stride * _mh),
@@ -939,7 +942,7 @@ def _kernel(
                                             nvvm.tcgen05_cp(
                                                 s2t_shape,
                                                 nvvm.make_tmem_ptr(
-                                                    sfb_tmem_bases[_bj] + (num_blocks_n * (_grp * sf_atoms_per_group + _at) + _nh) * 4,
+                                                    sfb_tmem_bases[_bj] + (num_blocks_n * (_grp * sf_atoms_per_group + _at) + _nh) * registers_per_atom,
                                                     cutlass.Float32,
                                                 ),
                                                 desc_sfb_bases[_bj] + (sf_atom_desc_stride * _at + sf_group_block_desc_stride * _nh),
@@ -978,7 +981,10 @@ def _kernel(
                         for mi in cutlass.range_constexpr(num_mma_m):
                             # B and its SF are shared by every M block; A's SF word block
                             # follows the M block (SF words are one per 128 rows, packed
-                            # M-fastest, registers_per_block columns apart).
+                            # M-fastest, one utccp 128x4 atom apart -- registers_per_ATOM,
+                            # which is NOT registers_per_block once a K=96 MMA
+                            # needs more than 4 scales (nvfp4: 6). The utccp
+                            # destination uses the same name so they cannot drift.
                             desc_a = _sm103_make_circular_mma_desc(desc_a_circ[_ai][mi][_kc], _ph, desc_a_next[_ai][mi][_kn])
                             if is_mma_leader:
                                 nvvm.tcgen05_mma_block_scale(
@@ -989,7 +995,7 @@ def _kernel(
                                     desc_b,
                                     idesc_k,
                                     enable_input_d=scale_d,
-                                    scale_a=nvvm.make_tmem_ptr(sfa_tmem_bases[_ai] + sfa_mma_col_off_by_j[_pj] + mi * registers_per_block, cutlass.Float32),
+                                    scale_a=nvvm.make_tmem_ptr(sfa_tmem_bases[_ai] + sfa_mma_col_off_by_j[_pj] + mi * registers_per_atom, cutlass.Float32),
                                     scale_b=nvvm.make_tmem_ptr(sfb_tmem_bases[_bj] + sfb_mma_col_off_by_j[_pj], cutlass.Float32),
                                     scale_vec_size=scale_vec_size,
                                 )
