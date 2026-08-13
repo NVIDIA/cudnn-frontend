@@ -216,6 +216,207 @@ def _reduction_stride_kernel_params(chain: FusionChain) -> str:
     return ",\n".join(params) + "," if params else ""
 
 
+#: Kernel-parameter annotation -> (size in the device parameter block, kind).
+#: Sizes are the ABI's, not the annotation's: a tensor map is passed by value,
+#: and a tensor's size depends on how many symbols its fake carries.
+_PARAM_ABI = {
+    "cutlass.Int64": (8, "scalar"),
+    "cutlass.Int32": (4, "scalar"),
+    "cute.Pointer": (8, "ptr"),
+    "cutlass.GridConstant[_tma.TensorMap]": (128, "tma"),
+    "cute.Tensor": (None, "tensor"),
+}
+
+#: Symbols an aux fake's shape can carry, and the `problem_size` field each is.
+_SYM_AT = {"sym_m": 0, "sym_n": 1, "sym_l": 3}
+
+
+def _aux_tail_words(aux: TensorRef) -> "list[tuple] | None":
+    """The 8-byte words that follow an aux tensor's address in the parameter block.
+
+    A fake tensor arrives as its address plus one word per symbol in the shape
+    and stride expressions rendered above, in that order -- so a per-col bias
+    ships N, which the kernel's own `n` parameter already carries. Returns None
+    for a shape this cannot account for, which makes the slot `unknown`.
+    """
+    words = []
+    for tok in re.findall(r"sym_\w+", _aux_fake_shape_code(aux)):
+        if tok not in _SYM_AT:
+            return None
+        words.append(("problem_size", _SYM_AT[tok]))
+    if not _aux_can_use_explicit_fake_stride(aux):
+        # A rank-1 aux is rendered as a rank-2 broadcastable fake, so the strides
+        # that reach the device are not the ones the graph declared.
+        if len(aux.dim) != 3:
+            return None
+        words.extend(("aux_stride", i) for i in range(3))
+    return words
+
+
+#: What each tensor map was built from, so a caller knows which ones a changed
+#: quantity invalidates. Mirrors the `create_tensor_map_tiled` calls in the
+#: templates: A and its scale factors span m/k, B and its scale factors n/k, the
+#: output m/n -- each over the whole stride triple, since which two of the three
+#: a descriptor reads depends on the operand's major axis.
+_MAP_DEPS = {
+    "a": lambda i: ["m", "k", "batch"] + [f"a_stride_{ax}_{i}" for ax in "mkl"],
+    "sfa": lambda i: ["m", "k", "batch"] + [f"a_stride_{ax}_{i}" for ax in "mkl"],
+    "b": lambda j: ["n", "k", "batch"] + [f"b_stride_{ax}_{j}" for ax in "nkl"],
+    "sfb": lambda j: ["n", "k", "batch"] + [f"b_stride_{ax}_{j}" for ax in "nkl"],
+    "c": lambda i: ["m", "n", "batch"] + [f"out_stride_{ax}_{i}" for ax in "mnl"],
+}
+
+#: Grid axis each extent sizes, from the closed form the templates launch with.
+_GRID_AXIS = {"m": "x", "n": "y", "batch": "z"}
+
+
+def _patch_groups_src(entries: list, field: dict) -> str:
+    """Per caller-supplied quantity, every byte of the launch it reaches.
+
+    ``SLOT_TABLE`` answers "what is in slot k", which is what building the block
+    once needs. Reusing a built block needs the transpose -- "if m changes, what
+    do I rewrite" -- plus two things a per-slot view cannot carry: the tensor
+    maps a quantity was built into, and the grid axis it sizes.
+
+    An executor pairs this with its contract: hold everything fixed but the
+    addresses and it writes one word per operand; let m vary and it writes those
+    plus m's own group and re-encodes m's descriptors.
+    """
+    groups = {}
+
+    def at(var):
+        return groups.setdefault(var, {"writes": [], "maps": []})
+
+    for var in ("m", "n", "k", "batch"):
+        at(var)
+    for slot, _name, kind, size, source in entries:
+        if kind == "scalar":
+            at(field[source[1]])["writes"].append((slot, 0, size))
+        elif kind == "ptr":
+            at(f"addr_tap_{source[1]}")["writes"].append((slot, 0, 8))
+        elif kind == "tensor":
+            at(f"addr_aux_{source[1]}")["writes"].append((slot, 0, 8))
+            for w, word in enumerate(source[2]):
+                var = field[word[1]] if word[0] == "problem_size" else f"aux_stride_{source[1]}_{word[1]}"
+                at(var)["writes"].append((slot, 8 * (w + 1), 8))
+        elif kind == "tma":
+            role, idx = source
+            at(f"addr_{role}_{idx}")["writes"].append((slot, 0, 8))
+            for var in _MAP_DEPS[role](idx):
+                at(var)["maps"].append(slot)
+
+    rows = []
+    for var in sorted(groups):
+        d = groups[var]
+        rows.append(f"    {var!r}: ({tuple(d['writes'])!r}, {tuple(sorted(set(d['maps'])))!r}, {_GRID_AXIS.get(var)!r}),")
+    fields = tuple(field[i] for i in range(max(field) + 1))
+    return (
+        "\n\n# `problem_size` field names, in order -- what a PATCH_GROUPS key refers to.\n"
+        f"PROBLEM_FIELDS = {fields!r}\n"
+        "\n# Per caller-supplied quantity, what a rebuilt launch has to rewrite:\n"
+        "#   var -> (writes, maps, grid_axis)\n"
+        "#   writes    -- ((slot, byte_offset, width), ...), store the value there\n"
+        "#   maps      -- (slot, ...), descriptors built from it; re-encode or patch\n"
+        "#   grid_axis -- 'x' | 'y' | 'z' | None, the grid dimension it sizes\n"
+        "# An address group's writes reach a descriptor's first 8 bytes, so rebinding\n"
+        "# a TMA operand never re-encodes.\n"
+        "PATCH_GROUPS = {\n" + "\n".join(rows) + "\n}\n"
+    )
+
+
+def _slot_table_src(src: str, chain: FusionChain, na: int, nb: int) -> str:
+    """The kernel's parameter table, as data, read off the signature just rendered.
+
+    A caller that marshals kernel parameters itself needs to know, per slot, how
+    wide it is and where its value comes from. Both are decided here and thrown
+    away today: the signature is a string join in this module and the values are
+    unpacked positionally out of ``problem_size`` by the host function.
+
+    Read off the RENDERED signature rather than rebuilt alongside it, so the
+    table cannot drift from the kernel it describes. A parameter this does not
+    recognise is emitted as ``unknown`` with a null source -- the point of the
+    table is that a consumer can refuse a kernel it cannot fill, and a guess
+    would be worse than the refusal.
+    """
+    sig = re.search(r"@cute\.kernel\s*\ndef\s+\w+\(\n(.*?)\n\)\s*->", src, re.S)
+    if sig is None:
+        return ""
+    params = []
+    for line in sig.group(1).splitlines():
+        line = line.strip().rstrip(",")
+        if not line or line.startswith("#"):
+            continue
+        name, _, ann = line.partition(":")
+        params.append((name.strip(), ann.strip()))
+
+    # Where the host unpacks each scalar: `problem_size` is
+    # (m, n, k, batch) + 3 per A operand + 3 per B operand + 3 per output,
+    # reduction and quant-scale, in that order.
+    stride_base = 4 + 3 * na + 3 * nb
+    at = {"m": 0, "n": 1, "k": 2}
+    for i in range(len(chain.output_specs)):
+        for j, axis in enumerate("mnl"):
+            at[f"out_stride_{axis}_{i}"] = stride_base + 3 * i + j
+    off = len(chain.output_specs)
+    for i in range(len(chain.reductions)):
+        for j, axis in enumerate("mnl"):
+            at[f"red_stride_{axis}_{i}"] = stride_base + 3 * (off + i) + j
+    off += len(chain.reductions)
+    for i in range(len(chain.quants)):
+        for j, axis in enumerate("mnl"):
+            at[f"quant_scale_stride_{axis}_{i}"] = stride_base + 3 * (off + i) + j
+
+    # The same fields by name, for the transpose below.
+    field = {0: "m", 1: "n", 2: "k", 3: "batch"}
+    for i in range(na):
+        for j, axis in enumerate("mkl"):
+            field[4 + 3 * i + j] = f"a_stride_{axis}_{i}"
+    for j in range(nb):
+        for j2, axis in enumerate("nkl"):
+            field[4 + 3 * na + 3 * j + j2] = f"b_stride_{axis}_{j}"
+    for nm, idx in at.items():
+        field.setdefault(idx, nm)
+
+    aux_at = {aux.name: i for i, aux in enumerate(chain.aux_tensors)}
+    entries = []
+    for name, ann in params:
+        size, kind = _PARAM_ABI.get(ann, (None, "unknown"))
+        source = None
+        if kind == "scalar":
+            source = ("problem_size", at[name]) if name in at else None
+        elif kind == "tma":
+            m = re.fullmatch(r"tma_(a|b|c|sfa|sfb)_desc_(\d+)", name)
+            source = (m.group(1), int(m.group(2))) if m else None
+        elif kind == "ptr":
+            m = re.fullmatch(r"mC_tap_(\d+)", name)
+            source = ("tap", int(m.group(1))) if m else None
+        elif kind == "tensor":
+            words = _aux_tail_words(chain.aux_tensors[aux_at[name]]) if name in aux_at else None
+            if words is not None:
+                size = 8 + 8 * len(words)
+                source = ("aux", aux_at[name], tuple(words))
+        if source is None:
+            kind = "unknown"
+        entries.append((len(entries), name, kind, size, source))
+
+    rows = [f"    ({name!r}, {kind!r}, {size}, {source!r})," for _slot, name, kind, size, source in entries]
+    table = (
+        "\n\n# One entry per kernel parameter, in declaration order:\n"
+        "#   (name, kind, size_bytes, source)\n"
+        "# kind 'scalar' -> source is ('problem_size', index)\n"
+        "# kind 'tma'    -> source is ('a'|'b'|'c'|'sfa'|'sfb', operand index); build\n"
+        "#                  the descriptor the way _host does, from the constants above\n"
+        "# kind 'ptr'    -> source is ('tap', index), the buffer's address\n"
+        "# kind 'tensor' -> source is ('aux', index, words): the address, then one\n"
+        "#                  8-byte word per entry in `words`\n"
+        "# kind 'unknown'-> codegen has not classified it; refuse the kernel\n"
+        "SLOT_TABLE = (\n" + "\n".join(rows) + "\n)\n"
+    )
+    if any(kind == "unknown" for _slot, _name, kind, _size, _source in entries):
+        return table
+    return table + _patch_groups_src(entries, field)
+
+
 def _reduction_stride_host_unpack(chain: FusionChain) -> str:
     if not chain.output_specs and not chain.reductions and not chain.quants:
         return ""
@@ -1408,7 +1609,7 @@ def _render_template(
     tag = re.sub(r"[^A-Za-z0-9_]", "_", f"{tmpl.file.removesuffix('.py')}_{config.geometry_name}")
     src = re.sub(r"\b_kernel\(", f"cudnn_frost_{tag}(", src)
 
-    return src
+    return src + _slot_table_src(src, chain, na, nb)
 
 
 def _render_block_scale_template(
@@ -1590,7 +1791,7 @@ def _render_block_scale_template(
 
     tag = re.sub(r"[^A-Za-z0-9_]", "_", f"{tmpl.file.removesuffix('.py')}_{config.geometry_name}")
     src = re.sub(r"\b_kernel\(", f"cudnn_frost_{tag}(", src)
-    return src
+    return src + _slot_table_src(src, chain, na, nb)
 
 
 # ---------------------------------------------------------------------------
@@ -2110,7 +2311,10 @@ class CompiledFusedGemm:
             return launchable(
                 tuple(problem),
                 *(v.permute(1, 2, 0) for v in vs),
-                *(operands[i].permute(1, 2, 0) if ref is None else _reshape_aux_to_fake(operands[i], ref) for i, ref in tail),
+                *(
+                    operands[i].data_ptr() if as_ptr else (operands[i].permute(1, 2, 0) if ref is None else _reshape_aux_to_fake(operands[i], ref))
+                    for i, ref, as_ptr in tail
+                ),
                 stream=_as_custream(stream),
             )
 
@@ -2913,10 +3117,9 @@ class CompiledMoeGemm:
         )
         a = _maybe_wrap_layout(a_perm, _LEADING_DIM_A)
         b = _maybe_wrap_layout(b_perm, _LEADING_DIM_B)
-        cs = [
-            (_wrap_raw_tensor(ci) if (spec.is_reduction or spec.is_quant_scale) else _maybe_wrap_layout(ci, _LEADING_DIM_C))
-            for spec, ci in zip(outputs_spec, c_perms)
-        ]
+        # A tap takes a bare address: the epilogue reads the pointer and gets its
+        # strides from problem_size, so no wrapper reaches the kernel.
+        cs = [ci.data_ptr() for ci in c_perms]
         # A-descriptor workspace: one 128-byte tensormap slot per CTA.
         workspace = self._make_workspace(self._grid_ctas * self.chain.num_a_operands, workspace)
         return self._launchable(
@@ -3028,10 +3231,9 @@ class CompiledMoeGemm:
         )
         a_wrapped = [_maybe_wrap_layout(t.permute(1, 2, 0), _LEADING_DIM_A) for t in a_slots]
         b_wrapped = [_maybe_wrap_layout(t.permute(1, 2, 0), _LEADING_DIM_B) for t in b_slots]
-        cs = [
-            (_wrap_raw_tensor(ci) if (spec.is_reduction or spec.is_quant_scale) else _maybe_wrap_layout(ci, _LEADING_DIM_C))
-            for spec, ci in zip(outputs_spec, c_perms)
-        ]
+        # A tap takes a bare address: the epilogue reads the pointer and gets its
+        # strides from problem_size, so no wrapper reaches the kernel.
+        cs = [ci.data_ptr() for ci in c_perms]
         for ref, t in zip(chain.aux_tensors, aux):
             if ref.grouped_by_moe and (len(t.shape) != 3 or int(t.shape[0]) != num_groups):
                 raise ValueError(
@@ -3296,10 +3498,9 @@ class CompiledMoeBlockScaleGemm:
         )
         a = _maybe_wrap_layout(a_perm, _LEADING_DIM_A)
         b = _maybe_wrap_layout(b_perm, _LEADING_DIM_B)
-        cs = [
-            (_wrap_raw_tensor(ci) if (spec.is_reduction or spec.is_quant_scale) else _maybe_wrap_layout(ci, _LEADING_DIM_C))
-            for spec, ci in zip(outputs_spec, c_perms)
-        ]
+        # A tap takes a bare address: the epilogue reads the pointer and gets its
+        # strides from problem_size, so no wrapper reaches the kernel.
+        cs = [ci.data_ptr() for ci in c_perms]
         msfa = _maybe_wrap_layout(sfa.permute(1, 2, 0), _LEADING_DIM_AUX)
         msfb = _maybe_wrap_layout(sfb.permute(1, 2, 0), _LEADING_DIM_AUX)
         workspace = self._make_workspace(self._grid_ctas * self.chain.num_a_operands, workspace)
@@ -3427,10 +3628,9 @@ class CompiledMoeBlockScaleGemm:
         b_wrapped = [_maybe_wrap_layout(t.permute(1, 2, 0), _LEADING_DIM_B) for (t, _sf) in b_slots]
         sfa_wrapped = [_maybe_wrap_layout(sf.permute(1, 2, 0), _LEADING_DIM_AUX) for (_t, sf) in a_slots]
         sfb_wrapped = [_maybe_wrap_layout(sf.permute(1, 2, 0), _LEADING_DIM_AUX) for (_t, sf) in b_slots]
-        cs = [
-            (_wrap_raw_tensor(ci) if (spec.is_reduction or spec.is_quant_scale) else _maybe_wrap_layout(ci, _LEADING_DIM_C))
-            for spec, ci in zip(outputs_spec, c_perms)
-        ]
+        # A tap takes a bare address: the epilogue reads the pointer and gets its
+        # strides from problem_size, so no wrapper reaches the kernel.
+        cs = [ci.data_ptr() for ci in c_perms]
         for ref, t in zip(chain.aux_tensors, aux):
             if ref.grouped_by_moe and (len(t.shape) != 3 or int(t.shape[0]) != num_groups):
                 raise ValueError(

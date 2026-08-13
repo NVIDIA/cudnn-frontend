@@ -1314,8 +1314,8 @@ def generate(
     # STG mode: the tap list IS the full output list (dense, reductions,
     # scales). TMA mode: outputs[0] rides the template's C params instead.
     taps = list(chain.outputs) if not use_tma_store else chain.taps
-    tap_kernel_params = [f"mC_tap_{i}: cute.Tensor" for i in range(len(taps))]
-    tap_host_params = [f"c_tap_{i}: cute.Tensor" for i in range(len(taps))]
+    tap_kernel_params = [f"mC_tap_{i}: cute.Pointer" for i in range(len(taps))]
+    tap_host_params = [f"c_tap_{i}: cute.Pointer" for i in range(len(taps))]
     tap_host_pass = [f"c_tap_{i}" for i in range(len(taps))]
     tap_compile_fakes: list[str] = []
     # Per-slot true store alignment (matches _alignment_reject's contract); 16 is
@@ -1332,20 +1332,13 @@ def generate(
         # would silently wrap the _out_reqs lookup.
         _si = i - dense_tap_shift
         assert 0 <= _si < len(_out_reqs), f"tap {i} maps to output slot {_si}, outside chain.outputs ({len(_out_reqs)})"
-        _n_major_dense = (not tap.is_reduction) and (not tap.is_quant_scale) and _si < len(specs) and specs[_si].major == "n"
-        _stride = "(cute.sym_int64(), 1, cute.sym_int64())" if _n_major_dense else "(cute.sym_int64(), cute.sym_int64(), cute.sym_int64())"
-        tap_compile_fakes.append(
-            f"fake_c_tap_{i} = cute.runtime.make_fake_tensor(\n"
-            f"    {_fake_dt},\n"
-            f"    {_tap_fake_shape(tap, chain)},\n"
-            f"    stride={_stride},\n"
-            f"    assumed_align={_out_reqs[_si]},\n"
-            f")"
-        )
+        tap_compile_fakes.append(f"fake_c_tap_{i} = cute.runtime.nullptr({_fake_dt}, assumed_align={_out_reqs[_si]})")
     tap_compile_pass = [f"fake_c_tap_{i}" for i in range(len(taps))]
     tap_ptr_binds: list[str] = []
     for i in range(len(taps)):
-        tap_ptr_binds.append(f"gC_tap_{i}_ptr = mC_tap_{i}.iterator.raw_ptr()")
+        # raw_ptr() is the base-DSL pointer whose store() takes an alignment;
+        # the cute Pointer the parameter arrives as does not.
+        tap_ptr_binds.append(f"gC_tap_{i}_ptr = mC_tap_{i}.raw_ptr()")
         tap_ptr_binds.append(f"VEC_BYTES_TAP_{i} = vec_bytes_tap_{i}")
     # vsize is the shared COMPUTE chunk; each tap's STORE width is capped at
     # MAX_MEM_ACCESS_BYTES (a wide dtype under a block-quant splits into sub-stores).
