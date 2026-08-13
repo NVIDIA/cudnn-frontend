@@ -11,4 +11,4 @@
 
 ## Acknowledgements
 
-The DSA/CSA kernels were a collaborative effort, jointly developed by: Hongxiao Bai, Jiayu Sun and Jie Fang
+The DSA/CSA kernels were a collaborative effort, jointly developed by: Hongxiao Bai, Jiayu Sun, Jerry Chen, Jie Fang, Qi Zhang, Bin Chai and Yue Weng
