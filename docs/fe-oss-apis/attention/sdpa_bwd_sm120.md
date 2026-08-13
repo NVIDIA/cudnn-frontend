@@ -20,7 +20,8 @@ Two integration surfaces are provided:
 
 The kernel lives at `python/cudnn/sdpa/bwd/kernels/bprop_f16_sm120.py`
 (one fused five-GEMM main kernel, plus a `dot` preprocess and a `cvt`
-dQ-finalize kernel per call).
+dQ-finalize kernel per call; GQA/MQA adds a fourth `reduce` kernel that sums
+the per-q-head dK/dV partials).
 
 ## Requirements
 
@@ -38,8 +39,14 @@ grads = sdpa_bwd_wrapper_dsl_sm120(
     is_causal=True,
     causal_bottom_right=False,
     window_size_left=None,   # W: keys with k < q + diag - W are masked
+    window_size_right=None,  # R: widen the causal diagonal right by R keys
+                             # (keep k <= q + diag + R
     deterministic=False,     # ordered dQ KV-tile reduction (bitwise-reproducible)
     scale_softmax=None,      # None -> 1/sqrt(D)
+    seq_q_lens=None,         # (B,) int32 per-batch Q lengths (padding mask)
+    seq_kv_lens=None,        # (B,) int32 per-batch KV lengths (padding mask)
+    sink_token=None,         # fp32 (1, H_q, 1, 1) sink logits; adds dsink_tensor
+                             # to the result
 )
 dq, dk, dv = grads["dq_tensor"], grads["dk_tensor"], grads["dv_tensor"]
 ```
@@ -47,7 +54,8 @@ dq, dk, dv = grads["dq_tensor"], grads["dk_tensor"], grads["dv_tensor"]
 Tensors are logical `(B, H, S, D)`; any dense layout with the head dim
 innermost-contiguous is accepted (`dense_flex`) — non-BSHD-compact operands
 are staged through workspace copies. `stats` is the natural-log forward LSE,
-fp32 `(B, H, S_q, 1)` contiguous.
+fp32 `(B, H, S_q, 1)` contiguous. GQA/MQA is expressed through the head
+counts: `H_kv` may be any divisor of `H_q` (K/V and dK/dV carry `H_kv` heads).
 
 Through the graph API, per-plan sequence-tile-width knobs can be requested via
 `SdpaBwdKnobs`: `tile_m` controls the Q tile (`q_tile`), and `tile_n` controls
@@ -60,30 +68,36 @@ can be bitwise non-deterministic when a q-tile receives contributions from
 multiple KV-tile CTAs. `deterministic=True` serializes the per-`(batch, head,
 q_tile)` additions in ascending KV-tile order through a GMEM turn-counter
 array (the FlashAttention-style ordered-reduction relay). dK/dV are
-deterministic in both modes. This maps to the graph API's
+deterministic in both modes — including under GQA, where the group reduction
+runs in a fixed q-head order. This maps to the graph API's
 `use_deterministic_algorithm` and costs a shape-dependent slowdown of the main
 kernel while keeping the workspace linear in sequence length.
 
 ## Kernel design and optimizations
 
-### The three-kernel chain
+### The kernel chain
 
-One backward call is three launches, overlapped with programmatic dependent
-launch (PDL) so each kernel's prologue runs under its predecessor's tail:
+One backward call is three launches (four under GQA), overlapped with
+programmatic dependent launch (PDL) so each kernel's prologue runs under its
+predecessor's tail:
 
-```
-dot   delta = rowsum(O ∘ dO); zeroes dq_accum (and, when deterministic, the relay counters)
-main  the fused five-GEMM pass; writes dK/dV, accumulates dQ into dq_accum
-cvt   dq_accum (fp32, scrambled) -> dQ (io dtype), applying attn_scale
+```text
+dot     delta = rowsum(O ∘ dO); zeroes dq_accum (and, when deterministic, the relay counters)
+main    the fused five-GEMM pass; writes dK/dV into dk_ws/dv_ws (aliased to the dk/dv
+        outputs for MHA, per-q-head partial buffers for GQA); accumulates dQ into dq_accum
+reduce  GQA only: dK/dV = fixed-order sum of each KV head's group of q-head partials
+cvt     dq_accum (fp32, scrambled) -> dQ (io dtype), applying attn_scale
+dsink   dSink_token graphs only, summing over every batch b and query row q:
+        dsink[h] = -sum_{b,q} exp(sink[h] - LSE[b,h,q]) * delta[b,h,q]
 ```
 
 ### Main-kernel pipeline: KV-stationary, five chained GEMMs
 
-Grid is `(num_kv_tiles, H, B)` — one CTA owns one KV tile, loads K/V **once**,
-and walks every q-tile of its (batch, head) in descending order. Per q-tile
-iteration:
+Grid is `(num_kv_tiles, H_q, B)` — one CTA owns one KV tile of one **query**
+head (its KV head is `q_head // group`), loads K/V **once**, and walks every
+q-tile of its (batch, head) in descending order. Per q-tile iteration:
 
-```
+```text
 GEMM1  S  = Q · Kᵀ            (K streamed from SMEM)
        P  = exp2((scale·S − LSE) · log2(e))   replay from natural-log LSE
 GEMM2  dP = dO · Vᵀ           (V resident in registers after one ldmatrix pass)
@@ -152,20 +166,52 @@ reduces dQ atomic traffic, and the `cvt` kernel un-scrambles it while converting
 to the I/O dtype. `dot` pre-zeroes the workspace (fused with the delta
 reduction; PDL orders it before `main`'s first add).
 
-### Causal and sliding-window masks
+### GQA/MQA group reduction
+
+Under GQA the chain rule sums each KV head's gradient over its group of
+`group = H_q / H_kv` query heads: `dK[kv_head] = Σ dK-contribution[q_head]`
+(same for dV); dQ is unaffected. The grid stays per query head — shrinking it
+by `group` would starve the GPU at small `B·H_kv`, and the kernel is
+compute-bound, so K/V-load reuse from walking the group in one CTA is not
+worth that trade. Instead each CTA writes its q head's dK/dV epilogue tiles to
+`dk_ws`/`dv_ws`, io-dtype buffers with an `H_q`-sized head axis (one slot per
+query head, so the group's partials coexist), and a lightweight `reduce`
+kernel then produces dK/dV: one thread per 16-byte output vector, accumulating
+the group's slices in fp32 in fixed q-head order — bandwidth-bound and bitwise
+deterministic by construction. For MHA (`H_q == H_kv`) the buffers alias the
+`dk`/`dv` outputs themselves — the same epilogue writes the results directly,
+nothing extra is carved, and no `reduce` kernel is launched.
+
+### Causal, sliding-window, and padding masks
 
 Masking is applied twice, cheaply:
 
 * **Loop bounds** do the heavy lifting: causal clamps the first q-tile
-  (`q_block_min`, bottom-right via `diag_off = S_kv − S_q`), a left window
-  clamps the last (`q_block_max`) — fully-masked tiles are never visited, so
-  square causal attention runs roughly half as many tile iterations.
+  (`q_block_min`, bottom-right via `diag_off = S_kv − S_q`, a right band via
+  the compile-time widening `q_block_min = (kv_base − diag_off − R) / tile_q`),
+  a left window clamps the last (`q_block_max`) — fully-masked tiles are never
+  visited, so square causal attention runs roughly half as many tile
+  iterations.
 * **In-register score masking** runs only on tiles that straddle a mask edge
-  (`do_mask_causal` / `do_mask_window` gates); interior tiles skip it.
+  (`do_mask_causal` / `do_mask_window` / `do_mask_pad` gates); interior tiles
+  skip it.
 
 The softmax replay guards fully-masked rows (forward `LSE = −inf`) by
 substituting `+inf`, reconstructing `P = 0` instead of NaN. Non-tile-multiple
 sequence tails are handled with load clamps and store row-gates.
+
+**Padding mask** (per-batch `seq_kv_lens`, optionally `seq_q_lens`) reuses
+both layers: `q_block_max` trims to `ceil(seq_q_lens[b] / tile_q)` and a KV
+tile fully inside the pad drains without loads or compute, while boundary
+tiles mask scores at `seq_kv_lens[b]`. With bottom-right alignment the
+diagonal anchors at the **actual** lengths (`diag_off = seq_kv_lens[b] −
+seq_q_lens[b]`), matching the SM120 forward kernel and cuDNN padded-graph
+semantics. Q rows at or past `seq_q_lens[b]` ride on the forward's
+`LSE = −inf` convention (`P = 0`), so `dQ` rows past `seq_q_lens[b]` and
+`dK`/`dV` rows past `seq_kv_lens[b]` come out exactly zero. The length
+tensors are `None`-specialized kernel parameters: a specialization built
+without them carries neither the parameters nor any padding code, and
+needs no extra workspace either way.
 
 ### Deterministic vs. non-deterministic dQ
 
@@ -191,10 +237,20 @@ only the unused relay operand remains in the kernel ABI.
 - Dtypes: FP16 / BF16 (LSE fp32)
 - Head dims: 32/64/128/192/256 natively; any other multiple of 8 up to 256 is
   served by zero-padding D to the next supported size (`d_qk == d_v`)
-- Masks: none, causal (top-left or bottom-right), sliding window
-  (left-window offset, with or without causal)
-- Equal Q/KV head counts (no GQA/MQA); no dropout / bias / ALiBi / sinks /
-  softcap / THD
+- Masks: none, causal (top-left or bottom-right), right-band-widened causal
+  (`diagonal_band_right_bound` > 0, the causal diagonal shifted right by a
+  compile-time R), sliding window (left-window offset, with or without
+  causal), padding (per-batch `seq_kv_len` required, `seq_q_len` optional;
+  composes with the other masks)
+- GQA/MQA: any `H_kv` dividing `H_q` (including `H_kv == 1`)
+- Sink tokens: sink logits input and optional `dSink_token` output. dQ/dK/dV
+  need no sink code (the forward LSE already folds the sink into the softmax
+  denominator); the `dSink_token` output adds one tiny `dsink` reduce kernel
+  (`dsink[h] = -sum p_sink * delta`, fixed order — bitwise deterministic in
+  both modes)
+- No dropout / bias / ALiBi / softcap / THD
 - Workspace (carved from the caller's buffer): fp32 `delta` and `dq_accum`
-  scratch plus int32 relay-counter storage (reserved in both modes); padded-D
-  and non-compact layouts add staging copies
+  scratch plus int32 relay-counter storage (reserved in both modes); GQA adds
+  the io-dtype `dk_ws`/`dv_ws` partials buffers (`B·S_kv·H_q·D_padded`
+  elements each, where `D_padded` is the adapter's zero-padded head
+  dimension); use `scratch_workspace_bytes()` for the exact total

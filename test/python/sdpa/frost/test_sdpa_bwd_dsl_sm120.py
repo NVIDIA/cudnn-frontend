@@ -68,6 +68,9 @@ def _ref_bwd(
     is_causal: bool = False,
     causal_bottom_right: bool = False,
     window_size_left: int | None = None,
+    window_size_right: int | None = None,
+    padding: tuple[list[int], list[int]] | None = None,
+    sink_token: torch.Tensor | None = None,
 ):
     """Reference via the canonical refs (sdpa/fp16_ref.py)."""
 
@@ -75,24 +78,59 @@ def _ref_bwd(
     from sdpa.fp16_ref import compute_ref, compute_ref_backward
 
     diag_align = cudnn.diagonal_alignment.BOTTOM_RIGHT if causal_bottom_right else cudnn.diagonal_alignment.TOP_LEFT
-    right_bound = 0 if is_causal else None
+    right_bound = window_size_right if window_size_right is not None else (0 if is_causal else None)
     # The refs take the cuDNN window LENGTH; window_size_left is the offset W = L - 1.
     left_bound = None if window_size_left is None else window_size_left + 1
-    o_ref, stats_ref, _, _ = compute_ref(q, k, v, attn_scale=scale, diag_align=diag_align, right_bound=right_bound, left_bound=left_bound, torch_type=q.dtype)
-    dq, dk, dv, _, _ = compute_ref_backward(
-        q, k, v, o_ref, do, attn_scale=scale, diag_align=diag_align, right_bound=right_bound, left_bound=left_bound, torch_type=q.dtype
+    o_ref, stats_ref, _, _ = compute_ref(
+        q,
+        k,
+        v,
+        attn_scale=scale,
+        diag_align=diag_align,
+        right_bound=right_bound,
+        left_bound=left_bound,
+        padding=padding,
+        sink_token=sink_token,
+        torch_type=q.dtype,
     )
-    return o_ref.to(q.dtype), stats_ref.contiguous(), dq.to(q.dtype), dk.to(q.dtype), dv.to(q.dtype)
+    dq, dk, dv, _, dsink = compute_ref_backward(
+        q,
+        k,
+        v,
+        o_ref,
+        do,
+        attn_scale=scale,
+        diag_align=diag_align,
+        right_bound=right_bound,
+        left_bound=left_bound,
+        padding=padding,
+        sink_token=sink_token,
+        torch_type=q.dtype,
+    )
+    return o_ref.to(q.dtype), stats_ref.contiguous(), dq.to(q.dtype), dk.to(q.dtype), dv.to(q.dtype), dsink
 
 
-def _expected_workspace_bytes(batch: int, heads: int, s_q: int, head_dim: int, staged: tuple[torch.Tensor, ...] = ()) -> int:
+def _expected_workspace_bytes(
+    batch: int,
+    h_q: int,
+    s_q: int,
+    head_dim: int,
+    staged: tuple[torch.Tensor, ...] = (),
+    h_kv: int | None = None,
+    s_kv: int | None = None,
+    io_itemsize: int = 2,
+) -> int:
     from cudnn.sdpa.bwd.config_sm120 import padded_head_dim
     from cudnn.sdpa.fwd.api_dsl import ws_align
 
     d_pad = padded_head_dim(head_dim)
     sq_r = -(-s_q // 128) * 128
-    dq_sem = batch * heads * (-(-s_q // 32))  # int32 relay counters (min q-tile 32)
-    base = ws_align(batch * heads * sq_r * 4) + ws_align(batch * sq_r * heads * d_pad * 4) + ws_align(dq_sem * 4)
+    h_kv = h_q if h_kv is None else h_kv
+    s_kv_eff = s_kv if s_kv is not None else s_q
+    dq_sem = batch * h_q * (-(-s_q // 32))  # int32 relay counters (min q-tile 32)
+    # dk_ws/dv_ws GQA partials buffers in the io dtype (none carved for MHA, where the main kernel writes dk/dv directly)
+    dkv_ws_half = 0 if h_kv == h_q else batch * s_kv_eff * h_q * d_pad * io_itemsize
+    base = ws_align(batch * h_q * sq_r * 4) + ws_align(batch * sq_r * h_q * d_pad * 4) + ws_align(dq_sem * 4) + 2 * ws_align(dkv_ws_half)
     # Padded-width staging copy per non-BSHD-compact operand (all when D pads).
     staging = sum(ws_align(t.numel() // head_dim * d_pad * t.element_size()) for t in staged if d_pad != head_dim or not t.transpose(1, 2).is_contiguous())
     return base + staging
@@ -110,13 +148,17 @@ def _run_bwd_graph(
     is_causal: bool = False,
     causal_bottom_right: bool = False,
     window_size_left: int | None = None,
+    window_size_right: int | None = None,
     deterministic: bool = False,
     select: bool = True,
     q_tile: int | None = None,
     kv_tile: int | None = None,
     grad_layout: str = "bshd",
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, str]:
-    """Build and execute the SM120 FROST backward graph; returns (dq, dk, dv, plan_name)."""
+    seq_q_lens: torch.Tensor | None = None,
+    seq_kv_lens: torch.Tensor | None = None,
+    sink_gpu: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, "torch.Tensor | None", str]:
+    """Build and execute the SM120 FROST backward graph; returns (dq, dk, dv, dsink, plan_name)."""
 
     _require_dsl()
     import cudnn
@@ -151,14 +193,32 @@ def _run_bwd_graph(
         "stats": stats,
         "attn_scale": scale,
     }
-    if causal_bottom_right:
-        bwd_kwargs["use_causal_mask_bottom_right"] = True
-    elif is_causal:
-        bwd_kwargs["use_causal_mask"] = True
-    if window_size_left is not None:
-        bwd_kwargs["sliding_window_length"] = window_size_left + 1
+    if window_size_right is not None:
+        bwd_kwargs["diagonal_band_right_bound"] = window_size_right
+        bwd_kwargs["diagonal_alignment"] = cudnn.diagonal_alignment.BOTTOM_RIGHT if causal_bottom_right else cudnn.diagonal_alignment.TOP_LEFT
+        if window_size_left is not None:
+            bwd_kwargs["diagonal_band_left_bound"] = window_size_left + 1
+    else:
+        if causal_bottom_right:
+            bwd_kwargs["use_causal_mask_bottom_right"] = True
+        elif is_causal:
+            bwd_kwargs["use_causal_mask"] = True
+        if window_size_left is not None:
+            bwd_kwargs["sliding_window_length"] = window_size_left + 1
     if deterministic:
         bwd_kwargs["use_deterministic_algorithm"] = True
+    sink_t = dsink_t = dsink_gpu = None
+    if sink_gpu is not None:
+        sink_t = graph.tensor_like(sink_gpu, name="sink")
+        dsink_gpu = torch.empty_like(sink_gpu)
+        dsink_t = graph.tensor_like(dsink_gpu, name="dSink")
+        bwd_kwargs.update(sink_token=sink_t, dSink_token=dsink_t)
+    seq_q_t = seq_kv_t = None
+    if seq_q_lens is not None or seq_kv_lens is not None:
+        assert seq_q_lens is not None and seq_kv_lens is not None
+        seq_q_t = graph.tensor_like(seq_q_lens, name="seq_q")
+        seq_kv_t = graph.tensor_like(seq_kv_lens, name="seq_kv")
+        bwd_kwargs.update(use_padding_mask=True, seq_len_q=seq_q_t, seq_len_kv=seq_kv_t)
 
     dq, dk, dv = graph.sdpa_backward(**bwd_kwargs)
     dq.set_output(True).set_dim(dq_gpu.shape).set_stride(dq_gpu.stride())
@@ -191,7 +251,9 @@ def _run_bwd_graph(
     workspace_size = graph.get_workspace_size()
     if plan_name == ENGINE:
         staged = (q_gpu, k_gpu, v_gpu, o_gpu, do_gpu, dq_gpu, dk_gpu, dv_gpu)
-        assert workspace_size == _expected_workspace_bytes(batch, h_q, q_gpu.shape[2], head_dim, staged)
+        assert workspace_size == _expected_workspace_bytes(
+            batch, h_q, q_gpu.shape[2], head_dim, staged, h_kv=h_kv, s_kv=k_gpu.shape[2], io_itemsize=q_gpu.element_size()
+        )
     workspace = torch.empty(max(workspace_size, 1), dtype=torch.uint8, device="cuda")
 
     variant_pack = {
@@ -205,9 +267,13 @@ def _run_bwd_graph(
         dk: dk_gpu,
         dv: dv_gpu,
     }
+    if seq_q_t is not None:
+        variant_pack.update({seq_q_t: seq_q_lens, seq_kv_t: seq_kv_lens})
+    if sink_t is not None:
+        variant_pack.update({sink_t: sink_gpu, dsink_t: dsink_gpu})
     graph.execute(variant_pack, workspace)
     torch.cuda.synchronize()
-    return dq_gpu, dk_gpu, dv_gpu, plan_name
+    return dq_gpu, dk_gpu, dv_gpu, dsink_gpu, plan_name
 
 
 def _tolerances(dtype: torch.dtype) -> dict:
@@ -217,7 +283,8 @@ def _tolerances(dtype: torch.dtype) -> dict:
 def _run_case(
     *,
     batch: int = 2,
-    heads: int = 4,
+    h_q: int = 4,
+    h_kv: int | None = None,
     s_q: int = 512,
     s_kv: int = 512,
     head_dim: int = 64,
@@ -225,23 +292,42 @@ def _run_case(
     is_causal: bool = False,
     causal_bottom_right: bool = False,
     window_size_left: int | None = None,
+    window_size_right: int | None = None,
     deterministic: bool = False,
     select: bool = True,
     q_tile: int | None = None,
     kv_tile: int | None = None,
     layout: str = "bshd",
     grad_layout: str = "bshd",
+    padding: tuple[list[int], list[int]] | None = None,
+    sink: bool = False,
 ) -> str:
+    h_kv = h_q if h_kv is None else h_kv
     scale = 1.0 / math.sqrt(head_dim)
-    q = _bhsd(batch, heads, s_q, head_dim, dtype, layout=layout)
-    k = _bhsd(batch, heads, s_kv, head_dim, dtype, layout=layout)
-    v = _bhsd(batch, heads, s_kv, head_dim, dtype, layout=layout)
-    do = _bhsd(batch, heads, s_q, head_dim, dtype, layout=layout)
-    o, stats, dq_ref, dk_ref, dv_ref = _ref_bwd(
-        q, k, v, do, scale=scale, is_causal=is_causal, causal_bottom_right=causal_bottom_right, window_size_left=window_size_left
+    q = _bhsd(batch, h_q, s_q, head_dim, dtype, layout=layout)
+    k = _bhsd(batch, h_kv, s_kv, head_dim, dtype, layout=layout)
+    v = _bhsd(batch, h_kv, s_kv, head_dim, dtype, layout=layout)
+    do = _bhsd(batch, h_q, s_q, head_dim, dtype, layout=layout)
+    sink_gpu = torch.randn(1, h_q, 1, 1, dtype=torch.float32, device="cuda") if sink else None
+    o, stats, dq_ref, dk_ref, dv_ref, dsink_ref = _ref_bwd(
+        q,
+        k,
+        v,
+        do,
+        scale=scale,
+        is_causal=is_causal,
+        causal_bottom_right=causal_bottom_right,
+        window_size_left=window_size_left,
+        window_size_right=window_size_right,
+        padding=padding,
+        sink_token=sink_gpu,
     )
-    o = _bhsd(batch, heads, s_q, head_dim, dtype, empty=True, layout=layout).copy_(o)
-    dq, dk, dv, plan_name = _run_bwd_graph(
+    o = _bhsd(batch, h_q, s_q, head_dim, dtype, empty=True, layout=layout).copy_(o)
+    seq_q_lens = seq_kv_lens = None
+    if padding is not None:
+        seq_q_lens = torch.tensor(padding[0], dtype=torch.int32, device="cuda").view(batch, 1, 1, 1)
+        seq_kv_lens = torch.tensor(padding[1], dtype=torch.int32, device="cuda").view(batch, 1, 1, 1)
+    dq, dk, dv, dsink, plan_name = _run_bwd_graph(
         q,
         k,
         v,
@@ -252,16 +338,29 @@ def _run_case(
         is_causal=is_causal,
         causal_bottom_right=causal_bottom_right,
         window_size_left=window_size_left,
+        window_size_right=window_size_right,
         deterministic=deterministic,
         select=select,
         q_tile=q_tile,
         kv_tile=kv_tile,
         grad_layout=grad_layout,
+        seq_q_lens=seq_q_lens,
+        seq_kv_lens=seq_kv_lens,
+        sink_gpu=sink_gpu,
     )
     tol = _tolerances(dtype)
     torch.testing.assert_close(dq.float(), dq_ref.float(), **tol)
     torch.testing.assert_close(dk.float(), dk_ref.float(), **tol)
     torch.testing.assert_close(dv.float(), dv_ref.float(), **tol)
+    if sink:
+        torch.testing.assert_close(dsink.float(), dsink_ref.float(), **tol)
+    if padding is not None:
+        for b, (len_q, len_kv) in enumerate(zip(*padding)):
+            if len_q < s_q:
+                assert dq[b, :, len_q:, :].abs().max().item() == 0.0, f"batch {b}: dQ padded rows must be exactly zero"
+            if len_kv < s_kv:
+                assert dk[b, :, len_kv:, :].abs().max().item() == 0.0, f"batch {b}: dK padded rows must be exactly zero"
+                assert dv[b, :, len_kv:, :].abs().max().item() == 0.0, f"batch {b}: dV padded rows must be exactly zero"
     return plan_name
 
 
@@ -316,7 +415,7 @@ def test_sdpa_bwd_dsl_sm120_causal_br_sq_gt_skv(s_q: int, s_kv: int):
     k = _bhsd(batch, heads, s_kv, head_dim, dtype)
     v = _bhsd(batch, heads, s_kv, head_dim, dtype)
     do = _bhsd(batch, heads, s_q, head_dim, dtype)
-    o, stats, dq_ref, dk_ref, dv_ref = _ref_bwd(q, k, v, do, scale=scale, is_causal=True, causal_bottom_right=True)
+    o, stats, dq_ref, dk_ref, dv_ref, _ = _ref_bwd(q, k, v, do, scale=scale, is_causal=True, causal_bottom_right=True)
     o = _bhsd(batch, heads, s_q, head_dim, dtype, empty=True).copy_(o)
     out = sdpa_bwd_wrapper_dsl_sm120(q, k, v, o, do, stats, is_causal=True, causal_bottom_right=True, scale_softmax=scale)
     tol = _tolerances(dtype)
@@ -387,6 +486,175 @@ def test_sdpa_bwd_dsl_sm120_sliding_window_tails():
 
 
 @pytest.mark.L0
+@torch_fork_set_rng(seed=46)
+def test_sdpa_bwd_dsl_sm120_right_band():
+    """diagonal_band_right_bound > 0: the causal diagonal widened right by a
+    compile-time R (keep kv <= q + diag + R)."""
+
+    _run_case(s_q=256, s_kv=256, head_dim=64, window_size_right=32)  # top-left band
+    _run_case(s_q=192, s_kv=320, head_dim=64, causal_bottom_right=True, window_size_right=48)  # bottom-right anchor
+    _run_case(s_q=256, s_kv=256, head_dim=64, window_size_left=64, window_size_right=32)  # full band
+    _run_case(s_q=193, s_kv=257, head_dim=128, window_size_right=24)  # ragged tails
+    _run_case(s_q=128, s_kv=128, head_dim=64, window_size_right=300)  # R >= S_kv clamps to dense
+    _run_case(s_q=256, s_kv=256, head_dim=64, window_size_right=32, deterministic=True)  # relay turns unaffected by R
+    _run_case(
+        s_q=256,
+        s_kv=256,
+        head_dim=64,
+        causal_bottom_right=True,
+        window_size_right=48,
+        window_size_left=96,
+        padding=([230, 120], [180, 240]),
+    )  # per-batch diagonal + R
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=49)
+def test_sdpa_bwd_dsl_sm120_sink():
+    """Sink attention"""
+
+    _run_case(s_q=256, s_kv=256, head_dim=64, sink=True)  # dense
+    _run_case(s_q=256, s_kv=256, head_dim=64, is_causal=True, sink=True)  # causal
+    _run_case(h_q=8, h_kv=2, s_q=256, s_kv=256, head_dim=64, sink=True)  # GQA
+    _run_case(s_q=256, s_kv=256, head_dim=64, sink=True, deterministic=True)  # fixed-order reduce
+    _run_case(s_q=193, s_kv=257, head_dim=128, is_causal=True, sink=True)  # ragged tails
+    _run_case(s_q=256, s_kv=256, head_dim=64, sink=True, padding=([230, 120], [180, 240]))  # padded rows skip (LSE = -inf guard)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("mask", ["dense", "causal_tl", "causal_br"])
+@torch_fork_set_rng(seed=20)
+def test_sdpa_bwd_dsl_sm120_padding_mask(mask: str):
+    """Padding mask (per-batch seq lens): full-length, tile-boundary, and
+    sub-tile batches; bottom-right diagonals anchor at the actual lengths."""
+
+    _run_case(
+        batch=3,
+        s_q=512,
+        s_kv=512,
+        head_dim=64,
+        is_causal=mask != "dense",
+        causal_bottom_right=mask == "causal_br",
+        padding=([512, 300, 17], [512, 128, 65]),
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=21)
+def test_sdpa_bwd_dsl_sm120_padding_mask_tails():
+    """Padding mask on top of non-tile-multiple global sequence tails."""
+
+    _run_case(
+        batch=2,
+        s_q=193,
+        s_kv=257,
+        head_dim=128,
+        is_causal=True,
+        padding=([193, 100], [200, 33]),
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=22)
+def test_sdpa_bwd_dsl_sm120_padding_sliding_window():
+    """Padding mask + bottom-right sliding window (the window follows the
+    per-batch diagonal anchor)."""
+
+    _run_case(
+        batch=3,
+        s_q=512,
+        s_kv=512,
+        head_dim=64,
+        is_causal=True,
+        causal_bottom_right=True,
+        window_size_left=127,
+        padding=([512, 300, 65], [512, 260, 64]),
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=23)
+def test_sdpa_bwd_dsl_sm120_padding_zero_lengths():
+    """Zero-length batches: seq_len_kv[b] == 0 (no visible key) and
+    seq_len_q[b] == 0 (no query) drain to all-zero gradients."""
+
+    _run_case(
+        batch=3,
+        s_q=512,
+        s_kv=512,
+        head_dim=64,
+        padding=([512, 0, 33], [0, 512, 48]),
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=27)
+def test_sdpa_bwd_dsl_sm120_padding_gqa():
+    """Padding mask composes with GQA: the group-reduce sums per-q-head
+    partials whose padded rows are zero, so dK/dV padding stays exactly zero."""
+
+    _run_case(
+        batch=3,
+        h_q=4,
+        h_kv=2,
+        s_q=512,
+        s_kv=512,
+        head_dim=64,
+        is_causal=True,
+        causal_bottom_right=True,
+        padding=([512, 300, 17], [512, 128, 65]),
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=29)
+def test_sdpa_bwd_dsl_sm120_padding_rejects_cpu_seq_lens():
+    """A CPU length tensor must be rejected up front — the kernel would
+    otherwise receive a host pointer (illegal access or garbage lengths)."""
+
+    _require_dsl()
+    from cudnn.sdpa.bwd.api_dsl import sdpa_bwd_wrapper_dsl_sm120
+
+    batch, heads, s, head_dim, dtype = 2, 4, 256, 64, torch.float16
+    q = _bhsd(batch, heads, s, head_dim, dtype)
+    k = _bhsd(batch, heads, s, head_dim, dtype)
+    v = _bhsd(batch, heads, s, head_dim, dtype)
+    do = _bhsd(batch, heads, s, head_dim, dtype)
+    o = torch.zeros_like(q)  # never consumed: execute rejects before launching
+    stats = torch.zeros(batch, heads, s, 1, dtype=torch.float32, device="cuda")
+    with pytest.raises(ValueError, match="seq_kv_lens must be on"):
+        sdpa_bwd_wrapper_dsl_sm120(q, k, v, o, do, stats, seq_kv_lens=torch.tensor([s, s], dtype=torch.int32))
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=25)
+def test_sdpa_bwd_dsl_sm120_padding_kv_only_wrapper():
+    """KV-only padding through the direct wrapper: seq_q_lens omitted means
+    every batch runs the full S_q."""
+
+    _require_dsl()
+    from cudnn.sdpa.bwd.api_dsl import sdpa_bwd_wrapper_dsl_sm120
+
+    batch, heads, s_q, s_kv, head_dim, dtype = 2, 4, 512, 512, 64, torch.float16
+    scale = 1.0 / math.sqrt(head_dim)
+    kv_lens = [317, 64]
+    q = _bhsd(batch, heads, s_q, head_dim, dtype)
+    k = _bhsd(batch, heads, s_kv, head_dim, dtype)
+    v = _bhsd(batch, heads, s_kv, head_dim, dtype)
+    do = _bhsd(batch, heads, s_q, head_dim, dtype)
+    o, stats, dq_ref, dk_ref, dv_ref, _ = _ref_bwd(q, k, v, do, scale=scale, padding=([s_q] * batch, kv_lens))
+    o = _bhsd(batch, heads, s_q, head_dim, dtype, empty=True).copy_(o)
+    out = sdpa_bwd_wrapper_dsl_sm120(q, k, v, o, do, stats, scale_softmax=scale, seq_kv_lens=torch.tensor(kv_lens, dtype=torch.int32, device="cuda"))
+    tol = _tolerances(dtype)
+    torch.testing.assert_close(out["dq_tensor"].float(), dq_ref.float(), **tol)
+    torch.testing.assert_close(out["dk_tensor"].float(), dk_ref.float(), **tol)
+    torch.testing.assert_close(out["dv_tensor"].float(), dv_ref.float(), **tol)
+    for b, len_kv in enumerate(kv_lens):
+        assert out["dk_tensor"][b, :, len_kv:, :].abs().max().item() == 0.0, f"batch {b}: dK padded rows must be exactly zero"
+        assert out["dv_tensor"][b, :, len_kv:, :].abs().max().item() == 0.0, f"batch {b}: dV padded rows must be exactly zero"
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("head_dim", [192, 256])
 @pytest.mark.parametrize("mask", ["dense", "causal_tl", "causal_br"])
 @torch_fork_set_rng(seed=12)
@@ -414,7 +682,7 @@ def test_sdpa_bwd_dsl_sm120_large_d_wrapper(mask: str, head_dim: int):
     k = _bhsd(batch, heads, s_kv, head_dim, dtype)
     v = _bhsd(batch, heads, s_kv, head_dim, dtype)
     do = _bhsd(batch, heads, s_q, head_dim, dtype)
-    o, stats, dq_ref, dk_ref, dv_ref = _ref_bwd(q, k, v, do, scale=scale, is_causal=is_causal, causal_bottom_right=causal_bottom_right)
+    o, stats, dq_ref, dk_ref, dv_ref, _ = _ref_bwd(q, k, v, do, scale=scale, is_causal=is_causal, causal_bottom_right=causal_bottom_right)
     o = _bhsd(batch, heads, s_q, head_dim, dtype, empty=True).copy_(o)
     out = sdpa_bwd_wrapper_dsl_sm120(q, k, v, o, do, stats, is_causal=is_causal, causal_bottom_right=causal_bottom_right, scale_softmax=scale)
     tol = _tolerances(dtype)
@@ -457,13 +725,62 @@ def test_sdpa_bwd_dsl_sm120_padded_head_dim_wrapper(head_dim: int):
     k = _bhsd(batch, heads, s_kv, head_dim, dtype)
     v = _bhsd(batch, heads, s_kv, head_dim, dtype)
     do = _bhsd(batch, heads, s_q, head_dim, dtype)
-    o, stats, dq_ref, dk_ref, dv_ref = _ref_bwd(q, k, v, do, scale=scale, is_causal=True)
+    o, stats, dq_ref, dk_ref, dv_ref, _ = _ref_bwd(q, k, v, do, scale=scale, is_causal=True)
     o = _bhsd(batch, heads, s_q, head_dim, dtype, empty=True).copy_(o)
     out = sdpa_bwd_wrapper_dsl_sm120(q, k, v, o, do, stats, is_causal=True, scale_softmax=scale)
     tol = _tolerances(dtype)
     torch.testing.assert_close(out["dq_tensor"].float(), dq_ref.float(), **tol)
     torch.testing.assert_close(out["dk_tensor"].float(), dk_ref.float(), **tol)
     torch.testing.assert_close(out["dv_tensor"].float(), dv_ref.float(), **tol)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    ("h_q", "h_kv", "is_causal"),
+    [(8, 2, True), (8, 1, False)],
+    ids=["gqa_8_2_causal", "mqa_8_1_dense"],
+)
+@torch_fork_set_rng(seed=17)
+def test_sdpa_bwd_dsl_sm120_gqa(h_q: int, h_kv: int, is_causal: bool):
+    """GQA / MQA head groups: the grid keeps one CTA per query head; each
+    head's dK/dV partial stages through dk_ws/dv_ws and the reduce kernel
+    sums the group per KV head."""
+
+    _run_case(h_q=h_q, h_kv=h_kv, s_q=1024, s_kv=1024, head_dim=64, is_causal=is_causal)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=18)
+def test_sdpa_bwd_dsl_sm120_gqa_swa_bf16():
+    """GQA composed with causal + sliding window, bf16, d=128."""
+
+    _run_case(h_q=8, h_kv=2, s_q=1024, s_kv=1024, head_dim=128, dtype=torch.bfloat16, is_causal=True, window_size_left=255)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=19)
+def test_sdpa_bwd_dsl_sm120_gqa_causal_br_tails():
+    """GQA with bottom-right causal, unequal seq lens, and a partial Q tile."""
+
+    _run_case(h_q=4, h_kv=2, s_q=193, s_kv=257, head_dim=128, is_causal=True, causal_bottom_right=True)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=20)
+def test_sdpa_bwd_dsl_sm120_gqa_padded_head_dim():
+    """GQA through the head-dim envelope (D=96 zero-pads to 128)."""
+
+    _run_case(h_q=8, h_kv=2, s_q=512, s_kv=512, head_dim=96, is_causal=True)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=21)
+def test_sdpa_bwd_dsl_sm120_gqa_deterministic_numeric():
+    """deterministic + GQA composes: dQ uses the relay, while dK/dV come
+    from the fixed-order group reduce (deterministic in both modes); the
+    graph routes to the engine with parity."""
+
+    _run_case(h_q=8, h_kv=2, s_q=512, s_kv=512, head_dim=64, is_causal=True, deterministic=True)
 
 
 @pytest.mark.L0
@@ -502,19 +819,20 @@ def test_sdpa_bwd_dsl_sm120_deterministic_numeric(mask: str):
     )
 
 
-def _run_bitwise_case(n_runs: int = 3, **case_kwargs) -> None:
+def _run_bitwise_case(n_runs: int = 3, padding: tuple[list[int], list[int]] | None = None, **case_kwargs) -> None:
     """Same inputs, ``n_runs`` independent graph runs: outputs must be bitwise equal."""
 
     batch, heads, dtype = 2, 4, torch.float16
     s_q = case_kwargs.pop("s_q", 1024)
     s_kv = case_kwargs.pop("s_kv", 1024)
     head_dim = case_kwargs.pop("head_dim", 64)
+    h_kv = case_kwargs.pop("h_kv", heads)
     scale = 1.0 / math.sqrt(head_dim)
     q = _bhsd(batch, heads, s_q, head_dim, dtype)
-    k = _bhsd(batch, heads, s_kv, head_dim, dtype)
-    v = _bhsd(batch, heads, s_kv, head_dim, dtype)
+    k = _bhsd(batch, h_kv, s_kv, head_dim, dtype)
+    v = _bhsd(batch, h_kv, s_kv, head_dim, dtype)
     do = _bhsd(batch, heads, s_q, head_dim, dtype)
-    o, stats, _, _, _ = _ref_bwd(
+    o, stats, _, _, _, _ = _ref_bwd(
         q,
         k,
         v,
@@ -523,11 +841,15 @@ def _run_bitwise_case(n_runs: int = 3, **case_kwargs) -> None:
         is_causal=case_kwargs.get("is_causal", False),
         causal_bottom_right=case_kwargs.get("causal_bottom_right", False),
         window_size_left=case_kwargs.get("window_size_left"),
+        padding=padding,
     )
     o = _bhsd(batch, heads, s_q, head_dim, dtype, empty=True).copy_(o)
+    if padding is not None:
+        case_kwargs["seq_q_lens"] = torch.tensor(padding[0], dtype=torch.int32, device="cuda").view(batch, 1, 1, 1)
+        case_kwargs["seq_kv_lens"] = torch.tensor(padding[1], dtype=torch.int32, device="cuda").view(batch, 1, 1, 1)
     runs = [_run_bwd_graph(q, k, v, o, do, stats, scale=scale, deterministic=True, **case_kwargs) for _ in range(n_runs)]
-    dq0, dk0, dv0, _ = runs[0]
-    for run_i, (dq, dk, dv, _) in enumerate(runs[1:], start=1):
+    dq0, dk0, dv0, _, _ = runs[0]
+    for run_i, (dq, dk, dv, _, _) in enumerate(runs[1:], start=1):
         assert torch.equal(dq, dq0), f"run {run_i}: dQ is not bitwise reproducible"
         assert torch.equal(dk, dk0), f"run {run_i}: dK is not bitwise reproducible"
         assert torch.equal(dv, dv0), f"run {run_i}: dV is not bitwise reproducible"
@@ -555,6 +877,29 @@ def test_sdpa_bwd_dsl_sm120_deterministic_bitwise_tails_knobs():
     _run_bitwise_case(s_q=1000, s_kv=999, head_dim=64, is_causal=True, q_tile=128, kv_tile=64)
 
 
+@pytest.mark.L0
+@pytest.mark.parametrize(("mask", "h_kv"), [("dense", 2), ("causal", 1)], ids=["dense_gqa2", "causal_mqa"])
+@torch_fork_set_rng(seed=22)
+def test_sdpa_bwd_dsl_sm120_gqa_deterministic_bitwise(mask: str, h_kv: int):
+    """Repeated deterministic GQA/MQA runs are bitwise identical: the relay
+    fixes dQ's fp32 add order and the reduce kernel sums the group's dK/dV
+    partials in fixed q-head order."""
+
+    _run_bitwise_case(
+        h_kv=h_kv,
+        head_dim=64,
+        is_causal=mask != "dense",
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=26)
+def test_sdpa_bwd_dsl_sm120_deterministic_bitwise_padding():
+    """Bitwise reproducibility with a padding mask (per-batch relay trims)."""
+
+    _run_bitwise_case(s_q=1024, s_kv=1024, head_dim=64, is_causal=True, padding=([1024, 300], [1000, 128]))
+
+
 def _run_wrapper_det_case(head_dim: int, *, s_q: int, s_kv: int, is_causal: bool, window_size_left: int | None, n_runs: int = 1):
     """Deterministic run(s) through the direct wrapper (D>128 has no graph
     surface); returns (outputs per run, references)."""
@@ -567,7 +912,7 @@ def _run_wrapper_det_case(head_dim: int, *, s_q: int, s_kv: int, is_causal: bool
     k = _bhsd(batch, heads, s_kv, head_dim, dtype)
     v = _bhsd(batch, heads, s_kv, head_dim, dtype)
     do = _bhsd(batch, heads, s_q, head_dim, dtype)
-    o, stats, dq_ref, dk_ref, dv_ref = _ref_bwd(q, k, v, do, scale=scale, is_causal=is_causal, window_size_left=window_size_left)
+    o, stats, dq_ref, dk_ref, dv_ref, _ = _ref_bwd(q, k, v, do, scale=scale, is_causal=is_causal, window_size_left=window_size_left)
     o = _bhsd(batch, heads, s_q, head_dim, dtype, empty=True).copy_(o)
     runs = [
         sdpa_bwd_wrapper_dsl_sm120(q, k, v, o, do, stats, is_causal=is_causal, window_size_left=window_size_left, deterministic=True, scale_softmax=scale)

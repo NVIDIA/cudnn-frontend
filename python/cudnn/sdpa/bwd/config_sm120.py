@@ -34,10 +34,17 @@ class TemplateParams:
     is_causal: bool = False
     causal_top_left: bool = False
     window_size_left: int | None = None
+    window_size_right: int | None = None
     deterministic: bool = False
     use_pdl: bool = True
     q_tile: int = 0
     kv_tile: int = 0
+    # Padding mask: per-batch int32 lengths; seq_q is only valid with seq_kv.
+    seq_kv_lens_present: bool = False
+    seq_q_lens_present: bool = False
+    # Sink Attention
+    sink_present: bool = False
+    dsink_present: bool = False
 
 
 def validate_params(params: TemplateParams) -> None:
@@ -54,6 +61,14 @@ def validate_params(params: TemplateParams) -> None:
         raise ValueError("SM120 SDPA bwd: causal_top_left requires is_causal=True")
     if params.window_size_left is not None and params.window_size_left < 0:
         raise ValueError(f"SM120 SDPA bwd: window_size_left must be non-negative; got {params.window_size_left}")
+    if params.window_size_right is not None and params.window_size_right < 0:
+        raise ValueError(f"SM120 SDPA bwd: window_size_right must be non-negative; got {params.window_size_right}")
+    if params.window_size_right is not None and not params.is_causal:
+        raise ValueError("SM120 SDPA bwd: window_size_right widens the causal diagonal and requires is_causal=True")
+    if params.seq_q_lens_present and not params.seq_kv_lens_present:
+        raise ValueError("SM120 SDPA bwd: seq_q_lens_present requires seq_kv_lens_present (padding mask)")
+    if params.dsink_present and not params.sink_present:
+        raise ValueError("SM120 SDPA bwd: dsink_present requires sink_present (a dSink output needs the sink logits)")
     if params.q_tile not in (0,) + SEQ_Q_TILES:
         raise ValueError(f"SM120 SDPA bwd: q_tile must be one of {(0,) + SEQ_Q_TILES} (0 = per-head-dim default); got {params.q_tile}")
     if params.kv_tile not in (0,) + SEQ_KV_TILES:
