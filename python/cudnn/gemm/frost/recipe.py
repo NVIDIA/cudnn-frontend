@@ -199,11 +199,8 @@ class GemmRecipe:
     device: int  # the GPU whose SMEM depth / cluster count / SM the kernel is baked for
     batch: int  # the kernel's batch extent, pinned by the checks above the launch
     # The launch call as data. ``arg_plan`` is one entry per positional argument
-    # after ``problem_size``: an operand index, the aux TensorRef whose fake
-    # shape it reshapes to (None -- every other role -- means permute(1, 2, 0)),
-    # and whether the kernel takes the buffer as a bare address rather than a
-    # tensor (every tap: the epilogue reads a pointer plus the strides that
-    # already ride in ``problem_size``, so the tensor around it was never read).
+    # after ``problem_size``: an operand index, plus the aux TensorRef whose fake
+    # shape it reshapes to (None -- every other role -- means permute(1, 2, 0)).
     # ``stride_ins`` gives the positions in ``inputs`` whose permuted strides ride
     # in ``problem_size``, ahead of every output's. This is the one field that says
     # how the six flavors differ, which is why they differ in a table and not in
@@ -530,13 +527,11 @@ def build(compiled) -> GemmRecipe:
     # A, every distinct B, their scale factors, then the outputs and the aux --
     # except under a TMA-store epilogue, where the single dense output binds the
     # template's trailing TMA-only parameter and so goes last.
-    heads = [(op.index, None, False) for op in inputs] + [(s.index, None, False) for s in sf]
-    outs = [(o.index, None, True) for o in outputs]
-    auxs = [(x.index, x.ref, False) for x in aux]
+    heads = [(op.index, None) for op in inputs] + [(s.index, None) for s in sf]
+    outs = [(o.index, None) for o in outputs]
+    auxs = [(x.index, x.ref) for x in aux]
     tma = bool(compiled.use_tma_store) and not chain.is_multi_gemm
-    # Under TMA store the one output is not a tap: the host builds a descriptor
-    # from it, so it stays a tensor.
-    arg_plan = tuple(heads + (auxs + [(outputs[0].index, None, False)] if tma else outs + auxs))
+    arg_plan = tuple(heads + (auxs + outs[:1] if tma else outs + auxs))
 
     # Block-scale multi-GEMM sends ONE A and ONE B stride triple and requires the
     # rest to match it; every other flavor sends each operand's own.

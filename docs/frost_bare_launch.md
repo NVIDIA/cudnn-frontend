@@ -61,6 +61,8 @@ from the kernel they describe.
 
 ### `SLOT_TABLE` — what is in each kernel parameter
 
+Verbatim, for the demo's default shape:
+
 ```python
 SLOT_TABLE = (
     ('m',              'scalar',   8, ('problem_size', 0)),
@@ -68,9 +70,10 @@ SLOT_TABLE = (
     ('k',              'scalar',   8, ('problem_size', 2)),
     ('tma_a_desc_0',   'tma',    128, ('a', 0)),
     ('tma_b_desc_0',   'tma',    128, ('b', 0)),
-    ('mC_tap_0',       'ptr',      8, ('tap', 0)),
     ('out_stride_m_0', 'scalar',   8, ('problem_size', 10)),
-    ...
+    ('out_stride_n_0', 'scalar',   8, ('problem_size', 11)),
+    ('out_stride_l_0', 'scalar',   8, ('problem_size', 12)),
+    ('tma_c_desc_0',   'tma',    128, ('c', 0)),
 )
 ```
 
@@ -88,8 +91,8 @@ was built into, and the grid axis it sizes.
 
 ```python
 PATCH_GROUPS = {
-    'm':        (((0, 0, 8),),  (3,),    'x'),   # writes, maps to re-encode, grid axis
-    'n':        (((1, 0, 8),),  (4,),    'y'),
+    'm':        (((0, 0, 8),),  (3, 8),  'x'),   # writes, maps to re-encode, grid axis
+    'n':        (((1, 0, 8),),  (4, 8),  'y'),
     'k':        (((2, 0, 8),),  (3, 4),  None),
     'addr_a_0': (((3, 0, 8),),  (),      None),
 }
@@ -105,9 +108,14 @@ regimes:
 
 | the caller may vary | per call |
 |---|---|
-| addresses | 3 stores |
-| addresses and M | 4 stores, 1 descriptor re-encode, `gridDimX` |
+| addresses | one store per operand |
+| addresses and M | + `m`'s store, its descriptors re-encoded, `gridDimX` |
 | anything | rebuild |
+
+How many descriptors M costs depends on the epilogue, and the table is what says so rather
+than a rule of thumb: under a TMA store the output descriptor spans M as well, so
+`--vary-m` re-encodes A **and** C and leaves B alone; under an STG epilogue the output is a
+bare address and only A is re-encoded. Either way B never moves, because N and K did not.
 
 ## Where the rest comes from
 
@@ -133,28 +141,42 @@ Nothing in the demo is harvested from a captured launch.
 
 ## Scope, and how it extends
 
-The demo is one narrow case on purpose — a dense bf16 matmul with an STG epilogue — so
-that its claims can be checked in a minute.
+The demo is one narrow case on purpose — a dense bf16 matmul with a TMA-store epilogue —
+so that its claims can be checked in a minute.
 
-The classification behind it is not narrow. Codegen emits `SLOT_TABLE` for every gemm
-flavor it can produce; across plain, relu-epilogue, aux-bias, two-output, reduction,
-multi-gemm and nvfp4 block-scale kernels it classifies every parameter, and the widths it
-claims match what `cuFuncGetParamInfo` reads out of each compiled cubin. Four parameter
-kinds cover all of them:
+What is classified today, measured by compiling each flavor and comparing the table's
+widths against `cuFuncGetParamInfo` on the resulting cubin:
+
+| flavor | outcome |
+|---|---|
+| plain, relu epilogue, 1024³, nvfp4 block scale | every parameter classified |
+| aux bias, two dense outputs, amax reduction, multi-gemm | refused: 1-2 `unknown` |
+| MoE | no table emitted at all |
+
+The refusals are all the same parameter. An STG epilogue passes its output as
+`mC_tap_i: cute.Tensor`, whose fake this does not model, so it comes out `unknown` and a
+consumer must refuse the kernel. **That is the mechanism working, not a gap in it** — and
+it is the obvious next increment, since codegen writes that fake's shape and stride
+expressions a few lines away from where the table is built.
+
+Three kinds cover everything classified so far:
 
 | kind | width | rebinding |
 |---|---|---|
 | `scalar` | 4 or 8 | a store |
-| `ptr` | 8 | a store |
 | `tma` | 128 | a store into the first 8 bytes |
 | `tensor` | 8 + 8 per symbol its fake carries | a store, plus the tail if the shape moved |
 
-What is not done: MoE, whose `mA_i` parameters and grouped `sym_g` extent are not yet
-mapped; and a per-call stream, which is one more store into the launch configuration.
-Both come out as `unknown` or are simply absent today, so nothing silently guesses.
+(`ptr` exists too, for a kernel that takes a bare address; nothing emits one today.)
 
-Linear attention needs much less of this than gemm does. Its sequence boundaries live in
-a device array, so a shape change never touches the parameter block; each operand carries
-its address plus one extent, and the TMA descriptors are built by device kernels into the
-workspace rather than encoded on the host. The per-call cost there scales with the number
-of launches, not with shape complexity.
+MoE gets no table because its `problem_size` carries `num_experts` and `num_groups` where
+a dense one carries `batch`, and its operands are unclassified — there is nothing to
+describe truthfully, so it describes nothing. A per-call stream is also not done; that is
+one more store into the launch configuration.
+
+Linear attention needs much less of this than gemm does. Its per-sequence boundaries live
+in a device array, so a ragged shape change never touches the parameter block; each
+operand carries its address plus one extent, and the TMA descriptors are built by device
+kernels into a workspace rather than encoded on the host. The per-call cost there scales
+with the number of launches, not with shape complexity. (Measured separately, on the GDN
+forward path; not reproducible from this file.)

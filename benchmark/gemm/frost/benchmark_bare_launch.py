@@ -29,11 +29,11 @@ the next rung, where the token count moves too.
 
 SCOPE
 -----
-One narrow case: a dense bf16 matmul with an STG epilogue, on SM100. The design
-generalises -- codegen classifies every parameter of every gemm flavor it can
-emit, and refuses (`kind == 'unknown'`) any it cannot -- but this file
-deliberately demonstrates one, so that what it claims can be checked in a
-minute. See `docs/frost_bare_launch.md`.
+One narrow case: a dense bf16 matmul with a TMA-store epilogue, on SM100. What
+generalises is the classification, not this file -- codegen describes what it
+can and emits `kind == 'unknown'` for what it cannot, so a consumer refuses
+rather than guesses. An STG epilogue's output tap is `unknown` today and is
+refused; `docs/frost_bare_launch.md` says what is and is not covered.
 """
 
 from __future__ import annotations
@@ -421,9 +421,9 @@ def prepare(graph, m, n, k, data, stream):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--m", type=int, default=256)
+    ap.add_argument("--m", type=int, default=128)
     ap.add_argument("--n", type=int, default=256)
-    ap.add_argument("--k", type=int, default=128)
+    ap.add_argument("--k", type=int, default=64)
     ap.add_argument("--vary-m", type=int, default=0, help="also serve this M from the same built block")
     args = ap.parse_args()
 
