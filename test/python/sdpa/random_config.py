@@ -415,17 +415,7 @@ class RandomizationContext:
 
             randoms_.stride_q = get_strides_from_indices(randoms_.shape_q, indices, gaps_q, rng)
             randoms_.stride_o = get_strides_from_indices(randoms_.shape_o, indices, gaps_o, rng)
-            # The stats layout is DRAWN unconditionally so the rng sequence —
-            # and therefore every stride derived from one seed — is identical
-            # on every backend version (seeded repro dicts must reproduce
-            # across 9.25/9.26). It is APPLIED only when the backend supports
-            # non-BHSD stats layouts in bprop (fixed in cuDNN 9.26, bug
-            # 6057616); older backends fall back to the packed BHSD default.
-            stride_stats = get_strides_from_indices(randoms_.shape_stats, indices, gaps_stats, rng)
-            if cudnn.backend_version() >= 92600:
-                randoms_.stride_stats = stride_stats
-            else:
-                randoms_.stride_stats = get_strides_from_layout(randoms_.shape_stats, "bhsd")
+            randoms_.stride_stats = get_strides_from_indices(randoms_.shape_stats, indices, gaps_stats, rng)
 
         # Decide K, V
         randoms_.shape_k = (
