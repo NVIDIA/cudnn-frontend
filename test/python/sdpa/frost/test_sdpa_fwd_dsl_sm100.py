@@ -301,28 +301,42 @@ def test_dsl_sm100_band_right_multi_cluster(d):
 
 
 @pytest.mark.L0
-def test_dsl_sm100_band_right_uncovered_tail_rejected():
-    """The complement: a widened band whose last unmasked column reaches past
-    S_kv (s_q + R > s_kv) must NOT be admitted without a padding mask — the
-    fast causal paths would unmask the garbage tail columns."""
+@pytest.mark.parametrize("d", _FLAVORS, ids=_FLAVOR_IDS)
+@torch_fork_set_rng(seed=0)
+def test_dsl_sm100_ragged_skv_tail_via_padding(d):
+    """Ragged S_kv (not a multiple of 128) with NO mask covering the tail:
+    served through the kernel's padded path with synthesized full-length
+    per-batch KV lengths (Capabilities.skv_tail_via_padding on the f16 rows —
+    mathematically identical, tail masked by the synthesized lengths)."""
     _require_dsl()
-    import cudnn
-    from cudnn.sdpa import graph_analyzer as ga
-    from cudnn.sdpa.fwd import engines as fwd_engines
+    dtype = torch.bfloat16
+    b, h, s_q, s_kv = 2, 4, 128, 200  # 200 % 128 != 0, no mask at all
+    scale = 1.0 / math.sqrt(d)
+    q = _bhsd(b, h, s_q, d, dtype)
+    k = _bhsd(b, h, s_kv, d, dtype)
+    v = _bhsd(b, h, s_kv, d, dtype)
+    o = _run_dsl_graph(q, k, v, scale=scale, dtype=dtype, sdpa_kwargs=dict())
+    o_ref = _ref_sdpa_full(q, k, v, scale=scale)
+    torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
 
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_dsl_sm100_band_right_uncovered_tail_via_padding():
+    """A widened band whose last unmasked column reaches past S_kv
+    (s_q + R > s_kv) cannot rely on the band to mask the ragged tail; the f16
+    rows serve it through the synthesized-padding path instead (the FP8 row's
+    long-standing mechanism), so the garbage tail columns stay masked."""
+    _require_dsl()
+    dtype = torch.bfloat16
     b, h, s_q, s_kv, d, R = 2, 4, 192, 200, 128, 40  # s_q + R = 232 > 200; 200 % 128 != 0
-    g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
-    dims_q, str_q = (b, h, s_q, d), (s_q * h * d, d, h * d, 1)
-    dims_kv, str_kv = (b, h, s_kv, d), (s_kv * h * d, d, h * d, 1)
-    tq = g.tensor(dim=dims_q, stride=str_q, data_type=cudnn.data_type.BFLOAT16, name="q")
-    tk = g.tensor(dim=dims_kv, stride=str_kv, data_type=cudnn.data_type.BFLOAT16, name="k")
-    tv = g.tensor(dim=dims_kv, stride=str_kv, data_type=cudnn.data_type.BFLOAT16, name="v")
-    o, _ = g.sdpa(name="s", q=tq, k=tk, v=tv, attn_scale=0.1, generate_stats=False, diagonal_band_right_bound=R)
-    o.set_output(True).set_dim(dims_q).set_stride(str_q)
-    o.set_data_type(cudnn.data_type.BFLOAT16)
-    facts = ga.analyze(g)
-    assert facts is not None and facts.invalid is None
-    assert all(fwd_engines.analyze_for(spec, g)[1] is not None for spec in fwd_engines.ENGINE_SPECS)
+    scale = 1.0 / math.sqrt(d)
+    q = _bhsd(b, h, s_q, d, dtype)
+    k = _bhsd(b, h, s_kv, d, dtype)
+    v = _bhsd(b, h, s_kv, d, dtype)
+    o = _run_dsl_graph(q, k, v, scale=scale, dtype=dtype, sdpa_kwargs=dict(diagonal_band_right_bound=R))
+    o_ref = _ref_sdpa_full(q, k, v, scale=scale, is_causal=True, band_right=R)
+    torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
 
 
 @pytest.mark.L0

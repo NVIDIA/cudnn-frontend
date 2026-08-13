@@ -514,9 +514,10 @@ def test_probe_rejects_bottom_right_swa_only():
     assert not _eligible(g)
 
 
-def test_probe_rejects_ragged_skv_without_padding_or_causal():
-    # KV tail (S_kv % 128 != 0) is only masked on the padded / causal paths;
-    # a dense graph with a ragged S_kv would silently read the tail columns.
+def test_probe_accepts_ragged_skv_via_synth_padding():
+    # KV tail (S_kv % 128 != 0) with no covering mask: the f16 rows opt into
+    # skv_tail_via_padding — the lowering synthesizes full-length per-batch KV
+    # lengths and the padded path masks the tail (the FP8 row's mechanism).
     g = _mk_graph()
     s_kv = 300
     q = g.tensor(dim=(B, H, S, D), stride=(S * H * D, D, H * D, 1), data_type=DTYPE, name="q")
@@ -524,7 +525,7 @@ def test_probe_rejects_ragged_skv_without_padding_or_causal():
     v = g.tensor(dim=(B, H, s_kv, D), stride=(s_kv * H * D, D, H * D, 1), data_type=DTYPE, name="v")
     o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True)
     _finish_output(o, (B, H, S, D), (S * H * D, D, H * D, 1))
-    assert not _eligible(g)
+    assert engines.engine_name(512) in _eligible(g)
 
 
 def test_probe_accepts_ragged_skv_with_top_left_causal():
