@@ -1815,26 +1815,18 @@ def _initialize_reduction_outputs(chain: FusionChain, outputs, stream=None) -> N
             continue
         red = chain.reductions[int(spec.source.rsplit("_", 1)[1])]
         value = _REDUCTION_INIT_VALUE[red.compute_dtype][red.mode]
+        # The driver, on the stream the kernel will run on -- for a padded output
+        # too. tensor.fill_() would queue on torch's current stream instead,
+        # which is the same stream only by luck, and only exists at all while
+        # the caller happened to pass a torch tensor. The pattern is packed as
+        # the OUTPUT's dtype, not as float: int32's identities are the ends of
+        # its range.
         shape, strides = tuple(tensor.shape), tuple(tensor.stride())
+        word = buffers.init_word(red.compute_dtype, value)
         if buffers.is_contiguous(shape, strides):
-            # The driver, on the stream the kernel will run on. tensor.fill_()
-            # would queue on torch's current stream instead, which is the same
-            # stream only by luck. The pattern is packed as the OUTPUT's dtype,
-            # not as float: int32's identities are the ends of its range.
-            buffers.fill_word_async(tensor.data_ptr(), int(tensor.numel()), buffers.init_word(red.compute_dtype, value), stream)
-            continue
-        # A padded output needs one memset per run -- for a per-row scalar that
-        # is one per row, measured at 572 us against 3.5 for a single fill
-        # kernel. TODO: emit that kernel and delete this branch, which is the
-        # last place the engine writes through the caller's buffer.
-        fill = getattr(tensor, "fill_", None)
-        if fill is None:
-            raise NotImplementedError(
-                f"frost_gemm: a strided reduction output (shape {shape} stride {strides}) can only be "
-                "seeded through a buffer that fills itself; pass a contiguous one, or run this graph "
-                "on the backend"
-            )
-        fill(value)
+            buffers.fill_word_async(tensor.data_ptr(), int(tensor.numel()), word, stream)
+        else:
+            buffers.fill_word_strided_async(tensor.data_ptr(), shape, strides, tensor.element_size(), word, stream)
 
 
 def _finalize_reductions(chain, out_bufs) -> None:

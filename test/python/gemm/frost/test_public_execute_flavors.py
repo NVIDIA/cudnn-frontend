@@ -257,7 +257,7 @@ def test_undersized_workspace_still_rejected():
     c = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
     pack = g._normalize(g._uid_to_data({1: a, 2: b, 3: c}), tiny)
     assert pack.workspace_bytes == 16
-    with pytest.raises(ValueError, match="needs a .*-byte workspace"):
+    with pytest.raises(ValueError, match=r"needs a .*-byte workspace"):
         Workspace.over(pack, 4096, "probe")
 
 
@@ -281,3 +281,102 @@ def test_unknown_size_workspace_refuses_to_measure_its_tail():
     carver = Workspace.over(pack, 1024, "probe")
     with pytest.raises(ValueError, match="size is unknown"):
         carver.remaining()
+
+
+# --- seeding a padded reduction output, which the engine owns ----------------
+
+
+@pytest.mark.parametrize(
+    "shape,stride,want",
+    [
+        ((1, 8, 4), (32, 4, 1), [(32, 1)]),  # dense whatever rank it was declared at
+        ((1, 8, 1), (32, 4, 1), [(8, 4)]),  # a per-row scalar: one strided run
+        ((2, 8, 4), (64, 8, 1), [(16, 8), (4, 1)]),  # padded rows: batch merges into the row count
+        ((1, 1, 1), (1, 1, 1), []),  # one element
+    ],
+)
+def test_a_layout_collapses_to_the_runs_a_memset_can_cover(shape, stride, want):
+    """Unit axes carry no elements and adjacent dense axes are one run.
+
+    Collapsing first is what keeps the seed to a single memset for a contiguous
+    tap and one per batch for a padded one, rather than one per row.
+    """
+    from cudnn.frost.buffers import collapse_layout
+
+    assert collapse_layout(shape, stride) == want
+
+
+@pytest.mark.parametrize(
+    "shape,stride",
+    [
+        ((1, 8, 1), (0, 0, 1)),  # stride 0 over a real extent
+        ((1, 4, 4), (16, 2, 1)),  # rows closer together than they are wide
+        ((1, 2, 2), (4, 2, 2)),  # two axes landing on the same elements
+    ],
+)
+def test_a_reduction_output_that_writes_an_element_twice_is_rejected(shape, stride):
+    """Two elements at one address is a write race, not a layout to support.
+
+    The rule is that each axis clears the whole span of the one below it.
+    Checking the innermost pair alone -- pitch against width -- passes the last
+    case, whose width is 1 and whose two axes both land on element 2.
+    """
+    from cudnn.frost.buffers import fill_word_strided_async, strided_fill_plan
+
+    assert strided_fill_plan(shape, stride) is None
+    with pytest.raises(ValueError, match="twice"):
+        fill_word_strided_async(0, shape, stride, 4, 0, None)
+
+
+@_GPU
+@pytest.mark.parametrize("shape,stride", [((1, 8, 1), (32, 4, 1)), ((2, 8, 4), (64, 8, 1)), ((3, 5, 1), (7, 1, 1))])
+def test_a_padded_seed_writes_its_own_elements_and_no_others(shape, stride):
+    """The engine seeds a padded output itself, without the caller's ``fill_()``.
+
+    Borrowing that method worked only while the buffer happened to be a torch
+    tensor -- and queued on torch's stream, not the one the kernel will run on.
+    What it has to get right is exactly this: every element the view covers, and
+    nothing between them.
+    """
+    from cudnn.frost.buffers import fill_word_strided_async, init_word
+
+    span = 1 + sum((d - 1) * s for d, s in zip(shape, stride))
+    flat = torch.zeros(span, dtype=torch.float32, device="cuda")
+    view = torch.as_strided(flat, shape, stride)
+    fill_word_strided_async(flat.data_ptr(), shape, stride, 4, init_word("fp32", 3.5), None)
+    torch.cuda.synchronize()
+
+    expected = torch.zeros(span, dtype=torch.float32, device="cuda")
+    torch.as_strided(expected, shape, stride).fill_(3.5)
+    assert torch.equal(flat, expected)
+    assert torch.equal(view, torch.full(shape, 3.5, device="cuda"))
+
+
+@_GPU
+def test_a_padded_reduction_output_is_seeded_on_the_kernel_s_stream():
+    """The case that used to reach ``tensor.fill_()``.
+
+    A tap declared into a padded buffer is legal and goes through the public
+    path like any other. Seeding it by calling ``fill_()`` on the caller's
+    tensor queued on torch's current stream rather than the one the kernel runs
+    on -- the same stream only by luck -- and only worked at all while that
+    buffer was a torch tensor. It is the driver's 2D memset now, so this asserts
+    both halves: the tap is right, and the padding it does not own is untouched.
+    """
+    g = cudnn.pygraph(io_data_type=BF16, intermediate_data_type=F32, compute_data_type=F32)
+    A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+    B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+    C = g.matmul(A=A, B=B, name="mm")
+    Y = g.relu(input=C, name="relu")
+    Y.set_output(True).set_data_type(BF16)
+    R = g.reduction(input=Y, mode=cudnn.reduction_mode.ADD, name="red")
+    R.set_dim([1, M, 1]).set_stride([M * 4, 4, 1]).set_output(True).set_data_type(F32)
+    _pin_frost(g)
+
+    a, b, ref = _operands()
+    y = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
+    pad = torch.full((1, M, 4), -7.0, dtype=torch.float32, device="cuda")
+    _run(g, {A: a, B: b, Y: y, R: pad[:, :, :1]})
+
+    torch.testing.assert_close(pad[:, :, 0], torch.relu(ref).sum(dim=2), atol=1.0, rtol=2e-2)
+    assert torch.equal(pad[:, :, 1:], torch.full((1, M, 3), -7.0, device="cuda"))
