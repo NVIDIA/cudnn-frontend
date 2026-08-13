@@ -89,7 +89,7 @@ class TemplateParams:
     thd_varlen: bool = False
     # cc10.3+ fuses the S_acc row-max into the LDTM (tcgen05.ld.red.f32.max); cc10.0
     # lacks it and uses the manual load + software reduction. Auto-set from the device
-    # capability at compile time (MXFP8 only; the f16/fp8 kernels do not read it).
+    # capability at compile time (MXFP8 and per-tensor FP8; the f16 kernels do not read it).
     fused_ldtm_stat: bool = False
 
 

@@ -943,7 +943,11 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # don't read this flag). Auto-set from the device capability so an SM103 run
         # picks the fused path with no user action.
         mxfp8 = self._fp8 and not self._pertensor
-        fused_ldtm_stat = mxfp8 and (self._device_cc == (10, 3))
+        # cc10.3 has the fused LDTM.STAT row-max: MXFP8 has used it since its
+        # bring-up; per-tensor FP8 now takes the same path (its kernel reads
+        # the flag identically — the SM107 sibling bakes it). cc10.0 lacks the
+        # instruction and keeps the manual reduction.
+        fused_ldtm_stat = self._fp8 and self._device_cc == (10, 3)
         sched_policy = self.sched_policy
         if mxfp8 and sched_policy == SCHED_NATURAL and self.window_right is not None:
             sched_policy = SCHED_LPT
