@@ -403,17 +403,19 @@ class RandomizationContext:
             indices.append(3)
             gaps_q = [0, 0, 0, 0]
             gaps_o = [0, 0, 0, 0]
+            gaps_stats = [0, 0, 0, 0]
 
             if rng.randint(0, 1) == 0:  # 50% chance of gaps
                 gaps_q = [rng.randint(0, 8) for _ in range(3)]
                 gaps_o = [rng.randint(0, 8) for _ in range(3)]
+                gaps_stats = [rng.randint(0, 8) for _ in range(3)]
                 gaps_q.append(elem_align * rng.randint(0, 2))
                 gaps_o.append(elem_align * rng.randint(0, 2))
+                gaps_stats.append(elem_align * rng.randint(0, 2))
 
             randoms_.stride_q = get_strides_from_indices(randoms_.shape_q, indices, gaps_q, rng)
             randoms_.stride_o = get_strides_from_indices(randoms_.shape_o, indices, gaps_o, rng)
-            # TODO: Randomize stride_stats once all layouts are supported correctly.
-            randoms_.stride_stats = get_strides_from_layout(randoms_.shape_stats, "bhsd")
+            randoms_.stride_stats = get_strides_from_indices(randoms_.shape_stats, indices, gaps_stats, rng)
 
         # Decide K, V
         randoms_.shape_k = (
