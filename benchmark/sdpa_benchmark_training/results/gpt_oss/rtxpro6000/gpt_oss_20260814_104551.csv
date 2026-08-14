@@ -1,0 +1,106 @@
+config_name,model_name,backend,data_type,attn_mask,batch_size,q_seqlen,kv_seqlen,num_q_heads,num_kv_heads,head_dim_qk,head_dim_vo,profile_pass,deterministic_bwd,time_ms,tflops,max_diff,num_iterations,sliding_window_size,success,skipped,error_message,gpu_name,cudnn_version,cudnn_backend_version,peak_mma_tflops
+gpt_oss,gpt_oss,cudnn,bfloat16,top_left,2,32768,32768,128,128,64,64,fwd,False,2.962,93.000,0.000,10,128,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,440.500
+gpt_oss,gpt_oss,cudnn,bfloat16,top_left,2,32768,32768,128,128,64,64,bwd,False,14.303,48.000,0.000,10,128,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,453.500
+gpt_oss,gpt_oss,cudnn,bfloat16,top_left,2,32768,32768,128,128,64,64,bwd,True,inf,0.000,0.000,10,128,False,False,Benchmark failed with return code 1.,,,,
+gpt_oss,gpt_oss,cudnn,fp8,top_left,2,32768,32768,128,128,64,64,fwd,False,2.884,95.000,0.000,10,128,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,932.500
+gpt_oss,gpt_oss,cudnn,fp8,top_left,2,32768,32768,128,128,64,64,bwd,False,inf,0.000,0.000,10,128,False,False,Benchmark failed with return code 1.,,,,
+gpt_oss,gpt_oss,cudnn,fp8,top_left,2,32768,32768,128,128,64,64,bwd,True,inf,0.000,0.000,10,128,False,False,Benchmark failed with return code 1.,,,,
+gpt_oss,gpt_oss,cudnn,mxfp8,top_left,2,32768,32768,128,128,64,64,fwd,False,inf,0.000,0.000,10,128,False,False,Benchmark failed with return code 1.,,,,
+gpt_oss,gpt_oss,cudnn,mxfp8,top_left,2,32768,32768,128,128,64,64,bwd,False,inf,0.000,0.000,10,128,False,False,Benchmark failed with return code 1.,,,,
+gpt_oss,gpt_oss,cudnn,mxfp8,top_left,2,32768,32768,128,128,64,64,bwd,True,inf,0.000,0.000,10,128,False,False,Benchmark failed with return code 1.,,,,
+gpt_oss,gpt_oss,cudnn,bfloat16,top_left,2,16384,16384,128,128,64,64,fwd,False,1.482,92.000,0.000,10,128,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,466.500
+gpt_oss,gpt_oss,cudnn,bfloat16,top_left,2,16384,16384,128,128,64,64,bwd,False,7.085,48.000,0.000,10,128,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,466.500
+gpt_oss,gpt_oss,cudnn,bfloat16,top_left,2,16384,16384,128,128,64,64,bwd,True,inf,0.000,0.000,10,128,False,False,Benchmark failed with return code 1.,,,,
+gpt_oss,gpt_oss,cudnn,fp8,top_left,2,16384,16384,128,128,64,64,fwd,False,1.447,95.000,0.000,10,128,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,932.500
+gpt_oss,gpt_oss,cudnn,fp8,top_left,2,16384,16384,128,128,64,64,bwd,False,inf,0.000,0.000,10,128,False,False,Benchmark failed with return code 1.,,,,
+gpt_oss,gpt_oss,cudnn,fp8,top_left,2,16384,16384,128,128,64,64,bwd,True,inf,0.000,0.000,10,128,False,False,Benchmark failed with return code 1.,,,,
+gpt_oss,gpt_oss,cudnn,mxfp8,top_left,2,16384,16384,128,128,64,64,fwd,False,inf,0.000,0.000,10,128,False,False,Benchmark failed with return code 1.,,,,
+gpt_oss,gpt_oss,cudnn,mxfp8,top_left,2,16384,16384,128,128,64,64,bwd,False,inf,0.000,0.000,10,128,False,False,Benchmark failed with return code 1.,,,,
+gpt_oss,gpt_oss,cudnn,mxfp8,top_left,2,16384,16384,128,128,64,64,bwd,True,inf,0.000,0.000,10,128,False,False,Benchmark failed with return code 1.,,,,
+gpt_oss,gpt_oss,cudnn,bfloat16,top_left,2,8192,8192,128,128,64,64,fwd,False,0.762,90.000,0.000,10,128,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,466.500
+gpt_oss,gpt_oss,cudnn,bfloat16,top_left,2,8192,8192,128,128,64,64,bwd,False,3.525,48.000,0.000,10,128,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,466.500
+gpt_oss,gpt_oss,cudnn,bfloat16,top_left,2,8192,8192,128,128,64,64,bwd,True,31.285,5.000,0.000,10,128,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,466.500
+gpt_oss,gpt_oss,cudnn,fp8,top_left,2,8192,8192,128,128,64,64,fwd,False,0.732,93.000,0.000,10,128,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,932.500
+gpt_oss,gpt_oss,cudnn,fp8,top_left,2,8192,8192,128,128,64,64,bwd,False,inf,0.000,0.000,10,128,False,False,Benchmark failed with return code 1.,,,,
+gpt_oss,gpt_oss,cudnn,fp8,top_left,2,8192,8192,128,128,64,64,bwd,True,inf,0.000,0.000,10,128,False,False,Benchmark failed with return code 1.,,,,
+gpt_oss,gpt_oss,cudnn,mxfp8,top_left,2,8192,8192,128,128,64,64,fwd,False,inf,0.000,0.000,10,128,False,False,Benchmark failed with return code 1.,,,,
+gpt_oss,gpt_oss,cudnn,mxfp8,top_left,2,8192,8192,128,128,64,64,bwd,False,inf,0.000,0.000,10,128,False,False,Benchmark failed with return code 1.,,,,
+gpt_oss,gpt_oss,cudnn,mxfp8,top_left,2,8192,8192,128,128,64,64,bwd,True,inf,0.000,0.000,10,128,False,False,Benchmark failed with return code 1.,,,,
+gpt_oss,gpt_oss,cudnn,bfloat16,top_left,2,4096,4096,128,128,64,64,fwd,False,0.398,85.000,0.000,10,128,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,466.500
+gpt_oss,gpt_oss,cudnn,bfloat16,top_left,2,4096,4096,128,128,64,64,bwd,False,1.760,48.000,0.000,10,128,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,466.500
+gpt_oss,gpt_oss,cudnn,bfloat16,top_left,2,4096,4096,128,128,64,64,bwd,True,8.342,10.000,0.000,10,128,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,466.500
+gpt_oss,gpt_oss,cudnn,fp8,top_left,2,4096,4096,128,128,64,64,fwd,False,0.379,89.000,0.000,10,128,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,932.500
+gpt_oss,gpt_oss,cudnn,fp8,top_left,2,4096,4096,128,128,64,64,bwd,False,inf,0.000,0.000,10,128,False,False,Benchmark failed with return code 1.,,,,
+gpt_oss,gpt_oss,cudnn,fp8,top_left,2,4096,4096,128,128,64,64,bwd,True,inf,0.000,0.000,10,128,False,False,Benchmark failed with return code 1.,,,,
+gpt_oss,gpt_oss,cudnn,mxfp8,top_left,2,4096,4096,128,128,64,64,fwd,False,inf,0.000,0.000,10,128,False,False,Benchmark failed with return code 1.,,,,
+gpt_oss,gpt_oss,cudnn,mxfp8,top_left,2,4096,4096,128,128,64,64,bwd,False,inf,0.000,0.000,10,128,False,False,Benchmark failed with return code 1.,,,,
+gpt_oss,gpt_oss,cudnn,mxfp8,top_left,2,4096,4096,128,128,64,64,bwd,True,inf,0.000,0.000,10,128,False,False,Benchmark failed with return code 1.,,,,
+gpt_oss,gpt_oss,cudnn,bfloat16,top_left,2,2048,2048,128,128,64,64,fwd,False,0.211,79.000,0.000,10,128,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,466.500
+gpt_oss,gpt_oss,cudnn,bfloat16,top_left,2,2048,2048,128,128,64,64,bwd,False,0.885,47.000,0.000,10,128,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,466.500
+gpt_oss,gpt_oss,cudnn,bfloat16,top_left,2,2048,2048,128,128,64,64,bwd,True,2.380,17.000,0.000,10,128,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,466.500
+gpt_oss,gpt_oss,cudnn,fp8,top_left,2,2048,2048,128,128,64,64,fwd,False,0.207,80.000,0.000,10,128,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,932.500
+gpt_oss,gpt_oss,cudnn,fp8,top_left,2,2048,2048,128,128,64,64,bwd,False,inf,0.000,0.000,10,128,False,False,Benchmark failed with return code 1.,,,,
+gpt_oss,gpt_oss,cudnn,fp8,top_left,2,2048,2048,128,128,64,64,bwd,True,inf,0.000,0.000,10,128,False,False,Benchmark failed with return code 1.,,,,
+gpt_oss,gpt_oss,cudnn,mxfp8,top_left,2,2048,2048,128,128,64,64,fwd,False,inf,0.000,0.000,10,128,False,False,Benchmark failed with return code 1.,,,,
+gpt_oss,gpt_oss,cudnn,mxfp8,top_left,2,2048,2048,128,128,64,64,bwd,False,inf,0.000,0.000,10,128,False,False,Benchmark failed with return code 1.,,,,
+gpt_oss,gpt_oss,cudnn,mxfp8,top_left,2,2048,2048,128,128,64,64,bwd,True,inf,0.000,0.000,10,128,False,False,Benchmark failed with return code 1.,,,,
+gpt_oss,gpt_oss,cudnn_oss,bfloat16,top_left,2,32768,32768,128,128,64,64,fwd,False,2.990,92.000,0.000,10,128,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,466.500
+gpt_oss,gpt_oss,cudnn_oss,bfloat16,top_left,2,32768,32768,128,128,64,64,bwd,False,14.645,47.000,0.000,10,128,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,466.500
+gpt_oss,gpt_oss,cudnn_oss,bfloat16,top_left,2,32768,32768,128,128,64,64,bwd,True,14.653,47.000,0.000,10,128,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,466.500
+gpt_oss,gpt_oss,cudnn_oss,fp8,top_left,2,32768,32768,128,128,64,64,fwd,False,inf,0.000,0.000,10,128,False,True,UNSUPPORTED_CONFIG: no FROST OSS engine serves this fwd graph (shape/pass/feature not covered),,,,
+gpt_oss,gpt_oss,cudnn_oss,fp8,top_left,2,32768,32768,128,128,64,64,bwd,False,inf,0.000,0.000,10,128,False,False,Benchmark failed with return code 1.,,,,
+gpt_oss,gpt_oss,cudnn_oss,fp8,top_left,2,32768,32768,128,128,64,64,bwd,True,inf,0.000,0.000,10,128,False,False,Benchmark failed with return code 1.,,,,
+gpt_oss,gpt_oss,cudnn_oss,mxfp8,top_left,2,32768,32768,128,128,64,64,fwd,False,inf,0.000,0.000,10,128,False,False,Benchmark failed with return code 1.,,,,
+gpt_oss,gpt_oss,cudnn_oss,mxfp8,top_left,2,32768,32768,128,128,64,64,bwd,False,inf,0.000,0.000,10,128,False,False,Benchmark failed with return code 1.,,,,
+gpt_oss,gpt_oss,cudnn_oss,mxfp8,top_left,2,32768,32768,128,128,64,64,bwd,True,inf,0.000,0.000,10,128,False,False,Benchmark failed with return code 1.,,,,
+gpt_oss,gpt_oss,cudnn_oss,bfloat16,top_left,2,16384,16384,128,128,64,64,fwd,False,1.502,91.000,0.000,10,128,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,465.000
+gpt_oss,gpt_oss,cudnn_oss,bfloat16,top_left,2,16384,16384,128,128,64,64,bwd,False,7.230,47.000,0.000,10,128,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,466.500
+gpt_oss,gpt_oss,cudnn_oss,bfloat16,top_left,2,16384,16384,128,128,64,64,bwd,True,7.247,47.000,0.000,10,128,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,466.500
+gpt_oss,gpt_oss,cudnn_oss,fp8,top_left,2,16384,16384,128,128,64,64,fwd,False,inf,0.000,0.000,10,128,False,True,UNSUPPORTED_CONFIG: no FROST OSS engine serves this fwd graph (shape/pass/feature not covered),,,,
+gpt_oss,gpt_oss,cudnn_oss,fp8,top_left,2,16384,16384,128,128,64,64,bwd,False,inf,0.000,0.000,10,128,False,False,Benchmark failed with return code 1.,,,,
+gpt_oss,gpt_oss,cudnn_oss,fp8,top_left,2,16384,16384,128,128,64,64,bwd,True,inf,0.000,0.000,10,128,False,False,Benchmark failed with return code 1.,,,,
+gpt_oss,gpt_oss,cudnn_oss,mxfp8,top_left,2,16384,16384,128,128,64,64,fwd,False,inf,0.000,0.000,10,128,False,False,Benchmark failed with return code 1.,,,,
+gpt_oss,gpt_oss,cudnn_oss,mxfp8,top_left,2,16384,16384,128,128,64,64,bwd,False,inf,0.000,0.000,10,128,False,False,Benchmark failed with return code 1.,,,,
+gpt_oss,gpt_oss,cudnn_oss,mxfp8,top_left,2,16384,16384,128,128,64,64,bwd,True,inf,0.000,0.000,10,128,False,False,Benchmark failed with return code 1.,,,,
+gpt_oss,gpt_oss,cudnn_oss,bfloat16,top_left,2,8192,8192,128,128,64,64,fwd,False,0.762,89.000,0.000,10,128,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,440.500
+gpt_oss,gpt_oss,cudnn_oss,bfloat16,top_left,2,8192,8192,128,128,64,64,bwd,False,3.595,47.000,0.000,10,128,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,440.500
+gpt_oss,gpt_oss,cudnn_oss,bfloat16,top_left,2,8192,8192,128,128,64,64,bwd,True,3.606,47.000,0.000,10,128,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,440.500
+gpt_oss,gpt_oss,cudnn_oss,fp8,top_left,2,8192,8192,128,128,64,64,fwd,False,inf,0.000,0.000,10,128,False,True,UNSUPPORTED_CONFIG: no FROST OSS engine serves this fwd graph (shape/pass/feature not covered),,,,
+gpt_oss,gpt_oss,cudnn_oss,fp8,top_left,2,8192,8192,128,128,64,64,bwd,False,inf,0.000,0.000,10,128,False,False,Benchmark failed with return code 1.,,,,
+gpt_oss,gpt_oss,cudnn_oss,fp8,top_left,2,8192,8192,128,128,64,64,bwd,True,inf,0.000,0.000,10,128,False,False,Benchmark failed with return code 1.,,,,
+gpt_oss,gpt_oss,cudnn_oss,mxfp8,top_left,2,8192,8192,128,128,64,64,fwd,False,inf,0.000,0.000,10,128,False,False,Benchmark failed with return code 1.,,,,
+gpt_oss,gpt_oss,cudnn_oss,mxfp8,top_left,2,8192,8192,128,128,64,64,bwd,False,inf,0.000,0.000,10,128,False,False,Benchmark failed with return code 1.,,,,
+gpt_oss,gpt_oss,cudnn_oss,mxfp8,top_left,2,8192,8192,128,128,64,64,bwd,True,inf,0.000,0.000,10,128,False,False,Benchmark failed with return code 1.,,,,
+gpt_oss,gpt_oss,cudnn_oss,bfloat16,top_left,2,4096,4096,128,128,64,64,fwd,False,0.398,85.000,0.000,10,128,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,440.500
+gpt_oss,gpt_oss,cudnn_oss,bfloat16,top_left,2,4096,4096,128,128,64,64,bwd,False,1.794,47.000,0.000,10,128,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,440.500
+gpt_oss,gpt_oss,cudnn_oss,bfloat16,top_left,2,4096,4096,128,128,64,64,bwd,True,1.813,47.000,0.000,10,128,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,440.500
+gpt_oss,gpt_oss,cudnn_oss,fp8,top_left,2,4096,4096,128,128,64,64,fwd,False,inf,0.000,0.000,10,128,False,True,UNSUPPORTED_CONFIG: no FROST OSS engine serves this fwd graph (shape/pass/feature not covered),,,,
+gpt_oss,gpt_oss,cudnn_oss,fp8,top_left,2,4096,4096,128,128,64,64,bwd,False,inf,0.000,0.000,10,128,False,False,Benchmark failed with return code 1.,,,,
+gpt_oss,gpt_oss,cudnn_oss,fp8,top_left,2,4096,4096,128,128,64,64,bwd,True,inf,0.000,0.000,10,128,False,False,Benchmark failed with return code 1.,,,,
+gpt_oss,gpt_oss,cudnn_oss,mxfp8,top_left,2,4096,4096,128,128,64,64,fwd,False,inf,0.000,0.000,10,128,False,False,Benchmark failed with return code 1.,,,,
+gpt_oss,gpt_oss,cudnn_oss,mxfp8,top_left,2,4096,4096,128,128,64,64,bwd,False,inf,0.000,0.000,10,128,False,False,Benchmark failed with return code 1.,,,,
+gpt_oss,gpt_oss,cudnn_oss,mxfp8,top_left,2,4096,4096,128,128,64,64,bwd,True,inf,0.000,0.000,10,128,False,False,Benchmark failed with return code 1.,,,,
+gpt_oss,gpt_oss,cudnn_oss,bfloat16,top_left,2,2048,2048,128,128,64,64,fwd,False,0.213,78.000,0.000,10,128,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,440.500
+gpt_oss,gpt_oss,cudnn_oss,bfloat16,top_left,2,2048,2048,128,128,64,64,bwd,False,0.899,46.000,0.000,10,128,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,466.500
+gpt_oss,gpt_oss,cudnn_oss,bfloat16,top_left,2,2048,2048,128,128,64,64,bwd,True,0.905,46.000,0.000,10,128,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,466.500
+gpt_oss,gpt_oss,cudnn_oss,fp8,top_left,2,2048,2048,128,128,64,64,fwd,False,inf,0.000,0.000,10,128,False,True,UNSUPPORTED_CONFIG: no FROST OSS engine serves this fwd graph (shape/pass/feature not covered),,,,
+gpt_oss,gpt_oss,cudnn_oss,fp8,top_left,2,2048,2048,128,128,64,64,bwd,False,inf,0.000,0.000,10,128,False,False,Benchmark failed with return code 1.,,,,
+gpt_oss,gpt_oss,cudnn_oss,fp8,top_left,2,2048,2048,128,128,64,64,bwd,True,inf,0.000,0.000,10,128,False,False,Benchmark failed with return code 1.,,,,
+gpt_oss,gpt_oss,cudnn_oss,mxfp8,top_left,2,2048,2048,128,128,64,64,fwd,False,inf,0.000,0.000,10,128,False,False,Benchmark failed with return code 1.,,,,
+gpt_oss,gpt_oss,cudnn_oss,mxfp8,top_left,2,2048,2048,128,128,64,64,bwd,False,inf,0.000,0.000,10,128,False,False,Benchmark failed with return code 1.,,,,
+gpt_oss,gpt_oss,cudnn_oss,mxfp8,top_left,2,2048,2048,128,128,64,64,bwd,True,inf,0.000,0.000,10,128,False,False,Benchmark failed with return code 1.,,,,
+gpt_oss,gpt_oss,flash_attention_4,bfloat16,top_left,2,32768,32768,128,128,64,64,fwd,False,108.666,3.000,0.000,10,128,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,,,437.500
+gpt_oss,gpt_oss,flash_attention_4,bfloat16,top_left,2,32768,32768,128,128,64,64,bwd,False,12.970,53.000,0.000,10,128,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,,,446.000
+gpt_oss,gpt_oss,flash_attention_4,bfloat16,top_left,2,32768,32768,128,128,64,64,bwd,True,inf,0.000,0.000,10,128,False,False,Benchmark failed with return code 1.,,,,
+gpt_oss,gpt_oss,flash_attention_4,bfloat16,top_left,2,16384,16384,128,128,64,64,fwd,False,27.307,5.000,0.000,10,128,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,,,439.000
+gpt_oss,gpt_oss,flash_attention_4,bfloat16,top_left,2,16384,16384,128,128,64,64,bwd,False,6.430,53.000,0.000,10,128,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,,,466.500
+gpt_oss,gpt_oss,flash_attention_4,bfloat16,top_left,2,16384,16384,128,128,64,64,bwd,True,inf,0.000,0.000,10,128,False,False,Benchmark failed with return code 1.,,,,
+gpt_oss,gpt_oss,flash_attention_4,bfloat16,top_left,2,8192,8192,128,128,64,64,fwd,False,7.018,10.000,0.000,10,128,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,,,466.500
+gpt_oss,gpt_oss,flash_attention_4,bfloat16,top_left,2,8192,8192,128,128,64,64,bwd,False,3.195,53.000,0.000,10,128,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,,,466.500
+gpt_oss,gpt_oss,flash_attention_4,bfloat16,top_left,2,8192,8192,128,128,64,64,bwd,True,inf,0.000,0.000,10,128,False,False,Benchmark failed with return code 1.,,,,
+gpt_oss,gpt_oss,flash_attention_4,bfloat16,top_left,2,4096,4096,128,128,64,64,fwd,False,1.958,17.000,0.000,10,128,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,,,466.500
+gpt_oss,gpt_oss,flash_attention_4,bfloat16,top_left,2,4096,4096,128,128,64,64,bwd,False,1.587,53.000,0.000,10,128,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,,,439.000
+gpt_oss,gpt_oss,flash_attention_4,bfloat16,top_left,2,4096,4096,128,128,64,64,bwd,True,inf,0.000,0.000,10,128,False,False,Benchmark failed with return code 1.,,,,
+gpt_oss,gpt_oss,flash_attention_4,bfloat16,top_left,2,2048,2048,128,128,64,64,fwd,False,0.564,30.000,0.000,10,128,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,,,466.500
+gpt_oss,gpt_oss,flash_attention_4,bfloat16,top_left,2,2048,2048,128,128,64,64,bwd,False,0.798,52.000,0.000,10,128,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,,,466.500
+gpt_oss,gpt_oss,flash_attention_4,bfloat16,top_left,2,2048,2048,128,128,64,64,bwd,True,inf,0.000,0.000,10,128,False,False,Benchmark failed with return code 1.,,,,

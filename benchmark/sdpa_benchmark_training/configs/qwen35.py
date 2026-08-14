@@ -32,7 +32,7 @@ CONFIG = BenchmarkConfig(
         (4096, 4096),
         (2048, 2048),
     ],
-    backends=["cudnn", "flash_attention_4"],
+    backends=["cudnn", "cudnn_oss", "flash_attention_4"],
     # Blackwell limits at head_dim=256: cuDNN bwd rejects head_dim>128 at
     # graph_bwd.validate(), and fa4's sm100 forward kernel asserts on tmem
     # exhaustion for head_dim=256 regardless of batch. Restrict to cuDNN fwd.

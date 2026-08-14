@@ -30,27 +30,37 @@ from typing import Optional, Dict, Any
 
 from torch.profiler import profile, record_function, ProfilerActivity
 
-# Dense MMA throughput (FLOPs / clock / SM) for Blackwell datacenter SKUs.
-# BF16/FP16 dense = 8192, FP8/MXFP8 dense = 16384 (MXFP8 uses the FP8
-# datapath with block scaling).
+# Exit code the benchmark subprocess uses to signal "this backend cannot serve
+# this configuration" (vs. a real failure). The `cudnn_oss` backend emits it for
+# shapes/passes no FROST OSS engine covers, so runners can skip those cases.
+UNSUPPORTED_CONFIG_RETURN_CODE = 42
+
+
+class UnsupportedConfigError(RuntimeError):
+    """The requested (backend, shape, pass) combination is not supported."""
+
+
+# Dense MMA throughput (FLOPs / clock / SM), per compute-capability major.
+# Blackwell datacenter (sm100 line): BF16/FP16 dense = 8192, FP8/MXFP8 = 16384
+# (MXFP8 uses the FP8 datapath with block scaling). GeForce/workstation
+# Blackwell (sm12x, GB202) tensor cores run dense MMA at an eighth of the
+# datacenter per-SM rate: the RTX Blackwell PRO architecture whitepaper lists
+# RTX PRO 6000 at 503.8 dense BF16 TFLOPS with FP32 accumulate (1007.6 is the
+# sparsity figure), which at 188 SMs x 2.62 GHz is 1024 BF16 FLOPs/clk/SM.
 # Keys match the strings accepted by the --data_type CLI flag.
-_BLACKWELL_DC_FLOPS_PER_CLOCK_PER_SM = {
-    "bfloat16": 8192,
-    "float16": 8192,
-    "fp8": 16384,
-    "mxfp8": 16384,
+_FLOPS_PER_CLOCK_PER_SM = {
+    10: {"bfloat16": 8192, "float16": 8192, "fp8": 16384, "mxfp8": 16384},
+    12: {"bfloat16": 1024, "float16": 1024, "fp8": 2048, "mxfp8": 2048},
 }
 
 
 def _peak_flops_per_clock_per_sm(dtype_str):
     """Return per-SM per-clock dense FLOPs for the current GPU + dtype.
-    Returns None on unsupported arch (anything other than Blackwell DC for now)."""
+    Returns None on arches without an entry in the table above."""
     if not torch.cuda.is_available():
         return None
     props = torch.cuda.get_device_properties(torch.cuda.current_device())
-    if props.major != 10:  # only Blackwell DC is in scope
-        return None
-    return _BLACKWELL_DC_FLOPS_PER_CLOCK_PER_SM.get(dtype_str)
+    return _FLOPS_PER_CLOCK_PER_SM.get(props.major, {}).get(dtype_str)
 
 
 class _SmClockSampler:
@@ -245,6 +255,7 @@ def parse_args():
             "flash_attention_3",
             "flash_attention_4",
             "cudnn",
+            "cudnn_oss",
         ],
     )
     parser.add_argument("--format_output", action="store_true", help="Format output to be used in benchmark")
@@ -390,6 +401,10 @@ def run_benchmark(
         check=False,
     )
 
+    if result.returncode == UNSUPPORTED_CONFIG_RETURN_CODE:
+        reason = result.stdout.strip().split("\n")[-1] if result.stdout.strip() else "unsupported configuration"
+        raise UnsupportedConfigError(reason)
+
     if result.returncode != 0:
         raise RuntimeError(f"Benchmark failed with return code {result.returncode}.\n" f"stderr: {result.stderr}\n" f"stdout: {result.stdout}")
 
@@ -424,6 +439,16 @@ def run_benchmark(
         time_ms = float(parts[9])
         tflops = float(parts[11])
 
+    # Trailing column: dense-MMA peak TFLOPS for this GPU + dtype at the boost
+    # clock actually sampled during the measurement window (the SOL
+    # denominator). Empty when the arch has no entry in the rate table.
+    peak_mma_tflops = None
+    if len(parts) > 14 and parts[14].strip():
+        try:
+            peak_mma_tflops = float(parts[14])
+        except ValueError:
+            pass
+
     return {
         "time_ms": time_ms,
         "tflops": tflops,
@@ -431,6 +456,7 @@ def run_benchmark(
         "gpu_name": gpu_name,
         "cudnn_version": cudnn_version,
         "cudnn_backend_version": cudnn_backend_version,
+        "peak_mma_tflops": peak_mma_tflops,
     }
 
 
@@ -447,6 +473,27 @@ if __name__ != "__main__":
 else:
     # Parse command line arguments
     args = parse_args()
+
+    # Both `cudnn` and `cudnn_oss` drive the same cuDNN Frontend graph API; they
+    # differ only in which engines serve the graph. `cudnn_oss` opts into the
+    # FROST engines (open-source CuTe-DSL kernels shipped in cudnn.sdpa /
+    # cudnn.gemm, routed via cudnn.engines) and pins one so the OSS kernel is
+    # guaranteed to be what gets measured. `cudnn` forces the opt-in OFF so its
+    # numbers always come from the native cuDNN backend, even if the caller's
+    # environment has FROST enabled globally. The env var is read live by the
+    # engine manifest, so setting it here (before any graph is built) suffices.
+    is_cudnn_fe = args.sdpa_backend in ("cudnn", "cudnn_oss")
+    if args.sdpa_backend == "cudnn_oss":
+        os.environ["CUDNN_FRONTEND_ENABLE_FROST_ENGINES"] = "1"
+    elif is_cudnn_fe:
+        os.environ["CUDNN_FRONTEND_ENABLE_FROST_ENGINES"] = "0"
+
+    def exit_unsupported(reason):
+        """Signal the parent runner that this config is unsupported (not failed)."""
+        import sys
+
+        print(f"UNSUPPORTED_CONFIG: {reason}")
+        sys.exit(UNSUPPORTED_CONFIG_RETURN_CODE)
 
     if args.data_type == "bfloat16":
         target_dtype = torch.bfloat16
@@ -494,8 +541,8 @@ else:
         run_bwd = False
     enable_gqa = num_q_heads != num_kv_heads
     if args.data_type == "mxfp8":
-        if args.sdpa_backend != "cudnn":
-            raise ValueError("mxfp8 is only supported with the 'cudnn' backend")
+        if not is_cudnn_fe:
+            raise ValueError("mxfp8 is only supported with the 'cudnn'/'cudnn_oss' backends")
         if not HAS_CUTLASS:
             raise RuntimeError("CUTLASS is required for mxfp8 but is not installed")
     # if args.sdpa_backend in ["flash_attention", "flash_attention_3", "pyt_flash_attention"]:
@@ -509,7 +556,7 @@ else:
     ########### Set up SDPA function for each backend ###########
 
     ## If using cuDNN FE, set up cuDNN graph.
-    if args.sdpa_backend == "cudnn":
+    if is_cudnn_fe:
         is_dropout = False  # Hard coded
         dropout_prob = dropout_p if is_dropout else 0.0  # Hard coded to 0
         is_infer = False  # Hard coded
@@ -730,24 +777,76 @@ else:
                 o_fwd.set_output(True).set_dim(output.size()).set_stride(output.stride())
                 (stats_fwd.set_output(True).set_dim(stats.size()).set_stride(stats.stride()).set_data_type(cudnn.data_type.FLOAT) if not is_infer else None)
         else:
+            # The graph is built as a training forward (is_inference=False), so
+            # stats IS an output — mark it real in fwd-only mode too (mxfp8
+            # already did; bf16/fp8 relied on the native backend pruning the
+            # unmarked tensor, which the FROST engines' variant-pack binding
+            # does not do). The stats buffer is already in every variant pack.
             if args.data_type == "fp8":
                 o_fwd.set_output(True).set_dim(output.size()).set_stride(output.stride()).set_data_type(cudnn.data_type.FP8_E4M3)
+                (stats_fwd.set_output(True).set_dim(stats.size()).set_stride(stats.stride()).set_data_type(cudnn.data_type.FLOAT) if not is_infer else None)
             elif args.data_type == "mxfp8":
                 o_fwd.set_output(True).set_dim(output.size()).set_stride(output.stride()).set_data_type(convert_to_cudnn_type(output_dtype))
                 stats_fwd.set_output(True).set_dim(stats.size()).set_stride(stats.stride()).set_data_type(cudnn.data_type.FLOAT)
             else:
                 o_fwd.set_output(True).set_dim(output.size()).set_stride(output.stride())
+                (stats_fwd.set_output(True).set_dim(stats.size()).set_stride(stats.stride()).set_data_type(cudnn.data_type.FLOAT) if not is_infer else None)
 
         if args.data_type == "fp8":
             amax_s_fwd.set_output(True).set_dim(amax_s_gpu.size()).set_stride(amax_s_gpu.stride()).set_data_type(cudnn.data_type.FLOAT)
             amax_o_fwd.set_output(True).set_dim(amax_o_gpu.size()).set_stride(amax_o_gpu.stride()).set_data_type(cudnn.data_type.FLOAT)
         elif args.data_type == "mxfp8":
             amax_o_fwd.set_output(True).set_dim(amax_o_gpu.size()).set_stride(amax_o_gpu.stride()).set_data_type(cudnn.data_type.FLOAT)
+
+        def pin_frost_engine_or_skip(graph, pass_name, required):
+            """`cudnn_oss` backend: pin the first FROST OSS engine in the ranked plan list.
+
+            After create_execution_plans() the Router has merged the python
+            engines that claimed this graph into graph.plans alongside the
+            backend's plans. select_plan() is strict — the OSS kernel is
+            guaranteed to serve the graph, with no silent fallback to the
+            native cuDNN backend. When no FROST engine claimed the graph and
+            this graph is the one being measured, the case is reported as
+            unsupported so the runner skips it.
+            """
+            from cudnn.engines.manifest import MANIFEST
+
+            oss_names = {name for fam in MANIFEST for name in fam.slots}
+            names = [graph.get_plan_name_at_index(i) for i in range(len(graph.plans))]
+            # Plan display names may carry a knob suffix ("engine[Knobs(...)]");
+            # match on the engine name alone.
+            eligible = [n for n in names if n.split("[")[0] in oss_names]
+            if not eligible:
+                if required:
+                    exit_unsupported(f"no FROST OSS engine serves this {pass_name} graph (shape/pass/feature not covered)")
+                return
+            # The plan list is ranked; the first OSS entry is the engine the
+            # router prefers for this graph.
+            graph.select_plan(names.index(eligible[0]))
+            if args.verbose:
+                print(f"[INFO] cudnn_oss: pinned FROST engine '{eligible[0]}' for {pass_name}")
+
         graph_fwd.validate()
         graph_fwd.build_operation_graph()
         graph_fwd.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+        if args.sdpa_backend == "cudnn_oss" and run_fwd:
+            # Only the measured pass must run on an OSS kernel. For bwd-only
+            # runs the fwd graph is just input prep — leave it fully unpinned,
+            # or a FROST engine whose build fails (e.g. an arch the probe
+            # accepts but the lowering rejects) crashes a case whose measured
+            # pass never needed it.
+            pin_frost_engine_or_skip(graph_fwd, "fwd", required=True)
         graph_fwd.check_support()
-        graph_fwd.build_plans()
+        if args.sdpa_backend == "cudnn_oss" and run_fwd:
+            try:
+                graph_fwd.build_plans()
+            except Exception as e:
+                # A pinned FROST engine that fails to build (e.g. missing CuTe
+                # DSL deps, kernel-side rejection) means this config cannot be
+                # measured on OSS kernels — skip rather than fail.
+                exit_unsupported(f"FROST OSS fwd engine failed to build: {e}")
+        else:
+            graph_fwd.build_plans()
 
         # If backward is requested, set up backward graph.
         if run_bwd:
@@ -970,8 +1069,20 @@ else:
             graph_bwd.validate()
             graph_bwd.build_operation_graph()
             graph_bwd.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+            if args.sdpa_backend == "cudnn_oss":
+                # FROST bwd currently ships only sdpa_bwd_sm120, so on other
+                # archs every cudnn_oss bwd case reports unsupported and is
+                # skipped; this probes rather than hard-codes that so new bwd
+                # engines light up when they land.
+                pin_frost_engine_or_skip(graph_bwd, "bwd", required=True)
             graph_bwd.check_support()
-            graph_bwd.build_plans()
+            if args.sdpa_backend == "cudnn_oss":
+                try:
+                    graph_bwd.build_plans()
+                except Exception as e:
+                    exit_unsupported(f"FROST OSS bwd engine failed to build: {e}")
+            else:
+                graph_bwd.build_plans()
 
             if args.data_type == "fp8":
                 variant_pack_fwd = {
@@ -1136,6 +1247,8 @@ else:
                     v_fwd: value,
                     o_fwd: output,
                 }
+                if not is_infer:
+                    variant_pack_fwd[stats_fwd] = stats
                 workspace = torch.empty(graph_fwd.get_workspace_size(), device="cuda", dtype=torch.uint8)
         if is_dropout:
             variant_pack_fwd[seed_fwd] = dropout_seed
@@ -1225,14 +1338,14 @@ else:
             return flash_attention_3_sdpa
         elif backend == "flash_attention_4":
             return flash_attention_4_sdpa
-        elif backend == "cudnn":
+        elif backend in ("cudnn", "cudnn_oss"):
             return None  # Will be set up separately
         else:
             raise ValueError(f"Invalid backend: {backend}")
 
     # Util function for addressing different qkv formats for each backend
     def preprocess_qkv(query, key, value, backend):
-        if backend.startswith("pyt_") or backend == "cudnn":
+        if backend.startswith("pyt_") or backend in ("cudnn", "cudnn_oss"):
             return query, key, value
         elif backend.startswith("flash_attention"):
             query = torch.swapaxes(query, 1, 2)
@@ -1244,7 +1357,7 @@ else:
 
     # Util function addressing different qkvo formats for each backend
     def postprocess_qkvo(query, key, value, output, backend):
-        if backend.startswith("pyt_") or backend == "cudnn":
+        if backend.startswith("pyt_") or backend in ("cudnn", "cudnn_oss"):
             return query, key, value, output
         elif backend.startswith("flash_attention"):
             output = torch.swapaxes(output, 1, 2)
@@ -1256,7 +1369,7 @@ else:
             raise ValueError(f"Invalid backend: {backend}")
 
     def postprocess_dqdkdvdo(dQuery, dKey, dValue, dOutput, backend):
-        if backend.startswith("pyt_") or backend == "cudnn":
+        if backend.startswith("pyt_") or backend in ("cudnn", "cudnn_oss"):
             return dQuery, dKey, dValue, dOutput
         elif backend.startswith("flash_attention"):
             dQuery = torch.swapaxes(dQuery, 1, 2)
@@ -1385,7 +1498,7 @@ else:
         )
 
         # cuDNN-specific FP8 descale/scale/amax tensors
-        if args.data_type == "fp8" and args.sdpa_backend == "cudnn":
+        if args.data_type == "fp8" and is_cudnn_fe:
             descale_q_gpu = torch.ones(1, 1, 1, 1, dtype=torch.float, device=device)
             descale_k_gpu = torch.ones(1, 1, 1, 1, dtype=torch.float, device=device)
             descale_v_gpu = torch.ones(1, 1, 1, 1, dtype=torch.float, device=device)
@@ -1409,7 +1522,7 @@ else:
         query, key, value = preprocess_qkv(query, key, value, args.sdpa_backend)
         dOutput = torch.randn(*query.shape[:-1], head_dim_vo, dtype=randn_dtype, device=device).to(target_dtype)
 
-        if args.sdpa_backend == "cudnn":
+        if is_cudnn_fe:
             if args.data_type == "mxfp8":
                 output = torch.empty(batch_size, q_seqlen, num_q_heads, head_dim_vo, dtype=output_dtype, device=device).transpose(1, 2)
                 # MXFP8 backward outputs use the same dtype as forward output
@@ -1575,6 +1688,8 @@ else:
                         v_fwd: value,
                         o_fwd: output,
                     }
+                    if not is_infer:
+                        variant_pack_fwd[stats_fwd] = stats
                 workspace = torch.empty(graph_fwd.get_workspace_size(), device="cuda", dtype=torch.uint8)
 
             if is_dropout:
@@ -1590,7 +1705,7 @@ else:
         if run_fwd:
             with profile(activities=[ProfilerActivity.CUDA], record_shapes=True) as prof:
                 with record_function("sdpa.forward"):  # Custom marker
-                    if args.sdpa_backend == "cudnn":
+                    if is_cudnn_fe:
                         graph_fwd.execute(variant_pack_fwd, workspace)
                     else:
                         output = sdpa_function(query, key, value)
@@ -1613,8 +1728,18 @@ else:
                 fwd_time = sum(item.device_time for item in matched_kernels) / 1000
                 if i >= dry_run_iters:
                     forward_times.append(fwd_time)
+            elif not prof.key_averages():
+                # A silently-empty profiler (typically CUPTI failing to init
+                # against this driver) would make every case read 0.000 ms and
+                # ship as valid data — fail loudly instead.
+                raise RuntimeError("torch.profiler recorded no CUDA events for the forward pass (CUPTI init failure?); refusing to emit unusable timings")
+            else:
+                raise RuntimeError(
+                    "torch.profiler recorded CUDA events for the forward pass but none matched the known kernel-name filters; "
+                    "add the new kernel prefix to the matched_kernels filter instead of shipping a 0.000 ms row"
+                )
         else:
-            if args.sdpa_backend == "cudnn":
+            if is_cudnn_fe:
                 graph_fwd.execute(variant_pack_fwd, workspace)
             else:
                 output = sdpa_function(query, key, value)
@@ -1627,7 +1752,7 @@ else:
 
             with profile(activities=[ProfilerActivity.CUDA], record_shapes=True) as prof:
                 with record_function("sdpa.backward"):  # Custom marker
-                    if args.sdpa_backend == "cudnn":
+                    if is_cudnn_fe:
                         graph_bwd.execute(variant_pack_bwd, workspace)
                     else:
                         query.retain_grad()
@@ -1660,6 +1785,13 @@ else:
                 bwd_time = sum(item.device_time for item in matched_kernels) / 1000
                 if i >= dry_run_iters:
                     backward_times.append(bwd_time)
+            elif not prof.key_averages():
+                raise RuntimeError("torch.profiler recorded no CUDA events for the backward pass (CUPTI init failure?); refusing to emit unusable timings")
+            else:
+                raise RuntimeError(
+                    "torch.profiler recorded CUDA events for the backward pass but none matched the known kernel-name filters; "
+                    "add the new kernel prefix to the matched_kernels filter instead of shipping a 0.000 ms row"
+                )
 
             dQuery, dKey, dValue, dOutput = postprocess_dqdkdvdo(dQuery, dKey, dValue, dOutput, args.sdpa_backend)
 
@@ -1695,7 +1827,7 @@ else:
         else:
             forward_diffs.append(0.0)
 
-        if args.sdpa_backend == "cudnn":
+        if is_cudnn_fe:
             del query, key, value, output, dQuery, dKey, dValue, dOutput, stats
         else:
             del query, key, value, output
@@ -1756,7 +1888,7 @@ else:
 
     if args.format_output:
         print(
-            f"{args.case_tag},{args.sdpa_backend},{args.batch_size},{args.q_seqlen},{args.kv_seqlen},{args.num_q_heads},{args.num_kv_heads},{head_dim_qk},{fwd_median_time:.3f},{bwd_median_time:.3f},{fwd_tflops:.0f},{bwd_tflops:.0f},{(np.max(np.array(forward_diffs[5:])) if len(forward_diffs) > 5 else (np.max(np.array(forward_diffs)) if len(forward_diffs) > 0 else 0.0)):.6f},{num_iters}"
+            f"{args.case_tag},{args.sdpa_backend},{args.batch_size},{args.q_seqlen},{args.kv_seqlen},{args.num_q_heads},{args.num_kv_heads},{head_dim_qk},{fwd_median_time:.3f},{bwd_median_time:.3f},{fwd_tflops:.0f},{bwd_tflops:.0f},{(np.max(np.array(forward_diffs[5:])) if len(forward_diffs) > 5 else (np.max(np.array(forward_diffs)) if len(forward_diffs) > 0 else 0.0)):.6f},{num_iters},{f'{_peak_mma_tflops:.0f}' if _peak_mma_tflops else ''}"
         )
     else:
         if run_fwd and run_bwd:

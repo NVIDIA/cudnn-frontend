@@ -67,31 +67,6 @@ def log_environment_info():
         pass  # flash_attn is optional
 
 
-def _get_peak_mma_tflops(data_type: str) -> Optional[float]:
-    """Get peak MMA TFLOPS for the current GPU and data type.
-
-    Uses 8192 FMA/clock/SM for FP8/MXFP8 and 4096 FMA/clock/SM for FP16/BF16.
-    """
-    try:
-        import torch
-        import pynvml
-
-        if not torch.cuda.is_available():
-            return None
-
-        pynvml.nvmlInit()
-        handle = pynvml.nvmlDeviceGetHandleByIndex(torch.cuda.current_device())
-        max_clock_mhz = pynvml.nvmlDeviceGetMaxClockInfo(handle, pynvml.NVML_CLOCK_SM)
-        pynvml.nvmlShutdown()
-
-        num_sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
-
-        fma_per_clock = 8192 if data_type in ("fp8", "mxfp8") else 4096
-        return fma_per_clock * 2 * num_sms * max_clock_mhz / 1e6
-    except Exception:
-        return None
-
-
 class BenchmarkRunner:
     """
     Runs benchmarks from configurations with cartesian product expansion.
@@ -169,11 +144,12 @@ class BenchmarkRunner:
             det_values = [False] if profile_pass == "fwd" else list(config.deterministic_bwd)
 
             for det_bwd in det_values:
-                # FP8/MXFP8 constraints: cudnn-only. FA4's cute interface
-                # rejects non-fp16/bf16 inputs outright, so emitting those
-                # cases just produces tracebacks in the CSV.
+                # FP8/MXFP8 constraints: cuDNN Frontend paths only (native or
+                # FROST OSS engines). FA4's cute interface rejects non-fp16/bf16
+                # inputs outright, so emitting those cases just produces
+                # tracebacks in the CSV.
                 if data_type in ("fp8", "mxfp8"):
-                    if backend != "cudnn":
+                    if backend not in ("cudnn", "cudnn_oss"):
                         continue
 
                 yield {
@@ -211,7 +187,7 @@ class BenchmarkRunner:
         try:
             # Import here to avoid circular imports and allow the module to be
             # used even if torch/cudnn aren't installed (for dry-run mode)
-            from .benchmark_single_sdpa import run_benchmark
+            from .benchmark_single_sdpa import run_benchmark, UnsupportedConfigError
 
             result = run_benchmark(
                 batch_size=case["batch_size"],
@@ -256,6 +232,37 @@ class BenchmarkRunner:
                 gpu_name=result.get("gpu_name"),
                 cudnn_version=result.get("cudnn_version"),
                 cudnn_backend_version=result.get("cudnn_backend_version"),
+                peak_mma_tflops=result.get("peak_mma_tflops"),
+            )
+
+        except UnsupportedConfigError as e:
+            # The backend cannot serve this (shape, dtype, pass) combination —
+            # e.g. cudnn_oss on a graph no FROST engine covers. Recorded as an
+            # unsuccessful row (so charts skip the bar) but logged as a skip,
+            # not a failure.
+            return BenchmarkResult(
+                config_name=case["config_name"],
+                model_name=model.name,
+                backend=case["backend"],
+                data_type=case["data_type"],
+                attn_mask=case["attn_mask"],
+                batch_size=case["batch_size"],
+                q_seqlen=case["q_seqlen"],
+                kv_seqlen=case["kv_seqlen"],
+                num_q_heads=model.num_q_heads,
+                num_kv_heads=model.num_kv_heads,
+                head_dim_qk=model.head_dim_qk,
+                head_dim_vo=model.head_dim_vo,
+                profile_pass=case["profile_pass"],
+                deterministic_bwd=case["deterministic_bwd"],
+                sliding_window_size=case["sliding_window_size"],
+                time_ms=float("inf"),
+                tflops=0.0,
+                max_diff=0.0,
+                num_iterations=case["num_iterations"],
+                success=False,
+                skipped=True,
+                error_message=str(e),
             )
 
         except Exception as e:
@@ -339,9 +346,14 @@ class BenchmarkRunner:
             results.append(result)
 
             if result.success:
-                peak = _get_peak_mma_tflops(case["data_type"])
+                # SOL denominator comes from the benchmark subprocess: dense-MMA
+                # rate for this GPU + dtype at the boost clock sampled DURING
+                # the measurement window (not NVML max clock).
+                peak = result.peak_mma_tflops
                 sol = f", {result.tflops / peak * 100:.1f}% SOL" if peak and result.tflops > 0 else ""
                 logger.info(f"  -> {result.profile_pass}: {result.time_ms:.3f}ms ({result.tflops:.0f} TFLOPS{sol})")
+            elif result.skipped:
+                logger.info(f"  -> SKIPPED (unsupported): {result.error_message}")
             else:
                 logger.warning(f"  -> FAILED: {result.error_message}")
 

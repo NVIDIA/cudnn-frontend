@@ -182,6 +182,17 @@ python benchmark_single_sdpa.py \
     --sdpa_backend cudnn --data_type bfloat16 \
     --attn_mask top_left --fwd_bwd
 
+# cuDNN OSS FROST engines (BF16) — same graph API, but the open-source
+# CuTe-DSL kernels (cudnn.sdpa, routed via cudnn.engines) are pinned to
+# serve the graph instead of the native cuDNN backend. Configurations no
+# FROST engine covers exit with a dedicated "unsupported" code and are
+# skipped by the runner/charts.
+python benchmark_single_sdpa.py \
+    --batch_size 1 --q_seqlen 8192 --kv_seqlen 8192 \
+    --num_q_heads 64 --num_kv_heads 8 --head_dim 128 \
+    --sdpa_backend cudnn_oss --data_type bfloat16 \
+    --attn_mask top_left --profile_pass fwd
+
 # cuDNN Frontend (FP8)
 python benchmark_single_sdpa.py \
     --batch_size 1 --q_seqlen 8192 --kv_seqlen 8192 \
@@ -288,6 +299,7 @@ runner.save_csv(results, config)
 | Backend | Description |
 |---------|-------------|
 | `cudnn` | cuDNN (native, via cuDNN Frontend) |
+| `cudnn_oss` | cuDNN OSS FROST engines (open-source CuTe-DSL kernels, via cuDNN Frontend) |
 | `flash_attention_4` | FlashAttention 4 |
 | `flash_attention_3` | FlashAttention 3 |
 | `pyt_flash_attention` | PyTorch FlashAttention |
@@ -297,6 +309,14 @@ runner.save_csv(results, config)
 ## Benchmark Results
 
 Results are organized by `<config>/<gpu>/`. The plots compare cuDNN against FAv4 across BF16, MXFP8, and FP8 (cuDNN-only for FP8/MXFP8). Per-config layout:
+
+The current drops include the `cudnn_oss` backend measured in the same run
+and environment as the native rows. Configurations no FROST engine covers
+(e.g. bwd passes on non-sm120 GPUs, sliding-window, d_qk > 512) are recorded
+as skipped rather than failed; the charts omit their bars. Charts also carry
+a dashed line per dtype at the dense-MMA peak for the GPU, computed at the
+boost clock sampled during the measurement window (the `peak_mma_tflops`
+CSV column).
 
 ```
 results/<config>/<gpu>/

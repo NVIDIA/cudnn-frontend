@@ -176,7 +176,15 @@ class BenchmarkResult:
     # Optional fields (must come after required fields)
     sliding_window_size: Optional[int] = None
     success: bool = True
+    # True when the case was cleanly skipped because the backend does not
+    # support this (shape, dtype, pass) combination (always success=False);
+    # distinguishes "unsupported" from a real failure in logs and CSVs.
+    skipped: bool = False
     error_message: Optional[str] = None
     gpu_name: Optional[str] = None
     cudnn_version: Optional[str] = None
     cudnn_backend_version: Optional[int] = None
+    # Dense-MMA peak TFLOPS for this GPU + dtype at the boost clock actually
+    # sampled during the measurement window — the SOL denominator. None on
+    # arches without a rate-table entry.
+    peak_mma_tflops: Optional[float] = None
