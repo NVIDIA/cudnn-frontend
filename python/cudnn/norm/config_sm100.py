@@ -283,8 +283,59 @@ def make_cfg(params: TemplateParams, M: int, *, staged_rows: int = 1) -> Cfg:
     return Cfg(block_threads=bt, V=V, stage_mode=stage_mode, vec=vec, elem_bytes=elem_bytes)
 
 
+# Target per-thread X-register footprint (LDGS): keeping ldgs ~4 (measured sweet
+# spot) avoids the register-spill cliff. For large C we widen the row to WARPS_N
+# warps (THREADS_PER_ROW = WARPS_N*32, cross-warp reduce via smem) rather than
+# growing ldgs — this is cuDNN's ln_fwd approach and the key to large-C bandwidth.
+_WARP_TARGET_LDGS = 4
+
+
+def make_warp_cfg(params: TemplateParams, C: int):
+    """Launch geometry for the warp-per-row LN/RMS forward, or None if unsuitable.
+
+    Returns ``(tpr, wn, intra, ldgs, rpc, block_threads, V)``:
+    ``tpr`` threads reduce one row (``wn`` = tpr//32 warps cooperate for C large
+    enough; ``intra`` = shfl group = min(tpr,32)), a CTA packs ``rpc`` rows, each
+    thread caches ``ldgs*V`` elements. None when C isn't 128-bit aligned or has no
+    suitable divisor (-> staged fallback).
+    """
+    from .dtypes import DTYPE_BYTES
+
+    eb = DTYPE_BYTES[params.io_dtype]
+    V = vector_width(eb)
+    if C % V != 0:
+        return None
+    vec_cols = C // V
+
+    if vec_cols < 32:  # tiny C: sub-warp, one warp packs several rows
+        tpr = 32
+        while vec_cols % tpr != 0 or tpr > vec_cols:
+            tpr //= 2
+        wn, intra, ldgs = 1, tpr, vec_cols // tpr
+    else:  # widen to WARPS_N so ldgs stays ~ target
+        best = None
+        for wn in (1, 2, 4, 8):
+            tpr = wn * 32
+            if tpr > 256 or vec_cols % tpr != 0:
+                continue
+            ldgs = vec_cols // tpr
+            if ldgs < 1:
+                continue
+            if best is None or abs(ldgs - _WARP_TARGET_LDGS) < abs(best[2] - _WARP_TARGET_LDGS):
+                best = (wn * 32, wn, ldgs)
+        if best is None:
+            return None
+        tpr, wn, ldgs = best
+        intra = 32
+
+    block_threads = max(tpr, (256 // tpr) * tpr)
+    rpc = block_threads // tpr
+    return (tpr, wn, intra, ldgs, rpc, block_threads, V)
+
+
 __all__ = [
     "NormVariant",
+    "make_warp_cfg",
     "ROWWISE_VARIANTS",
     "HAS_MEAN",
     "RowwiseSpec",
