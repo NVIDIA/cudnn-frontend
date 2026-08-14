@@ -143,6 +143,7 @@ init_properties(py::module_& m) {
         .value("FP8_E5M2", cudnn_frontend::DataType_t::FP8_E5M2)
         .value("FAST_FLOAT_FOR_FP8", cudnn_frontend::DataType_t::FAST_FLOAT_FOR_FP8)
         .value("FP8_E8M0", cudnn_frontend::DataType_t::FP8_E8M0)
+        .value("FP8_E5M3", cudnn_frontend::DataType_t::FP8_E5M3)
         .value("FP4_E2M1", cudnn_frontend::DataType_t::FP4_E2M1)
         .value("INT4", cudnn_frontend::DataType_t::INT4)
         .value("NOT_SET", cudnn_frontend::DataType_t::NOT_SET);

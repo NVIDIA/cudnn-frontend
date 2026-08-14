@@ -30,6 +30,7 @@ BF16 output are identical.
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from types import SimpleNamespace
 from typing import Callable
@@ -39,6 +40,7 @@ import cudnn.gemm.frost  # noqa: F401  (installs hook)
 import torch
 
 from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
+from cudnn.gemm.frost.tile_config import by_name as _by_name
 from cudnn.gemm.frost.graph_analyzer import analyze
 from cudnn.gemm.frost.kernel_registry import candidates as _registry_candidates
 
@@ -399,6 +401,28 @@ def _build_spec_map(variant: str, dtype: str) -> dict[str, tuple]:
     return m
 
 
+_LABEL_RE = re.compile(r"^(CONFIG_sm\d+_\d+x\d+x\d+_\d+x\d+x\d+_cluster\d+x\d+)_([12])ctamma(_static)?$")
+
+
+def _spec_for(label: str, spec_map: dict):
+    """(geometry cfg, cta_group, scheduler) for a --configs label, or None.
+
+    Takes the sweep map because this one is built per (variant, dtype). A label
+    naming a geometry outside CATALOG (e.g. a num_mma_m > 1 tile, which `by_name`
+    synthesizes) is still runnable, so parse it rather than calling it unsweepable."""
+    spec = spec_map.get(label)
+    if spec is not None:
+        return spec
+    m = _LABEL_RE.match(label)
+    if m is None:
+        return None
+    try:
+        cfg = _by_name(m.group(1))
+    except (KeyError, NotImplementedError):
+        return None
+    return cfg, int(m.group(2)), "static" if m.group(3) else "clc"
+
+
 # Main
 
 
@@ -438,10 +462,11 @@ def _run_model(key: str, spec: dict, args) -> tuple | None:
 
     best = None
     for label in labels:
-        if label not in spec_map:
+        spec = _spec_for(label, spec_map)
+        if spec is None:
             print(f"  {label:64s} UNKNOWN (not a sweepable MoE dual-GEMM strategy)", flush=True)
             continue
-        cfg, cta_group, sched = spec_map[label]
+        cfg, cta_group, sched = spec
         try:
             g, h = _graph(S, N, K, E, variant, args.dtype, offsets)
             plan = jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group, scheduler=sched)

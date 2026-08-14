@@ -119,6 +119,22 @@ def shared_memory_per_block_optin(device: int) -> int:
     return int(_ck(*drv.cuDeviceGetAttribute(drv.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN, handle)))
 
 
+# CU_DEVICE_ATTRIBUTE_MAX_OVERSIZED_SHARED_MEMORY_PER_BLOCK. Named in CUDA 13.4's
+# cuda.h; cuda-python's CUdevice_attribute does not carry it yet, so ask by ordinal.
+_ATTR_MAX_OVERSIZED_SHARED_MEMORY_PER_BLOCK = 150
+
+
+@functools.lru_cache(maxsize=None)
+def oversized_shared_memory_per_block(device: int) -> int:
+    """Per-CTA SMEM ceiling in the *oversized* carveout (327 KiB vs the 227 KiB
+    opt-in limit on SM 10.7), which the part gives by shrinking L1 to 8 kB — free for
+    a TMA-fed GEMM. 0 when the driver has no such mode."""
+    drv = _driver()
+    handle = _device_handle(device)
+    err, value = drv.cuDeviceGetAttribute(_ATTR_MAX_OVERSIZED_SHARED_MEMORY_PER_BLOCK, handle)
+    return int(value) if int(err) == 0 else 0
+
+
 @functools.lru_cache(maxsize=None)
 def l2_cache_bytes(device: int) -> int:
     drv = _driver()

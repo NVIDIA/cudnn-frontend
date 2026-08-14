@@ -25,6 +25,7 @@ import torch
 
 from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
 from cudnn.gemm.frost.tile_config import CATALOG as _CATALOG
+from cudnn.gemm.frost.tile_config import by_name as _by_name
 
 
 def _build_spec_map():
@@ -36,8 +37,8 @@ def _build_spec_map():
         kb_want = 384 if cfg.pipeline == "sm103" else 128
         if cfg.cta_tile_m % 128 or cfg.cta_tile_n % 128 or cfg.cta_tile_k_bytes != kb_want:
             continue
-        # sm103 has 1ctamma + 2ctamma CLC templates (no static variants).
-        scheds = (("clc", ""),) if cfg.pipeline == "sm103" else (("clc", ""), ("static", "_static"))
+        # Only sm100 has static-scheduler variants; sm103 / sm107 are CLC-only.
+        scheds = (("clc", ""), ("static", "_static")) if cfg.pipeline == "sm100" else (("clc", ""),)
         for cg in (1, 2):
             if cg == 2 and (cfg.cgrp_size_m % 2 or cfg.cta_tile_m == 64):
                 continue
@@ -48,6 +49,27 @@ def _build_spec_map():
 
 _SPEC_MAP = _build_spec_map()
 
+_LABEL_RE = re.compile(r"^(CONFIG_sm\d+_\d+x\d+x\d+_\d+x\d+x\d+_cluster\d+x\d+)_([12])ctamma(_static)?$")
+
+
+def _spec_for(name):
+    """(geometry cfg, cta_group, scheduler) for a --configs label, or None.
+
+    The sweep set comes from the registry funnel over CATALOG; a label naming a
+    geometry outside it (e.g. a num_mma_m > 1 tile, which `by_name` synthesizes) is
+    still runnable, so parse it rather than reporting UNKNOWN_CONFIG."""
+    spec = _SPEC_MAP.get(name)
+    if spec is not None:
+        return spec
+    m = _LABEL_RE.match(name)
+    if m is None:
+        return None
+    try:
+        cfg = _by_name(m.group(1))
+    except (KeyError, NotImplementedError):
+        return None
+    return cfg, int(m.group(2)), "static" if m.group(3) else "clc"
+
 
 def _vp_bs(handles, a, b, c, sfa, sfb):
     """Block-scale single-GEMM variant-pack dict keyed by the graph's tensors."""
@@ -57,7 +79,7 @@ def _vp_bs(handles, a, b, c, sfa, sfb):
 
 def _build_plan(g, cfg, name):
     """JIT-compile the recorded graph with a forced tile config."""
-    return jit_from_cudnn_graph(g, config=cfg, cta_group=_SPEC_MAP[name][1], scheduler=_SPEC_MAP[name][2])
+    return jit_from_cudnn_graph(g, config=cfg, cta_group=_spec_for(name)[1], scheduler=_spec_for(name)[2])
 
 
 # Combo table (input dtype family + scale dtype + block size)
@@ -508,10 +530,10 @@ def _nsys_worker(shape, combo, configs, warmup, iters, ref_mode, nbuf) -> None:
     torch.cuda.synchronize()
 
     # 2. each block-scale config.
-    name_to_cfg = {lbl: sp[0] for lbl, sp in _SPEC_MAP.items()}
     config_names = configs or list(_SPEC_MAP)
     for name in config_names:
-        cfg = name_to_cfg.get(name)
+        spec = _spec_for(name)
+        cfg = spec[0] if spec else None
         if cfg is None:
             continue
         try:
@@ -603,7 +625,6 @@ def main() -> int:
 
     flops = 2 * B * M * N * K
     config_names = [c.strip() for c in args.configs.split(",")] if args.configs else list(_SPEC_MAP)
-    name_to_cfg = {lbl: sp[0] for lbl, sp in _SPEC_MAP.items()}
 
     print(f"\n=== block-scale matmul B={B} {M}x{N}x{K}  (~{flops / 1e9:.1f} GFLOP) — " f"{combo} in / BF16 out ===")
 
@@ -644,7 +665,8 @@ def main() -> int:
             print("  reference kernel: not detected in nsys output")
 
         for name in config_names:
-            cfg = name_to_cfg.get(name)
+            spec = _spec_for(name)
+            cfg = spec[0] if spec else None
             if cfg is None:
                 rows.append((name, 0.0, float("inf"), "UNKNOWN_CONFIG"))
                 continue
@@ -687,7 +709,8 @@ def main() -> int:
 
         ctx_dead = False
         for name in config_names:
-            cfg = name_to_cfg.get(name)
+            spec = _spec_for(name)
+            cfg = spec[0] if spec else None
             if cfg is None:
                 row = (name, 0.0, float("inf"), "UNKNOWN_CONFIG")
             elif ctx_dead:

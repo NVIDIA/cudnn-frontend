@@ -24,62 +24,21 @@ from functools import lru_cache
 from typing import Callable
 
 import cutlass.experimental.primitives as nvvm
+from cudnn.gemm.frost.kernel_templates._tile_helpers import (
+    copy_tensormap_to_workspace as _copy_tensormap_to_workspace,
+    fence_tensormap_acquire as _fence_tensormap_acquire,
+    fence_tensormap_release as _fence_tensormap_release,
+    moe_swizzle_tile as _moe_swizzle_tile,
+    replace_tensormap_global_address as _replace_tensormap_global_address,
+    replace_tensormap_global_dim_1 as _replace_tensormap_global_dim_1,
+    TENSOR_MAP_QWORDS,
+)
 import cutlass.experimental.cuda.tensor_map as _tma
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import make_fake_compact_tensor
 from cutlass.cute.runtime import make_fake_stream
 from cuda.bindings import driver as _cuda
-
-_TENSOR_MAP_QWORDS = 16
-
-
-@cute.jit
-def _copy_tensormap_to_workspace(src_desc_ptr, dst_i64_ptr) -> None:
-    """Copy the 128-byte A tensormap into ``dst_i64_ptr`` (seeds the SMEM copy)."""
-    src_words = cute.make_ptr(cutlass.Int64, src_desc_ptr.toint(), mem_space=cute.AddressSpace.generic)
-    for i in cutlass.range(_TENSOR_MAP_QWORDS, unroll_full=True):
-        dst_i64_ptr.subview(i).store((src_words + i).load())
-
-
-@cute.jit
-def _replace_tensormap_global_address(desc_ptr, new_address) -> None:
-    nvvm.tensormap_replace(
-        nvvm.TensormapField.GLOBAL_ADDRESS,
-        desc_ptr,
-        new_value=cutlass.Int64(new_address),
-    )
-
-
-@cute.jit
-def _replace_tensormap_global_dim_1(desc_ptr, new_dim) -> None:
-    nvvm.tensormap_replace(
-        nvvm.TensormapField.GLOBAL_DIM,
-        desc_ptr,
-        new_value=cutlass.Int32(new_dim),
-        ord=1,
-    )
-
-
-@cute.jit
-def _fence_tensormap_release() -> None:
-    nvvm.fence_proxy_release(
-        nvvm.MemScope.GPU,
-        from_proxy=nvvm.Proxy.GENERIC,
-        to_proxy=nvvm.Proxy.TENSORMAP,
-    )
-
-
-@cute.jit
-def _fence_tensormap_acquire(desc_ptr) -> None:
-    nvvm.fence_proxy_acquire(
-        nvvm.MemScope.GPU,
-        desc_ptr,
-        _TENSOR_MAP_QWORDS * 8,
-        from_proxy=nvvm.Proxy.GENERIC,
-        to_proxy=nvvm.Proxy.TENSORMAP,
-    )
-
 
 # @@INJECT_TILE_CONSTANTS@@
 
@@ -113,18 +72,18 @@ def _moe_auto_swizzle_w(group_rows, n, k, nt_n):
     return cutlass.Int32(w)
 
 
-def _moe_swizzle_tile(t, nt_m, nt_n, swizzle_w):
-    """Group-local linear tile index -> (m, n) under an N-super-block walk.
-    ``swizzle_w == nt_n`` reproduces the plain n-fast split; ``1`` gives m-fast.
-    """
-    blk = cutlass.max(nt_m * swizzle_w, cutlass.Int32(1))
-    sb = t // blk
-    off = t - sb * blk
-    base_n = sb * swizzle_w
-    cur_S = cutlass.min(cutlass.Int32(swizzle_w), nt_n - base_n)
-    tile_m = off // cur_S
-    tile_n = base_n + off - tile_m * cur_S
-    return tile_m, tile_n
+def _b_collector_op(mi):
+    """B is identical across the M sub-blocks (only A's address advances), so the
+    first MMA fills the B collector and the rest read it back instead of
+    re-fetching the same operand from SMEM. `.collector::b::*` is silicon-gated
+    (sm_107a only), hence `b_collector_ok`."""
+    if cutlass.const_expr(not b_collector_ok or num_mma_m == 1):
+        return None
+    if cutlass.const_expr(mi == 0):
+        return nvvm.Tcgen05MMACollectorOp.FILL
+    if cutlass.const_expr(mi == num_mma_m - 1):
+        return nvvm.Tcgen05MMACollectorOp.LASTUSE
+    return nvvm.Tcgen05MMACollectorOp.USE
 
 
 @cute.kernel
@@ -223,7 +182,7 @@ def _kernel(
     tma_a_desc_smem_list = [
         cutlass.Array(
             cutlass.Int64,
-            _TENSOR_MAP_QWORDS,
+            TENSOR_MAP_QWORDS,
             space=cutlass.AddressSpace.smem,
             alignment=128,
         )
@@ -555,7 +514,7 @@ def _kernel(
 
         lane = tidx % 32
         block_linear = bidx + bidy * gridx
-        cta_desc_base_list = [a_tma_workspace.iterator.raw_ptr() + (block_linear * num_a_operands + _ai) * _TENSOR_MAP_QWORDS for _ai in range(num_a_operands)]
+        cta_desc_base_list = [a_tma_workspace.iterator.raw_ptr() + (block_linear * num_a_operands + _ai) * TENSOR_MAP_QWORDS for _ai in range(num_a_operands)]
         a_desc_tma_ptr_list = [
             cute.make_ptr(
                 cutlass.Int64,
@@ -609,7 +568,7 @@ def _kernel(
                             _replace_tensormap_global_address(tma_a_desc_smem_list[_ai], row_base)
                             _replace_tensormap_global_dim_1(tma_a_desc_smem_list[_ai], group_end - group_begin)
                         nvvm.bar_warp_sync(0xFFFFFFFF)
-                        if lane < _TENSOR_MAP_QWORDS:
+                        if lane < TENSOR_MAP_QWORDS:
                             (cta_desc_base_list[_ai] + lane).store((tma_a_desc_smem_list[_ai].subview(lane)).load())
                         nvvm.bar_warp_sync(0xFFFFFFFF)
                         _fence_tensormap_release()
@@ -727,7 +686,12 @@ def _kernel(
     ab_empty_arrive_mask = cutlass.Int16(a_part | b_part)
     if warp_idx == mma_warp_id:
         nvvm.setmaxregister(prod_reg_count, nvvm.SetMaxRegisterAction.DECREASE)
-        nvvm.tcgen05_alloc(tmem_ptr_i32, num_tmem_alloc_cols, group=nvvm.CTAGroup.CTA_2)
+        nvvm.tcgen05_alloc(
+            tmem_ptr_i32,
+            cutlass.Int32(num_tmem_alloc_cols),
+            is_exclusive=tmem_alloc_exclusive,
+            group=nvvm.CTAGroup.CTA_2,
+        )
         nvvm.bar_warp_sync(0xFFFFFFFF)
         nvvm.barrier_cta_arrive(barrier_id=TMEM_ALLOC_BARRIER_ID, thread_count=tmem_alloc_bar_count)
         tmem_raw_addr = tmem_ptr_i32.load()
@@ -909,6 +873,7 @@ def _kernel(
                                                 scale_a=sfa_dst_ptrs[_ai][mi],
                                                 scale_b=sfb_scale_ptrs[_bj],
                                                 scale_vec_size=scale_vec_size,
+                                                b_collector_op=_b_collector_op(mi),
                                             )
                                 # Every accumulator sees scale_d=False on exactly the first
                                 # k_block of the tile, so the flip stays outside mi.
@@ -958,7 +923,12 @@ def _kernel(
             if cutlass.const_expr(not use_acc_overlap):
                 nvvm.mbarrier_arrive(peer_mbar, scope=nvvm.MemScope.CLUSTER, relaxed=True)
             alloc_ptr = cutlass.inttoptr(tmem_raw_addr, 6, cutlass.Int32)
-            nvvm.tcgen05_dealloc(alloc_ptr, num_tmem_alloc_cols, group=nvvm.CTAGroup.CTA_2)
+            nvvm.tcgen05_dealloc(
+                alloc_ptr,
+                cutlass.Int32(num_tmem_alloc_cols),
+                is_exclusive=tmem_alloc_exclusive,
+                group=nvvm.CTAGroup.CTA_2,
+            )
         else:
             is_valid = cutlass.Int32(1)
             sched_stage = cutlass.Int32(0)
@@ -989,7 +959,12 @@ def _kernel(
             while not nvvm.mbarrier_try_wait_parity(tmem_dealloc_mbar_ptr, 0, time_limit=10_000_000):
                 pass
             alloc_ptr = cutlass.inttoptr(tmem_raw_addr, 6, cutlass.Int32)
-            nvvm.tcgen05_dealloc(alloc_ptr, num_tmem_alloc_cols, group=nvvm.CTAGroup.CTA_2)
+            nvvm.tcgen05_dealloc(
+                alloc_ptr,
+                cutlass.Int32(num_tmem_alloc_cols),
+                is_exclusive=tmem_alloc_exclusive,
+                group=nvvm.CTAGroup.CTA_2,
+            )
 
     if warp_idx < num_epilogue_warps:
         nvvm.setmaxregister(epi_reg_count, nvvm.SetMaxRegisterAction.INCREASE)

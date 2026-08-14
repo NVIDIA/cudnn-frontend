@@ -41,14 +41,11 @@ def _pipeline_from_file(template_file: str) -> str:
 
 
 # Active-GPU SM ranges per template pipeline — half-open [lo, hi) segments,
-# SM = major*10 + minor. A family may support several DISJOINT segments (e.g.
-# a future family running on sm200-210 plus sm250-270), so this is a tuple of
-# segments, never a single lo/hi pair.
+# SM = major*10 + minor. A family may support several DISJOINT segments
 PIPELINE_ARCH_RANGES: dict[str, tuple[tuple[int, int], ...]] = {
-    # sm100 templates use only family-portable Blackwell instructions.
     "sm100": ((100, 120),),
-    # The fp4 K=48B is an arch-exact ("a"-level) feature of SM 10.3.
-    "sm103": ((103, 104),),
+    "sm103": ((103, 110),),
+    "sm107": ((107, 110),),
 }
 
 # Pointwise ops a mainloop-fusion template can transform in SMEM.
@@ -141,16 +138,18 @@ def _bs_key(a: str, sfa: str, b: str, sfb: str, kblk: int) -> tuple:
     )
 
 
-# Supported block-scale (data, SF dtype, K-block) cases — shared by the plain
-# block-scale matmul and the block-scaled MoE grouped matmul.
 _BLOCK_SCALE_CASES = frozenset(
     {
-        _bs_key("fp4_e2m1", "fp8_e4m3", "fp4_e2m1", "fp8_e4m3", 16),  # nvfp4
-        _bs_key("fp4_e2m1", "fp8_e8m0", "fp4_e2m1", "fp8_e8m0", 32),  # mxfp4
-        _bs_key("fp8_e4m3", "fp8_e8m0", "fp8_e4m3", "fp8_e8m0", 32),  # mxfp8 e4m3×e4m3
-        _bs_key("fp8_e4m3", "fp8_e8m0", "fp8_e5m2", "fp8_e8m0", 32),  # mxfp8 e4m3×e5m2
-        _bs_key("fp8_e5m2", "fp8_e8m0", "fp8_e4m3", "fp8_e8m0", 32),  # mxfp8 e5m2×e4m3
-        _bs_key("fp8_e5m2", "fp8_e8m0", "fp8_e5m2", "fp8_e8m0", 32),  # mxfp8 e5m2×e5m2
+        _bs_key("fp4_e2m1", "fp8_e4m3", "fp4_e2m1", "fp8_e4m3", 16),
+        _bs_key("fp4_e2m1", "fp8_e4m3", "fp4_e2m1", "fp8_e4m3", 32),
+        _bs_key("fp4_e2m1", "fp8_e8m0", "fp4_e2m1", "fp8_e8m0", 16),
+        _bs_key("fp4_e2m1", "fp8_e8m0", "fp4_e2m1", "fp8_e8m0", 32),
+        _bs_key("fp4_e2m1", "fp8_e5m3", "fp4_e2m1", "fp8_e5m3", 16),
+        _bs_key("fp4_e2m1", "fp8_e5m3", "fp4_e2m1", "fp8_e5m3", 32),
+        _bs_key("fp8_e4m3", "fp8_e8m0", "fp8_e4m3", "fp8_e8m0", 32),
+        _bs_key("fp8_e4m3", "fp8_e8m0", "fp8_e5m2", "fp8_e8m0", 32),
+        _bs_key("fp8_e5m2", "fp8_e8m0", "fp8_e4m3", "fp8_e8m0", 32),
+        _bs_key("fp8_e5m2", "fp8_e8m0", "fp8_e5m2", "fp8_e8m0", 32),
     }
 )
 
@@ -193,10 +192,17 @@ MMA_TYPE_SUPPORT: dict[str, dict[GraphType, frozenset]] = {
     "sm103": {
         GraphType.BLOCK_SCALE_MATMUL: frozenset(
             {
-                _bs_key("fp4_e2m1", "fp8_e4m3", "fp4_e2m1", "fp8_e4m3", 16),  # nvfp4
-                _bs_key("fp4_e2m1", "fp8_e8m0", "fp4_e2m1", "fp8_e8m0", 32),  # mxfp4
+                _bs_key("fp4_e2m1", "fp8_e4m3", "fp4_e2m1", "fp8_e4m3", 16),
+                _bs_key("fp4_e2m1", "fp8_e4m3", "fp4_e2m1", "fp8_e4m3", 32),
+                _bs_key("fp4_e2m1", "fp8_e8m0", "fp4_e2m1", "fp8_e8m0", 16),
+                _bs_key("fp4_e2m1", "fp8_e8m0", "fp4_e2m1", "fp8_e8m0", 32),
+                _bs_key("fp4_e2m1", "fp8_e5m3", "fp4_e2m1", "fp8_e5m3", 16),
+                _bs_key("fp4_e2m1", "fp8_e5m3", "fp4_e2m1", "fp8_e5m3", 32),
             }
         ),
+    },
+    "sm107": {
+        GraphType.BLOCK_SCALE_MATMUL: _BLOCK_SCALE_CASES,
     },
 }
 
@@ -206,10 +212,16 @@ MMA_TYPE_SUPPORT: dict[str, dict[GraphType, frozenset]] = {
 # combos never appear here (stage-0 family gate + the existence sets decide).
 # Values are half-open [lo, hi) segments, same shape as PIPELINE_ARCH_RANGES.
 MMA_GPU_ARCH_SPECIAL_CASES: dict[tuple[str, tuple], tuple[tuple[int, int], ...]] = {
-    # int8 UTCIMMA (tcgen05 kind::i8) exists only on SM 100 and SM 110 — the
-    # other Blackwell family members dropped it (e.g. sm103 reworked the
-    # tensor core for fp4 throughput).
     ("sm100", ("int8", "int8", "int32")): ((100, 101), (110, 111)),
+    ("sm100", _bs_key("fp4_e2m1", "fp8_e5m3", "fp4_e2m1", "fp8_e5m3", 16)): ((107, 110),),
+    ("sm100", _bs_key("fp4_e2m1", "fp8_e5m3", "fp4_e2m1", "fp8_e5m3", 32)): ((107, 110),),
+    ("sm100", _bs_key("fp4_e2m1", "fp8_e4m3", "fp4_e2m1", "fp8_e4m3", 32)): ((107, 110),),
+    ("sm103", _bs_key("fp4_e2m1", "fp8_e5m3", "fp4_e2m1", "fp8_e5m3", 16)): ((107, 110),),
+    ("sm103", _bs_key("fp4_e2m1", "fp8_e5m3", "fp4_e2m1", "fp8_e5m3", 32)): ((107, 110),),
+    ("sm103", _bs_key("fp4_e2m1", "fp8_e4m3", "fp4_e2m1", "fp8_e4m3", 32)): ((107, 110),),
+    ("sm107", _bs_key("fp4_e2m1", "fp8_e5m3", "fp4_e2m1", "fp8_e5m3", 16)): ((107, 110),),
+    ("sm107", _bs_key("fp4_e2m1", "fp8_e5m3", "fp4_e2m1", "fp8_e5m3", 32)): ((107, 110),),
+    ("sm107", _bs_key("fp4_e2m1", "fp8_e4m3", "fp4_e2m1", "fp8_e4m3", 32)): ((107, 110),),
 }
 
 
@@ -259,6 +271,8 @@ class KernelTemplate:
     mainloop: bool  # mainloop-fusion variant (transform A/B before MMA)
     # Multi-GEMM support (templates without it reject multi-GEMM chains).
     supports_multi_gemm: bool = False
+    # A CTA tile spanning several MMA instructions along M (num_mma_m > 1).
+    supports_multi_mma_m: bool = True
 
     @property
     def block_scale(self) -> bool:
@@ -313,6 +327,9 @@ class KernelTemplate:
             C._check_mma_n_dim(chain, config, self.cta_group)
         except NotImplementedError as e:
             return str(e)
+        reason = self.multi_mma_m_reject(config)
+        if reason is not None:
+            return reason
         try:
             if self.block_scale:
                 from .tile_config import validate_block_scale_config
@@ -369,6 +386,23 @@ class KernelTemplate:
             or self._other_reject(chain, config)
         )
 
+    def multi_mma_m_reject(self, config: TileConfig) -> str | None:
+        """``None`` unless the config splits the CTA tile across several MMA
+        instructions along M and this template has not been adapted to it."""
+        if config.num_mma_m > 1 and not self.supports_multi_mma_m:
+            return (
+                f"{self.file} does not support a CTA tile spanning several MMA "
+                f"instructions along M (num_mma_m={config.num_mma_m}); use a "
+                f"cta_tile_m of {config.mma_inst_m}"
+            )
+        return None
+
+    def active_reject(self, config: TileConfig) -> str | None:
+        """The gates a JIT path applies once it has picked this template: the
+        active GPU's SM range, then capabilities a pure-geometry config can ask
+        for that this template does not implement."""
+        return self.arch_active_reject() or self.multi_mma_m_reject(config)
+
     def candidate_configs(self, chain: FusionChain) -> tuple[TileConfig, ...]:
         """Catalog geometries this template accepts for ``chain`` — by
         predicate filter, never hand-maintained."""
@@ -388,7 +422,7 @@ class MainloopKernelTemplate(KernelTemplate):
         return None
 
 
-# Registry — one entry per template file (15 today). A geometry config expands
+# Registry — one entry per template file (20 today). A geometry config expands
 # across these via `candidates`. cta_group / static_sched / mainloop live HERE.
 
 
@@ -400,6 +434,7 @@ def _mm(
     mainloop: bool = False,
     graph_type: GraphType = GraphType.MATMUL,
     supports_multi_gemm: bool = False,
+    supports_multi_mma_m: bool = True,
 ) -> KernelTemplate:
     pipeline = _pipeline_from_file(file)
     if pipeline not in PIPELINE_ARCH_RANGES:
@@ -415,6 +450,7 @@ def _mm(
         graph_type=graph_type,
         mainloop=mainloop,
         supports_multi_gemm=supports_multi_gemm,
+        supports_multi_mma_m=supports_multi_mma_m,
     )
 
 
@@ -465,17 +501,37 @@ TEMPLATES: tuple[KernelTemplate, ...] = (
     ),
     # sm103 block-scaled matmul: fp4-only (nvfp4/mxfp4), K=48B UTCOMMA
     # (K-tile 384 B, 8 MMAs over 3× 128-B chunks via circular SMEM descs).
+    # num_mma_m > 1 is NOT adapted here: the chunk pipeline miscomputes (A reads
+    # unwritten SMEM in K, period 192 B) and the ab_stages budget under-counts,
+    # so cta_tile_m=256 also overruns the SMEM cap. Both are silent-wrong /
+    # launch-fail, hence the gate. See CLAUDE.md for what was ruled out.
     _mm(
         "sm103_block_scale_matmul_1ctamma.py",
         cta_group=1,
         static=False,
         graph_type=GraphType.BLOCK_SCALE_MATMUL,
+        supports_multi_mma_m=False,
     ),
     _mm(
         "sm103_block_scale_matmul_2ctamma.py",
         cta_group=2,
         static=False,
         graph_type=GraphType.BLOCK_SCALE_MATMUL,
+        supports_multi_mma_m=False,
+    ),
+    _mm(
+        "sm107_block_scale_matmul_1ctamma.py",
+        cta_group=1,
+        static=False,
+        graph_type=GraphType.BLOCK_SCALE_MATMUL,
+        supports_multi_gemm=True,
+    ),
+    _mm(
+        "sm107_block_scale_matmul_2ctamma.py",
+        cta_group=2,
+        static=False,
+        graph_type=GraphType.BLOCK_SCALE_MATMUL,
+        supports_multi_gemm=True,
     ),
     # mainloop-fusion matmul (CLC only — no static / block-scale variant yet)
     _mm("sm100_matmul_mainloop_1ctamma.py", cta_group=1, static=False, mainloop=True),
@@ -511,7 +567,39 @@ TEMPLATES: tuple[KernelTemplate, ...] = (
         graph_type=GraphType.MOE_BLOCK_SCALE,
         supports_multi_gemm=True,
     ),
+    _mm(
+        "sm107_moe_grouped_block_scale_matmul_fwd_1ctamma.py",
+        cta_group=1,
+        static=False,
+        graph_type=GraphType.MOE_BLOCK_SCALE,
+        supports_multi_gemm=True,
+    ),
+    _mm(
+        "sm107_moe_grouped_block_scale_matmul_fwd_2ctamma.py",
+        cta_group=2,
+        static=False,
+        graph_type=GraphType.MOE_BLOCK_SCALE,
+        supports_multi_gemm=True,
+    ),
 )
+
+
+# Pipeline families the AUTO path (``tile_config.select_config``) may build
+# with, best first. sm103 is deliberately absent: its 384-byte K-tile is outside
+# select_config's geometry ladder, so it stays an explicit-config pipeline.
+_AUTO_PIPELINE_ORDER: tuple[str, ...] = ("sm107", "sm100")
+
+
+def preferred_pipeline(chain: FusionChain) -> str:
+    """Pipeline family the auto path should build ``chain`` with: the first
+    :data:`_AUTO_PIPELINE_ORDER` entry that has a template for this graph type
+    and whose SM range covers the active GPU. A graph type the newer family
+    does not implement (plain matmul, MoE) falls through to sm100 by itself."""
+    gt = classify_graph_type(chain)
+    for pipeline in _AUTO_PIPELINE_ORDER:
+        if any(t.pipeline == pipeline and t.graph_type is gt and t.arch_active_reject() is None for t in TEMPLATES):
+            return pipeline
+    return _AUTO_PIPELINE_ORDER[-1]
 
 
 def select_template(
