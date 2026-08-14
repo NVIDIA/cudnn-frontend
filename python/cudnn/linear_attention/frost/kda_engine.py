@@ -57,6 +57,8 @@ class KdaFrostEngine(BaseEngine):
         ckpt = facts.checkpoint_every_n_tokens
         if ckpt and (facts.is_bwd or ckpt % 16 != 0):
             raise NotImplementedError(f"KdaFrostEngine: checkpoint_every_n_tokens must be a positive multiple of 16 on the KDA node (got {ckpt})")
+        if not facts.gates_at_ho:
+            raise NotImplementedError(f"KdaFrostEngine: g/beta must carry HO = max(q, v) heads ({facts.h_o})")
         if facts.is_bwd and (facts.use_beta_sigmoid or facts.safe_gate):
             raise NotImplementedError("KdaFrostEngine: use_beta_sigmoid/safe_gate are forward-node attributes")
         fp32 = cudnn.data_type.FLOAT

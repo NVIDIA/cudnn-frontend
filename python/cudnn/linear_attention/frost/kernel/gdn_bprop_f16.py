@@ -68,7 +68,7 @@ SMEM layout (~226 KB of the 227 KB SM100 cap):
   K                                32768     2      <-- double-buffered (prefetch next chunk)
   V                                16384     1      <-- overwritten in place by U
   dO                               16384     1
-  state (checkpoint entry c-1)     32768     1      <-- bf16 [DK,DV], TMA-loaded
+  state (checkpoint entry c-1)     32768     1      <-- io-dtype [DK,DV], TMA-loaded
   T_inv                            8192      1      <-- inverse OUTPUT (upper tri = kernel-start zeros)
   KK (pristine M_kk)               8192      1      <-- KK epi's only store; inverse input + dGate/dBeta
   A staging / sDa                  8192      1      <-- ALIAS: A then the masked dA
@@ -4436,7 +4436,7 @@ def chunk_gdn_bwd_sm100(
             alpha, or the natural-log decay when ``log_gate``
         beta: ``(total_tokens, HO)`` float32, update gate
         do: ``(total_tokens, HO, DV)`` float16/bfloat16, output gradient
-        state_checkpoints: ``(total_checkpoints, HO, DK, DV)`` bfloat16, per-chunk
+        state_checkpoints: ``(total_checkpoints, HO, DK, DV)`` io dtype, per-chunk
             forward states from the prefill kernel's checkpoint output (``checkpoint_every_n_tokens=B_T``)
         dq/dk/dv: pre-allocated output gradients, shaped/typed like q/k/v at
             HO heads

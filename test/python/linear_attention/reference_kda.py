@@ -104,7 +104,8 @@ def kda_reference(
     if g.shape[2] != HO:
         alphaf = alphaf.unsqueeze(3).expand(-1, -1, -1, HO // g.shape[2], -1).reshape(g.shape[0], g.shape[1], HO, -1)
     if beta.shape[2] != HO:
-        betaf = betaf.unsqueeze(3).expand(-1, -1, -1, HO // beta.shape[2], -1).reshape(beta.shape[0], beta.shape[1], HO, -1)
+        # direct-reference callers only: the op and the kernels take beta at HO heads
+        betaf = betaf.unsqueeze(3).expand(-1, -1, -1, HO // beta.shape[2]).reshape(beta.shape[0], beta.shape[1], HO)
 
     # [B, T, HO, *] -> [B, HO, T, *]
     qf = qf.permute(0, 2, 1, 3)

@@ -34,8 +34,8 @@ arrive by TMA alongside Q/K/V.
 
 ABI: q `[T, HQ, DK]`, k `[T, HK, DK]`, v `[T, HV, DV]`, gate
 `[T, HO, DK]` fp32 (natural-log decay unless SAFE_GATE), beta `[T, HO, DK]`
-and w `[T, HO, DV]` in the io dtype, cu_seqlens int64, states/checkpoints
-`[N, HO, DV, DK]` (VK).  GQA/GVA head broadcast follows repeat_interleave:
+and w `[T, HO, DV]` in the io dtype, cu_seqlens int32, states/checkpoints
+`[N, HO, DK, DV]` (KV, v contiguous).  GQA/GVA head broadcast follows repeat_interleave:
 source head = head_idx // (HO // H_x).  State presence, L2NORM, SAFE_GATE,
 checkpoints, and the head ratios are compile-time specializations.
 

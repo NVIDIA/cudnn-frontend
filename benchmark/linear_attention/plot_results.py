@@ -9,8 +9,8 @@ Reads the CSV emitted by the shmoo runner (one --format_output line per
 size, with Forward and Backward TFLOPS panels side by side — same style as
 the SDPA training benchmark charts.
 
-    python plot_results.py results/gdn/b300/gdn_labench.csv \
-        --output-dir results/gdn/b300 --gpu-name B300 --cudnn-version 9.24.0
+    python plot_results.py results/gdn/gb300/gdn_20260813.csv \
+        --output-dir results/gdn/gb300 --gpu-name GB300 --cudnn-version 9.24.0
 """
 
 import argparse

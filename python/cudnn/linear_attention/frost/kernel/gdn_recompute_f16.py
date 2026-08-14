@@ -2446,7 +2446,7 @@ def chunk_gdn_recompute_sm100(
         initial_state: ``(num_seqs, HO, DK, DK)`` float32/bfloat16, or None
         output_state: ``(num_seqs, HO, DK, DK)`` float32/bfloat16, or None
         checkpoint_every_n_tokens: emit a checkpoint entry every N tokens (0 = off)
-        output_state_checkpoints: ``(total_checkpoints, HO, DK, DK)`` bfloat16, or None.  Entry j is the
+        output_state_checkpoints: ``(total_checkpoints, HO, DK, DK)`` io dtype, or None.  Entry j is the
             state after ``(j + 1) * N`` tokens, STRICTLY BEFORE the sequence
             end -- the end-of-sequence state is only ``output_state``
             (fp32-capable).  With ``N == B_T`` this is the per-chunk checkpoint

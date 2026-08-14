@@ -27,8 +27,8 @@ via ``cu_seqlens``.
 
 All math runs in fp64 on the input device and is differentiable, so it
 doubles as the gradient oracle for the bprop tests. The recurrent state is
-kept K-major ``[N, HO, K, V]`` here; the kernel keeps it V-major
-``[N, HO, V, K]`` (transpose at the boundary).
+kept K-major ``[N, HO, K, V]`` here, matching the kernel ABI (KV, v
+contiguous).
 """
 
 from __future__ import annotations

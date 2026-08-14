@@ -45,7 +45,7 @@ Warp assignments (16 warps = 512 threads):
   warps 8-11 : WG2 - dQ/dK part drain, dGate/dBeta assembly, reverse cumsum
   warp  12   : super-MMA - register KK/A/dA/dM + Neumann inverse
   warp  13   : tcgen05-MMA - the backward schedule
-  warp  14   : TMA load - Q/K/V/Gate/dO/state(checkpoint) loads + Beta scalars
+  warp  14   : TMA load - Q/K/V/Gate/dO/state(checkpoint) loads + Beta/W tiles
   warp  15   : epilogue - dQ/dK/dV/dGate/dBeta/dW_out TMA stores
 """
 

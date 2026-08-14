@@ -56,6 +56,8 @@ class Gdn2FrostEngine(BaseEngine):
         ckpt = facts.checkpoint_every_n_tokens
         if ckpt and (facts.is_bwd or ckpt % 16 != 0):
             raise NotImplementedError(f"Gdn2FrostEngine: checkpoint_every_n_tokens must be a positive multiple of 16 on the GDN-2 node (got {ckpt})")
+        if not facts.gates_at_ho:
+            raise NotImplementedError(f"Gdn2FrostEngine: g/beta/w must carry HO = max(q, v) heads ({facts.h_o})")
         if facts.is_bwd and facts.safe_gate:
             raise NotImplementedError("Gdn2FrostEngine: safe_gate is a forward-node attribute")
         fp32 = cudnn.data_type.FLOAT
@@ -231,7 +233,7 @@ class CompiledGdn2:
 class CompiledGdn2Bwd:
     """Compiled FROST GDN-2 backward plan: the workspace holds the
     regenerated per-chunk checkpoint series when the graph carries no ``state_checkpoints`` input,
-    plus GVA head scratch for dQ/dK."""
+    plus GVA/GQA head scratch for dQ/dK/dV."""
 
     def __init__(self, node, bwd_mod, regen_mod):
         from .common.split_k import WORK_ITEM_FIELDS, build_split_table, chunk_scratch_rows, compute_ideal_chunks, max_work_items

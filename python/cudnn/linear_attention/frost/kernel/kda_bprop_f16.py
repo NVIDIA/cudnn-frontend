@@ -39,12 +39,12 @@ dtype, the plain per-chunk checkpoint series with NO initial-state slot (entry `
 d_final_state fp32 `[N, HO, DK, DV]` (K-major).
 
 Warp assignments (16 warps = 512 threads):
-  warps 0-3  : WG0 - Gate prefix scan + decay/restore operands (all chunks)
-  warps 4-7  : WG1 - state SMEM->TMEM copy, value-side TMEM staging, dstate capture, dBeta
+  warps 0-3  : WG0 - Gate prefix scan + decay/restore operands (all chunks) + Beta scalar gather
+  warps 4-7  : WG1 - value-side TMEM staging, dstate capture, dBeta
   warps 8-11 : WG2 - dQ/dK part drain, dGate assembly, reverse cumsum, dGate
   warp  12   : super-MMA - register KK/A/dA/dM + Neumann inverse
   warp  13   : tcgen05-MMA - the 15-GEMM backward schedule
-  warp  14   : TMA load - Q/K/V/Gate/dO/entering-state loads + Beta scalars
+  warp  14   : TMA load - Q/K/V/Gate/dO/entering-state loads
   warp  15   : epilogue - dQ/dK/dV/dGate TMA stores
 """
 

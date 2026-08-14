@@ -904,7 +904,7 @@ def gated_delta_net_v2(
             a non-differentiable dump.
 
         plan_name: optionally pin one execution plan by name (the plan
-            API's ``get_plan_name_at_index`` names, e.g. ``gdn_frost``); a
+            API's ``get_plan_name_at_index`` names, e.g. ``gdn2_frost``); a
             graph offering no such plan raises ``cudnnGraphNotSupportedError``.
     Returns:
         ``(o, final_state)`` with ``o`` shaped like ``v``, or

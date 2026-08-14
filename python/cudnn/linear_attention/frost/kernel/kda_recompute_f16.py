@@ -39,7 +39,8 @@ Pipeline (direct CUTLASS primitives, chunk_idx-size 16 KDA schedule):
 ABI: k `[T, HK, DK]`, v `[T, HV, DV]`, gate
 `[T, HO, DK]` fp32 (natural-log decay unless SAFE_GATE, which applies the
 safe-gate transform from raw gate + a_log/dt_bias), beta `[T, HO]` fp32
-post-sigmoid, cu_seqlens int32, states/checkpoints `[N, HO, DV, DK]` (VK).
+post-sigmoid, cu_seqlens int32, states/checkpoints `[N, HO, DK, DV]` (KV, v
+contiguous).
 GQA/GVA head broadcast follows repeat_interleave: source head =
 head_idx // (HO // H_x).  State presence, L2NORM, SAFE_GATE, checkpoints, and the
 head ratios are compile-time specializations.
