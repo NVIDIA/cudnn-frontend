@@ -21,13 +21,16 @@ logger = logging.getLogger(__name__)
 # Each backend has a base color; FP8 variants get a darker/different shade
 BACKEND_CONFIG = {
     "cudnn": {"name": "cudnn", "color": "#76b900", "color_fp8": "#4a7500", "color_mxfp8": "#2d5a00", "order": 0},
-    "pyt_cudnn": {"name": "cuDNN (PyTorch)", "color": "#90EE90", "color_fp8": "#228B22", "color_mxfp8": "#006400", "order": 1},
-    "pyt_flash_attention": {"name": "FAv2 (PyTorch)", "color": "#6495ED", "color_fp8": "#0000CD", "color_mxfp8": "#00008B", "order": 2},
-    "pyt_efficient_attention": {"name": "xFormers (PyTorch)", "color": "#FF00FF", "color_fp8": "#8B008B", "color_mxfp8": "#4B0082", "order": 3},
-    "pyt_math": {"name": "Standard Attention", "color": "#FF8C00", "color_fp8": "#D2691E", "color_mxfp8": "#8B4513", "order": 4},
-    "flash_attention": {"name": "FAv2 (Native)", "color": "#F08080", "color_fp8": "#CD5C5C", "color_mxfp8": "#8B0000", "order": 5},
-    "flash_attention_3": {"name": "FAv3", "color": "#FFA500", "color_fp8": "#FF6600", "color_mxfp8": "#CC5200", "order": 6},
-    "flash_attention_4": {"name": "FAv4", "color": "#FFD700", "color_fp8": "#DAA520", "color_mxfp8": "#B8860B", "order": 7},
+    # cuDNN Frontend FROST engines: open-source CuTe-DSL kernels, pinned via
+    # cudnn.frost so no native cuDNN kernel serves the measured graph.
+    "cudnn_oss": {"name": "cuDNN OSS (FROST)", "color": "#2E8B57", "color_fp8": "#1F5F3B", "color_mxfp8": "#143D26", "order": 1},
+    "pyt_cudnn": {"name": "cuDNN (PyTorch)", "color": "#90EE90", "color_fp8": "#228B22", "color_mxfp8": "#006400", "order": 2},
+    "pyt_flash_attention": {"name": "FAv2 (PyTorch)", "color": "#6495ED", "color_fp8": "#0000CD", "color_mxfp8": "#00008B", "order": 3},
+    "pyt_efficient_attention": {"name": "xFormers (PyTorch)", "color": "#FF00FF", "color_fp8": "#8B008B", "color_mxfp8": "#4B0082", "order": 4},
+    "pyt_math": {"name": "Standard Attention", "color": "#FF8C00", "color_fp8": "#D2691E", "color_mxfp8": "#8B4513", "order": 5},
+    "flash_attention": {"name": "FAv2 (Native)", "color": "#F08080", "color_fp8": "#CD5C5C", "color_mxfp8": "#8B0000", "order": 6},
+    "flash_attention_3": {"name": "FAv3", "color": "#FFA500", "color_fp8": "#FF6600", "color_mxfp8": "#CC5200", "order": 7},
+    "flash_attention_4": {"name": "FAv4", "color": "#FFD700", "color_fp8": "#DAA520", "color_mxfp8": "#B8860B", "order": 8},
 }
 
 # Font sizes for plot elements
@@ -66,7 +69,7 @@ def _format_cudnn_backend_version(v) -> str:
     return f"{n // 10000}.{(n % 10000) // 100}.{n % 100}"
 
 
-def get_backend_display_name(backend: str, data_type: str, cudnn_backend_version=None) -> str:
+def get_backend_display_name(backend: str, data_type: str, cudnn_backend_version=None, cudnn_frontend_version=None) -> str:
     """
     Get display name for backend+dtype combination.
 
@@ -75,6 +78,9 @@ def get_backend_display_name(backend: str, data_type: str, cudnn_backend_version
         data_type: Data type (e.g., "bfloat16", "fp8")
         cudnn_backend_version: Integer version from cudnn.backend_version()
             (e.g. 92200 -> 9.22.0). Appended to the display name for cuDNN rows.
+        cudnn_frontend_version: cuDNN Frontend version string (e.g. "1.16.0").
+            Appended for cudnn_oss rows — the OSS FROST kernels ship with the
+            frontend, so the backend library version is not what ran.
 
     Returns:
         Display name for legend (e.g., "cudnn 9.22.0 (FP8)")
@@ -84,6 +90,8 @@ def get_backend_display_name(backend: str, data_type: str, cudnn_backend_version
         v = _format_cudnn_backend_version(cudnn_backend_version)
         if v:
             base_name = f"{base_name} {v}"
+    elif backend == "cudnn_oss" and cudnn_frontend_version:
+        base_name = f"{base_name} {cudnn_frontend_version}"
     if data_type == "fp8":
         return f"{base_name} (FP8)"
     elif data_type == "mxfp8":
@@ -114,10 +122,38 @@ def get_backend_color(backend: str, data_type: str) -> str:
     return config.get("color", "gray")
 
 
+# Dashed peak-line styling per dtype bucket (see DTYPE_ORDER). fp8 and mxfp8
+# share one line: same MMA datapath, same peak.
+_PEAK_LINE_STYLE = {
+    "bfloat16": {"color": "#333333", "label": "BF16 peak (dense MMA)"},
+    "float16": {"color": "#333333", "label": "FP16 peak (dense MMA)"},
+    "fp8": {"color": "#8b0000", "label": "FP8/MXFP8 peak (dense MMA)"},
+    "mxfp8": {"color": "#8b0000", "label": "FP8/MXFP8 peak (dense MMA)"},
+}
+
+
+def _draw_peak_lines(ax, dtypes, peak_tflops):
+    """Dashed horizontal line at peak TFLOPS for each dtype bucket on ``ax``.
+
+    ``peak_tflops`` maps dtype -> TFLOPS (the runner's SOL denominator:
+    dense-MMA rate x SM count x max SM clock). Duplicate buckets (fp8+mxfp8)
+    collapse to one line/legend entry.
+    """
+    drawn = set()
+    for dt in dtypes:
+        peak = (peak_tflops or {}).get(dt)
+        style = _PEAK_LINE_STYLE.get(dt)
+        if peak is None or style is None or style["label"] in drawn:
+            continue
+        drawn.add(style["label"])
+        ax.axhline(peak, linestyle="--", linewidth=1.3, color=style["color"], alpha=0.85, label=style["label"], zorder=1)
+
+
 def generate_charts_by_mask(
     df: "pd.DataFrame",
     config: "BenchmarkConfig",
     output_dir: Optional[Path] = None,
+    peak_tflops: Optional[dict] = None,
 ) -> list:
     """
     Generate separate charts for each mask type.
@@ -129,6 +165,8 @@ def generate_charts_by_mask(
         df: DataFrame with benchmark results
         config: BenchmarkConfig used for the run
         output_dir: Directory for output files
+        peak_tflops: Optional dtype -> peak TFLOPS map; when given, each chart
+            gets a dashed horizontal line per dtype bucket at that peak
 
     Returns:
         List of paths to saved chart files
@@ -137,6 +175,13 @@ def generate_charts_by_mask(
     import seaborn as sns
 
     df = df[df["success"] == True].copy()
+
+    # Peak lines default to the per-row SOL denominator the benchmark records
+    # (dense-MMA rate at the sampled boost clock); median per dtype so one
+    # outlier clock sample can't move the line.
+    if peak_tflops is None and "peak_mma_tflops" in df.columns:
+        by_dtype = df[df["peak_mma_tflops"].notna() & (df["peak_mma_tflops"] > 0)].groupby("data_type")["peak_mma_tflops"].median()
+        peak_tflops = {dt: float(v) for dt, v in by_dtype.items()} or None
 
     # Main charts show only non-deterministic mode; det-vs-nondet comparison
     # is in generate_det_overhead_charts. Fwd rows always carry det=False, so
@@ -170,6 +215,7 @@ def generate_charts_by_mask(
                 r["backend"],
                 r["data_type"],
                 r.get("cudnn_backend_version") if r["backend"] == "cudnn" else None,
+                r.get("cudnn_version") if r["backend"] == "cudnn_oss" else None,
             ),
             axis=1,
         )
@@ -230,6 +276,7 @@ def generate_charts_by_mask(
                 linewidth=0.5,
                 errorbar=None,
             )
+            _draw_peak_lines(ax_fwd, fwd_df["data_type"].unique(), peak_tflops)
             ax_fwd.set_xlabel("Sequence Length", fontsize=LABEL_FONT_SIZE)
             ax_fwd.set_ylabel("TFLOPS", fontsize=LABEL_FONT_SIZE)
             ax_fwd.set_title("Forward", fontsize=TITLE_FONT_SIZE)
@@ -251,6 +298,7 @@ def generate_charts_by_mask(
                 linewidth=0.5,
                 errorbar=None,
             )
+            _draw_peak_lines(ax_bwd, bwd_df["data_type"].unique(), peak_tflops)
             ax_bwd.set_xlabel("Sequence Length", fontsize=LABEL_FONT_SIZE)
             ax_bwd.set_ylabel("TFLOPS", fontsize=LABEL_FONT_SIZE)
             ax_bwd.set_title("Backward", fontsize=TITLE_FONT_SIZE)
@@ -273,6 +321,7 @@ def generate_det_overhead_charts(
     df: "pd.DataFrame",
     config: "BenchmarkConfig",
     output_dir: Optional[Path] = None,
+    peak_tflops: Optional[dict] = None,
 ) -> list:
     """
     For each (config, mask), emit a bwd-only bar chart showing raw TFLOPS for
@@ -281,9 +330,16 @@ def generate_det_overhead_charts(
     FAv4); FP8/MXFP8 are cuDNN-only and off-topic for this comparison.
 
     Only emits a chart if at least one seqlen has both det modes present.
+    ``peak_tflops`` as in :func:`generate_charts_by_mask`; defaults to the
+    recorded per-row SOL denominator (only the BF16 line applies here).
     """
     import matplotlib.pyplot as plt
     import seaborn as sns
+
+    if peak_tflops is None and "peak_mma_tflops" in df.columns:
+        ok = df[(df["success"] == True) & df["peak_mma_tflops"].notna() & (df["peak_mma_tflops"] > 0)]
+        by_dtype = ok.groupby("data_type")["peak_mma_tflops"].median()
+        peak_tflops = {dt: float(v) for dt, v in by_dtype.items()} or None
 
     bwd = df[
         (df["success"] == True) & (df["profile_pass"] == "bwd") & (df["backend"].isin(["cudnn", "flash_attention_4"])) & (df["data_type"] == "bfloat16")
@@ -352,6 +408,7 @@ def generate_det_overhead_charts(
             errorbar=None,
         )
 
+        _draw_peak_lines(ax, ["bfloat16"], peak_tflops)
         mask_title = "Causal" if mask == "top_left" else "Non-Causal" if mask == "no_mask" else mask
         model_info = _get_model_info(config)
         ax.set_xlabel("Sequence Length", fontsize=LABEL_FONT_SIZE)

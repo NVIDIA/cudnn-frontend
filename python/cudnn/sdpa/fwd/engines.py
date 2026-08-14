@@ -404,6 +404,7 @@ def _sm100_spec(d: int, d_v: Optional[int] = None) -> EngineSpec:
             dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
             causal=True,
             bottom_right=True,
+            bottom_right_with_swa=True,
             right_band_widening=True,
             swa=True,
             padded=True,
@@ -453,6 +454,9 @@ def _sm100_mxfp8_spec(d: int) -> EngineSpec:
             is_mxfp8=True,
             causal=True,
             bottom_right=True,
+            # BR+SWA stays off this row: the one mhas graph it admits trips the
+            # mxfp8 executor's SF-size mismatch (pre-existing SF-layout issue,
+            # independent of the mask) — flip once that plumbing is fixed.
             right_band_widening=True,
             swa=True,
             padded=True,
@@ -491,6 +495,7 @@ def _sm100_fp8_spec(d: int) -> EngineSpec:
             is_fp8=True,
             causal=True,
             bottom_right=True,
+            bottom_right_with_swa=True,
             right_band_widening=True,
             swa=True,
             padded=True,
