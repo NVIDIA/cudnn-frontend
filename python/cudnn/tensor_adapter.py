@@ -161,6 +161,28 @@ def canonicalize_unit_dim_strides(shape: Tuple[int, ...], stride: Tuple[int, ...
     return tuple(numel if dim == 1 else s for dim, s in zip(shape, stride))
 
 
+def fastsig(tensor: Any, *, dynamic_m: bool = False) -> Optional[tuple]:
+    """Cheap, torch-only, M-invariant operand signature for hot-loop dispatch keys.
+
+    The shared primitive behind the imperative-API fast paths. Unlike the canonical
+    signatures used for the (rare) compile cache, this avoids the per-operand sort and
+    the framework-dispatching adapters: read the torch attributes once and zero the
+    extent-1 dims' strides. Kernels cannot observe a unit dim's stride, and the only
+    M-dependent stride term rides the extent-1 batch dim, so zeroing it makes the key
+    invariant to M -- a hot loop that only grows M keeps hitting the same compiled op.
+
+    Callers pass torch tensors (or None for an absent operand); a non-torch tensor must
+    be gated out by the caller (its hot loop is not the optimization target).
+    """
+    if tensor is None:
+        return None
+    shape = tuple(tensor.shape)
+    stride = tensor.stride()
+    key_stride = tuple(0 if extent == 1 else s for extent, s in zip(shape, stride))
+    key_shape = (None, *shape[1:]) if dynamic_m else shape
+    return (key_shape, key_stride, tensor.dtype, tensor.device)
+
+
 def get_data_ptr(tensor: Any) -> int:
     """Device data pointer of the tensor, in the caller's framework.
 

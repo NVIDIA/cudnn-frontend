@@ -18,11 +18,14 @@ from cudnn.tensor_adapter import (
     canonicalize_unit_dim_strides,
     cuda_is_available,
     detect_framework,
+    fastsig,
+    framework_dtype,
     get_compute_capability,
     get_data_ptr,
     get_device,
     get_shape,
     get_strides,
+    is_torch_tensor,
 )
 
 from ._bf16_api import GroupedGemmBf16API, _validate_pointer_tensor
@@ -95,6 +98,7 @@ class GroupedGemmSm100(APIBase):
         bias_tensor: Optional[torch.Tensor] = None,
         prob_tensor: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
+        _trusted: bool = True,
     ) -> None:
         if self._implementation is None:
             raise RuntimeError("Kernel not compiled; call compile() first")
@@ -109,12 +113,21 @@ class GroupedGemmSm100(APIBase):
             bias_tensor=bias_tensor,
             prob_tensor=prob_tensor,
             current_stream=current_stream,
+            _trusted=_trusted,
         )
-        self._is_supported = self._implementation._is_supported
-        self._compiled_kernel = self._implementation._compiled_kernel
+        if not _trusted:
+            self._is_supported = self._implementation._is_supported
+            self._compiled_kernel = self._implementation._compiled_kernel
 
 
 _cache_of_GroupedGemmSm100Objects: dict[tuple, GroupedGemmSm100] = {}
+
+# Fast path for hot loops: operand-metadata key -> (op, output n, c/d dtypes, is_dense).
+# Keyed on shape/stride/dtype/device (M masked), NOT object identity, so a training loop
+# passing fresh tensors of the same shape each step skips normalization + the cache-key
+# rebuild, reuses the compiled op, and dispatches through execute(_trusted=True) (which
+# skips per-launch validation). Torch-only (jax falls through to the slow path).
+_wrapper_fastpath: dict = {}
 
 
 def _stride_order(tensor: torch.Tensor) -> Tuple[int, ...]:
@@ -273,6 +286,61 @@ def grouped_gemm_wrapper_sm100(
     use_dynamic_sched: bool = False,
     current_stream: Optional[cuda.CUstream] = None,
 ) -> TupleDict:
+    # Hot-loop fast path: same operand metadata (shape/stride/dtype/device, M masked) and
+    # scalar config as a previous call -- keyed on that metadata, NOT object identity, so a
+    # real training loop passing FRESH tensors of the same shape each step still hits. A hit
+    # skips normalization and the cache-key rebuild, allocates the outputs, and dispatches
+    # through execute(_trusted=True) (which skips per-launch validation). Torch-only, and
+    # only the allocate-the-outputs case; JAX inputs or a caller-supplied c/d fall through.
+    _fp_key = None
+    if c_tensor is None and d_tensor is None and is_torch_tensor(a_tensor):
+        _fp_key = (
+            fastsig(a_tensor, dynamic_m=True),
+            fastsig(padded_offsets),
+            fastsig(alpha_tensor),
+            fastsig(prob_tensor, dynamic_m=True),
+            fastsig(b_ptrs),
+            fastsig(b_tensor),
+            fastsig(bias_tensor),
+            n,
+            b_dtype,
+            b_major,
+            acc_dtype,
+            c_dtype,
+            d_dtype,
+            cd_major,
+            tuple(mma_tiler_mn),
+            None if cluster_shape_mn is None else tuple(cluster_shape_mn),
+            vector_f32,
+            m_aligned,
+            generate_c,
+            use_dynamic_sched,
+        )
+        _fp = _wrapper_fastpath.get(_fp_key)
+        if _fp is not None:
+            import torch
+
+            op, n_out, c_dt, d_dt, is_dense = _fp
+            tensor_m = a_tensor.shape[0]
+            exp_shape = (tensor_m, n_out, 1)
+            exp_stride = (n_out, 1, tensor_m * n_out)
+            internal_c = torch.empty_strided(exp_shape, exp_stride, dtype=framework_dtype(c_dt, "torch"), device=a_tensor.device)
+            d_out = torch.empty_strided(exp_shape, exp_stride, dtype=framework_dtype(d_dt, "torch"), device=a_tensor.device)
+            op.execute(
+                a_tensor=a_tensor,
+                c_tensor=internal_c,
+                d_tensor=d_out,
+                padded_offsets=padded_offsets,
+                alpha_tensor=alpha_tensor,
+                b_tensor=b_tensor if is_dense else None,
+                b_ptrs=None if is_dense else b_ptrs,
+                bias_tensor=bias_tensor,
+                prob_tensor=prob_tensor,
+                current_stream=current_stream,
+                _trusted=True,
+            )
+            return TupleDict(d_tensor=d_out, c_tensor=internal_c if generate_c else None)
+
     framework = detect_framework(a_tensor)
     if framework not in ("torch", "jax"):
         raise ValueError(f"Unsupported tensor framework '{framework}' for grouped_gemm_wrapper_sm100; pass torch tensors or JAX arrays")
@@ -408,6 +476,8 @@ def grouped_gemm_wrapper_sm100(
         op.compile()
         _cache_of_GroupedGemmSm100Objects[cache_key] = op
 
+    # First call of this configuration: run the fully checked launch so wrapper users get
+    # their inputs validated once before the trusted hot path (execute() trusts by default).
     op.execute(
         a_tensor=a_tensor,
         c_tensor=internal_c,
@@ -419,7 +489,10 @@ def grouped_gemm_wrapper_sm100(
         bias_tensor=bias_tensor,
         prob_tensor=prob_tensor,
         current_stream=current_stream,
+        _trusted=False,
     )
+    if _fp_key is not None and framework == "torch":
+        _wrapper_fastpath[_fp_key] = (op, n_out, c_dtype, d_dtype, is_dense)
     return TupleDict(
         d_tensor=d_tensor,
         c_tensor=internal_c if generate_c else None,

@@ -254,14 +254,20 @@ class GroupedGemmBf16API(APIBase):
         import torch
 
         handle = int(current_stream)
-        torch_current = torch.cuda.current_stream(b_ptrs.device)
-        torch_default = torch.cuda.default_stream(b_ptrs.device)
-        if handle == torch_current.cuda_stream:
-            launch_stream = torch_current
-        elif handle == torch_default.cuda_stream:
-            launch_stream = torch_default
-        else:
-            launch_stream = torch.cuda.ExternalStream(handle, device=b_ptrs.device)
+        # Resolving the handle to a torch.cuda.Stream queries current+default stream every
+        # launch; the mapping is stable, so cache it per (device, handle).
+        cache = self.__dict__.setdefault("_launch_stream_cache", {})
+        launch_stream = cache.get(handle)
+        if launch_stream is None:
+            torch_current = torch.cuda.current_stream(b_ptrs.device)
+            torch_default = torch.cuda.default_stream(b_ptrs.device)
+            if handle == torch_current.cuda_stream:
+                launch_stream = torch_current
+            elif handle == torch_default.cuda_stream:
+                launch_stream = torch_default
+            else:
+                launch_stream = torch.cuda.ExternalStream(handle, device=b_ptrs.device)
+            cache[handle] = launch_stream
         b_ptrs.record_stream(launch_stream)
 
     def check_support(self) -> bool:
@@ -533,6 +539,9 @@ class GroupedGemmBf16API(APIBase):
         *,
         dynamic_m: bool = False,
     ) -> TensorDesc:
+        # Only reached on a checked launch (execute(_trusted=False), e.g. the wrapper's
+        # first call of a configuration): build and check the canonical descriptor. The
+        # trusted hot path never gets here.
         desc = self._make_tensor_desc(tensor, name=name, canonical=True)
         if desc.dtype != sample.dtype:
             raise ValueError(f"{name} dtype mismatch: expected {sample.dtype}, got {desc.dtype}")
@@ -559,6 +568,7 @@ class GroupedGemmBf16API(APIBase):
         bias_tensor: Optional[torch.Tensor] = None,
         prob_tensor: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
+        _trusted: bool = True,
     ) -> None:
         if current_stream is None:
             # torch inputs stay ordered with the caller's current torch stream;
@@ -568,6 +578,17 @@ class GroupedGemmBf16API(APIBase):
             raise RuntimeError("Kernel not compiled; call compile() first")
         if prob_tensor is None:
             raise ValueError("prob_tensor is required")
+
+        # Trust contract (default): execute() trusts the caller to pass operands whose
+        # shape / stride / dtype / device match what the kernel was compiled with (only M
+        # may vary). The hot path does no per-launch validation -- just the pointer-stream
+        # record and the dispatch. This is an expert API: ensuring that contract is the
+        # caller's responsibility. Pass _trusted=False for a fully checked launch; the
+        # public wrapper does exactly that on the first call of each configuration, so
+        # wrapper users still get their inputs validated once before the trusted hot path.
+        if _trusted:
+            self._dispatch(a_tensor, c_tensor, d_tensor, padded_offsets, alpha_tensor, b_tensor, b_ptrs, bias_tensor, prob_tensor, current_stream)
+            return
 
         a_desc = self._validate_live_tensor(a_tensor, self.a_desc, "a_tensor", dynamic_m=True)
         c_desc = self._validate_live_tensor(c_tensor, self.c_desc, "c_tensor", dynamic_m=True)
@@ -620,8 +641,15 @@ class GroupedGemmBf16API(APIBase):
                 raise ValueError(f"b_ptrs must be on the same device as a_tensor " f"({self.a_desc.device}), got {get_device(b_ptrs)}")
             self._validate_pointer_array_alignment(b_ptrs)
             self._validate_pointer_values_once(b_ptrs)
-            self._record_pointer_stream(b_ptrs, current_stream)
 
+        self._dispatch(a_tensor, c_tensor, d_tensor, padded_offsets, alpha_tensor, b_tensor, b_ptrs, bias_tensor, prob_tensor, current_stream)
+
+    def _dispatch(self, a_tensor, c_tensor, d_tensor, padded_offsets, alpha_tensor, b_tensor, b_ptrs, bias_tensor, prob_tensor, current_stream) -> None:
+        # The one launch site shared by the trusted and post-validation paths: record the
+        # pointer array's launch stream (async correctness for the discrete weight pointers)
+        # and invoke the compiled kernel.
+        if self.weight_mode != MoEWeightMode.DENSE:
+            self._record_pointer_stream(b_ptrs, current_stream)
         self._compiled_kernel(
             a_tensor,
             c_tensor,
