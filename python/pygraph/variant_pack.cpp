@@ -857,11 +857,12 @@ its parts.
         .def("operands", &VariantPackNative::operands)
         .def_property_readonly("address", &VariantPackNative::pointer_array)
         .def("__len__", &VariantPackNative::size)
-        .def("all_contiguous", [](const VariantPackNative &self) {
-            std::string offender;
-            bool ok = self.all_contiguous(offender);
-            return py::make_tuple(ok, offender);
-        })
+        .def("all_contiguous",
+             [](const VariantPackNative &self) {
+                 std::string offender;
+                 bool ok = self.all_contiguous(offender);
+                 return py::make_tuple(ok, offender);
+             })
         .def("all_dense_layout", [](const VariantPackNative &self) {
             std::string offender;
             bool ok = self.all_dense_layout(offender);

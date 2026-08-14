@@ -2642,7 +2642,16 @@ _STRUCTURED_OPS = {
     "kda": dict(
         node_type=NodeType.KDA,
         inputs=("q", "k", "v", "g", "beta", "cu_seqlens", "initial_state", "a_log", "dt_bias"),
-        attrs=("scale", "output_final_state", "use_qk_l2norm", "checkpoint_every_n_tokens", "use_beta_sigmoid", "safe_gate", "gate_lower_bound", "batch_invariant"),
+        attrs=(
+            "scale",
+            "output_final_state",
+            "use_qk_l2norm",
+            "checkpoint_every_n_tokens",
+            "use_beta_sigmoid",
+            "safe_gate",
+            "gate_lower_bound",
+            "batch_invariant",
+        ),
         outputs=("O", "final_state", "state_checkpoints"),
         maybe={
             "final_state": lambda n: bool(n.params.get("output_final_state", False)),

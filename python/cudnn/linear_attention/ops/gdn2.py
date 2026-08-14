@@ -224,8 +224,25 @@ def _make_bprop_cache_key(
 
 
 def _build_fprop_graph(
-    total, N, H, HK, HV, K, V, io_dtype, g_dtype, gate_dtype, state_dtype, cu_dtype, scale, output_final_state,
-    use_qk_l2norm, batch_invariant, safe_gate, gate_lower_bound, ckpt
+    total,
+    N,
+    H,
+    HK,
+    HV,
+    K,
+    V,
+    io_dtype,
+    g_dtype,
+    gate_dtype,
+    state_dtype,
+    cu_dtype,
+    scale,
+    output_final_state,
+    use_qk_l2norm,
+    batch_invariant,
+    safe_gate,
+    gate_lower_bound,
+    ckpt,
 ):
     graph = cudnn.pygraph()
     HO = max(H, HV)

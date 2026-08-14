@@ -418,7 +418,9 @@ def _gdn_fwd_fake(
 # ---------------------------------------------------------------------------
 
 
-def _build_bprop_graph(total, N, H, HK, HV, K, V, io_dtype, g_dtype, beta_dtype, state_dtype, dstate_in_dtype, cu_dtype, ckpt_rows, scale, use_qk_l2norm, batch_invariant):
+def _build_bprop_graph(
+    total, N, H, HK, HV, K, V, io_dtype, g_dtype, beta_dtype, state_dtype, dstate_in_dtype, cu_dtype, ckpt_rows, scale, use_qk_l2norm, batch_invariant
+):
     graph = cudnn.pygraph()
     HO = max(H, HV)
     q_t = graph.tensor([total, H, K], data_type=io_dtype, name="q")

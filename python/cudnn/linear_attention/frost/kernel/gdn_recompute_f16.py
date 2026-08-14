@@ -479,9 +479,7 @@ def tmastg_warp(
     desc_qwords = cutlass.Int32(TENSOR_MAP_QWORDS)
 
     while tile_idx < total_tiles:
-        batch_idx, head_idx, batch_start, batch_end, seqlen_b, num_chunks_b, wstart, wend, cstart, cend = decode_work_item(
-            cfg, tile_idx, mWorkItems
-        )
+        batch_idx, head_idx, batch_start, batch_end, seqlen_b, num_chunks_b, wstart, wend, cstart, cend = decode_work_item(cfg, tile_idx, mWorkItems)
         n_local = wend - cstart
         n_padded = ((n_local + 1) // 2) * 2
 
@@ -549,9 +547,7 @@ def gate_beta_warp(
     sched_state = PipelineState.start(phase=0)
     tile_idx = cutlass.Int32(bidx)
     while tile_idx < total_tiles:
-        batch_idx, head_idx, batch_start, batch_end, seqlen_b, num_chunks_b, wstart, wend, cstart, cend = decode_work_item(
-            cfg, tile_idx, mWorkItems
-        )
+        batch_idx, head_idx, batch_start, batch_end, seqlen_b, num_chunks_b, wstart, wend, cstart, cend = decode_work_item(cfg, tile_idx, mWorkItems)
         n_local = wend - cstart
         n_padded = ((n_local + 1) // 2) * 2
         if n_local > 0:
@@ -767,9 +763,7 @@ def mma_warp(
     sched_state = PipelineState.start(phase=0)
     tile_idx = cutlass.Int32(bidx)
     while tile_idx < total_tiles:
-        batch_idx, head_idx, batch_start, batch_end, seqlen_b, num_chunks_b, wstart, wend, cstart, cend = decode_work_item(
-            cfg, tile_idx, mWorkItems
-        )
+        batch_idx, head_idx, batch_start, batch_end, seqlen_b, num_chunks_b, wstart, wend, cstart, cend = decode_work_item(cfg, tile_idx, mWorkItems)
         n_local = wend - cstart
         n_padded = ((n_local + 1) // 2) * 2
         n_pairs = n_padded // 2
@@ -953,9 +947,7 @@ def tmaldg_warp(
     desc_qwords = cutlass.Int32(TENSOR_MAP_QWORDS)
 
     while tile_idx < total_tiles:
-        batch_idx, head_idx, batch_start, batch_end, seqlen_b, num_chunks_b, wstart, wend, cstart, cend = decode_work_item(
-            cfg, tile_idx, mWorkItems
-        )
+        batch_idx, head_idx, batch_start, batch_end, seqlen_b, num_chunks_b, wstart, wend, cstart, cend = decode_work_item(cfg, tile_idx, mWorkItems)
 
         head_k = head_idx if cfg.k_ratio == 1 else head_idx // cutlass.Int32(cfg.k_ratio)
         head_v = head_idx if cfg.v_ratio == 1 else head_idx // cutlass.Int32(cfg.v_ratio)
@@ -1080,9 +1072,7 @@ def compute0_warp_group(
     sched_state = PipelineState.start(phase=0)
     tile_idx = cutlass.Int32(bidx)
     while tile_idx < total_tiles:
-        batch_idx, head_idx, batch_start, batch_end, seqlen_b, num_chunks_b, wstart, wend, cstart, cend = decode_work_item(
-            cfg, tile_idx, mWorkItems
-        )
+        batch_idx, head_idx, batch_start, batch_end, seqlen_b, num_chunks_b, wstart, wend, cstart, cend = decode_work_item(cfg, tile_idx, mWorkItems)
         n_local = wend - cstart
         n_pairs = (n_local + 1) // 2
         n_padded = n_pairs * 2
@@ -1377,9 +1367,7 @@ def compute1_warp_group(
     sched_state = PipelineState.start(phase=0)
     tile_idx = cutlass.Int32(bidx)
     while tile_idx < total_tiles:
-        batch_idx, head_idx, batch_start, batch_end, seqlen_b, num_chunks_b, wstart, wend, cstart, cend = decode_work_item(
-            cfg, tile_idx, mWorkItems
-        )
+        batch_idx, head_idx, batch_start, batch_end, seqlen_b, num_chunks_b, wstart, wend, cstart, cend = decode_work_item(cfg, tile_idx, mWorkItems)
         n_local = wend - cstart
         n_padded = ((n_local + 1) // 2) * 2
         if cutlass.const_expr(cfg.enable_checkpoints):

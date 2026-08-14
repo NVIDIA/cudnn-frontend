@@ -674,9 +674,7 @@ def tmastg_warp(
     desc_qwords = cutlass.Int32(TENSOR_MAP_QWORDS)
 
     while tile_idx < total_tiles:
-        batch_idx, head_idx, batch_start, batch_end, seqlen_b, num_chunks_b, wstart, wend, cstart, cend = decode_work_item(
-            cfg, tile_idx, mWorkItems
-        )
+        batch_idx, head_idx, batch_start, batch_end, seqlen_b, num_chunks_b, wstart, wend, cstart, cend = decode_work_item(cfg, tile_idx, mWorkItems)
 
         head_o = head_idx
         slot = batch_idx * desc_qwords
@@ -758,9 +756,7 @@ def gate_beta_warp(
     FIRST_STATE_CHUNK = 0 if cfg.use_initial_state else 1
     SFIRST_MIN = 1 if cfg.use_initial_state else 2
     while tile_idx < total_tiles:
-        batch_idx, head_idx, batch_start, batch_end, seqlen_b, num_chunks_b, wstart, wend, cstart, cend = decode_work_item(
-            cfg, tile_idx, mWorkItems
-        )
+        batch_idx, head_idx, batch_start, batch_end, seqlen_b, num_chunks_b, wstart, wend, cstart, cend = decode_work_item(cfg, tile_idx, mWorkItems)
         num_item_chunks = cend - wstart
         # dGate/dBeta ownership: mask stores past the item's write range
         write_end = batch_start + wend * cfg.b_t
@@ -1287,9 +1283,7 @@ def mma_warp(
     tile_idx = cutlass.Int32(bidx)
     FIRST_STATE_CHUNK = 0 if cfg.use_initial_state else 1
     while tile_idx < total_tiles:
-        batch_idx, head_idx, batch_start, batch_end, seqlen_b, num_chunks_b, wstart, wend, cstart, cend = decode_work_item(
-            cfg, tile_idx, mWorkItems
-        )
+        batch_idx, head_idx, batch_start, batch_end, seqlen_b, num_chunks_b, wstart, wend, cstart, cend = decode_work_item(cfg, tile_idx, mWorkItems)
         num_item_chunks = cend - wstart
 
         # ---- chunks NT-2 .. 0 (backward): full body ------------------------------
@@ -1747,9 +1741,7 @@ def tmaldg_warp(
     desc_qwords = cutlass.Int32(TENSOR_MAP_QWORDS)
 
     while tile_idx < total_tiles:
-        batch_idx, head_idx, batch_start, batch_end, seqlen_b, num_chunks_b, wstart, wend, cstart, cend = decode_work_item(
-            cfg, tile_idx, mWorkItems
-        )
+        batch_idx, head_idx, batch_start, batch_end, seqlen_b, num_chunks_b, wstart, wend, cstart, cend = decode_work_item(cfg, tile_idx, mWorkItems)
 
         head_o = head_idx
         head_q = head_idx if cfg.q_ratio == 1 else head_idx // cutlass.Int32(cfg.q_ratio)
@@ -1955,9 +1947,7 @@ def compute0_warp_group(
     FIRST_STATE_CHUNK = 0 if cfg.use_initial_state else 1
     SFIRST_MIN = 1 if cfg.use_initial_state else 2
     while tile_idx < total_tiles:
-        batch_idx, head_idx, batch_start, batch_end, seqlen_b, num_chunks_b, wstart, wend, cstart, cend = decode_work_item(
-            cfg, tile_idx, mWorkItems
-        )
+        batch_idx, head_idx, batch_start, batch_end, seqlen_b, num_chunks_b, wstart, wend, cstart, cend = decode_work_item(cfg, tile_idx, mWorkItems)
         num_item_chunks = cend - wstart
 
         for chunk_idx in cutlass.range(num_item_chunks):
@@ -2523,9 +2513,7 @@ def compute1_warp_group(
     FIRST_STATE_CHUNK = 0 if cfg.use_initial_state else 1
     SFIRST_MIN = 1 if cfg.use_initial_state else 2
     while tile_idx < total_tiles:
-        batch_idx, head_idx, batch_start, batch_end, seqlen_b, num_chunks_b, wstart, wend, cstart, cend = decode_work_item(
-            cfg, tile_idx, mWorkItems
-        )
+        batch_idx, head_idx, batch_start, batch_end, seqlen_b, num_chunks_b, wstart, wend, cstart, cend = decode_work_item(cfg, tile_idx, mWorkItems)
         num_item_chunks = cend - wstart
 
         # ---- d_final_state prologue ----------------------------------------------

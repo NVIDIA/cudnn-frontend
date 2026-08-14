@@ -357,9 +357,7 @@ def tmaldg_warp(
     sched_state = PipelineState.start(phase=1)
     tile_idx = cutlass.Int32(bidx)
     while tile_idx < total_tiles:
-        batch_idx, head_idx, batch_start, batch_end, seqlen_b, num_chunks_b, wstart, wend, cstart, cend = decode_work_item(
-            cfg, tile_idx, mWorkItems
-        )
+        batch_idx, head_idx, batch_start, batch_end, seqlen_b, num_chunks_b, wstart, wend, cstart, cend = decode_work_item(cfg, tile_idx, mWorkItems)
         head_o = head_idx
         head_q = head_idx if cfg.q_ratio == 1 else head_idx // cutlass.Int32(cfg.q_ratio)
         head_k = head_idx if cfg.k_ratio == 1 else head_idx // cutlass.Int32(cfg.k_ratio)
@@ -450,9 +448,7 @@ def super_mma_warp(
     sched_state = PipelineState.start(phase=0)
     tile_idx = cutlass.Int32(bidx)
     while tile_idx < total_tiles:
-        batch_idx, head_idx, batch_start, batch_end, seqlen_b, num_chunks_b, wstart, wend, cstart, cend = decode_work_item(
-            cfg, tile_idx, mWorkItems
-        )
+        batch_idx, head_idx, batch_start, batch_end, seqlen_b, num_chunks_b, wstart, wend, cstart, cend = decode_work_item(cfg, tile_idx, mWorkItems)
         num_chunks_tile = wend - cstart  # processed chunks; ring bookkeeping runs on cum_chunk_base + local_chunk_idx
         for local_chunk_idx in cutlass.range(num_chunks_tile, unroll=1):
             cum_chunk = cum_chunk_base + local_chunk_idx
@@ -731,9 +727,7 @@ def tcgen05_mma_warp(
     sched_state = PipelineState.start(phase=0)
     tile_idx = cutlass.Int32(bidx)
     while tile_idx < total_tiles:
-        batch_idx, head_idx, batch_start, batch_end, seqlen_b, num_chunks_b, wstart, wend, cstart, cend = decode_work_item(
-            cfg, tile_idx, mWorkItems
-        )
+        batch_idx, head_idx, batch_start, batch_end, seqlen_b, num_chunks_b, wstart, wend, cstart, cend = decode_work_item(cfg, tile_idx, mWorkItems)
         num_chunks_tile = wend - cstart
         for local_chunk_idx in cutlass.range(num_chunks_tile, unroll=1):
             cum_chunk = cum_chunk_base + local_chunk_idx
@@ -928,9 +922,7 @@ def epilogue_warp(
     sched_state = PipelineState.start(phase=0)
     tile_idx = cutlass.Int32(bidx)
     while tile_idx < total_tiles:
-        batch_idx, head_idx, batch_start, batch_end, seqlen_b, num_chunks_b, wstart, wend, cstart, cend = decode_work_item(
-            cfg, tile_idx, mWorkItems
-        )
+        batch_idx, head_idx, batch_start, batch_end, seqlen_b, num_chunks_b, wstart, wend, cstart, cend = decode_work_item(cfg, tile_idx, mWorkItems)
         head_o = head_idx
         o_slot = batch_idx * cutlass.Int32(TENSOR_MAP_QWORDS)
         desc_o_slot = (desc_o_base + o_slot).tospace(cutlass.AddressSpace.generic)
@@ -1137,9 +1129,7 @@ def compute0_warp_group(
     tile_idx = cutlass.Int32(bidx)
     opaque_one = opaque_f32_zero() + cutlass.Float32(1.0)
     while tile_idx < total_tiles:
-        batch_idx, head_idx, batch_start, batch_end, seqlen_b, num_chunks_b, wstart, wend, cstart, cend = decode_work_item(
-            cfg, tile_idx, mWorkItems
-        )
+        batch_idx, head_idx, batch_start, batch_end, seqlen_b, num_chunks_b, wstart, wend, cstart, cend = decode_work_item(cfg, tile_idx, mWorkItems)
         head_o = head_idx
         num_chunks_tile = wend - cstart
         if cutlass.const_expr(cfg.safe_gate):
@@ -1531,9 +1521,7 @@ def compute1_warp_group(
     sched_state = PipelineState.start(phase=0)
     tile_idx = cutlass.Int32(bidx)
     while tile_idx < total_tiles:
-        batch_idx, head_idx, batch_start, batch_end, seqlen_b, num_chunks_b, wstart, wend, cstart, cend = decode_work_item(
-            cfg, tile_idx, mWorkItems
-        )
+        batch_idx, head_idx, batch_start, batch_end, seqlen_b, num_chunks_b, wstart, wend, cstart, cend = decode_work_item(cfg, tile_idx, mWorkItems)
         head_o = head_idx
         num_chunks_tile = wend - cstart
 
