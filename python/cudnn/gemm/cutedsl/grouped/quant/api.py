@@ -438,7 +438,7 @@ class GroupedGemmQuantSm100(APIBase):
         if self.sf_fp8_dtype_override == "e5m3":
             # Only allow e5m3 to pretend to be e4m3fn
             self._value_error_if(
-                self.sf_dtype != torch.float8_e4m3fn,
+                self.sf_dtype != cutlass.Float8E4M3FN,
                 f"sf_fp8_dtype_override='e5m3' requires the NVFP4 recipe -- FP4 A/B with "
                 f"torch.float8_e4m3fn scale factors at sf_vec_size 16 -- but got "
                 f"ab_dtype={self.ab_dtype}, sf_dtype={self.sf_dtype}, sf_vec_size={self.sf_vec_size}",

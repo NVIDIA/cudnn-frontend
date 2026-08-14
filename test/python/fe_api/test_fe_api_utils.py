@@ -151,21 +151,30 @@ def _ue5m3_lut(device) -> torch.Tensor:
 
 
 def f32_to_ue5m3_bytes(values: torch.Tensor) -> torch.Tensor:
-    """Round-to-nearest-even encode a float tensor to UE5M3, returned as uint8.
-
-    Vectorized against the 255-entry finite value table rather than the
-    scalar search loop used by the CUTLASS examples, which is far too slow
-    for scale-factor tensors.
-    """
+    """Round-to-nearest-even encode a float tensor to UE5M3, returned as uint8."""
     lut = _ue5m3_lut(values.device)
-    flat = values.detach().to(torch.float32).reshape(-1, 1)
-    dist = (flat - lut.reshape(1, -1)).abs()
-    idx = dist.argmin(dim=1)
+    flat = values.detach().to(torch.float32).reshape(-1)
 
-    hi = (idx + 1).clamp(max=lut.numel() - 1)
-    tie = dist.gather(1, hi.unsqueeze(1)) == dist.gather(1, idx.unsqueeze(1))
-    idx = torch.where(tie.squeeze(1) & (idx % 2 == 1), hi, idx)
-    return idx.to(torch.uint8).reshape(values.shape)
+    is_nan = flat.isnan()
+    max_finite = lut[-1]
+    # UE5M3 can't express negative values or values larger than its maximum representable value (the last one from the LUT).
+    # NaN compares False against both bounds, so it passes through here and picks up the NaN byte at the end.
+    out_of_range = (flat < 0) | (flat > max_finite)
+    if out_of_range.any():
+        offenders = flat[out_of_range]
+        raise ValueError(f"{offenders.numel()} value(s) outside the finite UE5M3 range [0, {max_finite.item()}], e.g. {offenders[0].item()}")
+
+    # Find the next larger and next smaller LUT entries for each value. For NAN it returns len(lut) which is clamped
+    hi = torch.searchsorted(lut, flat).clamp(max=lut.numel() - 1)
+    lo = (hi - 1).clamp(min=0)
+    # Round to nearest
+    d_lo = flat - lut[lo]
+    d_hi = lut[hi] - flat
+    idx = torch.where(d_hi < d_lo, hi, lo)
+    # lo and hi are adjacent, so exactly one of them is even; ties take that one.
+    idx = torch.where(d_lo == d_hi, torch.where(lo % 2 == 0, lo, hi), idx)
+
+    return idx.to(torch.uint8).masked_fill(is_nan, _UE5M3_NAN_BYTE).reshape(values.shape)
 
 
 def reencode_sf_tensor_as_ue5m3(sf_tensor: torch.Tensor) -> torch.Tensor:
