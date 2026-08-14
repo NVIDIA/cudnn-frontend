@@ -241,10 +241,10 @@ def test_fp8_output_dtypes(in_key, out_key):
 
 @pytest.mark.L0
 @pytest.mark.parametrize("out_key", ["fp16", "bf16", "e4m3", "e5m2"])
-@pytest.mark.parametrize("in_key", ["e4m3"])
+@pytest.mark.parametrize("in_key", ["e4m3", "e5m2"])
 @torch_fork_set_rng(seed=0)
 def test_fp8_d192_d128_output_dtypes(in_key, out_key):
-    """Exact DSv3 shape: E4M3 Q/K use d192 while V and O use d128."""
+    """Exact DSv3 shape: FP8 Q/K use d192 while V and O use d128."""
     scale = 1.0 / math.sqrt(192)
     out, o_ref, a_o, a_o_ref = _run(
         1,

@@ -1038,7 +1038,7 @@ ENGINE_SPECS = (
     _sm100_fp8_spec(
         192,
         d_v=128,
-        dtypes=frozenset({cudnn.data_type.FP8_E4M3}),
+        dtypes=frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
     ),
     _sm120_spec(),
     _sm120_fp8_spec(),

@@ -943,22 +943,29 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 elem_bytes=1 if self._fp8 else 2,
             )
         lpt_head_group = 1
-        if (
-            self._fp8
-            and self._pertensor
-            and self.flavor == (192, 128)
-            and not self.thd
-            and (self.batch_size * self.h_q) % 16 == 0
-        ):
+        if self._fp8 and self._pertensor and self.flavor == (192, 128) and not self.thd and (self.batch_size * self.h_q) % 16 == 0:
             lpt_head_group = 16
         lpt_q_tiles = 0
         if self._fp8 and self._pertensor and self.flavor == (192, 128) and not self.thd:
             lpt_q_tiles = (self.s_q_max + 511) // 512
+        template_window_right = self.window_right
+        if (
+            self._fp8
+            and self._pertensor
+            and self.flavor == (192, 128)
+            and self.window_left is None
+            and self.window_right is None
+            and not self.seq_kv_lens_present
+        ):
+            # CUTLASS DSL 4.7 does not finish lowering the large-shape FP8
+            # MASK_NONE x32 path. A right bound of S_kv removes no valid K but
+            # selects the equivalent masked-interior lowering.
+            template_window_right = self.s_k_max
         params = Sm100TemplateParams(
             dtype_qkv=_SM100_DTYPE_QKV_CODE[self.dtype],
             dtype_o=_SM100_DTYPE_QKV_CODE[self.dtype_o],
             window_left=self.window_left,
-            window_right=self.window_right,
+            window_right=template_window_right,
             bottom_right=self.causal_bottom_right,
             has_sink=self.has_sink,
             seq_kv_lens_present=self.seq_kv_lens_present,
