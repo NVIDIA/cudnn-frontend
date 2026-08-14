@@ -40,32 +40,6 @@ def _torch_stream_context(current_stream: Optional[cuda.CUstream], device: torch
         yield
 
 
-def _record_streams(current_stream: Optional[cuda.CUstream], device: torch.device, *tensors) -> None:
-    """Keep torch's allocator from recycling buffers the kernel is still writing.
-
-    A wrapper that allocates its outputs on torch's stream but launches on the caller's has torch
-    tag each block to the allocation stream, so it can hand the block to the next allocation there
-    as soon as the tensor is freed -- without waiting for the kernel. Recording the consumer stream
-    is what defers that reuse. No-op when the two are the same stream, which is the common case and
-    where record_stream would only add the block to the allocator's event-polled path for nothing.
-
-    torch-only, like _torch_stream_context: guard the call on the framework.
-    """
-    if current_stream is None:
-        return
-    import torch
-
-    handle = int(current_stream)
-    torch_current = torch.cuda.current_stream(device)
-    if handle == torch_current.cuda_stream:
-        return
-    torch_default = torch.cuda.default_stream(device)
-    consumer = torch_default if handle == torch_default.cuda_stream else torch.cuda.ExternalStream(handle, device=device)
-    for tensor in tensors:
-        if tensor is not None:
-            tensor.record_stream(consumer)
-
-
 def select_grouped_gemm_backend(
     *,
     operation,

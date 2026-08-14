@@ -737,6 +737,39 @@ def test_grouped_gemm_dsrelu_deterministic_dbias(request):
 
 
 @pytest.mark.L0
+@torch_fork_set_rng(seed=71)
+@pytest.mark.parametrize("deterministic", [False, True], ids=["default", "deterministic"])
+def test_grouped_gemm_dsrelu_dbias_cache_keys_on_n(request, deterministic, monkeypatch):
+    """Two n values that share a dprob slot count must not share a dbias kernel.
+
+    Under the default full-dynamic key every tensor drops its shape, because the kernel compiles
+    with symbolic extents -- but _make_dbias_fake frees only dim 0, so dbias's n stays baked, and
+    nothing else in the dense key carries n (b_tensor.shape[2] is l; dprob_n_slots is too coarse,
+    n=384 and n=512 both give 2). Before the fix the second call reused the first kernel and
+    CuTeDSL rejected it: "Mismatched dbias_tensor.shape[1] ... expected to be 384" (job 469460).
+    Pre-existing on the default path, which is why this is parametrized over both modes.
+    """
+    try:
+        import cudnn  # noqa: F401
+        from cuda.bindings import driver as cuda  # noqa: F401
+        from cudnn.gemm.cutedsl.grouped.dsrelu import api as dsrelu_api
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn optional dependencies not installed")
+
+    monkeypatch.setattr(dsrelu_api, "_cache_of_GroupedGemmDsreluSm100Objects", {})
+    args = (torch.float8_e4m3fn, torch.bfloat16, torch.float8_e4m3fn, 32, torch.float8_e8m0fnu, False, True)
+    for n in (384, 512):
+        case = _build_dsrelu_case(request, *args, n_override=n)
+        try:
+            outputs = _run_dsrelu_case(case, deterministic=deterministic, generate_dbias=True)
+        except (ValueError, NotImplementedError) as e:
+            pytest.skip(f"Unsupported testcase: {e}")
+        torch.cuda.synchronize()
+        assert outputs["dbias_tensor"].shape == (case[1]["l"], n, 1)
+        check_ref_grouped_gemm_dsrelu(case[0], outputs, case[1], skip_ref=case[1]["skip_ref"])
+
+
+@pytest.mark.L0
 @torch_fork_set_rng(seed=67)
 def test_grouped_gemm_dsrelu_deterministic_class_api(request):
     """The class API under determinism: same output args as the default, plus explicit scratch.
@@ -831,8 +864,10 @@ def test_grouped_gemm_dsrelu_deterministic_class_api(request):
         norm_const_tensor=inputs.get("norm_const_tensor"),
         current_stream=stream,
     )
+    # Both accumulate onto the output, so the zeroed buffers above end up holding the result --
+    # no copy_ needed, and the same semantics the kernel has when the flag is off.
     GroupedGemmDsreluSm100.reduce_dprob_workspace(dprob_ws, dprob, stream)
-    dbias.copy_(GroupedGemmDsreluSm100.reduce_dbias_workspace(dbias_ws, inputs["padded_offsets_tensor"], cfg["mma_tiler_mn"], stream))
+    GroupedGemmDsreluSm100.reduce_dbias_workspace(dbias_ws, inputs["padded_offsets_tensor"], dbias, cfg["mma_tiler_mn"], stream)
     torch.cuda.synchronize()
 
     assert torch.equal(bitwise_bits(dprob), bitwise_bits(expected["dprob_tensor"])), "class API dprob differs from the wrapper"

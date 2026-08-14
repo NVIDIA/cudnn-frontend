@@ -23,7 +23,7 @@ from .moe_blockscaled_grouped_gemm_dsrelu_quant import (
     BlockScaledMoEGroupedGemmQuantBwdKernel,
     EpilogueType,
 )
-from ..backend_utils import _record_streams, _torch_stream_context
+from ..backend_utils import _torch_stream_context
 from ..moe_utils import MoEWeightMode
 from cuda.bindings import driver as cuda
 import logging
@@ -145,7 +145,11 @@ def _reduce_dbias_slots(dbias_workspace, dbias_tensor, current_stream, padded_of
         # it in fp32 internally and rounds once, which is still better than the default path
         # rounding on every M-tile, at half the memory and one store instead of two.
         onehot = ((block_tok >= starts) & (block_tok < padded_offsets.unsqueeze(1))).to(dbias_workspace.dtype)
-        return (onehot @ dbias_workspace.reshape(m_blocks, n_out)).reshape(-1, n_out, 1)
+        reduced = (onehot @ dbias_workspace.reshape(m_blocks, n_out)).reshape(-1, n_out, 1)
+        # Accumulate, like dprob and like the atomic on the non-deterministic path: a caller
+        # summing dbias across micro-batches into one buffer must not get overwrite semantics
+        # from the flag alone.
+        return reduced if dbias_tensor is None else dbias_tensor.add_(reduced)
 
 
 def _reinterpret_raw_grouped_fp4_tensor(tensor: torch.Tensor) -> torch.Tensor:
@@ -455,13 +459,15 @@ class GroupedGemmDsreluSm100(APIBase):
         return _reduce_dprob_slots(dprob_workspace, dprob_tensor, current_stream)
 
     @staticmethod
-    def reduce_dbias_workspace(dbias_workspace, padded_offsets, mma_tiler_mn: Tuple[int, int] = (256, 256), current_stream=None):
-        """Segment-sum the dbias slots per expert into ``(expert_cnt, n, 1)``.
+    def reduce_dbias_workspace(dbias_workspace, padded_offsets, dbias_tensor=None, mma_tiler_mn: Tuple[int, int] = (256, 256), current_stream=None):
+        """Segment-sum the dbias slots per expert; accumulates onto dbias_tensor if given.
 
         Public because a plain sum over dim 0 is wrong here and gets it wrong quietly: the slots
-        have to be grouped by the expert ranges ``padded_offsets`` marks off.
+        have to be grouped by the expert ranges ``padded_offsets`` marks off. Accumulates rather
+        than overwrites, matching both reduce_dprob_workspace and the atomic the kernel uses when
+        the flag is off.
         """
-        return _reduce_dbias_slots(dbias_workspace, None, current_stream, padded_offsets, _cta_tile_m(mma_tiler_mn))
+        return _reduce_dbias_slots(dbias_workspace, dbias_tensor, current_stream, padded_offsets, _cta_tile_m(mma_tiler_mn))
 
     @property
     def _kernel_dprob_desc(self):
@@ -1770,9 +1776,14 @@ def grouped_gemm_dsrelu_wrapper_sm100(
 
     if framework == "torch":
         d_torch_dtype = framework_dtype(d_dtype, "torch")
-        d_row_tensor = torch.empty_strided((valid_m, n_out, 1), (n_out, 1, valid_m * n_out), dtype=d_torch_dtype, device=a_tensor.device)
-        d_col_tensor = torch.empty_strided((valid_m, n_out, 1), (n_out, 1, valid_m * n_out), dtype=d_torch_dtype, device=a_tensor.device)
-        d_srelu_tensor = torch.empty_strided((valid_m, n_out, 1), (n_out, 1, valid_m * n_out), dtype=d_torch_dtype, device=a_tensor.device)
+        # Inside the context, like the accumulators: torch's allocator reuses a block freed on the
+        # allocating stream on the strength of that stream's ordering, which says nothing about a
+        # kernel writing the block on current_stream. record_stream cannot fix this direction --
+        # it defers reuse after *this* tensor is freed, not the handout of an already-freed block.
+        with _torch_stream_context(current_stream, a_tensor.device):
+            d_row_tensor = torch.empty_strided((valid_m, n_out, 1), (n_out, 1, valid_m * n_out), dtype=d_torch_dtype, device=a_tensor.device)
+            d_col_tensor = torch.empty_strided((valid_m, n_out, 1), (n_out, 1, valid_m * n_out), dtype=d_torch_dtype, device=a_tensor.device)
+            d_srelu_tensor = torch.empty_strided((valid_m, n_out, 1), (n_out, 1, valid_m * n_out), dtype=d_torch_dtype, device=a_tensor.device)
     else:
         # n-major C-contiguous; the extent-1 batch dim's stride is unobservable by the kernel.
         d_jax_dtype = framework_dtype(d_dtype, "jax")
@@ -1831,9 +1842,10 @@ def grouped_gemm_dsrelu_wrapper_sm100(
         mma_shape_col = (1, ceil_div(n_out, 128), ceil_div(sf_k_col, 4), 32, 4, 4)
         if framework == "torch":
             mma_permute_order = (3, 4, 1, 5, 2, 0)
-            sfd_row_tensor = torch.empty(mma_shape_row, dtype=sf_dtype, device=a_tensor.device).permute(mma_permute_order)
-            sfd_col_tensor = torch.empty(mma_shape_col, dtype=sf_dtype, device=a_tensor.device).permute(mma_permute_order)
-            sfd_col_d_srelu_tensor = torch.empty(mma_shape_col, dtype=sf_dtype, device=a_tensor.device).permute(mma_permute_order)
+            with _torch_stream_context(current_stream, a_tensor.device):
+                sfd_row_tensor = torch.empty(mma_shape_row, dtype=sf_dtype, device=a_tensor.device).permute(mma_permute_order)
+                sfd_col_tensor = torch.empty(mma_shape_col, dtype=sf_dtype, device=a_tensor.device).permute(mma_permute_order)
+                sfd_col_d_srelu_tensor = torch.empty(mma_shape_col, dtype=sf_dtype, device=a_tensor.device).permute(mma_permute_order)
         else:
             # Physical C-contiguous atom allocations: JAX cannot express the permuted view;
             # the kernel rebuilds the SF layout from the GEMM shapes and consumes only the
@@ -1862,13 +1874,6 @@ def grouped_gemm_dsrelu_wrapper_sm100(
         else:
             dbias_tensor = _jax_alloc(lambda: jnp.zeros((l, n_out, 1), dtype=framework_dtype(cutlass.BFloat16, "jax"), device=a_tensor.device))
     dbias_kernel_tensor = dbias_workspace if dbias_workspace is not None else dbias_tensor
-
-    # The write-only outputs need no ordered init, but they still come from torch's stream while
-    # the kernel writes them on the caller's, so torch could recycle the block early. The
-    # accumulators above are allocated on the caller's stream and need no such record. No-op
-    # under jax, which does not use torch's allocator.
-    if framework == "torch":
-        _record_streams(current_stream, a_tensor.device, d_row_tensor, d_col_tensor, d_srelu_tensor, sfd_row_tensor, sfd_col_tensor, sfd_col_d_srelu_tensor)
 
     if valid_m == 0:
         _logger.debug("grouped_gemm_dsrelu_wrapper_sm100: valid_m is zero, skipping kernel execution")
@@ -1945,6 +1950,12 @@ def grouped_gemm_dsrelu_wrapper_sm100(
         if deterministic and dbias_kernel_tensor is not None
         else tensor_signature(dbias_kernel_tensor)
     )
+    # Used on both arms, not just the non-full-dynamic one. Every other tensor may drop its shape
+    # under full dynamic because the kernel compiles with symbolic extents, but _make_dbias_fake
+    # frees only dim 0 -- dbias's n stays baked -- and nothing else in the dense key carries n
+    # (b_tensor.shape[2] is l, and dprob_n_slots is too coarse: n=384 and n=512 both give 2).
+    # Verified: with the shape dropped, n=384 then n=512 reuses the first kernel and CuTeDSL
+    # rejects the call with "Mismatched dbias_tensor.shape[1] ... expected to be 384" (job 469460).
     # The kernel writes the scratch under determinism, so that is what the key has to describe.
     dprob_kernel_tensor = dprob_workspace if dprob_workspace is not None else dprob_tensor
 
@@ -1981,7 +1992,7 @@ def grouped_gemm_dsrelu_wrapper_sm100(
             # stride order, so without this the second call would reuse a kernel built for
             # the wrong dprob extent.
             dprob_n_slots,
-            *(dynamic_tensor_signature(dbias_kernel_tensor) if use_full_dynamic else dbias_signature),
+            *dbias_signature,
             *(dynamic_m_tensor_signature(d_srelu_tensor, (n_out, 1)) if not use_full_dynamic else dynamic_tensor_signature(d_srelu_tensor)),
             *(dynamic_tensor_signature(sfb_tensor) if use_full_dynamic else tensor_signature(sfb_tensor)),
             *(dynamic_tensor_signature(sfd_col_d_srelu_tensor) if use_full_dynamic else tensor_signature(sfd_col_d_srelu_tensor)),
