@@ -142,9 +142,6 @@ GROUPED_GEMM_SWIGLU_PARAM_MARKS_BIAS_FP4 = (
 )
 
 
-# FP4 marks with the Rubin-only E5M3 scale-factor recipe folded in as a further
-# row. Kept separate so swiglu/srelu, whose APIs have no sf_fp8_dtype_override,
-# keep the plain list. Keep the non-scale-factor rows in sync with it.
 GROUPED_GEMM_SWIGLU_PARAM_MARKS_FP4_WITH_E5M3 = (
     GROUPED_GEMM_SWIGLU_FP4_TYPE_MARKS
     + GROUPED_GEMM_SWIGLU_COMMON_MARKS
