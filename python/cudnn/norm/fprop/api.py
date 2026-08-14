@@ -20,9 +20,14 @@ from ..config_sm100 import (
     batchnorm_spec,
     choose_block_threads,
     make_cfg,
+    make_warp_cfg,
     rowwise_spec,
     vector_width,
 )
+
+# LN/RMS reduce the last dim (M == C == gamma_len) and can use the warp-per-row
+# kernel; GN/IN have a different affine mapping and stay on the row-reduce kernel.
+_WARP_VARIANTS = (NormVariant.LAYER_NORM, NormVariant.RMS_NORM)
 from ..dtypes import DTYPE_BYTES, torch_dtype_to_str
 from .kernels import (
     batchnorm_sm100,
@@ -74,8 +79,20 @@ def norm_fprop(
         if gamma is None:
             gamma = torch.ones(spec.gamma_len, dtype=x.dtype, device=x.device)
         params = TemplateParams(variant=variant, io_dtype=io, has_beta=(beta is not None))
-        cfg = make_cfg(params, spec.M)
         x2d = x.reshape(spec.R, spec.M)
+
+        # Warp-per-row kernel for LN/RMS when the row fits the register budget.
+        if variant in _WARP_VARIANTS:
+            wcfg = make_warp_cfg(params, spec.M)
+            if wcfg is not None:
+                from .kernels import layernorm_warp_sm100
+
+                y2, mean, rstd = layernorm_warp_sm100.forward(
+                    spec, x2d, gamma, beta, eps=eps, wcfg=wcfg, params=params
+                )
+                return y2.reshape(x.shape), mean, rstd
+
+        cfg = make_cfg(params, spec.M)
         y2, mean, rstd = _ROWWISE_KERNEL[variant].forward(
             spec, x2d, gamma, beta, eps=eps, cfg=cfg, params=params
         )
