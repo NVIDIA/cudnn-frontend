@@ -16,6 +16,7 @@ This directory contains benchmarking tools for Scaled Dot Product Attention (SDP
   - `ltx2.py` - LTX-2 video DiT self-attention benchmarks (bidirectional, no mask)
   - `gpt_oss.py` - GPT-OSS sliding-window-attention GQA benchmarks (causal, SWA=128)
   - `qwen35.py` - Qwen 3.5 GQA benchmarks (head_dim=256, causal, bf16 bidirectional — Blackwell fp8/fa4 limits)
+  - `qwen3vl_vit.py` - Qwen3-VL vision-encoder (ViT) self-attention benchmarks (bidirectional, no mask, fwd-only, head_dim 72-in-80)
   - `auto_regressive_dit.py` - Autoregressive video DiT (short Q, long cached KV, bf16/mxfp8, no_mask)
 - `runner.py` - Configuration-based benchmark runner
 - `config_types.py` - Data types for benchmark configuration
@@ -55,6 +56,9 @@ python -m benchmark.sdpa_benchmark_training.runner --config ltx2
 
 # Run Qwen 3.5 benchmark suite (cuDNN bf16 at head_dim=256)
 python -m benchmark.sdpa_benchmark_training.runner --config qwen35
+
+# Run Qwen3-VL vision-encoder (ViT) benchmark suite (inference fwd-only)
+python -m benchmark.sdpa_benchmark_training.runner --config qwen3vl_vit
 
 # Run Autoregressive video DiT benchmark suite (short Q, long cached KV)
 python -m benchmark.sdpa_benchmark_training.runner --config auto_regressive_dit
