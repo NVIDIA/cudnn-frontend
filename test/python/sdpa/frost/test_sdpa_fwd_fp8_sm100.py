@@ -68,7 +68,9 @@ def _ref(qd, kd, vd, *, scale, is_causal=False, bottom_right=False, swa_window=N
         col = sinks.view(1, h_q, 1, 1).float().expand(b, h_q, s_q, 1).to(dev)
         probs = torch.softmax(torch.cat([scores, col], dim=-1), dim=-1)
         return torch.matmul(probs[..., :s_kv], v_e)
+    row_has_kv = torch.isfinite(scores).any(dim=-1, keepdim=True)
     probs = torch.softmax(scores, dim=-1)
+    probs = torch.where(row_has_kv, probs, torch.zeros_like(probs))
     return torch.matmul(probs, v_e)
 
 
@@ -266,9 +268,10 @@ def test_fp8_d192_d128_output_dtypes(in_key, out_key):
 @pytest.mark.parametrize("mask", ["none", "causal_br", "swa"])
 @torch_fork_set_rng(seed=0)
 def test_fp8_d192_d128_masks(mask):
+    # B*H_q=16 selects the grouped LPT decoder used by the target workload.
     scale = 1.0 / math.sqrt(192)
     out, o_ref, a_o, a_o_ref = _run(
-        1,
+        2,
         8,
         8,
         256,
@@ -277,6 +280,28 @@ def test_fp8_d192_d128_masks(mask):
         torch.float16,
         scale=scale,
         sdpa_kwargs=_MASKS[mask],
+        d_qk=192,
+        d_v=128,
+    )
+    _check(out, o_ref, torch.float16, "e4m3", a_o, a_o_ref)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_fp8_d192_d128_zero_length_kv():
+    """A zero-length KV batch must produce a finite zero output."""
+    scale = 1.0 / math.sqrt(192)
+    out, o_ref, a_o, a_o_ref = _run(
+        2,
+        8,
+        8,
+        256,
+        256,
+        "e4m3",
+        torch.float16,
+        scale=scale,
+        sdpa_kwargs={},
+        seq_lens_kv=[256, 0],
         d_qk=192,
         d_v=128,
     )

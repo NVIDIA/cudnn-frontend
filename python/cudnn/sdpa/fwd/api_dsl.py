@@ -83,6 +83,14 @@ _SM100_FP8_KERNEL_FILES = {
     (128, 128): "prefill_d128_fp8_sm100.py",
     (192, 128): "prefill_d192_d128_fp8_sm100.py",
 }
+
+
+def _sm100_fp8_shapes(pertensor: bool, device_cc: tuple[int, int]) -> frozenset[tuple[int, int]]:
+    if not pertensor or device_cc == (10, 7):
+        return frozenset({(128, 128)})
+    return frozenset({(128, 128), (192, 128)})
+
+
 # Both flavors tile KV in TILE_N=128 columns; the KV tail is only masked when
 # the padded/causal mask paths are active (see check_support).
 _SM100_TILE_N = 128
@@ -788,7 +796,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # FP8 paths use exact native shapes. Per-tensor FP8 also has the
         # d192/d128 flavor; MXFP8 remains d128-only until its scale-factor
         # descriptors and pipeline are extended.
-        fp8_shapes = {(128, 128), (192, 128)} if self._pertensor else {(128, 128)}
+        fp8_shapes = _sm100_fp8_shapes(self._pertensor, self._device_cc)
         self._value_error_if(
             self._fp8 and (int(d_qk), int(d_v)) not in fp8_shapes,
             f"{'FP8' if self._pertensor else 'MXFP8'} (E4M3/E5M2 inputs) requires an exact native shape in {sorted(fp8_shapes)} "

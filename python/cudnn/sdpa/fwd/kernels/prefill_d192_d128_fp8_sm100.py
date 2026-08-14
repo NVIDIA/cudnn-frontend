@@ -265,7 +265,15 @@ _sdpa_h = make_sdpa_helpers(
 _decode_initial = _sdpa_h.decode_initial
 _decode_payload = _sdpa_h.decode_payload
 _bounds_for_tile = _sdpa_h.bounds_for_tile
-_resolve_seqlen_kv = _sdpa_h.resolve_seqlen_kv
+
+
+@cute.jit
+def _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, scalar_seqlen_kv):
+    if cutlass.const_expr(CFG.SEQ_KV_LENS_PRESENT == 1):
+        arr = cutlass.make_array_view(seq_kv_lens_tensor)
+        return cutlass.Int32(arr[cutlass.Int32(batch_idx)])
+    return scalar_seqlen_kv
+
 
 # THD / varlen — shared helpers (FP8 element-addressed like f16, per-tensor
 # dequant scalars, no block-scale SF).  Gated by CFG.THD_VARLEN (folds out).
@@ -1926,6 +1934,22 @@ def _correction_warp_group(
                 lse_val = total_max_nat + cute.math.log(total_sum, fastmath=True)
                 # Safe inverse: avoid div by 0 on fully-masked rows.
                 beta = cute.arch.rcp_approx(cute.math.max(total_sum, cutlass.Float32(1e-30)))
+                if cutlass.const_expr((CFG.MASK_FLAGS & (MASK_PADDED | MASK_SWA)) != 0 or CFG.BOTTOM_RIGHT):
+                    row_dead = total_sum <= cutlass.Float32(0.0)
+                    beta = cutlass.Float32(
+                        arith.select(
+                            row_dead.ir_value(),
+                            cutlass.Float32(0.0).ir_value(),
+                            beta.ir_value(),
+                        )
+                    )
+                    lse_val = cutlass.Float32(
+                        arith.select(
+                            row_dead.ir_value(),
+                            cutlass.Float32(float("-inf")).ir_value(),
+                            lse_val.ir_value(),
+                        )
+                    )
                 inv_sum = o_scale_fused * beta
 
             # amax_s = max over valid rows of the softmax normalization (1/total_sum),
