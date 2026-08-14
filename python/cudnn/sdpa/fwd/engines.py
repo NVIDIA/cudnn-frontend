@@ -346,6 +346,12 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         if (facts.seq_q_t is not None and facts.cu_seq_q_t is not None) or (facts.seq_kv_t is not None and facts.cu_seq_kv_t is not None):
             return "seq_len_* and cu_seq_len_* on the same side is ambiguous (backend precedence is not replicated here)"
 
+    if facts.amax_s_t is not None:
+        # The FROST FP8 kernels no longer compute Amax_S (dropped: nothing
+        # consumed it and the atomicMax serialized the epilogue); a graph that
+        # DECLARES the output must go to an engine that writes it.
+        return "graph requests the Amax_S output, which the FROST engines do not produce"
+
     if facts.bottom_right:
         if not (facts.causal or facts.right_band_widening):
             return "bottom-right alignment requires a causal upper bound (plain or right-widened)"
@@ -477,7 +483,7 @@ def _sm100_fp8_spec(d: int) -> EngineSpec:
 
     Padding mask (per-batch ``seq_len_kv`` → KV-side masking) is supported: KV-only
     padding leaves every query row real, so each row's total_sum > 0 and the
-    in-kernel amax_s (= max over rows of 1/total_sum) stays well-defined — no
+    per-row softmax normalization stays well-defined — no
     fully-masked row can poison the global amax.  THD/varlen is still deferred
     (dense execute only for v1), so thd=False.
     """
@@ -799,7 +805,6 @@ def lower_dsl_prefill(
         descale_k=facts.descale_k_t,
         descale_v=facts.descale_v_t,
         scale_o=facts.scale_o_t,
-        amax_s=facts.amax_s_t,
         descale_s=facts.descale_s_t,
         scale_s=facts.scale_s_t,
     )
@@ -860,7 +865,6 @@ def lower_dsl_prefill(
         dk_buf = resolved.get(id(binding.descale_k)) if binding.descale_k is not None else None
         dv_buf = resolved.get(id(binding.descale_v)) if binding.descale_v is not None else None
         so_buf = resolved.get(id(binding.scale_o)) if binding.scale_o is not None else None
-        amax_s_buf = resolved.get(id(binding.amax_s)) if binding.amax_s is not None else None
         ds_buf = resolved.get(id(binding.descale_s)) if binding.descale_s is not None else None
         ss_buf = resolved.get(id(binding.scale_s)) if binding.scale_s is not None else None
         # The quantized DENSE lowerings drop the per-batch Q trim, which is
@@ -898,7 +902,6 @@ def lower_dsl_prefill(
                 descale_k=dk_buf,
                 descale_v=dv_buf,
                 scale_o=so_buf,
-                amax_s=amax_s_buf,
                 descale_s=ds_buf,
                 scale_s=ss_buf,
             )

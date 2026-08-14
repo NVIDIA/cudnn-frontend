@@ -788,7 +788,6 @@ class SM120FusedMultiHeadAttentionForward:
         sinks: Optional[cute.Tensor],
         seq_q_lens: cute.Tensor,
         seq_kv_lens: cute.Tensor,
-        amax_s: cute.Tensor,
         amax_o: cute.Tensor,
         tma_k_desc: cutlass.GridConstant[cuda.TensorMap],
         tma_v_desc: cutlass.GridConstant[cuda.TensorMap],
@@ -808,9 +807,6 @@ class SM120FusedMultiHeadAttentionForward:
         :param sinks: Unused; must be ``None`` (fp8 cell rejects has_sink).
         :param seq_q_lens: Per-batch query lengths, or an unused dummy tensor.
         :param seq_kv_lens: Per-batch key/value lengths, or an unused dummy tensor.
-        :param amax_s: 1-element Int32 buffer, host pre-zeroed on the launch
-            stream; receives bitcast-fp32 atomic max of ``1/row_sum`` over
-            valid rows (cuDNN Amax_S convention). Pass a dummy when unused.
         :param amax_o: 1-element Int32 buffer, host pre-zeroed; receives
             bitcast-fp32 atomic max of ``|o_scaled|`` pre-cast. The host
             divides by ``scale_o`` afterwards. Pass a dummy when unused.
@@ -1166,21 +1162,6 @@ class SM120FusedMultiHeadAttentionForward:
                     lse_val = -cutlass.Float32.inf
                 row_lse[row_half] = lse_val
 
-            # Amax_S = max over valid rows of the raw 1/row_sum (cuDNN
-            # convention: the softmax-probability amax proxy), captured BEFORE
-            # o_scale_fused folds into the normalization factor. One lane per
-            # thread-quad carries the replicated row state; bitcast-int32
-            # atomic max is exact for non-negative fp32.
-            amax_s_arr = cutlass.make_array_view(amax_s)
-            if lane % 4 == 0:
-                for row_half in cutlass.range_constexpr(2):
-                    amax_q_idx = q_seq_idx + q_warp_row0 + (lane // 4) + row_half * 8
-                    if amax_q_idx < seqlen_q:
-                        prims.atomicrmw(
-                            prims.AtomicOp.MAX,
-                            amax_s_arr,
-                            row_sum_inv[row_half].bitcast(cutlass.Int32),
-                        )
             for row_half in cutlass.range_constexpr(2):
                 row_sum_inv[row_half] = row_sum_inv[row_half] * o_scale_fused
 
@@ -1316,7 +1297,6 @@ class SM120FusedMultiHeadAttentionForward:
         sinks: Optional[cute.Tensor],
         seq_q_lens: cute.Tensor,
         seq_kv_lens: cute.Tensor,
-        amax_s: cute.Tensor,
         amax_o: cute.Tensor,
         softmax_scale_log2: cutlass.Float32,
         o_scale_fused: cutlass.Float32,
@@ -1334,7 +1314,6 @@ class SM120FusedMultiHeadAttentionForward:
         :param sinks: Must be ``None`` (fp8 cell rejects has_sink).
         :param seq_q_lens: Per-batch query lengths, or an unused dummy tensor.
         :param seq_kv_lens: Per-batch key/value lengths, or an unused dummy tensor.
-        :param amax_s: 1-element Int32 amax buffer (pre-zeroed; dummy ok).
         :param amax_o: 1-element Int32 amax buffer (pre-zeroed; dummy ok).
         :param softmax_scale_log2: ``softmax_scale * descale_q * descale_k * log2(e)``.
         :param o_scale_fused: ``descale_s * descale_v * scale_o``.
@@ -1452,7 +1431,6 @@ class SM120FusedMultiHeadAttentionForward:
             sinks,
             seq_q_lens,
             seq_kv_lens,
-            amax_s,
             amax_o,
             tma_k_desc,
             tma_v_desc,
@@ -1582,12 +1560,6 @@ def compile(  # noqa: A001
     )
     # Amax buffers are Int32 at the ABI (bitcast-fp32 atomic max targets);
     # the adapter passes torch fp32 buffers as .view(torch.int32).
-    fake_amax_s = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32,
-        (1,),
-        stride_order=(0,),
-        assumed_align=4,
-    )
     fake_amax_o = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
         (1,),
@@ -1604,7 +1576,6 @@ def compile(  # noqa: A001
         fake_sinks,
         fake_seq_q_lens,
         fake_seq_kv_lens,
-        fake_amax_s,
         fake_amax_o,
         cutlass.Float32(1.0),
         cutlass.Float32(1.0),

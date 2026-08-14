@@ -5,7 +5,7 @@
 
 Drives ``graph.sdpa_fp8`` (FP8 E4M3/E5M2 Q/K/V + scalar per-tensor descales) routed to
 the ``sdpa_fwd_prefill_sm100_d128_fp8`` engine, and validates O against an fp32-dequant
-reference. ``Amax_S`` and ``Amax_O`` are both produced in-kernel (atomicMax over the
+reference. ``Amax_O`` is produced in-kernel (atomicMax over the
 pre-cast fp32 values); both are checked.
 
 cuDNN's ``sdpa_fp8`` op exposes causal / bottom-right / sliding-window masks, attention
@@ -67,9 +67,9 @@ def _ref(qd, kd, vd, *, scale, is_causal=False, bottom_right=False, swa_window=N
     if sinks is not None:
         col = sinks.view(1, h_q, 1, 1).float().expand(b, h_q, s_q, 1).to(dev)
         probs = torch.softmax(torch.cat([scores, col], dim=-1), dim=-1)
-        return torch.matmul(probs[..., :s_kv], v_e), probs[..., :s_kv].max().item()
+        return torch.matmul(probs[..., :s_kv], v_e)
     probs = torch.softmax(scores, dim=-1)
-    return torch.matmul(probs, v_e), probs.max().item()
+    return torch.matmul(probs, v_e)
 
 
 def _run(B, H_q, H_kv, S_q, S_kv, in_key, out_dt, *, scale, sdpa_kwargs, sink=None, seq_lens_kv=None, s_scale=1.0, s_descale_gain=1.0, stats=True):
@@ -90,7 +90,6 @@ def _run(B, H_q, H_kv, S_q, S_kv, in_key, out_dt, *, scale, sdpa_kwargs, sink=No
     Qb, Kb, Vb = bshd(Q8), bshd(K8), bshd(V8)
     Ob = torch.empty(B, S_q, H_q, D, device=dev, dtype=out_dt).transpose(1, 2)
     lse = torch.empty(B, H_q, S_q, 1, device=dev, dtype=torch.float32)
-    amax_s = torch.zeros(1, 1, 1, 1, device=dev, dtype=torch.float32)
     amax_o = torch.zeros(1, 1, 1, 1, device=dev, dtype=torch.float32)
 
     def sc(val):
@@ -127,11 +126,10 @@ def _run(B, H_q, H_kv, S_q, S_kv, in_key, out_dt, *, scale, sdpa_kwargs, sink=No
         vp[sq_h] = slq
         vp[skv_h] = slk
     kw.update(sdpa_kwargs)
-    o, stats_t, amx_s, amx_o = g.sdpa_fp8(**kw)
+    o, stats_t, _amx_s_unused, amx_o = g.sdpa_fp8(**kw)  # Amax_S: not requested (engines decline graphs that declare it)
     o.set_output(True).set_dim(list(Ob.shape)).set_stride(list(Ob.stride())).set_data_type(getattr(cudnn.data_type, _CUDNN_OTYPE[out_dt]))
     if stats:
         stats_t.set_output(True).set_dim([B, H_q, S_q, 1]).set_stride([H_q * S_q, S_q, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
-    amx_s.set_output(True).set_dim([1, 1, 1, 1]).set_stride([1, 1, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
     amx_o.set_output(True).set_dim([1, 1, 1, 1]).set_stride([1, 1, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
 
     g.validate()
@@ -144,7 +142,7 @@ def _run(B, H_q, H_kv, S_q, S_kv, in_key, out_dt, *, scale, sdpa_kwargs, sink=No
         # No Stats output: the kernel compiles the LSE store out (has_lse=False)
         # — no dummy buffer exists at any level, so the dense workspace is 0.
         assert g.get_workspace_size() == 0
-    vp.update({o: Ob, amx_s: amax_s, amx_o: amax_o})
+    vp.update({o: Ob, amx_o: amax_o})
     if stats:
         vp[stats_t] = lse
     g.execute(vp, torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8))
@@ -153,8 +151,8 @@ def _run(B, H_q, H_kv, S_q, S_kv, in_key, out_dt, *, scale, sdpa_kwargs, sink=No
     ref_kw = _ref_kwargs(sdpa_kwargs)
     if sink is not None:
         ref_kw["sinks"] = sink.flatten()
-    o_ref, amax_s_ref = _ref(Q8.float() * dq, K8.float() * dk, V8.float() * dv, scale=scale, seq_lens_kv=seq_lens_kv, **ref_kw)
-    return Ob, o_ref, amax_s.item(), amax_s_ref, amax_o.item(), o_ref.abs().max().item()
+    o_ref = _ref(Q8.float() * dq, K8.float() * dk, V8.float() * dv, scale=scale, seq_lens_kv=seq_lens_kv, **ref_kw)
+    return Ob, o_ref, amax_o.item(), o_ref.abs().max().item()
 
 
 def _ref_kwargs(sdpa_kwargs):
@@ -170,16 +168,15 @@ def _ref_kwargs(sdpa_kwargs):
     return out
 
 
-def _check(O, O_ref, out_dt, in_key, amax_s, amax_s_ref, amax_o, amax_o_ref):
+def _check(out, o_ref, out_dt, in_key, amax_o, amax_o_ref):
     atol = 7e-2 if in_key == "e5m2" else 5e-2
-    diff = (O.float() - O_ref).abs().max().item()
+    diff = (out.float() - o_ref).abs().max().item()
     if out_dt in (torch.float8_e4m3fn, torch.float8_e5m2):
-        floor = (O_ref - O_ref.to(out_dt).float()).abs().max().item()
+        floor = (o_ref - o_ref.to(out_dt).float()).abs().max().item()
         atol = max(atol, 3.0 * floor)
     assert diff <= atol, f"max|O-ref|={diff:.4f} > {atol:.4f}"
-    # Amax_S and Amax_O are both produced in-kernel (atomicMax over the pre-cast fp32
+    # Amax_O is produced in-kernel (atomicMax over the pre-cast fp32
     # values), so they match the exact fp32 reference for every output dtype, incl. FP8.
-    assert abs(amax_s - amax_s_ref) <= 0.03, f"amax_s {amax_s:.4f} vs ref {amax_s_ref:.4f}"
     assert abs(amax_o - amax_o_ref) <= 0.03, f"amax_o {amax_o:.4f} vs ref {amax_o_ref:.4f}"
 
 
@@ -200,8 +197,8 @@ _MASKS = {
 @torch_fork_set_rng(seed=0)
 def test_fp8_masks(in_key, mask):
     scale = 1.0 / math.sqrt(128)
-    O, O_ref, a_s, a_s_ref, a_o, a_o_ref = _run(2, 8, 8, 256, 256, in_key, torch.float16, scale=scale, sdpa_kwargs=_MASKS[mask])
-    _check(O, O_ref, torch.float16, in_key, a_s, a_s_ref, a_o, a_o_ref)
+    out, o_ref, a_o, a_o_ref = _run(2, 8, 8, 256, 256, in_key, torch.float16, scale=scale, sdpa_kwargs=_MASKS[mask])
+    _check(out, o_ref, torch.float16, in_key, a_o, a_o_ref)
 
 
 @pytest.mark.L0
@@ -210,8 +207,8 @@ def test_fp8_masks(in_key, mask):
 @torch_fork_set_rng(seed=0)
 def test_fp8_output_dtypes(in_key, out_key):
     scale = 1.0 / math.sqrt(128)
-    O, O_ref, a_s, a_s_ref, a_o, a_o_ref = _run(1, 8, 8, 512, 512, in_key, _OUT[out_key], scale=scale, sdpa_kwargs=dict(use_causal_mask=True))
-    _check(O, O_ref, _OUT[out_key], in_key, a_s, a_s_ref, a_o, a_o_ref)
+    out, o_ref, a_o, a_o_ref = _run(1, 8, 8, 512, 512, in_key, _OUT[out_key], scale=scale, sdpa_kwargs=dict(use_causal_mask=True))
+    _check(out, o_ref, _OUT[out_key], in_key, a_o, a_o_ref)
 
 
 @pytest.mark.L0
@@ -220,8 +217,8 @@ def test_fp8_output_dtypes(in_key, out_key):
 def test_fp8_sink(in_key):
     scale = 1.0 / math.sqrt(128)
     sink = torch.randn(1, 8, 1, 1, dtype=torch.float32, device="cuda")
-    O, O_ref, a_s, a_s_ref, a_o, a_o_ref = _run(2, 8, 8, 256, 256, in_key, torch.float16, scale=scale, sdpa_kwargs=dict(use_causal_mask=True), sink=sink)
-    _check(O, O_ref, torch.float16, in_key, a_s, a_s_ref, a_o, a_o_ref)
+    out, o_ref, a_o, a_o_ref = _run(2, 8, 8, 256, 256, in_key, torch.float16, scale=scale, sdpa_kwargs=dict(use_causal_mask=True), sink=sink)
+    _check(out, o_ref, torch.float16, in_key, a_o, a_o_ref)
 
 
 @pytest.mark.L0
@@ -229,16 +226,16 @@ def test_fp8_sink(in_key):
 @torch_fork_set_rng(seed=0)
 def test_fp8_gqa(in_key):
     scale = 1.0 / math.sqrt(128)
-    O, O_ref, a_s, a_s_ref, a_o, a_o_ref = _run(2, 8, 2, 256, 256, in_key, torch.float16, scale=scale, sdpa_kwargs=dict(use_causal_mask=True))
-    _check(O, O_ref, torch.float16, in_key, a_s, a_s_ref, a_o, a_o_ref)
+    out, o_ref, a_o, a_o_ref = _run(2, 8, 2, 256, 256, in_key, torch.float16, scale=scale, sdpa_kwargs=dict(use_causal_mask=True))
+    _check(out, o_ref, torch.float16, in_key, a_o, a_o_ref)
 
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_fp8_bottom_right_rectangular():
     scale = 1.0 / math.sqrt(128)
-    O, O_ref, a_s, a_s_ref, a_o, a_o_ref = _run(2, 8, 8, 128, 256, "e4m3", torch.float16, scale=scale, sdpa_kwargs=dict(use_causal_mask_bottom_right=True))
-    _check(O, O_ref, torch.float16, "e4m3", a_s, a_s_ref, a_o, a_o_ref)
+    out, o_ref, a_o, a_o_ref = _run(2, 8, 8, 128, 256, "e4m3", torch.float16, scale=scale, sdpa_kwargs=dict(use_causal_mask_bottom_right=True))
+    _check(out, o_ref, torch.float16, "e4m3", a_o, a_o_ref)
 
 
 @pytest.mark.L0
@@ -247,13 +244,13 @@ def test_fp8_bottom_right_rectangular():
 @torch_fork_set_rng(seed=0)
 def test_fp8_padding(in_key, causal):
     # KV padding mask: batch 0 uses all 256 KV cols, batch 1 only 192 (a partial
-    # KV tile).  Exercises per-batch eff_seqlen_kv masking AND the in-kernel amax_s
+    # KV tile).  Exercises per-batch eff_seqlen_kv masking AND the in-kernel amax_o
     # / amax_o over the padding-masked scores (padded cols/rows must not leak or
     # poison the global amax).
     scale = 1.0 / math.sqrt(128)
     sk = dict(use_causal_mask=True) if causal else {}
-    O, O_ref, a_s, a_s_ref, a_o, a_o_ref = _run(2, 8, 8, 256, 256, in_key, torch.float16, scale=scale, sdpa_kwargs=sk, seq_lens_kv=[256, 192])
-    _check(O, O_ref, torch.float16, in_key, a_s, a_s_ref, a_o, a_o_ref)
+    out, o_ref, a_o, a_o_ref = _run(2, 8, 8, 256, 256, in_key, torch.float16, scale=scale, sdpa_kwargs=sk, seq_lens_kv=[256, 192])
+    _check(out, o_ref, torch.float16, in_key, a_o, a_o_ref)
 
 
 @pytest.mark.L0
@@ -262,11 +259,11 @@ def test_fp8_padding(in_key, causal):
 def test_fp8_stats_less_zero_workspace(in_key):
     """No Stats output: the kernel compiles the LSE store out (has_lse=False),
     no dummy buffer exists at any level, and the dense graph reports
-    ``get_workspace_size() == 0`` (asserted inside ``_run``). The Amax_S /
-    Amax_O atomicMax writes are independent of the LSE and still produced."""
+    ``get_workspace_size() == 0`` (asserted inside ``_run``). The Amax_O
+    atomicMax write is independent of the LSE and still produced."""
     scale = 1.0 / math.sqrt(128)
-    O, O_ref, a_s, a_s_ref, a_o, a_o_ref = _run(2, 8, 8, 256, 256, in_key, torch.float16, scale=scale, sdpa_kwargs=dict(use_causal_mask=True), stats=False)
-    _check(O, O_ref, torch.float16, in_key, a_s, a_s_ref, a_o, a_o_ref)
+    out, o_ref, a_o, a_o_ref = _run(2, 8, 8, 256, 256, in_key, torch.float16, scale=scale, sdpa_kwargs=dict(use_causal_mask=True), stats=False)
+    _check(out, o_ref, torch.float16, in_key, a_o, a_o_ref)
 
 
 @pytest.mark.L0
@@ -304,7 +301,7 @@ def test_fp8_sm100_execute_lse_contract():
         api.execute(lse_tensor=lse, **ex)
     api.execute(**ex)
     torch.cuda.synchronize()
-    o_ref, _ = _ref(q8.float() * dq, q8.float() * dq, q8.float() * dq, scale=api.scale_softmax, is_causal=True)
+    o_ref = _ref(q8.float() * dq, q8.float() * dq, q8.float() * dq, scale=api.scale_softmax, is_causal=True)
     torch.testing.assert_close(o.float(), o_ref, atol=5e-2, rtol=3e-2)
 
 
