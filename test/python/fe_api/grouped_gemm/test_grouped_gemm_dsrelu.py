@@ -426,7 +426,7 @@ def _run_dsrelu_case(case, **wrapper_kwargs):
     )
 
 
-def _build_dsrelu_case(request, ab_dtype, c_dtype, d_dtype, sf_vec_size, sf_dtype, vector_f32, discrete_col_sfd, n_override=None):
+def _build_dsrelu_case(request, ab_dtype, c_dtype, d_dtype, sf_vec_size, sf_dtype, vector_f32, discrete_col_sfd, n_override=None, group_m_override=None):
     cfg = grouped_gemm_dsrelu_init(
         request=request,
         ab_dtype=ab_dtype,
@@ -446,6 +446,12 @@ def _build_dsrelu_case(request, ab_dtype, c_dtype, d_dtype, sf_vec_size, sf_dtyp
         # Everything downstream reads cfg["n"], so overriding it here keeps the allocators,
         # the wrapper call and the reference in agreement.
         cfg["n"] = n_override
+    if group_m_override is not None:
+        # The default is [256] * l -- every expert the same size, so every expert owns the same
+        # number of M-blocks. Anything that assumes a uniform stride between experts survives
+        # that; only a ragged distribution tells a real segment mapping from a fake one.
+        cfg["group_m_list"] = group_m_override
+        cfg["l"] = len(group_m_override)
     inputs = allocate_grouped_gemm_input_tensors(
         n=cfg["n"],
         k=cfg["k"],
@@ -488,7 +494,7 @@ def _torch_deterministic_algorithms():
         torch.use_deterministic_algorithms(previous, warn_only=previous_warn_only)
 
 
-def _assert_dprob_deterministic(case, baseline, deterministic, relaunch, ref_inputs=None):
+def _assert_dprob_deterministic(case, baseline, deterministic, relaunch, ref_inputs=None, dprob_rtol=1e-4, dprob_atol=1e-4):
     """The three properties deterministic=True has to hold, shared by dense and discrete.
 
     ``relaunch`` produces another deterministic run; it is called repeatedly, because a
@@ -508,8 +514,9 @@ def _assert_dprob_deterministic(case, baseline, deterministic, relaunch, ref_inp
     # gap in the per-subtile slots, or double-counted by a second writer to an N-tile slot,
     # would show up here and nowhere else. The tolerance is not delicate -- both modes sum
     # the same terms, so the honest difference is fp32 reordering (~1e-5 here), while a
-    # dropped or duplicated partial moves dprob by tens of percent.
-    torch.testing.assert_close(deterministic["dprob_tensor"], baseline["dprob_tensor"], rtol=1e-4, atol=1e-4)
+    # dropped or duplicated partial moves dprob by tens of percent. It does not transfer across
+    # n, though -- dprob sums n terms -- so callers at a larger n pass a looser pair.
+    torch.testing.assert_close(deterministic["dprob_tensor"], baseline["dprob_tensor"], rtol=dprob_rtol, atol=dprob_atol)
 
     # dprob is the only output the flag touches; dA and friends are single-write per element
     # and must come back untouched. d_col only joins that list when the fp8 scale-factor path
@@ -674,6 +681,9 @@ def test_grouped_gemm_dsrelu_deterministic_dbias(request):
     dbias contends across M-tiles, not N-tiles like dprob, so it gets its own fp32 workspace
     indexed by absolute M-block plus a per-expert segment sum. The properties it has to hold are
     the same ones dprob does, so this reuses that checklist and adds the dbias-specific parts.
+
+    Run on a ragged expert distribution -- see the comment on the case below; the default one
+    cannot fail this test.
     """
     try:
         import cudnn  # noqa: F401
@@ -681,7 +691,21 @@ def test_grouped_gemm_dsrelu_deterministic_dbias(request):
     except ImportError:
         pytest.skip("Environment not supported: cudnn optional dependencies not installed")
 
-    case = _build_dsrelu_case(request, torch.float8_e4m3fn, torch.bfloat16, torch.float8_e4m3fn, 32, torch.float8_e8m0fnu, False, True)
+    # Ragged on purpose. Measured (job 466159, 16 launches per config): at the default
+    # [256] * 4 the NON-deterministic dbias is already bit-stable, so assert_bitwise_runs below
+    # would pass whether or not the fix works. At this distribution it varies 15/15, which is
+    # what makes the assertion mean something.
+    case = _build_dsrelu_case(
+        request,
+        torch.float8_e4m3fn,
+        torch.bfloat16,
+        torch.float8_e4m3fn,
+        32,
+        torch.float8_e8m0fnu,
+        False,
+        True,
+        group_m_override=[256, 512, 256, 1024],
+    )
     inputs, cfg = case
 
     try:
@@ -710,6 +734,165 @@ def test_grouped_gemm_dsrelu_deterministic_dbias(request):
     # ~2 ULP of bf16 there.
     det_dbias, base_dbias = deterministic["dbias_tensor"].float(), baseline["dbias_tensor"].float()
     torch.testing.assert_close(det_dbias, base_dbias, rtol=5e-2, atol=max(base_dbias.abs().max().item(), 1.0) * 5e-2)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=59)
+def test_grouped_gemm_dsrelu_deterministic_dbias_cache_is_m_dynamic(request, monkeypatch):
+    """Deterministic dbias must not add token-count dependence to the compile cache key.
+
+    The workspace has one row per CTA M-tile, so its dim 0 follows valid_m; keyed on the full
+    shape it would recompile for most steps of an MoE loop. Asserted as "no more entries than
+    the default path produces" rather than "exactly one": measured (job 466362) this config
+    already recompiles per valid_m without dbias at all -- elements 28/33/34 of the key are the
+    d_col batch stride and the sfd_col shape/strides, all of which carry M. That is pre-existing
+    and orthogonal; what this pins is that the flag adds nothing on top.
+
+    Only reachable with CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL=0 -- the default path drops tensor
+    shapes from the key entirely, which is why the other dbias tests cannot see this.
+    """
+    try:
+        import cudnn  # noqa: F401
+        from cuda.bindings import driver as cuda  # noqa: F401
+        from cudnn.gemm.cutedsl.grouped.dsrelu import api as dsrelu_api
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn optional dependencies not installed")
+
+    monkeypatch.setenv("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", "0")
+    args = (torch.float8_e4m3fn, torch.bfloat16, torch.float8_e4m3fn, 32, torch.float8_e8m0fnu, False, True)
+
+    def entries_for(deterministic):
+        monkeypatch.setattr(dsrelu_api, "_cache_of_GroupedGemmDsreluSm100Objects", {})
+        for group_m_list in ([256] * 4, [256, 512, 256, 512]):
+            case = _build_dsrelu_case(request, *args, group_m_override=group_m_list)
+            outputs = _run_dsrelu_case(case, deterministic=deterministic, generate_dbias=True)
+            torch.cuda.synchronize()
+            check_ref_grouped_gemm_dsrelu(case[0], outputs, case[1], skip_ref=case[1]["skip_ref"])
+        return len(dsrelu_api._cache_of_GroupedGemmDsreluSm100Objects)
+
+    try:
+        baseline_entries = entries_for(False)
+    except (ValueError, NotImplementedError) as e:
+        pytest.skip(f"Unsupported testcase: {e}")
+
+    assert entries_for(True) == baseline_entries, "deterministic dbias added a token-count-dependent cache key"
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=61)
+def test_grouped_gemm_dsrelu_deterministic_dbias_zero_tokens(request):
+    """A zero-token call must still return the documented dbias, not the slot workspace.
+
+    valid_m == 0 skips the kernel entirely, so the reduction runs on an empty workspace: the
+    one-hot is (expert_cnt, 0) and the matmul has an empty contraction. It has to come back
+    (expert_cnt, n, 1) bf16 and zeroed, the same as the non-deterministic path.
+    """
+    try:
+        import cudnn  # noqa: F401
+        from cuda.bindings import driver as cuda  # noqa: F401
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn optional dependencies not installed")
+
+    args = (torch.float8_e4m3fn, torch.bfloat16, torch.float8_e4m3fn, 32, torch.float8_e8m0fnu, False, True)
+    case = _build_dsrelu_case(request, *args)
+    inputs, cfg = case
+    # Zero every group: valid_m becomes 0 while the descriptors stay well-formed.
+    inputs = dict(inputs)
+    inputs["padded_offsets_tensor"] = torch.zeros_like(inputs["padded_offsets_tensor"])
+    try:
+        outputs = _run_dsrelu_case((inputs, cfg), deterministic=True, generate_dbias=True)
+    except (ValueError, NotImplementedError) as e:
+        pytest.skip(f"Unsupported testcase: {e}")
+    torch.cuda.synchronize()
+
+    assert outputs["dbias_tensor"].shape == (cfg["l"], cfg["n"], 1)
+    assert outputs["dbias_tensor"].dtype == torch.bfloat16
+    assert torch.count_nonzero(outputs["dbias_tensor"]).item() == 0
+    assert outputs["dprob_tensor"].shape[1:] == (1, 1)
+
+
+@pytest.mark.L1
+@torch_fork_set_rng(seed=53)
+def test_grouped_gemm_dsrelu_deterministic_at_scale(request):
+    """The one config in this file where the default path is non-deterministic in *both* outputs.
+
+    Measured (job 466159, 16 launches per config): at l=4 / [256] * 4 / n=512 -- what every other
+    determinism test here uses -- the non-deterministic dprob AND dbias are both already bit-stable,
+    so those tests cannot distinguish a working fix from a broken one. At l=8 / [1024] * 8 / n=2048
+    both vary 15/15. This is the case that actually demonstrates the flag does something.
+
+    L1 rather than L0: it is roughly 16x the work of the smoke configs.
+    """
+    try:
+        import cudnn  # noqa: F401
+        from cuda.bindings import driver as cuda  # noqa: F401
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn optional dependencies not installed")
+
+    case = _build_dsrelu_case(
+        request,
+        torch.float8_e4m3fn,
+        torch.bfloat16,
+        torch.float8_e4m3fn,
+        32,
+        torch.float8_e8m0fnu,
+        False,
+        True,
+        n_override=2048,
+        group_m_override=[1024] * 8,
+    )
+    inputs, cfg = case
+    try:
+        baseline = _run_dsrelu_case(case, deterministic=False, generate_dbias=True)
+    except (ValueError, NotImplementedError) as e:
+        pytest.skip(f"Unsupported testcase: {e}")
+    deterministic = _run_dsrelu_case(case, deterministic=True, generate_dbias=True)
+    # dprob sums n terms, so fp32 reassociation grows with n: the helper's 1e-4 is calibrated at
+    # the default n=512, and 1 element in 8192 lands at 1.8e-4 relative here (job 466172). That is
+    # reordering, not a dropped partial -- those move dprob by tens of percent, not by 5e-4.
+    _assert_dprob_deterministic(
+        case,
+        baseline,
+        deterministic,
+        lambda: _run_dsrelu_case(case, deterministic=True, generate_dbias=True),
+        dprob_rtol=1e-3,
+        dprob_atol=1e-3,
+    )
+    check_ref_grouped_gemm_dsrelu(inputs, deterministic, cfg, skip_ref=cfg["skip_ref"])
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=47)
+@pytest.mark.parametrize("group_m_list", [[256, 512, 256, 1024], [512, 256, 1024, 256]], ids=["ragged", "ragged-reordered"])
+def test_grouped_gemm_dsrelu_deterministic_dbias_ragged_experts(request, group_m_list):
+    """Experts of different sizes own different numbers of M-blocks.
+
+    The default config is [256] * 4 -- every expert exactly two M-blocks -- so a segment sum
+    that simply assumed a fixed stride between experts would pass every other dbias test here.
+    These distributions give 2/4/2/8 and 4/2/8/2 blocks, so a fixed-stride or off-by-one
+    mapping lands one expert's rows in another and the reference check fails.
+    """
+    try:
+        import cudnn  # noqa: F401
+        from cuda.bindings import driver as cuda  # noqa: F401
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn optional dependencies not installed")
+
+    case = _build_dsrelu_case(
+        request, torch.float8_e4m3fn, torch.bfloat16, torch.float8_e4m3fn, 32, torch.float8_e8m0fnu, False, True, group_m_override=group_m_list
+    )
+    inputs, cfg = case
+    try:
+        outputs = _run_dsrelu_case(case, deterministic=True, generate_dbias=True)
+    except (ValueError, NotImplementedError) as e:
+        pytest.skip(f"Unsupported testcase: {e}")
+    torch.cuda.synchronize()
+
+    # Each expert's row must be non-trivial, or a mapping that collapsed everything into one
+    # expert could still satisfy the reference check on the rows it happened to fill.
+    per_expert_nonzero = (outputs["dbias_tensor"].float().abs().sum(dim=(1, 2)) > 0).tolist()
+    assert all(per_expert_nonzero), f"empty dbias rows: {per_expert_nonzero}"
+    check_ref_grouped_gemm_dsrelu(inputs, outputs, cfg, skip_ref=cfg["skip_ref"])
 
 
 @pytest.mark.L0
