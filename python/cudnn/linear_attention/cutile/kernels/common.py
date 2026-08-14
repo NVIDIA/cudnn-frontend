@@ -89,6 +89,38 @@ def dev_id(buf) -> int:
     return probe(buf)[4]
 
 
+def ensure_cuda_context(stream=0) -> None:
+    """Make the calling thread's CUDA driver context current.
+
+    cuTile launches and the autotuner's driver-API timing fail on threads
+    whose driver context stack is empty — e.g. autograd backward worker
+    threads, where cudaSetDevice alone binds nothing. Prefer the launch
+    stream's own context; else retain + set-current the current device's
+    primary context (retained only when no context is bound, so at most once
+    per thread). Best-effort: never fatal."""
+    try:
+        from cuda.bindings import driver as drv
+
+        err, cur = drv.cuCtxGetCurrent()
+        if err == drv.CUresult.CUDA_SUCCESS and int(cur) != 0:
+            return
+        if stream:
+            err, sctx = drv.cuStreamGetCtx(stream)
+            if err == drv.CUresult.CUDA_SUCCESS:
+                drv.cuCtxSetCurrent(sctx)
+                return
+        from cuda.bindings import runtime as rt
+
+        err_d, dev = rt.cudaGetDevice()
+        if int(err_d) != 0:
+            return
+        err, pctx = drv.cuDevicePrimaryCtxRetain(dev)
+        if err == drv.CUresult.CUDA_SUCCESS:
+            drv.cuCtxSetCurrent(pctx)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 @ct.kernel
 def add_inplace_kernel(dst, src, TILE: ConstInt):
     pid = ct.bid(0)

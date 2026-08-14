@@ -22,7 +22,7 @@ from types import SimpleNamespace
 import cuda.tile as ct
 from cuda.tile.tune import exhaustive_search
 
-from .common import add_inplace, dev_id, dummy, head_group_sum, opt, reshaped, sum_leading, zero_fill
+from .common import add_inplace, dev_id, dummy, ensure_cuda_context, head_group_sum, opt, reshaped, sum_leading, zero_fill
 from cudnn.frost.buffers import dtype_name as dtname
 
 logger = logging.getLogger(__name__)
@@ -62,30 +62,6 @@ LAUNCH_HINT_CONFIGS = [
     SimpleNamespace(occupancy=1, num_worker_warps=8),
     SimpleNamespace(occupancy=1, num_worker_warps=4),
 ]
-
-
-def ensure_cuda_context():
-    """Make the calling thread's CUDA driver context current.
-
-    exhaustive_search times configs through the driver API, which fails on threads
-    with an empty driver context stack (e.g. autograd backward worker threads).
-    Retain + set-current the device primary context. Best-effort: never fatal."""
-    try:
-        from cuda.bindings import driver as drv
-
-        err, cur = drv.cuCtxGetCurrent()
-        if err == drv.CUresult.CUDA_SUCCESS and int(cur) != 0:
-            return
-        from cuda.bindings import runtime as rt
-
-        err_d, dev = rt.cudaGetDevice()
-        if int(err_d) != 0:
-            return
-        err, ctx = drv.cuDevicePrimaryCtxRetain(dev)
-        if err == drv.CUresult.CUDA_SUCCESS:
-            drv.cuCtxSetCurrent(ctx)
-    except Exception:  # noqa: BLE001
-        pass
 
 
 def device_attrs():

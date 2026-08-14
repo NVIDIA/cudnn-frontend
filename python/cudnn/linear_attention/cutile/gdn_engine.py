@@ -105,11 +105,12 @@ class GdnCuTilePlan(CompiledPlan):
         return self.ws_bytes
 
     def execute(self, graph, uid_to_data, ctx) -> None:
-        from .kernels.common import build_chunk_table
+        from .kernels.common import build_chunk_table, ensure_cuda_context
         from .kernels.gdn_chunk_cutile import BT_CHUNK
 
         node_buffers = resolve_node_buffers(graph, uid_to_data)
         stream = ctx.stream if ctx.stream is not None else 0
+        ensure_cuda_context(stream)
         ws = Workspace(ctx.workspace, self.ws_bytes, "GdnCuTileEngine")
         for node, _nbytes, table in self.layouts:
             nb = node_buffers[node]
