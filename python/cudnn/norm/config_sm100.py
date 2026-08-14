@@ -333,9 +333,39 @@ def make_warp_cfg(params: TemplateParams, C: int):
     return (tpr, wn, intra, ldgs, rpc, block_threads, V)
 
 
+def warp_cfg_candidates(params: TemplateParams, C: int):
+    """All feasible warp wcfgs (one per valid ``wn``) for autotuning. Same tuple
+    shape as :func:`make_warp_cfg`; empty if C is not warp-eligible."""
+    from .dtypes import DTYPE_BYTES
+
+    eb = DTYPE_BYTES[params.io_dtype]
+    V = vector_width(eb)
+    if C % V != 0:
+        return []
+    vec_cols = C // V
+    if vec_cols < 32:
+        tpr = 32
+        while vec_cols % tpr != 0 or tpr > vec_cols:
+            tpr //= 2
+        bt = max(tpr, (256 // tpr) * tpr)
+        return [(tpr, 1, tpr, vec_cols // tpr, bt // tpr, bt, V)]
+    out = []
+    for wn in (1, 2, 4, 8):
+        tpr = wn * 32
+        if tpr > 256 or vec_cols % tpr != 0:
+            continue
+        ldgs = vec_cols // tpr
+        if ldgs < 1 or ldgs > 32:  # register-footprint cap
+            continue
+        bt = max(tpr, (256 // tpr) * tpr)
+        out.append((tpr, wn, 32, ldgs, bt // tpr, bt, V))
+    return out
+
+
 __all__ = [
     "NormVariant",
     "make_warp_cfg",
+    "warp_cfg_candidates",
     "ROWWISE_VARIANTS",
     "HAS_MEAN",
     "RowwiseSpec",
