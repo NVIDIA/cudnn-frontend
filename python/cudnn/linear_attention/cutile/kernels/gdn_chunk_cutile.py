@@ -20,9 +20,10 @@ import logging
 from types import SimpleNamespace
 
 import cuda.tile as ct
+from cuda.tile.tune import exhaustive_search
 
-from .common import add_inplace, head_group_sum, reshaped, sum_leading, zero_fill
-from cudnn.frost.buffers import dtype_name as _dtname
+from .common import add_inplace, dev_id, dummy, ensure_cuda_context, head_group_sum, opt, reshaped, sum_leading, zero_fill
+from cudnn.frost.buffers import dtype_name as dtname
 
 logger = logging.getLogger(__name__)
 
@@ -31,36 +32,31 @@ ConstInt = ct.Constant[int]
 RCP_LN2 = 1.4426950216  # 1/ln(2)
 
 # chunk size (BT tile) of these kernels; the engine's carve layout imports it
-_BT = 64
+BT_CHUNK = 64
 
 
 # Host-side utilities
 
 
-def _cdiv(a: int, b: int) -> int:
+def cdiv(a: int, b: int) -> int:
     return (a + b - 1) // b
 
 
-def _next_power_of_2(n: int) -> int:
+def next_power_of_2(n: int) -> int:
     return 1 << (n - 1).bit_length()
 
 
 # Launch-hint autotuning (occupancy x num_worker_warps) for hot kernels.
-# These large unrolled tiles emit 255-reg kernels defaulting to occupancy=1, which
-# starves the SM; a higher occupancy hint budgets fewer regs/thread -> more blocks/SM.
-# Tuned once per (kernel, grid-shape) key and cached.
-from cuda.tile.tune import exhaustive_search  # noqa: E402
 
-_LAUNCH_HINT_CACHE: dict = {}
+LAUNCH_HINT_CACHE: dict = {}
 
-# occ=4/nww=4 = consistent winner; nww=8 and default kept as fallbacks.
 # NOTE: the upstream occupancy=2 config is EXCLUDED: on tileiras 13.2 (which
 # ignores num_worker_warps hints) a freshly compiled occ=2
 # chunk_bwd_kernel_dqkwg deadlocks on its first launch (deterministic;
 # occ=1/4 are fine, and occ=2 is fine on the dhu/kkt kernels).  Restore the
 # SimpleNamespace(occupancy=2, num_worker_warps=4) entry once the runtime is
 # on tileiras >= 13.3.
-_LAUNCH_HINT_CONFIGS = [
+LAUNCH_HINT_CONFIGS = [
     SimpleNamespace(occupancy=4, num_worker_warps=4),
     SimpleNamespace(occupancy=4, num_worker_warps=8),
     SimpleNamespace(occupancy=1, num_worker_warps=8),
@@ -68,47 +64,23 @@ _LAUNCH_HINT_CONFIGS = [
 ]
 
 
-def _ensure_cuda_context():
-    """Make the calling thread's CUDA driver context current.
-
-    exhaustive_search times configs through the driver API, which fails on threads
-    with an empty driver context stack (e.g. autograd backward worker threads).
-    Retain + set-current the device primary context. Best-effort: never fatal."""
-    try:
-        from cuda.bindings import driver as _drv
-
-        err, cur = _drv.cuCtxGetCurrent()
-        if err == _drv.CUresult.CUDA_SUCCESS and int(cur) != 0:
-            return
-        from cuda.bindings import runtime as _rt
-
-        err_d, dev = _rt.cudaGetDevice()
-        if int(err_d) != 0:
-            return
-        err, ctx = _drv.cuDevicePrimaryCtxRetain(dev)
-        if err == _drv.CUresult.CUDA_SUCCESS:
-            _drv.cuCtxSetCurrent(ctx)
-    except Exception:  # noqa: BLE001
-        pass
-
-
-def _device_attrs():
+def device_attrs():
     """(sm_count, cc_major) of the current device via the runtime API (which
     auto-inits the primary context, so this works before any framework call)."""
     try:
-        from cuda.bindings import runtime as _rt
+        from cuda.bindings import runtime as rt
 
-        err, dev = _rt.cudaGetDevice()
+        err, dev = rt.cudaGetDevice()
         if int(err) != 0:
             return 0, 0
-        err, sm = _rt.cudaDeviceGetAttribute(_rt.cudaDeviceAttr.cudaDevAttrMultiProcessorCount, dev)
-        err2, major = _rt.cudaDeviceGetAttribute(_rt.cudaDeviceAttr.cudaDevAttrComputeCapabilityMajor, dev)
+        err, sm = rt.cudaDeviceGetAttribute(rt.cudaDeviceAttr.cudaDevAttrMultiProcessorCount, dev)
+        err2, major = rt.cudaDeviceGetAttribute(rt.cudaDeviceAttr.cudaDevAttrComputeCapabilityMajor, dev)
         return (int(sm) if int(err) == 0 else 0), (int(major) if int(err2) == 0 else 0)
     except Exception:  # noqa: BLE001
         return 0, 0
 
 
-def _tuned_launch(kernel, stream, grid, args, cache_key, configs=None):
+def tuned_launch(kernel, stream, grid, args, cache_key, configs=None):
     """Launch ``kernel`` with autotuned (occupancy, num_worker_warps) hints.
 
     Tunes once per ``cache_key`` via exhaustive_search, caches the specialized
@@ -118,13 +90,13 @@ def _tuned_launch(kernel, stream, grid, args, cache_key, configs=None):
     """
     kname = getattr(getattr(kernel, "_pyfunc", None), "__name__", repr(kernel))
     key = (kname, cache_key)
-    if key not in _LAUNCH_HINT_CACHE:
+    if key not in LAUNCH_HINT_CACHE:
         tuned = None
-        _ensure_cuda_context()
+        ensure_cuda_context()
         try:
             with ct.compiler_timeout(20):
                 result = exhaustive_search(
-                    list(configs if configs is not None else _LAUNCH_HINT_CONFIGS),
+                    list(configs if configs is not None else LAUNCH_HINT_CONFIGS),
                     stream,
                     lambda cfg: grid,
                     kernel,
@@ -136,8 +108,8 @@ def _tuned_launch(kernel, stream, grid, args, cache_key, configs=None):
         except Exception as e:  # noqa: BLE001
             logger.warning("launch-hint autotune failed for %s: %s; using default hints", kname, e)
             tuned = kernel
-        _LAUNCH_HINT_CACHE[key] = tuned
-    ct.launch(stream, grid, _LAUNCH_HINT_CACHE[key], args)
+        LAUNCH_HINT_CACHE[key] = tuned
+    ct.launch(stream, grid, LAUNCH_HINT_CACHE[key], args)
 
 
 def exp(x):
@@ -153,21 +125,21 @@ def softplus(x):
     return ct.where(x < 20.0, ct.log(1.0 + ct.exp(x)), x)
 
 
-def _tf32(a):
+def tf32(a):
     """ct.mma/ct.matmul do not auto-cast fp32 operands to tf32; cast
     explicitly (allow-tf32 matmul semantics)."""
     return ct.astype(a, ct.tfloat32) if a.dtype == ct.float32 else a
 
 
 def safe_matmul(a, b):
-    return ct.matmul(_tf32(a), _tf32(b))
+    return ct.matmul(tf32(a), tf32(b))
 
 
 safe_dot = safe_matmul  # alias: non-accumulating dot with fp32->tf32 guard
 
 
 def safe_mma(a, b, acc):
-    return ct.mma(_tf32(a), _tf32(b), acc)
+    return ct.mma(tf32(a), tf32(b), acc)
 
 
 def gather_flat(raw, off, *, mask=None, padding_value=0, check_bounds=False):
@@ -178,7 +150,7 @@ def scatter_flat(raw, off, value, *, mask=None, check_bounds=False):
     raw.store_offset(off, value, mask=mask)
 
 
-def _array_numel(arr):
+def array_numel(arr):
     # Total element count; rank statically unrolled (<=5) since a Python for over
     # arr.shape is captured as a device loop and rejected. K<=256 bounds the rank.
     s = arr.shape
@@ -196,7 +168,7 @@ def _array_numel(arr):
 
 
 # Bounds-checked flat access: 1-D bounds mask `0 <= off < numel` AND-ed with any
-# caller mask. Pass `numel = _array_numel(arr)`.
+# caller mask. Pass `numel = array_numel(arr)`.
 def gather_flat_cb(raw, off, numel, *, mask=None, padding_value=0):
     inb = (off >= 0) & (off < numel)
     m = inb if mask is None else (mask & inb)
@@ -247,7 +219,7 @@ def l2norm_bwd_kernel1(y, rstd, dy, dy2, dx, eps, D, BD: ConstInt, HAS_DY2: Cons
 @ct.kernel
 def l2norm_fwd_kernel(x, y, rstd, eps, T, D: ConstInt, BD: ConstInt, BT: ConstInt):
     # D <= 512 path: BT rows per block, BD power-of-2 cols. Block-aligned ->
-    # ct.load with block index + ZERO padding (faithful to make_block_ptr).
+    # ct.load with block index + ZERO padding.
     i_t = ct.bid(0)
     b_x = ct.astype(ct.load(x, index=(i_t, 0), shape=(BT, BD), padding_mode=ct.PaddingMode.ZERO), ct.float32)
     b_rstd = ct.rsqrt(ct.sum(b_x * b_x, axis=1) + eps)
@@ -413,7 +385,7 @@ def gdn_gate_bwd_kernel(g, A_log, dt_bias, dyg, dg, dA, db, T, H: ConstInt, BT: 
         ct.scatter(db, i_t * H + i_h, b_db)
 
 
-# chunk_gated_delta_rule_fwd_kkt_solve_kernel  (fused kkt + solve, 4 sub-chunks)
+# chunk_gated_delta_rule_fwd_kkt_solve_kernel  (fused KK^T + solve, 4 sub-chunks)
 @ct.kernel
 def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
     k,
@@ -430,7 +402,7 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
     BK: ConstInt,
     USE_G: ConstInt,
 ):
-    """Fused: beta * K @ K^T (lower triangular) + solve_tril (I+A)^{-1} in one pass."""
+    """Fused: Beta * K @ K^T (lower triangular) + solve_tril (I+A)^{-1} in one pass."""
     i_t = ct.bid(0)
     i_h = ct.bid(1)
 
@@ -568,7 +540,7 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
                     b_A31 = ct.mma(b_k3, ct.transpose(b_k1), b_A31)
                     b_A32 = ct.mma(b_k3, ct.transpose(b_k2), b_A32)
 
-    # -- Step 2: gate + beta scaling --
+    # -- Step 2: Gate + Beta scaling --
     m_d = ct.expand_dims(o_i, 1) > ct.expand_dims(o_i, 0)
     m_I = ct.expand_dims(o_i, 1) == ct.expand_dims(o_i, 0)
 
@@ -821,13 +793,12 @@ def recompute_w_u_fwd_kernel(
     beta_seg = beta.slice(axis=0, start=bos, stop=eos)
 
     Z = ct.PaddingMode.ZERO
-    # Keep beta native bf16: scaling in bf16 avoids 2 extra ftof
+    # Keep Beta native bf16: scaling in bf16 avoids 2 extra ftof
     # converts/MMA-input that an f32 cast would force.
     b_b = ct.load(beta_seg, index=(i_t_loc, i_h), shape=(BT, 1), padding_mode=Z).reshape((BT,))
     b_A = ct.load(A_seg, index=(i_t_loc, i_h, 0), shape=(BT, 1, BT), padding_mode=Z).reshape((BT, BT))
 
-    # u = A @ (v * beta). latency=3 -> deeper pipeline of the per-tile TMA
-    # loads; small win over latency=2, no spill.
+    # U = A @ (V * Beta). latency=3 -> deeper pipeline of the per-tile TMA loads.
     for i_v in range(ct.cdiv(V, BV)):
         b_v = ct.load(v_seg, index=(i_t_loc, i_h, i_v), shape=(BT, 1, BV), padding_mode=Z, latency=3).reshape((BT, BV))
         # bf16 * bf16 -> bf16.
@@ -844,7 +815,7 @@ def recompute_w_u_fwd_kernel(
         )
         b_g = exp2(b_g_val)
 
-    # w = A @ (k * beta * g)
+    # W = A @ (K * Beta * Gate)
     for i_k in range(ct.cdiv(K, BK)):
         b_k = ct.load(k_seg, index=(i_t_loc, i_kh, i_k), shape=(BT, 1, BK), padding_mode=Z, latency=3).reshape((BT, BK))
         # bf16 * bf16 -> bf16; only the g-decay path promotes to f32.
@@ -1122,7 +1093,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     o_bv = ct.arange(BV, dtype=ct.int32)
     m_v_lane = (i_v * BV + o_bv) < V
 
-    # --- Load initial state h0 -> b_h1..b_h4 ---
+    # --- Load initial state H0 -> b_h1..b_h4 ---
     if USE_INITIAL_STATE:
         if STATE_V_FIRST:
             row = (i_v * BV + o_bv)[:, None]
@@ -1255,7 +1226,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
                     check_bounds=True,
                 )
 
-        # --- b_v = b_w @ b_h (accumulated over K blocks) ---
+        # --- V = W @ H (accumulated over K blocks) ---
         w_time = (t_base + i_t * BT + o_bt)[:, None]
         wmask_r = (i_t * BT + o_bt) < T
         bw1 = ct.gather(
@@ -1409,7 +1380,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
 
         b_v = ct.astype(b_v, k.dtype)
 
-        # --- b_h += b_k @ b_v   (b_k is (64, BT) transposed load of k) ---
+        # --- H += K^T @ V (K loaded transposed as (64, BT)) ---
         k_time = (t_base + i_t * BT + o_bt)[None, :]
         kmask = ((0 + o64)[:, None] < K) & ((i_t * BT + o_bt)[None, :] < T)
         bk1 = ct.gather(
@@ -1476,7 +1447,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             else:
                 b_h4 = b_h4 + prod4
 
-    # --- Store final state ht <- b_h*  (ht (N, HV, *), per-sequence state) ---
+    # --- Store final state Ht <- b_h*  (Ht (N, HV, *), per-sequence state) ---
     if STORE_FINAL_STATE:
         if STATE_V_FIRST:
             row = (i_v * BV + o_bv)[:, None]
@@ -1513,7 +1484,7 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
     w,
     g,
     gk,
-    dht,
+    dstate_in,
     dh0,
     do,
     dh,
@@ -1570,34 +1541,34 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
     dht_base = i_nh * K * V
 
     # Raw flat handles + element counts for 1-D flat gather/scatter (cuTile 1.4.0).
-    dhtf = dht.get_raw_memory()
-    dht_n = _array_numel(dht)
+    dhtf = dstate_in.get_raw_memory()
+    dht_n = array_numel(dstate_in)
     dhf = dh.get_raw_memory()
-    dh_n = _array_numel(dh)
+    dh_n = array_numel(dh)
     dh0f = dh0.get_raw_memory()
-    dh0_n = _array_numel(dh0)
+    dh0_n = array_numel(dh0)
     gf = g.get_raw_memory()
-    g_n = _array_numel(g)
+    g_n = array_numel(g)
     gkf = gk.get_raw_memory()
-    gk_n = _array_numel(gk)
+    gk_n = array_numel(gk)
     dof = do.get_raw_memory()
-    do_n = _array_numel(do)
+    do_n = array_numel(do)
     kf = k.get_raw_memory()
-    k_n = _array_numel(k)
+    k_n = array_numel(k)
     qf = q.get_raw_memory()
-    q_n = _array_numel(q)
+    q_n = array_numel(q)
     wf = w.get_raw_memory()
-    w_n = _array_numel(w)
+    w_n = array_numel(w)
     dvf = dv.get_raw_memory()
-    dv_n = _array_numel(dv)
+    dv_n = array_numel(dv)
     dv2f = dv2.get_raw_memory()
-    dv2_n = _array_numel(dv2)
+    dv2_n = array_numel(dv2)
 
     o64 = ct.arange(64, dtype=ct.int32)
     o_bt = ct.arange(BT, dtype=ct.int32)
     o_bv = ct.arange(BV, dtype=ct.int32)
 
-    # --- Load final-state gradient dht -> b_dh* ---
+    # --- Load final-state gradient dHt -> b_dh* ---
     if USE_FINAL_STATE_GRADIENT:
         if STATE_V_FIRST:
             row = (i_v * BV + o_bv)[:, None]
@@ -1716,7 +1687,7 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
         b_do = gather_flat_cb(dof, do_off, do_n, padding_value=0.0)
         b_do = ct.where(do_full, b_do, ct.zeros((BT, BV), dtype=b_do.dtype))
 
-        # b_dv = sum_n b_k_n @ b_dh_n
+        # dV = sum_n K_n @ dH_n
         k_row = (i_t * BT + o_bt)[:, None]
         kmask_r = (i_t * BT + o_bt) < T
         bk1 = gather_flat_cb(kf, k_base + k_row * (H * K) + (0 + o64)[None, :], k_n, padding_value=0.0)
@@ -1796,7 +1767,7 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
         dv2_off = ct.where(do_full, dv2_off, dv2_oob)
         scatter_flat_cb(dv2f, dv2_off, ct.astype(b_dv, dv2.dtype), dv2_n)
 
-        # --- b_dh += trans?(q@do*scale - w@dv) per K block ---
+        # --- dH += trans?(Q @ dO * scale - W @ dV) per K block ---
         time = (i_t * BT + o_bt)[None, :]
         tmask = (i_t * BT + o_bt)[None, :] < T
         b_dv_cast = ct.astype(b_dv, ct.float32)
@@ -1901,7 +1872,7 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
             else:
                 b_dh4 = b_dh4 + upd4
 
-    # --- Store initial-state gradient dh0 <- b_dh* ---
+    # --- Store initial-state gradient dH0 <- b_dh* ---
     if USE_INITIAL_STATE:
         # Mask both the 64-wide K-block rows and BV-wide V cols; flat numel check
         # alone would let an over-range K row spill into the next head's dh0 slot.
@@ -2028,16 +1999,15 @@ def chunk_fwd_kernel_o(
     b_A = ct.zeros((BT, BT), dtype=ct.float32)
 
     for i_k in range(ct.cdiv(K, BK)):
-        # latency=2 pipelining on this K-loop's TMA loads.
         b_q = ct.load(q_seg, index=(i_t, i_kh, i_k), shape=(BT, 1, BK), padding_mode=Z, latency=2).reshape((BT, BK))
         b_k = ct.load(k_seg, index=(i_t, i_kh, i_k), shape=(BT, 1, BK), padding_mode=Z, latency=2).reshape((BT, BK))
 
         if STATE_V_FIRST:
-            # b_h (BV, BK), o += q @ h^T
+            # b_h (BV, BK), O += Q @ H^T
             b_h = ct.load(h, index=(i_hc, i_v, i_k), shape=(1, BV, BK), padding_mode=Z, latency=2).reshape((BV, BK))
             b_o = safe_mma(b_q, ct.transpose(b_h), b_o)
         else:
-            # b_h (BK, BV), o += q @ h
+            # b_h (BK, BV), O += Q @ H
             b_h = ct.load(h, index=(i_hc, i_k, i_v), shape=(1, BK, BV), padding_mode=Z, latency=2).reshape((BK, BV))
             b_o = safe_mma(b_q, b_h, b_o)
         b_A = safe_mma(b_q, ct.transpose(b_k), b_A)
@@ -2094,7 +2064,7 @@ def chunk_bwd_kernel_dqkwg(
     NV,  # runtime cdiv(V,BV) -> rolled V-loop (avoids unroll reg-spill at K=256)
 ):
     # q/k/v/do/dv/dq/dk are (T,*,D) token-packed slabs, h/dh (NT_total*HV,*,*),
-    # dg (NK,T,HV); block-indexed ct.load -> TMA. latency=2.
+    # dg (NK,T,HV); block-indexed ct.load -> TMA.
     i_k = ct.bid(0)
     i_t = ct.bid(1)
     i_h = ct.bid(2)
@@ -2331,30 +2301,6 @@ def chunk_bwd_kernel_dv_local(
 # an integer flag (USE_*/HAS_*).
 
 
-def _dummy(dtype_name: str, bufs):
-    """Inert typed view over the workspace's 16-byte ``dummy`` carve, for
-    ABSENT optional kernel args (always paired with a flag==0, never
-    dereferenced). Dtype-bound so the compiled signature stays stable; the
-    library allocates nothing."""
-    from cudnn.frost.buffers import DTYPE_ITEMSIZE, DeviceView
-
-    d = bufs["dummy"]
-    return DeviceView(d.data_ptr(), (16 // DTYPE_ITEMSIZE[dtype_name],), dtype_name, d.__dlpack_device__()[1])
-
-
-def _i32(t):
-    if not str(t.dtype).endswith("int32"):
-        raise TypeError(f"index/boundary buffers must be int32 (callers convert), got {t.dtype}")
-    return t
-
-
-def _opt(t, bufs, dtype_name: str = "float32"):
-    """The buffer if present (contiguous by the engine contract), else an inert dummy (paired with a flag)."""
-    if t is None:
-        return _dummy(dtype_name, bufs)
-    return t
-
-
 # explicit workspace: all device memory is the caller's — the engine plan (or a
 # standalone harness) pre-carves every pipeline intermediate as a named view in
 # ``bufs`` and passes outputs via ``out=``; nothing here allocates.
@@ -2363,24 +2309,17 @@ def _opt(t, bufs, dtype_name: str = "float32"):
 # l2norm
 def l2norm_fwd(x, eps: float = 1e-6, out=None, rstd_out=None, stream=None):
     stream = 0 if stream is None else stream
-    if out is None or rstd_out is None:
-        raise ValueError("l2norm_fwd requires pre-allocated out= and rstd_out= buffers")
     x_shape_og = x.shape
-    x = x.reshape(-1, x.shape[-1]).contiguous()
+    x = reshaped(x, (-1, x.shape[-1]))
     y = reshaped(out, tuple(x.shape))
     T, D = x.shape[0], x.shape[-1]
     MAX_FUSED_SIZE = 65536 // x.element_size()
-    BD = min(MAX_FUSED_SIZE, _next_power_of_2(D))
-    if D > BD:
-        raise RuntimeError("This layer doesn't support feature dim >= 64KB.")
+    BD = min(MAX_FUSED_SIZE, next_power_of_2(D))
     rstd = reshaped(rstd_out, (T,))
     if D <= 512:
         BT = 32
-        grid = (_cdiv(T, BT),)
-        # Memory-bound row reduction: default occupancy=1 starves the SM (the
-        # grid is huge). Autotune (occupancy, num_worker_warps) so the scheduler
-        # packs enough blocks/SM to hide DRAM latency.
-        _tuned_launch(
+        grid = (cdiv(T, BT),)
+        tuned_launch(
             l2norm_fwd_kernel,
             stream,
             grid,
@@ -2404,26 +2343,18 @@ def l2norm_bwd(
 ):
     stream = 0 if stream is None else stream
     y_shape_og = y.shape
-    y = y.reshape(-1, dy.shape[-1]).contiguous()
-    dy = dy.reshape(-1, dy.shape[-1]).contiguous()
-    dy2_arg = dy2.reshape(-1, dy.shape[-1]).contiguous() if dy2 is not None else _dummy(_dtname(dy), bufs)
-    if out is None:
-        raise ValueError("l2norm_bwd requires a pre-allocated out= buffer")
+    y = y.reshape(-1, dy.shape[-1])
+    dy = dy.reshape(-1, dy.shape[-1])
+    dy2_arg = dy2.reshape(-1, dy.shape[-1]) if dy2 is not None else dummy(dtname(dy), bufs)
     dx = reshaped(out, tuple(y.shape))
     T, D = y.shape[0], y.shape[-1]
     MAX_FUSED_SIZE = 65536 // y.element_size()
-    BD = min(MAX_FUSED_SIZE, _next_power_of_2(D))
-    if D > BD:
-        raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
-    rstd_flat = rstd.reshape(-1).contiguous()
+    BD = min(MAX_FUSED_SIZE, next_power_of_2(D))
+    rstd_flat = rstd.reshape(-1)
     if D <= 512:
         BT = 32
-        grid = (_cdiv(T, BT),)
-        # Memory-bound row reduction (mirrors l2norm_fwd): default occupancy=1
-        # starves the SM on the huge row grid. Autotune (occupancy, nww) so the
-        # scheduler packs enough blocks/SM to hide DRAM latency. This kernel was
-        # the largest non-dot backward kernel.
-        _tuned_launch(
+        grid = (cdiv(T, BT),)
+        tuned_launch(
             l2norm_bwd_kernel,
             stream,
             grid,
@@ -2441,37 +2372,33 @@ def l2norm_bwd(
 
 
 # fused_beta_sigmoid
-_BETA_SIGMOID_BLOCK_SIZE = 2048
+BETA_SIGMOID_BLOCK_SIZE = 2048
 
 
 def fused_beta_sigmoid_fwd(x, scale: float = 1.0, out=None, stream=None):
     stream = 0 if stream is None else stream
-    if out is None:
-        raise ValueError("fused_beta_sigmoid_fwd requires a pre-allocated out= buffer (fp32, x-shaped)")
     y = reshaped(out, tuple(x.shape))
     n = x.numel()
-    grid = (_cdiv(n, _BETA_SIGMOID_BLOCK_SIZE),)
+    grid = (cdiv(n, BETA_SIGMOID_BLOCK_SIZE),)
     ct.launch(
         stream,
         grid,
         fused_beta_sigmoid_fwd_kernel,
-        (x.reshape(-1), y.reshape(-1), float(scale), n, _BETA_SIGMOID_BLOCK_SIZE),
+        (reshaped(x, (-1,)), y.reshape(-1), float(scale), n, BETA_SIGMOID_BLOCK_SIZE),
     )
     return y
 
 
 def fused_beta_sigmoid_bwd(x, dy, scale: float = 1.0, out=None, stream=None):
     stream = 0 if stream is None else stream
-    if out is None:
-        raise ValueError("fused_beta_sigmoid_bwd requires a pre-allocated out= buffer (x-shaped)")
     dx = reshaped(out, tuple(x.shape))
     n = x.numel()
-    grid = (_cdiv(n, _BETA_SIGMOID_BLOCK_SIZE),)
+    grid = (cdiv(n, BETA_SIGMOID_BLOCK_SIZE),)
     ct.launch(
         stream,
         grid,
         fused_beta_sigmoid_bwd_kernel,
-        (x.reshape(-1), dy.reshape(-1), dx.reshape(-1), float(scale), n, _BETA_SIGMOID_BLOCK_SIZE),
+        (reshaped(x, (-1,)), reshaped(dy, (-1,)), dx.reshape(-1), float(scale), n, BETA_SIGMOID_BLOCK_SIZE),
     )
     return dx
 
@@ -2496,16 +2423,12 @@ def chunk_local_cumsum_scalar(
     stream = 0 if stream is None else stream
     T, H = g.shape
     BT = chunk_size
-    if cu_seqlens is None or chunk_indices is None:
-        raise ValueError("cu_seqlens and chunk_indices are required (THD layout; callers build the (seq, intra) table)")
-    if out is None:
-        raise ValueError("chunk_local_cumsum requires a pre-allocated out= buffer (g-shaped)")
     NT = len(chunk_indices)
     g_out = reshaped(out, (T, H))
     scale_val = float(scale) if scale is not None else 0.0
     has_scale = int(scale is not None)
-    cu_arg = _i32(cu_seqlens)
-    ci_arg = _i32(chunk_indices)
+    cu_arg = cu_seqlens
+    ci_arg = chunk_indices
     ct.launch(
         stream,
         (NT, H),
@@ -2536,7 +2459,6 @@ def chunk_local_cumsum(
     stream=None,
 ):
     stream = 0 if stream is None else stream
-    assert len(g.shape) == 2, f"Unsupported input shape {g.shape}, expected (T, H)."
     return chunk_local_cumsum_scalar(
         g=g,
         chunk_size=chunk_size,
@@ -2564,23 +2486,19 @@ def gdn_gate_chunk_cumsum(
     stream = 0 if stream is None else stream
     T, H = g.shape
     BT = chunk_size
-    if cu_seqlens is None or chunk_indices is None:
-        raise ValueError("cu_seqlens and chunk_indices are required (THD layout; callers build the (seq, intra) table)")
-    if out is None:
-        raise ValueError("gdn_gate_chunk_cumsum requires a pre-allocated out= buffer (fp32, g-shaped)")
     NT = len(chunk_indices)
     o = reshaped(out, (T, H))
-    dt_arg = _opt(dt_bias, bufs, _dtname(A_log)).reshape(-1)
+    dt_arg = reshaped(opt(dt_bias, bufs, dtname(A_log)), (-1,))
     scale_val = float(scale) if scale is not None else 0.0
-    cu_arg = _i32(cu_seqlens)
-    ci_arg = _i32(chunk_indices)
+    cu_arg = cu_seqlens
+    ci_arg = chunk_indices
     ct.launch(
         stream,
         (NT, H),
         gdn_gate_chunk_cumsum_scalar_kernel,
         (
             g,
-            A_log.reshape(-1),
+            reshaped(A_log, (-1,)),
             dt_arg,
             o,
             scale_val,
@@ -2604,23 +2522,21 @@ def gdn_gate_bwd(g, A_log, dt_bias, dyg, dg_out=None, dA_out=None, dbias_out=Non
     H = g.shape[-1]
     T = g.numel() // H
     BT = 32
-    NT = _cdiv(T, BT)
-    if dg_out is None or dA_out is None or (dt_bias is not None and dbias_out is None):
-        raise ValueError("gdn_gate_bwd requires pre-allocated dg_out=, dA_out= (and dbias_out= with dt_bias)")
+    NT = cdiv(T, BT)
     dg = reshaped(dg_out, tuple(g.shape))
     dA_nt = reshaped(bufs["dA_gate"], (NT, H))
     db_nt = reshaped(bufs["db_gate"], (NT, H)) if dt_bias is not None else None
-    dt_arg = _opt(dt_bias, bufs, _dtname(A_log)).reshape(-1)
-    db_arg = db_nt.reshape(-1) if db_nt is not None else _dummy("float32", bufs)
+    dt_arg = reshaped(opt(dt_bias, bufs, dtname(A_log)), (-1,))
+    db_arg = db_nt.reshape(-1) if db_nt is not None else dummy("float32", bufs)
     ct.launch(
         stream,
         (NT, H),
         gdn_gate_bwd_kernel,
         (
-            g.reshape(-1),
-            A_log.reshape(-1),
+            reshaped(g, (-1,)),
+            reshaped(A_log, (-1,)),
             dt_arg,
-            dyg.reshape(-1),
+            reshaped(dyg, (-1,)),
             dg.reshape(-1),
             dA_nt.reshape(-1),
             db_arg,
@@ -2643,17 +2559,15 @@ def recompute_w_u_fwd(k, v, beta, A, g=None, cu_seqlens=None, chunk_indices=None
     BT = A.shape[-1]
     BK = 64
     BV = 64
-    if cu_seqlens is None or chunk_indices is None:
-        raise ValueError("cu_seqlens and chunk_indices are required (THD layout; callers build the (seq, intra) table)")
     NT = len(chunk_indices)
     w = reshaped(bufs["w"], (T, HV, K))
     u = reshaped(bufs["u"], (T, HV, V))
-    beta2 = beta.reshape(T, HV)
+    beta2 = reshaped(beta, (T, HV))
     A3 = A.reshape(T, HV, BT)
-    g_arg = g.reshape(T, HV) if g is not None else _dummy("float32", bufs)
-    cu_arg = _i32(cu_seqlens)
-    ci_arg = _i32(chunk_indices)
-    _tuned_launch(
+    g_arg = g.reshape(T, HV) if g is not None else dummy("float32", bufs)
+    cu_arg = cu_seqlens
+    ci_arg = chunk_indices
+    tuned_launch(
         recompute_w_u_fwd_kernel,
         stream,
         (NT, HV),
@@ -2676,7 +2590,7 @@ def recompute_w_u_fwd(k, v, beta, A, g=None, cu_seqlens=None, chunk_indices=None
             BV,
             int(g is not None),
         ),
-        cache_key=((NT, HV), K, V, BT, BK, BV, int(g is not None), str(k.dtype)),
+        cache_key=(H, HV, K, V, BT, BK, BV, int(g is not None), str(k.dtype), dev_id(k)),
     )
     return w, u
 
@@ -2685,21 +2599,19 @@ def prepare_wy_repr_bwd(k, v, beta, A, dw, du, g=None, cu_seqlens=None, chunk_in
     stream = 0 if stream is None else stream
     T, H, K, V, HV = *k.shape, v.shape[-1], v.shape[1]
     BT = 64
-    if cu_seqlens is None or chunk_indices is None:
-        raise ValueError("cu_seqlens and chunk_indices are required (THD layout; callers build the (seq, intra) table)")
     NT = len(chunk_indices)
     CONST_TILING = 64
-    BK = min(max(_next_power_of_2(K), 16), CONST_TILING)
-    BV = min(max(_next_power_of_2(V), 16), CONST_TILING)
+    BK = min(max(next_power_of_2(K), 16), CONST_TILING)
+    BV = min(max(next_power_of_2(V), 16), CONST_TILING)
     dk = reshaped(bufs["wy_dk"], (T, HV, K))
     dv = reshaped(bufs["wy_dv"], (T, HV, V))
     dg = reshaped(bufs["wy_dg"], (T, HV)) if g is not None else None
     db = reshaped(bufs["db"], (T, HV))
-    g_arg = _opt(g, bufs)
-    dg_arg = dg if dg is not None else _dummy("float32", bufs)
-    cu_arg = _i32(cu_seqlens)
-    ci_arg = _i32(chunk_indices)
-    _tuned_launch(
+    g_arg = opt(g, bufs)
+    dg_arg = dg if dg is not None else dummy("float32", bufs)
+    cu_arg = cu_seqlens
+    ci_arg = chunk_indices
+    tuned_launch(
         prepare_wy_repr_bwd_kernel,
         stream,
         (NT, HV),
@@ -2725,10 +2637,10 @@ def prepare_wy_repr_bwd(k, v, beta, A, dw, du, g=None, cu_seqlens=None, chunk_in
             BK,
             BV,
             int(g is not None),
-            _cdiv(K, BK),
-            _cdiv(V, BV),
+            cdiv(K, BK),
+            cdiv(V, BV),
         ),
-        cache_key=((NT, HV), K, V, BT, BK, BV, int(g is not None), str(k.dtype)),
+        cache_key=(H, HV, K, V, BT, BK, BV, int(g is not None), str(k.dtype), dev_id(k)),
     )
     if H != HV:
         dk_r = reshaped(bufs["wy_dk_hred"], (T, H, K))
@@ -2758,54 +2670,44 @@ def chunk_gated_delta_rule_fwd_h(
     stream = 0 if stream is None else stream
     T, H, K, V, HV = *k.shape, u.shape[-1], u.shape[1]
     BT = chunk_size
-    if cu_seqlens is None or chunk_indices is None:
-        raise ValueError("cu_seqlens and chunk_indices are required (THD layout; callers build the (seq, intra) table)")
     N, NT = len(cu_seqlens) - 1, len(chunk_indices)
     chunk_offsets = bufs["chunk_offsets"]
-    assert K <= 256, "kernel does not support head dimension larger than 256."
 
     state_shape = (N, HV, V, K) if state_v_first else (N, HV, K, V)
-    h = reshaped(bufs["h"], (NT, HV) + state_shape[2:])
+    h = reshaped(bufs["state_checkpoints"], (NT, HV) + state_shape[2:])
     final_state = reshaped(bufs["final_state"], state_shape) if output_final_state else None
     if final_state is not None:
         zero_fill(final_state, stream=stream)
     v_new = reshaped(bufs["v_new"], (T, HV, V)) if save_new_value else None
 
-    vnew_arg = v_new if v_new is not None else _dummy(_dtname(u), bufs)
-    g_arg = _opt(g, bufs)
-    gk_arg = _opt(gk, bufs)
-    h0_arg = initial_state if initial_state is not None else _dummy("float32", bufs)
-    ht_arg = final_state if final_state is not None else _dummy("float32", bufs)
-    cu_arg = _i32(cu_seqlens)
-    co_arg = _i32(chunk_offsets)
+    vnew_arg = v_new if v_new is not None else dummy(dtname(u), bufs)
+    g_arg = opt(g, bufs)
+    gk_arg = opt(gk, bufs)
+    h0_arg = initial_state if initial_state is not None else dummy("float32", bufs)
+    ht_arg = final_state if final_state is not None else dummy("float32", bufs)
+    cu_arg = cu_seqlens
+    co_arg = chunk_offsets
 
-    # BV = V-tile width. Shrinking BV widens the V grid (more parallel CTAs) without
-    # adding serial work; drop to 32 for low head counts where BV=64 grid-starves the
-    # GPU, else keep 64. Chosen up front (not swept) to avoid a tileiras compile stall.
+    # BV = V-tile width; chosen up front (not swept) to avoid a tileiras compile stall.
     BV = 64
     if V % 32 == 0:
         try:
-            sm_count, cc_major = _device_attrs()
+            sm_count, cc_major = device_attrs()
         except Exception:  # noqa: BLE001
             sm_count = 0
             cc_major = 0
-        grid_blocks = _cdiv(V, 64) * (N * HV)
-        # Split only when the doubled BV=32 grid still fits within one wave
-        # (grid_blocks*2 <= SMs); otherwise the halved MMA width is a net loss.
+        grid_blocks = cdiv(V, 64) * (N * HV)
         if sm_count and grid_blocks * 2 <= sm_count:
-            # Grid-saturation split (all arches): halve BV to double CTAs when the
-            # BV=64 grid under-occupies (V-lanes independent -> no extra serial work).
+            # Grid-saturation split (all arches).
             BV = 32
         elif cc_major == 8 and K >= 192:
             # Register-spill split (sm_80 only): at K>=192 the 4 fp32 (64,BV) state
             # accumulators overflow the 255-reg budget at BV=64 -> heavy spill.
-            # BV=32 halves the state (~10x less spill), fwd_h 2853->2468us. sm_100
-            # keeps BV=64 (BV=32 regresses its already-saturated grid).
             BV = 32
-    grid = (_cdiv(V, BV), N * HV)
+    grid = (cdiv(V, BV), N * HV)
 
     # Multi-dim arrays passed as-is (per-dim indices + real strides).
-    _tuned_launch(
+    tuned_launch(
         chunk_gated_delta_rule_fwd_kernel_h_blockdim64,
         stream,
         grid,
@@ -2835,7 +2737,8 @@ def chunk_gated_delta_rule_fwd_h(
             int(state_v_first),
         ),
         cache_key=(
-            grid,
+            H,
+            HV,
             K,
             V,
             BT,
@@ -2847,6 +2750,7 @@ def chunk_gated_delta_rule_fwd_h(
             int(save_new_value),
             int(state_v_first),
             str(k.dtype),
+            dev_id(k),
         ),
     )
     return h, v_new, final_state
@@ -2861,7 +2765,7 @@ def chunk_gated_delta_rule_bwd_dhu(
     g=None,
     gk=None,
     h0=None,
-    dht=None,
+    dstate_in=None,
     scale=None,
     state_v_first=False,
     cu_seqlens=None,
@@ -2873,28 +2777,25 @@ def chunk_gated_delta_rule_bwd_dhu(
     stream = 0 if stream is None else stream
     T, H, K, V, HV = *q.shape, do.shape[-1], do.shape[1]
     BT = chunk_size
-    assert K <= 256, "kernel does not support head dimension being larger than 256."
-    if cu_seqlens is None or chunk_indices is None:
-        raise ValueError("cu_seqlens and chunk_indices are required (THD layout; callers build the (seq, intra) table)")
     N, NT = len(cu_seqlens) - 1, len(chunk_indices)
     chunk_offsets = bufs["chunk_offsets"]
 
-    dh = reshaped(bufs["dh"], (NT, HV, V, K) if state_v_first else (NT, HV, K, V))
-    dh0 = reshaped(bufs["dh0"], tuple(h0.shape)) if h0 is not None else None
+    dh = reshaped(bufs["dstate"], (NT, HV, V, K) if state_v_first else (NT, HV, K, V))
+    dh0 = reshaped(bufs["dstate0"], tuple(h0.shape)) if h0 is not None else None
     dv2 = reshaped(bufs["dv2"], (T, HV, V))
 
-    # For K>128 the blockdim64 kernel's 4 (64xBV) fp32 dh accumulators overflow
+    # For K>128 the blockdim64 kernel's 4 (64xBV) fp32 dH accumulators overflow
     # tileiras allocation at BV=64; shrink BV to keep the live footprint in range.
     BV = 16 if K > 128 else 64
-    grid = (_cdiv(V, BV), N * HV)
-    g_arg = _opt(g, bufs)
-    gk_arg = _opt(gk, bufs)
-    dht_arg = _opt(dht, bufs)
-    dh0_arg = dh0 if dh0 is not None else _dummy("float32", bufs)
-    cu_arg = _i32(cu_seqlens)
-    co_arg = _i32(chunk_offsets)
+    grid = (cdiv(V, BV), N * HV)
+    g_arg = opt(g, bufs)
+    gk_arg = opt(gk, bufs)
+    dht_arg = opt(dstate_in, bufs)
+    dh0_arg = dh0 if dh0 is not None else dummy("float32", bufs)
+    cu_arg = cu_seqlens
+    co_arg = chunk_offsets
 
-    _tuned_launch(
+    tuned_launch(
         chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64,
         stream,
         grid,
@@ -2922,12 +2823,13 @@ def chunk_gated_delta_rule_bwd_dhu(
             int(g is not None),
             int(gk is not None),
             int(h0 is not None),
-            int(dht is not None),
+            int(dstate_in is not None),
             int(state_v_first),
             1,
         ),
         cache_key=(
-            grid,
+            H,
+            HV,
             K,
             V,
             BT,
@@ -2936,6 +2838,7 @@ def chunk_gated_delta_rule_bwd_dhu(
             int(gk is not None),
             int(state_v_first),
             str(q.dtype),
+            dev_id(q),
         ),
     )
     return dh, dh0, dv2
@@ -2960,25 +2863,23 @@ def chunk_fwd_o(
     stream = 0 if stream is None else stream
     T, H, K, V, HV = *q.shape, v.shape[-1], v.shape[1]
     BT = chunk_size
-    if cu_seqlens is None or chunk_indices is None:
-        raise ValueError("cu_seqlens and chunk_indices are required (THD layout; callers build the (seq, intra) table)")
     NT = len(chunk_indices)
     if scale is None:
         scale = k.shape[-1] ** -0.5
     o = reshaped(bufs["o"], (T, HV, V))
-    BK = min(max(_next_power_of_2(K), 16), 64)
+    BK = min(max(next_power_of_2(K), 16), 64)
     BV = 64
-    grid = (_cdiv(V, BV), NT, HV)
-    g_arg = g.reshape(T, HV) if g is not None else _dummy("float32", bufs)
-    gg_arg = _opt(g_gamma, bufs)
-    cu_arg = _i32(cu_seqlens)
-    ci_arg = _i32(chunk_indices)
+    grid = (cdiv(V, BV), NT, HV)
+    g_arg = g.reshape(T, HV) if g is not None else dummy("float32", bufs)
+    gg_arg = opt(g_gamma, bufs)
+    cu_arg = cu_seqlens
+    ci_arg = chunk_indices
     # h flattened to (NT*HV,*,*) slabs for block-indexed TMA.
     if state_v_first:
         h3 = h.reshape(NT * HV, V, K)
     else:
         h3 = h.reshape(NT * HV, K, V)
-    _tuned_launch(
+    tuned_launch(
         chunk_fwd_kernel_o,
         stream,
         grid,
@@ -3005,7 +2906,8 @@ def chunk_fwd_o(
             int(state_v_first),
         ),
         cache_key=(
-            grid,
+            H,
+            HV,
             K,
             V,
             BT,
@@ -3015,6 +2917,7 @@ def chunk_fwd_o(
             int(g_gamma is not None),
             int(state_v_first),
             str(q.dtype),
+            dev_id(q),
         ),
     )
     return o
@@ -3042,13 +2945,11 @@ def chunk_bwd_dqkwg(
     stream = 0 if stream is None else stream
     T, H, K, V, HV = *k.shape, v.shape[-1], v.shape[1]
     BT = chunk_size
-    if cu_seqlens is None or chunk_indices is None:
-        raise ValueError("cu_seqlens and chunk_indices are required (THD layout; callers build the (seq, intra) table)")
     NT = len(chunk_indices)
     CONST_TILING = 64
-    BK = min(max(_next_power_of_2(K), 16), CONST_TILING)
-    BV = min(max(_next_power_of_2(V), 16), CONST_TILING)
-    NK = _cdiv(K, BK)
+    BK = min(max(next_power_of_2(K), 16), CONST_TILING)
+    BV = min(max(next_power_of_2(V), 16), CONST_TILING)
+    NK = cdiv(K, BK)
     dq = reshaped(bufs["dq"], (T, HV, K))
     dk = reshaped(bufs["dk"], (T, HV, K))
     dg = reshaped(bufs["dg_nk"], (NK, T, HV)) if g is not None else None
@@ -3061,15 +2962,15 @@ def chunk_bwd_dqkwg(
     else:
         h3 = h.reshape(NT * HV, K, V)
         dh3 = dh.reshape(NT * HV, K, V)
-    g_arg = g.reshape(T, HV) if g is not None else _dummy(_dtname(q), bufs)
-    gg_arg = _opt(g_gamma, bufs)
-    dw3 = dw if dw is not None else _dummy(_dtname(k), bufs)
-    dv3 = dv.reshape(T, HV, V) if dv is not None else _dummy(_dtname(k), bufs)
-    dg3 = dg if dg is not None else _dummy("float32", bufs)
-    cu_arg = _i32(cu_seqlens)
-    ci_arg = _i32(chunk_indices)
+    g_arg = g.reshape(T, HV) if g is not None else dummy(dtname(q), bufs)
+    gg_arg = opt(g_gamma, bufs)
+    dw3 = dw if dw is not None else dummy(dtname(k), bufs)
+    dv3 = dv.reshape(T, HV, V) if dv is not None else dummy(dtname(k), bufs)
+    dg3 = dg if dg is not None else dummy("float32", bufs)
+    cu_arg = cu_seqlens
+    ci_arg = chunk_indices
     use_dw = int(dw is not None and dv is not None)
-    _tuned_launch(
+    tuned_launch(
         chunk_bwd_kernel_dqkwg,
         stream,
         grid,
@@ -3101,10 +3002,11 @@ def chunk_bwd_dqkwg(
             int(g_gamma is not None),
             use_dw,
             int(state_v_first),
-            _cdiv(V, BV),
+            cdiv(V, BV),
         ),
         cache_key=(
-            grid,
+            H,
+            HV,
             K,
             V,
             BT,
@@ -3115,6 +3017,7 @@ def chunk_bwd_dqkwg(
             use_dw,
             int(state_v_first),
             str(q.dtype),
+            dev_id(q),
         ),
     )
     if H != HV:
@@ -3134,23 +3037,19 @@ def chunk_bwd_dv_local(q, k, do, g=None, g_gamma=None, A=None, scale=None, cu_se
     stream = 0 if stream is None else stream
     T, H, K, V, HV = *k.shape, do.shape[-1], do.shape[1]
     BT = chunk_size
-    if cu_seqlens is None or chunk_indices is None:
-        raise ValueError("cu_seqlens and chunk_indices are required (THD layout; callers build the (seq, intra) table)")
     CONST_TILING = 64
-    BK = min(max(_next_power_of_2(K), 16), CONST_TILING)
-    BV = min(max(_next_power_of_2(V), 16), CONST_TILING)
+    BK = min(max(next_power_of_2(K), 16), CONST_TILING)
+    BV = min(max(next_power_of_2(V), 16), CONST_TILING)
     NT = len(chunk_indices)
     dv = reshaped(bufs["dv"], (T, HV, V))
     grid = (NT, HV)
-    g_arg = _opt(g, bufs)
-    gg_arg = _opt(g_gamma, bufs)
-    A_arg = _opt(A, bufs)
-    cu_arg = _i32(cu_seqlens)
-    ci_arg = _i32(chunk_indices)
+    g_arg = opt(g, bufs)
+    gg_arg = opt(g_gamma, bufs)
+    A_arg = opt(A, bufs)
+    cu_arg = cu_seqlens
+    ci_arg = chunk_indices
     scale_val = float(scale) if scale is not None else 0.0
-    # Autotune (occupancy, nww): an occ hint budgets
-    # fewer regs/thread -> more blocks/SM.
-    _tuned_launch(
+    tuned_launch(
         chunk_bwd_kernel_dv_local,
         stream,
         grid,
@@ -3177,7 +3076,8 @@ def chunk_bwd_dv_local(q, k, do, g=None, g_gamma=None, A=None, scale=None, cu_se
             int(A is not None),
         ),
         cache_key=(
-            grid,
+            H,
+            HV,
             K,
             V,
             BT,
@@ -3187,30 +3087,28 @@ def chunk_bwd_dv_local(q, k, do, g=None, g_gamma=None, A=None, scale=None, cu_se
             int(g_gamma is not None),
             int(A is not None),
             str(q.dtype),
+            dev_id(q),
         ),
     )
     return dv
 
 
-# fused intra (kkt + solve_tril + recompute_w_u)
+# fused intra (KK^T + solve_tril + recompute_w_u)
 def chunk_gated_delta_rule_fwd_intra(k, v, g=None, beta=None, cu_seqlens=None, chunk_size=64, chunk_indices=None, bufs=None, compute_wu=True, stream=None):
     stream = 0 if stream is None else stream
     T, H, K, HV = *k.shape, beta.shape[1]
     BT = chunk_size
-    if cu_seqlens is None or chunk_indices is None:
-        raise ValueError("cu_seqlens and chunk_indices are required (THD layout; callers build the (seq, intra) table)")
     NT = len(chunk_indices)
 
     A = reshaped(bufs["A"], (T, HV, BT))
     zero_fill(A, stream=stream)
     BK = 64
-    g_arg = _opt(g, bufs)
-    cu_arg = _i32(cu_seqlens)
-    ci_arg = _i32(chunk_indices)
-    # Masked BC=16 4-sub-block kernel: masks the partial last chunk's tail
-    # (m_out / o_t < T).
+    g_arg = opt(g, bufs)
+    cu_arg = cu_seqlens
+    ci_arg = chunk_indices
+    # Masked BC=16 4-sub-block kernel: masks the partial last chunk's tail.
     BC = 16
-    _tuned_launch(
+    tuned_launch(
         chunk_gated_delta_rule_fwd_kkt_solve_kernel,
         stream,
         (NT, HV),
@@ -3229,7 +3127,7 @@ def chunk_gated_delta_rule_fwd_intra(k, v, g=None, beta=None, cu_seqlens=None, c
             BK,
             int(g is not None),
         ),
-        cache_key=(NT, HV, K, BT, BC, BK, int(g is not None), str(k.dtype)),
+        cache_key=(H, HV, K, BT, BC, BK, int(g is not None), str(k.dtype), dev_id(k)),
     )
     if not compute_wu:
         return None, None, A
@@ -3260,7 +3158,6 @@ def chunk_gated_delta_rule_fwd(
     stream=None,
 ):
     stream = 0 if stream is None else stream
-    assert cp_context is None, "context-parallel not supported in this port"
     g_input = g if use_gate_in_kernel else None
     if use_gate_in_kernel:
         g = gdn_gate_chunk_cumsum(
@@ -3307,7 +3204,7 @@ def chunk_gated_delta_rule_bwd(
     scale,
     initial_state,
     do,
-    dht,
+    dstate_in,
     state_v_first=False,
     cu_seqlens=None,
     cp_context=None,
@@ -3320,7 +3217,6 @@ def chunk_gated_delta_rule_bwd(
     stream=None,
 ):
     stream = 0 if stream is None else stream
-    assert cp_context is None, "context-parallel not supported in this port"
     w, u = recompute_w_u_fwd(k=k, v=v, beta=beta, A=A, g=g, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices, bufs=bufs, stream=stream)
     h, v_new, _ = chunk_gated_delta_rule_fwd_h(
         k=k,
@@ -3342,7 +3238,7 @@ def chunk_gated_delta_rule_bwd(
         w=w,
         g=g,
         h0=initial_state,
-        dht=dht,
+        dstate_in=dstate_in,
         do=do,
         dv=dv,
         scale=scale,
@@ -3400,7 +3296,7 @@ def chunk_gated_delta_rule_grad(
     g,
     beta,
     do,
-    dht=None,
+    dstate_in=None,
     scale=None,
     initial_state=None,
     state_v_first=False,
@@ -3420,7 +3316,7 @@ def chunk_gated_delta_rule_grad(
 
     ``q``/``k``/``v``/``do`` are ``[total_T, H, D]``, ``g``/``beta`` are
     ``[total_T, H]``; ``cu_seqlens`` and ``chunk_indices`` are required.
-    Recomputes the forward's prep (L2-normalized q/k + rstd, cumulative gate,
+    Recomputes the forward's prep (L2-normalized Q/K + rstd, cumulative gate,
     intra-chunk WY matrix) from the ORIGINAL inputs, then runs the backward
     kernels.
 
@@ -3469,7 +3365,7 @@ def chunk_gated_delta_rule_grad(
         scale=scale,
         initial_state=initial_state,
         do=do,
-        dht=dht,
+        dstate_in=dstate_in,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         state_v_first=state_v_first,
@@ -3521,7 +3417,6 @@ def chunk_gated_delta_rule(
     required. Returns ``(o, final_state)`` in THD layout, written into
     ``bufs['o']`` / ``bufs['final_state']``."""
     stream = 0 if stream is None else stream
-    assert cp_context is None, "context-parallel not supported"
 
     if "transpose_state_layout" in kwargs:
         if state_v_first:

@@ -557,6 +557,23 @@ class VariantPackNative {
     }
 
     bool
+    all_dense_layout(std::string &offender) const {
+        for (size_t i = 0; i < operands_.size(); i++) {
+            const Operand &operand = operands_[i];
+            if (!operand.filled || operand.stride.empty()) continue;
+            for (int d = operand.ndim - 1; d >= 0; d--) {
+                if (operand.shape[d] == 1) continue;
+                if (operand.stride[d] != 1) {
+                    offender = std::to_string(i);
+                    return false;
+                }
+                break;
+            }
+        }
+        return true;
+    }
+
+    bool
     operand_contiguous(size_t index) const {
         const Operand &operand = operands_.at(index);
         if (!operand.filled || operand.stride.empty()) return true;
@@ -840,9 +857,15 @@ its parts.
         .def("operands", &VariantPackNative::operands)
         .def_property_readonly("address", &VariantPackNative::pointer_array)
         .def("__len__", &VariantPackNative::size)
-        .def("all_contiguous", [](const VariantPackNative &self) {
+        .def("all_contiguous",
+             [](const VariantPackNative &self) {
+                 std::string offender;
+                 bool ok = self.all_contiguous(offender);
+                 return py::make_tuple(ok, offender);
+             })
+        .def("all_dense_layout", [](const VariantPackNative &self) {
             std::string offender;
-            bool ok = self.all_contiguous(offender);
+            bool ok = self.all_dense_layout(offender);
             return py::make_tuple(ok, offender);
         });
 }

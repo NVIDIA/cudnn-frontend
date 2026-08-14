@@ -159,6 +159,12 @@ class VariantPack:
         ok, offender = self.native.all_contiguous()
         return ok, (int(offender) if offender else -1)
 
+    def all_dense_layout(self):
+        """``(ok, slot)`` over every filled operand: the innermost size>1 dim
+        must be stride-1. Padded or permuted outer strides pass."""
+        ok, offender = self.native.all_dense_layout()
+        return ok, (int(offender) if offender else -1)
+
     @property
     def index_of_uid(self):
         if self._index_of is None:

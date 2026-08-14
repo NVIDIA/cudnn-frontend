@@ -2447,11 +2447,11 @@ def _linear_attention_final_state_dims(node):
     return [cu.dim[0] - 1, max(q[1], v[1]), q[2], v[2]]
 
 
-def _linear_attention_h_dims(node):
-    # [total_h, HO, K, V] at capacity: sum_b (sl_b - 1) // N <= total_T // N
+def _linear_attention_state_checkpoints_dims(node):
     n = int(node.params.get("checkpoint_every_n_tokens", 0) or 0)
     q, v = node.inputs["q"].dim, node.inputs["v"].dim
-    if not n or not q or not v:
+    cu = node.inputs["cu_seqlens"].dim if node.inputs.get("cu_seqlens") is not None else None
+    if not n or not q or not v or not cu:
         return None
     return [max(v[0] // n, 1), max(q[1], v[1]), q[2], v[2]]
 
@@ -2620,20 +2620,20 @@ _STRUCTURED_OPS = {
     # ---- linear attention ----------------------------------------------------
     "gdn": dict(
         node_type=NodeType.GDN,
-        inputs=("q", "k", "v", "g", "beta", "cu_seqlens", "initial_state"),
-        attrs=("scale", "output_final_state", "use_qk_l2norm", "checkpoint_every_n_tokens"),
-        outputs=("O", "final_state", "H"),
+        inputs=("q", "k", "v", "g", "beta", "cu_seqlens", "initial_state", "a_log", "dt_bias"),
+        attrs=("scale", "output_final_state", "use_qk_l2norm", "checkpoint_every_n_tokens", "safe_gate", "batch_invariant"),
+        outputs=("O", "final_state", "state_checkpoints"),
         maybe={
             "final_state": lambda n: bool(n.params.get("output_final_state", False)),
-            "H": lambda n: bool(n.params.get("checkpoint_every_n_tokens") or 0),
+            "state_checkpoints": lambda n: bool(n.params.get("checkpoint_every_n_tokens") or 0),
         },
-        infer={"O": _linear_attention_o_dims, "final_state": _linear_attention_final_state_dims, "H": _linear_attention_h_dims},
+        infer={"O": _linear_attention_o_dims, "final_state": _linear_attention_final_state_dims, "state_checkpoints": _linear_attention_state_checkpoints_dims},
         python_only=True,
     ),
     "gdn_bwd": dict(
         node_type=NodeType.GDN_BWD,
-        inputs=("q", "k", "v", "g", "beta", "cu_seqlens", "dO", "h", "initial_state", "d_final_state"),
-        attrs=("scale", "use_qk_l2norm"),
+        inputs=("q", "k", "v", "g", "beta", "cu_seqlens", "dO", "state_checkpoints", "initial_state", "d_final_state"),
+        attrs=("scale", "use_qk_l2norm", "batch_invariant"),
         outputs=("dQ", "dK", "dV", "dG", "dBeta", "d_initial_state"),
         maybe={"d_initial_state": lambda n: "initial_state" in n.inputs},
         infer={"dQ": _like("q"), "dK": _like("k"), "dV": _like("v"), "dG": _like("g"), "dBeta": _like("beta"), "d_initial_state": _like("initial_state")},
@@ -2642,19 +2642,28 @@ _STRUCTURED_OPS = {
     "kda": dict(
         node_type=NodeType.KDA,
         inputs=("q", "k", "v", "g", "beta", "cu_seqlens", "initial_state", "a_log", "dt_bias"),
-        attrs=("scale", "output_final_state", "use_qk_l2norm", "checkpoint_every_n_tokens", "use_beta_sigmoid", "safe_gate", "gate_lower_bound"),
-        outputs=("O", "final_state", "H"),
+        attrs=(
+            "scale",
+            "output_final_state",
+            "use_qk_l2norm",
+            "checkpoint_every_n_tokens",
+            "use_beta_sigmoid",
+            "safe_gate",
+            "gate_lower_bound",
+            "batch_invariant",
+        ),
+        outputs=("O", "final_state", "state_checkpoints"),
         maybe={
             "final_state": lambda n: bool(n.params.get("output_final_state", False)),
-            "H": lambda n: bool(n.params.get("checkpoint_every_n_tokens") or 0),
+            "state_checkpoints": lambda n: bool(n.params.get("checkpoint_every_n_tokens") or 0),
         },
-        infer={"O": _like("v"), "final_state": _linear_attention_final_state_dims, "H": _linear_attention_h_dims},
+        infer={"O": _linear_attention_o_dims, "final_state": _linear_attention_final_state_dims, "state_checkpoints": _linear_attention_state_checkpoints_dims},
         python_only=True,
     ),
     "kda_bwd": dict(
         node_type=NodeType.KDA_BWD,
-        inputs=("q", "k", "v", "g", "beta", "cu_seqlens", "dO", "h", "initial_state", "d_final_state"),
-        attrs=("scale", "use_qk_l2norm"),
+        inputs=("q", "k", "v", "g", "beta", "cu_seqlens", "dO", "state_checkpoints", "initial_state", "d_final_state"),
+        attrs=("scale", "use_qk_l2norm", "batch_invariant"),
         outputs=("dQ", "dK", "dV", "dG", "dBeta", "d_initial_state"),
         maybe={"d_initial_state": lambda n: "initial_state" in n.inputs},
         infer={"dQ": _like("q"), "dK": _like("k"), "dV": _like("v"), "dG": _like("g"), "dBeta": _like("beta"), "d_initial_state": _like("initial_state")},
@@ -2662,20 +2671,20 @@ _STRUCTURED_OPS = {
     ),
     "gdn2": dict(
         node_type=NodeType.GDN2,
-        inputs=("q", "k", "v", "g", "beta", "w", "cu_seqlens", "initial_state"),
-        attrs=("scale", "output_final_state", "use_qk_l2norm", "checkpoint_every_n_tokens", "use_beta_w_sigmoid"),
-        outputs=("O", "final_state", "H"),
+        inputs=("q", "k", "v", "g", "beta", "w", "cu_seqlens", "initial_state", "a_log", "dt_bias"),
+        attrs=("scale", "output_final_state", "use_qk_l2norm", "checkpoint_every_n_tokens", "safe_gate", "gate_lower_bound", "batch_invariant"),
+        outputs=("O", "final_state", "state_checkpoints"),
         maybe={
             "final_state": lambda n: bool(n.params.get("output_final_state", False)),
-            "H": lambda n: bool(n.params.get("checkpoint_every_n_tokens") or 0),
+            "state_checkpoints": lambda n: bool(n.params.get("checkpoint_every_n_tokens") or 0),
         },
-        infer={"O": _like("v"), "final_state": _linear_attention_final_state_dims, "H": _linear_attention_h_dims},
+        infer={"O": _linear_attention_o_dims, "final_state": _linear_attention_final_state_dims, "state_checkpoints": _linear_attention_state_checkpoints_dims},
         python_only=True,
     ),
     "gdn2_bwd": dict(
         node_type=NodeType.GDN2_BWD,
-        inputs=("q", "k", "v", "g", "beta", "w", "cu_seqlens", "dO", "h", "initial_state", "d_final_state"),
-        attrs=("scale",),
+        inputs=("q", "k", "v", "g", "beta", "w", "cu_seqlens", "dO", "state_checkpoints", "initial_state", "d_final_state"),
+        attrs=("scale", "use_qk_l2norm", "batch_invariant"),
         outputs=("dQ", "dK", "dV", "dG", "dBeta", "dW", "d_initial_state"),
         maybe={"d_initial_state": lambda n: "initial_state" in n.inputs},
         infer={

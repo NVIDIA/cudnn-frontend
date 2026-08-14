@@ -13,7 +13,7 @@ Flat 1-D grid over output words: each thread owns one 4-byte word (a packed
 f16x2/bf16x2 pair, or one fp32 element), gathers it from all ``r`` group
 heads (coalesced, strided by ``inner_words``), accumulates in fp32, and
 stores one word back.  Serves the f16/bf16 ``[total, HO, D]`` tensor grads
-(dq/dk for GVA, dk/dv for GQA) and the fp32 ``[total, HO]`` gate/beta grads.
+(dQ/dK for GVA, dK/dV for GQA) and the fp32 ``[total, HO]`` Gate/Beta grads.
 """
 
 import cutlass
@@ -22,16 +22,20 @@ import cuda.bindings.driver as cuda
 
 from cutlass.cute.runtime import from_dlpack
 
+from .host import get_dtype
 from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32, fp32_to_fp16
 
 BLOCK = 256
 
 
 @cute.kernel
-def _head_reduce_kernel(
+def head_reduce_kernel(
     mIn: cute.Tensor,
     mOut: cute.Tensor,
     total_words: cutlass.Int64,
+    out_row_words: cutlass.Int64,
+    out_head_words: cutlass.Int64,
+    h_count: cutlass.Constexpr[int],
     r: cutlass.Constexpr[int],
     inner_words: cutlass.Constexpr[int],
     io_dtype: cutlass.Constexpr,
@@ -43,13 +47,16 @@ def _head_reduce_kernel(
         seg = gw // cutlass.Int64(inner_words)
         w_off = gw - seg * cutlass.Int64(inner_words)
         base = seg * cutlass.Int64(r * inner_words) + w_off
+        t_idx = seg // cutlass.Int64(h_count)
+        h_idx = seg - t_idx * cutlass.Int64(h_count)
+        out_off = t_idx * out_row_words + h_idx * out_head_words + w_off
         if cutlass.const_expr(io_dtype == cutlass.Float32):
             in_p = cute.recast_ptr(mIn.iterator, dtype=cutlass.Float32)
             out_p = cute.recast_ptr(mOut.iterator, dtype=cutlass.Float32)
             acc = (in_p + base).load()
             for i in cutlass.range_constexpr(r - 1):
                 acc = acc + (in_p + (base + (i + 1) * inner_words)).load()
-            (out_p + gw).store(acc)
+            (out_p + out_off).store(acc)
         else:
             in_p = cute.recast_ptr(mIn.iterator, dtype=cutlass.Int32)
             out_p = cute.recast_ptr(mOut.iterator, dtype=cutlass.Int32)
@@ -58,39 +65,31 @@ def _head_reduce_kernel(
                 lo, hi = f16x2_to_f32((in_p + (base + (i + 1) * inner_words)).load(), dtype=io_dtype)
                 acc_lo = acc_lo + lo
                 acc_hi = acc_hi + hi
-            (out_p + gw).store(fp32_to_fp16(acc_lo, acc_hi, dtype=io_dtype))
+            (out_p + out_off).store(fp32_to_fp16(acc_lo, acc_hi, dtype=io_dtype))
 
 
 @cute.jit
-def _launch(
+def launch(
     mIn: cute.Tensor,
     mOut: cute.Tensor,
     total_words: cutlass.Int64,
+    out_row_words: cutlass.Int64,
+    out_head_words: cutlass.Int64,
     grid_x: cutlass.Int32,
+    h_count: cutlass.Constexpr[int],
     r: cutlass.Constexpr[int],
     inner_words: cutlass.Constexpr[int],
     io_dtype: cutlass.Constexpr,
     stream: cuda.CUstream,
 ) -> None:
-    _head_reduce_kernel(mIn, mOut, total_words, r, inner_words, io_dtype).launch(
+    head_reduce_kernel(mIn, mOut, total_words, out_row_words, out_head_words, h_count, r, inner_words, io_dtype).launch(
         grid=(grid_x, 1, 1),
         block=(BLOCK, 1, 1),
         stream=stream,
     )
 
 
-_compiled_cache = {}
-
-
-def _cutlass_io_dtype(dtype) -> type:
-    name = str(dtype).split(".")[-1]
-    if name == "bfloat16":
-        return cutlass.BFloat16
-    if name == "float16":
-        return cutlass.Float16
-    if name == "float32":
-        return cutlass.Float32
-    raise ValueError(f"head_group_reduce: unsupported dtype {dtype} (float16/bfloat16/float32 only)")
+compiled_cache = {}
 
 
 def head_group_reduce(src, dst, *, stream) -> None:
@@ -98,7 +97,9 @@ def head_group_reduce(src, dst, *, stream) -> None:
     rank-2 ``(total, HO)`` into ``(total, H)`` — by summing each group of
     ``r = HO // H`` consecutive heads (fp32 accumulation).
 
-    Both tensors are contiguous, same-dtype (f16/bf16, or fp32),
+    ``src`` is contiguous (kernel-internal wide buffer); ``dst`` needs a
+    stride-1 innermost dim with free outer strides (f16/bf16 outer strides
+    must be even — word-pair stores). Same-dtype (f16/bf16, or fp32),
     DLPack-compatible CUDA tensors; the f16/bf16 inner extent ``D`` must be
     even.  Compile-cache-and-replay per ``(dtype, HO, H, D)``."""
     if len(src.shape) == 2:
@@ -114,7 +115,7 @@ def head_group_reduce(src, dst, *, stream) -> None:
         raise ValueError(f"head_group_reduce: shape mismatch {tuple(src.shape)} -> {tuple(dst.shape)}")
     if H <= 0 or HO % H != 0 or HO <= H:
         raise ValueError(f"head_group_reduce: bad head group HO={HO} H={H}")
-    io_dtype = _cutlass_io_dtype(src.dtype)
+    io_dtype = get_dtype(src.dtype)
     if str(src.dtype).split(".")[-1] != str(dst.dtype).split(".")[-1]:
         raise ValueError(f"head_group_reduce: dtype mismatch {src.dtype} vs {dst.dtype}")
     is_fp32 = io_dtype == cutlass.Float32
@@ -126,24 +127,32 @@ def head_group_reduce(src, dst, *, stream) -> None:
     grid_x = -(-total_words // BLOCK)
     cu_stream = cuda.CUstream(int(stream))
 
+    dst_strides = tuple(dst.stride())
+    if not is_fp32 and any(st % 2 != 0 for st, sz in zip(dst_strides[:-1], dst.shape[:-1]) if sz != 1):
+        raise ValueError(f"head_group_reduce: f16/bf16 dst outer strides must be even (word-pair stores), got {dst_strides}")
+    if dst.shape[-1] != 1 and dst_strides[-1] != 1:
+        raise ValueError(f"head_group_reduce: dst innermost dim must be stride-1, got strides {dst_strides}")
+    out_row_words = dst_strides[0] if is_fp32 else dst_strides[0] // 2
+    out_head_words = (dst_strides[1] if is_fp32 else dst_strides[1] // 2) if len(dst.shape) == 3 else 1
+
     key = (str(src.dtype).split(".")[-1], HO, H, D)
-    if key not in _compiled_cache:
+    if key not in compiled_cache:
 
-        def _tok(t):
-            c = from_dlpack(t, assumed_align=4)
-            c.mark_compact_shape_dynamic(mode=0, stride_order=tuple(range(len(t.shape))), divisibility=1)
-            return c
-
-        _compiled_cache[key] = cute.compile(
-            _launch,
-            _tok(src),
-            _tok(dst),
+        src_c = from_dlpack(src, assumed_align=4)
+        src_c.mark_compact_shape_dynamic(mode=0, stride_order=tuple(range(len(src.shape))), divisibility=1)
+        compiled_cache[key] = cute.compile(
+            launch,
+            src_c,
+            from_dlpack(dst, assumed_align=4).mark_layout_dynamic(leading_dim=len(dst.shape) - 1),
             cutlass.Int64(total_words),
+            cutlass.Int64(out_row_words),
+            cutlass.Int64(out_head_words),
             cutlass.Int32(grid_x),
+            H,
             r,
             inner_words,
             io_dtype,
             cu_stream,
             options="--enable-tvm-ffi",
         )
-    _compiled_cache[key](src, dst, total_words, grid_x, cu_stream)
+    compiled_cache[key](src, dst, total_words, out_row_words, out_head_words, grid_x, cu_stream)
