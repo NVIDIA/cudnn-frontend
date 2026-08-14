@@ -142,11 +142,19 @@ def _max_abs_reduction(vec):
     return cute.math.max(maxima[0], -minima[0], ftz=True)
 
 
-def _exp2_mixed_conservative(vec):
-    """Use E5M2-safe coverage while retaining the E4M3 performance mix."""
+def _exp2_chunk0_mask_aware(vec, apply_mask):
+    """Evaluate softmax chunk 0 with the precision required by each static path.
+
+    E5M2 mask-boundary tiles use native EXP2 because degree-2 emulation can
+    exceed the output tolerance there. The repeated unmasked path retains its
+    tuned emulation mix, while the E4M3 instruction mix remains unchanged.
+    """
     values = []
     for i in range(0, int(vec.shape[0]), 2):
-        if CFG.DTYPE_QKV == 1 and i < 32:
+        if CFG.DTYPE_QKV == 1 and apply_mask:
+            x = cute.math.exp2(vec[i], fastmath=True)
+            y = cute.math.exp2(vec[i + 1], fastmath=True)
+        elif CFG.DTYPE_QKV == 1 and i < 32:
             x, y = ex2_emulation_2(vec[i], vec[i + 1], poly_degree=2)
         elif CFG.DTYPE_QKV == 0 and i < 32 and i % 10 < 4:
             x, y = ex2_emulation_2(vec[i], vec[i + 1])
@@ -1532,7 +1540,7 @@ def _softmax_kv_body(
     reg_S = reg_S * scale_log2 - new_total_max
 
     chunk_S_0 = reg_S[0:CHUNK].vec
-    chunk_P_0 = _exp2_mixed_conservative(chunk_S_0)
+    chunk_P_0 = _exp2_chunk0_mask_aware(chunk_S_0, apply_mask)
     # Hoist chunk-0 sum before cast to overlap with cast's FFMA chain.
     hoisted_sum = row_reduction_pair(chunk_P_0)
     chunk_P_0_fp8 = _pack_fp8_vec(chunk_P_0)

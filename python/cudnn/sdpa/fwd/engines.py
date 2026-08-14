@@ -150,6 +150,10 @@ class Capabilities:
     swa: bool = False
     padded: bool = False
     sink: bool = False
+    # Optional dtype subset for sink support. None means every dtype served by
+    # the engine; a subset lets one exact-shape flavor decline an unsupported
+    # low-precision sink path without affecting its non-sink coverage.
+    sink_dtypes: Optional[frozenset] = None
     stats: bool = False
     # The adapter accepts lse_tensor=None (its kernel None-specializes the LSE
     # store), so a stats-less graph needs no dummy-LSE workspace chunk. Every
@@ -339,6 +343,9 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         if fact and not cap:
             return f"graph uses {label}, which this engine does not support"
 
+    if facts.has_sink and capabilities.sink_dtypes is not None and facts.dtype not in capabilities.sink_dtypes:
+        return f"sink token with dtype {facts.dtype} not in {sorted(str(d) for d in capabilities.sink_dtypes)}"
+
     if facts.right_band_widening and facts.right_bound is not None and facts.right_bound < 0:
         return f"negative diagonal_band_right_bound ({facts.right_bound}) is not supported"
 
@@ -486,6 +493,7 @@ def _sm100_fp8_spec(
     d_v: Optional[int] = None,
     *,
     dtypes: Optional[frozenset] = None,
+    sink_dtypes: Optional[frozenset] = None,
 ) -> EngineSpec:
     """Exact-shape per-tensor FP8 engine with scalar descales.
 
@@ -517,6 +525,7 @@ def _sm100_fp8_spec(
             swa=True,
             padded=True,
             sink=True,
+            sink_dtypes=sink_dtypes,
             stats=True,
             lse_optional=True,
             # The fp8 kernel lacks the SEQ_Q_LENS_PRESENT epilogue trim, but its
@@ -1039,6 +1048,9 @@ ENGINE_SPECS = (
         192,
         d_v=128,
         dtypes=frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
+        # The D192 E5M2 sink path has a distinct FP8 online-softmax rounding
+        # trajectory that exceeds the frontend tolerance on sparse CI seeds.
+        sink_dtypes=frozenset({cudnn.data_type.FP8_E4M3}),
     ),
     _sm120_spec(),
     _sm120_fp8_spec(),
