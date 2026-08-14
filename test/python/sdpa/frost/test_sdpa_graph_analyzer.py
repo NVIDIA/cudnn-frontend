@@ -477,24 +477,6 @@ def test_resolve_generate_stats():
     assert cfg.stats_t is not None
 
 
-def test_probe_rejects_bottom_right_plus_swa():
-    # Kernel gap: CAUSAL_BOTTOM_RIGHT excludes SWA (config would assert at import).
-    g = _mk_graph()
-    q, k, v, dims, strides = _mk_qkv(g)
-    o, _ = g.sdpa(
-        name="s",
-        q=q,
-        k=k,
-        v=v,
-        attn_scale=0.1,
-        is_inference=True,
-        use_causal_mask_bottom_right=True,
-        sliding_window_length=128,
-    )
-    _finish_output(o, dims, strides)
-    assert not _eligible(g)
-
-
 def test_probe_rejects_bottom_right_swa_only():
     # Kernel gap: CAUSAL_BOTTOM_RIGHT requires MASK_CAUSAL; BOTTOM_RIGHT
     # alignment with only a left band has no causal bit.
@@ -605,11 +587,19 @@ def test_sm120_probe_accepts_causal_swa_on_both_minors(monkeypatch):
         assert not any("sm100" in name for name in elig)
 
 
+def test_probe_accepts_bottom_right_with_swa():
+    # The band shifts wholesale with the diagonal: the SM100 kernels apply the
+    # same causal_diag offset to the SWA lower limit as to the causal upper one.
+    g = _mk_graph()
+    q, k, v, dims, strides = _mk_qkv(g)
+    o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True, use_causal_mask_bottom_right=True, sliding_window_length=64)
+    _finish_output(o, dims, strides)
+    assert engines.engine_name(512) in _eligible(g)
+
+
 def test_sm120_probe_accepts_bottom_right_with_swa(monkeypatch):
-    # SM120-only notch: the SM100 kernels' BR diagonal excludes SWA. Facts are
-    # cached per graph, so each device family probes a freshly built graph.
+    # BR + SWA is served on both families now; this pins the SM120 row's claim.
     kwargs = dict(use_causal_mask_bottom_right=True, sliding_window_length=64)
-    assert not _eligible(_mk_sm120_graph(**kwargs))  # (10, 0): no row serves BR+SWA
     monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
     assert _SM120 in _eligible(_mk_sm120_graph(**kwargs))
 

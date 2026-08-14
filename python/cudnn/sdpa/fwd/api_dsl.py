@@ -849,16 +849,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             band_right is not None and not self.is_causal,
             "SM100 DSL SDPA: window_size_right widens the causal diagonal and requires is_causal=True",
         )
-        # The kernels' bottom-right diagonal path excludes a left bound:
-        # bottom_right requires a right bound and rejects window_left
-        # (see config_sm100._validate_params).
         self._value_error_if(
             self.causal_bottom_right and not self.is_causal,
             "SM100 DSL SDPA: causal_bottom_right requires is_causal=True",
-        )
-        self._value_error_if(
-            self.causal_bottom_right and swa_left is not None,
-            "SM100 DSL SDPA: causal_bottom_right cannot be combined with a left sliding-window (kernel gap)",
         )
         # Backstop for the engines.bottom_right_padded_seq_q gate: with dense
         # per-batch Q lengths the kernel's BR diagonal (anchored at the global

@@ -128,7 +128,8 @@ def _ref_sdpa_full(q, k, v, *, scale, is_causal=False, bottom_right=False, band_
         lim = (i + (s_kv - s_q) if bottom_right else i) + band_right
         masked = masked | (j > lim)
     if swa_window is not None:
-        masked = masked | (j < i - swa_window)
+        swa_base = i + (s_kv - s_q) if bottom_right else i
+        masked = masked | (j < swa_base - swa_window)
     if seq_kv_lens is not None:
         lens = seq_kv_lens.view(b, 1, 1, 1).to(dev)
         masked = masked | (j >= lens)
@@ -671,6 +672,7 @@ def _mask_graph_kwargs(mask):
         "band": dict(diagonal_band_right_bound=_COMBO_BAND_R),
         "band_br": dict(diagonal_band_right_bound=_COMBO_BAND_R, diagonal_alignment=cudnn.diagonal_alignment.BOTTOM_RIGHT),
         "band_swa": dict(diagonal_band_right_bound=_COMBO_BAND_R, diagonal_band_left_bound=_COMBO_SWA_W + 1),
+        "swa_br": dict(use_causal_mask_bottom_right=True, sliding_window_length=_COMBO_SWA_W + 1),
     }[mask]
 
 
@@ -684,6 +686,7 @@ def _mask_ref_kwargs(mask):
         "band": dict(is_causal=True, band_right=_COMBO_BAND_R),
         "band_br": dict(is_causal=True, bottom_right=True, band_right=_COMBO_BAND_R),
         "band_swa": dict(is_causal=True, band_right=_COMBO_BAND_R, swa_window=_COMBO_SWA_W),
+        "swa_br": dict(is_causal=True, bottom_right=True, swa_window=_COMBO_SWA_W),
     }[mask]
 
 
@@ -812,7 +815,7 @@ def _run_dsl_thd_graph(
 
 def _combo_dense(d, dtype, H_q, H_kv, scale, sink_t, mask):
     b = 2
-    s_q, s_kv = (128, 256) if mask in ("causal_br", "band_br") else (256, 256)
+    s_q, s_kv = (128, 256) if mask in ("causal_br", "band_br", "swa_br") else (256, 256)
     q = _bhsd(b, H_q, s_q, d, dtype)
     k = _bhsd(b, H_kv, s_kv, d, dtype)
     v = _bhsd(b, H_kv, s_kv, d, dtype)
@@ -835,7 +838,7 @@ def _combo_thd(d, dtype, H_q, H_kv, scale, sink_t, mask):
     dev = "cuda"
     seq_lens_q = [200, 150]
     seq_lens_kv = [180, 120]
-    if mask in ("causal_br", "band_br"):
+    if mask in ("causal_br", "band_br", "swa_br"):
         # Bottom-right masks: keep seq_len_kv[b] >= seq_len_q[b] so no sequence
         # has fully-masked rows (the torch softmax reference NaNs on those).
         seq_lens_q = [150, 90]
@@ -1039,12 +1042,12 @@ def test_dsl_sm100_thd_cu_seq_len_zero_lens():
 
 
 _COMBO_MASKS = {
-    "dense": ["none", "causal", "causal_br", "swa", "padded", "band", "band_br", "band_swa"],
+    "dense": ["none", "causal", "causal_br", "swa", "padded", "band", "band_br", "band_swa", "swa_br"],
     # THD forces padding internally, so its mask axis rides on top of that.
     # causal_br: the kernels anchor the BR diagonal at each sequence's own
     # (seq_len_q[b], seq_len_kv[b]) from the cu_seqlen metadata.
     # band/band_br: diagonal-band right-bound widening (BAND_RIGHT).
-    "thd": ["none", "causal", "swa", "causal_br", "band", "band_br"],
+    "thd": ["none", "causal", "swa", "causal_br", "band", "band_br", "swa_br"],
 }
 
 
