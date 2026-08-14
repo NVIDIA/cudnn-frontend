@@ -165,20 +165,21 @@ class TileConfig:
         cm, cn = self.cgrp_size_m, self.cgrp_size_n
 
         kb_max = _pipeline_fact(_CTA_TILE_K_BYTES_MAX_BY_PIPELINE, self.pipeline, "max cta_tile_k_bytes")
-        if kb <= 0 or kb > kb_max or kb % _MMA_INST_K_BYTES != 0:
-            raise NotImplementedError(
-                f"TileConfig {self.name!r}: cta_tile_k_bytes={kb} — must be "
-                f"a positive multiple of {_MMA_INST_K_BYTES}, ≤ {kb_max} for "
-                f"pipeline {self.pipeline}"
-            )
+        if kb <= 0 or kb > kb_max:
+            raise NotImplementedError(f"TileConfig {self.name!r}: cta_tile_k_bytes={kb} — must be " f"positive, ≤ {kb_max} for pipeline {self.pipeline}")
         # sm103's K-tile is not free geometry either (K-tile = lcm(128, 48)).
         if self.pipeline == "sm103" and kb != 384:
             raise NotImplementedError(f"TileConfig {self.name!r}: sm103 fixes cta_tile_k_bytes=384 " f"(K-tile = lcm(128, 48)); got {kb}")
-        # A pipeline whose MMA instruction fixes its K width owns that axis —
-        # it is not free geometry (sm103 K=48B UTCOMMA, sm107 K=64B).
+        # A pipeline whose MMA instruction fixes its K width owns that axis — it
+        # is not free geometry (sm103 K=48B UTCOMMA, sm107 K=64B), and the K-tile
+        # walks that instruction, so it is a multiple of the SAME width.
         mkb_want = _pipeline_fact(_MMA_INST_K_BYTES_BY_PIPELINE, self.pipeline, "MMA-inst K width")
         if self.mma_inst_k_bytes != mkb_want:
             raise NotImplementedError(f"TileConfig {self.name!r}: {self.pipeline} fixes " f"mma_inst_k_bytes={mkb_want}; got {self.mma_inst_k_bytes}")
+        if kb % mkb_want != 0:
+            raise NotImplementedError(
+                f"TileConfig {self.name!r}: cta_tile_k_bytes={kb} — must be " f"a multiple of {self.pipeline}'s mma_inst_k_bytes={mkb_want}"
+            )
 
         # CGRP size sanity. (cta_group-specific constraints — e.g. cgrp_size_m
         # even for 2-CTA MMA — live on the 2ctamma template in the registry.)

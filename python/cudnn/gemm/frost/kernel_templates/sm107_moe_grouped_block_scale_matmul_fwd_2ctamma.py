@@ -18,8 +18,9 @@ driven by injected constants, so the rest of the file stays in lockstep with
   * half as many MMAs per K-tile, each consuming ``sf_scales_per_inst`` scales
     (8 at K-block 16, 4 at 32 — it follows the BLOCK SIZE, not the scale
     dtype). When that exceeds the 4 scales one 128x4 utccp atom holds, a scale
-    *word* spans ``word_atoms`` atoms, laid out atom-major across the MN-blocks;
-    at K-block 32 ``word_atoms == 1`` (identical to sm100).
+    *word* spans ``word_atoms`` atoms, and the two SF regions then lay them
+    out DIFFERENTLY: SFB atom-major across its N-blocks, SFA block-major.
+    At K-block 32 ``word_atoms == 1`` (identical to sm100).
   * fp4 rides the OMMA instruction descriptor (``Tcgen05MxOmmaInstrDesc``,
     K-mode 2 = 128 fp4 elements); mxfp8 stays on ``Tcgen05MxInstrDesc``
     (K-mode 1 = 64 fp8 elements). Both take the real operand dtype.
@@ -527,7 +528,6 @@ def _kernel(
         sched_stage = cutlass.Int32(0)
         sched_full_phase = cutlass.Int32(0)
         is_valid = cutlass.Int32(1)
-        elect_one = elect_one
         logical_cta_tile_n = cgrp_tile_mnk[1] // cluster_n
 
         lane = tidx % 32
@@ -765,11 +765,12 @@ def _kernel(
             s2t_shape, s2t_multicast = nvvm.S2TCopyMode.S2T_32x128b_WARPX4
             sfa_scale_ptrs = [nvvm.make_tmem_ptr(b, cutlass.Float32) for b in sfa_tmem_bases]
             sfb_scale_ptrs = [nvvm.make_tmem_ptr(b, cutlass.Float32) for b in sfb_tmem_bases]
-            # utccp destination per (MN-block, atom within the scale word). A word is
-            # atom-MAJOR across the blocks — atom ``a`` of block ``m`` sits at
-            # ``(a*num_blocks + m)*registers_per_atom``, which is what the MMA's
-            # scale operand expects once a word spans more than one atom. At
-            # word_atoms == 1 this is sm100's ``m * registers_per_block``.
+            # utccp destination per (MN-block, atom within the scale word). SFB
+            # is atom-MAJOR across the N-blocks because ONE instruction walks
+            # all of them; SFA is block-major because one instruction covers
+            # exactly one 128-row block, so that word has to be contiguous.
+            # Both collapse to the same addresses at a single block, and to
+            # sm100's layout at word_atoms == 1.
             sfa_dst_ptrs = [
                 [
                     [nvvm.make_tmem_ptr(sfa_tmem_bases[i] + m * registers_per_block + a * registers_per_atom, cutlass.Float32) for a in range(word_atoms)]

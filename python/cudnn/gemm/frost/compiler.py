@@ -733,7 +733,7 @@ def _quant_device_imports(chain: FusionChain) -> list[str]:
 
     ``ue8m0`` needs no widening helper — it is a bare exponent, so ``byte << 23``
     IS the fp32. ``ue5m3``'s cvt exists ONLY on sm_107, see the arch gate in
-    :func:`_check_quant_supported`.
+    :func:`_check_block_quant_supported`.
 
     Both take ``x == 0`` to byte 0, which the readback turns back into 0.0."""
     kinds = {q.scale_dtype for q in chain.quants}

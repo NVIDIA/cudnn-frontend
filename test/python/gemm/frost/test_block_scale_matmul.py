@@ -1349,6 +1349,11 @@ def test_config_families():
     # A raw-base construction can't bypass the family invariant either.
     with pytest.raises(NotImplementedError, match="fixes cta_tile_k_bytes=384"):
         TileConfig(cta_tile_k_bytes=128, pipeline="sm103", **kw)
+    # The K-tile walks the MMA instruction, so it is a multiple of the PIPELINE's
+    # K width: 96 B is three sm100 instructions but not a whole number of sm107's.
+    ConfigSm100(cta_tile_k_bytes=96, mma_inst_k_bytes=32, pipeline="sm100", **kw)
+    with pytest.raises(NotImplementedError, match="multiple of sm107's mma_inst_k_bytes=64"):
+        ConfigSm107(cta_tile_k_bytes=96, mma_inst_k_bytes=64, pipeline="sm107", **kw)
     # Catalog entries carry their family class (the template-pairing key).
     assert all(isinstance(c, ConfigSm103) for c in CATALOG if c.pipeline == "sm103")
     assert all(isinstance(c, ConfigSm100) for c in CATALOG if c.pipeline == "sm100")

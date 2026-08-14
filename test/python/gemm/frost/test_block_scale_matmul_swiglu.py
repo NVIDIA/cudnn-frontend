@@ -9,8 +9,8 @@ import pytest
 import torch
 
 from gemm_test_utils import (
-    _SM,
     requires_sm100,
+    requires_sm107,
     Plan as _plan,
     kw as _kw,
     E2M1 as _E2M1,
@@ -507,11 +507,6 @@ def test_dual_block_scale_matmul_reduction_rejects_int32():
 # ---------------------------------------------------------------------------
 # sm107 (64-byte-K MMA): the same dual block-scale SwiGLU chain
 # ---------------------------------------------------------------------------
-
-requires_sm107 = pytest.mark.skipif(
-    _SM is None or not (107 <= _SM < 110),
-    reason="sm107 block-scale kernels run only on 107 <= SM < 110, have " + ("none" if _SM is None else f"sm_{_SM}"),
-)
 
 
 @requires_sm107
