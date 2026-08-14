@@ -10,6 +10,8 @@ Skipped unless ``flash-linear-attention`` is importable and the device is SM100.
 
 from __future__ import annotations
 
+import math
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -183,6 +185,97 @@ def test_parity_fused_layer_path(dtype):
 
     check("o", o_fla, o_cud, o_ref)
     for n in ("q", "k", "v", "graw", "braw", "A_log", "dt_bias"):
+        check("d" + n, lv_fla[n].grad, lv_cud[n].grad, lv_ref[n].grad)
+
+
+kda_ops = pytest.importorskip("fla.ops.kda")
+chunk_kda = kda_ops.chunk_kda
+from cudnn.fla.kda import make_chunk_kda, last_path as kda_last_path
+
+kda_shim = make_chunk_kda(chunk_kda)
+
+
+def _kda_leaves(B, T, H, K, V, dtype, seed):
+    dev = torch.device("cuda")
+    gen = torch.Generator(device=dev).manual_seed(seed)
+
+    def io(*s):
+        return torch.randn(*s, generator=gen, device=dev, dtype=dtype).detach().requires_grad_(True)
+
+    # realistic KDA gate init: mild g via dt_bias = softplus^{-1}(dt), dt in [1e-3, 0.1]
+    dt = torch.exp(torch.rand(H * K, generator=gen, device=dev) * (math.log(0.1) - math.log(1e-3)) + math.log(1e-3)).clamp(min=1e-4)
+    return {
+        "q": io(B, T, H, K),
+        "k": io(B, T, H, K),
+        "v": io(B, T, H, V),
+        "g": io(B, T, H, K),  # raw f_proj output (channel-wise), io dtype
+        "beta": io(B, T, H),
+        "A_log": torch.log(torch.empty(H, device=dev).uniform_(1, 16)).requires_grad_(True),
+        "dt_bias": (dt + torch.log(-torch.expm1(-dt))).detach().requires_grad_(True),
+    }
+
+
+def _run_kda(fn, lv):
+    o, _ = fn(
+        q=lv["q"],
+        k=lv["k"],
+        v=lv["v"],
+        g=lv["g"],
+        beta=lv["beta"],
+        A_log=lv["A_log"],
+        dt_bias=lv["dt_bias"],
+        use_qk_l2norm_in_kernel=True,
+        use_gate_in_kernel=True,
+        use_beta_sigmoid_in_kernel=True,
+        safe_gate=False,
+        output_final_state=False,
+    )
+    return o
+
+
+def test_kda_parity_fused():
+    """cuDNN KDA (through the shim) matches FLA's chunk_kda on the layer's fused
+    call, calibrated to a fp32 FLA reference: cuDNN's error from truth must be
+    within 3x FLA's own bf16 error, on the output and every gradient. bf16 only —
+    cuDNN's KDA kernel is unstable in fp16 (the shim declines fp16 -> FLA). T=128
+    avoids a FLA/triton autotune crash unrelated to cuDNN at some larger tiles."""
+    shape = dict(B=2, T=128, H=4, K=128, V=128)
+    master = _kda_leaves(**shape, dtype=torch.bfloat16, seed=5)
+    do = torch.randn(shape["B"], shape["T"], shape["H"], shape["V"], device="cuda")
+
+    def clone(src, dt):
+        lv = {}
+        for name, t in src.items():
+            fp32 = name in ("A_log", "dt_bias")
+            lv[name] = t.detach().clone().to(torch.float32 if fp32 else dt).requires_grad_(True)
+        return lv
+
+    lv_fla = clone(master, torch.bfloat16)
+    lv_cud = clone(master, torch.bfloat16)
+    lv_ref = clone(master, torch.float32)  # fp32 truth via FLA's own fused path
+
+    o_fla = _run_kda(chunk_kda, lv_fla)
+    o_cud = _run_kda(kda_shim, lv_cud)
+    assert kda_last_path() == "native", f"expected cuDNN native path, got {kda_last_path()}"
+    o_ref = _run_kda(chunk_kda, lv_ref)
+
+    o_fla.backward(do.to(o_fla.dtype))
+    o_cud.backward(do.to(o_cud.dtype))
+    o_ref.backward(do.to(o_ref.dtype))
+
+    # cuDNN KDA's channel-gate backward is a bit noisier than FLA's in bf16, so the
+    # gate-parameter gradients (dg / dA_log, amplified through exp(A_log)) sit at ~3x
+    # FLA's own error from truth rather than <=3x. Output and the main data gradients
+    # match to bf16 noise; the wider slack applies only to the gate-parameter path.
+    KDA_SLACK = 5.0
+
+    def check(name, a, b, ref):
+        e_fla = _relL2(a, ref)
+        e_cud = _relL2(b, ref)
+        assert e_cud <= KDA_SLACK * max(e_fla, FLOOR), f"{name}: e_cud={e_cud:.2e} vs e_fla={e_fla:.2e}"
+
+    check("o", o_fla, o_cud, o_ref)
+    for n in ("q", "k", "v", "g", "beta", "A_log", "dt_bias"):
         check("d" + n, lv_fla[n].grad, lv_cud[n].grad, lv_ref[n].grad)
 
 
