@@ -494,7 +494,7 @@ def check_ref_grouped_gemm_dsrelu(
 
     torch.testing.assert_close(outputs["dprob_tensor"].float(), ref_tensors["dprob_ref"].float(), atol=atol, rtol=rtol)
 
-    if outputs.get("dbias_tensor") is not None and "dbias_ref" in ref_tensors:
+    if outputs.get("dbias_tensor") is not None:
         # dbias sums dA down a whole expert, so its magnitude is ~group_m times d_row's and the
         # shared atol does not transfer. Scaled by the largest reference value instead, which is
         # loose enough for the default path -- it atomic-accumulates in bf16, one rounding per

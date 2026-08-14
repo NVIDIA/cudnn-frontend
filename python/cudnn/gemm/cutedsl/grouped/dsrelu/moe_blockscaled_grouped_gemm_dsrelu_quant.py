@@ -1041,13 +1041,7 @@ class BlockScaledMoEGroupedGemmQuantBwdKernel:
         dbias_n_total,
         dbias_row_idx,
     ) -> None:
-        """Sum dA across M within this subtile and atomic-add to dbias[expert, n].
-
-        ``dbias_row_idx`` selects the destination row: ``expert_idx`` normally, or -- under
-        ``deterministic`` -- the absolute M-block, which gives every ``(M-block, n)`` pair a
-        single writer so the caller can reduce them per expert in a fixed order. The store
-        below is otherwise identical, except that the deterministic workspace is fp32, so it
-        takes two scalar atomics where the bf16 output takes one packed bf16x2.
+        """Sum dA across M within this subtile and atomic-add to dbias[dbias_row_idx, n].
 
         Adapted from moe_blockscaled_grouped_gemm_dglu_dbias.py's dbias_reduction,
         which handled two interleaved vectors (d1, d2). Here we have a single
@@ -2298,18 +2292,20 @@ class BlockScaledMoEGroupedGemmQuantBwdKernel:
                             for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
                                 tCompute[i] = acc_vec[i] * mProb
 
-                    # dbias reduction: sum dA across M for each N, atomic-add to dbias[expert, n]
+                    # This tile's row in any M-block-indexed output. token_offset is the expert's
+                    # start and a multiple of cta_tile_m, so the division is exact.
+                    global_m_block = epi_work_tile_info.tile_m_idx + epi_ext.token_offset // self.cta_tile_shape_mnk[0]
+
+                    # dbias reduction: sum dA across M for each N, atomic-add to dbias[row, n]
                     if cutlass.const_expr(self.generate_dbias):
                         dA_vec = tCompute.load()
                         n_base = epi_work_tile_info.tile_n_idx * self.mma_tiler[1] + real_subtile_idx * self.epi_tile[1]
                         dbias_n_total = cute.size(mDbias_tensor, mode=[1])
                         # Deterministic dbias is keyed by the absolute M-block instead of the
-                        # expert, so each (M-block, n) has one writer. token_offset is the
-                        # expert's start and a multiple of cta_tile_m, so the division is exact.
-                        # Same index global_sfd_m rebuilds for the SFD-col path further down.
+                        # expert, so each (M-block, n) has one writer.
                         dbias_row_idx = expert_idx
                         if cutlass.const_expr(self.deterministic):
-                            dbias_row_idx = epi_work_tile_info.tile_m_idx + epi_ext.token_offset // self.cta_tile_shape_mnk[0]
+                            dbias_row_idx = global_m_block
                         self.dbias_reduction(
                             dA_vec,
                             warp_idx,
@@ -2354,12 +2350,11 @@ class BlockScaledMoEGroupedGemmQuantBwdKernel:
                                 d_rcp_limits,
                                 tRS_rD_srelu,
                             )
-                        global_sfd_m = epi_work_tile_info.tile_m_idx + epi_ext.token_offset // self.cta_tile_shape_mnk[0]
                         if cutlass.const_expr(self.mma_tiler[1] == 256):
                             sfd_n = epi_work_tile_info.tile_n_idx * 2 + (real_subtile_idx >> 2)
                         else:
                             sfd_n = epi_work_tile_info.tile_n_idx
-                        sfd_row_idx_mn = (global_sfd_m, sfd_n)
+                        sfd_row_idx_mn = (global_m_block, sfd_n)
                         sfd_col_idx_mn = sfd_row_idx_mn
                         if cutlass.const_expr(self.discrete_col_sfd):
                             sfd_col_idx_mn = (

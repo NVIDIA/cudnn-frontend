@@ -15,6 +15,23 @@ class GroupedGemmBackend(str, Enum):
     BLOCK_SCALED = "block_scaled"
 
 
+def _resolve_torch_stream(handle: int, device: torch.device):
+    """The torch stream object for a raw CUDA stream handle.
+
+    Prefers torch's own current/default stream objects when the handle matches one of them, so
+    the common case does not mint an ExternalStream per call.
+    """
+    import torch
+
+    torch_current = torch.cuda.current_stream(device)
+    if handle == torch_current.cuda_stream:
+        return torch_current
+    torch_default = torch.cuda.default_stream(device)
+    if handle == torch_default.cuda_stream:
+        return torch_default
+    return torch.cuda.ExternalStream(handle, device=device)
+
+
 @contextmanager
 def _torch_stream_context(current_stream: Optional[cuda.CUstream], device: torch.device) -> Iterator[None]:
     """Run PyTorch work on the CUDA stream used for the kernel launch.
@@ -27,17 +44,32 @@ def _torch_stream_context(current_stream: Optional[cuda.CUstream], device: torch
     if current_stream is None:
         yield
         return
-    handle = int(current_stream)
-    torch_current = torch.cuda.current_stream(device)
-    torch_default = torch.cuda.default_stream(device)
-    if handle == torch_current.cuda_stream:
-        launch_stream = torch_current
-    elif handle == torch_default.cuda_stream:
-        launch_stream = torch_default
-    else:
-        launch_stream = torch.cuda.ExternalStream(handle, device=device)
-    with torch.cuda.stream(launch_stream):
+    with torch.cuda.stream(_resolve_torch_stream(int(current_stream), device)):
         yield
+
+
+def _record_streams(current_stream: Optional[cuda.CUstream], device: torch.device, *tensors) -> None:
+    """Keep torch's allocator from recycling buffers the kernel is still writing.
+
+    A wrapper that allocates its outputs on torch's stream but launches on the caller's has torch
+    tag each block to the allocation stream, so it can hand the block to the next allocation there
+    as soon as the tensor is freed -- without waiting for the kernel. Recording the consumer stream
+    is what defers that reuse. No-op when the two are the same stream, which is the common case and
+    where record_stream would only add the block to the allocator's event-polled path for nothing.
+
+    torch-only, like _torch_stream_context: guard the call on the framework.
+    """
+    if current_stream is None:
+        return
+    import torch
+
+    handle = int(current_stream)
+    if handle == torch.cuda.current_stream(device).cuda_stream:
+        return
+    consumer = _resolve_torch_stream(handle, device)
+    for tensor in tensors:
+        if tensor is not None:
+            tensor.record_stream(consumer)
 
 
 def select_grouped_gemm_backend(

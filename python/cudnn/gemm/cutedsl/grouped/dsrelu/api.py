@@ -23,7 +23,7 @@ from .moe_blockscaled_grouped_gemm_dsrelu_quant import (
     BlockScaledMoEGroupedGemmQuantBwdKernel,
     EpilogueType,
 )
-from ..backend_utils import _torch_stream_context
+from ..backend_utils import _record_streams, _torch_stream_context
 from ..moe_utils import MoEWeightMode
 from cuda.bindings import driver as cuda
 import logging
@@ -153,27 +153,6 @@ def _reduce_dbias_slots(dbias_workspace, dbias_tensor, current_stream, padded_of
         return (onehot @ dbias_workspace.reshape(m_blocks, n_out)).reshape(-1, n_out, 1).to(torch.bfloat16)
 
 
-def _record_streams(current_stream: Optional[cuda.CUstream], device, *tensors) -> None:
-    """Keep torch's allocator from recycling buffers the kernel is still writing.
-
-    These come from torch's current stream, so torch tags the block to that stream and hands it
-    to the next allocation there as soon as the tensor is freed -- without waiting for work
-    queued on ``current_stream``. Same reason ``csa/compressor/api.py`` and the sibling
-    grouped-GEMM APIs call ``record_stream``.
-    """
-    if current_stream is None:
-        return
-    import torch
-
-    handle = int(current_stream)
-    if handle == torch.cuda.current_stream(device).cuda_stream:
-        return  # same stream the blocks were allocated on; nothing to guard against
-    consumer = torch.cuda.ExternalStream(handle, device=device)
-    for tensor in tensors:
-        if tensor is not None:
-            tensor.record_stream(consumer)
-
-
 def _reinterpret_raw_grouped_fp4_tensor(tensor: torch.Tensor) -> torch.Tensor:
     if _convert_to_cutlass_data_type_or_none(tensor.dtype) is cutlass.Uint8:
         cute_tensor = from_dlpack(tensor, assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=1)
@@ -274,7 +253,9 @@ class GroupedGemmDsreluSm100(APIBase):
         :param sample_dprob: Gradient of probability tensor (valid_m, 1, 1), must be zero-initialized
         :param sample_b: (Dense) Sample B tensor (n, k, l)
         :param sample_sfb: (Dense) Sample scale factor B tensor
-        :param sample_dbias: Optional dbias output tensor (expert_cnt, n, 1)
+        :param sample_dbias: Optional dbias output tensor (expert_cnt, n, 1) bfloat16 -- but under
+            ``deterministic`` the kernel writes one fp32 slot per (CTA M-tile, n) instead, so pass
+            ``(ceil_div(valid_m, cta_tile_m), n, 1)`` float32 and reduce it per expert yourself
         :param num_experts: (Discrete) Number of experts
         :param b_shape: (Discrete) Shape of a single expert B tensor, e.g. (n, k)
         :param b_dtype: (Discrete) Data type of B tensors
@@ -292,9 +273,12 @@ class GroupedGemmDsreluSm100(APIBase):
         :param b_major: Major dimension for B tensor, one of "k" or "n"
         :param use_dynamic_sched: Enable dynamic tile scheduling for load balancing
         :param use_dsrelu_reuse: Reuse relu(C)^2 between d_srelu and dprob
-        :param deterministic: Compute dprob run-to-run bit-exactly. sample_dprob must then
-            carry one slot per N-tile (see _dprob_n_slots) and the caller must reduce over
-            dim 1 after execute(); grouped_gemm_dsrelu_wrapper_sm100 does both for you
+        :param deterministic: Compute dprob and dbias run-to-run bit-exactly. Both outputs then
+            arrive as slot workspaces the caller reduces after execute(): sample_dprob carries one
+            slot per N-tile (see _dprob_n_slots) and reduces over dim 1, sample_dbias one fp32 slot
+            per absolute M-block and reduces per expert over the ranges padded_offsets marks off (a
+            plain sum will not do -- see the segment sum in _reduce_dbias_slots).
+            grouped_gemm_dsrelu_wrapper_sm100 does all of this for you and returns the usual shapes
         """
         framework = detect_framework(sample_a)
         if sample_a is not None and framework not in ("torch", "jax"):
@@ -379,8 +363,6 @@ class GroupedGemmDsreluSm100(APIBase):
         self.acc_dtype = _convert_to_cutlass_data_type(acc_dtype)
         self.mma_tiler_mn = mma_tiler_mn
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
-        # Rows one CTA's epilogue owns, and so the granularity of a deterministic dbias slot.
-        # Mirrors the kernel's cta_tile_shape_mnk[0] = mma_tiler[0] // thr_id_size.
         self.cta_tile_m = _cta_tile_m(mma_tiler_mn)
         self.cluster_shape_mn = _resolve_cluster_shape_mn(mma_tiler_mn, cluster_shape_mn)
         self.sf_vec_size = sf_vec_size
@@ -468,8 +450,10 @@ class GroupedGemmDsreluSm100(APIBase):
             return self._make_fake_cute_tensor_from_desc(self.dbias_desc, assumed_align=16)
         return self._make_fake_cute_compact_tensor(
             dtype=self.dbias_desc.dtype,
-            shape=(cute.sym_int(divisibility=2), *self.dbias_desc.shape[1:]),
+            shape=self.dbias_desc.shape,
             stride_order=self.dbias_desc.stride_order,
+            dynamic_mode=0,
+            divisibility=2,
         )
 
     def check_support(self) -> bool:
@@ -1640,7 +1624,8 @@ def grouped_gemm_dsrelu_wrapper_sm100(
         discrete_col_sfd: Generate discrete col-major scale factor tensor
         use_dynamic_sched: Enable dynamic tile scheduling for load balancing
         use_dsrelu_reuse: Reuse relu(C)^2 between d_srelu and dprob
-        deterministic: Make dprob bit-exact run to run. ``dprob_tensor`` keeps its
+        deterministic: Make dprob and dbias bit-exact run to run; raises NotImplementedError
+            for any framework other than torch. ``dprob_tensor`` keeps its
             ``(valid_m, 1, 1)`` shape either way -- the extra per-N-tile workspace and the
             fixed-order reduction into it are internal. ``None`` (default) follows
             ``torch.use_deterministic_algorithms``. See docs/fe-oss-apis/gemm_fusions/
@@ -1878,6 +1863,17 @@ def grouped_gemm_dsrelu_wrapper_sm100(
         static_shape = (shape[0], shape[1], None, *shape[3:])
         return dynamic_m_tensor_signature(tensor, static_shape, dynamic_stride_dims=(0, 1))
 
+    # Deterministic dbias indexes by M-block, so its dim 0 follows valid_m and keying on the full
+    # shape would recompile for every distinct token count -- the trap _dprob_n_slots documents
+    # for dprob's slot extent, and _make_dbias_fake already keeps that extent symbolic. Key it
+    # the way dprob is keyed: M dynamic, the rest static. Strides are (n_out, 1, 1) either way,
+    # so they carry no M. Non-deterministic dbias is (expert_cnt, n_out, 1) and static already.
+    dbias_signature = (
+        dynamic_m_tensor_signature(dbias_kernel_tensor, tuple(get_shape(dbias_kernel_tensor)[1:]))
+        if deterministic and dbias_kernel_tensor is not None
+        else tensor_signature(dbias_kernel_tensor)
+    )
+
     use_full_dynamic = is_dense and os.environ.get("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", "1") != "0"
 
     if is_dense:
@@ -1907,7 +1903,7 @@ def grouped_gemm_dsrelu_wrapper_sm100(
             # stride order, so without this the second call would reuse a kernel built for
             # the wrong dprob extent.
             dprob_n_slots,
-            *(dynamic_tensor_signature(dbias_kernel_tensor) if use_full_dynamic else tensor_signature(dbias_kernel_tensor)),
+            *(dynamic_tensor_signature(dbias_kernel_tensor) if use_full_dynamic else dbias_signature),
             *(dynamic_m_tensor_signature(d_srelu_tensor, (n_out, 1)) if not use_full_dynamic else dynamic_tensor_signature(d_srelu_tensor)),
             *(dynamic_tensor_signature(sfb_tensor) if use_full_dynamic else tensor_signature(sfb_tensor)),
             *(dynamic_tensor_signature(sfd_col_d_srelu_tensor) if use_full_dynamic else tensor_signature(sfd_col_d_srelu_tensor)),
@@ -1941,7 +1937,7 @@ def grouped_gemm_dsrelu_wrapper_sm100(
             *tensor_signature(alpha_tensor),
             *dynamic_m_tensor_signature(prob_tensor, (1, 1)),
             *dynamic_m_tensor_signature(dprob_tensor, tuple(dprob_tensor.shape[1:])),
-            *tensor_signature(dbias_kernel_tensor),
+            *dbias_signature,
             *dynamic_m_tensor_signature(d_srelu_tensor, (n_out, 1), dynamic_stride_dims=(2,)),
             *dynamic_sfd_col_tensor_signature(sfd_col_d_srelu_tensor),
             *tensor_signature(norm_const_tensor),

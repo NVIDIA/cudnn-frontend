@@ -400,9 +400,9 @@ element and is reproducible either way.
 
 **Streams.** `dprob`, `dbias` and `amax` are accumulated into, so the wrapper initialises them
 on `current_stream` rather than on torch's current stream; otherwise the memset is unordered
-against the kernel and the guarantee is void whenever the caller runs on its own stream. The
-buffers themselves are allocated on torch's stream and `record_stream`-ed onto
-`current_stream`, which keeps all outputs in one allocator pool. A caller driving the class
+against the kernel and the guarantee is void whenever the caller runs on its own stream. Those
+buffers are therefore allocated on `current_stream` too; the write-only outputs still come from
+torch's stream and are `record_stream`-ed onto `current_stream` instead. A caller driving the class
 API directly owns both of these itself.
 
 ---

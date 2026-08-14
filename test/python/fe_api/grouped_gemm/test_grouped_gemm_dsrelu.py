@@ -672,9 +672,8 @@ def test_grouped_gemm_dsrelu_deterministic_dbias(request):
     """deterministic=True makes dbias bit-exact without changing what it computes.
 
     dbias contends across M-tiles, not N-tiles like dprob, so it gets its own fp32 workspace
-    indexed by absolute M-block plus a per-expert segment sum. The three properties are the
-    same ones dprob has to hold: repeatable to the bit, agreeing with the default path, and
-    with the flag's other outputs untouched.
+    indexed by absolute M-block plus a per-expert segment sum. The properties it has to hold are
+    the same ones dprob does, so this reuses that checklist and adds the dbias-specific parts.
     """
     try:
         import cudnn  # noqa: F401
@@ -694,41 +693,35 @@ def test_grouped_gemm_dsrelu_deterministic_dbias(request):
     deterministic = _run_dsrelu_case(case, deterministic=True, generate_dbias=True)
     torch.cuda.synchronize()
 
-    # The caller-visible dbias keeps its (expert, n, 1) bf16 shape -- the fp32 M-block
-    # workspace and the segment sum are internal to the wrapper.
-    assert deterministic["dbias_tensor"].shape == baseline["dbias_tensor"].shape
+    # Everything dprob has to hold, dbias holds too -- including that the flag leaves the other
+    # outputs untouched -- so the dprob checklist covers it. check_ref now asserts dbias against
+    # the reference as well, which is what actually pins the per-expert segment mapping.
+    _assert_dprob_deterministic(case, baseline, deterministic, lambda: _run_dsrelu_case(case, deterministic=True, generate_dbias=True))
+
+    # The caller-visible dbias keeps its (expert, n, 1) bf16 shape; the fp32 M-block workspace and
+    # the segment sum are internal to the wrapper.
     assert deterministic["dbias_tensor"].dtype == torch.bfloat16
     assert torch.count_nonzero(deterministic["dbias_tensor"]).item() > 0
-
-    def _relaunch():
-        out = _run_dsrelu_case(case, deterministic=True, generate_dbias=True)
-        # dprob rides along rather than getting its own run: both reductions are issued on the
-        # same stream, and only checking them together catches an ordering regression there.
-        return out["dbias_tensor"], out["dprob_tensor"]
-
-    assert_bitwise_runs(_relaunch, label="dbias+dprob")
 
     # The two paths sum the same terms but not the same way: the default rounds to bf16 on every
     # M-tile, the deterministic one keeps fp32 partials and narrows once, which makes it the more
     # accurate of the pair. So they agree only to bf16 resolution at dbias's magnitude, and the
     # bound is scaled accordingly -- job 459169 failed a flat 2e-2 on a 16.0 difference that is
-    # ~2 ULP of bf16 there. Correctness against the reference is check_ref's job, below.
+    # ~2 ULP of bf16 there.
     det_dbias, base_dbias = deterministic["dbias_tensor"].float(), baseline["dbias_tensor"].float()
     torch.testing.assert_close(det_dbias, base_dbias, rtol=5e-2, atol=max(base_dbias.abs().max().item(), 1.0) * 5e-2)
-
-    check_ref_grouped_gemm_dsrelu(inputs, deterministic, cfg, skip_ref=cfg["skip_ref"])
 
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=43)
-@pytest.mark.parametrize("n", [512, 768])
-def test_grouped_gemm_dsrelu_deterministic_dbias_segments(request, n):
-    """The per-expert segment sum must follow the real expert boundaries.
+def test_grouped_gemm_dsrelu_deterministic_dbias_segments(request):
+    """The per-expert segment sum must follow the real expert boundaries at a second N.
 
     A one-hot built off the wrong offsets still produces plausible finite numbers and still
     agrees with the non-deterministic path to a loose tolerance, so only the reference catches
     it -- check_ref_grouped_gemm_dsrelu compares against a dbias summed per expert from the
-    unquantized dA. Two n values, because the block count per expert differs between them.
+    unquantized dA. n=768 rather than the default 512, so the segment sum is exercised against
+    a workspace whose row stride differs from the one the test above already covers.
     """
     try:
         import cudnn  # noqa: F401
@@ -736,7 +729,7 @@ def test_grouped_gemm_dsrelu_deterministic_dbias_segments(request, n):
     except ImportError:
         pytest.skip("Environment not supported: cudnn optional dependencies not installed")
 
-    case = _build_dsrelu_case(request, torch.float8_e4m3fn, torch.bfloat16, torch.float8_e4m3fn, 32, torch.float8_e8m0fnu, False, True, n_override=n)
+    case = _build_dsrelu_case(request, torch.float8_e4m3fn, torch.bfloat16, torch.float8_e4m3fn, 32, torch.float8_e8m0fnu, False, True, n_override=768)
     inputs, cfg = case
     try:
         outputs = _run_dsrelu_case(case, deterministic=True, generate_dbias=True)
@@ -744,7 +737,7 @@ def test_grouped_gemm_dsrelu_deterministic_dbias_segments(request, n):
         pytest.skip(f"Unsupported testcase: {e}")
     torch.cuda.synchronize()
 
-    assert outputs["dbias_tensor"].shape == (cfg["l"], n, 1)
+    assert outputs["dbias_tensor"].shape == (cfg["l"], 768, 1)
     check_ref_grouped_gemm_dsrelu(inputs, outputs, cfg, skip_ref=cfg["skip_ref"])
 
 
