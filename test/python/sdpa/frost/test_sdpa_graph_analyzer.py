@@ -587,6 +587,64 @@ def test_sm120_probe_accepts_causal_swa_on_both_minors(monkeypatch):
         assert not any("sm100" in name for name in elig)
 
 
+def test_probe_rejects_requested_amax_s():
+    # The FP8 kernels no longer compute Amax_S; a graph that DECLARES the
+    # output (set_output(True), non-virtual) must go elsewhere. The port the
+    # op returns unconditionally does NOT count (is_virtual stays True).
+    import math
+
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.FP8_E4M3, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    dims, strides = (B, H, S, 128), (S * H * 128, 128, H * 128, 1)
+    q = g.tensor(dim=dims, stride=strides, data_type=cudnn.data_type.FP8_E4M3, name="q")
+    k = g.tensor(dim=dims, stride=strides, data_type=cudnn.data_type.FP8_E4M3, name="k")
+    v = g.tensor(dim=dims, stride=strides, data_type=cudnn.data_type.FP8_E4M3, name="v")
+    sc = [g.tensor(dim=(1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.FLOAT) for _ in range(6)]
+    kw = dict(
+        q=q,
+        k=k,
+        v=v,
+        descale_q=sc[0],
+        descale_k=sc[1],
+        descale_v=sc[2],
+        descale_s=sc[3],
+        scale_s=sc[4],
+        scale_o=sc[5],
+        attn_scale=1.0 / math.sqrt(128),
+        generate_stats=False,
+        use_causal_mask=True,
+    )
+
+    def build(request_amax_s):
+        gg = cudnn.pygraph(io_data_type=cudnn.data_type.FP8_E4M3, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+        qq = gg.tensor(dim=dims, stride=strides, data_type=cudnn.data_type.FP8_E4M3, name="q")
+        kk = gg.tensor(dim=dims, stride=strides, data_type=cudnn.data_type.FP8_E4M3, name="k")
+        vv = gg.tensor(dim=dims, stride=strides, data_type=cudnn.data_type.FP8_E4M3, name="v")
+        ss = [gg.tensor(dim=(1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.FLOAT) for _ in range(6)]
+        o, _stats, amx_s, amx_o = gg.sdpa_fp8(
+            q=qq,
+            k=kk,
+            v=vv,
+            descale_q=ss[0],
+            descale_k=ss[1],
+            descale_v=ss[2],
+            descale_s=ss[3],
+            scale_s=ss[4],
+            scale_o=ss[5],
+            attn_scale=1.0 / math.sqrt(128),
+            generate_stats=False,
+            use_causal_mask=True,
+        )
+        _finish_output(o, dims, strides, dtype=cudnn.data_type.HALF)
+        amx_o.set_output(True).set_dim((1, 1, 1, 1)).set_stride((1, 1, 1, 1)).set_data_type(cudnn.data_type.FLOAT)
+        if request_amax_s:
+            amx_s.set_output(True).set_dim((1, 1, 1, 1)).set_stride((1, 1, 1, 1)).set_data_type(cudnn.data_type.FLOAT)
+        return gg
+
+    fp8_name = engines.engine_name(128, fp8=True)
+    assert fp8_name in _eligible(build(request_amax_s=False))
+    assert fp8_name not in _eligible(build(request_amax_s=True))
+
+
 def test_probe_accepts_bottom_right_with_swa():
     # The band shifts wholesale with the diagonal: the SM100 kernels apply the
     # same causal_diag offset to the SWA lower limit as to the causal upper one.

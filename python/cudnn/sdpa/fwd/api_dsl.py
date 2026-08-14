@@ -666,8 +666,7 @@ class SdpaFwdDsl(APIBase):
         signature only with additional optional keyword arguments; an adapter
         whose engine capabilities accept FP8/MXFP8 graphs must also accept the
         FP8 operand set the lowering adds for those graphs (``sf_q/sf_k/sf_v``,
-        ``descale_q/descale_k/descale_v``, ``scale_o``, ``amax_o``,
-        ``amax_s`` — see :meth:`SdpaFwdDslSm100.execute`).
+        ``descale_q/descale_k/descale_v``, ``scale_o``, ``amax_o`` — see :meth:`SdpaFwdDslSm100.execute`).
         """
 
 
@@ -961,7 +960,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # FP8/MXFP8 kernels are exact-match d128 (gated in check_support);
             # their compile() has no envelope head-dim parameters. has_lse=False
             # (no Stats output) compiles the LSE store out — no dummy buffer at
-            # any level (the amax_s/amax_o atomicMax writes are independent).
+            # any level (the amax_o atomicMax write is independent).
             self._compiled_kernel = self._k_mod.compile(
                 b=self.batch_size,
                 qh=self.h_q,
@@ -1038,7 +1037,6 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         descale_k: Optional[torch.Tensor] = None,
         descale_v: Optional[torch.Tensor] = None,
         scale_o: Optional[torch.Tensor] = None,
-        amax_s: Optional[torch.Tensor] = None,
         descale_s: Optional[torch.Tensor] = None,
         scale_s: Optional[torch.Tensor] = None,
         workspace: Optional[torch.Tensor] = None,
@@ -1108,7 +1106,6 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 descale_k,
                 descale_v,
                 scale_o,
-                amax_s,
                 amax_o,
                 descale_s,
                 scale_s,
@@ -1455,7 +1452,6 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         descale_k,
         descale_v,
         scale_o,
-        amax_s,
         amax_o,
         descale_s=None,
         scale_s=None,
@@ -1503,15 +1499,13 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         )
         o_desc_dummy = self._dummy("o_desc", device, lambda: torch.zeros(1, dtype=torch.int64, device=device))
 
-        # amax_s / amax_o: the kernel atomicMax'es into these buffers, so they MUST
-        # start at 0. amax_o accumulates max|o_scaled| (pre-cast, exact even for FP8 O);
+        # amax_o: the kernel atomicMax'es into this buffer, so it MUST start
+        # at 0. It accumulates max|o_scaled| (pre-cast, exact even for FP8 O);
         # dividing by scale_o below yields the pre-quant output amax.
-        amax_s_buf = self._amax_slot(amax_s, "amax_s", device)
         amax_o_buf = self._amax_slot(amax_o, "amax_o", device)
-        # Same-stream ordering as MXFP8: the resets must precede the kernel's
+        # Same-stream ordering as MXFP8: the reset must precede the kernel's
         # atomicMax on the launch stream, not on torch's current stream.
         with _torch_stream_context(current_stream, device):
-            amax_s_buf.zero_()
             amax_o_buf.zero_()
 
         self._compiled_kernel(
@@ -1527,7 +1521,6 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             cutlass.Float32(scale_softmax_log2),
             cutlass.Float32(o_scale_fused),
             cutlass.Int32(0),  # n_thd_units (dense)
-            amax_s_buf,
             amax_o_buf,
             stream=current_stream,
         )
@@ -2046,7 +2039,6 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         descale_k: Optional[torch.Tensor] = None,
         descale_v: Optional[torch.Tensor] = None,
         scale_o: Optional[torch.Tensor] = None,
-        amax_s: Optional[torch.Tensor] = None,
         descale_s: Optional[torch.Tensor] = None,
         scale_s: Optional[torch.Tensor] = None,
         amax_o: Optional[torch.Tensor] = None,
@@ -2093,7 +2085,6 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                 descale_k,
                 descale_v,
                 scale_o,
-                amax_s,
                 amax_o,
                 descale_s,
                 scale_s,
@@ -2179,7 +2170,6 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         descale_k,
         descale_v,
         scale_o,
-        amax_s,
         amax_o,
         descale_s=None,
         scale_s=None,
@@ -2256,12 +2246,10 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         else:
             lse = self._checked_lse_view(lse_tensor) if lse_tensor is not None else None
 
-        # amax_s / amax_o: the kernel atomicMax'es into these buffers, so they
-        # MUST start at 0, reset on the LAUNCH stream (ordering vs the kernel).
-        amax_s_buf = self._amax_slot(amax_s, "amax_s", device)
+        # amax_o: the kernel atomicMax'es into this buffer, so it MUST start
+        # at 0, reset on the LAUNCH stream (ordering vs the kernel).
         amax_o_buf = self._amax_slot(amax_o, "amax_o", device)
         with _torch_stream_context(current_stream, device):
-            amax_s_buf.zero_()
             amax_o_buf.zero_()
 
         fn = self._compiled_kernel
@@ -2288,7 +2276,6 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             None,  # sinks: fp8 cell rejects has_sink
             pack.seq_q_dummy if pack is not None else seq_q_dummy,
             pack.meta if pack is not None else seq_kv_t,
-            amax_s_buf.view(torch.int32),
             amax_o_buf.view(torch.int32),
             cutlass.Float32(scale_softmax_log2),
             cutlass.Float32(o_scale_fused),

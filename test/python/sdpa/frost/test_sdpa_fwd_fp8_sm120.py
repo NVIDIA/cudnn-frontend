@@ -5,7 +5,7 @@
 
 Drives ``graph.sdpa_fp8`` (FP8 E4M3 Q/K/V + scalar per-tensor descales) routed to
 the ``sdpa_fwd_prefill_sm120_fp8`` engine, and validates O against an fp32-dequant
-reference. ``Amax_S`` and ``Amax_O`` are both produced in-kernel (bitcast-int32
+reference. ``Amax_O`` is produced in-kernel (bitcast-int32
 atomicMax over the pre-cast fp32 values); both are checked.
 
 SM120 envelope (see engines._sm120_fp8_spec): E4M3 in / FP16 out only, head
@@ -13,7 +13,7 @@ dims any multiple of 32 up to 256 with the QK^T and P@V sides independent
 (what graphs can reach is further gated by the C++ sdpa_fp8 node:
 d_qk <= 128 x d_v <= 128 plus the (192, 128) MLA pair), causal /
 bottom-right / SWA / KV-padding masks, THD (ragged) with token-major Stats;
-no sink (Amax_S semantics), no head-major ragged Stats.
+no sink, no head-major ragged Stats.
 
 Requires: SM120/SM121 (Blackwell GeForce), cutlass-dsl. Skips otherwise.
 """
@@ -60,7 +60,7 @@ def _ref(qd, kd, vd, *, scale, is_causal=False, bottom_right=False, swa_window=N
     scores = scores.masked_fill(masked, float("-inf"))
     probs = torch.softmax(scores, dim=-1)
     # Fully-masked rows are -inf in logsumexp; the kernel writes -inf too.
-    return torch.matmul(probs, v_e), probs.max().item(), torch.logsumexp(scores, dim=-1)
+    return torch.matmul(probs, v_e), torch.logsumexp(scores, dim=-1)
 
 
 def _run(B, H_q, H_kv, S_q, S_kv, *, scale, sdpa_kwargs, seq_lens_kv=None, tiles=None, s_descale_gain=1.0, D=128, D_v=None):
@@ -81,7 +81,6 @@ def _run(B, H_q, H_kv, S_q, S_kv, *, scale, sdpa_kwargs, seq_lens_kv=None, tiles
     Qb, Kb, Vb = bshd(Q8), bshd(K8), bshd(V8)
     Ob = torch.empty(B, S_q, H_q, D_v, device=dev, dtype=torch.float16).transpose(1, 2)
     lse = torch.empty(B, H_q, S_q, 1, device=dev, dtype=torch.float32)
-    amax_s = torch.zeros(1, 1, 1, 1, device=dev, dtype=torch.float32)
     amax_o = torch.zeros(1, 1, 1, 1, device=dev, dtype=torch.float32)
 
     def sc(val):
@@ -113,10 +112,9 @@ def _run(B, H_q, H_kv, S_q, S_kv, *, scale, sdpa_kwargs, seq_lens_kv=None, tiles
         vp[sq_h] = slq
         vp[skv_h] = slk
     kw.update(sdpa_kwargs)
-    o, stats, amx_s, amx_o = g.sdpa_fp8(**kw)
+    o, stats, _amx_s_unused, amx_o = g.sdpa_fp8(**kw)  # Amax_S: not requested
     o.set_output(True).set_dim(list(Ob.shape)).set_stride(list(Ob.stride())).set_data_type(cudnn.data_type.HALF)
     stats.set_output(True).set_dim([B, H_q, S_q, 1]).set_stride([H_q * S_q, S_q, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
-    amx_s.set_output(True).set_dim([1, 1, 1, 1]).set_stride([1, 1, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
     amx_o.set_output(True).set_dim([1, 1, 1, 1]).set_stride([1, 1, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
 
     g.validate()
@@ -125,13 +123,13 @@ def _run(B, H_q, H_kv, S_q, S_kv, *, scale, sdpa_kwargs, seq_lens_kv=None, tiles
     _select_engine(g, engine_name(arch="sm120", fp8=True), tiles=tiles)
     g.check_support()
     g.build_plans()
-    vp.update({o: Ob, stats: lse, amx_s: amax_s, amx_o: amax_o})
+    vp.update({o: Ob, stats: lse, amx_o: amax_o})
     g.execute(vp, torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8))
     torch.cuda.synchronize()
 
     ref_kw = _ref_kwargs(sdpa_kwargs)
-    o_ref, amax_s_ref, lse_ref = _ref(Q8.float() * dq, K8.float() * dk, V8.float() * dv, scale=scale, seq_lens_kv=seq_lens_kv, **ref_kw)
-    return Ob, o_ref, amax_s.item(), amax_s_ref, amax_o.item(), o_ref.abs().max().item(), lse.squeeze(-1), lse_ref
+    o_ref, lse_ref = _ref(Q8.float() * dq, K8.float() * dk, V8.float() * dv, scale=scale, seq_lens_kv=seq_lens_kv, **ref_kw)
+    return Ob, o_ref, amax_o.item(), o_ref.abs().max().item(), lse.squeeze(-1), lse_ref
 
 
 def _ref_kwargs(sdpa_kwargs):
@@ -147,10 +145,9 @@ def _ref_kwargs(sdpa_kwargs):
     return out
 
 
-def _check(out, o_ref, amax_s, amax_s_ref, amax_o, amax_o_ref, lse=None, lse_ref=None):
+def _check(out, o_ref, amax_o, amax_o_ref, lse=None, lse_ref=None):
     diff = (out.float() - o_ref).abs().max().item()
     assert diff <= 5e-2, f"max|O-ref|={diff:.4f} > 0.05"
-    assert abs(amax_s - amax_s_ref) <= 0.03, f"amax_s {amax_s:.4f} vs ref {amax_s_ref:.4f}"
     assert abs(amax_o - amax_o_ref) <= 0.03, f"amax_o {amax_o:.4f} vs ref {amax_o_ref:.4f}"
     if lse is not None:
         finite = torch.isfinite(lse_ref)
@@ -252,7 +249,7 @@ def test_fp8_sm120_e5m2_not_offered():
     g = cudnn.pygraph(io_data_type=cudnn.data_type.FP8_E5M2, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
     q, k, v = g.tensor_like(X), g.tensor_like(X), g.tensor_like(X)
     scalars = [g.tensor(dim=[1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.FLOAT) for _ in range(6)]
-    o, stats, amx_s, amx_o = g.sdpa_fp8(
+    o, stats, _amx_s_unused, amx_o = g.sdpa_fp8(
         q=q,
         k=k,
         v=v,
@@ -267,7 +264,6 @@ def test_fp8_sm120_e5m2_not_offered():
     )
     o.set_output(True).set_dim([B, H, S, D]).set_stride([S * H * D, D, H * D, 1]).set_data_type(cudnn.data_type.HALF)
     stats.set_output(True).set_dim([B, H, S, 1]).set_stride([H * S, S, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
-    amx_s.set_output(True).set_dim([1, 1, 1, 1]).set_stride([1, 1, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
     amx_o.set_output(True).set_dim([1, 1, 1, 1]).set_stride([1, 1, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
     g.validate()
     g.build_operation_graph()
@@ -313,11 +309,10 @@ def _fp8_graph_offers_sm120(io_dtype, o_dtype, D=128, D_v=None, sink=False):
     )
     if sink:
         kw["sink_token"] = g.tensor(dim=[1, H, 1, 1], stride=[H, 1, 1, 1], data_type=cudnn.data_type.FLOAT)
-    o, stats, amx_s, amx_o = g.sdpa_fp8(**kw)
+    o, stats, _amx_s_unused, amx_o = g.sdpa_fp8(**kw)  # Amax_S: not requested
     o.set_output(True).set_dim([B, H, S, D_v]).set_stride([S * H * D_v, D_v, H * D_v, 1]).set_data_type(o_dtype)
     stats.set_output(True).set_dim([B, H, S, 1]).set_stride([H * S, S, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
-    for t in (amx_s, amx_o):
-        t.set_output(True).set_dim([1, 1, 1, 1]).set_stride([1, 1, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
+    amx_o.set_output(True).set_dim([1, 1, 1, 1]).set_stride([1, 1, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
     try:
         g.validate()
         g.build_operation_graph()
@@ -332,8 +327,7 @@ def _fp8_graph_offers_sm120(io_dtype, o_dtype, D=128, D_v=None, sink=False):
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_fp8_sm120_sink_not_offered():
-    """Amax_S over a softmax that includes a sink column has no agreed meaning,
-    so the row declines rather than reporting an amax for a different quantity."""
+    """The fp8 cell does not implement the sink fold, so it must decline."""
     import cudnn
 
     assert not _fp8_graph_offers_sm120(cudnn.data_type.FP8_E4M3, cudnn.data_type.HALF, sink=True)
@@ -484,7 +478,6 @@ def _run_template_tail(D, D_v, *, mask, S=256):
     o = torch.zeros(B, S, H, D_v, device=dev, dtype=torch.float16)
     seq_q = torch.full((B,), S, dtype=torch.int32, device=dev)
     seq_kv = torch.tensor(seq_kv_lens, dtype=torch.int32, device=dev) if seq_kv_lens else seq_q
-    amax_s = torch.zeros(1, dtype=torch.float32, device=dev)
     amax_o = torch.zeros(1, dtype=torch.float32, device=dev)
     scale = 1.0 / math.sqrt(D)
     fn(
@@ -496,8 +489,7 @@ def _run_template_tail(D, D_v, *, mask, S=256):
         None,  # sinks (unsupported; ABI slot)
         seq_q,
         seq_kv,
-        amax_s.view(torch.int32),  # bitcast-int32 atomicMax storage
-        amax_o.view(torch.int32),
+        amax_o.view(torch.int32),  # bitcast-int32 atomicMax storage
         cutlass.Float32(scale * math.log2(math.e)),  # softmax_scale_log2 (descale_q = descale_k = 1)
         cutlass.Float32(1.0),  # o_scale_fused = descale_s * descale_v * scale_o, all 1.0 here
         cutlass.Float32(1.0),  # scale_s
@@ -508,7 +500,7 @@ def _run_template_tail(D, D_v, *, mask, S=256):
     def bhsd(t):
         return t.float().permute(0, 2, 1, 3)
 
-    o_ref, _, _ = _ref(bhsd(q8), bhsd(k8), bhsd(v8), scale=scale, is_causal=mask in ("causal", "swa"), swa_window=swa_window, seq_lens_kv=seq_kv_lens)
+    o_ref, _ = _ref(bhsd(q8), bhsd(k8), bhsd(v8), scale=scale, is_causal=mask in ("causal", "swa"), swa_window=swa_window, seq_lens_kv=seq_kv_lens)
     of = bhsd(o)
     assert not torch.isnan(of).any(), "NaN in O"
     diff = (of - o_ref).abs().max().item()
@@ -638,7 +630,6 @@ def _run_thd_fp8(*, seq_q_lens, seq_kv_lens, h_q=8, h_kv=8, is_causal=True, bott
 
     sq_t = torch.tensor(seq_q_lens, dtype=torch.int32, device=dev).view(batch, 1, 1, 1)
     skv_t = torch.tensor(seq_kv_lens, dtype=torch.int32, device=dev).view(batch, 1, 1, 1)
-    amax_s = torch.zeros(1, 1, 1, 1, device=dev, dtype=torch.float32)
     amax_o = torch.zeros(1, 1, 1, 1, device=dev, dtype=torch.float32)
 
     def sc(val):
@@ -681,10 +672,9 @@ def _run_thd_fp8(*, seq_q_lens, seq_kv_lens, h_q=8, h_kv=8, is_causal=True, bott
     elif is_causal:
         kw["use_causal_mask"] = True
 
-    o, stats, amx_s, amx_o = g.sdpa_fp8(**kw)
+    o, stats, _amx_s_unused, amx_o = g.sdpa_fp8(**kw)  # Amax_S: not requested
     o.set_output(True).set_dim(list(o_view.shape)).set_stride(list(o_view.stride())).set_data_type(cudnn.data_type.HALF)
     o.set_ragged_offset(ro)
-    amx_s.set_output(True).set_dim([1, 1, 1, 1]).set_stride([1, 1, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
     amx_o.set_output(True).set_dim([1, 1, 1, 1]).set_stride([1, 1, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
 
     vp = {
@@ -704,7 +694,6 @@ def _run_thd_fp8(*, seq_q_lens, seq_kv_lens, h_q=8, h_kv=8, is_causal=True, bott
         ssn: sst,
         son: sot,
         o: o_view,
-        amx_s: amax_s,
         amx_o: amax_o,
     }
     cu = [0]
@@ -736,14 +725,12 @@ def _run_thd_fp8(*, seq_q_lens, seq_kv_lens, h_q=8, h_kv=8, is_causal=True, bott
     torch.cuda.synchronize()
 
     packed_o = o_storage[: max(cu[-1], 1) * h_q * D].view(max(cu[-1], 1), h_q, D)
-    amax_s_ref = 0.0
     for i, (nq, nkv) in enumerate(zip(seq_q_lens, seq_kv_lens)):
         if nq == 0:
             continue
-        o_ref, a_s_ref, lse_ref = _ref(
+        o_ref, lse_ref = _ref(
             q_8[i].float() * dq, k_8[i].float() * dk, v_8[i].float() * dv, scale=scale, is_causal=is_causal or bottom_right, bottom_right=bottom_right
         )
-        amax_s_ref = max(amax_s_ref, a_s_ref)
         got = packed_o[cu[i] : cu[i + 1]].float()
         want = o_ref[0].permute(1, 0, 2).float()
         diff = (got - want).abs().max().item()
@@ -755,7 +742,6 @@ def _run_thd_fp8(*, seq_q_lens, seq_kv_lens, h_q=8, h_kv=8, is_causal=True, bott
 
     # Nothing outside the packed token range may be written.
     assert (o_storage[cu[-1] * h_q * D :] == _THD_SENTINEL).all(), "wrote past the packed O tokens"
-    assert abs(amax_s.item() - amax_s_ref) <= 5e-2 * max(amax_s_ref, 1e-3), f"amax_s {amax_s.item()} vs {amax_s_ref}"
 
 
 @pytest.mark.L0

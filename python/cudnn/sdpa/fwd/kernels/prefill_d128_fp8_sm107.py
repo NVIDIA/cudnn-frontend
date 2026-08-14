@@ -302,7 +302,6 @@ def _kernel(
     qh_per_kh: cutlass.Int32,
     scale_softmax_log2: cutlass.Float32,
     o_scale_fused: cutlass.Float32,
-    amax_s_tensor: cute.Tensor,
     amax_o_tensor: cute.Tensor,
 ) -> None:
 
@@ -503,7 +502,6 @@ def _kernel(
             cta_in_pair=cta_in_pair,
             cta_id_x=cta_id_x,
             o_scale_fused=o_scale_fused,
-            amax_s_tensor=amax_s_tensor,
             amax_o_tensor=amax_o_tensor,
         )
 
@@ -1648,7 +1646,6 @@ def _correction_warp_group(
     cta_in_pair,
     cta_id_x,
     o_scale_fused,
-    amax_s_tensor,
     amax_o_tensor,
 ):
     """Correction warp group: 4 warps × 32 lanes = 128, one lane per O row.
@@ -1831,14 +1828,6 @@ def _correction_warp_group(
                 # Safe inverse: avoid div by 0 on fully-masked rows.
                 inv_sum = o_scale_fused / cute.math.max(total_sum, cutlass.Float32(1e-30))
 
-            # amax_s = max over valid rows of the softmax normalization (1/total_sum),
-            # o_scale_fused divided back out so it is the pure softmax-prob amax (cuDNN
-            # FP8 ref: `beta = 1/total_sum`). atomicrmw MAX has no fp variant, so — like
-            # the reference — reinterpret the (always-positive) float as int32 and MAX on
-            # the bits (IEEE754 positive floats are monotonic in their int encoding).
-            _beta_bits = (inv_sum / o_scale_fused).bitcast(cutlass.Int32)
-            _amax_s_ptr = Pointer(amax_s_tensor.iterator.raw_ptr(), dtype=cutlass.Int32)
-
             # cga2 OOB-row guard: cluster Q rows can exceed seqlen_q.
             q_row_global = q_super_idx * cutlass.Int32(CFG.TILES_Q * CFG.TILE_M) + cutlass.Int32(qs * CFG.TILE_M) + tid_in_wg
             if cutlass.const_expr(CFG.THD_VARLEN):
@@ -1848,13 +1837,10 @@ def _correction_warp_group(
                 _s_q_b = cutlass.Int32(_cu[n_batch + batch_idx + cutlass.Int32(1)]) - _cu_q_b
                 _row_valid = q_row_global < _s_q_b
                 if _row_valid:
-                    # has_lse=False: the Stats store is compiled out; the amax_s
-                    # atomicMax is independent of it and always live.
                     if cutlass.const_expr(lse_tensor is not None):
                         lse_arr = cutlass.make_array_view(lse_tensor)
                         lse_row = lse_arr[cutlass.Int32(0), head_idx, :]
                         lse_row[_cu_q_b + q_row_global] = lse_val
-                    nvvm.atomicrmw(nvvm.AtomicOp.MAX, _amax_s_ptr, _beta_bits)
             else:
                 _row_valid = q_row_global < seqlen_q
                 if _row_valid:
@@ -1862,7 +1848,6 @@ def _correction_warp_group(
                         lse_arr = cutlass.make_array_view(lse_tensor)
                         lse_row = lse_arr[batch_idx, head_idx, :]
                         lse_row[q_row_global] = lse_val
-                    nvvm.atomicrmw(nvvm.AtomicOp.MAX, _amax_s_ptr, _beta_bits)
 
             # amax_o = max over valid rows of |o_scaled| (the fp32 pre-cast output). Divided
             # by scale_o in api to give the pre-quant output amax (cuDNN FP8 ref, in-kernel).
@@ -2009,7 +1994,6 @@ def _host(
     scale_softmax_log2: cutlass.Float32,
     o_scale_fused: cutlass.Float32,
     n_thd_units: cutlass.Int32,
-    amax_s_tensor: cute.Tensor,
     amax_o_tensor: cute.Tensor,
     stream: _cuda_driver.CUstream = None,
 ) -> None:
@@ -2099,7 +2083,6 @@ def _host(
         cutlass.Int32(QH // KH),
         scale_softmax_log2,
         o_scale_fused,
-        amax_s_tensor,
         amax_o_tensor,
     ).launch(
         grid=grid_shape,
@@ -2116,7 +2099,7 @@ def compile(b: int = 1, qh: int = 1, kh: int = 1, sq: int = 256, skv: int = 128,
     THD/varlen: q/k/v/o/lse PACKED with batch dim 1; ``b`` = logical batch.
     ``has_lse=False`` compiles the LSE store out (the kernel specializes on a
     ``None`` LSE argument) — callers without a Stats output pass no LSE buffer
-    at all; the amax_s/amax_o atomicMax writes are independent and unchanged."""
+    at all; the amax_o atomicMax write is independent and unchanged."""
     _fake_batch = 1 if CFG.THD_VARLEN else b
     fake_q = cute.runtime.make_fake_compact_tensor(
         STORAGE_DTYPE,
@@ -2177,14 +2160,6 @@ def compile(b: int = 1, qh: int = 1, kh: int = 1, sq: int = 256, skv: int = 128,
         stride_order=(0,),
         assumed_align=16,
     )
-    # amax_s output (scalar): max softmax prob (1/total_sum) via atomicMax. Always
-    # part of the ABI; api pre-zeros it and reads it back (Amax_S output).
-    fake_amax_s = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float32,
-        (1,),
-        stride_order=(0,),
-        assumed_align=16,
-    )
     fake_amax_o = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32,
         (1,),
@@ -2205,7 +2180,6 @@ def compile(b: int = 1, qh: int = 1, kh: int = 1, sq: int = 256, skv: int = 128,
         cutlass.Float32(0.0),
         cutlass.Float32(0.0),
         cutlass.Int32(0),
-        fake_amax_s,
         fake_amax_o,
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
