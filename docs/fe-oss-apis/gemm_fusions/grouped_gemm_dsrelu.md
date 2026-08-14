@@ -240,9 +240,9 @@ op.execute(
 - Output tensor **dprob**: `result["dprob_tensor"]` (wrapper) or `sample_dprob` / `dprob_tensor` (class)
   - Shape (wrapper): `(valid_m, 1, 1)`, whether or not `deterministic` is set — the per-N-tile
     workspace and the reduction into it are internal
-  - Shape (class API): `(valid_m, 1, 1)` normally, but `(valid_m, grid_n, 1)` under
-    `deterministic=True`, and the caller reduces over dim 1 after `execute()`.
-    See [Deterministic dprob](#deterministic-dprob) for `grid_n`
+  - Shape: `(valid_m, 1, 1)` in both modes. Under `deterministic=True` the class API also takes
+    `sample_dprob_workspace` / `dprob_workspace_tensor` (`dprob_workspace_shape(valid_m, n)`,
+    float32) and the caller calls `reduce_dprob_workspace` after `execute()`
   - Dtype: `float32`
 - Output tensors **SFD_row** / **SFD_col**
   - Dtypes: must match `SFA`
@@ -371,23 +371,29 @@ across *M*-tiles with bf16 atomics (`red.global.add.noftz.bf16x2`) in an order s
 scheduling — a separate contention axis from `dprob`'s, since every N column is owned outright
 by one `(tile_n, subtile)` pair.
 
-Under `deterministic=True` the kernel instead writes one **fp32** slot per
-`(absolute M-block, n)`, which has exactly one writer, and the wrapper reduces those per
-expert. Groups are padded to a multiple of `m_aligned`, so no M-block straddles two experts and
-each expert owns a contiguous block range `[padded_offsets[e-1] / cta_tile_m,
-padded_offsets[e] / cta_tile_m)`. The workspace is `ceil_div(valid_m, cta_tile_m) × n_out` fp32
-— 4 MiB at `valid_m=64k`, `n=2048`, the same order as `dprob`'s.
+Under `deterministic=True` the kernel instead writes one slot per `(absolute M-block, n)`,
+which has exactly one writer, and the reduction sums those per expert. Groups are padded to a
+multiple of `m_aligned`, so no M-block straddles two experts and each expert owns a contiguous
+block range `[padded_offsets[e-1] / cta_tile_m, padded_offsets[e] / cta_tile_m)`. The workspace
+is `ceil_div(valid_m, cta_tile_m) × n_out` **bf16** — 2 MiB at `valid_m=64k`, `n=2048`.
 
-The segment sum is a one-hot matmul rather than `index_add_`/`scatter_add_`, which are
+The slots stay bf16 deliberately. Reproducibility comes from the single writer and the
+fixed-order reduction, not from a wider accumulator, so fp32 slots would double the memory and
+split one packed `bf16x2` store into two scalar ones for no determinism benefit. Accuracy still
+improves over the default: there each M-tile's atomic rounds the *running* sum, here each slot
+rounds once and the segment matmul accumulates them in fp32.
+
+That segment sum is a one-hot matmul rather than `index_add_`/`scatter_add_`, which are
 themselves non-deterministic on CUDA, and rather than a per-expert slice, which would need
-`padded_offsets` on the host — a sync in the training loop. Keeping fp32 partials and narrowing
-to bf16 once at the end also makes this path **more accurate** than the default, which rounds
-on every M-tile.
+`padded_offsets` on the host — a sync in the training loop.
 
-`dbias_tensor` keeps its `(expert_cnt, n_out, 1)` bf16 shape either way. The class API is lower
-level: under `deterministic=True`, `sample_dbias` / `dbias_tensor` must be the
-`(ceil_div(valid_m, cta_tile_m), n_out, 1)` **float32** workspace, and the caller does the
-per-expert reduction itself.
+**The output arguments are identical in both modes.** `dprob` is `(valid_m, 1, 1)` float32 and
+`dbias` is `(expert_cnt, n_out, 1)` bf16 whether or not the flag is set. What the flag adds is
+scratch, and only for the class API: `sample_dprob_workspace` / `dprob_workspace_tensor` and
+`sample_dbias_workspace` / `dbias_workspace_tensor`, sized by `dprob_workspace_shape(valid_m, n)`
+and `dbias_workspace_shape(valid_m, n)`, reduced afterwards by `reduce_dprob_workspace` and
+`reduce_dbias_workspace`. Use those rather than reducing by hand — a plain sum over dim 0 of the
+dbias slots is wrong, and wrong quietly. The wrapper allocates and reduces both for you.
 
 `check_support()` rejects `deterministic=True` with `m_aligned % (cta_tile_m × cluster_m) != 0`:
 the slot index is only single-writer if the scheduler emits no M-tile past an expert's range,

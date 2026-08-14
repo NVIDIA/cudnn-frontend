@@ -737,6 +737,109 @@ def test_grouped_gemm_dsrelu_deterministic_dbias(request):
 
 
 @pytest.mark.L0
+@torch_fork_set_rng(seed=67)
+def test_grouped_gemm_dsrelu_deterministic_class_api(request):
+    """The class API under determinism: same output args as the default, plus explicit scratch.
+
+    Every other determinism test drives the wrapper, which hides the workspaces. This is the only
+    coverage of the contract a direct GroupedGemmDsreluSm100 caller sees -- that dprob and dbias
+    keep their shapes and dtypes, that the scratch is a separate argument sized by the public
+    helpers, and that the public reductions turn it into the documented outputs.
+    """
+    try:
+        import cudnn  # noqa: F401
+        from cuda.bindings import driver as cuda
+        from cudnn import GroupedGemmDsreluSm100
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn optional dependencies not installed")
+
+    args = (torch.float8_e4m3fn, torch.bfloat16, torch.float8_e4m3fn, 32, torch.float8_e8m0fnu, False, True)
+    case = _build_dsrelu_case(request, *args, group_m_override=[256, 512, 256, 1024])
+    inputs, cfg = case
+
+    # The wrapper run is the oracle: same inputs, so the class must reproduce it exactly.
+    try:
+        expected = _run_dsrelu_case(case, deterministic=True, generate_dbias=True)
+    except (ValueError, NotImplementedError) as e:
+        pytest.skip(f"Unsupported testcase: {e}")
+    torch.cuda.synchronize()
+
+    valid_m, n, l = inputs["a_tensor"].shape[0], cfg["n"], cfg["l"]
+    dev = inputs["a_tensor"].device
+    dprob = torch.zeros((valid_m, 1, 1), dtype=torch.float32, device=dev)
+    dbias = torch.zeros((l, n, 1), dtype=torch.bfloat16, device=dev)
+    dprob_ws = torch.zeros(GroupedGemmDsreluSm100.dprob_workspace_shape(valid_m, n), dtype=torch.float32, device=dev)
+    dbias_ws = torch.zeros(GroupedGemmDsreluSm100.dbias_workspace_shape(valid_m, n), dtype=torch.bfloat16, device=dev)
+
+    # The output args are byte-for-byte the ones the non-deterministic path takes.
+    assert dprob.shape == expected["dprob_tensor"].shape and dprob.dtype == expected["dprob_tensor"].dtype
+    assert dbias.shape == expected["dbias_tensor"].shape and dbias.dtype == expected["dbias_tensor"].dtype
+
+    d_row = torch.empty_strided((valid_m, n, 1), (n, 1, valid_m * n), dtype=cfg["d_dtype"], device=dev)
+    d_col = torch.empty_strided((valid_m, n, 1), (n, 1, valid_m * n), dtype=cfg["d_dtype"], device=dev)
+    op = GroupedGemmDsreluSm100(
+        sample_a=inputs["a_tensor"],
+        sample_b=inputs["b_tensor"],
+        sample_c=inputs["c_tensor"],
+        sample_d_row=d_row,
+        sample_d_col=d_col,
+        sample_sfa=inputs["sfa_tensor"],
+        sample_sfb=inputs["sfb_tensor"],
+        sample_padded_offsets=inputs["padded_offsets_tensor"],
+        sample_alpha=inputs["alpha_tensor"],
+        sample_prob=inputs["prob_tensor"],
+        sample_dprob=dprob,
+        sample_dbias=dbias,
+        sample_dprob_workspace=dprob_ws,
+        sample_dbias_workspace=dbias_ws,
+        sample_sfd_row=expected["sfd_row_tensor"],
+        sample_sfd_col=expected["sfd_col_tensor"],
+        sample_norm_const=inputs.get("norm_const_tensor"),
+        acc_dtype=cfg["acc_dtype"],
+        mma_tiler_mn=cfg["mma_tiler_mn"],
+        cluster_shape_mn=cfg["cluster_shape_mn"],
+        sf_vec_size=cfg["sf_vec_size"],
+        vector_f32=cfg["vector_f32"],
+        m_aligned=cfg["m_aligned"],
+        discrete_col_sfd=cfg["discrete_col_sfd"],
+        deterministic=True,
+    )
+    try:
+        assert op.check_support()
+    except (ValueError, NotImplementedError) as e:
+        pytest.skip(f"Unsupported testcase: {e}")
+    op.compile()
+
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    op.execute(
+        a_tensor=inputs["a_tensor"],
+        b_tensor=inputs["b_tensor"],
+        c_tensor=inputs["c_tensor"],
+        d_row_tensor=d_row,
+        d_col_tensor=d_col,
+        sfa_tensor=inputs["sfa_tensor"],
+        sfb_tensor=inputs["sfb_tensor"],
+        padded_offsets=inputs["padded_offsets_tensor"],
+        alpha_tensor=inputs["alpha_tensor"],
+        prob_tensor=inputs["prob_tensor"],
+        dprob_tensor=dprob,
+        dbias_tensor=dbias,
+        dprob_workspace_tensor=dprob_ws,
+        dbias_workspace_tensor=dbias_ws,
+        sfd_row_tensor=expected["sfd_row_tensor"],
+        sfd_col_tensor=expected["sfd_col_tensor"],
+        norm_const_tensor=inputs.get("norm_const_tensor"),
+        current_stream=stream,
+    )
+    GroupedGemmDsreluSm100.reduce_dprob_workspace(dprob_ws, dprob, stream)
+    dbias.copy_(GroupedGemmDsreluSm100.reduce_dbias_workspace(dbias_ws, inputs["padded_offsets_tensor"], cfg["mma_tiler_mn"], stream))
+    torch.cuda.synchronize()
+
+    assert torch.equal(bitwise_bits(dprob), bitwise_bits(expected["dprob_tensor"])), "class API dprob differs from the wrapper"
+    assert torch.equal(bitwise_bits(dbias), bitwise_bits(expected["dbias_tensor"])), "class API dbias differs from the wrapper"
+
+
+@pytest.mark.L0
 @torch_fork_set_rng(seed=59)
 def test_grouped_gemm_dsrelu_deterministic_dbias_cache_is_m_dynamic(request, monkeypatch):
     """Deterministic dbias must not add token-count dependence to the compile cache key.

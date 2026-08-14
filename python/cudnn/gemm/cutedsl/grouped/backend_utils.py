@@ -15,23 +15,6 @@ class GroupedGemmBackend(str, Enum):
     BLOCK_SCALED = "block_scaled"
 
 
-def _resolve_torch_stream(handle: int, device: torch.device):
-    """The torch stream object for a raw CUDA stream handle.
-
-    Prefers torch's own current/default stream objects when the handle matches one of them, so
-    the common case does not mint an ExternalStream per call.
-    """
-    import torch
-
-    torch_current = torch.cuda.current_stream(device)
-    if handle == torch_current.cuda_stream:
-        return torch_current
-    torch_default = torch.cuda.default_stream(device)
-    if handle == torch_default.cuda_stream:
-        return torch_default
-    return torch.cuda.ExternalStream(handle, device=device)
-
-
 @contextmanager
 def _torch_stream_context(current_stream: Optional[cuda.CUstream], device: torch.device) -> Iterator[None]:
     """Run PyTorch work on the CUDA stream used for the kernel launch.
@@ -44,7 +27,16 @@ def _torch_stream_context(current_stream: Optional[cuda.CUstream], device: torch
     if current_stream is None:
         yield
         return
-    with torch.cuda.stream(_resolve_torch_stream(int(current_stream), device)):
+    handle = int(current_stream)
+    torch_current = torch.cuda.current_stream(device)
+    torch_default = torch.cuda.default_stream(device)
+    if handle == torch_current.cuda_stream:
+        launch_stream = torch_current
+    elif handle == torch_default.cuda_stream:
+        launch_stream = torch_default
+    else:
+        launch_stream = torch.cuda.ExternalStream(handle, device=device)
+    with torch.cuda.stream(launch_stream):
         yield
 
 
@@ -64,9 +56,11 @@ def _record_streams(current_stream: Optional[cuda.CUstream], device: torch.devic
     import torch
 
     handle = int(current_stream)
-    if handle == torch.cuda.current_stream(device).cuda_stream:
+    torch_current = torch.cuda.current_stream(device)
+    if handle == torch_current.cuda_stream:
         return
-    consumer = _resolve_torch_stream(handle, device)
+    torch_default = torch.cuda.default_stream(device)
+    consumer = torch_default if handle == torch_default.cuda_stream else torch.cuda.ExternalStream(handle, device=device)
     for tensor in tensors:
         if tensor is not None:
             tensor.record_stream(consumer)

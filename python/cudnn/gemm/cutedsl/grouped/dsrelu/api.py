@@ -99,30 +99,25 @@ def _cta_tile_m(mma_tiler_mn: Tuple[int, int]) -> int:
     return mma_tiler_mn[0] // (2 if mma_tiler_mn[0] == 256 else 1)
 
 
-def _reduce_dprob_slots(
-    dprob_tensor: torch.Tensor,
-    caller_dprob_tensor: Optional[torch.Tensor],
-    deterministic: bool,
-    current_stream: Optional[cuda.CUstream],
-) -> torch.Tensor:
-    """Collapse the per-N-tile dprob slots back to the caller's ``(valid_m, 1, 1)`` shape.
+def _reduce_dprob_slots(dprob_workspace, dprob_tensor, current_stream):
+    """Collapse the per-N-tile dprob slots into the caller's ``(valid_m, 1, 1)`` output.
 
-    A no-op unless deterministic, where the fixed summation order is what makes the result
-    reproducible, unlike the kernel's cross-CTA atomics. Every token owns the same number of
-    slots, so this is a plain sum over dim 1 -- no segment structure, unlike dbias. Accumulates
-    onto a caller-supplied buffer, matching what the atomic does on the non-deterministic path.
+    ``dprob_workspace`` is None whenever the kernel wrote dprob directly -- the non-deterministic
+    path -- and then there is nothing to collapse. Every token owns the same number of slots, so
+    this is a plain sum over dim 1; dbias needs a segment sum instead. Accumulates onto the
+    output, matching what the atomic does on the non-deterministic path.
 
     Issued on ``current_stream``, the stream execute() ran the kernel on. On torch's current
-    stream instead, a caller who passes a different stream would have the reduction read
-    dprob_tensor before the kernel finished writing it.
+    stream instead, a caller who passes a different stream would have the reduction read the
+    workspace before the kernel finished writing it.
     """
-    if not deterministic:
+    if dprob_workspace is None:
         return dprob_tensor
     import torch
 
-    with _torch_stream_context(current_stream, dprob_tensor.device):
-        reduced = torch.sum(dprob_tensor, dim=1, keepdim=True)
-        return reduced if caller_dprob_tensor is None else caller_dprob_tensor.add_(reduced)
+    with _torch_stream_context(current_stream, dprob_workspace.device):
+        reduced = torch.sum(dprob_workspace, dim=1, keepdim=True)
+        return reduced if dprob_tensor is None else dprob_tensor.add_(reduced)
 
 
 def _reduce_dbias_slots(dbias_workspace, dbias_tensor, current_stream, padded_offsets, cta_tile_m):
@@ -137,9 +132,6 @@ def _reduce_dbias_slots(dbias_workspace, dbias_tensor, current_stream, padded_of
     need ``padded_offsets`` on the host -- a sync in the training loop. A cumsum-and-subtract
     would be deterministic too but cancels catastrophically across experts of different
     magnitude. Comparing in token space rather than block space saves the division.
-
-    fp32 throughout, narrowed once at the end: strictly more accurate than the default path,
-    which rounds to bf16 on every M-tile.
     """
     if dbias_workspace is None:
         return dbias_tensor
@@ -149,8 +141,11 @@ def _reduce_dbias_slots(dbias_workspace, dbias_tensor, current_stream, padded_of
     with _torch_stream_context(current_stream, dbias_workspace.device):
         block_tok = torch.arange(0, m_blocks * cta_tile_m, cta_tile_m, device=dbias_workspace.device, dtype=padded_offsets.dtype).unsqueeze(0)
         starts = torch.cat((padded_offsets.new_zeros(1), padded_offsets[:-1])).unsqueeze(1)
-        onehot = ((block_tok >= starts) & (block_tok < padded_offsets.unsqueeze(1))).to(torch.float32)
-        return (onehot @ dbias_workspace.reshape(m_blocks, n_out)).reshape(-1, n_out, 1).to(torch.bfloat16)
+        # Built in the workspace dtype so the matmul is a straight bf16 GEMM: cuBLAS accumulates
+        # it in fp32 internally and rounds once, which is still better than the default path
+        # rounding on every M-tile, at half the memory and one store instead of two.
+        onehot = ((block_tok >= starts) & (block_tok < padded_offsets.unsqueeze(1))).to(dbias_workspace.dtype)
+        return (onehot @ dbias_workspace.reshape(m_blocks, n_out)).reshape(-1, n_out, 1)
 
 
 def _reinterpret_raw_grouped_fp4_tensor(tensor: torch.Tensor) -> torch.Tensor:
@@ -217,6 +212,8 @@ class GroupedGemmDsreluSm100(APIBase):
         sample_prob: Optional[torch.Tensor] = None,
         sample_dprob: Optional[torch.Tensor] = None,
         sample_dbias: Optional[torch.Tensor] = None,
+        sample_dprob_workspace: Optional[torch.Tensor] = None,
+        sample_dbias_workspace: Optional[torch.Tensor] = None,
         # Discrete mode -- provide these instead:
         num_experts: Optional[int] = None,
         b_shape: Optional[Tuple[int, ...]] = None,
@@ -253,9 +250,11 @@ class GroupedGemmDsreluSm100(APIBase):
         :param sample_dprob: Gradient of probability tensor (valid_m, 1, 1), must be zero-initialized
         :param sample_b: (Dense) Sample B tensor (n, k, l)
         :param sample_sfb: (Dense) Sample scale factor B tensor
-        :param sample_dbias: Optional dbias output tensor (expert_cnt, n, 1) bfloat16 -- but under
-            ``deterministic`` the kernel writes one fp32 slot per (CTA M-tile, n) instead, so pass
-            ``(ceil_div(valid_m, cta_tile_m), n, 1)`` float32 and reduce it per expert yourself
+        :param sample_dbias: Optional dbias output tensor (expert_cnt, n, 1) bfloat16, in both modes
+        :param sample_dprob_workspace: Determinism scratch, required iff ``deterministic``:
+            ``dprob_workspace_shape(valid_m)``, float32
+        :param sample_dbias_workspace: Determinism scratch, required iff ``deterministic`` and
+            ``sample_dbias``: ``dbias_workspace_shape(valid_m, n)``, bfloat16
         :param num_experts: (Discrete) Number of experts
         :param b_shape: (Discrete) Shape of a single expert B tensor, e.g. (n, k)
         :param b_dtype: (Discrete) Data type of B tensors
@@ -273,12 +272,11 @@ class GroupedGemmDsreluSm100(APIBase):
         :param b_major: Major dimension for B tensor, one of "k" or "n"
         :param use_dynamic_sched: Enable dynamic tile scheduling for load balancing
         :param use_dsrelu_reuse: Reuse relu(C)^2 between d_srelu and dprob
-        :param deterministic: Compute dprob and dbias run-to-run bit-exactly. Both outputs then
-            arrive as slot workspaces the caller reduces after execute(): sample_dprob carries one
-            slot per N-tile (see _dprob_n_slots) and reduces over dim 1, sample_dbias one fp32 slot
-            per absolute M-block and reduces per expert over the ranges padded_offsets marks off (a
-            plain sum will not do -- see the segment sum in _reduce_dbias_slots).
-            grouped_gemm_dsrelu_wrapper_sm100 does all of this for you and returns the usual shapes
+        :param deterministic: Compute dprob and dbias run-to-run bit-exactly. dprob and dbias keep
+            their shapes and dtypes; what the flag adds is the two scratch tensors above, which the
+            kernel writes instead, and a reduction the caller runs after execute():
+            ``reduce_dprob_workspace`` and ``reduce_dbias_workspace``.
+            grouped_gemm_dsrelu_wrapper_sm100 allocates and reduces both for you
         """
         framework = detect_framework(sample_a)
         if sample_a is not None and framework not in ("torch", "jax"):
@@ -332,6 +330,10 @@ class GroupedGemmDsreluSm100(APIBase):
         self.prob_desc = self._make_tensor_desc(sample_prob, name="sample_prob", canonical=True)
         self.dprob_desc = self._make_tensor_desc(sample_dprob, name="sample_dprob", canonical=True)
         self.dbias_desc = self._make_tensor_desc(sample_dbias, name="sample_dbias", canonical=True)
+        # Determinism scratch, kept out of the output descriptors so dprob/dbias mean the same
+        # thing in both modes. The kernel writes whichever of the pair is active.
+        self.dprob_workspace_desc = self._make_tensor_desc(sample_dprob_workspace, name="sample_dprob_workspace", canonical=True)
+        self.dbias_workspace_desc = self._make_tensor_desc(sample_dbias_workspace, name="sample_dbias_workspace", canonical=True)
 
         self.sfd_row_desc = self._make_tensor_desc(sample_sfd_row, name="sample_sfd_row", canonical=True)
         self.sfd_col_desc = self._make_tensor_desc(sample_sfd_col, name="sample_sfd_col", canonical=True)
@@ -437,21 +439,56 @@ class GroupedGemmDsreluSm100(APIBase):
             extra_error_msg=f"{name} in the physical (L, MN', K', 32, 4, 4) form must be C-contiguous",
         )
 
+    @staticmethod
+    def dprob_workspace_shape(valid_m: int, n: int, mma_tiler_mn: Tuple[int, int] = (256, 256), cluster_shape_mn: Optional[Tuple[int, int]] = None):
+        """Shape of ``sample_dprob_workspace`` -- one fp32 slot per (token, N-tile)."""
+        return (valid_m, _dprob_n_slots(n, mma_tiler_mn, cluster_shape_mn, True), 1)
+
+    @staticmethod
+    def dbias_workspace_shape(valid_m: int, n: int, mma_tiler_mn: Tuple[int, int] = (256, 256)):
+        """Shape of ``sample_dbias_workspace`` -- one bf16 slot per (CTA M-block, n)."""
+        return (ceil_div(valid_m, _cta_tile_m(mma_tiler_mn)), n, 1)
+
+    @staticmethod
+    def reduce_dprob_workspace(dprob_workspace, dprob_tensor=None, current_stream=None):
+        """Collapse the dprob slots into ``(valid_m, 1, 1)``; accumulates onto dprob_tensor if given."""
+        return _reduce_dprob_slots(dprob_workspace, dprob_tensor, current_stream)
+
+    @staticmethod
+    def reduce_dbias_workspace(dbias_workspace, padded_offsets, mma_tiler_mn: Tuple[int, int] = (256, 256), current_stream=None):
+        """Segment-sum the dbias slots per expert into ``(expert_cnt, n, 1)``.
+
+        Public because a plain sum over dim 0 is wrong here and gets it wrong quietly: the slots
+        have to be grouped by the expert ranges ``padded_offsets`` marks off.
+        """
+        return _reduce_dbias_slots(dbias_workspace, None, current_stream, padded_offsets, _cta_tile_m(mma_tiler_mn))
+
+    @property
+    def _kernel_dprob_desc(self):
+        """The dprob descriptor the kernel writes: the per-N-tile scratch under determinism."""
+        return self.dprob_workspace_desc if self.deterministic else self.dprob_desc
+
+    @property
+    def _kernel_dbias_desc(self):
+        """The dbias descriptor the kernel writes: the M-block scratch under determinism."""
+        return self.dbias_workspace_desc if self.deterministic and self.dbias_desc is not None else self.dbias_desc
+
     def _make_dbias_fake(self):
         """Fake dbias tensor for compilation.
 
-        Deterministic dbias is indexed by M-block, so dim 0 scales with the token count and has
-        to stay symbolic -- baked static it would bind the compiled kernel to one valid_m and
-        silently reuse it for another, the trap _dprob_n_slots documents for dprob's slot extent.
+        The determinism scratch is indexed by M-block, so its dim 0 scales with the token count
+        and has to stay symbolic -- baked static it would bind the compiled kernel to one valid_m
+        and silently reuse it for another, the trap _dprob_n_slots documents for dprob's slots.
         Divisibility 2 because valid_m is a multiple of m_aligned (256) and a block is
-        cta_tile_m (128) rows. The default (expert, n, 1) layout has no token-dependent extent.
+        cta_tile_m (128) rows. The (expert, n, 1) output has no token-dependent extent.
         """
-        if self.dbias_desc is None or not self.deterministic:
-            return self._make_fake_cute_tensor_from_desc(self.dbias_desc, assumed_align=16)
+        desc = self._kernel_dbias_desc
+        if desc is None or not self.deterministic:
+            return self._make_fake_cute_tensor_from_desc(desc, assumed_align=16)
         return self._make_fake_cute_compact_tensor(
-            dtype=self.dbias_desc.dtype,
-            shape=self.dbias_desc.shape,
-            stride_order=self.dbias_desc.stride_order,
+            dtype=desc.dtype,
+            shape=desc.shape,
+            stride_order=desc.stride_order,
             dynamic_mode=0,
             divisibility=2,
         )
@@ -510,13 +547,14 @@ class GroupedGemmDsreluSm100(APIBase):
 
         self._check_tensor_shape(self.alpha_desc, (self.expert_cnt,), "alpha")
         self._check_tensor_shape(self.prob_desc, (tensor_m, 1, 1), "prob")
-        dprob_slots = _dprob_n_slots(n_out, self.mma_tiler_mn, self.cluster_shape_mn, self.deterministic)
-        self._check_tensor_shape(self.dprob_desc, (tensor_m, dprob_slots, 1), "dprob")
-        # Deterministic dbias is a different tensor, not an extra dimension on the same one --
-        # dprob could keep its shape because its slot axis is orthogonal to its output axis,
-        # dbias's is not. One fp32 slot per (CTA M-tile, n), reduced per expert after execute().
-        dbias_rows = ceil_div(tensor_m, self.cta_tile_m) if self.deterministic else self.expert_cnt
-        self._check_tensor_shape(self.dbias_desc, (dbias_rows, n_out, 1), "dbias")
+        self._check_tensor_shape(self.dprob_desc, (tensor_m, 1, 1), "dprob")
+        self._check_tensor_shape(self.dbias_desc, (self.expert_cnt, n_out, 1), "dbias")
+        # The determinism scratch. Separate tensors rather than a reshaped dprob/dbias, so the
+        # output contract does not depend on the flag; the kernel writes these instead.
+        self._check_tensor_shape(
+            self.dprob_workspace_desc, (tensor_m, _dprob_n_slots(n_out, self.mma_tiler_mn, self.cluster_shape_mn, True), 1), "dprob_workspace"
+        )
+        self._check_tensor_shape(self.dbias_workspace_desc, (ceil_div(tensor_m, self.cta_tile_m), n_out, 1), "dbias_workspace")
         self._check_tensor_shape(self.amax_desc, (self.expert_cnt, 1), "amax")
         self._check_tensor_shape(self.norm_const_desc, (1,), "norm_const")
         self._check_tensor_shape(self.padded_offsets_desc, (self.expert_cnt,), "padded_offsets")
@@ -637,12 +675,11 @@ class GroupedGemmDsreluSm100(APIBase):
             name="Dprob",
             extra_error_msg="Dprob must be float32",
         )
-        self._check_dtype(
-            self.dbias_desc,
-            dtype=cutlass.Float32 if self.deterministic else cutlass.BFloat16,
-            name="Dbias",
-            extra_error_msg="dbias must be float32 when deterministic=True" if self.deterministic else "dbias must be bfloat16",
-        )
+        self._check_dtype(self.dbias_desc, dtype=cutlass.BFloat16, name="Dbias", extra_error_msg="dbias must be bfloat16")
+        # Scratch matches the output it stands in for: the slots only need a single writer and a
+        # fixed-order reduction to be reproducible, not a wider accumulator.
+        self._check_dtype(self.dprob_workspace_desc, dtype=cutlass.Float32, name="Dprob workspace", extra_error_msg="dprob workspace must be float32")
+        self._check_dtype(self.dbias_workspace_desc, dtype=cutlass.BFloat16, name="Dbias workspace", extra_error_msg="dbias workspace must be bfloat16")
         self.c_dtype = self._check_dtype(
             self.c_desc,
             dtype=[cutlass.Float32, cutlass.Float16, cutlass.BFloat16, cutlass.Float8E4M3FN, cutlass.Float8E5M2],
@@ -796,6 +833,20 @@ class GroupedGemmDsreluSm100(APIBase):
             f"expert_cnt must be <= 1024, got {self.expert_cnt}",
         )
 
+        # ---- Determinism scratch must be present exactly when the flag is on ----
+        self._value_error_if(
+            self.deterministic and self.dprob_workspace_desc is None,
+            "deterministic=True requires sample_dprob_workspace of shape dprob_workspace_shape(valid_m, n), float32",
+        )
+        self._value_error_if(
+            self.deterministic and self.dbias_desc is not None and self.dbias_workspace_desc is None,
+            "deterministic=True with dbias requires sample_dbias_workspace of shape dbias_workspace_shape(valid_m, n), bfloat16",
+        )
+        self._value_error_if(
+            not self.deterministic and (self.dprob_workspace_desc is not None or self.dbias_workspace_desc is not None),
+            "the determinism workspaces are only used when deterministic=True",
+        )
+
         # ---- Disabled configurations ----
         # Deterministic dbias keys its workspace by absolute M-block,
         # token_offset // cta_tile_m + tile_m_idx, which is single-writer only if the scheduler
@@ -939,9 +990,9 @@ class GroupedGemmDsreluSm100(APIBase):
                 stride_order=self.prob_desc.stride_order,
             )
             dprob_cute_fake = self._make_fake_cute_compact_tensor(
-                dtype=self.dprob_desc.dtype,
-                shape=(valid_m, *self.dprob_desc.shape[1:]),
-                stride_order=self.dprob_desc.stride_order,
+                dtype=self._kernel_dprob_desc.dtype,
+                shape=(valid_m, *self._kernel_dprob_desc.shape[1:]),
+                stride_order=self._kernel_dprob_desc.stride_order,
             )
 
             sfd_row_fake = None
@@ -1055,9 +1106,9 @@ class GroupedGemmDsreluSm100(APIBase):
                 stride=self.prob_desc.stride,
             )
             dprob_cute_fake = self._make_fake_cute_tensor(
-                dtype=self.dprob_desc.dtype,
-                shape=(valid_m, *self.dprob_desc.shape[1:]),
-                stride=self.dprob_desc.stride,
+                dtype=self._kernel_dprob_desc.dtype,
+                shape=(valid_m, *self._kernel_dprob_desc.shape[1:]),
+                stride=self._kernel_dprob_desc.stride,
             )
 
             sfd_row_fake = None
@@ -1308,9 +1359,9 @@ class GroupedGemmDsreluSm100(APIBase):
             assumed_align=16,
         )
         dprob_tensor = self._make_fake_cute_tensor(
-            dtype=self.dprob_desc.dtype,
-            shape=(valid_m, *self.dprob_desc.shape[1:]),
-            stride=self.dprob_desc.stride,
+            dtype=self._kernel_dprob_desc.dtype,
+            shape=(valid_m, *self._kernel_dprob_desc.shape[1:]),
+            stride=self._kernel_dprob_desc.stride,
             assumed_align=16,
         )
         dbias_tensor = self._make_dbias_fake()
@@ -1437,6 +1488,9 @@ class GroupedGemmDsreluSm100(APIBase):
         b_tensor: Optional[torch.Tensor] = None,
         sfb_tensor: Optional[torch.Tensor] = None,
         dbias_tensor: Optional[torch.Tensor] = None,
+        # Determinism scratch, required iff the op was built with deterministic=True:
+        dprob_workspace_tensor: Optional[torch.Tensor] = None,
+        dbias_workspace_tensor: Optional[torch.Tensor] = None,
         # Discrete mode:
         b_ptrs: Optional[torch.Tensor] = None,
         sfb_ptrs: Optional[torch.Tensor] = None,
@@ -1466,6 +1520,8 @@ class GroupedGemmDsreluSm100(APIBase):
         :param b_tensor: (Dense) Input B tensor (weights)
         :param sfb_tensor: (Dense) Scale factor B
         :param dbias_tensor: Optional dbias output tensor.
+        :param dprob_workspace_tensor: Determinism scratch, required iff deterministic=True
+        :param dbias_workspace_tensor: Determinism scratch, required iff deterministic=True and dbias
         :param b_ptrs: (Discrete) 1-D int64 device tensor of per-expert B data pointers
         :param sfb_ptrs: (Discrete) 1-D int64 device tensor of per-expert SFB data pointers
         :param sfd_row_tensor: Optional row scale factor D
@@ -1494,6 +1550,19 @@ class GroupedGemmDsreluSm100(APIBase):
                 dbias_tensor is None,
                 "dbias_tensor is required when GroupedGemmDsreluSm100 is configured with sample_dbias",
             )
+        # Under determinism the kernel fills the scratch and the caller reduces it into
+        # dprob/dbias afterwards; dprob_tensor/dbias_tensor are otherwise written directly.
+        if self.deterministic:
+            self._value_error_if(
+                dprob_workspace_tensor is None,
+                "dprob_workspace_tensor is required when the op was built with deterministic=True",
+            )
+            self._value_error_if(
+                self._has_dbias and dbias_workspace_tensor is None,
+                "dbias_workspace_tensor is required when the op was built with deterministic=True and sample_dbias",
+            )
+            dprob_tensor = dprob_workspace_tensor
+            dbias_tensor = dbias_workspace_tensor if self._has_dbias else dbias_tensor
 
         if self.weight_mode == MoEWeightMode.DENSE:
             self._compiled_kernel(
@@ -1625,11 +1694,10 @@ def grouped_gemm_dsrelu_wrapper_sm100(
         use_dynamic_sched: Enable dynamic tile scheduling for load balancing
         use_dsrelu_reuse: Reuse relu(C)^2 between d_srelu and dprob
         deterministic: Make dprob and dbias bit-exact run to run; raises NotImplementedError
-            for any framework other than torch. ``dprob_tensor`` keeps its
-            ``(valid_m, 1, 1)`` shape either way -- the extra per-N-tile workspace and the
-            fixed-order reduction into it are internal. ``None`` (default) follows
-            ``torch.use_deterministic_algorithms``. See docs/fe-oss-apis/gemm_fusions/
-            grouped_gemm_dsrelu.md#deterministic-dprob.
+            for any framework other than torch. Every returned tensor keeps its usual shape and
+            dtype -- the slot workspaces and the fixed-order reductions into them are internal to
+            this wrapper. ``None`` (default) follows ``torch.use_deterministic_algorithms``.
+            See docs/fe-oss-apis/gemm_fusions/grouped_gemm_dsrelu.md#deterministic-dprob.
         current_stream: CUDA stream
 
     Returns:
@@ -1722,24 +1790,31 @@ def grouped_gemm_dsrelu_wrapper_sm100(
     # single writer; the reduction back to (valid_m, 1, 1) happens after execute(). Resolved
     # here, with the other arguments, so `deterministic` is a plain bool from this point on.
     if deterministic is None:
-        # Follows torch's process-wide flag. jax has no equivalent global, so there the opt-in
-        # has to be explicit rather than inherited -- and `torch` is not even bound on that path.
-        deterministic = framework == "torch" and torch.are_deterministic_algorithms_enabled()
+        # Follows torch's process-wide flag. jax has no equivalent global, so there the opt-in has
+        # to be explicit rather than inherited. Written as a nested branch, not
+        # `framework == "torch" and torch...`: `torch` is only bound by the conditional import
+        # above, so that form is one operand-reorder away from a NameError under jax.
+        deterministic = False
+        if framework == "torch":
+            deterministic = torch.are_deterministic_algorithms_enabled()
     if deterministic and framework != "torch":
         # The slot reductions below are torch ops on torch streams. Rather than half-support it,
         # say so: a caller who asked for reproducibility should not get it silently unenforced.
         raise NotImplementedError(f"deterministic=True is only implemented for the torch framework, got {framework}")
     dprob_n_slots = _dprob_n_slots(n_out, mma_tiler_mn, cluster_shape_mn, deterministic)
     cta_tile_m = _cta_tile_m(mma_tiler_mn)
-    # None when we allocate it ourselves, in which case the reduction can write the result
-    # straight out instead of adding it onto a buffer we just zeroed.
-    caller_dprob_tensor = dprob_tensor
-    if dprob_tensor is None or deterministic:
+    if dprob_tensor is None:
         if framework == "torch":
             with _torch_stream_context(current_stream, a_tensor.device):
-                dprob_tensor = torch.zeros((valid_m, dprob_n_slots, 1), dtype=torch.float32, device=a_tensor.device)
+                dprob_tensor = torch.zeros((valid_m, 1, 1), dtype=torch.float32, device=a_tensor.device)
         else:
-            dprob_tensor = _jax_alloc(lambda: jnp.zeros((valid_m, dprob_n_slots, 1), dtype=jnp.float32, device=a_tensor.device))
+            dprob_tensor = _jax_alloc(lambda: jnp.zeros((valid_m, 1, 1), dtype=jnp.float32, device=a_tensor.device))
+    # Determinism scratch, allocated here so the wrapper's own signature does not change with
+    # the flag. torch-only, rejected for jax above.
+    dprob_workspace = None
+    if deterministic:
+        with _torch_stream_context(current_stream, a_tensor.device):
+            dprob_workspace = torch.zeros((valid_m, dprob_n_slots, 1), dtype=torch.float32, device=a_tensor.device)
 
     if _convert_to_cutlass_data_type(a_tensor.dtype) in (
         cutlass.Float8E4M3FN,
@@ -1775,18 +1850,15 @@ def grouped_gemm_dsrelu_wrapper_sm100(
         else:
             amax_tensor = _jax_alloc(lambda: jnp.full((l, 1), float("-inf"), dtype=jnp.float32, device=a_tensor.device))
     # Deterministic dbias is a separate buffer, not a reshaped one: the kernel writes fp32
-    # per-(M-block, n) slots and _reduce_dbias_slots turns those into the bf16 (expert, n)
-    # output. The default path instead has the kernel atomic-accumulate straight into that
-    # output, so there it has to exist and be zeroed up front. dbias_kernel_tensor is what
-    # execute() writes; dbias_tensor is what comes back.
+    # dbias keeps its (expert, n, 1) bf16 shape in both modes; under determinism the kernel fills
+    # the M-block scratch instead and _reduce_dbias_slots segment-sums it into this tensor.
     dbias_workspace = None
     if generate_dbias:
-        if deterministic:  # torch-only, rejected for jax above
-            with _torch_stream_context(current_stream, a_tensor.device):
-                dbias_workspace = torch.zeros((ceil_div(valid_m, cta_tile_m), n_out, 1), dtype=torch.float32, device=a_tensor.device)
-        elif framework == "torch":
+        if framework == "torch":
             with _torch_stream_context(current_stream, a_tensor.device):
                 dbias_tensor = torch.zeros((l, n_out, 1), dtype=torch.bfloat16, device=a_tensor.device)
+                if deterministic:
+                    dbias_workspace = torch.zeros((ceil_div(valid_m, cta_tile_m), n_out, 1), dtype=torch.bfloat16, device=a_tensor.device)
         else:
             dbias_tensor = _jax_alloc(lambda: jnp.zeros((l, n_out, 1), dtype=framework_dtype(cutlass.BFloat16, "jax"), device=a_tensor.device))
     dbias_kernel_tensor = dbias_workspace if dbias_workspace is not None else dbias_tensor
@@ -1806,7 +1878,7 @@ def grouped_gemm_dsrelu_wrapper_sm100(
             d_srelu_tensor=d_srelu_tensor,
             # Reduced here too, so a zero-token call returns the documented (valid_m, 1, 1)
             # shape rather than leaking the slot dimension.
-            dprob_tensor=_reduce_dprob_slots(dprob_tensor, caller_dprob_tensor, deterministic, current_stream),
+            dprob_tensor=_reduce_dprob_slots(dprob_workspace, dprob_tensor, current_stream),
             dbias_tensor=_reduce_dbias_slots(dbias_workspace, dbias_tensor, current_stream, padded_offsets, cta_tile_m),
             amax_tensor=amax_tensor,
             sfd_row_tensor=sfd_row_tensor,
@@ -1873,6 +1945,8 @@ def grouped_gemm_dsrelu_wrapper_sm100(
         if deterministic and dbias_kernel_tensor is not None
         else tensor_signature(dbias_kernel_tensor)
     )
+    # The kernel writes the scratch under determinism, so that is what the key has to describe.
+    dprob_kernel_tensor = dprob_workspace if dprob_workspace is not None else dprob_tensor
 
     use_full_dynamic = is_dense and os.environ.get("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", "1") != "0"
 
@@ -1896,7 +1970,11 @@ def grouped_gemm_dsrelu_wrapper_sm100(
             ),
             *tensor_signature(alpha_tensor),
             *(dynamic_m_tensor_signature(prob_tensor, (1, 1)) if not use_full_dynamic else dynamic_tensor_signature(prob_tensor)),
-            *(dynamic_m_tensor_signature(dprob_tensor, tuple(dprob_tensor.shape[1:])) if not use_full_dynamic else dynamic_tensor_signature(dprob_tensor)),
+            *(
+                dynamic_m_tensor_signature(dprob_kernel_tensor, tuple(dprob_kernel_tensor.shape[1:]))
+                if not use_full_dynamic
+                else dynamic_tensor_signature(dprob_kernel_tensor)
+            ),
             # Explicit, because the signature above does not carry it under use_full_dynamic:
             # that path drops the shape entirely, yet the slot count is baked into the
             # compiled descriptor. n_out=512 and n_out=513 give 2 and 3 slots with identical
@@ -1936,7 +2014,7 @@ def grouped_gemm_dsrelu_wrapper_sm100(
             *dynamic_m_sf_signature(sfa_tensor),
             *tensor_signature(alpha_tensor),
             *dynamic_m_tensor_signature(prob_tensor, (1, 1)),
-            *dynamic_m_tensor_signature(dprob_tensor, tuple(dprob_tensor.shape[1:])),
+            *dynamic_m_tensor_signature(dprob_kernel_tensor, tuple(dprob_kernel_tensor.shape[1:])),
             *dbias_signature,
             *dynamic_m_tensor_signature(d_srelu_tensor, (n_out, 1), dynamic_stride_dims=(2,)),
             *dynamic_sfd_col_tensor_signature(sfd_col_d_srelu_tensor),
@@ -1978,7 +2056,9 @@ def grouped_gemm_dsrelu_wrapper_sm100(
                 sample_alpha=alpha_tensor,
                 sample_prob=prob_tensor,
                 sample_dprob=dprob_tensor,
-                sample_dbias=dbias_kernel_tensor,
+                sample_dbias=dbias_tensor,
+                sample_dprob_workspace=dprob_workspace,
+                sample_dbias_workspace=dbias_workspace,
                 sample_b=b_tensor,
                 sample_sfb=sfb_tensor,
                 sample_sfd_row=sfd_row_tensor,
@@ -2009,7 +2089,9 @@ def grouped_gemm_dsrelu_wrapper_sm100(
                 sample_alpha=alpha_tensor,
                 sample_prob=prob_tensor,
                 sample_dprob=dprob_tensor,
-                sample_dbias=dbias_kernel_tensor,
+                sample_dbias=dbias_tensor,
+                sample_dprob_workspace=dprob_workspace,
+                sample_dbias_workspace=dbias_workspace,
                 num_experts=num_experts,
                 b_shape=b_shape,
                 b_dtype=b_dtype,
@@ -2049,7 +2131,9 @@ def grouped_gemm_dsrelu_wrapper_sm100(
             alpha_tensor=alpha_tensor,
             prob_tensor=prob_tensor,
             dprob_tensor=dprob_tensor,
-            dbias_tensor=dbias_kernel_tensor,
+            dbias_tensor=dbias_tensor,
+            dprob_workspace_tensor=dprob_workspace,
+            dbias_workspace_tensor=dbias_workspace,
             b_tensor=b_tensor,
             sfb_tensor=sfb_tensor,
             sfd_row_tensor=sfd_row_tensor,
@@ -2071,7 +2155,9 @@ def grouped_gemm_dsrelu_wrapper_sm100(
             alpha_tensor=alpha_tensor,
             prob_tensor=prob_tensor,
             dprob_tensor=dprob_tensor,
-            dbias_tensor=dbias_kernel_tensor,
+            dbias_tensor=dbias_tensor,
+            dprob_workspace_tensor=dprob_workspace,
+            dbias_workspace_tensor=dbias_workspace,
             b_ptrs=b_ptrs,
             sfb_ptrs=sfb_ptrs,
             sfd_row_tensor=sfd_row_tensor,
@@ -2086,7 +2172,7 @@ def grouped_gemm_dsrelu_wrapper_sm100(
         d_row_tensor=d_row_tensor,
         d_col_tensor=d_col_tensor,
         d_srelu_tensor=d_srelu_tensor,
-        dprob_tensor=_reduce_dprob_slots(dprob_tensor, caller_dprob_tensor, deterministic, current_stream),
+        dprob_tensor=_reduce_dprob_slots(dprob_workspace, dprob_tensor, current_stream),
         dbias_tensor=_reduce_dbias_slots(dbias_workspace, dbias_tensor, current_stream, padded_offsets, cta_tile_m),
         amax_tensor=amax_tensor,
         sfd_row_tensor=sfd_row_tensor,

@@ -1043,6 +1043,12 @@ class BlockScaledMoEGroupedGemmQuantBwdKernel:
     ) -> None:
         """Sum dA across M within this subtile and atomic-add to dbias[dbias_row_idx, n].
 
+        ``dbias_row_idx`` is the expert normally, or -- under ``deterministic`` -- this CTA's
+        absolute M-block, which gives every ``(M-block, n)`` pair a single writer so the caller
+        can reduce per expert in a fixed order afterwards. Only the row differs: the slots stay
+        bf16, so both modes issue the same packed store. Determinism comes from the single writer
+        and the fixed-order reduction, not from a wider accumulator.
+
         Adapted from moe_blockscaled_grouped_gemm_dglu_dbias.py's dbias_reduction,
         which handled two interleaved vectors (d1, d2). Here we have a single
         vector dA, so 16 lanes handle the 32 N columns (2 cols each via bf16x2).
@@ -1119,29 +1125,10 @@ class BlockScaledMoEGroupedGemmQuantBwdKernel:
                     cta_sum_a = cta_sum_a + rDst_w[0]
                     cta_sum_b = cta_sum_b + rDst_w[1]
                 if n_offset < dbias_n_total:
-                    self.dbias_store(dbias_gmem_2d, dbias_row_idx, n_offset, cta_sum_a, cta_sum_b)
+                    atomic_add_bf16x2(dbias_gmem_2d[(dbias_row_idx, n_offset, None)].iterator.llvm_ptr, cta_sum_a, cta_sum_b)
         else:
             if lane_idx < 16 and n_offset < dbias_n_total:
-                self.dbias_store(dbias_gmem_2d, dbias_row_idx, n_offset, sum_a, sum_b)
-
-    @cute.jit
-    def dbias_store(self, dbias_gmem_2d, row_idx, n_offset, val_a, val_b) -> None:
-        """Commit one thread's two N columns of dbias.
-
-        Deterministic: the row is this CTA's own M-block, so the slot has exactly one writer and
-        the adds are uncontended. fp32 rather than bf16 because narrowing once after the
-        per-expert reduction loses less than rounding on every tile; that costs two scalar
-        atomics here where the default packs both columns into one. A plain vector store would
-        do -- the atomic buys nothing once the slot is single-writer -- but that is left for a
-        change that can be measured on hardware.
-
-        Default: every M-tile of the expert accumulates into the same address.
-        """
-        if cutlass.const_expr(self.deterministic):
-            _ = atomic_add_float32(ptr=dbias_gmem_2d[(row_idx, n_offset, None)].iterator.llvm_ptr, value=val_a)
-            _ = atomic_add_float32(ptr=dbias_gmem_2d[(row_idx, n_offset + 1, None)].iterator.llvm_ptr, value=val_b)
-        else:
-            atomic_add_bf16x2(dbias_gmem_2d[(row_idx, n_offset, None)].iterator.llvm_ptr, val_a, val_b)
+                atomic_add_bf16x2(dbias_gmem_2d[(dbias_row_idx, n_offset, None)].iterator.llvm_ptr, sum_a, sum_b)
 
     @cute.jit
     def quant_sfd_row(self, tile_idx, tiled_copy_r2s, src, pvscale, norm_const, rcp_limit, tRSrD):
