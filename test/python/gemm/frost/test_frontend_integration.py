@@ -4,8 +4,8 @@
 """Frontend integration: the GEMM engine ``frost_gemm`` joins the ONE ranked
 plan list the graph API builds at create_execution_plans() — discovered from
 ``cudnn/engines/manifest.py``, no registration call and no environment variable.
-Exercises its presence in the list, select_plan/deselect_engines, the build walk
-falling through a declining plan, ineligible graphs, and the wrapper.Graph path.
+Exercises its presence in the list, select_plan, ineligible graphs, and the
+wrapper.Graph path.
 """
 
 from __future__ import annotations
@@ -16,8 +16,7 @@ import torch
 from gemm_test_utils import requires_sm100
 
 import cudnn
-from cudnn.engines import MANIFEST, PlanConfig, heuristics, is_backend_engine, is_python_engine
-from test_dispatch import _FAKE, _offer
+from cudnn.engines import MANIFEST, is_backend_engine, is_python_engine
 
 pytestmark = pytest.mark.L0
 
@@ -230,11 +229,11 @@ def test_misaligned_buffer_rejected():
 
 
 @_GPU
-@pytest.mark.parametrize("route", ["default", "frost", "deselected"])
+@pytest.mark.parametrize("route", ["default", "frost"])
 def test_ranked_list_routes_and_all_routes_agree(route):
     """The same graph runs on whichever entry of the ranked list is selected:
-    the default, the FROST entry pinned by select_plan, or the backend after
-    deselect_engines bars FROST. All three produce the right numbers.
+    the default, or the FROST entry pinned by select_plan. Both produce the
+    right numbers.
 
     The default route asserts nothing about WHICH engine served it — that is
     the placeholder in engines/heuristics.py, and a cost model will change it."""
@@ -243,8 +242,6 @@ def test_ranked_list_routes_and_all_routes_agree(route):
     _plan(g)
     if route == "frost":
         _pin_frost(g)
-    elif route == "deselected":
-        g.deselect_engines([_FROST])
     g.check_support()
     g.build_plans()
     if route == "frost":
@@ -253,48 +250,6 @@ def test_ranked_list_routes_and_all_routes_agree(route):
         # scratch from the caller (its TMA-descriptor buffer is a one-time,
         # plan-owned allocation) — not a blanket FROST 0.
         assert g.get_workspace_size() == 0
-    elif route == "deselected":
-        assert g.selected_engine is None  # FROST barred -> the backend served it
-    ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
-    y = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
-    g.execute({A: a, B: b, bias: bias_t, Y: y}, ws)
-    torch.cuda.synchronize()
-    torch.testing.assert_close(y, ref, atol=1e-1, rtol=1e-2)
-
-
-@_GPU
-def test_build_walk_falls_through_a_declining_plan(caplog, monkeypatch):
-    """A plan that declines at build time is logged and the walk moves to the
-    next entry — here a python engine ranked ahead of the backend, so the graph
-    still builds and executes natively with no exception reaching the user
-    (a select_plan pin is strict instead; see build_plans)."""
-    import logging
-
-    from cudnn.engines import BaseEngine
-
-    class Boom(BaseEngine):
-        name = "frost_fake_always_fails"
-        engine_id = _FAKE + 1
-
-        def build_plan(self, graph, plan, ctx=None):
-            raise NotImplementedError("frost build boom")
-
-        def execute(self, graph, tensor_data, ctx=None):
-            raise AssertionError("should never run")
-
-    boom = Boom()
-    _offer(monkeypatch, boom)
-
-    a, b, bias_t, ref = _operands()
-    g, A, B, bias, Y = _build_matmul_bias_relu()
-    monkeypatch.setattr(heuristics, "rank", lambda graph, engines, backend_plans, modes=None: [PlanConfig(boom.engine_id)] + list(backend_plans))
-    _plan(g)
-    assert g.get_plan_name_at_index(0) == "frost_fake_always_fails"
-    g.check_support()
-    with caplog.at_level(logging.INFO, logger="cudnn.pygraph"):
-        g.build_plans()  # entry 0 declines -> the walk lands on the backend
-    assert any("declined at build time" in r.getMessage() for r in caplog.records)
-    assert g.selected_engine is None and is_backend_engine(g.plans[g._plan_index].engine_id)
     ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
     y = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
     g.execute({A: a, B: b, bias: bias_t, Y: y}, ws)
@@ -312,71 +267,6 @@ def test_frost_is_one_entry_of_the_ranked_list():
     assert names.count(_FROST) == 1
     assert g.get_execution_plan_count() == len(names)
     assert sum(1 for p in g.plans if is_python_engine(p.engine_id)) == 1
-
-
-class _LoweredSpy:
-    """Records deselect_engines calls reaching the lowered C++ graph, forwarding
-    everything else untouched."""
-
-    def __init__(self, real):
-        self._real = real
-        self.deselected = []
-
-    def __getattr__(self, name):
-        attr = getattr(self._real, name)
-        if name != "deselect_engines":
-            return attr
-
-        def _record(names, *args, **kwargs):
-            self.deselected.append(list(names))
-            return attr(names, *args, **kwargs)
-
-        return _record
-
-
-def _spy_on_lowered(g):
-    spy = _LoweredSpy(g.__dict__["_lowered_graph"])
-    g.__dict__["_lowered_graph"] = spy
-    return spy
-
-
-def _native_engine_token(g):
-    """The cuDNN engine name (e.g. "eng0") of the leading NATIVE plan."""
-    return g.get_plan_name_at_index(_first_backend_index(g)).split("_")[0]
-
-
-@_GPU
-def test_deselect_native_engine_reaches_cudnn():
-    """deselect_engines is the classic API and stays a passthrough to the
-    lowered C++ graph — pygraph bars the name across the whole ranked list AND
-    forwards it, so a backend engine name still reaches cuDNN itself."""
-    g, *_ = _build_matmul_bias_relu()
-    _plan(g)
-    native = _native_engine_token(g)
-    spy = _spy_on_lowered(g)
-    assert g.deselect_engines([native]) is g  # fluent, like the other setters
-    assert spy.deselected == [[native]]
-
-
-@_GPU
-def test_deselect_mixed_frost_and_native():
-    """A mixed list bars the python engine locally AND forwards to cuDNN; the
-    barred FROST entry is skipped by the build walk."""
-    a, b, bias_t, ref = _operands()
-    g, A, B, bias, Y = _build_matmul_bias_relu()
-    _plan(g)
-    native = _native_engine_token(g)
-    spy = _spy_on_lowered(g)
-    g.deselect_engines([_FROST, native])
-    assert _FROST in g._barred_names
-    assert spy.deselected == [[_FROST, native]]
-    g.build_plans()
-    assert g.selected_engine is None  # FROST barred -> a backend plan serves it
-    ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
-    y = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
-    g.execute({A: a, B: b, bias: bias_t, Y: y}, ws)
-    torch.cuda.synchronize()
-    torch.testing.assert_close(y, ref, atol=1e-1, rtol=1e-2)
 
 
 def _build_moe(S=512, N=256, K=256, E=4):

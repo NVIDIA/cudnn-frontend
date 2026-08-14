@@ -19,10 +19,14 @@ import pytest
 import torch
 
 from gemm_test_utils import (
+    requires_int8_mma,
     requires_sm100,
     Plan as _plan,
     vp as _vp,
     resolve as _resolve,
+    e5m3_quant_ref as _e5m3_quant_ref,
+    e5m3_to_float as _e5m3_to_float,
+    requires_sm107,
 )
 
 # Module-wide GPU gate — every test here is end-to-end and needs a B200.
@@ -33,10 +37,6 @@ import cudnn
 import cudnn.gemm.frost  # noqa: F401  — installs the cudnn.pygraph recorder hook
 from cudnn.gemm.frost.compiler import _current_arch, _epi_vec_bytes
 from cudnn.gemm.frost.tile_config import CATALOG, by_name
-
-# INT8 matmul runs only on SM 100 or SM 110 (disjoint range).
-_INT8_SM_RANGES = ((100, 101), (110, 111))
-
 
 _TORCH_DTYPE = {
     "bf16": torch.bfloat16,
@@ -904,6 +904,12 @@ def _col_quant_reference(
     blocks = x.view(B, M // block_size, block_size, N)
     output_max = 448.0 if out_dtype is torch.float8_e4m3fn else 57344.0
     scale_f = blocks.abs().amax(dim=2) / output_max
+    if scale_dtype == "e5m3":
+        scale = _e5m3_quant_ref(scale_f)
+        back = _e5m3_to_float(scale.to(torch.int32))
+        inv = torch.where(back > 0, back.reciprocal(), 0.0)
+        q = (blocks * inv.unsqueeze(2)).clamp(-output_max, output_max)
+        return q.to(out_dtype).view(B, M, N), scale
     if scale_dtype is torch.float8_e8m0fnu:
         safe = torch.where(scale_f > 0, scale_f, 1.0)
         scale_f = torch.where(
@@ -975,6 +981,40 @@ def test_dense_col_block_scale_quant(config_name) -> None:
     ref_sw = ref_mm * torch.sigmoid(ref_mm)
     q_ref, scale_ref = _col_quant_reference(ref_sw, block_size, torch.float8_e4m3fn, torch.float8_e8m0fnu)
     torch.testing.assert_close(q_scale.float(), scale_ref.float(), atol=0, rtol=0)
+    torch.testing.assert_close(q.float(), q_ref.float(), atol=0, rtol=0)
+
+
+@requires_sm107
+@pytest.mark.parametrize("block_size", [16, 32])
+def test_dense_col_quant_e5m3_scale(block_size) -> None:
+    """COL block quantize with an E5M3 scale. This path keeps the scale in a
+    per-lane register (`_scale_mine_*`) before storing, so it exercises the
+    zero-init + assignment + store of the byte carrier that row quant does not."""
+    cfg, cta_group, scheduler = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    M, N, K = 256, 128, 128
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    A = g.tensor(name="A", dim=[1, M, K], stride=_a_stride_batched(M, K, "k"))
+    B = g.tensor(name="B", dim=[1, K, N], stride=_b_stride_batched(N, K, "k"))
+    C = g.matmul(A=A, B=B, name="mm")
+    S = g.swish(input=C, name="sw")
+    Q, QS = g.block_scale_quantize(input=S, block_size=block_size, axis=1, name="q")
+    Q.set_output(True).set_data_type(cudnn.data_type.FP8_E4M3)
+    QS.set_dim([1, M // block_size, N]).set_stride([M // block_size * N, N, 1])
+    QS.set_output(True).set_data_type(cudnn.data_type.FP8_E5M3)
+
+    compiled = _plan(g, config=cfg, cta_group=cta_group, scheduler=scheduler)
+    assert compiled.chain.quants[0].axis == 1 and compiled.chain.quants[0].scale_dtype == "fp8_e5m3"
+
+    a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
+    q = torch.empty(1, M, N, dtype=torch.float8_e4m3fn, device="cuda")
+    q_scale = torch.empty(1, M // block_size, N, dtype=torch.int8, device="cuda")
+    compiled(_vp(compiled, a, b, [q, q_scale]))
+    torch.cuda.synchronize()
+
+    ref_mm = torch.einsum("bmk,bnk->bmn", a.to(torch.float32), b.to(torch.float32))
+    ref_sw = ref_mm * torch.sigmoid(ref_mm)
+    q_ref, scale_ref = _col_quant_reference(ref_sw, block_size, torch.float8_e4m3fn, "e5m3")
+    torch.testing.assert_close(q_scale.view(torch.uint8).float(), scale_ref.float(), atol=0, rtol=0)
     torch.testing.assert_close(q.float(), q_ref.float(), atol=0, rtol=0)
 
 
@@ -2023,14 +2063,12 @@ _INT8_OUT_DTYPES = {
 }
 
 
+@requires_int8_mma
 @pytest.mark.parametrize("config_name", _INT8_CONFIGS, ids=[_config_id(n) for n in _INT8_CONFIGS])
 @pytest.mark.parametrize("out_dt", list(_INT8_OUT_DTYPES))
 def test_int8_matmul(config_name: str, out_dt: str) -> None:
     """INT8×INT8→INT32, output ∈ {fp32,bf16,fp16,int32,fp8}; bit-exact vs a
     rounded integer reference (values small enough that the rounding is exact)."""
-    sm = _current_arch()
-    if sm is not None and not any(lo <= sm < hi for lo, hi in _INT8_SM_RANGES):
-        pytest.skip(f"int8 matmul unsupported on sm_{sm} (SM 100/110 only)")
     cfg, cta_group, scheduler = _resolve(config_name)
     M = N = K = 256
     cudnn_dt, torch_dt, vmax = _INT8_OUT_DTYPES[out_dt]

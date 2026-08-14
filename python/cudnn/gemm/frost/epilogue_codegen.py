@@ -832,6 +832,43 @@ def _quant_output_min(dtype: Dtype) -> str:
     raise ValueError(f"block quantize output dtype {dtype!r} is not supported by codegen")
 
 
+def _scale_store_dtype(scale_dtype: Dtype) -> str:
+    """The DSL type a quantized scale is STORED as — one source of truth for the
+    scale tap's element type, its zero-init, and the value written. E5M3 has no
+    DSL float type and a raw_ptr store to a Uint8 tensor is rejected, so it rides
+    the Int8 byte carrier (the same one packed FP4 data uses)."""
+    return "cutlass.Int8" if scale_dtype == "fp8_e5m3" else DTYPE_TO_CUTLASS[scale_dtype]
+
+
+def _emit_scale_quantize(p: str, sfx: str, src: str, scale_var: str, back_var: str, quant: BlockQuantizeSpec) -> list[str]:
+    """Quantize one fp32 scale to ``quant.scale_dtype`` and read the STORED
+    value back as fp32 — the data is divided by what was actually written, not
+    by the pre-rounding scale, so a dequantize reproduces it exactly.
+
+    E4M3 round-trips through the DSL ``.to()``. The other two reach the cvt unit
+    through the helpers :func:`compiler._quant_device_imports` emits (which
+    documents why their ``.to()`` is not usable), and read the byte back as
+    ``byte << 23`` for ue8m0 — a bare exponent, so that IS the fp32, and byte 0
+    is 0.0 — or through the paired widening helper for ue5m3."""
+    scale_dtype = _scale_store_dtype(quant.scale_dtype)
+    if quant.scale_dtype == "fp8_e8m0":
+        return [
+            f"{p}_qb{sfx} = _frost_cvt_f32_to_e8m0_bits({src})",
+            f"{scale_var} = (({p}_qb{sfx}).to(cutlass.Int8)).bitcast({scale_dtype})",
+            f"{back_var} = ({p}_qb{sfx} << 23).bitcast(cutlass.Float32)",
+        ]
+    if quant.scale_dtype == "fp8_e5m3":
+        return [
+            f"{p}_qb{sfx} = _frost_cvt_f32_to_e5m3_bits({src})",
+            f"{scale_var} = ({p}_qb{sfx}).to({scale_dtype})",
+            f"{back_var} = _frost_e5m3_bits_to_f32({p}_qb{sfx})",
+        ]
+    return [
+        f"{scale_var} = ({src}).to({scale_dtype})",
+        f"{back_var} = ({scale_var}).to(cutlass.Float32)",
+    ]
+
+
 def _emit_block_quant_col(
     quant: BlockQuantizeSpec,
     quant_idx: int,
@@ -849,7 +886,7 @@ def _emit_block_quant_col(
     stores the scale byte(s) of column(s) ``col_j + k*G + l % G``. The
     compiler gates the row guards to be reduction-uniform."""
     p = f"_q{quant_idx}"
-    scale_dtype = DTYPE_TO_CUTLASS[quant.scale_dtype]
+    scale_dtype = _scale_store_dtype(quant.scale_dtype)
     G = 16 if quant.block_size == 16 else 32
     if vsize % G != 0:
         raise NotImplementedError(
@@ -889,24 +926,7 @@ def _emit_block_quant_col(
                 lines.append(f'{p}_a{i} = cute.arch.warp_redux_sync({p}_src[{i}], "fmax", abs=True)')
         for i in cols:
             lines.append(f"{p}_s{i} = {p}_a{i} * {p}_rl")
-            if quant.scale_dtype == "fp8_e8m0":
-                # HW cvt (rp/satfinite) instead of the ~9-instruction emulated
-                # .to(E8M0); the widened value only feeds rcp, so byte<<23
-                # (0.0 for byte 0 -> rcp inf -> FLT_MAX clamp) is equivalent.
-                lines.extend(
-                    [
-                        f"{p}_qb{i} = _frost_cvt_f32_to_e8m0_bits({p}_s{i})",
-                        f"{p}_q{i} = (({p}_qb{i}).to(cutlass.Int8)).bitcast({scale_dtype})",
-                        f"{p}_u{i} = ({p}_qb{i} << 23).bitcast(cutlass.Float32)",
-                    ]
-                )
-            else:
-                lines.extend(
-                    [
-                        f"{p}_q{i} = ({p}_s{i}).to({scale_dtype})",
-                        f"{p}_u{i} = ({p}_q{i}).to(cutlass.Float32)",
-                    ]
-                )
+            lines.extend(_emit_scale_quantize(p, str(i), f"{p}_s{i}", f"{p}_q{i}", f"{p}_u{i}", quant))
             lines.extend(
                 [
                     f"{p}_i{i} = cute.math.min(cute.arch.rcp_approx({p}_u{i}), cutlass.Float32(3.402823466e38))",
@@ -993,7 +1013,6 @@ def _emit_block_quant(
     if vsize % bs != 0:
         raise NotImplementedError(f"row block-quantize: store vector {vsize} must be a multiple of block_size {bs}")
     n_sub = vsize // bs
-    scale_dtype = DTYPE_TO_CUTLASS[quant.scale_dtype]
     lines: list[str] = [
         f"{p}_src = ({source_var}).to(cutlass.Float32)",
         f"{p}_abs = cute.math.abs({p}_src)",
@@ -1006,21 +1025,7 @@ def _emit_block_quant(
         for e in range(1, bs):
             lines.append(f"{p}_amax{k} = cute.math.max({p}_amax{k}, {p}_abs[{base + e}])")
         lines.append(f"{p}_sf{k} = {p}_amax{k} * {p}_rl")
-        if quant.scale_dtype == "fp8_e8m0":
-            lines.extend(
-                [
-                    f"{p}_qb{k} = _frost_cvt_f32_to_e8m0_bits({p}_sf{k})",
-                    f"{p}_scale{k} = (({p}_qb{k}).to(cutlass.Int8)).bitcast({scale_dtype})",
-                    f"{p}_up{k} = ({p}_qb{k} << 23).bitcast(cutlass.Float32)",
-                ]
-            )
-        else:
-            lines.extend(
-                [
-                    f"{p}_scale{k} = ({p}_sf{k}).to({scale_dtype})",
-                    f"{p}_up{k} = ({p}_scale{k}).to(cutlass.Float32)",
-                ]
-            )
+        lines.extend(_emit_scale_quantize(p, str(k), f"{p}_sf{k}", f"{p}_scale{k}", f"{p}_up{k}", quant))
         lines.append(f"{p}_inv{k} = cute.math.min(cute.arch.rcp_approx({p}_up{k}), cutlass.Float32(3.402823466e38))")
         for e in range(bs):
             lines.append(f"{p}_out[{base + e}] = {p}_src[{base + e}] * {p}_inv{k}")
@@ -1322,7 +1327,11 @@ def generate(
     # a false claim for reduction / quant-scale / M-major taps.
     _out_reqs = _output_align_reqs(chain, use_tma_store, vec_bytes=vec_bytes_epi)
     for i, tap in enumerate(taps):
-        _fake_dt = "cutlass.Int8" if (not tap.is_reduction and not tap.is_quant_scale and tap.dtype == "fp4_e2m1") else DTYPE_TO_CUTLASS[tap.dtype]
+        # Byte-carrier taps: packed FP4 data, and an E5M3 scale (the DSL has no
+        # E5M3 float type, and a raw_ptr store to a Uint8 tensor is rejected —
+        # Int8 is the 8-bit carrier this package already uses for FP4).
+        _fp4_data_tap = not tap.is_reduction and not tap.is_quant_scale and tap.dtype == "fp4_e2m1"
+        _fake_dt = "cutlass.Int8" if _fp4_data_tap else _scale_store_dtype(tap.dtype) if tap.is_quant_scale else DTYPE_TO_CUTLASS[tap.dtype]
         # Every tap is consumed as a raw pointer (gC_tap_i_ptr) plus explicit
         # out_/red_/quant_scale_stride_* scalars, so the only genuine layout
         # contract is stride_n == 1 on an N-major DENSE tap (_dense_store_offset).

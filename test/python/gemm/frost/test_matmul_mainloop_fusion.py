@@ -15,6 +15,7 @@ import pytest
 import torch
 
 from gemm_test_utils import (
+    requires_int8_mma,
     requires_sm100,
     Plan as _plan,
     vp as _vp,
@@ -302,6 +303,7 @@ def test_e2e_mainloop_fp16(cfg) -> None:
     ],
 )
 @requires_sm100
+@requires_int8_mma
 def test_e2e_mainloop_int8(op, cfg) -> None:
     """INT8 mainloop fusion: f(int8 A) @ int8 B → int32 acc → fp32 out.
     Exercises the integer idesc + int32→fp32 widen; bit-exact vs int reference."""

@@ -25,6 +25,17 @@ from functools import lru_cache
 from typing import Callable
 
 import cutlass.experimental.primitives as nvvm
+from cudnn.gemm.frost.kernel_templates._tile_helpers import (
+    copy_tensormap_to_workspace as _copy_tensormap_to_workspace,
+    epi_subtile_spans as _epi_subtile_spans,
+    fence_tensormap_acquire as _fence_tensormap_acquire,
+    fence_tensormap_release as _fence_tensormap_release,
+    moe_group_at as _moe_group_at,
+    moe_swizzle_tile as _moe_swizzle_tile,
+    replace_tensormap_global_address as _replace_tensormap_global_address,
+    replace_tensormap_global_dim_1 as _replace_tensormap_global_dim_1,
+    TENSOR_MAP_QWORDS,
+)
 import cutlass.experimental.cuda.tensor_map as _tma
 import cutlass
 import cutlass.cute as cute
@@ -33,56 +44,6 @@ from cutlass.cute.runtime import make_fake_stream
 from cuda.bindings import driver as _cuda
 
 # A TMA tensormap is 128 bytes = 16 int64 qwords.
-_TENSOR_MAP_QWORDS = 16
-
-
-@cute.jit
-def _copy_tensormap_to_workspace(src_desc_ptr, dst_i64_ptr) -> None:
-    """Copy the 128-byte A tensormap (``src_desc_ptr``) into ``dst_i64_ptr``."""
-    src_words = cute.make_ptr(cutlass.Int64, src_desc_ptr.toint(), mem_space=cute.AddressSpace.generic)
-    for i in cutlass.range(_TENSOR_MAP_QWORDS, unroll_full=True):
-        dst_i64_ptr.subview(i).store((src_words + i).load())
-
-
-@cute.jit
-def _replace_tensormap_global_address(desc_ptr, new_address) -> None:
-    nvvm.tensormap_replace(
-        nvvm.TensormapField.GLOBAL_ADDRESS,
-        desc_ptr,
-        new_value=cutlass.Int64(new_address),
-    )
-
-
-@cute.jit
-def _replace_tensormap_global_dim_1(desc_ptr, new_dim) -> None:
-    nvvm.tensormap_replace(
-        nvvm.TensormapField.GLOBAL_DIM,
-        desc_ptr,
-        new_value=cutlass.Int32(new_dim),
-        ord=1,
-    )
-
-
-@cute.jit
-def _fence_tensormap_release() -> None:
-    nvvm.fence_proxy_release(
-        nvvm.MemScope.GPU,
-        from_proxy=nvvm.Proxy.GENERIC,
-        to_proxy=nvvm.Proxy.TENSORMAP,
-    )
-
-
-@cute.jit
-def _fence_tensormap_acquire(desc_ptr) -> None:
-    nvvm.fence_proxy_acquire(
-        nvvm.MemScope.GPU,
-        desc_ptr,
-        _TENSOR_MAP_QWORDS * 8,
-        from_proxy=nvvm.Proxy.GENERIC,
-        to_proxy=nvvm.Proxy.TENSORMAP,
-    )
-
-
 # @@INJECT_TILE_CONSTANTS@@
 
 
@@ -106,21 +67,6 @@ TMEM_ALLOC_BARRIER_ID = 2
 
 
 @cute.jit
-def _moe_group_at(visit_idx, num_groups, num_experts):
-    """Visitation index -> routed group index.
-
-    ``num_groups == num_experts`` (or a non-multiple) walks groups in order. Batched MoE
-    (``num_groups == B * num_experts``) walks expert-major -- the B groups sharing expert
-    ``g % E`` become consecutive, so the expert weight is fetched once instead of B times.
-    """
-    per_expert = num_groups // cutlass.max(num_experts, cutlass.Int32(1))
-    group = visit_idx
-    if per_expert > 1 and per_expert * num_experts == num_groups:
-        group = (visit_idx % per_expert) * num_experts + (visit_idx // per_expert)
-    return group
-
-
-@cute.jit
 def _moe_auto_swizzle_w(group_rows, n, k, nt_n):
     """N-super-block width for one routed group, resolved per group.
 
@@ -138,32 +84,6 @@ def _moe_auto_swizzle_w(group_rows, n, k, nt_n):
     if cutlass.min(rows, n) * row_bytes <= budget and rows <= n:
         w = cutlass.Int64(1)
     return cutlass.Int32(w)
-
-
-def _moe_swizzle_tile(t, nt_m, nt_n, swizzle_w):
-    """Group-local linear tile index -> (m, n) under an N-super-block walk.
-    ``swizzle_w == nt_n`` reproduces the plain n-fast split; ``1`` gives m-fast.
-    """
-    blk = cutlass.max(nt_m * swizzle_w, cutlass.Int32(1))
-    sb = t // blk
-    off = t - sb * blk
-    base_n = sb * swizzle_w
-    cur_S = cutlass.min(cutlass.Int32(swizzle_w), nt_n - base_n)
-    tile_m = off // cur_S
-    tile_n = base_n + off - tile_m * cur_S
-    return tile_m, tile_n
-
-
-def _epi_subtile_spans(cols):
-    spans = []
-    off = 0
-    while off < cols:
-        w = 32
-        while w > cols - off:
-            w //= 2
-        spans.append((off, w))
-        off += w
-    return spans
 
 
 @cute.kernel
@@ -281,7 +201,7 @@ def _kernel(
     tma_a_desc_smem_list = [
         cutlass.Array(
             cutlass.Int64,
-            _TENSOR_MAP_QWORDS,
+            TENSOR_MAP_QWORDS,
             space=cutlass.AddressSpace.smem,
             alignment=128,
         )
@@ -481,7 +401,7 @@ def _kernel(
 
         lane = tidx % 32
         block_linear = bidx + bidy * gridx
-        cta_desc_base_list = [a_tma_workspace.iterator.raw_ptr() + (block_linear * num_a_operands + _ai) * _TENSOR_MAP_QWORDS for _ai in range(num_a_operands)]
+        cta_desc_base_list = [a_tma_workspace.iterator.raw_ptr() + (block_linear * num_a_operands + _ai) * TENSOR_MAP_QWORDS for _ai in range(num_a_operands)]
         a_desc_tma_ptr_list = [
             cute.make_ptr(
                 cutlass.Int64,
@@ -531,7 +451,7 @@ def _kernel(
                             _replace_tensormap_global_address(tma_a_desc_smem_list[_ai], row_base.toint())
                             _replace_tensormap_global_dim_1(tma_a_desc_smem_list[_ai], group_end - group_begin)
                         nvvm.bar_warp_sync(0xFFFFFFFF)
-                        if lane < _TENSOR_MAP_QWORDS:
+                        if lane < TENSOR_MAP_QWORDS:
                             (cta_desc_base_list[_ai] + lane).store((tma_a_desc_smem_list[_ai].subview(lane)).load())
                         nvvm.bar_warp_sync(0xFFFFFFFF)
                         _fence_tensormap_release()
@@ -626,7 +546,12 @@ def _kernel(
     ab_empty_arrive_mask = cutlass.Int16(a_part | b_part)
     if warp_idx == mma_warp_id:
         nvvm.setmaxregister(prod_reg_count, nvvm.SetMaxRegisterAction.DECREASE)
-        nvvm.tcgen05_alloc(tmem_ptr_i32, num_tmem_alloc_cols, group=nvvm.CTAGroup.CTA_2)
+        nvvm.tcgen05_alloc(
+            tmem_ptr_i32,
+            cutlass.Int32(num_tmem_alloc_cols),
+            is_exclusive=tmem_alloc_exclusive,
+            group=nvvm.CTAGroup.CTA_2,
+        )
         nvvm.bar_warp_sync(0xFFFFFFFF)
         nvvm.barrier_cta_arrive(barrier_id=TMEM_ALLOC_BARRIER_ID, thread_count=tmem_alloc_bar_count)
         tmem_raw_addr = tmem_ptr_i32.load()
@@ -774,7 +699,12 @@ def _kernel(
                 pass
             nvvm.mbarrier_arrive(peer_mbar, scope=nvvm.MemScope.CLUSTER, relaxed=True)
             alloc_ptr = cutlass.inttoptr(tmem_raw_addr, 6, cutlass.Int32)
-            nvvm.tcgen05_dealloc(alloc_ptr, num_tmem_alloc_cols, group=nvvm.CTAGroup.CTA_2)
+            nvvm.tcgen05_dealloc(
+                alloc_ptr,
+                cutlass.Int32(num_tmem_alloc_cols),
+                is_exclusive=tmem_alloc_exclusive,
+                group=nvvm.CTAGroup.CTA_2,
+            )
         else:
             is_valid = cutlass.Int32(1)
             sched_stage = cutlass.Int32(0)
@@ -804,7 +734,12 @@ def _kernel(
             while not nvvm.mbarrier_try_wait_parity(tmem_dealloc_mbar_ptr, 0, time_limit=10_000_000):
                 pass
             alloc_ptr = cutlass.inttoptr(tmem_raw_addr, 6, cutlass.Int32)
-            nvvm.tcgen05_dealloc(alloc_ptr, num_tmem_alloc_cols, group=nvvm.CTAGroup.CTA_2)
+            nvvm.tcgen05_dealloc(
+                alloc_ptr,
+                cutlass.Int32(num_tmem_alloc_cols),
+                is_exclusive=tmem_alloc_exclusive,
+                group=nvvm.CTAGroup.CTA_2,
+            )
 
     if warp_idx < num_epilogue_warps:
         nvvm.setmaxregister(epi_reg_count, nvvm.SetMaxRegisterAction.INCREASE)

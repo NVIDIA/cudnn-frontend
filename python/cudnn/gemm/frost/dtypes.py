@@ -25,6 +25,11 @@ DTYPE_TO_CUTLASS: dict[Dtype, str] = {
     "fp8_e4m3": "cutlass.Float8E4M3FN",
     "fp8_e5m2": "cutlass.Float8E5M2",
     "fp8_e8m0": "cutlass.Float8E8M0FNU",
+    # E5M3 only ever appears as a scale factor, which the kernel takes as a base
+    # pointer — the format lives in the MMA descriptor, not the tensor type. So
+    # it rides an opaque byte (cutlass.FloatNV8E5M3FNU exists but TVM-FFI cannot
+    # marshal it, and torch has no E5M3 dtype for the runtime buffer either).
+    "fp8_e5m3": "cutlass.Uint8",
     "fp4_e2m1": "cutlass.Float4E2M1FNx2",
     "uint8": "cutlass.Uint8",
     "int32": "cutlass.Int32",
@@ -40,6 +45,7 @@ DTYPE_BYTES: dict[Dtype, int] = {
     "fp8_e4m3": 1,
     "fp8_e5m2": 1,
     "fp8_e8m0": 1,
+    "fp8_e5m3": 1,
     "fp4_e2m1": 1,
     "uint8": 1,
     "int32": 4,
@@ -49,6 +55,29 @@ DTYPE_BYTES: dict[Dtype, int] = {
 # Element width in BITS. Only sub-byte dtypes differ from DTYPE_BYTES * 8 — fp4
 # is stored packed 2/byte, so DTYPE_BYTES reads 1 and cannot tell fp4 from fp8.
 DTYPE_BITS: dict[Dtype, int] = {**{dt: nbytes * 8 for dt, nbytes in DTYPE_BYTES.items()}, "fp4_e2m1": 4}
+
+DTYPE_GPU_ARCH_RANGES: dict[Dtype, tuple[tuple[int, int], ...]] = {
+    "fp8_e5m3": ((107, 110),),
+}
+
+
+def _fmt_ranges(ranges: tuple[tuple[int, int], ...]) -> str:
+    return " or ".join(f"{lo} <= SM < {hi}" for lo, hi in ranges)
+
+
+def dtype_arch_reject(chain: FusionChain, arch: "int | None") -> "str | None":
+    """Why the active GPU cannot run this chain's dtypes, or ``None``.
+
+    ``arch`` is ``None`` when no GPU is visible (render-only / CI), which skips
+    the check the same way the other arch gates do."""
+    if arch is None:
+        return None
+    for dtype in sorted(chain.dtypes_used()):
+        ranges = DTYPE_GPU_ARCH_RANGES.get(dtype)
+        if ranges is not None and not any(lo <= arch < hi for lo, hi in ranges):
+            return f"dtype {dtype!r} exists only on {_fmt_ranges(ranges)}, but the active GPU is sm_{arch}"
+    return None
+
 
 # input dtype -> tcgen05 MMA kind.
 DTYPE_TO_MMA_KIND: dict[Dtype, str] = {
@@ -68,6 +97,7 @@ DTYPE_FROM_CUDNN: dict[Any, Dtype] = {
     cudnn.data_type.FP8_E4M3: "fp8_e4m3",
     cudnn.data_type.FP8_E5M2: "fp8_e5m2",
     cudnn.data_type.FP8_E8M0: "fp8_e8m0",
+    cudnn.data_type.FP8_E5M3: "fp8_e5m3",
     cudnn.data_type.FP4_E2M1: "fp4_e2m1",
     cudnn.data_type.UINT8: "uint8",
     cudnn.data_type.INT32: "int32",
