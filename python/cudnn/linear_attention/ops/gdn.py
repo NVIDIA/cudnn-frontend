@@ -399,6 +399,10 @@ def _gdn_fwd_fake(
         raise ValueError(f"k head count ({HK}) must match q's ({H}) or v's ({HV}); canonical GQA shares grouped k/v heads")
     HO = max(H, HV)
     N = cu_seqlens.shape[0] - 1
+    if cu_seqlens.dtype not in (torch.int32, torch.int64):
+        raise ValueError(f"gated_delta_net: cu_seqlens must be int32 or int64; got {cu_seqlens.dtype}")
+    if initial_state is not None and initial_state.shape[0] != N:
+        raise ValueError(f"initial_state must carry one state per sequence: got {initial_state.shape[0]} for {N} sequences")
     o = q.new_empty(total, HO, V)
     final = q.new_empty((N, HO, K, V) if output_final_state else (0,), dtype=torch.float32)
     if checkpoint_every_n_tokens > 0:

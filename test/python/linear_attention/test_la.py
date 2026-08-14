@@ -699,6 +699,64 @@ def test_checkpoints_varlen(backend, variant):
         base += cnt
 
 
+TIGHT_VARLEN_RECIPES = {
+    "pair+quarter": lambda c: [c + c // 4] * 2,
+    "triple+1": lambda c: [c + 1] * 3,
+    "single-2c+1": lambda c: [2 * c + 1],
+}
+
+
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("recipe", sorted(TIGHT_VARLEN_RECIPES))
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_checkpoints_varlen_tight_capacity(backend, variant, recipe):
+    """Non-multiple varlen lengths where the packed entries fill the
+    host-computable capacity exactly (sum over seqs of ceil(T/ckpt) - 1 ==
+    total // ckpt): every entry lands in bounds and matches the fp64
+    recurrence and its sequence's solo prefix run; the chunk-cadence bwd
+    reuse matches the recompute path bitwise."""
+    ckpt = CHUNK[variant]
+    seq_lens = TIGHT_VARLEN_RECIPES[recipe](ckpt)
+    counts = [max(sl - 1, 0) // ckpt for sl in seq_lens]
+    assert sum(counts) == max(sum(seq_lens) // ckpt, 1), "recipe must fill the capacity bound exactly"
+    case = make_case(variant, torch.bfloat16, seq_lens=seq_lens)
+    o, fs, state_checkpoints = run_fwd(backend, case, output_final_state=True, checkpoint_every_n_tokens=ckpt)
+    assert state_checkpoints.shape[0] == sum(counts)
+    ref_fn = {"gdn": gdn_reference, "kda": kda_reference, "gdn2": gdn2_reference}[variant]
+    bounds = case.cu.tolist()
+    base = 0
+    for n, cnt in enumerate(counts):
+        for j in range(cnt):
+            n0 = bounds[n]
+            ntok = (j + 1) * ckpt
+            ref_args = [t[:, n0 : n0 + ntok] for t in (case.q, case.k, case.v, case.gates["g"], case.gates["beta"])]
+            args = [to_thd(t)[n0 : n0 + ntok].clone() for t in (case.q, case.k, case.v, case.gates["g"], case.gates["beta"])]
+            if variant == "gdn2":
+                ref_args.append(case.gates["w"][:, n0 : n0 + ntok])
+                args.append(to_thd(case.gates["w"])[n0 : n0 + ntok].clone())
+            with torch.no_grad():
+                _, fs_ref = ref_fn(*ref_args)
+            check(f"state_checkpoints[seq {n}][{j}] vs fp64 reference", state_checkpoints[base + j], fs_ref[0], STATE_TOL[case.dtype])
+            cu_n = torch.tensor([0, ntok], dtype=torch.int32, device="cuda")
+            with waive_unsupported(backend, variant):
+                o_p, fs_p = pinned_op(backend, variant)(*args, cu_n, output_final_state=True)
+            check(f"state_checkpoints[seq {n}][{j}] vs solo prefix", state_checkpoints[base + j], fs_p[0], STATE_TOL[case.dtype])
+        base += cnt
+    grads_by_mode = []
+    for mode_ckpt in (0, ckpt):
+        leaves = [to_thd(case.q).detach().clone().requires_grad_(True), to_thd(case.k).detach().clone().requires_grad_(True)]
+        args = [leaves[0], leaves[1], to_thd(case.v), to_thd(case.gates["g"]), to_thd(case.gates["beta"])]
+        if variant == "gdn2":
+            args.append(to_thd(case.gates["w"]))
+        with waive_unsupported(backend, variant):
+            out = pinned_op(backend, variant)(*args, case.cu, checkpoint_every_n_tokens=mode_ckpt)
+            set_seed(SEED + 5)
+            dO = torch.randn_like(out[0])
+            grads_by_mode.append(torch.autograd.grad([out[0]], leaves, [dO]))
+    for gr, gc in zip(grads_by_mode[0], grads_by_mode[1]):
+        assert torch.equal(bits(gr), bits(gc)), "checkpoint-reuse grads differ from the recompute path"
+
+
 @pytest.mark.parametrize("ckpt_mult", [2, 3])
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_checkpoints_coarse_cadence(backend, variant, ckpt_mult):
