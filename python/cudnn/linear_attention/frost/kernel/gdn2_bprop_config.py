@@ -38,7 +38,7 @@ class Cfg:
     COMPUTE_GROUP_0_WARP_IDS: Tuple[int, ...] = (0, 1, 2, 3)  # forward gate cumsum + decay-operand materialize
     COMPUTE_GROUP_1_WARP_IDS: Tuple[int, ...] = (4, 5, 6, 7)  # value-side TMEM staging / restages / dH capture
     COMPUTE_GROUP_2_WARP_IDS: Tuple[int, ...] = (8, 9, 10, 11)  # dq/dk-bank drain, dG assembly + reverse cumsum
-    SUPER_MMA_WARP_ID: int = 12  # register-MMA kk/qk/dA/dM + Neumann inverse
+    SUPER_MMA_WARP_ID: int = 12  # register-MMA KK/A/dA/dM + Neumann T_inv
     TCGEN05_MMA_WARP_ID: int = 13  # tcgen05 GEMM schedule
     TMA_WARP_ID: int = 14  # q/k/v/gate/do/state(checkpoint) TMA loads
     EPILOGUE_WARP_ID: int = 15  # dq/dk/dv TMA stores only
@@ -51,9 +51,9 @@ class Cfg:
     # share a single setmaxregister value (56; super/epilogue peak ~R49).
     # dht configs keep ~15 in-loop WG2 spills at 136 (152 doesn't fit).
     NUM_REGS_COMPUTE_GROUP_0: int = 128
-    NUM_REGS_COMPUTE_GROUP_1: int = 192
+    NUM_REGS_COMPUTE_GROUP_1: int = 184
     NUM_REGS_COMPUTE_GROUP_2: int = 136
-    NUM_REGS_OTHER: int = 56
+    NUM_REGS_OTHER: int = 64  # warpgroup-uniform; +8 donated by CG1
 
     THREADS_PER_WARP: int = 32
 
@@ -63,11 +63,11 @@ class Cfg:
     SMEM_RAW_STAGES: int = 2
     SMEM_STATE_STAGES: int = 1
     SMEM_DECAY_STAGES: int = 2
-    SMEM_QK_STAGES: int = 2
+    SMEM_INTERMEDIATE_STAGES: int = 2
     SMEM_STATE_SCALE_DIAG_STAGES: int = 2
     SMEM_DQ_STAGES: int = 1
     SMEM_DK_STAGES: int = 1
-    SMEM_DG_STAGES: int = 1
+    SMEM_DGATE_STAGES: int = 1
     SMEM_DB_STAGES: int = 1
     SMEM_DV_STAGES: int = 2
     SMEM_DWO_STAGES: int = 2

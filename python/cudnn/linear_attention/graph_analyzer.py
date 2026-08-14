@@ -20,8 +20,9 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 import cudnn
-from cudnn.engines.base import CompiledPlan, resolve_node_buffers
+from cudnn.engines.base import CompiledPlan, NodeBuffers, bind_ports
 from cudnn.frost import buffers
+from cudnn.frost.workspace import Workspace
 
 BUFFER_NAME_FROM_CUDNN = {
     cudnn.data_type.HALF: "float16",
@@ -109,6 +110,7 @@ class LaGraphFacts:
     safe_gate: bool = False
     use_beta_sigmoid: bool = False
     checkpoint_every_n_tokens: int = 0
+    batch_invariant: bool = False
 
 
 def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
@@ -218,6 +220,7 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
         safe_gate=safe_gate,
         use_beta_sigmoid=bool(params.get("use_beta_sigmoid", False)),
         checkpoint_every_n_tokens=ckpt,
+        batch_invariant=bool(params.get("batch_invariant", False)),
     )
 
 
@@ -269,17 +272,34 @@ def frost_la_gate(engine: str, facts, op: str) -> None:
 
 
 class FrostLaPlan(CompiledPlan):
-    """A compiled LA executor, called with the graph's resolved node buffers."""
+    """A compiled LA executor, driven from the normalized variant pack: the
+    port-to-slot join is a property of the graph, so it happens once and is
+    kept; between executes only the buffer addresses move."""
+
+    takes_variant_pack = True
 
     def __init__(self, compiled):
         self.compiled = compiled
+        self.ports = None
 
     def get_workspace_size(self) -> int:
         return self.compiled.workspace_bytes()
 
-    def execute(self, graph, uid_to_data, ctx) -> None:
-        node_buffers = resolve_node_buffers(graph, uid_to_data)
-        self.compiled(node_buffers, workspace=ctx.workspace, stream=ctx.stream)
+    def execute(self, graph, variant_pack, ctx) -> None:
+        ports = self.ports
+        if ports is None:
+            ports = self.ports = bind_ports(graph, variant_pack)
+        ok, offender = variant_pack.all_dense_layout()
+        if not ok:
+            raise ValueError(dense_layout_message(self.compiled.plan_name, ports, offender))
+        node_buffers = {}
+        for node, slots in ports.items():
+            names = list(slots.inputs) + list(slots.outputs)
+            views = variant_pack.operands(list(slots.inputs.values()) + list(slots.outputs.values()))
+            split = len(slots.inputs)
+            node_buffers[node] = NodeBuffers(dict(zip(names[:split], views[:split])), dict(zip(names[split:], views[split:])))
+        workspace = Workspace.over(variant_pack, self.compiled.workspace_bytes(), type(self.compiled).__name__)
+        self.compiled(node_buffers, workspace=workspace, stream=ctx.stream)
 
 
 def expect_table(node, align) -> dict:
@@ -324,40 +344,13 @@ def check_layouts_compact(plan_name: str, expect, nb) -> None:
                 )
 
 
-def check_layouts(plan_name: str, expect=None, compact=(), **bufs) -> None:
-    """Layout gate for stride-plumbed kernels (pass-through, no staging):
-    innermost dim stride-1, non-broadcast, non-overlapping; outer strides on
-    size>1 dims must be 16-byte multiples (TMA global-stride rule, and the
-    vectorized gate-scan / word-pair store alignment). ``expect`` (from
-    :func:`expect_table`) additionally pins each buffer to the node's
-    build-time dims/dtype and the entry's assumed base alignment; ``compact``
-    names ports whose kernels compiled static-compact layouts (full
-    contiguity required, not just dense)."""
-    for name, b in bufs.items():
-        if b is None:
-            continue
-        ptr, shape, strides, dtype, _dev = buffers.probe(b)
-        if not buffers.dense_layout_ok(shape, strides):
-            raise ValueError(
-                f"{plan_name}: buffer for {name!r} must have a stride-1 innermost dim and "
-                f"non-broadcast, non-overlapping strides (padded outer strides allowed); got shape {shape} strides {strides}"
-            )
-        exp = expect.get(name) if expect else None
-        if exp is not None:
-            dims, dtype_name, align = exp
-            if dims is not None and tuple(shape) != dims:
-                raise ValueError(f"{plan_name}: buffer for {name!r} must match the graph's build-time dims {dims}; got {tuple(shape)}")
-            if dtype_name is not None and dtype != dtype_name:
-                raise ValueError(f"{plan_name}: buffer for {name!r} must be {dtype_name} (the node's declared dtype); got {dtype}")
-            if align and ptr % align != 0:
-                raise ValueError(f"{plan_name}: buffer for {name!r} base pointer must be {align}-byte aligned (kernel assumed_align); got 0x{ptr:x}")
-        if name in compact and not buffers.is_contiguous(shape, strides):
-            raise ValueError(f"{plan_name}: buffer for {name!r} must be contiguous (compiled static-compact); got shape {shape} strides {strides}")
-        if strides is None or buffers.is_contiguous(shape, strides):
-            continue
-        bpe = buffers.DTYPES[dtype][1] // 8
-        for sz, st in zip(shape[:-1], strides[:-1]):
-            if sz != 1 and (st * bpe) % 16 != 0:
-                raise ValueError(
-                    f"{plan_name}: buffer for {name!r} padded outer strides must be 16-byte multiples (TMA global-stride rule); got strides {strides} at {bpe} B/elem"
-                )
+def dense_layout_message(plan_name, ports, offender) -> str:
+    """Name the port behind ``all_dense_layout``'s failing slot. Buffers pass
+    straight to the stride-plumbed kernels, so the one execute-time rule is a
+    stride-1 innermost dim; this walk only runs on the way to raising."""
+    for slots in ports.values():
+        for direction in (slots.inputs, slots.outputs):
+            for port, slot in direction.items():
+                if slot == offender:
+                    return f"{plan_name}: buffer for {port!r} must have a stride-1 innermost dim (buffers pass straight to the kernel)"
+    return f"{plan_name}: the buffer at variant-pack slot {offender} must have a stride-1 innermost dim"

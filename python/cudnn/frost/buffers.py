@@ -296,23 +296,6 @@ def is_contiguous(shape, strides) -> bool:
     return True
 
 
-def dense_layout_ok(shape, strides) -> bool:
-    """Relaxed layout soundness (rank-agnostic, size-1 dims wildcarded):
-    innermost dim stride-1, no zero stride on a size>1 dim, non-overlapping
-    strides (padded / permuted outer strides allowed)."""
-    if strides is None:
-        return True
-    if shape[-1] != 1 and strides[-1] != 1:
-        return False
-    active = sorted((int(st), int(sz)) for st, sz in zip(strides, shape) if sz != 1)
-    span = 1
-    for st, sz in active:
-        if st < span:
-            return False
-        span = st * sz
-    return True
-
-
 def memset_zero_async(ptr: int, nbytes: int, stream) -> None:
     """Stream-ordered zero-fill of a device range via ``cuda.bindings``."""
     from cuda.bindings import runtime as _rt

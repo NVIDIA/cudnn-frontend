@@ -465,6 +465,16 @@ def test_fwd_gqa(backend, variant, H, HK, HV):
 
 
 @pytest.mark.parametrize("variant", VARIANTS)
+def test_fwd_multi_tile(backend, variant):
+    """B*H well above the SM count: each CTA walks several (b, h) tiles back
+    to back, exercising the inter-tile state drain -> seed ordering the
+    single-tile cases never reach."""
+    case = make_case(variant, torch.bfloat16, B=8, T=192, H=64)
+    o, fs = run_fwd(backend, case, output_final_state=True)
+    check_fwd(case, o, fs)
+
+
+@pytest.mark.parametrize("variant", VARIANTS)
 def test_fwd_qk_l2norm(backend, variant):
     """In-kernel Q/K L2 norm matches the reference on pre-normalized inputs."""
     case = make_case(variant, torch.bfloat16, T=256)
@@ -689,6 +699,28 @@ def test_checkpoints_varlen(backend, variant):
         base += cnt
 
 
+@pytest.mark.parametrize("ckpt_mult", [2, 3])
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_checkpoints_coarse_cadence(backend, variant, ckpt_mult):
+    """Coarser cadences (multiples of the base chunk) keep the prefix contract."""
+    ckpt = CHUNK[variant] * ckpt_mult
+    T = 5 * ckpt
+    case = make_case(variant, torch.bfloat16, T=T)
+    o, fs, state_checkpoints = run_fwd(backend, case, output_final_state=True, checkpoint_every_n_tokens=ckpt)
+    valid = (T - 1) // ckpt
+    assert state_checkpoints.shape == (T // ckpt, case.HO, case.K, case.V)
+    assert state_checkpoints.dtype == case.dtype
+    for j in (0, valid - 1):
+        n = (j + 1) * ckpt
+        args = [to_thd(case.q)[:n], to_thd(case.k)[:n], to_thd(case.v)[:n], to_thd(case.gates["g"])[:n], to_thd(case.gates["beta"])[:n]]
+        if variant == "gdn2":
+            args.append(to_thd(case.gates["w"])[:n])
+        cu_n = torch.tensor([0, n], dtype=torch.int32, device="cuda")
+        with waive_unsupported(backend, variant):
+            o, fs_p = pinned_op(backend, variant)(*args, cu_n, output_final_state=True)
+        check(f"state_checkpoints[{j}]", state_checkpoints[j], fs_p[0], STATE_TOL[case.dtype])
+
+
 # ---------------------------------------------------------------------------
 # Raw-logit gate modes (safe gate, in-kernel Beta sigmoid)
 # ---------------------------------------------------------------------------
@@ -880,6 +912,39 @@ def test_determinism_bwd(backend, variant):
 
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
 @pytest.mark.parametrize("variant", VARIANTS)
+def test_determinism_multi_tile_fwd(backend, variant):
+    """Multi-tile grid (B*H >> SM count) with an initial state: bitwise
+    stability across the inter-tile drain -> seed window."""
+    case = make_case(variant, torch.bfloat16, B=8, T=192, H=64)
+    state0 = torch.randn(case.N, case.HO, case.K, case.V, device="cuda", dtype=torch.float32) * 0.05
+
+    def launch():
+        o, fs = run_fwd(backend, case, initial_state=state0, output_final_state=True)
+        return o, fs
+
+    assert_bitwise_runs(launch, label=f"{variant} multi-tile fwd")
+
+
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_determinism_multi_tile_bwd(backend, variant):
+    case = make_case(variant, torch.bfloat16, B=8, T=192, H=64)
+    leaves = [to_thd(case.q).detach().clone().requires_grad_(True), to_thd(case.k).detach().clone().requires_grad_(True)]
+    args = [leaves[0], leaves[1], to_thd(case.v), to_thd(case.gates["g"]), to_thd(case.gates["beta"])]
+    if variant == "gdn2":
+        args.append(to_thd(case.gates["w"]))
+    with waive_unsupported(backend, variant):
+        o, fs = pinned_op(backend, variant)(*args, case.cu)
+        dO = torch.randn_like(o)
+
+        def launch():
+            return torch.autograd.grad([o], leaves, [dO], retain_graph=True)
+
+        assert_bitwise_runs(launch, label=f"{variant} multi-tile bwd")
+
+
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("variant", VARIANTS)
 def test_determinism_two_streams(backend, variant):
     """Two concurrent instances on separate streams must not perturb each
     other: every repeat matches its own single-stream baseline."""
@@ -906,6 +971,117 @@ def test_determinism_two_streams(backend, variant):
         for label, base, outs in (("A", base_a, out_a), ("B", base_b, out_b)):
             for i, (x, y) in enumerate(zip(base, outs)):
                 assert torch.equal(bits(x), bits(y)), f"stream {label} output {i} differs on concurrent run {r}"
+
+
+# ---------------------------------------------------------------------------
+# Batch invariance (whole-sequence work items; packed == solo, bitwise)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_batch_invariance_fwd(backend, variant):
+    """batch_invariant=True: each packed sequence matches its solo B = 1 run bitwise."""
+    case = make_case(variant, torch.bfloat16, seq_lens=[497, 16, 1, 480, 0, 253])
+    o, fs = run_fwd(backend, case, output_final_state=True, batch_invariant=True)
+    bounds = case.cu.tolist()
+    for n in range(case.N):
+        s, e = bounds[n], bounds[n + 1]
+        if s == e:
+            continue
+        args = [to_thd(t)[s:e].clone() for t in (case.q, case.k, case.v, case.gates["g"], case.gates["beta"])]
+        if variant == "gdn2":
+            args.append(to_thd(case.gates["w"])[s:e].clone())
+        cu1 = torch.tensor([0, e - s], dtype=torch.int32, device="cuda")
+        with waive_unsupported(backend, variant):
+            o_solo, fs_solo = pinned_op(backend, variant)(*args, cu1, output_final_state=True, batch_invariant=True)
+        assert torch.equal(bits(o[s:e]), bits(o_solo)), f"seq {n}: packed o differs from solo"
+        assert torch.equal(bits(fs[n]), bits(fs_solo[0])), f"seq {n}: packed final state differs from solo"
+
+
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_batch_invariance_bwd(backend, variant):
+    """batch_invariant=True: a sequence's grads match its solo B = 1 run bitwise."""
+    case = make_case(variant, torch.bfloat16, seq_lens=[497, 16, 1, 480, 0, 253])
+    leaves = [to_thd(case.q).detach().clone().requires_grad_(True), to_thd(case.k).detach().clone().requires_grad_(True)]
+    args = [leaves[0], leaves[1], to_thd(case.v), to_thd(case.gates["g"]), to_thd(case.gates["beta"])]
+    if variant == "gdn2":
+        args.append(to_thd(case.gates["w"]))
+    s, e = 0, 497
+    with waive_unsupported(backend, variant):
+        o, fs = pinned_op(backend, variant)(*args, case.cu, batch_invariant=True)
+        dO = torch.randn_like(o)
+        grads_packed = torch.autograd.grad([o], leaves, [dO], retain_graph=True)
+        solo_args = [to_thd(t)[s:e].clone() for t in (case.q, case.k, case.v, case.gates["g"], case.gates["beta"])]
+        if variant == "gdn2":
+            solo_args.append(to_thd(case.gates["w"])[s:e].clone())
+        solo_leaves = [solo_args[0].requires_grad_(True), solo_args[1].requires_grad_(True)]
+        cu1 = torch.tensor([0, e - s], dtype=torch.int32, device="cuda")
+        o_solo, fs_solo = pinned_op(backend, variant)(*solo_args, cu1, batch_invariant=True)
+        grads_solo = torch.autograd.grad([o_solo], solo_leaves, [dO[s:e].clone()])
+    for gp, gs in zip(grads_packed, grads_solo):
+        assert torch.equal(bits(gp[s:e]), bits(gs)), "packed grad slice differs from solo grad"
+
+
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_bwd_checkpoint_reuse(backend, variant):
+    """Training with chunk-cadence checkpoints: the bwd consumes the fwd's
+    series instead of recomputing it, and the grads match bitwise."""
+    case = make_case(variant, torch.bfloat16, seq_lens=[497, 16, 1, 480, 0, 253])
+    grads_by_mode = []
+    for ckpt in (0, CHUNK[variant]):
+        leaves = [to_thd(case.q).detach().clone().requires_grad_(True), to_thd(case.k).detach().clone().requires_grad_(True)]
+        args = [leaves[0], leaves[1], to_thd(case.v), to_thd(case.gates["g"]), to_thd(case.gates["beta"])]
+        if variant == "gdn2":
+            args.append(to_thd(case.gates["w"]))
+        with waive_unsupported(backend, variant):
+            out = pinned_op(backend, variant)(*args, case.cu, checkpoint_every_n_tokens=ckpt)
+            o = out[0]
+            set_seed(SEED + 5)
+            dO = torch.randn_like(o)
+            grads_by_mode.append(torch.autograd.grad([o], leaves, [dO]))
+    for gr, gc in zip(grads_by_mode[0], grads_by_mode[1]):
+        assert torch.equal(bits(gr), bits(gc)), "checkpoint-reuse grads differ from the recompute path"
+
+
+@pytest.mark.parametrize("backend", ["cutile"], indirect=True)
+@pytest.mark.parametrize("variant", ["gdn", "kda"])
+def test_batch_invariance_cutile(backend, variant):
+    """cuTile is batch-invariant by construction; the flag must hold there too."""
+    case = make_case(variant, torch.bfloat16, seq_lens=[497, 16, 1, 480, 0, 253])
+    o, fs = run_fwd(backend, case, output_final_state=True, batch_invariant=True)
+    bounds = case.cu.tolist()
+    for n in range(case.N):
+        s, e = bounds[n], bounds[n + 1]
+        if s == e:
+            continue
+        args = [to_thd(t)[s:e].clone() for t in (case.q, case.k, case.v, case.gates["g"], case.gates["beta"])]
+        cu1 = torch.tensor([0, e - s], dtype=torch.int32, device="cuda")
+        with waive_unsupported(backend, variant):
+            o_solo, fs_solo = pinned_op(backend, variant)(*args, cu1, output_final_state=True, batch_invariant=True)
+        assert torch.equal(bits(o[s:e]), bits(o_solo)), f"seq {n}: packed o differs from solo"
+        assert torch.equal(bits(fs[n]), bits(fs_solo[0])), f"seq {n}: packed final state differs from solo"
+
+
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_batch_invariance_with_coarse_checkpoints(backend, variant):
+    """batch_invariant=True composes with a coarser checkpoint cadence."""
+    ckpt = CHUNK[variant] * 2
+    T = 4 * ckpt
+    case = make_case(variant, torch.bfloat16, T=T)
+    o, fs, state_checkpoints = run_fwd(backend, case, output_final_state=True, batch_invariant=True, checkpoint_every_n_tokens=ckpt)
+    assert state_checkpoints.shape == (T // ckpt, case.HO, case.K, case.V)
+    n = ckpt
+    args = [to_thd(case.q)[:n], to_thd(case.k)[:n], to_thd(case.v)[:n], to_thd(case.gates["g"])[:n], to_thd(case.gates["beta"])[:n]]
+    if variant == "gdn2":
+        args.append(to_thd(case.gates["w"])[:n])
+    cu_n = torch.tensor([0, n], dtype=torch.int32, device="cuda")
+    with waive_unsupported(backend, variant):
+        o_p, fs_p = pinned_op(backend, variant)(*args, cu_n, output_final_state=True)
+    check("state_checkpoints[0]", state_checkpoints[0], fs_p[0], STATE_TOL[case.dtype])
 
 
 # ---------------------------------------------------------------------------

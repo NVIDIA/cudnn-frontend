@@ -29,7 +29,8 @@ BACKEND_CONFIG = {
     "fla": {"name": "FLA (Triton)", "color": "#FF8C00", "order": 0},
     "flash_qla": {"name": "FlashQLA (TileLang)", "color": "#6495ED", "order": 1},
     "flash_kda": {"name": "FlashKDA", "color": "#9370DB", "order": 2},
-    "cudnn": {"name": "cuDNN", "color": "#76b900", "order": 3},
+    "cudnn": {"name": "cuDNN (default)", "color": "#76b900", "order": 3},
+    "cudnn_state_on": {"name": "cuDNN (state on)", "color": "#2f6e00", "order": 4},
 }
 
 # Backends dropped from every chart (rows may still exist in older CSVs).
@@ -55,14 +56,20 @@ CSV_COLUMNS = [
     "bwd_tflops",
     "max_diff",
     "num_iters",
+    "fwd_bw",
+    "bwd_bw",
 ]
+
+# One chart per metric: (fwd column, bwd column, y-axis label, bar label
+# format, filename suffix).
+METRIC_CONFIG = (
+    ("fwd_tflops", "bwd_tflops", "TFLOPS", "%.0f", "_flops"),
+    ("fwd_bw", "bwd_bw", "DRAM Bandwidth (TB/s)", "%.2f", "_bw"),
+)
 
 
 def get_backend_display_name(backend: str, cudnn_version: Optional[str] = None) -> str:
-    base_name = BACKEND_CONFIG.get(backend, {}).get("name", backend)
-    if backend == "cudnn" and cudnn_version:
-        base_name = f"{base_name} {cudnn_version}"
-    return base_name
+    return BACKEND_CONFIG.get(backend, {}).get("name", backend)
 
 
 def generate_charts(
@@ -98,64 +105,74 @@ def generate_charts(
         sub = df[df[group_col] == group_val].copy()
         sub.sort_values([x_col, "backend_order"], inplace=True)
 
-        fwd_df = sub[sub["fwd_tflops"] > 0]
-        bwd_df = sub[sub["bwd_tflops"] > 0]
-        has_fwd = not fwd_df.empty
-        has_bwd = not bwd_df.empty
-
-        if has_fwd and has_bwd:
-            fig, (ax_fwd, ax_bwd) = plt.subplots(1, 2, figsize=(14, 6), dpi=150)
-        elif has_fwd:
-            fig, ax_fwd = plt.subplots(1, 1, figsize=(10, 6), dpi=150)
-            ax_bwd = None
-        else:
-            fig, ax_bwd = plt.subplots(1, 1, figsize=(10, 6), dpi=150)
-            ax_fwd = None
-
-        heads = sub["num_q_heads"].iloc[0]
-        head_dim = sub["head_dim"].iloc[0]
-        gpu_info = f" ({gpu_name})" if gpu_name else ""
-        group_label = f"Batch = {group_val}" if x_axis == "seqlen" else f"SeqLen = {group_val}"
-        fig.suptitle(
-            f"{variant.upper()} Linear Attention (BF16) — {group_label}, Heads = {heads}, d = {head_dim}{gpu_info}",
-            fontsize=TITLE_FONT_SIZE,
-        )
-
-        for ax, pass_df, pass_name, y_col in (
-            (ax_fwd, fwd_df, "Forward", "fwd_tflops"),
-            (ax_bwd, bwd_df, "Backward", "bwd_tflops"),
-        ):
-            if ax is None or pass_df.empty:
+        for fwd_col, bwd_col, y_label, bar_fmt, file_suffix in METRIC_CONFIG:
+            if fwd_col not in sub.columns or bwd_col not in sub.columns:
                 continue
-            hue_order = list(pass_df.sort_values("backend_order")["backend_display"].drop_duplicates())
-            sns.barplot(
-                data=pass_df,
-                x=x_col,
-                y=y_col,
-                hue="backend_display",
-                hue_order=hue_order,
-                ax=ax,
-                palette=palette,
-                edgecolor="black",
-                linewidth=0.5,
-                errorbar=None,
-            )
-            ax.set_xlabel(x_label, fontsize=LABEL_FONT_SIZE)
-            ax.set_ylabel("TFLOPS", fontsize=LABEL_FONT_SIZE)
-            ax.set_title(pass_name, fontsize=TITLE_FONT_SIZE)
-            ax.legend(title="Backend", fontsize=LEGEND_FONT_SIZE)
-            ax.tick_params(axis="x", rotation=45)
-            for container in ax.containers:
-                ax.bar_label(container, fmt="%.0f", fontsize=BAR_LABEL_FONT_SIZE)
+            fwd_df = sub[sub[fwd_col] > 0]
+            bwd_df = sub[sub[bwd_col] > 0]
+            has_fwd = not fwd_df.empty
+            has_bwd = not bwd_df.empty
+            if not has_fwd and not has_bwd:
+                continue
 
-        plt.tight_layout()
-        gv = int(group_val)
-        stem = f"{variant}_b{gv}" if x_axis == "seqlen" else f"{variant}_t{gv}_bsweep"
-        output_path = output_dir / f"{stem}.png"
-        plt.savefig(output_path, dpi=150, bbox_inches="tight")
-        plt.close()
-        saved_paths.append(output_path)
-        print(f"Chart saved to {output_path}")
+            if has_fwd and has_bwd:
+                fig, (ax_fwd, ax_bwd) = plt.subplots(1, 2, figsize=(14, 6), dpi=150)
+            elif has_fwd:
+                fig, ax_fwd = plt.subplots(1, 1, figsize=(10, 6), dpi=150)
+                ax_bwd = None
+            else:
+                fig, ax_bwd = plt.subplots(1, 1, figsize=(10, 6), dpi=150)
+                ax_fwd = None
+
+            heads = sub["num_q_heads"].iloc[0]
+            head_dim = sub["head_dim"].iloc[0]
+            gpu_info = f" ({gpu_name})" if gpu_name else ""
+            group_label = f"Batch = {group_val}" if x_axis == "seqlen" else f"Sequence Length = {group_val}"
+            fig.suptitle(
+                f"{variant.upper()} Linear Attention (BF16) — {group_label}, Heads = {heads}, d = {head_dim}{gpu_info}",
+                fontsize=TITLE_FONT_SIZE,
+            )
+
+            for ax, pass_df, pass_name, y_col in (
+                (ax_fwd, fwd_df, "Forward", fwd_col),
+                (ax_bwd, bwd_df, "Backward", bwd_col),
+            ):
+                if ax is None or pass_df.empty:
+                    continue
+                hue_order = list(pass_df.sort_values("backend_order")["backend_display"].drop_duplicates())
+                sns.barplot(
+                    data=pass_df,
+                    x=x_col,
+                    y=y_col,
+                    hue="backend_display",
+                    hue_order=hue_order,
+                    ax=ax,
+                    palette=palette,
+                    edgecolor="black",
+                    linewidth=0.5,
+                    errorbar=None,
+                )
+                ax.set_xlabel(x_label, fontsize=LABEL_FONT_SIZE)
+                ax.set_ylabel(y_label, fontsize=LABEL_FONT_SIZE)
+                ax.set_title(pass_name, fontsize=TITLE_FONT_SIZE)
+                ax.legend(title="Backend", fontsize=LEGEND_FONT_SIZE, loc="upper left")
+                ax.tick_params(axis="x", rotation=45)
+                for container in ax.containers:
+                    ax.bar_label(container, fmt=bar_fmt, fontsize=BAR_LABEL_FONT_SIZE)
+
+            plt.tight_layout()
+            gv = int(group_val)
+            if df[group_col].nunique() == 1:
+                # the sweep pinned the group dimension: fixed-batch (seqlen
+                # sweep) / fixed-seq (batch sweep) result-tree naming
+                stem = f"{variant}_fixed_batch" if x_axis == "seqlen" else f"{variant}_fixed_seq"
+            else:
+                stem = f"{variant}_b{gv}" if x_axis == "seqlen" else f"{variant}_t{gv}_bsweep"
+            output_path = output_dir / f"{stem}{file_suffix}.png"
+            plt.savefig(output_path, dpi=150, bbox_inches="tight")
+            plt.close()
+            saved_paths.append(output_path)
+            print(f"Chart saved to {output_path}")
 
     return saved_paths
 
@@ -175,7 +192,8 @@ def main():
     batch_sizes = [int(b) for b in args.batch_sizes.split(",")] if args.batch_sizes else None
 
     df = pd.read_csv(args.csv)
-    missing = [c for c in CSV_COLUMNS if c not in df.columns]
+    # fwd_bw/bwd_bw are newer columns; older CSVs simply skip the BW charts.
+    missing = [c for c in CSV_COLUMNS if c not in df.columns and c not in ("fwd_bw", "bwd_bw")]
     if missing:
         raise ValueError(f"CSV is missing expected columns: {missing}")
 

@@ -2621,7 +2621,7 @@ _STRUCTURED_OPS = {
     "gdn": dict(
         node_type=NodeType.GDN,
         inputs=("q", "k", "v", "g", "beta", "cu_seqlens", "initial_state", "a_log", "dt_bias"),
-        attrs=("scale", "output_final_state", "use_qk_l2norm", "checkpoint_every_n_tokens", "safe_gate"),
+        attrs=("scale", "output_final_state", "use_qk_l2norm", "checkpoint_every_n_tokens", "safe_gate", "batch_invariant"),
         outputs=("O", "final_state", "state_checkpoints"),
         maybe={
             "final_state": lambda n: bool(n.params.get("output_final_state", False)),
@@ -2633,7 +2633,7 @@ _STRUCTURED_OPS = {
     "gdn_bwd": dict(
         node_type=NodeType.GDN_BWD,
         inputs=("q", "k", "v", "g", "beta", "cu_seqlens", "dO", "state_checkpoints", "initial_state", "d_final_state"),
-        attrs=("scale", "use_qk_l2norm"),
+        attrs=("scale", "use_qk_l2norm", "batch_invariant"),
         outputs=("dQ", "dK", "dV", "dG", "dBeta", "d_initial_state"),
         maybe={"d_initial_state": lambda n: "initial_state" in n.inputs},
         infer={"dQ": _like("q"), "dK": _like("k"), "dV": _like("v"), "dG": _like("g"), "dBeta": _like("beta"), "d_initial_state": _like("initial_state")},
@@ -2642,7 +2642,7 @@ _STRUCTURED_OPS = {
     "kda": dict(
         node_type=NodeType.KDA,
         inputs=("q", "k", "v", "g", "beta", "cu_seqlens", "initial_state", "a_log", "dt_bias"),
-        attrs=("scale", "output_final_state", "use_qk_l2norm", "checkpoint_every_n_tokens", "use_beta_sigmoid", "safe_gate", "gate_lower_bound"),
+        attrs=("scale", "output_final_state", "use_qk_l2norm", "checkpoint_every_n_tokens", "use_beta_sigmoid", "safe_gate", "gate_lower_bound", "batch_invariant"),
         outputs=("O", "final_state", "state_checkpoints"),
         maybe={
             "final_state": lambda n: bool(n.params.get("output_final_state", False)),
@@ -2654,7 +2654,7 @@ _STRUCTURED_OPS = {
     "kda_bwd": dict(
         node_type=NodeType.KDA_BWD,
         inputs=("q", "k", "v", "g", "beta", "cu_seqlens", "dO", "state_checkpoints", "initial_state", "d_final_state"),
-        attrs=("scale", "use_qk_l2norm"),
+        attrs=("scale", "use_qk_l2norm", "batch_invariant"),
         outputs=("dQ", "dK", "dV", "dG", "dBeta", "d_initial_state"),
         maybe={"d_initial_state": lambda n: "initial_state" in n.inputs},
         infer={"dQ": _like("q"), "dK": _like("k"), "dV": _like("v"), "dG": _like("g"), "dBeta": _like("beta"), "d_initial_state": _like("initial_state")},
@@ -2663,7 +2663,7 @@ _STRUCTURED_OPS = {
     "gdn2": dict(
         node_type=NodeType.GDN2,
         inputs=("q", "k", "v", "g", "beta", "w", "cu_seqlens", "initial_state", "a_log", "dt_bias"),
-        attrs=("scale", "output_final_state", "use_qk_l2norm", "checkpoint_every_n_tokens", "safe_gate", "gate_lower_bound"),
+        attrs=("scale", "output_final_state", "use_qk_l2norm", "checkpoint_every_n_tokens", "safe_gate", "gate_lower_bound", "batch_invariant"),
         outputs=("O", "final_state", "state_checkpoints"),
         maybe={
             "final_state": lambda n: bool(n.params.get("output_final_state", False)),
@@ -2675,7 +2675,7 @@ _STRUCTURED_OPS = {
     "gdn2_bwd": dict(
         node_type=NodeType.GDN2_BWD,
         inputs=("q", "k", "v", "g", "beta", "w", "cu_seqlens", "dO", "state_checkpoints", "initial_state", "d_final_state"),
-        attrs=("scale", "use_qk_l2norm"),
+        attrs=("scale", "use_qk_l2norm", "batch_invariant"),
         outputs=("dQ", "dK", "dV", "dG", "dBeta", "dW", "d_initial_state"),
         maybe={"d_initial_state": lambda n: "initial_state" in n.inputs},
         infer={

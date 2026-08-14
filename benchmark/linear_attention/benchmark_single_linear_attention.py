@@ -268,6 +268,7 @@ def run_benchmark(
         Dict with keys:
             - time_ms: Median time of the requested pass in milliseconds
             - tflops: TFLOPS for the requested pass
+            - bw_tb_per_sec: DRAM bandwidth (TB/s) for the requested pass
             - max_diff: Maximum difference vs reference
             - gpu_name: GPU name string
             - cudnn_version: cuDNN version (if available)
@@ -339,7 +340,7 @@ def run_benchmark(
         raise RuntimeError(f"Benchmark failed with return code {result.returncode}.\n" f"stderr: {result.stderr}\n" f"stdout: {result.stdout}")
 
     # Parse CSV output
-    # Format: case_tag,backend,variant,batch_size,seqlen,num_q_heads,num_kv_heads,head_dim,fwd_time,bwd_time,fwd_tflops,bwd_tflops,max_diff,num_iters
+    # Format: case_tag,backend,variant,batch_size,seqlen,num_q_heads,num_kv_heads,head_dim,fwd_time,bwd_time,fwd_tflops,bwd_tflops,max_diff,num_iters,fwd_bw,bwd_bw
     output_line = result.stdout.strip().split("\n")[-1]
     parts = output_line.split(",")
 
@@ -365,13 +366,16 @@ def run_benchmark(
     if profile_pass == "fwd":
         time_ms = float(parts[8])
         tflops = float(parts[10])
+        bw_tb_per_sec = float(parts[14]) if len(parts) > 14 else 0.0
     else:  # "bwd"
         time_ms = float(parts[9])
         tflops = float(parts[11])
+        bw_tb_per_sec = float(parts[15]) if len(parts) > 15 else 0.0
 
     return {
         "time_ms": time_ms,
         "tflops": tflops,
+        "bw_tb_per_sec": bw_tb_per_sec,
         "max_diff": float(parts[12]) if len(parts) > 12 else 0.0,
         "gpu_name": gpu_name,
         "cudnn_version": cudnn_version,
@@ -818,6 +822,63 @@ else:
         )
         return f / time / 1e9 if not math.isnan(time) else 0.0  # Assume time is in msec
 
+    # Util functions for calculating DRAM bytes moved and bandwidth achieved
+    def dram_bytes(
+        batch_size,
+        seqlen,
+        head_dim_qk,
+        head_dim_vo,
+        num_q_heads,
+        num_kv_heads,
+        num_o_heads,
+        mode="fwd",
+    ):
+        assert mode in ["fwd", "bwd"]
+        io_bytes = 2
+        f32_bytes = 4
+        tokens = batch_size * seqlen
+        q_bytes = tokens * num_q_heads * head_dim_qk * io_bytes
+        k_bytes = tokens * num_q_heads * head_dim_qk * io_bytes
+        v_bytes = tokens * num_kv_heads * head_dim_vo * io_bytes
+        o_bytes = tokens * num_o_heads * head_dim_vo * io_bytes
+        if args.variant == "gdn":
+            gate_bytes = tokens * num_o_heads * 2 * f32_bytes
+        elif args.variant == "kda":
+            gate_bytes = tokens * num_o_heads * (head_dim_qk + 1) * f32_bytes
+        else:  # gdn2
+            gate_bytes = tokens * num_o_heads * (head_dim_qk * f32_bytes + (head_dim_qk + head_dim_vo) * io_bytes)
+        num_chunks = ceil_div(seqlen, _CHUNK_SIZE[args.variant])
+        h_bytes = batch_size * num_o_heads * num_chunks * head_dim_qk * head_dim_vo * io_bytes
+        qkv_bytes = q_bytes + k_bytes + v_bytes
+        if mode == "fwd":
+            return qkv_bytes + gate_bytes + o_bytes
+        recompute_bytes = k_bytes + v_bytes + gate_bytes + h_bytes
+        return recompute_bytes + 2 * (qkv_bytes + gate_bytes) + o_bytes + h_bytes
+
+    def tb_per_sec(
+        batch_size,
+        seqlen,
+        head_dim_qk,
+        head_dim_vo,
+        num_q_heads,
+        num_kv_heads,
+        num_o_heads,
+        time,
+        mode="fwd",
+    ):
+        assert mode in ["fwd", "bwd"]
+        b = dram_bytes(
+            batch_size,
+            seqlen,
+            head_dim_qk,
+            head_dim_vo,
+            num_q_heads,
+            num_kv_heads,
+            num_o_heads,
+            mode,
+        )
+        return b / time / 1e9 if not math.isnan(time) else 0.0  # Assume time is in msec
+
     ## Gate generators per variant. Decays are LOG-space (alpha = exp(g)),
     ## drawn from ranges the kernels' io-dtype arithmetic is conditioned for.
     def generate_gates(io_dtype):
@@ -1036,6 +1097,7 @@ else:
         np.median(np.array(forward_times[5:])) if len(forward_times) > 5 else (np.median(np.array(forward_times)) if len(forward_times) > 0 else 0.0)
     )
     fwd_tflops = 0.0
+    fwd_bw = 0.0
     if run_fwd and fwd_median_time > 0:
         fwd_tflops = tflops_per_sec(
             args.batch_size,
@@ -1046,17 +1108,40 @@ else:
             fwd_median_time,
             "fwd",
         )
+        fwd_bw = tb_per_sec(
+            args.batch_size,
+            args.seqlen,
+            head_dim_qk,
+            head_dim_vo,
+            args.num_q_heads,
+            args.num_kv_heads,
+            num_o_heads,
+            fwd_median_time,
+            "fwd",
+        )
 
     bwd_median_time = (
         np.median(np.array(backward_times[5:])) if len(backward_times) > 5 else (np.median(np.array(backward_times)) if len(backward_times) > 0 else 0.0)
     )
     bwd_tflops = 0.0
+    bwd_bw = 0.0
     if run_bwd and bwd_median_time > 0:
         bwd_tflops = tflops_per_sec(
             args.batch_size,
             args.seqlen,
             head_dim_qk,
             head_dim_vo,
+            num_o_heads,
+            bwd_median_time,
+            "bwd",
+        )
+        bwd_bw = tb_per_sec(
+            args.batch_size,
+            args.seqlen,
+            head_dim_qk,
+            head_dim_vo,
+            args.num_q_heads,
+            args.num_kv_heads,
             num_o_heads,
             bwd_median_time,
             "bwd",
@@ -1077,16 +1162,21 @@ else:
     fwd_sol_str = f", {fwd_tflops / _peak_mma_tflops * 100:.1f}% SOL" if _peak_mma_tflops and fwd_tflops > 0 else ""
     bwd_sol_str = f", {bwd_tflops / _peak_mma_tflops * 100:.1f}% SOL" if _peak_mma_tflops and bwd_tflops > 0 else ""
 
+    backend_tag = f"{args.la_backend}_state_on" if (args.store_on and args.la_backend == "cudnn") else args.la_backend
     if args.format_output:
         print(
-            f"{args.case_tag},{args.la_backend},{args.variant},{args.batch_size},{args.seqlen},{args.num_q_heads},{args.num_kv_heads},{head_dim_qk},{fwd_median_time:.3f},{bwd_median_time:.3f},{fwd_tflops:.0f},{bwd_tflops:.0f},{(np.max(np.array(forward_diffs[5:])) if len(forward_diffs) > 5 else (np.max(np.array(forward_diffs)) if len(forward_diffs) > 0 else 0.0)):.6f},{num_iters}"
+            f"{args.case_tag},{backend_tag},{args.variant},{args.batch_size},{args.seqlen},{args.num_q_heads},{args.num_kv_heads},{head_dim_qk},{fwd_median_time:.3f},{bwd_median_time:.3f},{fwd_tflops:.0f},{bwd_tflops:.0f},{(np.max(np.array(forward_diffs[5:])) if len(forward_diffs) > 5 else (np.max(np.array(forward_diffs)) if len(forward_diffs) > 0 else 0.0)):.6f},{num_iters},{fwd_bw:.2f},{bwd_bw:.2f}"
         )
     else:
         if run_fwd and run_bwd:
             print(
-                f"{args.la_backend}/{args.variant}:: Median (fwd, bwd) Execution Times: {fwd_median_time:.3f} ms ({fwd_tflops:.0f} TFLOPS{fwd_sol_str}), {bwd_median_time:.3f} ms ({bwd_tflops:.0f} TFLOPS{bwd_sol_str})"
+                f"{args.la_backend}/{args.variant}:: Median (fwd, bwd) Execution Times: {fwd_median_time:.3f} ms ({fwd_tflops:.0f} TFLOPS{fwd_sol_str}, {fwd_bw:.2f} TB/s), {bwd_median_time:.3f} ms ({bwd_tflops:.0f} TFLOPS{bwd_sol_str}, {bwd_bw:.2f} TB/s)"
             )
         elif run_fwd:
-            print(f"{args.la_backend}/{args.variant}:: Median (fwd) Execution Time: {fwd_median_time:.3f} ms ({fwd_tflops:.0f} TFLOPS{fwd_sol_str})")
+            print(
+                f"{args.la_backend}/{args.variant}:: Median (fwd) Execution Time: {fwd_median_time:.3f} ms ({fwd_tflops:.0f} TFLOPS{fwd_sol_str}, {fwd_bw:.2f} TB/s)"
+            )
         elif run_bwd:
-            print(f"{args.la_backend}/{args.variant}:: Median (bwd) Execution Time: {bwd_median_time:.3f} ms ({bwd_tflops:.0f} TFLOPS{bwd_sol_str})")
+            print(
+                f"{args.la_backend}/{args.variant}:: Median (bwd) Execution Time: {bwd_median_time:.3f} ms ({bwd_tflops:.0f} TFLOPS{bwd_sol_str}, {bwd_bw:.2f} TB/s)"
+            )

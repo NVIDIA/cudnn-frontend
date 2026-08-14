@@ -38,7 +38,7 @@ class Cfg:
     # --- warp assignments (16 warps = 512 threads) ---
     COMPUTE_GROUP_0_WARP_IDS: Tuple[int, ...] = (0, 1, 2, 3, 4, 5, 6, 7)  # decay-operand materialize (2-group ping-pong)
     COMPUTE_GROUP_1_WARP_IDS: Tuple[int, ...] = (8, 9, 10, 11)  # value-side TMEM / state staging
-    SUPER_MMA_WARP_ID: int = 12  # register-MMA kk + Neumann inverse
+    SUPER_MMA_WARP_ID: int = 12  # register-MMA KK + Neumann T_inv
     TCGEN05_MMA_WARP_ID: int = 13  # tcgen05 state GEMMs
     TMA_WARP_ID: int = 14  # k/v/gate TMA loads
     EPILOGUE_WARP_ID: int = 15  # H TMA store
@@ -56,9 +56,9 @@ class Cfg:
     SMEM_RAW_STAGES: int = 8
     SMEM_SCHED_STAGES: int = 8
     SMEM_DECAY_STAGES: int = 2
-    SMEM_QK_STAGES: int = 2
-    SMEM_STATE_SCALE_DIAG_STAGES: int = 3
-    QK_SCALE_READY_STAGES: int = 3
+    SMEM_INTERMEDIATE_STAGES: int = 2
+    SMEM_STATE_SCALE_DIAG_STAGES: int = 4
+    QK_SCALE_READY_STAGES: int = 4
 
     CLUSTER_SHAPE_MNK: Tuple[int, int, int] = (1, 1, 1)
 

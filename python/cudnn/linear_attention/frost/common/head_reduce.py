@@ -22,7 +22,6 @@ import cuda.bindings.driver as cuda
 
 from cutlass.cute.runtime import from_dlpack
 
-from cudnn.frost import buffers
 from .host import get_dtype
 from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32, fp32_to_fp16
 
@@ -128,14 +127,7 @@ def head_group_reduce(src, dst, *, stream) -> None:
     grid_x = -(-total_words // BLOCK)
     cu_stream = cuda.CUstream(int(stream))
 
-    _ptr, dst_shape, dst_strides, _dt, _dev = buffers.probe(dst)
-    if dst_strides is None:
-        dst_strides = []
-        acc = 1
-        for sz in reversed(dst_shape):
-            dst_strides.append(acc)
-            acc *= sz
-        dst_strides = tuple(reversed(dst_strides))
+    dst_strides = tuple(dst.stride())
     if not is_fp32 and any(st % 2 != 0 for st, sz in zip(dst_strides[:-1], dst.shape[:-1]) if sz != 1):
         raise ValueError(f"head_group_reduce: f16/bf16 dst outer strides must be even (word-pair stores), got {dst_strides}")
     if dst.shape[-1] != 1 and dst_strides[-1] != 1:

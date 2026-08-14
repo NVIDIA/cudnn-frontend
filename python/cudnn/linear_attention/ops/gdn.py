@@ -132,6 +132,7 @@ def _make_fprop_cache_key(
     scale,
     output_final_state,
     use_qk_l2norm,
+    batch_invariant,
     has_initial_state,
     ckpt,
     device,
@@ -155,6 +156,7 @@ def _make_fprop_cache_key(
         float(scale),
         bool(output_final_state),
         bool(use_qk_l2norm),
+        bool(batch_invariant),
         bool(has_initial_state),
         ckpt,
         device,
@@ -179,8 +181,10 @@ def _make_bprop_cache_key(
     cu_dtype,
     has_initial_state,
     has_d_final_state,
+    ckpt_rows,
     scale,
     use_qk_l2norm,
+    batch_invariant,
     device,
     plan_name,
 ):
@@ -202,8 +206,10 @@ def _make_bprop_cache_key(
         cu_dtype,
         bool(has_initial_state),
         bool(has_d_final_state),
+        ckpt_rows,
         float(scale),
         bool(use_qk_l2norm),
+        bool(batch_invariant),
         device,
         plan_name,
     )
@@ -214,7 +220,9 @@ def _make_bprop_cache_key(
 # ---------------------------------------------------------------------------
 
 
-def _build_fprop_graph(total, N, H, HK, HV, K, V, io_dtype, g_dtype, beta_dtype, state_dtype, cu_dtype, scale, output_final_state, use_qk_l2norm, ckpt):
+def _build_fprop_graph(
+    total, N, H, HK, HV, K, V, io_dtype, g_dtype, beta_dtype, state_dtype, cu_dtype, scale, output_final_state, use_qk_l2norm, batch_invariant, ckpt
+):
     graph = cudnn.pygraph()
     HO = max(H, HV)
     q_t = graph.tensor([total, H, K], data_type=io_dtype, name="q")
@@ -237,6 +245,7 @@ def _build_fprop_graph(total, N, H, HK, HV, K, V, io_dtype, g_dtype, beta_dtype,
         scale=scale,
         output_final_state=output_final_state,
         use_qk_l2norm=use_qk_l2norm,
+        batch_invariant=batch_invariant,
         checkpoint_every_n_tokens=ckpt,
         name="gdn",
     )
@@ -260,6 +269,7 @@ def _gdn_fwd(
     initial_state: Optional[torch.Tensor] = None,
     output_final_state: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
+    batch_invariant: bool = False,
     checkpoint_every_n_tokens: int = 0,
     plan_name: Optional[str] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -310,6 +320,7 @@ def _gdn_fwd(
         scale,
         output_final_state,
         use_qk_l2norm_in_kernel,
+        batch_invariant,
         state0 is not None,
         ckpt,
         device,
@@ -332,6 +343,7 @@ def _gdn_fwd(
             float(scale),
             bool(output_final_state),
             bool(use_qk_l2norm_in_kernel),
+            bool(batch_invariant),
             ckpt,
         )
         select_plan(_fprop_cache[cache_key][0], plan_name)
@@ -376,6 +388,7 @@ def _gdn_fwd_fake(
     initial_state=None,
     output_final_state=False,
     use_qk_l2norm_in_kernel=False,
+    batch_invariant=False,
     checkpoint_every_n_tokens=0,
     plan_name: Optional[str] = None,
 ):
@@ -401,7 +414,7 @@ def _gdn_fwd_fake(
 # ---------------------------------------------------------------------------
 
 
-def _build_bprop_graph(total, N, H, HK, HV, K, V, io_dtype, g_dtype, beta_dtype, state_dtype, dstate_in_dtype, cu_dtype, scale, use_qk_l2norm):
+def _build_bprop_graph(total, N, H, HK, HV, K, V, io_dtype, g_dtype, beta_dtype, state_dtype, dstate_in_dtype, cu_dtype, ckpt_rows, scale, use_qk_l2norm, batch_invariant):
     graph = cudnn.pygraph()
     HO = max(H, HV)
     q_t = graph.tensor([total, H, K], data_type=io_dtype, name="q")
@@ -417,6 +430,9 @@ def _build_bprop_graph(total, N, H, HK, HV, K, V, io_dtype, g_dtype, beta_dtype,
     dfs_t = None
     if dstate_in_dtype is not None:
         dfs_t = graph.tensor([N, HO, K, V], data_type=dstate_in_dtype, name="d_final_state")
+    ckpts_t = None
+    if ckpt_rows is not None:
+        ckpts_t = graph.tensor([ckpt_rows, HO, K, V], data_type=io_dtype, name="state_checkpoints")
     dQ_t, dK_t, dV_t, dG_t, dBeta_t, dstate0_t = graph.gdn_bwd(
         q=q_t,
         k=k_t,
@@ -425,10 +441,12 @@ def _build_bprop_graph(total, N, H, HK, HV, K, V, io_dtype, g_dtype, beta_dtype,
         beta=beta_t,
         cu_seqlens=cu_t,
         dO=dO_t,
+        state_checkpoints=ckpts_t,
         initial_state=state0_t,
         d_final_state=dfs_t,
         scale=scale,
         use_qk_l2norm=use_qk_l2norm,
+        batch_invariant=batch_invariant,
         name="gdn_bwd",
     )
     return graph, dict(
@@ -447,6 +465,7 @@ def _build_bprop_graph(total, N, H, HK, HV, K, V, io_dtype, g_dtype, beta_dtype,
         dG=dG_t,
         dBeta=dBeta_t,
         dstate0=dstate0_t,
+        ckpts=ckpts_t,
     )
 
 
@@ -467,13 +486,18 @@ def _gdn_bwd(
     scale: float,
     initial_state: Optional[torch.Tensor] = None,
     d_final_state: Optional[torch.Tensor] = None,
+    state_checkpoints: Optional[torch.Tensor] = None,
     use_qk_l2norm_in_kernel: bool = False,
+    batch_invariant: bool = False,
     plan_name: Optional[str] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """GDN backward (internal): a cached single-node GDN_BWD pygraph, THD layout.
 
-    Returns ``(dq, dk, dv, dg, dbeta, d_initial_state)``; ``d_initial_state``
-    is a zero-size tensor when ``initial_state`` is ``None``.
+    ``state_checkpoints`` is the forward's per-chunk state series (io dtype,
+    chunk cadence); when given, the engine consumes it instead of running
+    the checkpoint recompute pass. Returns ``(dq, dk, dv, dg, dbeta,
+    d_initial_state)``; ``d_initial_state`` is a zero-size tensor when
+    ``initial_state`` is ``None``.
     """
     total, H, K = q.shape
     # autograd materializes reduction grads as broadcast (stride-0)
@@ -497,7 +521,18 @@ def _gdn_bwd(
         _check_dtype("initial_state", initial_state, torch.float32)
         if initial_state.shape[0] != N:
             raise ValueError(f"initial_state must carry one state per sequence: got {initial_state.shape[0]} for {N} sequences")
-    for _name, _t in (("k", k), ("v", v), ("g", g), ("beta", beta), ("cu_seqlens", cu_seqlens), ("dO", dO), ("d_final_state", d_final_state)):
+    if state_checkpoints is not None:
+        _check_dtype("state_checkpoints", state_checkpoints, q.dtype)
+    for _name, _t in (
+        ("k", k),
+        ("v", v),
+        ("g", g),
+        ("beta", beta),
+        ("cu_seqlens", cu_seqlens),
+        ("dO", dO),
+        ("d_final_state", d_final_state),
+        ("state_checkpoints", state_checkpoints),
+    ):
         if _t is not None and _t.device != device:
             raise ValueError(f"gated_delta_net: {_name} must be on q's device ({device}); got {_t.device}")
     g32 = g
@@ -524,8 +559,10 @@ def _gdn_bwd(
         cu_seqlens.dtype,
         state0 is not None,
         dstate_in is not None,
+        state_checkpoints.shape[0] if state_checkpoints is not None else None,
         scale,
         use_qk_l2norm_in_kernel,
+        batch_invariant,
         device,
         plan_name,
     )
@@ -544,8 +581,10 @@ def _gdn_bwd(
             cudnn.data_type.FLOAT if state0 is not None else None,
             cudnn.data_type.FLOAT if dstate_in is not None else None,
             _torch_dtype_to_cudnn(cu_seqlens.dtype),
+            state_checkpoints.shape[0] if state_checkpoints is not None else None,
             float(scale),
             bool(use_qk_l2norm_in_kernel),
+            bool(batch_invariant),
         )
         select_plan(_bprop_cache[cache_key][0], plan_name)
 
@@ -578,6 +617,8 @@ def _gdn_bwd(
         variant_pack[t["dstate0"]] = dstate0
     if dstate_in is not None:
         variant_pack[t["dfs"]] = dstate_in
+    if state_checkpoints is not None:
+        variant_pack[t["ckpts"]] = state_checkpoints
     graph.execute(variant_pack, workspace=_graph_workspace(graph, device), handle=_get_handle(device))
     if dstate0 is None:
         dstate0 = torch.empty(0, dtype=torch.float32, device=device)
@@ -585,7 +626,22 @@ def _gdn_bwd(
 
 
 @_gdn_bwd.register_fake
-def _gdn_bwd_fake(dO, q, k, v, g, beta, cu_seqlens, scale, initial_state=None, d_final_state=None, use_qk_l2norm_in_kernel=False, plan_name=None):
+def _gdn_bwd_fake(
+    dO,
+    q,
+    k,
+    v,
+    g,
+    beta,
+    cu_seqlens,
+    scale,
+    initial_state=None,
+    d_final_state=None,
+    state_checkpoints=None,
+    use_qk_l2norm_in_kernel=False,
+    batch_invariant=False,
+    plan_name=None,
+):
     dstate0 = torch.empty_like(initial_state) if initial_state is not None else q.new_empty(0, dtype=torch.float32)
     return (
         torch.empty_like(q),
@@ -603,20 +659,34 @@ def _gdn_bwd_fake(dO, q, k, v, g, beta, cu_seqlens, scale, initial_state=None, d
 
 
 def _gdn_setup_context(ctx, inputs, output):
-    q, k, v, g, beta, cu_seqlens, scale, initial_state, output_final_state, use_qk_l2norm_in_kernel, checkpoint_every_n_tokens, plan_name = inputs
+    q, k, v, g, beta, cu_seqlens, scale, initial_state, output_final_state, use_qk_l2norm_in_kernel, batch_invariant, checkpoint_every_n_tokens, plan_name = (
+        inputs
+    )
     # save_for_backward cannot hold None; keep initial_state as an attribute.
-    ctx.save_for_backward(q, k, v, g, beta, cu_seqlens)
+    saved = [q, k, v, g, beta, cu_seqlens]
+    ctx.ckpt_reuse = checkpoint_every_n_tokens == 64 and output[2].numel() > 0
+    if ctx.ckpt_reuse:
+        saved.append(output[2])
+    ctx.save_for_backward(*saved)
     ctx.initial_state = initial_state
     ctx.scale = scale
     ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
+    ctx.batch_invariant = batch_invariant
     ctx.plan_name = plan_name
+    ctx.set_materialize_grads(False)
     ctx.mark_non_differentiable(output[2])
 
 
 def _gdn_backward(ctx, dO, dFinal, _dstate_checkpoints):
-    q, k, v, g, beta, cu_seqlens = ctx.saved_tensors
+    if ctx.ckpt_reuse:
+        q, k, v, g, beta, cu_seqlens, state_checkpoints = ctx.saved_tensors
+    else:
+        q, k, v, g, beta, cu_seqlens = ctx.saved_tensors
+        state_checkpoints = None
     initial_state = ctx.initial_state
 
+    if dO is None:
+        dO = torch.zeros(q.shape[0], max(q.shape[1], v.shape[1]), v.shape[2], dtype=q.dtype, device=q.device)
     dstate_in = dFinal if (dFinal is not None and dFinal.numel() > 0) else None
     dq, dk, dv, dg, dbeta, dstate0 = torch.ops.cudnn.gated_delta_net_bwd(
         dO,
@@ -629,11 +699,13 @@ def _gdn_backward(ctx, dO, dFinal, _dstate_checkpoints):
         ctx.scale,
         initial_state=initial_state,
         d_final_state=dstate_in,
+        state_checkpoints=state_checkpoints,
         use_qk_l2norm_in_kernel=ctx.use_qk_l2norm_in_kernel,
+        batch_invariant=ctx.batch_invariant,
         plan_name=ctx.plan_name,
     )
     # q, k, v, g, beta, cu_seqlens, scale, initial_state, output_final_state,
-    # use_qk_l2norm_in_kernel, checkpoint_every_n_tokens, plan_name
+    # use_qk_l2norm_in_kernel, batch_invariant, checkpoint_every_n_tokens, plan_name
     return (
         dq,
         dk,
@@ -643,6 +715,7 @@ def _gdn_backward(ctx, dO, dFinal, _dstate_checkpoints):
         None,
         None,
         dstate0 if initial_state is not None else None,
+        None,
         None,
         None,
         None,
@@ -673,6 +746,7 @@ def gated_delta_net(
     initial_state: Optional[torch.Tensor] = None,
     output_final_state: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
+    batch_invariant: bool = False,
     checkpoint_every_n_tokens: int = 0,
     plan_name: Optional[str] = None,
 ):
@@ -703,10 +777,13 @@ def gated_delta_net(
             after the last token.
         use_qk_l2norm_in_kernel: if ``True``, L2-normalize the Q/K rows inside
             the kernel. Engines that cannot honor it decline the graph.
+        batch_invariant: if ``True``, each sequence's results are bitwise
+            independent of the batch composition (whole-sequence scheduling;
+            disables split-K load balancing).
         checkpoint_every_n_tokens: if ``> 0``, also return the per-chunk
             recurrent state series ``state_checkpoints`` (``[total_checkpoints, HO, K, V]`` io dtype,
             one entry per N tokens strictly before each sequence end; the
-            FROST engine requires the kernel chunk size, 64). The series is
+            FROST engine requires a positive multiple of the kernel chunk size, 64). The series is
             a non-differentiable dump.
 
         plan_name: optionally pin one execution plan by name (the plan
@@ -732,6 +809,7 @@ def gated_delta_net(
         initial_state=initial_state,
         output_final_state=bool(output_final_state),
         use_qk_l2norm_in_kernel=bool(use_qk_l2norm_in_kernel),
+        batch_invariant=bool(batch_invariant),
         checkpoint_every_n_tokens=int(checkpoint_every_n_tokens),
         plan_name=plan_name,
     )

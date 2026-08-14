@@ -57,8 +57,8 @@ class Cfg:
     SMEM_Q_STAGES: int = 1
     SMEM_K_STAGES: int = 2
     SMEM_V_STAGES: int = 1
-    SMEM_AINV_STAGES: int = 1
-    SMEM_QK_STAGES: int = 1
+    SMEM_T_INV_STAGES: int = 1
+    SMEM_A_STAGES: int = 1
 
     # --- TMEM stage counts ---
     TMEM_DH_ACC_STAGES: int = 1
