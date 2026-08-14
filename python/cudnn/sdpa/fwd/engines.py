@@ -109,7 +109,7 @@ class Capabilities:
     # global-stride rule at 2 bytes/elem) via TMA zero-padding — the kernel's
     # descriptors carry the ACTUAL extents, so padded contraction columns load
     # as exact zeros (S/softmax unchanged) and O stores past d_v are
-    # OOB-clipped. False = only the native dims above are eligible (FP8/MXFP8,
+    # OOB-clipped. False = only the native dims above are eligible (MXFP8,
     # whose SF plumbing is not audited for zero-padding).
     d_envelope: bool = False
     # Alignment rule for envelope rows: graph head dims must be multiples of
@@ -171,8 +171,9 @@ class Capabilities:
     cu_seq_len: bool = False
     # Dense padded + stats needs the per-batch seq_len_q LSE trim (padded
     # q-rows write LSE=-inf / O=0, cuDNN >= 9.14). Plumbed for the half
-    # kernels via SEQ_Q_LENS_PRESENT; the FP8/MXFP8 kernels lack the epilogue
-    # trim, so their specs keep this False.
+    # kernels and the SM120 fp8 kernel via SEQ_Q_LENS_PRESENT; the SM100
+    # FP8/MXFP8 kernels lack the epilogue trim, so their specs keep this
+    # False.
     padded_stats: bool = False
     # s_q == 1 (decode-shaped) graphs; the SM80 prefill kernels are gated off.
     decode: bool = True
@@ -278,7 +279,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         if m > 1 and (facts.d_qk % m != 0 or facts.d_v % m != 0):
             return (
                 f"envelope zero-padding requires D_QK/D_V multiples of {m} (TMA 16-byte "
-                f"global-stride constraint at 2 bytes/elem); graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
+                f"global-stride constraint); graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
             )
     elif facts.d_qk not in capabilities.d_qk or facts.d_v not in capabilities.d_v:
         return f"serves D_QK in {sorted(capabilities.d_qk)}/D_V in {sorted(capabilities.d_v)}; graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
@@ -736,7 +737,7 @@ def lower_dsl_prefill(
     # buffer the FP8/MXFP8 kernels can't honor (dense padded-Q trim is not
     # plumbed there — known gap) is dropped here rather than erroring at
     # execute.
-    seq_q_lens_present = facts.padded and not facts.thd and facts.seq_q_t is not None and not (facts.is_mxfp8 or facts.is_fp8)
+    seq_q_lens_present = facts.padded and not facts.thd and facts.seq_q_t is not None and not ((facts.is_mxfp8 or facts.is_fp8) and api_type == _SM100)
     api = _adapter(api_type)(
         sample_q=ga.tensor_desc_from_ir(facts.q_t, name="q"),
         sample_k=ga.tensor_desc_from_ir(facts.k_t, name="k"),
@@ -753,8 +754,8 @@ def lower_dsl_prefill(
         seq_kv_lens_present=facts.padded or synth_kv_padding,
         # Dense padded-Q trim (q rows >= seq_len_q[b] -> O := 0, LSE := -inf):
         # enabled whenever a dense padded graph carries per-batch Q lengths.
-        # THD carries Q lengths via cu_seqlens; the FP8/MXFP8 kernels are not
-        # plumbed (their specs also keep padded_stats=False).
+        # THD carries Q lengths via cu_seqlens; the SM100 FP8/MXFP8 kernels
+        # are not plumbed (see seq_q_lens_present above).
         seq_q_lens_present=seq_q_lens_present,
         # cu_seq_len form (THD-only; the probe declined dense cu graphs): the
         # adapter's seq-lens execute arguments carry (B+1,) prefix sums.
@@ -952,25 +953,30 @@ def engine_name(
 # Engine IDS do NOT follow this order — they are pinned per name in
 # engine._ID_OFFSETS and never move.
 def _sm120_fp8_spec() -> EngineSpec:
-    """SM120 per-tensor FP8 engine (E4M3 in + scalar descales, FP16 out).
+    """SM120 per-tensor FP8 engine (E4M3/E5M2 in + scalar descales, FP16/BF16/FP8 out).
 
-    P quantization follows the backend's FORT ordering: Amax_S on the unscaled
-    softmax result, then Scale_S, then the e4m3 cast, with Descale_S folded into
-    o_scale_fused. (cuDNN's Scale_S/Descale_S scale the softmax OUTPUT, not the
-    scores.) The SM100 FP8 row deliberately does NOT do this: its lazy-rescale
-    skip leaves P bounded by 2^RESCALE_THRESHOLD rather than 1, so e4m3's range
-    above 1.0 is already spent and a caller Scale_S would saturate it. It
-    honours a reciprocal pair analytically instead and declines anything else.
+    P quantization follows the backend's FORT ordering: the softmax denominator
+    reads the unscaled result, then Scale_S multiplies P, then the fp8 cast,
+    with Descale_S folded into o_scale_fused. (cuDNN's Scale_S/Descale_S scale
+    the softmax OUTPUT, not the scores.) The SM100 FP8 row deliberately does
+    NOT do this: its lazy-rescale skip leaves P bounded by 2^RESCALE_THRESHOLD
+    rather than 1, so e4m3's range above 1.0 is already spent and a caller
+    Scale_S would saturate it. It honours a reciprocal pair analytically
+    instead and declines anything else.
 
     Same mma.sync architecture as the f16 SM120 cell with the MMA lowered to
     m16n8k32 e4m3; ``descale_q*descale_k`` folds into the softmax scale and
-    ``descale_v*scale_o`` into an epilogue scalar, so the kernel adds only the
-    Amax_S/Amax_O atomics over the f16 sibling. E4M3 only (no E5M2 tag in the
-    kernel yet), FP16 O only, head dims any multiple of 32 up to 256 with the
-    QK^T and P@V sides independent (exact — no zero-padding envelope on the
-    8-bit fragment path), and no sink (Amax_S semantics with a sink column are
-    undefined here). THD (ragged) is served with token-major Stats; head-major
-    ragged Stats stays f16-only (the fp8 kernel carries no such specialization).
+    ``descale_v*scale_o`` into an epilogue scalar, so beyond those the kernel
+    adds only the Amax_O atomic (no Amax_S — the shared mismatch rule declines
+    graphs that declare one). E4M3/E5M2 QKV supported; O may
+    be FP16, BF16, or FP8 (either flavor — a direct quantizing store applies
+    ``scale_o`` before the cast, and Amax_O stays the pre-cast fp32 amax).
+    Head TILES any multiple of 32 up to 256 with the QK^T and P@V sides
+    independent; actual head dims may be any multiple of 16 up to the tile
+    (TMA 16-byte global-stride rule at 1 byte/elem) via TMA zero-padding.
+    Attention sinks fold into the softmax denominator: the sink is a virtual
+    column with no V row — it rescales O and enters the LSE. THD (ragged) is
+    served with token- or head-major Stats.
     """
     from cudnn.sdpa.fwd.config_sm120 import SUPPORTED_HEAD_TILES_FP8
 
@@ -982,22 +988,29 @@ def _sm120_fp8_spec() -> EngineSpec:
             phase="prefill",
             d_qk=frozenset(SUPPORTED_HEAD_TILES_FP8),
             d_v=frozenset(SUPPORTED_HEAD_TILES_FP8),
-            dtypes=frozenset({cudnn.data_type.FP8_E4M3}),
-            out_dtypes=frozenset({cudnn.data_type.HALF}),
+            d_envelope=True,  # native tile box d; smaller dims via TMA zero-padding
+            d_pad_multiple=16,  # TMA 16-byte global-stride rule at 1 byte/elem
+            dtypes=frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
+            out_dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
             is_fp8=True,
             causal=True,
             bottom_right=True,
             bottom_right_with_swa=True,
             bottom_right_padded_seq_q=True,
             swa=True,
+            right_band_widening=True,
             padded=True,
+            sink=True,
             stats=True,
             lse_optional=True,
             thd=True,
-            # Same caveat as the SM100 fp8 row: no SEQ_Q_LENS epilogue trim,
-            # but fp8 graphs cannot carry seq_len_q here (lower_dsl_prefill
-            # forces seq_q_lens_present=False for the fp8 family).
             padded_stats=True,
+            skv_tile=0,
+            # dense_flex: any dense layout with the head dim
+            # innermost-contiguous is normalized to the kernel's compact BSHD
+            # by the shared adapter (one gather copy in, one scatter copy
+            # back for O; zero-copy when already BSHD-physical).
+            layouts=frozenset({"bshd", "dense_flex"}),
             sched_policies=frozenset({SCHED_NATURAL}),
             tile_ms=frozenset({64, 128}),
             tile_ns=frozenset({64, 128}),

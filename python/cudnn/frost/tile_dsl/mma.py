@@ -13,7 +13,7 @@ from .swizzle import swizzle_xor_128b, swizzle_lin_128b
 
 
 @cute.jit
-def ptx_mma_m16n8k16_f32(
+def mma_m16n8k16_f32(
     a0: cutlass.Int32,
     a1: cutlass.Int32,
     a2: cutlass.Int32,
@@ -43,7 +43,7 @@ def ptx_mma_m16n8k16_f32(
 
 
 @cute.jit
-def ptx_mma_m16n8k32_e4m3_f32(
+def mma_m16n8k32_f32(
     a0: cutlass.Int32,
     a1: cutlass.Int32,
     a2: cutlass.Int32,
@@ -54,18 +54,22 @@ def ptx_mma_m16n8k32_e4m3_f32(
     c1: cutlass.Float32,
     c2: cutlass.Float32,
     c3: cutlass.Float32,
+    ab_dtype: cutlass.Constexpr[Type[cutlass.Numeric]],
 ) -> tuple[cutlass.Float32, cutlass.Float32, cutlass.Float32, cutlass.Float32]:
-    """``mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32`` (SM89+/SM120).
+    """``mma.sync.aligned.m16n8k32.row.col.f32.{e4m3|e5m2}.{e4m3|e5m2}.f32``.
 
     The C operands travel as ``Int32`` bit patterns and are ``mov.b32``'d into
     ``.f32`` temps inside the asm block: cutlass-dsl 4.7.0's ``inline_ptx``
     fails in libNVVM when a compile-time-constant ``Float32`` reaches
     ``read_only_args``, and an accumulator's zero-init can fold to a constant.
     """
+    if cutlass.const_expr(ab_dtype != cutlass.Float8E4M3FN and ab_dtype != cutlass.Float8E5M2):
+        raise TypeError(f"Invalid A/B dtype: {ab_dtype}")
+    ab_tag = "e4m3" if cutlass.const_expr(ab_dtype == cutlass.Float8E4M3FN) else "e5m2"
     return cute.arch.inline_ptx(
         "{ .reg .f32 fc<4>; "
         "mov.b32 fc0, {$r6}; mov.b32 fc1, {$r7}; mov.b32 fc2, {$r8}; mov.b32 fc3, {$r9}; "
-        "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+        f"mma.sync.aligned.m16n8k32.row.col.f32.{ab_tag}.{ab_tag}.f32 "
         "{{$w0},{$w1},{$w2},{$w3}}, {{$r0},{$r1},{$r2},{$r3}}, {{$r4},{$r5}}, {fc0,fc1,fc2,fc3}; }",
         write_only_types=[
             cutlass.Float32,
@@ -85,34 +89,6 @@ def ptx_mma_m16n8k32_e4m3_f32(
             c2.bitcast(cutlass.Int32),
             c3.bitcast(cutlass.Int32),
         ],
-    )
-
-
-@cute.jit
-def ptx_cvt_e4m3x2(hi: cutlass.Float32, lo: cutlass.Float32) -> cutlass.Uint16:
-    """Pack two fp32 into e4m3 bytes: low byte = e4m3(lo), byte 1 = e4m3(hi).
-
-    ``cvt.rn.satfinite.e4m3x2.f32`` matches torch's ``.to(float8_e4m3fn)``
-    bit-exactly. Operands ride as Int32 bit patterns for the same
-    constant-operand ``inline_ptx`` reason as :func:`ptx_mma_m16n8k32_e4m3_f32`.
-
-    Stays 16-bit so two results pair into one MMA operand register with
-    :func:`pack_f8x2_pairs`.
-    """
-    return cute.arch.inline_ptx(
-        "{ .reg .f32 fa, fb; " "mov.b32 fa, {$r0}; mov.b32 fb, {$r1}; " "cvt.rn.satfinite.e4m3x2.f32 {$w0}, fa, fb; }",
-        write_only_types=[cutlass.Uint16],
-        read_only_args=[hi.bitcast(cutlass.Int32), lo.bitcast(cutlass.Int32)],
-    )
-
-
-@cute.jit
-def pack_f8x2_pairs(pair0: cutlass.Uint16, pair1: cutlass.Uint16) -> cutlass.Int32:
-    """Two e4m3x2 halves into one 32-bit MMA A/B operand (pair0 = low half)."""
-    return cute.arch.inline_ptx(
-        "mov.b32 $0, {$1, $2};",
-        write_only_types=[cutlass.Int32],
-        read_only_args=[pair0, pair1],
     )
 
 

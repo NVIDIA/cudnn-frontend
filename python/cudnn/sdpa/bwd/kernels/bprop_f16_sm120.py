@@ -47,7 +47,7 @@ from cutlass.experimental import primitives as prims
 from cutlass._mlir.dialects import arith
 
 from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_FP16
-from cudnn.frost.tile_dsl.mma import ptx_mma_m16n8k16_f32
+from cudnn.frost.tile_dsl.mma import mma_m16n8k16_f32
 from cudnn.frost.tile_dsl.swizzle import swizzle_xor
 from cudnn.sdpa.bwd.config_sm120 import TemplateParams, validate_params
 
@@ -205,7 +205,7 @@ def mma_bstream(
             a_off = m_block * a_stride
             for half in cutlass.range_constexpr(2):
                 s = (m_block * N_FRAGS + n_frag + half) * 4
-                c0, c1, c2, c3 = ptx_mma_m16n8k16_f32(
+                c0, c1, c2, c3 = mma_m16n8k16_f32(
                     a_frag[a_off + 0],
                     a_frag[a_off + 1],
                     a_frag[a_off + 2],
@@ -249,7 +249,7 @@ def mma_abregs(
             a_off = m_block * a_stride
             for half in cutlass.range_constexpr(2):
                 s = (m_block * N_FRAGS + n_frag + half) * 4
-                c0, c1, c2, c3 = ptx_mma_m16n8k16_f32(
+                c0, c1, c2, c3 = mma_m16n8k16_f32(
                     a_frag[a_off + 0],
                     a_frag[a_off + 1],
                     a_frag[a_off + 2],

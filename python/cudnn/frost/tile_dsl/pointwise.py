@@ -3,6 +3,7 @@
 
 
 import inspect
+from typing import Type
 
 import cutlass
 from cutlass.cute.arch.nvvm_wrappers import inline_ptx
@@ -146,6 +147,29 @@ def fp32_to_fp8_pack(values, *, dtype_tag: str):
         read_only_args=list(values),
     )
     return cutlass.Vector.from_elements((u0, u1, u2, u3), cutlass.Int32)
+
+
+@cute.jit
+def fp32_to_fp8x2(lo: cutlass.Float32, hi: cutlass.Float32, *, dtype: cutlass.Constexpr[Type[cutlass.Numeric]] = cutlass.Float8E4M3FN) -> cutlass.Uint16:
+    """Pack two fp32 into fp8 bytes: low byte = fp8(lo), byte 1 = fp8(hi)."""
+    if cutlass.const_expr(dtype != cutlass.Float8E4M3FN and dtype != cutlass.Float8E5M2):
+        raise TypeError(f"Invalid FP8 dtype: {dtype}")
+    cvt_tag = "e4m3x2" if cutlass.const_expr(dtype == cutlass.Float8E4M3FN) else "e5m2x2"
+    return cute.arch.inline_ptx(
+        "{ .reg .f32 fa, fb; mov.b32 fa, {$r0}; mov.b32 fb, {$r1}; " + f"cvt.rn.satfinite.{cvt_tag}.f32 " + "{$w0}, fa, fb; }",
+        write_only_types=[cutlass.Uint16],
+        read_only_args=[hi.bitcast(cutlass.Int32), lo.bitcast(cutlass.Int32)],
+    )
+
+
+@cute.jit
+def pack_fp8x2_pairs(pair0: cutlass.Uint16, pair1: cutlass.Uint16) -> cutlass.Int32:
+    """Two fp8x2 halves into one 32-bit MMA A/B operand (pair0 = low half)."""
+    return cute.arch.inline_ptx(
+        "mov.b32 $0, {$1, $2};",
+        write_only_types=[cutlass.Int32],
+        read_only_args=[pair0, pair1],
+    )
 
 
 def vec_scale_pair(vec, scalar, N):
