@@ -328,7 +328,12 @@ def make_warp_cfg(params: TemplateParams, C: int):
         tpr, wn, ldgs = best
         intra = 32
 
-    block_threads = max(tpr, (256 // tpr) * tpr)
+    # wn>1 uses a cross-warp smem reduce guarded by __syncthreads. One row per CTA
+    # (rpc=1) makes that barrier sync only this row's warps — packing 2 rows/CTA
+    # over-syncs (the fast row waits on the slow one) and measured ~10% slower. For
+    # wn==1 (single-warp / sub-warp, shfl-only, no block barrier) packing several
+    # rows/CTA is free and helps occupancy, so keep it there.
+    block_threads = tpr if wn > 1 else max(tpr, (256 // tpr) * tpr)
     rpc = block_threads // tpr
     return (tpr, wn, intra, ldgs, rpc, block_threads, V)
 
@@ -357,7 +362,7 @@ def warp_cfg_candidates(params: TemplateParams, C: int):
         ldgs = vec_cols // tpr
         if ldgs < 1 or ldgs > 32:  # register-footprint cap
             continue
-        bt = max(tpr, (256 // tpr) * tpr)
+        bt = wn * 32 if wn > 1 else max(tpr, (256 // tpr) * tpr)  # rpc=1 for wn>1
         out.append((tpr, wn, 32, ldgs, bt // tpr, bt, V))
     return out
 
