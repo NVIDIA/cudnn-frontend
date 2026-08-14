@@ -171,23 +171,26 @@ def _warp_fwd_host(
 # min CTAs/SM (launch_bounds minnctapersm). 0 = compiler default (measured: forcing
 # it spills and hurts, so left off).
 _MBPM = 0
-# Persistent grid: cap the grid at SM_COUNT * _PERSIST_MULT so each CTA grid-strides
-# over many rows, overlapping row i's reduction latency with row i+1's loads (a
-# one-tile-per-CTA grid exposes that latency and loses ~30% bandwidth). Measured
-# sweet spot ~4x SM count on this GPU. 0 override = one tile per CTA.
-_PERSIST_MULT = 4
-_CTAS_CAP = 0  # test override; 0 = use _PERSIST_MULT * SM count
+# Persistent grid: cap the grid so each CTA grid-strides over many rows, overlapping
+# row i's reduction latency with row i+1's loads (a one-tile-per-CTA grid exposes
+# that latency and loses ~30% bandwidth). The cap multiple of SM_COUNT is
+# ``clamp(round(16/ldgs), 2, 8)`` — an autotune-derived formula that matched the
+# per-shape optimum across every benchmark shape (more work per row -> ldgs large
+# -> fewer CTAs; small rows -> ldgs=1 -> many persistent CTAs). See
+# benchmark/norms/autotune_warp_fwd.py.
+_CTAS_CAP = 0  # test override; 0 = use the ldgs-based formula
 _SM_COUNT = None
 
 
-def _persist_cap():
+def _persist_cap(full_ctas, ldgs):
     global _SM_COUNT
     if _CTAS_CAP:
-        return _CTAS_CAP
+        return min(full_ctas, _CTAS_CAP)
     if _SM_COUNT is None:
         import torch
         _SM_COUNT = torch.cuda.get_device_properties(0).multi_processor_count
-    return _SM_COUNT * _PERSIST_MULT
+    mult = max(2, min(8, round(16 / ldgs)))
+    return min(full_ctas, _SM_COUNT * mult)
 
 
 _KCACHE = {}
@@ -203,7 +206,7 @@ def forward(spec, x2d, gamma, beta, *, eps, wcfg, params):
         beta = torch.zeros(spec.gamma_len, dtype=x2d.dtype, device=x2d.device)
 
     R, C = spec.R, spec.M
-    ctas = min((R + rpc - 1) // rpc, _persist_cap())  # persistent grid
+    ctas = _persist_cap((R + rpc - 1) // rpc, ldgs)  # persistent grid (ldgs-based cap)
     y = torch.empty_like(x2d)
     mean = torch.empty(R, dtype=torch.float32, device=x2d.device)
     rstd = torch.empty(R, dtype=torch.float32, device=x2d.device)
