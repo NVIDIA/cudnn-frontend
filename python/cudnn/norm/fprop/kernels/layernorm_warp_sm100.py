@@ -158,13 +158,36 @@ def _warp_fwd_host(
     intra: cutlass.Constexpr, ldgs: cutlass.Constexpr, rpc: cutlass.Constexpr,
     block_threads: cutlass.Constexpr, et: cutlass.Constexpr, it_ty: cutlass.Constexpr,
     nsteps: cutlass.Constexpr, has_mean: cutlass.Constexpr, has_beta: cutlass.Constexpr,
+    mbpm: cutlass.Constexpr,
 ) -> None:
     mXi = cute.recast_tensor(mX, it_ty)
     mYi = cute.recast_tensor(mY, it_ty)
     _warp_fwd_kernel(
         mXi, mYi, mGamma, mBeta, mMean, mRstd, R, ctas, eps,
         C, V, tpr, wn, intra, ldgs, rpc, block_threads, et, it_ty, nsteps, has_mean, has_beta,
-    ).launch(grid=(ctas, 1, 1), block=(block_threads, 1, 1))
+    ).launch(grid=(ctas, 1, 1), block=(block_threads, 1, 1), min_blocks_per_mp=mbpm)
+
+
+# min CTAs/SM (launch_bounds minnctapersm). 0 = compiler default (measured: forcing
+# it spills and hurts, so left off).
+_MBPM = 0
+# Persistent grid: cap the grid at SM_COUNT * _PERSIST_MULT so each CTA grid-strides
+# over many rows, overlapping row i's reduction latency with row i+1's loads (a
+# one-tile-per-CTA grid exposes that latency and loses ~30% bandwidth). Measured
+# sweet spot ~4x SM count on this GPU. 0 override = one tile per CTA.
+_PERSIST_MULT = 4
+_CTAS_CAP = 0  # test override; 0 = use _PERSIST_MULT * SM count
+_SM_COUNT = None
+
+
+def _persist_cap():
+    global _SM_COUNT
+    if _CTAS_CAP:
+        return _CTAS_CAP
+    if _SM_COUNT is None:
+        import torch
+        _SM_COUNT = torch.cuda.get_device_properties(0).multi_processor_count
+    return _SM_COUNT * _PERSIST_MULT
 
 
 _KCACHE = {}
@@ -180,7 +203,7 @@ def forward(spec, x2d, gamma, beta, *, eps, wcfg, params):
         beta = torch.zeros(spec.gamma_len, dtype=x2d.dtype, device=x2d.device)
 
     R, C = spec.R, spec.M
-    ctas = (R + rpc - 1) // rpc
+    ctas = min((R + rpc - 1) // rpc, _persist_cap())  # persistent grid
     y = torch.empty_like(x2d)
     mean = torch.empty(R, dtype=torch.float32, device=x2d.device)
     rstd = torch.empty(R, dtype=torch.float32, device=x2d.device)
@@ -191,8 +214,8 @@ def forward(spec, x2d, gamma, beta, *, eps, wcfg, params):
 
     args = (dyn(x2d), dyn(y), dyn(gamma), dyn(beta), dyn(mean), dyn(rstd),
             cutlass.Int32(R), cutlass.Int32(ctas), cutlass.Float32(eps))
-    ce = (C, V, tpr, wn, intra, ldgs, rpc, block_threads, et, it_ty, nsteps, spec.has_mean, has_beta)
-    key = (params.io_dtype, C, tpr, wn, intra, ldgs, rpc, block_threads, spec.has_mean, has_beta)
+    ce = (C, V, tpr, wn, intra, ldgs, rpc, block_threads, et, it_ty, nsteps, spec.has_mean, has_beta, _MBPM)
+    key = (params.io_dtype, C, tpr, wn, intra, ldgs, rpc, block_threads, spec.has_mean, has_beta, _MBPM)
     fn = _KCACHE.get(key)
     if fn is None:
         fn = cute.compile(_warp_fwd_host, *args, *ce)
