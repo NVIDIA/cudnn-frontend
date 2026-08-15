@@ -33,6 +33,8 @@ from cudnn.gemm.frost.kernel_templates._tile_helpers import (
     moe_swizzle_tile as _moe_swizzle_tile,
     replace_tensormap_global_address as _replace_tensormap_global_address,
     replace_tensormap_global_dim_1 as _replace_tensormap_global_dim_1,
+    tcgen05_alloc as _tcgen05_alloc,
+    tcgen05_dealloc as _tcgen05_dealloc,
     TENSOR_MAP_QWORDS,
 )
 import cutlass.experimental.cuda.tensor_map as _tma
@@ -516,7 +518,7 @@ def _kernel(
 
     if warp_idx == mma_warp_id:
         nvvm.setmaxregister(prod_reg_count, nvvm.SetMaxRegisterAction.DECREASE)
-        nvvm.tcgen05_alloc(
+        _tcgen05_alloc(
             tmem_ptr_i32,
             cutlass.Int32(num_tmem_alloc_cols),
             is_exclusive=tmem_alloc_exclusive,
@@ -662,7 +664,7 @@ def _kernel(
         nvvm.bar_warp_sync(0xFFFFFFFF)
         nvvm.tcgen05_relinquish_alloc_permit(group=nvvm.CTAGroup.CTA_1)
         alloc_ptr = cutlass.inttoptr(tmem_raw_addr, 6, cutlass.Int32)
-        nvvm.tcgen05_dealloc(
+        _tcgen05_dealloc(
             alloc_ptr,
             cutlass.Int32(num_tmem_alloc_cols),
             is_exclusive=tmem_alloc_exclusive,
