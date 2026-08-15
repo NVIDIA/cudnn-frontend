@@ -76,6 +76,7 @@ class Plan:
         self.binding = self._compiled.binding
         self.block_scale = self.chain.has_block_scale
         self.aux_names = [t.name for t in self.chain.aux_tensors]
+        self.generated_path = self._compiled.generated_path
 
     def __call__(self, variant_pack):
         return self._compiled(variant_pack)
