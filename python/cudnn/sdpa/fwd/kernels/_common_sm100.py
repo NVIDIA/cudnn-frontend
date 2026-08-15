@@ -45,6 +45,10 @@ class Bars(NamedTuple):
     mb_empty_mainloop: object
 
     mb_q_o_alias: object
+    # Return edge of the Q∪O alias gate (see the soundness note in
+    # make_classic_bars): TMA-LDG arrives after consuming each alias-gate
+    # phase; TMA-STG waits it before its next alias arrive.
+    mb_qo_slab_free: object
 
 
 class D256Bars(NamedTuple):
@@ -140,7 +144,19 @@ def make_classic_bars(CFG) -> Bars:
         mb_o_empty=MBarrier(_alloc(CFG.TILES_Q), stages=CFG.TILES_Q, init_count=CFG.ONE_WARP, producer=Producer.THREAD),
         mb_tmem_dealloc=MBarrier(_alloc(1), stages=1, init_count=CORR_LANES_TOTAL, producer=Producer.THREAD),
         mb_empty_mainloop=MBarrier(_alloc(1), stages=1, init_count=CORR_LANES_TOTAL, producer=Producer.LEADER, scope=Scope.LEADER),
+        # Q∪O alias gate FULL/EMPTY pair.  mb_q_o_alias alone is UNSOUND:
+        # mbarrier parity waits deadlock once a producer runs >= 2 phases
+        # ahead, and on EMPTY tiles (zero-KV varlen sequences) the
+        # corr -> STG -> alias-arrive chain has NO dependency on TMA-LDG, so
+        # a delayed LDG warp loses the race and its bootstrap parity credit
+        # is consumed by a real arrive (observed: LDG parked forever at the
+        # tile-1 alias wait with the barrier already in phase 1, deadlocking
+        # the whole cluster).  mb_qo_slab_free is the return edge: LDG
+        # arrives it right after consuming each alias phase and STG waits it
+        # before each alias arrive, bounding either side's lead to one phase
+        # by construction.
         mb_q_o_alias=MBarrier(_alloc(CFG.TILES_Q), stages=CFG.TILES_Q, init_count=CFG.ONE_WARP, producer=Producer.THREAD),
+        mb_qo_slab_free=MBarrier(_alloc(CFG.TILES_Q), stages=CFG.TILES_Q, init_count=CFG.ONE_WARP, producer=Producer.THREAD),
     )
 
 

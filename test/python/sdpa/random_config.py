@@ -355,11 +355,7 @@ class RandomizationContext:
             # ~10% chance of 0-length sequence for each batch
             randoms_.seq_len_q = [0 if rng.random() < 0.1 else rng.randint(1, randoms_.s_q) for _ in range(randoms_.batches)]
             # ~10% chance of 0-length sequence for each batch (independent of seq_len_q)
-            randoms_.seq_len_kv = [
-                # 0 if rng.random() < 0.1 else rng.randint(randoms_.seq_len_q[i], randoms_.s_kv) for i in range(randoms_.batches)
-                rng.randint(1, randoms_.s_kv)
-                for i in range(randoms_.batches)
-            ]
+            randoms_.seq_len_kv = [0 if rng.random() < 0.1 else rng.randint(1, randoms_.s_kv) for i in range(randoms_.batches)]
 
         # Decide the left and right bounds for the sliding window mask (None = no bound)
         randoms_.left_bound = None

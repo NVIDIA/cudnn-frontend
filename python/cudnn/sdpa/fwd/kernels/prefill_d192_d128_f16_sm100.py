@@ -428,6 +428,7 @@ def _kernel(
                 bars.mb_o_empty[qs].init()
                 if cutlass.const_expr(IS_QO_ALIAS):
                     bars.mb_q_o_alias[qs].init()
+                    bars.mb_qo_slab_free[qs].init()
                 for c in cutlass.range_constexpr(CFG.N_BMM2_CHUNKS):
                     bars.mb_bmm2_ready[qs * CFG.N_BMM2_CHUNKS + c].init()
             for ks in cutlass.range_constexpr(CFG.STAGES_KV):
@@ -700,8 +701,15 @@ def _tmaldg_warp_group(
                 # TMA-STG advances the Q/O alias gate for every tile, including
                 # empty ones. Consume that transaction even though no Q reload
                 # is needed, or the next nonempty tile observes stale parity.
+                # mb_qo_slab_free is the RETURN edge: without it, runs of
+                # empty tiles let STG (whose empty-tile O store depends only
+                # on correction, never on this warp) race >= 2 alias phases
+                # ahead of a delayed LDG, and mbarrier parity waits deadlock
+                # at lead 2 — the observed zero-KV cluster hang.
                 _wait_mbarrier(mb_q_reload[0], q_empty_phase)
+                bars.mb_qo_slab_free[0].arrive()
                 _wait_mbarrier(mb_q_reload[1], q_empty_phase)
+                bars.mb_qo_slab_free[1].arrive()
                 q_empty_phase = q_empty_phase ^ 1
         else:
             # Prologue interleave Q[0] -> K[first] -> Q[1] -> V[first] -> mainloop —
@@ -709,6 +717,8 @@ def _tmaldg_warp_group(
             kv_row_base = kv_left * CFG.TILE_N
 
             _wait_mbarrier(mb_q_reload[0], q_empty_phase)
+            if cutlass.const_expr(IS_QO_ALIAS):
+                bars.mb_qo_slab_free[0].arrive()
             if cutlass.const_expr(CFG.CTA_MMA == 2):
                 bars.mb_q_full[0].arrive(n_bytes=qTmaTransactionBytes, pred=is_leader & nvvm.elect_sync())
             else:
@@ -744,6 +754,8 @@ def _tmaldg_warp_group(
             )
 
             _wait_mbarrier(mb_q_reload[1], q_empty_phase)
+            if cutlass.const_expr(IS_QO_ALIAS):
+                bars.mb_qo_slab_free[1].arrive()
             if cutlass.const_expr(CFG.CTA_MMA == 2):
                 bars.mb_q_full[1].arrive(n_bytes=qTmaTransactionBytes, pred=is_leader & nvvm.elect_sync())
             else:
@@ -862,6 +874,9 @@ def _tmastg_warp_group(
     via scheduler warp's clusterlaunchcontrol.try_cancel.async.
     """
     o_full_phase = cutlass.Int32(0)  # consumer waits — first-arrive flips 0 → 1
+    # Alias-gate return edge (see the arrive site below): starts 0 — the
+    # first wait consumes LDG's first real slab_free arrive.
+    slab_free_phase = cutlass.Int32(0)
 
     tma_o = GmemTileTma(tma_o_desc)
 
@@ -906,11 +921,22 @@ def _tmastg_warp_group(
 
             bars.mb_o_empty[qs].arrive()
             # QO_ALIAS: O[qs] has drained to GMEM → the shared Q∪O slab is free
-            # for TMA-LDG to clobber with the next tile's Q[qs].
+            # for TMA-LDG to clobber with the next tile's Q[qs].  The
+            # mb_qo_slab_free wait (return edge) throttles this arrive to at
+            # most ONE phase ahead of LDG's alias-gate consumption — without
+            # it, empty-tile runs (zero-KV varlen) let this warp lap a
+            # delayed LDG by 2+ phases and mbarrier parity waits deadlock.
+            # Consumer-side bootstrap: slab_free_phase starts 0, so the first
+            # wait consumes LDG's first REAL arrive (LDG cannot be preceded —
+            # its arrive follows its own alias wait, which this warp's tile-1
+            # arrive has not yet advanced).
             if cutlass.const_expr(IS_QO_ALIAS):
+                _wait_mbarrier(bars.mb_qo_slab_free[qs], slab_free_phase)
                 bars.mb_q_o_alias[qs].arrive()
 
         o_full_phase = o_full_phase ^ 1
+        if cutlass.const_expr(IS_QO_ALIAS):
+            slab_free_phase = slab_free_phase ^ 1
 
         _wait_ptr(sched.mb_scheduler.subview(sched_state.idx), sched_state.phase)
         nxt_q = (sched.tile_id_smem.subview(sched_state.idx * cutlass.Int32(8) + cutlass.Int32(0))).load()
