@@ -1118,8 +1118,8 @@ def test_dsl_sm100_thd_over_launched_units_are_dead(monkeypatch):
 @pytest.mark.L0
 @torch_fork_set_rng(seed=39)
 def test_dsl_sm100_thd_lens_never_reach_host(monkeypatch):
-    """Issue #552 (D2H removal): with a THD_DEVICE_META module the length
-    tensors are consumed ONLY on device — the setup kernel builds the
+    """Issue #552 (D2H removal): the length tensors are consumed ONLY on
+    device — the setup kernel builds the
     metadata, the views bind buffer capacities, and the grid is the
     plan-time envelope — so ANY host read of them (the old tolist
     round-trip) is a regression. The guard rejects every _thd_host_lens

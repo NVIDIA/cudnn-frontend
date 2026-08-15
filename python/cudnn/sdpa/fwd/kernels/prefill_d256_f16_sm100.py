@@ -126,7 +126,6 @@ _TENSOR_MAP_QWORDS = TENSOR_MAP_QWORDS
 # The setup kernel builds the THD metadata buffer DEVICE-side from the
 # caller's length tensors and the adapter launches the plan-time envelope
 # grid (issue #552) — no length ever reaches the host.
-THD_DEVICE_META = True
 _dispatch_decode_initial = _sdpa_h.dispatch_decode_initial
 _dispatch_decode_payload = _sdpa_h.dispatch_decode_payload
 _thd_tma_offsets = _sdpa_h.thd_tma_offsets

@@ -97,15 +97,16 @@ Known violations, all pre-existing and each needing a kernel-side change, so
 none is precedent:
 
 - THD `cu_seqlens` host cumsum (`sdpa/fwd/api_dsl.py`, `_execute_thd` on both
-  SM100 and SM120). RESOLVED on `THD_DEVICE_META` modules (SM100 d128,
-  issue #552) — the reference for the remaining ports: the kernels compile
+  SM100 and SM120). RESOLVED on all SM100 f16 families
+  (issue #552) — the reference for the SM120 port: the kernels compile
   with dynamic token extents (Rule 4), the setup kernel builds the metadata
   buffer device-side from the caller's length tensors, every ragged view
   binds its buffer's capacity, and the grid is the plan-time envelope
   (`b * ceil(s_q_declared / CGA_TILE_M) * qh`) with dead units exiting via
   `_thd_decode`'s `batch == n_batch` sentinel — zero host reads, pinned by
-  the sync-debug and CUDA-graph capture tests. Still open: the OTHER SM100
-  families and SM120 (exact host-computed grid + host-built metadata), and
+  the sync-debug and CUDA-graph capture tests. Still open: SM120 (exact
+  host-computed grid + host-built metadata; its own engine class and grid
+  mechanism, so its own port), and
   the envelope's dead-tile tax under far-oversized declarations (measured
   ~145 ns/dead unit exposed, <0.2% at realistic declarations; a capped
   persistent grid reading a device-side live-unit count would bound it by
