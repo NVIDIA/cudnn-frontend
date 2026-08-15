@@ -1236,6 +1236,18 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             o_stride=_key(self.o_desc),
         )
 
+    def _thd_unit_count(self, slq_host) -> int:
+        """One THD unit per CGA-height slice of each sequence's Q rows.
+
+        The kernel tolerates OVER-counting (issue #552): units past the live
+        total decode to the batch == n_batch dead sentinel — every role takes
+        the empty-KV path and neither O nor LSE is written — so a launch grid
+        sized above the exact total changes nothing but occupancy. The
+        envelope-grid redesign relies on this; the over-launch test pads it
+        to pin the contract."""
+        cga_tile_m = int(self._k_mod.CGA_TILE_M)
+        return self.h_q * sum((l + cga_tile_m - 1) // cga_tile_m for l in slq_host)
+
     def _execute_thd(self, q_buf, k_buf, v_buf, o_buf, scale_softmax_log2, sinks, seq_len_kv, seq_q_lens, lse_tensor=None, workspace=None, current_stream=None):
         """THD / varlen execute: reconstruct the kernel's packed [1, T, H, D] views and metadata buffer from the cuDNN ragged buffers, then launch.
 
@@ -1311,9 +1323,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # vs the builder pass).
         with _torch_stream_context(current_stream, dev):
             o_desc = carver.take(b * 16 + 16, torch.int64) if carver is not None else torch.empty(b * 16 + 16, dtype=torch.int64, device=dev)
-        # One THD unit per CGA-height slice of each sequence's Q rows.
-        cga_tile_m = int(self._k_mod.CGA_TILE_M)
-        units = qh * sum((l + cga_tile_m - 1) // cga_tile_m for l in slq_host)
+        units = self._thd_unit_count(slq_host)
 
         # Declared-stride (1, T, H, D) views, addressed NATIVELY by the kernel
         # (the Q/K/V/O TMA descriptors are built from the tensor views, and

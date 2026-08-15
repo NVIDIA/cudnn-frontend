@@ -1093,6 +1093,28 @@ def test_dsl_sm100_thd_compile_key_plan_time_only():
     assert info_exec.hits >= info_plan.hits + 2
 
 
+@pytest.mark.L0
+@torch_fork_set_rng(seed=38)
+def test_dsl_sm100_thd_over_launched_units_are_dead(monkeypatch):
+    """Issue #552 (envelope-grid enabler): grid units past the live total are
+    DEAD by kernel contract — the decode maps them to the batch == n_batch
+    sentinel, every role takes the empty-KV path (eff_seqlen_kv reads
+    cu_q[0] == 0), and neither O nor the ragged Stats is written (LSE
+    predicate goes negative; the O-store role skips the TMA store). Padding
+    the launch grid must therefore change nothing. Covers a zero-length
+    LEADING sequence (pre-fix, dead units decoded to batch 0 and ran full KV
+    loops there), a zero-length middle sequence, all-KV-zero (dead units on
+    top of the packed-KV clamp), and both Stats layouts."""
+    _require_dsl()
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    exact = SdpaFwdDslSm100._thd_unit_count
+    monkeypatch.setattr(SdpaFwdDslSm100, "_thd_unit_count", lambda self, slq: exact(self, slq) + 7)
+    _run_thd_stats_case(seq_lens_q=[128, 0, 64], seq_lens_kv=[100, 0, 30], mask="causal", stats_layout="token_major")
+    _run_thd_stats_case(seq_lens_q=[0, 64, 32], seq_lens_kv=[50, 40, 0], mask="none", stats_layout="head_major")
+    _run_thd_stats_case(seq_lens_q=[64, 32], seq_lens_kv=[0, 0], mask="none", stats_layout="token_major")
+
+
 _COMBO_MASKS = {
     "dense": ["none", "causal", "causal_br", "swa", "padded", "band", "band_br", "band_swa", "swa_br"],
     # THD forces padding internally, so its mask axis rides on top of that.

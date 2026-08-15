@@ -449,7 +449,14 @@ def make_sdpa_helpers(CFG, lpt_q_tiles_in_cga_units: bool = False) -> SdpaHelper
         cu = cutlass.make_array_view(seq_kv_lens_t)
         cuq0 = n_batch
         acc = cutlass.Int32(0)
-        f_batch = cutlass.Int32(0)
+        # DEAD-unit sentinel (issue #552 over-launch): a unit no sequence
+        # claims (u >= sum of live units) keeps batch == n_batch.  That index
+        # makes every downstream consumer a no-op through IN-BOUNDS metadata
+        # reads: _resolve_seqlen_kv reads meta[n_batch] = cu_q[0] = 0 (empty
+        # KV range in every role), the epilogue's per-sequence Q length
+        # cu[2n+1]-cu[2n] goes negative (LSE predicate never fires), and the
+        # O-store role skips the TMA store explicitly (batch >= n_batch).
+        f_batch = n_batch
         f_head = cutlass.Int32(0)
         f_qc = cutlass.Int32(0)
         done = cutlass.Int32(0)

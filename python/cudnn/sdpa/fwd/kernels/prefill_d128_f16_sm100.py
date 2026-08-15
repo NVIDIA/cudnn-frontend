@@ -834,9 +834,13 @@ def _tmastg_warp_group(
                 # (base at the sequence's packed row, seq extent = S_q_b → a box
                 # past S_q_b is OOB-clipped).  q_row coord is sequence-local; the
                 # batch coord collapses to 0.  Both slabs share one descriptor.
-                o_desc_ptr = (o_desc_words.iterator.raw_ptr() + batch_idx * cutlass.Int32(_TENSOR_MAP_QWORDS)).tospace(cutlass.AddressSpace.generic)
-                o_slice = tma_slice_runtime_desc(o_desc_ptr, cutlass.Int32(0), head_idx, q_row_base + cutlass.Int32(qs * CFG.TILE_M), cutlass.Int32(0))
-                tma_store_tile(sO[qs], o_slice)
+                # DEAD unit (batch == n_batch, over-launched grid — issue #552):
+                # no O rows exist and descriptor slot n_batch is never built, so
+                # skip the store; the barrier protocol below still runs.
+                if batch_idx < n_batch:
+                    o_desc_ptr = (o_desc_words.iterator.raw_ptr() + batch_idx * cutlass.Int32(_TENSOR_MAP_QWORDS)).tospace(cutlass.AddressSpace.generic)
+                    o_slice = tma_slice_runtime_desc(o_desc_ptr, cutlass.Int32(0), head_idx, q_row_base + cutlass.Int32(qs * CFG.TILE_M), cutlass.Int32(0))
+                    tma_store_tile(sO[qs], o_slice)
             else:
                 tma_store_tile(
                     sO[qs],
