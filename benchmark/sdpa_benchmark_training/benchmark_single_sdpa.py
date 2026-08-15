@@ -213,9 +213,11 @@ def parse_args():
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
     parser.add_argument(
         "--fa4_num_splits",
-        default=None,
+        default=0,
         type=int,
-        help="FlashAttention-4 only: force num_splits (KV split count). " "Default is None (FA4 picks automatically).",
+        help="FlashAttention-4 only: num_splits (KV split count) passed to flash_attn_func. "
+        "Default 0 enables FA4's split-KV heuristic; FA4's own default of 1 never splits. "
+        "On SM120 (which only supports num_splits=1) 0 resolves to 1.",
     )
     parser.add_argument(
         "--fwd_bwd",
@@ -1306,15 +1308,22 @@ else:
     if args.sdpa_backend == "flash_attention_4" or (not args.skip_ref):
         import flash_attn.cute.interface as flash_attn_interface
 
+        # flash_attn_func's own default is num_splits=1 (never split KV); 0 engages
+        # FA4's split-KV heuristic. Always pass the resolved value explicitly.
+        # SM120's forward kernel only supports num_splits=1 (the heuristic path
+        # asserts there), so the auto default resolves to 1 on that arch.
+        fa4_num_splits = args.fa4_num_splits
+        if fa4_num_splits == 0 and torch.cuda.get_device_capability()[0] == 12:
+            fa4_num_splits = 1
+
         def flash_attention_4_sdpa(query, key, value):
             window_size = (args.sliding_window_size, 0) if args.sliding_window_size else (None, None)
             kwargs = dict(
                 causal=args.attn_mask != "no_mask",
                 window_size=window_size,
                 deterministic=args.deterministic_bwd,
+                num_splits=fa4_num_splits,
             )
-            if args.fa4_num_splits is not None:
-                kwargs["num_splits"] = args.fa4_num_splits
             output, _ = flash_attn_interface.flash_attn_func(
                 query,
                 key,
