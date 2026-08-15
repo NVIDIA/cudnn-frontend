@@ -1755,9 +1755,12 @@ class pygraph:
                     ``set_stream`` semantics, both python engines and backend)
             override_uids/shapes/strides: dynamic-shape overrides (backend path)
         """
-        # A JIT engine must compile for the device/stream it will run on.
-        caller_ctx = self._build_context(handle) if handle is not None else None
         if not self._is_built:
+            # A JIT engine must compile for the device/stream it will run on, so
+            # build the caller context here. Only here: a steady-state execute()
+            # otherwise discarded this (a cudnnGetStream round-trip + an
+            # ExecutionContext alloc, ~2.9us) on every already-built call.
+            caller_ctx = self._build_context(handle) if handle is not None else None
             if not self._planning_done:
                 self.create_execution_plans()
             self.build(ctx=caller_ctx)
