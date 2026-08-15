@@ -103,23 +103,26 @@ the whole step in a CUDA graph.
 ### 8. Measuring host bubbles instead of kernels
 Eager best-of-N CUDA-event timing includes the host dispatch bubble between events; it can
 make a faster kernel look slower purely from wrapper cost. When you want to compare *kernel*
-quality, capture the region in a CUDA graph and time `replay()` — that removes host dispatch
-and reports kernel time. Use eager timing to measure your *integration's* per-call overhead
-(that is a real cost too), and graph timing to measure the kernels.
+quality, capture the region in a CUDA graph and time `replay()` — that removes the host
+dispatch bubbles and reports the captured-workload GPU time (kernels plus the graph's own
+in-graph launch overhead), which is close to kernel time but not a pure kernel-only profile;
+for that, use a kernel profiler (Nsight/`torch.profiler` device time). Use eager timing to
+measure your *integration's* per-call overhead (a real cost too), graph replay for the
+captured GPU time, and a profiler when you need per-kernel numbers.
 
 ## The ceiling: CUDA graphs
 
 For a steady-state training or inference loop with fixed shapes, capture the step (or the
 whole iteration) into a CUDA graph once and replay it. This removes *all* per-call host
 overhead in this document at a stroke — `set_stream`, plan selection, variant-pack building,
-Python churn — leaving only kernel time. It is the single highest-leverage integration step
+Python churn — leaving essentially the captured GPU work. It is the single highest-leverage step
 when the shape is stable. See `docs/cuda-graphs.md`. cuDNN `execute` is capture-safe;
 pre-build graphs and pre-allocate workspaces/outputs so nothing allocates during capture.
 
 ## What "good" looks like
 
 A correctly-integrated single cuDNN GEMM lands at ~8-9 µs/call eager (cuBLAS parity), and a
-CUDA-graphed layer runs at pure kernel time where the in-graph fusions (SwiGLU forward, dACT
+CUDA-graphed layer runs at its captured GPU time where the in-graph fusions (SwiGLU forward, dACT
 epilogue) are net wins. If you see a GEMM-heavy layer regress when routed through cuDNN, the
 cause is almost always one of traps 1-4 above, not the kernels.
 

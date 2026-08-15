@@ -51,14 +51,20 @@ _AUTOTUNE_LOG = {}
 
 
 def _handle(device):
-    """One cuDNN handle per CUDA device, bound to that device's current stream. Graphs and
-    workspaces are device-specific, so every cache key below also includes device.index."""
-    h = _HANDLES.get(device.index)
-    if h is None:
+    """One cuDNN handle per CUDA device. Graphs/workspaces are device-specific, so every
+    cache key below also includes device.index. `set_stream` is called only when the
+    current stream changes (it costs ~5 us/call) — see docs/framework_integration_performance.md.
+    Assumes a handle is not used from two streams concurrently (true for this single-stream sample)."""
+    entry = _HANDLES.get(device.index)
+    if entry is None:
         with torch.cuda.device(device):
-            h = cudnn.create_handle()
-        _HANDLES[device.index] = h
-    cudnn.set_stream(handle=h, stream=torch.cuda.current_stream(device).cuda_stream)
+            entry = [cudnn.create_handle(), None]  # [handle, last_stream]
+        _HANDLES[device.index] = entry
+    h, last_stream = entry
+    stream = torch.cuda.current_stream(device).cuda_stream
+    if stream != last_stream:
+        cudnn.set_stream(handle=h, stream=stream)
+        entry[1] = stream
     return h
 
 
@@ -73,23 +79,24 @@ def _autotune(g, handle, var_pack, label):
     g.build_plans(cudnn.build_plan_policy.ALL)
     n = g.get_execution_plan_count()
     dev = next(iter(var_pack.values())).device
-    ws = torch.empty(max(g.get_workspace_size_plan_at_index(i) for i in range(n)), device=dev, dtype=torch.uint8)
-    start, stop = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
     times = [float("inf")] * n
-    for i in range(n):
-        try:
-            g.execute_plan_at_index(var_pack, ws, index=i, handle=handle)  # warm up / validity
-            torch.cuda.synchronize()
-            start.record()
-            for _ in range(_AUTOTUNE_ITERS):
-                g.execute_plan_at_index(var_pack, ws, index=i, handle=handle)
-            stop.record()
-            stop.synchronize()
-            times[i] = start.elapsed_time(stop) / _AUTOTUNE_ITERS
-        except Exception:
-            pass  # a plan may build but fail to execute on this shape; skip it
+    with torch.cuda.device(dev):  # events/workspace/sync must be on the graph's device
+        ws = torch.empty(max(g.get_workspace_size_plan_at_index(i) for i in range(n)), device=dev, dtype=torch.uint8)
+        start, stop = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        for i in range(n):
+            try:
+                g.execute_plan_at_index(var_pack, ws, index=i, handle=handle)  # warm up / validity
+                torch.cuda.synchronize(dev)
+                start.record()
+                for _ in range(_AUTOTUNE_ITERS):
+                    g.execute_plan_at_index(var_pack, ws, index=i, handle=handle)
+                stop.record()
+                stop.synchronize()
+                times[i] = start.elapsed_time(stop) / _AUTOTUNE_ITERS
+            except Exception:
+                pass  # a plan may build but fail to execute on this shape; skip it
     best = min(range(n), key=times.__getitem__)
-    heur_first = next((t for t in times if t != float("inf")), float("inf"))
+    heur_first = times[0]  # index 0 is the top heuristic pick (inf if it failed to run)
     _AUTOTUNE_LOG[label] = (n, best, heur_first, times[best])
     return best, ws
 
@@ -129,17 +136,17 @@ def swiglu_act(x, Wg, Wu):
     """
     h = _handle(x.device)
     M, H = x.shape
-    I = Wg.shape[0]
+    interm = Wg.shape[0]
     xv = x.unsqueeze(0)
-    wg, wu = Wg.t().unsqueeze(0), Wu.t().unsqueeze(0)  # [1,H,I] column-major views, no copy
+    wg, wu = Wg.t().unsqueeze(0), Wu.t().unsqueeze(0)  # [1,H,interm] column-major views, no copy
     # key on every bound tensor's actual strides + device: cached descriptors encode them
-    key = (M, H, I, x.dtype, xv.stride(), wg.stride(), wu.stride(), x.device.index)
+    key = (M, H, interm, x.dtype, xv.stride(), wg.stride(), wu.stride(), x.device.index)
     e = _SWIGLU_CACHE.get(key)
     if e is None:
         g = cudnn.pygraph(handle=h, compute_data_type=FP32)
         X = g.tensor(dim=[1, M, H], stride=list(xv.stride()), data_type=BF16)
-        WG = g.tensor(dim=[1, H, I], stride=list(wg.stride()), data_type=BF16)
-        WU = g.tensor(dim=[1, H, I], stride=list(wu.stride()), data_type=BF16)
+        WG = g.tensor(dim=[1, H, interm], stride=list(wg.stride()), data_type=BF16)
+        WU = g.tensor(dim=[1, H, interm], stride=list(wu.stride()), data_type=BF16)
         gate = g.matmul(name="gate", A=X, B=WG, compute_data_type=FP32)
         sg = g.mul(a=gate, b=g.sigmoid(input=gate))  # SiLU = gate * sigmoid(gate)
         up = g.matmul(name="up", A=X, B=WU, compute_data_type=FP32)
@@ -148,12 +155,12 @@ def swiglu_act(x, Wg, Wu):
         g.validate()
         g.build_operation_graph()
         g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
-        out = torch.empty(M, I, device=x.device, dtype=x.dtype)
-        best, ws = _autotune(g, h, {X: xv, WG: wg, WU: wu, hh: out.unsqueeze(0)}, ("swiglu", M, H, I))
+        out = torch.empty(M, interm, device=x.device, dtype=x.dtype)
+        best, ws = _autotune(g, h, {X: xv, WG: wg, WU: wu, hh: out.unsqueeze(0)}, ("swiglu", M, H, interm))
         e = (g, X, WG, WU, hh, best, ws)
         _SWIGLU_CACHE[key] = e
     g, X, WG, WU, hh, best, ws = e
-    out = torch.empty(M, I, device=x.device, dtype=x.dtype)
+    out = torch.empty(M, interm, device=x.device, dtype=x.dtype)
     g.execute_plan_at_index({X: xv, WG: wg, WU: wu, hh: out.unsqueeze(0)}, ws, index=best, handle=h)
     return out
 
@@ -165,16 +172,16 @@ def _dswiglu(dh, gate, up):
     both outputs hits "unsupported multi-output fusion", so dup and dgate are separate
     graphs; each fuses fully and they share the cheap sigmoid(gate) recompute."""
     h = _handle(dh.device)
-    M, I = dh.shape
-    key = (M, I, dh.dtype, dh.device.index)
+    M, interm = dh.shape
+    key = (M, interm, dh.dtype, dh.device.index)
     e = _DSWIGLU_CACHE.get(key)
     if e is None:
 
         def build(fn):
             g = cudnn.pygraph(handle=h, compute_data_type=FP32)
-            DH = g.tensor(dim=[1, M, I], stride=[M * I, I, 1], data_type=BF16)
-            GATE = g.tensor(dim=[1, M, I], stride=[M * I, I, 1], data_type=BF16)
-            UP = g.tensor(dim=[1, M, I], stride=[M * I, I, 1], data_type=BF16)
+            DH = g.tensor(dim=[1, M, interm], stride=[M * interm, interm, 1], data_type=BF16)
+            GATE = g.tensor(dim=[1, M, interm], stride=[M * interm, interm, 1], data_type=BF16)
+            UP = g.tensor(dim=[1, M, interm], stride=[M * interm, interm, 1], data_type=BF16)
             out = fn(g, DH, GATE, UP)
             out.set_output(True).set_data_type(BF16)
             g.validate()
@@ -191,19 +198,19 @@ def _dswiglu(dh, gate, up):
             silup = g.add(a=s, b=g.sub(a=silu, b=g.mul(a=silu, b=s)))  # silu' = s + silu*(1-s)
             return g.mul(a=g.mul(a=DH, b=UP), b=silup)
 
-        scratch = torch.empty(M, I, device=dh.device, dtype=dh.dtype)
+        scratch = torch.empty(M, interm, device=dh.device, dtype=dh.dtype)
         built = {}
         for name, fn in (("dup", dup_fn), ("dgate", dgate_fn)):
             g, DH, GATE, UP, out = build(fn)
             vp = {DH: dh.unsqueeze(0), GATE: gate.unsqueeze(0), UP: up.unsqueeze(0), out: scratch.unsqueeze(0)}
-            best, ws = _autotune(g, h, vp, ("dswiglu-" + name, M, I))
+            best, ws = _autotune(g, h, vp, ("dswiglu-" + name, M, interm))
             built[name] = (g, DH, GATE, UP, out, best, ws)
         e = built
         _DSWIGLU_CACHE[key] = e
     outs = {}
     for name in ("dup", "dgate"):
         g, DH, GATE, UP, out, best, ws = e[name]
-        buf = torch.empty(M, I, device=dh.device, dtype=dh.dtype)
+        buf = torch.empty(M, interm, device=dh.device, dtype=dh.dtype)
         g.execute_plan_at_index({DH: dh.unsqueeze(0), GATE: gate.unsqueeze(0), UP: up.unsqueeze(0), out: buf.unsqueeze(0)}, ws, index=best, handle=h)
         outs[name] = buf
     return outs["dgate"], outs["dup"]
@@ -230,7 +237,7 @@ class SwigluMLP(torch.autograd.Function):
         dWd = _mm(dout2.t(), h)
         gate = _mm(x2, Wg.t())  # recompute (no fwd materialization)
         up = _mm(x2, Wu.t())
-        dgate, dup = _dswiglu(dh, gate, up)  # fused: 1 cuDNN kernel
+        dgate, dup = _dswiglu(dh, gate, up)  # fused dSwiGLU: two cuDNN pointwise kernels (dup, dgate)
         dx = _mm(dgate, Wg) + _mm(dup, Wu)
         dWg = _mm(dgate.t(), x2)
         dWu = _mm(dup.t(), x2)
@@ -242,12 +249,12 @@ def _demo():
     if dev is None:
         print("no SM100+ (Blackwell) GPU found; the fused runtime-fusion engine needs one — skipping.")
         return
-    M, H, I = 2048, 5120, 17408  # Qwen3.5-27B MLP shape
+    M, H, interm = 2048, 5120, 17408  # Qwen3.5-27B MLP shape
     torch.manual_seed(0)
     x = torch.randn(1, M, H, device=dev, dtype=torch.bfloat16, requires_grad=True)
-    Wg = (torch.randn(I, H, device=dev, dtype=torch.bfloat16) * 0.02).requires_grad_(True)
-    Wu = (torch.randn(I, H, device=dev, dtype=torch.bfloat16) * 0.02).requires_grad_(True)
-    Wd = (torch.randn(H, I, device=dev, dtype=torch.bfloat16) * 0.02).requires_grad_(True)
+    Wg = (torch.randn(interm, H, device=dev, dtype=torch.bfloat16) * 0.02).requires_grad_(True)
+    Wu = (torch.randn(interm, H, device=dev, dtype=torch.bfloat16) * 0.02).requires_grad_(True)
+    Wd = (torch.randn(H, interm, device=dev, dtype=torch.bfloat16) * 0.02).requires_grad_(True)
     do = torch.randn(1, M, H, device=dev, dtype=torch.bfloat16)
     xr, Wgr, Wur, Wdr = (t.detach().clone().requires_grad_(True) for t in (x, Wg, Wu, Wd))
 
@@ -257,7 +264,7 @@ def _demo():
     def rel(a, b):
         return (a.float() - b.float()).norm().item() / max(b.float().norm().item(), 1e-9)
 
-    print(f"device {torch.cuda.get_device_properties(dev).name}; SwiGLU-MLP M{M} H{H} I{I}")
+    print(f"device {torch.cuda.get_device_properties(dev).name}; SwiGLU-MLP M{M} H{H} I{interm}")
     print(f"fwd  rel={rel(SwigluMLP.apply(x, Wg, Wu, Wd), (F.silu(xr @ Wgr.t()) * (xr @ Wur.t())) @ Wdr.t()):.2e}")
     for n, a, b in [("dx", x.grad, xr.grad), ("dWg", Wg.grad, Wgr.grad), ("dWu", Wu.grad, Wur.grad), ("dWd", Wd.grad, Wdr.grad)]:
         print(f"bwd {n:3} rel={rel(a, b):.2e}")
@@ -270,7 +277,7 @@ def _demo():
     kernels = [(ev.key, ev.count) for ev in prof.key_averages() if ev.self_device_time_total > 0]
     launches = sum(c for _, c in kernels)
     print(f"fused swiglu_act (gate+up+silu+mul) -> {launches} GPU launch(es): {', '.join(k[:60] for k, _ in kernels)}")
-    n, best, heur, bt = _AUTOTUNE_LOG[("swiglu", M, H, I)]
+    n, best, heur, bt = _AUTOTUNE_LOG[("swiglu", M, H, interm)]
     print(f"autotune: {n} plans, heuristic-first {heur:.3f} ms -> tuned {bt:.3f} ms (idx {best}, {heur / bt:.2f}x)")
 
 
