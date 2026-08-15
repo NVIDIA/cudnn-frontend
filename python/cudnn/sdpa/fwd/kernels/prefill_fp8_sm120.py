@@ -60,6 +60,7 @@ from cutlass.experimental import primitives as prims
 from cudnn.frost.tile_dsl.constants import DTYPE_E4M3
 from cudnn.frost.tile_dsl.mma import pack_f8x2_pairs, ptx_cvt_e4m3x2, ptx_mma_m16n8k32_e4m3_f32
 from cudnn.frost.tile_dsl.swizzle import swizzle_xor
+from cudnn.sdpa.fwd.kernels.thd_sm100 import build_thd_meta_kernel as _build_thd_meta_kernel
 from cudnn.sdpa.fwd.config_sm120 import (
     SEQ_KV_TILES as _SEQ_KV_TILES,
     SEQ_Q_TILES as _SEQ_Q_TILES,
@@ -1304,6 +1305,9 @@ class SM120FusedMultiHeadAttentionForward:
         o_scale_fused: cutlass.Float32,
         scale_s: cutlass.Float32,
         thd_max_sq: cutlass.Int32,
+        thd_q_lens: Optional[cute.Tensor],
+        thd_kv_lens: Optional[cute.Tensor],
+        thd_lens_form: Optional[cutlass.Int32],
         stream: cuda_driver.CUstream,
     ) -> None:
         """Launch the SM120 per-tensor FP8 FMHA kernel.
@@ -1433,6 +1437,17 @@ class SM120FusedMultiHeadAttentionForward:
             stride_order=(4, 3, 2, 1, 0),
             swizzle=self.v_tma_swizzle,
         )
+        if cutlass.const_expr(self.thd_varlen):
+            # Build the [kv|cu_q|cu_k] metadata buffer DEVICE-side from the
+            # caller's length tensors (no host cumsum, no H2D — issue #552);
+            # the main kernel launched after it on this stream reads it.
+            _build_thd_meta_kernel(
+                seq_kv_lens,
+                thd_q_lens,
+                thd_kv_lens,
+                thd_lens_form,
+                cutlass.Int32(self.thd_batch),
+            ).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
         self.kernel(
             q,
             k,
@@ -1585,6 +1600,18 @@ def compile(  # noqa: A001
         stride_order=(0,),
         assumed_align=4,
     )
+    # THD: the caller's Q/KV length tensors, consumed by the setup kernel's
+    # device-side metadata build. DYNAMIC extents — (B,) per-batch lengths and
+    # (B+1,) cu prefix sums bind the same artifact; the form rides the runtime
+    # thd_lens_form bitmask, so no compile key grows (Rule 4).
+    if PARAMS.thd_varlen:
+        fake_thd_q_lens = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (cute.sym_int(divisibility=1),), stride_order=(0,), assumed_align=4)
+        fake_thd_kv_lens = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (cute.sym_int(divisibility=1),), stride_order=(0,), assumed_align=4)
+        fake_thd_lens_form = cutlass.Int32(0)
+    else:
+        fake_thd_q_lens = None
+        fake_thd_kv_lens = None
+        fake_thd_lens_form = None
     return cute.compile(
         kernel,
         fake_q,
@@ -1599,7 +1626,10 @@ def compile(  # noqa: A001
         cutlass.Float32(1.0),
         cutlass.Float32(1.0),
         cutlass.Float32(1.0),
-        cutlass.Int32(0),  # thd_max_sq: runtime grid extent (THD)
+        cutlass.Int32(0),  # thd_max_sq: plan-time envelope grid extent (THD)
+        fake_thd_q_lens,
+        fake_thd_kv_lens,
+        fake_thd_lens_form,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
     )
