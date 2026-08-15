@@ -447,7 +447,6 @@ def _kernel(
     qh_per_kh: cutlass.Int32,
     scale_softmax_log2: cutlass.Float32,
     o_scale_fused: cutlass.Float32,
-    amax_s_tensor: cute.Tensor,
     amax_o_tensor: cute.Tensor,
 ) -> None:
 
@@ -667,7 +666,6 @@ def _kernel(
             cta_in_pair=cta_in_pair,
             cta_id_x=cta_id_x,
             o_scale_fused=o_scale_fused,
-            amax_s_tensor=amax_s_tensor,
             amax_o_tensor=amax_o_tensor,
         )
 
@@ -1806,7 +1804,6 @@ def _correction_warp_group(
     cta_in_pair,
     cta_id_x,
     o_scale_fused,
-    amax_s_tensor,
     amax_o_tensor,
 ):
     """Correction warp group: 4 warps × 32 lanes = 128, one lane per O row.
@@ -1960,13 +1957,6 @@ def _correction_warp_group(
                     )
                 inv_sum = o_scale_fused * beta
 
-            # amax_s = max over valid rows of the softmax normalization (1/total_sum),
-            # o_scale_fused divided back out so it is the pure softmax-prob amax (cuDNN
-            # FP8 ref: `beta = 1/total_sum`). atomicrmw MAX has no fp variant, so — like
-            # the reference — reinterpret the (always-positive) float as int32 and MAX on
-            # the bits (IEEE754 positive floats are monotonic in their int encoding).
-            _amax_s_ptr = Pointer(amax_s_tensor.iterator.raw_ptr(), dtype=cutlass.Int32)
-
             # cga2 OOB-row guard: cluster Q rows can exceed seqlen_q.
             q_row_global = q_super_idx * cutlass.Int32(CFG.TILES_Q * CFG.TILE_M) + cutlass.Int32(qs * CFG.TILE_M) + tid_in_wg
             if cutlass.const_expr(CFG.THD_VARLEN):
@@ -1987,9 +1977,6 @@ def _correction_warp_group(
                         lse_arr = cutlass.make_array_view(lse_tensor)
                         lse_row = lse_arr[batch_idx, head_idx, :]
                         lse_row[q_row_global] = lse_val
-
-            _amax_s_local = beta if _row_valid else cutlass.Float32(0.0)
-            _amax_s_warp = cute.arch.warp_redux_sync(_amax_s_local, "fmax")
 
             # amax_o is defined over the fp32 pre-cast output.
             _amax_o_ptr = Pointer(amax_o_tensor.iterator.raw_ptr(), dtype=cutlass.Int32)
@@ -2102,13 +2089,6 @@ def _correction_warp_group(
             if cutlass.const_expr(CFG.DTYPE_O > 1):
                 _amax_o_local = cute.math.max(_amax_o_local, _max_abs_reduction(o_scaled3), ftz=True)
 
-            if (tid_in_wg & cutlass.Int32(31)) == cutlass.Int32(0):
-                nvvm.atomicrmw(
-                    nvvm.AtomicOp.MAX,
-                    _amax_s_ptr,
-                    _amax_s_warp.bitcast(cutlass.Int32),
-                )
-
             if _row_valid:
                 nvvm.atomicrmw(nvvm.AtomicOp.MAX, _amax_o_ptr, _amax_o_local.bitcast(cutlass.Int32))
 
@@ -2153,7 +2133,6 @@ def _host(
     scale_softmax_log2: cutlass.Float32,
     o_scale_fused: cutlass.Float32,
     n_thd_units: cutlass.Int32,
-    amax_s_tensor: cute.Tensor,
     amax_o_tensor: cute.Tensor,
     stream: _cuda_driver.CUstream = None,
 ) -> None:
@@ -2259,7 +2238,6 @@ def _host(
         cutlass.Int32(QH // KH),
         scale_softmax_log2,
         o_scale_fused,
-        amax_s_tensor,
         amax_o_tensor,
     ).launch(
         grid=grid_shape,
@@ -2335,14 +2313,6 @@ def compile(b: int = 1, qh: int = 1, kh: int = 1, sq: int = 256, skv: int = 128,
         stride_order=(0,),
         assumed_align=16,
     )
-    # amax_s output (scalar): max softmax prob (1/total_sum) via atomicMax. Always
-    # part of the ABI; api pre-zeros it and reads it back (Amax_S output).
-    fake_amax_s = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float32,
-        (1,),
-        stride_order=(0,),
-        assumed_align=16,
-    )
     fake_amax_o = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32,
         (1,),
@@ -2363,7 +2333,6 @@ def compile(b: int = 1, qh: int = 1, kh: int = 1, sq: int = 256, skv: int = 128,
         cutlass.Float32(0.0),
         cutlass.Float32(0.0),
         cutlass.Int32(0),
-        fake_amax_s,
         fake_amax_o,
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi --ptxas-options -uumn",
