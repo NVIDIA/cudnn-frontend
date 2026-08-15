@@ -85,5 +85,7 @@ def restore_fla() -> None:
     for attr, (mod_path, original) in list(_ORIGINALS.items()):
         mod = importlib.import_module(mod_path)
         current = getattr(mod, attr, None)
-        _rebind_everywhere(attr, current, original)
+        if current is not None and current is not original:
+            _rebind_everywhere(attr, current, original)
+        setattr(mod, attr, original)  # restore the owning module's attribute explicitly
     _ORIGINALS.clear()

@@ -38,9 +38,6 @@ class _Decline(Exception):
     pass
 
 
-_SAFE_GATE_LB_DEFAULT = -5.0
-
-
 def _to_native(
     q,
     k,
@@ -64,8 +61,6 @@ def _to_native(
     if q.dtype == torch.float16:
         raise _Decline("cuDNN KDA is unstable in fp16 (NaN); bf16 only")
     B, T, H, K = q.shape
-    HV = v.shape[2]
-    HO = max(H, HV)
 
     if cu_seqlens is None:
         cu = torch.arange(0, (B + 1) * T, T, dtype=torch.int32, device=q.device)
@@ -75,15 +70,21 @@ def _to_native(
         cu = cu_seqlens.to(torch.int32)
 
     # gate: cuDNN's in-kernel gate is forward-only -> reproduce in torch (channel-wise).
+    # A_log/dt_bias describe the gate over the H key/query heads (matching g's [B,T,H,K]),
+    # not the value heads; a mismatched element count means we cannot adapt -> decline.
     g = g.float()
     if safe_gate or use_gate_in_kernel:
         if A_log is None or dt_bias is None:
             raise _Decline("gate transform requires A_log and dt_bias")
-        a = A_log.float().view(1, 1, HO, 1)
-        b = dt_bias.float().reshape(HO, K)
+        if A_log.numel() != H or dt_bias.numel() != H * K:
+            raise _Decline("A_log/dt_bias do not match [H] / [H, K]")
+        a = A_log.float().view(1, 1, H, 1)
+        b = dt_bias.float().reshape(H, K)
         if safe_gate:
-            lb = _SAFE_GATE_LB_DEFAULT if lower_bound is None else lower_bound
-            g = lb * torch.sigmoid(a.exp() * (g + b))
+            # FLA owns the safe-gate lower_bound default; don't guess it here.
+            if lower_bound is None:
+                raise _Decline("safe_gate without explicit lower_bound")
+            g = lower_bound * torch.sigmoid(a.exp() * (g + b))
         else:
             g = -a.exp() * F.softplus(g + b)
 

@@ -52,6 +52,8 @@ def pick_sm100():
 
 
 def build_model(dev, layers, hidden, attn_every, vocab):
+    if attn_every < 1:
+        raise ValueError("attn_every must be >= 1")
     heads = hidden // 128
     attn_layers = [i for i in range(layers) if (i + 1) % attn_every == 0]
     cfg = GatedDeltaNetConfig(
@@ -186,7 +188,9 @@ def main():
         total += t
 
     print(f"\nfull training step (fwd+bwd, eager): {best:.3f} ms")
-    print(f"  GPU kernel self-time: {total/1e3:.3f} ms   host/overhead gap: {best - total/1e3:.3f} ms ({100*(best - total/1e3)/best:.0f}% of wall)")
+    # `best` (min over timed runs) and `total` (a separate profiler run) come from different
+    # runs, so their difference is an APPROXIMATE host/overhead gap, not an exact per-run number.
+    print(f"  GPU kernel self-time: {total/1e3:.3f} ms   approx host/overhead gap: {best - total/1e3:.3f} ms ({100*(best - total/1e3)/best:.0f}% of wall)")
     print(f"\n{'category':12} {'ms':>9} {'share':>7}")
     print("-" * 30)
     for c in ("linear_attn", "full_attn", "gemm", "norm", "misc", "other"):
