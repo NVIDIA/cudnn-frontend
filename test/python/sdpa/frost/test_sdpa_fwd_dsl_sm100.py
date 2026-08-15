@@ -1093,6 +1093,241 @@ def test_dsl_sm100_thd_compile_key_plan_time_only():
     assert info_exec.hits >= info_plan.hits + 2
 
 
+@pytest.mark.L0
+@torch_fork_set_rng(seed=38)
+def test_dsl_sm100_thd_over_launched_units_are_dead(monkeypatch):
+    """Issue #552 (envelope-grid enabler): grid units past the live total are
+    DEAD by kernel contract — the decode maps them to the batch == n_batch
+    sentinel, every role takes the empty-KV path (eff_seqlen_kv reads
+    cu_q[0] == 0), and neither O nor the ragged Stats is written (LSE
+    predicate goes negative; the O-store role skips the TMA store). Padding
+    the launch grid must therefore change nothing. Covers a zero-length
+    LEADING sequence (pre-fix, dead units decoded to batch 0 and ran full KV
+    loops there), a zero-length middle sequence, all-KV-zero (dead units on
+    top of the packed-KV clamp), and both Stats layouts."""
+    _require_dsl()
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    envelope = SdpaFwdDslSm100._thd_unit_envelope
+    monkeypatch.setattr(SdpaFwdDslSm100, "_thd_unit_envelope", lambda self: envelope(self) + 7)
+    _run_thd_stats_case(seq_lens_q=[128, 0, 64], seq_lens_kv=[100, 0, 30], mask="causal", stats_layout="token_major")
+    _run_thd_stats_case(seq_lens_q=[0, 64, 32], seq_lens_kv=[50, 40, 0], mask="none", stats_layout="head_major")
+    _run_thd_stats_case(seq_lens_q=[64, 32], seq_lens_kv=[0, 0], mask="none", stats_layout="token_major")
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=39)
+def test_dsl_sm100_thd_lens_never_reach_host(monkeypatch):
+    """Issue #552 (D2H removal): the length tensors are consumed ONLY on
+    device — the setup kernel builds the
+    metadata, the views bind buffer capacities, and the grid is the
+    plan-time envelope — so ANY host read of them (the old tolist
+    round-trip) is a regression. The guard rejects every _thd_host_lens
+    call while full numerics run in both length forms."""
+    _require_dsl()
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    def guard(self, seq_lens, name, cu_form):
+        raise AssertionError(f"lengths reached the host via {name} (device-meta modules must not read them)")
+
+    monkeypatch.setattr(SdpaFwdDslSm100, "_thd_host_lens", guard)
+    _run_thd_stats_case(seq_lens_q=[200, 150], seq_lens_kv=[180, 120], mask="causal", stats_layout="token_major")
+    _run_thd_stats_case(seq_lens_q=[200, 150], seq_lens_kv=[180, 120], mask="causal", stats_layout="head_major", cu_lens=True)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=41)
+def test_dsl_sm100_thd_execute_never_syncs():
+    """Issue #552 endgame (d128): the THD execute performs NO synchronizing
+    CUDA call — no length D2H, no pageable H2D, no device/stream sync —
+    pinned by torch's sync debug mode ("error"), which raises on any. The
+    grid is the plan-time envelope, the ragged views bind buffer
+    capacities, and the metadata is built device-side; results are bitwise
+    identical to an unguarded execute."""
+    _require_dsl()
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    b, h, s, d = 2, 4, 256, 128
+    dtype = torch.float16
+    q, k, v = (_bhsd(b, h, s, d, dtype) for _ in range(3))
+    o = torch.zeros_like(q)
+    api = SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, thd=True)
+    assert api.check_support()
+    api.compile()
+    lens = torch.tensor([200, 150], dtype=torch.int32, device="cuda")
+
+    # Warm-up outside the guarded region: allocator pools and lazy launcher
+    # state populate here, so the guarded execute reuses cached blocks.
+    api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens)
+    torch.cuda.synchronize()
+    o_ref = o.clone()
+    o.zero_()
+    prev_sync_mode = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode(2)
+    try:
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens)
+    finally:
+        torch.cuda.set_sync_debug_mode(prev_sync_mode)
+    torch.cuda.synchronize()
+    assert torch.equal(o, o_ref)
+
+
+@pytest.mark.L1
+@torch_fork_set_rng(seed=44)
+def test_dsl_sm100_thd_cu_nonzero_base_normalized():
+    """The device-side metadata build NORMALIZES cu prefix sums (subtracts
+    element 0): the packed buffers are addressed from token 0, so a cu
+    tensor sliced from a larger prefix (cu[0] != 0) means the same lengths
+    and must produce bitwise-identical results. The old host path errored
+    on cu[0] != 0; a device-side build cannot raise (Rule 3), it
+    normalizes."""
+    _require_dsl()
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    b, h, s, d = 2, 4, 256, 128
+    dtype = torch.float16
+    q, k, v = (_bhsd(b, h, s, d, dtype) for _ in range(3))
+    o = torch.zeros_like(q)
+    api = SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, thd=True, cu_seq_q_lens=True, cu_seq_kv_lens=True)
+    assert api.check_support()
+    api.compile()
+
+    def _run(base):
+        cu = torch.tensor([base, base + 200, base + 350], dtype=torch.int32, device="cuda")
+        o.zero_()
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=cu, seq_kv_lens=cu)
+        torch.cuda.synchronize()
+        return o.clone()
+
+    assert torch.equal(_run(0), _run(1000))
+
+
+@pytest.mark.L1
+@torch_fork_set_rng(seed=43)
+def test_dsl_sm100_thd_d192_d128_device_meta():
+    """d192/d128 (native MLA head dims) THD through the device-meta +
+    envelope path: per-sequence numerics via the direct API — the graph THD
+    harness assumes d_qk == d_v, so this flavor's THD leg is pinned here."""
+    _require_dsl()
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    b, h, s = 2, 4, 256
+    d_qk, d_v = 192, 128
+    dtype = torch.float16
+    scale = 1.0 / math.sqrt(d_qk)
+    q, k = (_bhsd(b, h, s, d_qk, dtype) for _ in range(2))
+    v = _bhsd(b, h, s, d_v, dtype)
+    o = torch.zeros_like(v)
+    api = SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, thd=True)
+    assert api.check_support()
+    api.compile()
+    seq_lens = [200, 150]
+    lens = torch.tensor(seq_lens, dtype=torch.int32, device="cuda")
+    api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens)
+    torch.cuda.synchronize()
+    base_q = q.transpose(1, 2).reshape(b * s, h, d_qk)
+    base_k = k.transpose(1, 2).reshape(b * s, h, d_qk)
+    base_v = v.transpose(1, 2).reshape(b * s, h, d_v)
+    base_o = o.transpose(1, 2).reshape(b * s, h, d_v)
+    off = 0
+    for length in seq_lens:
+        qs = base_q[off : off + length].float()
+        ks = base_k[off : off + length].float()
+        vs = base_v[off : off + length].float()
+        scores = torch.einsum("lhd,mhd->hlm", qs, ks) * scale
+        ref = torch.einsum("hlm,mhd->lhd", torch.softmax(scores, dim=-1), vs)
+        torch.testing.assert_close(base_o[off : off + length].float(), ref, atol=5e-2, rtol=3e-2)
+        off += length
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=42)
+def test_dsl_sm100_thd_execute_cuda_graph_capture():
+    """Issue #552 endgame (d128): THD execute is CUDA-GRAPH CAPTURABLE — no
+    D2H, no pageable H2D, plan-time envelope grid. Capture once, then
+    replay with DIFFERENT lengths written into the same device tensors: the
+    replay must honor them (per-sequence lengths are read on device by the
+    setup and main kernels), proving no host value was baked into the
+    graph."""
+    _require_dsl()
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    b, h, s, d = 2, 4, 256, 128
+    dtype = torch.float16
+    scale = 1.0 / math.sqrt(d)
+    q, k, v = (_bhsd(b, h, s, d, dtype) for _ in range(3))
+    o = torch.zeros_like(q)
+    api = SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, thd=True)
+    assert api.check_support()
+    api.compile()
+    lens = torch.tensor([200, 150], dtype=torch.int32, device="cuda")
+
+    def _check(seq_lens):
+        base_q = q.transpose(1, 2).reshape(b * s, h, d)
+        base_k = k.transpose(1, 2).reshape(b * s, h, d)
+        base_v = v.transpose(1, 2).reshape(b * s, h, d)
+        base_o = o.transpose(1, 2).reshape(b * s, h, d)
+        off = 0
+        for length in seq_lens:
+            qs = base_q[off : off + length].float()
+            ks = base_k[off : off + length].float()
+            vs = base_v[off : off + length].float()
+            scores = torch.einsum("lhd,mhd->hlm", qs, ks) * scale
+            ref = torch.einsum("hlm,mhd->lhd", torch.softmax(scores, dim=-1), vs)
+            torch.testing.assert_close(base_o[off : off + length].float(), ref, atol=5e-2, rtol=3e-2)
+            off += length
+
+    # Warm-up (compile artifacts, allocator, launcher state), then capture.
+    api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens)
+    graph.replay()
+    torch.cuda.synchronize()
+    _check([200, 150])
+    # New lengths into the SAME device tensor — replay must honor them.
+    lens.copy_(torch.tensor([64, 33], dtype=torch.int32, device="cuda"))
+    graph.replay()
+    torch.cuda.synchronize()
+    _check([64, 33])
+
+
+@pytest.mark.L1
+@torch_fork_set_rng(seed=40)
+def test_dsl_sm100_thd_kv_zero_capacity_clamp():
+    """All-zero KV lengths, both storage shapes (issue #552): with LIVE K/V
+    storage the launch binds the buffers' capacity and the kernel's
+    per-sequence dead-row path zeroes O; with ZERO-numel K/V buffers the
+    packed-KV clamp binds the one never-dereferenced dummy token instead (a
+    zero-token view cannot back a TMA descriptor). Both must produce O == 0
+    on every live row."""
+    _require_dsl()
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    b, h, s, d = 2, 4, 128, 128
+    dtype = torch.float16
+    q = _bhsd(b, h, s, d, dtype)
+    k, v = _bhsd(b, h, s, d, dtype), _bhsd(b, h, s, d, dtype)
+    o = torch.full_like(q, 7.0)
+    api = SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, thd=True)
+    assert api.check_support()
+    api.compile()
+    lens_q = torch.tensor([100, 80], dtype=torch.int32, device="cuda")
+    lens_kv = torch.zeros(2, dtype=torch.int32, device="cuda")
+
+    def _run(k_buf, v_buf):
+        o.fill_(7.0)
+        api.execute(q_tensor=q, k_tensor=k_buf, v_tensor=v_buf, o_tensor=o, seq_q_lens=lens_q, seq_kv_lens=lens_kv)
+        torch.cuda.synchronize()
+        return o.transpose(1, 2).reshape(b * s, h, d)[: 100 + 80].clone()
+
+    live_capacity = _run(k, v)
+    zero_capacity = _run(torch.empty(0, dtype=dtype, device="cuda"), torch.empty(0, dtype=dtype, device="cuda"))
+    assert (live_capacity == 0).all(), "dead rows must be zeroed by the kernel's dead-row path"
+    assert torch.equal(live_capacity, zero_capacity)
+
+
 _COMBO_MASKS = {
     "dense": ["none", "causal", "causal_br", "swa", "padded", "band", "band_br", "band_swa", "swa_br"],
     # THD forces padding internally, so its mask axis rides on top of that.
