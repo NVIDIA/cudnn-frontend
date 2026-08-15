@@ -1162,13 +1162,44 @@ def test_dsl_sm100_thd_execute_never_syncs():
     torch.cuda.synchronize()
     o_ref = o.clone()
     o.zero_()
+    prev_sync_mode = torch.cuda.get_sync_debug_mode()
     torch.cuda.set_sync_debug_mode(2)
     try:
         api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens)
     finally:
-        torch.cuda.set_sync_debug_mode(0)
+        torch.cuda.set_sync_debug_mode(prev_sync_mode)
     torch.cuda.synchronize()
     assert torch.equal(o, o_ref)
+
+
+@pytest.mark.L1
+@torch_fork_set_rng(seed=44)
+def test_dsl_sm100_thd_cu_nonzero_base_normalized():
+    """The device-side metadata build NORMALIZES cu prefix sums (subtracts
+    element 0): the packed buffers are addressed from token 0, so a cu
+    tensor sliced from a larger prefix (cu[0] != 0) means the same lengths
+    and must produce bitwise-identical results. The old host path errored
+    on cu[0] != 0; a device-side build cannot raise (Rule 3), it
+    normalizes."""
+    _require_dsl()
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    b, h, s, d = 2, 4, 256, 128
+    dtype = torch.float16
+    q, k, v = (_bhsd(b, h, s, d, dtype) for _ in range(3))
+    o = torch.zeros_like(q)
+    api = SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, thd=True, cu_seq_q_lens=True, cu_seq_kv_lens=True)
+    assert api.check_support()
+    api.compile()
+
+    def _run(base):
+        cu = torch.tensor([base, base + 200, base + 350], dtype=torch.int32, device="cuda")
+        o.zero_()
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=cu, seq_kv_lens=cu)
+        torch.cuda.synchronize()
+        return o.clone()
+
+    assert torch.equal(_run(0), _run(1000))
 
 
 @pytest.mark.L1

@@ -30,7 +30,12 @@ def build_thd_meta_o_descs_kernel(
     build the [seq_kv_lens(B) | cu_seqlens_q(B+1) | cu_seqlens_k(B+1)] metadata
     buffer DEVICE-side from the caller's length tensors — ``(B,)`` per-batch
     lengths (serial cumsum; B is small) or the ``(B+1,)`` cu prefix-sum form
-    (copied as-is, per-batch KV lengths derived by diff), per side via
+    (NORMALIZED by subtracting element 0 — the packed buffers are addressed
+    from token 0, so a cu tensor sliced from a larger prefix means the same
+    lengths, and the host can no longer validate ``cu[0] == 0`` (Rule 3), so
+    an unnormalized base must not leak into the offsets the tiles and the
+    dead-unit sentinel read; per-batch KV lengths are adjacent diffs either
+    way), per side via
     ``lens_form`` (bit 0: Q is cu, bit 1: KV is cu) — then build the per-batch
     O TMA descriptors from the cu_q values just written (same thread, program
     order). Replaces the host tolist → cumsum → H2D round-trip with work
@@ -44,8 +49,9 @@ def build_thd_meta_o_descs_kernel(
         q_is_cu = (lens_form & cutlass.Int32(1)) != cutlass.Int32(0)
         kv_is_cu = (lens_form & cutlass.Int32(2)) != cutlass.Int32(0)
         if q_is_cu:
+            base_q = cutlass.Int32(ql[0])
             for b in cutlass.range(0, n_batch + cutlass.Int32(1), 1, unroll=1):
-                meta[cuq0 + b] = cutlass.Int32(ql[b])
+                meta[cuq0 + b] = cutlass.Int32(ql[b]) - base_q
         else:
             acc = cutlass.Int32(0)
             meta[cuq0] = cutlass.Int32(0)
@@ -53,9 +59,10 @@ def build_thd_meta_o_descs_kernel(
                 acc = acc + cutlass.Int32(ql[b])
                 meta[cuq0 + b + cutlass.Int32(1)] = acc
         if kv_is_cu:
-            meta[cuk0] = cutlass.Int32(kl[0])
+            base_k = cutlass.Int32(kl[0])
+            meta[cuk0] = cutlass.Int32(0)
             for b in cutlass.range(0, n_batch, 1, unroll=1):
-                meta[cuk0 + b + cutlass.Int32(1)] = cutlass.Int32(kl[b + cutlass.Int32(1)])
+                meta[cuk0 + b + cutlass.Int32(1)] = cutlass.Int32(kl[b + cutlass.Int32(1)]) - base_k
                 meta[b] = cutlass.Int32(kl[b + cutlass.Int32(1)]) - cutlass.Int32(kl[b])
         else:
             acc_k = cutlass.Int32(0)
