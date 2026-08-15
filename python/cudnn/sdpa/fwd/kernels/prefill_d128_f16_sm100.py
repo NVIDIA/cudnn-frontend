@@ -189,9 +189,14 @@ _resolve_seqlen_q = _sdpa_h.resolve_seqlen_q
 # Supported at cga1 and cga2 (TILES_Q=2 → two Q slabs / O stores per tile).
 # seq_kv_lens overloaded as the THD metadata buffer (int32 len 3B+2):
 #   [0..B-1]=seq_kv_lens  [B..2B]=cu_q(B+1)  [2B+1..3B+1]=cu_k(B+1)
-from cudnn.sdpa.fwd.kernels.thd_sm100 import build_o_descs_kernel as _build_o_descs_kernel, TENSOR_MAP_QWORDS
+from cudnn.sdpa.fwd.kernels.thd_sm100 import build_thd_meta_o_descs_kernel as _build_thd_meta_o_descs_kernel, TENSOR_MAP_QWORDS
 
 _TENSOR_MAP_QWORDS = TENSOR_MAP_QWORDS
+# The setup kernel builds the THD metadata buffer DEVICE-side from the
+# caller's length tensors (issue #552) — the adapter passes them through and
+# never reads the KV lengths to the host. Modules without this flag still
+# take the adapter's legacy host-built-meta path.
+THD_DEVICE_META = True
 _dispatch_decode_initial = _sdpa_h.dispatch_decode_initial
 _dispatch_decode_payload = _sdpa_h.dispatch_decode_payload
 _thd_tma_offsets = _sdpa_h.thd_tma_offsets
@@ -1939,6 +1944,15 @@ def _host(
     # Dense padded-Q trim: separate (B,)-int32 per-batch Q lengths; None
     # (and absent from the compiled ABI) unless CFG.SEQ_Q_LENS_PRESENT.
     seq_q_lens_tensor: Optional[cute.Tensor] = None,
+    # THD device metadata build (issue #552): the CALLER's Q/KV length
+    # tensors — (B,) per-batch lengths or (B+1,) cu prefix sums, per side via
+    # thd_lens_form (bit 0: Q is cu, bit 1: KV is cu) — consumed only by the
+    # setup kernel, which writes the [kv|cu_q|cu_k] metadata buffer
+    # (seq_kv_lens_tensor) device-side. None (folded out of the ABI) for
+    # dense graphs.
+    thd_q_lens_tensor: Optional[cute.Tensor] = None,
+    thd_kv_lens_tensor: Optional[cute.Tensor] = None,
+    thd_lens_form: Optional[cutlass.Int32] = None,
     stream: _cuda_driver.CUstream = None,
 ) -> None:
     B, QH, KH, SQ, SKV, _ = problem_size
@@ -2002,18 +2016,24 @@ def _host(
     grid_q_supers = q_clusters * CFG.CTA_MMA
     q_supers = grid_q_supers
     if cutlass.const_expr(CFG.THD_VARLEN):
-        # THD: build the per-batch O descriptor array (reuse tma_o_desc over the
-        # packed [1,T,QH,D_v] O as base), then launch the exact flat
-        # batch-outermost grid (n_thd_units = Σ_b ceil(S_q_b/CGA_TILE_M)*QH,
-        # host-computed); grid_x = n_thd_units * CGA_M.  Works at cga1 (CGA_M=1).
+        # THD setup launch: build the [kv|cu_q|cu_k] metadata buffer
+        # DEVICE-side from the caller's length tensors (no host cumsum, no
+        # H2D — issue #552), then the per-batch O descriptor array (reuse
+        # tma_o_desc over the packed [1,T,QH,D_v] O as base). Main grid: the
+        # exact flat batch-outermost grid (n_thd_units =
+        # Σ_b ceil(S_q_b/CGA_TILE_M)*QH, host-computed); grid_x =
+        # n_thd_units * CGA_M.  Works at cga1 (CGA_M=1).
         # ENVELOPE: the packed-O row stride is QH * ACTUAL d_v (o_tensor's
         # static inner extent), not QH * TILE_O — the per-batch descriptor
         # bases must step in real rows or every batch >= 1 lands OOB.
-        _build_o_descs_kernel(
+        _build_thd_meta_o_descs_kernel(
             o_tensor,
             tma_o_desc,
             o_desc_words,
             seq_kv_lens_tensor,
+            thd_q_lens_tensor,
+            thd_kv_lens_tensor,
+            thd_lens_form,
             cutlass.Int32(QH),
             cutlass.Int32(B),
             cutlass.Int32(o_tensor.stride[1]),
@@ -2205,6 +2225,19 @@ def compile(  # noqa: A001
         stride_order=(0,),
         assumed_align=16,
     )
+    # THD: the caller's Q/KV length tensors, consumed by the setup kernel's
+    # device-side metadata build. DYNAMIC extents — (B,) per-batch lengths and
+    # (B+1,) cu prefix sums bind the same artifact; the form rides the runtime
+    # thd_lens_form bitmask, so no compile key grows (Rule 4). align 4: bound
+    # directly, only natural int32 alignment is guaranteed.
+    if CFG.THD_VARLEN:
+        fake_thd_q_lens = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (cute.sym_int(divisibility=1),), stride_order=(0,), assumed_align=4)
+        fake_thd_kv_lens = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (cute.sym_int(divisibility=1),), stride_order=(0,), assumed_align=4)
+        fake_thd_lens_form = cutlass.Int32(0)
+    else:
+        fake_thd_q_lens = None
+        fake_thd_kv_lens = None
+        fake_thd_lens_form = None
     return cute.compile(
         _host,
         fake_q,
@@ -2221,6 +2254,9 @@ def compile(  # noqa: A001
         cutlass.Float32(0.0),
         cutlass.Int32(0),
         fake_seq_q_lens,
+        fake_thd_q_lens,
+        fake_thd_kv_lens,
+        fake_thd_lens_form,
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
     )

@@ -1260,34 +1260,46 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         in the first ``T*H`` elements, or head-major ``(H, head_stride)``
         with tokens contiguous within each head row; when ``None`` the kernel
         compiles the LSE store out (has_lse=False) and no scratch exists.
-        The host round-trip for the runtime totals (t_q / t_kv / unit count)
-        feeds the metadata upload, the ragged views' extents and the exact
-        launch grid, and costs one D2H sync per length tensor, no device
-        allocation. It no longer keys any compile: the kernels compile with
-        DYNAMIC token extents (issue #552), so a new packed total re-binds
-        the same artifact; removing the sync itself needs the plan-time-max
-        grid redesign tracked there."""
+        Host round-trips (issue #552): with a THD_DEVICE_META module the KV
+        lengths NEVER reach the host — the setup kernel builds the metadata
+        buffer device-side and the K/V views bind their buffers' capacity —
+        leaving ONE D2H sync, the Q lengths, which size the exact launch
+        grid (dies with the envelope grid). Legacy modules still take one
+        sync per length tensor and upload host-built metadata. Neither path
+        keys any compile: the kernels compile with DYNAMIC token extents, so
+        a new packed total re-binds the same artifact."""
         import cutlass
 
         dev = q_buf.device
         b = self.batch_size
         carver = WorkspaceCarver(workspace, self.scratch_workspace_bytes(), "SdpaFwdDslSm100 (THD)") if workspace is not None else None
-        # Metadata buffer: [ seq_kv_lens(B) | cu_seqlens_q(B+1) | cu_seqlens_k(B+1) ],
-        # built HOST-side from the (inherent) tolist round-trip and uploaded in
-        # ONE H2D copy: a device-side cumsum would allocate its scan-temp
-        # storage and launch kernels on the execute hot path. Either length
-        # form feeds it — per-batch (B,) lengths or the (B+1,) cu_seq_len
-        # prefix sums — at identical cost. The torch work (allocation, D2H
-        # length reads, the H2D upload) runs on the LAUNCH stream so it is
-        # ordered against the kernel that consumes it — the execute-time
-        # handle may carry a stream that is not torch's current.
+        # Metadata buffer: [ seq_kv_lens(B) | cu_seqlens_q(B+1) | cu_seqlens_k(B+1) ].
+        # Modules with THD_DEVICE_META build it DEVICE-side in the setup
+        # kernel from the caller's length tensors (either form) — no host
+        # cumsum, no H2D, and the KV lengths NEVER reach the host (issue
+        # #552); the KV-side prefix-sum invariants become caller contract
+        # (a validation that needs a device read is not a validation —
+        # AGENTS.md Rule 3). The Q lengths still take one tolist round-trip:
+        # they size the exact launch grid (dies with the envelope grid).
+        # Legacy modules build meta host-side from both tolists and upload it
+        # in ONE H2D copy. The torch work (allocation, any D2H length reads,
+        # any H2D upload) runs on the LAUNCH stream so it is ordered against
+        # the kernel that consumes it — the execute-time handle may carry a
+        # stream that is not torch's current.
+        dev_meta = getattr(self._k_mod, "THD_DEVICE_META", False)
+        q_lens_dev = kv_lens_dev = None
         with _torch_stream_context(current_stream, dev):
             meta = carver.take(3 * b + 2, torch.int32) if carver is not None else torch.empty(3 * b + 2, dtype=torch.int32, device=dev)
             slq_host, cu_q_host = self._thd_host_lens(seq_q_lens, "cu_seq_len_q" if self.cu_seq_q_lens else "seq_q_lens", self.cu_seq_q_lens)
-            slk_host, cu_k_host = self._thd_host_lens(seq_len_kv, "cu_seq_len_kv" if self.cu_seq_kv_lens else "seq_kv_lens", self.cu_seq_kv_lens)
-            meta.copy_(torch.tensor(slk_host + cu_q_host + cu_k_host, dtype=torch.int32))
+            if dev_meta:
+                q_lens_dev = self._checked_cu_seq_lens(seq_q_lens, "cu_seq_len_q") if self.cu_seq_q_lens else self._checked_seq_lens(seq_q_lens, "seq_q_lens")
+                kv_lens_dev = (
+                    self._checked_cu_seq_lens(seq_len_kv, "cu_seq_len_kv") if self.cu_seq_kv_lens else self._checked_seq_lens(seq_len_kv, "seq_kv_lens")
+                )
+            else:
+                slk_host, cu_k_host = self._thd_host_lens(seq_len_kv, "cu_seq_len_kv" if self.cu_seq_kv_lens else "seq_kv_lens", self.cu_seq_kv_lens)
+                meta.copy_(torch.tensor(slk_host + cu_q_host + cu_k_host, dtype=torch.int32))
         t_q = cu_q_host[-1]
-        t_kv = cu_k_host[-1]
 
         qh, kh = self.h_q, self.h_kv
         d_qk, d_v = self.head_dim_qk, self.head_dim_v
@@ -1331,15 +1343,30 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # check_support rejected any declaration TMA cannot express.
         Q = self._thd_view(q_buf, self.q_desc, t_q)
         O = self._thd_view(o_buf, self.o_desc, t_q)
+        if dev_meta:
+            # KV token extent = buffer CAPACITY (issue #552: the packed KV
+            # total lives on device only). K and V bind the same dynamic
+            # token symbol, so take the shared floor. Loads never step past
+            # the REAL per-sequence lengths the kernel reads from the device
+            # metadata, so an over-claimed extent only widens the TMA
+            # descriptors' bound. All-zero lengths with a live buffer launch
+            # normally through the kernel's per-sequence dead-row path.
+            (k_ts, _, _), _ = self._thd_declared(self.k_desc)
+            (v_ts, _, _), _ = self._thd_declared(self.v_desc)
+            t_kv = min(k_buf.numel() // k_ts, v_buf.numel() // v_ts)
+        else:
+            # Legacy modules: the packed KV total from the host round-trip.
+            t_kv = cu_k_host[-1]
         if t_kv == 0:
-            # Every query row is dead (all-zero seq_kv_lens): served by the
-            # KERNEL's own dead-row path (total_sum <= 0 -> O := 0 and
-            # LSE := -inf, or the sink alone — its column keeps the softmax
-            # denominator alive), exactly like a live launch's zero-KV
-            # sequences — no adapter-side fills on the execute hot path
-            # (AGENTS.md Rule 1). A zero-token packed K/V view cannot back a
-            # CuTe layout / TMA descriptor, so clamp the packed KV extent to
-            # ONE never-dereferenced token (every tile sees kv_left ==
+            # No KV storage at all (legacy modules: all-zero seq_kv_lens):
+            # every query row is dead — served by the KERNEL's own dead-row
+            # path (total_sum <= 0 -> O := 0 and LSE := -inf, or the sink
+            # alone — its column keeps the softmax denominator alive),
+            # exactly like a live launch's zero-KV sequences — no
+            # adapter-side fills on the execute hot path (AGENTS.md Rule 1).
+            # A zero-token packed K/V view cannot back a CuTe layout / TMA
+            # descriptor, so clamp the packed KV extent to ONE
+            # never-dereferenced token (every tile sees kv_left ==
             # kv_right == 0, so no K/V load is ever issued) bound over
             # storage guaranteed large enough: Q backs K (kh*d_qk <=
             # t_q*qh*d_qk) and O backs V (kh*d_v <= t_q*qh*d_v).
@@ -1374,7 +1401,45 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         kwargs = self._thd_compile_kwargs()
         kwargs.update(k_stride=(0, *K.stride()[1:]), v_stride=(0, *V.stride()[1:]))
         fn = self._k_mod.compile(**kwargs)
-        fn(Q, K, V, O, LSE, sinks_t, meta, o_desc, (b, qh, kh, t_q, t_kv, 0), cutlass.Float32(scale_softmax_log2), cutlass.Int32(units), stream=current_stream)
+        if dev_meta:
+            # The caller's length tensors ride to the setup kernel, which
+            # builds the metadata buffer device-side; the form bitmask is a
+            # runtime value (no compile key grows). problem_size sq/skv slots
+            # are 0 by the THD contract (_host reads the dynamic extents).
+            lens_form = (1 if self.cu_seq_q_lens else 0) | (2 if self.cu_seq_kv_lens else 0)
+            fn(
+                Q,
+                K,
+                V,
+                O,
+                LSE,
+                sinks_t,
+                meta,
+                o_desc,
+                (b, qh, kh, 0, 0, 0),
+                cutlass.Float32(scale_softmax_log2),
+                cutlass.Int32(units),
+                None,
+                q_lens_dev,
+                kv_lens_dev,
+                cutlass.Int32(lens_form),
+                stream=current_stream,
+            )
+        else:
+            fn(
+                Q,
+                K,
+                V,
+                O,
+                LSE,
+                sinks_t,
+                meta,
+                o_desc,
+                (b, qh, kh, t_q, t_kv, 0),
+                cutlass.Float32(scale_softmax_log2),
+                cutlass.Int32(units),
+                stream=current_stream,
+            )
         self._logger.debug("execute (THD) completed")
 
     @staticmethod

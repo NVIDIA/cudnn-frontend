@@ -99,12 +99,15 @@ none is precedent:
 - THD `cu_seqlens` host cumsum (`sdpa/fwd/api_dsl.py`, `_execute_thd` on both
   SM100 and SM120). The compile-side half is DONE — the THD kernels compile
   with dynamic token extents (Rule 4), so `T` is no longer a compile-time
-  constant and no compile is keyed on it. `t_q`/`t_kv` still reach the host
-  for the metadata upload, the ragged views' extents, and the launch
-  grid; removing that needs the plan-time-max (`b * s_q_max`) grid with
-  in-kernel dead-tile exit and the device-side metadata read (issue #552).
-  `sdpa_fwd_wrapper_sm80` shows the other half — it requires `max_s_q` from
-  the caller rather than deriving it.
+  constant and no compile is keyed on it. The KV half is DONE on
+  `THD_DEVICE_META` modules (SM100 d128): the setup kernel builds the
+  metadata buffer device-side from the caller's length tensors and the K/V
+  views bind their buffers' capacity, so the KV lengths never reach the
+  host. Only the Q lengths still do — they size the exact launch grid;
+  removing that needs the plan-time-max (`b * s_q_max`) grid, whose
+  in-kernel dead-unit exit is already in (`_thd_decode`'s `batch == n_batch`
+  sentinel) (issue #552). `sdpa_fwd_wrapper_sm80` shows the alternative — it
+  requires `max_s_q` from the caller rather than deriving it.
 - Per-tensor FP8 descale readback (`_scalar` in the same file): fold on device,
   passing the pointers, as the backend FP8 sdpa does.
 - The FP8/MXFP8 `seq_len_q` guard in `sdpa/fwd/engines.py`. This one cannot be

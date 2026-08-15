@@ -1115,6 +1115,64 @@ def test_dsl_sm100_thd_over_launched_units_are_dead(monkeypatch):
     _run_thd_stats_case(seq_lens_q=[64, 32], seq_lens_kv=[0, 0], mask="none", stats_layout="token_major")
 
 
+@pytest.mark.L0
+@torch_fork_set_rng(seed=39)
+def test_dsl_sm100_thd_kv_lens_never_reach_host(monkeypatch):
+    """Issue #552 (D2H removal, KV leg): with a THD_DEVICE_META module the KV
+    lengths are consumed ONLY by the setup kernel's device-side metadata
+    build — any host read of them (the old tolist round-trip) is a
+    regression. The guard rejects a KV-side _thd_host_lens call while full
+    numerics run in both length forms; the Q side still legitimately syncs
+    once for the exact launch grid (dies with the envelope grid)."""
+    _require_dsl()
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    orig = SdpaFwdDslSm100._thd_host_lens
+
+    def guard(self, seq_lens, name, cu_form):
+        assert "kv" not in name, f"KV lengths reached the host via {name} (device-meta modules must not read them)"
+        return orig(self, seq_lens, name, cu_form)
+
+    monkeypatch.setattr(SdpaFwdDslSm100, "_thd_host_lens", guard)
+    _run_thd_stats_case(seq_lens_q=[200, 150], seq_lens_kv=[180, 120], mask="causal", stats_layout="token_major")
+    _run_thd_stats_case(seq_lens_q=[200, 150], seq_lens_kv=[180, 120], mask="causal", stats_layout="head_major", cu_lens=True)
+
+
+@pytest.mark.L1
+@torch_fork_set_rng(seed=40)
+def test_dsl_sm100_thd_kv_zero_capacity_clamp():
+    """All-zero KV lengths, both storage shapes (issue #552): with LIVE K/V
+    storage the launch binds the buffers' capacity and the kernel's
+    per-sequence dead-row path zeroes O; with ZERO-numel K/V buffers the
+    packed-KV clamp binds the one never-dereferenced dummy token instead (a
+    zero-token view cannot back a TMA descriptor). Both must produce O == 0
+    on every live row."""
+    _require_dsl()
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    b, h, s, d = 2, 4, 128, 128
+    dtype = torch.float16
+    q = _bhsd(b, h, s, d, dtype)
+    k, v = _bhsd(b, h, s, d, dtype), _bhsd(b, h, s, d, dtype)
+    o = torch.full_like(q, 7.0)
+    api = SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, thd=True)
+    assert api.check_support()
+    api.compile()
+    lens_q = torch.tensor([100, 80], dtype=torch.int32, device="cuda")
+    lens_kv = torch.zeros(2, dtype=torch.int32, device="cuda")
+
+    def _run(k_buf, v_buf):
+        o.fill_(7.0)
+        api.execute(q_tensor=q, k_tensor=k_buf, v_tensor=v_buf, o_tensor=o, seq_q_lens=lens_q, seq_kv_lens=lens_kv)
+        torch.cuda.synchronize()
+        return o.transpose(1, 2).reshape(b * s, h, d)[: 100 + 80].clone()
+
+    live_capacity = _run(k, v)
+    zero_capacity = _run(torch.empty(0, dtype=dtype, device="cuda"), torch.empty(0, dtype=dtype, device="cuda"))
+    assert (live_capacity == 0).all(), "dead rows must be zeroed by the kernel's dead-row path"
+    assert torch.equal(live_capacity, zero_capacity)
+
+
 _COMBO_MASKS = {
     "dense": ["none", "causal", "causal_br", "swa", "padded", "band", "band_br", "band_swa", "swa_br"],
     # THD forces padding internally, so its mask axis rides on top of that.
