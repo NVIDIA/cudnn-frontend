@@ -1041,6 +1041,58 @@ def test_dsl_sm100_thd_cu_seq_len_zero_lens():
     _run_thd_stats_case(seq_lens_q=[64, 32], seq_lens_kv=[0, 0], mask="none", cu_lens=True)
 
 
+@pytest.mark.L0
+@torch_fork_set_rng(seed=37)
+def test_dsl_sm100_thd_compile_key_plan_time_only():
+    """Issue #552: the THD compile key carries NO packed totals.
+
+    ``compile()`` builds the one artifact at plan time (the token extents
+    compile dynamic), and executes with DIFFERENT packed totals re-bind it —
+    zero ``cute.compile`` calls on the execute path. Keying the compile on
+    the totals degenerated into a fresh multi-second compile per step under
+    continuous batching (the totals change every step), and correctness is
+    checked per total to prove one artifact serves them all.
+    """
+    _require_dsl()
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    b, h, s, d = 2, 4, 256, 128
+    dtype = torch.float16
+    scale = 1.0 / math.sqrt(d)
+    q, k, v = (_bhsd(b, h, s, d, dtype) for _ in range(3))
+    o = torch.zeros_like(q)
+    api = SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, thd=True)
+    assert api.check_support()
+    api.compile()
+    # Plan-time compile: no deferred sentinel, the artifact already exists.
+    assert api._compiled_kernel != "thd-deferred"
+    info_plan = api._k_mod.compile.cache_info()
+
+    def _run_and_check(seq_lens):
+        lens = torch.tensor(seq_lens, dtype=torch.int32, device="cuda")
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens)
+        torch.cuda.synchronize()
+        base_q = q.transpose(1, 2).reshape(b * s, h, d)
+        base_k = k.transpose(1, 2).reshape(b * s, h, d)
+        base_v = v.transpose(1, 2).reshape(b * s, h, d)
+        base_o = o.transpose(1, 2).reshape(b * s, h, d)
+        off = 0
+        for length in seq_lens:
+            qs = base_q[off : off + length].float()
+            ks = base_k[off : off + length].float()
+            vs = base_v[off : off + length].float()
+            scores = torch.einsum("lhd,mhd->hlm", qs, ks) * scale
+            ref = torch.einsum("hlm,mhd->lhd", torch.softmax(scores, dim=-1), vs)
+            torch.testing.assert_close(base_o[off : off + length].float(), ref, atol=5e-2, rtol=3e-2)
+            off += length
+
+    _run_and_check([200, 150])
+    _run_and_check([64, 33])
+    info_exec = api._k_mod.compile.cache_info()
+    assert info_exec.misses == info_plan.misses, "a THD execute minted a new kernel compile (runtime data leaked into the compile key)"
+    assert info_exec.hits >= info_plan.hits + 2
+
+
 _COMBO_MASKS = {
     "dense": ["none", "causal", "causal_br", "swa", "padded", "band", "band_br", "band_swa", "swa_br"],
     # THD forces padding internally, so its mask axis rides on top of that.

@@ -97,11 +97,14 @@ Known violations, all pre-existing and each needing a kernel-side change, so
 none is precedent:
 
 - THD `cu_seqlens` host cumsum (`sdpa/fwd/api_dsl.py`, `_execute_thd` on both
-  SM100 and SM120). `t_q`/`t_kv` reach the host only because `T` is a
-  compile-time constant. Compile on the `b * s_q_max` envelope and pass `T` as a
-  runtime argument, as the f16 kernels already do for head dims;
-  `sdpa_fwd_wrapper_sm80` shows the other half — it requires `max_s_q` from the
-  caller rather than deriving it.
+  SM100 and SM120). The compile-side half is DONE — the THD kernels compile
+  with dynamic token extents (Rule 4), so `T` is no longer a compile-time
+  constant and no compile is keyed on it. `t_q`/`t_kv` still reach the host
+  for the metadata upload, the ragged views' extents, and the launch
+  grid; removing that needs the plan-time-max (`b * s_q_max`) grid with
+  in-kernel dead-tile exit and the device-side metadata read (issue #552).
+  `sdpa_fwd_wrapper_sm80` shows the other half — it requires `max_s_q` from
+  the caller rather than deriving it.
 - Per-tensor FP8 descale readback (`_scalar` in the same file): fold on device,
   passing the pointers, as the backend FP8 sdpa does.
 - The FP8/MXFP8 `seq_len_q` guard in `sdpa/fwd/engines.py`. This one cannot be
@@ -121,6 +124,65 @@ none is precedent:
 When auditing this list, grep for the ARGUMENT, not the call shape:
 `device="cpu"` finds `to(dtype=..., device="cpu")`, which `to(device="cpu")`
 misses.
+
+**Rule 4 — compile keys are PLAN-TIME-ONLY: never key a kernel compile on
+runtime data values.**
+
+`cute.compile` takes seconds. Anything an execute path feeds into a
+compile-cache key (an `lru_cache`d `compile()` wrapper, a template parameter,
+a fake-tensor extent) must be derivable from the graph declaration alone —
+tensor dtypes, declared strides, head counts, head dims, flags. Values read
+out of runtime tensors (THD packed token totals, max sequence lengths, batch
+contents) change every step under continuous batching, so a key that includes
+them degenerates into a fresh multi-second compile per `execute()` — a
+pathology that no correctness test catches (issue #552 is the case study:
+`sq=t_q, skv=t_kv` in the THD compile key). Rule 3 bans the read that feeds
+such a key; this rule bans the key itself — a runtime value that arrives
+legally (a caller-passed host scalar, an `int(tensor.shape[...])`) still must
+not become a compile key.
+
+- **Runtime extents compile DYNAMIC.** Use `cute.sym_int()` in the fake
+  tensors (one symbol per ragged group) so one compiled artifact re-binds any
+  total; runtime scalars the launch needs (grid extents like THD `max_sq`)
+  are `cutlass.Int32` call arguments, never compile parameters.
+- **Derived values count.** A stride tuple whose batch stride is
+  `t_q * token_stride` smuggles the runtime total into the key just as
+  surely as `sq=t_q` — normalize it out (zero the never-stepped batch
+  stride, rebuild it symbolically kernel-side).
+- **Compile at plan time, re-bind at execute.** With a plan-time-only key
+  there is no reason to defer: `compile()` builds the artifact once and the
+  execute path's cached call must be a guaranteed hit. Guard it with a
+  cache-miss regression test (see
+  `test_dsl_sm100_thd_compile_key_plan_time_only`), not by inspection.
+- **Known open cleanup (issue #604)**: the SM80 engines' `_compile_cached`
+  (#493) still keys `SQ`/`SKV` under `THD_VARLEN` — migrate it to dynamic
+  token extents like the SM100/SM120 THD compiles rather than copying its
+  pattern.
+
+**Rule 5 — every torch operation on the execute path is ordered on the
+LAUNCH stream, never implicitly on torch's current stream.**
+
+The kernel launches on the stream carried by the execute-time handle
+(`ExecutionContext.stream`), but torch enqueues work — H2D metadata uploads,
+buffer resets (`zero_()`), post-kernel reductions (`div_()`, `copy_()`),
+and the caching allocator's stream-tagging of fresh blocks — on
+`torch.cuda.current_stream()`. When the two differ, the prep and the kernel
+race (PR #543 is the case study: the THD `[seq_kv | cu_q | cu_k]` upload vs
+the kernel that reads it).
+
+- **Resolve the launch stream FIRST**, before any torch work in the execute
+  path, and run every torch op (including allocator calls: workspace-less
+  fallback allocations, cached-dummy first use) inside
+  `_torch_stream_context(current_stream, device)` — see the fp8/mxfp8 amax
+  resets and both `_execute_thd` paths in `sdpa/fwd/api_dsl.py`.
+- **Consumers too, not just producers**: anything reading what the kernel
+  wrote (`amax_o.div_()`, an O scratch copy-back) belongs on the launch
+  stream for the same reason.
+- The PyTorch-integration path launches on torch's current stream, where the
+  context is a no-op — the race only bites direct graph-API users with an
+  explicit handle stream, which is exactly why tests miss it. Order the work
+  by construction rather than relying on the common case.
+
 
 ## Frontend-only kernel package layout
 
