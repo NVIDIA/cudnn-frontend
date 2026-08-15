@@ -1433,14 +1433,20 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         return (x + a - 1) // a
 
     def _reshape_sf(self, sf: torch.Tensor, h: int, n_tiles: int, sf_smem_size: int) -> torch.Tensor:
-        """cuDNN F8_128x4 scale-factor tensor (FP8_E8M0, ``[B, H, *, *]``) → the
-        kernel's per-tile int8 view ``[B, H, n_tiles, sf_smem_size]``.
+        """cuDNN F8_128x4 scale-factor tensor (FP8_E8M0) → the kernel's per-tile
+        int8 view ``[B, H, n_tiles, sf_smem_size]``.
 
         cuDNN packs the 128×4 SF atom contiguously (``F8_128x4`` reordering); a Q/K
         tile is 128 rows × d/32 d-blocks and a V tile is 128 rows × 4 s-blocks, so
         each tile is exactly ``sf_smem_size`` E8M0 bytes and this is a pure reshape.
+
+        A reordered tensor is an opaque byte layout: callers legally bind it under
+        any shape with the right byte count (the graph declares logical
+        ``[B, H, s_padded, d/32]`` dims; TE-style producers hand over flat
+        ``[B·H·s_padded, 4]`` swizzle output).  So B comes from the graph facts,
+        never from ``sf.shape[0]``, and only the total size is validated.
         """
-        b = sf.shape[0]
+        b = self.batch_size
         flat = sf.contiguous()
         if flat.dtype != torch.int8:
             flat = flat.view(torch.int8)
