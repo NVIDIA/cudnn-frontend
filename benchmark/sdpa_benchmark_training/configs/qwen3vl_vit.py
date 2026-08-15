@@ -55,7 +55,7 @@ CONFIG = BenchmarkConfig(
         (47376, 47376),  # non-square grid (168x282)
         (62500, 62500),  # 250x250
     ],
-    backends=["cudnn", "flash_attention_4"],
+    backends=["cudnn", "cudnn_oss", "flash_attention_4"],
     data_types=["bfloat16", "fp8"],
     attn_masks=["no_mask"],
     profile_pass="fwd",
