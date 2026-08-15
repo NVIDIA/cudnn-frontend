@@ -1237,16 +1237,34 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         )
 
     def _thd_unit_count(self, slq_host) -> int:
-        """One THD unit per CGA-height slice of each sequence's Q rows.
+        """One THD unit per CGA-height slice of each sequence's Q rows —
+        the EXACT total, host-computed from the length round-trip (legacy
+        modules only).
 
         The kernel tolerates OVER-counting (issue #552): units past the live
         total decode to the batch == n_batch dead sentinel — every role takes
         the empty-KV path and neither O nor LSE is written — so a launch grid
-        sized above the exact total changes nothing but occupancy. The
-        envelope-grid redesign relies on this; the over-launch test pads it
-        to pin the contract."""
+        sized above the exact total changes nothing but occupancy."""
         cga_tile_m = int(self._k_mod.CGA_TILE_M)
         return self.h_q * sum((l + cga_tile_m - 1) // cga_tile_m for l in slq_host)
+
+    def _thd_unit_envelope(self) -> int:
+        """PLAN-TIME upper bound on live THD units:
+        ``B * ceil(S_q_declared / CGA_TILE_M) * QH``.
+
+        Every sequence's length is bounded by the declared S_q (the padding
+        contract), so this covers ``Σ_b ceil(s_b / tile) * QH``. Units past
+        the live total are DEAD by kernel contract (the decode's
+        ``batch == n_batch`` sentinel): no loads, no O/LSE writes, one
+        empty-mainloop barrier dance each. The grid is host-known at PLAN
+        time — execute reads nothing from the lengths — which removes the
+        last THD D2H sync and unblocks CUDA-graph capture (issue #552). The
+        dead-tile tax mirrors the C++ backend's THD grid strategy; callers
+        declaring S_q far above their live totals pay it. The over-launch
+        test pads this to pin the dead-unit contract."""
+        cga_tile_m = int(self._k_mod.CGA_TILE_M)
+        s_q_decl = int(self.q_desc.shape[2])
+        return self.batch_size * ((s_q_decl + cga_tile_m - 1) // cga_tile_m) * self.h_q
 
     def _execute_thd(self, q_buf, k_buf, v_buf, o_buf, scale_softmax_log2, sinks, seq_len_kv, seq_q_lens, lse_tensor=None, workspace=None, current_stream=None):
         """THD / varlen execute: reconstruct the kernel's packed [1, T, H, D] views and metadata buffer from the cuDNN ragged buffers, then launch.
@@ -1260,14 +1278,16 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         in the first ``T*H`` elements, or head-major ``(H, head_stride)``
         with tokens contiguous within each head row; when ``None`` the kernel
         compiles the LSE store out (has_lse=False) and no scratch exists.
-        Host round-trips (issue #552): with a THD_DEVICE_META module the KV
-        lengths NEVER reach the host — the setup kernel builds the metadata
-        buffer device-side and the K/V views bind their buffers' capacity —
-        leaving ONE D2H sync, the Q lengths, which size the exact launch
-        grid (dies with the envelope grid). Legacy modules still take one
-        sync per length tensor and upload host-built metadata. Neither path
-        keys any compile: the kernels compile with DYNAMIC token extents, so
-        a new packed total re-binds the same artifact."""
+        Host round-trips (issue #552): with a THD_DEVICE_META module there
+        are NONE — the lengths never reach the host (the setup kernel builds
+        the metadata buffer device-side), every ragged view binds its
+        buffer's capacity, and the launch grid is the plan-time envelope
+        (dead units exit by kernel contract) — the execute is fully async
+        and CUDA-graph capturable. Legacy modules still take one sync per
+        length tensor, upload host-built metadata, and launch the exact
+        grid. Neither path keys any compile: the kernels compile with
+        DYNAMIC token extents, so a new packed total re-binds the same
+        artifact."""
         import cutlass
 
         dev = q_buf.device
@@ -1277,10 +1297,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # Modules with THD_DEVICE_META build it DEVICE-side in the setup
         # kernel from the caller's length tensors (either form) — no host
         # cumsum, no H2D, and the KV lengths NEVER reach the host (issue
-        # #552); the KV-side prefix-sum invariants become caller contract
-        # (a validation that needs a device read is not a validation —
-        # AGENTS.md Rule 3). The Q lengths still take one tolist round-trip:
-        # they size the exact launch grid (dies with the envelope grid).
+        # #552); the prefix-sum invariants become caller contract (a
+        # validation that needs a device read is not a validation —
+        # AGENTS.md Rule 3), and NOTHING is read back — the grid is the
+        # plan-time envelope.
         # Legacy modules build meta host-side from both tolists and upload it
         # in ONE H2D copy. The torch work (allocation, any D2H length reads,
         # any H2D upload) runs on the LAUNCH stream so it is ordered against
@@ -1290,36 +1310,60 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         q_lens_dev = kv_lens_dev = None
         with _torch_stream_context(current_stream, dev):
             meta = carver.take(3 * b + 2, torch.int32) if carver is not None else torch.empty(3 * b + 2, dtype=torch.int32, device=dev)
-            slq_host, cu_q_host = self._thd_host_lens(seq_q_lens, "cu_seq_len_q" if self.cu_seq_q_lens else "seq_q_lens", self.cu_seq_q_lens)
             if dev_meta:
                 q_lens_dev = self._checked_cu_seq_lens(seq_q_lens, "cu_seq_len_q") if self.cu_seq_q_lens else self._checked_seq_lens(seq_q_lens, "seq_q_lens")
                 kv_lens_dev = (
                     self._checked_cu_seq_lens(seq_len_kv, "cu_seq_len_kv") if self.cu_seq_kv_lens else self._checked_seq_lens(seq_len_kv, "seq_kv_lens")
                 )
             else:
+                slq_host, cu_q_host = self._thd_host_lens(seq_q_lens, "cu_seq_len_q" if self.cu_seq_q_lens else "seq_q_lens", self.cu_seq_q_lens)
                 slk_host, cu_k_host = self._thd_host_lens(seq_len_kv, "cu_seq_len_kv" if self.cu_seq_kv_lens else "seq_kv_lens", self.cu_seq_kv_lens)
                 meta.copy_(torch.tensor(slk_host + cu_q_host + cu_k_host, dtype=torch.int32))
-        t_q = cu_q_host[-1]
 
         qh, kh = self.h_q, self.h_kv
         d_qk, d_v = self.head_dim_qk, self.head_dim_v
 
-        # Degenerate total (runtime value, invisible to the plan-time probe):
-        # t_q == 0 means no query token exists anywhere, so the packed O/LSE
-        # have zero rows — nothing to compute or write. (t_kv == 0 launches
-        # normally through the kernel's dead-row path; see the K/V binding
-        # below.)
+        if dev_meta:
+            # Q/O token extent = buffer CAPACITY (issue #552: the packed Q
+            # total lives on device only). Q, O and a token-major (or
+            # compact head-major) LSE bind ONE dynamic token symbol, so take
+            # the shared floor. Writes never step past the real per-sequence
+            # lengths the kernel reads from the device metadata (O through
+            # the per-batch descriptors' extents, LSE via the row predicate),
+            # so
+            # the over-claim only widens the TMA descriptors' bound.
+            (q_ts, _, _), _ = self._thd_declared(self.q_desc)
+            (o_ts, _, _), _ = self._thd_declared(self.o_desc)
+            t_q = min(q_buf.numel() // q_ts, o_buf.numel() // o_ts)
+            if lse_tensor is not None and not (self.thd_stats_head_major and self.thd_stats_head_stride):
+                t_q = min(t_q, lse_tensor.numel() // qh)
+        else:
+            t_q = cu_q_host[-1]
+
+        # Degenerate Q side: zero CAPACITY (device-meta modules — no token is
+        # addressable, and a zero-token view cannot back a TMA descriptor) or
+        # a zero packed total (legacy modules): nothing to compute or write.
+        # All-zero LENGTHS over live storage launch normally on device-meta
+        # modules — every unit decodes dead and neither O nor LSE is touched.
+        # (t_kv == 0 launches normally through the kernel's dead-row path;
+        # see the K/V binding below.)
         if t_q == 0:
-            self._logger.debug("execute (THD): t_q == 0, nothing to do")
+            self._logger.debug("execute (THD): no addressable Q token, nothing to do")
             return
         lse = None
         if lse_tensor is not None:
             if self.thd_stats_head_major:
                 head_stride = self.thd_stats_head_stride
-                self._value_error_if(
-                    head_stride < t_q,
-                    f"head-major THD LSE head_stride ({head_stride}) must cover the packed Q token total ({t_q})",
-                )
+                if not dev_meta:
+                    # Device-meta modules cannot know t_q host-side; the
+                    # cover invariant is caller contract there (a validation
+                    # that needs a device read is not a validation — Rule 3).
+                    self._value_error_if(
+                        head_stride < t_q,
+                        f"head-major THD LSE head_stride ({head_stride}) must cover the packed Q token total ({t_q})",
+                    )
+                if head_stride == 0:
+                    head_stride = t_q  # compact: the token extent itself
                 lse = lse_tensor.as_strided((1, qh, head_stride), (qh * head_stride, head_stride, 1), lse_tensor.storage_offset())
             else:
                 # Token-major (TH1, the default): natural packed rank-2 (T, H)
@@ -1335,7 +1379,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # vs the builder pass).
         with _torch_stream_context(current_stream, dev):
             o_desc = carver.take(b * 16 + 16, torch.int64) if carver is not None else torch.empty(b * 16 + 16, dtype=torch.int64, device=dev)
-        units = self._thd_unit_count(slq_host)
+        # Device-meta modules launch the PLAN-TIME envelope grid (dead units
+        # exit by kernel contract); legacy modules the exact host-computed
+        # total.
+        units = self._thd_unit_envelope() if dev_meta else self._thd_unit_count(slq_host)
 
         # Declared-stride (1, T, H, D) views, addressed NATIVELY by the kernel
         # (the Q/K/V/O TMA descriptors are built from the tensor views, and
