@@ -27,6 +27,9 @@ from typing import Callable
 import cutlass.experimental.primitives as nvvm
 from cudnn.gemm.frost.kernel_templates._tile_helpers import (
     l2_swizzle_tile as _l2_swizzle_tile,
+    tcgen05_alloc as _tcgen05_alloc,
+    tcgen05_dealloc as _tcgen05_dealloc,
+    tcgen05_mma_block_scale as _tcgen05_mma_block_scale,
 )
 import cutlass.experimental.cuda.tensor_map as _tma
 import cutlass._mlir_helpers.vector as _cvec
@@ -513,7 +516,7 @@ def _kernel(
 
     if warp_idx == mma_warp_id:
         nvvm.setmaxregister(prod_reg_count, nvvm.SetMaxRegisterAction.DECREASE)
-        nvvm.tcgen05_alloc(
+        _tcgen05_alloc(
             tmem_ptr_i32,
             cutlass.Int32(num_tmem_alloc_cols),
             is_exclusive=tmem_alloc_exclusive,
@@ -668,7 +671,7 @@ def _kernel(
                                 # shared; A's SF word block follows the M block.
                                 desc_a = desc_a_k.advance_start_address(a_smem_m_step_bytes * mi)
                                 if elect_one:
-                                    nvvm.tcgen05_mma_block_scale(
+                                    _tcgen05_mma_block_scale(
                                         mma_block_scale_kind,
                                         nvvm.CTAGroup.CTA_1,
                                         acc_tmem_ptrs[g][mi],
@@ -721,7 +724,7 @@ def _kernel(
 
         nvvm.bar_warp_sync(0xFFFFFFFF)
         alloc_ptr = cutlass.inttoptr(tmem_raw_addr, 6, cutlass.Int32)
-        nvvm.tcgen05_dealloc(
+        _tcgen05_dealloc(
             alloc_ptr,
             cutlass.Int32(num_tmem_alloc_cols),
             is_exclusive=tmem_alloc_exclusive,

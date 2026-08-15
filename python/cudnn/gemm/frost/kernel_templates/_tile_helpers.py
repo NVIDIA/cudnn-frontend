@@ -129,3 +129,47 @@ def copy_tensormap_to_workspace(src_desc_ptr, dst_i64_ptr) -> None:
     src_words = cute.make_ptr(cutlass.Int64, src_desc_ptr.toint(), mem_space=cute.AddressSpace.generic)
     for i in cutlass.range_constexpr(TENSOR_MAP_QWORDS):
         dst_i64_ptr.subview(i).store((src_words + i).load())
+
+
+def tcgen05_alloc(tmem_ptr, num_cols, *, is_exclusive=False, group=None):
+    if is_exclusive:
+        nvvm.tcgen05_alloc(tmem_ptr, num_cols, is_exclusive=True, group=group)
+    else:
+        nvvm.tcgen05_alloc(tmem_ptr, num_cols, group=group)
+
+
+def tcgen05_dealloc(tmem_ptr, num_cols, *, is_exclusive=False, group=None):
+    if is_exclusive:
+        nvvm.tcgen05_dealloc(tmem_ptr, num_cols, is_exclusive=True, group=group)
+    else:
+        nvvm.tcgen05_dealloc(tmem_ptr, num_cols, group=group)
+
+
+def tcgen05_mma_block_scale(mma_kind, cta_group, d, a, b, idesc, *, enable_input_d, scale_a, scale_b, scale_vec_size, b_collector_op=None):
+    if b_collector_op is None:
+        nvvm.tcgen05_mma_block_scale(
+            mma_kind,
+            cta_group,
+            d,
+            a,
+            b,
+            idesc,
+            enable_input_d=enable_input_d,
+            scale_a=scale_a,
+            scale_b=scale_b,
+            scale_vec_size=scale_vec_size,
+        )
+    else:
+        nvvm.tcgen05_mma_block_scale(
+            mma_kind,
+            cta_group,
+            d,
+            a,
+            b,
+            idesc,
+            enable_input_d=enable_input_d,
+            scale_a=scale_a,
+            scale_b=scale_b,
+            scale_vec_size=scale_vec_size,
+            b_collector_op=b_collector_op,
+        )

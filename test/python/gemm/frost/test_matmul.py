@@ -13,7 +13,9 @@ CATALOG. Also runnable as a script (forwards argv to pytest).
 from __future__ import annotations
 
 import os
+import pathlib
 import sys
+import textwrap
 
 import pytest
 import torch
@@ -2402,3 +2404,69 @@ def test_tma_store_gate_follows_the_mma_block_height(name: str) -> None:
     g.matmul(A=A, B=B, name="mm").set_output(True)
     cfg = by_name(name)
     assert _use_tma_store_epi(analyze(g), cfg, 16, 1) == (cfg.mma_inst_m == 128)
+
+
+# --- cutlass-dsl version-gated kwargs ----------------------------------------
+
+# `is_exclusive` (the >512-column TMEM grant) and `b_collector_op` (B-operand
+# collector reuse) only reached the cutlass-dsl `nvvm.*` wrappers in 4.8. Those
+# wrappers take no **kwargs, so NAMING one on an older DSL is a TypeError at JIT
+# regardless of the value -- `is_exclusive=False` is just as fatal as True.
+
+_VERSION_GATED_KWARGS = {
+    "tcgen05_alloc": "is_exclusive",
+    "tcgen05_dealloc": "is_exclusive",
+    "tcgen05_mma_block_scale": "b_collector_op",
+}
+
+
+def _template_dir():
+    # kernel_templates has no __init__.py (it is exec'd per render), so go
+    # through the package that does.
+    return pathlib.Path(cudnn.gemm.frost.__file__).parent / "kernel_templates"
+
+
+def test_templates_route_version_gated_kwargs_through_the_guarded_wrappers():
+    """Every template must reach these ops through `_tile_helpers`, which emits
+    the kwarg only on the branch that wants it. Calling `nvvm.<op>` directly and
+    passing the inert False/None compiles on an internal wheel and fails every
+    single JIT on the public one -- which is how the whole gemm suite went red."""
+    import ast
+
+    offenders = []
+    for path in sorted(_template_dir().glob("sm*.py")):
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "nvvm"
+                and node.func.attr in _VERSION_GATED_KWARGS
+            ):
+                offenders.append(f"{path.name}:{node.lineno} nvvm.{node.func.attr}(...)")
+    assert not offenders, "call the _tile_helpers wrapper instead of nvvm directly:\n  " + "\n  ".join(offenders)
+
+
+def test_the_guarded_wrappers_keep_the_kwarg_off_the_default_branch():
+    """...and the wrappers themselves only name it under the flag. Pinned as
+    source structure because the failure mode is a TypeError at trace time on a
+    DSL we cannot install here, so no runtime assertion can see it."""
+    import ast
+    import inspect
+
+    import cudnn.gemm.frost.kernel_templates._tile_helpers as helpers
+
+    for fn_name, kwarg in _VERSION_GATED_KWARGS.items():
+        fn = getattr(helpers, fn_name)
+        tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+        calls = [
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and isinstance(n.func.value, ast.Name) and n.func.value.id == "nvvm"
+        ]
+        assert len(calls) == 2, f"{fn_name} should have exactly one guarded and one plain nvvm call, got {len(calls)}"
+        named = [c for c in calls if any(k.arg == kwarg for k in c.keywords)]
+        assert len(named) == 1, f"{fn_name}: exactly one branch may name {kwarg!r}, got {len(named)}"
+        # ...and the other branch must be reachable without the newer DSL.
+        assert len(calls) - len(named) == 1, f"{fn_name}: no branch left that omits {kwarg!r}"

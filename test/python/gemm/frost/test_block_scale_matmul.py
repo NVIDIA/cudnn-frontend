@@ -1908,10 +1908,14 @@ def test_sm107_templates_reject_older_blackwell(monkeypatch):
         ("mxfp8", 128, False, 1, 2, 1, "cutlass.Float8E4M3FN"),
     ],
 )
-def test_render_sm107_tile_constants(combo, cta_n, omma, k_mode, scales_per_inst, word_atoms, idesc_dtype):
+def test_render_sm107_tile_constants(_pretend_sm107, combo, cta_n, omma, k_mode, scales_per_inst, word_atoms, idesc_dtype):
     """One MMA spans a 64-byte K, so it eats twice sm100's scales; when that
     outgrows a 4-scale utccp atom the SF word spans word_atoms of them. fp4
-    rides the OMMA descriptor, mxfp8 the MX one; both take the real dtype."""
+    rides the OMMA descriptor, mxfp8 the MX one; both take the real dtype.
+
+    The render sizes TMEM from the LIVE arch, and the cta_n=256 tile's SFB span
+    needs 520 of SM 10.7's 576 columns — so this has to pretend, or it renders
+    against a 512-column part and raises."""
     chain = analyze(_bs_chain(combo))
     cfg = by_name(f"CONFIG_sm107_128x{cta_n}x128_128x{cta_n}x64_cluster1x1")
     txt = C._render_block_scale_tile_constants(cfg, chain, 1)
@@ -2194,13 +2198,26 @@ def test_fp4_scale_dtype_and_block_are_orthogonal(sf_dt, sf_name, block_size):
     assert (bs.a_dtype, bs.sf_dtype, bs.block_size) == ("fp4_e2m1", sf_name, block_size)
 
 
+# Block-scale cases that only some GPUs decode: SM 10.7 added the E5M3 scale
+# format (either K-block) and E4M3 at block 32. Keyed by (SF dtype, K-block).
+_GPU_GATED_FP4_CASES = {("fp8_e5m3", 16), ("fp8_e5m3", 32), ("fp8_e4m3", 32)}
+_DTYPE_GATED_SF_DTYPES = {"fp8_e5m3"}
+_GPU_GATED_RANGES = ((107, 110),)
+
+
 @_GPU
 @pytest.mark.parametrize("sf_dt,sf_name", [(cudnn.data_type.FP8_E4M3, "fp8_e4m3"), (cudnn.data_type.FP8_E8M0, "fp8_e8m0")])
 @pytest.mark.parametrize("block_size", [16, 32])
-@pytest.mark.parametrize("config_name", ["CONFIG_sm100_128x128x128_128x128x32_cluster1x1", _SM107_128])
+@pytest.mark.parametrize("config_name", ["CONFIG_sm100_128x128x128_128x128x32_cluster1x1", pytest.param(_SM107_128, marks=requires_sm107)])
 def test_fp4_all_scale_block_corners_numerics(config_name, sf_dt, sf_name, block_size):
     """Numerics for the whole non-E5M3 fp4 matrix, including the two corners the
-    nvfp4 / mxfp4 pair leaves out: e4m3 at block 32 and e8m0 at block 16."""
+    nvfp4 / mxfp4 pair leaves out: e4m3 at block 32 and e8m0 at block 16.
+
+    e4m3 at block 32 is one of the GPU-gated cases — it is a 10.7 addition on
+    EVERY pipeline, so it runs here only on a 10.7 part."""
+    if (sf_name, block_size) in _GPU_GATED_FP4_CASES and not any(lo <= _SM < hi for lo, hi in _GPU_GATED_RANGES):
+        spans = " or ".join(f"{lo} <= SM < {hi}" for lo, hi in _GPU_GATED_RANGES)
+        pytest.skip(f"fp4+{sf_name} at block {block_size} decodes only on {spans}, have sm_{_SM}")
     dev = "cuda"
     torch.manual_seed(0)
     M, N, K = 256, 256, 512
@@ -2229,13 +2246,6 @@ def test_fp4_all_scale_block_corners_numerics(config_name, sf_dt, sf_name, block
     a_s = _unpack_fp4(a_u8, lut).view(M, K) * sfa.float().repeat_interleave(block_size, 1)
     b_s = _unpack_fp4(b_u8, lut).view(N, K) * sfb.float().repeat_interleave(block_size, 1)
     torch.testing.assert_close(c[0], (a_s @ b_s.t()).to(torch.float16), atol=2e-1, rtol=2e-2)
-
-
-# Block-scale cases that only some GPUs decode: SM 10.7 added the E5M3 scale
-# format (either K-block) and E4M3 at block 32. Keyed by (SF dtype, K-block).
-_GPU_GATED_FP4_CASES = {("fp8_e5m3", 16), ("fp8_e5m3", 32), ("fp8_e4m3", 32)}
-_DTYPE_GATED_SF_DTYPES = {"fp8_e5m3"}
-_GPU_GATED_RANGES = ((107, 110),)
 
 
 def test_gpu_gated_cases_are_narrowed_everywhere():

@@ -26,6 +26,8 @@ import cutlass.experimental.primitives as nvvm
 from cudnn.gemm.frost.kernel_templates._tile_helpers import (
     epi_subtile_spans as _epi_subtile_spans,
     l2_swizzle_tile as _l2_swizzle_tile,
+    tcgen05_alloc as _tcgen05_alloc,
+    tcgen05_dealloc as _tcgen05_dealloc,
 )
 import cutlass.experimental.cuda.tensor_map as _tma
 import cutlass._mlir_helpers.vector as _cvec
@@ -556,7 +558,7 @@ def _kernel(
 
     if warp_idx == mma_warp_id:
         nvvm.setmaxregister(prod_reg_count, nvvm.SetMaxRegisterAction.DECREASE)
-        nvvm.tcgen05_alloc(
+        _tcgen05_alloc(
             tmem_ptr_i32,
             cutlass.Int32(num_tmem_alloc_cols),
             is_exclusive=tmem_alloc_exclusive,
@@ -707,7 +709,7 @@ def _kernel(
         nvvm.bar_warp_sync(0xFFFFFFFF)
         nvvm.tcgen05_relinquish_alloc_permit(group=nvvm.CTAGroup.CTA_1)
         alloc_ptr = cutlass.inttoptr(tmem_raw_addr, 6, cutlass.Int32)
-        nvvm.tcgen05_dealloc(
+        _tcgen05_dealloc(
             alloc_ptr,
             cutlass.Int32(num_tmem_alloc_cols),
             is_exclusive=tmem_alloc_exclusive,
