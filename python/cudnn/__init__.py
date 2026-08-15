@@ -21,7 +21,6 @@ symbols_to_import = [
     "backend_version",
     "backend_version_string",
     "get_last_error_string",
-    "destroy_handle",
     "norm_forward_phase",
     "reduction_mode",
     "behavior_note",
@@ -31,7 +30,6 @@ symbols_to_import = [
     "create_device_properties",
     "get_stream",
     "numerical_note",
-    "set_stream",
     "build_plan_policy",
     "data_type",
     "tensor_reordering",
@@ -59,6 +57,36 @@ for _optional_symbol in [
 ]:
     if hasattr(_pybind_module, _optional_symbol):
         globals()[_optional_symbol] = getattr(_pybind_module, _optional_symbol)
+
+
+# The last stream set on each handle, so set_stream() below can skip a redundant backend call.
+_handle_to_stream: dict = {}
+
+
+def set_stream(handle, stream):
+    """Set the CUDA stream a cuDNN handle runs on (wraps the compiled ``cudnnSetStream``).
+
+    ``cudnnSetStream`` is not free: for a non-null stream it issues several CUDA driver queries
+    on every call (green-context detection, stream priority, priority range) to maintain cuDNN's
+    internal per-priority stream pool, even when the stream is unchanged -- ~2.4us/call on
+    Blackwell. Frameworks that call this before every ``execute`` pay it every iteration, so we
+    cache the last stream per handle and skip the backend call when it has not changed; a
+    steady-state loop pays it once. (Assumes a handle is not driven from two streams
+    concurrently, which is the normal single-stream case; a caller that does needs its own
+    handle per stream regardless.)
+    """
+    if _handle_to_stream.get(handle) == stream:
+        return
+    _pybind_module._raw_set_stream(handle, stream)
+    _handle_to_stream[handle] = stream
+
+
+def destroy_handle(handle):
+    """Destroy a cuDNN handle (wraps the compiled binding); forget its cached stream so a
+    reused handle address is not wrongly skipped by set_stream()."""
+    _handle_to_stream.pop(handle, None)
+    return _pybind_module._raw_destroy_handle(handle)
+
 
 from .datatypes import _library_type, _is_torch_tensor
 
