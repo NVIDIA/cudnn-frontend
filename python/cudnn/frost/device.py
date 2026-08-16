@@ -14,6 +14,8 @@ device is not something the front end has an opinion about.
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import functools
 
 
@@ -57,13 +59,41 @@ def _device_handle(device: int):
     return _ck(*drv.cuDeviceGet(device))
 
 
+# The device a frost BUILD targets, scoped in by build_device() from the
+# cudnn.Handle the graph was built with. Every device-derived kernel constant
+# (arch, ab_stages, grid_num_clusters, sm_count, the L2/SMEM budgets) resolves
+# through current_device(), so setting this once bakes the plan for the handle's
+# GPU instead of whatever CUDA device happens to be current at build time.
+_build_device: contextvars.ContextVar = contextvars.ContextVar("cudnn_frost_build_device", default=None)
+
+
+@contextlib.contextmanager
+def build_device(device):
+    """Scope a frost build to ``device`` (a CUDA ordinal, e.g.
+    ``handle.device.ordinal``). ``None`` = no override (fall back to the live
+    current device), so a build with no handle keeps the classic behaviour."""
+    if device is None:
+        yield
+        return
+    token = _build_device.set(int(device))
+    try:
+        yield
+    finally:
+        _build_device.reset(token)
+
+
 def current_device() -> int:
     """CUDA device index a plan built right now would target.
 
-    A bound driver context wins — it is process-wide and authoritative. Before
-    anything has allocated there may be none, and ``cudaSetDevice`` (what
+    Inside a ``build_device()`` scope this is the handle's device (so the build
+    follows the handle, not the ambient CUDA device). Otherwise: a bound driver
+    context wins — it is process-wide and authoritative. Before anything has
+    allocated there may be none, and ``cudaSetDevice`` (what
     ``torch.cuda.set_device`` drives) has only moved the runtime's thread-local
     slot, so that is the second rung."""
+    override = _build_device.get()
+    if override is not None:
+        return override
     drv = _driver()
     if drv is None:
         raise RuntimeError("cudnn.frost: no CUDA device visible")

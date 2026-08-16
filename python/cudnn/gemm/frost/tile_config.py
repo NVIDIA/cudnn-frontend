@@ -555,12 +555,16 @@ _DEFAULT_SM_COUNT = 148
 
 
 def _sm_count() -> int:
-    """SM count of the active device, with a B200-shaped fallback for CPU-only use."""
-    try:
-        import torch
+    """SM count of the active device, with a B200-shaped fallback for CPU-only use.
 
-        if torch.cuda.is_available():
-            return torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    Queried through frost's device layer (not torch) so it honours a
+    ``build_device()`` scope — i.e. follows the handle's GPU during a build, like
+    every other device-derived constant."""
+    from cudnn.frost.device import is_available, multiprocessor_count, resolve_device
+
+    try:
+        if is_available():
+            return multiprocessor_count(resolve_device(None))
     except Exception:
         pass
     return _DEFAULT_SM_COUNT
