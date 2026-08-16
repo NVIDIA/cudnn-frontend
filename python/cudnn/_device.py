@@ -102,15 +102,17 @@ class DeviceInfo:
         """Per-CTA SMEM ceiling in the *oversized* carveout (327 KiB vs the 227 KiB
         opt-in limit on SM 10.7), which the part gives by shrinking L1 to 8 kB —
         free for a TMA-fed GEMM. 0 when the driver has no such mode."""
-        drv = _driver()
+        from . import _env
+
         # CU_DEVICE_ATTRIBUTE_MAX_OVERSIZED_SHARED_MEMORY_PER_BLOCK (ordinal 150)
         # arrived in CUDA 13.4. A driver older than that has no such mode -> 0 by
         # design (not an error), and the enum member — which an older cuda-python's
         # CUdevice_attribute does not carry (a bare ordinal would raise, since the
         # binding reads attrib.value) — is never touched. From 13.4 the attribute
         # is real: query it and let a genuine failure raise rather than masking it.
-        if int(_ck(*drv.cuDriverGetVersion())) < 13040:
+        if _env.driver_version() < 13040:
             return 0
+        drv = _driver()
         return int(
             _ck(*drv.cuDeviceGetAttribute(drv.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MAX_OVERSIZED_SHARED_MEMORY_PER_BLOCK, _device_handle(self.ordinal)))
         )

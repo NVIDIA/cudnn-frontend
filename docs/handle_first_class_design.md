@@ -117,6 +117,20 @@ cannot drift. `Handle.device` also owns the serializable backend
 `DeviceProperties` (deviceless AOT); when built from a descriptor/override the
 fields come from its JSON, not the driver.
 
+### Environment facts (versions) — `cudnn/_env.py`
+
+Device facts are per-ordinal; **version** facts (CUDA driver, CUDA runtime) are
+process-global — one per process regardless of which GPU a handle is bound to.
+Putting them on `DeviceInfo` would duplicate them per ordinal, and on `Handle`
+per handle, so they get their own owner `cudnn/_env.py` (`driver_version()`,
+`runtime_version()`). This mirrors the backend, which exposes its own versions as
+argument-less globals (`cudnnGetVersion`, `cudnnGetCudartVersion`), never off a
+handle or the `DEVICEPROP` descriptor — cuDNN's own version stays there,
+`cudnn.backend_version()`. The CUDA queries had accreted as re-reads in each
+engine (the `DeviceInfo` oversized-SMEM gate, the cutile GDN/KDA `check_support`);
+`_env` collects them. ~100 ns and off the execute hot path — the cache is a single
+owner returning a constant, not a speed play.
+
 ## Stream model
 
 `Handle.stream` is the single source of truth. Today the stream lives in two
