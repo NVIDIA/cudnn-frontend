@@ -2736,6 +2736,18 @@ def probe_supported(
 
     Block-scale / MoE gate inside their ``_jit_*`` compile paths; here a
     successful analysis is treated as eligible (full validation at compile)."""
+    # frost is written in the cutedsl these kernels compile through; below its
+    # floor the engine cannot build (same gate the linear-attention engines
+    # apply). Decline early so a too-old wheel falls back to the backend instead
+    # of faulting deep in cute -- and so the --gpu-arch target pin, which lands in
+    # cutedsl at the floor, is always available by the time a plan compiles. An
+    # internal RC passes: cutedsl_too_old judges only the public wheel.
+    installed, version = buffers.cutedsl_state()
+    if not installed:
+        raise NotImplementedError("frost_gemm requires the cutedsl extra (nvidia-cutlass-dsl)")
+    if buffers.cutedsl_too_old(version):
+        want = ".".join(str(v) for v in buffers.CUTEDSL_MIN_VERSION)
+        raise NotImplementedError(f"frost_gemm requires nvidia-cutlass-dsl >= {want}; found {version[1]}")
     chain, _binding = analyze_with_binding(graph)
     _dtype_reason = dtype_arch_reject(chain, _current_arch())
     if _dtype_reason is not None:
