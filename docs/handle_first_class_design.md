@@ -169,6 +169,31 @@ covers them all at once:
   the whole build bakes for the handle's GPU. `tile_config._sm_count()` is
   re-routed off `torch.cuda.current_device` onto `frost.device` so it honours the
   scope too (it was the one query that bypassed `current_device()`).
+- **Frost GEMM compile target (done):** the scope also had to reach the *cute
+  compile arch*, which the earlier constants did not. cutedsl derives the compile
+  target from the ambient CUDA device (`torch.cuda.get_device_capability`), so a
+  build for handle-GPU-A while GPU-B is current baked A's constants into a
+  B-targeted kernel. `_frost_compile_options()` (in `gemm/frost/compiler.py`) now
+  pins `--gpu-arch sm_<scope>` into the `cute.compile()` options string, so the
+  compile target follows the scope. The arch is part of the baked, content-hashed
+  source, so a cross-arch kernel can no longer collide in the JIT cache with a
+  same-source same-machine one. **Limitation:** the pin is honoured on the public
+  `nvidia-cutlass-dsl >= 4.7` (frost's `CUTEDSL_MIN_VERSION`) and on internal RCs;
+  only a public wheel below the floor never threads `--gpu-arch`, and frost already
+  declines those as too-old (`buffers.cutedsl_too_old`, which the support check
+  reuses so an internal RC's own `0.x` numbering is judged new, not old). On such a
+  wheel a handle-scoped build **fails loud** — it cannot pin the target and cutedsl
+  resolves it from an arch captured at *import* time, which we can neither set nor
+  reliably read (a live-device comparison would miss an import-on-B / build-on-A
+  process), so `_frost_compile_options` refuses any `build_device`-scoped build
+  rather than bake scope constants into a possibly-mis-targeted kernel. An unscoped
+  build makes no cross-device promise and is unchanged.
+- **Not yet scope-following (documented holes):** `check_support`/kernel-selection
+  gates read the ambient arch (`buffers.current_sm()`), and the linear-attention
+  kernels lazy-compile at first *execute* — after the build scope has closed — so
+  their compile target is the execute-time device. Same-GPU (scope == ambient, the
+  normal case) all of these agree; a handle-scoped build on a sub-floor wheel is
+  the only case that diverges, and it is the fail-loud path above.
 - `_check_plan_device` **stays unchanged** and correct: it is the EXECUTE-time
   launch guard and must check the *live* current device (where the launch is
   going) against the baked device — the override is a build-scope only, unset at
@@ -205,6 +230,22 @@ is correct (and the build scope is not active then).
   without needing two Blackwells (device queries only, no kernel launch).
   `_check_plan_device` remains the execute-time launch guard against baking on one
   GPU and launching on another.
+- **Compile-target follows scope** (SM100, cutedsl 4.7): the `--gpu-arch` pin is
+  non-regressive on the matching-arch path — `test_matmul.py` bf16 sweep 677
+  passed / 337 skipped end-to-end with `--gpu-arch sm_100a` baked in. That the pin
+  actually moves the target is shown by compiling one graph three ways: `sm_100a`
+  (machine) and `sm_103a` (a different Blackwell sibling) both compile, while
+  `sm_90a` fails in the arch-specific NVVM backend — impossible if the option were
+  ignored (all three would target sm_100 and pass), so on 4.7 the option reaches
+  the compiler. The sub-floor-wheel fail-loud is unit-checked by forcing the
+  support probe false and asserting a `build_device`-scoped build raises while an
+  unscoped one passes through.
+- **Forced through flashinfer's GEMM fuzzer** (SM100): this build dropped into
+  flashinfer's `.venv` (via a `PYTHONPATH` shim) and forced onto the `cudnn`
+  backend across the full unified GEMM fuzz cross-product (bf16 / fp8 / nvfp4 /
+  mxfp4 / mxfp8, mm + bmm) — 731 passed / 0 failed / 151 xfailed (the xfails are
+  flashinfer's pre-tracked, backend-agnostic findings). The first-class `Handle`,
+  `set_stream` idempotency and `destroy_handle` clear are exercised on every one.
 
 ## Relationship to PR #611
 

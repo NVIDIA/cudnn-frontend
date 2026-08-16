@@ -50,18 +50,20 @@ def build_device(device):
         _build_device.reset(token)
 
 
-def current_device() -> int:
-    """CUDA device index a plan built right now would target.
+def build_scope_device() -> int | None:
+    """The ordinal a surrounding ``build_device()`` pinned, or ``None`` when the
+    build is unscoped (no handle asked for a specific GPU)."""
+    return _build_device.get()
 
-    Inside a ``build_device()`` scope this is the handle's device (so the build
-    follows the handle, not the ambient CUDA device). Otherwise: a bound driver
-    context wins — it is process-wide and authoritative. Before anything has
-    allocated there may be none, and ``cudaSetDevice`` (what
+
+def ambient_device() -> int:
+    """The live CUDA device, IGNORING any ``build_device()`` scope — the device
+    cuDNN's backend and cutedsl's compile-target auto-detect actually see.
+
+    A bound driver context wins — it is process-wide and authoritative. Before
+    anything has allocated there may be none, and ``cudaSetDevice`` (what
     ``torch.cuda.set_device`` drives) has only moved the runtime's thread-local
     slot, so that is the second rung."""
-    override = _build_device.get()
-    if override is not None:
-        return override
     drv = _driver()
     if drv is None:
         raise RuntimeError("cudnn.frost: no CUDA device visible")
@@ -73,6 +75,18 @@ def current_device() -> int:
     if int(err) != 0:
         raise RuntimeError(f"cudnn.frost: cudaGetDevice failed: {err}")
     return int(index)
+
+
+def current_device() -> int:
+    """CUDA device index a plan built right now would target.
+
+    Inside a ``build_device()`` scope this is the handle's device (so the build
+    follows the handle, not the ambient CUDA device); otherwise the live
+    :func:`ambient_device`."""
+    override = _build_device.get()
+    if override is not None:
+        return override
+    return ambient_device()
 
 
 def resolve_device(device=None) -> int:
