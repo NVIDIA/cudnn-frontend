@@ -573,14 +573,10 @@ def super_mma_warp(
                 tinv_lo1, tinv_hi1 = f16x2_to_f32(tinv_p1, dtype=cfg.io_dtype)
                 tinv_lo2, tinv_hi2 = f16x2_to_f32(tinv_p2, dtype=cfg.io_dtype)
                 tinv_lo3, tinv_hi3 = f16x2_to_f32(tinv_p3, dtype=cfg.io_dtype)
-                tinv_acc[0] = tinv_lo0 + upd_acc[0]
-                tinv_acc[1] = tinv_hi0 + upd_acc[1]
-                tinv_acc[2] = tinv_lo1 + upd_acc[2]
-                tinv_acc[3] = tinv_hi1 + upd_acc[3]
-                tinv_acc[4] = tinv_lo2 + upd_acc[4]
-                tinv_acc[5] = tinv_hi2 + upd_acc[5]
-                tinv_acc[6] = tinv_lo3 + upd_acc[6]
-                tinv_acc[7] = tinv_hi3 + upd_acc[7]
+                tinv_acc[0], tinv_acc[1] = fadd2(tinv_lo0, tinv_hi0, upd_acc[0], upd_acc[1])
+                tinv_acc[2], tinv_acc[3] = fadd2(tinv_lo1, tinv_hi1, upd_acc[2], upd_acc[3])
+                tinv_acc[4], tinv_acc[5] = fadd2(tinv_lo2, tinv_hi2, upd_acc[4], upd_acc[5])
+                tinv_acc[6], tinv_acc[7] = fadd2(tinv_lo3, tinv_hi3, upd_acc[6], upd_acc[7])
 
             bars.mb_t_inv_done[intermediate_stage].wait(((global_chunk // cfg.smem_intermediate_stages) + 1) % 2)
             nvvm.stmatrix(
@@ -1047,10 +1043,8 @@ def compute0_warp_group(
 
             # ---- optional K L2-norm + K_inv staging ------------------------------
             if cutlass.const_expr(cfg.l2norm):
-                kk0_lo = opaque_f32_zero()
-                kk0_hi = opaque_f32_zero()
-                kk1_lo = opaque_f32_zero()
-                kk1_hi = opaque_f32_zero()
+                kk_lo = opaque_f32_zero()
+                kk_hi = opaque_f32_zero()
             for dim_half in cutlass.range_constexpr(2):
                 dim_base = dim_half * (cfg.d_k // 2) + lane_in_row_group * 8
                 reg_base = dim_half * 8
@@ -1069,15 +1063,16 @@ def compute0_warp_group(
                         half = cutlass.Float32(0.5)
                         beta_val = (cute.math.tanh(beta_val * half, approx=True) * half + half).to(cfg.io_dtype).to(cutlass.Float32)
                     raw_beta_regs[reg_base + dim_offset] = beta_val
-                    if cutlass.const_expr(cfg.l2norm):
-                        if cutlass.const_expr(dim_offset % 2 == 0):
-                            kk0_lo, kk0_hi = ffma2(k_val, k_val, k_val, k_val, kk0_lo, kk0_hi)
-                        else:
-                            kk1_lo, kk1_hi = ffma2(k_val, k_val, k_val, k_val, kk1_lo, kk1_hi)
+                if cutlass.const_expr(cfg.l2norm):
+                    # even dims in the lo lane, odd in the hi lane: same terms, same order
+                    for dim_pair in cutlass.range_constexpr(4):
+                        k_even = raw_k_frag_f32[2 * dim_pair]
+                        k_odd = raw_k_frag_f32[2 * dim_pair + 1]
+                        kk_lo, kk_hi = ffma2(k_even, k_odd, k_even, k_odd, kk_lo, kk_hi)
 
             k_inv_norm = opaque_one
             if cutlass.const_expr(cfg.l2norm):
-                k_sum_sq = kk0_hi + kk1_hi
+                k_sum_sq = kk_lo + kk_hi
                 k_sum_sq = k_sum_sq + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, k_sum_sq, 4, 31, kind=nvvm.Shfl.BFLY))
                 k_sum_sq = k_sum_sq + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, k_sum_sq, 2, 31, kind=nvvm.Shfl.BFLY))
                 k_sum_sq = k_sum_sq + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, k_sum_sq, 1, 31, kind=nvvm.Shfl.BFLY))

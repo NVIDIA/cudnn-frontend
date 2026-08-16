@@ -2350,7 +2350,6 @@ def compute0_warp_group(
                     crow_r = warp_id * 16 + lane_id // 4 + rp * 8
                     db = sBeta[crow_r, 0, beta_idx] - row_part[rp] * binv_row[rp]
                     if cutlass.const_expr(cfg.beta_sigmoid):
-                        # last dbeta write, beta still latched
                         b = gBeta[2 * rp]
                         db = db * (b - b * b)
                     sBeta[crow_r, 0, beta_idx] = db

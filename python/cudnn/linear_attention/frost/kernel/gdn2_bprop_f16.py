@@ -78,13 +78,14 @@ from cudnn.frost.tile_dsl.mma import mma_ss, mma_step, mma_ts_step
 from cudnn.frost.tile_dsl.swizzle import swizzle_lin_S, swizzle_xor_128b
 from cudnn.frost.tile_dsl.tma import tma_load_tile, tma_store_commit, tma_store_tile, tma_store_wait, tma_tensormap_acquire
 from cudnn.frost.tile_dsl.pointwise import (
-    opaque_f32_zero,
     f16x2_to_f32,
-    fmul2,
+    fadd2,
     ffma2,
+    fmul2,
+    fp32_to_fp16,
     movmatrix_16b,
     mul_f16x2,
-    fp32_to_fp16,
+    opaque_f32_zero,
     sub_f16x2,
 )
 
@@ -847,14 +848,10 @@ def super_mma_warp(
                 tinv_lo1, tinv_hi1 = f16x2_to_f32(tinv_p1, dtype=cfg.io_dtype)
                 tinv_lo2, tinv_hi2 = f16x2_to_f32(tinv_p2, dtype=cfg.io_dtype)
                 tinv_lo3, tinv_hi3 = f16x2_to_f32(tinv_p3, dtype=cfg.io_dtype)
-                tinv_acc[0] = tinv_lo0 + upd_acc[0]
-                tinv_acc[1] = tinv_hi0 + upd_acc[1]
-                tinv_acc[2] = tinv_lo1 + upd_acc[2]
-                tinv_acc[3] = tinv_hi1 + upd_acc[3]
-                tinv_acc[4] = tinv_lo2 + upd_acc[4]
-                tinv_acc[5] = tinv_hi2 + upd_acc[5]
-                tinv_acc[6] = tinv_lo3 + upd_acc[6]
-                tinv_acc[7] = tinv_hi3 + upd_acc[7]
+                tinv_acc[0], tinv_acc[1] = fadd2(tinv_lo0, tinv_hi0, upd_acc[0], upd_acc[1])
+                tinv_acc[2], tinv_acc[3] = fadd2(tinv_lo1, tinv_hi1, upd_acc[2], upd_acc[3])
+                tinv_acc[4], tinv_acc[5] = fadd2(tinv_lo2, tinv_hi2, upd_acc[4], upd_acc[5])
+                tinv_acc[6], tinv_acc[7] = fadd2(tinv_lo3, tinv_hi3, upd_acc[6], upd_acc[7])
 
             nvvm.stmatrix(
                 sIntermediate_ptr + 1 * (cfg.b_t * cfg.b_t) + stsm_idx,
@@ -2694,8 +2691,9 @@ def compute2_warp_group(
                             hval1 = (sDstate_raw.data_ptr() + dstate_addr1).load().to(cutlass.Float32)
                             hacc[(2 * j) % 8] = hacc[(2 * j) % 8] + hval0 * state_pair[0].to(cutlass.Float32)
                             hacc[(2 * j + 1) % 8] = hacc[(2 * j + 1) % 8] + hval1 * state_pair[1].to(cutlass.Float32)
-                        part_a = (hacc[0] + hacc[4]) + (hacc[1] + hacc[5])
-                        part_b = (hacc[2] + hacc[6]) + (hacc[3] + hacc[7])
+                        pa0, pb0 = fadd2(hacc[0], hacc[2], hacc[4], hacc[6])
+                        pa1, pb1 = fadd2(hacc[1], hacc[3], hacc[5], hacc[7])
+                        part_a, part_b = fadd2(pa0, pb0, pa1, pb1)
                         dgate_last_val = dgate_last_val + (part_a + part_b)
                 bars.mb_dstate_smem_cg2_done.arrive()
             bars.mb_state_inp_cg2_done[gc % 2].arrive()
@@ -2797,26 +2795,35 @@ def compute2_warp_group(
                     dots = cutlass.Array(cutlass.Float32, cfg.b_t, alignment=16)
                     for half in cutlass.range_constexpr(2):
                         p_words = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(row_addr + qk_col + half * (cfg.b_t // 4), cutlass.Float32), num=cfg.b_t // 4)
-                        for tt in cutlass.range_constexpr(cfg.b_t // 2):
+                        for tt2 in cutlass.range_constexpr(cfg.b_t // 4):
+                            tt = 2 * tt2
                             t = half * (cfg.b_t // 2) + tt
-                            p_pair = cutlass.Vector.from_elements((p_words[tt // 2],), cutlass.Float32).bitcast(cfg.io_dtype)
-                            dots[t] = grad[t] * p_pair[tt % 2].to(cutlass.Float32) * sNorm_raw[norm_base + inv_off + t]
+                            p_pair = cutlass.Vector.from_elements((p_words[tt2],), cutlass.Float32).bitcast(cfg.io_dtype)
+                            gp_lo, gp_hi = fmul2(grad[t], grad[t + 1], p_pair[0].to(cutlass.Float32), p_pair[1].to(cutlass.Float32))
+                            dots[t], dots[t + 1] = fmul2(gp_lo, gp_hi, sNorm_raw[norm_base + inv_off + t], sNorm_raw[norm_base + inv_off + t + 1])
                     for off in cutlass.range_constexpr(5):
                         step = cutlass.const_expr(1 << off)
-                        for t in cutlass.range_constexpr(cfg.b_t):
-                            dots[t] = dots[t] + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, dots[t], step, 31, kind=nvvm.Shfl.BFLY))
+                        for t2 in cutlass.range_constexpr(cfg.b_t // 2):
+                            t = 2 * t2
+                            bfly_lo = cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, dots[t], step, 31, kind=nvvm.Shfl.BFLY))
+                            bfly_hi = cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, dots[t + 1], step, 31, kind=nvvm.Shfl.BFLY))
+                            dots[t], dots[t + 1] = fadd2(dots[t], dots[t + 1], bfly_lo, bfly_hi)
                     if lane == 0:
                         for t in cutlass.range_constexpr(cfg.b_t):
                             sRed1_raw[wg1_sp * cfg.b_t + t] = dots[t]
                     nvvm.barrier_cta_sync(cfg.cg2_sync_barrier_id, thread_count=cfg.cg2_threads)
                     for half in cutlass.range_constexpr(2):
                         a_words = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(row_addr + qk_col + half * (cfg.b_t // 4), cutlass.Float32), num=cfg.b_t // 4)
-                        for tt in cutlass.range_constexpr(cfg.b_t // 2):
-                            t = half * (cfg.b_t // 2) + tt
-                            a_pair = cutlass.Vector.from_elements((a_words[tt // 2],), cutlass.Float32).bitcast(cfg.io_dtype)
-                            total_dot = sRed1_raw[t] + sRed1_raw[cfg.b_t + t] + sRed1_raw[2 * cfg.b_t + t] + sRed1_raw[3 * cfg.b_t + t]
-                            norm_t = sNorm_raw[norm_base + inv_off + t]
-                            grad[t] = (grad[t] - a_pair[tt % 2].to(cutlass.Float32) * norm_t * total_dot) * norm_t
+                        for tt2 in cutlass.range_constexpr(cfg.b_t // 4):
+                            t = half * (cfg.b_t // 2) + 2 * tt2
+                            a_pair = cutlass.Vector.from_elements((a_words[tt2],), cutlass.Float32).bitcast(cfg.io_dtype)
+                            dot_lo, dot_hi = fadd2(sRed1_raw[t], sRed1_raw[t + 1], sRed1_raw[cfg.b_t + t], sRed1_raw[cfg.b_t + t + 1])
+                            dot_lo, dot_hi = fadd2(dot_lo, dot_hi, sRed1_raw[2 * cfg.b_t + t], sRed1_raw[2 * cfg.b_t + t + 1])
+                            dot_lo, dot_hi = fadd2(dot_lo, dot_hi, sRed1_raw[3 * cfg.b_t + t], sRed1_raw[3 * cfg.b_t + t + 1])
+                            norm_lo = sNorm_raw[norm_base + inv_off + t]
+                            norm_hi = sNorm_raw[norm_base + inv_off + t + 1]
+                            grad[t] = (grad[t] - a_pair[0].to(cutlass.Float32) * norm_lo * dot_lo) * norm_lo
+                            grad[t + 1] = (grad[t + 1] - a_pair[1].to(cutlass.Float32) * norm_hi * dot_hi) * norm_hi
                     nvvm.barrier_cta_sync(cfg.cg2_sync_barrier_id, thread_count=cfg.cg2_threads)
 
             nvvm.tcgen05_wait("load")
