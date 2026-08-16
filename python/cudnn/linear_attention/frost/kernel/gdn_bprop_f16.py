@@ -4630,10 +4630,10 @@ def chunk_gdn_bwd_sm100(
             forward states from the prefill kernel's checkpoint output (``checkpoint_every_n_tokens=B_T``)
         dq/dk/dv: pre-allocated output gradients, shaped/typed like q/k/v at
             HO heads
-        dgate/dbeta: pre-allocated ``(total_tokens, HO)`` float32 gate/beta
-            gradients (``safe_gate`` leaves dgate in the transformed gate
-            space; ``use_beta_sigmoid`` returns dbeta wrt the raw logits,
-            io dtype)
+        dgate: pre-allocated ``(total_tokens, HO)`` float32 gate gradient
+            (``safe_gate`` leaves it in the transformed gate space)
+        dbeta: pre-allocated ``(total_tokens, HO)`` beta gradient; float32, or
+            io dtype and wrt the raw logits under ``use_beta_sigmoid``
         cu_seqlens: ``(num_seqs + 1,)`` int32
         initial_state: ``(num_seqs, HO, DK, DV)`` io dtype (matching ``state_checkpoints``),
             or None
