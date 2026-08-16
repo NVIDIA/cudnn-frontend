@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 from cudnn import _pybind_module
 
+from ._handle import to_backend_handle, unwrap_handles
 from .datatypes import _buffer_dtype_to_cudnn, _dlpack_code_bits, _torch_to_cudnn_data_type
 from .engines.base import ExecutionContext, VariantPack
 from .engines.engine_ids import is_python_engine
@@ -1538,6 +1539,7 @@ class pygraph:
     def get_workspace_size(self, *args, **kwargs) -> int:
         """Workspace bytes for the selected plan. Classic overloads (handle /
         dynamic-shape overrides) pass through on the backend path."""
+        args, kwargs = unwrap_handles(args, kwargs)  # a Handle in the overloads -> backend handle for C++
         if not self._is_built:
             raise RuntimeError("Call build() first")
 
@@ -1556,6 +1558,7 @@ class pygraph:
 
     def get_workspace_size_plan_at_index(self, index: int, *args, **kwargs) -> int:
         """Workspace bytes for the plan at ``index`` in the ranked list."""
+        args, kwargs = unwrap_handles(args, kwargs)  # a Handle in the overloads -> backend handle for C++
         if not self._planning_done:  # e.g. a deserialized graph: C++ owns the list
             return self._lowered_graph.get_workspace_size_plan_at_index(index, *args, **kwargs)
         self._reject_if_barred(self._check_plan_index(index))
@@ -1652,6 +1655,7 @@ class pygraph:
         return self._cuda_graph_call("update_cuda_graph", *args, **kwargs)
 
     def _cuda_graph_call(self, name: str, *args, **kwargs):
+        args, kwargs = unwrap_handles(args, kwargs)  # populate/update_cuda_graph take the handle first
         eng = self.selected_engine
         if eng is not None:
             raise cudnn_graph_not_supported(f"{name}() records a cuDNN backend plan; the selected plan is served by the python engine {eng.name!r}")
@@ -1709,7 +1713,7 @@ class pygraph:
         if not self._planning_done:  # e.g. a deserialized graph: C++ owns the list
             uid_to_data = self._uid_to_data(tensor_dict)
             var_pack, ws_ptr = self._native_var_pack(uid_to_data, workspace)
-            return self._lowered_graph._execute_plan_at_index(var_pack, ws_ptr, index, handle, *args, **kwargs)
+            return self._lowered_graph._execute_plan_at_index(var_pack, ws_ptr, index, to_backend_handle(handle), *args, **kwargs)
         self._reject_if_barred(self._check_plan_index(index))
         cfg = self._plans[index]
         if self._engine_for(cfg) is not None:
@@ -1727,9 +1731,9 @@ class pygraph:
         uid_to_data = self._uid_to_data(tensor_dict)
         var_pack, ws_ptr = self._native_var_pack(uid_to_data, workspace)
         if cfg.cpp_index is None:  # delegating entry
-            self._lowered_graph._execute(var_pack, ws_ptr, handle, *args, **kwargs)
+            self._lowered_graph._execute(var_pack, ws_ptr, to_backend_handle(handle), *args, **kwargs)
             return
-        self._lowered_graph._execute_plan_at_index(var_pack, ws_ptr, cfg.cpp_index, handle, *args, **kwargs)
+        self._lowered_graph._execute_plan_at_index(var_pack, ws_ptr, cfg.cpp_index, to_backend_handle(handle), *args, **kwargs)
 
     def execute(
         self,
@@ -1808,16 +1812,16 @@ class pygraph:
                 variant_pack.address,
                 len(variant_pack),
                 variant_pack.workspace,
-                handle or 0,
+                to_backend_handle(handle) or 0,
                 -1 if cpp_index is None else cpp_index,
             )
             return
 
         var_pack, ws_ptr = self._native_var_pack(uid_to_data, workspace)
         if cpp_index is not None:
-            self._lowered_graph._execute_plan_at_index(var_pack, ws_ptr, cpp_index, handle, override_uids, override_shapes, override_strides)
+            self._lowered_graph._execute_plan_at_index(var_pack, ws_ptr, cpp_index, to_backend_handle(handle), override_uids, override_shapes, override_strides)
             return
-        self._lowered_graph._execute(var_pack, ws_ptr, handle, override_uids, override_shapes, override_strides)
+        self._lowered_graph._execute(var_pack, ws_ptr, to_backend_handle(handle), override_uids, override_shapes, override_strides)
 
     def _variant_pack_uids(self) -> Optional[List[int]]:
         """The graph's caller-filled variant_pack, ASCENDING by uid.
@@ -2087,6 +2091,7 @@ class pygraph:
     def deserialize(self, *args, **kwargs) -> None:
         """Deserialize a graph (classic passthrough: (data) or (handle, data,
         enforce_precompiled=...)). Replaces this graph's lowered C++ graph."""
+        args, kwargs = unwrap_handles(args, kwargs)  # classic (handle, data, ...) -> backend handle for C++
         if self._lowered_graph is None:
             import cudnn
 
@@ -2103,7 +2108,7 @@ class pygraph:
                     if _k in self._cpp_graph_kwargs:
                         deser_kwargs[_k] = self._cpp_graph_kwargs[_k]
                 if self._handle is not None:
-                    deser_kwargs["handle"] = self._handle
+                    deser_kwargs["handle"] = to_backend_handle(self._handle)
                 self._lowered_graph = cudnn._pybind_module.backend_graph(**deser_kwargs)
         self._lowered_graph.deserialize(*args, **kwargs)
         self._is_built = True
@@ -2128,7 +2133,7 @@ class pygraph:
         pg_kwargs["intermediate_data_type"] = _library_type(self._context.intermediate_data_type or cudnn.data_type.FLOAT)
         pg_kwargs["compute_data_type"] = _library_type(self._context.compute_data_type or cudnn.data_type.FLOAT)
         if self._handle is not None:
-            pg_kwargs["handle"] = self._handle
+            pg_kwargs["handle"] = to_backend_handle(self._handle)
         graph = cudnn._pybind_module.backend_graph(**pg_kwargs)
 
         tensor_map: Dict[int, Any] = {}

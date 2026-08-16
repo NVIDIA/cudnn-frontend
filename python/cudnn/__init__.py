@@ -25,10 +25,8 @@ symbols_to_import = [
     "reduction_mode",
     "behavior_note",
     "knob_type",
-    "create_handle",
     "create_kernel_cache",
     "create_device_properties",
-    "get_stream",
     "numerical_note",
     "build_plan_policy",
     "data_type",
@@ -59,8 +57,34 @@ for _optional_symbol in [
         globals()[_optional_symbol] = getattr(_pybind_module, _optional_symbol)
 
 
-# The last stream set on each handle, so set_stream() below can skip a redundant backend call.
+from ._handle import Handle, DeviceInfo
+
+# Type alias for the annotations that reference ``cudnn.handle`` (a supplied handle
+# is a cudnn.Handle, or a bare int for a framework-created foreign handle).
+handle = Handle
+
+# Last stream per FOREIGN raw-int handle (a cudnn.Handle carries its own .stream);
+# lets set_stream() skip a redundant backend call when the stream is unchanged.
 _handle_to_stream: dict = {}
+
+
+def create_handle():
+    """Create a cuDNN handle, returned as a first-class :class:`cudnn.Handle`.
+
+    The Handle wraps the backend ``cudnnHandle_t`` and is bound to the current
+    CUDA device; it forwards to the backend anywhere an ``intptr_t`` handle is
+    expected (via ``__index__``), so existing code that passes the handle to
+    ``graph.execute`` / ``set_stream`` / the C++ layer is unchanged.
+    """
+    raw = _pybind_module.create_handle()
+    ordinal = None
+    try:
+        from .frost.device import current_device
+
+        ordinal = current_device()
+    except Exception:
+        ordinal = None  # no GPU visible / cuda-python absent: resolve lazily on .device
+    return Handle(raw, ordinal)
 
 
 def set_stream(handle, stream):
@@ -70,21 +94,45 @@ def set_stream(handle, stream):
     on every call (green-context detection, stream priority, priority range) to maintain cuDNN's
     internal per-priority stream pool, even when the stream is unchanged -- ~2.4us/call on
     Blackwell. Frameworks that call this before every ``execute`` pay it every iteration, so we
-    cache the last stream per handle and skip the backend call when it has not changed; a
-    steady-state loop pays it once. (Assumes a handle is not driven from two streams
-    concurrently, which is the normal single-stream case; a caller that does needs its own
-    handle per stream regardless.)
+    remember the last stream and skip the backend call when it has not changed; a steady-state
+    loop pays it once. A :class:`cudnn.Handle` remembers on itself; a foreign raw-int handle has
+    no object, so it is remembered in a module registry keyed by the raw address. (Assumes a
+    handle is not driven from two streams concurrently, which is the normal single-stream case; a
+    caller that does needs its own handle per stream regardless.)
     """
-    if _handle_to_stream.get(handle) == stream:
+    if isinstance(handle, Handle):
+        if handle.stream == stream:
+            return
+        if handle.backend_handle is not None:
+            _pybind_module._raw_set_stream(handle.backend_handle, stream)
+        handle.stream = stream
+        return
+    key = int(handle)
+    if _handle_to_stream.get(key) == stream:
         return
     _pybind_module._raw_set_stream(handle, stream)
-    _handle_to_stream[handle] = stream
+    _handle_to_stream[key] = stream
+
+
+def get_stream(handle):
+    """The CUDA stream a handle runs on. For a :class:`cudnn.Handle` this is the cached
+    ``Handle.stream`` (no backend round-trip); for a foreign raw-int handle it queries the
+    backend (``cudnnGetStream``)."""
+    if isinstance(handle, Handle):
+        return handle.stream
+    return _pybind_module.get_stream(handle)
 
 
 def destroy_handle(handle):
-    """Destroy a cuDNN handle (wraps the compiled binding); forget its cached stream so a
+    """Destroy a cuDNN handle (wraps the compiled binding); forget its remembered stream so a
     reused handle address is not wrongly skipped by set_stream()."""
-    _handle_to_stream.pop(handle, None)
+    if isinstance(handle, Handle):
+        backend = handle.backend_handle
+        handle.stream = None
+        if backend is None:
+            return None
+        return _pybind_module._raw_destroy_handle(backend)
+    _handle_to_stream.pop(int(handle), None)
     return _pybind_module._raw_destroy_handle(handle)
 
 
