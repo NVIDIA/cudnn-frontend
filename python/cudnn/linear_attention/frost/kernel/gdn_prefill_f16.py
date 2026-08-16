@@ -95,7 +95,8 @@ from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import min
 
 from ..common.thd import emit_checkpoint_seq_descs, emit_seq_descs, TENSOR_MAP_QWORDS
-from ..common.split_k import decode_work_item
+from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMS, ORDER_THREADS, decode_work_item, order_body
+from ..common.elementwise import softplus
 from ..common.host import get_dtype
 from cudnn.frost.buffers import current_device_id, data_ptr
 from cudnn.frost.device import multiprocessor_count
@@ -626,6 +627,8 @@ def gate_beta_warp(
     mWorkItems,
     tidx,
     mGate,
+    mA_log,
+    mDt_bias,
     mBeta,
     sCumsumlog,
     sCumprod,
@@ -641,12 +644,19 @@ def gate_beta_warp(
     beta_index = PipelineState.start(phase=1)
     lidx = tidx % cfg.threads_per_warp
 
+    a_l2 = cutlass.Float32(0.0)
+    bias = cutlass.Float32(0.0)
     sched_state = PipelineState.start(phase=0)
     tile_idx = cutlass.Int32(bidx)
     while tile_idx < total_tiles:
         batch_idx, head_idx, batch_start, batch_end, seqlen_b, num_chunks_b, wstart, wend, cstart, cend = decode_work_item(cfg, tile_idx, mWorkItems)
         n_local = wend - cstart
         n_padded = ((n_local + 1) // 2) * 2
+        if cutlass.const_expr(cfg.safe_gate):
+            if n_local > 0:
+                # per-head transform constants, fixed for the whole tile
+                a_l2 = -cute.math.exp2(mA_log[head_idx].to(cutlass.Float32) * cutlass.Float32(RCP_LN2), fastmath=True) * cutlass.Float32(RCP_LN2)
+                bias = mDt_bias[head_idx].to(cutlass.Float32)
         if n_local > 0:
             for local_idx in cutlass.range(n_padded):
                 # ---- Gate load: GMEM -> SMEM (OOB neutral) -----------------------
@@ -669,7 +679,12 @@ def gate_beta_warp(
                     tok_clamped = min(tok, batch_end - 1)
                     gate_vals[col] = gGateSeq[tok_clamped] if pos_valid[col] else oob_neutral
 
-                if cutlass.const_expr(cfg.log_gate):
+                if cutlass.const_expr(cfg.safe_gate):
+                    # raw logits -> log2-domain decay: a_l2 * softplus(g + bias) (split-K scan arithmetic)
+                    for col in cutlass.range_constexpr(n_cols):
+                        contrib = a_l2 * softplus(gate_vals[col] + bias)
+                        gate_vals[col] = contrib if pos_valid[col] else cutlass.Float32(0.0)
+                elif cutlass.const_expr(cfg.log_gate):
                     for col in cutlass.range_constexpr(n_cols):
                         gate_vals[col] = gate_vals[col] * cutlass.Float32(RCP_LN2)
                 else:
@@ -701,13 +716,25 @@ def gate_beta_warp(
                 beta_idx = beta_index.idx
                 bars.mb_beta_done[beta_idx].wait(beta_index.phase)
                 beta_index = advance(beta_index, cfg.smem_beta_stages)
-                for col in cutlass.range_constexpr(n_cols):
-                    pos = lidx + col * cfg.threads_per_warp
-                    src = gBeta.iterator + gBeta.layout((pos,))
-                    dst = sBeta.iterator + sBeta.layout((pos, 0, beta_idx))
-                    cp_size = cutlass.Int32(4) * cutlass.Int32(pos_valid[col])
-                    nvvm.cp_async_shared_global(dst, src, 4, nvvm.LoadCacheModifier.CA, cp_size=cp_size)
-                nvvm.cp_async_mbarrier_arrive(bars.mb_beta_ready[beta_idx].smem_ptr, noinc=True)
+                if cutlass.const_expr(cfg.beta_sigmoid):
+                    # io-dtype logits -> sigmoid (tanh identity) -> fp32 SMEM
+                    for col in cutlass.range_constexpr(n_cols):
+                        pos = lidx + col * cfg.threads_per_warp
+                        beta_value = cutlass.Float32(0.0)
+                        if pos_valid[col]:
+                            beta_value = gBeta[pos].to(cutlass.Float32)
+                            half = cutlass.Float32(0.5)
+                            beta_value = (cute.math.tanh(beta_value * half, approx=True) * half + half).to(mBeta.element_type).to(cutlass.Float32)
+                        sBeta[pos, 0, beta_idx] = beta_value
+                    bars.mb_beta_ready[beta_idx].arrive()
+                else:
+                    for col in cutlass.range_constexpr(n_cols):
+                        pos = lidx + col * cfg.threads_per_warp
+                        src = gBeta.iterator + gBeta.layout((pos,))
+                        dst = sBeta.iterator + sBeta.layout((pos, 0, beta_idx))
+                        cp_size = cutlass.Int32(4) * cutlass.Int32(pos_valid[col])
+                        nvvm.cp_async_shared_global(dst, src, 4, nvvm.LoadCacheModifier.CA, cp_size=cp_size)
+                    nvvm.cp_async_mbarrier_arrive(bars.mb_beta_ready[beta_idx].smem_ptr, noinc=True)
         tile_idx, sched_state = sched_next_tile(cfg, bars, sSched, sched_state, tile_idx, num_ctas)
 
     for _ in range(cfg.smem_gate_stages):
@@ -1925,13 +1952,14 @@ def compute1_warp_group(
             checkpoint_cnt = checkpoint_cnt + 1
 
 
-@cute.kernel
-def build_all_descs_kernel(
-    base_q: cutlass.GridConstant[tma.TensorMap],
-    base_k: cutlass.GridConstant[tma.TensorMap],
-    base_v: cutlass.GridConstant[tma.TensorMap],
-    base_o: cutlass.GridConstant[tma.TensorMap],
-    base_checkpoint: cutlass.GridConstant[tma.TensorMap],
+@cute.jit
+def build_descs_body(
+    widx,
+    base_q,
+    base_k,
+    base_v,
+    base_o,
+    base_checkpoint,
     desc_ws: cute.Tensor,
     cu_seqlens: cute.Tensor,
     q: cute.Tensor,
@@ -1947,10 +1975,9 @@ def build_all_descs_kernel(
     checkpoint_row_stride: cutlass.Int32,
     checkpoint_every_n: cutlass.Int32,
 ) -> None:
-    """Single-launch builder for the per-batch descriptor arrays (one warp
-    per array)."""
-    tidx, _, _ = cute.arch.thread_idx()
-    widx = cutlass.Int32(tidx) // cutlass.Int32(32)
+    """Per-batch descriptor-array build, one warp per array. Runs inside the
+    prologue kernel after its order pass; warps past the array count fall
+    through the widx guards."""
     arr_words = n_batch * cutlass.Int32(TENSOR_MAP_QWORDS)
     sub0 = cute.make_tensor(desc_ws.iterator, cute.make_layout((arr_words,), stride=(1,)))
     sub1 = cute.make_tensor(desc_ws.iterator + arr_words, cute.make_layout((arr_words,), stride=(1,)))
@@ -1982,21 +2009,110 @@ def build_all_descs_kernel(
                 nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
 
 
+@cute.kernel
+def prologue_kernel(
+    order_gen: cutlass.Constexpr[bool],
+    has_sched: cutlass.Constexpr[bool],
+    b_t: cutlass.Constexpr[int],
+    base_q: cutlass.GridConstant[tma.TensorMap],
+    base_k: cutlass.GridConstant[tma.TensorMap],
+    base_v: cutlass.GridConstant[tma.TensorMap],
+    base_o: cutlass.GridConstant[tma.TensorMap],
+    base_checkpoint: cutlass.GridConstant[tma.TensorMap],
+    desc_ws: cute.Tensor,
+    cu_seqlens: cute.Tensor,
+    q: cute.Tensor,
+    k: cute.Tensor,
+    v: cute.Tensor,
+    o: Optional[cute.Tensor],
+    state_checkpoints_out: Optional[cute.Tensor],
+    mStaging: Optional[cute.Tensor],
+    mCount: cute.Tensor,
+    mWorkItems: cute.Tensor,
+    mSched: Optional[cute.Tensor],
+    n_batch: cutlass.Int32,
+    q_row_stride: cutlass.Int32,
+    k_row_stride: cutlass.Int32,
+    v_row_stride: cutlass.Int32,
+    o_row_stride: cutlass.Int32,
+    checkpoint_row_stride: cutlass.Int32,
+    checkpoint_every_n: cutlass.Int32,
+) -> None:
+    """Single-CTA prologue: LPT-order the work-item table and zero the sched
+    rings via :func:`order_body`, then build the per-batch TMA-descriptor
+    arrays via :func:`build_descs_body`, one warp per array (the extra warps
+    only take part in the order phase)."""
+    tidx, _, _ = cute.arch.thread_idx()
+    tidx = cutlass.Int32(tidx)
+    widx = tidx // cutlass.Int32(32)
+    sKey = cutlass.Array(cutlass.Int32, ORDER_CAPACITY, space=cutlass.AddressSpace.smem, alignment=16)
+    sIdx = cutlass.Array(cutlass.Int32, ORDER_CAPACITY, space=cutlass.AddressSpace.smem, alignment=16)
+    sSpread = cutlass.Array(cutlass.Int32, 2, space=cutlass.AddressSpace.smem, alignment=8)
+    n_heads_out = cutlass.Int32(q.shape[1] if q.shape[1] >= v.shape[1] else v.shape[1])
+    order_body(
+        order_gen,
+        has_sched,
+        b_t,
+        ORDER_THREADS,
+        ORDER_ELEMS,
+        tidx,
+        n_heads_out,
+        n_heads_out * n_batch,
+        cu_seqlens,
+        mStaging,
+        mCount,
+        mWorkItems,
+        mSched,
+        sKey,
+        sIdx,
+        sSpread,
+    )
+    build_descs_body(
+        widx,
+        base_q,
+        base_k,
+        base_v,
+        base_o,
+        base_checkpoint,
+        desc_ws,
+        cu_seqlens,
+        q,
+        k,
+        v,
+        o,
+        state_checkpoints_out,
+        n_batch,
+        q_row_stride,
+        k_row_stride,
+        v_row_stride,
+        o_row_stride,
+        checkpoint_row_stride,
+        checkpoint_every_n,
+    )
+
+
 @cute.jit
-def build_descs(
+def prologue(
     io_dtype: cutlass.Constexpr,
     b_t: cutlass.Constexpr[int],
+    order_gen: cutlass.Constexpr[bool],
+    has_sched: cutlass.Constexpr[bool],
     q: cute.Tensor,
     k: cute.Tensor,
     v: cute.Tensor,
     o: Optional[cute.Tensor],
     cu_seqlens: cute.Tensor,
     state_checkpoints_out: Optional[cute.Tensor],
+    work_item_staging: Optional[cute.Tensor],
+    work_count: cute.Tensor,
+    work_items: cute.Tensor,
+    sched_ctr: Optional[cute.Tensor],
     checkpoint_every_n: cutlass.Int32,
     tensormap_workspace: cute.Tensor,
     stream: cuda.CUstream,
 ):
-    """Build the 5 per-(b,h) TMA-descriptor arrays (Q, K, V, O, checkpoints) into
+    """One-launch prologue: LPT-order the work items and build the 5
+    per-(b,h) TMA-descriptor arrays (Q, K, V, O, checkpoints) into
     ``tensormap_workspace``."""
     h_q = q.shape[1]
     h_k = k.shape[1]
@@ -2043,8 +2159,10 @@ def build_descs(
             checkpoint_view, box_dims=(checkpoint_elems_per_128b, d_k_state, 1, 1), stride_order=(0, 1, 2, 3), swizzle=swz128
         )
 
-    n_warps = 5 if state_checkpoints_out is not None else (4 if o is not None else 3)
-    build_all_descs_kernel(
+    prologue_kernel(
+        order_gen,
+        has_sched,
+        b_t,
         base_desc_q,
         base_desc_k,
         base_desc_v,
@@ -2057,6 +2175,10 @@ def build_descs(
         v,
         o,
         state_checkpoints_out,
+        work_item_staging,
+        work_count,
+        work_items,
+        sched_ctr,
         cutlass.Int32(batch_size),
         cutlass.Int32(q_row_stride),
         cutlass.Int32(k_row_stride),
@@ -2064,7 +2186,7 @@ def build_descs(
         cutlass.Int32(o.stride[0] if o is not None else 0),
         cutlass.Int32(state_checkpoints_out.stride[0] if state_checkpoints_out is not None else 0),
         checkpoint_every_n,
-    ).launch(grid=(1, 1, 1), block=(32 * n_warps, 1, 1), stream=stream)
+    ).launch(grid=(1, 1, 1), block=(ORDER_THREADS, 1, 1), stream=stream)
 
 
 @cute.jit
@@ -2074,6 +2196,8 @@ def host(
     k: cute.Tensor,
     v: cute.Tensor,
     gate: cute.Tensor,
+    a_log: Optional[cute.Tensor],
+    dt_bias: Optional[cute.Tensor],
     beta: cute.Tensor,
     o: Optional[cute.Tensor],
     cu_seqlens: cute.Tensor,
@@ -2226,6 +2350,8 @@ def host(
     kernel(
         cfg,
         gate,
+        a_log,
+        dt_bias,
         beta,
         cu_seqlens,
         state_in,
@@ -2256,6 +2382,8 @@ def host(
 def kernel(
     cfg: cutlass.Constexpr,
     mGate: cute.Tensor,
+    mA_log: Optional[cute.Tensor],
+    mDt_bias: Optional[cute.Tensor],
     mBeta: cute.Tensor,
     cu_seqlens: cute.Tensor,
     mState_init: Optional[cute.Tensor],
@@ -2523,6 +2651,8 @@ def kernel(
             mWorkItems,
             tidx=tidx,
             mGate=mGate,
+            mA_log=mA_log,
+            mDt_bias=mDt_bias,
             mBeta=mBeta,
             sCumsumlog=sCumsumlog,
             sCumprod=sCumprod,
@@ -2605,6 +2735,8 @@ class GdnCfg:
     store_final_state: bool
     enable_checkpoints: bool
     log_gate: bool = False
+    safe_gate: bool = False
+    beta_sigmoid: bool = False
     dyn_sched: bool = False
     sched_stages: int = CFG.SMEM_SCHED_STAGES
 
@@ -2681,6 +2813,8 @@ def build_cfg(
     store_final_state: bool = True,
     enable_checkpoints: bool = False,
     log_gate: bool = False,
+    safe_gate: bool = False,
+    beta_sigmoid: bool = False,
     dyn_sched: bool = False,
 ) -> GdnCfg:
     """Build the per-compile ``GdnCfg`` (io_dtype ∈ {Float16, BFloat16};
@@ -2697,6 +2831,8 @@ def build_cfg(
         store_final_state=store_final_state,
         enable_checkpoints=enable_checkpoints,
         log_gate=log_gate,
+        safe_gate=safe_gate,
+        beta_sigmoid=beta_sigmoid,
         dyn_sched=dyn_sched,
     )
     cfg.smem_checkpoint_stages = 1
@@ -2740,7 +2876,10 @@ def get_compiled_cache(
     store_final_state: bool,
     enable_checkpoints: bool,
     log_gate: bool,
+    safe_gate: bool,
+    beta_sigmoid: bool,
     dyn_sched: bool,
+    order_gen: bool,
 ):
     """Return a mutable dict that lazily stores the compiled kernel."""
     return {}
@@ -2754,6 +2893,8 @@ def compile(
     store_final_state: bool,
     enable_checkpoints: bool,
     log_gate: bool = False,
+    safe_gate: bool = False,
+    beta_sigmoid: bool = False,
     dyn_sched: bool = False,
     *,
     num_sm: int,
@@ -2761,6 +2902,8 @@ def compile(
     k_cute,
     v_cute,
     gate_cute,
+    a_log_cute=None,
+    dt_bias_cute=None,
     beta_cute,
     o_cute,
     cu_seqlens_cute,
@@ -2784,6 +2927,8 @@ def compile(
         store_final_state=store_final_state,
         enable_checkpoints=enable_checkpoints,
         log_gate=log_gate,
+        safe_gate=safe_gate,
+        beta_sigmoid=beta_sigmoid,
         dyn_sched=dyn_sched,
     )
 
@@ -2794,6 +2939,8 @@ def compile(
         k_cute,
         v_cute,
         gate_cute,
+        a_log_cute,
+        dt_bias_cute,
         beta_cute,
         o_cute,
         cu_seqlens_cute,
@@ -2827,6 +2974,11 @@ def chunk_gdn_sm100(
     work_count=None,
     sched_ctr=None,
     log_gate: bool = False,
+    safe_gate: bool = False,
+    a_log=None,
+    dt_bias=None,
+    use_beta_sigmoid: bool = False,
+    work_item_scratch=None,
     *,
     workspace,
     stream,
@@ -2842,8 +2994,11 @@ def chunk_gdn_sm100(
         k: ``(total_tokens, HK, DK)`` float16/bfloat16
         v: ``(total_tokens, HV, DK)`` float16/bfloat16
         gate: ``(total_tokens, HO)`` float32, forget gate — raw linear
-            alpha, or the natural-log decay when ``log_gate``
-        beta: ``(total_tokens, HO)`` float32, update gate
+            alpha, or the natural-log decay when ``log_gate``, or raw logits
+            when ``safe_gate``, which applies the safe-gate transform
+            ``-exp(a_log) * softplus(gate + dt_bias)``
+        beta: ``(total_tokens, HO)`` float32, update gate — post-sigmoid, or
+            io-dtype logits when ``use_beta_sigmoid``
         output: ``(total_tokens, HO, DK)`` float16/bfloat16, pre-allocated
         cu_seqlens: ``(num_seqs + 1,)`` int32
         initial_state: ``(num_seqs, HO, DK, DK)`` float32/bfloat16, or None
@@ -2863,6 +3018,10 @@ def chunk_gdn_sm100(
         log_gate: ``gate`` holds natural-log decay values; the gate warp
             skips its log2 (rescales by 1/ln2) instead of exponentiating
             upstream
+        safe_gate: interpret ``gate`` through the safe-gate transform
+        a_log: ``(HO,)`` float32, safe-gate per-head log-amplitude (None = 0)
+        dt_bias: ``(HO,)`` float32, safe-gate per-head bias (None = 0)
+        use_beta_sigmoid: ``beta`` holds logits; sigmoid in-kernel
         workspace: ``(>= tensormap_workspace_bytes(module, B) // 8,)`` int64,
             128-byte aligned; holds the per-(b,h) TMA descriptors (contents
             managed here — reuse the same buffer across calls)
@@ -2878,7 +3037,13 @@ def chunk_gdn_sm100(
     enable_checkpoints = checkpoint_every_n_tokens > 0
     if work_items is None or work_count is None:
         raise ValueError("work_items/work_count are required (the split-table stage builds them for every launch)")
+    if safe_gate and (a_log is None or dt_bias is None):
+        raise ValueError("safe_gate requires a_log and dt_bias")
+    if not safe_gate:
+        a_log = None
+        dt_bias = None
     dyn_sched = sched_ctr is not None
+    order_gen = work_item_scratch is None
     io_dtype = get_dtype(q.dtype)
 
     if initial_state is not None:
@@ -2903,7 +3068,10 @@ def chunk_gdn_sm100(
         store_final_state,
         enable_checkpoints,
         log_gate,
+        safe_gate,
+        use_beta_sigmoid,
         dyn_sched,
+        order_gen,
     )
 
     if "compiled" not in cache:
@@ -2915,6 +3083,8 @@ def chunk_gdn_sm100(
         v_cute.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2), divisibility=1)
         gate_cute = from_dlpack(gate, assumed_align=16)
         gate_cute.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
+        a_log_cute = from_dlpack(a_log, assumed_align=4) if a_log is not None else None
+        dt_bias_cute = from_dlpack(dt_bias, assumed_align=4) if dt_bias is not None else None
         beta_cute = from_dlpack(beta, assumed_align=16)
         beta_cute.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
         o_cute = from_dlpack(output, assumed_align=16)
@@ -2949,12 +3119,16 @@ def chunk_gdn_sm100(
             store_final_state,
             enable_checkpoints,
             log_gate,
+            safe_gate,
+            use_beta_sigmoid,
             dyn_sched,
             num_sm=multiprocessor_count(current_device_id()),
             q_cute=q_cute,
             k_cute=k_cute,
             v_cute=v_cute,
             gate_cute=gate_cute,
+            a_log_cute=a_log_cute,
+            dt_bias_cute=dt_bias_cute,
             beta_cute=beta_cute,
             o_cute=o_cute,
             cu_seqlens_cute=cu_seqlens_cute,
@@ -2971,47 +3145,64 @@ def chunk_gdn_sm100(
 
     compiled = cache["compiled"]
 
-    # desc build runs every execute by contract (cu contents are data;
-    # buffer pointers may change) — capture-safe, single tiny launch
-    if "build_descs" not in cache:
-        q_bc = from_dlpack(q, assumed_align=16)
-        q_bc.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2), divisibility=1)
-        k_bc = from_dlpack(k, assumed_align=16)
-        k_bc.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2), divisibility=1)
-        v_bc = from_dlpack(v, assumed_align=16)
-        v_bc.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2), divisibility=1)
-        o_bc = from_dlpack(output, assumed_align=16)
-        o_bc.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2), divisibility=1)
-        cu_bc = from_dlpack(cu_seqlens, assumed_align=8 if str(cu_seqlens.dtype).endswith("int64") else 4).mark_layout_dynamic()
-        checkpoints_bc = None
-        cu_ckpt_bc = None
+    if "prologue" not in cache:
+        q_pl = from_dlpack(q, assumed_align=16)
+        q_pl.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2), divisibility=1)
+        k_pl = from_dlpack(k, assumed_align=16)
+        k_pl.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2), divisibility=1)
+        v_pl = from_dlpack(v, assumed_align=16)
+        v_pl.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2), divisibility=1)
+        o_pl = from_dlpack(output, assumed_align=16)
+        o_pl.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2), divisibility=1)
+        cu_pl = from_dlpack(cu_seqlens, assumed_align=8 if str(cu_seqlens.dtype).endswith("int64") else 4).mark_layout_dynamic()
+        checkpoints_pl = None
         if enable_checkpoints:
-            checkpoints_bc = from_dlpack(output_state_checkpoints, assumed_align=16)
-            checkpoints_bc.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2, 3), divisibility=1)
-        ws_bc = from_dlpack(workspace, assumed_align=128).mark_layout_dynamic()
-        cache["build_descs"] = cute.compile(
-            build_descs,
+            checkpoints_pl = from_dlpack(output_state_checkpoints, assumed_align=16)
+            checkpoints_pl.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2, 3), divisibility=1)
+        staging_pl = None
+        if not order_gen:
+            staging_pl = from_dlpack(work_item_scratch, assumed_align=16)
+            staging_pl.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
+        work_items_pl = from_dlpack(work_items, assumed_align=16)
+        work_items_pl.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
+        work_count_pl = from_dlpack(work_count, assumed_align=4).mark_layout_dynamic()
+        sched_pl = None
+        if dyn_sched:
+            sched_pl = from_dlpack(sched_ctr, assumed_align=4).mark_layout_dynamic()
+        ws_pl = from_dlpack(workspace, assumed_align=128).mark_layout_dynamic()
+        cache["prologue"] = cute.compile(
+            prologue,
             io_dtype,
             CFG.B_T,
-            q_bc,
-            k_bc,
-            v_bc,
-            o_bc,
-            cu_bc,
-            checkpoints_bc,
-            cutlass.Int32(checkpoint_every_n_tokens if enable_checkpoints else 1),
-            ws_bc,
+            order_gen,
+            dyn_sched,
+            q_pl,
+            k_pl,
+            v_pl,
+            o_pl,
+            cu_pl,
+            checkpoints_pl,
+            staging_pl,
+            work_count_pl,
+            work_items_pl,
+            sched_pl,
+            cutlass.Int32(checkpoint_every_n_tokens),
+            ws_pl,
             cu_stream,
             options="--enable-tvm-ffi",
         )
-    cache["build_descs"](
+    cache["prologue"](
         q,
         k,
         v,
         output,
         cu_seqlens,
-        output_state_checkpoints,
-        checkpoint_every_n_tokens if enable_checkpoints else 1,
+        output_state_checkpoints if enable_checkpoints else None,
+        work_item_scratch if not order_gen else None,
+        work_count,
+        work_items,
+        sched_ctr,
+        checkpoint_every_n_tokens,
         workspace,
         cu_stream,
     )
@@ -3020,6 +3211,8 @@ def chunk_gdn_sm100(
         k,
         v,
         gate,
+        a_log,
+        dt_bias,
         beta,
         output,
         cu_seqlens,
@@ -3031,5 +3224,70 @@ def chunk_gdn_sm100(
         checkpoint_every_n_tokens,
         scale,
         workspace,
+        cu_stream,
+    )
+    return cache
+
+
+def run_prefill(
+    cache,
+    q,
+    k,
+    v,
+    gate,
+    beta,
+    output,
+    cu_seqlens,
+    initial_state,
+    output_state,
+    output_state_checkpoints,
+    work_items,
+    work_count,
+    sched_ctr,
+    work_item_scratch,
+    tensormap_workspace,
+    checkpoint_every_n_tokens,
+    scale,
+    stream,
+    a_log=None,
+    dt_bias=None,
+) -> None:
+    """Replay the compiled plan: the prologue launch, then the main launch.
+    The caller owns the contract, which the plan validated at build, so
+    nothing here raises."""
+    cu_stream = cuda.CUstream(int(stream))
+    cache["prologue"](
+        q,
+        k,
+        v,
+        output,
+        cu_seqlens,
+        output_state_checkpoints,
+        work_item_scratch,
+        work_count,
+        work_items,
+        sched_ctr,
+        checkpoint_every_n_tokens,
+        tensormap_workspace,
+        cu_stream,
+    )
+    cache["compiled"](
+        q,
+        k,
+        v,
+        gate,
+        a_log,
+        dt_bias,
+        beta,
+        output,
+        cu_seqlens,
+        initial_state,
+        output_state,
+        work_items,
+        work_count,
+        sched_ctr,
+        checkpoint_every_n_tokens,
+        scale,
+        tensormap_workspace,
         cu_stream,
     )
