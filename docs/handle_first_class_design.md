@@ -37,7 +37,9 @@ becomes one consumer rather than the anchor.
    handle), so the set is closed. `Handle` deliberately has **no `__index__`**:
    the only path to the backend is those explicit calls, and a Handle that
    reaches a binding unconverted fails loudly instead of being silently coerced.
-   C++ never reads device off the handle. **No `.cpp` changes.**
+   C++ never reads device off the handle. **The C++ handle ABI is unchanged**;
+   the only `.cpp` change is renaming the `set_stream`/`destroy_handle` bindings
+   to `_raw_*` (`python/properties.cpp`) so the Python wrappers own those names.
 2. **The `create_handle` wrapper must be defined AFTER the `__init__.py` symbol-
    copy loop**, or the raw pybind symbol shadows it.
 3. **Dunder minimalism.** `Handle` defines **no** int-coercing dunders and leaves

@@ -63,10 +63,6 @@ from ._handle import Handle, DeviceInfo
 # is a cudnn.Handle, or a bare int for a framework-created foreign handle).
 handle = Handle
 
-# Last stream per FOREIGN raw-int handle (a cudnn.Handle carries its own .stream);
-# lets set_stream() skip a redundant backend call when the stream is unchanged.
-_handle_to_stream: dict = {}
-
 
 def create_handle():
     """Create a cuDNN handle, returned as a first-class :class:`cudnn.Handle`.
@@ -85,7 +81,10 @@ def create_handle():
         ordinal = current_device()
     except Exception:
         ordinal = None  # no GPU visible / cuda-python absent: resolve lazily on .device
-    return Handle(raw, ordinal)
+    # Seed the stream from the backend's actual stream (a fresh handle runs on
+    # stream 0) so a python plan and a backend plan on this handle agree on the
+    # stream, instead of the python side falling back to torch's current stream.
+    return Handle(raw, ordinal, _pybind_module.get_stream(raw))
 
 
 def set_stream(handle, stream):
@@ -96,10 +95,11 @@ def set_stream(handle, stream):
     internal per-priority stream pool, even when the stream is unchanged -- ~2.4us/call on
     Blackwell. Frameworks that call this before every ``execute`` pay it every iteration, so we
     remember the last stream and skip the backend call when it has not changed; a steady-state
-    loop pays it once. A :class:`cudnn.Handle` remembers on itself; a foreign raw-int handle has
-    no object, so it is remembered in a module registry keyed by the raw address. (Assumes a
-    handle is not driven from two streams concurrently, which is the normal single-stream case; a
-    caller that does needs its own handle per stream regardless.)
+    loop pays it once. Only a :class:`cudnn.Handle` gets this fast path (it remembers the stream
+    on itself); a foreign raw-int handle is not ours to track -- its owner may call
+    ``cudnnSetStream`` out-of-band -- so it is always set through. (Assumes a Handle is not driven
+    from two streams concurrently, which is the normal single-stream case; a caller that does
+    needs its own handle per stream regardless.)
     """
     if isinstance(handle, Handle):
         if handle.stream == stream:
@@ -108,11 +108,10 @@ def set_stream(handle, stream):
             _pybind_module._raw_set_stream(handle.backend_handle, stream)
         handle.stream = stream
         return
-    key = int(handle)
-    if _handle_to_stream.get(key) == stream:
-        return
+    # Foreign raw-int handle: we do not own it and cannot observe an out-of-band
+    # cudnnSetStream by its owner, so never skip on a cached value -- always set
+    # through. The idempotency fast-path is kept only on Handle (handle.stream).
     _pybind_module._raw_set_stream(handle, stream)
-    _handle_to_stream[key] = stream
 
 
 def get_stream(handle):
@@ -125,15 +124,20 @@ def get_stream(handle):
 
 
 def destroy_handle(handle):
-    """Destroy a cuDNN handle (wraps the compiled binding); forget its remembered stream so a
-    reused handle address is not wrongly skipped by set_stream()."""
+    """Destroy a cuDNN handle (wraps the compiled binding). For a :class:`cudnn.Handle` the
+    backend handle is cleared after destruction so a reused Handle object cannot pass a released
+    ``cudnnHandle_t`` back to C++ (a double-destroy or a later set_stream)."""
     if isinstance(handle, Handle):
         backend = handle.backend_handle
-        handle.stream = None
         if backend is None:
+            handle.stream = None
             return None
-        return _pybind_module._raw_destroy_handle(backend)
-    _handle_to_stream.pop(int(handle), None)
+        _pybind_module._raw_destroy_handle(backend)
+        handle.backend_handle = None
+        handle.stream = None
+        return None
+    # Foreign raw-int handle: destroy it directly (FE tracked no state for it).
+    return _pybind_module._raw_destroy_handle(handle)
     return _pybind_module._raw_destroy_handle(handle)
 
 
@@ -281,6 +285,12 @@ _EAGER_PUBLIC_NAMES = (
         )
         if symbol in globals()
     ),
+    "create_handle",
+    "destroy_handle",
+    "get_stream",
+    "set_stream",
+    "Handle",
+    "DeviceInfo",
     "__version__",
     "NodeType",
     "Tensor",

@@ -104,18 +104,18 @@ class DeviceInfo:
         free for a TMA-fed GEMM. 0 when the driver has no such mode."""
         from . import _env
 
-        # CU_DEVICE_ATTRIBUTE_MAX_OVERSIZED_SHARED_MEMORY_PER_BLOCK (ordinal 150)
-        # arrived in CUDA 13.4. A driver older than that has no such mode -> 0 by
-        # design (not an error), and the enum member — which an older cuda-python's
-        # CUdevice_attribute does not carry (a bare ordinal would raise, since the
-        # binding reads attrib.value) — is never touched. From 13.4 the attribute
-        # is real: query it and let a genuine failure raise rather than masking it.
-        if _env.driver_version() < 13040:
-            return 0
         drv = _driver()
-        return int(
-            _ck(*drv.cuDeviceGetAttribute(drv.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MAX_OVERSIZED_SHARED_MEMORY_PER_BLOCK, _device_handle(self.ordinal)))
-        )
+        # CU_DEVICE_ATTRIBUTE_MAX_OVERSIZED_SHARED_MEMORY_PER_BLOCK (ordinal 150)
+        # arrived in CUDA 13.4. It needs BOTH a new-enough driver AND a cuda-python
+        # whose CUdevice_attribute carries the enum member: a new driver with an old
+        # binding passes the version gate but the enum member is absent (accessing it
+        # raises, since the binding reads attrib.value). Either missing -> no such
+        # mode -> 0 by design (not an error). With both present the attribute is real:
+        # query it and let a genuine failure raise rather than masking it.
+        attr = getattr(drv.CUdevice_attribute, "CU_DEVICE_ATTRIBUTE_MAX_OVERSIZED_SHARED_MEMORY_PER_BLOCK", None)
+        if attr is None or _env.driver_version() < 13040:
+            return 0
+        return int(_ck(*drv.cuDeviceGetAttribute(attr, _device_handle(self.ordinal))))
 
     @functools.cached_property
     def l2_cache_bytes(self) -> int:

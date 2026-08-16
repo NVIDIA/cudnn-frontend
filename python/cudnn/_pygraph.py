@@ -2088,10 +2088,13 @@ class pygraph:
     def deserialize(self, *args, **kwargs) -> None:
         """Deserialize a graph. This is the one genuinely ambiguous classic
         overload -- ``(data)`` or ``(handle, data, enforce_precompiled=...)`` --
-        so it stays a passthrough; a handle can only be the first positional, and
-        ``to_backend_handle`` is a no-op on the ``data`` blob, so unwrap just that."""
+        so it stays a passthrough. The handle can arrive as the first positional
+        or as the ``handle_`` keyword (the pybind overload's name); unwrap either,
+        and ``to_backend_handle`` is a no-op on the ``data`` blob."""
         if args:
             args = (to_backend_handle(args[0]),) + args[1:]
+        if "handle_" in kwargs:
+            kwargs["handle_"] = to_backend_handle(kwargs["handle_"])
         if self._lowered_graph is None:
             import cudnn
 

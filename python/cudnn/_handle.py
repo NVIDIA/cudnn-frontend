@@ -7,10 +7,10 @@ The backend ``cudnnHandle_t`` binds a device and carries the current stream, but
 on the FE side the handle used to be a bare int with nowhere to hang per-handle
 state — so that state accreted as side tables (the ``_handle_to_stream`` dict)
 and per-engine device queries (frost's ``current_device()``). ``Handle`` gives
-the handle a home for ``{backend_handle, device, stream}`` while staying a drop-in for the
-old int: it converts to the raw ``intptr_t`` via ``__index__`` anywhere a binding
-wants it, so code that forwards a handle to ``graph.execute`` / ``set_stream`` /
-the C++ layer is unchanged.
+the handle a home for ``{backend_handle, device, stream}``. It is NOT a drop-in
+int: the backend handle is extracted explicitly via ``to_backend_handle()`` at
+each binding boundary (grep it to trace every handoff), so a Handle that reaches
+a binding unconverted fails loudly rather than being silently coerced.
 """
 
 from __future__ import annotations
@@ -41,10 +41,15 @@ class Handle:
 
     __slots__ = ("backend_handle", "_ordinal", "stream")
 
-    def __init__(self, backend_handle: int, ordinal: int | None = None):
-        self.backend_handle = int(backend_handle)
+    def __init__(self, backend_handle: int | None, ordinal: int | None = None, stream: int | None = None):
+        # ``None`` backend_handle = a destroyed handle (destroy_handle clears it so
+        # a reused Handle cannot pass a released cudnnHandle_t back to C++).
+        self.backend_handle = None if backend_handle is None else int(backend_handle)
         self._ordinal = ordinal
-        self.stream = None  # None = default stream, until set_stream() is called
+        # Seeded from the backend's actual stream at create (a fresh handle runs on
+        # stream 0), so a python plan and a backend plan on the same handle agree
+        # on the stream instead of the python side falling back to torch's current.
+        self.stream = stream
 
     @property
     def device(self) -> DeviceInfo:
@@ -56,7 +61,8 @@ class Handle:
         return device_info(ordinal)
 
     def __repr__(self) -> str:
-        return f"cudnn.Handle(backend_handle=0x{self.backend_handle:x}, cuda:{self._ordinal})"
+        backend = "None" if self.backend_handle is None else f"0x{self.backend_handle:x}"
+        return f"cudnn.Handle(backend_handle={backend}, cuda:{self._ordinal})"
 
 
 def to_backend_handle(handle):
