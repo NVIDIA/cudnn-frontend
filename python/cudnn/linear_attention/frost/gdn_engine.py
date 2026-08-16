@@ -15,8 +15,7 @@ from cudnn import behavior_note
 from cudnn.engines.base import BaseEngine, CompiledPlan
 
 from cudnn.frost import buffers
-from cudnn.frost.buffers import current_device_id
-from cudnn.frost.device import multiprocessor_count
+from cudnn.frost.device import build_device, current_device, multiprocessor_count
 from cudnn.frost.workspace import WorkspaceLayout, carve_plan
 from ..graph_analyzer import analyze
 from .engine import FrostLaPlan, frost_la_gate
@@ -94,7 +93,12 @@ class GdnFrostEngine(BaseEngine):
             raise NotImplementedError("GdnFrostEngine: 'state_checkpoints' must match the io dtype")
 
     def build_plan(self, graph, plan, ctx=None) -> CompiledPlan:
-        return FrostLaPlan(build_gdn(graph))
+        # Bake the plan for the handle's device (via ctx), not the ambient one; a
+        # foreign raw-int handle (or none) carries no device -> None -> current.
+        handle = ctx.handle if ctx is not None else None
+        device = handle.device.ordinal if hasattr(handle, "device") else None
+        with build_device(device):
+            return FrostLaPlan(build_gdn(graph))
 
 
 class CompiledGdn:
@@ -139,7 +143,7 @@ class CompiledGdn:
         self.tensormap_words = tensormap_workspace_bytes(kernel_mod, B) // 8
         self.off_tensormaps = layout.add(self.tensormap_words * 8)
         self.off_sched = layout.add(8)
-        self.num_sm = multiprocessor_count(current_device_id())
+        self.num_sm = multiprocessor_count(current_device())
         self.n_tiles = B * HO
         self.n_heads_out = HO
         if self.split:
@@ -351,7 +355,7 @@ class CompiledGdnBwd:
         self.has_state0 = "initial_state" in node.inputs
         self.io_name = "float16" if node.inputs["q"].get_data_type().name == "HALF" else "bfloat16"
 
-        self.num_sm = multiprocessor_count(current_device_id())
+        self.num_sm = multiprocessor_count(current_device())
         self.bwd_dyn_sched = B * HO <= self.num_sm
         self.batch_invariant = bool(node.params.get("batch_invariant", False))
         # cuts never in batch-invariant mode

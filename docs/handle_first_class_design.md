@@ -159,9 +159,15 @@ covers them all at once:
   execute, so the guard keeps reading the live device.
 - `current_device()` is otherwise unchanged — it is the fallback whenever no
   build scope is active (no-handle, render-only, execute).
-- **Pending:** the same hinge wrap for `linear_attention/frost/*_engine.py`
-  (gdn/gdn2/kda) and the sdpa frost engines; those also read `buffers.current_sm()`
-  / `current_device_id()` at build, which must be routed through the scope too.
+- **Linear-attention (done):** `gdn/gdn2/kda_engine.build_plan` wrap their build
+  in `with build_device(ctx.handle.device.ordinal)` too, and their one device-baked
+  constant — `num_sm = multiprocessor_count(current_device_id())` — is re-routed
+  onto `frost.device.current_device()` so it follows the scope (it read the
+  `buffers` probe, which bypassed it). `test_la.py` 359 passed / 0 failed on SM100.
+- **sdpa frost engines:** nothing to scope at the engine level — their build bakes
+  no device constant from `current_device`; arch gating is in `check_support`, and
+  the one `torch.cuda.current_device()` (`sdpa/bwd/engines.py`) tags a TensorDesc's
+  operand device, which is correctly the live device (as `VariantPack.device`).
 
 `workspace` stays a per-execute argument — it is not handle state and does not
 belong on the Handle (today it is conflated into `ExecutionContext`).
