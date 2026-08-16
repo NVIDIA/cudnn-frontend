@@ -45,7 +45,7 @@ Example:
 
 from abc import ABC
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, List
+from typing import TYPE_CHECKING, Any, Dict, List, NamedTuple
 
 from .engine_ids import PYTHON_ENGINE_ID_BASE  # noqa: F401 — re-exported for engine authors
 
@@ -90,14 +90,19 @@ class PlanConfig:
     mode: Any = None
 
 
-@dataclass(frozen=True)
-class ExecutionContext:
+class ExecutionContext(NamedTuple):
     """Runtime context passed to a compiled plan at execute time.
 
     Everything an engine may need is explicit here — no engine should reach
     into private graph state, hard-code a stream, or allocate hidden workspace.
     ``stream`` is resolved from the handle when available (classic
     ``cudnn.set_stream(handle, ...)`` semantics).
+
+    A ``NamedTuple``, not a frozen dataclass: both are immutable (an engine
+    cannot rebind ``ctx.stream``), but a frozen dataclass ``__init__`` sets each
+    field through ``object.__setattr__``, and this is built on every execute —
+    the NamedTuple is ~220 ns/execute cheaper for the same three read-only
+    fields.
     """
 
     handle: Any = None

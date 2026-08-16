@@ -25,6 +25,7 @@ import logging
 import weakref
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
+import cudnn
 from cudnn import _pybind_module
 
 from ._handle import to_backend_handle
@@ -1265,8 +1266,6 @@ class pygraph:
         fall back to the default stream)."""
         if handle is None:
             return None
-        import cudnn
-
         return cudnn.get_stream(handle)
 
     def _build_context(self, handle: Any = None) -> Any:
