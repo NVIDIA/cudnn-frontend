@@ -1149,30 +1149,33 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             )
             return
 
-        Q = self._to_bshd(q_tensor)
-        K = self._to_bshd(k_tensor)
-        V = self._to_bshd(v_tensor)
-        O_view, o_needs_copy_back, O_scratch = self._to_bshd_writable(o_tensor)
-
         device = q_tensor.device
-        sinks_t = (
-            self._checked_sinks_1d(sinks)
-            if sinks is not None
-            else self._dummy("sinks", device, lambda: torch.zeros(self.h_q, dtype=torch.float32, device=device))
-        )
-        seq_kv_t = (
-            self._checked_seq_lens(seq_kv_lens, "seq_kv_lens")
-            if seq_kv_lens is not None
-            else self._dummy("seq_kv", device, lambda: torch.zeros(self.batch_size, dtype=torch.int32, device=device))
-        )
-        # Dense padded-Q trim: per-batch Q lengths are their OWN kernel
-        # parameter (compiled in only when seq_q_lens_present — the kernel
-        # signature is specialized on `None`, so the flag-off ABI is
-        # unchanged). The caller's (B,)-int32 device tensor is bound directly
-        # as a validated view — zero allocations/copies on the execute hot
-        # path, stable pointer (CUDA-graph-capture friendly).
-        seq_q_t = self._checked_seq_lens(seq_q_lens, "seq_q_lens") if self.seq_q_lens_present else None
-        o_desc_dummy = self._dummy("o_desc", device, lambda: torch.zeros(1, dtype=torch.int64, device=device))
+        # Tensor prep can LAUNCH work (_to_bshd's gather copy, the dummies'
+        # first-use zero-fill), so it runs on the LAUNCH stream (Rule 5) —
+        # otherwise an explicit caller stream races torch's current stream.
+        with _torch_stream_context(current_stream, device):
+            Q = self._to_bshd(q_tensor)
+            K = self._to_bshd(k_tensor)
+            V = self._to_bshd(v_tensor)
+            O_view, o_needs_copy_back, O_scratch = self._to_bshd_writable(o_tensor)
+            sinks_t = (
+                self._checked_sinks_1d(sinks)
+                if sinks is not None
+                else self._dummy("sinks", device, lambda: torch.zeros(self.h_q, dtype=torch.float32, device=device))
+            )
+            seq_kv_t = (
+                self._checked_seq_lens(seq_kv_lens, "seq_kv_lens")
+                if seq_kv_lens is not None
+                else self._dummy("seq_kv", device, lambda: torch.zeros(self.batch_size, dtype=torch.int32, device=device))
+            )
+            # Dense padded-Q trim: per-batch Q lengths are their OWN kernel
+            # parameter (compiled in only when seq_q_lens_present — the kernel
+            # signature is specialized on `None`, so the flag-off ABI is
+            # unchanged). The caller's (B,)-int32 device tensor is bound directly
+            # as a validated view — zero allocations/copies on the execute hot
+            # path, stable pointer (CUDA-graph-capture friendly).
+            seq_q_t = self._checked_seq_lens(seq_q_lens, "seq_q_lens") if self.seq_q_lens_present else None
+            o_desc_dummy = self._dummy("o_desc", device, lambda: torch.zeros(1, dtype=torch.int64, device=device))
 
         import cutlass
 
@@ -1192,7 +1195,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             stream=current_stream,
         )
         if o_needs_copy_back:
-            O_view.copy_(O_scratch)
+            # Consumes what the kernel just wrote — launch stream (Rule 5).
+            with _torch_stream_context(current_stream, device):
+                O_view.copy_(O_scratch)
         self._logger.debug("execute completed")
 
     def _thd_compile_kwargs(self) -> dict:
@@ -1492,28 +1497,34 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         sq, skv = self.s_q_max, self.s_k_max
         device = q_tensor.device
 
-        Q = self._to_bshd(q_tensor)
-        K = self._to_bshd(k_tensor)
-        V = self._to_bshd(v_tensor)
-        O_view, o_needs_copy_back, O_scratch = self._to_bshd_writable(o_tensor)
-        O = O_scratch if o_needs_copy_back else O_view
+        # Tensor prep can LAUNCH work (_to_bshd's gather copy, _reshape_sf's
+        # .contiguous(), the dummies' first-use zero-fill) — launch stream
+        # (Rule 5), like the amax reset below.
+        with _torch_stream_context(current_stream, device):
+            Q = self._to_bshd(q_tensor)
+            K = self._to_bshd(k_tensor)
+            V = self._to_bshd(v_tensor)
+            O_view, o_needs_copy_back, O_scratch = self._to_bshd_writable(o_tensor)
+            O = O_scratch if o_needs_copy_back else O_view
 
-        n_q_tiles = self._ceil_div(sq, _SM100_TILE_N)
-        n_kv_tiles = self._ceil_div(skv, _SM100_TILE_N)
-        sf_q_v = self._reshape_sf(sf_q, h_q, n_q_tiles, km.SF_SMEM_SIZE_Q)
-        sf_k_v = self._reshape_sf(sf_k, h_kv, n_kv_tiles, km.SF_SMEM_SIZE_K)
-        sf_v_v = self._reshape_sf(sf_v, h_kv, n_kv_tiles, km.SF_SMEM_SIZE_V)
+            n_q_tiles = self._ceil_div(sq, _SM100_TILE_N)
+            n_kv_tiles = self._ceil_div(skv, _SM100_TILE_N)
+            sf_q_v = self._reshape_sf(sf_q, h_q, n_q_tiles, km.SF_SMEM_SIZE_Q)
+            sf_k_v = self._reshape_sf(sf_k, h_kv, n_kv_tiles, km.SF_SMEM_SIZE_K)
+            sf_v_v = self._reshape_sf(sf_v, h_kv, n_kv_tiles, km.SF_SMEM_SIZE_V)
 
-        # has_lse=False (no Stats output): the store is compiled out; bind None.
-        lse = lse_tensor.reshape(b, h_q, sq) if lse_tensor is not None else None
-        sinks_t = (
-            self._checked_sinks_1d(sinks) if sinks is not None else self._dummy("sinks", device, lambda: torch.zeros(h_q, dtype=torch.float32, device=device))
-        )
-        seq_kv_t = (
-            self._checked_seq_lens(seq_kv_lens, "seq_kv_lens")
-            if seq_kv_lens is not None
-            else self._dummy("seq_kv", device, lambda: torch.zeros(b, dtype=torch.int32, device=device))
-        )
+            # has_lse=False (no Stats output): the store is compiled out; bind None.
+            lse = lse_tensor.reshape(b, h_q, sq) if lse_tensor is not None else None
+            sinks_t = (
+                self._checked_sinks_1d(sinks)
+                if sinks is not None
+                else self._dummy("sinks", device, lambda: torch.zeros(h_q, dtype=torch.float32, device=device))
+            )
+            seq_kv_t = (
+                self._checked_seq_lens(seq_kv_lens, "seq_kv_lens")
+                if seq_kv_lens is not None
+                else self._dummy("seq_kv", device, lambda: torch.zeros(b, dtype=torch.int32, device=device))
+            )
 
         amax_o_buf = amax_o.reshape(-1)[:1] if amax_o is not None else self._dummy("amax_o", device, lambda: torch.zeros(1, dtype=torch.float32, device=device))
         # Must be enqueued on the SAME stream as the kernel launch below, else the
@@ -1539,7 +1550,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             stream=current_stream,
         )
         if o_needs_copy_back:
-            O_view.copy_(O)
+            # Consumes what the kernel just wrote — launch stream (Rule 5).
+            with _torch_stream_context(current_stream, device):
+                O_view.copy_(O)
         self._logger.debug("execute (MXFP8) completed")
 
     def _execute_fp8(
@@ -1576,34 +1589,40 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         sq, skv = self.s_q_max, self.s_k_max
         device = q_tensor.device
 
-        # Rule 3: the scales stay on device — the kernel loads and folds
-        # descale_q*descale_k into the softmax scale and descale_v*scale_o
-        # into o_scale_fused; the scalar args carry only the bases.
-        # (descale_s/scale_s never reach this layer: the lowering does not
-        # forward them, and P is cast with the baked P_CAST_LOG2_SCALE bias.)
-        dq_t = self._scale_view(descale_q, "descale_q", device)
-        dk_t = self._scale_view(descale_k, "descale_k", device)
-        dv_t = self._scale_view(descale_v, "descale_v", device)
-        so_t = self._scale_view(scale_o, "scale_o", device)
+        # Tensor prep can LAUNCH work (_to_bshd's gather copy, the dummies'
+        # first-use zero-fill, _scale_view's cached-1.0 first-use fill) —
+        # launch stream (Rule 5), like the amax reset.
+        with _torch_stream_context(current_stream, device):
+            # Rule 3: the scales stay on device — the kernel loads and folds
+            # descale_q*descale_k into the softmax scale and descale_v*scale_o
+            # into o_scale_fused; the scalar args carry only the bases.
+            # (descale_s/scale_s never reach this layer: the lowering does not
+            # forward them, and P is cast with the baked P_CAST_LOG2_SCALE bias.)
+            dq_t = self._scale_view(descale_q, "descale_q", device)
+            dk_t = self._scale_view(descale_k, "descale_k", device)
+            dv_t = self._scale_view(descale_v, "descale_v", device)
+            so_t = self._scale_view(scale_o, "scale_o", device)
+
+            Q = self._to_bshd(q_tensor)
+            K = self._to_bshd(k_tensor)
+            V = self._to_bshd(v_tensor)
+            O_view, o_needs_copy_back, O_scratch = self._to_bshd_writable(o_tensor)
+            O = O_scratch if o_needs_copy_back else O_view
+
+            # has_lse=False (no Stats output): the store is compiled out; bind None.
+            lse = lse_tensor.reshape(b, h_q, sq) if lse_tensor is not None else None
+            sinks_t = (
+                self._checked_sinks_1d(sinks)
+                if sinks is not None
+                else self._dummy("sinks", device, lambda: torch.zeros(h_q, dtype=torch.float32, device=device))
+            )
+            seq_kv_t = (
+                self._checked_seq_lens(seq_kv_lens, "seq_kv_lens")
+                if seq_kv_lens is not None
+                else self._dummy("seq_kv", device, lambda: torch.zeros(b, dtype=torch.int32, device=device))
+            )
         scale_softmax_log2 = scale_val * math.log2(math.e)
         o_scale_fused = 1.0
-
-        Q = self._to_bshd(q_tensor)
-        K = self._to_bshd(k_tensor)
-        V = self._to_bshd(v_tensor)
-        O_view, o_needs_copy_back, O_scratch = self._to_bshd_writable(o_tensor)
-        O = O_scratch if o_needs_copy_back else O_view
-
-        # has_lse=False (no Stats output): the store is compiled out; bind None.
-        lse = lse_tensor.reshape(b, h_q, sq) if lse_tensor is not None else None
-        sinks_t = (
-            self._checked_sinks_1d(sinks) if sinks is not None else self._dummy("sinks", device, lambda: torch.zeros(h_q, dtype=torch.float32, device=device))
-        )
-        seq_kv_t = (
-            self._checked_seq_lens(seq_kv_lens, "seq_kv_lens")
-            if seq_kv_lens is not None
-            else self._dummy("seq_kv", device, lambda: torch.zeros(b, dtype=torch.int32, device=device))
-        )
 
         # amax_o: the kernel atomicMax'es into this buffer, so it MUST start
         # at 0. It accumulates max|o_scaled| (pre-cast, exact even for FP8 O);
@@ -1632,13 +1651,15 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             amax_o_buf,
             stream=current_stream,
         )
-        if o_needs_copy_back:
-            O_view.copy_(O)
-        if amax_o is not None:
-            # Device divisor: the same div_ as before, minus the readback.
-            # scale_o > 0 is caller contract (backend parity); None bound a
-            # cached 1.0 above.
-            amax_o_buf.div_(so_t)
+        # Both consume what the kernel just wrote — launch stream (Rule 5).
+        with _torch_stream_context(current_stream, device):
+            if o_needs_copy_back:
+                O_view.copy_(O)
+            if amax_o is not None:
+                # Device divisor: the same div_ as before, minus the readback.
+                # scale_o > 0 is caller contract (backend parity); None bound a
+                # cached 1.0 above.
+                amax_o_buf.div_(so_t)
         self._logger.debug("execute (FP8 per-tensor) completed")
 
 
@@ -2221,39 +2242,43 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                 current_stream=current_stream,
             )
             return
-        lse = self._checked_lse_view(lse_tensor) if lse_tensor is not None else None
-        sinks_t = self._checked_sinks_1d(sinks) if sinks is not None else None
-        seq_q_lens = (
-            self._checked_seq_lens(seq_q_lens, "seq_q_lens")
-            if seq_q_lens is not None
-            else self._dummy(
-                "seq_q_lens",
-                q_tensor.device,
-                lambda: torch.zeros(self.batch_size, dtype=torch.int32, device=q_tensor.device),
-            )
-        )
-        seq_kv_lens = (
-            self._checked_seq_lens(seq_kv_lens, "seq_kv_lens")
-            if seq_kv_lens is not None
-            else self._dummy(
-                "seq_kv_lens",
-                q_tensor.device,
-                lambda: torch.zeros(self.batch_size, dtype=torch.int32, device=q_tensor.device),
-            )
-        )
         if current_stream is None:
             # Direct call (no dispatch-forwarded stream): fall back to torch's
             # current stream, as before. A stream forwarded from the execute-time
-            # handle is respected rather than clobbered.
+            # handle is respected rather than clobbered. Resolved FIRST (Rule 5):
+            # the tensor prep below can launch work (the dummies' zero-fill,
+            # _to_bshd's gather copy), which must be ordered against the kernel.
             current_stream = cuda.CUstream(torch.cuda.current_stream(q_tensor.device).cuda_stream)
+
+        lse = self._checked_lse_view(lse_tensor) if lse_tensor is not None else None
+        sinks_t = self._checked_sinks_1d(sinks) if sinks is not None else None
+        with _torch_stream_context(current_stream, q_tensor.device):
+            seq_q_lens = (
+                self._checked_seq_lens(seq_q_lens, "seq_q_lens")
+                if seq_q_lens is not None
+                else self._dummy(
+                    "seq_q_lens",
+                    q_tensor.device,
+                    lambda: torch.zeros(self.batch_size, dtype=torch.int32, device=q_tensor.device),
+                )
+            )
+            seq_kv_lens = (
+                self._checked_seq_lens(seq_kv_lens, "seq_kv_lens")
+                if seq_kv_lens is not None
+                else self._dummy(
+                    "seq_kv_lens",
+                    q_tensor.device,
+                    lambda: torch.zeros(self.batch_size, dtype=torch.int32, device=q_tensor.device),
+                )
+            )
+            q = self._to_bshd(q_tensor)
+            k = self._to_bshd(k_tensor)
+            v = self._to_bshd(v_tensor)
+            o_view, o_needs_copy_back, o_scratch = self._to_bshd_writable(o_tensor)
+        o = o_scratch if o_needs_copy_back else o_view
 
         import cutlass
 
-        q = self._to_bshd(q_tensor)
-        k = self._to_bshd(k_tensor)
-        v = self._to_bshd(v_tensor)
-        o_view, o_needs_copy_back, o_scratch = self._to_bshd_writable(o_tensor)
-        o = o_scratch if o_needs_copy_back else o_view
         self._compiled_kernel(
             q,
             k,
@@ -2271,7 +2296,9 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             current_stream,
         )
         if o_needs_copy_back:
-            o_view.copy_(o_scratch)
+            # Consumes what the kernel just wrote — launch stream (Rule 5).
+            with _torch_stream_context(current_stream, q_tensor.device):
+                o_view.copy_(o_scratch)
 
     def _execute_fp8(
         self,
@@ -2305,15 +2332,22 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         import cutlass
 
         device = q_tensor.device
+        if current_stream is None:
+            # Resolved FIRST (Rule 5): the scale views' cached-1.0 fill, the
+            # dummies' zero-fill and _to_bshd's gather copy below launch work
+            # that must be ordered vs the kernel.
+            current_stream = cuda.CUstream(torch.cuda.current_stream(device).cuda_stream)
+
         # Rule 3: the scales stay on device — the kernel loads and folds
         # dq*dk into the softmax scale and dv*so into o_scale_fused; the
         # scalar args carry only the bases. None binds a cached 1.0.
         # (descale_s/scale_s never reach this layer: the lowering does not
         # forward them, and P is cast with the baked P_CAST_LOG2_SCALE bias.)
-        dq_t = self._scale_view(descale_q, "descale_q", device)
-        dk_t = self._scale_view(descale_k, "descale_k", device)
-        dv_t = self._scale_view(descale_v, "descale_v", device)
-        so_t = self._scale_view(scale_o, "scale_o", device)
+        with _torch_stream_context(current_stream, device):
+            dq_t = self._scale_view(descale_q, "descale_q", device)
+            dk_t = self._scale_view(descale_k, "descale_k", device)
+            dv_t = self._scale_view(descale_v, "descale_v", device)
+            so_t = self._scale_view(scale_o, "scale_o", device)
         scale_softmax_log2 = scale_val * math.log2(math.e)
         o_scale_fused = 1.0
 
@@ -2325,9 +2359,6 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             self.lse_desc is None and lse_tensor is not None,
             "this specialization was compiled without an LSE output; construct the API with sample_lse",
         )
-        if current_stream is None:
-            current_stream = cuda.CUstream(torch.cuda.current_stream(device).cuda_stream)
-
         sinks_t = self._checked_sinks_1d(sinks) if sinks is not None else None
         # THD packs the batch away, so the ragged views and the per-execute
         # compile replace the dense buffers; everything else (the folded
@@ -2372,22 +2403,26 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                 else:
                     lse = lse_tensor.as_strided((pack.t_q, self.h_q), (self.h_q, 1), lse_tensor.storage_offset())
         else:
-            seq_kv_t = (
-                self._checked_seq_lens(seq_kv_lens, "seq_kv_lens")
-                if seq_kv_lens is not None
-                else self._dummy("seq_kv_lens", device, lambda: torch.zeros(self.batch_size, dtype=torch.int32, device=device))
-            )
-            # Dense padded-Q trim: bind the REAL per-batch Q lengths whenever
-            # the graph carries them — a zeroed dummy would trim every row.
-            seq_q_t = (
-                self._checked_seq_lens(seq_q_lens, "seq_q_lens")
-                if seq_q_lens is not None
-                else self._dummy("seq_q_lens", device, lambda: torch.zeros(self.batch_size, dtype=torch.int32, device=device))
-            )
-            q = self._to_bshd(q_tensor)
-            k = self._to_bshd(k_tensor)
-            v = self._to_bshd(v_tensor)
-            o_view, o_needs_copy_back, o_scratch = self._to_bshd_writable(o_tensor)
+            # Tensor prep can LAUNCH work (_to_bshd's gather copy, the
+            # dummies' first-use zero-fill) — launch stream (Rule 5), like
+            # the amax reset below.
+            with _torch_stream_context(current_stream, device):
+                seq_kv_t = (
+                    self._checked_seq_lens(seq_kv_lens, "seq_kv_lens")
+                    if seq_kv_lens is not None
+                    else self._dummy("seq_kv_lens", device, lambda: torch.zeros(self.batch_size, dtype=torch.int32, device=device))
+                )
+                # Dense padded-Q trim: bind the REAL per-batch Q lengths whenever
+                # the graph carries them — a zeroed dummy would trim every row.
+                seq_q_t = (
+                    self._checked_seq_lens(seq_q_lens, "seq_q_lens")
+                    if seq_q_lens is not None
+                    else self._dummy("seq_q_lens", device, lambda: torch.zeros(self.batch_size, dtype=torch.int32, device=device))
+                )
+                q = self._to_bshd(q_tensor)
+                k = self._to_bshd(k_tensor)
+                v = self._to_bshd(v_tensor)
+                o_view, o_needs_copy_back, o_scratch = self._to_bshd_writable(o_tensor)
             o = o_scratch if o_needs_copy_back else o_view
             lse = self._checked_lse_view(lse_tensor) if lse_tensor is not None else None
 
