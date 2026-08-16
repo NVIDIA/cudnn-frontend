@@ -7,7 +7,7 @@
 * :func:`emit_seq_descs` — device helper (one electing thread) that builds
   a per-BATCH TMA-descriptor array in GMEM for varlen loads/stores over a
   packed ``[T,H,D]`` tensor whose head axis is a load coordinate.  Each op
-  calls it from a single combined ``build_all_descs_kernel`` launch (one
+  calls it from a single ``prologue_kernel`` launch (one
   warp per array).
 * :func:`emit_checkpoint_seq_descs` — its per-chunk-checkpoint sibling; derives the
   per-sequence checkpoint offsets from the token ``cu_seqlens`` in place of a

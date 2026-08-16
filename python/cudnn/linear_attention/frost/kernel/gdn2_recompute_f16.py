@@ -90,12 +90,13 @@ import cutlass.experimental.primitives as nvvm
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
-from ..common.split_k import decode_work_item
+from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMS, ORDER_THREADS, decode_work_item, order_body
 from ..common.host import get_dtype
 from cudnn.frost.buffers import current_device_id, data_ptr
 from cudnn.frost.device import multiprocessor_count
 from ..common.thd import TENSOR_MAP_QWORDS, emit_checkpoint_seq_descs, emit_seq_descs
 from .gdn2_recompute_config import CFG
+
 from cudnn.frost.tile_dsl.barrier import (
     advance,
     MBarrier,
@@ -572,14 +573,10 @@ def super_mma_warp(
                 tinv_lo1, tinv_hi1 = f16x2_to_f32(tinv_p1, dtype=cfg.io_dtype)
                 tinv_lo2, tinv_hi2 = f16x2_to_f32(tinv_p2, dtype=cfg.io_dtype)
                 tinv_lo3, tinv_hi3 = f16x2_to_f32(tinv_p3, dtype=cfg.io_dtype)
-                tinv_acc[0] = tinv_lo0 + upd_acc[0]
-                tinv_acc[1] = tinv_hi0 + upd_acc[1]
-                tinv_acc[2] = tinv_lo1 + upd_acc[2]
-                tinv_acc[3] = tinv_hi1 + upd_acc[3]
-                tinv_acc[4] = tinv_lo2 + upd_acc[4]
-                tinv_acc[5] = tinv_hi2 + upd_acc[5]
-                tinv_acc[6] = tinv_lo3 + upd_acc[6]
-                tinv_acc[7] = tinv_hi3 + upd_acc[7]
+                tinv_acc[0], tinv_acc[1] = fadd2(tinv_lo0, tinv_hi0, upd_acc[0], upd_acc[1])
+                tinv_acc[2], tinv_acc[3] = fadd2(tinv_lo1, tinv_hi1, upd_acc[2], upd_acc[3])
+                tinv_acc[4], tinv_acc[5] = fadd2(tinv_lo2, tinv_hi2, upd_acc[4], upd_acc[5])
+                tinv_acc[6], tinv_acc[7] = fadd2(tinv_lo3, tinv_hi3, upd_acc[6], upd_acc[7])
 
             bars.mb_t_inv_done[intermediate_stage].wait(((global_chunk // cfg.smem_intermediate_stages) + 1) % 2)
             nvvm.stmatrix(
@@ -1046,10 +1043,8 @@ def compute0_warp_group(
 
             # ---- optional K L2-norm + K_inv staging ------------------------------
             if cutlass.const_expr(cfg.l2norm):
-                kk0_lo = opaque_f32_zero()
-                kk0_hi = opaque_f32_zero()
-                kk1_lo = opaque_f32_zero()
-                kk1_hi = opaque_f32_zero()
+                kk_lo = opaque_f32_zero()
+                kk_hi = opaque_f32_zero()
             for dim_half in cutlass.range_constexpr(2):
                 dim_base = dim_half * (cfg.d_k // 2) + lane_in_row_group * 8
                 reg_base = dim_half * 8
@@ -1064,16 +1059,20 @@ def compute0_warp_group(
                     k_val = raw_k_frag_f32[dim_offset]
                     raw_k_regs[reg_base + dim_offset] = k_val
                     beta_val = raw_beta_frag_f32[dim_offset]
+                    if cutlass.const_expr(cfg.beta_sigmoid):
+                        half = cutlass.Float32(0.5)
+                        beta_val = (cute.math.tanh(beta_val * half, approx=True) * half + half).to(cfg.io_dtype).to(cutlass.Float32)
                     raw_beta_regs[reg_base + dim_offset] = beta_val
-                    if cutlass.const_expr(cfg.l2norm):
-                        if cutlass.const_expr(dim_offset % 2 == 0):
-                            kk0_lo, kk0_hi = ffma2(k_val, k_val, k_val, k_val, kk0_lo, kk0_hi)
-                        else:
-                            kk1_lo, kk1_hi = ffma2(k_val, k_val, k_val, k_val, kk1_lo, kk1_hi)
+                if cutlass.const_expr(cfg.l2norm):
+                    # even dims in the lo lane, odd in the hi lane: same terms, same order
+                    for dim_pair in cutlass.range_constexpr(4):
+                        k_even = raw_k_frag_f32[2 * dim_pair]
+                        k_odd = raw_k_frag_f32[2 * dim_pair + 1]
+                        kk_lo, kk_hi = ffma2(k_even, k_odd, k_even, k_odd, kk_lo, kk_hi)
 
             k_inv_norm = opaque_one
             if cutlass.const_expr(cfg.l2norm):
-                k_sum_sq = kk0_hi + kk1_hi
+                k_sum_sq = kk_lo + kk_hi
                 k_sum_sq = k_sum_sq + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, k_sum_sq, 4, 31, kind=nvvm.Shfl.BFLY))
                 k_sum_sq = k_sum_sq + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, k_sum_sq, 2, 31, kind=nvvm.Shfl.BFLY))
                 k_sum_sq = k_sum_sq + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, k_sum_sq, 1, 31, kind=nvvm.Shfl.BFLY))
@@ -1701,6 +1700,7 @@ def host(
     stream,
 ) -> None:
     num_sequences = cu_seqlens.shape[0] - 1
+
     grid_shape = (cfg.max_active_clusters, 1, 1)
     kernel(
         cfg,
@@ -2019,6 +2019,7 @@ class Gdn2RecomputeCfg:
     l2norm: bool
     safe_gate: bool
     gate_scale_log2: float
+    beta_sigmoid: bool
     k_ratio: int
     v_ratio: int
     n_heads_out: int
@@ -2096,6 +2097,7 @@ def build_cfg(
     l2norm: bool,
     safe_gate: bool,
     gate_scale_log2: float,
+    beta_sigmoid: bool,
     k_ratio: int,
     v_ratio: int,
     n_heads_out: int,
@@ -2115,6 +2117,7 @@ def build_cfg(
         l2norm=l2norm,
         safe_gate=safe_gate,
         gate_scale_log2=gate_scale_log2,
+        beta_sigmoid=beta_sigmoid,
         k_ratio=k_ratio,
         v_ratio=v_ratio,
         n_heads_out=n_heads_out,
@@ -2160,14 +2163,15 @@ TENSORMAP_DESC_ARRAYS = 6  # per-batch runtime TMA descriptors: K, V, Gate, Beta
 TENSORMAP_STATIC_SLOTS = 0
 
 
-@cute.kernel
-def build_all_descs_kernel(
-    base_k: cutlass.GridConstant[cuda.tensor_map.TensorMap],
-    base_v: cutlass.GridConstant[cuda.tensor_map.TensorMap],
-    base_gate: cutlass.GridConstant[cuda.tensor_map.TensorMap],
-    base_beta: cutlass.GridConstant[cuda.tensor_map.TensorMap],
-    base_w: cutlass.GridConstant[cuda.tensor_map.TensorMap],
-    base_checkpoint: cutlass.GridConstant[cuda.tensor_map.TensorMap],
+@cute.jit
+def build_descs_body(
+    widx,
+    base_k,
+    base_v,
+    base_gate,
+    base_beta,
+    base_w,
+    base_checkpoint,
     tensormap_workspace: cute.Tensor,
     cu_seqlens: cute.Tensor,
     k: cute.Tensor,
@@ -2185,9 +2189,9 @@ def build_all_descs_kernel(
     checkpoint_row_stride: cutlass.Int32,
     checkpoint_every_n: cutlass.Int32,
 ) -> None:
-    """Single-launch builder for the per-batch TMA-descriptor arrays."""
-    tidx, _, _ = cute.arch.thread_idx()
-    widx = cutlass.Int32(tidx) // cutlass.Int32(32)
+    """Per-batch descriptor-array build, one warp per array. Runs inside the
+    prologue kernel after its order pass; warps past the array count fall
+    through the widx guards."""
     arr_words = n_batch * cutlass.Int32(TENSOR_MAP_QWORDS)
     sub0 = cute.make_tensor(tensormap_workspace.iterator, cute.make_layout((arr_words,), stride=(1,)))
     sub1 = cute.make_tensor(tensormap_workspace.iterator + arr_words, cute.make_layout((arr_words,), stride=(1,)))
@@ -2223,10 +2227,104 @@ def build_all_descs_kernel(
                 nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
 
 
+@cute.kernel
+def prologue_kernel(
+    run_order: cutlass.Constexpr[bool],
+    order_gen: cutlass.Constexpr[bool],
+    has_sched: cutlass.Constexpr[bool],
+    b_t: cutlass.Constexpr[int],
+    base_k: cutlass.GridConstant[cuda.tensor_map.TensorMap],
+    base_v: cutlass.GridConstant[cuda.tensor_map.TensorMap],
+    base_gate: cutlass.GridConstant[cuda.tensor_map.TensorMap],
+    base_beta: cutlass.GridConstant[cuda.tensor_map.TensorMap],
+    base_w: cutlass.GridConstant[cuda.tensor_map.TensorMap],
+    base_checkpoint: cutlass.GridConstant[cuda.tensor_map.TensorMap],
+    tensormap_workspace: cute.Tensor,
+    cu_seqlens: cute.Tensor,
+    k: cute.Tensor,
+    v: cute.Tensor,
+    gate: cute.Tensor,
+    beta: cute.Tensor,
+    w: cute.Tensor,
+    state_checkpoints: cute.Tensor | None,
+    mStaging: cute.Tensor | None,
+    mCount: cute.Tensor,
+    mWorkItems: cute.Tensor,
+    mSched: cute.Tensor | None,
+    n_batch: cutlass.Int32,
+    k_row_stride: cutlass.Int32,
+    v_row_stride: cutlass.Int32,
+    gate_row_stride: cutlass.Int32,
+    beta_row_stride: cutlass.Int32,
+    w_row_stride: cutlass.Int32,
+    checkpoint_row_stride: cutlass.Int32,
+    checkpoint_every_n: cutlass.Int32,
+) -> None:
+    """Single-CTA prologue. Under ``run_order`` this kernel is the first
+    work-item-table consumer, so it LPT-orders the table and zeroes both
+    consumers' sched rings via :func:`order_body`; it then builds the
+    per-batch TMA-descriptor arrays via :func:`build_descs_body`, one warp
+    per array (the extra warps only take part in the order phase)."""
+    tidx, _, _ = cute.arch.thread_idx()
+    tidx = cutlass.Int32(tidx)
+    widx = tidx // cutlass.Int32(32)
+    if cutlass.const_expr(run_order):
+        sKey = cutlass.Array(cutlass.Int32, ORDER_CAPACITY, space=cutlass.AddressSpace.smem, alignment=16)
+        sIdx = cutlass.Array(cutlass.Int32, ORDER_CAPACITY, space=cutlass.AddressSpace.smem, alignment=16)
+        sSpread = cutlass.Array(cutlass.Int32, 2, space=cutlass.AddressSpace.smem, alignment=8)
+        n_heads_out = cutlass.Int32(gate.shape[1])
+        order_body(
+            order_gen,
+            has_sched,
+            b_t,
+            ORDER_THREADS,
+            ORDER_ELEMS,
+            tidx,
+            n_heads_out,
+            n_heads_out * n_batch,
+            cu_seqlens,
+            mStaging,
+            mCount,
+            mWorkItems,
+            mSched,
+            sKey,
+            sIdx,
+            sSpread,
+        )
+    build_descs_body(
+        widx,
+        base_k,
+        base_v,
+        base_gate,
+        base_beta,
+        base_w,
+        base_checkpoint,
+        tensormap_workspace,
+        cu_seqlens,
+        k,
+        v,
+        gate,
+        beta,
+        w,
+        state_checkpoints,
+        n_batch,
+        k_row_stride,
+        v_row_stride,
+        gate_row_stride,
+        beta_row_stride,
+        w_row_stride,
+        checkpoint_row_stride,
+        checkpoint_every_n,
+    )
+
+
 @cute.jit
-def build_descs(
+def prologue(
     io_dtype: cutlass.Constexpr,
     b_t: cutlass.Constexpr[int],
+    run_order: cutlass.Constexpr[bool],
+    order_gen: cutlass.Constexpr[bool],
+    has_sched: cutlass.Constexpr[bool],
     k: cute.Tensor,
     v: cute.Tensor,
     gate: cute.Tensor,
@@ -2234,12 +2332,18 @@ def build_descs(
     w: cute.Tensor,
     state_checkpoints: cute.Tensor | None,
     cu_seqlens: cute.Tensor,
+    work_item_staging: cute.Tensor | None,
+    work_count: cute.Tensor,
+    work_items: cute.Tensor,
+    sched_all: cute.Tensor | None,
     tensormap_workspace: cute.Tensor,
     checkpoint_every_n: cutlass.Int32,
     stream: cuda_driver.CUstream,
 ):
-    """Build the 6 per-batch TMA-descriptor arrays (k, v, gate, beta, w, state_checkpoints)
-    into ``tensormap_workspace``."""
+    """One-launch prologue: LPT-order the work items (when this kernel is
+    the table's first consumer) and build the 6 per-batch TMA-descriptor
+    arrays (k, v, gate, beta, w, state_checkpoints) into
+    ``tensormap_workspace``."""
     h_k = k.shape[1]
     h_v = v.shape[1]
     ho = gate.shape[1]
@@ -2273,8 +2377,11 @@ def build_descs(
             ),
         )
         base_checkpoint = cuda.create_tensor_map_tiled_from_view(checkpoint_view, box_dims=(tma_box_elems, d_k, 1, 1), stride_order=(0, 1, 2, 3), swizzle=swz)
-    n_warps = 6 if state_checkpoints is not None else 5
-    build_all_descs_kernel(
+    prologue_kernel(
+        run_order,
+        order_gen,
+        has_sched,
+        b_t,
         base_k,
         base_v,
         base_gate,
@@ -2289,6 +2396,10 @@ def build_descs(
         beta,
         w,
         state_checkpoints,
+        work_item_staging,
+        work_count,
+        work_items,
+        sched_all,
         cutlass.Int32(batch_size),
         cutlass.Int32(k.stride[0]),
         cutlass.Int32(v.stride[0]),
@@ -2297,7 +2408,7 @@ def build_descs(
         cutlass.Int32(w.stride[0]),
         cutlass.Int32(state_checkpoints.stride[0] if state_checkpoints is not None else 0),
         checkpoint_every_n,
-    ).launch(grid=(1, 1, 1), block=(32 * n_warps, 1, 1), stream=stream)
+    ).launch(grid=(1, 1, 1), block=(ORDER_THREADS, 1, 1), stream=stream)
 
 
 # ---- Torch adapter / host-side compilation ---------------------------------------
@@ -2317,7 +2428,11 @@ def get_compiled_cache(
     l2norm: bool,
     safe_gate: bool,
     gate_lower_bound: float,
+    beta_sigmoid: bool,
     dyn_sched: bool,
+    order_in_prologue: bool,
+    order_gen: bool,
+    has_sched: bool,
 ):
     """Return a mutable dict that lazily stores the compiled kernel."""
     return {}
@@ -2332,6 +2447,7 @@ def compile(
     l2norm: bool,
     safe_gate: bool,
     gate_scale_log2: float,
+    beta_sigmoid: bool,
     k_ratio: int,
     v_ratio: int,
     n_heads_out: int,
@@ -2365,6 +2481,7 @@ def compile(
         l2norm=l2norm,
         safe_gate=safe_gate,
         gate_scale_log2=gate_scale_log2,
+        beta_sigmoid=beta_sigmoid,
         k_ratio=k_ratio,
         v_ratio=v_ratio,
         n_heads_out=n_heads_out,
@@ -2411,9 +2528,13 @@ def chunk_gdn2_recompute_sm100(
     gate_lower_bound: float = DEFAULT_GATE_LOWER_BOUND,
     a_log=None,
     dt_bias=None,
+    use_beta_sigmoid: bool = False,
     work_items=None,
     work_count=None,
     sched_ctr=None,
+    sched_all=None,
+    work_item_scratch=None,
+    order_in_prologue: bool = False,
     *,
     tensormap_workspace,
     stream,
@@ -2430,7 +2551,8 @@ def chunk_gdn2_recompute_sm100(
         gate: ``(total_tokens, HO, DK)`` float32.  Natural-log decay unless
               ``safe_gate``, which applies the safe-gate transform
               ``lower_bound * sigmoid(exp(a_log) * (gate + dt_bias))``.
-        beta: ``(total_tokens, HO, DK)`` io dtype, channel-wise erase gate
+        beta: ``(total_tokens, HO, DK)`` io dtype, channel-wise erase gate.
+              Post-sigmoid, or logits when ``use_beta_sigmoid``
         w: ``(total_tokens, HO, DV)`` io dtype, channel-wise write gate
         cu_seqlens: ``(num_seqs + 1,)`` int32
         initial_state: ``(num_seqs, HO, DK, DV)`` float32/bfloat16, or None
@@ -2447,6 +2569,7 @@ def chunk_gdn2_recompute_sm100(
         safe_gate: interpret ``gate`` through the safe-gate transform
         a_log: ``(HO,)`` float32, safe-gate per-head log-amplitude (None = 0)
         dt_bias: ``(HO, DK)`` float32, safe-gate channel bias (None = 0)
+        use_beta_sigmoid: ``beta`` holds logits; sigmoid in-kernel
         work_items: ``(max_items, 8)`` int32 work-item table from
             ``common/split_k.py`` (REQUIRED; an uncut table row is the whole
             (b, h) sequence).  Each item computes chunks ``[cstart, wend)``
@@ -2469,6 +2592,9 @@ def chunk_gdn2_recompute_sm100(
     if work_items is None or work_count is None:
         raise ValueError("work_items/work_count are required (the split-table stage builds them for every launch)")
     dyn_sched = sched_ctr is not None
+    order_gen = work_item_scratch is None
+    if order_in_prologue and sched_all is None:
+        raise ValueError("order_in_prologue requires sched_all (the prologue zeroes both consumers' sched rings)")
 
     if initial_state is not None:
         state_dtype_src = initial_state.dtype
@@ -2504,7 +2630,11 @@ def chunk_gdn2_recompute_sm100(
         use_qk_l2norm_in_kernel,
         safe_gate,
         gate_lower_bound,
+        use_beta_sigmoid,
         dyn_sched,
+        order_in_prologue,
+        order_gen,
+        sched_all is not None,
     )
 
     if "compiled" not in cache:
@@ -2546,6 +2676,7 @@ def chunk_gdn2_recompute_sm100(
             use_qk_l2norm_in_kernel,
             safe_gate,
             gate_scale_log2,
+            use_beta_sigmoid,
             k_ratio,
             v_ratio,
             HO,
@@ -2569,35 +2700,53 @@ def chunk_gdn2_recompute_sm100(
             stream=cu_stream,
         )
 
-    compiled = cache["compiled"]
     state_checkpoints_for_descs = output_state_checkpoints if enable_checkpoints else None
-    # desc build runs every execute by contract (cu contents are data;
-    # buffer pointers may change) - capture-safe, single tiny launch
-    if cache.get("build_descs_has_state_checkpoints") != (state_checkpoints_for_descs is not None):
-        cache.pop("build_descs", None)
-        cache["build_descs_has_state_checkpoints"] = state_checkpoints_for_descs is not None
-    if "build_descs" not in cache:
+    if "prologue" not in cache:
         io_dtype = get_dtype(k.dtype)
-
-        cu_bd = from_dlpack(cu_seqlens, assumed_align=8).mark_layout_dynamic()
-        ws_bd = from_dlpack(tensormap_workspace, assumed_align=128).mark_layout_dynamic()
-        cache["build_descs"] = cute.compile(
-            build_descs,
+        k_pl = from_dlpack(k, assumed_align=16).mark_layout_dynamic(leading_dim=2)
+        v_pl = from_dlpack(v, assumed_align=16).mark_layout_dynamic(leading_dim=2)
+        gate_pl = from_dlpack(gate, assumed_align=16).mark_layout_dynamic(leading_dim=2)
+        beta_pl = from_dlpack(beta, assumed_align=16).mark_layout_dynamic(leading_dim=2)
+        w_pl = from_dlpack(w, assumed_align=16).mark_layout_dynamic(leading_dim=2)
+        cu_pl = from_dlpack(cu_seqlens, assumed_align=8).mark_layout_dynamic()
+        ws_pl = from_dlpack(tensormap_workspace, assumed_align=128).mark_layout_dynamic()
+        state_checkpoints_pl = None
+        if state_checkpoints_for_descs is not None:
+            state_checkpoints_pl = from_dlpack(state_checkpoints_for_descs, assumed_align=16).mark_layout_dynamic(leading_dim=3)
+        staging_pl = None
+        if not order_gen:
+            staging_pl = from_dlpack(work_item_scratch, assumed_align=16)
+            staging_pl.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
+        work_items_pl = from_dlpack(work_items, assumed_align=16)
+        work_items_pl.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
+        work_count_pl = from_dlpack(work_count, assumed_align=4).mark_layout_dynamic()
+        sched_all_pl = None
+        if sched_all is not None:
+            sched_all_pl = from_dlpack(sched_all, assumed_align=4).mark_layout_dynamic()
+        cache["prologue"] = cute.compile(
+            prologue,
             io_dtype,
             CFG.B_T,
-            from_dlpack(k, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            from_dlpack(v, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            from_dlpack(gate, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            from_dlpack(beta, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            from_dlpack(w, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            None if state_checkpoints_for_descs is None else from_dlpack(state_checkpoints_for_descs, assumed_align=16).mark_layout_dynamic(leading_dim=3),
-            cu_bd,
-            ws_bd,
+            order_in_prologue,
+            order_gen,
+            sched_all is not None,
+            k_pl,
+            v_pl,
+            gate_pl,
+            beta_pl,
+            w_pl,
+            state_checkpoints_pl,
+            cu_pl,
+            staging_pl,
+            work_count_pl,
+            work_items_pl,
+            sched_all_pl,
+            ws_pl,
             cutlass.Int32(checkpoint_every_n_tokens),
             cu_stream,
             options="--enable-tvm-ffi",
         )
-    cache["build_descs"](
+    cache["prologue"](
         k,
         v,
         gate,
@@ -2605,11 +2754,15 @@ def chunk_gdn2_recompute_sm100(
         w,
         state_checkpoints_for_descs,
         cu_seqlens,
+        work_item_scratch if not order_gen else None,
+        work_count,
+        work_items,
+        sched_all,
         tensormap_workspace,
         checkpoint_every_n_tokens,
         cu_stream,
     )
-    compiled(
+    cache["compiled"](
         k,
         v,
         gate,
@@ -2620,6 +2773,69 @@ def chunk_gdn2_recompute_sm100(
         cu_seqlens,
         initial_state if use_initial_state else None,
         output_state if store_final_state else None,
+        work_items,
+        work_count,
+        sched_ctr,
+        tensormap_workspace,
+        checkpoint_every_n_tokens,
+        cu_stream,
+    )
+    return cache
+
+
+def run_recompute(
+    cache,
+    k,
+    v,
+    gate,
+    a_log,
+    dt_bias,
+    beta,
+    w,
+    cu_seqlens,
+    initial_state,
+    output_state,
+    output_state_checkpoints,
+    work_items,
+    work_count,
+    sched_ctr,
+    sched_all,
+    work_item_scratch,
+    tensormap_workspace,
+    checkpoint_every_n_tokens,
+    stream,
+) -> None:
+    """Replay the compiled plan: the prologue launch, then the main launch.
+    The caller owns the contract, which the plan validated at build, so
+    nothing here raises."""
+    cu_stream = cuda_driver.CUstream(int(stream))
+    cache["prologue"](
+        k,
+        v,
+        gate,
+        beta,
+        w,
+        output_state_checkpoints,
+        cu_seqlens,
+        work_item_scratch,
+        work_count,
+        work_items,
+        sched_all,
+        tensormap_workspace,
+        checkpoint_every_n_tokens,
+        cu_stream,
+    )
+    cache["compiled"](
+        k,
+        v,
+        gate,
+        a_log,
+        dt_bias,
+        beta,
+        w,
+        cu_seqlens,
+        initial_state,
+        output_state,
         work_items,
         work_count,
         sched_ctr,

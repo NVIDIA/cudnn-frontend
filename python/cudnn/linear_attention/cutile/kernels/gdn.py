@@ -16,16 +16,28 @@
 # limitations under the License.
 
 
-import logging
-from types import SimpleNamespace
-
 import cuda.tile as ct
-from cuda.tile.tune import exhaustive_search
 
-from .common import add_inplace, dev_id, dummy, ensure_cuda_context, head_group_sum, opt, reshaped, sum_leading, zero_fill
-from cudnn.frost.buffers import dtype_name as dtname
-
-logger = logging.getLogger(__name__)
+from .common import (
+    add_inplace,
+    autotuned_launch,
+    cdiv,
+    ct_min,
+    dummy,
+    exp,
+    exp2,
+    fused_beta_sigmoid,
+    head_group_sum,
+    l2norm_bwd,
+    l2norm_fwd,
+    next_power_of_2,
+    opt,
+    softplus,
+    sum_leading,
+    tf32,
+    zero_fill,
+)
+from cudnn.frost.buffers import current_device_id, dtype_name as dtname
 
 ConstInt = ct.Constant[int]
 
@@ -35,33 +47,7 @@ RCP_LN2 = 1.4426950216  # 1/ln(2)
 BT_CHUNK = 64
 
 
-# Host-side utilities
-
-
-def cdiv(a: int, b: int) -> int:
-    return (a + b - 1) // b
-
-
-def next_power_of_2(n: int) -> int:
-    return 1 << (n - 1).bit_length()
-
-
-# Launch-hint autotuning (occupancy x num_worker_warps) for hot kernels.
-
-LAUNCH_HINT_CACHE: dict = {}
-
-# NOTE: the upstream occupancy=2 config is EXCLUDED: on tileiras 13.2 (which
-# ignores num_worker_warps hints) a freshly compiled occ=2
-# chunk_bwd_kernel_dqkwg deadlocks on its first launch (deterministic;
-# occ=1/4 are fine, and occ=2 is fine on the dhu/kkt kernels).  Restore the
-# SimpleNamespace(occupancy=2, num_worker_warps=4) entry once the runtime is
-# on tileiras >= 13.3.
-LAUNCH_HINT_CONFIGS = [
-    SimpleNamespace(occupancy=4, num_worker_warps=4),
-    SimpleNamespace(occupancy=4, num_worker_warps=8),
-    SimpleNamespace(occupancy=1, num_worker_warps=8),
-    SimpleNamespace(occupancy=1, num_worker_warps=4),
-]
+# --- Host helpers ---------------------------------------------------------------------------------
 
 
 def device_attrs():
@@ -80,55 +66,15 @@ def device_attrs():
         return 0, 0
 
 
-def tuned_launch(kernel, stream, grid, args, cache_key, configs=None):
-    """Launch ``kernel`` with autotuned (occupancy, num_worker_warps) hints.
-
-    Tunes once per ``cache_key`` via exhaustive_search, caches the specialized
-    kernel, and re-launches it on every subsequent call. On any tuning failure
-    (e.g. compiler error) falls back to the un-hinted kernel. ``configs`` overrides
-    the default (occupancy, num_worker_warps) candidate list.
-    """
-    kname = getattr(getattr(kernel, "_pyfunc", None), "__name__", repr(kernel))
-    key = (kname, cache_key)
-    if key not in LAUNCH_HINT_CACHE:
-        tuned = None
-        ensure_cuda_context()
-        try:
-            with ct.compiler_timeout(20):
-                result = exhaustive_search(
-                    list(configs if configs is not None else LAUNCH_HINT_CONFIGS),
-                    stream,
-                    lambda cfg: grid,
-                    kernel,
-                    lambda cfg: args,
-                    lambda cfg: {"occupancy": cfg.occupancy, "num_worker_warps": cfg.num_worker_warps},
-                )
-            best = result.best.config
-            tuned = kernel.replace_hints(occupancy=best.occupancy, num_worker_warps=best.num_worker_warps)
-        except Exception as e:  # noqa: BLE001
-            logger.warning("launch-hint autotune failed for %s: %s; using default hints", kname, e)
-            tuned = kernel
-        LAUNCH_HINT_CACHE[key] = tuned
-    ct.launch(stream, grid, LAUNCH_HINT_CACHE[key], args)
+# --- Launch tuning --------------------------------------------------------------------------------
 
 
-def exp(x):
-    return ct.exp(ct.astype(x, ct.float32))
+# occupancy=2 is EXCLUDED: on tileiras 13.2 a freshly compiled occ=2
+# chunk_bwd_kernel_dqkwg deadlocks on its first launch (occ=1/4 are fine).
+TUNE_OCC = (1, 4)
 
 
-def exp2(x):
-    return ct.exp2(ct.astype(x, ct.float32))
-
-
-def softplus(x):
-    # TODO(cutile): softplus_nv inline-asm replaced with log1p formula.
-    return ct.where(x < 20.0, ct.log(1.0 + ct.exp(x)), x)
-
-
-def tf32(a):
-    """ct.mma/ct.matmul do not auto-cast fp32 operands to tf32; cast
-    explicitly (allow-tf32 matmul semantics)."""
-    return ct.astype(a, ct.tfloat32) if a.dtype == ct.float32 else a
+# --- Device helpers -------------------------------------------------------------------------------
 
 
 def safe_matmul(a, b):
@@ -181,93 +127,7 @@ def scatter_flat_cb(raw, off, value, numel, *, mask=None):
     raw.store_offset(off, value, mask=m)
 
 
-# l2norm kernels
-
-
-@ct.kernel
-def l2norm_fwd_kernel1(x, y, rstd, eps, D, BD: ConstInt):
-    # D > 512 path: one row per program, row length D.
-    i_t = ct.bid(0)
-    cols = ct.arange(BD, dtype=ct.int32)
-    mask = cols < D
-
-    b_x = ct.astype(ct.gather(x, (i_t, cols), mask=mask, check_bounds=False, padding_value=0.0), ct.float32)
-    b_rstd = ct.rsqrt(ct.sum(b_x * b_x) + eps)
-    b_y = b_x * b_rstd
-    ct.scatter(y, (i_t, cols), ct.astype(b_y, y.dtype), mask=mask, check_bounds=False)
-    ct.scatter(rstd, (i_t,), ct.astype(b_rstd, rstd.dtype))
-
-
-@ct.kernel
-def l2norm_bwd_kernel1(y, rstd, dy, dy2, dx, eps, D, BD: ConstInt, HAS_DY2: ConstInt):
-    i_t = ct.bid(0)
-    cols = ct.arange(BD, dtype=ct.int32)
-    mask = cols < D
-
-    b_y = ct.astype(ct.gather(y, (i_t, cols), mask=mask, check_bounds=False, padding_value=0.0), ct.float32)
-    b_dy = ct.astype(ct.gather(dy, (i_t, cols), mask=mask, check_bounds=False, padding_value=0.0), ct.float32)
-    if HAS_DY2:
-        b_dy2 = ct.astype(ct.gather(dy2, (i_t, cols), mask=mask, check_bounds=False, padding_value=0.0), ct.float32)
-        # Preserve bf16 `dk.add_(dk2)` rounding before the fp32 normalization math.
-        b_dy = ct.astype(ct.astype(b_dy + b_dy2, dy.dtype), ct.float32)
-    b_rstd = ct.astype(ct.gather(rstd, (i_t,), check_bounds=False, padding_value=0.0), ct.float32).item()
-
-    b_dx = b_dy * b_rstd - ct.sum(b_dy * b_y) * b_y * b_rstd
-    ct.scatter(dx, (i_t, cols), ct.astype(b_dx, dx.dtype), mask=mask, check_bounds=False)
-
-
-@ct.kernel
-def l2norm_fwd_kernel(x, y, rstd, eps, T, D: ConstInt, BD: ConstInt, BT: ConstInt):
-    # D <= 512 path: BT rows per block, BD power-of-2 cols. Block-aligned ->
-    # ct.load with block index + ZERO padding.
-    i_t = ct.bid(0)
-    b_x = ct.astype(ct.load(x, index=(i_t, 0), shape=(BT, BD), padding_mode=ct.PaddingMode.ZERO), ct.float32)
-    b_rstd = ct.rsqrt(ct.sum(b_x * b_x, axis=1) + eps)
-    b_y = b_x * b_rstd[:, None]
-    ct.store(y, index=(i_t, 0), tile=ct.astype(b_y, y.dtype))
-    ct.store(rstd, index=(i_t,), tile=ct.astype(b_rstd, rstd.dtype))
-
-
-@ct.kernel
-def l2norm_bwd_kernel(y, rstd, dy, dy2, dx, eps, T, D: ConstInt, BD: ConstInt, BT: ConstInt, HAS_DY2: ConstInt):
-    i_t = ct.bid(0)
-    b_y = ct.astype(ct.load(y, index=(i_t, 0), shape=(BT, BD), padding_mode=ct.PaddingMode.ZERO), ct.float32)
-    b_rstd = ct.astype(ct.load(rstd, index=(i_t,), shape=(BT,), padding_mode=ct.PaddingMode.ZERO), ct.float32)
-    b_dy = ct.astype(ct.load(dy, index=(i_t, 0), shape=(BT, BD), padding_mode=ct.PaddingMode.ZERO), ct.float32)
-    if HAS_DY2:
-        b_dy2 = ct.astype(ct.load(dy2, index=(i_t, 0), shape=(BT, BD), padding_mode=ct.PaddingMode.ZERO), ct.float32)
-        b_dy = ct.astype(ct.astype(b_dy + b_dy2, dy.dtype), ct.float32)
-    b_dot = ct.sum(b_dy * b_y, axis=1)
-    b_dx = b_dy * b_rstd[:, None] - b_dot[:, None] * b_y * b_rstd[:, None]
-    ct.store(dx, index=(i_t, 0), tile=ct.astype(b_dx, dx.dtype))
-
-
-# fused_beta_sigmoid
-
-
-@ct.kernel
-def fused_beta_sigmoid_fwd_kernel(x, y, scale, n_elements, BLOCK_SIZE: ConstInt):
-    pid = ct.bid(0)
-    offs = pid * BLOCK_SIZE + ct.arange(BLOCK_SIZE, dtype=ct.int32)
-    mask = offs < n_elements
-    b_x = ct.astype(ct.gather(x, offs, mask=mask, check_bounds=False, padding_value=0.0), ct.float32)
-    b_y = scale * (1.0 / (1.0 + ct.exp(-b_x)))
-    ct.scatter(y, offs, ct.astype(b_y, y.dtype), mask=mask, check_bounds=False)
-
-
-@ct.kernel
-def fused_beta_sigmoid_bwd_kernel(x, dy, dx, scale, n_elements, BLOCK_SIZE: ConstInt):
-    pid = ct.bid(0)
-    offs = pid * BLOCK_SIZE + ct.arange(BLOCK_SIZE, dtype=ct.int32)
-    mask = offs < n_elements
-    b_x = ct.astype(ct.gather(x, offs, mask=mask, check_bounds=False, padding_value=0.0), ct.float32)
-    b_dy = ct.astype(ct.gather(dy, offs, mask=mask, check_bounds=False, padding_value=0.0), ct.float32)
-    b_y = 1.0 / (1.0 + ct.exp(-b_x))
-    b_dx = b_dy * scale * b_y * (1.0 - b_y)
-    ct.scatter(dx, offs, ct.astype(b_dx, dx.dtype), mask=mask, check_bounds=False)
-
-
-# scalar chunk_local_cumsum (used for the gate g)
+# --- Kernels: normalization and gates -------------------------------------------------------------
 
 
 @ct.kernel
@@ -304,9 +164,6 @@ def chunk_local_cumsum_scalar_kernel(
     if HAS_SCALE:
         b_o = b_o * scale
     ct.scatter(o, (t_idx, i_h), ct.astype(b_o, o.dtype), mask=mask, check_bounds=False)
-
-
-# gdn_gate_chunk_cumsum / gdn_gate_bwd
 
 
 @ct.kernel
@@ -385,7 +242,9 @@ def gdn_gate_bwd_kernel(g, A_log, dt_bias, dyg, dg, dA, db, T, H: ConstInt, BT: 
         ct.scatter(db, i_t * H + i_h, b_db)
 
 
-# chunk_gated_delta_rule_fwd_kkt_solve_kernel  (fused KK^T + solve, 4 sub-chunks)
+# --- Kernels: WY representation -------------------------------------------------------------------
+
+
 @ct.kernel
 def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
     k,
@@ -646,7 +505,6 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
     b_Ai33 = b_Ai33 + ct.astype(m_I, ct.float32)
 
     # -- Step 4: block merge --
-    # TODO(cutile): input_precision=ieee not representable; fp32 kept in fp32.
     b_Ai10 = -ct.matmul(ct.matmul(b_Ai11, b_A10), b_Ai00)
     b_Ai21 = -ct.matmul(ct.matmul(b_Ai22, b_A21), b_Ai11)
     b_Ai32 = -ct.matmul(ct.matmul(b_Ai33, b_A32), b_Ai22)
@@ -1023,14 +881,7 @@ def prepare_wy_repr_bwd_kernel(
         scatter_flat(dg_flat, row_hv, ct.astype(b_dg, dg_flat.dtype), mask=m_t)
 
 
-# chunk_delta_h (fwd_h state recurrence + bwd dhu)
-# The recurrent hidden state (K x V, split into 64-wide K blocks b_h1..b_h4) is
-# carried across chunks in a Python for-loop.
-
-
-def ct_min(a, b):
-    # scalar/tile min for runtime ints (builtin `min` is whitelisted; `hasattr` is not).
-    return min(a, b)
+# --- Kernels: state scan --------------------------------------------------------------------------
 
 
 @ct.kernel
@@ -1946,6 +1797,9 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
                 )
 
 
+# --- Kernels: attention and gradients -------------------------------------------------------------
+
+
 @ct.kernel
 def chunk_fwd_kernel_o(
     q,
@@ -2296,120 +2150,9 @@ def chunk_bwd_kernel_dv_local(
         scatter_flat(dvf, dv_off, ct.astype(b_dv, dv.dtype), mask=do_mask)
 
 
-# Host wrappers (compute grid + fixed tile sizes, then ct.launch)
-# cuTile never accepts None; optional tensors are passed as an inert device stub +
-# an integer flag (USE_*/HAS_*).
+# --- Launchers: normalization and gates -----------------------------------------------------------
 
 
-# explicit workspace: all device memory is the caller's — the engine plan (or a
-# standalone harness) pre-carves every pipeline intermediate as a named view in
-# ``bufs`` and passes outputs via ``out=``; nothing here allocates.
-
-
-# l2norm
-def l2norm_fwd(x, eps: float = 1e-6, out=None, rstd_out=None, stream=None):
-    stream = 0 if stream is None else stream
-    x_shape_og = x.shape
-    x = reshaped(x, (-1, x.shape[-1]))
-    y = reshaped(out, tuple(x.shape))
-    T, D = x.shape[0], x.shape[-1]
-    MAX_FUSED_SIZE = 65536 // x.element_size()
-    BD = min(MAX_FUSED_SIZE, next_power_of_2(D))
-    rstd = reshaped(rstd_out, (T,))
-    if D <= 512:
-        BT = 32
-        grid = (cdiv(T, BT),)
-        tuned_launch(
-            l2norm_fwd_kernel,
-            stream,
-            grid,
-            (x, y, rstd, float(eps), T, D, BD, BT),
-            cache_key=(D, BD, BT, str(x.dtype)),
-        )
-    else:
-        ct.launch(stream, (T,), l2norm_fwd_kernel1, (x, y, rstd, float(eps), D, BD))
-    return y.view(x_shape_og), rstd.view(x_shape_og[:-1])
-
-
-def l2norm_bwd(
-    y,
-    rstd,
-    dy,
-    eps: float = 1e-6,
-    dy2=None,
-    out=None,
-    bufs=None,
-    stream=None,
-):
-    stream = 0 if stream is None else stream
-    y_shape_og = y.shape
-    y = y.reshape(-1, dy.shape[-1])
-    dy = dy.reshape(-1, dy.shape[-1])
-    dy2_arg = dy2.reshape(-1, dy.shape[-1]) if dy2 is not None else dummy(dtname(dy), bufs)
-    dx = reshaped(out, tuple(y.shape))
-    T, D = y.shape[0], y.shape[-1]
-    MAX_FUSED_SIZE = 65536 // y.element_size()
-    BD = min(MAX_FUSED_SIZE, next_power_of_2(D))
-    rstd_flat = rstd.reshape(-1)
-    if D <= 512:
-        BT = 32
-        grid = (cdiv(T, BT),)
-        tuned_launch(
-            l2norm_bwd_kernel,
-            stream,
-            grid,
-            (y, rstd_flat, dy, dy2_arg, dx, float(eps), T, D, BD, BT, int(dy2 is not None)),
-            cache_key=(D, BD, BT, str(y.dtype), int(dy2 is not None)),
-        )
-    else:
-        ct.launch(
-            stream,
-            (T,),
-            l2norm_bwd_kernel1,
-            (y, rstd_flat, dy, dy2_arg, dx, float(eps), D, BD, int(dy2 is not None)),
-        )
-    return dx.view(y_shape_og)
-
-
-# fused_beta_sigmoid
-BETA_SIGMOID_BLOCK_SIZE = 2048
-
-
-def fused_beta_sigmoid_fwd(x, scale: float = 1.0, out=None, stream=None):
-    stream = 0 if stream is None else stream
-    y = reshaped(out, tuple(x.shape))
-    n = x.numel()
-    grid = (cdiv(n, BETA_SIGMOID_BLOCK_SIZE),)
-    ct.launch(
-        stream,
-        grid,
-        fused_beta_sigmoid_fwd_kernel,
-        (reshaped(x, (-1,)), y.reshape(-1), float(scale), n, BETA_SIGMOID_BLOCK_SIZE),
-    )
-    return y
-
-
-def fused_beta_sigmoid_bwd(x, dy, scale: float = 1.0, out=None, stream=None):
-    stream = 0 if stream is None else stream
-    dx = reshaped(out, tuple(x.shape))
-    n = x.numel()
-    grid = (cdiv(n, BETA_SIGMOID_BLOCK_SIZE),)
-    ct.launch(
-        stream,
-        grid,
-        fused_beta_sigmoid_bwd_kernel,
-        (reshaped(x, (-1,)), reshaped(dy, (-1,)), dx.reshape(-1), float(scale), n, BETA_SIGMOID_BLOCK_SIZE),
-    )
-    return dx
-
-
-def fused_beta_sigmoid(x, scale: float = 1.0, out=None, stream=None):
-    """Fused ``scale * sigmoid(x)`` (fp32, written to ``out``)."""
-    stream = 0 if stream is None else stream
-    return fused_beta_sigmoid_fwd(x, scale, out=out, stream=stream)
-
-
-# chunk_local_cumsum (scalar gate) / gdn_gate_chunk_cumsum / gdn_gate_bwd
 def chunk_local_cumsum_scalar(
     g,
     chunk_size,
@@ -2424,7 +2167,7 @@ def chunk_local_cumsum_scalar(
     T, H = g.shape
     BT = chunk_size
     NT = len(chunk_indices)
-    g_out = reshaped(out, (T, H))
+    g_out = out.reshape((T, H))
     scale_val = float(scale) if scale is not None else 0.0
     has_scale = int(scale is not None)
     cu_arg = cu_seqlens
@@ -2487,8 +2230,8 @@ def gdn_gate_chunk_cumsum(
     T, H = g.shape
     BT = chunk_size
     NT = len(chunk_indices)
-    o = reshaped(out, (T, H))
-    dt_arg = reshaped(opt(dt_bias, bufs, dtname(A_log)), (-1,))
+    o = out.reshape((T, H))
+    dt_arg = opt(dt_bias, bufs, dtname(A_log)).reshape((-1,))
     scale_val = float(scale) if scale is not None else 0.0
     cu_arg = cu_seqlens
     ci_arg = chunk_indices
@@ -2498,7 +2241,7 @@ def gdn_gate_chunk_cumsum(
         gdn_gate_chunk_cumsum_scalar_kernel,
         (
             g,
-            reshaped(A_log, (-1,)),
+            A_log.reshape((-1,)),
             dt_arg,
             o,
             scale_val,
@@ -2523,20 +2266,20 @@ def gdn_gate_bwd(g, A_log, dt_bias, dyg, dg_out=None, dA_out=None, dbias_out=Non
     T = g.numel() // H
     BT = 32
     NT = cdiv(T, BT)
-    dg = reshaped(dg_out, tuple(g.shape))
-    dA_nt = reshaped(bufs["dA_gate"], (NT, H))
-    db_nt = reshaped(bufs["db_gate"], (NT, H)) if dt_bias is not None else None
-    dt_arg = reshaped(opt(dt_bias, bufs, dtname(A_log)), (-1,))
-    db_arg = db_nt.reshape(-1) if db_nt is not None else dummy("float32", bufs)
+    dg = dg_out.reshape(tuple(g.shape))
+    dA_nt = bufs["dA_gate"].reshape((NT, H))
+    db_nt = bufs["db_gate"].reshape((NT, H)) if dt_bias is not None else None
+    dt_arg = opt(dt_bias, bufs, dtname(A_log)).reshape((-1,))
+    db_arg = opt(db_nt, bufs).reshape(-1)
     ct.launch(
         stream,
         (NT, H),
         gdn_gate_bwd_kernel,
         (
-            reshaped(g, (-1,)),
-            reshaped(A_log, (-1,)),
+            g.reshape((-1,)),
+            A_log.reshape((-1,)),
             dt_arg,
-            reshaped(dyg, (-1,)),
+            dyg.reshape((-1,)),
             dg.reshape(-1),
             dA_nt.reshape(-1),
             db_arg,
@@ -2546,13 +2289,15 @@ def gdn_gate_bwd(g, A_log, dt_bias, dyg, dg_out=None, dA_out=None, dbias_out=Non
             int(dt_bias is not None),
         ),
     )
-    sum_leading(reshaped(dA_out, (H,)), dA_nt, NT, H, stream=stream)
+    sum_leading(dA_out.reshape((H,)), dA_nt, NT, H, stream=stream)
     if dt_bias is not None:
-        sum_leading(reshaped(dbias_out, (H,)), db_nt, NT, H, stream=stream)
+        sum_leading(dbias_out.reshape((H,)), db_nt, NT, H, stream=stream)
     return dg, dA_out, (dbias_out if dt_bias is not None else None)
 
 
-# recompute_w_u_fwd / prepare_wy_repr_bwd
+# --- Launchers: WY representation -----------------------------------------------------------------
+
+
 def recompute_w_u_fwd(k, v, beta, A, g=None, cu_seqlens=None, chunk_indices=None, bufs=None, stream=None):
     stream = 0 if stream is None else stream
     T, H, K, V, HV = *k.shape, v.shape[-1], v.shape[1]
@@ -2560,16 +2305,16 @@ def recompute_w_u_fwd(k, v, beta, A, g=None, cu_seqlens=None, chunk_indices=None
     BK = 64
     BV = 64
     NT = len(chunk_indices)
-    w = reshaped(bufs["w"], (T, HV, K))
-    u = reshaped(bufs["u"], (T, HV, V))
-    beta2 = reshaped(beta, (T, HV))
+    w = bufs["w"].reshape((T, HV, K))
+    u = bufs["u"].reshape((T, HV, V))
+    beta2 = beta.reshape((T, HV))
     A3 = A.reshape(T, HV, BT)
     g_arg = g.reshape(T, HV) if g is not None else dummy("float32", bufs)
     cu_arg = cu_seqlens
     ci_arg = chunk_indices
-    tuned_launch(
+    autotuned_launch(
         recompute_w_u_fwd_kernel,
-        stream,
+        (H, HV, K, V, BT, BK, BV, int(g is not None), str(k.dtype), current_device_id()),
         (NT, HV),
         (
             k,
@@ -2590,7 +2335,8 @@ def recompute_w_u_fwd(k, v, beta, A, g=None, cu_seqlens=None, chunk_indices=None
             BV,
             int(g is not None),
         ),
-        cache_key=(H, HV, K, V, BT, BK, BV, int(g is not None), str(k.dtype), dev_id(k)),
+        occ_choices=TUNE_OCC,
+        stream=stream,
     )
     return w, u
 
@@ -2603,17 +2349,17 @@ def prepare_wy_repr_bwd(k, v, beta, A, dw, du, g=None, cu_seqlens=None, chunk_in
     CONST_TILING = 64
     BK = min(max(next_power_of_2(K), 16), CONST_TILING)
     BV = min(max(next_power_of_2(V), 16), CONST_TILING)
-    dk = reshaped(bufs["wy_dk"], (T, HV, K))
-    dv = reshaped(bufs["wy_dv"], (T, HV, V))
-    dg = reshaped(bufs["wy_dg"], (T, HV)) if g is not None else None
-    db = reshaped(bufs["db"], (T, HV))
+    dk = bufs["wy_dk"].reshape((T, HV, K))
+    dv = bufs["wy_dv"].reshape((T, HV, V))
+    dg = bufs["wy_dg"].reshape((T, HV)) if g is not None else None
+    db = bufs["db"].reshape((T, HV))
     g_arg = opt(g, bufs)
-    dg_arg = dg if dg is not None else dummy("float32", bufs)
+    dg_arg = opt(dg, bufs)
     cu_arg = cu_seqlens
     ci_arg = chunk_indices
-    tuned_launch(
+    autotuned_launch(
         prepare_wy_repr_bwd_kernel,
-        stream,
+        (H, HV, K, V, BT, BK, BV, int(g is not None), str(k.dtype), current_device_id()),
         (NT, HV),
         (
             k,
@@ -2640,16 +2386,61 @@ def prepare_wy_repr_bwd(k, v, beta, A, dw, du, g=None, cu_seqlens=None, chunk_in
             cdiv(K, BK),
             cdiv(V, BV),
         ),
-        cache_key=(H, HV, K, V, BT, BK, BV, int(g is not None), str(k.dtype), dev_id(k)),
+        occ_choices=TUNE_OCC,
+        stream=stream,
     )
     if H != HV:
-        dk_r = reshaped(bufs["wy_dk_hred"], (T, H, K))
+        dk_r = bufs["wy_dk_hred"].reshape((T, H, K))
         head_group_sum(dk_r, dk, T, H, HV // H, K, stream=stream)
         dk = dk_r
     return dk, dv, db, dg
 
 
-# chunk_gated_delta_rule_fwd_h / bwd_dhu
+def chunk_gated_delta_rule_fwd_intra(k, v, g=None, beta=None, cu_seqlens=None, chunk_size=64, chunk_indices=None, bufs=None, compute_wu=True, stream=None):
+    stream = 0 if stream is None else stream
+    T, H, K, HV = *k.shape, beta.shape[1]
+    BT = chunk_size
+    NT = len(chunk_indices)
+
+    A = bufs["A"].reshape((T, HV, BT))
+    zero_fill(A, stream=stream)
+    BK = 64
+    g_arg = opt(g, bufs)
+    cu_arg = cu_seqlens
+    ci_arg = chunk_indices
+    # Masked BC=16 4-sub-block kernel: masks the partial last chunk's tail.
+    BC = 16
+    autotuned_launch(
+        chunk_gated_delta_rule_fwd_kkt_solve_kernel,
+        (H, HV, K, BT, BC, BK, int(g is not None), str(k.dtype), current_device_id()),
+        (NT, HV),
+        (
+            k,
+            g_arg,
+            beta,
+            A,
+            cu_arg,
+            ci_arg,
+            H,
+            HV,
+            K,
+            BT,
+            BC,
+            BK,
+            int(g is not None),
+        ),
+        occ_choices=TUNE_OCC,
+        stream=stream,
+    )
+    if not compute_wu:
+        return None, None, A
+    w, u = recompute_w_u_fwd(k=k, v=v, beta=beta, A=A, g=g, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices, bufs=bufs, stream=stream)
+    return w, u, A
+
+
+# --- Launchers: state scan ------------------------------------------------------------------------
+
+
 def chunk_gated_delta_rule_fwd_h(
     k,
     w,
@@ -2674,17 +2465,17 @@ def chunk_gated_delta_rule_fwd_h(
     chunk_offsets = bufs["chunk_offsets"]
 
     state_shape = (N, HV, V, K) if state_v_first else (N, HV, K, V)
-    h = reshaped(bufs["state_checkpoints"], (NT, HV) + state_shape[2:])
-    final_state = reshaped(bufs["final_state"], state_shape) if output_final_state else None
+    h = bufs["state_checkpoints"].reshape((NT, HV) + state_shape[2:])
+    final_state = bufs["final_state"].reshape(state_shape) if output_final_state else None
     if final_state is not None:
         zero_fill(final_state, stream=stream)
-    v_new = reshaped(bufs["v_new"], (T, HV, V)) if save_new_value else None
+    v_new = bufs["v_new"].reshape((T, HV, V)) if save_new_value else None
 
-    vnew_arg = v_new if v_new is not None else dummy(dtname(u), bufs)
+    vnew_arg = opt(v_new, bufs, dtname(u))
     g_arg = opt(g, bufs)
     gk_arg = opt(gk, bufs)
-    h0_arg = initial_state if initial_state is not None else dummy("float32", bufs)
-    ht_arg = final_state if final_state is not None else dummy("float32", bufs)
+    h0_arg = opt(initial_state, bufs)
+    ht_arg = opt(final_state, bufs)
     cu_arg = cu_seqlens
     co_arg = chunk_offsets
 
@@ -2707,9 +2498,24 @@ def chunk_gated_delta_rule_fwd_h(
     grid = (cdiv(V, BV), N * HV)
 
     # Multi-dim arrays passed as-is (per-dim indices + real strides).
-    tuned_launch(
+    autotuned_launch(
         chunk_gated_delta_rule_fwd_kernel_h_blockdim64,
-        stream,
+        (
+            H,
+            HV,
+            K,
+            V,
+            BT,
+            BV,
+            int(g is not None),
+            int(gk is not None),
+            int(initial_state is not None),
+            int(output_final_state),
+            int(save_new_value),
+            int(state_v_first),
+            str(k.dtype),
+            current_device_id(),
+        ),
         grid,
         (
             k,
@@ -2736,22 +2542,8 @@ def chunk_gated_delta_rule_fwd_h(
             int(save_new_value),
             int(state_v_first),
         ),
-        cache_key=(
-            H,
-            HV,
-            K,
-            V,
-            BT,
-            BV,
-            int(g is not None),
-            int(gk is not None),
-            int(initial_state is not None),
-            int(output_final_state),
-            int(save_new_value),
-            int(state_v_first),
-            str(k.dtype),
-            dev_id(k),
-        ),
+        occ_choices=TUNE_OCC,
+        stream=stream,
     )
     return h, v_new, final_state
 
@@ -2780,9 +2572,9 @@ def chunk_gated_delta_rule_bwd_dhu(
     N, NT = len(cu_seqlens) - 1, len(chunk_indices)
     chunk_offsets = bufs["chunk_offsets"]
 
-    dh = reshaped(bufs["dstate"], (NT, HV, V, K) if state_v_first else (NT, HV, K, V))
-    dh0 = reshaped(bufs["dstate0"], tuple(h0.shape)) if h0 is not None else None
-    dv2 = reshaped(bufs["dv2"], (T, HV, V))
+    dh = bufs["dstate"].reshape((NT, HV, V, K) if state_v_first else (NT, HV, K, V))
+    dh0 = bufs["dstate0"].reshape(tuple(h0.shape)) if h0 is not None else None
+    dv2 = bufs["dv2"].reshape((T, HV, V))
 
     # For K>128 the blockdim64 kernel's 4 (64xBV) fp32 dH accumulators overflow
     # tileiras allocation at BV=64; shrink BV to keep the live footprint in range.
@@ -2791,13 +2583,25 @@ def chunk_gated_delta_rule_bwd_dhu(
     g_arg = opt(g, bufs)
     gk_arg = opt(gk, bufs)
     dht_arg = opt(dstate_in, bufs)
-    dh0_arg = dh0 if dh0 is not None else dummy("float32", bufs)
+    dh0_arg = opt(dh0, bufs)
     cu_arg = cu_seqlens
     co_arg = chunk_offsets
 
-    tuned_launch(
+    autotuned_launch(
         chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64,
-        stream,
+        (
+            H,
+            HV,
+            K,
+            V,
+            BT,
+            BV,
+            int(g is not None),
+            int(gk is not None),
+            int(state_v_first),
+            str(q.dtype),
+            current_device_id(),
+        ),
         grid,
         (
             q,
@@ -2827,24 +2631,15 @@ def chunk_gated_delta_rule_bwd_dhu(
             int(state_v_first),
             1,
         ),
-        cache_key=(
-            H,
-            HV,
-            K,
-            V,
-            BT,
-            BV,
-            int(g is not None),
-            int(gk is not None),
-            int(state_v_first),
-            str(q.dtype),
-            dev_id(q),
-        ),
+        occ_choices=TUNE_OCC,
+        stream=stream,
     )
     return dh, dh0, dv2
 
 
-# chunk_fwd_o / chunk_bwd_dqkwg / chunk_bwd_dv_local
+# --- Launchers: attention and gradients -----------------------------------------------------------
+
+
 def chunk_fwd_o(
     q,
     k,
@@ -2866,7 +2661,7 @@ def chunk_fwd_o(
     NT = len(chunk_indices)
     if scale is None:
         scale = k.shape[-1] ** -0.5
-    o = reshaped(bufs["o"], (T, HV, V))
+    o = bufs["o"].reshape((T, HV, V))
     BK = min(max(next_power_of_2(K), 16), 64)
     BV = 64
     grid = (cdiv(V, BV), NT, HV)
@@ -2879,9 +2674,22 @@ def chunk_fwd_o(
         h3 = h.reshape(NT * HV, V, K)
     else:
         h3 = h.reshape(NT * HV, K, V)
-    tuned_launch(
+    autotuned_launch(
         chunk_fwd_kernel_o,
-        stream,
+        (
+            H,
+            HV,
+            K,
+            V,
+            BT,
+            BK,
+            BV,
+            int(g is not None),
+            int(g_gamma is not None),
+            int(state_v_first),
+            str(q.dtype),
+            current_device_id(),
+        ),
         grid,
         (
             q,
@@ -2905,20 +2713,8 @@ def chunk_fwd_o(
             int(g_gamma is not None),
             int(state_v_first),
         ),
-        cache_key=(
-            H,
-            HV,
-            K,
-            V,
-            BT,
-            BK,
-            BV,
-            int(g is not None),
-            int(g_gamma is not None),
-            int(state_v_first),
-            str(q.dtype),
-            dev_id(q),
-        ),
+        occ_choices=TUNE_OCC,
+        stream=stream,
     )
     return o
 
@@ -2950,10 +2746,10 @@ def chunk_bwd_dqkwg(
     BK = min(max(next_power_of_2(K), 16), CONST_TILING)
     BV = min(max(next_power_of_2(V), 16), CONST_TILING)
     NK = cdiv(K, BK)
-    dq = reshaped(bufs["dq"], (T, HV, K))
-    dk = reshaped(bufs["dk"], (T, HV, K))
-    dg = reshaped(bufs["dg_nk"], (NK, T, HV)) if g is not None else None
-    dw = reshaped(bufs["dw"], (T, HV, K)) if w is not None else None
+    dq = bufs["dq"].reshape((T, HV, K))
+    dk = bufs["dk"].reshape((T, HV, K))
+    dg = bufs["dg_nk"].reshape((NK, T, HV)) if g is not None else None
+    dw = bufs["dw"].reshape((T, HV, K)) if w is not None else None
     grid = (NK, NT, HV)
     # h/dh flattened to (NT*HV,*,*) slabs for block-indexed TMA.
     if state_v_first:
@@ -2964,15 +2760,29 @@ def chunk_bwd_dqkwg(
         dh3 = dh.reshape(NT * HV, K, V)
     g_arg = g.reshape(T, HV) if g is not None else dummy(dtname(q), bufs)
     gg_arg = opt(g_gamma, bufs)
-    dw3 = dw if dw is not None else dummy(dtname(k), bufs)
+    dw3 = opt(dw, bufs, dtname(k))
     dv3 = dv.reshape(T, HV, V) if dv is not None else dummy(dtname(k), bufs)
-    dg3 = dg if dg is not None else dummy("float32", bufs)
+    dg3 = opt(dg, bufs)
     cu_arg = cu_seqlens
     ci_arg = chunk_indices
     use_dw = int(dw is not None and dv is not None)
-    tuned_launch(
+    autotuned_launch(
         chunk_bwd_kernel_dqkwg,
-        stream,
+        (
+            H,
+            HV,
+            K,
+            V,
+            BT,
+            BK,
+            BV,
+            int(g is not None),
+            int(g_gamma is not None),
+            use_dw,
+            int(state_v_first),
+            str(q.dtype),
+            current_device_id(),
+        ),
         grid,
         (
             q,
@@ -3004,31 +2814,18 @@ def chunk_bwd_dqkwg(
             int(state_v_first),
             cdiv(V, BV),
         ),
-        cache_key=(
-            H,
-            HV,
-            K,
-            V,
-            BT,
-            BK,
-            BV,
-            int(g is not None),
-            int(g_gamma is not None),
-            use_dw,
-            int(state_v_first),
-            str(q.dtype),
-            dev_id(q),
-        ),
+        occ_choices=TUNE_OCC,
+        stream=stream,
     )
     if H != HV:
-        dq_r = reshaped(bufs["dq_hred"], (T, H, K))
-        dk_r = reshaped(bufs["dk_hred"], (T, H, K))
+        dq_r = bufs["dq_hred"].reshape((T, H, K))
+        dk_r = bufs["dk_hred"].reshape((T, H, K))
         head_group_sum(dq_r, dq, T, H, HV // H, K, stream=stream)
         head_group_sum(dk_r, dk, T, H, HV // H, K, stream=stream)
         dq, dk = dq_r, dk_r
     if dg is not None:
-        dg_r = reshaped(bufs["dg"], (T, HV))
-        sum_leading(reshaped(dg_r, (T * HV,)), reshaped(dg, (NK, T * HV)), NK, T * HV, stream=stream)
+        dg_r = bufs["dg"].reshape((T, HV))
+        sum_leading(dg_r.reshape((T * HV,)), dg.reshape((NK, T * HV)), NK, T * HV, stream=stream)
         dg = dg_r
     return dq, dk, dw, dg
 
@@ -3041,7 +2838,7 @@ def chunk_bwd_dv_local(q, k, do, g=None, g_gamma=None, A=None, scale=None, cu_se
     BK = min(max(next_power_of_2(K), 16), CONST_TILING)
     BV = min(max(next_power_of_2(V), 16), CONST_TILING)
     NT = len(chunk_indices)
-    dv = reshaped(bufs["dv"], (T, HV, V))
+    dv = bufs["dv"].reshape((T, HV, V))
     grid = (NT, HV)
     g_arg = opt(g, bufs)
     gg_arg = opt(g_gamma, bufs)
@@ -3049,9 +2846,22 @@ def chunk_bwd_dv_local(q, k, do, g=None, g_gamma=None, A=None, scale=None, cu_se
     cu_arg = cu_seqlens
     ci_arg = chunk_indices
     scale_val = float(scale) if scale is not None else 0.0
-    tuned_launch(
+    autotuned_launch(
         chunk_bwd_kernel_dv_local,
-        stream,
+        (
+            H,
+            HV,
+            K,
+            V,
+            BT,
+            BK,
+            BV,
+            int(g is not None),
+            int(g_gamma is not None),
+            int(A is not None),
+            str(q.dtype),
+            current_device_id(),
+        ),
         grid,
         (
             q,
@@ -3075,67 +2885,13 @@ def chunk_bwd_dv_local(q, k, do, g=None, g_gamma=None, A=None, scale=None, cu_se
             int(g_gamma is not None),
             int(A is not None),
         ),
-        cache_key=(
-            H,
-            HV,
-            K,
-            V,
-            BT,
-            BK,
-            BV,
-            int(g is not None),
-            int(g_gamma is not None),
-            int(A is not None),
-            str(q.dtype),
-            dev_id(q),
-        ),
+        occ_choices=TUNE_OCC,
+        stream=stream,
     )
     return dv
 
 
-# fused intra (KK^T + solve_tril + recompute_w_u)
-def chunk_gated_delta_rule_fwd_intra(k, v, g=None, beta=None, cu_seqlens=None, chunk_size=64, chunk_indices=None, bufs=None, compute_wu=True, stream=None):
-    stream = 0 if stream is None else stream
-    T, H, K, HV = *k.shape, beta.shape[1]
-    BT = chunk_size
-    NT = len(chunk_indices)
-
-    A = reshaped(bufs["A"], (T, HV, BT))
-    zero_fill(A, stream=stream)
-    BK = 64
-    g_arg = opt(g, bufs)
-    cu_arg = cu_seqlens
-    ci_arg = chunk_indices
-    # Masked BC=16 4-sub-block kernel: masks the partial last chunk's tail.
-    BC = 16
-    tuned_launch(
-        chunk_gated_delta_rule_fwd_kkt_solve_kernel,
-        stream,
-        (NT, HV),
-        (
-            k,
-            g_arg,
-            beta,
-            A,
-            cu_arg,
-            ci_arg,
-            H,
-            HV,
-            K,
-            BT,
-            BC,
-            BK,
-            int(g is not None),
-        ),
-        cache_key=(H, HV, K, BT, BC, BK, int(g is not None), str(k.dtype), dev_id(k)),
-    )
-    if not compute_wu:
-        return None, None, A
-    w, u = recompute_w_u_fwd(k=k, v=v, beta=beta, A=A, g=g, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices, bufs=bufs, stream=stream)
-    return w, u, A
-
-
-# forward / backward drivers + entry point
+# --- Pipelines ------------------------------------------------------------------------------------
 
 
 def chunk_gated_delta_rule_fwd(
@@ -3271,7 +3027,7 @@ def chunk_gated_delta_rule_bwd(
     m_dg = 1
     for s_ in dg.shape:
         m_dg *= int(s_)
-    add_inplace(reshaped(dg, (m_dg,)), reshaped(dg2, (m_dg,)), m_dg, stream=stream)
+    add_inplace(dg.reshape((m_dg,)), dg2.reshape((m_dg,)), m_dg, stream=stream)
     dg = chunk_local_cumsum(dg, chunk_size=64, reverse=True, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices, out=bufs["dg_cum"], stream=stream)
     dA_log, ddt_bias = None, None
     if use_gate_in_kernel:
@@ -3299,63 +3055,33 @@ def chunk_gated_delta_rule_grad(
     dstate_in=None,
     scale=None,
     initial_state=None,
+    use_qk_l2norm_in_kernel=False,
     state_v_first=False,
     cu_seqlens=None,
-    cu_seqlens_cpu=None,
     chunk_indices=None,
-    use_qk_l2norm_in_kernel=False,
-    use_gate_in_kernel=False,
-    A_log=None,
-    dt_bias=None,
-    use_beta_sigmoid_in_kernel=False,
-    allow_neg_eigval=False,
     bufs=None,
     stream=None,
 ):
-    r"""GDN backward as a plain pipeline over explicit THD arguments.
+    r"""GDN backward over THD (token-packed) inputs.
 
     ``q``/``k``/``v``/``do`` are ``[total_T, H, D]``, ``g``/``beta`` are
-    ``[total_T, H]``; ``cu_seqlens`` and ``chunk_indices`` are required.
-    Recomputes the forward's prep (L2-normalized Q/K + rstd, cumulative gate,
-    intra-chunk WY matrix) from the ORIGINAL inputs, then runs the backward
-    kernels.
-
-    Returns ``(dq, dk, dv, dg, dbeta, dh0, dA_log, ddt_bias)`` in THD layout.
-    """
+    ``[total_T, HV]``; ``cu_seqlens``, ``chunk_indices`` and the pre-carved
+    ``bufs`` views are required. Recomputes the forward's prep (L2-normalized
+    q/k + rstd, cumulative gate, intra-chunk WY matrix) from the inputs, then
+    runs the backward kernels. Gradients land in the caller's planted carves;
+    the returned handles are those same buffers."""
     stream = 0 if stream is None else stream
-    if cu_seqlens is None:
-        raise ValueError("cu_seqlens is required (THD layout)")
     if scale is None:
         scale = k.shape[-1] ** -0.5
-    q_rstd, k_rstd = None, None
-    q_in, k_in = q, k
+    q_in, k_in, q_rstd, k_rstd = q, k, None, None
     if use_qk_l2norm_in_kernel:
         q_in, q_rstd = l2norm_fwd(q, out=bufs["q_norm"], rstd_out=bufs["q_rstd"], stream=stream)
         k_in, k_rstd = l2norm_fwd(k, out=bufs["k_norm"], rstd_out=bufs["k_rstd"], stream=stream)
-    beta_raw = beta
-    if use_beta_sigmoid_in_kernel:
-        beta = fused_beta_sigmoid(beta_raw, scale=2.0 if allow_neg_eigval else 1.0, out=bufs["beta_sig"], stream=stream)
-    if cu_seqlens is not None and chunk_indices is None:
-        raise ValueError("varlen (cu_seqlens) requires chunk_indices — callers build the (seq, intra) table")
-    g_cum, _o, A, _fs, initial_state, g_input = chunk_gated_delta_rule_fwd(
-        q=q_in,
-        k=k_in,
-        v=v,
-        g=g,
-        beta=beta,
-        scale=scale,
-        initial_state=initial_state,
-        output_final_state=False,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        state_v_first=state_v_first,
-        use_gate_in_kernel=use_gate_in_kernel,
-        A_log=A_log,
-        dt_bias=dt_bias,
-        bufs=bufs,
-        stream=stream,
+    g_cum = chunk_local_cumsum(g, chunk_size=BT_CHUNK, scale=RCP_LN2, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices, out=bufs["g_cum"], stream=stream)
+    _w, _u, A = chunk_gated_delta_rule_fwd_intra(
+        k=k_in, v=v, g=g_cum, beta=beta, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices, bufs=bufs, compute_wu=False, stream=stream
     )
-    dq, dk, dk2, dv, db, dg, dh0, dA_log, ddt_bias = chunk_gated_delta_rule_bwd(
+    dq, dk, dk2, dv, db, dg, dh0, _dA_log, _ddt_bias = chunk_gated_delta_rule_bwd(
         q=q_in,
         k=k_in,
         v=v,
@@ -3366,27 +3092,20 @@ def chunk_gated_delta_rule_grad(
         initial_state=initial_state,
         do=do,
         dstate_in=dstate_in,
+        state_v_first=state_v_first,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
-        state_v_first=state_v_first,
-        use_gate_in_kernel=use_gate_in_kernel,
-        g_input=g_input,
-        A_log=A_log,
-        dt_bias=dt_bias,
         bufs=bufs,
         stream=stream,
     )
     if use_qk_l2norm_in_kernel:
-        dq = l2norm_bwd(q_in, q_rstd, dq, out=bufs["dq_final"], bufs=bufs, stream=stream)
-        dk = l2norm_bwd(k_in, k_rstd, dk, dy2=dk2, out=bufs["dk_final"], bufs=bufs, stream=stream)
+        dq = l2norm_bwd(q_in, q_rstd, dq, out=bufs["dq_l2"], bufs=bufs, stream=stream)
+        dk = l2norm_bwd(k_in, k_rstd, dk, dy2=dk2, out=bufs["dk_l2"], bufs=bufs, stream=stream)
     else:
-        n_dk = 1
-        for s_ in dk.shape:
-            n_dk *= int(s_)
-        add_inplace(reshaped(dk, (n_dk,)), reshaped(dk2, (n_dk,)), n_dk, stream=stream)
-    if use_beta_sigmoid_in_kernel:
-        db = fused_beta_sigmoid_bwd(beta_raw, db, scale=2.0 if allow_neg_eigval else 1.0, out=db, stream=stream)
-    return dq, dk, dv, dg, db, dh0, dA_log, ddt_bias
+        # dk/dk2 are the head-reduced finals for GVA, HV-head for MHA
+        n_dk = k.shape[0] * k.shape[1] * k.shape[2]
+        add_inplace(dk.reshape(-1), dk2.reshape(-1), n_dk, stream=stream)
+    return dq, dk, dv, db, dg, dh0
 
 
 def chunk_gated_delta_rule(

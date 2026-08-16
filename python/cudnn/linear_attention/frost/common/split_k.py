@@ -55,22 +55,24 @@ The pipeline (one fixed shape regardless of gate kind):
    parallel (one warp per boundary, one lane per window chunk), then
    thread 0 walks the probe results and emits work items into the caller's
    ``item_scratch``.
-3. order: one CTA bitonic-sorts the emitted items into ``work_items``,
-   longest ``[cstart, cend)`` first, so the main kernels' ticket scheduler
-   consumes them in LPT order — the makespan tail is set by whatever starts
-   last, so the big items must go first.  This is what keeps ragged varlen
-   batches balanced without cutting them.
+3. order (:func:`order_body`, hosted by each kernel module's
+   prologue kernel alongside its TMA-descriptor build — one launch for
+   both): bitonic-sort the items into ``work_items``, longest ``[cstart,
+   cend)`` first, so the ticket scheduler consumes them in LPT order —
+   the makespan tail is set by whatever starts last, so the big items
+   must go first.  This is what keeps ragged varlen batches balanced
+   without cutting them.
 
-The order kernel also zeroes the main kernels' scheduler ticket rings
+The order body also zeroes the main kernels' scheduler ticket rings
 (dirty on exit), and with ``split=False`` it replaces the whole pipeline:
-scan and walk never launch, and the order kernel synthesizes the uncut
+scan and walk never launch, and the prologue kernel synthesizes the uncut
 whole-sequence item per (batch, head) from ``cu_seqlens`` alone, then
 LPT-sorts those.  That no-cuts table serves batch-invariant mode and
-coarse checkpoint cadences (cuts may not cross a checkpoint period), so
-ragged batches keep LPT scheduling at the cost of one single-CTA launch.
+coarse checkpoint cadences (cuts may not cross a checkpoint period).
 """
 
 import math
+from typing import NamedTuple
 
 import cuda.bindings.driver as cuda
 
@@ -82,6 +84,8 @@ from cutlass.cute.runtime import from_dlpack
 
 from cudnn.frost.buffers import data_ptr
 
+from .elementwise import softplus
+
 WORK_ITEM_FIELDS = 8
 WARMUP_CAP_CHUNKS = 32  # hard warmup cap: a cut must saturate within one warp of chunks per side
 MAX_BLOCKS = 2048  # piece-count ceiling; host clamps ideal_chunks so the per-tile block count fits
@@ -92,14 +96,13 @@ SCAN_WARPS = 4
 SCAN_THREADS = SCAN_WARPS * WARP_SIZE
 SCAN_ROWS_PER_WARP = 4  # consecutive chunk rows per scan warp
 SCAN_TOKEN_STRIDE = 4  # sample every Nth token of a chunk: skipped tokens only RAISE the negative horizon sums
-ORDER_THREADS = 1024
-ORDER_ELEMS = 4
-ORDER_CAPACITY = (
-    ORDER_THREADS * ORDER_ELEMS
-)  # sort capacity (32 KB SMEM); the kernel always launches — past this the device-side branch copies through unsorted
 OVERHEAD_TOKENS = 256  # per-item fixed cost for the piece model: state reseed + pipeline refill + typical warmup
 P_WINDOW = 16  # fill-regime piece-count search width
 P_BELOW = 8  # how far below the ideal-cap floor the fill-regime search may go
+
+ORDER_THREADS = 1024
+ORDER_ELEMS = 4
+ORDER_CAPACITY = ORDER_THREADS * ORDER_ELEMS  # sort capacity (32 KB SMEM); past this the device-side branch copies through unsorted
 
 DEFAULT_LOG2_THRESHOLD = -10.0 / math.log(2.0)  # e^-10, in log2 units
 RCP_LN2 = 1.4426950408889634  # 1/ln(2): natural-log gates -> the scan's log2 domain
@@ -379,6 +382,7 @@ def scan_kernel(
 def scan_scalar_kernel(
     b_t: cutlass.Constexpr[int],
     log_gate: cutlass.Constexpr[bool],
+    safe_gate: cutlass.Constexpr[bool],
     overhead_chunks: cutlass.Constexpr[int],
     n_heads_out: cutlass.Int32,
     n_tiles: cutlass.Int32,
@@ -386,6 +390,8 @@ def scan_scalar_kernel(
     ideal_chunks: cutlass.Int32,
     batch_size: cutlass.Int32,
     mGate: cute.Tensor,
+    mALog: cute.Tensor | None,
+    mDtBias: cute.Tensor | None,
     mCuSeqlens: cute.Tensor,
     mChunkVals: cute.Tensor,
     mCount: cute.Tensor,
@@ -393,8 +399,11 @@ def scan_scalar_kernel(
     """Scalar-gate scan (GDN): CTA ``(x, hg)`` covers 16 chunk-scratch rows
     for heads ``[hg*32, (hg+1)*32)``; lane ``l`` owns head ``hg*32 + l``, so
     gate reads and chunk-value writes are coalesced across lanes and every
-    lane accumulates its own head — no reduction.  CTA (0, 0) zeroes the
-    item count (the scheduler rings are the order kernel's job)."""
+    lane accumulates its own head — no reduction.  With ``safe_gate`` the
+    gate holds raw logits and each token contributes the GDN transform in
+    log2 domain: ``-exp(A_log[h]) * softplus(g + dt_bias[h]) * RCP_LN2``.
+    CTA (0, 0) zeroes the item count (the scheduler rings are the order
+    kernel's job)."""
     tidx, _, _ = cute.arch.thread_idx()
     bidx = cute.arch.block_idx()
     tidx = cutlass.Int32(tidx)
@@ -405,6 +414,12 @@ def scan_scalar_kernel(
     h = cutlass.Int32(bidx[1]) * cutlass.Int32(WARP_SIZE) + lidx
     h_ok = h < n_heads_out
     h_r = h if h_ok else n_heads_out - cutlass.Int32(1)
+    a_l2 = cutlass.Float32(0.0)
+    bias = cutlass.Float32(0.0)
+    if cutlass.const_expr(safe_gate):
+        # per-head transform constants, fixed for the lane's whole sweep
+        a_l2 = -cute.math.exp2(mALog[h_r].to(cutlass.Float32) * cutlass.Float32(RCP_LN2), fastmath=True) * cutlass.Float32(RCP_LN2)
+        bias = mDtBias[h_r].to(cutlass.Float32)
     row0 = (cutlass.Int32(bidx[0]) * cutlass.Int32(SCAN_WARPS) + widx) * cutlass.Int32(SCAN_ROWS_PER_WARP)
 
     # batch of the warp's first row: largest b with cu[b] // b_t + b <= row0
@@ -442,8 +457,12 @@ def scan_scalar_kernel(
                     inb = pos < batch_end
                     pos_r = pos if inb else batch_start
                     gv = (mGate.iterator + cutlass.Int64(pos_r) * cutlass.Int64(mGate.stride[0]) + h_r).load()
-                    gv = gv if inb else oob
-                    acc = acc + clamped_log2(log_gate, gv)
+                    if cutlass.const_expr(safe_gate):
+                        contrib = a_l2 * softplus(gv + bias)
+                        acc = acc + (contrib if inb else cutlass.Float32(0.0))
+                    else:
+                        gv = gv if inb else oob
+                        acc = acc + clamped_log2(log_gate, gv)
                 if h_ok:
                     mChunkVals[cv_base + c, h] = acc
 
@@ -579,11 +598,14 @@ def write_item(
             mWorkItems[dst, cutlass.Int32(f)] = mStaging[src, cutlass.Int32(f)]
 
 
-@cute.kernel
-def order_kernel(
+@cute.jit
+def order_body(
     gen: cutlass.Constexpr[bool],
     has_sched: cutlass.Constexpr[bool],
     b_t: cutlass.Constexpr[int],
+    n_threads: cutlass.Constexpr[int],
+    order_elems: cutlass.Constexpr[int],
+    tidx,
     n_heads_out: cutlass.Int32,
     n_tiles: cutlass.Int32,
     mCuSeqlens: cute.Tensor,
@@ -591,16 +613,21 @@ def order_kernel(
     mCount: cute.Tensor,
     mWorkItems: cute.Tensor,
     mSched: cute.Tensor | None,
+    sKey,
+    sIdx,
+    sSpread,
 ):
-    """LPT ordering (single CTA): bitonic-sort the items by span ``cend -
-    cstart``, longest first, into the final table, so the ticket scheduler
-    starts the big items before the filler.  Sorts the walk's staged items,
-    or with ``gen`` synthesizes the uncut whole-sequence item per (batch,
-    head) from ``cu_seqlens`` directly — the no-cuts table.  Thread 0 also
-    zeroes every ``sched_ctr`` cell (the main kernels' ticket rings, dirty
-    on exit): this kernel runs on every table build, split or not."""
-    tidx, _, _ = cute.arch.thread_idx()
-    tidx = cutlass.Int32(tidx)
+    """LPT ordering body over ``n_threads`` CTA threads and caller-owned SMEM
+    staging (``sKey``/``sIdx`` of ``n_threads * order_elems`` Int32 cells +
+    a 2-cell ``sSpread``): bitonic-sort the items by span ``cend - cstart``,
+    longest first, into the final table.  Sorts the walk's staged items, or
+    with ``gen`` synthesizes the uncut whole-sequence item per (batch, head)
+    from ``cu_seqlens`` directly — the no-cuts table.  Thread 0 also zeroes
+    every ``sched_ctr`` cell (the main kernels' ticket rings, dirty on exit).
+    Runs on the standalone :func:`order_kernel` CTA, or fused into a main
+    kernel's CTA 0 prologue.  Internally CTA-wide-barriers; every thread of
+    the calling CTA must reach it."""
+    capacity = cutlass.const_expr(n_threads * order_elems)
     if cutlass.const_expr(has_sched):
         if tidx == 0:
             si = cutlass.Int32(0)
@@ -613,15 +640,12 @@ def order_kernel(
             mCount[0] = n_tiles
     else:
         n = mCount[0]
-    if n > cutlass.Int32(ORDER_CAPACITY):
+    if n > cutlass.Int32(capacity):
         i = tidx
         while i < n:
             write_item(gen, b_t, n_heads_out, mCuSeqlens, mStaging, mWorkItems, i, i)
-            i = i + cutlass.Int32(ORDER_THREADS)
+            i = i + cutlass.Int32(n_threads)
     else:
-        sKey = cutlass.Array(cutlass.Int32, ORDER_CAPACITY, space=cutlass.AddressSpace.smem, alignment=16)
-        sIdx = cutlass.Array(cutlass.Int32, ORDER_CAPACITY, space=cutlass.AddressSpace.smem, alignment=16)
-        sSpread = cutlass.Array(cutlass.Int32, 2, space=cutlass.AddressSpace.smem, alignment=8)
         if tidx == 0:
             sSpread[0] = cutlass.Int32(2147483647)
             sSpread[1] = cutlass.Int32(-2147483648)
@@ -631,8 +655,8 @@ def order_kernel(
         nvvm.barrier_cta_sync()
         kmin = cutlass.Int32(2147483647)
         kmax = cutlass.Int32(-2147483648)
-        for e in cutlass.range_constexpr(ORDER_ELEMS):
-            i = tidx + cutlass.Int32(e * ORDER_THREADS)
+        for e in cutlass.range_constexpr(order_elems):
+            i = tidx + cutlass.Int32(e * n_threads)
             if i < n:
                 if cutlass.const_expr(gen):
                     batch_idx, head_idx, batch_start, batch_end, num_chunks_b = gen_item_bounds(b_t, n_heads_out, mCuSeqlens, i)
@@ -655,14 +679,14 @@ def order_kernel(
             i2 = tidx
             while i2 < n:
                 write_item(gen, b_t, n_heads_out, mCuSeqlens, mStaging, mWorkItems, i2, i2)
-                i2 = i2 + cutlass.Int32(ORDER_THREADS)
+                i2 = i2 + cutlass.Int32(n_threads)
         else:
             k = cutlass.Int32(2)
             while k <= b_pad:
                 j = k // cutlass.Int32(2)
                 while j > 0:
-                    for e in cutlass.range_constexpr(ORDER_ELEMS):
-                        i = tidx + cutlass.Int32(e * ORDER_THREADS)
+                    for e in cutlass.range_constexpr(order_elems):
+                        i = tidx + cutlass.Int32(e * n_threads)
                         if i < b_pad:
                             l = i ^ j
                             if l > i:
@@ -680,8 +704,8 @@ def order_kernel(
                     nvvm.barrier_cta_sync()
                     j = j // cutlass.Int32(2)
                 k = k * cutlass.Int32(2)
-            for e in cutlass.range_constexpr(ORDER_ELEMS):
-                i = tidx + cutlass.Int32(e * ORDER_THREADS)
+            for e in cutlass.range_constexpr(order_elems):
+                i = tidx + cutlass.Int32(e * n_threads)
                 if i < n:
                     src = sIdx[i]
                     write_item(gen, b_t, n_heads_out, mCuSeqlens, mStaging, mWorkItems, i, src)
@@ -745,6 +769,7 @@ def launch(
             scan_scalar_kernel(
                 b_t,
                 log_gate,
+                safe_gate,
                 overhead_chunks,
                 n_heads_out,
                 n_tiles,
@@ -752,6 +777,8 @@ def launch(
                 ideal_chunks,
                 batch_size,
                 mGate,
+                mALog,
+                mDtBias,
                 mCuSeqlens,
                 mChunkVals,
                 mCount,
@@ -777,25 +804,54 @@ def launch(
             block=(THREADS_PER_BLOCK, 1, 1),
             stream=stream,
         )
-    order_kernel(
-        not split,
-        has_sched,
-        b_t,
-        n_heads_out,
-        n_tiles,
-        mCuSeqlens,
-        mStaging,
-        mCount,
-        mWorkItems,
-        mSched,
-    ).launch(
-        grid=(1, 1, 1),
-        block=(ORDER_THREADS, 1, 1),
-        stream=stream,
-    )
 
 
 compiled_cache = {}
+
+
+class TableRecipe(NamedTuple):
+    """Build-time facts of one split-table launch: everything static is
+    settled once so :func:`run_table` can replay the call as a straight
+    line.  Produced by :func:`build_split_table`."""
+
+    compiled: object
+    split: bool
+    safe_gate: bool
+    n_heads_out: int
+    n_tiles: int
+    num_sms: int
+    ideal_chunks: int
+    batch_size: int
+    log2_threshold: float
+    gate_scale_log2: float
+    n_scan_ctas: int
+    n_walk_ctas: int
+
+
+def run_table(r, gate, a_log, dt_bias, cu_seqlens, chunk_scratch, item_scratch, work_items, work_count, sched_ctr, stream) -> None:
+    """The lowered split-table launch: no validation, no key build.  Only
+    buffers move between calls; every scalar comes from the recipe."""
+    r.compiled(
+        r.n_heads_out,
+        r.n_tiles,
+        r.num_sms,
+        r.ideal_chunks,
+        r.batch_size,
+        r.log2_threshold,
+        r.gate_scale_log2,
+        gate if r.split else None,
+        a_log if r.safe_gate else None,
+        dt_bias if r.safe_gate else None,
+        cu_seqlens,
+        chunk_scratch if r.split else None,
+        item_scratch if r.split else None,
+        work_items,
+        work_count,
+        sched_ctr,
+        r.n_scan_ctas,
+        r.n_walk_ctas,
+        cuda.CUstream(int(stream)),
+    )
 
 
 def build_split_table(
@@ -819,16 +875,17 @@ def build_split_table(
     sched_ctr=None,
     split=True,
     stream,
-) -> None:
+) -> "TableRecipe":
     """Fill ``work_items``/``work_count`` with the split-K partition of
     ``gate`` / ``cu_seqlens (B+1,) int32``, LPT-ordered (longest item
     first).  A 2-D ``(total_tokens, HO)`` gate is the scalar GDN kind; a
     3-D ``(total_tokens, HO, DK)`` gate is the per-key-channel KDA / GDN-2
     kind.  With ``log_gate`` the gate values are natural-log decay instead
-    of raw linear alpha.  With ``safe_gate`` (per-channel only) the gate
-    holds RAW logits and the scan applies the KDA safe-gate transform
-    ``gate_lower_bound * sigmoid(exp(a_log) * (g + dt_bias))`` per element,
-    so cuts land on true decay values.
+    of raw linear alpha.  With ``safe_gate`` the gate holds RAW logits and
+    the scan applies the matching transform so cuts land on true decay
+    values: per-channel (KDA / GDN-2, ``gate_lower_bound`` required)
+    ``gate_lower_bound * sigmoid(exp(a_log) * (g + dt_bias))`` per element;
+    scalar (GDN) ``-exp(a_log[h]) * softplus(g + dt_bias[h])`` per head.
 
     With ``split=False`` the scan and walk never launch: the order kernel
     alone synthesizes the no-cuts table — the uncut whole-sequence item per
@@ -853,14 +910,14 @@ def build_split_table(
     if len(gate.shape) not in (2, 3):
         raise ValueError(f"gate must be (total_tokens, HO) or (total_tokens, HO, DK), got {tuple(gate.shape)}")
     gate_channels = gate.shape[2] if len(gate.shape) == 3 else 0
-    if safe_gate and gate_channels == 0:
-        raise ValueError("safe_gate applies to per-channel gates only")
-    if safe_gate and (a_log is None or dt_bias is None or gate_lower_bound is None):
-        raise ValueError("safe_gate requires a_log, dt_bias, and gate_lower_bound")
+    if safe_gate and (a_log is None or dt_bias is None):
+        raise ValueError("safe_gate requires a_log and dt_bias")
+    if safe_gate and gate_channels > 0 and gate_lower_bound is None:
+        raise ValueError("per-channel safe_gate requires gate_lower_bound")
     if not safe_gate:
         a_log = None
         dt_bias = None
-    gate_scale_log2 = float(gate_lower_bound) * RCP_LN2 if safe_gate else 0.0
+    gate_scale_log2 = float(gate_lower_bound) * RCP_LN2 if safe_gate and gate_channels > 0 else 0.0
     n_heads_out = gate.shape[1]
     batch_size = cu_seqlens.shape[0] - 1
     if split:
@@ -880,9 +937,6 @@ def build_split_table(
                 f"item_scratch must match work_items (max_items, {WORK_ITEM_FIELDS}) int32, got {tuple(item_scratch.shape)} vs {tuple(work_items.shape)}"
             )
     else:
-        # no-cuts table: the order kernel synthesizes it from cu_seqlens; the
-        # gate and every scan/walk operand are unused (normalized out of the
-        # compile key so all variants share one specialization per b_t/HO)
         if work_items.shape[0] < n_tiles or work_items.shape[1] != WORK_ITEM_FIELDS:
             raise ValueError(f"work_items must be (>= {n_tiles}, {WORK_ITEM_FIELDS}) int32, got {tuple(work_items.shape)}")
         log_gate = False
@@ -968,4 +1022,18 @@ def build_split_table(
         n_scan_ctas,
         n_walk_ctas,
         cu_stream,
+    )
+    return TableRecipe(
+        compiled_cache[key],
+        bool(split),
+        bool(safe_gate),
+        n_heads_out,
+        n_tiles,
+        num_sms,
+        int(ideal_chunks),
+        batch_size,
+        float(log2_threshold),
+        float(gate_scale_log2),
+        n_scan_ctas,
+        n_walk_ctas,
     )

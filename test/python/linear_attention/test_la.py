@@ -787,55 +787,84 @@ def test_checkpoints_coarse_cadence(backend, variant, ckpt_mult):
 def safe_gate_case(variant, T=256, H=2, K=128, V=128, seed=SEED + 7):
     case = make_case(variant, torch.bfloat16, T=T, H=H, K=K, V=V, seed=seed)
     set_seed(seed + 1)
-    graw = torch.randn(1, T, case.HO, K, device="cuda", dtype=torch.float32)
+    if variant == "gdn":
+        # scalar per-head gate: -exp(a_log[h]) * softplus(g + dt_bias[h])
+        graw = torch.randn(1, T, case.HO, device="cuda", dtype=torch.float32)
+        dt_bias = torch.zeros(case.HO, dtype=torch.float32, device="cuda")
+    else:
+        graw = torch.randn(1, T, case.HO, K, device="cuda", dtype=torch.float32)
+        dt_bias = torch.zeros(case.HO, K, dtype=torch.float32, device="cuda")
     a_log = torch.zeros(case.HO, dtype=torch.float32, device="cuda")
-    dt_bias = torch.zeros(case.HO, K, dtype=torch.float32, device="cuda")
     return case, graw, a_log, dt_bias
 
 
-@pytest.mark.parametrize("variant", ["kda", "gdn2"])
+@pytest.mark.parametrize("variant", VARIANTS)
 def test_safe_gate_forward_parity(backend, variant):
     """Raw logits with a_log = 0 / dt_bias = 0 match the post-activation path
-    fed the host-side transform ``lb * sigmoid(g)``."""
+    fed the host-side transform (``lb * sigmoid(g)``, or ``-softplus(g)`` for
+    GDN's scalar gate)."""
     lb = -5.0
     case, graw, a_log, dt_bias = safe_gate_case(variant)
     kw = dict(output_final_state=True, use_qk_l2norm_in_kernel=True)
-    raw_kw = dict(kw, safe_gate=True, gate_lower_bound=lb, a_log=a_log, dt_bias=dt_bias)
+    raw_kw = dict(kw, safe_gate=True, a_log=a_log, dt_bias=dt_bias)
+    if variant != "gdn":
+        raw_kw["gate_lower_bound"] = lb
     raw_gates = dict(case.gates, g=graw)
-    if variant == "kda":
+    if variant in ("gdn", "kda"):
         braw = torch.randn(1, case.T, case.HO, device="cuda").to(case.dtype)
         raw_gates["beta"] = braw
         raw_kw["use_beta_sigmoid_in_kernel"] = True
         eff_beta = braw.float().sigmoid()
     else:
         eff_beta = case.gates["beta"]
+    g_eff = -F.softplus(graw) if variant == "gdn" else lb * torch.sigmoid(graw)
     raw_case = case.clone(gates=raw_gates)
-    eff_case = case.clone(gates=dict(case.gates, g=lb * torch.sigmoid(graw), beta=eff_beta))
+    eff_case = case.clone(gates=dict(case.gates, g=g_eff, beta=eff_beta))
     o_raw, fs_raw = run_fwd(backend, raw_case, **raw_kw)
     o_eff, fs_eff = run_fwd(backend, eff_case, **kw)
     check("o", o_raw, o_eff.double(), 2e-2)
     assert rms_ratio(fs_raw, fs_eff) < 2e-2
 
 
-@pytest.mark.parametrize("variant", ["kda", "gdn2"])
-def test_safe_gate_backward_raises(backend, variant):
-    """Raw-logit gate modes are forward-only by contract."""
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_safe_gate_backward(backend, variant):
+    """Fused-gate training: dG comes back in raw-logit space and the
+    parameter gradients satisfy their exact identities over dG
+    (d_dt_bias = sum dg_raw; d_a_log = sum dg_raw * (g + dt_bias) per-channel,
+    or sum dg_raw * softplus(y) / sigmoid(y) for GDN's scalar gate)."""
     lb = -5.0
     case, graw, a_log, dt_bias = safe_gate_case(variant, T=128)
+    set_seed(SEED + 9)
+    a_leaf = (torch.randn_like(a_log) * 0.3).requires_grad_(True)
+    dt_leaf = (torch.randn_like(dt_bias) * 0.3).requires_grad_(True)
     raw_gates = dict(case.gates, g=graw)
-    kw = dict(safe_gate=True, gate_lower_bound=lb, a_log=a_log, dt_bias=dt_bias, use_qk_l2norm_in_kernel=True)
-    if variant == "kda":
+    kw = dict(safe_gate=True, a_log=a_leaf, dt_bias=dt_leaf, use_qk_l2norm_in_kernel=True)
+    if variant != "gdn":
+        kw["gate_lower_bound"] = lb
+    if variant in ("gdn", "kda"):
         raw_gates["beta"] = torch.randn(1, case.T, case.HO, device="cuda").to(case.dtype)
         kw["use_beta_sigmoid_in_kernel"] = True
     raw_case = case.clone(gates=raw_gates)
     g_leaf = to_thd(raw_gates["g"]).detach().clone().requires_grad_(True)
-    args = [to_thd(raw_case.q).detach().clone().requires_grad_(True), to_thd(raw_case.k), to_thd(raw_case.v), g_leaf, to_thd(raw_gates["beta"])]
+    beta_leaf = to_thd(raw_gates["beta"]).detach().clone().requires_grad_(True)
+    args = [to_thd(raw_case.q).detach().clone().requires_grad_(True), to_thd(raw_case.k), to_thd(raw_case.v), g_leaf, beta_leaf]
     if variant == "gdn2":
         args.append(to_thd(raw_gates["w"]))
     with waive_unsupported(backend, variant):
         o, _ = pinned_op(backend, variant)(*args, case.cu, **kw)
-    with pytest.raises(NotImplementedError, match="forward-only"):
         o.sum().backward()
+    dg_raw = g_leaf.grad.double()
+    ddt_id = dg_raw.sum(0)
+    if variant == "gdn":
+        y = g_leaf.detach().double() + dt_leaf.detach().double()[None]
+        da_id = (dg_raw * (F.softplus(y) / torch.sigmoid(y))).sum(0)
+    else:
+        da_id = (dg_raw * (g_leaf.detach().double() + dt_leaf.detach().double()[None])).sum(dim=(0, 2))
+    for name, got, ident in (("d_dt_bias", dt_leaf.grad.double(), ddt_id), ("d_a_log", a_leaf.grad.double(), da_id)):
+        scale = max(ident.abs().max().item(), 1e-6)
+        assert (got - ident).abs().max().item() / scale < 1e-4, name
+    for name, leaf in (("dq", args[0]), ("dbeta", beta_leaf)):
+        assert leaf.grad is not None and bool(torch.isfinite(leaf.grad).all()), name
 
 
 def test_beta_sigmoid_in_kernel(backend):
@@ -850,6 +879,57 @@ def test_beta_sigmoid_in_kernel(backend):
     o_eff, fs_eff = run_fwd(backend, eff_case, output_final_state=True)
     check("o", o_raw, o_eff.double(), 2e-2)
     assert rms_ratio(fs_raw, fs_eff) < 2e-2
+
+
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_beta_sigmoid_backward(backend, variant):
+    """The in-kernel Beta sigmoid returns the gradient wrt the raw logit, so
+    dbeta must equal the post-activation path's dbeta times s * (1 - s) at the
+    io-rounded s the forward stores."""
+    case = make_case(variant, torch.bfloat16, T=256)
+    set_seed(SEED + 13)
+    braw = torch.randn_like(case.gates["beta"].float()).to(case.dtype)
+    s_io = torch.sigmoid(braw.float()).to(case.dtype)
+
+    def dbeta(beta, **kw):
+        leaf = to_thd(beta).detach().clone().requires_grad_(True)
+        args = [to_thd(case.q), to_thd(case.k), to_thd(case.v), to_thd(case.gates["g"]), leaf]
+        if variant == "gdn2":
+            args.append(to_thd(case.gates["w"]))
+        with waive_unsupported(backend, variant):
+            o, _ = pinned_op(backend, variant)(*args, case.cu, **kw)
+            o.sum().backward()
+        return leaf.grad.double()
+
+    got = dbeta(braw, use_beta_sigmoid_in_kernel=True)
+    s = to_thd(s_io).double()
+    ident = dbeta(s_io.to(case.gates["beta"].dtype)) * s * (1 - s)
+    scale = ident.abs().max().item()
+    assert scale > 1e-3, "dbeta is ~0, the comparison would be vacuous"
+    assert (got - ident).abs().max().item() / scale < 2e-2
+
+
+@pytest.mark.parametrize("H", (40, 160))
+def test_scalar_gate_head_tiling(backend, H):
+    """GDN's scalar gate-parameter reduction tiles heads; the dA_log /
+    ddt_bias identities must hold past one tile and past 128 heads."""
+    case, graw, a_log, dt_bias = safe_gate_case("gdn", T=128, H=H)
+    set_seed(SEED + 15)
+    a_leaf = (torch.randn_like(a_log) * 0.3).requires_grad_(True)
+    dt_leaf = (torch.randn_like(dt_bias) * 0.3).requires_grad_(True)
+    g_leaf = to_thd(graw).detach().clone().requires_grad_(True)
+    args = [to_thd(case.q), to_thd(case.k), to_thd(case.v), g_leaf, to_thd(case.gates["beta"])]
+    with waive_unsupported(backend, "gdn"):
+        o, _ = pinned_op(backend, "gdn")(*args, case.cu, safe_gate=True, a_log=a_leaf, dt_bias=dt_leaf, use_qk_l2norm_in_kernel=True)
+        o.sum().backward()
+    dg_raw = g_leaf.grad.double()
+    y = g_leaf.detach().double() + dt_leaf.detach().double()[None]
+    for name, got, ident in (
+        ("d_dt_bias", dt_leaf.grad.double(), dg_raw.sum(0)),
+        ("d_a_log", a_leaf.grad.double(), (dg_raw * (F.softplus(y) / torch.sigmoid(y))).sum(0)),
+    ):
+        scale = max(ident.abs().max().item(), 1e-6)
+        assert (got - ident).abs().max().item() / scale < 1e-4, name
 
 
 # ---------------------------------------------------------------------------

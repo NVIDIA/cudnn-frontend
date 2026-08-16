@@ -78,6 +78,11 @@ def gdn2_reference(
     scale: Optional[float] = None,
     initial_state: Optional[torch.Tensor] = None,
     cu_seqlens: Optional[torch.Tensor] = None,
+    safe_gate: bool = False,
+    gate_lower_bound: Optional[float] = None,
+    a_log: Optional[torch.Tensor] = None,
+    dt_bias: Optional[torch.Tensor] = None,
+    use_beta_sigmoid: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """GDN-2 reference.
 
@@ -90,6 +95,11 @@ def gdn2_reference(
         initial_state: ``[B, HO, K, V]`` (or ``[N, HO, K, V]`` with cu_seqlens),
             K-major.
         cu_seqlens: packed varlen boundaries (requires B == 1).
+        safe_gate: treat ``g`` as raw logits and use the log decay
+            ``gate_lower_bound * sigmoid(exp(a_log) * (g + dt_bias))``
+            (differentiable; a_log ``[Hg]``, dt_bias ``[Hg, K]``).
+        gate_lower_bound: safe-gate lower bound in log space (default -5.0).
+        use_beta_sigmoid: treat ``beta`` as raw logits; apply ``sigmoid``.
 
     Returns:
         ``(o, final_state)`` in fp64: o ``[B, T, HO, V]``, final_state
@@ -104,8 +114,14 @@ def gdn2_reference(
     qf = q.double() * scale
     kf = k.double()
     vf = v.double()
-    alphaf = g.double().exp()  # [B, T, HO, K]
+    gf = g.double()
+    if safe_gate:
+        lb = -5.0 if gate_lower_bound is None else float(gate_lower_bound)
+        gf = lb * torch.sigmoid(a_log.double().exp()[:, None] * (gf + dt_bias.double()))
+    alphaf = gf.exp()  # [B, T, HO, K]
     betaf = beta.double()  # [B, T, HO, K]
+    if use_beta_sigmoid:
+        betaf = betaf.sigmoid()
     wf = w.double()  # [B, T, HO, V]
     # expand tensors for grouped heads (view, no copy), as in the sdpa references
     if q.shape[2] != HO:

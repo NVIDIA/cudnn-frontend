@@ -60,6 +60,10 @@ def gdn_reference(
     scale: Optional[float] = None,
     initial_state: Optional[torch.Tensor] = None,
     cu_seqlens: Optional[torch.Tensor] = None,
+    safe_gate: bool = False,
+    a_log: Optional[torch.Tensor] = None,
+    dt_bias: Optional[torch.Tensor] = None,
+    use_beta_sigmoid: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """GDN reference.
 
@@ -69,6 +73,10 @@ def gdn_reference(
         scale: applied to q; defaults to ``1/sqrt(K)``.
         initial_state: ``[B, HO, K, V]`` (or ``[N, HO, K, V]`` with cu_seqlens).
         cu_seqlens: packed varlen boundaries (requires B == 1).
+        safe_gate: treat ``g`` as raw logits and use the log decay
+            ``-exp(a_log) * softplus(g + dt_bias)`` (differentiable; a_log /
+            dt_bias are per-head ``[Hg]``).
+        use_beta_sigmoid: treat ``beta`` as raw logits; apply ``sigmoid``.
 
     Returns:
         ``(o, final_state)`` in fp64: o ``[B, T, HO, V]``, final_state
@@ -83,8 +91,13 @@ def gdn_reference(
     qf = q.double() * scale
     kf = k.double()
     vf = v.double()
-    alphaf = g.double().exp()
+    gf = g.double()
+    if safe_gate:
+        gf = -a_log.double().exp() * torch.nn.functional.softplus(gf + dt_bias.double())
+    alphaf = gf.exp()
     betaf = beta.double()
+    if use_beta_sigmoid:
+        betaf = betaf.sigmoid()
     # expand tensors for grouped heads (view, no copy), as in the sdpa references
     if q.shape[2] != HO:
         qf = qf.unsqueeze(3).expand(-1, -1, -1, HO // q.shape[2], -1).reshape(q.shape[0], q.shape[1], HO, -1)

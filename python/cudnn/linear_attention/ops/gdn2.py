@@ -132,6 +132,7 @@ def _make_fprop_cache_key(
     output_final_state,
     use_qk_l2norm,
     batch_invariant,
+    use_beta_sigmoid,
     safe_gate,
     gate_lower_bound,
     has_initial_state,
@@ -158,6 +159,7 @@ def _make_fprop_cache_key(
         bool(output_final_state),
         bool(use_qk_l2norm),
         bool(batch_invariant),
+        bool(use_beta_sigmoid),
         bool(safe_gate),
         float(gate_lower_bound) if gate_lower_bound is not None else None,
         bool(has_initial_state),
@@ -188,6 +190,9 @@ def _make_bprop_cache_key(
     scale,
     use_qk_l2norm,
     batch_invariant,
+    use_beta_sigmoid,
+    safe_gate,
+    gate_lower_bound,
     device,
     plan_name,
 ):
@@ -213,6 +218,9 @@ def _make_bprop_cache_key(
         float(scale),
         bool(use_qk_l2norm),
         bool(batch_invariant),
+        bool(use_beta_sigmoid),
+        bool(safe_gate),
+        float(gate_lower_bound) if gate_lower_bound is not None else None,
         device,
         plan_name,
     )
@@ -243,6 +251,7 @@ def _build_fprop_graph(
     safe_gate,
     gate_lower_bound,
     ckpt,
+    use_beta_sigmoid=False,
 ):
     graph = cudnn.pygraph()
     HO = max(H, HV)
@@ -276,6 +285,7 @@ def _build_fprop_graph(
         output_final_state=output_final_state,
         use_qk_l2norm=use_qk_l2norm,
         batch_invariant=batch_invariant,
+        use_beta_sigmoid=use_beta_sigmoid or None,
         safe_gate=safe_gate,
         gate_lower_bound=gate_lower_bound,
         checkpoint_every_n_tokens=ckpt,
@@ -317,6 +327,7 @@ def _gdn2_fwd(
     output_final_state: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
     batch_invariant: bool = False,
+    use_beta_sigmoid_in_kernel: bool = False,
     safe_gate: bool = False,
     gate_lower_bound: Optional[float] = None,
     a_log: Optional[torch.Tensor] = None,
@@ -392,6 +403,7 @@ def _gdn2_fwd(
         output_final_state,
         use_qk_l2norm_in_kernel,
         batch_invariant,
+        use_beta_sigmoid_in_kernel,
         safe_gate,
         gate_lower_bound,
         state0 is not None,
@@ -420,6 +432,7 @@ def _gdn2_fwd(
             bool(safe_gate),
             float(gate_lower_bound) if gate_lower_bound is not None else None,
             ckpt,
+            use_beta_sigmoid=bool(use_beta_sigmoid_in_kernel),
         )
         select_plan(_fprop_cache[cache_key][0], plan_name)
 
@@ -468,6 +481,7 @@ def _gdn2_fwd_fake(
     output_final_state=False,
     use_qk_l2norm_in_kernel=False,
     batch_invariant=False,
+    use_beta_sigmoid_in_kernel=False,
     safe_gate=False,
     gate_lower_bound=None,
     a_log=None,
@@ -502,7 +516,26 @@ def _gdn2_fwd_fake(
 
 
 def _build_bprop_graph(
-    total, N, H, HK, HV, K, V, io_dtype, g_dtype, gate_dtype, state_dtype, dstate_in_dtype, cu_dtype, ckpt_rows, scale, use_qk_l2norm, batch_invariant
+    total,
+    N,
+    H,
+    HK,
+    HV,
+    K,
+    V,
+    io_dtype,
+    g_dtype,
+    gate_dtype,
+    state_dtype,
+    dstate_in_dtype,
+    cu_dtype,
+    ckpt_rows,
+    scale,
+    use_qk_l2norm,
+    batch_invariant,
+    use_beta_sigmoid=False,
+    safe_gate=False,
+    gate_lower_bound=None,
 ):
     graph = cudnn.pygraph()
     HO = max(H, HV)
@@ -523,7 +556,12 @@ def _build_bprop_graph(
     ckpts_t = None
     if ckpt_rows is not None:
         ckpts_t = graph.tensor([ckpt_rows, HO, K, V], data_type=io_dtype, name="state_checkpoints")
-    dQ_t, dK_t, dV_t, dG_t, dBeta_t, dW_t, dstate0_t = graph.gdn2_bwd(
+    a_log_t = None
+    dt_bias_t = None
+    if safe_gate:
+        a_log_t = graph.tensor([HO], data_type=cudnn.data_type.FLOAT, name="a_log")
+        dt_bias_t = graph.tensor([HO, K], data_type=cudnn.data_type.FLOAT, name="dt_bias")
+    dQ_t, dK_t, dV_t, dG_t, dBeta_t, dW_t, dstate0_t, dA_t, dDt_t = graph.gdn2_bwd(
         q=q_t,
         k=k_t,
         v=v_t,
@@ -535,9 +573,14 @@ def _build_bprop_graph(
         state_checkpoints=ckpts_t,
         initial_state=state0_t,
         d_final_state=dfs_t,
+        a_log=a_log_t,
+        dt_bias=dt_bias_t,
         scale=scale,
         use_qk_l2norm=use_qk_l2norm,
         batch_invariant=batch_invariant,
+        use_beta_sigmoid=use_beta_sigmoid or None,
+        safe_gate=safe_gate or None,
+        gate_lower_bound=gate_lower_bound,
         name="gdn2_bwd",
     )
     return graph, dict(
@@ -551,6 +594,8 @@ def _build_bprop_graph(
         dO=dO_t,
         state0=state0_t,
         dfs=dfs_t,
+        a_log=a_log_t,
+        dt_bias=dt_bias_t,
         dQ=dQ_t,
         dK=dK_t,
         dV=dV_t,
@@ -558,6 +603,8 @@ def _build_bprop_graph(
         dBeta=dBeta_t,
         dW=dW_t,
         dstate0=dstate0_t,
+        d_a_log=dA_t,
+        d_dt_bias=dDt_t,
         ckpts=ckpts_t,
     )
 
@@ -583,15 +630,24 @@ def _gdn2_bwd(
     state_checkpoints: Optional[torch.Tensor] = None,
     use_qk_l2norm_in_kernel: bool = False,
     batch_invariant: bool = False,
+    use_beta_sigmoid_in_kernel: bool = False,
+    safe_gate: bool = False,
+    gate_lower_bound: Optional[float] = None,
+    a_log: Optional[torch.Tensor] = None,
+    dt_bias: Optional[torch.Tensor] = None,
     plan_name: Optional[str] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """GDN-2 backward (internal): a cached single-node GDN2_BWD pygraph, THD layout.
 
     ``state_checkpoints`` is the forward's per-chunk state series (io dtype,
     chunk cadence); when given, the engine consumes it instead of running
     the checkpoint recompute pass. Returns ``(dq, dk, dv, dg, dbeta, dw,
-    d_initial_state)``; ``d_initial_state`` is a zero-size tensor when
-    ``initial_state`` is ``None``.
+    d_initial_state, d_a_log, d_dt_bias)``; ``d_initial_state`` is a
+    zero-size tensor when ``initial_state`` is ``None``, and ``d_a_log`` /
+    ``d_dt_bias`` are zero-size tensors unless ``safe_gate``. With
+    ``safe_gate``, ``g`` is the raw logits and ``dg`` is the raw-logit
+    gradient; with ``use_beta_sigmoid_in_kernel``, ``beta`` is io-dtype
+    logits and ``dbeta`` is the raw-logit gradient.
     """
     total, H, K = q.shape
     # autograd materializes reduction grads as broadcast (stride-0)
@@ -613,6 +669,13 @@ def _gdn2_bwd(
     _check_dtype("g", g, torch.float32)
     _check_dtype("beta", beta, q.dtype)
     _check_dtype("w", w, q.dtype)
+    if safe_gate:
+        if a_log is None or dt_bias is None:
+            raise ValueError("gated_delta_net_v2: safe_gate requires a_log and dt_bias")
+        _check_dtype("a_log", a_log, torch.float32)
+        _check_dtype("dt_bias", dt_bias, torch.float32)
+    elif a_log is not None or dt_bias is not None:
+        raise ValueError("gated_delta_net_v2: a_log/dt_bias require safe_gate=True")
     if initial_state is not None:
         _check_dtype("initial_state", initial_state, torch.float32)
         if initial_state.shape[0] != N:
@@ -631,6 +694,8 @@ def _gdn2_bwd(
         ("dO", dO),
         ("d_final_state", d_final_state),
         ("state_checkpoints", state_checkpoints),
+        ("a_log", a_log),
+        ("dt_bias", dt_bias),
     ):
         if _t is not None and _t.device != device:
             raise ValueError(f"gated_delta_net_v2: {_name} must be on q's device ({device}); got {_t.device}")
@@ -658,6 +723,9 @@ def _gdn2_bwd(
         scale,
         use_qk_l2norm_in_kernel,
         batch_invariant,
+        use_beta_sigmoid_in_kernel,
+        safe_gate,
+        gate_lower_bound,
         device,
         plan_name,
     )
@@ -680,6 +748,9 @@ def _gdn2_bwd(
             float(scale),
             bool(use_qk_l2norm_in_kernel),
             bool(batch_invariant),
+            use_beta_sigmoid=bool(use_beta_sigmoid_in_kernel),
+            safe_gate=bool(safe_gate),
+            gate_lower_bound=float(gate_lower_bound) if gate_lower_bound is not None else None,
         )
         select_plan(_bprop_cache[cache_key][0], plan_name)
 
@@ -716,10 +787,19 @@ def _gdn2_bwd(
         variant_pack[t["dfs"]] = dstate_in
     if state_checkpoints is not None:
         variant_pack[t["ckpts"]] = state_checkpoints
+    d_a_log = torch.empty(0, dtype=torch.float32, device=device)
+    d_dt_bias = torch.empty(0, dtype=torch.float32, device=device)
+    if safe_gate:
+        variant_pack[t["a_log"]] = a_log
+        variant_pack[t["dt_bias"]] = dt_bias
+        d_a_log = torch.empty(HO, dtype=torch.float32, device=device)
+        d_dt_bias = torch.empty(HO, K, dtype=torch.float32, device=device)
+        variant_pack[t["d_a_log"]] = d_a_log
+        variant_pack[t["d_dt_bias"]] = d_dt_bias
     graph.execute(variant_pack, workspace=_graph_workspace(graph, device), handle=_get_handle(device))
     if dstate0 is None:
         dstate0 = torch.empty(0, dtype=torch.float32, device=device)
-    return dq, dk, dv, dg, dbeta, dw, dstate0
+    return dq, dk, dv, dg, dbeta, dw, dstate0, d_a_log, d_dt_bias
 
 
 @_gdn2_bwd.register_fake
@@ -738,9 +818,18 @@ def _gdn2_bwd_fake(
     state_checkpoints=None,
     use_qk_l2norm_in_kernel=False,
     batch_invariant=False,
+    use_beta_sigmoid_in_kernel=False,
+    safe_gate=False,
+    gate_lower_bound=None,
+    a_log=None,
+    dt_bias=None,
     plan_name=None,
 ):
+    if safe_gate and (a_log is None or dt_bias is None):
+        raise ValueError("gated_delta_net_v2: safe_gate requires a_log and dt_bias")
     dstate0 = torch.empty_like(initial_state) if initial_state is not None else q.new_empty(0, dtype=torch.float32)
+    d_a_log = torch.empty_like(a_log) if safe_gate else q.new_empty(0, dtype=torch.float32)
+    d_dt_bias = torch.empty_like(dt_bias) if safe_gate else q.new_empty(0, dtype=torch.float32)
     return (
         torch.empty_like(q),
         torch.empty_like(k),
@@ -749,6 +838,8 @@ def _gdn2_bwd_fake(
         torch.empty_like(beta),
         torch.empty_like(w),
         dstate0,
+        d_a_log,
+        d_dt_bias,
     )
 
 
@@ -771,6 +862,7 @@ def _gdn2_setup_context(ctx, inputs, output):
         output_final_state,
         use_qk_l2norm_in_kernel,
         batch_invariant,
+        use_beta_sigmoid_in_kernel,
         safe_gate,
         gate_lower_bound,
         a_log,
@@ -779,35 +871,41 @@ def _gdn2_setup_context(ctx, inputs, output):
         plan_name,
     ) = inputs
     # save_for_backward cannot hold None; keep initial_state as an attribute.
+    # g/beta are saved as passed: raw logits under safe_gate / use_beta_sigmoid.
     saved = [q, k, v, g, beta, w, cu_seqlens]
     ctx.ckpt_reuse = checkpoint_every_n_tokens == 16 and output[2].numel() > 0
     if ctx.ckpt_reuse:
         saved.append(output[2])
+    if safe_gate:
+        saved.extend([a_log, dt_bias])
     ctx.save_for_backward(*saved)
     ctx.initial_state = initial_state
     ctx.scale = scale
     ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
     ctx.batch_invariant = batch_invariant
     ctx.plan_name = plan_name
+    ctx.use_beta_sigmoid_in_kernel = bool(use_beta_sigmoid_in_kernel)
     ctx.safe_gate = bool(safe_gate)
+    ctx.gate_lower_bound = gate_lower_bound
     ctx.set_materialize_grads(False)
     ctx.mark_non_differentiable(output[2])
 
 
 def _gdn2_backward(ctx, dO, dFinal, _dstate_checkpoints):
+    a_log = dt_bias = None
     if ctx.safe_gate:
-        raise NotImplementedError("gated_delta_net_v2: safe_gate is forward-only (GDN2_BWD takes post-activation gates)")
+        a_log, dt_bias = ctx.saved_tensors[-2:]
     if ctx.ckpt_reuse:
-        q, k, v, g, beta, w, cu_seqlens, state_checkpoints = ctx.saved_tensors
+        q, k, v, g, beta, w, cu_seqlens, state_checkpoints = ctx.saved_tensors[:8]
     else:
-        q, k, v, g, beta, w, cu_seqlens = ctx.saved_tensors
+        q, k, v, g, beta, w, cu_seqlens = ctx.saved_tensors[:7]
         state_checkpoints = None
     initial_state = ctx.initial_state
 
     if dO is None:
         dO = torch.zeros(q.shape[0], max(q.shape[1], v.shape[1]), v.shape[2], dtype=q.dtype, device=q.device)
     dstate_in = dFinal if (dFinal is not None and dFinal.numel() > 0) else None
-    dq, dk, dv, dg, dbeta, dw, dstate0 = torch.ops.cudnn.gated_delta_net_v2_bwd(
+    dq, dk, dv, dg, dbeta, dw, dstate0, d_a_log, d_dt_bias = torch.ops.cudnn.gated_delta_net_v2_bwd(
         dO,
         q,
         k,
@@ -822,12 +920,17 @@ def _gdn2_backward(ctx, dO, dFinal, _dstate_checkpoints):
         state_checkpoints=state_checkpoints,
         use_qk_l2norm_in_kernel=ctx.use_qk_l2norm_in_kernel,
         batch_invariant=ctx.batch_invariant,
+        use_beta_sigmoid_in_kernel=ctx.use_beta_sigmoid_in_kernel,
+        safe_gate=ctx.safe_gate,
+        gate_lower_bound=ctx.gate_lower_bound,
+        a_log=a_log,
+        dt_bias=dt_bias,
         plan_name=ctx.plan_name,
     )
     # q, k, v, g, beta, w, cu_seqlens, scale, initial_state,
     # output_final_state, use_qk_l2norm_in_kernel, batch_invariant,
-    # safe_gate, gate_lower_bound, a_log, dt_bias,
-    # checkpoint_every_n_tokens, plan_name
+    # use_beta_sigmoid_in_kernel, safe_gate, gate_lower_bound, a_log,
+    # dt_bias, checkpoint_every_n_tokens, plan_name
     return (
         dq,
         dk,
@@ -844,7 +947,8 @@ def _gdn2_backward(ctx, dO, dFinal, _dstate_checkpoints):
         None,
         None,
         None,
-        None,
+        d_a_log if ctx.safe_gate else None,
+        d_dt_bias if ctx.safe_gate else None,
         None,
         None,
     )
@@ -875,6 +979,7 @@ def gated_delta_net_v2(
     output_final_state: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
     batch_invariant: bool = False,
+    use_beta_sigmoid_in_kernel: bool = False,
     safe_gate: bool = False,
     gate_lower_bound: Optional[float] = None,
     a_log: Optional[torch.Tensor] = None,
@@ -899,7 +1004,8 @@ def gated_delta_net_v2(
     Args:
         g: per-key-channel log-space decay (``alpha = exp(g)``), or raw
             pre-activation logits when ``safe_gate=True``.
-        beta: per-key erase gate (io dtype, post-activation).
+        beta: per-key erase gate (io dtype, post-activation), or io-dtype
+            logits when ``use_beta_sigmoid_in_kernel=True``.
         w: per-value write gate (io dtype, post-activation).
         cu_seqlens: ``[N+1]`` int32 sequence boundaries over the packed tokens.
         scale: attention scale applied to ``q``. Defaults to ``1 / sqrt(K)``.
@@ -912,9 +1018,12 @@ def gated_delta_net_v2(
         batch_invariant: if ``True``, each sequence's results are bitwise
             independent of the batch composition (whole-sequence scheduling;
             disables split-K load balancing).
+        use_beta_sigmoid_in_kernel: apply ``sigmoid(beta)`` inside the kernel;
+            the backward returns the raw-logit beta gradient.
         safe_gate: interpret ``g`` through the safe-gate transform
             ``gate_lower_bound * sigmoid(exp(a_log) * (g + dt_bias))``.
-            Requires ``a_log`` and ``dt_bias``. Forward-only.
+            Requires ``a_log`` and ``dt_bias``; the backward returns the
+            raw-logit ``g`` gradient plus ``a_log`` / ``dt_bias`` gradients.
         gate_lower_bound: safe-gate lower bound in log space (default -5.0).
         a_log: ``[HO]`` float32 safe-gate per-head log-amplitude.
         dt_bias: ``[HO, K]`` float32 safe-gate channel bias.
@@ -949,6 +1058,7 @@ def gated_delta_net_v2(
         output_final_state=bool(output_final_state),
         use_qk_l2norm_in_kernel=bool(use_qk_l2norm_in_kernel),
         batch_invariant=bool(batch_invariant),
+        use_beta_sigmoid_in_kernel=bool(use_beta_sigmoid_in_kernel),
         safe_gate=bool(safe_gate),
         gate_lower_bound=float(gate_lower_bound) if gate_lower_bound is not None else None,
         a_log=a_log,

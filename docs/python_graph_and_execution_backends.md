@@ -253,18 +253,27 @@ are close.
   THD-only: token-packed `[total_T, heads, dim]` tensors with a required
   `cu_seqlens` (a dense batch is `[0, T, 2T, ...]`). `gdn_bwd` takes the
   forward inputs plus `dO` (and optionally `d_final_state`) and produces
-  `dQ/dK/dV/dG/dBeta` (+ `d_initial_state` iff `initial_state` is given);
+  `dQ/dK/dV/dG/dBeta` (+ `d_initial_state` iff `initial_state` is given,
+  + `d_a_log`/`d_dt_bias` iff the node carries `safe_gate` — the gate
+  transform's parameter gradients, with `dG`/`dBeta` then in raw-logit
+  space under `safe_gate`/`use_beta_sigmoid`);
   the cumulative gate and intra-chunk WY matrix are recomputed inside the
   engine, so the graph contract carries no forward intermediates. Both are
   python-engine-only ops: they have no cuDNN backend lowering, so routing
   them to the backend entry raises `cudnnGraphNotSupportedError` at
-  lowering. The kernels live in `cudnn.linear_attention.cutile.kernels.gdn_chunk_cutile`;
+  lowering. The kernels live in `cudnn.linear_attention.cutile.kernels.gdn`;
   the torch custom op `cudnn.linear_attention.ops.gated_delta_net` is a thin
   adapter that builds and executes cached `gdn`/`gdn_bwd` graphs (the SDPA
   op pattern), so it inherits whatever engine the planner selects. The
   optional `use_qk_l2norm` attribute asks the engine to L2-normalize the q/k
-  rows in-kernel; `GdnFrostEngine` (the SM100/SM103 forward default) declines
-  such graphs, the cuTile engine serves them.
+  rows; `GdnFrostEngine` (the SM100/SM103 default, serving both `gdn` and
+  `gdn_bwd` on the FROST chunked kernels) serves it through a workspace
+  helper kernel (normalized q/k copies + saved inverse norms, with the
+  backward Jacobian projection applied in place after the head-group fold),
+  and likewise serves `safe_gate` (in-kernel raw-logit gate transform, with
+  `d_a_log`/`d_dt_bias` produced by a deterministic reduction helper) and
+  `use_beta_sigmoid`; the cuTile engine remains the fallback for non-128
+  head dims.
 - `KdaFrostEngine` / `KdaCuTileEngine` do the same for the single-node
   `kda` / `kda_bwd` ops (Kimi Delta Attention). KDA is GDN with a
   per-key-channel decay: its `g` is the log-space vector gate
@@ -273,22 +282,25 @@ are close.
   the forward default on SM100/SM103; the node's `use_qk_l2norm` attribute
   (in-kernel L2-normalization of q/k — the KDA model's feature map) passes
   through to the kernel (without the in-kernel norm the caller owns the q/k
-  conditioning). It declines `kda_bwd` (its backward
-  kernel is a stub), so gradients route to the cuTile engine
-  (`cudnn.linear_attention.cutile.kernels.kda_chunk_cutile`); the torch op
-  is `cudnn.linear_attention.ops.kimi_delta_attention`.
+  conditioning). It serves `kda_bwd` on the FROST backward kernel,
+  regenerating the per-chunk state checkpoints with a recompute pass when
+  the graph does not provide them; the cuTile engine
+  (`cudnn.linear_attention.cutile.kernels.kda`) is the
+  fallback slot. The torch op is
+  `cudnn.linear_attention.ops.kimi_delta_attention`.
 - Gated DeltaNet v2 (`gdn2` / `gdn2_bwd`) has channel-wise gates — `g`/`beta`
   `[total_T, HO, K]` plus a NEW per-value write gate `w` `[total_T, HO, V]`.
   GDN-2 has **no** cuTile engine; `Gdn2FrostEngine`
   (`cudnn.linear_attention.frost.gdn2_engine`, SM100/SM103) is its only
   engine, passes the `use_qk_l2norm` attribute through to the kernel (like
-  `KdaFrostEngine`), and declines `gdn2_bwd` (stub backward kernel), so the
-  op (`cudnn.linear_attention.ops.gated_delta_net_v2`) is forward-only for
-  now.
+  `KdaFrostEngine`), and serves `gdn2_bwd` the same way (checkpoint
+  recompute when the series is absent); the op is
+  `cudnn.linear_attention.ops.gated_delta_net_v2`.
 - The FROST engines are pure pass-through: `check_support` requires the
   kernel-native dtypes (fp32 gates — io-dtype `beta`/`w` for GDN-2 — int32
-  `cu_seqlens`, fp32-or-bf16 state ports with matching initial/final dtypes,
-  fp32 state gradients) and execute hands the caller's buffers straight to
+  or int64 `cu_seqlens`, fp32-or-bf16 state ports with matching
+  initial/final dtypes, fp32 state gradients for GDN/KDA and io-dtype
+  `dBeta`/`dW` for GDN-2) and execute hands the caller's buffers straight to
   the kernels, carving any scratch it needs out of the explicit workspace as
   DLPack views. The cuTile engines follow the same buffer contract: outputs
   are written in place (the caller's output buffers, required in the
