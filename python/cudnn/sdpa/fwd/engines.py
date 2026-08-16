@@ -453,21 +453,23 @@ def _sm100_spec(d: int, d_v: Optional[int] = None) -> EngineSpec:
     )
 
 
-def _sm100_mxfp8_spec(d: int) -> EngineSpec:
-    """d128 block-scale MXFP8 engine (E4M3/E5M2 in + per-32-block E8M0 SF, half out).
+def _sm100_mxfp8_spec(d: int, d_v: Optional[int] = None) -> EngineSpec:
+    """Block-scale MXFP8 engine (E4M3/E5M2 + per-32-block E8M0 SF).
 
     THD/varlen is deferred (dense execute only for v1), so thd=False here even
     though the kernel itself supports it.
     """
 
+    d_v = d if d_v is None else d_v
+    suffix = f"d{d}" if d_v == d else f"d{d}_d{d_v}"
     return EngineSpec(
-        name=f"sdpa_fwd_prefill_sm100_d{d}_mxfp8",
+        name=f"sdpa_fwd_prefill_sm100_{suffix}_mxfp8",
         capabilities=Capabilities(
             sm_lo=_BLACKWELL[0],
             sm_hi=_BLACKWELL[1],
             phase="prefill",
             d_qk=frozenset({d}),
-            d_v=frozenset({d}),
+            d_v=frozenset({d_v}),
             dtypes=frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
             out_dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
             is_mxfp8=True,
@@ -1043,6 +1045,7 @@ ENGINE_SPECS = (
     _sm100_spec(256),
     _sm100_spec(512),
     _sm100_mxfp8_spec(128),
+    _sm100_mxfp8_spec(192, d_v=128),
     _sm100_fp8_spec(128),
     _sm100_fp8_spec(
         192,

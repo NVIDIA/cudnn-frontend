@@ -66,7 +66,7 @@ _SM100_KERNEL_FILES = {
     (128, 128): "prefill_d128_f16_sm100.py",
 }
 # DTYPE_* codes: E4M3=0, E5M2=1, BF16=2, FP16=3. FP8 inputs (0/1) route to the
-# block-scale MXFP8 kernel (d128 only); the output dtype is encoded the same way.
+# FP8 kernel family; the output dtype is encoded the same way.
 _SM100_DTYPE_QKV_CODE = {
     torch.float8_e4m3fn: DTYPE_E4M3,
     torch.float8_e5m2: DTYPE_E5M2,
@@ -75,9 +75,11 @@ _SM100_DTYPE_QKV_CODE = {
 }
 _SM100_FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 # FP8 kernels use E4M3/E5M2 inputs and BF16/FP16/FP8 outputs. Block-scale
-# MXFP8 remains d128-only; per-tensor FP8 has exact d128/d128 and d192/d128
-# kernels.
-_SM100_MXFP8_KERNEL_FILE = "prefill_d128_mxfp8_sm100.py"
+# Both FP8 paths have exact d128/d128 and d192/d128 kernels.
+_SM100_MXFP8_KERNEL_FILES = {
+    (128, 128): "prefill_d128_mxfp8_sm100.py",
+    (192, 128): "prefill_d192_d128_mxfp8_sm100.py",
+}
 _SM107_FP8_KERNEL_FILE = "prefill_d128_fp8_sm107.py"
 _SM100_FP8_KERNEL_FILES = {
     (128, 128): "prefill_d128_fp8_sm100.py",
@@ -86,7 +88,7 @@ _SM100_FP8_KERNEL_FILES = {
 
 
 def _sm100_fp8_shapes(pertensor: bool, device_cc: tuple[int, int]) -> frozenset[tuple[int, int]]:
-    if not pertensor or device_cc == (10, 7):
+    if device_cc == (10, 7):
         return frozenset({(128, 128)})
     return frozenset({(128, 128), (192, 128)})
 
@@ -246,7 +248,7 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
         filename = _SM107_FP8_KERNEL_FILE
         tag = f"sdpa_fwd_sm107_fp8_{tag}"
     elif fp8:
-        filename = _SM100_FP8_KERNEL_FILES[flavor] if pertensor else _SM100_MXFP8_KERNEL_FILE
+        filename = _SM100_FP8_KERNEL_FILES[flavor] if pertensor else _SM100_MXFP8_KERNEL_FILES[flavor]
         tag = f"sdpa_fwd_sm100_{'fp8' if pertensor else 'mxfp8'}_{tag}"
     else:
         filename = _SM100_KERNEL_FILES[flavor]
@@ -793,9 +795,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             f"SdpaFwdDslSm100 requires {_allowed_msg}; found SM{major}{minor} on {device}",
         )
 
-        # FP8 paths use exact native shapes. Per-tensor FP8 also has the
-        # d192/d128 flavor; MXFP8 remains d128-only until its scale-factor
-        # descriptors and pipeline are extended.
+        # FP8 paths use exact native shapes. SM100 supports d128/d128 and
+        # d192/d128; Rubin currently supports only per-tensor FP8 d128.
         fp8_shapes = _sm100_fp8_shapes(self._pertensor, self._device_cc)
         self._value_error_if(
             self._fp8 and (int(d_qk), int(d_v)) not in fp8_shapes,
@@ -951,10 +952,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 elem_bytes=1 if self._fp8 else 2,
             )
         lpt_head_group = 1
-        if self._fp8 and self._pertensor and self.flavor == (192, 128) and not self.thd and (self.batch_size * self.h_q) % 16 == 0:
-            lpt_head_group = 16
+        if self._fp8 and self.flavor == (192, 128) and not self.thd and (self.batch_size * self.h_q) % 8 == 0:
+            lpt_head_group = 8
         lpt_q_tiles = 0
-        if self._fp8 and self._pertensor and self.flavor == (192, 128) and not self.thd:
+        if self._fp8 and self.flavor == (192, 128) and not self.thd:
             lpt_q_tiles = (self.s_q_max + 511) // 512
         template_window_right = self.window_right
         if (
@@ -1518,7 +1519,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         import cutlass
 
         if self.thd:
-            raise NotImplementedError("Frost MXFP8: the legacy THD leg was removed (dense d128 only); see issue #552")
+            raise NotImplementedError("Frost MXFP8: the legacy THD leg was removed (dense only); see issue #552")
         if sf_q is None or sf_k is None or sf_v is None:
             raise ValueError("Frost MXFP8 execute requires sf_q/sf_k/sf_v (block-scale descale tensors)")
 

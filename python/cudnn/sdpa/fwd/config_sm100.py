@@ -179,8 +179,8 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
             # The sink logit is folded into the softmax denominator in the
             # per-tile epilogue, so every split would add its own copy of it.
             raise ValueError(f"{flavor}: split_kv > 1 with attention sink is not supported (the sink would be counted once per split)")
-    if k.lpt_head_group not in (1, 16):
-        raise ValueError(f"{flavor}: LPT_HEAD_GROUP must be 1 or 16; got {k.lpt_head_group}")
+    if k.lpt_head_group not in (1, 8, 16):
+        raise ValueError(f"{flavor}: LPT_HEAD_GROUP must be 1, 8, or 16; got {k.lpt_head_group}")
     if fp8 and flavor == "d192" and k.split_kv != 1:
         raise ValueError("d192: split_kv is not implemented by the per-tensor FP8 kernel")
 
