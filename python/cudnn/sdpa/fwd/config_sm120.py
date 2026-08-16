@@ -61,6 +61,12 @@ class TemplateParams:
     bottom_right: bool = False
     seq_q_lens_present: bool = False
     seq_kv_lens_present: bool = False
+    # cu_seq_len form (cuDNN 9.24+): the corresponding seq-lens kernel
+    # argument is the (B+1,)-int32 PREFIX-SUM tensor instead of (B,)
+    # per-batch lengths; the kernel reads len = cu[b+1] - cu[b] on device.
+    # Dense-only — THD already carries prefix sums in its metadata tensor.
+    seq_q_lens_cu: bool = False
+    seq_kv_lens_cu: bool = False
     has_sink: bool = False
     thd_varlen: bool = False
     q_tile: int = SEQ_Q_TILES[0]
@@ -71,6 +77,7 @@ def validate_params(
     params: TemplateParams,
     allowed_dtypes: tuple[int, ...] = (DTYPE_BF16, DTYPE_FP16),
     allow_right_band: bool = True,
+    allow_cu: bool = True,
 ) -> None:
     """Validate the SM120 template specialization.
 
@@ -78,7 +85,8 @@ def validate_params(
     capabilities or adapter support checks; this validation is a backstop for
     direct template use. ``allowed_dtypes`` defaults to the FP16/BF16 template's
     set; the FP8 template passes its own. ``allow_right_band=False`` also
-    rejects a widened right band, which the FP8 template does not plumb.
+    rejects a widened right band, which the FP8 template does not plumb;
+    ``allow_cu=False`` likewise rejects the dense cu_seq_len read mode.
     """
 
     if params.dtype_qkv not in allowed_dtypes:
@@ -100,3 +108,12 @@ def validate_params(
             raise ValueError("SM120 SDPA: thd_varlen requires seq_kv_lens_present (the THD metadata tensor)")
         if params.seq_q_lens_present:
             raise ValueError("SM120 SDPA: seq_q_lens_present is dense-only (THD carries per-sequence Q lengths via cu_seqlens)")
+    if params.seq_q_lens_cu or params.seq_kv_lens_cu:
+        if not allow_cu:
+            raise ValueError("SM120 SDPA: the dense cu_seq_len read mode is not plumbed for this template")
+        if params.thd_varlen:
+            raise ValueError("SM120 SDPA: seq_*_lens_cu is dense-only (the THD metadata tensor already carries cu_seqlens)")
+        if params.seq_q_lens_cu and not params.seq_q_lens_present:
+            raise ValueError("SM120 SDPA: seq_q_lens_cu declares the FORM of the Q lengths and requires seq_q_lens_present")
+        if params.seq_kv_lens_cu and not params.seq_kv_lens_present:
+            raise ValueError("SM120 SDPA: seq_kv_lens_cu declares the FORM of the KV lengths and requires seq_kv_lens_present")

@@ -196,6 +196,8 @@ class SM120FusedMultiHeadAttentionForward:
         window_size_right: int | None = None,
         seq_q_lens_present: bool = False,
         seq_kv_lens_present: bool = False,
+        seq_q_lens_cu: bool = False,
+        seq_kv_lens_cu: bool = False,
         has_sink: bool = False,
         thd_varlen: bool = False,
         thd_batch: int = 1,
@@ -219,6 +221,11 @@ class SM120FusedMultiHeadAttentionForward:
             this offset.
         :param seq_q_lens_present: Read per-batch query lengths at runtime.
         :param seq_kv_lens_present: Read per-batch key/value lengths at runtime.
+        :param seq_q_lens_cu: ``seq_q_lens`` is the ``(B+1,)`` cu_seq_len
+            prefix-sum form (cuDNN 9.24+); the kernel reads
+            ``len = cu[b+1] - cu[b]``. Dense-only; requires
+            ``seq_q_lens_present``.
+        :param seq_kv_lens_cu: Same for ``seq_kv_lens``.
         :param has_sink: Fold the per-Q-head sink logit from the ``sinks``
             tensor into the softmax denominator; when ``False`` the ``sinks``
             argument is an unused dummy.
@@ -259,8 +266,16 @@ class SM120FusedMultiHeadAttentionForward:
         # A translated diagonal (bottom-right anchoring or a right band) can
         # straddle one more KV tile than the tile-aligned top-left one.
         self.diag_shifted = bottom_right or self.right_slack > 0
+        if (seq_q_lens_cu or seq_kv_lens_cu) and thd_varlen:
+            raise ValueError("seq_*_lens_cu is dense-only (the THD metadata tensor already carries cu_seqlens)")
+        if seq_q_lens_cu and not seq_q_lens_present:
+            raise ValueError("seq_q_lens_cu declares the FORM of the Q lengths and requires seq_q_lens_present")
+        if seq_kv_lens_cu and not seq_kv_lens_present:
+            raise ValueError("seq_kv_lens_cu declares the FORM of the KV lengths and requires seq_kv_lens_present")
         self.seq_q_lens_present = seq_q_lens_present
         self.seq_kv_lens_present = seq_kv_lens_present
+        self.seq_q_lens_cu = seq_q_lens_cu
+        self.seq_kv_lens_cu = seq_kv_lens_cu
         self.has_sink = has_sink
         self.thd_varlen = thd_varlen
         self.thd_batch = thd_batch
@@ -844,15 +859,26 @@ class SM120FusedMultiHeadAttentionForward:
             kv_row_base = cutlass.Int32(meta[2 * n_batch + 1 + batch_idx])
             seqlen_k = cutlass.Int32(meta[2 * n_batch + 1 + batch_idx + 1]) - kv_row_base
         else:
+            # Dense per-batch lengths: (B,) lengths, or the (B+1,) cu_seq_len
+            # prefix sums (adjacent difference) under the *_cu specialization —
+            # read sync-free on device either way.
             if cutlass.const_expr(self.seq_q_lens_present):
+                if cutlass.const_expr(self.seq_q_lens_cu):
+                    q_len_b = cutlass.Int32(seq_q_lens[batch_idx + 1]) - cutlass.Int32(seq_q_lens[batch_idx])
+                else:
+                    q_len_b = cutlass.Int32(seq_q_lens[batch_idx])
                 seqlen_q = cute.math.max(
                     cutlass.Int32(0),
-                    cute.math.min(seq_q_lens[batch_idx], cutlass.Int32(q.shape[1])),
+                    cute.math.min(q_len_b, cutlass.Int32(q.shape[1])),
                 )
             if cutlass.const_expr(self.seq_kv_lens_present):
+                if cutlass.const_expr(self.seq_kv_lens_cu):
+                    kv_len_b = cutlass.Int32(seq_kv_lens[batch_idx + 1]) - cutlass.Int32(seq_kv_lens[batch_idx])
+                else:
+                    kv_len_b = cutlass.Int32(seq_kv_lens[batch_idx])
                 seqlen_k = cute.math.max(
                     cutlass.Int32(0),
-                    cute.math.min(seq_kv_lens[batch_idx], cutlass.Int32(k.shape[1])),
+                    cute.math.min(kv_len_b, cutlass.Int32(k.shape[1])),
                 )
 
         num_heads_q = q.shape[2]
@@ -1374,6 +1400,11 @@ class SM120FusedMultiHeadAttentionForward:
                 raise ValueError("THD Q/K/V/O must be packed batch-1 views")
             if cutlass.const_expr(seq_kv_lens.shape != (3 * self.thd_batch + 2,)):
                 raise ValueError("THD seq_kv_lens must be the (3*B+2,) metadata tensor")
+        else:
+            if cutlass.const_expr(self.seq_q_lens_cu and seq_q_lens.shape != (q.shape[0] + 1,)):
+                raise ValueError("cu-form seq_q_lens must be the (B+1,) prefix-sum tensor")
+            if cutlass.const_expr(self.seq_kv_lens_cu and seq_kv_lens.shape != (k.shape[0] + 1,)):
+                raise ValueError("cu-form seq_kv_lens must be the (B+1,) prefix-sum tensor")
 
         # Split D into I contiguous C-element chunks while preserving the
         # per-tensor TMA descriptor over the compact (B, S, H, D) storage.
@@ -1494,6 +1525,8 @@ def compile(  # noqa: A001
         window_size_right=PARAMS.window_right,
         seq_q_lens_present=PARAMS.seq_q_lens_present,
         seq_kv_lens_present=PARAMS.seq_kv_lens_present,
+        seq_q_lens_cu=PARAMS.seq_q_lens_cu,
+        seq_kv_lens_cu=PARAMS.seq_kv_lens_cu,
         has_sink=PARAMS.has_sink,
         thd_varlen=PARAMS.thd_varlen,
         thd_batch=b,
@@ -1548,15 +1581,16 @@ def compile(  # noqa: A001
         if PARAMS.has_sink
         else None
     )
+    # Dense cu form (seq_*_lens_cu): the argument is the (B+1,) prefix sums.
     fake_seq_q_lens = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
-        (b,),
+        ((b + 1) if PARAMS.seq_q_lens_cu else b,),
         stride_order=(0,),
         assumed_align=4,
     )
     fake_seq_kv_lens = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
-        (3 * b + 2,) if PARAMS.thd_varlen else (b,),  # THD: [ seq_kv(B) | cu_q(B+1) | cu_k(B+1) ]
+        (3 * b + 2,) if PARAMS.thd_varlen else ((b + 1) if PARAMS.seq_kv_lens_cu else b,),  # THD: [ seq_kv(B) | cu_q(B+1) | cu_k(B+1) ]
         stride_order=(0,),
         assumed_align=4,
     )

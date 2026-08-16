@@ -865,15 +865,73 @@ def test_probe_rejects_thd_cu_plus_seq_len():
     assert not _eligible(_mk_thd_cu_graph(extra_seq_len=True))
 
 
+def _mk_dense_cu_graph(*, d=128, cu_q=True, cu_kv=True, seq_q=False, seq_kv=False, bottom_right=False):
+    """Dense padded graph carrying the cu_seq_len (B+1,) prefix-sum form on
+    the selected sides (per-batch (B,) seq_len_* on the others)."""
+    g = _mk_graph()
+    q, k, v, dims, strides = _mk_qkv(g, d=d)
+    kw = {}
+    if cu_q:
+        kw["cu_seq_len_q"] = g.tensor(dim=(B + 1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT32, name="cu_q")
+    if cu_kv:
+        kw["cu_seq_len_kv"] = g.tensor(dim=(B + 1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT32, name="cu_kv")
+    if seq_q:
+        kw["seq_len_q"] = g.tensor(dim=(B, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT32, name="seq_q")
+    if seq_kv:
+        kw["seq_len_kv"] = g.tensor(dim=(B, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT32, name="seq_kv")
+    if bottom_right:
+        kw["use_causal_mask_bottom_right"] = True
+    o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True, use_padding_mask=True, **kw)
+    _finish_output(o, dims, strides)
+    return g
+
+
+def test_probe_accepts_dense_cu_seq_len():
+    """Dense padded graphs carrying the cu_seq_len (B+1,) prefix-sum form are
+    served by the SM100 f16 rows via the kernels' CU read mode
+    (len = cu[b+1] - cu[b], read sync-free on device); the FP8/MXFP8 rows have
+    no CU read mode and keep declining."""
+    g = _mk_dense_cu_graph()
+    names = _eligible(g)
+    assert engines.engine_name(128) in names
+    assert engines.engine_name(128, mxfp8=True) not in names
+    assert engines.engine_name(128, fp8=True) not in names
+    facts = _facts(g)
+    assert facts.has_cu_seq_len and facts.padded and not facts.thd
+
+
+def test_probe_accepts_dense_cu_kv_only():
+    """cu form on the KV side only (per-batch (B,) lengths on Q) — the forms
+    are declared per side and may be mixed across sides."""
+    assert engines.engine_name(128) in _eligible(_mk_dense_cu_graph(cu_q=False, seq_q=True))
+
+
+def test_probe_rejects_dense_cu_bottom_right_q_lens():
+    """Dense BR + per-batch Q lengths hits the same kernel gap regardless of
+    the length FORM: the SM100 kernels anchor the BR diagonal at the global
+    S_q, so cu-form Q lengths must be declined exactly like seq_len_q."""
+    assert not _eligible(_mk_dense_cu_graph(bottom_right=True))
+
+
+def test_sm120_probe_accepts_dense_cu_seq_len(monkeypatch):
+    monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
+    g = _mk_dense_cu_graph()
+    names = _eligible(g)
+    assert engines.engine_name(arch="sm120") in names
+    assert "sdpa_fwd_prefill_sm120_fp8" not in names
+    # SM120's kernel anchors the BR diagonal per batch, so dense cu-form Q
+    # lengths stay served with bottom-right (bottom_right_padded_seq_q).
+    assert engines.engine_name(arch="sm120") in _eligible(_mk_dense_cu_graph(bottom_right=True))
+
+
 @pytest.mark.parametrize("side", ["cu_seq_len_q", "cu_seq_len_kv"])
-def test_cu_seq_len_is_declined(side):
-    """cu_seq_len_* (cuDNN 9.24+) are prefix sums — a different contract from
-    seq_len_* and from ragged_offset, and these kernels implement neither.
-    Reading such a graph as plain padded silently produced wrong output: 14.9%
-    of O on test_sdpa_mixed_seq_len_forms_L0[cu_q_brcm].
+def test_cu_plus_seq_len_same_side_is_declined(side):
+    """Both length forms on ONE side is ambiguous (the backend has its own
+    precedence, which the python engines do not replicate) — declined even on
+    rows that serve the dense cu form.
 
     A FACT, not a verdict: ``invalid`` means malformed-for-everyone, so putting
-    this there would also bar the engine that eventually implements it."""
+    this there would also bar an engine that replicates the precedence."""
     g = _mk_graph()
     q, k, v, dims, strides = _mk_qkv(g, d=128)
     seq_kv = g.tensor(dim=(B, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT32, name="seq_kv")
@@ -895,7 +953,7 @@ def test_cu_seq_len_is_declined(side):
     facts = ga.analyze(g)
     assert facts.invalid is None, facts.invalid
     assert facts.has_cu_seq_len
-    assert not _eligible(g), "no engine may claim a graph carrying cu_seq_len"
+    assert not _eligible(g), "no engine may claim a graph with both length forms on one side"
 
 
 def test_sm120_probe_accepts_padding_mask_with_seq_lens(monkeypatch):

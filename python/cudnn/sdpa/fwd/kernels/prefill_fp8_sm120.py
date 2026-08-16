@@ -71,7 +71,7 @@ from cudnn.sdpa.fwd.config_sm120 import (
 # The FROST loader injects one immutable specialization before executing this
 # module. A direct import uses dense e4m3 defaults.
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams(dtype_qkv=DTYPE_E4M3))
-validate_params(PARAMS, allowed_dtypes=(DTYPE_E4M3,), allow_right_band=False)
+validate_params(PARAMS, allowed_dtypes=(DTYPE_E4M3,), allow_right_band=False, allow_cu=False)
 
 # e4m3 travels as raw bytes: TMA, ldmatrix, and the MMA consume bit patterns,
 # so Uint8 storage sidesteps Float8 element support in the DSL plumbing.

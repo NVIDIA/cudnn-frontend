@@ -1109,7 +1109,12 @@ def _compute_warp_group(
                 # so the trim recomputes the row index here — beta feeds the
                 # O normalization in that loop.)
                 _sq_arr = cutlass.make_array_view(seq_q_lens_tensor)
-                _q_len_b = cutlass.Int32(_sq_arr[batch_idx])
+                if cutlass.const_expr(CFG.SEQ_Q_LENS_CU == 1):
+                    # cu_seq_len form: (B+1,) prefix sums; the length is the
+                    # adjacent difference, read sync-free on device.
+                    _q_len_b = cutlass.Int32(_sq_arr[batch_idx + cutlass.Int32(1)]) - cutlass.Int32(_sq_arr[batch_idx])
+                else:
+                    _q_len_b = cutlass.Int32(_sq_arr[batch_idx])
                 _q_row_trim = q_super_idx * cutlass.Int32(CFG.TILES_Q * CFG.TILE_M) + tid_in_wg
                 row_trim = _q_row_trim >= _q_len_b
                 neg_inf_trim = cutlass.Float32(float("-inf"))
@@ -2025,7 +2030,8 @@ def compile(  # noqa: A001
         stride_order=(0,),
         assumed_align=16,
     )
-    _skv_len = (3 * b + 2) if CFG.THD_VARLEN else b
+    # Dense cu_seq_len form: the seq_kv parameter is the (B+1,) prefix sums.
+    _skv_len = (3 * b + 2) if CFG.THD_VARLEN else ((b + 1) if CFG.SEQ_KV_LENS_CU else b)
     fake_seq_kv_lens = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
         (_skv_len,),
@@ -2039,7 +2045,7 @@ def compile(  # noqa: A001
     fake_seq_q_lens = (
         cute.runtime.make_fake_compact_tensor(
             cutlass.Int32,
-            (b,),
+            ((b + 1) if CFG.SEQ_Q_LENS_CU else b,),  # cu form: (B+1,) prefix sums
             stride_order=(0,),
             assumed_align=4,
         )

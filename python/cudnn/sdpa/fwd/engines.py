@@ -166,9 +166,15 @@ class Capabilities:
     thd: bool = False
     # cu_seq_len_q / cu_seq_len_kv (B+1,) prefix sums (cuDNN 9.24+). Serving
     # rows consume the form on THD host-side (lens = adjacent differences of
-    # the inherent tolist); dense cu graphs stay declined until the kernels
-    # grow a CU read mode (len = cu[b+1] - cu[b]) — see mismatch().
+    # the inherent tolist); dense cu graphs additionally need the kernels'
+    # CU read mode — see dense_cu_seq_len and mismatch().
     cu_seq_len: bool = False
+    # Dense graphs carrying the cu form: the row's kernels read
+    # len = cu[b+1] - cu[b] straight from the bound (B+1,) tensor, so the
+    # sync-free dense hot path stays sync-free (no host round-trip, no
+    # conversion kernel). Only meaningful with cu_seq_len; rows without it
+    # (the FP8/MXFP8 flavors, SM80) keep declining dense cu graphs.
+    dense_cu_seq_len: bool = False
     # Dense padded + stats needs the per-batch seq_len_q LSE trim (padded
     # q-rows write LSE=-inf / O=0, cuDNN >= 9.14). Plumbed for the half
     # kernels via SEQ_Q_LENS_PRESENT; the FP8/MXFP8 kernels lack the epilogue
@@ -336,13 +342,12 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
 
     if facts.has_cu_seq_len:
         # cu_seq_len_* ((B+1,) prefix sums, cuDNN 9.24+). The THD lowering
-        # consumes either length form host-side; the dense kernels' CU read
-        # mode (len = cu[b+1] - cu[b]) is not plumbed yet, so dense cu graphs
-        # stay declined even on serving rows.
+        # consumes either length form host-side; dense graphs need the row's
+        # kernel CU read mode (len = cu[b+1] - cu[b], dense_cu_seq_len).
         if not capabilities.cu_seq_len:
             return "graph uses cu_seq_len_q / cu_seq_len_kv, which this engine does not support"
-        if not facts.thd:
-            return "cu_seq_len_* on dense graphs is not supported yet (kernel CU read mode not plumbed)"
+        if not facts.thd and not capabilities.dense_cu_seq_len:
+            return "cu_seq_len_* on dense graphs is not supported by this engine (no kernel CU read mode)"
         if (facts.seq_q_t is not None and facts.cu_seq_q_t is not None) or (facts.seq_kv_t is not None and facts.cu_seq_kv_t is not None):
             return "seq_len_* and cu_seq_len_* on the same side is ambiguous (backend precedence is not replicated here)"
 
@@ -359,7 +364,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             return "graph uses bottom-right causal, which this kernel does not support"
         if facts.window_left is not None and not capabilities.bottom_right_with_swa:
             return "bottom-right causal combined with a sliding window is not supported"
-        if facts.padded and not facts.thd and facts.seq_q_t is not None and not capabilities.bottom_right_padded_seq_q:
+        if facts.padded and not facts.thd and (facts.seq_q_t is not None or facts.cu_seq_q_t is not None) and not capabilities.bottom_right_padded_seq_q:
             return (
                 "bottom-right causal with a dense padding mask carrying per-batch seq_len_q is not "
                 "supported (kernel anchors the BR diagonal at the global S_q, not seq_len_q[b])"
@@ -419,6 +424,7 @@ def _sm100_spec(d: int, d_v: Optional[int] = None) -> EngineSpec:
             lse_optional=True,
             thd=True,
             cu_seq_len=True,
+            dense_cu_seq_len=True,
             padded_stats=True,
             # Ragged S_kv with an uncovered tail is served through the padded
             # path with synthesized full-length per-batch KV lengths (see
@@ -669,6 +675,7 @@ def _sm120_spec() -> EngineSpec:
             # padding and no padded-path cost.
             skv_tile=0,
             cu_seq_len=True,
+            dense_cu_seq_len=True,
             layouts=frozenset({"bshd", "dense_flex"}),
             sched_policies=frozenset({SCHED_NATURAL}),
             tile_ms=frozenset({64, 128}),
@@ -736,7 +743,7 @@ def lower_dsl_prefill(
     # buffer the FP8/MXFP8 kernels can't honor (dense padded-Q trim is not
     # plumbed there — known gap) is dropped here rather than erroring at
     # execute.
-    seq_q_lens_present = facts.padded and not facts.thd and facts.seq_q_t is not None and not (facts.is_mxfp8 or facts.is_fp8)
+    seq_q_lens_present = facts.padded and not facts.thd and (facts.seq_q_t is not None or facts.cu_seq_q_t is not None) and not (facts.is_mxfp8 or facts.is_fp8)
     api = _adapter(api_type)(
         sample_q=ga.tensor_desc_from_ir(facts.q_t, name="q"),
         sample_k=ga.tensor_desc_from_ir(facts.k_t, name="k"),
@@ -756,8 +763,10 @@ def lower_dsl_prefill(
         # THD carries Q lengths via cu_seqlens; the FP8/MXFP8 kernels are not
         # plumbed (their specs also keep padded_stats=False).
         seq_q_lens_present=seq_q_lens_present,
-        # cu_seq_len form (THD-only; the probe declined dense cu graphs): the
-        # adapter's seq-lens execute arguments carry (B+1,) prefix sums.
+        # cu_seq_len form: the adapter's seq-lens execute arguments carry
+        # (B+1,) prefix sums — consumed host-side for THD, bound directly for
+        # dense (the kernels' CU read mode; the probe admits dense cu graphs
+        # only on dense_cu_seq_len rows).
         cu_seq_q_lens=facts.cu_seq_q_t is not None,
         cu_seq_kv_lens=facts.cu_seq_kv_t is not None,
         has_sink=facts.has_sink,
