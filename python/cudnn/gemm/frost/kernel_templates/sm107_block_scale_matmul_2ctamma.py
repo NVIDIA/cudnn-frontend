@@ -147,13 +147,13 @@ def _kernel(
     gridx = cute.arch.grid_dim()[0]
     gridy = cute.arch.grid_dim()[1]
 
-    # Flexible CGA: the launch carries a preferred (wide) cluster plus a smaller
+    # Mixed CGA: the launch carries a preferred (wide) cluster plus a smaller
     # fallback one, and the device picks per cluster — a CTA can only tell which
     # by reading the hardware cluster dims. Everything cluster-shaped below then
     # follows from those, so the two kinds share one body; only the multicast bit
     # patterns are loop-built and come in precomputed per shape.
-    a_mcast_pattern = flex_a_pattern_pref
-    b_mcast_pattern = flex_b_pattern_pref
+    a_mcast_pattern = mixed_a_pattern_pref
+    b_mcast_pattern = mixed_b_pattern_pref
     if cutlass.const_expr(fallback_cluster_shape_mnk is None):
         cluster_m = cluster_shape_mnk[0]
         cluster_n = cluster_shape_mnk[1]
@@ -161,13 +161,13 @@ def _kernel(
         cdim_x, cdim_y, _cdim_z = cute.arch.block_in_cluster_dim()
         cluster_m = cdim_x
         cluster_n = cdim_y
-        a_mcast_pattern = cutlass.Int32(flex_a_pattern_pref)
-        b_mcast_pattern = cutlass.Int32(flex_b_pattern_pref)
+        a_mcast_pattern = cutlass.Int32(mixed_a_pattern_pref)
+        b_mcast_pattern = cutlass.Int32(mixed_b_pattern_pref)
         # Bitwise, not `or`: both operands are runtime Booleans (this is the form
         # cutlass.cute.experimental.is_preferred_cluster uses).
         if (cdim_x != cluster_shape_mnk[0]) | (cdim_y != cluster_shape_mnk[1]):
-            a_mcast_pattern = cutlass.Int32(flex_a_pattern_fb)
-            b_mcast_pattern = cutlass.Int32(flex_b_pattern_fb)
+            a_mcast_pattern = cutlass.Int32(mixed_a_pattern_fb)
+            b_mcast_pattern = cutlass.Int32(mixed_b_pattern_fb)
     cluster_size = cluster_m * cluster_n * cluster_shape_mnk[2]
 
     cta_rank_in_cluster = cute.arch.block_idx_in_cluster()
@@ -1428,7 +1428,7 @@ def _host(
         # @@INJECT_HOST_TMA_C_PASS@@
         # @@TMA_STORE_ONLY:END@@
     )
-    # Flexible CGA: `cluster` is the preferred (wide) shape and
+    # Mixed CGA: `cluster` is the preferred (wide) shape and
     # `fallback_cluster` the regular one the device groups blocks into when a
     # preferred cluster does not fit. The grid is already a multiple of the
     # preferred shape, which the driver requires.
