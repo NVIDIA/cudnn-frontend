@@ -2621,7 +2621,7 @@ def chunk_gdn_recompute_sm100(
         raise ValueError("work_items/work_count are required (the split-table stage builds them for every launch)")
     dyn_sched = sched_ctr is not None
     run_order = bool(order_in_prologue)
-    order_gen = run_order and work_item_scratch is None
+    order_gen = work_item_scratch is None
     if run_order and sched_all is None:
         raise ValueError("order_in_prologue requires sched_all (the prologue zeroes both consumers' sched rings)")
     if not (enable_checkpoints or store_final_state):
@@ -2739,7 +2739,7 @@ def chunk_gdn_recompute_sm100(
             checkpoints_pl = from_dlpack(output_state_checkpoints, assumed_align=16)
             checkpoints_pl.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2, 3), divisibility=1)
         staging_pl = None
-        if run_order and not order_gen:
+        if not order_gen:
             staging_pl = from_dlpack(work_item_scratch, assumed_align=16)
             staging_pl.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
         work_count_pl = from_dlpack(work_count, assumed_align=4).mark_layout_dynamic()
@@ -2775,7 +2775,7 @@ def chunk_gdn_recompute_sm100(
         gate,
         cu_seqlens,
         output_state_checkpoints if enable_checkpoints else None,
-        work_item_scratch if (run_order and not order_gen) else None,
+        work_item_scratch if not order_gen else None,
         work_count,
         work_items,
         sched_all if run_order else None,

@@ -798,6 +798,8 @@ def _gdn_bwd_fake(
     dt_bias=None,
     plan_name=None,
 ):
+    if safe_gate and (a_log is None or dt_bias is None):
+        raise ValueError("gated_delta_net: safe_gate requires a_log and dt_bias")
     dstate0 = torch.empty_like(initial_state) if initial_state is not None else q.new_empty(0, dtype=torch.float32)
     d_a_log = torch.empty_like(a_log) if safe_gate else q.new_empty(0, dtype=torch.float32)
     d_dt_bias = torch.empty_like(dt_bias) if safe_gate else q.new_empty(0, dtype=torch.float32)
@@ -960,9 +962,10 @@ def gated_delta_net(
     A dense batch of N equal-length sequences is expressed as
     ``cu_seqlens = [0, T, 2T, ...]`` over the flattened tokens.
 
-    Dtypes are kernel-native and strict (callers convert): ``g``, ``beta``
-    and the states are float32; ``final_state``, ``dG``, ``dBeta`` and
-    ``d_initial_state`` are returned in float32.
+    Dtypes are kernel-native and strict (callers convert): ``g`` and the
+    states are float32; ``final_state``, ``dG`` and ``d_initial_state`` are
+    returned in float32.  ``beta`` and ``dBeta`` are float32, or io dtype
+    under ``use_beta_sigmoid_in_kernel``.
 
     Args:
         g: log-space scalar decay per token (``alpha = exp(g) in (0, 1]``),

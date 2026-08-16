@@ -37,7 +37,7 @@ dtype, the plain per-chunk checkpoint series with NO initial-state slot (entry `
 - 1` = state entering chunk c >= 1; chunk 0 seeds from `initial_state`); dq/dk/dv io at HO heads; dgate `[T, HO, DK]` fp32
 (natural-log gate domain; with SAFE_GATE the gradient stays wrt the
 transformed log-decay); dbeta `[T, HO]` fp32, io dtype with BETA_SIGMOID
-(post-sigmoid space either way).  Gate
+(post-sigmoid space, or wrt the raw logits under BETA_SIGMOID).  Gate
 arrives natural-log fp32 unless SAFE_GATE (safe-gate transform from raw gate
 + a_log/dt_bias); beta arrives post-sigmoid fp32, or io-dtype logits with
 BETA_SIGMOID; d_initial_state / d_final_state fp32 `[N, HO, DK, DV]`
@@ -779,14 +779,10 @@ def super_mma_warp(
                 tinv_lo1, tinv_hi1 = f16x2_to_f32(tinv_p1, dtype=cfg.io_dtype)
                 tinv_lo2, tinv_hi2 = f16x2_to_f32(tinv_p2, dtype=cfg.io_dtype)
                 tinv_lo3, tinv_hi3 = f16x2_to_f32(tinv_p3, dtype=cfg.io_dtype)
-                tinv_acc[0] = tinv_lo0 + upd_acc[0]
-                tinv_acc[1] = tinv_hi0 + upd_acc[1]
-                tinv_acc[2] = tinv_lo1 + upd_acc[2]
-                tinv_acc[3] = tinv_hi1 + upd_acc[3]
-                tinv_acc[4] = tinv_lo2 + upd_acc[4]
-                tinv_acc[5] = tinv_hi2 + upd_acc[5]
-                tinv_acc[6] = tinv_lo3 + upd_acc[6]
-                tinv_acc[7] = tinv_hi3 + upd_acc[7]
+                tinv_acc[0], tinv_acc[1] = fadd2(tinv_lo0, tinv_hi0, upd_acc[0], upd_acc[1])
+                tinv_acc[2], tinv_acc[3] = fadd2(tinv_lo1, tinv_hi1, upd_acc[2], upd_acc[3])
+                tinv_acc[4], tinv_acc[5] = fadd2(tinv_lo2, tinv_hi2, upd_acc[4], upd_acc[5])
+                tinv_acc[6], tinv_acc[7] = fadd2(tinv_lo3, tinv_hi3, upd_acc[6], upd_acc[7])
 
             nvvm.stmatrix(
                 sIntermediate_ptr + 1 * (cfg.b_t * cfg.b_t) + stsm_idx,
@@ -2732,8 +2728,11 @@ def compute2_warp_group(
                             dots[t], dots[t + 1] = fmul2(gp_lo, gp_hi, sNorm_raw[norm_base + inv_off + t], sNorm_raw[norm_base + inv_off + t + 1])
                     for off in cutlass.range_constexpr(5):
                         step = cutlass.const_expr(1 << off)
-                        for t in cutlass.range_constexpr(cfg.b_t):
-                            dots[t] = dots[t] + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, dots[t], step, 31, kind=nvvm.Shfl.BFLY))
+                        for t2 in cutlass.range_constexpr(cfg.b_t // 2):
+                            t = 2 * t2
+                            sh_lo = cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, dots[t], step, 31, kind=nvvm.Shfl.BFLY))
+                            sh_hi = cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, dots[t + 1], step, 31, kind=nvvm.Shfl.BFLY))
+                            dots[t], dots[t + 1] = fadd2(dots[t], dots[t + 1], sh_lo, sh_hi)
                     if lane == 0:
                         for t in cutlass.range_constexpr(cfg.b_t):
                             sRed1_raw[tmem_subpartition * cfg.b_t + t] = dots[t]
@@ -3928,8 +3927,9 @@ def chunk_kda_bwd_sm100(
             With ``safe_gate`` this stays the gradient wrt the TRANSFORMED
             log-decay; a host-side helper converts to d(raw gate) afterward
         dbeta: ``(total_tokens, HO)`` fp32, or io dtype with
-            ``use_beta_sigmoid``, pre-allocated.  Stays the gradient wrt the
-            post-sigmoid beta; a host-side helper converts to d(logits)
+            ``use_beta_sigmoid``, pre-allocated.  Gradient wrt the post-sigmoid
+            beta, or wrt the raw logits under ``use_beta_sigmoid`` (the kernel
+            folds the sigmoid derivative into its own dbeta write)
         cu_seqlens: ``(num_seqs + 1,)`` int32
         scale: attention scale factor
         initial_state: ``(num_seqs, HO, DK, DV)`` io dtype (KV) -- the state

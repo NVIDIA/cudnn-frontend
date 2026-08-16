@@ -11,7 +11,7 @@ from cudnn.frost import buffers
 
 from ..graph_analyzer import BUFFER_NAME_FROM_CUDNN
 
-CUTILE_ALIGN = {"cu_seqlens": 4, "a_log": 4, "beta": 4}
+CUTILE_ALIGN = {"cu_seqlens": 4, "a_log": 4, "dt_bias": 4, "beta": 4}
 
 CUTILE_MIN_CUDART = 13030
 

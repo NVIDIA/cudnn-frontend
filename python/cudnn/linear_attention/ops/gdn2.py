@@ -825,6 +825,8 @@ def _gdn2_bwd_fake(
     dt_bias=None,
     plan_name=None,
 ):
+    if safe_gate and (a_log is None or dt_bias is None):
+        raise ValueError("gated_delta_net_v2: safe_gate requires a_log and dt_bias")
     dstate0 = torch.empty_like(initial_state) if initial_state is not None else q.new_empty(0, dtype=torch.float32)
     d_a_log = torch.empty_like(a_log) if safe_gate else q.new_empty(0, dtype=torch.float32)
     d_dt_bias = torch.empty_like(dt_bias) if safe_gate else q.new_empty(0, dtype=torch.float32)

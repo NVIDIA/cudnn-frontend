@@ -4051,6 +4051,7 @@ def get_compiled_cache(
     dyn_sched: bool,
     order_in_prologue: bool,
     order_gen: bool,
+    has_sched: bool,
 ):
     return {}
 
@@ -4113,8 +4114,8 @@ def chunk_gdn2_bwd_sm100(
         dq/dk/dv: io dtype at ``HO = max(HQ, HV)`` heads, pre-allocated
         dgate: ``(total_tokens, HO, DK)`` fp32 (dL/d ln alpha; ``safe_gate``
             leaves it in the transformed gate space), pre-allocated
-        dbeta: ``(total_tokens, HO, DK)`` io dtype (post-sigmoid space),
-            pre-allocated
+        dbeta: ``(total_tokens, HO, DK)`` io dtype (post-sigmoid space, or
+            wrt the raw logits under ``beta_sigmoid``), pre-allocated
         dw: ``(total_tokens, HO, DV)`` io dtype, pre-allocated
         cu_seqlens: ``(num_seqs + 1,)`` int32
         scale: attention scale factor
@@ -4185,6 +4186,7 @@ def chunk_gdn2_bwd_sm100(
         dyn_sched,
         order_in_prologue,
         order_gen,
+        sched_all is not None,
     )
 
     if "compiled" not in cache:

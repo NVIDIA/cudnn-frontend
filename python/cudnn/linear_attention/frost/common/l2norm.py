@@ -18,6 +18,7 @@ import cutlass.cute as cute
 from cutlass.cute.arch.nvvm_wrappers import inline_ptx
 from cutlass.cute.runtime import from_dlpack
 
+from cudnn.frost.buffers import data_ptr
 from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32, ffma2, fmul2, fp32_to_fp16
 from .elementwise import l2norm_inv, lane_group_sum
 
@@ -259,13 +260,18 @@ def l2norm_cache(key):
     return {}
 
 
-def l2norm_rows(q, k, q_n, k_n, inv_q, inv_k, rows_per_cta):
-    """Row counts and grid for a q/k pair, checking the workspace compactness
-    the kernels' ``row * 128`` addressing assumes."""
+def l2norm_qk(q, k, q_n, k_n, inv_q, inv_k, *, stream):
+    """Normalize q/k rows into the compact io workspace copies and stash the
+    fp32 inverse norms.  Sources are read through their own strides."""
+    ROWS = (128 // FWD_LANES) * FWD_ROWS_PER_GROUP
     total, h_q, d = (int(s_) for s_ in q.shape)
     total_k, h_k, d_k = (int(s_) for s_ in k.shape)
     if d != 128 or d_k != 128 or total_k != total:
         raise ValueError(f"q/k must be [total, H, 128] with matching totals; got {tuple(q.shape)} / {tuple(k.shape)}")
+    for name, t in (("q", q), ("k", k)):
+        st = tuple(int(s_) for s_ in t.stride())
+        if st[2] != 1 or st[0] % 8 != 0 or st[1] % 8 != 0 or data_ptr(t) % 16 != 0:
+            raise ValueError(f"{name} needs a 16B-aligned base, unit channel stride, and outer strides in multiples of 8; got {st}")
     for name, buf, h in (("q_n", q_n, h_q), ("k_n", k_n, h_k)):
         if tuple(int(s_) for s_ in buf.stride()) != (h * 128, 128, 1):
             raise ValueError(f"{name} workspace must be compact [total, {h}, 128]")
@@ -274,13 +280,7 @@ def l2norm_rows(q, k, q_n, k_n, inv_q, inv_k, rows_per_cta):
             raise ValueError(f"{name} workspace must be compact [total, {h}] fp32")
     n_q_rows = total * h_q
     n_rows = n_q_rows + total * h_k
-    return n_q_rows, n_rows, h_q, h_k, (n_rows + rows_per_cta - 1) // rows_per_cta
-
-
-def l2norm_qk(q, k, q_n, k_n, inv_q, inv_k, *, stream):
-    """Normalize q/k rows into the compact io workspace copies and stash the
-    fp32 inverse norms.  Sources are read through their own strides."""
-    args = l2norm_rows(q, k, q_n, k_n, inv_q, inv_k, (128 // FWD_LANES) * FWD_ROWS_PER_GROUP)
+    args = (n_q_rows, n_rows, h_q, h_k, (n_rows + ROWS - 1) // ROWS)
     cache = l2norm_cache(("fwd", str(q.dtype)))
     cu_stream = cuda.CUstream(int(stream))
     if "compiled" not in cache:
@@ -299,7 +299,24 @@ def l2norm_qk_bwd(dq, dk, q_n, k_n, inv_q, inv_k, *, stream):
     """Project dq/dk in place through the normalize Jacobian using the saved
     normalized rows and inverse norms.  Run after any head-group fold so the
     gradients are back at the native q/k head counts."""
-    args = l2norm_rows(dq, dk, q_n, k_n, inv_q, inv_k, ROWS_PER_CTA)
+    ROWS = ROWS_PER_CTA
+    total, h_q, d = (int(s_) for s_ in dq.shape)
+    total_k, h_k, d_k = (int(s_) for s_ in dk.shape)
+    if d != 128 or d_k != 128 or total_k != total:
+        raise ValueError(f"dq/dk must be [total, H, 128] with matching totals; got {tuple(dq.shape)} / {tuple(dk.shape)}")
+    for name, t in (("dq", dq), ("dk", dk)):
+        st = tuple(int(s_) for s_ in t.stride())
+        if st[2] != 1 or st[0] % 8 != 0 or st[1] % 8 != 0 or data_ptr(t) % 16 != 0:
+            raise ValueError(f"{name} needs a 16B-aligned base, unit channel stride, and outer strides in multiples of 8; got {st}")
+    for name, buf, h in (("q_n", q_n, h_q), ("k_n", k_n, h_k)):
+        if tuple(int(s_) for s_ in buf.stride()) != (h * 128, 128, 1):
+            raise ValueError(f"{name} workspace must be compact [total, {h}, 128]")
+    for name, buf, h in (("inv_q", inv_q, h_q), ("inv_k", inv_k, h_k)):
+        if tuple(int(s_) for s_ in buf.stride()) != (h, 1):
+            raise ValueError(f"{name} workspace must be compact [total, {h}] fp32")
+    n_q_rows = total * h_q
+    n_rows = n_q_rows + total * h_k
+    args = (n_q_rows, n_rows, h_q, h_k, (n_rows + ROWS - 1) // ROWS)
     cache = l2norm_cache(("bwd", str(dq.dtype)))
     cu_stream = cuda.CUstream(int(stream))
     if "compiled" not in cache:

@@ -4632,7 +4632,7 @@ def chunk_gdn_bwd_sm100(
             HO heads
         dgate/dbeta: pre-allocated ``(total_tokens, HO)`` float32 gate/beta
             gradients (``safe_gate`` leaves dgate in the transformed gate
-            space; ``use_beta_sigmoid`` leaves dbeta in post-sigmoid space,
+            space; ``use_beta_sigmoid`` returns dbeta wrt the raw logits,
             io dtype)
         cu_seqlens: ``(num_seqs + 1,)`` int32
         initial_state: ``(num_seqs, HO, DK, DV)`` io dtype (matching ``state_checkpoints``),

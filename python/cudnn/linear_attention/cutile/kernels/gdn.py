@@ -71,7 +71,7 @@ def device_attrs():
 
 # occupancy=2 is EXCLUDED: on tileiras 13.2 a freshly compiled occ=2
 # chunk_bwd_kernel_dqkwg deadlocks on its first launch (occ=1/4 are fine).
-TUNE_OCC = (4, 1)
+TUNE_OCC = (1, 4)
 
 
 # --- Device helpers -------------------------------------------------------------------------------

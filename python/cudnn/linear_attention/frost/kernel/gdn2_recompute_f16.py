@@ -2432,6 +2432,7 @@ def get_compiled_cache(
     dyn_sched: bool,
     order_in_prologue: bool,
     order_gen: bool,
+    has_sched: bool,
 ):
     """Return a mutable dict that lazily stores the compiled kernel."""
     return {}
@@ -2633,6 +2634,7 @@ def chunk_gdn2_recompute_sm100(
         dyn_sched,
         order_in_prologue,
         order_gen,
+        sched_all is not None,
     )
 
     if "compiled" not in cache:
