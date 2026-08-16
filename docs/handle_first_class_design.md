@@ -27,9 +27,11 @@ becomes one consumer rather than the anchor.
 1. **The C++ boundary needs no change; the handoff is EXPLICIT in Python.** Every
    handle-consuming binding takes `std::intptr_t` / `std::optional`. The backend
    handle is extracted **explicitly** in our Python code — `to_backend_handle(h)`
-   at the named handoffs (`_execute*`, `backend_graph`) and `unwrap_handles(args,
-   kwargs)` at the opaque passthroughs (`get_workspace_size`, cuda-graph,
-   `deserialize`) — so a reader can grep `backend_handle` and trace the plumbing
+   at each handoff (`_execute*`, `backend_graph`, and the workspace / cuda-graph
+   methods, whose signatures name `handle` rather than a `*args` passthrough).
+   `deserialize` is the one genuinely ambiguous classic overload (`(data)` vs
+   `(handle, data, ...)`), so it stays a passthrough and unwraps just its first
+   positional. A reader can grep `backend_handle` and trace the plumbing
    top-to-bottom without an IDE. A full inventory confirmed **every** handle→C++
    handoff is in `_pygraph`/`__init__` (the `__getattr__` delegation carries no
    handle), so the set is closed. `Handle` deliberately has **no `__index__`**:
@@ -74,9 +76,8 @@ class Handle:
     device -> DeviceInfo        # lazy, cached by ordinal
     # no __index__/__int__; __eq__/__hash__/__bool__ at object defaults (identity, truthy)
 
-# the explicit handoffs (grep `backend_handle` to trace them):
+# the explicit handoff (grep `backend_handle` to trace it):
 to_backend_handle(h)          # a Handle's .backend_handle, a foreign int, or None
-unwrap_handles(args, kwargs)  # same, for any Handle in a passthrough call
 ```
 
 `create_handle()` (Python, after the copy loop): `Handle(backend_handle=

@@ -28,11 +28,10 @@ class Handle:
     ordinal). The naming anticipates the front end BEING "cudnn": this object is
     the ``handle``; the wrapped ``cudnnHandle_t`` is the ``backend_handle``.
 
-    The backend handle is handed to C++ EXPLICITLY via ``to_backend_handle()`` /
-    ``unwrap_handles()`` at the handoff sites (all in ``_pygraph`` and this
-    module — none elsewhere), so there is no hidden path from a Handle to the
-    backend: a Handle that reaches a C++ binding unconverted fails loudly rather
-    than being silently coerced. The dunders are therefore minimal on purpose —
+    The backend handle is handed to C++ EXPLICITLY via ``to_backend_handle()``
+    at the handoff sites (all in ``_pygraph`` and this module — none elsewhere),
+    so there is no hidden path from a Handle to the backend: a Handle that reaches
+    a C++ binding unconverted fails loudly rather than being silently coerced. The dunders are therefore minimal on purpose —
     NO ``__index__``/``__int__`` (no implicit int coercion) — and
     ``__eq__``/``__hash__``/``__bool__`` are left at the object defaults
     (identity equality, identity hash, always-truthy), which is what the
@@ -65,10 +64,3 @@ def to_backend_handle(handle):
     ``backend_handle``, a foreign raw-int handle unchanged, or None. The ONE
     explicit conversion from the first-class Handle to the int the bindings take."""
     return handle.backend_handle if isinstance(handle, Handle) else handle
-
-
-def unwrap_handles(args, kwargs):
-    """Replace any Handle in a passthrough ``(*args, **kwargs)`` with its
-    ``backend_handle``, so an opaque forwarder (get_workspace_size, cuda-graph,
-    deserialize) can hand C++ a plain int without knowing the handle's position."""
-    return tuple(to_backend_handle(a) for a in args), {k: to_backend_handle(v) for k, v in kwargs.items()}

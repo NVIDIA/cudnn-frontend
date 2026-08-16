@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 from cudnn import _pybind_module
 
-from ._handle import to_backend_handle, unwrap_handles
+from ._handle import to_backend_handle
 from .datatypes import _buffer_dtype_to_cudnn, _dlpack_code_bits, _torch_to_cudnn_data_type
 from .engines.base import ExecutionContext, VariantPack
 from .engines.engine_ids import is_python_engine
@@ -1536,31 +1536,30 @@ class pygraph:
         self.check_support()
         self.build_plans(ctx=ctx)
 
-    def get_workspace_size(self, *args, **kwargs) -> int:
-        """Workspace bytes for the selected plan. Classic overloads (handle /
-        dynamic-shape overrides) pass through on the backend path."""
-        args, kwargs = unwrap_handles(args, kwargs)  # a Handle in the overloads -> backend handle for C++
+    def get_workspace_size(self, handle=None, override_uids=None, override_shapes=None, override_strides=None) -> int:
+        """Workspace bytes for the selected plan. The classic overload args -- a
+        handle and the dynamic-shape overrides -- pass through on the backend path."""
         if not self._is_built:
             raise RuntimeError("Call build() first")
 
         if self.selected_engine is not None:
-            # Classic overloads (handle, override_uids/shapes/strides) describe
-            # the problem, and CompiledPlan.get_workspace_size() takes none of
-            # them: a compiled python plan's workspace is a property of the plan.
-            # A shape-dependent one would have to say so through that API.
+            # The overload args (handle, override_uids/shapes/strides) describe the
+            # problem, and CompiledPlan.get_workspace_size() takes none of them: a
+            # compiled python plan's workspace is a property of the plan. A
+            # shape-dependent one would have to say so through that API.
             return self._compiled_plans[self._plan_index].get_workspace_size()
 
-        # Same reason execute() addresses by index; classic overloads pass through.
+        # Same reason execute() addresses by index; the overload args pass through.
         cfg = self._materialize_backend_plan(self._plan_index) if self._plans else None
-        if not args and not kwargs and cfg is not None and cfg.cpp_index is not None:
+        no_overload = handle is None and override_uids is None and override_shapes is None and override_strides is None
+        if no_overload and cfg is not None and cfg.cpp_index is not None:
             return self._lowered_graph.get_workspace_size_plan_at_index(cfg.cpp_index)
-        return self._lowered_graph.get_workspace_size(*args, **kwargs)
+        return self._lowered_graph.get_workspace_size(to_backend_handle(handle), override_uids, override_shapes, override_strides)
 
-    def get_workspace_size_plan_at_index(self, index: int, *args, **kwargs) -> int:
+    def get_workspace_size_plan_at_index(self, index: int, handle=None, override_uids=None, override_shapes=None, override_strides=None) -> int:
         """Workspace bytes for the plan at ``index`` in the ranked list."""
-        args, kwargs = unwrap_handles(args, kwargs)  # a Handle in the overloads -> backend handle for C++
         if not self._planning_done:  # e.g. a deserialized graph: C++ owns the list
-            return self._lowered_graph.get_workspace_size_plan_at_index(index, *args, **kwargs)
+            return self._lowered_graph.get_workspace_size_plan_at_index(index, to_backend_handle(handle), override_uids, override_shapes, override_strides)
         self._reject_if_barred(self._check_plan_index(index))
         cfg = self._plans[index]
         if self._engine_for(cfg) is not None:
@@ -1570,8 +1569,8 @@ class pygraph:
             return self._compiled_plans[index].get_workspace_size()
         cfg = self._materialize_backend_plan(index)
         if cfg.cpp_index is None:  # delegating entry
-            return self._lowered_graph.get_workspace_size(*args, **kwargs)
-        return self._lowered_graph.get_workspace_size_plan_at_index(cfg.cpp_index, *args, **kwargs)
+            return self._lowered_graph.get_workspace_size(to_backend_handle(handle), override_uids, override_shapes, override_strides)
+        return self._lowered_graph.get_workspace_size_plan_at_index(cfg.cpp_index, to_backend_handle(handle), override_uids, override_shapes, override_strides)
 
     def _reject_if_barred(self, index: int) -> None:
         """The ranked list is never filtered (indices stay stable), so every
@@ -1643,19 +1642,18 @@ class pygraph:
         self._lower_backend_plan()
         return self._lowered_graph.get_behavior_notes(*args, **kwargs)
 
-    def populate_cuda_graph(self, *args, **kwargs):
+    def populate_cuda_graph(self, handle, variant_pack, workspace, cuda_graph):
         """Classic CUDA-graph capture — the backend's, so a python plan declines.
 
         Capture itself is not the obstacle (the python engines run on the
         execute-time handle's stream); this API records the BACKEND's plan."""
-        return self._cuda_graph_call("populate_cuda_graph", *args, **kwargs)
+        return self._cuda_graph_call("populate_cuda_graph", to_backend_handle(handle), variant_pack, workspace, cuda_graph)
 
-    def update_cuda_graph(self, *args, **kwargs):
+    def update_cuda_graph(self, handle, variant_pack, workspace, cuda_graph):
         """Classic CUDA-graph update — backend plans only, as above."""
-        return self._cuda_graph_call("update_cuda_graph", *args, **kwargs)
+        return self._cuda_graph_call("update_cuda_graph", to_backend_handle(handle), variant_pack, workspace, cuda_graph)
 
     def _cuda_graph_call(self, name: str, *args, **kwargs):
-        args, kwargs = unwrap_handles(args, kwargs)  # populate/update_cuda_graph take the handle first
         eng = self.selected_engine
         if eng is not None:
             raise cudnn_graph_not_supported(f"{name}() records a cuDNN backend plan; the selected plan is served by the python engine {eng.name!r}")
@@ -2089,9 +2087,12 @@ class pygraph:
         return self._lowered_graph.serialize()
 
     def deserialize(self, *args, **kwargs) -> None:
-        """Deserialize a graph (classic passthrough: (data) or (handle, data,
-        enforce_precompiled=...)). Replaces this graph's lowered C++ graph."""
-        args, kwargs = unwrap_handles(args, kwargs)  # classic (handle, data, ...) -> backend handle for C++
+        """Deserialize a graph. This is the one genuinely ambiguous classic
+        overload -- ``(data)`` or ``(handle, data, enforce_precompiled=...)`` --
+        so it stays a passthrough; a handle can only be the first positional, and
+        ``to_backend_handle`` is a no-op on the ``data`` blob, so unwrap just that."""
+        if args:
+            args = (to_backend_handle(args[0]),) + args[1:]
         if self._lowered_graph is None:
             import cudnn
 
