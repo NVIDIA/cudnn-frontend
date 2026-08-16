@@ -84,9 +84,21 @@ _pybind_module.create_handle(), ordinal=<current device>)`.
 
 ### `DeviceInfo` (the union `Handle.device` exposes)
 
-Sourced from `frost/device.py`'s driver introspector (the richest, framework-
-neutral, already `lru_cache`d per ordinal). Reuse those functions; do not add a
-fourth query stack. Fields (superset the inventory proved is consumed):
+Lives in `cudnn/_device.py` — the FE's **single owner** of a GPU's facts. Each
+fact is a `@cached_property` that queries the driver once and caches **on the
+instance**, and there is one instance per ordinal (`device_info(ordinal)`,
+lru-cached), so a GPU's facts are asked for once and shared. `Handle.device` is
+that object.
+
+This inverts the previous direction: the driver queries used to live in
+`frost/device.py` and `DeviceInfo` delegated down to them. Now the common layer
+owns the queries, and `frost/device.py`'s fact functions (`compute_capability`,
+`multiprocessor_count`, ...) are **thin shims** onto `device_info(ordinal)` — so
+frost consumes the same object rather than running a parallel introspection
+stack, and its ~24-file / 65-site call surface is unchanged. (A later step can
+repoint those sites at `handle.device.*` directly where a handle is in scope; the
+ownership move here is the enabling half.) Fields (superset the inventory proved
+is consumed):
 
 | field | form | consumers |
 |---|---|---|

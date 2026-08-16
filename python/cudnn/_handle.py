@@ -15,74 +15,9 @@ the C++ layer is unchanged.
 
 from __future__ import annotations
 
-import functools
-
-
-@functools.lru_cache(maxsize=None)
-def _device_info(ordinal: int) -> "DeviceInfo":
-    """One DeviceInfo per ordinal (never keyed by Handle: the per-device driver
-    caches assume a stable ordinal, and two handles on the same GPU share facts)."""
-    return DeviceInfo(ordinal)
-
-
-class DeviceInfo:
-    """Device facts for a CUDA ordinal, read from the frost driver introspector
-    (``cudnn.frost.device``, itself lru_cached per ordinal). This is the single
-    device-info surface for the FE — every field a caller needs off a handle.
-
-    The introspector is imported lazily so a plain cuDNN-backend user who never
-    touches ``handle.device`` does not pull in the frost/cuda-python stack.
-    """
-
-    __slots__ = ("ordinal",)
-
-    def __init__(self, ordinal: int):
-        self.ordinal = int(ordinal)
-
-    @property
-    def compute_capability(self) -> tuple[int, int]:
-        from .frost.device import compute_capability
-
-        return compute_capability(self.ordinal)
-
-    @property
-    def sm_version(self) -> int:
-        """Packed ``major * 10 + minor`` (derived, so it cannot drift from the tuple)."""
-        major, minor = self.compute_capability
-        return major * 10 + minor
-
-    @property
-    def sm_count(self) -> int:
-        from .frost.device import multiprocessor_count
-
-        return multiprocessor_count(self.ordinal)
-
-    @property
-    def shared_memory_per_block_optin(self) -> int:
-        from .frost.device import shared_memory_per_block_optin
-
-        return shared_memory_per_block_optin(self.ordinal)
-
-    @property
-    def oversized_shared_memory_per_block(self) -> int:
-        from .frost.device import oversized_shared_memory_per_block
-
-        return oversized_shared_memory_per_block(self.ordinal)
-
-    @property
-    def l2_cache_bytes(self) -> int:
-        from .frost.device import l2_cache_bytes
-
-        return l2_cache_bytes(self.ordinal)
-
-    @property
-    def device_name(self) -> str:
-        from .frost.device import device_name
-
-        return device_name(self.ordinal)
-
-    def __repr__(self) -> str:
-        return f"DeviceInfo(cuda:{self.ordinal})"
+# The device-fact layer lives in cudnn._device (the FE's single owner of a GPU's
+# properties); Handle.device is the DeviceInfo for the handle's ordinal.
+from ._device import DeviceInfo, device_info
 
 
 class Handle:
@@ -119,7 +54,7 @@ class Handle:
             from .frost.device import current_device
 
             ordinal = self._ordinal = current_device()
-        return _device_info(ordinal)
+        return device_info(ordinal)
 
     def __repr__(self) -> str:
         return f"cudnn.Handle(backend_handle=0x{self.backend_handle:x}, cuda:{self._ordinal})"
