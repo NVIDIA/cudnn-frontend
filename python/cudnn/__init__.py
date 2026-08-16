@@ -72,9 +72,10 @@ def create_handle():
     """Create a cuDNN handle, returned as a first-class :class:`cudnn.Handle`.
 
     The Handle wraps the backend ``cudnnHandle_t`` and is bound to the current
-    CUDA device; it forwards to the backend anywhere an ``intptr_t`` handle is
-    expected (via ``__index__``), so existing code that passes the handle to
-    ``graph.execute`` / ``set_stream`` / the C++ layer is unchanged.
+    CUDA device. Anywhere the backend needs the raw ``cudnnHandle_t`` it is
+    extracted explicitly via ``to_backend_handle()`` (grep it to trace every
+    handoff) -- the Handle is never silently coerced to an int, so a Handle that
+    reaches a binding unconverted fails loudly rather than being magically cast.
     """
     raw = _pybind_module.create_handle()
     ordinal = None
