@@ -1324,6 +1324,18 @@ class SM120FusedMultiHeadAttentionForward:
         :param amax_o: 1-element Int32 amax buffer (pre-zeroed; dummy ok).
         :param softmax_scale_log2: ``softmax_scale * descale_q * descale_k * log2(e)``.
         :param o_scale_fused: ``descale_s * descale_v * scale_o``.
+        :param thd_max_sq: THD only: the PLAN-TIME declared S_q envelope (it
+            sizes the per-sequence grid without entering the compile cache
+            key; every runtime length is bounded by it, and tiles past a
+            sequence's real length drain without loads or stores); 0 /
+            ignored when dense.
+        :param thd_q_lens: THD only: the CALLER's Q length tensor — (B,)
+            per-batch lengths or (B+1,) cu prefix sums — consumed by the
+            setup kernel's device-side metadata build (issue #552). None
+            (folded out of the ABI) when dense.
+        :param thd_kv_lens: THD only: same for the KV side.
+        :param thd_lens_form: THD only: runtime bitmask — bit 0: Q is cu,
+            bit 1: KV is cu.
         :param stream: CUDA stream used for the launch.
         """
         head_dim_qk = q.shape[3]

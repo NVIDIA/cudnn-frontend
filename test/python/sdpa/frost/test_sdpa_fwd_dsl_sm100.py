@@ -1189,14 +1189,18 @@ def test_dsl_sm100_thd_cu_nonzero_base_normalized():
     assert api.check_support()
     api.compile()
 
-    def _run(base):
-        cu = torch.tensor([base, base + 200, base + 350], dtype=torch.int32, device="cuda")
+    def _run(base_q, base_kv):
+        # Distinct Q/KV prefix tensors with DIFFERENT lengths and bases: a
+        # normalization that subtracts one side's base from the other (or
+        # shares one tensor for both) cannot pass this by accident.
+        cu_q = torch.tensor([base_q, base_q + 200, base_q + 350], dtype=torch.int32, device="cuda")
+        cu_kv = torch.tensor([base_kv, base_kv + 180, base_kv + 310], dtype=torch.int32, device="cuda")
         o.zero_()
-        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=cu, seq_kv_lens=cu)
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=cu_q, seq_kv_lens=cu_kv)
         torch.cuda.synchronize()
         return o.clone()
 
-    assert torch.equal(_run(0), _run(1000))
+    assert torch.equal(_run(0, 0), _run(1000, 7000))
 
 
 @pytest.mark.L1
@@ -1280,11 +1284,16 @@ def test_dsl_sm100_thd_execute_cuda_graph_capture():
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens)
+    # Clobber O before each replay: the warm-up (and nothing else) has already
+    # produced the [200, 150] answer, so without this the first assertion
+    # would be satisfied by stale warm-up output even if replay did nothing.
+    o.zero_()
     graph.replay()
     torch.cuda.synchronize()
     _check([200, 150])
     # New lengths into the SAME device tensor — replay must honor them.
     lens.copy_(torch.tensor([64, 33], dtype=torch.int32, device="cuda"))
+    o.zero_()
     graph.replay()
     torch.cuda.synchronize()
     _check([64, 33])
