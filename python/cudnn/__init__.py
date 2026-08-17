@@ -332,6 +332,13 @@ def __getattr__(name: str) -> Any:
         globals()["jax"] = _jax
         return _jax
 
+    if name == "fla":
+        # `import cudnn; cudnn.fla.accelerate_fla()` works like `import cudnn.fla`.
+        # Deferred so `import cudnn` never eagerly imports torch / the FLA shim.
+        _fla = importlib.import_module(".fla", __name__)
+        globals()["fla"] = _fla
+        return _fla
+
     if name in _LAZY_OPTIONAL_IMPORTS:
         return _load_optional_symbol(name)
 
