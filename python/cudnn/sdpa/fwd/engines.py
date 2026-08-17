@@ -140,7 +140,6 @@ class Capabilities:
 
     causal: bool = False
     bottom_right: bool = False
-    bottom_right_with_swa: bool = False  # kernel gap: BR diagonal excludes SWA
     # Kernel gap (pre-existing): for a DENSE padded graph the BR diagonal is
     # computed as seq_len_kv[b] - GLOBAL S_q, but cuDNN semantics for a dense
     # padded graph carrying per-batch seq_len_q anchor it at
@@ -366,8 +365,6 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             return "bottom-right alignment requires a causal upper bound (plain or right-widened)"
         if not capabilities.bottom_right:
             return "graph uses bottom-right causal, which this kernel does not support"
-        if facts.window_left is not None and not capabilities.bottom_right_with_swa:
-            return "bottom-right causal combined with a sliding window is not supported"
         if facts.padded and not facts.thd and facts.seq_q_t is not None and not capabilities.bottom_right_padded_seq_q:
             return (
                 "bottom-right causal with a dense padding mask carrying per-batch seq_len_q is not "
@@ -419,7 +416,6 @@ def _sm100_spec(d: int, d_v: Optional[int] = None) -> EngineSpec:
             dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
             causal=True,
             bottom_right=True,
-            bottom_right_with_swa=True,
             right_band_widening=True,
             swa=True,
             padded=True,
@@ -470,9 +466,6 @@ def _sm100_mxfp8_spec(d: int) -> EngineSpec:
             is_mxfp8=True,
             causal=True,
             bottom_right=True,
-            # BR+SWA stays off this row: the one mhas graph it admits trips the
-            # mxfp8 executor's SF-size mismatch (pre-existing SF-layout issue,
-            # independent of the mask) — flip once that plumbing is fixed.
             right_band_widening=True,
             swa=True,
             padded=True,
@@ -511,7 +504,6 @@ def _sm100_fp8_spec(d: int) -> EngineSpec:
             is_fp8=True,
             causal=True,
             bottom_right=True,
-            bottom_right_with_swa=True,
             right_band_widening=True,
             swa=True,
             padded=True,
@@ -566,7 +558,6 @@ def _sm80_spec() -> EngineSpec:
             right_band_widening=True,
             causal=True,
             bottom_right=True,
-            bottom_right_with_swa=True,
             bottom_right_padded_seq_q=True,
             swa=True,
             padded=True,
@@ -662,7 +653,6 @@ def _sm120_spec() -> EngineSpec:
             dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
             causal=True,
             bottom_right=True,
-            bottom_right_with_swa=True,
             bottom_right_padded_seq_q=True,
             swa=True,
             right_band_widening=True,
@@ -1009,7 +999,6 @@ def _sm120_fp8_spec() -> EngineSpec:
             is_fp8=True,
             causal=True,
             bottom_right=True,
-            bottom_right_with_swa=True,
             bottom_right_padded_seq_q=True,
             swa=True,
             right_band_widening=True,
