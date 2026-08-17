@@ -60,9 +60,12 @@ class ModelPreset:
 def with_tp_shards(preset: "ModelPreset", degrees: List[int]) -> List["ModelPreset"]:
     """Expand a whole-model preset into per-GPU tensor-parallel shards.
 
-    TP=1 keeps the original preset; TP=n divides q heads by n and kv heads by
-    n (floored at 1 — kv heads replicate once the group is exhausted), naming
-    the shard "<name>-tp<n>".
+    Follows what serving frameworks actually do: q heads must divide evenly
+    across ranks, and kv heads either divide evenly or are replicated when
+    there are fewer kv heads than ranks (which requires tp % num_kv_heads ==
+    0, each rank then holding one kv head). Anything else is rejected — a
+    model that doesn't shard this way isn't head-parallelized in practice.
+    TP=1 keeps the original preset; shards are named "<name>-tp<n>".
     """
     from dataclasses import replace
 
@@ -70,15 +73,19 @@ def with_tp_shards(preset: "ModelPreset", degrees: List[int]) -> List["ModelPres
     for n in degrees:
         if n == 1:
             out.append(preset)
-        else:
-            out.append(
-                replace(
-                    preset,
-                    name=f"{preset.name}-tp{n}",
-                    num_q_heads=max(1, preset.num_q_heads // n),
-                    num_kv_heads=max(1, preset.num_kv_heads // n),
-                )
+            continue
+        if preset.num_q_heads % n != 0:
+            raise ValueError(f"{preset.name}: {preset.num_q_heads} q heads do not shard across tp={n}")
+        if preset.num_kv_heads % n != 0 and n % preset.num_kv_heads != 0:
+            raise ValueError(f"{preset.name}: {preset.num_kv_heads} kv heads neither divide nor replicate across tp={n}")
+        out.append(
+            replace(
+                preset,
+                name=f"{preset.name}-tp{n}",
+                num_q_heads=preset.num_q_heads // n,
+                num_kv_heads=max(1, preset.num_kv_heads // n),
             )
+        )
     return out
 
 
@@ -100,8 +107,10 @@ class InferenceBenchmarkConfig:
     backends: List[str] = field(default_factory=lambda: ["cudnn"])
     data_types: List[str] = field(default_factory=lambda: ["bfloat16"])
     # KV-cache dtype axis for the generation phase ("bfloat16", "fp8_e4m3").
-    # Serving deployments increasingly hold the KV cache in fp8 while queries
-    # stay bf16; context always uses data_types.
+    # Named for the serving configuration it corresponds to (fp8 KV cache);
+    # NB the cudnn paths realize "fp8_e4m3" as the full fp8 attention graph —
+    # q/k/v/o all e4m3 with unit descales — not bf16 queries against an fp8
+    # cache. Context always uses data_types.
     kv_cache_dtypes: List[str] = field(default_factory=lambda: ["bfloat16"])
     context_batch_size: int = 1
     generation_batch_sizes: List[int] = field(default_factory=lambda: [1, 32])

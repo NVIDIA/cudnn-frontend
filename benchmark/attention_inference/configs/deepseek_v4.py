@@ -11,10 +11,12 @@ and a sliding-window branch of 128. Config values from the official
 deepseek-ai/DeepSeek-V4-Flash and -Pro configs (head_dim=512,
 qk_rope_head_dim=64, num_key_value_heads=1).
 
-The dense core benchmarked here is the sliding-window MQA every layer runs;
-the CSA/HCA compressed-pool + lightning-indexer machinery is out of scope for
-a single-kernel benchmark. Modeled as kind="mla_absorbed" so KV bytes are
-counted once for the shared record.
+The presets benchmark the dense shared-K=V core UNWINDOWED: the production
+W=128 sliding window reads at most 128 cached tokens, which is not a
+KV-cache-bound problem, so the unwindowed sweep is the upper-bound stress on
+the shared record (the CSA/HCA compressed-pool + lightning-indexer machinery
+is likewise out of scope for a single-kernel benchmark). Modeled as
+kind="mla_absorbed" so KV bytes are counted once for the shared record.
 """
 
 from ..config_types import InferenceBenchmarkConfig, ModelPreset, with_tp_shards
@@ -40,9 +42,7 @@ DSV4_PRO = ModelPreset(
 CONFIG = InferenceBenchmarkConfig(
     name="deepseek_v4",
     models=with_tp_shards(DSV4_FLASH, [1, 2, 4, 8]) + with_tp_shards(DSV4_PRO, [1, 2, 4, 8]),
-    # Context: the sliding-window dense core over the full sequence would be
-    # SWA-dominated; benchmark the unwindowed core at moderate lengths plus
-    # the windowed shape (window covers locality; pools cover long range).
+    # Context: unwindowed core at moderate lengths (see module docstring).
     context_seqlens=[2048, 8192],
     context_chunked_shapes=[
         (512, 65536),

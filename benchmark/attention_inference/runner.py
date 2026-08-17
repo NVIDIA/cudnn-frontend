@@ -273,6 +273,10 @@ def main():
         cases = list(runner.expand_config(config))
         if args.filter_backend:
             cases = [c for c in cases if c["backend"] == args.filter_backend]
+        if args.filter_model:
+            cases = [c for c in cases if args.filter_model in c["model"].name]
+        if args.filter_phase:
+            cases = [c for c in cases if c["phase"] == args.filter_phase]
         print(f"Would run {len(cases)} cases from '{config.name}':")
         for i, c in enumerate(cases, 1):
             print(f"  [{i}] {c['model'].name} | {c['phase']} | b={c['batch_size']} q={c['q_tokens']} kv={c['kv_len']} | {c['backend']} | {c['data_type']}")

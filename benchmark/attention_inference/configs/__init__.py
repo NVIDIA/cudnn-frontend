@@ -12,6 +12,10 @@ def list_configs():
 def load_config(name: str):
     try:
         module = importlib.import_module(f".{name}", __package__)
-    except ModuleNotFoundError:
-        raise ValueError(f"Unknown config '{name}'. Available: {', '.join(list_configs())}")
+    except ModuleNotFoundError as e:
+        # only translate "no such config module" — a missing dependency raised
+        # from inside a valid config module must propagate as itself
+        if e.name == f"{__package__}.{name}":
+            raise ValueError(f"Unknown config '{name}'. Available: {', '.join(list_configs())}") from None
+        raise
     return module.CONFIG

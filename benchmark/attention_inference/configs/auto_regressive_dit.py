@@ -13,7 +13,7 @@ against the cached clip for completeness. The training suite carries its own
 forward-only sweep of the same model (`sdpa_benchmark_training`).
 """
 
-from ..config_types import InferenceBenchmarkConfig, ModelPreset, with_tp_shards
+from ..config_types import InferenceBenchmarkConfig, ModelPreset
 
 AR_DIT = ModelPreset(
     name="ar_dit",
@@ -24,7 +24,9 @@ AR_DIT = ModelPreset(
 
 CONFIG = InferenceBenchmarkConfig(
     name="auto_regressive_dit",
-    models=with_tp_shards(AR_DIT, [1, 2, 4, 8]),
+    # No TP shards: 9 heads don't head-shard, and video DiT deployments use
+    # sequence/context parallelism — attention runs whole-model per device.
+    models=[AR_DIT],
     context_seqlens=[8192, 62208],
     context_chunked_shapes=[
         (985, 62208),

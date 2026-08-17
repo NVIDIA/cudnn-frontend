@@ -12,9 +12,10 @@ raw QK width 192 (qk_nope 128 + 64). 96 query heads. Config values from the
 official moonshotai/Kimi-K3 config.json.
 
 Generation runs the absorbed shape (576/512 shared record, MQA-style).
-Context (prefill) for MLA models runs unabsorbed — that is the training
-suite's kimi_k3 config (96 heads, d_qk=192, d_v=128) — so this config only
-sweeps generation.
+Context (prefill) for latent-absorbed MLA runs unabsorbed — that is the
+training suite's kimi_k3 config (96 heads, d_qk=192, d_v=128). The context
+shapes below are still swept so the coverage gap shows up as blank slots in
+the charts rather than silently missing.
 """
 
 import math

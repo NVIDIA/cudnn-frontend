@@ -14,7 +14,7 @@ fi
 shift; [ $# -gt 0 ] && shift
 CONFIGS=("$@")
 [ ${#CONFIGS[@]} -eq 0 ] && CONFIGS=(llama qwen35 gpt_oss deepseek_v4 kimi_k3 auto_regressive_dit)
-cd "$(dirname "$0")/../.."
+cd "$(dirname "$0")/../.." || exit 1
 
 declare -A NAMES=(
     [llama]=llama3.1
@@ -24,7 +24,12 @@ declare -A NAMES=(
     [kimi_k3]=kimi_k3
     [auto_regressive_dit]=auto_regressive_dit
 )
+mkdir -p benchmark/attention_inference/results
 for cfg in "${CONFIGS[@]}"; do
+    if [ -z "${NAMES[$cfg]:-}" ]; then
+        echo "!! unknown config '$cfg' (known: ${!NAMES[*]})"
+        continue
+    fi
     echo "=== $cfg -> results/${NAMES[$cfg]}/$ARCH ==="
     python -m benchmark.attention_inference.runner --config "$cfg" \
         --output-dir "benchmark/attention_inference/results/${NAMES[$cfg]}/$ARCH" \

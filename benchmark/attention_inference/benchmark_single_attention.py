@@ -217,6 +217,8 @@ def setup_cudnn_oss(args, dtype):
 
 def setup_cudnn_fp8(args, cudnn, oss=False):
     """FP8 attention graph (q/k/v e4m3 with unit descales) for the fp8-KV axis."""
+    if args.has_sink:
+        raise NotImplementedError("sink tokens are not wired into the fp8 attention graph")
     b, hq, hkv = args.batch_size, args.num_q_heads, args.num_kv_heads
     dqk, dvo = args.head_dim_qk, args.head_dim_vo
     sq, skv = args.q_tokens, args.kv_len
@@ -252,6 +254,10 @@ def setup_cudnn_fp8(args, cudnn, oss=False):
             kwargs["use_causal_mask_bottom_right"] = True
     if args.sliding_window_size:
         kwargs["sliding_window"] = args.sliding_window_size
+        if args.phase == "generation" and sq == 1:
+            # anchor the window to the END of the cache, mirroring the bf16
+            # path — top-left anchoring would window the wrong tokens
+            kwargs["use_causal_mask_bottom_right"] = True
     ret = graph.sdpa_fp8(**kwargs)
     o, amax_s, amax_o = ret[0], ret[2], ret[3]
     o.set_output(True).set_dim(o_gpu.size()).set_stride(o_gpu.stride())
@@ -728,6 +734,8 @@ def main():
         kv_shared=args.kind == "mla_absorbed",
         sliding_window=args.sliding_window_size,
         kv_elt_size=1 if args.kv_cache_dtype == "fp8_e4m3" else 2,
+        # the cudnn fp8 graph holds Q and O in e4m3 as well
+        qo_elt_size=1 if args.kv_cache_dtype == "fp8_e4m3" and args.backend in ("cudnn", "cudnn_oss") else 2,
     )
     tflops = flops / (ms * 1e-3) / 1e12
     gbps = byts / (ms * 1e-3) / 1e9

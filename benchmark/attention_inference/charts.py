@@ -122,6 +122,8 @@ def _plot_phase(df, config, phase: str, outdir: Path) -> List[Path]:
     # hold their slot as a blank bar.
     pdf = df[df.phase == phase].copy()
     pdf = pdf[pdf.backend.isin(BACKEND_ORDER)]
+    # older CSVs may carry model shards the config has since dropped
+    pdf = pdf[pdf.model_name.isin({m.name for m in config.models})]
     if phase == "generation":
         # honor the config's current axes: older CSVs may carry batches or
         # cache lengths the config has since dropped as redundant

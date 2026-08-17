@@ -37,13 +37,17 @@ in the charts. Additional reference backends (`flashinfer`, `flash_mla`,
 | `kimi_k3` | absorbed MLA, 96 heads, 576/512, scale 1/√192, page 32 | context swept but structurally unabsorbed at prefill → blank slots (see training suite) |
 | `auto_regressive_dit` | dense 9/9, d=128, bidirectional | chunked AR steps live in the context phase's chunked kind |
 
-Model dimensions come from the official HuggingFace configs. Every model is
-swept across tensor-parallel shards (**TP 1/2/4/8**) — the `-tpN` presets are
+Model dimensions come from the official HuggingFace configs. Every LLM model
+is swept across tensor-parallel shards (**TP 1/2/4/8**, framework rules: q
+heads divide evenly, kv heads divide or replicate) — the `-tpN` presets are
 the per-GPU shapes deployments actually execute: few local heads, large
-batches. Generation additionally sweeps the KV-cache dtype
-(`kv_cache_dtypes`): bf16 queries against an fp8-e4m3 cache is a standard
-serving configuration. Sinks (`has_sink`) add per-head attention-sink logits
-(gpt-oss-style).
+batches. The 9-head video DiT is not head-shardable and runs whole-model
+(deployments use sequence/context parallelism there). Generation
+additionally sweeps the KV-cache dtype (`kv_cache_dtypes`): this corresponds
+to the fp8-KV-cache serving configuration, realized on the cudnn paths as
+the full fp8 attention graph (q/k/v/o e4m3 with unit descales). Sinks
+(`has_sink`) add per-head attention-sink logits (gpt-oss-style; not wired
+into the fp8 graph — those cases record as unsupported).
 
 MLA models run **absorbed** in generation (`kind="mla_absorbed"`: K reads the
 full record, V a leading slice of the *same* record, so KV bytes are counted
