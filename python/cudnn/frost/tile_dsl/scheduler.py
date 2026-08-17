@@ -29,7 +29,7 @@ def decode_linear_tile_lpt(linear, q_h, batch, q_tiles):
 def decode_linear_tile_lpt_l2(linear, q_h, batch, q_tiles, heads_per_kv, seqlen_kv, kv_bytes_per_row, l2_bytes):
     n_kh = q_h // heads_per_kv
     num_groups = n_kh * batch
-    # Guard per_group == 0 (the C++ does; a zero KV length would divide by zero).
+    # Guard per_group == 0: a zero KV length would divide by zero below.
     per_group_raw = seqlen_kv * cutlass.Int32(kv_bytes_per_row)
     per_group = cutlass.Int32(
         arith.select(
