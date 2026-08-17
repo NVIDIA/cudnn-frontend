@@ -120,8 +120,8 @@ from ..common.thd import emit_copy_desc, emit_checkpoint_seq_descs, emit_seq_des
 from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMS, ORDER_THREADS, decode_work_item, order_body
 from ..common.elementwise import softplus
 from ..common.host import get_dtype
-from cudnn.frost.buffers import current_device_id, data_ptr
-from cudnn.frost.device import multiprocessor_count
+from cudnn.frost.buffers import data_ptr
+from cudnn.frost.device import current_device, multiprocessor_count
 
 RCP_LN2 = 1.4426950408889634  # 1/ln(2): natural-log gates -> the kernel's log2 domain
 from cudnn.frost.tile_dsl.barrier import (
@@ -4723,7 +4723,7 @@ def chunk_gdn_bwd_sm100(
             safe_gate=safe_gate,
             beta_sigmoid=use_beta_sigmoid,
             dyn_sched=dyn_sched,
-            num_sm=multiprocessor_count(current_device_id()),
+            num_sm=multiprocessor_count(current_device()),
             h_q=HQ,
             h_k=HK,
             h_v=HV,

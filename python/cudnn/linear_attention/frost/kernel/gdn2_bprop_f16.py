@@ -62,8 +62,8 @@ from cutlass.cute.runtime import from_dlpack
 
 from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMS, ORDER_THREADS, decode_work_item, order_body
 from ..common.host import get_dtype
-from cudnn.frost.buffers import current_device_id, data_ptr
-from cudnn.frost.device import multiprocessor_count
+from cudnn.frost.buffers import data_ptr
+from cudnn.frost.device import current_device, multiprocessor_count
 from ..common.thd import TENSOR_MAP_QWORDS, emit_copy_desc, emit_checkpoint_seq_descs, emit_seq_descs
 from .gdn2_bprop_config import CFG
 
@@ -4204,7 +4204,7 @@ def chunk_gdn2_bwd_sm100(
             k_ratio=HO // HK,
             v_ratio=HO // HV,
             n_heads_out=HO,
-            max_active_clusters=multiprocessor_count(current_device_id()),
+            max_active_clusters=multiprocessor_count(current_device()),
             dyn_sched=dyn_sched,
         )
 

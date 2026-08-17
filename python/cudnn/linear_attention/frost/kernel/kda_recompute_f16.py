@@ -96,8 +96,8 @@ from cutlass.cute.runtime import from_dlpack
 
 from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMS, ORDER_THREADS, decode_work_item, order_body
 from ..common.host import get_dtype
-from cudnn.frost.buffers import current_device_id, data_ptr
-from cudnn.frost.device import multiprocessor_count
+from cudnn.frost.buffers import data_ptr
+from cudnn.frost.device import current_device, multiprocessor_count
 from ..common.thd import TENSOR_MAP_QWORDS, emit_checkpoint_seq_descs, emit_seq_descs
 from .kda_recompute_config import CFG
 
@@ -2536,7 +2536,7 @@ def chunk_kda_recompute_sm100(
             v_ratio,
             HO,
             dyn_sched,
-            num_sm=multiprocessor_count(current_device_id()),
+            num_sm=multiprocessor_count(current_device()),
             k_cute=k_cute,
             v_cute=v_cute,
             gate_cute=gate_cute,

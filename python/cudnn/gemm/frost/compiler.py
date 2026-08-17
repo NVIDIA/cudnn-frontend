@@ -86,6 +86,64 @@ _TVM_FFI_OK = importlib.util.find_spec("tvm_ffi") is not None
 _FROST_COMPILE_OPTIONS = "--enable-tvm-ffi" if _TVM_FFI_OK else ""
 
 
+def _supports_gpu_arch_option() -> bool:
+    """Whether this cutedsl threads ``--gpu-arch`` from the cute.compile() options
+    string to the compile target — dsl.compile_and_cache / get_arch_enum consult
+    ``compile_options.gpu_arch`` before the (import-time, ambient-detected) env
+    arch. That landed in the public wheel at 4.7 (frost's ``CUTEDSL_MIN_VERSION``),
+    so the ONLY build that lacks it is a public ``nvidia-cutlass-dsl`` wheel below
+    the floor. Reuses ``buffers.cutedsl_too_old`` so an internal RC (its own 0.x
+    numbering) is judged new, not old — matching how the rest of frost gates it."""
+    from cudnn.frost.buffers import cutedsl_state, cutedsl_too_old
+
+    return not cutedsl_too_old(cutedsl_state()[1])
+
+
+def _sm_target_string(arch: int) -> str:
+    """``major*10+minor`` -> the cute ``sm_XXX[a]`` target, matching cutedsl's own
+    ``detect_gpu_arch`` (the arch-specific ``a`` suffix appears from major >= 9)."""
+    major, minor = divmod(arch, 10)
+    return f"sm_{major}{minor}{'a' if major >= 9 else ''}"
+
+
+def _frost_compile_options() -> str:
+    """The ``cute.compile()`` options string for a build in the current
+    ``build_device()`` scope. Pins ``--gpu-arch`` to the scope's GPU so the
+    compile target follows the handle instead of the ambient CUDA device. On a
+    public wheel below the floor the option is inert, so a handle-scoped build is
+    refused rather than silently mis-targeted; an unscoped build needs no pin.
+    (frost declines such wheels as too-old before reaching here, so the refusal
+    is belt-and-suspenders.)
+
+    Called at render time (inside the scope) so the arch is baked into the
+    generated source, keeping it part of the content-addressed cache key."""
+    from cudnn.frost.device import build_scope_device as _build_scope_device
+
+    opts = [_FROST_COMPILE_OPTIONS] if _FROST_COMPILE_OPTIONS else []
+    arch = _current_arch()  # scope-aware: the handle's GPU inside build_device()
+    if arch is None:
+        return " ".join(opts)  # render-only / no GPU visible
+    if _supports_gpu_arch_option():
+        opts.append(f"--gpu-arch {_sm_target_string(arch)}")
+    elif _build_scope_device() is not None:
+        # A handle pinned a GPU (build_device scope) but this wheel cannot pin the
+        # compile target: cutedsl resolves it from an arch captured at IMPORT time,
+        # which we can neither set NOR reliably read here (comparing against the
+        # live device would miss an import-on-B, build-on-A process). We cannot
+        # honor the scope, so refuse rather than bake scope constants into a
+        # possibly-mis-targeted kernel. (frost's cutedsl_too_old gate already
+        # declines such wheels, so this is belt-and-suspenders.) An unscoped build
+        # makes no cross-device promise and falls through unchanged.
+        major, minor = divmod(arch, 10)
+        raise NotImplementedError(
+            f"cudnn.frost: a handle-scoped build for sm_{major}{minor} needs an nvidia-cutlass-dsl "
+            f"that pins the compile target (public >= 4.7 or an internal RC); this wheel cannot, so "
+            f"the build cannot follow the handle. Upgrade cutedsl, or build with the handle's GPU "
+            f"already current (no build_device scope)."
+        )
+    return " ".join(opts)
+
+
 # ---------------------------------------------------------------------------
 # Symbolic-shape helpers for aux fake tensors
 # ---------------------------------------------------------------------------
@@ -642,7 +700,7 @@ def _render_tile_constants(
     # divides every power-of-2 subtile span of this config's N-tile).
     vec_bytes_epi = _epi_vec_bytes(chain, cfg, cta_group)
     lines.append(f"vec_bytes_epi = {vec_bytes_epi}")
-    lines.append(f"frost_compile_options = {_FROST_COMPILE_OPTIONS!r}")
+    lines.append(f"frost_compile_options = {_frost_compile_options()!r}")
     # Epilogue store mode: TMA-store-via-SMEM (preferred) vs per-thread STG
     # (fallback). See _use_tma_store_epi() for gating.
     use_tma = (not _FORCE_STG_EPI) and _use_tma_store_epi(chain, cfg, vec_bytes_epi, cta_group)
@@ -1183,7 +1241,7 @@ def _render_block_scale_tile_constants(
         f"cd_dtype = {'cutlass.Int8' if out_dt == 'fp4_e2m1' else DTYPE_TO_CUTLASS[out_dt]}",
         f"cd_tma_dtype = {'cutlass.Int8' if out_dt == 'fp4_e2m1' else DTYPE_TO_CUTLASS[out_dt]}",
         f"vec_bytes_epi = {vec_bytes_epi}",
-        f"frost_compile_options = {_FROST_COMPILE_OPTIONS!r}",
+        f"frost_compile_options = {_frost_compile_options()!r}",
         f"use_tma_store_epi = {use_tma_store_epi}",
         f"cd_out_is_m_major = {chain.out_major == 'm'}",
         f"cd_fake_n_div = {2 if out_dt == 'fp4_e2m1' else 1}",
@@ -2678,6 +2736,18 @@ def probe_supported(
 
     Block-scale / MoE gate inside their ``_jit_*`` compile paths; here a
     successful analysis is treated as eligible (full validation at compile)."""
+    # frost is written in the cutedsl these kernels compile through; below its
+    # floor the engine cannot build (same gate the linear-attention engines
+    # apply). Decline early so a too-old wheel falls back to the backend instead
+    # of faulting deep in cute -- and so the --gpu-arch target pin, which lands in
+    # cutedsl at the floor, is always available by the time a plan compiles. An
+    # internal RC passes: cutedsl_too_old judges only the public wheel.
+    installed, version = buffers.cutedsl_state()
+    if not installed:
+        raise NotImplementedError("frost_gemm requires the cutedsl extra (nvidia-cutlass-dsl)")
+    if buffers.cutedsl_too_old(version):
+        want = ".".join(str(v) for v in buffers.CUTEDSL_MIN_VERSION)
+        raise NotImplementedError(f"frost_gemm requires nvidia-cutlass-dsl >= {want}; found {version[1]}")
     chain, _binding = analyze_with_binding(graph)
     _dtype_reason = dtype_arch_reject(chain, _current_arch())
     if _dtype_reason is not None:

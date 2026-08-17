@@ -21,17 +21,13 @@ symbols_to_import = [
     "backend_version",
     "backend_version_string",
     "get_last_error_string",
-    "destroy_handle",
     "norm_forward_phase",
     "reduction_mode",
     "behavior_note",
     "knob_type",
-    "create_handle",
     "create_kernel_cache",
     "create_device_properties",
-    "get_stream",
     "numerical_note",
-    "set_stream",
     "build_plan_policy",
     "data_type",
     "tensor_reordering",
@@ -59,6 +55,82 @@ for _optional_symbol in [
 ]:
     if hasattr(_pybind_module, _optional_symbol):
         globals()[_optional_symbol] = getattr(_pybind_module, _optional_symbol)
+
+
+from ._handle import Handle, DeviceInfo
+
+# Type alias for the annotations that reference ``cudnn.handle`` (a supplied handle
+# is a cudnn.Handle, or a bare int for a framework-created foreign handle).
+handle = Handle
+
+
+def create_handle():
+    """Create a cuDNN handle, returned as a first-class :class:`cudnn.Handle`.
+
+    The Handle wraps the backend ``cudnnHandle_t`` and is bound to the current
+    CUDA device. Anywhere the backend needs the raw ``cudnnHandle_t`` it is
+    extracted explicitly via ``to_backend_handle()`` (grep it to trace every
+    handoff) -- the Handle is never silently coerced to an int, so a Handle that
+    reaches a binding unconverted fails loudly rather than being magically cast.
+    """
+    raw = _pybind_module.create_handle()
+    ordinal = None
+    try:
+        from .frost.device import current_device
+
+        ordinal = current_device()
+    except Exception:
+        ordinal = None  # no GPU visible / cuda-python absent: resolve lazily on .device
+    # Seed the stream from the backend's actual stream (a fresh handle runs on
+    # stream 0) so a python plan and a backend plan on this handle agree on the
+    # stream, instead of the python side falling back to torch's current stream.
+    return Handle(raw, ordinal, _pybind_module.get_stream(raw))
+
+
+def set_stream(handle, stream):
+    """Set the CUDA stream a cuDNN handle runs on (wraps the compiled ``cudnnSetStream``).
+
+    ``cudnnSetStream`` is not free: for a non-null stream it issues several CUDA driver queries
+    on every call (green-context detection, stream priority, priority range) to maintain cuDNN's
+    internal per-priority stream pool, even when the stream is unchanged -- ~2.4us/call on
+    Blackwell. Frameworks that call this before every ``execute`` pay it every iteration, so the
+    :class:`cudnn.Handle` remembers its last stream and skips the backend call when it has not
+    changed; a steady-state loop pays it once. (Assumes a Handle is not driven from two streams
+    concurrently, which is the normal single-stream case; a caller that does needs its own handle
+    per stream regardless.)
+    """
+    if not isinstance(handle, Handle):
+        raise TypeError(f"cudnn.set_stream expects a cudnn.Handle (from cudnn.create_handle()), got {type(handle).__name__}")
+    if handle.stream == stream:
+        return
+    if handle.backend_handle is not None:
+        _pybind_module._raw_set_stream(handle.backend_handle, stream)
+    handle.stream = stream
+
+
+def get_stream(handle):
+    """The CUDA stream a :class:`cudnn.Handle` runs on -- the cached ``Handle.stream``, no
+    backend round-trip."""
+    if not isinstance(handle, Handle):
+        raise TypeError(f"cudnn.get_stream expects a cudnn.Handle (from cudnn.create_handle()), got {type(handle).__name__}")
+    return handle.stream
+
+
+def destroy_handle(handle):
+    """Destroy a :class:`cudnn.Handle` (wraps the compiled binding). The backend handle is cleared
+    after destruction so a reused Handle object cannot pass a released ``cudnnHandle_t`` back to
+    C++ (a double-destroy or a later set_stream)."""
+    if not isinstance(handle, Handle):
+        raise TypeError(f"cudnn.destroy_handle expects a cudnn.Handle (from cudnn.create_handle()), got {type(handle).__name__}")
+    backend = handle.backend_handle
+    if backend is None:
+        handle.stream = None
+        return None
+    _pybind_module._raw_destroy_handle(backend)
+    handle.backend_handle = None
+    handle.stream = None
+    return None
+
 
 from .datatypes import _library_type, _is_torch_tensor
 
@@ -204,6 +276,12 @@ _EAGER_PUBLIC_NAMES = (
         )
         if symbol in globals()
     ),
+    "create_handle",
+    "destroy_handle",
+    "get_stream",
+    "set_stream",
+    "Handle",
+    "DeviceInfo",
     "__version__",
     "NodeType",
     "Tensor",
