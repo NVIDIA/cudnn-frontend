@@ -60,8 +60,8 @@ def _to_native(
 ):
     if q.dim() != 4:
         raise _Decline("expected [B, T, H, K]")
-    if q.dtype == torch.float16:
-        raise _Decline("cuDNN KDA is unstable in fp16 (NaN); bf16 only")
+    if q.dtype != torch.bfloat16:
+        raise _Decline("cuDNN KDA is bf16-only (fp16 -> NaN; fp32 unsupported)")
     B, T, H, K = q.shape
 
     if cu_seqlens is None:
