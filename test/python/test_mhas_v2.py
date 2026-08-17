@@ -27,7 +27,7 @@ from sdpa.random_config import (
     RandomChoice,
     SlidingWindowMaskGenerator,
 )
-from sdpa.fp16 import exec_sdpa
+from sdpa.fp16 import exec_sdpa, TensorUid
 from sdpa.fp8 import exec_sdpa_fp8
 from sdpa.mxfp8 import exec_sdpa_mxfp8
 from sdpa.blocked import fetch_blocked_tests
@@ -195,6 +195,60 @@ def test_sdpa_random_bwd_L0(env_info, test_no, request, cudnn_handle):
     test.showConfig(test_no, request)
 
     exec_sdpa(test.cfg, request, cudnn_handle)
+
+
+# # ==================================
+# # L0 directed bprop test: rows with very negative LSE (nvbug 6591137)
+# # ==================================
+#
+# The bprop kernels recompute P = exp(scale * S - LSE) while walking KV in tile
+# groups whose size can exceed the granularity used to decide whether the
+# out-of-bounds KV tail needs masking (on SM90 each CTA covers 2 warp-groups =
+# 128 KV rows while the check used the 64-row tile). An unmasked zero-filled
+# tail evaluates exp(0 - LSE), which overflows to inf once LSE < -ln(FLT_MAX)
+# ~= -88.7 and turns grad_q into NaN through inf * 0 products.
+#
+# Random inputs can never catch this: randn-like data gives LSE ~= log(s_kv) > 0,
+# about 100 away from the overflow threshold, and with benign LSE the unmasked
+# garbage only ever multiplies zero-filled K/V/dO operands, so every stored
+# output stays bit-identical. This test instead engineers query rows that are
+# anti-aligned with every key: all scaled logits are ~= -100, giving
+# LSE ~= -100 + log(s_kv) < -88.7. Sequence lengths cover both halves of a
+# 128-row KV group (s = 64 mod 128), a multiple of 128, and a non-multiple.
+@pytest.mark.parametrize("seq_len", [64, 192, 1216, 1280, 1000], ids=lambda s: f"s{s}")
+@pytest.mark.parametrize("data_type", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+@pytest.mark.L0
+def test_sdpa_negative_lse_bwd_L0(env_info, seq_len, data_type, request, cudnn_handle):
+
+    test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
+
+    cfg = test.cfg
+    cfg.batches = 1
+    cfg.h_q = cfg.h_k = cfg.h_v = 2
+    cfg.s_q = cfg.s_kv = seq_len
+    cfg.d_qk = cfg.d_v = 64  # attn_scale = 0.125 below relies on d_qk = 64
+    cfg.data_type = data_type
+    cfg.is_infer = False
+    cfg.diag_align = cudnn.diagonal_alignment.TOP_LEFT
+    cfg.rng_geom_seed = 0
+    cfg.rng_data_seed = 0
+    cfg.fill_derived_fields()
+
+    test.showConfig((0, 1), request)
+
+    def make_negative_lse_inputs(tensors, rng):
+        q = tensors.get(TensorUid.q)
+        k = tensors.get(TensorUid.k)
+        u = torch.nn.functional.normalize(torch.randn(cfg.d_qk, device="cuda", generator=rng), dim=0)
+        # Keys point along a common direction u with |k . u| ~= 8; the poisoned
+        # query rows are -100 * u, so every attn_scale-scaled (1/sqrt(64)) logit
+        # of those rows is ~= -100 and their LSE is ~= -100 + log(s_kv) < -88.7.
+        noise = torch.randn(k.shape, device="cuda", generator=rng)
+        k.copy_((8.0 * u + 0.05 * noise).to(k.dtype))
+        for row in (0, cfg.s_q // 2, cfg.s_q - 1):
+            q[:, :, row, :] = (-100.0 * u).to(q.dtype)
+
+    exec_sdpa(test.cfg, request, cudnn_handle, tensor_initializer=make_negative_lse_inputs)
 
 
 # # ==================================
