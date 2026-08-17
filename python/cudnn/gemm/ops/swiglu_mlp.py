@@ -12,11 +12,12 @@ cuBLAS GEMMs plus a torch activation by ~1.05-1.20x on the Qwen3.5-27B MLP shape
 the down projection is a separate GEMM (a three-GEMM single graph does not
 compile). Backward recomputes gate/up and runs the dSwiGLU as two cuDNN pointwise
 kernels. (An opt-in ``CUDNN_GEMM_SWIGLU_FROST_BWD=1`` path fuses the ``dh = dout @
-Wd`` dgrad GEMM with the dSwiGLU into one FROST kernel; it is OFF by default because
-FROST's TN mainloop needs a K-contiguous B, so the natural down weight must be
-transposed each backward, and that copy currently costs more than the fused kernel
-saves — a net loss until FROST accepts an N-major B.) Numerically matches torch to
-bf16 noise on the output and all four gradients.
+Wd`` dgrad GEMM with the dSwiGLU into one FROST kernel — taking the natural down
+weight directly, no transpose. That fused stage beats the separate GEMM + two
+pointwise kernels ~1.15-2.64x, but the whole backward is GEMM-bound so it lands at
+~parity; a full-backward win needs the output transpose fused into the epilogue plus
+the remaining GEMMs on FROST. Off by default until then.) Numerically matches torch
+to bf16 noise on the output and all four gradients.
 
 Weights are the ``[I, H]`` / ``[H, I]`` ``nn.Linear`` tensors; they enter the
 GEMMs transposed and are bound as strided ``.t()`` views (cuDNN reads them
@@ -222,12 +223,14 @@ def _frost_dswiglu(dout2, Wd, gate, up):
     (natural down weight), ``gate, up:[M,I]``. Returns ``(dgate, dup):[M,I]``. Raises
     on any unsupported case so the caller falls back to the pointwise path.
 
-    The kernel itself is competitive, but FROST's TN mainloop needs a K-contiguous
-    B, so the ``[H,I]`` weight is transposed to a contiguous ``[I,H]`` buffer on every
-    call (below). At the Qwen3.5-27B shape that copy (~0.37 ms of ~356 MB traffic) is
-    larger than the fused kernel's saving, so this path is a net LOSS versus the
-    pointwise backward and is OFF by default (see ``_FROST_BWD``). It becomes a win
-    once FROST accepts an N-major B and the copy is dropped."""
+    FROST takes the natural down weight directly (an N-major / I-contiguous B — no
+    transpose copy; the downstream ``dg.t()`` wgrad operand is likewise a free strided
+    view). The fused stage beats the separate dh GEMM + two pointwise kernels
+    (~1.15-2.64x, Qwen3.5-27B, SM100); the full backward is ~parity with a fair torch
+    backward because it is GEMM-bound -- the dWd/dWgu/dx GEMMs dominate and are shared.
+    A full-backward win comes from routing those remaining GEMMs through FROST too
+    (dropping the per-GEMM backend-graph wrapper/dispatch cost), not from any transpose
+    (dense bf16 needs none; the MoE-blog's fused transpose is a quantization concern)."""
     from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
     from cudnn.gemm.frost.tile_config import CATALOG
 
@@ -240,9 +243,9 @@ def _frost_dswiglu(dout2, Wd, gate, up):
         cfg = next(c for c in CATALOG if (c.cta_tile_m, c.cta_tile_n, c.cta_tile_k_bytes, c.cgrp_size_m, c.cgrp_size_n) == (128, tn, 128, 1, 1))
         g = cudnn.pygraph(io_data_type=_BF16, intermediate_data_type=_FP32, compute_data_type=_FP32)
         DY = g.tensor(name="dy", dim=[1, M, H], stride=[M * H, H, 1])
-        # FROST's TN mainloop needs B contiguous in K(=H); the natural down weight
-        # [H,I] is I-contiguous, so bind the K-contiguous [I,H]-physical view.
-        WD = g.tensor(name="Wd", dim=[1, H, interm], stride=[H * interm, 1, H])
+        # Natural down weight [H,I] as an N-major (I-contiguous) B -- FROST takes
+        # arbitrary t/n operand layouts, so no transpose copy is needed.
+        WD = g.tensor(name="Wd", dim=[1, H, interm], stride=[H * interm, interm, 1])
         G = g.tensor(name="gate_pre", dim=[1, M, interm], stride=[M * interm, interm, 1])
         U = g.tensor(name="up_pre", dim=[1, M, interm], stride=[M * interm, interm, 1])
         dh = g.matmul(A=DY, B=WD, name="dgrad")
@@ -255,16 +258,12 @@ def _frost_dswiglu(dout2, Wd, gate, up):
         e = (compiled, bd, out_by, aux_by)
         _FROST_DSWIGLU_CACHE[key] = e
     compiled, bd, out_by, aux_by = e
-    # Full transpose COPY (not a view): FROST's TN B must be K(=H)-contiguous, and
-    # the natural down weight [H,I] is I-contiguous. Recomputed every call (never
-    # cached: the optimizer updates Wd in place, so a cached transpose would go stale).
-    Wd_kc = Wd.t().contiguous().unsqueeze(0)  # [1,I,H]
     dgate = torch.empty(1, M, interm, device=dout2.device, dtype=dout2.dtype)
     dup = torch.empty(1, M, interm, device=dout2.device, dtype=dout2.dtype)
     compiled(
         {
             bd.a_operands[0]: dout2.unsqueeze(0),
-            bd.b_operands[0]: Wd_kc,
+            bd.b_operands[0]: Wd.unsqueeze(0),  # natural [1,H,I], N-major — no transpose
             out_by["dup"]: dup,
             out_by["dgate"]: dgate,
             aux_by["gate_pre"]: gate.unsqueeze(0),
