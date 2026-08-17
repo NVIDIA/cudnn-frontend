@@ -584,7 +584,7 @@ def test_failed_stream_query_on_supplied_handle_raises(monkeypatch):
 
     monkeypatch.setattr(_cudnn, "get_stream", boom)
     with pytest.raises(RuntimeError, match="stream query failed"):
-        g.execute({C: torch.empty(2, 2)}, handle=42)
+        g.execute({C: torch.empty(2, 2)}, handle=_cudnn.Handle(backend_handle=42))
 
 
 # ---------------------------------------------------------------------------
@@ -1160,8 +1160,9 @@ def test_execute_time_handle_reaches_a_lazily_built_python_plan(monkeypatch):
     g._lowered_graph = _FakeBackend(build=cudnn.cudnnGraphNotSupportedError("backend build declined"))
     g._cpp_plans_created = g._cpp_bog_done = True
 
-    g.execute({C: torch.empty(2, 2)}, None, 42)
-    assert seen == [42], f"build_plan saw {seen}, execute was given handle=42"
+    h = cudnn.Handle(backend_handle=42)
+    g.execute({C: torch.empty(2, 2)}, None, h)
+    assert seen == [h], f"build_plan saw {seen}, execute was given a cudnn.Handle"
 
 
 def test_backend_runtime_error_is_not_a_decline(monkeypatch):

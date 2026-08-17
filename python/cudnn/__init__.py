@@ -93,52 +93,43 @@ def set_stream(handle, stream):
     ``cudnnSetStream`` is not free: for a non-null stream it issues several CUDA driver queries
     on every call (green-context detection, stream priority, priority range) to maintain cuDNN's
     internal per-priority stream pool, even when the stream is unchanged -- ~2.4us/call on
-    Blackwell. Frameworks that call this before every ``execute`` pay it every iteration, so we
-    remember the last stream and skip the backend call when it has not changed; a steady-state
-    loop pays it once. Only a :class:`cudnn.Handle` gets this fast path (it remembers the stream
-    on itself); a foreign raw-int handle is not ours to track -- its owner may call
-    ``cudnnSetStream`` out-of-band -- so it is always set through. (Assumes a Handle is not driven
-    from two streams concurrently, which is the normal single-stream case; a caller that does
-    needs its own handle per stream regardless.)
+    Blackwell. Frameworks that call this before every ``execute`` pay it every iteration, so the
+    :class:`cudnn.Handle` remembers its last stream and skips the backend call when it has not
+    changed; a steady-state loop pays it once. (Assumes a Handle is not driven from two streams
+    concurrently, which is the normal single-stream case; a caller that does needs its own handle
+    per stream regardless.)
     """
-    if isinstance(handle, Handle):
-        if handle.stream == stream:
-            return
-        if handle.backend_handle is not None:
-            _pybind_module._raw_set_stream(handle.backend_handle, stream)
-        handle.stream = stream
+    if not isinstance(handle, Handle):
+        raise TypeError(f"cudnn.set_stream expects a cudnn.Handle (from cudnn.create_handle()), got {type(handle).__name__}")
+    if handle.stream == stream:
         return
-    # Foreign raw-int handle: we do not own it and cannot observe an out-of-band
-    # cudnnSetStream by its owner, so never skip on a cached value -- always set
-    # through. The idempotency fast-path is kept only on Handle (handle.stream).
-    _pybind_module._raw_set_stream(handle, stream)
+    if handle.backend_handle is not None:
+        _pybind_module._raw_set_stream(handle.backend_handle, stream)
+    handle.stream = stream
 
 
 def get_stream(handle):
-    """The CUDA stream a handle runs on. For a :class:`cudnn.Handle` this is the cached
-    ``Handle.stream`` (no backend round-trip); for a foreign raw-int handle it queries the
-    backend (``cudnnGetStream``)."""
-    if isinstance(handle, Handle):
-        return handle.stream
-    return _pybind_module.get_stream(handle)
+    """The CUDA stream a :class:`cudnn.Handle` runs on -- the cached ``Handle.stream``, no
+    backend round-trip."""
+    if not isinstance(handle, Handle):
+        raise TypeError(f"cudnn.get_stream expects a cudnn.Handle (from cudnn.create_handle()), got {type(handle).__name__}")
+    return handle.stream
 
 
 def destroy_handle(handle):
-    """Destroy a cuDNN handle (wraps the compiled binding). For a :class:`cudnn.Handle` the
-    backend handle is cleared after destruction so a reused Handle object cannot pass a released
-    ``cudnnHandle_t`` back to C++ (a double-destroy or a later set_stream)."""
-    if isinstance(handle, Handle):
-        backend = handle.backend_handle
-        if backend is None:
-            handle.stream = None
-            return None
-        _pybind_module._raw_destroy_handle(backend)
-        handle.backend_handle = None
+    """Destroy a :class:`cudnn.Handle` (wraps the compiled binding). The backend handle is cleared
+    after destruction so a reused Handle object cannot pass a released ``cudnnHandle_t`` back to
+    C++ (a double-destroy or a later set_stream)."""
+    if not isinstance(handle, Handle):
+        raise TypeError(f"cudnn.destroy_handle expects a cudnn.Handle (from cudnn.create_handle()), got {type(handle).__name__}")
+    backend = handle.backend_handle
+    if backend is None:
         handle.stream = None
         return None
-    # Foreign raw-int handle: destroy it directly (FE tracked no state for it).
-    return _pybind_module._raw_destroy_handle(handle)
-    return _pybind_module._raw_destroy_handle(handle)
+    _pybind_module._raw_destroy_handle(backend)
+    handle.backend_handle = None
+    handle.stream = None
+    return None
 
 
 from .datatypes import _library_type, _is_torch_tensor

@@ -28,7 +28,8 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 import cudnn
 from cudnn import _pybind_module
 
-from ._handle import to_backend_handle
+from ._device import ensure_current_context
+from ._handle import Handle, to_backend_handle
 from .datatypes import _buffer_dtype_to_cudnn, _dlpack_code_bits, _torch_to_cudnn_data_type
 from .engines.base import ExecutionContext, VariantPack
 from .engines.engine_ids import is_python_engine
@@ -1736,7 +1737,7 @@ class pygraph:
         self,
         tensor_dict: Dict[Union[str, int, Tensor], Any],
         workspace: Any = None,
-        handle: int = None,
+        handle: Optional[Handle] = None,
         override_uids: Any = None,
         override_shapes: Any = None,
         override_strides: Any = None,
@@ -1776,6 +1777,10 @@ class pygraph:
         if eng is not None:  # python engine (plan id in the reserved region)
             h = handle if handle is not None else self._handle
             ctx = ExecutionContext(handle=h, stream=self._resolve_stream(h), workspace=workspace)
+            # A JIT engine talks to the driver directly, which reads the calling
+            # THREAD's context stack -- and an autograd backward runs on a worker
+            # thread that has none. Once here, so every python engine is covered.
+            ensure_current_context(ctx.stream)
             if self._plan_index not in self._compiled_plans:
                 # compile with the CALLER's context (execute-supplied handle
                 # and its stream reach the JIT build)
@@ -2089,12 +2094,13 @@ class pygraph:
         """Deserialize a graph. This is the one genuinely ambiguous classic
         overload -- ``(data)`` or ``(handle, data, enforce_precompiled=...)`` --
         so it stays a passthrough. The handle can arrive as the first positional
-        or as the ``handle_`` keyword (the pybind overload's name); unwrap either,
-        and ``to_backend_handle`` is a no-op on the ``data`` blob."""
-        if args:
-            args = (to_backend_handle(args[0]),) + args[1:]
-        if "handle_" in kwargs:
-            kwargs["handle_"] = to_backend_handle(kwargs["handle_"])
+        or as the ``handle_`` keyword (the pybind overload's name); unwrap a
+        Handle to its backend int and leave the ``data`` blob (the other overload)
+        untouched."""
+        if args and isinstance(args[0], Handle):
+            args = (args[0].backend_handle,) + args[1:]
+        if isinstance(kwargs.get("handle_"), Handle):
+            kwargs["handle_"] = kwargs["handle_"].backend_handle
         if self._lowered_graph is None:
             import cudnn
 

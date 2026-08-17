@@ -66,7 +66,19 @@ class Handle:
 
 
 def to_backend_handle(handle):
-    """The backend cudnnHandle_t to hand to the C++ layer: a Handle's
-    ``backend_handle``, a foreign raw-int handle unchanged, or None. The ONE
-    explicit conversion from the first-class Handle to the int the bindings take."""
-    return handle.backend_handle if isinstance(handle, Handle) else handle
+    """The backend ``cudnnHandle_t`` to hand to the C++ layer: a Handle's
+    ``backend_handle``, or ``None`` for the default handle. The ONE explicit
+    conversion from the first-class Handle to the int the bindings take.
+
+    A raw backend int is NOT accepted: the Python API creates handles only via
+    ``cudnn.create_handle()`` (which returns a Handle), so a bare int is a
+    mistake -- wrap a foreign ``cudnnHandle_t`` in
+    ``cudnn.Handle(backend_handle, ordinal, stream)`` to give it a device/stream."""
+    if handle is None:
+        return None
+    if isinstance(handle, Handle):
+        return handle.backend_handle
+    raise TypeError(
+        f"expected a cudnn.Handle (from cudnn.create_handle()) or None, got {type(handle).__name__}; "
+        "raw backend handles are no longer accepted -- wrap one with cudnn.Handle(backend_handle, ordinal, stream)"
+    )

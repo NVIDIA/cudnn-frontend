@@ -51,11 +51,16 @@ becomes one consumer rather than the anchor.
    - `if handle:` / `handle or 0` -> a live Handle must stay truthy.
    Giving Handle a value `__eq__` without `__hash__` would make it unhashable
    (TypeError on the stream dict) — so we give it neither.
-4. **Foreign raw-int handles keep working.** A framework may create a
-   `cudnnHandle_t` via the C API and pass the bare int. Those have no Handle
-   object, so stream/device fall back to the `_handle_to_stream` registry (keyed
-   by `int(handle)`) + a live `cudnnGetStream`. All wrappers branch
-   `isinstance(handle, Handle)`.
+4. **The Python handle APIs take a `cudnn.Handle` only; a raw backend int is
+   rejected.** `cudnn.create_handle()` is the only way to make a handle in the
+   Python API, so every real caller already holds a Handle (verified across
+   flashinfer / sglang / the FE's own code; torch uses the C++ frontend, not this
+   module). A bare int would silently opt out of the Handle's device/stream
+   tracking and device-scoped build, so `to_backend_handle` / `set_stream` /
+   `get_stream` / `destroy_handle` / `execute(handle=)` raise on a non-Handle. A
+   framework holding a foreign `cudnnHandle_t` wraps it once —
+   `cudnn.Handle(backend_handle, ordinal, stream)` — so it becomes first-class
+   (gaining the same device/stream/scoping) rather than a second-class bare int.
 5. **Deviceless AOT must not eager-query the driver.** `test_deviceless_aot_
    compilation.py` builds with `device_property=` and no live handle, targeting
    an SM that differs from any local GPU. `Handle.device` populated from a
