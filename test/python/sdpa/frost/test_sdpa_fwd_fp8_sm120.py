@@ -883,6 +883,7 @@ def _run_thd_fp8(
     check_stats=False,
     stats_layout="head_major",
     raw_bind=False,
+    poison_pad=False,
 ):
     """Run a ragged FP8 graph on the SM120 engine vs per-sequence references.
 
@@ -912,6 +913,14 @@ def _run_thd_fp8(
     k_view, k_storage, k_ro = _pack_thd(k_8, s_kv_max, torch.float8_e4m3fn)
     v_view, v_storage, v_ro = _pack_thd(v_8, s_kv_max, torch.float8_e4m3fn)
     o_view, o_storage, o_ro = _pack_thd([torch.zeros(1, h_q, max(n, 1), D, dtype=o_dtype, device=dev)[:, :, :n] for n in seq_q_lens], s_q_max, o_dtype)
+    if poison_pad:
+        # Model uninitialized capacity: fp8 NaN bit patterns past the packed
+        # KV tokens (real binders hand rounded-up allocations). The kernel
+        # must keep them out of P @ V — masking S alone is not enough
+        # (P = 0 times a NaN V row is still NaN).
+        t_kv_total = sum(seq_kv_lens)
+        for st, heads in ((k_storage, h_kv), (v_storage, h_kv)):
+            st[t_kv_total * heads * D :] = torch.tensor(float("nan")).to(st.dtype)
     # The kernel writes every valid packed O token; everything else must come
     # back untouched. (Clamped into the O dtype's range for fp8 outputs.)
     sentinel = min(_THD_SENTINEL, torch.finfo(o_dtype).max)
@@ -1113,6 +1122,17 @@ def test_fp8_sm120_thd_raw_buffer_binding():
     scratch copy-back scrambling packed O bytes (mhas fp8 ragged
     test16/25/28/32)."""
     _run_thd_fp8(seq_q_lens=[35, 75], seq_kv_lens=[289, 190], h_q=3, h_kv=3, is_causal=False, raw_bind=True)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=56)
+def test_fp8_sm120_thd_dirty_kv_pad():
+    """KV storage CAPACITY beyond the packed tokens is uninitialized in real
+    binders (rounded-up allocations), and fp8 has NaN bit patterns. The
+    S-side column mask survives them (a select), but P @ V would multiply
+    P = 0 into a NaN V row and 0 * NaN = NaN poisons every output row; the
+    masked step must zero the sV tail rows before the PV MMA."""
+    _run_thd_fp8(seq_q_lens=[35, 75], seq_kv_lens=[289, 190], h_q=3, h_kv=3, is_causal=False, poison_pad=True)
 
 
 @pytest.mark.L0

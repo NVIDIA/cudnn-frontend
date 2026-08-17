@@ -702,6 +702,58 @@ class SM120FusedMultiHeadAttentionForward:
         return p_regs
 
     @cute.jit
+    def sanitize_v_tail(
+        self,
+        basic_params: SimpleNamespace,
+        mma_params: SimpleNamespace,
+        kv_seq_idx: cutlass.Int32,
+    ) -> None:
+        """Zero ``sV`` rows at/past this tile's valid KV extent before P @ V.
+
+        The K/V TMA descriptors span the bound buffers' CAPACITY (under THD
+        the packed totals are device values, so the views bind whole-buffer
+        extents), so rows between the valid KV length and the tile end can
+        carry UNINITIALIZED storage — including fp8 NaN bit patterns. The
+        S-side mask overwrites those columns with -inf (a select, NaN-safe),
+        but P @ V still multiplies P = 0 against the NaN V row and
+        ``0 * NaN = NaN`` poisons the whole accumulator column-free. Reached
+        only from THD specializations' first masked step (see the call
+        site): dense descriptors carry the declared S_kv, so their overhang
+        loads zero-fill in hardware — a dense PADDED graph's pad rows are
+        user memory and deliberately NOT sanitized here (whether the
+        contract requires tolerating NaN bit patterns there is an open
+        question for the sibling kernels too).
+
+        Every compute warp redundantly zeroes the full overhang (idempotent
+        zero stores race benignly), so a warp-level sync is enough for each
+        warp's own ``ldmatrix`` lanes to observe the zeros.
+        """
+        segs_per_row = self.head_tile_v // 16  # 16-byte segments per V row
+        row_lo = cute.math.max(cutlass.Int32(0), basic_params.seqlen_k - kv_seq_idx)
+        for r_it in cutlass.range_constexpr(self.kv_tile // 32):
+            row = cutlass.Int32(r_it * 32) + basic_params.lane
+            for seg in cutlass.range_constexpr(segs_per_row):
+                col = seg * 16
+                phys_row = (col // self.v_swizzle_chunk_elems) * self.kv_tile + row
+                sv_ptr = (
+                    mma_params.sV.data_ptr()
+                    + phys_row * self.v_swizzle_chunk_elems
+                    + swizzle_xor(
+                        phys_row,
+                        col % self.v_swizzle_chunk_elems,
+                        self.v_swizzle_chunk_elems,
+                        self.in_dtype.bytes,
+                    )
+                )
+                zero16 = cutlass.Vector.from_elements(
+                    tuple(self.in_dtype(0.0) for _ in range(16)),
+                    self.in_dtype,
+                )
+                if row >= row_lo:
+                    sv_ptr.store(zero16, alignment=16)
+        prims.bar_warp_sync(cute.arch.FULL_MASK)
+
+    @cute.jit
     def mma_pv(
         self,
         basic_params: SimpleNamespace,
@@ -855,6 +907,8 @@ class SM120FusedMultiHeadAttentionForward:
             is_first_kv_tile,
         )
 
+        if cutlass.const_expr(self.thd_varlen and in_mask_steps and is_first_kv_tile):
+            self.sanitize_v_tail(basic_params, mma_params, kv_tile_idx * self.kv_tile)
         self.mma_pv(basic_params, mma_params, p_regs)
         prims.barrier_cta_arrive(self.bar_v_consumed, self.threads_kv_pipeline)
 
