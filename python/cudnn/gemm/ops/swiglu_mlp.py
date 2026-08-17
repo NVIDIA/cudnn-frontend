@@ -10,14 +10,22 @@ The forward fuses the gate GEMM, the up GEMM, ``SiLU`` and the multiply into ONE
 cuDNN kernel (the FORT-native runtime-fusion engine on SM100), which beats two
 cuBLAS GEMMs plus a torch activation by ~1.05-1.20x on the Qwen3.5-27B MLP shape;
 the down projection is a separate GEMM (a three-GEMM single graph does not
-compile). Backward recomputes gate/up and runs the dSwiGLU as two cuDNN pointwise
-kernels. (An opt-in ``CUDNN_GEMM_SWIGLU_FROST_BWD=1`` path fuses the ``dh = dout @
-Wd`` dgrad GEMM with the dSwiGLU into one FROST kernel — taking the natural down
-weight directly, no transpose. That fused stage beats the separate GEMM + two
-pointwise kernels ~1.15-2.64x, but the whole backward is GEMM-bound so it lands at
-~parity; a full-backward win needs the output transpose fused into the epilogue plus
-the remaining GEMMs on FROST. Off by default until then.) Numerically matches torch
-to bf16 noise on the output and all four gradients.
+compile). That fused kernel also emits the two pre-activations ``gate = x@Wg^T``
+and ``up = x@Wu^T`` (the GEMM accumulators it already computes) as extra outputs,
+so the backward reads them instead of recomputing two GEMMs -- still one kernel,
+the accumulators stored in the epilogue. This keeps the full backward at parity
+with a torch autograd MLP, which likewise saves its activations (~0.99-1.02x
+backward on the Qwen3.5-27B shape); an earlier revision that recomputed gate/up
+paid two extra GEMMs and ran ~1.3x slower on the backward, ~1.17-1.19x on the full
+fwd+bwd step. Saving ``{h, gate, up}`` costs ~3x[M,I] of activation memory, less
+than the ~4x[M,I] torch autograd already keeps. The backward runs the dSwiGLU as
+two cuDNN pointwise kernels. (An opt-in ``CUDNN_GEMM_SWIGLU_FROST_BWD=1`` path
+fuses the ``dh = dout @ Wd`` dgrad GEMM with the dSwiGLU into one FROST kernel,
+taking the natural down weight directly, no transpose. That fused stage beats the
+separate GEMM + two pointwise kernels ~1.15-2.64x, but with the pre-activations
+saved the whole backward is GEMM-bound and the fused stage does not move it, so it
+stays off by default.) Numerically matches torch to bf16 noise on the output and
+all four gradients.
 
 Weights are the ``[I, H]`` / ``[H, I]`` ``nn.Linear`` tensors; they enter the
 GEMMs transposed and are bound as strided ``.t()`` views (cuDNN reads them
@@ -126,8 +134,14 @@ def _mm(a2, b2):
 
 
 def _swiglu_act(x, Wg, Wu):
-    """Fused ``h = silu(x@Wg^T) * (x@Wu^T)`` in ONE cuDNN kernel. ``x:[M,H]``,
-    ``Wg,Wu:[I,H]`` bound as strided ``.t()`` views (no transpose copy)."""
+    """Fused ``h = silu(x@Wg^T) * (x@Wu^T)`` in ONE cuDNN kernel, also emitting the
+    two pre-activations ``gate = x@Wg^T`` and ``up = x@Wu^T`` (the GEMM
+    accumulators the fusion already computes) so the backward reads them instead of
+    recomputing two GEMMs. All three come from the single fused plan -- the extra
+    epilogue stores add ~14% to the forward but drop the two ~25% recompute GEMMs
+    from the backward (measured 1-kernel on SM100; the accumulators are stored in
+    the epilogue, no copy kernel appended). ``x:[M,H]``, ``Wg,Wu:[I,H]`` bound as
+    strided ``.t()`` views (no transpose copy). Returns ``(h, gate, up)`` ``:[M,I]``."""
     h, stream = _handle(x.device)
     M, H = x.shape
     interm = Wg.shape[0]
@@ -145,17 +159,23 @@ def _swiglu_act(x, Wg, Wu):
         up = g.matmul(name="up", A=X, B=WU, compute_data_type=_FP32)
         hh = g.mul(a=sg, b=up)
         hh.set_output(True).set_data_type(_BF16)
+        gate.set_output(True).set_data_type(_BF16)  # saved for backward -> no recompute GEMM
+        up.set_output(True).set_data_type(_BF16)
         g.validate()
         g.build_operation_graph()
         g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
-        out = torch.empty(M, interm, device=x.device, dtype=x.dtype)
-        best, ws = _autotune(g, h, {X: xv, WG: wg, WU: wu, hh: out.unsqueeze(0)})
-        e = (g, X, WG, WU, hh, best, ws)
+        hb = torch.empty(M, interm, device=x.device, dtype=x.dtype)
+        gb = torch.empty(M, interm, device=x.device, dtype=x.dtype)
+        ub = torch.empty(M, interm, device=x.device, dtype=x.dtype)
+        best, ws = _autotune(g, h, {X: xv, WG: wg, WU: wu, hh: hb.unsqueeze(0), gate: gb.unsqueeze(0), up: ub.unsqueeze(0)})
+        e = (g, X, WG, WU, hh, gate, up, best, ws)
         _SWIGLU_CACHE[key] = e
-    g, X, WG, WU, hh, best, ws = e
-    out = torch.empty(M, interm, device=x.device, dtype=x.dtype)
-    g.execute_plan_at_index({X: xv, WG: wg, WU: wu, hh: out.unsqueeze(0)}, ws, index=best, handle=h)
-    return out
+    g, X, WG, WU, hh, gate, up, best, ws = e
+    hb = torch.empty(M, interm, device=x.device, dtype=x.dtype)
+    gb = torch.empty(M, interm, device=x.device, dtype=x.dtype)
+    ub = torch.empty(M, interm, device=x.device, dtype=x.dtype)
+    g.execute_plan_at_index({X: xv, WG: wg, WU: wu, hh: hb.unsqueeze(0), gate: gb.unsqueeze(0), up: ub.unsqueeze(0)}, ws, index=best, handle=h)
+    return hb, gb, ub
 
 
 def _dswiglu(dh, gate, up):
@@ -209,9 +229,9 @@ def _dswiglu(dh, gate, up):
 
 _FROST_DSWIGLU_CACHE = {}
 # OFF by default: the FROST dgrad+dSwiGLU kernel is correct and its fused stage wins
-# ~1.15-2.64x, but the whole backward is GEMM-bound so it lands at ~parity with the
-# pointwise path. The remaining win is to stop recomputing gate/up (save them from the
-# forward), which is a forward-side change; opt in until that lands.
+# ~1.15-2.64x, but the full backward is GEMM-bound (the forward now saves gate/up, so
+# the two recompute GEMMs are already gone) and the fused stage does not move the full
+# backward past the pointwise path -- so there is no full-backward reason to enable it.
 _FROST_BWD = os.environ.get("CUDNN_GEMM_SWIGLU_FROST_BWD", "0") != "0"
 
 
@@ -223,15 +243,16 @@ def _frost_dswiglu(dout2, Wd, gate, up):
     (natural down weight), ``gate, up:[M,I]``. Returns ``(dgate, dup):[M,I]``. Raises
     on any unsupported case so the caller falls back to the pointwise path.
 
-    FROST takes the natural down weight directly (an N-major / I-contiguous B — no
+    FROST takes the natural down weight directly (an N-major / I-contiguous B -- no
     transpose copy; the downstream ``dg.t()`` wgrad operand is likewise a free strided
     view). The fused stage beats the separate dh GEMM + two pointwise kernels
-    (~1.15-2.64x, Qwen3.5-27B, SM100); the full backward is ~parity with a fair torch
-    backward because it is GEMM-bound. The full-backward win comes from NOT recomputing
-    gate/up: this op recomputes them (2 GEMMs, ~25% of the backward) to feed the epilogue,
-    so saving g,u from the forward and reading them here drops those GEMMs. Not from a
-    transpose (dense bf16 needs none; ``dg.t()`` is a free view) and not from all-FROST
-    (host overhead is ~1% of these compute-bound GEMMs, and #612 already cut it)."""
+    (~1.15-2.64x, Qwen3.5-27B, SM100), but the full backward is GEMM-bound so the fused
+    stage does not move it: the forward already saves gate/up, so the two recompute
+    GEMMs that once dominated the backward are gone, and what remains (dWd, dh, dx, dWg,
+    dWu) is pure GEMM that FROST's dgrad+epilogue fusion cannot shrink. Kept as an
+    opt-in experiment, not a win. Not a transpose problem (dense bf16 needs none;
+    ``dg.t()`` is a free view) and not a host-overhead one (host is ~1% of these
+    compute-bound GEMMs, and #612 already cut it)."""
     from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
     from cudnn.gemm.frost.tile_config import CATALOG
 
@@ -279,19 +300,17 @@ class _SwigluMLP(torch.autograd.Function):
     def forward(ctx, x, Wg, Wu, Wd):
         shp = x.shape
         x2 = x.reshape(-1, shp[-1])
-        h = _swiglu_act(x2, Wg, Wu)  # fused: 1 kernel
+        h, gate, up = _swiglu_act(x2, Wg, Wu)  # fused: 1 kernel, also emits gate/up for the backward
         out = _mm(h, Wd.t())  # transposed weight view; cuDNN reads it column-major, no copy
-        ctx.save_for_backward(x2, Wg, Wu, Wd, h)
+        ctx.save_for_backward(x2, Wg, Wu, Wd, h, gate, up)
         ctx.shp = shp
         return out.reshape(*shp[:-1], Wd.shape[0])
 
     @staticmethod
     def backward(ctx, dout):
-        x2, Wg, Wu, Wd, h = ctx.saved_tensors
+        x2, Wg, Wu, Wd, h, gate, up = ctx.saved_tensors  # gate/up saved by the fused forward, not recomputed
         dout2 = dout.reshape(-1, Wd.shape[0])
         dWd = _mm(dout2.t(), h)
-        gate = _mm(x2, Wg.t())  # recompute (no fwd materialization)
-        up = _mm(x2, Wu.t())
         # dh = dout@Wd + dSwiGLU as ONE FROST kernel; fall back to a separate dh
         # GEMM + two pointwise kernels if FROST cannot serve this shape/arch.
         if _FROST_BWD:
