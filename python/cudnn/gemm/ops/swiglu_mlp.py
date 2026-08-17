@@ -10,9 +10,11 @@ The forward fuses the gate GEMM, the up GEMM, ``SiLU`` and the multiply into ONE
 cuDNN kernel (the FORT-native runtime-fusion engine on SM100), which beats two
 cuBLAS GEMMs plus a torch activation by ~1.05-1.20x on the Qwen3.5-27B MLP shape;
 the down projection is a separate GEMM (a three-GEMM single graph does not
-compile). Backward recomputes gate/up and fuses the dSwiGLU into two cuDNN
-pointwise kernels. Numerically matches torch to bf16 noise on the output and all
-four gradients.
+compile). Backward recomputes gate/up, then runs the ``dh = dout @ Wd`` dgrad GEMM
+and the dSwiGLU elementwise as ONE fused FROST (cuTeDSL) kernel — ~1.5x the
+separate dh GEMM + two pointwise kernels (CUDA-graph kernel time, Qwen3.5-27B MLP
+shape, SM100); set ``CUDNN_GEMM_SWIGLU_FROST_BWD=0`` to fall back to the pointwise
+path. Numerically matches torch to bf16 noise on the output and all four gradients.
 
 Weights are the ``[I, H]`` / ``[H, I]`` ``nn.Linear`` tensors; they enter the
 GEMMs transposed and are bound as strided ``.t()`` views (cuDNN reads them
@@ -21,6 +23,8 @@ column-major), so no transpose copy is materialized.
 Requires an SM100 (Blackwell) device for the fused runtime-fusion engine; on
 other architectures the graph build declines and the op raises.
 """
+
+import os
 
 import torch
 
@@ -194,6 +198,62 @@ def _dswiglu(dh, gate, up):
     return outs["dgate"], outs["dup"]
 
 
+_FROST_DSWIGLU_CACHE = {}
+_FROST_BWD = os.environ.get("CUDNN_GEMM_SWIGLU_FROST_BWD", "1") != "0"
+
+
+def _frost_dswiglu(dout2, Wd, gate, up):
+    """Fused backward dgrad + dSwiGLU in ONE FROST kernel: ``dh = dout2 @ Wd`` with
+    ``dup = dh*silu(gate)`` and ``dgate = dh*silu'(gate)*up`` as the GEMM epilogue,
+    so the separate dh GEMM + two dSwiGLU pointwise kernels of :func:`_dswiglu`
+    collapse into a single cuTeDSL bare-launch kernel (no FE wrapper tax, no dh
+    round-trip to HBM). ``dout2:[M,H]``, ``Wd:[H,I]`` (natural down weight), ``gate,
+    up:[M,I]``. Returns ``(dgate, dup):[M,I]``. Raises on any unsupported case so
+    the caller falls back to the pointwise path. CUDA-graph kernel time on the
+    Qwen3.5-27B MLP shape: ~1.5x the recompute+pointwise backward (SM100)."""
+    from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
+    from cudnn.gemm.frost.tile_config import CATALOG
+
+    M, H = dout2.shape
+    interm = gate.shape[1]
+    key = (M, H, interm, dout2.dtype, dout2.device.index)
+    e = _FROST_DSWIGLU_CACHE.get(key)
+    if e is None:
+        tn = 256 if interm >= 256 else 128
+        cfg = next(c for c in CATALOG if c.cta_tile_m == 128 and c.cta_tile_n == tn and c.cta_tile_k_bytes == 128 and c.cgrp_size_m == 1 and c.cgrp_size_n == 1)
+        g = cudnn.pygraph(io_data_type=_BF16, intermediate_data_type=_FP32, compute_data_type=_FP32)
+        DY = g.tensor(name="dy", dim=[1, M, H], stride=[M * H, H, 1])
+        # FROST's TN mainloop needs B contiguous in K(=H); the natural down weight
+        # [H,I] is I-contiguous, so bind the K-contiguous [I,H]-physical view.
+        WD = g.tensor(name="Wd", dim=[1, H, interm], stride=[H * interm, 1, H])
+        G = g.tensor(name="gate_pre", dim=[1, M, interm], stride=[M * interm, interm, 1])
+        U = g.tensor(name="up_pre", dim=[1, M, interm], stride=[M * interm, interm, 1])
+        dh = g.matmul(A=DY, B=WD, name="dgrad")
+        g.mul(a=dh, b=g.swish(input=G), name="dup").set_output(True).set_data_type(_BF16)
+        g.mul(a=g.swish_backward(loss=dh, input=G), b=U, name="dgate").set_output(True).set_data_type(_BF16)
+        compiled = jit_from_cudnn_graph(g, config=cfg, cta_group=1, scheduler="clc")
+        bd = compiled.binding
+        out_by = {o.get_name().split("::")[0]: o for o in bd.outputs}
+        aux_by = {a.get_name(): a for a in bd.aux}
+        e = (compiled, bd, out_by, aux_by)
+        _FROST_DSWIGLU_CACHE[key] = e
+    compiled, bd, out_by, aux_by = e
+    Wd_kc = Wd.t().contiguous().unsqueeze(0)  # [1,I,H]: K(=H)-contiguous view of the down weight
+    dgate = torch.empty(1, M, interm, device=dout2.device, dtype=dout2.dtype)
+    dup = torch.empty(1, M, interm, device=dout2.device, dtype=dout2.dtype)
+    compiled(
+        {
+            bd.a_operands[0]: dout2.unsqueeze(0),
+            bd.b_operands[0]: Wd_kc,
+            out_by["dup"]: dup,
+            out_by["dgate"]: dgate,
+            aux_by["gate_pre"]: gate.unsqueeze(0),
+            aux_by["up_pre"]: up.unsqueeze(0),
+        }
+    )
+    return dgate.squeeze(0), dup.squeeze(0)
+
+
 class _SwigluMLP(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, Wg, Wu, Wd):
@@ -209,11 +269,18 @@ class _SwigluMLP(torch.autograd.Function):
     def backward(ctx, dout):
         x2, Wg, Wu, Wd, h = ctx.saved_tensors
         dout2 = dout.reshape(-1, Wd.shape[0])
-        dh = _mm(dout2, Wd)
         dWd = _mm(dout2.t(), h)
         gate = _mm(x2, Wg.t())  # recompute (no fwd materialization)
         up = _mm(x2, Wu.t())
-        dgate, dup = _dswiglu(dh, gate, up)  # fused dSwiGLU: two cuDNN pointwise kernels
+        # dh = dout@Wd + dSwiGLU as ONE FROST kernel; fall back to a separate dh
+        # GEMM + two pointwise kernels if FROST cannot serve this shape/arch.
+        if _FROST_BWD:
+            try:
+                dgate, dup = _frost_dswiglu(dout2, Wd, gate, up)
+            except Exception:
+                dgate, dup = _dswiglu(_mm(dout2, Wd), gate, up)
+        else:
+            dgate, dup = _dswiglu(_mm(dout2, Wd), gate, up)
         dx = _mm(dgate, Wg) + _mm(dup, Wu)
         dWg = _mm(dgate.t(), x2)
         dWu = _mm(dup.t(), x2)

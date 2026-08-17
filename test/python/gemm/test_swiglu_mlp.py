@@ -69,6 +69,30 @@ def test_swiglu_mlp_parity(M, H, inter):
     not (torch.cuda.is_available() and _cc() >= 100),
     reason="cuDNN SwiGLU-MLP fusion requires SM100 (Blackwell)",
 )
+@pytest.mark.parametrize("M,H,inter", [(512, 512, 1024), (2048, 1024, 2048)], ids=["small", "mlp"])
+def test_frost_dswiglu_matches_pointwise(M, H, inter):
+    """The fused FROST backward (dh GEMM + dSwiGLU epilogue) must match the
+    separate dh GEMM + two pointwise kernels it replaces, to bf16 noise."""
+    from cudnn.gemm.ops.swiglu_mlp import _frost_dswiglu, _dswiglu
+
+    torch.manual_seed(0)
+    dev = "cuda"
+    dout = torch.randn(M, H, device=dev, dtype=torch.bfloat16) * 0.1
+    Wd = torch.randn(H, inter, device=dev, dtype=torch.bfloat16) * 0.02
+    gate = torch.randn(M, inter, device=dev, dtype=torch.bfloat16) * 0.8
+    up = torch.randn(M, inter, device=dev, dtype=torch.bfloat16) * 0.8
+
+    dgate_f, dup_f = _frost_dswiglu(dout, Wd, gate, up)  # dh = dout@Wd fused with dSwiGLU
+    dgate_p, dup_p = _dswiglu(torch.mm(dout, Wd), gate, up)  # separate dh GEMM + two pointwise kernels
+    assert _rel_l2(dgate_f, dgate_p) < _TOL, f"dgate rel={_rel_l2(dgate_f, dgate_p):.2e}"
+    assert _rel_l2(dup_f, dup_p) < _TOL, f"dup rel={_rel_l2(dup_f, dup_p):.2e}"
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and _cc() >= 100),
+    reason="cuDNN SwiGLU-MLP fusion requires SM100 (Blackwell)",
+)
 def test_swiglu_mlp_forward_is_single_kernel():
     """The gate GEMM + up GEMM + SiLU + mul must fuse into ONE cuDNN launch."""
     from cudnn.gemm.ops.swiglu_mlp import _swiglu_act
