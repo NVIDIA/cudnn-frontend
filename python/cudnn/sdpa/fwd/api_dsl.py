@@ -846,6 +846,14 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             (self.cu_seq_q_lens or self.cu_seq_kv_lens) and not self.thd,
             "cu_seq_len_* is THD-only (the dense kernels have no CU read mode yet)",
         )
+        # The engine specs already declare thd=False for the FP8/MXFP8 cells
+        # (graph-API routing); this gate covers direct construction.
+        self._not_implemented_error_if(
+            self.thd and self._fp8,
+            "THD/varlen is not supported by the SM100 FP8/MXFP8 kernels (the "
+            "legacy THD leg was removed; the port will follow the write_thd_meta "
+            "envelope design — issue #552)",
+        )
         # Dense padded-Q trim backstops (engines.lower_dsl_prefill never sets
         # these combinations; a direct caller could).
         self._value_error_if(
@@ -937,9 +945,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # compile as dynamic extents — issue #552), so compile HERE like
             # every dense specialization; execute()'s lru-cached call re-binds
             # this artifact. (The all-KV-zero clamp swaps the K/V strides and
-            # mints its own entry on first hit.) FP8 THD is not wired
-            # (_execute_thd is f16-only); keep the deferred sentinel there.
-            self._compiled_kernel = "thd-deferred" if self._fp8 else self._k_mod.compile(**self._thd_compile_kwargs())
+            # mints its own entry on first hit.) FP8/MXFP8 THD is rejected in
+            # check_support (the legacy THD leg was removed), so this branch is
+            # f16-only.
+            self._compiled_kernel = self._k_mod.compile(**self._thd_compile_kwargs())
         elif self._fp8:
             # FP8/MXFP8 kernels are exact-match d128 (gated in check_support);
             # their compile() has no envelope head-dim parameters. has_lse=False
@@ -1462,7 +1471,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         import cutlass
 
         if self.thd:
-            raise NotImplementedError("Frost MXFP8: THD/varlen execute is not wired yet (dense d128 only for v1)")
+            raise NotImplementedError("Frost MXFP8: the legacy THD leg was removed (dense d128 only); see issue #552")
         if sf_q is None or sf_k is None or sf_v is None:
             raise ValueError("Frost MXFP8 execute requires sf_q/sf_k/sf_v (block-scale descale tensors)")
 
@@ -1556,7 +1565,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         import cutlass
 
         if self.thd:
-            raise NotImplementedError("Frost per-tensor FP8: THD/varlen execute is not wired yet (dense d128 only)")
+            raise NotImplementedError("Frost per-tensor FP8: the legacy THD leg was removed (dense d128 only); see issue #552")
 
         def _scalar(t, default=1.0):
             return float(t.reshape(-1)[0].item()) if t is not None else default
