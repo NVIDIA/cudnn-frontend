@@ -200,6 +200,10 @@ def test_grouped_gemm_jax_addressed_rows_survive_a_dirty_allocator():
     allocator passes either way -- fresh device memory reads as zeros -- so this one
     dirties the allocator first and checks only the contract that still holds.
     """
+    import cutlass.jax
+
+    if not cutlass.jax.is_available():
+        pytest.skip("CuTeDSL JAX extensions unavailable (jax >= 0.5 required)")
     skip_unless_sm100()
     from cudnn import grouped_gemm_jax_sm100, grouped_gemm_wrapper_sm100
 
