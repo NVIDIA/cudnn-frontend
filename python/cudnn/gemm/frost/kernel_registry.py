@@ -499,11 +499,13 @@ TEMPLATES: tuple[KernelTemplate, ...] = (
     # unwritten SMEM in K, period 192 B) and the ab_stages budget under-counts,
     # so cta_tile_m=256 also overruns the SMEM cap. Both are silent-wrong /
     # launch-fail, hence the gate. See CLAUDE.md for what was ruled out.
+    # Multi-GEMM has never been validated on this pipeline either — same gate.
     _mm(
         "sm103_block_scale_matmul_1ctamma.py",
         cta_group=1,
         static=False,
         graph_type=GraphType.BLOCK_SCALE_MATMUL,
+        supports_multi_gemm=False,
         supports_multi_mma_m=False,
     ),
     _mm(
@@ -511,6 +513,7 @@ TEMPLATES: tuple[KernelTemplate, ...] = (
         cta_group=2,
         static=False,
         graph_type=GraphType.BLOCK_SCALE_MATMUL,
+        supports_multi_gemm=False,
         supports_multi_mma_m=False,
     ),
     _mm(

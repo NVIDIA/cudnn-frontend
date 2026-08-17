@@ -2027,7 +2027,7 @@ def test_sm107_block_scale_matmul_shapes_and_clusters(combo, config_name, M, N, 
         "CONFIG_sm107_128x128x128_128x128x64_cluster2x2_1ctamma",
     ],
 )
-def test_sm107_block_scale_flexible_cga(combo, config_name):
+def test_sm107_block_scale_mixed_cga(combo, config_name):
     """Mixed CGA rides along with no caller change: any config whose cluster is
     wider than the MMA mode's minimum launches it as the PREFERRED shape plus that
     minimum as the fallback. The tile decomposition is the identity map for either
@@ -2101,6 +2101,9 @@ def test_mixed_cga_ported_templates_attach_a_fallback():
     src = _plan(g, **_kw(sm100_cfg)).generated_path.read_text()
     assert "fallback_cluster=fallback_cluster_shape_mnk" in src
     assert "fallback_cluster_shape_mnk = (2, 1, 1)" in src
+    # What makes the tile walk the identity map for BOTH shapes: the renderer
+    # pins the N-super-block width, so _auto_swizzle_w const-folds to 1.
+    assert "tile_swizzle_n = 1" in src
 
     # Already-minimal cluster -> nothing to fall back to, plain fixed launch.
     minimal_cfg = "CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma"

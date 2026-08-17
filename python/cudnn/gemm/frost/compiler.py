@@ -950,8 +950,10 @@ def _mixed_cga_fallback(cfg: TileConfig, cta_group: int, template_file: str) -> 
     when the template has not been ported (its cluster constants are baked to the
     preferred shape, so a CTA landing in a smaller cluster would wait on arrivals
     that never come — a hang, not a lost optimization), when the config's cluster
-    is ALREADY the minimum, and when the config pins the N-super-block walk (that
-    rasterization is not invariant across the two cluster shapes).
+    is ALREADY the minimum, when the preferred cluster is not an integer multiple
+    of it per dim (what the driver requires of the pair), and when the config pins
+    the N-super-block walk (that rasterization is not invariant across the two
+    cluster shapes).
     """
     if os.environ.get("CUDNN_FROST_DISABLE_MIXED_CGA"):
         return None
@@ -961,6 +963,8 @@ def _mixed_cga_fallback(cfg: TileConfig, cta_group: int, template_file: str) -> 
         return None
     fallback = min_fallback_cluster(cta_group)
     if fallback == (cfg.cgrp_size_m, cfg.cgrp_size_n) or cfg.tile_swizzle_n > 1:
+        return None
+    if cfg.cgrp_size_m % fallback[0] or cfg.cgrp_size_n % fallback[1]:
         return None
     return fallback
 
