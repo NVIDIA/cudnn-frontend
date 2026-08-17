@@ -15,7 +15,7 @@ from .barrier import PipelineState, advance, wait, arrive_expect_tx
 
 
 @cute.jit
-def decode_linear_tile_lpt(linear, q_h, batch, q_tiles):
+def lpt_tile_coords(linear, q_h, batch, q_tiles):
     hb = q_h * batch
     row_rank = linear // hb
     within = linear % hb
@@ -26,7 +26,7 @@ def decode_linear_tile_lpt(linear, q_h, batch, q_tiles):
 
 
 @cute.jit
-def decode_linear_tile_lpt_l2(linear, q_h, batch, q_tiles, heads_per_kv, seqlen_kv, kv_bytes_per_row, l2_bytes):
+def lpt_l2_tile_coords(linear, q_h, batch, q_tiles, heads_per_kv, seqlen_kv, kv_bytes_per_row, l2_bytes):
     n_kh = q_h // heads_per_kv
     num_groups = n_kh * batch
     # Guard per_group == 0: a zero KV length would divide by zero below.

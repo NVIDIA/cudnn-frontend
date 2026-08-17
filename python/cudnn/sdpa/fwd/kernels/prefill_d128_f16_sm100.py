@@ -138,7 +138,7 @@ from cudnn.sdpa.fwd.kernels._common_sm100 import (
     KvLoopBounds,
     make_classic_bars,
     compute_kv_loop_bounds,
-    decode_linear_tile_lpt,
+    lpt_tile_coords,
     row_max_for_exp2,
     make_sdpa_helpers,
 )

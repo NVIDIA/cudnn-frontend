@@ -68,8 +68,8 @@ from cudnn.frost.tile_dsl.pointwise import fp32_to_fp8x2, pack_fp8x2_pairs
 from cudnn.frost.tile_dsl.scheduler import (
     SCHED_LPT_L2,
     SCHED_NATURAL,
-    decode_linear_tile_lpt,
-    decode_linear_tile_lpt_l2,
+    lpt_tile_coords,
+    lpt_l2_tile_coords,
 )
 from cudnn.frost.tile_dsl.swizzle import swizzle_xor
 from cudnn.sdpa.fwd.kernels.thd_sm100 import build_thd_meta_kernel as _build_thd_meta_kernel
@@ -979,7 +979,7 @@ class SM120FusedMultiHeadAttentionForward:
             # value, so the decode cannot disagree with the launch geometry.
             _q_tiles = n_q_tiles
             if cutlass.const_expr(self.sched_policy == SCHED_LPT_L2):
-                q_tile_idx, head_idx, batch_idx = decode_linear_tile_lpt_l2(
+                q_tile_idx, head_idx, batch_idx = lpt_l2_tile_coords(
                     q_tile_idx,
                     _n_qh,
                     _n_batch,
@@ -990,7 +990,7 @@ class SM120FusedMultiHeadAttentionForward:
                     _SCHED_L2_BUDGET_BYTES,
                 )
             else:
-                q_tile_idx, head_idx, batch_idx = decode_linear_tile_lpt(q_tile_idx, _n_qh, _n_batch, _q_tiles)
+                q_tile_idx, head_idx, batch_idx = lpt_tile_coords(q_tile_idx, _n_qh, _n_batch, _q_tiles)
         elif cutlass.const_expr(self.is_causal):
             # Causal work grows with the Q tile. Launch long tiles first to
             # avoid leaving a few expensive CTAs in the final scheduler waves.
