@@ -152,8 +152,8 @@ def _run_fused(fn, lv):
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
 def test_parity_fused_layer_path(dtype):
     """The FLA GatedDeltaNet layer's actual call (raw g/beta + A_log/dt_bias +
-    in-kernel L2-norm/gate/beta fusion): the shim reproduces the fusions in torch
-    and must still match FLA within its own noise (truth = FLA fused in fp32)."""
+    in-kernel L2-norm/gate/beta fusion): the shim forwards the fusions to the native
+    kernel and must still match FLA within its own noise (truth = FLA fused in fp32)."""
     shape = dict(B=2, T=256, H=4, HV=4, K=128, V=128)
     do = torch.randn(shape["B"], shape["T"], shape["HV"], shape["V"], device="cuda")
 

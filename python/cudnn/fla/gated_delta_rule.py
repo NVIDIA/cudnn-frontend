@@ -11,39 +11,25 @@ FLA layout is ``[B, T, H, ...]`` batch-first; ``g``/``beta`` are indexed by the
 *value* heads ``HV`` and FLA's grouped-value attention has ``HV >= H``, so native
 ``HO = max(H, HV) = HV`` and the head mapping is a plain reshape + float cast.
 
-FLA's ``GatedDeltaNet`` layer drives the kernel with fused knobs; the adapter
-reproduces each transform in torch (so autograd flows to the raw inputs and the
-``A_log``/``dt_bias`` parameters) and hands the native op the values it expects:
+FLA's ``GatedDeltaNet`` layer drives the kernel with fused knobs; the native op
+now fuses each transform in-kernel (fwd+bwd), so the adapter forwards the raw
+inputs and the fusion flags rather than reproducing the math in torch:
 
-* ``use_gate_in_kernel``  -> ``g = -exp(A_log) * softplus(g + dt_bias)`` (per-token
-  log decay; native accumulates it, like FLA's naive reference).
-* ``use_beta_sigmoid_in_kernel`` -> ``beta = sigmoid(beta)`` (post-sigmoid write
-  strength; ``allow_neg_eigval`` would scale by 2 and is not yet served).
-* ``use_qk_l2norm_in_kernel`` -> the shim L2-normalizes q/k and clears the flag,
-  since the native in-kernel flag is not served for these shapes.
+* ``use_gate_in_kernel`` -> ``safe_gate`` with ``a_log``/``dt_bias``; the kernel
+  applies ``g = -exp(a_log) * softplus(g + dt_bias)`` (native ``safe_gate`` matches
+  FLA's log decay exactly). FLA may omit ``dt_bias``; native requires it, so a
+  zero bias is synthesized.
+* ``use_beta_sigmoid_in_kernel`` -> forwarded; the kernel applies ``sigmoid(beta)``
+  (raw beta stays io-dtype). ``allow_neg_eigval`` would scale by 2 and is not served.
+* ``use_qk_l2norm_in_kernel`` -> forwarded; the kernel L2-normalizes q/k.
 """
 
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
 
 import cudnn
 from cudnn.linear_attention.ops import gated_delta_net
-
-try:
-    # FLA ships an efficient fused L2-norm kernel; torch F.normalize (fwd+bwd) is
-    # ~2.6x slower and would erase the kernel win on the layer's fused path.
-    from fla.modules.l2norm import l2norm as _fla_l2norm
-except Exception:  # pragma: no cover
-    _fla_l2norm = None
-
-
-def _l2norm(x):
-    if _fla_l2norm is not None:
-        return _fla_l2norm(x)
-    return F.normalize(x, p=2.0, dim=-1)
-
 
 # Native declines a graph it cannot serve with one of these; treat as a fallback.
 _DECLINE = (cudnn.cudnnGraphNotSupportedError, NotImplementedError)
@@ -90,19 +76,22 @@ def _to_native(
             raise _Decline("varlen requires B==1 (FLA contract)")
         cu = cu_seqlens.to(torch.int32)
 
-    if use_qk_l2norm_in_kernel:
-        q = _l2norm(q)
-        k = _l2norm(k)
-
+    # Fuse the gate in-kernel via safe_gate: pass raw g logits + a_log/dt_bias and
+    # let the kernel compute -exp(a_log)*softplus(g+dt_bias). safe_gate requires
+    # both; FLA may omit dt_bias, so synthesize a zero bias.
+    a_log_t = dt_bias_t = None
     if use_gate_in_kernel:
         if A_log is None:
             raise _Decline("use_gate_in_kernel requires A_log")
-        gg = g.float()
-        if dt_bias is not None:
-            gg = gg + dt_bias.float()
-        g = -A_log.float().exp() * F.softplus(gg)
+        a_log_t = A_log.float().reshape(-1)
+        dt_bias_t = dt_bias.float().reshape(-1) if dt_bias is not None else torch.zeros_like(a_log_t)
+        if a_log_t.shape[0] != HO or dt_bias_t.shape[0] != HO:
+            raise _Decline("a_log/dt_bias head count does not match HO=max(H,HV)")
+
+    # g is always fp32 (raw logits under safe_gate, else FLA's precomputed log decay).
+    # beta is io-dtype logits when the kernel applies the sigmoid, else fp32 post-activation.
     g = g.float()
-    beta = torch.sigmoid(beta.float()) if use_beta_sigmoid_in_kernel else beta.float()
+    beta = beta.to(q.dtype) if use_beta_sigmoid_in_kernel else beta.float()
 
     def thd(t):
         return t.reshape(-1, *t.shape[2:])
@@ -122,7 +111,11 @@ def _to_native(
         scale=scale,
         initial_state=h0,
         output_final_state=output_final_state,
-        use_qk_l2norm_in_kernel=False,  # the shim already normalized q/k
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
+        safe_gate=use_gate_in_kernel,
+        a_log=a_log_t,
+        dt_bias=dt_bias_t,
     )
     o = o.reshape(B, T, *o.shape[1:])  # native o is shaped like v (THD) -> [B,T,HV,V]
     return o, (fs if output_final_state else None)
