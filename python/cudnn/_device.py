@@ -140,16 +140,19 @@ class DeviceInfo:
 
         drv = _driver()
         # CU_DEVICE_ATTRIBUTE_MAX_OVERSIZED_SHARED_MEMORY_PER_BLOCK (ordinal 150)
-        # arrived in CUDA 13.4. It needs BOTH a new-enough driver AND a cuda-python
-        # whose CUdevice_attribute carries the enum member: a new driver with an old
-        # binding passes the version gate but the enum member is absent (accessing it
-        # raises, since the binding reads attrib.value). Either missing -> no such
-        # mode -> 0 by design (not an error). With both present the attribute is real:
-        # query it and let a genuine failure raise rather than masking it.
-        attr = getattr(drv.CUdevice_attribute, "CU_DEVICE_ATTRIBUTE_MAX_OVERSIZED_SHARED_MEMORY_PER_BLOCK", None)
-        if attr is None or _env.driver_version() < 13040:
+        # arrived in CUDA 13.4. The DRIVER decides whether the mode exists at all,
+        # so an older one is 0 by design (not an error). The BINDING only decides
+        # how to ask: a cuda-python older than the driver cannot name the enum
+        # member but still forwards the bare ordinal, and only bindings old enough
+        # to reject an int (they read attrib.value) genuinely cannot make the query
+        # -> 0. A real driver failure still raises rather than being masked.
+        if _env.driver_version() < 13040:
             return 0
-        return int(_ck(*drv.cuDeviceGetAttribute(attr, _device_handle(self.ordinal))))
+        attr = getattr(drv.CUdevice_attribute, "CU_DEVICE_ATTRIBUTE_MAX_OVERSIZED_SHARED_MEMORY_PER_BLOCK", 150)
+        try:
+            return int(_ck(*drv.cuDeviceGetAttribute(attr, _device_handle(self.ordinal))))
+        except AttributeError:
+            return 0
 
     @functools.cached_property
     def l2_cache_bytes(self) -> int:
