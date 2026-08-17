@@ -1117,20 +1117,17 @@ def test_dsl_sm100_thd_over_launched_units_are_dead(monkeypatch):
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=39)
-def test_dsl_sm100_thd_lens_never_reach_host(monkeypatch):
+def test_dsl_sm100_thd_lens_never_reach_host():
     """Issue #552 (D2H removal): the length tensors are consumed ONLY on
-    device — the setup kernel builds the
-    metadata, the views bind buffer capacities, and the grid is the
-    plan-time envelope — so ANY host read of them (the old tolist
-    round-trip) is a regression. The guard rejects every _thd_host_lens
-    call while full numerics run in both length forms."""
+    device — the setup kernel builds the metadata, the views bind buffer
+    capacities, and the grid is the plan-time envelope. The old host
+    round-trip helper (_thd_host_lens) is GONE from the adapter entirely —
+    a host read of the lengths is structurally impossible — while full
+    numerics run in both length forms."""
     _require_dsl()
-    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDsl, SdpaFwdDslSm100
 
-    def guard(self, seq_lens, name, cu_form):
-        raise AssertionError(f"lengths reached the host via {name} (device-meta modules must not read them)")
-
-    monkeypatch.setattr(SdpaFwdDslSm100, "_thd_host_lens", guard)
+    assert not hasattr(SdpaFwdDsl, "_thd_host_lens") and not hasattr(SdpaFwdDslSm100, "_thd_host_lens")
     _run_thd_stats_case(seq_lens_q=[200, 150], seq_lens_kv=[180, 120], mask="causal", stats_layout="token_major")
     _run_thd_stats_case(seq_lens_q=[200, 150], seq_lens_kv=[180, 120], mask="causal", stats_layout="head_major", cu_lens=True)
 
@@ -1192,14 +1189,18 @@ def test_dsl_sm100_thd_cu_nonzero_base_normalized():
     assert api.check_support()
     api.compile()
 
-    def _run(base):
-        cu = torch.tensor([base, base + 200, base + 350], dtype=torch.int32, device="cuda")
+    def _run(base_q, base_kv):
+        # Distinct Q/KV prefix tensors with DIFFERENT lengths and bases: a
+        # normalization that subtracts one side's base from the other (or
+        # shares one tensor for both) cannot pass this by accident.
+        cu_q = torch.tensor([base_q, base_q + 200, base_q + 350], dtype=torch.int32, device="cuda")
+        cu_kv = torch.tensor([base_kv, base_kv + 180, base_kv + 310], dtype=torch.int32, device="cuda")
         o.zero_()
-        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=cu, seq_kv_lens=cu)
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=cu_q, seq_kv_lens=cu_kv)
         torch.cuda.synchronize()
         return o.clone()
 
-    assert torch.equal(_run(0), _run(1000))
+    assert torch.equal(_run(0, 0), _run(1000, 7000))
 
 
 @pytest.mark.L1
@@ -1283,11 +1284,16 @@ def test_dsl_sm100_thd_execute_cuda_graph_capture():
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens)
+    # Clobber O before each replay: the warm-up (and nothing else) has already
+    # produced the [200, 150] answer, so without this the first assertion
+    # would be satisfied by stale warm-up output even if replay did nothing.
+    o.zero_()
     graph.replay()
     torch.cuda.synchronize()
     _check([200, 150])
     # New lengths into the SAME device tensor — replay must honor them.
     lens.copy_(torch.tensor([64, 33], dtype=torch.int32, device="cuda"))
+    o.zero_()
     graph.replay()
     torch.cuda.synchronize()
     _check([64, 33])

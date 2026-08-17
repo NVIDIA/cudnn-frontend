@@ -337,8 +337,8 @@ class SdpaFwdDsl(APIBase):
         self.seq_q_lens_present = bool(seq_q_lens_present)
         # cu_seq_len form (cuDNN 9.24+): the corresponding seq-lens execute
         # argument arrives as a (B+1,)-int32 PREFIX-SUM tensor instead of
-        # (B,) per-batch lengths. THD-only today: the ragged lowering derives
-        # both forms host-side from its inherent tolist round-trip; the dense
+        # (B,) per-batch lengths. THD-only today: the setup kernels consume
+        # either form on device (issue #552); the dense
         # kernels have no CU read mode yet (check_support rejects).
         self.cu_seq_q_lens = bool(cu_seq_q_lens)
         self.cu_seq_kv_lens = bool(cu_seq_kv_lens)
@@ -566,9 +566,9 @@ class SdpaFwdDsl(APIBase):
         """Validate a caller-provided (B+1,)-int32 prefix-sum tensor (cu_seq_len form).
 
         Strictly a view, like :meth:`_checked_seq_lens`. The prefix-sum
-        INVARIANTS (starts at 0, non-decreasing) are runtime values — they are
-        validated host-side by the THD lowering's inherent tolist round-trip,
-        not here.
+        INVARIANTS (non-decreasing; any base — the setup kernel normalizes by
+        subtracting element 0) are runtime values and caller contract: a
+        validation that needs a device read is not a validation (Rule 3).
         """
         self._value_error_if(
             cu_seq_lens.dtype != torch.int32,
@@ -583,27 +583,6 @@ class SdpaFwdDsl(APIBase):
             f"{name} must be contiguous (read as a flat (B+1,) view)",
         )
         return cu_seq_lens.reshape(-1)
-
-    def _thd_host_lens(self, seq_lens, name: str, cu_form: bool) -> tuple[list, list]:
-        """One inherent D2H round-trip -> (per-batch lens, prefix sums) host lists.
-
-        Consumes EITHER length form: per-batch ``(B,)`` lengths (prefix sums
-        built by a Python scan) or the ``(B+1,)`` cu_seq_len prefix-sum form
-        (lengths are adjacent differences; the prefix-sum invariants are
-        validated here, where they are free to check).
-        """
-        if cu_form:
-            cu_host = [int(x) for x in self._checked_cu_seq_lens(seq_lens, name).tolist()]
-            self._value_error_if(
-                cu_host[0] != 0 or any(cu_host[i] > cu_host[i + 1] for i in range(len(cu_host) - 1)),
-                f"{name} must be a non-decreasing prefix sum starting at 0; got {cu_host}",
-            )
-            return [cu_host[i + 1] - cu_host[i] for i in range(len(cu_host) - 1)], cu_host
-        lens_host = [int(x) for x in self._checked_seq_lens(seq_lens, name).tolist()]
-        cu_host = [0]
-        for n in lens_host:
-            cu_host.append(cu_host[-1] + n)
-        return lens_host, cu_host
 
     def _check_seq_lens_contract(self, seq_q_lens, seq_kv_lens) -> None:
         """Reject seq-length tensors inconsistent with the compiled specialization.
@@ -1011,8 +990,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # caller's ragged Stats buffer directly (token-major (T, H) or
             # head-major (H, head_stride)); without one it compiles with
             # has_lse=False and no LSE buffer exists at all. No slq/slk
-            # copies either: the metadata is built host-side from the tolist
-            # round-trip and uploaded in one H2D copy. o_desc: 16 int64 per
+            # copies either: the metadata is built DEVICE-side by the setup
+            # kernel (issue #552). o_desc: 16 int64 per
             # sequence + 16 spare, the per-sequence O TMA descriptors the
             # builder kernel fills.
             return ws_align((3 * b + 2) * 4) + ws_align((b * 16 + 16) * 8) + (0 if self.has_sink else ws_align(qh * 4))
@@ -2266,7 +2245,10 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             seq_q_lens,
             seq_kv_lens,
             cutlass.Float32(scale_softmax_log2),
-            cutlass.Int32(0),  # thd_max_sq: THD-only runtime grid extent
+            cutlass.Int32(0),  # thd_max_sq: THD-only plan-time envelope grid extent
+            None,  # thd_q_lens / thd_kv_lens / thd_lens_form: THD-only, folded out
+            None,
+            None,
             current_stream,
         )
         if o_needs_copy_back:
@@ -2350,13 +2332,11 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             # This kernel's ragged LSE store is head-major (H, head_stride):
             # tokens contiguous within a head row. (The f16 cell specializes on
             # either layout; check_support declines token-major here.)
+            # head_stride covering the packed total is caller contract — the
+            # total is a device value (Rule 3).
             lse = None
             if lse_tensor is not None:
                 head_stride = self.thd_stats_head_stride
-                self._value_error_if(
-                    head_stride < pack.t_q,
-                    f"head-major THD LSE head_stride ({head_stride}) must cover the packed Q token total ({pack.t_q})",
-                )
                 lse = lse_tensor.as_strided((self.h_q, head_stride), (head_stride, 1), lse_tensor.storage_offset())
         else:
             lse = self._checked_lse_view(lse_tensor) if lse_tensor is not None else None
@@ -2387,6 +2367,9 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             cutlass.Float32(o_scale_fused),
             cutlass.Float32(ss),
             cutlass.Int32(pack.max_sq if pack is not None else 0),
+            pack.q_lens_dev if pack is not None else None,
+            pack.kv_lens_dev if pack is not None else None,
+            cutlass.Int32(pack.lens_form) if pack is not None else None,
             current_stream,
         )
         # Both of these consume what the kernel just wrote, so they belong on
@@ -2434,22 +2417,24 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         )
         return kwargs
 
-    def _thd_pack(self, q_buf, k_buf, v_buf, o_buf, seq_q_lens, seq_kv_lens, workspace, label, declared_views=False, current_stream=None):
-        """Shared THD (ragged) packing: cu_seqlens metadata + ``(1, T, H, D)`` views.
+    def _thd_pack(self, q_buf, k_buf, v_buf, o_buf, seq_q_lens, seq_kv_lens, workspace, label, declared_views=False, current_stream=None, lse_tokens_cap=None):
+        """Shared THD (ragged) packing: metadata buffer + ``(1, T, H, D)`` views.
 
         Serves the same fully-packed contract as the SM100 THD path
-        (``ragged_offset == cumsum(seq_len) * H * D`` from 0, multiplier 1);
-        the offsets are re-derived from ``seq_len_q``/``seq_len_kv``. The two
-        ``.tolist()`` D2H syncs feed the metadata upload, the ragged views'
-        extents and the launch grid (they no longer key any compile — the
-        kernels compile with DYNAMIC token extents, issue #552; removing the
-        sync itself needs the plan-time-max grid redesign tracked there).
-        The torch work (allocation, length
-        reads, the H2D upload) runs on ``current_stream`` — the LAUNCH
-        stream — so it is ordered against the kernel that consumes it.
+        (``ragged_offset == cumsum(seq_len) * H * D`` from 0, multiplier 1).
+        Host round-trips (issue #552): NONE — the metadata buffer is built
+        DEVICE-side by the kernels' setup launch from the caller's length
+        tensors (returned as ``q_lens_dev``/``kv_lens_dev`` + the
+        ``lens_form`` bitmask), every ragged view binds its buffer's
+        CAPACITY (the kernels read the real per-sequence lengths from the
+        device metadata; ``lse_tokens_cap`` joins the Q/O floor when the LSE
+        shares their dynamic token symbol), and ``max_sq`` is the PLAN-TIME
+        declared S_q envelope that sizes the per-sequence grid — tiles past
+        a sequence's real length drain without loads or stores. The torch
+        allocation runs on ``current_stream`` — the LAUNCH stream — so it is
+        ordered against the kernels that consume it.
 
-        Returns ``None`` when the packed Q total is zero (nothing to launch).
-        """
+        Returns ``None`` when no Q token is addressable (zero capacity)."""
         b, qh, kh = self.batch_size, self.h_q, self.h_kv
         d_qk, d_v = self.head_dim_qk, self.head_dim_v
         dev = q_buf.device
@@ -2458,19 +2443,28 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         # [seq_kv(B) | cu_q(B+1) | cu_k(B+1)] — bound as the kernel's
         # seq_kv_lens tensor; the leading B words alias the per-sequence KV
         # lengths so the kernel's existing padded-mask read works unchanged.
-        # Built HOST-side from the (inherent) tolist round-trip and uploaded
-        # in ONE H2D copy: a device-side cumsum would allocate its scan-temp
-        # storage and launch kernels on the execute hot path. Either length
-        # form feeds it — per-batch (B,) lengths or the (B+1,) cu_seq_len
-        # prefix sums — at identical cost.
+        # WRITTEN by the setup kernel; the prefix-sum invariants are caller
+        # contract (a validation that needs a device read is not a
+        # validation — AGENTS.md Rule 3; cu prefixes are normalized by the
+        # setup kernel).
         with _torch_stream_context(current_stream, dev):
             meta = carver.take(3 * b + 2, torch.int32) if carver is not None else torch.empty(3 * b + 2, dtype=torch.int32, device=dev)
-            slq_host, cu_q_host = self._thd_host_lens(seq_q_lens, "cu_seq_len_q" if self.cu_seq_q_lens else "seq_q_lens", self.cu_seq_q_lens)
-            slk_host, cu_k_host = self._thd_host_lens(seq_kv_lens, "cu_seq_len_kv" if self.cu_seq_kv_lens else "seq_kv_lens", self.cu_seq_kv_lens)
-            meta.copy_(torch.tensor(slk_host + cu_q_host + cu_k_host, dtype=torch.int32))
-        t_q = cu_q_host[-1]
-        t_kv = cu_k_host[-1]
-        max_sq = max(slq_host) if slq_host else 0
+        q_lens_dev = self._checked_cu_seq_lens(seq_q_lens, "cu_seq_len_q") if self.cu_seq_q_lens else self._checked_seq_lens(seq_q_lens, "seq_q_lens")
+        kv_lens_dev = self._checked_cu_seq_lens(seq_kv_lens, "cu_seq_len_kv") if self.cu_seq_kv_lens else self._checked_seq_lens(seq_kv_lens, "seq_kv_lens")
+        lens_form = (1 if self.cu_seq_q_lens else 0) | (2 if self.cu_seq_kv_lens else 0)
+
+        def _cap(buf, desc, heads, d):
+            # Token CAPACITY under the strides the view will bind: declared
+            # (f16, TMA-expressible by check_support) or packed (FP8).
+            ts = self._thd_declared(desc)[0][0] if declared_views else heads * d
+            return buf.numel() // ts
+
+        # Q/O (and a token-major LSE) bind ONE dynamic token symbol; K/V the
+        # other — shared floors.
+        t_q = min(_cap(q_buf, self.q_desc, qh, d_qk), _cap(o_buf, self.o_desc, qh, d_v))
+        if lse_tokens_cap is not None:
+            t_q = min(t_q, lse_tokens_cap)
+        t_kv = min(_cap(k_buf, self.k_desc, kh, d_qk), _cap(v_buf, self.v_desc, kh, d_v))
 
         if t_q == 0:
             return None
@@ -2486,7 +2480,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             return self._thd_view(buf, desc, tokens) if declared_views else _packed(buf, tokens, heads, d)
 
         if t_kv == 0:
-            # Every query row is dead (all-zero seq_kv_lens): served by the
+            # No KV storage at all: every query row is dead — served by the
             # KERNEL's own dead-row path (row_sum <= 0 -> O := 0 and
             # LSE := -inf, or the sink alone — its column keeps the softmax
             # denominator alive), exactly like a live launch's zero-KV
@@ -2496,7 +2490,8 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             # never-dereferenced token (every sequence's KV tile range is
             # empty, so no K/V load is ever issued) bound over storage
             # guaranteed large enough: Q backs K (kh*d_qk <= t_q*qh*d_qk) and
-            # O backs V (kh*d_v <= t_q*qh*d_v).
+            # O backs V (kh*d_v <= t_q*qh*d_v). All-zero LENGTHS over live
+            # storage launch normally through the dead-row path.
             t_kv = 1
             K = q_buf.as_strided((1, 1, kh, d_qk), (kh * d_qk, kh * d_qk, d_qk, 1), q_buf.storage_offset())
             V = o_buf.as_strided((1, 1, kh, d_v), (kh * d_v, kh * d_v, d_v, 1), o_buf.storage_offset())
@@ -2512,12 +2507,17 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             meta=meta,
             t_q=t_q,
             t_kv=t_kv,
-            max_sq=max_sq,
+            # PLAN-TIME envelope: sizes the per-sequence grid; tiles past a
+            # sequence's real length drain without loads or stores.
+            max_sq=int(self.q_desc.shape[2]),
             Q=_view(q_buf, self.q_desc, t_q, qh, d_qk),
             K=K,
             V=V,
             O=_view(o_buf, self.o_desc, t_q, qh, d_v),
             seq_q_dummy=seq_q_dummy,
+            q_lens_dev=q_lens_dev,
+            kv_lens_dev=kv_lens_dev,
+            lens_form=lens_form,
         )
 
     def _execute_thd(
@@ -2536,8 +2536,23 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         if current_stream is None:
             current_stream = cuda.CUstream(torch.cuda.current_stream(q_buf.device).cuda_stream)
 
+        # A token-major LSE shares the Q/O dynamic token symbol, so its
+        # capacity joins their floor; head-major carries its own declared
+        # head_stride (covering the packed total is caller contract — t_q is
+        # a device value, Rule 3).
+        lse_cap = lse_tensor.numel() // self.h_q if (lse_tensor is not None and not self.thd_stats_head_major) else None
         pack = self._thd_pack(
-            q_buf, k_buf, v_buf, o_buf, seq_q_lens, seq_kv_lens, workspace, "SdpaFwdDslSm120 (THD)", declared_views=True, current_stream=current_stream
+            q_buf,
+            k_buf,
+            v_buf,
+            o_buf,
+            seq_q_lens,
+            seq_kv_lens,
+            workspace,
+            "SdpaFwdDslSm120 (THD)",
+            declared_views=True,
+            current_stream=current_stream,
+            lse_tokens_cap=lse_cap,
         )
         if pack is None:
             return
@@ -2546,10 +2561,6 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         if lse_tensor is not None:
             if self.thd_stats_head_major:
                 head_stride = self.thd_stats_head_stride
-                self._value_error_if(
-                    head_stride < pack.t_q,
-                    f"head-major THD LSE head_stride ({head_stride}) must cover the packed Q token total ({pack.t_q})",
-                )
                 lse = lse_tensor.as_strided((self.h_q, head_stride), (head_stride, 1), lse_tensor.storage_offset())
             else:
                 lse = lse_tensor.as_strided((pack.t_q, self.h_q), (self.h_q, 1), lse_tensor.storage_offset())
@@ -2580,6 +2591,9 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             pack.meta,
             cutlass.Float32(scale_softmax_log2),
             cutlass.Int32(pack.max_sq),
+            pack.q_lens_dev,
+            pack.kv_lens_dev,
+            cutlass.Int32(pack.lens_form),
             current_stream,
         )
 
@@ -2590,8 +2604,8 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             # caller's ragged Stats buffer directly (token-major (T, H) or
             # head-major (H, head_stride)); without one it compiles with
             # has_lse=False and no LSE buffer exists at all. No slq/slk
-            # copies either: the metadata is built host-side from the tolist
-            # round-trip. No sinks-dummy chunk: the kernel None-specializes
+            # copies either: the metadata is built DEVICE-side by the setup
+            # kernel (issue #552). No sinks-dummy chunk: the kernel None-specializes
             # on sinks. No O-descriptor chunk: SM120 stores O with plain
             # guarded GMEM stores, so THD needs no per-sequence tensor maps.
             b = self.batch_size
