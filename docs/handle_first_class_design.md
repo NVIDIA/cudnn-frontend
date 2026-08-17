@@ -20,8 +20,6 @@ backend": this object is the `handle`; the wrapped `cudnnHandle_t` is the
 linear-attention) need device+stream, not a `cudnnHandle_t`, so the backend
 becomes one consumer rather than the anchor.
 
-`note to self: claude::11323ca1-07bc-4fc4-8ec7-ba95d8f061d8 — first-class Handle. cwd /home/scratch.yanxu_libs/cudnn_frontend`
-
 ## Hard constraints (from a full call-site inventory)
 
 1. **The C++ boundary needs no change; the handoff is EXPLICIT in Python.** Every
