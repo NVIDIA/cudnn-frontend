@@ -98,11 +98,8 @@ class ExecutionContext(NamedTuple):
     ``stream`` is resolved from the handle when available (classic
     ``cudnn.set_stream(handle, ...)`` semantics).
 
-    A ``NamedTuple``, not a frozen dataclass: both are immutable (an engine
-    cannot rebind ``ctx.stream``), but a frozen dataclass ``__init__`` sets each
-    field through ``object.__setattr__``, and this is built on every execute —
-    the NamedTuple is ~220 ns/execute cheaper for the same three read-only
-    fields.
+    A ``NamedTuple`` (not a frozen dataclass): both immutable, but built on every
+    execute, where the NamedTuple is ~220 ns/execute cheaper.
     """
 
     handle: Any = None

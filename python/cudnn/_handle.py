@@ -39,8 +39,6 @@ class Handle:
     ``if handle:`` guards, and does not raise on ``wrapper.py``'s ``== 'auto'``.
     """
 
-    __slots__ = ("backend_handle", "_ordinal", "stream")
-
     def __init__(self, backend_handle: int | None, ordinal: int | None = None, stream: int | None = None):
         # ``None`` backend_handle = a destroyed handle (destroy_handle clears it so
         # a reused Handle cannot pass a released cudnnHandle_t back to C++).
