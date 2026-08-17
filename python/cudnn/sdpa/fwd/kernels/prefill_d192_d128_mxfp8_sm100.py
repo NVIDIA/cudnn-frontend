@@ -63,6 +63,9 @@ TMA_QK_ITERS = _TMA.QK_ITERS
 TMA_VO_ITERS = _TMA.VO_ITERS
 TMA_QK_GRANU_ELEMS = _TMA.QK_GRANU_ELEMS
 TMA_VO_GRANU_ELEMS = _TMA.VO_GRANU_ELEMS
+# Merging the masked softmax callsites cuts code size; no-mask keeps static
+# callsites because runtime TMEM offsets regress its compiler schedule.
+MERGE_SOFTMAX_WGS = CFG.MASK_FLAGS != 0
 
 # O TMA box params follow O's swizzle, not V's — required when V_SWZ_B != O_SWZ_B.
 # Sized in BPE_O — O may be written at BF16/FP16 when DTYPE_O != DTYPE_QKV.
@@ -594,10 +597,19 @@ def _kernel(
     sf_mcast_mask = cutlass.Int16(3) if cutlass.const_expr(CFG.CTA_MMA == 2) else cutlass.Int16(0)
     is_leader = cta_in_pair == cutlass.Int32(0)
 
-    if warp_idx >= CFG.SOFTMAX_WG0_BASE and warp_idx < CFG.SOFTMAX_WG0_BASE + CFG.SOFTMAX_WG_WARPS:
+    softmax_first_end = (
+        CFG.CORR_WARP_BASE
+        if cutlass.const_expr(MERGE_SOFTMAX_WGS)
+        else CFG.SOFTMAX_WG0_BASE + CFG.SOFTMAX_WG_WARPS
+    )
+    if warp_idx >= CFG.SOFTMAX_WG0_BASE and warp_idx < softmax_first_end:
         nvvm.setmaxregister(CFG.SOFTMAX_REGS, nvvm.SetMaxRegisterAction.INCREASE)
+        if cutlass.const_expr(MERGE_SOFTMAX_WGS):
+            sub_tile_id = (warp_idx - cutlass.Int32(CFG.SOFTMAX_WG0_BASE)) // cutlass.Int32(CFG.SOFTMAX_WG_WARPS)
+        else:
+            sub_tile_id = 0
         _softmax_warp_group(
-            sub_tile_id=0,
+            sub_tile_id=sub_tile_id,
             seqlen_q=seqlen_q,
             seqlen_kv=seqlen_kv,
             scale_log2=scale_softmax_log2,
@@ -615,7 +627,7 @@ def _kernel(
             cta_in_pair=cta_in_pair,
         )
 
-    elif warp_idx >= CFG.SOFTMAX_WG1_BASE and warp_idx < CFG.SOFTMAX_WG1_BASE + CFG.SOFTMAX_WG_WARPS:
+    elif warp_idx >= CFG.SOFTMAX_WG1_BASE and warp_idx < CFG.CORR_WARP_BASE:
         nvvm.setmaxregister(CFG.SOFTMAX_REGS, nvvm.SetMaxRegisterAction.INCREASE)
         _softmax_warp_group(
             sub_tile_id=1,
@@ -1634,7 +1646,7 @@ def _mma_warp_group(
 @cute.jit
 def _softmax_kv_body(
     apply_mask: bool,
-    sub_tile_id: int,
+    sub_tile_id,
     kv_loop,
     tmem_base,
     sStats_raw,
@@ -1659,8 +1671,12 @@ def _softmax_kv_body(
     split into LEFT/unmasked/RIGHT segments to keep the fast path on
     every interior iter.
     """
-    tmem_S_off = LAYOUT.S0_OFF if sub_tile_id == 0 else LAYOUT.S1_OFF
-    tmem_P_off = LAYOUT.P0_OFF if sub_tile_id == 0 else LAYOUT.P1_OFF
+    if cutlass.const_expr(MERGE_SOFTMAX_WGS):
+        tmem_S_off = cutlass.Int32(LAYOUT.S0_OFF) + sub_tile_id * cutlass.Int32(LAYOUT.S1_OFF - LAYOUT.S0_OFF)
+        tmem_P_off = cutlass.Int32(LAYOUT.P0_OFF) + sub_tile_id * cutlass.Int32(LAYOUT.P1_OFF - LAYOUT.P0_OFF)
+    else:
+        tmem_S_off = LAYOUT.S0_OFF if sub_tile_id == 0 else LAYOUT.S1_OFF
+        tmem_P_off = LAYOUT.P0_OFF if sub_tile_id == 0 else LAYOUT.P1_OFF
     CHUNK = 64
     P_COLS_PER_CHUNK = CHUNK // 4
     NEG_INF = cutlass.Float32(-3.4028235e38)
@@ -1814,8 +1830,9 @@ def _softmax_kv_body(
     reg_S_a = reg_S_a * scale_log2 - new_total_max
     reg_S_b = reg_S_b * scale_log2 - new_total_max
     reg_P_a = _exp2_chunk0_mask_aware(reg_S_a, apply_mask)
-    sum_a_pair = row_reduction_pair_64(reg_P_a)
+    # Expose conversion and row reduction as independent chains before the P store.
     p_a_fp16 = reg_P_a.to(STORAGE_DTYPE)
+    sum_a_pair = row_reduction_pair_64(reg_P_a)
     nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr_a, cutlass.Float32), p_a_fp16)
     nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
     bars.mb_bmm2_ready[sub_tile_id * CFG.N_BMM2_CHUNKS + 0].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
@@ -1842,7 +1859,7 @@ def _softmax_kv_body(
 
 @cute.jit
 def _softmax_warp_group(
-    sub_tile_id: int,
+    sub_tile_id,
     seqlen_q,
     seqlen_kv,
     scale_log2: cutlass.Float32,
@@ -1864,8 +1881,12 @@ def _softmax_warp_group(
     nvvm.barrier_cta_sync(barrier_id=1, thread_count=32 * (CFG.SOFTMAX_WARPGROUPS * CFG.SOFTMAX_WG_WARPS + 1))
     tmem_base = tmem_ptr_i32.load()
 
-    tmem_S_off = LAYOUT.S0_OFF if sub_tile_id == 0 else LAYOUT.S1_OFF
-    tmem_P_off = LAYOUT.P0_OFF if sub_tile_id == 0 else LAYOUT.P1_OFF
+    if cutlass.const_expr(MERGE_SOFTMAX_WGS):
+        tmem_S_off = cutlass.Int32(LAYOUT.S0_OFF) + sub_tile_id * cutlass.Int32(LAYOUT.S1_OFF - LAYOUT.S0_OFF)
+        tmem_P_off = cutlass.Int32(LAYOUT.P0_OFF) + sub_tile_id * cutlass.Int32(LAYOUT.P1_OFF - LAYOUT.P0_OFF)
+    else:
+        tmem_S_off = LAYOUT.S0_OFF if sub_tile_id == 0 else LAYOUT.S1_OFF
+        tmem_P_off = LAYOUT.P0_OFF if sub_tile_id == 0 else LAYOUT.P1_OFF
 
     NEG_INF = cutlass.Float32(-3.4028235e38)
 
@@ -1901,8 +1922,14 @@ def _softmax_warp_group(
     eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch)
     bounds = _bounds_for_tile(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair)
 
-    softmax_wg_base_const = CFG.SOFTMAX_WG0_BASE if sub_tile_id == 0 else CFG.SOFTMAX_WG1_BASE
-    tid_in_wg = cute.arch.thread_idx()[0] - cutlass.Int32(softmax_wg_base_const * 32)
+    if cutlass.const_expr(MERGE_SOFTMAX_WGS):
+        softmax_wg_base = cutlass.Int32(CFG.SOFTMAX_WG0_BASE) + sub_tile_id * cutlass.Int32(
+            CFG.SOFTMAX_WG1_BASE - CFG.SOFTMAX_WG0_BASE
+        )
+        tid_in_wg = cute.arch.thread_idx()[0] - softmax_wg_base * cutlass.Int32(32)
+    else:
+        softmax_wg_base_const = CFG.SOFTMAX_WG0_BASE if sub_tile_id == 0 else CFG.SOFTMAX_WG1_BASE
+        tid_in_wg = cute.arch.thread_idx()[0] - cutlass.Int32(softmax_wg_base_const * 32)
 
     while is_valid_tile > cutlass.Int32(0):
         if cutlass.const_expr(not (CFG.MASK_FLAGS & MASK_CAUSAL)):
