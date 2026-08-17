@@ -12,6 +12,12 @@ attention is only ~6%, so the dominant lever is the MLP. Each model can route th
 MLP through `cudnn.gemm.ops.swiglu_mlp` (`--accelerate_mlp`) and, if the package is
 installed, linear attention through `cudnn.fla` (`--accelerate_attn`, PR #596).
 
+The MLP op's forward fuses gate+up+SiLU+mul (1.05-1.20x); its backward fuses the
+`dh = dout @ Wd` dgrad GEMM with the dSwiGLU elementwise into one FROST (cuTeDSL)
+kernel — ~1.5x the recompute+pointwise backward and ~1.25x a fair torch backward
+at the Qwen3.5-27B MLP shape (CUDA-graph kernel time, SM100). Both directions now
+win, so the MLP is a training-step win, not just an inference one.
+
 The shared, model-agnostic harness lives in [`_perfshare.py`](_perfshare.py); a
 model file only builds its model, applies the swaps, and calls `profile_and_report`.
 
@@ -19,7 +25,7 @@ model file only builds its model, applies the swaps, and calls `profile_and_repo
 
 | folder | proxy of | MLP swap | notes |
 |---|---|---|---|
-| [`Qwen3-Next/`](Qwen3-Next/) | Qwen3-Next hybrid Gated DeltaNet LM | `swiglu_mlp` | forward SwiGLU fusion wins; fwd+bwd still pays the backward recompute (needs a fused bwd GEMM+epilogue) |
+| [`Qwen3-Next/`](Qwen3-Next/) | Qwen3-Next hybrid Gated DeltaNet LM | `swiglu_mlp` | forward + FROST-fused backward both win (fwd 1.05-1.20x, bwd ~1.25x vs torch); training-step win |
 
 Planned: Kimi Linear (KDA), DeepSeek-V3.
 

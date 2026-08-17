@@ -11,8 +11,9 @@ owns and which un-owned op is next.
 Two cuDNN swaps, each behind a flag:
   --accelerate_mlp   route the SwiGLU MLP through cudnn.gemm.ops.swiglu_mlp (PR #609).
                      The MLP GEMMs are ~70% of a step at real dims, so this is the
-                     dominant block; the forward SwiGLU fusion wins, the fwd+bwd still
-                     pays the backward recompute (see docs/framework_integration_performance.md).
+                     dominant block; the forward SwiGLU fusion wins (1.05-1.20x) and the
+                     backward fuses the dgrad GEMM + dSwiGLU into one FROST kernel
+                     (~1.25x vs torch), so fwd+bwd is a training-step win.
   --accelerate_attn  route linear attention through cudnn.fla (PR #596), if installed.
                      Only ~6% of a step, so small e2e effect; kept for completeness.
 
