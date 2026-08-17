@@ -33,7 +33,7 @@ from cudnn.sdpa.fwd.config_sm120 import (
     SEQ_KV_TILES as _SM120_KV_TILES,
     SEQ_Q_TILES as _SM120_Q_TILES,
     SUPPORTED_HEAD_TILE_MAX as _SM120_HEAD_TILE_MAX,
-    SUPPORTED_HEAD_TILES_FP8 as _SM120_FP8_HEAD_TILES,
+    FP8_HEAD_TILE_GRANULE as _SM120_FP8_HEAD_TILE_GRANULE,
     TemplateParams as Sm120TemplateParams,
     smem_bytes as _sm120_smem_bytes,
 )
@@ -117,10 +117,12 @@ _SM107_FP8_KERNEL_FILE = "prefill_d128_fp8_sm107.py"
 _SM100_TILE_N = 128
 
 _SM120_KERNEL_FILE = "prefill_f16_sm120.py"
-# Per-tensor FP8 sibling (E4M3 in as Uint8 storage, FP16 out, mma.sync
+# Per-tensor FP8 kernel (E4M3/E5M2 in, FP16/BF16/FP8 out, mma.sync
 # m16n8k32); selected by the graph op (sdpa_fp8) via check_support's dtype.
 _SM120_FP8_KERNEL_FILE = "prefill_fp8_sm120.py"
 _SM120_DTYPE_QKV_CODE = {
+    torch.float8_e4m3fn: DTYPE_E4M3,
+    torch.float8_e5m2: DTYPE_E5M2,
     torch.bfloat16: DTYPE_BF16,
     torch.float16: DTYPE_FP16,
 }
@@ -1348,12 +1350,18 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # A zero-token packed K/V view cannot back a CuTe layout / TMA
             # descriptor, so clamp the packed KV extent to ONE
             # never-dereferenced token (every tile sees kv_left ==
-            # kv_right == 0, so no K/V load is ever issued) bound over
-            # storage guaranteed large enough: Q backs K (kh*d_qk <=
-            # t_q*qh*d_qk) and O backs V (kh*d_v <= t_q*qh*d_v).
+            # kv_right == 0, so no K/V load is ever issued). Q backs K
+            # (same element type, and kh*d_qk <= t_q*qh*d_qk); V must carry
+            # the INPUT element type, which no output buffer guarantees (O's
+            # dtype is independent), and Q's storage is not always large
+            # enough for kh*d_v — so V binds a cached zero stub (allocated
+            # once, off the execute hot path).
             t_kv = 1
             K = q_buf.as_strided((1, 1, kh, d_qk), (kh * d_qk, kh * d_qk, d_qk, 1), q_buf.storage_offset())
-            V = o_buf.as_strided((1, 1, kh, d_v), (kh * d_v, kh * d_v, d_v, 1), o_buf.storage_offset())
+            with _torch_stream_context(current_stream, dev):
+                V = self._dummy(f"thd_v_stub_{d_v}", dev, lambda: torch.zeros(kh * d_v, dtype=q_buf.dtype, device=dev)).as_strided(
+                    (1, 1, kh, d_v), (kh * d_v, kh * d_v, d_v, 1), 0
+                )
         else:
             K = self._thd_view(k_buf, self.k_desc, t_kv)
             V = self._thd_view(v_buf, self.v_desc, t_kv)
@@ -1949,13 +1957,13 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             f"D_V ({d_v}) must be a multiple of 8 (TMA 16-byte global-stride rule at 2 B/elem) and <= {_SM120_HEAD_TILE_MAX}",
         )
 
-        self.dtype = self._check_dtype(self.q_desc, [torch.float16, torch.bfloat16, torch.float8_e4m3fn], name="Q")
-        self._fp8 = self.dtype == torch.float8_e4m3fn
+        self.dtype = self._check_dtype(self.q_desc, [torch.float16, torch.bfloat16, *_SM100_FP8_DTYPES], name="Q")
+        self._fp8 = self.dtype in _SM100_FP8_DTYPES
         for desc in (self.k_desc, self.v_desc, self.o_desc):
             if self._fp8 and desc is self.o_desc:
-                # The fp8 kernel's epilogue emits FP16 only (see the kernel
-                # docstring); fp8 O would need a scale_o quantizing store.
-                self._check_dtype(desc, torch.float16, name="O", extra_error_msg="SM120 fp8 emits FP16 O only")
+                # SDPA_FP8's O dtype is independent of QKV: fp16/bf16 ride the
+                # staging epilogue, fp8 the direct quantizing store.
+                self._check_dtype(desc, [torch.float16, torch.bfloat16, *_SM100_FP8_DTYPES], name="O")
             else:
                 self._check_dtype(
                     desc,
@@ -1972,20 +1980,9 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                 not self._pertensor,
                 "SM120 fp8 serves the per-tensor SDPA_FP8 op only (no MXFP8 cell)",
             )
-            # THD is served; token-major ragged Stats is not. This kernel's
-            # ragged LSE store is unconditionally head-major (it writes
-            # lse[0, head, q_row_base + row]) — the f16 cell is the one that
-            # specializes on both layouts.
-            self._not_implemented_error_if(
-                self.thd and self.lse_desc is not None and not self.thd_stats_head_major,
-                "SM120 fp8 THD serves head-major ragged Stats only (token-major is f16-only)",
-            )
-            self._value_error_if(self.has_sink, "SM120 fp8 does not support attention sinks (Amax_S semantics)")
-            self._value_error_if(self.seq_q_lens_present and not self.thd, "SM120 fp8 does not support per-batch seq_len_q")
             self._value_error_if(
-                any(d not in _SM120_FP8_HEAD_TILES for d in (d_q, d_v)),
-                f"SM120 fp8 requires D_QK and D_V to be multiples of 32 within 32..256 (k32 contraction and 1-byte "
-                f"TMA swizzle span; no zero-padding envelope on the 8-bit fragment path); got ({d_q}, {d_v})",
+                d_q % 16 != 0 or d_v % 16 != 0,
+                f"SM120 fp8 requires D_QK/D_V multiples of 16, got ({d_q}, {d_v})",
             )
 
         self._value_error_if(
@@ -2036,8 +2033,9 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         # SMEM tiles are sized at the ENVELOPE-padded head tiles (rounded up
         # to the head-tile granule), not the actual dims — the kernel stages
         # full tiles and the TMA zero-fills the pad columns.
-        d_qp = -(-d_q // _SM120_HEAD_TILE_GRANULE) * _SM120_HEAD_TILE_GRANULE
-        d_vp = -(-d_v // _SM120_HEAD_TILE_GRANULE) * _SM120_HEAD_TILE_GRANULE
+        granule = _SM120_FP8_HEAD_TILE_GRANULE if self._fp8 else _SM120_HEAD_TILE_GRANULE
+        d_qp = -(-d_q // granule) * granule
+        d_vp = -(-d_v // granule) * granule
 
         def _smem_bytes(kv_tile: int) -> int:
             # FP8 stages a byte per KV element but still writes O in half.
@@ -2078,7 +2076,8 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             return
 
         params = Sm120TemplateParams(
-            dtype_qkv=DTYPE_E4M3 if self._fp8 else _SM120_DTYPE_QKV_CODE[self.dtype],
+            dtype_qkv=_SM120_DTYPE_QKV_CODE[self.dtype],
+            dtype_o=_SM120_DTYPE_QKV_CODE[self.o_desc.dtype],
             window_left=self.window_left,
             window_right=self.window_right,
             bottom_right=self.causal_bottom_right,
@@ -2181,6 +2180,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                 amax_o,
                 descale_s,
                 scale_s,
+                sinks=sinks,
                 seq_q_lens=seq_q_lens,
                 workspace=workspace,
                 current_stream=current_stream,
@@ -2270,6 +2270,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         amax_o,
         descale_s=None,
         scale_s=None,
+        sinks=None,
         seq_q_lens=None,
         workspace=None,
         current_stream=None,
@@ -2279,13 +2280,10 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         ``descale_q*descale_k`` folds into ``scale_softmax_log2`` and
         ``descale_s*descale_v*scale_o`` into the kernel's ``o_scale_fused``
         scalar; ``scale_s`` goes in separately because it multiplies P before
-        the e4m3 cast rather than the output (the FORT ordering: amax on the
-        unscaled softmax result, then scale, then cast).
-        ``Amax_S`` is produced in-kernel (bitcast-int32 atomicMax of the
-        per-row ``1/row_sum``) into the caller's pre-zeroed buffer; ``Amax_O``
-        is ``max|o_scaled|/scale_o`` post-kernel (exact for the FP16 output).
-        E4M3 tensors travel as ``uint8`` views — the kernel consumes bit
-        patterns (see the kernel docstring).
+        the fp8 cast rather than the output (the FORT ordering: the softmax
+        denominator reads the unscaled result, then scale, then cast).
+        ``Amax_O`` is ``max|o_scaled|/scale_o`` post-kernel (pre-cast fp32,
+        so exact for every O dtype including the fp8 quantizing store).
         """
         import cutlass
 
@@ -2306,39 +2304,70 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             self.lse_desc is None and lse_tensor is not None,
             "this specialization was compiled without an LSE output; construct the API with sample_lse",
         )
-        seq_kv_t = (
-            self._checked_seq_lens(seq_kv_lens, "seq_kv_lens")
-            if seq_kv_lens is not None
-            else self._dummy("seq_kv_lens", device, lambda: torch.zeros(self.batch_size, dtype=torch.int32, device=device))
-        )
-        seq_q_dummy = self._dummy("seq_q_lens", device, lambda: torch.zeros(self.batch_size, dtype=torch.int32, device=device))
         if current_stream is None:
             current_stream = cuda.CUstream(torch.cuda.current_stream(device).cuda_stream)
 
-        q = self._to_bshd(q_tensor).view(torch.uint8)
-        k = self._to_bshd(k_tensor).view(torch.uint8)
-        v = self._to_bshd(v_tensor).view(torch.uint8)
-        o_view, o_needs_copy_back, o_scratch = self._to_bshd_writable(o_tensor)
-        o = o_scratch if o_needs_copy_back else o_view
-
+        sinks_t = self._checked_sinks_1d(sinks) if sinks is not None else None
         # THD packs the batch away, so the ragged views and the per-execute
         # compile replace the dense buffers; everything else (the folded
-        # scalars, the amax protocol) is identical.
+        # scalars, the amax protocol) is identical. THD buffers go to
+        # _thd_pack RAW: callers may bind ragged storage in any rank (mhas
+        # hands flat (T, H, D) buffers), the packed as_strided views read raw
+        # storage directly, and the dense _to_bshd_writable normalization
+        # must NOT run -- its scratch copy-back is a SEMANTIC (shape-wise)
+        # copy that scrambles packed bytes whenever it misreads such a buffer
+        # as a non-BSHD dense layout (h > 1; size-1 axes made h == 1 immune).
         pack = None
+        q = k = v = o = None
+        o_needs_copy_back = False
+        seq_kv_t = seq_q_t = None
         if self.thd:
-            pack = self._thd_pack(q, k, v, o, seq_q_lens, seq_kv_lens, workspace, "SdpaFwdDslSm120 (FP8 THD)", current_stream=current_stream)
+            # A token-major LSE shares the Q/O dynamic token symbol, so its
+            # capacity joins their floor; head-major carries its own declared
+            # head_stride (covering the packed total is caller contract — t_q
+            # is a device value, Rule 3).
+            lse_cap = lse_tensor.numel() // self.h_q if (lse_tensor is not None and not self.thd_stats_head_major) else None
+            pack = self._thd_pack(
+                q_tensor,
+                k_tensor,
+                v_tensor,
+                o_tensor,
+                seq_q_lens,
+                seq_kv_lens,
+                workspace,
+                "SdpaFwdDslSm120 (FP8 THD)",
+                current_stream=current_stream,
+                lse_tokens_cap=lse_cap,
+            )
             if pack is None:
                 return
-            # This kernel's ragged LSE store is head-major (H, head_stride):
-            # tokens contiguous within a head row. (The f16 cell specializes on
-            # either layout; check_support declines token-major here.)
-            # head_stride covering the packed total is caller contract — the
-            # total is a device value (Rule 3).
+            # The kernel specializes on either ragged-Stats layout:
+            #   token-major packed (T, H) or head-major (H, head_stride)
             lse = None
             if lse_tensor is not None:
-                head_stride = self.thd_stats_head_stride
-                lse = lse_tensor.as_strided((self.h_q, head_stride), (head_stride, 1), lse_tensor.storage_offset())
+                if self.thd_stats_head_major:
+                    head_stride = self.thd_stats_head_stride
+                    lse = lse_tensor.as_strided((self.h_q, head_stride), (head_stride, 1), lse_tensor.storage_offset())
+                else:
+                    lse = lse_tensor.as_strided((pack.t_q, self.h_q), (self.h_q, 1), lse_tensor.storage_offset())
         else:
+            seq_kv_t = (
+                self._checked_seq_lens(seq_kv_lens, "seq_kv_lens")
+                if seq_kv_lens is not None
+                else self._dummy("seq_kv_lens", device, lambda: torch.zeros(self.batch_size, dtype=torch.int32, device=device))
+            )
+            # Dense padded-Q trim: bind the REAL per-batch Q lengths whenever
+            # the graph carries them — a zeroed dummy would trim every row.
+            seq_q_t = (
+                self._checked_seq_lens(seq_q_lens, "seq_q_lens")
+                if seq_q_lens is not None
+                else self._dummy("seq_q_lens", device, lambda: torch.zeros(self.batch_size, dtype=torch.int32, device=device))
+            )
+            q = self._to_bshd(q_tensor)
+            k = self._to_bshd(k_tensor)
+            v = self._to_bshd(v_tensor)
+            o_view, o_needs_copy_back, o_scratch = self._to_bshd_writable(o_tensor)
+            o = o_scratch if o_needs_copy_back else o_view
             lse = self._checked_lse_view(lse_tensor) if lse_tensor is not None else None
 
         # amax_o: the kernel atomicMax'es into this buffer, so it MUST start
@@ -2359,8 +2388,8 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             pack.V if pack is not None else v,
             pack.O if pack is not None else o,
             lse,
-            None,  # sinks: fp8 cell rejects has_sink
-            pack.seq_q_dummy if pack is not None else seq_q_dummy,
+            sinks_t,
+            pack.seq_q_dummy if pack is not None else seq_q_t,
             pack.meta if pack is not None else seq_kv_t,
             amax_o_buf.view(torch.int32),
             cutlass.Float32(scale_softmax_log2),
@@ -2400,8 +2429,9 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             lse_head_stride=self.thd_stats_head_stride,
         )
         if self._fp8:
-            # The FP8 cell serves only the packed contract (no stride keys)
-            # and its ragged LSE store is head-major-only.
+            # The FP8 cell serves only the packed contract (no stride keys);
+            # its ragged LSE store specializes on either layout.
+            kwargs.update(lse_head_major=self.thd_stats_head_major)
             return kwargs
 
         def _key(desc):
@@ -2488,13 +2518,19 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             # (AGENTS.md Rule 1). A zero-token packed K/V view cannot back a
             # CuTe layout, so clamp the packed KV extent to ONE
             # never-dereferenced token (every sequence's KV tile range is
-            # empty, so no K/V load is ever issued) bound over storage
-            # guaranteed large enough: Q backs K (kh*d_qk <= t_q*qh*d_qk) and
-            # O backs V (kh*d_v <= t_q*qh*d_v). All-zero LENGTHS over live
-            # storage launch normally through the dead-row path.
+            # empty, so no K/V load is ever issued). Q backs K (same element
+            # type, and kh*d_qk <= t_q*qh*d_qk); V must carry the INPUT
+            # element type, which no output buffer guarantees (O's dtype is
+            # independent), and Q's storage is not always large enough for
+            # kh*d_v — so V binds a cached zero stub (allocated once, off the
+            # execute hot path). All-zero LENGTHS over live storage launch
+            # normally through the dead-row path.
             t_kv = 1
             K = q_buf.as_strided((1, 1, kh, d_qk), (kh * d_qk, kh * d_qk, d_qk, 1), q_buf.storage_offset())
-            V = o_buf.as_strided((1, 1, kh, d_v), (kh * d_v, kh * d_v, d_v, 1), o_buf.storage_offset())
+            with _torch_stream_context(current_stream, dev):
+                V = self._dummy(f"thd_v_stub_{d_v}", dev, lambda: torch.zeros(kh * d_v, dtype=q_buf.dtype, device=dev)).as_strided(
+                    (1, 1, kh, d_v), (kh * d_v, kh * d_v, d_v, 1), 0
+                )
         else:
             K = _view(k_buf, self.k_desc, t_kv, kh, d_qk)
             V = _view(v_buf, self.v_desc, t_kv, kh, d_v)

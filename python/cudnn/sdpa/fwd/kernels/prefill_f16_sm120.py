@@ -29,14 +29,14 @@ The kernel implements key optimizations including:
   single TMA descriptor's seq coordinate
 
 Constraints:
-* Supported input dtypes: Float16 and BFloat16, output dtype must match input dtype
-* Runtime head dimensions must be multiples of 8 up to 256 (TMA 16-byte
+- Supported input dtypes: Float16 and BFloat16, output dtype must match input dtype
+- Runtime head dimensions must be multiples of 8 up to 256 (TMA 16-byte
   global-stride rule); the kernel compiles at head TILES rounded up to 16 and
   TMA zero-fills the pad columns (the head-dim ENVELOPE)
-* Q heads must be divisible by the number of K/V heads
-* Q/K/V/O use compact BSHD storage
-* Supported CTA Q/KV tiles are 128 or 64
-* K/V pipeline and output staging storage must fit within the target SM120 SMEM
+- Q heads must be divisible by the number of K/V heads
+- Q/K/V/O use compact BSHD storage
+- Supported CTA Q/KV tiles are 128 or 64
+- K/V pipeline and output staging storage must fit within the target SM120 SMEM
   capacity
 """
 
@@ -51,7 +51,7 @@ import cutlass.cute as cute
 
 from cutlass.experimental import primitives as prims
 from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_FP16
-from cudnn.frost.tile_dsl.mma import ptx_mma_m16n8k16_f32
+from cudnn.frost.tile_dsl.mma import mma_m16n8k16_f32
 from cudnn.frost.tile_dsl.swizzle import swizzle_xor
 from cudnn.sdpa.fwd.kernels.thd_sm100 import build_thd_meta_kernel as _build_thd_meta_kernel
 from cudnn.sdpa.fwd.config_sm120 import (
@@ -252,14 +252,13 @@ class SM120FusedMultiHeadAttentionForward:
         self.is_causal = is_causal
         self.bottom_right = bottom_right
         self.window_size_left = window_size_left
-        self.window_size_right = window_size_right
         # Band model: a right bound implies the causal upper limit (compile()
         # maps window_right -> is_causal), so the masking sites key off
-        # is_causal and add the (compile-time) widening.
-        self.right_slack = window_size_right if window_size_right is not None else 0
+        # is_causal and add the (compile-time) widening. 0 = plain causal.
+        self.window_right = window_size_right if window_size_right is not None else 0
         # A translated diagonal (bottom-right anchoring or a right band) can
         # straddle one more KV tile than the tile-aligned top-left one.
-        self.diag_shifted = bottom_right or self.right_slack > 0
+        self.diag_shifted = bottom_right or self.window_right > 0
         self.seq_q_lens_present = seq_q_lens_present
         self.seq_kv_lens_present = seq_kv_lens_present
         self.has_sink = has_sink
@@ -488,7 +487,7 @@ class SM120FusedMultiHeadAttentionForward:
                 k_vec = load_k_frag_pair(k_frag_pair, d_frag)
                 q_off = d_frag * 4
                 s_off = (k_frag_pair * 2) * 4
-                s_regs[s_off:4] = ptx_mma_m16n8k16_f32(
+                s_regs[s_off:4] = mma_m16n8k16_f32(
                     q_regs[q_off + 0],
                     q_regs[q_off + 1],
                     q_regs[q_off + 2],
@@ -501,7 +500,7 @@ class SM120FusedMultiHeadAttentionForward:
                     s_regs[s_off + 3],
                     self.in_dtype,
                 )
-                s_regs[s_off + 4 : 4] = ptx_mma_m16n8k16_f32(
+                s_regs[s_off + 4 : 4] = mma_m16n8k16_f32(
                     q_regs[q_off + 0],
                     q_regs[q_off + 1],
                     q_regs[q_off + 2],
@@ -564,10 +563,10 @@ class SM120FusedMultiHeadAttentionForward:
             valid_cols = basic_params.seqlen_k
             if cutlass.const_expr(self.is_causal):
                 # Causal upper bound, widened right by the (compile-time) band
-                # slack — 0 for plain causal, R for diagonal_band_right_bound.
+                # widening — 0 for plain causal, R for diagonal_band_right_bound.
                 valid_cols = cute.math.max(
                     cutlass.Int32(0),
-                    cute.math.min(diagonal_position + 1 + self.right_slack, basic_params.seqlen_k),
+                    cute.math.min(diagonal_position + 1 + self.window_right, basic_params.seqlen_k),
                 )
 
             first_valid_col = cutlass.Int32(0)
@@ -708,7 +707,7 @@ class SM120FusedMultiHeadAttentionForward:
                 p2 = p_regs[p_pack_off + 4].bitcast(cutlass.Int32)
                 p3 = p_regs[p_pack_off + 6].bitcast(cutlass.Int32)
                 o_off = (d_frag_pair * 2) * 4
-                o_regs[o_off:4] = ptx_mma_m16n8k16_f32(
+                o_regs[o_off:4] = mma_m16n8k16_f32(
                     p0,
                     p1,
                     p2,
@@ -721,7 +720,7 @@ class SM120FusedMultiHeadAttentionForward:
                     o_regs[o_off + 3],
                     self.in_dtype,
                 )
-                o_regs[o_off + 4 : 4] = ptx_mma_m16n8k16_f32(
+                o_regs[o_off + 4 : 4] = mma_m16n8k16_f32(
                     p0,
                     p1,
                     p2,
@@ -889,7 +888,7 @@ class SM120FusedMultiHeadAttentionForward:
             if q_seq_idx >= seqlen_q:
                 num_kv_tiles = cutlass.Int32(0)
         if cutlass.const_expr(self.is_causal):
-            causal_k_end = q_seq_idx + self.q_tile + self.right_slack
+            causal_k_end = q_seq_idx + self.q_tile + self.window_right
             if cutlass.const_expr(self.bottom_right):
                 causal_k_end += seqlen_k - seqlen_q
             causal_k_end = cute.math.max(cutlass.Int32(0), cute.math.min(causal_k_end, seqlen_k))

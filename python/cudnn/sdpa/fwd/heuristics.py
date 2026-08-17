@@ -33,7 +33,7 @@ from typing import Any, Dict, List, Tuple
 import cudnn
 
 from cudnn.engines.base import PlanConfig
-from cudnn.sdpa.fwd.config_sm120 import SMEM_CAPACITY_BYTES, smem_bytes
+from cudnn.sdpa.fwd.config_sm120 import FP8_HEAD_TILE_GRANULE, HEAD_TILE_GRANULE, SMEM_CAPACITY_BYTES, smem_bytes
 from cudnn.sdpa.fwd.engines import ENGINE_SPECS, Capabilities, SdpaFwdKnobs, mismatch
 
 # Cells timed against the backend's kernel and found SLOWER, so the backend's
@@ -77,9 +77,15 @@ def _sm120_tiles(caps: Capabilities, facts) -> Tuple[int, int]:
     fine = sm_count > 0 and (grid * 2 <= sm_count or (grid * 2 <= 3 * sm_count and kv_tiles >= 12))
     tile_m = 64 if fine else 128
     # FP8 stages a byte per KV element but still writes O in half, so the two
-    # SMEM terms size differently -- see config_sm120.smem_bytes.
+    # SMEM terms size differently -- see config_sm120.smem_bytes. The kernel
+    # stages ENVELOPE head tiles (actual dims round up to the granule), so
+    # the fit check must round the same way or a tile offered here declines
+    # at build -- and a knob-carried tile skips the adapter's fallback.
     qkv_itemsize, o_itemsize = (1, 2) if facts.is_fp8 else (2, 2)
-    fits = [n for n in sorted(caps.tile_ns, reverse=True) if smem_bytes(facts.d_qk, facts.d_v, tile_m, n, qkv_itemsize, o_itemsize) <= SMEM_CAPACITY_BYTES]
+    granule = FP8_HEAD_TILE_GRANULE if facts.is_fp8 else HEAD_TILE_GRANULE
+    d_qp = -(-facts.d_qk // granule) * granule
+    d_vp = -(-facts.d_v // granule) * granule
+    fits = [n for n in sorted(caps.tile_ns, reverse=True) if smem_bytes(d_qp, d_vp, tile_m, n, qkv_itemsize, o_itemsize) <= SMEM_CAPACITY_BYTES]
     return tile_m, (fits[0] if fits else min(caps.tile_ns))
 
 
@@ -125,9 +131,11 @@ def _mode_a(facts, offered: Dict[str, int], mode) -> List[PlanConfig]:
         # offering to a caller who measures. Configs the kernel cannot fit are
         # not runners-up -- they would sit in the list only to decline at build.
         qkv_itemsize, o_itemsize = (1, 2) if facts.is_fp8 else (2, 2)
-        domain = [
-            (m, n) for m in caps.tile_ms for n in caps.tile_ns if smem_bytes(facts.d_qk, facts.d_v, m, n, qkv_itemsize, o_itemsize) <= SMEM_CAPACITY_BYTES
-        ]
+        # Same envelope rounding as _sm120_tiles / the adapter's SMEM check.
+        granule = FP8_HEAD_TILE_GRANULE if facts.is_fp8 else HEAD_TILE_GRANULE
+        d_qp = -(-facts.d_qk // granule) * granule
+        d_vp = -(-facts.d_v // granule) * granule
+        domain = [(m, n) for m in caps.tile_ms for n in caps.tile_ns if smem_bytes(d_qp, d_vp, m, n, qkv_itemsize, o_itemsize) <= SMEM_CAPACITY_BYTES]
         ordered = sorted(domain or [best], key=lambda mn: (mn != best, mn[1] != best[1], -mn[0]))
         for tile_m, tile_n in ordered:
             knobs = _knobs(caps, tile_m, tile_n)
