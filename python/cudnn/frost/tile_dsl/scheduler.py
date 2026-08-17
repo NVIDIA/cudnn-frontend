@@ -82,6 +82,7 @@ def decode_linear_tile_lpt_l2(linear, q_h, batch, q_tiles, heads_per_kv, seqlen_
     row = (q_tiles - cutlass.Int32(1)) - row_rank
     return row, head, batch_idx
 
+
 @cute.jit
 def read_tile_id_arrive(mb, cga_size: int):
     if cga_size == 1:

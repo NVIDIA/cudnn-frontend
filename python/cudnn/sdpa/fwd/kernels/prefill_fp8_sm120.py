@@ -974,9 +974,7 @@ class SM120FusedMultiHeadAttentionForward:
         q_tile_idx, batch_idx, head_idx = cute.arch.block_idx()
         if cutlass.const_expr(self.sched_policy != SCHED_NATURAL):
             _n_qh = cutlass.Int32(q.shape[2])
-            _n_batch = cutlass.Int32(
-                self.thd_batch if cutlass.const_expr(self.thd_varlen) else q.shape[0]
-            )
+            _n_batch = cutlass.Int32(self.thd_batch if cutlass.const_expr(self.thd_varlen) else q.shape[0])
             # Host-computed (see __call__): the grid is sized from the same
             # value, so the decode cannot disagree with the launch geometry.
             _q_tiles = n_q_tiles
@@ -992,9 +990,7 @@ class SM120FusedMultiHeadAttentionForward:
                     _SCHED_L2_BUDGET_BYTES,
                 )
             else:
-                q_tile_idx, head_idx, batch_idx = decode_linear_tile_lpt(
-                    q_tile_idx, _n_qh, _n_batch, _q_tiles
-                )
+                q_tile_idx, head_idx, batch_idx = decode_linear_tile_lpt(q_tile_idx, _n_qh, _n_batch, _q_tiles)
         elif cutlass.const_expr(self.is_causal):
             # Causal work grows with the Q tile. Launch long tiles first to
             # avoid leaving a few expensive CTAs in the final scheduler waves.

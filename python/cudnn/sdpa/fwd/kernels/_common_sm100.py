@@ -371,9 +371,7 @@ def make_sdpa_helpers(CFG, lpt_q_tiles_in_cga_units: bool = False) -> SdpaHelper
             q_tiles = n_q_supers // cutlass.Int32(_cta_mma) if lpt_q_tiles_in_cga_units else n_q_supers
             if cutlass.const_expr(qh_per_kh is None or seqlen_kv is None):
                 raise ValueError("SCHED_LPT_L2 decode requires qh_per_kh and seqlen_kv at every call site")
-            row, head, batch = decode_linear_tile_lpt_l2(
-                linear, n_qh, n_batch, q_tiles, qh_per_kh, seqlen_kv, _kv_bytes_per_row, _l2_bytes
-            )
+            row, head, batch = decode_linear_tile_lpt_l2(linear, n_qh, n_batch, q_tiles, qh_per_kh, seqlen_kv, _kv_bytes_per_row, _l2_bytes)
             return _lpt_q_super(row, cta_in_pair), head, batch
 
         @cute.jit
@@ -382,9 +380,7 @@ def make_sdpa_helpers(CFG, lpt_q_tiles_in_cga_units: bool = False) -> SdpaHelper
             q_tiles = n_q_supers // cutlass.Int32(_cta_mma) if lpt_q_tiles_in_cga_units else n_q_supers
             if cutlass.const_expr(qh_per_kh is None or seqlen_kv is None):
                 raise ValueError("SCHED_LPT_L2 decode requires qh_per_kh and seqlen_kv at every call site")
-            row, head, batch = decode_linear_tile_lpt_l2(
-                linear, n_qh, n_batch, q_tiles, qh_per_kh, seqlen_kv, _kv_bytes_per_row, _l2_bytes
-            )
+            row, head, batch = decode_linear_tile_lpt_l2(linear, n_qh, n_batch, q_tiles, qh_per_kh, seqlen_kv, _kv_bytes_per_row, _l2_bytes)
             return _lpt_q_super(row, cta_in_pair), head, batch
 
     else:
@@ -510,17 +506,13 @@ def make_sdpa_helpers(CFG, lpt_q_tiles_in_cga_units: bool = False) -> SdpaHelper
         return q_super, f_head, f_batch
 
     @cute.jit
-    def _dispatch_decode_initial(
-        bidx, bidy, bidz, cta_in_pair, n_q_supers, n_qh, n_batch, seq_kv_lens_t, qh_per_kh=None, seqlen_kv=None
-    ):
+    def _dispatch_decode_initial(bidx, bidy, bidz, cta_in_pair, n_q_supers, n_qh, n_batch, seq_kv_lens_t, qh_per_kh=None, seqlen_kv=None):
         if cutlass.const_expr(_thd_on):
             return _thd_decode(bidx, seq_kv_lens_t, n_batch, n_qh, cta_in_pair)
         return _decode_initial(bidx, bidy, bidz, cta_in_pair, n_q_supers, n_qh, n_batch, qh_per_kh, seqlen_kv)
 
     @cute.jit
-    def _dispatch_decode_payload(
-        t0, t1, cta_in_pair, n_q_supers, n_qh, n_batch, seq_kv_lens_t, qh_per_kh=None, seqlen_kv=None
-    ):
+    def _dispatch_decode_payload(t0, t1, cta_in_pair, n_q_supers, n_qh, n_batch, seq_kv_lens_t, qh_per_kh=None, seqlen_kv=None):
         if cutlass.const_expr(_thd_on):
             return _thd_decode(t0, seq_kv_lens_t, n_batch, n_qh, cta_in_pair)
         return _decode_payload(t0, t1, cta_in_pair, n_q_supers, n_qh, n_batch, qh_per_kh, seqlen_kv)

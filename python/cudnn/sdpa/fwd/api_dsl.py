@@ -153,6 +153,7 @@ def _torch_stream_context(current_stream: Optional[cuda.CUstream], device: torch
     with torch.cuda.stream(launch_stream):
         yield
 
+
 # Causal-balancing scheduler choice: use the L2-GROUPED LPT when ONE head's K+V
 # working set fits this budget -- that is the condition under which the
 # block-cyclic grouping can actually keep that K/V resident; otherwise plain
