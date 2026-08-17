@@ -988,17 +988,20 @@ def _run_thd_fp8(
     if check_stats:
         assert stats is not None
         stats.set_output(True).set_data_type(cudnn.data_type.FLOAT)
-        # head-major [h, t]: tokens contiguous within a head, heads strided by
-        # the padded token capacity; offsets = cu_q * stride_s = cu_q. This is
-        # the only ragged Stats layout the fp8 kernel stores.
+        # One flat fp32 buffer covers either ragged Stats layout; the ragged
+        # offsets are ELEMENT offsets under the declared strides, so each
+        # layout scales cu_q by its own token stride.
         stats_storage = torch.full((h_q * t_cap,), _THD_SENTINEL, dtype=torch.float32, device=dev)
         if stats_layout == "head_major":
-            # (H, t_cap): tokens contiguous within a head row.
+            # (H, t_cap): tokens contiguous within a head row (stride_s = 1);
+            # element offsets = cu_q.
             stats.set_dim((batch, h_q, s_q_max, 1)).set_stride((h_q * t_cap, t_cap, 1, 1))
+            stats_ro_t = (q_ro.flatten() // (D * h_q)).view(batch + 1, 1, 1, 1).contiguous()
         else:
-            # token-major packed (T, H): heads contiguous within a token row.
+            # token-major packed (T, H): heads contiguous within a token row
+            # (stride_s = h_q); element offsets = cu_q * h_q.
             stats.set_dim((batch, h_q, s_q_max, 1)).set_stride((s_q_max * h_q, 1, h_q, 1))
-        stats_ro_t = (q_ro.flatten() // (D * h_q)).view(batch + 1, 1, 1, 1).contiguous()
+            stats_ro_t = (q_ro.flatten() // D).view(batch + 1, 1, 1, 1).contiguous()
         stats_ro = g.tensor_like(stats_ro_t)
         stats.set_ragged_offset(stats_ro)
         vp[stats_ro] = stats_ro_t
