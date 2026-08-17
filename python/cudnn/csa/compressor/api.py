@@ -18,7 +18,7 @@ The framework-side autograd wiring stays in the caller (e.g. a ``torch.autograd.
 that calls the forward wrapper in ``forward()`` and the backward wrapper in
 ``backward()``); these APIs are pure kernels-plus-validation.
 
-Validated envelope (``check_support``): compute capability 10.0, BF16 ``kv``/``score``/
+Validated envelope (``check_support``): compute capability major >= 10 (SM100+), BF16 ``kv``/``score``/
 ``out``, FP32 ``ape``, int32 ``cu_seqlens``/``cu_seqlens_comp``, int32 flat offsets
 (``total_tokens * coff * head_dim < 2**31``), and per ratio:
 
@@ -66,8 +66,8 @@ from cudnn.api_base import APIBase, TupleDict
 
 from .compressor_sm100 import (
     CU_ALIGN_BYTES,
+    MINIMUM_COMPUTE_CAPABILITY_MAJOR,
     PTR_ALIGN_BYTES,
-    SUPPORTED_COMPUTE_CAPABILITY,
     precompile_bwd,
     precompile_fwd,
     run_bwd,
@@ -321,8 +321,9 @@ class _CSACompressorBase(APIBase):
 
         capability = torch.cuda.get_device_capability(target)
         self._runtime_error_if(
-            capability != SUPPORTED_COMPUTE_CAPABILITY,
-            f"CSA compressor requires compute capability {SUPPORTED_COMPUTE_CAPABILITY} (the only validated architecture so far), found SM{capability[0]}.{capability[1]} on {target}",
+            capability[0] < MINIMUM_COMPUTE_CAPABILITY_MAJOR,
+            f"CSA compressor requires compute capability major >= {MINIMUM_COMPUTE_CAPABILITY_MAJOR} "
+            f"(SM100+), found SM{capability[0]}.{capability[1]} on {target}",
         )
 
         self.total_tokens = total_tokens

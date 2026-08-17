@@ -130,8 +130,8 @@ that need a fully deterministic backward must use an eager implementation.
 
 ### Support surface (`check_support`)
 
-- Compute capability **10.0** (the only validated architecture so far; the kernels use
-  no arch-specific features, wider enablement is possible after validation)
+- Compute-capability major **>= 10** (SM100 and newer; the kernels use no
+  architecture-specific features beyond the SM100 baseline)
 - `ratio == 4`, `coff in {1, 2}` (`coff == 2` is the production CSA/HCA configuration,
   `coff == 1` the own-block window form) — served by the generic kernels, which are
   generic over `(ratio, head_dim, coff in {1, 2})` but keep the whole pooling window in

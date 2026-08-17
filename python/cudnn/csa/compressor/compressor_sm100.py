@@ -92,12 +92,10 @@ from cutlass.cute.runtime import make_ptr
 
 _ENV_FAST_LAUNCH = "CUDNNFE_CSA_COMPRESSOR_FAST_LAUNCH"
 
-# The only compute capability the kernels have been validated on so far. The kernels use
-# no architecture-specific features (plain loads/stores, fp32 atomics, pinned mul/fma
-# PTX), but wider coverage stays opt-in until validated per architecture. The
-# ``cute.compile`` default arch resolution maps (10, 0) to ``sm_100a``, so the CC gate
-# also pins the generated SASS target.
-SUPPORTED_COMPUTE_CAPABILITY = (10, 0)
+# The kernels use no architecture-specific features beyond the SM100 baseline (plain
+# loads/stores, fp32 atomics, pinned mul/fma PTX), so admit SM100 and newer GPU
+# families. ``cute.compile`` resolves the concrete SASS target from the active device.
+MINIMUM_COMPUTE_CAPABILITY_MAJOR = 10
 
 
 # =============================================================================
