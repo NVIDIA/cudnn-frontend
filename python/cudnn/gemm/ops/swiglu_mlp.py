@@ -208,10 +208,10 @@ def _dswiglu(dh, gate, up):
 
 
 _FROST_DSWIGLU_CACHE = {}
-# OFF by default: the FROST dgrad+dSwiGLU kernel is correct and competitive, but it
-# needs a K-contiguous B, so the natural [H,I] down weight is transposed every
-# backward -- that copy currently outweighs the fused kernel's saving (net loss vs
-# the pointwise path). Opt in once FROST accepts an N-major B (then no copy).
+# OFF by default: the FROST dgrad+dSwiGLU kernel is correct and its fused stage wins
+# ~1.15-2.64x, but the whole backward is GEMM-bound so it lands at ~parity with the
+# pointwise path. The remaining win is to stop recomputing gate/up (save them from the
+# forward), which is a forward-side change; opt in until that lands.
 _FROST_BWD = os.environ.get("CUDNN_GEMM_SWIGLU_FROST_BWD", "0") != "0"
 
 
@@ -227,10 +227,11 @@ def _frost_dswiglu(dout2, Wd, gate, up):
     transpose copy; the downstream ``dg.t()`` wgrad operand is likewise a free strided
     view). The fused stage beats the separate dh GEMM + two pointwise kernels
     (~1.15-2.64x, Qwen3.5-27B, SM100); the full backward is ~parity with a fair torch
-    backward because it is GEMM-bound -- the dWd/dWgu/dx GEMMs dominate and are shared.
-    A full-backward win comes from routing those remaining GEMMs through FROST too
-    (dropping the per-GEMM backend-graph wrapper/dispatch cost), not from any transpose
-    (dense bf16 needs none; the MoE-blog's fused transpose is a quantization concern)."""
+    backward because it is GEMM-bound. The full-backward win comes from NOT recomputing
+    gate/up: this op recomputes them (2 GEMMs, ~25% of the backward) to feed the epilogue,
+    so saving g,u from the forward and reading them here drops those GEMMs. Not from a
+    transpose (dense bf16 needs none; ``dg.t()`` is a free view) and not from all-FROST
+    (host overhead is ~1% of these compute-bound GEMMs, and #612 already cut it)."""
     from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
     from cudnn.gemm.frost.tile_config import CATALOG
 
