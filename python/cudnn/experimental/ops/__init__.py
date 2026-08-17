@@ -14,7 +14,13 @@ _moe_mod = importlib.import_module("cudnn.gemm.ops.moe_grouped_matmul")
 sys.modules[__name__ + ".moe_grouped_matmul"] = _moe_mod
 moe_grouped_matmul = _moe_mod.moe_grouped_matmul
 
+# swiglu_mlp likewise lives in cudnn.gemm.ops; alias it here for discoverability.
+_swiglu_mod = importlib.import_module("cudnn.gemm.ops.swiglu_mlp")
+sys.modules[__name__ + ".swiglu_mlp"] = _swiglu_mod
+swiglu_mlp = _swiglu_mod.swiglu_mlp
+
 __all__ = [
     "scaled_dot_product_attention",
     "moe_grouped_matmul",
+    "swiglu_mlp",
 ]
