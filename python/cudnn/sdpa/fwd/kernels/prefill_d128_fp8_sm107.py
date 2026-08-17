@@ -1866,7 +1866,6 @@ def _correction_warp_group(
                 _SWZ_SHIFT_C = 3 - _O_SWZ_B
                 _SWZ_MASK_C = (1 << _O_SWZ_B) - 1
                 _SUBTILE_BYTES_C = CFG.TILE_M * _SWZ_BYTES_C
-                _FP8_TAG = "e4m3" if cutlass.const_expr(CFG.DTYPE_O == 0) else "e5m2"
 
                 row_base_bytes = tid_in_wg * cutlass.Int32(_SWZ_BYTES_C)
                 row_xor_field = ((tid_in_wg >> cutlass.Int32(_SWZ_SHIFT_C)) & cutlass.Int32(_SWZ_MASK_C)) << cutlass.Int32(4)
@@ -1888,7 +1887,7 @@ def _correction_warp_group(
                     # Plain range (not range_constexpr) — extraction at Python trace time.
                     o_packed_v = fp32_to_fp8_pack(
                         [o_scaled[i] for i in range(16)],
-                        dtype_tag=_FP8_TAG,
+                        dtype=OUT_STORAGE_DTYPE,
                     )
 
                     col_elems = chunk_idx * O_CHUNK

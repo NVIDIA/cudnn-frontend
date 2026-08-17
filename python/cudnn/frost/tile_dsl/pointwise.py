@@ -125,9 +125,14 @@ def fp32_to_fp16(lo, hi, *, dtype=cutlass.Float16):
     )
 
 
-def fp32_to_fp8_pack(values, *, dtype_tag: str):
+def fp32_to_fp8_pack(values, *, dtype: Type[cutlass.Numeric]):
     assert len(values) == 16, f"fp32_to_fp8_pack: expected 16 input values, got {len(values)}"
-    assert dtype_tag in ("e4m3", "e5m2"), f"fp32_to_fp8_pack: dtype_tag must be 'e4m3' or 'e5m2', got {dtype_tag!r}"
+    if dtype == cutlass.Float8E4M3FN:
+        dtype_tag = "e4m3"
+    elif dtype == cutlass.Float8E5M2:
+        dtype_tag = "e5m2"
+    else:
+        raise TypeError(f"fp32_to_fp8_pack: dtype must be Float8E4M3FN or Float8E5M2, got {dtype}")
 
     u0, u1, u2, u3 = inline_ptx(
         "{ .reg .b16 lo, hi;\n"
