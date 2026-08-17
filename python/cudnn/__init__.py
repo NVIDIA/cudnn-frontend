@@ -353,6 +353,8 @@ _LAZY_OPTIONAL_IMPORTS = {
     "grouped_gemm_glu_wrapper_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_glu_wrapper_sm100"),
     "GroupedGemmGluHadamardSm100": (".gemm.cutedsl.grouped", "GroupedGemmGluHadamardSm100"),
     "grouped_gemm_glu_hadamard_wrapper_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_glu_hadamard_wrapper_sm100"),
+    "GroupedGemmGluHadamardQuantSm100": (".gemm.cutedsl.grouped", "GroupedGemmGluHadamardQuantSm100"),
+    "grouped_gemm_glu_hadamard_quant_wrapper_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_glu_hadamard_quant_wrapper_sm100"),
     "GroupedGemmDgluSm100": (".gemm.cutedsl.grouped", "GroupedGemmDgluSm100"),
     "grouped_gemm_dglu_wrapper_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_dglu_wrapper_sm100"),
     "GroupedGemmWgradSm100": (".gemm.cutedsl.grouped", "GroupedGemmWgradSm100"),
