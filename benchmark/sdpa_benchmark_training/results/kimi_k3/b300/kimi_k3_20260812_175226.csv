@@ -1,0 +1,511 @@
+config_name,model_name,backend,data_type,attn_mask,batch_size,q_seqlen,kv_seqlen,num_q_heads,num_kv_heads,head_dim_qk,head_dim_vo,profile_pass,deterministic_bwd,time_ms,tflops,max_diff,num_iterations,sliding_window_size,success,error_message,gpu_name,cudnn_version,cudnn_backend_version
+kimi_k3,kimi_k3,cudnn,bfloat16,top_left,2,32768,32768,96,96,192,128,fwd,False,38.795,1701.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,bfloat16,top_left,2,32768,32768,96,96,192,128,bwd,False,162.976,1052.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,bfloat16,top_left,2,32768,32768,96,96,192,128,bwd,True,157.627,1088.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,bfloat16,no_mask,2,32768,32768,96,96,192,128,fwd,False,80.701,1635.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,bfloat16,no_mask,2,32768,32768,96,96,192,128,bwd,False,325.734,1053.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,bfloat16,no_mask,2,32768,32768,96,96,192,128,bwd,True,314.510,1091.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,fp8,top_left,2,32768,32768,96,96,192,128,fwd,False,23.906,2760.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,fp8,top_left,2,32768,32768,96,96,192,128,bwd,False,83.333,2058.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,fp8,top_left,2,32768,32768,96,96,192,128,bwd,True,83.955,2043.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,fp8,no_mask,2,32768,32768,96,96,192,128,fwd,False,47.477,2779.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,fp8,no_mask,2,32768,32768,96,96,192,128,bwd,False,168.552,2035.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,fp8,no_mask,2,32768,32768,96,96,192,128,bwd,True,168.149,2040.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,mxfp8,top_left,2,32768,32768,96,96,192,128,fwd,False,24.417,2702.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,mxfp8,top_left,2,32768,32768,96,96,192,128,bwd,False,106.552,1610.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,mxfp8,top_left,2,32768,32768,96,96,192,128,bwd,True,107.064,1602.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,mxfp8,no_mask,2,32768,32768,96,96,192,128,fwd,False,51.318,2571.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,mxfp8,no_mask,2,32768,32768,96,96,192,128,bwd,False,206.118,1664.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,mxfp8,no_mask,2,32768,32768,96,96,192,128,bwd,True,207.268,1655.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,flash_attention_4,bfloat16,top_left,2,32768,32768,96,96,192,128,fwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
+stderr: Traceback (most recent call last):
+  File ""/home/vagarwalla/attn_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 1194, in <module>
+    import flash_attn.cute.interface as flash_attn_interface
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/__init__.py"", line 12, in <module>
+    from .interface import (
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/interface.py"", line 45, in <module>
+    from flash_attn.cute import utils
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/utils.py"", line 167, in <module>
+    smem: cute.Tensor, thr_mma: cute.core.ThrMma, swapAB: cutlass.Constexpr[bool] = False
+                                ^^^^^^^^^^^^^^^^
+AttributeError: module 'cutlass.cute.core' has no attribute 'ThrMma'
+
+stdout: ",,,
+kimi_k3,kimi_k3,flash_attention_4,bfloat16,top_left,2,32768,32768,96,96,192,128,bwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
+stderr: Traceback (most recent call last):
+  File ""/home/vagarwalla/attn_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 1194, in <module>
+    import flash_attn.cute.interface as flash_attn_interface
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/__init__.py"", line 12, in <module>
+    from .interface import (
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/interface.py"", line 45, in <module>
+    from flash_attn.cute import utils
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/utils.py"", line 167, in <module>
+    smem: cute.Tensor, thr_mma: cute.core.ThrMma, swapAB: cutlass.Constexpr[bool] = False
+                                ^^^^^^^^^^^^^^^^
+AttributeError: module 'cutlass.cute.core' has no attribute 'ThrMma'
+
+stdout: ",,,
+kimi_k3,kimi_k3,flash_attention_4,bfloat16,top_left,2,32768,32768,96,96,192,128,bwd,True,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
+stderr: Traceback (most recent call last):
+  File ""/home/vagarwalla/attn_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 1194, in <module>
+    import flash_attn.cute.interface as flash_attn_interface
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/__init__.py"", line 12, in <module>
+    from .interface import (
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/interface.py"", line 45, in <module>
+    from flash_attn.cute import utils
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/utils.py"", line 167, in <module>
+    smem: cute.Tensor, thr_mma: cute.core.ThrMma, swapAB: cutlass.Constexpr[bool] = False
+                                ^^^^^^^^^^^^^^^^
+AttributeError: module 'cutlass.cute.core' has no attribute 'ThrMma'
+
+stdout: ",,,
+kimi_k3,kimi_k3,flash_attention_4,bfloat16,no_mask,2,32768,32768,96,96,192,128,fwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
+stderr: Traceback (most recent call last):
+  File ""/home/vagarwalla/attn_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 1194, in <module>
+    import flash_attn.cute.interface as flash_attn_interface
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/__init__.py"", line 12, in <module>
+    from .interface import (
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/interface.py"", line 45, in <module>
+    from flash_attn.cute import utils
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/utils.py"", line 167, in <module>
+    smem: cute.Tensor, thr_mma: cute.core.ThrMma, swapAB: cutlass.Constexpr[bool] = False
+                                ^^^^^^^^^^^^^^^^
+AttributeError: module 'cutlass.cute.core' has no attribute 'ThrMma'
+
+stdout: ",,,
+kimi_k3,kimi_k3,flash_attention_4,bfloat16,no_mask,2,32768,32768,96,96,192,128,bwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
+stderr: Traceback (most recent call last):
+  File ""/home/vagarwalla/attn_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 1194, in <module>
+    import flash_attn.cute.interface as flash_attn_interface
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/__init__.py"", line 12, in <module>
+    from .interface import (
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/interface.py"", line 45, in <module>
+    from flash_attn.cute import utils
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/utils.py"", line 167, in <module>
+    smem: cute.Tensor, thr_mma: cute.core.ThrMma, swapAB: cutlass.Constexpr[bool] = False
+                                ^^^^^^^^^^^^^^^^
+AttributeError: module 'cutlass.cute.core' has no attribute 'ThrMma'
+
+stdout: ",,,
+kimi_k3,kimi_k3,flash_attention_4,bfloat16,no_mask,2,32768,32768,96,96,192,128,bwd,True,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
+stderr: Traceback (most recent call last):
+  File ""/home/vagarwalla/attn_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 1194, in <module>
+    import flash_attn.cute.interface as flash_attn_interface
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/__init__.py"", line 12, in <module>
+    from .interface import (
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/interface.py"", line 45, in <module>
+    from flash_attn.cute import utils
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/utils.py"", line 167, in <module>
+    smem: cute.Tensor, thr_mma: cute.core.ThrMma, swapAB: cutlass.Constexpr[bool] = False
+                                ^^^^^^^^^^^^^^^^
+AttributeError: module 'cutlass.cute.core' has no attribute 'ThrMma'
+
+stdout: ",,,
+kimi_k3,kimi_k3,cudnn,bfloat16,top_left,2,16384,16384,96,96,192,128,fwd,False,8.975,1838.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,bfloat16,top_left,2,16384,16384,96,96,192,128,bwd,False,37.853,1133.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,bfloat16,top_left,2,16384,16384,96,96,192,128,bwd,True,39.098,1097.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,bfloat16,no_mask,2,16384,16384,96,96,192,128,fwd,False,17.097,1929.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,bfloat16,no_mask,2,16384,16384,96,96,192,128,bwd,False,78.072,1099.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,bfloat16,no_mask,2,16384,16384,96,96,192,128,bwd,True,75.159,1141.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,fp8,top_left,2,16384,16384,96,96,192,128,fwd,False,5.395,3057.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,fp8,top_left,2,16384,16384,96,96,192,128,bwd,False,20.704,2071.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,fp8,top_left,2,16384,16384,96,96,192,128,bwd,True,20.321,2110.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,fp8,no_mask,2,16384,16384,96,96,192,128,fwd,False,10.656,3095.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,fp8,no_mask,2,16384,16384,96,96,192,128,bwd,False,41.492,2067.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,fp8,no_mask,2,16384,16384,96,96,192,128,bwd,True,40.905,2097.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,mxfp8,top_left,2,16384,16384,96,96,192,128,fwd,False,5.916,2788.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,mxfp8,top_left,2,16384,16384,96,96,192,128,bwd,False,25.190,1702.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,mxfp8,top_left,2,16384,16384,96,96,192,128,bwd,True,25.313,1694.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,mxfp8,no_mask,2,16384,16384,96,96,192,128,fwd,False,11.246,2933.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,mxfp8,no_mask,2,16384,16384,96,96,192,128,bwd,False,51.280,1672.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,mxfp8,no_mask,2,16384,16384,96,96,192,128,bwd,True,51.675,1660.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,flash_attention_4,bfloat16,top_left,2,16384,16384,96,96,192,128,fwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
+stderr: Traceback (most recent call last):
+  File ""/home/vagarwalla/attn_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 1194, in <module>
+    import flash_attn.cute.interface as flash_attn_interface
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/__init__.py"", line 12, in <module>
+    from .interface import (
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/interface.py"", line 45, in <module>
+    from flash_attn.cute import utils
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/utils.py"", line 167, in <module>
+    smem: cute.Tensor, thr_mma: cute.core.ThrMma, swapAB: cutlass.Constexpr[bool] = False
+                                ^^^^^^^^^^^^^^^^
+AttributeError: module 'cutlass.cute.core' has no attribute 'ThrMma'
+
+stdout: ",,,
+kimi_k3,kimi_k3,flash_attention_4,bfloat16,top_left,2,16384,16384,96,96,192,128,bwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
+stderr: Traceback (most recent call last):
+  File ""/home/vagarwalla/attn_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 1194, in <module>
+    import flash_attn.cute.interface as flash_attn_interface
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/__init__.py"", line 12, in <module>
+    from .interface import (
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/interface.py"", line 45, in <module>
+    from flash_attn.cute import utils
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/utils.py"", line 167, in <module>
+    smem: cute.Tensor, thr_mma: cute.core.ThrMma, swapAB: cutlass.Constexpr[bool] = False
+                                ^^^^^^^^^^^^^^^^
+AttributeError: module 'cutlass.cute.core' has no attribute 'ThrMma'
+
+stdout: ",,,
+kimi_k3,kimi_k3,flash_attention_4,bfloat16,top_left,2,16384,16384,96,96,192,128,bwd,True,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
+stderr: Traceback (most recent call last):
+  File ""/home/vagarwalla/attn_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 1194, in <module>
+    import flash_attn.cute.interface as flash_attn_interface
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/__init__.py"", line 12, in <module>
+    from .interface import (
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/interface.py"", line 45, in <module>
+    from flash_attn.cute import utils
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/utils.py"", line 167, in <module>
+    smem: cute.Tensor, thr_mma: cute.core.ThrMma, swapAB: cutlass.Constexpr[bool] = False
+                                ^^^^^^^^^^^^^^^^
+AttributeError: module 'cutlass.cute.core' has no attribute 'ThrMma'
+
+stdout: ",,,
+kimi_k3,kimi_k3,flash_attention_4,bfloat16,no_mask,2,16384,16384,96,96,192,128,fwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
+stderr: Traceback (most recent call last):
+  File ""/home/vagarwalla/attn_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 1194, in <module>
+    import flash_attn.cute.interface as flash_attn_interface
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/__init__.py"", line 12, in <module>
+    from .interface import (
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/interface.py"", line 45, in <module>
+    from flash_attn.cute import utils
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/utils.py"", line 167, in <module>
+    smem: cute.Tensor, thr_mma: cute.core.ThrMma, swapAB: cutlass.Constexpr[bool] = False
+                                ^^^^^^^^^^^^^^^^
+AttributeError: module 'cutlass.cute.core' has no attribute 'ThrMma'
+
+stdout: ",,,
+kimi_k3,kimi_k3,flash_attention_4,bfloat16,no_mask,2,16384,16384,96,96,192,128,bwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
+stderr: Traceback (most recent call last):
+  File ""/home/vagarwalla/attn_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 1194, in <module>
+    import flash_attn.cute.interface as flash_attn_interface
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/__init__.py"", line 12, in <module>
+    from .interface import (
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/interface.py"", line 45, in <module>
+    from flash_attn.cute import utils
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/utils.py"", line 167, in <module>
+    smem: cute.Tensor, thr_mma: cute.core.ThrMma, swapAB: cutlass.Constexpr[bool] = False
+                                ^^^^^^^^^^^^^^^^
+AttributeError: module 'cutlass.cute.core' has no attribute 'ThrMma'
+
+stdout: ",,,
+kimi_k3,kimi_k3,flash_attention_4,bfloat16,no_mask,2,16384,16384,96,96,192,128,bwd,True,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
+stderr: Traceback (most recent call last):
+  File ""/home/vagarwalla/attn_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 1194, in <module>
+    import flash_attn.cute.interface as flash_attn_interface
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/__init__.py"", line 12, in <module>
+    from .interface import (
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/interface.py"", line 45, in <module>
+    from flash_attn.cute import utils
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/utils.py"", line 167, in <module>
+    smem: cute.Tensor, thr_mma: cute.core.ThrMma, swapAB: cutlass.Constexpr[bool] = False
+                                ^^^^^^^^^^^^^^^^
+AttributeError: module 'cutlass.cute.core' has no attribute 'ThrMma'
+
+stdout: ",,,
+kimi_k3,kimi_k3,cudnn,bfloat16,top_left,2,8192,8192,96,96,192,128,fwd,False,2.379,1734.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,bfloat16,top_left,2,8192,8192,96,96,192,128,bwd,False,8.949,1198.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,bfloat16,top_left,2,8192,8192,96,96,192,128,bwd,True,8.862,1210.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,bfloat16,no_mask,2,8192,8192,96,96,192,128,fwd,False,4.307,1914.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,bfloat16,no_mask,2,8192,8192,96,96,192,128,bwd,False,18.493,1159.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,bfloat16,no_mask,2,8192,8192,96,96,192,128,bwd,True,18.011,1190.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,fp8,top_left,2,8192,8192,96,96,192,128,fwd,False,1.411,2922.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,fp8,top_left,2,8192,8192,96,96,192,128,bwd,False,4.981,2152.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,fp8,top_left,2,8192,8192,96,96,192,128,bwd,True,4.979,2154.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,fp8,no_mask,2,8192,8192,96,96,192,128,fwd,False,2.623,3143.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,fp8,no_mask,2,8192,8192,96,96,192,128,bwd,False,9.217,2326.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,fp8,no_mask,2,8192,8192,96,96,192,128,bwd,True,9.100,2356.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,mxfp8,top_left,2,8192,8192,96,96,192,128,fwd,False,1.556,2651.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,mxfp8,top_left,2,8192,8192,96,96,192,128,bwd,False,6.342,1691.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,mxfp8,top_left,2,8192,8192,96,96,192,128,bwd,True,6.341,1691.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,mxfp8,no_mask,2,8192,8192,96,96,192,128,fwd,False,2.822,2922.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,mxfp8,no_mask,2,8192,8192,96,96,192,128,bwd,False,11.314,1895.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,mxfp8,no_mask,2,8192,8192,96,96,192,128,bwd,True,11.311,1895.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,flash_attention_4,bfloat16,top_left,2,8192,8192,96,96,192,128,fwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
+stderr: Traceback (most recent call last):
+  File ""/home/vagarwalla/attn_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 1194, in <module>
+    import flash_attn.cute.interface as flash_attn_interface
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/__init__.py"", line 12, in <module>
+    from .interface import (
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/interface.py"", line 45, in <module>
+    from flash_attn.cute import utils
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/utils.py"", line 167, in <module>
+    smem: cute.Tensor, thr_mma: cute.core.ThrMma, swapAB: cutlass.Constexpr[bool] = False
+                                ^^^^^^^^^^^^^^^^
+AttributeError: module 'cutlass.cute.core' has no attribute 'ThrMma'
+
+stdout: ",,,
+kimi_k3,kimi_k3,flash_attention_4,bfloat16,top_left,2,8192,8192,96,96,192,128,bwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
+stderr: Traceback (most recent call last):
+  File ""/home/vagarwalla/attn_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 1194, in <module>
+    import flash_attn.cute.interface as flash_attn_interface
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/__init__.py"", line 12, in <module>
+    from .interface import (
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/interface.py"", line 45, in <module>
+    from flash_attn.cute import utils
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/utils.py"", line 167, in <module>
+    smem: cute.Tensor, thr_mma: cute.core.ThrMma, swapAB: cutlass.Constexpr[bool] = False
+                                ^^^^^^^^^^^^^^^^
+AttributeError: module 'cutlass.cute.core' has no attribute 'ThrMma'
+
+stdout: ",,,
+kimi_k3,kimi_k3,flash_attention_4,bfloat16,top_left,2,8192,8192,96,96,192,128,bwd,True,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
+stderr: Traceback (most recent call last):
+  File ""/home/vagarwalla/attn_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 1194, in <module>
+    import flash_attn.cute.interface as flash_attn_interface
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/__init__.py"", line 12, in <module>
+    from .interface import (
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/interface.py"", line 45, in <module>
+    from flash_attn.cute import utils
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/utils.py"", line 167, in <module>
+    smem: cute.Tensor, thr_mma: cute.core.ThrMma, swapAB: cutlass.Constexpr[bool] = False
+                                ^^^^^^^^^^^^^^^^
+AttributeError: module 'cutlass.cute.core' has no attribute 'ThrMma'
+
+stdout: ",,,
+kimi_k3,kimi_k3,flash_attention_4,bfloat16,no_mask,2,8192,8192,96,96,192,128,fwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
+stderr: Traceback (most recent call last):
+  File ""/home/vagarwalla/attn_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 1194, in <module>
+    import flash_attn.cute.interface as flash_attn_interface
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/__init__.py"", line 12, in <module>
+    from .interface import (
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/interface.py"", line 45, in <module>
+    from flash_attn.cute import utils
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/utils.py"", line 167, in <module>
+    smem: cute.Tensor, thr_mma: cute.core.ThrMma, swapAB: cutlass.Constexpr[bool] = False
+                                ^^^^^^^^^^^^^^^^
+AttributeError: module 'cutlass.cute.core' has no attribute 'ThrMma'
+
+stdout: ",,,
+kimi_k3,kimi_k3,flash_attention_4,bfloat16,no_mask,2,8192,8192,96,96,192,128,bwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
+stderr: Traceback (most recent call last):
+  File ""/home/vagarwalla/attn_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 1194, in <module>
+    import flash_attn.cute.interface as flash_attn_interface
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/__init__.py"", line 12, in <module>
+    from .interface import (
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/interface.py"", line 45, in <module>
+    from flash_attn.cute import utils
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/utils.py"", line 167, in <module>
+    smem: cute.Tensor, thr_mma: cute.core.ThrMma, swapAB: cutlass.Constexpr[bool] = False
+                                ^^^^^^^^^^^^^^^^
+AttributeError: module 'cutlass.cute.core' has no attribute 'ThrMma'
+
+stdout: ",,,
+kimi_k3,kimi_k3,flash_attention_4,bfloat16,no_mask,2,8192,8192,96,96,192,128,bwd,True,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
+stderr: Traceback (most recent call last):
+  File ""/home/vagarwalla/attn_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 1194, in <module>
+    import flash_attn.cute.interface as flash_attn_interface
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/__init__.py"", line 12, in <module>
+    from .interface import (
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/interface.py"", line 45, in <module>
+    from flash_attn.cute import utils
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/utils.py"", line 167, in <module>
+    smem: cute.Tensor, thr_mma: cute.core.ThrMma, swapAB: cutlass.Constexpr[bool] = False
+                                ^^^^^^^^^^^^^^^^
+AttributeError: module 'cutlass.cute.core' has no attribute 'ThrMma'
+
+stdout: ",,,
+kimi_k3,kimi_k3,cudnn,bfloat16,top_left,2,4096,4096,96,96,192,128,fwd,False,0.654,1576.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,bfloat16,top_left,2,4096,4096,96,96,192,128,bwd,False,2.505,1070.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,bfloat16,top_left,2,4096,4096,96,96,192,128,bwd,True,2.411,1112.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,bfloat16,no_mask,2,4096,4096,96,96,192,128,fwd,False,1.099,1876.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,bfloat16,no_mask,2,4096,4096,96,96,192,128,bwd,False,4.486,1195.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,bfloat16,no_mask,2,4096,4096,96,96,192,128,bwd,True,4.406,1217.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,fp8,top_left,2,4096,4096,96,96,192,128,fwd,False,0.389,2653.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,fp8,top_left,2,4096,4096,96,96,192,128,bwd,False,1.447,1853.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,fp8,top_left,2,4096,4096,96,96,192,128,bwd,True,1.447,1852.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,fp8,no_mask,2,4096,4096,96,96,192,128,fwd,False,0.649,3177.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,fp8,no_mask,2,4096,4096,96,96,192,128,bwd,False,2.404,2230.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,fp8,no_mask,2,4096,4096,96,96,192,128,bwd,True,2.402,2231.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,mxfp8,top_left,2,4096,4096,96,96,192,128,fwd,False,0.433,2381.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,mxfp8,top_left,2,4096,4096,96,96,192,128,bwd,False,1.877,1428.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,mxfp8,top_left,2,4096,4096,96,96,192,128,bwd,True,1.877,1428.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,mxfp8,no_mask,2,4096,4096,96,96,192,128,fwd,False,0.709,2909.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,mxfp8,no_mask,2,4096,4096,96,96,192,128,bwd,False,2.973,1803.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,mxfp8,no_mask,2,4096,4096,96,96,192,128,bwd,True,2.972,1804.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,flash_attention_4,bfloat16,top_left,2,4096,4096,96,96,192,128,fwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
+stderr: Traceback (most recent call last):
+  File ""/home/vagarwalla/attn_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 1194, in <module>
+    import flash_attn.cute.interface as flash_attn_interface
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/__init__.py"", line 12, in <module>
+    from .interface import (
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/interface.py"", line 45, in <module>
+    from flash_attn.cute import utils
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/utils.py"", line 167, in <module>
+    smem: cute.Tensor, thr_mma: cute.core.ThrMma, swapAB: cutlass.Constexpr[bool] = False
+                                ^^^^^^^^^^^^^^^^
+AttributeError: module 'cutlass.cute.core' has no attribute 'ThrMma'
+
+stdout: ",,,
+kimi_k3,kimi_k3,flash_attention_4,bfloat16,top_left,2,4096,4096,96,96,192,128,bwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
+stderr: Traceback (most recent call last):
+  File ""/home/vagarwalla/attn_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 1194, in <module>
+    import flash_attn.cute.interface as flash_attn_interface
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/__init__.py"", line 12, in <module>
+    from .interface import (
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/interface.py"", line 45, in <module>
+    from flash_attn.cute import utils
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/utils.py"", line 167, in <module>
+    smem: cute.Tensor, thr_mma: cute.core.ThrMma, swapAB: cutlass.Constexpr[bool] = False
+                                ^^^^^^^^^^^^^^^^
+AttributeError: module 'cutlass.cute.core' has no attribute 'ThrMma'
+
+stdout: ",,,
+kimi_k3,kimi_k3,flash_attention_4,bfloat16,top_left,2,4096,4096,96,96,192,128,bwd,True,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
+stderr: Traceback (most recent call last):
+  File ""/home/vagarwalla/attn_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 1194, in <module>
+    import flash_attn.cute.interface as flash_attn_interface
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/__init__.py"", line 12, in <module>
+    from .interface import (
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/interface.py"", line 45, in <module>
+    from flash_attn.cute import utils
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/utils.py"", line 167, in <module>
+    smem: cute.Tensor, thr_mma: cute.core.ThrMma, swapAB: cutlass.Constexpr[bool] = False
+                                ^^^^^^^^^^^^^^^^
+AttributeError: module 'cutlass.cute.core' has no attribute 'ThrMma'
+
+stdout: ",,,
+kimi_k3,kimi_k3,flash_attention_4,bfloat16,no_mask,2,4096,4096,96,96,192,128,fwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
+stderr: Traceback (most recent call last):
+  File ""/home/vagarwalla/attn_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 1194, in <module>
+    import flash_attn.cute.interface as flash_attn_interface
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/__init__.py"", line 12, in <module>
+    from .interface import (
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/interface.py"", line 45, in <module>
+    from flash_attn.cute import utils
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/utils.py"", line 167, in <module>
+    smem: cute.Tensor, thr_mma: cute.core.ThrMma, swapAB: cutlass.Constexpr[bool] = False
+                                ^^^^^^^^^^^^^^^^
+AttributeError: module 'cutlass.cute.core' has no attribute 'ThrMma'
+
+stdout: ",,,
+kimi_k3,kimi_k3,flash_attention_4,bfloat16,no_mask,2,4096,4096,96,96,192,128,bwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
+stderr: Traceback (most recent call last):
+  File ""/home/vagarwalla/attn_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 1194, in <module>
+    import flash_attn.cute.interface as flash_attn_interface
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/__init__.py"", line 12, in <module>
+    from .interface import (
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/interface.py"", line 45, in <module>
+    from flash_attn.cute import utils
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/utils.py"", line 167, in <module>
+    smem: cute.Tensor, thr_mma: cute.core.ThrMma, swapAB: cutlass.Constexpr[bool] = False
+                                ^^^^^^^^^^^^^^^^
+AttributeError: module 'cutlass.cute.core' has no attribute 'ThrMma'
+
+stdout: ",,,
+kimi_k3,kimi_k3,flash_attention_4,bfloat16,no_mask,2,4096,4096,96,96,192,128,bwd,True,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
+stderr: Traceback (most recent call last):
+  File ""/home/vagarwalla/attn_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 1194, in <module>
+    import flash_attn.cute.interface as flash_attn_interface
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/__init__.py"", line 12, in <module>
+    from .interface import (
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/interface.py"", line 45, in <module>
+    from flash_attn.cute import utils
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/utils.py"", line 167, in <module>
+    smem: cute.Tensor, thr_mma: cute.core.ThrMma, swapAB: cutlass.Constexpr[bool] = False
+                                ^^^^^^^^^^^^^^^^
+AttributeError: module 'cutlass.cute.core' has no attribute 'ThrMma'
+
+stdout: ",,,
+kimi_k3,kimi_k3,cudnn,bfloat16,top_left,2,2048,2048,96,96,192,128,fwd,False,0.207,1246.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,bfloat16,top_left,2,2048,2048,96,96,192,128,bwd,False,0.770,870.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,bfloat16,top_left,2,2048,2048,96,96,192,128,bwd,True,0.738,908.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,bfloat16,no_mask,2,2048,2048,96,96,192,128,fwd,False,0.297,1738.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,bfloat16,no_mask,2,2048,2048,96,96,192,128,bwd,False,1.254,1068.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,bfloat16,no_mask,2,2048,2048,96,96,192,128,bwd,True,1.203,1113.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,fp8,top_left,2,2048,2048,96,96,192,128,fwd,False,0.123,2104.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,fp8,top_left,2,2048,2048,96,96,192,128,bwd,False,0.475,1411.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,fp8,top_left,2,2048,2048,96,96,192,128,bwd,True,0.475,1411.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,fp8,no_mask,2,2048,2048,96,96,192,128,fwd,False,0.179,2872.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,fp8,no_mask,2,2048,2048,96,96,192,128,bwd,False,0.682,1965.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,fp8,no_mask,2,2048,2048,96,96,192,128,bwd,True,0.682,1965.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,mxfp8,top_left,2,2048,2048,96,96,192,128,fwd,False,0.137,1885.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,mxfp8,top_left,2,2048,2048,96,96,192,128,bwd,False,0.631,1063.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,mxfp8,top_left,2,2048,2048,96,96,192,128,bwd,True,0.630,1065.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,mxfp8,no_mask,2,2048,2048,96,96,192,128,fwd,False,0.198,2598.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,mxfp8,no_mask,2,2048,2048,96,96,192,128,bwd,False,0.855,1568.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,cudnn,mxfp8,no_mask,2,2048,2048,96,96,192,128,bwd,True,0.854,1569.000,0.000,10,,True,,NVIDIA B300 SXM6 AC,1.27.0,92400.000
+kimi_k3,kimi_k3,flash_attention_4,bfloat16,top_left,2,2048,2048,96,96,192,128,fwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
+stderr: Traceback (most recent call last):
+  File ""/home/vagarwalla/attn_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 1194, in <module>
+    import flash_attn.cute.interface as flash_attn_interface
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/__init__.py"", line 12, in <module>
+    from .interface import (
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/interface.py"", line 45, in <module>
+    from flash_attn.cute import utils
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/utils.py"", line 167, in <module>
+    smem: cute.Tensor, thr_mma: cute.core.ThrMma, swapAB: cutlass.Constexpr[bool] = False
+                                ^^^^^^^^^^^^^^^^
+AttributeError: module 'cutlass.cute.core' has no attribute 'ThrMma'
+
+stdout: ",,,
+kimi_k3,kimi_k3,flash_attention_4,bfloat16,top_left,2,2048,2048,96,96,192,128,bwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
+stderr: Traceback (most recent call last):
+  File ""/home/vagarwalla/attn_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 1194, in <module>
+    import flash_attn.cute.interface as flash_attn_interface
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/__init__.py"", line 12, in <module>
+    from .interface import (
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/interface.py"", line 45, in <module>
+    from flash_attn.cute import utils
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/utils.py"", line 167, in <module>
+    smem: cute.Tensor, thr_mma: cute.core.ThrMma, swapAB: cutlass.Constexpr[bool] = False
+                                ^^^^^^^^^^^^^^^^
+AttributeError: module 'cutlass.cute.core' has no attribute 'ThrMma'
+
+stdout: ",,,
+kimi_k3,kimi_k3,flash_attention_4,bfloat16,top_left,2,2048,2048,96,96,192,128,bwd,True,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
+stderr: Traceback (most recent call last):
+  File ""/home/vagarwalla/attn_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 1194, in <module>
+    import flash_attn.cute.interface as flash_attn_interface
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/__init__.py"", line 12, in <module>
+    from .interface import (
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/interface.py"", line 45, in <module>
+    from flash_attn.cute import utils
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/utils.py"", line 167, in <module>
+    smem: cute.Tensor, thr_mma: cute.core.ThrMma, swapAB: cutlass.Constexpr[bool] = False
+                                ^^^^^^^^^^^^^^^^
+AttributeError: module 'cutlass.cute.core' has no attribute 'ThrMma'
+
+stdout: ",,,
+kimi_k3,kimi_k3,flash_attention_4,bfloat16,no_mask,2,2048,2048,96,96,192,128,fwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
+stderr: Traceback (most recent call last):
+  File ""/home/vagarwalla/attn_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 1194, in <module>
+    import flash_attn.cute.interface as flash_attn_interface
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/__init__.py"", line 12, in <module>
+    from .interface import (
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/interface.py"", line 45, in <module>
+    from flash_attn.cute import utils
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/utils.py"", line 167, in <module>
+    smem: cute.Tensor, thr_mma: cute.core.ThrMma, swapAB: cutlass.Constexpr[bool] = False
+                                ^^^^^^^^^^^^^^^^
+AttributeError: module 'cutlass.cute.core' has no attribute 'ThrMma'
+
+stdout: ",,,
+kimi_k3,kimi_k3,flash_attention_4,bfloat16,no_mask,2,2048,2048,96,96,192,128,bwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
+stderr: Traceback (most recent call last):
+  File ""/home/vagarwalla/attn_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 1194, in <module>
+    import flash_attn.cute.interface as flash_attn_interface
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/__init__.py"", line 12, in <module>
+    from .interface import (
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/interface.py"", line 45, in <module>
+    from flash_attn.cute import utils
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/utils.py"", line 167, in <module>
+    smem: cute.Tensor, thr_mma: cute.core.ThrMma, swapAB: cutlass.Constexpr[bool] = False
+                                ^^^^^^^^^^^^^^^^
+AttributeError: module 'cutlass.cute.core' has no attribute 'ThrMma'
+
+stdout: ",,,
+kimi_k3,kimi_k3,flash_attention_4,bfloat16,no_mask,2,2048,2048,96,96,192,128,bwd,True,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
+stderr: Traceback (most recent call last):
+  File ""/home/vagarwalla/attn_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 1194, in <module>
+    import flash_attn.cute.interface as flash_attn_interface
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/__init__.py"", line 12, in <module>
+    from .interface import (
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/interface.py"", line 45, in <module>
+    from flash_attn.cute import utils
+  File ""/usr/local/lib/python3.12/dist-packages/flash_attn/cute/utils.py"", line 167, in <module>
+    smem: cute.Tensor, thr_mma: cute.core.ThrMma, swapAB: cutlass.Constexpr[bool] = False
+                                ^^^^^^^^^^^^^^^^
+AttributeError: module 'cutlass.cute.core' has no attribute 'ThrMma'
+
+stdout: ",,,

@@ -1,0 +1,473 @@
+config_name,model_name,phase,backend,data_type,kv_cache_dtype,batch_size,q_tokens,kv_len,num_q_heads,num_kv_heads,head_dim_qk,head_dim_vo,kind,sliding_window_size,page_size,time_ms,tflops,gbps,sol_pct,num_iterations,success,error_message,gpu_name,backend_detail,cudnn_backend_version
+kimi_k3,kimi_k3,context,cudnn,bfloat16,bfloat16,1,2048,2048,96,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,SKIPPED: context phase for latent-absorbed MLA runs unabsorbed (see training suite prefill),,,
+kimi_k3,kimi_k3,context,cudnn,bfloat16,bfloat16,1,8192,8192,96,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,SKIPPED: context phase for latent-absorbed MLA runs unabsorbed (see training suite prefill),,,
+kimi_k3,kimi_k3,context,cudnn,bfloat16,bfloat16,1,32768,32768,96,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,SKIPPED: context phase for latent-absorbed MLA runs unabsorbed (see training suite prefill),,,
+kimi_k3,kimi_k3,context,cudnn,bfloat16,bfloat16,1,512,65536,96,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,SKIPPED: context phase for latent-absorbed MLA runs unabsorbed (see training suite prefill),,,
+kimi_k3,kimi_k3,context,cudnn,bfloat16,bfloat16,1,512,131072,96,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,SKIPPED: context phase for latent-absorbed MLA runs unabsorbed (see training suite prefill),,,
+kimi_k3,kimi_k3,context,cudnn,bfloat16,bfloat16,1,1024,65536,96,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,SKIPPED: context phase for latent-absorbed MLA runs unabsorbed (see training suite prefill),,,
+kimi_k3,kimi_k3,context,cudnn,bfloat16,bfloat16,1,1024,131072,96,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,SKIPPED: context phase for latent-absorbed MLA runs unabsorbed (see training suite prefill),,,
+kimi_k3,kimi_k3,generation,cudnn,bfloat16,bfloat16,1,1,131072,96,1,576,512,mla_absorbed,,32,0.648128,42.245,233.293,2.9162,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+kimi_k3,kimi_k3,generation,cudnn,bfloat16,bfloat16,128,1,131072,96,1,576,512,mla_absorbed,,32,68.145439,51.43,284.012,3.5501,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+kimi_k3,kimi_k3,generation,cudnn,bfloat16,bfloat16,1,2,131072,96,1,576,512,mla_absorbed,,32,28.62064,1.913,5.29,0.0661,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+kimi_k3,kimi_k3,generation,cudnn,bfloat16,bfloat16,128,2,131072,96,1,576,512,mla_absorbed,,32,2475.784424,2.831,7.828,0.0979,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+kimi_k3,kimi_k3,generation,cudnn,bfloat16,bfloat16,1,3,131072,96,1,576,512,mla_absorbed,,32,28.606976,2.871,5.3,0.0663,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+kimi_k3,kimi_k3,generation,cudnn,bfloat16,bfloat16,128,3,131072,96,1,576,512,mla_absorbed,,32,2473.067139,4.251,7.848,0.0981,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+kimi_k3,kimi_k3,generation,cudnn,bfloat16,bfloat16,1,4,131072,96,1,576,512,mla_absorbed,,32,28.599936,3.829,5.309,0.0664,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+kimi_k3,kimi_k3,generation,cudnn,bfloat16,bfloat16,128,4,131072,96,1,576,512,mla_absorbed,,32,2473.15918,5.668,7.858,0.0982,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+kimi_k3,kimi_k3,context,cudnn_oss,bfloat16,bfloat16,1,2048,2048,96,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,SKIPPED: context phase for latent-absorbed MLA runs unabsorbed (see training suite prefill),,,
+kimi_k3,kimi_k3,context,cudnn_oss,bfloat16,bfloat16,1,8192,8192,96,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,SKIPPED: context phase for latent-absorbed MLA runs unabsorbed (see training suite prefill),,,
+kimi_k3,kimi_k3,context,cudnn_oss,bfloat16,bfloat16,1,32768,32768,96,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,SKIPPED: context phase for latent-absorbed MLA runs unabsorbed (see training suite prefill),,,
+kimi_k3,kimi_k3,context,cudnn_oss,bfloat16,bfloat16,1,512,65536,96,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,SKIPPED: context phase for latent-absorbed MLA runs unabsorbed (see training suite prefill),,,
+kimi_k3,kimi_k3,context,cudnn_oss,bfloat16,bfloat16,1,512,131072,96,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,SKIPPED: context phase for latent-absorbed MLA runs unabsorbed (see training suite prefill),,,
+kimi_k3,kimi_k3,context,cudnn_oss,bfloat16,bfloat16,1,1024,65536,96,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,SKIPPED: context phase for latent-absorbed MLA runs unabsorbed (see training suite prefill),,,
+kimi_k3,kimi_k3,context,cudnn_oss,bfloat16,bfloat16,1,1024,131072,96,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,SKIPPED: context phase for latent-absorbed MLA runs unabsorbed (see training suite prefill),,,
+kimi_k3,kimi_k3,generation,cudnn_oss,bfloat16,bfloat16,1,1,131072,96,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+kimi_k3,kimi_k3,generation,cudnn_oss,bfloat16,bfloat16,128,1,131072,96,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+kimi_k3,kimi_k3,generation,cudnn_oss,bfloat16,bfloat16,1,2,131072,96,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+kimi_k3,kimi_k3,generation,cudnn_oss,bfloat16,bfloat16,128,2,131072,96,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+kimi_k3,kimi_k3,generation,cudnn_oss,bfloat16,bfloat16,1,3,131072,96,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+kimi_k3,kimi_k3,generation,cudnn_oss,bfloat16,bfloat16,128,3,131072,96,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+kimi_k3,kimi_k3,generation,cudnn_oss,bfloat16,bfloat16,1,4,131072,96,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+kimi_k3,kimi_k3,generation,cudnn_oss,bfloat16,bfloat16,128,4,131072,96,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+kimi_k3,kimi_k3-tp2,context,cudnn,bfloat16,bfloat16,1,2048,2048,48,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,SKIPPED: context phase for latent-absorbed MLA runs unabsorbed (see training suite prefill),,,
+kimi_k3,kimi_k3-tp2,context,cudnn,bfloat16,bfloat16,1,8192,8192,48,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,SKIPPED: context phase for latent-absorbed MLA runs unabsorbed (see training suite prefill),,,
+kimi_k3,kimi_k3-tp2,context,cudnn,bfloat16,bfloat16,1,32768,32768,48,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,SKIPPED: context phase for latent-absorbed MLA runs unabsorbed (see training suite prefill),,,
+kimi_k3,kimi_k3-tp2,context,cudnn,bfloat16,bfloat16,1,512,65536,48,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,SKIPPED: context phase for latent-absorbed MLA runs unabsorbed (see training suite prefill),,,
+kimi_k3,kimi_k3-tp2,context,cudnn,bfloat16,bfloat16,1,512,131072,48,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,SKIPPED: context phase for latent-absorbed MLA runs unabsorbed (see training suite prefill),,,
+kimi_k3,kimi_k3-tp2,context,cudnn,bfloat16,bfloat16,1,1024,65536,48,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,SKIPPED: context phase for latent-absorbed MLA runs unabsorbed (see training suite prefill),,,
+kimi_k3,kimi_k3-tp2,context,cudnn,bfloat16,bfloat16,1,1024,131072,48,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,SKIPPED: context phase for latent-absorbed MLA runs unabsorbed (see training suite prefill),,,
+kimi_k3,kimi_k3-tp2,generation,cudnn,bfloat16,bfloat16,1,1,131072,48,1,576,512,mla_absorbed,,32,0.361248,37.897,418.271,5.2284,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+kimi_k3,kimi_k3-tp2,generation,cudnn,bfloat16,bfloat16,128,1,131072,48,1,576,512,mla_absorbed,,32,37.721249,46.455,512.728,6.4091,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+kimi_k3,kimi_k3-tp2,generation,cudnn,bfloat16,bfloat16,1,2,131072,48,1,576,512,mla_absorbed,,32,12.899424,2.123,11.722,0.1465,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+kimi_k3,kimi_k3-tp2,generation,cudnn,bfloat16,bfloat16,128,2,131072,48,1,576,512,mla_absorbed,,32,1188.61853,2.949,16.283,0.2035,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+kimi_k3,kimi_k3-tp2,generation,cudnn,bfloat16,bfloat16,1,3,131072,48,1,576,512,mla_absorbed,,32,12.894688,3.185,11.734,0.1467,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+kimi_k3,kimi_k3-tp2,generation,cudnn,bfloat16,bfloat16,128,3,131072,48,1,576,512,mla_absorbed,,32,1185.102295,4.436,16.342,0.2043,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+kimi_k3,kimi_k3-tp2,generation,cudnn,bfloat16,bfloat16,1,4,131072,48,1,576,512,mla_absorbed,,32,12.884736,4.25,11.751,0.1469,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+kimi_k3,kimi_k3-tp2,generation,cudnn,bfloat16,bfloat16,128,4,131072,48,1,576,512,mla_absorbed,,32,1186.050903,5.91,16.341,0.2043,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+kimi_k3,kimi_k3-tp2,context,cudnn_oss,bfloat16,bfloat16,1,2048,2048,48,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,SKIPPED: context phase for latent-absorbed MLA runs unabsorbed (see training suite prefill),,,
+kimi_k3,kimi_k3-tp2,context,cudnn_oss,bfloat16,bfloat16,1,8192,8192,48,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,SKIPPED: context phase for latent-absorbed MLA runs unabsorbed (see training suite prefill),,,
+kimi_k3,kimi_k3-tp2,context,cudnn_oss,bfloat16,bfloat16,1,32768,32768,48,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,SKIPPED: context phase for latent-absorbed MLA runs unabsorbed (see training suite prefill),,,
+kimi_k3,kimi_k3-tp2,context,cudnn_oss,bfloat16,bfloat16,1,512,65536,48,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,SKIPPED: context phase for latent-absorbed MLA runs unabsorbed (see training suite prefill),,,
+kimi_k3,kimi_k3-tp2,context,cudnn_oss,bfloat16,bfloat16,1,512,131072,48,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,SKIPPED: context phase for latent-absorbed MLA runs unabsorbed (see training suite prefill),,,
+kimi_k3,kimi_k3-tp2,context,cudnn_oss,bfloat16,bfloat16,1,1024,65536,48,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,SKIPPED: context phase for latent-absorbed MLA runs unabsorbed (see training suite prefill),,,
+kimi_k3,kimi_k3-tp2,context,cudnn_oss,bfloat16,bfloat16,1,1024,131072,48,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,SKIPPED: context phase for latent-absorbed MLA runs unabsorbed (see training suite prefill),,,
+kimi_k3,kimi_k3-tp2,generation,cudnn_oss,bfloat16,bfloat16,1,1,131072,48,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+kimi_k3,kimi_k3-tp2,generation,cudnn_oss,bfloat16,bfloat16,128,1,131072,48,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+kimi_k3,kimi_k3-tp2,generation,cudnn_oss,bfloat16,bfloat16,1,2,131072,48,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+kimi_k3,kimi_k3-tp2,generation,cudnn_oss,bfloat16,bfloat16,128,2,131072,48,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+kimi_k3,kimi_k3-tp2,generation,cudnn_oss,bfloat16,bfloat16,1,3,131072,48,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+kimi_k3,kimi_k3-tp2,generation,cudnn_oss,bfloat16,bfloat16,128,3,131072,48,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+kimi_k3,kimi_k3-tp2,generation,cudnn_oss,bfloat16,bfloat16,1,4,131072,48,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+kimi_k3,kimi_k3-tp2,generation,cudnn_oss,bfloat16,bfloat16,128,4,131072,48,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+kimi_k3,kimi_k3-tp4,context,cudnn,bfloat16,bfloat16,1,2048,2048,24,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,SKIPPED: context phase for latent-absorbed MLA runs unabsorbed (see training suite prefill),,,
+kimi_k3,kimi_k3-tp4,context,cudnn,bfloat16,bfloat16,1,8192,8192,24,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,SKIPPED: context phase for latent-absorbed MLA runs unabsorbed (see training suite prefill),,,
+kimi_k3,kimi_k3-tp4,context,cudnn,bfloat16,bfloat16,1,32768,32768,24,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,SKIPPED: context phase for latent-absorbed MLA runs unabsorbed (see training suite prefill),,,
+kimi_k3,kimi_k3-tp4,context,cudnn,bfloat16,bfloat16,1,512,65536,24,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,SKIPPED: context phase for latent-absorbed MLA runs unabsorbed (see training suite prefill),,,
+kimi_k3,kimi_k3-tp4,context,cudnn,bfloat16,bfloat16,1,512,131072,24,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,SKIPPED: context phase for latent-absorbed MLA runs unabsorbed (see training suite prefill),,,
+kimi_k3,kimi_k3-tp4,context,cudnn,bfloat16,bfloat16,1,1024,65536,24,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,SKIPPED: context phase for latent-absorbed MLA runs unabsorbed (see training suite prefill),,,
+kimi_k3,kimi_k3-tp4,context,cudnn,bfloat16,bfloat16,1,1024,131072,24,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,SKIPPED: context phase for latent-absorbed MLA runs unabsorbed (see training suite prefill),,,
+kimi_k3,kimi_k3-tp4,generation,cudnn,bfloat16,bfloat16,1,1,131072,24,1,576,512,mla_absorbed,,32,0.258336,26.497,584.693,7.3087,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+kimi_k3,kimi_k3-tp4,generation,cudnn,bfloat16,bfloat16,128,1,131072,24,1,576,512,mla_absorbed,,32,26.152897,33.502,739.269,9.2409,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+kimi_k3,kimi_k3-tp4,generation,cudnn,bfloat16,bfloat16,1,2,131072,24,1,576,512,mla_absorbed,,32,12.821792,1.068,11.785,0.1473,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+kimi_k3,kimi_k3-tp4,generation,cudnn,bfloat16,bfloat16,128,2,131072,24,1,576,512,mla_absorbed,,32,580.829529,3.017,33.298,0.4162,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+kimi_k3,kimi_k3-tp4,generation,cudnn,bfloat16,bfloat16,1,3,131072,24,1,576,512,mla_absorbed,,32,12.814176,1.603,11.796,0.1474,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+kimi_k3,kimi_k3-tp4,generation,cudnn,bfloat16,bfloat16,128,3,131072,24,1,576,512,mla_absorbed,,32,579.37915,4.537,33.393,0.4174,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+kimi_k3,kimi_k3-tp4,generation,cudnn,bfloat16,bfloat16,1,4,131072,24,1,576,512,mla_absorbed,,32,12.809984,2.137,11.804,0.1475,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+kimi_k3,kimi_k3-tp4,generation,cudnn,bfloat16,bfloat16,128,4,131072,24,1,576,512,mla_absorbed,,32,579.739563,6.045,33.384,0.4173,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+kimi_k3,kimi_k3-tp4,context,cudnn_oss,bfloat16,bfloat16,1,2048,2048,24,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,SKIPPED: context phase for latent-absorbed MLA runs unabsorbed (see training suite prefill),,,
+kimi_k3,kimi_k3-tp4,context,cudnn_oss,bfloat16,bfloat16,1,8192,8192,24,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,SKIPPED: context phase for latent-absorbed MLA runs unabsorbed (see training suite prefill),,,
+kimi_k3,kimi_k3-tp4,context,cudnn_oss,bfloat16,bfloat16,1,32768,32768,24,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,SKIPPED: context phase for latent-absorbed MLA runs unabsorbed (see training suite prefill),,,
+kimi_k3,kimi_k3-tp4,context,cudnn_oss,bfloat16,bfloat16,1,512,65536,24,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,SKIPPED: context phase for latent-absorbed MLA runs unabsorbed (see training suite prefill),,,
+kimi_k3,kimi_k3-tp4,context,cudnn_oss,bfloat16,bfloat16,1,512,131072,24,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,SKIPPED: context phase for latent-absorbed MLA runs unabsorbed (see training suite prefill),,,
+kimi_k3,kimi_k3-tp4,context,cudnn_oss,bfloat16,bfloat16,1,1024,65536,24,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,SKIPPED: context phase for latent-absorbed MLA runs unabsorbed (see training suite prefill),,,
+kimi_k3,kimi_k3-tp4,context,cudnn_oss,bfloat16,bfloat16,1,1024,131072,24,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,SKIPPED: context phase for latent-absorbed MLA runs unabsorbed (see training suite prefill),,,
+kimi_k3,kimi_k3-tp4,generation,cudnn_oss,bfloat16,bfloat16,1,1,131072,24,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+kimi_k3,kimi_k3-tp4,generation,cudnn_oss,bfloat16,bfloat16,128,1,131072,24,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+kimi_k3,kimi_k3-tp4,generation,cudnn_oss,bfloat16,bfloat16,1,2,131072,24,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+kimi_k3,kimi_k3-tp4,generation,cudnn_oss,bfloat16,bfloat16,128,2,131072,24,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+kimi_k3,kimi_k3-tp4,generation,cudnn_oss,bfloat16,bfloat16,1,3,131072,24,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+kimi_k3,kimi_k3-tp4,generation,cudnn_oss,bfloat16,bfloat16,128,3,131072,24,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+kimi_k3,kimi_k3-tp4,generation,cudnn_oss,bfloat16,bfloat16,1,4,131072,24,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+kimi_k3,kimi_k3-tp4,generation,cudnn_oss,bfloat16,bfloat16,128,4,131072,24,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+kimi_k3,kimi_k3-tp8,context,cudnn,bfloat16,bfloat16,1,2048,2048,12,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,SKIPPED: context phase for latent-absorbed MLA runs unabsorbed (see training suite prefill),,,
+kimi_k3,kimi_k3-tp8,context,cudnn,bfloat16,bfloat16,1,8192,8192,12,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,SKIPPED: context phase for latent-absorbed MLA runs unabsorbed (see training suite prefill),,,
+kimi_k3,kimi_k3-tp8,context,cudnn,bfloat16,bfloat16,1,32768,32768,12,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,SKIPPED: context phase for latent-absorbed MLA runs unabsorbed (see training suite prefill),,,
+kimi_k3,kimi_k3-tp8,context,cudnn,bfloat16,bfloat16,1,512,65536,12,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,SKIPPED: context phase for latent-absorbed MLA runs unabsorbed (see training suite prefill),,,
+kimi_k3,kimi_k3-tp8,context,cudnn,bfloat16,bfloat16,1,512,131072,12,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,SKIPPED: context phase for latent-absorbed MLA runs unabsorbed (see training suite prefill),,,
+kimi_k3,kimi_k3-tp8,context,cudnn,bfloat16,bfloat16,1,1024,65536,12,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,SKIPPED: context phase for latent-absorbed MLA runs unabsorbed (see training suite prefill),,,
+kimi_k3,kimi_k3-tp8,context,cudnn,bfloat16,bfloat16,1,1024,131072,12,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,SKIPPED: context phase for latent-absorbed MLA runs unabsorbed (see training suite prefill),,,
+kimi_k3,kimi_k3-tp8,generation,cudnn,bfloat16,bfloat16,1,1,131072,12,1,576,512,mla_absorbed,,32,0.154336,22.176,978.521,12.2315,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+kimi_k3,kimi_k3-tp8,generation,cudnn,bfloat16,bfloat16,128,1,131072,12,1,576,512,mla_absorbed,,32,13.870304,31.585,1393.675,17.4209,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+kimi_k3,kimi_k3-tp8,generation,cudnn,bfloat16,bfloat16,1,2,131072,12,1,576,512,mla_absorbed,,32,12.800768,0.535,11.8,0.1475,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+kimi_k3,kimi_k3-tp8,generation,cudnn,bfloat16,bfloat16,128,2,131072,12,1,576,512,mla_absorbed,,32,289.056396,3.031,66.887,0.8361,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+kimi_k3,kimi_k3-tp8,generation,cudnn,bfloat16,bfloat16,1,3,131072,12,1,576,512,mla_absorbed,,32,12.793088,0.803,11.809,0.1476,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+kimi_k3,kimi_k3-tp8,generation,cudnn,bfloat16,bfloat16,128,3,131072,12,1,576,512,mla_absorbed,,32,289.190216,4.545,66.867,0.8358,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+kimi_k3,kimi_k3-tp8,generation,cudnn,bfloat16,bfloat16,1,4,131072,12,1,576,512,mla_absorbed,,32,12.790688,1.07,11.813,0.1477,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+kimi_k3,kimi_k3-tp8,generation,cudnn,bfloat16,bfloat16,128,4,131072,12,1,576,512,mla_absorbed,,32,289.183289,6.06,66.88,0.836,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+kimi_k3,kimi_k3-tp8,context,cudnn_oss,bfloat16,bfloat16,1,2048,2048,12,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,SKIPPED: context phase for latent-absorbed MLA runs unabsorbed (see training suite prefill),,,
+kimi_k3,kimi_k3-tp8,context,cudnn_oss,bfloat16,bfloat16,1,8192,8192,12,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,SKIPPED: context phase for latent-absorbed MLA runs unabsorbed (see training suite prefill),,,
+kimi_k3,kimi_k3-tp8,context,cudnn_oss,bfloat16,bfloat16,1,32768,32768,12,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,SKIPPED: context phase for latent-absorbed MLA runs unabsorbed (see training suite prefill),,,
+kimi_k3,kimi_k3-tp8,context,cudnn_oss,bfloat16,bfloat16,1,512,65536,12,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,SKIPPED: context phase for latent-absorbed MLA runs unabsorbed (see training suite prefill),,,
+kimi_k3,kimi_k3-tp8,context,cudnn_oss,bfloat16,bfloat16,1,512,131072,12,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,SKIPPED: context phase for latent-absorbed MLA runs unabsorbed (see training suite prefill),,,
+kimi_k3,kimi_k3-tp8,context,cudnn_oss,bfloat16,bfloat16,1,1024,65536,12,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,SKIPPED: context phase for latent-absorbed MLA runs unabsorbed (see training suite prefill),,,
+kimi_k3,kimi_k3-tp8,context,cudnn_oss,bfloat16,bfloat16,1,1024,131072,12,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,SKIPPED: context phase for latent-absorbed MLA runs unabsorbed (see training suite prefill),,,
+kimi_k3,kimi_k3-tp8,generation,cudnn_oss,bfloat16,bfloat16,1,1,131072,12,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+kimi_k3,kimi_k3-tp8,generation,cudnn_oss,bfloat16,bfloat16,128,1,131072,12,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+kimi_k3,kimi_k3-tp8,generation,cudnn_oss,bfloat16,bfloat16,1,2,131072,12,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+kimi_k3,kimi_k3-tp8,generation,cudnn_oss,bfloat16,bfloat16,128,2,131072,12,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+kimi_k3,kimi_k3-tp8,generation,cudnn_oss,bfloat16,bfloat16,1,3,131072,12,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+kimi_k3,kimi_k3-tp8,generation,cudnn_oss,bfloat16,bfloat16,128,3,131072,12,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+kimi_k3,kimi_k3-tp8,generation,cudnn_oss,bfloat16,bfloat16,1,4,131072,12,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+kimi_k3,kimi_k3-tp8,generation,cudnn_oss,bfloat16,bfloat16,128,4,131072,12,1,576,512,mla_absorbed,,32,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,

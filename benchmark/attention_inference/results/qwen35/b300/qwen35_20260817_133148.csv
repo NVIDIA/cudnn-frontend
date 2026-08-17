@@ -1,0 +1,889 @@
+config_name,model_name,phase,backend,data_type,kv_cache_dtype,batch_size,q_tokens,kv_len,num_q_heads,num_kv_heads,head_dim_qk,head_dim_vo,kind,sliding_window_size,page_size,time_ms,tflops,gbps,sol_pct,num_iterations,success,error_message,gpu_name,backend_detail,cudnn_backend_version
+qwen35,qwen3.5,context,cudnn,bfloat16,bfloat16,1,2048,2048,32,2,256,256,gqa,,16,0.067232,1022.125,1060.554,13.2569,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+qwen35,qwen3.5,context,cudnn,bfloat16,bfloat16,1,8192,8192,32,2,256,256,gqa,,16,0.619712,1774.23,460.234,5.7529,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+qwen35,qwen3.5,context,cudnn,bfloat16,bfloat16,1,32768,32768,32,2,256,256,gqa,,16,11.028192,1595.201,103.449,1.2931,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+qwen35,qwen3.5,context,cudnn,bfloat16,bfloat16,1,512,65536,32,2,256,256,gqa,,16,0.619968,1773.497,243.553,3.0444,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+qwen35,qwen3.5,context,cudnn,bfloat16,bfloat16,1,512,131072,32,2,256,256,gqa,,16,1.1952,1839.879,238.632,2.9829,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+qwen35,qwen3.5,context,cudnn,bfloat16,bfloat16,1,1024,65536,32,2,256,256,gqa,,16,1.225312,1794.664,136.922,1.7115,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+qwen35,qwen3.5,context,cudnn,bfloat16,bfloat16,1,1024,131072,32,2,256,256,gqa,,16,2.411424,1823.838,125.233,1.5654,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+qwen35,qwen3.5,generation,cudnn,bfloat16,bfloat16,1,1,131072,32,2,256,256,gqa,,16,0.093216,46.075,2880.066,36.0008,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+qwen35,qwen3.5,generation,cudnn,bfloat16,fp8_e4m3,1,1,131072,32,2,256,256,gqa,,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5,generation,cudnn,bfloat16,bfloat16,128,1,131072,32,2,256,256,gqa,,16,8.676832,63.359,3960.424,49.5053,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+qwen35,qwen3.5,generation,cudnn,bfloat16,fp8_e4m3,128,1,131072,32,2,256,256,gqa,,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5,generation,cudnn,bfloat16,bfloat16,1,2,131072,32,2,256,256,gqa,,16,6.525344,1.316,41.147,0.5143,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+qwen35,qwen3.5,generation,cudnn,bfloat16,fp8_e4m3,1,2,131072,32,2,256,256,gqa,,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5,generation,cudnn,bfloat16,bfloat16,128,2,131072,32,2,256,256,gqa,,16,193.834686,5.672,177.306,2.2163,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+qwen35,qwen3.5,generation,cudnn,bfloat16,fp8_e4m3,128,2,131072,32,2,256,256,gqa,,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5,generation,cudnn,bfloat16,bfloat16,1,3,131072,32,2,256,256,gqa,,16,6.5248,1.975,41.156,0.5144,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+qwen35,qwen3.5,generation,cudnn,bfloat16,fp8_e4m3,1,3,131072,32,2,256,256,gqa,,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5,generation,cudnn,bfloat16,bfloat16,128,3,131072,32,2,256,256,gqa,,16,193.764069,8.512,177.393,2.2174,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+qwen35,qwen3.5,generation,cudnn,bfloat16,fp8_e4m3,128,3,131072,32,2,256,256,gqa,,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5,generation,cudnn,bfloat16,bfloat16,1,4,131072,32,2,256,256,gqa,,16,6.523776,2.633,41.167,0.5146,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+qwen35,qwen3.5,generation,cudnn,bfloat16,fp8_e4m3,1,4,131072,32,2,256,256,gqa,,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5,generation,cudnn,bfloat16,bfloat16,128,4,131072,32,2,256,256,gqa,,16,193.464676,11.367,177.689,2.2211,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+qwen35,qwen3.5,generation,cudnn,bfloat16,fp8_e4m3,128,4,131072,32,2,256,256,gqa,,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5,context,cudnn_oss,bfloat16,bfloat16,1,2048,2048,32,2,256,256,gqa,,16,0.208352,329.824,342.225,4.2778,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d256[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen35,qwen3.5,context,cudnn_oss,bfloat16,bfloat16,1,8192,8192,32,2,256,256,gqa,,16,1.052992,1044.179,270.859,3.3857,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d256[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen35,qwen3.5,context,cudnn_oss,bfloat16,bfloat16,1,32768,32768,32,2,256,256,gqa,,16,12.249888,1436.11,93.132,1.1641,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d256[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen35,qwen3.5,context,cudnn_oss,bfloat16,bfloat16,1,512,65536,32,2,256,256,gqa,,16,0.798592,1376.813,189.076,2.3635,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d256[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen35,qwen3.5,context,cudnn_oss,bfloat16,bfloat16,1,512,131072,32,2,256,256,gqa,,16,1.529376,1437.856,186.49,2.3311,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d256[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen35,qwen3.5,context,cudnn_oss,bfloat16,bfloat16,1,1024,65536,32,2,256,256,gqa,,16,1.451744,1514.746,115.566,1.4446,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d256[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen35,qwen3.5,context,cudnn_oss,bfloat16,bfloat16,1,1024,131072,32,2,256,256,gqa,,16,2.751136,1598.629,109.769,1.3721,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d256[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen35,qwen3.5,generation,cudnn_oss,bfloat16,bfloat16,1,1,131072,32,2,256,256,gqa,,16,1.487776,2.887,180.449,2.2556,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d256[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen35,qwen3.5,generation,cudnn_oss,bfloat16,fp8_e4m3,1,1,131072,32,2,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5,generation,cudnn_oss,bfloat16,bfloat16,128,1,131072,32,2,256,256,gqa,,16,114.485535,4.802,300.16,3.752,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d256[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen35,qwen3.5,generation,cudnn_oss,bfloat16,fp8_e4m3,128,1,131072,32,2,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5,generation,cudnn_oss,bfloat16,bfloat16,1,2,131072,32,2,256,256,gqa,,16,1.465408,5.862,183.226,2.2903,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d256[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen35,qwen3.5,generation,cudnn_oss,bfloat16,fp8_e4m3,1,2,131072,32,2,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5,generation,cudnn_oss,bfloat16,bfloat16,128,2,131072,32,2,256,256,gqa,,16,114.229568,9.625,300.869,3.7609,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d256[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen35,qwen3.5,generation,cudnn_oss,bfloat16,fp8_e4m3,128,2,131072,32,2,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5,generation,cudnn_oss,bfloat16,bfloat16,1,3,131072,32,2,256,256,gqa,,16,1.501216,8.583,178.877,2.236,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d256[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen35,qwen3.5,generation,cudnn_oss,bfloat16,fp8_e4m3,1,3,131072,32,2,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5,generation,cudnn_oss,bfloat16,bfloat16,128,3,131072,32,2,256,256,gqa,,16,113.881119,14.482,301.826,3.7728,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d256[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen35,qwen3.5,generation,cudnn_oss,bfloat16,fp8_e4m3,128,3,131072,32,2,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5,generation,cudnn_oss,bfloat16,bfloat16,1,4,131072,32,2,256,256,gqa,,16,1.499584,11.456,179.094,2.2387,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d256[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen35,qwen3.5,generation,cudnn_oss,bfloat16,fp8_e4m3,1,4,131072,32,2,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5,generation,cudnn_oss,bfloat16,bfloat16,128,4,131072,32,2,256,256,gqa,,16,115.756157,18.997,296.974,3.7122,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d256[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen35,qwen3.5,generation,cudnn_oss,bfloat16,fp8_e4m3,128,4,131072,32,2,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5-tp2,context,cudnn,bfloat16,bfloat16,1,2048,2048,16,1,256,256,gqa,,16,0.056032,613.216,636.272,7.9534,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+qwen35,qwen3.5-tp2,context,cudnn,bfloat16,bfloat16,1,8192,8192,16,1,256,256,gqa,,16,0.322976,1702.157,441.539,5.5192,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+qwen35,qwen3.5-tp2,context,cudnn,bfloat16,bfloat16,1,32768,32768,16,1,256,256,gqa,,16,5.562624,1581.285,102.546,1.2818,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+qwen35,qwen3.5-tp2,context,cudnn,bfloat16,bfloat16,1,512,65536,16,1,256,256,gqa,,16,0.58896,933.435,128.188,1.6023,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+qwen35,qwen3.5-tp2,context,cudnn,bfloat16,bfloat16,1,512,131072,16,1,256,256,gqa,,16,1.139328,965.053,125.167,1.5646,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+qwen35,qwen3.5-tp2,context,cudnn,bfloat16,bfloat16,1,1024,65536,16,1,256,256,gqa,,16,0.616768,1782.699,136.009,1.7001,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+qwen35,qwen3.5-tp2,context,cudnn,bfloat16,bfloat16,1,1024,131072,16,1,256,256,gqa,,16,1.205472,1824.201,125.258,1.5657,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+qwen35,qwen3.5-tp2,generation,cudnn,bfloat16,bfloat16,1,1,131072,16,1,256,256,gqa,,16,0.09648,22.258,1391.315,17.3914,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+qwen35,qwen3.5-tp2,generation,cudnn,bfloat16,fp8_e4m3,1,1,131072,16,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5-tp2,generation,cudnn,bfloat16,bfloat16,128,1,131072,16,1,256,256,gqa,,16,4.255296,64.597,4037.784,50.4723,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+qwen35,qwen3.5-tp2,generation,cudnn,bfloat16,fp8_e4m3,128,1,131072,16,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5-tp2,generation,cudnn,bfloat16,bfloat16,1,2,131072,16,1,256,256,gqa,,16,6.52016,0.659,20.59,0.2574,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+qwen35,qwen3.5-tp2,generation,cudnn,bfloat16,fp8_e4m3,1,2,131072,16,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5-tp2,generation,cudnn,bfloat16,bfloat16,128,2,131072,16,1,256,256,gqa,,16,97.195038,5.656,176.8,2.21,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+qwen35,qwen3.5-tp2,generation,cudnn,bfloat16,fp8_e4m3,128,2,131072,16,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5-tp2,generation,cudnn,bfloat16,bfloat16,1,3,131072,16,1,256,256,gqa,,16,6.520544,0.988,20.591,0.2574,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+qwen35,qwen3.5-tp2,generation,cudnn,bfloat16,fp8_e4m3,1,3,131072,16,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5-tp2,generation,cudnn,bfloat16,bfloat16,128,3,131072,16,1,256,256,gqa,,16,97.2248,8.482,176.767,2.2096,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+qwen35,qwen3.5-tp2,generation,cudnn,bfloat16,fp8_e4m3,128,3,131072,16,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5-tp2,generation,cudnn,bfloat16,bfloat16,1,4,131072,16,1,256,256,gqa,,16,6.520896,1.317,20.593,0.2574,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+qwen35,qwen3.5-tp2,generation,cudnn,bfloat16,fp8_e4m3,1,4,131072,16,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5-tp2,generation,cudnn,bfloat16,bfloat16,128,4,131072,16,1,256,256,gqa,,16,97.132515,11.32,176.957,2.212,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+qwen35,qwen3.5-tp2,generation,cudnn,bfloat16,fp8_e4m3,128,4,131072,16,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5-tp2,context,cudnn_oss,bfloat16,bfloat16,1,2048,2048,16,1,256,256,gqa,,16,0.151904,226.194,234.698,2.9337,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d256[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen35,qwen3.5-tp2,context,cudnn_oss,bfloat16,bfloat16,1,8192,8192,16,1,256,256,gqa,,16,0.57408,957.629,248.408,3.1051,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d256[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen35,qwen3.5-tp2,context,cudnn_oss,bfloat16,bfloat16,1,32768,32768,16,1,256,256,gqa,,16,6.018784,1461.44,94.774,1.1847,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d256[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen35,qwen3.5-tp2,context,cudnn_oss,bfloat16,bfloat16,1,512,65536,16,1,256,256,gqa,,16,0.659712,833.327,114.44,1.4305,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d256[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen35,qwen3.5-tp2,context,cudnn_oss,bfloat16,bfloat16,1,512,131072,16,1,256,256,gqa,,16,1.211072,907.883,117.752,1.4719,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d256[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen35,qwen3.5-tp2,context,cudnn_oss,bfloat16,bfloat16,1,1024,65536,16,1,256,256,gqa,,16,0.686592,1601.405,122.177,1.5272,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d256[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen35,qwen3.5-tp2,context,cudnn_oss,bfloat16,bfloat16,1,1024,131072,16,1,256,256,gqa,,16,1.275328,1724.28,118.397,1.48,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d256[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen35,qwen3.5-tp2,generation,cudnn_oss,bfloat16,bfloat16,1,1,131072,16,1,256,256,gqa,,16,1.148832,1.869,116.844,1.4605,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d256[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen35,qwen3.5-tp2,generation,cudnn_oss,bfloat16,fp8_e4m3,1,1,131072,16,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5-tp2,generation,cudnn_oss,bfloat16,bfloat16,128,1,131072,16,1,256,256,gqa,,16,38.082176,7.218,451.181,5.6398,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d256[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen35,qwen3.5-tp2,generation,cudnn_oss,bfloat16,fp8_e4m3,128,1,131072,16,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5-tp2,generation,cudnn_oss,bfloat16,bfloat16,1,2,131072,16,1,256,256,gqa,,16,1.205856,3.562,111.332,1.3917,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d256[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen35,qwen3.5-tp2,generation,cudnn_oss,bfloat16,fp8_e4m3,1,2,131072,16,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5-tp2,generation,cudnn_oss,bfloat16,bfloat16,128,2,131072,16,1,256,256,gqa,,16,38.465664,14.292,446.738,5.5842,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d256[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen35,qwen3.5-tp2,generation,cudnn_oss,bfloat16,fp8_e4m3,128,2,131072,16,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5-tp2,generation,cudnn_oss,bfloat16,bfloat16,1,3,131072,16,1,256,256,gqa,,16,1.20496,5.347,111.428,1.3929,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d256[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen35,qwen3.5-tp2,generation,cudnn_oss,bfloat16,fp8_e4m3,1,3,131072,16,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5-tp2,generation,cudnn_oss,bfloat16,bfloat16,128,3,131072,16,1,256,256,gqa,,16,38.565536,21.383,445.635,5.5704,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d256[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen35,qwen3.5-tp2,generation,cudnn_oss,bfloat16,fp8_e4m3,128,3,131072,16,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5-tp2,generation,cudnn_oss,bfloat16,bfloat16,1,4,131072,16,1,256,256,gqa,,16,1.205408,7.126,111.401,1.3925,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d256[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen35,qwen3.5-tp2,generation,cudnn_oss,bfloat16,fp8_e4m3,1,4,131072,16,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5-tp2,generation,cudnn_oss,bfloat16,bfloat16,128,4,131072,16,1,256,256,gqa,,16,38.805534,28.334,442.933,5.5367,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d256[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen35,qwen3.5-tp2,generation,cudnn_oss,bfloat16,fp8_e4m3,128,4,131072,16,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5-tp4,context,cudnn,bfloat16,bfloat16,1,2048,2048,8,1,256,256,gqa,,16,0.05312,323.416,355.316,4.4414,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+qwen35,qwen3.5-tp4,context,cudnn,bfloat16,bfloat16,1,8192,8192,8,1,256,256,gqa,,16,0.17968,1529.819,420.177,5.2522,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+qwen35,qwen3.5-tp4,context,cudnn,bfloat16,bfloat16,1,32768,32768,8,1,256,256,gqa,,16,2.288288,1921.981,131.972,1.6496,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+qwen35,qwen3.5-tp4,context,cudnn,bfloat16,bfloat16,1,512,65536,8,1,256,256,gqa,,16,0.587712,467.709,121.323,1.5165,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+qwen35,qwen3.5-tp4,context,cudnn,bfloat16,bfloat16,1,512,131072,8,1,256,256,gqa,,16,1.138432,482.906,121.581,1.5198,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+qwen35,qwen3.5-tp4,context,cudnn,bfloat16,bfloat16,1,1024,65536,8,1,256,256,gqa,,16,0.588672,933.892,128.25,1.6031,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+qwen35,qwen3.5-tp4,context,cudnn,bfloat16,bfloat16,1,1024,131072,8,1,256,256,gqa,,16,1.138656,965.622,125.241,1.5655,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+qwen35,qwen3.5-tp4,generation,cudnn,bfloat16,bfloat16,1,1,131072,8,1,256,256,gqa,,16,0.09504,11.298,1412.31,17.6539,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+qwen35,qwen3.5-tp4,generation,cudnn,bfloat16,fp8_e4m3,1,1,131072,8,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5-tp4,generation,cudnn,bfloat16,bfloat16,128,1,131072,8,1,256,256,gqa,,16,4.25296,32.316,4039.755,50.4969,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+qwen35,qwen3.5-tp4,generation,cudnn,bfloat16,fp8_e4m3,128,1,131072,8,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5-tp4,generation,cudnn,bfloat16,bfloat16,1,2,131072,8,1,256,256,gqa,,16,6.52144,0.329,20.584,0.2573,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+qwen35,qwen3.5-tp4,generation,cudnn,bfloat16,fp8_e4m3,1,2,131072,8,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5-tp4,generation,cudnn,bfloat16,bfloat16,128,2,131072,8,1,256,256,gqa,,16,51.192223,5.37,335.636,4.1955,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+qwen35,qwen3.5-tp4,generation,cudnn,bfloat16,fp8_e4m3,128,2,131072,8,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5-tp4,generation,cudnn,bfloat16,bfloat16,1,3,131072,8,1,256,256,gqa,,16,6.522272,0.494,20.582,0.2573,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+qwen35,qwen3.5-tp4,generation,cudnn,bfloat16,fp8_e4m3,1,3,131072,8,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5-tp4,generation,cudnn,bfloat16,bfloat16,128,3,131072,8,1,256,256,gqa,,16,51.001122,8.084,336.914,4.2114,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+qwen35,qwen3.5-tp4,generation,cudnn,bfloat16,fp8_e4m3,128,3,131072,8,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5-tp4,generation,cudnn,bfloat16,bfloat16,1,4,131072,8,1,256,256,gqa,,16,6.51984,0.659,20.591,0.2574,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+qwen35,qwen3.5-tp4,generation,cudnn,bfloat16,fp8_e4m3,1,4,131072,8,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5-tp4,generation,cudnn,bfloat16,bfloat16,128,4,131072,8,1,256,256,gqa,,16,50.817986,10.818,338.149,4.2269,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+qwen35,qwen3.5-tp4,generation,cudnn,bfloat16,fp8_e4m3,128,4,131072,8,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5-tp4,context,cudnn_oss,bfloat16,bfloat16,1,2048,2048,8,1,256,256,gqa,,16,0.123776,138.798,152.488,1.9061,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d256[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen35,qwen3.5-tp4,context,cudnn_oss,bfloat16,bfloat16,1,8192,8192,8,1,256,256,gqa,,16,0.344096,798.841,219.408,2.7426,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d256[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen35,qwen3.5-tp4,context,cudnn_oss,bfloat16,bfloat16,1,32768,32768,8,1,256,256,gqa,,16,2.850752,1542.767,105.933,1.3242,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d256[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen35,qwen3.5-tp4,context,cudnn_oss,bfloat16,bfloat16,1,512,65536,8,1,256,256,gqa,,16,0.65552,419.328,108.773,1.3597,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d256[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen35,qwen3.5-tp4,context,cudnn_oss,bfloat16,bfloat16,1,512,131072,8,1,256,256,gqa,,16,1.209408,454.566,114.446,1.4306,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d256[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen35,qwen3.5-tp4,context,cudnn_oss,bfloat16,bfloat16,1,1024,65536,8,1,256,256,gqa,,16,0.660064,832.883,114.379,1.4297,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d256[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen35,qwen3.5-tp4,context,cudnn_oss,bfloat16,bfloat16,1,1024,131072,8,1,256,256,gqa,,16,1.211232,907.763,117.737,1.4717,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d256[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen35,qwen3.5-tp4,generation,cudnn_oss,bfloat16,bfloat16,1,1,131072,8,1,256,256,gqa,,16,1.183424,0.907,113.422,1.4178,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d256[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen35,qwen3.5-tp4,generation,cudnn_oss,bfloat16,fp8_e4m3,1,1,131072,8,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5-tp4,generation,cudnn_oss,bfloat16,bfloat16,128,1,131072,8,1,256,256,gqa,,16,19.269472,7.132,891.613,11.1452,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d256[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen35,qwen3.5-tp4,generation,cudnn_oss,bfloat16,fp8_e4m3,128,1,131072,8,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5-tp4,generation,cudnn_oss,bfloat16,bfloat16,1,2,131072,8,1,256,256,gqa,,16,1.20368,1.784,111.52,1.394,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d256[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen35,qwen3.5-tp4,generation,cudnn_oss,bfloat16,fp8_e4m3,1,2,131072,8,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5-tp4,generation,cudnn_oss,bfloat16,bfloat16,128,2,131072,8,1,256,256,gqa,,16,19.369152,14.192,887.079,11.0885,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d256[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen35,qwen3.5-tp4,generation,cudnn_oss,bfloat16,fp8_e4m3,128,2,131072,8,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5-tp4,generation,cudnn_oss,bfloat16,bfloat16,1,3,131072,8,1,256,256,gqa,,16,1.206048,2.671,111.308,1.3913,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d256[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen35,qwen3.5-tp4,generation,cudnn_oss,bfloat16,fp8_e4m3,1,3,131072,8,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5-tp4,generation,cudnn_oss,bfloat16,bfloat16,128,3,131072,8,1,256,256,gqa,,16,19.287584,21.377,890.885,11.1361,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d256[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen35,qwen3.5-tp4,generation,cudnn_oss,bfloat16,fp8_e4m3,128,3,131072,8,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5-tp4,generation,cudnn_oss,bfloat16,bfloat16,1,4,131072,8,1,256,256,gqa,,16,1.205248,3.564,111.388,1.3924,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d256[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen35,qwen3.5-tp4,generation,cudnn_oss,bfloat16,fp8_e4m3,1,4,131072,8,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5-tp4,generation,cudnn_oss,bfloat16,bfloat16,128,4,131072,8,1,256,256,gqa,,16,19.456127,28.256,883.221,11.0403,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d256[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen35,qwen3.5-tp4,generation,cudnn_oss,bfloat16,fp8_e4m3,128,4,131072,8,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5-tp8,context,cudnn,bfloat16,bfloat16,1,2048,2048,4,1,256,256,gqa,,16,0.05056,169.896,207.392,2.5924,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+qwen35,qwen3.5-tp8,context,cudnn,bfloat16,bfloat16,1,8192,8192,4,1,256,256,gqa,,16,0.109856,1251.083,381.8,4.7725,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+qwen35,qwen3.5-tp8,context,cudnn,bfloat16,bfloat16,1,32768,32768,4,1,256,256,gqa,,16,1.155808,1902.585,145.156,1.8144,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+qwen35,qwen3.5-tp8,context,cudnn,bfloat16,bfloat16,1,512,65536,4,1,256,256,gqa,,16,0.587584,233.905,117.781,1.4723,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+qwen35,qwen3.5-tp8,context,cudnn,bfloat16,bfloat16,1,512,131072,4,1,256,256,gqa,,16,1.139232,241.284,119.655,1.4957,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+qwen35,qwen3.5-tp8,context,cudnn,bfloat16,bfloat16,1,1024,65536,4,1,256,256,gqa,,16,0.587584,467.81,121.35,1.5169,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+qwen35,qwen3.5-tp8,context,cudnn,bfloat16,bfloat16,1,1024,131072,4,1,256,256,gqa,,16,1.138752,482.77,121.547,1.5193,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+qwen35,qwen3.5-tp8,generation,cudnn,bfloat16,bfloat16,1,1,131072,4,1,256,256,gqa,,16,0.08304,6.465,1616.351,20.2044,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+qwen35,qwen3.5-tp8,generation,cudnn,bfloat16,fp8_e4m3,1,1,131072,4,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5-tp8,generation,cudnn,bfloat16,bfloat16,128,1,131072,4,1,256,256,gqa,,16,4.253472,16.156,4039.146,50.4893,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+qwen35,qwen3.5-tp8,generation,cudnn,bfloat16,fp8_e4m3,128,1,131072,4,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5-tp8,generation,cudnn,bfloat16,bfloat16,1,2,131072,4,1,256,256,gqa,,16,6.543584,0.164,20.513,0.2564,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+qwen35,qwen3.5-tp8,generation,cudnn,bfloat16,fp8_e4m3,1,2,131072,4,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5-tp8,generation,cudnn,bfloat16,bfloat16,128,2,131072,4,1,256,256,gqa,,16,30.132511,4.561,570.179,7.1272,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+qwen35,qwen3.5-tp8,generation,cudnn,bfloat16,fp8_e4m3,128,2,131072,4,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5-tp8,generation,cudnn,bfloat16,bfloat16,1,3,131072,4,1,256,256,gqa,,16,6.543264,0.246,20.514,0.2564,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+qwen35,qwen3.5-tp8,generation,cudnn,bfloat16,fp8_e4m3,1,3,131072,4,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5-tp8,generation,cudnn,bfloat16,bfloat16,128,3,131072,4,1,256,256,gqa,,16,30.114817,6.846,570.531,7.1316,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+qwen35,qwen3.5-tp8,generation,cudnn,bfloat16,fp8_e4m3,128,3,131072,4,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5-tp8,generation,cudnn,bfloat16,bfloat16,1,4,131072,4,1,256,256,gqa,,16,6.543648,0.328,20.514,0.2564,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+qwen35,qwen3.5-tp8,generation,cudnn,bfloat16,fp8_e4m3,1,4,131072,4,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5-tp8,generation,cudnn,bfloat16,bfloat16,128,4,131072,4,1,256,256,gqa,,16,30.094816,9.134,570.928,7.1366,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+qwen35,qwen3.5-tp8,generation,cudnn,bfloat16,fp8_e4m3,128,4,131072,4,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5-tp8,context,cudnn_oss,bfloat16,bfloat16,1,2048,2048,4,1,256,256,gqa,,16,0.121344,70.79,86.414,1.0802,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d256[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen35,qwen3.5-tp8,context,cudnn_oss,bfloat16,bfloat16,1,8192,8192,4,1,256,256,gqa,,16,0.254816,539.365,164.601,2.0575,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d256[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen35,qwen3.5-tp8,context,cudnn_oss,bfloat16,bfloat16,1,32768,32768,4,1,256,256,gqa,,16,1.521152,1445.63,110.293,1.3787,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d256[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen35,qwen3.5-tp8,context,cudnn_oss,bfloat16,bfloat16,1,512,65536,4,1,256,256,gqa,,16,0.654432,210.013,105.75,1.3219,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d256[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen35,qwen3.5-tp8,context,cudnn_oss,bfloat16,bfloat16,1,512,131072,4,1,256,256,gqa,,16,1.206624,227.807,112.972,1.4122,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d256[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen35,qwen3.5-tp8,context,cudnn_oss,bfloat16,bfloat16,1,1024,65536,4,1,256,256,gqa,,16,0.610912,449.947,116.716,1.4589,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d256[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen35,qwen3.5-tp8,context,cudnn_oss,bfloat16,bfloat16,1,1024,131072,4,1,256,256,gqa,,16,1.208384,454.951,114.543,1.4318,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d256[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen35,qwen3.5-tp8,generation,cudnn_oss,bfloat16,bfloat16,1,1,131072,4,1,256,256,gqa,,16,1.190912,0.451,112.705,1.4088,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d256[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen35,qwen3.5-tp8,generation,cudnn_oss,bfloat16,fp8_e4m3,1,1,131072,4,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5-tp8,generation,cudnn_oss,bfloat16,bfloat16,128,1,131072,4,1,256,256,gqa,,16,10.223104,6.722,1680.546,21.0068,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d256[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen35,qwen3.5-tp8,generation,cudnn_oss,bfloat16,fp8_e4m3,128,1,131072,4,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5-tp8,generation,cudnn_oss,bfloat16,bfloat16,1,2,131072,4,1,256,256,gqa,,16,1.209984,0.887,110.932,1.3866,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d256[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen35,qwen3.5-tp8,generation,cudnn_oss,bfloat16,fp8_e4m3,1,2,131072,4,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5-tp8,generation,cudnn_oss,bfloat16,bfloat16,128,2,131072,4,1,256,256,gqa,,16,10.202624,13.471,1683.97,21.0496,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d256[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen35,qwen3.5-tp8,generation,cudnn_oss,bfloat16,fp8_e4m3,128,2,131072,4,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5-tp8,generation,cudnn_oss,bfloat16,bfloat16,1,3,131072,4,1,256,256,gqa,,16,1.211744,1.329,110.774,1.3847,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d256[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen35,qwen3.5-tp8,generation,cudnn_oss,bfloat16,fp8_e4m3,1,3,131072,4,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5-tp8,generation,cudnn_oss,bfloat16,bfloat16,128,3,131072,4,1,256,256,gqa,,16,10.240512,20.132,1677.791,20.9724,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d256[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen35,qwen3.5-tp8,generation,cudnn_oss,bfloat16,fp8_e4m3,128,3,131072,4,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5-tp8,generation,cudnn_oss,bfloat16,bfloat16,1,4,131072,4,1,256,256,gqa,,16,1.212128,1.772,110.743,1.3843,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d256[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen35,qwen3.5-tp8,generation,cudnn_oss,bfloat16,fp8_e4m3,1,4,131072,4,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,
+qwen35,qwen3.5-tp8,generation,cudnn_oss,bfloat16,bfloat16,128,4,131072,4,1,256,256,gqa,,16,10.280256,26.738,1671.356,20.8919,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d256[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+qwen35,qwen3.5-tp8,generation,cudnn_oss,bfloat16,fp8_e4m3,128,4,131072,4,1,256,256,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 261, in setup_cudnn_fp8
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: hidden_dim d_qk should be less than or equal to 128 and hidden_dim d_qk should be multiple of 16 unless d_qk == 192 and d_v == 128 (requires cuDNN 9.19+)",,,

@@ -62,7 +62,7 @@ def log_environment_info():
     try:
         import flash_attn
 
-        logger.info(f"flash_attn.__version__ = '{flash_attn.__version__}'")
+        logger.info(f"flash_attn.__version__ = '{getattr(flash_attn, '__version__', 'unknown')}'")
     except ImportError:
         pass  # flash_attn is optional
 
