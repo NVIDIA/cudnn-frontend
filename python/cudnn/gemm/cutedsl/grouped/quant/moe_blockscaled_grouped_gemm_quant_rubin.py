@@ -15,7 +15,7 @@ This module contains only the kernel class.
 MoE scheduler components live in moe_persistent_scheduler.py / moe_sched_extension.py / moe_utils.py.
 """
 
-from typing import Type, Tuple, Union, Optional
+from typing import Literal, Type, Tuple, Union, Optional
 from enum import Enum
 
 import cuda.bindings.driver as cuda
@@ -85,6 +85,12 @@ class BlockScaledMoEGroupedGemmQuantKernel:
     :param generate_c: Generate C output tensor.
     :param enable_bias: Fuse bias addition.
     :param expert_cnt: Number of experts.
+    :param sf_fp8_dtype_override: Reinterpret the FP8-format block scale factors
+        as E5M3 instead of the E4M3 implied by their storage dtype. ``None``
+        (default) leaves the format inferred, as every caller did before this
+        knob existed. ``"e5m3"`` requires Rubin and the NVFP4 recipe, and the
+        scale tensors are still supplied as ``torch.float8_e4m3fn`` because
+        torch has no e5m3 dtype -- only the CuTe element type is overridden.
     :param weight_mode: ``MoEWeightMode.DENSE`` or ``MoEWeightMode.DISCRETE``.
     :param use_dynamic_sched: Enable dynamic tile scheduling.
     """
@@ -185,6 +191,7 @@ class BlockScaledMoEGroupedGemmQuantKernel:
         weight_mode: MoEWeightMode = MoEWeightMode.DENSE,
         use_dynamic_sched: bool = False,
         epilogue_type: int = EpilogueType.NONE.value,
+        sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
         use_single_group_runtime_offsets: bool = False,
     ):
         # Hardware MMA instruction M: 2CTA → 256, 1CTA → 128
@@ -216,6 +223,7 @@ class BlockScaledMoEGroupedGemmQuantKernel:
             raise TypeError(f"weight_mode must be a MoEWeightMode, got {type(weight_mode)}")
 
         self.sf_vec_size = sf_vec_size
+        self.sf_dtype_override: Optional[Type[cutlass.Numeric]] = cutlass.FloatNV8E5M3FNU if sf_fp8_dtype_override == "e5m3" else None
         self.expert_cnt = expert_cnt
         self.use_single_group_runtime_offsets = use_single_group_runtime_offsets
         self.acc_dtype: Type[cutlass.Numeric] = acc_dtype
@@ -727,7 +735,14 @@ class BlockScaledMoEGroupedGemmQuantKernel:
         self.b_dtype: Type[cutlass.Numeric] = a.element_type
         self.c_dtype: Type[cutlass.Numeric] = c.element_type
         self.d_dtype: Type[cutlass.Numeric] = d.element_type
-        self.sf_dtype: Type[cutlass.Numeric] = sfa.element_type
+        # Scale factors may arrive under a stand-in element type: FloatNV8E5M3FNU has
+        # no torch dtype and TVM-FFI cannot marshal it, so e5m3 scales are passed as
+        # Float8E4M3FN storage of the same width and reinterpreted here. This must
+        # happen before _setup_attributes(), which picks the MMA atom off sf_dtype.
+        if cutlass.const_expr(self.sf_dtype_override is not None):
+            self.sf_dtype: Type[cutlass.Numeric] = self.sf_dtype_override
+        else:
+            self.sf_dtype: Type[cutlass.Numeric] = sfa.element_type
         self.a_major_mode = utils.LayoutEnum.from_tensor(a).mma_major_mode()
         self.c_layout = utils.LayoutEnum.from_tensor(c)
         self.d_layout = utils.LayoutEnum.from_tensor(d)
