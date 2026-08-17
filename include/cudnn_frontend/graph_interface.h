@@ -408,7 +408,10 @@ class Graph : public ICudnn, public INode {
 
         switch (attributes.implementation) {
             case AttentionImplementation_t::AUTO:
-                throw std::runtime_error("No suitable implementation for given SDPA_attributes");
+                // No implementation supports the requested feature combination on this
+                // arch/version. Throw the typed exception (a std::runtime_error subclass)
+                // so callers get GRAPH_NOT_SUPPORTED semantics rather than a generic error.
+                throw cudnnGraphNotSupportedException("No suitable implementation for given SDPA_attributes");
                 break;
             case AttentionImplementation_t::COMPOSITE:
                 sub_nodes.emplace_back(std::make_unique<CompositeSDPANode>(std::move(attributes), context));
