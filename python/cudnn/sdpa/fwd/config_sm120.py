@@ -74,21 +74,24 @@ class TemplateParams:
 def validate_params(
     params: TemplateParams,
     allowed_dtypes: tuple[int, ...] = (DTYPE_BF16, DTYPE_FP16),
+    allowed_o_dtypes: tuple[int, ...] = (DTYPE_BF16, DTYPE_FP16),
     allow_right_band: bool = True,
 ) -> None:
     """Validate the SM120 template specialization.
 
     Reachable failures should already have been rejected by the engine
     capabilities or adapter support checks; this validation is a backstop for
-    direct template use. ``allowed_dtypes`` defaults to the FP16/BF16 template's
-    set; the FP8 template passes its own. ``allow_right_band=False`` rejects a
+    direct template use. ``allowed_dtypes``/``allowed_o_dtypes`` default to the
+    FP16/BF16 template's sets (which stores O at the input dtype and plumbs no
+    quantizing epilogue); the FP8 template passes its own — FP8 in, any of its
+    four quantizing-store epilogues out. ``allow_right_band=False`` rejects a
     widened right band for templates that do not plumb one.
     """
 
     if params.dtype_qkv not in allowed_dtypes:
         raise ValueError(f"SM120 SDPA: dtype_qkv must be one of {allowed_dtypes}; got {params.dtype_qkv}")
-    if params.dtype_o not in (DTYPE_E4M3, DTYPE_E5M2, DTYPE_BF16, DTYPE_FP16):
-        raise ValueError(f"SM120 SDPA: dtype_o must be a frost tile_dsl dtype code (E4M3/E5M2/BF16/FP16); got {params.dtype_o}")
+    if params.dtype_o not in allowed_o_dtypes:
+        raise ValueError(f"SM120 SDPA: dtype_o must be one of {allowed_o_dtypes}; got {params.dtype_o}")
     if params.window_right is not None and params.window_right < 0:
         raise ValueError(f"SM120 SDPA: window_right must be None (unbounded) or >= 0 (0 = plain causal); got {params.window_right}")
     if not allow_right_band and params.window_right not in (None, 0):

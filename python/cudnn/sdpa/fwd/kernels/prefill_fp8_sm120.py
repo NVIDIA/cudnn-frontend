@@ -71,7 +71,7 @@ from cudnn.sdpa.fwd.config_sm120 import (
     FP8_HEAD_TILE_GRANULE,
     SEQ_KV_TILES as _SEQ_KV_TILES,
     SEQ_Q_TILES as _SEQ_Q_TILES,
-    SUPPORTED_HEAD_TILES as _SUPPORTED_HEAD_TILES,
+    SUPPORTED_HEAD_TILES_FP8 as _SUPPORTED_HEAD_TILES_FP8,
     TemplateParams,
     validate_params,
 )
@@ -79,7 +79,12 @@ from cudnn.sdpa.fwd.config_sm120 import (
 # The FROST loader injects one immutable specialization before executing this
 # module. A direct import uses dense e4m3 defaults.
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams(dtype_qkv=DTYPE_E4M3))
-validate_params(PARAMS, allowed_dtypes=(DTYPE_E4M3, DTYPE_E5M2), allow_right_band=True)
+validate_params(
+    PARAMS,
+    allowed_dtypes=(DTYPE_E4M3, DTYPE_E5M2),
+    allowed_o_dtypes=(DTYPE_E4M3, DTYPE_E5M2, DTYPE_BF16, DTYPE_FP16),
+    allow_right_band=True,
+)
 
 IN_DTYPE = cutlass.Float8E4M3FN if PARAMS.dtype_qkv == DTYPE_E4M3 else cutlass.Float8E5M2
 OUT_DTYPE = {
@@ -174,7 +179,7 @@ class SM120FusedMultiHeadAttentionForward:
 
     SEQ_Q_TILES = _SEQ_Q_TILES
     SEQ_KV_TILES = _SEQ_KV_TILES
-    SUPPORTED_HEAD_TILES = _SUPPORTED_HEAD_TILES
+    SUPPORTED_HEAD_TILES = _SUPPORTED_HEAD_TILES_FP8
     MMA_TILER = (16, 8, 32)  # mma.sync.aligned.m16n8k32 (e4m3)
 
     @staticmethod
@@ -260,6 +265,12 @@ class SM120FusedMultiHeadAttentionForward:
             raise ValueError("out_dtype must be Float16, BFloat16, Float8E4M3FN, or Float8E5M2")
         if thd_varlen and thd_batch < 1:
             raise ValueError("thd_varlen requires thd_batch >= 1")
+        for tile_name, tile in (("head_tile_qk", head_tile_qk), ("head_tile_v", head_tile_v)):
+            if tile not in _SUPPORTED_HEAD_TILES_FP8:
+                raise ValueError(
+                    f"{tile_name} must be a multiple of {FP8_HEAD_TILE_GRANULE} between "
+                    f"{_SUPPORTED_HEAD_TILES_FP8[0]} and {_SUPPORTED_HEAD_TILES_FP8[-1]}, got {tile}"
+                )
         self.in_dtype = in_dtype
         self.out_dtype = out_dtype
         self.is_causal = is_causal
@@ -1639,7 +1650,7 @@ def compile(  # noqa: A001
         is_causal=PARAMS.window_right is not None,
         bottom_right=PARAMS.bottom_right,
         window_size_left=PARAMS.window_left,
-        window_size_right=(PARAMS.window_right if PARAMS.window_right else None),
+        window_size_right=PARAMS.window_right,
         seq_q_lens_present=PARAMS.seq_q_lens_present,
         seq_kv_lens_present=PARAMS.seq_kv_lens_present,
         has_sink=PARAMS.has_sink,

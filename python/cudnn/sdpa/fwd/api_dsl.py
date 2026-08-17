@@ -1350,12 +1350,18 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # A zero-token packed K/V view cannot back a CuTe layout / TMA
             # descriptor, so clamp the packed KV extent to ONE
             # never-dereferenced token (every tile sees kv_left ==
-            # kv_right == 0, so no K/V load is ever issued) bound over
-            # storage guaranteed large enough: Q backs K (kh*d_qk <=
-            # t_q*qh*d_qk) and O backs V (kh*d_v <= t_q*qh*d_v).
+            # kv_right == 0, so no K/V load is ever issued). Q backs K
+            # (same element type, and kh*d_qk <= t_q*qh*d_qk); V must carry
+            # the INPUT element type, which no output buffer guarantees (O's
+            # dtype is independent), and Q's storage is not always large
+            # enough for kh*d_v — so V binds a cached zero stub (allocated
+            # once, off the execute hot path).
             t_kv = 1
             K = q_buf.as_strided((1, 1, kh, d_qk), (kh * d_qk, kh * d_qk, d_qk, 1), q_buf.storage_offset())
-            V = o_buf.as_strided((1, 1, kh, d_v), (kh * d_v, kh * d_v, d_v, 1), o_buf.storage_offset())
+            with _torch_stream_context(current_stream, dev):
+                V = self._dummy(f"thd_v_stub_{d_v}", dev, lambda: torch.zeros(kh * d_v, dtype=q_buf.dtype, device=dev)).as_strided(
+                    (1, 1, kh, d_v), (kh * d_v, kh * d_v, d_v, 1), 0
+                )
         else:
             K = self._thd_view(k_buf, self.k_desc, t_kv)
             V = self._thd_view(v_buf, self.v_desc, t_kv)
@@ -2512,13 +2518,19 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             # (AGENTS.md Rule 1). A zero-token packed K/V view cannot back a
             # CuTe layout, so clamp the packed KV extent to ONE
             # never-dereferenced token (every sequence's KV tile range is
-            # empty, so no K/V load is ever issued) bound over storage
-            # guaranteed large enough: Q backs K (kh*d_qk <= t_q*qh*d_qk) and
-            # O backs V (kh*d_v <= t_q*qh*d_v). All-zero LENGTHS over live
-            # storage launch normally through the dead-row path.
+            # empty, so no K/V load is ever issued). Q backs K (same element
+            # type, and kh*d_qk <= t_q*qh*d_qk); V must carry the INPUT
+            # element type, which no output buffer guarantees (O's dtype is
+            # independent), and Q's storage is not always large enough for
+            # kh*d_v — so V binds a cached zero stub (allocated once, off the
+            # execute hot path). All-zero LENGTHS over live storage launch
+            # normally through the dead-row path.
             t_kv = 1
             K = q_buf.as_strided((1, 1, kh, d_qk), (kh * d_qk, kh * d_qk, d_qk, 1), q_buf.storage_offset())
-            V = o_buf.as_strided((1, 1, kh, d_v), (kh * d_v, kh * d_v, d_v, 1), o_buf.storage_offset())
+            with _torch_stream_context(current_stream, dev):
+                V = self._dummy(f"thd_v_stub_{d_v}", dev, lambda: torch.zeros(kh * d_v, dtype=q_buf.dtype, device=dev)).as_strided(
+                    (1, 1, kh, d_v), (kh * d_v, kh * d_v, d_v, 1), 0
+                )
         else:
             K = _view(k_buf, self.k_desc, t_kv, kh, d_qk)
             V = _view(v_buf, self.v_desc, t_kv, kh, d_v)

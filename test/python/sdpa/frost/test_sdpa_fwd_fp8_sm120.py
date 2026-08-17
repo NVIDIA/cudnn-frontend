@@ -74,12 +74,11 @@ def _ref(qd, kd, vd, *, scale, is_causal=False, bottom_right=False, swa_window=N
     lse = torch.logsumexp(scores, dim=-1)
     if seq_lens_q is not None:
         # cuDNN dense padded-Q trim: rows at/past seq_len_q[b] write O := 0 /
-        # LSE := -inf and contribute nothing to the amaxes (softmax of a
-        # fully -inf row is NaN in torch; the trim replaces it).
+        # LSE := -inf (softmax of a fully -inf row is NaN in torch; the trim
+        # replaces it).
         slq = torch.as_tensor(seq_lens_q, device=dev, dtype=torch.long).view(b, 1, 1, 1)
         row_dead = i >= slq
         out = torch.where(row_dead, torch.zeros((), device=dev), out)
-        probs = torch.where(row_dead, torch.zeros((), device=dev), probs)
         lse = lse.masked_fill(row_dead.squeeze(-1), float("-inf"))
     # Fully-masked rows are -inf in logsumexp; the kernel writes -inf too.
     return out, lse
@@ -309,8 +308,9 @@ def test_fp8_sm120_single_kv_tile(mask, s):
     populations."""
     scale = 1.0 / math.sqrt(128)
     seq_lens_kv = [s] if mask == "none" else None
+    kwargs = {**_MASKS, "none_dense": _MASKS["none"]}[mask]
     for _ in range(3):
-        res = _run(1, 4, 4, s, s, scale=scale, sdpa_kwargs=_MASKS.get(mask, {}), seq_lens_kv=seq_lens_kv)
+        res = _run(1, 4, 4, s, s, scale=scale, sdpa_kwargs=kwargs, seq_lens_kv=seq_lens_kv)
         _check(*res)
 
 
@@ -324,6 +324,17 @@ def test_fp8_sm120_dense_flex_layout(layout):
     scale = 1.0 / math.sqrt(128)
     res = _run(2, 4, 4, 256, 256, scale=scale, sdpa_kwargs=dict(use_causal_mask=True), layout=layout)
     _check(*res)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_fp8_sm120_dense_flex_offered():
+    """The dense_flex capability is a DECLARED offer: a BHSD-contiguous (non
+    BSHD-physical) graph must be claimed by the row, not merely survive
+    engine selection. Guards the ``layouts={"bshd", "dense_flex"}`` entry."""
+    import cudnn
+
+    assert _fp8_graph_offers_sm120(cudnn.data_type.FP8_E4M3, cudnn.data_type.HALF, layout="bhsd")
 
 
 _O_TOL = {torch.bfloat16: 5e-2, torch.float8_e4m3fn: 1.5e-1, torch.float8_e5m2: 3.5e-1}
@@ -366,6 +377,29 @@ def test_fp8_sm120_fp8_out_envelope():
 
 @pytest.mark.L1
 @torch_fork_set_rng(seed=0)
+def test_fp8_sm120_fp8_out_dense_flex():
+    """fp8 O x dense_flex: the adapter's O normalization allocates an fp8
+    scratch and ``o_view.copy_(o_scratch)`` does a strided fp8 copy-back — a
+    torch path with historically uneven fp8 support."""
+    scale = 1.0 / math.sqrt(128)
+    res = _run(2, 4, 4, 256, 256, scale=scale, sdpa_kwargs=dict(use_causal_mask=True), layout="bhsd", o_dtype=torch.float8_e4m3fn, so_val=2.0)
+    _check(*res, tol_o=_O_TOL[torch.float8_e4m3fn])
+
+
+@pytest.mark.L1
+@torch_fork_set_rng(seed=0)
+def test_fp8_sm120_fp8_out_sink():
+    """fp8 O x sink: the sink rescales ``row_sum_inv`` before the direct
+    quantizing store, so a sink-scaled value must still land inside
+    ``cvt.rn.satfinite``'s saturation rather than corrupt the pair pack."""
+    scale = 1.0 / math.sqrt(128)
+    sinks = torch.randn(1, 4, 1, 1, dtype=torch.float32, device="cuda")
+    res = _run(2, 4, 2, 256, 256, scale=scale, sdpa_kwargs=dict(use_causal_mask=True), sinks=sinks, o_dtype=torch.float8_e4m3fn, so_val=2.0)
+    _check(*res, tol_o=_O_TOL[torch.float8_e4m3fn])
+
+
+@pytest.mark.L1
+@torch_fork_set_rng(seed=0)
 def test_fp8_sm120_fp8_out_seq_q_trim():
     """fp8 O x per-batch Q trim: rows at/past seq_len_q[b] zero-fill through
     the direct-store path."""
@@ -402,8 +436,7 @@ def test_fp8_sm120_d_envelope_offering():
 @torch_fork_set_rng(seed=0)
 def test_fp8_sm120_sink(mask):
     """Attention sink: per-Q-head logit in the softmax denominator (virtual
-    column with no V row). O rescales, the LSE extends, and Amax_S follows
-    the SM100 fp8 cell's sink-extended convention."""
+    column with no V row). O rescales and the LSE extends by the sink term."""
     scale = 1.0 / math.sqrt(128)
     sinks = torch.randn(1, 4, 1, 1, dtype=torch.float32, device="cuda")
     kwargs = dict(use_causal_mask=True) if mask == "causal" else {}
@@ -488,7 +521,7 @@ def test_fp8_sm120_e5m2(mask):
     """E5M2 inputs: the MMA tag and the P-quantization target follow the
     input dtype (P is cast to e5m2, Scale_S maps it onto e5m2's range).
     E5M2's 2-bit mantissa doubles the P-quantization floor, hence the wider
-    O tolerance; Amax_S / Amax_O are fp32 pre-cast values and keep theirs."""
+    O tolerance; Amax_O is a fp32 pre-cast value and keeps its own."""
     scale = 1.0 / math.sqrt(128)
     res = _run(2, 4, 4, 256, 256, scale=scale, sdpa_kwargs=_MASKS[mask], io_dtype=torch.float8_e5m2)
     _check(*res, tol_o=1e-1)
@@ -562,8 +595,8 @@ def _fp8_graph_offers_sm120(io_dtype, o_dtype, D=128, D_v=None, sink=False, layo
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_fp8_sm120_sink_offered():
-    """Sink graphs are served (SM100 fp8 Amax_S semantics: the sink extends
-    the softmax denominator; P carries no sink column)."""
+    """Sink graphs are served (the sink extends the softmax denominator as a
+    virtual column; P carries no sink column)."""
     import cudnn
 
     assert _fp8_graph_offers_sm120(cudnn.data_type.FP8_E4M3, cudnn.data_type.HALF, sink=True)
@@ -1143,6 +1176,17 @@ def test_fp8_sm120_thd_zero_length_sequence():
     ZERO keys inside a live launch: its rows must come back O := 0 with
     LSE := -inf through the kernel's row_sum <= 0 guard, not stale memory."""
     _run_thd_fp8(seq_q_lens=[128, 0, 64], seq_kv_lens=[100, 0, 0], is_causal=True, check_stats=True, stats_layout="token_major")
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=57)
+def test_fp8_sm120_thd_all_kv_zero():
+    """EVERY sequence has zero keys: all Q rows are dead and must come back
+    O := 0 / LSE := -inf through the kernel's row_sum <= 0 guard. This shape
+    also exercises the adapter's all-KV-zero clamp, whose V binding is a
+    zero stub carrying the INPUT dtype (Q's storage cannot back V when
+    kh*d_v exceeds it, and O's dtype is independent of the input's)."""
+    _run_thd_fp8(seq_q_lens=[200, 150], seq_kv_lens=[0, 0], is_causal=False, check_stats=True, stats_layout="token_major")
 
 
 @pytest.mark.L0
