@@ -290,6 +290,7 @@ class BlockScaledMoEGroupedGemmDgluKernel:
 
         self.sf_vec_size = sf_vec_size
         self.expert_cnt = expert_cnt
+        self.use_single_group_runtime_offsets = use_single_group_runtime_offsets
         self.acc_dtype: Type[cutlass.Numeric] = acc_dtype
         self.use_2cta_instrs = use_2cta_instrs
         self.cluster_shape_mn = cluster_shape_mn
