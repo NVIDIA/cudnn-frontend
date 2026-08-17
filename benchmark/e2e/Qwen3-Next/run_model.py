@@ -37,12 +37,15 @@ from _perfshare import pick_sm100, profile_and_report  # noqa: E402
 
 def _wire_sdpa_attention():
     """FLA's full-attention layer hard-requires flash-attn; substitute torch SDPA
-    (which dispatches to cuDNN's fused attention on SM100)."""
+    pinned to cuDNN's fused attention (so the full-attention layers are counted as
+    cuDNN, not whichever backend torch would auto-select)."""
     import fla.layers.attn as fla_attn
+    from torch.nn.attention import SDPBackend, sdpa_kernel
 
     def _sdpa_flash(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False, window_size=(-1, -1), **kw):
         qt, kt, vt = (x.transpose(1, 2) for x in (q, k, v))  # [B,L,H,D] -> [B,H,L,D]
-        o = F.scaled_dot_product_attention(qt, kt, vt, is_causal=causal, scale=softmax_scale, dropout_p=dropout_p)
+        with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
+            o = F.scaled_dot_product_attention(qt, kt, vt, is_causal=causal, scale=softmax_scale, dropout_p=dropout_p)
         return o.transpose(1, 2)
 
     fla_attn.flash_attn_func = _sdpa_flash

@@ -48,9 +48,10 @@ _CATEGORIES = (
 
 def pick_sm100():
     for i in range(torch.cuda.device_count()):
-        if torch.cuda.get_device_properties(i).major >= 10:
+        p = torch.cuda.get_device_properties(i)
+        if 100 <= p.major * 10 + p.minor < 120:  # SM100-family (Blackwell); the fused engine is not on SM120
             return torch.device(f"cuda:{i}")
-    raise SystemExit("no SM100 (Blackwell) device")
+    raise SystemExit("no SM100-family (Blackwell) device; the fused SwiGLU-MLP engine requires one")
 
 
 def categorize(name):
@@ -115,7 +116,7 @@ def profile_and_report(model, ids, *, step=_default_step, warmup=3, iters=10, ex
         total += t
 
     kernel_ms = total / 1e3
-    print(f"\nfwd+bwd training step (eager):")
+    print("\nfwd+bwd training step (eager):")
     print(f"  wall (min over {iters}):   {best:.3f} ms")
     print(f"  GPU kernel self-time:      {kernel_ms:.3f} ms")
     if best > kernel_ms:  # different iterations -> only an approximate host/overhead gap

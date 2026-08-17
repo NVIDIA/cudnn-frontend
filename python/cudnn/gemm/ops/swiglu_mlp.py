@@ -67,6 +67,8 @@ def _autotune(g, handle, var_pack):
     g.check_support()
     g.build_plans(cudnn.build_plan_policy.ALL)
     n = g.get_execution_plan_count()
+    if n == 0:
+        raise RuntimeError("cudnn.gemm.swiglu_mlp: no execution plan was generated for this graph")
     dev = next(iter(var_pack.values())).device
     times = [float("inf")] * n
     errors = {}
@@ -220,7 +222,7 @@ def _frost_dswiglu(dout2, Wd, gate, up):
     e = _FROST_DSWIGLU_CACHE.get(key)
     if e is None:
         tn = 256 if interm >= 256 else 128
-        cfg = next(c for c in CATALOG if c.cta_tile_m == 128 and c.cta_tile_n == tn and c.cta_tile_k_bytes == 128 and c.cgrp_size_m == 1 and c.cgrp_size_n == 1)
+        cfg = next(c for c in CATALOG if (c.cta_tile_m, c.cta_tile_n, c.cta_tile_k_bytes, c.cgrp_size_m, c.cgrp_size_n) == (128, tn, 128, 1, 1))
         g = cudnn.pygraph(io_data_type=_BF16, intermediate_data_type=_FP32, compute_data_type=_FP32)
         DY = g.tensor(name="dy", dim=[1, M, H], stride=[M * H, H, 1])
         # FROST's TN mainloop needs B contiguous in K(=H); the natural down weight
