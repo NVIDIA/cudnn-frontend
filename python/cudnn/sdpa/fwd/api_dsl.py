@@ -1502,7 +1502,6 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             if seq_kv_lens is not None
             else self._dummy("seq_kv", device, lambda: torch.zeros(b, dtype=torch.int32, device=device))
         )
-        o_desc_dummy = self._dummy("o_desc", device, lambda: torch.zeros(1, dtype=torch.int64, device=device))
 
         amax_o_buf = amax_o.reshape(-1)[:1] if amax_o is not None else self._dummy("amax_o", device, lambda: torch.zeros(1, dtype=torch.float32, device=device))
         # Must be enqueued on the SAME stream as the kernel launch below, else the
@@ -1523,12 +1522,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             amax_o_buf,
             sinks_t,
             seq_kv_t,
-            o_desc_dummy,
             (b, h_q, h_kv, sq, skv, 0),
             cutlass.Float32(scale_softmax_log2),
-            cutlass.Int32(0),  # n_thd_units (dense)
-            cutlass.Int32(0),  # total_q_sf_tiles (dense — kernel folds it out)
-            cutlass.Int32(0),  # total_kv_sf_tiles
             stream=current_stream,
         )
         if o_needs_copy_back:
@@ -1595,7 +1590,6 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             if seq_kv_lens is not None
             else self._dummy("seq_kv", device, lambda: torch.zeros(b, dtype=torch.int32, device=device))
         )
-        o_desc_dummy = self._dummy("o_desc", device, lambda: torch.zeros(1, dtype=torch.int64, device=device))
 
         # amax_o: the kernel atomicMax'es into this buffer, so it MUST start
         # at 0. It accumulates max|o_scaled| (pre-cast, exact even for FP8 O);
@@ -1614,11 +1608,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             lse,
             sinks_t,
             seq_kv_t,
-            o_desc_dummy,
             (b, h_q, h_kv, sq, skv, 0),
             cutlass.Float32(scale_softmax_log2),
             cutlass.Float32(o_scale_fused),
-            cutlass.Int32(0),  # n_thd_units (dense)
             amax_o_buf,
             stream=current_stream,
         )

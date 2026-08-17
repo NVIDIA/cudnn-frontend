@@ -2209,15 +2209,8 @@ def _host(
     amax_o_tensor: cute.Tensor,
     sinks_tensor: cute.Tensor,
     seq_kv_lens_tensor: cute.Tensor,
-    # Unused ABI slot (legacy THD per-batch O-descriptor array; leg removed).
-    o_desc_words: cute.Tensor,
     problem_size: Tuple[int, int, int, int, int, int],
     scale_softmax_log2: cutlass.Float32,
-    # Unused ABI slots (legacy THD flat-grid unit count + packed SF-tile
-    # totals; leg removed).
-    n_thd_units: cutlass.Int32,
-    total_q_sf_tiles: cutlass.Int32,
-    total_kv_sf_tiles: cutlass.Int32,
     stream: _cuda_driver.CUstream = None,
 ) -> None:
     """MXFP8 host launcher — builds TMA descriptors for Q/K/V/O + SF tensors."""
@@ -2434,13 +2427,6 @@ def compile(  # noqa: A001
         stride_order=(0,),
         assumed_align=16,
     )
-    # Unused 1-elem ABI slot (legacy THD per-batch O-descriptor array).
-    fake_o_desc = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int64,
-        (1,),
-        stride_order=(0,),
-        assumed_align=16,
-    )
     return cute.compile(
         _host,
         fake_q,
@@ -2454,12 +2440,8 @@ def compile(  # noqa: A001
         fake_amax_o,
         fake_sinks,
         fake_seq_kv_lens,
-        fake_o_desc,
         (b, qh, kh, sq, skv, 0),
         cutlass.Float32(0.0),
-        cutlass.Int32(0),
-        cutlass.Int32(_q_sf_tiles),
-        cutlass.Int32(_kv_sf_tiles),
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
     )

@@ -1821,13 +1821,9 @@ def _host(
     lse_tensor: Optional[cute.Tensor],
     sinks_tensor: cute.Tensor,
     seq_kv_lens_tensor: cute.Tensor,
-    # Unused ABI slot (legacy THD per-batch O-descriptor array; leg removed).
-    o_desc_words: cute.Tensor,
     problem_size: Tuple[int, int, int, int, int, int],
     scale_softmax_log2: cutlass.Float32,
     o_scale_fused: cutlass.Float32,
-    # Unused ABI slot (legacy THD flat-grid unit count; leg removed).
-    n_thd_units: cutlass.Int32,
     amax_o_tensor: cute.Tensor,
     stream: _cuda_driver.CUstream = None,
 ) -> None:
@@ -1966,13 +1962,6 @@ def compile(b: int = 1, qh: int = 1, kh: int = 1, sq: int = 256, skv: int = 128,
         stride_order=(0,),
         assumed_align=16,
     )
-    # Unused 1-elem ABI slot (legacy THD per-batch O-descriptor array).
-    fake_o_desc = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int64,
-        (1,),
-        stride_order=(0,),
-        assumed_align=16,
-    )
     fake_amax_o = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32,
         (1,),
@@ -1988,11 +1977,9 @@ def compile(b: int = 1, qh: int = 1, kh: int = 1, sq: int = 256, skv: int = 128,
         fake_lse,
         fake_sinks,
         fake_seq_kv_lens,
-        fake_o_desc,
         (b, qh, kh, sq, skv, 0),
         cutlass.Float32(0.0),
         cutlass.Float32(0.0),
-        cutlass.Int32(0),
         fake_amax_o,
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
