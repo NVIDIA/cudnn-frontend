@@ -29,7 +29,7 @@ from cutlass.cute.nvgpu import OperandMajorMode
 
 from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.tensor_adapter import framework_dtype
-from cudnn.jax import call, gemm_operand_spec, zeros_init
+from cudnn.jax import call, gemm_operand_spec
 from ..moe_utils import MoEWeightMode
 from ..unfused.jax_api import _pointer_count, _prob_spec
 from .moe_grouped_gemm_glu_bias import MoEGroupedGemmGluBiasBf16Kernel
@@ -101,9 +101,8 @@ def grouped_gemm_glu_jax_sm100(
     ``n`` is the full weight N before the GLU split; ``d`` comes back ``(m, n // 2, 1)``.
     ``linear_offset`` defaults per ``act_func`` (1.0 for ``"geglu"``, 0.0 for
     ``"swiglu"``) and is a compile-time constant of the traced call. Returns
-    ``(d_tensor, c_tensor)`` with ``c_tensor`` None unless ``generate_c``; rows
-    at/past ``padded_offsets[-1]`` come back zero-filled (the outputs are donated
-    zero-initialized buffers).
+    ``(d_tensor, c_tensor)`` with ``c_tensor`` None unless ``generate_c``. Rows
+    at/past ``padded_offsets[-1]`` are unspecified.
     """
     c_dtype = _convert_to_cutlass_data_type(c_dtype)
     d_dtype = _convert_to_cutlass_data_type(d_dtype)
@@ -207,10 +206,13 @@ def grouped_gemm_glu_jax_sm100(
         ),
         input_spec=(operand, None, None, None, _prob_spec()),
         output_spec=(operand, operand, None),
-        # All three donated: c/d for the trailing-unit-dim layout spec (and defined
-        # bytes past the last offset); the workspace because the helper kernel writes
-        # the per-expert TMA descriptors into it (XLA inputs are immutable).
-        initialized_outputs={0: zeros_init, 1: zeros_init, 2: zeros_init},
+        # Only zero what the kernel does not write. Zero-filling an output the
+        # kernel overwrites is a full-size device write on every dispatch, and it
+        # scales with the output -- the dominant host-visible cost of the JAX path.
+        # Nothing here qualifies: the kernel writes d/c over the addressed rows and the
+        # descriptor helper writes the workspace before the kernel reads it. Rows at or
+        # past padded_offsets[-1] are consequently unspecified, matching what the torch
+        # wrapper has always returned from empty_strided.
         kernel=kernel,
         n=int(n),
         k=int(k),
