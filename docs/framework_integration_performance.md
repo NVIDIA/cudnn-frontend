@@ -90,9 +90,13 @@ WG = g.tensor(dim=[1, H, I], stride=list(Wg.t().unsqueeze(0).stride()), data_typ
 Fusing the activation into the GEMM is a genuine kernel-time win, not just a launch saving.
 A SwiGLU MLP forward — `gate_gemm + up_gemm + SiLU + mul` — compiles to ONE cuDNN kernel and
 runs 1.05-1.20× a 2-cuBLAS-GEMM + torch-activation baseline (eager and under graph replay,
-every token count). In the backward, the dSwiGLU as a matmul epilogue (`matmul(dout,Wd)`
-fused with the elementwise) is ~2.3× the unfused GEMM + elementwise. Express the fusion in
-one graph; let cuDNN pick the fused engine.
+every token count). That same kernel also emits its two pre-activations as extra outputs, so
+the backward reads them instead of recomputing two GEMMs — the actual backward win: parity
+with a torch autograd MLP that likewise saves them, where recomputing ran ~1.3× slower. A
+dSwiGLU-as-matmul-epilogue fusion (`matmul(dout,Wd)` fused with the elementwise) is ~2.3× the
+unfused GEMM + elementwise *in isolation*, but with the pre-activations saved the full
+backward is GEMM-bound and does not surface that stage win — so express fusions in one graph,
+but always measure the whole step, not the fused stage alone.
 
 ### 7. Mixing libraries in a hot eager loop
 Interleaving cuDNN `execute` with cuBLAS/`torch.mm`/other-library calls, op by op, is the
