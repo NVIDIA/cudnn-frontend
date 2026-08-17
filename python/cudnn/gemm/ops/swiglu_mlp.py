@@ -10,11 +10,13 @@ The forward fuses the gate GEMM, the up GEMM, ``SiLU`` and the multiply into ONE
 cuDNN kernel (the FORT-native runtime-fusion engine on SM100), which beats two
 cuBLAS GEMMs plus a torch activation by ~1.05-1.20x on the Qwen3.5-27B MLP shape;
 the down projection is a separate GEMM (a three-GEMM single graph does not
-compile). Backward recomputes gate/up, then runs the ``dh = dout @ Wd`` dgrad GEMM
-and the dSwiGLU elementwise as ONE fused FROST (cuTeDSL) kernel — ~1.5x the
-separate dh GEMM + two pointwise kernels (CUDA-graph kernel time, Qwen3.5-27B MLP
-shape, SM100); set ``CUDNN_GEMM_SWIGLU_FROST_BWD=0`` to fall back to the pointwise
-path. Numerically matches torch to bf16 noise on the output and all four gradients.
+compile). Backward recomputes gate/up and runs the dSwiGLU as two cuDNN pointwise
+kernels. (An opt-in ``CUDNN_GEMM_SWIGLU_FROST_BWD=1`` path fuses the ``dh = dout @
+Wd`` dgrad GEMM with the dSwiGLU into one FROST kernel; it is OFF by default because
+FROST's TN mainloop needs a K-contiguous B, so the natural down weight must be
+transposed each backward, and that copy currently costs more than the fused kernel
+saves — a net loss until FROST accepts an N-major B.) Numerically matches torch to
+bf16 noise on the output and all four gradients.
 
 Weights are the ``[I, H]`` / ``[H, I]`` ``nn.Linear`` tensors; they enter the
 GEMMs transposed and are bound as strided ``.t()`` views (cuDNN reads them
@@ -33,8 +35,11 @@ import cudnn
 _BF16 = cudnn.data_type.BFLOAT16
 _FP32 = cudnn.data_type.FLOAT
 
-# One cuDNN handle per device; plans/workspaces are device-bound so every cache
-# key below also carries device.index. Value: [handle, last_stream].
+# One cuDNN handle -- and its plans + workspaces -- per (device, stream). The
+# handle's stream is bound once at creation, and the caches below key on the same
+# (device.index, stream), so two streams that use the op concurrently never share a
+# handle or a scratch workspace (which would race and silently corrupt grads under
+# DDP comm streams / explicit torch.cuda.stream() regions / multi-threaded backward).
 _HANDLES = {}
 _MM_CACHE = {}
 _SWIGLU_CACHE = {}
@@ -43,20 +48,21 @@ _AUTOTUNE_ITERS = 20
 
 
 def _handle(device):
-    """One cuDNN handle per CUDA device. ``set_stream`` is called only when the
-    current stream changes (it costs ~5 us/call). Assumes a handle is not used
-    from two streams concurrently (true for a single-stream training loop)."""
-    entry = _HANDLES.get(device.index)
-    if entry is None:
-        with torch.cuda.device(device):
-            entry = [cudnn.create_handle(), None]  # [handle, last_stream]
-        _HANDLES[device.index] = entry
-    h, last_stream = entry
+    """The cuDNN handle for ``(device, current stream)``, its stream bound once at
+    creation. Returns ``(handle, stream)``; callers fold ``stream`` into their plan/
+    workspace cache key so per-stream state stays isolated. A stream serialises its
+    own kernels on the GPU, so a per-stream cached workspace is safe to reuse; the
+    only unsafe sharing -- one workspace/handle across two concurrent streams -- can
+    no longer happen."""
     stream = torch.cuda.current_stream(device).cuda_stream
-    if stream != last_stream:
-        cudnn.set_stream(handle=h, stream=stream)
-        entry[1] = stream
-    return h
+    key = (device.index, stream)
+    h = _HANDLES.get(key)
+    if h is None:
+        with torch.cuda.device(device):
+            h = cudnn.create_handle()
+            cudnn.set_stream(handle=h, stream=stream)
+        _HANDLES[key] = h
+    return h, stream
 
 
 def _autotune(g, handle, var_pack):
@@ -95,9 +101,9 @@ def _autotune(g, handle, var_pack):
 
 def _mm(a2, b2):
     """``[M,K] @ [K,N] -> [M,N]`` on cuDNN (cached, autotuned graph keyed by shape/stride/dtype/device)."""
-    h = _handle(a2.device)
+    h, stream = _handle(a2.device)
     a, b = a2.unsqueeze(0), b2.unsqueeze(0)
-    key = (tuple(a.shape), tuple(a.stride()), tuple(b.shape), tuple(b.stride()), a.dtype, a2.device.index)
+    key = (tuple(a.shape), tuple(a.stride()), tuple(b.shape), tuple(b.stride()), a.dtype, a2.device.index, stream)
     e = _MM_CACHE.get(key)
     if e is None:
         g = cudnn.pygraph(handle=h, compute_data_type=_FP32)
@@ -121,12 +127,12 @@ def _mm(a2, b2):
 def _swiglu_act(x, Wg, Wu):
     """Fused ``h = silu(x@Wg^T) * (x@Wu^T)`` in ONE cuDNN kernel. ``x:[M,H]``,
     ``Wg,Wu:[I,H]`` bound as strided ``.t()`` views (no transpose copy)."""
-    h = _handle(x.device)
+    h, stream = _handle(x.device)
     M, H = x.shape
     interm = Wg.shape[0]
     xv = x.unsqueeze(0)
     wg, wu = Wg.t().unsqueeze(0), Wu.t().unsqueeze(0)  # [1,H,interm] column-major views, no copy
-    key = (M, H, interm, x.dtype, xv.stride(), wg.stride(), wu.stride(), x.device.index)
+    key = (M, H, interm, x.dtype, xv.stride(), wg.stride(), wu.stride(), x.device.index, stream)
     e = _SWIGLU_CACHE.get(key)
     if e is None:
         g = cudnn.pygraph(handle=h, compute_data_type=_FP32)
@@ -155,9 +161,9 @@ def _dswiglu(dh, gate, up):
     """Fused dSwiGLU: ``dup = dh*silu(gate)``, ``dgate = dh*up*silu'(gate)`` given
     ``dh,gate,up:[M,I]`` — two single-output cuDNN pointwise kernels (a single
     graph writing both outputs hits unsupported multi-output fusion)."""
-    h = _handle(dh.device)
+    h, stream = _handle(dh.device)
     M, interm = dh.shape
-    key = (M, interm, dh.dtype, dh.device.index)
+    key = (M, interm, dh.dtype, dh.device.index, stream)
     e = _DSWIGLU_CACHE.get(key)
     if e is None:
 
@@ -201,18 +207,27 @@ def _dswiglu(dh, gate, up):
 
 
 _FROST_DSWIGLU_CACHE = {}
-_FROST_BWD = os.environ.get("CUDNN_GEMM_SWIGLU_FROST_BWD", "1") != "0"
+# OFF by default: the FROST dgrad+dSwiGLU kernel is correct and competitive, but it
+# needs a K-contiguous B, so the natural [H,I] down weight is transposed every
+# backward -- that copy currently outweighs the fused kernel's saving (net loss vs
+# the pointwise path). Opt in once FROST accepts an N-major B (then no copy).
+_FROST_BWD = os.environ.get("CUDNN_GEMM_SWIGLU_FROST_BWD", "0") != "0"
 
 
 def _frost_dswiglu(dout2, Wd, gate, up):
     """Fused backward dgrad + dSwiGLU in ONE FROST kernel: ``dh = dout2 @ Wd`` with
     ``dup = dh*silu(gate)`` and ``dgate = dh*silu'(gate)*up`` as the GEMM epilogue,
     so the separate dh GEMM + two dSwiGLU pointwise kernels of :func:`_dswiglu`
-    collapse into a single cuTeDSL bare-launch kernel (no FE wrapper tax, no dh
-    round-trip to HBM). ``dout2:[M,H]``, ``Wd:[H,I]`` (natural down weight), ``gate,
-    up:[M,I]``. Returns ``(dgate, dup):[M,I]``. Raises on any unsupported case so
-    the caller falls back to the pointwise path. CUDA-graph kernel time on the
-    Qwen3.5-27B MLP shape: ~1.5x the recompute+pointwise backward (SM100)."""
+    collapse into a single cuTeDSL bare-launch kernel. ``dout2:[M,H]``, ``Wd:[H,I]``
+    (natural down weight), ``gate, up:[M,I]``. Returns ``(dgate, dup):[M,I]``. Raises
+    on any unsupported case so the caller falls back to the pointwise path.
+
+    The kernel itself is competitive, but FROST's TN mainloop needs a K-contiguous
+    B, so the ``[H,I]`` weight is transposed to a contiguous ``[I,H]`` buffer on every
+    call (below). At the Qwen3.5-27B shape that copy (~0.37 ms of ~356 MB traffic) is
+    larger than the fused kernel's saving, so this path is a net LOSS versus the
+    pointwise backward and is OFF by default (see ``_FROST_BWD``). It becomes a win
+    once FROST accepts an N-major B and the copy is dropped."""
     from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
     from cudnn.gemm.frost.tile_config import CATALOG
 
@@ -240,7 +255,10 @@ def _frost_dswiglu(dout2, Wd, gate, up):
         e = (compiled, bd, out_by, aux_by)
         _FROST_DSWIGLU_CACHE[key] = e
     compiled, bd, out_by, aux_by = e
-    Wd_kc = Wd.t().contiguous().unsqueeze(0)  # [1,I,H]: K(=H)-contiguous view of the down weight
+    # Full transpose COPY (not a view): FROST's TN B must be K(=H)-contiguous, and
+    # the natural down weight [H,I] is I-contiguous. Recomputed every call (never
+    # cached: the optimizer updates Wd in place, so a cached transpose would go stale).
+    Wd_kc = Wd.t().contiguous().unsqueeze(0)  # [1,I,H]
     dgate = torch.empty(1, M, interm, device=dout2.device, dtype=dout2.dtype)
     dup = torch.empty(1, M, interm, device=dout2.device, dtype=dout2.dtype)
     compiled(
@@ -300,6 +318,23 @@ def swiglu_mlp(x, Wg, Wu, Wd):
     Returns:
         ``[..., H]`` (bf16). Differentiable w.r.t. all four inputs.
 
-    Requires an SM100 (Blackwell) device.
+    Requires an SM100 (Blackwell) device. Raises on a non-bf16 / non-CUDA input
+    or a shape mismatch (the kernels are bf16-only; other dtypes are not silently
+    reinterpreted).
     """
+    for name, t in (("x", x), ("Wg", Wg), ("Wu", Wu), ("Wd", Wd)):
+        if t.dtype != torch.bfloat16:
+            raise TypeError(f"cudnn.gemm.swiglu_mlp: {name} must be bfloat16, got {t.dtype}")
+        if t.device.type != "cuda":
+            raise ValueError(f"cudnn.gemm.swiglu_mlp: {name} must be a CUDA tensor, got device {t.device}")
+    H = x.shape[-1]
+    if x.dim() < 2 or Wg.dim() != 2 or Wu.dim() != 2 or Wd.dim() != 2:
+        raise ValueError(
+            f"cudnn.gemm.swiglu_mlp: expected x[...,H] and 2-D Wg/Wu[I,H], Wd[H,I]; got x{tuple(x.shape)} Wg{tuple(Wg.shape)} Wu{tuple(Wu.shape)} Wd{tuple(Wd.shape)}"
+        )
+    if Wg.shape != Wu.shape or Wg.shape[1] != H or Wd.shape[0] != H or Wd.shape[1] != Wg.shape[0]:
+        raise ValueError(
+            f"cudnn.gemm.swiglu_mlp: shape mismatch — x[...,{H}], Wg{tuple(Wg.shape)}, Wu{tuple(Wu.shape)}, Wd{tuple(Wd.shape)}; "
+            f"expected Wg/Wu = [I, {H}] and Wd = [{H}, I]"
+        )
     return _SwigluMLP.apply(x, Wg, Wu, Wd)

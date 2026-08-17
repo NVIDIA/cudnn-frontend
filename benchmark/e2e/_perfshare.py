@@ -15,9 +15,12 @@ import collections
 
 import torch
 
-# Kernel-name substrings -> category. First match wins, so order matters.
+# Kernel-name substrings -> category (the op the kernel implements, NOT the backend
+# that runs it). First match wins, so order matters. Backend names like "frost" /
+# "cutile" belong in backend() below, not here -- FROST serves the MLP dgrad too, so
+# bucketing it as linear-attention would miscount the headline category shares.
 _CATEGORIES = (
-    ("linear_attn", ("gdn", "delta", "chunk_gated", "wy_fast", "solve", "cumsum", "l2norm", "kda", "frost", "cutile")),
+    ("linear_attn", ("gdn", "delta", "chunk_gated", "wy_fast", "solve", "cumsum", "l2norm", "kda")),
     ("full_attn", ("flash", "fmha", "sdpa", "scaled_dot", "mha", "_attention")),
     ("gemm", ("gemm", "cutlass", "ampere", "sm100_tst", "nvjet", "cublas", "matmul", "wgrad", "dgrad", "tensorop")),
     ("norm", ("rmsnorm", "layernorm", "layer_norm", "rms_norm", "norm")),
