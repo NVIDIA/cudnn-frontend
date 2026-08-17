@@ -13,6 +13,8 @@ import re
 
 import cudnn
 import cudnn.gemm.frost  # noqa: F401  (installs recorder)
+import dataclasses
+
 import pytest
 import torch
 
@@ -2010,6 +2012,103 @@ def test_sm107_block_scale_matmul_multi_mma_m(combo, cta_group, cta_m, cta_n):
 )
 def test_sm107_block_scale_matmul_shapes_and_clusters(combo, config_name, M, N, K):
     _run_bs_numeric(combo, config_name, M, N, K)
+
+
+@requires_sm107
+@pytest.mark.parametrize("combo", ["nvfp4", "mxfp8"])
+@pytest.mark.parametrize(
+    "config_name",
+    [
+        "CONFIG_sm107_128x128x128_128x128x64_cluster4x1_2ctamma",
+        "CONFIG_sm107_128x128x128_128x128x64_cluster4x2_2ctamma",
+        "CONFIG_sm107_256x256x128_128x256x64_cluster2x4_2ctamma",
+        "CONFIG_sm107_128x128x128_128x128x64_cluster4x1_1ctamma",
+        "CONFIG_sm107_128x128x128_128x128x64_cluster1x4_1ctamma",
+        "CONFIG_sm107_128x128x128_128x128x64_cluster2x2_1ctamma",
+    ],
+)
+def test_sm107_block_scale_mixed_cga(combo, config_name):
+    """Mixed CGA rides along with no caller change: any config whose cluster is
+    wider than the MMA mode's minimum launches it as the PREFERRED shape plus that
+    minimum as the fallback. The tile decomposition is the identity map for either
+    cluster shape, so both kinds cover the problem exactly once; only the multicast
+    masks, mbarrier arrival counts and rank math follow the shape the CTA actually
+    landed in. M is large enough that the grid outruns what the preferred clusters
+    hold resident, which is when the device substitutes the fallback shape."""
+    cta_group = 2 if config_name.endswith("_2ctamma") else 1
+    cfg = by_name(config_name.rsplit("_", 1)[0])
+    assert C._mixed_cga_fallback(cfg, cta_group, f"sm107_block_scale_matmul_{cta_group}ctamma.py") == (cta_group, 1)
+    _run_bs_numeric(combo, config_name, 1920, 1920, 512)
+
+
+@requires_sm107
+@pytest.mark.parametrize("cta_group", [1, 2])
+def test_mixed_cga_fallback_is_the_mma_mode_minimum(cta_group):
+    """The fallback shape is derived, never passed: one CTA for a 1-CTA MMA, the
+    pair for a 2-CTA one — and a config already AT that minimum has nothing to
+    fall back to, so it launches as a plain fixed cluster."""
+    tmpl = f"sm107_block_scale_matmul_{cta_group}ctamma.py"
+    assert C.min_fallback_cluster(cta_group) == (cta_group, 1)
+    wide = by_name("CONFIG_sm107_128x128x128_128x128x64_cluster4x2")
+    assert C._mixed_cga_fallback(wide, cta_group, tmpl) == (cta_group, 1)
+    minimal = by_name(f"CONFIG_sm107_128x128x128_128x128x64_cluster{cta_group}x1")
+    assert C._mixed_cga_fallback(minimal, cta_group, tmpl) is None
+
+
+@requires_sm107
+def test_mixed_cga_is_off_where_it_cannot_be_honored(monkeypatch):
+    """Every gate is a fact, not a knob: the GPU's ability to substitute clusters,
+    whether the template consumes the fallback constant at all (an unported one
+    would hang — its cluster constants are baked to the preferred shape), and
+    whether the config pins the N-super-block walk (not invariant across the two
+    cluster shapes)."""
+    wide = by_name("CONFIG_sm107_128x128x128_128x128x64_cluster4x2")
+    sm107_tmpl = "sm107_block_scale_matmul_2ctamma.py"
+    assert C._mixed_cga_fallback(wide, 2, sm107_tmpl) == (2, 1)
+
+    # Template that never reads the constant -> no fallback attached. The MoE
+    # ones stay that way: their fixed-grid persistent scheduler strides by a
+    # host-computed cluster count, which mixed clusters invalidate.
+    moe_tmpl = "sm100_moe_grouped_block_scale_matmul_fwd_2ctamma.py"
+    assert not C._template_reads_fallback_cluster(moe_tmpl)
+    assert C._mixed_cga_fallback(wide, 2, moe_tmpl) is None
+
+    # Substitution is a floor, not a range: every part from SM 10.0 up can do it.
+    assert C._mixed_cga_supported(100) and C._mixed_cga_supported(110)
+    # A pre-Blackwell part -> plain fixed cluster, as before.
+    monkeypatch.setattr(C, "_current_arch", lambda: 90)
+    assert not C._mixed_cga_supported()
+    assert C._mixed_cga_fallback(wide, 2, sm107_tmpl) is None
+    monkeypatch.undo()
+
+    # A pinned N-super-block walk -> skipped rather than silently mis-tiled.
+    pinned = dataclasses.replace(wide, tile_swizzle_n=8)
+    assert C._mixed_cga_fallback(pinned, 2, sm107_tmpl) is None
+
+    # The escape hatch for A/B measurement.
+    monkeypatch.setenv("CUDNN_FROST_DISABLE_MIXED_CGA", "1")
+    assert C._mixed_cga_fallback(wide, 2, sm107_tmpl) is None
+
+
+@requires_sm107
+def test_mixed_cga_ported_templates_attach_a_fallback():
+    """A ported template on a wide-cluster config launches with both shapes and
+    still computes the same result; an unported one renders exactly as it did
+    before mixed CGA existed."""
+    sm100_cfg = "CONFIG_sm100_128x128x128_128x128x32_cluster4x2_2ctamma"
+    _run_bs_numeric("nvfp4", sm100_cfg, 512, 512, 512)
+    g = _build_nvfp4_graph(256, 256, 512)
+    src = _plan(g, **_kw(sm100_cfg)).generated_path.read_text()
+    assert "fallback_cluster=fallback_cluster_shape_mnk" in src
+    assert "fallback_cluster_shape_mnk = (2, 1, 1)" in src
+    # What makes the tile walk the identity map for BOTH shapes: the renderer
+    # pins the N-super-block width, so _auto_swizzle_w const-folds to 1.
+    assert "tile_swizzle_n = 1" in src
+
+    # Already-minimal cluster -> nothing to fall back to, plain fixed launch.
+    minimal_cfg = "CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma"
+    src = _plan(_build_nvfp4_graph(256, 256, 512), **_kw(minimal_cfg)).generated_path.read_text()
+    assert "fallback_cluster_shape_mnk = None" in src
 
 
 @requires_sm107

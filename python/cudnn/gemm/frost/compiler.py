@@ -484,6 +484,8 @@ def _render_tile_constants(
     chain: FusionChain,
     cta_group: int,
     use_tma: bool = True,
+    *,
+    fallback_cluster: tuple[int, int] | None = None,
 ) -> str:
     """Emit module-level tile + dtype constants for the config/chain, appended
     below the template's defaults (last assignment wins). TileConfig geometry is
@@ -607,7 +609,7 @@ def _render_tile_constants(
     ]
     # Persistent kernel always: double-TMEM + L2 N-super-block swizzle.
     # (acc_stages is emitted below, once the TMEM budget is known.)
-    lines.append(f"tile_swizzle_n = {cfg.tile_swizzle_n}")
+    lines.append(f"tile_swizzle_n = {1 if fallback_cluster is not None else cfg.tile_swizzle_n}")
     lines.append(f"swizzle_l2_budget_bytes = {_l2_swizzle_budget_bytes()}")
     # Multi-GEMM (parallel matmuls sharing the epilogue). Always emitted;
     # single-GEMM = (1, 1, 1). gemm_a_idx[g]/gemm_b_idx[g] pick GEMM g's operand
@@ -725,6 +727,7 @@ def _render_tile_constants(
         )
         lines.append(f"ab_stages = {new_ab}  # SMEM-D {smem_d_bytes}B fixed" f" + cast LOAD {cast_extra_per_stage}B/stage")
     lines.extend(_quant_device_imports(chain))
+    lines.extend(_mixed_cga_constants(cfg, cta_group, fallback_cluster))
     return "\n".join(lines)
 
 
@@ -890,12 +893,114 @@ def _grid_num_clusters(cfg: TileConfig, device=None) -> int:
     return max_active_clusters(cfg.cgrp_size_m * cfg.cgrp_size_n, device)
 
 
+def _cluster_mcast_patterns(cluster_m: int, cluster_n: int, cta_group: int) -> tuple[int, int]:
+    """(A, B) multicast bit patterns for a cluster shape, at CTA rank 0.
+
+    A is shared along N (one bit per n_rank, stride cluster_m); B along the M
+    pairs (one bit per MMA pair, stride cta_group). The kernel shifts each by
+    its own rank.
+    """
+    a_pattern = 0
+    for n_idx in range(cluster_n):
+        a_pattern |= 1 << (n_idx * cluster_m)
+    b_pattern = 0
+    for pair_idx in range(cluster_m // cta_group):
+        b_pattern |= 1 << (pair_idx * cta_group)
+    return a_pattern, b_pattern
+
+
+# Preferred-cluster substitution (CU_LAUNCH_ATTRIBUTE_PREFERRED_CLUSTER_DIMENSION)
+# is a property of the PART, like the B collector above — but unlike it, every
+# part from SM 10.0 up can do it, so this is a FLOOR, not a range: there is no
+# known ceiling to encode. (No driver check rides along: the attribute and
+# Blackwell support shipped together, so a part this new implies a driver that
+# knows it.)
+_MIXED_CGA_MIN_ARCH = 100
+
+
+def _mixed_cga_supported(arch: int | None = None) -> bool:
+    """Whether this GPU can group blocks into a preferred cluster and fall back
+    to a smaller one where the preferred does not fit — SM 10.0 and up."""
+    a = _current_arch() if arch is None else arch
+    return a is not None and a >= _MIXED_CGA_MIN_ARCH
+
+
+def min_fallback_cluster(cta_group: int) -> tuple[int, int]:
+    """The smallest cluster this MMA mode can fall back to: one CTA for a 1-CTA
+    MMA, and the 2-CTA pair for a 2-CTA one (the pair must stay inside a single
+    cluster). Smaller is better — it lets the device place a fallback cluster on
+    any leftover SM."""
+    return (cta_group, 1)
+
+
+@functools.lru_cache(maxsize=None)
+def _template_reads_fallback_cluster(template_file: str) -> bool:
+    """Whether a template implements mixed CGA — i.e. whether it consumes the
+    ``fallback_cluster_shape_mnk`` constant. Read off the source rather than a
+    hand-kept capability flag, so it cannot drift from what the template does."""
+    return "fallback_cluster_shape_mnk" in (_TEMPLATE_DIR / template_file).read_text()
+
+
+def _mixed_cga_fallback(cfg: TileConfig, cta_group: int, template_file: str) -> tuple[int, int] | None:
+    """The fallback cluster to attach to this launch, or ``None`` for a plain
+    fixed-cluster launch — byte-for-byte the pre-mixed-CGA behavior.
+
+    Nothing here is a caller knob: the shape is `min_fallback_cluster(cta_group)`
+    and the rest is facts. It is OFF when the GPU cannot substitute clusters,
+    when the template has not been ported (its cluster constants are baked to the
+    preferred shape, so a CTA landing in a smaller cluster would wait on arrivals
+    that never come — a hang, not a lost optimization), when the config's cluster
+    is ALREADY the minimum, when the preferred cluster is not an integer multiple
+    of it per dim (what the driver requires of the pair), and when the config pins
+    the N-super-block walk (that rasterization is not invariant across the two
+    cluster shapes).
+    """
+    if os.environ.get("CUDNN_FROST_DISABLE_MIXED_CGA"):
+        return None
+    if not _mixed_cga_supported():
+        return None
+    if not _template_reads_fallback_cluster(template_file):
+        return None
+    fallback = min_fallback_cluster(cta_group)
+    if fallback == (cfg.cgrp_size_m, cfg.cgrp_size_n) or cfg.tile_swizzle_n > 1:
+        return None
+    if cfg.cgrp_size_m % fallback[0] or cfg.cgrp_size_n % fallback[1]:
+        return None
+    return fallback
+
+
+def _mixed_cga_constants(cfg: TileConfig, cta_group: int, fallback_cluster: tuple[int, int] | None) -> list[str]:
+    """Constants for the kernel's runtime cluster-shape select.
+
+    The config's own cluster is the PREFERRED (wide) shape; ``fallback_cluster``
+    is the smaller one the device substitutes when a preferred cluster does not
+    fit. Everything else the kernel needs follows arithmetically from the cluster
+    dims it reads at runtime — only the multicast bit patterns are loop-built, so
+    both are precomputed here.
+    """
+    a_pref, b_pref = _cluster_mcast_patterns(cfg.cgrp_size_m, cfg.cgrp_size_n, cta_group)
+    if fallback_cluster is None:
+        a_fb, b_fb = a_pref, b_pref
+        shape = "None"
+    else:
+        a_fb, b_fb = _cluster_mcast_patterns(fallback_cluster[0], fallback_cluster[1], cta_group)
+        shape = f"({fallback_cluster[0]}, {fallback_cluster[1]}, 1)"
+    return [
+        f"fallback_cluster_shape_mnk = {shape}",
+        f"mixed_a_pattern_pref = {a_pref}",
+        f"mixed_b_pattern_pref = {b_pref}",
+        f"mixed_a_pattern_fb = {a_fb}",
+        f"mixed_b_pattern_fb = {b_fb}",
+    ]
+
+
 def _render_block_scale_tile_constants(
     cfg: TileConfig,
     chain: FusionChain,
     cta_group: int,
     *,
     use_tma_store_epi: bool = False,
+    fallback_cluster: tuple[int, int] | None = None,
 ) -> str:
     """Emit module-level constants for the block-scale matmul template.
 
@@ -1197,8 +1302,13 @@ def _render_block_scale_tile_constants(
         f"acc_gemm_stride = {acc_gemm_stride}",
         f"sfa_col_bases = {tuple(sfa_col_bases)}",
         f"sfb_col_bases = {tuple(sfb_col_bases)}",
-        f"tile_swizzle_n = {cfg.tile_swizzle_n}",
+        # Mixed CGA pins the walk to the identity map: the super-block
+        # rasterization is not invariant across the two cluster shapes.
+        f"tile_swizzle_n = {1 if fallback_cluster is not None else cfg.tile_swizzle_n}",
         f"swizzle_l2_budget_bytes = {_l2_swizzle_budget_bytes()}",
+        # Read off the PREFERRED cluster; a fallback cluster is a divisor of it,
+        # so these flags dominate and the multicast code path degenerates to the
+        # plain load when the runtime pattern names a single peer.
         f"multicast_a = {cfg.multicast_a}",
         f"multicast_b = {cfg.multicast_b(cta_group)}",
         "",
@@ -1338,6 +1448,7 @@ def _render_block_scale_tile_constants(
         # routed-group base offset = group_begin rows × this. NOT ab_dtype.width
         # (that is the packed Float4E2M1FNx2 8-bit type).
         lines.append(f"ab_data_elem_bits = {data_elem_bits}")
+    lines.extend(_mixed_cga_constants(cfg, cta_group, fallback_cluster))
     lines.extend(_quant_device_imports(chain))
     return "\n".join(lines)
 
@@ -1408,6 +1519,7 @@ def _render_template(
     from .kernel_registry import select_template
 
     tmpl = select_template(chain, config, cta_group, scheduler)
+    fallback_cluster = _mixed_cga_fallback(config, cta_group, tmpl.file)
     template_path = _TEMPLATE_DIR / tmpl.file
     src = template_path.read_text()
     # Strip the unused epilogue path FIRST so its @@INJECT_EPILOGUE@@ marker
@@ -1462,7 +1574,7 @@ def _render_template(
         align_reqs=_aux_align_reqs(chain, vec_bytes=vec_bytes_epi),
     )
     compile_aux_pass = _aux_call_block(aux_tensors, prefix="fake_")
-    tile_constants = _render_tile_constants(config, chain, cta_group, use_tma)
+    tile_constants = _render_tile_constants(config, chain, cta_group, use_tma, fallback_cluster=fallback_cluster)
     if snippets.tap_constants:
         tile_constants += "\n" + "\n".join(snippets.tap_constants)
     # Multi-output tap plumbing. Empty lists → markers expand to nothing (kernel
@@ -1569,6 +1681,7 @@ def _render_block_scale_template(
     config: TileConfig,
     cta_group: int,
     scheduler: str,
+    fallback_cluster: tuple[int, int] | None = None,
 ) -> str:
     """Render the block-scale matmul template. Picks TMA-store when
     _use_tma_store_epi allows, else STG; SF TMA descriptors are hardcoded in the
@@ -1588,7 +1701,7 @@ def _render_block_scale_template(
     host_aux_pass = _aux_call_block(aux_tensors)
     compile_aux_fakes = _aux_fake_block(aux_tensors, dynamic_strides=True, align_reqs=_aux_align_reqs(chain, vec_bytes=vec_bytes_epi))
     compile_aux_pass = _aux_call_block(aux_tensors, prefix="fake_")
-    tile_constants = _render_block_scale_tile_constants(config, chain, cta_group, use_tma_store_epi=use_tma)
+    tile_constants = _render_block_scale_tile_constants(config, chain, cta_group, use_tma_store_epi=use_tma, fallback_cluster=fallback_cluster)
     if snippets.tap_constants:
         tile_constants += "\n" + "\n".join(snippets.tap_constants)
 
@@ -2793,6 +2906,12 @@ def jit_from_cudnn_graph(
     `tile_config.CATALOG`. Execution strategy: ``cta_group`` ∈ {1, 2} and
     ``scheduler`` ∈ {"clc", "static"} pick the template (mainloop auto-detected).
     ``force_stg_epi=True`` skips the TMA-store path even when its gate accepts.
+
+    Mixed CGA needs no argument and no caller change: where the GPU and the
+    template both support it, the launch carries ``config``'s cluster as the
+    PREFERRED shape plus the smallest fallback the MMA mode allows, so the device
+    fills the SMs a wide fixed cluster leaves idle (:func:`_mixed_cga_fallback`).
+    Everywhere else the launch is the plain fixed cluster it always was.
     """
     chain, binding = analyze_with_binding(graph)
     _dtype_reason = dtype_arch_reject(chain, _current_arch())
@@ -3322,6 +3441,7 @@ def _jit_block_scale(
     _arch_reason = _tmpl.active_reject(config)
     if _arch_reason is not None:
         raise NotImplementedError(_arch_reason)
+    fallback_cluster = _mixed_cga_fallback(config, cta_group, _tmpl.file)
     _compute_output_vec_bytes(chain)  # eager: rejects bad output alignment
     vec_bytes_epi = _epi_vec_bytes(chain, config, cta_group)
     _check_block_quant_supported(chain, vec_bytes_epi, config, cta_group)
@@ -3332,7 +3452,7 @@ def _jit_block_scale(
         output_elem_bytes=DTYPE_BYTES[chain.output_dtype],
         use_tma_store=use_tma,
     )
-    src = _render_block_scale_template(chain, snippets, config, cta_group, scheduler)
+    src = _render_block_scale_template(chain, snippets, config, cta_group, scheduler, fallback_cluster=fallback_cluster)
     mod = _import_kernel(src)
     digest = hashlib.sha256(src.encode("utf-8")).hexdigest()[:16]
     return CompiledFusedGemm(
@@ -3671,7 +3791,7 @@ def _jit_moe_block_scale(
         output_elem_bytes=DTYPE_BYTES[chain.output_dtype],
         use_tma_store=(not _FORCE_STG_EPI) and _use_tma_store_epi(chain, config, vec_bytes_epi, cta_group),
     )
-    src = _render_block_scale_template(chain, snippets, config, cta_group, scheduler)
+    src = _render_block_scale_template(chain, snippets, config, cta_group, scheduler, fallback_cluster=_mixed_cga_fallback(config, cta_group, _tmpl.file))
     mod = _import_kernel(src)
     digest = hashlib.sha256(src.encode("utf-8")).hexdigest()[:16]
     cluster_m, cluster_n = config.cgrp_size_m, config.cgrp_size_n

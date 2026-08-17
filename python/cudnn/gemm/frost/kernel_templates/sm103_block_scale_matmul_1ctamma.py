@@ -195,8 +195,24 @@ def _kernel(
     gridx = cute.arch.grid_dim()[0]
     gridy = cute.arch.grid_dim()[1]
 
-    cluster_m = cluster_shape_mnk[0]
-    cluster_n = cluster_shape_mnk[1]
+    # Mixed CGA: the launch carries a preferred (wide) cluster plus a smaller
+    # fallback one, and the device picks per cluster — a CTA can only tell which
+    # by reading the hardware cluster dims. Everything cluster-shaped below then
+    # follows from those, so the two kinds share one body; only the multicast bit
+    # pattern is loop-built and comes in precomputed per shape.
+    a_mcast_pattern = mixed_a_pattern_pref
+    if cutlass.const_expr(fallback_cluster_shape_mnk is None):
+        cluster_m = cluster_shape_mnk[0]
+        cluster_n = cluster_shape_mnk[1]
+    else:
+        cdim_x, cdim_y, _cdim_z = cute.arch.block_in_cluster_dim()
+        cluster_m = cdim_x
+        cluster_n = cdim_y
+        a_mcast_pattern = cutlass.Int32(mixed_a_pattern_pref)
+        # Bitwise, not `or`: both operands are runtime Booleans (this is the form
+        # cutlass.cute.experimental.is_preferred_cluster uses).
+        if (cdim_x != cluster_shape_mnk[0]) | (cdim_y != cluster_shape_mnk[1]):
+            a_mcast_pattern = cutlass.Int32(mixed_a_pattern_fb)
     cluster_size = cluster_m * cluster_n * cluster_shape_mnk[2]
 
     cta_rank_in_cluster = cute.arch.block_idx_in_cluster()
@@ -204,8 +220,6 @@ def _kernel(
     n_rank = cta_rank_in_cluster // cluster_m
 
     is_cluster_leader_cta = cta_rank_in_cluster == 0
-
-    full_cluster_mask = cutlass.Int16((1 << cluster_size) - 1)
 
     if warp_idx == mma_warp_id:
         for _i in cutlass.range_constexpr(num_a_operands):
@@ -229,10 +243,11 @@ def _kernel(
     )
     init_tile_l = bidz
 
-    a_pattern = 0
-    for n_idx in cutlass.range_constexpr(cluster_n):
-        a_pattern = a_pattern | (1 << (n_idx * cluster_m))
-    b_pattern = (1 << cluster_m) - 1
+    a_pattern = a_mcast_pattern
+    if cutlass.const_expr(fallback_cluster_shape_mnk is None):
+        b_pattern = (1 << cluster_m) - 1
+    else:
+        b_pattern = (cutlass.Int32(1) << cluster_m) - 1
 
     if cutlass.const_expr(multicast_a):
         tma_mcast_mask_a = cutlass.Int16(a_pattern) << m_rank
@@ -370,9 +385,12 @@ def _kernel(
 
     M = m
     N = n
-    num_tile_m = cute.ceil_div(M, cgrp_tile_mnk[0])
-    num_tile_n = cute.ceil_div(N, cgrp_tile_mnk[1])
     num_k_tiles = cute.ceil_div(k, cta_tile_mnk[2])
+    # The tile this cluster owns spans its OWN cluster shape; both shapes walk
+    # the grid as the identity map (tile == blockIdx), so they tile the problem
+    # identically and every output tile is still covered exactly once.
+    cgrp_tile_m_cur = cta_tile_mnk[0] * cluster_m
+    cgrp_tile_n_cur = cta_tile_mnk[1] * cluster_n
 
     if warp_idx == scheduler_warp_id:
         nvvm.setmaxregister(prod_reg_count, nvvm.SetMaxRegisterAction.DECREASE)
@@ -443,8 +461,8 @@ def _kernel(
         is_valid = cutlass.Int32(1)
         clc_full_phase_tma = cutlass.Int32(0)
         while is_valid != 0:
-            coord_m_per_cta = tile_m * cgrp_tile_mnk[0] + m_rank * cta_tile_mnk[0]
-            coord_n_per_cta = tile_n * cgrp_tile_mnk[1] + n_rank * cta_tile_mnk[1]
+            coord_m_per_cta = tile_m * cgrp_tile_m_cur + m_rank * cta_tile_mnk[0]
+            coord_n_per_cta = tile_n * cgrp_tile_n_cur + n_rank * cta_tile_mnk[1]
             if cutlass.const_expr(matmul_a_batch == 1):
                 tile_l_a = cutlass.Int32(0)
             else:
@@ -576,8 +594,8 @@ def _kernel(
         is_valid = cutlass.Int32(1)
         clc_full_phase_sf = cutlass.Int32(0)
         while is_valid != 0:
-            coord_m_per_cta = tile_m * cgrp_tile_mnk[0] + m_rank * cta_tile_mnk[0]
-            coord_n_per_cta = tile_n * cgrp_tile_mnk[1] + n_rank * cta_tile_mnk[1]
+            coord_m_per_cta = tile_m * cgrp_tile_m_cur + m_rank * cta_tile_mnk[0]
+            coord_n_per_cta = tile_n * cgrp_tile_n_cur + n_rank * cta_tile_mnk[1]
             if cutlass.const_expr(matmul_a_batch == 1):
                 tile_l_a = cutlass.Int32(0)
             else:
@@ -1079,8 +1097,8 @@ def _kernel(
         # @@TMA_STORE_ONLY:END@@
 
         while is_valid != 0:
-            coord_m_tile = tile_m * cgrp_tile_mnk[0] + m_rank * cta_tile_mnk[0]
-            coord_n = tile_n * cgrp_tile_mnk[1] + n_rank * cta_tile_mnk[1]
+            coord_m_tile = tile_m * cgrp_tile_m_cur + m_rank * cta_tile_mnk[0]
+            coord_n = tile_n * cgrp_tile_n_cur + n_rank * cta_tile_mnk[1]
 
             acc_stage = tile_iter % acc_stages
             if acc_stage == 0 and tile_iter != 0:
@@ -1424,7 +1442,7 @@ def _host(
     grid_x = num_tile_m_host * cluster_m
     grid_y = num_tile_n_host * cluster_n
     grid_shape = (grid_x, grid_y, batch)
-    _kernel(
+    launch = _kernel(
         problem_size[0],
         problem_size[1],
         problem_size[2],
@@ -1435,13 +1453,28 @@ def _host(
         # @@TMA_STORE_ONLY:BEGIN@@
         # @@INJECT_HOST_TMA_C_PASS@@
         # @@TMA_STORE_ONLY:END@@
-    ).launch(
-        grid=grid_shape,
-        block=(threads_per_cta, 1, 1),
-        cluster=cluster_shape_mnk,
-        use_pdl=USE_PDL,
-        stream=stream,
     )
+    # Mixed CGA: `cluster` is the preferred (wide) shape and `fallback_cluster`
+    # the regular one the device groups blocks into when a preferred cluster does
+    # not fit. The grid is already a multiple of the preferred shape, which the
+    # driver requires.
+    if cutlass.const_expr(fallback_cluster_shape_mnk is None):
+        launch.launch(
+            grid=grid_shape,
+            block=(threads_per_cta, 1, 1),
+            cluster=cluster_shape_mnk,
+            use_pdl=USE_PDL,
+            stream=stream,
+        )
+    else:
+        launch.launch(
+            grid=grid_shape,
+            block=(threads_per_cta, 1, 1),
+            cluster=cluster_shape_mnk,
+            fallback_cluster=fallback_cluster_shape_mnk,
+            use_pdl=USE_PDL,
+            stream=stream,
+        )
 
 
 @lru_cache(maxsize=None)

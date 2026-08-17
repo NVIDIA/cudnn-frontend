@@ -270,7 +270,7 @@ class KernelTemplate:
     graph_type: GraphType  # the single graph type this template supports
     mainloop: bool  # mainloop-fusion variant (transform A/B before MMA)
     # Multi-GEMM support (templates without it reject multi-GEMM chains).
-    supports_multi_gemm: bool = False
+    supports_multi_gemm: bool = True
     # A CTA tile spanning several MMA instructions along M (num_mma_m > 1).
     supports_multi_mma_m: bool = True
 
@@ -433,7 +433,7 @@ def _mm(
     static: bool,
     mainloop: bool = False,
     graph_type: GraphType = GraphType.MATMUL,
-    supports_multi_gemm: bool = False,
+    supports_multi_gemm: bool = True,
     supports_multi_mma_m: bool = True,
 ) -> KernelTemplate:
     pipeline = _pipeline_from_file(file)
@@ -456,19 +456,17 @@ def _mm(
 
 TEMPLATES: tuple[KernelTemplate, ...] = (
     # plain matmul
-    _mm("sm100_matmul_1ctamma.py", cta_group=1, static=False, supports_multi_gemm=True),
+    _mm("sm100_matmul_1ctamma.py", cta_group=1, static=False),
     _mm(
         "sm100_matmul_1ctamma_static.py",
         cta_group=1,
         static=True,
-        supports_multi_gemm=True,
     ),
-    _mm("sm100_matmul_2ctamma.py", cta_group=2, static=False, supports_multi_gemm=True),
+    _mm("sm100_matmul_2ctamma.py", cta_group=2, static=False),
     _mm(
         "sm100_matmul_2ctamma_static.py",
         cta_group=2,
         static=True,
-        supports_multi_gemm=True,
     ),
     # block-scaled matmul
     _mm(
@@ -476,28 +474,24 @@ TEMPLATES: tuple[KernelTemplate, ...] = (
         cta_group=1,
         static=False,
         graph_type=GraphType.BLOCK_SCALE_MATMUL,
-        supports_multi_gemm=True,
     ),
     _mm(
         "sm100_block_scale_matmul_1ctamma_static.py",
         cta_group=1,
         static=True,
         graph_type=GraphType.BLOCK_SCALE_MATMUL,
-        supports_multi_gemm=True,
     ),
     _mm(
         "sm100_block_scale_matmul_2ctamma.py",
         cta_group=2,
         static=False,
         graph_type=GraphType.BLOCK_SCALE_MATMUL,
-        supports_multi_gemm=True,
     ),
     _mm(
         "sm100_block_scale_matmul_2ctamma_static.py",
         cta_group=2,
         static=True,
         graph_type=GraphType.BLOCK_SCALE_MATMUL,
-        supports_multi_gemm=True,
     ),
     # sm103 block-scaled matmul: fp4-only (nvfp4/mxfp4), K=48B UTCOMMA
     # (K-tile 384 B, 8 MMAs over 3× 128-B chunks via circular SMEM descs).
@@ -505,11 +499,13 @@ TEMPLATES: tuple[KernelTemplate, ...] = (
     # unwritten SMEM in K, period 192 B) and the ab_stages budget under-counts,
     # so cta_tile_m=256 also overruns the SMEM cap. Both are silent-wrong /
     # launch-fail, hence the gate. See CLAUDE.md for what was ruled out.
+    # Multi-GEMM has never been validated on this pipeline either — same gate.
     _mm(
         "sm103_block_scale_matmul_1ctamma.py",
         cta_group=1,
         static=False,
         graph_type=GraphType.BLOCK_SCALE_MATMUL,
+        supports_multi_gemm=False,
         supports_multi_mma_m=False,
     ),
     _mm(
@@ -517,6 +513,7 @@ TEMPLATES: tuple[KernelTemplate, ...] = (
         cta_group=2,
         static=False,
         graph_type=GraphType.BLOCK_SCALE_MATMUL,
+        supports_multi_gemm=False,
         supports_multi_mma_m=False,
     ),
     _mm(
@@ -524,18 +521,19 @@ TEMPLATES: tuple[KernelTemplate, ...] = (
         cta_group=1,
         static=False,
         graph_type=GraphType.BLOCK_SCALE_MATMUL,
-        supports_multi_gemm=True,
     ),
     _mm(
         "sm107_block_scale_matmul_2ctamma.py",
         cta_group=2,
         static=False,
         graph_type=GraphType.BLOCK_SCALE_MATMUL,
-        supports_multi_gemm=True,
     ),
     # mainloop-fusion matmul (CLC only — no static / block-scale variant yet)
-    _mm("sm100_matmul_mainloop_1ctamma.py", cta_group=1, static=False, mainloop=True),
-    _mm("sm100_matmul_mainloop_2ctamma.py", cta_group=2, static=False, mainloop=True),
+    # The mainloop templates have no per-GEMM operand indexing (no gemm_a_idx /
+    # gemm_b_idx in the MMA warp), so a second GEMM's accumulator would never be
+    # written. The analyzer also only detects mainloop at len(matmuls) == 1.
+    _mm("sm100_matmul_mainloop_1ctamma.py", cta_group=1, static=False, mainloop=True, supports_multi_gemm=False),
+    _mm("sm100_matmul_mainloop_2ctamma.py", cta_group=2, static=False, mainloop=True, supports_multi_gemm=False),
     # MoE grouped matmul fwd (own grouped persistent scheduler; static_sched
     # irrelevant, registered False so default scheduler="clc" selects).
     _mm(
@@ -543,14 +541,12 @@ TEMPLATES: tuple[KernelTemplate, ...] = (
         cta_group=1,
         static=False,
         graph_type=GraphType.MOE,
-        supports_multi_gemm=True,
     ),
     _mm(
         "sm100_moe_grouped_matmul_fwd_2ctamma.py",
         cta_group=2,
         static=False,
         graph_type=GraphType.MOE,
-        supports_multi_gemm=True,
     ),
     # MoE grouped matmul with block-scaled (FP4/FP8 + SF) inputs.
     _mm(
@@ -558,28 +554,24 @@ TEMPLATES: tuple[KernelTemplate, ...] = (
         cta_group=1,
         static=False,
         graph_type=GraphType.MOE_BLOCK_SCALE,
-        supports_multi_gemm=True,
     ),
     _mm(
         "sm100_moe_grouped_block_scale_matmul_fwd_2ctamma.py",
         cta_group=2,
         static=False,
         graph_type=GraphType.MOE_BLOCK_SCALE,
-        supports_multi_gemm=True,
     ),
     _mm(
         "sm107_moe_grouped_block_scale_matmul_fwd_1ctamma.py",
         cta_group=1,
         static=False,
         graph_type=GraphType.MOE_BLOCK_SCALE,
-        supports_multi_gemm=True,
     ),
     _mm(
         "sm107_moe_grouped_block_scale_matmul_fwd_2ctamma.py",
         cta_group=2,
         static=False,
         graph_type=GraphType.MOE_BLOCK_SCALE,
-        supports_multi_gemm=True,
     ),
 )
 
