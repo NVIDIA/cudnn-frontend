@@ -9,8 +9,8 @@ Benchmarks Qwen 3.5-style GQA attention with causal (top_left) mask only.
 Forward-only pass with bfloat16 (backward blocked at head_dim=256 on Blackwell).
 
 Usage:
-    python -m benchmark.sdpa_benchmark_training.runner --config qwen35
-    python -m benchmark.sdpa_benchmark_training.runner --config qwen35 --dry-run
+    python -m benchmark.attention_training.runner --config qwen35
+    python -m benchmark.attention_training.runner --config qwen35 --dry-run
 """
 
 from ..config_types import ModelPreset, BenchmarkConfig

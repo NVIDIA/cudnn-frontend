@@ -2,7 +2,7 @@ config_name,model_name,backend,data_type,attn_mask,batch_size,q_seqlen,kv_seqlen
 kimi_k3,kimi_k3,cudnn,bfloat16,top_left,2,32768,32768,96,96,192,128,fwd,False,291.756,226.000,0.000,10,,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92400.000
 kimi_k3,kimi_k3,cudnn,bfloat16,top_left,2,32768,32768,96,96,192,128,bwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 971, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 971, in <module>
     graph_bwd.validate()
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 776, in validate
     self._lowered_graph.validate()
@@ -11,7 +11,7 @@ cudnn._compiled_module.cudnnGraphNotSupportedError: Num hidden_dim should be les
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,bfloat16,top_left,2,32768,32768,96,96,192,128,bwd,True,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 971, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 971, in <module>
     graph_bwd.validate()
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 776, in validate
     self._lowered_graph.validate()
@@ -21,7 +21,7 @@ stdout: ",,,
 kimi_k3,kimi_k3,cudnn,bfloat16,no_mask,2,32768,32768,96,96,192,128,fwd,False,575.196,229.000,0.000,10,,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92400.000
 kimi_k3,kimi_k3,cudnn,bfloat16,no_mask,2,32768,32768,96,96,192,128,bwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 971, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 971, in <module>
     graph_bwd.validate()
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 776, in validate
     self._lowered_graph.validate()
@@ -30,7 +30,7 @@ cudnn._compiled_module.cudnnGraphNotSupportedError: Num hidden_dim should be les
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,bfloat16,no_mask,2,32768,32768,96,96,192,128,bwd,True,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 971, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 971, in <module>
     graph_bwd.validate()
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 776, in validate
     self._lowered_graph.validate()
@@ -39,7 +39,7 @@ cudnn._compiled_module.cudnnGraphNotSupportedError: Num hidden_dim should be les
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,fp8,top_left,2,32768,32768,96,96,192,128,fwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 749, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 749, in <module>
     graph_fwd.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 882, in create_execution_plans
     raise cudnn_graph_not_supported(f""no engine — python or backend — proposed a plan for this graph{why}"")
@@ -110,7 +110,7 @@ Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: finalize_internal()
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,fp8,top_left,2,32768,32768,96,96,192,128,bwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 749, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 749, in <module>
     graph_fwd.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 882, in create_execution_plans
     raise cudnn_graph_not_supported(f""no engine — python or backend — proposed a plan for this graph{why}"")
@@ -181,7 +181,7 @@ Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: finalize_internal()
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,fp8,top_left,2,32768,32768,96,96,192,128,bwd,True,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 749, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 749, in <module>
     graph_fwd.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 882, in create_execution_plans
     raise cudnn_graph_not_supported(f""no engine — python or backend — proposed a plan for this graph{why}"")
@@ -252,7 +252,7 @@ Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: finalize_internal()
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,fp8,no_mask,2,32768,32768,96,96,192,128,fwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 749, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 749, in <module>
     graph_fwd.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 882, in create_execution_plans
     raise cudnn_graph_not_supported(f""no engine — python or backend — proposed a plan for this graph{why}"")
@@ -323,7 +323,7 @@ Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: finalize_internal()
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,fp8,no_mask,2,32768,32768,96,96,192,128,bwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 749, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 749, in <module>
     graph_fwd.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 882, in create_execution_plans
     raise cudnn_graph_not_supported(f""no engine — python or backend — proposed a plan for this graph{why}"")
@@ -394,7 +394,7 @@ Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: finalize_internal()
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,fp8,no_mask,2,32768,32768,96,96,192,128,bwd,True,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 749, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 749, in <module>
     graph_fwd.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 882, in create_execution_plans
     raise cudnn_graph_not_supported(f""no engine — python or backend — proposed a plan for this graph{why}"")
@@ -465,7 +465,7 @@ Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: finalize_internal()
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,mxfp8,top_left,2,32768,32768,96,96,192,128,fwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 747, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 747, in <module>
     graph_fwd.validate()
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 776, in validate
     self._lowered_graph.validate()
@@ -474,7 +474,7 @@ cudnn._compiled_module.cudnnGraphNotSupportedError: MXFP8 SDPA is only supported
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,mxfp8,top_left,2,32768,32768,96,96,192,128,bwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 747, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 747, in <module>
     graph_fwd.validate()
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 776, in validate
     self._lowered_graph.validate()
@@ -483,7 +483,7 @@ cudnn._compiled_module.cudnnGraphNotSupportedError: MXFP8 SDPA is only supported
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,mxfp8,top_left,2,32768,32768,96,96,192,128,bwd,True,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 747, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 747, in <module>
     graph_fwd.validate()
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 776, in validate
     self._lowered_graph.validate()
@@ -492,7 +492,7 @@ cudnn._compiled_module.cudnnGraphNotSupportedError: MXFP8 SDPA is only supported
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,mxfp8,no_mask,2,32768,32768,96,96,192,128,fwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 747, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 747, in <module>
     graph_fwd.validate()
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 776, in validate
     self._lowered_graph.validate()
@@ -501,7 +501,7 @@ cudnn._compiled_module.cudnnGraphNotSupportedError: MXFP8 SDPA is only supported
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,mxfp8,no_mask,2,32768,32768,96,96,192,128,bwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 747, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 747, in <module>
     graph_fwd.validate()
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 776, in validate
     self._lowered_graph.validate()
@@ -510,7 +510,7 @@ cudnn._compiled_module.cudnnGraphNotSupportedError: MXFP8 SDPA is only supported
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,mxfp8,no_mask,2,32768,32768,96,96,192,128,bwd,True,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 747, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 747, in <module>
     graph_fwd.validate()
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 776, in validate
     self._lowered_graph.validate()
@@ -519,7 +519,7 @@ cudnn._compiled_module.cudnnGraphNotSupportedError: MXFP8 SDPA is only supported
 stdout: ",,,
 kimi_k3,kimi_k3,flash_attention_4,bfloat16,top_left,2,32768,32768,96,96,192,128,fwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 1195, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 1195, in <module>
     import flash_attn.cute.interface as flash_attn_interface
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/flash_attn/cute/__init__.py"", line 3, in <module>
     from .interface import (
@@ -533,7 +533,7 @@ AttributeError: module 'cutlass.cute.core' has no attribute 'ThrMma'
 stdout: ",,,
 kimi_k3,kimi_k3,flash_attention_4,bfloat16,top_left,2,32768,32768,96,96,192,128,bwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 1195, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 1195, in <module>
     import flash_attn.cute.interface as flash_attn_interface
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/flash_attn/cute/__init__.py"", line 3, in <module>
     from .interface import (
@@ -547,7 +547,7 @@ AttributeError: module 'cutlass.cute.core' has no attribute 'ThrMma'
 stdout: ",,,
 kimi_k3,kimi_k3,flash_attention_4,bfloat16,top_left,2,32768,32768,96,96,192,128,bwd,True,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 1195, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 1195, in <module>
     import flash_attn.cute.interface as flash_attn_interface
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/flash_attn/cute/__init__.py"", line 3, in <module>
     from .interface import (
@@ -561,7 +561,7 @@ AttributeError: module 'cutlass.cute.core' has no attribute 'ThrMma'
 stdout: ",,,
 kimi_k3,kimi_k3,flash_attention_4,bfloat16,no_mask,2,32768,32768,96,96,192,128,fwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 1195, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 1195, in <module>
     import flash_attn.cute.interface as flash_attn_interface
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/flash_attn/cute/__init__.py"", line 3, in <module>
     from .interface import (
@@ -575,7 +575,7 @@ AttributeError: module 'cutlass.cute.core' has no attribute 'ThrMma'
 stdout: ",,,
 kimi_k3,kimi_k3,flash_attention_4,bfloat16,no_mask,2,32768,32768,96,96,192,128,bwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 1195, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 1195, in <module>
     import flash_attn.cute.interface as flash_attn_interface
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/flash_attn/cute/__init__.py"", line 3, in <module>
     from .interface import (
@@ -589,7 +589,7 @@ AttributeError: module 'cutlass.cute.core' has no attribute 'ThrMma'
 stdout: ",,,
 kimi_k3,kimi_k3,flash_attention_4,bfloat16,no_mask,2,32768,32768,96,96,192,128,bwd,True,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 1195, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 1195, in <module>
     import flash_attn.cute.interface as flash_attn_interface
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/flash_attn/cute/__init__.py"", line 3, in <module>
     from .interface import (
@@ -604,7 +604,7 @@ stdout: ",,,
 kimi_k3,kimi_k3,cudnn,bfloat16,top_left,2,16384,16384,96,96,192,128,fwd,False,73.879,223.000,0.000,10,,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92400.000
 kimi_k3,kimi_k3,cudnn,bfloat16,top_left,2,16384,16384,96,96,192,128,bwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 971, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 971, in <module>
     graph_bwd.validate()
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 776, in validate
     self._lowered_graph.validate()
@@ -613,7 +613,7 @@ cudnn._compiled_module.cudnnGraphNotSupportedError: Num hidden_dim should be les
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,bfloat16,top_left,2,16384,16384,96,96,192,128,bwd,True,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 971, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 971, in <module>
     graph_bwd.validate()
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 776, in validate
     self._lowered_graph.validate()
@@ -623,7 +623,7 @@ stdout: ",,,
 kimi_k3,kimi_k3,cudnn,bfloat16,no_mask,2,16384,16384,96,96,192,128,fwd,False,144.025,229.000,0.000,10,,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92400.000
 kimi_k3,kimi_k3,cudnn,bfloat16,no_mask,2,16384,16384,96,96,192,128,bwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 971, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 971, in <module>
     graph_bwd.validate()
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 776, in validate
     self._lowered_graph.validate()
@@ -632,7 +632,7 @@ cudnn._compiled_module.cudnnGraphNotSupportedError: Num hidden_dim should be les
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,bfloat16,no_mask,2,16384,16384,96,96,192,128,bwd,True,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 971, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 971, in <module>
     graph_bwd.validate()
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 776, in validate
     self._lowered_graph.validate()
@@ -641,7 +641,7 @@ cudnn._compiled_module.cudnnGraphNotSupportedError: Num hidden_dim should be les
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,fp8,top_left,2,16384,16384,96,96,192,128,fwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 749, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 749, in <module>
     graph_fwd.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 882, in create_execution_plans
     raise cudnn_graph_not_supported(f""no engine — python or backend — proposed a plan for this graph{why}"")
@@ -712,7 +712,7 @@ Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: finalize_internal()
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,fp8,top_left,2,16384,16384,96,96,192,128,bwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 749, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 749, in <module>
     graph_fwd.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 882, in create_execution_plans
     raise cudnn_graph_not_supported(f""no engine — python or backend — proposed a plan for this graph{why}"")
@@ -783,7 +783,7 @@ Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: finalize_internal()
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,fp8,top_left,2,16384,16384,96,96,192,128,bwd,True,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 749, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 749, in <module>
     graph_fwd.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 882, in create_execution_plans
     raise cudnn_graph_not_supported(f""no engine — python or backend — proposed a plan for this graph{why}"")
@@ -854,7 +854,7 @@ Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: finalize_internal()
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,fp8,no_mask,2,16384,16384,96,96,192,128,fwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 749, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 749, in <module>
     graph_fwd.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 882, in create_execution_plans
     raise cudnn_graph_not_supported(f""no engine — python or backend — proposed a plan for this graph{why}"")
@@ -925,7 +925,7 @@ Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: finalize_internal()
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,fp8,no_mask,2,16384,16384,96,96,192,128,bwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 749, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 749, in <module>
     graph_fwd.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 882, in create_execution_plans
     raise cudnn_graph_not_supported(f""no engine — python or backend — proposed a plan for this graph{why}"")
@@ -996,7 +996,7 @@ Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: finalize_internal()
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,fp8,no_mask,2,16384,16384,96,96,192,128,bwd,True,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 749, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 749, in <module>
     graph_fwd.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 882, in create_execution_plans
     raise cudnn_graph_not_supported(f""no engine — python or backend — proposed a plan for this graph{why}"")
@@ -1067,7 +1067,7 @@ Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: finalize_internal()
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,mxfp8,top_left,2,16384,16384,96,96,192,128,fwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 747, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 747, in <module>
     graph_fwd.validate()
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 776, in validate
     self._lowered_graph.validate()
@@ -1076,7 +1076,7 @@ cudnn._compiled_module.cudnnGraphNotSupportedError: MXFP8 SDPA is only supported
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,mxfp8,top_left,2,16384,16384,96,96,192,128,bwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 747, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 747, in <module>
     graph_fwd.validate()
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 776, in validate
     self._lowered_graph.validate()
@@ -1085,7 +1085,7 @@ cudnn._compiled_module.cudnnGraphNotSupportedError: MXFP8 SDPA is only supported
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,mxfp8,top_left,2,16384,16384,96,96,192,128,bwd,True,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 747, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 747, in <module>
     graph_fwd.validate()
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 776, in validate
     self._lowered_graph.validate()
@@ -1094,7 +1094,7 @@ cudnn._compiled_module.cudnnGraphNotSupportedError: MXFP8 SDPA is only supported
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,mxfp8,no_mask,2,16384,16384,96,96,192,128,fwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 747, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 747, in <module>
     graph_fwd.validate()
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 776, in validate
     self._lowered_graph.validate()
@@ -1103,7 +1103,7 @@ cudnn._compiled_module.cudnnGraphNotSupportedError: MXFP8 SDPA is only supported
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,mxfp8,no_mask,2,16384,16384,96,96,192,128,bwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 747, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 747, in <module>
     graph_fwd.validate()
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 776, in validate
     self._lowered_graph.validate()
@@ -1112,7 +1112,7 @@ cudnn._compiled_module.cudnnGraphNotSupportedError: MXFP8 SDPA is only supported
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,mxfp8,no_mask,2,16384,16384,96,96,192,128,bwd,True,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 747, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 747, in <module>
     graph_fwd.validate()
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 776, in validate
     self._lowered_graph.validate()
@@ -1121,7 +1121,7 @@ cudnn._compiled_module.cudnnGraphNotSupportedError: MXFP8 SDPA is only supported
 stdout: ",,,
 kimi_k3,kimi_k3,flash_attention_4,bfloat16,top_left,2,16384,16384,96,96,192,128,fwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 1195, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 1195, in <module>
     import flash_attn.cute.interface as flash_attn_interface
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/flash_attn/cute/__init__.py"", line 3, in <module>
     from .interface import (
@@ -1135,7 +1135,7 @@ AttributeError: module 'cutlass.cute.core' has no attribute 'ThrMma'
 stdout: ",,,
 kimi_k3,kimi_k3,flash_attention_4,bfloat16,top_left,2,16384,16384,96,96,192,128,bwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 1195, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 1195, in <module>
     import flash_attn.cute.interface as flash_attn_interface
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/flash_attn/cute/__init__.py"", line 3, in <module>
     from .interface import (
@@ -1149,7 +1149,7 @@ AttributeError: module 'cutlass.cute.core' has no attribute 'ThrMma'
 stdout: ",,,
 kimi_k3,kimi_k3,flash_attention_4,bfloat16,top_left,2,16384,16384,96,96,192,128,bwd,True,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 1195, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 1195, in <module>
     import flash_attn.cute.interface as flash_attn_interface
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/flash_attn/cute/__init__.py"", line 3, in <module>
     from .interface import (
@@ -1163,7 +1163,7 @@ AttributeError: module 'cutlass.cute.core' has no attribute 'ThrMma'
 stdout: ",,,
 kimi_k3,kimi_k3,flash_attention_4,bfloat16,no_mask,2,16384,16384,96,96,192,128,fwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 1195, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 1195, in <module>
     import flash_attn.cute.interface as flash_attn_interface
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/flash_attn/cute/__init__.py"", line 3, in <module>
     from .interface import (
@@ -1177,7 +1177,7 @@ AttributeError: module 'cutlass.cute.core' has no attribute 'ThrMma'
 stdout: ",,,
 kimi_k3,kimi_k3,flash_attention_4,bfloat16,no_mask,2,16384,16384,96,96,192,128,bwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 1195, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 1195, in <module>
     import flash_attn.cute.interface as flash_attn_interface
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/flash_attn/cute/__init__.py"", line 3, in <module>
     from .interface import (
@@ -1191,7 +1191,7 @@ AttributeError: module 'cutlass.cute.core' has no attribute 'ThrMma'
 stdout: ",,,
 kimi_k3,kimi_k3,flash_attention_4,bfloat16,no_mask,2,16384,16384,96,96,192,128,bwd,True,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 1195, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 1195, in <module>
     import flash_attn.cute.interface as flash_attn_interface
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/flash_attn/cute/__init__.py"", line 3, in <module>
     from .interface import (
@@ -1206,7 +1206,7 @@ stdout: ",,,
 kimi_k3,kimi_k3,cudnn,bfloat16,top_left,2,8192,8192,96,96,192,128,fwd,False,18.148,227.000,0.000,10,,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92400.000
 kimi_k3,kimi_k3,cudnn,bfloat16,top_left,2,8192,8192,96,96,192,128,bwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 971, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 971, in <module>
     graph_bwd.validate()
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 776, in validate
     self._lowered_graph.validate()
@@ -1215,7 +1215,7 @@ cudnn._compiled_module.cudnnGraphNotSupportedError: Num hidden_dim should be les
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,bfloat16,top_left,2,8192,8192,96,96,192,128,bwd,True,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 971, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 971, in <module>
     graph_bwd.validate()
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 776, in validate
     self._lowered_graph.validate()
@@ -1225,7 +1225,7 @@ stdout: ",,,
 kimi_k3,kimi_k3,cudnn,bfloat16,no_mask,2,8192,8192,96,96,192,128,fwd,False,35.705,231.000,0.000,10,,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92400.000
 kimi_k3,kimi_k3,cudnn,bfloat16,no_mask,2,8192,8192,96,96,192,128,bwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 971, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 971, in <module>
     graph_bwd.validate()
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 776, in validate
     self._lowered_graph.validate()
@@ -1234,7 +1234,7 @@ cudnn._compiled_module.cudnnGraphNotSupportedError: Num hidden_dim should be les
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,bfloat16,no_mask,2,8192,8192,96,96,192,128,bwd,True,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 971, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 971, in <module>
     graph_bwd.validate()
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 776, in validate
     self._lowered_graph.validate()
@@ -1243,7 +1243,7 @@ cudnn._compiled_module.cudnnGraphNotSupportedError: Num hidden_dim should be les
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,fp8,top_left,2,8192,8192,96,96,192,128,fwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 749, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 749, in <module>
     graph_fwd.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 882, in create_execution_plans
     raise cudnn_graph_not_supported(f""no engine — python or backend — proposed a plan for this graph{why}"")
@@ -1314,7 +1314,7 @@ Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: finalize_internal()
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,fp8,top_left,2,8192,8192,96,96,192,128,bwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 749, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 749, in <module>
     graph_fwd.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 882, in create_execution_plans
     raise cudnn_graph_not_supported(f""no engine — python or backend — proposed a plan for this graph{why}"")
@@ -1385,7 +1385,7 @@ Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: finalize_internal()
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,fp8,top_left,2,8192,8192,96,96,192,128,bwd,True,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 749, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 749, in <module>
     graph_fwd.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 882, in create_execution_plans
     raise cudnn_graph_not_supported(f""no engine — python or backend — proposed a plan for this graph{why}"")
@@ -1456,7 +1456,7 @@ Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: finalize_internal()
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,fp8,no_mask,2,8192,8192,96,96,192,128,fwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 749, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 749, in <module>
     graph_fwd.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 882, in create_execution_plans
     raise cudnn_graph_not_supported(f""no engine — python or backend — proposed a plan for this graph{why}"")
@@ -1527,7 +1527,7 @@ Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: finalize_internal()
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,fp8,no_mask,2,8192,8192,96,96,192,128,bwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 749, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 749, in <module>
     graph_fwd.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 882, in create_execution_plans
     raise cudnn_graph_not_supported(f""no engine — python or backend — proposed a plan for this graph{why}"")
@@ -1598,7 +1598,7 @@ Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: finalize_internal()
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,fp8,no_mask,2,8192,8192,96,96,192,128,bwd,True,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 749, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 749, in <module>
     graph_fwd.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 882, in create_execution_plans
     raise cudnn_graph_not_supported(f""no engine — python or backend — proposed a plan for this graph{why}"")
@@ -1669,7 +1669,7 @@ Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: finalize_internal()
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,mxfp8,top_left,2,8192,8192,96,96,192,128,fwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 747, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 747, in <module>
     graph_fwd.validate()
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 776, in validate
     self._lowered_graph.validate()
@@ -1678,7 +1678,7 @@ cudnn._compiled_module.cudnnGraphNotSupportedError: MXFP8 SDPA is only supported
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,mxfp8,top_left,2,8192,8192,96,96,192,128,bwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 747, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 747, in <module>
     graph_fwd.validate()
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 776, in validate
     self._lowered_graph.validate()
@@ -1687,7 +1687,7 @@ cudnn._compiled_module.cudnnGraphNotSupportedError: MXFP8 SDPA is only supported
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,mxfp8,top_left,2,8192,8192,96,96,192,128,bwd,True,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 747, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 747, in <module>
     graph_fwd.validate()
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 776, in validate
     self._lowered_graph.validate()
@@ -1696,7 +1696,7 @@ cudnn._compiled_module.cudnnGraphNotSupportedError: MXFP8 SDPA is only supported
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,mxfp8,no_mask,2,8192,8192,96,96,192,128,fwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 747, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 747, in <module>
     graph_fwd.validate()
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 776, in validate
     self._lowered_graph.validate()
@@ -1705,7 +1705,7 @@ cudnn._compiled_module.cudnnGraphNotSupportedError: MXFP8 SDPA is only supported
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,mxfp8,no_mask,2,8192,8192,96,96,192,128,bwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 747, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 747, in <module>
     graph_fwd.validate()
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 776, in validate
     self._lowered_graph.validate()
@@ -1714,7 +1714,7 @@ cudnn._compiled_module.cudnnGraphNotSupportedError: MXFP8 SDPA is only supported
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,mxfp8,no_mask,2,8192,8192,96,96,192,128,bwd,True,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 747, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 747, in <module>
     graph_fwd.validate()
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 776, in validate
     self._lowered_graph.validate()
@@ -1723,7 +1723,7 @@ cudnn._compiled_module.cudnnGraphNotSupportedError: MXFP8 SDPA is only supported
 stdout: ",,,
 kimi_k3,kimi_k3,flash_attention_4,bfloat16,top_left,2,8192,8192,96,96,192,128,fwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 1195, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 1195, in <module>
     import flash_attn.cute.interface as flash_attn_interface
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/flash_attn/cute/__init__.py"", line 3, in <module>
     from .interface import (
@@ -1737,7 +1737,7 @@ AttributeError: module 'cutlass.cute.core' has no attribute 'ThrMma'
 stdout: ",,,
 kimi_k3,kimi_k3,flash_attention_4,bfloat16,top_left,2,8192,8192,96,96,192,128,bwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 1195, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 1195, in <module>
     import flash_attn.cute.interface as flash_attn_interface
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/flash_attn/cute/__init__.py"", line 3, in <module>
     from .interface import (
@@ -1751,7 +1751,7 @@ AttributeError: module 'cutlass.cute.core' has no attribute 'ThrMma'
 stdout: ",,,
 kimi_k3,kimi_k3,flash_attention_4,bfloat16,top_left,2,8192,8192,96,96,192,128,bwd,True,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 1195, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 1195, in <module>
     import flash_attn.cute.interface as flash_attn_interface
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/flash_attn/cute/__init__.py"", line 3, in <module>
     from .interface import (
@@ -1765,7 +1765,7 @@ AttributeError: module 'cutlass.cute.core' has no attribute 'ThrMma'
 stdout: ",,,
 kimi_k3,kimi_k3,flash_attention_4,bfloat16,no_mask,2,8192,8192,96,96,192,128,fwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 1195, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 1195, in <module>
     import flash_attn.cute.interface as flash_attn_interface
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/flash_attn/cute/__init__.py"", line 3, in <module>
     from .interface import (
@@ -1779,7 +1779,7 @@ AttributeError: module 'cutlass.cute.core' has no attribute 'ThrMma'
 stdout: ",,,
 kimi_k3,kimi_k3,flash_attention_4,bfloat16,no_mask,2,8192,8192,96,96,192,128,bwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 1195, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 1195, in <module>
     import flash_attn.cute.interface as flash_attn_interface
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/flash_attn/cute/__init__.py"", line 3, in <module>
     from .interface import (
@@ -1793,7 +1793,7 @@ AttributeError: module 'cutlass.cute.core' has no attribute 'ThrMma'
 stdout: ",,,
 kimi_k3,kimi_k3,flash_attention_4,bfloat16,no_mask,2,8192,8192,96,96,192,128,bwd,True,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 1195, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 1195, in <module>
     import flash_attn.cute.interface as flash_attn_interface
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/flash_attn/cute/__init__.py"", line 3, in <module>
     from .interface import (
@@ -1808,7 +1808,7 @@ stdout: ",,,
 kimi_k3,kimi_k3,cudnn,bfloat16,top_left,2,4096,4096,96,96,192,128,fwd,False,4.722,218.000,0.000,10,,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92400.000
 kimi_k3,kimi_k3,cudnn,bfloat16,top_left,2,4096,4096,96,96,192,128,bwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 971, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 971, in <module>
     graph_bwd.validate()
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 776, in validate
     self._lowered_graph.validate()
@@ -1817,7 +1817,7 @@ cudnn._compiled_module.cudnnGraphNotSupportedError: Num hidden_dim should be les
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,bfloat16,top_left,2,4096,4096,96,96,192,128,bwd,True,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 971, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 971, in <module>
     graph_bwd.validate()
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 776, in validate
     self._lowered_graph.validate()
@@ -1827,7 +1827,7 @@ stdout: ",,,
 kimi_k3,kimi_k3,cudnn,bfloat16,no_mask,2,4096,4096,96,96,192,128,fwd,False,18.417,112.000,0.000,10,,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92400.000
 kimi_k3,kimi_k3,cudnn,bfloat16,no_mask,2,4096,4096,96,96,192,128,bwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 971, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 971, in <module>
     graph_bwd.validate()
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 776, in validate
     self._lowered_graph.validate()
@@ -1836,7 +1836,7 @@ cudnn._compiled_module.cudnnGraphNotSupportedError: Num hidden_dim should be les
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,bfloat16,no_mask,2,4096,4096,96,96,192,128,bwd,True,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 971, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 971, in <module>
     graph_bwd.validate()
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 776, in validate
     self._lowered_graph.validate()
@@ -1845,7 +1845,7 @@ cudnn._compiled_module.cudnnGraphNotSupportedError: Num hidden_dim should be les
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,fp8,top_left,2,4096,4096,96,96,192,128,fwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 749, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 749, in <module>
     graph_fwd.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 882, in create_execution_plans
     raise cudnn_graph_not_supported(f""no engine — python or backend — proposed a plan for this graph{why}"")
@@ -1916,7 +1916,7 @@ Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: finalize_internal()
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,fp8,top_left,2,4096,4096,96,96,192,128,bwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 749, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 749, in <module>
     graph_fwd.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 882, in create_execution_plans
     raise cudnn_graph_not_supported(f""no engine — python or backend — proposed a plan for this graph{why}"")
@@ -1987,7 +1987,7 @@ Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: finalize_internal()
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,fp8,top_left,2,4096,4096,96,96,192,128,bwd,True,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 749, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 749, in <module>
     graph_fwd.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 882, in create_execution_plans
     raise cudnn_graph_not_supported(f""no engine — python or backend — proposed a plan for this graph{why}"")
@@ -2058,7 +2058,7 @@ Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: finalize_internal()
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,fp8,no_mask,2,4096,4096,96,96,192,128,fwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 749, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 749, in <module>
     graph_fwd.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 882, in create_execution_plans
     raise cudnn_graph_not_supported(f""no engine — python or backend — proposed a plan for this graph{why}"")
@@ -2129,7 +2129,7 @@ Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: finalize_internal()
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,fp8,no_mask,2,4096,4096,96,96,192,128,bwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 749, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 749, in <module>
     graph_fwd.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 882, in create_execution_plans
     raise cudnn_graph_not_supported(f""no engine — python or backend — proposed a plan for this graph{why}"")
@@ -2200,7 +2200,7 @@ Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: finalize_internal()
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,fp8,no_mask,2,4096,4096,96,96,192,128,bwd,True,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 749, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 749, in <module>
     graph_fwd.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 882, in create_execution_plans
     raise cudnn_graph_not_supported(f""no engine — python or backend — proposed a plan for this graph{why}"")
@@ -2271,7 +2271,7 @@ Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: finalize_internal()
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,mxfp8,top_left,2,4096,4096,96,96,192,128,fwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 747, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 747, in <module>
     graph_fwd.validate()
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 776, in validate
     self._lowered_graph.validate()
@@ -2280,7 +2280,7 @@ cudnn._compiled_module.cudnnGraphNotSupportedError: MXFP8 SDPA is only supported
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,mxfp8,top_left,2,4096,4096,96,96,192,128,bwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 747, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 747, in <module>
     graph_fwd.validate()
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 776, in validate
     self._lowered_graph.validate()
@@ -2289,7 +2289,7 @@ cudnn._compiled_module.cudnnGraphNotSupportedError: MXFP8 SDPA is only supported
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,mxfp8,top_left,2,4096,4096,96,96,192,128,bwd,True,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 747, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 747, in <module>
     graph_fwd.validate()
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 776, in validate
     self._lowered_graph.validate()
@@ -2298,7 +2298,7 @@ cudnn._compiled_module.cudnnGraphNotSupportedError: MXFP8 SDPA is only supported
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,mxfp8,no_mask,2,4096,4096,96,96,192,128,fwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 747, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 747, in <module>
     graph_fwd.validate()
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 776, in validate
     self._lowered_graph.validate()
@@ -2307,7 +2307,7 @@ cudnn._compiled_module.cudnnGraphNotSupportedError: MXFP8 SDPA is only supported
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,mxfp8,no_mask,2,4096,4096,96,96,192,128,bwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 747, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 747, in <module>
     graph_fwd.validate()
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 776, in validate
     self._lowered_graph.validate()
@@ -2316,7 +2316,7 @@ cudnn._compiled_module.cudnnGraphNotSupportedError: MXFP8 SDPA is only supported
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,mxfp8,no_mask,2,4096,4096,96,96,192,128,bwd,True,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 747, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 747, in <module>
     graph_fwd.validate()
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 776, in validate
     self._lowered_graph.validate()
@@ -2325,7 +2325,7 @@ cudnn._compiled_module.cudnnGraphNotSupportedError: MXFP8 SDPA is only supported
 stdout: ",,,
 kimi_k3,kimi_k3,flash_attention_4,bfloat16,top_left,2,4096,4096,96,96,192,128,fwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 1195, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 1195, in <module>
     import flash_attn.cute.interface as flash_attn_interface
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/flash_attn/cute/__init__.py"", line 3, in <module>
     from .interface import (
@@ -2339,7 +2339,7 @@ AttributeError: module 'cutlass.cute.core' has no attribute 'ThrMma'
 stdout: ",,,
 kimi_k3,kimi_k3,flash_attention_4,bfloat16,top_left,2,4096,4096,96,96,192,128,bwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 1195, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 1195, in <module>
     import flash_attn.cute.interface as flash_attn_interface
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/flash_attn/cute/__init__.py"", line 3, in <module>
     from .interface import (
@@ -2353,7 +2353,7 @@ AttributeError: module 'cutlass.cute.core' has no attribute 'ThrMma'
 stdout: ",,,
 kimi_k3,kimi_k3,flash_attention_4,bfloat16,top_left,2,4096,4096,96,96,192,128,bwd,True,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 1195, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 1195, in <module>
     import flash_attn.cute.interface as flash_attn_interface
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/flash_attn/cute/__init__.py"", line 3, in <module>
     from .interface import (
@@ -2367,7 +2367,7 @@ AttributeError: module 'cutlass.cute.core' has no attribute 'ThrMma'
 stdout: ",,,
 kimi_k3,kimi_k3,flash_attention_4,bfloat16,no_mask,2,4096,4096,96,96,192,128,fwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 1195, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 1195, in <module>
     import flash_attn.cute.interface as flash_attn_interface
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/flash_attn/cute/__init__.py"", line 3, in <module>
     from .interface import (
@@ -2381,7 +2381,7 @@ AttributeError: module 'cutlass.cute.core' has no attribute 'ThrMma'
 stdout: ",,,
 kimi_k3,kimi_k3,flash_attention_4,bfloat16,no_mask,2,4096,4096,96,96,192,128,bwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 1195, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 1195, in <module>
     import flash_attn.cute.interface as flash_attn_interface
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/flash_attn/cute/__init__.py"", line 3, in <module>
     from .interface import (
@@ -2395,7 +2395,7 @@ AttributeError: module 'cutlass.cute.core' has no attribute 'ThrMma'
 stdout: ",,,
 kimi_k3,kimi_k3,flash_attention_4,bfloat16,no_mask,2,4096,4096,96,96,192,128,bwd,True,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 1195, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 1195, in <module>
     import flash_attn.cute.interface as flash_attn_interface
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/flash_attn/cute/__init__.py"", line 3, in <module>
     from .interface import (
@@ -2410,7 +2410,7 @@ stdout: ",,,
 kimi_k3,kimi_k3,cudnn,bfloat16,top_left,2,2048,2048,96,96,192,128,fwd,False,1.273,203.000,0.000,10,,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92400.000
 kimi_k3,kimi_k3,cudnn,bfloat16,top_left,2,2048,2048,96,96,192,128,bwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 971, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 971, in <module>
     graph_bwd.validate()
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 776, in validate
     self._lowered_graph.validate()
@@ -2419,7 +2419,7 @@ cudnn._compiled_module.cudnnGraphNotSupportedError: Num hidden_dim should be les
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,bfloat16,top_left,2,2048,2048,96,96,192,128,bwd,True,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 971, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 971, in <module>
     graph_bwd.validate()
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 776, in validate
     self._lowered_graph.validate()
@@ -2429,7 +2429,7 @@ stdout: ",,,
 kimi_k3,kimi_k3,cudnn,bfloat16,no_mask,2,2048,2048,96,96,192,128,fwd,False,2.289,225.000,0.000,10,,True,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92400.000
 kimi_k3,kimi_k3,cudnn,bfloat16,no_mask,2,2048,2048,96,96,192,128,bwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 971, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 971, in <module>
     graph_bwd.validate()
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 776, in validate
     self._lowered_graph.validate()
@@ -2438,7 +2438,7 @@ cudnn._compiled_module.cudnnGraphNotSupportedError: Num hidden_dim should be les
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,bfloat16,no_mask,2,2048,2048,96,96,192,128,bwd,True,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 971, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 971, in <module>
     graph_bwd.validate()
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 776, in validate
     self._lowered_graph.validate()
@@ -2447,7 +2447,7 @@ cudnn._compiled_module.cudnnGraphNotSupportedError: Num hidden_dim should be les
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,fp8,top_left,2,2048,2048,96,96,192,128,fwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 749, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 749, in <module>
     graph_fwd.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 882, in create_execution_plans
     raise cudnn_graph_not_supported(f""no engine — python or backend — proposed a plan for this graph{why}"")
@@ -2518,7 +2518,7 @@ Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: finalize_internal()
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,fp8,top_left,2,2048,2048,96,96,192,128,bwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 749, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 749, in <module>
     graph_fwd.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 882, in create_execution_plans
     raise cudnn_graph_not_supported(f""no engine — python or backend — proposed a plan for this graph{why}"")
@@ -2589,7 +2589,7 @@ Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: finalize_internal()
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,fp8,top_left,2,2048,2048,96,96,192,128,bwd,True,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 749, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 749, in <module>
     graph_fwd.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 882, in create_execution_plans
     raise cudnn_graph_not_supported(f""no engine — python or backend — proposed a plan for this graph{why}"")
@@ -2660,7 +2660,7 @@ Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: finalize_internal()
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,fp8,no_mask,2,2048,2048,96,96,192,128,fwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 749, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 749, in <module>
     graph_fwd.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 882, in create_execution_plans
     raise cudnn_graph_not_supported(f""no engine — python or backend — proposed a plan for this graph{why}"")
@@ -2731,7 +2731,7 @@ Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: finalize_internal()
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,fp8,no_mask,2,2048,2048,96,96,192,128,bwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 749, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 749, in <module>
     graph_fwd.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 882, in create_execution_plans
     raise cudnn_graph_not_supported(f""no engine — python or backend — proposed a plan for this graph{why}"")
@@ -2802,7 +2802,7 @@ Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: finalize_internal()
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,fp8,no_mask,2,2048,2048,96,96,192,128,bwd,True,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 749, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 749, in <module>
     graph_fwd.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 882, in create_execution_plans
     raise cudnn_graph_not_supported(f""no engine — python or backend — proposed a plan for this graph{why}"")
@@ -2873,7 +2873,7 @@ Warning: CUDNN_STATUS_NOT_SUPPORTED; Reason: finalize_internal()
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,mxfp8,top_left,2,2048,2048,96,96,192,128,fwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 747, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 747, in <module>
     graph_fwd.validate()
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 776, in validate
     self._lowered_graph.validate()
@@ -2882,7 +2882,7 @@ cudnn._compiled_module.cudnnGraphNotSupportedError: MXFP8 SDPA is only supported
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,mxfp8,top_left,2,2048,2048,96,96,192,128,bwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 747, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 747, in <module>
     graph_fwd.validate()
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 776, in validate
     self._lowered_graph.validate()
@@ -2891,7 +2891,7 @@ cudnn._compiled_module.cudnnGraphNotSupportedError: MXFP8 SDPA is only supported
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,mxfp8,top_left,2,2048,2048,96,96,192,128,bwd,True,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 747, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 747, in <module>
     graph_fwd.validate()
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 776, in validate
     self._lowered_graph.validate()
@@ -2900,7 +2900,7 @@ cudnn._compiled_module.cudnnGraphNotSupportedError: MXFP8 SDPA is only supported
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,mxfp8,no_mask,2,2048,2048,96,96,192,128,fwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 747, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 747, in <module>
     graph_fwd.validate()
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 776, in validate
     self._lowered_graph.validate()
@@ -2909,7 +2909,7 @@ cudnn._compiled_module.cudnnGraphNotSupportedError: MXFP8 SDPA is only supported
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,mxfp8,no_mask,2,2048,2048,96,96,192,128,bwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 747, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 747, in <module>
     graph_fwd.validate()
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 776, in validate
     self._lowered_graph.validate()
@@ -2918,7 +2918,7 @@ cudnn._compiled_module.cudnnGraphNotSupportedError: MXFP8 SDPA is only supported
 stdout: ",,,
 kimi_k3,kimi_k3,cudnn,mxfp8,no_mask,2,2048,2048,96,96,192,128,bwd,True,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 747, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 747, in <module>
     graph_fwd.validate()
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/cudnn/_pygraph.py"", line 776, in validate
     self._lowered_graph.validate()
@@ -2927,7 +2927,7 @@ cudnn._compiled_module.cudnnGraphNotSupportedError: MXFP8 SDPA is only supported
 stdout: ",,,
 kimi_k3,kimi_k3,flash_attention_4,bfloat16,top_left,2,2048,2048,96,96,192,128,fwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 1195, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 1195, in <module>
     import flash_attn.cute.interface as flash_attn_interface
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/flash_attn/cute/__init__.py"", line 3, in <module>
     from .interface import (
@@ -2941,7 +2941,7 @@ AttributeError: module 'cutlass.cute.core' has no attribute 'ThrMma'
 stdout: ",,,
 kimi_k3,kimi_k3,flash_attention_4,bfloat16,top_left,2,2048,2048,96,96,192,128,bwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 1195, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 1195, in <module>
     import flash_attn.cute.interface as flash_attn_interface
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/flash_attn/cute/__init__.py"", line 3, in <module>
     from .interface import (
@@ -2955,7 +2955,7 @@ AttributeError: module 'cutlass.cute.core' has no attribute 'ThrMma'
 stdout: ",,,
 kimi_k3,kimi_k3,flash_attention_4,bfloat16,top_left,2,2048,2048,96,96,192,128,bwd,True,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 1195, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 1195, in <module>
     import flash_attn.cute.interface as flash_attn_interface
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/flash_attn/cute/__init__.py"", line 3, in <module>
     from .interface import (
@@ -2969,7 +2969,7 @@ AttributeError: module 'cutlass.cute.core' has no attribute 'ThrMma'
 stdout: ",,,
 kimi_k3,kimi_k3,flash_attention_4,bfloat16,no_mask,2,2048,2048,96,96,192,128,fwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 1195, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 1195, in <module>
     import flash_attn.cute.interface as flash_attn_interface
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/flash_attn/cute/__init__.py"", line 3, in <module>
     from .interface import (
@@ -2983,7 +2983,7 @@ AttributeError: module 'cutlass.cute.core' has no attribute 'ThrMma'
 stdout: ",,,
 kimi_k3,kimi_k3,flash_attention_4,bfloat16,no_mask,2,2048,2048,96,96,192,128,bwd,False,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 1195, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 1195, in <module>
     import flash_attn.cute.interface as flash_attn_interface
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/flash_attn/cute/__init__.py"", line 3, in <module>
     from .interface import (
@@ -2997,7 +2997,7 @@ AttributeError: module 'cutlass.cute.core' has no attribute 'ThrMma'
 stdout: ",,,
 kimi_k3,kimi_k3,flash_attention_4,bfloat16,no_mask,2,2048,2048,96,96,192,128,bwd,True,inf,0.000,0.000,10,,False,"Benchmark failed with return code 1.
 stderr: Traceback (most recent call last):
-  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py"", line 1195, in <module>
+  File ""/data/vagarwalla/rtx6000_bench/cudnn-frontend/benchmark/attention_training/benchmark_single_sdpa.py"", line 1195, in <module>
     import flash_attn.cute.interface as flash_attn_interface
   File ""/data/vagarwalla/rtx6000_bench/venv/lib/python3.12/site-packages/flash_attn/cute/__init__.py"", line 3, in <module>
     from .interface import (

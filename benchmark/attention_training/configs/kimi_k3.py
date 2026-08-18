@@ -15,8 +15,8 @@ The absorbed decode shape (576/512 shared record) is covered by
 benchmark/attention_inference's kimi_k3 config.
 
 Usage:
-    python -m benchmark.sdpa_benchmark_training.runner --config kimi_k3
-    python -m benchmark.sdpa_benchmark_training.runner --config kimi_k3 --dry-run
+    python -m benchmark.attention_training.runner --config kimi_k3
+    python -m benchmark.attention_training.runner --config kimi_k3 --dry-run
 """
 
 from ..config_types import ModelPreset, BenchmarkConfig

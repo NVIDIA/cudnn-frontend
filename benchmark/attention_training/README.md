@@ -39,46 +39,46 @@ docker run -it --gpus all --rm cudnn_attention_benchmark
 
 ```bash
 # Run Llama 3.1 benchmark suite
-python -m benchmark.sdpa_benchmark_training.runner --config llama
+python -m benchmark.attention_training.runner --config llama
 
 # Run DeepSeek V3 benchmark suite
-python -m benchmark.sdpa_benchmark_training.runner --config dsv3
+python -m benchmark.attention_training.runner --config dsv3
 
 # Run Kimi-K2.6 benchmark suite
-python -m benchmark.sdpa_benchmark_training.runner --config kimiK26
+python -m benchmark.attention_training.runner --config kimiK26
 
 # Run GPT-OSS benchmark suite (sliding window attention, W=128)
-python -m benchmark.sdpa_benchmark_training.runner --config gpt_oss
+python -m benchmark.attention_training.runner --config gpt_oss
 
 # Run Wan 2.2 A14B benchmark suite
-python -m benchmark.sdpa_benchmark_training.runner --config wan22
+python -m benchmark.attention_training.runner --config wan22
 
 # Run LTX-2 benchmark suite
-python -m benchmark.sdpa_benchmark_training.runner --config ltx2
+python -m benchmark.attention_training.runner --config ltx2
 
 # Run Qwen 3.5 benchmark suite (cuDNN bf16 at head_dim=256)
-python -m benchmark.sdpa_benchmark_training.runner --config qwen35
+python -m benchmark.attention_training.runner --config qwen35
 
 # Run Qwen3-VL vision-encoder (ViT) benchmark suite (inference fwd-only)
-python -m benchmark.sdpa_benchmark_training.runner --config qwen3vl_vit
+python -m benchmark.attention_training.runner --config qwen3vl_vit
 
 # Run Autoregressive video DiT benchmark suite (short Q, long cached KV)
-python -m benchmark.sdpa_benchmark_training.runner --config auto_regressive_dit
+python -m benchmark.attention_training.runner --config auto_regressive_dit
 
 # Run Kimi K3 benchmark suite (MLA, 96 heads)
-python -m benchmark.sdpa_benchmark_training.runner --config kimi_k3
+python -m benchmark.attention_training.runner --config kimi_k3
 
 # Run DeepSeek-V4 benchmark suite (shared-K=V MQA, head_dim=512)
-python -m benchmark.sdpa_benchmark_training.runner --config deepseek_v4
+python -m benchmark.attention_training.runner --config deepseek_v4
 
 # Dry run (show what would be executed)
-python -m benchmark.sdpa_benchmark_training.runner --config llama --dry-run
+python -m benchmark.attention_training.runner --config llama --dry-run
 
 # Filter by backend
-python -m benchmark.sdpa_benchmark_training.runner --config llama --backend cudnn
+python -m benchmark.attention_training.runner --config llama --backend cudnn
 
 # Filter by data type
-python -m benchmark.sdpa_benchmark_training.runner --config llama --dtype bfloat16
+python -m benchmark.attention_training.runner --config llama --dtype bfloat16
 ```
 
 ## Configuration-Based Benchmarking
@@ -115,7 +115,7 @@ python -m benchmark.sdpa_benchmark_training.runner --config llama --dtype bfloat
 
 3. Run:
    ```bash
-   python -m benchmark.sdpa_benchmark_training.runner --config my_config
+   python -m benchmark.attention_training.runner --config my_config
    ```
 
 ### Configuration Options
@@ -237,7 +237,7 @@ The benchmark script above is useful for standalone SDPA timing. To compare thos
 
 ```bash
 # benchmark (CUPTI-style timing)
-python benchmark/sdpa_benchmark_training/benchmark_single_sdpa.py \
+python benchmark/attention_training/benchmark_single_sdpa.py \
     --batch_size 1 --q_seqlen 8192 --kv_seqlen 8192 \
     --num_q_heads 64 --num_kv_heads 8 --head_dim 128 \
     --sdpa_backend cudnn --data_type bfloat16 \
@@ -283,7 +283,7 @@ pytest -vv -s test/python/test_mhas_v2.py::test_repro --perf --timing_method eve
 ## Programmatic Usage
 
 ```python
-from benchmark.sdpa_benchmark_training import (
+from benchmark.attention_training import (
     BenchmarkRunner,
     BenchmarkConfig,
     ModelPreset,
@@ -377,7 +377,7 @@ Runs were captured on GB200 and GB300 with cuDNN 9.23.0 and FAv4 4.0.0b15.
 ![Autoregressive DiT on GB300](results/auto_regressive_dit/gb300/auto_regressive_dit_no_mask.png)
 - `batch=1; num_q_heads=9; num_kv_heads=9; head_dim=128; s_q ∈ {985..8192}; s_kv=62208`
 - Forward-only (autoregressive inference). cuDNN 9.30.0 with prefill split-K on bf16/fp8/mxfp8; FAv4 BF16 swept over `num_splits ∈ {1, 2, 4, 8, 16, 32}` with the best annotated on each bar (`ks=`). FAv4 FP8/MXFP8 are absent — the CuTe-DSL FAv4 build rejects those input types.
-- Reproduce with `python -m benchmark.sdpa_benchmark_training.bench_ar_dit_peak --out <path>`.
+- Reproduce with `python -m benchmark.attention_training.bench_ar_dit_peak --out <path>`.
 
 ### GB200 - Autoregressive video DiT
 ![Autoregressive DiT on GB200](results/auto_regressive_dit/gb200/auto_regressive_dit_no_mask.png)

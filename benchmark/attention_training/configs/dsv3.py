@@ -9,8 +9,8 @@ Only causal (top_left) mask - no non-causal benchmarks needed.
 Includes forward and backward pass benchmarking with deterministic mode options.
 
 Usage:
-    python -m benchmark.sdpa_benchmark_training.runner --config dsv3
-    python -m benchmark.sdpa_benchmark_training.runner --config dsv3 --dry-run
+    python -m benchmark.attention_training.runner --config dsv3
+    python -m benchmark.attention_training.runner --config dsv3 --dry-run
 """
 
 from ..config_types import ModelPreset, BenchmarkConfig

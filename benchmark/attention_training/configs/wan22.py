@@ -28,8 +28,8 @@ factors come from VAE x8 spatial + patchify x2.
     (75600, 81 frames, 720p 1280x720)
 
 Usage:
-    python -m benchmark.sdpa_benchmark_training.runner --config wan22
-    python -m benchmark.sdpa_benchmark_training.runner --config wan22 --dry-run
+    python -m benchmark.attention_training.runner --config wan22
+    python -m benchmark.attention_training.runner --config wan22 --dry-run
 """
 
 from ..config_types import ModelPreset, BenchmarkConfig

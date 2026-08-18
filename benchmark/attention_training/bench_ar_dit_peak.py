@@ -8,7 +8,7 @@ Sweeps FAv4 ``num_splits`` and reports the best, paired against cuDNN
 against a cuDNN build that has split-K so the comparison is split-KV
 on both sides).
 
-CSV schema matches the rest of ``benchmark.sdpa_benchmark_training``
+CSV schema matches the rest of ``benchmark.attention_training``
 plus an extra ``num_splits`` column so the per-seqlen winners are
 visible.
 """
@@ -27,7 +27,7 @@ log = logging.getLogger(__name__)
 import torch
 import cudnn
 
-from benchmark.sdpa_benchmark_training.benchmark_single_sdpa import run_benchmark
+from benchmark.attention_training.benchmark_single_sdpa import run_benchmark
 
 H = 9
 D = 128

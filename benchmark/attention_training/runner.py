@@ -9,12 +9,12 @@ from configuration files, and a CLI entry point.
 
 Usage:
     # Run from command line
-    python -m benchmark.sdpa_benchmark_training.runner --config mlperf
-    python -m benchmark.sdpa_benchmark_training.runner --config mlperf --dry-run
+    python -m benchmark.attention_training.runner --config mlperf
+    python -m benchmark.attention_training.runner --config mlperf --dry-run
 
     # Import and use programmatically
-    from benchmark.sdpa_benchmark_training.runner import BenchmarkRunner
-    from benchmark.sdpa_benchmark_training.configs import load_config
+    from benchmark.attention_training.runner import BenchmarkRunner
+    from benchmark.attention_training.configs import load_config
 
     config = load_config("mlperf")
     runner = BenchmarkRunner()
@@ -416,19 +416,19 @@ def main():
         epilog="""
 Examples:
     # Run all benchmarks from mlperf config
-    python -m benchmark.sdpa_benchmark_training.runner --config mlperf
+    python -m benchmark.attention_training.runner --config mlperf
 
     # Dry run (show what would be executed)
-    python -m benchmark.sdpa_benchmark_training.runner --config mlperf --dry-run
+    python -m benchmark.attention_training.runner --config mlperf --dry-run
 
     # Filter by model name
-    python -m benchmark.sdpa_benchmark_training.runner --config mlperf --filter llama3.1
+    python -m benchmark.attention_training.runner --config mlperf --filter llama3.1
 
     # Filter by backend
-    python -m benchmark.sdpa_benchmark_training.runner --config mlperf --backend cudnn
+    python -m benchmark.attention_training.runner --config mlperf --backend cudnn
 
     # Skip chart generation
-    python -m benchmark.sdpa_benchmark_training.runner --config mlperf --no-chart
+    python -m benchmark.attention_training.runner --config mlperf --no-chart
         """,
     )
 

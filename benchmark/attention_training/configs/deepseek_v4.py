@@ -20,8 +20,8 @@ d=512 heads also make this the support-surface probe for wide-head attention:
 unsupported (backend, pass) combos are recorded in the CSV rather than hidden.
 
 Usage:
-    python -m benchmark.sdpa_benchmark_training.runner --config deepseek_v4
-    python -m benchmark.sdpa_benchmark_training.runner --config deepseek_v4 --dry-run
+    python -m benchmark.attention_training.runner --config deepseek_v4
+    python -m benchmark.attention_training.runner --config deepseek_v4 --dry-run
 """
 
 from ..config_types import ModelPreset, BenchmarkConfig

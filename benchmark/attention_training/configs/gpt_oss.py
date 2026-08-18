@@ -2,28 +2,28 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Llama 3.1 SDPA Benchmark Configuration
+GPT OSS SDPA Benchmark Configuration
 
-Benchmarks Llama 3.1 405B-style GQA attention with both causal and non-causal masks.
-Includes forward and backward pass benchmarking with deterministic mode options.
+Benchmarks GPT-style attention with sliding window attention (SWA) and GQA.
+Uses a 128-token sliding window for local attention.
 
 Usage:
-    python -m benchmark.sdpa_benchmark_training.runner --config llama
-    python -m benchmark.sdpa_benchmark_training.runner --config llama --dry-run
+    python -m benchmark.attention_training.runner --config gpt_oss
+    python -m benchmark.attention_training.runner --config gpt_oss --dry-run
 """
 
 from ..config_types import ModelPreset, BenchmarkConfig
 
-LLAMA3_1 = ModelPreset(
-    name="llama3.1",
-    num_q_heads=64,
-    num_kv_heads=8,
-    head_dim=128,
+GPT_OSS = ModelPreset(
+    name="gpt_oss",
+    num_q_heads=128,
+    num_kv_heads=128,
+    head_dim=64,
 )
 
 CONFIG = BenchmarkConfig(
-    name="llama3.1",
-    models=[LLAMA3_1],
+    name="gpt_oss",
+    models=[GPT_OSS],
     seqlens=[
         (32768, 32768),
         (16384, 16384),
@@ -33,9 +33,10 @@ CONFIG = BenchmarkConfig(
     ],
     backends=["cudnn", "cudnn_oss", "flash_attention_4"],
     data_types=["bfloat16", "fp8", "mxfp8"],
-    attn_masks=["top_left", "no_mask"],  # Both causal and non-causal
+    attn_masks=["top_left"],  # Causal with sliding window
     profile_pass="both",  # Forward and backward
     deterministic_bwd=[False, True],
+    sliding_window_size=128,
     batch_size=2,
     num_iterations=10,
     output_dir="results",

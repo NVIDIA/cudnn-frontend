@@ -27,8 +27,8 @@ further patchify.
     (37632, 161 frames, 1024 x 1792)
 
 Usage:
-    python -m benchmark.sdpa_benchmark_training.runner --config ltx2
-    python -m benchmark.sdpa_benchmark_training.runner --config ltx2 --dry-run
+    python -m benchmark.attention_training.runner --config ltx2
+    python -m benchmark.attention_training.runner --config ltx2 --dry-run
 """
 
 from ..config_types import ModelPreset, BenchmarkConfig

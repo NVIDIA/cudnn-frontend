@@ -9,13 +9,13 @@ Scaled Dot Product Attention (SDPA) operations.
 
 Usage:
     # Run benchmarks from command line
-    python -m benchmark.sdpa_benchmark_training.runner --config mlperf
+    python -m benchmark.attention_training.runner --config mlperf
 
     # Dry run to see what would be executed
-    python -m benchmark.sdpa_benchmark_training.runner --config mlperf --dry-run
+    python -m benchmark.attention_training.runner --config mlperf --dry-run
 
     # Import and use programmatically
-    from benchmark.sdpa_benchmark_training import (
+    from benchmark.attention_training import (
         BenchmarkRunner,
         BenchmarkConfig,
         BenchmarkResult,

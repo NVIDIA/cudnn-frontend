@@ -17,8 +17,8 @@ This shape is the one cuDNN explicitly supports past head_dim=128 on both
 fwd AND bwd (requires cuDNN 9.19+), so full training benchmarking works.
 
 Usage:
-    python -m benchmark.sdpa_benchmark_training.runner --config kimiK26
-    python -m benchmark.sdpa_benchmark_training.runner --config kimiK26 --dry-run
+    python -m benchmark.attention_training.runner --config kimiK26
+    python -m benchmark.attention_training.runner --config kimiK26 --dry-run
 """
 
 from ..config_types import ModelPreset, BenchmarkConfig

@@ -26,8 +26,8 @@ the operator; frame-level autoregression is the outer loop), so the
 operator-level mask is ``no_mask``.
 
 Usage:
-    python -m benchmark.sdpa_benchmark_training.runner --config auto_regressive_dit
-    python -m benchmark.sdpa_benchmark_training.runner --config auto_regressive_dit --dry-run
+    python -m benchmark.attention_training.runner --config auto_regressive_dit
+    python -m benchmark.attention_training.runner --config auto_regressive_dit --dry-run
 """
 
 from ..config_types import ModelPreset, BenchmarkConfig

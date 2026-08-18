@@ -1,7 +1,7 @@
 # Attention Inference Benchmark
 
 Benchmarks attention for **inference**, split into two phases (mirroring
-forward/backward in `../sdpa_benchmark_training`):
+forward/backward in `../attention_training`):
 
 - **context** — prefill, in two kinds, both reported in **TFLOPS**:
   - *full*: `s_q == s_kv`, contiguous Q/K/V, compute-bound;
@@ -52,7 +52,7 @@ into the fp8 graph — those cases record as unsupported).
 MLA models run **absorbed** in generation (`kind="mla_absorbed"`: K reads the
 full record, V a leading slice of the *same* record, so KV bytes are counted
 once) and **unabsorbed** in prefill — which is dense training-style attention
-and lives in `../sdpa_benchmark_training`.
+and lives in `../attention_training`.
 
 ## Usage
 
@@ -82,3 +82,12 @@ are visible. Architectures are reported in isolation, never merged.
   descales).
 - cuDNN `sink_token` does not support s_q==1; sink decode rows on cudnn
   record that limitation.
+
+## qwen3vl_vit (vision-encoder inference)
+
+The Qwen3-VL vision tower's self-attention is an inference workload
+(forward-only, bidirectional over patch tokens), so it lives in this suite as
+a context-phase-only config (`configs/qwen3vl_vit.py`): an encoder has no KV
+cache, so there is no generation phase and no kv-cache dtype axis. It
+previously sat in the training suite; its results here are native
+inference-schema measurements.
