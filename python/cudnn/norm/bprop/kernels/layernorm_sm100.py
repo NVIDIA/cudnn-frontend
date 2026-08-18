@@ -412,6 +412,134 @@ def _ln_bwd_pipe_host(
         grid=(fgrid, nchunk, 1), block=(FB, 1, 1))
 
 
+# ---------------------------------------------------------------------------
+# Tiny-C (sub-warp, wn==1) RMS backward with MULTI-ROW TILING. One cp.async.bulk
+# loads RPT contiguous rows at once (a big transfer) instead of RPT tiny per-row
+# copies whose fixed overhead dominates at C=128 (bwd 0.45-0.58x -> 0.82-0.96x).
+# One compute warp processes the tile's rows in an inner loop; dgamma partials
+# accumulate in one warp (no cross-warp reduce). RMS only (has_mean=False).
+# ---------------------------------------------------------------------------
+
+
+@cute.kernel
+def _ln_bwd_tiled_kernel(
+    mDY: cute.Tensor, mX: cute.Tensor, mDXi: cute.Tensor, mGi: cute.Tensor, mRstd: cute.Tensor,
+    mDGp: cute.Tensor, R: cutlass.Int32, ctas: cutlass.Int32,
+    C: cutlass.Constexpr, V: cutlass.Constexpr, tpr: cutlass.Constexpr, ldgs: cutlass.Constexpr,
+    RPT: cutlass.Constexpr, et: cutlass.Constexpr, it_ty: cutlass.Constexpr, STAGES: cutlass.Constexpr,
+) -> None:
+    tid, _, _ = cute.arch.thread_idx()
+    bid, _, _ = cute.arch.block_idx()
+    warp = tid // 32
+    lane = tid % 32
+    TC: cutlass.Constexpr = RPT * C
+    smem = SmemAllocator()
+    xbuf = smem.allocate_tensor(cutlass.Int16, cute.make_layout(STAGES * TC), byte_alignment=16)
+    dybuf = smem.allocate_tensor(cutlass.Int16, cute.make_layout(STAGES * TC), byte_alignment=16)
+    sG = smem.allocate_tensor(cutlass.Int16, cute.make_layout(C), byte_alignment=16)
+    mbar = smem.allocate_tensor(cutlass.Int64, cute.make_layout(2 * STAGES + 1), byte_alignment=8)
+    GBAR: cutlass.Constexpr = 2 * STAGES
+    if tid == 0:
+        for j in cutlass.range_constexpr(2 * STAGES + 1):
+            nvvm.mbarrier_init(mbar.iterator + j, 1)
+        nvvm.mbarrier_arrive_expect_tx(mbar.iterator + GBAR, C * 2)
+        nvvm.cp_async_bulk_shared_cluster_global(sG.iterator, mGi.iterator, mbar.iterator + GBAR, C * 2)
+    cute.arch.sync_threads()
+    while not nvvm.mbarrier_try_wait_parity(mbar.iterator + GBAR, 0):
+        pass
+    NB: cutlass.Constexpr = TC * 2
+    ntiles = R // RPT
+    stride = ctas
+    Cf = cutlass.Float32(C)
+    rn = 1.0 / Cf
+    dgp = [cutlass.Float32(0.0)] * (ldgs * V)
+
+    if warp == 1:  # DMA warp
+        if lane == 0:
+            i = cutlass.Int32(0)
+            t = bid
+            while t < ntiles:
+                s = i % STAGES
+                if i >= STAGES:
+                    ep = ((i // STAGES) - 1) & 1
+                    while not nvvm.mbarrier_try_wait_parity(mbar.iterator + (STAGES + s), ep):
+                        pass
+                nvvm.mbarrier_arrive_expect_tx(mbar.iterator + s, 2 * NB)
+                base = cutlass.Int64(t) * TC
+                nvvm.cp_async_bulk_shared_cluster_global(xbuf.iterator + s * TC, mX.iterator + base, mbar.iterator + s, NB)
+                nvvm.cp_async_bulk_shared_cluster_global(dybuf.iterator + s * TC, mDY.iterator + base, mbar.iterator + s, NB)
+                i = i + 1
+                t = t + stride
+    else:  # single compute warp
+        i = cutlass.Int32(0)
+        t = bid
+        while t < ntiles:
+            s = i % STAGES
+            while not nvvm.mbarrier_try_wait_parity(mbar.iterator + s, (i // STAGES) & 1):
+                pass
+            sbase = s * TC
+            for rr in cutlass.range_constexpr(RPT):
+                row = t * RPT + rr
+                roff = sbase + rr * C
+                rstd = mRstd[row]
+                c2 = cutlass.Float32(0.0)
+                xh = [cutlass.Float32(0.0)] * (ldgs * V)
+                dh = [cutlass.Float32(0.0)] * (ldgs * V)
+                for it in cutlass.range_constexpr(ldgs):
+                    col0 = (it * tpr + tid) * V
+                    xv = nvvm.load_ext(xbuf.iterator + (roff + col0), dtype=it_ty, count=V, shared_space=_CTA_SS).bitcast(et)
+                    dyv = nvvm.load_ext(dybuf.iterator + (roff + col0), dtype=it_ty, count=V, shared_space=_CTA_SS).bitcast(et)
+                    gv = nvvm.load_ext(sG.iterator + col0, dtype=it_ty, count=V, shared_space=_CTA_SS).bitcast(et)
+                    for e in cutlass.range_constexpr(V):
+                        x = xv[e].to(cutlass.Float32)
+                        dy = dyv[e].to(cutlass.Float32)
+                        g = gv[e].to(cutlass.Float32)
+                        xhat = x * rstd
+                        dxhat = dy * g
+                        xh[it * V + e] = xhat
+                        dh[it * V + e] = dxhat
+                        c2 = c2 + dxhat * xhat
+                        dgp[it * V + e] = dgp[it * V + e] + dy * xhat
+                for k in cutlass.range_constexpr(5):
+                    off = 32 >> (k + 1)
+                    c2 = c2 + nvvm.shfl_sync(0xFFFFFFFF, c2, off, 0x1F, nvvm.Shfl.BFLY)
+                b = c2 * rn
+                base = cutlass.Int64(row) * C
+                for it in cutlass.range_constexpr(ldgs):
+                    col0 = (it * tpr + tid) * V
+                    ys = []
+                    for e in cutlass.range_constexpr(V):
+                        ys.append((rstd * (dh[it * V + e] - xh[it * V + e] * b)).to(et))
+                    nvvm.store_ext(cutlass.Vector.from_elements(tuple(ys), et).bitcast(it_ty), mDXi.iterator + (base + col0))
+            if tid == 0:
+                nvvm.mbarrier_arrive(mbar.iterator + (STAGES + s))
+            i = i + 1
+            t = t + stride
+        pbase = cutlass.Int64(bid) * C
+        for it in cutlass.range_constexpr(ldgs):
+            col0 = (it * tpr + tid) * V
+            for e in cutlass.range_constexpr(V):
+                mDGp[pbase + (col0 + e)] = dgp[it * V + e]
+
+
+@cute.jit
+def _ln_bwd_tiled_host(
+    mDY, mX, mDX, mGamma, mRstd, mDGp, mDGamma,
+    R: cutlass.Int32, ctas: cutlass.Int32,
+    C: cutlass.Constexpr, V: cutlass.Constexpr, tpr: cutlass.Constexpr, ldgs: cutlass.Constexpr,
+    RPT: cutlass.Constexpr, et: cutlass.Constexpr, it_ty: cutlass.Constexpr, STAGES: cutlass.Constexpr,
+    FB: cutlass.Constexpr, fgrid: cutlass.Constexpr, nchunk: cutlass.Constexpr, CHUNK: cutlass.Constexpr,
+    smem_bytes: cutlass.Constexpr,
+) -> None:
+    mDXi = cute.recast_tensor(mDX, it_ty)
+    mGi = cute.recast_tensor(mGamma, it_ty)
+    _ln_bwd_tiled_kernel(
+        mDY, mX, mDXi, mGi, mRstd, mDGp, R, ctas, C, V, tpr, ldgs, RPT, et, it_ty, STAGES,
+    ).launch(grid=(ctas, 1, 1), block=(64, 1, 1), smem=smem_bytes)
+    _ln_bwd_finalize_kernel(mDGp, mDGp, mDGamma, mDGamma, ctas, C, FB, CHUNK, False).launch(
+        grid=(fgrid, nchunk, 1), block=(FB, 1, 1))
+
+
 _PIPE_STAGES = 2
 _PIPE_SMEM_MAX = 228 * 1024
 _SM_COUNT = None
@@ -521,6 +649,59 @@ def _backward_pipe(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, params, wcfg
     return dx, dgamma, (dbeta if has_beta else None)
 
 
+_KTILED = {}
+
+
+def _backward_tiled(spec, dy2d, x2d, gamma, rstd, *, params, wcfg):
+    """Tiny-C (wn==1) RMS backward: multi-row tiled bulk-loads. Returns dgamma only
+    (RMS has no dbeta)."""
+    import torch
+
+    tpr, wn, ldgs, V = wcfg
+    R, C = spec.R, spec.M
+    STAGES = 2
+    RPT = 1
+    for r in (8, 4, 2):
+        if R % r == 0 and 2 * STAGES * r * C * 2 <= _PIPE_SMEM_MAX:
+            RPT = r
+            break
+    ntiles = R // RPT
+    ctas = min(ntiles, _sm_count() * 12)
+
+    dx = torch.empty_like(x2d)
+    dgamma = torch.zeros(spec.gamma_len, dtype=torch.float32, device=x2d.device)
+    dgp = torch.empty(ctas * C, dtype=torch.float32, device=x2d.device)
+
+    et = DTYPE_TO_CUTLASS[params.io_dtype]
+    it_ty = _INT_TY[DTYPE_BYTES[params.io_dtype]]
+    FB = 128 if C < 256 else 256
+    fgrid = (C + FB - 1) // FB
+    nchunk = max(1, min(32, 256 // fgrid))
+    if nchunk > ctas:
+        nchunk = ctas
+    CHUNK = (ctas + nchunk - 1) // nchunk
+    smem_bytes = 2 * STAGES * RPT * C * 2 + C * 2 + (2 * STAGES + 1) * 8 + 64
+
+    args = (dyn(dy2d), dyn(x2d), dyn(dx), dyn(gamma), dyn(rstd), dyn(dgp), dyn(dgamma),
+            cutlass.Int32(R), cutlass.Int32(ctas))
+    ce = (C, V, tpr, ldgs, RPT, et, it_ty, STAGES, FB, fgrid, nchunk, CHUNK, smem_bytes)
+    key = ("tiled", params.io_dtype, C, V, tpr, ldgs, RPT, nchunk, CHUNK)
+    fn = _KTILED.get(key)
+    if fn is None:
+        fn = cute.compile(_ln_bwd_tiled_host, *args, *ce)
+        _KTILED[key] = fn
+    fn(*args)
+    return dx, dgamma, None
+
+
+def _sm_count():
+    global _SM_COUNT
+    if _SM_COUNT is None:
+        import torch
+        _SM_COUNT = torch.cuda.get_device_properties(0).multi_processor_count
+    return _SM_COUNT
+
+
 _KCACHE = {}
 
 
@@ -529,6 +710,9 @@ def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, cfg, params):
     import torch
 
     wcfg = _bwd_pipe_cfg(spec.M, DTYPE_BYTES[params.io_dtype])
+    if wcfg is not None and wcfg[1] == 1 and not spec.has_mean and (spec.R % 2 == 0):
+        # tiny C (single warp per row) RMS: multi-row tiling beats the per-row pipeline
+        return _backward_tiled(spec, dy2d, x2d, gamma, rstd, params=params, wcfg=wcfg)
     if wcfg is not None and _pipe_bwd_eligible(spec.M, wcfg[1]):
         return _backward_pipe(spec, dy2d, x2d, gamma, mean, rstd, has_beta=has_beta, params=params, wcfg=wcfg)
 
