@@ -71,6 +71,38 @@ class _FrostSdpaFwdPlan(CompiledPlan):
         else:
             self._compiled(pack, stream=ctx.stream)
 
+    def _launch_sequence(self):
+        """Run the kernel over probe buffers and record what it launches.
+
+        The executor wants a pack keyed by the binding's own tensor objects, so
+        that is all this supplies; export itself is shared (CompiledPlan). The
+        probe buffers carry each tensor's graph strides, which for SDPA are a
+        BHSD view over BSHD storage rather than anything row-major.
+
+        INCOMPLETE, and it will say so rather than write a bad artifact. One
+        parameter is left: ``problem_size``, a tuple of six int32 passed as a
+        SINGLE argument, which the payload has no kind for. Adding one means a
+        tvm-ffi container built once at load -- building it per call would add
+        host cost to the path whose cheapness is the point.
+
+        Everything else about this plan does export: the recorder carves the
+        ``sinks`` / ``seq_kv`` / ``o_desc`` dummies (zero-filled stand-ins for
+        optional ports the graph did not ask for) out of the engine workspace,
+        and binds the keyword-called kernel positionally.
+        """
+        from cudnn.engines.cutedsl_aot import record_launch_sequence
+
+        required = self.get_workspace_size()
+
+        def run(buffers, workspace, stream):
+            pack = {t: buffers[t.get_uid()] for t in self._tensors}
+            if required:
+                self._compiled(pack, workspace, stream=stream)
+            else:
+                self._compiled(pack, stream=stream)
+
+        return record_launch_sequence(run, self._tensors, required)
+
 
 class FrostSdpaFwdEngine(BaseEngine):
     """One SDPA-forward capability cell (arch x phase x geometry x quantization).

@@ -35,7 +35,16 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, Mapping, Optional, Tuple
 
-from .engine_ids import FAMILY_BLOCK, FROST_GEMM_ID_BASE, FROST_SDPA_BWD_ID_BASE, FROST_SDPA_FWD_ID_BASE, GDN2_ID_BASE, GDN_ID_BASE, KDA_ID_BASE
+from .engine_ids import (
+    CUTEDSL_DEMO_ID_BASE,
+    FAMILY_BLOCK,
+    FROST_GEMM_ID_BASE,
+    FROST_SDPA_BWD_ID_BASE,
+    FROST_SDPA_FWD_ID_BASE,
+    GDN2_ID_BASE,
+    GDN_ID_BASE,
+    KDA_ID_BASE,
+)
 
 _LOG = logging.getLogger("cudnn.engines.manifest")
 
@@ -131,6 +140,15 @@ _ANCHOR_NODE_TO_FAMILY = {
     "GDN2_BWD": "gdn2",
 }
 
+# Consulted only when the anchors above name NOTHING. POINTWISE cannot be a
+# primary anchor -- family_for() returns None the moment two families are named,
+# so anchoring on it would knock every `matmul + pointwise` graph off the gemm
+# family. As a fallback it is safe by construction: a primary anchor always
+# wins, and this is reached only by a graph no shipping family claims.
+_FALLBACK_NODE_TO_FAMILY = {
+    "POINTWISE": "cutedsl_demo",
+}
+
 # ---------------------------------------------------------------------------
 # The manifest, one entry per family. Ids are pre-release (engine_ids.py), so
 # blocks may still be re-cut; once shipped, a slot is fixed forever because an
@@ -202,6 +220,23 @@ MANIFEST: Tuple[EngineFamily, ...] = (
         },
         analyzer=("cudnn.sdpa.graph_analyzer", "analyze"),
     ),
+    # The AOT export reference: two deliberately small CuTeDSL engines the
+    # samples and tests build against. opt_in, because a demo has no business
+    # competing for real pointwise graphs.
+    EngineFamily(
+        CUTEDSL_DEMO_ID_BASE,
+        "cutedsl_demo",
+        "cudnn.engines.cutedsl_demo",
+        "CuteDslDemoEngines",
+        # TMA first: both engines claim a contiguous fp32 add, and with no
+        # heuristics hook the first accepting engine wins. The TMA one declines
+        # anything not divisible by its 128x64 tile, so the plain engine still
+        # takes the shapes it is the sample's control for.
+        slots={
+            "cutedsl_tma_add": EngineSlot(0, opt_in=True),
+            "cutedsl_pointwise_add": EngineSlot(1, opt_in=True),
+        },
+    ),
 )
 
 
@@ -224,7 +259,10 @@ def family_for(graph) -> Optional[EngineFamily]:
     Does NOT decide coverage: an unlisted node type is ignored, so
     ``matmul -> reshape`` still classifies as gemm and the analyzer declines it.
     """
-    named = {_ANCHOR_NODE_TO_FAMILY[n] for n in graph_node_types(graph) if n in _ANCHOR_NODE_TO_FAMILY}
+    types = graph_node_types(graph)
+    named = {_ANCHOR_NODE_TO_FAMILY[n] for n in types if n in _ANCHOR_NODE_TO_FAMILY}
+    if not named:
+        named = {_FALLBACK_NODE_TO_FAMILY[n] for n in types if n in _FALLBACK_NODE_TO_FAMILY}
     if len(named) != 1:
         return None
     name = named.pop()  # once: a generator would re-pop on every iteration
