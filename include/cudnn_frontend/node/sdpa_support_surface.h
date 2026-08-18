@@ -49,9 +49,6 @@ SDPA_attributes::validate_sdpa_support_surface(const detail::Context& context,
     auto const& rng_tensor = outputs.find(SDPA_attributes::output_names::RNG_DUMP);
     bool const is_rng      = (rng_tensor != outputs.end() && rng_tensor->second != nullptr);
 
-    auto const& stats_out = outputs.find(SDPA_attributes::output_names::Stats);
-    bool const has_stats  = (stats_out != outputs.end()) && (stats_out->second != nullptr);
-
     bool const max_seq_kv_explicit = max_seq_len_kv.has_value();
 
     auto const& attn_scale    = inputs.find(SDPA_attributes::input_names::Attn_scale);
@@ -162,20 +159,9 @@ SDPA_attributes::validate_sdpa_support_surface(const detail::Context& context,
                                    error_code_t::ATTRIBUTE_NOT_SET,
                                    "Intermediate tensor data type needs to be set as internal tensors require it.");
 
-    // Non-ragged layouts other than BHSD are not correctly supported prior to 9.26.0.
-    if (has_stats && !stats_out->second->get_ragged_offset() && detail::get_backend_version() < 92600) {
-        auto const& stats_dim           = stats_out->second->get_dim();
-        auto const& stats_stride        = stats_out->second->get_stride();
-        bool const stats_is_packed_bhsd = stats_dim.size() == 4 && stats_stride.size() == 4 && stats_stride[3] == 1 &&
-                                          stats_stride[2] == stats_dim[3] &&
-                                          stats_stride[1] == stats_dim[2] * stats_dim[3] &&
-                                          stats_stride[0] == stats_dim[1] * stats_dim[2] * stats_dim[3];
-        RETURN_CUDNN_FRONTEND_ERROR_IF(
-            !stats_is_packed_bhsd,
-            error_code_t::GRAPH_NOT_SUPPORTED,
-            "For cuDNN version below 9.26.0, a non-ragged Stats output must be a packed BHSD "
-            "tensor.");
-    }
+    // The Stats layout check (packed BHSD required prior to 9.26.0) lives in
+    // SDPANode::post_validate_node(), as it must run after shape inference has
+    // filled in the dim/stride of an unset Stats output.
 
     if (mma_core_mode == DataType_t::FP8_E4M3 || mma_core_mode == DataType_t::FP8_E5M2) {
         // FP8 specific validation
