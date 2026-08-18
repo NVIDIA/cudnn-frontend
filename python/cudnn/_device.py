@@ -59,6 +59,40 @@ def _device_handle(device: int):
     return _ck(*drv.cuDeviceGet(device))
 
 
+def ensure_current_context(stream=None) -> None:
+    """Bind a driver context to the calling thread when none is bound.
+
+    JIT engines talk to the driver directly, which reads the calling THREAD's
+    context stack — and an autograd backward runs on a worker thread where
+    ``cudaSetDevice`` has only moved the runtime's thread-local slot. Prefer
+    the stream's context, else retain the runtime-current device's primary one
+    (the retain ref is held for the process lifetime, like the primary context
+    itself). Best-effort: a context this cannot establish fails at the launch,
+    with the launch's own diagnostics."""
+    try:
+        drv = _driver()
+        if drv is None:
+            return
+        err, cur = drv.cuCtxGetCurrent()
+        if int(err) == 0 and int(cur) != 0:
+            return
+        if stream:
+            err, sctx = drv.cuStreamGetCtx(int(stream))
+            if int(err) == 0:
+                drv.cuCtxSetCurrent(sctx)
+                return
+        import cuda.bindings.runtime as rt
+
+        err, device = rt.cudaGetDevice()
+        if int(err) != 0:
+            return
+        err, pctx = drv.cuDevicePrimaryCtxRetain(_device_handle(int(device)))
+        if int(err) == 0:
+            drv.cuCtxSetCurrent(pctx)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 class DeviceInfo:
     """Device facts for one CUDA ordinal, each queried from the driver on first
     access and cached on the instance. One instance per ordinal (via
