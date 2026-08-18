@@ -15,9 +15,22 @@ SUPPORTED_HEAD_DIMS = (32, 64, 128, 192, 256)
 
 
 def padded_head_dim(d: int) -> "int | None":
-    """Smallest native bin >= ``d``, or ``None`` when ``d`` exceeds every bin."""
+    """Smallest native kernel head-dim size >= ``d``, or ``None`` when ``d`` exceeds them all."""
 
     return min((b for b in SUPPORTED_HEAD_DIMS if b >= d), default=None)
+
+
+def padded_head_dims(d_qk: int, d_v: int) -> "tuple[int, int] | None":
+    """Native kernel head-dim sizes for a head-dim pair."""
+
+    d_qk_pad = padded_head_dim(d_qk)
+    d_v_pad = padded_head_dim(d_v)
+    if d_qk_pad is None or d_v_pad is None:
+        return None
+    # Unequal dims must both be multiples of 64 (one smem swizzle).
+    if d_v_pad != d_qk_pad:
+        d_v_pad = max(d_v_pad, 64)
+    return d_qk_pad, d_v_pad
 
 
 @dataclass(frozen=True)

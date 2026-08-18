@@ -179,6 +179,8 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
             return f"head dims (D_QK={facts.d_qk}, D_V={facts.d_v}) exceed the {max(capabilities.d)} envelope"
     elif facts.d_qk not in capabilities.d:
         return f"serves D in {sorted(capabilities.d)}; graph has D={facts.d_qk}"
+    elif facts.d_v not in capabilities.d:
+        return f"serves D_V in {sorted(capabilities.d)}; graph has D_V={facts.d_v}"
     if facts.dtype not in capabilities.dtypes:
         return f"dtype {facts.dtype} not in {sorted(str(d) for d in capabilities.dtypes)}"
     if not facts.uniform_dtype:
@@ -261,6 +263,7 @@ def _sm120_spec() -> EngineSpec:
             sm_hi=_BLACKWELL_GEFORCE[1],
             # Any head size multipled of 8
             d=frozenset(range(8, max(_SM120_HEAD_DIMS) + 1, 8)),
+            dqk_ge_dv=True,
             dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
             gqa=True,
             causal=True,

@@ -145,16 +145,25 @@ warp-partition triple:
 | 192 | 32 × 64 | double-buffered Q at the default config |
 | 256 | 32 × 64 | SMEM-bound: single-buffered Q at the default config |
 
-SMEM per CTA is `(Q_STAGES + 1)·M·D + N·D + max(N·D, 2·M·N)` elements against
-the ~99 KB SM120 cap. The constructor tries `Q_STAGES = 2` and falls back to a
-**single Q buffer** when it doesn't fit; among the default configs, this occurs
-at D=256. In the single-buffer branch the iteration reorders GEMM5 *before*
-GEMM4 (GEMM5 is sQ's last reader), so the Q refill for the next tile hides
-behind GEMM4 and the dQ scatter instead of stalling the loop. Head dims that
-are multiples of 8 but are not native sizes are zero-padded by the adapter
-(pad columns contribute nothing anywhere in the chain). Explicit
-`tile_m`/`tile_n` knobs override the Q/KV tile defaults; off-table combinations
-derive their warp partitions from a largest-valid rule.
+SMEM per CTA is `Q_STAGES·tile_q·d_qk + tile_q·d_v + tile_kv·d_qk +
+max(tile_kv·d_v, 2·tile_q·tile_kv)` elements against the ~99 KB SM120 cap.
+The constructor tries `Q_STAGES = 2` and falls back to a **single Q buffer**
+when it does not fit; among the default configs, this occurs at D=256. In
+the single-buffer branch the iteration reorders GEMM5 *before* GEMM4 (GEMM5
+is sQ's last reader), so the Q refill for the next tile hides behind GEMM4
+and the dQ scatter instead of stalling the loop. Head dims that are multiples
+of 8 but are not native sizes are zero-padded by the adapter (pad columns
+contribute nothing anywhere in the chain). Explicit `tile_m`/`tile_n` knobs
+override the Q/KV tile defaults; off-table combinations derive their warp
+partitions from a largest-valid rule.
+
+The Q/K head dim may exceed the V head dim (MLA: DeepSeek-V3 and Kimi-K2.6
+train at 192/128). `d_qk` sizes Q/K/dQ/dK and `d_v` sizes V/O/dO/dV: GEMM1
+contracts over `d_qk`, GEMM2 over `d_v`, and dK/dV share one warp partition
+with per-side column slices. Tile defaults come from `d_qk`. Unequal dims
+must both be multiples of 64 (one smem page/swizzle); the adapter pads each
+side to its own native kernel size and raises the VO side to at least 64
+when the sizes differ.
 
 ### dQ scatter and the scrambled workspace
 
@@ -236,7 +245,9 @@ only the unused relay operand remains in the kernel ABI.
 - SM120 and SM121, e.g. RTX 5090, RTX PRO 6000 Blackwell, and DGX Spark
 - Dtypes: FP16 / BF16 (LSE fp32)
 - Head dims: 32/64/128/192/256 natively; any other multiple of 8 up to 256 is
-  served by zero-padding D to the next supported size (`d_qk == d_v`)
+  served by zero-padding D to the next supported size. Rectangular
+  `d_qk >= d_v` (MLA, e.g. 192/128) is supported: each side pads to its own
+  native size (the VO side raises to >= 64 when the sizes differ)
 - Masks: none, causal (top-left or bottom-right), right-band-widened causal
   (`diagonal_band_right_bound` > 0, the causal diagonal shifted right by a
   compile-time R), sliding window (left-window offset, with or without
@@ -251,6 +262,7 @@ only the unused relay operand remains in the kernel ABI.
 - No dropout / bias / ALiBi / softcap / THD
 - Workspace (carved from the caller's buffer): fp32 `delta` and `dq_accum`
   scratch plus int32 relay-counter storage (reserved in both modes); GQA adds
-  the io-dtype `dk_ws`/`dv_ws` partials buffers (`B·S_kv·H_q·D_padded`
-  elements each, where `D_padded` is the adapter's zero-padded head
-  dimension); use `scratch_workspace_bytes()` for the exact total
+  the io-dtype `dk_ws`/`dv_ws` partials buffers (`B·S_kv·H_q·d_qk_padded` and
+  `B·S_kv·H_q·d_v_padded` elements, where `d_*_padded` are the adapter's
+  zero-padded head dimensions); use `scratch_workspace_bytes()` for the exact
+  total
