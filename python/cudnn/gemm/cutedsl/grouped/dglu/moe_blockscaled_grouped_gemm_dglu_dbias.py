@@ -259,6 +259,7 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
         weight_mode: MoEWeightMode = MoEWeightMode.DISCRETE,
         use_dynamic_sched: bool = False,
         act_func: str = "dswiglu",
+        situ_beta1: float = 4.0,
         use_single_group_runtime_offsets: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled grouped GEMM dGLU kernel.
@@ -374,6 +375,7 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
         self.weight_mode = weight_mode
 
         self.act_func = act_func
+        self.situ_beta1 = float(situ_beta1)
 
     def _setup_attributes(self):
         """Set up configurations that are dependent on GEMM inputs
@@ -1904,11 +1906,41 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
             up = up_vec[i].to(cutlass.Float32) * beta_val
             gate_tanh = cute.math.tanh(gate / beta1, fastmath=True)
             up_tanh = cute.math.tanh(up / beta2, fastmath=True)
-            sigmoid = cute.arch.rcp_approx(cutlass.Float32(1.0) + cute.math.exp(-gate, fastmath=True))
+            if cutlass.const_expr(self.situ_beta1 == 4.0):
+                # For a = tanh(gate / 4), sigmoid(gate) = 1/2 + a / (1 + a^2).
+                gate_tanh_sq = gate_tanh * gate_tanh
+                gate_tanh_denom_rcp = cute.arch.rcp_approx(
+                    cutlass.Float32(1.0) + gate_tanh_sq
+                )
+                sigmoid = (
+                    cutlass.Float32(0.5) + gate_tanh * gate_tanh_denom_rcp
+                )
+            else:
+                sigmoid = cute.arch.rcp_approx(
+                    cutlass.Float32(1.0) + cute.math.exp(-gate, fastmath=True)
+                )
             gate_value = beta1 * gate_tanh * sigmoid
             up_value = beta2 * up_tanh
-            gate_grad = (cutlass.Float32(1.0) - gate_tanh * gate_tanh) * sigmoid
-            gate_grad = gate_grad + beta1 * gate_tanh * sigmoid * (cutlass.Float32(1.0) - sigmoid)
+            if cutlass.const_expr(self.situ_beta1 == 4.0):
+                # d[4*a*sigmoid(gate)]/dgate, expressed with the same reciprocal.
+                gate_grad = (cutlass.Float32(1.0) - gate_tanh_sq) * (
+                    cutlass.Float32(0.5)
+                    + cutlass.Float32(2.0)
+                    * gate_tanh
+                    * gate_tanh_denom_rcp
+                    * gate_tanh_denom_rcp
+                )
+            else:
+                gate_grad = (
+                    cutlass.Float32(1.0) - gate_tanh * gate_tanh
+                ) * sigmoid
+                gate_grad = (
+                    gate_grad
+                    + beta1
+                    * gate_tanh
+                    * sigmoid
+                    * (cutlass.Float32(1.0) - sigmoid)
+                )
             up_grad = cutlass.Float32(1.0) - up_tanh * up_tanh
             activation_grad = grad
             if cutlass.const_expr(self.has_prob):

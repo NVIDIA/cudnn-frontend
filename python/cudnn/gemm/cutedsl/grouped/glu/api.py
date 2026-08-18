@@ -190,6 +190,7 @@ class GroupedGemmGluSm100(APIBase):
         m_aligned: int = 256,
         discrete_col_sfd: bool = False,
         act_func: str = "swiglu",
+        situ_beta1: float = 4.0,
         b_major: str = "k",
         use_dynamic_sched: bool = False,
         use_single_group_runtime_offsets: bool = False,
@@ -659,6 +660,7 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall) -> TupleDict:
         return static_shape_suffix, stride_signature, tensor.dtype
 
     use_full_dynamic = is_dense and os.environ.get("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", "1") != "0"
+    situ_beta1_cache_signature = float(situ_beta1) if act_func == "situglu" else None
 
     device_type = get_device_type()
 
@@ -667,6 +669,7 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall) -> TupleDict:
             device_type,
             weight_mode,
             act_func,
+            situ_beta1_cache_signature,
             use_full_dynamic,
             a_tensor.shape[1:] if not use_full_dynamic else None,
             b_tensor.shape[2] if use_full_dynamic else tuple(b_tensor.shape),
@@ -711,6 +714,7 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall) -> TupleDict:
             device_type,
             weight_mode,
             act_func,
+            situ_beta1_cache_signature,
             a_tensor.shape[1:],
             stride_order(a_tensor),
             a_tensor.dtype,
@@ -784,6 +788,7 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall) -> TupleDict:
                 m_aligned=m_aligned,
                 discrete_col_sfd=discrete_col_sfd,
                 act_func=act_func,
+                situ_beta1=situ_beta1,
                 use_dynamic_sched=use_dynamic_sched,
                 use_single_group_runtime_offsets=use_single_group_runtime_offsets,
             )
@@ -814,6 +819,7 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall) -> TupleDict:
                 m_aligned=m_aligned,
                 discrete_col_sfd=discrete_col_sfd,
                 act_func=act_func,
+                situ_beta1=situ_beta1,
                 b_major=b_major,
                 use_dynamic_sched=use_dynamic_sched,
                 use_single_group_runtime_offsets=use_single_group_runtime_offsets,

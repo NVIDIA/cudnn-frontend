@@ -263,6 +263,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
         weight_mode: MoEWeightMode = MoEWeightMode.DISCRETE,
         use_dynamic_sched: bool = False,
         act_func: str = "swiglu",
+        situ_beta1: float = 4.0,
         enable_bias: bool = False,
         use_single_group_runtime_offsets: bool = False,
     ):
@@ -381,6 +382,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
         self.num_epilog_warps = len(self.epilog_warp_id)
 
         self.act_func = act_func
+        self.situ_beta1 = float(situ_beta1)
         if act_func not in ["swiglu", "geglu", "situglu"]:
             raise ValueError(f"Invalid activation function: {act_func}")
 
@@ -1578,7 +1580,15 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
             up = acc_vec_up[i]
             gate_tanh = cute.math.tanh(gate / beta1, fastmath=True)
             up_tanh = cute.math.tanh(up / beta2, fastmath=True)
-            sigmoid = cute.arch.rcp_approx(cutlass.Float32(1.0) + cute.math.exp(-gate, fastmath=True))
+            if cutlass.const_expr(self.situ_beta1 == 4.0):
+                # For a = tanh(gate / 4), sigmoid(gate) = 1/2 + a / (1 + a^2).
+                sigmoid = cutlass.Float32(0.5) + gate_tanh * cute.arch.rcp_approx(
+                    cutlass.Float32(1.0) + gate_tanh * gate_tanh
+                )
+            else:
+                sigmoid = cute.arch.rcp_approx(
+                    cutlass.Float32(1.0) + cute.math.exp(-gate, fastmath=True)
+                )
             tCompute[i] = beta1 * gate_tanh * sigmoid * beta2 * up_tanh
             if cutlass.const_expr(self.has_prob):
                 tCompute[i] = tCompute[i] * mProb

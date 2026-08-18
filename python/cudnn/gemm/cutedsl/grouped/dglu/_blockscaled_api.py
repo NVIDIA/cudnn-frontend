@@ -762,6 +762,7 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
             weight_mode=self.weight_mode,
             act_func=self.act_func,
             use_dynamic_sched=self.use_dynamic_sched,
+            **({"situ_beta1": self.situ_beta1} if not self._is_rubin_kernel else {}),
             **rubin_single_group_offsets_kwarg(self._is_rubin_kernel, self.use_single_group_runtime_offsets),
             # Only the Rubin kernel accepts sf_fp8_dtype_override, and check_support
             # rejects "e5m3" unless _is_rubin_kernel -- the same flag that selected
