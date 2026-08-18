@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import threading
 from typing import Optional
 
 import pytest
@@ -164,3 +165,149 @@ def test_agg_simple_low_precision(dtype):
     actual.sum().backward()
     expected.sum().backward()
     torch.testing.assert_close(features.grad, expected_features.grad, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.L0
+def test_agg_simple_usage():
+    _require_gnn_agg_simple()
+    graph = CscGraph(
+        torch.tensor([0, 2, 4], device="cuda", dtype=torch.int32),
+        torch.tensor([0, 1, 1, 2], device="cuda", dtype=torch.int32),
+        num_src_nodes=3,
+    )
+    features = torch.arange(12, device="cuda", dtype=torch.float32).reshape(3, 4).requires_grad_()
+
+    output = agg_simple(graph, node_features=features, aggr="mean")
+
+    expected = torch.stack(((features[0] + features[1]) / 2, (features[1] + features[2]) / 2))
+    torch.testing.assert_close(output, expected)
+    output.sum().backward()
+    torch.testing.assert_close(
+        features.grad,
+        torch.tensor([[0.5] * 4, [1.0] * 4, [0.5] * 4], device="cuda"),
+    )
+
+
+@pytest.mark.L0
+def test_agg_simple_compatibility_wrappers():
+    _require_gnn_agg_simple()
+    graph = CscGraph(
+        torch.tensor([0, 2, 4], device="cuda", dtype=torch.int32),
+        torch.tensor([0, 1, 1, 2], device="cuda", dtype=torch.int32),
+        num_src_nodes=3,
+    )
+    node = torch.randn((3, 4), device="cuda")
+    edge = torch.randn((4, 2), device="cuda")
+    torch.testing.assert_close(agg_simple_n2n(node, graph), agg_simple(graph, node_features=node))
+    torch.testing.assert_close(agg_simple_e2n(edge, graph), agg_simple(graph, edge_features=edge))
+    torch.testing.assert_close(agg_simple_n2n_e2n(node, edge, graph), agg_simple(graph, node_features=node, edge_features=edge))
+
+
+@pytest.mark.L0
+def test_agg_simple_empty_destination_set():
+    graph = CscGraph(
+        torch.tensor([0], device="cuda", dtype=torch.int32),
+        torch.empty((0,), device="cuda", dtype=torch.int32),
+        num_src_nodes=3,
+    )
+    features = torch.randn((3, 4), device="cuda", requires_grad=True)
+    output = agg_simple_n2n(features, graph)
+    assert output.shape == (0, 4)
+    output.sum().backward()
+    torch.testing.assert_close(features.grad, torch.zeros_like(features))
+
+
+@pytest.mark.L0
+def test_agg_simple_rejects_invalid_inputs():
+    offsets = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+    indices = torch.tensor([0], device="cuda", dtype=torch.int32)
+    graph = CscGraph(offsets, indices, num_src_nodes=1)
+    features = torch.randn((1, 2), device="cuda")
+
+    with pytest.raises(ValueError, match="Unsupported aggregation"):
+        agg_simple_n2n(features, graph, aggr="product")
+    with pytest.raises(TypeError, match="indices dtype"):
+        agg_simple_n2n(features, CscGraph(offsets, indices.to(torch.int64), num_src_nodes=1))
+    with pytest.raises(ValueError, match="zero edges"):
+        agg_simple_n2n(
+            features,
+            CscGraph(torch.tensor([0, 0], device="cuda", dtype=torch.int32), torch.empty(0, device="cuda", dtype=torch.int32), 1),
+        )
+
+
+@pytest.mark.L0
+def test_agg_simple_uses_current_stream():
+    _require_gnn_agg_simple()
+    graph = CscGraph(
+        torch.tensor([0, 2, 4], device="cuda", dtype=torch.int32),
+        torch.tensor([0, 1, 1, 2], device="cuda", dtype=torch.int32),
+        num_src_nodes=3,
+    )
+    features = torch.randn((3, 8), device="cuda")
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        actual = agg_simple_n2n(features, graph)
+    stream.synchronize()
+    torch.testing.assert_close(actual, _reference(graph, features, None, None, "sum"))
+
+
+@pytest.mark.L0
+def test_agg_simple_backward_initializes_cuda_context_on_new_thread():
+    _require_gnn_agg_simple()
+    offsets = torch.tensor([0, 2, 4], device="cuda", dtype=torch.int32)
+    indices = torch.tensor([0, 1, 1, 2], device="cuda", dtype=torch.int32)
+    grad_output = torch.arange(6, device="cuda", dtype=torch.float32).reshape(2, 3)
+    grad_edge = torch.empty((4, 3), device="cuda", dtype=torch.float32)
+    backward_args = (
+        0,
+        offsets.data_ptr(),
+        indices.data_ptr(),
+        0,
+        3,
+        2,
+        4,
+        4,  # CUDNN_DATA_INT32
+        grad_output.data_ptr(),
+        0,
+        0,
+        grad_edge.data_ptr(),
+        0,
+        0,
+        3,
+        0,
+        0,  # CUDNN_DATA_FLOAT
+        0,  # CUDNN_GNN_AGG_SUM
+    )
+    errors = []
+
+    def run_backward():
+        try:
+            # Make no CUDA calls on this worker before entering the binding.
+            cudnn.gnn_agg_simple_backward(*backward_args)
+        except Exception as error:
+            errors.append(error)
+
+    worker = threading.Thread(target=run_backward)
+    worker.start()
+    worker.join()
+
+    if errors:
+        raise errors[0]
+    torch.testing.assert_close(grad_edge, grad_output.repeat_interleave(2, dim=0))
+
+
+@pytest.mark.L0
+def test_agg_simple_torch_compile():
+    _require_gnn_agg_simple()
+    graph = CscGraph(
+        torch.tensor([0, 2, 4], device="cuda", dtype=torch.int32),
+        torch.tensor([0, 1, 1, 2], device="cuda", dtype=torch.int32),
+        num_src_nodes=3,
+    )
+
+    def fn(features):
+        return agg_simple_n2n(features, graph, aggr="sum")
+
+    features = torch.randn((3, 4), device="cuda")
+    compiled = torch.compile(fn, backend="eager", fullgraph=True)
+    torch.testing.assert_close(compiled(features), fn(features))
