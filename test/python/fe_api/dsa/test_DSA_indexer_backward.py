@@ -651,9 +651,25 @@ _BF16_OUT_BAND = 3e-3
 _DK_ATOMIC_BAND = 1e-3
 
 
-@pytest.mark.L0
+# Each topk compiles its own SM100 kernel variant (20-60 s apiece), so the
+# default L0 smoke run keeps exactly one numeric point: topk=512, which
+# exercises the multi-I-block path (4 blocks of 128). The rest of the sweep --
+# including the topk=2048 smem-cap boundary -- runs at L1, per test/AGENTS.md
+# ("L0 must stay fast (default CI smoke); big parameter sweeps go to higher
+# levels").
+_V2_TOPK_PARAMS = [
+    pytest.param(128, marks=pytest.mark.L1),
+    pytest.param(256, marks=pytest.mark.L1),
+    pytest.param(384, marks=pytest.mark.L1),
+    pytest.param(512, marks=pytest.mark.L0),
+    pytest.param(640, marks=pytest.mark.L1),
+    pytest.param(1024, marks=pytest.mark.L1),
+    pytest.param(2048, marks=pytest.mark.L1),
+]
+
+
 @torch_fork_set_rng(seed=0)
-@pytest.mark.parametrize("topk", (128, 256, 384, 512, 640, 1024, 2048))
+@pytest.mark.parametrize("topk", _V2_TOPK_PARAMS)
 @with_dsa_indexer_backward_params
 def test_DSA_indexer_backward_wrapper_v2(
     dtype,
@@ -774,7 +790,7 @@ def test_DSA_indexer_backward_wrapper_v2(
         assert dk_rr < _BF16_OUT_BAND, f"topk={topk}: d_index_k rms_rel {dk_rr:.3e} vs fp64 oracle above the bf16-output band"
 
 
-@pytest.mark.L0
+@pytest.mark.L1
 @torch_fork_set_rng(seed=0)
 @pytest.mark.parametrize("topk", (256, 384))
 @with_dsa_indexer_backward_params
@@ -863,7 +879,7 @@ def test_DSA_indexer_backward_wrapper_v2_low_tile_metadata_war(
     assert dq_rr < _BF16_OUT_BAND, f"topk={topk}: d_index_q rms_rel {dq_rr:.3e} above the bf16-output band"
 
 
-@pytest.mark.L0
+@pytest.mark.L1
 @torch_fork_set_rng(seed=0)
 @with_dsa_indexer_backward_params
 def test_DSA_indexer_backward_wrapper_v2_full_valid_topk2048(
@@ -1042,7 +1058,7 @@ def test_DSA_indexer_backward_wrapper_v2_envelope_rejection(
     assert torch.equal(attn_score, attn_before), "rejected request must not mutate attn_score"
 
 
-@pytest.mark.L0
+@pytest.mark.L1
 @torch_fork_set_rng(seed=0)
 @with_dsa_indexer_backward_params
 def test_DSA_indexer_backward_wrapper_v2_batch_local_global_oob(
@@ -1141,7 +1157,7 @@ def test_DSA_indexer_backward_wrapper_v2_batch_local_global_oob(
         )
 
 
-@pytest.mark.L0
+@pytest.mark.L1
 @torch_fork_set_rng(seed=0)
 @with_dsa_indexer_backward_params
 def test_DSA_indexer_backward_wrapper_v2_sm_scale(
@@ -1242,7 +1258,7 @@ def test_DSA_indexer_backward_wrapper_v2_sm_scale(
         )
 
 
-@pytest.mark.L0
+@pytest.mark.L1
 @torch_fork_set_rng(seed=0)
 @with_dsa_indexer_backward_params
 def test_DSA_indexer_backward_wrapper_v2_fp32_outputs(
@@ -1407,7 +1423,7 @@ def _v2_plan_cache():
     return _api._cache_of_IndexerBackwardObjects
 
 
-@pytest.mark.L0
+@pytest.mark.L1
 @torch_fork_set_rng(seed=0)
 @with_dsa_indexer_backward_params
 def test_DSA_indexer_backward_wrapper_v2_stream_none_ambient_streams(
@@ -1531,7 +1547,7 @@ def test_DSA_indexer_backward_wrapper_v2_stream_none_ambient_streams(
             assert _rms_rel(r["d_index_k"], refs[lane]["d_index_k"].double()) < _DK_ATOMIC_BAND, f"ambient stream {lane} iter {it}: d_index_k diverged"
 
 
-@pytest.mark.L0
+@pytest.mark.L1
 @torch_fork_set_rng(seed=0)
 @with_dsa_indexer_backward_params
 def test_DSA_indexer_backward_wrapper_v2_stream_per_thread_two_threads(
