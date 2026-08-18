@@ -132,10 +132,10 @@ edges is not yet supported by the backend binding.
 ## Benchmark
 
 The benchmark separates reusable model shapes, execution, and command-line
-orchestration under `benchmark/gnn`:
+orchestration under `benchmark/gnn/agg_simple`:
 
 ```bash
-python benchmark/gnn/harness.py \
+python benchmark/gnn/agg_simple/harness.py \
     --shape medium \
     --dtype float32 \
     --aggr sum \

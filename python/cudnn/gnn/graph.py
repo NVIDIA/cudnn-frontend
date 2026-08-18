@@ -4,8 +4,6 @@
 from dataclasses import dataclass
 from typing import Optional
 
-import torch
-
 from torch import Tensor
 
 
@@ -45,44 +43,3 @@ class CscGraph:
     @property
     def num_indices(self) -> int:
         return self.num_edges
-
-
-def agg_simple(
-    graph: CscGraph,
-    *,
-    node_features: Optional[Tensor] = None,
-    edge_features: Optional[Tensor] = None,
-    concat_features: Optional[Tensor] = None,
-    aggr: str = "sum",
-) -> Tensor:
-    """Aggregate CSC-neighbor node/edge features and optionally append destination features."""
-
-    output, _ = torch.ops.cudnn.gnn_agg_simple_fwd(
-        graph.offsets,
-        graph.indices,
-        graph.map_csc_to_coo,
-        node_features,
-        edge_features,
-        concat_features,
-        graph.num_src_nodes,
-        aggr,
-    )
-    return output
-
-
-def agg_simple_n2n(feat: Tensor, graph: CscGraph, aggr: str = "sum") -> Tensor:
-    """Compatibility wrapper for node-to-node aggregation."""
-
-    return agg_simple(graph, node_features=feat, aggr=aggr)
-
-
-def agg_simple_e2n(edge_feat: Tensor, graph: CscGraph, aggr: str = "sum") -> Tensor:
-    """Compatibility wrapper for edge-to-node aggregation."""
-
-    return agg_simple(graph, edge_features=edge_feat, aggr=aggr)
-
-
-def agg_simple_n2n_e2n(node_feat: Tensor, edge_feat: Tensor, graph: CscGraph, aggr: str = "sum") -> Tensor:
-    """Compatibility wrapper for combined node-to-node and edge-to-node aggregation."""
-
-    return agg_simple(graph, node_features=node_feat, edge_features=edge_feat, aggr=aggr)
