@@ -315,7 +315,7 @@ def test_state_v_first_routing(state_v_first, expect_native):
         assert fs_cud.shape == (m["q"].shape[0], m["v"].shape[2], m["v"].shape[3], m["q"].shape[3])
     else:
         assert got.startswith("fallback"), f"state_v_first={state_v_first}: expected fallback, got {got}"
-        o_fla, fs_fla = chunk_gated_delta_rule(
+        o_fla, _ = chunk_gated_delta_rule(
             lv["q"],
             lv["k"],
             lv["v"],

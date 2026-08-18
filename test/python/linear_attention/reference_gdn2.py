@@ -92,8 +92,7 @@ def gdn2_reference(
             per-key erase gate); w: ``[B, T, Hw, V]`` (per-value write gate).
             Head counts must divide ``HO = max(Hq, Hv)``.
         scale: applied to q; defaults to ``1/sqrt(K)``.
-        initial_state: ``[B, HO, V, K]`` (or ``[N, HO, V, K]`` with cu_seqlens), V-major,
-            V-major.
+        initial_state: ``[B, HO, V, K]`` (or ``[N, HO, V, K]`` with cu_seqlens), V-major.
         cu_seqlens: packed varlen boundaries (requires B == 1).
         safe_gate: treat ``g`` as raw logits and use the log decay
             ``gate_lower_bound * sigmoid(exp(a_log) * (g + dt_bias))``

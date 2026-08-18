@@ -658,7 +658,7 @@ def test_checkpoints_match_prefix_final_states(backend, variant):
     ckpt = CHUNK[variant]
     T = 5 * ckpt
     case = make_case(variant, torch.bfloat16, T=T)
-    o, fs, state_checkpoints = run_fwd(backend, case, output_final_state=True, checkpoint_every_n_tokens=ckpt)
+    _, _, state_checkpoints = run_fwd(backend, case, output_final_state=True, checkpoint_every_n_tokens=ckpt)
     valid = (T - 1) // ckpt + 1
     assert state_checkpoints.shape == (T // ckpt + 1, case.HO, case.V, case.K)
     assert state_checkpoints.dtype == case.dtype
@@ -671,7 +671,7 @@ def test_checkpoints_match_prefix_final_states(backend, variant):
             args.append(to_thd(case.gates["w"])[:n])
         cu_n = torch.tensor([0, n], dtype=torch.int32, device="cuda")
         with waive_unsupported(backend, variant):
-            o, fs_p = pinned_op(backend, variant)(*args, cu_n, output_final_state=True)
+            _, fs_p = pinned_op(backend, variant)(*args, cu_n, output_final_state=True)
         assert_rms_close(f"state_checkpoints[{j}]", state_checkpoints[j], fs_p[0], STATE_TOL[case.dtype])
 
 
@@ -682,7 +682,7 @@ def test_checkpoints_varlen(backend, variant):
     ckpt = CHUNK[variant]
     seq_lens = [3 * ckpt + 5, ckpt - 1, 0, 2 * ckpt]
     case = make_case(variant, torch.bfloat16, seq_lens=seq_lens)
-    o, fs, state_checkpoints = run_fwd(backend, case, output_final_state=True, checkpoint_every_n_tokens=ckpt)
+    _, _, state_checkpoints = run_fwd(backend, case, output_final_state=True, checkpoint_every_n_tokens=ckpt)
     counts = [(sl - 1) // ckpt + 1 if sl > 0 else 0 for sl in seq_lens]
     # shape[0] is the shape-derived capacity bound; the packed prefix holds
     # sum(counts) real rows (per-sequence, in order), the tail is uninitialized
@@ -701,7 +701,7 @@ def test_checkpoints_varlen(backend, variant):
                 args.append(to_thd(case.gates["w"])[n0 : n0 + ntok].clone())
             cu_n = torch.tensor([0, ntok], dtype=torch.int32, device="cuda")
             with waive_unsupported(backend, variant):
-                o_p, fs_p = pinned_op(backend, variant)(*args, cu_n, output_final_state=True)
+                _, fs_p = pinned_op(backend, variant)(*args, cu_n, output_final_state=True)
             assert_rms_close(f"state_checkpoints[seq {n}][{j}]", state_checkpoints[base + j], fs_p[0], STATE_TOL[case.dtype])
         base += cnt
 
@@ -749,7 +749,7 @@ def test_checkpoints_varlen_tight_capacity(backend, variant, recipe):
             assert_rms_close(f"state_checkpoints[seq {n}][{j}] vs fp64 reference", state_checkpoints[base + j], fs_ref[0], STATE_TOL[case.dtype])
             cu_n = torch.tensor([0, ntok], dtype=torch.int32, device="cuda")
             with waive_unsupported(backend, variant):
-                o_p, fs_p = pinned_op(backend, variant)(*args, cu_n, output_final_state=True)
+                _, fs_p = pinned_op(backend, variant)(*args, cu_n, output_final_state=True)
             assert_rms_close(f"state_checkpoints[seq {n}][{j}] vs solo prefix", state_checkpoints[base + j], fs_p[0], STATE_TOL[case.dtype])
         base += cnt
     grads_by_mode = []
@@ -786,7 +786,7 @@ def test_checkpoints_coarse_cadence(backend, variant, ckpt_mult):
             args.append(to_thd(case.gates["w"])[:n])
         cu_n = torch.tensor([0, n], dtype=torch.int32, device="cuda")
         with waive_unsupported(backend, variant):
-            o, fs_p = pinned_op(backend, variant)(*args, cu_n, output_final_state=True)
+            _, fs_p = pinned_op(backend, variant)(*args, cu_n, output_final_state=True)
         assert_rms_close(f"state_checkpoints[{j}]", state_checkpoints[j], fs_p[0], STATE_TOL[case.dtype])
 
 
@@ -1291,7 +1291,7 @@ def test_batch_invariance_with_coarse_checkpoints(backend, variant):
         args.append(to_thd(case.gates["w"])[:n])
     cu_n = torch.tensor([0, n], dtype=torch.int32, device="cuda")
     with waive_unsupported(backend, variant):
-        o_p, fs_p = pinned_op(backend, variant)(*args, cu_n, output_final_state=True)
+        _, fs_p = pinned_op(backend, variant)(*args, cu_n, output_final_state=True)
     assert_rms_close("state_checkpoints[1]", state_checkpoints[1], fs_p[0], STATE_TOL[case.dtype])
 
 
