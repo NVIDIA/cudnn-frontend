@@ -900,6 +900,11 @@ def test_DSA_indexer_backward_wrapper_v2_full_valid_topk2048(
         s_q_default=128,
         s_kv_default=2048,
     )
+    # ``dsa_init`` honours --dsa-s_kv; topk=2048 needs at least that many keys
+    # per batch or the all-slots-valid premise below cannot hold, so raise it
+    # back up rather than failing the run.
+    cfg = dict(cfg)
+    cfg["s_kv"] = max(cfg["s_kv"], 2048)
     sm_scale = 1.0
     b, s_q = cfg["b"], cfg["s_q"]
     loss_coeff = float(b * s_q)
@@ -1012,7 +1017,7 @@ def test_DSA_indexer_backward_wrapper_v2_envelope_rejection(
             backend="sm100_v2",
         )
         torch.cuda.synchronize()
-        index_k = index_k.reshape(2, cfg["s_kv"], head_dim // 2).contiguous()
+        index_k = index_k.reshape(2 * cfg["b"], cfg["s_kv"], head_dim // 2).contiguous()
         d_index_k = torch.empty_like(index_k)
 
     attn_before = attn_score.clone()
