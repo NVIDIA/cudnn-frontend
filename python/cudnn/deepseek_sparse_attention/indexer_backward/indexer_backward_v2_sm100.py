@@ -1651,9 +1651,11 @@ def indexer_backward_v2_sm100(
     rows = batch * seqlen
     seq_k_total = batch * seqlen_k
     idx_local = (not topk_indices_global) and batch > 1
-    # Per-plan workspace (module docstring: concurrency contract). Created
-    # once on the plan's first execute — steady-state execute() allocates
-    # nothing.
+    # Per-plan workspace (module docstring: concurrency contract): the
+    # dynamic-ticket counter, created once on the plan's first execute. The
+    # fp32 dK accumulator a bf16 ``d_index_k`` needs is deliberately not in
+    # here; it comes from the caching allocator on every call, the same way
+    # the sm90 / sm100 backends take theirs.
     plan_ws: dict = {}
 
     def _check(cond, msg):

@@ -935,13 +935,17 @@ def test_DSA_indexer_backward_wrapper_v2_full_valid_topk2048(
 
     for t in (result["d_index_q"], result["d_weights"], result["d_index_k"]):
         assert torch.isfinite(t.float()).all()
-    dq_o, dw_o, dk_o = _fp64_oracle(index_q, weights, index_k, g, topk_indices)
-    dw_rr = _rms_rel(result["d_weights"], dw_o)
-    dk_rr = _rms_rel(result["d_index_k"], dk_o)
-    dq_rr = _rms_rel(result["d_index_q"], dq_o)
-    assert dw_rr < 1e-5, f"fp32 d_weights rms_rel {dw_rr:.3e} above the deterministic-accumulator band"
-    assert dk_rr < 1e-3, f"fp32 d_index_k rms_rel {dk_rr:.3e} above the v2 band"
-    assert dq_rr < 3e-3, f"d_index_q rms_rel {dq_rr:.3e} above the bf16-output floor band"
+    # ``_fp64_oracle`` recomputes at B == 1 only (same guard as
+    # ``test_DSA_indexer_backward_wrapper_v2``): a ``--dsa-b`` override keeps
+    # everything above and drops just the oracle bands.
+    if cfg["b"] == 1:
+        dq_o, dw_o, dk_o = _fp64_oracle(index_q, weights, index_k, g, topk_indices)
+        dw_rr = _rms_rel(result["d_weights"], dw_o)
+        dk_rr = _rms_rel(result["d_index_k"], dk_o)
+        dq_rr = _rms_rel(result["d_index_q"], dq_o)
+        assert dw_rr < 1e-5, f"fp32 d_weights rms_rel {dw_rr:.3e} above the deterministic-accumulator band"
+        assert dk_rr < 1e-3, f"fp32 d_index_k rms_rel {dk_rr:.3e} above the v2 band"
+        assert dq_rr < 3e-3, f"d_index_q rms_rel {dq_rr:.3e} above the bf16-output floor band"
 
 
 @pytest.mark.L0
@@ -1316,13 +1320,17 @@ def test_DSA_indexer_backward_wrapper_v2_fp32_outputs(
     assert torch.equal(r1["d_index_q"], r2["d_index_q"]), "d_index_q must be bitwise deterministic"
 
     # advertised precision property vs strict fp64 oracle on the captured g
-    dq_o, dw_o, dk_o = _fp64_oracle(index_q, weights, index_k, g1, topk_indices)
-    dw_rr = _rms_rel(r1["d_weights"], dw_o)
-    dk_rr = _rms_rel(r1["d_index_k"], dk_o)
-    dq_rr = _rms_rel(r1["d_index_q"], dq_o)
-    assert dw_rr < 1e-5, f"fp32 d_weights rms_rel {dw_rr:.3e} above the deterministic-accumulator band"
-    assert dk_rr < 1e-3, f"fp32 d_index_k rms_rel {dk_rr:.3e} above the v2 band"
-    assert dq_rr < 3e-3, f"d_index_q rms_rel {dq_rr:.3e} above the bf16-output floor band"
+    # ``_fp64_oracle`` recomputes at B == 1 only (same guard as
+    # ``test_DSA_indexer_backward_wrapper_v2``): a ``--dsa-b`` override keeps
+    # the determinism checks above and drops just the oracle bands.
+    if cfg["b"] == 1:
+        dq_o, dw_o, dk_o = _fp64_oracle(index_q, weights, index_k, g1, topk_indices)
+        dw_rr = _rms_rel(r1["d_weights"], dw_o)
+        dk_rr = _rms_rel(r1["d_index_k"], dk_o)
+        dq_rr = _rms_rel(r1["d_index_q"], dq_o)
+        assert dw_rr < 1e-5, f"fp32 d_weights rms_rel {dw_rr:.3e} above the deterministic-accumulator band"
+        assert dk_rr < 1e-3, f"fp32 d_index_k rms_rel {dk_rr:.3e} above the v2 band"
+        assert dq_rr < 3e-3, f"d_index_q rms_rel {dq_rr:.3e} above the bf16-output floor band"
 
 
 @pytest.mark.L0
@@ -1442,8 +1450,8 @@ def test_DSA_indexer_backward_wrapper_v2_stream_none_ambient_streams(
     calling context. Keying the plan cache on the ``stream`` argument alone
     therefore mapped two genuinely different execution streams onto one cached
     plan, and so onto one per-plan workspace -- the self-resetting ticket
-    counter and the fp32 dK scratch -- which the backend documents as
-    single-execution-at-a-time state. The committed multi-stream test only
+    counter -- which the backend documents as single-execution-at-a-time
+    state. The committed multi-stream test only
     passes ``stream=`` explicitly, which is the gap this covers.
 
     What this test asserts is the *invariant* (one plan per resolved stream),
@@ -1524,7 +1532,7 @@ def test_DSA_indexer_backward_wrapper_v2_stream_none_ambient_streams(
     added = set(cache.keys()) - keys_before
     assert len(added) == 2, (
         "stream=None under two different ambient streams must key two separate plans "
-        f"(the per-plan ticket counter / dK scratch cannot be shared across concurrent streams); "
+        f"(the per-plan ticket counter cannot be shared across concurrent streams); "
         f"got {len(added)} new plan-cache entries"
     )
 
@@ -1566,9 +1574,8 @@ def test_DSA_indexer_backward_wrapper_v2_stream_per_thread_two_threads(
     streams apart -- but the caller can: that handle means "the calling
     thread's stream" by definition, so the wrapper appends the calling thread's
     id to the key for that one value. Without it both threads land on one plan
-    and so on one per-plan workspace -- the self-resetting ticket counter and
-    the fp32 dK scratch -- which the backend documents as
-    single-execution-at-a-time state.
+    and so on one per-plan workspace -- the self-resetting ticket counter --
+    which the backend documents as single-execution-at-a-time state.
 
     This is the explicit-handle twin of the ``stream=None`` ambient-stream test
     above and asserts the same invariant: one plan per resolved stream. Two
@@ -1657,7 +1664,7 @@ def test_DSA_indexer_backward_wrapper_v2_stream_per_thread_two_threads(
     assert len(added) == 2, (
         "two host threads passing cudaStreamPerThread must key two separate plans "
         "(the handle is the integer 2 in both threads but denotes a different stream in each, "
-        "and the per-plan ticket counter / dK scratch cannot be shared across concurrent streams); "
+        "and the per-plan ticket counter cannot be shared across concurrent streams); "
         f"got {len(added)} new plan-cache entries"
     )
 
@@ -1745,7 +1752,7 @@ def test_DSA_indexer_backward_wrapper_v2_multi_device(
         return r
 
     # each device serially: without the device in the cache key, device 1 would
-    # reuse device 0's plan and with it device 0's ticket counter / dK scratch
+    # reuse device 0's plan and with it device 0's ticket counter
     refs = {dev: call(dev) for dev in (0, 1)}
 
     # identical bits + deterministic dq/dw => cross-device bitwise equality,
