@@ -687,9 +687,9 @@ class SM120FusedMultiHeadAttentionFP16Backward:
 
         smem = cutlass.Array(io_dtype, self.smem_elems, space=cutlass.AddressSpace.smem, alignment=128)
         sQ = smem  # Q_STAGES * M * d_qk
-        sdO = smem.subview(self.off_sdO)  # M * d_qk
+        sdO = smem.subview(self.off_sdO)  # M * d_v
         sK = smem.subview(self.off_sK)  # N * d_qk
-        sV = smem.subview(self.off_sV)  # N * d_qk
+        sV = smem.subview(self.off_sV)  # N * d_v (region max(N * d_v, 2 * M * N))
         sdS = smem.subview(self.off_sdS)  # M * N (aliases sV)
         sP = smem.subview(self.off_sP)  # M * N
         tma_mbar = cutlass.Array(cutlass.Int64, 5, space=cutlass.AddressSpace.smem, alignment=8)

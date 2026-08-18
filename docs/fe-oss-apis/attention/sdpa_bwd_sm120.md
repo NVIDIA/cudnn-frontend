@@ -148,7 +148,7 @@ warp-partition triple:
 SMEM per CTA is `Q_STAGES·tile_q·d_qk + tile_q·d_v + tile_kv·d_qk +
 max(tile_kv·d_v, 2·tile_q·tile_kv)` elements against the ~99 KB SM120 cap.
 The constructor tries `Q_STAGES = 2` and falls back to a **single Q buffer**
-when it doesn't fit; among the default configs, this occurs at D=256. In 
+when it does not fit; among the default configs, this occurs at D=256. In
 the single-buffer branch the iteration reorders GEMM5 *before* GEMM4 (GEMM5
 is sQ's last reader), so the Q refill for the next tile hides behind GEMM4
 and the dQ scatter instead of stalling the loop. Head dims that are multiples
