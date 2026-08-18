@@ -96,8 +96,6 @@ neither names the thing that breaks it most directly: a device-to-host read.
 Known violations, all pre-existing and each needing a kernel-side change, so
 none is precedent:
 
-- Per-tensor FP8 descale readback (`_scalar` in the same file): fold on device,
-  passing the pointers, as the backend FP8 sdpa does.
 - The FP8/MXFP8 `seq_len_q` guard in `sdpa/fwd/engines.py`. This one cannot be
   lifted to `check_support()`: `use_padding_mask=True` requires a `seq_len_q`
   tensor even when only KV is padded, so no static rule separates "declares

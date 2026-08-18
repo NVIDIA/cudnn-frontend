@@ -806,8 +806,6 @@ def lower_dsl_prefill(
         descale_k=facts.descale_k_t,
         descale_v=facts.descale_v_t,
         scale_o=facts.scale_o_t,
-        descale_s=facts.descale_s_t,
-        scale_s=facts.scale_s_t,
     )
 
     def _ir_view(buf, ir_t):
@@ -866,13 +864,12 @@ def lower_dsl_prefill(
         dk_buf = resolved.get(id(binding.descale_k)) if binding.descale_k is not None else None
         dv_buf = resolved.get(id(binding.descale_v)) if binding.descale_v is not None else None
         so_buf = resolved.get(id(binding.scale_o)) if binding.scale_o is not None else None
-        ds_buf = resolved.get(id(binding.descale_s)) if binding.descale_s is not None else None
-        ss_buf = resolved.get(id(binding.scale_s)) if binding.scale_s is not None else None
         # Rows whose kernel lacks the dense padded-Q trim (dense_seq_q_trim
         # False) drop the per-batch Q lengths, which is harmless only while
         # every seq_len_q equals S_q -- a shorter one writes O and a finite
         # LSE past the valid length. Checked here because the lengths are
-        # device values; this path already reads the descale scalars back.
+        # device values (its own Rule 3 known-violation entry; the descale
+        # scalars themselves no longer read back at all).
         # THD is exempt: ragged lengths ARE shorter than S_q by construction,
         # and the packed layout gives each sequence its own extent, so
         # nothing is written past a valid length.
@@ -907,8 +904,6 @@ def lower_dsl_prefill(
                 descale_k=dk_buf,
                 descale_v=dv_buf,
                 scale_o=so_buf,
-                descale_s=ds_buf,
-                scale_s=ss_buf,
             )
         if api_scratch_bytes:
             execute_kwargs["workspace"] = carver.remaining()

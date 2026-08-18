@@ -5,8 +5,11 @@
 DSL prefill SDPA kernel — classic pipeline, per-tensor FP8 (E4M3 / E5M2), d=128, SM100.
 
 Classic 2-sub-tile pipeline (TILES_Q=2, two softmax warpgroups, four correction
-warps, persistent try_cancel scheduler).  Per-tensor descales fold into
-scale_softmax_log2; o_scale_fused feeds the correction epilogue's threshold_beta.
+warps, persistent try_cancel scheduler).  Per-tensor descales are LOADED
+IN-KERNEL from 1-element device tensors and folded into scale_softmax_log2 /
+o_scale_fused (Rule 3 — no host readback); o_scale_fused feeds the correction
+epilogue's threshold_beta.  descale_s/scale_s are accepted and ignored (P is
+cast unscaled; unsupported knobs on this cell).
 Optional output dtype (DTYPE_O): FP8 in → E4M3 / E5M2 / BF16 / FP16 O.  Shares the
 f16 / mxfp8 SM100 d=128 layout plus the FP8-on-Blackwell K-path:
   1. **cga2-only, STAGES_KV=4** (config; FP8 BPE=1 → 128..160 KiB SMEM).
@@ -230,6 +233,15 @@ def _kernel(
     qh_per_kh: cutlass.Int32,
     scale_softmax_log2: cutlass.Float32,
     o_scale_fused: cutlass.Float32,
+    # 1-element fp32 DEVICE scales (Rule 3): the descale/scale factors are
+    # loaded and folded HERE — scale_softmax_log2 arrives as attn_scale*log2(e)
+    # and o_scale_fused as 1.0; no host readback exists anywhere. descale_s /
+    # scale_s are NOT taken: this kernel casts P unscaled, so their values are
+    # accepted by the adapter and ignored (unsupported knobs on this cell).
+    descale_q_t: cute.Tensor,
+    descale_k_t: cute.Tensor,
+    descale_v_t: cute.Tensor,
+    scale_o_t: cute.Tensor,
     amax_o_tensor: cute.Tensor,
 ) -> None:
 
@@ -356,6 +368,16 @@ def _kernel(
     # tma_mcast_mask = 1 << cta_rank — cta_group::2 routing strips bit-24 onto leader.
     tma_mcast_mask = (cutlass.Int16(1) << cta_in_pair) if cutlass.const_expr(CFG.CTA_MMA == 2) else cutlass.Int16(0)
     is_leader = cta_in_pair == cutlass.Int32(0)
+
+    # Device-scale fold: every thread loads the four 1-element fp32 scales
+    # (same addresses -> L2 broadcast, negligible) and folds them into the
+    # softmax scale and the output scale.
+    _dsc_q = cutlass.Float32(cutlass.make_array_view(descale_q_t)[0])
+    _dsc_k = cutlass.Float32(cutlass.make_array_view(descale_k_t)[0])
+    _dsc_v = cutlass.Float32(cutlass.make_array_view(descale_v_t)[0])
+    _scl_o = cutlass.Float32(cutlass.make_array_view(scale_o_t)[0])
+    scale_softmax_log2 = scale_softmax_log2 * _dsc_q * _dsc_k
+    o_scale_fused = o_scale_fused * _dsc_v * _scl_o
 
     if warp_idx >= CFG.SOFTMAX_WG0_BASE and warp_idx < CFG.SOFTMAX_WG0_BASE + CFG.SOFTMAX_WG_WARPS:
         nvvm.setmaxregister(CFG.SOFTMAX_REGS, nvvm.SetMaxRegisterAction.INCREASE)
@@ -1855,6 +1877,11 @@ def _host(
     problem_size: Tuple[int, int, int, int, int, int],
     scale_softmax_log2: cutlass.Float32,
     o_scale_fused: cutlass.Float32,
+    # 1-element fp32 device scales (Rule 3 — see _kernel).
+    descale_q_t: cute.Tensor,
+    descale_k_t: cute.Tensor,
+    descale_v_t: cute.Tensor,
+    scale_o_t: cute.Tensor,
     amax_o_tensor: cute.Tensor,
     stream: _cuda_driver.CUstream = None,
 ) -> None:
@@ -1928,6 +1955,10 @@ def _host(
         cutlass.Int32(QH // KH),
         scale_softmax_log2,
         o_scale_fused,
+        descale_q_t,
+        descale_k_t,
+        descale_v_t,
+        scale_o_t,
         amax_o_tensor,
     ).launch(
         grid=grid_shape,
@@ -1999,6 +2030,15 @@ def compile(b: int = 1, qh: int = 1, kh: int = 1, sq: int = 256, skv: int = 128,
         stride_order=(0,),
         assumed_align=16,
     )
+
+    def _fake_scale():
+        return cute.runtime.make_fake_compact_tensor(
+            cutlass.Float32,
+            (1,),
+            stride_order=(0,),
+            assumed_align=4,
+        )
+
     return cute.compile(
         _host,
         fake_q,
@@ -2011,6 +2051,10 @@ def compile(b: int = 1, qh: int = 1, kh: int = 1, sq: int = 256, skv: int = 128,
         (b, qh, kh, sq, skv, 0),
         cutlass.Float32(0.0),
         cutlass.Float32(0.0),
+        _fake_scale(),
+        _fake_scale(),
+        _fake_scale(),
+        _fake_scale(),
         fake_amax_o,
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
