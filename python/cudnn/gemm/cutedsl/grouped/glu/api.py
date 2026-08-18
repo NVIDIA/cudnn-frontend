@@ -107,7 +107,7 @@ class GluCall:
     mma_tiler_mn: Tuple[int, int] = (256, 256)
     cluster_shape_mn: Optional[Tuple[int, int]] = None
     sf_vec_size: int = 16
-    sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
+    sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None
     vector_f32: bool = False
     m_aligned: int = 256
     discrete_col_sfd: bool = False
