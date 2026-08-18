@@ -23,7 +23,7 @@ Extension: moe_sched_extension.py (WgradDense / WgradDiscrete)
 """
 
 from importlib.metadata import PackageNotFoundError, version
-from typing import Type, Tuple, Optional
+from typing import Literal, Type, Tuple, Optional
 
 import cuda.bindings.driver as cuda
 
@@ -93,8 +93,10 @@ class BlockScaledMoEGroupedGemmWgradKernel:
         expert_cnt: int = 1,
         weight_mode: MoEWeightMode = MoEWeightMode.DENSE,
         input_order: WGradInputOrder = WGradInputOrder.Tensor2D,
+        sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
     ):
         self.sf_vec_size = sf_vec_size
+        self.sf_dtype_override: Optional[Type[cutlass.Numeric]] = cutlass.FloatNV8E5M3FNU if sf_fp8_dtype_override == "e5m3" else None
         self.expert_cnt = expert_cnt
         self.acc_dtype = acc_dtype
         self.use_2cta_instrs = use_2cta_instrs
@@ -415,7 +417,14 @@ class BlockScaledMoEGroupedGemmWgradKernel:
         self.a_dtype = a_gemm.element_type
         self.b_dtype = b_gemm.element_type
         self.c_dtype = c_gemm.element_type
-        self.sf_dtype = sfa_gemm.element_type
+        # Scale factors may arrive under a stand-in element type: FloatNV8E5M3FNU has
+        # no torch dtype and TVM-FFI cannot marshal it, so e5m3 scales are passed as
+        # Float8E4M3FN storage of the same width and reinterpreted here. This must
+        # happen before _setup_attributes(), which picks the MMA atom off sf_dtype.
+        if cutlass.const_expr(self.sf_dtype_override is not None):
+            self.sf_dtype = self.sf_dtype_override
+        else:
+            self.sf_dtype = sfa_gemm.element_type
         self.a_major_mode = utils.LayoutEnum.from_tensor(a_gemm).mma_major_mode()
         self.b_major_mode = utils.LayoutEnum.from_tensor(b_gemm).mma_major_mode()
         self.c_layout = utils.LayoutEnum.from_tensor(c_gemm)

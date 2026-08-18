@@ -45,7 +45,7 @@ Example:
 
 from abc import ABC
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, List
+from typing import TYPE_CHECKING, Any, Dict, List, NamedTuple
 
 from .engine_ids import PYTHON_ENGINE_ID_BASE  # noqa: F401 — re-exported for engine authors
 
@@ -90,14 +90,16 @@ class PlanConfig:
     mode: Any = None
 
 
-@dataclass(frozen=True)
-class ExecutionContext:
+class ExecutionContext(NamedTuple):
     """Runtime context passed to a compiled plan at execute time.
 
     Everything an engine may need is explicit here — no engine should reach
     into private graph state, hard-code a stream, or allocate hidden workspace.
     ``stream`` is resolved from the handle when available (classic
     ``cudnn.set_stream(handle, ...)`` semantics).
+
+    A ``NamedTuple`` (not a frozen dataclass): both immutable, but built on every
+    execute, where the NamedTuple is ~220 ns/execute cheaper.
     """
 
     handle: Any = None
@@ -157,6 +159,12 @@ class VariantPack:
         """``(ok, index)`` over every filled operand, decided from the strides
         the native pack already holds."""
         ok, offender = self.native.all_contiguous()
+        return ok, (int(offender) if offender else -1)
+
+    def all_dense_layout(self):
+        """``(ok, slot)`` over every filled operand: the innermost size>1 dim
+        must be stride-1. Padded or permuted outer strides pass."""
+        ok, offender = self.native.all_dense_layout()
         return ok, (int(offender) if offender else -1)
 
     @property

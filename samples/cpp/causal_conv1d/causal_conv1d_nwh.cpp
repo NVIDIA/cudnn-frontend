@@ -28,6 +28,9 @@ TEST_CASE("Causal conv1d NWH forward", "[causal_conv1d_nwh][forward]") {
     if (is_arch_supported_by_cudnn() == false) {
         SKIP("Architecture is not supported by current cudnn version");
     }
+    if (get_compute_capability() == 107 && cudnnGetVersion() < 92600) {
+        SKIP("Causal conv1d NWH kernels on SM107 require cuDNN 9.26.0 or newer");
+    }
 
     int batch       = 2;
     int dim         = 64;
@@ -67,6 +70,9 @@ TEST_CASE("Causal conv1d NWH backward", "[causal_conv1d_nwh][backward]") {
 #else
     if (is_arch_supported_by_cudnn() == false) {
         SKIP("Architecture is not supported by current cudnn version");
+    }
+    if (get_compute_capability() == 107 && cudnnGetVersion() < 92600) {
+        SKIP("Causal conv1d NWH kernels on SM107 require cuDNN 9.26.0 or newer");
     }
 
     int batch       = 2;

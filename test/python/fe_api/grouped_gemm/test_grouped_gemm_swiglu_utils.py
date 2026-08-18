@@ -9,6 +9,8 @@ Reference: continugous_blockscaled_grouped_gemm_swiglu_quant_fusion.py (lines 35
 """
 
 import torch
+import functools
+
 import pytest
 from typing import Optional, Tuple, List, Dict, Any
 from fe_api.test_fe_api_utils import (
@@ -94,23 +96,40 @@ GROUPED_GEMM_SWIGLU_PARAM_MARKS_FP8 = (
     ]
 )
 
-GROUPED_GEMM_SWIGLU_PARAM_MARKS_FP4 = (
+GROUPED_GEMM_SWIGLU_PARAM_MARKS_FP4_BASE = (
     GROUPED_GEMM_SWIGLU_FP4_TYPE_MARKS
     + GROUPED_GEMM_SWIGLU_COMMON_MARKS
     + [
         pytest.mark.parametrize("mma_tiler_mn", [(256, 256), (128, 256)]),
-        pytest.mark.parametrize(
-            "sf_vec_size,sf_dtype",
-            [
-                (16, torch.float8_e8m0fnu),
-                (16, torch.float8_e4m3fn),
-                (32, torch.float8_e8m0fnu),
-                (32, torch.float8_e4m3fn),
-            ],
-        ),
         pytest.mark.parametrize("discrete_col_sfd", [False]),
     ]
 )
+
+GROUPED_GEMM_SWIGLU_PARAM_MARKS_FP4 = GROUPED_GEMM_SWIGLU_PARAM_MARKS_FP4_BASE + [
+    pytest.mark.parametrize(
+        "sf_vec_size,sf_dtype",
+        [
+            (16, torch.float8_e8m0fnu),
+            (16, torch.float8_e4m3fn),
+            (32, torch.float8_e8m0fnu),
+            (32, torch.float8_e4m3fn),
+        ],
+    ),
+]
+
+GROUPED_GEMM_SWIGLU_PARAM_MARKS_FP4_WITH_E5M3 = GROUPED_GEMM_SWIGLU_PARAM_MARKS_FP4_BASE + [
+    pytest.mark.parametrize(
+        "sf_vec_size,sf_dtype,sf_fp8_dtype_override",
+        [
+            (16, torch.float8_e8m0fnu, None),
+            (16, torch.float8_e4m3fn, None),
+            (32, torch.float8_e8m0fnu, None),
+            (32, torch.float8_e4m3fn, None),
+            (16, torch.float8_e4m3fn, "e5m3"),
+        ],
+        ids=["v16_e8m0", "v16_e4m3", "v32_e8m0", "v32_e4m3", "v16_e5m3"],
+    ),
+]
 
 GROUPED_GEMM_SWIGLU_PARAM_MARKS_BIAS_FP8 = (
     GROUPED_GEMM_SWIGLU_FP8_TYPE_MARKS
@@ -140,9 +159,12 @@ GROUPED_GEMM_SWIGLU_PARAM_MARKS_BIAS_FP4 = (
 )
 
 
-def with_grouped_gemm_swiglu_params_fp4(func):
+def with_grouped_gemm_swiglu_params_fp4(func=None, *, with_e5m3: bool = False):
     """Decorator to apply grouped GEMM SwiGLU FP4 test parameters."""
-    for mark in reversed(GROUPED_GEMM_SWIGLU_PARAM_MARKS_FP4):
+    if func is None:
+        return functools.partial(with_grouped_gemm_swiglu_params_fp4, with_e5m3=with_e5m3)
+    param_marks = GROUPED_GEMM_SWIGLU_PARAM_MARKS_FP4_WITH_E5M3 if with_e5m3 else GROUPED_GEMM_SWIGLU_PARAM_MARKS_FP4
+    for mark in reversed(param_marks):
         func = mark(func)
     return func
 

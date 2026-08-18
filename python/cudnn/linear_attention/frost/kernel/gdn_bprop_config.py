@@ -34,7 +34,6 @@ class Cfg:
     D_V: int = 128  # value head dim
 
     # --- TMA descriptor pool ---
-    BYTES_PER_TENSORMAP: int = 128
 
     # --- warp assignments (12 warps total) ---
     COMPUTE_GROUP_0_WARP_IDS: Tuple[int, ...] = (0, 1, 2, 3)  # T-pairwise / kk_epi / qk_epi / inverse / parts
@@ -46,8 +45,8 @@ class Cfg:
 
     # --- register split ---
     NUM_REGS_COMPUTE_GROUP_0: int = 224
-    NUM_REGS_COMPUTE_GROUP_1: int = 256
-    NUM_REGS_OTHER: int = 24
+    NUM_REGS_COMPUTE_GROUP_1: int = 248
+    NUM_REGS_OTHER: int = 32
 
     THREADS_PER_WARP: int = 32
 
@@ -58,8 +57,8 @@ class Cfg:
     SMEM_Q_STAGES: int = 1
     SMEM_K_STAGES: int = 2
     SMEM_V_STAGES: int = 1
-    SMEM_AINV_STAGES: int = 1
-    SMEM_QK_STAGES: int = 1
+    SMEM_T_INV_STAGES: int = 1
+    SMEM_A_STAGES: int = 1
 
     # --- TMEM stage counts ---
     TMEM_DH_ACC_STAGES: int = 1

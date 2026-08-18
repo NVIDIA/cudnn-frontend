@@ -31,7 +31,7 @@ from ..moe_utils import MoEWeightMode
 from cuda.bindings import driver as cuda
 import logging
 import os
-from typing import Any, Tuple, Optional, overload
+from typing import Any, Literal, Tuple, Optional, overload
 
 import cutlass
 
@@ -107,6 +107,7 @@ class DgluCall:
     mma_tiler_mn: Tuple[int, int] = (256, 256)
     cluster_shape_mn: Optional[Tuple[int, int]] = None
     sf_vec_size: int = 16
+    sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
     vector_f32: bool = False
     m_aligned: int = 256
     discrete_col_sfd: bool = False
@@ -189,6 +190,7 @@ class GroupedGemmDgluSm100(APIBase):
         mma_tiler_mn: Tuple[int, int] = (256, 256),
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         sf_vec_size: int = 16,
+        sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
         vector_f32: bool = False,
         m_aligned: int = 256,
         discrete_col_sfd: bool = False,
@@ -230,6 +232,7 @@ class GroupedGemmDgluSm100(APIBase):
                     ("sample_amax", kwargs["sample_amax"]),
                     ("sample_norm_const", kwargs["sample_norm_const"]),
                     ("sf_vec_size", kwargs["sf_vec_size"] if kwargs["sf_vec_size"] != 16 else None),
+                    ("sf_fp8_dtype_override", kwargs["sf_fp8_dtype_override"]),
                     ("discrete_col_sfd", kwargs["discrete_col_sfd"] if kwargs["discrete_col_sfd"] else None),
                     ("geglu_alpha", kwargs["geglu_alpha"] if kwargs["geglu_alpha"] != 1.702 else None),
                     ("glu_clamp_max", kwargs["glu_clamp_max"] if kwargs["glu_clamp_max"] != 7.0 else None),
@@ -468,6 +471,15 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall) -> TupleDict:
         mma_tiler_mn: MMA tiler shape
         cluster_shape_mn: Cluster shape
         sf_vec_size: Scale factor vector size
+        sf_fp8_dtype_override: Reinterpret the FP8-format block scale factors as
+            E5M3 instead of the encoding implied by ``sfa_tensor.dtype``. ``None``
+            (default) infers as usual -- E4M3 for NVFP4, E8M0 for MXFP4/MXFP8 --
+            and is the only accepted value on the BF16 backend, which has no
+            scale factors. ``"e5m3"`` selects an unsigned 5-exponent-bit,
+            3-mantissa-bit format that trades two mantissa bits for one exponent
+            bit to widen the scale range; it is Rubin-only, requires the NVFP4
+            recipe, and the scale tensors are still passed as
+            ``torch.float8_e4m3fn`` because torch has no e5m3 dtype.
         vector_f32: Use vectorized f32
         m_aligned: M alignment (must be 256)
         discrete_col_sfd: Generate discrete col-major scale factor tensor
@@ -525,6 +537,7 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall) -> TupleDict:
     mma_tiler_mn = call.mma_tiler_mn
     cluster_shape_mn = call.cluster_shape_mn
     sf_vec_size = call.sf_vec_size
+    sf_fp8_dtype_override = call.sf_fp8_dtype_override
     vector_f32 = call.vector_f32
     m_aligned = call.m_aligned
     discrete_col_sfd = call.discrete_col_sfd
@@ -698,6 +711,7 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall) -> TupleDict:
             mma_tiler_mn,
             cluster_shape_mn,
             sf_vec_size,
+            sf_fp8_dtype_override,
             vector_f32,
             m_aligned,
             discrete_col_sfd,
@@ -737,6 +751,7 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall) -> TupleDict:
             mma_tiler_mn,
             cluster_shape_mn,
             sf_vec_size,
+            sf_fp8_dtype_override,
             vector_f32,
             m_aligned,
             discrete_col_sfd,
@@ -775,6 +790,7 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall) -> TupleDict:
                 mma_tiler_mn=mma_tiler_mn,
                 cluster_shape_mn=cluster_shape_mn,
                 sf_vec_size=sf_vec_size,
+                sf_fp8_dtype_override=sf_fp8_dtype_override,
                 vector_f32=vector_f32,
                 m_aligned=m_aligned,
                 discrete_col_sfd=discrete_col_sfd,
@@ -811,6 +827,7 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall) -> TupleDict:
                 mma_tiler_mn=mma_tiler_mn,
                 cluster_shape_mn=cluster_shape_mn,
                 sf_vec_size=sf_vec_size,
+                sf_fp8_dtype_override=sf_fp8_dtype_override,
                 vector_f32=vector_f32,
                 m_aligned=m_aligned,
                 discrete_col_sfd=discrete_col_sfd,
@@ -939,6 +956,7 @@ def _normalize_dglu_call(
             ("sfb_ptrs", call.sfb_ptrs),
             ("norm_const_tensor", call.norm_const_tensor),
             ("sf_vec_size", call.sf_vec_size if call.sf_vec_size != 16 else None),
+            ("sf_fp8_dtype_override", call.sf_fp8_dtype_override),
             (
                 "discrete_col_sfd",
                 call.discrete_col_sfd if call.discrete_col_sfd else None,
@@ -1209,6 +1227,7 @@ def grouped_gemm_dglu_wrapper_sm100(
     mma_tiler_mn: Tuple[int, int] = (256, 256),
     cluster_shape_mn: Optional[Tuple[int, int]] = None,
     sf_vec_size: int = 16,
+    sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
     vector_f32: bool = False,
     m_aligned: int = 256,
     discrete_col_sfd: bool = False,
@@ -1255,6 +1274,7 @@ def grouped_gemm_dglu_wrapper_sm100(
         mma_tiler_mn=mma_tiler_mn,
         cluster_shape_mn=cluster_shape_mn,
         sf_vec_size=sf_vec_size,
+        sf_fp8_dtype_override=sf_fp8_dtype_override,
         vector_f32=vector_f32,
         m_aligned=m_aligned,
         discrete_col_sfd=discrete_col_sfd,

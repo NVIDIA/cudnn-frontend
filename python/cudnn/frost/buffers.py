@@ -99,6 +99,14 @@ def dtype_name(buf) -> str:
     return str(buf.dtype).split(".")[-1]
 
 
+def data_ptr(buf) -> int:
+    """Device address of a tensor-like (``data_ptr()`` or the CUDA array interface)."""
+    fn = getattr(buf, "data_ptr", None)
+    if fn is not None:
+        return fn()
+    return buf.__cuda_array_interface__["data"][0]
+
+
 class DeviceView:
     """Zero-copy DLPack view over a raw CUDA pointer.
 

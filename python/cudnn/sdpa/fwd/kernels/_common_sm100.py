@@ -7,7 +7,12 @@ import cutlass
 import cutlass.cute as cute
 from cutlass._mlir.dialects import arith
 
-from cudnn.frost.tile_dsl.scheduler import SCHED_NATURAL
+from cudnn.frost.tile_dsl.scheduler import (
+    SCHED_LPT_L2,
+    SCHED_NATURAL,
+    lpt_tile_coords,
+    lpt_l2_tile_coords,
+)
 from cudnn.frost.tile_dsl.mask import MASK_CAUSAL, MASK_PADDED, MASK_SWA
 from cudnn.frost.tile_dsl.barrier import MBarrier, Producer, Scope
 
@@ -45,6 +50,10 @@ class Bars(NamedTuple):
     mb_empty_mainloop: object
 
     mb_q_o_alias: object
+    # Return edge of the Q∪O alias gate (see the soundness note in
+    # make_classic_bars): TMA-LDG arrives after consuming each alias-gate
+    # phase; TMA-STG waits it before its next alias arrive.
+    mb_qo_slab_free: object
 
 
 class D256Bars(NamedTuple):
@@ -140,7 +149,19 @@ def make_classic_bars(CFG) -> Bars:
         mb_o_empty=MBarrier(_alloc(CFG.TILES_Q), stages=CFG.TILES_Q, init_count=CFG.ONE_WARP, producer=Producer.THREAD),
         mb_tmem_dealloc=MBarrier(_alloc(1), stages=1, init_count=CORR_LANES_TOTAL, producer=Producer.THREAD),
         mb_empty_mainloop=MBarrier(_alloc(1), stages=1, init_count=CORR_LANES_TOTAL, producer=Producer.LEADER, scope=Scope.LEADER),
+        # Q∪O alias gate FULL/EMPTY pair.  mb_q_o_alias alone is UNSOUND:
+        # mbarrier parity waits deadlock once a producer runs >= 2 phases
+        # ahead, and on EMPTY tiles (zero-KV varlen sequences) the
+        # corr -> STG -> alias-arrive chain has NO dependency on TMA-LDG, so
+        # a delayed LDG warp loses the race and its bootstrap parity credit
+        # is consumed by a real arrive (observed: LDG parked forever at the
+        # tile-1 alias wait with the barrier already in phase 1, deadlocking
+        # the whole cluster).  mb_qo_slab_free is the return edge: LDG
+        # arrives it right after consuming each alias phase and STG waits it
+        # before each alias arrive, bounding either side's lead to one phase
+        # by construction.
         mb_q_o_alias=MBarrier(_alloc(CFG.TILES_Q), stages=CFG.TILES_Q, init_count=CFG.ONE_WARP, producer=Producer.THREAD),
+        mb_qo_slab_free=MBarrier(_alloc(CFG.TILES_Q), stages=CFG.TILES_Q, init_count=CFG.ONE_WARP, producer=Producer.THREAD),
     )
 
 
@@ -226,8 +247,12 @@ def compute_kv_loop_bounds(
         right = cute.math.min(right, kv_hi_caus)
 
     if cutlass.const_expr(mask_flags & MASK_SWA):
-        cond = q_row_coord > cutlass.Int32(window_left)
-        delta = q_row_coord - cutlass.Int32(window_left)
+        # The whole band shifts with the diagonal: under BOTTOM_RIGHT the SWA
+        # lower bound is q + (S_kv - S_q) - W, same anchor the causal upper
+        # bound uses (causal_diag folds to 0 for top-left).
+        swa_base = q_row_coord + causal_diag
+        cond = swa_base > cutlass.Int32(window_left)
+        delta = swa_base - cutlass.Int32(window_left)
         kv_lo_swa = cutlass.Int32(
             arith.select(
                 cond.ir_value(),
@@ -255,7 +280,7 @@ def compute_kv_loop_bounds(
 
     unmasked_lo = left
     if cutlass.const_expr(mask_flags & MASK_SWA):
-        anchor = q_row_coord + cutlass.Int32(cga_tile_m - 1 - window_left)
+        anchor = q_row_coord + causal_diag + cutlass.Int32(cga_tile_m - 1 - window_left)
         swa_unmasked_lo = _div_up(anchor, tile_n)
         cond = anchor > cutlass.Int32(0)
         swa_unmasked_lo = cutlass.Int32(
@@ -277,17 +302,6 @@ def compute_kv_loop_bounds(
     )
 
 
-@cute.jit
-def decode_linear_tile_lpt(linear, q_h, batch, q_tiles):
-    hb = q_h * batch
-    row_rank = linear // hb
-    within = linear % hb
-    row = (q_tiles - cutlass.Int32(1)) - row_rank
-    head = within % q_h
-    batch_idx = within // q_h
-    return row, head, batch_idx
-
-
 class SdpaHelpers(NamedTuple):
     decode_initial: object
     decode_payload: object
@@ -305,16 +319,31 @@ class SdpaHelpers(NamedTuple):
 def make_sdpa_helpers(CFG, lpt_q_tiles_in_cga_units: bool = False) -> SdpaHelpers:
     cga_tile_m = CFG.TILES_Q * CFG.TILE_M * CFG.CTA_MMA
 
+    _cga_m = getattr(CFG, "CGA_M", 1)
+    _cta_mma = getattr(CFG, "CTA_MMA", 1)
+
+    @cute.jit
+    def _lpt_linear(block_id):
+        if cutlass.const_expr(_cga_m > 1):
+            return block_id // cutlass.Int32(_cga_m)
+        return block_id
+
+    @cute.jit
+    def _lpt_q_super(row, cta_in_pair):
+        if cutlass.const_expr(_cta_mma > 1):
+            return row * cutlass.Int32(_cta_mma) + cta_in_pair
+        return row
+
     if CFG.SCHEDULER_POLICY == SCHED_NATURAL:
         if CFG.SPLIT_PIPELINE == 1:
 
             @cute.jit
-            def _decode_initial(bidx, bidy, bidz, cta_in_pair, n_q_supers, n_qh, n_batch):
+            def _decode_initial(bidx, bidy, bidz, cta_in_pair, n_q_supers, n_qh, n_batch, qh_per_kh=None, seqlen_kv=None):
                 blocked_row = (bidx // cutlass.Int32(CFG.CGA_M)) * cutlass.Int32(CFG.CTA_MMA) + cta_in_pair
                 return blocked_row, bidy, bidz
 
             @cute.jit
-            def _decode_payload(t0, t1, cta_in_pair, n_q_supers, n_qh, n_batch):
+            def _decode_payload(t0, t1, cta_in_pair, n_q_supers, n_qh, n_batch, qh_per_kh=None, seqlen_kv=None):
                 blocked_row = (t0 // cutlass.Int32(CFG.CGA_M)) * cutlass.Int32(CFG.CTA_MMA) + cta_in_pair
                 head = t1 & cutlass.Int32(0xFFFF)
                 batch = (t1 >> cutlass.Int32(16)) & cutlass.Int32(0xFFFF)
@@ -323,30 +352,52 @@ def make_sdpa_helpers(CFG, lpt_q_tiles_in_cga_units: bool = False) -> SdpaHelper
         else:
 
             @cute.jit
-            def _decode_initial(bidx, bidy, bidz, cta_in_pair, n_q_supers, n_qh, n_batch):
+            def _decode_initial(bidx, bidy, bidz, cta_in_pair, n_q_supers, n_qh, n_batch, qh_per_kh=None, seqlen_kv=None):
                 return bidx, bidy, bidz
 
             @cute.jit
-            def _decode_payload(t0, t1, cta_in_pair, n_q_supers, n_qh, n_batch):
+            def _decode_payload(t0, t1, cta_in_pair, n_q_supers, n_qh, n_batch, qh_per_kh=None, seqlen_kv=None):
                 head = t1 & cutlass.Int32(0xFFFF)
                 batch = (t1 >> cutlass.Int32(16)) & cutlass.Int32(0xFFFF)
                 return t0 + cta_in_pair, head, batch
 
+    elif CFG.SCHEDULER_POLICY == SCHED_LPT_L2:
+        _kv_bytes_per_row = (CFG.TILE_K + CFG.TILE_O) * CFG.BPE
+        _l2_bytes = CFG.L2_SIZE_MIB * 1024 * 1024
+
+        @cute.jit
+        def _decode_initial(bidx, bidy, bidz, cta_in_pair, n_q_supers, n_qh, n_batch, qh_per_kh=None, seqlen_kv=None):
+            linear = _lpt_linear(bidx)
+            q_tiles = n_q_supers // cutlass.Int32(_cta_mma) if lpt_q_tiles_in_cga_units else n_q_supers
+            if cutlass.const_expr(qh_per_kh is None or seqlen_kv is None):
+                raise ValueError("SCHED_LPT_L2 decode requires qh_per_kh and seqlen_kv at every call site")
+            row, head, batch = lpt_l2_tile_coords(linear, n_qh, n_batch, q_tiles, qh_per_kh, seqlen_kv, _kv_bytes_per_row, _l2_bytes)
+            return _lpt_q_super(row, cta_in_pair), head, batch
+
+        @cute.jit
+        def _decode_payload(t0, t1, cta_in_pair, n_q_supers, n_qh, n_batch, qh_per_kh=None, seqlen_kv=None):
+            linear = _lpt_linear(t0)
+            q_tiles = n_q_supers // cutlass.Int32(_cta_mma) if lpt_q_tiles_in_cga_units else n_q_supers
+            if cutlass.const_expr(qh_per_kh is None or seqlen_kv is None):
+                raise ValueError("SCHED_LPT_L2 decode requires qh_per_kh and seqlen_kv at every call site")
+            row, head, batch = lpt_l2_tile_coords(linear, n_qh, n_batch, q_tiles, qh_per_kh, seqlen_kv, _kv_bytes_per_row, _l2_bytes)
+            return _lpt_q_super(row, cta_in_pair), head, batch
+
     else:
 
         @cute.jit
-        def _decode_initial(bidx, bidy, bidz, cta_in_pair, n_q_supers, n_qh, n_batch):
-            linear = bidx // cutlass.Int32(CFG.CGA_M)
-            q_tiles = n_q_supers // cutlass.Int32(CFG.CTA_MMA) if lpt_q_tiles_in_cga_units else n_q_supers
-            row, head, batch = decode_linear_tile_lpt(linear, n_qh, n_batch, q_tiles)
-            return row * cutlass.Int32(CFG.CTA_MMA) + cta_in_pair, head, batch
+        def _decode_initial(bidx, bidy, bidz, cta_in_pair, n_q_supers, n_qh, n_batch, qh_per_kh=None, seqlen_kv=None):
+            linear = _lpt_linear(bidx)
+            q_tiles = n_q_supers // cutlass.Int32(_cta_mma) if lpt_q_tiles_in_cga_units else n_q_supers
+            row, head, batch = lpt_tile_coords(linear, n_qh, n_batch, q_tiles)
+            return _lpt_q_super(row, cta_in_pair), head, batch
 
         @cute.jit
-        def _decode_payload(t0, t1, cta_in_pair, n_q_supers, n_qh, n_batch):
-            linear = t0 // cutlass.Int32(CFG.CGA_M)
-            q_tiles = n_q_supers // cutlass.Int32(CFG.CTA_MMA) if lpt_q_tiles_in_cga_units else n_q_supers
-            row, head, batch = decode_linear_tile_lpt(linear, n_qh, n_batch, q_tiles)
-            return row * cutlass.Int32(CFG.CTA_MMA) + cta_in_pair, head, batch
+        def _decode_payload(t0, t1, cta_in_pair, n_q_supers, n_qh, n_batch, qh_per_kh=None, seqlen_kv=None):
+            linear = _lpt_linear(t0)
+            q_tiles = n_q_supers // cutlass.Int32(_cta_mma) if lpt_q_tiles_in_cga_units else n_q_supers
+            row, head, batch = lpt_tile_coords(linear, n_qh, n_batch, q_tiles)
+            return _lpt_q_super(row, cta_in_pair), head, batch
 
     @cute.jit
     def _bounds_for_tile(q_super_idx, seqlen_q, seqlen_kv, cta_in_pair):
@@ -429,7 +480,14 @@ def make_sdpa_helpers(CFG, lpt_q_tiles_in_cga_units: bool = False) -> SdpaHelper
         cu = cutlass.make_array_view(seq_kv_lens_t)
         cuq0 = n_batch
         acc = cutlass.Int32(0)
-        f_batch = cutlass.Int32(0)
+        # DEAD-unit sentinel (issue #552 over-launch): a unit no sequence
+        # claims (u >= sum of live units) keeps batch == n_batch.  That index
+        # makes every downstream consumer a no-op through IN-BOUNDS metadata
+        # reads: _resolve_seqlen_kv reads meta[n_batch] = cu_q[0] = 0 (empty
+        # KV range in every role), the epilogue's per-sequence Q length
+        # cu[2n+1]-cu[2n] goes negative (LSE predicate never fires), and the
+        # O-store role skips the TMA store explicitly (batch >= n_batch).
+        f_batch = n_batch
         f_head = cutlass.Int32(0)
         f_qc = cutlass.Int32(0)
         done = cutlass.Int32(0)
@@ -448,16 +506,16 @@ def make_sdpa_helpers(CFG, lpt_q_tiles_in_cga_units: bool = False) -> SdpaHelper
         return q_super, f_head, f_batch
 
     @cute.jit
-    def _dispatch_decode_initial(bidx, bidy, bidz, cta_in_pair, n_q_supers, n_qh, n_batch, seq_kv_lens_t):
+    def _dispatch_decode_initial(bidx, bidy, bidz, cta_in_pair, n_q_supers, n_qh, n_batch, seq_kv_lens_t, qh_per_kh=None, seqlen_kv=None):
         if cutlass.const_expr(_thd_on):
             return _thd_decode(bidx, seq_kv_lens_t, n_batch, n_qh, cta_in_pair)
-        return _decode_initial(bidx, bidy, bidz, cta_in_pair, n_q_supers, n_qh, n_batch)
+        return _decode_initial(bidx, bidy, bidz, cta_in_pair, n_q_supers, n_qh, n_batch, qh_per_kh, seqlen_kv)
 
     @cute.jit
-    def _dispatch_decode_payload(t0, t1, cta_in_pair, n_q_supers, n_qh, n_batch, seq_kv_lens_t):
+    def _dispatch_decode_payload(t0, t1, cta_in_pair, n_q_supers, n_qh, n_batch, seq_kv_lens_t, qh_per_kh=None, seqlen_kv=None):
         if cutlass.const_expr(_thd_on):
             return _thd_decode(t0, seq_kv_lens_t, n_batch, n_qh, cta_in_pair)
-        return _decode_payload(t0, t1, cta_in_pair, n_q_supers, n_qh, n_batch)
+        return _decode_payload(t0, t1, cta_in_pair, n_q_supers, n_qh, n_batch, qh_per_kh, seqlen_kv)
 
     @cute.jit
     def _thd_tma_offsets(seq_kv_lens_t, batch_idx, n_batch):

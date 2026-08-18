@@ -623,7 +623,9 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         scale_o_t=(rec.get("scale_o") if is_fp8 else None),
         descale_s_t=(rec.get("descale_s") if is_fp8 else None),
         scale_s_t=(rec.get("scale_s") if is_fp8 else None),
-        amax_s_t=(rec.get("amax_s") if is_fp8 else None),
+        # Amax_S: the op RETURNS the port unconditionally; only a real
+        # (non-virtual, set_output(True)) tensor is a requested output.
+        amax_s_t=(rec.get("amax_s") if (is_fp8 and rec.get("amax_s") is not None and not getattr(rec.get("amax_s"), "is_virtual", True)) else None),
     )
 
 
@@ -671,7 +673,6 @@ class SdpaBinding:
     scale_o: Any = None
     descale_s: Any = None
     scale_s: Any = None
-    amax_s: Any = None
     # SM80 feature operands + backward ports.
     bias: Any = None
     block_mask: Any = None
@@ -721,7 +722,6 @@ class SdpaBinding:
                 self.descale_k,
                 self.descale_v,
                 self.scale_o,
-                self.amax_s,
                 self.descale_s,
                 self.scale_s,
                 self.bias,

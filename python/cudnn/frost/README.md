@@ -506,7 +506,7 @@ expressible, with one discipline separating them:
 - The box is pure data: per-axis fields on `Capabilities`. Covers most of the
   surface; adding an engine is writing a row, not logic.
 - A notch is a rule in `mismatch()` gated by a conjunction flag on the row
-  (e.g. `bottom_right_with_swa: bool`). The matcher encodes the SHAPE of the
+  (e.g. `bottom_right_padded_seq_q: bool`). The matcher encodes the SHAPE of the
   interaction once; each engine's row supplies the VERDICT. When a future
   kernel supports the conjunction, flip its flag -- never edit the matcher.
   This is what keeps interaction checks from regressing into a per-engine

@@ -124,6 +124,15 @@ Methods:
   - The cuda stream to use for operation kernel execution.
   - Default: None (uses default stream)
 
+- Determinism
+  - Several kernels reduce with cross-CTA atomics, so those outputs are not bit-exact run to
+    run. Kernels react to `torch.use_deterministic_algorithms(True)`: they switch to a
+    deterministic path where one exists, and otherwise raise (or warn, under
+    `warn_only`) rather than silently return a non-reproducible result.
+  - Where a deterministic path exists it can also be selected per call with
+    `deterministic=True`, independent of the torch setting. See
+    [Grouped GEMM + dsReLU](gemm_fusions/grouped_gemm_dsrelu.md#deterministic-dprob).
+
 
 ## File structure and examples
 

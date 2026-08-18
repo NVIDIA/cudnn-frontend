@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Optional, Tuple, overload
+from typing import Any, Literal, Optional, Tuple, overload
 import os
 
 from cuda.bindings import driver as cuda
@@ -109,6 +109,7 @@ class GroupedGemmWgradSm100(APIBase):
         mma_tiler_mn: Tuple[int, int] = (256, 256),
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         sf_vec_size: int = 16,
+        sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
         accumulate_on_output: bool = False,
         input_order: WGradInputOrder | str = WGradInputOrder.Tensor2D,
     ) -> None:
@@ -133,6 +134,7 @@ class GroupedGemmWgradSm100(APIBase):
                     ("sample_global_scale_a", kwargs["sample_global_scale_a"]),
                     ("sample_global_scale_b", kwargs["sample_global_scale_b"]),
                     ("sf_vec_size", kwargs["sf_vec_size"] if kwargs["sf_vec_size"] != 16 else None),
+                    ("sf_fp8_dtype_override", kwargs["sf_fp8_dtype_override"]),
                 ),
                 block_scaled_dtype_pairs=_block_scaled_dtype_pairs(),
             )
@@ -248,6 +250,7 @@ def grouped_gemm_wgrad_wrapper_sm100(
     mma_tiler_mn: Tuple[int, int] = (256, 256),
     cluster_shape_mn: Optional[Tuple[int, int]] = None,
     sf_vec_size: int = 16,
+    sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
     accumulate_on_output: bool = False,
     input_order: WGradInputOrder | str = WGradInputOrder.Tensor2D,
     current_stream: Optional[cuda.CUstream] = None,
@@ -285,6 +288,7 @@ def grouped_gemm_wgrad_wrapper_sm100(
             ("global_scale_a", global_scale_a),
             ("global_scale_b", global_scale_b),
             ("sf_vec_size", sf_vec_size if sf_vec_size != 16 else None),
+            ("sf_fp8_dtype_override", sf_fp8_dtype_override),
         ),
         block_scaled_dtype_pairs=_block_scaled_dtype_pairs(),
     )
@@ -324,6 +328,7 @@ def grouped_gemm_wgrad_wrapper_sm100(
         tuple(mma_tiler_mn),
         tuple(cluster_shape_mn) if cluster_shape_mn is not None else None,
         sf_vec_size,
+        sf_fp8_dtype_override,
         accumulate_on_output,
         input_order,
         int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0")),
@@ -355,6 +360,7 @@ def grouped_gemm_wgrad_wrapper_sm100(
             mma_tiler_mn=mma_tiler_mn,
             cluster_shape_mn=cluster_shape_mn,
             sf_vec_size=sf_vec_size,
+            sf_fp8_dtype_override=sf_fp8_dtype_override,
             accumulate_on_output=accumulate_on_output,
             input_order=input_order,
         )

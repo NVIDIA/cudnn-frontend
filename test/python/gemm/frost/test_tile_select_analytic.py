@@ -99,3 +99,23 @@ def test_moe_and_mainloop_never_get_static():
         for N in (1024, 8192):
             _, _, sched = select_config(M, N, 1, K=4096, supports_static=False)
             assert sched == "clc"
+
+
+def test_a_new_pipeline_must_register_its_hardware_facts():
+    """A family that registers a config class but forgets a per-pipeline table
+    must raise, not inherit another family's value: the tables are hardware
+    facts, and a wrong MMA-inst K renders a descriptor that is silently wrong."""
+    import dataclasses
+
+    from cudnn.gemm.frost import tile_config as tc
+
+    @dataclasses.dataclass(frozen=True)
+    class ConfigSmFake(tc.TileConfig):
+        pass
+
+    tc._CONFIG_CLASS_BY_PIPELINE["sm_fake"] = ConfigSmFake
+    try:
+        with pytest.raises(NotImplementedError, match="MMA-inst K width not known for pipeline"):
+            tc.as_pipeline(tc.DEFAULT_CONFIG, "sm_fake")
+    finally:
+        del tc._CONFIG_CLASS_BY_PIPELINE["sm_fake"]

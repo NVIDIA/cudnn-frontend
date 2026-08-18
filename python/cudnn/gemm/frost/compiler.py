@@ -51,6 +51,7 @@ from .dtypes import (
     _output_align_reqs,
     _pow2_floor,
     allowed_store_vsize,
+    dtype_arch_reject,
     tensor_alignment,
 )
 from .epilogue_codegen import EpilogueSnippets, generate
@@ -83,6 +84,64 @@ _TEMPLATE_DIR = Path(__file__).parent / "kernel_templates"
 # source (frost_compile_options) so it is part of the content-addressed cache key.
 _TVM_FFI_OK = importlib.util.find_spec("tvm_ffi") is not None
 _FROST_COMPILE_OPTIONS = "--enable-tvm-ffi" if _TVM_FFI_OK else ""
+
+
+def _supports_gpu_arch_option() -> bool:
+    """Whether this cutedsl threads ``--gpu-arch`` from the cute.compile() options
+    string to the compile target — dsl.compile_and_cache / get_arch_enum consult
+    ``compile_options.gpu_arch`` before the (import-time, ambient-detected) env
+    arch. That landed in the public wheel at 4.7 (frost's ``CUTEDSL_MIN_VERSION``),
+    so the ONLY build that lacks it is a public ``nvidia-cutlass-dsl`` wheel below
+    the floor. Reuses ``buffers.cutedsl_too_old`` so an internal RC (its own 0.x
+    numbering) is judged new, not old — matching how the rest of frost gates it."""
+    from cudnn.frost.buffers import cutedsl_state, cutedsl_too_old
+
+    return not cutedsl_too_old(cutedsl_state()[1])
+
+
+def _sm_target_string(arch: int) -> str:
+    """``major*10+minor`` -> the cute ``sm_XXX[a]`` target, matching cutedsl's own
+    ``detect_gpu_arch`` (the arch-specific ``a`` suffix appears from major >= 9)."""
+    major, minor = divmod(arch, 10)
+    return f"sm_{major}{minor}{'a' if major >= 9 else ''}"
+
+
+def _frost_compile_options() -> str:
+    """The ``cute.compile()`` options string for a build in the current
+    ``build_device()`` scope. Pins ``--gpu-arch`` to the scope's GPU so the
+    compile target follows the handle instead of the ambient CUDA device. On a
+    public wheel below the floor the option is inert, so a handle-scoped build is
+    refused rather than silently mis-targeted; an unscoped build needs no pin.
+    (frost declines such wheels as too-old before reaching here, so the refusal
+    is belt-and-suspenders.)
+
+    Called at render time (inside the scope) so the arch is baked into the
+    generated source, keeping it part of the content-addressed cache key."""
+    from cudnn.frost.device import build_scope_device as _build_scope_device
+
+    opts = [_FROST_COMPILE_OPTIONS] if _FROST_COMPILE_OPTIONS else []
+    arch = _current_arch()  # scope-aware: the handle's GPU inside build_device()
+    if arch is None:
+        return " ".join(opts)  # render-only / no GPU visible
+    if _supports_gpu_arch_option():
+        opts.append(f"--gpu-arch {_sm_target_string(arch)}")
+    elif _build_scope_device() is not None:
+        # A handle pinned a GPU (build_device scope) but this wheel cannot pin the
+        # compile target: cutedsl resolves it from an arch captured at IMPORT time,
+        # which we can neither set NOR reliably read here (comparing against the
+        # live device would miss an import-on-B, build-on-A process). We cannot
+        # honor the scope, so refuse rather than bake scope constants into a
+        # possibly-mis-targeted kernel. (frost's cutedsl_too_old gate already
+        # declines such wheels, so this is belt-and-suspenders.) An unscoped build
+        # makes no cross-device promise and falls through unchanged.
+        major, minor = divmod(arch, 10)
+        raise NotImplementedError(
+            f"cudnn.frost: a handle-scoped build for sm_{major}{minor} needs an nvidia-cutlass-dsl "
+            f"that pins the compile target (public >= 4.7 or an internal RC); this wheel cannot, so "
+            f"the build cannot follow the handle. Upgrade cutedsl, or build with the handle's GPU "
+            f"already current (no build_device scope)."
+        )
+    return " ".join(opts)
 
 
 # ---------------------------------------------------------------------------
@@ -425,6 +484,8 @@ def _render_tile_constants(
     chain: FusionChain,
     cta_group: int,
     use_tma: bool = True,
+    *,
+    fallback_cluster: tuple[int, int] | None = None,
 ) -> str:
     """Emit module-level tile + dtype constants for the config/chain, appended
     below the template's defaults (last assignment wins). TileConfig geometry is
@@ -548,7 +609,7 @@ def _render_tile_constants(
     ]
     # Persistent kernel always: double-TMEM + L2 N-super-block swizzle.
     # (acc_stages is emitted below, once the TMEM budget is known.)
-    lines.append(f"tile_swizzle_n = {cfg.tile_swizzle_n}")
+    lines.append(f"tile_swizzle_n = {1 if fallback_cluster is not None else cfg.tile_swizzle_n}")
     lines.append(f"swizzle_l2_budget_bytes = {_l2_swizzle_budget_bytes()}")
     # Multi-GEMM (parallel matmuls sharing the epilogue). Always emitted;
     # single-GEMM = (1, 1, 1). gemm_a_idx[g]/gemm_b_idx[g] pick GEMM g's operand
@@ -560,6 +621,8 @@ def _render_tile_constants(
     lines.append(f"gemm_b_idx = {tuple(b for _, b in chain.gemm_operands)}")
     total_tmem = _tmem_cols_for_arch()
     lines.append(f"num_tmem_alloc_cols = {total_tmem}")
+    lines.append(f"tmem_alloc_exclusive = {total_tmem > _MAX_NON_EXCLUSIVE_TMEM_COLS}")
+    lines.append(f"b_collector_ok = {_b_collector_supported()}")
     # TMEM accumulator budget. One acc stage holds, per GEMM, one region of
     # `num_mma_m` MMA-M blocks each `_epi_tile_cols` columns wide (the N-direction
     # MMAs subdivide that width, they do not add to it). `total_tmem == 0` means
@@ -639,7 +702,7 @@ def _render_tile_constants(
     # divides every power-of-2 subtile span of this config's N-tile).
     vec_bytes_epi = _epi_vec_bytes(chain, cfg, cta_group)
     lines.append(f"vec_bytes_epi = {vec_bytes_epi}")
-    lines.append(f"frost_compile_options = {_FROST_COMPILE_OPTIONS!r}")
+    lines.append(f"frost_compile_options = {_frost_compile_options()!r}")
     # Epilogue store mode: TMA-store-via-SMEM (preferred) vs per-thread STG
     # (fallback). See _use_tma_store_epi() for gating.
     use_tma = (not _FORCE_STG_EPI) and _use_tma_store_epi(chain, cfg, vec_bytes_epi, cta_group)
@@ -664,38 +727,112 @@ def _render_tile_constants(
         )
         lines.append(f"ab_stages = {new_ab}  # SMEM-D {smem_d_bytes}B fixed" f" + cast LOAD {cast_extra_per_stage}B/stage")
     lines.extend(_quant_device_imports(chain))
+    lines.extend(_mixed_cga_constants(cfg, cta_group, fallback_cluster))
     return "\n".join(lines)
 
 
-def _quant_device_imports(chain: FusionChain) -> list[str]:
-    """fp32 -> ue8m0 scale byte via the sm100 cvt unit (round-up, satfinite),
-    emitted into the generated kernel so it stays self-contained. Semantics
-    match the 2^ceil(log2(x)) scale reference; x == 0 gives byte 0 (2^-127).
-    The DSL's own .to(Float8E8M0FNU) lowers to a ~9-instruction emulation."""
-    if not any(q.scale_dtype == "fp8_e8m0" for q in chain.quants):
-        return []
+def _cvt_f32_to_fp8_scale_bits(fn_name: str, dsl_dtype: str, rnd: str) -> list[str]:
+    """A ``fp32 -> <8-bit scale> byte`` helper, emitted into the generated kernel
+    so it stays self-contained. The x2 destination gets the value in both lanes;
+    only the low byte is read back."""
     return [
-        "from cutlass.cutlass_dsl import T as _frost_T",
-        "from cutlass._mlir.dialects import llvm as _frost_llvm",
         "",
         "",
-        "def _frost_cvt_f32_to_e8m0_bits(x):",
+        f"def {fn_name}(x):",
         "    src = cutlass.Float32(x).ir_value()",
-        '    asm = "{\\n  .reg .b16 lo;\\n  cvt.rp.satfinite.ue8m0x2.f32 lo, 0f00000000, $1;\\n  cvt.u32.u16 $0, lo;\\n}"',
-        "    byte = _frost_llvm.inline_asm(",
-        "        _frost_T.i32(),",
-        "        [src],",
-        "        asm,",
-        '        "=r,f",',
-        "        has_side_effects=False,",
-        "        is_align_stack=False,",
-        "        asm_dialect=_frost_llvm.AsmDialect.AD_ATT,",
+        "    pair = _frost_vector.from_elements(_frost_ir.VectorType.get([2], cutlass.Float32.mlir_type), [src, src])",
+        "    lo = _frost_vector.extract(pair, dynamic_position=[], static_position=[0])",
+        "    hi = _frost_vector.extract(pair, dynamic_position=[], static_position=[1])",
+        "    packed = _frost_nvvm.convert_f32x2_to_f8x2(",
+        "        _frost_ir.VectorType.get([2], cutlass.Int8.mlir_type),",
+        "        hi,",
+        "        lo,",
+        f"        _frost_ir.TypeAttr.get(cutlass.{dsl_dtype}.mlir_type),",
+        f"        rnd=_frost_nvvm.FPRoundingMode.{rnd},",
+        "        sat=_frost_nvvm.SaturationMode.SATFINITE,",
         "    )",
-        "    return cutlass.Int32(byte)",
+        "    byte = _frost_llvm.zext(_frost_T.i32(), _frost_llvm.bitcast(cutlass.Int16.mlir_type, packed))",
+        "    return cutlass.Int32(byte) & 0xFF",
     ]
 
 
-_TMEM_COLS_BY_ARCH: tuple[tuple[tuple[int, int], int], ...] = (((100, 120), 512),)
+def _cvt_e5m3_bits_to_f32() -> list[str]:
+    """The inverse of :func:`_cvt_f32_to_fp8_scale_bits` for ue5m3. It goes
+    through **bf16**, not fp16: bf16 carries 8 exponent bits, so it holds the
+    whole E5M3 range including bytes 248..254 (up to 114688), which are finite
+    because the format is canonical-NaN-only. fp16 would turn those into inf."""
+    return [
+        "",
+        "",
+        "def _frost_e5m3_bits_to_f32(b):",
+        "    byte = _frost_llvm.trunc(_frost_T.i8(), cutlass.Int32(b).ir_value(), _frost_llvm.IntegerOverflowFlags.none)",
+        "    pair = _frost_vector.from_elements(_frost_ir.VectorType.get([2], cutlass.Int8.mlir_type), [byte, byte])",
+        "    widened = _frost_nvvm.convert_f8x2_to_bf16x2(",
+        "        _frost_ir.VectorType.get([2], cutlass.BFloat16.mlir_type),",
+        "        pair,",
+        "        _frost_ir.TypeAttr.get(cutlass.FloatNV8E5M3FNU.mlir_type),",
+        "    )",
+        "    return cutlass.Float32(cutlass.BFloat16(_frost_vector.extract(widened, dynamic_position=[], static_position=[0])))",
+    ]
+
+
+def _quant_device_imports(chain: FusionChain) -> list[str]:
+    """Device-side converters between fp32 and the two scale formats whose
+    user-level DSL cast is not usable here. These reach the same hardware cvt
+    unit through the typed NVVM ops the cast itself is built on, which is what
+    lets them ask for the two things the cast does not do:
+
+    * ``sat=SATFINITE`` on the narrowing. The plain cast overflows to byte 255
+      (NaN); a NaN scale poisons its whole block on dequantize. Measured on
+      sm_107, that saturation is the ONLY way the cast differs here.
+    * ``ue5m3 -> bf16`` on the widening. The cast widens through a type that
+      reads E == 31 as inf, but E5M3 is canonical-NaN-only, so bytes 248..253
+      are finite (up to 114688) and come back as inf.
+
+    Both round UP: a scale rounded DOWN makes ``amax / scale`` exceed the output
+    format's max, clamping the block's largest element.
+
+    ``ue8m0`` needs no widening helper — it is a bare exponent, so ``byte << 23``
+    IS the fp32. ``ue5m3``'s cvt exists ONLY on sm_107, see the arch gate in
+    :func:`_check_block_quant_supported`.
+
+    Both take ``x == 0`` to byte 0, which the readback turns back into 0.0."""
+    kinds = {q.scale_dtype for q in chain.quants}
+    lines: list[str] = []
+    if "fp8_e8m0" in kinds:
+        lines += _cvt_f32_to_fp8_scale_bits("_frost_cvt_f32_to_e8m0_bits", "Float8E8M0FNU", "RP")
+    if "fp8_e5m3" in kinds:
+        lines += _cvt_f32_to_fp8_scale_bits("_frost_cvt_f32_to_e5m3_bits", "FloatNV8E5M3FNU", "RP")
+        lines += _cvt_e5m3_bits_to_f32()
+    if not lines:
+        return []
+    return [
+        "from cutlass.cutlass_dsl import T as _frost_T",
+        "from cutlass._mlir import ir as _frost_ir",
+        "from cutlass._mlir.dialects import llvm as _frost_llvm, nvvm as _frost_nvvm, vector as _frost_vector",
+    ] + lines
+
+
+# TMEM columns the GPU has — a HARDWARE property, so every pipeline running on
+# a given arch gets the same budget
+_TMEM_COLS_BY_ARCH: tuple[tuple[tuple[int, int], int], ...] = (
+    ((100, 107), 512),
+    ((107, 110), 576),
+    ((110, 120), 512),
+)
+
+# Past this, tcgen05.alloc must ask for the exclusive mode (and the count stops
+# being a power of two, so it goes through as a register operand).
+_MAX_NON_EXCLUSIVE_TMEM_COLS = 512
+
+
+_B_COLLECTOR_ARCH_RANGES: tuple[tuple[int, int], ...] = ((107, 110),)
+
+
+def _b_collector_supported(arch: int | None = None) -> bool:
+    """Whether this GPU's MMA can hold B in a collector buffer across MMAs."""
+    a = _current_arch() if arch is None else arch
+    return a is not None and any(lo <= a < hi for lo, hi in _B_COLLECTOR_ARCH_RANGES)
 
 
 def _tmem_cols_for_arch(arch: int | None = None) -> int:
@@ -756,12 +893,114 @@ def _grid_num_clusters(cfg: TileConfig, device=None) -> int:
     return max_active_clusters(cfg.cgrp_size_m * cfg.cgrp_size_n, device)
 
 
+def _cluster_mcast_patterns(cluster_m: int, cluster_n: int, cta_group: int) -> tuple[int, int]:
+    """(A, B) multicast bit patterns for a cluster shape, at CTA rank 0.
+
+    A is shared along N (one bit per n_rank, stride cluster_m); B along the M
+    pairs (one bit per MMA pair, stride cta_group). The kernel shifts each by
+    its own rank.
+    """
+    a_pattern = 0
+    for n_idx in range(cluster_n):
+        a_pattern |= 1 << (n_idx * cluster_m)
+    b_pattern = 0
+    for pair_idx in range(cluster_m // cta_group):
+        b_pattern |= 1 << (pair_idx * cta_group)
+    return a_pattern, b_pattern
+
+
+# Preferred-cluster substitution (CU_LAUNCH_ATTRIBUTE_PREFERRED_CLUSTER_DIMENSION)
+# is a property of the PART, like the B collector above — but unlike it, every
+# part from SM 10.0 up can do it, so this is a FLOOR, not a range: there is no
+# known ceiling to encode. (No driver check rides along: the attribute and
+# Blackwell support shipped together, so a part this new implies a driver that
+# knows it.)
+_MIXED_CGA_MIN_ARCH = 100
+
+
+def _mixed_cga_supported(arch: int | None = None) -> bool:
+    """Whether this GPU can group blocks into a preferred cluster and fall back
+    to a smaller one where the preferred does not fit — SM 10.0 and up."""
+    a = _current_arch() if arch is None else arch
+    return a is not None and a >= _MIXED_CGA_MIN_ARCH
+
+
+def min_fallback_cluster(cta_group: int) -> tuple[int, int]:
+    """The smallest cluster this MMA mode can fall back to: one CTA for a 1-CTA
+    MMA, and the 2-CTA pair for a 2-CTA one (the pair must stay inside a single
+    cluster). Smaller is better — it lets the device place a fallback cluster on
+    any leftover SM."""
+    return (cta_group, 1)
+
+
+@functools.lru_cache(maxsize=None)
+def _template_reads_fallback_cluster(template_file: str) -> bool:
+    """Whether a template implements mixed CGA — i.e. whether it consumes the
+    ``fallback_cluster_shape_mnk`` constant. Read off the source rather than a
+    hand-kept capability flag, so it cannot drift from what the template does."""
+    return "fallback_cluster_shape_mnk" in (_TEMPLATE_DIR / template_file).read_text()
+
+
+def _mixed_cga_fallback(cfg: TileConfig, cta_group: int, template_file: str) -> tuple[int, int] | None:
+    """The fallback cluster to attach to this launch, or ``None`` for a plain
+    fixed-cluster launch — byte-for-byte the pre-mixed-CGA behavior.
+
+    Nothing here is a caller knob: the shape is `min_fallback_cluster(cta_group)`
+    and the rest is facts. It is OFF when the GPU cannot substitute clusters,
+    when the template has not been ported (its cluster constants are baked to the
+    preferred shape, so a CTA landing in a smaller cluster would wait on arrivals
+    that never come — a hang, not a lost optimization), when the config's cluster
+    is ALREADY the minimum, when the preferred cluster is not an integer multiple
+    of it per dim (what the driver requires of the pair), and when the config pins
+    the N-super-block walk (that rasterization is not invariant across the two
+    cluster shapes).
+    """
+    if os.environ.get("CUDNN_FROST_DISABLE_MIXED_CGA"):
+        return None
+    if not _mixed_cga_supported():
+        return None
+    if not _template_reads_fallback_cluster(template_file):
+        return None
+    fallback = min_fallback_cluster(cta_group)
+    if fallback == (cfg.cgrp_size_m, cfg.cgrp_size_n) or cfg.tile_swizzle_n > 1:
+        return None
+    if cfg.cgrp_size_m % fallback[0] or cfg.cgrp_size_n % fallback[1]:
+        return None
+    return fallback
+
+
+def _mixed_cga_constants(cfg: TileConfig, cta_group: int, fallback_cluster: tuple[int, int] | None) -> list[str]:
+    """Constants for the kernel's runtime cluster-shape select.
+
+    The config's own cluster is the PREFERRED (wide) shape; ``fallback_cluster``
+    is the smaller one the device substitutes when a preferred cluster does not
+    fit. Everything else the kernel needs follows arithmetically from the cluster
+    dims it reads at runtime — only the multicast bit patterns are loop-built, so
+    both are precomputed here.
+    """
+    a_pref, b_pref = _cluster_mcast_patterns(cfg.cgrp_size_m, cfg.cgrp_size_n, cta_group)
+    if fallback_cluster is None:
+        a_fb, b_fb = a_pref, b_pref
+        shape = "None"
+    else:
+        a_fb, b_fb = _cluster_mcast_patterns(fallback_cluster[0], fallback_cluster[1], cta_group)
+        shape = f"({fallback_cluster[0]}, {fallback_cluster[1]}, 1)"
+    return [
+        f"fallback_cluster_shape_mnk = {shape}",
+        f"mixed_a_pattern_pref = {a_pref}",
+        f"mixed_b_pattern_pref = {b_pref}",
+        f"mixed_a_pattern_fb = {a_fb}",
+        f"mixed_b_pattern_fb = {b_fb}",
+    ]
+
+
 def _render_block_scale_tile_constants(
     cfg: TileConfig,
     chain: FusionChain,
     cta_group: int,
     *,
     use_tma_store_epi: bool = False,
+    fallback_cluster: tuple[int, int] | None = None,
 ) -> str:
     """Emit module-level constants for the block-scale matmul template.
 
@@ -775,8 +1014,9 @@ def _render_block_scale_tile_constants(
     assert bs is not None
     is_fp4 = bs.is_fp4
     is_sm103 = cfg.pipeline == "sm103"
+    is_sm107 = cfg.pipeline == "sm107"
     if is_sm103 and not is_fp4:
-        raise NotImplementedError("the sm103 block-scale pipeline is fp4-only (nvfp4/mxfp4); " f"{bs.combo} runs the sm100 templates")
+        raise NotImplementedError("the sm103 block-scale pipeline is fp4-only; " f"{bs.a_dtype} data with {bs.sf_dtype} scales runs the sm100 templates")
 
     # data_elem_bits / sA-sB bytes / B's TMA stride encoding all take one packed
     # width, read off A alone — a mixed-width combo would mis-size B, not fail.
@@ -1011,10 +1251,13 @@ def _render_block_scale_tile_constants(
     out_dt = chain.output_dtype
     vec_bytes_epi = _epi_vec_bytes(chain, cfg, cta_group)
 
-    # Instruction-descriptor operand dtype. fp4 MMA uses Tcgen05MxInstrDesc with
-    # the E5M2 piggy-back; fp8 uses the real fp8 dtype.
-    if is_fp4:
+    # Instruction-descriptor operand dtype. On sm100 the fp4 MMA rides
+    # Tcgen05MxInstrDesc with the E5M2 piggy-back; the K=64B sm107 fp4 MMA is an
+    # OMMA and takes the real fp4 dtype. fp8 always uses its real dtype.
+    if is_fp4 and not is_sm107:
         idesc_a = idesc_b = "cutlass.Float8E5M2"
+    elif is_fp4:
+        idesc_a = idesc_b = "cutlass.Float4E2M1FN"
     else:
         idesc_a = DTYPE_TO_CUTLASS[bs.a_dtype]
         idesc_b = DTYPE_TO_CUTLASS[bs.b_dtype]
@@ -1023,7 +1266,7 @@ def _render_block_scale_tile_constants(
     ab_tma_format = "_tma.TensorMapDataFormat.B4X16" if is_fp4 else "None"
 
     lines = [
-        f"# Block-scale config: {cfg.name} combo={bs.combo}",
+        f"# Block-scale config: {cfg.name} data={bs.a_dtype}x{bs.b_dtype} sf={bs.sf_dtype} block={bs.block_size}",
         f"cta_tile_m = {cta_m}",
         f"cta_tile_n = {cta_n}",
         f"cta_tile_k_elems = {cta_k_elems}",
@@ -1059,8 +1302,13 @@ def _render_block_scale_tile_constants(
         f"acc_gemm_stride = {acc_gemm_stride}",
         f"sfa_col_bases = {tuple(sfa_col_bases)}",
         f"sfb_col_bases = {tuple(sfb_col_bases)}",
-        f"tile_swizzle_n = {cfg.tile_swizzle_n}",
+        # Mixed CGA pins the walk to the identity map: the super-block
+        # rasterization is not invariant across the two cluster shapes.
+        f"tile_swizzle_n = {1 if fallback_cluster is not None else cfg.tile_swizzle_n}",
         f"swizzle_l2_budget_bytes = {_l2_swizzle_budget_bytes()}",
+        # Read off the PREFERRED cluster; a fallback cluster is a divisor of it,
+        # so these flags dominate and the multicast code path degenerates to the
+        # plain load when the runtime pattern names a single peer.
         f"multicast_a = {cfg.multicast_a}",
         f"multicast_b = {cfg.multicast_b(cta_group)}",
         "",
@@ -1103,7 +1351,7 @@ def _render_block_scale_tile_constants(
         f"cd_dtype = {'cutlass.Int8' if out_dt == 'fp4_e2m1' else DTYPE_TO_CUTLASS[out_dt]}",
         f"cd_tma_dtype = {'cutlass.Int8' if out_dt == 'fp4_e2m1' else DTYPE_TO_CUTLASS[out_dt]}",
         f"vec_bytes_epi = {vec_bytes_epi}",
-        f"frost_compile_options = {_FROST_COMPILE_OPTIONS!r}",
+        f"frost_compile_options = {_frost_compile_options()!r}",
         f"use_tma_store_epi = {use_tma_store_epi}",
         f"cd_out_is_m_major = {chain.out_major == 'm'}",
         f"cd_fake_n_div = {2 if out_dt == 'fp4_e2m1' else 1}",
@@ -1144,6 +1392,8 @@ def _render_block_scale_tile_constants(
         f"sfa_col_base = {sfa_col_base}",
         f"sfb_col_base = {sfb_col_base}",
         f"num_tmem_alloc_cols = {num_tmem_alloc_cols}",
+        f"tmem_alloc_exclusive = {num_tmem_alloc_cols > _MAX_NON_EXCLUSIVE_TMEM_COLS}",
+        f"b_collector_ok = {_b_collector_supported()}",
         f"sfa_smem_bytes = {sfa_smem_bytes}",
         f"sfb_smem_bytes = {sfb_smem_bytes}",
         f"sf_tma_box_k = {sf_tma_box_k}",
@@ -1176,6 +1426,18 @@ def _render_block_scale_tile_constants(
             f"sfa_mma_col_off_by_j = {tuple(spi * j // 4 * 4 * nb_m for j in range(num_kblocks))}",
             f"sfb_mma_col_off_by_j = {tuple(spi * j // 4 * 4 * nb_n for j in range(num_kblocks))}",
         ]
+    if is_sm107:
+        # SM 10.7 block-scale MMA: K = 64 bytes per instruction (2x sm100), so
+        # one MMA consumes sf_scales_per_inst scales — 8 for nvfp4, which spans
+        # word_atoms = 2 of the 4-scale 128x4 utccp atoms. fp4 is an OMMA
+        # (K-mode 2 = 128 fp4 elements); mxfp8 stays on the MX descriptor
+        # (K-mode 1 = 64 fp8 elements).
+        lines += [
+            "",
+            f"# sm107 K=64B block-scale MMA: {num_kblocks} MMAs per K-tile",
+            f"idesc_is_omma = {is_fp4}",
+            f"mma_k_dim_mode = {2 if is_fp4 else 1}",
+        ]
     # MoE grouped block-scale: grouped persistent scheduler launches a FIXED
     # cluster count (≈ NUM_SMS / cluster_size); host grid and stride share it.
     # first_token_offset dtype (int32/int64) drives the compile() fake.
@@ -1186,6 +1448,7 @@ def _render_block_scale_tile_constants(
         # routed-group base offset = group_begin rows × this. NOT ab_dtype.width
         # (that is the packed Float4E2M1FNx2 8-bit type).
         lines.append(f"ab_data_elem_bits = {data_elem_bits}")
+    lines.extend(_mixed_cga_constants(cfg, cta_group, fallback_cluster))
     lines.extend(_quant_device_imports(chain))
     return "\n".join(lines)
 
@@ -1256,6 +1519,7 @@ def _render_template(
     from .kernel_registry import select_template
 
     tmpl = select_template(chain, config, cta_group, scheduler)
+    fallback_cluster = _mixed_cga_fallback(config, cta_group, tmpl.file)
     template_path = _TEMPLATE_DIR / tmpl.file
     src = template_path.read_text()
     # Strip the unused epilogue path FIRST so its @@INJECT_EPILOGUE@@ marker
@@ -1310,7 +1574,7 @@ def _render_template(
         align_reqs=_aux_align_reqs(chain, vec_bytes=vec_bytes_epi),
     )
     compile_aux_pass = _aux_call_block(aux_tensors, prefix="fake_")
-    tile_constants = _render_tile_constants(config, chain, cta_group, use_tma)
+    tile_constants = _render_tile_constants(config, chain, cta_group, use_tma, fallback_cluster=fallback_cluster)
     if snippets.tap_constants:
         tile_constants += "\n" + "\n".join(snippets.tap_constants)
     # Multi-output tap plumbing. Empty lists → markers expand to nothing (kernel
@@ -1417,6 +1681,7 @@ def _render_block_scale_template(
     config: TileConfig,
     cta_group: int,
     scheduler: str,
+    fallback_cluster: tuple[int, int] | None = None,
 ) -> str:
     """Render the block-scale matmul template. Picks TMA-store when
     _use_tma_store_epi allows, else STG; SF TMA descriptors are hardcoded in the
@@ -1436,7 +1701,7 @@ def _render_block_scale_template(
     host_aux_pass = _aux_call_block(aux_tensors)
     compile_aux_fakes = _aux_fake_block(aux_tensors, dynamic_strides=True, align_reqs=_aux_align_reqs(chain, vec_bytes=vec_bytes_epi))
     compile_aux_pass = _aux_call_block(aux_tensors, prefix="fake_")
-    tile_constants = _render_block_scale_tile_constants(config, chain, cta_group, use_tma_store_epi=use_tma)
+    tile_constants = _render_block_scale_tile_constants(config, chain, cta_group, use_tma_store_epi=use_tma, fallback_cluster=fallback_cluster)
     if snippets.tap_constants:
         tile_constants += "\n" + "\n".join(snippets.tap_constants)
 
@@ -2584,7 +2849,22 @@ def probe_supported(
 
     Block-scale / MoE gate inside their ``_jit_*`` compile paths; here a
     successful analysis is treated as eligible (full validation at compile)."""
+    # frost is written in the cutedsl these kernels compile through; below its
+    # floor the engine cannot build (same gate the linear-attention engines
+    # apply). Decline early so a too-old wheel falls back to the backend instead
+    # of faulting deep in cute -- and so the --gpu-arch target pin, which lands in
+    # cutedsl at the floor, is always available by the time a plan compiles. An
+    # internal RC passes: cutedsl_too_old judges only the public wheel.
+    installed, version = buffers.cutedsl_state()
+    if not installed:
+        raise NotImplementedError("frost_gemm requires the cutedsl extra (nvidia-cutlass-dsl)")
+    if buffers.cutedsl_too_old(version):
+        want = ".".join(str(v) for v in buffers.CUTEDSL_MIN_VERSION)
+        raise NotImplementedError(f"frost_gemm requires nvidia-cutlass-dsl >= {want}; found {version[1]}")
     chain, _binding = analyze_with_binding(graph)
+    _dtype_reason = dtype_arch_reject(chain, _current_arch())
+    if _dtype_reason is not None:
+        raise NotImplementedError(_dtype_reason)
     _check_executable(chain)
     if chain.has_moe or chain.has_block_scale:
         return  # specialized paths validate at compile
@@ -2601,7 +2881,7 @@ def probe_supported(
     _check_supported(chain, config)
     from .kernel_registry import select_template as _sel_tmpl
 
-    _arch_reason = _sel_tmpl(chain, config, cta_group, scheduler).arch_active_reject()
+    _arch_reason = _sel_tmpl(chain, config, cta_group, scheduler).active_reject(config)
     if _arch_reason is not None:
         raise NotImplementedError(_arch_reason)
     _check_dtype_config_compat(chain, config, cta_group)
@@ -2626,8 +2906,17 @@ def jit_from_cudnn_graph(
     `tile_config.CATALOG`. Execution strategy: ``cta_group`` ∈ {1, 2} and
     ``scheduler`` ∈ {"clc", "static"} pick the template (mainloop auto-detected).
     ``force_stg_epi=True`` skips the TMA-store path even when its gate accepts.
+
+    Mixed CGA needs no argument and no caller change: where the GPU and the
+    template both support it, the launch carries ``config``'s cluster as the
+    PREFERRED shape plus the smallest fallback the MMA mode allows, so the device
+    fills the SMs a wide fixed cluster leaves idle (:func:`_mixed_cga_fallback`).
+    Everywhere else the launch is the plain fixed cluster it always was.
     """
     chain, binding = analyze_with_binding(graph)
+    _dtype_reason = dtype_arch_reject(chain, _current_arch())
+    if _dtype_reason is not None:
+        raise NotImplementedError(_dtype_reason)
     _check_cta_group_geometry(config, cta_group)
     _check_mma_n_dim(chain, config, cta_group)
     # MoE grouped block-scale = both matches at once (dequant + moe_grouped);
@@ -2659,7 +2948,7 @@ def jit_from_cudnn_graph(
     _check_supported(chain, config)
     from .kernel_registry import select_template as _sel_tmpl
 
-    _arch_reason = _sel_tmpl(chain, config, cta_group, scheduler).arch_active_reject()
+    _arch_reason = _sel_tmpl(chain, config, cta_group, scheduler).active_reject(config)
     if _arch_reason is not None:
         raise NotImplementedError(_arch_reason)
     _check_dtype_config_compat(chain, config, cta_group)
@@ -3074,7 +3363,7 @@ def _jit_moe(
         )
     from .kernel_registry import select_template as _sel_tmpl
 
-    _arch_reason = _sel_tmpl(chain, config, cta_group, scheduler).arch_active_reject()
+    _arch_reason = _sel_tmpl(chain, config, cta_group, scheduler).active_reject(config)
     if _arch_reason is not None:
         raise NotImplementedError(_arch_reason)
     _check_dtype_config_compat(chain, config, cta_group)
@@ -3130,14 +3419,17 @@ def _jit_block_scale(
     # both-sided requirement (single-sided matches no case).
     _check_block_scale_supported(chain, config.pipeline)
     _check_input_alignment(chain)
+    # The sm107 templates carry the sm100 epilogue verbatim, so reductions and
+    # the quant epilogue ride it unchanged; sm103's own pipeline does not.
+    _epi_pipelines = ("sm100", "sm107")
     if chain.reductions:
-        if config.pipeline != "sm100":
-            raise NotImplementedError("block-scale reduction is supported only on sm100 templates")
+        if config.pipeline not in _epi_pipelines:
+            raise NotImplementedError(f"block-scale reduction is not supported on {config.pipeline} templates")
         for red in chain.reductions:
             if red.compute_dtype != "fp32" or red.dtype != "fp32":
                 raise NotImplementedError("block-scale reduction supports only fp32 compute/output")
-    if chain.quants and config.pipeline != "sm100":
-        raise NotImplementedError("block-scale quant epilogue is supported only on sm100 templates " "(not yet validated on sm103)")
+    if chain.quants and config.pipeline not in _epi_pipelines:
+        raise NotImplementedError(f"block-scale quant epilogue is not supported on {config.pipeline} " "templates (not yet validated on sm103)")
     # Per-template active-GPU SM gate (no-op when no GPU is visible).
     from .kernel_registry import select_template
 
@@ -3146,9 +3438,10 @@ def _jit_block_scale(
         raise NotImplementedError(
             f"block-scale multi-GEMM ({chain.num_gemms} GEMMs) is not supported by " f"{_tmpl.file} (cta_group={cta_group}, scheduler={scheduler!r})."
         )
-    _arch_reason = _tmpl.arch_active_reject()
+    _arch_reason = _tmpl.active_reject(config)
     if _arch_reason is not None:
         raise NotImplementedError(_arch_reason)
+    fallback_cluster = _mixed_cga_fallback(config, cta_group, _tmpl.file)
     _compute_output_vec_bytes(chain)  # eager: rejects bad output alignment
     vec_bytes_epi = _epi_vec_bytes(chain, config, cta_group)
     _check_block_quant_supported(chain, vec_bytes_epi, config, cta_group)
@@ -3159,7 +3452,7 @@ def _jit_block_scale(
         output_elem_bytes=DTYPE_BYTES[chain.output_dtype],
         use_tma_store=use_tma,
     )
-    src = _render_block_scale_template(chain, snippets, config, cta_group, scheduler)
+    src = _render_block_scale_template(chain, snippets, config, cta_group, scheduler, fallback_cluster=fallback_cluster)
     mod = _import_kernel(src)
     digest = hashlib.sha256(src.encode("utf-8")).hexdigest()[:16]
     return CompiledFusedGemm(
@@ -3486,7 +3779,7 @@ def _jit_moe_block_scale(
     _check_input_alignment(chain)
     # Per-template active-GPU SM gate (no-op when no GPU is visible).
     _tmpl = select_template(chain, config, cta_group, scheduler)
-    _arch_reason = _tmpl.arch_active_reject()
+    _arch_reason = _tmpl.active_reject(config)
     if _arch_reason is not None:
         raise NotImplementedError(_arch_reason)
     _compute_output_vec_bytes(chain)
@@ -3498,7 +3791,7 @@ def _jit_moe_block_scale(
         output_elem_bytes=DTYPE_BYTES[chain.output_dtype],
         use_tma_store=(not _FORCE_STG_EPI) and _use_tma_store_epi(chain, config, vec_bytes_epi, cta_group),
     )
-    src = _render_block_scale_template(chain, snippets, config, cta_group, scheduler)
+    src = _render_block_scale_template(chain, snippets, config, cta_group, scheduler, fallback_cluster=_mixed_cga_fallback(config, cta_group, _tmpl.file))
     mod = _import_kernel(src)
     digest = hashlib.sha256(src.encode("utf-8")).hexdigest()[:16]
     cluster_m, cluster_n = config.cgrp_size_m, config.cgrp_size_n

@@ -97,9 +97,16 @@ class FrostGemmEngine(BaseEngine):
 
     def build_plan(self, graph: "pygraph", plan: PlanConfig, ctx: ExecutionContext = None) -> CompiledPlan:
         from .graph_analyzer import build_gemm_plan
+        from cudnn.frost.device import build_device
 
+        # Bake the plan for the device of the handle the graph carries (via ctx),
+        # not whatever CUDA device is current at build time. A foreign raw-int
+        # handle (or none) carries no device -> None -> classic current-device.
+        handle = ctx.handle if ctx is not None else None
+        device = handle.device.ordinal if hasattr(handle, "device") else None
         try:
-            return _FrostGemmPlan(build_gemm_plan(graph))
+            with build_device(device):
+                return _FrostGemmPlan(build_gemm_plan(graph))
         except (NotImplementedError, ValueError) as exc:
             raise NotImplementedError(f"frost_gemm: {exc}") from exc
 

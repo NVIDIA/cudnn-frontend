@@ -143,6 +143,7 @@ MANIFEST: Tuple[EngineFamily, ...] = (
         "cudnn.linear_attention",
         "GdnEngines",
         slots={"gdn_frost": EngineSlot(0), "gdn_cutile": EngineSlot(1)},
+        analyzer=("cudnn.linear_attention.graph_analyzer", "analyze"),
     ),
     EngineFamily(
         KDA_ID_BASE,
@@ -150,6 +151,7 @@ MANIFEST: Tuple[EngineFamily, ...] = (
         "cudnn.linear_attention",
         "KdaEngines",
         slots={"kda_frost": EngineSlot(0), "kda_cutile": EngineSlot(1)},
+        analyzer=("cudnn.linear_attention.graph_analyzer", "analyze"),
     ),
     EngineFamily(
         GDN2_ID_BASE,
@@ -157,6 +159,7 @@ MANIFEST: Tuple[EngineFamily, ...] = (
         "cudnn.linear_attention",
         "Gdn2Engines",
         slots={"gdn2_frost": EngineSlot(0)},
+        analyzer=("cudnn.linear_attention.graph_analyzer", "analyze"),
     ),
     EngineFamily(
         FROST_GEMM_ID_BASE,

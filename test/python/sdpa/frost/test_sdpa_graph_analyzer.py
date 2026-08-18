@@ -477,24 +477,6 @@ def test_resolve_generate_stats():
     assert cfg.stats_t is not None
 
 
-def test_probe_rejects_bottom_right_plus_swa():
-    # Kernel gap: CAUSAL_BOTTOM_RIGHT excludes SWA (config would assert at import).
-    g = _mk_graph()
-    q, k, v, dims, strides = _mk_qkv(g)
-    o, _ = g.sdpa(
-        name="s",
-        q=q,
-        k=k,
-        v=v,
-        attn_scale=0.1,
-        is_inference=True,
-        use_causal_mask_bottom_right=True,
-        sliding_window_length=128,
-    )
-    _finish_output(o, dims, strides)
-    assert not _eligible(g)
-
-
 def test_probe_rejects_bottom_right_swa_only():
     # Kernel gap: CAUSAL_BOTTOM_RIGHT requires MASK_CAUSAL; BOTTOM_RIGHT
     # alignment with only a left band has no causal bit.
@@ -605,11 +587,77 @@ def test_sm120_probe_accepts_causal_swa_on_both_minors(monkeypatch):
         assert not any("sm100" in name for name in elig)
 
 
+def test_probe_rejects_requested_amax_s():
+    # The FP8 kernels no longer compute Amax_S; a graph that DECLARES the
+    # output (set_output(True), non-virtual) must go elsewhere. The port the
+    # op returns unconditionally does NOT count (is_virtual stays True).
+    import math
+
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.FP8_E4M3, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    dims, strides = (B, H, S, 128), (S * H * 128, 128, H * 128, 1)
+    q = g.tensor(dim=dims, stride=strides, data_type=cudnn.data_type.FP8_E4M3, name="q")
+    k = g.tensor(dim=dims, stride=strides, data_type=cudnn.data_type.FP8_E4M3, name="k")
+    v = g.tensor(dim=dims, stride=strides, data_type=cudnn.data_type.FP8_E4M3, name="v")
+    sc = [g.tensor(dim=(1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.FLOAT) for _ in range(6)]
+    kw = dict(
+        q=q,
+        k=k,
+        v=v,
+        descale_q=sc[0],
+        descale_k=sc[1],
+        descale_v=sc[2],
+        descale_s=sc[3],
+        scale_s=sc[4],
+        scale_o=sc[5],
+        attn_scale=1.0 / math.sqrt(128),
+        generate_stats=False,
+        use_causal_mask=True,
+    )
+
+    def build(request_amax_s):
+        gg = cudnn.pygraph(io_data_type=cudnn.data_type.FP8_E4M3, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+        qq = gg.tensor(dim=dims, stride=strides, data_type=cudnn.data_type.FP8_E4M3, name="q")
+        kk = gg.tensor(dim=dims, stride=strides, data_type=cudnn.data_type.FP8_E4M3, name="k")
+        vv = gg.tensor(dim=dims, stride=strides, data_type=cudnn.data_type.FP8_E4M3, name="v")
+        ss = [gg.tensor(dim=(1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.FLOAT) for _ in range(6)]
+        o, _stats, amx_s, amx_o = gg.sdpa_fp8(
+            q=qq,
+            k=kk,
+            v=vv,
+            descale_q=ss[0],
+            descale_k=ss[1],
+            descale_v=ss[2],
+            descale_s=ss[3],
+            scale_s=ss[4],
+            scale_o=ss[5],
+            attn_scale=1.0 / math.sqrt(128),
+            generate_stats=False,
+            use_causal_mask=True,
+        )
+        _finish_output(o, dims, strides, dtype=cudnn.data_type.HALF)
+        amx_o.set_output(True).set_dim((1, 1, 1, 1)).set_stride((1, 1, 1, 1)).set_data_type(cudnn.data_type.FLOAT)
+        if request_amax_s:
+            amx_s.set_output(True).set_dim((1, 1, 1, 1)).set_stride((1, 1, 1, 1)).set_data_type(cudnn.data_type.FLOAT)
+        return gg
+
+    fp8_name = engines.engine_name(128, fp8=True)
+    assert fp8_name in _eligible(build(request_amax_s=False))
+    assert fp8_name not in _eligible(build(request_amax_s=True))
+
+
+def test_probe_accepts_bottom_right_with_swa():
+    # The band shifts wholesale with the diagonal: the SM100 kernels apply the
+    # same causal_diag offset to the SWA lower limit as to the causal upper one.
+    g = _mk_graph()
+    q, k, v, dims, strides = _mk_qkv(g)
+    o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True, use_causal_mask_bottom_right=True, sliding_window_length=64)
+    _finish_output(o, dims, strides)
+    assert engines.engine_name(512) in _eligible(g)
+
+
 def test_sm120_probe_accepts_bottom_right_with_swa(monkeypatch):
-    # SM120-only notch: the SM100 kernels' BR diagonal excludes SWA. Facts are
-    # cached per graph, so each device family probes a freshly built graph.
+    # BR + SWA is served on both families now; this pins the SM120 row's claim.
     kwargs = dict(use_causal_mask_bottom_right=True, sliding_window_length=64)
-    assert not _eligible(_mk_sm120_graph(**kwargs))  # (10, 0): no row serves BR+SWA
     monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
     assert _SM120 in _eligible(_mk_sm120_graph(**kwargs))
 

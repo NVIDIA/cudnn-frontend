@@ -22,6 +22,12 @@ from functools import lru_cache
 from typing import Callable
 
 import cutlass.experimental.primitives as nvvm
+from cudnn.gemm.frost.kernel_templates._tile_helpers import (
+    epi_subtile_spans as _epi_subtile_spans,
+    l2_swizzle_tile as _l2_swizzle_tile,
+    tcgen05_alloc as _tcgen05_alloc,
+    tcgen05_dealloc as _tcgen05_dealloc,
+)
 import cutlass.experimental.cuda.tensor_map as _tma
 import cutlass._mlir_helpers.vector as _cvec
 from cutlass import apply_swizzle as _apply_smem_swizzle
@@ -72,33 +78,6 @@ def _auto_swizzle_w(m, n, k, nt_n):
     return cutlass.Int32(w)
 
 
-def _l2_swizzle_tile(raw_m, raw_n, nt_m, nt_n, swizzle_w):
-    """N-direction super-block rasterization of the (m, n) cgrp-tile coord, for
-    L2 reuse. ``swizzle_w == 1`` falls out of the math as the identity mapping.
-    """
-    t = raw_n * nt_m + raw_m
-    blk = nt_m * swizzle_w
-    sb = t // blk
-    off = t - sb * blk
-    base_n = sb * swizzle_w
-    cur_S = cutlass.min(cutlass.Int32(swizzle_w), nt_n - base_n)
-    log_m = off // cur_S
-    log_n = base_n + off - log_m * cur_S
-    return log_m, log_n
-
-
-def _epi_subtile_spans(cols):
-    spans = []
-    off = 0
-    while off < cols:
-        w = 32
-        while w > cols - off:
-            w //= 2
-        spans.append((off, w))
-        off += w
-    return spans
-
-
 @cute.kernel
 def _kernel(
     m: cutlass.Int64,
@@ -137,8 +116,27 @@ def _kernel(
     gridx = cute.arch.grid_dim()[0]
     gridy = cute.arch.grid_dim()[1]
 
-    cluster_m = cluster_shape_mnk[0]
-    cluster_n = cluster_shape_mnk[1]
+    # Mixed CGA: the launch carries a preferred (wide) cluster plus a smaller
+    # fallback one, and the device picks per cluster — a CTA can only tell which
+    # by reading the hardware cluster dims. Everything cluster-shaped below then
+    # follows from those, so the two kinds share one body; only the multicast bit
+    # patterns are loop-built and come in precomputed per shape.
+    a_mcast_pattern = mixed_a_pattern_pref
+    b_mcast_pattern = mixed_b_pattern_pref
+    if cutlass.const_expr(fallback_cluster_shape_mnk is None):
+        cluster_m = cluster_shape_mnk[0]
+        cluster_n = cluster_shape_mnk[1]
+    else:
+        cdim_x, cdim_y, _cdim_z = cute.arch.block_in_cluster_dim()
+        cluster_m = cdim_x
+        cluster_n = cdim_y
+        a_mcast_pattern = cutlass.Int32(mixed_a_pattern_pref)
+        b_mcast_pattern = cutlass.Int32(mixed_b_pattern_pref)
+        # Bitwise, not `or`: both operands are runtime Booleans (this is the form
+        # cutlass.cute.experimental.is_preferred_cluster uses).
+        if (cdim_x != cluster_shape_mnk[0]) | (cdim_y != cluster_shape_mnk[1]):
+            a_mcast_pattern = cutlass.Int32(mixed_a_pattern_fb)
+            b_mcast_pattern = cutlass.Int32(mixed_b_pattern_fb)
     cluster_size = cluster_m * cluster_n * cluster_shape_mnk[2]
 
     cta_rank_in_cluster = cute.arch.block_idx_in_cluster()
@@ -171,19 +169,12 @@ def _kernel(
     )
     init_tile_l = bidz
 
-    a_pattern = 0
-    for n_idx in cutlass.range_constexpr(cluster_n):
-        a_pattern = a_pattern | (1 << (n_idx * cluster_m))
-    b_pattern = 0
-    for pm_idx in cutlass.range_constexpr(cluster_m // 2):
-        b_pattern = b_pattern | (1 << (pm_idx * 2))
-
     if cutlass.const_expr(multicast_a):
-        tma_mcast_mask_a = cutlass.Int16(a_pattern << m_rank)
+        tma_mcast_mask_a = cutlass.Int16(a_mcast_pattern << m_rank)
     else:
         tma_mcast_mask_a = cutlass.Int16(1 << cta_rank_in_cluster)
     if cutlass.const_expr(multicast_b):
-        tma_mcast_mask_b = cutlass.Int16((b_pattern << pair_member) << (n_rank * cluster_m))
+        tma_mcast_mask_b = cutlass.Int16((b_mcast_pattern << pair_member) << (n_rank * cluster_m))
     else:
         tma_mcast_mask_b = cutlass.Int16(1 << cta_rank_in_cluster)
 
@@ -284,7 +275,11 @@ def _kernel(
     )
 
     # TMEM: per-pair (CTA_2 group), double-buffered along N.
-    pair_n_size = cgrp_tile_mnk[1] // cluster_n
+    # Per-CTA logical tile — the cluster cancels out, so these stay compile-time
+    # constants even when the cluster shape is only known at runtime.
+    logical_cta_tile_m = cgrp_tile_mnk[0] // cluster_shape_mnk[0]
+    logical_cta_tile_n = cgrp_tile_mnk[1] // cluster_shape_mnk[1]
+    pair_n_size = logical_cta_tile_n
     # Per-CTA output rows one MMA-M block covers. The pair splits M, so this is
     # the per-CTA mma_inst_m — half the instruction's hardware M.
     epi_rows_per_mma_m = cta_tile_mnk[0] // num_mma_m
@@ -310,10 +305,12 @@ def _kernel(
     vsize = (VEC_BYTES * 8) // cd_dtype.width
     M = m
     N = n
-    num_tile_m = cute.ceil_div(M, cgrp_tile_mnk[0])
-    num_tile_n = cute.ceil_div(N, cgrp_tile_mnk[1])
-    total_tiles = num_tile_m * num_tile_n
     num_k_tiles = cute.ceil_div(k, cgrp_tile_mnk[2])
+    # The tile this cluster owns spans its OWN cluster shape; both shapes walk
+    # the grid as the identity map (tile == blockIdx), so they tile the problem
+    # identically and every output tile is still covered exactly once.
+    cgrp_tile_m_cur = logical_cta_tile_m * cluster_m
+    cgrp_tile_n_cur = logical_cta_tile_n * cluster_n
     num_k_blocks = cgrp_tile_mnk[2] // mma_inst_shape_mnk[2]
 
     if warp_idx == scheduler_warp_id:
@@ -385,9 +382,8 @@ def _kernel(
         is_valid = cutlass.Int32(1)
         clc_full_phase_tma = cutlass.Int32(0)
         while is_valid != 0:
-            logical_cta_tile_n = cgrp_tile_mnk[1] // cluster_n
-            coord_m_per_cta = tile_m * cgrp_tile_mnk[0] + m_rank * cta_tile_mnk[0]
-            coord_n_per_cta = tile_n * cgrp_tile_mnk[1] + n_rank * logical_cta_tile_n + pair_member * cta_tile_mnk[1]
+            coord_m_per_cta = tile_m * cgrp_tile_m_cur + m_rank * cta_tile_mnk[0]
+            coord_n_per_cta = tile_n * cgrp_tile_n_cur + n_rank * logical_cta_tile_n + pair_member * cta_tile_mnk[1]
             if cutlass.const_expr(matmul_a_batch == 1):
                 tile_l_a = cutlass.Int32(0)
             else:
@@ -574,19 +570,23 @@ def _kernel(
                 pass
 
     pair_mask = cutlass.Int16(3) << pair_leader_rank
-    a_arrive_pattern = 0
-    for n_idx in cutlass.range_constexpr(cluster_n):
-        a_arrive_pattern = a_arrive_pattern | (1 << (n_idx * cluster_m))
-    b_arrive_pattern = 0
-    for m_idx in cutlass.range_constexpr(cluster_m):
-        b_arrive_pattern = b_arrive_pattern | (1 << m_idx)
+    a_arrive_pattern = a_mcast_pattern
+    if cutlass.const_expr(fallback_cluster_shape_mnk is None):
+        b_arrive_pattern = (1 << cluster_m) - 1
+    else:
+        b_arrive_pattern = (cutlass.Int32(1) << cluster_m) - 1
     a_part = a_arrive_pattern << m_rank
     a_part = a_part | (a_part << 1)
     b_part = b_arrive_pattern << (n_rank * cluster_m)
     ab_empty_arrive_mask = cutlass.Int16(a_part | b_part)
     if warp_idx == mma_warp_id:
         nvvm.setmaxregister(prod_reg_count, nvvm.SetMaxRegisterAction.DECREASE)
-        nvvm.tcgen05_alloc(tmem_ptr_i32, num_tmem_alloc_cols, group=nvvm.CTAGroup.CTA_2)
+        _tcgen05_alloc(
+            tmem_ptr_i32,
+            cutlass.Int32(num_tmem_alloc_cols),
+            is_exclusive=tmem_alloc_exclusive,
+            group=nvvm.CTAGroup.CTA_2,
+        )
         nvvm.bar_warp_sync(0xFFFFFFFF)
         nvvm.barrier_cta_arrive(barrier_id=TMEM_ALLOC_BARRIER_ID, thread_count=tmem_alloc_bar_count)
         tmem_raw_addr = tmem_ptr_i32.load()
@@ -735,7 +735,12 @@ def _kernel(
                 pass
             nvvm.mbarrier_arrive(peer_mbar, scope=nvvm.MemScope.CLUSTER, relaxed=True)
             alloc_ptr = cutlass.inttoptr(tmem_raw_addr, 6, cutlass.Int32)
-            nvvm.tcgen05_dealloc(alloc_ptr, num_tmem_alloc_cols, group=nvvm.CTAGroup.CTA_2)
+            _tcgen05_dealloc(
+                alloc_ptr,
+                cutlass.Int32(num_tmem_alloc_cols),
+                is_exclusive=tmem_alloc_exclusive,
+                group=nvvm.CTAGroup.CTA_2,
+            )
         else:
             tile_iter = cutlass.Int32(0)
             is_valid = cutlass.Int32(1)
@@ -769,7 +774,12 @@ def _kernel(
             while not nvvm.mbarrier_try_wait_parity(tmem_dealloc_mbar_ptr, 0, time_limit=10_000_000):
                 pass
             alloc_ptr = cutlass.inttoptr(tmem_raw_addr, 6, cutlass.Int32)
-            nvvm.tcgen05_dealloc(alloc_ptr, num_tmem_alloc_cols, group=nvvm.CTAGroup.CTA_2)
+            _tcgen05_dealloc(
+                alloc_ptr,
+                cutlass.Int32(num_tmem_alloc_cols),
+                is_exclusive=tmem_alloc_exclusive,
+                group=nvvm.CTAGroup.CTA_2,
+            )
 
     if warp_idx < num_epilogue_warps:
         nvvm.setmaxregister(epi_reg_count, nvvm.SetMaxRegisterAction.INCREASE)
@@ -800,8 +810,8 @@ def _kernel(
         # @@TMA_STORE_ONLY:END@@
 
         while is_valid != 0:
-            coord_m_tile = tile_m * cgrp_tile_mnk[0] + m_rank * cta_tile_mnk[0]
-            coord_n_c = tile_n * cgrp_tile_mnk[1] + n_rank * pair_n_size
+            coord_m_tile = tile_m * cgrp_tile_m_cur + m_rank * cta_tile_mnk[0]
+            coord_n_c = tile_n * cgrp_tile_n_cur + n_rank * pair_n_size
             if cutlass.const_expr(epi_rows_per_mma_m == 64):
                 coord_n_c = coord_n_c + (warp_idx // 2) * epi_cols_per_mma_m
 
@@ -1146,7 +1156,7 @@ def _host(
     grid_x = num_tile_m_host * cluster_m
     grid_y = num_tile_n_host * cluster_n
     grid_shape = (grid_x, grid_y, batch)
-    _kernel(
+    launch = _kernel(
         problem_size[0],
         problem_size[1],
         problem_size[2],
@@ -1157,13 +1167,28 @@ def _host(
         # @@TMA_STORE_ONLY:BEGIN@@
         # @@INJECT_HOST_TMA_C_PASS@@
         # @@TMA_STORE_ONLY:END@@
-    ).launch(
-        grid=grid_shape,
-        block=(threads_per_cta, 1, 1),
-        cluster=cluster_shape_mnk,
-        use_pdl=USE_PDL,
-        stream=stream,
     )
+    # Mixed CGA: `cluster` is the preferred (wide) shape and `fallback_cluster`
+    # the regular one the device groups blocks into when a preferred cluster does
+    # not fit. The grid is already a multiple of the preferred shape, which the
+    # driver requires.
+    if cutlass.const_expr(fallback_cluster_shape_mnk is None):
+        launch.launch(
+            grid=grid_shape,
+            block=(threads_per_cta, 1, 1),
+            cluster=cluster_shape_mnk,
+            use_pdl=USE_PDL,
+            stream=stream,
+        )
+    else:
+        launch.launch(
+            grid=grid_shape,
+            block=(threads_per_cta, 1, 1),
+            cluster=cluster_shape_mnk,
+            fallback_cluster=fallback_cluster_shape_mnk,
+            use_pdl=USE_PDL,
+            stream=stream,
+        )
 
 
 @lru_cache(maxsize=None)

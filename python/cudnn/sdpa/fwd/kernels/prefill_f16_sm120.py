@@ -29,14 +29,14 @@ The kernel implements key optimizations including:
   single TMA descriptor's seq coordinate
 
 Constraints:
-* Supported input dtypes: Float16 and BFloat16, output dtype must match input dtype
-* Runtime head dimensions must be multiples of 8 up to 256 (TMA 16-byte
+- Supported input dtypes: Float16 and BFloat16, output dtype must match input dtype
+- Runtime head dimensions must be multiples of 8 up to 256 (TMA 16-byte
   global-stride rule); the kernel compiles at head TILES rounded up to 16 and
   TMA zero-fills the pad columns (the head-dim ENVELOPE)
-* Q heads must be divisible by the number of K/V heads
-* Q/K/V/O use compact BSHD storage
-* Supported CTA Q/KV tiles are 128 or 64
-* K/V pipeline and output staging storage must fit within the target SM120 SMEM
+- Q heads must be divisible by the number of K/V heads
+- Q/K/V/O use compact BSHD storage
+- Supported CTA Q/KV tiles are 128 or 64
+- K/V pipeline and output staging storage must fit within the target SM120 SMEM
   capacity
 """
 
@@ -51,8 +51,15 @@ import cutlass.cute as cute
 
 from cutlass.experimental import primitives as prims
 from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_FP16
-from cudnn.frost.tile_dsl.mma import ptx_mma_m16n8k16_f32
+from cudnn.frost.tile_dsl.scheduler import (
+    SCHED_LPT_L2,
+    SCHED_NATURAL,
+    lpt_tile_coords,
+    lpt_l2_tile_coords,
+)
+from cudnn.frost.tile_dsl.mma import mma_m16n8k16_f32
 from cudnn.frost.tile_dsl.swizzle import swizzle_xor
+from cudnn.sdpa.fwd.kernels.thd_sm100 import build_thd_meta_kernel as _build_thd_meta_kernel
 from cudnn.sdpa.fwd.config_sm120 import (
     HEAD_TILE_GRANULE,
     SEQ_KV_TILES as _SEQ_KV_TILES,
@@ -130,6 +137,10 @@ def pack_to_i32(
     return vals.bitcast(cutlass.Int32)[0]
 
 
+# L2 working-set budget used by the LPT_L2 group sizing.
+_SCHED_L2_BUDGET_BYTES = 50 * 1024 * 1024
+
+
 def ceil_div(a: int, b: int) -> int:
     """Return the ceiling division of a by b."""
     return (a + b - 1) // b
@@ -191,6 +202,7 @@ class SM120FusedMultiHeadAttentionForward:
         in_dtype: Type[cutlass.Numeric] = cutlass.Float16,
         out_dtype: Type[cutlass.Numeric] = cutlass.Float16,
         is_causal: bool = False,
+        sched_policy: int = SCHED_NATURAL,
         bottom_right: bool = False,
         window_size_left: int | None = None,
         window_size_right: int | None = None,
@@ -199,7 +211,6 @@ class SM120FusedMultiHeadAttentionForward:
         has_sink: bool = False,
         thd_varlen: bool = False,
         thd_batch: int = 1,
-        thd_max_sq: int = 0,
         thd_lse_head_major: bool = False,
         head_tile_qk: int = 128,
         head_tile_v: int = 128,
@@ -228,7 +239,6 @@ class SM120FusedMultiHeadAttentionForward:
             ``[seq_kv(B) | cu_q(B+1) | cu_k(B+1)]`` metadata tensor, and the
             grid covers ``ceil(thd_max_sq / q_tile)`` tiles per sequence.
         :param thd_batch: THD only: the real sequence count B.
-        :param thd_max_sq: THD only: the longest sequence's Q length.
         :param thd_lse_head_major: THD only: the packed LSE is head-major
             ``(H, head_stride)`` (FlashAttention's ``softmax_lse`` layout; tokens
             contiguous within a head, ``head_stride >= T``) instead of the default
@@ -246,27 +256,26 @@ class SM120FusedMultiHeadAttentionForward:
 
         if out_dtype != in_dtype:
             raise ValueError("out_dtype must match in_dtype")
-        if thd_varlen and (thd_batch < 1 or thd_max_sq < 1):
-            raise ValueError("thd_varlen requires thd_batch >= 1 and thd_max_sq >= 1")
+        if thd_varlen and thd_batch < 1:
+            raise ValueError("thd_varlen requires thd_batch >= 1")
         self.in_dtype = in_dtype
         self.out_dtype = in_dtype
         self.is_causal = is_causal
+        self.sched_policy = sched_policy
         self.bottom_right = bottom_right
         self.window_size_left = window_size_left
-        self.window_size_right = window_size_right
         # Band model: a right bound implies the causal upper limit (compile()
         # maps window_right -> is_causal), so the masking sites key off
-        # is_causal and add the (compile-time) widening.
-        self.right_slack = window_size_right if window_size_right is not None else 0
+        # is_causal and add the (compile-time) widening. 0 = plain causal.
+        self.window_right = window_size_right if window_size_right is not None else 0
         # A translated diagonal (bottom-right anchoring or a right band) can
         # straddle one more KV tile than the tile-aligned top-left one.
-        self.diag_shifted = bottom_right or self.right_slack > 0
+        self.diag_shifted = bottom_right or self.window_right > 0
         self.seq_q_lens_present = seq_q_lens_present
         self.seq_kv_lens_present = seq_kv_lens_present
         self.has_sink = has_sink
         self.thd_varlen = thd_varlen
         self.thd_batch = thd_batch
-        self.thd_max_sq = thd_max_sq
         self.thd_lse_head_major = thd_lse_head_major
 
         self.head_tile_qk = head_tile_qk
@@ -490,7 +499,7 @@ class SM120FusedMultiHeadAttentionForward:
                 k_vec = load_k_frag_pair(k_frag_pair, d_frag)
                 q_off = d_frag * 4
                 s_off = (k_frag_pair * 2) * 4
-                s_regs[s_off:4] = ptx_mma_m16n8k16_f32(
+                s_regs[s_off:4] = mma_m16n8k16_f32(
                     q_regs[q_off + 0],
                     q_regs[q_off + 1],
                     q_regs[q_off + 2],
@@ -503,7 +512,7 @@ class SM120FusedMultiHeadAttentionForward:
                     s_regs[s_off + 3],
                     self.in_dtype,
                 )
-                s_regs[s_off + 4 : 4] = ptx_mma_m16n8k16_f32(
+                s_regs[s_off + 4 : 4] = mma_m16n8k16_f32(
                     q_regs[q_off + 0],
                     q_regs[q_off + 1],
                     q_regs[q_off + 2],
@@ -566,10 +575,10 @@ class SM120FusedMultiHeadAttentionForward:
             valid_cols = basic_params.seqlen_k
             if cutlass.const_expr(self.is_causal):
                 # Causal upper bound, widened right by the (compile-time) band
-                # slack — 0 for plain causal, R for diagonal_band_right_bound.
+                # widening — 0 for plain causal, R for diagonal_band_right_bound.
                 valid_cols = cute.math.max(
                     cutlass.Int32(0),
-                    cute.math.min(diagonal_position + 1 + self.right_slack, basic_params.seqlen_k),
+                    cute.math.min(diagonal_position + 1 + self.window_right, basic_params.seqlen_k),
                 )
 
             first_valid_col = cutlass.Int32(0)
@@ -710,7 +719,7 @@ class SM120FusedMultiHeadAttentionForward:
                 p2 = p_regs[p_pack_off + 4].bitcast(cutlass.Int32)
                 p3 = p_regs[p_pack_off + 6].bitcast(cutlass.Int32)
                 o_off = (d_frag_pair * 2) * 4
-                o_regs[o_off:4] = ptx_mma_m16n8k16_f32(
+                o_regs[o_off:4] = mma_m16n8k16_f32(
                     p0,
                     p1,
                     p2,
@@ -723,7 +732,7 @@ class SM120FusedMultiHeadAttentionForward:
                     o_regs[o_off + 3],
                     self.in_dtype,
                 )
-                o_regs[o_off + 4 : 4] = ptx_mma_m16n8k16_f32(
+                o_regs[o_off + 4 : 4] = mma_m16n8k16_f32(
                     p0,
                     p1,
                     p2,
@@ -800,6 +809,7 @@ class SM120FusedMultiHeadAttentionForward:
         tma_k_desc: cutlass.GridConstant[cuda.TensorMap],
         tma_v_desc: cutlass.GridConstant[cuda.TensorMap],
         softmax_scale_log2: cutlass.Float32,
+        n_q_tiles: cutlass.Int32,
     ) -> None:
         """SM120 FMHA prefill kernel.
 
@@ -821,7 +831,26 @@ class SM120FusedMultiHeadAttentionForward:
         """
         tidx, _, _ = cute.arch.thread_idx()
         q_tile_idx, batch_idx, head_idx = cute.arch.block_idx()
-        if cutlass.const_expr(self.is_causal):
+        if cutlass.const_expr(self.sched_policy != SCHED_NATURAL):
+            _n_qh = cutlass.Int32(q.shape[2])
+            _n_batch = cutlass.Int32(self.thd_batch if cutlass.const_expr(self.thd_varlen) else q.shape[0])
+            # Host-computed (see __call__): the grid is sized from the same
+            # value, so the decode cannot disagree with the launch geometry.
+            _q_tiles = n_q_tiles
+            if cutlass.const_expr(self.sched_policy == SCHED_LPT_L2):
+                q_tile_idx, head_idx, batch_idx = lpt_l2_tile_coords(
+                    q_tile_idx,
+                    _n_qh,
+                    _n_batch,
+                    _q_tiles,
+                    _n_qh // cutlass.Int32(k.shape[2]),
+                    cutlass.Int32(k.shape[1]),
+                    (self.head_tile_qk + self.head_tile_v) * self.in_dtype.width // 8,
+                    _SCHED_L2_BUDGET_BYTES,
+                )
+            else:
+                q_tile_idx, head_idx, batch_idx = lpt_tile_coords(q_tile_idx, _n_qh, _n_batch, _q_tiles)
+        elif cutlass.const_expr(self.is_causal):
             # Diagonal-bounded work grows with the Q tile. Launch long tiles
             # first to avoid leaving a few expensive CTAs in the final
             # scheduler waves (right-band graphs share the causal shape).
@@ -891,7 +920,7 @@ class SM120FusedMultiHeadAttentionForward:
             if q_seq_idx >= seqlen_q:
                 num_kv_tiles = cutlass.Int32(0)
         if cutlass.const_expr(self.is_causal):
-            causal_k_end = q_seq_idx + self.q_tile + self.right_slack
+            causal_k_end = q_seq_idx + self.q_tile + self.window_right
             if cutlass.const_expr(self.bottom_right):
                 causal_k_end += seqlen_k - seqlen_q
             causal_k_end = cute.math.max(cutlass.Int32(0), cute.math.min(causal_k_end, seqlen_k))
@@ -1292,6 +1321,10 @@ class SM120FusedMultiHeadAttentionForward:
         seq_q_lens: cute.Tensor,
         seq_kv_lens: cute.Tensor,
         softmax_scale_log2: cutlass.Float32,
+        thd_max_sq: cutlass.Int32,
+        thd_q_lens: Optional[cute.Tensor],
+        thd_kv_lens: Optional[cute.Tensor],
+        thd_lens_form: Optional[cutlass.Int32],
         stream: cuda_driver.CUstream,
     ) -> None:
         """Launch the SM120 cutlass FMHA kernel.
@@ -1309,6 +1342,18 @@ class SM120FusedMultiHeadAttentionForward:
         :param seq_q_lens: Per-batch query lengths, or an unused dummy tensor.
         :param seq_kv_lens: Per-batch key/value lengths, or an unused dummy tensor.
         :param softmax_scale_log2: ``softmax_scale * log2(e)``.
+        :param thd_max_sq: THD only: the PLAN-TIME declared S_q envelope (it
+            sizes the per-sequence grid without entering the compile cache
+            key; every runtime length is bounded by it, and tiles past a
+            sequence's real length drain without loads or stores); 0 /
+            ignored when dense.
+        :param thd_q_lens: THD only: the CALLER's Q length tensor — (B,)
+            per-batch lengths or (B+1,) cu prefix sums — consumed by the
+            setup kernel's device-side metadata build (issue #552). None
+            (folded out of the ABI) when dense.
+        :param thd_kv_lens: THD only: same for the KV side.
+        :param thd_lens_form: THD only: runtime bitmask — bit 0: Q is cu,
+            bit 1: KV is cu.
         :param stream: CUDA stream used for the launch.
         """
         head_dim_qk = q.shape[3]
@@ -1319,12 +1364,20 @@ class SM120FusedMultiHeadAttentionForward:
             raise ValueError("runtime V/O head dimensions must round up (by the head-tile granule) to the kernel head_tile_v")
         if cutlass.const_expr(head_dim_qk % 8 != 0 or head_dim_v % 8 != 0):
             raise ValueError("head dimensions must be multiples of 8 (TMA 16-byte global-stride rule at 2 B/elem)")
+
+        # THD compiles the token extents DYNAMIC (mode 1 is a symbol, not an
+        # int), so only statically-known modes can be compared at trace time;
+        # the adapter builds the ragged views from shared totals, so the
+        # dynamic seq extents match by construction.
+        def _static_neq(a, b):
+            return isinstance(a, int) and isinstance(b, int) and a != b
+
         if cutlass.const_expr(
-            q.shape[0] != k.shape[0]
-            or k.shape[:3] != v.shape[:3]
-            or q.shape[0] != o.shape[0]
-            or q.shape[1] != o.shape[1]
-            or q.shape[2] != o.shape[2]
+            _static_neq(q.shape[0], k.shape[0])
+            or any(_static_neq(a, b) for a, b in zip(k.shape[:3], v.shape[:3]))
+            or _static_neq(q.shape[0], o.shape[0])
+            or _static_neq(q.shape[1], o.shape[1])
+            or _static_neq(q.shape[2], o.shape[2])
             or q.shape[2] % k.shape[2] != 0
         ):
             raise ValueError("runtime Q/K/V/O batch, sequence, or head geometry mismatch")
@@ -1337,13 +1390,17 @@ class SM120FusedMultiHeadAttentionForward:
                 )
         if cutlass.const_expr(lse is not None):
             if cutlass.const_expr(self.thd_varlen):
+                # The packed token total (q.shape[1]) is DYNAMIC under THD, so
+                # only the static modes are trace-checkable; head_stride >= T
+                # and the (T, H) extent are validated by the adapter at
+                # execute, which builds both views from the same total.
                 if cutlass.const_expr(self.thd_lse_head_major):
-                    if cutlass.const_expr(lse.shape[0] != q.shape[2] or lse.shape[1] < q.shape[1]):
+                    if cutlass.const_expr(lse.shape[0] != q.shape[2]):
                         raise ValueError("head-major THD LSE must have shape (H, head_stride) with head_stride >= T")
                     if cutlass.const_expr(lse.stride != (lse.shape[1], 1)):
                         raise ValueError("head-major THD LSE must be compact row-major")
                 else:
-                    if cutlass.const_expr(lse.shape != (q.shape[1], q.shape[2])):
+                    if cutlass.const_expr(lse.shape[1] != q.shape[2]):
                         raise ValueError("THD LSE must have shape (T, H)")
                     if cutlass.const_expr(lse.stride != (q.shape[2], 1)):
                         raise ValueError("THD LSE must be compact token-major")
@@ -1404,6 +1461,31 @@ class SM120FusedMultiHeadAttentionForward:
 
         tma_k_desc = kv_tma_desc(k, head_dim_qk, self.head_tile_qk, self.k_tma_swizzle, self.k_tma_swizzle_chunks, self.k_swizzle_chunk_elems)
         tma_v_desc = kv_tma_desc(v, head_dim_v, self.head_tile_v, self.v_tma_swizzle, self.v_tma_swizzle_chunks, self.v_swizzle_chunk_elems)
+        if cutlass.const_expr(self.thd_varlen):
+            # Build the [kv|cu_q|cu_k] metadata buffer DEVICE-side from the
+            # caller's length tensors (no host cumsum, no H2D — issue #552);
+            # the main kernel launched after it on this stream reads it.
+            _build_thd_meta_kernel(
+                seq_kv_lens,
+                thd_q_lens,
+                thd_kv_lens,
+                thd_lens_form,
+                cutlass.Int32(self.thd_batch),
+            ).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
+        # Grid geometry. THD: ceil(max_seq_q / q_tile) tiles per sequence over the
+        # REAL batch count (the packed view's batch mode is 1); tiles past a shorter
+        # sequence's length drain without work. NOTE thd_max_sq is a __call__
+        # argument in this base, not a member.
+        n_q_tiles = ceil_div(thd_max_sq, self.q_tile) if cutlass.const_expr(self.thd_varlen) else ceil_div(q.shape[1], self.q_tile)
+        n_batch = self.thd_batch if cutlass.const_expr(self.thd_varlen) else q.shape[0]
+        n_head = q.shape[2]
+        # LPT / LPT_L2 flatten the 3-D grid so the decode can order the whole tile
+        # set globally (heaviest causal rows first); NATURAL keeps the zero-overhead
+        # 3-D grid. The kernel receives n_q_tiles so its decode uses the same value.
+        if cutlass.const_expr(self.sched_policy != SCHED_NATURAL):
+            grid = (n_q_tiles * n_batch * n_head, 1, 1)
+        else:
+            grid = (n_q_tiles, n_batch, n_head)
         self.kernel(
             q,
             k,
@@ -1416,15 +1498,9 @@ class SM120FusedMultiHeadAttentionForward:
             tma_k_desc,
             tma_v_desc,
             softmax_scale_log2,
+            cutlass.Int32(n_q_tiles),
         ).launch(
-            # THD: ceil(max_seq_q / q_tile) tiles per sequence over the real
-            # batch count (the packed view's batch mode is 1); tiles past a
-            # shorter sequence's length drain without work.
-            grid=(
-                ceil_div(self.thd_max_sq, self.q_tile) if cutlass.const_expr(self.thd_varlen) else ceil_div(q.shape[1], self.q_tile),
-                self.thd_batch if cutlass.const_expr(self.thd_varlen) else q.shape[0],
-                q.shape[2],
-            ),
+            grid=grid,
             block=(self.threads_per_cta, 1, 1),
             stream=stream,
             min_blocks_per_mp=1,
@@ -1441,7 +1517,6 @@ def compile(  # noqa: A001
     skv: int = 128,
     d_qk: int = 128,
     d_v: int = 128,
-    max_sq: int = 0,
     has_lse: bool = True,
     lse_head_major: bool = False,
     lse_head_stride: int = 0,
@@ -1455,9 +1530,15 @@ def compile(  # noqa: A001
     ``d_qk`` is the Q/K head dim (QK^T contraction width) and ``d_v`` the V/O
     head dim (P@V output width); they are independent, e.g. (192, 128).
 
-    THD specializations pack the batch: ``b`` is the real sequence count,
-    ``sq``/``skv`` are the packed token totals, and ``max_sq`` (the longest
-    sequence's Q length) sizes the per-sequence grid.
+    THD specializations pack the batch: ``b`` is the real sequence count and
+    ``sq``/``skv`` are IGNORED — the packed token totals are runtime values
+    (they change every step under continuous batching), so the token extents
+    compile DYNAMIC (``cute.sym_int``) and the cache key stays plan-time-only;
+    callers must not pass them. ``max_sq`` (the longest sequence's Q length,
+    which sizes the per-sequence grid) is likewise a RUNTIME ``__call__``
+    argument, not a compile parameter. THD strides carry a ZERO batch stride
+    (the real view's batch stride is ``t * token_stride``, a runtime value;
+    the fake rebuilds it symbolically — batch extent 1 never steps).
 
     ``has_lse=False`` compiles the LSE store out (the kernel specializes on a
     ``None`` LSE argument) — callers that don't want stats pass no LSE buffer
@@ -1471,6 +1552,7 @@ def compile(  # noqa: A001
         in_dtype=STORAGE_DTYPE,
         out_dtype=STORAGE_DTYPE,
         is_causal=PARAMS.window_right is not None,
+        sched_policy=PARAMS.sched_policy,
         bottom_right=PARAMS.bottom_right,
         window_size_left=PARAMS.window_left,
         window_size_right=PARAMS.window_right,
@@ -1479,7 +1561,6 @@ def compile(  # noqa: A001
         has_sink=PARAMS.has_sink,
         thd_varlen=PARAMS.thd_varlen,
         thd_batch=b,
-        thd_max_sq=max_sq,
         thd_lse_head_major=lse_head_major,
         head_tile_qk=round_up_head_tile(d_qk),
         head_tile_v=round_up_head_tile(d_v),
@@ -1487,10 +1568,20 @@ def compile(  # noqa: A001
         kv_tile=PARAMS.kv_tile,
     )
     fake_batch = 1 if PARAMS.thd_varlen else b
+    if PARAMS.thd_varlen:
+        # Dynamic packed token totals: one symbol per ragged group (Q/O and
+        # the LSE share t_q; K/V share t_kv), so a new total re-binds the same
+        # compiled artifact instead of minting a new one (issue #552).
+        sq = cute.sym_int(divisibility=1)
+        skv = cute.sym_int(divisibility=1)
 
     def _fake_bshd(shape, stride):
         if stride is None:
             return cute.runtime.make_fake_compact_tensor(STORAGE_DTYPE, shape, stride_order=(3, 2, 1, 0), assumed_align=16)
+        if PARAMS.thd_varlen:
+            # Batch stride = tokens * token_stride (`_thd_view`'s envelope),
+            # a runtime value: rebuild it from the dynamic token extent.
+            return cute.runtime.make_fake_tensor(STORAGE_DTYPE, shape, (shape[1] * stride[1], stride[1], stride[2], stride[3]), assumed_align=16)
         return cute.runtime.make_fake_tensor(STORAGE_DTYPE, shape, tuple(stride), assumed_align=16)
 
     fake_q = _fake_bshd((fake_batch, sq, qh, d_qk), q_stride)
@@ -1533,6 +1624,18 @@ def compile(  # noqa: A001
         stride_order=(0,),
         assumed_align=4,
     )
+    # THD: the caller's Q/KV length tensors, consumed by the setup kernel's
+    # device-side metadata build. DYNAMIC extents — (B,) per-batch lengths and
+    # (B+1,) cu prefix sums bind the same artifact; the form rides the runtime
+    # thd_lens_form bitmask, so no compile key grows (Rule 4).
+    if PARAMS.thd_varlen:
+        fake_thd_q_lens = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (cute.sym_int(divisibility=1),), stride_order=(0,), assumed_align=4)
+        fake_thd_kv_lens = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (cute.sym_int(divisibility=1),), stride_order=(0,), assumed_align=4)
+        fake_thd_lens_form = cutlass.Int32(0)
+    else:
+        fake_thd_q_lens = None
+        fake_thd_kv_lens = None
+        fake_thd_lens_form = None
     return cute.compile(
         kernel,
         fake_q,
@@ -1544,6 +1647,10 @@ def compile(  # noqa: A001
         fake_seq_q_lens,
         fake_seq_kv_lens,
         cutlass.Float32(1.0),
+        cutlass.Int32(0),  # thd_max_sq: plan-time envelope grid extent (THD)
+        fake_thd_q_lens,
+        fake_thd_kv_lens,
+        fake_thd_lens_form,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
     )

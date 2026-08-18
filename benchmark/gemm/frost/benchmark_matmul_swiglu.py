@@ -10,6 +10,7 @@ unfused 2×cuBLAS + pointwise baseline. --shape is B,M,N,K.
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 import time
 from typing import Callable
@@ -21,6 +22,7 @@ import torch
 from types import SimpleNamespace
 
 from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
+from cudnn.gemm.frost.tile_config import by_name as _by_name
 from cudnn.gemm.frost.graph_analyzer import analyze
 from cudnn.gemm.frost.kernel_registry import candidates as _registry_candidates
 
@@ -147,6 +149,27 @@ def _build_spec_map():
 
 _SPEC_MAP = _build_spec_map()
 
+_LABEL_RE = re.compile(r"^(CONFIG_sm\d+_\d+x\d+x\d+_\d+x\d+x\d+_cluster\d+x\d+)_([12])ctamma(_static)?$")
+
+
+def _spec_for(name):
+    """(geometry cfg, cta_group, scheduler) for a --configs label, or None.
+
+    The sweep set comes from the registry funnel over CATALOG; a label naming a
+    geometry outside it (e.g. a num_mma_m > 1 tile, which `by_name` synthesizes) is
+    still runnable, so parse it rather than reporting it unsweepable."""
+    spec = _SPEC_MAP.get(name)
+    if spec is not None:
+        return spec
+    m = _LABEL_RE.match(name)
+    if m is None:
+        return None
+    try:
+        cfg = _by_name(m.group(1))
+    except (KeyError, NotImplementedError):
+        return None
+    return cfg, int(m.group(2)), "static" if m.group(3) else "clc"
+
 
 # ---------------------------------------------------------------------------
 # Main
@@ -204,10 +227,11 @@ def main() -> int:
 
     best = None
     for label in config_names:
-        if label not in _SPEC_MAP:
+        spec = _spec_for(label)
+        if spec is None:
             print(f"  {label:62s} UNKNOWN (not a sweepable swiglu strategy)")
             continue
-        cfg, cta_group, sched = _SPEC_MAP[label]
+        cfg, cta_group, sched = spec
         try:
             g, h = _graph_swiglu(B, M, N, K, in_dt, out_dt)
             plan = _build_plan(g, cfg, cta_group, sched)
