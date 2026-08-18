@@ -211,7 +211,7 @@ def _ln_bwd_pipe_kernel(
     R: cutlass.Int32, ctas: cutlass.Int32,
     C: cutlass.Constexpr, V: cutlass.Constexpr, tpr: cutlass.Constexpr, wn: cutlass.Constexpr,
     ldgs: cutlass.Constexpr, block_threads: cutlass.Constexpr, et: cutlass.Constexpr,
-    it_ty: cutlass.Constexpr, STAGES: cutlass.Constexpr,
+    it_ty: cutlass.Constexpr, STAGES: cutlass.Constexpr, cache_xd: cutlass.Constexpr,
     has_mean: cutlass.Constexpr, has_beta: cutlass.Constexpr,
 ) -> None:
     tid, _, _ = cute.arch.thread_idx()
@@ -267,6 +267,9 @@ def _ln_bwd_pipe_kernel(
             boff = s * C
             mean = mMean[row] if cutlass.const_expr(has_mean) else cutlass.Float32(0.0)
             rstd = mRstd[row]
+            if cutlass.const_expr(cache_xd):
+                xhat_c = [cutlass.Float32(0.0)] * (ldgs * V)
+                dxhat_c = [cutlass.Float32(0.0)] * (ldgs * V)
             c1 = cutlass.Float32(0.0)
             c2 = cutlass.Float32(0.0)
             for it in cutlass.range_constexpr(ldgs):
@@ -280,6 +283,9 @@ def _ln_bwd_pipe_kernel(
                     g = gv[e].to(cutlass.Float32)
                     xhat = (x - mean) * rstd
                     dxhat = dy * g
+                    if cutlass.const_expr(cache_xd):
+                        xhat_c[it * V + e] = xhat
+                        dxhat_c[it * V + e] = dxhat
                     if cutlass.const_expr(has_mean):
                         c1 = c1 + dxhat
                     c2 = c2 + dxhat * xhat
@@ -304,30 +310,44 @@ def _ln_bwd_pipe_kernel(
                     c1 = cutlass.Float32(0.0)
                     for j in cutlass.range_constexpr(wn):
                         c1 = c1 + red[wn + j]
+            # With caching, pass2 reads registers (not smem), so the buffer is free
+            # right after pass1 -> signal empty now so the DMA warp prefetches the next
+            # row *during* pass2 (freeing after pass2 would kill the overlap large N
+            # depends on). The wn>1 cross-warp barrier above already fenced pass1 reads.
+            if cutlass.const_expr(cache_xd):
+                if tid == 0:
+                    nvvm.mbarrier_arrive(mbar.iterator + (STAGES + s))
             a = c1 * rn if cutlass.const_expr(has_mean) else cutlass.Float32(0.0)
             b = c2 * rn
             base = cutlass.Int64(row) * C
             for it in cutlass.range_constexpr(ldgs):
                 col0 = (it * tpr + tid) * V
-                xv = nvvm.load_ext(xbuf.iterator + (boff + col0), dtype=it_ty, count=V, shared_space=_CTA_SS).bitcast(et)
-                dyv = nvvm.load_ext(dybuf.iterator + (boff + col0), dtype=it_ty, count=V, shared_space=_CTA_SS).bitcast(et)
-                gv = nvvm.load_ext(sG.iterator + col0, dtype=it_ty, count=V, shared_space=_CTA_SS).bitcast(et)
+                if cutlass.const_expr(not cache_xd):
+                    xv = nvvm.load_ext(xbuf.iterator + (boff + col0), dtype=it_ty, count=V, shared_space=_CTA_SS).bitcast(et)
+                    dyv = nvvm.load_ext(dybuf.iterator + (boff + col0), dtype=it_ty, count=V, shared_space=_CTA_SS).bitcast(et)
+                    gv = nvvm.load_ext(sG.iterator + col0, dtype=it_ty, count=V, shared_space=_CTA_SS).bitcast(et)
                 ys = []
                 for e in cutlass.range_constexpr(V):
-                    x = xv[e].to(cutlass.Float32)
-                    dy = dyv[e].to(cutlass.Float32)
-                    g = gv[e].to(cutlass.Float32)
-                    xhat = (x - mean) * rstd
-                    dxhat = dy * g
+                    if cutlass.const_expr(cache_xd):
+                        dxhat = dxhat_c[it * V + e]
+                        xhat = xhat_c[it * V + e]
+                    else:
+                        x = xv[e].to(cutlass.Float32)
+                        dy = dyv[e].to(cutlass.Float32)
+                        g = gv[e].to(cutlass.Float32)
+                        xhat = (x - mean) * rstd
+                        dxhat = dy * g
                     ys.append((rstd * (dxhat - a - xhat * b)).to(et))
                 nvvm.store_ext(cutlass.Vector.from_elements(tuple(ys), et).bitcast(it_ty), mDXi.iterator + (base + col0))
-            # pass2 RE-READS smem, so all compute warps must finish before the buffer
-            # is freed. wn==1 is a single warp (SIMT-synchronous) and needs no barrier;
-            # wn>1 does (else the DMA warp reloads the buffer mid-read -> garbage dx).
-            if cutlass.const_expr(wn > 1):
-                nvvm.barrier_cta_sync(1, thread_count=tpr)
-            if tid == 0:
-                nvvm.mbarrier_arrive(mbar.iterator + (STAGES + s))
+            # Non-cached pass2 RE-READS smem, so all compute warps must finish before the
+            # buffer is freed. wn==1 is a single warp (SIMT-synchronous) and needs no
+            # barrier; wn>1 does (else the DMA reloads the buffer mid-read -> garbage dx).
+            # (Cached path already freed the buffer after pass1.)
+            if cutlass.const_expr(not cache_xd):
+                if cutlass.const_expr(wn > 1):
+                    nvvm.barrier_cta_sync(1, thread_count=tpr)
+                if tid == 0:
+                    nvvm.mbarrier_arrive(mbar.iterator + (STAGES + s))
             i = i + 1
             row = row + stride
         # flush register partials -> [ctas, C] (compute warps only)
@@ -378,15 +398,15 @@ def _ln_bwd_pipe_host(
     R: cutlass.Int32, ctas: cutlass.Int32,
     C: cutlass.Constexpr, V: cutlass.Constexpr, tpr: cutlass.Constexpr, wn: cutlass.Constexpr,
     ldgs: cutlass.Constexpr, block_threads: cutlass.Constexpr, et: cutlass.Constexpr,
-    it_ty: cutlass.Constexpr, STAGES: cutlass.Constexpr, has_mean: cutlass.Constexpr,
-    has_beta: cutlass.Constexpr, FB: cutlass.Constexpr, fgrid: cutlass.Constexpr,
+    it_ty: cutlass.Constexpr, STAGES: cutlass.Constexpr, cache_xd: cutlass.Constexpr,
+    has_mean: cutlass.Constexpr, has_beta: cutlass.Constexpr, FB: cutlass.Constexpr, fgrid: cutlass.Constexpr,
     nchunk: cutlass.Constexpr, CHUNK: cutlass.Constexpr, smem_bytes: cutlass.Constexpr,
 ) -> None:
     mDXi = cute.recast_tensor(mDX, it_ty)
     mGi = cute.recast_tensor(mGamma, it_ty)
     _ln_bwd_pipe_kernel(
         mDY, mX, mDXi, mGi, mMean, mRstd, mDGp, mDBp, R, ctas,
-        C, V, tpr, wn, ldgs, block_threads, et, it_ty, STAGES, has_mean, has_beta,
+        C, V, tpr, wn, ldgs, block_threads, et, it_ty, STAGES, cache_xd, has_mean, has_beta,
     ).launch(grid=(ctas, 1, 1), block=(block_threads, 1, 1), smem=smem_bytes)
     _ln_bwd_finalize_kernel(mDGp, mDBp, mDGamma, mDBeta, ctas, C, FB, CHUNK, has_beta).launch(
         grid=(fgrid, nchunk, 1), block=(FB, 1, 1))
@@ -471,6 +491,13 @@ def _backward_pipe(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, params, wcfg
 
     et = DTYPE_TO_CUTLASS[params.io_dtype]
     it_ty = _INT_TY[DTYPE_BYTES[params.io_dtype]]
+    # Cache xhat/dxhat in registers so pass2 skips re-reading smem + recomputing.
+    # Costs (2+npb)*ldgs*V fp32 regs, which lowers occupancy -- a win only when the
+    # total work is small enough that occupancy isn't the limiter (measured crossover
+    # R*C ~ 48M: helps small-N/mid-C and C=128, hurts large-N e.g. llama3-70b 67M).
+    # Also gate on the register budget (larger ldgs would spill -> use CGA for those).
+    npb = 2 if has_beta else 1
+    cache_xd = ((2 + npb) * ldgs * V <= 96) and (R * C <= 48 * 1024 * 1024)
     smem_bytes = _pipe_bwd_smem(C, wn, STAGES)
     FB = 128 if C < 256 else 256
     fgrid = (C + FB - 1) // FB
@@ -484,8 +511,8 @@ def _backward_pipe(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, params, wcfg
     args = (dyn(dy2d), dyn(x2d), dyn(dx), dyn(gamma), dyn(mean), dyn(rstd),
             dyn(dgp), dyn(dbp), dyn(dgamma), dyn(dbeta),
             cutlass.Int32(R), cutlass.Int32(ctas))
-    ce = (C, V, tpr, wn, ldgs, block_threads, et, it_ty, STAGES, spec.has_mean, has_beta, FB, fgrid, nchunk, CHUNK, smem_bytes)
-    key = ("pipe", params.io_dtype, C, tpr, wn, ldgs, block_threads, STAGES, spec.has_mean, has_beta, nchunk, CHUNK)
+    ce = (C, V, tpr, wn, ldgs, block_threads, et, it_ty, STAGES, cache_xd, spec.has_mean, has_beta, FB, fgrid, nchunk, CHUNK, smem_bytes)
+    key = ("pipe", params.io_dtype, C, tpr, wn, ldgs, block_threads, STAGES, cache_xd, spec.has_mean, has_beta, nchunk, CHUNK)
     fn = _KPIPE.get(key)
     if fn is None:
         fn = cute.compile(_ln_bwd_pipe_host, *args, *ce)
