@@ -391,12 +391,15 @@ the default backend.
 - **Scratch / workspace behavior** — `attn_score`/`index_score` are consumed
   in place exactly like the default backend (`attn_score` is left holding
   kernel 1's `grad_signal`; `sm_scale` folds inside kernel 2 without touching
-  the buffer). The backend owns a per-plan workspace (a dynamic-ticket
-  counter, plus a `B * S_k * D` fp32 dK scratch when `d_index_k` is BF16 —
-  2 MiB = 2,097,152 bytes at B=1, S_k=4096, D=128, growing with `S_k`),
-  allocated once
-  on first execute — later executes of that plan allocate nothing (the
-  wrapper still allocates any output buffer you do not pass in).
+  the buffer). The backend owns one piece of per-plan workspace — the
+  dynamic-ticket counter — allocated on first execute and reused by every
+  later one. A BF16 `d_index_k` additionally needs a `B * S_k * D` fp32
+  accumulator (2 MiB = 2,097,152 bytes at B=1, S_k=4096, D=128, growing with
+  `S_k`); that one comes from PyTorch's caching allocator on every call, which
+  is a pool hit in steady state — it has to be re-zeroed per call anyway, and
+  this way it stays reclaimable via `torch.cuda.empty_cache()` instead of
+  staying pinned for as long as the plan is cached. The wrapper still
+  allocates any output buffer you do not pass in.
 - **Concurrency** — executions sharing one plan must not overlap on the
   device (the ticket counter is per-plan workspace). One plan serves one
   device: the workspace is device-resident, and execution rejects tensors on

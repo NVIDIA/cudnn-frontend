@@ -562,9 +562,9 @@ class IndexerBackward(APIBase):
             (topk_indices, self.topk_desc, "topk_indices"),
         )
         # One plan serves one device: the v2 backend's per-plan
-        # workspace (ticket counter, optional dK scratch) lives on the
-        # sample tensors' device, so reject cross-device execution before
-        # kernel 1 mutates the score buffers. The backend re-checks every
+        # workspace (the ticket counter) lives on the sample tensors'
+        # device, so reject cross-device execution before kernel 1 mutates
+        # the score buffers. The backend re-checks every
         # tensor against index_q.device, so validating index_q covers all.
         if self.use_v2 and index_q.device != self.iq_desc.device:
             raise ValueError(
@@ -830,9 +830,11 @@ def indexer_backward_wrapper(
             gains)**; the default wrapper-allocated buffers keep the input
             dtypes (bf16), which rounds the extra accuracy back to the bf16
             representation floor. fp32 ``d_index_k`` is zeroed internally.
-            The backend owns a per-plan workspace (dynamic-ticket counter;
-            a ``B * S_k * D`` fp32 dK scratch for bf16 outputs), so one plan
-            must never have two executions in flight at once. The wrapper keys
+            The backend owns a per-plan workspace (the dynamic-ticket
+            counter; a bf16 ``d_index_k`` additionally takes a
+            ``B * S_k * D`` fp32 accumulator from the caching allocator on
+            every call), so one plan must never have two executions in flight
+            at once. The wrapper keys
             its plan cache on the CUDA device and on the **resolved** stream
             (``stream`` when given, otherwise ``torch.cuda.current_stream()``
             at call time), so calls that differ in device or stream get
@@ -874,12 +876,12 @@ def indexer_backward_wrapper(
     # the sm100_v2 backend additionally compiles a d_weights-dtype variant
     # and validates the output dtype matrix. The CUDA device is keyed: the
     # sm100_v2 backend owns device-resident per-plan workspace (the
-    # ticket counter; the dK scratch), so a cached plan must never be
+    # ticket counter), so a cached plan must never be
     # reused on another device — execute() additionally enforces the plan
     # device.
     #
     # For backend="sm100_v2" the *resolved* stream is keyed too, so that a
-    # plan (and thus its ticket-counter / dK-scratch workspace) is never
+    # plan (and thus its ticket-counter workspace) is never
     # shared by two different streams. It must be the resolved stream, not
     # the ``stream`` argument: ``stream=None`` does not mean "the default
     # stream", it means "whatever ``torch.cuda.current_stream()`` is at call

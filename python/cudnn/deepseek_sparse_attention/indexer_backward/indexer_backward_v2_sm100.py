@@ -40,7 +40,7 @@ a **two-term bf16-expansion** formulation:
   to keep the full accuracy gain).
 * ``d_index_k`` is accumulated with vectorized fp32 atomics (four-element
   ``cute.arch.atomic_add``), the same numerics class as the default backend,
-  into the caller's fp32 buffer (zeroed here) or a per-plan fp32 scratch
+  into the caller's fp32 buffer (zeroed here) or a per-call fp32 scratch
   that is cast to a bf16 output buffer.
 
 Semantics (H = indexer heads, D = head dim; per query row ``s`` and top-k
@@ -142,10 +142,11 @@ Requires SM100, H == 64, D == 128, and topk % 128 == 0 with
 
 ``api.py`` raises before compile otherwise.
 
-Workspace ownership / concurrency contract: the dynamic-ticket counter (and
-the fp32 dK scratch used for bf16 ``d_index_k`` outputs) are **per-plan
-workspace**, allocated once when the plan first executes and reused by every
-subsequent execute of that plan. The kernel self-resets the counter (the CTA
+Workspace ownership / concurrency contract: the dynamic-ticket counter is
+**per-plan workspace**, allocated once when the plan first executes and reused
+by every subsequent execute of that plan. (The fp32 dK accumulator a bf16
+``d_index_k`` needs is not per-plan: it comes from the caching allocator on
+every call.) The kernel self-resets the counter (the CTA
 that draws the final raw ticket stores 0), so back-to-back launches need no
 host reset — but that also means executions of the SAME plan must be
 serialized: they may target any stream, provided the launches do not overlap
@@ -1614,10 +1615,10 @@ def indexer_backward_v2_sm100(
       (the atomic accumulator is fp32); fp32 ``d_index_k`` buffers are
       written directly (zeroed here, no caller pre-zero needed).
 
-    The returned callable performs **no allocations after the first
-    execute**: the ticket counter and (for bf16 ``d_index_k``) the fp32 dK
-    scratch are per-plan workspace, allocated on the first execute and reused
-    by every later one. The
+    The returned callable allocates its ticket counter on the first execute
+    and reuses it on every later one; a bf16 ``d_index_k`` additionally takes
+    a ``B * S_k * D`` fp32 accumulator from the caching allocator per call (it
+    has to be re-zeroed each time regardless). The per-plan ticket-counter
     workspace is device-resident: the plan binds the device of its first
     execute and raises on any indexer tensor from another device
     (``grad_loss`` is validated by ``api.py``'s wrapper). Executions
@@ -1717,12 +1718,12 @@ def indexer_backward_v2_sm100(
             _check(t.is_cuda and t.device == IndexQ.device, f"{name} must be on {IndexQ.device}")
             _check(t.is_contiguous(), f"{name} must be contiguous")
 
-        # One plan serves one device: the per-plan workspace (ticket
-        # counter, optional dK scratch) is device-resident, so bind the
-        # plan to the device of its first execute and reject any other
-        # device BEFORE kernel 1 mutates the score buffers. api.py keys
-        # its plan cache on the device; this check keeps direct users of
-        # the factory safe independently of that cache.
+        # One plan serves one device: the per-plan ticket counter is
+        # device-resident, so bind the plan to the device of its first
+        # execute and reject any other device BEFORE kernel 1 mutates the
+        # score buffers. api.py keys its plan cache on the device; this
+        # check keeps direct users of the factory safe independently of
+        # that cache.
         plan_device = plan_ws.get("device")
         if plan_device is None:
             plan_ws["device"] = plan_device = IndexQ.device
@@ -1750,11 +1751,15 @@ def indexer_backward_v2_sm100(
                 # zeroed here — no caller pre-zero contract)
                 dk_f32_flat = dIndexK.view(seq_k_total, d)
             else:
-                dk_f32_flat = plan_ws.get("dk_scratch")
-                if dk_f32_flat is None:
-                    # one-time per-plan workspace
-                    dk_f32_flat = torch.empty((seq_k_total, d), dtype=torch.float32, device=IndexK.device)
-                    plan_ws["dk_scratch"] = dk_f32_flat
+                # fp32 accumulator for a bf16 ``d_index_k``, taken from the
+                # caching allocator per call instead of being pinned to the
+                # plan: it is B * S_k * D * 4 B and has to be re-zeroed on
+                # every call either way, so caching it inside the plan would
+                # save no work while keeping it alive (and unreclaimable by
+                # ``empty_cache()``) for as long as the plan is cached. The
+                # allocator hands the same block back for the same size on the
+                # same stream, so steady state is a pool hit, not a cudaMalloc.
+                dk_f32_flat = torch.empty((seq_k_total, d), dtype=torch.float32, device=IndexK.device)
             dk_f32_flat.zero_()
             cnt = plan_ws.get("counter")
             if cnt is None:
