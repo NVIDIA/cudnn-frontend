@@ -238,10 +238,14 @@ def parse_nsys_stats(text: str) -> dict[str, float]:
         sys.exit("could not find the cuda_gpu_kern_sum CSV header in nsys stats output:\n  " + "\n  ".join(lines[:60]))
 
     cols = next(csv.reader([lines[header_i]]))
-    med_i = next(i for i, c in enumerate(cols) if c.startswith("Med ("))
-    name_i = cols.index("Name")
-    unit = re.search(r"Med \((\w+)\)", cols[med_i]).group(1)
-    per_ms = {"ns": 1e6, "us": 1e3, "ms": 1.0, "s": 1e-3}[unit]
+    med = next((i for i, c in enumerate(cols) if re.fullmatch(r"Med \(\w+\)", c)), None)
+    if med is None or "Name" not in cols:
+        sys.exit(f"cuda_gpu_kern_sum CSV header has no Med (<unit>) / Name column: {lines[header_i]!r}")
+    med_i, name_i = med, cols.index("Name")
+    unit = re.fullmatch(r"Med \((\w+)\)", cols[med_i]).group(1)
+    per_ms = {"ns": 1e6, "us": 1e3, "ms": 1.0, "s": 1e-3}.get(unit)
+    if per_ms is None:
+        sys.exit(f"unsupported time unit {unit!r} in the cuda_gpu_kern_sum CSV header: {lines[header_i]!r}")
     out: dict[str, float] = {}
     for row in csv.reader(io.StringIO("\n".join(lines[header_i + 1 :]))):
         if len(row) <= max(med_i, name_i):

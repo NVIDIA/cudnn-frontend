@@ -402,7 +402,8 @@ def _run_model(key: str, spec: dict, args) -> tuple | None:
             iters=args.iters,
             timing=args.timing,
         )
-        print(f"  {'unfused per-group cuBLAS bf16 + pointwise':64s} {flops / (bl_ms * 1e-3) / 1e12:8.2f} TFLOP/s  " f"{bl_ms:8.3f} ms", flush=True)
+        bl_label = "unfused per-group cuBLAS bf16 + pointwise" + ("" if bl_sets is pool else " [no rotation]")
+        print(f"  {bl_label:64s} {flops / (bl_ms * 1e-3) / 1e12:8.2f} TFLOP/s  " f"{bl_ms:8.3f} ms", flush=True)
 
     spec_map = _build_spec_map(variant, args.dtype)
     labels = select_configs(args.configs, spec_map)
@@ -439,7 +440,7 @@ def _run_model(key: str, spec: dict, args) -> tuple | None:
             if not ok:
                 flag = f"  !! maxerr={(got - ref.float()).abs().max().item():.3g}"
         vps = [_vp(h, s, fto, s.out, aux_bufs) for s in pool]
-        ms = time_ms(rotating(plan, vps), lambda: plan(vp), warmup=args.warmup, iters=args.iters, timing=args.timing)
+        ms = time_ms(rotating(plan, vps), lambda _plan=plan, _vp=vp: _plan(_vp), warmup=args.warmup, iters=args.iters, timing=args.timing)
         tflops = flops / (ms * 1e-3) / 1e12
         ratio = f"{bl_ms / ms:>7.2f}x" if bl_ms else " " * 8
         print(f"  {label:64s} {tflops:8.2f} TFLOP/s  {ms:8.3f} ms  {ratio}{flag}", flush=True)

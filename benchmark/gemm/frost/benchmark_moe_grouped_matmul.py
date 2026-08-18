@@ -51,7 +51,8 @@ def _vp_moe(handles, token, weight, fto, output):
 
 def _build_plan(g, cfg, name):
     """JIT-compile the recorded graph with a forced tile config."""
-    return jit_from_cudnn_graph(g, config=cfg, cta_group=spec_for(name, _SPEC_MAP)[1], scheduler=spec_for(name, _SPEC_MAP)[2])
+    _, cta_group, scheduler = spec_for(name, _SPEC_MAP)
+    return jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group, scheduler=scheduler)
 
 
 def _build_spec_map():
@@ -232,7 +233,7 @@ def main() -> int:
     per_set = _per_set_bytes(S, N, K, E)
     nbuf = resolve_nbuf(args.rotate_buffers, per_set)
 
-    if getattr(args, "_nsys_worker"):
+    if args._nsys_worker:
         configs = select_configs(args.configs, _SPEC_MAP) if args.configs else []
         _nsys_worker(args.shape, configs, args.warmup, args.iters, nbuf)
         return 0

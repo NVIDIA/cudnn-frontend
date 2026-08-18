@@ -49,7 +49,8 @@ def _vp_moe_bs(handles, token, weight, sfa, sfb, fto, output):
 
 def _build_plan(g, cfg, name):
     """JIT-compile the recorded graph with a forced tile config -> compiled kernel."""
-    return jit_from_cudnn_graph(g, config=cfg, cta_group=spec_for(name, _SPEC_MAP)[1], scheduler=spec_for(name, _SPEC_MAP)[2])
+    _, cta_group, scheduler = spec_for(name, _SPEC_MAP)
+    return jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group, scheduler=scheduler)
 
 
 # combo : (is_fp4, block_size, a_dtype, sf_dtype)
@@ -182,10 +183,6 @@ def _mkdata_bf16_pool(S: int, N: int, K: int, E: int, nbuf: int):
     return pool
 
 
-def _per_set_bytes(S: int, N: int, K: int, E: int, combo: str) -> int:
-    return set_bytes(_mkdata(S, N, K, E, combo))
-
-
 # cuBLAS reference — BF16 batched GEMM over the E equal-sized groups.
 
 
@@ -269,10 +266,11 @@ def main() -> int:
     G, M, N, K = parts
     S, E = G * M, G  # total tokens, num groups (== experts)
     combo = args.combo
-    per_set_bytes = _per_set_bytes(S, N, K, E, combo)
+    wset = _mkdata(S, N, K, E, combo)  # dedicated warmup buffer, and the pool's size unit
+    per_set_bytes = set_bytes(wset)
     nbuf = resolve_nbuf(args.rotate_buffers, per_set_bytes, free_divisor=4)
 
-    if getattr(args, "_nsys_worker"):
+    if args._nsys_worker:
         configs = select_configs(args.configs, _SPEC_MAP) if args.configs else []
         _nsys_worker(args.shape, combo, configs, args.warmup, args.iters, nbuf, args.no_baseline)
         return 0
@@ -359,7 +357,6 @@ def main() -> int:
             # with, and on large shapes its BF16 set is the bigger allocation.
             del wbf, bf_pool
             torch.cuda.empty_cache()
-        wset = _mkdata(S, N, K, E, combo)
         pool = _mkdata_pool(S, N, K, E, combo, nbuf)
 
         ctx_dead = False

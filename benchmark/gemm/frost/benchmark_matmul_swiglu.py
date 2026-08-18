@@ -102,6 +102,18 @@ def _mkdata_pool(B, M, N, K, in_dt, out_dt, nbuf):
     return pool
 
 
+def _unpack(s):
+    """A pooled set is (a, b0, b1, out, scale); _unfused_launch wants scale before out."""
+    a, b0, b1, out, scale = s
+    return a, b0, b1, scale, out
+
+
+def _gemm_args(s):
+    """A pooled set -> _vp_mg's (gemm_pairs, outs, *aux)."""
+    a, b0, b1, out, scale = s
+    return [(a, b0), (a, b1)], out, scale
+
+
 def _reference(a, b0, b1, scale, out_dt):
     """Correctness reference: 2 GEMMs + elementwise chain (einsum 'bmk,bnk->bmn'
     matches the (B,N,K) operands)."""
@@ -175,7 +187,7 @@ def main() -> int:
     if args.stream:
         print("  ▶ running unfused baseline ...", flush=True)
     bl_ms = time_ms(
-        rotating(lambda s: _unfused_launch(s[0], s[1], s[2], s[4], s[3]), pool),
+        rotating(lambda s: _unfused_launch(*_unpack(s)), pool),
         lambda: _unfused_launch(wa, wb0, wb1, wscale, out_bl),
         warmup=args.warmup,
         iters=args.iters,
@@ -210,7 +222,7 @@ def main() -> int:
         err = (w_out.float() - ref.float()).abs().max().item()
         ok = torch.allclose(w_out.float(), ref.float(), rtol=args.rtol, atol=args.atol)
         ms = time_ms(
-            rotating(lambda s, _plan=plan, _h=h: _plan(_vp_mg(_h, [(s[0], s[1]), (s[0], s[2])], s[3], s[4])), pool),
+            rotating(lambda s, _plan=plan, _h=h: _plan(_vp_mg(_h, *_gemm_args(s))), pool),
             lambda _plan=plan, _h=h: _plan(_vp_mg(_h, [(wa, wb0), (wa, wb1)], w_out, wscale)),
             warmup=args.warmup,
             iters=args.iters,

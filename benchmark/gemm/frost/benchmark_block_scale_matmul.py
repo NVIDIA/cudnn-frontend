@@ -69,7 +69,8 @@ def _vp_bs(handles, a, b, c, sfa, sfb):
 
 def _build_plan(g, cfg, name):
     """JIT-compile the recorded graph with a forced tile config."""
-    return jit_from_cudnn_graph(g, config=cfg, cta_group=spec_for(name, _SPEC_MAP)[1], scheduler=spec_for(name, _SPEC_MAP)[2])
+    _, cta_group, scheduler = spec_for(name, _SPEC_MAP)
+    return jit_from_cudnn_graph(g, config=cfg, cta_group=cta_group, scheduler=scheduler)
 
 
 # Combo table (input dtype family + scale dtype + block size)
@@ -328,10 +329,11 @@ def main() -> int:
     if len(parts) != 4:
         sys.exit("--shape must be B,M,N,K (four values; use B=1 for a single GEMM)")
     B, M, N, K = parts
-    per_set = set_bytes(_mkdata(B, M, N, K, combo))
+    wset = _mkdata(B, M, N, K, combo)  # dedicated warmup buffer, and the pool's size unit
+    per_set = set_bytes(wset)
     nbuf = resolve_nbuf(args.rotate_buffers, per_set)
 
-    if getattr(args, "_nsys_worker"):
+    if args._nsys_worker:
         configs = select_configs(args.configs, _SPEC_MAP) if args.configs else []
         _nsys_worker(args.shape, args.combo, configs, args.warmup, args.iters, args.ref, nbuf)
         return 0
@@ -403,7 +405,6 @@ def main() -> int:
         else:
             print("  [timing: torch.cuda.Event wall-clock around python loop — " "includes ~50us/call dispatch overhead]\n")
 
-        wset = _mkdata(B, M, N, K, combo)  # dedicated warmup buffer
         pool = _mkdata_pool(B, M, N, K, combo, nbuf)  # rotation pool
         ref_label, ref_warmup, ref_timed = _make_reference_pool(B, M, N, K, combo, args.ref, nbuf)
         if args.stream:

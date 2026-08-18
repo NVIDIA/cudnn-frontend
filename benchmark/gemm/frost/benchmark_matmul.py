@@ -200,7 +200,7 @@ def main() -> int:
     B, M, N, K = parts
     nbuf = resolve_nbuf(args.rotate_buffers, _per_set_bytes(B, M, N, K))
 
-    if getattr(args, "_nsys_worker"):
+    if args._nsys_worker:
         configs = select_configs(args.configs, _SPEC_MAP) if args.configs else []
         _nsys_worker(args.shape, configs, args.warmup, args.iters, nbuf)
         return 0
