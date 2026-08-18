@@ -196,26 +196,27 @@ def forward(
     _require_backend()
     import cudnn
 
-    cudnn.gnn_agg_simple_forward(
-        torch.cuda.current_stream(offsets.device).cuda_stream,
-        offsets.data_ptr(),
-        indices.data_ptr(),
-        _pointer(map_csc_to_coo),
-        num_src_nodes,
-        num_dst_nodes,
-        num_edges,
-        _TORCH_INDEX_DTYPE_TO_CUDNN[offsets.dtype],
-        _pointer(node_features),
-        _pointer(edge_features),
-        _pointer(concat_features),
-        output.data_ptr(),
-        out_positions.data_ptr() if out_positions.numel() else 0,
-        node_feat_dim,
-        edge_feat_dim,
-        concat_feat_dim,
-        _TORCH_DTYPE_TO_CUDNN[dtype],
-        _AGGREGATION_TO_INT[aggr],
-    )
+    with torch.cuda.device(offsets.device):
+        cudnn.gnn_agg_simple_forward(
+            torch.cuda.current_stream(offsets.device).cuda_stream,
+            offsets.data_ptr(),
+            indices.data_ptr(),
+            _pointer(map_csc_to_coo),
+            num_src_nodes,
+            num_dst_nodes,
+            num_edges,
+            _TORCH_INDEX_DTYPE_TO_CUDNN[offsets.dtype],
+            _pointer(node_features),
+            _pointer(edge_features),
+            _pointer(concat_features),
+            output.data_ptr(),
+            out_positions.data_ptr() if out_positions.numel() else 0,
+            node_feat_dim,
+            edge_feat_dim,
+            concat_feat_dim,
+            _TORCH_DTYPE_TO_CUDNN[dtype],
+            _AGGREGATION_TO_INT[aggr],
+        )
     return output, out_positions
 
 
@@ -271,26 +272,27 @@ def backward(
     _require_backend()
     import cudnn
 
-    cudnn.gnn_agg_simple_backward(
-        torch.cuda.current_stream(offsets.device).cuda_stream,
-        offsets.data_ptr(),
-        indices.data_ptr(),
-        _pointer(map_csc_to_coo),
-        num_src_nodes,
-        num_dst_nodes,
-        num_edges,
-        _TORCH_INDEX_DTYPE_TO_CUDNN[offsets.dtype],
-        grad_output.data_ptr(),
-        out_positions.data_ptr() if out_positions.numel() else 0,
-        grad_node.data_ptr() if node_feat_dim else 0,
-        grad_edge.data_ptr() if edge_feat_dim else 0,
-        grad_concat.data_ptr() if concat_feat_dim else 0,
-        node_feat_dim,
-        edge_feat_dim,
-        concat_feat_dim,
-        _TORCH_DTYPE_TO_CUDNN[grad_output.dtype],
-        _AGGREGATION_TO_INT[aggr],
-    )
+    with torch.cuda.device(offsets.device):
+        cudnn.gnn_agg_simple_backward(
+            torch.cuda.current_stream(offsets.device).cuda_stream,
+            offsets.data_ptr(),
+            indices.data_ptr(),
+            _pointer(map_csc_to_coo),
+            num_src_nodes,
+            num_dst_nodes,
+            num_edges,
+            _TORCH_INDEX_DTYPE_TO_CUDNN[offsets.dtype],
+            grad_output.data_ptr(),
+            out_positions.data_ptr() if out_positions.numel() else 0,
+            grad_node.data_ptr() if node_feat_dim else 0,
+            grad_edge.data_ptr() if edge_feat_dim else 0,
+            grad_concat.data_ptr() if concat_feat_dim else 0,
+            node_feat_dim,
+            edge_feat_dim,
+            concat_feat_dim,
+            _TORCH_DTYPE_TO_CUDNN[grad_output.dtype],
+            _AGGREGATION_TO_INT[aggr],
+        )
     return grad_node, grad_edge, grad_concat
 
 
