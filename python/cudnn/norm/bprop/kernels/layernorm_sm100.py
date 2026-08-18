@@ -427,12 +427,17 @@ def _pipe_bwd_eligible(C, wn):
     return wn >= 1 and _pipe_bwd_smem(C, wn, _pipe_bwd_stages(C)) <= _PIPE_SMEM_MAX
 
 
-def _pipe_bwd_cap(R, C):
+def _pipe_bwd_cap(R, wn):
+    # Cap is N-driven: the dgamma/dbeta partials cost ~ ctas*C, so ``ctas ~ N/4096``
+    # keeps the partials a ~constant (~4%) fraction of the data traffic while filling
+    # the machine (measured optimum). Small blocks (wn<=2, tiny C) need a higher floor
+    # to reach occupancy; a max of 12x avoids over-subscribing the finalize at huge N.
     global _SM_COUNT
     if _SM_COUNT is None:
         import torch
         _SM_COUNT = torch.cuda.get_device_properties(0).multi_processor_count
-    mult = max(2, min(6, round(16384 / C)))
+    floor = 2 if wn <= 2 else 1
+    mult = max(floor, min(12, round(R / 4096)))
     return min(R, _SM_COUNT * mult)
 
 
@@ -443,7 +448,7 @@ def _backward_pipe(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, params, wcfg
     R, C = spec.R, spec.M
     STAGES = _pipe_bwd_stages(C)
     block_threads = (wn + 1) * 32
-    ctas = _pipe_bwd_cap(R, C)
+    ctas = _pipe_bwd_cap(R, wn)
     if mean is None:
         mean = rstd
 
