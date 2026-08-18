@@ -100,7 +100,8 @@ def hadamard_rmem_colwise_fwht(rmem_bf16, d_buffer, tidx, sRht):
 
 
 @cute.jit
-def hadamard_rmem_colwise_fwht_quant(rmem_bf16, d_buffer, tidx, norm_const, sRht, sSf, sf_row_base):
+def hadamard_rmem_colwise_fwht_quant(rmem_bf16, d_buffer, tidx, norm_const, sRht,
+                                     sSf, sf_row_base, sf_dtype):
     """Colwise FWHT + NVFP4 quantization from the load_colwise_pairs_bf16 registers,
     stored at the SAME (token, feature) coords the input was read from (the staging
     is f-major like every other output; packed nibbles pair ADJACENT FEATURES of one
@@ -139,22 +140,24 @@ def hadamard_rmem_colwise_fwht_quant(rmem_bf16, d_buffer, tidx, norm_const, sRht
             pv[c] = fmax(pv[c], fmax(v, -v))
     pv[0], pv[1] = cute.arch.mul_packed_f32x2((pv[0], pv[1]), (gem, gem))
 
-    # f32 -> e4m3 as a padded 4-wide vector (and widen back the same way):
+    # f32 -> fp8 scale format as a padded 4-wide vector (and widen back the same way):
     # nvgpu.cvt_fptrunc requires a 32-bit-aligned 1-d vector (4 x f8), never a
     # scalar. Same pattern as grouped_gemm_swiglu_quant's pvscale round-trip.
     pv_f32x4 = cute.make_rmem_tensor((4,), cutlass.Float32)
     for c in cutlass.range_constexpr(4):
         pv_f32x4[c] = pv[min(c, 1)]
-    tCrSFC_f8x4 = cute.make_rmem_tensor((4,), cutlass.Float8E4M3FN)
-    tCrSFC_f8x4.store(pv_f32x4.load().to(cutlass.Float8E4M3FN))
+    tCrSFC_f8x4 = cute.make_rmem_tensor((4,), sf_dtype)
+    tCrSFC_f8x4.store(pv_f32x4.load().to(sf_dtype))
     tCrSFC_f32x4 = cute.make_rmem_tensor((4,), cutlass.Float32)
     tCrSFC_f32x4.store(tCrSFC_f8x4.load().to(cutlass.Float32))
     for c in cutlass.range_constexpr(2):
         sSf[(sf_row_base + feature + c, token_block)] = tCrSFC_f8x4[c]
 
     fp32_max = cutlass.Float32(3.40282346638528859812e38)
-    acc_scale_min0 = fmin(cutlass.Float32(1.0) / (tCrSFC_f32x4[0] * gd), fp32_max, nan=True)
-    acc_scale_min1 = fmin(cutlass.Float32(1.0) / (tCrSFC_f32x4[1] * gd), fp32_max, nan=True)
+    acc_scale_min0 = fmin(
+        cutlass.Float32(1.0) / (tCrSFC_f32x4[0] * gd), fp32_max, nan=True)
+    acc_scale_min1 = fmin(
+        cutlass.Float32(1.0) / (tCrSFC_f32x4[1] * gd), fp32_max, nan=True)
     for i in cutlass.range_constexpr(HADAMARD_SIZE):
         tCompute[2 * i], tCompute[2 * i + 1] = cute.arch.mul_packed_f32x2(
             (tCompute[2 * i], tCompute[2 * i + 1]),
@@ -173,11 +176,11 @@ def hadamard_rmem_colwise_fwht_quant(rmem_bf16, d_buffer, tidx, norm_const, sRht
 
 
 @cute.jit
-def hadamard_rmem_rowwise_fwht(rmem_bf16, d_buffer, tidx, sRht, norm_const=1.0, sSf=None, sf_pair=0):
+def hadamard_rmem_rowwise_fwht(rmem_bf16, d_buffer, tidx, sRht, norm_const, sSf, sf_pair, sf_dtype):
     """Per-token FWHT over the thread's full 32-feature row (two independent 16-feature
     Hadamard blocks) from the load_row_bf16 registers, stored to sRht at the same
-    (token, feature) coords: bf16, or NVFP4 (packed e2m1 into sRht + e4m3 block scales
-    into sSf slots (tidx, 2*sf_pair..)) when sRht is fp4-typed."""
+    (token, feature) coords: bf16, or NVFP4 (packed e2m1 into sRht + e4m3/ue5m3 block
+    scales into sSf slots (tidx, 2*sf_pair..)) when sRht is fp4-typed."""
     token = tidx
     row_feats = 2 * HADAMARD_SIZE
 
@@ -214,7 +217,7 @@ def hadamard_rmem_rowwise_fwht(rmem_bf16, d_buffer, tidx, sRht, norm_const=1.0, 
         tCompute[i] = (tCompute[i] * cutlass.Float32(0.25)).to(cutlass.BFloat16).to(cutlass.Float32)
 
     if cutlass.const_expr(sRht.element_type == cutlass.Float4E2M1FN):
-        _nvfp4_quant_row(tCompute, d_buffer, token, sRht, norm_const, sSf, sf_pair)
+        _nvfp4_quant_row(tCompute, d_buffer, token, sRht, norm_const, sSf, sf_pair, sf_dtype)
     else:
         rmem_st = cute.make_rmem_tensor(rmem_bf16.shape, cutlass.BFloat16)
         for i in cutlass.range_constexpr(row_feats):

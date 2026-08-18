@@ -177,6 +177,12 @@ def f32_to_ue5m3_bytes(values: torch.Tensor) -> torch.Tensor:
     return idx.to(torch.uint8).masked_fill(is_nan, _UE5M3_NAN_BYTE).reshape(values.shape)
 
 
+def ue5m3_bytes_to_fp32(encoded: torch.Tensor) -> torch.Tensor:
+    """Decode a UE5M3 byte tensor to float."""
+    lut = _ue5m3_lut(encoded.device)
+    return lut[encoded.view(torch.uint8).to(torch.int)]
+
+
 def reencode_sf_tensor_as_ue5m3(sf_tensor: torch.Tensor) -> torch.Tensor:
     """Rewrite an e4m3-valued scale-factor tensor's bytes as UE5M3, in place."""
     assert sf_tensor.dtype == torch.float8_e4m3fn, f"expected e4m3 storage, got {sf_tensor.dtype}"

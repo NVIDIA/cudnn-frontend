@@ -4,9 +4,9 @@
 """FE API for grouped GEMM GLU forward fusion with fused RHT output and NVFP4 quantization.
 
 Output modes are dtype driven, mirroring the kernel:
-  - D is bf16, or NVFP4 (packed e2m1 data + e4m3 block scales in ``sfd``)
-  - The optional RHT output is bf16, or NVFP4 (packed e2m1 data + e4m3 block scales
-    in ``sfrht``)
+  - D is bf16, or NVFP4 (packed e2m1 data + e4m3/ue5m3 block scales in ``sfd``)
+  - The optional RHT output is bf16, or NVFP4 (packed e2m1 data + e4m3/ue5m3
+    block scales in ``sfrht``)
 
 The RHT data is always stored at D's own (m, f) orientation — only the SCALE grid
 follows the transform orientation: swizzled scale factors for logical (m, f)
@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Optional, Tuple
+from typing import Any, Literal, Optional, Tuple
 
 from cuda.bindings import driver as cuda
 import cutlass
@@ -25,12 +25,20 @@ import cutlass.cute as cute
 from cutlass.cute.nvgpu import OperandMajorMode
 from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
-from cudnn.api_base import APIBase, TupleDict, ceil_div, is_power_of_2
+from cudnn.api_base import APIBase, TupleDict, ceil_div, get_device_type, is_power_of_2
 from cudnn.datatypes import _convert_to_cutlass_data_type
 
 from ..moe_utils import MoEWeightMode
 from .rht_utils import HADAMARD_SIZE
 from .moe_blockscaled_grouped_gemm_glu_hadamard_quant import BlockScaledMoEGroupedGemmGluHadamardQuantKernel
+
+
+def _get_rubin_kernel():
+    from .moe_blockscaled_grouped_gemm_glu_hadamard_quant_rubin import (
+        BlockScaledMoEGroupedGemmGluHadamardQuantKernel as RubinBlockScaledMoEGroupedGemmGluHadamardQuantKernel,
+    )
+
+    return RubinBlockScaledMoEGroupedGemmGluHadamardQuantKernel
 
 # The GLU + Hadamard + quant fusion is block-scaled only: its mandatory
 # scale-factor inputs use an MMA-interleaved 6-D layout with no row-major
@@ -83,7 +91,7 @@ class GroupedGemmGluHadamardQuantSm100(APIBase):
         mma_tiler_mn: Tuple[int, int] = (256, 256),
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         sf_vec_size: int = 16,
-        sf_fp8_dtype_override: Optional[str] = None,
+        sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
         vector_f32: bool = False,
         m_aligned: int = 256,
         act_func: str = "swiglu",
@@ -161,7 +169,7 @@ class GroupedGemmGluHadamardQuantSm100(APIBase):
         self.rht_rowwise = rht_rowwise
         self.glu_alpha = glu_alpha
         self.glu_limit = glu_limit
-        self._kernel = BlockScaledMoEGroupedGemmGluHadamardQuantKernel
+        self._kernel = _get_rubin_kernel() if self._is_rubin_kernel else BlockScaledMoEGroupedGemmGluHadamardQuantKernel
         self.num_cluster_overlap_margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
         self._workspace = None
 
@@ -258,11 +266,11 @@ class GroupedGemmGluHadamardQuantSm100(APIBase):
         self._check_dtype(self.prob_desc, dtype=torch.float32, name="prob")
         self._check_dtype(self.bias_desc, dtype=[torch.float16, torch.bfloat16, torch.float32], name="bias")
         if self.d_quant:
-            self._check_dtype(self.sfd_desc, dtype=torch.float8_e4m3fn, name="SFD")
+            self._check_dtype(self.sfd_desc, dtype=self.sf_dtype, name="SFD", extra_error_msg="SFD must match SFA dtype")
         if self.generate_rht:
             self._check_dtype(self.rht_desc, dtype=[torch.bfloat16, torch.float4_e2m1fn_x2], name="RHT")
         if self.rht_quant:
-            self._check_dtype(self.sfrht_desc, dtype=torch.float8_e4m3fn, name="SFRHT")
+            self._check_dtype(self.sfrht_desc, dtype=self.sf_dtype, name="SFRHT", extra_error_msg="SFRHT must match SFA dtype")
         self._check_dtype(self.acc_dtype, dtype=torch.float32, name="acc_dtype")
 
         self._value_error_if(self.sf_vec_size != 16, f"sf_vec_size must be 16, got {self.sf_vec_size}")
@@ -301,8 +309,8 @@ class GroupedGemmGluHadamardQuantSm100(APIBase):
             f"Invalid cluster shape: {self.cluster_shape_mn}",
         )
         self._value_error_if(
-            self.m_aligned != BlockScaledMoEGroupedGemmGluHadamardQuantKernel.FIX_PAD_SIZE,
-            f"m_aligned must be {BlockScaledMoEGroupedGemmGluHadamardQuantKernel.FIX_PAD_SIZE}, got {self.m_aligned}",
+            self.m_aligned != self._kernel.FIX_PAD_SIZE,
+            f"m_aligned must be {self._kernel.FIX_PAD_SIZE}, got {self.m_aligned}",
         )
         self._value_error_if(self.expert_cnt > 1024, f"expert_cnt must be <= 1024, got {self.expert_cnt}")
 
@@ -347,7 +355,7 @@ class GroupedGemmGluHadamardQuantSm100(APIBase):
         if self.a_desc.shape[0] == 0:
             return
 
-        kernel = self._kernel(
+        kernel_kwargs = dict(
             sf_vec_size=self.sf_vec_size,
             acc_dtype=_convert_to_cutlass_data_type(self.acc_dtype),
             use_2cta_instrs=self.use_2cta_instrs,
@@ -360,10 +368,12 @@ class GroupedGemmGluHadamardQuantSm100(APIBase):
             act_func=self.act_func,
             enable_bias=self.bias_desc is not None,
             rht_rowwise=self.rht_rowwise if self.generate_rht else False,
-            sf_fp8_dtype_override=self.sf_fp8_dtype_override,
             glu_alpha=self.glu_alpha,
             glu_limit=self.glu_limit,
         )
+        if self.sf_fp8_dtype_override == "e5m3":
+            kernel_kwargs["sf_fp8_dtype_override"] = self.sf_fp8_dtype_override
+        kernel = self._kernel(**kernel_kwargs)
 
         hardware_info = cutlass.utils.HardwareInfo()
         max_active_clusters = hardware_info.get_max_active_clusters(self.cluster_shape_mn[0] * self.cluster_shape_mn[1])
@@ -720,7 +730,7 @@ def grouped_gemm_glu_hadamard_quant_wrapper_sm100(
     """High-level wrapper for grouped GEMM GLU forward fusion with fused RHT output.
 
     Output modes are dtype driven: ``d_dtype``/``rht_dtype`` of
-    ``torch.float4_e2m1fn_x2`` emit packed NVFP4 data plus e4m3 block scales
+    ``torch.float4_e2m1fn_x2`` emit packed NVFP4 data plus e4m3/ue5m3 block scales
     (``sfd_tensor``/``sfrht_tensor``); ``torch.bfloat16`` emits plain bf16.
     ``sf_fp8_dtype_override="e5m3"`` reinterprets ``torch.float8_e4m3fn``
     SFA/SFB storage as UE5M3 input scale factors on Rubin.
@@ -790,7 +800,7 @@ def grouped_gemm_glu_hadamard_quant_wrapper_sm100(
 
     def alloc_swizzled_sf(rows: int, cols: int) -> torch.Tensor:
         shape = (1, ceil_div(rows, 128), ceil_div(ceil_div(cols, sf_vec_size), 4), 32, 4, 4)
-        return torch.empty(shape, dtype=torch.float8_e4m3fn, device=device).permute(3, 4, 1, 5, 2, 0)
+        return torch.empty(shape, dtype=sfa_tensor.dtype, device=device).permute(3, 4, 1, 5, 2, 0)
 
     c_tensor = alloc_n_major(valid_m, n_full, c_dtype)
     if d_quant:
@@ -828,7 +838,10 @@ def grouped_gemm_glu_hadamard_quant_wrapper_sm100(
         stride_signature = tuple(None if idx in dynamic_stride_dims else value for idx, value in enumerate(tensor.stride()))
         return static_shape_suffix, stride_signature, tensor.dtype
 
+    device_type = get_device_type()
+
     cache_key = (
+        device_type,
         weight_mode,
         act_func,
         a_tensor.shape[1:],

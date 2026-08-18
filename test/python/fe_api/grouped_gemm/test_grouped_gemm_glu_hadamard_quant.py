@@ -11,7 +11,11 @@ from test_utils import torch_fork_set_rng
 from fe_api.grouped_gemm.test_discrete_grouped_gemm_swiglu_utils import allocate_discrete_input_tensors
 from fe_api.grouped_gemm.test_grouped_gemm_swiglu_utils import allocate_grouped_gemm_input_tensors, grouped_gemm_swiglu_init
 from fe_api.grouped_gemm.test_grouped_gemm_wgrad_utils import _skip_unless_e5m3_supported
-from fe_api.test_fe_api_utils import DYNAMIC_SHAPES_M_VALUES, reencode_sf_tensor_as_ue5m3
+from fe_api.test_fe_api_utils import (
+    DYNAMIC_SHAPES_M_VALUES,
+    reencode_sf_tensor_as_ue5m3,
+    ue5m3_bytes_to_fp32,
+)
 
 FP4_EXECUTION_CASES = [
     (torch.float4_e2m1fn_x2, torch.float8_e4m3fn, 16),
@@ -205,6 +209,7 @@ def _check_outputs(
     norm_const: float = 1.0,
     rht_norm_const: float = 1.0,
     ref_tensors: Optional[Dict] = None,
+    sf_fp8_dtype_override: Optional[str] = None,
 ) -> None:
     if ref_tensors is None:
         ref_tensors = _run_grouped_gemm_glu_ref(inputs, act_func, glu_alpha=glu_alpha, glu_limit=glu_limit)
@@ -227,9 +232,12 @@ def _check_outputs(
             rtol=1e-2,
         )
     else:
+        sfd_tensor = outputs["sfd_tensor"]
+        if sf_fp8_dtype_override == "e5m3":
+            sfd_tensor = ue5m3_bytes_to_fp32(sfd_tensor)
         _check_nvfp4_output(
             float4_e2m1fn_x2_to_float32(outputs["d_tensor"][:valid_m, :, 0].view(torch.uint8).cpu()),
-            outputs["sfd_tensor"].cpu(),
+            sfd_tensor.cpu(),
             d_ref[:, :, 0].cpu(),
             norm_const,
             "D",
@@ -249,9 +257,12 @@ def _check_outputs(
             rtol=1e-2,
         )
     elif rht_rowwise:
+        sfrht_tensor = outputs["sfrht_tensor"]
+        if sf_fp8_dtype_override == "e5m3":
+            sfrht_tensor = ue5m3_bytes_to_fp32(sfrht_tensor)
         _check_nvfp4_output(
             float4_e2m1fn_x2_to_float32(outputs["rht_tensor"][:valid_m, :, 0].view(torch.uint8).cpu()),
-            outputs["sfrht_tensor"].cpu(),
+            sfrht_tensor.cpu(),
             rht_ref.float(),
             rht_norm_const,
             "RHT",
@@ -261,9 +272,12 @@ def _check_outputs(
         # adjacent features), but quantization blocks are (16, 1) token blocks,
         # so check through the transposed unpacked values and the swizzled
         # SF(N_out, valid_m) scale domain.
+        sfrht_tensor = outputs["sfrht_tensor"]
+        if sf_fp8_dtype_override == "e5m3":
+            sfrht_tensor = ue5m3_bytes_to_fp32(sfrht_tensor)
         _check_nvfp4_output(
             float4_e2m1fn_x2_to_float32(outputs["rht_tensor"][:valid_m, :, 0].view(torch.uint8).cpu()).t(),
-            outputs["sfrht_tensor"].cpu(),
+            sfrht_tensor.cpu(),
             rht_ref.float().t(),
             rht_norm_const,
             "RHT",
@@ -366,6 +380,7 @@ def _run_wrapper(
         norm_const=norm_const,
         rht_norm_const=rht_norm_const,
         ref_tensors=ref_tensors,
+        sf_fp8_dtype_override=sf_fp8_dtype_override,
     )
 
 
@@ -443,7 +458,15 @@ def _run_compile_execute(request, *, ab_dtype, sf_dtype, sf_vec_size, act_func="
         rht_tensor=outputs["rht_tensor"],
     )
 
-    _check_outputs(inputs, outputs, cfg, act_func=act_func, rht_output=True, rht_rowwise=False)
+    _check_outputs(
+        inputs,
+        outputs,
+        cfg,
+        act_func=act_func,
+        rht_output=True,
+        rht_rowwise=False,
+        sf_fp8_dtype_override=sf_fp8_dtype_override,
+    )
 
 
 def _run_discrete_wrapper(request, *, ab_dtype, sf_dtype, sf_vec_size, act_func="swiglu", sf_fp8_dtype_override=None):
@@ -489,7 +512,15 @@ def _run_discrete_wrapper(request, *, ab_dtype, sf_dtype, sf_vec_size, act_func=
         act_func=act_func,
     )
 
-    _check_outputs(inputs, outputs, cfg, act_func=act_func, rht_output=True, rht_rowwise=False)
+    _check_outputs(
+        inputs,
+        outputs,
+        cfg,
+        act_func=act_func,
+        rht_output=True,
+        rht_rowwise=False,
+        sf_fp8_dtype_override=sf_fp8_dtype_override,
+    )
 
 
 # =============================================================================
@@ -741,13 +772,63 @@ def test_grouped_gemm_glu_hadamard_quant_rejects_unsupported_sf_fp8_dtype(reques
     """e5m3 is only reachable through the FP4xFP4 atom with e4m3-carried scales."""
     if sf_fp8_dtype_override == "e5m3":
         _skip_unless_e5m3_supported()
+
+    # Construct kernel config
+    cfg_kwargs = dict(
+        ab_dtype=torch.float4_e2m1fn_x2,
+        c_dtype=torch.bfloat16,
+        d_dtype=torch.bfloat16,
+        cd_major="n",
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=16,
+        sf_dtype=torch.float8_e4m3fn,
+        vector_f32=False,
+        discrete_col_sfd=False,
+        enable_bias=False,
+    )
+    cfg_kwargs.update(overrides)
+    cfg = grouped_gemm_swiglu_init(request, **cfg_kwargs)
+
+    # Allocate input tensors
+    inputs = allocate_grouped_gemm_input_tensors(
+        n=cfg["n"],
+        k=cfg["k"],
+        l=cfg["l"],
+        group_m_list=cfg["group_m_list"],
+        ab_dtype=cfg["ab_dtype"],
+        sf_dtype=cfg["sf_dtype"],
+        sf_vec_size=cfg["sf_vec_size"],
+        m_aligned=cfg["m_aligned"],
+        b_major=cfg["b_major"],
+        enable_bias=False,
+    )
+
+    from cudnn import grouped_gemm_glu_hadamard_quant_wrapper_sm100
+
+    # Check that calling kernel API triggers exception
     with pytest.raises(ValueError, match=expected):
-        _run_compile_execute(
-            request,
-            ab_dtype=torch.float4_e2m1fn_x2,
-            sf_dtype=overrides.get("sf_dtype", torch.float8_e4m3fn),
-            sf_vec_size=overrides.get("sf_vec_size", 16),
+        grouped_gemm_glu_hadamard_quant_wrapper_sm100(
+            a_tensor=inputs["a_tensor"],
+            b_tensor=inputs["b_tensor"],
+            sfa_tensor=inputs["sfa_tensor"],
+            sfb_tensor=inputs["sfb_tensor"],
+            padded_offsets=inputs["padded_offsets_tensor"],
+            alpha_tensor=inputs["alpha_tensor"],
+            prob_tensor=inputs["prob_tensor"],
+            bias_tensor=inputs["bias_tensor"],
+            acc_dtype=cfg["acc_dtype"],
+            c_dtype=cfg["c_dtype"],
+            d_dtype=cfg["d_dtype"],
+            cd_major=cfg["cd_major"],
+            mma_tiler_mn=cfg["mma_tiler_mn"],
+            cluster_shape_mn=cfg["cluster_shape_mn"],
+            sf_vec_size=cfg["sf_vec_size"],
             sf_fp8_dtype_override=sf_fp8_dtype_override,
+            vector_f32=cfg["vector_f32"],
+            m_aligned=cfg["m_aligned"],
+            act_func="swiglu",
         )
 
 
