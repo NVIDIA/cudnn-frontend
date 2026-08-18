@@ -455,12 +455,17 @@ def _sm100_spec(d: int, d_v: Optional[int] = None) -> EngineSpec:
 def _sm100_mxfp8_spec(d: int, d_v: Optional[int] = None) -> EngineSpec:
     """Block-scale MXFP8 engine (E4M3/E5M2 + per-32-block E8M0 SF).
 
-    THD/varlen is not supported by the current MXFP8 kernels, so this engine is
-    intentionally dense-only.
+    THD/varlen (d128/d128 only — the d192/d128 kernel is dense-only) rides the
+    shared packed lowering (write_thd_meta envelope design, issue #552; packed
+    Q/K/V/O contract only). The SF tensors travel PACKED
+    per-sequence-TILE-padded ([1, H, Σ_b ceil(S_b/128), SF_SMEM] tile sequences
+    in cu_seqlens order — see api_dsl._reshape_sf_packed); the graph's declared
+    SF dims stay the dense capacity, like the ragged Q/K/V storage.
     """
 
     d_v = d if d_v is None else d_v
     suffix = f"d{d}" if d_v == d else f"d{d}_d{d_v}"
+    thd = (d, d_v) == (128, 128)
     return EngineSpec(
         name=f"sdpa_fwd_prefill_sm100_{suffix}_mxfp8",
         capabilities=Capabilities(
@@ -480,6 +485,8 @@ def _sm100_mxfp8_spec(d: int, d_v: Optional[int] = None) -> EngineSpec:
             sink=True,
             stats=True,
             lse_optional=True,
+            thd=thd,
+            cu_seq_len=thd,
             sched_policies=frozenset({SCHED_NATURAL}),
             tile_ms=frozenset({128}),
             tile_ns=frozenset({128}),
@@ -501,12 +508,16 @@ def _sm100_fp8_spec(
     Padding mask (per-batch ``seq_len_kv`` → KV-side masking) is supported: KV-only
     padding leaves every query row real, so each row's total_sum > 0 and the
     per-row softmax normalization stays well-defined — no
-    fully-masked row can poison the global amax.  THD/varlen is still deferred
-    (dense execute only for v1), so thd=False.
+    fully-masked row can poison the global amax.  THD/varlen (d128/d128 only —
+    the d192/d128 kernel is dense-only) rides the shared packed lowering
+    (write_thd_meta envelope design, issue #552; packed Q/K/V/O contract
+    only) — on cc10.7 (Rubin) through the SM107 sibling kernel, which carries
+    the same THD leg.
     """
 
     d_v = d if d_v is None else d_v
     suffix = f"d{d}" if d_v == d else f"d{d}_d{d_v}"
+    thd = (d, d_v) == (128, 128)
     if dtypes is None:
         dtypes = frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2})
     return EngineSpec(
@@ -529,6 +540,8 @@ def _sm100_fp8_spec(
             sink_dtypes=sink_dtypes,
             stats=True,
             lse_optional=True,
+            thd=thd,
+            cu_seq_len=thd,
             # The fp8 kernel lacks the SEQ_Q_LENS_PRESENT epilogue trim, but its
             # only reachable padded+stats population is KV-only padding with
             # full-length seq_len_q (the fp8 suite; test_mhas_v2 fp8 padding
