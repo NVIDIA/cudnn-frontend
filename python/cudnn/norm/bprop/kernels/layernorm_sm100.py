@@ -497,7 +497,7 @@ def _backward_pipe(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, params, wcfg
     # R*C ~ 48M: helps small-N/mid-C and C=128, hurts large-N e.g. llama3-70b 67M).
     # Also gate on the register budget (larger ldgs would spill -> use CGA for those).
     npb = 2 if has_beta else 1
-    cache_xd = ((2 + npb) * ldgs * V <= 96) and (R * C <= 48 * 1024 * 1024)
+    cache_xd = ((2 + npb) * ldgs * V <= 120) and (R * C <= 48 * 1024 * 1024)
     smem_bytes = _pipe_bwd_smem(C, wn, STAGES)
     FB = 128 if C < 256 else 256
     fgrid = (C + FB - 1) // FB
