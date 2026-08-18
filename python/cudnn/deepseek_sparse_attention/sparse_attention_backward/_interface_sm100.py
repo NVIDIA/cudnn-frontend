@@ -20,6 +20,13 @@ torch2cute_dtype_map = {
 }
 
 
+def _select_sm100_backend(num_heads: int, head_dim: int) -> Tuple[str, int]:
+    """Return the tuned SM100 kernel variant and its sparse-row tile size."""
+    if num_heads == 16 and head_dim == 576:
+        return "h16_m128", 128
+    return "generic_m64", 64
+
+
 def flash_attn_bwd_sm100(
     q: torch.Tensor,
     kv: torch.Tensor,
@@ -91,7 +98,9 @@ def flash_attn_bwd_sm100(
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
 
-    block_tile = 64
+    # H16 KV-major specialization can use the full M128 UMMA tile.  This
+    # halves the top-k loop count while keeping one CTA per query token.
+    backend, block_tile = _select_sm100_backend(num_head, head_dim)
     num_head_blocks = (num_head + block_tile - 1) // block_tile
     batch_size = 1
 
@@ -184,13 +193,27 @@ def flash_attn_bwd_sm100(
         workspace_LSE_OdO_tensor = to_cute_tensor(workspace_LSE_OdO)
         workspace_dKV_tensor = to_cute_tensor(workspace_dKV)
 
-        kernel_obj = FlashAttentionDSABackwardSm100(
-            element_dtype=dtype,
-            head_dim=head_dim,
-            head_dim_v=head_dim_v,
-            block_tile=block_tile,
-            max_topk=max_topk,
-        )
+        if backend == "h16_m128":
+            from .dsa_bwd_sm100_h16 import FlashAttentionDSABackwardSm100H16
+
+            kernel_obj = FlashAttentionDSABackwardSm100H16(
+                element_dtype=dtype,
+                head_dim=head_dim,
+                head_dim_v=head_dim_v,
+                block_tile=block_tile,
+                max_topk=max_topk,
+            )
+        else:
+            # Keep this constructor and class byte-for-byte on the tuned H64
+            # path; embedding H16 conditionals in the same CuTe DSL class
+            # measurably perturbs H64 code generation.
+            kernel_obj = FlashAttentionDSABackwardSm100(
+                element_dtype=dtype,
+                head_dim=head_dim,
+                head_dim_v=head_dim_v,
+                block_tile=block_tile,
+                max_topk=max_topk,
+            )
 
         with torch.cuda.nvtx.range("flash_attn_bwd_sm100_compile"):
             flash_attn_bwd_sm100.compile_cache[compile_key] = cute.compile(
@@ -214,7 +237,7 @@ def flash_attn_bwd_sm100(
                 options=compile_options(),
             )
 
-    with torch.cuda.nvtx.range("flash_attn_bwd_sm100_kernel"):
+    with torch.cuda.nvtx.range(f"flash_attn_bwd_sm100_kernel[{backend}]"):
         flash_attn_bwd_sm100.compile_cache[compile_key](
             problem_shape,
             q,
