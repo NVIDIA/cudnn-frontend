@@ -2525,7 +2525,9 @@ def _host(
         # KV split rides the BATCH axis: z = batch + split*B.  The decode
         # already recovers the batch coord on both the blockIdx and the
         # scheduler-handout paths, so the split travels with it for free.
-        grid_shape = (grid_q_supers, QH, B * SPLIT_KV) if cutlass.const_expr(CFG.SCHEDULER_POLICY == SCHED_NATURAL) else (grid_q_supers * QH * B * SPLIT_KV, 1, 1)
+        grid_shape = (
+            (grid_q_supers, QH, B * SPLIT_KV) if cutlass.const_expr(CFG.SCHEDULER_POLICY == SCHED_NATURAL) else (grid_q_supers * QH * B * SPLIT_KV, 1, 1)
+        )
     _kernel(
         tma_q_desc,
         tma_k_desc,

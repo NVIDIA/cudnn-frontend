@@ -482,9 +482,9 @@ def test_mxfp8_dense_padding(in_key, causal):
     needs the per-batch LSE trim, which this cell does not declare)."""
     scale = 1.0 / math.sqrt(128)
     sk = dict(use_causal_mask=True) if causal else {}
-    O, O_ref, amax = _run(2, 8, 8, 256, in_key, torch.float16, scale=scale, sdpa_kwargs=sk, seq_lens_kv=[256, 192], stats=False)
-    _check(O, O_ref, torch.float16, in_key)
-    assert abs(amax.item() - O_ref.abs().max().item()) <= 0.03
+    o_out, o_ref, amax = _run(2, 8, 8, 256, in_key, torch.float16, scale=scale, sdpa_kwargs=sk, seq_lens_kv=[256, 192], stats=False)
+    _check(o_out, o_ref, torch.float16, in_key)
+    assert abs(amax.item() - o_ref.abs().max().item()) <= 0.03
 
 
 def _quantize_seq(t_1hsd, h, s, d, fp8, *, columnwise):
@@ -690,9 +690,9 @@ def _run_thd(seq_lens_q, seq_lens_kv, H_q, H_kv, in_key, out_dt, *, scale, causa
 def test_mxfp8_thd(in_key, causal):
     """THD/varlen self-attention: two packed sequences of unequal, tile-ragged length."""
     scale = 1.0 / math.sqrt(128)
-    O, O_ref, amax, _ = _run_thd([200, 150], [200, 150], 8, 8, in_key, torch.float16, scale=scale, causal=causal)
-    _check(O, O_ref, torch.float16, in_key)
-    assert abs(amax.item() - O_ref.abs().max().item()) <= 0.03
+    o_out, o_ref, amax, _ = _run_thd([200, 150], [200, 150], 8, 8, in_key, torch.float16, scale=scale, causal=causal)
+    _check(o_out, o_ref, torch.float16, in_key)
+    assert abs(amax.item() - o_ref.abs().max().item()) <= 0.03
 
 
 @pytest.mark.L0
@@ -700,8 +700,8 @@ def test_mxfp8_thd(in_key, causal):
 def test_mxfp8_thd_cross_gqa():
     """THD cross-attention (unequal packed Q and K/V totals) with GQA heads."""
     scale = 1.0 / math.sqrt(128)
-    O, O_ref, _, _ = _run_thd([64, 200], [256, 128], 8, 2, "e4m3", torch.float16, scale=scale)
-    _check(O, O_ref, torch.float16, "e4m3")
+    o_out, o_ref, _, _ = _run_thd([64, 200], [256, 128], 8, 2, "e4m3", torch.float16, scale=scale)
+    _check(o_out, o_ref, torch.float16, "e4m3")
 
 
 @pytest.mark.L0
@@ -710,8 +710,8 @@ def test_mxfp8_thd_sink():
     """THD causal + attention sink."""
     scale = 1.0 / math.sqrt(128)
     sink = torch.randn(1, 8, 1, 1, dtype=torch.float32, device="cuda")
-    O, O_ref, _, _ = _run_thd([200, 150], [200, 150], 8, 8, "e4m3", torch.float16, scale=scale, causal=True, sink=sink)
-    _check(O, O_ref, torch.float16, "e4m3")
+    o_out, o_ref, _, _ = _run_thd([200, 150], [200, 150], 8, 8, "e4m3", torch.float16, scale=scale, causal=True, sink=sink)
+    _check(o_out, o_ref, torch.float16, "e4m3")
 
 
 @pytest.mark.L0
@@ -719,8 +719,8 @@ def test_mxfp8_thd_sink():
 def test_mxfp8_thd_stats():
     """THD + generate_stats: the ragged token-major TH1 LSE is written next to O."""
     scale = 1.0 / math.sqrt(128)
-    O, O_ref, _, lse = _run_thd([200, 150], [200, 150], 8, 8, "e4m3", torch.float16, scale=scale, causal=True, stats=True)
-    _check(O, O_ref, torch.float16, "e4m3")
+    o_out, o_ref, _, lse = _run_thd([200, 150], [200, 150], 8, 8, "e4m3", torch.float16, scale=scale, causal=True, stats=True)
+    _check(o_out, o_ref, torch.float16, "e4m3")
     assert lse is not None and torch.isfinite(lse).all()
 
 
@@ -729,5 +729,5 @@ def test_mxfp8_thd_stats():
 def test_mxfp8_thd_cu_seq_len():
     """THD via the (B+1,) cu_seq_len prefix-sum length form."""
     scale = 1.0 / math.sqrt(128)
-    O, O_ref, _, _ = _run_thd([200, 150], [180, 120], 8, 8, "e4m3", torch.float16, scale=scale, cu_lens=True)
-    _check(O, O_ref, torch.float16, "e4m3")
+    o_out, o_ref, _, _ = _run_thd([200, 150], [180, 120], 8, 8, "e4m3", torch.float16, scale=scale, cu_lens=True)
+    _check(o_out, o_ref, torch.float16, "e4m3")

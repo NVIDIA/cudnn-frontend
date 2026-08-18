@@ -1418,6 +1418,8 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
                     use_padding_mask (Optional[bool]): Whether per-batch valid lengths mask the attention. Default is False.
                     seq_len_q (Optional[cudnn_tensor]): The per-batch valid sequence lengths of Q (int32, shape (B, 1, 1, 1)). Required with use_padding_mask and for THD/ragged inputs. Default is None.
                     seq_len_kv (Optional[cudnn_tensor]): The per-batch valid sequence lengths of K/V (int32, shape (B, 1, 1, 1)). Required with use_padding_mask and for THD/ragged inputs. Default is None.
+                    cu_seq_len_q (Optional[cudnn_tensor]): Cumulative sequence length of Q, shape (B+1, 1, 1, 1), int32. Mutually exclusive with seq_len_q; pair with a KV-side length tensor and set use_padding_mask=True. Requires cuDNN 9.24 or above. Default is None.
+                    cu_seq_len_kv (Optional[cudnn_tensor]): Cumulative sequence length of K/V, shape (B+1, 1, 1, 1), int32. Mutually exclusive with seq_len_kv; pair with a Q-side length tensor and set use_padding_mask=True. Requires cuDNN 9.24 or above. Default is None.
 
                 Returns:
                     o (cudnn_tensor): The output data.
