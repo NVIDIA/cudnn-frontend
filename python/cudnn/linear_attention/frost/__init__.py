@@ -3,14 +3,11 @@
 
 """cudnn.linear_attention.frost: the FROST linear-attention engines —
 Gated DeltaNet, Kimi Delta Attention, and Gated DeltaNet v2 on the SM100
-chunked kernels built on Cutlass primitives. ``GdnFrostEngine`` is the
-default GDN engine on SM100/SM103; ``KdaFrostEngine`` and ``Gdn2FrostEngine``
-are forward-only (their backward kernels are stubs — KDA gradients run on
-``KdaCuTileEngine``)."""
+chunked kernels built on Cutlass primitives. All three serve forward and
+backward on SM100/SM103 and rank ahead of the cuTile fallbacks, except
+GDN-2, which does not have a cuTile fallback."""
 
-# Lazy: importing one family's engine must not drag its neighbours in. The
-# manifest's factories tolerate a missing optional dependency PER ENGINE, and
-# eager imports here would have made one bad import cost all three.
+# Lazy: importing one family's engine must not drag its neighbours in.
 import importlib
 from typing import Any
 

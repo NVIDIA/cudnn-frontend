@@ -46,6 +46,10 @@ _CFG = "CONFIG_sm100_128x256x128_128x256x32_cluster2x1"
 _GEOMETRIES = [
     ("CONFIG_sm100_128x256x128_128x256x32_cluster2x1", 2),
     ("CONFIG_sm100_128x256x128_128x256x32_cluster1x1", 1),
+    # CTA tiles split across several MMA instructions along M (num_mma_m).
+    ("CONFIG_sm100_256x256x128_128x256x32_cluster2x1", 2),  # num_mma_m=2 on the pair
+    ("CONFIG_sm100_256x128x128_128x128x32_cluster1x1", 1),  # num_mma_m=2
+    ("CONFIG_sm100_128x128x128_64x128x32_cluster1x1", 1),  # num_mma_m=2 at mma_inst_m=64
 ]
 
 # The plain-e2e test additionally covers N-tiles that are not a multiple of 32

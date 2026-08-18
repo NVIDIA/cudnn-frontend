@@ -2,8 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Fused projection GEMM + per-head YARN RoPE + dual-direction MXFP8 quantize (Blackwell / SM100)."""
 
-import torch
-
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils
@@ -652,6 +650,8 @@ def gemm_proj_rope_mxfp8_host(
 
 
 def _as_e8m0(t):
-    ct = from_dlpack(t.detach(), assumed_align=16)
+    from cudnn.tensor_adapter import is_torch_tensor
+
+    ct = from_dlpack(t.detach() if is_torch_tensor(t) else t, assumed_align=16, enable_tvm_ffi=True)
     ct.element_type = cutlass.Float8E8M0FNU
     return ct.mark_layout_dynamic(leading_dim=1)

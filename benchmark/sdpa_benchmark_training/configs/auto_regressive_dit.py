@@ -49,7 +49,7 @@ CONFIG = BenchmarkConfig(
         (4096, 62208),
         (8192, 62208),
     ],
-    backends=["cudnn", "flash_attention_4"],
+    backends=["cudnn", "cudnn_oss", "flash_attention_4"],
     data_types=["bfloat16", "fp8", "mxfp8"],
     attn_masks=["no_mask"],
     profile_pass="fwd",

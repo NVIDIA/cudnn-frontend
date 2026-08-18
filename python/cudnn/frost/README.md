@@ -99,10 +99,9 @@ Reading that sequence line by line:
   still forwarded to the lowered C++ graph.
 - **`get_workspace_size()` is honest.** For a python plan it returns
   `CompiledPlan.get_workspace_size()`, the executor's real requirement (for
-  the graph above on an SM100 engine: the dummy-LSE scratch `b*h*s*4 = 16384`
-  bytes, because an inference graph has no Stats output and the SM100 kernels
-  always write an LSE; `lse_optional` adapters like SM120 compile the LSE
-  store out instead and report 0). `execute()` forwards the caller's
+  the dense graph above: 0 — every SM100/SM120 adapter is `lse_optional`, so
+  a stats-less inference graph compiles the LSE store out and binds no dummy
+  buffer at any level). `execute()` forwards the caller's
   buffer through `ExecutionContext.workspace` and the executor carves its
   scratch out of it in 128-byte-aligned chunks, never touching bytes at or
   beyond the reported size -- no hidden per-execute allocation, stable
@@ -235,10 +234,31 @@ CompiledPlan.execute(graph, uid_to_data, ctx)          (the hot path)
 - **`build_plan` runs once per (graph, plan)** at `build_plans()` time and the
   compiled artifact lives on the graph, so one engine instance is safely
   reusable across graphs.
+- **What a runtime value cannot change belongs in a build-time table.** An
+  operand's role and major, each output's shape rule and required alignment,
+  which outputs are reductions -- all settled when the kernel compiled, and
+  deciding them again per call is most of what a python execute path costs
+  (measured: 40-50 -> 20-22 us for one gemm, across six flavors).
+  `gemm/frost/recipe.py` is the worked example: one table, captured into a
+  closure that loops over it flat. Even what the kernel's parameter list looks
+  like is a table entry (`arg_plan`), which is why one loop serves every flavor
+  -- a call path per flavor is how two of them disagree. That closure never
+  raises and it is the ONLY thing that launches: what it refuses goes to a
+  checker that reads the same table, names the rule and raises without running
+  anything, and a graph it cannot serve at all is declined at `check_support`.
+  A second executor kept for diagnostics is still a second answer to what the
+  graph computes, and a differential between two readings of one plan cannot
+  catch a misconception they share.
 - **`ExecutionContext` carries handle, stream and workspace explicitly.** No
   engine may hard-code a stream, reach into private graph state, or allocate
   hidden workspace. `uid_to_data` is the caller's variant pack (tensor uid ->
   device buffer), exactly as the classic backend receives it.
+- **The pack's vocabulary is `index` and `OperandBuffer`,** and the two are not
+  the same thing. `pack.index_of(tensor_or_uid)` gives an operand's POSITION in
+  the pack; `pack.operands(indices)` turns positions into `OperandBuffer`s --
+  one caller buffer described (pointer, shape, stride, dtype), non-owning, and
+  itself a DLPack producer. An engine resolves positions once at first execute
+  and asks for buffers per call.
 
 `python/cudnn/gemm/frost/engine.py` is the worked example, deliberately thin:
 `check_support` delegates to `probe_supported` and
@@ -486,7 +506,7 @@ expressible, with one discipline separating them:
 - The box is pure data: per-axis fields on `Capabilities`. Covers most of the
   surface; adding an engine is writing a row, not logic.
 - A notch is a rule in `mismatch()` gated by a conjunction flag on the row
-  (e.g. `bottom_right_with_swa: bool`). The matcher encodes the SHAPE of the
+  (e.g. `bottom_right_padded_seq_q: bool`). The matcher encodes the SHAPE of the
   interaction once; each engine's row supplies the VERDICT. When a future
   kernel supports the conjunction, flip its flag -- never edit the matcher.
   This is what keeps interaction checks from regressing into a per-engine

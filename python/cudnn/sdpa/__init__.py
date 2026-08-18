@@ -18,6 +18,10 @@ _LAZY_EXPORTS = {
     "sdpa_bwd_wrapper_sm100_d256": (".bwd", "sdpa_bwd_wrapper_sm100_d256"),
     "SdpafwdSm100D256": (".fwd", "SdpafwdSm100D256"),
     "sdpa_fwd_wrapper_sm100_d256": (".fwd", "sdpa_fwd_wrapper_sm100_d256"),
+    "SdpafwdSm80": (".fwd", "SdpafwdSm80"),
+    "sdpa_fwd_wrapper_sm80": (".fwd", "sdpa_fwd_wrapper_sm80"),
+    "SdpabwdSm80": (".bwd", "SdpabwdSm80"),
+    "sdpa_bwd_wrapper_sm80": (".bwd", "sdpa_bwd_wrapper_sm80"),
 }
 
 __all__ = list(_LAZY_EXPORTS)

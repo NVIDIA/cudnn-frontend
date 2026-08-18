@@ -17,13 +17,14 @@ Discrete mode
     at execution time.
 """
 
+from __future__ import annotations
+
 from .moe_blockscaled_grouped_gemm_glu_bias import BlockScaledMoEGroupedGemmGluBiasKernel
-from ..backend_utils import _torch_stream_context, rubin_single_group_offsets_kwarg
+from ..backend_utils import rubin_single_group_offsets_kwarg
 from ..moe_utils import MoEWeightMode
 from cuda.bindings import driver as cuda
 import os
-import torch
-from typing import Tuple, Optional
+from typing import Literal, Tuple, Optional
 
 import cutlass
 import cutlass.cute as cute
@@ -117,10 +118,11 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
         sample_norm_const: Optional[torch.Tensor] = None,
         sample_prob: Optional[torch.Tensor] = None,
         # Configuration
-        acc_dtype: torch.dtype = torch.float32,
+        acc_dtype: Optional[torch.dtype] = None,
         mma_tiler_mn: Tuple[int, int] = (256, 256),
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         sf_vec_size: int = 16,
+        sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
         vector_f32: bool = False,
         m_aligned: int = 256,
         discrete_col_sfd: bool = False,
@@ -154,6 +156,12 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
         :param mma_tiler_mn: MMA tiler shape (M, N)
         :param cluster_shape_mn: Cluster shape (M, N)
         :param sf_vec_size: Scale factor vector size
+        :param sf_fp8_dtype_override: Reinterpret the FP8-format block scale factors
+            as E5M3 instead of the E4M3 implied by their storage dtype. ``None``
+            (default) leaves the format inferred, as every caller did before this
+            knob existed. ``"e5m3"`` requires Rubin and the NVFP4 recipe, and the
+            scale tensors are still supplied as ``torch.float8_e4m3fn`` because
+            torch has no e5m3 dtype -- only the CuTe element type is overridden.
         :param vector_f32: Use vectorized f32 operations
         :param m_aligned: Alignment for group M dimension
         :param discrete_col_sfd: Generate discrete col-major scale factor tensor
@@ -161,6 +169,17 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
         :param b_major: Major dimension for B tensor, one of "k" or "n"
         :param use_dynamic_sched: Enable dynamic tile scheduling for load balancing
         """
+        from cudnn.tensor_adapter import detect_framework
+
+        if sample_a is not None and detect_framework(sample_a) != "torch":
+            raise ValueError(
+                "GroupedGemmGluBlockScaledAPI supports torch tensors only: the block-scaled "
+                "scale-factor tensors use an MMA-interleaved layout that is not expressible as JAX arrays"
+            )
+        import torch
+
+        if acc_dtype is None:
+            acc_dtype = torch.float32
         super().__init__()
 
         self._warn_experimental_api()
@@ -223,6 +242,7 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
         else:
             self.cluster_shape_mn = cluster_shape_mn
         self.sf_vec_size = sf_vec_size
+        self.sf_fp8_dtype_override = sf_fp8_dtype_override
         self.vector_f32 = vector_f32
         self.m_aligned = m_aligned
         self.discrete_col_sfd = discrete_col_sfd
@@ -257,6 +277,8 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
 
         :return: True if supported, raises exception otherwise
         """
+        import torch
+
         self._logger.debug("Entering check_support")
 
         # ---- SFD group validation ----
@@ -427,6 +449,30 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
             self._is_fp8(self.ab_dtype) and self.sf_vec_size == 16,
             f"ab_dtype {self.ab_dtype} and sf_vec_size {self.sf_vec_size} combination is not supported",
         )
+
+        # torch has no e5m3 dtype and TVM-FFI cannot marshal FloatNV8E5M3FNU, so e5m3
+        # scale factors arrive as e4m3 storage of the same width and the Rubin kernel
+        # reinterprets them. That reinterpretation is the only real override; every
+        # other format the kernel reads straight off sfa.element_type.
+
+        # e5m3 is the only override currently supported
+        self._value_error_if(
+            self.sf_fp8_dtype_override not in (None, "e5m3"),
+            f"sf_fp8_dtype_override must be None or 'e5m3', got {self.sf_fp8_dtype_override!r}",
+        )
+        if self.sf_fp8_dtype_override == "e5m3":
+            # Only allow e5m3 to pretend to be e4m3fn
+            self._value_error_if(
+                self.sf_dtype != torch.float8_e4m3fn,
+                f"sf_fp8_dtype_override='e5m3' requires the NVFP4 recipe -- FP4 A/B with "
+                f"torch.float8_e4m3fn scale factors at sf_vec_size 16 -- but got "
+                f"ab_dtype={self.ab_dtype}, sf_dtype={self.sf_dtype}, sf_vec_size={self.sf_vec_size}",
+            )
+            # Only allow e5m3 for rubin kernels
+            self._value_error_if(
+                not self._is_rubin_kernel,
+                f"sf_fp8_dtype_override='e5m3' requires Rubin (SM107), got device type {self._device_type!r}",
+            )
 
         self._check_dtype(
             self.acc_dtype,
@@ -601,6 +647,8 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
 
     def compile(self) -> None:
         """Compile the kernel."""
+        import torch
+
         self._logger.debug("Entering compile")
         self._ensure_support_checked()
         if self._compiled_kernel is not None:
@@ -626,6 +674,11 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
             enable_bias=self._has_bias,
             use_dynamic_sched=self.use_dynamic_sched,
             **rubin_single_group_offsets_kwarg(self._is_rubin_kernel, self.use_single_group_runtime_offsets),
+            # Only the Rubin kernel accepts sf_fp8_dtype_override, and check_support
+            # rejects "e5m3" unless _is_rubin_kernel -- the same flag that selected
+            # self._kernel. The kernel maps the string to FloatNV8E5M3FNU itself, so
+            # that internal-only type is never named outside the Rubin module.
+            **({"sf_fp8_dtype_override": self.sf_fp8_dtype_override} if self.sf_fp8_dtype_override == "e5m3" else {}),
         )
 
         hardware_info = cutlass.utils.HardwareInfo()
@@ -931,6 +984,8 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
 
     def _compile_discrete(self, gemm_glu, max_active_clusters, fake_stream) -> None:
         """Compile for discrete (per-expert pointer) weight mode."""
+        import torch
+
         if len(self.b_shape) == 2:
             n, k = self.b_shape
         else:

@@ -55,10 +55,12 @@ def _assert_absent(mods: set, stage: str) -> None:
     assert not present, f"{stage} imported {present}; it must not"
 
 
+@pytest.mark.L0
 def test_importing_cudnn_pulls_no_framework():
     _assert_absent(_imported_by("import cudnn"), "import cudnn")
 
 
+@pytest.mark.L0
 def test_describing_a_graph_pulls_no_framework():
     """Build and validate an SDPA graph through the graph API alone."""
     _assert_absent(
@@ -79,6 +81,7 @@ g.validate()
     )
 
 
+@pytest.mark.L0
 def test_classification_and_facts_pull_no_framework():
     """The manifest classifies and the analyzer describes; neither lowers."""
     _assert_absent(
@@ -87,6 +90,7 @@ def test_classification_and_facts_pull_no_framework():
     )
 
 
+@pytest.mark.L0
 @pytest.mark.parametrize("module", ["cudnn.sdpa.fwd.engines", "cudnn.sdpa.bwd.engines"])
 def test_support_check_pulls_no_framework(module):
     """Capabilities and mismatch() are pure data and comparisons.

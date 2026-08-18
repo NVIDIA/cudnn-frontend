@@ -4,6 +4,10 @@
 
 **Legacy dense-only API note:** This page documents the older dense-only grouped quant API. For new integrations, prefer the unified [Grouped GEMM + Quant (Unified)](grouped_gemm_quant_unified.md) page.
 
+## JAX support
+
+JAX arrays are **not supported**: all configurations consume the SFA scale-factor tensor as an MMA-permuted strided cute tensor argument, a layout with no row-major (JAX) equivalent. JAX inputs raise a clear `ValueError` at the entry points. The API is otherwise type-erased and torch-lazy.
+
 ## Overview
 
 **Grouped GEMM + Quant fusion**: A contiguous grouped block-scaled GEMM with output quantization on NVIDIA Blackwell GPUs (SM100+), designed for MoE (Mixture of Experts) workloads. Implemented with CUTLASS/CUTE.

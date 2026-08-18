@@ -13,16 +13,22 @@ CATALOG. Also runnable as a script (forwards argv to pytest).
 from __future__ import annotations
 
 import os
+import pathlib
 import sys
+import textwrap
 
 import pytest
 import torch
 
 from gemm_test_utils import (
+    requires_int8_mma,
     requires_sm100,
     Plan as _plan,
     vp as _vp,
     resolve as _resolve,
+    e5m3_quant_ref as _e5m3_quant_ref,
+    e5m3_to_float as _e5m3_to_float,
+    requires_sm107,
 )
 
 # Module-wide GPU gate — every test here is end-to-end and needs a B200.
@@ -32,11 +38,7 @@ pytestmark = [pytest.mark.L0, requires_sm100]
 import cudnn
 import cudnn.gemm.frost  # noqa: F401  — installs the cudnn.pygraph recorder hook
 from cudnn.gemm.frost.compiler import _current_arch, _epi_vec_bytes
-from cudnn.gemm.frost.tile_config import CATALOG
-
-# INT8 matmul runs only on SM 100 or SM 110 (disjoint range).
-_INT8_SM_RANGES = ((100, 101), (110, 111))
-
+from cudnn.gemm.frost.tile_config import CATALOG, by_name
 
 _TORCH_DTYPE = {
     "bf16": torch.bfloat16,
@@ -87,6 +89,7 @@ _CORE_DTYPE_PAIRS: tuple[tuple[str, str], ...] = (
 
 # Curated config subset — each entry covers a distinct template-architectural
 # corner. Full CATALOG sweep is opt-in via CUDNN_GEMM_TEST_FULL=1.
+_BF16 = cudnn.data_type.BFLOAT16
 _QUICK_CONFIGS: tuple[str, ...] = (
     "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma",  # baseline cta1 single-CTA
     "CONFIG_sm100_128x256x128_128x256x32_cluster1x1_1ctamma",  # large N
@@ -112,6 +115,21 @@ _QUICK_CONFIGS: tuple[str, ...] = (
     "CONFIG_sm100_64x24x128_64x24x32_cluster1x1_1ctamma",  # cta_m=64, 16+8 spans
     "CONFIG_sm100_128x144x128_128x144x32_cluster2x1_2ctamma",  # cta2 (N%16), 16-col tail
     "CONFIG_sm100_128x48x128_128x48x32_cluster2x1_2ctamma_static",  # static cta2, 16-col tail
+    # CTA tiles split across num_mma_m MMA instructions along M. Split is just
+    # another geometry axis, so it rides the same dtype x layout x shape matrix;
+    # the invariants it has to hold are pinned by the unit tests at the end.
+    "CONFIG_sm100_256x128x128_128x128x32_cluster1x1_1ctamma",  # num_mma_m=2
+    "CONFIG_sm100_256x256x128_128x256x32_cluster2x1_1ctamma",  # num_mma_m=2, acc_stages drops to 1
+    "CONFIG_sm100_128x128x128_64x128x32_cluster1x1_1ctamma",  # num_mma_m=2 at mma_inst_m=64 (packed drain)
+    "CONFIG_sm100_256x128x128_128x128x32_cluster1x1_1ctamma_static",  # static scheduler
+    "CONFIG_sm100_256x256x128_128x256x32_cluster2x1_2ctamma",  # on the pair (cuBLAS geometry)
+    "CONFIG_sm100_128x128x128_64x128x32_cluster2x1_2ctamma_static",  # at mma_inst_m=64 (2x2 DP drain)
+    "CONFIG_sm100_256x128x128_128x128x32_cluster2x2_1ctamma",  # split + both multicasts
+    "CONFIG_sm100_256x256x64_128x256x32_cluster2x1_1ctamma",  # split + K_BYTES=64
+    # Split at mma_inst_m=64 on the pair drains N/2 per M block, so an N whose
+    # half is not a power of two exercises the tile-clamped epilogue chunk.
+    "CONFIG_sm100_128x48x128_64x48x32_cluster2x1_2ctamma",  # 2x2 DP, 24-col per-M-block drain
+    "CONFIG_sm100_128x16x128_64x16x32_cluster2x1_2ctamma",  # 2x2 DP, 8-col per-M-block drain
 )
 
 _BATCHED_CONFIGS: tuple[str, ...] = (
@@ -254,10 +272,14 @@ def _compatible(
         )
     cta_smem_m, cta_smem_n, _ = cfg.cta_smem_tile_mnk(in_eb, cta_group)
     mn_group_elems = cfg.cta_tile_k_bytes // in_eb
-    if a_major == "m" and (cta_smem_m < mn_group_elems or cta_smem_m % mn_group_elems != 0):
-        return False, (f"A M-major per-CTA SMEM M={cta_smem_m} is not compatible with " f"the {mn_group_elems}-element swizzle group")
-    if b_major == "n" and (cta_smem_n < mn_group_elems or cta_smem_n % mn_group_elems != 0):
-        return False, (f"B N-major per-CTA SMEM N={cta_smem_n} is not compatible with " f"the {mn_group_elems}-element swizzle group")
+    # Each MMA instruction reads its own M sub-block of the SMEM tile, so the
+    # swizzle-group rule applies per MMA (== the whole extent at num_mma_m == 1).
+    mma_smem_m = cta_smem_m // cfg.num_mma_m
+    mma_smem_n = cta_smem_n
+    if a_major == "m" and (mma_smem_m < mn_group_elems or mma_smem_m % mn_group_elems != 0):
+        return False, (f"A M-major per-MMA SMEM M={mma_smem_m} is not compatible with " f"the {mn_group_elems}-element swizzle group")
+    if b_major == "n" and (mma_smem_n < mn_group_elems or mma_smem_n % mn_group_elems != 0):
+        return False, (f"B N-major per-MMA SMEM N={mma_smem_n} is not compatible with " f"the {mn_group_elems}-element swizzle group")
     out_contig_name, out_contig_extent = ("N", N) if out_major == "n" else ("M", M)
     if (out_contig_extent * out_eb) % 32 != 0:
         return False, (
@@ -884,6 +906,12 @@ def _col_quant_reference(
     blocks = x.view(B, M // block_size, block_size, N)
     output_max = 448.0 if out_dtype is torch.float8_e4m3fn else 57344.0
     scale_f = blocks.abs().amax(dim=2) / output_max
+    if scale_dtype == "e5m3":
+        scale = _e5m3_quant_ref(scale_f)
+        back = _e5m3_to_float(scale.to(torch.int32))
+        inv = torch.where(back > 0, back.reciprocal(), 0.0)
+        q = (blocks * inv.unsqueeze(2)).clamp(-output_max, output_max)
+        return q.to(out_dtype).view(B, M, N), scale
     if scale_dtype is torch.float8_e8m0fnu:
         safe = torch.where(scale_f > 0, scale_f, 1.0)
         scale_f = torch.where(
@@ -955,6 +983,40 @@ def test_dense_col_block_scale_quant(config_name) -> None:
     ref_sw = ref_mm * torch.sigmoid(ref_mm)
     q_ref, scale_ref = _col_quant_reference(ref_sw, block_size, torch.float8_e4m3fn, torch.float8_e8m0fnu)
     torch.testing.assert_close(q_scale.float(), scale_ref.float(), atol=0, rtol=0)
+    torch.testing.assert_close(q.float(), q_ref.float(), atol=0, rtol=0)
+
+
+@requires_sm107
+@pytest.mark.parametrize("block_size", [16, 32])
+def test_dense_col_quant_e5m3_scale(block_size) -> None:
+    """COL block quantize with an E5M3 scale. This path keeps the scale in a
+    per-lane register (`_scale_mine_*`) before storing, so it exercises the
+    zero-init + assignment + store of the byte carrier that row quant does not."""
+    cfg, cta_group, scheduler = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    M, N, K = 256, 128, 128
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    A = g.tensor(name="A", dim=[1, M, K], stride=_a_stride_batched(M, K, "k"))
+    B = g.tensor(name="B", dim=[1, K, N], stride=_b_stride_batched(N, K, "k"))
+    C = g.matmul(A=A, B=B, name="mm")
+    S = g.swish(input=C, name="sw")
+    Q, QS = g.block_scale_quantize(input=S, block_size=block_size, axis=1, name="q")
+    Q.set_output(True).set_data_type(cudnn.data_type.FP8_E4M3)
+    QS.set_dim([1, M // block_size, N]).set_stride([M // block_size * N, N, 1])
+    QS.set_output(True).set_data_type(cudnn.data_type.FP8_E5M3)
+
+    compiled = _plan(g, config=cfg, cta_group=cta_group, scheduler=scheduler)
+    assert compiled.chain.quants[0].axis == 1 and compiled.chain.quants[0].scale_dtype == "fp8_e5m3"
+
+    a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
+    q = torch.empty(1, M, N, dtype=torch.float8_e4m3fn, device="cuda")
+    q_scale = torch.empty(1, M // block_size, N, dtype=torch.int8, device="cuda")
+    compiled(_vp(compiled, a, b, [q, q_scale]))
+    torch.cuda.synchronize()
+
+    ref_mm = torch.einsum("bmk,bnk->bmn", a.to(torch.float32), b.to(torch.float32))
+    ref_sw = ref_mm * torch.sigmoid(ref_mm)
+    q_ref, scale_ref = _col_quant_reference(ref_sw, block_size, torch.float8_e4m3fn, "e5m3")
+    torch.testing.assert_close(q_scale.view(torch.uint8).float(), scale_ref.float(), atol=0, rtol=0)
     torch.testing.assert_close(q.float(), q_ref.float(), atol=0, rtol=0)
 
 
@@ -2003,14 +2065,12 @@ _INT8_OUT_DTYPES = {
 }
 
 
+@requires_int8_mma
 @pytest.mark.parametrize("config_name", _INT8_CONFIGS, ids=[_config_id(n) for n in _INT8_CONFIGS])
 @pytest.mark.parametrize("out_dt", list(_INT8_OUT_DTYPES))
 def test_int8_matmul(config_name: str, out_dt: str) -> None:
     """INT8×INT8→INT32, output ∈ {fp32,bf16,fp16,int32,fp8}; bit-exact vs a
     rounded integer reference (values small enough that the rounding is exact)."""
-    sm = _current_arch()
-    if sm is not None and not any(lo <= sm < hi for lo, hi in _INT8_SM_RANGES):
-        pytest.skip(f"int8 matmul unsupported on sm_{sm} (SM 100/110 only)")
     cfg, cta_group, scheduler = _resolve(config_name)
     M = N = K = 256
     cudnn_dt, torch_dt, vmax = _INT8_OUT_DTYPES[out_dt]
@@ -2237,3 +2297,176 @@ def test_import_kernel_publishes_by_rename(tmp_path, monkeypatch):
         _usable_cache_dir.cache_clear()
     assert mod.MARKER == 4321
     assert any(name.endswith("generated_kernel.py") for name in renamed)
+
+
+# --- num_mma_m geometry invariants ------------------------------------------
+#
+# The CTA tile may span several `tcgen05.mma` along M (`num_mma_m = cta_tile_m /
+# mma_inst_m`). The e2e behaviour rides `_QUICK_CONFIGS` above; what needs its own
+# assertion is the geometry contract those configs rely on.
+
+
+@pytest.mark.parametrize(
+    "name,num_mma_m",
+    [
+        ("CONFIG_sm100_128x128x128_128x128x32_cluster1x1", 1),
+        ("CONFIG_sm100_256x128x128_128x128x32_cluster1x1", 2),
+        ("CONFIG_sm100_256x256x128_128x256x32_cluster1x1", 2),
+        ("CONFIG_sm100_128x128x128_64x128x32_cluster1x1", 2),
+    ],
+)
+def test_num_mma_m_is_derived_from_the_two_tiles(name: str, num_mma_m: int) -> None:
+    cfg = by_name(name)
+    assert cfg.num_mma_m == num_mma_m
+    assert cfg.cta_tile_m == cfg.num_mma_m * cfg.mma_inst_m
+    assert cfg.mma_inst_n == cfg.cta_tile_n  # N is never split
+    # The epilogue drains one MMA-M block per pass, so its subtile height is the
+    # instruction's M, not the CTA tile's.
+    assert cfg.epi_tile_mn[0] == cfg.mma_inst_m
+
+
+@pytest.mark.parametrize(
+    "name,reason",
+    [
+        # The pre-existing M/N bounds read off the MMA INSTRUCTION tile now that
+        # the CTA tile can be several instructions wide.
+        ("CONFIG_sm100_128x128x128_32x128x32_cluster1x1", "mma_inst_m=32"),
+        ("CONFIG_sm100_128x512x128_128x512x32_cluster1x1", "mma_inst_n=512"),
+        ("CONFIG_sm100_128x24x128_128x12x32_cluster1x1", "mma_inst_n=12"),
+        # At most 2 instructions along M this pass...
+        ("CONFIG_sm100_256x128x128_64x128x32_cluster1x1", "num_mma_m=4"),
+        ("CONFIG_sm100_512x128x128_128x128x32_cluster1x1", "num_mma_m=4"),
+        # ... and N is not an instruction-count axis at all.
+        ("CONFIG_sm100_128x256x128_128x128x32_cluster1x1", "N is not split"),
+    ],
+)
+def test_illegal_mma_decomposition_rejected(name: str, reason: str) -> None:
+    with pytest.raises(NotImplementedError) as e:
+        by_name(name)
+    assert reason in str(e.value)
+
+
+def test_split_tiles_are_by_name_only() -> None:
+    """Split geometries are reachable only through `by_name` synthesis, so they
+    stay out of the funnel's candidate set, the CUDNN_GEMM_TEST_FULL sweep and the
+    benchmarks' default config set (which is built from the funnel). They are still
+    measurable by name: `benchmark_matmul.py --configs` resolves an unknown label
+    through `by_name`."""
+    from cudnn.gemm.frost.graph_analyzer import analyze
+    from cudnn.gemm.frost.kernel_registry import candidates
+
+    assert all(c.num_mma_m == 1 for c in CATALOG)
+    g = cudnn.pygraph(io_data_type=_BF16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    A = g.tensor(name="A", dim=[1, 256, 128], stride=[256 * 128, 128, 1])
+    B = g.tensor(name="B", dim=[1, 128, 256], stride=[128 * 256, 1, 128])
+    g.matmul(A=A, B=B, name="mm").set_output(True)
+    assert all(cfg.num_mma_m == 1 for _t, cfg in candidates(analyze(g)))
+
+
+@pytest.mark.parametrize(
+    "name,cta_group,want",
+    [
+        ("CONFIG_sm100_128x128x128_128x128x32_cluster2x1", 2, 128),  # mma_inst_m=128 -> full N
+        ("CONFIG_sm100_64x128x128_64x128x32_cluster2x1", 2, 64),  # mma_inst_m=64, num_mma_m=1
+        ("CONFIG_sm100_128x128x128_64x128x32_cluster2x1", 2, 64),  # mma_inst_m=64, num_mma_m=2
+        ("CONFIG_sm100_128x256x128_64x256x32_cluster2x1", 2, 128),
+        ("CONFIG_sm100_128x128x128_64x128x32_cluster1x1", 1, 128),  # 1-CTA never halves
+    ],
+)
+def test_drain_width_keys_on_the_mma_block_height(name: str, cta_group: int, want: int) -> None:
+    """The 2-CTA 2x2-DP drain splits N across the two 64-lane halves. That is a
+    property of the per-CTA MMA block height (cluster-MMA m=128), NOT of the CTA
+    tile — they agree only at num_mma_m == 1. Keying it on cta_tile_m made the
+    compiler over-report the drain width, which both over-reserved TMEM (losing an
+    acc stage) and let the baked STG chunk exceed the real subtile: the 2-CTA
+    cta_tile_n=48 split entry of _QUICK_CONFIGS faulted with `misaligned address`."""
+    from cudnn.gemm.frost.compiler import _epi_tile_cols
+
+    assert _epi_tile_cols(by_name(name), cta_group) == want
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "CONFIG_sm100_256x128x128_128x128x32_cluster1x1",
+        "CONFIG_sm100_128x128x128_64x128x32_cluster1x1",
+    ],
+)
+def test_tma_store_gate_follows_the_mma_block_height(name: str) -> None:
+    """The TMA-store epilogue stages one MMA-M block of rows, so its gate is on
+    mma_inst_m — an M=64 MMA block drains through the packed lane<16 layout."""
+    from cudnn.gemm.frost.compiler import _use_tma_store_epi
+    from cudnn.gemm.frost.graph_analyzer import analyze
+
+    g = cudnn.pygraph(io_data_type=_BF16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    A = g.tensor(name="A", dim=[1, 256, 128], stride=[256 * 128, 128, 1])
+    B = g.tensor(name="B", dim=[1, 128, 256], stride=[128 * 256, 1, 128])
+    g.matmul(A=A, B=B, name="mm").set_output(True)
+    cfg = by_name(name)
+    assert _use_tma_store_epi(analyze(g), cfg, 16, 1) == (cfg.mma_inst_m == 128)
+
+
+# --- cutlass-dsl version-gated kwargs ----------------------------------------
+
+# `is_exclusive` (the >512-column TMEM grant) and `b_collector_op` (B-operand
+# collector reuse) only reached the cutlass-dsl `nvvm.*` wrappers in 4.8. Those
+# wrappers take no **kwargs, so NAMING one on an older DSL is a TypeError at JIT
+# regardless of the value -- `is_exclusive=False` is just as fatal as True.
+
+_VERSION_GATED_KWARGS = {
+    "tcgen05_alloc": "is_exclusive",
+    "tcgen05_dealloc": "is_exclusive",
+    "tcgen05_mma_block_scale": "b_collector_op",
+}
+
+
+def _template_dir():
+    # kernel_templates has no __init__.py (it is exec'd per render), so go
+    # through the package that does.
+    return pathlib.Path(cudnn.gemm.frost.__file__).parent / "kernel_templates"
+
+
+def test_templates_route_version_gated_kwargs_through_the_guarded_wrappers():
+    """Every template must reach these ops through `_tile_helpers`, which emits
+    the kwarg only on the branch that wants it. Calling `nvvm.<op>` directly and
+    passing the inert False/None compiles on an internal wheel and fails every
+    single JIT on the public one -- which is how the whole gemm suite went red."""
+    import ast
+
+    offenders = []
+    for path in sorted(_template_dir().glob("sm*.py")):
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "nvvm"
+                and node.func.attr in _VERSION_GATED_KWARGS
+            ):
+                offenders.append(f"{path.name}:{node.lineno} nvvm.{node.func.attr}(...)")
+    assert not offenders, "call the _tile_helpers wrapper instead of nvvm directly:\n  " + "\n  ".join(offenders)
+
+
+def test_the_guarded_wrappers_keep_the_kwarg_off_the_default_branch():
+    """...and the wrappers themselves only name it under the flag. Pinned as
+    source structure because the failure mode is a TypeError at trace time on a
+    DSL we cannot install here, so no runtime assertion can see it."""
+    import ast
+    import inspect
+
+    import cudnn.gemm.frost.kernel_templates._tile_helpers as helpers
+
+    for fn_name, kwarg in _VERSION_GATED_KWARGS.items():
+        fn = getattr(helpers, fn_name)
+        tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+        calls = [
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and isinstance(n.func.value, ast.Name) and n.func.value.id == "nvvm"
+        ]
+        assert len(calls) == 2, f"{fn_name} should have exactly one guarded and one plain nvvm call, got {len(calls)}"
+        named = [c for c in calls if any(k.arg == kwarg for k in c.keywords)]
+        assert len(named) == 1, f"{fn_name}: exactly one branch may name {kwarg!r}, got {len(named)}"
+        # ...and the other branch must be reachable without the newer DSL.
+        assert len(calls) - len(named) == 1, f"{fn_name}: no branch left that omits {kwarg!r}"

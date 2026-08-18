@@ -1,0 +1,46 @@
+config_name,model_name,backend,data_type,attn_mask,batch_size,q_seqlen,kv_seqlen,num_q_heads,num_kv_heads,head_dim_qk,head_dim_vo,profile_pass,deterministic_bwd,time_ms,tflops,max_diff,num_iterations,sliding_window_size,success,skipped,error_message,gpu_name,cudnn_version,cudnn_backend_version,peak_mma_tflops
+wan22,wan22_a14b,cudnn,bfloat16,no_mask,1,7800,7800,40,40,128,128,fwd,False,3.259,382.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,440.500
+wan22,wan22_a14b,cudnn,bfloat16,no_mask,1,7800,7800,40,40,128,128,bwd,False,12.610,247.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,440.500
+wan22,wan22_a14b,cudnn,bfloat16,no_mask,1,7800,7800,40,40,128,128,bwd,True,12.397,251.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,466.500
+wan22,wan22_a14b,cudnn,bfloat16,no_mask,1,17160,17160,40,40,128,128,fwd,False,14.813,407.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,466.500
+wan22,wan22_a14b,cudnn,bfloat16,no_mask,1,17160,17160,40,40,128,128,bwd,False,59.301,254.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,466.500
+wan22,wan22_a14b,cudnn,bfloat16,no_mask,1,17160,17160,40,40,128,128,bwd,True,58.663,257.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,466.500
+wan22,wan22_a14b,cudnn,bfloat16,no_mask,1,32760,32760,40,40,128,128,fwd,False,55.165,398.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,457.500
+wan22,wan22_a14b,cudnn,bfloat16,no_mask,1,32760,32760,40,40,128,128,bwd,False,213.032,258.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,466.500
+wan22,wan22_a14b,cudnn,bfloat16,no_mask,1,32760,32760,40,40,128,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+wan22,wan22_a14b,cudnn,bfloat16,no_mask,1,48360,48360,40,40,128,128,fwd,False,122.738,390.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,466.500
+wan22,wan22_a14b,cudnn,bfloat16,no_mask,1,48360,48360,40,40,128,128,bwd,False,463.671,258.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,466.500
+wan22,wan22_a14b,cudnn,bfloat16,no_mask,1,48360,48360,40,40,128,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+wan22,wan22_a14b,cudnn,bfloat16,no_mask,1,75600,75600,40,40,128,128,fwd,False,301.785,388.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,466.500
+wan22,wan22_a14b,cudnn,bfloat16,no_mask,1,75600,75600,40,40,128,128,bwd,False,1125.823,260.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,466.500
+wan22,wan22_a14b,cudnn,bfloat16,no_mask,1,75600,75600,40,40,128,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+wan22,wan22_a14b,cudnn_oss,bfloat16,no_mask,1,7800,7800,40,40,128,128,fwd,False,2.934,425.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,466.500
+wan22,wan22_a14b,cudnn_oss,bfloat16,no_mask,1,7800,7800,40,40,128,128,bwd,False,8.587,363.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,466.500
+wan22,wan22_a14b,cudnn_oss,bfloat16,no_mask,1,7800,7800,40,40,128,128,bwd,True,13.202,236.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,466.500
+wan22,wan22_a14b,cudnn_oss,bfloat16,no_mask,1,17160,17160,40,40,128,128,fwd,False,14.062,429.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,466.500
+wan22,wan22_a14b,cudnn_oss,bfloat16,no_mask,1,17160,17160,40,40,128,128,bwd,False,41.090,367.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,466.500
+wan22,wan22_a14b,cudnn_oss,bfloat16,no_mask,1,17160,17160,40,40,128,128,bwd,True,61.663,245.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,466.500
+wan22,wan22_a14b,cudnn_oss,bfloat16,no_mask,1,32760,32760,40,40,128,128,fwd,False,52.782,416.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,466.500
+wan22,wan22_a14b,cudnn_oss,bfloat16,no_mask,1,32760,32760,40,40,128,128,bwd,False,149.470,368.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,466.500
+wan22,wan22_a14b,cudnn_oss,bfloat16,no_mask,1,32760,32760,40,40,128,128,bwd,True,220.680,249.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,466.500
+wan22,wan22_a14b,cudnn_oss,bfloat16,no_mask,1,48360,48360,40,40,128,128,fwd,False,116.124,412.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,466.500
+wan22,wan22_a14b,cudnn_oss,bfloat16,no_mask,1,48360,48360,40,40,128,128,bwd,False,325.406,368.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,466.500
+wan22,wan22_a14b,cudnn_oss,bfloat16,no_mask,1,48360,48360,40,40,128,128,bwd,True,479.788,250.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,466.500
+wan22,wan22_a14b,cudnn_oss,bfloat16,no_mask,1,75600,75600,40,40,128,128,fwd,False,284.311,412.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,465.000
+wan22,wan22_a14b,cudnn_oss,bfloat16,no_mask,1,75600,75600,40,40,128,128,bwd,False,802.493,365.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,466.500
+wan22,wan22_a14b,cudnn_oss,bfloat16,no_mask,1,75600,75600,40,40,128,128,bwd,True,1160.301,252.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,457.500
+wan22,wan22_a14b,flash_attention_4,bfloat16,no_mask,1,7800,7800,40,40,128,128,fwd,False,3.436,363.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,,,437.500
+wan22,wan22_a14b,flash_attention_4,bfloat16,no_mask,1,7800,7800,40,40,128,128,bwd,False,14.158,220.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,,,437.500
+wan22,wan22_a14b,flash_attention_4,bfloat16,no_mask,1,7800,7800,40,40,128,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+wan22,wan22_a14b,flash_attention_4,bfloat16,no_mask,1,17160,17160,40,40,128,128,fwd,False,15.948,378.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,,,439.000
+wan22,wan22_a14b,flash_attention_4,bfloat16,no_mask,1,17160,17160,40,40,128,128,bwd,False,67.084,225.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,,,453.500
+wan22,wan22_a14b,flash_attention_4,bfloat16,no_mask,1,17160,17160,40,40,128,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+wan22,wan22_a14b,flash_attention_4,bfloat16,no_mask,1,32760,32760,40,40,128,128,fwd,False,57.652,381.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,,,457.500
+wan22,wan22_a14b,flash_attention_4,bfloat16,no_mask,1,32760,32760,40,40,128,128,bwd,False,240.702,228.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,,,466.500
+wan22,wan22_a14b,flash_attention_4,bfloat16,no_mask,1,32760,32760,40,40,128,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+wan22,wan22_a14b,flash_attention_4,bfloat16,no_mask,1,48360,48360,40,40,128,128,fwd,False,126.464,379.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,,,466.500
+wan22,wan22_a14b,flash_attention_4,bfloat16,no_mask,1,48360,48360,40,40,128,128,bwd,False,522.521,229.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,,,466.500
+wan22,wan22_a14b,flash_attention_4,bfloat16,no_mask,1,48360,48360,40,40,128,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+wan22,wan22_a14b,flash_attention_4,bfloat16,no_mask,1,75600,75600,40,40,128,128,fwd,False,309.913,378.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,,,466.500
+wan22,wan22_a14b,flash_attention_4,bfloat16,no_mask,1,75600,75600,40,40,128,128,bwd,False,1273.217,230.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,,,466.500
+wan22,wan22_a14b,flash_attention_4,bfloat16,no_mask,1,75600,75600,40,40,128,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,

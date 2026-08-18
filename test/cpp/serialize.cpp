@@ -7,6 +7,10 @@
 
 #include <cudnn_frontend.h>
 
+#include <cmath>
+#include <thread>
+#include <vector>
+
 TEST_CASE("Tensor attributes", "[tensor][serialize]") {
     namespace fe = cudnn_frontend;
 
@@ -24,6 +28,101 @@ TEST_CASE("Tensor attributes", "[tensor][serialize]") {
     auto tensor_attributes_deserialized = j;
 
     REQUIRE(tensor_attributes_deserialized == tensor_attributes);
+}
+
+TEST_CASE("Tensor attributes alignment", "[tensor][serialize]") {
+    namespace fe = cudnn_frontend;
+
+    auto make_tensor = []() -> fe::graph::Tensor_attributes {
+        return fe::graph::Tensor_attributes()
+            .set_name("image")
+            .set_dim({4, 32, 16, 16})
+            .set_stride({32 * 16 * 16, 1, 32 * 16, 32})
+            .set_uid(12312)
+            .set_data_type(fe::DataType_t::HALF);
+    };
+
+    SECTION("a non-default alignment survives the round trip") {
+        auto tensor_attributes = make_tensor().set_alignment(4);
+
+        json j = tensor_attributes;
+        REQUIRE(j.contains("alignment"));
+        REQUIRE(j["alignment"].get<int64_t>() == 4);
+
+        auto deserialized = j.get<fe::graph::Tensor_attributes>();
+        REQUIRE(deserialized.get_alignment() == 4);
+    }
+
+    SECTION("the default alignment is not emitted") {
+        auto tensor_attributes = make_tensor();
+        REQUIRE(tensor_attributes.get_alignment() == fe::graph::Tensor_attributes::default_alignment);
+
+        json j = tensor_attributes;
+        REQUIRE_FALSE(j.contains("alignment"));
+
+        auto deserialized = j.get<fe::graph::Tensor_attributes>();
+        REQUIRE(deserialized.get_alignment() == fe::graph::Tensor_attributes::default_alignment);
+    }
+
+    SECTION("a payload with no alignment key deserializes to the default") {
+        json j = make_tensor().set_alignment(4);
+        REQUIRE(j.erase("alignment") == 1);
+
+        fe::graph::Tensor_attributes deserialized;
+        REQUIRE_NOTHROW(deserialized = j.get<fe::graph::Tensor_attributes>());
+        REQUIRE(deserialized.get_alignment() == fe::graph::Tensor_attributes::default_alignment);
+    }
+}
+
+TEST_CASE("conv graph serialization preserves alignment", "[graph][serialize]") {
+    namespace fe = cudnn_frontend;
+
+    fe::graph::Graph graph;
+
+    auto x = graph.tensor(fe::graph::Tensor_attributes());
+    x->set_name("image")
+        .set_dim({4, 32, 16, 16})
+        .set_stride({32 * 16 * 16, 1, 32 * 16, 32})
+        .set_data_type(fe::DataType_t::HALF)
+        .set_alignment(4);
+
+    auto w = graph.tensor(fe::graph::Tensor_attributes());
+    w->set_name("weight")
+        .set_dim({64, 32, 3, 3})
+        .set_stride({32 * 3 * 3, 1, 32 * 3, 32})
+        .set_data_type(fe::DataType_t::HALF);
+
+    auto conv_fprop_attributes = fe::graph::Conv_fprop_attributes()
+                                     .set_name("conv_fprop")
+                                     .set_padding({1, 1})
+                                     .set_stride({1, 1})
+                                     .set_dilation({1, 1})
+                                     .set_compute_data_type(fe::DataType_t::FLOAT);
+
+    auto y = graph.conv_fprop(x, w, conv_fprop_attributes);
+    y->set_name("output").set_output(true).set_data_type(fe::DataType_t::HALF);
+
+    auto alignment_of = [](json const& serialized, std::string const& name) -> int64_t {
+        for (auto const& tensor : serialized["tensors"]) {
+            if (tensor.contains("name") && tensor["name"].get<std::string>() == name) {
+                return tensor.value("alignment", fe::graph::Tensor_attributes::default_alignment);
+            }
+        }
+        return -1;
+    };
+
+    json j = graph;
+
+    REQUIRE(alignment_of(j, "image") == 4);
+    REQUIRE(alignment_of(j, "weight") == fe::graph::Tensor_attributes::default_alignment);
+
+    fe::graph::Graph graph_deserialized;
+    REQUIRE(graph_deserialized.deserialize(j).is_good());
+
+    json j2 = graph_deserialized;
+
+    REQUIRE(alignment_of(j2, "image") == 4);
+    REQUIRE(j == j2);
 }
 
 TEST_CASE("Context serialization", "[context][serialize]") {
@@ -699,7 +798,7 @@ TEST_CASE("serialize_structure flag controls structural payload", "[graph][seria
 
     // Both remain reloadable through the plan path with identical variant packs.
     auto const expected_uids = graph.get_variant_pack_uids_sorted();
-    for (auto const &blob : {with_structure, without_structure}) {
+    for (auto const& blob : {with_structure, without_structure}) {
         fe::graph::Graph reloaded;
         REQUIRE(reloaded.deserialize(handle, blob, /*enforce_precompiled=*/false, /*run_warmup=*/false).is_good());
         REQUIRE(reloaded.get_variant_pack_uids_sorted() == expected_uids);
@@ -764,4 +863,302 @@ TEST_CASE("Plan re-serialize preserves pass-by-value and workspace modifications
     REQUIRE(j_next["workspace_modifications"] == j_fresh["workspace_modifications"]);
 
     cudnnDestroy(handle);
+}
+
+// ============================================================
+// Helpers shared by handle-less deserialize tests below.
+// ============================================================
+
+namespace {
+namespace fe = cudnn_frontend;
+
+// Build a small NHWC FP32 conv graph and return (graph, X-uid, W-uid, Y-uid).
+// N=1, C=4, H=8, W=8, K=4, R=1, S=1, padding=0, stride=1, dilation=1.
+// This shape is simple but exercises the full stack.
+struct ConvGraph {
+    static constexpr int64_t N = 1, C = 4, H = 8, W = 8, K = 4, R = 1, S = 1;
+    std::shared_ptr<fe::graph::Graph> graph;
+    std::shared_ptr<fe::graph::Tensor_attributes> X, W_t, Y;
+
+    ConvGraph() {
+        graph = std::make_shared<fe::graph::Graph>();
+        graph->set_io_data_type(fe::DataType_t::FLOAT)
+            .set_intermediate_data_type(fe::DataType_t::FLOAT)
+            .set_compute_data_type(fe::DataType_t::FLOAT);
+        // NHWC layout
+        X = graph->tensor(
+            fe::graph::Tensor_attributes().set_name("X").set_dim({N, C, H, W}).set_stride({C * H * W, 1, C * W, C}));
+        W_t = graph->tensor(
+            fe::graph::Tensor_attributes().set_name("W").set_dim({K, C, R, S}).set_stride({C * R * S, 1, C * S, C}));
+        auto opts = fe::graph::Conv_fprop_attributes().set_padding({0, 0}).set_stride({1, 1}).set_dilation({1, 1});
+        Y         = graph->conv_fprop(X, W_t, opts);
+        Y->set_output(true);
+    }
+};
+
+// Build a conv+relu fusion graph for the RTC test.
+struct FusionGraph {
+    static constexpr int64_t N = 16, C = 128, H = 64, W = 64, K = 256, R = 3, S = 3;
+    std::shared_ptr<fe::graph::Graph> graph;
+    std::shared_ptr<fe::graph::Tensor_attributes> X, W_t, Y;
+
+    FusionGraph() {
+        graph = std::make_shared<fe::graph::Graph>();
+        graph->set_io_data_type(fe::DataType_t::HALF)
+            .set_intermediate_data_type(fe::DataType_t::FLOAT)
+            .set_compute_data_type(fe::DataType_t::FLOAT);
+        // NHWC layout
+        X = graph->tensor(
+            fe::graph::Tensor_attributes().set_name("X").set_dim({N, C, H, W}).set_stride({C * H * W, 1, C * W, C}));
+        W_t = graph->tensor(
+            fe::graph::Tensor_attributes().set_name("W").set_dim({K, C, R, S}).set_stride({C * R * S, 1, C * S, C}));
+        auto conv_opts = fe::graph::Conv_fprop_attributes().set_padding({1, 1}).set_stride({1, 1}).set_dilation({1, 1});
+        auto conv      = graph->conv_fprop(X, W_t, conv_opts);
+        Y = graph->pointwise(conv, fe::graph::Pointwise_attributes().set_mode(fe::PointwiseMode_t::RELU_FWD));
+        Y->set_output(true).set_data_type(fe::DataType_t::HALF);
+    }
+};
+
+// Return the deviceVer encoded in a serialized DeviceProperties byte buffer.
+// The wire format is a JSON string, e.g. {"deviceVer":890,...}.
+// Returns -1 if the key is not found.
+static int
+parse_device_ver(std::vector<uint8_t> const& buf) {
+    std::string s(reinterpret_cast<const char*>(buf.data()), buf.size());
+    auto pos = s.find("\"deviceVer\":");
+    if (pos == std::string::npos) return -1;
+    pos += std::string("\"deviceVer\":").size();
+    return std::stoi(s.substr(pos));
+}
+
+// Produce a DeviceProperties whose deviceVer has been changed to a different
+// SM than the current device. Returns nullptr if the edit fails.
+static std::shared_ptr<fe::DeviceProperties>
+make_wrong_arch_devprop() {
+    auto dp_real = std::make_shared<fe::DeviceProperties>();
+    if (dp_real->set_device_id(0).build().is_bad()) return nullptr;
+
+    std::vector<uint8_t> buf;
+    if (dp_real->serialize(buf).is_bad()) return nullptr;
+
+    int real_ver = parse_device_ver(buf);
+    if (real_ver < 0) return nullptr;
+
+    // Pick a different SM: add 100 (one major step up) if possible, else subtract 100.
+    int wrong_ver = (real_ver < 900) ? (real_ver + 100) : (real_ver - 100);
+
+    std::string s(reinterpret_cast<const char*>(buf.data()), buf.size());
+    std::string needle = "\"deviceVer\":" + std::to_string(real_ver);
+    std::string repl   = "\"deviceVer\":" + std::to_string(wrong_ver);
+    auto pos           = s.find(needle);
+    if (pos == std::string::npos) return nullptr;
+    s.replace(pos, needle.size(), repl);
+
+    std::vector<uint8_t> bad(s.begin(), s.end());
+    auto dp_wrong = std::make_shared<fe::DeviceProperties>();
+    if (dp_wrong->deserialize(bad).is_bad()) return nullptr;
+    return dp_wrong;
+}
+
+}  // namespace
+
+// ============================================================
+// Compile-only overload resolution (no GPU, no cuDNN handle).
+// Verifies that std::vector<uint8_t> selects the new handle-less
+// deserialize overload and not the structural-graph json overload.
+// ============================================================
+
+TEST_CASE("Handle-less deserialize overload resolution", "[serialize][graph]") {
+    namespace fe = cudnn_frontend;
+    // This test is purely compile-time: if the wrong overload is selected the
+    // assertion message distinguishes plan vs. structural deserialize.
+    // We call it on an empty graph that will fail at runtime (no devprop),
+    // but the call must COMPILE to the blob overload, not convert to json.
+    fe::graph::Graph g;
+    std::vector<uint8_t> blob{0, 1, 2};  // intentionally invalid
+    auto err = g.deserialize(blob);
+    // No devprop set → ATTRIBUTE_NOT_SET, not a json parse error.
+    REQUIRE(err.is_bad());
+    REQUIRE(err.get_code() == fe::error_code_t::ATTRIBUTE_NOT_SET);
+}
+
+// ============================================================
+// Negative: no device properties set → clean ATTRIBUTE_NOT_SET error.
+// ============================================================
+
+TEST_CASE("Handle-less deserialize with no devprop returns ATTRIBUTE_NOT_SET", "[serialize][graph]") {
+#if (CUDNN_VERSION < 90800)
+    SKIP("Handle-less plan deserialize requires cuDNN >= 9.8 headers");
+#else
+    namespace fe = cudnn_frontend;
+
+    fe::graph::Graph g;
+    std::vector<uint8_t> dummy(64, 0);
+    auto status = g.deserialize(dummy);
+    REQUIRE(status.is_bad());
+    REQUIRE(status.get_code() == fe::error_code_t::ATTRIBUTE_NOT_SET);
+    REQUIRE(status.get_message().find("set_device_properties") != std::string::npos);
+#endif
+}
+
+// ============================================================
+// Main runtime tests — gated at 9.11 (matching the deviceless sample).
+// ============================================================
+
+TEST_CASE("Handle-less plan deserialize", "[serialize][graph]") {
+#if (CUDNN_VERSION < 90800)
+    SKIP("Handle-less plan deserialize requires cuDNN >= 9.8 headers");
+#else
+    if (cudnn_frontend::detail::get_backend_version() < 91100) {
+        SKIP("Handle-less plan deserialize runtime tests require cuDNN >= 9.11");
+    }
+
+    // ── build a device properties descriptor ──────────────────────────────
+    auto dp = std::make_shared<cudnn_frontend::DeviceProperties>();
+    REQUIRE(dp->set_device_id(0).build().is_good());
+
+    namespace fe = cudnn_frontend;
+
+    SECTION("wrong-arch devprop causes arch mismatch on deserialize") {
+        // This is the primary discriminator: if devprop were ignored,
+        // deserialize would succeed regardless of which SM is claimed.
+        ConvGraph cg;
+        cg.graph->set_device_properties(dp);
+        REQUIRE(cg.graph->build({fe::HeurMode_t::A, fe::HeurMode_t::FALLBACK}).is_good());
+        std::vector<uint8_t> blob;
+        REQUIRE(cg.graph->serialize(blob).is_good());
+
+        auto dp_wrong = make_wrong_arch_devprop();
+        REQUIRE(dp_wrong != nullptr);
+
+        fe::graph::Graph deser;
+        deser.set_device_properties(dp_wrong);
+        auto status = deser.deserialize(blob);
+        REQUIRE(status.is_bad());
+        // Backend returns NOT_SUPPORTED for arch mismatch during plan finalize.
+        auto const code  = status.get_code();
+        bool is_plan_err = (code == fe::error_code_t::GRAPH_EXECUTION_PLAN_CREATION_FAILED);
+        bool is_be_err   = (code == fe::error_code_t::CUDNN_BACKEND_API_FAILED);
+        REQUIRE((is_plan_err || is_be_err));
+    }
+
+    SECTION("RTC fusion plan carries RUNTIME_COMPILATION behavior note") {
+        FusionGraph fg;
+        fg.graph->set_device_properties(dp);
+        REQUIRE(fg.graph->build_operation_graph().is_good());
+        REQUIRE(fg.graph->create_execution_plans({fe::HeurMode_t::A, fe::HeurMode_t::FALLBACK}).is_good());
+        fg.graph->select_behavior_notes({fe::BehaviorNote_t::RUNTIME_COMPILATION});
+        if (fg.graph->check_support().is_bad()) {
+            SKIP("No RUNTIME_COMPILATION engine available for this graph on this GPU/cuDNN");
+        }
+        REQUIRE(fg.graph->build_plans(fe::BuildPlanPolicy_t::HEURISTICS_CHOICE).is_good());
+
+        std::vector<fe::BehaviorNote_t> notes;
+        REQUIRE(fg.graph->get_behavior_notes(notes).is_good());
+        bool has_rtc = std::find(notes.begin(), notes.end(), fe::BehaviorNote_t::RUNTIME_COMPILATION) != notes.end();
+        REQUIRE(has_rtc);
+
+        std::vector<uint8_t> blob;
+        REQUIRE(fg.graph->serialize(blob).is_good());
+
+        fe::graph::Graph deser;
+        deser.set_device_properties(dp);
+        REQUIRE(deser.deserialize(blob).is_good());
+    }
+
+    SECTION("plan-only blob (serialize_structure=false) + handle-less deserialize") {
+        ConvGraph cg;
+        cg.graph->set_device_properties(dp);
+        REQUIRE(cg.graph->build({fe::HeurMode_t::A, fe::HeurMode_t::FALLBACK}).is_good());
+
+        std::vector<uint8_t> blob;
+        REQUIRE(cg.graph->serialize(blob, /*serialize_structure=*/false).is_good());
+
+        fe::graph::Graph deser;
+        deser.set_device_properties(dp);
+        auto status = deser.deserialize(blob);
+        REQUIRE(status.is_good());
+
+        int64_t ws = 0;
+        REQUIRE(deser.get_workspace_size(ws).is_good());
+    }
+
+    SECTION("enforce_precompiled=true rejects blob with no plan data") {
+        // enforce_precompiled checks that the blob contains serialized plan bytes
+        // (cudnn_backend_data field). Manufacture a blob without that field.
+        ConvGraph cg;
+        cg.graph->set_device_properties(dp);
+        REQUIRE(cg.graph->build({fe::HeurMode_t::A, fe::HeurMode_t::FALLBACK}).is_good());
+
+        std::vector<uint8_t> full_blob;
+        REQUIRE(cg.graph->serialize(full_blob).is_good());
+
+        auto j = json::from_ubjson(full_blob);
+        j.erase("cudnn_backend_data");
+        auto no_plan_blob = json::to_ubjson(j);
+
+        fe::graph::Graph deser;
+        deser.set_device_properties(dp);
+        auto status = deser.deserialize(no_plan_blob, /*enforce_precompiled=*/true);
+        REQUIRE(status.is_bad());
+        auto const code  = status.get_code();
+        bool is_plan_err = (code == fe::error_code_t::GRAPH_EXECUTION_PLAN_CREATION_FAILED);
+        REQUIRE(is_plan_err);
+    }
+
+    SECTION("handle overload still uses handle even when devprop is set on graph") {
+        // Decision #7: the existing deserialize(handle, blob) overloads forward an
+        // explicit device_prop=nullptr so the graph's device_properties is NOT consulted.
+        ConvGraph cg;
+        cg.graph->set_device_properties(dp);
+        REQUIRE(cg.graph->build({fe::HeurMode_t::A, fe::HeurMode_t::FALLBACK}).is_good());
+        std::vector<uint8_t> blob;
+        REQUIRE(cg.graph->serialize(blob).is_good());
+
+        auto dp_wrong = make_wrong_arch_devprop();
+        REQUIRE(dp_wrong != nullptr);
+
+        cudnnHandle_t handle;
+        REQUIRE(cudnnCreate(&handle) == CUDNN_STATUS_SUCCESS);
+
+        // Graph has incompatible devprop, but we deserialize via handle overload.
+        // Should succeed because handle overload ignores graph's device_properties.
+        fe::graph::Graph deser;
+        deser.set_device_properties(dp_wrong);  // deliberately incompatible
+        auto status = deser.deserialize(handle, blob, false, false);
+        REQUIRE(status.is_good());  // handle path used, not devprop
+
+        cudnnDestroy(handle);
+    }
+
+    SECTION("concurrency: N threads share one devprop, each deserializes its own blob") {
+        // Concurrent rehydration is the primary motivation for this feature.
+        // One shared read-only DeviceProperties descriptor is used by all threads;
+        // each thread deserializes into its own Graph.
+        constexpr int kThreads = 4;
+
+        ConvGraph cg;
+        cg.graph->set_device_properties(dp);
+        REQUIRE(cg.graph->build({fe::HeurMode_t::A, fe::HeurMode_t::FALLBACK}).is_good());
+        std::vector<uint8_t> blob;
+        REQUIRE(cg.graph->serialize(blob).is_good());
+
+        std::vector<int> results(kThreads, 0);
+        std::vector<std::thread> threads;
+        threads.reserve(kThreads);
+
+        for (int t = 0; t < kThreads; ++t) {
+            threads.emplace_back([&dp, &blob, &results, t]() {
+                fe::graph::Graph g;
+                g.set_device_properties(dp);  // shared descriptor
+                results[t] = g.deserialize(blob).is_good() ? 1 : 0;
+            });
+        }
+        for (auto& th : threads) th.join();
+
+        for (int t = 0; t < kThreads; ++t) {
+            REQUIRE(results[t] == 1);
+        }
+    }
+#endif  // CUDNN_VERSION >= 90800
 }

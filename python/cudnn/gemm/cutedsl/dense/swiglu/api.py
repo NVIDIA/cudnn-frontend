@@ -7,8 +7,7 @@ from .dense_blockscaled_gemm_persistent_swiglu_interleaved_quant import (
     Sm100BlockScaledPersistentDenseGemmKernel,
 )
 from cuda.bindings import driver as cuda
-import torch
-from typing import Tuple, Optional
+from typing import Any, Tuple, Optional
 
 import cutlass
 import cutlass.cute as cute
@@ -16,26 +15,44 @@ from cutlass.cute.runtime import make_fake_stream
 
 from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.api_base import APIBase, TupleDict, ceil_div, is_power_of_2
+from cudnn.tensor_adapter import (
+    canonicalize_unit_dim_strides,
+    cuda_is_available,
+    default_stream,
+    detect_framework,
+    framework_dtype,
+    get_compute_capability,
+    get_shape,
+    get_strides,
+)
 import os
 
 
 class GemmSwigluSm100(APIBase):
+    """Persistent GEMM + SwiGLU for SM100.
+
+    Tensor parameters are type-erased: torch tensors and JAX arrays are both accepted
+    (the compiled kernels consume tensors via DLPack). torch is only imported when
+    torch tensors/dtypes are passed; likewise for JAX. Dtype parameters accept torch
+    dtypes, numpy/ml_dtypes dtypes, dtype name strings, or cutlass types.
+    """
+
     def __init__(
         self,
-        sample_a: torch.Tensor,
-        sample_b: torch.Tensor,
-        sample_ab12: torch.Tensor,
-        sample_c: torch.Tensor,
+        sample_a: Any,
+        sample_b: Any,
+        sample_ab12: Any,
+        sample_c: Any,
         alpha: float = 1.0,
-        acc_dtype: torch.dtype = torch.float32,
+        acc_dtype: Any = cutlass.Float32,
         mma_tiler_mn: Tuple[int, int] = (128, 128),
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         ### Quantize only arguments
-        sample_sfa: Optional[torch.Tensor] = None,
-        sample_sfb: Optional[torch.Tensor] = None,
-        sample_amax: Optional[torch.Tensor] = None,
-        sample_sfc: Optional[torch.Tensor] = None,
-        sample_norm_const: Optional[torch.Tensor] = None,
+        sample_sfa: Optional[Any] = None,
+        sample_sfb: Optional[Any] = None,
+        sample_amax: Optional[Any] = None,
+        sample_sfc: Optional[Any] = None,
+        sample_norm_const: Optional[Any] = None,
         sf_vec_size: int = 16,
         vector_f32: bool = False,
         ab12_stages: int = 4,
@@ -45,12 +62,12 @@ class GemmSwigluSm100(APIBase):
         self._warn_experimental_api()
         self._logger.debug("Entering __init__")
 
-        self.a_desc = self._make_tensor_desc(sample_a, name="sample_a")
-        self.b_desc = self._make_tensor_desc(sample_b, name="sample_b")
-        self.ab12_desc = self._make_tensor_desc(sample_ab12, name="sample_ab12")
-        self.c_desc = self._make_tensor_desc(sample_c, name="sample_c")
+        self.a_desc = self._make_tensor_desc(sample_a, name="sample_a", canonical=True)
+        self.b_desc = self._make_tensor_desc(sample_b, name="sample_b", canonical=True)
+        self.ab12_desc = self._make_tensor_desc(sample_ab12, name="sample_ab12", canonical=True)
+        self.c_desc = self._make_tensor_desc(sample_c, name="sample_c", canonical=True)
         self.alpha = alpha
-        self.acc_dtype = acc_dtype
+        self.acc_dtype = _convert_to_cutlass_data_type(acc_dtype)
         self.mma_tiler_mn = mma_tiler_mn
         if cluster_shape_mn is None:
             self.cluster_shape_mn = (1, 1) if not self.mma_tiler_mn[0] == 256 else (2, 2)
@@ -58,11 +75,11 @@ class GemmSwigluSm100(APIBase):
             self.cluster_shape_mn = cluster_shape_mn
 
         ### Quantize only arguments
-        self.sfa_desc = self._make_tensor_desc(sample_sfa, name="sample_sfa")
-        self.sfb_desc = self._make_tensor_desc(sample_sfb, name="sample_sfb")
-        self.sfc_desc = self._make_tensor_desc(sample_sfc, name="sample_sfc")
-        self.amax_desc = self._unpad_tensor_to_ndim(self._make_tensor_desc(sample_amax, name="sample_amax"), 1, "amax")
-        self.norm_const_desc = self._unpad_tensor_to_ndim(self._make_tensor_desc(sample_norm_const, name="sample_norm_const"), 1, "norm_const")
+        self.sfa_desc = self._make_tensor_desc(sample_sfa, name="sample_sfa", canonical=True)
+        self.sfb_desc = self._make_tensor_desc(sample_sfb, name="sample_sfb", canonical=True)
+        self.sfc_desc = self._make_tensor_desc(sample_sfc, name="sample_sfc", canonical=True)
+        self.amax_desc = self._unpad_tensor_to_ndim(self._make_tensor_desc(sample_amax, name="sample_amax", canonical=True), 1, "amax")
+        self.norm_const_desc = self._unpad_tensor_to_ndim(self._make_tensor_desc(sample_norm_const, name="sample_norm_const", canonical=True), 1, "norm_const")
         self.sf_vec_size = sf_vec_size
         self.vector_f32 = vector_f32
         self.ab12_stages = ab12_stages
@@ -98,12 +115,19 @@ class GemmSwigluSm100(APIBase):
         self._check_tensor_shape(self.c_desc, (m, n // 2, l), "C")
 
         if self._kernel is Sm100BlockScaledPersistentDenseGemmKernel:
+            # SF tensors are accepted in the torch-style logical atom view or the
+            # byte-identical physical C-contiguous shape (L, MN', K', 32, 4, 4) --
+            # frameworks with row-major-only layouts (e.g. JAX) cannot express the
+            # permuted logical view.
+            def sf_shapes(mn_div, k_div):
+                return [(32, 4, mn_div, 4, k_div, l), (l, mn_div, k_div, 32, 4, 4)]
+
             rest_k = ceil_div(ceil_div(k, self.sf_vec_size), 4)
-            self._check_tensor_shape(self.sfa_desc, (32, 4, ceil_div(m, 128), 4, rest_k, l), "SFA")
-            self._check_tensor_shape(self.sfb_desc, (32, 4, ceil_div(n, 128), 4, rest_k, l), "SFB")
+            self._check_tensor_shape(self.sfa_desc, sf_shapes(ceil_div(m, 128), rest_k), "SFA")
+            self._check_tensor_shape(self.sfb_desc, sf_shapes(ceil_div(n, 128), rest_k), "SFB")
             self._check_tensor_shape(self.amax_desc, (1,), "amax")
             rest_n2 = ceil_div(ceil_div(n // 2, self.sf_vec_size), 4)
-            self._check_tensor_shape(self.sfc_desc, (32, 4, ceil_div(m, 128), 4, rest_n2, l), "SFC")
+            self._check_tensor_shape(self.sfc_desc, sf_shapes(ceil_div(m, 128), rest_n2), "SFC")
             self._check_tensor_shape(self.norm_const_desc, (1,), "norm_const")
 
         _ = self._check_tensor_stride(self.a_desc, stride=[(1, m, m * k), (k, 1, m * k)])
@@ -120,45 +144,44 @@ class GemmSwigluSm100(APIBase):
             self.ab_dtype = self._check_dtype(
                 self.a_desc,
                 dtype=[
-                    torch.float16,
-                    torch.bfloat16,
-                    torch.float32,
-                    torch.float8_e4m3fn,
-                    torch.float8_e5m2,
+                    cutlass.Float16,
+                    cutlass.BFloat16,
+                    cutlass.Float32,
+                    cutlass.Float8E4M3FN,
+                    cutlass.Float8E5M2,
                 ],
                 name="A",
             )
-            match self.acc_dtype:
-                case torch.float32:
-                    self.ab12_dtype = self._check_dtype(
-                        self.ab12_desc,
-                        dtype=[
-                            torch.float32,
-                            torch.float16,
-                            torch.bfloat16,
-                            torch.float8_e4m3fn,
-                            torch.float8_e5m2,
-                        ],
-                        name="AB12 (for float32 acc_dtype)",
-                    )
-                    self._not_implemented_error_if(
-                        self._is_fp8(self.ab12_dtype),
-                        f"ab12_dtype {{torch.float8_e5m2, torch.float8_e4m3fn}} is currently disabled",
-                    )
-                case torch.float16:
-                    self.ab12_dtype = self._check_dtype(
-                        self.ab12_desc,
-                        dtype=[torch.float16, torch.bfloat16],
-                        name="AB12 (for float16 acc_dtype)",
-                    )
-                    self._check_dtype(
-                        self.a_desc,
-                        dtype=[torch.float16, torch.float8_e4m3fn, torch.float8_e5m2],
-                        name="A/B (for float16 acc_dtype)",
-                    )
-                case _:
-                    raise ValueError(f"Unsupported acc_dtype: expected one of {{torch.float32, torch.float16}}, got {self.acc_dtype}")
-            self.c_dtype = self._check_dtype(self.c_desc, dtype=[torch.float16, torch.bfloat16], name="C")
+            if self.acc_dtype is cutlass.Float32:
+                self.ab12_dtype = self._check_dtype(
+                    self.ab12_desc,
+                    dtype=[
+                        cutlass.Float32,
+                        cutlass.Float16,
+                        cutlass.BFloat16,
+                        cutlass.Float8E4M3FN,
+                        cutlass.Float8E5M2,
+                    ],
+                    name="AB12 (for float32 acc_dtype)",
+                )
+                self._not_implemented_error_if(
+                    self._is_fp8(self.ab12_dtype),
+                    f"ab12_dtype {{torch.float8_e5m2, torch.float8_e4m3fn}} is currently disabled",
+                )
+            elif self.acc_dtype is cutlass.Float16:
+                self.ab12_dtype = self._check_dtype(
+                    self.ab12_desc,
+                    dtype=[cutlass.Float16, cutlass.BFloat16],
+                    name="AB12 (for float16 acc_dtype)",
+                )
+                self._check_dtype(
+                    self.a_desc,
+                    dtype=[cutlass.Float16, cutlass.Float8E4M3FN, cutlass.Float8E5M2],
+                    name="A/B (for float16 acc_dtype)",
+                )
+            else:
+                raise ValueError(f"Unsupported acc_dtype: expected one of {{torch.float32, torch.float16}}, got {self.acc_dtype}")
+            self.c_dtype = self._check_dtype(self.c_desc, dtype=[cutlass.Float16, cutlass.BFloat16], name="C")
         elif self._kernel is Sm100BlockScaledPersistentDenseGemmKernel:
             self._value_error_if(
                 self.sfa_desc is None or self.sfb_desc is None,
@@ -168,37 +191,37 @@ class GemmSwigluSm100(APIBase):
             self.ab_dtype = self._check_dtype(
                 self.a_desc,
                 dtype=[
-                    torch.float4_e2m1fn_x2,
-                    torch.uint8,
-                    torch.float8_e5m2,
-                    torch.float8_e4m3fn,
+                    cutlass.Float4E2M1FN,
+                    cutlass.Uint8,
+                    cutlass.Float8E5M2,
+                    cutlass.Float8E4M3FN,
                 ],
                 name="A (for quantized GEMM swiglu kernel)",
             )
             self.acc_dtype = self._check_dtype(
                 self.acc_dtype,
-                dtype=torch.float32,
+                dtype=cutlass.Float32,
                 name="Accumulator (for quantized GEMM swiglu kernel)",
             )
             self.ab12_dtype = self._check_dtype(
                 self.ab12_desc,
                 dtype=[
-                    torch.float32,
-                    torch.float16,
-                    torch.bfloat16,
-                    torch.float8_e4m3fn,
-                    torch.float8_e5m2,
+                    cutlass.Float32,
+                    cutlass.Float16,
+                    cutlass.BFloat16,
+                    cutlass.Float8E4M3FN,
+                    cutlass.Float8E5M2,
                 ],
                 name="AB12 (for quantized GEMM swiglu kernel)",
             )
             self.c_dtype = self._check_dtype(
                 self.c_desc,
                 dtype=[
-                    torch.float32,
-                    torch.float16,
-                    torch.bfloat16,
-                    torch.float8_e4m3fn,
-                    torch.float8_e5m2,
+                    cutlass.Float32,
+                    cutlass.Float16,
+                    cutlass.BFloat16,
+                    cutlass.Float8E4M3FN,
+                    cutlass.Float8E5M2,
                 ],
                 name="C (for quantized GEMM swiglu kernel)",
             )
@@ -213,12 +236,12 @@ class GemmSwigluSm100(APIBase):
                 "sfc and norm_const must be provided when c_dtype is fp8",
             )
             self._value_error_if(
-                (self._is_fp4x2(self.ab_dtype) and self.c_dtype == torch.bfloat16) and (self.amax_desc is None),
+                (self._is_fp4x2(self.ab_dtype) and self.c_dtype is cutlass.BFloat16) and (self.amax_desc is None),
                 "amax must be provided when ab_dtype is fp4 and c_dtype is bf16",
             )
 
             self._not_implemented_error_if(
-                self.c_dtype == torch.float32 and self.ab12_dtype == torch.float32,
+                self.c_dtype is cutlass.Float32 and self.ab12_dtype is cutlass.Float32,
                 "float32 c_dtype and float32 ab12_dtype currently disabled due to kernel bug",
             )
 
@@ -228,7 +251,7 @@ class GemmSwigluSm100(APIBase):
             )
             self.sf_dtype = self._check_dtype(
                 self.sfa_desc,
-                dtype=[torch.float8_e8m0fnu, torch.float8_e4m3fn],
+                dtype=[cutlass.Float8E8M0FNU, cutlass.Float8E4M3FN],
                 name="SFA",
             )
             self._check_dtype(
@@ -245,12 +268,12 @@ class GemmSwigluSm100(APIBase):
             )
             if self._is_fp8(self.ab_dtype):
                 self._value_error_if(
-                    not (self.sf_dtype == torch.float8_e8m0fnu and self.sf_vec_size == 32),
+                    not (self.sf_dtype is cutlass.Float8E8M0FNU and self.sf_vec_size == 32),
                     "Invalid ab_dtype and sf_dtype/sf_vec_size combination: fp8 ab_dtype requires float8_e8m0fnu sf_dtype and 32 sf_vec_size",
                 )
             elif self._is_fp4x2(self.ab_dtype):
                 self._value_error_if(
-                    self.sf_dtype == torch.float8_e4m3fn and self.sf_vec_size == 32,
+                    self.sf_dtype is cutlass.Float8E4M3FN and self.sf_vec_size == 32,
                     "Invalid ab_dtype and sf_dtype/sf_vec_size combination: fp4 ab_dtype not supported with float8_e4m3fn sf_dtype and 32 sf_vec_size",
                 )
 
@@ -291,7 +314,7 @@ class GemmSwigluSm100(APIBase):
             else:
                 if self._is_fp8(self.ab_dtype):
                     self._value_error_if(
-                        self._is_fp8(self.c_dtype) or self._is_fp8(self.ab12_dtype) or self.ab12_dtype == torch.float32,
+                        self._is_fp8(self.c_dtype) or self._is_fp8(self.ab12_dtype) or self.ab12_dtype is cutlass.Float32,
                         "For MXFP8 inputs for blockscaled quantized GEMM swiglu kernel, ab12_dtype and c_dtype cannot be FP8. ab12_dtype also cannot be float32",
                     )
 
@@ -347,24 +370,20 @@ class GemmSwigluSm100(APIBase):
             )
 
         self._logger.debug("Checking environment")
-        if not torch.cuda.is_available():
+        if not cuda_is_available():
             raise RuntimeError("CUDA is not available")
-        device = torch.cuda.current_device()
-        major, minor = torch.cuda.get_device_capability(device)
+        major, minor = get_compute_capability()
         compute_capability = major * 10 + minor
         if compute_capability < 100:
-            raise RuntimeError(f"GemmSwiglu requires SM100+ compute capability, but found SM{compute_capability} on device {device}")
+            raise RuntimeError(f"GemmSwiglu requires SM100+ compute capability, but found SM{compute_capability} on the current device")
 
         self._is_supported = True
         self._logger.debug("check_support completed successfully")
         return True
 
-    def compile(self) -> None:
-        self._logger.debug("Entering compile")
+    def _compile_kernel(self):
+        """Compile the kernel and return the raw TVM-FFI callable."""
         self._ensure_support_checked()
-        if self._compiled_kernel is not None:
-            self._logger.debug("Kernel already compiled; skipping recompilation")
-            return
 
         if self._kernel is PersistentDenseGemmKernel:
             gemm_swiglu = self._kernel(
@@ -396,7 +415,7 @@ class GemmSwigluSm100(APIBase):
 
         if self._kernel is PersistentDenseGemmKernel:
             self._logger.debug("Compiling gemm_swiglu")
-            _compiled_kernel = cute.compile(
+            return cute.compile(
                 gemm_swiglu,
                 a=self._make_fake_cute_tensor_from_desc(self.a_desc),
                 b=self._make_fake_cute_tensor_from_desc(self.b_desc),
@@ -407,12 +426,40 @@ class GemmSwigluSm100(APIBase):
                 stream=fake_stream,
                 options="--enable-tvm-ffi",
             )
+        self._logger.debug("Compiling gemm_swiglu_blockscaled_quantized")
+        return cute.compile(
+            gemm_swiglu,
+            a_tensor=self._make_fake_cute_tensor_from_desc(self.a_desc, assumed_align=16),
+            b_tensor=self._make_fake_cute_tensor_from_desc(self.b_desc, assumed_align=16),
+            sfa_tensor=self._make_fake_cute_tensor_from_desc(self.sfa_desc, assumed_align=16),
+            sfb_tensor=self._make_fake_cute_tensor_from_desc(self.sfb_desc, assumed_align=16),
+            c_tensor=self._make_fake_cute_tensor_from_desc(self.c_desc, assumed_align=16),
+            ab12_tensor=self._make_fake_cute_tensor_from_desc(self.ab12_desc, assumed_align=8),
+            amax_tensor=self._make_fake_cute_tensor_from_desc(self.amax_desc, assumed_align=16),
+            sfc_tensor=self._make_fake_cute_tensor_from_desc(self.sfc_desc, assumed_align=16),
+            norm_const_tensor=self._make_fake_cute_tensor_from_desc(self.norm_const_desc, assumed_align=16),
+            alpha=self.alpha,
+            max_active_clusters=max_active_clusters,
+            stream=fake_stream,
+            options="--enable-tvm-ffi",
+        )
+
+    def compile(self) -> None:
+        self._logger.debug("Entering compile")
+        self._ensure_support_checked()
+        if self._compiled_kernel is not None:
+            self._logger.debug("Kernel already compiled; skipping recompilation")
+            return
+
+        _compiled_kernel = self._compile_kernel()
+
+        if self._kernel is PersistentDenseGemmKernel:
 
             def tensor_api(
-                a_tensor: torch.Tensor,
-                b_tensor: torch.Tensor,
-                ab12_tensor: torch.Tensor,
-                c_tensor: torch.Tensor,
+                a_tensor: Any,
+                b_tensor: Any,
+                ab12_tensor: Any,
+                c_tensor: Any,
                 alpha: float,
                 stream: cuda.CUstream,
             ) -> None:
@@ -427,34 +474,17 @@ class GemmSwigluSm100(APIBase):
 
             self._compiled_kernel = tensor_api
         elif self._kernel is Sm100BlockScaledPersistentDenseGemmKernel:
-            self._logger.debug("Compiling gemm_swiglu_blockscaled_quantized")
-            _compiled_kernel = cute.compile(
-                gemm_swiglu,
-                a_tensor=self._make_fake_cute_tensor_from_desc(self.a_desc, assumed_align=16),
-                b_tensor=self._make_fake_cute_tensor_from_desc(self.b_desc, assumed_align=16),
-                sfa_tensor=self._make_fake_cute_tensor_from_desc(self.sfa_desc, assumed_align=16),
-                sfb_tensor=self._make_fake_cute_tensor_from_desc(self.sfb_desc, assumed_align=16),
-                c_tensor=self._make_fake_cute_tensor_from_desc(self.c_desc, assumed_align=16),
-                ab12_tensor=self._make_fake_cute_tensor_from_desc(self.ab12_desc, assumed_align=8),
-                amax_tensor=self._make_fake_cute_tensor_from_desc(self.amax_desc, assumed_align=16),
-                sfc_tensor=self._make_fake_cute_tensor_from_desc(self.sfc_desc, assumed_align=16),
-                norm_const_tensor=self._make_fake_cute_tensor_from_desc(self.norm_const_desc, assumed_align=16),
-                alpha=self.alpha,
-                max_active_clusters=max_active_clusters,
-                stream=fake_stream,
-                options="--enable-tvm-ffi",
-            )
 
             def tensor_api(
-                a_tensor: torch.Tensor,
-                b_tensor: torch.Tensor,
-                ab12_tensor: torch.Tensor,
-                c_tensor: torch.Tensor,
-                sfa_tensor: Optional[torch.Tensor],
-                sfb_tensor: Optional[torch.Tensor],
-                amax_tensor: Optional[torch.Tensor],
-                sfc_tensor: Optional[torch.Tensor],
-                norm_const_tensor: Optional[torch.Tensor],
+                a_tensor: Any,
+                b_tensor: Any,
+                ab12_tensor: Any,
+                c_tensor: Any,
+                sfa_tensor: Optional[Any],
+                sfb_tensor: Optional[Any],
+                amax_tensor: Optional[Any],
+                sfc_tensor: Optional[Any],
+                norm_const_tensor: Optional[Any],
                 alpha: float,
                 stream: cuda.CUstream,
             ) -> None:
@@ -480,20 +510,23 @@ class GemmSwigluSm100(APIBase):
 
     def execute(
         self,
-        a_tensor: torch.Tensor,
-        b_tensor: torch.Tensor,
-        ab12_tensor: torch.Tensor,
-        c_tensor: torch.Tensor,
-        sfa_tensor: Optional[torch.Tensor] = None,
-        sfb_tensor: Optional[torch.Tensor] = None,
-        amax_tensor: Optional[torch.Tensor] = None,
-        sfc_tensor: Optional[torch.Tensor] = None,
-        norm_const_tensor: Optional[torch.Tensor] = None,
+        a_tensor: Any,
+        b_tensor: Any,
+        ab12_tensor: Any,
+        c_tensor: Any,
+        sfa_tensor: Optional[Any] = None,
+        sfb_tensor: Optional[Any] = None,
+        amax_tensor: Optional[Any] = None,
+        sfc_tensor: Optional[Any] = None,
+        norm_const_tensor: Optional[Any] = None,
         alpha: float = 1.0,
         current_stream: Optional[cuda.CUstream] = None,
     ) -> None:
         self._logger.debug("Entering execute")
-        current_stream = self._get_default_stream(current_stream)
+        if current_stream is None:
+            # torch inputs stay ordered with the caller's current torch stream;
+            # other frameworks (e.g. JAX) default to the CUDA legacy default stream.
+            current_stream = default_stream(detect_framework(a_tensor))
 
         self._runtime_error_if(
             self._compiled_kernel is None,
@@ -537,19 +570,19 @@ _cache_of_GemmSwigluSm100Objects = {}
 
 
 def gemm_swiglu_wrapper_sm100(
-    a_tensor: torch.Tensor,
-    b_tensor: torch.Tensor,
+    a_tensor: Any,
+    b_tensor: Any,
     alpha: float = 1.0,
     c_major: str = "n",
-    ab12_dtype: torch.dtype = torch.float32,
-    c_dtype: torch.dtype = torch.float16,
-    acc_dtype: torch.dtype = torch.float32,
+    ab12_dtype: Any = cutlass.Float32,
+    c_dtype: Any = cutlass.Float16,
+    acc_dtype: Any = cutlass.Float32,
     mma_tiler_mn: Tuple[int, int] = (128, 128),
     cluster_shape_mn: Optional[Tuple[int, int]] = None,
     ### Quantize only arguments
-    sfa_tensor: Optional[torch.Tensor] = None,
-    sfb_tensor: Optional[torch.Tensor] = None,
-    norm_const_tensor: Optional[torch.Tensor] = None,
+    sfa_tensor: Optional[Any] = None,
+    sfb_tensor: Optional[Any] = None,
+    norm_const_tensor: Optional[Any] = None,
     sf_vec_size: int = 16,
     vector_f32: bool = False,
     ab12_stages: int = 4,
@@ -557,55 +590,96 @@ def gemm_swiglu_wrapper_sm100(
 ) -> TupleDict:
 
     _logger.debug("gemm_swiglu_wrapper_sm100: Creating empty output tensors ab12 and c")
-    m, k, l = a_tensor.shape
-    n, k, l = b_tensor.shape
-    ab12_tensor, c_tensor = None, None
-    if c_major == "m":
-        ab12_tensor = torch.empty_strided((m, n, l), (1, m, m * n), dtype=ab12_dtype, device=a_tensor.device)
-        c_tensor = torch.empty_strided((m, n // 2, l), (1, m, m * n // 2), dtype=c_dtype, device=a_tensor.device)
-    elif c_major == "n":
-        ab12_tensor = torch.empty_strided((m, n, l), (n, 1, m * n), dtype=ab12_dtype, device=a_tensor.device)
-        c_tensor = torch.empty_strided(
-            (m, n // 2, l),
-            (n // 2, 1, m * n // 2),
-            dtype=c_dtype,
-            device=a_tensor.device,
-        )
-    else:
+    framework = detect_framework(a_tensor)
+    ab12_dtype = _convert_to_cutlass_data_type(ab12_dtype)
+    c_dtype = _convert_to_cutlass_data_type(c_dtype)
+    acc_dtype = _convert_to_cutlass_data_type(acc_dtype)
+    is_quantized = sfa_tensor is not None and sfb_tensor is not None
+    ab_cutlass_dtype = _convert_to_cutlass_data_type(a_tensor.dtype)
+
+    m, k, l = get_shape(a_tensor)
+    n, k, l = get_shape(b_tensor)
+    if c_major not in ("m", "n"):
         raise ValueError(f"c_major must be either 'm' or 'n', got {c_major}")
 
     sfc_tensor, amax_tensor = None, None
-    if sfa_tensor is not None and sfb_tensor is not None:
-        _logger.debug("gemm_swiglu_wrapper_sm100: Detected sfa_tensor and sfb_tensor, constructing quantized output tensors")
-        if c_dtype in {torch.float8_e5m2, torch.float8_e4m3fn}:
-            _logger.debug("gemm_swiglu_wrapper_sm100: Detected fp8 c_dtype, constructing sfc_tensor")
+    if framework == "torch":
+        import torch
 
-            sf_k = ceil_div(n // 2, sf_vec_size)
-            mma_shape = (
-                l,
-                ceil_div(m, 128),
-                ceil_div(sf_k, 4),
-                32,
-                4,
-                4,
-            )
-            mma_permute_order = (3, 4, 1, 5, 2, 0)
-            sfc_tensor = torch.empty(
-                mma_shape,
-                dtype=torch.float8_e8m0fnu,
+        if c_major == "m":
+            ab12_tensor = torch.empty_strided((m, n, l), (1, m, m * n), dtype=framework_dtype(ab12_dtype, "torch"), device=a_tensor.device)
+            c_tensor = torch.empty_strided((m, n // 2, l), (1, m, m * n // 2), dtype=framework_dtype(c_dtype, "torch"), device=a_tensor.device)
+        else:
+            ab12_tensor = torch.empty_strided((m, n, l), (n, 1, m * n), dtype=framework_dtype(ab12_dtype, "torch"), device=a_tensor.device)
+            c_tensor = torch.empty_strided(
+                (m, n // 2, l),
+                (n // 2, 1, m * n // 2),
+                dtype=framework_dtype(c_dtype, "torch"),
                 device=a_tensor.device,
-            ).permute(mma_permute_order)
-        if a_tensor.dtype in {torch.float4_e2m1fn_x2, torch.uint8} and c_dtype == torch.bfloat16:
-            _logger.debug("gemm_swiglu_wrapper_sm100: Detected fp4 ab_dtype and bf16 c_dtype, constructing amax_tensor")
-            amax_tensor = torch.full((1, 1, 1), -float("inf"), device=a_tensor.device, dtype=torch.float32)
+            )
+
+        if is_quantized:
+            _logger.debug("gemm_swiglu_wrapper_sm100: Detected sfa_tensor and sfb_tensor, constructing quantized output tensors")
+            if c_dtype in {cutlass.Float8E5M2, cutlass.Float8E4M3FN}:
+                _logger.debug("gemm_swiglu_wrapper_sm100: Detected fp8 c_dtype, constructing sfc_tensor")
+
+                sf_k = ceil_div(n // 2, sf_vec_size)
+                mma_shape = (
+                    l,
+                    ceil_div(m, 128),
+                    ceil_div(sf_k, 4),
+                    32,
+                    4,
+                    4,
+                )
+                mma_permute_order = (3, 4, 1, 5, 2, 0)
+                sfc_tensor = torch.empty(
+                    mma_shape,
+                    dtype=torch.float8_e8m0fnu,
+                    device=a_tensor.device,
+                ).permute(mma_permute_order)
+            if ab_cutlass_dtype in {cutlass.Float4E2M1FN, cutlass.Uint8} and c_dtype is cutlass.BFloat16:
+                _logger.debug("gemm_swiglu_wrapper_sm100: Detected fp4 ab_dtype and bf16 c_dtype, constructing amax_tensor")
+                amax_tensor = torch.full((1, 1, 1), -float("inf"), device=a_tensor.device, dtype=torch.float32)
+    elif framework == "jax":
+        import jax
+        import jax.numpy as jnp
+
+        if c_major == "m":
+            raise ValueError("JAX arrays are row-major; only c_major='n' is supported for JAX inputs")
+        if l != 1:
+            raise ValueError("JAX inputs must have batch dim L == 1; batch-outermost (L-major) layouts are not expressible as JAX arrays")
+        device = a_tensor.device
+        ab12_tensor = jnp.empty((m, n, l), dtype=framework_dtype(ab12_dtype, "jax"), device=device)
+        c_tensor = jnp.empty((m, n // 2, l), dtype=framework_dtype(c_dtype, "jax"), device=device)
+        outputs_to_sync = [ab12_tensor, c_tensor]
+        if is_quantized:
+            if c_dtype in {cutlass.Float8E5M2, cutlass.Float8E4M3FN}:
+                # SFC in the physical C-contiguous atom shape; the torch path's permuted
+                # logical view is byte-identical in memory
+                sf_k = ceil_div(n // 2, sf_vec_size)
+                sfc_tensor = jnp.empty(
+                    (l, ceil_div(m, 128), ceil_div(sf_k, 4), 32, 4, 4),
+                    dtype=framework_dtype(cutlass.Float8E8M0FNU, "jax"),
+                    device=device,
+                )
+                outputs_to_sync.append(sfc_tensor)
+            if ab_cutlass_dtype in {cutlass.Float4E2M1FN, cutlass.Uint8} and c_dtype is cutlass.BFloat16:
+                amax_tensor = jnp.full((1, 1, 1), -float("inf"), dtype=jnp.float32, device=device)
+                outputs_to_sync.append(amax_tensor)
+        # The kernel writes into these buffers on the launch stream; make sure XLA has
+        # finished materializing them before the kernel runs.
+        jax.block_until_ready(outputs_to_sync)
+    else:
+        raise ValueError(f"Unsupported tensor framework '{framework}' for gemm_swiglu_wrapper_sm100; pass torch tensors or JAX arrays")
 
     cache_key = (
-        a_tensor.shape,
-        b_tensor.shape,
-        a_tensor.dtype,
-        b_tensor.dtype,
-        a_tensor.stride(),
-        b_tensor.stride(),
+        get_shape(a_tensor),
+        get_shape(b_tensor),
+        ab_cutlass_dtype,
+        _convert_to_cutlass_data_type(b_tensor.dtype),
+        canonicalize_unit_dim_strides(get_shape(a_tensor), get_strides(a_tensor)),
+        canonicalize_unit_dim_strides(get_shape(b_tensor), get_strides(b_tensor)),
         alpha,
         c_major,
         ab12_dtype,
@@ -613,15 +687,15 @@ def gemm_swiglu_wrapper_sm100(
         acc_dtype,
         mma_tiler_mn,
         cluster_shape_mn,
-        sfa_tensor.shape if sfa_tensor is not None else None,
-        sfb_tensor.shape if sfb_tensor is not None else None,
-        sfa_tensor.stride() if sfa_tensor is not None else None,
-        sfb_tensor.stride() if sfb_tensor is not None else None,
-        sfa_tensor.dtype if sfa_tensor is not None else None,
-        sfb_tensor.dtype if sfb_tensor is not None else None,
-        norm_const_tensor.shape if norm_const_tensor is not None else None,
-        norm_const_tensor.stride() if norm_const_tensor is not None else None,
-        norm_const_tensor.dtype if norm_const_tensor is not None else None,
+        get_shape(sfa_tensor) if sfa_tensor is not None else None,
+        get_shape(sfb_tensor) if sfb_tensor is not None else None,
+        canonicalize_unit_dim_strides(get_shape(sfa_tensor), get_strides(sfa_tensor)) if sfa_tensor is not None else None,
+        canonicalize_unit_dim_strides(get_shape(sfb_tensor), get_strides(sfb_tensor)) if sfb_tensor is not None else None,
+        _convert_to_cutlass_data_type(sfa_tensor.dtype) if sfa_tensor is not None else None,
+        _convert_to_cutlass_data_type(sfb_tensor.dtype) if sfb_tensor is not None else None,
+        get_shape(norm_const_tensor) if norm_const_tensor is not None else None,
+        canonicalize_unit_dim_strides(get_shape(norm_const_tensor), get_strides(norm_const_tensor)) if norm_const_tensor is not None else None,
+        _convert_to_cutlass_data_type(norm_const_tensor.dtype) if norm_const_tensor is not None else None,
         sf_vec_size,
         vector_f32,
         ab12_stages,

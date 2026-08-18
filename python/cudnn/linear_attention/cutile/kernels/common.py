@@ -15,82 +15,240 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Small cuTile glue kernels shared by the chunked GDN/KDA pipelines.
+"""Helpers and small kernels shared by the chunked GDN/KDA cuTile pipelines.
 
-The pipeline hosts stitch their main kernels together with a handful of
-element-wise / reduction steps (gradient accumulation, leading-axis sums,
-dtype-converting copies, chunk-table building). These entries perform those
-steps as plain cuTile launches over DLPack/CAI device buffers with an
-explicit stream handle.
-
-``add_inplace`` / ``cast_copy`` treat buffers as FLAT contiguous element
-ranges (the callers own the shape bookkeeping) and take the element count
-explicitly; ``sum_leading`` takes a 2-D ``[r, m]`` view. Tile-tail loads are
-zero-padded and stores clip at the buffer extent.
+Every buffer reaching this module comes from an engine (a variant-pack operand
+or a workspace carve), so it is contiguous and needs no probing.
 """
 
+from types import SimpleNamespace
+
 import cuda.tile as ct
+from cuda.tile.tune import exhaustive_search
+
+from cudnn.frost.buffers import DTYPE_ITEMSIZE, DeviceView, current_device_id, dtype_name as dtname, memset_zero_async
 
 ConstInt = ct.Constant[int]
 
-_TILE = 2048
+TILE = 2048
 
 
-def _cdiv(a: int, b: int) -> int:
+# --- Host helpers ---------------------------------------------------------------------------------
+
+
+def next_power_of_2(n: int) -> int:
+    return 1 << (n - 1).bit_length()
+
+
+def cdiv(a: int, b: int) -> int:
     return (a + b - 1) // b
 
 
 def zero_fill(buf, *, stream) -> None:
-    """Stream-ordered zero of a whole contiguous buffer (any DLPack/CAI)."""
-    from cudnn.frost.buffers import DTYPE_ITEMSIZE, memset_zero_async, probe
-
-    ptr, shape, _strides, dtype, _dev = probe(buf)
-    n = DTYPE_ITEMSIZE[dtype]
-    for s_ in shape:
-        n *= int(s_)
-    memset_zero_async(ptr, n, stream)
+    """Stream-ordered zero of a whole contiguous buffer."""
+    memset_zero_async(buf.data_ptr(), int(buf.nbytes), stream)
 
 
-def reshaped(buf, shape):
-    """A ``shape``-d view of a contiguous device buffer: native ``reshape``
-    when the object has one (torch & co.), else a fresh DLPack view over the
-    same pointer (the kernels derive their index rank from the array rank)."""
-    if hasattr(buf, "reshape"):
-        return buf.reshape(*shape)
-    from cudnn.frost.buffers import DeviceView, probe
+def dummy(dtype_name: str, bufs):
+    """Inert typed view over the workspace's 16-byte ``dummy`` carve, for an
+    absent optional kernel arg. Always paired with a flag==0, never read."""
+    d = bufs["dummy"]
+    return DeviceView(d.data_ptr(), (16 // DTYPE_ITEMSIZE[dtype_name],), dtype_name, d.__dlpack_device__()[1])
 
-    ptr, _shape, _strides, dtype, dev = probe(buf)
-    return DeviceView(ptr, shape, dtype, dev)
+
+def opt(t, bufs, dtype_name: str = "float32"):
+    """``t`` if present, else an inert dummy: cuTile takes no None launch arg."""
+    if t is None:
+        return dummy(dtype_name, bufs)
+    return t
+
+
+# --- Launch tuning --------------------------------------------------------------------------------
+
+
+# Only the @ct.kernel launch hints (occupancy x num_worker_warps) are explored;
+# the grid, args and algorithm are unchanged, so tuning never moves numerics.
+launch_hint_cache: dict = {}
+
+
+def launch_hint_configs(occ_choices, nww_choices=(4, 8)):
+    """occupancy x num_worker_warps grid; deduped, default (occ=1,nww=4) first."""
+    seen = set()
+    cfgs = []
+    for occ in occ_choices:
+        for nww in nww_choices:
+            key = (occ, nww)
+            if key in seen:
+                continue
+            seen.add(key)
+            cfgs.append(SimpleNamespace(occupancy=occ, num_worker_warps=nww))
+    return cfgs
+
+
+def autotuned_launch(kernel, cache_key, grid, args, occ_choices=(1, 2, 3, 4), nww_choices=(4, 8), timeout=30, stream=None):
+    """Launch ``kernel`` with the best launch hints for ``cache_key``.
+
+    Tune-once/cache/launch over launch hints only (grid, args and signature are
+    fixed). Falls back to the base kernel when tuning fails or times out.
+    Default config (occ=1, nww=4) is explored first so a no-improvement shape
+    keeps the base behaviour. ``cache_key`` is qualified
+    by the kernel's own name, so two kernels sharing a key shape stay apart.
+    """
+    stream = 0 if stream is None else stream
+    cache_key = (getattr(getattr(kernel, "_pyfunc", None), "__name__", repr(kernel)), cache_key)
+    if cache_key not in launch_hint_cache:
+        tuned = None
+        try:
+            configs = launch_hint_configs(occ_choices, nww_choices)
+            with ct.compiler_timeout(timeout):
+                result = exhaustive_search(
+                    configs,
+                    stream,
+                    lambda cfg: grid,
+                    kernel,
+                    lambda cfg: args,
+                    lambda cfg: {"occupancy": cfg.occupancy, "num_worker_warps": cfg.num_worker_warps},
+                )
+            best = result.best.config
+            tuned = kernel.replace_hints(occupancy=best.occupancy, num_worker_warps=best.num_worker_warps)
+        except Exception:
+            tuned = None
+        launch_hint_cache[cache_key] = tuned
+
+    tuned = launch_hint_cache[cache_key]
+    if tuned is None:
+        ct.launch(stream, grid, kernel, args)
+    else:
+        ct.launch(stream, grid, tuned, args)
+
+
+# --- Device helpers -------------------------------------------------------------------------------
+
+
+def exp(x):
+    return ct.exp(ct.astype(x, ct.float32))
+
+
+def exp2(x):
+    return ct.exp2(ct.astype(x, ct.float32))
+
+
+def softplus(x):
+    # softplus: where(x <= 20, log1p(exp(x)), x)
+    return ct.where(x <= 20.0, ct.log(1.0 + ct.exp(x)), x)
+
+
+def tf32(a):
+    """ct.mma/ct.matmul do not auto-cast fp32 operands to tf32; cast
+    explicitly (allow-tf32 matmul semantics)."""
+    return ct.astype(a, ct.tfloat32) if a.dtype == ct.float32 else a
+
+
+def ct_min(a, b):
+    # scalar/tile min for runtime ints (builtin `min` is whitelisted; `hasattr` is not).
+    return min(a, b)
+
+
+# --- Kernels --------------------------------------------------------------------------------------
 
 
 @ct.kernel
-def _add_inplace_kernel(dst, src, TILE: ConstInt):
+def l2norm_fwd_kernel1(x, y, rstd, eps, D, BD: ConstInt):
+    # D > 512 path: one row per program, row length D.
+    i_t = ct.bid(0)
+    cols = ct.arange(BD, dtype=ct.int32)
+    mask = cols < D
+
+    b_x = ct.astype(ct.gather(x, (i_t, cols), mask=mask, check_bounds=False, padding_value=0.0), ct.float32)
+    b_rstd = ct.rsqrt(ct.sum(b_x * b_x) + eps)
+    b_y = b_x * b_rstd
+    ct.scatter(y, (i_t, cols), ct.astype(b_y, y.dtype), mask=mask, check_bounds=False)
+    ct.scatter(rstd, (i_t,), ct.astype(b_rstd, rstd.dtype))
+
+
+@ct.kernel
+def l2norm_fwd_kernel(x, y, rstd, eps, T, D: ConstInt, BD: ConstInt, BT: ConstInt):
+    # D <= 512 path: BT rows per block, BD power-of-2 cols. Block-aligned ->
+    # ct.load with block index + ZERO padding.
+    i_t = ct.bid(0)
+    b_x = ct.astype(ct.load(x, index=(i_t, 0), shape=(BT, BD), padding_mode=ct.PaddingMode.ZERO), ct.float32)
+    b_rstd = ct.rsqrt(ct.sum(b_x * b_x, axis=1) + eps)
+    b_y = b_x * b_rstd[:, None]
+    ct.store(y, index=(i_t, 0), tile=ct.astype(b_y, y.dtype))
+    ct.store(rstd, index=(i_t,), tile=ct.astype(b_rstd, rstd.dtype))
+
+
+@ct.kernel
+def l2norm_bwd_kernel1(y, rstd, dy, dy2, dx, eps, D, BD: ConstInt, HAS_DY2: ConstInt):
+    i_t = ct.bid(0)
+    cols = ct.arange(BD, dtype=ct.int32)
+    mask = cols < D
+
+    b_y = ct.astype(ct.gather(y, (i_t, cols), mask=mask, check_bounds=False, padding_value=0.0), ct.float32)
+    b_dy = ct.astype(ct.gather(dy, (i_t, cols), mask=mask, check_bounds=False, padding_value=0.0), ct.float32)
+    if HAS_DY2:
+        b_dy2 = ct.astype(ct.gather(dy2, (i_t, cols), mask=mask, check_bounds=False, padding_value=0.0), ct.float32)
+        # Preserve bf16 `dk.add_(dk2)` rounding before the fp32 normalization math.
+        b_dy = ct.astype(ct.astype(b_dy + b_dy2, dy.dtype), ct.float32)
+    b_rstd = ct.astype(ct.gather(rstd, (i_t,), check_bounds=False, padding_value=0.0), ct.float32).item()
+
+    b_dx = b_dy * b_rstd - ct.sum(b_dy * b_y) * b_y * b_rstd
+    ct.scatter(dx, (i_t, cols), ct.astype(b_dx, dx.dtype), mask=mask, check_bounds=False)
+
+
+@ct.kernel
+def l2norm_bwd_kernel(y, rstd, dy, dy2, dx, eps, T, D: ConstInt, BD: ConstInt, BT: ConstInt, HAS_DY2: ConstInt):
+    i_t = ct.bid(0)
+    b_y = ct.astype(ct.load(y, index=(i_t, 0), shape=(BT, BD), padding_mode=ct.PaddingMode.ZERO), ct.float32)
+    b_rstd = ct.astype(ct.load(rstd, index=(i_t,), shape=(BT,), padding_mode=ct.PaddingMode.ZERO), ct.float32)
+    b_dy = ct.astype(ct.load(dy, index=(i_t, 0), shape=(BT, BD), padding_mode=ct.PaddingMode.ZERO), ct.float32)
+    if HAS_DY2:
+        b_dy2 = ct.astype(ct.load(dy2, index=(i_t, 0), shape=(BT, BD), padding_mode=ct.PaddingMode.ZERO), ct.float32)
+        b_dy = ct.astype(ct.astype(b_dy + b_dy2, dy.dtype), ct.float32)
+    b_dot = ct.sum(b_dy * b_y, axis=1)
+    b_dx = b_dy * b_rstd[:, None] - b_dot[:, None] * b_y * b_rstd[:, None]
+    ct.store(dx, index=(i_t, 0), tile=ct.astype(b_dx, dx.dtype))
+
+
+@ct.kernel
+def fused_beta_sigmoid_fwd_kernel(x, y, scale, n_elements, BLOCK_SIZE: ConstInt):
+    pid = ct.bid(0)
+    offs = pid * BLOCK_SIZE + ct.arange(BLOCK_SIZE, dtype=ct.int32)
+    mask = offs < n_elements
+    b_x = ct.astype(ct.gather(x, offs, mask=mask, check_bounds=False, padding_value=0.0), ct.float32)
+    b_y = scale * (1.0 / (1.0 + ct.exp(-b_x)))
+    ct.scatter(y, offs, ct.astype(b_y, y.dtype), mask=mask, check_bounds=False)
+
+
+@ct.kernel
+def fused_beta_sigmoid_bwd_kernel(x, dy, dx, scale, n_elements, BLOCK_SIZE: ConstInt):
+    pid = ct.bid(0)
+    offs = pid * BLOCK_SIZE + ct.arange(BLOCK_SIZE, dtype=ct.int32)
+    mask = offs < n_elements
+    b_x = ct.astype(ct.gather(x, offs, mask=mask, check_bounds=False, padding_value=0.0), ct.float32)
+    b_dy = ct.astype(ct.gather(dy, offs, mask=mask, check_bounds=False, padding_value=0.0), ct.float32)
+    b_y = 1.0 / (1.0 + ct.exp(-b_x))
+    b_dx = b_dy * scale * b_y * (1.0 - b_y)
+    ct.scatter(dx, offs, ct.astype(b_dx, dx.dtype), mask=mask, check_bounds=False)
+
+
+@ct.kernel
+def add_inplace_kernel(dst, src, TILE: ConstInt):
     pid = ct.bid(0)
     a = ct.load(dst, index=(pid,), shape=(TILE,), padding_mode=ct.PaddingMode.ZERO)
     b = ct.load(src, index=(pid,), shape=(TILE,), padding_mode=ct.PaddingMode.ZERO)
     ct.store(dst, index=(pid,), tile=a + b)
 
 
-def add_inplace(dst, src, numel: int, *, stream) -> None:
-    """``dst += src`` over ``numel`` flat elements (same dtype, contiguous)."""
-    ct.launch(stream, (_cdiv(numel, _TILE),), _add_inplace_kernel, (dst, src, _TILE))
-
-
 @ct.kernel
-def _cast_copy_kernel(dst, src, TILE: ConstInt):
+def cast_copy_kernel(dst, src, TILE: ConstInt):
     pid = ct.bid(0)
     t = ct.load(src, index=(pid,), shape=(TILE,), padding_mode=ct.PaddingMode.ZERO)
     ct.store(dst, index=(pid,), tile=ct.astype(t, dst.dtype))
 
 
-def cast_copy(dst, src, numel: int, *, stream) -> None:
-    """``dst[:] = src`` over ``numel`` flat elements, converting to ``dst``'s
-    dtype (a plain copy when the dtypes already match)."""
-    ct.launch(stream, (_cdiv(numel, _TILE),), _cast_copy_kernel, (dst, src, _TILE))
-
-
 @ct.kernel
-def _sum_leading_kernel(dst, src, R: ConstInt, ACC: ConstInt, TILE: ConstInt):
+def sum_leading_kernel(dst, src, R: ConstInt, ACC: ConstInt, TILE: ConstInt):
     pid = ct.bid(0)
     acc = ct.astype(ct.load(src, index=(0, pid), shape=(1, TILE), padding_mode=ct.PaddingMode.ZERO), ct.float32)
     for r in range(1, R):
@@ -101,16 +259,8 @@ def _sum_leading_kernel(dst, src, R: ConstInt, ACC: ConstInt, TILE: ConstInt):
     ct.store(dst, index=(pid,), tile=ct.astype(acc, dst.dtype))
 
 
-def sum_leading(dst, src, r: int, m: int, *, stream, accumulate: bool = False) -> None:
-    """Reduce ``src`` (a 2-D ``[r, m]`` row-major buffer) over its leading
-    axis into ``dst`` (flat ``[m]``), accumulating in fp32.  ``r`` is a
-    compile-time constant (small fan-ins: split partials, head groups).
-    ``accumulate`` adds the reduction onto ``dst`` instead of overwriting."""
-    ct.launch(stream, (_cdiv(m, _TILE),), _sum_leading_kernel, (dst, src, r, int(accumulate), _TILE))
-
-
 @ct.kernel
-def _build_chunk_table_kernel(cu_seqlens, table, count, offsets, N: ConstInt, CS: ConstInt, BOUND: ConstInt):
+def build_chunk_table_kernel(cu_seqlens, table, count, offsets, N: ConstInt, CS: ConstInt, BOUND: ConstInt):
     run = 0
     last = N - 1
     ct.store(offsets, (0,), 0)
@@ -125,33 +275,18 @@ def _build_chunk_table_kernel(cu_seqlens, table, count, offsets, N: ConstInt, CS
             last = n
         run = run + nc
         ct.store(offsets, (n + 1,), run)
-    # sentinel tail: (last_nonempty_seq, BOUND) decodes to a token range
-    # starting at or past the packed end (BOUND * CS >= total), so a consumer
-    # launched at the bound grid loads zero-padding and its stores clip — no
-    # guard needed in the consuming kernels. The sentinel must reference a
-    # NONEMPTY sequence: a zero-length one turns seq-derived divisors to
-    # zero inside consumers (device trap).
+    # Sentinel tail: (last_nonempty_seq, BOUND) decodes to a token range at or
+    # past the packed end, so a consumer gridded at BOUND loads zero-padding
+    # and its stores clip. It must name a NONEMPTY sequence -- a zero-length
+    # one turns seq-derived divisors to zero inside consumers (device trap).
     for j in range(run, BOUND):
         ct.store(table, (j * 2,), last)
         ct.store(table, (j * 2 + 1,), BOUND)
     ct.store(count, (0,), run)
 
 
-def build_chunk_table(table, count, offsets, cu_seqlens, n_seqs: int, chunk_size: int, bound: int, *, stream) -> None:
-    """Build the per-chunk ``(sequence, intra_chunk)`` index table ON DEVICE
-    from ``cu_seqlens`` — no host round-trip, so the launch stays async and
-    capture-safe.  ``table`` is a flat int32 buffer of ``2 * bound`` entries
-    (``bound = cdiv(total, chunk_size) + n_seqs``, shape-derived); rows past
-    the real chunk count are filled with an inert sentinel whose decoded
-    token range lies at/past the packed end, so consumers may launch their
-    chunk grids at ``bound`` unchanged.  ``count`` (one int32) receives the
-    real chunk count; ``offsets`` (int32 ``[n_seqs + 1]``) receives the
-    per-sequence chunk prefix (``prepare_chunk_offsets`` semantics)."""
-    ct.launch(stream, (1,), _build_chunk_table_kernel, (cu_seqlens, reshaped(table, (2 * bound,)), count, offsets, n_seqs, chunk_size, bound))
-
-
 @ct.kernel
-def _head_group_sum_kernel(dst, src, G: ConstInt, BT: ConstInt, BK: ConstInt):
+def head_group_sum_kernel(dst, src, G: ConstInt, BT: ConstInt, BK: ConstInt):
     t = ct.bid(0)
     h = ct.bid(1)
     k = ct.bid(2)
@@ -161,9 +296,146 @@ def _head_group_sum_kernel(dst, src, G: ConstInt, BT: ConstInt, BK: ConstInt):
     ct.store(dst, index=(t, h, k), tile=ct.astype(acc, dst.dtype))
 
 
+# --- Launchers ------------------------------------------------------------------------------------
+
+
+BETA_SIGMOID_BLOCK_SIZE = 2048
+
+# l2norm is a memory-bound row reduction (each row loaded once, reduced,
+# written once), so higher occupancy hides DRAM latency; do not force occ=1.
+L2NORM_TUNE_OCC = (1, 2, 4, 8)
+
+
+def l2norm_fwd(x, eps: float = 1e-6, out=None, rstd_out=None, stream=None):
+    stream = 0 if stream is None else stream
+    x_shape_og = x.shape
+    x = x.reshape((-1, x.shape[-1]))
+    y = out.reshape(tuple(x.shape))
+    T, D = x.shape[0], x.shape[-1]
+    MAX_FUSED_SIZE = 65536 // x.element_size()
+    BD = min(MAX_FUSED_SIZE, next_power_of_2(D))
+    rstd = rstd_out.reshape((T,))
+    if D <= 512:
+        BT = 32
+        grid = (cdiv(T, BT),)
+        autotuned_launch(
+            l2norm_fwd_kernel,
+            ("l2norm_fwd_kernel", D, BD, BT, str(x.dtype), current_device_id()),
+            grid,
+            (x, y, rstd, float(eps), T, D, BD, BT),
+            occ_choices=L2NORM_TUNE_OCC,
+            nww_choices=(4,),
+            stream=stream,
+        )
+    else:
+        ct.launch(stream, (T,), l2norm_fwd_kernel1, (x, y, rstd, float(eps), D, BD))
+    return y.view(x_shape_og), rstd.view(x_shape_og[:-1])
+
+
+def l2norm_bwd(
+    y,
+    rstd,
+    dy,
+    eps: float = 1e-6,
+    dy2=None,
+    out=None,
+    bufs=None,
+    stream=None,
+):
+    stream = 0 if stream is None else stream
+    y_shape_og = y.shape
+    y = y.reshape(-1, dy.shape[-1])
+    dy = dy.reshape(-1, dy.shape[-1])
+    dy2_arg = dy2.reshape(-1, dy.shape[-1]) if dy2 is not None else dummy(dtname(dy), bufs)
+    dx = out.reshape(tuple(y.shape))
+    T, D = y.shape[0], y.shape[-1]
+    MAX_FUSED_SIZE = 65536 // y.element_size()
+    BD = min(MAX_FUSED_SIZE, next_power_of_2(D))
+    rstd_flat = rstd.reshape(-1)
+    if D <= 512:
+        BT = 32
+        grid = (cdiv(T, BT),)
+        autotuned_launch(
+            l2norm_bwd_kernel,
+            ("l2norm_bwd_kernel", D, BD, BT, str(y.dtype), int(dy2 is not None), current_device_id()),
+            grid,
+            (y, rstd_flat, dy, dy2_arg, dx, float(eps), T, D, BD, BT, int(dy2 is not None)),
+            occ_choices=L2NORM_TUNE_OCC,
+            nww_choices=(4,),
+            stream=stream,
+        )
+    else:
+        ct.launch(
+            stream,
+            (T,),
+            l2norm_bwd_kernel1,
+            (y, rstd_flat, dy, dy2_arg, dx, float(eps), D, BD, int(dy2 is not None)),
+        )
+    return dx.view(y_shape_og)
+
+
+def fused_beta_sigmoid_fwd(x, scale: float = 1.0, out=None, stream=None):
+    stream = 0 if stream is None else stream
+    y = out.reshape(tuple(x.shape))
+    n = x.numel()
+    grid = (cdiv(n, BETA_SIGMOID_BLOCK_SIZE),)
+    ct.launch(
+        stream,
+        grid,
+        fused_beta_sigmoid_fwd_kernel,
+        (x.reshape((-1,)), y.reshape(-1), float(scale), n, BETA_SIGMOID_BLOCK_SIZE),
+    )
+    return y
+
+
+def fused_beta_sigmoid_bwd(x, dy, scale: float = 1.0, out=None, stream=None):
+    stream = 0 if stream is None else stream
+    dx = out.reshape(tuple(x.shape))
+    n = x.numel()
+    grid = (cdiv(n, BETA_SIGMOID_BLOCK_SIZE),)
+    ct.launch(
+        stream,
+        grid,
+        fused_beta_sigmoid_bwd_kernel,
+        (x.reshape((-1,)), dy.reshape((-1,)), dx.reshape(-1), float(scale), n, BETA_SIGMOID_BLOCK_SIZE),
+    )
+    return dx
+
+
+def fused_beta_sigmoid(x, scale: float = 1.0, out=None, stream=None):
+    """Fused ``scale * sigmoid(x)`` (fp32, written to ``out``)."""
+    stream = 0 if stream is None else stream
+    return fused_beta_sigmoid_fwd(x, scale, out=out, stream=stream)
+
+
+def add_inplace(dst, src, numel: int, *, stream) -> None:
+    """``dst += src`` over ``numel`` flat elements (same dtype, contiguous)."""
+    ct.launch(stream, (cdiv(numel, TILE),), add_inplace_kernel, (dst, src, TILE))
+
+
+def cast_copy(dst, src, numel: int, *, stream) -> None:
+    """``dst[:] = src`` over ``numel`` flat elements, converting to ``dst``'s dtype."""
+    ct.launch(stream, (cdiv(numel, TILE),), cast_copy_kernel, (dst, src, TILE))
+
+
+def sum_leading(dst, src, r: int, m: int, *, stream, accumulate: bool = False) -> None:
+    """Reduce ``src`` ``[r, m]`` over its leading axis into ``dst`` ``[m]`` in
+    fp32. ``r`` is compile-time (split partials, head groups); ``accumulate``
+    adds onto ``dst`` instead of overwriting."""
+    ct.launch(stream, (cdiv(m, TILE),), sum_leading_kernel, (dst, src, r, int(accumulate), TILE))
+
+
+def build_chunk_table(table, count, offsets, cu_seqlens, n_seqs: int, chunk_size: int, bound: int, *, stream) -> None:
+    """Build the per-chunk ``(sequence, intra_chunk)`` index table ON DEVICE, so
+    the launch stays async and capture-safe. ``table`` holds ``2 * bound``
+    int32s; rows past the real chunk count get the inert sentinel above, so
+    consumers may grid at ``bound``. ``count`` receives the real chunk count,
+    ``offsets`` the per-sequence chunk prefix."""
+    ct.launch(stream, (1,), build_chunk_table_kernel, (cu_seqlens, table.reshape((2 * bound,)), count, offsets, n_seqs, chunk_size, bound))
+
+
 def head_group_sum(dst, src, t: int, h: int, g: int, k: int, *, stream) -> None:
-    """Grouped-head reduction ``dst[t, h, :] = sum_g src[t, h*g + g', :]``:
-    ``src`` is a 3-D ``[t, h*g, k]`` buffer, ``dst`` 3-D ``[t, h, k]``;
-    fp32 accumulation, ``g`` consecutive heads per group (compile-time)."""
+    """``dst[t, h, :] = sum_g src[t, h*g + g', :]`` in fp32, ``g`` consecutive
+    heads per group (compile-time)."""
     BT, BK = 64, 128  # padded loads + clipped stores absorb ragged t/k
-    ct.launch(stream, (_cdiv(t, BT), h, _cdiv(k, BK)), _head_group_sum_kernel, (dst, src, g, BT, BK))
+    ct.launch(stream, (cdiv(t, BT), h, cdiv(k, BK)), head_group_sum_kernel, (dst, src, g, BT, BK))

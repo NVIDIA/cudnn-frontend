@@ -80,15 +80,148 @@ create_execution_plans([heur_mode.A, ...])                    _pygraph.py
 - `BaseEngine`: `check_support(graph)` (accept, or decline by raising),
   `build_plan(graph, plan, ctx) → CompiledPlan` (the expensive
   JIT step, once per graph/plan, cached on the graph),
-  `CompiledPlan.execute(graph, uid_to_data, ExecutionContext)` with explicit
-  handle/stream/workspace/overrides. `uid_to_data` is the caller's variant
-  pack, exactly as the classic backend receives it; engines that address
-  buffers by port name call `resolve_node_buffers(graph, uid_to_data)`
-  (`engines/base.py`), which joins the pack with each node's wired ports —
-  strict missing-buffer validation, torch tensors detached once (DLPack/CAI
-  refuse `requires_grad` export) — into per-node `NodeBuffers`
-  (`{port_name: caller buffer}`). Simple eager engines implement
-  `execute()` only.
+  `CompiledPlan.execute(graph, operands, ExecutionContext)` with explicit
+  handle/stream/workspace. Dynamic-shape overrides are a backend-path feature:
+  a python plan is compiled for the shapes the graph declared, so `execute()`
+  refuses them rather than silently running a different problem. Simple eager
+  engines implement `execute()` only.
+
+#### The variant pack is normalized once
+
+`graph.execute()` converts whatever the caller passed — a torch tensor, a
+`DeviceView`, any `__dlpack__` / `__cuda_array_interface__` producer, or a bare
+device address — into a `VariantPack` at the top, and everything below reads that.
+**Do not add a branch on what the caller's object is.** This exists because
+there used to be two such branches: the backend path accepted a bare address
+(`_native_var_pack`'s `if type(d) is int: return d`) while an engine got the
+object untouched and `frost.buffers.probe` refused it. One public call, two
+answers, decided by which plan the heuristics happened to pick — which the
+caller does not control.
+
+`VariantPack` carries the caller-filled uids ascending and the operands
+themselves, held in a C type (`pygraph/variant_pack.cpp`) as one `DLTensor`
+each. That type both consumes `__dlpack_c_exchange_api__` — the C function
+table a producer publishes on its type, which is how one crossing reads the
+whole pack — and implements it, so a kernel reads an operand through the same
+fast path it has for a framework tensor. `address` is the pointer array
+`_execute_with_raw_ptrs` takes.
+
+The pack's vocabulary distinguishes the position from the thing at it:
+`pack.index_of(tensor_or_uid)` gives an operand's POSITION, and
+`pack.operands(indices)` turns positions into `OperandBuffer`s — one caller
+buffer described (pointer, shape, stride, dtype), non-owning. Resolve positions
+once; ask for buffers per call.
+
+Each operand's OWN dim/stride/data_type is what the pack holds, deliberately
+not the graph's declaration: the two may differ and one engine relies on it —
+`frost_gemm` takes its M/N/K from the buffers, so a plan built for one problem
+size runs another bit-exactly. **Read the IR port for the shape the plan was
+built for; read the pack for the shape about to run.**
+
+Two rules that are easy to break by accident:
+
+- **The pointer array is per call.** Two threads may execute one graph
+  concurrently with different buffers. A shared array hands each thread the
+  other's pointers, and each pointer in it is individually valid, so the failure
+  is a wrong number rather than a raise.
+- **The operand order has exactly one source, never a union.** The lowered
+  graph's variant-pack template when the graph has one — only C++ sees every
+  user slot, since a tensor's `ragged_offset` is an operand but hangs off the
+  `Tensor` rather than off a node port, and the slots the graph fills itself
+  (pass-by-value scalars, slice replacement destinations, workspace
+  modifications) must be excluded. The python IR only for the python-only ops
+  that never lower. The two sides do not have to agree: each indexes the layout
+  it was handed.
+
+`is_virtual` on a python-only graph does not mean "the caller supplies
+nothing" — it is a statement about the backend's lowering, and a gdn graph marks
+its own `O` virtual while the caller passes a buffer for it. So the layout there
+is every wired port, and an unfilled slot is an optional port the caller did not
+request.
+
+`CompiledPlan.takes_variant_pack` is the migration flag. An engine that has not
+set it still receives the caller's `{uid: buffer}` map and reaches ports through
+`resolve_node_buffers`; the flag and that function both go once the last engine
+has moved. `execute()` builds the `Tensor`s only for a plan that sets the flag —
+measured, normalizing for a plan that will not read the result costs more than
+it saves.
+
+#### What a per-execute path costs
+
+An engine owns its internals, and this section does not change that. It exists
+because the default outcome is expensive: an engine that re-derives its per-call
+facts lands around **40 µs of host time per execute**, and for a single-kernel
+op that is most of what the caller pays. The same kernel with those facts read
+once is **20**. Both numbers are `frost_gemm` at 256×256×128 bf16, host
+enqueue, min over 25 reps of a 64-call burst from a drained queue.
+
+The budget it has to fit in, all measured on SM100:
+
+| | µs |
+|---|---|
+| `cuLaunchKernelEx`, untraced | 1.85 |
+| one CuTe-DSL entry | ~3.6 |
+| `graph.execute()` entry + `_normalize` | ~8 |
+| **everything else is the engine's** | |
+
+Do not read a per-call cost out of an nsys trace: CUPTI adds ~2.2 µs per traced
+API call, which is more than the call.
+
+**Split the facts by when they are decided.** Operand roles and majors, packing
+factors, alignment requirements, output shape rules, which outputs need a seed —
+all fixed when the kernel compiled. M/N/K, strides and pointers arrive per call.
+Read the first set into a table at build (`gemm/frost/recipe.py` is the worked
+example) and let the call read the table. That alone is 44 → 35.
+
+**Then lower the table into one closure per plan**, with its constants captured
+and the operand structure flattened into the loop headers, so the call does no
+attribute lookup and takes no branch the build already settled. That is 35 → 20.
+Two rules make it safe:
+
+- **The lowered path never raises, and it is the only path that runs.** What it
+  refuses it hands to a checker that reads the same table, names the rule and
+  raises — it launches nothing. A graph the closure cannot serve at all is
+  declined when the engine is asked to support it, so it goes to the backend
+  rather than to a second executor.
+- **So a refusal is the answer, not a slower route.** The set of calls the
+  closure refuses should equal the set of illegal calls; a legal call it will
+  not serve is a bug. Keeping a reference executor instead would buy a
+  differential that catches divergence but never a misconception the two share —
+  which is exactly how an axis-order bug survived one here. The tests that
+  matter are against intended semantics and against the BACKEND, at the shapes
+  where two encodings coincide.
+
+**A loop over a flat table gets almost all of it, so do not hand-unroll per
+flavor.** Measured three ways on the same plan and buffers: interpreting the
+table 35.8, looping over it flattened 19.7, a hand-written straight line with the
+structure unrolled 17.5. The loop is worth 45%; unrolling adds 12% and costs one
+closure body per operand shape — six flavors, six bodies to keep in agreement.
+One loop over `arg_plan` (the launch argument order as data) serves aux, extra
+outputs, multi-GEMM and block scale at 22 µs each, down from 39–50. Source
+codegen off the same table is how to buy the last 12% back later, for every
+flavor at once rather than for the one that was worth hand-writing.
+
+This is a pattern to copy, not a framework to import. Sharing the code across
+engines would couple their kernels' ABIs, which is the thing engine autonomy
+buys; sharing the shape of the solution costs nothing.
+
+**Costs that are easy to miss, each measured:**
+
+- A `from x import y` inside a per-call function: **1.1 µs**. It was 65% of
+  what `_check_plan_device` cost.
+- `torch.Tensor.permute()`: **1.4 µs** per call, per operand.
+- Rebuilding a `{id(tensor): buffer}` map to look operands back up, when the
+  operand order was settled at build and a list index would do.
+- Recomputing a pure function of values every call. `tensor_alignment`'s
+  layout half is **1.5 µs** and memoizes on `(shape, stride, elem_bytes)` —
+  values, so there is nothing to invalidate; only the pointer half is per call.
+- Reading an operand through the exchange vtable is **0.08 µs** against 1.5 for
+  the python attribute walk. Framework neutrality is not what costs.
+
+**Measure from a drained queue, and sweep the burst size.** A number that is
+flat in the burst size is host-bound; one that climbs with it is the device
+rate, and back-to-back timing reads the device rate whenever host and device
+are close.
 - **An engine does not propose its own plans.** Which configs to try, in what
   order, and where the backend's entries belong is one comparison across every
   candidate, and no engine can make it from the inside — it sees neither its
@@ -120,18 +253,27 @@ create_execution_plans([heur_mode.A, ...])                    _pygraph.py
   THD-only: token-packed `[total_T, heads, dim]` tensors with a required
   `cu_seqlens` (a dense batch is `[0, T, 2T, ...]`). `gdn_bwd` takes the
   forward inputs plus `dO` (and optionally `d_final_state`) and produces
-  `dQ/dK/dV/dG/dBeta` (+ `d_initial_state` iff `initial_state` is given);
+  `dQ/dK/dV/dG/dBeta` (+ `d_initial_state` iff `initial_state` is given,
+  + `d_a_log`/`d_dt_bias` iff the node carries `safe_gate` — the gate
+  transform's parameter gradients, with `dG`/`dBeta` then in raw-logit
+  space under `safe_gate`/`use_beta_sigmoid`);
   the cumulative gate and intra-chunk WY matrix are recomputed inside the
   engine, so the graph contract carries no forward intermediates. Both are
   python-engine-only ops: they have no cuDNN backend lowering, so routing
   them to the backend entry raises `cudnnGraphNotSupportedError` at
-  lowering. The kernels live in `cudnn.linear_attention.cutile.kernels.gdn_chunk_cutile`;
+  lowering. The kernels live in `cudnn.linear_attention.cutile.kernels.gdn`;
   the torch custom op `cudnn.linear_attention.ops.gated_delta_net` is a thin
   adapter that builds and executes cached `gdn`/`gdn_bwd` graphs (the SDPA
   op pattern), so it inherits whatever engine the planner selects. The
   optional `use_qk_l2norm` attribute asks the engine to L2-normalize the q/k
-  rows in-kernel; `GdnFrostEngine` (the SM100/SM103 forward default) declines
-  such graphs, the cuTile engine serves them.
+  rows; `GdnFrostEngine` (the SM100/SM103 default, serving both `gdn` and
+  `gdn_bwd` on the FROST chunked kernels) serves it through a workspace
+  helper kernel (normalized q/k copies + saved inverse norms, with the
+  backward Jacobian projection applied in place after the head-group fold),
+  and likewise serves `safe_gate` (in-kernel raw-logit gate transform, with
+  `d_a_log`/`d_dt_bias` produced by a deterministic reduction helper) and
+  `use_beta_sigmoid`; the cuTile engine remains the fallback for non-128
+  head dims.
 - `KdaFrostEngine` / `KdaCuTileEngine` do the same for the single-node
   `kda` / `kda_bwd` ops (Kimi Delta Attention). KDA is GDN with a
   per-key-channel decay: its `g` is the log-space vector gate
@@ -140,22 +282,25 @@ create_execution_plans([heur_mode.A, ...])                    _pygraph.py
   the forward default on SM100/SM103; the node's `use_qk_l2norm` attribute
   (in-kernel L2-normalization of q/k — the KDA model's feature map) passes
   through to the kernel (without the in-kernel norm the caller owns the q/k
-  conditioning). It declines `kda_bwd` (its backward
-  kernel is a stub), so gradients route to the cuTile engine
-  (`cudnn.linear_attention.cutile.kernels.kda_chunk_cutile`); the torch op
-  is `cudnn.linear_attention.ops.kimi_delta_attention`.
+  conditioning). It serves `kda_bwd` on the FROST backward kernel,
+  regenerating the per-chunk state checkpoints with a recompute pass when
+  the graph does not provide them; the cuTile engine
+  (`cudnn.linear_attention.cutile.kernels.kda`) is the
+  fallback slot. The torch op is
+  `cudnn.linear_attention.ops.kimi_delta_attention`.
 - Gated DeltaNet v2 (`gdn2` / `gdn2_bwd`) has channel-wise gates — `g`/`beta`
   `[total_T, HO, K]` plus a NEW per-value write gate `w` `[total_T, HO, V]`.
   GDN-2 has **no** cuTile engine; `Gdn2FrostEngine`
   (`cudnn.linear_attention.frost.gdn2_engine`, SM100/SM103) is its only
   engine, passes the `use_qk_l2norm` attribute through to the kernel (like
-  `KdaFrostEngine`), and declines `gdn2_bwd` (stub backward kernel), so the
-  op (`cudnn.linear_attention.ops.gated_delta_net_v2`) is forward-only for
-  now.
+  `KdaFrostEngine`), and serves `gdn2_bwd` the same way (checkpoint
+  recompute when the series is absent); the op is
+  `cudnn.linear_attention.ops.gated_delta_net_v2`.
 - The FROST engines are pure pass-through: `check_support` requires the
   kernel-native dtypes (fp32 gates — io-dtype `beta`/`w` for GDN-2 — int32
-  `cu_seqlens`, fp32-or-bf16 state ports with matching initial/final dtypes,
-  fp32 state gradients) and execute hands the caller's buffers straight to
+  or int64 `cu_seqlens`, fp32-or-bf16 state ports with matching
+  initial/final dtypes, fp32 state gradients for GDN/KDA and io-dtype
+  `dBeta`/`dW` for GDN-2) and execute hands the caller's buffers straight to
   the kernels, carving any scratch it needs out of the explicit workspace as
   DLPack views. The cuTile engines follow the same buffer contract: outputs
   are written in place (the caller's output buffers, required in the

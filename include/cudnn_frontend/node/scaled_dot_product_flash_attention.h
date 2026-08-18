@@ -498,6 +498,25 @@ class SDPANodeBase : public NodeCRTP<DerivedT> {
 
         CUDNN_FE_VALIDATE_STRIDE(output_names::O, attributes.outputs);
 
+        // Non-ragged Stats layouts other than packed BHSD are not correctly supported prior to 9.26.0.
+        // Runs post shape inference so that an unset Stats layout (always inferred as packed BHSD)
+        // is not rejected.
+        auto const& stats_out = attributes.outputs.find(output_names::Stats);
+        bool const has_stats  = (stats_out != attributes.outputs.end()) && (stats_out->second != nullptr);
+        if (has_stats && !stats_out->second->get_ragged_offset() && detail::get_backend_version() < 92600) {
+            auto const& stats_dim           = stats_out->second->get_dim();
+            auto const& stats_stride        = stats_out->second->get_stride();
+            bool const stats_is_packed_bhsd = stats_dim.size() == 4 && stats_stride.size() == 4 &&
+                                              stats_stride[3] == 1 && stats_stride[2] == stats_dim[3] &&
+                                              stats_stride[1] == stats_dim[2] * stats_dim[3] &&
+                                              stats_stride[0] == stats_dim[1] * stats_dim[2] * stats_dim[3];
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                !stats_is_packed_bhsd,
+                error_code_t::GRAPH_NOT_SUPPORTED,
+                "For cuDNN version below 9.26.0, a non-ragged Stats output must be a packed BHSD "
+                "tensor.");
+        }
+
 #undef CUDNN_FE_VALIDATE_STRIDE
 
         return {error_code_t::OK, ""};
@@ -1406,15 +1425,32 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
             is_deterministic_algorithm_supported_on_blackwell = true;
         }
 
-        if(detail::get_backend_version() >= 91801) {
+        if (detail::get_backend_version() >= 91801) {
             RETURN_CUDNN_FRONTEND_ERROR_IF(is_ragged && (8 == prop_major || 12 == prop_major) && attributes.is_deterministic_algorithm,
                                         error_code_t::GRAPH_NOT_SUPPORTED,
                                         "Deterministic algorithm is not supported for bprop thd on SM8X and SM12X GPUs");
 
-	    RETURN_CUDNN_FRONTEND_ERROR_IF(is_ragged && (8 == prop_major || 12 == prop_major) && attributes.inputs[input_names::Stats]->get_ragged_offset(),
+            RETURN_CUDNN_FRONTEND_ERROR_IF(is_ragged && (8 == prop_major || 12 == prop_major) && attributes.inputs[input_names::Stats]->get_ragged_offset(),
                                         error_code_t::GRAPH_NOT_SUPPORTED,
                                         "Packed/ragged LSE is not supported for bprop thd on SM8X and SM12X GPUs");
-	}
+        }
+
+        // Non-ragged layouts other than BHSD are not correctly supported prior to 9.26.0.
+        // TODO: move to sdpa_support_surface.h (where the forward twin of this check lives)
+        // once the backward path grows a SDPA_backward_attributes support surface there —
+        // today that file serves only the forward attributes.
+        if (detail::get_backend_version() < 92600 && !attributes.inputs.at(input_names::Stats)->get_ragged_offset()) {
+            auto const& stats_dim    = attributes.inputs.at(input_names::Stats)->get_dim();
+            auto const& stats_stride = attributes.inputs.at(input_names::Stats)->get_stride();
+            bool const stats_is_packed_bhsd = stats_stride[3] == 1 &&
+                                              stats_stride[2] == stats_dim[3] &&
+                                              stats_stride[1] == stats_dim[2] * stats_dim[3] &&
+                                              stats_stride[0] == stats_dim[1] * stats_dim[2] * stats_dim[3];
+            RETURN_CUDNN_FRONTEND_ERROR_IF(!stats_is_packed_bhsd,
+                                        error_code_t::GRAPH_NOT_SUPPORTED,
+                                        "For cuDNN version below 9.26.0, a non-ragged Stats input of sdpa_backward must be "
+                                        "a packed BHSD tensor.");
+        }
 
         // version specific validation
         RETURN_CUDNN_FRONTEND_ERROR_IF(detail::get_backend_version() < 90500 && is_dbias && attributes.padding_mask,

@@ -142,12 +142,6 @@ def _packed_bhsd_stride(shape: Tuple[int, int, int, int]) -> Tuple[int, int, int
     return (s * h * d, d, h * d, 1)
 
 
-def _get_variant_pack_uid_order(graph, present_uids):
-    if hasattr(graph, "_get_variant_pack_uids_sorted"):
-        return graph._get_variant_pack_uids_sorted()
-    return sorted(present_uids)
-
-
 def _validate_d256_oss_args(
     is_causal: bool,
     diagonal_alignment: int,
@@ -714,23 +708,9 @@ def _sdpa_impl(
             cumulative_seq_len_q,
             cumulative_seq_len_kv,
         )
-        uid_order = _get_variant_pack_uid_order(
-            graph,
-            [
-                int(_UIDs.Q),
-                int(_UIDs.K),
-                int(_UIDs.V),
-                int(_UIDs.O),
-                int(_UIDs.STATS),
-                *([int(_UIDs.SEQ_LEN_Q)] if seq_len_q is not None else []),
-                *([int(_UIDs.SEQ_LEN_KV)] if seq_len_kv is not None else []),
-                *([int(_UIDs.CUM_SEQ_LEN_Q)] if cumulative_seq_len_q is not None else []),
-                *([int(_UIDs.CUM_SEQ_LEN_KV)] if cumulative_seq_len_kv is not None else []),
-            ],
-        )
-        _fprop_cache[cache_key] = (graph, workspace_size, uid_order)
+        _fprop_cache[cache_key] = (graph, workspace_size)
 
-    graph, workspace_size, uid_order = _fprop_cache[cache_key]
+    graph, workspace_size = _fprop_cache[cache_key]
 
     # Allocate outputs and workspace (BHSD layout)
     # Workspace is per-call — PyTorch's caching allocator recycles the allocation.
@@ -757,11 +737,7 @@ def _sdpa_impl(
     if cumulative_seq_len_kv is not None:
         uid_to_tensor[int(_UIDs.CUM_SEQ_LEN_KV)] = cumulative_seq_len_kv
 
-    if hasattr(graph, "_execute_with_ptrs"):
-        ptrs = [uid_to_tensor[uid].data_ptr() for uid in uid_order]
-        graph._execute_with_ptrs(ptrs, workspace.data_ptr(), int(handle))
-    else:
-        graph.execute(uid_to_tensor, workspace, handle=handle)
+    graph.execute(uid_to_tensor, workspace, handle=handle)
 
     return o_gpu, stats_gpu
 
@@ -1007,27 +983,9 @@ def _sdpa_bwd_impl(
             cumulative_seq_len_kv,
             is_deterministic,
         )
-        uid_order = _get_variant_pack_uid_order(
-            graph,
-            [
-                int(_UIDs.Q),
-                int(_UIDs.K),
-                int(_UIDs.V),
-                int(_UIDs.O),
-                int(_UIDs.DO),
-                int(_UIDs.STATS),
-                int(_UIDs.DQ),
-                int(_UIDs.DK),
-                int(_UIDs.DV),
-                *([int(_UIDs.SEQ_LEN_Q)] if seq_len_q is not None else []),
-                *([int(_UIDs.SEQ_LEN_KV)] if seq_len_kv is not None else []),
-                *([int(_UIDs.CUM_SEQ_LEN_Q)] if cumulative_seq_len_q is not None else []),
-                *([int(_UIDs.CUM_SEQ_LEN_KV)] if cumulative_seq_len_kv is not None else []),
-            ],
-        )
-        _bprop_cache[cache_key] = (graph, workspace_size, uid_order)
+        _bprop_cache[cache_key] = (graph, workspace_size)
 
-    graph, workspace_size, uid_order = _bprop_cache[cache_key]
+    graph, workspace_size = _bprop_cache[cache_key]
 
     # Allocate gradient outputs and workspace (same shapes as Q, K, V)
     dQ_gpu = torch.empty_like(q)
@@ -1056,11 +1014,7 @@ def _sdpa_bwd_impl(
     if cumulative_seq_len_kv is not None:
         uid_to_tensor[int(_UIDs.CUM_SEQ_LEN_KV)] = cumulative_seq_len_kv
 
-    if hasattr(graph, "_execute_with_ptrs"):
-        ptrs = [uid_to_tensor[uid].data_ptr() for uid in uid_order]
-        graph._execute_with_ptrs(ptrs, workspace.data_ptr(), int(handle))
-    else:
-        graph.execute(uid_to_tensor, workspace, handle=handle)
+    graph.execute(uid_to_tensor, workspace, handle=handle)
 
     return dQ_gpu, dK_gpu, dV_gpu
 

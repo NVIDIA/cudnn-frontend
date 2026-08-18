@@ -4,9 +4,9 @@
 """cudnn.linear_attention.cutile: cuTile GDN / KDA implementations.
 
 ``GdnCuTileEngine`` (a router ``BaseEngine``) executes single-node GDN /
-GDN_BWD graphs on the chunked cuTile kernels in ``kernels/gdn_chunk_cutile``.
+GDN_BWD graphs on the chunked cuTile kernels in ``kernels/gdn``.
 ``KdaCuTileEngine`` does the same for KDA / KDA_BWD graphs on
-``kernels/kda_chunk_cutile``.
+``kernels/kda``.
 """
 
 from typing import Any

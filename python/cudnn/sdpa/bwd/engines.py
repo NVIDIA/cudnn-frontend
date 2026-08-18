@@ -84,7 +84,14 @@ class Capabilities:
     # (sm110) are meant to reuse these kernels and an exact set excluded both.
     sm_lo: int
     sm_hi: int
-    d: frozenset[int]  # supported head dims (d_qk == d_v required)
+    d: frozenset[int]  # supported head dims (d_qk == d_v unless dqk_ge_dv)
+    # When True, ``d`` is an ENVELOPE upper bound: the lowering also serves any
+    # graph with head dims <= max(d) (the SM80 adapter zero-pads to the
+    # smallest covering kernel flavor). False = exact-set membership.
+    d_envelope: bool = False
+    # When True the lowering serves rectangular head dims with D_QK >= D_V
+    # (e.g. 192/128); False requires D_QK == D_V.
+    dqk_ge_dv: bool = False
     dtypes: frozenset = frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16})  # cudnn.data_type, see graph_analyzer
 
     # optional features a backward graph may request
@@ -112,6 +119,19 @@ class Capabilities:
     sink: bool = False
     thd: bool = False
     cu_seq_len: bool = False  # cu_seq_len_q / cu_seq_len_kv prefix sums (no row serves these yet)
+    # s_q == 1 (decode-shaped) graphs; rows whose kernels are prefill-only gate
+    # them off.
+    decode: bool = True
+    # Dense layout envelope this engine accepts (mirrors fwd/engines.py):
+    #   "bshd"       — Q/K/V/O must be BSHD-physical (stride order 3,1,2,0).
+    #   "dense_flex" — any B/H/S stride permutation, padded (oversized)
+    #                  strides included, as long as the head dim is
+    #                  innermost-contiguous (stride 1) and the strides are
+    #                  non-broadcast / non-overlapping (facts.dense_layout;
+    #                  see graph_analyzer.dense_layout_ok). The lowering
+    #                  normalizes such tensors to the kernel's canonical
+    #                  BSHD-compact buffers (zero-copy when already BSHD).
+    layouts: frozenset[str] = frozenset({"bshd"})
 
     # Tuning-knob domains this engine's lowering honors (see SdpaBwdKnobs).
     tile_ms: frozenset[int] = frozenset()
@@ -149,17 +169,31 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
         return f"requires nvidia-cutlass-dsl >= {want}; found {version[1]}"
     if facts.is_mxfp8 or facts.is_fp8:
         return "this engine serves only half (fp16/bf16) sdpa_backward graphs"
-    if facts.d_qk != facts.d_v:
+    if capabilities.dqk_ge_dv:
+        if facts.d_qk < facts.d_v:
+            return f"D_QK must be >= D_V; graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
+    elif facts.d_qk != facts.d_v:
         return f"D_QK must equal D_V; graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
-    if facts.d_qk not in capabilities.d:
+    if capabilities.d_envelope:
+        if max(facts.d_qk, facts.d_v) > max(capabilities.d):
+            return f"head dims (D_QK={facts.d_qk}, D_V={facts.d_v}) exceed the {max(capabilities.d)} envelope"
+    elif facts.d_qk not in capabilities.d:
         return f"serves D in {sorted(capabilities.d)}; graph has D={facts.d_qk}"
+    elif facts.d_v not in capabilities.d:
+        return f"serves D_V in {sorted(capabilities.d)}; graph has D_V={facts.d_v}"
     if facts.dtype not in capabilities.dtypes:
         return f"dtype {facts.dtype} not in {sorted(str(d) for d in capabilities.dtypes)}"
     if not facts.uniform_dtype:
         return "K/V/O/dO/dQ/dK/dV dtypes must match Q"
     if facts.h_q != facts.h_kv and not capabilities.gqa:
         return f"GQA / MQA is not supported (H_q={facts.h_q}, H_kv={facts.h_kv})"
-    if not facts.bshd_layout:
+    if "dense_flex" in capabilities.layouts:
+        if not facts.dense_layout:
+            return (
+                "Q/K/V/O/dO/dQ/dK/dV must have the head dim innermost-contiguous (stride 1) and "
+                "non-broadcast, non-overlapping strides (any B/H/S order, padded strides allowed)"
+            )
+    elif not facts.bshd_layout:
         return "Q/K/V/O/dO/dQ/dK/dV must be BSHD-physical (stride order 3,1,2,0)"
 
     for fact, cap, label in (
@@ -189,9 +223,13 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
         if fact and not cap:
             return f"graph uses {label}, which this engine does not support"
 
-    if facts.bottom_right and not facts.causal:
-        return "bottom-right alignment requires a causal upper bound"
-    if facts.causal and facts.bottom_right and not capabilities.bottom_right:
+    if facts.has_dsink and not facts.has_sink:
+        return "dSink_token output requires a sink_token input"
+    if facts.s_q == 1 and not capabilities.decode:
+        return "s_q == 1 (decode) is out of scope for the prefill kernels"
+    if facts.bottom_right and not (facts.causal or facts.right_band_widening):
+        return "bottom-right alignment requires a causal upper bound (plain or right-widened)"
+    if facts.bottom_right and not capabilities.bottom_right:
         return "graph uses bottom-right causal, which this engine does not support"
 
     # The kernel consumes the forward stats as a contiguous natural-log LSE
@@ -223,11 +261,20 @@ def _sm120_spec() -> EngineSpec:
         capabilities=Capabilities(
             sm_lo=_BLACKWELL_GEFORCE[0],
             sm_hi=_BLACKWELL_GEFORCE[1],
-            d=frozenset(_SM120_HEAD_DIMS),
+            # Any head size multipled of 8
+            d=frozenset(range(8, max(_SM120_HEAD_DIMS) + 1, 8)),
+            dqk_ge_dv=True,
             dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
+            gqa=True,
             causal=True,
             bottom_right=True,
+            right_band_widening=True,
             swa=True,
+            padded=True,
+            sink=True,
+            dsink=True,
+            layouts=frozenset({"bshd", "dense_flex"}),
+            deterministic=True,
             tile_ms=frozenset(_SM120_Q_TILES),
             tile_ns=frozenset(_SM120_KV_TILES),
         ),
@@ -268,17 +315,13 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
     execute chain.
     """
 
-    # Canonical BSHD-physical geometry, fixed at build time from the facts.
-    # Deliberately NOT read back from the IR tensors at execute:
-    # ``build_operation_graph`` rewrites the backward node's K/V ports to
-    # transposed (B, H, D, S) views, so the live ``get_dim()`` after a native
-    # build would describe the transposed view while the underlying buffer
-    # keeps the user's canonical layout (which the bshd gate already proved).
-    def _bshd_geometry(b: int, h: int, s: int, d: int) -> tuple[tuple[int, ...], tuple[int, ...]]:
-        return (b, h, s, d), (s * h * d, d, h * d, 1)
-
-    q_geom = _bshd_geometry(facts.b, facts.h_q, facts.s_q, facts.d_qk)
-    kv_geom = _bshd_geometry(facts.b, facts.h_kv, facts.s_kv, facts.d_qk)
+    # Per-port geometry from facts.port_layouts, NOT the live IR tensors:
+    # build_operation_graph rewrites the backward node's K/V ports to
+    # transposed (B, H, D, S) views; the analyzer captured the geometry with
+    # that rewrite undone.
+    ports = {name: (tuple(dim), tuple(stride)) for name, dim, stride in facts.port_layouts}
+    q_geom, k_geom, v_geom, o_geom = ports["q"], ports["k"], ports["v"], ports["o"]
+    do_geom, dq_geom, dk_geom, dv_geom = ports["dO"], ports["dQ"], ports["dK"], ports["dV"]
     stats_geom = ((facts.b, facts.h_q, facts.s_q, 1), (facts.h_q * facts.s_q, facts.s_q, 1, 1))
 
     import torch
@@ -299,22 +342,34 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
             name=name,
         )
 
+    seq_kv_t = facts.seq_kv_t if facts.padded else None
+    seq_q_t = facts.seq_q_t if facts.padded else None
+    # Sink ports: geometry straight from the IR tensors (fp32 (1, H_q, 1, 1)).
+    sink_geom = (tuple(facts.sink_t.get_dim()), tuple(facts.sink_t.get_stride())) if facts.has_sink else None
+    dsink_geom = (tuple(facts.dsink_t.get_dim()), tuple(facts.dsink_t.get_stride())) if facts.has_dsink else None
+
     api = _adapter_sm120()(
         sample_q=_desc(q_geom, facts.dtype, "q"),
-        sample_k=_desc(kv_geom, facts.dtype, "k"),
-        sample_v=_desc(kv_geom, facts.dtype, "v"),
-        sample_o=_desc(q_geom, facts.dtype, "o"),
-        sample_do=_desc(q_geom, facts.dtype, "dO"),
+        sample_k=_desc(k_geom, facts.dtype, "k"),
+        sample_v=_desc(v_geom, facts.dtype, "v"),
+        sample_o=_desc(o_geom, facts.dtype, "o"),
+        sample_do=_desc(do_geom, facts.dtype, "dO"),
         sample_stats=_desc(stats_geom, torch.float32, "stats"),
-        sample_dq=_desc(q_geom, facts.dtype, "dQ"),
-        sample_dk=_desc(kv_geom, facts.dtype, "dK"),
-        sample_dv=_desc(kv_geom, facts.dtype, "dV"),
-        is_causal=facts.causal,
+        sample_dq=_desc(dq_geom, facts.dtype, "dQ"),
+        sample_dk=_desc(dk_geom, facts.dtype, "dK"),
+        sample_dv=_desc(dv_geom, facts.dtype, "dV"),
+        sample_sink=_desc(sink_geom, facts.sink_t.get_data_type(), "sink") if sink_geom is not None else None,
+        sample_dsink=_desc(dsink_geom, facts.dsink_t.get_data_type(), "dSink") if dsink_geom is not None else None,
+        is_causal=facts.causal or facts.right_band_widening,
         causal_bottom_right=facts.bottom_right,
         window_size_left=facts.window_left,
+        window_size_right=(facts.right_bound if facts.right_band_widening else None),
+        deterministic=facts.deterministic,
         scale_softmax=facts.scale,
         tile_m=requested.tile_m if requested is not None else None,
         tile_n=requested.tile_n if requested is not None else None,
+        seq_kv_lens_present=seq_kv_t is not None,
+        seq_q_lens_present=seq_q_t is not None,
     )
     api.check_support()  # raises ValueError / NotImplementedError if unsupported
     api.compile()
@@ -335,15 +390,19 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
         dq=facts.dq_t,
         dk=facts.dk_t,
         dv=facts.dv_t,
+        seq_len_kv=seq_kv_t,
+        seq_len_q=seq_q_t,
+        sink_token=facts.sink_t if facts.has_sink else None,
+        dsink=facts.dsink_t if facts.has_dsink else None,
     )
 
     def _canonical_view(buf, geom):
-        """Reinterpret a variant-pack buffer through the canonical geometry.
+        """Reinterpret a variant-pack buffer through the port's geometry.
 
         cuDNN's execute contract treats variant-pack entries as raw storage
         laid out per the IR tensor descriptor — callers may hand in a torch
         tensor whose logical shape is anything with the right bytes. The DSL
-        executor consumes torch views, so rebuild the canonical view here.
+        executor consumes torch views, so rebuild the port-shaped view here.
         No-op when the caller already passed a matching view.
         """
         dim, stride = geom
@@ -353,16 +412,24 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
 
     def _execute(variant_pack, workspace=None, stream=None):
         resolved = ga.resolve_variant_pack(variant_pack, binding)
+        seq_kv_buf = resolved.get(id(binding.seq_len_kv)) if binding.seq_len_kv is not None else None
+        seq_q_buf = resolved.get(id(binding.seq_len_q)) if binding.seq_len_q is not None else None
+        sink_buf = _canonical_view(resolved[id(binding.sink_token)], sink_geom) if binding.sink_token is not None else None
+        dsink_buf = _canonical_view(resolved[id(binding.dsink)], dsink_geom) if binding.dsink is not None else None
         api.execute(
             q_tensor=_canonical_view(resolved[id(binding.q)], q_geom),
-            k_tensor=_canonical_view(resolved[id(binding.k)], kv_geom),
-            v_tensor=_canonical_view(resolved[id(binding.v)], kv_geom),
-            o_tensor=_canonical_view(resolved[id(binding.o)], q_geom),
-            do_tensor=_canonical_view(resolved[id(binding.do)], q_geom),
+            k_tensor=_canonical_view(resolved[id(binding.k)], k_geom),
+            v_tensor=_canonical_view(resolved[id(binding.v)], v_geom),
+            o_tensor=_canonical_view(resolved[id(binding.o)], o_geom),
+            do_tensor=_canonical_view(resolved[id(binding.do)], do_geom),
             stats_tensor=_canonical_view(resolved[id(binding.stats)], stats_geom),
-            dq_tensor=_canonical_view(resolved[id(binding.dq)], q_geom),
-            dk_tensor=_canonical_view(resolved[id(binding.dk)], kv_geom),
-            dv_tensor=_canonical_view(resolved[id(binding.dv)], kv_geom),
+            dq_tensor=_canonical_view(resolved[id(binding.dq)], dq_geom),
+            dk_tensor=_canonical_view(resolved[id(binding.dk)], dk_geom),
+            dv_tensor=_canonical_view(resolved[id(binding.dv)], dv_geom),
+            seq_q_lens=seq_q_buf,
+            seq_kv_lens=seq_kv_buf,
+            sink_tensor=sink_buf,
+            dsink_tensor=dsink_buf,
             scale_softmax=facts.scale,
             # Scratch comes from the CALLER's workspace (never allocated
             # here): the dispatch sized/validated it against workspace_bytes;
@@ -386,6 +453,116 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
     return _execute
 
 
+def _sm80_spec() -> EngineSpec:
+    """SM80 (A100) backward row: lowers onto the ``cudnn.sdpa`` SM80 APIBase
+    adapter (``bwd/api.py``), which owns kernel-flavor selection
+    (head-dim envelopes up to (256, 256), incl. rectangular 192/128),
+    host-side head-dim zero-padding, BHSD<->BSHD normalization, per-shape
+    kernel caching, and the dedicated plain-dense d=64 fast path.  The
+    CuTe-DSL JIT happens on the first execute (the kernel modules self-cache
+    per shape).  Knob domains are empty (no tunables wired).  sm80 exactly:
+    the kernels assume the A100's 164 KiB opt-in SMEM, which the sm86/sm89
+    parts do not have."""
+    return EngineSpec(
+        name="sdpa_bwd_sm80",
+        capabilities=Capabilities(
+            sm_lo=80,
+            sm_hi=80,
+            d=frozenset({256}),
+            d_envelope=True,  # flavor envelopes; host-side zero-padding
+            dqk_ge_dv=True,  # bprop kernel constraint relaxed to D_QK >= D_V
+            dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
+            gqa=True,
+            causal=True,
+            bottom_right=True,
+            deterministic=True,  # ordered dQ KV-tile reduction
+            dbias=True,
+            dsink=True,
+            bias=True,
+            alibi=True,
+            block_mask=True,
+            right_band_widening=True,
+            seq_q_trim=False,
+            swa=True,
+            padded=True,
+            sink=True,
+            decode=False,  # prefill kernels only
+            layouts=frozenset({"bshd", "dense_flex"}),
+        ),
+        lower=lower_sm80_bwd,
+    )
+
+
+def lower_sm80_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any = None):
+    """Lower the SM80 backward row through the ``cudnn.sdpa`` SM80 adapter."""
+    from .api import sdpa_bwd_wrapper_sm80
+
+    binding = ga.SdpaBinding(
+        q=facts.q_t,
+        k=facts.k_t,
+        v=facts.v_t,
+        o=facts.o_t,
+        stats=facts.stats_t,
+        bias=facts.bias_t,
+        sink_token=facts.sink_t,
+        seq_len_kv=facts.seq_kv_t,
+        seq_len_q=facts.seq_q_t,
+        block_mask=facts.block_mask_t,
+        do=facts.do_t,
+        dq=facts.dq_t,
+        dk=facts.dk_t,
+        dv=facts.dv_t,
+        dbias=facts.dbias_t,
+        dsink=facts.dsink_t,
+    )
+    mask_args = ga.adapter_mask_args(facts)
+
+    def _execute(variant_pack, stream=None):
+        resolved = ga.resolve_variant_pack(variant_pack, binding)
+        # mismatch() admits only the contiguous (B, H_q, S_q, 1) stats layout,
+        # so this is a pure view (a copying reshape would violate the
+        # execute() contract and hide the -inf padded-row trim semantics).
+        lse = resolved[id(facts.stats_t)].view(facts.b, facts.h_q, facts.s_q)
+
+        out = sdpa_bwd_wrapper_sm80(
+            # dense_flex delivery: normalize to the BSHD-physical order the
+            # adapter requires (zero-copy when already BSHD).
+            ga.to_bshd_physical(resolved[id(facts.q_t)]),
+            ga.to_bshd_physical(resolved[id(facts.k_t)]),
+            ga.to_bshd_physical(resolved[id(facts.v_t)]),
+            ga.to_bshd_physical(resolved[id(facts.o_t)]),
+            ga.to_bshd_physical(resolved[id(facts.do_t)]),
+            lse,
+            scale_softmax=facts.scale,
+            deterministic=facts.deterministic,
+            # Stream from the caller's handle (ExecutionContext.stream);
+            # None keeps the current stream.
+            current_stream=stream,
+            **mask_args,
+            **ga.adapter_feature_buffers(facts, resolved),
+        )
+
+        # copy_ casts in place; no .to() (which would allocate a staging
+        # tensor per execute).
+        for t_ref, key in ((facts.dq_t, "dq_tensor"), (facts.dk_t, "dk_tensor"), (facts.dv_t, "dv_tensor")):
+            resolved[id(t_ref)].copy_(out[key])
+        if facts.has_dbias and "dbias_tensor" in out:
+            buf = resolved.get(id(facts.dbias_t))
+            if buf is not None:
+                buf.copy_(out["dbias_tensor"].view(buf.shape))
+        if facts.has_dsink and "dsink_tensor" in out:
+            buf = resolved.get(id(facts.dsink_t))
+            if buf is not None:
+                buf.view(-1).copy_(out["dsink_tensor"])
+        return None
+
+    # Executor contract (engine._FrostSdpaBwdPlan): torch-native host code,
+    # no carved scratch — workspace_bytes 0 means _execute(variant_pack).
+    _execute.workspace_bytes = 0
+    _execute.binding = binding
+    return _execute
+
+
 def engine_name(arch: str = "sm120") -> str:
     """The shipped engine name for a coverage cell (test/user convenience)."""
 
@@ -394,6 +571,6 @@ def engine_name(arch: str = "sm120") -> str:
 
 # Preference order: the ranked plan list offers these in this order (see
 # cudnn/sdpa/bwd/engine.py, which wraps each spec as a BaseEngine).
-ENGINE_SPECS = (_sm120_spec(),)
+ENGINE_SPECS = (_sm120_spec(), _sm80_spec())
 
 __all__ = ["ENGINE_SPECS", "Capabilities", "EngineSpec", "SdpaBwdKnobs", "analyze_for", "engine_name", "mismatch"]

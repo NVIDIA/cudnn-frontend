@@ -3,9 +3,10 @@
 
 """Unified FE API for grouped GEMM wgrad on SM100+."""
 
-from typing import Optional, Tuple, Union
+from __future__ import annotations
 
-import torch
+from typing import Literal, Optional, Tuple, Union
+
 import cutlass
 import cutlass.cute as cute
 from cuda.bindings import driver as cuda
@@ -13,7 +14,8 @@ from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
 from cudnn.api_base import APIBase, TensorDesc, ceil_div, is_power_of_2
 from cudnn.datatypes import _convert_to_cutlass_data_type
-from cudnn.gemm.cutedsl.discrete_grouped.discrete_kernel_utils import _require_pointer_tensor
+from cudnn.gemm.cutedsl.grouped.unfused._bf16_api import _validate_pointer_tensor
+from cudnn.tensor_adapter import is_torch_tensor
 
 from .moe_blockscaled_grouped_gemm_wgrad import BlockScaledMoEGroupedGemmWgradKernel
 from ..moe_utils import MoEWeightMode, WGradInputOrder
@@ -28,6 +30,8 @@ def _get_rubin_kernel():
 
 
 def _is_supported_rubin_quantization(ab_dtype: torch.dtype, sf_dtype: torch.dtype, sf_vec_size: int) -> bool:
+    import torch
+
     is_fp4 = ab_dtype in (torch.float4_e2m1fn_x2, torch.uint8)
     if is_fp4:
         return (sf_dtype == torch.float8_e4m3fn and sf_vec_size == 16) or (sf_dtype == torch.float8_e8m0fnu and sf_vec_size == 32)
@@ -55,13 +59,28 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
         wgrad_dtype: Optional[torch.dtype] = None,
         sample_global_scale_a: Optional[torch.Tensor] = None,
         sample_global_scale_b: Optional[torch.Tensor] = None,
-        acc_dtype: torch.dtype = torch.float32,
+        acc_dtype: Optional[torch.dtype] = None,
         mma_tiler_mn: Tuple[int, int] = (256, 256),
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         sf_vec_size: int = 16,
+        sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
         accumulate_on_output: bool = False,
         input_order: Union[WGradInputOrder, str] = WGradInputOrder.Tensor2D,
     ):
+        if sample_a is not None and not is_torch_tensor(sample_a):
+            raise ValueError(
+                "The block-scaled wgrad backend supports torch tensors only: its B operand "
+                "(and fp4-packed A/B operands) require K-major (token-innermost) layouts that "
+                "are not expressible as row-major JAX arrays"
+            )
+        import torch
+
+        from cudnn.tensor_adapter import framework_dtype
+
+        # This backend is torch-internal: normalize loose dtype parameters (which the
+        # type-erased wrapper/facade may pass as cutlass or numpy dtypes) to torch dtypes.
+        acc_dtype = framework_dtype(acc_dtype, "torch") if acc_dtype is not None else torch.float32
+        wgrad_dtype = framework_dtype(wgrad_dtype, "torch") if wgrad_dtype is not None else None
         super().__init__()
         self._warn_experimental_api()
         self.input_order = WGradInputOrder(input_order)
@@ -86,6 +105,7 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
         self.global_scale_a_desc = self._make_tensor_desc(sample_global_scale_a, name="sample_global_scale_a")
         self.global_scale_b_desc = self._make_tensor_desc(sample_global_scale_b, name="sample_global_scale_b")
         self.sf_vec_size = sf_vec_size
+        self.sf_fp8_dtype_override = sf_fp8_dtype_override
         tokens_sum_a = self.a_desc.shape[1]
         tokens_sum_b = self.b_desc.shape[0]
         self._value_error_if(
@@ -159,6 +179,8 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
         return offset_values
 
     def _check_rubin_quantization_support(self) -> None:
+        import torch
+
         if not self._is_rubin_kernel:
             return
 
@@ -179,6 +201,8 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
             )
 
     def check_support(self) -> bool:
+        import torch
+
         m, tokens_sum = self._tensor_shape(self.a_desc, name="sample_a")
         _, n = self._tensor_shape(self.b_desc, name="sample_b")
 
@@ -202,6 +226,30 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
             "sample_sfb",
             extra_error_msg="sample_sfb must have dtype float8_e8m0fnu or float8_e4m3fn",
         )
+        # torch has no e5m3 dtype and TVM-FFI cannot marshal FloatNV8E5M3FNU, so e5m3
+        # scale factors arrive as e4m3 storage of the same width and the Rubin kernel
+        # reinterprets them. That reinterpretation is the only real override; every
+        # other format the kernel reads straight off sfa.element_type.
+
+        # e5m3 is the only override currently supported
+        self._value_error_if(
+            self.sf_fp8_dtype_override not in (None, "e5m3"),
+            f"sf_fp8_dtype_override must be None or 'e5m3', got {self.sf_fp8_dtype_override!r}",
+        )
+        if self.sf_fp8_dtype_override == "e5m3":
+            # Only allow e5m3 to pretend to be e4m3fn
+            self._value_error_if(
+                self.sfa_desc.dtype != torch.float8_e4m3fn,
+                f"sf_fp8_dtype_override='e5m3' requires the NVFP4 recipe -- FP4 A/B with "
+                f"torch.float8_e4m3fn scale factors at sf_vec_size 16 -- but got "
+                f"ab_dtype={self.a_desc.dtype}, sf_dtype={self.sfa_desc.dtype}, sf_vec_size={self.sf_vec_size}",
+            )
+            # Only allow e5m3 for rubin kernels
+            self._value_error_if(
+                not self._is_rubin_kernel,
+                f"sf_fp8_dtype_override='e5m3' requires Rubin (SM107), got device type {self._device_type!r}",
+            )
+
         self._check_rubin_quantization_support()
         self._check_dtype(self.offsets_desc, torch.int32, "sample_offsets", extra_error_msg="sample_offsets must be int32")
         self._check_dtype(
@@ -266,6 +314,8 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
         return True
 
     def compile(self) -> None:
+        import torch
+
         self._ensure_support_checked()
         if self._compiled_kernel is not None:
             return
@@ -280,6 +330,7 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
             expert_cnt=self.expert_cnt,
             weight_mode=self.weight_mode,
             input_order=self.input_order,
+            sf_fp8_dtype_override=self.sf_fp8_dtype_override,
         )
 
         hardware_info = cutlass.utils.HardwareInfo()
@@ -399,6 +450,8 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
         self._compiled_kernel = tensor_api
 
     def _compile_discrete(self, kernel, max_active_clusters, fake_stream) -> None:
+        import torch
+
         a_fake = (
             from_dlpack(self.sample_a_tensor, assumed_align=16, enable_tvm_ffi=True).mark_compact_shape_dynamic(
                 mode=1,
@@ -530,6 +583,8 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
         global_scale_b: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
     ) -> None:
+        import torch
+
         current_stream = self._get_default_stream(current_stream)
         self._runtime_error_if(self._compiled_kernel is None, "Kernel not compiled; call compile() first")
 
@@ -558,7 +613,7 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
                 expert_stride_bytes = wgrad_tensor.stride(0) * wgrad_tensor.element_size()
                 ptrs = [wgrad_tensor.data_ptr() + i * expert_stride_bytes for i in range(wgrad_tensor.shape[0])]
                 wgrad_ptrs = torch.tensor(ptrs, dtype=torch.int64, device=wgrad_tensor.device)
-        _require_pointer_tensor(wgrad_ptrs, "wgrad_ptrs", self.expert_cnt)
+        _validate_pointer_tensor(wgrad_ptrs, "wgrad_ptrs", self.expert_cnt)
         self._compiled_kernel(
             a_tensor,
             b_tensor,

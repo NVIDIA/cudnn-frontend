@@ -477,24 +477,6 @@ def test_resolve_generate_stats():
     assert cfg.stats_t is not None
 
 
-def test_probe_rejects_bottom_right_plus_swa():
-    # Kernel gap: CAUSAL_BOTTOM_RIGHT excludes SWA (config would assert at import).
-    g = _mk_graph()
-    q, k, v, dims, strides = _mk_qkv(g)
-    o, _ = g.sdpa(
-        name="s",
-        q=q,
-        k=k,
-        v=v,
-        attn_scale=0.1,
-        is_inference=True,
-        use_causal_mask_bottom_right=True,
-        sliding_window_length=128,
-    )
-    _finish_output(o, dims, strides)
-    assert not _eligible(g)
-
-
 def test_probe_rejects_bottom_right_swa_only():
     # Kernel gap: CAUSAL_BOTTOM_RIGHT requires MASK_CAUSAL; BOTTOM_RIGHT
     # alignment with only a left band has no causal bit.
@@ -514,9 +496,10 @@ def test_probe_rejects_bottom_right_swa_only():
     assert not _eligible(g)
 
 
-def test_probe_rejects_ragged_skv_without_padding_or_causal():
-    # KV tail (S_kv % 128 != 0) is only masked on the padded / causal paths;
-    # a dense graph with a ragged S_kv would silently read the tail columns.
+def test_probe_accepts_ragged_skv_via_synth_padding():
+    # KV tail (S_kv % 128 != 0) with no covering mask: the f16 rows opt into
+    # skv_tail_via_padding — the lowering synthesizes full-length per-batch KV
+    # lengths and the padded path masks the tail (the FP8 row's mechanism).
     g = _mk_graph()
     s_kv = 300
     q = g.tensor(dim=(B, H, S, D), stride=(S * H * D, D, H * D, 1), data_type=DTYPE, name="q")
@@ -524,7 +507,7 @@ def test_probe_rejects_ragged_skv_without_padding_or_causal():
     v = g.tensor(dim=(B, H, s_kv, D), stride=(s_kv * H * D, D, H * D, 1), data_type=DTYPE, name="v")
     o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True)
     _finish_output(o, (B, H, S, D), (S * H * D, D, H * D, 1))
-    assert not _eligible(g)
+    assert engines.engine_name(512) in _eligible(g)
 
 
 def test_probe_accepts_ragged_skv_with_top_left_causal():
@@ -604,11 +587,77 @@ def test_sm120_probe_accepts_causal_swa_on_both_minors(monkeypatch):
         assert not any("sm100" in name for name in elig)
 
 
+def test_probe_rejects_requested_amax_s():
+    # The FP8 kernels no longer compute Amax_S; a graph that DECLARES the
+    # output (set_output(True), non-virtual) must go elsewhere. The port the
+    # op returns unconditionally does NOT count (is_virtual stays True).
+    import math
+
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.FP8_E4M3, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    dims, strides = (B, H, S, 128), (S * H * 128, 128, H * 128, 1)
+    q = g.tensor(dim=dims, stride=strides, data_type=cudnn.data_type.FP8_E4M3, name="q")
+    k = g.tensor(dim=dims, stride=strides, data_type=cudnn.data_type.FP8_E4M3, name="k")
+    v = g.tensor(dim=dims, stride=strides, data_type=cudnn.data_type.FP8_E4M3, name="v")
+    sc = [g.tensor(dim=(1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.FLOAT) for _ in range(6)]
+    kw = dict(
+        q=q,
+        k=k,
+        v=v,
+        descale_q=sc[0],
+        descale_k=sc[1],
+        descale_v=sc[2],
+        descale_s=sc[3],
+        scale_s=sc[4],
+        scale_o=sc[5],
+        attn_scale=1.0 / math.sqrt(128),
+        generate_stats=False,
+        use_causal_mask=True,
+    )
+
+    def build(request_amax_s):
+        gg = cudnn.pygraph(io_data_type=cudnn.data_type.FP8_E4M3, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+        qq = gg.tensor(dim=dims, stride=strides, data_type=cudnn.data_type.FP8_E4M3, name="q")
+        kk = gg.tensor(dim=dims, stride=strides, data_type=cudnn.data_type.FP8_E4M3, name="k")
+        vv = gg.tensor(dim=dims, stride=strides, data_type=cudnn.data_type.FP8_E4M3, name="v")
+        ss = [gg.tensor(dim=(1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.FLOAT) for _ in range(6)]
+        o, _stats, amx_s, amx_o = gg.sdpa_fp8(
+            q=qq,
+            k=kk,
+            v=vv,
+            descale_q=ss[0],
+            descale_k=ss[1],
+            descale_v=ss[2],
+            descale_s=ss[3],
+            scale_s=ss[4],
+            scale_o=ss[5],
+            attn_scale=1.0 / math.sqrt(128),
+            generate_stats=False,
+            use_causal_mask=True,
+        )
+        _finish_output(o, dims, strides, dtype=cudnn.data_type.HALF)
+        amx_o.set_output(True).set_dim((1, 1, 1, 1)).set_stride((1, 1, 1, 1)).set_data_type(cudnn.data_type.FLOAT)
+        if request_amax_s:
+            amx_s.set_output(True).set_dim((1, 1, 1, 1)).set_stride((1, 1, 1, 1)).set_data_type(cudnn.data_type.FLOAT)
+        return gg
+
+    fp8_name = engines.engine_name(128, fp8=True)
+    assert fp8_name in _eligible(build(request_amax_s=False))
+    assert fp8_name not in _eligible(build(request_amax_s=True))
+
+
+def test_probe_accepts_bottom_right_with_swa():
+    # The band shifts wholesale with the diagonal: the SM100 kernels apply the
+    # same causal_diag offset to the SWA lower limit as to the causal upper one.
+    g = _mk_graph()
+    q, k, v, dims, strides = _mk_qkv(g)
+    o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True, use_causal_mask_bottom_right=True, sliding_window_length=64)
+    _finish_output(o, dims, strides)
+    assert engines.engine_name(512) in _eligible(g)
+
+
 def test_sm120_probe_accepts_bottom_right_with_swa(monkeypatch):
-    # SM120-only notch: the SM100 kernels' BR diagonal excludes SWA. Facts are
-    # cached per graph, so each device family probes a freshly built graph.
+    # BR + SWA is served on both families now; this pins the SM120 row's claim.
     kwargs = dict(use_causal_mask_bottom_right=True, sliding_window_length=64)
-    assert not _eligible(_mk_sm120_graph(**kwargs))  # (10, 0): no row serves BR+SWA
     monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
     assert _SM120 in _eligible(_mk_sm120_graph(**kwargs))
 
@@ -779,6 +828,43 @@ def test_sm120_probe_accepts_thd_stats(monkeypatch):
     assert engines.engine_name(arch="sm120") in _eligible(g)
 
 
+def _mk_thd_cu_graph(*, extra_seq_len=False):
+    """Ragged (THD) graph carrying the cu_seq_len_q/kv (B+1,) prefix-sum form."""
+    g = _mk_graph()
+    dims = (B, H, S, D)
+    strides = (S * H * D, D, H * D, 1)
+    q = g.tensor(dim=dims, stride=strides, data_type=DTYPE, name="q")
+    k = g.tensor(dim=dims, stride=strides, data_type=DTYPE, name="k")
+    v = g.tensor(dim=dims, stride=strides, data_type=DTYPE, name="v")
+    ro = g.tensor(dim=(B + 1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT64, name="ro")
+    q.set_ragged_offset(ro)
+    k.set_ragged_offset(ro)
+    v.set_ragged_offset(ro)
+    cu_q = g.tensor(dim=(B + 1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT32, name="cu_q")
+    cu_kv = g.tensor(dim=(B + 1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT32, name="cu_kv")
+    kw = dict(cu_seq_len_q=cu_q, cu_seq_len_kv=cu_kv)
+    if extra_seq_len:
+        skv = g.tensor(dim=(B, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT32, name="skv")
+        kw["seq_len_kv"] = skv
+    o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True, use_causal_mask=True, use_padding_mask=True, **kw)
+    _finish_output(o, dims, strides)
+    o.set_ragged_offset(ro)
+    return g
+
+
+def test_probe_accepts_thd_cu_seq_len():
+    """THD with the (B+1,) cu_seq_len prefix-sum form (cuDNN 9.24+) is served:
+    the lowering derives per-batch lengths host-side from its inherent tolist
+    round-trip."""
+    assert engines.engine_name(512) in _eligible(_mk_thd_cu_graph())
+
+
+def test_probe_rejects_thd_cu_plus_seq_len():
+    """Both forms on one side is ambiguous (the backend has its own
+    precedence, which the python engines do not replicate) — declined."""
+    assert not _eligible(_mk_thd_cu_graph(extra_seq_len=True))
+
+
 @pytest.mark.parametrize("side", ["cu_seq_len_q", "cu_seq_len_kv"])
 def test_cu_seq_len_is_declined(side):
     """cu_seq_len_* (cuDNN 9.24+) are prefix sums — a different contract from
@@ -893,6 +979,9 @@ def _mk_bwd_graph(
     grad_strides: tuple | None = None,
     bias: bool = False,
     dbias: bool = False,
+    sink: bool = False,
+    dsink: bool = False,
+    seq_lens: str | None = None,  # "kv" / "both" (padding mask) or "q_only"
     **bwd_kwargs,
 ):
     g = _mk_graph()
@@ -921,6 +1010,18 @@ def _mk_bwd_graph(
     if dbias:
         dbias_t = g.tensor(dim=(1, H, s_q, s_kv), stride=(H * s_q * s_kv, s_q * s_kv, s_kv, 1), data_type=DTYPE, name="dBias")
         bwd_kwargs.update(dBias=dbias_t)
+    if sink:
+        sink_t = g.tensor(dim=(1, H, 1, 1), stride=(H, 1, 1, 1), data_type=cudnn.data_type.FLOAT, name="sink")
+        bwd_kwargs.update(sink_token=sink_t)
+    if dsink:
+        dsink_t = g.tensor(dim=(1, H, 1, 1), stride=(H, 1, 1, 1), data_type=cudnn.data_type.FLOAT, name="dSink")
+        bwd_kwargs.update(dSink_token=dsink_t)
+    if seq_lens in ("kv", "both"):
+        seq_kv_t = g.tensor(dim=(B, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT32, name="seq_kv")
+        bwd_kwargs.update(use_padding_mask=True, seq_len_kv=seq_kv_t)
+    if seq_lens in ("both", "q_only"):
+        seq_q_t = g.tensor(dim=(B, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT32, name="seq_q")
+        bwd_kwargs.update(seq_len_q=seq_q_t)
     dq, dk, dv = g.sdpa_backward(name="sb", q=q, k=k, v=v, o=o, dO=do, stats=stats, attn_scale=0.125, **bwd_kwargs)
     _finish_output(dq, q_dims, grad_strides or _bshd_strides(H, s_q, d))
     _finish_output(dk, (B, h_kv, s_kv, d), grad_strides or _bshd_strides(h_kv, s_kv, d))
@@ -959,6 +1060,10 @@ def test_bwd_facts_kv_transposed_view_canonicalized():
     facts = _facts(_mk_bwd_graph(kv_transposed_view=True))
     assert (facts.s_kv, facts.d_qk) == (S, _BWD_D)
     assert facts.bshd_layout
+    # port_layouts (what bwd lowering consumes) has the rewrite undone too.
+    ports = {name: (dim, stride) for name, dim, stride in facts.port_layouts}
+    assert ports["k"] == ((B, H, S, _BWD_D), _bshd_strides(H, S, _BWD_D))
+    assert ports["v"] == ((B, H, S, _BWD_D), _bshd_strides(H, S, _BWD_D))
 
 
 def test_bwd_probe_accepts(monkeypatch):
@@ -981,15 +1086,20 @@ def test_bwd_probe_rejects_forward_graph(monkeypatch):
     assert not _eligible(_mk_bwd_graph())
 
 
-def test_bwd_probe_rejects_gqa(monkeypatch):
+def test_bwd_probe_gqa(monkeypatch):
     monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
-    assert not _bwd_eligible(_mk_bwd_graph(h_kv=H // 2))
+    assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(h_kv=H // 2))
+    assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(h_kv=1))
+    assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(h_kv=H // 2, use_deterministic_algorithm=True))
+    # H_q must be a multiple of H_kv
+    assert not _bwd_eligible(_mk_bwd_graph(h_kv=3))
 
 
 def test_bwd_probe_rejects_unsupported_head_dim(monkeypatch):
+    # Envelope: any multiple of 8 up to 256 (adapter pads); reject the rest.
     monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
-    assert not _bwd_eligible(_mk_bwd_graph(d=96))
-    assert not _bwd_eligible(_mk_bwd_graph(d=256))
+    assert not _bwd_eligible(_mk_bwd_graph(d=100))
+    assert not _bwd_eligible(_mk_bwd_graph(d=264))
 
 
 def test_bwd_probe_causal_notches(monkeypatch):
@@ -1002,9 +1112,42 @@ def test_bwd_probe_causal_notches(monkeypatch):
     assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(s_q=S // 2, use_causal_mask_bottom_right=True, sliding_window_length=64))
 
 
-def test_bwd_probe_rejects_deterministic(monkeypatch):
+def test_bwd_probe_accepts_right_band_widening(monkeypatch):
+    # diagonal_band_right_bound > 0 lowers as causal with a right offset.
     monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
-    assert not _bwd_eligible(_mk_bwd_graph(use_deterministic_algorithm=True))
+    import cudnn
+
+    assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(diagonal_band_right_bound=16))
+    assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(s_q=S // 2, diagonal_band_right_bound=16, diagonal_alignment=cudnn.diagonal_alignment.BOTTOM_RIGHT))
+
+
+def test_bwd_probe_accepts_deterministic(monkeypatch):
+    # use_deterministic_algorithm is served by the ordered-relay dQ path.
+    monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
+    assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(use_deterministic_algorithm=True))
+
+
+def test_bwd_probe_accepts_padding_mask(monkeypatch):
+    monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
+    assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(seq_lens="kv"))
+    assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(seq_lens="both"))
+    assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(seq_lens="both", use_causal_mask_bottom_right=True))
+    assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(seq_lens="both", use_causal_mask=True, sliding_window_length=64))
+    assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(seq_lens="both", use_deterministic_algorithm=True))
+
+
+def test_bwd_probe_rejects_seq_len_q_without_padding_mask(monkeypatch):
+    # Bare seq_len_q is per-batch Q trimming, which the kernel has no path for.
+    monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
+    assert not _bwd_eligible(_mk_bwd_graph(seq_lens="q_only"))
+
+
+def test_bwd_probe_accepts_sink(monkeypatch):
+    # dSink without the sink input is rejected.
+    monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
+    assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(sink=True))
+    assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(sink=True, dsink=True, use_causal_mask=True))
+    assert not _bwd_eligible(_mk_bwd_graph(dsink=True))
 
 
 def test_bwd_probe_rejects_bias(monkeypatch):
@@ -1017,12 +1160,15 @@ def test_bwd_probe_rejects_dbias(monkeypatch):
     assert not _bwd_eligible(_mk_bwd_graph(dbias=True))
 
 
-def test_bwd_probe_rejects_non_bshd_layout(monkeypatch):
+def test_bwd_probe_accepts_dense_flex_layouts(monkeypatch):
+    # Same dense_flex envelope as the forward rows: any B/H/S order with the
+    # head dim innermost; the adapter stages to compact BSHD.
     monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
-    # BHSD-contiguous gradients are outside the strict-BSHD envelope (no
-    # normalization copy on the backward path, unlike the forward dense_flex).
     bhsd_contig = (H * S * _BWD_D, S * _BWD_D, _BWD_D, 1)
-    assert not _bwd_eligible(_mk_bwd_graph(grad_strides=bhsd_contig))
+    assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(grad_strides=bhsd_contig))
+    # Head dim NOT innermost (S innermost instead) is outside dense_flex.
+    s_innermost = (H * S * _BWD_D, S * _BWD_D, 1, S)
+    assert not _bwd_eligible(_mk_bwd_graph(grad_strides=s_innermost))
 
 
 def test_bwd_probe_rejects_strided_stats(monkeypatch):
@@ -1048,16 +1194,64 @@ def test_bwd_knob_domains(monkeypatch):
 def test_bwd_mismatch_reason_strings(monkeypatch):
     monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
     caps = bwd_engines.ENGINE_SPECS[0].capabilities
-    reason = bwd_engines.mismatch(caps, _facts(_mk_bwd_graph(h_kv=H // 2)))
-    assert reason is not None and "GQA" in reason
-    reason = bwd_engines.mismatch(caps, _facts(_mk_bwd_graph(d=96)))
-    assert reason is not None and "96" in reason
+    reason = bwd_engines.mismatch(caps, _facts(_mk_bwd_graph(d=100)))
+    assert reason is not None and "100" in reason
     reason = bwd_engines.mismatch(caps, _facts(_mk_bwd_graph(use_causal_mask=True, use_alibi_mask=True)))
     assert reason is not None and "ALiBi" in reason
-    reason = bwd_engines.mismatch(caps, _facts(_mk_bwd_graph(use_deterministic_algorithm=True)))
-    assert reason is not None and "deterministic" in reason
     reason = bwd_engines.mismatch(caps, _facts(_mk_bwd_graph()), engines.SdpaFwdKnobs(tile_m=64))
     assert reason is not None and "knob" in reason
     reason = bwd_engines.mismatch(caps, _facts(_mk_bwd_graph()), bwd_engines.SdpaBwdKnobs(tile_m=48))
     assert reason is not None and "tile_m=48" in reason
     assert bwd_engines.mismatch(caps, _facts(_mk_bwd_graph()), bwd_engines.SdpaBwdKnobs(tile_m=64, tile_n=128)) is None
+
+
+# ---------------------------------------------------------------------------
+# The SM80 backward row (sdpa_bwd_sm80): its envelope covers exactly the
+# features the SM120 row's kernel rejects.
+# ---------------------------------------------------------------------------
+
+_BWD_SM80 = "sdpa_bwd_sm80"
+
+
+def test_bwd_sm80_probe_accepts_the_sm120_rejections(monkeypatch):
+    monkeypatch.setattr(ga, "_device_cc", lambda: (8, 0))
+    assert _BWD_SM80 in _bwd_eligible(_mk_bwd_graph())
+    assert _BWD_SM80 in _bwd_eligible(_mk_bwd_graph(use_causal_mask=True))
+    assert _BWD_SM80 in _bwd_eligible(_mk_bwd_graph(h_kv=H // 2))  # GQA
+    assert _BWD_SM80 in _bwd_eligible(_mk_bwd_graph(use_deterministic_algorithm=True))
+    # Flavor envelope: any head dim <= 256 (no multiple-of-16 rule) and
+    # top-left causal with S_q != S_kv.
+    assert _BWD_SM80 in _bwd_eligible(_mk_bwd_graph(d=96))
+    assert _BWD_SM80 in _bwd_eligible(_mk_bwd_graph(use_causal_mask=True, s_q=S // 2))
+
+
+def test_bwd_sm80_probe_rejections(monkeypatch):
+    monkeypatch.setattr(ga, "_device_cc", lambda: (8, 0))
+    assert not _bwd_eligible(_mk_bwd_graph(s_q=1))  # decode-shaped: prefill kernels only
+    assert not _bwd_eligible(_mk_bwd_graph(d=257))  # beyond the qwen (256, 256) envelope
+
+
+def test_bwd_sm80_probe_rejects_off_arch(monkeypatch):
+    monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
+    assert _BWD_SM80 not in _bwd_eligible(_mk_bwd_graph())
+
+
+def test_bwd_dsink_fact():
+    d = 128
+    g = _mk_graph()
+    dims = (B, H, S, d)
+    strides = (S * H * d, d, H * d, 1)
+    q = g.tensor(dim=dims, stride=strides, data_type=DTYPE, name="q")
+    k = g.tensor(dim=dims, stride=strides, data_type=DTYPE, name="k")
+    v = g.tensor(dim=dims, stride=strides, data_type=DTYPE, name="v")
+    o = g.tensor(dim=dims, stride=strides, data_type=DTYPE, name="o")
+    do = g.tensor(dim=dims, stride=strides, data_type=DTYPE, name="dO")
+    stats = g.tensor(dim=(B, H, S, 1), stride=(H * S, S, 1, 1), data_type=cudnn.data_type.FLOAT, name="stats")
+    sink = g.tensor(dim=(1, H, 1, 1), stride=(H, 1, 1, 1), data_type=cudnn.data_type.FLOAT, name="sink")
+    dsink = g.tensor(dim=(1, H, 1, 1), stride=(H, 1, 1, 1), data_type=cudnn.data_type.FLOAT, name="dsink")
+    dq, dk, dv = g.sdpa_backward(q=q, k=k, v=v, o=o, dO=do, stats=stats, attn_scale=0.5, use_causal_mask=True, sink_token=sink, dSink_token=dsink)
+    for t in (dq, dk, dv):
+        _finish_output(t, dims, strides)
+    facts = _facts(g)
+    assert facts.has_sink and facts.has_dsink
+    assert facts.sink_t is not None and facts.dsink_t is not None

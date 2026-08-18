@@ -21,17 +21,13 @@ symbols_to_import = [
     "backend_version",
     "backend_version_string",
     "get_last_error_string",
-    "destroy_handle",
     "norm_forward_phase",
     "reduction_mode",
     "behavior_note",
     "knob_type",
-    "create_handle",
     "create_kernel_cache",
     "create_device_properties",
-    "get_stream",
     "numerical_note",
-    "set_stream",
     "build_plan_policy",
     "data_type",
     "tensor_reordering",
@@ -63,6 +59,82 @@ for _optional_symbol in [
 ]:
     if hasattr(_pybind_module, _optional_symbol):
         globals()[_optional_symbol] = getattr(_pybind_module, _optional_symbol)
+
+
+from ._handle import Handle, DeviceInfo
+
+# Type alias for the annotations that reference ``cudnn.handle`` (a supplied handle
+# is a cudnn.Handle, or a bare int for a framework-created foreign handle).
+handle = Handle
+
+
+def create_handle():
+    """Create a cuDNN handle, returned as a first-class :class:`cudnn.Handle`.
+
+    The Handle wraps the backend ``cudnnHandle_t`` and is bound to the current
+    CUDA device. Anywhere the backend needs the raw ``cudnnHandle_t`` it is
+    extracted explicitly via ``to_backend_handle()`` (grep it to trace every
+    handoff) -- the Handle is never silently coerced to an int, so a Handle that
+    reaches a binding unconverted fails loudly rather than being magically cast.
+    """
+    raw = _pybind_module.create_handle()
+    ordinal = None
+    try:
+        from .frost.device import current_device
+
+        ordinal = current_device()
+    except Exception:
+        ordinal = None  # no GPU visible / cuda-python absent: resolve lazily on .device
+    # Seed the stream from the backend's actual stream (a fresh handle runs on
+    # stream 0) so a python plan and a backend plan on this handle agree on the
+    # stream, instead of the python side falling back to torch's current stream.
+    return Handle(raw, ordinal, _pybind_module.get_stream(raw))
+
+
+def set_stream(handle, stream):
+    """Set the CUDA stream a cuDNN handle runs on (wraps the compiled ``cudnnSetStream``).
+
+    ``cudnnSetStream`` is not free: for a non-null stream it issues several CUDA driver queries
+    on every call (green-context detection, stream priority, priority range) to maintain cuDNN's
+    internal per-priority stream pool, even when the stream is unchanged -- ~2.4us/call on
+    Blackwell. Frameworks that call this before every ``execute`` pay it every iteration, so the
+    :class:`cudnn.Handle` remembers its last stream and skips the backend call when it has not
+    changed; a steady-state loop pays it once. (Assumes a Handle is not driven from two streams
+    concurrently, which is the normal single-stream case; a caller that does needs its own handle
+    per stream regardless.)
+    """
+    if not isinstance(handle, Handle):
+        raise TypeError(f"cudnn.set_stream expects a cudnn.Handle (from cudnn.create_handle()), got {type(handle).__name__}")
+    if handle.stream == stream:
+        return
+    if handle.backend_handle is not None:
+        _pybind_module._raw_set_stream(handle.backend_handle, stream)
+    handle.stream = stream
+
+
+def get_stream(handle):
+    """The CUDA stream a :class:`cudnn.Handle` runs on -- the cached ``Handle.stream``, no
+    backend round-trip."""
+    if not isinstance(handle, Handle):
+        raise TypeError(f"cudnn.get_stream expects a cudnn.Handle (from cudnn.create_handle()), got {type(handle).__name__}")
+    return handle.stream
+
+
+def destroy_handle(handle):
+    """Destroy a :class:`cudnn.Handle` (wraps the compiled binding). The backend handle is cleared
+    after destruction so a reused Handle object cannot pass a released ``cudnnHandle_t`` back to
+    C++ (a double-destroy or a later set_stream)."""
+    if not isinstance(handle, Handle):
+        raise TypeError(f"cudnn.destroy_handle expects a cudnn.Handle (from cudnn.create_handle()), got {type(handle).__name__}")
+    backend = handle.backend_handle
+    if backend is None:
+        handle.stream = None
+        return None
+    _pybind_module._raw_destroy_handle(backend)
+    handle.backend_handle = None
+    handle.stream = None
+    return None
+
 
 from .datatypes import _library_type, _is_torch_tensor
 
@@ -122,93 +194,6 @@ def _set_data_type(
 
 _pybind_module.tensor.set_data_type = _set_data_type
 _pybind_module.backend_graph.tensor = _tensor
-
-
-def _library_device_pointer(input_tensor):
-    # either pass in pointers directly
-    if type(input_tensor) is int:
-        return input_tensor
-    # directly extract data pointer for torch tensors
-    elif _is_torch_tensor(input_tensor):
-        return input_tensor.data_ptr()
-    # fall back to dlpack support by library
-    else:
-        return _pybind_module._get_data_ptr(input_tensor)
-
-
-def _execute(
-    self,
-    tensor_to_device_buffer,
-    workspace,
-    handle=None,
-    override_uids=None,
-    override_shapes=None,
-    override_strides=None,
-):
-    """
-    Execute a cudnn graph.
-
-    Args:
-        tensor_to_device_buffer (dict(cudnn_tensor, Union[torch.Tensor, int, __dlpack__])): The dimensions of the tensor.
-        workspace (Union[torch.Tensor, int, __dlpack__]): The name of the tensor.
-        handle: cudnn_handle created with cudnn.create_handle()
-    Returns:
-        None
-    """
-    uid_to_tensor_pointer = {
-        x if type(x) is int else x.get_uid(): _library_device_pointer(pointer) for x, pointer in tensor_to_device_buffer.items() if x is not None
-    }
-
-    workspace_pointer = _library_device_pointer(workspace)
-    self._execute(
-        uid_to_tensor_pointer,
-        workspace_pointer,
-        handle,
-        override_uids,
-        override_shapes,
-        override_strides,
-    )
-
-
-def _execute_plan_at_index(
-    self,
-    tensor_to_device_buffer,
-    workspace,
-    index,
-    handle=None,
-    override_uids=None,
-    override_shapes=None,
-    override_strides=None,
-):
-    """
-    Execute a cudnn graph.
-
-    Args:
-        tensor_to_device_buffer (dict(cudnn_tensor, Union[torch.Tensor, int, __dlpack__])): The dimensions of the tensor.
-        workspace (Union[torch.Tensor, int, __dlpack__]): The name of the tensor.
-        index(int): Location of execution plan to use.
-        handle: cudnn_handle created with cudnn.create_handle()
-    Returns:
-        None
-    """
-    uid_to_tensor_pointer = {
-        x if type(x) is int else x.get_uid(): _library_device_pointer(pointer) for x, pointer in tensor_to_device_buffer.items() if x is not None
-    }
-
-    workspace_pointer = _library_device_pointer(workspace)
-    self._execute_plan_at_index(
-        uid_to_tensor_pointer,
-        workspace_pointer,
-        index,
-        handle,
-        override_uids,
-        override_shapes,
-        override_strides,
-    )
-
-
-_pybind_module.backend_graph.execute = _execute
-_pybind_module.backend_graph.execute_plan_at_index = _execute_plan_at_index
 
 
 def load_cudnn():
@@ -298,6 +283,12 @@ _EAGER_PUBLIC_NAMES = (
         )
         if symbol in globals()
     ),
+    "create_handle",
+    "destroy_handle",
+    "get_stream",
+    "set_stream",
+    "Handle",
+    "DeviceInfo",
     "__version__",
     "NodeType",
     "Tensor",
@@ -325,20 +316,32 @@ _LAZY_OPTIONAL_IMPORTS = {
     "NSA": (".native_sparse_attention", "NSA"),
     "GemmSwigluSm100": (".gemm.cutedsl.dense.swiglu", "GemmSwigluSm100"),
     "gemm_swiglu_wrapper_sm100": (".gemm.cutedsl.dense.swiglu", "gemm_swiglu_wrapper_sm100"),
+    "gemm_swiglu_jax_sm100": (".gemm.cutedsl.dense.swiglu", "gemm_swiglu_jax_sm100"),
+    "gemm_srelu_jax_sm100": (".gemm.cutedsl.dense.srelu", "gemm_srelu_jax_sm100"),
+    "gemm_dsrelu_jax_sm100": (".gemm.cutedsl.dense.dsrelu", "gemm_dsrelu_jax_sm100"),
     "GemmSreluSm100": (".gemm.cutedsl.dense.srelu", "GemmSreluSm100"),
     "gemm_srelu_wrapper_sm100": (".gemm.cutedsl.dense.srelu", "gemm_srelu_wrapper_sm100"),
     "GemmDsreluSm100": (".gemm.cutedsl.dense.dsrelu", "GemmDsreluSm100"),
     "gemm_dsrelu_wrapper_sm100": (".gemm.cutedsl.dense.dsrelu", "gemm_dsrelu_wrapper_sm100"),
     "GemmAmaxSm100": (".gemm.cutedsl.dense.amax", "GemmAmaxSm100"),
     "gemm_amax_wrapper_sm100": (".gemm.cutedsl.dense.amax", "gemm_amax_wrapper_sm100"),
+    "gemm_amax_jax_sm100": (".gemm.cutedsl.dense.amax", "gemm_amax_jax_sm100"),
     "GemmProjRopeMxfp8Bf16InSm100": (".gemm.cutedsl.dense.proj_rope_mxfp8", "GemmProjRopeMxfp8Bf16InSm100"),
     "GemmProjRopeMxfp8Mxfp8InSm100": (".gemm.cutedsl.dense.proj_rope_mxfp8", "GemmProjRopeMxfp8Mxfp8InSm100"),
     "gemm_proj_rope_mxfp8_wrapper_sm100": (".gemm.cutedsl.dense.proj_rope_mxfp8", "gemm_proj_rope_mxfp8_wrapper_sm100"),
+    "gemm_proj_rope_mxfp8_jax_sm100": (".gemm.cutedsl.dense.proj_rope_mxfp8", "gemm_proj_rope_mxfp8_jax_sm100"),
     "RmsNormRhtAmaxSm100": (".rmsnorm_rht_amax", "RmsNormRhtAmaxSm100"),
     "rmsnorm_rht_amax_wrapper_sm100": (".rmsnorm_rht_amax", "rmsnorm_rht_amax_wrapper_sm100"),
     "grouped_gemm": (".gemm.cutedsl.grouped", None),
     "GroupedGemmSm100": (".gemm.cutedsl.grouped", "GroupedGemmSm100"),
     "grouped_gemm_wrapper_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_wrapper_sm100"),
+    "grouped_gemm_jax_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_jax_sm100"),
+    "grouped_gemm_glu_jax_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_glu_jax_sm100"),
+    "grouped_gemm_dglu_jax_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_dglu_jax_sm100"),
+    "grouped_gemm_dsrelu_jax_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_dsrelu_jax_sm100"),
+    "grouped_gemm_wgrad_jax_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_wgrad_jax_sm100"),
+    "discrete_grouped_gemm_swiglu_jax_sm100": (".gemm.cutedsl.discrete_grouped", "discrete_grouped_gemm_swiglu_jax_sm100"),
+    "discrete_grouped_gemm_dswiglu_jax_sm100": (".gemm.cutedsl.discrete_grouped", "discrete_grouped_gemm_dswiglu_jax_sm100"),
     "GroupedGemmSwigluSm100": (".gemm.cutedsl.grouped", "GroupedGemmSwigluSm100"),
     "grouped_gemm_swiglu_wrapper_sm100": (".gemm.cutedsl.grouped", "grouped_gemm_swiglu_wrapper_sm100"),
     "GroupedGemmDswigluSm100": (".gemm.cutedsl.grouped", "GroupedGemmDswigluSm100"),
@@ -406,10 +409,25 @@ def __getattr__(name: str) -> Any:
         globals()["experimental"] = _experimental
         return _experimental
 
+    if name == "jax":
+        # `import cudnn; cudnn.jax.call` works like `import cudnn.jax`.
+        # Deferred so torch-only users never pay the jax import (the submodule
+        # itself raises a descriptive ImportError when jax >= 0.5 is missing).
+        _jax = importlib.import_module(".jax", __name__)
+        globals()["jax"] = _jax
+        return _jax
+
+    if name == "fla":
+        # `import cudnn; cudnn.fla.accelerate_fla()` works like `import cudnn.fla`.
+        # Deferred so `import cudnn` never eagerly imports torch / the FLA shim.
+        _fla = importlib.import_module(".fla", __name__)
+        globals()["fla"] = _fla
+        return _fla
+
     if name in _LAZY_OPTIONAL_IMPORTS:
         return _load_optional_symbol(name)
 
-    raise AttributeError(name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def __dir__():

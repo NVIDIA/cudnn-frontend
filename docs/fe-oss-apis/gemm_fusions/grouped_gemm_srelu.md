@@ -2,6 +2,10 @@
 
 **This is an experimental API and subject to change.**
 
+## JAX support
+
+JAX arrays are **not supported**: both dense and discrete modes consume the SFA scale-factor tensor as an MMA-permuted strided cute tensor argument, a layout with no row-major (JAX) equivalent. JAX inputs raise a clear `ValueError` at the entry points. The API is otherwise type-erased and torch-lazy.
+
 ## Overview
 
 **Grouped GEMM + sReLU fusion**: A grouped block-scaled GEMM fused with a probability-gated squared-ReLU epilogue on NVIDIA Blackwell GPUs (SM100+), designed for MoE-style workloads. The API supports dense contiguous weights and discrete per-expert weight allocations. Groups are contiguous in the `M` dimension and described by `padded_offsets`.

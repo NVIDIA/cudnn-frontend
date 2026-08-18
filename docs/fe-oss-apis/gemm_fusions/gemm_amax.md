@@ -63,6 +63,8 @@ A (MxKxL), SFA                   B (NxKxL), SFB
 
 ## API Usage
 
+The tensor parameters are type-erased: torch tensors and JAX arrays are both accepted. torch is only imported when torch tensors/dtypes are passed, and jax only when JAX arrays are passed. Dtype parameters (`c_dtype`, `acc_dtype`) accept torch dtypes, numpy/ml_dtypes dtypes, dtype name strings, or `cutlass` types.
+
 ### High-level wrapper
 ```python
 result = gemm_amax_wrapper_sm100(
@@ -101,6 +103,53 @@ op = GemmAmaxSm100(
 assert op.check_support()
 op.compile()
 op.execute(a, b, sfa, sfb, c, amax, current_stream=None)
+```
+
+### Using JAX arrays
+
+Two integration levels are available:
+
+1. **`gemm_amax_jax_sm100`** (recommended for jitted programs) — an XLA custom call built on `cudnn.jax.call` (CuTeDSL's native `cutlass.jax` bridge). The kernel runs on XLA's compute stream (correctly ordered with surrounding ops), outputs are XLA-managed fresh arrays, and the call composes with `jax.jit`. No manual synchronization is needed. Requires the `jax` dependency group (`pip install --group jax`; jax >= 0.5).
+
+```python
+from cudnn import gemm_amax_jax_sm100
+
+@jax.jit
+def quantized_matmul(a, b, sfa, sfb):
+    c, amax = gemm_amax_jax_sm100(a, b, sfa, sfb, c_dtype=jnp.float32, sf_vec_size=32)
+    return c, amax
+```
+
+Calling it eagerly works but re-traces the custom call on every invocation; call it from inside a jitted function in hot loops.
+
+2. **The eager entry points below** (`gemm_amax_wrapper_sm100`, `GemmAmaxSm100`) also accept JAX arrays via DLPack. In hot loops prefer the **class API with pre-allocated output buffers** (~15 µs CPU per launch) over the wrapper — per-call `jnp` output allocation in the wrapper costs hundreds of µs of XLA dispatch.
+
+JAX arrays are always row-major (C-contiguous) and immutable-by-contract, so the JAX contract differs from torch in a few ways (all entry points):
+
+- `A`/`B` must be k-major `(M, K, 1)` / `(N, K, 1)` C-contiguous arrays, and the batch dim must be `L == 1` (batch-outermost layouts are not expressible as JAX arrays).
+- `C` supports `c_major="n"` only (the wrapper raises for `"m"`).
+- `SFA`/`SFB` are passed in the **physical C-contiguous atom shape** `(L, ceil_div(MN, 128), ceil_div(K, 4·sf_vec_size), 32, 4, 4)` — byte-identical in memory to the torch-style logical view above (which is this allocation permuted by `(3, 4, 1, 5, 2, 0)`). Both forms are accepted for either framework.
+- Packed fp4 has no JAX dtype; the intended vehicle is a `uint8` container tensor (`(M, K // 2, 1)`), but that container path is currently disabled kernel-side for torch and JAX alike. FP8 flavors (`float8_e4m3fn`, `float8_e5m2`, `float8_e8m0fnu` via ml_dtypes) are fully supported.
+- Eager entry points only: with no explicit stream, the kernel launches on the **CUDA legacy default stream**, which XLA does not track. `jax.block_until_ready(...)` your inputs before calling, and synchronize the device (or the stream you passed) before reading the outputs. (`gemm_amax_jax_sm100` has neither caveat — XLA orders it on its own stream.)
+- The eager wrapper allocates outputs with `jnp.empty`/`jnp.full` and the kernel writes into them via DLPack. This is outside JAX's functional model: eager use only — do not call the wrapper under `jax.jit` or with donated buffers. Use `gemm_amax_jax_sm100` under `jit`.
+
+```python
+import jax, jax.numpy as jnp
+import ml_dtypes
+import numpy as np
+from cudnn import gemm_amax_wrapper_sm100
+
+m, n, k, sf_vec_size = 512, 256, 256, 32
+a = jax.device_put(np.random.randn(m, k, 1).astype(ml_dtypes.float8_e5m2))
+b = jax.device_put(np.random.randn(n, k, 1).astype(ml_dtypes.float8_e5m2))
+sfa = jax.device_put(np.ones((1, m // 128, k // (4 * sf_vec_size), 32, 4, 4), dtype=ml_dtypes.float8_e8m0fnu))
+sfb = jax.device_put(np.ones((1, n // 128, k // (4 * sf_vec_size), 32, 4, 4), dtype=ml_dtypes.float8_e8m0fnu))
+jax.block_until_ready((a, b, sfa, sfb))
+
+c, amax = gemm_amax_wrapper_sm100(a, b, sfa, sfb, c_dtype=jnp.float32, sf_vec_size=sf_vec_size)
+
+from cuda.bindings import runtime as cudart
+cudart.cudaDeviceSynchronize()  # kernel ran on the legacy stream, outside XLA's tracking
 ```
 
 ---
@@ -199,9 +248,16 @@ Tuple unpacking order is: `(c_tensor, amax_tensor)`.
 ### Environment
 
 - Requires CUDA with SM100+ compute capability
+- All tensors must reside on the same CUDA device
+
+### JAX-specific constraints
+
+- `L == 1`; `A`/`B` k-major; `C` n-major only
+- `SFA`/`SFB` in the physical atom shape `(L, MN', K', 32, 4, 4)` (see "Using JAX arrays")
+- The wrapper/class entry points are eager-only (use `gemm_amax_jax_sm100` under `jax.jit`); synchronize before reading outputs
 
 ---
 
 ## Usage examples
 
-For usage examples, see test cases in `test/python/fe_api/gemm/test_gemm_amax.py`
+For usage examples, see test cases in `test/python/fe_api/gemm/test_gemm_amax.py` (torch) and `test/python/fe_api/gemm/test_gemm_amax_jax.py` (JAX)

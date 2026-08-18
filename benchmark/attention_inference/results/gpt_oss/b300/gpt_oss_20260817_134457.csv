@@ -1,0 +1,1849 @@
+config_name,model_name,phase,backend,data_type,kv_cache_dtype,batch_size,q_tokens,kv_len,num_q_heads,num_kv_heads,head_dim_qk,head_dim_vo,kind,sliding_window_size,page_size,time_ms,tflops,gbps,sol_pct,num_iterations,success,error_message,gpu_name,backend_detail,cudnn_backend_version
+gpt_oss,gpt_oss_swa,context,cudnn,bfloat16,bfloat16,1,2048,2048,64,8,64,64,gqa,128.0,16,0.060544,567.517,623.493,7.7937,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_swa,context,cudnn,bfloat16,bfloat16,1,8192,8192,64,8,64,64,gqa,128.0,16,0.133312,4123.828,1132.643,14.158,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_swa,context,cudnn,bfloat16,bfloat16,1,32768,32768,64,8,64,64,gqa,128.0,16,0.427936,20554.693,1411.379,17.6422,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_swa,context,cudnn,bfloat16,bfloat16,1,512,65536,64,8,64,64,gqa,128.0,16,0.027808,19769.7,348.796,4.36,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_swa,context,cudnn,bfloat16,bfloat16,1,512,131072,64,8,64,64,gqa,128.0,16,0.040736,26991.153,238.102,2.9763,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_swa,context,cudnn,bfloat16,bfloat16,1,1024,65536,64,8,64,64,gqa,128.0,16,0.048096,22860.77,397.882,4.9735,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_swa,context,cudnn,bfloat16,bfloat16,1,1024,131072,64,8,64,64,gqa,128.0,16,0.048672,45180.456,393.173,4.9147,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_swa,generation,cudnn,bfloat16,bfloat16,1,1,131072,64,8,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"Traceback (most recent call last):
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 744, in <module>
+    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 169, in setup_cudnn
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: decode only mode, i.e. s_q == 1, not supported with sink_token",,,
+gpt_oss,gpt_oss_swa,generation,cudnn,bfloat16,fp8_e4m3,1,1,131072,64,8,64,64,gqa,128.0,16,0.98448,2.181,0.151,0.0019,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_swa,generation,cudnn,bfloat16,bfloat16,128,1,131072,64,8,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"Traceback (most recent call last):
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 744, in <module>
+    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 169, in setup_cudnn
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: decode only mode, i.e. s_q == 1, not supported with sink_token",,,
+gpt_oss,gpt_oss_swa,generation,cudnn,bfloat16,fp8_e4m3,128,1,131072,64,8,64,64,gqa,128.0,16,52.131329,5.273,0.365,0.0046,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_swa,generation,cudnn,bfloat16,bfloat16,1,2,131072,64,8,64,64,gqa,128.0,16,0.039616,108.415,7.548,0.0943,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_swa,generation,cudnn,bfloat16,fp8_e4m3,1,2,131072,64,8,64,64,gqa,128.0,16,0.037152,115.605,4.465,0.0558,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_swa,generation,cudnn,bfloat16,bfloat16,128,2,131072,64,8,64,64,gqa,128.0,16,0.306848,1791.623,124.73,1.5591,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_swa,generation,cudnn,bfloat16,fp8_e4m3,128,2,131072,64,8,64,64,gqa,128.0,16,0.502784,1093.423,42.232,0.5279,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_swa,generation,cudnn,bfloat16,bfloat16,1,3,131072,64,8,64,64,gqa,128.0,16,0.040544,158.9,7.83,0.0979,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_swa,generation,cudnn,bfloat16,fp8_e4m3,1,3,131072,64,8,64,64,gqa,128.0,16,0.056672,113.68,3.234,0.0404,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_swa,generation,cudnn,bfloat16,bfloat16,128,3,131072,64,8,64,64,gqa,128.0,16,0.308128,2676.27,131.868,1.6484,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_swa,generation,cudnn,bfloat16,fp8_e4m3,128,3,131072,64,8,64,64,gqa,128.0,16,0.521696,1580.679,44.972,0.5622,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_swa,generation,cudnn,bfloat16,bfloat16,1,4,131072,64,8,64,64,gqa,128.0,16,0.040608,211.533,8.271,0.1034,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_swa,generation,cudnn,bfloat16,fp8_e4m3,1,4,131072,64,8,64,64,gqa,128.0,16,0.056576,151.83,3.548,0.0443,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_swa,generation,cudnn,bfloat16,bfloat16,128,4,131072,64,8,64,64,gqa,128.0,16,0.3088,3560.595,139.222,1.7403,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_swa,generation,cudnn,bfloat16,fp8_e4m3,128,4,131072,64,8,64,64,gqa,128.0,16,0.503488,2183.789,51.024,0.6378,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_swa,context,cudnn_oss,bfloat16,bfloat16,1,2048,2048,64,8,64,64,gqa,128.0,16,0.202016,170.084,186.86,2.3358,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_swa,context,cudnn_oss,bfloat16,bfloat16,1,8192,8192,64,8,64,64,gqa,128.0,16,0.495008,1110.6,305.035,3.8129,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_swa,context,cudnn_oss,bfloat16,bfloat16,1,32768,32768,64,8,64,64,gqa,128.0,16,1.690624,5202.868,357.253,4.4657,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_swa,context,cudnn_oss,bfloat16,bfloat16,1,512,65536,64,8,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa,context,cudnn_oss,bfloat16,bfloat16,1,512,131072,64,8,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa,context,cudnn_oss,bfloat16,bfloat16,1,1024,65536,64,8,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa,context,cudnn_oss,bfloat16,bfloat16,1,1024,131072,64,8,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa,generation,cudnn_oss,bfloat16,bfloat16,1,1,131072,64,8,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 169, in setup_cudnn
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: decode only mode, i.e. s_q == 1, not supported with sink_token",,,
+gpt_oss,gpt_oss_swa,generation,cudnn_oss,bfloat16,fp8_e4m3,1,1,131072,64,8,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa,generation,cudnn_oss,bfloat16,bfloat16,128,1,131072,64,8,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 169, in setup_cudnn
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: decode only mode, i.e. s_q == 1, not supported with sink_token",,,
+gpt_oss,gpt_oss_swa,generation,cudnn_oss,bfloat16,fp8_e4m3,128,1,131072,64,8,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa,generation,cudnn_oss,bfloat16,bfloat16,1,2,131072,64,8,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa,generation,cudnn_oss,bfloat16,fp8_e4m3,1,2,131072,64,8,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa,generation,cudnn_oss,bfloat16,bfloat16,128,2,131072,64,8,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa,generation,cudnn_oss,bfloat16,fp8_e4m3,128,2,131072,64,8,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa,generation,cudnn_oss,bfloat16,bfloat16,1,3,131072,64,8,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa,generation,cudnn_oss,bfloat16,fp8_e4m3,1,3,131072,64,8,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa,generation,cudnn_oss,bfloat16,bfloat16,128,3,131072,64,8,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa,generation,cudnn_oss,bfloat16,fp8_e4m3,128,3,131072,64,8,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa,generation,cudnn_oss,bfloat16,bfloat16,1,4,131072,64,8,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa,generation,cudnn_oss,bfloat16,fp8_e4m3,1,4,131072,64,8,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa,generation,cudnn_oss,bfloat16,bfloat16,128,4,131072,64,8,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa,generation,cudnn_oss,bfloat16,fp8_e4m3,128,4,131072,64,8,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa-tp2,context,cudnn,bfloat16,bfloat16,1,2048,2048,32,4,64,64,gqa,128.0,16,0.04768,360.316,395.855,4.9482,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_swa-tp2,context,cudnn,bfloat16,bfloat16,1,8192,8192,32,4,64,64,gqa,128.0,16,0.084032,3271.11,898.437,11.2305,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_swa-tp2,context,cudnn,bfloat16,bfloat16,1,32768,32768,32,4,64,64,gqa,128.0,16,0.233696,18819.52,1292.234,16.1529,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_swa-tp2,context,cudnn,bfloat16,bfloat16,1,512,65536,32,4,64,64,gqa,128.0,16,0.041056,6695.195,118.123,1.4765,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_swa-tp2,context,cudnn,bfloat16,bfloat16,1,512,131072,32,4,64,64,gqa,128.0,16,0.04032,13634.816,120.279,1.5035,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_swa-tp2,context,cudnn,bfloat16,bfloat16,1,1024,65536,32,4,64,64,gqa,128.0,16,0.040032,13732.909,239.015,2.9877,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_swa-tp2,context,cudnn,bfloat16,bfloat16,1,1024,131072,32,4,64,64,gqa,128.0,16,0.040064,27443.881,238.824,2.9853,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_swa-tp2,generation,cudnn,bfloat16,bfloat16,1,1,131072,32,4,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"Traceback (most recent call last):
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 744, in <module>
+    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 169, in setup_cudnn
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: decode only mode, i.e. s_q == 1, not supported with sink_token",,,
+gpt_oss,gpt_oss_swa-tp2,generation,cudnn,bfloat16,fp8_e4m3,1,1,131072,32,4,64,64,gqa,128.0,16,0.98448,1.091,0.075,0.0009,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_swa-tp2,generation,cudnn,bfloat16,bfloat16,128,1,131072,32,4,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"Traceback (most recent call last):
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 744, in <module>
+    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 169, in setup_cudnn
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: decode only mode, i.e. s_q == 1, not supported with sink_token",,,
+gpt_oss,gpt_oss_swa-tp2,generation,cudnn,bfloat16,fp8_e4m3,128,1,131072,32,4,64,64,gqa,128.0,16,26.106848,5.264,0.364,0.0045,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_swa-tp2,generation,cudnn,bfloat16,bfloat16,1,2,131072,32,4,64,64,gqa,128.0,16,0.039744,54.033,3.762,0.047,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_swa-tp2,generation,cudnn,bfloat16,fp8_e4m3,1,2,131072,32,4,64,64,gqa,128.0,16,0.05568,38.568,1.49,0.0186,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_swa-tp2,generation,cudnn,bfloat16,bfloat16,128,2,131072,32,4,64,64,gqa,128.0,16,0.1696,1620.742,112.833,1.4104,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_swa-tp2,generation,cudnn,bfloat16,fp8_e4m3,128,2,131072,32,4,64,64,gqa,128.0,16,0.286464,959.555,37.062,0.4633,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_swa-tp2,generation,cudnn,bfloat16,bfloat16,1,3,131072,32,4,64,64,gqa,128.0,16,0.039968,80.595,3.971,0.0496,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_swa-tp2,generation,cudnn,bfloat16,fp8_e4m3,1,3,131072,32,4,64,64,gqa,128.0,16,0.056832,56.68,1.613,0.0202,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_swa-tp2,generation,cudnn,bfloat16,bfloat16,128,3,131072,32,4,64,64,gqa,128.0,16,0.1696,2431.114,119.789,1.4974,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_swa-tp2,generation,cudnn,bfloat16,fp8_e4m3,128,3,131072,32,4,64,64,gqa,128.0,16,0.286656,1438.368,40.923,0.5115,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_swa-tp2,generation,cudnn,bfloat16,bfloat16,1,4,131072,32,4,64,64,gqa,128.0,16,0.039456,108.855,4.256,0.0532,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_swa-tp2,generation,cudnn,bfloat16,fp8_e4m3,1,4,131072,32,4,64,64,gqa,128.0,16,0.056672,75.786,1.771,0.0221,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_swa-tp2,generation,cudnn,bfloat16,bfloat16,128,4,131072,32,4,64,64,gqa,128.0,16,0.169472,3243.933,126.84,1.5855,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_swa-tp2,generation,cudnn,bfloat16,fp8_e4m3,128,4,131072,32,4,64,64,gqa,128.0,16,0.288192,1907.603,44.571,0.5571,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_swa-tp2,context,cudnn_oss,bfloat16,bfloat16,1,2048,2048,32,4,64,64,gqa,128.0,16,0.169312,101.469,111.477,1.3935,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_swa-tp2,context,cudnn_oss,bfloat16,bfloat16,1,8192,8192,32,4,64,64,gqa,128.0,16,0.250528,1097.194,301.353,3.7669,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_swa-tp2,context,cudnn_oss,bfloat16,bfloat16,1,32768,32768,32,4,64,64,gqa,128.0,16,0.904192,4864.063,333.989,4.1749,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_swa-tp2,context,cudnn_oss,bfloat16,bfloat16,1,512,65536,32,4,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa-tp2,context,cudnn_oss,bfloat16,bfloat16,1,512,131072,32,4,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa-tp2,context,cudnn_oss,bfloat16,bfloat16,1,1024,65536,32,4,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa-tp2,context,cudnn_oss,bfloat16,bfloat16,1,1024,131072,32,4,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa-tp2,generation,cudnn_oss,bfloat16,bfloat16,1,1,131072,32,4,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 169, in setup_cudnn
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: decode only mode, i.e. s_q == 1, not supported with sink_token",,,
+gpt_oss,gpt_oss_swa-tp2,generation,cudnn_oss,bfloat16,fp8_e4m3,1,1,131072,32,4,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa-tp2,generation,cudnn_oss,bfloat16,bfloat16,128,1,131072,32,4,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 169, in setup_cudnn
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: decode only mode, i.e. s_q == 1, not supported with sink_token",,,
+gpt_oss,gpt_oss_swa-tp2,generation,cudnn_oss,bfloat16,fp8_e4m3,128,1,131072,32,4,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa-tp2,generation,cudnn_oss,bfloat16,bfloat16,1,2,131072,32,4,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa-tp2,generation,cudnn_oss,bfloat16,fp8_e4m3,1,2,131072,32,4,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa-tp2,generation,cudnn_oss,bfloat16,bfloat16,128,2,131072,32,4,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa-tp2,generation,cudnn_oss,bfloat16,fp8_e4m3,128,2,131072,32,4,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa-tp2,generation,cudnn_oss,bfloat16,bfloat16,1,3,131072,32,4,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa-tp2,generation,cudnn_oss,bfloat16,fp8_e4m3,1,3,131072,32,4,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa-tp2,generation,cudnn_oss,bfloat16,bfloat16,128,3,131072,32,4,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa-tp2,generation,cudnn_oss,bfloat16,fp8_e4m3,128,3,131072,32,4,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa-tp2,generation,cudnn_oss,bfloat16,bfloat16,1,4,131072,32,4,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa-tp2,generation,cudnn_oss,bfloat16,fp8_e4m3,1,4,131072,32,4,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa-tp2,generation,cudnn_oss,bfloat16,bfloat16,128,4,131072,32,4,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa-tp2,generation,cudnn_oss,bfloat16,fp8_e4m3,128,4,131072,32,4,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa-tp4,context,cudnn,bfloat16,bfloat16,1,2048,2048,16,2,64,64,gqa,128.0,16,0.039104,219.669,241.336,3.0167,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_swa-tp4,context,cudnn,bfloat16,bfloat16,1,8192,8192,16,2,64,64,gqa,128.0,16,0.061024,2252.212,618.588,7.7324,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_swa-tp4,context,cudnn,bfloat16,bfloat16,1,32768,32768,16,2,64,64,gqa,128.0,16,0.133824,16432.203,1128.31,14.1039,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_swa-tp4,context,cudnn,bfloat16,bfloat16,1,512,65536,16,2,64,64,gqa,128.0,16,0.040128,3425.014,60.427,0.7553,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_swa-tp4,context,cudnn,bfloat16,bfloat16,1,512,131072,16,2,64,64,gqa,128.0,16,0.04048,6790.462,59.902,0.7488,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_swa-tp4,context,cudnn,bfloat16,bfloat16,1,1024,65536,16,2,64,64,gqa,128.0,16,0.039328,6989.369,121.647,1.5206,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_swa-tp4,context,cudnn,bfloat16,bfloat16,1,1024,131072,16,2,64,64,gqa,128.0,16,0.039264,14001.523,121.845,1.5231,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_swa-tp4,generation,cudnn,bfloat16,bfloat16,1,1,131072,16,2,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"Traceback (most recent call last):
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 744, in <module>
+    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 169, in setup_cudnn
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: decode only mode, i.e. s_q == 1, not supported with sink_token",,,
+gpt_oss,gpt_oss_swa-tp4,generation,cudnn,bfloat16,fp8_e4m3,1,1,131072,16,2,64,64,gqa,128.0,16,0.978656,0.549,0.038,0.0005,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_swa-tp4,generation,cudnn,bfloat16,bfloat16,128,1,131072,16,2,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"Traceback (most recent call last):
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 744, in <module>
+    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 169, in setup_cudnn
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: decode only mode, i.e. s_q == 1, not supported with sink_token",,,
+gpt_oss,gpt_oss_swa-tp4,generation,cudnn,bfloat16,fp8_e4m3,128,1,131072,16,2,64,64,gqa,128.0,16,13.071424,5.257,0.363,0.0045,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_swa-tp4,generation,cudnn,bfloat16,bfloat16,1,2,131072,16,2,64,64,gqa,128.0,16,0.039488,27.192,1.893,0.0237,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_swa-tp4,generation,cudnn,bfloat16,fp8_e4m3,1,2,131072,16,2,64,64,gqa,128.0,16,0.056288,19.076,0.737,0.0092,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_swa-tp4,generation,cudnn,bfloat16,bfloat16,128,2,131072,16,2,64,64,gqa,128.0,16,0.10192,1348.498,93.88,1.1735,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_swa-tp4,generation,cudnn,bfloat16,fp8_e4m3,128,2,131072,16,2,64,64,gqa,128.0,16,0.172448,796.988,30.783,0.3848,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_swa-tp4,generation,cudnn,bfloat16,bfloat16,1,3,131072,16,2,64,64,gqa,128.0,16,0.03968,40.59,2.0,0.025,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_swa-tp4,generation,cudnn,bfloat16,fp8_e4m3,1,3,131072,16,2,64,64,gqa,128.0,16,0.05552,29.01,0.825,0.0103,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_swa-tp4,generation,cudnn,bfloat16,bfloat16,128,3,131072,16,2,64,64,gqa,128.0,16,0.103168,1998.279,98.462,1.2308,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_swa-tp4,generation,cudnn,bfloat16,fp8_e4m3,128,3,131072,16,2,64,64,gqa,128.0,16,0.169984,1212.811,34.506,0.4313,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_swa-tp4,generation,cudnn,bfloat16,bfloat16,1,4,131072,16,2,64,64,gqa,128.0,16,0.039776,53.989,2.111,0.0264,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_swa-tp4,generation,cudnn,bfloat16,fp8_e4m3,1,4,131072,16,2,64,64,gqa,128.0,16,0.037568,57.163,1.336,0.0167,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_swa-tp4,generation,cudnn,bfloat16,bfloat16,128,4,131072,16,2,64,64,gqa,128.0,16,0.101248,2714.897,106.154,1.3269,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_swa-tp4,generation,cudnn,bfloat16,fp8_e4m3,128,4,131072,16,2,64,64,gqa,128.0,16,0.170624,1611.015,37.641,0.4705,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_swa-tp4,context,cudnn_oss,bfloat16,bfloat16,1,2048,2048,16,2,64,64,gqa,128.0,16,0.14704,58.419,64.181,0.8023,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_swa-tp4,context,cudnn_oss,bfloat16,bfloat16,1,8192,8192,16,2,64,64,gqa,128.0,16,0.206016,667.128,183.232,2.2904,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_swa-tp4,context,cudnn_oss,bfloat16,bfloat16,1,32768,32768,16,2,64,64,gqa,128.0,16,0.495872,4434.659,304.504,3.8063,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_swa-tp4,context,cudnn_oss,bfloat16,bfloat16,1,512,65536,16,2,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa-tp4,context,cudnn_oss,bfloat16,bfloat16,1,512,131072,16,2,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa-tp4,context,cudnn_oss,bfloat16,bfloat16,1,1024,65536,16,2,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa-tp4,context,cudnn_oss,bfloat16,bfloat16,1,1024,131072,16,2,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa-tp4,generation,cudnn_oss,bfloat16,bfloat16,1,1,131072,16,2,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 169, in setup_cudnn
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: decode only mode, i.e. s_q == 1, not supported with sink_token",,,
+gpt_oss,gpt_oss_swa-tp4,generation,cudnn_oss,bfloat16,fp8_e4m3,1,1,131072,16,2,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa-tp4,generation,cudnn_oss,bfloat16,bfloat16,128,1,131072,16,2,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 169, in setup_cudnn
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: decode only mode, i.e. s_q == 1, not supported with sink_token",,,
+gpt_oss,gpt_oss_swa-tp4,generation,cudnn_oss,bfloat16,fp8_e4m3,128,1,131072,16,2,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa-tp4,generation,cudnn_oss,bfloat16,bfloat16,1,2,131072,16,2,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa-tp4,generation,cudnn_oss,bfloat16,fp8_e4m3,1,2,131072,16,2,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa-tp4,generation,cudnn_oss,bfloat16,bfloat16,128,2,131072,16,2,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa-tp4,generation,cudnn_oss,bfloat16,fp8_e4m3,128,2,131072,16,2,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa-tp4,generation,cudnn_oss,bfloat16,bfloat16,1,3,131072,16,2,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa-tp4,generation,cudnn_oss,bfloat16,fp8_e4m3,1,3,131072,16,2,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa-tp4,generation,cudnn_oss,bfloat16,bfloat16,128,3,131072,16,2,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa-tp4,generation,cudnn_oss,bfloat16,fp8_e4m3,128,3,131072,16,2,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa-tp4,generation,cudnn_oss,bfloat16,bfloat16,1,4,131072,16,2,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa-tp4,generation,cudnn_oss,bfloat16,fp8_e4m3,1,4,131072,16,2,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa-tp4,generation,cudnn_oss,bfloat16,bfloat16,128,4,131072,16,2,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa-tp4,generation,cudnn_oss,bfloat16,fp8_e4m3,128,4,131072,16,2,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa-tp8,context,cudnn,bfloat16,bfloat16,1,2048,2048,8,1,64,64,gqa,128.0,16,0.040224,106.776,117.308,1.4663,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_swa-tp8,context,cudnn,bfloat16,bfloat16,1,8192,8192,8,1,64,64,gqa,128.0,16,0.047232,1454.935,399.61,4.9951,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_swa-tp8,context,cudnn,bfloat16,bfloat16,1,32768,32768,8,1,64,64,gqa,128.0,16,0.0832,13215.284,907.422,11.3428,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_swa-tp8,context,cudnn,bfloat16,bfloat16,1,512,65536,8,1,64,64,gqa,128.0,16,0.039616,1734.639,30.604,0.3826,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_swa-tp8,context,cudnn,bfloat16,bfloat16,1,512,131072,8,1,64,64,gqa,128.0,16,0.038784,3543.702,31.261,0.3908,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_swa-tp8,context,cudnn,bfloat16,bfloat16,1,1024,65536,8,1,64,64,gqa,128.0,16,0.039904,3444.24,59.945,0.7493,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_swa-tp8,context,cudnn,bfloat16,bfloat16,1,1024,131072,8,1,64,64,gqa,128.0,16,0.039968,6877.45,59.849,0.7481,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_swa-tp8,generation,cudnn,bfloat16,bfloat16,1,1,131072,8,1,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"Traceback (most recent call last):
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 744, in <module>
+    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 169, in setup_cudnn
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: decode only mode, i.e. s_q == 1, not supported with sink_token",,,
+gpt_oss,gpt_oss_swa-tp8,generation,cudnn,bfloat16,fp8_e4m3,1,1,131072,8,1,64,64,gqa,128.0,16,0.977664,0.275,0.019,0.0002,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_swa-tp8,generation,cudnn,bfloat16,bfloat16,128,1,131072,8,1,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"Traceback (most recent call last):
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 744, in <module>
+    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 169, in setup_cudnn
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: decode only mode, i.e. s_q == 1, not supported with sink_token",,,
+gpt_oss,gpt_oss_swa-tp8,generation,cudnn,bfloat16,fp8_e4m3,128,1,131072,8,1,64,64,gqa,128.0,16,6.60176,5.205,0.36,0.0045,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_swa-tp8,generation,cudnn,bfloat16,bfloat16,1,2,131072,8,1,64,64,gqa,128.0,16,0.041088,13.066,0.91,0.0114,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_swa-tp8,generation,cudnn,bfloat16,fp8_e4m3,1,2,131072,8,1,64,64,gqa,128.0,16,0.056384,9.522,0.368,0.0046,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_swa-tp8,generation,cudnn,bfloat16,bfloat16,128,2,131072,8,1,64,64,gqa,128.0,16,0.067584,1016.801,70.788,0.8848,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_swa-tp8,generation,cudnn,bfloat16,fp8_e4m3,128,2,131072,8,1,64,64,gqa,128.0,16,0.111136,618.337,23.883,0.2985,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_swa-tp8,generation,cudnn,bfloat16,bfloat16,1,3,131072,8,1,64,64,gqa,128.0,16,0.039264,20.51,1.011,0.0126,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_swa-tp8,generation,cudnn,bfloat16,fp8_e4m3,1,3,131072,8,1,64,64,gqa,128.0,16,0.055456,14.522,0.413,0.0052,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_swa-tp8,generation,cudnn,bfloat16,bfloat16,128,3,131072,8,1,64,64,gqa,128.0,16,0.067552,1525.924,75.187,0.9398,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_swa-tp8,generation,cudnn,bfloat16,fp8_e4m3,128,3,131072,8,1,64,64,gqa,128.0,16,0.111008,928.575,26.419,0.3302,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_swa-tp8,generation,cudnn,bfloat16,bfloat16,1,4,131072,8,1,64,64,gqa,128.0,16,0.0392,27.391,1.071,0.0134,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_swa-tp8,generation,cudnn,bfloat16,fp8_e4m3,1,4,131072,8,1,64,64,gqa,128.0,16,0.055584,19.317,0.451,0.0056,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_swa-tp8,generation,cudnn,bfloat16,bfloat16,128,4,131072,8,1,64,64,gqa,128.0,16,0.068384,2009.812,78.585,0.9823,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_swa-tp8,generation,cudnn,bfloat16,fp8_e4m3,128,4,131072,8,1,64,64,gqa,128.0,16,0.111264,1235.251,28.862,0.3608,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_swa-tp8,context,cudnn_oss,bfloat16,bfloat16,1,2048,2048,8,1,64,64,gqa,128.0,16,0.124608,34.468,37.867,0.4733,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_swa-tp8,context,cudnn_oss,bfloat16,bfloat16,1,8192,8192,8,1,64,64,gqa,128.0,16,0.150272,457.301,125.601,1.57,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_swa-tp8,context,cudnn_oss,bfloat16,bfloat16,1,32768,32768,8,1,64,64,gqa,128.0,16,0.26768,4107.56,282.044,3.5255,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_swa-tp8,context,cudnn_oss,bfloat16,bfloat16,1,512,65536,8,1,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa-tp8,context,cudnn_oss,bfloat16,bfloat16,1,512,131072,8,1,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa-tp8,context,cudnn_oss,bfloat16,bfloat16,1,1024,65536,8,1,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa-tp8,context,cudnn_oss,bfloat16,bfloat16,1,1024,131072,8,1,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa-tp8,generation,cudnn_oss,bfloat16,bfloat16,1,1,131072,8,1,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 169, in setup_cudnn
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: decode only mode, i.e. s_q == 1, not supported with sink_token",,,
+gpt_oss,gpt_oss_swa-tp8,generation,cudnn_oss,bfloat16,fp8_e4m3,1,1,131072,8,1,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa-tp8,generation,cudnn_oss,bfloat16,bfloat16,128,1,131072,8,1,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 169, in setup_cudnn
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: decode only mode, i.e. s_q == 1, not supported with sink_token",,,
+gpt_oss,gpt_oss_swa-tp8,generation,cudnn_oss,bfloat16,fp8_e4m3,128,1,131072,8,1,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa-tp8,generation,cudnn_oss,bfloat16,bfloat16,1,2,131072,8,1,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa-tp8,generation,cudnn_oss,bfloat16,fp8_e4m3,1,2,131072,8,1,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa-tp8,generation,cudnn_oss,bfloat16,bfloat16,128,2,131072,8,1,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa-tp8,generation,cudnn_oss,bfloat16,fp8_e4m3,128,2,131072,8,1,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa-tp8,generation,cudnn_oss,bfloat16,bfloat16,1,3,131072,8,1,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa-tp8,generation,cudnn_oss,bfloat16,fp8_e4m3,1,3,131072,8,1,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa-tp8,generation,cudnn_oss,bfloat16,bfloat16,128,3,131072,8,1,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa-tp8,generation,cudnn_oss,bfloat16,fp8_e4m3,128,3,131072,8,1,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa-tp8,generation,cudnn_oss,bfloat16,bfloat16,1,4,131072,8,1,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa-tp8,generation,cudnn_oss,bfloat16,fp8_e4m3,1,4,131072,8,1,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa-tp8,generation,cudnn_oss,bfloat16,bfloat16,128,4,131072,8,1,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 173, in setup_cudnn
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_swa-tp8,generation,cudnn_oss,bfloat16,fp8_e4m3,128,4,131072,8,1,64,64,gqa,128.0,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_full,context,cudnn,bfloat16,bfloat16,1,2048,2048,64,8,64,64,gqa,,16,0.07296,470.939,517.389,6.4674,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_full,context,cudnn,bfloat16,bfloat16,1,8192,8192,64,8,64,64,gqa,,16,0.495264,1110.026,304.878,3.811,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_full,context,cudnn,bfloat16,bfloat16,1,32768,32768,64,8,64,64,gqa,,16,7.73072,1137.81,78.127,0.9766,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_full,context,cudnn,bfloat16,bfloat16,1,512,65536,64,8,64,64,gqa,,16,0.527616,1041.962,270.284,3.3786,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_full,context,cudnn,bfloat16,bfloat16,1,512,131072,64,8,64,64,gqa,,16,1.0056,1093.389,275.282,3.441,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_full,context,cudnn,bfloat16,bfloat16,1,1024,65536,64,8,64,64,gqa,,16,1.016128,1082.06,148.598,1.8575,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_full,context,cudnn,bfloat16,bfloat16,1,1024,131072,64,8,64,64,gqa,,16,1.992064,1103.892,143.174,1.7897,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_full,generation,cudnn,bfloat16,bfloat16,1,1,131072,64,8,64,64,gqa,,16,inf,0.0,0.0,,20,False,"Traceback (most recent call last):
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 744, in <module>
+    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 169, in setup_cudnn
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: decode only mode, i.e. s_q == 1, not supported with sink_token",,,
+gpt_oss,gpt_oss_full,generation,cudnn,bfloat16,fp8_e4m3,1,1,131072,64,8,64,64,gqa,,16,0.828128,2.593,162.093,2.0262,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_full,generation,cudnn,bfloat16,bfloat16,128,1,131072,64,8,64,64,gqa,,16,inf,0.0,0.0,,20,False,"Traceback (most recent call last):
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 744, in <module>
+    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 169, in setup_cudnn
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: decode only mode, i.e. s_q == 1, not supported with sink_token",,,
+gpt_oss,gpt_oss_full,generation,cudnn,bfloat16,fp8_e4m3,128,1,131072,64,8,64,64,gqa,,16,44.444767,6.185,386.591,4.8324,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_full,generation,cudnn,bfloat16,bfloat16,1,2,131072,64,8,64,64,gqa,,16,2.502528,1.716,107.279,1.341,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_full,generation,cudnn,bfloat16,fp8_e4m3,1,2,131072,64,8,64,64,gqa,,16,0.964096,4.455,139.25,1.7406,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_full,generation,cudnn,bfloat16,bfloat16,128,2,131072,64,8,64,64,gqa,,16,113.020515,4.864,304.05,3.8006,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_full,generation,cudnn,bfloat16,fp8_e4m3,128,2,131072,64,8,64,64,gqa,,16,51.867264,10.599,331.308,4.1414,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_full,generation,cudnn,bfloat16,bfloat16,1,3,131072,64,8,64,64,gqa,,16,2.514176,2.562,106.788,1.3349,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_full,generation,cudnn,bfloat16,fp8_e4m3,1,3,131072,64,8,64,64,gqa,,16,0.98336,6.551,136.539,1.7067,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_full,generation,cudnn,bfloat16,bfloat16,128,3,131072,64,8,64,64,gqa,,16,113.02211,7.296,304.065,3.8008,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_full,generation,cudnn,bfloat16,fp8_e4m3,128,3,131072,64,8,64,64,gqa,,16,51.854176,15.903,331.433,4.1429,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_full,generation,cudnn,bfloat16,bfloat16,1,4,131072,64,8,64,64,gqa,,16,2.51488,3.416,106.765,1.3346,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_full,generation,cudnn,bfloat16,fp8_e4m3,1,4,131072,64,8,64,64,gqa,,16,0.984448,8.726,136.405,1.7051,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_full,generation,cudnn,bfloat16,bfloat16,128,4,131072,64,8,64,64,gqa,,16,113.007454,9.73,304.123,3.8015,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_full,generation,cudnn,bfloat16,fp8_e4m3,128,4,131072,64,8,64,64,gqa,,16,51.857471,21.203,331.452,4.1431,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_full,context,cudnn_oss,bfloat16,bfloat16,1,2048,2048,64,8,64,64,gqa,,16,0.157888,217.621,239.086,2.9886,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_full,context,cudnn_oss,bfloat16,bfloat16,1,8192,8192,64,8,64,64,gqa,,16,0.914176,601.368,165.171,2.0646,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_full,context,cudnn_oss,bfloat16,bfloat16,1,32768,32768,64,8,64,64,gqa,,16,11.125728,790.608,54.287,0.6786,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_full,context,cudnn_oss,bfloat16,bfloat16,1,512,65536,64,8,64,64,gqa,,16,0.886304,620.279,160.9,2.0113,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_full,context,cudnn_oss,bfloat16,bfloat16,1,512,131072,64,8,64,64,gqa,,16,1.676832,655.708,165.088,2.0636,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_full,context,cudnn_oss,bfloat16,bfloat16,1,1024,65536,64,8,64,64,gqa,,16,1.517696,724.461,99.49,1.2436,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_full,context,cudnn_oss,bfloat16,bfloat16,1,1024,131072,64,8,64,64,gqa,,16,2.972544,739.778,95.949,1.1994,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_full,generation,cudnn_oss,bfloat16,bfloat16,1,1,131072,64,8,64,64,gqa,,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 169, in setup_cudnn
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: decode only mode, i.e. s_q == 1, not supported with sink_token",,,
+gpt_oss,gpt_oss_full,generation,cudnn_oss,bfloat16,fp8_e4m3,1,1,131072,64,8,64,64,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_full,generation,cudnn_oss,bfloat16,bfloat16,128,1,131072,64,8,64,64,gqa,,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 169, in setup_cudnn
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: decode only mode, i.e. s_q == 1, not supported with sink_token",,,
+gpt_oss,gpt_oss_full,generation,cudnn_oss,bfloat16,fp8_e4m3,128,1,131072,64,8,64,64,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_full,generation,cudnn_oss,bfloat16,bfloat16,1,2,131072,64,8,64,64,gqa,,16,1.679712,2.557,159.83,1.9979,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_full,generation,cudnn_oss,bfloat16,fp8_e4m3,1,2,131072,64,8,64,64,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_full,generation,cudnn_oss,bfloat16,bfloat16,128,2,131072,64,8,64,64,gqa,,16,187.596542,2.931,183.18,2.2897,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_full,generation,cudnn_oss,bfloat16,fp8_e4m3,128,2,131072,64,8,64,64,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_full,generation,cudnn_oss,bfloat16,bfloat16,1,3,131072,64,8,64,64,gqa,,16,1.680064,3.835,159.806,1.9976,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_full,generation,cudnn_oss,bfloat16,fp8_e4m3,1,3,131072,64,8,64,64,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_full,generation,cudnn_oss,bfloat16,bfloat16,128,3,131072,64,8,64,64,gqa,,16,187.692932,4.394,183.097,2.2887,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_full,generation,cudnn_oss,bfloat16,fp8_e4m3,128,3,131072,64,8,64,64,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_full,generation,cudnn_oss,bfloat16,bfloat16,1,4,131072,64,8,64,64,gqa,,16,1.644096,5.225,163.312,2.0414,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_full,generation,cudnn_oss,bfloat16,fp8_e4m3,1,4,131072,64,8,64,64,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_full,generation,cudnn_oss,bfloat16,bfloat16,128,4,131072,64,8,64,64,gqa,,16,187.736191,5.857,183.066,2.2883,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_full,generation,cudnn_oss,bfloat16,fp8_e4m3,128,4,131072,64,8,64,64,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_full-tp2,context,cudnn,bfloat16,bfloat16,1,2048,2048,32,4,64,64,gqa,,16,0.054016,318.051,349.422,4.3678,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_full-tp2,context,cudnn,bfloat16,bfloat16,1,8192,8192,32,4,64,64,gqa,,16,0.267264,1028.488,282.483,3.531,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_full-tp2,context,cudnn,bfloat16,bfloat16,1,32768,32768,32,4,64,64,gqa,,16,3.417728,1286.833,88.36,1.1045,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_full-tp2,context,cudnn,bfloat16,bfloat16,1,512,65536,32,4,64,64,gqa,,16,0.526816,521.772,135.347,1.6918,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_full-tp2,context,cudnn,bfloat16,bfloat16,1,512,131072,32,4,64,64,gqa,,16,1.014816,541.73,136.391,1.7049,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_full-tp2,context,cudnn,bfloat16,bfloat16,1,1024,65536,32,4,64,64,gqa,,16,0.51504,1067.404,146.586,1.8323,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_full-tp2,context,cudnn,bfloat16,bfloat16,1,1024,131072,32,4,64,64,gqa,,16,1.0136,1084.759,140.693,1.7587,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_full-tp2,generation,cudnn,bfloat16,bfloat16,1,1,131072,32,4,64,64,gqa,,16,inf,0.0,0.0,,20,False,"Traceback (most recent call last):
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 744, in <module>
+    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 169, in setup_cudnn
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: decode only mode, i.e. s_q == 1, not supported with sink_token",,,
+gpt_oss,gpt_oss_full-tp2,generation,cudnn,bfloat16,fp8_e4m3,1,1,131072,32,4,64,64,gqa,,16,0.824256,1.303,81.427,1.0178,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_full-tp2,generation,cudnn,bfloat16,bfloat16,128,1,131072,32,4,64,64,gqa,,16,inf,0.0,0.0,,20,False,"Traceback (most recent call last):
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 744, in <module>
+    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 169, in setup_cudnn
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: decode only mode, i.e. s_q == 1, not supported with sink_token",,,
+gpt_oss,gpt_oss_full-tp2,generation,cudnn,bfloat16,fp8_e4m3,128,1,131072,32,4,64,64,gqa,,16,22.243135,6.179,386.231,4.8279,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_full-tp2,generation,cudnn,bfloat16,bfloat16,1,2,131072,32,4,64,64,gqa,,16,2.509824,0.856,53.483,0.6685,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_full-tp2,generation,cudnn,bfloat16,fp8_e4m3,1,2,131072,32,4,64,64,gqa,,16,0.98096,2.189,68.428,0.8554,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_full-tp2,generation,cudnn,bfloat16,bfloat16,128,2,131072,32,4,64,64,gqa,,16,56.675999,4.85,303.161,3.7895,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_full-tp2,generation,cudnn,bfloat16,fp8_e4m3,128,2,131072,32,4,64,64,gqa,,16,25.974655,10.583,330.785,4.1348,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_full-tp2,generation,cudnn,bfloat16,bfloat16,1,3,131072,32,4,64,64,gqa,,16,2.496,1.291,53.783,0.6723,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_full-tp2,generation,cudnn,bfloat16,fp8_e4m3,1,3,131072,32,4,64,64,gqa,,16,0.982944,3.277,68.298,0.8537,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_full-tp2,generation,cudnn,bfloat16,bfloat16,128,3,131072,32,4,64,64,gqa,,16,56.67683,7.275,303.175,3.7897,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_full-tp2,generation,cudnn,bfloat16,fp8_e4m3,128,3,131072,32,4,64,64,gqa,,16,25.969536,15.877,330.891,4.1361,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_full-tp2,generation,cudnn,bfloat16,bfloat16,1,4,131072,32,4,64,64,gqa,,16,2.497152,1.72,53.761,0.672,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_full-tp2,generation,cudnn,bfloat16,fp8_e4m3,1,4,131072,32,4,64,64,gqa,,16,0.982272,4.372,68.353,0.8544,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_full-tp2,generation,cudnn,bfloat16,bfloat16,128,4,131072,32,4,64,64,gqa,,16,56.661537,9.702,303.276,3.7909,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_full-tp2,generation,cudnn,bfloat16,fp8_e4m3,128,4,131072,32,4,64,64,gqa,,16,25.971807,21.167,330.902,4.1363,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_full-tp2,context,cudnn_oss,bfloat16,bfloat16,1,2048,2048,32,4,64,64,gqa,,16,0.180736,95.055,104.431,1.3054,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_full-tp2,context,cudnn_oss,bfloat16,bfloat16,1,8192,8192,32,4,64,64,gqa,,16,0.515904,532.808,146.34,1.8293,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_full-tp2,context,cudnn_oss,bfloat16,bfloat16,1,32768,32768,32,4,64,64,gqa,,16,5.611808,783.713,53.813,0.6727,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_full-tp2,context,cudnn_oss,bfloat16,bfloat16,1,512,65536,32,4,64,64,gqa,,16,0.76,361.681,93.82,1.1727,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_full-tp2,context,cudnn_oss,bfloat16,bfloat16,1,512,131072,32,4,64,64,gqa,,16,1.483008,370.703,93.332,1.1666,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_full-tp2,context,cudnn_oss,bfloat16,bfloat16,1,1024,65536,32,4,64,64,gqa,,16,0.802528,685.03,94.075,1.1759,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_full-tp2,context,cudnn_oss,bfloat16,bfloat16,1,1024,131072,32,4,64,64,gqa,,16,1.518816,723.927,93.893,1.1737,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_full-tp2,generation,cudnn_oss,bfloat16,bfloat16,1,1,131072,32,4,64,64,gqa,,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 169, in setup_cudnn
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: decode only mode, i.e. s_q == 1, not supported with sink_token",,,
+gpt_oss,gpt_oss_full-tp2,generation,cudnn_oss,bfloat16,fp8_e4m3,1,1,131072,32,4,64,64,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_full-tp2,generation,cudnn_oss,bfloat16,bfloat16,128,1,131072,32,4,64,64,gqa,,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 169, in setup_cudnn
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: decode only mode, i.e. s_q == 1, not supported with sink_token",,,
+gpt_oss,gpt_oss_full-tp2,generation,cudnn_oss,bfloat16,fp8_e4m3,128,1,131072,32,4,64,64,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_full-tp2,generation,cudnn_oss,bfloat16,bfloat16,1,2,131072,32,4,64,64,gqa,,16,1.519712,1.413,88.329,1.1041,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_full-tp2,generation,cudnn_oss,bfloat16,fp8_e4m3,1,2,131072,32,4,64,64,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_full-tp2,generation,cudnn_oss,bfloat16,bfloat16,128,2,131072,32,4,64,64,gqa,,16,93.078461,2.953,184.597,2.3075,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_full-tp2,generation,cudnn_oss,bfloat16,fp8_e4m3,128,2,131072,32,4,64,64,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_full-tp2,generation,cudnn_oss,bfloat16,bfloat16,1,3,131072,32,4,64,64,gqa,,16,1.51632,2.124,88.532,1.1066,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_full-tp2,generation,cudnn_oss,bfloat16,fp8_e4m3,1,3,131072,32,4,64,64,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_full-tp2,generation,cudnn_oss,bfloat16,bfloat16,128,3,131072,32,4,64,64,gqa,,16,93.424416,4.413,183.924,2.2991,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_full-tp2,generation,cudnn_oss,bfloat16,fp8_e4m3,128,3,131072,32,4,64,64,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_full-tp2,generation,cudnn_oss,bfloat16,bfloat16,1,4,131072,32,4,64,64,gqa,,16,1.478784,2.904,90.784,1.1348,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_full-tp2,generation,cudnn_oss,bfloat16,fp8_e4m3,1,4,131072,32,4,64,64,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_full-tp2,generation,cudnn_oss,bfloat16,bfloat16,128,4,131072,32,4,64,64,gqa,,16,93.329117,5.891,184.123,2.3015,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_full-tp2,generation,cudnn_oss,bfloat16,fp8_e4m3,128,4,131072,32,4,64,64,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_full-tp4,context,cudnn,bfloat16,bfloat16,1,2048,2048,16,2,64,64,gqa,,16,0.049728,172.738,189.776,2.3722,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_full-tp4,context,cudnn,bfloat16,bfloat16,1,8192,8192,16,2,64,64,gqa,,16,0.1536,894.785,245.76,3.072,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_full-tp4,context,cudnn,bfloat16,bfloat16,1,32768,32768,16,2,64,64,gqa,,16,1.731776,1269.808,87.191,1.0899,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_full-tp4,context,cudnn,bfloat16,bfloat16,1,512,65536,16,2,64,64,gqa,,16,0.525536,261.521,67.839,0.848,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_full-tp4,context,cudnn,bfloat16,bfloat16,1,512,131072,16,2,64,64,gqa,,16,1.013568,271.198,68.28,0.8535,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_full-tp4,context,cudnn,bfloat16,bfloat16,1,1024,65536,16,2,64,64,gqa,,16,0.527104,521.487,71.615,0.8952,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_full-tp4,context,cudnn,bfloat16,bfloat16,1,1024,131072,16,2,64,64,gqa,,16,1.000896,549.264,71.239,0.8905,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_full-tp4,generation,cudnn,bfloat16,bfloat16,1,1,131072,16,2,64,64,gqa,,16,inf,0.0,0.0,,20,False,"Traceback (most recent call last):
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 744, in <module>
+    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 169, in setup_cudnn
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: decode only mode, i.e. s_q == 1, not supported with sink_token",,,
+gpt_oss,gpt_oss_full-tp4,generation,cudnn,bfloat16,fp8_e4m3,1,1,131072,16,2,64,64,gqa,,16,0.841344,0.638,39.887,0.4986,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_full-tp4,generation,cudnn,bfloat16,bfloat16,128,1,131072,16,2,64,64,gqa,,16,inf,0.0,0.0,,20,False,"Traceback (most recent call last):
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 744, in <module>
+    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 169, in setup_cudnn
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: decode only mode, i.e. s_q == 1, not supported with sink_token",,,
+gpt_oss,gpt_oss_full-tp4,generation,cudnn,bfloat16,fp8_e4m3,128,1,131072,16,2,64,64,gqa,,16,11.163904,6.156,384.766,4.8096,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_full-tp4,generation,cudnn,bfloat16,bfloat16,1,2,131072,16,2,64,64,gqa,,16,2.334688,0.46,28.748,0.3593,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_full-tp4,generation,cudnn,bfloat16,fp8_e4m3,1,2,131072,16,2,64,64,gqa,,16,0.973248,1.103,34.485,0.4311,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_full-tp4,generation,cudnn,bfloat16,bfloat16,128,2,131072,16,2,64,64,gqa,,16,28.544832,4.815,300.965,3.7621,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_full-tp4,generation,cudnn,bfloat16,fp8_e4m3,128,2,131072,16,2,64,64,gqa,,16,13.019904,10.556,329.958,4.1245,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_full-tp4,generation,cudnn,bfloat16,bfloat16,1,3,131072,16,2,64,64,gqa,,16,2.334112,0.69,28.757,0.3595,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_full-tp4,generation,cudnn,bfloat16,fp8_e4m3,1,3,131072,16,2,64,64,gqa,,16,0.97312,1.655,34.494,0.4312,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_full-tp4,generation,cudnn,bfloat16,bfloat16,128,3,131072,16,2,64,64,gqa,,16,28.536863,7.224,301.067,3.7633,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_full-tp4,generation,cudnn,bfloat16,fp8_e4m3,128,3,131072,16,2,64,64,gqa,,16,13.019872,15.834,329.999,4.125,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_full-tp4,generation,cudnn,bfloat16,bfloat16,1,4,131072,16,2,64,64,gqa,,16,2.335424,0.92,28.742,0.3593,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_full-tp4,generation,cudnn,bfloat16,fp8_e4m3,1,4,131072,16,2,64,64,gqa,,16,0.9728,2.208,34.509,0.4314,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_full-tp4,generation,cudnn,bfloat16,bfloat16,128,4,131072,16,2,64,64,gqa,,16,28.535872,9.633,301.096,3.7637,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_full-tp4,generation,cudnn,bfloat16,fp8_e4m3,128,4,131072,16,2,64,64,gqa,,16,13.021408,21.11,330.0,4.125,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_full-tp4,context,cudnn_oss,bfloat16,bfloat16,1,2048,2048,16,2,64,64,gqa,,16,0.152384,56.37,61.93,0.7741,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_full-tp4,context,cudnn_oss,bfloat16,bfloat16,1,8192,8192,16,2,64,64,gqa,,16,0.373376,368.098,101.101,1.2638,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_full-tp4,context,cudnn_oss,bfloat16,bfloat16,1,32768,32768,16,2,64,64,gqa,,16,2.806208,783.628,53.807,0.6726,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_full-tp4,context,cudnn_oss,bfloat16,bfloat16,1,512,65536,16,2,64,64,gqa,,16,0.75632,181.721,47.138,0.5892,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_full-tp4,context,cudnn_oss,bfloat16,bfloat16,1,512,131072,16,2,64,64,gqa,,16,1.425824,192.785,48.538,0.6067,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_full-tp4,context,cudnn_oss,bfloat16,bfloat16,1,1024,65536,16,2,64,64,gqa,,16,0.757536,362.858,49.831,0.6229,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_full-tp4,context,cudnn_oss,bfloat16,bfloat16,1,1024,131072,16,2,64,64,gqa,,16,1.392256,394.867,51.214,0.6402,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_full-tp4,generation,cudnn_oss,bfloat16,bfloat16,1,1,131072,16,2,64,64,gqa,,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 169, in setup_cudnn
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: decode only mode, i.e. s_q == 1, not supported with sink_token",,,
+gpt_oss,gpt_oss_full-tp4,generation,cudnn_oss,bfloat16,fp8_e4m3,1,1,131072,16,2,64,64,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_full-tp4,generation,cudnn_oss,bfloat16,bfloat16,128,1,131072,16,2,64,64,gqa,,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 169, in setup_cudnn
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: decode only mode, i.e. s_q == 1, not supported with sink_token",,,
+gpt_oss,gpt_oss_full-tp4,generation,cudnn_oss,bfloat16,fp8_e4m3,128,1,131072,16,2,64,64,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_full-tp4,generation,cudnn_oss,bfloat16,bfloat16,1,2,131072,16,2,64,64,gqa,,16,1.423136,0.754,47.161,0.5895,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_full-tp4,generation,cudnn_oss,bfloat16,fp8_e4m3,1,2,131072,16,2,64,64,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_full-tp4,generation,cudnn_oss,bfloat16,bfloat16,128,2,131072,16,2,64,64,gqa,,16,46.487904,2.956,184.8,2.31,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_full-tp4,generation,cudnn_oss,bfloat16,fp8_e4m3,128,2,131072,16,2,64,64,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_full-tp4,generation,cudnn_oss,bfloat16,bfloat16,1,3,131072,16,2,64,64,gqa,,16,1.387168,1.161,48.387,0.6048,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_full-tp4,generation,cudnn_oss,bfloat16,fp8_e4m3,1,3,131072,16,2,64,64,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_full-tp4,generation,cudnn_oss,bfloat16,bfloat16,128,3,131072,16,2,64,64,gqa,,16,46.308128,4.452,185.529,2.3191,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_full-tp4,generation,cudnn_oss,bfloat16,fp8_e4m3,128,3,131072,16,2,64,64,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_full-tp4,generation,cudnn_oss,bfloat16,bfloat16,1,4,131072,16,2,64,64,gqa,,16,1.424448,1.508,47.124,0.589,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_full-tp4,generation,cudnn_oss,bfloat16,fp8_e4m3,1,4,131072,16,2,64,64,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_full-tp4,generation,cudnn_oss,bfloat16,bfloat16,128,4,131072,16,2,64,64,gqa,,16,46.523457,5.908,184.682,2.3085,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_full-tp4,generation,cudnn_oss,bfloat16,fp8_e4m3,128,4,131072,16,2,64,64,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_full-tp8,context,cudnn,bfloat16,bfloat16,1,2048,2048,8,1,64,64,gqa,,16,0.037312,115.11,126.463,1.5808,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_full-tp8,context,cudnn,bfloat16,bfloat16,1,8192,8192,8,1,64,64,gqa,,16,0.095584,718.943,197.464,2.4683,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_full-tp8,context,cudnn,bfloat16,bfloat16,1,32768,32768,8,1,64,64,gqa,,16,0.890848,1234.23,84.748,1.0593,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_full-tp8,context,cudnn,bfloat16,bfloat16,1,512,65536,8,1,64,64,gqa,,16,0.521056,131.885,34.211,0.4276,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_full-tp8,context,cudnn,bfloat16,bfloat16,1,512,131072,8,1,64,64,gqa,,16,1.008256,136.314,34.32,0.429,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_full-tp8,context,cudnn,bfloat16,bfloat16,1,1024,65536,8,1,64,64,gqa,,16,0.524832,261.872,35.963,0.4495,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_full-tp8,context,cudnn,bfloat16,bfloat16,1,1024,131072,8,1,64,64,gqa,,16,1.013312,271.267,35.183,0.4398,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_full-tp8,generation,cudnn,bfloat16,bfloat16,1,1,131072,8,1,64,64,gqa,,16,inf,0.0,0.0,,20,False,"Traceback (most recent call last):
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 744, in <module>
+    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 169, in setup_cudnn
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: decode only mode, i.e. s_q == 1, not supported with sink_token",,,
+gpt_oss,gpt_oss_full-tp8,generation,cudnn,bfloat16,fp8_e4m3,1,1,131072,8,1,64,64,gqa,,16,0.839168,0.32,19.995,0.2499,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_full-tp8,generation,cudnn,bfloat16,bfloat16,128,1,131072,8,1,64,64,gqa,,16,inf,0.0,0.0,,20,False,"Traceback (most recent call last):
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 744, in <module>
+    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 169, in setup_cudnn
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: decode only mode, i.e. s_q == 1, not supported with sink_token",,,
+gpt_oss,gpt_oss_full-tp8,generation,cudnn,bfloat16,fp8_e4m3,128,1,131072,8,1,64,64,gqa,,16,5.605696,6.129,383.136,4.7892,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_full-tp8,generation,cudnn,bfloat16,bfloat16,1,2,131072,8,1,64,64,gqa,,16,2.313696,0.232,14.504,0.1813,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_full-tp8,generation,cudnn,bfloat16,fp8_e4m3,1,2,131072,8,1,64,64,gqa,,16,0.972256,0.552,17.26,0.2158,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_full-tp8,generation,cudnn,bfloat16,bfloat16,128,2,131072,8,1,64,64,gqa,,16,14.447552,4.756,297.316,3.7165,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_full-tp8,generation,cudnn,bfloat16,fp8_e4m3,128,2,131072,8,1,64,64,gqa,,16,6.588832,10.43,326.007,4.0751,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_full-tp8,generation,cudnn,bfloat16,bfloat16,1,3,131072,8,1,64,64,gqa,,16,2.31296,0.348,14.51,0.1814,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_full-tp8,generation,cudnn,bfloat16,fp8_e4m3,1,3,131072,8,1,64,64,gqa,,16,0.971488,0.829,17.276,0.2159,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_full-tp8,generation,cudnn,bfloat16,bfloat16,128,3,131072,8,1,64,64,gqa,,16,14.4304,7.143,297.688,3.7211,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_full-tp8,generation,cudnn,bfloat16,fp8_e4m3,128,3,131072,8,1,64,64,gqa,,16,6.590368,15.641,325.971,4.0746,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_full-tp8,generation,cudnn,bfloat16,bfloat16,1,4,131072,8,1,64,64,gqa,,16,2.326656,0.461,14.425,0.1803,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_full-tp8,generation,cudnn,bfloat16,fp8_e4m3,1,4,131072,8,1,64,64,gqa,,16,0.971872,1.105,17.271,0.2159,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_full-tp8,generation,cudnn,bfloat16,bfloat16,128,4,131072,8,1,64,64,gqa,,16,14.380608,9.557,298.737,3.7342,20,True,,NVIDIA B300 SXM6 AC,cudnn 9.25.0,
+gpt_oss,gpt_oss_full-tp8,generation,cudnn,bfloat16,fp8_e4m3,128,4,131072,8,1,64,64,gqa,,16,6.592512,20.848,325.905,4.0738,20,True,,NVIDIA B300 SXM6 AC,cudnn fp8 9.25.0,
+gpt_oss,gpt_oss_full-tp8,context,cudnn_oss,bfloat16,bfloat16,1,2048,2048,8,1,64,64,gqa,,16,0.129184,33.247,36.526,0.4566,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_full-tp8,context,cudnn_oss,bfloat16,bfloat16,1,8192,8192,8,1,64,64,gqa,,16,0.270272,254.26,69.835,0.8729,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_full-tp8,context,cudnn_oss,bfloat16,bfloat16,1,32768,32768,8,1,64,64,gqa,,16,1.538528,714.652,49.071,0.6134,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_full-tp8,context,cudnn_oss,bfloat16,bfloat16,1,512,65536,8,1,64,64,gqa,,16,0.730144,94.118,24.414,0.3052,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_full-tp8,context,cudnn_oss,bfloat16,bfloat16,1,512,131072,8,1,64,64,gqa,,16,1.351872,101.666,25.596,0.32,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_full-tp8,context,cudnn_oss,bfloat16,bfloat16,1,1024,65536,8,1,64,64,gqa,,16,0.737376,186.389,25.597,0.32,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_full-tp8,context,cudnn_oss,bfloat16,bfloat16,1,1024,131072,8,1,64,64,gqa,,16,1.361792,201.85,26.18,0.3272,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_full-tp8,generation,cudnn_oss,bfloat16,bfloat16,1,1,131072,8,1,64,64,gqa,,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 169, in setup_cudnn
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: decode only mode, i.e. s_q == 1, not supported with sink_token",,,
+gpt_oss,gpt_oss_full-tp8,generation,cudnn_oss,bfloat16,fp8_e4m3,1,1,131072,8,1,64,64,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_full-tp8,generation,cudnn_oss,bfloat16,bfloat16,128,1,131072,8,1,64,64,gqa,,16,inf,0.0,0.0,,20,False,"    main()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 718, in main
+    fn, detail = SETUPS[args.backend](args, dtype)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 169, in setup_cudnn
+    graph.validate()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 776, in validate
+    self._lowered_graph.validate()
+cudnn._compiled_module.cudnnGraphNotSupportedError: decode only mode, i.e. s_q == 1, not supported with sink_token",,,
+gpt_oss,gpt_oss_full-tp8,generation,cudnn_oss,bfloat16,fp8_e4m3,128,1,131072,8,1,64,64,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_full-tp8,generation,cudnn_oss,bfloat16,bfloat16,1,2,131072,8,1,64,64,gqa,,16,1.302688,0.412,25.761,0.322,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_full-tp8,generation,cudnn_oss,bfloat16,fp8_e4m3,1,2,131072,8,1,64,64,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_full-tp8,generation,cudnn_oss,bfloat16,bfloat16,128,2,131072,8,1,64,64,gqa,,16,18.027937,3.812,238.269,2.9784,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_full-tp8,generation,cudnn_oss,bfloat16,fp8_e4m3,128,2,131072,8,1,64,64,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_full-tp8,generation,cudnn_oss,bfloat16,bfloat16,1,3,131072,8,1,64,64,gqa,,16,1.30256,0.618,25.765,0.3221,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_full-tp8,generation,cudnn_oss,bfloat16,fp8_e4m3,1,3,131072,8,1,64,64,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_full-tp8,generation,cudnn_oss,bfloat16,bfloat16,128,3,131072,8,1,64,64,gqa,,16,18.028929,5.717,238.27,2.9784,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_full-tp8,generation,cudnn_oss,bfloat16,fp8_e4m3,128,3,131072,8,1,64,64,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_full-tp8,generation,cudnn_oss,bfloat16,bfloat16,1,4,131072,8,1,64,64,gqa,,16,1.35104,0.795,24.842,0.3105,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_full-tp8,generation,cudnn_oss,bfloat16,fp8_e4m3,1,4,131072,8,1,64,64,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,
+gpt_oss,gpt_oss_full-tp8,generation,cudnn_oss,bfloat16,bfloat16,128,4,131072,8,1,64,64,gqa,,16,18.064417,7.608,237.816,2.9727,20,True,,NVIDIA B300 SXM6 AC,cudnn_oss plan=sdpa_fwd_prefill_sm100_d128[SdpaFwdKnobs(sched_policy=0; tile_m=128; tile_n=128; cga=2)],
+gpt_oss,gpt_oss_full-tp8,generation,cudnn_oss,bfloat16,fp8_e4m3,128,4,131072,8,1,64,64,gqa,,16,inf,0.0,0.0,,20,False,"                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 215, in setup_cudnn_oss
+    return setup_cudnn(args, dtype, oss=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 119, in setup_cudnn
+    return setup_cudnn_fp8(args, cudnn, oss=oss)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/benchmark/attention_inference/benchmark_single_attention.py"", line 265, in setup_cudnn_fp8
+    graph.check_support()
+  File ""/home/vagarwalla/attn_inf/cudnn-frontend/python/cudnn/_pygraph.py"", line 1389, in check_support
+    self._lowered_graph.check_support()
+cudnn._compiled_module.cudnnGraphNotSupportedError: [cudnn_frontend] Error: No execution plans support the graph.",,,

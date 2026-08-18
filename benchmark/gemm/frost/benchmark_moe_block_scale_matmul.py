@@ -25,6 +25,7 @@ import cudnn.gemm.frost  # noqa: F401
 import torch
 
 from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
+from cudnn.gemm.frost.tile_config import by_name as _by_name
 from cudnn.gemm.frost.graph_analyzer import analyze
 from cudnn.gemm.frost.kernel_registry import candidates as _candidates
 from cudnn.gemm.frost.tile_config import TileConfig
@@ -38,7 +39,7 @@ def _vp_moe_bs(handles, token, weight, sfa, sfb, fto, output):
 
 def _build_plan(g, cfg, name):
     """JIT-compile the recorded graph with a forced tile config -> compiled kernel."""
-    return jit_from_cudnn_graph(g, config=cfg, cta_group=_SPEC_MAP[name][1], scheduler=_SPEC_MAP[name][2])
+    return jit_from_cudnn_graph(g, config=cfg, cta_group=_spec_for(name)[1], scheduler=_spec_for(name)[2])
 
 
 # combo : (is_fp4, block_size, a_dtype, sf_dtype)
@@ -108,6 +109,27 @@ def _build_spec_map():
 
 
 _SPEC_MAP = _build_spec_map()
+
+_LABEL_RE = re.compile(r"^(CONFIG_sm\d+_\d+x\d+x\d+_\d+x\d+x\d+_cluster\d+x\d+)_([12])ctamma(_static)?$")
+
+
+def _spec_for(name):
+    """(geometry cfg, cta_group, scheduler) for a --configs label, or None.
+
+    The sweep set comes from the registry funnel over CATALOG; a label naming a
+    geometry outside it (e.g. a num_mma_m > 1 tile, which `by_name` synthesizes) is
+    still runnable, so parse it rather than reporting UNKNOWN_CONFIG."""
+    spec = _SPEC_MAP.get(name)
+    if spec is not None:
+        return spec
+    m = _LABEL_RE.match(name)
+    if m is None:
+        return None
+    try:
+        cfg = _by_name(m.group(1))
+    except (KeyError, NotImplementedError):
+        return None
+    return cfg, int(m.group(2)), "static" if m.group(3) else "clc"
 
 
 def _offsets(S: int, E: int) -> torch.Tensor:
@@ -425,9 +447,9 @@ def _nsys_worker(shape, combo, configs, warmup, iters, nbuf, no_baseline=False) 
     pool = _mkdata_pool(S, N, K, E, combo, nbuf)
 
     # 2. each MoE-block-scale config.
-    name_to_cfg = {lbl: sp[0] for lbl, sp in _SPEC_MAP.items()}
     for name in configs or list(_SPEC_MAP):
-        cfg = name_to_cfg.get(name)
+        spec = _spec_for(name)
+        cfg = spec[0] if spec else None
         if cfg is None:
             continue
         try:
@@ -501,7 +523,6 @@ def main() -> int:
 
     flops = 2 * S * N * K
     config_names = [c.strip() for c in args.configs.split(",")] if args.configs else list(_SPEC_MAP)
-    name_to_cfg = {lbl: sp[0] for lbl, sp in _SPEC_MAP.items()}
 
     print(f"\n=== moe_block_scale_matmul G={G} M={M} N={N} K={K}  " f"(S={S} tokens, ~{flops / 1e9:.1f} GFLOP) — {combo} ===")
 
@@ -536,11 +557,12 @@ def main() -> int:
             cublas_tflops, cublas_ms = float("nan"), float("nan")
             print("  cuBLAS kernel: not detected in nsys output")
         for name in config_names:
-            cfg = name_to_cfg.get(name)
+            spec = _spec_for(name)
+            cfg = spec[0] if spec else None
             if cfg is None:
                 rows.append((name, 0.0, float("inf"), "UNKNOWN_CONFIG"))
                 continue
-            tok = _kernel_match_token(cfg, _SPEC_MAP[name][1])
+            tok = _kernel_match_token(cfg, _spec_for(name)[1])
             matches = [(k, v) for k, v in kern_times.items() if tok in k]
             if not matches:
                 rows.append((name, 0.0, float("inf"), "NO_KERNEL_IN_NSYS"))
@@ -587,7 +609,8 @@ def main() -> int:
 
         ctx_dead = False
         for name in config_names:
-            cfg = name_to_cfg.get(name)
+            spec = _spec_for(name)
+            cfg = spec[0] if spec else None
             if cfg is None:
                 row = (name, 0.0, float("inf"), "UNKNOWN_CONFIG")
             elif ctx_dead:

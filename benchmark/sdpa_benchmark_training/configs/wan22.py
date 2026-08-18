@@ -51,7 +51,7 @@ CONFIG = BenchmarkConfig(
         (48360, 48360),  # 480p, 121 frames
         (75600, 75600),  # 720p, 81 frames
     ],
-    backends=["cudnn", "flash_attention_4"],
+    backends=["cudnn", "cudnn_oss", "flash_attention_4"],
     data_types=["bfloat16"],  # Wan 2.2 is released/trained in bf16; no official FP8 checkpoint
     attn_masks=["no_mask"],  # bidirectional diffusion DiT, no causal mask
     profile_pass="both",  # forward + backward for training

@@ -31,7 +31,7 @@ CONFIG = BenchmarkConfig(
         (4096, 4096),
         (2048, 2048),
     ],
-    backends=["cudnn", "flash_attention_4"],
+    backends=["cudnn", "cudnn_oss", "flash_attention_4"],
     data_types=["bfloat16", "fp8", "mxfp8"],
     attn_masks=["top_left", "no_mask"],  # Both causal and non-causal
     profile_pass="both",  # Forward and backward

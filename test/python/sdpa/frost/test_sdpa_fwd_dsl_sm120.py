@@ -379,6 +379,7 @@ def _run_thd_case(
     with_sink: bool = False,
     check_stats: bool = False,
     stats_layout: str = "token_major",
+    cu_lens: bool = False,
 ) -> None:
     """Run a THD (ragged) graph on the SM120 engine vs per-sequence references.
 
@@ -411,6 +412,16 @@ def _run_thd_case(
     o_storage.fill_(_THD_SENTINEL)
     sq_t = torch.tensor(seq_q_lens, dtype=torch.int32, device="cuda").view(batch, 1, 1, 1)
     skv_t = torch.tensor(seq_kv_lens, dtype=torch.int32, device="cuda").view(batch, 1, 1, 1)
+
+    # cu_lens: bind the (B+1,) prefix-sum form (cu_seq_len_q/kv, cuDNN 9.24+)
+    # instead of per-batch lengths.
+    def _prefix(lens):
+        cu = [0]
+        for n in lens:
+            cu.append(cu[-1] + n)
+        return torch.tensor(cu, dtype=torch.int32, device="cuda").view(batch + 1, 1, 1, 1)
+
+    cuq_t, cukv_t = (_prefix(seq_q_lens), _prefix(seq_kv_lens)) if cu_lens else (None, None)
     sinks = torch.randn(1, h_q, 1, 1, dtype=torch.float32, device="cuda") if with_sink else None
 
     io_dtype = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
@@ -425,8 +436,8 @@ def _run_thd_case(
     tq.set_ragged_offset(rq)
     tk.set_ragged_offset(rk)
     tv.set_ragged_offset(rv)
-    sq = graph.tensor_like(sq_t, name="seq_q")
-    skv = graph.tensor_like(skv_t, name="seq_kv")
+    sq = graph.tensor_like(cuq_t, name="cu_seq_q") if cu_lens else graph.tensor_like(sq_t, name="seq_q")
+    skv = graph.tensor_like(cukv_t, name="cu_seq_kv") if cu_lens else graph.tensor_like(skv_t, name="seq_kv")
     sdpa_kwargs = dict(
         name="sdpa",
         q=tq,
@@ -435,9 +446,11 @@ def _run_thd_case(
         generate_stats=check_stats,
         attn_scale=scale,
         use_padding_mask=True,
-        seq_len_q=sq,
-        seq_len_kv=skv,
     )
+    if cu_lens:
+        sdpa_kwargs.update(cu_seq_len_q=sq, cu_seq_len_kv=skv)
+    else:
+        sdpa_kwargs.update(seq_len_q=sq, seq_len_kv=skv)
     _apply_mask_kwargs(
         sdpa_kwargs,
         cudnn,
@@ -446,7 +459,17 @@ def _run_thd_case(
         window_size_left=window_size_left,
         window_size_right=window_size_right,
     )
-    variant_pack = {tq: q_view, tk: k_view, tv: v_view, rq: q_ro, rk: k_ro, rv: v_ro, ro: o_ro, sq: sq_t, skv: skv_t}
+    variant_pack = {
+        tq: q_view,
+        tk: k_view,
+        tv: v_view,
+        rq: q_ro,
+        rk: k_ro,
+        rv: v_ro,
+        ro: o_ro,
+        sq: (cuq_t if cu_lens else sq_t),
+        skv: (cukv_t if cu_lens else skv_t),
+    }
     if sinks is not None:
         st = graph.tensor_like(sinks, name="sink")
         sdpa_kwargs["sink_token"] = st
@@ -958,6 +981,224 @@ def test_dsl_sm120_thd_all_q_zero_stats(stats_layout: str):
 
     _run_thd_case(seq_q_lens=[0, 0], seq_kv_lens=[50, 30], check_stats=True, stats_layout=stats_layout)
     _run_thd_case(seq_q_lens=[0, 0], seq_kv_lens=[0, 0], check_stats=True, stats_layout=stats_layout)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("stats_layout", ["token_major", "head_major"])
+@torch_fork_set_rng(seed=35)
+def test_dsl_sm120_thd_cu_seq_len_stats(stats_layout: str):
+    """THD with the cu_seq_len_q/kv length form ((B+1,) prefix sums, cuDNN
+    9.24+ — the form TE/PyT/vLLM natively hold): the lowering derives the
+    per-batch lengths host-side from the same inherent tolist round-trip, so
+    results are identical to the seq_len form, ragged Stats included."""
+
+    _run_thd_case(seq_q_lens=[200, 150], seq_kv_lens=[200, 150], is_causal=True, check_stats=True, stats_layout=stats_layout, cu_lens=True)
+
+
+@pytest.mark.L1
+@torch_fork_set_rng(seed=36)
+def test_dsl_sm120_thd_cu_seq_len_zero_lens():
+    """cu_seq_len form with degenerate lengths: a zero-length sequence
+    (repeated prefix value), an all-zero KV side (kernel dead-row path), and
+    the all-zero Q no-op keep the same semantics as the seq_len form."""
+
+    _run_thd_case(seq_q_lens=[128, 0, 64], seq_kv_lens=[100, 0, 0], is_causal=True, check_stats=True, cu_lens=True)
+    _run_thd_case(seq_q_lens=[64, 32], seq_kv_lens=[0, 0], check_stats=True, cu_lens=True)
+    _run_thd_case(seq_q_lens=[0, 0], seq_kv_lens=[50, 30], check_stats=True, cu_lens=True)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=37)
+def test_dsl_sm120_thd_compile_key_plan_time_only():
+    """Issue #552: the THD compile key carries NO packed totals.
+
+    ``compile()`` builds the one artifact at plan time (the token extents
+    compile dynamic, ``max_sq`` is a runtime launch argument), and executes
+    with DIFFERENT packed totals re-bind it — zero ``cute.compile`` calls on
+    the execute path. Keying the compile on the totals degenerated into a
+    fresh multi-second compile per step under continuous batching (the
+    totals change every step), and correctness is checked per total to prove
+    one artifact serves them all.
+    """
+    _require_dsl()
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm120
+
+    b, h, s, d = 2, 4, 256, 128
+    dtype = torch.float16
+    scale = 1.0 / math.sqrt(d)
+    q, k, v = (_bhsd(b, h, s, d, dtype) for _ in range(3))
+    o = torch.zeros_like(q)
+    api = SdpaFwdDslSm120(sample_q=q, sample_k=k, sample_v=v, sample_o=o, thd=True)
+    assert api.check_support()
+    api.compile()
+    # Plan-time compile: no deferred sentinel, the artifact already exists.
+    assert api._compiled_kernel != "thd-deferred"
+    info_plan = api._k_mod.compile.cache_info()
+
+    def _run_and_check(seq_lens):
+        lens = torch.tensor(seq_lens, dtype=torch.int32, device="cuda")
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens)
+        torch.cuda.synchronize()
+        base_q = q.transpose(1, 2).reshape(b * s, h, d)
+        base_k = k.transpose(1, 2).reshape(b * s, h, d)
+        base_v = v.transpose(1, 2).reshape(b * s, h, d)
+        base_o = o.transpose(1, 2).reshape(b * s, h, d)
+        off = 0
+        for length in seq_lens:
+            qs = base_q[off : off + length].float()
+            ks = base_k[off : off + length].float()
+            vs = base_v[off : off + length].float()
+            scores = torch.einsum("lhd,mhd->hlm", qs, ks) * scale
+            ref = torch.einsum("hlm,mhd->lhd", torch.softmax(scores, dim=-1), vs)
+            torch.testing.assert_close(base_o[off : off + length].float(), ref, atol=5e-2, rtol=3e-2)
+            off += length
+
+    _run_and_check([200, 150])
+    _run_and_check([64, 33])
+    info_exec = api._k_mod.compile.cache_info()
+    assert info_exec.misses == info_plan.misses, "a THD execute minted a new kernel compile (runtime data leaked into the compile key)"
+    assert info_exec.hits >= info_plan.hits + 2
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=45)
+def test_dsl_sm120_thd_lens_never_reach_host():
+    """Issue #552 (D2H removal): the length tensors are consumed ONLY on
+    device — the setup kernel builds the metadata, the ragged views bind
+    buffer capacities, and the grid is the plan-time declared-S_q envelope
+    (tiles past a sequence's real length drain without loads or stores).
+    The old host round-trip helper (_thd_host_lens) is GONE from the
+    adapter entirely, while full numerics run in both length forms."""
+    _require_dsl()
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDsl, SdpaFwdDslSm120
+
+    assert not hasattr(SdpaFwdDsl, "_thd_host_lens") and not hasattr(SdpaFwdDslSm120, "_thd_host_lens")
+    _run_thd_case(seq_q_lens=[200, 150], seq_kv_lens=[180, 120], is_causal=True, check_stats=True, stats_layout="token_major")
+    _run_thd_case(seq_q_lens=[200, 150], seq_kv_lens=[180, 120], is_causal=True, check_stats=True, stats_layout="head_major", cu_lens=True)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=46)
+def test_dsl_sm120_thd_execute_never_syncs():
+    """Issue #552 endgame (SM120): the THD execute performs NO synchronizing
+    CUDA call — no length D2H, no pageable H2D, no device/stream sync —
+    pinned by torch's sync debug mode ("error"), which raises on any;
+    results are bitwise identical to an unguarded execute."""
+    _require_dsl()
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm120
+
+    b, h, s, d = 2, 4, 256, 128
+    dtype = torch.float16
+    q, k, v = (_bhsd(b, h, s, d, dtype) for _ in range(3))
+    o = torch.zeros_like(q)
+    api = SdpaFwdDslSm120(sample_q=q, sample_k=k, sample_v=v, sample_o=o, thd=True)
+    assert api.check_support()
+    api.compile()
+    lens = torch.tensor([200, 150], dtype=torch.int32, device="cuda")
+
+    # Warm-up outside the guarded region: allocator pools and lazy launcher
+    # state populate here, so the guarded execute reuses cached blocks.
+    api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens)
+    torch.cuda.synchronize()
+    o_ref = o.clone()
+    o.zero_()
+    prev_sync_mode = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode(2)
+    try:
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens)
+    finally:
+        torch.cuda.set_sync_debug_mode(prev_sync_mode)
+    torch.cuda.synchronize()
+    assert torch.equal(o, o_ref)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=47)
+def test_dsl_sm120_thd_execute_cuda_graph_capture():
+    """Issue #552 endgame (SM120): THD execute is CUDA-GRAPH CAPTURABLE — no
+    D2H, no pageable H2D, plan-time envelope grid. Capture once, then
+    replay with DIFFERENT lengths written into the same device tensors: the
+    replay must honor them (per-sequence lengths are read on device by the
+    setup and main kernels), proving no host value was baked into the
+    graph."""
+    _require_dsl()
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm120
+
+    b, h, s, d = 2, 4, 256, 128
+    dtype = torch.float16
+    scale = 1.0 / math.sqrt(d)
+    q, k, v = (_bhsd(b, h, s, d, dtype) for _ in range(3))
+    o = torch.zeros_like(q)
+    api = SdpaFwdDslSm120(sample_q=q, sample_k=k, sample_v=v, sample_o=o, thd=True)
+    assert api.check_support()
+    api.compile()
+    lens = torch.tensor([200, 150], dtype=torch.int32, device="cuda")
+
+    def _check(seq_lens):
+        base_q = q.transpose(1, 2).reshape(b * s, h, d)
+        base_k = k.transpose(1, 2).reshape(b * s, h, d)
+        base_v = v.transpose(1, 2).reshape(b * s, h, d)
+        base_o = o.transpose(1, 2).reshape(b * s, h, d)
+        off = 0
+        for length in seq_lens:
+            qs = base_q[off : off + length].float()
+            ks = base_k[off : off + length].float()
+            vs = base_v[off : off + length].float()
+            scores = torch.einsum("lhd,mhd->hlm", qs, ks) * scale
+            ref = torch.einsum("hlm,mhd->lhd", torch.softmax(scores, dim=-1), vs)
+            torch.testing.assert_close(base_o[off : off + length].float(), ref, atol=5e-2, rtol=3e-2)
+            off += length
+
+    api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens)
+    # Clobber O before each replay: the warm-up (and nothing else) has already
+    # produced the [200, 150] answer, so without this the first assertion
+    # would be satisfied by stale warm-up output even if replay did nothing.
+    o.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    _check([200, 150])
+    # New lengths into the SAME device tensor — replay must honor them.
+    lens.copy_(torch.tensor([64, 33], dtype=torch.int32, device="cuda"))
+    o.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    _check([64, 33])
+
+
+@pytest.mark.L1
+@torch_fork_set_rng(seed=48)
+def test_dsl_sm120_thd_cu_nonzero_base_normalized():
+    """The device-side metadata build NORMALIZES cu prefix sums (subtracts
+    element 0): the packed buffers are addressed from token 0, so a cu
+    tensor sliced from a larger prefix (cu[0] != 0) means the same lengths
+    and must produce bitwise-identical results."""
+    _require_dsl()
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm120
+
+    b, h, s, d = 2, 4, 256, 128
+    dtype = torch.float16
+    q, k, v = (_bhsd(b, h, s, d, dtype) for _ in range(3))
+    o = torch.zeros_like(q)
+    api = SdpaFwdDslSm120(sample_q=q, sample_k=k, sample_v=v, sample_o=o, thd=True, cu_seq_q_lens=True, cu_seq_kv_lens=True)
+    assert api.check_support()
+    api.compile()
+
+    def _run(base_q, base_kv):
+        # Distinct Q/KV prefix tensors with DIFFERENT lengths and bases: a
+        # normalization that subtracts one side's base from the other (or
+        # shares one tensor for both) cannot pass this by accident.
+        cu_q = torch.tensor([base_q, base_q + 200, base_q + 350], dtype=torch.int32, device="cuda")
+        cu_kv = torch.tensor([base_kv, base_kv + 180, base_kv + 310], dtype=torch.int32, device="cuda")
+        o.zero_()
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=cu_q, seq_kv_lens=cu_kv)
+        torch.cuda.synchronize()
+        return o.clone()
+
+    assert torch.equal(_run(0, 0), _run(1000, 7000))
 
 
 @pytest.mark.L0

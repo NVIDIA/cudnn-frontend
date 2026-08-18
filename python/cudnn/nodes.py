@@ -42,13 +42,6 @@ class Node:
         self.outputs: Dict[str, Tensor] = {}
         self.params: Dict[str, Any] = {}
 
-    def __setattr__(self, name, value):
-        # attribute writes freeze with the owning graph; the port/param dicts
-        # themselves become MappingProxy views at freeze time
-        if getattr(self, "_frozen", False) and name != "_frozen":
-            raise RuntimeError(f"cannot set Node.{name}: the owning graph is frozen after lowering/planning")
-        object.__setattr__(self, name, value)
-
     def validate(self) -> None:
         """Validate node configuration."""
         for port_name, tensor in self.inputs.items():

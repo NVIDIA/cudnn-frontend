@@ -1,0 +1,211 @@
+config_name,model_name,backend,data_type,attn_mask,batch_size,q_seqlen,kv_seqlen,num_q_heads,num_kv_heads,head_dim_qk,head_dim_vo,profile_pass,deterministic_bwd,time_ms,tflops,max_diff,num_iterations,sliding_window_size,success,skipped,error_message,gpu_name,cudnn_version,cudnn_backend_version,peak_mma_tflops
+kimiK26,kimiK26,cudnn,bfloat16,top_left,2,32768,32768,64,64,192,128,fwd,False,188.829,233.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,465.000
+kimiK26,kimiK26,cudnn,bfloat16,top_left,2,32768,32768,64,64,192,128,bwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,bfloat16,top_left,2,32768,32768,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,bfloat16,no_mask,2,32768,32768,64,64,192,128,fwd,False,379.283,232.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,466.500
+kimiK26,kimiK26,cudnn,bfloat16,no_mask,2,32768,32768,64,64,192,128,bwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,bfloat16,no_mask,2,32768,32768,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,fp8,top_left,2,32768,32768,64,64,192,128,fwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,fp8,top_left,2,32768,32768,64,64,192,128,bwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,fp8,top_left,2,32768,32768,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,fp8,no_mask,2,32768,32768,64,64,192,128,fwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,fp8,no_mask,2,32768,32768,64,64,192,128,bwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,fp8,no_mask,2,32768,32768,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,mxfp8,top_left,2,32768,32768,64,64,192,128,fwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,mxfp8,top_left,2,32768,32768,64,64,192,128,bwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,mxfp8,top_left,2,32768,32768,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,mxfp8,no_mask,2,32768,32768,64,64,192,128,fwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,mxfp8,no_mask,2,32768,32768,64,64,192,128,bwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,mxfp8,no_mask,2,32768,32768,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,bfloat16,top_left,2,16384,16384,64,64,192,128,fwd,False,47.716,230.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,466.500
+kimiK26,kimiK26,cudnn,bfloat16,top_left,2,16384,16384,64,64,192,128,bwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,bfloat16,top_left,2,16384,16384,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,bfloat16,no_mask,2,16384,16384,64,64,192,128,fwd,False,94.710,232.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,466.500
+kimiK26,kimiK26,cudnn,bfloat16,no_mask,2,16384,16384,64,64,192,128,bwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,bfloat16,no_mask,2,16384,16384,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,fp8,top_left,2,16384,16384,64,64,192,128,fwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,fp8,top_left,2,16384,16384,64,64,192,128,bwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,fp8,top_left,2,16384,16384,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,fp8,no_mask,2,16384,16384,64,64,192,128,fwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,fp8,no_mask,2,16384,16384,64,64,192,128,bwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,fp8,no_mask,2,16384,16384,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,mxfp8,top_left,2,16384,16384,64,64,192,128,fwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,mxfp8,top_left,2,16384,16384,64,64,192,128,bwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,mxfp8,top_left,2,16384,16384,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,mxfp8,no_mask,2,16384,16384,64,64,192,128,fwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,mxfp8,no_mask,2,16384,16384,64,64,192,128,bwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,mxfp8,no_mask,2,16384,16384,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,bfloat16,top_left,2,8192,8192,64,64,192,128,fwd,False,12.208,225.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,466.500
+kimiK26,kimiK26,cudnn,bfloat16,top_left,2,8192,8192,64,64,192,128,bwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,bfloat16,top_left,2,8192,8192,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,bfloat16,no_mask,2,8192,8192,64,64,192,128,fwd,False,23.907,230.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,466.500
+kimiK26,kimiK26,cudnn,bfloat16,no_mask,2,8192,8192,64,64,192,128,bwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,bfloat16,no_mask,2,8192,8192,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,fp8,top_left,2,8192,8192,64,64,192,128,fwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,fp8,top_left,2,8192,8192,64,64,192,128,bwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,fp8,top_left,2,8192,8192,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,fp8,no_mask,2,8192,8192,64,64,192,128,fwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,fp8,no_mask,2,8192,8192,64,64,192,128,bwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,fp8,no_mask,2,8192,8192,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,mxfp8,top_left,2,8192,8192,64,64,192,128,fwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,mxfp8,top_left,2,8192,8192,64,64,192,128,bwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,mxfp8,top_left,2,8192,8192,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,mxfp8,no_mask,2,8192,8192,64,64,192,128,fwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,mxfp8,no_mask,2,8192,8192,64,64,192,128,bwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,mxfp8,no_mask,2,8192,8192,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,bfloat16,top_left,2,4096,4096,64,64,192,128,fwd,False,3.206,214.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,466.500
+kimiK26,kimiK26,cudnn,bfloat16,top_left,2,4096,4096,64,64,192,128,bwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,bfloat16,top_left,2,4096,4096,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,bfloat16,no_mask,2,4096,4096,64,64,192,128,fwd,False,6.119,225.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,466.500
+kimiK26,kimiK26,cudnn,bfloat16,no_mask,2,4096,4096,64,64,192,128,bwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,bfloat16,no_mask,2,4096,4096,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,fp8,top_left,2,4096,4096,64,64,192,128,fwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,fp8,top_left,2,4096,4096,64,64,192,128,bwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,fp8,top_left,2,4096,4096,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,fp8,no_mask,2,4096,4096,64,64,192,128,fwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,fp8,no_mask,2,4096,4096,64,64,192,128,bwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,fp8,no_mask,2,4096,4096,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,mxfp8,top_left,2,4096,4096,64,64,192,128,fwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,mxfp8,top_left,2,4096,4096,64,64,192,128,bwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,mxfp8,top_left,2,4096,4096,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,mxfp8,no_mask,2,4096,4096,64,64,192,128,fwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,mxfp8,no_mask,2,4096,4096,64,64,192,128,bwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,mxfp8,no_mask,2,4096,4096,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,bfloat16,top_left,2,2048,2048,64,64,192,128,fwd,False,0.888,194.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,466.500
+kimiK26,kimiK26,cudnn,bfloat16,top_left,2,2048,2048,64,64,192,128,bwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,bfloat16,top_left,2,2048,2048,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,bfloat16,no_mask,2,2048,2048,64,64,192,128,fwd,False,1.583,217.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,440.500
+kimiK26,kimiK26,cudnn,bfloat16,no_mask,2,2048,2048,64,64,192,128,bwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,bfloat16,no_mask,2,2048,2048,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,fp8,top_left,2,2048,2048,64,64,192,128,fwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,fp8,top_left,2,2048,2048,64,64,192,128,bwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,fp8,top_left,2,2048,2048,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,fp8,no_mask,2,2048,2048,64,64,192,128,fwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,fp8,no_mask,2,2048,2048,64,64,192,128,bwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,fp8,no_mask,2,2048,2048,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,mxfp8,top_left,2,2048,2048,64,64,192,128,fwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,mxfp8,top_left,2,2048,2048,64,64,192,128,bwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,mxfp8,top_left,2,2048,2048,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,mxfp8,no_mask,2,2048,2048,64,64,192,128,fwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,mxfp8,no_mask,2,2048,2048,64,64,192,128,bwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn,mxfp8,no_mask,2,2048,2048,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,bfloat16,top_left,2,32768,32768,64,64,192,128,fwd,False,108.532,405.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,447.500
+kimiK26,kimiK26,cudnn_oss,bfloat16,top_left,2,32768,32768,64,64,192,128,bwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,bfloat16,top_left,2,32768,32768,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,bfloat16,no_mask,2,32768,32768,64,64,192,128,fwd,False,213.757,412.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,440.500
+kimiK26,kimiK26,cudnn_oss,bfloat16,no_mask,2,32768,32768,64,64,192,128,bwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,bfloat16,no_mask,2,32768,32768,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,fp8,top_left,2,32768,32768,64,64,192,128,fwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,fp8,top_left,2,32768,32768,64,64,192,128,bwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,fp8,top_left,2,32768,32768,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,fp8,no_mask,2,32768,32768,64,64,192,128,fwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,fp8,no_mask,2,32768,32768,64,64,192,128,bwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,fp8,no_mask,2,32768,32768,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,mxfp8,top_left,2,32768,32768,64,64,192,128,fwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,mxfp8,top_left,2,32768,32768,64,64,192,128,bwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,mxfp8,top_left,2,32768,32768,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,mxfp8,no_mask,2,32768,32768,64,64,192,128,fwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,mxfp8,no_mask,2,32768,32768,64,64,192,128,bwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,mxfp8,no_mask,2,32768,32768,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,bfloat16,top_left,2,16384,16384,64,64,192,128,fwd,False,27.449,401.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,466.500
+kimiK26,kimiK26,cudnn_oss,bfloat16,top_left,2,16384,16384,64,64,192,128,bwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,bfloat16,top_left,2,16384,16384,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,bfloat16,no_mask,2,16384,16384,64,64,192,128,fwd,False,53.618,410.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,466.500
+kimiK26,kimiK26,cudnn_oss,bfloat16,no_mask,2,16384,16384,64,64,192,128,bwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,bfloat16,no_mask,2,16384,16384,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,fp8,top_left,2,16384,16384,64,64,192,128,fwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,fp8,top_left,2,16384,16384,64,64,192,128,bwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,fp8,top_left,2,16384,16384,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,fp8,no_mask,2,16384,16384,64,64,192,128,fwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,fp8,no_mask,2,16384,16384,64,64,192,128,bwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,fp8,no_mask,2,16384,16384,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,mxfp8,top_left,2,16384,16384,64,64,192,128,fwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,mxfp8,top_left,2,16384,16384,64,64,192,128,bwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,mxfp8,top_left,2,16384,16384,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,mxfp8,no_mask,2,16384,16384,64,64,192,128,fwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,mxfp8,no_mask,2,16384,16384,64,64,192,128,bwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,mxfp8,no_mask,2,16384,16384,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,bfloat16,top_left,2,8192,8192,64,64,192,128,fwd,False,6.815,403.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,466.500
+kimiK26,kimiK26,cudnn_oss,bfloat16,top_left,2,8192,8192,64,64,192,128,bwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,bfloat16,top_left,2,8192,8192,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,bfloat16,no_mask,2,8192,8192,64,64,192,128,fwd,False,12.891,426.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,466.500
+kimiK26,kimiK26,cudnn_oss,bfloat16,no_mask,2,8192,8192,64,64,192,128,bwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,bfloat16,no_mask,2,8192,8192,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,fp8,top_left,2,8192,8192,64,64,192,128,fwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,fp8,top_left,2,8192,8192,64,64,192,128,bwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,fp8,top_left,2,8192,8192,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,fp8,no_mask,2,8192,8192,64,64,192,128,fwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,fp8,no_mask,2,8192,8192,64,64,192,128,bwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,fp8,no_mask,2,8192,8192,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,mxfp8,top_left,2,8192,8192,64,64,192,128,fwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,mxfp8,top_left,2,8192,8192,64,64,192,128,bwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,mxfp8,top_left,2,8192,8192,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,mxfp8,no_mask,2,8192,8192,64,64,192,128,fwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,mxfp8,no_mask,2,8192,8192,64,64,192,128,bwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,mxfp8,no_mask,2,8192,8192,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,bfloat16,top_left,2,4096,4096,64,64,192,128,fwd,False,1.862,369.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,466.500
+kimiK26,kimiK26,cudnn_oss,bfloat16,top_left,2,4096,4096,64,64,192,128,bwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,bfloat16,top_left,2,4096,4096,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,bfloat16,no_mask,2,4096,4096,64,64,192,128,fwd,False,3.345,411.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,440.500
+kimiK26,kimiK26,cudnn_oss,bfloat16,no_mask,2,4096,4096,64,64,192,128,bwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,bfloat16,no_mask,2,4096,4096,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,fp8,top_left,2,4096,4096,64,64,192,128,fwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,fp8,top_left,2,4096,4096,64,64,192,128,bwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,fp8,top_left,2,4096,4096,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,fp8,no_mask,2,4096,4096,64,64,192,128,fwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,fp8,no_mask,2,4096,4096,64,64,192,128,bwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,fp8,no_mask,2,4096,4096,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,mxfp8,top_left,2,4096,4096,64,64,192,128,fwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,mxfp8,top_left,2,4096,4096,64,64,192,128,bwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,mxfp8,top_left,2,4096,4096,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,mxfp8,no_mask,2,4096,4096,64,64,192,128,fwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,mxfp8,no_mask,2,4096,4096,64,64,192,128,bwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,mxfp8,no_mask,2,4096,4096,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,bfloat16,top_left,2,2048,2048,64,64,192,128,fwd,False,0.569,302.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,442.000
+kimiK26,kimiK26,cudnn_oss,bfloat16,top_left,2,2048,2048,64,64,192,128,bwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,bfloat16,top_left,2,2048,2048,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,bfloat16,no_mask,2,2048,2048,64,64,192,128,fwd,False,0.918,374.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,1.27.0,92700.000,440.500
+kimiK26,kimiK26,cudnn_oss,bfloat16,no_mask,2,2048,2048,64,64,192,128,bwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,bfloat16,no_mask,2,2048,2048,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,fp8,top_left,2,2048,2048,64,64,192,128,fwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,fp8,top_left,2,2048,2048,64,64,192,128,bwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,fp8,top_left,2,2048,2048,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,fp8,no_mask,2,2048,2048,64,64,192,128,fwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,fp8,no_mask,2,2048,2048,64,64,192,128,bwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,fp8,no_mask,2,2048,2048,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,mxfp8,top_left,2,2048,2048,64,64,192,128,fwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,mxfp8,top_left,2,2048,2048,64,64,192,128,bwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,mxfp8,top_left,2,2048,2048,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,mxfp8,no_mask,2,2048,2048,64,64,192,128,fwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,mxfp8,no_mask,2,2048,2048,64,64,192,128,bwd,False,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,cudnn_oss,mxfp8,no_mask,2,2048,2048,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,flash_attention_4,bfloat16,top_left,2,32768,32768,64,64,192,128,fwd,False,121.056,363.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,,,466.500
+kimiK26,kimiK26,flash_attention_4,bfloat16,top_left,2,32768,32768,64,64,192,128,bwd,False,714.133,160.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,,,466.500
+kimiK26,kimiK26,flash_attention_4,bfloat16,top_left,2,32768,32768,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,flash_attention_4,bfloat16,no_mask,2,32768,32768,64,64,192,128,fwd,False,226.718,388.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,,,466.500
+kimiK26,kimiK26,flash_attention_4,bfloat16,no_mask,2,32768,32768,64,64,192,128,bwd,False,1441.186,159.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,,,466.500
+kimiK26,kimiK26,flash_attention_4,bfloat16,no_mask,2,32768,32768,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,flash_attention_4,bfloat16,top_left,2,16384,16384,64,64,192,128,fwd,False,30.777,357.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,,,466.500
+kimiK26,kimiK26,flash_attention_4,bfloat16,top_left,2,16384,16384,64,64,192,128,bwd,False,181.089,158.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,,,466.500
+kimiK26,kimiK26,flash_attention_4,bfloat16,top_left,2,16384,16384,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,flash_attention_4,bfloat16,no_mask,2,16384,16384,64,64,192,128,fwd,False,56.848,387.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,,,466.500
+kimiK26,kimiK26,flash_attention_4,bfloat16,no_mask,2,16384,16384,64,64,192,128,bwd,False,362.741,158.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,,,440.500
+kimiK26,kimiK26,flash_attention_4,bfloat16,no_mask,2,16384,16384,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,flash_attention_4,bfloat16,top_left,2,8192,8192,64,64,192,128,fwd,False,7.975,345.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,,,439.000
+kimiK26,kimiK26,flash_attention_4,bfloat16,top_left,2,8192,8192,64,64,192,128,bwd,False,46.621,153.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,,,466.500
+kimiK26,kimiK26,flash_attention_4,bfloat16,top_left,2,8192,8192,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,flash_attention_4,bfloat16,no_mask,2,8192,8192,64,64,192,128,fwd,False,14.180,388.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,,,439.000
+kimiK26,kimiK26,flash_attention_4,bfloat16,no_mask,2,8192,8192,64,64,192,128,bwd,False,91.948,155.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,,,450.500
+kimiK26,kimiK26,flash_attention_4,bfloat16,no_mask,2,8192,8192,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,flash_attention_4,bfloat16,top_left,2,4096,4096,64,64,192,128,fwd,False,2.147,320.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,,,439.000
+kimiK26,kimiK26,flash_attention_4,bfloat16,top_left,2,4096,4096,64,64,192,128,bwd,False,12.369,144.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,,,459.000
+kimiK26,kimiK26,flash_attention_4,bfloat16,top_left,2,4096,4096,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,flash_attention_4,bfloat16,no_mask,2,4096,4096,64,64,192,128,fwd,False,3.635,378.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,,,439.000
+kimiK26,kimiK26,flash_attention_4,bfloat16,no_mask,2,4096,4096,64,64,192,128,bwd,False,23.571,152.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,,,439.000
+kimiK26,kimiK26,flash_attention_4,bfloat16,no_mask,2,4096,4096,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,flash_attention_4,bfloat16,top_left,2,2048,2048,64,64,192,128,fwd,False,0.653,263.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,,,439.000
+kimiK26,kimiK26,flash_attention_4,bfloat16,top_left,2,2048,2048,64,64,192,128,bwd,False,3.620,123.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,,,439.000
+kimiK26,kimiK26,flash_attention_4,bfloat16,top_left,2,2048,2048,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,
+kimiK26,kimiK26,flash_attention_4,bfloat16,no_mask,2,2048,2048,64,64,192,128,fwd,False,1.015,338.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,,,34.500
+kimiK26,kimiK26,flash_attention_4,bfloat16,no_mask,2,2048,2048,64,64,192,128,bwd,False,6.217,144.000,0.000,10,,True,False,,NVIDIA RTX PRO 6000 Blackwell Server Edition,,,34.500
+kimiK26,kimiK26,flash_attention_4,bfloat16,no_mask,2,2048,2048,64,64,192,128,bwd,True,inf,0.000,0.000,10,,False,False,Benchmark failed with return code 1.,,,,

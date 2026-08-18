@@ -16,7 +16,10 @@ This directory contains benchmarking tools for Scaled Dot Product Attention (SDP
   - `ltx2.py` - LTX-2 video DiT self-attention benchmarks (bidirectional, no mask)
   - `gpt_oss.py` - GPT-OSS sliding-window-attention GQA benchmarks (causal, SWA=128)
   - `qwen35.py` - Qwen 3.5 GQA benchmarks (head_dim=256, causal, bf16 bidirectional — Blackwell fp8/fa4 limits)
+  - `qwen3vl_vit.py` - Qwen3-VL vision-encoder (ViT) self-attention benchmarks (bidirectional, no mask, fwd-only, head_dim 72-in-80)
   - `auto_regressive_dit.py` - Autoregressive video DiT (short Q, long cached KV, bf16/mxfp8, no_mask)
+  - `kimi_k3.py` - Kimi K3 MLA benchmarks (96 heads, unabsorbed 192/128, NoPE)
+  - `deepseek_v4.py` - DeepSeek-V4 shared-K=V MQA benchmarks (head_dim=512, SWA=128)
 - `runner.py` - Configuration-based benchmark runner
 - `config_types.py` - Data types for benchmark configuration
 - `charts.py` - Chart generation utilities
@@ -56,8 +59,17 @@ python -m benchmark.sdpa_benchmark_training.runner --config ltx2
 # Run Qwen 3.5 benchmark suite (cuDNN bf16 at head_dim=256)
 python -m benchmark.sdpa_benchmark_training.runner --config qwen35
 
+# Run Qwen3-VL vision-encoder (ViT) benchmark suite (inference fwd-only)
+python -m benchmark.sdpa_benchmark_training.runner --config qwen3vl_vit
+
 # Run Autoregressive video DiT benchmark suite (short Q, long cached KV)
 python -m benchmark.sdpa_benchmark_training.runner --config auto_regressive_dit
+
+# Run Kimi K3 benchmark suite (MLA, 96 heads)
+python -m benchmark.sdpa_benchmark_training.runner --config kimi_k3
+
+# Run DeepSeek-V4 benchmark suite (shared-K=V MQA, head_dim=512)
+python -m benchmark.sdpa_benchmark_training.runner --config deepseek_v4
 
 # Dry run (show what would be executed)
 python -m benchmark.sdpa_benchmark_training.runner --config llama --dry-run
@@ -182,6 +194,17 @@ python benchmark_single_sdpa.py \
     --sdpa_backend cudnn --data_type bfloat16 \
     --attn_mask top_left --fwd_bwd
 
+# cuDNN OSS FROST engines (BF16) — same graph API, but the open-source
+# CuTe-DSL kernels (cudnn.sdpa, routed via cudnn.engines) are pinned to
+# serve the graph instead of the native cuDNN backend. Configurations no
+# FROST engine covers exit with a dedicated "unsupported" code and are
+# skipped by the runner/charts.
+python benchmark_single_sdpa.py \
+    --batch_size 1 --q_seqlen 8192 --kv_seqlen 8192 \
+    --num_q_heads 64 --num_kv_heads 8 --head_dim 128 \
+    --sdpa_backend cudnn_oss --data_type bfloat16 \
+    --attn_mask top_left --profile_pass fwd
+
 # cuDNN Frontend (FP8)
 python benchmark_single_sdpa.py \
     --batch_size 1 --q_seqlen 8192 --kv_seqlen 8192 \
@@ -288,6 +311,7 @@ runner.save_csv(results, config)
 | Backend | Description |
 |---------|-------------|
 | `cudnn` | cuDNN (native, via cuDNN Frontend) |
+| `cudnn_oss` | cuDNN OSS FROST engines (open-source CuTe-DSL kernels, via cuDNN Frontend) |
 | `flash_attention_4` | FlashAttention 4 |
 | `flash_attention_3` | FlashAttention 3 |
 | `pyt_flash_attention` | PyTorch FlashAttention |
@@ -297,6 +321,14 @@ runner.save_csv(results, config)
 ## Benchmark Results
 
 Results are organized by `<config>/<gpu>/`. The plots compare cuDNN against FAv4 across BF16, MXFP8, and FP8 (cuDNN-only for FP8/MXFP8). Per-config layout:
+
+The current drops include the `cudnn_oss` backend measured in the same run
+and environment as the native rows. Configurations no FROST engine covers
+(e.g. bwd passes on non-sm120 GPUs, sliding-window, d_qk > 512) are recorded
+as skipped rather than failed; the charts omit their bars. Charts also carry
+a dashed line per dtype at the dense-MMA peak for the GPU, computed at the
+boost clock sampled during the measurement window (the `peak_mma_tflops`
+CSV column).
 
 ```
 results/<config>/<gpu>/
@@ -352,3 +384,7 @@ Runs were captured on GB200 and GB300 with cuDNN 9.23.0 and FAv4 4.0.0b15.
 - Same configuration as the GB300 chart above, captured on GB200.
 
 GB200 results are available under the same layout at `results/<config>/gb200/`.
+
+Inference-phase benchmarks (context vs generation decode, MTP widths,
+cudnn vs the frontend's open-source engines) live in
+[`../attention_inference/`](../attention_inference/README.md).
