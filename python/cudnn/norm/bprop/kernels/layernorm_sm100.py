@@ -550,8 +550,23 @@ def _pipe_bwd_smem(C, wn, STAGES):
     return 2 * STAGES * C * 2 + C * 2 + wn * 8 + (2 * STAGES + 1) * 8 + 64
 
 
-def _pipe_bwd_stages(C):
-    return 3 if C <= 2048 else _PIPE_STAGES
+def _bwd_cache_xd(ldgs, V, R, C, has_beta):
+    """Whether pass2 caches xhat/dxhat in registers (skips the smem re-read). Costs
+    (2+npb)*ldgs*V fp32 regs -> lowers occupancy, a win only when occupancy isn't the
+    limiter (R*C<=48M crossover: mixtral 33M helps, llama3-70b 67M regresses) and the
+    register budget doesn't spill."""
+    npb = 2 if has_beta else 1
+    return ((2 + npb) * ldgs * V <= 120) and (R * C <= 48 * 1024 * 1024)
+
+
+def _pipe_bwd_actual_stages(cache_xd):
+    # 3 stages ONLY on the cached path: caching already spent occupancy on register
+    # state, so the extra buffer's deeper overlap of the read-heavy (dy+x) load is a
+    # net win (mixtral C4096 0.79->0.82, nemotronh C8192 0.80->0.83). The non-cached
+    # path (large N, R*C>48M e.g. llama3-8b/llama3-70b) is occupancy-critical -- a 3rd
+    # buffer drops it to 2 CTAs/SM and regresses hard (llama3-8b 0.88->0.67). Cached
+    # shapes always have small ldgs, so C is bounded (<=~10K) and 3 buffers fit smem.
+    return 3 if cache_xd else _PIPE_STAGES
 
 
 def _bwd_pipe_cfg(C, eb):
@@ -581,8 +596,12 @@ def _bwd_pipe_cfg(C, eb):
     return (tpr, wn, ldgs, V)
 
 
-def _pipe_bwd_eligible(C, wn):
-    return wn >= 1 and _pipe_bwd_smem(C, wn, _pipe_bwd_stages(C)) <= _PIPE_SMEM_MAX
+def _pipe_bwd_eligible(C, wn, ldgs, V, R, has_beta):
+    # Use the ACTUAL stage count (cached -> 3) so the smem bound matches what the kernel
+    # allocates -- a fixed STAGES=3 bound would wrongly reject non-cached large C
+    # (llama31 C=16384 actually runs at 2 = 160KB, but 3 = 229KB > cap).
+    STAGES = _pipe_bwd_actual_stages(_bwd_cache_xd(ldgs, V, R, C, has_beta))
+    return wn >= 1 and _pipe_bwd_smem(C, wn, STAGES) <= _PIPE_SMEM_MAX
 
 
 def _pipe_bwd_cap(R, wn):
@@ -604,28 +623,29 @@ def _backward_pipe(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, params, wcfg
 
     tpr, wn, ldgs, V = wcfg
     R, C = spec.R, spec.M
-    STAGES = _pipe_bwd_stages(C)
+    cache_xd = _bwd_cache_xd(ldgs, V, R, C, has_beta)
+    STAGES = _pipe_bwd_actual_stages(cache_xd)
     block_threads = (wn + 1) * 32
     ctas = _pipe_bwd_cap(R, wn)
     if mean is None:
         mean = rstd
 
     dx = torch.empty_like(x2d)
-    # finalize atomic-accumulates over partition chunks -> outputs start at zero
-    dgamma = torch.zeros(spec.gamma_len, dtype=torch.float32, device=x2d.device)
-    dbeta = torch.zeros(spec.gamma_len, dtype=torch.float32, device=x2d.device)
+    # finalize atomic-accumulates over partition chunks -> outputs start at zero. Zero
+    # dgamma+dbeta in ONE fill (a contiguous [2,gamma_len] buffer, sliced to views) so
+    # LN pays a single zeroing-kernel launch instead of two -- the launch overhead is a
+    # measurable fraction of the small-N LN backward (gpt3). RMS aliases dbeta->dgamma.
+    if has_beta:
+        _gb = torch.zeros(2, spec.gamma_len, dtype=torch.float32, device=x2d.device)
+        dgamma, dbeta = _gb[0], _gb[1]
+    else:
+        dgamma = torch.zeros(spec.gamma_len, dtype=torch.float32, device=x2d.device)
+        dbeta = dgamma
     dgp = torch.empty(ctas * C, dtype=torch.float32, device=x2d.device)
     dbp = torch.empty(ctas * C, dtype=torch.float32, device=x2d.device) if has_beta else dgp
 
     et = DTYPE_TO_CUTLASS[params.io_dtype]
     it_ty = _INT_TY[DTYPE_BYTES[params.io_dtype]]
-    # Cache xhat/dxhat in registers so pass2 skips re-reading smem + recomputing.
-    # Costs (2+npb)*ldgs*V fp32 regs, which lowers occupancy -- a win only when the
-    # total work is small enough that occupancy isn't the limiter (measured crossover
-    # R*C ~ 48M: helps small-N/mid-C and C=128, hurts large-N e.g. llama3-70b 67M).
-    # Also gate on the register budget (larger ldgs would spill -> use CGA for those).
-    npb = 2 if has_beta else 1
-    cache_xd = ((2 + npb) * ldgs * V <= 120) and (R * C <= 48 * 1024 * 1024)
     smem_bytes = _pipe_bwd_smem(C, wn, STAGES)
     FB = 128 if C < 256 else 256
     fgrid = (C + FB - 1) // FB
@@ -713,7 +733,7 @@ def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, cfg, params):
     if wcfg is not None and wcfg[1] == 1 and not spec.has_mean and (spec.R % 2 == 0):
         # tiny C (single warp per row) RMS: multi-row tiling beats the per-row pipeline
         return _backward_tiled(spec, dy2d, x2d, gamma, rstd, params=params, wcfg=wcfg)
-    if wcfg is not None and _pipe_bwd_eligible(spec.M, wcfg[1]):
+    if wcfg is not None and _pipe_bwd_eligible(spec.M, wcfg[1], wcfg[2], wcfg[3], spec.R, has_beta):
         return _backward_pipe(spec, dy2d, x2d, gamma, mean, rstd, has_beta=has_beta, params=params, wcfg=wcfg)
 
     if mean is None:  # RMSNorm has no centering; kernel ignores it when has_mean=False
