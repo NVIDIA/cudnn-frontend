@@ -46,7 +46,7 @@ def _build_spec_map():
     m = {}
     for cfg in _CATALOG:
         kb_want = 384 if cfg.pipeline == "sm103" else 128
-        if cfg.cta_tile_m % 128 or cfg.cta_tile_n % 128 or cfg.cta_tile_k_bytes != kb_want:
+        if cfg.mma_inst_m % 128 or cfg.mma_inst_n % 128 or cfg.cta_tile_k_bytes != kb_want:
             continue
         # Only sm100 has static-scheduler variants; sm103 / sm107 are CLC-only.
         scheds = (("clc", ""), ("static", "_static")) if cfg.pipeline == "sm100" else (("clc", ""),)

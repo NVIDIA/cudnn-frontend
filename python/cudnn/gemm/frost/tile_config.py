@@ -449,15 +449,18 @@ def _geom_sm103(cta_m: int, cta_n: int, cgrp_m: int, cgrp_n: int) -> ConfigSm103
     )
 
 
-def _geom_sm107(cta_m: int, cta_n: int, cgrp_m: int, cgrp_n: int) -> ConfigSm107:
-    """Build one sm107 config (the 64-byte MMA-inst K is the family's, not ours)."""
+def _geom_sm107(num_mma_m: int, cta_n: int, cgrp_m: int, cgrp_n: int) -> ConfigSm107:
+    """Build one sm107 config (the 64-byte MMA-inst K is the family's, not ours).
+    mma_inst_m is pinned to 128 — the block-scale F8_128x4 SF swizzle needs
+    mma_inst_m % 128 == 0, so 64 is not an axis here."""
     return ConfigSm107(
-        cta_tile_m=cta_m,
+        cta_tile_m=_CTA_TILE_M_MAX * num_mma_m,
         cta_tile_n=cta_n,
         cta_tile_k_bytes=128,
         cgrp_size_m=cgrp_m,
         cgrp_size_n=cgrp_n,
-        epi_tile_mn=(cta_m, 32),
+        mma_inst_m=_CTA_TILE_M_MAX,
+        epi_tile_mn=(_CTA_TILE_M_MAX, 32),
         threads_per_cta=256,
         pipeline="sm107",
         acc_stages=2,
@@ -481,9 +484,10 @@ def _build_catalog() -> tuple[TileConfig, ...]:
     # sm107 block-scale geometries: the sm100 axes narrowed to what the F8_128x4
     # SF swizzle admits (M/N multiples of 128, K-tile 128 B) — the rest of the
     # sm100 enumeration would only be rejected by validate_block_scale_config.
-    for cta_n in (256, 128):
-        for cgrp_m, cgrp_n in _CLUSTERS:
-            cfgs.append(_geom_sm107(128, cta_n, cgrp_m, cgrp_n))
+    for num_mma_m in (1, 2):
+        for cta_n in (256, 128):
+            for cgrp_m, cgrp_n in _CLUSTERS:
+                cfgs.append(_geom_sm107(num_mma_m, cta_n, cgrp_m, cgrp_n))
     return tuple(cfgs)
 
 

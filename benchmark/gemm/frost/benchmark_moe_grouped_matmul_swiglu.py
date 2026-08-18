@@ -173,7 +173,7 @@ def _build_spec_map():
     chain = analyze(_graph_swiglu(2048, 256, 256, 9)[0])
     m = {}
     for t, cfg in _registry_candidates(chain):
-        if cfg.pipeline != "sm100" or cfg.cta_tile_n > 256 or cfg.cta_tile_m != 128:
+        if cfg.pipeline != "sm100" or cfg.cta_tile_n > 256 or cfg.mma_inst_m != 128:
             continue
         label = f"{cfg.name}_{t.cta_group}ctamma" + ("_static" if t.static_sched else "")
         m[label] = (cfg, t.cta_group, t.scheduler)

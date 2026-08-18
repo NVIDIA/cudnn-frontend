@@ -355,7 +355,7 @@ def _build_spec_map(variant: str, dtype: str) -> dict[str, tuple]:
     n_cap = 128 if dtype == "mxfp8" else 256
     m = {}
     for t, cfg in _registry_candidates(chain):
-        if cfg.pipeline != "sm100" or cfg.cta_tile_n > n_cap or cfg.cta_tile_m != 128:
+        if cfg.pipeline != "sm100" or cfg.cta_tile_n > n_cap or cfg.mma_inst_m != 128:
             continue
         label = f"{cfg.name}_{t.cta_group}ctamma" + ("_static" if t.static_sched else "")
         m[label] = (cfg, t.cta_group, t.scheduler)
