@@ -498,6 +498,25 @@ class SDPANodeBase : public NodeCRTP<DerivedT> {
 
         CUDNN_FE_VALIDATE_STRIDE(output_names::O, attributes.outputs);
 
+        // Non-ragged Stats layouts other than packed BHSD are not correctly supported prior to 9.26.0.
+        // Runs post shape inference so that an unset Stats layout (always inferred as packed BHSD)
+        // is not rejected.
+        auto const& stats_out = attributes.outputs.find(output_names::Stats);
+        bool const has_stats  = (stats_out != attributes.outputs.end()) && (stats_out->second != nullptr);
+        if (has_stats && !stats_out->second->get_ragged_offset() && detail::get_backend_version() < 92600) {
+            auto const& stats_dim           = stats_out->second->get_dim();
+            auto const& stats_stride        = stats_out->second->get_stride();
+            bool const stats_is_packed_bhsd = stats_dim.size() == 4 && stats_stride.size() == 4 &&
+                                              stats_stride[3] == 1 && stats_stride[2] == stats_dim[3] &&
+                                              stats_stride[1] == stats_dim[2] * stats_dim[3] &&
+                                              stats_stride[0] == stats_dim[1] * stats_dim[2] * stats_dim[3];
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                !stats_is_packed_bhsd,
+                error_code_t::GRAPH_NOT_SUPPORTED,
+                "For cuDNN version below 9.26.0, a non-ragged Stats output must be a packed BHSD "
+                "tensor.");
+        }
+
 #undef CUDNN_FE_VALIDATE_STRIDE
 
         return {error_code_t::OK, ""};
