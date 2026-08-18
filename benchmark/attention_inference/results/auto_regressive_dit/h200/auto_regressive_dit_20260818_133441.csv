@@ -1,0 +1,11 @@
+config_name,model_name,phase,backend,data_type,kv_cache_dtype,batch_size,q_tokens,kv_len,num_q_heads,num_kv_heads,head_dim_qk,head_dim_vo,kind,sliding_window_size,page_size,time_ms,tflops,gbps,sol_pct,num_iterations,success,error_message,gpu_name,backend_detail,cudnn_backend_version
+auto_regressive_dit,ar_dit,context,cudnn,bfloat16,bfloat16,1,8192,8192,9,9,128,128,gqa,,64,0.527392,586.353,143.152,2.9823,20,True,,NVIDIA H200,cudnn 9.26.0,
+auto_regressive_dit,ar_dit,context,cudnn,bfloat16,bfloat16,1,62208,62208,9,9,128,128,gqa,,64,28.938208,616.216,19.811,0.4127,20,True,,NVIDIA H200,cudnn 9.26.0,
+auto_regressive_dit,ar_dit,context,cudnn,bfloat16,bfloat16,1,985,62208,9,9,128,128,gqa,,64,0.743296,379.868,391.76,8.1617,20,True,,NVIDIA H200,cudnn 9.26.0,
+auto_regressive_dit,ar_dit,context,cudnn,bfloat16,bfloat16,1,2048,62208,9,9,128,128,gqa,,64,1.487552,394.654,199.046,4.1468,20,True,,NVIDIA H200,cudnn 9.26.0,
+auto_regressive_dit,ar_dit,context,cudnn,bfloat16,bfloat16,1,4096,62208,9,9,128,128,gqa,,64,2.224064,527.924,137.374,2.862,20,True,,NVIDIA H200,cudnn 9.26.0,
+auto_regressive_dit,ar_dit,context,cudnn,bfloat16,bfloat16,1,8192,62208,9,9,128,128,gqa,,64,3.962112,592.682,81.876,1.7058,20,True,,NVIDIA H200,cudnn 9.26.0,
+auto_regressive_dit,ar_dit,generation,cudnn,bfloat16,bfloat16,1,1,62208,9,9,128,128,gqa,,64,0.099072,2.893,2893.442,60.28,20,True,,NVIDIA H200,cudnn 9.26.0,
+auto_regressive_dit,ar_dit,generation,cudnn,bfloat16,bfloat16,1,2,62208,9,9,128,128,gqa,,64,0.74272,0.772,385.965,8.0409,20,True,,NVIDIA H200,cudnn 9.26.0,
+auto_regressive_dit,ar_dit,generation,cudnn,bfloat16,bfloat16,1,3,62208,9,9,128,128,gqa,,64,0.74416,1.156,385.224,8.0255,20,True,,NVIDIA H200,cudnn 9.26.0,
+auto_regressive_dit,ar_dit,generation,cudnn,bfloat16,bfloat16,1,4,62208,9,9,128,128,gqa,,64,0.741632,1.546,386.543,8.053,20,True,,NVIDIA H200,cudnn 9.26.0,
