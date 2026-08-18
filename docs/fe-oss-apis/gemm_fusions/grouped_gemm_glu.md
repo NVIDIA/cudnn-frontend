@@ -100,8 +100,7 @@ The block-scaled backend performs:
 
 ### Equations
 
-For SiTU-GLU, with gate branch `G`, up branch `U`, `situ_beta1=4`, and
-`situ_beta2=25`, the fused epilogue computes
+For SiTU-GLU, with gate branch `G` and up branch `U`, the fused epilogue computes
 
 $$
 D = \mathrm{prob}\,
@@ -109,8 +108,10 @@ D = \mathrm{prob}\,
     \left[\beta_2\tanh(U/\beta_2)\right].
 $$
 
-The beta values are runtime FP32 scalars and do not create new compiled-kernel
-cache entries.
+where `beta_1 = situ_beta1` and `beta_2 = situ_beta2`, with defaults
+`beta_1 = 4.0` and `beta_2 = 25.0`. `situ_beta1` specializes the compiled kernel
+and is part of its cache key; `situ_beta2` is a runtime FP32 scalar and does not
+create a new compiled-kernel cache entry.
 
 - **Inputs**
   - `A`: contiguous activation tensor across all groups, shape `(valid_m, K, 1)`

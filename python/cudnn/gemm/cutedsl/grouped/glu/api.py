@@ -502,7 +502,8 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall) -> TupleDict:
             parameter, intentionally not part of the cache key. Ignored when
             ``act_func == "swiglu"``.
         situ_beta1: Positive finite gate tanh scale for SiTU-GLU. Default
-            ``4.0``. Runtime parameter, intentionally not part of the cache key.
+            ``4.0``. This value specializes the compiled kernel and is part of
+            the cache key.
         situ_beta2: Positive finite up-branch tanh scale for SiTU-GLU. Default
             ``25.0``. Runtime parameter, intentionally not part of the cache key.
         use_dynamic_sched: Enable dynamic tile scheduling for load balancing

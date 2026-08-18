@@ -146,8 +146,8 @@ $$
 \frac{\partial T_u}{\partial U}=1-\tanh^2(U/\beta_2),
 $$
 
-and returns `R * prob * T_u * dT_g/dG` and
-`R * prob * T_g * dT_u/dU`. `dprob` accumulates `R * T_g * T_u`.
+and returns `ref * prob * T_u * dT_g/dG` and
+`ref * prob * T_g * dT_u/dU`. `dprob` accumulates `ref * T_g * T_u`.
 The beta values are compile-time specialization values and therefore belong to
 the dGLU compiled-kernel cache key.
 
