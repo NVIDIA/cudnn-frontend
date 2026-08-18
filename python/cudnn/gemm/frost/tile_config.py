@@ -385,14 +385,17 @@ def config_class_for_pipeline(pipeline: str) -> type[TileConfig]:
 # ---------------------------------------------------------------------------
 # Catalog — pure-geometry enumeration. cta_group / static / mainloop are NOT
 # enumerated here; the registry expands each geometry across accepting templates.
-# Axes: cta_m ∈ {128,64}, cta_n ∈ {8..256 step 8}, K_bytes ∈ {128,64}, cluster ∈
-# _CLUSTERS. N < 8 / N % 8 rejected by __post_init__ (tcgen05 idesc n_dim is a
-# multiple of 8). 2-CTA templates accept only cgrp_size_m % 2 == 0 (registry
-# predicate). Every catalog entry has num_mma_m == 1 (mma_inst tile == cta tile);
-# geometries that split the tile across several MMA instructions along M are
-# reached by `by_name` synthesis, so they stay out of the funnel's candidate set
-# and out of the benchmark / full-sweep enumerations.
+# Axes: M ∈ _M_AXES (the UTCMMA instruction M and how many of them the CTA tile
+# spans — cta_tile_m is the PRODUCT, not an axis), cta_n ∈ {8..256 step 8},
+# K_bytes ∈ {128,64}, cluster ∈ _CLUSTERS. N < 8 / N % 8 rejected by
+# __post_init__ (tcgen05 idesc n_dim is a multiple of 8). 2-CTA templates accept
+# only cgrp_size_m % 2 == 0 (registry predicate).
 # ---------------------------------------------------------------------------
+
+# (mma_inst_m, num_mma_m) — the UTCMMA instruction M and how many of them one CTA
+# tile spans; cta_tile_m is their product. num_mma_m == 1 first, so a lookup like
+# `next(c for c in CATALOG if c.cta_tile_m == 128)` still lands on the unsplit tile.
+_M_AXES: tuple[tuple[int, int], ...] = ((128, 1), (64, 1), (128, 2), (64, 2))
 
 _CLUSTERS: tuple[tuple[int, int], ...] = (
     (1, 1),
@@ -413,15 +416,17 @@ _CLUSTERS: tuple[tuple[int, int], ...] = (
 )
 
 
-def _geom_sm100(cta_m: int, cta_n: int, k_bytes: int, cgrp_m: int, cgrp_n: int) -> ConfigSm100:
-    """Build one sm100 pure-geometry config."""
+def _geom_sm100(mma_m: int, num_mma_m: int, cta_n: int, k_bytes: int, cgrp_m: int, cgrp_n: int) -> ConfigSm100:
+    """Build one sm100 pure-geometry config from the MMA-instruction M and the
+    number of them the CTA tile spans."""
     return ConfigSm100(
-        cta_tile_m=cta_m,
+        cta_tile_m=mma_m * num_mma_m,
         cta_tile_n=cta_n,
         cta_tile_k_bytes=k_bytes,
         cgrp_size_m=cgrp_m,
         cgrp_size_n=cgrp_n,
-        epi_tile_mn=(cta_m, 32),
+        mma_inst_m=mma_m,
+        epi_tile_mn=(mma_m, 32),
         threads_per_cta=256,
         pipeline="sm100",
         acc_stages=2,
@@ -444,15 +449,18 @@ def _geom_sm103(cta_m: int, cta_n: int, cgrp_m: int, cgrp_n: int) -> ConfigSm103
     )
 
 
-def _geom_sm107(cta_m: int, cta_n: int, cgrp_m: int, cgrp_n: int) -> ConfigSm107:
-    """Build one sm107 config (the 64-byte MMA-inst K is the family's, not ours)."""
+def _geom_sm107(num_mma_m: int, cta_n: int, cgrp_m: int, cgrp_n: int) -> ConfigSm107:
+    """Build one sm107 config (the 64-byte MMA-inst K is the family's, not ours).
+    mma_inst_m is pinned to 128 — the block-scale F8_128x4 SF swizzle needs
+    mma_inst_m % 128 == 0, so 64 is not an axis here."""
     return ConfigSm107(
-        cta_tile_m=cta_m,
+        cta_tile_m=_CTA_TILE_M_MAX * num_mma_m,
         cta_tile_n=cta_n,
         cta_tile_k_bytes=128,
         cgrp_size_m=cgrp_m,
         cgrp_size_n=cgrp_n,
-        epi_tile_mn=(cta_m, 32),
+        mma_inst_m=_CTA_TILE_M_MAX,
+        epi_tile_mn=(_CTA_TILE_M_MAX, 32),
         threads_per_cta=256,
         pipeline="sm107",
         acc_stages=2,
@@ -462,11 +470,11 @@ def _geom_sm107(cta_m: int, cta_n: int, cgrp_m: int, cgrp_n: int) -> ConfigSm107
 
 def _build_catalog() -> tuple[TileConfig, ...]:
     cfgs: list[TileConfig] = []
-    for cta_m in (128, 64):
+    for mma_m, num_mma_m in _M_AXES:
         for cta_n in range(256, 0, -8):
             for k_bytes in (128, 64):
                 for cgrp_m, cgrp_n in _CLUSTERS:
-                    cfgs.append(_geom_sm100(cta_m, cta_n, k_bytes, cgrp_m, cgrp_n))
+                    cfgs.append(_geom_sm100(mma_m, num_mma_m, cta_n, k_bytes, cgrp_m, cgrp_n))
     # sm103 block-scale geometries: M pinned to 128 by the 1-CTA MMA atom;
     # clusters share the sm100 enumeration (the templates use the same generic
     # rank-decomposition multicast masks for data + SF).
@@ -476,9 +484,10 @@ def _build_catalog() -> tuple[TileConfig, ...]:
     # sm107 block-scale geometries: the sm100 axes narrowed to what the F8_128x4
     # SF swizzle admits (M/N multiples of 128, K-tile 128 B) — the rest of the
     # sm100 enumeration would only be rejected by validate_block_scale_config.
-    for cta_n in (256, 128):
-        for cgrp_m, cgrp_n in _CLUSTERS:
-            cfgs.append(_geom_sm107(128, cta_n, cgrp_m, cgrp_n))
+    for num_mma_m in (1, 2):
+        for cta_n in (256, 128):
+            for cgrp_m, cgrp_n in _CLUSTERS:
+                cfgs.append(_geom_sm107(num_mma_m, cta_n, cgrp_m, cgrp_n))
     return tuple(cfgs)
 
 

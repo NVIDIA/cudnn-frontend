@@ -1850,13 +1850,15 @@ def _sm107_kw(config_name, cta_group=1):
 
 def test_catalog_has_sm107_geometries():
     sm107 = [c for c in CATALOG if c.pipeline == "sm107"]
-    # 2 cta_n × the shared 15-cluster enumeration.
-    assert len(sm107) == 30
-    pat = re.compile(r"^CONFIG_sm107_128x(128|256)x128_128x(128|256)x64_cluster\d+x\d+$")
+    # num_mma_m {1,2} × 2 cta_n × the shared 15-cluster enumeration.
+    assert len(sm107) == 60
+    pat = re.compile(r"^CONFIG_sm107_(128|256)x(128|256)x128_128x(128|256)x64_cluster\d+x\d+$")
     for c in sm107:
         assert pat.match(c.name), c.name
         assert isinstance(c, ConfigSm107)
-        assert c.cta_tile_m == 128 and c.cta_tile_k_bytes == 128
+        # mma_inst_m is pinned: the block-scale F8_128x4 SF swizzle needs % 128 == 0.
+        assert c.mma_inst_m == 128 and c.cta_tile_k_bytes == 128
+        assert c.cta_tile_m == 128 * c.num_mma_m
         assert c.mma_inst_k_bytes == 64
     assert by_name(_SM107_128).geometry_name == "128x128x128_128x128x64_cluster1x1"
 
