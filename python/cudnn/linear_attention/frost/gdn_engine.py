@@ -14,7 +14,6 @@ import math
 from cudnn import behavior_note
 from cudnn.engines.base import BaseEngine, CompiledPlan
 
-from cudnn.frost import buffers
 from cudnn.frost.device import build_device, current_device, multiprocessor_count
 from cudnn.frost.workspace import WorkspaceLayout, carve_plan
 from ..graph_analyzer import analyze
@@ -134,8 +133,7 @@ class CompiledGdn:
         self.ckpt = int(node.params.get("checkpoint_every_n_tokens", 0) or 0)
         self.has_state_checkpoints = "state_checkpoints" in node.outputs
         self.batch_invariant = bool(node.params.get("batch_invariant", False))
-        # cuts only for chunk-granular checkpoint cadences, never in batch-invariant mode
-        self.split = self.ckpt in (0, self.b_t) and not self.batch_invariant
+        self.split = self.ckpt % self.b_t == 0 and not self.batch_invariant
 
         layout = WorkspaceLayout()
         from .common.host import tensormap_workspace_bytes
@@ -326,13 +324,11 @@ class CompiledGdnBwd:
         self.kcache = None
         self.regen_cache = None
         self.plan_name = "GdnFrostEngine (GDN_BWD)"
-        from .common.downcast import downcast_state
         from .common.gate_bwd import scalar_gate_bwd, scalar_gate_blocks
         from .common.head_reduce import head_group_reduce
         from .common.host import tensormap_workspace_bytes
         from .common.l2norm import l2norm_qk, l2norm_qk_bwd
 
-        self.downcast_state = downcast_state
         self.head_group_reduce = head_group_reduce
         self.scalar_gate_bwd = scalar_gate_bwd
         self.l2norm_qk = l2norm_qk
@@ -352,7 +348,6 @@ class CompiledGdnBwd:
         HO = g.dim[1]
         B = node.inputs["cu_seqlens"].dim[0] - 1
         self.has_state_checkpoints = "state_checkpoints" in node.inputs
-        self.has_state0 = "initial_state" in node.inputs
         self.io_name = "float16" if node.inputs["q"].get_data_type().name == "HALF" else "bfloat16"
 
         self.num_sm = multiprocessor_count(current_device())
@@ -364,7 +359,6 @@ class CompiledGdnBwd:
         self.off_sched = layout.add(16)
         self.tensormap_words = tensormap_workspace_bytes(bwd_mod, B) // 8
         self.off_tensormaps = layout.add(self.tensormap_words * 8)
-        self.off_state0_io = layout.add(B * HO * K * V * 2) if self.has_state0 else None
         if not self.has_state_checkpoints:
             self.state_checkpoints_rows = max(total // self.b_t + B, 1)
             self.off_state_checkpoints = layout.add(self.state_checkpoints_rows * HO * K * V * 2)
@@ -417,10 +411,8 @@ class CompiledGdnBwd:
         if self.split:
             regions.append(("item_scratch", self.off_item_scratch, "int32", (self.work_item_rows, WORK_ITEM_FIELDS)))
             regions.append(("chunk_scratch", self.off_chunk_scratch, "float32", (self.chunk_scratch_rows, HO)))
-        if self.has_state0:
-            regions.append(("state0_io", self.off_state0_io, self.io_name, (B, HO, K, V)))
         if not self.has_state_checkpoints:
-            regions.append(("state_checkpoints", self.off_state_checkpoints, self.io_name, (self.state_checkpoints_rows, HO, K, V)))
+            regions.append(("state_checkpoints", self.off_state_checkpoints, self.io_name, (self.state_checkpoints_rows, HO, V, K)))
             regions.append(("regen_tensormaps", self.off_regen_tensormaps, "int64", (self.regen_tensormap_words,)))
         if self.fold_dq:
             regions.append(("dq_ho", self.off_dq_ho, self.io_name, (total, HO, K)))
@@ -512,13 +504,6 @@ class CompiledGdnBwd:
                     region["sched_all"],
                     stream,
                 )
-            state0_io = None
-            if state0 is not None:
-                if state0.dtype == self.io_name and buffers.is_contiguous(tuple(state0.shape), state0.stride()) and state0.data_ptr() % 16 == 0:
-                    state0_io = state0
-                else:
-                    state0_io = region["state0_io"]
-                    self.downcast_state(state0, state0_io, stream=stream)
             if self.has_state_checkpoints:
                 checkpoint_series = state_checkpoints
             else:
@@ -562,7 +547,6 @@ class CompiledGdnBwd:
                 dg,
                 db,
                 cu,
-                state0_io,
                 dstate0,
                 dstate_in,
                 work_items,
@@ -609,13 +593,6 @@ class CompiledGdnBwd:
                 stream=stream,
             )
 
-        state0_io = None
-        if state0 is not None:
-            if state0.dtype == self.io_name and buffers.is_contiguous(tuple(state0.shape), state0.stride()) and state0.data_ptr() % 16 == 0:
-                state0_io = state0
-            else:
-                state0_io = region["state0_io"]
-                self.downcast_state(state0, state0_io, stream=stream)
         if self.has_state_checkpoints:
             checkpoint_series = state_checkpoints
         else:
@@ -667,7 +644,7 @@ class CompiledGdnBwd:
             db,
             cu,
             self.scale,
-            initial_state=state0_io,
+            use_initial_state=state0 is not None,
             d_initial_state=dstate0,
             d_final_state=dstate_in,
             safe_gate=self.safe_gate,

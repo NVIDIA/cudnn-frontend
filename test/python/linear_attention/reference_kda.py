@@ -81,7 +81,7 @@ def kda_reference(
             (log-space per-channel decay); beta: ``[B, T, Hb]`` (scalar per
             token/head). Head counts must divide ``HO = max(Hq, Hv)``.
         scale: applied to q; defaults to ``1/sqrt(K)``.
-        initial_state: ``[B, HO, K, V]`` (or ``[N, HO, K, V]`` with cu_seqlens).
+        initial_state: ``[B, HO, V, K]`` (or ``[N, HO, V, K]`` with cu_seqlens), V-major.
         cu_seqlens: packed varlen boundaries (requires B == 1).
         safe_gate: treat ``g`` as raw logits and use the log decay
             ``gate_lower_bound * sigmoid(exp(a_log) * (g + dt_bias))``
@@ -91,7 +91,7 @@ def kda_reference(
 
     Returns:
         ``(o, final_state)`` in fp64: o ``[B, T, HO, V]``, final_state
-        ``[B, HO, K, V]`` (``[N, HO, K, V]`` with cu_seqlens).
+        ``[B, HO, V, K]`` (``[N, HO, V, K]`` with cu_seqlens), V-major.
     """
     K = q.shape[-1]
     if scale is None:
@@ -138,9 +138,9 @@ def kda_reference(
         if initial_state is None:
             state0 = torch.zeros(B, HV, K, V, dtype=torch.float64, device=q.device)
         else:
-            state0 = initial_state.double()
+            state0 = initial_state.double().transpose(-1, -2).contiguous()
         o, state = recurrent_dense(qf, kf, vf, alphaf, betaf, state0)
-        return o.permute(0, 2, 1, 3), state
+        return o.permute(0, 2, 1, 3), state.transpose(-1, -2).contiguous()
 
     assert q.shape[0] == 1, "cu_seqlens requires packed batch B == 1"
     bounds = cu_seqlens.tolist()
@@ -150,7 +150,7 @@ def kda_reference(
         if initial_state is None:
             state0 = torch.zeros(1, HV, K, V, dtype=torch.float64, device=q.device)
         else:
-            state0 = initial_state[n : n + 1].double()
+            state0 = initial_state[n : n + 1].double().transpose(-1, -2).contiguous()
         if e == s:
             states.append(state0)
             continue
@@ -161,4 +161,4 @@ def kda_reference(
         o = torch.cat(outs, dim=2).permute(0, 2, 1, 3)
     else:
         o = qf.new_zeros(1, 0, HV, V)
-    return o, torch.cat(states, dim=0)
+    return o, torch.cat(states, dim=0).transpose(-1, -2).contiguous()

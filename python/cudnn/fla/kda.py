@@ -183,8 +183,8 @@ def make_chunk_kda(real_fn):
 
         if allow_neg_eigval or cp_context is not None or return_intermediate_states:
             return fallback("variant")
-        if state_v_first and (initial_state is not None or output_final_state):
-            return fallback("state_v_first")
+        if not state_v_first and (initial_state is not None or output_final_state):
+            return fallback("state_v_first=False")
         if not (q.is_cuda and torch.cuda.get_device_capability(q.device)[0] >= 10):
             return fallback("pre-Blackwell")
         try:

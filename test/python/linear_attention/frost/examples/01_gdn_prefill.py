@@ -10,7 +10,7 @@ strength ``beta_t``::
     o_t = q_t S_t
 
 THD layout: token-packed ``[total, H, D]`` tensors plus ``cu_seqlens``
-sequence boundaries; the final state comes back K-major ``[N, H, K, V]``.
+sequence boundaries; the final state comes back V-major ``[N, H, V, K]``.
 """
 
 from __future__ import annotations

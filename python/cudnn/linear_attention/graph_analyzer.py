@@ -65,6 +65,9 @@ class LaGraphFacts:
     h_o: int = 0
     d_qk: int = 0
     d_v: int = 0
+    total_t: int = 0  # packed token count
+    n_seq: int = 0
+    state_checkpoint_rows: int = 0  # rows declared on the checkpoint port (0 = absent or undeclared)
     gates_at_ho: bool = True  # Gate/Beta(/W) carry HO = max(h_q, h_v) heads
 
     # dtypes (cudnn.data_type vocabulary; None = unset/inferred)
@@ -175,6 +178,13 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
     else:
         h_q = h_k = h_v = d_qk = d_v = 0
     h_o = max(h_q, h_v)
+    total_t = int(q.dim[0]) if thd_layout else 0
+    cu = ins["cu_seqlens"]
+    n_seq = int(cu.dim[0]) - 1 if cu.dim else 0
+    ckpt_port = ins.get("state_checkpoints")
+    if ckpt_port is None:
+        ckpt_port = outs.get("state_checkpoints")
+    state_checkpoint_rows = int(ckpt_port.dim[0]) if ckpt_port is not None and ckpt_port.dim else 0
     gates_at_ho = all(t is None or not t.dim or (len(t.dim) > 1 and int(t.dim[1]) == h_o) for t in (ins["g"], ins["beta"], ins.get("w")))
     io_dtypes = {in_dt["q"], in_dt["k"], in_dt["v"]} - {None}
     state_dtypes = {in_dt.get("initial_state"), out_dt.get("final_state")} - {None}
@@ -190,6 +200,9 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
         h_o=h_o,
         d_qk=d_qk,
         d_v=d_v,
+        total_t=total_t,
+        n_seq=n_seq,
+        state_checkpoint_rows=state_checkpoint_rows,
         gates_at_ho=gates_at_ho,
         io_dtype=in_dt["q"],
         uniform_io=len(io_dtypes) <= 1,

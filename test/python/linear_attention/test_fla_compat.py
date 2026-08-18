@@ -293,6 +293,40 @@ def test_fallback_is_transparent():
     torch.testing.assert_close(o_cud, o_fla, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("state_v_first,expect_native", [(True, True), (False, False)])
+def test_state_v_first_routing(state_v_first, expect_native):
+    """cuDNN carries the recurrent state V-major, so it serves ``state_v_first=True``
+    natively and declines the K-major request; a stateless call is layout-agnostic
+    and runs native either way."""
+    m = _master(2, 256, 4, 4, 128, 128, seed=2)
+    lv = _leaves(m, torch.bfloat16)
+    o_cud, fs_cud = shim(
+        lv["q"],
+        lv["k"],
+        lv["v"],
+        lv["g"],
+        lv["beta"],
+        output_final_state=True,
+        state_v_first=state_v_first,
+    )
+    got = last_path()
+    if expect_native:
+        assert got == "native", f"state_v_first={state_v_first}: expected native, got {got}"
+        assert fs_cud.shape == (m["q"].shape[0], m["v"].shape[2], m["v"].shape[3], m["q"].shape[3])
+    else:
+        assert got.startswith("fallback"), f"state_v_first={state_v_first}: expected fallback, got {got}"
+        o_fla, _ = chunk_gated_delta_rule(
+            lv["q"],
+            lv["k"],
+            lv["v"],
+            lv["g"],
+            lv["beta"],
+            output_final_state=True,
+            state_v_first=state_v_first,
+        )
+        torch.testing.assert_close(o_cud, o_fla, rtol=0, atol=0)
+
+
 def test_accelerate_fla_patches_and_restores():
     original = fla_gdr.chunk_gated_delta_rule
     try:

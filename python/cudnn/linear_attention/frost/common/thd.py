@@ -12,9 +12,6 @@
 * :func:`emit_checkpoint_seq_descs` — its per-chunk-checkpoint sibling; derives the
   per-sequence checkpoint offsets from the token ``cu_seqlens`` in place of a
   caller-computed prefix array.
-* :func:`emit_copy_desc` — verbatim single-slot copy of a fully static
-  descriptor (dense ``[N, HO, K, V]`` state; batch and head are both load
-  coordinates).
 """
 
 import cutlass
@@ -83,7 +80,7 @@ def emit_checkpoint_seq_descs(
     """Per-BATCH descriptor array for the per-chunk checkpoint tensor with the head
     axis as a descriptor dimension (``(dv, dk, chunk, head)``).  Derives the
     per-sequence checkpoint offsets from the TOKEN ``cu_seqlens`` on the fly
-    (``count_b = (seqlen_b - 1) // every_n``, running-prefix-summed) — an
+    (``count_b = (seqlen_b - 1) // every_n + 1``, running-prefix-summed) — an
     address fold no coordinate transform can express — and caps
     GLOBAL_DIM[``seq_ord``] to ``count_b``.  The head index is a load
     coordinate.  Runs on one electing thread; the calling warp elects and
@@ -95,7 +92,7 @@ def emit_checkpoint_seq_descs(
     run = cutlass.Int32(0)
     for b in cutlass.range(0, n_batch, 1, unroll=1):
         s_tok = cutlass.Int32(cu[b + cutlass.Int32(1)]) - cutlass.Int32(cu[b])
-        cnt = (s_tok - cutlass.Int32(1)) // every_n
+        cnt = (s_tok - cutlass.Int32(1)) // every_n + cutlass.Int32(1)
         cnt = cnt if s_tok > 0 else cutlass.Int32(0)
         checkpoint_base = run
         run = run + cnt
@@ -114,15 +111,3 @@ def emit_checkpoint_seq_descs(
             new_value=cnt,
             ord=seq_ord,
         )
-
-
-@cute.jit
-def emit_copy_desc(base_desc, desc_words) -> None:
-    """Verbatim single-slot copy of a fully static descriptor (e.g. the
-    dense ``[N, HO, K, V]`` initial state, whose batch and head are both
-    load coordinates).  Runs on one electing thread; the calling warp
-    elects and fences."""
-    desc_base = desc_words.iterator.raw_ptr()
-    src_words = Pointer(base_desc.get_ptr(), dtype=cutlass.Int64)
-    for i in cutlass.range_constexpr(TENSOR_MAP_QWORDS):
-        (desc_base + i).store((src_words + i).load())

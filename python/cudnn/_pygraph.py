@@ -2455,13 +2455,12 @@ def _moe_bwd_dweight_dims(node):
 
 
 def _linear_attention_final_state_dims(node):
-    # [N, HO, K, V]: N sequences (cu_seqlens carries N+1 boundaries), HO =
-    # max(q, v) heads — the recurrent state lives at the gate heads
+    # [N, HO, V, K]
     q, v = node.inputs["q"].dim, node.inputs["v"].dim
     cu = node.inputs.get("cu_seqlens")
     if cu is None or not cu.dim:
         return None
-    return [cu.dim[0] - 1, max(q[1], v[1]), q[2], v[2]]
+    return [cu.dim[0] - 1, max(q[1], v[1]), v[2], q[2]]
 
 
 def _linear_attention_state_checkpoints_dims(node):
@@ -2470,7 +2469,7 @@ def _linear_attention_state_checkpoints_dims(node):
     cu = node.inputs["cu_seqlens"].dim if node.inputs.get("cu_seqlens") is not None else None
     if not n or not q or not v or not cu:
         return None
-    return [max(v[0] // n, 1), max(q[1], v[1]), q[2], v[2]]
+    return [max(v[0] // n + (cu[0] - 1), 1), max(q[1], v[1]), v[2], q[2]]
 
 
 def _linear_attention_o_dims(node):

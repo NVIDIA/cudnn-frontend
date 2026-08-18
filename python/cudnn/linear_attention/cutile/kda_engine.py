@@ -64,7 +64,7 @@ class KdaCuTilePlan(CompiledPlan):
             ("u", layout.add(total * HV * V * isz), io, (total, HV, V)),
             ("qg", layout.add(total * HV * K * isz), io, (total, HV, K)),
             ("kg", layout.add(total * HV * K * isz), io, (total, HV, K)),
-            ("state_checkpoints", layout.add(NT_bound * HV * K * V * isz), io, (NT_bound, HV, K, V)),
+            ("state_checkpoints", layout.add(NT_bound * HV * K * V * isz), io, (NT_bound, HV, V, K)),
             ("v_new", layout.add(total * HV * V * isz), io, (total, HV, V)),
         ]
         if node.params.get("use_beta_sigmoid", False):
@@ -82,7 +82,7 @@ class KdaCuTilePlan(CompiledPlan):
             regions += [
                 ("dAqk", layout.add(total * HV * BT * 4), f32, (total, HV, BT)),
                 ("dv_dAv", layout.add(total * HV * V * isz), io, (total, HV, V)),
-                ("dstate", layout.add(NT_bound * HV * K * V * isz), io, (NT_bound, HV, K, V)),
+                ("dstate", layout.add(NT_bound * HV * K * V * isz), io, (NT_bound, HV, V, K)),
                 ("dv_dstate_u", layout.add(total * HV * V * isz), io, (total, HV, V)),
                 ("dq", layout.add(total * HV * K * 4), f32, (total, HV, K)),
                 ("dk", layout.add(total * HV * K * 4), f32, (total, HV, K)),
@@ -158,7 +158,6 @@ class KdaCuTilePlan(CompiledPlan):
         check_layouts_compact(self.plan_name, self.expect, self.names, views)
         nb = dict(zip(self.names, views))
         stream = ctx.stream if ctx.stream is not None else 0
-        self.common.ensure_cuda_context(stream)
         ws = Workspace.over(variant_pack, self.ws_bytes, self.plan_name)
         region = dict(zip(self.carve_names, ws.carve(self.carve)))
         self.common.build_chunk_table(
@@ -197,6 +196,7 @@ class KdaCuTilePlan(CompiledPlan):
             cu_seqlens=nb["cu_seqlens"],
             chunk_indices=region["chunk_table"],
             bufs=region,
+            state_v_first=True,
             stream=stream,
             **gate,
         )
@@ -216,6 +216,7 @@ class KdaCuTilePlan(CompiledPlan):
             cu_seqlens=nb["cu_seqlens"],
             chunk_indices=region["chunk_table"],
             bufs=region,
+            state_v_first=True,
             stream=stream,
         )
 
