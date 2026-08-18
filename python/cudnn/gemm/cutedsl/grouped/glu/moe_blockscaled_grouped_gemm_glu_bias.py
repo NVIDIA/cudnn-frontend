@@ -1575,21 +1575,20 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
         beta1: cutlass.Float32,
         beta2: cutlass.Float32,
     ):
+        beta1_rcp = cutlass.Float32(1.0 / self.situ_beta1)
+        beta2_rcp = cute.arch.rcp_approx(beta2)
+        beta_product = beta1 * beta2
         for i in cutlass.range_constexpr(cute.size(tCompute)):
             gate = acc_vec_gate[i]
             up = acc_vec_up[i]
-            gate_tanh = cute.math.tanh(gate / beta1, fastmath=True)
-            up_tanh = cute.math.tanh(up / beta2, fastmath=True)
+            gate_tanh = cute.math.tanh(gate * beta1_rcp, fastmath=True)
+            up_tanh = cute.math.tanh(up * beta2_rcp, fastmath=True)
             if cutlass.const_expr(self.situ_beta1 == 4.0):
                 # For a = tanh(gate / 4), sigmoid(gate) = 1/2 + a / (1 + a^2).
-                sigmoid = cutlass.Float32(0.5) + gate_tanh * cute.arch.rcp_approx(
-                    cutlass.Float32(1.0) + gate_tanh * gate_tanh
-                )
+                sigmoid = cutlass.Float32(0.5) + gate_tanh * cute.arch.rcp_approx(cutlass.Float32(1.0) + gate_tanh * gate_tanh)
             else:
-                sigmoid = cute.arch.rcp_approx(
-                    cutlass.Float32(1.0) + cute.math.exp(-gate, fastmath=True)
-                )
-            tCompute[i] = beta1 * gate_tanh * sigmoid * beta2 * up_tanh
+                sigmoid = cute.arch.rcp_approx(cutlass.Float32(1.0) + cute.math.exp(-gate, fastmath=True))
+            tCompute[i] = beta_product * gate_tanh * sigmoid * up_tanh
             if cutlass.const_expr(self.has_prob):
                 tCompute[i] = tCompute[i] * mProb
 

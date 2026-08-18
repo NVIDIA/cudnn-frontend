@@ -1893,54 +1893,125 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
         mProb: cute.Tensor,
         beta_val: Float32,
         square_alpha: Float32,
-        beta1: Float32,
-        beta2: Float32,
+        beta1: cutlass.Constexpr,
+        beta2: cutlass.Constexpr,
         dprob_swiglu: Optional[cute.Tensor] = None,
     ):
         dgate_vec = cute.make_rmem_tensor(acc_vec.shape, cutlass.Float32)
         dup_vec = cute.make_rmem_tensor(acc_vec.shape, cutlass.Float32)
+        beta1_f32 = cutlass.Float32(beta1)
+        beta2_f32 = cutlass.Float32(beta2)
+        beta1_rcp = cutlass.Float32(1.0 / beta1)
+        beta2_rcp = cutlass.Float32(1.0 / beta2)
+
+        if cutlass.const_expr(self.situ_beta1 == 4.0):
+            fmul2 = partial(cute.arch.mul_packed_f32x2, rnd="rn", ftz=False)
+            fadd2 = partial(cute.arch.add_packed_f32x2, rnd="rn", ftz=False)
+            square_alpha2 = (square_alpha, square_alpha)
+            beta_val2 = (beta_val, beta_val)
+            beta1_2 = (beta1_f32, beta1_f32)
+            beta2_2 = (beta2_f32, beta2_f32)
+            beta1_rcp2 = (beta1_rcp, beta1_rcp)
+            beta2_rcp2 = (beta2_rcp, beta2_rcp)
+            mprob2 = (mProb, mProb)
+            ones2 = (cutlass.Float32(1.0), cutlass.Float32(1.0))
+            halves2 = (cutlass.Float32(0.5), cutlass.Float32(0.5))
+            twos2 = (cutlass.Float32(2.0), cutlass.Float32(2.0))
+
+            for i in cutlass.range(0, cute.size(acc_vec), 2, unroll_full=True):
+                grad = fmul2((acc_vec[i], acc_vec[i + 1]), square_alpha2)
+                gate = fmul2(
+                    (
+                        gate_vec[i].to(cutlass.Float32),
+                        gate_vec[i + 1].to(cutlass.Float32),
+                    ),
+                    beta_val2,
+                )
+                up = fmul2(
+                    (
+                        up_vec[i].to(cutlass.Float32),
+                        up_vec[i + 1].to(cutlass.Float32),
+                    ),
+                    beta_val2,
+                )
+                gate_scaled = fmul2(gate, beta1_rcp2)
+                up_scaled = fmul2(up, beta2_rcp2)
+                gate_tanh = (
+                    cute.math.tanh(gate_scaled[0], fastmath=True),
+                    cute.math.tanh(gate_scaled[1], fastmath=True),
+                )
+                up_tanh = (
+                    cute.math.tanh(up_scaled[0], fastmath=True),
+                    cute.math.tanh(up_scaled[1], fastmath=True),
+                )
+                gate_tanh_sq = fmul2(gate_tanh, gate_tanh)
+                gate_tanh_denom = fadd2(ones2, gate_tanh_sq)
+                gate_tanh_denom_rcp = (
+                    cute.arch.rcp_approx(gate_tanh_denom[0]),
+                    cute.arch.rcp_approx(gate_tanh_denom[1]),
+                )
+                sigmoid = fadd2(
+                    halves2,
+                    fmul2(gate_tanh, gate_tanh_denom_rcp),
+                )
+                gate_value = fmul2(fmul2(beta1_2, gate_tanh), sigmoid)
+                up_value = fmul2(beta2_2, up_tanh)
+                gate_tanh_denom_rcp_sq = fmul2(
+                    gate_tanh_denom_rcp,
+                    gate_tanh_denom_rcp,
+                )
+                gate_grad_inner = fadd2(
+                    halves2,
+                    fmul2(
+                        twos2,
+                        fmul2(gate_tanh, gate_tanh_denom_rcp_sq),
+                    ),
+                )
+                one_minus_gate_tanh_sq = fadd2(
+                    ones2,
+                    (-gate_tanh_sq[0], -gate_tanh_sq[1]),
+                )
+                gate_grad = fmul2(one_minus_gate_tanh_sq, gate_grad_inner)
+                up_tanh_sq = fmul2(up_tanh, up_tanh)
+                up_grad = fadd2(ones2, (-up_tanh_sq[0], -up_tanh_sq[1]))
+                activation_grad = grad
+                if cutlass.const_expr(self.has_prob):
+                    activation_grad = fmul2(grad, mprob2)
+                dgate = fmul2(fmul2(activation_grad, up_value), gate_grad)
+                dup = fmul2(fmul2(activation_grad, gate_value), up_grad)
+                dgate_vec[i], dgate_vec[i + 1] = dgate
+                dup_vec[i], dup_vec[i + 1] = dup
+                if cutlass.const_expr(self.generate_dprob):
+                    dprob = fmul2(fmul2(grad, gate_value), up_value)
+                    dprob_swiglu[i], dprob_swiglu[i + 1] = dprob
+
+            if cutlass.const_expr(self.generate_dprob):
+                dprob_swiglu = dprob_swiglu.load()
+            return dgate_vec.load(), dup_vec.load(), dprob_swiglu
 
         for i in cutlass.range_constexpr(cute.size(acc_vec)):
             grad = acc_vec[i] * square_alpha
             gate = gate_vec[i].to(cutlass.Float32) * beta_val
             up = up_vec[i].to(cutlass.Float32) * beta_val
-            gate_tanh = cute.math.tanh(gate / beta1, fastmath=True)
-            up_tanh = cute.math.tanh(up / beta2, fastmath=True)
+            gate_tanh = cute.math.tanh(gate * beta1_rcp, fastmath=True)
+            up_tanh = cute.math.tanh(up * beta2_rcp, fastmath=True)
             if cutlass.const_expr(self.situ_beta1 == 4.0):
                 # For a = tanh(gate / 4), sigmoid(gate) = 1/2 + a / (1 + a^2).
                 gate_tanh_sq = gate_tanh * gate_tanh
-                gate_tanh_denom_rcp = cute.arch.rcp_approx(
-                    cutlass.Float32(1.0) + gate_tanh_sq
-                )
-                sigmoid = (
-                    cutlass.Float32(0.5) + gate_tanh * gate_tanh_denom_rcp
-                )
+                gate_tanh_denom_rcp = cute.arch.rcp_approx(cutlass.Float32(1.0) + gate_tanh_sq)
+                sigmoid = cutlass.Float32(0.5) + gate_tanh * gate_tanh_denom_rcp
             else:
-                sigmoid = cute.arch.rcp_approx(
-                    cutlass.Float32(1.0) + cute.math.exp(-gate, fastmath=True)
-                )
-            gate_value = beta1 * gate_tanh * sigmoid
-            up_value = beta2 * up_tanh
+                sigmoid = cute.arch.rcp_approx(cutlass.Float32(1.0) + cute.math.exp(-gate, fastmath=True))
+            gate_value = beta1_f32 * gate_tanh * sigmoid
+            up_value = beta2_f32 * up_tanh
             if cutlass.const_expr(self.situ_beta1 == 4.0):
                 # d[4*a*sigmoid(gate)]/dgate, expressed with the same reciprocal.
                 gate_grad = (cutlass.Float32(1.0) - gate_tanh_sq) * (
-                    cutlass.Float32(0.5)
-                    + cutlass.Float32(2.0)
-                    * gate_tanh
-                    * gate_tanh_denom_rcp
-                    * gate_tanh_denom_rcp
+                    cutlass.Float32(0.5) + cutlass.Float32(2.0) * gate_tanh * gate_tanh_denom_rcp * gate_tanh_denom_rcp
                 )
             else:
-                gate_grad = (
-                    cutlass.Float32(1.0) - gate_tanh * gate_tanh
-                ) * sigmoid
-                gate_grad = (
-                    gate_grad
-                    + beta1
-                    * gate_tanh
-                    * sigmoid
-                    * (cutlass.Float32(1.0) - sigmoid)
-                )
+                gate_grad = (cutlass.Float32(1.0) - gate_tanh * gate_tanh) * sigmoid
+                gate_grad = gate_grad + beta1_f32 * gate_tanh * sigmoid * (cutlass.Float32(1.0) - sigmoid)
             up_grad = cutlass.Float32(1.0) - up_tanh * up_tanh
             activation_grad = grad
             if cutlass.const_expr(self.has_prob):
@@ -3128,8 +3199,8 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
                             mProb,
                             beta_val,
                             square_alpha,
-                            cutlass.Float32(situ_beta1),
-                            cutlass.Float32(situ_beta2),
+                            situ_beta1,
+                            situ_beta2,
                             dprob_swiglu,
                         )
 
