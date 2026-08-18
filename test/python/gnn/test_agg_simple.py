@@ -77,11 +77,18 @@ def _reference(
     return torch.empty((0, dtype_source.shape[1] + concat_dim), device=dtype_source.device, dtype=dtype_source.dtype)
 
 
-@pytest.mark.L0
 @pytest.mark.parametrize("graph_data", [torch.int32, torch.int64], indirect=True)
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param(torch.float32, marks=pytest.mark.L0),
+        pytest.param(torch.float16, marks=pytest.mark.L1),
+        pytest.param(torch.bfloat16, marks=pytest.mark.L1),
+    ],
+)
 @pytest.mark.parametrize("aggr", ["sum", "mean", "max", "min"])
 @pytest.mark.parametrize("mode", ["node", "edge", "node_edge_concat"])
-def test_agg_simple_forward_backward(graph_data, aggr, mode):
+def test_agg_simple_forward_backward(graph_data, dtype, aggr, mode):
     _require_gnn_agg_simple()
     graph = graph_data
     torch.manual_seed(1234)
@@ -90,11 +97,11 @@ def test_agg_simple_forward_backward(graph_data, aggr, mode):
     edge_features = None
     concat_features = None
     if mode in ("node", "node_edge_concat"):
-        node_features = torch.randn((4, 5), device="cuda", dtype=torch.float32, requires_grad=True)
+        node_features = torch.randn((4, 5), device="cuda", dtype=dtype, requires_grad=True)
     if mode in ("edge", "node_edge_concat"):
-        edge_features = torch.randn((6, 3), device="cuda", dtype=torch.float32, requires_grad=True)
+        edge_features = torch.randn((6, 3), device="cuda", dtype=dtype, requires_grad=True)
     if mode == "node_edge_concat":
-        concat_features = torch.randn((3, 2), device="cuda", dtype=torch.float32, requires_grad=True)
+        concat_features = torch.randn((3, 2), device="cuda", dtype=dtype, requires_grad=True)
 
     actual = agg_simple(
         graph,
@@ -113,14 +120,15 @@ def test_agg_simple_forward_backward(graph_data, aggr, mode):
             reference_inputs.append(tensor)
     expected = _reference(graph, reference_node, reference_edge, reference_concat, aggr)
 
-    torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
+    tolerance = 1e-4 if dtype == torch.float32 else 2e-2
+    torch.testing.assert_close(actual, expected, atol=tolerance, rtol=tolerance)
 
     grad = torch.randn_like(actual)
     actual.backward(grad)
     expected.backward(grad)
     actual_inputs = [tensor for tensor in (node_features, edge_features, concat_features) if tensor is not None]
     for actual_input, reference_input in zip(actual_inputs, reference_inputs):
-        torch.testing.assert_close(actual_input.grad, reference_input.grad, atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(actual_input.grad, reference_input.grad, atol=tolerance, rtol=tolerance)
 
 
 @pytest.mark.L0
@@ -146,25 +154,6 @@ def test_agg_simple_concat_gradient():
         output.backward(grad_output)
 
         torch.testing.assert_close(concat_features.grad, grad_output[:, node_features.shape[1] :])
-
-
-@pytest.mark.L1
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_agg_simple_low_precision(dtype):
-    _require_gnn_agg_simple()
-    graph = CscGraph(
-        torch.tensor([0, 2, 4], device="cuda", dtype=torch.int32),
-        torch.tensor([0, 1, 1, 2], device="cuda", dtype=torch.int32),
-        num_src_nodes=3,
-    )
-    features = torch.randn((3, 16), device="cuda", dtype=dtype, requires_grad=True)
-    actual = agg_simple_n2n(features, graph, aggr="mean")
-    expected_features = features.detach().clone().requires_grad_()
-    expected = _reference(graph, expected_features, None, None, "mean")
-    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
-    actual.sum().backward()
-    expected.sum().backward()
-    torch.testing.assert_close(features.grad, expected_features.grad, atol=2e-2, rtol=2e-2)
 
 
 @pytest.mark.L0

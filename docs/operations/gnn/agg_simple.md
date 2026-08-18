@@ -131,11 +131,11 @@ edges is not yet supported by the backend binding.
 
 ## Benchmark
 
-The benchmark separates reusable model shapes, execution, and command-line
-orchestration under `benchmark/gnn/agg_simple`:
+The benchmark script contains synthetic shape presets, CUDA timing, and its
+command-line interface in `benchmark/gnn/benchmark_agg_simple.py`:
 
 ```bash
-python benchmark/gnn/agg_simple/harness.py \
+python benchmark/gnn/benchmark_agg_simple.py \
     --shape medium \
     --dtype float32 \
     --aggr sum \
