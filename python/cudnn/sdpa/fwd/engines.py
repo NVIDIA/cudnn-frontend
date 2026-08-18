@@ -32,7 +32,7 @@ from typing import Any, Callable, Optional
 
 import cudnn
 
-from cudnn.frost.tile_dsl.constants import SCHED_NATURAL
+from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
 from cudnn.frost.buffers import CUTEDSL_MIN_VERSION, cutedsl_state, cutedsl_too_old
 from cudnn.sdpa import graph_analyzer as ga
 
@@ -437,7 +437,7 @@ def _sm100_spec(d: int, d_v: Optional[int] = None) -> EngineSpec:
             # FP8/MXFP8 rows stay on the strict BSHD gate until their padded /
             # scale-factor paths are validated against relaxed layouts.
             layouts=frozenset({"bshd", "dense_flex"}),
-            sched_policies=frozenset({SCHED_NATURAL}),
+            sched_policies=frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
             tile_ms=frozenset({128}),
             tile_ns=frozenset({128}),
             cgas=frozenset({2}),
@@ -472,7 +472,7 @@ def _sm100_mxfp8_spec(d: int) -> EngineSpec:
             sink=True,
             stats=True,
             lse_optional=True,
-            sched_policies=frozenset({SCHED_NATURAL}),
+            sched_policies=frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
             tile_ms=frozenset({128}),
             tile_ns=frozenset({128}),
             cgas=frozenset({2}),
@@ -522,7 +522,7 @@ def _sm100_fp8_spec(d: int) -> EngineSpec:
             # race was fixed with the mb_stats_read barrier (verified on the
             # gated 132/192/200-cluster repros, 3x each).
             skv_tail_via_padding=True,
-            sched_policies=frozenset({SCHED_NATURAL}),
+            sched_policies=frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
             tile_ms=frozenset({128}),
             tile_ns=frozenset({128}),
             cgas=frozenset({2}),

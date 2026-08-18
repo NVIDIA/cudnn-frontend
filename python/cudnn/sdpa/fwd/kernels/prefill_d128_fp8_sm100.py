@@ -47,12 +47,17 @@ import cuda.bindings.driver as _cuda_driver  # noqa: F401  (cute.compile pulls c
 
 from dataclasses import dataclass
 
-from cudnn.sdpa.fwd.config_sm100 import TemplateParams, make_cfg_d128
+from cudnn.sdpa.fwd.config_sm100 import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL, TemplateParams, make_cfg_d128
 
 # The template loader (api_dsl._load_kernel_module) injects FROST_TEMPLATE_PARAMS
 # as a module global before this body runs; the default keeps direct import usable.
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
 CFG, _TMA = make_cfg_d128(PARAMS)
+
+# Tile-scheduler policies this kernel file DECODES. The adapter's defaulting
+# heuristic must choose within this set and the engine row must not declare
+# beyond it — test_sdpa_fp8_sibling_parity pins all three in lockstep.
+SUPPORTED_SCHED_POLICIES = frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2})
 Cfg = type(CFG)
 TMA_QK_ITERS = _TMA.QK_ITERS
 TMA_VO_ITERS = _TMA.VO_ITERS
