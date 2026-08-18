@@ -343,24 +343,33 @@ def _ln_bwd_pipe_kernel(
 @cute.kernel
 def _ln_bwd_finalize_kernel(
     mDGp: cute.Tensor, mDBp: cute.Tensor, mDG: cute.Tensor, mDB: cute.Tensor,
-    nparts: cutlass.Int32, C: cutlass.Constexpr, FB: cutlass.Constexpr, has_beta: cutlass.Constexpr,
+    nparts: cutlass.Int32, C: cutlass.Constexpr, FB: cutlass.Constexpr,
+    CHUNK: cutlass.Constexpr, has_beta: cutlass.Constexpr,
 ) -> None:
+    # 2D grid: x = column tile (coalesced, thread-per-column), y = partition chunk.
+    # Splitting the reduction over y and atomic-adding into the tiny [C] output keeps
+    # every SM busy -- a single-block finalize starves memory when C is small and the
+    # partition count is large (C=128 was reducing 1776 partials on one SM).
     tid, _, _ = cute.arch.thread_idx()
-    bid, _, _ = cute.arch.block_idx()
-    c = bid * FB + tid
+    bx, by, _ = cute.arch.block_idx()
+    c = bx * FB + tid
     if c < C:
+        p0 = by * CHUNK
+        p1 = p0 + CHUNK
+        if p1 > nparts:
+            p1 = nparts
         gsum = cutlass.Float32(0.0)
         bsum = cutlass.Float32(0.0)
-        p = cutlass.Int32(0)
-        while p < nparts:
+        p = p0
+        while p < p1:
             off = cutlass.Int64(p) * C + c
             gsum = gsum + mDGp[off]
             if cutlass.const_expr(has_beta):
                 bsum = bsum + mDBp[off]
             p = p + 1
-        mDG[c] = gsum
+        cute.arch.atomic_add(mDG.iterator + c, gsum)
         if cutlass.const_expr(has_beta):
-            mDB[c] = bsum
+            cute.arch.atomic_add(mDB.iterator + c, bsum)
 
 
 @cute.jit
@@ -370,7 +379,8 @@ def _ln_bwd_pipe_host(
     C: cutlass.Constexpr, V: cutlass.Constexpr, tpr: cutlass.Constexpr, wn: cutlass.Constexpr,
     ldgs: cutlass.Constexpr, block_threads: cutlass.Constexpr, et: cutlass.Constexpr,
     it_ty: cutlass.Constexpr, STAGES: cutlass.Constexpr, has_mean: cutlass.Constexpr,
-    has_beta: cutlass.Constexpr, FB: cutlass.Constexpr, fgrid: cutlass.Constexpr, smem_bytes: cutlass.Constexpr,
+    has_beta: cutlass.Constexpr, FB: cutlass.Constexpr, fgrid: cutlass.Constexpr,
+    nchunk: cutlass.Constexpr, CHUNK: cutlass.Constexpr, smem_bytes: cutlass.Constexpr,
 ) -> None:
     mDXi = cute.recast_tensor(mDX, it_ty)
     mGi = cute.recast_tensor(mGamma, it_ty)
@@ -378,8 +388,8 @@ def _ln_bwd_pipe_host(
         mDY, mX, mDXi, mGi, mMean, mRstd, mDGp, mDBp, R, ctas,
         C, V, tpr, wn, ldgs, block_threads, et, it_ty, STAGES, has_mean, has_beta,
     ).launch(grid=(ctas, 1, 1), block=(block_threads, 1, 1), smem=smem_bytes)
-    _ln_bwd_finalize_kernel(mDGp, mDBp, mDGamma, mDBeta, ctas, C, FB, has_beta).launch(
-        grid=(fgrid, 1, 1), block=(FB, 1, 1))
+    _ln_bwd_finalize_kernel(mDGp, mDBp, mDGamma, mDBeta, ctas, C, FB, CHUNK, has_beta).launch(
+        grid=(fgrid, nchunk, 1), block=(FB, 1, 1))
 
 
 _PIPE_STAGES = 2
@@ -453,22 +463,29 @@ def _backward_pipe(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, params, wcfg
         mean = rstd
 
     dx = torch.empty_like(x2d)
-    dgamma = torch.empty(spec.gamma_len, dtype=torch.float32, device=x2d.device)
-    dbeta = torch.empty(spec.gamma_len, dtype=torch.float32, device=x2d.device)
+    # finalize atomic-accumulates over partition chunks -> outputs start at zero
+    dgamma = torch.zeros(spec.gamma_len, dtype=torch.float32, device=x2d.device)
+    dbeta = torch.zeros(spec.gamma_len, dtype=torch.float32, device=x2d.device)
     dgp = torch.empty(ctas * C, dtype=torch.float32, device=x2d.device)
     dbp = torch.empty(ctas * C, dtype=torch.float32, device=x2d.device) if has_beta else dgp
 
     et = DTYPE_TO_CUTLASS[params.io_dtype]
     it_ty = _INT_TY[DTYPE_BYTES[params.io_dtype]]
     smem_bytes = _pipe_bwd_smem(C, wn, STAGES)
-    FB = 256
+    FB = 128 if C < 256 else 256
     fgrid = (C + FB - 1) // FB
+    # split the finalize's partition reduction across the y-grid so it isn't stuck on
+    # one SM when C is small; more chunks for few column-tiles (small C).
+    nchunk = max(1, min(32, 256 // fgrid))
+    if nchunk > ctas:
+        nchunk = ctas
+    CHUNK = (ctas + nchunk - 1) // nchunk
 
     args = (dyn(dy2d), dyn(x2d), dyn(dx), dyn(gamma), dyn(mean), dyn(rstd),
             dyn(dgp), dyn(dbp), dyn(dgamma), dyn(dbeta),
             cutlass.Int32(R), cutlass.Int32(ctas))
-    ce = (C, V, tpr, wn, ldgs, block_threads, et, it_ty, STAGES, spec.has_mean, has_beta, FB, fgrid, smem_bytes)
-    key = ("pipe", params.io_dtype, C, tpr, wn, ldgs, block_threads, STAGES, spec.has_mean, has_beta)
+    ce = (C, V, tpr, wn, ldgs, block_threads, et, it_ty, STAGES, spec.has_mean, has_beta, FB, fgrid, nchunk, CHUNK, smem_bytes)
+    key = ("pipe", params.io_dtype, C, tpr, wn, ldgs, block_threads, STAGES, spec.has_mean, has_beta, nchunk, CHUNK)
     fn = _KPIPE.get(key)
     if fn is None:
         fn = cute.compile(_ln_bwd_pipe_host, *args, *ce)
