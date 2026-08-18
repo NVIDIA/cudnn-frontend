@@ -598,6 +598,8 @@ def get_dtype_rcp_limits(dtype: Type[cutlass.Numeric]) -> float:
         return 1 / 448.0
     if dtype == cutlass.Float8E5M2:
         return 1 / 128.0
+    if dtype == cutlass.FloatNV8E5M3FNU:
+        return 1 / 114688.0
     return 1.0
 
 

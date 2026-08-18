@@ -1,5 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: BSD-3-Clause
+# SPDX-License-Identifier: MIT
 
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions are met:
@@ -27,14 +27,23 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 """
-MoE Block-Scaled Grouped GEMM Kernel with GLU (SwiGLU/GeGLU) + Hadamard Transform Fusion.
+MoE Block-Scaled Grouped GEMM Kernel with GLU (SwiGLU/GeGLU) + Hadamard Transform
+Fusion — RUBIN (sm_107) port of kernel.py.
+
+Rubin deltas vs the Blackwell body (the proven recipe, see also
+glu_hadamard/kernel_sm107.py): sm107_utils tiled MMAs with explicit (M, N, K_inst)
+(K_inst = 128 for FP4xFP4, else 64), a/b_collector_op=DISCARD, identity
+atom_layout/permutation; mma_inst_tile_k = 2 for FP4/sf16; SF TMEM columns x
+sf_pack_factor (32 // sf_vec_size); SF s2t partition through an appended MN
+broadcast-4 mode; sm_107 smem/tmem capacities; TmemAllocator(arch="sm_107").
+No B-reuse (measured slower at the primary shape).
 
 Supports:
     - Static / Dynamic persistent tile scheduling (MoEPersistentTileScheduler)
     - Dense (contiguous 3-D B) / Discrete (per-expert pointer array B) weight layout
-    - BF16 or NVFP4 (packed e2m1 + e4m3 block scales) D output with GLU activation
+    - BF16 or NVFP4 (packed e2m1 + e4m3/ue5m3 block scales) D output with GLU activation
     - Optional C output (pre-activation GLU output)
-    - Optional fused RHT output (bf16 or NVFP4 + e4m3 block scales)
+    - Optional fused RHT output (bf16 or NVFP4 + e4m3/ue5m3 block scales)
     - GLU activation fusion (SwiGLU / GeGLU)
 
 Warp assignment (8 epilogue warps, pingpong):
@@ -49,7 +58,7 @@ sInfo format: (expert_idx, tile_m_idx, tile_n_idx, k_tile_cnt)
     Validity: tile_info[0] >= 0  (expert_idx == -1 signals end)
 """
 
-from typing import Type, Tuple, Union, Optional
+from typing import Literal, Type, Tuple, Union, Optional
 
 import cuda.bindings.driver as cuda
 
@@ -57,9 +66,11 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.nvgpu import OperandMajorMode
+from cutlass.cute.nvgpu.tcgen05 import CollectorOp
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 import cutlass.utils.blackwell_helpers as sm100_utils
+import cutlass.utils.rubin_helpers as sm107_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.typing import Float32, Int32, AddressSpace
 from ..moe_persistent_scheduler import (
@@ -95,11 +106,20 @@ from .moe_kernel_helpers import (
 )
 
 
+# Valid launch-config space for THIS kernel (the wrapper's autotune candidates;
+# can_implement still prunes per problem). cta shape == mma_tiler_mn; Rubin
+# extends the set with the (512, 256) B-reuse tile.
+VALID_CTA_SHAPES = ((256, 256), (512, 256))
+VALID_CLUSTER_SHAPES = ((1, 1), (2, 1), (2, 2), (4, 1), (4, 2))
+DEFAULT_CTA_SHAPE = (256, 256)
+DEFAULT_CLUSTER_SHAPE = (2, 1)
+
+
 class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
     """Block-scaled MoE grouped GEMM with GLU activation and Hadamard transform fusion.
 
     Always uses pingpong epilogue (8 epilogue warps: 4 ACT + 4 RHT-store).
-    D output is BF16 or NVFP4 (packed e2m1 plus swizzled e4m3 SFD).
+    D output is BF16 or F16 only (no FP8/FP4, no SFD).
 
     :param sf_vec_size: Scalefactor vector size.
     :param mma_tiler_mn: Shape of MMA tile (M, N).
@@ -109,6 +129,12 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
     :param use_dynamic_sched: Use dynamic tile scheduling.
     :param act_func: Activation function ('swiglu', 'geglu', or 'srelu').
     :param enable_bias: Enable bias addition.
+    :param sf_fp8_dtype_override: Reinterpret the FP8-format block scale factors
+        as E5M3 instead of the E4M3 implied by their storage dtype. ``None``
+        (default) leaves the format inferred, as every caller did before this
+        knob existed. ``"e5m3"`` requires Rubin and the NVFP4 recipe, and the
+        scale tensors are still supplied as ``torch.float8_e4m3fn`` because
+        torch has no e5m3 dtype -- only the CuTe element type is overridden.
     """
 
     FIX_PAD_SIZE = 256
@@ -134,13 +160,32 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
         rht_quant: bool = False,
         d_quant: bool = False,
     ) -> bool:
-        # speical requirements for hadamard fusion
-        if not use_2cta_instrs or mma_tiler_mn[0] != 256 or mma_tiler_mn[1] != 256:
-            return False
         # NVFP4 quantization: scale-byte rows are stored as one contiguous 8-byte
         # store per thread, so f = n/2 must be divisible by 128 (f/16 % 8 == 0;
         # same shape gate as the standalone group_rht_cast kernel).
         if (rht_quant or d_quant) and (n // 2) % 128 != 0:
+            return False
+        # B-reuse: 2CTA + mma tiler M=512 (M-split with B held in the collector).
+        # RHT fusion keeps the N=256-only constraint.
+        if use_2cta_instrs and mma_tiler_mn[0] == 512:
+            from .moe_kernel_helpers import (
+                is_valid_dtypes_and_scale_factor_vec_size,
+                is_valid_layouts, is_valid_tensor_alignment,
+            )
+            if not is_valid_dtypes_and_scale_factor_vec_size(ab_dtype, sf_dtype, sf_vec_size, acc_dtype, d_dtype):
+                return False
+            if not is_valid_layouts(ab_dtype, d_dtype, a_major, b_major, cd_major):
+                return False
+            if not is_valid_tensor_alignment(m, n, k, l, ab_dtype, d_dtype, a_major, b_major, cd_major):
+                return False
+            if mma_tiler_mn[1] != 256:
+                return False
+            # Cluster M must be a multiple of 2 (2CTA M-split).
+            if cluster_shape_mn[0] % 2 != 0:
+                return False
+            return True
+        # special requirements for hadamard fusion
+        if not use_2cta_instrs or mma_tiler_mn[0] != 256 or mma_tiler_mn[1] != 256:
             return False
         return can_implement(
             ab_dtype,
@@ -176,23 +221,38 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
         act_func: str = "swiglu",
         enable_bias: bool = False,
         rht_rowwise: bool = False,
+        sf_fp8_dtype_override: Optional[str] = None,
         glu_alpha: Optional[float] = None,
         glu_limit: Optional[float] = None,
     ):
-        mma_tile_m = mma_tiler_mn[0]
-        if self.FIX_PAD_SIZE % mma_tile_m != 0:
-            raise ValueError(f"FIX_PAD_SIZE ({self.FIX_PAD_SIZE}) must be divisible by " f"mma_tiler_mn[0] ({mma_tile_m}).")
+        # B-reuse: mma tiler M = 2x the MMA instruction M (2CTA M-split, B held
+        # in the tcgen05 collector buffer across the two A halves).
+        mma_inst_m = 256 if use_2cta_instrs else 128
+        enable_breuse = (mma_tiler_mn[0] // mma_inst_m == 2)
+        if enable_breuse:
+            if mma_tiler_mn[0] % self.FIX_PAD_SIZE != 0:
+                raise ValueError(
+                    f"mma_tiler_mn[0] ({mma_tiler_mn[0]}) must be a multiple of "
+                    f"FIX_PAD_SIZE ({self.FIX_PAD_SIZE}) for breuse. "
+                    f"Also use m_aligned=mma_tiler_mn[0] (={mma_tiler_mn[0]})."
+                )
+        else:
+            mma_tile_m = mma_tiler_mn[0]
+            if self.FIX_PAD_SIZE % mma_tile_m != 0:
+                raise ValueError(f"FIX_PAD_SIZE ({self.FIX_PAD_SIZE}) must be divisible by " f"mma_tiler_mn[0] ({mma_tile_m}).")
         if expert_cnt > 1024:
             raise ValueError("Expert count > 1024 is not supported.")
         if not isinstance(weight_mode, MoEWeightMode):
             raise TypeError(f"weight_mode must be a MoEWeightMode, got {type(weight_mode)}")
 
         self.sf_vec_size = sf_vec_size
+        self.sf_dtype_override: Optional[Type[cutlass.Numeric]] = cutlass.FloatNV8E5M3FNU if sf_fp8_dtype_override == "e5m3" else None
         self.expert_cnt = expert_cnt
         self.acc_dtype: Type[cutlass.Numeric] = acc_dtype
         self.use_2cta_instrs = use_2cta_instrs
         self.cluster_shape_mn = cluster_shape_mn
         self.mma_tiler = (*mma_tiler_mn, 1)
+        self.enable_breuse = enable_breuse
         self.weight_mode = weight_mode
         self.use_dynamic_sched = use_dynamic_sched
         self.enable_bias = enable_bias
@@ -257,9 +317,8 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
             num_threads=32 * self.epilogue_warp_group_size,
         )
 
-        self.num_smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
-        SM100_TMEM_CAPACITY_COLUMNS = 512
-        self.num_tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
+        self.num_smem_capacity = utils.get_smem_capacity_in_bytes("sm_107")
+        self.num_tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols("sm_107")
 
         self.vectorized_f32 = vectorized_f32
 
@@ -270,11 +329,27 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
         self.glu_alpha = glu_alpha
         self.glu_limit = glu_limit
 
+    def _get_mma_permutation_mnk(self, mma_inst_shape_mnk):
+        """Return MMA permutation for the Bkeep-Breuse pattern (2CTA only).
+        Only active when enable_breuse=True to avoid breaking the TMA atom
+        setup for the non-breuse 2CTA case.
+        """
+        if cutlass.const_expr(self.use_2cta_instrs and self.enable_breuse):
+            m_layout = cute.make_layout(
+                shape=(mma_inst_shape_mnk[0] // 2, 2, 2),
+                stride=(1, mma_inst_shape_mnk[0], mma_inst_shape_mnk[0] // 2),
+            )
+            return (m_layout, mma_inst_shape_mnk[1], mma_inst_shape_mnk[2])
+        return (1, 1, 1)
+
     def _setup_attributes(self):
         """Set up configurations dependent on GEMM inputs (called inside __call__)."""
 
+        # Hardware MMA instruction M: 2CTA -> 256, 1CTA -> 128 (decoupled from the
+        # tiler M so the B-reuse (512, 256) tiler maps to 2 M-split instructions).
+        mma_inst_m = 256 if self.use_2cta_instrs else 128
         self.mma_inst_shape_mn = (
-            self.mma_tiler[0],
+            mma_inst_m,
             self.mma_tiler[1],
         )
         self.mma_inst_shape_mn_sfb = (
@@ -282,7 +357,18 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
             cute.round_up(self.mma_inst_shape_mn[1], 128),
         )
 
-        tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
+        # K dim of the MMA instruction shape on Rubin sm107:
+        #  - SM107MmaMXF4NVF4Op (FP4 x FP4) requires K=128
+        #  - SM107BlockScaledMmaMXF8F6F4Op (FP8 or mixed) requires K=64
+        mma_inst_k = (
+            128
+            if (self.a_dtype.width == 4 and self.b_dtype.width == 4)
+            else 64
+        )
+        mma_inst_shape_mnk = (*self.mma_inst_shape_mn, mma_inst_k)
+        mma_inst_shape_mnk_sfb = (*self.mma_inst_shape_mn_sfb, mma_inst_k)
+
+        tiled_mma = sm107_utils.make_blockscaled_trivial_tiled_mma(
             self.a_dtype,
             self.b_dtype,
             self.a_major_mode,
@@ -290,10 +376,14 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
             self.sf_dtype,
             self.sf_vec_size,
             self.cta_group,
-            self.mma_inst_shape_mn,
+            mma_inst_shape_mnk,
+            a_collector_op=CollectorOp.DISCARD,
+            b_collector_op=CollectorOp.DISCARD,
+            atom_layout_mnk=(1, 1, 1),
+            permutation_mnk=self._get_mma_permutation_mnk(mma_inst_shape_mnk),
         )
 
-        tiled_mma_sfb = sm100_utils.make_blockscaled_trivial_tiled_mma(
+        tiled_mma_sfb = sm107_utils.make_blockscaled_trivial_tiled_mma(
             self.a_dtype,
             self.b_dtype,
             self.a_major_mode,
@@ -301,11 +391,11 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
             self.sf_dtype,
             self.sf_vec_size,
             cute.nvgpu.tcgen05.CtaGroup.ONE,
-            self.mma_inst_shape_mn_sfb,
+            mma_inst_shape_mnk_sfb,
         )
 
         mma_inst_shape_k = cute.size(tiled_mma.shape_mnk, mode=[2])
-        mma_inst_tile_k = 4
+        mma_inst_tile_k = 2 if (self.a_dtype.width == 4 and self.sf_vec_size == 16) else 4
         self.mma_tiler = (
             self.mma_tiler[0],
             self.mma_tiler[1],
@@ -330,8 +420,10 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
         )
 
         d_tile_n = self.mma_inst_shape_mn[1] if self.act_func == "srelu" else self.mma_inst_shape_mn[1] // 2
+        # D tiler M = the full mma tiler M (== inst M non-breuse; 512 for breuse,
+        # so each CTA's epilogue covers both M-halves of its rows).
         self.mma_tiler_d = (
-            self.mma_inst_shape_mn[0],
+            self.mma_tiler[0],
             d_tile_n,
             mma_inst_shape_k * mma_inst_tile_k,
         )
@@ -446,21 +538,60 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
         else:
             self.bias_smem_layout_staged = cute.make_layout((1, 1))
 
-        self.overlapping_accum = self.num_acc_stage == 1 and self.mma_tiler[1] == 256
+        # B-reuse: single acc stage; overlapping_accum shares SF TMEM with a
+        # second acc stage and is incompatible with the split accumulator.
+        if self.enable_breuse:
+            self.num_acc_stage = 1
+        self.overlapping_accum = (
+            self.num_acc_stage == 1 and self.mma_tiler[1] == 256 and not self.enable_breuse
+        )
 
         sf_atom_mn = 32
-        self.num_sfa_tmem_cols = (self.cta_tile_shape_mnk[0] // sf_atom_mn) * mma_inst_tile_k
-        self.num_sfb_tmem_cols = (self.cta_tile_shape_mnk_sfb[1] // sf_atom_mn) * mma_inst_tile_k
+        sf_pack_factor = 32 // self.sf_vec_size
+        self.num_sfa_tmem_cols = (self.cta_tile_shape_mnk[0] // sf_atom_mn) * mma_inst_tile_k * sf_pack_factor
+        self.num_sfb_tmem_cols = (self.cta_tile_shape_mnk_sfb[1] // sf_atom_mn) * mma_inst_tile_k * sf_pack_factor
         self.num_sf_tmem_cols = self.num_sfa_tmem_cols + self.num_sfb_tmem_cols
         self.num_reserved_tmem_cols = self.num_sf_tmem_cols
-        self.num_accumulator_tmem_cols = (
-            self.cta_tile_shape_mnk[1] * self.num_acc_stage if not self.overlapping_accum else self.cta_tile_shape_mnk[1] * 2 - self.num_reserved_tmem_cols
-        )
+        if self.enable_breuse:
+            # Split accumulator: bkeep + breuse halves (2x cols; 512 + 64 SF = 576
+            # = the full sm107 TMEM).
+            self.num_accumulator_tmem_cols = self.cta_tile_shape_mnk[1] * self.num_acc_stage * 2
+        else:
+            self.num_accumulator_tmem_cols = (
+                self.cta_tile_shape_mnk[1] * self.num_acc_stage if not self.overlapping_accum else self.cta_tile_shape_mnk[1] * 2 - self.num_reserved_tmem_cols
+            )
 
         self.epi_tile_n_required = cute.size(self.epi_tile[1]) if self.act_func == "srelu" else 2 * cute.size(self.epi_tile[1])
         self.iter_acc_early_release_in_epilogue = (self.num_reserved_tmem_cols + self.epi_tile_n_required - 1) // self.epi_tile_n_required - 1
         if self.act_func != "srelu":
             self.iter_acc_early_release_in_epilogue = self.iter_acc_early_release_in_epilogue * 2
+
+    @cute.jit
+    def store_swizzled_sf_row(self, sf_tensor: cute.Tensor, logical_row, sf_col_base, sSf: cute.Tensor, tidx):
+        """Store one logical scale row into M32x4xrm_K4xrk_L SF layout."""
+        sf_tensor = cute.recast_tensor(sf_tensor, self.sf_dtype)
+        sf_tensor = cute.recast_tensor(sf_tensor, self.sf_dtype)
+        row_m0 = logical_row % 32
+        row_m1 = (logical_row // 32) % 4
+        row_m2 = logical_row // 128
+        num_sf = self.cta_tile_shape_mnk_d[1] // HADAMARD_SIZE
+        for vi in cutlass.range_constexpr(num_sf):
+            sf_col = sf_col_base + vi
+            sf_tensor[(row_m0, row_m1, row_m2, sf_col % 4, sf_col // 4, 0)] = sSf[(tidx, vi)]
+
+    def mainloop_s2t_copy_and_partition(self, sSF, tSF):
+        tCsSF_compact = cute.filter_zeros(sSF)
+        tCtSF_compact = cute.filter_zeros(tSF)
+        copy_atom_s2t = cute.make_copy_atom(
+            tcgen05.Cp4x32x128bOp(self.cta_group),
+            self.sf_dtype,
+        )
+        tiled_copy_s2t = tcgen05.make_s2t_copy(copy_atom_s2t, tCtSF_compact)
+        thr_copy_s2t = tiled_copy_s2t.get_slice(0)
+        tCsSF_compact_s2t_ = thr_copy_s2t.partition_S(tCsSF_compact)
+        tCsSF_compact_s2t = tcgen05.get_s2t_smem_desc_tensor(tiled_copy_s2t, tCsSF_compact_s2t_)
+        tCtSF_compact_s2t = thr_copy_s2t.partition_D(tCtSF_compact)
+        return tiled_copy_s2t, tCsSF_compact_s2t, tCtSF_compact_s2t
 
     def get_desc_workspace_bytes(self) -> int:
         """Return descriptor workspace size in bytes."""
@@ -585,9 +716,9 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
         workspace_ptr,
         c: cute.Tensor,
         d: cute.Tensor,  # post-GLU output (bf16, or NVFP4 packed e2m1 with sfd)
-        sfd: Optional[cute.Tensor],  # NVFP4 D block scales (e4m3, swizzled SF layout); required iff d is NVFP4
+        sfd: Optional[cute.Tensor],  # NVFP4 D block scales (e4m3/ue5m3, (m, f/16, l)); required iff d is NVFP4
         rht: Optional[cute.Tensor],  # RHT output (bf16 or NVFP4, D layout); None => off
-        sfrht: Optional[cute.Tensor],  # NVFP4 RHT block scales (e4m3, swizzled SF layout); required iff rht is NVFP4
+        sfrht: Optional[cute.Tensor],  # NVFP4 RHT block scales (e4m3/ue5m3, (m, f/16, l)); required iff rht is NVFP4
         padded_offsets: cute.Tensor,
         alpha: cute.Tensor,
         prob: cute.Tensor,
@@ -609,7 +740,10 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
         self.b_dtype: Type[cutlass.Numeric] = a.element_type
         self.c_dtype: Type[cutlass.Numeric] = c.element_type
         self.d_dtype: Type[cutlass.Numeric] = d.element_type
-        self.sf_dtype: Type[cutlass.Numeric] = sfa.element_type
+        if cutlass.const_expr(self.sf_dtype_override is not None):
+            self.sf_dtype: Type[cutlass.Numeric] = self.sf_dtype_override
+        else:
+            self.sf_dtype: Type[cutlass.Numeric] = sfa.element_type
         self.bias_dtype = bias.element_type if cutlass.const_expr(self.enable_bias) else cutlass.BFloat16
         self.a_major_mode = utils.LayoutEnum.from_tensor(a).mma_major_mode()
         self.c_layout = utils.LayoutEnum.from_tensor(c)
@@ -632,8 +766,9 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
         self.rht_dtype = rht.element_type if cutlass.const_expr(self.generate_rht) else self.d_dtype
         self.rht_quant = self.generate_rht and self.rht_dtype == cutlass.Float4E2M1FN
         # The rht STORE has no orientation logic anywhere in this kernel; only the
-        # SCALE tensor is orientation-aware below: rowwise uses swizzled SF for
-        # logical (m, f), while colwise uses swizzled SF for logical (f, m).
+        # SCALE tensor is orientation-aware below (its block grid follows the
+        # transform: (m, f/16) rowwise vs (f, m/16) colwise — a different logical
+        # shape, not expressible as strides).
         # RHT warps run for the RHT output and/or the D quantization (both read sD).
         # When neither is on (plain bf16 mode) the warpgroup is COMPILED OUT: no
         # pingpong, no ACT<->RHT barriers, and the tile-info pipeline's consumer
@@ -655,9 +790,7 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
             raise ValueError(f"rht dtype must be BFloat16 or Float4E2M1FN, got {self.rht_dtype}")
         if cutlass.const_expr(self.rht_quant != self.generate_sfrht):
             raise ValueError("NVFP4 rht and sfrht must be passed together")
-        sf_storage_dtype = (
-            cutlass.Float8E4M3FN if self.sf_dtype == cutlass.FloatNV8E5M3FNU else self.sf_dtype
-        )
+        sf_storage_dtype = cutlass.Float8E4M3FN if self.sf_dtype == cutlass.FloatNV8E5M3FNU else self.sf_dtype
         if cutlass.const_expr(self.generate_sfd and sfd.element_type != sf_storage_dtype):
             raise ValueError("sfd element type must match scale-factor storage dtype")
         if cutlass.const_expr(self.generate_sfrht and sfrht.element_type != sf_storage_dtype):
@@ -703,7 +836,14 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
             self.num_d_stage,
         )
 
-        tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
+        mma_inst_k = (
+            128
+            if (self.a_dtype.width == 4 and self.b_dtype.width == 4)
+            else 64
+        )
+        mma_inst_shape_mnk = (*self.mma_inst_shape_mn, mma_inst_k)
+        permutation_mnk = self._get_mma_permutation_mnk(mma_inst_shape_mnk)
+        tiled_mma = sm107_utils.make_blockscaled_trivial_tiled_mma(
             self.a_dtype,
             self.b_dtype,
             self.a_major_mode,
@@ -711,9 +851,13 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
             self.sf_dtype,
             self.sf_vec_size,
             self.cta_group,
-            self.mma_inst_shape_mn,
+            mma_inst_shape_mnk,
+            a_collector_op=CollectorOp.DISCARD,
+            b_collector_op=CollectorOp.DISCARD,
+            atom_layout_mnk=(1, 1, 1),
+            permutation_mnk=permutation_mnk,
         )
-        tiled_mma_sfb = sm100_utils.make_blockscaled_trivial_tiled_mma(
+        tiled_mma_sfb = sm107_utils.make_blockscaled_trivial_tiled_mma(
             self.a_dtype,
             self.b_dtype,
             self.a_major_mode,
@@ -721,8 +865,38 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
             self.sf_dtype,
             self.sf_vec_size,
             cute.nvgpu.tcgen05.CtaGroup.ONE,
-            self.mma_inst_shape_mn_sfb,
+            (*self.mma_inst_shape_mn_sfb, mma_inst_k),
         )
+
+        # B-reuse MMA pair: bkeep FILLs the collector with B, breuse LASTUSEs it.
+        tiled_mma_bkeep = None
+        tiled_mma_breuse = None
+        if cutlass.const_expr(self.enable_breuse):
+            tiled_mma_bkeep = sm107_utils.make_blockscaled_trivial_tiled_mma(
+                self.a_dtype, self.b_dtype,
+                self.a_major_mode, self.b_major_mode,
+                self.sf_dtype, self.sf_vec_size,
+                self.cta_group, mma_inst_shape_mnk,
+                a_collector_op=CollectorOp.DISCARD,
+                b_collector_op=CollectorOp.FILL,
+                atom_layout_mnk=(1, 1, 1),
+                permutation_mnk=permutation_mnk,
+            )
+            tiled_mma_bkeep.set(tcgen05.Field.NEGATE_A, False)
+            tiled_mma_bkeep.set(tcgen05.Field.NEGATE_B, False)
+            tiled_mma_breuse = sm107_utils.make_blockscaled_trivial_tiled_mma(
+                self.a_dtype, self.b_dtype,
+                self.a_major_mode, self.b_major_mode,
+                self.sf_dtype, self.sf_vec_size,
+                self.cta_group, mma_inst_shape_mnk,
+                a_collector_op=CollectorOp.DISCARD,
+                b_collector_op=CollectorOp.LASTUSE,
+                atom_layout_mnk=(1, 1, 1),
+                permutation_mnk=permutation_mnk,
+            )
+            tiled_mma_breuse.set(tcgen05.Field.NEGATE_A, False)
+            tiled_mma_breuse.set(tcgen05.Field.NEGATE_B, False)
+
         atom_thr_size = cute.size(tiled_mma.thr_id.shape)
 
         # TMA load A
@@ -960,6 +1134,8 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
         self.kernel(
             tiled_mma,
             tiled_mma_sfb,
+            tiled_mma_bkeep,
+            tiled_mma_breuse,
             tma_atom_a,
             tma_tensor_a,
             tma_atom_b,
@@ -1026,18 +1202,6 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                 sf_vec_size=self.sf_vec_size,
             )
 
-    @cute.jit
-    def store_swizzled_sf_row(self, sf_tensor: cute.Tensor, logical_row, sf_col_base, sSf: cute.Tensor, tidx):
-        """Store one logical scale row into M32x4xrm_K4xrk_L SF layout."""
-        sf_tensor = cute.recast_tensor(sf_tensor, self.sf_dtype)
-        row_m0 = logical_row % 32
-        row_m1 = (logical_row // 32) % 4
-        row_m2 = logical_row // 128
-        num_sf = self.cta_tile_shape_mnk_d[1] // HADAMARD_SIZE
-        for vi in cutlass.range_constexpr(num_sf):
-            sf_col = sf_col_base + vi
-            sf_tensor[(row_m0, row_m1, row_m2, sf_col % 4, sf_col // 4, 0)] = sSf[(tidx, vi)]
-
     def mainloop_s2t_copy_and_partition(self, sSF, tSF):
         tCsSF_compact = cute.filter_zeros(sSF)
         tCtSF_compact = cute.filter_zeros(tSF)
@@ -1047,7 +1211,26 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
         )
         tiled_copy_s2t = tcgen05.make_s2t_copy(copy_atom_s2t, tCtSF_compact)
         thr_copy_s2t = tiled_copy_s2t.get_slice(0)
-        tCsSF_compact_s2t_ = thr_copy_s2t.partition_S(tCsSF_compact)
+
+        # Rubin SF s2t partitions through an appended MN broadcast-4 mode (the
+        # packed SF TMEM lanes each read the same smem bytes).
+        def _append_mn_broadcast_mode(smem_layout: cute.Layout):
+            mn_dim = cute.get(smem_layout, mode=[0, 0])
+            mn_dim = cute.append(mn_dim, cute.make_layout((4), stride=(0)))
+            layout = cute.append(
+                cute.group_modes(mn_dim, 0), cute.get(smem_layout, mode=[0, 1])
+            )
+            layout = cute.append(
+                cute.group_modes(layout, 0), cute.get(smem_layout, mode=[1])
+            )
+            layout = cute.append(layout, cute.get(smem_layout, mode=[2]))
+            layout = cute.append(layout, cute.get(smem_layout, mode=[3]))
+            return layout
+
+        tCsSF_compact_bcast = cute.make_tensor(
+            tCsSF_compact.iterator, _append_mn_broadcast_mode(tCsSF_compact.layout)
+        )
+        tCsSF_compact_s2t_ = thr_copy_s2t.partition_S(tCsSF_compact_bcast)
         tCsSF_compact_s2t = tcgen05.get_s2t_smem_desc_tensor(tiled_copy_s2t, tCsSF_compact_s2t_)
         tCtSF_compact_s2t = thr_copy_s2t.partition_D(tCtSF_compact)
         return tiled_copy_s2t, tCsSF_compact_s2t, tCtSF_compact_s2t
@@ -1260,7 +1443,7 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
             for i in cutlass.range_constexpr(cute.size(tCompute)):
                 tCompute[i] = acc_relu[i] * acc_relu[i] * mProb
 
-    def epilog_tmem_copy_and_partition(self, tidx, tAcc, gD_mnl, epi_tile, use_2cta_instrs):
+    def epilog_tmem_copy_and_partition(self, tidx, tAcc, gD_mnl, epi_tile, use_2cta_instrs, m_half=0):
         copy_atom_t2r = sm100_utils.get_tmem_load_op(
             self.cta_tile_shape_mnk,
             self.d_layout,
@@ -1269,11 +1452,17 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
             epi_tile,
             use_2cta_instrs,
         )
-        tAcc_epi = cute.flat_divide(tAcc[((None, None), 0, 0, None)], epi_tile)
+        # For breuse, select the requested m_half (0=bkeep, 1=breuse) from the
+        # split accumulator. m_half is a Python int (resolves at trace time).
+        if cutlass.const_expr(self.enable_breuse):
+            tAcc_epi = cute.flat_divide(tAcc[((None, None), m_half, 0, None)], epi_tile)
+            gD_mnl_epi = cute.flat_divide(gD_mnl[((None, None), m_half, 0, None, None, None)], epi_tile)
+        else:
+            tAcc_epi = cute.flat_divide(tAcc[((None, None), 0, 0, None)], epi_tile)
+            gD_mnl_epi = cute.flat_divide(gD_mnl[((None, None), 0, 0, None, None, None)], epi_tile)
         tiled_copy_t2r = tcgen05.make_tmem_copy(copy_atom_t2r, tAcc_epi[(None, None, 0, 0, 0)])
         thr_copy_t2r = tiled_copy_t2r.get_slice(tidx)
         tTR_tAcc = thr_copy_t2r.partition_S(tAcc_epi)
-        gD_mnl_epi = cute.flat_divide(gD_mnl[((None, None), 0, 0, None, None, None)], epi_tile)
         tTR_gC = thr_copy_t2r.partition_D(gD_mnl_epi)
         tTR_rAcc_gate = cute.make_rmem_tensor(tTR_gC[(None, None, None, 0, 0, 0, 0, 0)].shape, self.acc_dtype)
         tTR_rAcc_up = cute.make_rmem_tensor(tTR_gC[(None, None, None, 0, 0, 0, 0, 0)].shape, self.acc_dtype)
@@ -1324,9 +1513,15 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
     ):
         num_acc_stage = 1 if mma_tiler_mnk[1] == 256 else 2
         num_c_stage = 1
-        num_d_stage = 1
+        # Double-buffer the D staging when the RHT warps consume it (run_rht):
+        # the pingpong pipeline then lets the ACT warps run up to num_d_stage
+        # subtiles ahead, taking the whole FWHT/quant/store chain off their
+        # critical path. Plain D (TMA'd by ACT) keeps the single stage.
+        num_d_stage = 2 if (rht_dtype is not None or d_quant) else 1
         num_tile_stage = 2
-        num_pingpong_stage = mma_tiler_mnk[1] // epi_tile_c[1]
+        # The pingpong pipeline protects the sD stages, so its depth must match
+        # num_d_stage (stage index and d_buffer advance in lockstep).
+        num_pingpong_stage = num_d_stage
 
         a_smem_layout_one = sm100_utils.make_smem_layout_a(tiled_mma, mma_tiler_mnk, a_dtype, 1)
         b_smem_layout_one = sm100_utils.make_smem_layout_b(tiled_mma, mma_tiler_mnk, b_dtype, 1)
@@ -1343,7 +1538,7 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
         )
         mbar_helpers_bytes = 1024
 
-        # One e4m3 scale byte per (1,16) feature block, one row per thread (128 threads).
+        # One fp8 scale byte per (1,16) feature block, one row per thread (128 threads).
         quant_sf_bytes = 128 * ((mma_tiler_mnk[1] // 2) // HADAMARD_SIZE)
 
         # sInfo is in SchedulerStorage, not here, so use 4-int sInfo
@@ -1384,6 +1579,8 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
         self,
         tiled_mma: cute.TiledMma,
         tiled_mma_sfb: cute.TiledMma,
+        tiled_mma_bkeep: Optional[cute.TiledMma],
+        tiled_mma_breuse: Optional[cute.TiledMma],
         tma_atom_a: cute.CopyAtom,
         mA_mkl: cute.Tensor,
         tma_atom_b: cute.CopyAtom,
@@ -1543,6 +1740,7 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
             allocator_warp_id=self.epilog_act_warp_id[0],
             is_two_cta=use_2cta_instrs,
             two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr.ptr,
+            arch="sm_107",
         )
 
         # Cluster arrive after barrier init
@@ -1888,12 +2086,36 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                             peek_ab_full_status = ab_pipeline.consumer_try_wait(ab_consumer_state_next)
 
                         for kblock_idx in cutlass.range(num_kblocks, unroll_full=True):
-                            kblock_coord = (None, None, kblock_idx, ab_consumer_state.index)
-                            sf_kblock_coord = (None, None, kblock_idx)
-                            tiled_mma.set(tcgen05.Field.SFA, tCtSFA[sf_kblock_coord].iterator)
-                            tiled_mma.set(tcgen05.Field.SFB, tCtSFB_mma[sf_kblock_coord].iterator)
-                            cute.gemm(tiled_mma, tCtAcc, tCrA[kblock_coord], tCrB[kblock_coord], tCtAcc)
-                            tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                            if cutlass.const_expr(
+                                self.enable_breuse
+                                and cute.size(tCtAcc.layout, mode=[1]) == 2
+                                and cute.size(tCtAcc.layout, mode=[2]) == 1
+                            ):
+                                tCtAcc_bkeep = tCtAcc[(None, 0, 0)]
+                                tCtAcc_breuse = tCtAcc[(None, 1, 0)]
+                                a_kblk_crd_keep = (None, 0, kblock_idx, ab_consumer_state.index)
+                                a_kblk_crd_reuse = (None, 1, kblock_idx, ab_consumer_state.index)
+                                b_kblk_crd = (None, 0, kblock_idx, ab_consumer_state.index)
+                                sfa_kblk_crd_keep = (None, 0, kblock_idx)
+                                sfa_kblk_crd_reuse = (None, 1, kblock_idx)
+                                sfb_kblk_crd = (None, 0, kblock_idx)
+                                # Bkeep: accumulate A_upper x B (keeps B in reuse buffer)
+                                tiled_mma_bkeep.set(tcgen05.Field.ACCUMULATE, k_tile != 0 or kblock_idx != 0)
+                                cute.gemm(tiled_mma_bkeep, tCtAcc_bkeep,
+                                    [tCrA[a_kblk_crd_keep], tCtSFA[sfa_kblk_crd_keep]],
+                                    [tCrB[b_kblk_crd], tCtSFB_mma[sfb_kblk_crd]], tCtAcc_bkeep)
+                                # Breuse: accumulate A_lower x B (reuses B)
+                                tiled_mma_breuse.set(tcgen05.Field.ACCUMULATE, k_tile != 0 or kblock_idx != 0)
+                                cute.gemm(tiled_mma_breuse, tCtAcc_breuse,
+                                    [tCrA[a_kblk_crd_reuse], tCtSFA[sfa_kblk_crd_reuse]],
+                                    [tCrB[b_kblk_crd], tCtSFB_mma[sfb_kblk_crd]], tCtAcc_breuse)
+                            else:
+                                kblock_coord = (None, None, kblock_idx, ab_consumer_state.index)
+                                sf_kblock_coord = (None, None, kblock_idx)
+                                tiled_mma.set(tcgen05.Field.SFA, tCtSFA[sf_kblock_coord].iterator)
+                                tiled_mma.set(tcgen05.Field.SFB, tCtSFB_mma[sf_kblock_coord].iterator)
+                                cute.gemm(tiled_mma, tCtAcc, tCrA[kblock_coord], tCrB[kblock_coord], tCtAcc)
+                                tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
 
                         ab_pipeline.consumer_release(ab_consumer_state)
                         ab_consumer_state = ab_consumer_state_next
@@ -2014,6 +2236,18 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                 tTR_rAcc_gate,
                 tTR_rAcc_up,
             ) = self.epilog_tmem_copy_and_partition(epi_tidx, tCtAcc_base, tCgD_shape, epi_tile, use_2cta_instrs)
+            # For breuse: second partition for the breuse M-half (defaults to bk
+            # for JIT scoping; overridden when enable_breuse=True).
+            tTR_tAcc_base_br = tTR_tAcc_base
+            if cutlass.const_expr(self.enable_breuse):
+                (
+                    _,
+                    tTR_tAcc_base_br,
+                    _tTR_rAcc_gate_br,
+                    _tTR_rAcc_up_br,
+                ) = self.epilog_tmem_copy_and_partition(
+                    epi_tidx, tCtAcc_base, tCgD_shape, epi_tile, use_2cta_instrs, m_half=1
+                )
 
             tTR_rC = cute.make_rmem_tensor(tTR_rAcc_gate.shape, self.c_dtype)
             tiled_copy_r2s, tRS_rC, tRS_sC = self.epilog_smem_copy_and_partition(tiled_copy_t2r, tTR_rC, epi_tidx, sC)
@@ -2113,9 +2347,17 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                 gC_mnl = cute.local_tile(real_c, cute.slice_(self.mma_tiler, (None, None, 0)), (None, None, None))
                 thr_mma_epi_loop = tiled_mma.get_slice(mma_tile_coord_v)
                 tCgC = thr_mma_epi_loop.partition_C(gC_mnl)
-                _, bSG_sC, bSG_gC_partitioned = self.epilog_gmem_copy_and_partition(epi_tidx, tma_atom_c, tCgC, self.epi_tile_c, sC)
-                bSG_gC = bSG_gC_partitioned[(None, None, None, *mma_tile_coord_mnl)]
-                bSG_gC = cute.group_modes(bSG_gC, 1, cute.rank(bSG_gC))
+                if cutlass.const_expr(self.enable_breuse):
+                    # Select bkeep/breuse halves by indexing mode1 with 0 or 1
+                    gC_epi_bk = cute.flat_divide(tCgC[((None, None), 0, 0, None, None, None)], self.epi_tile_c)
+                    gC_epi_br = cute.flat_divide(tCgC[((None, None), 1, 0, None, None, None)], self.epi_tile_c)
+                    sC_for_tma = cute.group_modes(sC, 0, 2)
+                    bSG_sC, bSG_gC_partitioned_bk = cpasync.tma_partition(
+                        tma_atom_c, 0, cute.make_layout(1), sC_for_tma, cute.group_modes(gC_epi_bk, 0, 2))
+                    _, bSG_gC_partitioned_br = cpasync.tma_partition(
+                        tma_atom_c, 0, cute.make_layout(1), sC_for_tma, cute.group_modes(gC_epi_br, 0, 2))
+                else:
+                    _, bSG_sC, bSG_gC_partitioned = self.epilog_gmem_copy_and_partition(epi_tidx, tma_atom_c, tCgC, self.epi_tile_c, sC)
 
                 #
                 # Get per-expert D tensor inside tile loop (NVFP4 D: the RHT warps own
@@ -2125,9 +2367,40 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                     real_d, _ = epi_ext.get_gmem_tensor("d", mD_mnl, padded_offsets, epi_work_tile_info)
                     gD_mnl_loop = cute.local_tile(real_d, cute.slice_(self.mma_tiler_d, (None, None, 0)), (None, None, None))
                     tCgD = thr_mma_epi_loop.partition_C(gD_mnl_loop)
-                    _, bSG_sD, bSG_gD_partitioned = self.epilog_gmem_copy_and_partition(epi_tidx, tma_atom_d, tCgD, epi_tile, sD)
-                    bSG_gD = bSG_gD_partitioned[(None, None, None, *mma_tile_coord_mnl)]
-                    bSG_gD = cute.group_modes(bSG_gD, 1, cute.rank(bSG_gD))
+                    if cutlass.const_expr(self.enable_breuse):
+                        gD_epi_bk = cute.flat_divide(tCgD[((None, None), 0, 0, None, None, None)], epi_tile)
+                        gD_epi_br = cute.flat_divide(tCgD[((None, None), 1, 0, None, None, None)], epi_tile)
+                        sD_for_tma = cute.group_modes(sD, 0, 2)
+                        bSG_sD, bSG_gD_partitioned_bk = cpasync.tma_partition(
+                            tma_atom_d, 0, cute.make_layout(1), sD_for_tma, cute.group_modes(gD_epi_bk, 0, 2))
+                        _, bSG_gD_partitioned_br = cpasync.tma_partition(
+                            tma_atom_d, 0, cute.make_layout(1), sD_for_tma, cute.group_modes(gD_epi_br, 0, 2))
+                    else:
+                        _, bSG_sD, bSG_gD_partitioned = self.epilog_gmem_copy_and_partition(epi_tidx, tma_atom_d, tCgD, epi_tile, sD)
+
+                # Slice to per-expert tile coords (L=0, domain already offset'd)
+                def _grp(p):
+                    q = p[(None, None, None, *mma_tile_coord_mnl)]
+                    return cute.group_modes(q, 1, cute.rank(q))
+
+                if cutlass.const_expr(self.enable_breuse):
+                    bSG_gC_bk = _grp(bSG_gC_partitioned_bk)
+                    bSG_gC_br = _grp(bSG_gC_partitioned_br)
+                    # Placeholders so the JIT sees all names in non-breuse paths too
+                    bSG_gC = bSG_gC_bk
+                else:
+                    bSG_gC = _grp(bSG_gC_partitioned)
+                    bSG_gC_bk = bSG_gC
+                    bSG_gC_br = bSG_gC
+                if cutlass.const_expr(not self.d_quant):
+                    if cutlass.const_expr(self.enable_breuse):
+                        bSG_gD_bk = _grp(bSG_gD_partitioned_bk)
+                        bSG_gD_br = _grp(bSG_gD_partitioned_br)
+                        bSG_gD = bSG_gD_bk
+                    else:
+                        bSG_gD = _grp(bSG_gD_partitioned)
+                        bSG_gD_bk = bSG_gD
+                        bSG_gD_br = bSG_gD
 
                 #
                 # Get per-expert prob tensor inside tile loop
@@ -2139,6 +2412,13 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                     + tidx
                 )
                 mProb = real_prob[mPosition, 0, 0]
+                # For breuse: also fetch the breuse-half prob (second 128-row half
+                # of this CTA's rows).
+                mProb_bk = mProb
+                mProb_br = mProb
+                if cutlass.const_expr(self.enable_breuse):
+                    mProb_bk = mProb
+                    mProb_br = real_prob[mPosition + (self.cta_tile_shape_mnk[0] // 2), 0, 0]
 
                 #
                 # Get accumulator stage index
@@ -2149,22 +2429,47 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                 else:
                     acc_stage_index = acc_consumer_state.index
 
-                # Set tensor memory buffer for current tile
-                # (T2R, T2R_M, T2R_N, EPI_M, EPI_N, STAGE)
-                tTR_tAcc = tTR_tAcc_base[(None, None, None, None, None, acc_stage_index)]
-
                 #
                 # Wait for accumulator buffer full
                 #
                 acc_pipeline.consumer_wait(acc_consumer_state)
-                tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
 
-                #
-                # Store accumulator to global memory in subtiles
-                #
-                subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
-                subtile_step = 1 if cutlass.const_expr(self.act_func == "srelu") else 2
-                for subtile_idx in cutlass.range(0, subtile_cnt, subtile_step, unroll=1):
+                # For breuse: process bkeep (m_half=0) then breuse (m_half=1)
+                # M-halves — each is a normal subtile pass. Non-breuse: one pass.
+                # (2-space indent below keeps the subtile-loop body untouched.)
+                _breuse_halves = [0, 1] if self.enable_breuse else [0]
+
+                _tTR_tAcc_base_h = tTR_tAcc_base
+                _mProb_h = mProb
+                _bSG_gC_h = bSG_gC
+                if cutlass.const_expr(not self.d_quant):
+                    _bSG_gD_h = bSG_gD
+
+                for _m_half in _breuse_halves:
+                  if self.enable_breuse:
+                    _tTR_tAcc_base_h = tTR_tAcc_base if _m_half == 0 else tTR_tAcc_base_br
+                    _mProb_h = mProb_bk if _m_half == 0 else mProb_br
+                    _bSG_gC_h = bSG_gC_bk if _m_half == 0 else bSG_gC_br
+                    if cutlass.const_expr(not self.d_quant):
+                        _bSG_gD_h = bSG_gD_bk if _m_half == 0 else bSG_gD_br
+                  else:
+                    _tTR_tAcc_base_h = tTR_tAcc_base
+                    _mProb_h = mProb
+                    _bSG_gC_h = bSG_gC
+                    if cutlass.const_expr(not self.d_quant):
+                        _bSG_gD_h = bSG_gD
+
+                  # Set tensor memory buffer for current tile
+                  # (T2R, T2R_M, T2R_N, EPI_M, EPI_N, STAGE)
+                  tTR_tAcc = _tTR_tAcc_base_h[(None, None, None, None, None, acc_stage_index)]
+                  tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
+
+                  #
+                  # Store accumulator to global memory in subtiles
+                  #
+                  subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
+                  subtile_step = 1 if cutlass.const_expr(self.act_func == "srelu") else 2
+                  for subtile_idx in cutlass.range(0, subtile_cnt, subtile_step, unroll=1):
                     real_subtile_idx = subtile_idx if cutlass.const_expr(self.act_func == "srelu") else subtile_idx // 2
                     if cutlass.const_expr(self.overlapping_accum):
                         if reverse_subtile:
@@ -2243,7 +2548,9 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                                     tTR_rAcc_up[i] = tTR_rAcc_up[i] * cutlass.Float32(alpha_val) + bias_vec_up[i].to(cutlass.Float32)
 
                         last_bias_subtile = subtile_cnt - 1 if cutlass.const_expr(self.act_func == "srelu") else subtile_cnt - 2
-                        if subtile_idx == last_bias_subtile:
+                        # Release once per WORK TILE (the wait precedes the m-half
+                        # loop): only the LAST half may release under B-reuse.
+                        if subtile_idx == last_bias_subtile and _m_half == _breuse_halves[-1]:
                             bias_pipeline.consumer_release(bias_consumer_state)
                             bias_consumer_state.advance()
                     else:
@@ -2285,7 +2592,7 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                             tTR_rAcc_gate,
                             tRS_rC,
                             tRS_sC,
-                            bSG_gC,
+                            _bSG_gC_h,
                             bSG_sC,
                             c_pipeline,
                             num_prev_subtiles,
@@ -2300,7 +2607,7 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                             tTR_rAcc_up,
                             tRS_rC,
                             tRS_sC,
-                            bSG_gC,
+                            _bSG_gC_h,
                             bSG_sC,
                             c_pipeline,
                             num_prev_subtiles,
@@ -2327,13 +2634,13 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                     #
                     tCompute = cute.make_rmem_tensor(acc_vec_gate.shape, self.acc_dtype)
                     if cutlass.const_expr(self.act_func == "srelu"):
-                        self.srelu_act(tCompute, acc_vec_gate, mProb)
+                        self.srelu_act(tCompute, acc_vec_gate, _mProb_h)
                     elif cutlass.const_expr(self.act_func == "geglu"):
                         acc_vec_up = tTR_rAcc_up.load()
-                        self.geglu_act(tCompute, acc_vec_up, acc_vec_gate, mProb, linear_offset)
+                        self.geglu_act(tCompute, acc_vec_up, acc_vec_gate, _mProb_h, linear_offset)
                     elif cutlass.const_expr(self.act_func == "swiglu"):
                         acc_vec_up = tTR_rAcc_up.load()
-                        self.swiglu_act(tCompute, acc_vec_up, acc_vec_gate, mProb)
+                        self.swiglu_act(tCompute, acc_vec_up, acc_vec_gate, _mProb_h)
 
                     #
                     # Store post-activation output to D staging (bf16 under NVFP4 D —
@@ -2342,6 +2649,14 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                     acc_vec = tiled_copy_r2s_d.retile(tCompute).load()
                     tRS_rD.store(acc_vec.to(self.d_smem_dtype))
                     d_buffer = num_prev_d_subtiles % self.num_d_stage
+                    # The sD stage is guarded by the pingpong pipeline: acquire
+                    # BEFORE writing (the RHT warps consumer_release the slot right
+                    # after their sD register loads, up to num_d_stage subtiles
+                    # behind). Replaces the old per-subtile ACT<->RHT lockstep
+                    # barrier — the mbarrier phase bit makes the early release safe
+                    # (the named-barrier arrive() variant raced its release drain).
+                    if cutlass.const_expr(self.run_rht):
+                        pingpong_pipeline.producer_acquire(pingpong_act_producer_state)
                     cute.copy(
                         tiled_copy_r2s_d,
                         tRS_rD,
@@ -2354,15 +2669,15 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                             cute.copy(
                                 tma_atom_d,
                                 bSG_sD[(None, d_buffer)],
-                                bSG_gD[(None, real_subtile_idx)],
+                                _bSG_gD_h[(None, real_subtile_idx)],
                             )
                             d_pipeline.producer_commit()
 
                     #
                     # Signal the RHT epilogue warps that the post-activation D tile is in SMEM.
+                    # (The matching producer_acquire moved BEFORE the sD write above.)
                     #
                     if cutlass.const_expr(self.run_rht):
-                        pingpong_pipeline.producer_acquire(pingpong_act_producer_state)
                         pingpong_pipeline.producer_commit(pingpong_act_producer_state)
                         pingpong_act_producer_state.advance()
 
@@ -2378,14 +2693,14 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                             c_pipeline.producer_acquire()
                         self.epilog_sync_barrier_group0.arrive_and_wait()
 
-                    if cutlass.const_expr(self.run_rht):
-                        self.epilog_sync_barrier.arrive_and_wait()
+                    # (No per-subtile ACT<->RHT barrier: sD reuse is fully ordered
+                    # by the pingpong producer_acquire above.)
 
                 #
-                # Full epilogue barrier (ACT + RHT must both arrive)
+                # (No tile-end ACT<->RHT barrier either: the RHT warps touch no
+                # ACT-owned state across the tile boundary — sD stays pingpong-
+                # guarded, TMEM/acc is ACT-only, and the sSf staging is RHT-only.)
                 #
-                if cutlass.const_expr(self.run_rht):
-                    self.epilog_sync_barrier.arrive_and_wait()
 
                 #
                 # Async arrive accumulator buffer empty
@@ -2504,11 +2819,27 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                     real_rht, _ = epi_ext.get_gmem_tensor("d", mRht_mnl, padded_offsets, epi_work_tile_info)
                     gRht_mnl_loop = cute.local_tile(real_rht, cute.slice_(self.mma_tiler_d, (None, None, 0)), (None, None, None))
                     tCgRht = thr_mma_epi_rht.partition_C(gRht_mnl_loop)
-                    _, bSG_sRht, bSG_gRht_partitioned = self.epilog_gmem_copy_and_partition(epi_tidx, tma_atom_rht, tCgRht, epi_tile, sRht)
-                    bSG_gRht = bSG_gRht_partitioned[(None, None, None, *mma_tile_coord_mnl)]
-                    bSG_gRht = cute.group_modes(bSG_gRht, 1, cute.rank(bSG_gRht))
+                    if cutlass.const_expr(self.enable_breuse):
+                        gRht_epi_bk = cute.flat_divide(tCgRht[((None, None), 0, 0, None, None, None)], epi_tile)
+                        gRht_epi_br = cute.flat_divide(tCgRht[((None, None), 1, 0, None, None, None)], epi_tile)
+                        sRht_for_tma = cute.group_modes(sRht, 0, 2)
+                        bSG_sRht, bSG_gRht_partitioned_bk = cpasync.tma_partition(
+                            tma_atom_rht, 0, cute.make_layout(1), sRht_for_tma, cute.group_modes(gRht_epi_bk, 0, 2))
+                        _, bSG_gRht_partitioned_br = cpasync.tma_partition(
+                            tma_atom_rht, 0, cute.make_layout(1), sRht_for_tma, cute.group_modes(gRht_epi_br, 0, 2))
+                        bSG_gRht_bk = bSG_gRht_partitioned_bk[(None, None, None, *mma_tile_coord_mnl)]
+                        bSG_gRht_bk = cute.group_modes(bSG_gRht_bk, 1, cute.rank(bSG_gRht_bk))
+                        bSG_gRht_br = bSG_gRht_partitioned_br[(None, None, None, *mma_tile_coord_mnl)]
+                        bSG_gRht_br = cute.group_modes(bSG_gRht_br, 1, cute.rank(bSG_gRht_br))
+                        bSG_gRht = bSG_gRht_bk
+                    else:
+                        _, bSG_sRht, bSG_gRht_partitioned = self.epilog_gmem_copy_and_partition(epi_tidx, tma_atom_rht, tCgRht, epi_tile, sRht)
+                        bSG_gRht = bSG_gRht_partitioned[(None, None, None, *mma_tile_coord_mnl)]
+                        bSG_gRht = cute.group_modes(bSG_gRht, 1, cute.rank(bSG_gRht))
+                        bSG_gRht_bk = bSG_gRht
+                        bSG_gRht_br = bSG_gRht
                 if cutlass.const_expr(self.rht_quant and not self.rht_rowwise):
-                    # Expert token offset for the colwise (f, m) scale grid's
+                    # Expert token offset for the colwise (f, m/16) scale grid's
                     # tile index (offsets are 256-aligned, divisions exact).
                     rht_t_off, _rht_t_cnt = compute_expert_token_range(
                         padded_offsets, epi_work_tile_info.expert_idx)
@@ -2521,14 +2852,34 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                     real_dq, _ = epi_ext.get_gmem_tensor("d", mD_mnl, padded_offsets, epi_work_tile_info)
                     gDq_mnl_loop = cute.local_tile(real_dq, cute.slice_(self.mma_tiler_d, (None, None, 0)), (None, None, None))
                     tCgDq = thr_mma_epi_dq.partition_C(gDq_mnl_loop)
-                    _, bSG_sDq, bSG_gDq_partitioned = self.epilog_gmem_copy_and_partition(epi_tidx, tma_atom_d, tCgDq, epi_tile, sDq)
-                    bSG_gDq = bSG_gDq_partitioned[(None, None, None, *mma_tile_coord_mnl)]
-                    bSG_gDq = cute.group_modes(bSG_gDq, 1, cute.rank(bSG_gDq))
+                    if cutlass.const_expr(self.enable_breuse):
+                        gDq_epi_bk = cute.flat_divide(tCgDq[((None, None), 0, 0, None, None, None)], epi_tile)
+                        gDq_epi_br = cute.flat_divide(tCgDq[((None, None), 1, 0, None, None, None)], epi_tile)
+                        sDq_for_tma = cute.group_modes(sDq, 0, 2)
+                        bSG_sDq, bSG_gDq_partitioned_bk = cpasync.tma_partition(
+                            tma_atom_d, 0, cute.make_layout(1), sDq_for_tma, cute.group_modes(gDq_epi_bk, 0, 2))
+                        _, bSG_gDq_partitioned_br = cpasync.tma_partition(
+                            tma_atom_d, 0, cute.make_layout(1), sDq_for_tma, cute.group_modes(gDq_epi_br, 0, 2))
+                        bSG_gDq_bk = bSG_gDq_partitioned_bk[(None, None, None, *mma_tile_coord_mnl)]
+                        bSG_gDq_bk = cute.group_modes(bSG_gDq_bk, 1, cute.rank(bSG_gDq_bk))
+                        bSG_gDq_br = bSG_gDq_partitioned_br[(None, None, None, *mma_tile_coord_mnl)]
+                        bSG_gDq_br = cute.group_modes(bSG_gDq_br, 1, cute.rank(bSG_gDq_br))
+                        bSG_gDq = bSG_gDq_bk
+                    else:
+                        _, bSG_sDq, bSG_gDq_partitioned = self.epilog_gmem_copy_and_partition(epi_tidx, tma_atom_d, tCgDq, epi_tile, sDq)
+                        bSG_gDq = bSG_gDq_partitioned[(None, None, None, *mma_tile_coord_mnl)]
+                        bSG_gDq = cute.group_modes(bSG_gDq, 1, cute.rank(bSG_gDq))
+                        bSG_gDq_bk = bSG_gDq
+                        bSG_gDq_br = bSG_gDq
 
                 #
-                # NVFP4 scale tensors: each thread owns one logical scale-domain row.
-                # Per subtile iteration it stages one scale byte per 16-value block
-                # into smem, then writes those bytes into the swizzled SF atom layout.
+                # NVFP4 scale tensors: per-expert (m, f/16, 1) gmem tensors + this
+                # thread's row. The "d" extension branch only applies the expert row
+                # offset + shape rewrite, so it works for the scale tensors as-is.
+                # Each thread owns one token row (mPosition analog); per subtile
+                # iteration it stages one scale byte per 16-feature block into smem,
+                # then stores its whole (contiguous) 8-byte scale row once per tile —
+                # per-block scalar gmem stores would be ~32x sector-amplified.
                 #
                 if cutlass.const_expr(self.rht_quant or self.d_quant):
                     sf_row = (
@@ -2536,12 +2887,42 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                         + mma_tile_coord_v * (self.mma_tiler[0] // cute.size(tiled_mma.thr_id.shape))
                         + epi_tidx
                     )
-                #
-                # Consume D subtiles from SMEM
-                #
-                subtile_cnt = self.cta_tile_shape_mnk[1] // cute.size(self.epi_tile[1])
-                subtile_step = 1 if cutlass.const_expr(self.act_func == "srelu") else 2
-                for subtile_idx in cutlass.range(0, subtile_cnt, subtile_step, unroll=1):
+                # For breuse: the ACT warps emit the subtile sequence once per
+                # M-half (bkeep then breuse) — consume both, with per-half gmem
+                # partitions and scale rows. The per-half scale-row stores keep
+                # the sSfRht/sSfd smem staging correct (half 1 reuses it).
+                # (2-space indent below keeps the subtile-loop body untouched.)
+                _breuse_halves = [0, 1] if self.enable_breuse else [0]
+
+                if cutlass.const_expr(self.generate_rht):
+                    _bSG_gRht_h = bSG_gRht
+                if cutlass.const_expr(self.d_quant):
+                    _bSG_gDq_h = bSG_gDq
+                if cutlass.const_expr(self.rht_quant or self.d_quant):
+                    _sf_row_h = sf_row
+
+                for _m_half in _breuse_halves:
+                  if self.enable_breuse:
+                    if cutlass.const_expr(self.generate_rht):
+                        _bSG_gRht_h = bSG_gRht_bk if _m_half == 0 else bSG_gRht_br
+                    if cutlass.const_expr(self.d_quant):
+                        _bSG_gDq_h = bSG_gDq_bk if _m_half == 0 else bSG_gDq_br
+                    if cutlass.const_expr(self.rht_quant or self.d_quant):
+                        _sf_row_h = sf_row + _m_half * (self.cta_tile_shape_mnk[0] // 2)
+                  else:
+                    if cutlass.const_expr(self.generate_rht):
+                        _bSG_gRht_h = bSG_gRht
+                    if cutlass.const_expr(self.d_quant):
+                        _bSG_gDq_h = bSG_gDq
+                    if cutlass.const_expr(self.rht_quant or self.d_quant):
+                        _sf_row_h = sf_row
+
+                  #
+                  # Consume D subtiles from SMEM
+                  #
+                  subtile_cnt = self.cta_tile_shape_mnk[1] // cute.size(self.epi_tile[1])
+                  subtile_step = 1 if cutlass.const_expr(self.act_func == "srelu") else 2
+                  for subtile_idx in cutlass.range(0, subtile_cnt, subtile_step, unroll=1):
                     #
                     # Wait for ACT warps to finish writing the post-activation D tile to SMEM.
                     #
@@ -2560,11 +2941,14 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                                     - 1 - real_subtile_idx
                                 )
                         #
-                        # Load this subtile's sD values to registers, then ARRIVE the
-                        # lockstep barrier immediately: the ACT warps' arrive_and_wait
-                        # releases, and their next subtile overlaps ALL the FWHT/quant
-                        # compute and stores below. The RHT side never waits on this
-                        # barrier (the pingpong gates it).
+                        # Load this subtile's sD values to registers, then release
+                        # the pingpong slot IMMEDIATELY: the ACT producers' acquire
+                        # (before their sD write) is the only reuse gate, so the
+                        # whole FWHT/quant/store chain below overlaps the ACT warps'
+                        # next subtiles (up to num_d_stage ahead). The mbarrier
+                        # phase bit makes this early release sound — the old
+                        # named-barrier arrive() variant raced its release drain
+                        # (~1/300 hangs on sm100 silicon).
                         #
                         if cutlass.const_expr(self.generate_rht):
                             if cutlass.const_expr(self.rht_rowwise):
@@ -2573,7 +2957,8 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                                 rht_ld = load_colwise_pairs_bf16(sD, d_buffer, epi_tidx)
                         if cutlass.const_expr(self.d_quant):
                             dq_ld = load_row_bf16(sD, d_buffer, epi_tidx)
-                        self.epilog_sync_barrier.arrive()
+                        pingpong_pipeline.consumer_release(pingpong_rht_consumer_state)
+                        pingpong_rht_consumer_state.advance()
                         # RHT output: write the transform (x0.25) to sRht. rht_rowwise
                         # picks the transform axis (16-feature blocks per token vs
                         # 16-token blocks per feature); NVFP4 quantization is inferred
@@ -2605,7 +2990,7 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                                 cute.copy(
                                     tma_atom_rht,
                                     bSG_sRht[(None, d_buffer)],
-                                    bSG_gRht[(None, real_subtile_idx)],
+                                    _bSG_gRht_h[(None, real_subtile_idx)],
                                 )
                                 rht_pipeline.producer_commit()
                                 rht_pipeline.producer_acquire()
@@ -2613,63 +2998,68 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                                 cute.copy(
                                     tma_atom_d,
                                     bSG_sDq[(None, d_buffer)],
-                                    bSG_gDq[(None, real_subtile_idx)],
+                                    _bSG_gDq_h[(None, real_subtile_idx)],
                                 )
                                 dq_pipeline.producer_commit()
                                 dq_pipeline.producer_acquire()
                         self.epilog_sync_barrier_group1.arrive_and_wait()
 
-                    #
-                    # Release pingpong consumer slot
-                    #
-                    pingpong_pipeline.consumer_release(pingpong_rht_consumer_state)
-                    pingpong_rht_consumer_state.advance()
+                    # (Pingpong slot already released right after the sD register
+                    # loads above.)
                     num_prev_d_subtiles = num_prev_d_subtiles + 1
-                    # Lockstep barrier: under run_rht the 128 RHT arrivals already
-                    # happened right after the sD reads (arrive() above); only the
-                    # idle-RHT plain mode still pairs arrive_and_wait here.
-                    if cutlass.const_expr(not self.run_rht):
-                        self.epilog_sync_barrier.arrive_and_wait()
+
+                  #
+                  # NVFP4: one contiguous 8-byte scale-row store per thread PER
+                  # M-HALF pass (still inside the m-half loop: half 1 reuses the
+                  # sSfRht/sSfd smem staging, so each half must drain it first).
+                  # Rowwise: the thread wrote all its own smem slots (no barrier
+                  # needed). Colwise: rows were filled ACROSS warps — the group1
+                  # barrier at the end of the subtile loop already ordered those
+                  # writes.
+                  #
+                  _num_sf = self.cta_tile_shape_mnk_d[1] // HADAMARD_SIZE
+                  if cutlass.const_expr(self.rht_quant and self.rht_rowwise):
+                      self.store_swizzled_sf_row(
+                          mSfRht_mnl,
+                          epi_ext.token_offset + _sf_row_h,
+                          mma_tile_coord_mnl[1] * _num_sf,
+                          sSfRht,
+                          epi_tidx,
+                      )
+                  if cutlass.const_expr(self.rht_quant and not self.rht_rowwise):
+                      # (f, m) scale domain: thread <-> feature-in-tile; columns are
+                      # 16-token scale blocks, stored in the same swizzled SF atom layout.
+                      sf_feat_row = mma_tile_coord_mnl[1] * self.cta_tile_shape_mnk_d[1] + epi_tidx
+                      self.store_swizzled_sf_row(
+                          mSfRht_mnl,
+                          sf_feat_row,
+                          (rht_t_off + _sf_row_h - epi_tidx) // HADAMARD_SIZE,
+                          sSfRht,
+                          epi_tidx,
+                      )
+                  if cutlass.const_expr(self.d_quant):
+                      self.store_swizzled_sf_row(
+                          mSfd_mnl,
+                          epi_ext.token_offset + _sf_row_h,
+                          mma_tile_coord_mnl[1] * _num_sf,
+                          sSfd,
+                          epi_tidx,
+                      )
+
+                  # Under breuse the next M-half rewrites the sSfRht/sSfd staging
+                  # that the (cross-warp for colwise) reads above consume — order
+                  # the halves. Compiled out for non-breuse.
+                  if cutlass.const_expr(self.enable_breuse and (self.rht_quant or self.d_quant)):
+                      self.epilog_sync_barrier_group1.arrive_and_wait()
 
                 #
-                # NVFP4: one contiguous 8-byte scale-row store per thread per tile.
-                # Rowwise: the thread wrote all its own smem slots (no barrier needed).
-                # Colwise: rows were filled ACROSS warps — the loop-end epilog_sync
-                # barrier above already ordered those writes.
+                # (No tile-end ACT<->RHT barrier: sD reuse is pingpong-guarded.)
+                # The NEXT tile's FWHT/quant rewrites the sSfRht/sSfd staging the
+                # (cross-warp for colwise) scale-row reads above consume — order
+                # within the RHT group. Breuse already barriers per half above.
                 #
-                _num_sf = self.cta_tile_shape_mnk_d[1] // HADAMARD_SIZE
-                if cutlass.const_expr(self.rht_quant and self.rht_rowwise):
-                    self.store_swizzled_sf_row(
-                        mSfRht_mnl,
-                        epi_ext.token_offset + sf_row,
-                        mma_tile_coord_mnl[1] * _num_sf,
-                        sSfRht,
-                        epi_tidx,
-                    )
-                if cutlass.const_expr(self.rht_quant and not self.rht_rowwise):
-                    # (f, m) scale domain: thread <-> feature-in-tile; columns are
-                    # 16-token scale blocks, stored in the same swizzled SF atom layout.
-                    sf_feat_row = mma_tile_coord_mnl[1] * self.cta_tile_shape_mnk_d[1] + epi_tidx
-                    self.store_swizzled_sf_row(
-                        mSfRht_mnl,
-                        sf_feat_row,
-                        (rht_t_off + sf_row - epi_tidx) // HADAMARD_SIZE,
-                        sSfRht,
-                        epi_tidx,
-                    )
-                if cutlass.const_expr(self.d_quant):
-                    self.store_swizzled_sf_row(
-                        mSfd_mnl,
-                        epi_ext.token_offset + sf_row,
-                        mma_tile_coord_mnl[1] * _num_sf,
-                        sSfd,
-                        epi_tidx,
-                    )
-
-                #
-                # Full epilogue barrier (ACT + RHT must both arrive)
-                #
-                self.epilog_sync_barrier.arrive_and_wait()
+                if cutlass.const_expr(not self.enable_breuse and (self.rht_quant or self.d_quant)):
+                    self.epilog_sync_barrier_group1.arrive_and_wait()
 
                 #
                 # Toggle the subtile-column reversal for the next tile.

@@ -17,6 +17,8 @@ def get_dtype_rcp_limits(dtype):
         return 1 / 6.0
     if dtype == cutlass.Float8E4M3FN:
         return 1 / 448.0
+    if dtype == cutlass.FloatNV8E5M3FNU:
+        return 1 / 114688.0
     raise ValueError(f"unsupported quantized dtype {dtype}")
 
 
@@ -34,22 +36,22 @@ def load_row_bf16(sD, d_buffer, tidx):
 
 
 @cute.jit
-def nvfp4_quant_rmem_row(rmem_bf16, d_buffer, tidx, sOut, norm_const, sSf, sf_pair):
+def nvfp4_quant_rmem_row(rmem_bf16, d_buffer, tidx, sOut, norm_const, sSf, sf_pair, sf_dtype):
     """NVFP4-quantize the thread's full 32-feature bf16 row (from load_row_bf16, no
-    transform) into sOut (packed e2m1) + sSf (e4m3 block scales) — the fused-D
+    transform) into sOut (packed e2m1) + sSf (fp8 block scales) — the fused-D
     analog of group_rht_cast's rowwise cast path."""
     row_feats = 2 * HADAMARD_SIZE
     tCompute = cute.make_rmem_tensor(rmem_bf16.shape, cutlass.Float32)
     for i in cutlass.range_constexpr(row_feats):
         tCompute[i] = rmem_bf16[i].to(cutlass.Float32)
 
-    _nvfp4_quant_row(tCompute, d_buffer, tidx, sOut, norm_const, sSf, sf_pair)
+    _nvfp4_quant_row(tCompute, d_buffer, tidx, sOut, norm_const, sSf, sf_pair, sf_dtype)
 
 
 @cute.jit
-def _nvfp4_quant_row(tCompute, d_buffer, token, sOut, norm_const, sSf, sf_pair):
+def _nvfp4_quant_row(tCompute, d_buffer, token, sOut, norm_const, sSf, sf_pair, sf_dtype):
     """Flashinfer blockscaled-epilogue NVFP4 quantization of one thread's 32-feature
-    f32 row: packed e2m1 data into sOut, one e4m3 block scale per (1,16) block into
+    f32 row: packed e2m1 data into sOut, one fp8 block scale per (1,16) block into
     sSf slots (token, num_vecs*sf_pair + vi)."""
     row_feats = cute.size(tCompute.shape)
     tCompute_flat = cute.make_tensor(tCompute.iterator, cute.make_layout((row_feats,)))
@@ -71,32 +73,36 @@ def _nvfp4_quant_row(tCompute, d_buffer, token, sOut, norm_const, sSf, sf_pair):
         )
     # blockscaled_contiguous_gather_grouped_gemm_act_fusion.py:2856-2873
     for vi in cutlass.range_constexpr(0, num_vecs, 2):
-        tCrSFC_pvscale[vi], tCrSFC_pvscale[vi + 1] = cute.arch.mul_packed_f32x2(
-            (tCrSFC_pvscale[vi], tCrSFC_pvscale[vi + 1]),
-            (
-                get_dtype_rcp_limits(cutlass.Float4E2M1FN),
-                get_dtype_rcp_limits(cutlass.Float4E2M1FN),
-            ),
+        tCrSFC_pvscale[vi], tCrSFC_pvscale[vi + 1] = (
+            cute.arch.mul_packed_f32x2(
+                (tCrSFC_pvscale[vi], tCrSFC_pvscale[vi + 1]),
+                (
+                    get_dtype_rcp_limits(cutlass.Float4E2M1FN),
+                    get_dtype_rcp_limits(cutlass.Float4E2M1FN),
+                ),
+            )
         )
-        tCrSFC_pvscale[vi], tCrSFC_pvscale[vi + 1] = cute.arch.mul_packed_f32x2(
-            (tCrSFC_pvscale[vi], tCrSFC_pvscale[vi + 1]),
-            (norm_const, norm_const),
+        tCrSFC_pvscale[vi], tCrSFC_pvscale[vi + 1] = (
+            cute.arch.mul_packed_f32x2(
+                (tCrSFC_pvscale[vi], tCrSFC_pvscale[vi + 1]),
+                (norm_const, norm_const),
+            )
         )
 
     # blockscaled_contiguous_gather_grouped_gemm_act_fusion.py:2887
-    # f32 -> e4m3 as a padded 4-wide vector: nvgpu.cvt_fptrunc requires a
+    # f32 -> fp8 scale format as a padded 4-wide vector: nvgpu.cvt_fptrunc requires a
     # 32-bit-aligned 1-d vector (4 x f8), never a scalar. Same pattern as
     # grouped_gemm_swiglu_quant's pvscale_f32x4 -> sfd_f8x4 round-trip.
     assert num_vecs <= 4, "scale convert padding assumes at most 4 blocks per row"
     pvscale_f32x4 = cute.make_rmem_tensor((4,), cutlass.Float32)
     for vi in cutlass.range_constexpr(4):
         pvscale_f32x4[vi] = tCrSFC_pvscale[min(vi, num_vecs - 1)]
-    tCrSFC_f8x4 = cute.make_rmem_tensor((4,), cutlass.Float8E4M3FN)
-    tCrSFC_f8x4.store(pvscale_f32x4.load().to(cutlass.Float8E4M3FN))
-    tCrSFC = cute.make_rmem_tensor((num_vecs,), cutlass.Float8E4M3FN)
+    tCrSFC_f8x4 = cute.make_rmem_tensor((4,), sf_dtype)
+    tCrSFC_f8x4.store(pvscale_f32x4.load().to(sf_dtype))
+    tCrSFC = cute.make_rmem_tensor((num_vecs,), sf_dtype)
     for vi in cutlass.range_constexpr(num_vecs):
         tCrSFC[vi] = tCrSFC_f8x4[vi]
-    # e4m3 -> f32 widening round-trip, vectorized for the same reason.
+    # fp8 scale -> f32 widening round-trip, vectorized for the same reason.
     tCrSFC_f32x4 = cute.make_rmem_tensor((4,), cutlass.Float32)
     tCrSFC_f32x4.store(tCrSFC_f8x4.load().to(cutlass.Float32))
 
