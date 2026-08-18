@@ -324,6 +324,45 @@ class CompiledPlan:
     def execute(self, graph: "pygraph", variant_pack: "VariantPack", ctx: ExecutionContext) -> None:
         raise NotImplementedError
 
+    def _launch_sequence(self):
+        """``(steps, workspace_bytes)`` — the launches this plan issues.
+
+        The entire per-engine half of the AOT plugin interface. A plan that
+        implements it can be handed to ``cudnn.export_to_disk()`` or
+        ``cudnn.register_global()``; the container, both loaders and both
+        executors are shared and need nothing further.
+
+        Most plans do not write the list by hand. ``record_launch_sequence()``
+        derives it by running the plan once on throwaway buffers and watching
+        which compiled kernels it issues, over which of its own tensors — so a
+        retrofit is usually a few lines saying how to run the plan, not a
+        transcription of every kernel's signature.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support AOT export yet. It needs a _launch_sequence(); the cuDNN "
+            "backend, cuda-python and CUDA C++ engines are not retrofitted."
+        )
+
+    def export_aot_payload(self, graph: "pygraph") -> Any:
+        """Flow 2: ``(payload, module_bytes)`` — the steps written to one linked .so."""
+        from cudnn.engines.cutedsl_aot import base_payload, link_steps
+
+        steps, workspace_size = self._launch_sequence()
+        payload_steps, module_bytes, runtime_deps = link_steps(steps, graph.get_name())
+        payload = base_payload(workspace_size)
+        payload["steps"] = payload_steps
+        payload["runtime_deps"] = runtime_deps
+        return payload, module_bytes
+
+    def aot_global_payload(self, graph: "pygraph", symbol: str) -> Any:
+        """Flow 3: the same steps, published into the tvm-ffi table. Nothing is written."""
+        from cudnn.engines.cutedsl_aot import base_payload, register_steps
+
+        steps, workspace_size = self._launch_sequence()
+        payload = base_payload(workspace_size)
+        payload["steps"] = register_steps(steps, symbol)
+        return payload
+
 
 class _EagerPlan(CompiledPlan):
     """Default CompiledPlan for simple eager engines (delegates to engine.execute)."""

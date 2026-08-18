@@ -803,6 +803,39 @@ class PyGraph {
     serialize() const;
 
     void
+    set_name(std::string const& name) {
+        graph->set_name(name);
+    }
+
+    std::string
+    get_name() const {
+        return graph->get_name();
+    }
+
+    bool
+    is_built_from_artifact() const {
+        return graph->is_built_from_artifact();
+    }
+
+    // True when this graph's plan is an AOT CuTeDSL artifact rather than a
+    // cuDNN backend execution plan.
+    bool
+    has_cutedsl_payload() const {
+        return graph->has_cutedsl_payload();
+    }
+
+    // Attach the AOT artifact produced for this graph's selected plan.
+    // `payload_json` carries everything but the module bytes, which arrive
+    // separately so they never pass through a JSON text encoding.
+    void
+    set_cutedsl_payload(std::string const& payload_json, py::bytes const& module_bytes);
+
+    // Name the variant pack directly, for a graph with no cuDNN backend
+    // lowering. See Graph::declare_variant_pack().
+    void
+    declare_variant_pack(std::vector<int64_t> const& uids);
+
+    void
     deserialize(std::optional<std::intptr_t> handle_, py::object const& pyobj, bool const enforce_precompiled = false);
 
     void

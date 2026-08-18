@@ -21,6 +21,7 @@
 #include "experimental/sm90_sdpa_prefill_engine.h"
 #include "experimental/sm100_sdpa_prefill_engine.h"
 #include "experimental/sm100_rms_norm_silu_engine.h"
+#include "experimental/cutedsl_engine_interface.h"
 
 namespace cudnn_frontend {
 
@@ -820,6 +821,13 @@ class Execution_plan_list {
             return {error_code_t::OK, ""};
         }
 
+        // AOT CuTeDSL engine path
+        if (index == CUTEDSL_ENGINE_CANDIDATE) {
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                !cutedsl_engine_, error_code_t::GRAPH_EXECUTION_FAILED, "CuTeDSL engine not loaded.");
+            return {error_code_t::OK, ""};
+        }
+
         RETURN_CUDNN_FRONTEND_ERROR_IF((index < 0) || (static_cast<int64_t>(execution_plans.size()) <= index),
                                        error_code_t::GRAPH_EXECUTION_FAILED,
                                        "Plan index " + std::to_string(index) + " is invalid.");
@@ -1159,6 +1167,17 @@ class Execution_plan_list {
         }
     }
 
+    // Same hook as set_oss_slot_indices(), but the CuTeDSL engine can report a
+    // uid that is not in this graph's variant pack (an artifact/graph mismatch),
+    // so it returns a status instead of writing -1 and failing later.
+    error_t
+    bind_cutedsl_slot_indices(std::function<int(int64_t)> const& slot_for) {
+        if (!cutedsl_engine_) {
+            return {error_code_t::OK, ""};
+        }
+        return cutedsl_engine_->bind_slots(slot_for);
+    }
+
     // Flat-array overload for RmsNorm+SiLU
     error_t
     execute_oss_rms_norm_silu_engine(void* const* ptrs, void* workspace, int device, cudaStream_t stream) const {
@@ -1205,7 +1224,48 @@ class Execution_plan_list {
                                                   extra);
     }
 
+    // ================================================================
+    // AOT CuTeDSL-family engine support
+    //
+    // The fourth dispatch target. Unlike the two above, this engine is never
+    // selected by heuristics: it exists only on a graph that came back from
+    // import_from_disk() / get_global(), where the artifact IS the plan.
+    // ================================================================
+
+    static constexpr int64_t CUTEDSL_ENGINE_CANDIDATE = -4;
+
+    void
+    set_cutedsl_engine(std::shared_ptr<experimental::ICuteDslEngine> engine) {
+        cutedsl_engine_ = std::move(engine);
+        candidate       = CUTEDSL_ENGINE_CANDIDATE;
+    }
+
+    bool
+    has_cutedsl_engine() const {
+        return cutedsl_engine_ != nullptr;
+    }
+
+    bool
+    is_cutedsl_candidate() const {
+        return candidate == CUTEDSL_ENGINE_CANDIDATE;
+    }
+
+    int64_t
+    get_cutedsl_workspace_size() const {
+        if (!cutedsl_engine_) return 0;
+        return cutedsl_engine_->get_workspace_size();
+    }
+
+    error_t
+    execute_cutedsl_engine(void* const* ptrs, void* workspace, cudaStream_t stream) const {
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            !cutedsl_engine_, error_code_t::GRAPH_EXECUTION_FAILED, "CuTeDSL engine not loaded");
+        return cutedsl_engine_->execute(ptrs, workspace, stream);
+    }
+
    private:
+    std::shared_ptr<experimental::ICuteDslEngine> cutedsl_engine_;
+
     std::shared_ptr<experimental::IOssSdpaEngine> oss_sdpa_engine_;
     bool oss_sdpa_engine_supported_ = false;
     bool oss_sdpa_engine_built_     = false;

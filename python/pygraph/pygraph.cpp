@@ -19,6 +19,11 @@
 #include "pybind11/stl.h"
 
 #include "cudnn_frontend.h"
+#ifdef CUDNN_FRONTEND_ENABLE_AOT
+// Pulls in the tvm-ffi engine and installs the factory that deserialize() uses
+// to reconstitute a CuTeDSL artifact.
+#include "cudnn_frontend/kernel_library.h"
+#endif
 #include "pygraph.h"
 
 namespace py = pybind11;
@@ -625,6 +630,43 @@ PyGraph::serialize() const {
 }
 
 void
+PyGraph::set_cutedsl_payload(std::string const& payload_json, py::bytes const& module_bytes) {
+#ifdef CUDNN_FRONTEND_ENABLE_AOT
+    cudnn_frontend::experimental::CuteDslPayload payload;
+    try {
+        json j  = json::parse(payload_json);
+        payload = j.get<cudnn_frontend::experimental::CuteDslPayload>();
+    } catch (std::exception const& e) {
+        throw_if(
+            true, cudnn_frontend::error_code_t::INVALID_VALUE, std::string("Malformed CuTeDSL payload: ") + e.what());
+    }
+
+    std::string_view const bytes = static_cast<std::string_view>(module_bytes);
+    payload.module_bytes.assign(bytes.begin(), bytes.end());
+    // Hashed here rather than in Python so the writer and the loader can never
+    // disagree about the algorithm.
+    payload.module_hash =
+        cudnn_frontend::experimental::cutedsl_detail::fnv1a64(payload.module_bytes.data(), payload.module_bytes.size());
+
+    auto status = graph->set_cutedsl_payload(std::move(payload));
+    throw_if(status.is_bad(), status.get_code(), status.get_message());
+#else
+    (void)payload_json;
+    (void)module_bytes;
+    throw_if(true,
+             cudnn_frontend::error_code_t::GRAPH_NOT_SUPPORTED,
+             "AOT kernel export is not available in this build. Reinstall cudnn-frontend with the 'cutedsl' extra "
+             "(pip install nvidia-cudnn-frontend[cutedsl]) so apache-tvm-ffi is present at build time.");
+#endif
+}
+
+void
+PyGraph::declare_variant_pack(std::vector<int64_t> const& uids) {
+    auto status = graph->declare_variant_pack(uids);
+    throw_if(status.is_bad(), status.get_code(), status.get_message());
+}
+
+void
 PyGraph::deserialize(std::optional<std::intptr_t> handle_, py::object const& pyobj, bool const enforce_precompiled) {
     if (py::isinstance<py::str>(pyobj)) {
         json j = json::parse(pyobj.cast<std::string>());
@@ -828,8 +870,151 @@ default_vector(void) {
     return {};
 }
 
+// ---------------------------------------------------------------------------
+// AOT container: the set of graphs goes in, one container comes out, and it
+// comes back as name -> graph. The format is written and read entirely in C++
+// so a C++ consumer reads the same file with no Python in the picture.
+// ---------------------------------------------------------------------------
+
+static void
+aot_export_to_disk(std::vector<PyGraph*> const& graphs, std::string const& path) {
+#ifdef CUDNN_FRONTEND_ENABLE_AOT
+    std::vector<std::shared_ptr<cudnn_frontend::graph::Graph>> raw;
+    raw.reserve(graphs.size());
+    for (auto* g : graphs) {
+        throw_if(g == nullptr, error_code_t::INVALID_VALUE, "export_to_disk() got a null graph.");
+        raw.push_back(g->graph);
+    }
+    auto status = cudnn_frontend::export_to_disk(raw, path);
+    throw_if(status.is_bad(), status.get_code(), status.get_message());
+#else
+    (void)graphs;
+    (void)path;
+    throw_if(true,
+             error_code_t::GRAPH_NOT_SUPPORTED,
+             "AOT kernel export is not available in this build. Reinstall cudnn-frontend with apache-tvm-ffi "
+             "importable at build time (pip install -e . --no-build-isolation, with the 'cutedsl' extra).");
+#endif
+}
+
+static void
+aot_register_global(PyGraph* graph, std::string const& payload_json, bool override_existing) {
+#ifdef CUDNN_FRONTEND_ENABLE_AOT
+    throw_if(graph == nullptr, error_code_t::INVALID_VALUE, "register_global() got a null graph.");
+
+    cudnn_frontend::experimental::CuteDslPayload payload;
+    try {
+        json j  = json::parse(payload_json);
+        payload = j.get<cudnn_frontend::experimental::CuteDslPayload>();
+    } catch (std::exception const& e) {
+        throw_if(true, error_code_t::INVALID_VALUE, std::string("Malformed CuTeDSL payload: ") + e.what());
+    }
+
+    auto status = graph->graph->activate_cutedsl_payload(std::move(payload));
+    throw_if(status.is_bad(), status.get_code(), status.get_message());
+
+    status = cudnn_frontend::register_global(graph->graph, override_existing);
+    throw_if(status.is_bad(), status.get_code(), status.get_message());
+#else
+    (void)graph;
+    (void)payload_json;
+    (void)override_existing;
+    throw_if(true, error_code_t::GRAPH_NOT_SUPPORTED, "AOT kernel registration is not available in this build.");
+#endif
+}
+
+static PyGraph*
+aot_get_global(std::string const& name, std::optional<std::intptr_t> handle_) {
+#ifdef CUDNN_FRONTEND_ENABLE_AOT
+    // A snapshot, per the flow-3 contract: the copy keeps a reference to the
+    // engine it was fetched with, so an override=True re-registration does not
+    // change what this handle runs.
+    auto snapshot = std::make_shared<cudnn_frontend::graph::Graph>();
+    auto status   = cudnn_frontend::get_global(name, snapshot.get());
+    throw_if(status.is_bad(), status.get_code(), status.get_message());
+
+    auto* py_graph   = new PyGraph(snapshot);
+    py_graph->handle = handle_.has_value() ? static_cast<cudnnHandle_t>((void*)(handle_.value())) : nullptr;
+    return py_graph;
+#else
+    (void)name;
+    (void)handle_;
+    throw_if(true, error_code_t::GRAPH_NOT_SUPPORTED, "AOT kernel registration is not available in this build.");
+    return nullptr;
+#endif
+}
+
+static void
+aot_unregister_global(std::string const& name) {
+#ifdef CUDNN_FRONTEND_ENABLE_AOT
+    auto status = cudnn_frontend::unregister_global(name);
+    throw_if(status.is_bad(), status.get_code(), status.get_message());
+#else
+    (void)name;
+    throw_if(true, error_code_t::GRAPH_NOT_SUPPORTED, "AOT kernel registration is not available in this build.");
+#endif
+}
+
+static std::vector<std::string>
+aot_registered_global_names() {
+#ifdef CUDNN_FRONTEND_ENABLE_AOT
+    return cudnn_frontend::registered_global_names();
+#else
+    return {};
+#endif
+}
+
+static std::string
+aot_global_symbol_for(std::string const& name) {
+#ifdef CUDNN_FRONTEND_ENABLE_AOT
+    return cudnn_frontend::global_symbol_for(name);
+#else
+    return "cudnn." + name;
+#endif
+}
+
+static std::vector<std::pair<std::string, PyGraph*>>
+aot_import_from_disk(std::string const& path, std::optional<std::intptr_t> handle_) {
+#ifdef CUDNN_FRONTEND_ENABLE_AOT
+    cudnn_frontend::KernelLibrary lib;
+    cudnnHandle_t handle = handle_.has_value() ? static_cast<cudnnHandle_t>((void*)(handle_.value())) : nullptr;
+
+    auto status = cudnn_frontend::import_from_disk(path, &lib, handle);
+    throw_if(status.is_bad(), status.get_code(), status.get_message());
+
+    std::vector<std::pair<std::string, PyGraph*>> out;
+    out.reserve(lib.graphs_.size());
+    for (auto const& [name, graph] : lib.graphs_) {
+        auto* py_graph   = new PyGraph(graph);
+        py_graph->handle = handle;
+        out.emplace_back(name, py_graph);
+    }
+    return out;
+#else
+    (void)path;
+    (void)handle_;
+    throw_if(true,
+             error_code_t::GRAPH_NOT_SUPPORTED,
+             "AOT kernel import is not available in this build. Reinstall cudnn-frontend with apache-tvm-ffi "
+             "importable at build time (pip install -e . --no-build-isolation, with the 'cutedsl' extra).");
+    return {};
+#endif
+}
+
 void
 init_pygraph_submodule(py::module_& m) {
+    m.def("_aot_export_to_disk", &aot_export_to_disk, py::arg("graphs"), py::arg("path"));
+    m.def("_aot_import_from_disk", &aot_import_from_disk, py::arg("path"), py::arg("handle") = py::none());
+    m.def("_aot_register_global",
+          &aot_register_global,
+          py::arg("graph"),
+          py::arg("payload_json"),
+          py::arg("override_existing"));
+    m.def("_aot_get_global", &aot_get_global, py::arg("name"), py::arg("handle") = py::none());
+    m.def("_aot_unregister_global", &aot_unregister_global, py::arg("name"));
+    m.def("_aot_registered_global_names", &aot_registered_global_names);
+    m.def("_aot_global_symbol_for", &aot_global_symbol_for, py::arg("name"));
+
     py::class_<PyGraph> pygraph_(m, "backend_graph");
     pygraph_
         .def(py::init<std::string const&,
@@ -1374,6 +1559,12 @@ init_pygraph_submodule(py::module_& m) {
         .def("populate_cuda_graph", &PyGraph::populate_cuda_graph)
         .def("update_cuda_graph", &PyGraph::update_cuda_graph)
         .def("serialize", &PyGraph::serialize)
+        .def("set_name", &PyGraph::set_name, py::arg("name"))
+        .def("get_name", &PyGraph::get_name)
+        .def("_is_built_from_artifact", &PyGraph::is_built_from_artifact)
+        .def("_has_cutedsl_payload", &PyGraph::has_cutedsl_payload)
+        .def("_set_cutedsl_payload", &PyGraph::set_cutedsl_payload, py::arg("payload_json"), py::arg("module_bytes"))
+        .def("_declare_variant_pack", &PyGraph::declare_variant_pack, py::arg("uids"))
         .def("deserialize",
              (void (PyGraph::*)(std::optional<std::intptr_t>, py::object const&, bool const))&PyGraph::deserialize,
              py::arg("handle_"),

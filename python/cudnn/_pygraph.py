@@ -1757,6 +1757,13 @@ class pygraph:
                     ``set_stream`` semantics, both python engines and backend)
             override_uids/shapes/strides: dynamic-shape overrides (backend path)
         """
+        # AOT form: a flat pointer array already gathered in
+        # variant_pack_uids_sorted() order. Both AOT flows hand back a graph, so
+        # this is the one call shape a caller off an artifact uses. It returns
+        # before the build below, which an artifact has already had done for it.
+        if isinstance(tensor_dict, (list, tuple)):
+            return self.execute_ptrs(tensor_dict, workspace, handle=handle)
+
         if not self._is_built:
             # A JIT engine must compile for the device/stream it will run on, so
             # build the caller context here. Only here: a steady-state execute()
@@ -2073,6 +2080,70 @@ class pygraph:
         import json
 
         return json.dumps(self.inspect(), default=str, indent=2)
+
+    @property
+    def engine(self) -> Optional["BaseEngine"]:
+        """The python engine for the selected plan, or None for the backend path.
+        Populated after create_execution_plans()."""
+        return self.selected_engine
+
+    # =========================================================================
+    # AOT: naming, the uid order a caller needs to gather pointers, and the
+    # pointer-array execute both AOT flows hand back.
+    # =========================================================================
+
+    def set_name(self, name: str) -> "pygraph":
+        """Name this graph. Mandatory before AOT export: the name is the kernel's
+        identity and the lookup key in both AOT flows."""
+        if not name:
+            raise ValueError("set_name() needs a non-empty name")
+        self._cpp_graph_kwargs["name"] = name
+        if self._lowered_graph is not None:
+            self._lowered_graph.set_name(name)
+        return self
+
+    def get_name(self) -> str:
+        return self._cpp_graph_kwargs.get("name", "")
+
+    def variant_pack_uids_sorted(self) -> List[int]:
+        """The uids execute(ptrs, ...) expects pointers for, in order.
+
+        Resolved once at startup by an AOT caller, then used to gather a flat
+        pointer array on every call.
+        """
+        if self._lowered_graph is None:
+            raise RuntimeError("variant_pack_uids_sorted() needs a built or imported graph")
+        return list(self._lowered_graph._get_variant_pack_uids_sorted())
+
+    def execute_ptrs(self, ptrs, workspace, handle=None) -> None:
+        """Execute from a flat pointer array gathered in variant_pack_uids_sorted() order.
+
+        The hot path of both AOT flows. ``ptrs`` may hold ints or anything with
+        ``.data_ptr()``; nothing about the graph is mutated, so concurrent calls
+        on one graph are safe -- which is why the void*[] is built per call
+        rather than kept on the graph and refilled.
+        """
+        if self._lowered_graph is None:
+            raise RuntimeError("execute_ptrs() needs a built or imported graph")
+
+        def _ptr(d):
+            if type(d) is int:
+                return d
+            if hasattr(d, "data_ptr"):
+                return d.data_ptr()
+            import cudnn
+
+            return cudnn._pybind_module._get_data_ptr(d)
+
+        n = len(ptrs)
+        array = (ctypes.c_void_p * n)(*[_ptr(p) for p in ptrs])
+        self._lowered_graph._execute_with_raw_ptrs(
+            ctypes.addressof(array),
+            n,
+            _ptr(workspace) if workspace is not None else 0,
+            to_backend_handle(handle if handle is not None else self._handle) or 0,
+            -1,
+        )
 
     def serialize(self):
         """Serialize the graph (classic passthrough).

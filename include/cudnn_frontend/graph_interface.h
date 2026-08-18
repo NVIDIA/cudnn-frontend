@@ -81,6 +81,15 @@ class Graph : public ICudnn, public INode {
     // char: 'x'=hex, 'd'=decimal, 'b'=base64
     std::vector<std::pair<std::shared_ptr<Tensor_attributes>, char>> tensors_to_dump;
 
+    // AOT: what this graph's plan actually is, when the plan is not a cuDNN
+    // backend execution plan. Empty for a classic graph.
+    std::optional<experimental::CuteDslPayload> cutedsl_payload;
+
+    // Set by deserialize(). A graph that arrived from an artifact has its plan
+    // already chosen and compiled; re-running the build lifecycle on it would
+    // either silently do nothing or corrupt the loaded state, so it is refused.
+    bool built_from_artifact = false;
+
     error_t
     collect_assigned_uid(std::shared_ptr<Tensor_attributes> const &tensor,
                          std::unordered_set<Tensor_attributes::uid_t> &used_uids,
@@ -979,8 +988,29 @@ class Graph : public ICudnn, public INode {
         return {error_code_t::OK, ""};
     }
 
+    // A graph handed back by deserialize() / import_from_disk() / get_global()
+    // already has its one plan chosen and compiled. Re-entering the build
+    // lifecycle on it would at best do nothing and at worst overwrite the
+    // loaded plan, so every build-time entry point refuses instead.
+    error_t
+    reject_if_from_artifact(char const *what) const {
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            built_from_artifact,
+            error_code_t::GRAPH_NOT_SUPPORTED,
+            std::string(what) +
+                " cannot be called on a graph that was deserialized: its plan was selected and compiled when the "
+                "artifact was built, and this graph carries only that plan. Build a new graph to plan again.");
+        return {error_code_t::OK, ""};
+    }
+
+    bool
+    is_built_from_artifact() const {
+        return built_from_artifact;
+    }
+
     error_t
     validate() {
+        CHECK_CUDNN_FRONTEND_ERROR(reject_if_from_artifact("validate()"));
         CUDNN_FE_LOG_BANNER("  VALIDATING GRAPH  ");
         CHECK_CUDNN_FRONTEND_ERROR(assign_uids());
         CUDNN_FE_LOG(*this << std::endl;);
@@ -1016,6 +1046,7 @@ class Graph : public ICudnn, public INode {
 
     error_t
     build_operation_graph(cudnnHandle_t handle) {
+        CHECK_CUDNN_FRONTEND_ERROR(reject_if_from_artifact("build_operation_graph()"));
         CUDNN_FE_LOG_BANNER("  BUILD OP GRAPH  ");
 
         CUDNN_FE_LOG_BANNER("  1/4 INFER PROPERTIES OF NODES  ");
@@ -1129,6 +1160,13 @@ class Graph : public ICudnn, public INode {
             return {error_code_t::OK, ""};
         }
 
+        // AOT CuTeDSL engine workspace: whatever the artifact declared.
+        if (plan_index == graph::Execution_plan_list::CUTEDSL_ENGINE_CANDIDATE) {
+            cudnn_workspace_size = fe_workspace_size + plans.get_cutedsl_workspace_size();
+            CUDNN_FE_LOG_LABEL_ENDL("INFO: get_workspace_size() is " << cudnn_workspace_size << " (CuTeDSL engine)");
+            return {error_code_t::OK, ""};
+        }
+
         // There are two workspaces:
         // - cudnn execution plan workspace
         // - FE node workspace (example: alibiSlope for fmha)
@@ -1159,7 +1197,8 @@ class Graph : public ICudnn, public INode {
 
         // OSS engines are not backed by cuDNN execution plans, so their workspace stays frontend-owned.
         if (plan_index == graph::Execution_plan_list::OSS_SDPA_ENGINE_CANDIDATE ||
-            plan_index == graph::Execution_plan_list::OSS_RMS_NORM_SILU_ENGINE_CANDIDATE) {
+            plan_index == graph::Execution_plan_list::OSS_RMS_NORM_SILU_ENGINE_CANDIDATE ||
+            plan_index == graph::Execution_plan_list::CUTEDSL_ENGINE_CANDIDATE) {
             return get_workspace_size_plan_at_index(plan_index, cudnn_workspace_size);
         }
 
@@ -1547,6 +1586,18 @@ class Graph : public ICudnn, public INode {
             return {error_code_t::OK, ""};
         }
 
+        // AOT CuTeDSL-family engine: the artifact is the plan.
+        if (plan_index == graph::Execution_plan_list::CUTEDSL_ENGINE_CANDIDATE) {
+            RETURN_CUDNN_FRONTEND_ERROR_IF(!override_uids.empty(),
+                                           error_code_t::GRAPH_NOT_SUPPORTED,
+                                           "Dynamic shape overrides are not supported for an AOT CuTeDSL graph: the "
+                                           "artifact is compiled for one fully specialized shape.");
+            cudaStream_t stream = nullptr;
+            _CUDNN_CHECK_CUDNN_ERROR(detail::get_stream(handle, &stream));
+            CHECK_CUDNN_FRONTEND_ERROR(plans.execute_cutedsl_engine(ptrs, engine_workspace, stream));
+            return {error_code_t::OK, ""};
+        }
+
         // Backend path
         if (override_uids.empty()) {
             CHECK_CUDNN_FRONTEND_ERROR(detail::execute(
@@ -1673,27 +1724,73 @@ class Graph : public ICudnn, public INode {
      */
     error_t
     serialize(std::vector<uint8_t> &data, bool serialize_structure = true) const {
-        CUDNN_FE_LOG_BANNER(" SERIALIZE PLAN  ");
 #ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
-        CHECK_CUDNN_FRONTEND_ERROR(assign_uids());
         json j;
+        CHECK_CUDNN_FRONTEND_ERROR(serialize_plan(j, serialize_structure));
+        data = json::to_ubjson(j);
+        return {error_code_t::OK, ""};
+#else
+        CUDNN_FRONTEND_UNUSED(data);
+        CUDNN_FRONTEND_UNUSED(serialize_structure);
+        return {error_code_t::GRAPH_NOT_SUPPORTED, "unavailable when compiled with CUDNN_FRONTEND_SKIP_JSON_LIB"};
+#endif
+    }
+
+#ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
+    /**
+     * @brief serialize() without the final UBJSON encoding.
+     *
+     * The multi-graph container nests one of these per name, so it must not pay
+     * for a byte encoding per graph and a decode per graph on the way back.
+     */
+    error_t
+    serialize_plan(json &j, bool serialize_structure = true) const {
+        CUDNN_FE_LOG_BANNER(" SERIALIZE PLAN  ");
+        CHECK_CUDNN_FRONTEND_ERROR(assign_uids());
+        j                 = json::object();
         j["json_version"] = GRAPH_JSON_VERSION;
         // Optionally serialize the graph structure (nodes/tensors).
         if (serialize_structure) {
             serialize(j);
         }
 
-        auto const candidate = plans.candidate;
-        auto execution_plan  = plans.execution_plans[candidate];
-        if (execution_plan != nullptr) {
-            auto serialized_plan    = execution_plan->getJsonRepresentation();
-            j["cudnn_backend_data"] = serialized_plan;
-            j["variant_pack_uids"]  = variant_pack_uids;
-        }
+        // The uid order the variant pack is addressed in. Needed by every
+        // engine, so it is written unconditionally; it used to be nested under
+        // the backend-plan branch, where an engine with no cuDNN execution plan
+        // could never reach it.
+        j["variant_pack_uids"] = variant_pack_uids;
 
-        std::vector<BehaviorNote_t> selected_behavior_notes;
-        CHECK_CUDNN_FRONTEND_ERROR(plans.get_behavior_notes_at_index(candidate, selected_behavior_notes));
-        j["behavior_notes"] = std::vector<std::vector<BehaviorNote_t>>{std::move(selected_behavior_notes)};
+        // The name is the kernel's identity for AOT lookup, so it has to
+        // survive a plan-only round trip too. The structural blob writes it
+        // under "context", which the plan deserialize path never reads.
+        j["kernel_name"] = context.get_name();
+
+        auto const candidate = plans.candidate;
+
+        if (cutedsl_payload.has_value()) {
+            // A CuTeDSL graph carries its own artifact instead of a cuDNN plan.
+            // The two keys are siblings and mutually exclusive; engine_kind is
+            // what the loader branches on.
+            j["engine_kind"]    = "cutedsl";
+            j["cutedsl_data"]   = cutedsl_payload.value();
+            j["behavior_notes"] = std::vector<std::vector<BehaviorNote_t>>{{}};
+        } else {
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                candidate < 0 || candidate >= static_cast<int64_t>(plans.execution_plans.size()),
+                error_code_t::GRAPH_NOT_SUPPORTED,
+                "This graph's selected plan (" + std::to_string(candidate) +
+                    ") is not a cuDNN backend execution plan and carries no exportable payload. Only the CuTeDSL "
+                    "family engine supports AOT export today.");
+            auto execution_plan = plans.execution_plans[candidate];
+            if (execution_plan != nullptr) {
+                auto serialized_plan    = execution_plan->getJsonRepresentation();
+                j["cudnn_backend_data"] = serialized_plan;
+            }
+
+            std::vector<BehaviorNote_t> selected_behavior_notes;
+            CHECK_CUDNN_FRONTEND_ERROR(plans.get_behavior_notes_at_index(candidate, selected_behavior_notes));
+            j["behavior_notes"] = std::vector<std::vector<BehaviorNote_t>>{std::move(selected_behavior_notes)};
+        }
 
         std::unordered_map<uid_t, pass_by_values_t> tensor_to_pass_by_value;
         // Pass-by-value data lives in the cached member restored on deserialize.
@@ -1743,15 +1840,10 @@ class Graph : public ICudnn, public INode {
         }
         j["tensors_to_dump"] = tensors_to_dump_uids;
 
-        data = json::to_ubjson(j);
         CUDNN_FE_LOG_BANNER(" SERIALIZE PLAN (ALL OK) ");
         return {error_code_t::OK, ""};
-#else
-        CUDNN_FRONTEND_UNUSED(data);
-        CUDNN_FRONTEND_UNUSED(serialize_structure);
-        return {error_code_t::GRAPH_NOT_SUPPORTED, "unavailable when compiled with CUDNN_FRONTEND_SKIP_JSON_LIB"};
-#endif
     }
+#endif
 
     /**
      * @brief Deserialize an execution plan from a serialized byte blob.
@@ -1867,16 +1959,41 @@ class Graph : public ICudnn, public INode {
             }
         }
 
-        RETURN_CUDNN_FRONTEND_ERROR_IF(
-            enforce_precompiled && !j.contains("cudnn_backend_data"),
-            error_code_t::GRAPH_EXECUTION_PLAN_CREATION_FAILED,
-            "enforce_precompiled requested, but serialized graph has no precompiled execution plan");
+        if (j.contains("kernel_name") && j["kernel_name"].is_string()) {
+            context.set_name(j["kernel_name"].get<std::string>());
+        }
 
-        auto serialized_plan = j["cudnn_backend_data"];
-        if (device_prop != nullptr) {
-            CHECK_CUDNN_FRONTEND_ERROR(plans.build_plans(device_prop, serialized_plan));
+        std::string const engine_kind = j.value("engine_kind", std::string("cudnn_backend"));
+        bool const is_cutedsl         = (engine_kind == "cutedsl");
+
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            engine_kind != "cudnn_backend" && !is_cutedsl,
+            error_code_t::UNSUPPORTED_GRAPH_FORMAT,
+            "This artifact was produced by engine '" + engine_kind + "', which this build does not know how to load.");
+
+        if (is_cutedsl) {
+            // The artifact IS the plan: no cuDNN execution plan to rebuild, and
+            // nothing for the backend to be asked about.
+            RETURN_CUDNN_FRONTEND_ERROR_IF(!j.contains("cutedsl_data"),
+                                           error_code_t::UNSUPPORTED_GRAPH_FORMAT,
+                                           "Artifact declares engine_kind 'cutedsl' but carries no cutedsl_data.");
+            experimental::CuteDslPayload payload = j["cutedsl_data"].get<experimental::CuteDslPayload>();
+            std::shared_ptr<experimental::ICuteDslEngine> engine;
+            CHECK_CUDNN_FRONTEND_ERROR(experimental::make_cutedsl_engine(payload, engine));
+            cutedsl_payload = std::move(payload);
+            plans.set_cutedsl_engine(std::move(engine));
         } else {
-            CHECK_CUDNN_FRONTEND_ERROR(plans.build_plans(handle, serialized_plan));
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                enforce_precompiled && !j.contains("cudnn_backend_data"),
+                error_code_t::GRAPH_EXECUTION_PLAN_CREATION_FAILED,
+                "enforce_precompiled requested, but serialized graph has no precompiled execution plan");
+
+            auto serialized_plan = j["cudnn_backend_data"];
+            if (device_prop != nullptr) {
+                CHECK_CUDNN_FRONTEND_ERROR(plans.build_plans(device_prop, serialized_plan));
+            } else {
+                CHECK_CUDNN_FRONTEND_ERROR(plans.build_plans(handle, serialized_plan));
+            }
         }
 
         plans.behavior_notes = j["behavior_notes"].get<std::vector<std::vector<BehaviorNote_t>>>();
@@ -1934,9 +2051,13 @@ class Graph : public ICudnn, public INode {
             }
         }
 
-        if (run_warmup && handle != nullptr) {
+        // warmup() fake-captures a cudnnBackendExecute; there is no backend plan
+        // on the CuTeDSL path, and the artifact needs no warming.
+        if (run_warmup && handle != nullptr && !is_cutedsl) {
             CHECK_CUDNN_FRONTEND_ERROR(warmup(handle));
         }
+
+        built_from_artifact = true;
 
         CUDNN_FE_LOG_BANNER(" DESERIALIZE PLAN (ALL OK) ");
 
@@ -1974,6 +2095,78 @@ class Graph : public ICudnn, public INode {
     set_name(std::string const &name) {
         context.set_name(name);
         return *this;
+    }
+
+    std::string
+    get_name() const {
+        return context.get_name();
+    }
+
+    // Attach the artifact this graph's chosen plan lowered to. Called on the
+    // build box, by the engine that produced it, before serialize(). Does not
+    // load anything: exporting must work without a device able to run the
+    // kernel.
+    error_t
+    set_cutedsl_payload(experimental::CuteDslPayload payload) {
+        RETURN_CUDNN_FRONTEND_ERROR_IF(payload.steps.empty(),
+                                       error_code_t::INVALID_VALUE,
+                                       "A CuTeDSL payload must name at least one entry point.");
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            payload.module_bytes.empty(), error_code_t::INVALID_VALUE, "A CuTeDSL payload must carry module bytes.");
+        cutedsl_payload = std::move(payload);
+        return {error_code_t::OK, ""};
+    }
+
+    // Declare the variant pack directly, with no cuDNN operation graph behind
+    // it.
+    //
+    // The elementwise-add vehicle is also a valid cuDNN graph, so its uid set
+    // falls out of the ordinary lowering. A Python-engine family need not be:
+    // the FROST linear-attention kernels have no backend lowering at all, and
+    // build_operation_graph() on one of them fails with "no cuDNN backend
+    // lowering" rather than producing a uid set. For those the engine is the
+    // only thing that knows which buffers the kernel wants, so it says so here.
+    //
+    // Everything downstream -- serialize_plan(), the variant-pack template,
+    // execute() -- reads variant_pack_uids and does not care where it came
+    // from, which is why this is a setter and not a second code path.
+    error_t
+    declare_variant_pack(std::vector<uid_t> const &uids) {
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            uids.empty(), error_code_t::INVALID_VALUE, "A declared variant pack must name at least one tensor.");
+        variant_pack_uids.clear();
+        variant_pack_uids.insert(uids.begin(), uids.end());
+        varpack_prep_state->prepared.store(false, std::memory_order_release);
+        varpack_template = {};
+        return {error_code_t::OK, ""};
+    }
+
+    bool
+    has_cutedsl_payload() const {
+        return cutedsl_payload.has_value();
+    }
+
+    // Attach the payload AND make it executable now, without a round trip
+    // through a container. This is what register_global() uses: the kernel is
+    // already compiled and resident, so the only thing missing is the binding
+    // between its arguments and this graph's variant pack.
+    error_t
+    activate_cutedsl_payload(experimental::CuteDslPayload payload) {
+        std::shared_ptr<experimental::ICuteDslEngine> engine;
+        CHECK_CUDNN_FRONTEND_ERROR(experimental::make_cutedsl_engine(payload, engine));
+        cutedsl_payload = std::move(payload);
+        plans.set_cutedsl_engine(std::move(engine));
+
+        // The template may already have been prepared against the previous
+        // candidate; rebuild it so the engine's slots get bound.
+        varpack_prep_state->prepared.store(false, std::memory_order_release);
+        varpack_template = {};
+        CHECK_CUDNN_FRONTEND_ERROR(prepare_variant_pack_template());
+
+        // From here this graph carries one fixed compiled plan, exactly like a
+        // graph that came off disk.
+        built_from_artifact = true;
+        return {error_code_t::OK, ""};
     }
 
     error_t
@@ -2241,6 +2434,7 @@ class Graph : public ICudnn, public INode {
     // overload for deviceless AoT compilation
     error_t
     check_support() {
+        CHECK_CUDNN_FRONTEND_ERROR(reject_if_from_artifact("check_support()"));
         // Check OSS engine first if registered
 
         CHECK_CUDNN_FRONTEND_ERROR(context.populate_sm_version_from_device());
@@ -2428,6 +2622,12 @@ class Graph : public ICudnn, public INode {
         // Apply OSS slot indices before the release-store so a reader that
         // observes prepared=true also sees the slot writes.
         apply_oss_slot_indices_to_plans();
+        CHECK_CUDNN_FRONTEND_ERROR(plans.bind_cutedsl_slot_indices([this](int64_t uid) -> int {
+            for (size_t i = 0; i < varpack_template.all_uids.size(); ++i) {
+                if (varpack_template.all_uids[i] == uid) return static_cast<int>(i);
+            }
+            return -1;
+        }));
         varpack_prep_state->prepared.store(true, std::memory_order_release);
 
         return {error_code_t::OK, ""};
@@ -2931,6 +3131,7 @@ Graph::get_knobs_for_engine(int64_t const engine, std::vector<Knob> &knobs) {
 
 inline error_t
 Graph::create_execution_plans(std::vector<HeurMode_t> const &mode) {
+    CHECK_CUDNN_FRONTEND_ERROR(reject_if_from_artifact("create_execution_plans()"));
     CUDNN_FE_LOG_BANNER("  CREATE EXECUTION PLANS  (HEURISTICS QUERY)  ");
 
     // CHECK IF NEED TO OVERRIDE HEURISTICS QUERY
@@ -3026,12 +3227,14 @@ Graph::create_execution_plan(int64_t const engine_id, std::unordered_map<KnobTyp
 
 inline error_t
 Graph::build_plan_at_index(int64_t plan_index) {
+    CHECK_CUDNN_FRONTEND_ERROR(reject_if_from_artifact("build_plan_at_index()"));
     CHECK_CUDNN_FRONTEND_ERROR(plans.build_plan_at_index(plan_index));
     return {error_code_t::OK, ""};
 }
 
 inline error_t
 Graph::build_plans(BuildPlanPolicy_t const policy, bool const do_multithreaded_builds) {
+    CHECK_CUDNN_FRONTEND_ERROR(reject_if_from_artifact("build_plans()"));
 #ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
     CUDNN_FE_LOG_BANNER("  BUILD PLANS  for policy " << nlohmann::json(policy).dump() << "  ");
 #else
