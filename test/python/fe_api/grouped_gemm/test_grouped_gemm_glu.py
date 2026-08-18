@@ -1349,16 +1349,17 @@ def _test_grouped_gemm_glu_discrete_wrapper(
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 @pytest.mark.parametrize(
-    ("ab_dtype", "d_dtype"),
+    ("ab_dtype", "d_dtype", "sf_dtype", "sf_vec_size"),
     [
-        (torch.float4_e2m1fn_x2, torch.bfloat16),
-        (torch.float8_e4m3fn, torch.float8_e4m3fn),
+        (torch.float4_e2m1fn_x2, torch.bfloat16, torch.float8_e8m0fnu, 32),
+        (torch.float8_e4m3fn, torch.float8_e4m3fn, torch.float8_e8m0fnu, 32),
+        (torch.float4_e2m1fn_x2, torch.bfloat16, torch.float8_e4m3fn, 16),
     ],
-    ids=["mxfp4", "mxfp8"],
+    ids=["mxfp4", "mxfp8", "nvfp4"],
 )
 @pytest.mark.parametrize(("situ_beta1", "situ_beta2"), [(4.0, 25.0), (2.0, 8.0)])
-def test_grouped_gemm_glu_discrete_wrapper_situglu(ab_dtype, d_dtype, situ_beta1, situ_beta2, request):
-    """Exercise SiTU-GLU with the inherited MXFP4 and MXFP8 layouts."""
+def test_grouped_gemm_glu_discrete_wrapper_situglu(ab_dtype, d_dtype, sf_dtype, sf_vec_size, situ_beta1, situ_beta2, request):
+    """Exercise SiTU-GLU with the inherited MXFP4, MXFP8, and NVFP4 layouts."""
 
     _test_grouped_gemm_glu_discrete_wrapper(
         ab_dtype=ab_dtype,
@@ -1368,8 +1369,8 @@ def test_grouped_gemm_glu_discrete_wrapper_situglu(ab_dtype, d_dtype, situ_beta1
         acc_dtype=torch.float32,
         mma_tiler_mn=(256, 256),
         cluster_shape_mn=(2, 1),
-        sf_vec_size=32,
-        sf_dtype=torch.float8_e8m0fnu,
+        sf_vec_size=sf_vec_size,
+        sf_dtype=sf_dtype,
         vector_f32=False,
         discrete_col_sfd=False,
         act_func="situglu",
