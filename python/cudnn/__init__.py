@@ -304,6 +304,7 @@ __all__ = [*_EAGER_PUBLIC_NAMES, "Graph", "wrapper"]
 _OPTIONAL_DEPENDENCY_INSTALL_HINT = "Install with 'pip install nvidia-cudnn-frontend[cutedsl]'"
 
 _LAZY_OPTIONAL_IMPORTS = {
+    "gnn": (".gnn", None),
     "BSA": (".block_sparse_attention", "BSA"),
     "block_sparse_attention_forward": (".block_sparse_attention", "block_sparse_attention_forward"),
     "block_sparse_attention_backward": (".block_sparse_attention", "block_sparse_attention_backward"),

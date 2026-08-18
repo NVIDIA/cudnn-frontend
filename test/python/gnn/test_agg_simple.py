@@ -217,6 +217,8 @@ def test_agg_simple_rejects_invalid_inputs():
         agg_simple_n2n(features, graph, aggr="product")
     with pytest.raises(TypeError, match="indices dtype"):
         agg_simple_n2n(features, CscGraph(offsets, indices.to(torch.int64), num_src_nodes=1))
+    with pytest.raises(ValueError, match="at least one element"):
+        CscGraph(torch.empty(0, device="cuda", dtype=torch.int32), indices, num_src_nodes=1).num_dst_nodes
     with pytest.raises(ValueError, match="zero edges"):
         agg_simple_n2n(
             features,

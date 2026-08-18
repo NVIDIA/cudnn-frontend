@@ -32,6 +32,8 @@ class CscGraph:
     def num_dst_nodes(self) -> int:
         if self.offsets.ndim != 1:
             raise ValueError(f"offsets must be rank 1, got shape {tuple(self.offsets.shape)}")
+        if self.offsets.numel() == 0:
+            raise ValueError("offsets must contain at least one element")
         return self.offsets.numel() - 1
 
     @property

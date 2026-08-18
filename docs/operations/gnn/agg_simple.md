@@ -12,9 +12,9 @@ cache.
 
 ## Mathematical formula
 
-For destination vertex  incoming CSC neighbors (v) node features
- edge features  and optional destination features  the
-operation computes
+For each destination vertex `v`, let `N(v)` be its incoming source vertices,
+`x_u` the node features of source `u`, `e_uv` the features of edge `u -> v`,
+and `c_v` the optional destination features. The operation computes
 
 ```text
 y_v = concat(reduce({x_u | u in N(v)}),
