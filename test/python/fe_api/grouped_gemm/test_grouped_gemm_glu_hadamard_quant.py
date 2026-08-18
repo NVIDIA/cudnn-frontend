@@ -10,7 +10,8 @@ from test_low_precision_matmul import float4_e2m1fn_x2_to_float32
 from test_utils import torch_fork_set_rng
 from fe_api.grouped_gemm.test_discrete_grouped_gemm_swiglu_utils import allocate_discrete_input_tensors
 from fe_api.grouped_gemm.test_grouped_gemm_swiglu_utils import allocate_grouped_gemm_input_tensors, grouped_gemm_swiglu_init
-from fe_api.test_fe_api_utils import DYNAMIC_SHAPES_M_VALUES
+from fe_api.grouped_gemm.test_grouped_gemm_wgrad_utils import _skip_unless_e5m3_supported
+from fe_api.test_fe_api_utils import DYNAMIC_SHAPES_M_VALUES, reencode_sf_tensor_as_ue5m3
 
 FP4_EXECUTION_CASES = [
     (torch.float4_e2m1fn_x2, torch.float8_e4m3fn, 16),
@@ -316,6 +317,12 @@ def _run_wrapper(
         rht_ref = _rht_ref(ref_tensors["d_ref"].cpu(), rht_rowwise)
         rht_norm_const = 2688.0 / rht_ref.float().abs().max().item()
 
+    if sf_fp8_dtype_override == "e5m3":
+        # Rewrite the scale bytes as UE5M3 in place; values are exact in both
+        # formats so the fp32 reference stays valid.
+        reencode_sf_tensor_as_ue5m3(inputs["sfa_tensor"])
+        reencode_sf_tensor_as_ue5m3(inputs["sfb_tensor"])
+
     from cudnn import grouped_gemm_glu_hadamard_quant_wrapper_sm100
 
     outputs = grouped_gemm_glu_hadamard_quant_wrapper_sm100(
@@ -376,6 +383,12 @@ def _run_compile_execute(request, *, ab_dtype, sf_dtype, sf_vec_size, act_func="
         b_major=cfg["b_major"],
         enable_bias=False,
     )
+
+    if sf_fp8_dtype_override == "e5m3":
+        # Rewrite the scale bytes as UE5M3 in place; values are exact in both
+        # formats so the fp32 reference stays valid.
+        reencode_sf_tensor_as_ue5m3(inputs["sfa_tensor"])
+        reencode_sf_tensor_as_ue5m3(inputs["sfb_tensor"])
 
     valid_m = inputs["valid_m"]
     n = cfg["n"]
@@ -596,6 +609,146 @@ def test_grouped_gemm_glu_hadamard_quant_wrapper_quant_full(request):
         d_dtype=torch.float4_e2m1fn_x2,
         rht_dtype=torch.float4_e2m1fn_x2,
     )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+@pytest.mark.parametrize("rht_rowwise", [False, True], ids=["colwise", "rowwise"])
+def test_grouped_gemm_glu_hadamard_quant_wrapper_quant_rht_e5m3(request, rht_rowwise):
+    """quant_rht with the input block scales carried as UE5M3 bytes in e4m3 storage."""
+    _skip_unless_e5m3_supported()
+    _run_wrapper(
+        request,
+        ab_dtype=torch.float4_e2m1fn_x2,
+        sf_dtype=torch.float8_e4m3fn,
+        sf_vec_size=16,
+        rht_dtype=torch.float4_e2m1fn_x2,
+        rht_rowwise=rht_rowwise,
+        sf_fp8_dtype_override="e5m3",
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_grouped_gemm_glu_hadamard_quant_wrapper_quant_full_e5m3(request):
+    """quant_full with the input block scales carried as UE5M3 bytes in e4m3 storage."""
+    _skip_unless_e5m3_supported()
+    _run_wrapper(
+        request,
+        ab_dtype=torch.float4_e2m1fn_x2,
+        sf_dtype=torch.float8_e4m3fn,
+        sf_vec_size=16,
+        d_dtype=torch.float4_e2m1fn_x2,
+        rht_dtype=torch.float4_e2m1fn_x2,
+        sf_fp8_dtype_override="e5m3",
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_grouped_gemm_glu_hadamard_quant_compile_execute_e5m3(request):
+    """Class-API compile/execute path with e5m3-reinterpreted input scales."""
+    _skip_unless_e5m3_supported()
+    _run_compile_execute(
+        request,
+        ab_dtype=torch.float4_e2m1fn_x2,
+        sf_dtype=torch.float8_e4m3fn,
+        sf_vec_size=16,
+        sf_fp8_dtype_override="e5m3",
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_grouped_gemm_glu_hadamard_quant_e5m3_is_not_cached_as_e4m3(request):
+    """sf_fp8_dtype_override must take part in the compile cache key.
+
+    Identical scale-factor bytes decode to different values under E4M3 and
+    UE5M3, so if sf_fp8_dtype_override were omitted from the key the second
+    call would reuse the first kernel and silently return E4M3 results.
+    """
+    _skip_unless_e5m3_supported()
+
+    # One problem, one set of scale-factor bytes, two interpretations. Any
+    # difference in the output can only come from sf_fp8_dtype_override.
+    cfg = _make_cfg(request, ab_dtype=torch.float4_e2m1fn_x2, sf_dtype=torch.float8_e4m3fn, sf_vec_size=16)
+    inputs = allocate_grouped_gemm_input_tensors(
+        n=cfg["n"],
+        k=cfg["k"],
+        l=cfg["l"],
+        group_m_list=cfg["group_m_list"],
+        ab_dtype=cfg["ab_dtype"],
+        sf_dtype=cfg["sf_dtype"],
+        sf_vec_size=cfg["sf_vec_size"],
+        m_aligned=cfg["m_aligned"],
+        b_major=cfg["b_major"],
+        enable_bias=False,
+    )
+
+    from cudnn import grouped_gemm_glu_hadamard_quant_wrapper_sm100
+
+    def run(sf_fp8_dtype_override):
+        outputs = grouped_gemm_glu_hadamard_quant_wrapper_sm100(
+            a_tensor=inputs["a_tensor"],
+            b_tensor=inputs["b_tensor"],
+            sfa_tensor=inputs["sfa_tensor"],
+            sfb_tensor=inputs["sfb_tensor"],
+            padded_offsets=inputs["padded_offsets_tensor"],
+            alpha_tensor=inputs["alpha_tensor"],
+            prob_tensor=inputs["prob_tensor"],
+            bias_tensor=inputs["bias_tensor"],
+            acc_dtype=cfg["acc_dtype"],
+            c_dtype=cfg["c_dtype"],
+            d_dtype=torch.bfloat16,
+            cd_major=cfg["cd_major"],
+            rht_output=True,
+            rht_dtype=torch.bfloat16,
+            rht_rowwise=False,
+            mma_tiler_mn=cfg["mma_tiler_mn"],
+            cluster_shape_mn=cfg["cluster_shape_mn"],
+            sf_vec_size=cfg["sf_vec_size"],
+            sf_fp8_dtype_override=sf_fp8_dtype_override,
+            vector_f32=cfg["vector_f32"],
+            m_aligned=cfg["m_aligned"],
+            act_func="swiglu",
+        )
+        return outputs["d_tensor"].float().clone()
+
+    d_e4m3 = run(None)
+    d_e5m3 = run("e5m3")
+
+    assert not torch.equal(
+        d_e5m3, d_e4m3
+    ), "e5m3 and e4m3 produced identical output from identical scale-factor bytes; sf_fp8_dtype_override is likely missing from the compile cache key"
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+@pytest.mark.parametrize(
+    "sf_fp8_dtype_override,overrides,expected",
+    [
+        pytest.param(
+            "e5m3",
+            dict(sf_dtype=torch.float8_e8m0fnu),
+            "requires torch.float8_e4m3fn scale-factor storage",
+            id="e8m0_carrier",
+        ),
+        pytest.param("e4m3", {}, "sf_fp8_dtype_override must be", id="e4m3_is_not_an_override"),
+        pytest.param("e5m2", {}, "sf_fp8_dtype_override must be", id="unknown_format"),
+    ],
+)
+def test_grouped_gemm_glu_hadamard_quant_rejects_unsupported_sf_fp8_dtype(request, sf_fp8_dtype_override, overrides, expected):
+    """e5m3 is only reachable through the FP4xFP4 atom with e4m3-carried scales."""
+    if sf_fp8_dtype_override == "e5m3":
+        _skip_unless_e5m3_supported()
+    with pytest.raises(ValueError, match=expected):
+        _run_compile_execute(
+            request,
+            ab_dtype=torch.float4_e2m1fn_x2,
+            sf_dtype=overrides.get("sf_dtype", torch.float8_e4m3fn),
+            sf_vec_size=overrides.get("sf_vec_size", 16),
+            sf_fp8_dtype_override=sf_fp8_dtype_override,
+        )
 
 
 @pytest.mark.L0
