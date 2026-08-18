@@ -139,7 +139,7 @@ from cudnn.sdpa.fwd.kernels._common_sm100 import (
     KvLoopBounds,
     make_classic_bars,
     compute_kv_loop_bounds,
-    decode_linear_tile_lpt,
+    lpt_tile_coords,
     make_sdpa_helpers,
 )
 
@@ -374,6 +374,7 @@ def _kernel(
             n_batch=n_batch,
             leader_cta_id=leader_cta_id,
             cta_in_pair=cta_in_pair,
+            qh_per_kh=qh_per_kh,
         )
 
     elif warp_idx >= CFG.SOFTMAX_WG1_BASE and warp_idx < CFG.SOFTMAX_WG1_BASE + CFG.SOFTMAX_WG_WARPS:
@@ -393,6 +394,7 @@ def _kernel(
             n_batch=n_batch,
             leader_cta_id=leader_cta_id,
             cta_in_pair=cta_in_pair,
+            qh_per_kh=qh_per_kh,
         )
 
     elif warp_idx >= CFG.CORR_WARP_BASE and warp_idx < CFG.CORR_WARP_BASE + CFG.CORRECTION_WARPS:
@@ -416,6 +418,7 @@ def _kernel(
             cta_id_x=cta_id_x,
             o_scale_fused=o_scale_fused,
             amax_o_tensor=amax_o_tensor,
+            qh_per_kh=qh_per_kh,
         )
 
     # cga2 non-leader runs quiet body (alloc+dealloc only); cga1 folds to full path.
@@ -438,6 +441,7 @@ def _kernel(
                     n_batch=n_batch,
                     mcast_mask=mcast_mask,
                     cta_in_pair=cta_in_pair,
+                    qh_per_kh=qh_per_kh,
                 )
             else:
                 _mma_warp_quiet(tmem_ptr_i32, bars)
@@ -457,6 +461,7 @@ def _kernel(
                 n_batch=n_batch,
                 mcast_mask=mcast_mask,
                 cta_in_pair=cta_in_pair,
+                qh_per_kh=qh_per_kh,
             )
 
     elif warp_idx == CFG.TMALDG_WARP_ID:
@@ -498,6 +503,8 @@ def _kernel(
             n_batch=n_batch,
             cta_in_pair=cta_in_pair,
             seq_kv_lens_tensor=seq_kv_lens_tensor,
+            qh_per_kh=qh_per_kh,
+            seqlen_kv=seqlen_kv,
         )
 
     else:  # warp_idx == CFG.SCHED_WARP_ID
@@ -553,6 +560,8 @@ def _tmaldg_warp_group(
         n_qh,
         n_batch,
         seq_kv_lens_tensor,
+        qh_per_kh,
+        seqlen_kv,
     )
     # GQA: K/V are indexed by kv-head.
     kv_head_idx = cute.arch.make_warp_uniform(head_idx // qh_per_kh)
@@ -686,6 +695,8 @@ def _tmaldg_warp_group(
             n_qh,
             n_batch,
             seq_kv_lens_tensor,
+            qh_per_kh,
+            seqlen_kv,
         )
         kv_head_idx = cute.arch.make_warp_uniform(head_idx // qh_per_kh)
         # q_row_base after decode drives ptxas R2UR (keeps nxt_q live before back-edge).
@@ -726,6 +737,8 @@ def _tmastg_warp_group(
     n_batch,
     cta_in_pair,
     seq_kv_lens_tensor,
+    seqlen_kv,
+    qh_per_kh,
 ):
     """Persistent O-store warp; tiles claimed via scheduler's try_cancel.async."""
     o_full_phase = cutlass.Int32(0)
@@ -741,6 +754,8 @@ def _tmastg_warp_group(
         n_qh,
         n_batch,
         seq_kv_lens_tensor,
+        qh_per_kh,
+        seqlen_kv,
     )
     is_valid_tile = cutlass.Int32(1)
     sched_state = PipelineState.start()
@@ -778,6 +793,8 @@ def _tmastg_warp_group(
             n_qh,
             n_batch,
             seq_kv_lens_tensor,
+            qh_per_kh,
+            seqlen_kv,
         )
         is_valid_tile = nxt_v & cutlass.Int32(1)
         sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
@@ -843,6 +860,7 @@ def _mma_warp_group(
     n_batch,
     mcast_mask,
     cta_in_pair,
+    qh_per_kh,
 ):
     """Unified MMA warp (cga1 / cga2-leader; MASK_NONE/PADDED/CAUSAL/SWA).
 
@@ -915,6 +933,8 @@ def _mma_warp_group(
             n_qh,
             n_batch,
             seq_kv_lens_tensor,
+            qh_per_kh,
+            seqlen_kv,
         )
         eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
         eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch)
@@ -1110,6 +1130,8 @@ def _mma_warp_group(
                 n_qh,
                 n_batch,
                 seq_kv_lens_tensor,
+                qh_per_kh,
+                seqlen_kv,
             )
             is_valid_tile = nxt_v & cutlass.Int32(1)
             eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
@@ -1312,6 +1334,7 @@ def _softmax_warp_group(
     n_batch,
     leader_cta_id,
     cta_in_pair,
+    qh_per_kh,
 ):
     """Softmax warp group: online softmax per kv iter, one lane per S_acc row.
 
@@ -1353,6 +1376,8 @@ def _softmax_warp_group(
         n_qh,
         n_batch,
         seq_kv_lens_tensor,
+        qh_per_kh,
+        seqlen_kv,
     )
     is_valid_tile = cutlass.Int32(1)
     sched_state = PipelineState.start()
@@ -1485,6 +1510,8 @@ def _softmax_warp_group(
             n_qh,
             n_batch,
             seq_kv_lens_tensor,
+            qh_per_kh,
+            seqlen_kv,
         )
         is_valid_tile = nxt_v & cutlass.Int32(1)
         sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
@@ -1513,6 +1540,7 @@ def _correction_warp_group(
     cta_id_x,
     o_scale_fused,
     amax_o_tensor,
+    qh_per_kh,
 ):
     """Correction warp group: 4 warps × 32 lanes = 128, one lane per O row.
 
@@ -1552,6 +1580,8 @@ def _correction_warp_group(
         n_qh,
         n_batch,
         seq_kv_lens_tensor,
+        qh_per_kh,
+        seqlen_kv,
     )
     is_valid_tile = cutlass.Int32(1)
     sched_state = PipelineState.start()
@@ -1793,6 +1823,8 @@ def _correction_warp_group(
             n_qh,
             n_batch,
             seq_kv_lens_tensor,
+            qh_per_kh,
+            seqlen_kv,
         )
         is_valid_tile = nxt_v & cutlass.Int32(1)
         sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)

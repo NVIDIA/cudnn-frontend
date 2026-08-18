@@ -526,6 +526,7 @@ def _kernel(
             cta_in_pair=cta_in_pair,
             cta_id_x=cta_id_x,
             cross_sg_peer=cross_sg_peer,
+            qh_per_kh=qh_per_kh,
         )
 
     elif warp_idx == cutlass.Int32(CFG.MMA_WARP_ID):
@@ -552,6 +553,7 @@ def _kernel(
                 sg0_mcast_mask=sg0_mcast_mask,
                 cta_in_pair=cta_in_pair,
                 leader_cta_id=leader_cta_id,
+                qh_per_kh=qh_per_kh,
             )
         else:
             _mma_warp_non_leader(
@@ -571,6 +573,7 @@ def _kernel(
                 mcast_mask=mcast_mask,
                 cta_in_pair=cta_in_pair,
                 leader_cta_id=leader_cta_id,
+                qh_per_kh=qh_per_kh,
             )
 
     elif warp_idx == cutlass.Int32(CFG.TMALDG_WARP_ID):
@@ -616,6 +619,8 @@ def _kernel(
             cta_in_pair=cta_in_pair,
             seq_kv_lens_tensor=seq_kv_lens_tensor,
             o_desc_words=o_desc_words,
+            qh_per_kh=qh_per_kh,
+            seqlen_kv=seqlen_kv,
         )
 
     else:
@@ -792,6 +797,7 @@ def _compute_warp_group(
     cta_in_pair,
     cta_id_x,
     cross_sg_peer,
+    qh_per_kh,
 ):
     nvvm.barrier_cta_sync(barrier_id=1, thread_count=32 * (CFG.SOFTMAX_WG_WARPS + 1))
     tmem_base_addr = tmem_ptr_i32.load()
@@ -810,6 +816,8 @@ def _compute_warp_group(
         n_qh,
         n_batch,
         seq_kv_lens_tensor,
+        qh_per_kh,
+        seqlen_kv,
     )
     is_valid_tile = cutlass.Int32(1)
     sched_state = PipelineState.start()
@@ -1185,6 +1193,8 @@ def _compute_warp_group(
             n_qh,
             n_batch,
             seq_kv_lens_tensor,
+            qh_per_kh,
+            seqlen_kv,
         )
         is_valid_tile = nxt_v & cutlass.Int32(1)
         sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
@@ -1235,6 +1245,7 @@ def _mma_warp_group(
     sg0_mcast_mask,
     cta_in_pair,
     leader_cta_id,
+    qh_per_kh,
 ):
     tmem_alloc(tmem_ptr_i32, LAYOUT.TOTAL_COLS, CTA_GROUP_KIND)
     nvvm.barrier_cta_arrive(1, 32 * (CFG.SOFTMAX_WG_WARPS + 1))
@@ -1291,6 +1302,8 @@ def _mma_warp_group(
         n_qh,
         n_batch,
         seq_kv_lens_tensor,
+        qh_per_kh,
+        seqlen_kv,
     )
     is_valid_tile = cutlass.Int32(1)
     sched_state = PipelineState.start()
@@ -1442,6 +1455,8 @@ def _mma_warp_group(
             n_qh,
             n_batch,
             seq_kv_lens_tensor,
+            qh_per_kh,
+            seqlen_kv,
         )
         is_valid_tile = nxt_v & cutlass.Int32(1)
         sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
@@ -1474,6 +1489,7 @@ def _mma_warp_non_leader(
     mcast_mask,
     cta_in_pair,
     leader_cta_id,
+    qh_per_kh,
 ):
     tmem_alloc(tmem_ptr_i32, LAYOUT.TOTAL_COLS, CTA_GROUP_KIND)
     nvvm.barrier_cta_arrive(1, 32 * (CFG.SOFTMAX_WG_WARPS + 1))
@@ -1496,6 +1512,8 @@ def _mma_warp_non_leader(
             n_qh,
             n_batch,
             seq_kv_lens_tensor,
+            qh_per_kh,
+            seqlen_kv,
         )
         is_valid_tile = cutlass.Int32(1)
         sched_state = PipelineState.start()
@@ -1540,6 +1558,8 @@ def _mma_warp_non_leader(
                 n_qh,
                 n_batch,
                 seq_kv_lens_tensor,
+                qh_per_kh,
+                seqlen_kv,
             )
             is_valid_tile = nxt_v & cutlass.Int32(1)
             sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
@@ -1595,6 +1615,8 @@ def _tmaldg_warp_group(
         n_qh,
         n_batch,
         seq_kv_lens_tensor,
+        qh_per_kh,
+        seqlen_kv,
     )
     kv_head_idx = cute.arch.make_warp_uniform(head_idx // qh_per_kh)
     q_row_base = cute.arch.make_warp_uniform(q_super_idx * cutlass.Int32(CFG.TILES_Q * CFG.TILE_M))
@@ -1691,6 +1713,8 @@ def _tmaldg_warp_group(
             n_qh,
             n_batch,
             seq_kv_lens_tensor,
+            qh_per_kh,
+            seqlen_kv,
         )
         kv_head_idx = cute.arch.make_warp_uniform(head_idx // qh_per_kh)
         q_row_base = cute.arch.make_warp_uniform(q_super_idx * cutlass.Int32(CFG.TILES_Q * CFG.TILE_M))
@@ -1730,6 +1754,8 @@ def _tmastg_warp_group(
     cta_in_pair,
     seq_kv_lens_tensor,
     o_desc_words,
+    seqlen_kv,
+    qh_per_kh,
 ):
     o_full_state = PipelineState.start(phase=0)
 
@@ -1744,6 +1770,8 @@ def _tmastg_warp_group(
         n_qh,
         n_batch,
         seq_kv_lens_tensor,
+        qh_per_kh,
+        seqlen_kv,
     )
     is_valid_tile = cutlass.Int32(1)
     sched_state = PipelineState.start()
@@ -1789,6 +1817,8 @@ def _tmastg_warp_group(
             n_qh,
             n_batch,
             seq_kv_lens_tensor,
+            qh_per_kh,
+            seqlen_kv,
         )
         is_valid_tile = nxt_v & cutlass.Int32(1)
         sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)

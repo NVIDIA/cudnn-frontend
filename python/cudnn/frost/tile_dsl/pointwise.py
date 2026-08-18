@@ -34,8 +34,7 @@ def _packed_f32x2(op, vec_a, vec_b):
 
 def tmem_load_max_reduction(tmem_addr, num: cutlass.Constexpr = 64):
     """tcgen05.ld.red.sync.aligned.32x32b.x{num}.f32.max — fused TMEM
-    load + HW row-max reduction (LDTM.STAT).  Mirrors C++ templated
-    ``tile::tmem_load_max_reduction<N>``.  ``num`` is the elements-per-
+    load + HW row-max reduction (LDTM.STAT).  ``num`` is the elements-per-
     thread count (= TILE_N/2 for the current dual-MMA softmax path).
     """
     _data_ops = ", ".join("{$w%d}" % i for i in range(num))

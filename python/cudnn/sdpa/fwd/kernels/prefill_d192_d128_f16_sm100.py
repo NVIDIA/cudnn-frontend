@@ -483,6 +483,7 @@ def _kernel(
             n_batch=n_batch,
             leader_cta_id=leader_cta_id,
             cta_in_pair=cta_in_pair,
+            qh_per_kh=qh_per_kh,
         )
 
     elif warp_idx >= CFG.SOFTMAX_WG1_BASE and warp_idx < CFG.SOFTMAX_WG1_BASE + CFG.SOFTMAX_WG_WARPS:
@@ -503,6 +504,7 @@ def _kernel(
             n_batch=n_batch,
             leader_cta_id=leader_cta_id,
             cta_in_pair=cta_in_pair,
+            qh_per_kh=qh_per_kh,
         )
 
     elif warp_idx >= CFG.CORR_WARP_BASE and warp_idx < CFG.CORR_WARP_BASE + CFG.CORRECTION_WARPS:
@@ -525,6 +527,7 @@ def _kernel(
             leader_cta_id=leader_cta_id,
             cta_in_pair=cta_in_pair,
             cta_id_x=cta_id_x,
+            qh_per_kh=qh_per_kh,
         )
 
     elif warp_idx == CFG.MMA_WARP_ID:
@@ -548,6 +551,7 @@ def _kernel(
                     n_batch=n_batch,
                     mcast_mask=mcast_mask,
                     cta_in_pair=cta_in_pair,
+                    qh_per_kh=qh_per_kh,
                 )
             else:
                 _mma_warp_quiet(tmem_ptr_i32, bars)
@@ -568,6 +572,7 @@ def _kernel(
                 n_batch=n_batch,
                 mcast_mask=mcast_mask,
                 cta_in_pair=cta_in_pair,
+                qh_per_kh=qh_per_kh,
             )
 
     elif warp_idx == CFG.TMALDG_WARP_ID:
@@ -610,6 +615,8 @@ def _kernel(
             cta_in_pair=cta_in_pair,
             seq_kv_lens_tensor=seq_kv_lens_tensor,
             o_desc_words=o_desc_words,
+            qh_per_kh=qh_per_kh,
+            seqlen_kv=seqlen_kv,
         )
 
     else:  # warp_idx == CFG.SCHED_WARP_ID
@@ -673,6 +680,8 @@ def _tmaldg_warp_group(
         n_qh,
         n_batch,
         seq_kv_lens_tensor,
+        qh_per_kh,
+        seqlen_kv,
     )
     # GQA: K/V are indexed by kv-head, not Q-head.
     kv_head_idx = cute.arch.make_warp_uniform(head_idx // qh_per_kh)
@@ -749,7 +758,6 @@ def _tmaldg_warp_group(
                 # tma_batch==batch_idx) but reads the WRONG packed location for
                 # THD batch>=1 — corrupting the first (diagonal) KV tile and, via
                 # the online-softmax running max/sum, the whole batch>=1 output.
-                # (Ported from VibeTile 7ac72cb "fix THD".)
                 tma_k(cutlass.Int32(0), kv_head_idx, kv_row_base + K_ROW_OFFSET_PEER + kv_seq_off, tma_batch),
                 bars.mb_k_full[kv_state.idx].smem_ptr,
                 cta_group=CFG.CTA_MMA,
@@ -830,6 +838,8 @@ def _tmaldg_warp_group(
             n_qh,
             n_batch,
             seq_kv_lens_tensor,
+            qh_per_kh,
+            seqlen_kv,
         )
         kv_head_idx = cute.arch.make_warp_uniform(head_idx // qh_per_kh)
         # q_row_base compute right after decode drives ptxas R2UR.
@@ -872,6 +882,8 @@ def _tmastg_warp_group(
     cta_in_pair,
     seq_kv_lens_tensor,
     o_desc_words,
+    seqlen_kv,
+    qh_per_kh,
 ):
     """Persistent O-store warp.  First tile from blockIdx; subsequent tiles
     via scheduler warp's clusterlaunchcontrol.try_cancel.async.
@@ -892,6 +904,8 @@ def _tmastg_warp_group(
         n_qh,
         n_batch,
         seq_kv_lens_tensor,
+        qh_per_kh,
+        seqlen_kv,
     )
     is_valid_tile = cutlass.Int32(1)
     sched_state = PipelineState.start()
@@ -957,6 +971,8 @@ def _tmastg_warp_group(
             n_qh,
             n_batch,
             seq_kv_lens_tensor,
+            qh_per_kh,
+            seqlen_kv,
         )
         is_valid_tile = nxt_v & cutlass.Int32(1)
         sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
@@ -1032,6 +1048,7 @@ def _mma_warp_group(
     n_batch,
     mcast_mask,
     cta_in_pair,
+    qh_per_kh,
 ):
     """Unified MMA warp — cga1 / cga2-leader x MASK_NONE / PADDED / CAUSAL / SWA,
     spill-free in CFG.OTHER_REGS (40).  Non-leader under cga2 uses _mma_warp_quiet.
@@ -1102,6 +1119,8 @@ def _mma_warp_group(
             n_qh,
             n_batch,
             seq_kv_lens_tensor,
+            qh_per_kh,
+            seqlen_kv,
         )
         eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
         eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch)
@@ -1303,6 +1322,8 @@ def _mma_warp_group(
                 n_qh,
                 n_batch,
                 seq_kv_lens_tensor,
+                qh_per_kh,
+                seqlen_kv,
             )
             is_valid_tile = nxt_v & cutlass.Int32(1)
             eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
@@ -1563,6 +1584,7 @@ def _softmax_warp_group(
     n_batch,
     leader_cta_id,
     cta_in_pair,
+    qh_per_kh,
 ):
     """Softmax warp group (one of two): online softmax per kv iter.
 
@@ -1604,6 +1626,8 @@ def _softmax_warp_group(
         n_qh,
         n_batch,
         seq_kv_lens_tensor,
+        qh_per_kh,
+        seqlen_kv,
     )
     is_valid_tile = cutlass.Int32(1)
     sched_state = PipelineState.start()
@@ -1739,6 +1763,8 @@ def _softmax_warp_group(
             n_qh,
             n_batch,
             seq_kv_lens_tensor,
+            qh_per_kh,
+            seqlen_kv,
         )
         is_valid_tile = nxt_v & cutlass.Int32(1)
         sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
@@ -1766,6 +1792,7 @@ def _correction_warp_group(
     leader_cta_id,
     cta_in_pair,
     cta_id_x,
+    qh_per_kh,
 ):
     """Correction warp group: 4 warps x 32 lanes = 128 lanes, 1 lane per O row.
 
@@ -1806,6 +1833,8 @@ def _correction_warp_group(
         n_qh,
         n_batch,
         seq_kv_lens_tensor,
+        qh_per_kh,
+        seqlen_kv,
     )
     is_valid_tile = cutlass.Int32(1)
     sched_state = PipelineState.start()
@@ -2029,6 +2058,8 @@ def _correction_warp_group(
             n_qh,
             n_batch,
             seq_kv_lens_tensor,
+            qh_per_kh,
+            seqlen_kv,
         )
         is_valid_tile = nxt_v & cutlass.Int32(1)
         sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)

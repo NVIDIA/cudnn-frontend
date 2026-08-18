@@ -25,6 +25,7 @@ from cudnn.frost.tile_dsl.constants import (
     DTYPE_E5M2,
     DTYPE_FP16,
     SCHED_LPT,
+    SCHED_LPT_L2,
     SCHED_NATURAL,
 )
 from cudnn.sdpa.fwd.config_sm100 import TemplateParams as Sm100TemplateParams
@@ -151,6 +152,19 @@ def _torch_stream_context(current_stream: Optional[cuda.CUstream], device: torch
         launch_stream = torch.cuda.ExternalStream(handle, device=device)
     with torch.cuda.stream(launch_stream):
         yield
+
+
+# Causal-balancing scheduler choice: use the L2-GROUPED LPT when ONE head's K+V
+# working set fits this budget -- that is the condition under which the
+# block-cyclic grouping can actually keep that K/V resident; otherwise plain
+# reverse-row LPT.
+_SCHED_L2_BUDGET_BYTES = 50 * 1024 * 1024
+
+
+def _causal_sched_policy(s_kv: int, d_qk: int, d_v: int, elem_bytes: int) -> int:
+    """SCHED_LPT_L2 vs SCHED_LPT for a causal graph (see _SCHED_L2_BUDGET_BYTES)."""
+    one_head_bytes = int(s_kv) * (int(d_qk) + int(d_v)) * int(elem_bytes)
+    return SCHED_LPT_L2 if _SCHED_L2_BUDGET_BYTES >= one_head_bytes else SCHED_LPT
 
 
 def ws_align(nbytes: int) -> int:
@@ -926,8 +940,17 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         mxfp8 = self._fp8 and not self._pertensor
         fused_ldtm_stat = mxfp8 and (self._device_cc == (10, 3))
         sched_policy = self.sched_policy
-        if mxfp8 and sched_policy == SCHED_NATURAL and self.window_right is not None:
-            sched_policy = SCHED_LPT
+        if sched_policy == SCHED_NATURAL and self.window_right is not None:
+            # Causal: balance the triangular load; pick the LPT variant by working set.
+            _, _, s_kv_sched, _ = self.k_desc.shape
+            _, _, _, d_qk_sched = self.q_desc.shape
+            _, _, _, d_v_sched = self.v_desc.shape
+            sched_policy = _causal_sched_policy(
+                s_kv=s_kv_sched,
+                d_qk=d_qk_sched,
+                d_v=d_v_sched,
+                elem_bytes=1 if self._fp8 else 2,
+            )
         params = Sm100TemplateParams(
             dtype_qkv=_SM100_DTYPE_QKV_CODE[self.dtype],
             dtype_o=_SM100_DTYPE_QKV_CODE[self.dtype_o],
@@ -1870,10 +1893,6 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             "cu_seq_len_* is THD-only (the dense kernels have no CU read mode yet)",
         )
         self._value_error_if(
-            self.sched_policy is not None and self.sched_policy != SCHED_NATURAL,
-            f"SM120 DSL SDPA only supports sched_policy={SCHED_NATURAL}",
-        )
-        self._value_error_if(
             self.cga is not None and self.cga != 1,
             "SM120 DSL SDPA only supports cga=1",
         )
@@ -2076,9 +2095,22 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         if self._compiled_kernel is not None:
             return
 
+        # Causal: balance the triangular load; pick the LPT variant by working set.
+        sched_policy = self.sched_policy
+        if sched_policy == SCHED_NATURAL and self.window_right is not None:
+            _, _, s_kv_sched, _ = self.k_desc.shape
+            _, _, _, d_qk_sched = self.q_desc.shape
+            _, _, _, d_v_sched = self.v_desc.shape
+            sched_policy = _causal_sched_policy(
+                s_kv=s_kv_sched,
+                d_qk=d_qk_sched,
+                d_v=d_v_sched,
+                elem_bytes=1 if self._fp8 else 2,
+            )
         params = Sm120TemplateParams(
             dtype_qkv=_SM120_DTYPE_QKV_CODE[self.dtype],
             dtype_o=_SM120_DTYPE_QKV_CODE[self.o_desc.dtype],
+            sched_policy=sched_policy,
             window_left=self.window_left,
             window_right=self.window_right,
             bottom_right=self.causal_bottom_right,

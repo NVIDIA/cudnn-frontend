@@ -65,6 +65,12 @@ from cutlass.experimental import primitives as prims
 from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3, DTYPE_E5M2, DTYPE_FP16
 from cudnn.frost.tile_dsl.mma import mma_m16n8k32_f32
 from cudnn.frost.tile_dsl.pointwise import fp32_to_fp8x2, pack_fp8x2_pairs
+from cudnn.frost.tile_dsl.scheduler import (
+    SCHED_LPT_L2,
+    SCHED_NATURAL,
+    lpt_tile_coords,
+    lpt_l2_tile_coords,
+)
 from cudnn.frost.tile_dsl.swizzle import swizzle_xor
 from cudnn.sdpa.fwd.kernels.thd_sm100 import build_thd_meta_kernel as _build_thd_meta_kernel
 from cudnn.sdpa.fwd.config_sm120 import (
@@ -155,6 +161,10 @@ def pack_to_i32(
     return vals.bitcast(cutlass.Int32)[0]
 
 
+# L2 working-set budget used by the LPT_L2 group sizing.
+_SCHED_L2_BUDGET_BYTES = 50 * 1024 * 1024
+
+
 def ceil_div(a: int, b: int) -> int:
     """Return the ceiling division of a by b."""
     return (a + b - 1) // b
@@ -209,6 +219,7 @@ class SM120FusedMultiHeadAttentionForward:
         in_dtype: Type[cutlass.Numeric] = cutlass.Float8E4M3FN,
         out_dtype: Type[cutlass.Numeric] = cutlass.Float16,
         is_causal: bool = False,
+        sched_policy: int = SCHED_NATURAL,
         bottom_right: bool = False,
         window_size_left: int | None = None,
         window_size_right: int | None = None,
@@ -274,6 +285,7 @@ class SM120FusedMultiHeadAttentionForward:
         self.in_dtype = in_dtype
         self.out_dtype = out_dtype
         self.is_causal = is_causal
+        self.sched_policy = sched_policy
         self.bottom_right = bottom_right
         self.window_size_left = window_size_left
         # The band only TRANSLATES the diagonal (frontier width is
@@ -929,6 +941,7 @@ class SM120FusedMultiHeadAttentionForward:
         softmax_scale_log2: cutlass.Float32,
         o_scale_fused: cutlass.Float32,
         scale_s: cutlass.Float32,
+        n_q_tiles: cutlass.Int32,
     ) -> None:
         """SM120 per-tensor FP8 FMHA prefill kernel.
 
@@ -959,7 +972,26 @@ class SM120FusedMultiHeadAttentionForward:
         """
         tidx, _, _ = cute.arch.thread_idx()
         q_tile_idx, batch_idx, head_idx = cute.arch.block_idx()
-        if cutlass.const_expr(self.is_causal):
+        if cutlass.const_expr(self.sched_policy != SCHED_NATURAL):
+            _n_qh = cutlass.Int32(q.shape[2])
+            _n_batch = cutlass.Int32(self.thd_batch if cutlass.const_expr(self.thd_varlen) else q.shape[0])
+            # Host-computed (see __call__): the grid is sized from the same
+            # value, so the decode cannot disagree with the launch geometry.
+            _q_tiles = n_q_tiles
+            if cutlass.const_expr(self.sched_policy == SCHED_LPT_L2):
+                q_tile_idx, head_idx, batch_idx = lpt_l2_tile_coords(
+                    q_tile_idx,
+                    _n_qh,
+                    _n_batch,
+                    _q_tiles,
+                    _n_qh // cutlass.Int32(k.shape[2]),
+                    cutlass.Int32(k.shape[1]),
+                    (self.head_tile_qk + self.head_tile_v) * self.in_dtype.width // 8,
+                    _SCHED_L2_BUDGET_BYTES,
+                )
+            else:
+                q_tile_idx, head_idx, batch_idx = lpt_tile_coords(q_tile_idx, _n_qh, _n_batch, _q_tiles)
+        elif cutlass.const_expr(self.is_causal):
             # Causal work grows with the Q tile. Launch long tiles first to
             # avoid leaving a few expensive CTAs in the final scheduler waves.
             grid_q, _, _ = cute.arch.grid_dim()
@@ -1631,6 +1663,20 @@ class SM120FusedMultiHeadAttentionForward:
                 thd_lens_form,
                 cutlass.Int32(self.thd_batch),
             ).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
+        # Grid geometry. THD: ceil(max_seq_q / q_tile) tiles per sequence over the
+        # REAL batch count (the packed view's batch mode is 1); tiles past a shorter
+        # sequence's length drain without work. NOTE thd_max_sq is a __call__
+        # argument in this base, not a member.
+        n_q_tiles = ceil_div(thd_max_sq, self.q_tile) if cutlass.const_expr(self.thd_varlen) else ceil_div(q.shape[1], self.q_tile)
+        n_batch = self.thd_batch if cutlass.const_expr(self.thd_varlen) else q.shape[0]
+        n_head = q.shape[2]
+        # LPT / LPT_L2 flatten the 3-D grid so the decode can order the whole tile
+        # set globally (heaviest causal rows first); NATURAL keeps the zero-overhead
+        # 3-D grid. The kernel receives n_q_tiles so its decode uses the same value.
+        if cutlass.const_expr(self.sched_policy != SCHED_NATURAL):
+            grid = (n_q_tiles * n_batch * n_head, 1, 1)
+        else:
+            grid = (n_q_tiles, n_batch, n_head)
         self.kernel(
             q,
             k,
@@ -1646,15 +1692,9 @@ class SM120FusedMultiHeadAttentionForward:
             softmax_scale_log2,
             o_scale_fused,
             scale_s,
+            cutlass.Int32(n_q_tiles),
         ).launch(
-            # THD: ceil(max_seq_q / q_tile) tiles per sequence over the real
-            # batch count (the packed view's batch mode is 1); tiles past a
-            # shorter sequence's length drain without work.
-            grid=(
-                ceil_div(thd_max_sq, cutlass.Int32(self.q_tile)) if cutlass.const_expr(self.thd_varlen) else ceil_div(q.shape[1], self.q_tile),
-                self.thd_batch if cutlass.const_expr(self.thd_varlen) else q.shape[0],
-                q.shape[2],
-            ),
+            grid=grid,
             block=(self.threads_per_cta, 1, 1),
             stream=stream,
             min_blocks_per_mp=1,
@@ -1702,6 +1742,7 @@ def compile(  # noqa: A001
         in_dtype=IN_DTYPE,
         out_dtype=OUT_DTYPE,
         is_causal=PARAMS.window_right is not None,
+        sched_policy=PARAMS.sched_policy,
         bottom_right=PARAMS.bottom_right,
         window_size_left=PARAMS.window_left,
         window_size_right=PARAMS.window_right,
