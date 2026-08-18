@@ -521,6 +521,75 @@ causal_conv1d_backward(cudaStream_t stream,
 }
 #endif
 
+#if defined(CUDNN_FRONTEND_HAS_GNN_AGG_SIMPLE)
+inline bool
+is_gnn_agg_simple_available() {
+#if defined(NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING)
+    return get_symbol("cudnnGnnAggSimpleForward") != nullptr && get_symbol("cudnnGnnAggSimpleBackward") != nullptr;
+#else
+    return true;
+#endif
+}
+
+inline cudnnStatus_t
+gnn_agg_simple_forward(cudaStream_t stream,
+                       const cudnnGnnCscGraph_t *graph,
+                       const void *node_features,
+                       const void *edge_features,
+                       const void *concat_features,
+                       void *output,
+                       void *out_positions,
+                       int node_feat_dim,
+                       int edge_feat_dim,
+                       int concat_feat_dim,
+                       cudnnDataType_t data_type,
+                       cudnnGnnAggOp_t agg_op) {
+    NV_FE_CALL_TO_BACKEND(gnn_agg_simple_forward,
+                          cudnnGnnAggSimpleForward,
+                          stream,
+                          graph,
+                          node_features,
+                          edge_features,
+                          concat_features,
+                          output,
+                          out_positions,
+                          node_feat_dim,
+                          edge_feat_dim,
+                          concat_feat_dim,
+                          data_type,
+                          agg_op);
+}
+
+inline cudnnStatus_t
+gnn_agg_simple_backward(cudaStream_t stream,
+                        const cudnnGnnCscGraph_t *graph,
+                        const void *grad_output,
+                        const void *out_positions,
+                        void *grad_node_features,
+                        void *grad_edge_features,
+                        void *grad_concat_features,
+                        int node_feat_dim,
+                        int edge_feat_dim,
+                        int concat_feat_dim,
+                        cudnnDataType_t data_type,
+                        cudnnGnnAggOp_t agg_op) {
+    NV_FE_CALL_TO_BACKEND(gnn_agg_simple_backward,
+                          cudnnGnnAggSimpleBackward,
+                          stream,
+                          graph,
+                          grad_output,
+                          out_positions,
+                          grad_node_features,
+                          grad_edge_features,
+                          grad_concat_features,
+                          node_feat_dim,
+                          edge_feat_dim,
+                          concat_feat_dim,
+                          data_type,
+                          agg_op);
+}
+#endif
+
 inline size_t
 get_backend_version(void) {
 #if defined NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING

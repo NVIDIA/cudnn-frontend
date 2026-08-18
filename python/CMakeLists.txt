@@ -39,6 +39,28 @@ find_package(Python 3.8 COMPONENTS Interpreter Development.Module REQUIRED)
 # Find cudnn
 include(${PROJECT_SOURCE_DIR}/cmake/cuDNN.cmake)
 
+# The GNN direct-call API is newer than the first cudnn_gnn_ops.h revisions,
+# so probe for the declarations themselves instead of relying on a cuDNN
+# version number or header-presence check.
+include(CheckCXXSourceCompiles)
+set(_CUDNN_FRONTEND_SAVED_TRY_COMPILE_TARGET_TYPE ${CMAKE_TRY_COMPILE_TARGET_TYPE})
+set(_CUDNN_FRONTEND_SAVED_REQUIRED_INCLUDES ${CMAKE_REQUIRED_INCLUDES})
+set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
+set(CMAKE_REQUIRED_INCLUDES ${CUDNN_INCLUDE_DIR} ${CUDAToolkit_INCLUDE_DIRS})
+check_cxx_source_compiles(
+    "#include <cudnn.h>
+     int main() {
+       auto forward = &cudnnGnnAggSimpleForward;
+       auto backward = &cudnnGnnAggSimpleBackward;
+       (void)forward;
+       (void)backward;
+       return 0;
+     }"
+    CUDNN_FRONTEND_HAS_GNN_AGG_SIMPLE
+)
+set(CMAKE_TRY_COMPILE_TARGET_TYPE ${_CUDNN_FRONTEND_SAVED_TRY_COMPILE_TARGET_TYPE})
+set(CMAKE_REQUIRED_INCLUDES ${_CUDNN_FRONTEND_SAVED_REQUIRED_INCLUDES})
+
 option(CUDNN_FRONTEND_FETCH_PYBINDS_IN_CMAKE "Whether cmake build system should fetch pybinds." ON)
 set(PYBIND11_FINDPYTHON ON)
 
@@ -62,6 +84,7 @@ python_add_library(
     
     MODULE
     pycudnn.cpp
+    gnn.cpp
     properties.cpp
 
     pygraph/pygraph.cpp
@@ -90,6 +113,9 @@ target_include_directories(
 )
 
 target_compile_definitions(_compiled_module PRIVATE NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING)
+if(CUDNN_FRONTEND_HAS_GNN_AGG_SIMPLE)
+    target_compile_definitions(_compiled_module PRIVATE CUDNN_FRONTEND_HAS_GNN_AGG_SIMPLE=1)
+endif()
 
 if(CUDNN_FRONTEND_USE_SYSTEM_DLPACK)
     target_link_libraries(

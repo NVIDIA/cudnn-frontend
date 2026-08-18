@@ -44,6 +44,7 @@ symbols_to_import = [
     "moe_grouped_matmul_mode",
     "scalar_type",
     "reshape_mode",
+    "is_gnn_agg_simple_available",
 ]
 
 for symbol_name in symbols_to_import:
@@ -56,6 +57,9 @@ for _optional_symbol in [
     "causal_conv1d_nwh_backward",
     "b2b_causal_conv1d_forward",
     "b2b_causal_conv1d_backward",
+    "gnn_agg_op",
+    "gnn_agg_simple_forward",
+    "gnn_agg_simple_backward",
 ]:
     if hasattr(_pybind_module, _optional_symbol):
         globals()[_optional_symbol] = getattr(_pybind_module, _optional_symbol)
@@ -288,6 +292,9 @@ _EAGER_PUBLIC_NAMES = (
             "causal_conv1d_nwh_backward",
             "b2b_causal_conv1d_forward",
             "b2b_causal_conv1d_backward",
+            "gnn_agg_op",
+            "gnn_agg_simple_forward",
+            "gnn_agg_simple_backward",
         )
         if symbol in globals()
     ),
