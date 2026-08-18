@@ -259,7 +259,7 @@ def _build_fprop_graph(
     cu_t = graph.tensor([N + 1], data_type=cu_dtype, name="cu_seqlens")
     state0_t = None
     if state_dtype is not None:
-        state0_t = graph.tensor([N, HO, K, V], data_type=state_dtype, name="initial_state")
+        state0_t = graph.tensor([N, HO, V, K], data_type=state_dtype, name="initial_state")
     a_log_t = None
     dt_bias_t = None
     if safe_gate:
@@ -443,12 +443,12 @@ def _gdn_fwd(
         variant_pack[t["dt_bias"]] = dt_bias
     final_state = torch.empty(0, dtype=torch.float32, device=device)
     if output_final_state:
-        final_state = torch.empty(N, HO, K, V, dtype=torch.float32, device=device)
+        final_state = torch.empty(N, HO, V, K, dtype=torch.float32, device=device)
         variant_pack[t["fs"]] = final_state
     state_checkpoints = torch.empty(0, dtype=q.dtype, device=device)
     if ckpt > 0:
-        total_checkpoints = max(total // ckpt, 1)
-        state_checkpoints = torch.empty(total_checkpoints, HO, K, V, dtype=q.dtype, device=device)
+        total_checkpoints = max(total // ckpt + N, 1)
+        state_checkpoints = torch.empty(total_checkpoints, HO, V, K, dtype=q.dtype, device=device)
         variant_pack[t["state_checkpoints"]] = state_checkpoints
     graph.execute(variant_pack, workspace=_graph_workspace(graph, device), handle=_get_handle(device))
     return o, final_state, state_checkpoints
@@ -486,10 +486,10 @@ def _gdn_fwd_fake(
     if initial_state is not None and initial_state.shape[0] != N:
         raise ValueError(f"initial_state must carry one state per sequence: got {initial_state.shape[0]} for {N} sequences")
     o = q.new_empty(total, HO, V)
-    final = q.new_empty((N, HO, K, V) if output_final_state else (0,), dtype=torch.float32)
+    final = q.new_empty((N, HO, V, K) if output_final_state else (0,), dtype=torch.float32)
     if checkpoint_every_n_tokens > 0:
-        total_checkpoints = max(total // int(checkpoint_every_n_tokens), 1)
-        state_checkpoints = q.new_empty(total_checkpoints, HO, K, V)
+        total_checkpoints = max(total // int(checkpoint_every_n_tokens) + N, 1)
+        state_checkpoints = q.new_empty(total_checkpoints, HO, V, K)
     else:
         state_checkpoints = q.new_empty(0)
     return o, final, state_checkpoints
@@ -532,13 +532,13 @@ def _build_bprop_graph(
     dO_t = graph.tensor([total, HO, V], data_type=io_dtype, name="dO")
     state0_t = None
     if state_dtype is not None:
-        state0_t = graph.tensor([N, HO, K, V], data_type=state_dtype, name="initial_state")
+        state0_t = graph.tensor([N, HO, V, K], data_type=state_dtype, name="initial_state")
     dfs_t = None
     if dstate_in_dtype is not None:
-        dfs_t = graph.tensor([N, HO, K, V], data_type=dstate_in_dtype, name="d_final_state")
+        dfs_t = graph.tensor([N, HO, V, K], data_type=dstate_in_dtype, name="d_final_state")
     ckpts_t = None
     if ckpt_rows is not None:
-        ckpts_t = graph.tensor([ckpt_rows, HO, K, V], data_type=io_dtype, name="state_checkpoints")
+        ckpts_t = graph.tensor([ckpt_rows, HO, V, K], data_type=io_dtype, name="state_checkpoints")
     a_log_t = None
     dt_bias_t = None
     if safe_gate:
@@ -957,7 +957,7 @@ def gated_delta_net(
         HK = HV for canonical GQA: grouped K/V heads shared across query groups); v: ``[total_tokens, HV, V]``
         g, beta: ``[total_tokens, HO]`` with ``HO = max(H, HV)``;
         cu_seqlens: ``[N+1]`` int32; O and the states live at HO heads
-        (initial_state / final_state: ``[N, HO, K, V]``)
+        (initial_state / final_state: ``[N, HO, V, K]``)
 
     A dense batch of N equal-length sequences is expressed as
     ``cu_seqlens = [0, T, 2T, ...]`` over the flattened tokens.
@@ -989,7 +989,7 @@ def gated_delta_net(
         a_log: ``[HO]`` float32 safe-gate per-head log-amplitude.
         dt_bias: ``[HO]`` float32 safe-gate per-head bias.
         checkpoint_every_n_tokens: if ``> 0``, also return the per-chunk
-            recurrent state series ``state_checkpoints`` (``[total_checkpoints, HO, K, V]`` io dtype,
+            recurrent state series ``state_checkpoints`` (``[total_checkpoints, HO, V, K]`` io dtype,
             one entry per N tokens strictly before each sequence end; the
             FROST engine requires a positive multiple of the kernel chunk size, 64). The series is
             a non-differentiable dump.

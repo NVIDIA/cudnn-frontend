@@ -63,35 +63,6 @@ def opt(t, bufs, dtype_name: str = "float32"):
     return t
 
 
-def ensure_cuda_context(stream=0) -> None:
-    """Bind a driver context to the calling thread when none is bound.
-
-    ``ct.launch`` and the autotuner read the calling thread's context stack,
-    and an autograd backward runs on a worker thread where ``cudaSetDevice``
-    has only moved the runtime's thread-local slot. Prefer the launch stream's
-    context, else retain the device's primary one. Best-effort: a context this
-    cannot establish fails at the launch, with the launch's own diagnostics."""
-    try:
-        from cuda.bindings import driver as drv
-
-        err, cur = drv.cuCtxGetCurrent()
-        if err == drv.CUresult.CUDA_SUCCESS and int(cur) != 0:
-            return
-        if stream:
-            err, sctx = drv.cuStreamGetCtx(stream)
-            if err == drv.CUresult.CUDA_SUCCESS:
-                drv.cuCtxSetCurrent(sctx)
-                return
-        device = current_device_id()
-        if device is None:
-            return
-        err, pctx = drv.cuDevicePrimaryCtxRetain(device)
-        if err == drv.CUresult.CUDA_SUCCESS:
-            drv.cuCtxSetCurrent(pctx)
-    except Exception:  # noqa: BLE001
-        pass
-
-
 # --- Launch tuning --------------------------------------------------------------------------------
 
 

@@ -57,7 +57,7 @@ class GdnCuTilePlan(CompiledPlan):
             ("A", layout.add(total * HV * BT * isz), io, (total, HV, BT)),
             ("w", layout.add(total * HV * K * isz), io, (total, HV, K)),
             ("u", layout.add(total * HV * V * isz), io, (total, HV, V)),
-            ("state_checkpoints", layout.add(NT_bound * HV * K * V * isz), io, (NT_bound, HV, K, V)),
+            ("state_checkpoints", layout.add(NT_bound * HV * K * V * isz), io, (NT_bound, HV, V, K)),
             ("v_new", layout.add(total * HV * V * isz), io, (total, HV, V)),
         ]
         if l2norm:
@@ -71,7 +71,7 @@ class GdnCuTilePlan(CompiledPlan):
             NK = common.cdiv(K, min(max(common.next_power_of_2(K), 16), 64))
             regions += [
                 ("dv", layout.add(total * HV * V * isz), io, (total, HV, V)),
-                ("dstate", layout.add(NT_bound * HV * K * V * isz), io, (NT_bound, HV, K, V)),
+                ("dstate", layout.add(NT_bound * HV * K * V * isz), io, (NT_bound, HV, V, K)),
                 ("dv2", layout.add(total * HV * V * isz), io, (total, HV, V)),
                 ("dg_nk", layout.add(NK * total * HV * 4), f32, (NK, total, HV)),
                 ("dw", layout.add(total * HV * K * isz), io, (total, HV, K)),
@@ -132,7 +132,6 @@ class GdnCuTilePlan(CompiledPlan):
         check_layouts_compact(self.plan_name, self.expect, self.names, views)
         nb = dict(zip(self.names, views))
         stream = ctx.stream if ctx.stream is not None else 0
-        self.common.ensure_cuda_context(stream)
         ws = Workspace.over(variant_pack, self.ws_bytes, self.plan_name)
         region = dict(zip(self.carve_names, ws.carve(self.carve)))
         self.common.build_chunk_table(
@@ -167,6 +166,7 @@ class GdnCuTilePlan(CompiledPlan):
             cu_seqlens=nb["cu_seqlens"],
             chunk_indices=region["chunk_table"],
             bufs=region,
+            state_v_first=True,
             stream=stream,
             **gate,
         )
@@ -186,6 +186,7 @@ class GdnCuTilePlan(CompiledPlan):
             cu_seqlens=nb["cu_seqlens"],
             chunk_indices=region["chunk_table"],
             bufs=region,
+            state_v_first=True,
             stream=stream,
         )
 

@@ -172,8 +172,8 @@ def make_chunk_gated_delta_rule(real_fn):
             return fallback("variant")
         # state_v_first only changes the recurrent-state layout, so it is a no-op
         # for a stateless (training) call; decline only when a state is exchanged.
-        if state_v_first and (initial_state is not None or output_final_state):
-            return fallback("state_v_first")
+        if not state_v_first and (initial_state is not None or output_final_state):
+            return fallback("state_v_first=False")
         if not (q.is_cuda and torch.cuda.get_device_capability(q.device)[0] >= 10):
             return fallback("pre-Blackwell")
         try:

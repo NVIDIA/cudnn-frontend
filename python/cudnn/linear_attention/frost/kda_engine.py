@@ -128,8 +128,7 @@ class CompiledKda:
 
         q, g = node.inputs["q"], node.inputs["g"]
         self.b_t = kernel_mod.CFG.B_T
-        # cuts only for chunk-granular checkpoint cadences, never in batch-invariant mode
-        self.split = self.ckpt in (0, self.b_t) and not self.batch_invariant
+        self.split = self.ckpt % self.b_t == 0 and not self.batch_invariant
         total = q.dim[0]
         HO = g.dim[1]
         B = node.inputs["cu_seqlens"].dim[0] - 1
@@ -310,12 +309,10 @@ class CompiledKdaBwd:
         self.kcache = None
         self.regen_cache = None
         self.plan_name = "KdaFrostEngine (KDA_BWD)"
-        from .common.downcast import downcast_state
         from .common.gate_bwd import GATE_BWD_BLOCKS, channel_gate_bwd
         from .common.head_reduce import head_group_reduce
         from .common.host import tensormap_workspace_bytes
 
-        self.downcast_state = downcast_state
         self.head_group_reduce = head_group_reduce
         self.channel_gate_bwd = channel_gate_bwd
         scale = node.params.get("scale")
@@ -327,7 +324,6 @@ class CompiledKdaBwd:
         self.gate_lower_bound = float(glb) if glb is not None else bwd_mod.DEFAULT_GATE_LOWER_BOUND
         self.gate_bwd_blocks = GATE_BWD_BLOCKS
         self.has_state_checkpoints = "state_checkpoints" in node.inputs
-        self.has_state0 = "initial_state" in node.inputs
         self.has_dstate0 = "d_initial_state" in node.outputs
 
         q, g, v = node.inputs["q"], node.inputs["g"], node.inputs["v"]
@@ -359,7 +355,6 @@ class CompiledKdaBwd:
             self.off_item_scratch = layout.add(self.work_item_rows * WORK_ITEM_FIELDS * 4)
             self.chunk_scratch_rows = chunk_scratch_rows(total, B, self.b_t)
             self.off_chunk_scratch = layout.add(self.chunk_scratch_rows * HO * 4)
-        self.off_state0_io = layout.add(B * HO * K * V * 2) if self.has_state0 else None
         if not self.has_state_checkpoints:
             self.state_checkpoints_rows = max(total // self.b_t + B, 1)
             self.off_state_checkpoints = layout.add(self.state_checkpoints_rows * HO * K * V * 2)
@@ -393,10 +388,8 @@ class CompiledKdaBwd:
         if self.split:
             regions.append(("item_scratch", self.off_item_scratch, "int32", (self.work_item_rows, WORK_ITEM_FIELDS)))
             regions.append(("chunk_scratch", self.off_chunk_scratch, "float32", (self.chunk_scratch_rows, HO)))
-        if self.has_state0:
-            regions.append(("state0_io", self.off_state0_io, self.io_name, (B, HO, K, V)))
         if not self.has_state_checkpoints:
-            regions.append(("state_checkpoints", self.off_state_checkpoints, self.io_name, (self.state_checkpoints_rows, HO, K, V)))
+            regions.append(("state_checkpoints", self.off_state_checkpoints, self.io_name, (self.state_checkpoints_rows, HO, V, K)))
             regions.append(("regen_tensormaps", self.off_regen_tensormaps, "int64", (self.regen_tm_bytes // 8,)))
         if self.fold_dq:
             regions.append(("dq_ho", self.off_dq_ho, self.io_name, (total, HO, K)))
@@ -480,10 +473,6 @@ class CompiledKdaBwd:
                     region["sched_all"],
                     stream,
                 )
-            state0_io = None
-            if state0 is not None:
-                state0_io = region["state0_io"]
-                self.downcast_state(state0, state0_io, stream=stream)
             if self.has_state_checkpoints:
                 checkpoint_series = state_checkpoints
             else:
@@ -527,7 +516,6 @@ class CompiledKdaBwd:
                 dg,
                 db,
                 cu,
-                state0_io,
                 dstate0 if self.has_dstate0 else None,
                 dstate_in,
                 work_items,
@@ -575,10 +563,6 @@ class CompiledKdaBwd:
                 stream=stream,
             )
 
-        state0_io = None
-        if state0 is not None:
-            state0_io = region["state0_io"]
-            self.downcast_state(state0, state0_io, stream=stream)
         if self.has_state_checkpoints:
             checkpoint_series = state_checkpoints
         else:
@@ -632,7 +616,7 @@ class CompiledKdaBwd:
             db,
             cu,
             self.scale,
-            initial_state=state0_io,
+            use_initial_state=state0 is not None,
             d_initial_state=dstate0 if self.has_dstate0 else None,
             d_final_state=dstate_in,
             use_qk_l2norm_in_kernel=self.use_qk_l2norm,
