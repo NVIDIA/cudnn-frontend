@@ -49,6 +49,10 @@ class UnsupportedConfigError(RuntimeError):
 # sparsity figure), which at 188 SMs x 2.62 GHz is 1024 BF16 FLOPs/clk/SM.
 # Keys match the strings accepted by the --data_type CLI flag.
 _FLOPS_PER_CLOCK_PER_SM = {
+    # Hopper (sm90): H100 SXM lists 989.5 dense BF16 TFLOPS (FP32 accumulate;
+    # 1979 is the sparsity figure) = 132 SMs x 1.83 GHz x 4096 FLOPs/clk/SM;
+    # FP8 dense is 2x. (No mxfp8 entry: Hopper has no MXFP8 datapath.)
+    9: {"bfloat16": 4096, "float16": 4096, "fp8": 8192},
     10: {"bfloat16": 8192, "float16": 8192, "fp8": 16384, "mxfp8": 16384},
     12: {"bfloat16": 1024, "float16": 1024, "fp8": 2048, "mxfp8": 2048},
 }
