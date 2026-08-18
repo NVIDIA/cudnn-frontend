@@ -23,6 +23,7 @@ from cudnn.sdpa.bwd.config_sm120 import (
     SUPPORTED_HEAD_DIMS as _SM120_SUPPORTED_HEAD_DIMS,
     TemplateParams as Sm120TemplateParams,
     padded_head_dim as _sm120_padded_head_dim,
+    padded_head_dims as _sm120_padded_head_dims,
 )
 from cudnn.sdpa.fwd.api_dsl import WorkspaceCarver, _torch_stream_context, ws_align
 
@@ -111,7 +112,8 @@ class SdpaBwdDsl(APIBase):
         self.s_k_max: Optional[int] = None
         self.h_q: Optional[int] = None
         self.h_kv: Optional[int] = None
-        self.head_dim: Optional[int] = None
+        self.head_dim_qk: Optional[int] = None
+        self.head_dim_v: Optional[int] = None
         self.dtype: Optional[torch.dtype] = None
         self._initialize_implementation()
         self._logger.debug("__init__ completed")
@@ -157,8 +159,11 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
         self.compute_capability: Optional[tuple[int, int]] = None
         self._k_mod = None
         self._sq_rounded: Optional[int] = None
-        # Kernel-facing head dim. When it differs from D, operands stage through zero-padded compact copies
-        self.head_dim_padded: Optional[int] = None
+        # Kernel-facing head dims per side (QK: Q/K/dQ/dK, V: V/O/dO/dV).
+        # When one differs from its D, that side's operands stage through
+        # zero-padded compact copies.
+        self.head_dim_qk_padded: Optional[int] = None
+        self.head_dim_v_padded: Optional[int] = None
         # name -> staging number-of-elements for each non-BSHD-compact port
         self._staging_numels: dict[str, int] = {}
 
@@ -189,29 +194,41 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
 
         b, h_q, s_q, d_qk = self.q_desc.shape
         _, h_kv, s_kv, _ = self.k_desc.shape
+        d_v = int(self.v_desc.shape[3])
         self._check_tensor_shape(self.k_desc, (b, h_kv, s_kv, d_qk), name="K")
-        self._check_tensor_shape(self.v_desc, (b, h_kv, s_kv, d_qk), name="V")
-        self._check_tensor_shape(self.o_desc, (b, h_q, s_q, d_qk), name="O")
-        self._check_tensor_shape(self.do_desc, (b, h_q, s_q, d_qk), name="dO")
+        self._check_tensor_shape(self.v_desc, (b, h_kv, s_kv, d_v), name="V")
+        self._check_tensor_shape(self.o_desc, (b, h_q, s_q, d_v), name="O")
+        self._check_tensor_shape(self.do_desc, (b, h_q, s_q, d_v), name="dO")
         self._check_tensor_shape(self.dq_desc, tuple(self.q_desc.shape), name="dQ")
         self._check_tensor_shape(self.dk_desc, tuple(self.k_desc.shape), name="dK")
         self._check_tensor_shape(self.dv_desc, tuple(self.v_desc.shape), name="dV")
 
-        for label, val in (("B", b), ("H_q", h_q), ("H_kv", h_kv), ("S_q", s_q), ("S_kv", s_kv), ("D", d_qk)):
+        for label, val in (("B", b), ("H_q", h_q), ("H_kv", h_kv), ("S_q", s_q), ("S_kv", s_kv), ("D_QK", d_qk), ("D_V", d_v)):
             self._value_error_if(int(val) <= 0, f"{label} must be > 0; got {val}")
         self._value_error_if(
             h_q % h_kv != 0,
             f"SM120 DSL SDPA backward requires H_q to be a multiple of H_kv (GQA / MQA); got H_q={h_q}, H_kv={h_kv}",
         )
-        self.head_dim_padded = _sm120_padded_head_dim(int(d_qk)) if d_qk % 8 == 0 else None
         self._value_error_if(
-            self.head_dim_padded is None,
-            f"D ({d_qk}) must be a multiple of 8 and <= {max(_SM120_SUPPORTED_HEAD_DIMS)}",
+            d_v > d_qk,
+            f"SM120 DSL SDPA backward requires D_QK >= D_V (MLA-style rectangular head dims); got D_QK={d_qk}, D_V={d_v}",
         )
-        # All operands stage when D pads; otherwise only non-BSHD-compact ones.
-        for desc in (self.q_desc, self.k_desc, self.v_desc, self.o_desc, self.do_desc, self.dq_desc, self.dk_desc, self.dv_desc):
-            if self.head_dim_padded != d_qk or not self._bshd_physical_ok(desc):
-                self._staging_numels[desc.name] = math.prod(desc.shape[:-1]) * self.head_dim_padded
+        self._value_error_if(
+            d_qk % 8 != 0 or _sm120_padded_head_dim(int(d_qk)) is None,
+            f"D_QK ({d_qk}) must be a multiple of 8 and <= {max(_SM120_SUPPORTED_HEAD_DIMS)}",
+        )
+        self._value_error_if(
+            d_v % 8 != 0 or _sm120_padded_head_dim(int(d_v)) is None,
+            f"D_V ({d_v}) must be a multiple of 8 and <= {max(_SM120_SUPPORTED_HEAD_DIMS)}",
+        )
+        self.head_dim_qk_padded, self.head_dim_v_padded = _sm120_padded_head_dims(int(d_qk), int(d_v))
+        # A side's operands all stage when its D pads; otherwise only the non-BSHD-compact ones.
+        for desc in (self.q_desc, self.k_desc, self.dq_desc, self.dk_desc):
+            if self.head_dim_qk_padded != d_qk or not self._bshd_physical_ok(desc):
+                self._staging_numels[desc.name] = math.prod(desc.shape[:-1]) * self.head_dim_qk_padded
+        for desc in (self.v_desc, self.o_desc, self.do_desc, self.dv_desc):
+            if self.head_dim_v_padded != d_v or not self._bshd_physical_ok(desc):
+                self._staging_numels[desc.name] = math.prod(desc.shape[:-1]) * self.head_dim_v_padded
 
         self._value_error_if(
             self.stats_desc.ndim != 4 or tuple(self.stats_desc.shape) != (b, h_q, s_q, 1),
@@ -304,7 +321,8 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
         self.s_k_max = int(s_kv)
         self.h_q = int(h_q)
         self.h_kv = int(h_kv)
-        self.head_dim = int(d_qk)
+        self.head_dim_qk = int(d_qk)
+        self.head_dim_v = int(d_v)
         self._sq_rounded = _round_up(self.s_q_max, _SM120_ROW_ROUND)
         self._is_supported = True
 
@@ -340,8 +358,9 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
             qh=self.h_q,
             sq=self.s_q_max,
             skv=self.s_k_max,
-            d=self.head_dim_padded,
+            d_qk=self.head_dim_qk_padded,
             kvh=self.h_kv,
+            d_v=self.head_dim_v_padded,
         )
         self._logger.debug("compile completed")
 
@@ -350,13 +369,14 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
 
         return self.batch_size * self.h_q * _round_up(self.s_q_max, _SM120_MIN_Q_TILE) // _SM120_MIN_Q_TILE
 
-    def _dkv_ws_elems(self) -> int:
-        """io-dtype elements of each GQA partials buffer (dk_ws / dv_ws);
-        0 for MHA, where they alias the dk/dv outputs."""
+    def _dkv_ws_elems(self) -> tuple[int, int]:
+        """io-dtype elements of the GQA partials buffers (dk_ws, dv_ws);
+        (0, 0) for MHA, where they alias the dk/dv outputs."""
 
         if self.h_q == self.h_kv:
-            return 0
-        return self.batch_size * self.s_k_max * self.h_q * self.head_dim_padded
+            return (0, 0)
+        rows = self.batch_size * self.s_k_max * self.h_q
+        return (rows * self.head_dim_qk_padded, rows * self.head_dim_v_padded)
 
     def _checked_seq_lens(self, seq_lens: torch.Tensor, name: str) -> torch.Tensor:
         """Validate per-batch lengths and return a (B,) int32 view (never a copy/cast)."""
@@ -379,16 +399,17 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
         return seq_lens.reshape(-1)
 
     def scratch_workspace_bytes(self) -> int:
-        """delta (fp32 [B, H, SQ_r128]) + dq_accum (fp32 flat [B*SQ_r128*H*D])
+        """delta (fp32 [B, H, SQ_r128]) + dq_accum (fp32 flat [B*SQ_r128*H*D_QK])
         + dq_sem (int32 flat [B*H*ceil(SQ/32)], deterministic relay counters)
-        + dk_ws/dv_ws (io [B, SKV, H_q, D] each, per-q-head partials, GQA only)
-        + one compact staging copy per non-BSHD-compact operand."""
+        + dk_ws/dv_ws (io [B, SKV, H_q, D_QK] / [B, SKV, H_q, D_V], per-q-head
+        partials, GQA only) + one compact staging copy per non-BSHD-compact
+        operand."""
 
         self._ensure_support_checked()
         delta_bytes = ws_align(self.batch_size * self.h_q * self._sq_rounded * 4)
-        dq_accum_bytes = ws_align(self.batch_size * self._sq_rounded * self.h_q * self.head_dim_padded * 4)
+        dq_accum_bytes = ws_align(self.batch_size * self._sq_rounded * self.h_q * self.head_dim_qk_padded * 4)
         dq_sem_bytes = ws_align(self._dq_sem_len() * 4)
-        dkv_ws_bytes = 2 * ws_align(self._dkv_ws_elems() * self.dtype.itemsize)
+        dkv_ws_bytes = sum(ws_align(elems * self.dtype.itemsize) for elems in self._dkv_ws_elems())
         staging_bytes = sum(ws_align(numel * self.dtype.itemsize) for numel in self._staging_numels.values())
         return delta_bytes + dq_accum_bytes + dq_sem_bytes + dkv_ws_bytes + staging_bytes
 
@@ -446,7 +467,7 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
 
         carver = WorkspaceCarver(workspace, self.scratch_workspace_bytes(), "sdpa_bwd_sm120")
         delta = carver.take(self.batch_size * self.h_q * self._sq_rounded, torch.float32).reshape(self.batch_size, self.h_q, self._sq_rounded)
-        dq_accum = carver.take(self.batch_size * self._sq_rounded * self.h_q * self.head_dim_padded, torch.float32)
+        dq_accum = carver.take(self.batch_size * self._sq_rounded * self.h_q * self.head_dim_qk_padded, torch.float32)
         dq_sem = carver.take(self._dq_sem_len(), torch.int32)
 
         if current_stream is None:
@@ -457,26 +478,27 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
 
         import cutlass
 
-        # Non-compact operands (all operands when D pads) stage through
-        # workspace-carved compact copies with zero-filled pad columns.
-        d_pad = self.head_dim_padded
-        pads = d_pad != self.head_dim
+        # Non-compact operands (a whole side when its D pads) stage through
+        # workspace-carved compact copies with zero-filled pad columns. The QK
+        # side (Q/dQ/K/dK) and the VO side (V/O/dO/dV) pad independently.
+        d_qk, dqk_pad = self.head_dim_qk, self.head_dim_qk_padded
+        d_v, dv_pad = self.head_dim_v, self.head_dim_v_padded
 
-        def _staged_bshd(tensor: torch.Tensor) -> torch.Tensor:
+        def _staged_bshd(tensor: torch.Tensor, d_orig: int, d_pad: int) -> torch.Tensor:
             view = tensor.transpose(1, 2)
-            if not pads and view.is_contiguous():
+            if d_pad == d_orig and view.is_contiguous():
                 return view
             b, s, h, _ = view.shape
             staged = carver.take(b * s * h * d_pad, self.dtype).view(b, s, h, d_pad)
-            if pads:
-                staged[..., self.head_dim :].zero_()
-            staged[..., : self.head_dim].copy_(view)
+            if d_pad != d_orig:
+                staged[..., d_orig:].zero_()
+            staged[..., :d_orig].copy_(view)
             return staged
 
-        def _staged_out_bshd(tensor: torch.Tensor):
+        def _staged_out_bshd(tensor: torch.Tensor, d_orig: int, d_pad: int):
             """(kernel-facing compact BSHD buffer, user view to scatter back into or None)."""
             view = tensor.transpose(1, 2)
-            if not pads and view.is_contiguous():
+            if d_pad == d_orig and view.is_contiguous():
                 return view, None
             b, s, h, _ = view.shape
             return carver.take(b * s * h * d_pad, self.dtype).view(b, s, h, d_pad), view
@@ -485,14 +507,14 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
         seq_kv_t = self._checked_seq_lens(seq_kv_lens, "seq_kv_lens") if seq_kv_lens is not None else None
 
         with _torch_stream_context(current_stream, q_tensor.device):
-            q = _staged_bshd(q_tensor)
-            k = _staged_bshd(k_tensor)
-            v = _staged_bshd(v_tensor)
-            o = _staged_bshd(o_tensor)
-            do = _staged_bshd(do_tensor)
-            dq, dq_user = _staged_out_bshd(dq_tensor)
-            dk, dk_user = _staged_out_bshd(dk_tensor)
-            dv, dv_user = _staged_out_bshd(dv_tensor)
+            q = _staged_bshd(q_tensor, d_qk, dqk_pad)
+            k = _staged_bshd(k_tensor, d_qk, dqk_pad)
+            v = _staged_bshd(v_tensor, d_v, dv_pad)
+            o = _staged_bshd(o_tensor, d_v, dv_pad)
+            do = _staged_bshd(do_tensor, d_v, dv_pad)
+            dq, dq_user = _staged_out_bshd(dq_tensor, d_qk, dqk_pad)
+            dk, dk_user = _staged_out_bshd(dk_tensor, d_qk, dqk_pad)
+            dv, dv_user = _staged_out_bshd(dv_tensor, d_v, dv_pad)
             lse = stats_tensor.reshape(self.batch_size, self.h_q, self.s_q_max)
 
             kernels = self._compiled_kernel
@@ -501,9 +523,9 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
             if self.h_q == self.h_kv:
                 dk_ws, dv_ws = dk, dv
             else:
-                ws_shape = (self.batch_size, self.s_k_max, self.h_q, self.head_dim_padded)
-                dk_ws = carver.take(self._dkv_ws_elems(), self.dtype).view(ws_shape)
-                dv_ws = carver.take(self._dkv_ws_elems(), self.dtype).view(ws_shape)
+                dkw_elems, dvw_elems = self._dkv_ws_elems()
+                dk_ws = carver.take(dkw_elems, self.dtype).view(self.batch_size, self.s_k_max, self.h_q, dqk_pad)
+                dv_ws = carver.take(dvw_elems, self.dtype).view(self.batch_size, self.s_k_max, self.h_q, dv_pad)
 
             # Kernel chain (dot -> main -> [reduce] -> cvt)
             kernels.dot(o, do, delta, dq_accum, dq_sem, current_stream)
@@ -530,9 +552,9 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
             kernels.cvt(dq_accum, dq, cutlass.Float32(scale_val), current_stream)
             if kernels.dsink is not None:
                 kernels.dsink(lse, delta, sink_tensor.reshape(self.h_q), dsink_tensor.reshape(self.h_q), seq_q_t, current_stream)
-            for user_view, staged in ((dq_user, dq), (dk_user, dk), (dv_user, dv)):
+            for user_view, staged, d_orig in ((dq_user, dq, d_qk), (dk_user, dk, d_qk), (dv_user, dv, d_v)):
                 if user_view is not None:
-                    user_view.copy_(staged[..., : self.head_dim])
+                    user_view.copy_(staged[..., :d_orig])
 
 
 def _tensor_signature(tensor: torch.Tensor) -> tuple:
