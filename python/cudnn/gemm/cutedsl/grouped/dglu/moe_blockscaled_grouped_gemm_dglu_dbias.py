@@ -242,7 +242,7 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
             result = False
         if not (a_major == "k"):
             result = False
-        if act_func not in ["dswiglu", "dgeglu"]:
+        if act_func not in ["dswiglu", "dgeglu", "dsituglu"]:
             result = False
         return result
 
@@ -728,6 +728,8 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
         geglu_alpha: cutlass.Constexpr = 1.702,
         glu_clamp_max: cutlass.Constexpr = 7.0,
         glu_clamp_min: cutlass.Constexpr = -7.0,
+        situ_beta1: cutlass.Constexpr = 4.0,
+        situ_beta2: cutlass.Constexpr = 25.0,
     ):
         """Execute the GEMM.
 
@@ -742,7 +744,9 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
             out = (clamp(up, min=glu_clamp_min, max=glu_clamp_max) + linear_offset)
                   * silu(geglu_alpha * clamp(gate, max=glu_clamp_max))
         and the backward consumes the same values plus the corresponding
-        clamp masks. They are ignored when ``act_func == "dswiglu"``.
+        clamp masks. ``situ_beta1`` and ``situ_beta2`` configure the SiTU-GLU
+        derivative. GeGLU parameters are ignored unless ``act_func == "dgeglu"``
+        and SiTU parameters are ignored unless ``act_func == "dsituglu"``.
         """
         # Setup static attributes before smem/grid/tma computation
         self.a_dtype: Type[cutlass.Numeric] = a.element_type
@@ -1100,6 +1104,8 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
             geglu_alpha,
             glu_clamp_max,
             glu_clamp_min,
+            situ_beta1,
+            situ_beta2,
             dbias_tensor,
             workspace_ptr,
             self.cluster_layout_vmnk,
@@ -1877,6 +1883,46 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
             return d1_vec, d2_vec, dprob_swiglu
 
     @cute.jit
+    def dsituglu(
+        self,
+        acc_vec: cute.Tensor,
+        gate_vec: cute.Tensor,
+        up_vec: cute.Tensor,
+        mProb: cute.Tensor,
+        beta_val: Float32,
+        square_alpha: Float32,
+        beta1: Float32,
+        beta2: Float32,
+        dprob_swiglu: Optional[cute.Tensor] = None,
+    ):
+        dgate_vec = cute.make_rmem_tensor(acc_vec.shape, cutlass.Float32)
+        dup_vec = cute.make_rmem_tensor(acc_vec.shape, cutlass.Float32)
+
+        for i in cutlass.range_constexpr(cute.size(acc_vec)):
+            grad = acc_vec[i] * square_alpha
+            gate = gate_vec[i].to(cutlass.Float32) * beta_val
+            up = up_vec[i].to(cutlass.Float32) * beta_val
+            gate_tanh = cute.math.tanh(gate / beta1, fastmath=True)
+            up_tanh = cute.math.tanh(up / beta2, fastmath=True)
+            sigmoid = cute.arch.rcp_approx(cutlass.Float32(1.0) + cute.math.exp(-gate, fastmath=True))
+            gate_value = beta1 * gate_tanh * sigmoid
+            up_value = beta2 * up_tanh
+            gate_grad = (cutlass.Float32(1.0) - gate_tanh * gate_tanh) * sigmoid
+            gate_grad = gate_grad + beta1 * gate_tanh * sigmoid * (cutlass.Float32(1.0) - sigmoid)
+            up_grad = cutlass.Float32(1.0) - up_tanh * up_tanh
+            activation_grad = grad
+            if cutlass.const_expr(self.has_prob):
+                activation_grad = grad * mProb
+            dgate_vec[i] = activation_grad * up_value * gate_grad
+            dup_vec[i] = activation_grad * gate_value * up_grad
+            if cutlass.const_expr(self.generate_dprob):
+                dprob_swiglu[i] = grad * gate_value * up_value
+
+        if cutlass.const_expr(self.generate_dprob):
+            dprob_swiglu = dprob_swiglu.load()
+        return dgate_vec.load(), dup_vec.load(), dprob_swiglu
+
+    @cute.jit
     def dgeglu(
         self,
         acc_vec: cute.Tensor,
@@ -2069,6 +2115,8 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
         geglu_alpha: cutlass.Constexpr,
         glu_clamp_max: cutlass.Constexpr,
         glu_clamp_min: cutlass.Constexpr,
+        situ_beta1: cutlass.Constexpr,
+        situ_beta2: cutlass.Constexpr,
         mDbias_tensor: Optional[cute.Tensor],
         workspace_ptr,
         cluster_layout_vmnk: cute.Layout,
@@ -3038,6 +3086,18 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
                             cutlass.Float32(geglu_alpha),
                             cutlass.Float32(glu_clamp_max),
                             cutlass.Float32(glu_clamp_min),
+                            dprob_swiglu,
+                        )
+                    elif cutlass.const_expr(self.act_func == "dsituglu"):
+                        d1_vec, d2_vec, dprob_swiglu = self.dsituglu(
+                            acc_vec,
+                            ab1_vec_load,
+                            ab2_vec_load,
+                            mProb,
+                            beta_val,
+                            square_alpha,
+                            cutlass.Float32(situ_beta1),
+                            cutlass.Float32(situ_beta2),
                             dprob_swiglu,
                         )
 

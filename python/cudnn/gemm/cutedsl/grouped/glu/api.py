@@ -5,7 +5,7 @@ Unified API for Grouped GEMM GLU Forward Kernel (SM100+)
 
 This module provides a single API class that supports both contiguous (dense)
 and discrete weight modes for block-scaled grouped GEMM with GLU activation
-(SwiGLU / GeGLU) in MoE (Mixture of Experts) workloads.
+(SwiGLU / GeGLU / SiTU-GLU) in MoE (Mixture of Experts) workloads.
 
 Dense mode
     All expert weights are packed contiguously in a 3-D tensor (N, K, L).
@@ -20,6 +20,7 @@ Discrete mode
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import math
 
 from ..backend_utils import (
     GroupedGemmBackend,
@@ -107,7 +108,7 @@ class GluCall:
     mma_tiler_mn: Tuple[int, int] = (256, 256)
     cluster_shape_mn: Optional[Tuple[int, int]] = None
     sf_vec_size: int = 16
-    sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
+    sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None
     vector_f32: bool = False
     m_aligned: int = 256
     discrete_col_sfd: bool = False
@@ -116,6 +117,8 @@ class GluCall:
     geglu_alpha: float = 1.702
     glu_clamp_max: float = 7.0
     glu_clamp_min: float = -7.0
+    situ_beta1: float = 4.0
+    situ_beta2: float = 25.0
     use_dynamic_sched: bool = False
     use_single_group_runtime_offsets: bool = False
     current_stream: Optional[cuda.CUstream] = None
@@ -345,6 +348,8 @@ class GroupedGemmGluSm100(APIBase):
         geglu_alpha: float = 1.702,
         glu_clamp_max: float = 7.0,
         glu_clamp_min: float = -7.0,
+        situ_beta1: float = 4.0,
+        situ_beta2: float = 25.0,
         current_stream: Optional[cuda.CUstream] = None,
     ) -> None:
         if self._implementation is None:
@@ -410,6 +415,8 @@ class GroupedGemmGluSm100(APIBase):
                 geglu_alpha=geglu_alpha,
                 glu_clamp_max=glu_clamp_max,
                 glu_clamp_min=glu_clamp_min,
+                situ_beta1=situ_beta1,
+                situ_beta2=situ_beta2,
                 current_stream=current_stream,
             )
         self._is_supported = self._implementation._is_supported
@@ -469,7 +476,7 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall) -> TupleDict:
         vector_f32: Use vectorized f32
         m_aligned: M alignment (must be 256)
         discrete_col_sfd: Generate discrete col-major scale factor tensor
-        act_func: Activation function ("swiglu" or "geglu")
+        act_func: Activation function ("swiglu", "geglu", or block-scaled "situglu")
         linear_offset: Linear offset applied to the up branch in the
             ``act_func == "geglu"`` activation, i.e.
             ``out = (up + linear_offset) * silu(geglu_alpha * gate)``. Ignored
@@ -493,6 +500,10 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall) -> TupleDict:
             kernel never lower-clamps the gate). Default ``-7.0``. Runtime
             parameter, intentionally not part of the cache key. Ignored when
             ``act_func == "swiglu"``.
+        situ_beta1: Positive finite gate tanh scale for SiTU-GLU. Default
+            ``4.0``. Runtime parameter, intentionally not part of the cache key.
+        situ_beta2: Positive finite up-branch tanh scale for SiTU-GLU. Default
+            ``25.0``. Runtime parameter, intentionally not part of the cache key.
         use_dynamic_sched: Enable dynamic tile scheduling for load balancing
         current_stream: CUDA stream
 
@@ -536,6 +547,8 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall) -> TupleDict:
     geglu_alpha = call.geglu_alpha
     glu_clamp_max = call.glu_clamp_max
     glu_clamp_min = call.glu_clamp_min
+    situ_beta1 = call.situ_beta1
+    situ_beta2 = call.situ_beta2
     use_dynamic_sched = call.use_dynamic_sched
     use_single_group_runtime_offsets = call.use_single_group_runtime_offsets
     current_stream = call.current_stream
@@ -833,6 +846,8 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall) -> TupleDict:
             geglu_alpha=geglu_alpha,
             glu_clamp_max=glu_clamp_max,
             glu_clamp_min=glu_clamp_min,
+            situ_beta1=situ_beta1,
+            situ_beta2=situ_beta2,
             current_stream=current_stream,
         )
     else:
@@ -856,6 +871,8 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall) -> TupleDict:
             geglu_alpha=geglu_alpha,
             glu_clamp_max=glu_clamp_max,
             glu_clamp_min=glu_clamp_min,
+            situ_beta1=situ_beta1,
+            situ_beta2=situ_beta2,
             current_stream=current_stream,
         )
 
@@ -879,6 +896,16 @@ def _normalize_glu_call(call: GluCall) -> tuple[GluCall, GroupedGemmBackend]:
         d_dtype=_convert_to_cutlass_data_type(call.d_dtype) if call.d_dtype is not None else cutlass.BFloat16,
         b_dtype=_convert_to_cutlass_data_type(call.b_dtype) if call.b_dtype is not None else None,
     )
+
+    if call.act_func not in ("swiglu", "geglu", "situglu"):
+        raise ValueError(f"act_func must be 'swiglu', 'geglu', or 'situglu', got {call.act_func}")
+    if call.act_func == "situglu":
+        if not math.isfinite(call.situ_beta1) or call.situ_beta1 <= 0.0:
+            raise ValueError(f"situ_beta1 must be finite and positive, got {call.situ_beta1}")
+        if not math.isfinite(call.situ_beta2) or call.situ_beta2 <= 0.0:
+            raise ValueError(f"situ_beta2 must be finite and positive, got {call.situ_beta2}")
+        if get_device_type() == "rubin":
+            raise NotImplementedError("Rubin grouped GEMM GLU does not support situglu")
 
     is_dense = call.b_tensor is not None
     is_discrete = call.b_ptrs is not None
@@ -964,7 +991,7 @@ def _normalize_glu_call(call: GluCall) -> tuple[GluCall, GroupedGemmBackend]:
     if call.cd_major != "n":
         raise ValueError(f"cd_major must be 'n', got {call.cd_major}")
     if call.act_func not in ("swiglu", "geglu"):
-        raise ValueError(f"act_func must be 'swiglu' or 'geglu', got {call.act_func}")
+        raise ValueError(f"BF16 act_func must be 'swiglu' or 'geglu'; situglu is block-scaled only, got {call.act_func}")
     if normalized.c_dtype not in (cutlass.BFloat16, cutlass.Float16, cutlass.Float32):
         raise ValueError(f"c_dtype must be BF16, FP16, or FP32, got {normalized.c_dtype}")
     if normalized.d_dtype not in (cutlass.BFloat16, cutlass.Float16, cutlass.Float32):
@@ -1186,6 +1213,8 @@ def grouped_gemm_glu_wrapper_sm100(
     geglu_alpha: float = 1.702,
     glu_clamp_max: float = 7.0,
     glu_clamp_min: float = -7.0,
+    situ_beta1: float = 4.0,
+    situ_beta2: float = 25.0,
     use_dynamic_sched: bool = False,
     use_single_group_runtime_offsets: bool = False,
     current_stream: Optional[cuda.CUstream] = None,
@@ -1242,6 +1271,8 @@ def grouped_gemm_glu_wrapper_sm100(
         geglu_alpha=geglu_alpha,
         glu_clamp_max=glu_clamp_max,
         glu_clamp_min=glu_clamp_min,
+        situ_beta1=situ_beta1,
+        situ_beta2=situ_beta2,
         use_dynamic_sched=use_dynamic_sched,
         use_single_group_runtime_offsets=use_single_group_runtime_offsets,
         current_stream=current_stream,
