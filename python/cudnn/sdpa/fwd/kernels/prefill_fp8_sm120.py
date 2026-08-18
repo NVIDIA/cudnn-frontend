@@ -86,6 +86,18 @@ from cudnn.sdpa.fwd.config_sm120 import (
 # The FROST loader injects one immutable specialization before executing this
 # module. A direct import uses dense e4m3 defaults.
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams(dtype_qkv=DTYPE_E4M3))
+
+# P -> fp8 cast bias (BAKED constant — NOT cuDNN's Scale_S; that pair is
+# accepted and ignored). P is quantized as P * 2**P_CAST_LOG2_SCALE via the
+# exp2 bias: the lazy-rescale skip bounds P by 2**rescale_threshold (4.0 for
+# fp8), so the cast peaks at 2^(4+4) = 256 < 448 (e4m3 max) — no saturation —
+# while flat-row entries (P ~ 1/S) sit four binades above e4m3's subnormal
+# cliff (quantization stays normal out to S ~ 2^13). row_sum accumulates in
+# the same 2^4-scaled units and is de-scaled by the EXACT 2^-4 before the
+# finalize paths (sink mix, rcp, LSE, zero-row guards run on bit-identical
+# true sums); the O leg's 2^4 is cancelled by the 2^-4 folded into
+# o_scale_fused. Invariant: rescale_threshold + P_CAST_LOG2_SCALE <= log2(448).
+P_CAST_LOG2_SCALE = 4.0
 validate_params(
     PARAMS,
     allowed_dtypes=(DTYPE_E4M3, DTYPE_E5M2),
@@ -681,7 +693,9 @@ class SM120FusedMultiHeadAttentionForward:
             if cutlass.const_expr(in_mask_steps):
                 if exp_max == -cutlass.Float32.inf:
                     exp_max = cutlass.Float32(0.0)
-            neg_exp_max_scaled = -exp_max * softmax_scale_log2
+            # P-cast bias: exp2(x + P_CAST_LOG2_SCALE) = 2^4 * P (EX2 is
+            # binade-shift-exact); see P_CAST_LOG2_SCALE.
+            neg_exp_max_scaled = cutlass.Float32(P_CAST_LOG2_SCALE) - exp_max * softmax_scale_log2
             tile_sum = cutlass.Float32(0.0)
             for k_frag in cutlass.range_constexpr(self.qk_k_frags):
                 s_off = k_frag * 4
@@ -1249,7 +1263,10 @@ class SM120FusedMultiHeadAttentionForward:
             _dsc_v = cutlass.Float32(cutlass.make_array_view(descale_v_t)[0])
             _scl_o = cutlass.Float32(cutlass.make_array_view(scale_o_t)[0])
             softmax_scale_log2 = softmax_scale_log2 * _dsc_q * _dsc_k
-            o_scale_fused = o_scale_fused * _dsc_v * _scl_o
+            # The trailing 2^-P_CAST_LOG2_SCALE cancels the P-cast bias the O
+            # accumulator picked up through BMM2 (row_sum is de-scaled
+            # separately at finalize).
+            o_scale_fused = o_scale_fused * _dsc_v * _scl_o * cutlass.Float32(2.0**-P_CAST_LOG2_SCALE)
             softmax_params = SimpleNamespace(
                 row_max=row_max,
                 row_sum=row_sum,
@@ -1346,6 +1363,9 @@ class SM120FusedMultiHeadAttentionForward:
             row_sum_inv = cutlass.Array(cutlass.Float32, 2, alignment=8)
             row_lse = cutlass.Array(cutlass.Float32, 2, alignment=8)
             for row_half in cutlass.range_constexpr(2):
+                # row_sum carries the P-cast 2^4 — take it out with the EXACT
+                # 2^-4 so every finalize path below sees the true sum.
+                row_sum[row_half] = row_sum[row_half] * cutlass.Float32(2.0**-P_CAST_LOG2_SCALE)
                 row_max_nat = row_max[row_half] * softmax_scale_log2 * LN2
                 if cutlass.const_expr(self.has_sink):
                     sinks_arr = cutlass.make_array_view(sinks)

@@ -121,6 +121,17 @@ elif CFG.DTYPE_QKV == 1:
 else:
     raise ValueError(f"prefill_sdpa_mxfp8: DTYPE_QKV={CFG.DTYPE_QKV} not supported " f"(expected 0=E4M3 or 1=E5M2)")
 
+# P -> fp8 cast bias (BAKED constant — MXFP8's block SFs cover Q/K/V inputs,
+# not P). P is quantized as P * 2**P_CAST_LOG2_SCALE: the lazy-rescale skip
+# bounds P by 2**RESCALE_THRESHOLD (4.0 for fp8 dtypes), so the cast peaks at
+# 2^(4+4) = 256 < 448 (e4m3 max) — no saturation — while flat-row entries
+# (P ~ 1/S) sit four binades above e4m3's subnormal cliff. The bias rides the
+# exp2 argument, so total_sum accumulates in the SAME 2^4-scaled units and
+# the O normalization (O_acc / total_sum) cancels it exactly; only the LSE
+# subtracts the constant (and the sink denominator term is scaled to match).
+# Invariant: RESCALE_THRESHOLD + P_CAST_LOG2_SCALE <= log2(448).
+P_CAST_LOG2_SCALE = 4.0
+
 MMA_KIND = nvvm.MMABlockScaleKind.MXF8F6F4
 SCALE_VEC_SIZE = nvvm.Tcgen05MMAScaleVecSize.BLOCK32
 
@@ -1753,8 +1764,10 @@ def _softmax_kv_body(
     nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
     bars.mb_stat_full[sub_tile_id].arrive()
 
-    reg_S_a = reg_S_a * scale_log2 - new_total_max
-    reg_S_b = reg_S_b * scale_log2 - new_total_max
+    # P-cast bias: exp2(x + P_CAST_LOG2_SCALE) = 2^4 * P — the sum picks up
+    # the same factor, so normalization cancels it (see P_CAST_LOG2_SCALE).
+    reg_S_a = reg_S_a * scale_log2 - (new_total_max - cutlass.Float32(P_CAST_LOG2_SCALE))
+    reg_S_b = reg_S_b * scale_log2 - (new_total_max - cutlass.Float32(P_CAST_LOG2_SCALE))
     reg_P_a = cute.math.exp2(reg_S_a, fastmath=True)
     sum_a_pair = row_reduction_pair_64(reg_P_a)
     p_a_fp16 = reg_P_a.to(STORAGE_DTYPE)
@@ -2134,11 +2147,14 @@ def _correction_warp_group(
                 sink_logit = sinks_arr[head_idx]
                 new_max = cute.math.max(total_max_nat, sink_logit)
                 scale = cute.math.exp(total_max_nat - new_max, fastmath=True)
-                new_sum = total_sum * scale + cute.math.exp(sink_logit - new_max, fastmath=True)
-                lse_val = new_max + cute.math.log(new_sum, fastmath=True)
+                # total_sum is in 2^P_CAST_LOG2_SCALE units — lift the sink term
+                # into the same units, then take the constant back out of the LSE.
+                new_sum = total_sum * scale + cute.math.exp(sink_logit - new_max, fastmath=True) * cutlass.Float32(2.0**P_CAST_LOG2_SCALE)
+                lse_val = new_max + cute.math.log(new_sum, fastmath=True) - cutlass.Float32(P_CAST_LOG2_SCALE) * LN2
                 inv_sum = scale / new_sum
             else:
-                lse_val = total_max_nat + cute.math.log(total_sum, fastmath=True)
+                # total_sum carries 2^P_CAST_LOG2_SCALE — subtract the constant.
+                lse_val = total_max_nat + cute.math.log(total_sum, fastmath=True) - cutlass.Float32(P_CAST_LOG2_SCALE) * LN2
                 # Safe inverse: avoid div by 0 (rows fully masked).
                 inv_sum = cutlass.Float32(1.0) / cute.math.max(total_sum, cutlass.Float32(1e-30))
 
