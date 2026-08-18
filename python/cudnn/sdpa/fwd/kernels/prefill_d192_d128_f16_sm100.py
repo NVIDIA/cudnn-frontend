@@ -2166,10 +2166,13 @@ def _host(
     grid_q_supers = q_clusters * CFG.CTA_MMA
     q_supers = grid_q_supers
     if cutlass.const_expr(CFG.THD_VARLEN):
-        # THD: build the per-batch O descriptor array (reuse tma_o_desc over the
-        # packed [1,T,QH,D_v] O as base), then launch the exact flat
-        # batch-outermost grid (n_thd_units = Σ_b ceil(S_q_b/CGA_TILE_M)*QH,
-        # host-computed); grid_x = n_thd_units * CGA_M.  Works at cga1 (CGA_M=1).
+        # THD: build the [kv|cu_q|cu_k] metadata + per-batch O descriptor
+        # array DEVICE-side (reuse tma_o_desc over the packed [1,T,QH,D_v] O
+        # as base), then launch the PLAN-TIME ENVELOPE grid (n_thd_units =
+        # B * ceil(S_q_decl/CGA_TILE_M) * QH, from the DECLARED S_q — no
+        # runtime length reaches the host); units past a sequence's live
+        # tiles decode the batch == n_batch sentinel and drain without loads
+        # or stores. grid_x = n_thd_units * CGA_M.  Works at cga1 (CGA_M=1).
         # ENVELOPE: the packed-O row stride is QH * ACTUAL d_v (o_tensor's
         # static inner extent), not QH * TILE_O — the per-batch descriptor
         # bases must step in real rows or every batch >= 1 lands OOB.

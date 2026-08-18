@@ -97,6 +97,7 @@ def _run(
     seq_lens_q=None,
     tiles=None,
     s_descale_gain=1.0,
+    sync_debug=False,
     D=128,
     D_v=None,
     io_dtype=torch.float8_e4m3fn,
@@ -199,7 +200,17 @@ def _run(
     g.check_support()
     g.build_plans()
     vp.update({o: Ob, stats: lse, amx_o: amax_o})
-    g.execute(vp, torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8))
+    ws = torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8)
+    if sync_debug:
+        # Rule 3 pin: execute must not read the scale tensors (or anything
+        # else) back to the host.
+        prev_sync_mode = torch.cuda.get_sync_debug_mode()
+        torch.cuda.set_sync_debug_mode(2)
+    try:
+        g.execute(vp, ws)
+    finally:
+        if sync_debug:
+            torch.cuda.set_sync_debug_mode(prev_sync_mode)
     torch.cuda.synchronize()
 
     ref_kw = _ref_kwargs(sdpa_kwargs)
@@ -750,6 +761,7 @@ def _run_template_tail(D, D_v, *, mask, S=256):
     seq_kv = torch.tensor(seq_kv_lens, dtype=torch.int32, device=dev) if seq_kv_lens else seq_q
     amax_o = torch.zeros(1, dtype=torch.float32, device=dev)
     scale = 1.0 / math.sqrt(D)
+    one = torch.ones(1, dtype=torch.float32, device=dev)  # identity device scales
     fn(
         q8,  # native fp8 element types across the ABI
         k8,
@@ -760,9 +772,12 @@ def _run_template_tail(D, D_v, *, mask, S=256):
         seq_q,
         seq_kv,
         amax_o.view(torch.int32),  # bitcast-int32 atomicMax storage
-        cutlass.Float32(scale * math.log2(math.e)),  # softmax_scale_log2 (descale_q = descale_k = 1)
-        cutlass.Float32(1.0),  # o_scale_fused = descale_s * descale_v * scale_o, all 1.0 here
-        cutlass.Float32(1.0),  # scale_s
+        cutlass.Float32(scale * math.log2(math.e)),  # softmax_scale_log2 base (descale_q*descale_k fold in-kernel)
+        cutlass.Float32(1.0),  # o_scale_fused base (descale_v*scale_o and the P-cast 2^-4 fold in-kernel)
+        one,  # descale_q_t
+        one,  # descale_k_t
+        one,  # descale_v_t
+        one,  # scale_o_t
         cutlass.Int32(0),  # thd_max_sq (dense: ignored)
         None,  # thd_q_lens (dense: folded out of the ABI)
         None,  # thd_kv_lens
@@ -819,28 +834,15 @@ def test_fp8_sm120_every_enumerated_tile(tiles):
 
 
 @pytest.mark.L0
-@torch_fork_set_rng(seed=5)
-def test_fp8_sm120_s_scales_are_actually_applied():
-    """Scale_S and Descale_S are reciprocal in normal use, so a correct kernel
-    and one that ignores BOTH produce the same O — every other test here would
-    pass either way. Break the reciprocity: with Descale_S = k/Scale_S the
-    output must scale by exactly k, which only holds if both reach the math.
-    """
+@torch_fork_set_rng(seed=7)
+def test_fp8_sm120_device_scales_execute_reads_no_device_memory():
+    """The graph path binds DEVICE scale tensors and the kernel folds
+    dq*dk / ds*dv*so / ss in-kernel; amax_o divides by the device scale_o --
+    no .item()/D2H readback anywhere (Rule 3), pinned by sync-debug mode 2
+    around the execute. Numerics vs the fp32 reference are unchanged."""
     scale = 1.0 / math.sqrt(128)
-    k = 2.0
-    # _run draws its own Q/K/V, so both runs must start from the same RNG state
-    # or the comparison says nothing about the scales.
-    torch.manual_seed(1234)
-    base = _run(2, 8, 8, 256, 256, scale=scale, sdpa_kwargs=dict(use_causal_mask=True))
-    torch.manual_seed(1234)
-    gained = _run(2, 8, 8, 256, 256, scale=scale, sdpa_kwargs=dict(use_causal_mask=True), s_descale_gain=k)
-
-    o_base, o_gain = base[0].float(), gained[0].float()
-    ref = o_base * k
-    diff = (o_gain - ref).abs().max().item()
-    assert diff <= 5e-2 * k, f"Descale_S gain {k} not reflected in O: max|O_gain - {k}*O_base| = {diff:.4f}"
-    # and the pair is not being cancelled away: the two runs must differ
-    assert (o_gain - o_base).abs().max().item() > 1e-3
+    res = _run(2, 8, 8, 256, 256, scale=scale, sdpa_kwargs=dict(use_causal_mask=True), sync_debug=True)
+    _check(*res)
 
 
 _THD_SENTINEL = 2048.0

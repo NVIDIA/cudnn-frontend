@@ -53,39 +53,6 @@ def dtype_name(buffer) -> str:
     return str(buffer.dtype).rsplit(".", 1)[-1]
 
 
-def _require_reciprocal_s_scales(descale_s: float, scale_s: float) -> None:
-    """Guard for a kernel that converts P to e4m3 UNSCALED (the SM100 FP8 row).
-
-    cuDNN's Scale_S/Descale_S quantize P — the softmax OUTPUT, not the scores.
-    Applying neither still returns the RIGHT O whenever the pair is reciprocal:
-    no scale was applied, so none is owed back. A non-reciprocal pair is a
-    different request — O scaled by descale_s*scale_s — so decline that.
-
-    This row cannot apply Scale_S, and would gain nothing if it could:
-
-    - No headroom. The lazy-rescale skip refreshes the running max only when
-      a tile exceeds it by RESCALE_THRESHOLD -- 4.0 for the fp8 dtypes
-      (config_sm100.rescale_threshold; 8.0 is the dataclass default the fp8
-      path overrides) -- so P is bounded by 2^4 = 16, not 1. e4m3 tops out at
-      448, so any scale_s > 448/16 = 28 can saturate a lazily-skipped tile.
-      Measured on B2xH8xS256 e4m3: max|O-ref| is flat from scale_s 1 to 64
-      (the analytical bound is conservative) and degrades at 448
-      (swa .0239 -> .0807).
-    - Nothing to gain. e4m3 is floating point, so relative precision does not
-      move with scale, and subtracting the row max already places P per ROW —
-      strictly better than a per-tensor scale. Hence the flat error above.
-
-    SM120 does implement it: that kernel has no lazy rescale, so P <= 1 there
-    and the full e4m3 range is available.
-    """
-    product = descale_s * scale_s
-    if abs(product - 1.0) > 1e-3:
-        raise NotImplementedError(
-            f"per-tensor FP8: this kernel converts P unscaled, so it can only serve a reciprocal "
-            f"descale_s*scale_s == 1; got {descale_s} * {scale_s} = {product}"
-        )
-
-
 _SM100_FLAVORS = (
     (128, 128),
     (192, 128),
@@ -503,6 +470,24 @@ class SdpaFwdDsl(APIBase):
             return tensor.view(-1)[:1]
         except RuntimeError as exc:
             raise ValueError(f"{name} must be contiguous — the kernel writes it in place; got strides {tuple(tensor.stride())}") from exc
+
+    def _scale_view(self, t, name: str, device: torch.device) -> torch.Tensor:
+        """A per-tensor scale as the kernel's 1-element fp32 device view.
+
+        ``None`` binds a cached 1.0 dummy (identity fold) — the kernels take
+        the scale tensors unconditionally so there is exactly one compile
+        form and execute never reads a value back to the host (Rule 3)."""
+        if t is None:
+            return self._dummy("scale_one", device, lambda: torch.ones(1, dtype=torch.float32, device=device))
+        self._value_error_if(
+            not isinstance(t, torch.Tensor) or t.device.type != "cuda",
+            f"{name} must be a CUDA tensor; got {type(t).__name__}",
+        )
+        self._value_error_if(
+            t.dtype != torch.float32 or t.numel() < 1,
+            f"{name} must be a 1-element fp32 tensor; got dtype={t.dtype} numel={t.numel()}",
+        )
+        return t.reshape(-1)[:1]
 
     def _dummy(self, key: str, device: torch.device, factory: Callable[[], torch.Tensor]) -> torch.Tensor:
         """Return a cached device-local dummy tensor."""
@@ -1055,8 +1040,6 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         descale_k: Optional[torch.Tensor] = None,
         descale_v: Optional[torch.Tensor] = None,
         scale_o: Optional[torch.Tensor] = None,
-        descale_s: Optional[torch.Tensor] = None,
-        scale_s: Optional[torch.Tensor] = None,
         workspace: Optional[torch.Tensor] = None,
     ) -> None:
         """Launch the compiled kernel.
@@ -1125,8 +1108,6 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 descale_v,
                 scale_o,
                 amax_o,
-                descale_s,
-                scale_s,
                 current_stream,
             )
             return
@@ -1577,8 +1558,6 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         descale_v,
         scale_o,
         amax_o,
-        descale_s=None,
-        scale_s=None,
         current_stream=None,
     ):
         """Per-tensor FP8 execute (dense): scalar descales fold into scale_softmax_log2
@@ -1593,17 +1572,21 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         if self.thd:
             raise NotImplementedError("Frost per-tensor FP8: the legacy THD leg was removed (dense d128 only); see issue #552")
 
-        def _scalar(t, default=1.0):
-            return float(t.reshape(-1)[0].item()) if t is not None else default
-
-        dq, dk, dv, so = _scalar(descale_q), _scalar(descale_k), _scalar(descale_v), _scalar(scale_o)
-        _require_reciprocal_s_scales(_scalar(descale_s), _scalar(scale_s))
-        scale_softmax_log2 = scale_val * dq * dk * math.log2(math.e)
-        o_scale_fused = dv * so
-
         b, h_q, h_kv = self.batch_size, self.h_q, self.h_kv
         sq, skv = self.s_q_max, self.s_k_max
         device = q_tensor.device
+
+        # Rule 3: the scales stay on device — the kernel loads and folds
+        # descale_q*descale_k into the softmax scale and descale_v*scale_o
+        # into o_scale_fused; the scalar args carry only the bases.
+        # (descale_s/scale_s never reach this layer: the lowering does not
+        # forward them, and P is cast with the baked P_CAST_LOG2_SCALE bias.)
+        dq_t = self._scale_view(descale_q, "descale_q", device)
+        dk_t = self._scale_view(descale_k, "descale_k", device)
+        dv_t = self._scale_view(descale_v, "descale_v", device)
+        so_t = self._scale_view(scale_o, "scale_o", device)
+        scale_softmax_log2 = scale_val * math.log2(math.e)
+        o_scale_fused = 1.0
 
         Q = self._to_bshd(q_tensor)
         K = self._to_bshd(k_tensor)
@@ -1642,13 +1625,20 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             (b, h_q, h_kv, sq, skv, 0),
             cutlass.Float32(scale_softmax_log2),
             cutlass.Float32(o_scale_fused),
+            dq_t,
+            dk_t,
+            dv_t,
+            so_t,
             amax_o_buf,
             stream=current_stream,
         )
         if o_needs_copy_back:
             O_view.copy_(O)
         if amax_o is not None:
-            amax_o_buf.div_(max(so, 1e-30))
+            # Device divisor: the same div_ as before, minus the readback.
+            # scale_o > 0 is caller contract (backend parity); None bound a
+            # cached 1.0 above.
+            amax_o_buf.div_(so_t)
         self._logger.debug("execute (FP8 per-tensor) completed")
 
 
@@ -2164,8 +2154,6 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         descale_k: Optional[torch.Tensor] = None,
         descale_v: Optional[torch.Tensor] = None,
         scale_o: Optional[torch.Tensor] = None,
-        descale_s: Optional[torch.Tensor] = None,
-        scale_s: Optional[torch.Tensor] = None,
         amax_o: Optional[torch.Tensor] = None,
         sf_q: Optional[torch.Tensor] = None,
         sf_k: Optional[torch.Tensor] = None,
@@ -2211,8 +2199,6 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                 descale_v,
                 scale_o,
                 amax_o,
-                descale_s,
-                scale_s,
                 sinks=sinks,
                 seq_q_lens=seq_q_lens,
                 workspace=workspace,
@@ -2301,8 +2287,6 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         descale_v,
         scale_o,
         amax_o,
-        descale_s=None,
-        scale_s=None,
         sinks=None,
         seq_q_lens=None,
         workspace=None,
@@ -2310,24 +2294,28 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
     ):
         """Per-tensor FP8 execute: SM100 convention on the SM120 kernel.
 
-        ``descale_q*descale_k`` folds into ``scale_softmax_log2`` and
-        ``descale_s*descale_v*scale_o`` into the kernel's ``o_scale_fused``
-        scalar; ``scale_s`` goes in separately because it multiplies P before
-        the fp8 cast rather than the output (the FORT ordering: the softmax
-        denominator reads the unscaled result, then scale, then cast).
-        ``Amax_O`` is ``max|o_scaled|/scale_o`` post-kernel (pre-cast fp32,
-        so exact for every O dtype including the fp8 quantizing store).
+        The scales ride as 1-element DEVICE tensors and fold IN-KERNEL
+        (Rule 3 — no host readback): ``descale_q*descale_k`` into the softmax
+        scale, ``descale_v*scale_o`` into ``o_scale_fused``. Scale_S/Descale_S
+        never reach this layer (the lowering does not forward them); P is cast
+        with the kernels' baked ``P_CAST_LOG2_SCALE`` bias instead. ``Amax_O``
+        is ``max|o_scaled|/scale_o`` post-kernel (pre-cast fp32, so exact for
+        every O dtype including the fp8 quantizing store).
         """
         import cutlass
 
-        def _scalar(t, default=1.0):
-            return float(t.reshape(-1)[0].item()) if t is not None else default
-
-        dq, dk, dv, so = _scalar(descale_q), _scalar(descale_k), _scalar(descale_v), _scalar(scale_o)
-        ds, ss = _scalar(descale_s), _scalar(scale_s)
-        scale_softmax_log2 = scale_val * dq * dk * math.log2(math.e)
-        o_scale_fused = ds * dv * so
         device = q_tensor.device
+        # Rule 3: the scales stay on device — the kernel loads and folds
+        # dq*dk into the softmax scale and dv*so into o_scale_fused; the
+        # scalar args carry only the bases. None binds a cached 1.0.
+        # (descale_s/scale_s never reach this layer: the lowering does not
+        # forward them, and P is cast with the baked P_CAST_LOG2_SCALE bias.)
+        dq_t = self._scale_view(descale_q, "descale_q", device)
+        dk_t = self._scale_view(descale_k, "descale_k", device)
+        dv_t = self._scale_view(descale_v, "descale_v", device)
+        so_t = self._scale_view(scale_o, "scale_o", device)
+        scale_softmax_log2 = scale_val * math.log2(math.e)
+        o_scale_fused = 1.0
 
         self._value_error_if(
             self.lse_desc is not None and lse_tensor is None,
@@ -2427,7 +2415,10 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             amax_o_buf.view(torch.int32),
             cutlass.Float32(scale_softmax_log2),
             cutlass.Float32(o_scale_fused),
-            cutlass.Float32(ss),
+            dq_t,
+            dk_t,
+            dv_t,
+            so_t,
             cutlass.Int32(pack.max_sq if pack is not None else 0),
             pack.q_lens_dev if pack is not None else None,
             pack.kv_lens_dev if pack is not None else None,
@@ -2440,7 +2431,9 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             if o_needs_copy_back:
                 o_view.copy_(o_scratch)
             if amax_o is not None:
-                amax_o_buf.div_(max(so, 1e-30))
+                # Device divisor: same div_, minus the readback; scale_o > 0
+                # is caller contract (None bound a cached 1.0 above).
+                amax_o_buf.div_(so_t)
         self._logger.debug("execute (SM120 FP8 per-tensor) completed")
 
     def _thd_compile_kwargs(self) -> dict:

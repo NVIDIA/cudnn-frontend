@@ -12,7 +12,8 @@ lowered to ``mma.sync.aligned.m16n8k32.row.col.f32.{e4m3|e5m2}.{...}.f32``:
 - Q/K/V arrive PRE-QUANTIZED e4m3/e5m2: the kernel never does elementwise
   math on them, so bytes flow TMA -> ldmatrix -> MMA as bit patterns; the
   element dtype only selects the MMA tag and the P-cast cvt tag.
-  ``descale_q * descale_k`` folds host-side into ``softmax_scale_log2`` and
+  ``descale_q * descale_k`` folds IN-KERNEL from 1-element device scale
+  tensors into ``softmax_scale_log2`` (Rule 3 — no host readback) and
   ``descale_v * scale_o`` into the ``o_scale_fused`` scalar (cuDNN SDPA_FP8
   node convention; see the SM100 fp8 adapter).
 - K B-fragments: classic byte-preserving ``ldmatrix.m8n8.x4.b16`` (sm_120a has
@@ -85,6 +86,18 @@ from cudnn.sdpa.fwd.config_sm120 import (
 # The FROST loader injects one immutable specialization before executing this
 # module. A direct import uses dense e4m3 defaults.
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams(dtype_qkv=DTYPE_E4M3))
+
+# P -> fp8 cast bias (BAKED constant — NOT cuDNN's Scale_S; that pair is
+# accepted and ignored). P is quantized as P * 2**P_CAST_LOG2_SCALE via the
+# exp2 bias: the lazy-rescale skip bounds P by 2**rescale_threshold (4.0 for
+# fp8), so the cast peaks at 2^(4+4) = 256 < 448 (e4m3 max) — no saturation —
+# while flat-row entries (P ~ 1/S) sit four binades above e4m3's subnormal
+# cliff (quantization stays normal out to S ~ 2^13). row_sum accumulates in
+# the same 2^4-scaled units and is de-scaled by the EXACT 2^-4 before the
+# finalize paths (sink mix, rcp, LSE, zero-row guards run on bit-identical
+# true sums); the O leg's 2^4 is cancelled by the 2^-4 folded into
+# o_scale_fused. Invariant: rescale_threshold + P_CAST_LOG2_SCALE <= log2(448).
+P_CAST_LOG2_SCALE = 4.0
 validate_params(
     PARAMS,
     allowed_dtypes=(DTYPE_E4M3, DTYPE_E5M2),
@@ -585,7 +598,6 @@ class SM120FusedMultiHeadAttentionForward:
         row_max = softmax_params.row_max
         row_sum = softmax_params.row_sum
         softmax_scale_log2 = softmax_params.softmax_scale_log2
-        log2_scale_s = softmax_params.log2_scale_s
         p_regs = cutlass.Array(cutlass.Uint16, self.qk_k_frags * 2)
 
         # Each lane owns four S registers split across two Q rows after Q@K^T.
@@ -681,7 +693,9 @@ class SM120FusedMultiHeadAttentionForward:
             if cutlass.const_expr(in_mask_steps):
                 if exp_max == -cutlass.Float32.inf:
                     exp_max = cutlass.Float32(0.0)
-            neg_exp_max_scaled = log2_scale_s - exp_max * softmax_scale_log2
+            # P-cast bias: exp2(x + P_CAST_LOG2_SCALE) = 2^4 * P (EX2 is
+            # binade-shift-exact); see P_CAST_LOG2_SCALE.
+            neg_exp_max_scaled = cutlass.Float32(P_CAST_LOG2_SCALE) - exp_max * softmax_scale_log2
             tile_sum = cutlass.Float32(0.0)
             for k_frag in cutlass.range_constexpr(self.qk_k_frags):
                 s_off = k_frag * 4
@@ -696,10 +710,9 @@ class SM120FusedMultiHeadAttentionForward:
                 p1 = cute.math.exp2(in1, fastmath=True)
                 tile_sum = tile_sum + (p0 + p1)
                 # P stays in registers at the C-fragment coordinates; mma_pv
-                # redistributes it to the k32 A layout with shfl. p0/p1 carry
-                # Scale_S via the exp2 bias, so the cast input is the scaled
-                # value the contract asks for; descale_s stays folded into
-                # o_scale_fused.
+                # redistributes it to the k32 A layout with shfl. P is cast
+                # UNSCALED (descale_s/scale_s are unsupported on this cell,
+                # like SM100).
                 p_regs[k_frag * 2 + row_half] = fp32_to_fp8x2(p0, p1, dtype=self.in_dtype)
 
             # Reduce tile_sum across the four lanes that own one Q row.
@@ -940,8 +953,15 @@ class SM120FusedMultiHeadAttentionForward:
         tma_v_desc: cutlass.GridConstant[cuda.TensorMap],
         softmax_scale_log2: cutlass.Float32,
         o_scale_fused: cutlass.Float32,
-        scale_s: cutlass.Float32,
         n_q_tiles: cutlass.Int32,
+        # 1-element fp32 DEVICE scales (Rule 3): loaded and folded in-kernel —
+        # the scalar args arrive as attn_scale*log2(e) / 1.0 and no host
+        # readback exists anywhere. descale_s/scale_s are NOT taken: P is
+        # cast unscaled (unsupported knobs on this cell, like SM100).
+        descale_q_t: cute.Tensor,
+        descale_k_t: cute.Tensor,
+        descale_v_t: cute.Tensor,
+        scale_o_t: cute.Tensor,
     ) -> None:
         """SM120 per-tensor FP8 FMHA prefill kernel.
 
@@ -962,13 +982,14 @@ class SM120FusedMultiHeadAttentionForward:
             divides by ``scale_o`` afterwards. Pass a dummy when unused.
         :param tma_k_desc: Tensor map descriptor for K.
         :param tma_v_desc: Tensor map descriptor for V.
-        :param softmax_scale_log2: ``softmax_scale * descale_q * descale_k *
-            log2(e)``, pre-folded host-side.
-        :param o_scale_fused: ``descale_s * descale_v * scale_o``, pre-folded
-            host-side.
-        :param scale_s: cuDNN's Scale_S. Multiplies P before the e4m3 cast, the
-            way the backend's FORT engine does (amax on the unscaled softmax
-            result, then scale, then cast).
+        :param softmax_scale_log2: ``softmax_scale * log2(e)`` — descale_q *
+            descale_k folds in IN-KERNEL from the device scale tensors.
+        :param o_scale_fused: base ``1.0`` — descale_v * scale_o folds in
+            IN-KERNEL from the device scale tensors. descale_s/scale_s are
+            unsupported on this cell (P is cast unscaled, like SM100).
+        :param descale_q_t: 1-element fp32 DEVICE tensors (with descale_k_t /
+            descale_v_t / scale_o_t): loaded and folded in-kernel — Rule 3,
+            no host readback.
         """
         tidx, _, _ = cute.arch.thread_idx()
         q_tile_idx, batch_idx, head_idx = cute.arch.block_idx()
@@ -1235,13 +1256,21 @@ class SM120FusedMultiHeadAttentionForward:
                 sV=sV,
                 o_regs=o_regs,
             )
-            log2_scale_s = cute.math.log2(scale_s, fastmath=True)
-            inv_scale_s = cutlass.Float32(1.0) / scale_s
+            # Device-scale fold (Rule 3): 1-element loads, same address across
+            # the CTA -> L2 broadcast; folded exactly like the old host path.
+            _dsc_q = cutlass.Float32(cutlass.make_array_view(descale_q_t)[0])
+            _dsc_k = cutlass.Float32(cutlass.make_array_view(descale_k_t)[0])
+            _dsc_v = cutlass.Float32(cutlass.make_array_view(descale_v_t)[0])
+            _scl_o = cutlass.Float32(cutlass.make_array_view(scale_o_t)[0])
+            softmax_scale_log2 = softmax_scale_log2 * _dsc_q * _dsc_k
+            # The trailing 2^-P_CAST_LOG2_SCALE cancels the P-cast bias the O
+            # accumulator picked up through BMM2 (row_sum is de-scaled
+            # separately at finalize).
+            o_scale_fused = o_scale_fused * _dsc_v * _scl_o * cutlass.Float32(2.0**-P_CAST_LOG2_SCALE)
             softmax_params = SimpleNamespace(
                 row_max=row_max,
                 row_sum=row_sum,
                 softmax_scale_log2=softmax_scale_log2,
-                log2_scale_s=log2_scale_s,
             )
 
             # Load Q into registers.
@@ -1334,7 +1363,9 @@ class SM120FusedMultiHeadAttentionForward:
             row_sum_inv = cutlass.Array(cutlass.Float32, 2, alignment=8)
             row_lse = cutlass.Array(cutlass.Float32, 2, alignment=8)
             for row_half in cutlass.range_constexpr(2):
-                row_sum[row_half] = row_sum[row_half] * inv_scale_s
+                # row_sum carries the P-cast 2^4 — take it out with the EXACT
+                # 2^-4 so every finalize path below sees the true sum.
+                row_sum[row_half] = row_sum[row_half] * cutlass.Float32(2.0**-P_CAST_LOG2_SCALE)
                 row_max_nat = row_max[row_half] * softmax_scale_log2 * LN2
                 if cutlass.const_expr(self.has_sink):
                     sinks_arr = cutlass.make_array_view(sinks)
@@ -1523,7 +1554,10 @@ class SM120FusedMultiHeadAttentionForward:
         amax_o: cute.Tensor,
         softmax_scale_log2: cutlass.Float32,
         o_scale_fused: cutlass.Float32,
-        scale_s: cutlass.Float32,
+        descale_q_t: cute.Tensor,
+        descale_k_t: cute.Tensor,
+        descale_v_t: cute.Tensor,
+        scale_o_t: cute.Tensor,
         thd_max_sq: cutlass.Int32,
         thd_q_lens: Optional[cute.Tensor],
         thd_kv_lens: Optional[cute.Tensor],
@@ -1543,8 +1577,12 @@ class SM120FusedMultiHeadAttentionForward:
         :param seq_q_lens: Per-batch query lengths, or an unused dummy tensor.
         :param seq_kv_lens: Per-batch key/value lengths, or an unused dummy tensor.
         :param amax_o: 1-element Int32 amax buffer (pre-zeroed; dummy ok).
-        :param softmax_scale_log2: ``softmax_scale * descale_q * descale_k * log2(e)``.
-        :param o_scale_fused: ``descale_s * descale_v * scale_o``.
+        :param softmax_scale_log2: ``softmax_scale * log2(e)`` (bases only —
+            the kernel folds the device scale tensors in).
+        :param o_scale_fused: base ``1.0`` (see above). descale_s/scale_s are
+            unsupported on this cell (P is cast unscaled, like SM100).
+        :param descale_q_t: 1-element fp32 DEVICE scale tensors (with
+            descale_k_t / descale_v_t / scale_o_t) — Rule 3, no host readback.
         :param thd_max_sq: THD only: the PLAN-TIME declared S_q envelope (it
             sizes the per-sequence grid without entering the compile cache
             key; every runtime length is bounded by it, and tiles past a
@@ -1691,8 +1729,11 @@ class SM120FusedMultiHeadAttentionForward:
             tma_v_desc,
             softmax_scale_log2,
             o_scale_fused,
-            scale_s,
             cutlass.Int32(n_q_tiles),
+            descale_q_t,
+            descale_k_t,
+            descale_v_t,
+            scale_o_t,
         ).launch(
             grid=grid,
             block=(self.threads_per_cta, 1, 1),
@@ -1840,6 +1881,15 @@ def compile(  # noqa: A001
         fake_thd_q_lens = None
         fake_thd_kv_lens = None
         fake_thd_lens_form = None
+
+    def _fake_scale():
+        return cute.runtime.make_fake_compact_tensor(
+            cutlass.Float32,
+            (1,),
+            stride_order=(0,),
+            assumed_align=4,
+        )
+
     return cute.compile(
         kernel,
         fake_q,
@@ -1853,7 +1903,10 @@ def compile(  # noqa: A001
         fake_amax_o,
         cutlass.Float32(1.0),
         cutlass.Float32(1.0),
-        cutlass.Float32(1.0),
+        _fake_scale(),
+        _fake_scale(),
+        _fake_scale(),
+        _fake_scale(),
         cutlass.Int32(0),  # thd_max_sq: plan-time envelope grid extent (THD)
         fake_thd_q_lens,
         fake_thd_kv_lens,

@@ -96,25 +96,6 @@ neither names the thing that breaks it most directly: a device-to-host read.
 Known violations, all pre-existing and each needing a kernel-side change, so
 none is precedent:
 
-- THD `cu_seqlens` host cumsum (`sdpa/fwd/api_dsl.py`). RESOLVED
-  (issue #552) on every forward THD engine — SM100 f16 (all families) and
-  SM120 f16/fp8 — and the reference for future ports: the kernels compile
-  with dynamic token extents (Rule 4), a setup kernel builds the metadata
-  buffer device-side from the caller's length tensors (cu prefixes
-  normalized), every ragged view binds its buffer's capacity, and the grid
-  is the plan-time declared-S_q envelope — SM100 with dead units exiting
-  via `_thd_decode`'s `batch == n_batch` sentinel, SM120 with its
-  per-sequence rectangular grid whose past-the-length tiles always drained
-  without stores. Zero host reads, pinned per arch by the sync-debug and
-  CUDA-graph capture tests; `_thd_host_lens` is gone from the adapter.
-  Remaining follow-up: the envelope's dead-tile tax under far-oversized
-  declarations (measured ~145 ns/dead unit exposed on SM100, <0.2% at
-  realistic declarations; a capped persistent grid reading a device-side
-  live-unit count would bound it by resident clusters).
-  `sdpa_fwd_wrapper_sm80` shows the caller-provided alternative — it
-  requires `max_s_q` rather than deriving it.
-- Per-tensor FP8 descale readback (`_scalar` in the same file): fold on device,
-  passing the pointers, as the backend FP8 sdpa does.
 - The FP8/MXFP8 `seq_len_q` guard in `sdpa/fwd/engines.py`. This one cannot be
   lifted to `check_support()`: `use_padding_mask=True` requires a `seq_len_q`
   tensor even when only KV is padded, so no static rule separates "declares

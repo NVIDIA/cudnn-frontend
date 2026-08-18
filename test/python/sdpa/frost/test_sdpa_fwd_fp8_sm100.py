@@ -72,7 +72,9 @@ def _ref(qd, kd, vd, *, scale, is_causal=False, bottom_right=False, swa_window=N
     return torch.matmul(probs, v_e)
 
 
-def _run(B, H_q, H_kv, S_q, S_kv, in_key, out_dt, *, scale, sdpa_kwargs, sink=None, seq_lens_kv=None, s_scale=1.0, s_descale_gain=1.0, stats=True):
+def _run(
+    B, H_q, H_kv, S_q, S_kv, in_key, out_dt, *, scale, sdpa_kwargs, sink=None, seq_lens_kv=None, s_scale=1.0, s_descale_gain=1.0, stats=True, sync_debug=False
+):
     import cudnn
 
     dev = "cuda"
@@ -145,7 +147,17 @@ def _run(B, H_q, H_kv, S_q, S_kv, in_key, out_dt, *, scale, sdpa_kwargs, sink=No
     vp.update({o: Ob, amx_o: amax_o})
     if stats:
         vp[stats_t] = lse
-    g.execute(vp, torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8))
+    ws = torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8)
+    if sync_debug:
+        # Rule 3 pin: execute must not read the scale tensors (or anything
+        # else) back to the host.
+        prev_sync_mode = torch.cuda.get_sync_debug_mode()
+        torch.cuda.set_sync_debug_mode(2)
+    try:
+        g.execute(vp, ws)
+    finally:
+        if sync_debug:
+            torch.cuda.set_sync_debug_mode(prev_sync_mode)
     torch.cuda.synchronize()
 
     ref_kw = _ref_kwargs(sdpa_kwargs)
@@ -308,14 +320,19 @@ def test_fp8_sm100_execute_lse_contract():
 @pytest.mark.L0
 @pytest.mark.parametrize("gain", [2.0, 0.5])
 @torch_fork_set_rng(seed=0)
-def test_fp8_sm100_declines_non_reciprocal_s_scales(gain):
-    """A reciprocal Scale_S/Descale_S pair is exact on a kernel that casts P
-    unscaled, so it is served. A non-reciprocal pair asks for an O this kernel
-    will not produce -- it must decline, not answer wrongly.
+def test_fp8_sm100_s_scales_ignored(gain):
+    """Scale_S/Descale_S are unsupported knobs on this cell (P is cast
+    unscaled): their values are accepted and IGNORED -- nothing reads them,
+    host or device (the old execute-time reciprocal check was itself a Rule 3
+    readback). A wild non-reciprocal pair therefore produces the bitwise-same
+    O as unit scales.
     """
     scale = 1.0 / math.sqrt(128)
-    with pytest.raises(NotImplementedError, match="reciprocal"):
-        _run(2, 8, 8, 256, 256, "e4m3", torch.float16, scale=scale, sdpa_kwargs=dict(use_causal_mask=True), s_descale_gain=gain)
+    torch.manual_seed(2024)
+    unit = _run(2, 8, 8, 256, 256, "e4m3", torch.float16, scale=scale, sdpa_kwargs=dict(use_causal_mask=True))
+    torch.manual_seed(2024)
+    wild = _run(2, 8, 8, 256, 256, "e4m3", torch.float16, scale=scale, sdpa_kwargs=dict(use_causal_mask=True), s_scale=8.0, s_descale_gain=gain)
+    assert torch.equal(unit[0], wild[0]), "descale_s/scale_s values must not reach the kernel"
 
 
 @pytest.mark.L0
@@ -331,3 +348,16 @@ def test_fp8_sm100_accepts_reciprocal_s_scales(s_scale):
     torch.manual_seed(2024)
     scaled = _run(2, 8, 8, 256, 256, "e4m3", torch.float16, scale=scale, sdpa_kwargs=dict(use_causal_mask=True), s_scale=s_scale)
     assert torch.equal(unit[0], scaled[0]), "reciprocal S scales must not change O"
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=7)
+def test_fp8_sm100_device_scales_execute_reads_no_device_memory():
+    """The graph path binds DEVICE scale tensors and the kernel folds
+    descale_q*descale_k / descale_v*scale_o in-kernel; amax_o divides by the
+    device scale_o -- no .item()/D2H readback anywhere (Rule 3), pinned by
+    sync-debug mode 2 around the execute. Numerics vs the fp32 reference are
+    unchanged."""
+    scale = 1.0 / math.sqrt(128)
+    out, o_ref, a_o, a_o_ref = _run(2, 8, 8, 256, 256, "e4m3", torch.float16, scale=scale, sdpa_kwargs=dict(use_causal_mask=True), sync_debug=True)
+    _check(out, o_ref, torch.float16, "e4m3", a_o, a_o_ref)

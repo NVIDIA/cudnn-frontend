@@ -2049,9 +2049,11 @@ def _host(
         # DEVICE-side from the caller's length tensors (no host cumsum, no
         # H2D — issue #552), then the per-batch O descriptor array (reuse
         # tma_o_desc over the packed [1,T,QH,D_v] O as base). Main grid: the
-        # exact flat batch-outermost grid (n_thd_units =
-        # Σ_b ceil(S_q_b/CGA_TILE_M)*QH, host-computed); grid_x =
-        # n_thd_units * CGA_M.  Works at cga1 (CGA_M=1).
+        # PLAN-TIME ENVELOPE (n_thd_units = B * ceil(S_q_decl/CGA_TILE_M) * QH,
+        # from the DECLARED S_q — no runtime length reaches the host); units
+        # past a sequence's live tiles decode the batch == n_batch sentinel
+        # and drain without loads or stores. grid_x = n_thd_units * CGA_M.
+        # Works at cga1 (CGA_M=1).
         # ENVELOPE: the packed-O row stride is QH * ACTUAL d_v (o_tensor's
         # static inner extent), not QH * TILE_O — the per-batch descriptor
         # bases must step in real rows or every batch >= 1 lands OOB.

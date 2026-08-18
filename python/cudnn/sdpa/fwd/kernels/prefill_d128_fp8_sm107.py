@@ -18,8 +18,11 @@ never touch the shipping Blackwell kernel:
 Original header follows.
 
 Classic 2-sub-tile pipeline (TILES_Q=2, two softmax warpgroups, four correction
-warps, persistent try_cancel scheduler).  Per-tensor descales fold into
-scale_softmax_log2; o_scale_fused feeds the correction epilogue's threshold_beta.
+warps, persistent try_cancel scheduler).  Per-tensor descales are LOADED
+IN-KERNEL from 1-element device tensors and folded into scale_softmax_log2 /
+o_scale_fused (Rule 3 — no host readback); o_scale_fused feeds the correction
+epilogue's threshold_beta.  descale_s/scale_s are accepted and ignored (P is
+cast unscaled; unsupported knobs on this cell).
 Optional output dtype (DTYPE_O): FP8 in → E4M3 / E5M2 / BF16 / FP16 O.  Shares the
 f16 / mxfp8 SM100 d=128 layout plus the FP8-on-Blackwell K-path:
   1. **cga2-only, STAGES_KV=4** (config; FP8 BPE=1 → 128..160 KiB SMEM).
@@ -154,6 +157,19 @@ else:
         f"(expected 0=E4M3 or 1=E5M2; use the DSL backend with --bf16/--fp16 "
         f"for the f16 kernel, or extend this dispatch for new fp8 variants)"
     )
+
+# P -> fp8 cast bias (BAKED constant — NOT cuDNN's Scale_S; that pair is
+# accepted and ignored). P is quantized as P * 2**P_CAST_LOG2_SCALE: the
+# lazy-rescale skip bounds P by 2**RESCALE_THRESHOLD (4.0 for fp8, see
+# config_sm100.rescale_threshold), so the cast peaks at 2^(4+4) = 256 < 448
+# (e4m3 max) — no saturation — while flat-row entries (P ~ 1/S) sit four
+# binades above e4m3's subnormal cliff (quantization stays normal out to
+# S ~ 2^13). The bias rides the exp2 argument, so total_sum accumulates in
+# the SAME 2^4-scaled units and the O normalization (O_acc / total_sum)
+# cancels it exactly; only the LSE subtracts the constant (and the sink
+# denominator term is scaled up to match). Invariant:
+# RESCALE_THRESHOLD + P_CAST_LOG2_SCALE <= log2(448).
+P_CAST_LOG2_SCALE = 4.0
 
 # DTYPE_O is independent of DTYPE_QKV (mirrors C++ Cfg::DTYPE_O — defaults to
 # DTYPE_QKV but may be promoted to BF16/FP16 so a downstream consumer skips a
@@ -294,6 +310,15 @@ def _kernel(
     qh_per_kh: cutlass.Int32,
     scale_softmax_log2: cutlass.Float32,
     o_scale_fused: cutlass.Float32,
+    # 1-element fp32 DEVICE scales (Rule 3): the descale/scale factors are
+    # loaded and folded HERE — scale_softmax_log2 arrives as attn_scale*log2(e)
+    # and o_scale_fused as 1.0; no host readback exists anywhere. descale_s /
+    # scale_s are NOT taken: this kernel casts P unscaled, so their values are
+    # accepted by the adapter and ignored (unsupported knobs on this cell).
+    descale_q_t: cute.Tensor,
+    descale_k_t: cute.Tensor,
+    descale_v_t: cute.Tensor,
+    scale_o_t: cute.Tensor,
     amax_o_tensor: cute.Tensor,
 ) -> None:
 
@@ -435,6 +460,16 @@ def _kernel(
     # tma_mcast_mask = 1 << cta_rank — cta_group::2 routing strips bit-24 onto leader.
     tma_mcast_mask = (cutlass.Int16(1) << cta_in_pair) if cutlass.const_expr(CFG.CTA_MMA == 2) else cutlass.Int16(0)
     is_leader = cta_in_pair == cutlass.Int32(0)
+
+    # Device-scale fold: every thread loads the four 1-element fp32 scales
+    # (same addresses -> L2 broadcast, negligible) and folds them into the
+    # softmax scale and the output scale.
+    _dsc_q = cutlass.Float32(cutlass.make_array_view(descale_q_t)[0])
+    _dsc_k = cutlass.Float32(cutlass.make_array_view(descale_k_t)[0])
+    _dsc_v = cutlass.Float32(cutlass.make_array_view(descale_v_t)[0])
+    _scl_o = cutlass.Float32(cutlass.make_array_view(scale_o_t)[0])
+    scale_softmax_log2 = scale_softmax_log2 * _dsc_q * _dsc_k
+    o_scale_fused = o_scale_fused * _dsc_v * _scl_o
 
     if warp_idx >= CFG.SOFTMAX_WG0_BASE and warp_idx < CFG.SOFTMAX_WG0_BASE + CFG.SOFTMAX_WG_WARPS:
         nvvm.setmaxregister(CFG.SOFTMAX_REGS, nvvm.SetMaxRegisterAction.INCREASE)
@@ -1372,7 +1407,9 @@ def _softmax_kv_body(
 
     # Manual unroll — tracer intercepts range_constexpr in ways that break
     # slice.indices() inside RegTile[]; N_CHUNKS ∈ {1,2} so explicit is cleaner.
-    reg_S = reg_S * scale_log2 - new_total_max
+    # P-cast bias: exp2(x + P_CAST_LOG2_SCALE) = 2^4 * P — the sum picks up
+    # the same factor, so normalization cancels it (see P_CAST_LOG2_SCALE).
+    reg_S = reg_S * scale_log2 - (new_total_max - cutlass.Float32(P_CAST_LOG2_SCALE))
 
     chunk_S_0 = reg_S[0:CHUNK].vec
     chunk_P_0 = cute.math.exp2(chunk_S_0, fastmath=True)
@@ -1799,11 +1836,14 @@ def _correction_warp_group(
                 sink_logit = sinks_arr[head_idx]
                 new_max = cute.math.max(total_max_nat, sink_logit)
                 scale = cute.math.exp(total_max_nat - new_max, fastmath=True)
-                new_sum = total_sum * scale + cute.math.exp(sink_logit - new_max, fastmath=True)
-                lse_val = new_max + cute.math.log(new_sum, fastmath=True)
+                # total_sum is in 2^P_CAST_LOG2_SCALE units — lift the sink term
+                # into the same units, then take the constant back out of the LSE.
+                new_sum = total_sum * scale + cute.math.exp(sink_logit - new_max, fastmath=True) * cutlass.Float32(2.0**P_CAST_LOG2_SCALE)
+                lse_val = new_max + cute.math.log(new_sum, fastmath=True) - cutlass.Float32(P_CAST_LOG2_SCALE) * LN2
                 inv_sum = (scale * o_scale_fused) / new_sum
             else:
-                lse_val = total_max_nat + cute.math.log(total_sum, fastmath=True)
+                # total_sum carries 2^P_CAST_LOG2_SCALE — subtract the constant.
+                lse_val = total_max_nat + cute.math.log(total_sum, fastmath=True) - cutlass.Float32(P_CAST_LOG2_SCALE) * LN2
                 # Safe inverse: avoid div by 0 on fully-masked rows.
                 inv_sum = o_scale_fused / cute.math.max(total_sum, cutlass.Float32(1e-30))
 
@@ -1958,6 +1998,11 @@ def _host(
     problem_size: Tuple[int, int, int, int, int, int],
     scale_softmax_log2: cutlass.Float32,
     o_scale_fused: cutlass.Float32,
+    # 1-element fp32 device scales (Rule 3 — see _kernel).
+    descale_q_t: cute.Tensor,
+    descale_k_t: cute.Tensor,
+    descale_v_t: cute.Tensor,
+    scale_o_t: cute.Tensor,
     amax_o_tensor: cute.Tensor,
     stream: _cuda_driver.CUstream = None,
 ) -> None:
@@ -2031,6 +2076,10 @@ def _host(
         cutlass.Int32(QH // KH),
         scale_softmax_log2,
         o_scale_fused,
+        descale_q_t,
+        descale_k_t,
+        descale_v_t,
+        scale_o_t,
         amax_o_tensor,
     ).launch(
         grid=grid_shape,
@@ -2102,6 +2151,15 @@ def compile(b: int = 1, qh: int = 1, kh: int = 1, sq: int = 256, skv: int = 128,
         stride_order=(0,),
         assumed_align=16,
     )
+
+    def _fake_scale():
+        return cute.runtime.make_fake_compact_tensor(
+            cutlass.Float32,
+            (1,),
+            stride_order=(0,),
+            assumed_align=4,
+        )
+
     return cute.compile(
         _host,
         fake_q,
@@ -2114,6 +2172,10 @@ def compile(b: int = 1, qh: int = 1, kh: int = 1, sq: int = 256, skv: int = 128,
         (b, qh, kh, sq, skv, 0),
         cutlass.Float32(0.0),
         cutlass.Float32(0.0),
+        _fake_scale(),
+        _fake_scale(),
+        _fake_scale(),
+        _fake_scale(),
         fake_amax_o,
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
