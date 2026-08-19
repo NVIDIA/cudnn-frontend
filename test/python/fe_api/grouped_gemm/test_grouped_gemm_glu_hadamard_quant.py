@@ -17,6 +17,17 @@ from fe_api.test_fe_api_utils import (
     ue5m3_bytes_to_fp32,
 )
 
+import cutlass
+
+# The glu_hadamard_quant kernel references cutlass.FloatNV8E5M3FNU
+# unconditionally at compile time (moe_blockscaled_grouped_gemm_glu_hadamard_quant.py),
+# and that dtype only exists in cutlass-dsl >= 4.8. Skip the whole file on
+# older builds instead of failing every test with an AttributeError.
+pytestmark = pytest.mark.skipif(
+    not hasattr(cutlass, "FloatNV8E5M3FNU"),
+    reason="glu_hadamard_quant kernels require cutlass-dsl >= 4.8 (cutlass.FloatNV8E5M3FNU)",
+)
+
 FP4_EXECUTION_CASES = [
     (torch.float4_e2m1fn_x2, torch.float8_e4m3fn, 16),
     (torch.float4_e2m1fn_x2, torch.float8_e8m0fnu, 16),
