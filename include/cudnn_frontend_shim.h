@@ -523,13 +523,18 @@ causal_conv1d_backward(cudaStream_t stream,
 
 inline bool
 is_gnn_agg_simple_available() {
+#if CUDNN_VERSION >= 92600
 #if defined(NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING)
     return get_symbol("cudnnGnnAggSimpleForward") != nullptr && get_symbol("cudnnGnnAggSimpleBackward") != nullptr;
 #else
     return true;
 #endif
+#else
+    return false;
+#endif
 }
 
+#if CUDNN_VERSION >= 92600
 inline cudnnStatus_t
 gnn_agg_simple_forward(cudaStream_t stream,
                        const cudnnGnnCscGraph_t *graph,
@@ -587,6 +592,7 @@ gnn_agg_simple_backward(cudaStream_t stream,
                           data_type,
                           agg_op);
 }
+#endif
 
 inline size_t
 get_backend_version(void) {
