@@ -570,7 +570,7 @@ def _render_tile_constants(
         f"b_is_n_major = {chain.matmul.b_major == 'n'}",
         f"mma_a_major = {1 if chain.matmul.a_major == 'm' else 0}",
         f"mma_b_major = {1 if chain.matmul.b_major == 'n' else 0}",
-        f"ab_stages = {cfg.max_ab_stages(cta_group)}",
+        f"ab_stages = {cfg.max_ab_stages(cta_group, moe=chain.has_moe)}",
         f"multicast_a = {cfg.multicast_a}",
         f"multicast_b = {cfg.multicast_b(cta_group)}",
         f"ab_smem_swizzle = cutlass.experimental.primitives.Tcgen05SmemSwizzle.{smem_swizzle_name}",
@@ -649,7 +649,7 @@ def _render_tile_constants(
         # Per-CTA SMEM B-tile N is halved under 2-CTA MMA (the pair splits B's N).
         smem_n = cfg.cta_tile_n // cta_group
         per_stage = (chain.num_a_operands * cfg.cta_tile_m + chain.num_b_operands * smem_n) * cfg.cta_tile_k_bytes
-        avail = _sm_smem_ab_budget_bytes(cfg.pipeline)
+        avail = _sm_smem_ab_budget_bytes(cfg.pipeline, moe=chain.has_moe)
         ab_stages_mg = min(avail // per_stage, _AB_STAGES_CAP)
         if ab_stages_mg < 1:
             raise NotImplementedError(
@@ -723,6 +723,7 @@ def _render_tile_constants(
             cta_group,
             extra_smem_bytes=smem_d_bytes,
             extra_per_stage_bytes=cast_extra_per_stage,
+            moe=chain.has_moe,
         )
         lines.append(f"ab_stages = {new_ab}  # SMEM-D {smem_d_bytes}B fixed" f" + cast LOAD {cast_extra_per_stage}B/stage")
     lines.extend(_quant_device_imports(chain))
@@ -1225,7 +1226,7 @@ def _render_block_scale_tile_constants(
 
     # TMA-store stages output through a fixed SMEM-D buffer; reserve it before
     # sizing the AB pipeline (else SMEM overflows the cap).
-    ab_budget = _sm_smem_ab_budget_bytes(cfg.pipeline) - (_smem_d_bytes(cfg, chain) if use_tma_store_epi else 0)
+    ab_budget = _sm_smem_ab_budget_bytes(cfg.pipeline, moe=chain.has_moe) - (_smem_d_bytes(cfg, chain) if use_tma_store_epi else 0)
     if is_sm103:
         # CUTLASS-style sm103 pipeline: an AB stage is ONE 128-B-K chunk (a
         # third of the 384-B K-tile), and SF rides its OWN ring (own warp,
