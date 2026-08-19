@@ -454,7 +454,9 @@ def _fp8_family_split(kfile, dtype_qkv, splits, cta_mma, mx):
         # The FP8 entry takes four 1-element fp32 DEVICE scale tensors
         # (descale_q/k/v, scale_o) — the scales fold in-kernel — and no Amax_S.
         one = lambda: torch.ones(1, dtype=torch.float32, device=dev)
-        fn(q, k, v, o_p, lse_p, zH, zB, ps, log2e, cutlass.Float32(1.0), one(), one(), one(), one(), amax_o, stream=stream)
+        # o_desc dummy + n_thd_units=0: THD-only ABI slots (dense fold), like the f16 call above.
+        o_desc = torch.zeros(1, dtype=torch.int64, device=dev)
+        fn(q, k, v, o_p, lse_p, zH, zB, o_desc, ps, log2e, cutlass.Float32(1.0), cutlass.Int32(0), one(), one(), one(), one(), amax_o, stream=stream)
         qf, kf, vf = (t.float().permute(0, 2, 1, 3) for t in (q, k, v))
     else:
         from sdpa.mxfp8_quant import quantize_to_mxfp8
@@ -472,7 +474,9 @@ def _fp8_family_split(kfile, dtype_qkv, splits, cta_mma, mx):
         q8 = q8.reshape(B, H, SQ, D).permute(0, 2, 1, 3).contiguous()
         k8 = k8.reshape(B, H, SKV, D).permute(0, 2, 1, 3).contiguous()
         v8 = v8.reshape(B, H, SKV, D).permute(0, 2, 1, 3).contiguous()
-        fn(q8, k8, v8, o_p, sfq, sfk, sfv, lse_p, amax_o, zH, zB, ps, log2e, stream=stream)
+        # o_desc dummy + n_thd_units=0: THD-only ABI slots (dense fold), like the f16 call above.
+        o_desc = torch.zeros(1, dtype=torch.int64, device=dev)
+        fn(q8, k8, v8, o_p, sfq, sfk, sfv, lse_p, amax_o, zH, zB, o_desc, ps, log2e, cutlass.Int32(0), stream=stream)
 
     ref = torch.matmul(torch.softmax(torch.matmul(qf, kf.transpose(-1, -2)) * scale, -1), vf).permute(0, 2, 1, 3)
     if splits == 1:

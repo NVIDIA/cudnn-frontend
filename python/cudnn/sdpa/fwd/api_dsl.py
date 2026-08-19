@@ -873,8 +873,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # covers direct construction.
         self._not_implemented_error_if(
             self.thd and self._fp8 and (int(d_qk), int(d_v)) != (128, 128),
-            f"THD/varlen on the FP8/MXFP8 path requires D_QK=D_V=128 (the d192/d128 "
-            f"kernels are dense-only); got (D_QK={d_qk}, D_V={d_v})",
+            f"THD/varlen on the FP8/MXFP8 path requires D_QK=D_V=128 (the d192/d128 " f"kernels are dense-only); got (D_QK={d_qk}, D_V={d_v})",
         )
         # Dense padded-Q trim backstops (engines.lower_dsl_prefill never sets
         # these combinations; a direct caller could).
@@ -1393,6 +1392,17 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             lens_form=lens_form,
         )
 
+    def _thd_lse_tokens_cap(self, lse_tensor):
+        """The LSE buffer's token capacity when it shares the Q/O dynamic token
+        symbol — token-major (the default) and COMPACT head-major (declared
+        head stride 0, i.e. the token extent itself) both do, so their
+        capacity joins the packed-Q floor; head-major with a declared
+        head_stride carries its own extent (covering the packed total is
+        caller contract — t_q is a device value, Rule 3), so it stays out."""
+        if lse_tensor is None or (self.thd_stats_head_major and self.thd_stats_head_stride):
+            return None
+        return lse_tensor.numel() // self.h_q
+
     def _thd_lse_view(self, lse_tensor, t_q):
         """The caller's ragged Stats buffer in its declared layout — token-major
         packed rank-2 (T, H) (the default; cuDNN's TH1 ragged Stats recipe) or
@@ -1425,10 +1435,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         new packed total re-binds the same artifact."""
         import cutlass
 
-        # A token-major (or compact head-major) LSE shares the Q/O dynamic
-        # token symbol, so its capacity joins their floor; head-major with a
-        # declared head_stride carries its own extent.
-        lse_cap = lse_tensor.numel() // self.h_q if (lse_tensor is not None and not (self.thd_stats_head_major and self.thd_stats_head_stride)) else None
+        lse_cap = self._thd_lse_tokens_cap(lse_tensor)
         pack = self._thd_pack(
             q_buf, k_buf, v_buf, o_buf, sinks, seq_len_kv, seq_q_lens, workspace, "SdpaFwdDslSm100 (THD)", current_stream=current_stream, lse_tokens_cap=lse_cap
         )
@@ -1578,7 +1585,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             amax_o_buf = self._amax_slot(amax_o, "amax_o", device)
             with _torch_stream_context(current_stream, device):
                 amax_o_buf.zero_()
-            lse_cap = lse_tensor.numel() // h_q if (lse_tensor is not None and not (self.thd_stats_head_major and self.thd_stats_head_stride)) else None
+            lse_cap = self._thd_lse_tokens_cap(lse_tensor)
             pack = self._thd_pack(
                 q_tensor,
                 k_tensor,
@@ -1729,7 +1736,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             amax_o_buf = self._amax_slot(amax_o, "amax_o", device)
             with _torch_stream_context(current_stream, device):
                 amax_o_buf.zero_()
-            lse_cap = lse_tensor.numel() // h_q if (lse_tensor is not None and not (self.thd_stats_head_major and self.thd_stats_head_stride)) else None
+            lse_cap = self._thd_lse_tokens_cap(lse_tensor)
             pack = self._thd_pack(
                 q_tensor,
                 k_tensor,
