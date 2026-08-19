@@ -2,12 +2,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Benchmark block-sparse attention inference (forward-only) in cuDNN Frontend.
+"""Benchmark block-sparse attention (forward and backward) in cuDNN Frontend.
 
-Times the public ``cudnn.block_sparse_attention_forward`` API against the
-FA4-lineage CuTe DSL block-sparse forward (``flash_attn.cute``, optional) on
-identical block masks, across sparse-block granularities of 64, 128, and 256
-tokens. A dense run (every block selected) is included per case to show the
+Times the public ``cudnn.block_sparse_attention_forward``/``_backward`` APIs
+against the FA4-lineage CuTe DSL block-sparse kernels (``flash_attn.cute``,
+optional) on identical block masks, across sparse-block granularities of 64,
+128, and 256 tokens. A dense run (every block selected) is included per case to show the
 kernel's peak as an upper reference for the sparse bars.
 
 The workload models video-generation sparse attention: batch 1, head_dim
@@ -20,9 +20,10 @@ The default cases are Wan2.1 text-to-video shapes — 1.3B (12 heads) and 14B
 (40 heads) at 480P (S = 24x32x52 = 39936 latent tokens) and 720P
 (S = 24x48x80 = 92160) — plus MiniMax-H3 (56 heads, ~31k/~91k tokens).
 
-Reported TFLOPS count only the selected blocks:
+Reported TFLOPS count only the selected blocks — 2 matmuls forward
+(QK^T, PV), 5 backward (recompute S, dV, dP, dQ, dK):
 
-    FLOPs = 4 * H * D * S * keep_blocks_per_row * block_tokens
+    FLOPs = 2 * matmuls * D * block_tokens^2 * selected_blocks
 
 Both arms are fed the same selected-token set in every cell. Where a kernel
 cannot express the requested granularity natively, the mask is losslessly
@@ -47,7 +48,10 @@ import sys
 import torch
 
 try:
-    from cudnn.block_sparse_attention import block_sparse_attention_forward
+    from cudnn.block_sparse_attention import (
+        block_sparse_attention_backward,
+        block_sparse_attention_forward,
+    )
 except ImportError as e:
     block_sparse_attention_forward, _CUDNN_IMPORT_ERROR = None, e
 else:
@@ -139,11 +143,17 @@ def make_qkv(num_heads, seqlen, device="cuda"):
     return q, torch.randn_like(q), torch.randn_like(q)
 
 
+def make_dout(out):
+    """Deterministic output gradient, identical across arms and the reference."""
+    gen = torch.Generator(out.device).manual_seed(7)
+    return torch.randn(out.shape, generator=gen, device=out.device,
+                       dtype=torch.float32).to(out.dtype)
+
+
 # --------------------------------------------------------------------------- arms
 
 
-def run_cudnn(q, k, v, mask, granularity):
-    """cuDNN BSA forward. 64/128 are native; 256 is re-expressed on 128 blocks."""
+def _cudnn_metadata(mask, granularity):
     if granularity == 256:
         mask, sparse_block_size = expand_mask(mask, 2), 128
     else:
@@ -160,8 +170,22 @@ def run_cudnn(q, k, v, mask, granularity):
         if sparse_block_size == 128 and cap % 2:
             idx = torch.cat([idx, idx[..., -1:]], -1)
             cap += 1
-    return lambda: block_sparse_attention_forward(
+    return idx, nums, cap, sparse_block_size
+
+
+def run_cudnn(q, k, v, mask, granularity, direction="fwd"):
+    """cuDNN BSA. 64/128 are native block sizes; 256 is re-expressed on 128."""
+    idx, nums, cap, sparse_block_size = _cudnn_metadata(mask, granularity)
+    fwd = lambda: block_sparse_attention_forward(
         q, k, v, idx, block_sparse_num=cap, q2k_block_nums=nums,
+        sparse_block_size=sparse_block_size, layout="bshd",
+    )
+    if direction == "fwd":
+        return fwd
+    out, lse = fwd()
+    dout = make_dout(out)
+    return lambda: block_sparse_attention_backward(
+        dout, q, k, v, out, lse, idx, block_sparse_num=cap, q2k_block_nums=nums,
         sparse_block_size=sparse_block_size, layout="bshd",
     )
 
@@ -173,21 +197,38 @@ def _load_fa4():
     return BlockSparseTensorsTorch, _flash_attn_fwd
 
 
-def run_fa4(q, k, v, mask, granularity):
-    """FA4-lineage CuTe BSA forward (flash_attn.cute).
+def _load_fa4_bwd():
+    from flash_attn.cute.interface import _flash_attn_bwd
+
+    return _flash_attn_bwd
+
+
+def run_fa4(q, k, v, mask, granularity, direction="fwd"):
+    """FA4-lineage CuTe BSA (flash_attn.cute).
 
     The SM100 kernel selects at 256-token Q granularity and its KV tile caps
     at 128, so masks finer than that are aggregated on the Q side (rows in a
     256-token group attend the union of their blocks — extra work the shared
     FLOP count does not credit) and re-expressed on 128-token KV blocks for
-    granularity 256.
+    granularity 256. The backward requires the sparse KV block to be a
+    multiple of its N tile, so 64-token blocks run with a 64-wide N tile.
     """
     BlockSparseTensorsTorch, _flash_attn_fwd = _load_fa4()
     if granularity == 256:
         mask, kv_block = expand_mask(mask, 2), 128
     else:
         kv_block = granularity
-    q_group = 256 // kv_block
+    if direction == "bwd" and kv_block < 128:
+        # The SM100 backward's N tile is fixed at 128, so the sparse KV block
+        # must be at least 128. The forward must attend the identical token
+        # set for the gradients to be correct, so the whole pipeline runs the
+        # KV-aggregated (union) mask.
+        h, nbq, nbk = mask.shape
+        factor = 128 // kv_block
+        mask = mask.view(h, nbq, nbk // factor, factor).any(-1)
+        kv_block = 128
+    q_gran = 128 if granularity == 256 else granularity
+    q_group = 256 // q_gran
     if q_group > 1:
         h, nbq, nbk = mask.shape
         mask = mask.view(h, nbq // q_group, q_group, nbk).any(2)
@@ -200,9 +241,29 @@ def run_fa4(q, k, v, mask, granularity):
         mask_block_idx=idx[..., :0].unsqueeze(0).cuda(),
         block_size=(256, kv_block),
     )
-    return lambda: _flash_attn_fwd(
+    fwd = lambda: _flash_attn_fwd(
         q, k, v, tile_mn=(128, kv_block), block_sparse_tensors=sparse_tensors,
         causal=False, return_lse=True,
+    )
+    if direction == "fwd":
+        return fwd
+    _flash_attn_bwd = _load_fa4_bwd()
+    out, lse = fwd()[:2]
+    dout = make_dout(out)
+    # The backward consumes Q-direction metadata: per KV block, the list of
+    # Q blocks that attend it (the transpose of the forward lists).
+    t_idx, t_counts, _ = mask_to_indices(mask.transpose(-1, -2).contiguous())
+    t_empty = torch.zeros_like(t_counts)
+    bwd_tensors = BlockSparseTensorsTorch(
+        full_block_cnt=t_counts.unsqueeze(0).cuda(),
+        full_block_idx=t_idx.unsqueeze(0).cuda(),
+        mask_block_cnt=t_empty.unsqueeze(0).cuda(),
+        mask_block_idx=t_idx[..., :0].unsqueeze(0).cuda(),
+        block_size=(256, kv_block),
+    )
+    return lambda: _flash_attn_bwd(
+        q, k, v, out, dout, lse, causal=False,
+        block_sparse_tensors=bwd_tensors,
     )
 
 
@@ -231,12 +292,14 @@ def time_fn(fn, warmup=3, target_ms=500.0, max_iters=50):
     return start.elapsed_time(end) / iters
 
 
-def bench_cell(arm, num_heads, seqlen, granularity, mask):
+def bench_cell(arm, num_heads, seqlen, granularity, mask, direction):
     q, k, v = make_qkv(num_heads, seqlen)
-    fn = ARMS[arm](q, k, v, mask, granularity)
+    fn = ARMS[arm](q, k, v, mask, granularity, direction)
     ms = time_fn(fn)
-    # 2 matmuls (QK^T, PV) over the selected blocks only.
-    flops = 4 * HEAD_DIM * granularity * granularity * int(mask.sum())
+    # Selected blocks only: forward is 2 matmuls (QK^T, PV), backward is 5
+    # (recompute S, dV, dP, dQ, dK).
+    matmuls = 2 if direction == "fwd" else 5
+    flops = 2 * matmuls * HEAD_DIM * granularity * granularity * int(mask.sum())
     return ms, flops / ms * 1e-9
 
 
@@ -252,12 +315,15 @@ def check_parity(arms):
         }
         for family, mask in families.items():
             q, k, v = make_qkv(num_heads, seqlen)
-            qf, kf, vf = (t.squeeze(0).permute(1, 0, 2).float() for t in (q, k, v))
+            qf, kf, vf = (t.squeeze(0).permute(1, 0, 2).float().requires_grad_()
+                          for t in (q, k, v))
             scores = qf @ kf.transpose(-1, -2) / math.sqrt(HEAD_DIM)
             token_mask = expand_mask(mask, granularity).cuda()
             scores = scores.masked_fill(~token_mask, float("-inf"))
             ref = (scores.softmax(-1) @ vf).permute(1, 0, 2)
             floor = (ref.to(torch.bfloat16).float() - ref).abs().max().item()
+            ref.backward(make_dout(ref.unsqueeze(0)).squeeze(0).float())
+            grad_refs = [t.grad.permute(1, 0, 2) for t in (qf, kf, vf)]
             for arm in arms:
                 if arm == "fa4" and granularity < 256 and family == "topk":
                     continue  # FA4's Q aggregation attends a superset; not comparable
@@ -265,8 +331,17 @@ def check_parity(arms):
                 err = (out.squeeze(0).float() - ref).abs().max().item()
                 ok = err < 8 * max(floor, 1e-3)
                 failures += not ok
-                print(f"parity {arm} {family} blk{granularity}: max_err={err:.3e} "
+                print(f"parity {arm} {family} blk{granularity} fwd: max_err={err:.3e} "
                       f"bf16_floor={floor:.3e} -> {'PASS' if ok else 'FAIL'}")
+                grads = tuple(ARMS[arm](q, k, v, mask, granularity, "bwd")())[:3]
+                for name, grad, grad_ref in zip("dq dk dv".split(), grads, grad_refs):
+                    gfloor = (grad_ref.to(torch.bfloat16).float() - grad_ref).abs().max().item()
+                    gerr = (grad.squeeze(0).float() - grad_ref).abs().max().item()
+                    ok = gerr < 16 * max(gfloor, 1e-3)
+                    failures += not ok
+                    print(f"parity {arm} {family} blk{granularity} bwd {name}: "
+                          f"max_err={gerr:.3e} bf16_floor={gfloor:.3e} -> "
+                          f"{'PASS' if ok else 'FAIL'}")
     return failures
 
 
@@ -283,16 +358,18 @@ def plot(rows, path):
     fig, axes = plt.subplots(1, len(cases), figsize=(6 * len(cases), 4.5), squeeze=False)
     for ax, case in zip(axes[0], cases):
         cells = [r for r in rows if r["case"] == case]
-        labels = list(dict.fromkeys(
-            "dense" if r["sparsity"] == 0.0 else f"blk{r['granularity']}\n{int(r['sparsity'] * 100)}%"
-            for r in cells))
+        def cell_label(r):
+            base = "dense" if r["sparsity"] == 0.0 else f"blk{r['granularity']} {int(r['sparsity'] * 100)}%"
+            return f"{base}\n{r['direction']}"
+
+        labels = list(dict.fromkeys(cell_label(r) for r in cells))
         arms = list(dict.fromkeys(r["arm"] for r in cells))
         width = 0.8 / len(arms)
         for i, arm in enumerate(arms):
             vals = []
             for label in labels:
-                match = [r["tflops"] for r in cells if r["arm"] == arm and (
-                    ("dense" if r["sparsity"] == 0.0 else f"blk{r['granularity']}\n{int(r['sparsity'] * 100)}%") == label)]
+                match = [r["tflops"] for r in cells
+                         if r["arm"] == arm and cell_label(r) == label]
                 vals.append(match[0] if match else 0.0)
             xs = [j + (i - (len(arms) - 1) / 2) * width for j in range(len(labels))]
             bars = ax.bar(xs, vals, width, label=names[arm], color=colors[arm])
@@ -329,6 +406,7 @@ def main():
     parser.add_argument("--no-anchor", action="store_true",
                         help="frame_causal: do not always attend frame 0")
     parser.add_argument("--arms", default="cudnn,fa4")
+    parser.add_argument("--direction", default="both", choices=["fwd", "bwd", "both"])
     parser.add_argument("--no-dense", action="store_true",
                         help="skip the dense peak-reference run per case")
     parser.add_argument("--csv", help="write results to this CSV file")
@@ -364,7 +442,8 @@ def main():
     sparsities = [float(s) for s in args.sparsities.split(",")]
 
     rows = []
-    print(f"{'case':<14} {'arm':<6} {'blk':>4} {'sparsity':>8} {'ms':>9} {'TFLOP/s':>8}")
+    print(f"{'case':<14} {'arm':<6} {'dir':<4} {'blk':>4} {'sparsity':>8} "
+          f"{'ms':>9} {'TFLOP/s':>8}")
     for case, (num_heads, seqlen) in cases.items():
         grid = []
         for granularity in granularities:
@@ -382,16 +461,20 @@ def main():
         if not args.no_dense:
             # Dense peak reference: every block selected, granularity-independent.
             grid.append((128, make_topk_mask(num_heads, seqlen, 128, 0.0)))
+        directions = ["fwd", "bwd"] if args.direction == "both" else [args.direction]
         for granularity, mask in grid:
             sparsity = 1.0 - mask.float().mean().item()
-            for arm in arms:
-                ms, tflops = bench_cell(arm, num_heads, seqlen, granularity, mask)
-                rows.append(dict(case=case, arm=arm, mask=args.mask,
-                                 granularity=granularity, sparsity=round(sparsity, 4),
-                                 ms=round(ms, 3), tflops=round(tflops, 1)))
-                label = "dense" if sparsity == 0.0 else f"{sparsity:.1%}"
-                print(f"{case:<14} {arm:<6} {granularity:>4} {label:>8} "
-                      f"{ms:>9.3f} {tflops:>8.0f}")
+            for direction in directions:
+                for arm in arms:
+                    ms, tflops = bench_cell(arm, num_heads, seqlen, granularity,
+                                            mask, direction)
+                    rows.append(dict(case=case, arm=arm, mask=args.mask,
+                                     direction=direction, granularity=granularity,
+                                     sparsity=round(sparsity, 4),
+                                     ms=round(ms, 3), tflops=round(tflops, 1)))
+                    label = "dense" if sparsity == 0.0 else f"{sparsity:.1%}"
+                    print(f"{case:<14} {arm:<6} {direction:<4} {granularity:>4} "
+                          f"{label:>8} {ms:>9.3f} {tflops:>8.0f}")
 
     if args.csv:
         with open(args.csv, "w", newline="") as f:

@@ -1,8 +1,9 @@
 # Sparse Attention Inference Benchmark
 
-Forward-only microbenchmark of block-sparse attention (BSA), driven through
-the public `cudnn.block_sparse_attention_forward` API, with an optional
-FA4-lineage CuTe DSL arm (`flash_attn.cute`) on identical block masks.
+Microbenchmark of block-sparse attention (BSA) forward and backward, driven
+through the public `cudnn.block_sparse_attention_forward`/`_backward` APIs,
+with an optional FA4-lineage CuTe DSL arm (`flash_attn.cute`) on identical
+block masks. `--direction fwd|bwd|both` selects the passes (default both).
 
 ## What is measured
 
@@ -33,23 +34,31 @@ at each requested sparsity, plus one **dense** run per case (every block
 selected) that shows the kernel's peak as an upper reference for the sparse
 bars.
 
-Reported TFLOPS count only the selected blocks:
+Reported TFLOPS count only the selected blocks — 2 matmuls forward
+(QK^T, PV), 5 backward (recompute S, dV, dP, dQ, dK):
 
 ```
-FLOPs = 4 * H * D * S * keep_blocks_per_row * block_tokens
+FLOPs = 2 * matmuls * D * block_tokens^2 * selected_blocks
 ```
+
+Backward runs each arm's own forward once to produce the `out`/`lse` it
+consumes; only the backward call is timed.
 
 Granularity handling per arm (kept lossless in terms of attended tokens):
 
 - **cuDNN**: 64 and 128 are native block sizes; 256-token masks are
   re-expressed on 128-token blocks.
 - **FA4** (`flash_attn.cute`): the SM100 kernel selects at 256-token Q
-  granularity with a 128-token KV tile cap. Masks finer than 256 are
-  aggregated on the Q side, so rows in a 256-token group attend the union of
-  their blocks — real extra work the shared FLOP count does not credit. Its
-  TFLOPS are therefore "work done per second on the requested mask", which is
-  the deployment-relevant number when the workload's mask is finer than the
-  kernel's granularity floor.
+  granularity with a 128-token KV tile cap, and its backward additionally
+  requires 128-token KV sparse blocks (its N tile), consuming Q-direction
+  (per-KV-block) index lists. Masks finer than the floor are aggregated —
+  on the Q side always, and on the KV side for the backward at 64-token
+  granularity (where the forward producing `out`/`lse` runs the same
+  aggregated mask so the gradients stay exact). Aggregated rows attend the
+  union of their blocks — real extra work the shared FLOP count does not
+  credit. FA4's TFLOPS are therefore "work done per second on the requested
+  mask", which is the deployment-relevant number when the workload's mask is
+  finer than the kernel's granularity floor.
 
 ## Default cases
 
