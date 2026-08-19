@@ -184,8 +184,8 @@ def test_grouped_gemm_quant_has_rubin_compile_branches():
 @pytest.mark.parametrize(
     "kernel_path",
     [
-        "grouped_gemm_quant/grouped_gemm_quant.py",
-        "grouped_gemm_quant/moe_blockscaled_grouped_gemm_quant_rubin.py",
+        "quant/grouped_gemm_quant.py",
+        "quant/moe_blockscaled_grouped_gemm_quant_rubin.py",
     ],
 )
 def test_grouped_gemm_quant_kernels_support_optional_prob(kernel_path):
