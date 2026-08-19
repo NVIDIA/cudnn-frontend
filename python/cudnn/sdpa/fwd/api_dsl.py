@@ -128,6 +128,21 @@ def _torch_stream_context(current_stream: Optional[cuda.CUstream], device: torch
 _SCHED_L2_BUDGET_BYTES = 50 * 1024 * 1024
 
 
+def _sm100_sched_domain(rubin: bool) -> frozenset:
+    """Tile-scheduler policies the routed kernel file can DECODE.
+
+    One set per route (the SM107 sibling is hunk-symmetric with the SM100
+    kernel since the #585 port); kept as a function so a future divergence is
+    a one-line change HERE plus its kernel constant — the sibling-parity test
+    asserts this table equals each file's SUPPORTED_SCHED_POLICIES. Both the
+    explicit-request gate (check_support) and the defaulting clamp (compile)
+    read it: a default may never be a value the route could not honor as an
+    explicit request.
+    """
+    del rubin  # same domain on every SM100-family route today
+    return frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2})
+
+
 def _causal_sched_policy(s_kv: int, d_qk: int, d_v: int, elem_bytes: int) -> int:
     """SCHED_LPT_L2 vs SCHED_LPT for a causal graph (see _SCHED_L2_BUDGET_BYTES)."""
     one_head_bytes = int(s_kv) * (int(d_qk) + int(d_v)) * int(elem_bytes)
@@ -801,8 +816,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         )
         self.flavor = _pick_flavor(d_qk, d_v)
         self._value_error_if(
-            self.sched_policy != SCHED_NATURAL,
-            f"SM100 DSL SDPA only supports sched_policy={SCHED_NATURAL}",
+            self.sched_policy not in _sm100_sched_domain(self._device_cc == (10, 7)),
+            f"SM100 DSL SDPA serves sched_policy in {sorted(_sm100_sched_domain(self._device_cc == (10, 7)))}; got {self.sched_policy}",
         )
         for requested, supported, name in (
             (self.tile_m, 128, "tile_m"),
@@ -936,6 +951,12 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 d_v=d_v_sched,
                 elem_bytes=1 if self._fp8 else 2,
             )
+            # Defaults must stay inside the served route's declared domain —
+            # a heuristic choice the kernel cannot decode is a plan-build
+            # failure, not a preference (this clamp is what turned #653's
+            # failure mode into a clean NATURAL fallback).
+            if sched_policy not in _sm100_sched_domain(self._device_cc == (10, 7)):
+                sched_policy = SCHED_NATURAL
         params = Sm100TemplateParams(
             dtype_qkv=_SM100_DTYPE_QKV_CODE[self.dtype],
             dtype_o=_SM100_DTYPE_QKV_CODE[self.dtype_o],

@@ -559,6 +559,17 @@ If a kernel cannot run the requested scheduler policy, the answer is "this
 engine cannot serve this plan", not "ran with a different policy". A knob
 object of the wrong operation's type is rejected outright.
 
+**Defaults obey the same domains as requests.** When no value is requested,
+the adapter's defaulting policy (`_causal_sched_policy` and friends) picks
+one -- and that pick must lie inside the served route's declared domain,
+falling back to the universal default otherwise. A default the kernel cannot
+decode is a plan-build failure, not a preference: issue #653 (the LPT
+scheduler landed in one FP8 kernel sibling but the auto causal policy chose
+it for both) is exactly the failure this rule closes. The kernel files
+declare their decode domain (`SUPPORTED_SCHED_POLICIES`), the adapter's
+routing table mirrors it, the engine rows must not declare beyond it, and
+`test_sdpa_fp8_sibling_parity` pins the three in lockstep.
+
 Generic discoverability survives without the enum: knob domains are ordinary
 dataclass fields on `Capabilities`, so "list every engine and the knobs it
 honors" is a `dataclasses.fields()` walk over the spec table.
