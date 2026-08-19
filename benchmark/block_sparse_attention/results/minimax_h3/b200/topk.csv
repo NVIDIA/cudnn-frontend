@@ -1,0 +1,17 @@
+case,arm,mask,direction,granularity,sparsity,ms,tflops
+minimax-h3-15s,cudnn,topk,fwd,64,0.8999,52.871,453.6
+minimax-h3-15s,fa4,topk,fwd,64,0.8999,140.421,170.8
+minimax-h3-15s,cudnn,topk,bwd,64,0.8999,181.671,330.0
+minimax-h3-15s,fa4,topk,bwd,64,0.8999,489.577,122.5
+minimax-h3-15s,cudnn,topk,fwd,128,0.9006,29.97,794.6
+minimax-h3-15s,fa4,topk,fwd,128,0.9006,55.037,432.7
+minimax-h3-15s,cudnn,topk,bwd,128,0.9006,100.321,593.4
+minimax-h3-15s,fa4,topk,bwd,128,0.9006,167.655,355.1
+minimax-h3-15s,cudnn,topk,fwd,256,0.8992,30.293,797.2
+minimax-h3-15s,fa4,topk,fwd,256,0.8992,28.914,835.2
+minimax-h3-15s,cudnn,topk,bwd,256,0.8992,98.716,611.6
+minimax-h3-15s,fa4,topk,bwd,256,0.8992,90.261,668.9
+minimax-h3-15s,cudnn,topk,fwd,128,0.0,284.103,842.9
+minimax-h3-15s,fa4,topk,fwd,128,0.0,285.34,839.3
+minimax-h3-15s,cudnn,topk,bwd,128,0.0,857.531,698.2
+minimax-h3-15s,fa4,topk,bwd,128,0.0,891.97,671.2

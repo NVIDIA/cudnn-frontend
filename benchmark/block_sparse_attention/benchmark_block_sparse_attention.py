@@ -61,20 +61,20 @@ HEAD_DIM = 128
 
 # (label, num_heads, seqlen): Wan2.1 T2V latent shapes, padded to the VSA tile
 # grid. 1.3B has 12 heads, 14B has 40; both use head_dim 128.
+# One case per model; other shapes (e.g. Wan-1.3B's 12 heads, 480P latents,
+# H3's ~31k 5 s clip) are reachable as custom HxS cases.
 CASES = {
-    "wan1.3b-480p": (12, 39936),
-    "wan14b-480p": (40, 39936),
+    # Wan2.1-14B at 720P: 40 heads x d128, S = 24x48x80 = 92160 latent tokens.
     "wan14b-720p": (40, 92160),
-    # MiniMax-H3 (open weights): 56 heads x d128; ~31k visual tokens for a
-    # 1344x768 124-frame clip, ~91k for a 15 s output (padded to 256-token
-    # blocks). The release ships full attention with sparse support planned,
-    # so the dense bar is its current cost and the sparse bars the headroom.
-    "minimax-h3-5s": (56, 31488),
+    # MiniMax-H3 (open weights): 56 heads x d128, ~91k tokens for a 15 s
+    # output (padded to 256-token blocks). The release ships full attention
+    # with sparse support planned, so the dense bar is its current cost and
+    # the sparse bars the headroom.
     "minimax-h3-15s": (56, 91392),
 }
 
 
-def make_topk_mask(num_heads, seqlen, granularity, sparsity, seed=0):
+def make_topk_mask(num_heads, seqlen, granularity, sparsity, seed=0, seqlen_q=0):
     """Per-head boolean block mask: top-k of NB blocks per row, diagonal kept.
 
     Models learned, data-dependent sparsity (e.g. VSA): a different mask per
@@ -83,16 +83,19 @@ def make_topk_mask(num_heads, seqlen, granularity, sparsity, seed=0):
     selections of the same target sparsity.
     """
     nb = seqlen // granularity
+    nbq = seqlen_q // granularity if seqlen_q else nb
     keep = nb if sparsity == 0.0 else max(1, round((1.0 - sparsity) * nb))
     gen = torch.Generator("cpu").manual_seed(seed)
-    scores = torch.rand(num_heads, nb, nb, generator=gen)
-    eye = torch.eye(nb, dtype=torch.bool).unsqueeze(0).expand_as(scores)
-    scores = scores.masked_fill(eye, 2.0)  # diagonal block always selected
+    scores = torch.rand(num_heads, nbq, nb, generator=gen)
+    # the block containing the query's own tokens is always selected
+    self_col = torch.arange(nb - nbq, nb).view(1, -1, 1)
+    scores = scores.scatter(-1, self_col.expand(num_heads, nbq, 1), 2.0)
     top = torch.topk(scores, keep, -1).indices
-    return torch.zeros(num_heads, nb, nb, dtype=torch.bool).scatter_(-1, top, True)
+    return torch.zeros(num_heads, nbq, nb, dtype=torch.bool).scatter_(-1, top, True)
 
 
-def make_frame_causal_mask(num_heads, seqlen, granularity, frame_size, window, anchor):
+def make_frame_causal_mask(num_heads, seqlen, granularity, frame_size, window, anchor,
+                           seqlen_q=0):
     """Structural mask for autoregressive video generation.
 
     Tokens are grouped into frames of ``frame_size`` tokens; every query
@@ -106,14 +109,16 @@ def make_frame_causal_mask(num_heads, seqlen, granularity, frame_size, window, a
     if frame_size % granularity:
         raise ValueError(f"frame_size {frame_size} must be a multiple of granularity {granularity}")
     nb = seqlen // granularity
+    nbq = seqlen_q // granularity if seqlen_q else nb
     frame = torch.arange(nb) * granularity // frame_size
-    q_frame, kv_frame = frame.view(-1, 1), frame.view(1, -1)
+    q_frame = frame[nb - nbq:].view(-1, 1)  # queries are the sequence tail
+    kv_frame = frame.view(1, -1)
     mask = kv_frame <= q_frame
     if window >= 0:
         mask &= q_frame - kv_frame <= window
     if anchor:
         mask |= kv_frame == 0
-    return mask.unsqueeze(0).expand(num_heads, nb, nb).contiguous()
+    return mask.unsqueeze(0).expand(num_heads, nbq, nb).contiguous()
 
 
 def expand_mask(mask, factor):
@@ -137,10 +142,15 @@ def mask_to_indices(mask):
     return idx.to(torch.int32).contiguous(), counts.to(torch.int32).contiguous(), cap
 
 
-def make_qkv(num_heads, seqlen, device="cuda"):
+def make_qkv(num_heads, seqlen, seqlen_q=0, device="cuda"):
     torch.manual_seed(42)
-    q = torch.randn(1, seqlen, num_heads, HEAD_DIM, dtype=torch.bfloat16, device=device)
-    return q, torch.randn_like(q), torch.randn_like(q)
+    k = torch.randn(1, seqlen, num_heads, HEAD_DIM, dtype=torch.bfloat16, device=device)
+    v = torch.randn_like(k)
+    # Fresh allocation: slicing k's shape would keep the parent's batch
+    # stride (size-1 dim), which the kernels' compact-layout checks reject.
+    q = torch.randn(1, seqlen_q or seqlen, num_heads, HEAD_DIM,
+                    dtype=torch.bfloat16, device=device)
+    return q, k, v
 
 
 def make_dout(out):
@@ -292,8 +302,8 @@ def time_fn(fn, warmup=3, target_ms=500.0, max_iters=50):
     return start.elapsed_time(end) / iters
 
 
-def bench_cell(arm, num_heads, seqlen, granularity, mask, direction):
-    q, k, v = make_qkv(num_heads, seqlen)
+def bench_cell(arm, num_heads, seqlen, granularity, mask, direction, seqlen_q=0):
+    q, k, v = make_qkv(num_heads, seqlen, seqlen_q)
     fn = ARMS[arm](q, k, v, mask, granularity, direction)
     ms = time_fn(fn)
     # Selected blocks only: forward is 2 matmuls (QK^T, PV), backward is 5
@@ -342,6 +352,32 @@ def check_parity(arms):
                     print(f"parity {arm} {family} blk{granularity} bwd {name}: "
                           f"max_err={gerr:.3e} bf16_floor={gfloor:.3e} -> "
                           f"{'PASS' if ok else 'FAIL'}")
+    # Decode shape: tail queries over the full KV history, forward only.
+    seqlen_q, granularity = 1024, 128
+    families = {
+        "topk": make_topk_mask(num_heads, seqlen, granularity, 0.9, seqlen_q=seqlen_q),
+        "frame_causal": make_frame_causal_mask(
+            num_heads, seqlen, granularity, frame_size=1024, window=1, anchor=True,
+            seqlen_q=seqlen_q),
+    }
+    for family, mask in families.items():
+        q, k, v = make_qkv(num_heads, seqlen, seqlen_q)
+        qf, kf, vf = (t.squeeze(0).permute(1, 0, 2).float() for t in (q, k, v))
+        scores = qf @ kf.transpose(-1, -2) / math.sqrt(HEAD_DIM)
+        token_mask = expand_mask(mask, granularity).cuda()
+        scores = scores.masked_fill(~token_mask, float("-inf"))
+        ref = (scores.softmax(-1) @ vf).permute(1, 0, 2)
+        floor = (ref.to(torch.bfloat16).float() - ref).abs().max().item()
+        for arm in arms:
+            if arm == "fa4" and family == "topk":
+                continue  # FA4's Q aggregation attends a superset; not comparable
+            out = ARMS[arm](q, k, v, mask, granularity)()[0]
+            err = (out.squeeze(0).float() - ref).abs().max().item()
+            ok = err < 8 * max(floor, 1e-3)
+            failures += not ok
+            print(f"parity {arm} {family} decode blk{granularity} fwd: "
+                  f"max_err={err:.3e} bf16_floor={floor:.3e} -> "
+                  f"{'PASS' if ok else 'FAIL'}")
     return failures
 
 
@@ -405,6 +441,10 @@ def main():
                              "90%% sparsity at these sequence lengths")
     parser.add_argument("--no-anchor", action="store_true",
                         help="frame_causal: do not always attend frame 0")
+    parser.add_argument("--decode-q", type=int, default=0,
+                        help="decode shape: query is only the last N tokens of the "
+                             "sequence attending the full KV history (chunked "
+                             "autoregressive generation). Forward only.")
     parser.add_argument("--arms", default="cudnn,fa4")
     parser.add_argument("--direction", default="both", choices=["fwd", "bwd", "both"])
     parser.add_argument("--no-dense", action="store_true",
@@ -445,8 +485,13 @@ def main():
     print(f"{'case':<14} {'arm':<6} {'dir':<4} {'blk':>4} {'sparsity':>8} "
           f"{'ms':>9} {'TFLOP/s':>8}")
     for case, (num_heads, seqlen) in cases.items():
+        seqlen_q = args.decode_q
         grid = []
         for granularity in granularities:
+            if seqlen_q and seqlen_q % granularity:
+                print(f"{case}: skipping blk{granularity} (--decode-q {seqlen_q} "
+                      f"not a multiple of it)")
+                continue
             if args.mask == "frame_causal":
                 if args.frame_size % granularity:
                     print(f"{case}: skipping blk{granularity} (frame_size "
@@ -454,20 +499,27 @@ def main():
                     continue
                 grid.append((granularity, make_frame_causal_mask(
                     num_heads, seqlen, granularity, args.frame_size,
-                    args.window, not args.no_anchor)))
+                    args.window, not args.no_anchor, seqlen_q=seqlen_q)))
             else:
                 grid.extend((granularity, make_topk_mask(
-                    num_heads, seqlen, granularity, s)) for s in sparsities)
+                    num_heads, seqlen, granularity, s, seqlen_q=seqlen_q))
+                    for s in sparsities)
         if not args.no_dense:
             # Dense peak reference: every block selected, granularity-independent.
-            grid.append((128, make_topk_mask(num_heads, seqlen, 128, 0.0)))
-        directions = ["fwd", "bwd"] if args.direction == "both" else [args.direction]
+            grid.append((128, make_topk_mask(num_heads, seqlen, 128, 0.0,
+                                             seqlen_q=seqlen_q)))
+        if seqlen_q:
+            if args.direction != "fwd":
+                print("decode shape is forward-only; running fwd")
+            directions = ["fwd"]
+        else:
+            directions = ["fwd", "bwd"] if args.direction == "both" else [args.direction]
         for granularity, mask in grid:
             sparsity = 1.0 - mask.float().mean().item()
             for direction in directions:
                 for arm in arms:
                     ms, tflops = bench_cell(arm, num_heads, seqlen, granularity,
-                                            mask, direction)
+                                            mask, direction, seqlen_q)
                     rows.append(dict(case=case, arm=arm, mask=args.mask,
                                      direction=direction, granularity=granularity,
                                      sparsity=round(sparsity, 4),

@@ -1,0 +1,7 @@
+case,arm,mask,direction,granularity,sparsity,ms,tflops
+minimax-h3-15s,cudnn,frame_causal,fwd,64,0.938,6.182,53.8
+minimax-h3-15s,fa4,frame_causal,fwd,64,0.938,0.776,428.7
+minimax-h3-15s,cudnn,frame_causal,fwd,128,0.938,0.495,671.4
+minimax-h3-15s,fa4,frame_causal,fwd,128,0.938,0.553,601.8
+minimax-h3-15s,cudnn,frame_causal,fwd,256,0.938,0.495,672.0
+minimax-h3-15s,fa4,frame_causal,fwd,256,0.938,0.553,601.1

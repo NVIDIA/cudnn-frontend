@@ -67,11 +67,11 @@ grid), head_dim 128:
 
 | case | heads | seqlen |
 |---|---|---|
-| `wan1.3b-480p` | 12 | 39936 |
-| `wan14b-480p` | 40 | 39936 |
 | `wan14b-720p` | 40 | 92160 |
-| `minimax-h3-5s` | 56 | 31488 |
 | `minimax-h3-15s` | 56 | 91392 |
+
+One case per model; other shapes (Wan-1.3B's 12 heads, 480P latents, H3's
+~31k 5 s clip) are reachable as custom cases.
 
 The MiniMax-H3 cases use the open-weights attention config (56 heads,
 head_dim 128) at its published sequence scales (~31k visual tokens per
@@ -82,6 +82,14 @@ available headroom.
 
 Custom shapes: `--cases 12x65536` (heads x seqlen). The default sparsity is
 0.9, the value video sparse-attention deployments typically target.
+
+## Decode shape
+
+`--decode-q N` switches to the chunked autoregressive-generation shape: the
+query is only the last N tokens of the sequence, attending the full KV
+history (s_q << s_kv). Both mask families support it — top-k keeps the
+query's own block instead of the diagonal, and frame-causal places the
+queries in the final frame. Forward only.
 
 ## Requirements
 
@@ -108,9 +116,12 @@ masked-softmax reference at a small shape before trusting the numbers.
 
 ## Example results
 
-`results/` holds one full run of both mask families on a B200 (SM100,
-clock-locked at 847 MHz — absolute TFLOPS scale with clocks; relative
-comparisons are the point):
+`results/<model>/<arch>/` holds one full run per model — both mask families,
+forward+backward, plus the decode shape — on a B200 (SM100, clock-locked at
+847 MHz; absolute TFLOPS scale with clocks, relative comparisons are the
+point):
 
-![topk](results/topk_b200.png)
-![frame_causal](results/frame_causal_b200.png)
+![wan topk](results/wan14b/b200/topk.png)
+![wan frame_causal](results/wan14b/b200/frame_causal.png)
+![h3 topk](results/minimax_h3/b200/topk.png)
+![h3 frame_causal](results/minimax_h3/b200/frame_causal.png)
