@@ -607,21 +607,35 @@ def _kernel(
                         for _ai in cutlass.range_constexpr(num_a_operands):
                             if elect_one:
                                 nvvm.cp_async_bulk_tensor_shared_cluster_global(
-                                    smem_a_list[_ai].subview(sA_elems * stage),
-                                    a_desc_tma_ptr_list[_ai],
-                                    (coord_k, coord_m_group, cutlass.Int32(0)),
-                                    ab_full_mbar_ptr.subview(stage),
-                                    [],
-                                    multicast_mask=tma_mcast_mask_a,
-                                    group=nvvm.CTAGroup.CTA_2,
-                                )
-                        for _ai in cutlass.range_constexpr(num_a_operands):
-                            if elect_one:
-                                nvvm.cp_async_bulk_tensor_shared_cluster_global(
                                     smem_sfa_list[_ai].subview(sfa_smem_bytes * stage),
                                     tma_sfa_descs[_ai].get_ptr(),
                                     (0, coord_sf_k, sfa_m_block, cutlass.Int32(0)),
                                     sf_full_mbar_ptr.subview(stage),
+                                    [],
+                                    multicast_mask=tma_mcast_mask_a,
+                                    group=nvvm.CTAGroup.CTA_2,
+                                )
+                    if b_issue:
+                        for _bj in cutlass.range_constexpr(num_b_operands):
+                            if elect_one:
+                                nvvm.cp_async_bulk_tensor_shared_cluster_global(
+                                    smem_sfb_list[_bj].subview(sfb_smem_bytes * stage),
+                                    tma_sfb_descs[_bj].get_ptr(),
+                                    (0, coord_sf_k, sfb_n_block, coord_expert),
+                                    sf_full_mbar_ptr.subview(stage),
+                                    [],
+                                    multicast_mask=tma_mcast_mask_b,
+                                    group=nvvm.CTAGroup.CTA_2,
+                                )
+
+                    if a_issue:
+                        for _ai in cutlass.range_constexpr(num_a_operands):
+                            if elect_one:
+                                nvvm.cp_async_bulk_tensor_shared_cluster_global(
+                                    smem_a_list[_ai].subview(sA_elems * stage),
+                                    a_desc_tma_ptr_list[_ai],
+                                    (coord_k, coord_m_group, cutlass.Int32(0)),
+                                    ab_full_mbar_ptr.subview(stage),
                                     [],
                                     multicast_mask=tma_mcast_mask_a,
                                     group=nvvm.CTAGroup.CTA_2,
@@ -656,18 +670,6 @@ def _kernel(
                                         multicast_mask=tma_mcast_mask_b,
                                         group=nvvm.CTAGroup.CTA_2,
                                     )
-                        for _bj in cutlass.range_constexpr(num_b_operands):
-                            if elect_one:
-                                nvvm.cp_async_bulk_tensor_shared_cluster_global(
-                                    smem_sfb_list[_bj].subview(sfb_smem_bytes * stage),
-                                    tma_sfb_descs[_bj].get_ptr(),
-                                    (0, coord_sf_k, sfb_n_block, coord_expert),
-                                    sf_full_mbar_ptr.subview(stage),
-                                    [],
-                                    multicast_mask=tma_mcast_mask_b,
-                                    group=nvvm.CTAGroup.CTA_2,
-                                )
-
                     ab_iter += 1
 
         tail_stage = ab_iter % ab_stages
