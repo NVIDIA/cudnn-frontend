@@ -1124,9 +1124,6 @@ def _render_block_scale_tile_constants(
     # double-TMEM pipelining at a single mbar.
     total_tmem = _tmem_cols_for_arch()
 
-    def _align16(x: int) -> int:
-        return (x + 15) & ~15
-
     # --- TMEM acc-stage + overlap (per-GEMM budget; arch- & count-agnostic) ---
     # SF = one fixed word PER DISTINCT OPERAND (shared A → one SFA word).
     # Each GEMM's acc gets its OWN region; the 2 tile-stage buffers overlap
@@ -1177,7 +1174,7 @@ def _render_block_scale_tile_constants(
     acc_overlap_subtiles = acc_overlap_cols // 32
     acc_region_cols = acc_cols_per_stage  # per-stage stride WITHIN a GEMM
 
-    sf_region_base = _align16(num_gemms * acc_gemm_stride)
+    sf_region_base = num_gemms * acc_gemm_stride
     # Per-distinct-operand SF word col bases (single-GEMM → length-1 lists).
     sfa_col_bases = [sf_region_base + i * sfa_tmem_cols for i in range(na)]
     sfb_col_bases = [sf_region_base + na * sfa_tmem_cols + j * sfb_tmem_cols for j in range(nb)]
