@@ -87,6 +87,12 @@ class TemplateParams:
     # cu_seqlens instead.
     seq_q_lens_present: bool = False
     sched_policy: int = SCHED_NATURAL
+    # Compile-time LPT head/batch grouping. Keep 1 unless the selected kernel
+    # and concrete graph shape opt into a divisor of B*Hq.
+    lpt_head_group: int = 1
+    # Dense D192 FP8 may specialize the reverse-row LPT decoder to its exact
+    # number of query tiles. Zero keeps the existing runtime derivation.
+    lpt_q_tiles: int = 0
     thd_varlen: bool = False
     # KV split: each Q tile's KV loop range is cut into ``split_kv`` contiguous
     # chunks, each run as its own persistent tile writing a partial (O, LSE)
@@ -125,8 +131,8 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
     if k.dtype_qkv not in (DTYPE_E4M3, DTYPE_E5M2, DTYPE_BF16, DTYPE_FP16):
         raise ValueError(f"{flavor}: DTYPE_QKV must be E4M3/E5M2/BF16/FP16 (0..3); got {k.dtype_qkv}")
     fp8 = k.dtype_qkv in (DTYPE_E4M3, DTYPE_E5M2)
-    if fp8 and flavor != "d128":
-        raise ValueError(f"{flavor}: FP8/MXFP8 inputs (DTYPE_QKV 0/1) are only supported on d128")
+    if fp8 and flavor not in ("d128", "d192"):
+        raise ValueError(f"{flavor}: FP8/MXFP8 inputs (DTYPE_QKV 0/1) are only supported on d128 and d192")
     dtype_o = k.dtype_qkv if k.dtype_o < 0 else k.dtype_o
     if dtype_o not in (DTYPE_E4M3, DTYPE_E5M2, DTYPE_BF16, DTYPE_FP16):
         raise ValueError(f"{flavor}: DTYPE_O must be 0..3; got {dtype_o}")
@@ -173,6 +179,10 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
             # The sink logit is folded into the softmax denominator in the
             # per-tile epilogue, so every split would add its own copy of it.
             raise ValueError(f"{flavor}: split_kv > 1 with attention sink is not supported (the sink would be counted once per split)")
+    if k.lpt_head_group not in (1, 8, 16):
+        raise ValueError(f"{flavor}: LPT_HEAD_GROUP must be 1, 8, or 16; got {k.lpt_head_group}")
+    if fp8 and flavor == "d192" and k.split_kv != 1:
+        raise ValueError("d192: split_kv is not implemented by the per-tensor FP8 kernel")
 
 
 def _mask_flags_from(params: TemplateParams) -> int:
@@ -773,7 +783,7 @@ class CfgD192(CfgD128):
 
 
 def _d192_smem_bytes(cfg) -> int:
-    """Data-buffer SMEM for the d192 pipeline (Q/O always aliased).
+    """Data-buffer SMEM for the d192 pipeline.
 
     Same shape as _d128_smem_bytes, but d_qk = 192 makes the Q and K slabs 1.5x
     the d128 ones, which is why this flavor needs a shallower KV pipeline:
@@ -792,32 +802,43 @@ def _d192_smem_bytes(cfg) -> int:
 
 def _validate_cfg_d192(cfg: CfgD192) -> None:
     """Consistency checks on the native DSv3 d192/d128 geometry."""
+    fp8 = cfg.DTYPE_QKV in (DTYPE_E4M3, DTYPE_E5M2)
     checks = (
-        (cfg.DTYPE_QKV in (DTYPE_BF16, DTYPE_FP16), "d192: only BF16/FP16 inputs are supported"),
-        (cfg.DTYPE_O == cfg.DTYPE_QKV, "d192: DTYPE_O must equal DTYPE_QKV"),
+        (
+            cfg.DTYPE_O in (DTYPE_E4M3, DTYPE_E5M2, DTYPE_BF16, DTYPE_FP16) if fp8 else cfg.DTYPE_O == cfg.DTYPE_QKV,
+            "d192: DTYPE_O must equal DTYPE_QKV for half input; FP8 allows an independent output dtype",
+        ),
         (cfg.MMA_REGS == cfg.TMALDG_REGS == cfg.TMASTG_REGS == cfg.SCHEDULER_REGS, "d192: MMA/TMALDG/TMASTG/SCHEDULER regs must match"),
         (cfg.MMA_REGS + cfg.CORRECTION_REGS + cfg.SOFTMAX_WARPGROUPS * cfg.SOFTMAX_REGS <= 512, "d192: register budget over 512"),
         (cfg.MMA_REGS % 8 == 0 and cfg.CORRECTION_REGS % 8 == 0 and cfg.SOFTMAX_REGS % 8 == 0, "d192: per-role regs must be multiples of 8"),
         (cfg.CGA_M == cfg.CTA_MMA and cfg.CTA_MMA in (1, 2), "d192 SM100: CGA_M must equal CTA_MMA, and CTA_MMA must be 1 (cga1) or 2 (cga2)"),
         (
-            cfg.STAGES_KV == (1 if cfg.CTA_MMA == 1 else 2),
-            "d192: STAGES_KV must scale with the cluster width (2 at cga2, 1 at cga1) — cga1 doubles per-CTA K/V, "
-            "and cuDNN's own d192 kernel uses stages_kv = 1 * CTA_MMA for exactly this reason",
+            cfg.STAGES_KV == (2 if fp8 else 1) * cfg.CTA_MMA,
+            "d192: STAGES_KV must scale with input dtype and cluster width " "(FP8: 2/4 at cga1/cga2; half: 1/2)",
         ),
         (
             _d192_smem_bytes(cfg) <= _SM100_MAX_DYN_SMEM,
             f"d192: SMEM {_d192_smem_bytes(cfg) // 1024} KiB over the SM100 {_SM100_MAX_DYN_SMEM // 1024} KiB per-CTA cap",
         ),
         (cfg.TILE_K == 192 and cfg.TILE_O == 128, "d192: expected D_QK tile 192 and D_V tile 128"),
-        (cfg.QO_ALIAS == 1, "d192: Q/O SMEM alias is required to stay within SM100 SMEM budget"),
+        (cfg.QO_ALIAS == (0 if fp8 else 1), "d192: Q/O SMEM alias must be disabled for FP8 and enabled for half input"),
         (cfg.TILES_Q == 2, "d192: TILES_Q must be 2"),
         (cfg.SOFTMAX_WARPGROUPS == 2, "d192: SOFTMAX_WARPGROUPS must be 2"),
         (cfg.CORRECTION_WARPS == 4, "d192: CORRECTION_WARPS must be 4"),
         (cfg.TOTAL_WARPS == 16 and cfg.THREADS_PER_CTA == 512, "d192: 16 warps / 512 threads"),
         (cfg.READ_TILE_ARRIVERS == 15, f"d192: expected READ_TILE_ARRIVERS=15, got {cfg.READ_TILE_ARRIVERS}"),
-        (cfg.TILE_K_HW_BMM1 == 16 and cfg.TILE_K_HW_BMM2 == 16, "d192: TILE_K_HW must be 16 for BF16/FP16 on SM10x"),
-        (cfg.Q_SWZ_BYTES == 128 and cfg.K_SWZ_BYTES == 128, "d192: Q/K swizzle must be 128B"),
-        (cfg.V_SWZ_BYTES == 128 and cfg.O_SWZ_BYTES == 128, "d192: V/O swizzle must be 128B"),
+        (
+            cfg.TILE_K_HW_BMM1 == (32 if fp8 else 16) and cfg.TILE_K_HW_BMM2 == (32 if fp8 else 16),
+            "d192: TILE_K_HW must be 32 for FP8 and 16 for BF16/FP16",
+        ),
+        (
+            cfg.Q_SWZ_BYTES == (64 if fp8 else 128) and cfg.K_SWZ_BYTES == (64 if fp8 else 128),
+            "d192: Q/K swizzle must be 64B for FP8 and 128B for BF16/FP16",
+        ),
+        (
+            cfg.V_SWZ_BYTES == v_swz_bytes(128, cfg.CTA_MMA, cfg.BPE) and cfg.O_SWZ_BYTES in ((64, 128) if fp8 else (128,)),
+            "d192: V/O swizzle is inconsistent with the input/output dtype",
+        ),
     )
     for ok, msg in checks:
         if not ok:
@@ -827,32 +848,34 @@ def _validate_cfg_d192(cfg: CfgD192) -> None:
 def make_cfg_d192(params: TemplateParams) -> Tuple[CfgD192, TmaIters]:
     _validate_params("d192", params)
     b = bpe(params.dtype_qkv)
+    fp8 = params.dtype_qkv in (DTYPE_E4M3, DTYPE_E5M2)
+    dtype_o = params.dtype_qkv if params.dtype_o < 0 else params.dtype_o
+    b_o = bpe(dtype_o)
     cfg = CfgD192(
         DTYPE_QKV=params.dtype_qkv,
-        DTYPE_O=params.dtype_qkv,
+        DTYPE_O=dtype_o,
         BPE=b,
-        BPE_O=b,
+        BPE_O=b_o,
         SPLIT_KV=int(params.split_kv),
+        QO_ALIAS=0 if fp8 else 1,
         Q_SWZ_BYTES=q_swz_bytes(192, b),
         K_SWZ_BYTES=q_swz_bytes(192, b),
         CGA_M=params.cta_mma,
         CTA_MMA=params.cta_mma,
-        # cuDNN's d192 kernel uses stages_kv = 1 * CTA_MMA; cga1 doubles per-CTA
-        # K/V, so the stage count has to halve to keep the CTA inside the cap.
-        STAGES_KV=1 if params.cta_mma == 1 else 2,
         V_SWZ_BYTES=v_swz_bytes(128, params.cta_mma, b),
-        O_SWZ_BYTES=o_swz_bytes(128, b),
+        O_SWZ_BYTES=o_swz_bytes(128, b_o),
         RESCALE_THRESHOLD=rescale_threshold(params.dtype_qkv),
-        TILE_K_HW_BMM1=tile_k_hw(params.dtype_qkv),
-        TILE_K_HW_BMM2=tile_k_hw(params.dtype_qkv),
+        TILE_K_HW_BMM1=32 if fp8 else tile_k_hw(params.dtype_qkv),
+        TILE_K_HW_BMM2=32 if fp8 else tile_k_hw(params.dtype_qkv),
+        STAGES_KV=(2 if fp8 else 1) * params.cta_mma,
         MASK_FLAGS=_mask_flags_from(params),
         WINDOW_LEFT=params.window_left or 0,
         WINDOW_RIGHT=params.window_right or 0,
         HAS_SINK=int(params.has_sink),
         BOTTOM_RIGHT=int(params.bottom_right),
         SCHEDULER_POLICY=1,
-        SOFTMAX_REGS=216 if _mask_flags_from(params) == MASK_NONE else 192,
-        CORRECTION_REGS=40 if _mask_flags_from(params) == MASK_NONE else 88,
+        SOFTMAX_REGS=184 if fp8 else 216 if _mask_flags_from(params) == MASK_NONE else 192,
+        CORRECTION_REGS=104 if fp8 else 40 if _mask_flags_from(params) == MASK_NONE else 88,
         SEQ_KV_LENS_PRESENT=1 if (params.thd_varlen or params.seq_kv_lens_present) else 0,
         SEQ_Q_LENS_PRESENT=int(params.seq_q_lens_present),
         THD_VARLEN=int(params.thd_varlen),

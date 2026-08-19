@@ -150,6 +150,10 @@ class Capabilities:
     swa: bool = False
     padded: bool = False
     sink: bool = False
+    # Optional dtype subset for sink support. None means every dtype served by
+    # the engine; a subset lets one exact-shape flavor decline an unsupported
+    # low-precision sink path without affecting its non-sink coverage.
+    sink_dtypes: Optional[frozenset] = None
     stats: bool = False
     # The adapter accepts lse_tensor=None (its kernel None-specializes the LSE
     # store), so a stats-less graph needs no dummy-LSE workspace chunk. Every
@@ -339,6 +343,9 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         if fact and not cap:
             return f"graph uses {label}, which this engine does not support"
 
+    if facts.has_sink and capabilities.sink_dtypes is not None and facts.dtype not in capabilities.sink_dtypes:
+        return f"sink token with dtype {facts.dtype} not in {sorted(str(d) for d in capabilities.sink_dtypes)}"
+
     if facts.right_band_widening and facts.right_bound is not None and facts.right_bound < 0:
         return f"negative diagonal_band_right_bound ({facts.right_bound}) is not supported"
 
@@ -446,21 +453,23 @@ def _sm100_spec(d: int, d_v: Optional[int] = None) -> EngineSpec:
     )
 
 
-def _sm100_mxfp8_spec(d: int) -> EngineSpec:
-    """d128 block-scale MXFP8 engine (E4M3/E5M2 in + per-32-block E8M0 SF, half out).
+def _sm100_mxfp8_spec(d: int, d_v: Optional[int] = None) -> EngineSpec:
+    """Block-scale MXFP8 engine (E4M3/E5M2 + per-32-block E8M0 SF).
 
-    THD/varlen is deferred (dense execute only for v1), so thd=False here even
-    though the kernel itself supports it.
+    THD/varlen is not supported by the current MXFP8 kernels, so this engine is
+    intentionally dense-only.
     """
 
+    d_v = d if d_v is None else d_v
+    suffix = f"d{d}" if d_v == d else f"d{d}_d{d_v}"
     return EngineSpec(
-        name=f"sdpa_fwd_prefill_sm100_d{d}_mxfp8",
+        name=f"sdpa_fwd_prefill_sm100_{suffix}_mxfp8",
         capabilities=Capabilities(
             sm_lo=_BLACKWELL[0],
             sm_hi=_BLACKWELL[1],
             phase="prefill",
             d_qk=frozenset({d}),
-            d_v=frozenset({d}),
+            d_v=frozenset({d_v}),
             dtypes=frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
             out_dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
             is_mxfp8=True,
@@ -481,8 +490,14 @@ def _sm100_mxfp8_spec(d: int) -> EngineSpec:
     )
 
 
-def _sm100_fp8_spec(d: int) -> EngineSpec:
-    """d128 per-tensor FP8 engine (E4M3/E5M2 in + scalar descales, half/FP8 out).
+def _sm100_fp8_spec(
+    d: int,
+    d_v: Optional[int] = None,
+    *,
+    dtypes: Optional[frozenset] = None,
+    sink_dtypes: Optional[frozenset] = None,
+) -> EngineSpec:
+    """Exact-shape per-tensor FP8 engine with scalar descales.
 
     Padding mask (per-batch ``seq_len_kv`` → KV-side masking) is supported: KV-only
     padding leaves every query row real, so each row's total_sum > 0 and the
@@ -491,15 +506,19 @@ def _sm100_fp8_spec(d: int) -> EngineSpec:
     (dense execute only for v1), so thd=False.
     """
 
+    d_v = d if d_v is None else d_v
+    suffix = f"d{d}" if d_v == d else f"d{d}_d{d_v}"
+    if dtypes is None:
+        dtypes = frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2})
     return EngineSpec(
-        name=f"sdpa_fwd_prefill_sm100_d{d}_fp8",
+        name=f"sdpa_fwd_prefill_sm100_{suffix}_fp8",
         capabilities=Capabilities(
             sm_lo=_BLACKWELL[0],
             sm_hi=_BLACKWELL[1],
             phase="prefill",
             d_qk=frozenset({d}),
-            d_v=frozenset({d}),
-            dtypes=frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
+            d_v=frozenset({d_v}),
+            dtypes=dtypes,
             out_dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
             is_fp8=True,
             causal=True,
@@ -508,6 +527,7 @@ def _sm100_fp8_spec(d: int) -> EngineSpec:
             swa=True,
             padded=True,
             sink=True,
+            sink_dtypes=sink_dtypes,
             stats=True,
             lse_optional=True,
             # The fp8 kernel lacks the SEQ_Q_LENS_PRESENT epilogue trim, but its
@@ -1025,7 +1045,16 @@ ENGINE_SPECS = (
     _sm100_spec(256),
     _sm100_spec(512),
     _sm100_mxfp8_spec(128),
+    _sm100_mxfp8_spec(192, d_v=128),
     _sm100_fp8_spec(128),
+    _sm100_fp8_spec(
+        192,
+        d_v=128,
+        dtypes=frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
+        # The D192 E5M2 sink path has a distinct FP8 online-softmax rounding
+        # trajectory that exceeds the frontend tolerance on sparse CI seeds.
+        sink_dtypes=frozenset({cudnn.data_type.FP8_E4M3}),
+    ),
     _sm120_spec(),
     _sm120_fp8_spec(),
     _sm80_spec(),

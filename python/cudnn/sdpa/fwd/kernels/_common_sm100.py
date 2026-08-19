@@ -500,6 +500,20 @@ def make_split_helpers(CFG, *, bounds_for_tile, dispatch_decode_initial, dispatc
     )
 
 
+@cute.jit
+def decode_linear_tile_lpt_grouped(linear, q_h, batch, q_tiles, lpt_head_group: cutlass.Constexpr[int]):
+    head_group = cutlass.Int32(lpt_head_group)
+    group_span = q_tiles * head_group
+    group_idx = linear // group_span
+    group_offset = linear % group_span
+    row_rank = group_offset // head_group
+    within = group_idx * head_group + group_offset % head_group
+    row = (q_tiles - cutlass.Int32(1)) - row_rank
+    head = within % q_h
+    batch_idx = within // q_h
+    return row, head, batch_idx
+
+
 class SdpaHelpers(NamedTuple):
     decode_initial: object
     decode_payload: object
@@ -514,7 +528,13 @@ class SdpaHelpers(NamedTuple):
     thd_sf_tile_bases: object
 
 
-def make_sdpa_helpers(CFG, lpt_q_tiles_in_cga_units: bool = False) -> SdpaHelpers:
+def make_sdpa_helpers(
+    CFG,
+    lpt_q_tiles_in_cga_units: bool = False,
+    grouped_lpt: bool = False,
+    lpt_head_group: int = 1,
+    lpt_q_tiles: int = 0,
+) -> SdpaHelpers:
     cga_tile_m = CFG.TILES_Q * CFG.TILE_M * CFG.CTA_MMA
 
     _cga_m = getattr(CFG, "CGA_M", 1)
@@ -582,20 +602,48 @@ def make_sdpa_helpers(CFG, lpt_q_tiles_in_cga_units: bool = False) -> SdpaHelper
             return _lpt_q_super(row, cta_in_pair), head, batch
 
     else:
+        if grouped_lpt:
+            if lpt_q_tiles > 0:
 
-        @cute.jit
-        def _decode_initial(bidx, bidy, bidz, cta_in_pair, n_q_supers, n_qh, n_batch, qh_per_kh=None, seqlen_kv=None):
-            linear = _lpt_linear(bidx)
-            q_tiles = n_q_supers // cutlass.Int32(_cta_mma) if lpt_q_tiles_in_cga_units else n_q_supers
-            row, head, batch = lpt_tile_coords(linear, n_qh, n_batch, q_tiles)
-            return _lpt_q_super(row, cta_in_pair), head, batch
+                @cute.jit
+                def _decode_initial(bidx, bidy, bidz, cta_in_pair, n_q_supers, n_qh, n_batch, qh_per_kh=None, seqlen_kv=None):
+                    row, head, batch = decode_linear_tile_lpt_grouped(_lpt_linear(bidx), n_qh, n_batch, cutlass.Int32(lpt_q_tiles), lpt_head_group)
+                    return _lpt_q_super(row, cta_in_pair), head, batch
 
-        @cute.jit
-        def _decode_payload(t0, t1, cta_in_pair, n_q_supers, n_qh, n_batch, qh_per_kh=None, seqlen_kv=None):
-            linear = _lpt_linear(t0)
-            q_tiles = n_q_supers // cutlass.Int32(_cta_mma) if lpt_q_tiles_in_cga_units else n_q_supers
-            row, head, batch = lpt_tile_coords(linear, n_qh, n_batch, q_tiles)
-            return _lpt_q_super(row, cta_in_pair), head, batch
+                @cute.jit
+                def _decode_payload(t0, t1, cta_in_pair, n_q_supers, n_qh, n_batch, qh_per_kh=None, seqlen_kv=None):
+                    row, head, batch = decode_linear_tile_lpt_grouped(_lpt_linear(t0), n_qh, n_batch, cutlass.Int32(lpt_q_tiles), lpt_head_group)
+                    return _lpt_q_super(row, cta_in_pair), head, batch
+
+            else:
+
+                @cute.jit
+                def _decode_initial(bidx, bidy, bidz, cta_in_pair, n_q_supers, n_qh, n_batch, qh_per_kh=None, seqlen_kv=None):
+                    q_tiles = n_q_supers // cutlass.Int32(_cta_mma) if lpt_q_tiles_in_cga_units else n_q_supers
+                    row, head, batch = decode_linear_tile_lpt_grouped(_lpt_linear(bidx), n_qh, n_batch, q_tiles, lpt_head_group)
+                    return _lpt_q_super(row, cta_in_pair), head, batch
+
+                @cute.jit
+                def _decode_payload(t0, t1, cta_in_pair, n_q_supers, n_qh, n_batch, qh_per_kh=None, seqlen_kv=None):
+                    q_tiles = n_q_supers // cutlass.Int32(_cta_mma) if lpt_q_tiles_in_cga_units else n_q_supers
+                    row, head, batch = decode_linear_tile_lpt_grouped(_lpt_linear(t0), n_qh, n_batch, q_tiles, lpt_head_group)
+                    return _lpt_q_super(row, cta_in_pair), head, batch
+
+        else:
+
+            @cute.jit
+            def _decode_initial(bidx, bidy, bidz, cta_in_pair, n_q_supers, n_qh, n_batch, qh_per_kh=None, seqlen_kv=None):
+                linear = _lpt_linear(bidx)
+                q_tiles = n_q_supers // cutlass.Int32(_cta_mma) if lpt_q_tiles_in_cga_units else n_q_supers
+                row, head, batch = lpt_tile_coords(linear, n_qh, n_batch, q_tiles)
+                return _lpt_q_super(row, cta_in_pair), head, batch
+
+            @cute.jit
+            def _decode_payload(t0, t1, cta_in_pair, n_q_supers, n_qh, n_batch, qh_per_kh=None, seqlen_kv=None):
+                linear = _lpt_linear(t0)
+                q_tiles = n_q_supers // cutlass.Int32(_cta_mma) if lpt_q_tiles_in_cga_units else n_q_supers
+                row, head, batch = lpt_tile_coords(linear, n_qh, n_batch, q_tiles)
+                return _lpt_q_super(row, cta_in_pair), head, batch
 
     @cute.jit
     def _bounds_for_tile(q_super_idx, seqlen_q, seqlen_kv, cta_in_pair):
