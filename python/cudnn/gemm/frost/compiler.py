@@ -1081,6 +1081,9 @@ def _render_block_scale_tile_constants(
     sf_k4 = sf_k // 4  # 4 SF-K per utccp atom
     nb_m = cta_m // 128
     nb_n = cta_n // 128
+    mma_nb_m = cfg.mma_inst_m // 128
+    mma_nb_n = cfg.mma_inst_n // 128
+    sfa_nb_m = mma_nb_m * cfg.num_mma_m
 
     _REGISTERS_PER_ATOM = 4  # cols per 128×4 utccp atom
     scales_per_inst = mma_inst_k_elems // bs.block_size
@@ -1091,14 +1094,14 @@ def _render_block_scale_tile_constants(
     _REGISTERS_PER_BLOCK = word_scales  # SF word width per block
     # One SF word per 128-row / 128-column block, packed back to back. SFB must
     # stay contiguous (one instruction's SFB read extent grows with n_dim, so a
-    # single scale_b reads every N block as one span); SFA blocks each get their
-    # own scale_a at the same stride.
-    sfa_tmem_cols = nb_m * _REGISTERS_PER_BLOCK
-    sfb_tmem_cols = nb_n * _REGISTERS_PER_BLOCK  # fixed SF word width (SFB)
+    # single scale_b reads every N block as one span); SFA is one block per M
+    # sub-block, so its M instructions stay independent.
+    sfa_tmem_cols = sfa_nb_m * _REGISTERS_PER_BLOCK
+    sfb_tmem_cols = mma_nb_n * _REGISTERS_PER_BLOCK
     if is_sm103:
         num_sf_words = sf_k4
-        sfa_tmem_cols = nb_m * sf_k
-        sfb_tmem_cols = nb_n * sf_k
+        sfa_tmem_cols = sfa_nb_m * sf_k
+        sfb_tmem_cols = mma_nb_n * sf_k
     # utccp SMEM-source offsets (16-byte units). One 128×4 atom = 512 B = 32;
     # consecutive K-atoms 1 atom apart; each M/N-block of 128 rows is sf_k4 atoms
     # further along the SF SMEM tile.
@@ -1193,8 +1196,8 @@ def _render_block_scale_tile_constants(
     omma_k = mma_inst_k_elems if is_fp4 else 0
     sf_ids = [scales_per_inst * j % 4 for j in range(num_kblocks)]
     sfb_extra = 4 if cta_n <= 128 else 8
-    sfa_off = [scales_per_inst * j // 4 * 4 * nb_m for j in range(num_kblocks)]
-    sfb_off = [scales_per_inst * j // 4 * 4 * nb_n for j in range(num_kblocks)]
+    sfa_off = [scales_per_inst * j // 4 * 4 * sfa_nb_m for j in range(num_kblocks)]
+    sfb_off = [scales_per_inst * j // 4 * 4 * mma_nb_n for j in range(num_kblocks)]
     if omma_k in (96, 128):
         # 96 -> 3X (block 32) / 6X (block 16); 128 -> 4X (block 32) / 8X (block 16).
         wide_vec = bs.block_size == 16  # the 6X / 8X arm
@@ -1425,8 +1428,8 @@ def _render_block_scale_tile_constants(
             f"mma_next_chunk_by_j = {tuple((kstep * j + kstep - 1) // 128 for j in range(num_kblocks))}",
             f"mma_phase16_by_j = {tuple((kstep * j) % 128 // 16 for j in range(num_kblocks))}",
             f"sf_id_by_j = {tuple(spi * j % 4 for j in range(num_kblocks))}",
-            f"sfa_mma_col_off_by_j = {tuple(spi * j // 4 * 4 * nb_m for j in range(num_kblocks))}",
-            f"sfb_mma_col_off_by_j = {tuple(spi * j // 4 * 4 * nb_n for j in range(num_kblocks))}",
+            f"sfa_mma_col_off_by_j = {tuple(spi * j // 4 * 4 * sfa_nb_m for j in range(num_kblocks))}",
+            f"sfb_mma_col_off_by_j = {tuple(spi * j // 4 * 4 * mma_nb_n for j in range(num_kblocks))}",
         ]
     if is_sm107:
         # SM 10.7 block-scale MMA: K = 64 bytes per instruction (2x sm100), so

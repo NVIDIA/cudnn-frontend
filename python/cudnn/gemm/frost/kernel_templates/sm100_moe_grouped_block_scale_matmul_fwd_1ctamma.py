@@ -710,7 +710,7 @@ def _kernel(
         sfa_scale_ptrs = [nvvm.make_tmem_ptr(b, cutlass.Float32) for b in sfa_tmem_bases]
         sfb_scale_ptrs = [nvvm.make_tmem_ptr(b, cutlass.Float32) for b in sfb_tmem_bases]
         sfa_dst_ptrs = [
-            [nvvm.make_tmem_ptr(sfa_tmem_bases[i] + m * registers_per_block, cutlass.Float32) for m in range(num_blocks_m)] for i in range(num_a_operands)
+            [nvvm.make_tmem_ptr(sfa_tmem_bases[i] + m * registers_per_block, cutlass.Float32) for m in range(num_mma_m)] for i in range(num_a_operands)
         ]
         sfb_dst_ptrs = [
             [nvvm.make_tmem_ptr(sfb_tmem_bases[j] + m * registers_per_block, cutlass.Float32) for m in range(num_blocks_n)] for j in range(num_b_operands)
@@ -766,13 +766,6 @@ def _kernel(
                     if stage == 0 and ab_iter != 0:
                         ab_full_phase_bit = ab_full_phase_bit ^ 1
 
-                    while not nvvm.mbarrier_try_wait_parity(
-                        sf_full_mbar_ptr.subview(stage),
-                        ab_full_phase_bit,
-                        time_limit=10_000_000,
-                    ):
-                        pass
-
                     desc_a_bases = [
                         cutlass.experimental.primitives.Tcgen05SmemDesc.build(
                             start_address=smem_a_list[i].subview(sA_elems * stage),
@@ -810,61 +803,69 @@ def _kernel(
                         for j in range(num_b_operands)
                     ]
 
-                    for atom_r in cutlass.range_constexpr(num_sf_atoms):
+                    while not nvvm.mbarrier_try_wait_parity(
+                        sf_full_mbar_ptr.subview(stage),
+                        ab_full_phase_bit,
+                        time_limit=10_000_000,
+                    ):
+                        pass
+
+                    for sf_word in cutlass.range_constexpr(num_sf_atoms):
                         for _bj in cutlass.range_constexpr(num_b_operands):
-                            for _m in cutlass.range_constexpr(num_blocks_n):
+                            for block_n in cutlass.range_constexpr(num_blocks_n):
                                 if elect_one:
                                     nvvm.tcgen05_cp(
                                         s2t_shape,
-                                        sfb_dst_ptrs[_bj][_m],
-                                        desc_sfb_bases[_bj] + (sf_atom_desc_stride * atom_r + sf_block_desc_stride * _m),
+                                        sfb_dst_ptrs[_bj][block_n],
+                                        desc_sfb_bases[_bj] + (sf_atom_desc_stride * sf_word + sf_block_desc_stride * block_n),
                                         group=nvvm.CTAGroup.CTA_1,
                                         multicast=s2t_multicast,
                                     )
-                        if cutlass.const_expr(atom_r == 0):
+                        if cutlass.const_expr(sf_word == 0):
                             while not nvvm.mbarrier_try_wait_parity(
                                 ab_full_mbar_ptr.subview(stage),
                                 ab_full_phase_bit,
                                 time_limit=10_000_000,
                             ):
                                 pass
-                        for j in cutlass.range_constexpr(sf_insts_per_atom):
-                            k_block_idx = atom_r * sf_insts_per_atom + j
-                            idesc_k = idesc_by_j[j]
-                            for g in cutlass.range_constexpr(num_gemms):
-                                _ai = gemm_a_idx[g]
-                                _bj = gemm_b_idx[g]
-                                desc_a_k = desc_a_bases[_ai].advance_start_address(a_smem_k_step_bytes * k_block_idx)
-                                desc_b = desc_b_bases[_bj].advance_start_address(b_smem_k_step_bytes * k_block_idx)
-                                for mi in cutlass.range_constexpr(num_mma_m):
-                                    if elect_one:
-                                        nvvm.tcgen05_cp(
-                                            s2t_shape,
-                                            sfa_dst_ptrs[_ai][mi],
-                                            desc_sfa_bases[_ai] + (sf_atom_desc_stride * atom_r + sf_block_desc_stride * mi),
-                                            group=nvvm.CTAGroup.CTA_1,
-                                            multicast=s2t_multicast,
-                                        )
+                        for mma_k_in_word in cutlass.range_constexpr(sf_insts_per_atom):
+                            mma_k = sf_word * sf_insts_per_atom + mma_k_in_word
+                            idesc_k = idesc_by_j[mma_k_in_word]
+                            for gemm_i in cutlass.range_constexpr(num_gemms):
+                                _ai = gemm_a_idx[gemm_i]
+                                _bj = gemm_b_idx[gemm_i]
+                                desc_a_k = desc_a_bases[_ai].advance_start_address(a_smem_k_step_bytes * mma_k)
+                                desc_b = desc_b_bases[_bj].advance_start_address(b_smem_k_step_bytes * mma_k)
+                                for mma_m in cutlass.range_constexpr(num_mma_m):
+                                    if cutlass.const_expr(mma_k_in_word == 0 and _ai not in gemm_a_idx[:gemm_i]):
+                                        if elect_one:
+                                            nvvm.tcgen05_cp(
+                                                s2t_shape,
+                                                sfa_dst_ptrs[_ai][mma_m],
+                                                desc_sfa_bases[_ai] + (sf_atom_desc_stride * sf_word + sf_block_desc_stride * mma_m),
+                                                group=nvvm.CTAGroup.CTA_1,
+                                                multicast=s2t_multicast,
+                                            )
                                     # The M sub-block offset is a whole SMEM swizzle atom, so
                                     # the descriptor's swizzle phase is preserved. B and its SF
                                     # are shared; A's SF word block follows the M block.
-                                    desc_a = desc_a_k.advance_start_address(a_smem_m_step_bytes * mi)
+                                    desc_a = desc_a_k.advance_start_address(a_smem_m_step_bytes * mma_m)
                                     if elect_one:
                                         _tcgen05_mma_block_scale(
                                             mma_block_scale_kind,
                                             nvvm.CTAGroup.CTA_1,
-                                            acc_tmem_ptrs[g][mi],
+                                            acc_tmem_ptrs[gemm_i][mma_m],
                                             desc_a,
                                             desc_b,
                                             idesc_k,
                                             enable_input_d=scale_d,
-                                            scale_a=sfa_dst_ptrs[_ai][mi],
+                                            scale_a=sfa_dst_ptrs[_ai][mma_m],
                                             scale_b=sfb_scale_ptrs[_bj],
                                             scale_vec_size=scale_vec_size,
-                                            b_collector_op=_b_collector_op(mi),
+                                            b_collector_op=_b_collector_op(mma_m),
                                         )
                             # Every accumulator sees scale_d=False on exactly the first
-                            # k_block of the tile, so the flip stays outside mi.
+                            # k_block of the tile, so the flip stays outside mma_m.
                             scale_d = cutlass.Boolean(True)
 
                     if elect_one:
