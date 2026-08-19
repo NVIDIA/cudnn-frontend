@@ -45,6 +45,15 @@ grid), head_dim 128:
 | `wan1.3b-480p` | 12 | 39936 |
 | `wan14b-480p` | 40 | 39936 |
 | `wan14b-720p` | 40 | 92160 |
+| `minimax-h3-5s` | 56 | 31488 |
+| `minimax-h3-15s` | 56 | 91392 |
+
+The MiniMax-H3 cases use the open-weights attention config (56 heads,
+head_dim 128) at its published sequence scales (~31k visual tokens per
+1344x768 124-frame clip, ~91k for 15 s, padded to 256-token blocks). H3
+ships with full attention and lists sparse attention as planned, so the
+dense bar reflects its current per-layer cost and the sparse bars the
+available headroom.
 
 Custom shapes: `--cases 12x65536` (heads x seqlen). The default sparsity is
 0.9, the value video sparse-attention deployments typically target.

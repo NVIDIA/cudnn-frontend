@@ -55,6 +55,12 @@ CASES = {
     "wan1.3b-480p": (12, 39936),
     "wan14b-480p": (40, 39936),
     "wan14b-720p": (40, 92160),
+    # MiniMax-H3 (open weights): 56 heads x d128; ~31k visual tokens for a
+    # 1344x768 124-frame clip, ~91k for a 15 s output (padded to 256-token
+    # blocks). The release ships full attention with sparse support planned,
+    # so the dense bar is its current cost and the sparse bars the headroom.
+    "minimax-h3-5s": (56, 31488),
+    "minimax-h3-15s": (56, 91392),
 }
 
 
