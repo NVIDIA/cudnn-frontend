@@ -278,7 +278,9 @@ def test_mxfp8_d192_d128_output_dtypes(out_key):
         d_v=d_v,
     )
     _check(O, O_ref, _OUT[out_key], "e4m3", d_qk=d_qk)
-    assert amax.item() > 0.0
+    amax_value = amax.item()
+    amax_ref = O_ref.abs().max().item()
+    assert abs(amax_value - amax_ref) <= 0.03, f"amax {amax_value:.4f} vs ref {amax_ref:.4f}"
 
 
 @pytest.mark.L0
@@ -360,36 +362,47 @@ def test_mxfp8_gqa(in_key):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("d_qk,d_v", [(128, 128), (192, 128)])
 @torch_fork_set_rng(seed=0)
-def test_mxfp8_bottom_right_rectangular():
+def test_mxfp8_bottom_right_rectangular(d_qk, d_v):
     """Bottom-right causal with S_q != S_kv (the case where it differs from top-left)."""
-    scale = 1.0 / math.sqrt(128)
+    scale = 1.0 / math.sqrt(d_qk)
     # S must be a multiple of TILE_N (128) for the non-padded path; use S_q=128, S_kv=256.
     import cudnn  # noqa: F401
 
-    O, O_ref, _ = _run_rect(2, 8, 128, 256, "e4m3", torch.float16, scale=scale, sdpa_kwargs=dict(use_causal_mask_bottom_right=True))
-    _check(O, O_ref, torch.float16, "e4m3")
+    O, O_ref, _ = _run_rect(
+        2,
+        8,
+        128,
+        256,
+        "e4m3",
+        torch.float16,
+        scale=scale,
+        sdpa_kwargs=dict(use_causal_mask_bottom_right=True),
+        d_qk=d_qk,
+        d_v=d_v,
+    )
+    _check(O, O_ref, torch.float16, "e4m3", d_qk=d_qk)
 
 
-def _run_rect(B, H, S_q, S_kv, in_key, out_dt, *, scale, sdpa_kwargs):
+def _run_rect(B, H, S_q, S_kv, in_key, out_dt, *, scale, sdpa_kwargs, d_qk=128, d_v=128):
     """_run variant allowing S_q != S_kv (bottom-right causal)."""
     import cudnn
 
     dev = "cuda"
-    D = 128
     fp8 = _FP8[in_key]
-    Qf = torch.randn(B, H, S_q, D, device=dev) * 0.5
-    Kf = torch.randn(B, H, S_kv, D, device=dev) * 0.5
-    Vf = torch.randn(B, H, S_kv, D, device=dev) * 0.5
-    Q8, sfq, dqq, (sqp, dsc) = _quantize(Qf, B, H, S_q, D, fp8, columnwise=False)
-    K8, sfk, dqk, (skp, _) = _quantize(Kf, B, H, S_kv, D, fp8, columnwise=False)
-    V8, sfv, dqv, (ssc, dvp) = _quantize(Vf, B, H, S_kv, D, fp8, columnwise=True)
+    Qf = torch.randn(B, H, S_q, d_qk, device=dev) * 0.5
+    Kf = torch.randn(B, H, S_kv, d_qk, device=dev) * 0.5
+    Vf = torch.randn(B, H, S_kv, d_v, device=dev) * 0.5
+    Q8, sfq, dqq, (sqp, dsc) = _quantize(Qf, B, H, S_q, d_qk, fp8, columnwise=False)
+    K8, sfk, dqk, (skp, _) = _quantize(Kf, B, H, S_kv, d_qk, fp8, columnwise=False)
+    V8, sfv, dqv, (ssc, dvp) = _quantize(Vf, B, H, S_kv, d_v, fp8, columnwise=True)
 
     def bshd(x8):
         return x8.permute(0, 2, 1, 3).contiguous().transpose(1, 2)
 
     Qb, Kb, Vb = bshd(Q8), bshd(K8), bshd(V8)
-    Ob = torch.empty(B, S_q, H, D, device=dev, dtype=out_dt).transpose(1, 2)
+    Ob = torch.empty(B, S_q, H, d_v, device=dev, dtype=out_dt).transpose(1, 2)
     lse = torch.empty(B, H, S_q, 1, device=dev, dtype=torch.float32)
     amax = torch.zeros(1, 1, 1, 1, device=dev, dtype=torch.float32)
     g = cudnn.pygraph(
@@ -417,7 +430,7 @@ def _run_rect(B, H, S_q, S_kv, in_key, out_dt, *, scale, sdpa_kwargs):
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name(128, mxfp8=True))
+    _select_engine(g, engine_name(d_qk, d_v=d_v, mxfp8=True))
     g.check_support()
     g.build_plans()
     g.execute(
