@@ -1128,7 +1128,7 @@ def _kernel(
 
                 # @@INJECT_AUX_VIEWS@@
 
-                for subtile_idx in cutlass.range(subtile_cnt, unroll_full=True):
+                for subtile_idx in cutlass.range_constexpr(subtile_cnt):
                     if cutlass.const_expr(use_acc_overlap):
                         _sub = subtile_idx + (1 - acc_buf_parity) * (subtile_cnt - 1 - 2 * subtile_idx)
                         subtile_col_offset = _sub * 32
@@ -1144,6 +1144,13 @@ def _kernel(
                             )
                             c_rmem_vecs.append(nvvm.tcgen05_ld(shape, tmem, num=t2r_inst_repx, offset=ld_half_off))
                         c_rmem_vec = c_rmem_vecs[0]
+
+                    if cutlass.const_expr(((not use_acc_overlap) or cd_out_is_m_major) and not (use_tma_store_epi and cd_out_is_m_major)):
+                        if cutlass.const_expr(mi == num_mma_m - 1 and subtile_idx == subtile_cnt - 1):
+                            nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+                            nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
+                            if elect_one:
+                                nvvm.mbarrier_arrive(acc_empty_mbar_ptr.subview(acc_stage))
 
                     if use_acc_overlap and (not cd_out_is_m_major) and mi == num_mma_m - 1 and subtile_idx == acc_overlap_subtiles - 1:
                         nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
@@ -1243,7 +1250,8 @@ def _kernel(
                                 # @@INJECT_EPILOGUE@@
                     # @@STG_ONLY:END@@
 
-            if cutlass.const_expr((not use_acc_overlap) or cd_out_is_m_major):
+            # The M-major TMA path loads its accumulator inside the store loop, so its release cannot move up.
+            if cutlass.const_expr(use_tma_store_epi and cd_out_is_m_major):
                 nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
                 nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
                 if elect_one:

@@ -1217,8 +1217,10 @@ def _render_block_scale_tile_constants(
             )
 
     # --- AB SMEM pipeline depth ----------------------------------------------
-    # Per-stage SMEM = (packed data + SF) per DISTINCT operand + 2 mbar.
-    per_stage = na * (sA_packed_elems + sfa_smem_bytes) + nb * (sB_packed_elems + sfb_smem_bytes) + 2 * 8
+    # Per-stage SMEM = (packed data + SF) per DISTINCT operand + 3 mbar: the
+    # block-scale templates give the scale factors their own ring (ab_full,
+    # ab_empty, sf_full) so the MMA can utccp the SFs without waiting on A+B.
+    per_stage = na * (sA_packed_elems + sfa_smem_bytes) + nb * (sB_packed_elems + sfb_smem_bytes) + 3 * 8
     from .tile_config import _sm_smem_ab_budget_bytes, _AB_STAGES_CAP
 
     fixed = 2 * acc_stages * 8 + 8

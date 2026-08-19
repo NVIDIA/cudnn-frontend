@@ -214,6 +214,7 @@ def _kernel(
     _smem_sys_reserved = cutlass.Array(cutlass.Int8, 1024, space=cutlass.AddressSpace.smem, alignment=1)
 
     ab_full_mbar_ptr = cutlass.Array(cutlass.Int64, ab_stages, space=cutlass.AddressSpace.smem)
+    sf_full_mbar_ptr = cutlass.Array(cutlass.Int64, ab_stages, space=cutlass.AddressSpace.smem)
     ab_empty_mbar_ptr = cutlass.Array(cutlass.Int64, ab_stages, space=cutlass.AddressSpace.smem)
     acc_empty_mbar_ptr = cutlass.Array(cutlass.Int64, acc_stages, space=cutlass.AddressSpace.smem)
     acc_full_mbar_ptr = cutlass.Array(cutlass.Int64, acc_stages, space=cutlass.AddressSpace.smem)
@@ -299,6 +300,8 @@ def _kernel(
             if elect_one:
                 nvvm.mbarrier_init(ab_full_mbar_ptr.subview(i), 1)
             if elect_one:
+                nvvm.mbarrier_init(sf_full_mbar_ptr.subview(i), 1)
+            if elect_one:
                 nvvm.mbarrier_init(ab_empty_mbar_ptr.subview(i), ab_empty_count)
         for i in range(acc_stages):
             if elect_one:
@@ -316,6 +319,8 @@ def _kernel(
     sA_bytes = sA_elems * (ab_dtype.width // 8)
     sB_bytes = sB_elems * (ab_dtype.width // 8)
     num_tma_copy_bytes = (num_a_operands * (sA_bytes + sfa_smem_bytes) + num_b_operands * (sB_bytes + sfb_smem_bytes)) * 2
+    ab_only_copy_bytes = (num_a_operands * sA_bytes + num_b_operands * sB_bytes) * 2
+    sf_only_copy_bytes = (num_a_operands * sfa_smem_bytes + num_b_operands * sfb_smem_bytes) * 2
 
     # Per-CTA logical tile — the cluster cancels out, so these stay compile-time
     # constants even when the cluster shape is only known at runtime.
@@ -444,7 +449,9 @@ def _kernel(
 
                 if is_pair_leader:
                     if elect_one:
-                        nvvm.mbarrier_arrive_expect_tx(ab_full_mbar_ptr.subview(stage), num_tma_copy_bytes)
+                        nvvm.mbarrier_arrive_expect_tx(ab_full_mbar_ptr.subview(stage), ab_only_copy_bytes)
+                    if elect_one:
+                        nvvm.mbarrier_arrive_expect_tx(sf_full_mbar_ptr.subview(stage), sf_only_copy_bytes)
 
                 for _ai in cutlass.range_constexpr(num_a_operands):
                     sA_stage = smem_a_list[_ai].subview(sA_elems * stage)
@@ -516,7 +523,7 @@ def _kernel(
                                     sSFA_stage,
                                     tma_sfa_desc.get_ptr(),
                                     (0, coord_sf_k, sfa_m_block, tile_l_a),
-                                    ab_full_mbar_ptr.subview(stage),
+                                    sf_full_mbar_ptr.subview(stage),
                                     [],
                                     multicast_mask=tma_mcast_mask_a,
                                     group=nvvm.CTAGroup.CTA_2,
@@ -527,7 +534,7 @@ def _kernel(
                                 sSFA_stage,
                                 tma_sfa_desc.get_ptr(),
                                 (0, coord_sf_k, sfa_m_block, tile_l_a),
-                                ab_full_mbar_ptr.subview(stage),
+                                sf_full_mbar_ptr.subview(stage),
                                 [],
                                 multicast_mask=tma_mcast_mask_a,
                                 group=nvvm.CTAGroup.CTA_2,
@@ -602,7 +609,7 @@ def _kernel(
                                     sSFB_stage,
                                     tma_sfb_desc.get_ptr(),
                                     (0, coord_sf_k, sfb_n_block, tile_l_b),
-                                    ab_full_mbar_ptr.subview(stage),
+                                    sf_full_mbar_ptr.subview(stage),
                                     [],
                                     multicast_mask=tma_mcast_mask_b,
                                     group=nvvm.CTAGroup.CTA_2,
@@ -613,7 +620,7 @@ def _kernel(
                                 sSFB_stage,
                                 tma_sfb_desc.get_ptr(),
                                 (0, coord_sf_k, sfb_n_block, tile_l_b),
-                                ab_full_mbar_ptr.subview(stage),
+                                sf_full_mbar_ptr.subview(stage),
                                 [],
                                 multicast_mask=tma_mcast_mask_b,
                                 group=nvvm.CTAGroup.CTA_2,
@@ -792,7 +799,7 @@ def _kernel(
                         ab_full_phase_bit = ab_full_phase_bit ^ 1
 
                     while not nvvm.mbarrier_try_wait_parity(
-                        ab_full_mbar_ptr.subview(stage),
+                        sf_full_mbar_ptr.subview(stage),
                         ab_full_phase_bit,
                         time_limit=10_000_000,
                     ):
@@ -837,18 +844,7 @@ def _kernel(
 
                     # One SF word per group of MMAs, refreshed right before they
                     # read it. A word spans word_atoms consecutive K-atoms in SMEM.
-                    for atom_r in cutlass.range(num_sf_atoms, unroll_full=True):
-                        for _ai in cutlass.range_constexpr(num_a_operands):
-                            for _m in cutlass.range_constexpr(num_blocks_m):
-                                for _a in cutlass.range_constexpr(word_atoms):
-                                    if elect_one:
-                                        nvvm.tcgen05_cp(
-                                            s2t_shape,
-                                            sfa_dst_ptrs[_ai][_m][_a],
-                                            desc_sfa_bases[_ai] + (sf_atom_desc_stride * (atom_r * word_atoms + _a) + sf_block_desc_stride * _m),
-                                            group=nvvm.CTAGroup.CTA_2,
-                                            multicast=s2t_multicast,
-                                        )
+                    for atom_r in cutlass.range_constexpr(num_sf_atoms):
                         for _bj in cutlass.range_constexpr(num_b_operands):
                             for _m in cutlass.range_constexpr(num_blocks_n):
                                 for _a in cutlass.range_constexpr(word_atoms):
@@ -860,6 +856,13 @@ def _kernel(
                                             group=nvvm.CTAGroup.CTA_2,
                                             multicast=s2t_multicast,
                                         )
+                        if cutlass.const_expr(atom_r == 0):
+                            while not nvvm.mbarrier_try_wait_parity(
+                                ab_full_mbar_ptr.subview(stage),
+                                ab_full_phase_bit,
+                                time_limit=10_000_000,
+                            ):
+                                pass
                         for j in cutlass.range_constexpr(sf_insts_per_atom):
                             k_block_idx = atom_r * sf_insts_per_atom + j
                             idesc_k = idesc_by_j[j]
@@ -869,6 +872,15 @@ def _kernel(
                                 desc_a_k = desc_a_bases[_ai].advance_start_address(a_smem_k_step_bytes * k_block_idx)
                                 desc_b = desc_b_bases[_bj].advance_start_address(b_smem_k_step_bytes * k_block_idx)
                                 for mi in cutlass.range_constexpr(num_mma_m):
+                                    for _a in cutlass.range_constexpr(word_atoms):
+                                        if elect_one:
+                                            nvvm.tcgen05_cp(
+                                                s2t_shape,
+                                                sfa_dst_ptrs[_ai][mi][_a],
+                                                desc_sfa_bases[_ai] + (sf_atom_desc_stride * (atom_r * word_atoms + _a) + sf_block_desc_stride * mi),
+                                                group=nvvm.CTAGroup.CTA_2,
+                                                multicast=s2t_multicast,
+                                            )
                                     # The M sub-block offset is a whole SMEM swizzle atom, so
                                     # the descriptor's swizzle phase is preserved. B and its SF
                                     # are shared; A's SF word block follows the M block.
@@ -1066,7 +1078,7 @@ def _kernel(
 
                 # @@INJECT_AUX_VIEWS@@
 
-                for subtile_idx in cutlass.range(subtile_cnt, unroll_full=True):
+                for subtile_idx in cutlass.range_constexpr(subtile_cnt):
                     if cutlass.const_expr(use_acc_overlap):
                         _sub = subtile_idx + (1 - acc_buf_parity) * (subtile_cnt - 1 - 2 * subtile_idx)
                         subtile_col_offset = _sub * t2r_inst_repx
@@ -1083,6 +1095,14 @@ def _kernel(
                             )
                             c_rmem_vecs.append(nvvm.tcgen05_ld(shape, tmem, num=t2r_inst_repx))
                         c_rmem_vec = c_rmem_vecs[0]
+
+                    if cutlass.const_expr(((not use_acc_overlap) or cd_out_is_m_major) and not (use_tma_store_epi and cd_out_is_m_major)):
+                        if cutlass.const_expr(mi == num_mma_m - 1 and subtile_idx == subtile_cnt - 1):
+                            nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+                            nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
+                            if elect_one:
+                                _mb_pair = nvvm.mapa(acc_empty_mbar_ptr.subview(acc_stage), pair_leader_rank)
+                                nvvm.mbarrier_arrive(_mb_pair, scope=nvvm.MemScope.CLUSTER, relaxed=True)
 
                     if use_acc_overlap and (not cd_out_is_m_major) and mi == num_mma_m - 1 and subtile_idx == acc_overlap_subtiles - 1:
                         nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
@@ -1183,7 +1203,8 @@ def _kernel(
                                 # @@INJECT_EPILOGUE@@
                     # @@STG_ONLY:END@@
 
-            if cutlass.const_expr((not use_acc_overlap) or cd_out_is_m_major):
+            # The M-major TMA path loads its accumulator inside the store loop, so its release cannot move up.
+            if cutlass.const_expr(use_tma_store_epi and cd_out_is_m_major):
                 nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
                 nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
                 if elect_one:
