@@ -215,8 +215,9 @@ def test_grouped_gemm_wgrad_rubin_quantization_validation(
     sf_vec_size,
     expected,
 ):
+    import torch
+
     api_mod = _import_api_module("cudnn.gemm.cutedsl.grouped.wgrad.api")
-    torch = api_mod.torch
 
     assert (
         api_mod._is_supported_rubin_quantization(
