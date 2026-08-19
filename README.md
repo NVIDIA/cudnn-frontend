@@ -57,13 +57,13 @@ Contributor credits for these OSS CuTe DSL kernels are listed in [Acknowledgemen
 
 #### Llama 3.1 style Forward and Bprop with causal masking (GB300)
 <p align="center">
-  <img src="https://github.com/NVIDIA/cudnn-frontend/blob/main/benchmark/sdpa_benchmark_training/results/llama3.1/gb300/llama3.1_top_left.png" alt="Llama 3.1 SDPA Benchmark on GB300 (only cuDNN)" width="600"/>
+  <img src="https://github.com/NVIDIA/cudnn-frontend/blob/main/benchmark/attention_training/results/llama3.1/gb300/llama3.1_top_left.png" alt="Llama 3.1 SDPA Benchmark on GB300 (only cuDNN)" width="600"/>
 </p>
 
 #### Deepseek v3 style Forward and Bprop with causal masking (GB300)
 
 <p align="center">
-  <img src="https://github.com/NVIDIA/cudnn-frontend/blob/main/benchmark/sdpa_benchmark_training/results/dsv3/gb300/dsv3_top_left.png" alt="DSv3 SDPA Benchmark on GB300 (only cuDNN)" width="600"/>
+  <img src="https://github.com/NVIDIA/cudnn-frontend/blob/main/benchmark/attention_training/results/dsv3/gb300/dsv3_top_left.png" alt="DSv3 SDPA Benchmark on GB300 (only cuDNN)" width="600"/>
 </p>
 
 ## Key Features

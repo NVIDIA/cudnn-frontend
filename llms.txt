@@ -46,7 +46,7 @@ Published documentation: https://docs.nvidia.com/deeplearning/cudnn/latest/devel
 
 - [C++ samples (Catch2)](https://github.com/NVIDIA/cudnn-frontend/tree/main/samples/cpp)
 - [Python notebook tutorials](https://github.com/NVIDIA/cudnn-frontend/tree/main/samples/python)
-- [SDPA training benchmark](https://github.com/NVIDIA/cudnn-frontend/tree/main/benchmark/sdpa_benchmark_training)
+- [SDPA training benchmark](https://github.com/NVIDIA/cudnn-frontend/tree/main/benchmark/attention_training)
 
 ## Optional
 
