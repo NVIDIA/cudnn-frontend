@@ -1904,6 +1904,8 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
         beta1_rcp = cutlass.Float32(1.0 / beta1)
         beta2_rcp = cutlass.Float32(1.0 / beta2)
 
+        # The K3-default specialization always uses packed FP32x2 arithmetic. This is an
+        # activation-specific optimization and is independent of the generic vectorized_f32 knob.
         if cutlass.const_expr(self.situ_beta1 == 4.0):
             fmul2 = partial(cute.arch.mul_packed_f32x2, rnd="rn", ftz=False)
             fadd2 = partial(cute.arch.add_packed_f32x2, rnd="rn", ftz=False)
@@ -1995,23 +1997,11 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
             up = up_vec[i].to(cutlass.Float32) * beta_val
             gate_tanh = cute.math.tanh(gate * beta1_rcp, fastmath=True)
             up_tanh = cute.math.tanh(up * beta2_rcp, fastmath=True)
-            if cutlass.const_expr(self.situ_beta1 == 4.0):
-                # For a = tanh(gate / 4), sigmoid(gate) = 1/2 + a / (1 + a^2).
-                gate_tanh_sq = gate_tanh * gate_tanh
-                gate_tanh_denom_rcp = cute.arch.rcp_approx(cutlass.Float32(1.0) + gate_tanh_sq)
-                sigmoid = cutlass.Float32(0.5) + gate_tanh * gate_tanh_denom_rcp
-            else:
-                sigmoid = cute.arch.rcp_approx(cutlass.Float32(1.0) + cute.math.exp(-gate, fastmath=True))
+            sigmoid = cute.arch.rcp_approx(cutlass.Float32(1.0) + cute.math.exp(-gate, fastmath=True))
             gate_value = beta1_f32 * gate_tanh * sigmoid
             up_value = beta2_f32 * up_tanh
-            if cutlass.const_expr(self.situ_beta1 == 4.0):
-                # d[4*a*sigmoid(gate)]/dgate, expressed with the same reciprocal.
-                gate_grad = (cutlass.Float32(1.0) - gate_tanh_sq) * (
-                    cutlass.Float32(0.5) + cutlass.Float32(2.0) * gate_tanh * gate_tanh_denom_rcp * gate_tanh_denom_rcp
-                )
-            else:
-                gate_grad = (cutlass.Float32(1.0) - gate_tanh * gate_tanh) * sigmoid
-                gate_grad = gate_grad + beta1_f32 * gate_tanh * sigmoid * (cutlass.Float32(1.0) - sigmoid)
+            gate_grad = (cutlass.Float32(1.0) - gate_tanh * gate_tanh) * sigmoid
+            gate_grad = gate_grad + beta1_f32 * gate_tanh * sigmoid * (cutlass.Float32(1.0) - sigmoid)
             up_grad = cutlass.Float32(1.0) - up_tanh * up_tanh
             activation_grad = grad
             if cutlass.const_expr(self.has_prob):

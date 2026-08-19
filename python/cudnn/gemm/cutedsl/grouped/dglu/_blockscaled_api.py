@@ -177,7 +177,9 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
             knob existed. ``"e5m3"`` requires Rubin and the NVFP4 recipe, and the
             scale tensors are still supplied as ``torch.float8_e4m3fn`` because
             torch has no e5m3 dtype -- only the CuTe element type is overridden.
-        :param vector_f32: Use vectorized f32 operations
+        :param vector_f32: Use vectorized f32 operations for dSwiGLU and dGeGLU.
+            K3-default dSiTU-GLU (``situ_beta1=4.0``) always uses its packed
+            FP32x2 specialization; non-default dSiTU-GLU uses scalar FP32.
         :param m_aligned: Alignment for group M dimension
         :param discrete_col_sfd: Generate discrete col-major scale factor tensor
         :param act_func: Activation function, one of "dswiglu", "dgeglu", or "dsituglu"

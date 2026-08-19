@@ -518,7 +518,9 @@ Providing both or neither raises `ValueError`.
   - `TILE_N = 256`
 - `cluster_shape_mn`: Thread Block cluster shape. Default: `(2, 1)` when `TILE_M=256`, `(1, 1)` otherwise
 - `sf_vec_size`: Scale factor vector size. `{16, 32}`. Default: `16`
-- `vector_f32`: Enable packed f32 operations. Default: `False`
+- `vector_f32`: Enable packed f32 operations for dSwiGLU and dGeGLU. Default:
+  `False`. K3-default dSiTU-GLU (`situ_beta1=4.0`) always uses its packed FP32x2
+  specialization; non-default dSiTU-GLU uses scalar FP32.
 - `m_aligned`: Must be `256`. Default: `256`
 - `discrete_col_sfd`: Generate discrete col-major scale factors. Default: `False`
 - `act_func`: Backward activation function. `"dswiglu"` (default), `"dgeglu"`, or block-scaled `"dsituglu"`

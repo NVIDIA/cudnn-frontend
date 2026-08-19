@@ -485,7 +485,9 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall) -> TupleDict:
             bit to widen the scale range; it is Rubin-only, requires the NVFP4
             recipe, and the scale tensors are still passed as
             ``torch.float8_e4m3fn`` because torch has no e5m3 dtype.
-        vector_f32: Use vectorized f32
+        vector_f32: Use vectorized f32 for dSwiGLU and dGeGLU. K3-default
+            dSiTU-GLU (``situ_beta1=4.0``) always uses its packed FP32x2
+            specialization; non-default dSiTU-GLU uses scalar FP32.
         m_aligned: M alignment (must be 256)
         discrete_col_sfd: Generate discrete col-major scale factor tensor
         act_func: Activation function ("dswiglu", "dgeglu", or block-scaled "dsituglu")

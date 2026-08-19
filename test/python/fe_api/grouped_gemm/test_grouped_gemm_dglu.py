@@ -1473,8 +1473,18 @@ def _test_grouped_gemm_dglu_discrete_wrapper(
     ids=["mxfp4", "mxfp8", "nvfp4"],
 )
 @pytest.mark.parametrize(("situ_beta1", "situ_beta2"), [(4.0, 25.0), (2.0, 8.0)])
-def test_grouped_gemm_dglu_discrete_wrapper_dsituglu(ab_dtype, d_dtype, sf_dtype, sf_vec_size, situ_beta1, situ_beta2, request):
-    """Exercise dSiTU-GLU with the inherited MXFP4, MXFP8, and NVFP4 layouts."""
+@pytest.mark.parametrize("vector_f32", [False, True], ids=["vector-f32-off", "vector-f32-on"])
+def test_grouped_gemm_dglu_discrete_wrapper_dsituglu(
+    ab_dtype,
+    d_dtype,
+    sf_dtype,
+    sf_vec_size,
+    situ_beta1,
+    situ_beta2,
+    vector_f32,
+    request,
+):
+    """Exercise dSiTU-GLU layouts and its activation-specific vectorization policy."""
 
     _test_grouped_gemm_dglu_discrete_wrapper(
         ab_dtype=ab_dtype,
@@ -1486,7 +1496,7 @@ def test_grouped_gemm_dglu_discrete_wrapper_dsituglu(ab_dtype, d_dtype, sf_dtype
         cluster_shape_mn=(2, 1),
         sf_vec_size=sf_vec_size,
         sf_dtype=sf_dtype,
-        vector_f32=False,
+        vector_f32=vector_f32,
         discrete_col_sfd=False,
         act_func="dsituglu",
         request=request,
