@@ -51,11 +51,17 @@ grads = sdpa_bwd_wrapper_dsl_sm120(
 dq, dk, dv = grads["dq_tensor"], grads["dk_tensor"], grads["dv_tensor"]
 ```
 
-Tensors are logical `(B, H, S, D)`; any dense layout with the head dim
-innermost-contiguous is accepted (`dense_flex`) — non-BSHD-compact operands
-are staged through workspace copies. `stats` is the natural-log forward LSE,
-fp32 `(B, H, S_q, 1)` contiguous. GQA/MQA is expressed through the head
-counts: `H_kv` may be any divisor of `H_q` (K/V and dK/dV carry `H_kv` heads).
+Tensors are logical `(B, H, S, D)`. Any dense layout with the head dim
+innermost-contiguous is accepted (`dense_flex`) and addressed in place: the
+declared strides bake into the kernel. TMA sets the limits — batch/seq/head
+strides must be 16-byte multiples and each base address 16-byte aligned;
+anything else is declined. Head dims that pad to the next supported size
+are also served in place: the TMA descriptors declare the actual extents
+and reads past them zero-fill in hardware. `stats` is the natural-log forward LSE, fp32
+`(B, H, S_q, 1)`; any non-broadcast layout serves, its strides baked in the
+same way (scalar loads, so no 16-byte rule). GQA/MQA is expressed through
+the head counts: `H_kv` may be any divisor of `H_q` (K/V and dK/dV carry
+`H_kv` heads).
 
 Through the graph API, per-plan sequence-tile-width knobs can be requested via
 `SdpaBwdKnobs`: `tile_m` controls the Q tile (`q_tile`), and `tile_n` controls
@@ -152,18 +158,21 @@ when it does not fit; among the default configs, this occurs at D=256. In
 the single-buffer branch the iteration reorders GEMM5 *before* GEMM4 (GEMM5
 is sQ's last reader), so the Q refill for the next tile hides behind GEMM4
 and the dQ scatter instead of stalling the loop. Head dims that are multiples
-of 8 but are not native sizes are zero-padded by the adapter (pad columns
-contribute nothing anywhere in the chain). Explicit `tile_m`/`tile_n` knobs
+of 8 but are not native sizes compute on the next native size: the TMA
+descriptors declare the actual extents, reads past them zero-fill in
+hardware (pad columns contribute nothing anywhere in the chain), and the
+dQ/dK/dV writers guard their stores at the actual widths. Explicit `tile_m`/`tile_n` knobs
 override the Q/KV tile defaults; off-table combinations derive their warp
 partitions from a largest-valid rule.
 
 The Q/K head dim may exceed the V head dim (MLA: DeepSeek-V3 and Kimi-K2.6
 train at 192/128). `d_qk` sizes Q/K/dQ/dK and `d_v` sizes V/O/dO/dV: GEMM1
 contracts over `d_qk`, GEMM2 over `d_v`, and dK/dV share one warp partition
-with per-side column slices. Tile defaults come from `d_qk`. Unequal dims
-must both be multiples of 64 (one smem page/swizzle); the adapter pads each
-side to its own native kernel size and raises the VO side to at least 64
-when the sizes differ.
+with per-side column slices. Tile defaults come from `d_qk`. When the
+kernel-facing padded sizes differ, both must be multiples of 64 (one smem
+page/swizzle); the adapter pads each side to its own native kernel size and
+raises the VO side to at least 64 when they differ — the actual head dims
+need not be (e.g. 96/40 computes as 128/64).
 
 ### dQ scatter and the scrambled workspace
 
@@ -244,10 +253,9 @@ only the unused relay operand remains in the kernel ABI.
 
 - SM120 and SM121, e.g. RTX 5090, RTX PRO 6000 Blackwell, and DGX Spark
 - Dtypes: FP16 / BF16 (LSE fp32)
-- Head dims: 32/64/128/192/256 natively; any other multiple of 8 up to 256 is
-  served by zero-padding D to the next supported size. Rectangular
-  `d_qk >= d_v` (MLA, e.g. 192/128) is supported: each side pads to its own
-  native size (the VO side raises to >= 64 when the sizes differ)
+- Head dims: 32/64/128/192/256 natively; any other multiple of 8 up to 256
+  computes on the next supported size, in place through the TMA zero-fill
+  envelope. Rectangular `d_qk >= d_v` (MLA, e.g. 192/128) is supported.
 - Masks: none, causal (top-left or bottom-right), right-band-widened causal
   (`diagonal_band_right_bound` > 0, the causal diagonal shifted right by a
   compile-time R), sliding window (left-window offset, with or without

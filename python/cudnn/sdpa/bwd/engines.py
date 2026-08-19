@@ -86,12 +86,19 @@ class Capabilities:
     sm_hi: int
     d: frozenset[int]  # supported head dims (d_qk == d_v unless dqk_ge_dv)
     # When True, ``d`` is an ENVELOPE upper bound: the lowering also serves any
-    # graph with head dims <= max(d) (the SM80 adapter zero-pads to the
-    # smallest covering kernel flavor). False = exact-set membership.
+    # graph with head dims <= max(d), computing on the smallest covering
+    # kernel size (sm120 in place via TMA zero-fill; sm80 via host-side
+    # zero-padding). False = exact-set membership.
     d_envelope: bool = False
+    # Alignment rule for envelope rows: head dims must be multiples of this
+    # (sm120's TMA 16-byte global-stride rule at 2 B/elem -> 8; sm80's
+    # host-side padding has no such constraint -> 1).
+    d_pad_multiple: int = 1
     # When True the lowering serves rectangular head dims with D_QK >= D_V
     # (e.g. 192/128); False requires D_QK == D_V.
     dqk_ge_dv: bool = False
+    # True when stats is not contiguous (B, H_q, S_q, 1) in memory.
+    strided_stats: bool = False
     dtypes: frozenset = frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16})  # cudnn.data_type, see graph_analyzer
 
     # optional features a backward graph may request
@@ -128,9 +135,7 @@ class Capabilities:
     #                  strides included, as long as the head dim is
     #                  innermost-contiguous (stride 1) and the strides are
     #                  non-broadcast / non-overlapping (facts.dense_layout;
-    #                  see graph_analyzer.dense_layout_ok). The lowering
-    #                  normalizes such tensors to the kernel's canonical
-    #                  BSHD-compact buffers (zero-copy when already BSHD).
+    #                  see graph_analyzer.dense_layout_ok).
     layouts: frozenset[str] = frozenset({"bshd"})
 
     # Tuning-knob domains this engine's lowering honors (see SdpaBwdKnobs).
@@ -177,6 +182,9 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
     if capabilities.d_envelope:
         if max(facts.d_qk, facts.d_v) > max(capabilities.d):
             return f"head dims (D_QK={facts.d_qk}, D_V={facts.d_v}) exceed the {max(capabilities.d)} envelope"
+        m = capabilities.d_pad_multiple
+        if m > 1 and (facts.d_qk % m != 0 or facts.d_v % m != 0):
+            return f"the envelope serves head-dim multiples of {m} (TMA 16-byte global-stride rule); graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
     elif facts.d_qk not in capabilities.d:
         return f"serves D in {sorted(capabilities.d)}; graph has D={facts.d_qk}"
     elif facts.d_v not in capabilities.d:
@@ -232,19 +240,21 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
     if facts.bottom_right and not capabilities.bottom_right:
         return "graph uses bottom-right causal, which this engine does not support"
 
-    # The kernel consumes the forward stats as a contiguous natural-log LSE
-    # (fp32 (B, H_q, S_q, 1)); a strided stats view has no zero-copy reshape.
     if facts.stats_t is not None:
         if facts.stats_t.get_data_type() != cudnn.data_type.FLOAT:
             return f"stats must be fp32; got {facts.stats_t.get_data_type()}"
         s_dim = tuple(facts.stats_t.get_dim())
         s_stride = tuple(facts.stats_t.get_stride())
         expect_dim = (facts.b, facts.h_q, facts.s_q, 1)
-        expect_stride = (facts.h_q * facts.s_q, facts.s_q, 1, 1)
         if s_dim != expect_dim:
             return f"stats must be (B, H_q, S_q, 1) = {expect_dim}; got {s_dim}"
-        if s_stride != expect_stride:
-            return f"stats must be contiguous {expect_stride}; got stride {s_stride}"
+        if capabilities.strided_stats:
+            if any(st == 0 and d > 1 for d, st in zip(s_dim, s_stride)):
+                return f"stats must not broadcast (stride 0 on a size > 1 dim); got stride {s_stride}"
+        else:
+            expect_stride = (facts.h_q * facts.s_q, facts.s_q, 1, 1)
+            if s_stride != expect_stride:
+                return f"stats must be contiguous {expect_stride}; got stride {s_stride}"
     return None
 
 
@@ -262,7 +272,9 @@ def _sm120_spec() -> EngineSpec:
             sm_lo=_BLACKWELL_GEFORCE[0],
             sm_hi=_BLACKWELL_GEFORCE[1],
             # Any head size multipled of 8
-            d=frozenset(range(8, max(_SM120_HEAD_DIMS) + 1, 8)),
+            d=frozenset(_SM120_HEAD_DIMS),
+            d_envelope=True,  # any multiple of 8 computes on the next native size (TMA zero-fill)
+            d_pad_multiple=8,
             dqk_ge_dv=True,
             dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
             gqa=True,
@@ -274,6 +286,7 @@ def _sm120_spec() -> EngineSpec:
             sink=True,
             dsink=True,
             layouts=frozenset({"bshd", "dense_flex"}),
+            strided_stats=True,
             deterministic=True,
             tile_ms=frozenset(_SM120_Q_TILES),
             tile_ns=frozenset(_SM120_KV_TILES),
@@ -322,7 +335,7 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
     ports = {name: (tuple(dim), tuple(stride)) for name, dim, stride in facts.port_layouts}
     q_geom, k_geom, v_geom, o_geom = ports["q"], ports["k"], ports["v"], ports["o"]
     do_geom, dq_geom, dk_geom, dv_geom = ports["dO"], ports["dQ"], ports["dK"], ports["dV"]
-    stats_geom = ((facts.b, facts.h_q, facts.s_q, 1), (facts.h_q * facts.s_q, facts.s_q, 1, 1))
+    stats_geom = (tuple(facts.stats_t.get_dim()), tuple(facts.stats_t.get_stride()))
 
     import torch
 
