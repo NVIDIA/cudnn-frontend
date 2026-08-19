@@ -16,7 +16,6 @@ This directory contains benchmarking tools for Scaled Dot Product Attention (SDP
   - `ltx2.py` - LTX-2 video DiT self-attention benchmarks (bidirectional, no mask)
   - `gpt_oss.py` - GPT-OSS sliding-window-attention GQA benchmarks (causal, SWA=128)
   - `qwen35.py` - Qwen 3.5 GQA benchmarks (head_dim=256, causal, bf16 bidirectional — Blackwell fp8/fa4 limits)
-  - `qwen3vl_vit.py` - Qwen3-VL vision-encoder (ViT) self-attention benchmarks (bidirectional, no mask, fwd-only, head_dim 72-in-80)
   - `auto_regressive_dit.py` - Autoregressive video DiT (short Q, long cached KV, bf16/mxfp8, no_mask)
   - `kimi_k3.py` - Kimi K3 MLA benchmarks (96 heads, unabsorbed 192/128, NoPE)
   - `deepseek_v4.py` - DeepSeek-V4 shared-K=V MQA benchmarks (head_dim=512, SWA=128)
@@ -58,9 +57,6 @@ python -m benchmark.attention_training.runner --config ltx2
 
 # Run Qwen 3.5 benchmark suite (cuDNN bf16 at head_dim=256)
 python -m benchmark.attention_training.runner --config qwen35
-
-# Run Qwen3-VL vision-encoder (ViT) benchmark suite (inference fwd-only)
-python -m benchmark.attention_training.runner --config qwen3vl_vit
 
 # Run Autoregressive video DiT benchmark suite (short Q, long cached KV)
 python -m benchmark.attention_training.runner --config auto_regressive_dit
@@ -337,7 +333,7 @@ results/<config>/<gpu>/
     <config>_<mask>_det_overhead.png     # bwd bf16: det vs non-det comparison
 ```
 
-Runs were captured on GB200 and GB300 with cuDNN 9.23.0 and FAv4 4.0.0b15.
+Runs were captured on H200, GB200, GB300 and RTX PRO 6000 Server Edition (GB300 results shown below).
 
 ### GB300 - Llama 3.1 Causal (top_left)
 ![Llama 3.1 Causal on GB300](results/llama3.1/gb300/llama3.1_top_left.png)
@@ -379,11 +375,7 @@ Runs were captured on GB200 and GB300 with cuDNN 9.23.0 and FAv4 4.0.0b15.
 - Forward-only (autoregressive inference). cuDNN 9.30.0 with prefill split-K on bf16/fp8/mxfp8; FAv4 BF16 swept over `num_splits ∈ {1, 2, 4, 8, 16, 32}` with the best annotated on each bar (`ks=`). FAv4 FP8/MXFP8 are absent — the CuTe-DSL FAv4 build rejects those input types.
 - Reproduce with `python -m benchmark.attention_training.bench_ar_dit_peak --out <path>`.
 
-### GB200 - Autoregressive video DiT
-![Autoregressive DiT on GB200](results/auto_regressive_dit/gb200/auto_regressive_dit_no_mask.png)
-- Same configuration as the GB300 chart above, captured on GB200.
-
-GB200 results are available under the same layout at `results/<config>/gb200/`.
+Results on other archs are available under the same layout at `results/<config>/`.
 
 Inference-phase benchmarks (context vs generation decode, MTP widths,
 cudnn vs the frontend's open-source engines) live in
