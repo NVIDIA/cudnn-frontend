@@ -1090,18 +1090,21 @@ def _render_block_scale_tile_constants(
     word_scales = max(_REGISTERS_PER_ATOM, scales_per_inst)  # cols per block-word
     word_atoms = -(-word_scales // _REGISTERS_PER_ATOM)  # atoms copied per word (ceil: a partial atom still costs one)
     insts_per_word = max(_REGISTERS_PER_ATOM // scales_per_inst, 1)
-    num_sf_words = max(num_kblocks // insts_per_word, 1)  # utccp refreshes / k-tile
     _REGISTERS_PER_BLOCK = word_scales  # SF word width per block
-    # One SF word per 128-row / 128-column block, packed back to back. SFB must
-    # stay contiguous (one instruction's SFB read extent grows with n_dim, so a
-    # single scale_b reads every N block as one span); SFA is one block per M
-    # sub-block, so its M instructions stay independent.
-    sfa_tmem_cols = sfa_nb_m * _REGISTERS_PER_BLOCK
-    sfb_tmem_cols = mma_nb_n * _REGISTERS_PER_BLOCK
     if is_sm103:
+        # A whole K-tile of SF is TMEM-resident, so a region is sf_k wide.
         num_sf_words = sf_k4
         sfa_tmem_cols = sfa_nb_m * sf_k
         sfb_tmem_cols = mma_nb_n * sf_k
+    else:
+        # One SF word per 128-row / 128-column block, packed back to back and
+        # refreshed per word. SFB must stay contiguous (one instruction's SFB read
+        # extent grows with n_dim, so a single scale_b reads every N block as one
+        # span); SFA is one block per M sub-block, so its M instructions stay
+        # independent.
+        num_sf_words = max(num_kblocks // insts_per_word, 1)  # utccp refreshes / k-tile
+        sfa_tmem_cols = sfa_nb_m * _REGISTERS_PER_BLOCK
+        sfb_tmem_cols = mma_nb_n * _REGISTERS_PER_BLOCK
     # utccp SMEM-source offsets (16-byte units). One 128×4 atom = 512 B = 32;
     # consecutive K-atoms 1 atom apart; each M/N-block of 128 rows is sf_k4 atoms
     # further along the SF SMEM tile.
@@ -1144,7 +1147,29 @@ def _render_block_scale_tile_constants(
     acc_cols_per_stage = num_mma_m * epi_cols_per_mma_m
     na, nb = chain.num_a_operands, chain.num_b_operands
     sf_total_cols = na * sfa_tmem_cols + nb * sfb_tmem_cols
-    per_gemm = (total_tmem - sf_total_cols) // num_gemms
+    # Columns each instruction reads from its scale base -- ISA opUTCHMMA,
+    # "Load A/B scale factors" (sf{a,b}_tmem_cols).
+    if is_sm103:
+        # The resident K-tile means the scale pointer advances per k-block, so a
+        # read window can reach past the operand's own region.
+        sf_ids = [scales_per_inst * j % 4 for j in range(num_kblocks)]
+        wide_vec = bs.block_size == 16
+        sfb_extra = 4 if cta_n <= 128 else 8
+        sfa_off = [scales_per_inst * j // 4 * 4 * sfa_nb_m for j in range(num_kblocks)]
+        sfb_off = [scales_per_inst * j // 4 * 4 * mma_nb_n for j in range(num_kblocks)]
+        extra = [sfb_extra if (wide_vec or sf_ids[j] >= 2) else 0 for j in range(num_kblocks)]
+        sfa_spans = [(sfa_off[j], 4 if (not wide_vec and sf_ids[j] < 2) else 8) for j in range(num_kblocks)]
+        sfb_spans = [(sfb_off[j], 2 * ((cta_n + 63) // 64) + extra[j]) for j in range(num_kblocks)]
+        sf_reserved_cols = max(
+            sf_total_cols,
+            (na - 1) * sfa_tmem_cols + max(off + cols for off, cols in sfa_spans),
+            na * sfa_tmem_cols + (nb - 1) * sfb_tmem_cols + max(off + cols for off, cols in sfb_spans),
+        )
+    else:
+        # Every SF word is re-utccp'd into the same columns and the scale base is fixed,
+        # so an instruction reads exactly its own operand's region.
+        sf_reserved_cols = sf_total_cols
+    per_gemm = (total_tmem - sf_reserved_cols) // num_gemms
     if per_gemm < acc_cols_per_stage:
         raise NotImplementedError(
             f"block-scale {cfg.name!r}: per-GEMM TMEM budget {per_gemm} < one acc "
@@ -1156,12 +1181,10 @@ def _render_block_scale_tile_constants(
         acc_stages = 2  # full per-GEMM double-buffer
     else:
         acc_stages = 1
-        # the overlap drain order assumes one contiguous M block per stage
-        if num_mma_m == 1:
-            gran = 32  # epilogue TMEM-load drain unit (cols)
-            ov = ((2 * acc_cols_per_stage - per_gemm + gran - 1) // gran) * gran
-            if ov < acc_cols_per_stage:  # else no room → plain 1-stage
-                acc_overlap_cols = ov
+        gran = 32  # epilogue TMEM-load drain unit (cols)
+        ov = ((2 * acc_cols_per_stage - per_gemm + gran - 1) // gran) * gran
+        if ov < acc_cols_per_stage:  # else no room -> plain 1-stage
+            acc_overlap_cols = ov
     use_acc_overlap = acc_overlap_cols > 0
     # within-GEMM per-stage stride + per-GEMM region size:
     acc_stage_stride = (acc_cols_per_stage - acc_overlap_cols) if use_acc_overlap else acc_cols_per_stage
@@ -1188,33 +1211,15 @@ def _render_block_scale_tile_constants(
             f"block-scale {cfg.name!r}: the accumulator + SF regions need {used_cols} TMEM columns but only {num_tmem_alloc_cols} are allocated"
         )
 
-    mma_m = cfg.mma_inst_m * cta_group
-    half_m = cta_group == 2 and mma_m == 128  # unreachable while block-scale pins cta_m=128
-    omma_k = mma_inst_k_elems if is_fp4 else 0
-    sf_ids = [scales_per_inst * j % 4 for j in range(num_kblocks)]
-    sfb_extra = 4 if cta_n <= 128 else 8
-    sfa_off = [scales_per_inst * j // 4 * 4 * sfa_nb_m for j in range(num_kblocks)]
-    sfb_off = [scales_per_inst * j // 4 * 4 * mma_nb_n for j in range(num_kblocks)]
-    if omma_k in (96, 128):
-        # 96 -> 3X (block 32) / 6X (block 16); 128 -> 4X (block 32) / 8X (block 16).
-        wide_vec = bs.block_size == 16  # the 6X / 8X arm
-        if omma_k == 128:  # extra-enhanced: the extra term is 8X-only
-            extra = [sfb_extra if wide_vec else 0] * num_kblocks
-        else:  # enhanced: 6X, or 3X with sfb_id >= 2
-            extra = [sfb_extra if (wide_vec or sf_ids[j] >= 2) else 0 for j in range(num_kblocks)]
-        sfa_spans = [(sfa_off[j], 4 if (not wide_vec and omma_k == 96 and sf_ids[j] < 2) else 8) for j in range(num_kblocks)]
-        sfb_spans = [(sfb_off[j], 2 * ((cta_n + 63) // 64) + extra[j]) for j in range(num_kblocks)]
-    else:
-        sfa_spans = [(0, 2 if half_m else 4)]
-        sfb_spans = [(0, 2 * ((cta_n + 127) // 128) if half_m else 2 * ((cta_n + 63) // 64))]
-    for _label, _bases, _spans in (("SFA", sfa_col_bases, sfa_spans), ("SFB", sfb_col_bases, sfb_spans)):
-        _end = max(b + off + cols for b in _bases for off, cols in _spans)
-        if _end > num_tmem_alloc_cols:
-            raise NotImplementedError(
-                f"block-scale {cfg.name!r}: the hardware {_label} TMEM span reaches "
-                f"column {_end} but only {num_tmem_alloc_cols} are allocated"
-                + ("; an SFB overrun is NOT reported by the hardware, so this check is the only guard" if _label == "SFB" else "")
-            )
+    if is_sm103:
+        for _label, _bases, _spans in (("SFA", sfa_col_bases, sfa_spans), ("SFB", sfb_col_bases, sfb_spans)):
+            _end = max(b + off + cols for b in _bases for off, cols in _spans)
+            if _end > num_tmem_alloc_cols:
+                raise NotImplementedError(
+                    f"block-scale {cfg.name!r}: the hardware {_label} TMEM span reaches "
+                    f"column {_end} but only {num_tmem_alloc_cols} are allocated (the MMA "
+                    f"would fault OOR_ADDR)"
+                )
 
     # --- AB SMEM pipeline depth ----------------------------------------------
     # Per-stage SMEM = (packed data + SF) per DISTINCT operand + 3 mbar: the

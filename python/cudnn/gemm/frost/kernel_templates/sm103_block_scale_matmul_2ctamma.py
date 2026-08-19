@@ -1194,8 +1194,12 @@ def _kernel(
             # epi_rows_per_mma_m rows at a time, so a CTA tile of num_mma_m blocks
             # drains in num_mma_m passes over its own column region.
             for mi in cutlass.range_constexpr(num_mma_m):
-                coord_m = coord_m_tile + mi * epi_rows_per_mma_m
-                mi_col_base = acc_base_col + mi * epi_cols_per_mma_m
+                if cutlass.const_expr(use_acc_overlap and num_mma_m > 1):
+                    _mi = mi + (1 - acc_buf_parity) * (num_mma_m - 1 - 2 * mi)
+                else:
+                    _mi = mi
+                coord_m = coord_m_tile + _mi * epi_rows_per_mma_m
+                mi_col_base = acc_base_col + _mi * epi_cols_per_mma_m
                 tmem_col_addr_gemms = [(row_id_with_warp_offset << 16) | (mi_col_base + g * acc_gemm_stride) for g in range(num_gemms)]
 
                 if cutlass.const_expr(epi_rows_per_mma_m == 64):
@@ -1232,7 +1236,7 @@ def _kernel(
                                 _mb_pair = nvvm.mapa(acc_empty_mbar_ptr.subview(acc_stage), pair_leader_rank)
                                 nvvm.mbarrier_arrive(_mb_pair, scope=nvvm.MemScope.CLUSTER, relaxed=True)
 
-                    if use_acc_overlap and (not cd_out_is_m_major) and mi == num_mma_m - 1 and subtile_idx == acc_overlap_subtiles - 1:
+                    if use_acc_overlap and (not cd_out_is_m_major) and mi * subtile_cnt + subtile_idx == acc_overlap_subtiles - 1:
                         nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
                         nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
                         if elect_one:

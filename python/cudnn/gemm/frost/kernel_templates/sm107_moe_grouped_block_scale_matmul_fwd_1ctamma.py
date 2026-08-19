@@ -1049,8 +1049,12 @@ def _kernel(
                     acc_base_col = base_col_id_root + acc_stage * acc_region_cols
                 # One pass per MMA-M block over its own column region.
                 for mi in cutlass.range_constexpr(num_mma_m):
-                    coord_m = coord_m_tile + mi * mma_inst_shape_mnk[0]
-                    mi_col_base = acc_base_col + mi * epi_cols_per_mma_m
+                    if cutlass.const_expr(use_acc_overlap and num_mma_m > 1):
+                        _mi = mi + (1 - acc_buf_parity) * (num_mma_m - 1 - 2 * mi)
+                    else:
+                        _mi = mi
+                    coord_m = coord_m_tile + _mi * mma_inst_shape_mnk[0]
+                    mi_col_base = acc_base_col + _mi * epi_cols_per_mma_m
                     tmem_col_addr_gemms = [(row_id_with_warp_offset << 16) | (mi_col_base + g * acc_gemm_stride) for g in range(num_gemms)]
 
                     if cutlass.const_expr(mma_inst_shape_mnk[0] == 64):
@@ -1084,7 +1088,7 @@ def _kernel(
                             if elect_one:
                                 nvvm.mbarrier_arrive(acc_empty_mbar_ptr.subview(acc_stage))
 
-                        if cutlass.const_expr(use_acc_overlap and mi == num_mma_m - 1 and subtile_idx == acc_overlap_subtiles - 1):
+                        if cutlass.const_expr(use_acc_overlap and mi * subtile_cnt + subtile_idx == acc_overlap_subtiles - 1):
                             nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
                             nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
                             if elect_one:
