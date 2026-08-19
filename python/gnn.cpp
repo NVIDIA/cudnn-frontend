@@ -17,7 +17,6 @@ namespace cudnn_frontend::python_bindings {
 
 namespace {
 
-#if defined(CUDNN_FRONTEND_HAS_GNN_AGG_SIMPLE)
 cudnnGnnCscGraph_t
 make_csc_graph(std::intptr_t csc_offsets,
                std::intptr_t csc_indices,
@@ -62,13 +61,11 @@ ensure_cuda_runtime_context() {
                                  detail::cuda_get_error_string(status));
     }
 }
-#endif
 
 }  // namespace
 
 void
 init_gnn_submodule(py::module_ &m) {
-#if defined(CUDNN_FRONTEND_HAS_GNN_AGG_SIMPLE)
     py::enum_<cudnnGnnAggOp_t>(m, "gnn_agg_op")
         .value("SUM", CUDNN_GNN_AGG_SUM)
         .value("MEAN", CUDNN_GNN_AGG_MEAN)
@@ -188,9 +185,6 @@ init_gnn_submodule(py::module_ &m) {
         py::arg("concat_feat_dim"),
         py::arg("data_type"),
         py::arg("agg_op"));
-#else
-    m.def("is_gnn_agg_simple_available", []() { return false; });
-#endif
 }
 
 }  // namespace cudnn_frontend::python_bindings

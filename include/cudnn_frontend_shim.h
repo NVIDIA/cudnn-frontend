@@ -521,7 +521,6 @@ causal_conv1d_backward(cudaStream_t stream,
 }
 #endif
 
-#if defined(CUDNN_FRONTEND_HAS_GNN_AGG_SIMPLE)
 inline bool
 is_gnn_agg_simple_available() {
 #if defined(NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING)
@@ -588,7 +587,6 @@ gnn_agg_simple_backward(cudaStream_t stream,
                           data_type,
                           agg_op);
 }
-#endif
 
 inline size_t
 get_backend_version(void) {
