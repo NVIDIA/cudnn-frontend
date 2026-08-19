@@ -118,9 +118,18 @@ _CAUSAL_CONV1D_CASES = [
 
 
 def _require_variant(required_symbols, dtype, minimum_version):
-    required_version = max(minimum_version, 92600 if dtype == torch.float64 else 0)
+    is_sm107 = torch.cuda.get_device_capability() == (10, 7)
+    required_version = max(minimum_version, 92600 if dtype == torch.float64 or is_sm107 else 0)
     if cudnn.backend_version() < required_version or any(getattr(cudnn, name, None) is None for name in required_symbols):
         pytest.skip(f"SE causal conv1d case requires cuDNN {required_version // 10000}.{required_version // 100 % 100}")
+
+
+def test_require_variant_skips_sm107_before_cudnn_926(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (10, 7))
+    monkeypatch.setattr(cudnn, "backend_version", lambda: 92500)
+
+    with pytest.raises(pytest.skip.Exception, match=r"requires cuDNN 9\.26"):
+        _require_variant((), torch.float32, 92200)
 
 
 def _make_tensor(shape, dtype, scale=1.0):
