@@ -302,6 +302,204 @@ def compute_kv_loop_bounds(
     )
 
 
+class SplitHelpers(NamedTuple):
+    """Split-aware decode / bounds closures, plus the two flags kernels fold on."""
+
+    SPLIT_KV: int
+    # True when a tile's KV range can come out empty (right <= left).  See
+    # make_split_helpers for why KV split makes this reachable without a mask.
+    MAY_BE_EMPTY: bool
+    split_chunk: object
+    decode_initial_split: object
+    decode_payload_split: object
+    bounds_for_tile_split: object
+    nomask_range_split: object
+    partial_batch: object
+
+
+def make_split_helpers(CFG, *, bounds_for_tile, dispatch_decode_initial, dispatch_decode_payload) -> SplitHelpers:
+    """Split-aware decode / bounds closures shared by the SM100 prefill flavors.
+
+    ``bounds_for_tile`` is the caller's own bounds closure, taking
+    ``(q_super_idx, seqlen_q, seqlen_kv, cta_in_pair, seq_q_lens_tensor,
+    batch_idx)`` — flavors differ in whether they apply the dead-Q-tile trim, so
+    the split narrowing composes on top of whatever they already do.
+
+    At SPLIT_KV == 1 every closure below folds away and the traced code is the
+    classic single-pass kernel.
+    """
+    SPLIT_KV = int(getattr(CFG, "SPLIT_KV", 1))
+
+    # The split index rides the BATCH axis (grid.z), not grid.x: the decode
+    # already recovers the batch coordinate on BOTH the blockIdx and the
+    # scheduler-handout paths -- it is the high half of the packed head|batch
+    # word -- so a composite z = batch + split*B travels with it for free, with
+    # no in-place mutation of the shared tile id and no dependence on the grid's
+    # x extent (which is q_clusters * CGA_M, NOT the n_q_supers the kernel is
+    # handed, on any flavor where CGA_M != CTA_MMA -- d512).
+
+    # Can a tile's KV range come out EMPTY (right <= left)?
+    #
+    # Before KV split the answer was "only under a mask" — a SWA/causal/padded
+    # tile can fall entirely outside the band — so the empty-tile handshake
+    # (mb_empty_mainloop: correction arrives, MMA waits, TMA-LDG skips its
+    # loads) was gated on MASK_FLAGS != 0 and folded away at MASK_NONE, where
+    # [0, S_kv/TILE_N) is never empty.
+    #
+    # KV split breaks that WITHOUT a mask: a split past the end of a short range
+    # legitimately gets zero tiles.  Correction detects empties with a RUNTIME
+    # test, so if the gate const-folds to False the warp groups disagree —
+    # correction jumps to its epilogue while MMA waits on mb_q_full and TMA-LDG
+    # issues loads nobody consumes — and the kernel deadlocks.
+    MAY_BE_EMPTY = (CFG.MASK_FLAGS != 0) or (SPLIT_KV > 1)
+
+    # Which grid does this flavor launch?  SCHED_NATURAL uses a 3-D
+    # (q_super, head, batch) grid; the LPT policy flattens everything into x.
+    # NOTE this is the flavor's EFFECTIVE policy, not the requested one:
+    # make_cfg_d192 hardcodes SCHEDULER_POLICY=1 regardless of params, so a
+    # params-level check would miss it (and did -- d192 silently launched the
+    # unsplit grid because the split multiplier was only on the NATURAL branch).
+    IS_LPT = CFG.SCHEDULER_POLICY != SCHED_NATURAL
+
+    @cute.jit
+    def _lpt_split_of(raw, n_q_supers, n_qh, n_batch):
+        """(within-split raw x, split) for the flattened LPT grid.
+
+        The LPT tile space is q_tiles * n_qh * n_batch clusters; KV split
+        appends SPLIT_KV copies of it, split-major, so the split is the high
+        digit of the cluster index.  The CGA lane (raw % CGA_M) is preserved so
+        the caller's decode still sees a well-formed x coordinate.
+        """
+        cga = cutlass.Int32(CFG.CGA_M)
+        linear = raw // cga
+        q_tiles = n_q_supers // cutlass.Int32(CFG.CTA_MMA)
+        per_split = q_tiles * n_qh * n_batch
+        split = linear // per_split
+        rest = (linear % per_split) * cga + (raw % cga)
+        return rest, split
+
+    @cute.jit
+    def _split_chunk(left, right, split_idx):
+        """Cut ``[left, right)`` into SPLIT_KV near-equal chunks.
+
+        The FIRST ``rem`` splits get one extra tile, so chunk sizes differ by at
+        most 1 however the mask has already narrowed the range — a balanced cut
+        matters because the slowest split sets the critical path.  A split past
+        the end collapses to ``lo == hi``; the existing empty-mainloop path then
+        writes O := 0 / LSE := -inf, exactly the identity of the combine's
+        log-sum-exp, so no special case is needed downstream.
+        """
+        n_tiles = right - left
+        per = n_tiles // cutlass.Int32(SPLIT_KV)
+        rem = n_tiles % cutlass.Int32(SPLIT_KV)
+        lo = left + split_idx * per + cute.math.min(split_idx, rem)
+        extra = cutlass.Int32(
+            arith.select(
+                (split_idx < rem).ir_value(),
+                cutlass.Int32(1).ir_value(),
+                cutlass.Int32(0).ir_value(),
+            )
+        )
+        return lo, lo + per + extra
+
+    @cute.jit
+    def _decode_initial_split(bidx, bidy, bidz, cta_in_pair, n_q_supers, n_qh, n_batch, seq_kv_lens_t, qh_per_kh=None, seqlen_kv=None):
+        """decode_initial + this tile's split index.
+
+        NATURAL: the split rides the BATCH axis (see the note above on why not
+        grid.x).  The host launches z = B * SPLIT_KV, so the split falls out of
+        the DECODED batch coordinate as ``b // n_batch``, leaving the real batch
+        as ``b % n_batch``.
+
+        LPT / LPT_L2: the grid is flat, so there is no batch axis to ride and the
+        split is folded into the linear tile id instead; ``_lpt_split_of`` peels
+        it back off before the flavor's dispatcher sees the id.
+
+        ``qh_per_kh`` / ``seqlen_kv`` are the LPT_L2 cost-model inputs; they are
+        opaque here and forwarded to the flavor's dispatcher unchanged.
+        """
+        if cutlass.const_expr(SPLIT_KV > 1 and IS_LPT):
+            raw, split = _lpt_split_of(bidx, n_q_supers, n_qh, n_batch)
+            q, h, b = dispatch_decode_initial(raw, bidy, bidz, cta_in_pair, n_q_supers, n_qh, n_batch, seq_kv_lens_t, qh_per_kh, seqlen_kv)
+            return q, h, b, split
+        q, h, b = dispatch_decode_initial(bidx, bidy, bidz, cta_in_pair, n_q_supers, n_qh, n_batch, seq_kv_lens_t, qh_per_kh, seqlen_kv)
+        if cutlass.const_expr(SPLIT_KV == 1):
+            return q, h, b, cutlass.Int32(0)
+        return q, h, b % n_batch, b // n_batch
+
+    @cute.jit
+    def _decode_payload_split(t0, t1, cta_in_pair, n_q_supers, n_qh, n_batch, seq_kv_lens_t, qh_per_kh=None, seqlen_kv=None):
+        """decode_payload + split index; ``t0`` is the try_cancel cluster-base id."""
+        if cutlass.const_expr(SPLIT_KV > 1 and IS_LPT):
+            raw, split = _lpt_split_of(t0, n_q_supers, n_qh, n_batch)
+            q, h, b = dispatch_decode_payload(raw, t1, cta_in_pair, n_q_supers, n_qh, n_batch, seq_kv_lens_t, qh_per_kh, seqlen_kv)
+            return q, h, b, split
+        q, h, b = dispatch_decode_payload(t0, t1, cta_in_pair, n_q_supers, n_qh, n_batch, seq_kv_lens_t, qh_per_kh, seqlen_kv)
+        if cutlass.const_expr(SPLIT_KV == 1):
+            return q, h, b, cutlass.Int32(0)
+        return q, h, b % n_batch, b // n_batch
+
+    @cute.jit
+    def _bounds_for_tile_split(q_super_idx, seqlen_q, seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx, split_idx):
+        """The flavor's bounds, narrowed to this split's slice of the KV range.
+
+        Splitting the ALREADY-masked ``[left, right)`` rather than the raw KV
+        extent is what keeps causal / SWA correct AND balanced: each split gets
+        an equal share of the tile's real work, not of the sequence.  The
+        unmasked band is clamped into the slice, which preserves the
+        ``left <= unmasked_lo <= unmasked_hi <= right`` invariant the mainloop
+        relies on, because clamping is monotone.
+        """
+        b = bounds_for_tile(q_super_idx, seqlen_q, seqlen_kv, cta_in_pair, seq_q_lens_tensor, batch_idx)
+        if cutlass.const_expr(SPLIT_KV == 1):
+            return b
+        lo, hi = _split_chunk(b.left, b.right, split_idx)
+        return KvLoopBounds(
+            left=lo,
+            unmasked_lo=cute.math.min(cute.math.max(b.unmasked_lo, lo), hi),
+            unmasked_hi=cute.math.min(cute.math.max(b.unmasked_hi, lo), hi),
+            right=hi,
+        )
+
+    @cute.jit
+    def _nomask_range_split(seqlen_kv, split_idx):
+        """MASK_NONE fast-path KV range, split-aware.
+
+        MMA / TMA-LDG take this path while softmax / correction go through
+        bounds_for_tile_split; every warp group must land on the SAME chunk
+        boundaries or their mbarrier handshakes desync.  The split branch
+        therefore divides with the div-up compute_kv_loop_bounds uses, not the
+        floor of the historical fast path.
+        """
+        if cutlass.const_expr(SPLIT_KV == 1):
+            return cutlass.Int32(0), seqlen_kv // cutlass.Int32(CFG.TILE_N)
+        n_tiles = (seqlen_kv + cutlass.Int32(CFG.TILE_N - 1)) // cutlass.Int32(CFG.TILE_N)
+        return _split_chunk(cutlass.Int32(0), n_tiles, split_idx)
+
+    @cute.jit
+    def _partial_batch(batch_idx, split_idx, n_batch):
+        """Batch coord of this split's partial O / LSE slot (split-major).
+
+        Stacking the partials on the BATCH axis (extent B*SPLIT_KV) means the O
+        TMA descriptor is untouched — only the coord shifts.  Folds to batch_idx
+        at SPLIT_KV == 1.
+        """
+        if cutlass.const_expr(SPLIT_KV == 1):
+            return batch_idx
+        return batch_idx + split_idx * n_batch
+
+    return SplitHelpers(
+        SPLIT_KV=SPLIT_KV,
+        MAY_BE_EMPTY=MAY_BE_EMPTY,
+        split_chunk=_split_chunk,
+        decode_initial_split=_decode_initial_split,
+        decode_payload_split=_decode_payload_split,
+        bounds_for_tile_split=_bounds_for_tile_split,
+        nomask_range_split=_nomask_range_split,
+        partial_batch=_partial_batch,
+    )
+
+
 class SdpaHelpers(NamedTuple):
     decode_initial: object
     decode_payload: object
