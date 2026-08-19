@@ -8,13 +8,7 @@ import pytest
 import torch
 
 import cudnn
-from cudnn.gnn import (
-    CscGraph,
-    agg_simple,
-    agg_simple_e2n,
-    agg_simple_n2n,
-    agg_simple_n2n_e2n,
-)
+from cudnn.gnn import CscGraph, agg_simple
 
 
 def _require_gnn_agg_simple() -> None:
@@ -178,21 +172,6 @@ def test_agg_simple_usage():
 
 
 @pytest.mark.L0
-def test_agg_simple_compatibility_wrappers():
-    _require_gnn_agg_simple()
-    graph = CscGraph(
-        torch.tensor([0, 2, 4], device="cuda", dtype=torch.int32),
-        torch.tensor([0, 1, 1, 2], device="cuda", dtype=torch.int32),
-        num_src_nodes=3,
-    )
-    node = torch.randn((3, 4), device="cuda")
-    edge = torch.randn((4, 2), device="cuda")
-    torch.testing.assert_close(agg_simple_n2n(node, graph), agg_simple(graph, node_features=node))
-    torch.testing.assert_close(agg_simple_e2n(edge, graph), agg_simple(graph, edge_features=edge))
-    torch.testing.assert_close(agg_simple_n2n_e2n(node, edge, graph), agg_simple(graph, node_features=node, edge_features=edge))
-
-
-@pytest.mark.L0
 def test_agg_simple_empty_destination_set():
     graph = CscGraph(
         torch.tensor([0], device="cuda", dtype=torch.int32),
@@ -200,7 +179,7 @@ def test_agg_simple_empty_destination_set():
         num_src_nodes=3,
     )
     features = torch.randn((3, 4), device="cuda", requires_grad=True)
-    output = agg_simple_n2n(features, graph)
+    output = agg_simple(graph, node_features=features)
     assert output.shape == (0, 4)
     output.sum().backward()
     torch.testing.assert_close(features.grad, torch.zeros_like(features))
@@ -214,15 +193,15 @@ def test_agg_simple_rejects_invalid_inputs():
     features = torch.randn((1, 2), device="cuda")
 
     with pytest.raises(ValueError, match="Unsupported aggregation"):
-        agg_simple_n2n(features, graph, aggr="product")
+        agg_simple(graph, node_features=features, aggr="product")
     with pytest.raises(TypeError, match="indices dtype"):
-        agg_simple_n2n(features, CscGraph(offsets, indices.to(torch.int64), num_src_nodes=1))
+        agg_simple(CscGraph(offsets, indices.to(torch.int64), num_src_nodes=1), node_features=features)
     with pytest.raises(ValueError, match="at least one element"):
         CscGraph(torch.empty(0, device="cuda", dtype=torch.int32), indices, num_src_nodes=1).num_dst_nodes
     with pytest.raises(ValueError, match="zero edges"):
-        agg_simple_n2n(
-            features,
+        agg_simple(
             CscGraph(torch.tensor([0, 0], device="cuda", dtype=torch.int32), torch.empty(0, device="cuda", dtype=torch.int32), 1),
+            node_features=features,
         )
 
 
@@ -237,7 +216,7 @@ def test_agg_simple_uses_current_stream():
     features = torch.randn((3, 8), device="cuda")
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
-        actual = agg_simple_n2n(features, graph)
+        actual = agg_simple(graph, node_features=features)
     stream.synchronize()
     torch.testing.assert_close(actual, _reference(graph, features, None, None, "sum"))
 
@@ -297,7 +276,7 @@ def test_agg_simple_torch_compile():
     )
 
     def fn(features):
-        return agg_simple_n2n(features, graph, aggr="sum")
+        return agg_simple(graph, node_features=features, aggr="sum")
 
     features = torch.randn((3, 4), device="cuda")
     compiled = torch.compile(fn, backend="eager", fullgraph=True)

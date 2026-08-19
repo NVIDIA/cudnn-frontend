@@ -419,21 +419,3 @@ def agg_simple(
         aggr,
     )
     return output
-
-
-def agg_simple_n2n(feat: Tensor, graph: CscGraph, aggr: str = "sum") -> Tensor:
-    """Compatibility wrapper for node-to-node aggregation."""
-
-    return agg_simple(graph, node_features=feat, aggr=aggr)
-
-
-def agg_simple_e2n(edge_feat: Tensor, graph: CscGraph, aggr: str = "sum") -> Tensor:
-    """Compatibility wrapper for edge-to-node aggregation."""
-
-    return agg_simple(graph, edge_features=edge_feat, aggr=aggr)
-
-
-def agg_simple_n2n_e2n(node_feat: Tensor, edge_feat: Tensor, graph: CscGraph, aggr: str = "sum") -> Tensor:
-    """Compatibility wrapper for combined node-to-node and edge-to-node aggregation."""
-
-    return agg_simple(graph, node_features=node_feat, edge_features=edge_feat, aggr=aggr)

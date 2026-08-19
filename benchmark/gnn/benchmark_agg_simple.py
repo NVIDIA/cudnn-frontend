@@ -7,7 +7,7 @@ from typing import Optional
 
 import torch
 
-from cudnn.gnn import CscGraph, agg_simple_n2n
+from cudnn.gnn import CscGraph, agg_simple
 
 
 @dataclass(frozen=True)
@@ -97,14 +97,14 @@ def benchmark(
 ) -> BenchmarkResult:
     graph, features = _make_inputs(shape, dtype)
 
-    forward_ms = _time_cuda(lambda: agg_simple_n2n(features, graph, aggr=aggr), warmup, iterations)
+    forward_ms = _time_cuda(lambda: agg_simple(graph, node_features=features, aggr=aggr), warmup, iterations)
     backward_ms = None
     if include_backward:
         grad_output = torch.randn((shape.num_dst_nodes, shape.feature_dim), device="cuda", dtype=dtype)
 
         def forward_backward() -> None:
             features.grad = None
-            agg_simple_n2n(features, graph, aggr=aggr).backward(grad_output)
+            agg_simple(graph, node_features=features, aggr=aggr).backward(grad_output)
 
         total_ms = _time_cuda(forward_backward, warmup, iterations)
         backward_ms = max(total_ms - forward_ms, 0.0)

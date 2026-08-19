@@ -78,18 +78,6 @@ If edge-feature rows are not already in CSC order, set
 `CscGraph.map_csc_to_coo` to an index tensor of shape `(num_edges,)` that maps
 each CSC edge position to its edge-feature row.
 
-Compatibility helpers matching the common `pylibcugraphops` entry points are
-also available:
-
-```python
-agg_simple_n2n(node_features, graph, aggr="sum")
-agg_simple_e2n(edge_features, graph, aggr="sum")
-agg_simple_n2n_e2n(node_features, edge_features, graph, aggr="sum")
-```
-
-Weighted aggregation is not included because it is a separate operation and
-is not part of the cuDNN AggSimple C API.
-
 ## Autograd and determinism
 
 The Python API registers a PyTorch autograd formula. For max/min reductions,
@@ -112,16 +100,6 @@ exports both symbols at runtime:
 ```python
 import cudnn
 print(cudnn.is_gnn_agg_simple_available())
-```
-
-For development against a local cuDNN build, select both its headers and
-libraries before installing cuDNN Frontend:
-
-```bash
-export CUDNN_INCLUDE_PATH=/workspace/repo/cudnn/include
-export CUDNN_LIBRARY_PATH=/workspace/repo/cudnn/out/build/linux-x86_64-13.2--debug
-export LD_LIBRARY_PATH="$CUDNN_LIBRARY_PATH${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-pip install -e /workspace/repo/cudnn-frontend
 ```
 
 The current backend requires SM 8.0 or newer. A graph with zero destination
